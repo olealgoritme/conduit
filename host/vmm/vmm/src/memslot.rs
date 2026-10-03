@@ -217,7 +217,7 @@ impl virtio_devices::HostMemoryMapper for MemorySlots {
             None => self.next_slot.fetch_add(1, Ordering::SeqCst),
         };
         self.set_region(slot, guest_addr, host_addr, size)
-            .inspect_err(|err| {
+            .inspect_err(|_| {
                 // Give the number back; nothing was registered under it.
                 self.free.lock().unwrap().push(slot);
             })?;

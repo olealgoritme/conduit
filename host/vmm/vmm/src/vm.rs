@@ -286,7 +286,7 @@ impl Vm {
 /// Create an anonymous shared memory file of `size` bytes, on hugetlb pages of
 /// `hugetlb` bytes when given.
 fn create_memfd(size: u64, hugetlb: Option<u64>) -> Result<std::fs::File> {
-    let name = c"nesbox-guest-ram";
+    let name = c"conduit-vmm-guest-ram";
     let flags = match hugetlb {
         None => libc::MFD_CLOEXEC,
         Some(page) if page == 1 << 30 => libc::MFD_CLOEXEC | libc::MFD_HUGETLB | libc::MFD_HUGE_1GB,
@@ -632,7 +632,7 @@ fn pmd_mapped_kib(smaps: &str) -> usize {
             .is_some_and(|field| !field.ends_with(':'))
         {
             // A VMA header: `start-end perms offset dev inode path`.
-            ours = line.contains("/memfd:nesbox-guest-ram");
+            ours = line.contains("/memfd:conduit-vmm-guest-ram");
         }
     }
     kib
@@ -863,12 +863,12 @@ mod tests {
     #[test]
     fn only_guest_ram_is_counted_as_huge() {
         let smaps = "\
-7f0000000000-7f00c0000000 rw-s 00000000 00:01 12 /memfd:nesbox-guest-ram (deleted)
+7f0000000000-7f00c0000000 rw-s 00000000 00:01 12 /memfd:conduit-vmm-guest-ram (deleted)
 Size:            3145728 kB
 ShmemPmdMapped:  2097152 kB
 7f0100000000-7f0100200000 rw-s 00000000 00:01 13 /memfd:gpu-blob (deleted)
 ShmemPmdMapped:     2048 kB
-7f0200000000-7f0240000000 rw-s c0000000 00:01 12 /memfd:nesbox-guest-ram (deleted)
+7f0200000000-7f0240000000 rw-s c0000000 00:01 12 /memfd:conduit-vmm-guest-ram (deleted)
 ShmemPmdMapped:  1048576 kB
 ";
         assert_eq!(pmd_mapped_kib(smaps), 3 << 20);

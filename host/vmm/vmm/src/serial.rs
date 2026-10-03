@@ -22,7 +22,6 @@ const REG_MSR: u16 = 6; // modem status
 const REG_SCR: u16 = 7; // scratch
 
 const LCR_DLAB: u8 = 0x80;
-const LSR_DATA_READY: u8 = 0x01;
 const LSR_THR_EMPTY: u8 = 0x20;
 const LSR_TRANSMITTER_IDLE: u8 = 0x40;
 const IIR_NO_INTERRUPT: u8 = 0x01;
@@ -102,10 +101,9 @@ impl Serial {
             REG_IIR => IIR_NO_INTERRUPT,
             REG_LCR => i.lcr,
             REG_MCR => i.mcr,
-            // Always ready to transmit, and `LSR_DATA_READY` is deliberately
+            // Always ready to transmit, and data-ready (0x01) is deliberately
             // never set: this port is write-only, guest input arrives on the
-            // virtio console. It used to be written as `| (0 & LSR_DATA_READY)`
-            // to show that, which is an expression that can only be zero.
+            // virtio console.
             REG_LSR => LSR_THR_EMPTY | LSR_TRANSMITTER_IDLE,
             REG_MSR => MSR_DEFAULTS,
             REG_SCR => i.scr,

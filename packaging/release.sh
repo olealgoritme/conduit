@@ -31,8 +31,11 @@ git fetch -q --tags origin
   echo "release: local main differs from origin/main; pull/push first" >&2; exit 1; }
 # Only the files this script edits must be clean; other work in progress in
 # the tree is left alone and is not part of the release (the tag is a commit).
-git diff --quiet -- Cargo.toml Cargo.lock || {
-  echo "release: Cargo.toml/Cargo.lock have uncommitted changes" >&2; exit 1; }
+# Every Rust workspace carries the Conduit version.
+VERSIONED=(Cargo.toml Cargo.lock host/backend/Cargo.toml host/backend/Cargo.lock
+           host/vmm/Cargo.toml host/vmm/Cargo.lock host/stream/Cargo.toml host/stream/Cargo.lock)
+git diff --quiet -- "${VERSIONED[@]}" || {
+  echo "release: Cargo.toml/Cargo.lock files have uncommitted changes" >&2; exit 1; }
 
 last=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
 last=${last#v}
@@ -54,9 +57,11 @@ git rev-parse -q --verify "refs/tags/v$new" >/dev/null && {
 
 echo "Releasing v$new (previous: ${last:-none})"
 if [ "$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)" != "$new" ]; then
-  run sed -i "0,/^version *= *\".*\"/s//version = \"$new\"/" Cargo.toml
-  run cargo update -q -p conduit --precise "$new" 2>/dev/null || run cargo update -q -w
-  run git commit -q -m "Release v$new" -- Cargo.toml Cargo.lock
+  for d in . host/backend host/vmm host/stream; do
+    run sed -i "0,/^version *= *\".*\"/s//version = \"$new\"/" "$d/Cargo.toml"
+    (cd "$d" && run cargo update -q -w --offline 2>/dev/null || run cargo update -q -w)
+  done
+  run git commit -q -m "Release v$new" -- "${VERSIONED[@]}"
 fi
 run git tag -a "v$new" -m "Conduit v$new"
 run git push -q origin main "v$new"

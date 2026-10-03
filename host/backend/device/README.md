@@ -1,55 +1,42 @@
 # device
 
-The host side of virtio-nvgpu: a Rust library that serves the device, and
-`vhost-user-nvgpu`, the backend binary built on it. Licensed Apache-2.0
-(`LICENSE-APACHE-2.0`).
+`conduit-backend`, the host half of Conduit's GPU device, and the library it is
+built on. Licensed Apache-2.0 (`../LICENSE-APACHE-2.0`).
 
-The library names no VMM. Everything a VMM owns is a trait the embedding VMM
-implements: descriptor chains, the event queue, guest memory, and placing host
-memory where the guest can reach it (`shm::WindowPlacer`). The backend binary
-implements those traits over vhost-user, so any VMM with a vhost-user frontend
-can run it.
-
-## Layout
+One backend process serves one VM over vhost-user (QEMU or `conduit-vmm`
+connect to its socket; `conduit up` / libvirt socket activation start it). It
+holds the real `/dev/nvidia*` descriptors, checks every forwarded ioctl against
+the host driver release's ABI table (`../gen`), applies the RM allowlist,
+supplies every pointer-carrying buffer itself, places GPU mappings in the
+shared-memory window and UVM aperture, and exports the guest's scanout
+buffers as dma-bufs to `conduit-viewer` / `conduit-stream`. Before the first
+guest message it drops privileges and locks itself down (seccomp, Landlock);
+it refuses to run as root. See `docs/ARCHITECTURE.md` and `docs/SECURITY.md`.
 
 | path | what it does |
 |---|---|
-| `src/nvidia/mod.rs` | the backend's state for one VM, and the message loop |
-| `src/nvidia/ioctl.rs` | forwarded ioctls, the ABI size check, RM allowlist refusals |
-| `src/nvidia/rmctrl.rs`, `nested.rs` | RM controls whose parameters hold pointers: the backend supplies those buffers itself |
-| `src/nvidia/uvm.rs` | UVM calls: size check, descriptor and client checks, the backend's own init flags |
-| `src/nvidia/osdesc.rs`, `src/guestmem.rs` | memory a guest registers by CPU address, rebuilt from the guest's own pages |
-| `src/nvidia/vidmem.rs`, `src/vram.rs` | the video memory limit: admission, charges, and what the guest is told |
-| `src/nvidia/window.rs`, `src/shm.rs` | mappings placed in the shared window |
-| `src/nvidia/aperture.rs` | CUDA semaphore pools, placed in the UVM aperture |
-| `src/nvidia/open.rs`, `files.rs` | opens, closes, and the host files the guest is shown |
+| `bin/conduit-backend.rs` | `conduit-backend`: the vhost-user transport and options |
+| `bin/conduit-userspace.rs` | `conduit-userspace`: stages the host's NVIDIA userspace for the guest's read-only share |
+| `src/nvidia/` | per-VM state, ioctl/RM/UVM forwarding and refusals, memory placement |
+| `src/display.rs` | scanout, cursor, input, clipboard and mode hints to the viewer |
 | `src/caps.rs` | `--caps`: which device nodes and RM classes a guest is served |
-| `src/sandbox.rs`, `posture.rs` | seccomp, Landlock and the privilege drop, before the first guest message |
-| `bin/vhost-user-nvgpu.rs` | the backend binary |
+| `src/vram.rs`, `src/nvidia/vidmem.rs` | `--vram-limit-mib` |
+| `src/sandbox.rs`, `src/posture.rs` | seccomp, Landlock, privilege drop |
 
-## Running it
-
-```sh
-vhost-user-nvgpu --socket /run/nvgpu/vm1.sock \
-    --caps graphics,video,utility --vram-limit-mib 4096
-```
-
-The backend refuses to run as root or with `CAP_SYS_ADMIN`. It refuses to start
-on a kernel without seccomp or Landlock, on a driver release older than every
-ABI profile, and with `--vram-limit-mib` on a release with no video memory
-table of its own. No flag turns any of these off. `--caps` lists what a guest
-is served. Compute (`/dev/nvidia-uvm`) is off unless `compute` is in it.
-
-One backend serves one VM. Each VM gets its own process and its own socket.
-
-## Tests
+## Build and test
 
 ```sh
-cargo test -p device
+cd host/backend
+cargo build --release -p device --features vhost-user --bins
+cargo test --workspace --features device/vhost-user -- \
+    --skip for_real --skip closing_the_fd --skip repeated_map_unmap
 ```
 
-The tests run against a fake host driver and need no GPU. Tests that need a
-card run in a guest on a GPU host, through `scripts/rig/`.
+`make backend` / `make test` at the repo root do the same. The tests run
+against a fake host driver; the skipped ones open the real `/dev/nvidiactl`.
 
-Tables of NVIDIA's struct layouts and command lists come from `gen/`, one per
-driver release. The backend picks the table for the host's release at start.
+```sh
+conduit-backend --socket /run/user/1000/conduit/vm.sock \
+    --caps graphics,video,utility,compute [--vram-limit-mib 8192] \
+    [--display-socket PATH]
+```

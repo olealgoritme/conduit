@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a virtio-nvgpu ABI profile from gVisor's nvproxy.
+"""Generate a Conduit ABI profile from gVisor's nvproxy.
 
 nvproxy records each NVIDIA driver version as a delta against its parent, so
 the ABI for one version is the base map plus every override along its

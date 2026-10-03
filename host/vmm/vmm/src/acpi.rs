@@ -19,7 +19,7 @@ pub fn slot_gsi(slot: u32) -> u32 {
 }
 
 fn build_dsdt(mmio64: crate::layout::Mmio64Window) -> Vec<u8> {
-    let mut dsdt = Sdt::new(*b"DSDT", 36, 6, *b"NESTRI", *b"DSDT    ", 1);
+    let mut dsdt = Sdt::new(*b"DSDT", 36, 6, *b"CONDUI", *b"DSDT    ", 1);
 
     // _CRS: what the host bridge decodes. The memory window must agree with
     // the BAR allocator in the `pci` crate, or the guest will reassign BARs
@@ -135,7 +135,7 @@ fn build_fadt(dsdt_addr: u64) -> Vec<u8> {
     const OFF_SLEEP_CONTROL_REG: usize = 244;
     const OFF_SLEEP_STATUS_REG: usize = 256;
 
-    let mut fadt = Sdt::new(*b"FACP", 276, 6, *b"NESTRI", *b"FACP    ", 1);
+    let mut fadt = Sdt::new(*b"FACP", 276, 6, *b"CONDUI", *b"FACP    ", 1);
     fadt.write_u32(OFF_FLAGS, FLAG_HW_REDUCED_ACPI | FLAG_RESET_REG_SUP);
     fadt.write_u8(OFF_MINOR_VERSION, 1);
     fadt.write_u64(OFF_X_DSDT, dsdt_addr);
@@ -159,7 +159,7 @@ fn build_fadt(dsdt_addr: u64) -> Vec<u8> {
 }
 
 fn build_madt(vcpu_count: u8, ioapic_id: u8, ioapic_addr: u32, gsi_base: u32) -> Vec<u8> {
-    let mut madt = Sdt::new(*b"APIC", 44, 5, *b"NESTRI", *b"APIC    ", 1);
+    let mut madt = Sdt::new(*b"APIC", 44, 5, *b"CONDUI", *b"APIC    ", 1);
     madt.write_u32(36, 0xFEE0_0000);
     madt.write_u32(40, 1); // PCAT_COMPAT
 
@@ -196,7 +196,7 @@ fn build_madt(vcpu_count: u8, ioapic_id: u8, ioapic_addr: u32, gsi_base: u32) ->
 }
 
 fn build_mcfg() -> Vec<u8> {
-    let mut mcfg = Sdt::new(*b"MCFG", 60, 1, *b"NESTRI", *b"MCFG    ", 1);
+    let mut mcfg = Sdt::new(*b"MCFG", 60, 1, *b"CONDUI", *b"MCFG    ", 1);
     mcfg.write_u64(44, crate::layout::MMCONFIG_START); // MMCONFIG base
     mcfg.write_u16(52, 0); // segment 0
     mcfg.write_u16(54, 0); // start bus = 0, end bus = 0
@@ -205,7 +205,7 @@ fn build_mcfg() -> Vec<u8> {
 
 fn build_xsdt(table_addrs: &[u64]) -> Vec<u8> {
     let len = 36 + (table_addrs.len() * 8) as u32;
-    let mut xsdt = Sdt::new(*b"XSDT", len, 1, *b"NESTRI", *b"XSDT    ", 1);
+    let mut xsdt = Sdt::new(*b"XSDT", len, 1, *b"CONDUI", *b"XSDT    ", 1);
     for (i, addr) in table_addrs.iter().enumerate() {
         xsdt.write_u64(36 + (i * 8), *addr);
     }
@@ -213,7 +213,7 @@ fn build_xsdt(table_addrs: &[u64]) -> Vec<u8> {
 }
 
 fn build_rsdp(xsdt_addr: u64) -> Vec<u8> {
-    let rsdp = Rsdp::new(*b"NESTRI", xsdt_addr);
+    let rsdp = Rsdp::new(*b"CONDUI", xsdt_addr);
     rsdp.as_bytes().to_vec()
 }
 

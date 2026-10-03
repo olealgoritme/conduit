@@ -22,7 +22,7 @@
 //!    KVM. It has no business opening files or sockets, and after this it cannot.
 //!
 //! crosvm gets stronger isolation than this by running each device in its own
-//! *process*, so each gets its own policy. nesbox is one process with threads, so
+//! *process*, so each gets its own policy. conduit-vmm is one process with threads, so
 //! per-thread filters are the closest equivalent — better than a single union,
 //! weaker than separate processes. Worth being clear about rather than implying
 //! parity.
@@ -252,7 +252,7 @@ extern "C" fn on_sigsys(_sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mu
     // Written as separate pieces rather than patched into one buffer at computed
     // offsets. The offset version was wrong on the first run and printed
     // "NNNN00317add", which is a silly way to lose an afternoon.
-    say(b"nesbox: seccomp refused syscall ");
+    say(b"conduit-vmm: seccomp refused syscall ");
     say_num(nr as i64);
     say(b" on thread ");
     say_num(tid);

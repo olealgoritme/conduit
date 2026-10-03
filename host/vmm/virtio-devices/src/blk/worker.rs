@@ -308,8 +308,7 @@ impl Worker {
     /// latency more than the box needs the core.
     ///
     /// Measured, 4 KiB reads one at a time: 23.6 -> 12.6 us per request served
-    /// from host cache, 38.0 -> 28.5 us against an NVMe. See
-    /// `docs/BENCHMARKS.md` §14.2.
+    /// from host cache, 38.0 -> 28.5 us against an NVMe.
     fn wait(&mut self, completions: &mut Vec<Done>) -> std::io::Result<bool> {
         if self.poll_us > 0 {
             let deadline = Instant::now() + Duration::from_micros(self.poll_us);

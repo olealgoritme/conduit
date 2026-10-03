@@ -1,9 +1,9 @@
-# Running the virtio-nvgpu device under QEMU
+# Running the Conduit GPU device under QEMU
 
 Conduit has two VM runners. QEMU 11.1 (patched, see `host/qemu`) is the
 default: `conduit up NAME` / `conduit view NAME` start it with everything on
 this page, plus a virtio-sound card and a QMP socket for a clean ACPI
-shutdown. The built-in runner `conduit-vmm` (from nesbox, which has the device
+shutdown. The built-in runner `conduit-vmm` (which has the device
 built in) is the fallback when the bundled QEMU is missing, or with
 `--vmm builtin`; it has no sound. This page is the QEMU command line `conduit`
 uses (`$XDG_RUNTIME_DIR/conduit/NAME/qemu.args` holds the exact one of a
@@ -18,7 +18,7 @@ both.
 | backend (`conduit-backend`) | `cd host/backend && cargo build --release -p device --features vhost-user --bin conduit-backend` |
 | virtiofsd (NVIDIA userspace share) | `/usr/libexec/virtiofsd` (Ubuntu package `virtiofsd`) |
 | guest kernel | the VM's own stock kernel: `conduit` copies the newest `/boot/vmlinuz-*` and its `initrd.img-*` out of the disk (`debugfs`) and passes them as `-kernel`/`-initrd`. The guest driver comes from DKMS (`conduit-guest`). A custom ELF `vmlinux` (`CONFIG_PVH=y`) also boots, without `-initrd`; that is what the commands below show. |
-| guest disk | `~/code/nvgpu-lab/rootfs-ssh.ext4` (a bare ext4 filesystem with no partition table or bootloader. It mounts as `/dev/vda`) |
+| guest disk | a `conduit create` disk (`~/.local/share/conduit/vms/NAME/disk.img`): a bare ext4 filesystem with no partition table or bootloader, mounted as `/dev/vda` |
 
 **Stock QEMU 11.1 does not work.** It aborts on the guest's first device
 config read, because it caps vhost-user config at 256 bytes and nvgpu's is
@@ -27,7 +27,7 @@ the window, CUDA in the aperture, MSI-X, mapping order (without 0005
 every Vulkan submit fails: Xid 13/32) and the shared-memory BAR size (without
 0006 QEMU aborts at startup). `host/qemu/README.md` explains each one.
 
-Don't run this VM while nesbox has the same `rootfs-ssh.ext4` open. Two
+Don't run this VM while another runner has the same disk open. Two
 writers on one ext4 image corrupt it.
 
 ## Command line
@@ -36,20 +36,22 @@ Start the processes in this order: the backend (it listens), then
 virtiofsd (it listens), then QEMU (it connects to both).
 
 ```sh
-LAB=$HOME/code/nvgpu-lab
-QEMU=$HOME/code/conduit/host/qemu/build/qemu-system-x86_64   # or /opt/conduit/bin/...
-BACKEND=$HOME/code/conduit/host/backend/target/release/conduit-backend
+QEMU=/opt/conduit/bin/qemu-system-x86_64          # or host/qemu/build/qemu-system-x86_64
+BACKEND=/opt/conduit/bin/conduit-backend          # or host/backend/target/release/conduit-backend
+DISK=~/.local/share/conduit/vms/NAME/disk.img
+KERNEL=/path/to/vmlinux                            # ELF, CONFIG_PVH=y
 RUN=${XDG_RUNTIME_DIR:-/tmp}/conduit; mkdir -p "$RUN"
+SHARE=$RUN/share; /opt/conduit/bin/conduit-userspace --stage "$SHARE"   # NVIDIA userspace
 
 # 1. GPU backend. Add --display WxH@HZ --display-socket PATH for the scanout.
 RUST_LOG=info "$BACKEND" --socket "$RUN/nvgpu.sock" \
     --caps graphics,video,utility,compute > "$RUN/backend.log" 2>&1 &
 
-# 2. The share the guest mounts as tag "nvidia" (nvgpu.service in the image).
+# 2. The share the guest mounts as tag "nvidia" (mounted by the guest image).
 #    Ubuntu 24.04 restricts unprivileged user namespaces, so run unsandboxed
 #    as yourself.
 /usr/libexec/virtiofsd --socket-path="$RUN/vfs.sock" \
-    --shared-dir="$LAB/share610" --sandbox=none > "$RUN/virtiofsd.log" 2>&1 &
+    --shared-dir="$SHARE" --sandbox=none > "$RUN/virtiofsd.log" 2>&1 &
 
 # 3. The VM.
 "$QEMU" \
@@ -57,10 +59,10 @@ RUST_LOG=info "$BACKEND" --socket "$RUN/nvgpu.sock" \
   -cpu host,host-phys-bits=on -smp 4 -m 4G \
   -object memory-backend-memfd,id=mem,size=4G,share=on \
   -nodefaults -display none -serial mon:stdio \
-  -kernel "$LAB/linux-7.2.9/vmlinux" \
+  -kernel "$KERNEL" \
   -append "console=ttyS0 root=/dev/vda rw" \
-  -drive file="$LAB/rootfs-ssh.ext4",format=raw,if=virtio,cache=none \
-  -netdev tap,id=net0,ifname=nesbox0,script=no,downscript=no \
+  -drive file="$DISK",format=raw,if=virtio,cache=none \
+  -netdev tap,id=net0,ifname=conduit0,script=no,downscript=no \
   -device virtio-net-pci,netdev=net0,mac=02:00:00:00:00:01 \
   -chardev socket,id=vfs,path="$RUN/vfs.sock" \
   -device vhost-user-fs-pci,chardev=vfs,tag=nvidia \
@@ -85,7 +87,7 @@ Why each nvgpu-related argument is there:
     `config_size=0` turns config reads off, and the guest driver then
     rejects the device.
   - With patch 0004, `vectors=` defaults to `num_vqs + 1` = 3, which is
-    the same as nesbox.
+    the same as `conduit-vmm`.
 - The shared memory regions are not given on the command line. QEMU asks
   the backend for them with `GET_SHMEM_CONFIG`. The backend answers shmid 1
   (window, 1 GiB) and shmid 2 (UVM aperture, 32 GiB).
@@ -93,30 +95,29 @@ Why each nvgpu-related argument is there:
   2 GiB and 64-bit. The firmware places it above 4 GiB, which needs real
   physical-address width.
 
-Networking is the same as with nesbox. `nvgpu-vm up` creates the `nesbox0`
+Networking is the same as with `conduit-vmm`. `conduit up` creates the `conduit0`
 tap, owned by you, with the host at 172.30.0.1. The guest configures itself
 statically to 172.30.0.2 on any `e*` interface, which includes QEMU's
 virtio-net `enp0s*`. For a VM without the tap, use
 `-netdev user,id=net0,hostfwd=tcp::2222-:22` and set the guest address
 another way.
 
-The console is `ttyS0`. nesbox uses `hvc0`; systemd starts a getty on
+The console is `ttyS0`. `conduit-vmm` uses `hvc0`; systemd starts a getty on
 whichever console the kernel command line names.
 
 ### Booting through OVMF instead
 
-This disk can't boot from its own kernel. `rootfs-ssh.ext4` is a bare
-filesystem with an empty `/boot` and no ESP, so the firmware finds nothing
-to boot on it. UEFI is still possible with a kernel given to OVMF. OVMF's
-`-kernel` loader needs a PE/EFI-stub `bzImage`, not the ELF `vmlinux`, so
-run `make bzImage` in `linux-7.2.9` first:
+The disk is a bare filesystem with no ESP, so the firmware finds nothing to
+boot on it. UEFI is still possible with a kernel given to OVMF. OVMF's
+`-kernel` loader needs a PE/EFI-stub `bzImage` (a distro `vmlinuz` is one),
+not the ELF `vmlinux`:
 
 ```sh
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$RUN/OVMF_VARS.fd"
 # Replace "-kernel .../vmlinux" in the command above with:
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
   -drive if=pflash,format=raw,file="$RUN/OVMF_VARS.fd" \
-  -kernel "$LAB/linux-7.2.9/arch/x86/boot/bzImage" \
+  -kernel /path/to/bzImage \
 ```
 
 OVMF sizes its 64-bit MMIO window from the CPU's physical-address bits, so
@@ -144,14 +145,14 @@ device:
   </qemu:commandline>
 ```
 
-## What the guest sees: QEMU compared with nesbox
+## What the guest sees: QEMU compared with conduit-vmm
 
 The guest driver finds everything through virtio PCI capabilities. It calls
 `virtio_get_shm_region()` for shmid 1 and 2, and reads config through the
 device-config capability. It never uses a BAR number, so the different
 layout below needs no driver change.
 
-| | nesbox | QEMU 11.1 (+ patches) |
+| | conduit-vmm | QEMU 11.1 (+ patches) |
 | --- | --- | --- |
 | PCI id / class | 1af4:106d rev 1, class 0x0380 (display) | 1af4:106d rev 1, class 0x0780 (communication). The driver binds by virtio id and builds its own PCI device for NVIDIA userspace, so the class does not matter. |
 | virtio config structures | all in BAR 0 (32-bit, 16 KiB): common, isr, notify, MSI-X, device cfg at 0x1000 | BAR 2 (64-bit): common 0x0, isr 0x1000, device cfg 0x2000 (4 KiB window), notify 0x3000. MSI-X in BAR 1 |
@@ -163,7 +164,7 @@ layout below needs no driver change.
 | UVM pool | mapped at the pool's address (`MAP_FIXED_NOREPLACE`) | the same, with patch 0003. Stock QEMU's mmap is refused by nvidia-uvm, so CUDA semaphore pools fail |
 | migration | none | blocked: QEMU refuses to migrate a device with shmem regions |
 
-## Open risks
+## Known issues
 
 - **Mapping order (fixed by patch 0005).** The backend negotiates
   `REPLY_ACK` (the vhost crate always offers it), so `SHMEM_MAP` waits for
@@ -178,13 +179,10 @@ layout below needs no driver change.
   display-mode read, and nothing breaks.
 - **Patch 0003 is outside the spec.** It is a Conduit extension. Until it
   is upstreamed, compute through UVM depends on the patched QEMU.
-- **Tested** on an RTX 5090 host (driver 610.57.04, Ubuntu 24.04 host,
-  QEMU 11.1.2 + patches 0001-0005): `conduit up NAME --vmm qemu` boots, the
-  guest module probes, `vulkaninfo` lists the RTX 5090, the offscreen Vulkan
-  draw test passes (fence, pixels), the virtio-sound card shows one playback
-  and one capture stream, and `conduit down` powers off through ACPI.
-  Both with a custom 7.2.9 vmlinux and with Ubuntu's stock 6.8.0-146-generic
-  booted from the disk (driver from DKMS), on a `conduit create` disk and on
-  a disk converted with `conduit stock-kernel`. The built-in runner cannot
-  boot the stock kernel (it loads only an uncompressed ELF vmlinux, with no
-  initrd), so VMs on their own kernel need QEMU.
+- **The built-in runner cannot boot a stock distro kernel** (it loads only an
+  uncompressed ELF `vmlinux`, with no initrd), so VMs on their own kernel
+  need QEMU.
+
+Tested with an RTX 5090 (driver 610.57.04, Ubuntu 24.04 host, QEMU 11.1.2),
+booting both a custom `vmlinux` and Ubuntu's stock kernel with the module from
+DKMS.

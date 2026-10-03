@@ -10,7 +10,7 @@ layout, so a layout change is made in one place.
 |---|---|
 | `/opt/conduit/bin/conduit` | the CLI |
 | `/opt/conduit/bin/conduit-backend` | GPU backend (static musl in release builds) |
-| `/opt/conduit/bin/conduit-userspace` | userspace backend tool (`nvgpu-userspace`, same crate) |
+| `/opt/conduit/bin/conduit-userspace` | userspace backend tool (`conduit-userspace`, same crate) |
 | `/opt/conduit/bin/conduit-viewer` | Wayland/X11 viewer |
 | `/opt/conduit/bin/conduit-vmm` | built-in VM runner (static musl in release builds) |
 | `/opt/conduit/bin/qemu-system-x86_64`, `share/qemu/` | bundled QEMU 11.1 |
@@ -79,8 +79,8 @@ alike). That is why each format is built in its own distribution's container.
 These are assumptions the packaging makes. Change them here and in
 `build.sh` together.
 
-**Binary names.** `build.sh` (top) and `flake.nix` hold the upstream names as
-variables: `BACKEND_BIN_SRC=conduit-backend` (cargo package `device`,
+**Binary names.** `build.sh` (top) and `flake.nix` hold the cargo/make output names
+as variables: `BACKEND_BIN_SRC=conduit-backend` (cargo package `device`,
 feature `vhost-user`), `VIEWER_BIN_SRC=conduit-viewer`,
 `VMM_BIN_SRC=conduit-vmm` (built with `--no-default-features`),
 `CLI_BIN_SRC=conduit`. When a component is renamed, change the variable;
@@ -104,9 +104,8 @@ these. The desktop entry runs `conduit view` with no argument, which should
 open the default (or only) VM.
 
 **Rust toolchain.** `rust-toolchain.toml` at the repo root pins 1.90.0 with
-the gnu and musl targets for all three Rust projects. Delete any
-`rust-toolchain.toml` imported into a subdirectory (nesbox has one), or it
-wins over the root file.
+the gnu and musl targets for all Rust projects. Don't add a
+`rust-toolchain.toml` in a subdirectory: it would win over the root file.
 
 ## AppArmor (Ubuntu, Debian, openSUSE)
 
@@ -205,14 +204,8 @@ QEMU expression (switched to the 11.1.2 tarball when nixpkgs is older, plus
 `dist/` (all build output) and `host/qemu/{src,build,build.log}` (local QEMU
 builds) belong in `.gitignore`.
 
-## Not yet verified
+## Not covered by CI
 
-Checked locally: `build.sh stage/bundle-libs/package` for all formats with
-stand-in binaries (nfpm 2.41), the DKMS package installing, building against
-Ubuntu 24.04 headers and removing cleanly, the tarball install/uninstall
-round trip, actionlint, shellcheck, `nix-instantiate --parse flake.nix`.
-
-Not run yet (most component sources were not in the tree when this was written): the real Rust,
-viewer and QEMU builds, musl static linking of the backend and VMM, the CI
-jobs themselves, `rpmbuild` of the specs, `makepkg`, `nix build`, the
-AppArmor and SELinux rules against a real libvirt VM.
+CI and `release.yml` build and package every format, but do not run
+`nix build` or exercise the AppArmor and SELinux rules against a real libvirt
+VM; check those by hand when they change.

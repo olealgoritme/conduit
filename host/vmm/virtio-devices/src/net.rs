@@ -56,7 +56,7 @@ const CONFIG_SIZE: u32 = 6;
 /// How to set up the guest's network link.
 #[derive(Clone, Debug)]
 pub struct NetConfig {
-    /// Tap interface to open. Exact -- the host created it, so nesbox is not
+    /// Tap interface to open. Exact -- the host created it, so conduit-vmm is not
     /// choosing the name.
     pub tap_name: String,
     /// Guest MAC. Generated if absent.

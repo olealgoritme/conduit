@@ -168,10 +168,10 @@ impl Tool {
             ),
             Tool::Viewer => (&["bin/conduit-viewer"], &["host/viewer/conduit-viewer"]),
             Tool::Userspace => (
-                &["bin/conduit-userspace", "bin/nvgpu-userspace"],
+                &["bin/conduit-userspace"],
                 &[
-                    "target/release/nvgpu-userspace",
-                    "host/backend/target/release/nvgpu-userspace",
+                    "target/release/conduit-userspace",
+                    "host/backend/target/release/conduit-userspace",
                 ],
             ),
             // In a checkout: `packaging/build.sh package guest-deb` (newest wins, below).

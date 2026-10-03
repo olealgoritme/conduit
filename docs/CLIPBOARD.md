@@ -34,7 +34,7 @@ guest app ─copy─► guest clipboard ──► agent ── /dev/conduit-clip
 Who decides: the **viewer** (`--clipboard`), from host state only. The backend
 and the guest move bytes; neither can widen the policy.
 
-## Rules
+## Behaviour
 
 - **Host → VM is pushed, not pulled.** The viewer sends the host clipboard on
   focus-in and whenever it changes while the window is focused. That is exactly
@@ -53,7 +53,7 @@ and the guest move bytes; neither can widen the policy.
 
 ## Wire formats
 
-Guest ↔ backend (`protocol/src/messages.rs`, `guest/linux/nvgpu_clipboard.h`):
+Guest ↔ backend (`host/backend/protocol/src/messages.rs`, `guest/linux/nvgpu_clipboard.h`):
 
 | value | name | direction | queue |
 |---|---|---|---|

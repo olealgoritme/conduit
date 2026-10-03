@@ -191,7 +191,7 @@ pub fn serve(path: PathBuf, source: StatsSource) -> Result<()> {
     log::info!("stats: serving on {path:?}");
 
     std::thread::Builder::new()
-        .name("nesbox-stats".into())
+        .name("conduit-vmm-stats".into())
         .spawn(move || {
             for stream in listener.incoming() {
                 match stream {

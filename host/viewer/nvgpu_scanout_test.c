@@ -2,7 +2,7 @@
 /*
  * nvgpu_scanout_test.c -- standalone producer for the virtio-nvgpu viewer.
  *
- * Stands in for the vhost-user-nvgpu backend WITHOUT a VM: allocates a ring of
+ * Stands in for the conduit-backend backend WITHOUT a VM: allocates a ring of
  * GBM buffers on the host GPU (default /dev/dri/renderD128), renders a moving
  * pattern into them ON THE GPU (EGL/GLES2, so NVIDIA block-linear buffers work
  * -- gbm_bo_map cannot write those), exports each as a dma-buf ONCE and streams

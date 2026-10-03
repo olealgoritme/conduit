@@ -1,27 +1,26 @@
-# Zero-copy scanout: the contract
+# Zero-copy scanout
 
-Goal: the guest's desktop appears in a window on the host's Wayland desktop
-(Hyprland), at the guest's refresh rate (240 Hz target), with **no copy and no
-compression**. The guest's framebuffers already live in host VRAM (every guest
+The guest's desktop appears in a window on the host's Wayland desktop at the
+guest's refresh rate (tested at 240 Hz), with **no copy and no compression**. The guest's framebuffers already live in host VRAM (every guest
 GEM object is a proxy for a host GEM object), so the host displays the very
 same memory.
 
 ```
-guest compositor ──atomic commit──► guest KMS (driver/, virtual CRTC+plane+connector)
+guest compositor ──atomic commit──► guest KMS (guest/linux/, virtual CRTC+plane+connector)
                                        │ ScanoutFlip{owner_handle, host_handle, fourcc, modifier, stride, ...}
                                        ▼ control queue
-                                 backend (device/)  ── PRIME_HANDLE_TO_FD on the owner's host drm fd ──► dma-buf fd
+                                 backend (host/backend/device/)  ── PRIME_HANDLE_TO_FD on the owner's host drm fd ──► dma-buf fd
                                        │ unix socket, nvkvm broker wire protocol (SCM_RIGHTS)
                                        ▼
-                                 viewer = nvkvm-pv broker (host/broker/), Wayland zwp_linux_dmabuf_v1 window
+                                 viewer = conduit-viewer (host/viewer/), Wayland zwp_linux_dmabuf_v1 window
                                        │ keyboard / mouse events back over the same socket
                                        ▼
-                                 backend ──InputEvent on the event queue──► guest input_dev (driver/)
+                                 backend ──InputEvent on the event queue──► guest input_dev (guest/linux/)
 ```
 
-## Guest ↔ backend messages (protocol/src/messages.rs; mirrored in driver/)
+## Guest ↔ backend messages (host/backend/protocol/src/messages.rs; mirrored in guest/linux/)
 
-All little-endian, `#[repr(C)]`, after the existing message header. New
+All little-endian, `#[repr(C)]`, after the common message header. Display
 `MsgType` values:
 
 | value | name | direction | queue |
@@ -75,13 +74,13 @@ struct cursor_update {         /* 64 bytes */
 Device config gains the preferred mode, set by the backend's
 `--display WxH@HZ` (default 2560x1440@240), read by the guest at probe:
 `u32 display_width, display_height, display_refresh_hz` appended after the
-existing config fields (feature-gated by a new config flag bit
-`NVGPU_CFG_DISPLAY = 1<<8`; absent → no KMS, behaviour as before). This is the
+other config fields (gated by the config flag bit `NVGPU_CFG_DISPLAY = 1<<8`;
+absent → no KMS). This is the
 **configured mode**: what the guest boots with and what "restore" means below.
 
 `NVGPU_CFG_CURSOR = 1<<9` (backend `--display-cursor on`, the default) gives
 the head a cursor plane; without it there is none and the guest compositor
-draws the cursor into its frames, as before.
+draws the cursor into its frames.
 
 ## Dynamic resolution
 
@@ -94,19 +93,19 @@ viewer window/fullscreen change ──EV_MODE_HINT──► backend ModePolicy �
 - **Who decides**: the viewer, from host state only (window, output, the
   user's `--resize` choice) — never from a guest frame, so there is no loop.
   - fullscreen → the output's exact mode in buffer pixels (fractional scale
-    applied, here 5120x1440@240), immediately: covering the output 1:1 is the
+    applied, e.g. 5120x1440@240), immediately: covering the output 1:1 is the
     compositor's condition for direct scanout;
-  - windowed, `--resize=scale` (default) → "restore": the configured mode; the
-    viewer fits the **whole** guest picture into whatever window the tiling WM
-    gives (aspect kept, black bars, never cropped or stretched);
-  - windowed, `--resize=guest` (CTRL+ALT+R toggles) → the window's own size,
-    debounced 150 ms after the last configure of a drag.
-- **Backend** (`device/src/display.rs` `ModePolicy`): turns the hint into a
+  - windowed, `--resize=guest` (default) → the window's own size, debounced
+    150 ms after the last configure of a drag;
+  - windowed, `--resize=scale` (CTRL+ALT+R toggles) → "restore": the
+    configured mode; the viewer fits the **whole** guest picture into whatever
+    window the WM gives (aspect kept, black bars, never cropped or stretched).
+- **Backend** (`host/backend/device/src/display.rs` `ModePolicy`): turns the hint into a
   `DisplayMode` event, only when it differs from the last one (initially the
   configured mode). `0x0` = configured mode, refresh 0 = configured rate. A
-  broker without `CAP_MODE_HINTS` gets the old rule: an `EV_SURFACE` flagged
+  broker without `CAP_MODE_HINTS` gets the fallback rule: an `EV_SURFACE` flagged
   fullscreen is the output's mode, a windowed one means restore.
-- **Guest** (`driver/nvgpu_kms.h`): the event-queue interrupt records the mode,
+- **Guest** (`guest/linux/nvgpu_kms.h`): the event-queue interrupt records the mode,
   a work item makes it the connector's preferred mode (the configured mode
   stays in the list) and fires `drm_kms_helper_hotplug_event`. The connector
   carries `hotplug_mode_update = 1` and `suggested X/Y = 0` (as vmwgfx/qxl),
@@ -129,7 +128,7 @@ guest cursor plane commit ──CursorUpdate{owner,handle,hot}──► backend 
 - The plane takes ARGB8888 LINEAR up to 256x256 (`DRM_CAP_CURSOR_WIDTH` 256)
   and the driver sets `DRIVER_CURSOR_HOTSPOT`: atomic compositors must declare
   `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` to see it (mutter 46+, wlroots 0.18+);
-  others get no cursor plane and draw their own, exactly as before.
+  others get no cursor plane and draw their own.
 - `CursorUpdate` is sent when the framebuffer (GEM identity, size, pitch),
   hotspot or visibility changes — **never for a move**. The host pointer
   positions the cursor itself, so it moves at host rate with zero guest
@@ -147,13 +146,13 @@ guest cursor plane commit ──CursorUpdate{owner,handle,hot}──► backend 
 
 The backend connects to the broker socket given by `--display-socket PATH`
 and speaks the nvkvm broker wire protocol
-(`host/broker/common/nvkvm_broker_proto.h`, version 2): one dma-buf per distinct
+(`host/viewer/common/nvkvm_broker_proto.h`, version 2): one dma-buf per distinct
 `(owner_handle, host_handle)`, exported once and cached, then frame/flip
 messages referencing it. Input from the broker is turned into `InputEvent`
 batches, mode hints into `DisplayMode`. A dead or absent broker never blocks
 the guest: flips are acked and dropped.
 
-virtio-nvgpu additions to the broker protocol — capabilities and appended
+Conduit additions to the broker protocol — capabilities and appended
 types, no version bump; record sizes unchanged:
 
 | what | direction | meaning |
@@ -164,14 +163,14 @@ types, no version bump; record sizes unchanged:
 | `CMD_CURSOR` = 7 | backend → broker | with a dma-buf fd: the cursor image (ATTACH's fields, ≤256², AR24, `seq` = hot_x \| hot_y<<16); without: hide, all fields 0 |
 | `CMD_CAPS` width bit `CLIENT_SEQ_USEC` (1<<1) | backend → broker | ATTACH/COMMIT `seq` is the backend's CLOCK_MONOTONIC µs at the flip (lets the viewer measure flip → screen) |
 
-## Viewer (host/broker, Wayland backend)
+## Viewer (host/viewer, Wayland backend)
 
 - Default windowed behaviour: the whole guest picture fitted with aspect. The
   main surface always covers the whole window (exact fit: it carries the guest
   buffer; letterbox: it is a black backdrop and the guest buffer sits on a
   subsurface). Hyprland crops a main surface by the window geometry, so a
-  picture surface smaller than the window rendered smeared edge columns and let
-  the desktop show through — that layout is gone.
+  picture surface smaller than the window would show smeared edge columns and
+  the desktop behind it.
 - Frame timing is always in the window title (~2/s): mode, fps, frame time
   avg/p99, flip→commit, commit→screen, DIRECT/COMPOSITED (from
   `wp_presentation` ZERO_COPY). The stats overlay (CTRL+ALT+O, `--overlay=
@@ -182,7 +181,7 @@ types, no version bump; record sizes unchanged:
   the guest asked again for the output's exact mode, `--direct-hook CMD` run as
   `CMD on|off`. Off: overlay per `--overlay`, tearing VSYNC.
 
-## Rules
+## Invariants
 
 - No CPU copy anywhere. If an import fails, log and drop the frame; never fall
   back to readback.

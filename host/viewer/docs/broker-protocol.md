@@ -1,12 +1,13 @@
 # nvkvm display broker — wire protocol
 
+> Origin: nvkvm-pv's `docs/reference/broker-protocol.md` (see `../NOTICE`),
+> kept as the reference for the socket between `conduit-backend` /
+> `conduit-stream` and `conduit-viewer`. Paths below are upstream's; in
+> Conduit the header is `host/viewer/common/nvkvm_broker_proto.h`.
+
 Reference for anyone implementing or auditing either side of the broker
 socket.  Both structures are fixed-size and byte-exact; a mismatch is a
 protocol violation and ends the connection rather than being negotiated.
-
-For what the broker is and how to run it, see
-[`src/broker/README.md`](../../src/broker/README.md).  For why it is shaped
-this way, see [`../internal/broker-design.md`](../internal/broker-design.md).
 
 ## 4. Wire protocol
 
@@ -75,7 +76,7 @@ Capability bits in `HELLO.w1`: `KEYBOARD`, `ABS_POINTER`, `REL_POINTER`,
 `POINTER_LOCK`, `TOTAL_GRAB`, `FOCUS_EVENTS`, `FULLSCREEN`, `DMABUF`,
 `MODIFIERS`, `RELEASE`.
 
-### virtio-nvgpu additions (capabilities, no version bump)
+### Conduit additions (capabilities, no version bump)
 
 | | |
 |---|---|

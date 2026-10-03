@@ -7,7 +7,7 @@
 //! -- so N guests streaming the same size of working set cost N times the host
 //! RAM for it, and a `io.max` cgroup bound on the VM stops meaning anything the
 //! moment the host has the image cached (measured: a capped guest ran 35x
-//! faster than an uncapped one with a cold cache; `docs/BENCHMARKS.md` §12.2).
+//! faster than an uncapped one with a cold cache).
 //!
 //! It is not free to ask for. Direct I/O requires every buffer address, file
 //! offset and length to be aligned, and what to is a property of the file and
@@ -312,7 +312,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str, bytes: usize) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("nesbox-blk-tests");
+        let dir = std::env::temp_dir().join("conduit-vmm-blk-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{name}-{}", std::process::id()));
         std::fs::write(&path, vec![0u8; bytes]).unwrap();

@@ -65,7 +65,7 @@ const QUEUE_COUNT: usize = NUM_QUEUES;
 const RESP_MAX: usize = 64 * 1024;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "vhost-user backend for virtio-nvgpu")]
+#[command(version, about = "Conduit GPU backend (vhost-user)")]
 struct Args {
     /// Unix socket QEMU connects to.
     #[arg(long, default_value = "/tmp/nvgpu.sock")]
@@ -154,7 +154,7 @@ struct VhostWindow(Backend);
 
 /// Set once the frontend asks for `GET_SHMEM_CONFIG`: a spec frontend (QEMU
 /// >= 11.1) that lays the regions out and picks mapping addresses itself.
-/// nesbox never asks. One process serves one VM, and a device reset keeps
+/// conduit-vmm never asks. One process serves one VM, and a device reset keeps
 /// the same frontend, so this is never cleared.
 static SPEC_SHMEM_FRONTEND: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -874,7 +874,7 @@ impl VhostUserBackendMut for NvGpuBackend {
 
     /// The regions a frontend lays out for us: QEMU >= 11.1 asks, because
     /// SHMEM is offered, and refuses the device if this goes unanswered.
-    /// nesbox never asks; it has the same two sizes built in.
+    /// conduit-vmm never asks; it has the same two sizes built in.
     fn get_shmem_config(&self) -> std::io::Result<VhostUserShMemConfig> {
         SPEC_SHMEM_FRONTEND.store(true, std::sync::atomic::Ordering::Relaxed);
         let window = self.nvidia.lock().expect("backend mutex").shm_total_size();
@@ -1025,7 +1025,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     log::info!(
-        "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}, caps {}, {}",
+        "conduit-backend: device id {VIRTIO_ID_GPU_NV}, socket {}, caps {}, {}",
         args.socket,
         args.caps,
         match args.vram_limit_mib {
@@ -1080,7 +1080,7 @@ fn main() -> anyhow::Result<()> {
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.
     let mut daemon = VhostUserDaemon::new(
-        "virtio-nvgpu".to_string(),
+        "conduit-backend".to_string(),
         backend.clone(),
         GuestMemoryAtomic::new(GuestMemoryMmap::new()),
     )

@@ -1,10 +1,10 @@
 #!/bin/bash
-# run-viewer.sh -- start the virtio-nvgpu zero-copy scanout viewer (the
+# run-viewer.sh -- start the Conduit zero-copy scanout viewer (the
 # vendored nvkvm display broker) in the current Wayland session.
 #
-#   host/broker/run-viewer.sh                 # listen on $NVGPU_DISPLAY_SOCK
+#   host/viewer/run-viewer.sh                 # listen on $NVGPU_DISPLAY_SOCK
 #   NVGPU_VIEWER_FULLSCREEN=1 run-viewer.sh   # start fullscreen
-#   NVGPU_VIEWER_RESIZE=guest run-viewer.sh   # guest mode follows the window
+#   NVGPU_VIEWER_RESIZE=scale run-viewer.sh   # keep the guest mode, scale it
 #   NVGPU_VIEWER_DIRECT=1 run-viewer.sh       # start in direct mode
 #   run-viewer.sh --overlay=windowed          # extra args go to the broker
 #
@@ -26,13 +26,13 @@ if [ -S "$SOCK" ] && ! fuser -s "$SOCK" 2>/dev/null; then rm -f "$SOCK"; fi
 ARGS=(--backend wayland
       --socket "$SOCK"
       --size "$SIZE"
-      --title "virtio-nvgpu"
+      --title "conduit"
       --present-mode=native      # zero-copy or a loud dropped frame; never shm
       --scale aspect
       --persist                  # survive backend/VM restarts
       --stats)
 [ "${NVGPU_VIEWER_FULLSCREEN:-0}" = 1 ] && ARGS+=(--fullscreen)
-ARGS+=(--resize="${NVGPU_VIEWER_RESIZE:-scale}")
+ARGS+=(--resize="${NVGPU_VIEWER_RESIZE:-guest}")
 [ "${NVGPU_VIEWER_DIRECT:-0}" = 1 ] && ARGS+=(--direct-mode=on)
 [ -n "${NVGPU_VIEWER_DIRECT_HOOK:-}" ] && ARGS+=(--direct-hook "$NVGPU_VIEWER_DIRECT_HOOK")
 

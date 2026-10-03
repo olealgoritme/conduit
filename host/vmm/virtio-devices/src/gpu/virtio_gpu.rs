@@ -583,7 +583,7 @@ impl VirtioGpu {
             // window into freed host memory.
             if self.withdraw_mapping(&resource, guest_addr).is_err() {
                 log::error!(
-                    "NESBOX_GPU: unref_resource: resource {resource_id} at {guest_addr:#x} \
+                    "virtio-gpu: unref_resource: resource {resource_id} at {guest_addr:#x} \
                      would not unmap, refusing the unref"
                 );
                 self.resources.insert(resource_id, resource);
@@ -594,7 +594,7 @@ impl VirtioGpu {
                     // As in `resource_unmap_blob`: worth knowing about, not
                     // worth abandoning the rest of the teardown over.
                     log::warn!(
-                        "NESBOX_GPU: unref_resource: virglrenderer kept resource \
+                        "virtio-gpu: unref_resource: virglrenderer kept resource \
                          {resource_id} mapped: {e:?}"
                     );
                 }
@@ -677,14 +677,14 @@ impl VirtioGpu {
         let capset = self.rutabaga.get_capset(capset_id, version)?;
         if capset_id == 6 {
             log::info!(
-                "NESBOX_GPU: DRM capset {} bytes, first 24: {:02x?}",
+                "virtio-gpu: DRM capset {} bytes, first 24: {:02x?}",
                 capset.len(),
                 &capset[..capset.len().min(24)]
             );
             if capset.len() >= 20 {
                 let ct = u32::from_le_bytes([capset[16], capset[17], capset[18], capset[19]]);
                 log::info!(
-                    "NESBOX_GPU: DRM capset context_type={} (1=msm, 2=amdgpu, 3=i915)",
+                    "virtio-gpu: DRM capset context_type={} (1=msm, 2=amdgpu, 3=i915)",
                     ct
                 );
             }
@@ -703,7 +703,7 @@ impl VirtioGpu {
         context_name: Option<&str>,
     ) -> VirtioGpuResult {
         log::info!(
-            "NESBOX_GPU: create_context ctx_id={} context_init={:#x} ({:#b}) name={:?}",
+            "virtio-gpu: create_context ctx_id={} context_init={:#x} ({:#b}) name={:?}",
             ctx_id,
             context_init,
             context_init,
@@ -714,14 +714,14 @@ impl VirtioGpu {
             .create_context(ctx_id, context_init, context_name)
         {
             Ok(_) => {
-                log::info!("NESBOX_GPU: create_context succeeded");
+                log::info!("virtio-gpu: create_context succeeded");
                 if let Some(vram) = self.vram.as_mut() {
                     vram.note_context(ctx_id, context_init);
                 }
                 Ok(GpuResponse::OkNoData)
             }
             Err(e) => {
-                log::error!("NESBOX_GPU: create_context FAILED: {:?}", e);
+                log::error!("virtio-gpu: create_context FAILED: {:?}", e);
                 Err(GpuResponse::ErrUnspec)
             }
         }
@@ -778,7 +778,7 @@ impl VirtioGpu {
         self.metrics.counters.submit.since(at);
         submitted.map_err(|e| {
             GpuCounters::inc(&self.metrics.counters.submits_failed);
-            log::error!("NESBOX_GPU: submit_command FAILED ctx={} : {:?}", ctx_id, e);
+            log::error!("virtio-gpu: submit_command FAILED ctx={} : {:?}", ctx_id, e);
             ErrUnspec
         })?;
         Ok(OkNoData)
@@ -875,7 +875,7 @@ impl VirtioGpu {
         offset: u64,
     ) -> VirtioGpuResult {
         let resource = self.resources.get(&resource_id).ok_or_else(|| {
-            log::error!("NESBOX_GPU: map_blob: resource {resource_id} not found");
+            log::error!("virtio-gpu: map_blob: resource {resource_id} not found");
             ErrInvalidResourceId
         })?;
         let res_size = resource.size;
@@ -896,7 +896,7 @@ impl VirtioGpu {
         // add. The guest must unmap before it maps again.
         if let Some(existing) = resource.shmem_offset {
             log::warn!(
-                "NESBOX_GPU: map_blob: resource {resource_id} is already mapped at \
+                "virtio-gpu: map_blob: resource {resource_id} is already mapped at \
                  offset {existing:#x}; refusing to map it again at {offset:#x}"
             );
             return Err(ErrUnspec);
@@ -908,7 +908,7 @@ impl VirtioGpu {
         // reports as a failed buffer map.
         if let Err(why) = self.window.try_map(res_size) {
             log::warn!(
-                "NESBOX_GPU: map_blob: refusing resource {resource_id}: {why} -- {}",
+                "virtio-gpu: map_blob: refusing resource {resource_id}: {why} -- {}",
                 self.window.summary()
             );
             return Err(ErrUnspec);
@@ -918,7 +918,7 @@ impl VirtioGpu {
             Ok(i) => i,
             Err(e) => {
                 self.window.release(res_size);
-                log::error!("NESBOX_GPU: map_blob: map_info failed: {e:?}");
+                log::error!("virtio-gpu: map_blob: map_info failed: {e:?}");
                 return Err(ErrUnspec);
             }
         };
@@ -926,7 +926,7 @@ impl VirtioGpu {
         if offset.saturating_add(res_size) > shm_region.size as u64 {
             self.window.release(res_size);
             log::error!(
-                "NESBOX_GPU: map_blob: {res_size:#x} bytes at offset {offset:#x} does not \
+                "virtio-gpu: map_blob: {res_size:#x} bytes at offset {offset:#x} does not \
                  fit the {:#x}-byte window",
                 shm_region.size
             );
@@ -964,7 +964,7 @@ impl VirtioGpu {
                     }
                     err => {
                         log::warn!(
-                            "NESBOX_GPU: map_blob: placing resource {resource_id} at \
+                            "virtio-gpu: map_blob: placing resource {resource_id} at \
                              {host:#x} failed ({err}); falling back to its own slot"
                         );
                         GpuCounters::inc(&self.metrics.counters.place_refused);
@@ -990,7 +990,7 @@ impl VirtioGpu {
                 Err(e) => {
                     self.window.release(res_size);
                     log::error!(
-                        "NESBOX_GPU: map_blob: resource {resource_id} would not map: {e:?}"
+                        "virtio-gpu: map_blob: resource {resource_id} would not map: {e:?}"
                     );
                     return Err(ErrUnspec);
                 }
@@ -998,7 +998,7 @@ impl VirtioGpu {
 
             if mapping.size < res_size {
                 log::error!(
-                    "NESBOX_GPU: map_blob: resource {resource_id} mapped {:#x} bytes, \
+                    "virtio-gpu: map_blob: resource {resource_id} mapped {:#x} bytes, \
                      short of the {res_size:#x} the guest expects",
                     mapping.size
                 );
@@ -1012,7 +1012,7 @@ impl VirtioGpu {
             self.metrics.counters.kvm_map.since(at);
             if let Err(err) = published {
                 log::error!(
-                    "NESBOX_GPU: map_blob: could not publish {:#x} bytes at guest \
+                    "virtio-gpu: map_blob: could not publish {:#x} bytes at guest \
                      {guest_addr:#x}: {err:#}",
                     mapping.size
                 );
@@ -1055,7 +1055,7 @@ impl VirtioGpu {
             let withdrawn = self.mapper.withdraw(guest_addr, resource.size);
             self.metrics.counters.placed_withdraw.since(at);
             return withdrawn.map_err(|err| {
-                log::error!("NESBOX_GPU: withdrawing {guest_addr:#x}: {err:#}");
+                log::error!("virtio-gpu: withdrawing {guest_addr:#x}: {err:#}");
             });
         }
 
@@ -1063,7 +1063,7 @@ impl VirtioGpu {
         let removed = self.mapper.unmap(guest_addr, resource.size);
         self.metrics.counters.kvm_unmap.since(at);
         removed.map_err(|err| {
-            log::error!("NESBOX_GPU: unmapping {guest_addr:#x}: {err:#}");
+            log::error!("virtio-gpu: unmapping {guest_addr:#x}: {err:#}");
         })
     }
 
@@ -1096,7 +1096,7 @@ impl VirtioGpu {
             self.metrics.counters.rutabaga_unmap.since(at);
             if let Err(e) = released {
                 log::warn!(
-                    "NESBOX_GPU: unmap_blob: virglrenderer kept resource {resource_id} mapped: {e:?}"
+                    "virtio-gpu: unmap_blob: virglrenderer kept resource {resource_id} mapped: {e:?}"
                 );
             }
         }

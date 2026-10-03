@@ -6,7 +6,7 @@
 # exported as dma-bufs once) for a few seconds, then stops both and prints the
 # per-second fps / latency lines from each side.
 #
-#   bash host/broker/test-standalone.sh [SECONDS] [HZ] [WxH]
+#   bash host/viewer/test-standalone.sh [SECONDS] [HZ] [WxH]
 #   NVGPU_TEST_LINEAR=1 ...     use LINEAR buffers instead of block-linear
 #   NVGPU_TEST_FULLSCREEN=1 ... start the viewer fullscreen (direct scanout /
 #                               tearing only happen fullscreen)
@@ -23,7 +23,7 @@ make -C "$DIR" >/dev/null || exit 1
 [ -n "${WAYLAND_DISPLAY:-}" ] || { echo "WAYLAND_DISPLAY not set" >&2; exit 1; }
 HYPR_PID="$(pgrep -x Hyprland | head -1 || true)"
 
-VARGS=(--backend wayland --socket "$SOCK" --size "$SIZE" --title "virtio-nvgpu test"
+VARGS=(--backend wayland --socket "$SOCK" --size "$SIZE" --title "conduit test"
        --present-mode=native --stats --seq-usec)
 [ "${NVGPU_TEST_FULLSCREEN:-0}" = 1 ] && VARGS+=(--fullscreen)
 "$DIR/conduit-viewer" "${VARGS[@]}" >"$OUT/viewer.log" 2>&1 &

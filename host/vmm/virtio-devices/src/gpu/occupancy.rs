@@ -156,7 +156,7 @@ amd-evicted-vram:\t0 KiB
 
     #[test]
     fn parses_a_real_amdgpu_client() {
-        let p = write_tmp("nesbox-fdinfo-real", REAL);
+        let p = write_tmp("conduit-vmm-fdinfo-real", REAL);
         let o = OccupancyReader::parse(&p).expect("should recognise a DRM client");
         assert_eq!(o.gfx_ns, 48_123_456_789);
         assert_eq!(o.requested_vram_bytes, 37584 * 1024);
@@ -168,14 +168,17 @@ amd-evicted-vram:\t0 KiB
     fn a_non_drm_fd_is_not_mistaken_for_one() {
         // A socket's fdinfo. Without the engine counter there is nothing to
         // report, and reporting zeroes would look like an idle GPU.
-        let p = write_tmp("nesbox-fdinfo-sock", "pos:\t0\nflags:\t02\nmnt_id:\t9\n");
+        let p = write_tmp(
+            "conduit-vmm-fdinfo-sock",
+            "pos:\t0\nflags:\t02\nmnt_id:\t9\n",
+        );
         assert!(OccupancyReader::parse(&p).is_none());
     }
 
     #[test]
     fn eviction_is_carried_through() {
         let body = REAL.replace("amd-evicted-vram:\t0 KiB", "amd-evicted-vram:\t8192 KiB");
-        let p = write_tmp("nesbox-fdinfo-evict", &body);
+        let p = write_tmp("conduit-vmm-fdinfo-evict", &body);
         let o = OccupancyReader::parse(&p).unwrap();
         assert_eq!(o.evicted_vram_bytes, 8 * 1024 * 1024);
     }
@@ -194,7 +197,7 @@ amd-evicted-vram:\t0 KiB
         // Some DRM drivers report memory without per-engine time. Occupancy is
         // the point, so this is not a client we can meter.
         let body = REAL.replace("drm-engine-gfx:\t48123456789 ns\n", "");
-        let p = write_tmp("nesbox-fdinfo-nogfx", &body);
+        let p = write_tmp("conduit-vmm-fdinfo-nogfx", &body);
         assert!(OccupancyReader::parse(&p).is_none());
     }
 

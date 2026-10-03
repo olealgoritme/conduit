@@ -175,7 +175,7 @@ pub fn now() -> String {
         .unwrap_or_default()
 }
 
-/// The built-in VM runner's (conduit-vmm, from nesbox) JSON config.
+/// The built-in VM runner's (conduit-vmm) JSON config.
 pub fn vmm_config(c: &VmConfig, kernel: &Path, gpu_sock: &Path, share: &Path) -> serde_json::Value {
     let n = c.net();
     let mut args = String::from("console=hvc0 root=/dev/vda rw");

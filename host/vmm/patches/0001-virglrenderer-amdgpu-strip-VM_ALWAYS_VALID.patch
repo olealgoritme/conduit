@@ -6,7 +6,7 @@ index cf7f4f1..27285cd 100644
        goto alloc_failed;
     }
  
-+   /* NESTRI: strip AMDGPU_GEM_CREATE_VM_ALWAYS_VALID.
++   /* CONDUIT: strip AMDGPU_GEM_CREATE_VM_ALWAYS_VALID.
 +    *
 +    * amdgpu_gem_prime_export() returns -EPERM for any BO carrying this flag, so
 +    * such a BO can never be exported as a dmabuf. We cannot tell at GEM_NEW time

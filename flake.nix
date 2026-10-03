@@ -22,12 +22,11 @@
       pkgs = nixpkgs.legacyPackages.${system};
       lib = pkgs.lib;
 
-      version = "0.1.0+${self.shortRev or "dirty"}";
+      version = "${(builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version}+${self.shortRev or "dirty"}";
 
-      # Upstream binary names; change here when the components are renamed
-      # (same variables as packaging/build.sh).
+      # Cargo/make binary names (same variables as packaging/build.sh).
       backendBin = "conduit-backend";
-      userspaceBin = "nvgpu-userspace";
+      userspaceBin = "conduit-userspace";
       viewerBin = "conduit-viewer";
       vmmBin = "conduit-vmm";
 
@@ -45,9 +44,6 @@
         cargoLock.allowBuiltinFetchGit = true;
         buildFeatures = [ "vhost-user" ];
         cargoBuildFlags = [ "-p" "device" "--bin" backendBin "--bin" userspaceBin ];
-        postInstall = ''
-          mv $out/bin/${userspaceBin} $out/bin/conduit-userspace
-        '';
       };
 
       vmm = rustPkg {

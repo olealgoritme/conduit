@@ -714,7 +714,7 @@ mod seccomp {
 /// Returns what did not hold. Both halves matter: a sandbox that refuses what
 /// the backend needs is as much a defect as one that lets something through,
 /// so the allowed cases are checked too. This runs in the
-/// `nvgpu-sandbox-selftest` binary, a process of its own because [`enter`]
+/// `conduit-sandbox-selftest` binary, a process of its own because [`enter`]
 /// cannot be undone and must run single-threaded -- which a test harness,
 /// having a thread of its own, is not.
 ///

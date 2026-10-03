@@ -2,7 +2,7 @@
 //!
 //! `vram-limit-mib` is not enforced by this process. It is enforced inside
 //! virglrenderer, by `patches/0002-virglrenderer-amdgpu-per-guest-VRAM-budget.patch`,
-//! which reads `NESTRI_VRAM_LIMIT_MIB` from the environment — the VMM sets the
+//! which reads `CONDUIT_VRAM_LIMIT_MIB` from the environment — the VMM sets the
 //! variable and counts allocations, but the refusal happens in the renderer,
 //! because that is the only place with a channel that can tell a guest it was
 //! refused (see `virtio-devices/src/gpu/vram.rs`).
@@ -16,12 +16,12 @@
 //!
 //! **A limit that silently does not apply is worse than no limit**, because it
 //! is a limit you have stopped thinking about. So when the config asks for one,
-//! nesbox now refuses to start unless it can see the enforcing renderer.
+//! conduit-vmm now refuses to start unless it can see the enforcing renderer.
 //!
 //! # What the check actually proves, and what it does not
 //!
 //! It finds the `libvirglrenderer` the dynamic loader mapped into this process,
-//! reads it, and looks for the string `NESTRI_VRAM_LIMIT_MIB`. Only the patched
+//! reads it, and looks for the string `CONDUIT_VRAM_LIMIT_MIB`. Only the patched
 //! build reads that variable, so only the patched build contains the name of it.
 //!
 //! That is evidence, not proof. It shows the loaded library was built from a
@@ -38,7 +38,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// The name the patched renderer reads. Present in that build and no other.
-const BUDGET_MARKER: &[u8] = b"NESTRI_VRAM_LIMIT_MIB";
+const BUDGET_MARKER: &[u8] = b"CONDUIT_VRAM_LIMIT_MIB";
 
 /// What we could determine about the loaded renderer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +88,7 @@ fn loaded_renderer() -> Option<PathBuf> {
 ///
 /// It has to be: the test binary for this crate does not link virglrenderer at
 /// all — nothing in the library references a rutabaga symbol, so `--as-needed`
-/// drops it, even though the `nesbox` binary maps it. Asserting against whatever
+/// drops it, even though the `conduit-vmm` binary maps it. Asserting against whatever
 /// the test process happens to have loaded tests the harness, not the parser.
 fn find_renderer(maps: &str) -> Option<PathBuf> {
     maps.lines()
@@ -168,7 +168,7 @@ mod tests {
     /// parsing: an anonymous mapping with no path at all, `[heap]`, and a
     /// same-directory neighbour whose name merely starts the same way.
     const MAPS: &str = "\
-55a1c0000000-55a1c0002000 r--p 00000000 fe:02 1234567    /usr/bin/nesbox
+55a1c0000000-55a1c0002000 r--p 00000000 fe:02 1234567    /usr/bin/conduit-vmm
 7f21f4f41000-7f21f5000000 r-xp 00000000 fe:02 7654321    /home/w/artifacts/virgl-nvalid/lib/libvirglrenderer.so.1.11.0
 7f21f5000000-7f21f5001000 rw-p 00000000 00:00 0
 7f21f5100000-7f21f5200000 r-xp 00000000 fe:02 7654322    /usr/lib/libvirglrenderer-helper.so.1
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn a_file_without_the_marker_reads_as_not_enforcing() {
-        let dir = std::env::temp_dir().join(format!("nesbox-rend-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("conduit-vmm-rend-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let stock = dir.join("stock.so");
         std::fs::write(&stock, b"nothing interesting in here").unwrap();

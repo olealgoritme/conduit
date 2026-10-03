@@ -1,12 +1,12 @@
 [package]
-name = "nesbox-vmm"
-version = "0.3.0"
+name = "conduit-vmm"
+version.workspace = true
 edition = "2024"
 license = "Apache-2.0"
 
 [[bin]]
 name = "conduit-vmm"
-path = "src/bin/nesbox.rs"
+path = "src/main.rs"
 
 [dependencies]
 kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }

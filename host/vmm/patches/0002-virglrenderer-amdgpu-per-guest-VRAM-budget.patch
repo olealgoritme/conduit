@@ -7,7 +7,7 @@ device memory with AMDGPU_CCMD_GEM_NEW and the renderer calls amdgpu_bo_alloc on
 its behalf. Nothing between the guest and the card bounds how much it may ask
 for, so one guest can exhaust a card its neighbours are sharing.
 
-This adds a per-context budget from NESTRI_VRAM_LIMIT_MIB, in two parts:
+This adds a per-context budget from CONDUIT_VRAM_LIMIT_MIB, in two parts:
 
   * The three paths that tell a guest how much VRAM exists -- the shmem heap
     block, AMDGPU_INFO_MEMORY and AMDGPU_INFO_VRAM_GTT -- report the budget
@@ -45,7 +45,7 @@ guests for memory they never took from the card.
  
     struct hash_table_u64 *id_to_ctx;
  
-+   /* NESTRI: per-guest VRAM budget, from NESTRI_VRAM_LIMIT_MIB.
++   /* CONDUIT: per-guest VRAM budget, from CONDUIT_VRAM_LIMIT_MIB.
 +    *
 +    * Nothing between a native-context guest and the card bounds how much
 +    * device memory it may ask for, so one guest can exhaust a card its
@@ -73,7 +73,7 @@ guests for memory they never took from the card.
     bool has_metadata    :1;
     bool exported        :1;
     bool enable_cache_wc :1;
-+   /* NESTRI: this object's size is charged against ctx->vram_charged. */
++   /* CONDUIT: this object's size is charged against ctx->vram_charged. */
 +   bool holds_vram_budget :1;
  };
  DEFINE_CAST(drm_object, amdgpu_object)
@@ -82,7 +82,7 @@ guests for memory they never took from the card.
  
     print(2, "free obj res_id: %d", dobj->res_id);
  
-+   /* NESTRI: return the budget. drm_context_deinit() frees every object a
++   /* CONDUIT: return the budget. drm_context_deinit() frees every object a
 +    * context created, so this runs whether the guest unreffed the resource or
 +    * simply died.
 +    */
@@ -98,7 +98,7 @@ guests for memory they never took from the card.
                 amdgpu_device_get_fd(ctx->dev), args.out.addr_ptr);
  }
  
-+/* NESTRI: present the guest's budget as if it were the card's VRAM.
++/* CONDUIT: present the guest's budget as if it were the card's VRAM.
 + *
 + * Refusing an over-budget allocation contains the damage but cannot report it:
 + * the guest kernel's blob-create ioctl succeeds whatever the host did with the
@@ -119,14 +119,14 @@ guests for memory they never took from the card.
 + * VRAM use different 64-bit typedefs -- libdrm's uint64_t and the uapi's __u64 --
 + * which are distinct types to the compiler even where they are the same width.
 + */
-+#define NESTRI_CAP(field, cap)                                                   \
++#define CONDUIT_CAP(field, cap)                                                   \
 +   do {                                                                          \
 +      if ((field) > (cap))                                                       \
 +         (field) = (cap);                                                        \
 +   } while (0)
 +
 +/* This guest's VRAM window: how much it may hold, and how much it holds now. */
-+#define NESTRI_VRAM_WINDOW(ctx, lim, used)                                       \
++#define CONDUIT_VRAM_WINDOW(ctx, lim, used)                                       \
 +   uint64_t lim = (ctx)->vram_limit;                                             \
 +   uint64_t used = (ctx)->vram_charged < lim ? (ctx)->vram_charged : lim
 +
@@ -139,18 +139,18 @@ guests for memory they never took from the card.
                            &ctx->shmem->gtt);
 +
 +   if (ctx->vram_limit) {
-+      NESTRI_VRAM_WINDOW(ctx, lim, used);
++      CONDUIT_VRAM_WINDOW(ctx, lim, used);
 +      /* struct amdgpu_heap_info has no total/usable split. Usage is set to this
 +       * guest's own, not the card's: a guest told a heap it has barely touched
 +       * is nearly full will degrade itself for no reason.
 +       */
-+      NESTRI_CAP(ctx->shmem->vram.heap_size, lim);
++      CONDUIT_CAP(ctx->shmem->vram.heap_size, lim);
 +      ctx->shmem->vram.heap_usage = used;
-+      NESTRI_CAP(ctx->shmem->vram.max_allocation, lim - used);
++      CONDUIT_CAP(ctx->shmem->vram.max_allocation, lim - used);
 +
-+      NESTRI_CAP(ctx->shmem->vis_vram.heap_size, lim);
++      CONDUIT_CAP(ctx->shmem->vis_vram.heap_size, lim);
 +      ctx->shmem->vis_vram.heap_usage = used;
-+      NESTRI_CAP(ctx->shmem->vis_vram.max_allocation, lim - used);
++      CONDUIT_CAP(ctx->shmem->vis_vram.max_allocation, lim - used);
 +   }
  }
  
@@ -159,29 +159,29 @@ guests for memory they never took from the card.
              "ioctl error: fd: %d request.query: 0x%x r: %d|%d %s",
              amdgpu_device_get_fd(ctx->dev), request.query, rsp->hdr.ret, r, strerror(errno));
  
-+   /* NESTRI: clamp the two queries that tell the guest how much VRAM it has.
++   /* CONDUIT: clamp the two queries that tell the guest how much VRAM it has.
 +    * Short reads are the guest's business, but a partial struct must not be
 +    * rewritten as though it were whole.
 +    */
 +   if (r == 0 && ctx->vram_limit) {
-+      NESTRI_VRAM_WINDOW(ctx, lim, used);
++      CONDUIT_VRAM_WINDOW(ctx, lim, used);
 +      if (request.query == AMDGPU_INFO_MEMORY &&
 +          return_size >= sizeof(struct drm_amdgpu_memory_info)) {
 +         struct drm_amdgpu_memory_info *mi = value;
-+         NESTRI_CAP(mi->vram.total_heap_size, lim);
-+         NESTRI_CAP(mi->vram.usable_heap_size, lim);
++         CONDUIT_CAP(mi->vram.total_heap_size, lim);
++         CONDUIT_CAP(mi->vram.usable_heap_size, lim);
 +         mi->vram.heap_usage = used;
-+         NESTRI_CAP(mi->vram.max_allocation, lim - used);
++         CONDUIT_CAP(mi->vram.max_allocation, lim - used);
 +
-+         NESTRI_CAP(mi->cpu_accessible_vram.total_heap_size, lim);
-+         NESTRI_CAP(mi->cpu_accessible_vram.usable_heap_size, lim);
++         CONDUIT_CAP(mi->cpu_accessible_vram.total_heap_size, lim);
++         CONDUIT_CAP(mi->cpu_accessible_vram.usable_heap_size, lim);
 +         mi->cpu_accessible_vram.heap_usage = used;
-+         NESTRI_CAP(mi->cpu_accessible_vram.max_allocation, lim - used);
++         CONDUIT_CAP(mi->cpu_accessible_vram.max_allocation, lim - used);
 +      } else if (request.query == AMDGPU_INFO_VRAM_GTT &&
 +                 return_size >= sizeof(struct drm_amdgpu_info_vram_gtt)) {
 +         struct drm_amdgpu_info_vram_gtt *vg = value;
-+         NESTRI_CAP(vg->vram_size, lim);
-+         NESTRI_CAP(vg->vram_cpu_accessible_size, lim);
++         CONDUIT_CAP(vg->vram_size, lim);
++         CONDUIT_CAP(vg->vram_cpu_accessible_size, lim);
 +      }
 +   }
 +
@@ -192,7 +192,7 @@ guests for memory they never took from the card.
     const struct amdgpu_ccmd_gem_new_req *req = to_amdgpu_ccmd_gem_new_req(hdr);
     struct amdgpu_context *ctx = to_amdgpu_context(dctx);
     int ret = 0;
-+   /* NESTRI: declared before the first goto so the credit-back below cannot
++   /* CONDUIT: declared before the first goto so the credit-back below cannot
 +    * read it uninitialised on the validation failure paths.
 +    */
 +   bool charged_vram = false;
@@ -203,7 +203,7 @@ guests for memory they never took from the card.
      */
     uint64_t alloc_flags = req->r.flags & ~AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
  
-+   /* NESTRI: refuse allocations past this guest's VRAM budget. Only the VRAM
++   /* CONDUIT: refuse allocations past this guest's VRAM budget. Only the VRAM
 +    * heap is bounded here; GTT lives in host system memory, which is capped for
 +    * the whole VMM process by cgroups, and counting it twice would refuse
 +    * guests for memory they never took from the card.
@@ -237,7 +237,7 @@ guests for memory they never took from the card.
     amdgpu_bo_free(bo_handle);
  
  alloc_failed:
-+   /* NESTRI: an allocation that did not survive holds no budget. */
++   /* CONDUIT: an allocation that did not survive holds no budget. */
 +   if (charged_vram)
 +      ctx->vram_charged -= req->r.alloc_size;
 +
@@ -248,12 +248,12 @@ guests for memory they never took from the card.
     if (d)
        ctx->debug = atoi(d);
  
-+   /* NESTRI: per-guest VRAM budget. One VMM process serves one guest, so the
++   /* CONDUIT: per-guest VRAM budget. One VMM process serves one guest, so the
 +    * environment is the right scope for it. Absent or 0 means unbounded.
 +    */
 +   ctx->vram_limit = 0;
 +   ctx->vram_charged = 0;
-+   const char *vram_mib = getenv("NESTRI_VRAM_LIMIT_MIB");
++   const char *vram_mib = getenv("CONDUIT_VRAM_LIMIT_MIB");
 +   if (vram_mib) {
 +      char *end = NULL;
 +      unsigned long long mib = strtoull(vram_mib, &end, 10);
@@ -261,7 +261,7 @@ guests for memory they never took from the card.
 +         ctx->vram_limit = (uint64_t)mib << 20;
 +         print(0, "VRAM budget %llu MiB", mib);
 +      } else {
-+         print(0, "ignoring malformed NESTRI_VRAM_LIMIT_MIB=\"%s\"", vram_mib);
++         print(0, "ignoring malformed CONDUIT_VRAM_LIMIT_MIB=\"%s\"", vram_mib);
 +      }
 +   }
 +

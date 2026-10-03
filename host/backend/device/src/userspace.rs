@@ -1097,7 +1097,7 @@ mod tests {
     impl TempTree {
         fn new(files: &[&str]) -> Self {
             let base = std::env::temp_dir().join(format!(
-                "nvgpu-userspace-{}-{:?}",
+                "conduit-userspace-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));

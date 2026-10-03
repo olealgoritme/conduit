@@ -25,14 +25,14 @@
 #   QEMU_BUILD_SCRIPT  default host/qemu/build-qemu.sh, see "QEMU" in docs/PACKAGING.md
 #   JOBS               parallel build jobs (default: nproc)
 #
-# The upstream binary names are variables because the components are being
-# renamed; only these lines change when they are. Installed names are fixed.
+# Build-output binary names (cargo bins, make targets). Installed names are
+# fixed.
 set -euo pipefail
 
 BACKEND_BIN_SRC=${BACKEND_BIN_SRC:-conduit-backend}       # cargo bin name
 BACKEND_PKG=${BACKEND_PKG:-device}                         # cargo package that owns it
 BACKEND_FEATURES=${BACKEND_FEATURES:-vhost-user}
-USERSPACE_BIN_SRC=${USERSPACE_BIN_SRC:-nvgpu-userspace}   # -> conduit-userspace (same package)
+USERSPACE_BIN_SRC=${USERSPACE_BIN_SRC:-conduit-userspace} # same package as the backend
 VIEWER_BIN_SRC=${VIEWER_BIN_SRC:-conduit-viewer}          # Makefile target
 VMM_BIN_SRC=${VMM_BIN_SRC:-conduit-vmm}                    # cargo bin name
 CLI_BIN_SRC=${CLI_BIN_SRC:-conduit}                        # -> conduit

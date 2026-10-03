@@ -13,7 +13,7 @@
 //! way RM refuses an allocation it cannot back -- `NV_ERR_NO_MEMORY` in the
 //! caller's block, the ioctl itself succeeding -- so a guest over its limit
 //! fails exactly as a guest on a full card does. That is the same choice the
-//! DRM native-context path made in nesbox (`virtio-devices/src/gpu/vram.rs`):
+//! DRM native-context path made in conduit-vmm (`virtio-devices/src/gpu/vram.rs`):
 //! no failure mode the guest's driver has not already met.
 //!
 //! # What a charge lives as long as

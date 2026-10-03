@@ -1,7 +1,7 @@
 //! Where the VMM backs guest physical addresses with host memory.
 //!
 //! This lives outside `gpu` because both GPU devices need it and only one of
-//! them is always compiled in: `virtio-nvgpu` places its forwarded mappings in
+//! them is always compiled in: the Conduit GPU device places its forwarded mappings in
 //! the same shared window, and it must keep working in a build with no
 //! virglrenderer at all. The trait never mentions rutabaga; it only happens to
 //! have been written for it first.
@@ -11,7 +11,7 @@
 ///
 /// Resources are placed in the shared window -- blob resources by rutabaga on
 /// the virtio-gpu path, forwarded device memory by the backend on the
-/// virtio-nvgpu one -- and then read and written by the guest at full speed;
+/// Conduit GPU one -- and then read and written by the guest at full speed;
 /// going through an MMIO exit per access would defeat the entire point.
 /// Implemented by the VMM, which is the only part that holds the KVM handle.
 pub trait HostMemoryMapper: Send + Sync {

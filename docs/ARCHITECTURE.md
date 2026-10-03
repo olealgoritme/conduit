@@ -1,188 +1,114 @@
 # Architecture
 
-How a Linux VM gets an NVIDIA GPU while the host keeps the card.
+How a Linux VM uses the host's NVIDIA GPU while the host keeps using it.
 
-There's no code here. The code is in [`driver/`](driver/), [`device/`](device/)
-and [`protocol/`](protocol/).
-
-## The idea
-
-The guest runs NVIDIA's real user-mode driver: the real `libvulkan_nvidia.so`,
-the real NVENC, the real CUDA. That driver talks to the kernel through
-`/dev/nvidia*`. We only change what sits behind those device nodes.
+## Overview
 
 ```text
-Guest                                     Host
-────────────────────────────────          ──────────────────────────
-Application
-NVIDIA user-mode driver (unmodified)
-  │
-  │ ioctl / mmap on /dev/nvidia*
-  ▼
-virtio-nvgpu guest driver
-  │  copies the request, adds nothing
-  ▼
-  ═══ virtqueue ═══════════════════►      virtio-nvgpu backend
-                                            │  checks, then translates
-                                            │  handles, pointers and fds
-                                            ▼
-                                          host NVIDIA driver → GPU
+ Guest                                     Host
+ ─────────────────────────────────         ─────────────────────────────────────
+ app (Vulkan / GL / CUDA / NVENC)
+ NVIDIA user-mode driver, unmodified        (the host's own files, shared
+   │ ioctl / mmap on /dev/nvidia*            read-only over virtiofs)
+   ▼
+ virtio_gpu_nv.ko  (guest/linux)
+   │ virtio: control + event queue ─────►  conduit-backend (host/backend)
+   │ shared memory: window, UVM aperture      one per VM, sandboxed
+   │                                          │ checks, translates, calls
+ guest compositor → KMS flip ────────────►    ▼
+                                            host NVIDIA driver → GPU
+                                              │ scanout buffer as dma-buf
+                                              ▼
+                                            conduit-viewer  (Wayland window)
+                                         or conduit-stream  (Moonlight / network)
 ```
 
-Two things cross the boundary:
+The VM runner between guest and backend is the bundled QEMU 11.1 (default,
+`host/qemu`) or the built-in `conduit-vmm` (fallback, `host/vmm`). Both host
+the GPU device as a vhost-user frontend; the backend is the vhost-user
+backend. The `conduit` command (`cli/`) creates VMs, starts all processes and
+registers each VM with libvirt's user session.
 
-- **ioctls**, mostly while a device is being set up
-- **memory mappings**, set up once and then used directly
+## Guest module
 
-The work itself doesn't cross. The guest submits a frame by writing to memory
-it has already mapped, and that memory is the host's. Over 813,691 measured
-frames, the backend handled one message per 59 frames.
+The guest runs NVIDIA's real user-mode driver: Vulkan, OpenGL/EGL, CUDA,
+NVENC/NVDEC. Its userspace files are the host's own, staged by
+`conduit-userspace` and mounted read-only over virtiofs, because the forwarded
+ioctls are a private contract between one driver build's userspace and kernel
+module.
 
-## Why not Venus?
+`virtio_gpu_nv.ko` creates `/dev/nvidiactl`, `/dev/nvidia0..N`,
+`/dev/nvidia-uvm`, `/dev/nvidia-modeset` and a DRM device. It forwards each
+`ioctl()` and `mmap()` without interpreting RM calls, swaps guest file
+descriptors for backend handles, pins memory a process registers by address,
+and maps what the backend placed. It also provides a KMS display, input
+devices, a power key and `/dev/conduit-clipboard`. It is packaged with DKMS
+(`conduit-guest`).
 
-Venus forwards every Vulkan call. That means thousands of crossings per frame.
-The host owns the buffers, so a compositor in the guest can't track them. And
-the guest never holds a real GPU pointer, so it can't encode locally.
+## Backend
 
-Intel and AMD solve this with _DRM native context_: the guest runs the real
-driver and only submissions cross. NVIDIA has nothing like it, and outsiders
-can't build one because the user-mode driver is closed source.
+`conduit-backend` holds the real `/dev/nvidia*` descriptors for one VM. For
+each request it:
 
-NVIDIA does expose a **kernel ABI**, though. gVisor's `nvproxy` already
-forwards it, with Vulkan, CUDA and NVENC working. We do the same thing, but
-across a real VM boundary: a guest kernel module and a virtio transport.
+- checks it against the ABI table of the host's driver release
+  (`host/backend/gen`, generated from NVIDIA's open kernel modules and gVisor's
+  nvproxy) and the RM allowlist;
+- replaces what cannot cross unchanged: pointers (the backend supplies the
+  buffers), handles (translated to the owning file) and file descriptors;
+- makes the real call and returns the result.
 
-## The pieces
+Only setup crosses the queue. Work is submitted through memory both sides
+map: when the guest maps GPU memory, the backend maps it on the host and
+places it in the device's **window** (shared-memory region 1), which the guest
+maps into the process. CUDA semaphore pools and managed memory need a mapping
+at a fixed address, so they go into the **UVM aperture** (region 2, 32 GiB of
+address space, committed only as touched). Pinned host memory is registered as
+guest-physical page runs and mapped zero-copy. When a host descriptor becomes
+ready (GPU interrupt), the backend sends an event so the guest's `poll()` wakes.
 
-| piece        | where                  | what it does                                                                                                                                                                        |
-| ------------ | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| guest driver | `driver/` (GPL)        | Creates `/dev/nvidiactl`, `/dev/nvidia0…N`, `/dev/nvidia-uvm`, `/dev/nvidia-modeset` and a DRM render node. Copies requests across. Doesn't understand the ABI on purpose.          |
-| backend      | `device/` (Apache-2.0) | Holds the real host descriptors. Understands the ABI, decides what's allowed, translates, and makes the real calls. Depends on no VMM: a VMM plugs in by implementing a few traits. |
-| protocol     | `protocol/`            | The wire format, shared by both halves.                                                                                                                                             |
+See [SECURITY.md](SECURITY.md) for the sandbox and what is refused.
 
-The device has a **control queue** (requests and replies), an **event queue**
-(host to guest, for wakeups), and two shared memory regions: a **window** for
-GPU mappings and a **UVM aperture** for CUDA.
+## Display
 
-Each VM gets its own backend process which refuses to run as root, and
-locks itself down with seccomp and Landlock before it opens the GPU.
+The guest compositor flips through the module's KMS device. The backend
+exports the flipped buffer once as a dma-buf (`PRIME_HANDLE_TO_FD`) and sends
+it over a Unix socket (the broker protocol,
+`host/viewer/docs/broker-protocol.md`) to:
 
-## How a call travels
+- **`conduit-viewer`**, which hands it to the Wayland compositor with
+  `zwp_linux_dmabuf_v1`: no copy, and in fullscreen the compositor can scan it
+  out directly. Input, cursor, clipboard and mode hints (window size, refresh
+  rate) go back over the same socket.
+- **`conduit-stream`**, which takes the viewer's place on that socket, encodes
+  frames with NVENC and serves Moonlight (GameStream) clients or a remote
+  Conduit viewer ([STREAMING.md](STREAMING.md)).
 
-The guest driver copies the ioctl's parameters and sends them over the control
-queue. The backend checks them, makes the real call, and sends the result
-back.
+Details: [SCANOUT.md](SCANOUT.md), [CLIPBOARD.md](CLIPBOARD.md).
 
-Three things can't cross unchanged:
+## Runners and libvirt
 
-- **Pointers.** A guest address means nothing on the host. The memory it points
-  to travels with the request, and the backend points the call at its own copy.
-- **Handles.** NVIDIA handles belong to one open file. When a compositor uses a
-  client's buffer, the handle is translated to the file that owns it.
-- **File descriptors.** An fd number from the guest would point at some random
-  file in the backend. The guest driver swaps it for a handle, and the backend
-  swaps in its own fd.
+`conduit up` / `view` start, per VM, the backend, virtiofsd and the runner in
+one systemd user slice, plus a tap device with NAT. QEMU additionally gets a
+virtio-sound card (PipeWire/PulseAudio) and a QMP socket for clean ACPI
+shutdown. For libvirt, the domain XML adds the GPU device through
+`<qemu:commandline>` and the backend starts by socket activation
+(`conduit-backend@NAME.socket`), so virt-manager and `virsh` control the VM
+normally. Saving memory, snapshots with memory and migration are not
+supported: the GPU state lives in the host driver. Details:
+[QEMU.md](QEMU.md), [LIBVIRT.md](LIBVIRT.md).
 
-## How memory travels
+## Limits
 
-Frames are never copied. When the guest maps GPU memory, the backend maps the
-same memory on the host and places it in the **window**, which the VMM exposes
-in guest physical memory. Then the guest maps those pages into the process and
-both sides see the same bytes, at full speed.
-
-The window has a fixed size, set when the VM is created. Mappings are tracked
-and handed back when they go away.
-
-### CUDA and the UVM aperture
-
-CUDA needs one mapping the window can't provide. A CUDA context maps a
-semaphore pool at an address the program chose, and UVM only accepts that
-mapping at exactly that host address.
-
-So each pool gets its own memory slot in a second region, the UVM aperture
-(32 GiB of guest-physical address space, nothing committed), whereby the VMM
-maps the pool at the address it asked for, without replacing anything of its
-own. Managed memory (`cuMemAllocManaged`) is a mapping of the UVM file too and
-takes the same path: the VMM maps it at the guest's own address, the GPU uses
-that address, and UVM migrates pages between host RAM and VRAM as either side
-touches them (KVM follows through its MMU notifier). Only the first page is
-faulted in at placement, so host RAM is committed as pages are used, not up
-front. Limits: 32 GiB and 1024 mappings per VM, addresses between 4 GiB and
-128 TiB. The backend checks them, and the VMM checks them again.
-
-Pinned host memory (`cuMemHostAlloc`, `cuMemHostRegister`) is registered by
-address: the guest pins the pages and sends their guest-physical runs, and the
-backend maps exactly those pages into one span for RM (zero-copy). Up to 1024
-runs travel in the message; a more scattered buffer sends its run table
-through guest memory instead (up to 262143 runs, 64 GiB per registration).
-
-CUDA is opt-in: without `--caps ...,compute` the backend refuses
-`/dev/nvidia-uvm`.
-
-## How buffers get shared
-
-Rendering doesn't need this, but... showing a frame does.
-
-A client hands its buffer to a compositor as a dma-buf, through the DRM render
-node. The guest's own DRM code handles the export and import. Behind each
-buffer is a **proxy object** pointing at the real host object, so the memory
-underneath is still the host's, reachable through the window.
-
-`/dev/nvidia-modeset` isn't a display, it's how NVIDIA's stack names
-shareable memory, so nothing is shown on a screen.
-
-## How a guest waits
-
-At the end of a frame, the driver waits for the GPU by polling a descriptor.
-The interrupt fires on the host, so the backend watches its descriptors and
-sends an **event** to the guest when one becomes ready. The guest driver then
-wakes whoever is waiting.
-
-If `poll` were missing, the kernel would report the device as always ready and
-the driver would spin a whole CPU core and still look slightly _faster_ than
-bare metal. Waiting properly costs about 0.02 ms per wake which is nothing
-against a 16 ms frame, but it shows on a smaller 0.05 ms one.
-
-## Driver versions
-
-NVIDIA's kernel ABI changes between releases. The backend reads the host's
-driver version at startup and picks the matching table, so a request of the wrong
-size is refused, never guessed at.
-
-The tables are generated from NVIDIA's open kernel modules and checked in, so a
-build doesn't need NVIDIA source. The generator is in [`gen/`](gen/), which
-lists the supported versions. Adding a release takes one generator run.
-
-## Getting a frame out
-
-Today that's done with **Vulkan Video**. A capture layer in the guest encodes
-the app's swapchain image on the app's own device as H.264, then sends it out
-over a socket. There's no CPU copy and no second device. On the driver we tested, Vulkan
-Video encodes don't count against NVENC's 12-session cap on GeForce cards.
-
-CUDA → NVENC (encoding from a GPU pointer) is forwarded, but hasn't been tried
-end to end yet.
-
-## What it can't do
-
-- **NVIDIA only.** It forwards one vendor's kernel ABI.
-- **It isn't hardware isolation.** There's no IOMMU between guest GPU work and
-  the host. The GPU's own MMU separates them, so the host NVIDIA driver is part
-  of the trusted base. The backend narrows what a guest can reach (allowlists
-  generated from NVIDIA's own privilege tables), but passthrough or vGPU is
-  stronger. See [`SECURITY.md`](SECURITY.md).
-- **The window size is fixed** when the VM is created.
-- **No HMM / pageable memory access** (the GPU touching plain `malloc` memory), MIG or SR-IOV (out of scope for now). Managed memory works; see the UVM aperture above.
-- **VRAM limits are approximate.** `--vram-limit-mib` misses memory RM
-  allocates internally, which is tens of MiB per guest (might be fixed in a future version).
+- NVIDIA only, Linux guests only (Windows: [ROADMAP.md](ROADMAP.md)).
+- Not hardware isolation; the host NVIDIA driver is trusted.
+- The window size is fixed when the VM starts.
+- No HMM / pageable memory access, MIG or SR-IOV.
+- `--vram-limit-mib` does not count memory RM allocates internally.
 
 ## Prior art
 
-- **gVisor `nvproxy`** came first. It showed that forwarding NVIDIA's kernel
-  ABI works, and its versioned tables are our model.
-- **[`nvkvm-pv`](https://github.com/reindertpelsma/nvkvm-pv)** reached the same
-  design independently. We checked our mapping, event and quirk handling
-  against it. Its sibling **[`kayfabe`](https://github.com/reindertpelsma/kayfabe)**
-  emulates the device itself instead.
-- **DRM native context** (Intel, AMD) is what we're matching, but for NVIDIA.
-- **`chromeos/virtio-media`** is where the repo layout comes from.
+gVisor's `nvproxy` showed that forwarding NVIDIA's kernel ABI works; its
+versioned tables are the model for `gen/`. The device and backend started from
+[virtio-nvgpu](https://github.com/nestrilabs/virtio-nvgpu), the built-in runner
+from [nesbox](https://github.com/nestrilabs/nesbox), and the viewer from the
+display broker of [nvkvm-pv](https://github.com/reindertpelsma/nvkvm-pv).

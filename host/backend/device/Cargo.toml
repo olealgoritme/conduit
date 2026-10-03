@@ -45,16 +45,16 @@ vmm-sys-util = ["dep:vmm-sys-util"]
 
 [[bin]]
 name = "conduit-backend"
-path = "bin/vhost-user-nvgpu.rs"
+path = "bin/conduit-backend.rs"
 required-features = ["vhost-user"]
 
 [[bin]]
-name = "nvgpu-userspace"
-path = "bin/nvgpu-userspace.rs"
+name = "conduit-userspace"
+path = "bin/conduit-userspace.rs"
 
 [[bin]]
-name = "nvgpu-sandbox-selftest"
-path = "bin/nvgpu-sandbox-selftest.rs"
+name = "conduit-sandbox-selftest"
+path = "bin/conduit-sandbox-selftest.rs"
 
 [[bin]]
 name = "test-harness"

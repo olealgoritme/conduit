@@ -18,7 +18,7 @@ pub mod seccomp;
 pub mod serial;
 /// The metrics surface. Currently shaped entirely around `GpuDevice`, so it
 /// compiles only with `virgl`; making it source-agnostic is what a
-/// virtio-nvgpu stats surface needs first.
+/// GPU forwarding stats surface needs first.
 #[cfg(feature = "virgl")]
 pub mod stats;
 pub mod virtiofsd;

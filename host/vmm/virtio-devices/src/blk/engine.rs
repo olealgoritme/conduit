@@ -403,7 +403,7 @@ mod tests {
     use std::os::unix::io::IntoRawFd;
 
     fn scratch(name: &str, contents: &[u8]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("nesbox-blk-tests");
+        let dir = std::env::temp_dir().join("conduit-vmm-blk-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{name}-{}", std::process::id()));
         std::fs::write(&path, contents).unwrap();

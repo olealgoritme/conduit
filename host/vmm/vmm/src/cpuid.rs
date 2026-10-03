@@ -21,8 +21,7 @@
 //! before doubling up.
 //!
 //! Modelled on Cloud Hypervisor's `update_cpuid_topology`
-//! (`cloudhypervisor-for-llm-ref/arch/src/x86_64/mod.rs`), which is the
-//! reference kept in this tree.
+//! (`arch/src/x86_64/mod.rs` in cloud-hypervisor).
 
 use kvm_bindings::{CpuId, kvm_cpuid_entry2};
 

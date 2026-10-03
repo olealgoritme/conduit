@@ -1,33 +1,33 @@
 # Network streaming (conduit-stream)
 
-Goal: play a Conduit VM from another machine. Any **Moonlight** client
-(PC, Mac, phone, TV, Steam Deck) works, and Conduit's own viewer can connect
-over the network too, with a **lossless** mode for 10 GbE links.
+`conduit-stream` serves a Conduit VM over the network. Any **Moonlight**
+client (PC, Mac, phone, TV, Steam Deck) can connect, and so can Conduit's own
+viewer, with a **lossless** mode for 10 GbE links.
 
 ```
  VM ──flip──► backend ──dma-buf + ATTACH/COMMIT──► conduit-stream ──► network ──► Moonlight / conduit viewer
         ◄── input ◄── EV_KEY/BTN/ABS/REL/WHEEL/PAD ◄──      (GameStream protocol, or Conduit's own link)
 ```
 
-## The decision: our own GameStream host, not a Sunshine fork
+## Why its own GameStream host, not Sunshine
 
 Moonlight speaks NVIDIA's GameStream protocol. There are two open hosts:
 [Sunshine](https://github.com/LizardByte/Sunshine) (GPL-3.0, C++) and the
 protocol's client side, [moonlight-common-c](https://github.com/moonlight-stream/moonlight-common-c)
-(GPL-3.0). We considered building on Sunshine with a new capture source for
-our frames and chose to implement the host side ourselves:
+(GPL-3.0). Conduit implements the host side itself rather than adding a
+capture source to Sunshine:
 
-| | Sunshine fork | own host (chosen) |
+| | Sunshine fork | conduit-stream |
 |---|---|---|
 | frame source | its capture loop polls a display at a fixed rate | encode **on the guest's flip**, no capture timer: lowest latency |
 | input | injects into the *host* through uinput (a virtual pad on the host desktop) | events go straight to the VM over the broker socket, never touch the host |
 | build | Boost, a CUDA toolkit (nvcc) for its NVENC kernels, its own FFmpeg, npm web UI | Rust + a small C file; NVENC/NVDEC/CUDA are loaded at run time from the driver |
 | licence | GPL-3.0 binary in the package, patches to carry | Apache-2.0 like the rest of the host side |
-| our viewer over the network | a second, separate implementation anyway | same pipeline, second transport |
+| Conduit viewer over the network | a second, separate implementation anyway | same pipeline, second transport |
 
-The cost is owning the protocol. It is a fixed, well-understood protocol
-(Sunshine and Moonlight are its reference); our implementation is written from
-scratch in `host/stream/src`, and checked against the real Moonlight client.
+The protocol is fixed and well understood (Sunshine and Moonlight are its
+reference); Conduit's implementation is in `host/stream/src` and is tested
+against the real Moonlight client.
 Two small libraries both of those projects use are vendored unchanged, so the
 wire behaviour matches bit for bit: **ENet** (control channel, Moonlight's
 fork, MIT) and **nanors** (Reed-Solomon FEC, MIT). NVIDIA's video codec
@@ -37,8 +37,8 @@ headers (nv-codec-headers, MIT) describe NVENC/NVDEC. See `host/stream/NOTICE`.
 
 ```
 host/stream/                     conduit-stream (Rust, Apache-2.0)
-  src/broker.rs                  we ARE the display broker: listen on the VM's display.sock,
-                                 take ATTACH/COMMIT/CURSOR (dma-bufs), send input + mode hints
+  src/broker.rs                  acts as the display broker: listens on the VM's display.sock,
+                                 takes ATTACH/COMMIT/CURSOR (dma-bufs), sends input + mode hints
   csrc/gpu.c                     EGL (device platform, no window) + GL + CUDA + NVENC/NVDEC
   src/gamestream/nvhttp.rs       HTTP 47989 / HTTPS 47984: serverinfo, PIN pairing, applist, launch
   src/gamestream/rtsp.rs         RTSP 48010 (TCP): DESCRIBE/SETUP/ANNOUNCE/PLAY, AES-GCM optional
@@ -116,10 +116,10 @@ evdev and sent to the backend as broker events:
   `CAP_GAMEPAD`, carried by the backend to the guest driver, which registers
   a "Conduit pad N" input device. Rumble back to the client is a later step.
 
-### Audio (designed, stubbed)
+### Audio (not streamed yet)
 
-The VM has no sound card yet (virtio-sound under QEMU is in progress). The
-path, once it exists:
+Under QEMU the VM has a virtio-sound card, played through the host's
+PipeWire/PulseAudio, but conduit-stream does not send it yet. The planned path:
 
 ```
 guest virtio-sound ─► QEMU audiodev (PipeWire/Pulse), one sink per VM: "conduit-NAME"
@@ -127,9 +127,9 @@ guest virtio-sound ─► QEMU audiodev (PipeWire/Pulse), one sink per VM: "cond
                       ─► Opus (5 ms packets) ─► RTP + Reed-Solomon 4+2 ─► AES-CBC ─► UDP 48000
 ```
 
-`src/gamestream/audio.rs` has the packetizer interface and the RTSP side
-already advertises the Opus layouts; with no source it sends nothing, and
-Moonlight plays the video without sound.
+`src/gamestream/audio.rs` has the RTP + FEC packetizer and RTSP advertises the
+Opus layouts; with no source nothing is sent, and Moonlight plays the video
+without sound.
 
 ## PIN pairing
 
@@ -188,7 +188,7 @@ uses the same NVENC settings as Moonlight.
 ## Security
 
 - Network-facing parsers are Rust (HTTP, RTSP, ENet payloads, input); the C
-  side only sees dma-bufs from the local backend and our own bitstreams.
+  side only sees dma-bufs from the local backend and NVENC's own bitstreams.
 - Everything a client can do after the TLS handshake requires a paired
   certificate; the control channel and input are AES-GCM with the per-launch
   key from the HTTPS `launch` request.
@@ -196,7 +196,7 @@ uses the same NVENC settings as Moonlight.
 - `conduit-stream` holds no privileges; it needs the GPU (render node) and
   the VM's display socket, nothing else.
 
-## Measured (RTX 5090, driver 610.57.04, client on the same machine)
+## Performance (RTX 5090, driver 610.57.04, client on the same machine)
 
 | path | result |
 |---|---|
@@ -212,7 +212,7 @@ frame at 5120x1440), so lossless 240 fps needs content a desktop or game
 actually has; for H.264/HEVC that same noise also exceeds the bitrate target
 (AV1 holds it).
 
-## Known gaps (outside host/stream)
+## Limitations
 
 - The backend does not forward `EV_FRAME`/`EV_RELEASE` (display.rs) and does
   not fence frames against unfinished guest GPU work (no sync_fd /
@@ -221,17 +221,14 @@ actually has; for H.264/HEVC that same noise also exceeds the bitrate target
   narrow the window, but a guest can still draw into a buffer while it is
   read: occasional torn or partial frames until the backend gains release
   and fence support.
-- Audio waits for the VM's sound device (see Audio above).
+- No audio in the stream yet (see Audio above).
 - No HDR, touch/pen, rumble or motion yet; one stream client at a time.
 
-## Status
+## Supported
 
-| | |
-|---|---|
-| Moonlight: PIN pairing, applist, launch/resume/quit, encrypted RTSP | done, tested with Moonlight 6.1 |
-| H.264 / HEVC / AV1 via NVENC, 4:4:4, FEC, encrypted control, video encryption | done |
-| keyboard, mouse, wheel, gamepads (up to 4) | done, verified in a VM |
-| guest follows the client's resolution and refresh | done (mutter, KWin; wlroots needs `wlr-randr --preferred`) |
-| conduit link (`conduit remote`), lossless | done |
-| `conduit stream NAME`, `--service`, `pair` | done |
-| audio | designed, stubbed |
+- Moonlight 6.1: PIN pairing, app list, launch/resume/quit, encrypted RTSP.
+- H.264 / HEVC / AV1 via NVENC, 4:4:4, FEC, encrypted control and video.
+- Keyboard, mouse, wheel, up to 4 gamepads.
+- The guest follows the client's resolution and refresh (mutter, KWin;
+  wlroots needs `wlr-randr --preferred`).
+- `conduit remote` over the Conduit link, including lossless.

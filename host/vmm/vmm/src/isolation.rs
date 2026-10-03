@@ -5,12 +5,12 @@
 //! what it may *reach*: `openat` and `connect` are both on the policy, so the
 //! process keeps its uid's whole filesystem and its network. Those are bounded
 //! by things that live outside this program — a uid, a mount namespace, a
-//! network namespace, a cgroup — and until now nesbox neither applied them nor
+//! network namespace, a cgroup — and until now conduit-vmm neither applied them nor
 //! looked to see whether anyone else had.
 //!
 //! That gap had a specific cost. `virtio-devices/src/gpu/vram.rs` declines to
 //! enforce a GTT limit on the grounds that "host system memory is bounded for the
-//! whole VMM process by cgroups", and `docs/STATS.md` repeats it. Nothing in this
+//! whole VMM process by cgroups". Nothing in this
 //! repository applies a cgroup. The claim was true only if whoever launched the
 //! process remembered, and nothing checked, and nothing said.
 //!
@@ -23,8 +23,8 @@
 //! boot instead of a surprise at 3am.
 //!
 //! Reporting is the honest shape here rather than applying limits ourselves.
-//! `docs/BENCHMARKS.md` §12 measured what cgroups do to a guest, and the answer
-//! was that the supervisor is the right owner: a `cpu.max` holds, an `io.max`
+//! Measurements of what cgroups do to a guest showed that the supervisor
+//! is the right owner: a `cpu.max` holds, an `io.max`
 //! holds only against cold host cache, and `memory.max` is not a bound on the
 //! guest at all — it decides what happens when a guest exceeds the RAM it was
 //! given, which on a host with swap is silent thrashing and on a host without is
@@ -242,8 +242,7 @@ impl Report {
             Some(true) => log::info!("isolation: in its own network namespace"),
             Some(false) => log::warn!(
                 "isolation: sharing the host's network namespace. seccomp allows socket and \
-                 connect, so a compromised device model has the host's network. See \
-                 \"unshare-network\" in docs/SECURITY.md."
+                 connect, so a compromised device model has the host's network."
             ),
             None => log::debug!(
                 "isolation: could not compare network namespaces (/proc/1/ns/net is not \
@@ -478,7 +477,7 @@ mod tests {
     fn a_limit_on_an_ancestor_is_found_and_attributed() {
         // Exercised through `ancestors` plus `read`, since `effective` is
         // hard-wired to /sys/fs/cgroup. The composition is what could break.
-        let dir = std::env::temp_dir().join(format!("nesbox-hier-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("conduit-vmm-hier-{}", std::process::id()));
         let leaf = dir.join("user.slice/session.scope");
         std::fs::create_dir_all(&leaf).unwrap();
         // Limit written on the parent, not the leaf.
@@ -510,7 +509,7 @@ mod tests {
 
     #[test]
     fn limits_distinguish_unset_from_absent() {
-        let dir = std::env::temp_dir().join(format!("nesbox-cg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("conduit-vmm-cg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_str().unwrap();
 

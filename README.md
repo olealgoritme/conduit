@@ -26,8 +26,8 @@ from GPU memory to your screen: no copying, no video compression.
 | virt-manager / virsh (start, pause, reboot, stop; attach to existing VMs) | ✅ |
 | Windows VMs | ❌ not yet ([roadmap](docs/ROADMAP.md)) |
 
-> **Status: early.** Works on the developer's machine (RTX 5090, Ubuntu 24.04,
-> Hyprland). Expect rough edges. Windows guests are not supported yet
+> Conduit is early software, tested mainly on an RTX 5090 with Ubuntu 24.04
+> and Hyprland. Expect rough edges. Windows guests are not supported yet
 > (see [Roadmap](docs/ROADMAP.md)).
 
 ## What you need
@@ -118,7 +118,7 @@ or `packaging/release.sh X.Y.Z`); GitHub then builds every package for that tag.
 | `Ctrl+Alt+G` | Capture the mouse (for games) / release it |
 | `Ctrl+Alt+O` | Performance overlay on/off (fps, frame times, latency) |
 | `Ctrl+Alt+D` | Direct mode: lowest latency (fullscreen, no overlay) |
-| `Ctrl+Alt+R` | Window size changes the VM's resolution / just scales it |
+| `Ctrl+Alt+R` | Switch between the VM's resolution following the window (default) and scaling a fixed resolution into it |
 
 ## Play it from another computer (Moonlight)
 

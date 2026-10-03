@@ -23,7 +23,9 @@ Modified by the virtio-nvgpu project (2026-10). Changes, all marked
   - every commit is flushed to the compositor immediately
   - new test producer nvgpu_scanout_test.c (GBM + EGL/GLES2, test only),
     run-viewer.sh, test-standalone.sh, README.md
-The original README is kept as README.upstream.md.
+Conduit (2026-10): renamed the binary to conduit-viewer and replaced
+README.md. Upstream's README and docs/internal/broker-design.md are not
+included; docs/broker-protocol.md is kept with an origin note.
 
 "NVIDIA" is a trademark of NVIDIA Corporation. Nothing here is affiliated
 with or endorsed by NVIDIA.

@@ -7,8 +7,8 @@
 //! own manifest, finds what a guest needs on this host, and builds a directory
 //! to export read-only over a filesystem share.
 //!
-//!     nvgpu-userspace                      # what this host would export
-//!     nvgpu-userspace --stage /run/nvgpu   # build the share
+//!     conduit-userspace                      # what this host would export
+//!     conduit-userspace --stage /run/nvgpu   # build the share
 //!
 //! The staged tree is hard links where the filesystem allows it, so exporting
 //! ~1 GiB of driver costs no extra space and no copy. It falls back to symlinks

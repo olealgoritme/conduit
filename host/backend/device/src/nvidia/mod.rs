@@ -42,14 +42,7 @@ const NV_OK: u32 = 0;
 /// The host path an `Open` refers to.
 ///
 /// The wire encoding is one flat `u32`: a GPU is its own minor number and the
-/// singleton devices take values above every possible minor. This previously
-/// decoded a `{kind, index}` pair that the driver never sent, so every open of
-/// the control device arrived as kind 255 and was refused.
-fn device_path(device_type: u32) -> Result<CString> {
-    device_path_with(device_type, &[])
-}
-
-/// As [`device_path`], but able to resolve a render node.
+/// singleton devices take values above every possible minor.
 ///
 /// A render node's name is not derivable from its index: the host numbers them
 /// per DRM device, so the guest's index has to be looked up in the same list

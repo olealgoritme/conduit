@@ -517,13 +517,6 @@ mod tests {
         p
     }
 
-    fn send(be: &mut NvidiaBackend, h: u64, escape: u32, params: &[u8]) -> Vec<u8> {
-        let mut resp = vec![0u8; 512];
-        be.dispatch(&ioctl_msg(h, escape, params), &mut resp);
-        assert_eq!(parse_resp(&resp).status, 0, "the ioctl itself must succeed");
-        resp
-    }
-
     /// As `send_nested`, where the nested block has contents rather than being
     /// a length's worth of zeroes.
     fn send_nested_bytes(

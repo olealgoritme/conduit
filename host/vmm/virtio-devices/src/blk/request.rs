@@ -21,7 +21,7 @@ pub const BLK_S_IOERR: u8 = 1;
 pub const BLK_S_UNSUPP: u8 = 2;
 
 /// The serial number the guest reads back from `/sys/block/vda/serial`.
-pub const DISK_ID: &[u8; 20] = b"nesbox-vda\0\0\0\0\0\0\0\0\0\0";
+pub const DISK_ID: &[u8; 20] = b"conduit-vda\0\0\0\0\0\0\0\0\0";
 
 /// One `virtio_blk_discard_write_zeroes` segment.
 pub const DISCARD_SEG_SIZE: u32 = 16;
@@ -240,7 +240,7 @@ mod tests {
     /// One file per test: they run on threads of one process, and a shared
     /// name means one test truncating the image another is opening.
     fn disk(name: &str) -> Disk {
-        let dir = std::env::temp_dir().join("nesbox-blk-tests");
+        let dir = std::env::temp_dir().join("conduit-vmm-blk-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("request-{name}-{}", std::process::id()));
         std::fs::write(&path, vec![0u8; 64 * 1024]).unwrap();
@@ -346,7 +346,7 @@ mod tests {
     /// driver ignoring what it was told -- reported, never carried out.
     #[test]
     fn a_write_to_a_read_only_disk_is_refused() {
-        let dir = std::env::temp_dir().join("nesbox-blk-tests");
+        let dir = std::env::temp_dir().join("conduit-vmm-blk-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("ro-disk-{}", std::process::id()));
         std::fs::write(&path, vec![0u8; 64 * 1024]).unwrap();

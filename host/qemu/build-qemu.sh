@@ -4,11 +4,11 @@
 # QEMU >= 11.1 is required: it is the first release with vhost-user
 # VIRTIO Shared Memory Regions (VHOST_USER_PROTOCOL_F_SHMEM, GET_SHMEM_CONFIG,
 # BACKEND_SHMEM_MAP/UNMAP) and shmem support in the generic vhost-user
-# device (vhost-user-test-device-pci), which the virtio-nvgpu backend needs
+# device (vhost-user-test-device-pci), which conduit-backend needs
 # for its window and UVM aperture.
 #
 # The patches in ./patches are applied unless --stock is given. Stock 11.1
-# cannot host virtio-nvgpu (256-byte vhost-user config limit); see README.md.
+# cannot host the Conduit GPU device (256-byte vhost-user config limit); see README.md.
 #
 # Usage: build-qemu.sh [--version X.Y.Z] [--prefix DIR] [--no-slirp]
 #                      [--no-audio] [--stock] [--jobs N] [--install]

@@ -1,11 +1,11 @@
-use nesbox_vmm::lifecycle::{ExitReason, Shutdown};
-use nesbox_vmm::power::PowerDevice;
-use nesbox_vmm::{acpi_slot_gsi, config, interrupt::IrqManager, virtiofsd::Virtiofsd, vm};
+use conduit_vmm::lifecycle::{ExitReason, Shutdown};
+use conduit_vmm::power::PowerDevice;
+use conduit_vmm::{acpi_slot_gsi, config, interrupt::IrqManager, virtiofsd::Virtiofsd, vm};
 
 use anyhow::{Context, Result};
+use conduit_vmm::memslot::MemorySlots;
 use env_logger::Env;
 use log::info;
-use nesbox_vmm::memslot::MemorySlots;
 use pci::Bus;
 use std::io::stdin;
 use std::os::fd::AsRawFd;
@@ -25,10 +25,10 @@ use virtio_devices::{GpuConfig, GpuDevice};
 const GPU_SHM_BAR: usize = 2;
 
 const USAGE: &str = "Usage:
-  nesbox <config.json>            run a VM
+  conduit-vmm <config.json>       run a VM (normally started by `conduit up`)
 
-Host networking -- bridge, VLAN uplink, and the taps guests attach to -- is set
-up separately by scripts/nestri-net-setup.sh. nesbox opens a tap that already
+Host networking -- the tap the guest attaches to, and NAT -- is set up
+separately by `conduit up`. conduit-vmm opens a tap that already
 exists, which needs no capabilities: the kernel only demands CAP_NET_ADMIN to
 create a device, or from someone who is not its owner.";
 
@@ -100,14 +100,14 @@ fn main() -> Result<()> {
     // worker as they are built. This is only half the job -- it buys the
     // privilege to unshare the network further down, once the tap is open.
     if config.unshare_network {
-        nesbox_vmm::isolation::enter_user_namespace()?;
+        conduit_vmm::isolation::enter_user_namespace()?;
     }
 
     // What is actually confining this process, said out loud before anything
     // depends on it. Several bounds this codebase assumes -- host memory for GTT
     // most of all -- are applied by whoever supervises us or not at all, and the
     // difference used to be invisible.
-    nesbox_vmm::isolation::Report::gather().log();
+    conduit_vmm::isolation::Report::gather().log();
 
     // A VRAM limit is enforced inside virglrenderer, not here, and which
     // renderer gets loaded is LD_LIBRARY_PATH's decision. Checked before the
@@ -122,7 +122,7 @@ fn main() -> Result<()> {
     {
         if config.gpu.is_some() {
             anyhow::bail!(
-                "this nesbox was built without the `virgl` feature, so it has no \
+                "this conduit-vmm was built without the `virgl` feature, so it has no \
                  virtio-gpu device; remove `gpu` from the config or rebuild with it"
             );
         }
@@ -132,13 +132,13 @@ fn main() -> Result<()> {
         // this build cannot honour should fail before it half-boots a guest.
         if config.stats_socket.is_some() {
             anyhow::bail!(
-                "this nesbox was built without the `virgl` feature; the stats \
+                "this conduit-vmm was built without the `virgl` feature; the stats \
                  socket reports virtio-gpu counters only and has nothing to serve"
             );
         }
     }
     #[cfg(feature = "virgl")]
-    nesbox_vmm::renderer::check(config.gpu.as_ref().and_then(|g| g.vram_limit_mib))?;
+    conduit_vmm::renderer::check(config.gpu.as_ref().and_then(|g| g.vram_limit_mib))?;
 
     // ── Where the threads that are not vCPUs go ───────────────────────────
     // Set on this thread before anything is spawned, so the block and console
@@ -324,7 +324,7 @@ fn main() -> Result<()> {
             // SAFETY: single-threaded here. Devices are built before any vCPU or
             // worker thread is spawned, so no other thread can be reading the
             // environment concurrently.
-            unsafe { std::env::set_var("NESTRI_VRAM_LIMIT_MIB", mib.to_string()) };
+            unsafe { std::env::set_var("CONDUIT_VRAM_LIMIT_MIB", mib.to_string()) };
         }
 
         let slots = memory_slots.clone();
@@ -383,13 +383,13 @@ fn main() -> Result<()> {
     // box come up rather than getting connection refused for the first second.
     #[cfg(feature = "virgl")]
     if let Some(path) = config.stats_socket.clone() {
-        nesbox_vmm::stats::serve(path, nesbox_vmm::stats::StatsSource::new(stats_gpu))?;
+        conduit_vmm::stats::serve(path, conduit_vmm::stats::StatsSource::new(stats_gpu))?;
     }
 
     // ── Shared directories over virtio-fs ─────────────────────────────────
     // The daemons are kept alive for as long as the VM runs; dropping them
     // kills virtiofsd.
-    let runtime_dir = std::env::temp_dir().join(format!("nesbox-{}", std::process::id()));
+    let runtime_dir = std::env::temp_dir().join(format!("conduit-vmm-{}", std::process::id()));
     let mut fs_daemons = Vec::new();
     // ── GPU ioctl forwarding ──────────────────────────────────────────────
     // Attached before the filesystem shares so its PCI slot does not move when
@@ -467,7 +467,7 @@ fn main() -> Result<()> {
     }
 
     // ── Legacy COM1, for early boot output ────────────────────────────────
-    let serial = Arc::new(nesbox_vmm::serial::Serial::new());
+    let serial = Arc::new(conduit_vmm::serial::Serial::new());
 
     // ── Lifetime ──────────────────────────────────────────────────────────
     let shutdown = Shutdown::new();
@@ -487,7 +487,7 @@ fn main() -> Result<()> {
                  guest's control channel goes quiet, this is the first thing to turn off."
             );
         }
-        nesbox_vmm::isolation::enter_network_namespace()?;
+        conduit_vmm::isolation::enter_network_namespace()?;
     }
 
     // ── Confine the process ───────────────────────────────────────────────
@@ -495,13 +495,13 @@ fn main() -> Result<()> {
     // built: virtiofsd has been spawned by now, and `execve` is not on the
     // policy. Anything that needs to open a new path or start a process must
     // happen above this line.
-    let seccomp_mode = nesbox_vmm::seccomp::Mode::parse(&config.seccomp).ok_or_else(|| {
+    let seccomp_mode = conduit_vmm::seccomp::Mode::parse(&config.seccomp).ok_or_else(|| {
         anyhow::anyhow!(
             "seccomp: {:?} is not one of enforce, audit, off",
             config.seccomp
         )
     })?;
-    nesbox_vmm::seccomp::apply_baseline(seccomp_mode).context("could not confine the VMM")?;
+    conduit_vmm::seccomp::apply_baseline(seccomp_mode).context("could not confine the VMM")?;
 
     // ── Run vCPUs ─────────────────────────────────────────────────────────
     // Where each vCPU thread goes: its own pin if it has one, otherwise the

@@ -1,7 +1,7 @@
 [package]
 name = "conduit-stream"
 description = "Stream a Conduit VM to Moonlight clients and Conduit viewers (NVENC)"
-version = "0.1.0"
+version = "0.1.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/olealgoritme/conduit"

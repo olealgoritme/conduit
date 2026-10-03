@@ -10,7 +10,7 @@
 //! | 1 | the window: device memory the backend places (`shm.rs`) | the allocator's total, 1 GiB |
 //! | 2 | the UVM aperture: CUDA semaphore pools and managed memory (`nvidia/aperture.rs`) | 32 GiB |
 //!
-//! nesbox hard-codes both (BAR 2 and BAR 4). QEMU >= 11.1 asks instead, with
+//! conduit-vmm hard-codes both (BAR 2 and BAR 4). QEMU >= 11.1 asks instead, with
 //! `VHOST_USER_GET_SHMEM_CONFIG`, and lays the regions out itself -- one BAR
 //! (BAR 4) holding them back to back in shmid order. The answer is built here,
 //! where it can be tested without the vhost crates.
@@ -24,7 +24,7 @@ pub const SHM_ID_WINDOW: u8 = 1;
 /// The UVM aperture. Must match `NVGPU_SHM_ID_APERTURE`.
 pub const SHM_ID_APERTURE: u8 = 2;
 
-/// Size of the UVM aperture. nesbox's `APERTURE_SIZE` is the same number, and
+/// Size of the UVM aperture. conduit-vmm's `APERTURE_SIZE` is the same number, and
 /// QEMU takes it from the reply built here.
 ///
 /// It is guest-physical address space and nothing else: a pool gets a memory
@@ -40,7 +40,7 @@ pub const APERTURE_LEN: u64 = 32 << 30;
 /// nvidia-uvm only accepts a mapping whose address equals its file offset, and
 /// a spec frontend picks the address itself.
 ///
-/// Sent only to a frontend that asked for `GET_SHMEM_CONFIG` (QEMU); nesbox
+/// Sent only to a frontend that asked for `GET_SHMEM_CONFIG` (QEMU); conduit-vmm
 /// never asks, maps pools at that address already, and refuses unknown bits.
 /// A stock QEMU ignores the bit; its mapping of a UVM file then fails.
 pub const MAP_FLAG_FIXED_VA: u64 = 1 << 1;
@@ -78,7 +78,7 @@ pub fn region_sizes(window_len: u64, aperture_len: u64) -> (u32, [u64; MAX_SHM_R
 /// of exactly this length; KVM can only give a guest whole pages of it, so a
 /// ragged tail would be emulated as a hole. It is also the length the
 /// matching unmap has to repeat, so placement and withdrawal both go through
-/// here. nesbox mmaps, which rounds the same way, so nothing changes for it.
+/// here. conduit-vmm mmaps, which rounds the same way, so nothing changes for it.
 pub fn page_align(len: u64) -> u64 {
     len.checked_add(PAGE - 1)
         .map_or(u64::MAX & !(PAGE - 1), |v| v & !(PAGE - 1))
@@ -102,8 +102,12 @@ mod tests {
         let (n, sizes) = region_sizes(window, APERTURE_LEN);
         assert_eq!(n, 2);
         assert_eq!(sizes[0], 0, "region 0 is unused");
-        assert_eq!(sizes[1], 1 << 30, "window, as nesbox's SHM_SIZE");
-        assert_eq!(sizes[2], 32 << 30, "aperture, as nesbox's APERTURE_SIZE");
+        assert_eq!(sizes[1], 1 << 30, "window, as conduit-vmm's SHM_SIZE");
+        assert_eq!(
+            sizes[2],
+            32 << 30,
+            "aperture, as conduit-vmm's APERTURE_SIZE"
+        );
         assert!(sizes[3..].iter().all(|&s| s == 0));
     }
 
@@ -132,7 +136,7 @@ mod tests {
 
     #[test]
     fn only_a_spec_frontend_is_asked_for_a_fixed_address() {
-        // nesbox validates flags against WRITABLE alone.
+        // conduit-vmm validates flags against WRITABLE alone.
         assert_eq!(pool_map_flags(1, false), 1);
         assert_eq!(pool_map_flags(1, true), 1 | MAP_FLAG_FIXED_VA);
         // Bit 0 is the spec's read-write bit; the extension must not reuse it.

@@ -33,15 +33,15 @@ fn is_executable(path: &Path) -> bool {
 
 /// Find virtiofsd, or say where it was looked for.
 ///
-/// `NESBOX_VIRTIOFSD` wins outright, so a machine that keeps it somewhere
+/// `CONDUIT_VIRTIOFSD` wins outright, so a machine that keeps it somewhere
 /// unusual needs no code change. Otherwise `PATH` first, then the directories
 /// distributions actually use.
 pub fn binary_path() -> Result<PathBuf> {
-    if let Some(explicit) = std::env::var_os("NESBOX_VIRTIOFSD") {
+    if let Some(explicit) = std::env::var_os("CONDUIT_VIRTIOFSD") {
         let path = PathBuf::from(&explicit);
         anyhow::ensure!(
             is_executable(&path),
-            "NESBOX_VIRTIOFSD is set to {}, which is not an executable file",
+            "CONDUIT_VIRTIOFSD is set to {}, which is not an executable file",
             path.display()
         );
         return Ok(path);
@@ -73,7 +73,7 @@ fn resolve(path_env: Option<OsString>, fallbacks: &[&str]) -> Result<PathBuf> {
     }
 
     anyhow::bail!(
-        "could not find virtiofsd. Set NESBOX_VIRTIOFSD to its path, or install it. Looked in: {}",
+        "could not find virtiofsd. Set CONDUIT_VIRTIOFSD to its path, or install it. Looked in: {}",
         searched
             .iter()
             .map(|p| p.display().to_string())
@@ -244,7 +244,8 @@ mod tests {
 
     /// A directory holding a fake, executable `virtiofsd`.
     fn with_binary(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nesbox-vfsd-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("conduit-vmm-vfsd-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("virtiofsd");
         std::fs::write(&path, b"#!/bin/sh\n").unwrap();
@@ -304,7 +305,8 @@ mod tests {
     fn a_non_executable_file_does_not_count() {
         // A stray text file named virtiofsd would otherwise be "found" and then
         // fail to spawn, reporting the wrong problem.
-        let dir = std::env::temp_dir().join(format!("nesbox-vfsd-noexec-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("conduit-vmm-vfsd-noexec-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("virtiofsd"), b"not a program").unwrap();
         assert!(resolve(None, &[dir.to_str().unwrap()]).is_err());
@@ -320,6 +322,6 @@ mod tests {
         let message = format!("{err}");
         assert!(message.contains("/nowhere-a/virtiofsd"), "{message}");
         assert!(message.contains("/nowhere-b/virtiofsd"), "{message}");
-        assert!(message.contains("NESBOX_VIRTIOFSD"), "{message}");
+        assert!(message.contains("CONDUIT_VIRTIOFSD"), "{message}");
     }
 }

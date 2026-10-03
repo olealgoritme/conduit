@@ -26,7 +26,7 @@ conduit/
 ├── packaging/
 │   ├── deb/       Debian packages: conduit, conduit-guest
 │   └── dkms/      dkms.conf for the guest module
-├── docs/          ARCHITECTURE, SECURITY, ROADMAP, developer notes
+├── docs/          ARCHITECTURE, SECURITY, ROADMAP; design/ holds design notes
 └── .github/workflows/
     ├── ci.yml         every push: Rust tests, guest module build against
     │                  Ubuntu/Fedora headers, viewer selftests

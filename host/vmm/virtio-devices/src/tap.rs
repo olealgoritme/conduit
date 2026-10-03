@@ -1,20 +1,20 @@
 //! A tap interface, the host end of the guest's network link.
 //!
 //! Taps are *opened*, never created. A tap the host set up beforehand and gave
-//! to the user nesbox runs as can be attached to with no privilege at all --
+//! to the user conduit-vmm runs as can be attached to with no privilege at all --
 //! the kernel demands `CAP_NET_ADMIN` only to create a device, or when the
 //! opener is not its owner (`tun_not_capable` in `drivers/net/tun.c`). Creating
 //! them here would mean shipping a VMM that wants net-admin on its binary,
 //! which is a thing to ask of everyone who self-hosts.
 //!
-//! `scripts/nestri-net-setup.sh` creates them. The interface is not persistent: it
+//! `conduit up` creates them (`ip tuntap add ... user <you>`). The interface is not persistent: it
 //! exists only while we hold the file descriptor, so it disappears when the VM
 //! exits however the VM exits, including a crash. Nothing has to clean up
 //! after us.
 //!
 //! What is *not* here, and cannot be: routing the tap's subnet to the outside
 //! world. That is `ip_forward` plus a NAT rule, which is host-global state and
-//! belongs to whoever installs nesbox, not to a running VM.
+//! belongs to whoever installs conduit-vmm, not to a running VM.
 
 use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions};
@@ -103,7 +103,7 @@ impl Tap {
     /// changed on the strength of it.
     ///
     /// If it recurs, the check that settles it is `lsof /dev/net/tun` between
-    /// the stop and the start: a nesbox process still listed there is the
+    /// the stop and the start: a conduit-vmm process still listed there is the
     /// stale opener. The fix would be to close the tap explicitly on teardown
     /// rather than leaving it to process exit, and for the caller to wait for
     /// the previous process to be reaped before reusing its slot. Until then,
@@ -112,9 +112,9 @@ impl Tap {
     pub fn open(name: &str) -> Result<Self> {
         if !std::path::Path::new(&format!("/sys/class/net/{name}")).exists() {
             bail!(
-                "tap {name} does not exist. nesbox does not create taps -- run \
-                 scripts/nestri-net-setup.sh on this host, which makes them and \
-                 hands them to the user nesbox runs as"
+                "tap {name} does not exist. conduit-vmm does not create taps -- \
+                 `conduit up` makes them and hands them to the user the VM \
+                 runs as"
             );
         }
 
@@ -139,8 +139,8 @@ impl Tap {
                 bail!(
                     "TUNSETIFF on {name} denied. The tap exists but is owned by \
                      someone else -- a tap may be opened without privilege only by \
-                     its owner. Re-run scripts/nestri-net-setup.sh naming the user \
-                     nesbox runs as."
+                     its owner. Recreate it owned by the user conduit-vmm runs \
+                     as (`conduit up` does)."
                 );
             }
             return Err(err).context("TUNSETIFF");

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 /// almost always one of two things, and both are worse silently: a typo, or a
 /// config written for a build that has a feature this one does not. The second
 /// is not hypothetical -- a config asking for `gpu-forward` was handed to a
-/// nesbox built before that device existed, and it booted a guest with no GPU
+/// conduit-vmm built before that device existed, and it booted a guest with no GPU
 /// and said nothing. The guest came up, the forwarding backend sat waiting on
 /// a socket nobody connected to, and the failure surfaced as a driver inside
 /// the guest finding no hardware.
@@ -202,7 +202,7 @@ pub struct Network {
     /// Tap interface to create. `%d` is filled in by the kernel with the
     /// lowest free number, which is what you want when several VMs run at
     /// once.
-    /// Tap to open. Exact: the host created it, so nesbox is not choosing.
+    /// Tap to open. Exact: the host created it, so conduit-vmm is not choosing.
     pub tap_name: String,
     /// Guest MAC. Generated if absent; a supervising agent would normally
     /// supply one so the address is stable across restarts.
@@ -364,7 +364,7 @@ pub struct MachineConfig {
     /// The pinned CPUs belong to this guest alone, and nothing else on the host
     /// will run on them.
     ///
-    /// This is a promise the caller makes; nesbox cannot check it. On the
+    /// This is a promise the caller makes; conduit-vmm cannot check it. On the
     /// strength of it, a halting vCPU halts the physical core instead of
     /// exiting to the host, spin-waits stop exiting, and the guest is told its
     /// vCPUs are never preempted, which moves it off paravirtual spinlocks. All
@@ -382,7 +382,7 @@ pub struct MachineConfig {
     /// cpuset, so a pin onto it is refused until the thread is inside the
     /// partition. A descriptor rather than a path because the kernel checks a
     /// cgroup move against whoever opened the file, so whoever set the
-    /// partition up can open it and hand it on, and nesbox needs neither the
+    /// partition up can open it and hand it on, and conduit-vmm needs neither the
     /// privilege nor a view of the cgroup filesystem to use it.
     #[serde(default)]
     pub vcpu_cgroup_fd: Option<i32>,
@@ -729,7 +729,7 @@ mod whole_config_tests {
     const HAND_WRITTEN: &str = r#"{
       "boot-source": {
         "kernel_image_path": "/mnt/INSTANCES/DEV/vmlinux",
-        "boot_args": "console=hvc0 root=/dev/vda ro nestri.ip=192.168.128.11/24 nestri.gw=192.168.128.1"
+        "boot_args": "console=hvc0 root=/dev/vda ro conduit.ip=192.168.128.11/24 conduit.gw=192.168.128.1"
       },
       "drives": [
         { "drive_id": "rootfs", "path_on_host": "/mnt/INSTANCES/DEV/testrootfs.ext4",
@@ -739,7 +739,7 @@ mod whole_config_tests {
         "vcpu_count": 8, "mem_size_mib": 8192, "cpu_affinity": [0,1,2,3]
       },
       "gpu": { "render-node": "/dev/dri/renderD128", "width": 1920, "height": 1080 },
-      "network": { "tap-name": "nesbox0", "mac": "02:00:00:00:00:01" },
+      "network": { "tap-name": "conduit0", "mac": "02:00:00:00:00:01" },
       "shared-directories": [
         { "tag": "install", "path-on-host": "/mnt/GAMEDRIVE/nes/632360", "read-only": true },
         { "tag": "user", "path-on-host": "/mnt/INSTANCES/users/usr_x", "read-only": false }
@@ -750,23 +750,23 @@ mod whole_config_tests {
     fn a_hand_written_config_parses() {
         let config: VmConfig = serde_json::from_str(HAND_WRITTEN).expect("parses");
         let net = config.network.as_ref().expect("has a network");
-        assert_eq!(net.tap_name, "nesbox0");
+        assert_eq!(net.tap_name, "conduit0");
         assert_eq!(config.machine_config.cpu_affinity, vec![0, 1, 2, 3]);
         assert_eq!(config.machine_config.vcpu_count, 8);
     }
 
-    /// The network section is down to what nesbox can act on by itself.
+    /// The network section is down to what conduit-vmm can act on by itself.
     /// Addresses, netmasks and bridges were host administration wearing a VM
     /// config's clothes, and they are the setup script's now.
     #[test]
     fn the_network_section_is_only_a_tap_and_a_mac() {
-        let net: Network = serde_json::from_str(r#"{ "tap-name": "nesbox1" }"#).expect("parses");
-        assert_eq!(net.tap_name, "nesbox1");
+        let net: Network = serde_json::from_str(r#"{ "tap-name": "conduit1" }"#).expect("parses");
+        assert_eq!(net.tap_name, "conduit1");
         assert!(net.mac.is_none());
     }
 
     /// An exact name, because the host made the device. `%d` only ever worked
-    /// when nesbox was the one creating it.
+    /// when conduit-vmm was the one creating it.
     #[test]
     fn a_tap_name_is_required() {
         assert!(serde_json::from_str::<Network>(r#"{ "mac": "02:00:00:00:00:01" }"#).is_err());
@@ -775,7 +775,7 @@ mod whole_config_tests {
     /// A key this build does not know is refused, not dropped.
     ///
     /// The case that prompted it: a config naming `gpu-forward` handed to a
-    /// nesbox built before that device existed. It parsed, the key was
+    /// conduit-vmm built before that device existed. It parsed, the key was
     /// dropped, and the guest booted with no GPU while the forwarding backend
     /// waited on a socket nobody connected to. The key here stands in for
     /// whatever the *next* such device is called -- this build knows

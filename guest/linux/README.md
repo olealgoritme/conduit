@@ -1,47 +1,48 @@
-# driver
+# guest/linux
 
-The guest kernel module, `virtio_gpu_nv.ko`. Licensed GPL-2.0
-(`LICENSE-GPL-2.0`), which kernel symbol access requires.
+Conduit's guest kernel module, `virtio_gpu_nv.ko`. Licensed GPL-2.0
+(`LICENSE`).
 
-The module registers NVIDIA's device nodes in the guest: `/dev/nvidiactl`,
-`/dev/nvidia0` to `/dev/nvidiaN`, `/dev/nvidia-modeset`, `/dev/nvidia-uvm`, and
-a DRM render node per GPU. NVIDIA's own user-mode driver runs unchanged on top
-of them. The module forwards each `ioctl()` and `mmap()` on the control queue
-and waits for the backend's answer on the same queue. Readiness for `poll()`
-arrives on the event queue.
+Inside the VM it creates NVIDIA's device nodes (`/dev/nvidiactl`,
+`/dev/nvidia0..N`, `/dev/nvidia-modeset`, `/dev/nvidia-uvm`) and a DRM device,
+so NVIDIA's own user-mode driver runs unchanged. Each `ioctl()` and `mmap()` is
+forwarded over virtio to `conduit-backend` on the host; GPU memory is mapped
+straight from the device's shared-memory regions, never copied.
 
-The module copies parameter blocks and does not interpret RM calls. The few
-things it has to do itself are things only the guest kernel can do:
+It also provides:
 
-- Replace a guest file descriptor inside a parameter block with the backend's
-  handle for the same file.
-- Pin the pages behind memory a process registers by CPU address, and send
-  their guest-physical addresses.
-- Map what the backend placed. Device memory comes from the shared window,
-  region 1. A CUDA semaphore pool comes from the UVM aperture, region 2, mapped
-  write-back.
+- a KMS display (virtual CRTC, plane, connector) whose flips go to
+  `conduit-viewer` / `conduit-stream` as dma-bufs (`nvgpu_kms.h`,
+  `docs/SCANOUT.md`),
+- keyboard, mouse and power-key input from the viewer,
+- `/dev/conduit-clipboard` for `guest/agent/conduit-clipboard-agent`
+  (`docs/CLIPBOARD.md`).
 
-Which files the guest is shown, which UVM calls exist and how large each RM
-allocation block is come from the backend at probe time. The module carries
-the RM control tables for every supported release and picks one by the host's
-version, which it reads from device config.
+The module does not interpret RM calls. It only does what needs the guest
+kernel: swapping file descriptors for backend handles, pinning memory a
+process registers by address, and mapping what the backend placed.
 
-With a display the module also registers `/dev/conduit-clipboard`
-(`nvgpu_clipboard.h`), which `guest/agent/conduit-clipboard-agent` connects to
-the desktop session's clipboard; see `docs/CLIPBOARD.md`.
+## Install (DKMS)
 
-## Building
+The `conduit-guest` package (`.deb` / `.rpm`) installs the source to
+`/usr/src/conduit-guest-<version>/` and DKMS rebuilds it for every installed
+kernel. `conduit create` and `conduit attach` install it for you. To build the
+package: `make guest-deb` or `make guest-rpm` at the repo root. Linux 6.4 or
+newer is required.
+
+## Build by hand
 
 ```sh
-make -C driver KDIR=/path/to/guest/kernel/build
+make -C guest/linux                                   # this machine's kernel
+make -C guest/linux KDIR=/lib/modules/<ver>/build     # another kernel's headers
 ```
 
-`KDIR` is the build tree of the guest kernel the module loads into, not the
-host's. In a kernel tree, `CONFIG_VIRTIO_GPU_NV` builds it in tree.
+`KDIR` is the build tree of the kernel the module will be *loaded* into (the
+guest's). Any distro kernel with headers installed works; CI builds against
+Ubuntu 24.04 (GA and HWE), Debian 13 and Fedora with zero warnings.
+`nvgpu_compat.h` covers API differences between kernel versions. In a kernel
+tree, `CONFIG_VIRTIO_GPU_NV` builds it in tree (`Kconfig`);
+`guest-kernel.config` is a minimal config for a custom guest `vmlinux`.
 
-`guest-kernel.config` is the configuration the rig's guest kernel is built
-with. `scripts/build-guest-kernel.sh` builds that kernel. The module's
-vermagic must match the guest kernel exactly, and `rig.sh module` prints it.
-
-`gen/` and `rmctrl/` hold headers generated from NVIDIA's sources by the
-scripts in the top-level `gen/`. Don't edit them by hand.
+`gen/` and `rmctrl/` are generated from NVIDIA's open kernel modules by
+`host/backend/gen/` (see its README). Don't edit them by hand.
