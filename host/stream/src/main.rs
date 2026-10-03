@@ -421,9 +421,8 @@ fn serve(o: ServeOpts) -> Result<()> {
             udp::ping_loop(h, audio, udp::Kind::Audio)
         });
         let h = host.clone();
-        let outbox = Arc::new(control::Outbox::default());
         spawn("control", move || {
-            if let Err(e) = control::serve(h, outbox) {
+            if let Err(e) = control::serve(h) {
                 log::error!("control: {e:#}");
                 std::process::exit(1);
             }

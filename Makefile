@@ -10,7 +10,7 @@
 #   make release      tag the next patch version and let GitHub build packages
 #                     (release-minor / release-major / packaging/release.sh X.Y.Z)
 #
-# Single parts: make backend | vmm | cli | viewer | guest | qemu
+# Single parts: make backend | vmm | cli | viewer | guest | qemu | stream
 # The guest module builds against this machine's kernel; KDIR=... overrides.
 
 CARGO  ?= cargo
@@ -19,9 +19,9 @@ JOBS   ?= $(shell nproc)
 # Tests that open the real /dev/nvidiactl; kept out of `make test`.
 GPU_TESTS := --skip for_real --skip closing_the_fd --skip repeated_map_unmap
 
-.PHONY: all backend vmm cli viewer guest qemu test install package deps clean help release release-minor release-major
+.PHONY: all backend vmm cli viewer guest qemu stream test install package deps clean help release release-minor release-major
 
-all: backend vmm cli viewer guest qemu
+all: backend vmm cli viewer guest qemu stream
 	@echo
 	@echo "Built. Try: ./target/release/conduit doctor"
 
@@ -37,6 +37,10 @@ cli:
 viewer:
 	$(MAKE) -C host/viewer -j$(JOBS)
 
+# The network stream host (Moonlight, conduit link); docs/STREAMING.md.
+stream:
+	cd host/stream && $(CARGO) build --release
+
 guest:
 	$(MAKE) -C guest/linux KDIR=$(KDIR)
 
@@ -50,6 +54,7 @@ test:
 	$(CARGO) test -p conduit
 	cd host/backend && $(CARGO) test --workspace --features device/vhost-user -- $(GPU_TESTS)
 	cd host/vmm && $(CARGO) test --workspace --no-default-features
+	cd host/stream && $(CARGO) test
 	$(MAKE) -C host/viewer check
 
 # Builds the release tarball and runs its installer (the same path users take).
@@ -74,6 +79,7 @@ clean:
 	$(CARGO) clean
 	cd host/backend && $(CARGO) clean
 	cd host/vmm && $(CARGO) clean
+	cd host/stream && $(CARGO) clean
 	$(MAKE) -C host/viewer clean
 	$(MAKE) -C guest/linux clean KDIR=$(KDIR)
 	rm -rf dist

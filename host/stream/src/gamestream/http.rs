@@ -15,7 +15,6 @@ pub struct Request {
     pub path: String,
     /// The whole target as sent (RTSP needs it).
     pub target: String,
-    pub protocol: String,
     pub query: HashMap<String, String>,
     /// Header names lower-cased.
     pub headers: HashMap<String, String>,
@@ -76,7 +75,7 @@ pub fn parse(buf: &[u8]) -> Option<(Request, usize)> {
     let mut parts = first.split(' ');
     let method = parts.next()?.to_string();
     let target = parts.next()?.to_string();
-    let protocol = parts.next().unwrap_or("").to_string();
+    let _protocol = parts.next();
     if method.is_empty() || target.is_empty() || parts.next().is_some() {
         return None;
     }
@@ -105,7 +104,6 @@ pub fn parse(buf: &[u8]) -> Option<(Request, usize)> {
             method,
             path,
             target,
-            protocol,
             query,
             headers,
             body: buf[end + 4..total].to_vec(),
@@ -222,7 +220,6 @@ mod tests {
         let raw = b"ANNOUNCE streamid=control/13/0 RTSP/1.0\r\nCSeq: 6\r\nContent-length: 5\r\n\r\nv=0\r\nEXTRA";
         let (r, n) = parse(raw).unwrap();
         assert_eq!(r.method, "ANNOUNCE");
-        assert_eq!(r.protocol, "RTSP/1.0");
         assert_eq!(r.body, b"v=0\r\n");
         assert_eq!(n, raw.len() - 5);
         assert!(parse(b"ANNOUNCE x RTSP/1.0\r\nContent-Length: 10\r\n\r\nshort").is_none());

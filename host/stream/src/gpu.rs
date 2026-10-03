@@ -124,7 +124,6 @@ pub struct DecFrame {
 extern "C" {
     fn cs_gpu_open(node: *const c_char, err: *mut c_char, errlen: usize) -> *mut CsGpu;
     fn cs_gpu_close(g: *mut CsGpu);
-    fn cs_gpu_format_ok(g: *mut CsGpu, fourcc: u32, modifier: u64) -> c_int;
     fn cs_gpu_modifiers(g: *mut CsGpu, fourcc: u32, out: *mut u64, max: usize) -> usize;
     fn cs_gpu_codec_caps(g: *mut CsGpu, codec: c_int) -> u32;
     fn cs_gpu_set_frame(
@@ -140,7 +139,6 @@ extern "C" {
         err: *mut c_char,
         errlen: usize,
     ) -> c_int;
-    fn cs_gpu_clear_frame(g: *mut CsGpu);
     fn cs_gpu_frame_size(g: *mut CsGpu, w: *mut u32, h: *mut u32);
     fn cs_gpu_set_cursor(
         g: *mut CsGpu,
@@ -270,11 +268,6 @@ impl Gpu {
         })
     }
 
-    pub fn format_ok(&self, fourcc: u32, modifier: u64) -> bool {
-        // SAFETY: valid handle.
-        unsafe { cs_gpu_format_ok(self.g, fourcc, modifier) != 0 }
-    }
-
     /// Modifiers EGL imports for `fourcc` (LINEAR included if supported).
     pub fn modifiers(&self, fourcc: u32) -> Vec<u64> {
         let mut v = vec![0u64; 128];
@@ -312,11 +305,6 @@ impl Gpu {
             return Err(anyhow!("{}", e.get()));
         }
         Ok(())
-    }
-
-    pub fn clear_frame(&self) {
-        // SAFETY: valid handle.
-        unsafe { cs_gpu_clear_frame(self.g) }
     }
 
     pub fn frame_size(&self) -> (u32, u32) {

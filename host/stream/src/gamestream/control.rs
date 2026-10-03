@@ -5,15 +5,14 @@
 //!   IV = LE32(seq) ‖ 0 ‖ 'C'/'H' ‖ 'C'
 //!
 //! Input, IDR and reference-frame-invalidation requests, pings and loss
-//! reports arrive here. ENet is not thread-safe: only this thread touches it;
-//! others queue messages with `queue()`.
+//! reports arrive here. ENet is not thread-safe: only this thread touches it.
 
 use crate::host::Host;
 use crate::session::{self, Session};
 use anyhow::{bail, Result};
 use openssl::symm::{decrypt_aead, encrypt_aead, Cipher};
 use std::ffi::{c_char, c_void};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const T_ENCRYPTED: u16 = 0x0001;
@@ -26,8 +25,6 @@ pub const T_IDR: u16 = 0x0302;
 pub const T_START_A: u16 = 0x0305;
 pub const T_START_B: u16 = 0x0307;
 pub const T_TERMINATION: u16 = 0x0109;
-pub const T_RUMBLE: u16 = 0x010b;
-pub const T_HDR: u16 = 0x010e;
 pub const T_FEC_STATUS: u16 = 0x5502;
 pub const T_LTR_ACK: u16 = 0x0350;
 
@@ -125,18 +122,6 @@ pub fn open(key: &[u8; 16], msg: &[u8]) -> Result<(u16, Vec<u8>)> {
     Ok((ity, p[4..].to_vec()))
 }
 
-/// Messages other threads want sent: (session id, type, payload).
-#[derive(Default)]
-pub struct Outbox {
-    pub msgs: Mutex<Vec<(u32, u16, Vec<u8>)>>,
-}
-
-impl Outbox {
-    pub fn queue(&self, session: u32, ty: u16, payload: Vec<u8>) {
-        self.msgs.lock().unwrap().push((session, ty, payload));
-    }
-}
-
 struct Peer {
     peer: *mut c_void,
     session: Arc<Session>,
@@ -175,7 +160,7 @@ fn dispatch(host: &Host, s: &Session, ty: u16, p: &[u8]) {
     }
 }
 
-pub fn serve(host: Arc<Host>, outbox: Arc<Outbox>) -> Result<()> {
+pub fn serve(host: Arc<Host>) -> Result<()> {
     // SAFETY: creates an ENet host owned by this thread for its lifetime.
     let h = unsafe { cs_enet_host(host.ports.control, 8) };
     if h.is_null() {
@@ -253,23 +238,7 @@ pub fn serve(host: Arc<Host>, outbox: Arc<Outbox>) -> Result<()> {
                 _ => {}
             }
         }
-        // Outgoing, and peers whose session is over.
-        let msgs: Vec<_> = std::mem::take(&mut *outbox.msgs.lock().unwrap());
-        for (sid, ty, payload) in msgs {
-            if let Some(p) = peers.iter_mut().find(|p| p.session.id == sid) {
-                let m = if p.session.cfg.control_v2 {
-                    p.seq += 1;
-                    seal(&p.session.launch.rikey, p.seq, ty, &payload)
-                } else {
-                    let mut m = ty.to_le_bytes().to_vec();
-                    m.extend_from_slice(&(payload.len() as u16).to_le_bytes());
-                    m.extend_from_slice(&payload);
-                    m
-                };
-                // SAFETY: live peer of this host.
-                unsafe { cs_enet_send(p.peer, 0, m.as_ptr(), m.len(), 1) };
-            }
-        }
+        // Peers whose session is over.
         let before = peers.len();
         peers.retain(|p| {
             if p.session.alive() {

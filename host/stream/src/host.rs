@@ -72,17 +72,15 @@ pub fn preset(name: &str) -> Option<Preset> {
 pub struct Launch {
     pub id: u32,
     pub rikey: [u8; 16],
+    /// The audio encryption IV's first word (for the audio path, audio.rs).
+    #[allow(dead_code)]
     pub rikeyid: u32,
-    pub width: u32,
-    pub height: u32,
-    pub fps: u32,
     pub client_name: String,
     /// 16 characters echoed in the clients' UDP pings.
     pub ping_payload: String,
     pub connect_data: u32,
     pub encrypted_rtsp: bool,
     pub surround_params: String,
-    pub created: Instant,
 }
 
 /// A pairing in progress, keyed by the client's uniqueid.

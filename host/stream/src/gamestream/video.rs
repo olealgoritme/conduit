@@ -160,9 +160,7 @@ impl Packetizer {
             let multi = ((bi as u8) << 4) | (((nblocks - 1) as u8) << 6);
             for (x, s) in blk.iter_mut().enumerate() {
                 let nv = &mut s[RTP_HEADER + 4..SHARD_HEADER];
-                nv[0..4].copy_from_slice(
-                    &(((self.seq as u32).wrapping_add(x as u32)) << 8).to_le_bytes(),
-                );
+                nv[0..4].copy_from_slice(&(self.seq.wrapping_add(x as u32) << 8).to_le_bytes());
                 nv[4..8].copy_from_slice(&frame_index.to_le_bytes());
                 let mut flags = FLAG_CONTAINS_PIC_DATA;
                 if x == 0 {

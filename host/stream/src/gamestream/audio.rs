@@ -1,3 +1,5 @@
+// Ready for the audio source; nothing feeds it yet (see below).
+#![allow(dead_code)]
 //! Audio: designed, not yet fed (the VM has no sound device yet).
 //!
 //! The path once virtio-sound exists (see docs/STREAMING.md):

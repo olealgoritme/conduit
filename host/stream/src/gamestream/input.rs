@@ -66,7 +66,7 @@ impl Geometry {
         }
     }
     /// Stream pixel → guest pixel, clamped into the picture.
-    pub fn to_guest(&self, x: f64, y: f64) -> (i32, i32) {
+    pub fn map_to_guest(&self, x: f64, y: f64) -> (i32, i32) {
         let (rx, ry, rw, rh) = self.rect();
         let (gw, gh) = self.guest();
         let gx = ((x - rx) * gw as f64 / rw)
@@ -412,7 +412,7 @@ impl InputState {
                 );
                 let sx = (x as f64 + 0.5) * self.geo.sw as f64 / w;
                 let sy = (y as f64 + 0.5) * self.geo.sh as f64 / h;
-                let (gx, gy) = self.geo.to_guest(sx, sy);
+                let (gx, gy) = self.geo.map_to_guest(sx, sy);
                 self.abs_guest(gx, gy, &mut out);
             }
             MOUSE_REL | MOUSE_REL_GEN5 => {

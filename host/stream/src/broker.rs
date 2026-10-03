@@ -32,16 +32,12 @@ pub const CMD_CURSOR: u16 = 7;
 
 pub const EV_HELLO: u16 = 1;
 pub const EV_SURFACE: u16 = 2;
-pub const EV_FRAME: u16 = 3;
 pub const EV_KEY: u16 = 5;
 pub const EV_BTN: u16 = 6;
 pub const EV_ABS: u16 = 7;
 pub const EV_REL: u16 = 8;
 pub const EV_WHEEL: u16 = 9;
-pub const EV_GRAB: u16 = 10;
 pub const EV_FOCUS: u16 = 11;
-pub const EV_POINTER: u16 = 12;
-pub const EV_BYE: u16 = 13;
 pub const EV_CLOSE: u16 = 14;
 pub const EV_FORMAT: u16 = 16;
 pub const EV_MODE_HINT: u16 = 17;
@@ -49,15 +45,12 @@ pub const EV_MODE_HINT: u16 = 17;
 /// CLIENT_GAMEPAD): x = evdev code, y = value, w0 = pad index << 16 | evdev type.
 pub const EV_PAD: u16 = 18;
 
-pub const F_GRABBED: u16 = 1 << 0;
 pub const F_FOCUSED: u16 = 1 << 1;
-pub const F_FULLSCREEN: u16 = 1 << 2;
 
 pub const CAP_KEYBOARD: u32 = 1 << 0;
 pub const CAP_ABS_POINTER: u32 = 1 << 1;
 pub const CAP_REL_POINTER: u32 = 1 << 2;
 pub const CAP_FOCUS_EVENTS: u32 = 1 << 5;
-pub const CAP_FULLSCREEN: u32 = 1 << 6;
 pub const CAP_DMABUF: u32 = 1 << 7;
 pub const CAP_MODIFIERS: u32 = 1 << 8;
 pub const CAP_MODE_HINTS: u32 = 1 << 10;
@@ -66,7 +59,6 @@ pub const CAP_GAMEPAD: u32 = 1 << 13;
 
 pub const HINT_RESTORE: u32 = 0;
 pub const HINT_FULLSCREEN: u32 = 1;
-pub const HINT_FIXED: u32 = 3;
 
 pub const CLIENT_SEQ_USEC: u32 = 1 << 1;
 /// CMD_CAPS bit (Conduit addition): the backend carries EV_PAD to the guest.
@@ -179,8 +171,8 @@ impl Pkt {
 pub struct Frame {
     pub fd: OwnedFd,
     pub desc: BufDesc,
-    /// Backend's CLOCK_MONOTONIC µs at the flip (low 32 bits), if announced.
-    pub flip_us: Option<u32>,
+    /// When the guest flipped (the backend's stamp, CLOCK_MONOTONIC like
+    /// Instant), or when it arrived here if the backend sends no stamp.
     pub received: Instant,
 }
 
@@ -271,6 +263,16 @@ impl Shared {
         self.inbox.lock().unwrap().kick += 1;
         self.cv.notify_all();
     }
+}
+
+fn mono_us32() -> u32 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime into a local.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000) as u32
 }
 
 /// Inode of a dma-buf: the buffer's identity across separate fds.
@@ -451,11 +453,22 @@ fn session(s: UnixStream, sh: &Arc<Shared>, on_connect: &dyn Fn()) -> Result<()>
                         fourcc: c.fourcc,
                         modifier: c.modifier,
                     };
+                    let now = Instant::now();
+                    let received = if seq_usec {
+                        // seq = the flip's CLOCK_MONOTONIC µs, low 32 bits.
+                        let age = mono_us32().wrapping_sub(c.seq);
+                        if age < 1_000_000 {
+                            now - Duration::from_micros(age as u64)
+                        } else {
+                            now
+                        }
+                    } else {
+                        now
+                    };
                     let frame = Frame {
                         fd: f,
                         desc,
-                        flip_us: seq_usec.then_some(c.seq),
-                        received: Instant::now(),
+                        received,
                     };
                     let mut ib = sh.inbox.lock().unwrap();
                     if ib.frame.replace(frame).is_some() {

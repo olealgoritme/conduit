@@ -500,15 +500,11 @@ fn launch(
         id: host.new_id(),
         rikey,
         rikeyid: rikeyid as u32,
-        width: w,
-        height: h,
-        fps,
         client_name: client.unwrap_or_default(),
         ping_payload: random_hex(8),
         connect_data: u32::from_le_bytes(cd),
         encrypted_rtsp: corever >= 1,
         surround_params: req.q("surroundparams").unwrap_or("").to_string(),
-        created: Instant::now(),
     };
     log::info!(
         "{} by {:?}: {}x{}@{}{}",

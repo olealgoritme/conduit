@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 pub const SS_ENC_CONTROL_V2: u32 = 0x01;
 pub const SS_ENC_VIDEO: u32 = 0x02;
 pub const SS_ENC_AUDIO: u32 = 0x04;
-pub const ML_FF_FEC_STATUS: u32 = 0x01;
 pub const ML_FF_SESSION_ID_V1: u32 = 0x02;
 
 /// The client's stream request, from the ANNOUNCE body.

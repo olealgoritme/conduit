@@ -6,8 +6,8 @@
 //!   1. client: salt, its cert          → server: our cert (after the PIN is entered here)
 //!   2. client: E(challenge)            → server: E(SHA-256(challenge ‖ sig(our cert) ‖ S) ‖ serverchallenge)
 //!   3. client: E(clienthash)           → server: S ‖ RSA-SHA256(S) with our key
-//!   4. client: C ‖ RSA-SHA256(C)       → server checks SHA-256(serverchallenge ‖ sig(client cert) ‖ C)
-//!                                        == clienthash and the signature; then the client is paired
+//!   4. client: C ‖ RSA-SHA256(C)       → server checks the signature and that
+//!      SHA-256(serverchallenge ‖ sig(client cert) ‖ C) == clienthash; then the client is paired
 //!
 //! "sig(cert)" is the certificate's own signature bytes. Both sides prove they
 //! know the PIN and hold their certificate's key; the client cert is then pinned.
@@ -46,7 +46,7 @@ pub fn aes_key(salt: &[u8; 16], pin: &str) -> [u8; 16] {
 }
 
 pub fn ecb(key: &[u8; 16], data: &[u8], encrypt: bool) -> Result<Vec<u8>> {
-    if data.is_empty() || data.len() % 16 != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(16) {
         bail!("pairing data is not whole AES blocks");
     }
     let mut c = Crypter::new(

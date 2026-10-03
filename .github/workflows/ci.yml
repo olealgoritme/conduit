@@ -4,6 +4,7 @@
 #   guest-module  the guest kernel module against Ubuntu 24.04 (GA 6.8 and HWE),
 #                 Debian 13 (6.12) and Fedora (newest) headers
 #   viewer        the C viewer's own test suite (`make check`, no display needed)
+#   stream        conduit-stream (network streaming): fmt, clippy, tests
 #   guest-agent   the guest clipboard agent's unit tests (Python, Xvfb)
 #   packaging     shellcheck the packaging scripts, build the DKMS source package
 #
@@ -151,6 +152,34 @@ jobs:
             libxcb-present-dev libxcb-render0-dev libxcb-xinput-dev libgbm-dev python3
       - name: make check
         run: make -C host/viewer -j"$(nproc)" check
+
+  stream:
+    # conduit-stream (host/stream): fmt, clippy (zero warnings) and tests.
+    # The tests cover the protocol side (pairing crypto, RTSP/control
+    # encryption, video packets + Reed-Solomon recovery, input translation,
+    # the broker socket); NVENC/NVDEC need a GPU and run on the developer rig.
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: host/stream
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev libegl-dev libgl-dev libgbm-dev pkg-config
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host/stream
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: test
+        run: cargo test --locked
 
   guest-agent:
     # conduit-clipboard-agent: record format, echo suppression, backend

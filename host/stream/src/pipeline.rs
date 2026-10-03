@@ -10,7 +10,7 @@
 use crate::broker::{self, Frame};
 use crate::gamestream::input::Geometry;
 use crate::gamestream::{udp, video};
-use crate::gpu::{self, BufDesc, Codec, CodecCaps, EncParams, FrameOpts, Gpu};
+use crate::gpu::{self, Codec, CodecCaps, EncParams, FrameOpts, Gpu};
 use crate::host::Host;
 use crate::session::{self, Job, Session, Sink, SS_ENC_VIDEO};
 use std::collections::HashSet;
@@ -26,7 +26,6 @@ const REPEAT: Duration = Duration::from_millis(100);
 pub struct GpuInfo {
     pub codecs: [CodecCaps; 3],
     pub modifiers: HashSet<(u32, u64)>,
-    pub render_node: Option<String>,
 }
 
 pub const FOURCCS: [u32; 4] = [
@@ -139,11 +138,7 @@ pub fn run(
             modifiers.insert((f, m));
         }
     }
-    let _ = info_tx.send(Ok(GpuInfo {
-        codecs,
-        modifiers,
-        render_node,
-    }));
+    let _ = info_tx.send(Ok(GpuInfo { codecs, modifiers }));
     let Ok((host, sock)) = host_rx.recv() else {
         return;
     };
@@ -155,7 +150,6 @@ fn main_loop(g: &Gpu, host: &Arc<Host>, sock: &Arc<UdpSocket>) {
     let mut enc: Option<(u32, gpu::Encoder<'_>)> = None;
     let mut sender: Option<Sender> = None;
     let mut pending: Option<Frame> = None;
-    let mut last_received = Instant::now();
     let mut last_encode = Instant::now() - REPEAT;
     let mut last_cursor: Option<(i32, i32)> = None;
     let mut seen_kick = 0u64;
@@ -171,7 +165,7 @@ fn main_loop(g: &Gpu, host: &Arc<Host>, sock: &Arc<UdpSocket>) {
     let mut held_back = false;
     loop {
         // Wait for something to do, at most until the next due time.
-        let (cursor, kicked) = {
+        let cursor = {
             let mut ib = sh.inbox.lock().unwrap();
             let timeout = if enc.is_none() {
                 Duration::from_millis(100)
@@ -192,11 +186,9 @@ fn main_loop(g: &Gpu, host: &Arc<Host>, sock: &Arc<UdpSocket>) {
             if let Some(f) = ib.frame.take() {
                 pending = Some(f);
             }
-            let kicked = ib.kick != seen_kick;
             seen_kick = ib.kick;
-            (ib.cursor.take(), kicked)
+            ib.cursor.take()
         };
-        let _ = kicked;
         if let Some(c) = cursor {
             let r = match &c {
                 Some(img) => {
@@ -324,7 +316,6 @@ fn main_loop(g: &Gpu, host: &Arc<Host>, sock: &Arc<UdpSocket>) {
         let mut received = now;
         if let Some(f) = pending.take() {
             received = f.received;
-            last_received = f.received;
             if let Err(err) = g.set_frame(f.fd.as_raw_fd(), &f.desc) {
                 log::warn!(
                     "frame {}x{} {} {:#x}: {err:#}",
@@ -335,7 +326,6 @@ fn main_loop(g: &Gpu, host: &Arc<Host>, sock: &Arc<UdpSocket>) {
                 );
             }
         }
-        let _ = last_received;
         let mut force_idr = want_idr;
         let mut after_rfi = false;
         if let Some((first, last)) = rfi {
@@ -406,9 +396,4 @@ pub fn format_check(mods: HashSet<(u32, u64)>) -> broker::FormatCheck {
         FOURCCS.contains(&fourcc)
             && (modifier == 0x00ff_ffff_ffff_ffff || mods.contains(&(fourcc, modifier)))
     })
-}
-
-#[allow(dead_code)]
-pub fn desc_of(f: &Frame) -> BufDesc {
-    f.desc
 }

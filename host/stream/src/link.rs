@@ -21,7 +21,7 @@ use openssl::hash::MessageDigest;
 use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslStream, SslVerifyMode};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -278,15 +278,11 @@ fn video_conn(
         id: host.new_id(),
         rikey: [0; 16],
         rikeyid: 0,
-        width: 0,
-        height: 0,
-        fps,
         client_name: hello.name.clone(),
         ping_payload: String::new(),
         connect_data: 0,
         encrypted_rtsp: false,
         surround_params: String::new(),
-        created: Instant::now(),
     };
     let (tx, rx) = sync_channel::<Job>(8);
     let r = HelloReply {
@@ -533,7 +529,7 @@ pub struct ConnectOpts {
 
 /// Viewer events the decode thread cares about.
 enum FromViewer {
-    Format(u32, u64, bool),
+    Format(u64, bool),
     Gone,
 }
 
@@ -609,7 +605,7 @@ pub fn connect(o: ConnectOpts) -> Result<()> {
                 match p.ty {
                     broker::EV_FORMAT => {
                         let m = p.w0 as u64 | (p.w1 as u64) << 32;
-                        let _ = tx.send(FromViewer::Format(p.y as u32, m, p.x == 1));
+                        let _ = tx.send(FromViewer::Format(m, p.x == 1));
                     }
                     broker::EV_CLOSE => break,
                     _ if allowed(&p) => {
@@ -643,7 +639,7 @@ pub fn connect(o: ConnectOpts) -> Result<()> {
     let mut answers = 0;
     while answers < candidates.len() && Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(FromViewer::Format(_, m, ok)) => {
+            Ok(FromViewer::Format(m, ok)) => {
                 answers += 1;
                 if ok {
                     ok_mods.push(m);
