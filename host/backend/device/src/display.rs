@@ -276,6 +276,10 @@ pub mod wire {
     /// virtio-nvgpu: x,y = mode in buffer pixels (0,0 = the configured
     /// mode), w0 = refresh mHz (0 = configured), w1 = reason.
     pub const EV_MODE_HINT: u16 = 17;
+    /// Conduit (stream host): one gamepad event. x = evdev code, y = value,
+    /// w0 = pad << 16 | evdev type (EV_KEY, EV_ABS, EV_SYN); pad 0..3.
+    /// Sent only to a client that declared [`CLIENT_GAMEPAD`].
+    pub const EV_PAD: u16 = 18;
 
     pub const F_FULLSCREEN: u16 = 1 << 2;
 
@@ -285,12 +289,18 @@ pub mod wire {
     /// The broker takes and sends clipboard transfers up to
     /// [`CLIP_LARGE_MAX`] with a client that declared [`CLIENT_CLIP_LARGE`].
     pub const CAP_CLIP_LARGE: u32 = 1 << 12;
+    /// The broker may send [`EV_PAD`] (a stream host).
+    pub const CAP_GAMEPAD: u32 = 1 << 13;
     /// CMD_CAPS bit: a clipboard agent is behind this client.
     pub const CLIENT_CLIPBOARD: u32 = 1 << 0;
     /// CMD_CAPS bit: ATTACH/COMMIT `seq` is our CLOCK_MONOTONIC microseconds.
     pub const CLIENT_SEQ_USEC: u32 = 1 << 1;
     /// CMD_CAPS bit: we take and send large clipboard transfers.
     pub const CLIENT_CLIP_LARGE: u32 = 1 << 2;
+    /// CMD_CAPS bit: we carry [`EV_PAD`] to the guest's gamepads.
+    pub const CLIENT_GAMEPAD: u32 = 1 << 3;
+    /// Gamepads the guest driver offers (nvgpu_pad.h).
+    pub const MAX_PADS: u32 = 4;
 
     /// Clipboard framing: payload bytes per chunk, each direction.
     pub const CLIP_PKT_BYTES: usize = 15;
@@ -564,6 +574,21 @@ impl InputTranslator {
                     ));
                 }
                 Self::syn(out);
+            }
+            EV_PAD => {
+                // To the guest as an ordinary event whose type carries the
+                // pad: (pad + 1) << 8 | type. Guests without gamepads drop it.
+                let (pad, ty) = (p.w0 >> 16, (p.w0 & 0xffff) as u16);
+                let ok_ty = matches!(ty, input::EV_KEY | input::EV_ABS | input::EV_SYN);
+                let Ok(code) = u16::try_from(p.x) else { return };
+                if pad >= MAX_PADS || !ok_ty || (ty == input::EV_KEY && code > input::KEY_MAX) {
+                    return;
+                }
+                out.push(InputEventEntry::new(
+                    ((pad as u16 + 1) << 8) | ty,
+                    code,
+                    p.y,
+                ));
             }
             EV_FOCUS | EV_GRAB if p.x == 0 => self.release_all(out),
             EV_FOCUS | EV_GRAB => {}
@@ -1176,7 +1201,10 @@ impl DisplayLink {
         if let Some(sock) = st.sock.clone() {
             let caps_cmd = wire::Cmd {
                 ty: wire::CMD_CAPS,
-                width: wire::CLIENT_SEQ_USEC | wire::CLIENT_CLIPBOARD | wire::CLIENT_CLIP_LARGE,
+                width: wire::CLIENT_SEQ_USEC
+                    | wire::CLIENT_CLIPBOARD
+                    | wire::CLIENT_CLIP_LARGE
+                    | wire::CLIENT_GAMEPAD,
                 ..Default::default()
             };
             if let Err(e) = send_records(sock.as_raw_fd(), &caps_cmd.encode(), None) {
@@ -1891,6 +1919,37 @@ mod tests {
         );
         assert_eq!(t.held(), 2);
 
+        // Gamepads: the pad rides in the type's high byte; bad ones are dropped.
+        let mut pads = Vec::new();
+        t.packet(
+            &pkt(wire::EV_PAD, 0x130, 1, (1 << 16) | EV_KEY as u32, 0),
+            &mut pads,
+        );
+        t.packet(
+            &pkt(wire::EV_PAD, ABS_X as i32, -500, EV_ABS as u32, 0),
+            &mut pads,
+        );
+        t.packet(
+            &pkt(wire::EV_PAD, 0, 0, (1 << 16) | EV_SYN as u32, 0),
+            &mut pads,
+        );
+        t.packet(
+            &pkt(wire::EV_PAD, 0x130, 1, (9 << 16) | EV_KEY as u32, 0),
+            &mut pads,
+        );
+        t.packet(
+            &pkt(wire::EV_PAD, 0, 1, (1 << 16) | EV_REL as u32, 0),
+            &mut pads,
+        );
+        assert_eq!(
+            pads,
+            vec![
+                ev(0x200 | EV_KEY, 0x130, 1),
+                ev(0x100 | EV_ABS, ABS_X, -500),
+                ev(0x200 | EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+
         // Focus loss releases what is held, so no key sticks in the guest.
         out.clear();
         t.packet(&pkt(wire::EV_FOCUS, 0, 0, 0, 0), &mut out);
@@ -2235,7 +2294,10 @@ mod tests {
             (c.ty, c.width),
             (
                 wire::CMD_CAPS,
-                wire::CLIENT_SEQ_USEC | wire::CLIENT_CLIPBOARD | wire::CLIENT_CLIP_LARGE
+                wire::CLIENT_SEQ_USEC
+                    | wire::CLIENT_CLIPBOARD
+                    | wire::CLIENT_CLIP_LARGE
+                    | wire::CLIENT_GAMEPAD
             )
         );
         assert!(!link.cursor_owed());

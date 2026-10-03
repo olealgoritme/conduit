@@ -62,7 +62,7 @@ pub const CAP_DMABUF: u32 = 1 << 7;
 pub const CAP_MODIFIERS: u32 = 1 << 8;
 pub const CAP_MODE_HINTS: u32 = 1 << 10;
 pub const CAP_CURSOR: u32 = 1 << 11;
-pub const CAP_GAMEPAD: u32 = 1 << 12;
+pub const CAP_GAMEPAD: u32 = 1 << 13;
 
 pub const HINT_RESTORE: u32 = 0;
 pub const HINT_FULLSCREEN: u32 = 1;
@@ -70,7 +70,7 @@ pub const HINT_FIXED: u32 = 3;
 
 pub const CLIENT_SEQ_USEC: u32 = 1 << 1;
 /// CMD_CAPS bit (Conduit addition): the backend carries EV_PAD to the guest.
-pub const CLIENT_GAMEPAD: u32 = 1 << 2;
+pub const CLIENT_GAMEPAD: u32 = 1 << 3;
 pub const MAX_DIM: u32 = 8192;
 pub const CURSOR_MAX_DIM: u32 = 256;
 

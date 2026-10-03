@@ -977,7 +977,10 @@ static int nvgpu_kms_init(struct nvgpu_dri_dev *dri, struct drm_device *drm) {
 
 #define NVGPU_INPUT_ABS_MAX 0x7fff /* protocol INPUT_ABS_MAX: mode-independent */
 
+#include "nvgpu_pad.h"
+
 struct nvgpu_input {
+  struct nvgpu_pads pads; /* gamepads from a stream client (nvgpu_pad.h) */
   struct input_dev *kbd;
   struct input_dev *mouse;  /* relative */
   struct input_dev *tablet; /* absolute */
@@ -1022,6 +1025,7 @@ static void nvgpu_input_free(struct nvgpu_input *in) {
   struct input_dev **devs[] = {&in->kbd, &in->mouse, &in->tablet};
   unsigned int i;
 
+  nvgpu_pads_free(&in->pads);
   for (i = 0; i < ARRAY_SIZE(devs); i++) {
     if (*devs[i])
       input_unregister_device(*devs[i]);
@@ -1038,6 +1042,7 @@ static int nvgpu_input_create(struct nvgpu_device *dev) {
   in = kzalloc(sizeof(*in), GFP_KERNEL);
   if (!in)
     return -ENOMEM;
+  nvgpu_pads_init(&in->pads, &dev->vdev->dev);
 
   /* Separate devices, because libinput classifies a device by what it has:
    * relative and absolute axes on one device make neither work well. */
@@ -1109,6 +1114,11 @@ static void nvgpu_input_destroy(struct nvgpu_device *dev) {
 static void nvgpu_input_route(struct nvgpu_input *in, u16 type, u16 code,
                               s32 value) {
   struct input_dev *to = NULL;
+
+  if (type >> 8) { /* a gamepad: (pad + 1) << 8 | type */
+    nvgpu_pad_event(&in->pads, type >> 8, type & 0xff, code, value);
+    return;
+  }
 
   switch (type) {
   case EV_SYN:

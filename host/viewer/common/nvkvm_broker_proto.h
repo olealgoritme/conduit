@@ -128,6 +128,17 @@ enum {
      * frame path displays whatever size arrives.
      */
     NVKVM_BROKER_EV_MODE_HINT = 17,
+
+    /*
+     * EV_PAD -- one gamepad event (Conduit; from a stream host, which takes
+     * input from Moonlight clients). Only to a client that declared
+     * NVKVM_BROKER_CLIENT_GAMEPAD:
+     *     x  = Linux evdev code (BTN_SOUTH..., ABS_X...)
+     *     y  = value
+     *     w0 = pad << 16 | evdev type (EV_KEY, EV_ABS or EV_SYN); pad 0..3
+     * The backend carries it to the guest driver's gamepads (nvgpu_pad.h).
+     */
+    NVKVM_BROKER_EV_PAD = 18,
 };
 
 #define NVKVM_BROKER_HINT_RESTORE    0u  /* windowed, scaled: configured mode */
@@ -262,6 +273,8 @@ enum {
  * types; two transfers never interleave.
  */
 #define NVKVM_BROKER_CAP_CLIP_LARGE   (1u << 12)
+/* The broker may send EV_PAD (a stream host; the viewer does not). */
+#define NVKVM_BROKER_CAP_GAMEPAD      (1u << 13)
 
 /* BYE reason codes. */
 enum {
@@ -456,6 +469,8 @@ enum {
  * NVKVM_BROKER_CLIP_LARGE_MAX_BYTES.  Meaningful only to a broker that
  * advertised NVKVM_BROKER_CAP_CLIP_LARGE. */
 #define NVKVM_BROKER_CLIENT_CLIP_LARGE (1u << 2)
+/* The client carries EV_PAD to the guest's gamepads. */
+#define NVKVM_BROKER_CLIENT_GAMEPAD    (1u << 3)
 
 /*
  * Explicitly laid out so every field is naturally aligned and the struct is
