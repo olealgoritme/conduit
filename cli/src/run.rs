@@ -80,8 +80,26 @@ impl Rt {
     fn gpu_sock(&self) -> PathBuf {
         self.p("gpu.sock")
     }
+    /// The local viewer's display socket.
     pub(crate) fn display_sock(&self) -> PathBuf {
         self.p("display.sock")
+    }
+    /// The stream host's display socket. The backend connects to both, so
+    /// the VM can be viewed and streamed at the same time.
+    pub(crate) fn stream_sock(&self) -> PathBuf {
+        self.p("stream.sock")
+    }
+    /// Does the running backend connect to [`Rt::stream_sock`]? `None` when
+    /// it cannot be told (a libvirt VM, whose backend systemd started).
+    pub(crate) fn backend_takes_stream_sock(&self) -> Option<bool> {
+        let st = self.state();
+        let pid = self.pid("backend", &st.backend_comm)?;
+        let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let want = self.stream_sock();
+        Some(
+            cmd.split(|b| *b == 0)
+                .any(|a| a == want.as_os_str().as_encoded_bytes()),
+        )
     }
     fn vfs_sock(&self) -> PathBuf {
         self.p("vfs.sock")
@@ -220,7 +238,9 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
         cmd.arg("--display")
             .arg(m.to_string())
             .arg("--display-socket")
-            .arg(rt.display_sock());
+            .arg(rt.display_sock())
+            .arg("--display-socket")
+            .arg(rt.stream_sock());
     }
     let level = std::env::var("RUST_LOG").unwrap_or_else(|_| {
         if mode.is_some() {
@@ -1078,6 +1098,7 @@ fn down_inner(c: &VmConfig, interactive: bool, verbose: bool, how: Stop) -> Resu
     Slice::stop(&c.name);
     let _ = sys::clear_stale_socket(&rt.gpu_sock());
     let _ = sys::clear_stale_socket(&rt.display_sock());
+    let _ = sys::clear_stale_socket(&rt.stream_sock());
     let _ = sys::clear_stale_socket(&rt.vfs_sock());
     let _ = sys::clear_stale_socket(&rt.qmp_sock());
     if rt.hypr_state().exists() {
@@ -1108,8 +1129,14 @@ pub fn watch(name: &str) -> Result<()> {
         std::thread::sleep(Duration::from_secs(1));
         let viewer = rt.pid("viewer", &st.viewer_comm).is_some();
         let vm = rt.pid("vm", &st.vm_comm).is_some();
-        if !viewer && vm && !st.close_stops_vm {
-            ui::info(format!("viewer window closed; {name} keeps running"));
+        // A stream of the VM keeps it running whatever the window would do.
+        let streamed = !viewer && sys::socket_live(&rt.stream_sock());
+        if !viewer && vm && (!st.close_stops_vm || streamed) {
+            ui::info(if streamed {
+                format!("viewer window closed; {name} keeps running (it is being streamed)")
+            } else {
+                format!("viewer window closed; {name} keeps running")
+            });
             let _ = std::fs::remove_file(rt.p("viewer.pid"));
             let _ = std::fs::remove_file(rt.p("watcher.pid"));
             if rt.hypr_state().exists() {

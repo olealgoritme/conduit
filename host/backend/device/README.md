@@ -38,5 +38,9 @@ against a fake host driver; the skipped ones open the real `/dev/nvidiactl`.
 ```sh
 conduit-backend --socket /run/user/1000/conduit/vm.sock \
     --caps graphics,video,utility,compute [--vram-limit-mib 8192] \
-    [--display-socket PATH]
+    [--display-socket PATH]...
 ```
+
+`--display-socket` may be given several times (the CLI passes the viewer's
+`display.sock` and the stream host's `stream.sock`); every frame goes to each
+connected client that wants it (docs/SCANOUT.md, "Several display clients").

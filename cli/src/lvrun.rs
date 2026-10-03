@@ -331,7 +331,11 @@ pub fn watch(name: &str, link: &Link) -> Result<()> {
             break;
         }
         if !viewer {
-            if st.close_stops_vm {
+            if st.close_stops_vm && sys::socket_live(&rt.stream_sock()) {
+                ui::info(format!(
+                    "viewer window closed; {name} keeps running (it is being streamed)"
+                ));
+            } else if st.close_stops_vm {
                 ui::info(format!("viewer window closed; shutting {name} down"));
                 // Held while stopping: a new `conduit view` waits for it
                 // (and says so) instead of attaching to a VM about to go.
@@ -539,7 +543,9 @@ pub fn backend_exec(name: &str) -> Result<()> {
         cmd.arg("--display")
             .arg(m.to_string())
             .arg("--display-socket")
-            .arg(rt.display_sock());
+            .arg(rt.display_sock())
+            .arg("--display-socket")
+            .arg(rt.stream_sock());
     }
     let level = std::env::var("RUST_LOG").unwrap_or_else(|_| {
         if mode.is_some() {

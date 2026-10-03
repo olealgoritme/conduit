@@ -138,6 +138,7 @@ The VM switches to the resolution you pick automatically.
 
 In a stream: **Ctrl+Alt+Shift+Q** quits, **Ctrl+Alt+Shift+Z** captures or
 releases mouse and keyboard. Keyboard, mouse and gamepads go to the VM.
+`conduit view myvm` and `conduit stream myvm` can run at the same time, started in either order.
 
 `conduit stream myvm --service` keeps streaming in the background. Conduit's
 own viewer can connect too (`conduit stream myvm --link` here,

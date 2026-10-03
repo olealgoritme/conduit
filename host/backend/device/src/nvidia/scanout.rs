@@ -39,6 +39,16 @@ impl NvidiaBackend {
         let Ok(drm_fd) = self.handles.get_raw(owner) else {
             return self.write_error_resp(resp_buf, Status::BadHandle, 0, libc::EBADF);
         };
+        // Nobody is looking (no display client, or none that wants frames):
+        // no export, no descriptor; the link only remembers which buffer it
+        // was, for a client that attaches later.
+        match self.display.as_ref() {
+            None => return self.write_hdr(resp_buf, 0, 0),
+            Some(link) if !link.wants_frames() && link.park(drm_fd, &f) => {
+                return self.write_hdr(resp_buf, 0, 0);
+            }
+            Some(_) => {}
+        }
         let host = &self.host;
         let dmabuf = match self
             .dmabufs
@@ -102,6 +112,14 @@ impl NvidiaBackend {
         let Ok(drm_fd) = self.handles.get_raw(owner) else {
             return self.write_error_resp(resp_buf, Status::BadHandle, 0, libc::EBADF);
         };
+        // As for a frame: nothing is exported for nobody.
+        match self.display.as_ref() {
+            None => return self.write_hdr(resp_buf, 0, 0),
+            Some(link) if !link.wants_frames() && link.park_cursor(drm_fd, &c) => {
+                return self.write_hdr(resp_buf, 0, 0);
+            }
+            Some(_) => {}
+        }
         let host = &self.host;
         let dmabuf = match self
             .dmabufs
@@ -136,7 +154,8 @@ impl NvidiaBackend {
     /// A forwarded `DRM_IOCTL_GEM_CLOSE`: the host may reuse the handle
     /// number, so the dma-buf exported for it goes now.
     pub(super) fn note_gem_close(&mut self, payload: &[u8]) {
-        if self.dmabufs.is_empty() || payload.len() < size_of::<IoctlReq>() + 4 {
+        let parked = self.display.as_ref().is_some_and(|l| l.has_parked());
+        if (self.dmabufs.is_empty() && !parked) || payload.len() < size_of::<IoctlReq>() + 4 {
             return;
         }
         let req = read_struct::<IoctlReq>(payload, 0);
@@ -146,12 +165,18 @@ impl NvidiaBackend {
         let at = size_of::<IoctlReq>();
         let handle = u32::from_le_bytes(payload[at..at + 4].try_into().unwrap());
         self.dmabufs.forget(self.current_handle, handle);
+        if let Some(link) = self.display.as_ref() {
+            link.forget(self.current_handle, handle);
+        }
     }
 
     /// The guest closed a file: everything exported from it goes.
     pub(super) fn forget_scanout_file(&mut self, owner: u64) {
         if !self.dmabufs.is_empty() {
             self.dmabufs.forget_owner(owner as u32);
+        }
+        if let Some(link) = self.display.as_ref() {
+            link.forget_owner(owner as u32);
         }
     }
 
@@ -181,7 +206,7 @@ mod tests {
     use super::*;
     use crate::display::DRM_IOCTL_PRIME_HANDLE_TO_FD;
     use protocol::messages::MsgHeader;
-    use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
     use std::sync::Mutex;
 
     /// Answers PRIME export with a fresh memfd and counts the calls.
@@ -216,7 +241,7 @@ mod tests {
         read_struct::<MsgHeader>(resp, 0).status
     }
 
-    fn setup() -> (NvidiaBackend, PrimeHost, u32) {
+    fn setup_without_viewer() -> (NvidiaBackend, PrimeHost, u32) {
         let mut be = NvidiaBackend::for_test();
         let host = PrimeHost::default();
         be.set_host(Box::new(host.clone()));
@@ -224,6 +249,49 @@ mod tests {
         let h = be.handles.insert(null);
         be.handle_kinds.insert(h, DeviceKind::Dri(0));
         (be, host, h as u32)
+    }
+
+    /// With a display client attached that reads nothing (the socket keeps
+    /// what the few flips here send).
+    fn setup() -> (NvidiaBackend, PrimeHost, u32) {
+        let (mut be, host, owner) = setup_without_viewer();
+        let mut sv = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) },
+            0
+        );
+        let link = DisplayLink::new(None);
+        link.adopt(unsafe { OwnedFd::from_raw_fd(sv[0]) });
+        // The broker's end stays open (leaked) for the test's life.
+        let _ = sv[1];
+        be.set_display(link);
+        (be, host, owner)
+    }
+
+    /// No display client, or none that wants frames: acked, and nothing is
+    /// exported -- the flip costs what an unconnected display always did.
+    #[test]
+    fn flips_without_a_client_are_acked_and_not_exported() {
+        let (mut be, host, owner) = setup_without_viewer();
+        let mut resp = [0u8; 64];
+        // No display at all.
+        be.dispatch(&flip(owner, 7, 0), &mut resp);
+        assert_eq!(status(&resp), 0);
+        // A display with no client connected.
+        let link = DisplayLink::new(None);
+        be.set_display(link.clone());
+        for seq in 1..5 {
+            be.dispatch(&flip(owner, 7, seq), &mut resp);
+            assert_eq!(status(&resp), 0);
+        }
+        be.dispatch(&cursor_msg(owner, 21, 64, 3, true), &mut resp);
+        assert_eq!(status(&resp), 0);
+        assert!(host.0.lock().unwrap().is_empty(), "nothing exported");
+        assert_eq!(be.scanout_buffers(), 0);
+        assert!(link.has_parked());
+        // Closing the file forgets what was parked.
+        be.dispatch(&msg(MsgType::Close, owner, &[]), &mut resp);
+        assert!(!link.has_parked());
     }
 
     fn flip(owner: u32, handle: u32, seq: u64) -> Vec<u8> {
@@ -245,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn flips_export_once_and_ack_without_a_broker() {
+    fn flips_export_once_and_ack_with_a_slow_client() {
         let (mut be, host, owner) = setup();
         let mut resp = [0u8; 64];
         for seq in 0..5 {

@@ -94,11 +94,14 @@ struct Args {
           default_missing_value = "2560x1440@240", value_parser = DisplayMode::parse)]
     display: Option<DisplayMode>,
 
-    /// The display broker's socket. Frames go there as dma-bufs, input comes
-    /// back. Implies --display. Connected lazily and reconnected; with no
-    /// broker listening, flips are acked and dropped.
+    /// A display client's (broker's) socket. Frames go there as dma-bufs,
+    /// input comes back. Implies --display. Give it more than once for
+    /// several clients at the same time (the local viewer and a stream
+    /// host); each is connected lazily and reconnected on its own. With no
+    /// client listening (or none that wants frames), flips are acked and
+    /// dropped without being exported.
     #[arg(long, value_name = "PATH")]
-    display_socket: Option<PathBuf>,
+    display_socket: Vec<PathBuf>,
 
     /// Give the guest head a cursor plane whose image the viewer shows as the
     /// host pointer (zero-latency cursor). `off`: the guest compositor draws
@@ -1175,9 +1178,9 @@ fn main() -> anyhow::Result<()> {
     // thread of its own that connects, reads input and reconnects. Started
     // after the sandbox, which must go on while this process is one thread.
     let input_target: EventTarget = Arc::new(Mutex::new(None));
-    let display = if args.display.is_some() || args.display_socket.is_some() {
+    let display = if args.display.is_some() || !args.display_socket.is_empty() {
         let mode = args.display.unwrap_or(DisplayMode::DEFAULT);
-        let link = DisplayLink::with_mode(args.display_socket.clone(), mode);
+        let link = DisplayLink::with_paths(args.display_socket.clone(), mode);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sink = VqInputSink {
             target: input_target.clone(),
@@ -1196,9 +1199,14 @@ fn main() -> anyhow::Result<()> {
         log::info!(
             "display: {mode}, cursor plane {}, broker {}",
             if cursor { "on" } else { "off" },
-            match &args.display_socket {
-                Some(p) => p.display().to_string(),
-                None => "none (flips are acked and dropped)".to_string(),
+            if args.display_socket.is_empty() {
+                "none (flips are acked and dropped)".to_string()
+            } else {
+                args.display_socket
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             }
         );
         Some((mode, link, cursor))

@@ -370,7 +370,8 @@ fn serve(o: ServeOpts) -> Result<()> {
         | broker::CAP_MODIFIERS
         | broker::CAP_MODE_HINTS
         | broker::CAP_CURSOR
-        | broker::CAP_GAMEPAD;
+        | broker::CAP_GAMEPAD
+        | broker::CAP_IDLE;
     let sh = broker::Shared::new(caps);
     *sh.formats.lock().unwrap() = Some(pipeline::format_check(info.modifiers));
 
@@ -432,8 +433,10 @@ fn serve(o: ServeOpts) -> Result<()> {
         let h = host.clone();
         spawn("display", move || {
             let on_connect = move || {
-                // A backend (re)connected: put the guest at the stream's mode again.
+                // A backend (re)connected: it starts us idle. With a session
+                // running, ask for frames and the stream's mode again.
                 if let Some(s) = h.current_session() {
+                    h.broker.set_active(true);
                     session::mode_hint(&h, s.cfg.width, s.cfg.height, s.cfg.fps);
                 }
             };

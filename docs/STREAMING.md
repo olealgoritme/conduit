@@ -37,7 +37,7 @@ headers (nv-codec-headers, MIT) describe NVENC/NVDEC. See `host/stream/NOTICE`.
 
 ```
 host/stream/                     conduit-stream (Rust, Apache-2.0)
-  src/broker.rs                  acts as the display broker: listens on the VM's display.sock,
+  src/broker.rs                  acts as a display broker: listens on the VM's stream.sock,
                                  takes ATTACH/COMMIT/CURSOR (dma-bufs), sends input + mode hints
   csrc/gpu.c                     EGL (device platform, no window) + GL + CUDA + NVENC/NVDEC
   src/gamestream/nvhttp.rs       HTTP 47989 / HTTPS 47984: serverinfo, PIN pairing, applist, launch
@@ -90,10 +90,15 @@ bitrate 200 Mbps.
 
 ### Guest resolution follows the client
 
-On launch the stream sends `EV_MODE_HINT` with the client's resolution and
-refresh, exactly like the local viewer going fullscreen, so the guest renders
-at the stream size (no scaling). When the session ends it restores the
-configured mode.
+On launch the stream asks the backend for frames (`EV_ACTIVE`) and sends
+`EV_MODE_HINT` with the client's resolution and refresh, exactly like the
+local viewer going fullscreen, so the guest renders at the stream size (no
+scaling). When the session ends it goes idle again: the backend stops sending
+it frames and the guest goes back to what the local viewer asks for, or to
+the configured mode when no viewer is open (an older backend is asked for the
+configured mode instead). While a session runs its resolution wins over the
+viewer's; the viewer scales the picture. See docs/SCANOUT.md, "Mode policy
+with several clients".
 
 ### Input
 
@@ -159,9 +164,16 @@ Add the host in Moonlight by IP, pair, start "myvm". One stream host per VM;
 a second VM streams on another port base (`--port 48089` → add it in Moonlight
 as `IP:48089`).
 
-The local viewer and the stream share the VM's one display socket, so a VM is
-either viewed locally or streamed; `conduit stream` refuses while a viewer is
-open.
+The local viewer and the stream host have a display socket each
+(`display.sock`, `stream.sock`) and the backend serves both, so a VM can be
+viewed and streamed at the same time: `conduit view` and `conduit stream`
+work in either order, and closing one leaves the other running (a VM that
+`conduit view` booted keeps running while it is streamed, and one that
+`conduit stream` booted keeps running while its window is open). With no
+Moonlight or link client attached, the stream host is idle and costs the
+backend nothing per frame. A VM started by an older Conduit has only the
+viewer's socket; it is streamed through that one while no window is open, and
+restarting it enables both.
 
 ### Conduit's own viewer over the network
 
@@ -214,7 +226,8 @@ actually has; for H.264/HEVC that same noise also exceeds the bitrate target
 
 ## Limitations
 
-- The backend does not forward `EV_FRAME`/`EV_RELEASE` (display.rs) and does
+- The backend does not forward `EV_FRAME`/`EV_RELEASE` (display.rs; with
+  several display clients a buffer would be free only once all released it) and does
   not fence frames against unfinished guest GPU work (no sync_fd /
   `DRIVER_SYNCOBJ`). conduit-stream copies each guest buffer into its own
   planes the moment it arrives (one GL pass, finished before encoding) to

@@ -7,8 +7,10 @@
 //!   conduit stream pair PIN          enter the PIN a Moonlight client shows
 //!   conduit stream clients | unpair CLIENT | status
 //!
-//! The stream host takes the VM's display socket, the one the local viewer
-//! would use, so a VM is either viewed here or streamed.
+//! The stream host listens on the VM's stream socket (`stream.sock`), next to
+//! the local viewer's `display.sock`; the GPU backend connects to both, so a
+//! VM can be viewed here and streamed at the same time, started in any order.
+//! The stream asks for frames only while a client watches.
 
 use crate::mode::{self, Mode};
 use crate::paths::{self, Tool};
@@ -210,11 +212,24 @@ pub fn stream(name: &str, o: &Opts, keep_vm: bool) -> Result<()> {
         return install_service(name, o);
     }
     let bin = Tool::Stream.require()?;
-    let sock = paths::run_dir(name).join("display.sock");
+    let rt = run::Rt::new(name)?;
+    let viewer_sock = rt.display_sock();
+    let mut sock = rt.stream_sock();
+    if run::is_running(name) && rt.backend_takes_stream_sock() == Some(false) {
+        // A VM booted before view and stream could run together: its
+        // backend only knows the viewer's socket.
+        if viewer_sock.exists() && sys::socket_live(&viewer_sock) {
+            return Err(oops(
+                format!("{name}'s screen is already taken by its viewer window"),
+                format!("{name} was started by an older Conduit that shows it in one place at a time: close the window, or restart the VM (`conduit down {name}`) to view and stream it together"),
+            ));
+        }
+        sock = viewer_sock.clone();
+    }
     if sock.exists() && sys::socket_live(&sock) {
         return Err(oops(
-            format!("{name}'s screen is already taken (a viewer window, or another stream)"),
-            format!("Close the viewer window, or check `conduit stream status`; then run `conduit stream {name}` again"),
+            format!("{name} is already being streamed"),
+            "Check `conduit stream status`; stop that stream first",
         ));
     }
     let _ = std::fs::remove_file(&sock);
@@ -258,9 +273,16 @@ pub fn stream(name: &str, o: &Opts, keep_vm: bool) -> Result<()> {
     // SAFETY: changing our own SIGINT disposition after the child exists.
     unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
     let st = child.wait()?;
+    let _ = sys::clear_stale_socket(&sock);
     if started && !keep_vm {
-        ui::info(format!("streaming ended; shutting {name} down"));
-        let _ = run::down(name, run::Stop::Soft(run::SHUTDOWN_GRACE));
+        if viewer_sock.exists() && sys::socket_live(&viewer_sock) {
+            ui::info(format!(
+                "streaming ended; {name} keeps running for its viewer window"
+            ));
+        } else {
+            ui::info(format!("streaming ended; shutting {name} down"));
+            let _ = run::down(name, run::Stop::Soft(run::SHUTDOWN_GRACE));
+        }
     }
     if !st.success() && st.code().is_some() {
         return Err(oops(

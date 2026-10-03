@@ -42,7 +42,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -280,6 +280,9 @@ pub mod wire {
     /// w0 = pad << 16 | evdev type (EV_KEY, EV_ABS, EV_SYN); pad 0..3.
     /// Sent only to a client that declared [`CLIENT_GAMEPAD`].
     pub const EV_PAD: u16 = 18;
+    /// Conduit: x = 1 the client wants frames from now on, 0 it does not
+    /// (any more). Only from a client with [`CAP_IDLE`], which starts idle.
+    pub const EV_ACTIVE: u16 = 19;
 
     pub const F_FULLSCREEN: u16 = 1 << 2;
 
@@ -291,6 +294,10 @@ pub mod wire {
     pub const CAP_CLIP_LARGE: u32 = 1 << 12;
     /// The broker may send [`EV_PAD`] (a stream host).
     pub const CAP_GAMEPAD: u32 = 1 << 13;
+    /// The broker starts idle and says [`EV_ACTIVE`] when it wants frames
+    /// (a stream host with no client attached wants none). Also makes it a
+    /// session client for the mode policy ([`super::ModeArbiter`]).
+    pub const CAP_IDLE: u32 = 1 << 14;
     /// CMD_CAPS bit: a clipboard agent is behind this client.
     pub const CLIENT_CLIPBOARD: u32 = 1 << 0;
     /// CMD_CAPS bit: ATTACH/COMMIT `seq` is our CLOCK_MONOTONIC microseconds.
@@ -299,6 +306,10 @@ pub mod wire {
     pub const CLIENT_CLIP_LARGE: u32 = 1 << 2;
     /// CMD_CAPS bit: we carry [`EV_PAD`] to the guest's gamepads.
     pub const CLIENT_GAMEPAD: u32 = 1 << 3;
+    /// CMD_CAPS bit: we honour [`EV_ACTIVE`] (send nothing to an idle
+    /// broker) and arbitrate the mode between several clients, so a session
+    /// that ends may just go idle instead of asking for a restore.
+    pub const CLIENT_IDLE: u32 = 1 << 4;
     /// Gamepads the guest driver offers (nvgpu_pad.h).
     pub const MAX_PADS: u32 = 4;
 
@@ -618,30 +629,72 @@ impl InputTranslator {
 // Mode hints: broker packets -> DisplayMode events for the guest
 // ---------------------------------------------------------------------------
 
-/// Decides the guest's display mode from what the broker reports, and says
-/// only when it changes.
-///
-/// A broker with `CAP_MODE_HINTS` says what it wants (`EV_MODE_HINT`); one
-/// without gets the old contract: an `EV_SURFACE` flagged fullscreen is the
-/// output's mode, and a windowed one means "back to the configured mode".
-/// Starts from the configured mode, which is what the guest booted with.
+/// One display client's say in the guest's mode.
 #[derive(Clone, Copy, Debug)]
-pub struct ModePolicy {
-    configured: DisplayMode,
+struct ModeSlot {
+    /// The client sends `EV_MODE_HINT` (`CAP_MODE_HINTS`).
     hints: bool,
-    last: (u32, u32, u32),
+    /// A session client (`CAP_IDLE`, a stream host): while active, its
+    /// request outranks a plain viewer's.
+    session: bool,
+    /// Frames are wanted. A session client starts idle.
+    active: bool,
+    /// The mode this client last asked for, resolved.
+    want: Option<(u32, u32, u32)>,
+    /// When it asked (arbiter ticks), for "the most recent request wins".
+    at: u64,
 }
 
-impl ModePolicy {
+impl ModeSlot {
+    /// Before HELLO: a legacy client, active, asking nothing yet.
+    const NEW: Self = Self {
+        hints: false,
+        session: false,
+        active: true,
+        want: None,
+        at: 0,
+    };
+}
+
+/// Decides the guest's display mode from what the display clients report, and
+/// says only when it changes.
+///
+/// Per client: one with `CAP_MODE_HINTS` says what it wants (`EV_MODE_HINT`);
+/// one without gets the old contract: an `EV_SURFACE` flagged fullscreen is
+/// the output's mode, and a windowed one means "back to the configured mode".
+///
+/// Between clients (docs/SCANOUT.md, "Several display clients"):
+///
+/// * an active session client (a stream with a client attached) wins over
+///   the others; among equals the most recent request wins;
+/// * the other clients' requests are remembered, not applied, so they never
+///   fight over the mode: a viewer scales the stream's picture meanwhile;
+/// * a session client going idle withdraws its request: the remaining
+///   clients' most recent request applies, or the configured mode if none
+///   asked for anything;
+/// * a client disconnecting withdraws its request too, but if nobody else
+///   asked for anything the guest keeps its mode (as with one client).
+///
+/// Starts from the configured mode, which is what the guest booted with.
+#[derive(Clone, Debug)]
+pub struct ModeArbiter {
+    configured: DisplayMode,
+    slots: Vec<ModeSlot>,
+    last: (u32, u32, u32),
+    tick: u64,
+}
+
+impl ModeArbiter {
     pub fn new(configured: DisplayMode) -> Self {
         Self {
             configured,
-            hints: false,
+            slots: Vec::new(),
             last: (
                 configured.width,
                 configured.height,
                 configured.refresh_hz * 1000,
             ),
+            tick: 0,
         }
     }
 
@@ -668,23 +721,93 @@ impl ModePolicy {
         (w, h, mhz)
     }
 
-    /// The mode the guest should switch to after this packet, if it changed.
-    pub fn packet(&mut self, p: &wire::Pkt) -> Option<DisplayModeEvent> {
+    fn slot(&mut self, i: usize) -> &mut ModeSlot {
+        if self.slots.len() <= i {
+            self.slots.resize(i + 1, ModeSlot::NEW);
+        }
+        &mut self.slots[i]
+    }
+
+    /// The mode the guest should switch to after client `i` sent this
+    /// packet, if it changed.
+    pub fn packet(&mut self, i: usize, p: &wire::Pkt) -> Option<DisplayModeEvent> {
         use wire::*;
-        let want = match p.ty {
+        self.tick += 1;
+        let tick = self.tick;
+        let resolved = self.resolve(p.x, p.y, p.w0);
+        let configured = self.configured();
+        let s = self.slot(i);
+        let mut withdrew = false;
+        match p.ty {
             EV_HELLO => {
-                self.hints = p.w1 & CAP_MODE_HINTS != 0;
+                let session = p.w1 & CAP_IDLE != 0;
+                *s = ModeSlot {
+                    hints: p.w1 & CAP_MODE_HINTS != 0,
+                    session,
+                    active: !session,
+                    want: None,
+                    at: 0,
+                };
                 return None;
             }
-            EV_MODE_HINT if self.hints => self.resolve(p.x, p.y, p.w0),
-            EV_SURFACE if !self.hints && p.x > 0 && p.y > 0 => {
-                if p.flags & F_FULLSCREEN != 0 {
-                    self.resolve(p.x, p.y, p.w0)
-                } else {
-                    self.configured()
+            EV_ACTIVE => {
+                let on = p.x != 0;
+                if s.active == on {
+                    return None;
+                }
+                s.active = on;
+                if on {
+                    // Nothing asked yet; its hint follows.
+                    return None;
+                }
+                withdrew = s.want.take().is_some();
+                if !withdrew {
+                    return None;
                 }
             }
+            EV_MODE_HINT if s.hints => {
+                s.want = Some(resolved);
+                s.at = tick;
+            }
+            EV_SURFACE if !s.hints && p.x > 0 && p.y > 0 => {
+                s.want = Some(if p.flags & F_FULLSCREEN != 0 {
+                    resolved
+                } else {
+                    configured
+                });
+                s.at = tick;
+            }
             _ => return None,
+        }
+        self.decide(withdrew)
+    }
+
+    /// Client `i` went away.
+    pub fn disconnect(&mut self, i: usize) -> Option<DisplayModeEvent> {
+        let had = self.slots.get(i).is_some_and(|s| s.want.is_some());
+        if i < self.slots.len() {
+            self.slots[i] = ModeSlot::NEW;
+        }
+        if !had {
+            return None;
+        }
+        self.decide(false)
+    }
+
+    /// The request that rules now. `restore`: with no request left, go back
+    /// to the configured mode (rather than keep the current one).
+    fn decide(&mut self, restore: bool) -> Option<DisplayModeEvent> {
+        let best = self
+            .slots
+            .iter()
+            .filter(|s| s.active)
+            .filter_map(|s| s.want.map(|w| ((s.session, s.at), w)))
+            .max_by_key(|(k, _)| *k)
+            .map(|(_, w)| w);
+        let want = match best {
+            Some(w) => w,
+            None if restore => self.configured(),
+            None => return None,
         };
         if want == self.last {
             return None;
@@ -700,6 +823,25 @@ impl ModePolicy {
 
     pub fn current(&self) -> (u32, u32, u32) {
         self.last
+    }
+}
+
+/// The policy for a single display client: [`ModeArbiter`] with one slot.
+#[derive(Clone, Debug)]
+pub struct ModePolicy(ModeArbiter);
+
+impl ModePolicy {
+    pub fn new(configured: DisplayMode) -> Self {
+        Self(ModeArbiter::new(configured))
+    }
+
+    /// The mode the guest should switch to after this packet, if it changed.
+    pub fn packet(&mut self, p: &wire::Pkt) -> Option<DisplayModeEvent> {
+        self.0.packet(0, p)
+    }
+
+    pub fn current(&self) -> (u32, u32, u32) {
+        self.0.current()
     }
 }
 
@@ -857,13 +999,28 @@ pub enum FlipOutcome {
     Sent,
     /// The socket was full: this frame dropped, latest wins.
     Busy,
-    /// No broker connected: dropped.
+    /// No broker connected (or none wants frames): dropped.
     NoBroker,
     /// The connection broke on this send; dropped, reconnect pending.
     Broken,
     /// The broker cannot take this (no `CAP_CURSOR`); kept for a broker that
     /// can, and not sent.
     Unsupported,
+}
+
+impl FlipOutcome {
+    /// Several clients: the best thing that happened to any of them.
+    fn merge(self, o: FlipOutcome) -> FlipOutcome {
+        use FlipOutcome::*;
+        let rank = |x: FlipOutcome| match x {
+            Sent => 4,
+            Busy => 3,
+            Broken => 2,
+            Unsupported => 1,
+            NoBroker => 0,
+        };
+        if rank(o) > rank(self) { o } else { self }
+    }
 }
 
 /// The last cursor the guest showed, kept so a broker that connects later --
@@ -874,8 +1031,25 @@ struct SentCursor {
     c: CursorUpdate,
 }
 
+/// A buffer the guest showed while no client wanted it: not exported, only
+/// remembered by its GEM identity, and exported when a client becomes active.
+struct Parked<T> {
+    /// A dup of the owning drm file's host descriptor, so the handle still
+    /// means the same object when the export happens on the link thread.
+    drm: Arc<OwnedFd>,
+    owner: u32,
+    host_handle: u32,
+    what: T,
+}
+
+/// Exports `host_handle` on a drm descriptor; the real one is PRIME.
+pub type Exporter = dyn Fn(RawFd, u32) -> Result<OwnedFd, i32> + Send + Sync;
+
+/// One display client: a socket path the backend connects to, and what this
+/// connection has been told.
 #[derive(Default)]
-struct LinkState {
+struct Client {
+    path: Option<PathBuf>,
     sock: Option<Arc<OwnedFd>>,
     /// Size last asked of the broker with WINDOW, per connection.
     last_size: Option<(u32, u32)>,
@@ -883,19 +1057,49 @@ struct LinkState {
     queried: HashSet<(u32, u64)>,
     /// HELLO's capability bits on this connection (0 until it arrives).
     broker_caps: u32,
-    /// The guest's cursor, and whether this connection still needs it.
-    cursor: Option<SentCursor>,
+    /// HELLO arrived on this connection (CAPS sent, caps known).
+    hello: bool,
+    /// The client wants frames: from connect on, unless it said `CAP_IDLE`
+    /// and has not said `EV_ACTIVE` yet.
+    active: bool,
+    /// The guest's cursor is owed to this connection.
     cursor_dirty: bool,
+    /// The newest frame did not fit in the socket: re-sent when it drains.
+    frame_owed: bool,
+    /// The guest's clipboard on its way to this client.
+    clip_out: Option<ClipOut>,
+    /// When the last batch of it went, for pacing.
+    clip_sent_at: Option<Instant>,
+}
+
+impl Client {
+    fn wants_frames(&self) -> bool {
+        self.sock.is_some() && self.active
+    }
+
+    /// Forget the connection, keep the path.
+    fn reset(&mut self, sock: Option<Arc<OwnedFd>>) {
+        *self = Client {
+            path: self.path.take(),
+            active: sock.is_some(),
+            sock,
+            ..Default::default()
+        };
+    }
+}
+
+#[derive(Default)]
+struct LinkState {
+    clients: Vec<Client>,
+    /// The guest's cursor, kept across connections.
+    cursor: Option<SentCursor>,
     /// The last frame the guest flipped (a dup of its dma-buf), kept across
     /// connections so a viewer that (re)attaches shows it at once instead of
     /// a black window until the guest's next flip.
     frame: Option<(Arc<OwnedFd>, ScanoutFlip)>,
-    /// HELLO arrived on this connection (CAPS sent, caps known).
-    hello: bool,
-    /// The guest's clipboard on its way to the broker.
-    clip_out: Option<ClipOut>,
-    /// When the last batch of it went, for pacing.
-    clip_sent_at: Option<Instant>,
+    /// The last frame / cursor while nobody wanted them (see [`Parked`]).
+    parked_frame: Option<Parked<ScanoutFlip>>,
+    parked_cursor: Option<Parked<CursorUpdate>>,
 }
 
 /// Guest -> broker clipboard pacing: at most this many records per
@@ -917,19 +1121,46 @@ pub struct LinkStats {
     pub modes: AtomicU64,
     pub clip_to_guest: AtomicU64,
     pub clip_to_host: AtomicU64,
+    /// Frames re-sent to a client whose socket had been full.
+    pub resent: AtomicU64,
 }
 
-/// The backend's connection to the display broker. Shared between the
-/// thread serving guest RPCs (which sends) and the link's own thread (which
-/// connects, reads input, and reconnects).
+/// The backend's connections to its display clients (brokers): the local
+/// viewer, a stream host, or both. Shared between the thread serving guest
+/// RPCs (which sends) and the link's own thread (which connects, reads input,
+/// and reconnects).
+///
+/// Every client gets every frame through its own non-blocking socket: one
+/// that is slow, stuck or gone costs only its own frames (latest frame wins,
+/// per client). A client that wants no frames (none connected, or a stream
+/// host with no session) costs nothing at all: the guest's flip is not even
+/// exported (see [`DisplayLink::wants_frames`]).
 pub struct DisplayLink {
-    path: Option<PathBuf>,
     /// The mode the guest boots with (device config); what "restore" means.
     configured: DisplayMode,
     state: Mutex<LinkState>,
+    /// Clients that want frames now; read without the lock on every flip.
+    active: AtomicUsize,
+    /// A frame or cursor is parked (lock-free check for GEM closes).
+    parked: AtomicBool,
     /// The guest asked for the host clipboard again (ClipboardRequest).
     clip_resend: AtomicBool,
+    exporter: Mutex<Arc<Exporter>>,
     pub stats: LinkStats,
+}
+
+fn real_export(drm: RawFd, host_handle: u32) -> Result<OwnedFd, i32> {
+    prime_export(drm, host_handle, |fd, req, arg| {
+        // SAFETY: `arg` is a live 12-byte drm_prime_handle for the call.
+        let rc = unsafe { libc::ioctl(fd, req as libc::Ioctl, arg.as_mut_ptr()) };
+        if rc < 0 {
+            Err(io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 impl DisplayLink {
@@ -940,13 +1171,39 @@ impl DisplayLink {
 
     /// A link whose "configured mode" (restore target) is `mode`.
     pub fn with_mode(path: Option<PathBuf>, mode: DisplayMode) -> Arc<Self> {
+        Self::with_paths(path.into_iter().collect(), mode)
+    }
+
+    /// A link to every broker in `paths`, each connected and reconnected on
+    /// its own.
+    pub fn with_paths(paths: Vec<PathBuf>, mode: DisplayMode) -> Arc<Self> {
+        let mut clients: Vec<Client> = paths
+            .into_iter()
+            .map(|p| Client {
+                path: Some(p),
+                ..Default::default()
+            })
+            .collect();
+        if clients.is_empty() {
+            clients.push(Client::default());
+        }
         Arc::new(Self {
-            path,
             configured: mode,
-            state: Mutex::new(LinkState::default()),
+            state: Mutex::new(LinkState {
+                clients,
+                ..Default::default()
+            }),
+            active: AtomicUsize::new(0),
+            parked: AtomicBool::new(false),
             clip_resend: AtomicBool::new(false),
+            exporter: Mutex::new(Arc::new(real_export)),
             stats: LinkStats::default(),
         })
+    }
+
+    /// Replace the PRIME export used for parked buffers (tests).
+    pub fn set_exporter(&self, f: Arc<Exporter>) {
+        *self.exporter.lock().unwrap() = f;
     }
 
     /// The guest wants the current host clipboard (again): its driver just
@@ -957,68 +1214,267 @@ impl DisplayLink {
         self.clip_resend.store(true, Ordering::Relaxed);
     }
 
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+    /// The first client's path.
+    pub fn path(&self) -> Option<PathBuf> {
+        self.paths().into_iter().next()
     }
 
+    pub fn paths(&self) -> Vec<PathBuf> {
+        let st = self.state.lock().unwrap();
+        st.clients.iter().filter_map(|c| c.path.clone()).collect()
+    }
+
+    /// Any client connected.
     pub fn connected(&self) -> bool {
-        self.state.lock().unwrap().sock.is_some()
+        let st = self.state.lock().unwrap();
+        st.clients.iter().any(|c| c.sock.is_some())
     }
 
-    /// Adopt an already-connected socket (tests, or a VMM that passes one).
+    /// Some client wants frames. When not, the guest's flips and cursor
+    /// changes should be [`DisplayLink::park`]ed instead of exported: one
+    /// atomic load, the whole cost of a flip nobody looks at.
+    #[inline]
+    pub fn wants_frames(&self) -> bool {
+        self.active.load(Ordering::Acquire) != 0
+    }
+
+    /// Something is parked (see [`DisplayLink::park`]).
+    #[inline]
+    pub fn has_parked(&self) -> bool {
+        self.parked.load(Ordering::Relaxed)
+    }
+
+    fn note_parked(&self, st: &LinkState) {
+        self.parked.store(
+            st.parked_frame.is_some() || st.parked_cursor.is_some(),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn recount(&self, st: &LinkState) {
+        let n = st.clients.iter().filter(|c| c.wants_frames()).count();
+        self.active.store(n, Ordering::Release);
+    }
+
+    /// Adopt an already-connected socket as the first client (tests, or a
+    /// VMM that passes one).
     pub fn adopt(&self, sock: OwnedFd) {
+        self.adopt_at(0, sock);
+    }
+
+    /// Adopt a connected socket as client `i`.
+    pub fn adopt_at(&self, i: usize, sock: OwnedFd) {
         set_nonblocking(sock.as_raw_fd());
         let mut st = self.state.lock().unwrap();
-        // The guest's cursor outlives a connection: the next broker gets it
-        // once it has said HELLO (and whether it takes cursors at all).
-        let cursor = st.cursor.take();
-        let frame = st.frame.take();
-        *st = LinkState {
-            sock: Some(Arc::new(sock)),
-            cursor,
-            frame,
-            ..Default::default()
-        };
+        if st.clients.len() <= i {
+            st.clients.resize_with(i + 1, Client::default);
+        }
+        if let Some(old) = st.clients[i].sock.as_ref() {
+            // SAFETY: shutdown on a live descriptor; wakes the reader's poll.
+            unsafe { libc::shutdown(old.as_raw_fd(), libc::SHUT_RDWR) };
+        }
+        // The guest's cursor and last frame outlive a connection: the next
+        // broker gets them once it has said HELLO.
+        st.clients[i].reset(Some(Arc::new(sock)));
+        self.recount(&st);
+        drop(st);
         self.stats.connects.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn current(&self) -> Option<Arc<OwnedFd>> {
-        self.state.lock().unwrap().sock.clone()
+    fn sockets(&self) -> Vec<Option<Arc<OwnedFd>>> {
+        let st = self.state.lock().unwrap();
+        st.clients.iter().map(|c| c.sock.clone()).collect()
     }
 
-    /// Drop `sock` if it is still the current connection.
-    fn drop_conn(&self, sock: &Arc<OwnedFd>) {
+    /// Drop client `i`'s connection if `sock` is still it.
+    fn drop_conn(&self, i: usize, sock: &Arc<OwnedFd>) {
         let mut st = self.state.lock().unwrap();
-        if st.sock.as_ref().is_some_and(|s| Arc::ptr_eq(s, sock)) {
+        self.drop_conn_locked(&mut st, i, sock);
+    }
+
+    fn drop_conn_locked(&self, st: &mut LinkState, i: usize, sock: &Arc<OwnedFd>) {
+        let Some(c) = st.clients.get_mut(i) else {
+            return;
+        };
+        if c.sock.as_ref().is_some_and(|s| Arc::ptr_eq(s, sock)) {
             // SAFETY: shutdown on a live descriptor; wakes the reader's poll.
             unsafe { libc::shutdown(sock.as_raw_fd(), libc::SHUT_RDWR) };
-            let cursor = st.cursor.take();
-            let frame = st.frame.take();
-            *st = LinkState {
-                cursor,
-                frame,
-                ..Default::default()
-            };
+            c.reset(None);
+            self.recount(st);
         }
     }
 
-    /// Present `dmabuf` as described by `f`. Never blocks.
+    /// The guest flipped while nobody wants frames: remember the buffer by
+    /// its GEM identity without exporting it. `drm` is the owning file's host
+    /// descriptor (dup'd only when the owner changes). Returns `false` when a
+    /// client became active meanwhile: then export and [`DisplayLink::flip`].
+    pub fn park(&self, drm: RawFd, f: &ScanoutFlip) -> bool {
+        let mut st = self.state.lock().unwrap();
+        if self.wants_frames() {
+            return false;
+        }
+        let Some(drm) = Self::drm_for(&st, drm, f.owner_handle) else {
+            return true;
+        };
+        st.frame = None;
+        st.parked_frame = Some(Parked {
+            drm,
+            owner: f.owner_handle,
+            host_handle: f.host_handle,
+            what: *f,
+        });
+        self.note_parked(&st);
+        self.stats.no_broker.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// As [`DisplayLink::park`], for a visible cursor.
+    pub fn park_cursor(&self, drm: RawFd, c: &CursorUpdate) -> bool {
+        let mut st = self.state.lock().unwrap();
+        if self.wants_frames() {
+            return false;
+        }
+        let Some(drm) = Self::drm_for(&st, drm, c.owner_handle) else {
+            return true;
+        };
+        st.cursor = None;
+        st.parked_cursor = Some(Parked {
+            drm,
+            owner: c.owner_handle,
+            host_handle: c.host_handle,
+            what: *c,
+        });
+        self.note_parked(&st);
+        true
+    }
+
+    /// A descriptor for `owner`'s drm file: one already parked, or a dup.
+    fn drm_for(st: &LinkState, drm: RawFd, owner: u32) -> Option<Arc<OwnedFd>> {
+        let have = [
+            st.parked_frame.as_ref().map(|p| (p.owner, &p.drm)),
+            st.parked_cursor.as_ref().map(|p| (p.owner, &p.drm)),
+        ];
+        if let Some((_, d)) = have.into_iter().flatten().find(|(o, _)| *o == owner) {
+            return Some(d.clone());
+        }
+        // SAFETY: dup of a descriptor the caller keeps open for this call.
+        let kept = unsafe { libc::fcntl(drm, libc::F_DUPFD_CLOEXEC, 0) };
+        if kept < 0 {
+            log::warn!(
+                "display: dup of drm file {owner}: {}",
+                io::Error::last_os_error()
+            );
+            return None;
+        }
+        // SAFETY: a fresh descriptor owned by nobody else.
+        Some(Arc::new(unsafe { OwnedFd::from_raw_fd(kept) }))
+    }
+
+    /// The guest closed GEM handle `host_handle` of `owner`: a parked buffer
+    /// naming it is gone (the number may be reissued).
+    pub fn forget(&self, owner: u32, host_handle: u32) {
+        let mut st = self.state.lock().unwrap();
+        if st
+            .parked_frame
+            .as_ref()
+            .is_some_and(|p| p.owner == owner && p.host_handle == host_handle)
+        {
+            st.parked_frame = None;
+        }
+        if st
+            .parked_cursor
+            .as_ref()
+            .is_some_and(|p| p.owner == owner && p.host_handle == host_handle)
+        {
+            st.parked_cursor = None;
+        }
+        self.note_parked(&st);
+    }
+
+    /// The guest closed drm file `owner`: drop parked buffers (and the
+    /// descriptor dup that would keep the file alive).
+    pub fn forget_owner(&self, owner: u32) {
+        let mut st = self.state.lock().unwrap();
+        if st.parked_frame.as_ref().is_some_and(|p| p.owner == owner) {
+            st.parked_frame = None;
+        }
+        if st.parked_cursor.as_ref().is_some_and(|p| p.owner == owner) {
+            st.parked_cursor = None;
+        }
+        self.note_parked(&st);
+    }
+
+    /// A client became active: export what was parked while nobody looked.
+    fn unpark_locked(&self, st: &mut LinkState) {
+        if st.parked_frame.is_none() && st.parked_cursor.is_none() {
+            return;
+        }
+        let export = self.exporter.lock().unwrap().clone();
+        if let Some(p) = st.parked_frame.take() {
+            match export(p.drm.as_raw_fd(), p.host_handle) {
+                Ok(fd) => st.frame = Some((Arc::new(fd), p.what)),
+                Err(e) => log::warn!(
+                    "display: export of the parked frame (handle {} on file {}): errno {e}",
+                    p.host_handle,
+                    p.owner
+                ),
+            }
+        }
+        if let Some(p) = st.parked_cursor.take() {
+            match export(p.drm.as_raw_fd(), p.host_handle) {
+                Ok(fd) => {
+                    st.cursor = Some(SentCursor {
+                        fd: Some(Arc::new(fd)),
+                        c: p.what,
+                    })
+                }
+                Err(e) => log::warn!(
+                    "display: export of the parked cursor (handle {} on file {}): errno {e}",
+                    p.host_handle,
+                    p.owner
+                ),
+            }
+        }
+        self.note_parked(st);
+    }
+
+    /// Present `dmabuf` as described by `f` to every client that wants
+    /// frames. Never blocks.
     pub fn flip(&self, dmabuf: RawFd, f: &ScanoutFlip) -> FlipOutcome {
         let mut st = self.state.lock().unwrap();
-        let resend = st
-            .frame
-            .as_ref()
-            .is_some_and(|(k, _)| k.as_raw_fd() == dmabuf);
-        if !resend {
-            // SAFETY: dup of a descriptor the caller keeps open for this call.
-            let kept = unsafe { libc::fcntl(dmabuf, libc::F_DUPFD_CLOEXEC, 0) };
-            st.frame = (kept >= 0).then(|| {
-                // SAFETY: `kept` is a fresh descriptor owned by nobody else.
-                (Arc::new(unsafe { OwnedFd::from_raw_fd(kept) }), *f)
-            });
-        }
-        let Some(sock) = st.sock.clone() else {
+        if !self.wants_frames() {
             self.stats.no_broker.fetch_add(1, Ordering::Relaxed);
+            return FlipOutcome::NoBroker;
+        }
+        // SAFETY: dup of a descriptor the caller keeps open for this call.
+        let kept = unsafe { libc::fcntl(dmabuf, libc::F_DUPFD_CLOEXEC, 0) };
+        st.frame = (kept >= 0).then(|| {
+            // SAFETY: `kept` is a fresh descriptor owned by nobody else.
+            (Arc::new(unsafe { OwnedFd::from_raw_fd(kept) }), *f)
+        });
+        if st.parked_frame.take().is_some() {
+            self.note_parked(&st);
+        }
+        let mut out = FlipOutcome::NoBroker;
+        for i in 0..st.clients.len() {
+            if st.clients[i].wants_frames() {
+                out = out.merge(self.send_frame_locked(&mut st, i, dmabuf, f));
+            }
+        }
+        out
+    }
+
+    /// One frame to client `i`. A full socket owes it the newest frame,
+    /// which the link thread sends when the socket drains.
+    fn send_frame_locked(
+        &self,
+        st: &mut LinkState,
+        i: usize,
+        dmabuf: RawFd,
+        f: &ScanoutFlip,
+    ) -> FlipOutcome {
+        let c = &mut st.clients[i];
+        let Some(sock) = c.sock.clone() else {
             return FlipOutcome::NoBroker;
         };
         let fd = sock.as_raw_fd();
@@ -1027,7 +1483,7 @@ impl DisplayLink {
         // the first byte of the ATTACH record, and SCM_RIGHTS attaches to the
         // first byte of whatever one sendmsg carries.
         let mut ctl: Vec<u8> = Vec::new();
-        if st.last_size != Some((f.width, f.height)) {
+        if c.last_size != Some((f.width, f.height)) {
             ctl.extend_from_slice(
                 &wire::Cmd {
                     ty: wire::CMD_WINDOW,
@@ -1039,7 +1495,7 @@ impl DisplayLink {
             );
         }
         let fmt = (f.fourcc, f.modifier);
-        let ask = !st.queried.contains(&fmt);
+        let ask = !c.queried.contains(&fmt);
         if ask {
             ctl.extend_from_slice(
                 &wire::Cmd {
@@ -1054,19 +1510,19 @@ impl DisplayLink {
         if !ctl.is_empty() {
             match send_records(fd, &ctl, None) {
                 Ok(()) => {
-                    st.last_size = Some((f.width, f.height));
+                    c.last_size = Some((f.width, f.height));
                     if ask {
-                        st.queried.insert(fmt);
+                        c.queried.insert(fmt);
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    c.frame_owed = true;
                     self.stats.busy.fetch_add(1, Ordering::Relaxed);
                     return FlipOutcome::Busy;
                 }
                 Err(e) => {
-                    drop(st);
-                    log::warn!("display: broker send failed: {e}; reconnecting");
-                    self.drop_conn(&sock);
+                    log::warn!("display: send to client {i} failed: {e}; reconnecting");
+                    self.drop_conn_locked(st, i, &sock);
                     self.stats.broken.fetch_add(1, Ordering::Relaxed);
                     return FlipOutcome::Broken;
                 }
@@ -1102,21 +1558,31 @@ impl DisplayLink {
         );
         match send_records(fd, &frame, Some(dmabuf)) {
             Ok(()) => {
+                c.frame_owed = false;
                 self.stats.sent.fetch_add(1, Ordering::Relaxed);
                 FlipOutcome::Sent
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                c.frame_owed = true;
                 self.stats.busy.fetch_add(1, Ordering::Relaxed);
                 FlipOutcome::Busy
             }
             Err(e) => {
-                drop(st);
-                log::warn!("display: broker send failed: {e}; reconnecting");
-                self.drop_conn(&sock);
+                log::warn!("display: send to client {i} failed: {e}; reconnecting");
+                self.drop_conn_locked(st, i, &sock);
                 self.stats.broken.fetch_add(1, Ordering::Relaxed);
                 FlipOutcome::Broken
             }
         }
+    }
+
+    /// Send the kept frame to client `i` (a new or drained connection).
+    fn resend_frame_locked(&self, st: &mut LinkState, i: usize) -> Option<FlipOutcome> {
+        if !st.clients.get(i).is_some_and(Client::wants_frames) {
+            return None;
+        }
+        let (fd, f) = st.frame.clone()?;
+        Some(self.send_frame_locked(st, i, fd.as_raw_fd(), &f))
     }
 
     /// The guest's cursor changed: `dmabuf` is the exported cursor plane
@@ -1139,24 +1605,41 @@ impl DisplayLink {
         };
         let mut st = self.state.lock().unwrap();
         st.cursor = Some(SentCursor { fd, c: *c });
-        st.cursor_dirty = true;
-        self.send_cursor_locked(&mut st)
+        if st.parked_cursor.take().is_some() {
+            self.note_parked(&st);
+        }
+        let mut out = FlipOutcome::NoBroker;
+        for i in 0..st.clients.len() {
+            st.clients[i].cursor_dirty = true;
+            if st.clients[i].sock.is_some() {
+                out = out.merge(self.send_cursor_locked(&mut st, i));
+            }
+        }
+        out
     }
 
-    /// Send the kept cursor if this connection still needs it.
-    fn send_cursor_locked(&self, st: &mut LinkState) -> FlipOutcome {
-        let Some(sock) = st.sock.clone() else {
+    /// Send the kept cursor to client `i` if it still needs it.
+    fn send_cursor_locked(&self, st: &mut LinkState, i: usize) -> FlipOutcome {
+        let LinkState {
+            clients, cursor, ..
+        } = st;
+        let cl = &mut clients[i];
+        let Some(sock) = cl.sock.clone() else {
             return FlipOutcome::NoBroker;
         };
-        if !st.cursor_dirty {
+        if !cl.cursor_dirty {
             return FlipOutcome::Sent;
         }
-        if st.broker_caps & wire::CAP_CURSOR == 0 {
+        if cl.broker_caps & wire::CAP_CURSOR == 0 {
             // Before HELLO the caps are unknown; HELLO re-arms the send.
             return FlipOutcome::Unsupported;
         }
-        let Some(cur) = st.cursor.as_ref() else {
-            st.cursor_dirty = false;
+        if !cl.active {
+            // EV_ACTIVE re-arms it.
+            return FlipOutcome::NoBroker;
+        }
+        let Some(cur) = cursor.as_ref() else {
+            cl.cursor_dirty = false;
             return FlipOutcome::Sent;
         };
         let (cmd, fd) = match &cur.fd {
@@ -1184,14 +1667,14 @@ impl DisplayLink {
         };
         match send_records(sock.as_raw_fd(), &cmd.encode(), fd) {
             Ok(()) => {
-                st.cursor_dirty = false;
+                cl.cursor_dirty = false;
                 self.stats.cursors.fetch_add(1, Ordering::Relaxed);
                 FlipOutcome::Sent
             }
             // Stays dirty: the link thread retries within a poll period.
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => FlipOutcome::Busy,
             Err(e) => {
-                log::warn!("display: broker send failed: {e}; reconnecting");
+                log::warn!("display: send to client {i} failed: {e}; reconnecting");
                 // SAFETY: shutdown on a live descriptor; the link thread
                 // notices and reconnects.
                 unsafe { libc::shutdown(sock.as_raw_fd(), libc::SHUT_RDWR) };
@@ -1200,115 +1683,185 @@ impl DisplayLink {
         }
     }
 
-    /// A cursor send is owed (socket was full, or a new broker said HELLO).
+    /// A cursor send is owed to some client (socket was full, or a new
+    /// broker said HELLO).
     fn cursor_owed(&self) -> bool {
         let st = self.state.lock().unwrap();
-        st.cursor_dirty && st.sock.is_some() && st.broker_caps & wire::CAP_CURSOR != 0
+        st.clients
+            .iter()
+            .any(|c| c.cursor_dirty && c.wants_frames() && c.broker_caps & wire::CAP_CURSOR != 0)
     }
 
     fn retry_cursor(&self) {
         let mut st = self.state.lock().unwrap();
-        let _ = self.send_cursor_locked(&mut st);
+        for i in 0..st.clients.len() {
+            if st.clients[i].sock.is_some() {
+                let _ = self.send_cursor_locked(&mut st, i);
+            }
+        }
     }
 
-    /// HELLO: remember what this broker takes, tell it our frames are
-    /// timestamped, and owe it the guest's cursor.
-    fn hello(&self, caps: u32) {
+    /// Client `i` said HELLO: remember what it takes, tell it our frames are
+    /// timestamped, and owe it the guest's cursor and current frame (unless
+    /// it starts idle).
+    fn hello_at(&self, i: usize, caps: u32) {
         let mut st = self.state.lock().unwrap();
-        st.broker_caps = caps;
-        st.hello = true;
-        st.cursor_dirty = st.cursor.is_some();
-        let frame = st.frame.clone();
-        if let Some(sock) = st.sock.clone() {
+        let Some(c) = st.clients.get_mut(i) else {
+            return;
+        };
+        c.broker_caps = caps;
+        c.hello = true;
+        c.active = caps & wire::CAP_IDLE == 0;
+        c.cursor_dirty = true;
+        if let Some(sock) = c.sock.clone() {
             let caps_cmd = wire::Cmd {
                 ty: wire::CMD_CAPS,
                 width: wire::CLIENT_SEQ_USEC
                     | wire::CLIENT_CLIPBOARD
                     | wire::CLIENT_CLIP_LARGE
-                    | wire::CLIENT_GAMEPAD,
+                    | wire::CLIENT_GAMEPAD
+                    | wire::CLIENT_IDLE,
                 ..Default::default()
             };
             if let Err(e) = send_records(sock.as_raw_fd(), &caps_cmd.encode(), None) {
                 log::debug!("display: CAPS not sent: {e}");
             }
         }
-        drop(st);
-        // A viewer that (re)attaches gets the current picture now, not at the
-        // guest's next flip (an idle desktop may not flip for a long time).
-        if let Some((fd, f)) = frame {
-            let r = self.flip(fd.as_raw_fd(), &f);
-            log::info!("display: current frame re-sent to the new viewer: {r:?}");
+        self.recount(&st);
+        if !st.clients[i].active {
+            log::info!("display: client {i} is idle until it asks for frames");
+            return;
+        }
+        self.became_active_locked(&mut st, i);
+    }
+
+    /// Client `i` now wants frames: export anything parked, then give it
+    /// the current picture now, not at the guest's next flip (an idle
+    /// desktop may not flip for a long time). Its cursor follows from the
+    /// link thread.
+    fn became_active_locked(&self, st: &mut LinkState, i: usize) {
+        self.unpark_locked(st);
+        st.clients[i].cursor_dirty = true;
+        if let Some(r) = self.resend_frame_locked(st, i) {
+            log::info!("display: current frame re-sent to client {i}: {r:?}");
         }
     }
 
-    /// The guest copied `text` (validated UTF-8): send it to the broker,
-    /// paced, from the link thread. A newer copy replaces one still being sent
-    /// (chunk 0 restarts a transfer in the broker's framing). Dropped when no
-    /// broker is connected, or when it is over the broker's cap.
-    pub fn clipboard_to_host(&self, text: Vec<u8>) {
+    /// EV_ACTIVE from client `i`.
+    fn set_active(&self, i: usize, on: bool) {
         let mut st = self.state.lock().unwrap();
-        if st.sock.is_none() {
+        let Some(c) = st.clients.get_mut(i) else {
+            return;
+        };
+        if c.sock.is_none() || c.active == on {
+            return;
+        }
+        c.active = on;
+        c.frame_owed = false;
+        self.recount(&st);
+        log::info!(
+            "display: client {i} {}",
+            if on { "wants frames" } else { "is idle" }
+        );
+        if on {
+            self.became_active_locked(&mut st, i);
+        }
+    }
+
+    /// The link thread: frames owed to clients whose sockets drained.
+    fn retry_frames(&self, writable: &[usize]) {
+        let mut st = self.state.lock().unwrap();
+        for &i in writable {
+            if st.clients.get(i).is_some_and(|c| c.frame_owed)
+                && self.resend_frame_locked(&mut st, i) == Some(FlipOutcome::Sent)
+            {
+                self.stats.resent.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The guest copied `text` (validated UTF-8): send it to every connected
+    /// client, paced, from the link thread. A newer copy replaces one still
+    /// being sent (chunk 0 restarts a transfer in the broker's framing).
+    /// Dropped for a client whose cap it is over, and when none is connected.
+    pub fn clipboard_to_host(&self, text: Vec<u8>) {
+        if text.is_empty() {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        let mut any = false;
+        for i in 0..st.clients.len() {
+            let c = &mut st.clients[i];
+            if c.sock.is_none() {
+                continue;
+            }
+            any = true;
+            let cap = wire::clip_cap(c.broker_caps);
+            if text.len() > cap {
+                log::warn!(
+                    "display: guest clipboard is {} bytes, over client {i}'s {cap}-byte cap; dropped",
+                    text.len()
+                );
+                continue;
+            }
+            c.clip_out = Some(ClipOut::new(text.clone()));
+            c.clip_sent_at = None;
+            self.send_clip_locked(&mut st, i);
+        }
+        if !any {
             log::debug!(
                 "display: guest clipboard ({} bytes) dropped: no viewer",
                 text.len()
             );
-            return;
         }
-        if text.is_empty() {
-            return;
-        }
-        let cap = wire::clip_cap(st.broker_caps);
-        if text.len() > cap {
-            log::warn!(
-                "display: guest clipboard is {} bytes, over the viewer's {cap}-byte cap; dropped",
-                text.len()
-            );
-            return;
-        }
-        st.clip_out = Some(ClipOut::new(text));
-        st.clip_sent_at = None;
-        self.send_clip_locked(&mut st);
     }
 
-    /// Send the next paced batch of the guest's clipboard, if one is due.
-    fn send_clip_locked(&self, st: &mut LinkState) {
-        if !st.hello {
+    /// Send the next paced batch of the guest's clipboard to client `i`, if
+    /// one is due.
+    fn send_clip_locked(&self, st: &mut LinkState, i: usize) {
+        let c = &mut st.clients[i];
+        if !c.hello {
             return; // CAPS first; HELLO re-arms it.
         }
-        let Some(sock) = st.sock.clone() else {
-            st.clip_out = None;
+        let Some(sock) = c.sock.clone() else {
+            c.clip_out = None;
             return;
         };
-        if st
-            .clip_sent_at
+        if c.clip_sent_at
             .is_some_and(|t| t.elapsed() < CLIP_BATCH_EVERY)
         {
             return;
         }
-        let Some(out) = st.clip_out.as_mut() else {
+        let Some(out) = c.clip_out.as_mut() else {
             return;
         };
         let (bytes, n) = out.records(CLIP_BATCH);
         match send_records(sock.as_raw_fd(), &bytes, None) {
             Ok(()) => {
                 out.commit(n);
-                st.clip_sent_at = Some(Instant::now());
+                c.clip_sent_at = Some(Instant::now());
                 if out.done() {
                     let len = out.text.len();
-                    st.clip_out = None;
+                    c.clip_out = None;
                     self.stats.clip_to_host.fetch_add(1, Ordering::Relaxed);
-                    log::info!("display: guest clipboard sent to the viewer ({len} bytes)");
+                    log::info!("display: guest clipboard sent to client {i} ({len} bytes)");
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => {
-                log::warn!("display: broker send failed: {e}; reconnecting");
-                st.clip_out = None;
+                log::warn!("display: send to client {i} failed: {e}; reconnecting");
+                c.clip_out = None;
                 // SAFETY: shutdown on a live descriptor; the link thread
                 // notices and reconnects.
                 unsafe { libc::shutdown(sock.as_raw_fd(), libc::SHUT_RDWR) };
             }
         }
+    }
+
+    /// HELLO on the first client (tests).
+    #[cfg(test)]
+    pub(crate) fn hello(&self, caps: u32) {
+        self.hello_at(0, caps);
     }
 
     #[cfg(test)]
@@ -1321,38 +1874,55 @@ impl DisplayLink {
         self.retry_clip();
     }
 
-    /// Guest clipboard still being sent on this connection.
+    /// Guest clipboard still being sent to some client.
     fn clip_owed(&self) -> bool {
         let st = self.state.lock().unwrap();
-        st.clip_out.is_some() && st.hello
+        st.clients.iter().any(|c| c.clip_out.is_some() && c.hello)
     }
 
     fn retry_clip(&self) {
         let mut st = self.state.lock().unwrap();
-        self.send_clip_locked(&mut st);
+        for i in 0..st.clients.len() {
+            if st.clients[i].clip_out.is_some() {
+                self.send_clip_locked(&mut st, i);
+            }
+        }
     }
 
     /// The guest turned the scanout off. The broker protocol has no detach;
     /// the window keeps the last frame. Forget the requested size so the next
     /// enable asks again.
     pub fn disable(&self) {
-        self.state.lock().unwrap().last_size = None;
+        let mut st = self.state.lock().unwrap();
+        for c in st.clients.iter_mut() {
+            c.last_size = None;
+        }
     }
 
-    /// Try once to connect. `Ok(false)` when there is no path to connect to.
-    pub fn try_connect(&self) -> io::Result<bool> {
-        let Some(path) = self.path.as_ref() else {
-            return Ok(false);
+    /// Try once to connect client `i`. `Ok(false)` when it has no path.
+    fn try_connect_at(&self, i: usize) -> io::Result<bool> {
+        let path = {
+            let st = self.state.lock().unwrap();
+            match st.clients.get(i).and_then(|c| c.path.clone()) {
+                Some(p) => p,
+                None => return Ok(false),
+            }
         };
-        let sock = connect_unix(path)?;
-        self.adopt(sock);
+        let sock = connect_unix(&path)?;
+        self.adopt_at(i, sock);
         log::info!("display: connected to broker at {}", path.display());
         Ok(true)
     }
 
-    /// The link's own thread: connect (with backoff), read broker packets,
-    /// translate input and push it to `sink`, reconnect when the broker goes.
-    /// Returns only when `stop` is set.
+    /// Try once to connect the first client. `Ok(false)` when there is no
+    /// path to connect to.
+    pub fn try_connect(&self) -> io::Result<bool> {
+        self.try_connect_at(0)
+    }
+
+    /// The link's own thread: connect every client (each with its own
+    /// backoff), read their packets, translate input and push it to `sink`,
+    /// reconnect when one goes. Returns only when `stop` is set.
     pub fn run(
         self: &Arc<Self>,
         mut sink: Box<dyn InputSink>,
@@ -1360,14 +1930,30 @@ impl DisplayLink {
     ) {
         const RETRY_MIN: Duration = Duration::from_millis(100);
         const RETRY_MAX: Duration = Duration::from_millis(1000);
-        let mut retry = RETRY_MIN;
-        let mut tr = InputTranslator::default();
-        let mut reader = wire::PktReader::default();
+
+        /// What the link thread keeps per client.
+        struct Reader {
+            seen: Option<Arc<OwnedFd>>,
+            tr: InputTranslator,
+            reader: wire::PktReader,
+            clip_in: ClipAssembler,
+            retry: Duration,
+            next_try: Instant,
+            warned_absent: bool,
+        }
+        let new_reader = || Reader {
+            seen: None,
+            tr: InputTranslator::default(),
+            reader: wire::PktReader::default(),
+            clip_in: ClipAssembler::default(),
+            retry: RETRY_MIN,
+            next_try: Instant::now(),
+            warned_absent: false,
+        };
+        let mut rd: Vec<Reader> = Vec::new();
         let mut pending: Vec<InputEventEntry> = Vec::new();
-        let mut policy = ModePolicy::new(self.configured);
+        let mut policy = ModeArbiter::new(self.configured);
         let mut pending_mode: Option<DisplayModeEvent> = None;
-        let mut warned_absent = false;
-        let mut clip_in = ClipAssembler::default();
         // Host clipboard on its way to the guest: generation, text, offset.
         let mut pending_clip: Option<(u64, Vec<u8>, usize)> = None;
         let mut clip_gen: u64 = 0;
@@ -1378,43 +1964,71 @@ impl DisplayLink {
         let mut clip_stalled = false;
 
         while !stop.load(Ordering::Relaxed) {
-            let Some(sock) = self.current() else {
-                // A disconnect releases whatever was held.
-                tr.release_all(&mut pending);
-                self.deliver(&mut *sink, &mut pending);
-                reader.reset();
-                clip_in.reset();
-                clip_in.set_cap(wire::CLIP_LEGACY_MAX);
-                match self.try_connect() {
-                    Ok(true) => {
-                        retry = RETRY_MIN;
-                        warned_absent = false;
-                        continue;
-                    }
-                    Ok(false) => {
-                        // No path: nothing to read, only adopted sockets.
-                        std::thread::sleep(RETRY_MAX);
-                        continue;
-                    }
-                    Err(e) => {
-                        if !warned_absent {
-                            log::info!(
-                                "display: no broker at {} ({e}); flips are dropped until one appears",
-                                self.path.as_deref().unwrap_or(Path::new("?")).display()
-                            );
-                            warned_absent = true;
+            // Connections that changed under us (a send broke one, a test
+            // adopted one): the old one's held input is released.
+            let socks = self.sockets();
+            while rd.len() < socks.len() {
+                rd.push(new_reader());
+            }
+            let paths = self.paths_by_slot();
+            let now = Instant::now();
+            for (i, s) in socks.iter().enumerate() {
+                let r = &mut rd[i];
+                let same = match (&r.seen, s) {
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !same {
+                    if r.seen.is_some() {
+                        r.tr.release_all(&mut pending);
+                        if let Some(m) = policy.disconnect(i) {
+                            pending_mode = Some(m);
                         }
-                        std::thread::sleep(retry);
-                        retry = (retry * 2).min(RETRY_MAX);
-                        continue;
+                    }
+                    r.reader.reset();
+                    r.clip_in.reset();
+                    r.clip_in.set_cap(wire::CLIP_LEGACY_MAX);
+                    r.seen = s.clone();
+                }
+                if s.is_none()
+                    && let Some(Some(path)) = paths.get(i)
+                    && now >= r.next_try
+                {
+                    match self.try_connect_at(i) {
+                        Ok(_) => {
+                            r.retry = RETRY_MIN;
+                            r.warned_absent = false;
+                        }
+                        Err(e) => {
+                            if !r.warned_absent {
+                                log::info!(
+                                    "display: no broker at {} ({e}); waiting for one",
+                                    path.display()
+                                );
+                                r.warned_absent = true;
+                            }
+                            r.next_try = now + r.retry;
+                            r.retry = (r.retry * 2).min(RETRY_MAX);
+                        }
                     }
                 }
-            };
+            }
+            self.deliver(&mut *sink, &mut pending);
+            let socks = self.sockets();
+            // Pick up a connection made just now on the next round.
+            if socks
+                .iter()
+                .zip(rd.iter())
+                .any(|(s, r)| s.as_ref().map(Arc::as_ptr) != r.seen.as_ref().map(Arc::as_ptr))
+            {
+                continue;
+            }
 
             // Undeliverable input (no buffer posted) is retried soon rather
             // than on the next packet: a lost key release is a stuck key.
             let clip_waiting = pending_clip.is_some() && !clip_stalled;
-            let timeout = if pending.is_empty() && pending_mode.is_none() && !clip_waiting {
+            let mut timeout = if pending.is_empty() && pending_mode.is_none() && !clip_waiting {
                 if self.clip_owed() {
                     CLIP_BATCH_EVERY.as_millis() as i32
                 } else if self.cursor_owed() || pending_clip.is_some() {
@@ -1425,22 +2039,55 @@ impl DisplayLink {
             } else {
                 2
             };
-            let mut pfd = libc::pollfd {
-                fd: sock.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: one pollfd, valid for the call.
-            let n = unsafe { libc::poll(&mut pfd, 1, timeout) };
+            // Wake for the next reconnect attempt.
+            for (i, s) in socks.iter().enumerate() {
+                if s.is_none() && paths.get(i).is_some_and(Option::is_some) {
+                    let ms = rd[i]
+                        .next_try
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .min(RETRY_MAX.as_millis()) as i32;
+                    timeout = timeout.min(ms.max(1));
+                }
+            }
+            let owed = self.frames_owed();
+            let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(socks.len());
+            let mut who: Vec<usize> = Vec::with_capacity(socks.len());
+            for (i, s) in socks.iter().enumerate() {
+                if let Some(s) = s {
+                    pfds.push(libc::pollfd {
+                        fd: s.as_raw_fd(),
+                        events: libc::POLLIN
+                            | if owed.get(i).copied().unwrap_or(false) {
+                                libc::POLLOUT
+                            } else {
+                                0
+                            },
+                        revents: 0,
+                    });
+                    who.push(i);
+                }
+            }
+            // SAFETY: a live pollfd array of the stated length.
+            let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout) };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() != io::ErrorKind::Interrupted {
                     log::warn!("display: poll: {e}");
-                    self.drop_conn(&sock);
+                    std::thread::sleep(Duration::from_millis(10));
                 }
                 continue;
             }
-            if n > 0 {
+            let mut writable = Vec::new();
+            for (k, pfd) in pfds.iter().enumerate() {
+                let i = who[k];
+                let sock = socks[i].clone().unwrap();
+                if pfd.revents & libc::POLLOUT != 0 {
+                    writable.push(i);
+                }
+                if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+                    continue;
+                }
                 let mut buf = [0u8; 64 * wire::PKT_SIZE];
                 // SAFETY: a live buffer of the stated length.
                 let r = unsafe {
@@ -1452,8 +2099,8 @@ impl DisplayLink {
                     )
                 };
                 if r == 0 {
-                    log::info!("display: broker closed the connection");
-                    self.drop_conn(&sock);
+                    log::info!("display: client {i} closed the connection");
+                    self.drop_conn(i, &sock);
                     continue;
                 }
                 if r < 0 {
@@ -1462,39 +2109,47 @@ impl DisplayLink {
                         e.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                     ) {
-                        log::warn!("display: recv: {e}");
-                        self.drop_conn(&sock);
-                        continue;
+                        log::warn!("display: recv from client {i}: {e}");
+                        self.drop_conn(i, &sock);
                     }
-                } else {
-                    let mut bye = false;
-                    reader.feed(&buf[..r as usize], |p| {
-                        self.note_packet(&p);
-                        if p.ty == wire::EV_BYE {
-                            bye = true;
-                        }
-                        if p.ty == wire::EV_HELLO {
-                            clip_in.set_cap(wire::clip_cap(p.w1));
-                        }
-                        if let Some(text) = clip_in.feed(&p) {
-                            clip_gen += 1;
-                            log::info!(
-                                "display: host clipboard ({} bytes) -> guest, generation {clip_gen}",
-                                text.len()
-                            );
-                            latest_clip = Some(text.clone());
-                            pending_clip = Some((clip_gen, text, 0));
-                            clip_stalled = false;
-                        }
-                        if let Some(m) = policy.packet(&p) {
-                            pending_mode = Some(m);
-                        }
-                        tr.packet(&p, &mut pending);
-                    });
-                    if bye {
-                        self.drop_conn(&sock);
-                    }
+                    continue;
                 }
+                let mut bye = false;
+                let Reader {
+                    tr,
+                    reader,
+                    clip_in,
+                    ..
+                } = &mut rd[i];
+                reader.feed(&buf[..r as usize], |p| {
+                    self.note_packet(i, &p);
+                    if p.ty == wire::EV_BYE {
+                        bye = true;
+                    }
+                    if p.ty == wire::EV_HELLO {
+                        clip_in.set_cap(wire::clip_cap(p.w1));
+                    }
+                    if let Some(text) = clip_in.feed(&p) {
+                        clip_gen += 1;
+                        log::info!(
+                            "display: host clipboard ({} bytes) from client {i} -> guest, generation {clip_gen}",
+                            text.len()
+                        );
+                        latest_clip = Some(text.clone());
+                        pending_clip = Some((clip_gen, text, 0));
+                        clip_stalled = false;
+                    }
+                    if let Some(m) = policy.packet(i, &p) {
+                        pending_mode = Some(m);
+                    }
+                    tr.packet(&p, &mut pending);
+                });
+                if bye {
+                    self.drop_conn(i, &sock);
+                }
+            }
+            if !writable.is_empty() {
+                self.retry_frames(&writable);
             }
             self.deliver(&mut *sink, &mut pending);
             if let Some(m) = pending_mode
@@ -1547,6 +2202,19 @@ impl DisplayLink {
         }
     }
 
+    fn paths_by_slot(&self) -> Vec<Option<PathBuf>> {
+        let st = self.state.lock().unwrap();
+        st.clients.iter().map(|c| c.path.clone()).collect()
+    }
+
+    fn frames_owed(&self) -> Vec<bool> {
+        let st = self.state.lock().unwrap();
+        st.clients
+            .iter()
+            .map(|c| c.frame_owed && c.wants_frames())
+            .collect()
+    }
+
     fn deliver(&self, sink: &mut dyn InputSink, pending: &mut Vec<InputEventEntry>) {
         if pending.is_empty() {
             return;
@@ -1572,36 +2240,41 @@ impl DisplayLink {
         }
     }
 
-    fn note_packet(&self, p: &wire::Pkt) {
+    fn note_packet(&self, i: usize, p: &wire::Pkt) {
         use wire::*;
         match p.ty {
             EV_HELLO => {
                 if p.w0 != PROTO_VERSION {
                     log::warn!(
-                        "display: broker speaks protocol {}, this backend {PROTO_VERSION}",
+                        "display: client {i} speaks protocol {}, this backend {PROTO_VERSION}",
                         p.w0
                     );
                 }
-                log::info!("display: broker hello, version {}, caps {:#x}", p.w0, p.w1);
-                self.hello(p.w1);
+                log::info!(
+                    "display: client {i} hello, version {}, caps {:#x}",
+                    p.w0,
+                    p.w1
+                );
+                self.hello_at(i, p.w1);
             }
+            EV_ACTIVE => self.set_active(i, p.x != 0),
             EV_FORMAT => {
                 let m = (p.w0 as u64) | ((p.w1 as u64) << 32);
                 if p.x == 1 {
                     log::info!(
-                        "display: broker can show fourcc {:#010x} modifier {m:#018x}",
+                        "display: client {i} can show fourcc {:#010x} modifier {m:#018x}",
                         p.y as u32
                     );
                 } else {
                     log::warn!(
-                        "display: broker CANNOT show fourcc {:#010x} modifier {m:#018x}; \
+                        "display: client {i} CANNOT show fourcc {:#010x} modifier {m:#018x}; \
                          frames in it will be dropped (no copy fallback by design)",
                         p.y as u32
                     );
                 }
             }
             EV_SURFACE => log::debug!(
-                "display: broker window {}x{}{}",
+                "display: client {i} window {}x{}{}",
                 p.x,
                 p.y,
                 if p.flags & F_FULLSCREEN != 0 {
@@ -1611,14 +2284,14 @@ impl DisplayLink {
                 }
             ),
             EV_MODE_HINT => log::debug!(
-                "display: broker mode hint {}x{} @{} mHz (reason {})",
+                "display: client {i} mode hint {}x{} @{} mHz (reason {})",
                 p.x,
                 p.y,
                 p.w0,
                 p.w1
             ),
             EV_CLOSE => log::info!("display: the user closed the viewer window"),
-            EV_BYE => log::info!("display: broker says goodbye (reason {})", p.x),
+            EV_BYE => log::info!("display: client {i} says goodbye (reason {})", p.x),
             _ => {}
         }
     }
@@ -2304,18 +2977,32 @@ mod tests {
 
     /// The cursor waits for a broker that can take it, then goes as CMD_CURSOR
     /// with the dma-buf and the hotspot packed into seq; a hide carries nothing.
+    /// An exporter for parked buffers that hands out dups of `buf`.
+    fn fake_exporter(link: &DisplayLink, buf: &OwnedFd) -> Arc<Mutex<u32>> {
+        let calls = Arc::new(Mutex::new(0u32));
+        let (c, b) = (calls.clone(), buf.try_clone().unwrap());
+        link.set_exporter(Arc::new(move |_drm, _h| {
+            *c.lock().unwrap() += 1;
+            b.try_clone().map_err(|_| libc::EIO)
+        }));
+        calls
+    }
+
     #[test]
     fn a_new_viewer_gets_the_current_frame_at_hello() {
         let link = DisplayLink::new(None);
         let buf = memfd();
-        // The guest flips while no viewer is attached: kept, not lost.
-        assert_eq!(
-            link.flip(buf.as_raw_fd(), &flip(1, 1920)),
-            FlipOutcome::NoBroker
-        );
+        let exports = fake_exporter(&link, &buf);
+        let drm = memfd();
+        // The guest flips while no viewer is attached: nothing is exported,
+        // the buffer is only remembered.
+        assert!(!link.wants_frames());
+        assert!(link.park(drm.as_raw_fd(), &flip(1, 1920)));
+        assert_eq!(*exports.lock().unwrap(), 0);
         let (ours, broker) = socketpair();
         link.adopt(ours);
         link.hello(0);
+        assert_eq!(*exports.lock().unwrap(), 1, "exported when someone looks");
         assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_CAPS);
         assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_WINDOW);
         assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_QUERY_FORMAT);
@@ -2338,6 +3025,340 @@ mod tests {
             wire::CMD_QUERY_FORMAT
         );
         assert_eq!(broker_recv(broker2.as_raw_fd()).0.ty, wire::CMD_ATTACH);
+        assert_eq!(*exports.lock().unwrap(), 1, "kept, not exported again");
+    }
+
+    /// No client: a flip is one atomic load for the caller, and the link
+    /// itself neither dups nor sends anything.
+    #[test]
+    fn with_no_client_a_flip_costs_nothing() {
+        let link = DisplayLink::new(None);
+        let buf = memfd();
+        assert!(!link.wants_frames());
+        assert_eq!(
+            link.flip(buf.as_raw_fd(), &flip(1, 1920)),
+            FlipOutcome::NoBroker
+        );
+        assert!(link.state.lock().unwrap().frame.is_none(), "no dup kept");
+        // The same drm file parks without a second dup.
+        let drm = memfd();
+        assert!(link.park(drm.as_raw_fd(), &flip(1, 1920)));
+        let first = link
+            .state
+            .lock()
+            .unwrap()
+            .parked_frame
+            .as_ref()
+            .unwrap()
+            .drm
+            .clone();
+        assert!(link.park(drm.as_raw_fd(), &flip(2, 1920)));
+        let again = link
+            .state
+            .lock()
+            .unwrap()
+            .parked_frame
+            .as_ref()
+            .unwrap()
+            .drm
+            .clone();
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(link.has_parked());
+        // The guest closing the handle or the file forgets it.
+        link.forget(3, 4);
+        assert!(!link.has_parked());
+        assert!(link.park(drm.as_raw_fd(), &flip(3, 1920)));
+        link.forget_owner(3);
+        assert!(!link.has_parked());
+    }
+
+    /// Two clients (two paths): connected one by one.
+    fn two_clients() -> (Arc<DisplayLink>, OwnedFd, OwnedFd) {
+        let link = DisplayLink::with_paths(
+            vec!["/nonexistent/a".into(), "/nonexistent/b".into()],
+            DisplayMode::DEFAULT,
+        );
+        let (a, broker_a) = socketpair();
+        let (b, broker_b) = socketpair();
+        link.adopt_at(0, a);
+        link.adopt_at(1, b);
+        (link, broker_a, broker_b)
+    }
+
+    /// Read records until the next ATTACH; its fd and the COMMIT after it.
+    fn next_frame(fd: RawFd) -> (wire::Cmd, OwnedFd) {
+        loop {
+            let (c, f) = broker_recv(fd);
+            if c.ty == wire::CMD_ATTACH {
+                assert_eq!(broker_recv(fd).0.ty, wire::CMD_COMMIT);
+                return (c, f.expect("ATTACH carries the dma-buf"));
+            }
+        }
+    }
+
+    fn pending_bytes(fd: RawFd) -> usize {
+        let mut n: libc::c_int = 0;
+        assert_eq!(unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) }, 0);
+        n as usize
+    }
+
+    #[test]
+    fn two_clients_get_the_same_frames() {
+        let (link, a, b) = two_clients();
+        link.hello_at(0, 0);
+        link.hello_at(1, 0);
+        let buf = memfd();
+        for seq in 1..=3 {
+            assert_eq!(
+                link.flip(buf.as_raw_fd(), &flip(seq, 2560)),
+                FlipOutcome::Sent
+            );
+        }
+        for broker in [&a, &b] {
+            assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_CAPS);
+            for _ in 0..3 {
+                let (c, f) = next_frame(broker.as_raw_fd());
+                assert_eq!(c.width, 2560);
+                assert_eq!(inode(f.as_raw_fd()), inode(buf.as_raw_fd()));
+            }
+            assert_eq!(pending_bytes(broker.as_raw_fd()), 0);
+        }
+        assert_eq!(link.stats.sent.load(Ordering::Relaxed), 6);
+    }
+
+    /// A client that never reads fills its socket and loses frames; the
+    /// other gets every one, and the stuck one gets the newest frame once it
+    /// drains.
+    #[test]
+    fn a_stuck_client_does_not_stall_the_other() {
+        let (link, stuck, fine) = two_clients();
+        let buf = memfd();
+        let start = Instant::now();
+        let mut busy = 0;
+        for seq in 0..20_000u64 {
+            link.flip(buf.as_raw_fd(), &flip(seq, 2560));
+            // The healthy client keeps up.
+            let (c, _) = next_frame(fine.as_raw_fd());
+            assert_eq!(c.width, 2560);
+            if link.frames_owed()[0] {
+                busy += 1;
+                if busy > 10 {
+                    break;
+                }
+            }
+        }
+        assert!(busy > 10, "the stuck socket never filled");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(link.wants_frames());
+        // It drains: the link thread re-sends the newest frame.
+        let mut sink = [0u8; 4096];
+        while unsafe {
+            libc::recv(
+                stuck.as_raw_fd(),
+                sink.as_mut_ptr().cast(),
+                sink.len(),
+                libc::MSG_DONTWAIT,
+            )
+        } > 0
+        {}
+        link.retry_frames(&[0]);
+        assert!(!link.frames_owed()[0]);
+        assert_eq!(link.stats.resent.load(Ordering::Relaxed), 1);
+        let (c, _) = next_frame(stuck.as_raw_fd());
+        assert_eq!(c.width, 2560);
+    }
+
+    #[test]
+    fn either_client_can_leave_and_come_back() {
+        let (link, a, b) = two_clients();
+        let buf = memfd();
+        drop(a);
+        // The dead one breaks on the send; the other still gets the frame.
+        assert_eq!(
+            link.flip(buf.as_raw_fd(), &flip(1, 2560)),
+            FlipOutcome::Sent
+        );
+        assert!(link.sockets()[0].is_none());
+        next_frame(b.as_raw_fd());
+        // It comes back and gets the current frame at HELLO.
+        let (a2, broker_a2) = socketpair();
+        link.adopt_at(0, a2);
+        link.hello_at(0, 0);
+        assert_eq!(broker_recv(broker_a2.as_raw_fd()).0.ty, wire::CMD_CAPS);
+        next_frame(broker_a2.as_raw_fd());
+        // Now the other goes; the first is untouched.
+        drop(b);
+        assert_eq!(
+            link.flip(buf.as_raw_fd(), &flip(2, 2560)),
+            FlipOutcome::Sent
+        );
+        next_frame(broker_a2.as_raw_fd());
+        assert!(link.sockets()[1].is_none());
+        assert_eq!(pending_bytes(broker_a2.as_raw_fd()), 0);
+    }
+
+    /// A client with CAP_IDLE gets nothing until it says EV_ACTIVE, and
+    /// nothing again after it goes idle.
+    #[test]
+    fn an_idle_client_gets_no_frames() {
+        let (link, viewer, stream) = two_clients();
+        link.hello_at(0, 0);
+        link.hello_at(1, wire::CAP_IDLE | wire::CAP_CURSOR);
+        let buf = memfd();
+        link.flip(buf.as_raw_fd(), &flip(1, 2560));
+        link.cursor(Some(buf.as_raw_fd()), &cursor(9, 1, 1));
+        next_frame(viewer.as_raw_fd());
+        let (c, _) = broker_recv(stream.as_raw_fd());
+        assert_eq!(c.ty, wire::CMD_CAPS);
+        assert!(c.width & wire::CLIENT_IDLE != 0);
+        assert_eq!(pending_bytes(stream.as_raw_fd()), 0, "idle: nothing");
+        // Active: the current frame at once, then the cursor and every flip.
+        link.set_active(1, true);
+        next_frame(stream.as_raw_fd());
+        link.retry_cursor();
+        assert_eq!(broker_recv(stream.as_raw_fd()).0.ty, wire::CMD_CURSOR);
+        link.flip(buf.as_raw_fd(), &flip(2, 2560));
+        next_frame(stream.as_raw_fd());
+        // Idle again: nothing more, the viewer carries on.
+        link.set_active(1, false);
+        link.flip(buf.as_raw_fd(), &flip(3, 2560));
+        assert_eq!(pending_bytes(stream.as_raw_fd()), 0);
+        // Only the viewer idle-capable? No: with both idle nothing is exported.
+        link.hello_at(0, wire::CAP_IDLE);
+        assert!(!link.wants_frames());
+    }
+
+    fn hint(w: i32, h: i32) -> wire::Pkt {
+        pkt(wire::EV_MODE_HINT, 0, w, h, 0, 2)
+    }
+
+    fn mode_of(m: Option<DisplayModeEvent>) -> Option<(u32, u32)> {
+        m.map(|m| (m.width, m.height))
+    }
+
+    /// Viewer (slot 0) and stream (slot 1): an active stream's request wins,
+    /// the viewer's is remembered, not applied, and comes back when the
+    /// stream goes idle.
+    #[test]
+    fn the_mode_follows_an_active_stream_then_the_viewer_again() {
+        let mut a = ModeArbiter::new(DisplayMode::DEFAULT);
+        let hello = |caps| pkt(wire::EV_HELLO, 0, 0, 0, 2, caps);
+        let active = |on| pkt(wire::EV_ACTIVE, 0, on, 0, 0, 0);
+        assert_eq!(a.packet(0, &hello(wire::CAP_MODE_HINTS)), None);
+        assert_eq!(mode_of(a.packet(0, &hint(1600, 900))), Some((1600, 900)));
+        // The stream connects idle: nothing changes.
+        assert_eq!(
+            a.packet(1, &hello(wire::CAP_MODE_HINTS | wire::CAP_IDLE)),
+            None
+        );
+        // A session starts: active, then its size.
+        assert_eq!(a.packet(1, &active(1)), None);
+        assert_eq!(mode_of(a.packet(1, &hint(1920, 1080))), Some((1920, 1080)));
+        // The viewer resizes meanwhile: remembered, not applied (no ping-pong).
+        assert_eq!(a.packet(0, &hint(1700, 950)), None);
+        assert_eq!(a.packet(0, &hint(1800, 1000)), None);
+        assert_eq!(a.current(), (1920, 1080, 240_000));
+        // The session ends: the viewer's latest request applies again.
+        assert_eq!(mode_of(a.packet(1, &active(0))), Some((1800, 1000)));
+        // A second session: the stream again; then it crashes (disconnect).
+        a.packet(1, &active(1));
+        assert_eq!(mode_of(a.packet(1, &hint(3840, 2160))), Some((3840, 2160)));
+        assert_eq!(mode_of(a.disconnect(1)), Some((1800, 1000)));
+    }
+
+    #[test]
+    fn the_mode_without_a_viewer_and_between_viewers() {
+        let mut a = ModeArbiter::new(DisplayMode::DEFAULT);
+        let hello = |caps| pkt(wire::EV_HELLO, 0, 0, 0, 2, caps);
+        let active = |on| pkt(wire::EV_ACTIVE, 0, on, 0, 0, 0);
+        // A stream alone: its session, then idle restores the configured mode.
+        a.packet(1, &hello(wire::CAP_MODE_HINTS | wire::CAP_IDLE));
+        a.packet(1, &active(1));
+        assert_eq!(mode_of(a.packet(1, &hint(1280, 720))), Some((1280, 720)));
+        assert_eq!(mode_of(a.packet(1, &active(0))), Some((2560, 1440)));
+        // Idle twice, or an idle client's hint: nothing.
+        assert_eq!(a.packet(1, &active(0)), None);
+        assert_eq!(a.packet(1, &hint(640, 480)), None);
+        // Two plain clients: the most recent request wins.
+        a.packet(0, &hello(wire::CAP_MODE_HINTS));
+        a.packet(2, &hello(wire::CAP_MODE_HINTS));
+        assert_eq!(mode_of(a.packet(0, &hint(1000, 800))), Some((1000, 800)));
+        assert_eq!(mode_of(a.packet(2, &hint(1200, 800))), Some((1200, 800)));
+        assert_eq!(mode_of(a.packet(0, &hint(1000, 800))), Some((1000, 800)));
+        // The last one leaving keeps the mode, as with a single viewer.
+        assert_eq!(mode_of(a.disconnect(0)), Some((1200, 800)));
+        assert_eq!(a.disconnect(2), None);
+        assert_eq!(a.current(), (1200, 800, 240_000));
+        // A legacy client (no hints) next to them still works by EV_SURFACE.
+        a.packet(3, &hello(0));
+        let fs = a.packet(
+            3,
+            &pkt(wire::EV_SURFACE, wire::F_FULLSCREEN, 3840, 2160, 60_000, 0),
+        );
+        assert_eq!(mode_of(fs), Some((3840, 2160)));
+    }
+
+    /// The single-client flip path, for comparing the per-frame cost before
+    /// and after a change: `cargo test -p device --release --lib
+    /// flip_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn flip_cost() {
+        let (ours, broker) = socketpair();
+        let link = DisplayLink::new(None);
+        link.adopt(ours);
+        let buf = memfd();
+        let stop = Arc::new(AtomicBool::new(false));
+        let drain = {
+            let stop = stop.clone();
+            let fd = broker.as_raw_fd();
+            std::thread::spawn(move || {
+                let mut b = [0u8; 65536];
+                let mut cbuf = [0u64; 64];
+                while !stop.load(Ordering::Relaxed) {
+                    let mut iov = libc::iovec {
+                        iov_base: b.as_mut_ptr().cast(),
+                        iov_len: b.len(),
+                    };
+                    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                    msg.msg_iov = &mut iov;
+                    msg.msg_iovlen = 1;
+                    msg.msg_control = cbuf.as_mut_ptr().cast();
+                    msg.msg_controllen = std::mem::size_of_val(&cbuf);
+                    let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
+                    if n <= 0 {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    unsafe {
+                        let mut c = libc::CMSG_FIRSTHDR(&msg);
+                        while !c.is_null() {
+                            let p = libc::CMSG_DATA(c) as *const RawFd;
+                            let k = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / 4;
+                            for j in 0..k {
+                                libc::close(*p.add(j));
+                            }
+                            c = libc::CMSG_NXTHDR(&msg, c);
+                        }
+                    }
+                }
+            })
+        };
+        let n = 200_000u64;
+        for round in 0..3 {
+            let t = Instant::now();
+            for i in 0..n {
+                let _ = link.flip(buf.as_raw_fd(), &flip(i, 2560));
+            }
+            let ns = t.elapsed().as_nanos() as f64 / n as f64;
+            eprintln!(
+                "round {round}: {ns:.0} ns per flip (sent {}, busy {})",
+                link.stats.sent.load(Ordering::Relaxed),
+                link.stats.busy.load(Ordering::Relaxed)
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        drain.join().unwrap();
     }
 
     #[test]
@@ -2362,6 +3383,7 @@ mod tests {
                     | wire::CLIENT_CLIPBOARD
                     | wire::CLIENT_CLIP_LARGE
                     | wire::CLIENT_GAMEPAD
+                    | wire::CLIENT_IDLE
             )
         );
         assert!(!link.cursor_owed());

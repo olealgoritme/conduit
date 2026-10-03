@@ -139,6 +139,14 @@ enum {
      * The backend carries it to the guest driver's gamepads (nvgpu_pad.h).
      */
     NVKVM_BROKER_EV_PAD = 18,
+
+    /*
+     * EV_ACTIVE -- x = 1: send me frames (and the cursor) from now on;
+     * x = 0: stop.  Only from a broker with NVKVM_BROKER_CAP_IDLE, which
+     * starts idle: a stream host asks for frames only while a client watches.
+     * A client that does not know it may ignore it and keep sending.
+     */
+    NVKVM_BROKER_EV_ACTIVE = 19,
 };
 
 #define NVKVM_BROKER_HINT_RESTORE    0u  /* windowed, scaled: configured mode */
@@ -275,6 +283,12 @@ enum {
 #define NVKVM_BROKER_CAP_CLIP_LARGE   (1u << 12)
 /* The broker may send EV_PAD (a stream host; the viewer does not). */
 #define NVKVM_BROKER_CAP_GAMEPAD      (1u << 13)
+/*
+ * CAP_IDLE (Conduit): the broker starts idle and sends EV_ACTIVE when it wants
+ * frames.  A client with several brokers also treats it as a session broker:
+ * while active, its mode hints take precedence over the others'.
+ */
+#define NVKVM_BROKER_CAP_IDLE         (1u << 14)
 
 /* BYE reason codes. */
 enum {
@@ -471,6 +485,9 @@ enum {
 #define NVKVM_BROKER_CLIENT_CLIP_LARGE (1u << 2)
 /* The client carries EV_PAD to the guest's gamepads. */
 #define NVKVM_BROKER_CLIENT_GAMEPAD    (1u << 3)
+/* The client honours EV_ACTIVE and arbitrates the guest mode between its
+ * brokers: a session broker that is done may just go idle. */
+#define NVKVM_BROKER_CLIENT_IDLE       (1u << 4)
 
 /*
  * Explicitly laid out so every field is naturally aligned and the struct is

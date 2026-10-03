@@ -83,6 +83,8 @@ Capability bits in `HELLO.w1`: `KEYBOARD`, `ABS_POINTER`, `REL_POINTER`,
 | `CAP_MODE_HINTS` (bit 10) | the broker sends `EV_MODE_HINT` = 17: x,y = the mode the guest should be in, in buffer pixels (0,0 = the client's configured mode), w0 = refresh mHz (0 = configured), w1 = reason (0 restore, 1 fullscreen, 2 window, 3 fixed). On change and at attach; windowed `--resize=guest` hints are debounced 150 ms. A client seeing the bit ignores `EV_SURFACE` for mode decisions. |
 | `CAP_CURSOR` (bit 11) | the broker takes `CMD_CURSOR` = 7: with one dma-buf fd, the guest cursor image (ATTACH's fields; ≤256x256, ARGB8888 only — no opaque-twin substitution — and `seq` = hot_x \| hot_y << 16, inside the image), validated like ATTACH and dropped (not disconnected) when bad; without an fd, hide (all fields 0). Shown as the host pointer's cursor over the guest, hidden under grab. Never send it to a broker without the bit. |
 | `CMD_CAPS` width bit 1 `CLIENT_SEQ_USEC` | ATTACH/COMMIT `seq` is the client's CLOCK_MONOTONIC µs at the flip; the broker then measures flip → screen. |
+| `CAP_IDLE` (bit 14) | the broker starts idle and sends `EV_ACTIVE` = 19 (x = 1 frames please, 0 stop) when it wants frames. A client with several brokers treats it as a session broker: while active, its mode hints take precedence. The viewer does not set it; conduit-stream does. |
+| `CMD_CAPS` width bit 4 `CLIENT_IDLE` | the client honours `EV_ACTIVE` and arbitrates the guest mode between brokers (docs/SCANOUT.md, "Several display clients"). |
 
 ### Backpressure, and the rule it enforces
 

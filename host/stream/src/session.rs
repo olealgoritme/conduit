@@ -198,6 +198,27 @@ pub fn mode_hint(host: &Host, w: u32, h: u32, fps: u32) {
     ));
 }
 
+/// The session is over: a backend that knows EV_ACTIVE is told we are idle
+/// (it stops sending frames, and the guest's mode goes back to what the
+/// other display clients asked for, or the configured mode); an older one
+/// gets the configured mode asked for back.
+pub fn session_over(host: &Host) {
+    if host.broker.backend_knows_idle() {
+        host.broker.set_active(false);
+    } else {
+        mode_restore(host);
+    }
+}
+
+/// A session runs: frames please, at the stream's size unless it follows
+/// the guest.
+pub fn session_live(host: &Host, cfg: &StreamConfig) {
+    host.broker.set_active(true);
+    if !cfg.follow_guest {
+        mode_hint(host, cfg.width, cfg.height, cfg.fps);
+    }
+}
+
 pub fn mode_restore(host: &Host) {
     host.broker.send(Pkt::new(
         broker::EV_MODE_HINT,
@@ -248,9 +269,7 @@ pub fn start_with(host: &Arc<Host>, launch: Launch, cfg: StreamConfig, sink: Sin
         cfg.encryption
     );
     *host.session.lock().unwrap() = Some(s.clone());
-    if !cfg.follow_guest {
-        mode_hint(host, cfg.width, cfg.height, cfg.fps);
-    }
+    session_live(host, &cfg);
     host.broker.kick();
     s
 }
@@ -279,7 +298,7 @@ pub fn end(host: &Host, s: &Session, why: &str) {
         s.stop.store(true, Ordering::Relaxed);
         let evs = s.input.lock().unwrap().release_all();
         host.broker.send_all(&evs);
-        mode_restore(host);
+        session_over(host);
         host.broker.kick();
     }
 }
@@ -287,7 +306,7 @@ pub fn end(host: &Host, s: &Session, why: &str) {
 /// The client chose Quit: end the session and forget the launch.
 pub fn quit(host: &Host, why: &str) {
     if stop_current(host, why).is_some() {
-        mode_restore(host);
+        session_over(host);
     }
     *host.launch.lock().unwrap() = None;
     set_app_running(host, false);

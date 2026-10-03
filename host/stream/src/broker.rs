@@ -44,6 +44,8 @@ pub const EV_MODE_HINT: u16 = 17;
 /// Gamepad (Conduit addition; only to a backend that announced
 /// CLIENT_GAMEPAD): x = evdev code, y = value, w0 = pad index << 16 | evdev type.
 pub const EV_PAD: u16 = 18;
+/// Conduit addition (with CAP_IDLE): x = 1 send frames from now on, 0 stop.
+pub const EV_ACTIVE: u16 = 19;
 
 pub const F_FOCUSED: u16 = 1 << 1;
 
@@ -56,6 +58,9 @@ pub const CAP_MODIFIERS: u32 = 1 << 8;
 pub const CAP_MODE_HINTS: u32 = 1 << 10;
 pub const CAP_CURSOR: u32 = 1 << 11;
 pub const CAP_GAMEPAD: u32 = 1 << 13;
+/// We start idle and say EV_ACTIVE while a client watches: with no session
+/// the backend sends us nothing (and exports nothing for us).
+pub const CAP_IDLE: u32 = 1 << 14;
 
 pub const HINT_RESTORE: u32 = 0;
 pub const HINT_FULLSCREEN: u32 = 1;
@@ -63,6 +68,10 @@ pub const HINT_FULLSCREEN: u32 = 1;
 pub const CLIENT_SEQ_USEC: u32 = 1 << 1;
 /// CMD_CAPS bit (Conduit addition): the backend carries EV_PAD to the guest.
 pub const CLIENT_GAMEPAD: u32 = 1 << 3;
+/// CMD_CAPS bit (Conduit addition): the backend honours EV_ACTIVE and
+/// arbitrates the guest's mode between its clients, so a session that ends
+/// goes idle instead of asking for the configured mode back.
+pub const CLIENT_IDLE: u32 = 1 << 4;
 pub const MAX_DIM: u32 = 8192;
 pub const CURSOR_MAX_DIM: u32 = 256;
 
@@ -259,6 +268,17 @@ impl Shared {
         self.out.lock().unwrap().is_some()
     }
 
+    /// Tell the backend whether we want frames (a session runs). Ignored by
+    /// a backend that does not know EV_ACTIVE; it sends frames regardless.
+    pub fn set_active(&self, on: bool) -> bool {
+        self.send(Pkt::new(EV_ACTIVE, on as i32, 0, 0, 0))
+    }
+
+    /// The connected backend said it understands EV_ACTIVE (CLIENT_IDLE).
+    pub fn backend_knows_idle(&self) -> bool {
+        *self.client_caps.lock().unwrap() & CLIENT_IDLE != 0
+    }
+
     pub fn kick(&self) {
         self.inbox.lock().unwrap().kick += 1;
         self.cv.notify_all();
@@ -400,6 +420,7 @@ fn session(s: UnixStream, sh: &Arc<Shared>, on_connect: &dyn Fn()) -> Result<()>
     s.set_write_timeout(Some(Duration::from_millis(500)))?;
     *sh.out.lock().unwrap() = Some(s.try_clone()?);
     *sh.seq.lock().unwrap() = 0;
+    *sh.client_caps.lock().unwrap() = 0;
     sh.send(Pkt::new(EV_HELLO, 0, 0, PROTO_VERSION, sh.caps));
     sh.send(Pkt::new(EV_FOCUS, 1, 0, 0, 0));
     {
@@ -642,6 +663,48 @@ mod tests {
         drop(b);
         t.join().unwrap().unwrap();
         unsafe { libc::close(mfd) };
+    }
+
+    /// HELLO says we start idle; a backend that answers CLIENT_IDLE is told
+    /// when we want frames, and a reconnect forgets what the last one said.
+    #[test]
+    fn idle_and_active_reach_the_backend() {
+        use std::io::{Read, Write};
+        let sh = Shared::new(CAP_IDLE | CAP_MODE_HINTS);
+        for round in 0..2 {
+            let (a, mut b) = UnixStream::pair().unwrap();
+            let sh2 = sh.clone();
+            let t = std::thread::spawn(move || session(a, &sh2, &|| {}));
+            let mut p = [0u8; 24];
+            b.read_exact(&mut p).unwrap();
+            let hello = Pkt::decode(&p);
+            assert_eq!(hello.ty, EV_HELLO);
+            assert!(hello.w1 & CAP_IDLE != 0);
+            b.read_exact(&mut p).unwrap(); // focus
+            assert!(!sh.backend_knows_idle(), "round {round}: not before CAPS");
+            let caps = Cmd {
+                ty: CMD_CAPS,
+                width: CLIENT_SEQ_USEC | CLIENT_IDLE,
+                ..Default::default()
+            };
+            b.write_all(&caps.encode()).unwrap();
+            for _ in 0..200 {
+                if sh.backend_knows_idle() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(sh.backend_knows_idle());
+            assert!(sh.set_active(true));
+            b.read_exact(&mut p).unwrap();
+            assert_eq!((Pkt::decode(&p).ty, Pkt::decode(&p).x), (EV_ACTIVE, 1));
+            assert!(sh.set_active(false));
+            b.read_exact(&mut p).unwrap();
+            assert_eq!((Pkt::decode(&p).ty, Pkt::decode(&p).x), (EV_ACTIVE, 0));
+            drop(b);
+            t.join().unwrap().unwrap();
+            *sh.out.lock().unwrap() = None;
+        }
     }
 
     fn send_fd(s: &UnixStream, bytes: &[u8], fd: RawFd) {

@@ -145,12 +145,14 @@ guest cursor plane commit ──CursorUpdate{owner,handle,hot}──► backend 
 ## Backend → viewer
 
 The backend connects to the broker socket given by `--display-socket PATH`
+(repeatable; see "Several display clients" below)
 and speaks the nvkvm broker wire protocol
 (`host/viewer/common/nvkvm_broker_proto.h`, version 2): one dma-buf per distinct
 `(owner_handle, host_handle)`, exported once and cached, then frame/flip
 messages referencing it. Input from the broker is turned into `InputEvent`
 batches, mode hints into `DisplayMode`. A dead or absent broker never blocks
-the guest: flips are acked and dropped.
+the guest: flips are acked and dropped. With no client that wants frames
+the flip is not even exported (see below).
 
 Conduit additions to the broker protocol — capabilities and appended
 types, no version bump; record sizes unchanged:
@@ -162,6 +164,71 @@ types, no version bump; record sizes unchanged:
 | `CAP_CURSOR` (HELLO w1 bit 11) | broker → backend | the broker takes `CMD_CURSOR` |
 | `CMD_CURSOR` = 7 | backend → broker | with a dma-buf fd: the cursor image (ATTACH's fields, ≤256², AR24, `seq` = hot_x \| hot_y<<16); without: hide, all fields 0 |
 | `CMD_CAPS` width bit `CLIENT_SEQ_USEC` (1<<1) | backend → broker | ATTACH/COMMIT `seq` is the backend's CLOCK_MONOTONIC µs at the flip (lets the viewer measure flip → screen) |
+| `CAP_IDLE` (HELLO w1 bit 14) | broker → backend | the broker starts idle: no frames, no cursor until it sends `EV_ACTIVE`; it is a session client for the mode policy |
+| `EV_ACTIVE` = 19 | broker → backend | x = 1 send frames from now on, 0 stop (only from a `CAP_IDLE` broker) |
+| `CMD_CAPS` width bit `CLIENT_IDLE` (1<<4) | backend → broker | the backend honours `EV_ACTIVE` and arbitrates the mode between clients, so a session that ends goes idle instead of asking for a restore |
+
+## Several display clients
+
+A VM can be shown in the local viewer and streamed (conduit-stream:
+Moonlight, `conduit remote`) at the same time. The backend takes
+`--display-socket` once per client; the CLI passes `display.sock` (the
+viewer's) and `stream.sock` (the stream host's), both in the VM's run
+directory, so `conduit view` and `conduit stream` work in either order and
+closing one leaves the other alone.
+
+```
+                                ┌──► display.sock ──► conduit-viewer   (always active)
+guest flip ─► backend ─ export ─┤
+              (once, cached)    └──► stream.sock  ──► conduit-stream   (active only while a client watches)
+```
+
+- **Frames.** Each flip is exported once (the same per-buffer cache) and the
+  same dma-buf goes to every client that wants frames, with the fd passed
+  per client. Every client has its own non-blocking socket: a full one costs
+  that client this frame (latest frame wins, per client) and the link thread
+  re-sends the newest frame as soon as that socket drains; a dead one is
+  dropped and reconnected on its own. Neither ever delays the guest or the
+  other client.
+- **Nobody watching costs nothing.** A client that is not connected, or that
+  declared `CAP_IDLE` and has not said `EV_ACTIVE` (a stream host with no
+  session), gets nothing. With no client that wants frames the flip path is
+  one atomic load: no export, no fd dup, no send. The link only remembers the
+  buffer's GEM identity (and a dup of its drm file, taken once per file) so
+  that a client that becomes active is shown the current picture at once; it
+  is exported then, on the link thread. The cursor is handled the same way.
+- **Cursor and clipboard** are per client: each gets the cursor when it
+  becomes active and whenever it changes; the guest's clipboard goes to every
+  connected client, and the host clipboard from any client goes to the guest.
+- **Input** from any client goes to the guest. Keys and buttons held through
+  a client are released when that client disconnects or loses focus, without
+  touching what the other holds.
+- **Buffer release.** The backend does not forward `EV_RELEASE` (see
+  docs/STREAMING.md, Limitations); when it does, a buffer becomes reusable
+  only once every client that was sent it has released it.
+
+### Mode policy with several clients
+
+The backend keeps the last request (`EV_MODE_HINT`, or the legacy
+`EV_SURFACE` rule) of every client and applies exactly one:
+
+1. An **active session client** (one with `CAP_IDLE` that said `EV_ACTIVE`,
+   i.e. a stream with a client attached) wins. Its request is the stream's
+   resolution and refresh.
+2. Otherwise the **most recent** request of any active client wins.
+3. Requests that do not win are remembered, not applied. The viewer keeps
+   scaling the guest picture into its window (aspect kept), so a viewer next
+   to a running stream shows the stream's resolution, and its own resizes
+   never re-mode the guest while the stream is on: no ping-pong.
+4. When the session ends the stream goes idle (`EV_ACTIVE` 0), which
+   withdraws its request: the viewer's most recent request applies again, or
+   the configured mode if no other client asked for anything.
+5. A client disconnecting withdraws its request the same way, except that
+   when it was the last one with a request the guest keeps its current mode
+   (as it always did when the only viewer closed).
+
+A stream host talking to an older backend (no `CLIENT_IDLE` in `CMD_CAPS`)
+asks for the configured mode at session end instead, as before.
 
 ## Viewer (host/viewer, Wayland backend)
 
@@ -185,6 +252,8 @@ types, no version bump; record sizes unchanged:
 
 - No CPU copy anywhere. If an import fails, log and drop the frame; never fall
   back to readback.
+- A client that wants no frames costs the flip path nothing (no export, no
+  descriptor, no syscall).
 - Nothing in this path calls NVKMS on the host. Only DRM PRIME export on the
   backend's own host drm fds.
 - The cursor is no exception: its buffer is exported and imported like a

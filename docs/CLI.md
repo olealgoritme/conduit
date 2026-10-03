@@ -45,7 +45,7 @@ before your desktop. `conduit down` stops the slice. Without a systemd user sess
 |---|---|
 | Settings | `~/.config/conduit/` (`ssh/id_ed25519` is the key used for VMs) |
 | VMs | `~/.local/share/conduit/vms/NAME/{disk.img, vm.json, logs/}` |
-| Running state | `/run/user/$UID/conduit/NAME/` (pid files, `gpu.sock`, `display.sock`, `vfs.sock`, `qmp.sock`, `qemu.args` or `vmm.json`; libvirt VMs: `gpu-libvirt.sock`, `vfs-libvirt.sock`, `libvirt-mode`) |
+| Running state | `/run/user/$UID/conduit/NAME/` (pid files, `gpu.sock`, `display.sock` (viewer), `stream.sock` (stream host), `vfs.sock`, `qmp.sock`, `qemu.args` or `vmm.json`; libvirt VMs: `gpu-libvirt.sock`, `vfs-libvirt.sock`, `libvirt-mode`) |
 | libvirt | `vms/NAME/libvirt.json` (which domain), `vms/NAME/libvirt-backup-*.xml` (attach), `~/.config/systemd/user/conduit-{backend,virtiofsd}@*`, `/etc/systemd/system/conduit-net-NAME.service`, `~/.local/share/applications/conduit-NAME.desktop` |
 | Boot files | `~/.local/share/conduit/vms/NAME/boot/{vmlinuz,initrd.img}`: the newest kernel in the disk's `/boot`, copied out with `debugfs` before every start |
 | Cache | `~/.cache/conduit/` (Ubuntu image, the NVIDIA user-space files staged for each driver version) |
