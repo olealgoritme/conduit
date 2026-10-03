@@ -1,0 +1,9 @@
+Conduit is a combination of components under different licenses:
+
+- guest/linux: GPL-2.0-only (from virtio-nvgpu driver/)
+- host/backend: Apache-2.0 (backend), BSD-3-Clause OR GPL-2.0 (protocol) (from virtio-nvgpu)
+- host/viewer: Apache-2.0, see host/viewer/NOTICE (from nvkvm-pv broker)
+- host/vmm: Apache-2.0 (from nesbox)
+- everything else: Apache-2.0 unless a file says otherwise
+
+Full license texts are in each component directory.

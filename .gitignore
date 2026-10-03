@@ -1,0 +1,7 @@
+target/
+*.o
+*.ko
+*.mod*
+*.cmd
+.*.d
+*.deb
