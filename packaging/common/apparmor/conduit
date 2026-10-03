@@ -1,0 +1,18 @@
+# AppArmor abstraction for Conduit, installed as /etc/apparmor.d/abstractions/conduit.
+#
+# conduit-integrate includes it from /etc/apparmor.d/local/abstractions/libvirt-qemu,
+# which libvirt's per-VM profiles (libvirt-<uuid>) include. That lets a
+# libvirt-managed VM (`conduit attach`, virt-manager) run the bundled QEMU and
+# connect to the Conduit backend's vhost-user socket. Nothing else is opened up.
+
+  # The bundled QEMU 11.1 and what it loads at run time.
+  /opt/conduit/bin/qemu-system-x86_64 rmix,
+  /opt/conduit/share/qemu/** r,
+  /opt/conduit/lib/** rm,
+
+  # Backend sockets: system instances (qemu:///system) and per-user instances
+  # (qemu:///session). Connecting to a unix socket needs rw on the path.
+  /run/conduit/ r,
+  /run/conduit/** rw,
+  /run/user/[0-9]*/conduit/ r,
+  /run/user/[0-9]*/conduit/** rw,

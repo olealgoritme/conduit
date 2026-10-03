@@ -1,0 +1,60 @@
+# nfpm config for the `conduit` host package: one file -> .deb, .rpm, Arch.
+# Not used directly: packaging/build.sh `package` fills in the @PLACEHOLDERS@
+# (version, paths, and the runtime library dependencies it detects from the
+# staged binaries) and writes dist/nfpm-conduit.yaml.
+name: conduit
+arch: amd64
+platform: linux
+version: "@VERSION@"
+version_schema: semver
+release: "1"
+section: misc
+priority: optional
+maintainer: "Ole Algoritme <olealgoritme@gmail.com>"
+description: |
+  Share your NVIDIA GPU with a virtual machine and see its desktop on yours.
+  Host side of Conduit: the GPU backend, the zero-copy Wayland viewer, a
+  small built-in VM runner and a bundled QEMU 11.1, all in /opt/conduit, plus
+  the `conduit` command. System QEMU and libvirt are never replaced.
+vendor: Conduit
+homepage: https://github.com/olealgoritme/conduit
+license: Apache-2.0 AND BSD-3-Clause AND GPL-2.0-only
+
+# Shared-library dependencies of the viewer and the bundled QEMU, detected at
+# build time (Debian/Arch package names, RPM sonames). The Rust binaries are
+# static and need nothing.
+depends: ["@DEPENDS@"]
+
+contents:
+  - src: "@STAGE@/opt/conduit"
+    dst: /opt/conduit
+    type: tree
+  - src: /opt/conduit/bin/conduit
+    dst: /usr/bin/conduit
+    type: symlink
+  - src: "@STAGE@/usr/share/applications/conduit.desktop"
+    dst: /usr/share/applications/conduit.desktop
+  - src: "@STAGE@/etc/apparmor.d/abstractions/conduit"
+    dst: /etc/apparmor.d/abstractions/conduit
+    type: config|noreplace
+
+scripts:
+  postinstall: "@SCRIPTS@/conduit-postinst"
+  preremove: "@SCRIPTS@/conduit-prerm"
+
+overrides:
+  deb:
+    recommends: [apparmor]
+    suggests: [libvirt-daemon-system, virt-manager]
+  rpm:
+    recommends: [policycoreutils-python-utils]
+    suggests: [libvirt-daemon, virt-manager]
+  archlinux:
+    suggests: [libvirt, virt-manager]
+
+rpm:
+  summary: Share your NVIDIA GPU with a virtual machine
+  group: Applications/Emulators
+  compression: zstd
+deb:
+  compression: zstd

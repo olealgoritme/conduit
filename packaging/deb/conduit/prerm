@@ -1,0 +1,13 @@
+#!/bin/sh
+# Pre-remove for the `conduit` host package (shared by .deb, .rpm and Arch).
+# Undo the system integration only on a real removal, not on an upgrade:
+#   deb: "upgrade"/"failed-upgrade" = upgrade, "remove"/"deconfigure" = removal
+#   rpm: $1 >= 1 = upgrade, 0 = erase
+#   Arch: pre_remove runs only on removal (argument is the old version)
+set -e
+case "${1:-}" in
+    upgrade|failed-upgrade|[1-9]|[1-9][0-9]) exit 0 ;;
+esac
+[ -x /opt/conduit/libexec/conduit-integrate ] \
+    && /opt/conduit/libexec/conduit-integrate disable || true
+exit 0

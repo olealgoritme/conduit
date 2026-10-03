@@ -1,0 +1,181 @@
+# Release: on a v* tag, build every artifact in docs/STRUCTURE.md and attach
+# them to a GitHub Release. All builds go through packaging/build.sh.
+#
+#   rust-static  backend, VMM and CLI as static musl binaries, built once and
+#                shared by every package (they have no runtime dependencies)
+#   host         per-format container: viewer + bundled QEMU 11.1 (cached),
+#                staged and packaged with nfpm (deb/rpm/Arch) or as a tarball
+#                with its libraries bundled (Debian 12, the oldest glibc we build on)
+#   guest        conduit-guest DKMS source packages (.deb, .rpm)
+#   release      checksums, AUR PKGBUILD, GitHub Release
+#
+# workflow_dispatch builds everything without publishing (artifacts only).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # build.sh strips the leading "v". Manual runs get a dev version.
+  VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('0.0.0-dev.{0}', github.run_number) }}
+  NFPM_VERSION: "2.43.0"
+
+jobs:
+  rust-static:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain (rust-toolchain.toml, incl. the musl target)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            host/backend
+            host/vmm
+      - name: Build static binaries
+        run: RUST_TARGET=x86_64-unknown-linux-musl packaging/build.sh rust
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-static
+          path: dist/rust/bin/
+          if-no-files-found: error
+
+  host:
+    name: host (${{ matrix.format }})
+    needs: rust-static
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - format: deb
+            image: ubuntu:24.04
+          - format: rpm
+            image: fedora:latest
+          - format: archlinux
+            image: archlinux:latest
+          - format: tarball
+            image: debian:12
+    steps:
+      - name: Tools the checkout and cache actions need
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl tar zstd
+          elif command -v dnf >/dev/null; then
+            dnf install -y git curl tar zstd
+          else
+            pacman -Syu --noconfirm --needed git curl tar zstd
+          fi
+      - uses: actions/checkout@v5
+      - name: Mark the workspace safe for git (container runs as root)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build dependencies
+        run: packaging/build.sh deps
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: rust-static
+          path: dist/rust/bin
+      - name: Restore executable bits (artifacts drop them)
+        run: chmod 0755 dist/rust/bin/*
+
+      # QEMU takes most of the build time. Cache it per format, per week
+      # (rolling images like fedora:latest and archlinux change library
+      # sonames), and per change to the QEMU build script or patches.
+      - name: Cache key
+        id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+      - name: Cache QEMU
+        id: qemu-cache
+        uses: actions/cache@v4
+        with:
+          path: dist/qemu-root
+          key: qemu-11.1-${{ matrix.format }}-${{ steps.week.outputs.week }}-${{ hashFiles('host/qemu/**') }}
+      - name: Build QEMU 11.1
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: packaging/build.sh qemu
+
+      - name: Build viewer
+        run: packaging/build.sh viewer
+
+      - name: Stage
+        run: |
+          if [ "${{ matrix.format }}" = tarball ]; then
+            # Tarball installs link /usr/local/bin/conduit and carry their libraries.
+            LINK_DIR=/usr/local/bin packaging/build.sh stage
+            packaging/build.sh bundle-libs
+          else
+            packaging/build.sh stage
+          fi
+
+      - name: Install nfpm
+        if: matrix.format != 'tarball'
+        run: |
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | tar -xz -C /usr/local/bin nfpm
+      - name: Package
+        run: packaging/build.sh package "${{ matrix.format }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.format }}
+          path: dist/out/*
+          if-no-files-found: error
+
+  guest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install nfpm
+        run: |
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin nfpm
+      - name: Package
+        run: |
+          packaging/build.sh package guest-deb
+          packaging/build.sh package guest-rpm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-guest
+          path: dist/out/*
+          if-no-files-found: error
+
+  release:
+    needs: [host, guest]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: pkg-*
+          path: out
+          merge-multiple: true
+      - name: AUR PKGBUILD and checksums
+        run: |
+          v="${VERSION#v}"
+          # pacman versions cannot contain "-": 0.2.0-rc1 -> 0.2.0rc1
+          sed -e "s/^pkgver=.*/pkgver=${v//-/}/" -e "s/#tag=v\$pkgver/#tag=v$v/" \
+            packaging/arch/PKGBUILD > out/PKGBUILD
+          cp packaging/arch/conduit.install out/
+          (cd out && sha256sum -- * > SHA256SUMS)
+          ls -l out
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true

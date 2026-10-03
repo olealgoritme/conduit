@@ -1,0 +1,82 @@
+#!/bin/sh
+# conduit-integrate enable|disable
+#
+# Hooks Conduit into the host's security frameworks and desktop, and undoes it.
+# Called by every package's maintainer scripts and by the tarball installer,
+# installed as /opt/conduit/libexec/conduit-integrate. Idempotent, and never
+# fails a package transaction: every step is best-effort and says what it did.
+#
+#   AppArmor: one marked `include` line in /etc/apparmor.d/local/abstractions/libvirt-qemu
+#             (pulls in /etc/apparmor.d/abstractions/conduit), and one marked rule
+#             in local/usr.lib.libvirt.virt-aa-helper so libvirt's profile
+#             generator may read /opt/conduit.
+#   SELinux:  labels the bundled QEMU qemu_exec_t, so svirt can transition to it.
+#   Desktop:  refreshes the desktop entry cache.
+set -u
+
+MARK="# added by conduit-integrate"
+AA=/etc/apparmor.d
+AA_QEMU=$AA/local/abstractions/libvirt-qemu
+AA_HELPER=$AA/local/usr.lib.libvirt.virt-aa-helper
+QEMU=/opt/conduit/bin/qemu-system-x86_64
+
+say() { echo "conduit: $*"; }
+
+add_line() {   # file line
+    mkdir -p "$(dirname "$1")" || return 0
+    grep -qF "$MARK" "$1" 2>/dev/null && return 0
+    printf '%s %s\n' "$2" "$MARK" >> "$1" && say "updated $1"
+}
+
+drop_line() {  # file
+    [ -f "$1" ] && grep -qF "$MARK" "$1" || return 0
+    sed -i "\|$MARK|d" "$1" && say "cleaned $1"
+}
+
+aa_reload_helper() {
+    [ -f "$AA/usr.lib.libvirt.virt-aa-helper" ] || return 0
+    command -v apparmor_parser >/dev/null 2>&1 || return 0
+    [ -d /sys/kernel/security/apparmor ] || return 0
+    apparmor_parser -r "$AA/usr.lib.libvirt.virt-aa-helper" 2>/dev/null || true
+}
+
+selinux_on() {
+    command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled \
+        && command -v semanage >/dev/null 2>&1
+}
+
+do_enable() {
+    if [ -d "$AA" ]; then
+        # libvirt regenerates per-VM profiles at VM start, so no reload is
+        # needed for the qemu abstraction; virt-aa-helper's profile is static.
+        add_line "$AA_QEMU" "include if exists <abstractions/conduit>"
+        add_line "$AA_HELPER" "/opt/conduit/** r,"
+        aa_reload_helper
+    fi
+    if selinux_on && [ -e "$QEMU" ]; then
+        semanage fcontext -a -t qemu_exec_t "$QEMU" 2>/dev/null \
+            || semanage fcontext -m -t qemu_exec_t "$QEMU" 2>/dev/null || true
+        restorecon -F "$QEMU" 2>/dev/null || true
+        say "labelled $QEMU qemu_exec_t"
+    fi
+    command -v update-desktop-database >/dev/null 2>&1 \
+        && update-desktop-database -q 2>/dev/null || true
+}
+
+do_disable() {
+    drop_line "$AA_QEMU"
+    drop_line "$AA_HELPER"
+    aa_reload_helper
+    if selinux_on; then
+        semanage fcontext -d "$QEMU" 2>/dev/null || true
+    fi
+    command -v update-desktop-database >/dev/null 2>&1 \
+        && update-desktop-database -q 2>/dev/null || true
+}
+
+case "${1:-}" in
+    enable) do_enable ;;
+    disable) do_disable ;;
+    *) echo "usage: $0 enable|disable" >&2; exit 2 ;;
+esac
+exit 0

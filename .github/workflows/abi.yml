@@ -1,0 +1,104 @@
+# ABI: weekly check for new NVIDIA driver releases.
+#
+# Lists open-gpu-kernel-modules release tags and the driver ABIs gVisor's
+# nvproxy knows, runs host/backend/gen's generators for any release without a
+# table (.github/scripts/abi_update.py), tests the result, and opens (or
+# updates) one pull request on the `abi/auto` branch. A failing test run still
+# opens the PR, as a draft, so the generated tables are there to look at.
+#
+# PRs opened with the default GITHUB_TOKEN do not trigger other workflows
+# (so ci.yml would not run on them). Add a fine-grained token with
+# contents+pull-requests write as the ABI_BOT_TOKEN secret to get CI on them.
+name: abi
+
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+    inputs:
+      max:
+        description: "New releases per source in this run"
+        default: "4"
+
+concurrency:
+  group: abi
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fetch gVisor (nvproxy driver ABI list)
+        run: git clone -q --depth 1 https://github.com/google/gvisor.git "$RUNNER_TEMP/gvisor"
+
+      - name: Generate missing tables
+        # The *_extract.py scripts compile a C probe against each release's
+        # headers: python3 and gcc are on the runner.
+        run: |
+          .github/scripts/abi_update.py \
+            --gvisor "$RUNNER_TEMP/gvisor" \
+            --max "${{ inputs.max || '4' }}" \
+            --report "$RUNNER_TEMP/abi-report.md"
+          cat "$RUNNER_TEMP/abi-report.md" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$(git status --porcelain -uall)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            # PR title: the versions this run added, e.g. "620.51.00, 615.71.09".
+            versions=$(git status --porcelain -uall | grep -oE 'v[0-9]+_[0-9]+_[0-9]+' \
+              | sort -u -t_ -k1.2,1n -k2,2n -k3,3n | sed -E 's/^v//; s/_/./g' | paste -sd, - | sed 's/,/, /g')
+            echo "versions=$versions" >> "$GITHUB_OUTPUT"
+          fi
+        id: gen
+
+      # ---- verify what was generated -------------------------------------
+      - name: Toolchain
+        if: steps.gen.outputs.changed == 'true'
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        if: steps.gen.outputs.changed == 'true'
+        with:
+          workspaces: host/backend
+      - name: Test tables and backend
+        id: test
+        if: steps.gen.outputs.changed == 'true'
+        continue-on-error: true
+        working-directory: host/backend
+        run: |
+          cargo test --locked -p abi
+          cargo test --locked --workspace --features device/vhost-user -- \
+            --skip for_real --skip closing_the_fd --skip repeated_map_unmap
+      - name: Build the guest module with the new headers
+        id: guest
+        if: steps.gen.outputs.changed == 'true'
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-headers-$(uname -r)"
+          make -C guest/linux KDIR="/lib/modules/$(uname -r)/build" module
+          make -C guest/linux KDIR="/lib/modules/$(uname -r)/build" clean
+
+      # ---- open / update the PR ------------------------------------------
+      - name: Pull request
+        if: steps.gen.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.ABI_BOT_TOKEN || github.token }}
+          branch: abi/auto
+          delete-branch: true
+          commit-message: "gen: ABI tables for NVIDIA ${{ steps.gen.outputs.versions }}"
+          title: "ABI: NVIDIA ${{ steps.gen.outputs.versions }}"
+          body-path: ${{ runner.temp }}/abi-report.md
+          labels: abi
+          draft: ${{ steps.test.outcome != 'success' || steps.guest.outcome != 'success' }}
+          add-paths: |
+            host/backend/gen/src/**
+            guest/linux/rmctrl/**
+            guest/linux/gen/**

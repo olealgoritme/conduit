@@ -1,0 +1,43 @@
+# nfpm config for `conduit-guest`: the guest kernel module as a DKMS source
+# package (.deb and .rpm), installed inside the VM. Rendered by
+# packaging/build.sh `package guest-deb|guest-rpm`.
+name: conduit-guest
+arch: all
+platform: linux
+version: "@VERSION@"
+version_schema: semver
+release: "1"
+section: kernel
+priority: optional
+maintainer: "Ole Algoritme <olealgoritme@gmail.com>"
+description: |
+  Conduit guest driver (virtio_gpu_nv), DKMS source.
+  Install inside a Linux VM (kernel 6.4 or newer) that runs on a Conduit
+  host. Lets NVIDIA's own user-space driver render on the host GPU and
+  provides the VM's display and input.
+vendor: Conduit
+homepage: https://github.com/olealgoritme/conduit
+license: GPL-2.0-only
+
+depends: [dkms]
+
+contents:
+  - src: "@GUEST_SRC@"
+    dst: "/usr/src/conduit-guest-@VERSION@"
+    type: tree
+
+scripts:
+  postinstall: "@SCRIPTS@/conduit-guest-postinst"
+  preremove: "@SCRIPTS@/conduit-guest-prerm"
+
+overrides:
+  deb:
+    recommends: ["linux-headers-generic | linux-headers-amd64"]
+  rpm:
+    recommends: [kernel-devel]
+
+rpm:
+  summary: Conduit guest driver (DKMS source)
+  group: System Environment/Kernel
+deb:
+  compression: zstd

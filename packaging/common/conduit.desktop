@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Conduit
+GenericName=Virtual Machine Viewer
+Comment=Run a Linux VM on your NVIDIA GPU and see its desktop in a window
+# `conduit view` with no name opens the default VM (CLI contract, see docs/PACKAGING.md).
+Exec=conduit view
+TryExec=conduit
+Icon=computer
+Terminal=false
+Categories=System;Emulator;
+Keywords=VM;virtual machine;GPU;NVIDIA;KVM;
+StartupNotify=true

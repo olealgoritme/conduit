@@ -1,0 +1,11 @@
+#!/bin/sh
+# Pre-remove for `conduit-guest`: drop this version from DKMS. On an upgrade
+# the new package's postinst has already added its own version (deb runs the
+# old prerm first, rpm runs %preun of the old package after the new %post), so
+# removing exactly @VERSION@ is right in both cases.
+set -e
+NAME=conduit-guest
+VERSION=@VERSION@
+command -v dkms >/dev/null 2>&1 || exit 0
+dkms remove -m "$NAME" -v "$VERSION" --all 2>/dev/null || true
+exit 0

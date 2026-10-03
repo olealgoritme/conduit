@@ -1,0 +1,30 @@
+#!/bin/sh
+# Post-install for `conduit-guest` (DKMS source package; shared by .deb and .rpm).
+# Registers the module source with DKMS and builds it for the running kernel.
+# A missing kernel header package is reported, not fatal: DKMS builds the
+# module automatically once headers (and the kernel) are installed.
+set -e
+NAME=conduit-guest
+VERSION=@VERSION@
+
+command -v dkms >/dev/null 2>&1 || { echo "$NAME: dkms not installed" >&2; exit 0; }
+
+if ! dkms status -m "$NAME" -v "$VERSION" 2>/dev/null | grep -q .; then
+    dkms add -m "$NAME" -v "$VERSION" || true
+fi
+
+KVER=$(uname -r)
+case "$KVER" in
+    [0-5].*|6.[0-3].*|6.[0-3]-*)
+        echo "$NAME: kernel $KVER is too old; the guest driver needs Linux 6.4 or newer." >&2
+        exit 0 ;;
+esac
+
+if [ -e "/lib/modules/$KVER/build" ]; then
+    dkms install -m "$NAME" -v "$VERSION" -k "$KVER" || \
+        echo "$NAME: DKMS build failed; see /var/lib/dkms/$NAME/$VERSION/build/make.log" >&2
+    modprobe virtio_gpu_nv 2>/dev/null || true
+else
+    echo "$NAME: no headers for $KVER (install linux-headers-$KVER / kernel-devel), module will build on next kernel install." >&2
+fi
+exit 0

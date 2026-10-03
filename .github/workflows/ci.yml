@@ -1,0 +1,154 @@
+# CI: every push and pull request.
+#
+#   rust          fmt, clippy and tests for each Rust project (backend, VMM, CLI)
+#   guest-module  the guest kernel module against Ubuntu 24.04 and Fedora headers
+#   viewer        the C viewer's own test suite (`make check`, no display needed)
+#   packaging     shellcheck the packaging scripts, build the DKMS source package
+#
+# Nothing here needs an NVIDIA GPU. Tests that open /dev/nvidiactl are skipped
+# by name (the --skip filters in the rust job); they run on the developer rig instead.
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            dir: host/backend
+            # The vhost-user transport is feature-gated; lint and test it too.
+            features: "--workspace --features device/vhost-user"
+          - name: vmm
+            dir: host/vmm
+            # Built without default features (no virglrenderer), as shipped.
+            features: "--workspace --no-default-features"
+          - name: cli
+            # cli/ is a member of the workspace at the repo root.
+            dir: "."
+            features: "--workspace"
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v5
+      # rustup is on the runner; the first cargo call installs the toolchain
+      # pinned in rust-toolchain.toml (with rustfmt and clippy).
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.dir }}
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
+      - name: test
+        # The skipped tests open /dev/nvidiactl and map GPU memory.
+        run: >-
+          cargo test --locked ${{ matrix.features }} --
+          --skip for_real --skip closing_the_fd --skip repeated_map_unmap
+
+  guest-module:
+    name: guest module (${{ matrix.distro }})
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu-24.04
+            image: ubuntu:24.04
+          - distro: fedora-latest
+            image: fedora:latest
+    steps:
+      - name: Install kernel headers and compiler
+        run: |
+          if command -v apt-get >/dev/null; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends linux-headers-generic make gcc git ca-certificates
+          else
+            dnf install -y kernel-devel make gcc elfutils-libelf-devel git
+          fi
+      - uses: actions/checkout@v5
+      - name: Find the header tree and its compiler
+        run: |
+          # Containers have no running kernel of their own: build against the
+          # newest installed header tree, with the GCC major it was built with
+          # (a mismatched GCC can reject the tree's flags).
+          KDIR=$(for d in /usr/src/linux-headers-*-generic /usr/src/kernels/*; do
+                   [ -f "$d/Makefile" ] && echo "$d"; done | sort -V | tail -1)
+          test -n "$KDIR" || { echo "no kernel headers found"; exit 1; }
+          GCCVER=$(sed -n 's/^CONFIG_GCC_VERSION=\([0-9]*\)$/\1/p' "$KDIR/.config")
+          CC=gcc
+          if [ -n "$GCCVER" ] && [ "$(gcc -dumpversion | cut -d. -f1)" != "$((GCCVER / 10000))" ]; then
+            CC=gcc-$((GCCVER / 10000))
+            command -v apt-get >/dev/null && apt-get install -y --no-install-recommends "$CC"
+          fi
+          echo "KDIR=$KDIR" >> "$GITHUB_ENV"
+          echo "KCC=$CC" >> "$GITHUB_ENV"
+          echo "Building against $KDIR with $CC"
+      - name: Build
+        run: make -C guest/linux KDIR="$KDIR" CC="$KCC" module
+      - name: Check the module
+        run: |
+          ko=guest/linux/virtio_gpu_nv.ko
+          test -f "$ko"
+          # modinfo is not always installed; the .modinfo section is enough.
+          objcopy -O binary --only-section=.modinfo "$ko" modinfo.bin
+          tr '\0' '\n' < modinfo.bin | grep -E '^(license|vermagic|alias)='
+
+  viewer:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev wayland-protocols libxcb1-dev libxcb-dri3-dev \
+            libxcb-present-dev libxcb-render0-dev libxcb-xinput-dev libgbm-dev python3
+      - name: make check
+        run: make -C host/viewer -j"$(nproc)" check
+
+  packaging:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # build.sh derives the version from tags
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+      - name: shellcheck
+        run: |
+          shellcheck -S warning \
+            packaging/build.sh packaging/common/conduit-integrate \
+            packaging/tarball/*.sh packaging/deb/*/*
+      - name: DKMS source package
+        run: |
+          NFPM_VERSION=2.43.0
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin nfpm
+          packaging/build.sh package guest-deb
+          dpkg-deb -c dist/out/conduit-guest_*_all.deb

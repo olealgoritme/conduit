@@ -1,0 +1,7 @@
+#!/bin/sh
+# Post-install for the `conduit` host package. nfpm uses this one script for
+# .deb, .rpm and Arch, so it must accept each format's arguments
+# (deb: configure <old>, rpm: <count>, Arch: <new version>); it ignores them.
+set -e
+/opt/conduit/libexec/conduit-integrate enable || true
+exit 0

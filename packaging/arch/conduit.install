@@ -1,0 +1,10 @@
+# pacman install script for the `conduit` package.
+post_install() {
+  /opt/conduit/libexec/conduit-integrate enable || true
+}
+post_upgrade() {
+  post_install
+}
+pre_remove() {
+  /opt/conduit/libexec/conduit-integrate disable || true
+}

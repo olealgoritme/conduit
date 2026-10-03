@@ -5,3 +5,7 @@ target/
 *.cmd
 .*.d
 *.deb
+dist/
+host/qemu/src/
+host/qemu/build/
+host/qemu/build.log

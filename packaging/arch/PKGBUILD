@@ -1,0 +1,56 @@
+# Maintainer: Ole Algoritme <olealgoritme@gmail.com>
+#
+# Split package built from source: `conduit` (host) and `conduit-guest-dkms`
+# (guest module, DKMS). Release .pkg.tar.zst files come from nfpm in
+# .github/workflows/release.yml; both run packaging/build.sh, so the layout
+# matches. AUR publishing notes: docs/PACKAGING.md.
+pkgbase=conduit
+pkgname=(conduit conduit-guest-dkms)
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Share your NVIDIA GPU with a virtual machine and see its desktop on yours"
+arch=(x86_64)
+url="https://github.com/olealgoritme/conduit"
+license=('Apache-2.0' 'BSD-3-Clause' 'GPL-2.0-only')
+makedepends=(git rustup base-devel python ninja meson flex bison file
+             wayland wayland-protocols libxcb mesa
+             glib2 pixman libslirp libseccomp libcap-ng zstd libaio dtc)
+options=(!lto !debug)
+source=("$pkgbase::git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgbase"
+  # rust-toolchain.toml pins the compiler; rustup fetches it here, before
+  # build(), so a network-less build() still works.
+  cargo --version
+}
+
+build() {
+  cd "$pkgbase"
+  export VERSION=$pkgver RUST_TARGET=host
+  packaging/build.sh rust
+  packaging/build.sh viewer
+  packaging/build.sh qemu
+}
+
+package_conduit() {
+  depends=(glibc gcc-libs wayland libxcb glib2 pixman libslirp libseccomp
+           libcap-ng zstd libaio dtc)
+  optdepends=('libvirt: virt-manager/virsh integration (conduit attach)')
+  backup=(etc/apparmor.d/abstractions/conduit)
+  install=conduit.install
+  cd "$pkgbase"
+  VERSION=$pkgver STAGE="$pkgdir" packaging/build.sh stage
+}
+
+package_conduit-guest-dkms() {
+  pkgdesc="Conduit guest driver (virtio_gpu_nv) for Linux VMs, DKMS source"
+  arch=(any)
+  license=('GPL-2.0-only')
+  depends=(dkms)
+  provides=(conduit-guest)
+  cd "$pkgbase"
+  # Arch's dkms pacman hooks build and remove the module; no install script.
+  VERSION=$pkgver packaging/build.sh guest-src "$pkgdir/usr/src/conduit-guest-$pkgver"
+}
