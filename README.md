@@ -82,6 +82,19 @@ or `packaging/release.sh X.Y.Z`); GitHub then builds every package for that tag.
 | `Ctrl+Alt+D` | Direct mode: lowest latency (fullscreen, no overlay) |
 | `Ctrl+Alt+R` | Window size changes the VM's resolution / just scales it |
 
+### Play it from another computer
+
+```bash
+conduit stream myvm             # stream it (NVENC: AV1/HEVC/H.264, up to 240 fps)
+conduit stream pair 1234        # the PIN Moonlight shows when you add this computer
+```
+
+Any [Moonlight](https://moonlight-stream.org) client works: add this computer,
+pair, start "myvm". Keyboard, mouse and gamepads go to the VM. `--service`
+keeps streaming in the background. Conduit's own viewer can connect too
+(`conduit stream myvm --link` here, `conduit remote THIS-PC` there), losslessly
+with `--lossless` on a 10 GbE link. Details: [docs/STREAMING.md](docs/STREAMING.md).
+
 ### Using virt-manager or virsh instead
 
 Already have VMs in virt-manager? Add Conduit to one of them:

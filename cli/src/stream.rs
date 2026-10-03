@@ -170,6 +170,36 @@ fn remove_service(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The GameStream ports (and the link's) must be free before the VM boots.
+fn ports_free(http: u16, link: bool) -> Result<()> {
+    let mut tcp = vec![http, http.wrapping_sub(5), http.wrapping_add(21)];
+    if link {
+        tcp.push(48100);
+    }
+    let udp = [
+        http.wrapping_add(9),
+        http.wrapping_add(10),
+        http.wrapping_add(11),
+    ];
+    let busy = tcp
+        .iter()
+        .filter(|&&p| std::net::TcpListener::bind(("0.0.0.0", p)).is_err())
+        .map(|p| format!("TCP {p}"))
+        .chain(
+            udp.iter()
+                .filter(|&&p| std::net::UdpSocket::bind(("0.0.0.0", p)).is_err())
+                .map(|p| format!("UDP {p}")),
+        )
+        .collect::<Vec<_>>();
+    if busy.is_empty() {
+        return Ok(());
+    }
+    Err(oops(
+        format!("the streaming ports are in use ({})", busy.join(", ")),
+        "Another `conduit stream` (or Sunshine) runs; stop it, or use --port 48089 (then add the host in Moonlight as IP:48089)",
+    ))
+}
+
 pub fn stream(name: &str, o: &Opts, keep_vm: bool) -> Result<()> {
     if o.stop {
         return remove_service(name);
@@ -188,6 +218,7 @@ pub fn stream(name: &str, o: &Opts, keep_vm: bool) -> Result<()> {
         ));
     }
     let _ = std::fs::remove_file(&sock);
+    ports_free(o.port, o.link)?;
 
     // The VM: start it with a display if it is not running. Its guest
     // follows the client's resolution once a client connects.

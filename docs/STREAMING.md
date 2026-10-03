@@ -196,14 +196,42 @@ uses the same NVENC settings as Moonlight.
 - `conduit-stream` holds no privileges; it needs the GPU (render node) and
   the VM's display socket, nothing else.
 
+## Measured (RTX 5090, driver 610.57.04, client on the same machine)
+
+| path | result |
+|---|---|
+| Moonlight 6.1 ← VM (GNOME + vkcube), 2560x1440 AV1, 200 Mbit/s | 237.6 fps received; host processing latency 2.2 ms avg (1.8–6.4), measured from the guest's flip; client decode 1.7 ms; the guest switched itself to 2560x1440@240 on the client's request |
+| headless client ← test source, 5120x1440 AV1 @240, full-screen noise | 240 fps, ~195 Mbit/s on the wire, host latency 1.95 ms avg, no corrupt frame |
+| same, HEVC 5120x1440@240 / H.264 2560x1440@120 | every frame delivered; host latency 2.1 / 4.2 ms |
+| conduit link, lossless, 5120x1440 desktop-like content | 174 fps, 820 Mbit/s; 2560x1440: 200 fps, 650 Mbit/s (host and client sharing one GPU) |
+| conduit link, lossless, pixel check | bit-exact: 0 of 2,073,600 pixels differ source → viewer |
+| input into the VM (evdev, read back in the guest) | keyboard, relative and absolute pointer, buttons, wheel (detent + hi-res), gamepad buttons/sticks/triggers |
+
+Full-screen per-pixel random noise is incompressible losslessly (~26 MB a
+frame at 5120x1440), so lossless 240 fps needs content a desktop or game
+actually has; for H.264/HEVC that same noise also exceeds the bitrate target
+(AV1 holds it).
+
+## Known gaps (outside host/stream)
+
+- The backend does not forward `EV_FRAME`/`EV_RELEASE` (display.rs) and does
+  not fence frames against unfinished guest GPU work (no sync_fd /
+  `DRIVER_SYNCOBJ`). conduit-stream copies each guest buffer into its own
+  planes the moment it arrives (one GL pass, finished before encoding) to
+  narrow the window, but a guest can still draw into a buffer while it is
+  read: occasional torn or partial frames until the backend gains release
+  and fence support.
+- Audio waits for the VM's sound device (see Audio above).
+- No HDR, touch/pen, rumble or motion yet; one stream client at a time.
+
 ## Status
 
 | | |
 |---|---|
-| Moonlight: pairing, applist, launch/resume/quit | done |
-| H.264 / HEVC / AV1 via NVENC, FEC, encrypted control, video encryption | done |
-| keyboard, mouse, wheel | done |
-| gamepads | done (needs the matching guest driver) |
-| audio | designed, stubbed (no sound device in the VM yet) |
-| HDR, touch/pen, rumble, motion | not yet |
-| conduit link + lossless | done |
+| Moonlight: PIN pairing, applist, launch/resume/quit, encrypted RTSP | done, tested with Moonlight 6.1 |
+| H.264 / HEVC / AV1 via NVENC, 4:4:4, FEC, encrypted control, video encryption | done |
+| keyboard, mouse, wheel, gamepads (up to 4) | done, verified in a VM |
+| guest follows the client's resolution and refresh | done (mutter, KWin; wlroots needs `wlr-randr --preferred`) |
+| conduit link (`conduit remote`), lossless | done |
+| `conduit stream NAME`, `--service`, `pair` | done |
+| audio | designed, stubbed |

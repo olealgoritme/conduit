@@ -8,6 +8,9 @@ conduit/
 │   │              (from virtio-nvgpu: device/, protocol/, gen/)
 │   ├── viewer/    C. The Wayland window: zero-copy frames, input, overlay.
 │   │              (from nvkvm-pv's display broker)
+│   ├── stream/    Rust + C. conduit-stream: the VM over the network — a
+│   │              GameStream host for Moonlight and the conduit link for
+│   │              Conduit viewers; NVENC/NVDEC (docs/STREAMING.md).
 │   ├── vmm/       Rust. Small built-in VM runner `conduit-vmm` (from
 │   │              nesbox), the fallback when the bundled QEMU is missing.
 │   └── qemu/      Build script + patches for the bundled QEMU 11.1, the
@@ -18,7 +21,8 @@ conduit/
 │   ├── agent/     Python. conduit-clipboard-agent: the desktop session's
 │   │              clipboard <-> /dev/conduit-clipboard.
 │   └── windows/   Reserved for the Windows guest driver (see ROADMAP).
-├── cli/           The `conduit` command (create / attach / view / up / down).
+├── cli/           The `conduit` command (create / attach / view / up / down /
+│                  stream / remote).
 ├── packaging/
 │   ├── deb/       Debian packages: conduit, conduit-guest
 │   └── dkms/      dkms.conf for the guest module
@@ -47,4 +51,5 @@ and VMM), adds the `conduit` command, a desktop entry, and an AppArmor/SELinux
 rule for libvirt. It never replaces system QEMU or libvirt.
 
 Licenses stay per component: guest driver GPL-2.0, backend Apache-2.0,
-protocol BSD-3-Clause, viewer Apache-2.0 (with its NOTICE), VMM Apache-2.0.
+protocol BSD-3-Clause, viewer Apache-2.0 (with its NOTICE), VMM Apache-2.0,
+stream host Apache-2.0 (with its NOTICE: vendored ENet, nanors, nv-codec-headers, all MIT).
