@@ -51,6 +51,8 @@
 #include <drm/drm_ioctl.h>
 #include <drm/drm_prime.h>
 
+#include "nvgpu_compat.h"
+
 #include "gen/nvgpu_rmalloc_classes.h"
 #include "gen/nvgpu_v1v2_rewrites.h"
 #include "nvgpu_rm_intercepts.h"
@@ -4776,6 +4778,7 @@ static const struct drm_driver nvgpu_drm_driver = {
     .fops = &nvgpu_drm_fops,
     .name = "nvidia-drm",
     .desc = "NVIDIA DRM driver",
+    NVGPU_DRM_DRIVER_DATE
     .major = 0,
     .minor = 0,
     .patchlevel = 0,
@@ -4795,13 +4798,14 @@ static const struct drm_driver nvgpu_drm_kms_driver = {
      * DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT -- they draw their own cursor).
      */
     .driver_features = DRIVER_GEM | DRIVER_RENDER | DRIVER_MODESET |
-                       DRIVER_ATOMIC | DRIVER_CURSOR_HOTSPOT,
+                       DRIVER_ATOMIC | NVGPU_DRIVER_CURSOR_HOTSPOT,
     .gem_prime_import = nvgpu_gem_prime_import,
     .open = nvgpu_drm_open,
     .postclose = nvgpu_drm_postclose,
     .fops = &nvgpu_drm_fops,
     .name = "nvidia-drm",
     .desc = "NVIDIA DRM driver",
+    NVGPU_DRM_DRIVER_DATE
     .major = 0,
     .minor = 0,
     .patchlevel = 0,

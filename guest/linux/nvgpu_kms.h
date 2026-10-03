@@ -20,8 +20,9 @@
  *     *fire-and-forget* -- the commit never waits for the host, and the flip
  *     goes out the moment the commit lands, not at the next vblank.
  *
- *   - Vblank from the core's hrtimer (DRM_CRTC_VBLANK_TIMER_FUNCS) at the
- *     mode's refresh. Synchronous flips complete on it; async flips
+ *   - Vblank from the core's hrtimer (DRM_CRTC_VBLANK_TIMER_FUNCS; before
+ *     6.19 the same timer from nvgpu_compat.h) at the mode's refresh.
+ *     Synchronous flips complete on it; async flips
  *     (DRM_MODE_PAGE_FLIP_ASYNC, the "tearing" path) complete at once.
  *
  *   - Input: a keyboard, a relative mouse and an absolute pointer, fed from
@@ -66,7 +67,6 @@
 #include <drm/drm_plane.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
-#include <drm/drm_vblank_helper.h>
 #include <linux/input.h>
 #include <linux/rcupdate.h>
 
@@ -189,6 +189,11 @@ struct nvgpu_kms {
 
   u64 n_flips;
   u64 n_flip_errors;
+
+#ifndef NVGPU_HAVE_VBLANK_TIMER
+  /* The vblank hrtimer the core keeps itself from 6.19 (nvgpu_compat.h). */
+  struct nvgpu_vblank_timer vblank;
+#endif
 };
 
 static const u32 nvgpu_kms_cursor_formats[] = {DRM_FORMAT_ARGB8888};
@@ -313,7 +318,7 @@ nvgpu_kms_fb_create(struct drm_device *drm, struct drm_file *file,
     drm_gem_object_put(obj);
     return ERR_PTR(-ENOMEM);
   }
-  drm_helper_mode_fill_fb_struct(drm, fb, info, cmd);
+  nvgpu_fill_fb_struct(drm, fb, info, cmd);
   fb->obj[0] = obj;
 
   ret = drm_framebuffer_init(drm, fb, &nvgpu_kms_fb_funcs);
@@ -324,6 +329,20 @@ nvgpu_kms_fb_create(struct drm_device *drm, struct drm_file *file,
   }
   return fb;
 }
+
+#ifndef NVGPU_HAVE_FB_CREATE_INFO
+/* Before 6.17 the core does not pass the format info (nvgpu_compat.h). */
+static struct drm_framebuffer *
+nvgpu_kms_fb_create_noinfo(struct drm_device *drm, struct drm_file *file,
+                           const struct drm_mode_fb_cmd2 *cmd) {
+  const struct drm_format_info *info = drm_get_format_info(drm, cmd);
+
+  if (!info)
+    return ERR_PTR(-EINVAL);
+  return nvgpu_kms_fb_create(drm, file, info, cmd);
+}
+#define nvgpu_kms_fb_create nvgpu_kms_fb_create_noinfo
+#endif
 
 /* ───────── primary plane ───────── */
 
@@ -343,7 +362,7 @@ static bool nvgpu_kms_format_mod_supported(struct drm_plane *plane, u32 format,
 }
 
 static int nvgpu_kms_plane_atomic_check(struct drm_plane *plane,
-                                        struct drm_atomic_commit *state) {
+                                        struct nvgpu_atomic_commit *state) {
   struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
   struct drm_crtc_state *crtc_state;
 
@@ -363,7 +382,7 @@ static int nvgpu_kms_plane_atomic_check(struct drm_plane *plane,
  * present never waits on the guest's vblank.
  */
 static void nvgpu_kms_plane_atomic_update(struct drm_plane *plane,
-                                          struct drm_atomic_commit *state) {
+                                          struct nvgpu_atomic_commit *state) {
   struct nvgpu_kms *kms = container_of(plane, struct nvgpu_kms, primary);
   struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
 
@@ -389,7 +408,7 @@ static const struct drm_plane_funcs nvgpu_kms_plane_funcs = {
     .format_mod_supported = nvgpu_kms_format_mod_supported,
     /* Async flips take the same buffers; this also publishes
      * IN_FORMATS_ASYNC so a compositor knows tearing works with them. */
-    .format_mod_supported_async = nvgpu_kms_format_mod_supported,
+    NVGPU_PLANE_FORMAT_MOD_ASYNC(nvgpu_kms_format_mod_supported)
 };
 
 /* ───────── cursor plane ───────── */
@@ -418,8 +437,10 @@ static void nvgpu_kms_send_cursor(struct nvgpu_kms *kms,
     w = min_t(u32, fb->width, NVGPU_CURSOR_MAX);
     h = min_t(u32, fb->height, NVGPU_CURSOR_MAX);
     pitch = fb->pitches[0];
+#if NVGPU_HAVE_CURSOR_HOTSPOT
     hx = clamp_t(s32, st->hotspot_x, 0, (s32)w - 1);
     hy = clamp_t(s32, st->hotspot_y, 0, (s32)h - 1);
+#endif
   }
   if (kms->cur_sent && vis == kms->cur_vis &&
       (!vis || (owner == kms->cur_owner && handle == kms->cur_handle &&
@@ -471,7 +492,7 @@ static void nvgpu_kms_send_cursor(struct nvgpu_kms *kms,
 }
 
 static int nvgpu_kms_cursor_atomic_check(struct drm_plane *plane,
-                                         struct drm_atomic_commit *state) {
+                                         struct nvgpu_atomic_commit *state) {
   struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
   struct drm_crtc_state *crtc_state;
 
@@ -489,7 +510,7 @@ static int nvgpu_kms_cursor_atomic_check(struct drm_plane *plane,
 }
 
 static void nvgpu_kms_cursor_atomic_update(struct drm_plane *plane,
-                                           struct drm_atomic_commit *state) {
+                                           struct nvgpu_atomic_commit *state) {
   struct nvgpu_kms *kms = container_of(plane, struct nvgpu_kms, cursor);
 
   nvgpu_kms_send_cursor(kms, drm_atomic_get_new_plane_state(state, plane));
@@ -523,7 +544,7 @@ static const struct drm_plane_funcs nvgpu_kms_cursor_funcs = {
  * about the buffer already, in the plane update.
  */
 static void nvgpu_kms_crtc_atomic_flush(struct drm_crtc *crtc,
-                                        struct drm_atomic_commit *state) {
+                                        struct nvgpu_atomic_commit *state) {
   struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
   struct drm_pending_vblank_event *event = cs->event;
 
@@ -540,7 +561,7 @@ static void nvgpu_kms_crtc_atomic_flush(struct drm_crtc *crtc,
 }
 
 static void nvgpu_kms_crtc_atomic_disable(struct drm_crtc *crtc,
-                                          struct drm_atomic_commit *state) {
+                                          struct nvgpu_atomic_commit *state) {
   struct nvgpu_kms *kms = container_of(crtc, struct nvgpu_kms, crtc);
 
   /* Sends any event still armed, so no compositor waits on a dead head. */
@@ -548,9 +569,46 @@ static void nvgpu_kms_crtc_atomic_disable(struct drm_crtc *crtc,
   nvgpu_kms_send_disable(kms);
 }
 
+#ifdef NVGPU_HAVE_VBLANK_TIMER
+#define NVGPU_KMS_CRTC_VBLANK_FUNCS DRM_CRTC_VBLANK_TIMER_FUNCS
+#define nvgpu_kms_crtc_atomic_enable drm_crtc_vblank_atomic_enable
+#else
+/* Before 6.19: the same timer vblank, from nvgpu_compat.h. */
+static int nvgpu_kms_enable_vblank(struct drm_crtc *crtc) {
+  struct nvgpu_kms *kms = container_of(crtc, struct nvgpu_kms, crtc);
+
+  return nvgpu_vblank_timer_start(&kms->vblank, crtc);
+}
+
+static void nvgpu_kms_disable_vblank(struct drm_crtc *crtc) {
+  struct nvgpu_kms *kms = container_of(crtc, struct nvgpu_kms, crtc);
+
+  nvgpu_vblank_timer_cancel(&kms->vblank);
+}
+
+static bool nvgpu_kms_get_vblank_timestamp(struct drm_crtc *crtc,
+                                           int *max_error, ktime_t *vblank_time,
+                                           bool in_vblank_irq) {
+  struct nvgpu_kms *kms = container_of(crtc, struct nvgpu_kms, crtc);
+
+  nvgpu_vblank_timer_timestamp(&kms->vblank, crtc, vblank_time);
+  return true;
+}
+
+static void nvgpu_kms_crtc_atomic_enable(struct drm_crtc *crtc,
+                                         struct nvgpu_atomic_commit *state) {
+  drm_crtc_vblank_on(crtc);
+}
+
+#define NVGPU_KMS_CRTC_VBLANK_FUNCS                                            \
+  .enable_vblank = nvgpu_kms_enable_vblank,                                    \
+  .disable_vblank = nvgpu_kms_disable_vblank,                                  \
+  .get_vblank_timestamp = nvgpu_kms_get_vblank_timestamp
+#endif
+
 static const struct drm_crtc_helper_funcs nvgpu_kms_crtc_helper_funcs = {
     .atomic_flush = nvgpu_kms_crtc_atomic_flush,
-    .atomic_enable = drm_crtc_vblank_atomic_enable,
+    .atomic_enable = nvgpu_kms_crtc_atomic_enable,
     .atomic_disable = nvgpu_kms_crtc_atomic_disable,
 };
 
@@ -561,7 +619,7 @@ static const struct drm_crtc_funcs nvgpu_kms_crtc_funcs = {
     .page_flip = drm_atomic_helper_page_flip,
     .atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
     .atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
-    DRM_CRTC_VBLANK_TIMER_FUNCS,
+    NVGPU_KMS_CRTC_VBLANK_FUNCS,
 };
 
 /* ───────── encoder and connector ───────── */
@@ -732,7 +790,7 @@ static void nvgpu_kms_mode_event(struct nvgpu_device *dev, const u8 *p,
  * compositor flipping as fast as it renders is not paced by the commit worker
  * through cleanup_done; for an ordinary flip it is the same one vblank.
  */
-static void nvgpu_kms_commit_tail(struct drm_atomic_commit *state) {
+static void nvgpu_kms_commit_tail(struct nvgpu_atomic_commit *state) {
   struct drm_device *drm = state->dev;
 
   drm_atomic_helper_commit_modeset_disables(drm, state);
@@ -810,7 +868,8 @@ static int nvgpu_kms_init(struct nvgpu_dri_dev *dri, struct drm_device *drm) {
   kms->boot_w = kms->width;
   kms->boot_h = kms->height;
   kms->boot_mhz = kms->refresh_mhz;
-  kms->has_cursor = dev->has_cursor;
+  /* No hotspot before 6.8 (nvgpu_compat.h): no cursor plane either. */
+  kms->has_cursor = NVGPU_HAVE_CURSOR_HOTSPOT && dev->has_cursor;
   spin_lock_init(&kms->mode_lock);
   INIT_WORK(&kms->mode_work, nvgpu_kms_mode_work);
   nvgpu_kms_build_modifiers(kms);
@@ -1171,6 +1230,9 @@ static void nvgpu_kms_fini(struct nvgpu_dri_dev *dri) {
   cancel_work_sync(&kms->mode_work);
   /* Turns the CRTC off: vblank timer stopped, pending events sent. */
   drm_atomic_helper_shutdown(dri->drm);
+#ifndef NVGPU_HAVE_VBLANK_TIMER
+  nvgpu_vblank_timer_fini(&kms->vblank);
+#endif
   dev_info(&dri->dev->vdev->dev,
            "virtio-gpu-nv: KMS head down after %llu flips (%llu dropped), "
            "%llu cursor updates\n",

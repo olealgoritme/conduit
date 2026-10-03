@@ -1,7 +1,8 @@
 # CI: every push and pull request.
 #
 #   rust          fmt, clippy and tests for each Rust project (backend, VMM, CLI)
-#   guest-module  the guest kernel module against Ubuntu 24.04 and Fedora headers
+#   guest-module  the guest kernel module against Ubuntu 24.04 (GA 6.8 and HWE),
+#                 Debian 13 (6.12) and Fedora (newest) headers
 #   viewer        the C viewer's own test suite (`make check`, no display needed)
 #   packaging     shellcheck the packaging scripts, build the DKMS source package
 #
@@ -77,19 +78,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The oldest kernels exercise nvgpu_compat.h's fallbacks (own
+          # vblank timer, no format info in fb_create, old virtio_find_vqs).
           - distro: ubuntu-24.04
             image: ubuntu:24.04
+            headers: linux-headers-generic
+          - distro: ubuntu-24.04-hwe
+            image: ubuntu:24.04
+            headers: linux-headers-generic-hwe-24.04
+          - distro: debian-13
+            image: debian:13
+            headers: linux-headers-amd64
           - distro: fedora-latest
             image: fedora:latest
+            headers: kernel-devel
     steps:
       - name: Install kernel headers and compiler
         run: |
           if command -v apt-get >/dev/null; then
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            apt-get install -y --no-install-recommends linux-headers-generic make gcc git ca-certificates
+            apt-get install -y --no-install-recommends ${{ matrix.headers }} make gcc git ca-certificates
           else
-            dnf install -y kernel-devel make gcc elfutils-libelf-devel git
+            dnf install -y ${{ matrix.headers }} make gcc elfutils-libelf-devel git
           fi
       - uses: actions/checkout@v5
       - name: Find the header tree and its compiler
@@ -97,7 +108,7 @@ jobs:
           # Containers have no running kernel of their own: build against the
           # newest installed header tree, with the GCC major it was built with
           # (a mismatched GCC can reject the tree's flags).
-          KDIR=$(for d in /usr/src/linux-headers-*-generic /usr/src/kernels/*; do
+          KDIR=$(for d in /usr/src/linux-headers-*-generic /usr/src/linux-headers-*-amd64 /usr/src/kernels/*; do
                    [ -f "$d/Makefile" ] && echo "$d"; done | sort -V | tail -1)
           test -n "$KDIR" || { echo "no kernel headers found"; exit 1; }
           GCCVER=$(sed -n 's/^CONFIG_GCC_VERSION=\([0-9]*\)$/\1/p' "$KDIR/.config")
@@ -110,7 +121,15 @@ jobs:
           echo "KCC=$CC" >> "$GITHUB_ENV"
           echo "Building against $KDIR with $CC"
       - name: Build
-        run: make -C guest/linux KDIR="$KDIR" CC="$KCC" module
+        shell: bash
+        run: |
+          set -o pipefail
+          make -C guest/linux KDIR="$KDIR" CC="$KCC" module 2>&1 | tee build.log
+          # Zero compiler warnings on every kernel. (Kbuild's own notes about
+          # the compiler or pahole differing are not file:line diagnostics.)
+          if grep -E '^[^ :]+:[0-9]+:([0-9]+:)? warning:' build.log; then
+            echo "::error::compiler warnings in the guest module"; exit 1
+          fi
       - name: Check the module
         run: |
           ko=guest/linux/virtio_gpu_nv.ko
