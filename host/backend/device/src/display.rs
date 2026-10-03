@@ -855,15 +855,15 @@ impl DisplayLink {
         let fd = match dmabuf {
             // SAFETY: a borrowed descriptor that is live for this call; the
             // dup is ours.
-            Some(raw) => match unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) }
-                .try_clone_to_owned()
-            {
-                Ok(o) => Some(Arc::new(o)),
-                Err(e) => {
-                    log::warn!("display: cursor: dup: {e}; cursor update dropped");
-                    return FlipOutcome::Busy;
+            Some(raw) => {
+                match unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) }.try_clone_to_owned() {
+                    Ok(o) => Some(Arc::new(o)),
+                    Err(e) => {
+                        log::warn!("display: cursor: dup: {e}; cursor update dropped");
+                        return FlipOutcome::Busy;
+                    }
                 }
-            },
+            }
             None => None,
         };
         let mut st = self.state.lock().unwrap();
@@ -1275,8 +1275,8 @@ fn connect_unix(path: &Path) -> io::Result<OwnedFd> {
     }
     // SAFETY: fresh descriptor, owned from here.
     let sock = unsafe { OwnedFd::from_raw_fd(fd) };
-    let len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1)
-        as libc::socklen_t;
+    let len =
+        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as libc::socklen_t;
     // SAFETY: sa is a valid sockaddr_un of at least `len` bytes.
     let r = unsafe { libc::connect(fd, (&sa as *const libc::sockaddr_un).cast(), len) };
     if r < 0 {
@@ -1308,7 +1308,14 @@ mod tests {
                 refresh_hz: 240
             }
         );
-        for bad in ["", "2560", "0x1440@60", "2560x1440@0", "99999x10@60", "axb@c"] {
+        for bad in [
+            "",
+            "2560",
+            "0x1440@60",
+            "2560x1440@0",
+            "99999x10@60",
+            "axb@c",
+        ] {
             assert!(DisplayMode::parse(bad).is_err(), "{bad} parsed");
         }
         assert_eq!(DisplayMode::DEFAULT.to_string(), "2560x1440@240");
@@ -1354,7 +1361,10 @@ mod tests {
         // File close drops only that file's entries.
         assert_eq!(c.forget_owner(5), 2);
         assert_eq!(c.len(), 1);
-        assert_eq!(c.get_or_export(7, 7, || Err(libc::ENOENT)), Err(libc::ENOENT));
+        assert_eq!(
+            c.get_or_export(7, 7, || Err(libc::ENOENT)),
+            Err(libc::ENOENT)
+        );
         assert_eq!(c.len(), 1);
     }
 
@@ -1392,7 +1402,10 @@ mod tests {
         })
         .unwrap();
         assert!(fd.as_raw_fd() >= 0);
-        assert_eq!(prime_export(1, 1, |_, _, _| Err(libc::EINVAL)).err(), Some(libc::EINVAL));
+        assert_eq!(
+            prime_export(1, 1, |_, _, _| Err(libc::EINVAL)).err(),
+            Some(libc::EINVAL)
+        );
     }
 
     #[test]
@@ -1599,7 +1612,10 @@ mod tests {
         link.adopt(ours);
         let buf = memfd();
 
-        assert_eq!(link.flip(buf.as_raw_fd(), &flip(1, 2560)), FlipOutcome::Sent);
+        assert_eq!(
+            link.flip(buf.as_raw_fd(), &flip(1, 2560)),
+            FlipOutcome::Sent
+        );
         // First flip of a size/format: WINDOW and QUERY_FORMAT, no fd.
         let (c, f) = broker_recv(broker.as_raw_fd());
         assert_eq!((c.ty, c.width, c.height), (wire::CMD_WINDOW, 2560, 1440));
@@ -1613,21 +1629,38 @@ mod tests {
         assert_eq!(c.ty, wire::CMD_ATTACH);
         assert_eq!((c.width, c.stride, c.fourcc), (2560, 10240, 0x3432_5258));
         // seq is the flip's CLOCK_MONOTONIC microseconds (CLIENT_SEQ_USEC).
-        assert!(before.wrapping_sub(c.seq) < 5_000_000, "seq {} vs now {before}", c.seq);
+        assert!(
+            before.wrapping_sub(c.seq) < 5_000_000,
+            "seq {} vs now {before}",
+            c.seq
+        );
         let f = f.expect("ATTACH carries the dma-buf");
         assert_eq!(inode(f.as_raw_fd()), inode(buf.as_raw_fd()));
         let attach_seq = c.seq;
         let (c, f) = broker_recv(broker.as_raw_fd());
-        assert_eq!(c, wire::Cmd { ty: wire::CMD_COMMIT, seq: attach_seq, ..Default::default() });
+        assert_eq!(
+            c,
+            wire::Cmd {
+                ty: wire::CMD_COMMIT,
+                seq: attach_seq,
+                ..Default::default()
+            }
+        );
         assert!(f.is_none());
 
         // Steady state: exactly ATTACH+COMMIT per flip.
-        assert_eq!(link.flip(buf.as_raw_fd(), &flip(2, 2560)), FlipOutcome::Sent);
+        assert_eq!(
+            link.flip(buf.as_raw_fd(), &flip(2, 2560)),
+            FlipOutcome::Sent
+        );
         assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_ATTACH);
         assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_COMMIT);
 
         // A mode change asks for a new window first.
-        assert_eq!(link.flip(buf.as_raw_fd(), &flip(3, 1920)), FlipOutcome::Sent);
+        assert_eq!(
+            link.flip(buf.as_raw_fd(), &flip(3, 1920)),
+            FlipOutcome::Sent
+        );
         let (c, _) = broker_recv(broker.as_raw_fd());
         assert_eq!((c.ty, c.width), (wire::CMD_WINDOW, 1920));
         assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_ATTACH);
@@ -1664,9 +1697,15 @@ mod tests {
         link.adopt(ours);
         drop(broker);
         let buf = memfd();
-        assert_eq!(link.flip(buf.as_raw_fd(), &flip(1, 2560)), FlipOutcome::Broken);
+        assert_eq!(
+            link.flip(buf.as_raw_fd(), &flip(1, 2560)),
+            FlipOutcome::Broken
+        );
         assert!(!link.connected());
-        assert_eq!(link.flip(buf.as_raw_fd(), &flip(2, 2560)), FlipOutcome::NoBroker);
+        assert_eq!(
+            link.flip(buf.as_raw_fd(), &flip(2, 2560)),
+            FlipOutcome::NoBroker
+        );
     }
 
     struct VecSink(Arc<Mutex<Vec<InputEventEntry>>>);
@@ -1699,28 +1738,58 @@ mod tests {
             refresh_hz: 240,
         };
         let mut p = ModePolicy::new(cfg);
-        assert_eq!(p.packet(&pkt(wire::EV_HELLO, 0, 0, 0, 2, wire::CAP_MODE_HINTS)), None);
+        assert_eq!(
+            p.packet(&pkt(wire::EV_HELLO, 0, 0, 0, 2, wire::CAP_MODE_HINTS)),
+            None
+        );
         // The handshake's EV_SURFACE is not a mode decision any more.
         assert_eq!(p.packet(&pkt(wire::EV_SURFACE, 0, 1920, 1080, 0, 0)), None);
         // Restore while already configured: nothing to do.
         assert_eq!(p.packet(&pkt(wire::EV_MODE_HINT, 0, 0, 0, 0, 0)), None);
         let fs = p
-            .packet(&pkt(wire::EV_MODE_HINT, wire::F_FULLSCREEN, 5120, 1440, 239_960, 1))
+            .packet(&pkt(
+                wire::EV_MODE_HINT,
+                wire::F_FULLSCREEN,
+                5120,
+                1440,
+                239_960,
+                1,
+            ))
             .unwrap();
         assert_eq!((fs.width, fs.height, fs.refresh_mhz), (5120, 1440, 239_960));
         assert_eq!(
-            p.packet(&pkt(wire::EV_MODE_HINT, wire::F_FULLSCREEN, 5120, 1440, 239_960, 1)),
+            p.packet(&pkt(
+                wire::EV_MODE_HINT,
+                wire::F_FULLSCREEN,
+                5120,
+                1440,
+                239_960,
+                1
+            )),
             None,
             "the same hint twice is one re-mode"
         );
         let back = p.packet(&pkt(wire::EV_MODE_HINT, 0, 0, 0, 0, 0)).unwrap();
-        assert_eq!((back.width, back.height, back.refresh_mhz), (2560, 1440, 240_000));
+        assert_eq!(
+            (back.width, back.height, back.refresh_mhz),
+            (2560, 1440, 240_000)
+        );
         // --resize=guest: the window's size; unknown refresh is the configured.
-        let win = p.packet(&pkt(wire::EV_MODE_HINT, 0, 1277, 1413, 0, 2)).unwrap();
-        assert_eq!((win.width, win.height, win.refresh_mhz), (1277, 1413, 240_000));
+        let win = p
+            .packet(&pkt(wire::EV_MODE_HINT, 0, 1277, 1413, 0, 2))
+            .unwrap();
+        assert_eq!(
+            (win.width, win.height, win.refresh_mhz),
+            (1277, 1413, 240_000)
+        );
         // Nonsense is clamped, not passed on.
-        let tiny = p.packet(&pkt(wire::EV_MODE_HINT, 0, 3, 99_999, 7, 2)).unwrap();
-        assert_eq!((tiny.width, tiny.height, tiny.refresh_mhz), (64, 8192, 1000));
+        let tiny = p
+            .packet(&pkt(wire::EV_MODE_HINT, 0, 3, 99_999, 7, 2))
+            .unwrap();
+        assert_eq!(
+            (tiny.width, tiny.height, tiny.refresh_mhz),
+            (64, 8192, 1000)
+        );
     }
 
     /// A broker without the capability: only a fullscreen EV_SURFACE re-modes,
@@ -1730,12 +1799,24 @@ mod tests {
         let mut p = ModePolicy::new(DisplayMode::DEFAULT);
         p.packet(&pkt(wire::EV_HELLO, 0, 0, 0, 2, 0));
         assert_eq!(p.packet(&pkt(wire::EV_MODE_HINT, 0, 800, 600, 0, 2)), None);
-        assert_eq!(p.packet(&pkt(wire::EV_SURFACE, 0, 1280, 720, 60_000, 0)), None);
+        assert_eq!(
+            p.packet(&pkt(wire::EV_SURFACE, 0, 1280, 720, 60_000, 0)),
+            None
+        );
         let fs = p
-            .packet(&pkt(wire::EV_SURFACE, wire::F_FULLSCREEN, 3840, 2160, 60_000, 0))
+            .packet(&pkt(
+                wire::EV_SURFACE,
+                wire::F_FULLSCREEN,
+                3840,
+                2160,
+                60_000,
+                0,
+            ))
             .unwrap();
         assert_eq!((fs.width, fs.height, fs.refresh_mhz), (3840, 2160, 60_000));
-        let back = p.packet(&pkt(wire::EV_SURFACE, 0, 1280, 720, 60_000, 0)).unwrap();
+        let back = p
+            .packet(&pkt(wire::EV_SURFACE, 0, 1280, 720, 60_000, 0))
+            .unwrap();
         assert_eq!((back.width, back.height), (2560, 1440));
     }
 
@@ -1779,17 +1860,32 @@ mod tests {
         link.retry_cursor();
         let (c, f) = broker_recv(broker.as_raw_fd());
         assert_eq!(c.ty, wire::CMD_CURSOR);
-        assert_eq!((c.width, c.height, c.stride, c.fourcc), (64, 64, 256, 0x3432_5241));
+        assert_eq!(
+            (c.width, c.height, c.stride, c.fourcc),
+            (64, 64, 256, 0x3432_5241)
+        );
         assert_eq!(c.seq, 3 | (60 << 16));
-        assert_eq!(inode(f.expect("the cursor dma-buf").as_raw_fd()), inode(buf.as_raw_fd()));
+        assert_eq!(
+            inode(f.expect("the cursor dma-buf").as_raw_fd()),
+            inode(buf.as_raw_fd())
+        );
         // Hidden: a bare CMD_CURSOR.
         let hidden = CursorUpdate::default();
         assert_eq!(link.cursor(None, &hidden), FlipOutcome::Sent);
         let (c, f) = broker_recv(broker.as_raw_fd());
-        assert_eq!(c, wire::Cmd { ty: wire::CMD_CURSOR, ..Default::default() });
+        assert_eq!(
+            c,
+            wire::Cmd {
+                ty: wire::CMD_CURSOR,
+                ..Default::default()
+            }
+        );
         assert!(f.is_none());
         // Shown again, then the broker goes and a new one comes: it is re-sent.
-        assert_eq!(link.cursor(Some(buf.as_raw_fd()), &cursor(9, 1, 2)), FlipOutcome::Sent);
+        assert_eq!(
+            link.cursor(Some(buf.as_raw_fd()), &cursor(9, 1, 2)),
+            FlipOutcome::Sent
+        );
         broker_recv(broker.as_raw_fd());
         drop(broker);
         let (ours2, broker2) = socketpair();

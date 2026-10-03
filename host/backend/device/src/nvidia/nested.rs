@@ -125,7 +125,7 @@ impl NvidiaBackend {
                         Ok(real_fd) => {
                             saved_nested_handle = Some((NV0005_DATA, guest_handle_val));
                             host_buf[NV0005_DATA..NV0005_DATA + 4]
-                                .copy_from_slice(&(real_fd as i32).to_le_bytes());
+                                .copy_from_slice(&real_fd.to_le_bytes());
                         }
                         Err(_) => {
                             // Worth naming rather than forwarding: RM answers
@@ -155,7 +155,7 @@ impl NvidiaBackend {
                                 real_fd
                             );
                             saved_nested_handle = Some((16, guest_handle_val));
-                            host_buf[16..20].copy_from_slice(&(real_fd as i32).to_le_bytes());
+                            host_buf[16..20].copy_from_slice(&real_fd.to_le_bytes());
                         }
                         Err(_) => {
                             log::warn!("EXPORT_TO_FD: bad guest_handle {}", guest_handle_val);
@@ -176,7 +176,7 @@ impl NvidiaBackend {
                                 real_fd
                             );
                             saved_nested_handle = Some((0, guest_handle_val));
-                            host_buf[0..4].copy_from_slice(&(real_fd as i32).to_le_bytes());
+                            host_buf[0..4].copy_from_slice(&real_fd.to_le_bytes());
                         }
                         Err(_) => {
                             log::warn!("IMPORT_FROM_FD: bad guest_handle {}", guest_handle_val);
@@ -211,7 +211,7 @@ impl NvidiaBackend {
                     Ok(real_fd) => {
                         log::debug!("nvkms memFd: handle {guest_handle_val} → host fd {real_fd}");
                         saved_nested_handle = Some((off, guest_handle_val));
-                        host_buf[off..off + 4].copy_from_slice(&(real_fd as i32).to_le_bytes());
+                        host_buf[off..off + 4].copy_from_slice(&real_fd.to_le_bytes());
                     }
                     Err(_) => {
                         log::warn!(
@@ -514,7 +514,7 @@ impl NvidiaBackend {
                 }
             }
             let mut combined = outer;
-            combined.extend_from_slice(&host_buf);
+            combined.extend_from_slice(host_buf);
             combined.extend_from_slice(&deep_buf[..deep_reply]);
             self.write_ioctl_resp_deep(resp_buf, cookie, &combined, deep_reply)
         } else {

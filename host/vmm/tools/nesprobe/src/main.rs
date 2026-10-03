@@ -531,7 +531,7 @@ impl Drop for Probe {
 }
 
 fn read_spv(bytes: &[u8]) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err("SPIR-V length is not a multiple of 4".into());
     }
     Ok(bytes
@@ -598,10 +598,10 @@ fn main() {
     let mut next_frame = Instant::now();
 
     loop {
-        if let Some(d) = deadline {
-            if Instant::now() >= d {
-                break;
-            }
+        if let Some(d) = deadline
+            && Instant::now() >= d
+        {
+            break;
         }
         let t0 = Instant::now();
         for _ in 0..args.budget_queries {

@@ -325,10 +325,10 @@ impl FsDevice {
                 i.com.st = v1;
                 if v1 == 0 {
                     i.reset();
-                } else if v1 & STATUS_DRIVER_OK != 0 {
-                    if let Err(err) = i.activate() {
-                        log::error!("failed to start virtio-fs: {err:#}");
-                    }
+                } else if v1 & STATUS_DRIVER_OK != 0
+                    && let Err(err) = i.activate()
+                {
+                    log::error!("failed to start virtio-fs: {err:#}");
                 }
             }
             CFG_QUEUE_SEL => i.qs = v2,

@@ -108,7 +108,7 @@ impl PciConfig {
         let start = self.next_cap_start;
 
         assert!(
-            start >= FIRST_CAP && start < CAP_MAX,
+            (FIRST_CAP..CAP_MAX).contains(&start),
             "capability space exhausted"
         );
         let s = start as usize;
@@ -299,7 +299,7 @@ mod tests {
     fn capabilities_fit_in_config_space() {
         let (cfg, _) = gpu_like();
         for (pos, _) in capabilities(&cfg) {
-            assert!(pos >= FIRST_CAP && pos < CAP_MAX);
+            assert!((FIRST_CAP..CAP_MAX).contains(&pos));
         }
     }
 }

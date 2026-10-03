@@ -28,8 +28,8 @@ const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54d0;
 const TUNSETVNETHDRSZ: libc::c_ulong = 0x4004_54d8;
 
-/// Add an interface to a bridge. `ifr_name` is the *bridge*, and the payload
-/// carries the ifindex of the interface being added.
+// Add an interface to a bridge. `ifr_name` is the *bridge*, and the payload
+// carries the ifindex of the interface being added.
 
 /// Offloads the tap may pass through without doing the work itself. Which of
 /// these we ask for follows from the features the guest accepted: the guest is

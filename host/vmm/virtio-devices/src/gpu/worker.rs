@@ -28,6 +28,7 @@ use vm_memory::GuestAddress;
 
 use vm_memory::GuestMemoryMmap;
 
+use super::GpuQueues;
 use super::VirtioShmRegion;
 use super::descriptor_utils::{Reader, Writer};
 use super::display::DisplayInfo;
@@ -37,7 +38,6 @@ use super::protocol::{
     virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
 use super::virtio_gpu::{VirtioGpu, VirtioGpuRing};
-use super::GpuQueues;
 use crate::memmap::HostMemoryMapper;
 use std::path::PathBuf;
 

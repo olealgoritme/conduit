@@ -641,9 +641,16 @@ pub fn encode_input_events(events: &[InputEventEntry], out: &mut [u8]) -> Option
         return None;
     }
     let hdr = MsgHeader::ok(MsgType::InputEvent, 0);
-    for (i, v) in [hdr.msg_type, hdr.handle, hdr.status as u32, hdr.padding, events.len() as u32, 0]
-        .iter()
-        .enumerate()
+    for (i, v) in [
+        hdr.msg_type,
+        hdr.handle,
+        hdr.status as u32,
+        hdr.padding,
+        events.len() as u32,
+        0,
+    ]
+    .iter()
+    .enumerate()
     {
         out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }

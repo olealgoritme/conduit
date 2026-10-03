@@ -57,9 +57,9 @@ impl Aperture {
     pub fn admit(&self, handle: u64, addr: u64, len: u64) -> std::result::Result<Pool, i32> {
         let page = 4096;
         if len == 0
-            || len % page != 0
+            || !len.is_multiple_of(page)
             || len > POOL_MAX_LEN
-            || addr % page != 0
+            || !addr.is_multiple_of(page)
             || addr < HVA_MIN
             || addr.checked_add(len).is_none_or(|end| end > HVA_MAX)
         {
@@ -182,14 +182,14 @@ impl NvidiaBackend {
     /// Take a pool out of the aperture: the VMM drops the slot, then its
     /// mapping, so the guest never has a slot over nothing.
     pub(super) fn unmap_uvm_pool(&mut self, id: u32, pool: Pool) {
-        if let Some(window) = self.window.as_ref() {
-            if let Err(e) = window.withdraw_pool(pool.offset, pool.len) {
-                log::warn!(
-                    "UVM pool {id} at {:#x}+{:#x}: the VMM would not give it back: {e}",
-                    pool.addr,
-                    pool.len
-                );
-            }
+        if let Some(window) = self.window.as_ref()
+            && let Err(e) = window.withdraw_pool(pool.offset, pool.len)
+        {
+            log::warn!(
+                "UVM pool {id} at {:#x}+{:#x}: the VMM would not give it back: {e}",
+                pool.addr,
+                pool.len
+            );
         }
     }
 

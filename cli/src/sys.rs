@@ -91,7 +91,9 @@ pub fn sudo_ready(why: &str) -> Result<()> {
         anyhow::bail!("sudo needs a password and there is no terminal to ask on");
     }
     if !SUDO_EXPLAINED.swap(true, Ordering::SeqCst) {
-        ui::info(format!("{why}\n         This needs administrator rights, so sudo will ask for your password."));
+        ui::info(format!(
+            "{why}\n         This needs administrator rights, so sudo will ask for your password."
+        ));
     }
     let ok = Command::new("sudo")
         .args(["-v", "-p", "[sudo] password for %u: "])
@@ -109,9 +111,17 @@ pub fn sudo_ready(why: &str) -> Result<()> {
 
 fn sudo_cmd(cmd: &str, args: &[&str]) -> Command {
     let root = unsafe { libc::geteuid() } == 0;
-    let mut c = if root { Command::new(cmd) } else { Command::new("sudo") };
+    let mut c = if root {
+        Command::new(cmd)
+    } else {
+        Command::new("sudo")
+    };
     if !root {
-        c.arg("-n").arg(which(cmd).map(|p| p.display().to_string()).unwrap_or(cmd.into()));
+        c.arg("-n").arg(
+            which(cmd)
+                .map(|p| p.display().to_string())
+                .unwrap_or(cmd.into()),
+        );
     }
     c.args(args);
     c
@@ -205,7 +215,9 @@ pub fn spawn_detached(cmd: &mut Command, log: &Path, append: bool) -> Result<u32
     } else {
         opts.write(true).truncate(true);
     }
-    let out = opts.open(log).with_context(|| format!("opening {}", log.display()))?;
+    let out = opts
+        .open(log)
+        .with_context(|| format!("opening {}", log.display()))?;
     let err = out.try_clone()?;
     unsafe {
         cmd.pre_exec(|| {
@@ -292,11 +304,11 @@ pub fn lock(path: &Path, timeout: Duration) -> Result<Lock> {
     }
 }
 
-
 /// Free bytes for an unprivileged user on the filesystem holding `p`.
 #[allow(clippy::unnecessary_cast)] // field types differ between glibc and musl
 pub fn free_bytes(p: &Path) -> Option<u64> {
     let c = std::ffi::CString::new(p.as_os_str().to_str()?).ok()?;
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
+    (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0)
+        .then(|| s.f_bavail as u64 * s.f_frsize as u64)
 }

@@ -87,34 +87,34 @@ impl Zone {
         }
 
         // Overlap with an existing free extent means this was freed already.
-        if let Some((&ps, &pl)) = self.free.range(..=start).next_back() {
-            if ps + pl > start {
-                return false;
-            }
+        if let Some((&ps, &pl)) = self.free.range(..=start).next_back()
+            && ps + pl > start
+        {
+            return false;
         }
-        if let Some((&ns, _)) = self.free.range(start..).next() {
-            if start + want > ns {
-                return false;
-            }
+        if let Some((&ns, _)) = self.free.range(start..).next()
+            && start + want > ns
+        {
+            return false;
         }
 
         let mut s = start;
         let mut l = want;
 
         // Coalesce with the extent below, if it ends exactly here.
-        if let Some((&ps, &pl)) = self.free.range(..s).next_back() {
-            if ps + pl == s {
-                self.free.remove(&ps);
-                s = ps;
-                l += pl;
-            }
+        if let Some((&ps, &pl)) = self.free.range(..s).next_back()
+            && ps + pl == s
+        {
+            self.free.remove(&ps);
+            s = ps;
+            l += pl;
         }
         // Coalesce with the extent above, if it starts exactly at our end.
-        if let Some((&ns, &nl)) = self.free.range(s + l..).next() {
-            if s + l == ns {
-                self.free.remove(&ns);
-                l += nl;
-            }
+        if let Some((&ns, &nl)) = self.free.range(s + l..).next()
+            && s + l == ns
+        {
+            self.free.remove(&ns);
+            l += nl;
         }
 
         self.free.insert(s, l);
@@ -490,6 +490,58 @@ fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
 }
 
+// ============================================================
+// The shared window
+// ============================================================
+
+/// Places device memory where the guest can reach it.
+///
+/// This exists because the backend cannot do the placement itself. `MAP_FIXED`
+/// rewrites the calling process's page tables and nothing else, so a mapping
+/// made here would never appear in the memory slot the VMM registered -- the
+/// guest would read the window's own empty pages and find no device. The
+/// descriptor has to travel up to whoever owns that address space.
+///
+/// It is a trait for the reason every VMM concern in this crate is one: the
+/// crate names no VMM. A transport implements it, and a backend without one
+/// keeps its mappings to itself and says so.
+pub trait WindowPlacer: Send {
+    /// Put `len` bytes of `fd`, starting `fd_offset` bytes into it, at
+    /// `shm_offset` within the window.
+    ///
+    /// `fd_offset` is zero for every RM mapping -- the descriptor names the
+    /// mapping already, and the offset is a cookie RM chose rather than a
+    /// position in a file. A DRM object is the exception: GEM_MAP_OFFSET hands
+    /// out a file offset and the memory is only reachable by mapping the node
+    /// there.
+    fn place(
+        &self,
+        shm_offset: u64,
+        len: u64,
+        fd: RawFd,
+        fd_offset: u64,
+        writable: bool,
+    ) -> Result<()>;
+
+    /// Return a range to empty. Not an unmap: leaving a hole would let a later
+    /// access reach no mapping at all in a range the memory slot still covers.
+    fn withdraw(&self, shm_offset: u64, len: u64) -> Result<()>;
+
+    /// Have the VMM map `len` bytes of a UVM file at host address `addr`,
+    /// which is also the file offset, and back `offset` within the aperture
+    /// with it. See `nvidia/aperture.rs`. A transport with no aperture says so.
+    fn place_pool(&self, offset: u64, len: u64, fd: RawFd, addr: u64) -> Result<()> {
+        let _ = (offset, len, fd, addr);
+        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into())
+    }
+
+    /// Take a pool back out: the slot first, then the VMM's mapping.
+    fn withdraw_pool(&self, offset: u64, len: u64) -> Result<()> {
+        let _ = (offset, len);
+        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,57 +643,5 @@ mod tests {
         }
 
         unsafe { libc::close(host_fd) };
-    }
-}
-
-// ============================================================
-// The shared window
-// ============================================================
-
-/// Places device memory where the guest can reach it.
-///
-/// This exists because the backend cannot do the placement itself. `MAP_FIXED`
-/// rewrites the calling process's page tables and nothing else, so a mapping
-/// made here would never appear in the memory slot the VMM registered -- the
-/// guest would read the window's own empty pages and find no device. The
-/// descriptor has to travel up to whoever owns that address space.
-///
-/// It is a trait for the reason every VMM concern in this crate is one: the
-/// crate names no VMM. A transport implements it, and a backend without one
-/// keeps its mappings to itself and says so.
-pub trait WindowPlacer: Send {
-    /// Put `len` bytes of `fd`, starting `fd_offset` bytes into it, at
-    /// `shm_offset` within the window.
-    ///
-    /// `fd_offset` is zero for every RM mapping -- the descriptor names the
-    /// mapping already, and the offset is a cookie RM chose rather than a
-    /// position in a file. A DRM object is the exception: GEM_MAP_OFFSET hands
-    /// out a file offset and the memory is only reachable by mapping the node
-    /// there.
-    fn place(
-        &self,
-        shm_offset: u64,
-        len: u64,
-        fd: RawFd,
-        fd_offset: u64,
-        writable: bool,
-    ) -> Result<()>;
-
-    /// Return a range to empty. Not an unmap: leaving a hole would let a later
-    /// access reach no mapping at all in a range the memory slot still covers.
-    fn withdraw(&self, shm_offset: u64, len: u64) -> Result<()>;
-
-    /// Have the VMM map `len` bytes of a UVM file at host address `addr`,
-    /// which is also the file offset, and back `offset` within the aperture
-    /// with it. See `nvidia/aperture.rs`. A transport with no aperture says so.
-    fn place_pool(&self, offset: u64, len: u64, fd: RawFd, addr: u64) -> Result<()> {
-        let _ = (offset, len, fd, addr);
-        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into())
-    }
-
-    /// Take a pool back out: the slot first, then the VMM's mapping.
-    fn withdraw_pool(&self, offset: u64, len: u64) -> Result<()> {
-        let _ = (offset, len);
-        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into())
     }
 }

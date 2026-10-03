@@ -97,7 +97,11 @@ pub fn parse_size(s: &str, default_unit: char) -> anyhow::Result<u64> {
     })?;
     let unit = unit.trim().to_ascii_uppercase();
     let unit = unit.trim_end_matches("IB").trim_end_matches('B');
-    let unit = if unit.is_empty() { default_unit.to_string() } else { unit.to_string() };
+    let unit = if unit.is_empty() {
+        default_unit.to_string()
+    } else {
+        unit.to_string()
+    };
     let mult: u64 = match unit.as_str() {
         "K" => 1 << 10,
         "M" => 1 << 20,
@@ -136,7 +140,10 @@ mod tests {
 
     #[test]
     fn quoting() {
-        assert_eq!(shell_quote("/opt/conduit/bin/conduit"), "/opt/conduit/bin/conduit");
+        assert_eq!(
+            shell_quote("/opt/conduit/bin/conduit"),
+            "/opt/conduit/bin/conduit"
+        );
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote(""), "''");

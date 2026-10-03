@@ -40,11 +40,17 @@ impl Report {
 }
 
 fn can_open_rw(p: &str) -> bool {
-    std::fs::OpenOptions::new().read(true).write(true).open(p).is_ok()
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(p)
+        .is_ok()
 }
 
 fn in_group(g: &str) -> bool {
-    sys::output("id", &["-Gn"]).map(|s| s.split_whitespace().any(|x| x == g)).unwrap_or(false)
+    sys::output("id", &["-Gn"])
+        .map(|s| s.split_whitespace().any(|x| x == g))
+        .unwrap_or(false)
 }
 
 pub fn run() -> i32 {
@@ -91,7 +97,12 @@ pub fn run() -> i32 {
         }
     }
     if !Path::new("/dev/nvidia-uvm").exists() {
-        r.line(Level::Warn, "CUDA", "/dev/nvidia-uvm is missing (CUDA in VMs will not work)", "Load it once: sudo modprobe nvidia-uvm   (or run nvidia-smi once)");
+        r.line(
+            Level::Warn,
+            "CUDA",
+            "/dev/nvidia-uvm is missing (CUDA in VMs will not work)",
+            "Load it once: sudo modprobe nvidia-uvm   (or run nvidia-smi once)",
+        );
     }
 
     // Desktop
@@ -105,24 +116,62 @@ pub fn run() -> i32 {
     }
 
     let (m, src) = crate::mode::detect();
-    r.line(Level::Ok, "Display", &format!("VMs will get {m} (from {src}); `conduit view NAME WxH@HZ` overrides"), "");
+    r.line(
+        Level::Ok,
+        "Display",
+        &format!("VMs will get {m} (from {src}); `conduit view NAME WxH@HZ` overrides"),
+        "",
+    );
 
     // sudo
     if unsafe { libc::geteuid() } == 0 {
-        r.line(Level::Warn, "sudo", "you are running as root", "Run conduit as your normal user; it asks for sudo only when it needs it.");
+        r.line(
+            Level::Warn,
+            "sudo",
+            "you are running as root",
+            "Run conduit as your normal user; it asks for sudo only when it needs it.",
+        );
     } else if !sys::have("sudo") {
-        r.line(Level::Fail, "sudo", "not installed", "Install sudo: Conduit needs it to set up the VM network and to build disks.");
-    } else if in_group("sudo") || in_group("wheel") || in_group("admin") || sys::quiet("sudo", &["-n", "true"]) {
-        r.line(Level::Ok, "sudo", "available (asked only for network setup and disk building)", "");
+        r.line(
+            Level::Fail,
+            "sudo",
+            "not installed",
+            "Install sudo: Conduit needs it to set up the VM network and to build disks.",
+        );
+    } else if in_group("sudo")
+        || in_group("wheel")
+        || in_group("admin")
+        || sys::quiet("sudo", &["-n", "true"])
+    {
+        r.line(
+            Level::Ok,
+            "sudo",
+            "available (asked only for network setup and disk building)",
+            "",
+        );
     } else {
-        r.line(Level::Warn, "sudo", "your user may not be allowed to use sudo", "Ask an administrator to add you to the 'sudo' (or 'wheel') group.");
+        r.line(
+            Level::Warn,
+            "sudo",
+            "your user may not be allowed to use sudo",
+            "Ask an administrator to add you to the 'sudo' (or 'wheel') group.",
+        );
     }
 
     // Tools
-    let mut missing: Vec<&str> = ["ip", "iptables", "ssh", "curl", "mkfs.ext4", "tar", "xz", "sha256sum"]
-        .into_iter()
-        .filter(|t| !sys::have(t))
-        .collect();
+    let mut missing: Vec<&str> = [
+        "ip",
+        "iptables",
+        "ssh",
+        "curl",
+        "mkfs.ext4",
+        "tar",
+        "xz",
+        "sha256sum",
+    ]
+    .into_iter()
+    .filter(|t| !sys::have(t))
+    .collect();
     if !Path::new("/dev/net/tun").exists() {
         missing.push("/dev/net/tun");
     }
@@ -134,7 +183,14 @@ pub fn run() -> i32 {
     }
 
     // Conduit's own parts
-    for t in [Tool::Backend, Tool::Vmm, Tool::Viewer, Tool::Kernel, Tool::GuestModule, Tool::Userspace] {
+    for t in [
+        Tool::Backend,
+        Tool::Vmm,
+        Tool::Viewer,
+        Tool::Kernel,
+        Tool::GuestModule,
+        Tool::Userspace,
+    ] {
         match t.find() {
             Some(p) => r.line(Level::Ok, t.label(), &p.display().to_string(), ""),
             None => r.line(Level::Fail, t.label(), "not found",
@@ -144,13 +200,26 @@ pub fn run() -> i32 {
 
     // Disk space
     let data = paths::data_dir();
-    let probe = if data.exists() { data.clone() } else { paths::home() };
+    let probe = if data.exists() {
+        data.clone()
+    } else {
+        paths::home()
+    };
     if let Some(free) = sys::free_bytes(&probe) {
-        let msg = format!("{} free for VMs ({})", ui::human_bytes(free), data.display());
+        let msg = format!(
+            "{} free for VMs ({})",
+            ui::human_bytes(free),
+            data.display()
+        );
         if free < 12 << 30 {
             r.line(Level::Fail, "Disk space", &msg, "A new VM needs about 12 GB (disks are sparse and grow as you use them). Free some space.");
         } else if free < 40 << 30 {
-            r.line(Level::Warn, "Disk space", &msg, "Enough for one VM; games and apps inside need more.");
+            r.line(
+                Level::Warn,
+                "Disk space",
+                &msg,
+                "Enough for one VM; games and apps inside need more.",
+            );
         } else {
             r.line(Level::Ok, "Disk space", &msg, "");
         }
@@ -169,8 +238,14 @@ pub fn run() -> i32 {
     } else if r.fails == 0 {
         println!("Ready, with {} warning(s) above.", r.warns);
     } else {
-        println!("{} problem(s) to fix first; see the lines marked FAIL.", r.fails);
+        println!(
+            "{} problem(s) to fix first; see the lines marked FAIL.",
+            r.fails
+        );
     }
-    if r.fails > 0 { 1 } else { 0 }
+    if r.fails > 0 {
+        1
+    } else {
+        0
+    }
 }
-

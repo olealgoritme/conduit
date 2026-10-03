@@ -13,7 +13,11 @@ pub struct Mode {
     pub hz: u32,
 }
 
-pub const FALLBACK: Mode = Mode { width: 2560, height: 1440, hz: 60 };
+pub const FALLBACK: Mode = Mode {
+    width: 2560,
+    height: 1440,
+    hz: 60,
+};
 
 impl fmt::Display for Mode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -64,7 +68,10 @@ impl FromStr for Mode {
             ));
         }
         if !(1..=1000).contains(&hz) {
-            return Err(oops(format!("{hz} Hz is not a usable refresh rate"), "Use a rate between 1 and 1000"));
+            return Err(oops(
+                format!("{hz} Hz is not a usable refresh rate"),
+                "Use a rate between 1 and 1000",
+            ));
         }
         Ok(Mode { width, height, hz })
     }
@@ -102,7 +109,11 @@ pub fn from_wlr_randr(text: &str) -> Option<Mode> {
             .next()?
             .parse::<f64>()
             .ok()?;
-        return Some(Mode { width: w.parse().ok()?, height: h.parse().ok()?, hz: hz.round() as u32 });
+        return Some(Mode {
+            width: w.parse().ok()?,
+            height: h.parse().ok()?,
+            hz: hz.round() as u32,
+        });
     }
     None
 }
@@ -156,12 +167,44 @@ mod tests {
 
     #[test]
     fn parse_modes() {
-        assert_eq!("2560x1440@240".parse::<Mode>().unwrap(), Mode { width: 2560, height: 1440, hz: 240 });
-        assert_eq!("1920x1080".parse::<Mode>().unwrap(), Mode { width: 1920, height: 1080, hz: 60 });
+        assert_eq!(
+            "2560x1440@240".parse::<Mode>().unwrap(),
+            Mode {
+                width: 2560,
+                height: 1440,
+                hz: 240
+            }
+        );
+        assert_eq!(
+            "1920x1080".parse::<Mode>().unwrap(),
+            Mode {
+                width: 1920,
+                height: 1080,
+                hz: 60
+            }
+        );
         assert_eq!("1920X1080@59.94".parse::<Mode>().unwrap().hz, 60);
         assert_eq!("3840x2160@143.9Hz".parse::<Mode>().unwrap().hz, 144);
-        assert_eq!(" 1280×720@75 ".parse::<Mode>().unwrap(), Mode { width: 1280, height: 720, hz: 75 });
-        for bad in ["", "1920", "x1080", "1920x", "axb", "1920x1080@", "1920x1080@fast", "10x10", "1920x1080@0", "99999x1080"] {
+        assert_eq!(
+            " 1280×720@75 ".parse::<Mode>().unwrap(),
+            Mode {
+                width: 1280,
+                height: 720,
+                hz: 75
+            }
+        );
+        for bad in [
+            "",
+            "1920",
+            "x1080",
+            "1920x",
+            "axb",
+            "1920x1080@",
+            "1920x1080@fast",
+            "10x10",
+            "1920x1080@0",
+            "99999x1080",
+        ] {
             assert!(bad.parse::<Mode>().is_err(), "{bad} should fail");
         }
     }
@@ -179,9 +222,23 @@ mod tests {
           {"id":0,"name":"DP-1","width":1920,"height":1080,"refreshRate":60.00,"focused":false},
           {"id":1,"name":"DP-2","width":2560,"height":1440,"refreshRate":239.97,"focused":true}
         ]"#;
-        assert_eq!(from_hyprctl_json(j), Some(Mode { width: 2560, height: 1440, hz: 240 }));
+        assert_eq!(
+            from_hyprctl_json(j),
+            Some(Mode {
+                width: 2560,
+                height: 1440,
+                hz: 240
+            })
+        );
         let one = r#"[{"width":3840,"height":2160,"refreshRate":143.856,"focused":false}]"#;
-        assert_eq!(from_hyprctl_json(one), Some(Mode { width: 3840, height: 2160, hz: 144 }));
+        assert_eq!(
+            from_hyprctl_json(one),
+            Some(Mode {
+                width: 3840,
+                height: 2160,
+                hz: 144
+            })
+        );
         assert_eq!(from_hyprctl_json("[]"), None);
         assert_eq!(from_hyprctl_json("ok"), None);
     }
@@ -189,7 +246,14 @@ mod tests {
     #[test]
     fn wlr_randr_current() {
         let t = "DP-1 \"Some Monitor\"\n  Enabled: yes\n  Modes:\n    3840x2160 px, 60.000000 Hz (preferred)\n    2560x1440 px, 164.958000 Hz (current)\n    1920x1080 px, 60.000000 Hz\n";
-        assert_eq!(from_wlr_randr(t), Some(Mode { width: 2560, height: 1440, hz: 165 }));
+        assert_eq!(
+            from_wlr_randr(t),
+            Some(Mode {
+                width: 2560,
+                height: 1440,
+                hz: 165
+            })
+        );
         assert_eq!(from_wlr_randr("nothing here"), None);
     }
 }

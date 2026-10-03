@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn short_request_rejected() {
         let mut be = NvidiaBackend::for_test();
-        be.dispatch(&[0u8; 4], &mut vec![0u8; 32]);
+        be.dispatch(&[0u8; 4], &mut [0u8; 32]);
         // just must not panic
     }
 

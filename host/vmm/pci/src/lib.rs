@@ -704,7 +704,7 @@ impl Bus {
     /// or None otherwise.
     fn bar_slot_for_offset(offset: u32, _len: usize) -> Option<usize> {
         // BAR0 = 0x10, BAR1 = 0x14, …, BAR5 = 0x24
-        if offset >= 0x10 && offset <= 0x27 {
+        if (0x10..=0x27).contains(&offset) {
             Some(((offset - 0x10) / 4) as usize)
         } else {
             None

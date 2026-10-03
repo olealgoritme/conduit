@@ -42,8 +42,13 @@ fn default_disk() -> PathBuf {
 pub fn check_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 32
-        && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
     if ok {
         Ok(())
     } else {
@@ -63,7 +68,14 @@ pub struct Net {
 }
 
 impl VmConfig {
-    pub fn new(name: &str, ram_mib: u64, cpus: u32, net_index: u8, user: &str, desktop: &str) -> Self {
+    pub fn new(
+        name: &str,
+        ram_mib: u64,
+        cpus: u32,
+        net_index: u8,
+        user: &str,
+        desktop: &str,
+    ) -> Self {
         VmConfig {
             name: name.into(),
             disk: default_disk(),
@@ -115,7 +127,8 @@ impl VmConfig {
                 "Run `conduit list` to see your VMs, or `conduit create NAME` to make one",
             )
         })?;
-        let mut c: VmConfig = serde_json::from_str(&text).with_context(|| format!("{} is damaged", f.display()))?;
+        let mut c: VmConfig =
+            serde_json::from_str(&text).with_context(|| format!("{} is damaged", f.display()))?;
         c.name = name.to_string();
         Ok(c)
     }
@@ -156,7 +169,11 @@ pub fn all() -> Vec<String> {
 
 /// Lowest network index no other VM uses.
 pub fn free_net_index() -> Result<u8> {
-    let used: Vec<u8> = all().iter().filter_map(|n| VmConfig::load(n).ok()).map(|c| c.net_index).collect();
+    let used: Vec<u8> = all()
+        .iter()
+        .filter_map(|n| VmConfig::load(n).ok())
+        .map(|c| c.net_index)
+        .collect();
     (0..=254u8)
         .find(|i| !used.contains(i))
         .ok_or_else(|| oops("too many VMs (255)", "Remove one you no longer need"))
@@ -215,7 +232,16 @@ mod tests {
         for ok in ["myvm", "a", "game-box_2", "9lives"] {
             check_name(ok).unwrap();
         }
-        for bad in ["", "-x", "_x", "my vm", "../etc", "a/b", "x.y", &"a".repeat(33)] {
+        for bad in [
+            "",
+            "-x",
+            "_x",
+            "my vm",
+            "../etc",
+            "a/b",
+            "x.y",
+            &"a".repeat(33),
+        ] {
             assert!(check_name(bad).is_err(), "{bad}");
         }
     }
@@ -224,7 +250,10 @@ mod tests {
     fn network_from_index() {
         let mut c = VmConfig::new("t", 8192, 4, 0, "me", "gnome");
         let n = c.net();
-        assert_eq!((n.tap.as_str(), n.host_ip.as_str(), n.guest_ip.as_str()), ("conduit0", "172.30.0.1", "172.30.0.2"));
+        assert_eq!(
+            (n.tap.as_str(), n.host_ip.as_str(), n.guest_ip.as_str()),
+            ("conduit0", "172.30.0.1", "172.30.0.2")
+        );
         assert_eq!(n.mac, "02:00:00:00:00:01");
         c.net_index = 17;
         let n = c.net();
@@ -237,9 +266,17 @@ mod tests {
         let mut c = VmConfig::new("t", 8192, 6, 3, "me", "gnome");
         c.disk = PathBuf::from("/vms/t/disk.img");
         c.kernel_args = "quiet".into();
-        let v = vmm_config(&c, Path::new("/k/vmlinux"), Path::new("/run/gpu.sock"), Path::new("/share"));
+        let v = vmm_config(
+            &c,
+            Path::new("/k/vmlinux"),
+            Path::new("/run/gpu.sock"),
+            Path::new("/share"),
+        );
         assert_eq!(v["boot-source"]["kernel_image_path"], "/k/vmlinux");
-        assert_eq!(v["boot-source"]["boot_args"], "console=hvc0 root=/dev/vda rw quiet");
+        assert_eq!(
+            v["boot-source"]["boot_args"],
+            "console=hvc0 root=/dev/vda rw quiet"
+        );
         assert_eq!(v["drives"][0]["path_on_host"], "/vms/t/disk.img");
         assert_eq!(v["drives"][0]["is_root_device"], true);
         assert_eq!(v["machine-config"]["vcpu_count"], 6);
@@ -260,7 +297,10 @@ mod tests {
         let back: VmConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back, c);
         // Minimal hand-written file.
-        let m: VmConfig = serde_json::from_str(r#"{"name":"x","ram_mib":1024,"cpus":1,"net_index":0,"user":"u"}"#).unwrap();
+        let m: VmConfig = serde_json::from_str(
+            r#"{"name":"x","ram_mib":1024,"cpus":1,"net_index":0,"user":"u"}"#,
+        )
+        .unwrap();
         assert_eq!(m.disk, PathBuf::from("disk.img"));
     }
 }

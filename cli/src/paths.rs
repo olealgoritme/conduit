@@ -97,7 +97,8 @@ pub fn repo_root() -> Option<PathBuf> {
     if let Some(r) = env::var_os("CONDUIT_REPO") {
         return Some(PathBuf::from(r));
     }
-    let is_repo = |p: &Path| p.join("cli/Cargo.toml").is_file() && p.join("docs/STRUCTURE.md").is_file();
+    let is_repo =
+        |p: &Path| p.join("cli/Cargo.toml").is_file() && p.join("docs/STRUCTURE.md").is_file();
     // Compiled-in location of this crate (cli/..).
     let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     if is_repo(&built) {
@@ -154,7 +155,10 @@ impl Tool {
         let (installed, dev): (&[&str], &[&str]) = match self {
             Tool::Backend => (
                 &["bin/conduit-backend", "bin/vhost-user-nvgpu"],
-                &["target/release/vhost-user-nvgpu", "host/backend/target/release/vhost-user-nvgpu"],
+                &[
+                    "target/release/vhost-user-nvgpu",
+                    "host/backend/target/release/vhost-user-nvgpu",
+                ],
             ),
             Tool::Vmm => (
                 &["bin/conduit-vmm", "bin/nesbox"],
@@ -162,18 +166,27 @@ impl Tool {
             ),
             Tool::Viewer => (
                 &["bin/conduit-viewer", "libexec/conduit/nvkvm-display-broker"],
-                &["host/viewer/nvkvm-display-broker", "host/viewer/build/nvkvm-display-broker"],
+                &[
+                    "host/viewer/nvkvm-display-broker",
+                    "host/viewer/build/nvkvm-display-broker",
+                ],
             ),
             Tool::Userspace => (
                 &["bin/conduit-userspace", "bin/nvgpu-userspace"],
-                &["target/release/nvgpu-userspace", "host/backend/target/release/nvgpu-userspace"],
+                &[
+                    "target/release/nvgpu-userspace",
+                    "host/backend/target/release/nvgpu-userspace",
+                ],
             ),
             Tool::Kernel => (&["share/conduit/vmlinux"], &["guest/kernel/vmlinux"]),
             Tool::GuestModule => (
                 &["share/conduit/guest/virtio_gpu_nv.ko"],
                 &["guest/linux/virtio_gpu_nv.ko"],
             ),
-            Tool::BundledQemu => (&["bin/qemu-system-x86_64"], &["host/qemu/build/qemu-system-x86_64"]),
+            Tool::BundledQemu => (
+                &["bin/qemu-system-x86_64"],
+                &["host/qemu/build/qemu-system-x86_64"],
+            ),
         };
         v.extend(installed.iter().map(|p| pf.join(p)));
         if let Some(r) = repo_root() {
@@ -208,7 +221,10 @@ impl Tool {
 
 /// The kernel's process name for a binary (`comm`, at most 15 bytes).
 pub fn comm_of(p: &Path) -> String {
-    let n = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let n = p
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
     n.chars().take(15).collect()
 }
 
@@ -219,7 +235,10 @@ mod tests {
     #[test]
     fn comm_is_truncated() {
         assert_eq!(comm_of(Path::new("/x/vhost-user-nvgpu")), "vhost-user-nvgp");
-        assert_eq!(comm_of(Path::new("/x/nvkvm-display-broker")), "nvkvm-display-b");
+        assert_eq!(
+            comm_of(Path::new("/x/nvkvm-display-broker")),
+            "nvkvm-display-b"
+        );
         assert_eq!(comm_of(Path::new("nesbox")), "nesbox");
     }
 

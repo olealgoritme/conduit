@@ -13,7 +13,9 @@ fn tap_exists(tap: &str) -> bool {
 
 fn tap_ready(c: &VmConfig) -> bool {
     let n = c.net();
-    let Ok(out) = sys::output("ip", &["-4", "-br", "addr", "show", "dev", &n.tap]) else { return false };
+    let Ok(out) = sys::output("ip", &["-4", "-br", "addr", "show", "dev", &n.tap]) else {
+        return false;
+    };
     out.contains(&format!("{}/", n.host_ip)) && (out.contains(" UP ") || out.contains("UNKNOWN"))
 }
 
@@ -21,9 +23,30 @@ fn rules(c: &VmConfig) -> Vec<Vec<String>> {
     let n = c.net();
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     vec![
-        s(&["-t", "nat", "POSTROUTING", "-s", &n.subnet, "!", "-d", &n.subnet, "-j", "MASQUERADE"]),
+        s(&[
+            "-t",
+            "nat",
+            "POSTROUTING",
+            "-s",
+            &n.subnet,
+            "!",
+            "-d",
+            &n.subnet,
+            "-j",
+            "MASQUERADE",
+        ]),
         s(&["FORWARD", "-i", &n.tap, "-j", "ACCEPT"]),
-        s(&["FORWARD", "-o", &n.tap, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"]),
+        s(&[
+            "FORWARD",
+            "-o",
+            &n.tap,
+            "-m",
+            "state",
+            "--state",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+        ]),
     ]
 }
 
@@ -45,7 +68,9 @@ fn ipt(args: &[String]) -> Vec<&str> {
 }
 
 fn rules_present(c: &VmConfig) -> bool {
-    rules(c).iter().all(|r| sudo_ok("iptables", &ipt(&with_op(r, "-C"))))
+    rules(c)
+        .iter()
+        .all(|r| sudo_ok("iptables", &ipt(&with_op(r, "-C"))))
 }
 
 pub fn up(c: &VmConfig) -> Result<()> {
@@ -55,25 +80,39 @@ pub fn up(c: &VmConfig) -> Result<()> {
     if tap_ready(c) && (!sys::quiet("sudo", &["-n", "true"]) || rules_present(c)) {
         return Ok(());
     }
-    sys::sudo_ready(&format!("Setting up the VM's private network ({} on {}).", n.tap, n.subnet))?;
+    sys::sudo_ready(&format!(
+        "Setting up the VM's private network ({} on {}).",
+        n.tap, n.subnet
+    ))?;
     let user = crate::paths::username();
     if !tap_exists(&n.tap) {
-        sudo("ip", &["tuntap", "add", "dev", &n.tap, "mode", "tap", "user", &user])
-            .context("could not create the VM's network device")?;
+        sudo(
+            "ip",
+            &["tuntap", "add", "dev", &n.tap, "mode", "tap", "user", &user],
+        )
+        .context("could not create the VM's network device")?;
     }
     let addrs = sys::output("ip", &["-4", "addr", "show", "dev", &n.tap]).unwrap_or_default();
     if !addrs.contains(&format!("{}/", n.host_ip)) {
-        sudo("ip", &["addr", "add", &format!("{}/24", n.host_ip), "dev", &n.tap])?;
+        sudo(
+            "ip",
+            &["addr", "add", &format!("{}/24", n.host_ip), "dev", &n.tap],
+        )?;
     }
     sudo("ip", &["link", "set", &n.tap, "up"])?;
-    if std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").unwrap_or_default().trim() != "1" {
+    if std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        .unwrap_or_default()
+        .trim()
+        != "1"
+    {
         sudo("sysctl", &["-qw", "net.ipv4.ip_forward=1"])?;
     }
     for (i, r) in rules(c).iter().enumerate() {
         if !sudo_ok("iptables", &ipt(&with_op(r, "-C"))) {
             // NAT appends; FORWARD inserts at the top so a DROP policy does not shadow us.
             let op = if i == 0 { "-A" } else { "-I" };
-            sudo("iptables", &ipt(&with_op(r, op))).context("could not set up the VM's internet access")?;
+            sudo("iptables", &ipt(&with_op(r, op)))
+                .context("could not set up the VM's internet access")?;
         }
     }
     Ok(())
@@ -89,7 +128,11 @@ pub fn down(c: &VmConfig, interactive: bool) -> Result<()> {
         return Ok(());
     }
     if !interactive && !sys::quiet("sudo", &["-n", "true"]) && unsafe { libc::geteuid() } != 0 {
-        anyhow::bail!("network {} left in place (needs sudo); `conduit down {}` removes it", n.tap, c.name);
+        anyhow::bail!(
+            "network {} left in place (needs sudo); `conduit down {}` removes it",
+            n.tap,
+            c.name
+        );
     }
     sys::sudo_ready(&format!("Removing the VM's private network ({}).", n.tap))?;
     for r in rules(c) {
@@ -127,8 +170,13 @@ mod tests {
             with_op(&r[0], "-C").join(" "),
             "-t nat -C POSTROUTING -s 172.30.2.0/24 ! -d 172.30.2.0/24 -j MASQUERADE"
         );
-        assert_eq!(with_op(&r[1], "-I").join(" "), "-I FORWARD -i conduit2 -j ACCEPT");
+        assert_eq!(
+            with_op(&r[1], "-I").join(" "),
+            "-I FORWARD -i conduit2 -j ACCEPT"
+        );
         // No uplink interface is named anywhere: VPNs come and go.
-        assert!(r.iter().all(|x| !x.contains(&"-o".to_string()) || x.contains(&"conduit2".to_string())));
+        assert!(r
+            .iter()
+            .all(|x| !x.contains(&"-o".to_string()) || x.contains(&"conduit2".to_string())));
     }
 }

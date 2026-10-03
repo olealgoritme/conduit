@@ -163,12 +163,12 @@ fn check_pool(
     let page = 4096;
     if flags != VhostUserMMapFlags::WRITABLE.bits()
         || len == 0
-        || len % page != 0
+        || !len.is_multiple_of(page)
         || len > POOL_MAX_LEN
-        || hva % page != 0
+        || !hva.is_multiple_of(page)
         || hva < POOL_HVA_MIN
         || hva.checked_add(len).is_none_or(|end| end > POOL_HVA_MAX)
-        || offset % APERTURE_ALIGN != 0
+        || !offset.is_multiple_of(APERTURE_ALIGN)
         || offset
             .checked_add(len)
             .is_none_or(|end| end > APERTURE_SIZE)
@@ -951,10 +951,10 @@ impl NvGpuDevice {
                 i.com.st = v1;
                 if v1 == 0 {
                     i.reset();
-                } else if v1 & STATUS_DRIVER_OK != 0 {
-                    if let Err(err) = i.activate() {
-                        log::error!("failed to start virtio-gpu-nv: {err:#}");
-                    }
+                } else if v1 & STATUS_DRIVER_OK != 0
+                    && let Err(err) = i.activate()
+                {
+                    log::error!("failed to start virtio-gpu-nv: {err:#}");
                 }
             }
             CFG_QUEUE_SEL => i.qs = v2,

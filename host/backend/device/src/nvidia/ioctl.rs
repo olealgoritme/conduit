@@ -2,8 +2,8 @@
 
 use super::*;
 
-/// `NV01_ROOT`, `NV01_ROOT_NON_PRIV` and `NV01_ROOT_CLIENT`: the classes
-/// whose allocation makes a client.
+// `NV01_ROOT`, `NV01_ROOT_NON_PRIV` and `NV01_ROOT_CLIENT`: the classes
+// whose allocation makes a client.
 
 impl NvidiaBackend {
     // ------------------------------------------------------------------
@@ -473,7 +473,12 @@ impl NvidiaBackend {
                 let allowed = nvkms_cmd <= 1 || (reg..=reg + 4).contains(&nvkms_cmd);
                 if !allowed {
                     log::warn!("NVKMS cmd={nvkms_cmd} refused: acts on the host display");
-                    return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EPERM);
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::IoctlFailed,
+                        cookie,
+                        libc::EPERM,
+                    );
                 }
             }
             // REGISTER_SURFACE carries one of our handles where NVKMS expects a
@@ -482,7 +487,8 @@ impl NvidiaBackend {
             // back. See the driver's side of this, which explains why it only
             // shows up on some driver versions.
             let nvkms_fd_offset = if param_in.len() >= 4
-                && u32::from_le_bytes(param_in[0..4].try_into().unwrap()) == super::nvkms_register_surface(self.driver)
+                && u32::from_le_bytes(param_in[0..4].try_into().unwrap())
+                    == super::nvkms_register_surface(self.driver)
             {
                 Some(NVKMS_SURFACE_FD_OFFSET)
             } else {
@@ -626,10 +632,10 @@ impl NvidiaBackend {
                 if param_in.len() >= 16 {
                     let class = u32::from_le_bytes(param_in[12..16].try_into().unwrap());
                     *self.rm_classes.entry(class).or_insert(0) += 1;
-                    if let Some(bit) = crate::caps::Caps::for_class(class) {
-                        if !self.caps.has(bit) {
-                            return self.refuse_alloc_class(cookie, class, bit, param_in, resp_buf);
-                        }
+                    if let Some(bit) = crate::caps::Caps::for_class(class)
+                        && !self.caps.has(bit)
+                    {
+                        return self.refuse_alloc_class(cookie, class, bit, param_in, resp_buf);
                     }
                     // The cap is a decision somebody made; this is RM's. Both
                     // have to pass. The allocation parameters are the nested

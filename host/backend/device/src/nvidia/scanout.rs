@@ -43,7 +43,9 @@ impl NvidiaBackend {
         let dmabuf = match self
             .dmabufs
             .get_or_export(f.owner_handle, f.host_handle, || {
-                prime_export(drm_fd, f.host_handle, |fd, req, arg| host.ioctl(fd, req, arg))
+                prime_export(drm_fd, f.host_handle, |fd, req, arg| {
+                    host.ioctl(fd, req, arg)
+                })
             }) {
             Ok(fd) => fd,
             Err(e) => {
@@ -104,7 +106,9 @@ impl NvidiaBackend {
         let dmabuf = match self
             .dmabufs
             .get_or_export(c.owner_handle, c.host_handle, || {
-                prime_export(drm_fd, c.host_handle, |fd, req, arg| host.ioctl(fd, req, arg))
+                prime_export(drm_fd, c.host_handle, |fd, req, arg| {
+                    host.ioctl(fd, req, arg)
+                })
             }) {
             Ok(fd) => fd,
             Err(e) => {
@@ -248,11 +252,20 @@ mod tests {
             let n = be.dispatch(&flip(owner, 7, seq), &mut resp);
             assert_eq!(n, 16);
             assert_eq!(status(&resp), 0);
-            assert_eq!(read_struct::<MsgHeader>(&resp, 0).msg_type, MsgType::ScanoutFlip as u32);
+            assert_eq!(
+                read_struct::<MsgHeader>(&resp, 0).msg_type,
+                MsgType::ScanoutFlip as u32
+            );
         }
         be.dispatch(&flip(owner, 8, 5), &mut resp);
         let calls = host.0.lock().unwrap().clone();
-        assert_eq!(calls, vec![(DRM_IOCTL_PRIME_HANDLE_TO_FD, 7), (DRM_IOCTL_PRIME_HANDLE_TO_FD, 8)]);
+        assert_eq!(
+            calls,
+            vec![
+                (DRM_IOCTL_PRIME_HANDLE_TO_FD, 7),
+                (DRM_IOCTL_PRIME_HANDLE_TO_FD, 8)
+            ]
+        );
         assert_eq!(be.scanout_buffers(), 2);
 
         // Disable is acked.
@@ -312,7 +325,10 @@ mod tests {
         // Short payload.
         be.dispatch(&msg(MsgType::ScanoutFlip, 0, &[0; 10]), &mut resp);
         assert_eq!(status(&resp), -libc::EINVAL);
-        assert!(host.0.lock().unwrap().is_empty(), "nothing reached the host");
+        assert!(
+            host.0.lock().unwrap().is_empty(),
+            "nothing reached the host"
+        );
     }
 
     fn cursor_msg(owner: u32, handle: u32, w: u32, hx: u32, visible: bool) -> Vec<u8> {
@@ -328,7 +344,11 @@ mod tests {
                 host_handle: handle,
                 stride: w * 4,
                 fourcc: 0x3432_5241,
-                flags: if visible { protocol::messages::CURSOR_F_VISIBLE } else { 0 },
+                flags: if visible {
+                    protocol::messages::CURSOR_F_VISIBLE
+                } else {
+                    0
+                },
                 ..Default::default()
             }
             .to_bytes(),
@@ -347,7 +367,10 @@ mod tests {
         assert_eq!(status(&resp), 0);
         be.dispatch(&cursor_msg(owner, 0, 0, 0, false), &mut resp);
         assert_eq!(status(&resp), 0);
-        assert_eq!(host.0.lock().unwrap().clone(), vec![(DRM_IOCTL_PRIME_HANDLE_TO_FD, 21)]);
+        assert_eq!(
+            host.0.lock().unwrap().clone(),
+            vec![(DRM_IOCTL_PRIME_HANDLE_TO_FD, 21)]
+        );
         // Too big, hotspot outside, not a render node.
         be.dispatch(&cursor_msg(owner, 22, 512, 0, true), &mut resp);
         assert_eq!(status(&resp), -libc::EINVAL);
@@ -355,7 +378,11 @@ mod tests {
         assert_eq!(status(&resp), -libc::EINVAL);
         be.dispatch(&cursor_msg(999, 22, 64, 0, true), &mut resp);
         assert_eq!(status(&resp), -libc::EBADF);
-        assert_eq!(host.0.lock().unwrap().len(), 1, "nothing more reached the host");
+        assert_eq!(
+            host.0.lock().unwrap().len(),
+            1,
+            "nothing more reached the host"
+        );
         // And the guest closing the GEM handle drops the export, like a frame's.
         assert_eq!(be.scanout_buffers(), 1);
     }
@@ -378,18 +405,29 @@ mod tests {
         let mut resp = [0u8; 64];
         be.dispatch(&flip(owner, 7, 1), &mut resp);
         assert_eq!(status(&resp), 0);
-        assert_eq!(link.stats.sent.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            link.stats.sent.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
         // WINDOW + QUERY_FORMAT + ATTACH + COMMIT, 40 bytes each.
         let mut buf = [0u8; 160];
         let mut got = 0;
         while got < buf.len() {
             let n = unsafe {
-                libc::recv(broker.as_raw_fd(), buf[got..].as_mut_ptr().cast(), buf.len() - got, 0)
+                libc::recv(
+                    broker.as_raw_fd(),
+                    buf[got..].as_mut_ptr().cast(),
+                    buf.len() - got,
+                    0,
+                )
             };
             assert!(n > 0);
             got += n as usize;
         }
-        assert_eq!(u16::from_le_bytes([buf[80], buf[81]]), crate::display::wire::CMD_ATTACH);
+        assert_eq!(
+            u16::from_le_bytes([buf[80], buf[81]]),
+            crate::display::wire::CMD_ATTACH
+        );
         let _ = broker.into_raw_fd();
     }
 }

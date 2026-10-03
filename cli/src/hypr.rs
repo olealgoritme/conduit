@@ -38,11 +38,17 @@ pub fn instance() -> Option<String> {
         }
     }
     let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    for base in [crate::paths::xdg_runtime().join("hypr"), PathBuf::from("/tmp/hypr")] {
+    for base in [
+        crate::paths::xdg_runtime().join("hypr"),
+        PathBuf::from("/tmp/hypr"),
+    ] {
         if let Ok(rd) = std::fs::read_dir(&base) {
             for e in rd.flatten() {
                 if e.path().is_dir() {
-                    let t = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                    let t = e
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::UNIX_EPOCH);
                     dirs.push((t, e.path()));
                 }
             }
@@ -70,7 +76,10 @@ pub struct Saved {
 
 impl Saved {
     pub fn render(&self) -> String {
-        format!("sig={}\nno_direct_scanout={}\nallow_tearing={}\n", self.sig, self.no_direct_scanout, self.allow_tearing)
+        format!(
+            "sig={}\nno_direct_scanout={}\nallow_tearing={}\n",
+            self.sig, self.no_direct_scanout, self.allow_tearing
+        )
     }
 
     pub fn parse(s: &str) -> Option<Saved> {
@@ -85,7 +94,11 @@ impl Saved {
                 _ => {}
             }
         }
-        Some(Saved { sig: sig?, no_direct_scanout: nds?, allow_tearing: tear? })
+        Some(Saved {
+            sig: sig?,
+            no_direct_scanout: nds?,
+            allow_tearing: tear?,
+        })
     }
 }
 
@@ -97,12 +110,22 @@ pub fn hook(action: &str, state: &Path) -> Result<()> {
         "on" => {
             let sig = instance().context("no running Hyprland found")?;
             if !state.exists() {
-                let nds = get_int(&sig, "misc:no_direct_scanout").context("cannot read misc:no_direct_scanout")?;
-                let tear = get_int(&sig, "general:allow_tearing").context("cannot read general:allow_tearing")?;
+                let nds = get_int(&sig, "misc:no_direct_scanout")
+                    .context("cannot read misc:no_direct_scanout")?;
+                let tear = get_int(&sig, "general:allow_tearing")
+                    .context("cannot read general:allow_tearing")?;
                 if let Some(d) = state.parent() {
                     std::fs::create_dir_all(d)?;
                 }
-                std::fs::write(state, Saved { sig: sig.clone(), no_direct_scanout: nds, allow_tearing: tear }.render())?;
+                std::fs::write(
+                    state,
+                    Saved {
+                        sig: sig.clone(),
+                        no_direct_scanout: nds,
+                        allow_tearing: tear,
+                    }
+                    .render(),
+                )?;
             }
             let batch = format!(
                 "keyword misc:no_direct_scanout 0 ; keyword general:allow_tearing 1 ; keyword windowrulev2 immediate,class:^({VIEWER_CLASS})$"
@@ -110,7 +133,9 @@ pub fn hook(action: &str, state: &Path) -> Result<()> {
             hyprctl(&sig, &["--batch", &batch])?;
         }
         "off" | "restore" => {
-            let Ok(text) = std::fs::read_to_string(state) else { return Ok(()) };
+            let Ok(text) = std::fs::read_to_string(state) else {
+                return Ok(());
+            };
             if let Some(s) = Saved::parse(&text) {
                 let batch = format!(
                     "keyword misc:no_direct_scanout {} ; keyword general:allow_tearing {}",
@@ -134,7 +159,11 @@ mod tests {
 
     #[test]
     fn saved_roundtrip() {
-        let s = Saved { sig: "abc_123".into(), no_direct_scanout: 1, allow_tearing: 0 };
+        let s = Saved {
+            sig: "abc_123".into(),
+            no_direct_scanout: 1,
+            allow_tearing: 0,
+        };
         assert_eq!(Saved::parse(&s.render()), Some(s));
         assert_eq!(Saved::parse("sig=x\n"), None);
     }

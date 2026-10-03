@@ -146,7 +146,7 @@ struct VhostWindow(Backend);
 
 /// Set once the frontend asks for `GET_SHMEM_CONFIG`: a spec frontend (QEMU
 /// >= 11.1) that lays the regions out and picks mapping addresses itself.
-/// nesbox never asks. One process serves one VM, so this never resets.
+/// > nesbox never asks. One process serves one VM, so this never resets.
 static SPEC_SHMEM_FRONTEND: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -330,7 +330,8 @@ impl InputSink for VqInputSink {
                     done = events.len();
                 } else {
                     let take = fit.min(events.len() - done);
-                    self.msg.resize(protocol::messages::input_event_message_len(take), 0);
+                    self.msg
+                        .resize(protocol::messages::input_event_message_len(take), 0);
                     let n = encode_input_events(&events[done..done + take], &mut self.msg)
                         .expect("sized for it");
                     if guard.write_slice(&self.msg[..n], desc.addr()).is_ok() {

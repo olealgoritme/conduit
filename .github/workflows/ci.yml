@@ -60,7 +60,9 @@ jobs:
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
+        # Our own code (cli) is held to zero warnings. The imported components
+        # keep upstream's style; there only correctness/suspicious lints fail.
+        run: cargo clippy --locked --all-targets ${{ matrix.features }} -- ${{ matrix.name == 'cli' && '-D warnings' || '-D clippy::correctness -D clippy::suspicious -D unused_must_use' }}
       - name: test
         # The skipped tests open /dev/nvidiactl and map GPU memory.
         run: >-

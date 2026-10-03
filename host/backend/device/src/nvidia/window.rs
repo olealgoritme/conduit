@@ -134,25 +134,25 @@ impl NvidiaBackend {
 
         // The same object mapped twice is the same memory: hand back the
         // placement that is already there rather than a second copy of it.
-        if let Some(&id) = self.dri_maps.get(&(handle, fd_offset)) {
-            if let Some(live) = self.live_maps.get(&id) {
-                let (offset, length) = (live.region.offset, live.length);
-                let need = size_of::<MsgHeader>() + size_of::<MmapResp>();
-                if resp_buf.len() < need {
-                    return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
-                }
-                let mut off = self.write_hdr(resp_buf, self.current_handle, 0);
-                off += write_struct(
-                    &mut resp_buf[off..],
-                    &MmapResp {
-                        guest_phys_addr: offset,
-                        size: length.div_ceil(4096) * 4096,
-                        mapping_id: id,
-                        padding: 0,
-                    },
-                );
-                return off;
+        if let Some(&id) = self.dri_maps.get(&(handle, fd_offset))
+            && let Some(live) = self.live_maps.get(&id)
+        {
+            let (offset, length) = (live.region.offset, live.length);
+            let need = size_of::<MsgHeader>() + size_of::<MmapResp>();
+            if resp_buf.len() < need {
+                return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
             }
+            let mut off = self.write_hdr(resp_buf, self.current_handle, 0);
+            off += write_struct(
+                &mut resp_buf[off..],
+                &MmapResp {
+                    guest_phys_addr: offset,
+                    size: length.div_ceil(4096) * 4096,
+                    mapping_id: id,
+                    padding: 0,
+                },
+            );
+            return off;
         }
 
         let length = size.max(4096);
@@ -173,7 +173,9 @@ impl NvidiaBackend {
                 "mmap on handle {handle}: nothing armed on this file, or it could \
                  not be placed: {e}"
             );
-            self.shm.free(&region);
+            if let Err(e) = self.shm.free(&region) {
+                log::warn!("mmap on handle {handle}: freeing the unplaced region failed: {e}");
+            }
             return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
         }
 
@@ -247,13 +249,13 @@ impl NvidiaBackend {
         // Emptied rather than unmapped: a hole would leave the memory slot
         // covering a range that reaches no mapping at all, and a stray access
         // there faults the VMM rather than the guest.
-        if let Some(window) = self.window.as_ref() {
-            if let Err(e) = window.withdraw(live.region.offset, live.length) {
-                log::warn!(
-                    "munmap {}: the window would not give it back: {e}",
-                    req.mapping_id
-                );
-            }
+        if let Some(window) = self.window.as_ref()
+            && let Err(e) = window.withdraw(live.region.offset, live.length)
+        {
+            log::warn!(
+                "munmap {}: the window would not give it back: {e}",
+                req.mapping_id
+            );
         }
         self.active_maps.remove(live.region.offset);
         if let Err(e) = self.shm.free(&live.region) {

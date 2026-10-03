@@ -73,7 +73,8 @@ pub fn region_sizes(window_len: u64, aperture_len: u64) -> (u32, [u64; MAX_SHM_R
 /// matching unmap has to repeat, so placement and withdrawal both go through
 /// here. nesbox mmaps, which rounds the same way, so nothing changes for it.
 pub fn page_align(len: u64) -> u64 {
-    len.checked_add(PAGE - 1).map_or(u64::MAX & !(PAGE - 1), |v| v & !(PAGE - 1))
+    len.checked_add(PAGE - 1)
+        .map_or(u64::MAX & !(PAGE - 1), |v| v & !(PAGE - 1))
 }
 
 #[cfg(test)]

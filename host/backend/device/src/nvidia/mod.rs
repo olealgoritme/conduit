@@ -844,7 +844,9 @@ impl NvidiaBackend {
             // Host to guest only. A guest that sends one is confused about the
             // direction of the queue, and saying so beats serving it.
             MsgType::EventReady | MsgType::InputEvent | MsgType::DisplayMode => {
-                log::warn!("{msg_type:?} arrived from the guest; that message only travels outward");
+                log::warn!(
+                    "{msg_type:?} arrived from the guest; that message only travels outward"
+                );
                 self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, libc::EINVAL)
             }
             MsgType::ScanoutFlip => self.handle_scanout_flip(payload, resp_buf),

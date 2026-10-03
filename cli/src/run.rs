@@ -67,7 +67,9 @@ impl Rt {
 }
 
 fn self_comm() -> String {
-    std::env::current_exe().map(|p| comm_of(&p)).unwrap_or_else(|_| "conduit".into())
+    std::env::current_exe()
+        .map(|p| comm_of(&p))
+        .unwrap_or_else(|_| "conduit".into())
 }
 
 pub fn is_running(name: &str) -> bool {
@@ -86,19 +88,31 @@ fn ensure_share(c: &VmConfig) -> Result<PathBuf> {
             return Ok(s.clone());
         }
         return Err(oops(
-            format!("the NVIDIA share folder set for this VM is missing: {}", s.display()),
-            format!("Fix or remove \"share\" in {}", c.dir().join("vm.json").display()),
+            format!(
+                "the NVIDIA share folder set for this VM is missing: {}",
+                s.display()
+            ),
+            format!(
+                "Fix or remove \"share\" in {}",
+                c.dir().join("vm.json").display()
+            ),
         ));
     }
     let drv = crate::host::driver().ok_or_else(|| {
-        oops("the NVIDIA driver is not loaded on this computer", "Run `conduit doctor` for help")
+        oops(
+            "the NVIDIA driver is not loaded on this computer",
+            "Run `conduit doctor` for help",
+        )
     })?;
     let dir = paths::cache_dir().join("nvidia-share").join(&drv.version);
     if dir.join(".conduit-staged").is_file() {
         return Ok(dir);
     }
     let tool = Tool::Userspace.require()?;
-    ui::info(format!("preparing the NVIDIA {} files for VMs (once per driver version)", drv.version));
+    ui::info(format!(
+        "preparing the NVIDIA {} files for VMs (once per driver version)",
+        drv.version
+    ));
     let tmp = dir.with_extension("partial");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(tmp.parent().unwrap())?;
@@ -109,7 +123,10 @@ fn ensure_share(c: &VmConfig) -> Result<PathBuf> {
         .args(["--caps", "graphics,video,utility,compute"])
         .output()
         .context("could not run the driver share tool")?;
-    let _ = std::fs::write(&log, [out.stdout.as_slice(), out.stderr.as_slice()].concat());
+    let _ = std::fs::write(
+        &log,
+        [out.stdout.as_slice(), out.stderr.as_slice()].concat(),
+    );
     if !out.status.success() {
         return Err(oops(
             "could not prepare the NVIDIA files for the VM",
@@ -128,23 +145,38 @@ fn start_backend(c: &VmConfig, rt: &Rt, backend: &Path, mode: Option<Mode>) -> R
     let sock = rt.gpu_sock();
     sys::clear_stale_socket(&sock)?;
     let mut cmd = Command::new(backend);
-    cmd.arg("--socket").arg(&sock).args(["--caps", "graphics,video,utility,compute"]);
+    cmd.arg("--socket")
+        .arg(&sock)
+        .args(["--caps", "graphics,video,utility,compute"]);
     if let Some(m) = mode {
-        cmd.arg("--display").arg(m.to_string()).arg("--display-socket").arg(rt.display_sock());
+        cmd.arg("--display")
+            .arg(m.to_string())
+            .arg("--display-socket")
+            .arg(rt.display_sock());
     }
     let level = std::env::var("RUST_LOG").unwrap_or_else(|_| {
-        if mode.is_some() { "info,device::display=debug".into() } else { "info".into() }
+        if mode.is_some() {
+            "info,device::display=debug".into()
+        } else {
+            "info".into()
+        }
     });
     cmd.env("RUST_LOG", level);
     let log = c.logs_dir().join("backend.log");
     let pid = sys::spawn_detached(&mut cmd, &log, false)?;
     sys::write_pid(&rt.p("backend.pid"), pid)?;
     let pid = pid as i32;
-    let ok = sys::wait_for(Duration::from_secs(10), || sock.exists() || !sys::alive(pid));
+    let ok = sys::wait_for(Duration::from_secs(10), || {
+        sock.exists() || !sys::alive(pid)
+    });
     if !ok || !sock.exists() {
         return Err(oops(
             "the GPU backend did not start",
-            format!("Its log ({}) ends with:\n{}", log.display(), sys::tail(&log, 6)),
+            format!(
+                "Its log ({}) ends with:\n{}",
+                log.display(),
+                sys::tail(&log, 6)
+            ),
         ));
     }
     Ok(())
@@ -171,7 +203,11 @@ fn start_vm(c: &VmConfig, rt: &Rt, vmm: &Path, share: &Path) -> Result<()> {
     if !sys::alive(pid as i32) {
         return Err(oops(
             "the VM failed to start",
-            format!("Its console log ({}) ends with:\n{}", log.display(), sys::tail(&log, 6)),
+            format!(
+                "Its console log ({}) ends with:\n{}",
+                log.display(),
+                sys::tail(&log, 6)
+            ),
         ));
     }
     Ok(())
@@ -189,7 +225,14 @@ fn viewer_supports_hook(viewer: &Path) -> bool {
 }
 
 /// Returns true if Hyprland must be tuned for the whole run (old viewer without hook support).
-fn start_viewer(c: &VmConfig, rt: &Rt, viewer: &Path, m: Mode, tune: Option<&str>, fullscreen: bool) -> Result<bool> {
+fn start_viewer(
+    c: &VmConfig,
+    rt: &Rt,
+    viewer: &Path,
+    m: Mode,
+    tune: Option<&str>,
+    fullscreen: bool,
+) -> Result<bool> {
     let dsock = rt.display_sock();
     if dsock.exists() && sys::socket_live(&dsock) {
         return Err(oops(
@@ -201,8 +244,19 @@ fn start_viewer(c: &VmConfig, rt: &Rt, viewer: &Path, m: Mode, tune: Option<&str
     let mut cmd = Command::new(viewer);
     cmd.args(["--backend", "wayland", "--socket"])
         .arg(&dsock)
-        .args(["--size", &m.size(), "--title", &format!("{} - Conduit", c.name)])
-        .args(["--present-mode=native", "--scale", "aspect", "--persist", "--stats"]);
+        .args([
+            "--size",
+            &m.size(),
+            "--title",
+            &format!("{} - Conduit", c.name),
+        ])
+        .args([
+            "--present-mode=native",
+            "--scale",
+            "aspect",
+            "--persist",
+            "--stats",
+        ]);
     if fullscreen || std::env::var("CONDUIT_FULLSCREEN").as_deref() == Ok("1") {
         cmd.arg("--fullscreen");
     }
@@ -225,11 +279,17 @@ fn start_viewer(c: &VmConfig, rt: &Rt, viewer: &Path, m: Mode, tune: Option<&str
     let pid = sys::spawn_detached(&mut cmd, &log, false)?;
     sys::write_pid(&rt.p("viewer.pid"), pid)?;
     let pid = pid as i32;
-    sys::wait_for(Duration::from_secs(5), || dsock.exists() || !sys::alive(pid));
+    sys::wait_for(Duration::from_secs(5), || {
+        dsock.exists() || !sys::alive(pid)
+    });
     if !sys::alive(pid) {
         return Err(oops(
             "the viewer window could not open",
-            format!("Its log ({}) ends with:\n{}", log.display(), sys::tail(&log, 6)),
+            format!(
+                "Its log ({}) ends with:\n{}",
+                log.display(),
+                sys::tail(&log, 6)
+            ),
         ));
     }
     Ok(whole_run)
@@ -263,7 +323,11 @@ fn preflight(c: &VmConfig) -> Result<Parts> {
     c.kernel_path()?;
     let share = ensure_share(c)?;
     net::up(c)?;
-    Ok(Parts { backend, vmm, share })
+    Ok(Parts {
+        backend,
+        vmm,
+        share,
+    })
 }
 
 /// Backend + VM. `mode` None = no display at all (headless, no KMS).
@@ -282,7 +346,9 @@ fn boot(c: &VmConfig, rt: &Rt, st: &mut State, p: &Parts, mode: Option<Mode>) ->
 pub fn up(name: &str, display: Option<Mode>, headless: bool) -> Result<()> {
     let c = VmConfig::load(name)?;
     if is_running(name) {
-        ui::info(format!("{name} is already running (`conduit status {name}`)"));
+        ui::info(format!(
+            "{name} is already running (`conduit status {name}`)"
+        ));
         return Ok(());
     }
     let (rt, _lock) = prepare(&c)?;
@@ -302,7 +368,8 @@ pub fn up(name: &str, display: Option<Mode>, headless: bool) -> Result<()> {
     let n = c.net();
     ui::info(format!(
         "{name} is starting{}. In about 20 seconds: `conduit ssh {name}` (VM address {})",
-        mode.map(|m| format!(" with a {m} display")).unwrap_or_default(),
+        mode.map(|m| format!(" with a {m} display"))
+            .unwrap_or_default(),
         n.guest_ip
     ));
     if mode.is_some() {
@@ -412,7 +479,11 @@ pub fn view(name: &str, req: Option<Mode>, tune_hyprland: bool, fullscreen: bool
 /// Clear pid files and sockets of processes that are gone (crash, reboot).
 fn stop_leftovers(c: &VmConfig, rt: &Rt) {
     let st = rt.state();
-    for (what, comm) in [("viewer", &st.viewer_comm), ("backend", &st.backend_comm), ("vm", &st.vm_comm)] {
+    for (what, comm) in [
+        ("viewer", &st.viewer_comm),
+        ("backend", &st.backend_comm),
+        ("vm", &st.vm_comm),
+    ] {
         if rt.pid(what, comm).is_none() {
             let _ = std::fs::remove_file(rt.p(&format!("{what}.pid")));
         }
@@ -430,9 +501,12 @@ pub fn ssh_cmd(c: &VmConfig, user: &str) -> Command {
         cmd.arg("-i").arg(key);
     }
     cmd.args([
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "LogLevel=ERROR",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "LogLevel=ERROR",
     ]);
     cmd.arg(format!("{user}@{}", c.net().guest_ip));
     cmd
@@ -467,24 +541,42 @@ fn down_inner(c: &VmConfig, interactive: bool, verbose: bool) -> Result<()> {
     let me = std::process::id() as i32;
     if let Some(w) = rt.pid("watcher", &st.watcher_comm) {
         if w != me {
-            sys::stop_pid(&rt.p("watcher.pid"), &st.watcher_comm, "watcher", Duration::from_secs(2));
+            sys::stop_pid(
+                &rt.p("watcher.pid"),
+                &st.watcher_comm,
+                "watcher",
+                Duration::from_secs(2),
+            );
         }
     }
     let _ = std::fs::remove_file(rt.p("watcher.pid"));
     if !st.viewer_comm.is_empty() {
-        sys::stop_pid(&rt.p("viewer.pid"), &st.viewer_comm, "viewer", Duration::from_secs(5));
+        sys::stop_pid(
+            &rt.p("viewer.pid"),
+            &st.viewer_comm,
+            "viewer",
+            Duration::from_secs(5),
+        );
     }
     if let Some(v) = rt.pid("vm", &st.vm_comm) {
         if verbose {
             ui::info(format!("shutting down {} cleanly…", c.name));
         }
         if !guest_poweroff(c, v) && sys::alive(v) {
-            ui::warn(format!("could not reach {} to shut it down cleanly; stopping it", c.name));
+            ui::warn(format!(
+                "could not reach {} to shut it down cleanly; stopping it",
+                c.name
+            ));
         }
         sys::stop_pid(&rt.p("vm.pid"), &st.vm_comm, "VM", Duration::from_secs(5));
     }
     if !st.backend_comm.is_empty() {
-        sys::stop_pid(&rt.p("backend.pid"), &st.backend_comm, "GPU backend", Duration::from_secs(5));
+        sys::stop_pid(
+            &rt.p("backend.pid"),
+            &st.backend_comm,
+            "GPU backend",
+            Duration::from_secs(5),
+        );
     }
     let _ = sys::clear_stale_socket(&rt.gpu_sock());
     let _ = sys::clear_stale_socket(&rt.display_sock());
@@ -544,8 +636,20 @@ pub fn status(name: Option<&str>) -> Result<()> {
         let rt = Rt::new(n)?;
         let st = rt.state();
         let vm_pid = rt.pid("vm", &st.vm_comm);
-        println!("{n}: {}", if vm_pid.is_some() { "running" } else { "stopped" });
-        for (what, comm) in [("vm", &st.vm_comm), ("backend", &st.backend_comm), ("viewer", &st.viewer_comm), ("watcher", &st.watcher_comm)] {
+        println!(
+            "{n}: {}",
+            if vm_pid.is_some() {
+                "running"
+            } else {
+                "stopped"
+            }
+        );
+        for (what, comm) in [
+            ("vm", &st.vm_comm),
+            ("backend", &st.backend_comm),
+            ("viewer", &st.viewer_comm),
+            ("watcher", &st.watcher_comm),
+        ] {
             if let Some(p) = rt.pid(what, comm) {
                 println!("  {what:<8} running (pid {p})");
             } else if vm_pid.is_some() || name.is_some() {
@@ -569,7 +673,9 @@ pub fn status(name: Option<&str>) -> Result<()> {
                 .stderr(std::process::Stdio::null())
                 .output();
             match out {
-                Ok(o) if o.status.success() => println!("  guest    {}", String::from_utf8_lossy(&o.stdout).trim()),
+                Ok(o) if o.status.success() => {
+                    println!("  guest    {}", String::from_utf8_lossy(&o.stdout).trim())
+                }
                 _ => println!("  guest    not reachable yet (it may still be booting)"),
             }
         }
@@ -584,13 +690,24 @@ pub fn logs(name: &str, which: Option<&str>, follow: bool, lines: usize) -> Resu
         None => all.to_vec(),
         Some(w) if all.contains(&w) || w == "watcher" || w == "share" => vec![w],
         Some(w) => {
-            return Err(oops(format!("there is no \"{w}\" log"), "Choose backend, vm or viewer"));
+            return Err(oops(
+                format!("there is no \"{w}\" log"),
+                "Choose backend, vm or viewer",
+            ));
         }
     };
-    let files: Vec<PathBuf> = pick.iter().map(|w| c.logs_dir().join(format!("{w}.log"))).collect();
+    let files: Vec<PathBuf> = pick
+        .iter()
+        .map(|w| c.logs_dir().join(format!("{w}.log")))
+        .collect();
     if follow {
         use std::os::unix::process::CommandExt;
-        let err = Command::new("tail").arg("-n").arg(lines.to_string()).arg("-F").args(&files).exec();
+        let err = Command::new("tail")
+            .arg("-n")
+            .arg(lines.to_string())
+            .arg("-F")
+            .args(&files)
+            .exec();
         return Err(err).context("could not run tail");
     }
     for (w, f) in pick.iter().zip(&files) {
@@ -610,7 +727,10 @@ pub fn ssh(name: &str, user: Option<&str>, args: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let c = VmConfig::load(name)?;
     if !is_running(name) {
-        return Err(oops(format!("{name} is not running"), format!("Start it with `conduit up {name}` or `conduit view {name}`")));
+        return Err(oops(
+            format!("{name} is not running"),
+            format!("Start it with `conduit up {name}` or `conduit view {name}`"),
+        ));
     }
     let user = user.unwrap_or(&c.user).to_string();
     let err = ssh_cmd(&c, &user).args(args).exec();

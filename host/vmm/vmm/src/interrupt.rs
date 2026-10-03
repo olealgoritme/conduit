@@ -148,10 +148,11 @@ impl MsiRouter for IrqManager {
         let mut state = self.state.lock().unwrap();
         // Committing an unchanged route would be a pointless ioctl; the guest
         // rewrites table entries on every unmask.
-        if let Some(old) = state.msi.get(&gsi) {
-            if old.addr == addr && old.data == data {
-                return Ok(());
-            }
+        if let Some(old) = state.msi.get(&gsi)
+            && old.addr == addr
+            && old.data == data
+        {
+            return Ok(());
         }
         state.msi.insert(gsi, MsiRoute { addr, data });
         log::debug!("routing gsi {gsi} to MSI addr={addr:#x} data={data:#x}");

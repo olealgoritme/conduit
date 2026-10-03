@@ -144,6 +144,12 @@ pub struct ConsoleDevice {
     inner: Arc<Mutex<Inner>>,
 }
 
+impl Default for ConsoleDevice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConsoleDevice {
     pub fn new() -> Self {
         let stdin_buf = Arc::new(Mutex::new(Vec::new()));

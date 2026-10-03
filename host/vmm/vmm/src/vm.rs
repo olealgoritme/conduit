@@ -203,7 +203,7 @@ impl Vm {
         }
 
         // Load kernel
-        let loader_result = boot::load_kernel(&mem, &kernel_path)?;
+        let loader_result = boot::load_kernel(&mem, kernel_path)?;
         let entry_point = loader_result.kernel_load;
         log::info!(
             "kernel: load/entry={:#x} end={:?} setup_header={:?}",
