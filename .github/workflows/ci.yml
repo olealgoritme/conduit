@@ -209,7 +209,7 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck -S warning \
-            packaging/build.sh packaging/common/conduit-integrate \
+            packaging/build.sh packaging/supported-drivers.sh packaging/common/conduit-integrate \
             packaging/tarball/*.sh packaging/deb/*/* \
             guest/system/conduit-guest-setup cli/assets/build-disk.sh
       - name: DKMS source package

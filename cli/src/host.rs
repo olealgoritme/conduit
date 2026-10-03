@@ -1,6 +1,7 @@
 //! Facts about the host: NVIDIA driver, supported driver versions, QEMU.
 
 use crate::paths;
+use std::path::Path;
 
 #[derive(Debug, PartialEq)]
 pub struct Driver {
@@ -34,9 +35,10 @@ pub fn major(v: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// Driver versions the backend has ABI tables for.
-/// Installed: share/conduit/supported-drivers.txt (one per line). Source
-/// checkout: the generated table files. Else the list this CLI was built with.
+/// Driver releases the backend accepts: those with exact ABI tables.
+/// Installed: share/conduit/supported-drivers.txt (one per line, written by
+/// packaging/build.sh via packaging/supported-drivers.sh). Source checkout:
+/// the generated table files. Else the list this CLI was built with.
 pub fn supported_drivers() -> (Vec<String>, &'static str) {
     let f = paths::prefix().join("share/conduit/supported-drivers.txt");
     if let Ok(s) = std::fs::read_to_string(&f) {
@@ -51,17 +53,9 @@ pub fn supported_drivers() -> (Vec<String>, &'static str) {
         }
     }
     if let Some(r) = paths::repo_root() {
-        for d in ["host/backend/gen/src/versions", "gen/src/versions"] {
-            if let Ok(rd) = std::fs::read_dir(r.join(d)) {
-                let mut v: Vec<String> = rd
-                    .flatten()
-                    .filter_map(|e| version_from_table_name(&e.file_name().to_string_lossy()))
-                    .collect();
-                if !v.is_empty() {
-                    v.sort();
-                    return (v, "source tree");
-                }
-            }
+        let v = tree_releases(&r.join("host/backend/gen/src"));
+        if !v.is_empty() {
+            return (v, "source tree");
         }
     }
     (
@@ -70,7 +64,43 @@ pub fn supported_drivers() -> (Vec<String>, &'static str) {
     )
 }
 
-const BUILT_IN: &[&str] = &["535.129.03", "580.178.04", "595.71.05", "610.57.04"];
+/// The table directories the backend's exact-table check reads
+/// (`NvidiaBackend::inexact_tables`); a release needs its own file in each.
+pub const EXACT_TABLES: &[&str] = &["rmctrl", "rmallow", "uvm", "vidmem"];
+
+/// Releases with a table of their own in every one of [`EXACT_TABLES`]
+/// under `gen_src` (host/backend/gen/src), ascending.
+pub fn tree_releases(gen_src: &Path) -> Vec<String> {
+    let mut sets = EXACT_TABLES.iter().map(|t| {
+        std::fs::read_dir(gen_src.join(t))
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| version_from_table_name(&e.file_name().to_string_lossy()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    let mut v = sets.next().unwrap_or_default();
+    for s in sets {
+        v.retain(|r| s.contains(r));
+    }
+    v.sort_by_key(|r| version_key(r));
+    v
+}
+
+/// "595.104.02" -> [595, 104, 2], for numeric ordering.
+fn version_key(v: &str) -> Vec<u64> {
+    v.split('.').map(|p| p.parse().unwrap_or(0)).collect()
+}
+
+const BUILT_IN: &[&str] = &[
+    "535.129.03",
+    "580.178.04",
+    "595.71.05",
+    "595.104.02",
+    "610.57.04",
+    "615.71.09",
+];
 
 /// "v610_57_04.rs" -> "610.57.04"
 pub fn version_from_table_name(n: &str) -> Option<String> {
@@ -103,6 +133,30 @@ pub fn parse_qemu_version(text: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CLI's list (`conduit doctor`), the installed list build.sh writes
+    /// (packaging/supported-drivers.sh) and the built-in fallback agree. The
+    /// backend's own test checks its accepted releases against the same script.
+    #[test]
+    fn supported_drivers_match_the_backend() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let gen = root.join("host/backend/gen/src");
+        let tree = tree_releases(&gen);
+        assert!(tree.iter().any(|v| v == "595.104.02"), "{tree:?}");
+        assert!(tree.iter().any(|v| v == "615.71.09"), "{tree:?}");
+        let out = std::process::Command::new(root.join("packaging/supported-drivers.sh"))
+            .arg(&gen)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let script: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        assert_eq!(tree, script, "CLI vs packaging/supported-drivers.sh");
+        assert_eq!(tree, BUILT_IN, "update host.rs BUILT_IN");
+    }
 
     #[test]
     fn driver_version() {

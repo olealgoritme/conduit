@@ -186,6 +186,11 @@ pub fn select(v: DriverVersion) -> Option<Selected> {
         })
 }
 
+/// The versions with a layout of their own, ascending.
+pub fn supported_versions() -> impl Iterator<Item = DriverVersion> {
+    PROFILES.iter().map(|(v, _)| *v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

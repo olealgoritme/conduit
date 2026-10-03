@@ -580,6 +580,18 @@ impl NvidiaBackend {
         Ok(())
     }
 
+    /// The host releases the backend starts on without
+    /// `--allow-nearest-abi`: those every table [`Self::inexact_tables`]
+    /// counts has as its own. `conduit doctor` lists the same
+    /// (packaging/supported-drivers.sh; a test keeps them equal).
+    pub fn accepted_releases() -> Vec<abi::version::DriverVersion> {
+        abi::rmctrl::supported_versions()
+            .filter(|v| abi::rmallow::select(*v).is_some_and(|s| s.exact))
+            .filter(|v| abi::uvm::select(*v).is_some_and(|s| s.exact))
+            .filter(|v| abi::vidmem::select(*v).is_some_and(|s| s.exact))
+            .collect()
+    }
+
     /// The tables chosen for the host release that are not that release's
     /// own but the nearest older one's, by name. Empty when every table is
     /// exact (or no release is set yet).

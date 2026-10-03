@@ -408,6 +408,28 @@ mod tests {
         );
     }
 
+    /// Every release the backend accepts starts with no inexact table, and
+    /// the list equals what `conduit doctor` reports (the CLI's test checks
+    /// its side against the same script).
+    #[test]
+    fn accepted_releases_match_the_cli_list() {
+        let acc = NvidiaBackend::accepted_releases();
+        for v in &acc {
+            let mut be = NvidiaBackend::for_test();
+            be.set_host_driver_version(*v).unwrap();
+            assert!(be.inexact_tables().is_empty(), "{v}");
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let out = std::process::Command::new(root.join("packaging/supported-drivers.sh"))
+            .arg(root.join("host/backend/gen/src"))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let listed = String::from_utf8(out.stdout).unwrap();
+        let ours: Vec<String> = acc.iter().map(|v| v.to_string()).collect();
+        assert_eq!(listed.lines().collect::<Vec<_>>(), ours);
+    }
+
     /// A release with tables of its own has none inexact; a point release
     /// past it runs on the older tables, and says which.
     #[test]

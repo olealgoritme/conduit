@@ -249,11 +249,10 @@ cmd_stage() {
         cp -a "$DIST/qemu-root$PREFIX/." "$o/"
     fi
 
-    # Host driver releases the backend has ABI tables for (read by `conduit doctor`).
+    # Host driver releases the backend accepts (read by `conduit doctor`).
     {
-        echo "# NVIDIA driver releases with backend ABI tables (from host/backend/gen/src/versions)"
-        find "$ROOT/host/backend/gen/src/versions" -maxdepth 1 -name 'v*_*_*.rs' -printf '%f\n' 2>/dev/null \
-            | sed -E 's/^v//; s/\.rs$//; s/_/./g' | sort -V
+        echo "# NVIDIA driver releases the backend has exact ABI tables for (packaging/supported-drivers.sh)"
+        "$PKG/supported-drivers.sh" "$ROOT/host/backend/gen/src"
     } > "$o/share/conduit/supported-drivers.txt"
 
     # The guest driver package `conduit create` / `conduit stock-kernel`
