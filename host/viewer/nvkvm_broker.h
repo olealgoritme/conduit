@@ -160,7 +160,7 @@ struct nb_config {
      */
     int  scale_mode;
     /*
-     * virtio-nvgpu viewer options (Wayland backend):
+     * Conduit display options (Wayland backend):
      *   overlay_mode  NB_OVERLAY_*: when the stats overlay may be shown
      *   direct_mode   start in direct mode (CTRL+ALT+D toggles)
      *   direct_hook   run as `HOOK on` / `HOOK off` on each direct-mode edge,
