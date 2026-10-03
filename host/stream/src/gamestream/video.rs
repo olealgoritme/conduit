@@ -67,7 +67,9 @@ pub struct Packetizer {
     pub min_fec: usize,
     /// AES-GCM key when video encryption is on.
     pub key: Option<[u8; 16]>,
-    seq: u16,
+    /// Packets sent so far: RTP takes the low 16 bits, the NV header's
+    /// streamPacketIndex 24 (the client checks continuity on 24).
+    seq: u32,
     iv_counter: u64,
 }
 
@@ -195,7 +197,7 @@ impl Packetizer {
             }
             let n = blk.len();
             for (x, s) in blk.iter_mut().enumerate() {
-                let seq = self.seq.wrapping_add(x as u16);
+                let seq = self.seq.wrapping_add(x as u32) as u16;
                 s[0] = 0x80 | RTP_FLAG_EXTENSION;
                 s[1] = 0;
                 s[2..4].copy_from_slice(&seq.to_be_bytes());
@@ -209,7 +211,7 @@ impl Packetizer {
                 nv[11] = multi;
                 nv[4..8].copy_from_slice(&frame_index.to_le_bytes());
             }
-            self.seq = self.seq.wrapping_add(n as u16);
+            self.seq = self.seq.wrapping_add(n as u32);
             for s in blk {
                 out.push(match self.key {
                     Some(k) => self.encrypt(&k, s, frame_index),
@@ -324,6 +326,15 @@ mod tests {
         assert!(rs_decode(&mut blk, data_n, &[1, 5]));
         assert_eq!(&blk[1][SHARD_HEADER..], &pk[1][SHARD_HEADER..]);
         assert_eq!(&blk[5][SHARD_HEADER..], &pk[5][SHARD_HEADER..]);
+    }
+
+    #[test]
+    fn packet_index_outlives_the_16_bit_rtp_sequence() {
+        let mut p = Packetizer::new(1024, 0, 0, None);
+        p.seq = 65535;
+        let pk = p.frame(&vec![1u8; 3000], 9, FrameType::P, 0, 0);
+        assert_eq!(u16::from_be_bytes([pk[1][2], pk[1][3]]), 0); // RTP wraps
+        assert_eq!(nv(&pk[1]).0 >> 8, 65536); // the 24-bit index does not
     }
 
     #[test]
