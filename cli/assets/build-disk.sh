@@ -143,6 +143,12 @@ if [ "$MODE" = convert ]; then
     rm -f "$MNT/etc/systemd/system/nvgpu.service"
     in_vm systemctl mask nvgpu.service >/dev/null 2>&1 || true
     say "disabled the old nvgpu.service (conduit-guest.service replaces it)"
+    # Drop-ins that made other units depend on it (e.g. gdm) would now keep
+    # them from starting at all: point them at conduit-guest.service instead.
+    for d in "$MNT"/etc/systemd/system/*.service.d/*.conf; do
+      [ -f "$d" ] && grep -q 'nvgpu\.service' "$d" && sed -i 's/nvgpu\.service/conduit-guest.service/g' "$d" \
+        && say "repointed $(basename "$(dirname "$d")")/$(basename "$d") to conduit-guest.service"
+    done
   fi
   finish
   exit 0
