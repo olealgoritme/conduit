@@ -103,6 +103,7 @@ pub fn pick_audio(qemu: &Path) -> Option<Audio> {
 
 pub struct Paths<'a> {
     pub kernel: &'a Path,
+    pub initrd: Option<&'a Path>,
     pub gpu_sock: &'a Path,
     pub vfs_sock: &'a Path,
     pub qmp_sock: &'a Path,
@@ -164,6 +165,11 @@ pub fn args(c: &VmConfig, p: &Paths, audio: Option<Audio>) -> Vec<String> {
         d(p.kernel),
         s("-append"),
         kernel_args(c),
+    ];
+    if let Some(i) = p.initrd {
+        a.extend([s("-initrd"), d(i)]);
+    }
+    a.extend([
         s("-drive"),
         format!(
             "file={},format=raw,if=virtio,cache=none,discard=unmap",
@@ -183,7 +189,7 @@ pub fn args(c: &VmConfig, p: &Paths, audio: Option<Audio>) -> Vec<String> {
         gpu_device("nvgpu"),
         s("-device"),
         s("virtio-rng-pci"),
-    ];
+    ]);
     if let Some(au) = audio {
         a.extend([
             s("-audiodev"),
@@ -306,6 +312,7 @@ mod tests {
         c.kernel_args = "quiet".into();
         let p = Paths {
             kernel: Path::new("/k/vmlinux"),
+            initrd: Some(Path::new("/k/initrd.img")),
             gpu_sock: Path::new("/run/gpu.sock"),
             vfs_sock: Path::new("/run/vfs.sock"),
             qmp_sock: Path::new("/run/qmp.sock"),
@@ -319,6 +326,7 @@ mod tests {
             "-smp 6 -m 4096M",
             "memory-backend-memfd,id=mem,size=4096M,share=on",
             "-display none",
+            "-initrd /k/initrd.img",
             "-kernel /k/vmlinux -append console=ttyS0 root=/dev/vda rw quiet",
             "file=/vms/t/disk.img,format=raw,if=virtio",
             "tap,id=net0,ifname=conduit3,script=no,downscript=no",

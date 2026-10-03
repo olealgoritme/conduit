@@ -183,14 +183,20 @@ pub fn run() -> i32 {
     }
 
     // Conduit's own parts
-    for t in [
-        Tool::Backend,
-        Tool::Vmm,
-        Tool::Viewer,
-        Tool::Kernel,
-        Tool::GuestModule,
-        Tool::Userspace,
-    ] {
+    // The VM runner: the bundled QEMU, or the built-in one as a fallback.
+    let qemu = Tool::BundledQemu.find();
+    match (&qemu, crate::qemu::virtiofsd(), Tool::Vmm.find()) {
+        (Some(q), Some(_), _) => r.line(Level::Ok, "VM runner", &format!("QEMU {}", q.display()), ""),
+        (Some(_), None, _) => r.line(Level::Fail, "VM runner", "QEMU found, but virtiofsd is missing",
+            "Ubuntu/Debian: sudo apt install virtiofsd   Fedora: sudo dnf install virtiofsd"),
+        (None, _, Some(v)) => r.line(Level::Warn, "VM runner",
+            &format!("bundled QEMU missing; only the built-in runner ({})", v.display()),
+            "The built-in runner has no sound and cannot boot a VM's own (stock) kernel. Reinstall the conduit package, or build host/qemu."),
+        (None, _, None) => r.line(Level::Fail, "VM runner", "neither the bundled QEMU nor the built-in runner was found",
+            "Reinstall the conduit package. In a source checkout: host/qemu/build-qemu.sh"),
+    }
+
+    for t in [Tool::Backend, Tool::Viewer, Tool::GuestDeb, Tool::Userspace] {
         match t.find() {
             Some(p) => r.line(Level::Ok, t.label(), &p.display().to_string(), ""),
             None => r.line(Level::Fail, t.label(), "not found",

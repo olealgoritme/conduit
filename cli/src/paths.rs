@@ -2,9 +2,8 @@
 //!
 //! Installed layout ($CONDUIT_PREFIX, default /opt/conduit):
 //!   bin/conduit-backend   bin/conduit-vmm   bin/conduit-viewer   bin/conduit-userspace
-//!   bin/qemu-system-x86_64 (bundled QEMU, older distros only)
-//!   share/conduit/vmlinux               guest kernel booted by the built-in VMM
-//!   share/conduit/guest/virtio_gpu_nv.ko guest driver for that kernel
+//!   bin/qemu-system-x86_64              bundled QEMU 11.1, the default VM runner
+//!   share/conduit/guest/conduit-guest.deb the guest driver (DKMS) `conduit create` installs
 //!   share/conduit/supported-drivers.txt  host driver versions the backend speaks
 //! In a source checkout the build outputs are used instead (see `Tool::candidates`).
 
@@ -115,8 +114,7 @@ pub enum Tool {
     Vmm,
     Viewer,
     Userspace,
-    Kernel,
-    GuestModule,
+    GuestDeb,
     BundledQemu,
 }
 
@@ -124,11 +122,10 @@ impl Tool {
     pub fn label(self) -> &'static str {
         match self {
             Tool::Backend => "GPU backend",
-            Tool::Vmm => "VM runner",
+            Tool::Vmm => "built-in VM runner",
             Tool::Viewer => "viewer",
             Tool::Userspace => "driver share tool",
-            Tool::Kernel => "guest kernel",
-            Tool::GuestModule => "guest driver module",
+            Tool::GuestDeb => "guest driver package (conduit-guest .deb)",
             Tool::BundledQemu => "bundled QEMU",
         }
     }
@@ -139,8 +136,7 @@ impl Tool {
             Tool::Vmm => "CONDUIT_VMM",
             Tool::Viewer => "CONDUIT_VIEWER",
             Tool::Userspace => "CONDUIT_USERSPACE",
-            Tool::Kernel => "CONDUIT_KERNEL",
-            Tool::GuestModule => "CONDUIT_GUEST_MODULE",
+            Tool::GuestDeb => "CONDUIT_GUEST_DEB",
             Tool::BundledQemu => "CONDUIT_QEMU",
         }
     }
@@ -175,11 +171,8 @@ impl Tool {
                     "host/backend/target/release/nvgpu-userspace",
                 ],
             ),
-            Tool::Kernel => (&["share/conduit/vmlinux"], &["guest/kernel/vmlinux"]),
-            Tool::GuestModule => (
-                &["share/conduit/guest/virtio_gpu_nv.ko"],
-                &["guest/linux/virtio_gpu_nv.ko"],
-            ),
+            // In a checkout: `packaging/build.sh package guest-deb` (newest wins, below).
+            Tool::GuestDeb => (&["share/conduit/guest/conduit-guest.deb"], &[]),
             Tool::BundledQemu => (
                 &["bin/qemu-system-x86_64"],
                 &["host/qemu/build/qemu-system-x86_64"],
@@ -188,6 +181,9 @@ impl Tool {
         v.extend(installed.iter().map(|p| pf.join(p)));
         if let Some(r) = repo_root() {
             v.extend(dev.iter().map(|p| r.join(p)));
+            if self == Tool::GuestDeb {
+                v.extend(newest_guest_deb(&r.join("dist/out")));
+            }
         }
         v
     }
@@ -214,6 +210,19 @@ impl Tool {
             )
         })
     }
+}
+
+/// The newest conduit-guest_*_all.deb in `dir` (by modification time).
+fn newest_guest_deb(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("conduit-guest_") && n.ends_with("_all.deb")
+        })
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
 }
 
 /// The kernel's process name for a binary (`comm`, at most 15 bytes).

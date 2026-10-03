@@ -6,6 +6,7 @@
 set -e
 NAME=conduit-guest
 VERSION=@VERSION@
+done_k=
 
 # Clipboard: the device node's permissions (70-conduit-clipboard.rules) and the
 # per-session agent. Best effort; none of it may fail the install.
@@ -23,18 +24,27 @@ if ! dkms status -m "$NAME" -v "$VERSION" 2>/dev/null | grep -q .; then
     dkms add -m "$NAME" -v "$VERSION" || true
 fi
 
-KVER=$(uname -r)
-case "$KVER" in
-    [0-5].*|6.[0-3].*|6.[0-3]-*)
-        echo "$NAME: kernel $KVER is too old; the guest driver needs Linux 6.4 or newer." >&2
-        exit 0 ;;
-esac
-
-if [ -e "/lib/modules/$KVER/build" ]; then
-    dkms install -m "$NAME" -v "$VERSION" -k "$KVER" || \
-        echo "$NAME: DKMS build failed; see /var/lib/dkms/$NAME/$VERSION/build/make.log" >&2
-    modprobe virtio_gpu_nv 2>/dev/null || true
-else
-    echo "$NAME: no headers for $KVER (install linux-headers-$KVER / kernel-devel), module will build on next kernel install." >&2
-fi
+# Build for the running kernel and for every other installed kernel with
+# headers: a VM image is often built in a chroot, where `uname -r` is the
+# build host's kernel, and the kernel the VM boots is only installed.
+built=0
+for KVER in $(uname -r) $(ls /lib/modules 2>/dev/null); do
+    case " $done_k " in *" $KVER "*) continue ;; esac
+    done_k="$done_k $KVER"
+    case "$KVER" in
+        [0-5].*|6.[0-3].*|6.[0-3]-*)
+            echo "$NAME: kernel $KVER is too old; the guest driver needs Linux 6.4 or newer." >&2
+            continue ;;
+    esac
+    if [ -e "/lib/modules/$KVER/build" ]; then
+        if dkms install -m "$NAME" -v "$VERSION" -k "$KVER"; then
+            built=1
+        else
+            echo "$NAME: DKMS build for $KVER failed; see /var/lib/dkms/$NAME/$VERSION/build/make.log" >&2
+        fi
+    elif [ "$KVER" = "$(uname -r)" ] && [ -d "/lib/modules/$KVER/kernel" ]; then
+        echo "$NAME: no headers for $KVER (install linux-headers-$KVER / kernel-devel), module will build on next kernel install." >&2
+    fi
+done
+[ "$built" = 1 ] && modprobe virtio_gpu_nv 2>/dev/null || true
 exit 0

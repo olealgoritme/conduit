@@ -284,7 +284,6 @@ fn start_virtiofsd(c: &VmConfig, rt: &Rt, p: &Parts, vfsd: &Path) -> Result<()> 
 }
 
 fn start_qemu(c: &VmConfig, rt: &Rt, p: &Parts) -> Result<()> {
-    let kernel = c.kernel_path()?;
     check_disk(c)?;
     let log = c.logs_dir().join("vm.log");
     let qmp = rt.qmp_sock();
@@ -292,7 +291,8 @@ fn start_qemu(c: &VmConfig, rt: &Rt, p: &Parts) -> Result<()> {
     let args = qemu::args(
         c,
         &qemu::Paths {
-            kernel: &kernel,
+            kernel: p.boot.kernel(),
+            initrd: p.boot.initrd(),
             gpu_sock: &rt.gpu_sock(),
             vfs_sock: &rt.vfs_sock(),
             qmp_sock: &qmp,
@@ -336,10 +336,9 @@ fn start_qemu(c: &VmConfig, rt: &Rt, p: &Parts) -> Result<()> {
 }
 
 fn start_vm(c: &VmConfig, rt: &Rt, p: &Parts) -> Result<()> {
-    let (vmm, share) = (&p.vmm, &p.share);
-    let kernel = c.kernel_path()?;
+    let (vmm, share, kernel) = (&p.vmm, &p.share, p.boot.kernel());
     check_disk(c)?;
-    let cfg = vm::vmm_config(c, &kernel, &rt.gpu_sock(), share);
+    let cfg = vm::vmm_config(c, kernel, &rt.gpu_sock(), share);
     let cfg_path = rt.p("vmm.json");
     std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg)?)?;
     let log = c.logs_dir().join("vm.log");
@@ -516,6 +515,7 @@ struct Parts {
     share: PathBuf,
     /// The VM's systemd slice (memory limit), when there is a user systemd.
     slice: Option<Slice>,
+    boot: crate::boot::Boot,
 }
 
 fn need_virtiofsd() -> Result<PathBuf> {
@@ -528,13 +528,25 @@ fn need_virtiofsd() -> Result<PathBuf> {
 }
 
 /// QEMU unless asked otherwise; the built-in runner when QEMU is missing.
-fn pick_vmm(want: Option<VmmKind>) -> Result<(VmmKind, PathBuf, Option<PathBuf>)> {
+/// `own_kernel`: the VM boots the kernel on its disk, which only QEMU can do
+/// (the built-in runner loads an uncompressed ELF vmlinux, with no initrd).
+fn pick_vmm(
+    want: Option<VmmKind>,
+    own_kernel: bool,
+) -> Result<(VmmKind, PathBuf, Option<PathBuf>)> {
+    let builtin_cannot = || {
+        oops(
+            "the built-in VM runner cannot boot this VM: it boots the kernel installed on its own disk, which needs QEMU",
+            "Use the bundled QEMU (reinstall the conduit package; in a source checkout run host/qemu/build-qemu.sh, and install virtiofsd)",
+        )
+    };
     match want {
         Some(VmmKind::Qemu) => Ok((
             VmmKind::Qemu,
             Tool::BundledQemu.require()?,
             Some(need_virtiofsd()?),
         )),
+        Some(VmmKind::Builtin) if own_kernel => Err(builtin_cannot()),
         Some(VmmKind::Builtin) => Ok((VmmKind::Builtin, Tool::Vmm.require()?, None)),
         None => match (Tool::BundledQemu.find(), qemu::virtiofsd()) {
             (Some(q), Some(v)) => Ok((VmmKind::Qemu, q, Some(v))),
@@ -544,6 +556,10 @@ fn pick_vmm(want: Option<VmmKind>) -> Result<(VmmKind, PathBuf, Option<PathBuf>)
                 } else {
                     "virtiofsd is not installed"
                 };
+                if own_kernel {
+                    let e = builtin_cannot();
+                    return Err(oops(why, format!("{e:#}")));
+                }
                 let vmm = Tool::Vmm.require().map_err(|e| {
                     oops(
                         format!("{why}, and neither was the built-in VM runner"),
@@ -589,7 +605,7 @@ fn check_memory(c: &VmConfig) -> Result<()> {
 fn preflight(c: &VmConfig, want: Option<VmmKind>) -> Result<Parts> {
     check_memory(c)?;
     let backend = Tool::Backend.require()?;
-    let (kind, vmm, virtiofsd) = pick_vmm(want)?;
+    let (kind, vmm, virtiofsd) = pick_vmm(want, c.kernel.is_none())?;
     let audio = match kind {
         VmmKind::Qemu => qemu::pick_audio(&vmm),
         VmmKind::Builtin => None,
@@ -605,7 +621,9 @@ fn preflight(c: &VmConfig, want: Option<VmmKind>) -> Result<Parts> {
                 .unwrap_or_else(|| "off (no PipeWire or PulseAudio found)".into())
         )),
     }
-    c.kernel_path()?;
+    check_disk(c)?;
+    let boot = crate::boot::resolve(c)?;
+    ui::info(format!("booting {}", boot.describe()));
     let share = ensure_share(c)?;
     net::up(c)?;
     Ok(Parts {
@@ -616,6 +634,7 @@ fn preflight(c: &VmConfig, want: Option<VmmKind>) -> Result<Parts> {
         audio,
         share,
         slice: Slice::prepare(&c.name, c.ram_mib),
+        boot,
     })
 }
 

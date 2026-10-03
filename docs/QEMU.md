@@ -17,7 +17,7 @@ both.
 | QEMU 11.1.x with the Conduit patches | `host/qemu/build-qemu.sh` (see `host/qemu/README.md`). It builds `host/qemu/build/qemu-system-x86_64`, and `--install` puts it in `/opt/conduit/bin`. |
 | backend (`conduit-backend`) | `cd host/backend && cargo build --release -p device --features vhost-user --bin conduit-backend` |
 | virtiofsd (NVIDIA userspace share) | `/usr/libexec/virtiofsd` (Ubuntu package `virtiofsd`) |
-| guest kernel | `~/code/nvgpu-lab/linux-7.2.9/vmlinux` (ELF with `CONFIG_PVH=y`, which QEMU `-kernel` boots directly) |
+| guest kernel | the VM's own stock kernel: `conduit` copies the newest `/boot/vmlinuz-*` and its `initrd.img-*` out of the disk (`debugfs`) and passes them as `-kernel`/`-initrd`. The guest driver comes from DKMS (`conduit-guest`). A custom ELF `vmlinux` (`CONFIG_PVH=y`) also boots, without `-initrd`; that is what the commands below show. |
 | guest disk | `~/code/nvgpu-lab/rootfs-ssh.ext4` (a bare ext4 filesystem with no partition table or bootloader. It mounts as `/dev/vda`) |
 
 **Stock QEMU 11.1 does not work.** It aborts on the guest's first device
@@ -227,3 +227,8 @@ layout below needs no driver change.
   guest module probes, `vulkaninfo` lists the RTX 5090, the offscreen Vulkan
   draw test passes (fence, pixels), the virtio-sound card shows one playback
   and one capture stream, and `conduit down` powers off through ACPI.
+  Both with a custom 7.2.9 vmlinux and with Ubuntu's stock 6.8.0-146-generic
+  booted from the disk (driver from DKMS), on a `conduit create` disk and on
+  a disk converted with `conduit stock-kernel`. The built-in runner cannot
+  boot the stock kernel (it loads only an uncompressed ELF vmlinux, with no
+  initrd), so VMs on their own kernel need QEMU.

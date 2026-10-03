@@ -1,5 +1,6 @@
 //! conduit: share your NVIDIA GPU with a Linux VM and see its desktop in a window.
 
+mod boot;
 mod create;
 mod doctor;
 mod host;
@@ -80,7 +81,7 @@ enum Cmd {
         /// Login name inside the VM
         #[arg(long, default_value = "root")]
         user: String,
-        /// Guest kernel to boot (if the disk's driver was built for a specific one)
+        /// Boot this kernel file (ELF vmlinux) instead of the one on the disk
         #[arg(long, value_name = "VMLINUX")]
         kernel: Option<PathBuf>,
         /// Share this NVIDIA user-space folder instead of staging the host's
@@ -90,6 +91,10 @@ enum Cmd {
         #[arg(long, value_name = "N")]
         net: Option<u8>,
     },
+    /// Switch a VM to its distro's own kernel: installs linux-image-generic,
+    /// headers, DKMS and the conduit-guest driver into its disk (VM stopped)
+    #[command(name = "stock-kernel")]
+    StockKernel { name: String },
     /// List your VMs
     List,
     /// Start a VM in the background (no window; `conduit view` opens one later)
@@ -269,6 +274,7 @@ fn main() {
                 net_index: net,
             })
         })(),
+        Cmd::StockKernel { name } => create::stock_kernel(&name),
         Cmd::List => list(),
         Cmd::Up {
             name,
@@ -362,6 +368,7 @@ mod tests {
             vec!["conduit", "ssh", "myvm", "nvidia-smi", "-L"],
             vec!["conduit", "import", "/x/rootfs.ext4", "lab", "--move"],
             vec!["conduit", "list"],
+            vec!["conduit", "stock-kernel", "lab"],
             vec!["conduit", "doctor"],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));

@@ -15,7 +15,7 @@ layout, so a layout change is made in one place.
 | `/opt/conduit/bin/conduit-vmm` | built-in VM runner (static musl in release builds) |
 | `/opt/conduit/bin/qemu-system-x86_64`, `share/qemu/` | bundled QEMU 11.1 |
 | `/opt/conduit/share/conduit/supported-drivers.txt` | driver releases with backend ABI tables (`conduit doctor`) |
-| `/opt/conduit/share/conduit/vmlinux`, `guest/virtio_gpu_nv.ko` | only when `GUEST_KERNEL_DIR` is set at stage time (built-in VMM's guest kernel; not built by CI yet) |
+| `/opt/conduit/share/conduit/guest/conduit-guest.deb` | the guest driver package `conduit create` and `conduit stock-kernel` install into VMs (built at stage time with nfpm) |
 | `/opt/conduit/libexec/conduit-integrate` | AppArmor/SELinux/desktop hookup (`enable`/`disable`) |
 | `/opt/conduit/lib/` | tarball only: the viewer's and QEMU's shared libraries |
 | `/opt/conduit/share/doc/conduit/` | LICENSE and every component's LICENSE/NOTICE |

@@ -182,6 +182,31 @@ fn get_image(local: Option<&Path>) -> Result<PathBuf> {
     Ok(file)
 }
 
+/// The conduit-guest package (DKMS) that goes into new VMs. In a source
+/// checkout it is built on first use (`packaging/build.sh package guest-deb`).
+fn guest_deb() -> Result<PathBuf> {
+    if let Some(p) = Tool::GuestDeb.find() {
+        return Ok(p);
+    }
+    if let Some(root) = paths::repo_root() {
+        if sys::have("nfpm") {
+            ui::info("building the conduit-guest package from this checkout");
+            let ok = Command::new(root.join("packaging/build.sh"))
+                .args(["package", "guest-deb"])
+                .stdout(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                if let Some(p) = Tool::GuestDeb.find() {
+                    return Ok(p);
+                }
+            }
+        }
+    }
+    Tool::GuestDeb.require()
+}
+
 /// Conduit's own ssh key, used to log in to (and cleanly shut down) VMs.
 pub fn ensure_ssh_key() -> Result<PathBuf> {
     let key = paths::ssh_key();
@@ -241,6 +266,7 @@ pub fn build_env(
 ) -> String {
     let n = c.net();
     let mut s = String::new();
+    s += &env_line("MODE", "create");
     s += &env_line("DISK", &c.disk_path().to_string_lossy());
     s += &env_line("SIZE_BYTES", &o.size.to_string());
     s += &env_line("TARBALL", &tarball.to_string_lossy());
@@ -302,10 +328,7 @@ pub fn create(o: CreateOpts) -> Result<()> {
             ));
         }
     }
-    let module = Tool::GuestModule.require()?;
-    if Tool::Kernel.find().is_none() {
-        ui::warn("the guest kernel was not found; the disk will be built, but `conduit up` needs it (see `conduit doctor`)");
-    }
+    let guest_deb = guest_deb()?;
     let need = 12u64 << 30;
     std::fs::create_dir_all(paths::data_dir())?;
     if let Some(free) = sys::free_bytes(&paths::data_dir()) {
@@ -342,46 +365,23 @@ pub fn create(o: CreateOpts) -> Result<()> {
     std::fs::create_dir_all(c.logs_dir())?;
 
     // Work folder handed to the root helper.
-    let work = paths::cache_dir().join(format!("build-{}", o.name));
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(work.join("guest"))?;
-    for (f, body) in GUEST_FILES {
-        std::fs::write(work.join("guest").join(f), body)?;
-    }
-    let script = work.join("build-disk.sh");
-    std::fs::write(&script, BUILD_SCRIPT)?;
-    std::fs::copy(&module, work.join("virtio_gpu_nv.ko")).context("copying the guest driver")?;
-    std::fs::write(work.join("authorized_keys"), authorized_keys()?)?;
     let meta = std::fs::metadata(paths::data_dir())?;
-    std::fs::write(
-        work.join("config.env"),
-        build_env(&o, &c, &tarball, &user, meta.uid(), meta.gid()),
-    )?;
+    let env = build_env(&o, &c, &tarball, &user, meta.uid(), meta.gid());
+    let work = prepare_work(&o.name, &env, &guest_deb)?;
+    std::fs::write(work.join("authorized_keys"), authorized_keys()?)?;
 
     sys::sudo_ready(
         "Building the VM disk: it is formatted and filled through a loop mount and a chroot,\n         \
          which only the administrator may do. Nothing outside the new disk file is changed.",
     )?;
     ui::info(format!(
-        "building {} ({}, {} desktop)",
+        "building {} ({}, {} desktop, Ubuntu's stock kernel)",
         o.name,
         ui::human_bytes(o.size),
         o.desktop
     ));
     let log = c.logs_dir().join("create.log");
-    // tee runs as you, so the log stays yours; only the build script runs as root.
-    let status = Command::new("bash")
-        .arg("-c")
-        .arg(format!(
-            "set -o pipefail; sudo bash {} {} 2>&1 | tee {}",
-            ui::shell_quote(&script.to_string_lossy()),
-            ui::shell_quote(&work.to_string_lossy()),
-            ui::shell_quote(&log.to_string_lossy())
-        ))
-        .status()
-        .context("could not run sudo")?;
-    let _ = std::fs::remove_dir_all(&work);
-    if !status.success() {
+    if !run_build(&work, &log)? {
         let _ = std::fs::remove_file(c.disk_path());
         return Err(oops(
             format!("building {} failed", o.name),
@@ -398,6 +398,94 @@ pub fn create(o: CreateOpts) -> Result<()> {
     println!("  open it:      conduit view {}", o.name);
     println!("  terminal:     conduit ssh {}", o.name);
     println!("  user / pass:  {user} / conduit  (change it with `passwd` inside the VM)");
+    Ok(())
+}
+
+/// Write the work folder build-disk.sh reads (script, guest files, package).
+fn prepare_work(name: &str, env: &str, guest_deb: &Path) -> Result<PathBuf> {
+    let work = paths::cache_dir().join(format!("build-{name}"));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(work.join("guest"))?;
+    for (f, body) in GUEST_FILES {
+        std::fs::write(work.join("guest").join(f), body)?;
+    }
+    std::fs::write(work.join("build-disk.sh"), BUILD_SCRIPT)?;
+    std::fs::copy(guest_deb, work.join("conduit-guest.deb"))
+        .with_context(|| format!("copying {}", guest_deb.display()))?;
+    std::fs::write(work.join("config.env"), env)?;
+    Ok(work)
+}
+
+/// Run build-disk.sh as root, its output shown and logged (tee runs as you).
+fn run_build(work: &Path, log: &Path) -> Result<bool> {
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "set -o pipefail; sudo bash {} {} 2>&1 | tee {}",
+            ui::shell_quote(&work.join("build-disk.sh").to_string_lossy()),
+            ui::shell_quote(&work.to_string_lossy()),
+            ui::shell_quote(&log.to_string_lossy())
+        ))
+        .status()
+        .context("could not run sudo")?;
+    let _ = std::fs::remove_dir_all(work);
+    Ok(status.success())
+}
+
+/// `conduit stock-kernel NAME`: give an existing VM disk the distro's own
+/// kernel (linux-image-generic + headers), DKMS and the conduit-guest package,
+/// then boot that kernel from now on instead of a kernel file.
+pub fn stock_kernel(name: &str) -> Result<()> {
+    let mut c = VmConfig::load(name)?;
+    if crate::run::is_running(name) {
+        return Err(oops(
+            format!("{name} is running"),
+            format!("Stop it first: conduit down {name}"),
+        ));
+    }
+    let disk = c.disk_path();
+    if in_use(&disk) {
+        return Err(oops(
+            format!("{} is in use by a running program", disk.display()),
+            "Stop whatever has it open (another VM runner?) first",
+        ));
+    }
+    let guest_deb = guest_deb()?;
+    let meta = std::fs::metadata(&disk)?;
+    let mut env = String::new();
+    env += &env_line("MODE", "convert");
+    env += &env_line("DISK", &disk.to_string_lossy());
+    env += &env_line("OWNER_UID", &meta.uid().to_string());
+    env += &env_line("OWNER_GID", &meta.gid().to_string());
+    let work = prepare_work(&format!("{name}-convert"), &env, &guest_deb)?;
+    sys::sudo_ready(
+        "Converting the VM disk: it is changed through a loop mount and a chroot,\n         \
+         which only the administrator may do. Nothing outside the disk file is changed.",
+    )?;
+    ui::info(format!(
+        "installing the stock Ubuntu kernel, headers, DKMS and conduit-guest into {name}"
+    ));
+    std::fs::create_dir_all(c.logs_dir())?;
+    let log = c.logs_dir().join("convert.log");
+    if !run_build(&work, &log)? {
+        return Err(oops(
+            format!("converting {name} failed"),
+            format!("The full log is in {}", log.display()),
+        ));
+    }
+    let old = c.kernel.take();
+    c.save()?;
+    let boot = crate::boot::resolve(&c)?;
+    println!();
+    println!("{name} now boots {}.", boot.describe());
+    if let Some(k) = old {
+        println!(
+            "  (it booted {} before; to go back, set \"kernel\" in {} again)",
+            k.display(),
+            c.dir().join("vm.json").display()
+        );
+    }
+    println!("  start it: conduit up {name}   (the stock kernel needs the QEMU runner)");
     Ok(())
 }
 
@@ -516,11 +604,13 @@ pub fn import(o: ImportOpts) -> Result<()> {
         "  It must use the static address {} with gateway {} inside (this is VM network #{}).",
         n.guest_ip, n.host_ip, net_index
     );
-    if c.kernel.is_none() && Tool::Kernel.find().is_none() {
-        println!(
-            "  Note: no guest kernel found. Set one with --kernel, or edit \"kernel\" in {}",
-            c.dir().join("vm.json").display()
-        );
+    if c.kernel.is_none() {
+        match crate::boot::resolve(&c) {
+            Ok(b) => println!("  It boots {}.", b.describe()),
+            Err(_) => println!(
+                "  Note: the disk has no kernel in /boot. Install one inside it (linux-image-generic), or boot a kernel file with --kernel."
+            ),
+        }
     }
     println!("  Start it: conduit view {}", o.name);
     Ok(())

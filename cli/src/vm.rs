@@ -21,7 +21,8 @@ pub struct VmConfig {
     pub user: String,
     #[serde(default)]
     pub desktop: String,
-    /// Guest kernel; empty = the one Conduit ships.
+    /// Kernel file to boot (an ELF vmlinux); empty = the one installed on the
+    /// VM's own disk (needs QEMU). See boot.rs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel: Option<PathBuf>,
     /// Extra kernel command line.
@@ -139,17 +140,6 @@ impl VmConfig {
         let tmp = self.dir().join(".vm.json.tmp");
         std::fs::write(&tmp, serde_json::to_string_pretty(self)? + "\n")?;
         std::fs::rename(&tmp, &f).with_context(|| format!("saving {}", f.display()))
-    }
-
-    pub fn kernel_path(&self) -> Result<PathBuf> {
-        match &self.kernel {
-            Some(k) if k.is_file() => Ok(k.clone()),
-            Some(k) => Err(oops(
-                format!("the kernel set for this VM is missing: {}", k.display()),
-                format!("Fix \"kernel\" in {}", self.dir().join("vm.json").display()),
-            )),
-            None => paths::Tool::Kernel.require(),
-        }
     }
 }
 

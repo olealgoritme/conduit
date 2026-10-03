@@ -8,8 +8,8 @@ Before=gdm.service display-manager.service systemd-user-sessions.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# The driver is built for the kernel Conduit boots; a packaged (DKMS) module wins if present.
-ExecStart=/bin/sh -c "modprobe virtio_gpu_nv 2>/dev/null || insmod /opt/conduit-guest/virtio_gpu_nv.ko"
+# The driver comes from the conduit-guest package (DKMS builds it for each kernel).
+ExecStart=/sbin/modprobe virtio_gpu_nv
 ExecStart=/bin/sh -c "mountpoint -q /mnt/nvidia || mount -t virtiofs -o ro nvidia /mnt/nvidia"
 ExecStart=/sbin/ldconfig
 ExecStart=-/bin/udevadm settle -t 10

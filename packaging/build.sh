@@ -22,8 +22,6 @@
 #   LINK_DIR           where the `conduit` command symlink goes (default /usr/bin;
 #                      the tarball uses /usr/local/bin)
 #   QEMU_BUILD_SCRIPT  default host/qemu/build-qemu.sh, see "QEMU" in docs/PACKAGING.md
-#   GUEST_KERNEL_DIR   optional: dir with vmlinux + virtio_gpu_nv.ko for the
-#                      built-in VMM, staged to /opt/conduit/share/conduit/
 #   JOBS               parallel build jobs (default: nproc)
 #
 # The upstream binary names are variables because the components are being
@@ -198,7 +196,8 @@ cmd_qemu() {
 # --------------------------------------------------------------- stage -----
 # Lays out the complete install tree under $STAGE, as it will be on disk:
 #   /opt/conduit/bin/{conduit,conduit-backend,conduit-userspace,conduit-viewer,conduit-vmm,qemu-system-x86_64}
-#   /opt/conduit/share/conduit/supported-drivers.txt (+ vmlinux, guest/*.ko if GUEST_KERNEL_DIR)
+#   /opt/conduit/share/conduit/supported-drivers.txt
+#   /opt/conduit/share/conduit/guest/conduit-guest.deb (what `conduit create` installs in VMs)
 #   /opt/conduit/share/qemu/...            (bundled QEMU data)
 #   /opt/conduit/libexec/conduit-integrate (AppArmor/SELinux/desktop hookup)
 #   /opt/conduit/share/conduit/...         (desktop entry, AppArmor sources)
@@ -231,10 +230,19 @@ cmd_stage() {
             | sed -E 's/^v//; s/\.rs$//; s/_/./g' | sort -V
     } > "$o/share/conduit/supported-drivers.txt"
 
-    # Guest kernel + module for the built-in VMM, when one has been built.
-    if [ -n "${GUEST_KERNEL_DIR:-}" ]; then
-        install -D -m0644 "$GUEST_KERNEL_DIR/vmlinux" "$o/share/conduit/vmlinux"
-        install -D -m0644 "$GUEST_KERNEL_DIR/virtio_gpu_nv.ko" "$o/share/conduit/guest/virtio_gpu_nv.ko"
+    # The guest driver package `conduit create` / `conduit stock-kernel`
+    # install into VMs (DKMS builds it there for the VM's stock kernel).
+    local gdeb="$OUT/conduit-guest_${v}-1_all.deb"
+    if [ ! -f "$gdeb" ] && command -v nfpm >/dev/null; then
+        install -d "$OUT"; render_scripts
+        cmd_guest_src
+        render_nfpm "$PKG/nfpm/conduit-guest.yaml" "$DIST/nfpm-conduit-guest.yaml" ""
+        nfpm package --config "$DIST/nfpm-conduit-guest.yaml" --packager deb --target "$gdeb" >/dev/null
+    fi
+    if [ -f "$gdeb" ]; then
+        install -D -m0644 "$gdeb" "$o/share/conduit/guest/conduit-guest.deb"
+    else
+        log "warning: no conduit-guest .deb (nfpm missing); \`conduit create\` will not work from this install"
     fi
 
     install -m0755 "$PKG/common/conduit-integrate" "$o/libexec/conduit-integrate"
