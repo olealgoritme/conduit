@@ -175,7 +175,7 @@ struct nb_config {
     int         resize_mode;    /* NB_RESIZE_*: what a windowed resize does */
 };
 
-#define NB_RESIZE_SCALE 0       /* default: scale the full guest picture     */
+#define NB_RESIZE_SCALE 0       /* scale the full guest picture into the window */
 #define NB_RESIZE_GUEST 1       /* the guest's mode follows the window       */
 
 #define NB_OVERLAY_WINDOWED 0   /* default: shown windowed, hidden fullscreen */

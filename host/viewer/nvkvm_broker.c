@@ -3057,9 +3057,9 @@ static void usage(void)
 "                       out directly) or off (starts hidden).  Direct mode\n"
 "                       hides it.  The window title always carries the numbers\n"
 "  --resize=MODE        what a windowed resize does (CTRL+ALT+R toggles):\n"
-"                       scale (default) fits the full guest picture into the\n"
-"                       window, aspect kept; guest asks the guest to switch to\n"
-"                       the window's size (debounced while dragging).\n"
+"                       guest (default) asks the guest to switch to the\n"
+"                       window's size (debounced while dragging); scale keeps\n"
+"                       the guest's mode and fits it into the window.\n"
 "                       Fullscreen always asks for the output's exact mode\n"
 "  --direct-mode=on|off start in direct mode (CTRL+ALT+D toggles): overlay\n"
 "                       hidden, tearing ASYNC, the guest asked for the output's\n"
@@ -3266,6 +3266,7 @@ int main(int argc, char **argv)
     sigset_t mask;
 
     memset(&cfg, 0, sizeof(cfg));
+    cfg.resize_mode = NB_RESIZE_GUEST;    /* the VM follows the window; --resize=scale keeps its mode */
     cfg.backend = "auto";
     cfg.scale_mode = NB_SCALE_ASPECT;   /* preserve aspect, black bars */
     cfg.socket_mode = 0600;
