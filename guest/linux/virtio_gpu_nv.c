@@ -13,6 +13,7 @@
 
 #include <drm/drm.h>
 #include <linux/cdev.h>
+#include <linux/compat.h>
 #include <linux/completion.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
@@ -1372,6 +1373,63 @@ static long nvgpu_dri_ioctl(struct file *filp, unsigned int cmd,
   /* NVIDIA-type and everything else → proxy to host */
   return nvgpu_ioctl(filp, cmd, arg);
 }
+
+#ifdef CONFIG_COMPAT
+/*
+ * struct drm_version as a 32-bit process lays it out: size_t and pointers are
+ * four bytes, so the native handler would read the lengths and pointers from
+ * the wrong offsets and write a 64-bit struct over a 36-byte buffer.
+ */
+struct nvgpu_drm_version32 {
+  int version_major;
+  int version_minor;
+  int version_patchlevel;
+  u32 name_len;
+  compat_uptr_t name;
+  u32 date_len;
+  compat_uptr_t date;
+  u32 desc_len;
+  compat_uptr_t desc;
+};
+
+static int nvgpu_drm_fill_str32(compat_uptr_t buf, u32 *len, const char *s) {
+  size_t sl = strlen(s);
+
+  if (*len >= sl && buf && copy_to_user(compat_ptr(buf), s, sl))
+    return -EFAULT;
+  *len = sl;
+  return 0;
+}
+
+static long nvgpu_drm_version32(void __user *uarg) {
+  struct nvgpu_drm_version32 v;
+
+  if (copy_from_user(&v, uarg, sizeof(v)))
+    return -EFAULT;
+  v.version_major = 0;
+  v.version_minor = 1;
+  v.version_patchlevel = 0;
+  if (nvgpu_drm_fill_str32(v.name, &v.name_len, "nvidia-drm") ||
+      nvgpu_drm_fill_str32(v.date, &v.date_len, "20240101") ||
+      nvgpu_drm_fill_str32(v.desc, &v.desc_len, "NVIDIA DRM stub"))
+    return -EFAULT;
+  if (copy_to_user(uarg, &v, sizeof(v)))
+    return -EFAULT;
+  return 0;
+}
+
+/*
+ * 32-bit callers on the fallback /dev/dri nodes. The only core DRM ioctl
+ * answered here is VERSION, whose struct differs between 32 and 64 bit; the
+ * nvidia-drm driver range and the RM ioctls use fixed-width layouts.
+ */
+static long nvgpu_dri_compat_ioctl(struct file *filp, unsigned int cmd,
+                                   unsigned long arg) {
+  if (_IOC_TYPE(cmd) == DRM_IOCTL_BASE && _IOC_NR(cmd) == 0x00)
+    return nvgpu_drm_version32(compat_ptr(arg));
+  return nvgpu_dri_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
+}
+#endif
 
 /* ───────── Virtqueue communication ───────── */
 
@@ -4717,7 +4775,9 @@ static const struct file_operations nvgpu_dri_fops = {
     .open = nvgpu_dri_open,
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_dri_ioctl,
-    .compat_ioctl = nvgpu_dri_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = nvgpu_dri_compat_ioctl,
+#endif
     .mmap = nvgpu_mmap,
     .poll = nvgpu_poll,
 };
@@ -4884,6 +4944,30 @@ static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
   return nvgpu_ioctl_fd(nfd, cmd, arg);
 }
 
+#ifdef CONFIG_COMPAT
+/*
+ * 32-bit callers (Steam's client, Wine/Proton's 32-bit side). Core DRM
+ * structs differ between 32 and 64 bit -- drm_version and drm_unique carry
+ * size_t lengths and pointers, and several KMS structs are packed differently
+ * -- so the core ioctls go through drm_compat_ioctl(), which converts them
+ * as it does for every other DRM driver. Handing them to drm_ioctl() as they
+ * are made libdrm's drmGetVersion() read garbage lengths and crash in strdup.
+ *
+ * The nvidia-drm driver range and the RM ioctls use fixed-width layouts
+ * (NvU64 for pointers), the same in both, which is also how nvidia-drm.ko
+ * handles them.
+ */
+static long nvgpu_drm_compat_ioctl(struct file *filp, unsigned int cmd,
+                                   unsigned long arg) {
+  unsigned int nr = _IOC_NR(cmd);
+
+  if (_IOC_TYPE(cmd) == DRM_IOCTL_BASE &&
+      (nr < DRM_COMMAND_BASE || nr >= DRM_COMMAND_END))
+    return drm_compat_ioctl(filp, cmd, arg);
+  return nvgpu_drm_unlocked_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
+}
+#endif
+
 static const struct file_operations nvgpu_drm_fops = {
     .owner = THIS_MODULE,
 #if defined(FOP_UNSIGNED_OFFSET)
@@ -4892,7 +4976,9 @@ static const struct file_operations nvgpu_drm_fops = {
     .open = drm_open,
     .release = drm_release,
     .unlocked_ioctl = nvgpu_drm_unlocked_ioctl,
-    .compat_ioctl = nvgpu_drm_unlocked_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = nvgpu_drm_compat_ioctl,
+#endif
     .mmap = drm_gem_mmap,
     .poll = drm_poll,
     .read = drm_read,
