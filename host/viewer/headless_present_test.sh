@@ -44,7 +44,7 @@
 set -u
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-BROKER="$DIR/nvkvm-display-broker"
+BROKER="$DIR/conduit-viewer"
 DMASRC="$DIR/nvkvm-broker-dmabuf-src"
 FRAMES=10
 rc=0

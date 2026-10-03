@@ -11,6 +11,7 @@ host/qemu/build/
 host/qemu/build.log
 host/viewer/*.o
 host/viewer/*.d
+host/viewer/conduit-viewer
 host/viewer/nvkvm-display-broker
 host/viewer/nvgpu-scanout-test
 guest/linux/*.ko

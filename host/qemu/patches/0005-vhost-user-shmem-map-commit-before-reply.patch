@@ -1,0 +1,31 @@
+--- a/hw/virtio/vhost-user.c	2026-10-03 20:22:30.349705438 +0200
++++ b/hw/virtio/vhost-user.c	2026-10-03 20:22:30.357000952 +0200
+@@ -2019,17 +2019,25 @@
+     }
+ 
+ send_reply_commit:
+-    /* Send reply and commit after transaction started */
++    /*
++     * Commit first, then reply. The reply tells the backend the mapping is
++     * in place, and the backend tells the guest, which may touch the range
++     * at once. Replying before the commit leaves a window in which the KVM
++     * memory slot does not exist yet: guest writes there land in a hole and
++     * are dropped (on virtio-nvgpu: corrupted push buffers and shader
++     * headers, Xid 13/32). The commit sends nothing to the backend, because
++     * shared memory mappings are kept out of the vhost memory table, so it
++     * cannot deadlock against a backend waiting for this reply.
++     */
++    memory_region_transaction_commit();
+     if (hdr->flags & VHOST_USER_NEED_REPLY_MASK) {
+         payload->u64 = !!ret;
+         hdr->size = sizeof(payload->u64);
+         if (!vhost_user_send_resp(ioc, hdr, payload, &local_err)) {
+             error_report_err(local_err);
+-            memory_region_transaction_commit();
+             return -EFAULT;
+         }
+     }
+-    memory_region_transaction_commit();
+     return 0;
+ 
+ send_reply:

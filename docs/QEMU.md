@@ -1,8 +1,13 @@
 # Running the virtio-nvgpu device under QEMU
 
-virtio-nvgpu has two hosts. One is nesbox, which has the device built in. The
-other is QEMU 11.1 or later, through the generic vhost-user device. This page
-covers QEMU. The guest kernel, driver, userspace and disk are the same for
+Conduit has two VM runners. QEMU 11.1 (patched, see `host/qemu`) is the
+default: `conduit up NAME` / `conduit view NAME` start it with everything on
+this page, plus a virtio-sound card and a QMP socket for a clean ACPI
+shutdown. The built-in runner `conduit-vmm` (from nesbox, which has the device
+built in) is the fallback when the bundled QEMU is missing, or with
+`--vmm builtin`; it has no sound. This page is the QEMU command line `conduit`
+uses (`$XDG_RUNTIME_DIR/conduit/NAME/qemu.args` holds the exact one of a
+running VM), for running it by hand or from libvirt. The guest kernel, driver, userspace and disk are the same for
 both.
 
 ## What you need
@@ -10,15 +15,16 @@ both.
 | piece | where |
 | --- | --- |
 | QEMU 11.1.x with the Conduit patches | `host/qemu/build-qemu.sh` (see `host/qemu/README.md`). It builds `host/qemu/build/qemu-system-x86_64`, and `--install` puts it in `/opt/conduit/bin`. |
-| backend with GET_SHMEM_CONFIG support | virtio-nvgpu branch `qemu11`, `cargo build --release -p device --features vhost-user --bin vhost-user-nvgpu` |
+| backend (`conduit-backend`) | `cd host/backend && cargo build --release -p device --features vhost-user --bin conduit-backend` |
 | virtiofsd (NVIDIA userspace share) | `/usr/libexec/virtiofsd` (Ubuntu package `virtiofsd`) |
 | guest kernel | `~/code/nvgpu-lab/linux-7.2.9/vmlinux` (ELF with `CONFIG_PVH=y`, which QEMU `-kernel` boots directly) |
 | guest disk | `~/code/nvgpu-lab/rootfs-ssh.ext4` (a bare ext4 filesystem with no partition table or bootloader. It mounts as `/dev/vda`) |
 
 **Stock QEMU 11.1 does not work.** It aborts on the guest's first device
 config read, because it caps vhost-user config at 256 bytes and nvgpu's is
-4036. Patch `0001` is required. Patches `0002` to `0004` fix correctness for
-the window, CUDA in the aperture, and MSI-X. `host/qemu/README.md` explains
+4036. Patch `0001` is required. Patches `0002` to `0005` fix correctness for
+the window, CUDA in the aperture, MSI-X, and mapping order (without 0005
+every Vulkan submit fails: Xid 13/32). `host/qemu/README.md` explains
 each one.
 
 Don't run this VM while nesbox has the same `rootfs-ssh.ext4` open. Two
@@ -32,7 +38,7 @@ virtiofsd (it listens), then QEMU (it connects to both).
 ```sh
 LAB=$HOME/code/nvgpu-lab
 QEMU=$HOME/code/conduit/host/qemu/build/qemu-system-x86_64   # or /opt/conduit/bin/...
-BACKEND=$HOME/code/virtio-nvgpu-qemu/target/release/vhost-user-nvgpu
+BACKEND=$HOME/code/conduit/host/backend/target/release/conduit-backend
 RUN=${XDG_RUNTIME_DIR:-/tmp}/conduit; mkdir -p "$RUN"
 
 # 1. GPU backend. Add --display WxH@HZ --display-socket PATH for the scanout.
@@ -203,15 +209,11 @@ layout below needs no driver change.
 
 ## Open risks
 
-- **Mapping is asynchronous.** The backend doesn't negotiate `REPLY_ACK`,
-  so `SHMEM_MAP` is fire-and-forget. The guest's mmap reply can arrive
-  before QEMU's main loop has placed the memory, and an access in that gap
-  reads the hole. nesbox has the same gap, but QEMU handles backend
-  requests on its main loop under the BQL, so the gap may be wider.
-  Turning on `REPLY_ACK` naively risks a deadlock. The vring thread waits
-  for QEMU while holding the backend's write lock, and QEMU's vCPU thread
-  can at the same moment be waiting on a `GET_CONFIG`, whose reply needs
-  the read lock.
+- **Mapping order (fixed by patch 0005).** The backend negotiates
+  `REPLY_ACK` (the vhost crate always offers it), so `SHMEM_MAP` waits for
+  QEMU's answer. Stock 11.1 answers before it commits the memory region, so
+  the guest could touch a mapping before KVM had it, and those writes were
+  dropped. Patch 0005 commits first.
 - **A failed map stays invisible.** For the same reason, a mapping QEMU
   rejects (for example a UVM pool on stock QEMU) appears only in QEMU's
   stderr. The guest gets success and finds a hole.
@@ -220,6 +222,8 @@ layout below needs no driver change.
   display-mode read, and nothing breaks.
 - **Patch 0003 is outside the spec.** It is a Conduit extension. Until it
   is upstreamed, compute through UVM depends on the patched QEMU.
-- **Nothing here has run yet.** QEMU and the backend are built and the unit
-  tests pass. No VM was started for this page, because the GPU host was in
-  use.
+- **Tested** on an RTX 5090 host (driver 610.57.04, Ubuntu 24.04 host,
+  QEMU 11.1.2 + patches 0001-0005): `conduit up NAME --vmm qemu` boots, the
+  guest module probes, `vulkaninfo` lists the RTX 5090, the offscreen Vulkan
+  draw test passes (fence, pixels), the virtio-sound card shows one playback
+  and one capture stream, and `conduit down` powers off through ACPI.

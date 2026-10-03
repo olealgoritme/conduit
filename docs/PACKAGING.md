@@ -80,9 +80,9 @@ These are assumptions the packaging makes. Change them here and in
 `build.sh` together.
 
 **Binary names.** `build.sh` (top) and `flake.nix` hold the upstream names as
-variables: `BACKEND_BIN_SRC=vhost-user-nvgpu` (cargo package `device`,
-feature `vhost-user`), `VIEWER_BIN_SRC=nvkvm-display-broker`,
-`VMM_BIN_SRC=nesbox` (built with `--no-default-features`),
+variables: `BACKEND_BIN_SRC=conduit-backend` (cargo package `device`,
+feature `vhost-user`), `VIEWER_BIN_SRC=conduit-viewer`,
+`VMM_BIN_SRC=conduit-vmm` (built with `--no-default-features`),
 `CLI_BIN_SRC=conduit`. When a component is renamed, change the variable;
 installed names (`conduit-*`) stay.
 

@@ -16,7 +16,7 @@
 set -u
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-BROKER="$DIR/nvkvm-display-broker"
+BROKER="$DIR/conduit-viewer"
 CLIENT="$DIR/nvkvm-broker-testclient"
 TMP="$(mktemp -d)"
 FAIL=0

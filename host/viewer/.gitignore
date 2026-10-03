@@ -1,3 +1,4 @@
+conduit-viewer
 nvkvm-display-broker
 nvkvm-broker-testclient
 *.o

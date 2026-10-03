@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0 OR Apache-2.0
 #
-# nvkvm-display-broker
+# conduit-viewer (formerly nvkvm-display-broker)
 #
 # Backends are compiled in only when their libraries are present, and the build
 # PRINTS which ones it kept.  A missing backend must be visible at build time,
@@ -23,7 +23,7 @@
 
 PKG_CONFIG ?= pkg-config
 PREFIX     ?= /usr/local
-BIN         = nvkvm-display-broker
+BIN         = conduit-viewer
 TESTCLIENT  = nvkvm-broker-testclient
 RELAY       = nvkvm-broker-relay
 DMASRC      = nvkvm-broker-dmabuf-src
@@ -126,7 +126,7 @@ SCANTEST    = nvgpu-scanout-test
 all: report $(BIN) $(TESTCLIENT) $(RELAY) $(if $(HAVE_GBM),$(DMASRC),) $(if $(HAVE_SCANTEST),$(SCANTEST),)
 
 report:
-	@echo "nvkvm-display-broker backends:"
+	@echo "conduit-viewer backends:"
 	@echo "  scanout test source : $(if $(HAVE_SCANTEST),yes (gbm+egl+glesv2),NO - apt install libgbm-dev libegl-dev libgles-dev)"
 	@echo "  dma-buf test source : $(if $(HAVE_GBM),yes (libgbm),NO - apt install libgbm-dev)"
 	@echo "  wayland : $(if $(HAVE_WL),yes,NO - install libwayland-dev wayland-protocols)"

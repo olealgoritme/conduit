@@ -52,9 +52,12 @@ conduit view myvm
 That's it. The VM gets your monitor's resolution and refresh rate
 automatically.
 
-> **Older systems** (for example Ubuntu 24.04, whose QEMU is too old): the
-> package brings its own VM runner, so nothing else needs installing or
-> upgrading. Your system QEMU is never touched.
+> **VM runner:** the package brings its own QEMU 11.1 (in `/opt/conduit`), so
+> it works on systems whose QEMU is too old (for example Ubuntu 24.04). Your
+> system QEMU is never touched. The VM gets a sound card (speakers and
+> microphone) through your desktop's PipeWire or PulseAudio. If that QEMU is
+> missing, Conduit falls back to its small built-in runner, which has no sound
+> (`--vmm builtin` picks it on purpose).
 
 ### Keys inside the viewer
 

@@ -8,9 +8,10 @@ conduit/
 │   │              (from virtio-nvgpu: device/, protocol/, gen/)
 │   ├── viewer/    C. The Wayland window: zero-copy frames, input, overlay.
 │   │              (from nvkvm-pv's display broker)
-│   ├── vmm/       Rust. Small built-in VM runner (from nesbox), used when
-│   │              QEMU is too old.
-│   └── qemu/      Build script + patches for the bundled QEMU 11.1.
+│   ├── vmm/       Rust. Small built-in VM runner `conduit-vmm` (from
+│   │              nesbox), the fallback when the bundled QEMU is missing.
+│   └── qemu/      Build script + patches for the bundled QEMU 11.1, the
+│                  default VM runner (`conduit up/view --vmm qemu|builtin`).
 ├── guest/
 │   ├── linux/     C. The guest kernel module (virtio GPU, KMS display,
 │   │              input, clipboard device). Packaged with DKMS.

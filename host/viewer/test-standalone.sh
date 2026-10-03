@@ -26,7 +26,7 @@ HYPR_PID="$(pgrep -x Hyprland | head -1 || true)"
 VARGS=(--backend wayland --socket "$SOCK" --size "$SIZE" --title "virtio-nvgpu test"
        --present-mode=native --stats --seq-usec)
 [ "${NVGPU_TEST_FULLSCREEN:-0}" = 1 ] && VARGS+=(--fullscreen)
-"$DIR/nvkvm-display-broker" "${VARGS[@]}" >"$OUT/viewer.log" 2>&1 &
+"$DIR/conduit-viewer" "${VARGS[@]}" >"$OUT/viewer.log" 2>&1 &
 VPID=$!
 for _ in $(seq 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
 [ -S "$SOCK" ] || { echo "viewer did not come up:"; cat "$OUT/viewer.log"; exit 1; }

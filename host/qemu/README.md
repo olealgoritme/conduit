@@ -2,7 +2,7 @@
 
 `build-qemu.sh` fetches QEMU, checks the tarball, applies the patches in
 `patches/`, and builds a small `qemu-system-x86_64`: x86_64-softmmu only,
-KVM (no TCG), vhost-user, virtio, slirp, VNC. GTK, SDL, SPICE and OpenGL are
+KVM (no TCG), vhost-user, virtio, slirp, VNC, PipeWire/PulseAudio audio. GTK, SDL, SPICE and OpenGL are
 off, because the guest display is the zero-copy nvgpu scanout shown by the
 Conduit viewer.
 
@@ -14,7 +14,7 @@ host/qemu/build-qemu.sh --stock              # no patches (cannot host nvgpu)
 ```
 
 Options: `--version X.Y.Z` (default 11.1.2; anything older than 11.1 is
-refused), `--prefix DIR` (default `/opt/conduit`), `--no-slirp`, `--jobs N`.
+refused), `--prefix DIR` (default `/opt/conduit`), `--no-slirp`, `--no-audio`, `--jobs N`.
 The compile runs under `nice -n 10`. Nothing is installed without
 `--install`.
 
@@ -45,14 +45,20 @@ correctness and performance.
 | 0002 vhost: keep shmem mappings out of the mem table | QEMU sends every fd-backed RAM region back to the backend as guest memory, including the mappings the backend placed with SHMEM_MAP. The backend would then mmap its own `/dev/nvidia*` fds a second time. That can fail, and if it does, `vhost-user-backend` exits. It also uses up the 8 memory-table slots. |
 | 0003 vhost-user: fixed-VA shmem mappings | nvidia-uvm only accepts a mapping whose address equals its file offset. QEMU picks the mapping address itself, so CUDA semaphore pools could never be mapped into the aperture. This patch adds a non-spec `flags` bit 1 meaning "map at `fd_offset`" (with `MAP_FIXED_NOREPLACE` and `MADV_POPULATE_WRITE`), which is what nesbox does. The backend sets the bit only for a frontend that sent `GET_SHMEM_CONFIG`. |
 | 0004 vhost-user-test-device-pci: vectors | The stock device hard-codes 1 MSI-X vector. A guest driver with 2 queues then falls back to INTx. With this patch the default is `num_vqs + 1`, and a `vectors=` property is added. |
+| 0005 vhost-user: commit a shmem mapping before replying | QEMU acks `SHMEM_MAP` before it commits the memory transaction, so the KVM memory slot appears only after the backend has told the guest the mapping exists. Guest writes in that gap land in a hole and are dropped: on virtio-nvgpu that showed up as corrupted push buffers and shader headers (Xid 32 / Xid 13, every Vulkan submit failed its fence). Committing first is safe because patch 0002 keeps these mappings out of the vhost memory table, so the commit sends nothing to the backend that is waiting for the reply. |
 
 ## Build dependencies (Ubuntu 24.04)
 
 ```sh
 sudo apt install build-essential ninja-build python3-venv pkg-config \
   libglib2.0-dev libpixman-1-dev zlib1g-dev flex bison \
-  libslirp-dev libfdt-dev curl gnupg xz-utils patch
+  libslirp-dev libfdt-dev curl gnupg xz-utils patch \
+  libpipewire-0.3-dev libpulse-dev
 ```
+
+Audio: the build has the PipeWire and PulseAudio backends (`-audiodev
+pipewire` / `pa`), so the VM gets a virtio-sound card with speakers and a
+microphone. `--no-audio` builds without them (and drops the two -dev packages).
 
 QEMU ships its own meson. `libslirp-dev` is only needed when slirp is
 enabled, i.e. without `--no-slirp`.

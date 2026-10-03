@@ -26,10 +26,10 @@
 
       # Upstream binary names; change here when the components are renamed
       # (same variables as packaging/build.sh).
-      backendBin = "vhost-user-nvgpu";
+      backendBin = "conduit-backend";
       userspaceBin = "nvgpu-userspace";
-      viewerBin = "nvkvm-display-broker";
-      vmmBin = "nesbox";
+      viewerBin = "conduit-viewer";
+      vmmBin = "conduit-vmm";
 
       # nixpkgs' Rust is used rather than the rust-toolchain.toml pin (1.90.0);
       # nixos-unstable is newer, and the code needs nothing beyond stable.
@@ -46,7 +46,6 @@
         buildFeatures = [ "vhost-user" ];
         cargoBuildFlags = [ "-p" "device" "--bin" backendBin "--bin" userspaceBin ];
         postInstall = ''
-          mv $out/bin/${backendBin} $out/bin/conduit-backend
           mv $out/bin/${userspaceBin} $out/bin/conduit-userspace
         '';
       };
@@ -60,7 +59,6 @@
         cargoLock.allowBuiltinFetchGit = true;
         buildNoDefaultFeatures = true;
         cargoBuildFlags = [ "--bin" vmmBin ];
-        postInstall = ''mv $out/bin/${vmmBin} $out/bin/conduit-vmm'';
       };
 
       # cli/ is a member of the workspace at the repo root.

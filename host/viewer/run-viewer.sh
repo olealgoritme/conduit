@@ -9,11 +9,11 @@
 #   run-viewer.sh --overlay=windowed          # extra args go to the broker
 #
 # The backend then connects with:
-#   vhost-user-nvgpu ... --display-socket "$NVGPU_DISPLAY_SOCK"
+#   conduit-backend ... --display-socket "$NVGPU_DISPLAY_SOCK"
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-BIN="$DIR/nvkvm-display-broker"
+BIN="$DIR/conduit-viewer"
 SOCK="${NVGPU_DISPLAY_SOCK:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nvgpu-display.sock}"
 SIZE="${NVGPU_VIEWER_SIZE:-2560x1440}"
 
