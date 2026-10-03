@@ -1852,6 +1852,30 @@ out:
  * A guest descriptor means nothing on the other side. Anything that names an
  * open file has to name it by the handle the backend issued when we opened it.
  */
+static const struct file_operations nvgpu_gpu_fops, nvgpu_ctl_fops,
+    nvgpu_uvm_fops, nvgpu_modeset_fops, nvgpu_dri_fops, nvgpu_drm_fops;
+
+/*
+ * The nvgpu_fd behind a descriptor the caller handed us, or NULL when it is
+ * not one of this driver's files. Callers pass descriptors of every kind
+ * (eventfds, sockets, other drivers' nodes); reading ->private_data of a file
+ * we do not own as an nvgpu_fd is reading some other driver's structure.
+ */
+static struct nvgpu_fd *nvgpu_fd_of_file(struct file *f) {
+  if (!f)
+    return NULL;
+  if (f->f_op == &nvgpu_gpu_fops || f->f_op == &nvgpu_ctl_fops ||
+      f->f_op == &nvgpu_uvm_fops || f->f_op == &nvgpu_modeset_fops ||
+      f->f_op == &nvgpu_dri_fops)
+    return f->private_data;
+  if (f->f_op == &nvgpu_drm_fops) {
+    struct drm_file *df = f->private_data;
+
+    return df ? df->driver_priv : NULL;
+  }
+  return NULL;
+}
+
 static int nvgpu_handle_for_fd(int guest_fd, u32 *handle) {
   struct file *f;
   struct nvgpu_fd *other;
@@ -1863,7 +1887,7 @@ static int nvgpu_handle_for_fd(int guest_fd, u32 *handle) {
   if (!f)
     return -EBADF;
 
-  other = f->private_data;
+  other = nvgpu_fd_of_file(f);
   if (!other) {
     fput(f);
     return -EINVAL;
@@ -2425,7 +2449,7 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
           struct file *ev_file = fget(event_fd);
 
           if (ev_file) {
-            struct nvgpu_fd *ev_nfd = ev_file->private_data;
+            struct nvgpu_fd *ev_nfd = nvgpu_fd_of_file(ev_file);
 
             if (ev_nfd) {
               u32 handle = ev_nfd->handle;
@@ -2525,7 +2549,7 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
       goto out;
     }
 
-    other_nfd = other_file->private_data;
+    other_nfd = nvgpu_fd_of_file(other_file);
     if (!other_nfd) {
       fput(other_file);
       ret = -EINVAL;
@@ -3483,7 +3507,8 @@ static int nvgpu_open_common(struct inode *inode, struct file *filp,
     kfree(resp);
     if (ret < 0)
       return ret;
-    return (s32)le32_to_cpu((__le32)resp->hdr.status);
+    ret = (s32)le32_to_cpu((__le32)resp->hdr.status);
+    return ret < 0 ? ret : -EIO;
   }
 
   nfd->handle = le32_to_cpu(resp->hdr.handle);
@@ -4608,7 +4633,10 @@ static struct proc_dir_entry *nvgpu_proc_mkdir_parents(char *pathbuf,
       strlcat(built, "/", sizeof(built));
     strlcat(built, p, sizeof(built));
 
-    parent = nvgpu_proc_mkdir_cached(built, NULL);
+    /* /proc/driver is the kernel's own (proc_root_init); creating it again
+     * trips "already registered". Only directories below it are ours. */
+    if (strcmp(built, "driver") != 0)
+      parent = nvgpu_proc_mkdir_cached(built, NULL);
 
     if (next) {
       *next = '/';
