@@ -1,0 +1,29 @@
+host/broker/ -- virtio-nvgpu scanout viewer
+
+This directory is a vendored copy of the display broker from nvkvm-pv
+(src/broker/, src/common/nvkvm_broker_proto.h, src/common/nvkvm_uidmap.h,
+docs/reference/broker-protocol.md, docs/internal/broker-design.md),
+upstream commit 39972874d22f5ba19e39827488b089e80a0c17f4 (2026-09-28).
+
+  nvkvm
+  Copyright 2026 Reindert Pelsma
+  Licensed under the Apache License, Version 2.0 (see LICENSE in this
+  directory). Files carry SPDX "GPL-2.0 OR Apache-2.0"; virtio-nvgpu uses them
+  under Apache-2.0.
+
+Modified by the virtio-nvgpu project (2026-10). Changes, all marked
+"virtio-nvgpu" in the source:
+  - include paths flattened (../common -> common/)
+  - default presentation tier is NATIVE (zero-copy dma-buf only); the wl_shm
+    tier is refused loudly unless --present-mode=auto|shm is given
+  - wp_tearing_control_v1 ASYNC hint (--no-tearing to disable)
+  - --stats / --seq-usec: per-second fps and latency from CLOCK_MONOTONIC
+    and wp_presentation feedback (recv->commit, commit->present, and
+    send->commit / send->present when the sender stamps cmd.seq)
+  - every commit is flushed to the compositor immediately
+  - new test producer nvgpu_scanout_test.c (GBM + EGL/GLES2, test only),
+    run-viewer.sh, test-standalone.sh, README.md
+The original README is kept as README.upstream.md.
+
+"NVIDIA" is a trademark of NVIDIA Corporation. Nothing here is affiliated
+with or endorsed by NVIDIA.

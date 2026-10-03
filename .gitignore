@@ -9,3 +9,13 @@ dist/
 host/qemu/src/
 host/qemu/build/
 host/qemu/build.log
+host/viewer/*.o
+host/viewer/*.d
+host/viewer/nvkvm-display-broker
+host/viewer/nvgpu-scanout-test
+guest/linux/*.ko
+guest/linux/*.o
+guest/linux/.*.cmd
+guest/linux/*.mod*
+guest/linux/modules.order
+guest/linux/Module.symvers

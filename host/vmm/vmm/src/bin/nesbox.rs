@@ -1,0 +1,667 @@
+use nesbox_vmm::lifecycle::{ExitReason, Shutdown};
+use nesbox_vmm::power::PowerDevice;
+use nesbox_vmm::{acpi_slot_gsi, config, interrupt::IrqManager, virtiofsd::Virtiofsd, vm};
+
+use anyhow::{Context, Result};
+use env_logger::Env;
+use log::info;
+use nesbox_vmm::memslot::MemorySlots;
+use pci::Bus;
+use std::io::stdin;
+use std::os::fd::AsRawFd;
+use std::os::unix::thread::JoinHandleExt;
+use std::sync::Arc;
+use termios::*;
+#[cfg(feature = "virgl")]
+use virtio_devices::gpu::display::DisplayInfo;
+use virtio_devices::{
+    BlkConfig, BlkDevice, ConsoleDevice, FsDevice, NetConfig, NetDevice, NvGpuDevice, VsockDevice,
+};
+#[cfg(feature = "virgl")]
+use virtio_devices::{GpuConfig, GpuDevice};
+
+/// BAR index the GPU puts its shared memory window in.
+#[cfg(feature = "virgl")]
+const GPU_SHM_BAR: usize = 2;
+
+const USAGE: &str = "Usage:
+  nesbox <config.json>            run a VM
+
+Host networking -- bridge, VLAN uplink, and the taps guests attach to -- is set
+up separately by scripts/nestri-net-setup.sh. nesbox opens a tap that already
+exists, which needs no capabilities: the kernel only demands CAP_NET_ADMIN to
+create a device, or from someone who is not its owner.";
+
+/// Puts the terminal in raw mode so guest console input is unbuffered, and
+/// restores it on drop.
+///
+/// A no-op when stdin is not a terminal: a launcher spawns the VMM with pipes,
+/// and failing to start in that case would make it unusable as a child
+/// process.
+struct RawMode {
+    orig: Option<Termios>,
+}
+impl RawMode {
+    fn enter() -> Result<Self> {
+        let fd = stdin().as_raw_fd();
+        // SAFETY: isatty only inspects the fd.
+        if unsafe { libc::isatty(fd) } != 1 {
+            log::debug!("stdin is not a terminal; leaving it as it is");
+            return Ok(Self { orig: None });
+        }
+        let orig = Termios::from_fd(fd).context("tcgetattr")?;
+        let mut raw = orig;
+        cfmakeraw(&mut raw);
+        tcsetattr(fd, TCSANOW, &raw).context("tcsetattr")?;
+        Ok(Self { orig: Some(orig) })
+    }
+}
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        if let Some(orig) = self.orig {
+            let _ = tcsetattr(stdin().as_raw_fd(), TCSANOW, &orig);
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    let config_path = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .context(USAGE)?
+        .clone();
+
+    let config_str = std::fs::read_to_string(&config_path).context("Failed to read config")?;
+    let config: config::VmConfig =
+        serde_json::from_str(&config_str).context("Invalid JSON config")?;
+    config
+        .machine_config
+        .validate()
+        .context("Invalid machine_config")?;
+
+    // Raw mode belongs to the guest console and nothing else, and is entered
+    // only once the config has parsed: raw mode turns off echo, line buffering
+    // and the signal characters, so anything that still wants to report a
+    // problem has to do it first.
+    let _raw = RawMode::enter()?;
+
+    info!("Starting VMM with config: {:#?}", config);
+
+    // ── Private user namespace, if asked for ──────────────────────────────
+    // Here and nowhere later: the kernel only lets a *single-threaded* process
+    // create a user namespace, and the block and console devices each spawn a
+    // worker as they are built. This is only half the job -- it buys the
+    // privilege to unshare the network further down, once the tap is open.
+    if config.unshare_network {
+        nesbox_vmm::isolation::enter_user_namespace()?;
+    }
+
+    // What is actually confining this process, said out loud before anything
+    // depends on it. Several bounds this codebase assumes -- host memory for GTT
+    // most of all -- are applied by whoever supervises us or not at all, and the
+    // difference used to be invisible.
+    nesbox_vmm::isolation::Report::gather().log();
+
+    // A VRAM limit is enforced inside virglrenderer, not here, and which
+    // renderer gets loaded is LD_LIBRARY_PATH's decision. Checked before the
+    // device is built so a limit that would silently do nothing stops the boot
+    // rather than becoming a number in a config nobody rechecks.
+    // A build without `virgl` cannot create this device at all, so a config
+    // naming one is refused by name here rather than silently ignored -- the
+    // same rule `deny_unknown_fields` follows for a key this build does not
+    // know. Silently booting a guest with no GPU is the failure mode that cost
+    // a day on the second machine.
+    #[cfg(not(feature = "virgl"))]
+    {
+        if config.gpu.is_some() {
+            anyhow::bail!(
+                "this nesbox was built without the `virgl` feature, so it has no \
+                 virtio-gpu device; remove `gpu` from the config or rebuild with it"
+            );
+        }
+        // The metrics surface reports virtio-gpu counters and nothing else, so
+        // without that device it would serve an empty object. Refused here with
+        // the rest of config validation, before anything is opened: a config
+        // this build cannot honour should fail before it half-boots a guest.
+        if config.stats_socket.is_some() {
+            anyhow::bail!(
+                "this nesbox was built without the `virgl` feature; the stats \
+                 socket reports virtio-gpu counters only and has nothing to serve"
+            );
+        }
+    }
+    #[cfg(feature = "virgl")]
+    nesbox_vmm::renderer::check(config.gpu.as_ref().and_then(|g| g.vram_limit_mib))?;
+
+    // ── Where the threads that are not vCPUs go ───────────────────────────
+    // Set on this thread before anything is spawned, so the block and console
+    // workers, the stats server, every virtiofsd and the watcher all inherit
+    // it. The vCPU threads each replace it with their own below; what they
+    // spawn on activation is handled by `affinity::with_io_affinity`.
+    //
+    // The affinity this process started with is kept for vCPU threads that
+    // were given no placement of their own, so an I/O set alone does not
+    // quietly confine the guest to it too.
+    let started_on = virtio_devices::affinity::current().ok();
+    let io_cpus = config.machine_config.io_cpus().to_vec();
+    virtio_devices::affinity::set_io_cpus(&io_cpus);
+    if let (Some(vcpu), Some(io)) = (
+        config.machine_config.vcpu_cgroup_fd,
+        config.machine_config.io_cgroup_fd,
+    ) {
+        virtio_devices::affinity::set_cgroup_fds(virtio_devices::affinity::CgroupFds { vcpu, io });
+    }
+    if let Some(set) = virtio_devices::affinity::cpu_set(&io_cpus)
+        && let Err(e) = virtio_devices::affinity::apply(&set)
+    {
+        eprintln!("io_affinity: could not confine the VMM's own threads: {e}");
+    }
+
+    // Create KVM VM
+    let vm = vm::Vm::new(
+        &config.machine_config,
+        &config.boot_source.kernel_image_path,
+        &config.boot_source.boot_args,
+    )?;
+
+    // Create PCI bus and interrupt routing
+    let pci_bus = Arc::new(Bus::new(pci::Mmio64Window::new(
+        vm.mmio64.start,
+        vm.mmio64.size,
+    )));
+    let irq = IrqManager::new(vm.vm_fd.clone())?;
+    // Before any device is added: a device registers its doorbells as it joins
+    // the bus, so a registrar set afterwards would come too late for it.
+    pci_bus.set_ioevent_registrar(irq.clone());
+
+    // The INTx line follows the PCI slot, and slots are handed out in the order
+    // devices are added. One counter, incremented exactly where a device lands,
+    // so adding or removing one does not silently renumber the ones after it.
+    let mut next_slot: u32 = 1;
+
+    // ── Block devices ─────────────────────────────────────────────────────
+    // The root drive is still special: the boot source names it, so it is found
+    // first and gets slot 1. Everything else in `config.drives` is added in
+    // config order after it, exactly like virtio-fs shares are below.
+    let root_drive = config
+        .drives
+        .iter()
+        .find(|d| d.is_root_device)
+        .context("No root drive specified")?;
+
+    // A queue per vCPU is what the guest's own multiqueue block layer wants,
+    // bounded because past about four the queues stop being the constraint and
+    // start being threads.
+    let default_queues = (config.machine_config.vcpu_count as u16).clamp(1, 4);
+
+    let blk_device = BlkDevice::new(
+        &BlkConfig {
+            path: root_drive.path_on_host.clone(),
+            read_only: root_drive.is_read_only,
+            direct: root_drive.direct,
+            num_queues: root_drive.num_queues.unwrap_or(default_queues),
+            poll_us: root_drive.poll_us.unwrap_or(0),
+        },
+        vm.mem.clone(),
+    )?;
+    let blk_vectors = irq
+        .allocate_msi_vectors(blk_device.msix_vectors())
+        .context("blk MSI-X vectors")?;
+    let blk_intx = irq
+        .legacy_irqfd(acpi_slot_gsi(next_slot))
+        .context("blk INTx")?;
+    blk_device.bind_interrupts(blk_vectors, irq.clone(), blk_intx);
+    let blk_bdf = pci_bus.add_device(blk_device)?;
+    info!(
+        "virtio-blk (root) at {:02x}:{:02x}.{}",
+        blk_bdf.0, blk_bdf.1, blk_bdf.2
+    );
+    next_slot += 1;
+
+    for drive in config.drives.iter().filter(|d| !d.is_root_device) {
+        let device = BlkDevice::new(
+            &BlkConfig {
+                path: drive.path_on_host.clone(),
+                read_only: drive.is_read_only,
+                direct: drive.direct,
+                num_queues: drive.num_queues.unwrap_or(default_queues),
+                poll_us: drive.poll_us.unwrap_or(0),
+            },
+            vm.mem.clone(),
+        )?;
+        let vectors = irq
+            .allocate_msi_vectors(device.msix_vectors())
+            .context("blk MSI-X vectors")?;
+        let intx = irq
+            .legacy_irqfd(acpi_slot_gsi(next_slot))
+            .context("blk INTx")?;
+        device.bind_interrupts(vectors, irq.clone(), intx);
+        let bdf = pci_bus.add_device(device)?;
+        info!(
+            "virtio-blk \"{}\" at {:02x}:{:02x}.{}",
+            drive.path_on_host.display(),
+            bdf.0,
+            bdf.1,
+            bdf.2
+        );
+        next_slot += 1;
+    }
+
+    // ── Console device ────────────────────────────────────────────────────
+    let console_device = ConsoleDevice::new();
+    console_device.set_mem(vm.mem.clone());
+    let con_vectors = irq
+        .allocate_msi_vectors(4)
+        .context("console MSI-X vectors")?;
+    let con_intx = irq
+        .legacy_irqfd(acpi_slot_gsi(next_slot))
+        .context("console INTx")?;
+    console_device.bind_interrupts(con_vectors, irq.clone(), con_intx);
+    let con_bdf = pci_bus.add_device(console_device)?;
+    info!(
+        "virtio-console at {:02x}:{:02x}.{}",
+        con_bdf.0, con_bdf.1, con_bdf.2
+    );
+    next_slot += 1;
+
+    // ── Vsock device (optional) ───────────────────────────────────────────
+    if let Some(vsock_cfg) = &config.vsock {
+        let vsock_device = VsockDevice::new(vsock_cfg.guest_cid, vm.mem.clone())?;
+        let vsock_vectors = irq.allocate_msi_vectors(4).context("vsock MSI-X vectors")?;
+        let vsock_intx = irq
+            .legacy_irqfd(acpi_slot_gsi(next_slot))
+            .context("vsock INTx")?;
+        vsock_device.bind_interrupts(vsock_vectors, irq.clone(), vsock_intx);
+        let bdf = pci_bus.add_device(vsock_device)?;
+        info!("virtio-vsock at {:02x}:{:02x}.{}", bdf.0, bdf.1, bdf.2);
+        next_slot += 1;
+    }
+
+    // ── Network device (optional) ─────────────────────────────────────────
+    if let Some(net_cfg) = &config.network {
+        let net_device = NetDevice::new(
+            &NetConfig {
+                tap_name: net_cfg.tap_name.clone(),
+                mac: net_cfg.parsed_mac()?,
+            },
+            vm.mem.clone(),
+        )?;
+        let net_vectors = irq.allocate_msi_vectors(4).context("net MSI-X vectors")?;
+        let net_intx = irq
+            .legacy_irqfd(acpi_slot_gsi(next_slot))
+            .context("net INTx")?;
+        net_device.bind_interrupts(net_vectors, irq.clone(), net_intx);
+        let bdf = pci_bus.add_device(net_device)?;
+        info!("virtio-net at {:02x}:{:02x}.{}", bdf.0, bdf.1, bdf.2);
+        next_slot += 1;
+    }
+
+    // ── GPU (optional) ────────────────────────────────────────────────────
+    // Added before virtio-fs so its slot does not shift when a share is added
+    // or removed. Its shared window is a real memory slot, taken after the
+    // ones guest RAM already occupies.
+    #[cfg(feature = "virgl")]
+    let mut stats_gpu = None;
+    // One allocator for both windowed devices. Two would each start numbering
+    // at the first slot past guest RAM and hand out the same numbers.
+    let memory_slots = MemorySlots::new(vm.vm_fd.clone(), vm.ram_slot_count);
+
+    #[cfg(feature = "virgl")]
+    if let Some(gpu_cfg) = &config.gpu {
+        // The VRAM limit is enforced inside virglrenderer, which reads it from
+        // the environment: the refusal has to happen where it can be reported to
+        // the guest, and only the renderer owns that channel. See
+        // `virtio-devices/src/gpu/vram.rs`. One VMM process serves one guest, so
+        // process scope is guest scope.
+        if let Some(mib) = gpu_cfg.vram_limit_mib {
+            // SAFETY: single-threaded here. Devices are built before any vCPU or
+            // worker thread is spawned, so no other thread can be reading the
+            // environment concurrently.
+            unsafe { std::env::set_var("NESTRI_VRAM_LIMIT_MIB", mib.to_string()) };
+        }
+
+        let slots = memory_slots.clone();
+        let window_slots = slots.clone();
+        let gpu_device = Arc::new(GpuDevice::new(
+            &GpuConfig {
+                render_node: gpu_cfg.render_node.clone(),
+                displays: vec![DisplayInfo::new(gpu_cfg.width, gpu_cfg.height)],
+                vram_limit_bytes: gpu_cfg.vram_limit_mib.map(|m| m * (1 << 20)),
+                window_limit_bytes: gpu_cfg.host_visible_window_mib.map_or(0, |m| m * (1 << 20)),
+                window_max_mappings: gpu_cfg.host_visible_max_mappings.unwrap_or(0),
+                poll_us: gpu_cfg.poll_us,
+                // The I/O set, which is the guest's own set unless the caller
+                // named a separate one. Either way it stays in the guest's L3
+                // domain: the worker is the other half of every forwarded
+                // command, and a handoff crossing dies costs on every one. It
+                // confines itself explicitly because it is spawned on
+                // activation, from a vCPU thread whose pin it would inherit.
+                cpu_affinity: io_cpus.clone(),
+            },
+            vm.mem.clone(),
+        )?);
+        let gpu_vectors = irq.allocate_msi_vectors(4).context("GPU MSI-X vectors")?;
+        let gpu_intx = irq
+            .legacy_irqfd(acpi_slot_gsi(next_slot))
+            .context("GPU INTx")?;
+        gpu_device.bind_interrupts(gpu_vectors, irq.clone(), gpu_intx);
+        gpu_device.bind_mapper(slots);
+        let bdf = pci_bus.add_device_arc(gpu_device.clone())?;
+        // The shared window has to appear at whatever address the bus gave
+        // BAR2, so the device only learns it now.
+        let shm_addr = pci_bus
+            .bar_address(bdf, GPU_SHM_BAR)
+            .context("the GPU has no BAR2")?;
+        gpu_device.set_shm_guest_addr(shm_addr);
+        // Reserved and registered once, now that BAR2 has an address. A failure
+        // is not fatal: every blob then takes the per-resource slot path, which
+        // is what this VMM did before the window existed. It is warned about
+        // because that path costs a memslot update per map and per unmap.
+        if let Err(err) = window_slots.open_window(shm_addr, GpuDevice::shm_bar_size()) {
+            log::warn!(
+                "GPU window not reserved ({err:#}); every blob will take its own \
+                 memory slot, which is markedly slower"
+            );
+        }
+        info!(
+            "virtio-gpu at {:02x}:{:02x}.{}, shared window at {shm_addr:#x}",
+            bdf.0, bdf.1, bdf.2
+        );
+        stats_gpu = Some(gpu_device);
+        next_slot += 1;
+    }
+
+    // ── Metrics surface ───────────────────────────────────────────────────
+    // Started before the vCPUs, so a supervisor that is already polling sees a
+    // box come up rather than getting connection refused for the first second.
+    #[cfg(feature = "virgl")]
+    if let Some(path) = config.stats_socket.clone() {
+        nesbox_vmm::stats::serve(path, nesbox_vmm::stats::StatsSource::new(stats_gpu))?;
+    }
+
+    // ── Shared directories over virtio-fs ─────────────────────────────────
+    // The daemons are kept alive for as long as the VM runs; dropping them
+    // kills virtiofsd.
+    let runtime_dir = std::env::temp_dir().join(format!("nesbox-{}", std::process::id()));
+    let mut fs_daemons = Vec::new();
+    // ── GPU ioctl forwarding ──────────────────────────────────────────────
+    // Attached before the filesystem shares so its PCI slot does not move when
+    // a share is added or removed: a guest that enumerates a different slot
+    // across boots binds its driver to a different device.
+    if let Some(forward) = &config.gpu_forward {
+        let device = Arc::new(
+            NvGpuDevice::new(
+                &forward.socket,
+                &forward.proc_nvidia,
+                forward.vram_limit_mib,
+                vm.mem.clone(),
+            )
+            .with_context(|| format!("GPU forwarding backend at {}", forward.socket.display()))?,
+        );
+        let vectors = irq
+            .allocate_msi_vectors(3)
+            .context("virtio-gpu-nv MSI-X vectors")?;
+        let intx = irq
+            .legacy_irqfd(acpi_slot_gsi(next_slot))
+            .context("virtio-gpu-nv INTx")?;
+        device.bind_interrupts(vectors, irq.clone(), intx);
+        device.bind_mapper(memory_slots.clone());
+        let bdf = pci_bus.add_device_arc(device.clone())?;
+        // The window has to appear wherever the bus put BAR 2, so the device
+        // only learns its address now.
+        let shm_addr = pci_bus
+            .bar_address(bdf, NvGpuDevice::shm_bar())
+            .context("virtio-gpu-nv has no BAR 2")?;
+        device.set_shm_guest_addr(shm_addr);
+        let aperture_addr = pci_bus
+            .bar_address(bdf, NvGpuDevice::aperture_bar())
+            .context("virtio-gpu-nv has no BAR 4")?;
+        device.set_aperture_guest_addr(aperture_addr);
+        // Reserved and registered once. A failure here is not fatal: the
+        // backend is simply never offered a request channel, and every mapping
+        // stays where the guest cannot reach it -- which is where this device
+        // was before the window existed.
+        if let Err(err) = memory_slots.open_window(shm_addr, NvGpuDevice::shm_bar_size()) {
+            log::warn!(
+                "virtio-gpu-nv window not reserved ({err:#}); device memory will not be \
+                 mappable by the guest"
+            );
+        }
+        info!(
+            "virtio-gpu-nv at {:02x}:{:02x}.{}, shared window at {shm_addr:#x}",
+            bdf.0, bdf.1, bdf.2
+        );
+        next_slot += 1;
+    }
+
+    for shared in &config.shared_directories {
+        let daemon = Virtiofsd::spawn(
+            &shared.tag,
+            &shared.path_on_host,
+            shared.read_only,
+            shared.guest_owner,
+            &runtime_dir,
+        )?;
+        let fs_device = FsDevice::new(&shared.tag, daemon.socket_path(), vm.mem.clone())?;
+        let vectors = irq
+            .allocate_msi_vectors(4)
+            .context("virtio-fs MSI-X vectors")?;
+        let intx = irq
+            .legacy_irqfd(acpi_slot_gsi(next_slot))
+            .context("virtio-fs INTx")?;
+        fs_device.bind_interrupts(vectors, irq.clone(), intx);
+        let bdf = pci_bus.add_device(fs_device)?;
+        info!(
+            "virtio-fs \"{}\" at {:02x}:{:02x}.{}",
+            shared.tag, bdf.0, bdf.1, bdf.2
+        );
+        fs_daemons.push(daemon);
+        next_slot += 1;
+    }
+
+    // ── Legacy COM1, for early boot output ────────────────────────────────
+    let serial = Arc::new(nesbox_vmm::serial::Serial::new());
+
+    // ── Lifetime ──────────────────────────────────────────────────────────
+    let shutdown = Shutdown::new();
+    let power = Arc::new(PowerDevice::new(shutdown.clone()));
+    install_signal_handlers(shutdown.clone())?;
+
+    // ── Take away the network ─────────────────────────────────────────────
+    // Deliberately here: after the tap is opened, after virtiofsd is spawned and
+    // after the stats socket is bound. All three keep working across the unshare
+    // because a descriptor -- and a socket's namespace -- is fixed when it is
+    // created, not when it is used. Moving this earlier breaks all three.
+    if config.unshare_network {
+        if config.vsock.is_some() {
+            log::warn!(
+                "unshare-network is on and a vsock device is configured. vsock is \
+                 namespace-aware and this combination has not been measured; if the \
+                 guest's control channel goes quiet, this is the first thing to turn off."
+            );
+        }
+        nesbox_vmm::isolation::enter_network_namespace()?;
+    }
+
+    // ── Confine the process ───────────────────────────────────────────────
+    // Last thing before the guest runs, and deliberately after every device is
+    // built: virtiofsd has been spawned by now, and `execve` is not on the
+    // policy. Anything that needs to open a new path or start a process must
+    // happen above this line.
+    let seccomp_mode = nesbox_vmm::seccomp::Mode::parse(&config.seccomp).ok_or_else(|| {
+        anyhow::anyhow!(
+            "seccomp: {:?} is not one of enforce, audit, off",
+            config.seccomp
+        )
+    })?;
+    nesbox_vmm::seccomp::apply_baseline(seccomp_mode).context("could not confine the VMM")?;
+
+    // ── Run vCPUs ─────────────────────────────────────────────────────────
+    // Where each vCPU thread goes: its own pin if it has one, otherwise the
+    // shared set, otherwise back to where the process started -- this thread
+    // may already be on the I/O set, and a vCPU inheriting that would put the
+    // guest on the CPUs meant for serving it. cpu_set_t is Copy.
+    let shared =
+        virtio_devices::affinity::cpu_set(&config.machine_config.cpu_affinity).or(started_on);
+    let placements: Vec<Option<libc::cpu_set_t>> = (0..vm.vcpus.len())
+        .map(|i| match config.machine_config.vcpu_pins.get(i) {
+            Some(&cpu) => virtio_devices::affinity::cpu_set(&[cpu]),
+            None => shared,
+        })
+        .collect();
+
+    let handles: Vec<_> = vm
+        .vcpus
+        .into_iter()
+        .enumerate()
+        .map(|(vcpu_id, vcpu_fd)| {
+            let mem = vm.mem.clone();
+            let pci_bus = pci_bus.clone();
+            let serial = serial.clone();
+            let power = power.clone();
+            let shutdown = shutdown.clone();
+            let placement = placements[vcpu_id];
+            let cgroup_fd = config.machine_config.vcpu_cgroup_fd;
+            std::thread::Builder::new()
+                // Named so the threads are identifiable from the host. Without
+                // this they are anonymous, and anything done to place them --
+                // by us or by an operator with taskset -- cannot be checked.
+                .name(format!("vcpu{vcpu_id}"))
+                .spawn(move || {
+                    // Into the partition first: until then its CPUs are not in
+                    // this thread's cpuset, and the pin below is refused.
+                    if let Some(fd) = cgroup_fd
+                        && let Err(e) = virtio_devices::affinity::join_cgroup(fd)
+                    {
+                        eprintln!("vcpu{vcpu_id}: could not join the vCPU cgroup: {e}");
+                    }
+                    if let Some(set) = placement
+                        && let Err(e) = virtio_devices::affinity::apply(&set)
+                    {
+                        // A warning rather than a failure: placement is an
+                        // optimisation, and a guest on the wrong cores is
+                        // better than one that does not boot.
+                        eprintln!("vcpu{vcpu_id}: could not set CPU affinity: {e}");
+                    }
+                    // NOT confined further, and the reason is structural.
+                    //
+                    // A vCPU needs almost nothing, so a tight per-thread filter
+                    // here would be the single biggest hardening available --
+                    // `seccomp::vcpu()` exists and is tested. It cannot be
+                    // installed yet: **device workers are spawned lazily by
+                    // whichever vCPU thread services the guest's activation
+                    // write**, and a thread inherits its creator's filters. The
+                    // GPU worker would come into existence already forbidden from
+                    // opening the render node, and measured, it dies at virtio-gpu
+                    // probe.
+                    //
+                    // The fix is to stop vCPU threads being the parents of
+                    // long-lived workers -- have activation hand the work to a
+                    // thread that already exists under the baseline. Until then
+                    // this is deliberately left off rather than shipped broken.
+                    if let Err(e) =
+                        vm::run_vcpu_loop(mem, vcpu_fd, pci_bus, serial, power, shutdown)
+                    {
+                        eprintln!("vCPU thread error: {}", e);
+                    }
+                })
+                .expect("failed to spawn vCPU thread")
+        })
+        .collect();
+
+    // A vCPU blocked in KVM_RUN only notices the stop request when a signal
+    // interrupts it, so wake every thread once the VM is asked to stop.
+    let watcher = {
+        let shutdown = shutdown.clone();
+        let vcpu_threads: Vec<_> = handles.iter().map(|h| h.as_pthread_t()).collect();
+        std::thread::spawn(move || {
+            // KVM's own workers appear with the first KVM_RUN, on a vCPU's
+            // CPU: moved at half a second, and again at five for one created
+            // late.
+            let mut ticks = 0u32;
+            while !shutdown.is_requested() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                ticks = ticks.saturating_add(1);
+                if ticks == 10 || ticks == 100 {
+                    let moved = virtio_devices::affinity::rehome_kvm_workers();
+                    if moved > 0 {
+                        log::debug!("moved {moved} KVM worker(s) to the I/O CPUs");
+                    }
+                }
+            }
+            for thread in vcpu_threads {
+                // SAFETY: the vCPU threads are joined below, so these ids stay
+                // valid until after this signal is delivered.
+                unsafe { libc::pthread_kill(thread, VCPU_WAKE_SIGNAL) };
+            }
+        })
+    };
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    shutdown.request(ExitReason::Error("all vCPUs stopped".into()));
+    let _ = watcher.join();
+
+    // Devices and their backends are torn down here: dropping the virtiofsd
+    // supervisors kills them, and the VM's memory goes with the process.
+    drop(fs_daemons);
+    // Empty once every daemon has removed its socket and pidfile. `remove_dir`
+    // rather than `remove_dir_all`: if anything is unexpectedly still in there,
+    // leaving it is better than deleting it, and the failure is silent because a
+    // stray directory is not worth failing a shutdown over.
+    let _ = std::fs::remove_dir(&runtime_dir);
+
+    let reason = shutdown.reason().unwrap_or(ExitReason::GuestFault);
+    if reason.is_clean() {
+        info!("VM stopped: {reason}");
+    } else {
+        log::error!("VM stopped: {reason}");
+    }
+    std::process::exit(reason.exit_code());
+}
+
+/// Signal used to wake a vCPU out of KVM_RUN. Its handler does nothing; the
+/// EINTR it causes is the point.
+const VCPU_WAKE_SIGNAL: libc::c_int = libc::SIGUSR1;
+
+extern "C" fn wake_handler(_: libc::c_int) {}
+
+extern "C" fn stop_handler(_: libc::c_int) {
+    // Async-signal-safe: just flips an atomic.
+    if let Some(shutdown) = SHUTDOWN.get() {
+        shutdown.request(ExitReason::HostSignal);
+    }
+}
+
+static SHUTDOWN: std::sync::OnceLock<Arc<Shutdown>> = std::sync::OnceLock::new();
+
+/// SIGTERM and SIGINT ask the VM to stop; SIGUSR1 just interrupts KVM_RUN.
+fn install_signal_handlers(shutdown: Arc<Shutdown>) -> Result<()> {
+    let _ = SHUTDOWN.set(shutdown);
+    // SAFETY: both handlers are async-signal-safe.
+    unsafe {
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            if libc::signal(signal, stop_handler as *const () as libc::sighandler_t)
+                == libc::SIG_ERR
+            {
+                anyhow::bail!("failed to install handler for signal {signal}");
+            }
+        }
+        if libc::signal(
+            VCPU_WAKE_SIGNAL,
+            wake_handler as *const () as libc::sighandler_t,
+        ) == libc::SIG_ERR
+        {
+            anyhow::bail!("failed to install the vCPU wake handler");
+        }
+    }
+    Ok(())
+}

@@ -1,0 +1,15 @@
+/target
+.vscode/
+.idea/
+.zed/
+/artifacts
+*.tar.zst
+tools/nesprobe/target
+*.local.json
+
+# build/'s own output — an unpacked jail image, not source
+/build/output/
+
+# Scratch VM configs. They name paths on one machine; examples/ holds the
+# ones meant to be read.
+/test-*.json

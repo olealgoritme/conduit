@@ -1,0 +1,1206 @@
+//! The rutabaga backend: resources, blob mappings and fences.
+//!
+//! Derived from libkrun's `virtio_gpu.rs`, with the host-side scanout code
+//! removed — nothing here draws to a host display. The resource and fence
+//! handling is kept close to the original.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use rutabaga_gfx::{
+    RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder,
+    RutabagaFence, RutabagaFenceHandler, RutabagaIovec, Transfer3D,
+};
+#[cfg(target_os = "linux")]
+use rutabaga_gfx::{RUTABAGA_PATH_TYPE_GPU, RutabagaComponentType, RutabagaPath};
+use vm_memory::{GuestAddress, GuestMemoryBackend};
+
+use vm_memory::GuestMemoryMmap;
+
+use super::display::{DisplayInfo, Rect};
+use super::metrics::{GpuCounters, GpuMetrics};
+use super::protocol::GpuResponse::*;
+use super::protocol::{
+    GpuResponse, GpuResponsePlaneInfo, VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE,
+    VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_MAX_SCANOUTS,
+    VirtioGpuResult,
+};
+use super::vram::VramAccountant;
+use super::window::WindowQuota;
+use super::{GpuError, GpuQueues, Result, VirtioShmRegion};
+use crate::memmap::HostMemoryMapper;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn sglist_to_rutabaga_iovecs(
+    vecs: &[(GuestAddress, usize)],
+    mem: &GuestMemoryMmap,
+) -> Result<Vec<RutabagaIovec>> {
+    if vecs
+        .iter()
+        .any(|&(addr, len)| mem.get_slice(addr, len).is_err())
+    {
+        return Err(GpuError::GuestMemory);
+    }
+    let mut out = Vec::with_capacity(vecs.len());
+    for &(addr, len) in vecs {
+        let slice = mem.get_slice(addr, len).unwrap();
+        out.push(RutabagaIovec {
+            base: slice.ptr_guard_mut().as_ptr() as *mut libc::c_void,
+            len,
+        });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Fence tracking
+// ---------------------------------------------------------------------------
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum VirtioGpuRing {
+    Global,
+    ContextSpecific { ctx_id: u32, ring_idx: u8 },
+}
+
+#[derive(Debug)]
+struct FenceDescriptor {
+    ring: VirtioGpuRing,
+    fence_id: u64,
+    desc_index: u16,
+    len: u32,
+    /// When the guest started waiting on this.
+    ///
+    /// Taken here rather than in `create_fence`, which runs microseconds
+    /// earlier on the same thread -- close enough that the difference is below
+    /// what any of these measurements resolve, and it costs no second map.
+    recorded: std::time::Instant,
+}
+
+#[derive(Default, Debug)]
+pub struct FenceState {
+    descs: Vec<FenceDescriptor>,
+    completed_fences: BTreeMap<VirtioGpuRing, u64>,
+}
+
+// ---------------------------------------------------------------------------
+// Resource tracking
+// ---------------------------------------------------------------------------
+
+#[derive(Copy, Clone, Debug, Default)]
+struct AssociatedScanouts(u32);
+
+impl AssociatedScanouts {
+    fn enable(&mut self, scanout_id: u32) {
+        self.0 |= 1 << scanout_id;
+    }
+    fn disable(&mut self, scanout_id: u32) {
+        self.0 &= !(1 << scanout_id);
+    }
+    const fn has_any_enabled(self) -> bool {
+        self.0 != 0
+    }
+    /// Which scanouts are enabled. Nothing in the device needs this — there is
+    /// no display path — but the tests use it to check the bitmap.
+    #[cfg(test)]
+    fn iter_enabled(self) -> impl Iterator<Item = u32> {
+        (0..VIRTIO_GPU_MAX_SCANOUTS).filter(move |i| ((self.0 >> i) & 1) == 1)
+    }
+}
+
+unsafe extern "C" {
+    /// Map a resource at an address the caller chose, `MAP_FIXED`.
+    ///
+    /// # Why this is declared here rather than called through rutabaga
+    ///
+    /// `rutabaga_gfx` has a binding for it, behind a `virgl_renderer_unstable`
+    /// cfg, and the body inside that cfg does not compile -- it matches
+    /// `if let Some(addr)` on a `u64`. The symbol itself is a *stable* virglrenderer
+    /// export and is already linked into this process, so it is declared and called
+    /// directly rather than forking the crate to fix a dead branch.
+    ///
+    /// Returns `0` on success and `-EOPNOTSUPP` for a resource that cannot be
+    /// placed this way, which is a documented answer and the reason the slot path
+    /// below still exists.
+    ///
+    /// **The mapping belongs to the caller.** virglrenderer does not record it --
+    /// `res->mapped` is left alone -- so `virgl_renderer_resource_unmap` refuses it
+    /// with `EINVAL`, and undoing it is this file's job. See the header comment on
+    /// the C side, which says exactly that.
+    fn virgl_renderer_resource_map_fixed(
+        res_handle: u32,
+        addr: *mut std::ffi::c_void,
+    ) -> std::ffi::c_int;
+}
+
+/// `-EOPNOTSUPP`, the answer meaning "not this resource, use the other path".
+const EOPNOTSUPP: std::ffi::c_int = -95;
+
+#[derive(Copy, Clone, Debug)]
+struct VirtioGpuResource {
+    scanouts: AssociatedScanouts,
+    /// Blob resources only; how much of the shared window this one occupies.
+    size: u64,
+    /// Where in the shared window it is mapped, once it is.
+    shmem_offset: Option<u64>,
+    rutabaga_external_mapping: bool,
+    /// Mapped by being placed inside the window rather than given a slot.
+    ///
+    /// The two are torn down differently and cannot be told apart afterwards:
+    /// a placed resource is withdrawn by overwriting its range, a slotted one
+    /// by deleting its memory slot. Doing either to the other leaves the guest
+    /// addressing memory nothing owns.
+    placed: bool,
+}
+
+impl VirtioGpuResource {
+    /// The guest's id, dimensions and format are not kept: rutabaga owns the
+    /// resource and is asked whenever they are needed, so a second copy here
+    /// could only go stale.
+    fn new(size: u64) -> Self {
+        VirtioGpuResource {
+            scanouts: Default::default(),
+            size,
+            shmem_offset: None,
+            rutabaga_external_mapping: false,
+            placed: false,
+        }
+    }
+
+    /// Where in guest physical address space this resource is mapped, if it is.
+    ///
+    /// `shmem_offset` is the authoritative "is this mapped" signal — it is set
+    /// on a successful `RESOURCE_MAP_BLOB` and cleared on unmap, and since the
+    /// double-map guard it is also what refuses a second mapping.
+    ///
+    /// This exists so the two paths that tear a mapping down cannot disagree
+    /// about whether there is one. They already did once: `resource_unmap_blob`
+    /// computed this address and removed the KVM slot, while `unref_resource`
+    /// looked at `rutabaga_external_mapping` instead and never removed it.
+    fn mapped_at(&self, shm_region: &VirtioShmRegion) -> Option<u64> {
+        self.shmem_offset
+            .map(|offset| shm_region.guest_addr + offset)
+    }
+}
+
+#[derive(Debug)]
+struct VirtioGpuScanout {
+    resource_id: u32,
+}
+
+// ---------------------------------------------------------------------------
+// VirtioGpu – the main GPU state machine
+// ---------------------------------------------------------------------------
+
+pub struct VirtioGpu {
+    rutabaga: Rutabaga,
+    /// Gives the guest direct access to memory we hold, used to publish mapped
+    /// blob resources into the host-visible window.
+    mapper: Arc<dyn HostMemoryMapper>,
+    resources: BTreeMap<u32, VirtioGpuResource>,
+    fence_state: Arc<Mutex<FenceState>>,
+    scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
+    displays: Box<[DisplayInfo]>,
+    pub num_capsets: u32,
+    /// Bounds how much device memory this guest may hold. `None` leaves the
+    /// guest able to allocate until the card is exhausted, which is only safe
+    /// when it is the sole tenant.
+    vram: Option<VramAccountant>,
+    /// Bounds what the guest may map into BAR2 and reach directly.
+    window: WindowQuota,
+    /// Shared with whoever is watching this device.
+    metrics: Arc<GpuMetrics>,
+}
+
+impl fmt::Debug for VirtioGpu {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("")
+            .field(&self.resources)
+            .field(&self.fence_state)
+            .field(&self.scanouts)
+            .field(&self.displays)
+            .finish()
+    }
+}
+
+impl VirtioGpu {
+    // -----------------------------------------------------------------------
+    // Fence handler construction
+    // -----------------------------------------------------------------------
+
+    /// Build a [`RutabagaFenceHandler`] that runs on rutabaga's internal thread.
+    ///
+    /// When a fence completes the handler:
+    ///   1. Looks up pending descriptor(s) waiting on that fence.
+    ///   2. Calls `queue.add_used()` + `advance_used_ring_idx()` for each.
+    ///   3. Fires the virtio interrupt.
+    ///
+    fn create_fence_handler(
+        signal: Arc<dyn GpuQueues>,
+        fence_state: Arc<Mutex<FenceState>>,
+        metrics: Arc<GpuMetrics>,
+    ) -> RutabagaFenceHandler {
+        RutabagaFenceHandler::new(move |completed_fence: RutabagaFence| {
+            GpuCounters::inc(&metrics.counters.fences);
+            let ring = match completed_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
+                0 => VirtioGpuRing::Global,
+                _ => VirtioGpuRing::ContextSpecific {
+                    ctx_id: completed_fence.ctx_id,
+                    ring_idx: completed_fence.ring_idx,
+                },
+            };
+
+            // Collect completed descriptors while holding fence_state.
+            // Release the lock before touching the queue to maintain ordering
+            // and avoid potential deadlocks with the main thread.
+            let completed: Vec<FenceDescriptor> = {
+                let mut fs = fence_state.lock().unwrap();
+                let mut i = 0;
+                let mut out = Vec::new();
+                while i < fs.descs.len() {
+                    if fs.descs[i].ring == ring && fs.descs[i].fence_id <= completed_fence.fence_id
+                    {
+                        out.push(fs.descs.remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                fs.completed_fences.insert(ring, completed_fence.fence_id);
+                out
+            };
+
+            if completed.is_empty() {
+                return;
+            }
+
+            for desc in &completed {
+                metrics.counters.fence_latency.since(desc.recorded);
+            }
+            let used: Vec<(u16, u32)> = completed
+                .iter()
+                .map(|desc| (desc.desc_index, desc.len))
+                .collect();
+            signal.complete_ctl(&used);
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Rutabaga builder helpers
+    // -----------------------------------------------------------------------
+
+    // NOTE: This are unneeded as everything runs in the guest
+    // fn build_rutabaga_channels() -> Vec<RutabagaChannel> {
+    //     let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
+    //     let wl = env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
+    //     let mut channels = vec![RutabagaChannel {
+    //         base_channel: PathBuf::from(format!("{xdg}/{wl}")),
+    //         channel_type: RUTABAGA_CHANNEL_TYPE_WAYLAND,
+    //     }];
+
+    //     #[cfg(target_os = "linux")]
+    //     {
+    //         use rutabaga_gfx::{RUTABAGA_CHANNEL_TYPE_PW, RUTABAGA_CHANNEL_TYPE_X11};
+
+    //         if let Ok(x_disp) = env::var("DISPLAY") {
+    //             if let Some(num) = x_disp.strip_prefix(':') {
+    //                 channels.push(RutabagaChannel {
+    //                     base_channel: PathBuf::from(format!("/tmp/.X11-unix/X{num}")),
+    //                     channel_type: RUTABAGA_CHANNEL_TYPE_X11,
+    //                 });
+    //             }
+    //         }
+    //         if let Ok(pw_dir) =
+    //             env::var("PIPEWIRE_RUNTIME_DIR").or_else(|_| env::var("XDG_RUNTIME_DIR"))
+    //         {
+    //             let name = env::var("PIPEWIRE_REMOTE").unwrap_or_else(|_| "pipewire-0".into());
+    //             let mut pw = PathBuf::from(pw_dir);
+    //             pw.push(name);
+    //             channels.push(RutabagaChannel {
+    //                 base_channel: pw,
+    //                 channel_type: RUTABAGA_CHANNEL_TYPE_PW,
+    //             });
+    //         }
+    //     }
+
+    //     channels
+    // }
+
+    /// Try to create a full rutabaga instance.
+    pub fn create_rutabaga(
+        signal: Arc<dyn GpuQueues>,
+        fence_state: Arc<Mutex<FenceState>>,
+        gpu_device_path: PathBuf,
+        metrics: Arc<GpuMetrics>,
+    ) -> Option<Rutabaga> {
+        let fence = Self::create_fence_handler(signal, fence_state, metrics);
+
+        // Native-context DRM only — no Venus, no virgl2, no gfxstream.
+        let capset_mask: u64 = 1 << rutabaga_gfx::RUTABAGA_CAPSET_DRM;
+
+        // Tell rutabaga which host DRM render node to give to virglrenderer.
+        let gpu_path = RutabagaPath {
+            path_type: RUTABAGA_PATH_TYPE_GPU,
+            path: gpu_device_path.clone(),
+        };
+
+        log::info!(
+            "virtio-gpu: building rutabaga with GPU path {:?}",
+            gpu_device_path
+        );
+
+        let builder = RutabagaBuilder::new(capset_mask, fence)
+            .set_default_component(RutabagaComponentType::VirglRenderer)
+            .set_rutabaga_paths(Some(vec![gpu_path]))
+            // External blob is required for native-context dma-buf passing.
+            .set_use_external_blob(true);
+
+        match builder.build() {
+            Ok(r) => Some(r),
+            Err(e) => {
+                log::error!("virtio-gpu: rutabaga build failed: {e:?}");
+                None
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Constructor
+    // -----------------------------------------------------------------------
+
+    /// Build the GPU backend. Fails rather than panics: a missing render node
+    /// or a rutabaga that will not initialise is a configuration problem the
+    /// launcher should hear about, not a crash.
+    pub fn new(
+        signal: Arc<dyn GpuQueues>,
+        displays: Box<[DisplayInfo]>,
+        gpu_device_path: PathBuf,
+        mapper: Arc<dyn HostMemoryMapper>,
+        vram_limit_bytes: Option<u64>,
+        window_limit_bytes: u64,
+        window_max_mappings: u32,
+        metrics: Arc<GpuMetrics>,
+    ) -> Option<Self> {
+        let fence_state: Arc<Mutex<FenceState>> = Arc::new(Mutex::new(FenceState::default()));
+
+        let rutabaga = Self::create_rutabaga(
+            signal,
+            fence_state.clone(),
+            gpu_device_path,
+            metrics.clone(),
+        )?;
+
+        let mut num_capsets = 0u32;
+        for i in 0.. {
+            match rutabaga.get_capset_info(i) {
+                Ok((id, ver, size)) => {
+                    log::info!("virtio-gpu: capset[{i}] id={id} ver={ver} size={size}");
+                    num_capsets += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        log::info!("virtio-gpu: {num_capsets} capsets available");
+
+        Some(Self {
+            rutabaga,
+            mapper,
+            resources: Default::default(),
+            fence_state,
+            scanouts: Default::default(),
+            displays,
+            num_capsets,
+            vram: vram_limit_bytes.map(|limit| {
+                log::info!(
+                    "virtio-gpu: VRAM limit {} MiB for this guest",
+                    limit / (1 << 20)
+                );
+                VramAccountant::new(limit, metrics.clone())
+            }),
+            window: WindowQuota::new(window_limit_bytes, window_max_mappings, metrics.clone()),
+            metrics,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    fn result_from_query(&mut self, resource_id: u32) -> GpuResponse {
+        match self.rutabaga.resource3d_info(resource_id) {
+            Ok(q) => OkResourcePlaneInfo {
+                format_modifier: q.modifier,
+                plane_info: (0..4)
+                    .map(|i| GpuResponsePlaneInfo {
+                        stride: q.strides[i],
+                        offset: q.offsets[i],
+                    })
+                    .collect(),
+            },
+            Err(_) => OkNoData,
+        }
+    }
+
+    pub fn force_ctx_0(&self) {
+        self.rutabaga.force_ctx_0();
+    }
+
+    // -----------------------------------------------------------------------
+    // Display info / EDID
+    // -----------------------------------------------------------------------
+
+    pub fn display_info(&self) -> VirtioGpuResult {
+        let info = self
+            .displays
+            .iter()
+            .map(|d| (d.width, d.height, true))
+            .collect();
+        Ok(OkDisplayInfo(info))
+    }
+
+    pub fn get_edid(&self, scanout_id: u32) -> VirtioGpuResult {
+        let display = self
+            .displays
+            .get(scanout_id as usize)
+            .ok_or(ErrInvalidScanoutId)?;
+        Ok(OkEdid(display.edid_bytes()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Scanout management (no host display – just book-keeping)
+    // -----------------------------------------------------------------------
+
+    /// Track which resource is associated with a scanout.
+    /// No actual host display operations are performed.
+    pub fn set_scanout(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        _width: u32,
+        _height: u32,
+    ) -> VirtioGpuResult {
+        let scanout = self
+            .scanouts
+            .get_mut(scanout_id as usize)
+            .ok_or(ErrInvalidScanoutId)?;
+
+        // Detach from old resource.
+        if let Some(old_id) = scanout.as_ref().map(|s| s.resource_id) {
+            if let Some(res) = self.resources.get_mut(&old_id) {
+                res.scanouts.disable(scanout_id);
+            }
+        }
+
+        if resource_id == 0 {
+            *scanout = None;
+            return Ok(OkNoData);
+        }
+
+        let resource = self
+            .resources
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        resource.scanouts.enable(scanout_id);
+        *scanout = Some(VirtioGpuScanout { resource_id });
+        Ok(OkNoData)
+    }
+
+    // -----------------------------------------------------------------------
+    // Resource flush
+    // -----------------------------------------------------------------------
+    //
+    // Without a display backend there is nothing to present.  Return success
+    // so the guest driver does not stall.
+
+    pub fn flush_resource(&mut self, resource_id: u32, _rect: Rect) -> VirtioGpuResult {
+        if resource_id == 0 {
+            return Ok(OkNoData);
+        }
+        // Verify the resource exists.
+        let _resource = self
+            .resources
+            .get(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+
+        // No host display – nothing to flush.
+        Ok(OkNoData)
+    }
+
+    // -----------------------------------------------------------------------
+    // 3-D resource management
+    // -----------------------------------------------------------------------
+
+    pub fn resource_create_3d(
+        &mut self,
+        resource_id: u32,
+        resource_create_3d: ResourceCreate3D,
+    ) -> VirtioGpuResult {
+        self.rutabaga
+            .resource_create_3d(resource_id, resource_create_3d)?;
+
+        // Not a blob, so it occupies none of the shared window.
+        let resource = VirtioGpuResource::new(0);
+        self.resources.insert(resource_id, resource);
+        Ok(self.result_from_query(resource_id))
+    }
+
+    pub fn unref_resource(
+        &mut self,
+        resource_id: u32,
+        shm_region: &VirtioShmRegion,
+    ) -> VirtioGpuResult {
+        let resource = self
+            .resources
+            .remove(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+
+        if resource.scanouts.has_any_enabled() {
+            log::warn!(
+                "virtio-gpu: unref_resource({resource_id}) while scanouts are active, refusing"
+            );
+            self.resources.insert(resource_id, resource);
+            return Err(ErrUnspec);
+        }
+
+        // A guest may unref a resource it never unmapped, so everything
+        // `resource_unmap_blob` does has to happen here as well -- and in the
+        // same order, because the order is a safety property rather than a
+        // tidiness one.
+        //
+        // This used to release virglrenderer's mapping and credit the window
+        // while leaving the KVM memory slot registered, which is that ordering
+        // exactly inverted. The slot leaked -- and slots are finite, so a
+        // map/unref loop exhausted them -- but the worse half is that the guest
+        // went on addressing host memory after the renderer had freed it, and
+        // that memory could already have been handed to something else.
+        if let Some(guest_addr) = resource.mapped_at(shm_region) {
+            // Take it away from the guest first. If that fails it must not be
+            // released, so the unref is refused and the resource kept: a
+            // resource the guest still holds is a far smaller problem than a
+            // window into freed host memory.
+            if self.withdraw_mapping(&resource, guest_addr).is_err() {
+                log::error!(
+                    "NESBOX_GPU: unref_resource: resource {resource_id} at {guest_addr:#x} \
+                     would not unmap, refusing the unref"
+                );
+                self.resources.insert(resource_id, resource);
+                return Err(ErrUnspec);
+            }
+            if resource.rutabaga_external_mapping {
+                if let Err(e) = self.rutabaga.unmap(resource_id) {
+                    // As in `resource_unmap_blob`: worth knowing about, not
+                    // worth abandoning the rest of the teardown over.
+                    log::warn!(
+                        "NESBOX_GPU: unref_resource: virglrenderer kept resource \
+                         {resource_id} mapped: {e:?}"
+                    );
+                }
+            }
+            // Credited here too, or the window drains over a session.
+            self.window.release(resource.size);
+        }
+
+        self.rutabaga.unref_resource(resource_id)?;
+        if let Some(vram) = self.vram.as_mut() {
+            vram.release_resource(resource_id);
+        }
+        Ok(OkNoData)
+    }
+
+    pub fn transfer_write(
+        &mut self,
+        ctx_id: u32,
+        resource_id: u32,
+        transfer: Transfer3D,
+    ) -> VirtioGpuResult {
+        self.rutabaga
+            .transfer_write(ctx_id, resource_id, transfer, None)?;
+        Ok(OkNoData)
+    }
+
+    pub fn transfer_read(
+        &mut self,
+        _ctx_id: u32,
+        _resource_id: u32,
+        _transfer: Transfer3D,
+        _buf: Option<&mut [u8]>,
+    ) -> VirtioGpuResult {
+        // Not required for the headless use-case.
+        log::warn!("virtio-gpu: transfer_read is not implemented");
+        Err(ErrUnspec)
+    }
+
+    pub fn attach_backing(
+        &mut self,
+        resource_id: u32,
+        mem: &GuestMemoryMmap,
+        vecs: Vec<(GuestAddress, usize)>,
+    ) -> VirtioGpuResult {
+        let iovecs = sglist_to_rutabaga_iovecs(&vecs, mem).map_err(|_| ErrUnspec)?;
+        self.rutabaga.attach_backing(resource_id, iovecs)?;
+        Ok(OkNoData)
+    }
+
+    pub fn detach_backing(&mut self, resource_id: u32) -> VirtioGpuResult {
+        self.rutabaga.detach_backing(resource_id)?;
+        Ok(OkNoData)
+    }
+
+    pub fn resource_assign_uuid(&self, resource_id: u32) -> VirtioGpuResult {
+        if !self.resources.contains_key(&resource_id) {
+            return Err(ErrInvalidResourceId);
+        }
+        let mut uuid = [0u8; 16];
+        for (i, byte) in resource_id.to_be_bytes().iter().enumerate() {
+            uuid[12 + i] = *byte;
+        }
+        Ok(OkResourceUuid { uuid })
+    }
+
+    // -----------------------------------------------------------------------
+    // Capability sets
+    // -----------------------------------------------------------------------
+
+    pub fn get_capset_info(&self, index: u32) -> VirtioGpuResult {
+        let (capset_id, version, size) = self.rutabaga.get_capset_info(index)?;
+        Ok(OkCapsetInfo {
+            capset_id,
+            version,
+            size,
+        })
+    }
+
+    pub fn get_capset(&self, capset_id: u32, version: u32) -> VirtioGpuResult {
+        let capset = self.rutabaga.get_capset(capset_id, version)?;
+        if capset_id == 6 {
+            log::info!(
+                "NESBOX_GPU: DRM capset {} bytes, first 24: {:02x?}",
+                capset.len(),
+                &capset[..capset.len().min(24)]
+            );
+            if capset.len() >= 20 {
+                let ct = u32::from_le_bytes([capset[16], capset[17], capset[18], capset[19]]);
+                log::info!(
+                    "NESBOX_GPU: DRM capset context_type={} (1=msm, 2=amdgpu, 3=i915)",
+                    ct
+                );
+            }
+        }
+        Ok(OkCapset(capset))
+    }
+
+    // -----------------------------------------------------------------------
+    // Context management
+    // -----------------------------------------------------------------------
+
+    pub fn create_context(
+        &mut self,
+        ctx_id: u32,
+        context_init: u32,
+        context_name: Option<&str>,
+    ) -> VirtioGpuResult {
+        log::info!(
+            "NESBOX_GPU: create_context ctx_id={} context_init={:#x} ({:#b}) name={:?}",
+            ctx_id,
+            context_init,
+            context_init,
+            context_name
+        );
+        match self
+            .rutabaga
+            .create_context(ctx_id, context_init, context_name)
+        {
+            Ok(_) => {
+                log::info!("NESBOX_GPU: create_context succeeded");
+                if let Some(vram) = self.vram.as_mut() {
+                    vram.note_context(ctx_id, context_init);
+                }
+                Ok(GpuResponse::OkNoData)
+            }
+            Err(e) => {
+                log::error!("NESBOX_GPU: create_context FAILED: {:?}", e);
+                Err(GpuResponse::ErrUnspec)
+            }
+        }
+    }
+
+    pub fn destroy_context(&mut self, ctx_id: u32) -> VirtioGpuResult {
+        self.rutabaga.destroy_context(ctx_id)?;
+        // Releases charges the guest allocated but never claimed with a blob
+        // create; without this they would be held for the life of the VM.
+        if let Some(vram) = self.vram.as_mut() {
+            vram.forget_context(ctx_id);
+        }
+        Ok(OkNoData)
+    }
+
+    pub fn context_attach_resource(&mut self, ctx_id: u32, resource_id: u32) -> VirtioGpuResult {
+        self.rutabaga.context_attach_resource(ctx_id, resource_id)?;
+        Ok(OkNoData)
+    }
+
+    pub fn context_detach_resource(&mut self, ctx_id: u32, resource_id: u32) -> VirtioGpuResult {
+        self.rutabaga.context_detach_resource(ctx_id, resource_id)?;
+        Ok(OkNoData)
+    }
+
+    pub fn submit_command(
+        &mut self,
+        ctx_id: u32,
+        commands: &mut [u8],
+        fence_ids: &[u64],
+    ) -> VirtioGpuResult {
+        // Count the device memory this stream asks for. Measurement only: the
+        // refusal happens in the renderer, because a refusal here cannot be
+        // reported to the guest. RESOURCE_CREATE_BLOB is asynchronous, so
+        // dropping the submit leaves the guest holding a buffer it believes was
+        // created, waiting on a fence that will never signal -- measured, and it
+        // hangs the guest rather than failing it. See `vram.rs`.
+        // Unconditional, unlike the accounting below it: what a stream contains
+        // is the question, and gating the only parser in the tree on a quota
+        // being configured is why nobody could answer it.
+        let at = std::time::Instant::now();
+        super::vram::count_ccmds(commands, &self.metrics.counters);
+        self.metrics.counters.observe.since(at);
+
+        if let Some(vram) = self.vram.as_mut() {
+            if let Err(why) = vram.observe_submit(ctx_id, commands) {
+                log::warn!("virtio-gpu: ctx {ctx_id}: {why} -- {}", vram.summary());
+            }
+        }
+
+        GpuCounters::inc(&self.metrics.counters.submits);
+        let at = std::time::Instant::now();
+        let submitted = self.rutabaga.submit_command(ctx_id, commands, fence_ids);
+        self.metrics.counters.submit.since(at);
+        submitted.map_err(|e| {
+            GpuCounters::inc(&self.metrics.counters.submits_failed);
+            log::error!("NESBOX_GPU: submit_command FAILED ctx={} : {:?}", ctx_id, e);
+            ErrUnspec
+        })?;
+        Ok(OkNoData)
+    }
+
+    pub fn create_fence(&mut self, fence: RutabagaFence) -> VirtioGpuResult {
+        let at = std::time::Instant::now();
+        let made = self.rutabaga.create_fence(fence);
+        self.metrics.counters.fence_create.since(at);
+        made?;
+        Ok(OkNoData)
+    }
+
+    /// Register a pending descriptor that waits for `fence_id` to complete.
+    /// Returns `true` if the fence has already completed (caller should
+    /// immediately add the descriptor to the used ring).
+    pub fn process_fence(
+        &mut self,
+        ring: VirtioGpuRing,
+        fence_id: u64,
+        desc_index: u16,
+        len: u32,
+    ) -> bool {
+        let mut fs = self.fence_state.lock().unwrap();
+        let already_done = fence_id <= *fs.completed_fences.get(&ring).unwrap_or(&0);
+
+        if !already_done {
+            fs.descs.push(FenceDescriptor {
+                ring,
+                fence_id,
+                desc_index,
+                len,
+                recorded: std::time::Instant::now(),
+            });
+        }
+        already_done
+    }
+
+    // -----------------------------------------------------------------------
+    // Blob resource management
+    // -----------------------------------------------------------------------
+
+    pub fn resource_create_blob(
+        &mut self,
+        ctx_id: u32,
+        resource_id: u32,
+        resource_create_blob: ResourceCreateBlob,
+        vecs: Vec<(GuestAddress, usize)>,
+        mem: &GuestMemoryMmap,
+    ) -> VirtioGpuResult {
+        if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
+            log::error!("virtio-gpu: GUEST_HANDLE blob creation is not implemented");
+            return Err(ErrUnspec);
+        }
+
+        let rutabaga_iovecs = if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
+            Some(sglist_to_rutabaga_iovecs(&vecs, mem).map_err(|_| ErrUnspec)?)
+        } else {
+            None
+        };
+
+        self.rutabaga.resource_create_blob(
+            ctx_id,
+            resource_id,
+            resource_create_blob,
+            rutabaga_iovecs,
+            None,
+        )?;
+
+        // The charge taken at GEM_NEW now has an id the guest can free it by.
+        if let Some(vram) = self.vram.as_mut() {
+            vram.claim_blob(ctx_id, resource_create_blob.blob_id, resource_id);
+        }
+
+        let resource = VirtioGpuResource::new(resource_create_blob.size);
+        self.resources.insert(resource_id, resource);
+        Ok(self.result_from_query(resource_id))
+    }
+
+    // -----------------------------------------------------------------------
+    // Blob resource host mapping
+    // -----------------------------------------------------------------------
+    //
+    // Maps a blob resource into the host-visible window so the guest can reach
+    // it through VIRTIO_GPU_SHM_ID_HOST_VISIBLE. The window is BAR2, registered
+    // with KVM, so once a resource is mapped the guest touches it without
+    // trapping to us at all.
+
+    #[cfg(target_os = "linux")]
+    pub fn resource_map_blob(
+        &mut self,
+        resource_id: u32,
+        shm_region: &VirtioShmRegion,
+        offset: u64,
+    ) -> VirtioGpuResult {
+        let resource = self.resources.get(&resource_id).ok_or_else(|| {
+            log::error!("NESBOX_GPU: map_blob: resource {resource_id} not found");
+            ErrInvalidResourceId
+        })?;
+        let res_size = resource.size;
+
+        // Refuse a resource that is already mapped, and refuse it before anything
+        // is charged.
+        //
+        // Nothing in the protocol stops a guest mapping the same resource twice,
+        // and doing so used to be quietly destructive in two ways. The window
+        // quota was charged on each map and credited on the single unmap, so a
+        // loop drained it permanently. Worse, `shmem_offset` records only the
+        // latest offset while `HostMemoryMapper` keys its slots by guest address,
+        // so the earlier mapping was never torn down: its KVM memory slot leaked
+        // and the stale window mapping stayed addressable by the guest.
+        //
+        // Upstream is no help here -- crosvm overwrites `shmem_offset` the same
+        // way -- but our slots are a bounded resource, so the guard is ours to
+        // add. The guest must unmap before it maps again.
+        if let Some(existing) = resource.shmem_offset {
+            log::warn!(
+                "NESBOX_GPU: map_blob: resource {resource_id} is already mapped at \
+                 offset {existing:#x}; refusing to map it again at {offset:#x}"
+            );
+            return Err(ErrUnspec);
+        }
+
+        // Charged before anything is mapped, so a refusal leaves no host address
+        // space committed. RESOURCE_MAP_BLOB is synchronous, so unlike a VRAM
+        // refusal this one reaches the guest -- as a failed mmap, which Mesa
+        // reports as a failed buffer map.
+        if let Err(why) = self.window.try_map(res_size) {
+            log::warn!(
+                "NESBOX_GPU: map_blob: refusing resource {resource_id}: {why} -- {}",
+                self.window.summary()
+            );
+            return Err(ErrUnspec);
+        }
+
+        let map_info = match self.rutabaga.map_info(resource_id) {
+            Ok(i) => i,
+            Err(e) => {
+                self.window.release(res_size);
+                log::error!("NESBOX_GPU: map_blob: map_info failed: {e:?}");
+                return Err(ErrUnspec);
+            }
+        };
+
+        if offset.saturating_add(res_size) > shm_region.size as u64 {
+            self.window.release(res_size);
+            log::error!(
+                "NESBOX_GPU: map_blob: {res_size:#x} bytes at offset {offset:#x} does not \
+                 fit the {:#x}-byte window",
+                shm_region.size
+            );
+            return Err(ErrUnspec);
+        }
+
+        let guest_addr = shm_region.guest_addr + offset;
+
+        // **Placed inside the window first.** The window is one KVM memory slot
+        // registered at boot, so putting a resource in it is an `mmap` and
+        // nothing else. The alternative below needs a memslot update on a
+        // running VM, which zaps shadow page tables and synchronises against
+        // every vCPU: measured at 732 µs to map and 2.13 ms to unmap, tens of
+        // times a second, and every one of them a stall the guest sees.
+        let placed = match self.mapper.host_addr(guest_addr, res_size) {
+            None => false,
+            Some(host) => {
+                let at = std::time::Instant::now();
+                // SAFETY: `host` is inside the window reservation, which the
+                // mapper owns and has just bounds-checked, and the call maps
+                // over it rather than anywhere else. The resource id is one
+                // virglrenderer gave us.
+                let ret = unsafe {
+                    virgl_renderer_resource_map_fixed(resource_id, host as *mut std::ffi::c_void)
+                };
+                self.metrics.counters.placed_map.since(at);
+                match ret {
+                    0 => true,
+                    EOPNOTSUPP => {
+                        // A documented answer for some resource types, not a
+                        // fault. Counted so the share still paying the old cost
+                        // is visible rather than inferred.
+                        GpuCounters::inc(&self.metrics.counters.place_refused);
+                        false
+                    }
+                    err => {
+                        log::warn!(
+                            "NESBOX_GPU: map_blob: placing resource {resource_id} at \
+                             {host:#x} failed ({err}); falling back to its own slot"
+                        );
+                        GpuCounters::inc(&self.metrics.counters.place_refused);
+                        false
+                    }
+                }
+            }
+        };
+
+        if !placed {
+            // The slow path, for a resource virglrenderer will not place and for
+            // a host where the window could not be reserved at all.
+            //
+            // The obvious alternative -- export the resource as a dmabuf and map
+            // the fd -- cannot work on stock amdgpu. RADV creates buffers with
+            // AMDGPU_GEM_CREATE_VM_ALWAYS_VALID, and `amdgpu_gem_prime_export`
+            // refuses those with EPERM unconditionally.
+            let at = std::time::Instant::now();
+            let mapped = self.rutabaga.map(resource_id);
+            self.metrics.counters.rutabaga_map.since(at);
+            let mapping = match mapped {
+                Ok(m) => m,
+                Err(e) => {
+                    self.window.release(res_size);
+                    log::error!(
+                        "NESBOX_GPU: map_blob: resource {resource_id} would not map: {e:?}"
+                    );
+                    return Err(ErrUnspec);
+                }
+            };
+
+            if mapping.size < res_size {
+                log::error!(
+                    "NESBOX_GPU: map_blob: resource {resource_id} mapped {:#x} bytes, \
+                     short of the {res_size:#x} the guest expects",
+                    mapping.size
+                );
+                let _ = self.rutabaga.unmap(resource_id);
+                self.window.release(res_size);
+                return Err(ErrUnspec);
+            }
+
+            let at = std::time::Instant::now();
+            let published = self.mapper.map(guest_addr, mapping.ptr, mapping.size);
+            self.metrics.counters.kvm_map.since(at);
+            if let Err(err) = published {
+                log::error!(
+                    "NESBOX_GPU: map_blob: could not publish {:#x} bytes at guest \
+                     {guest_addr:#x}: {err:#}",
+                    mapping.size
+                );
+                let _ = self.rutabaga.unmap(resource_id);
+                self.window.release(res_size);
+                return Err(ErrUnspec);
+            }
+        }
+
+        let resource = self
+            .resources
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        resource.shmem_offset = Some(offset);
+        resource.rutabaga_external_mapping = !placed;
+        resource.placed = placed;
+        Ok(OkMapInfo {
+            map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
+        })
+    }
+
+    /// Take a mapping away from the guest, by whichever means made it.
+    ///
+    /// **The one place that decides between the two.** They were separate once
+    /// and disagreed -- `resource_unmap_blob` removed a slot while
+    /// `unref_resource` did not -- and the guest went on addressing host memory
+    /// the renderer had freed. Both callers now ask this.
+    fn withdraw_mapping(
+        &self,
+        resource: &VirtioGpuResource,
+        guest_addr: u64,
+    ) -> std::result::Result<(), ()> {
+        if resource.placed {
+            // Overwritten with PROT_NONE rather than unmapped, and
+            // virglrenderer is *not* told: it never recorded this mapping, so
+            // its `resource_unmap` would refuse it with EINVAL, and if it ever
+            // stopped refusing it would `munmap` a hole in the middle of the
+            // window the guest still has a memory slot over.
+            let at = std::time::Instant::now();
+            let withdrawn = self.mapper.withdraw(guest_addr, resource.size);
+            self.metrics.counters.placed_withdraw.since(at);
+            return withdrawn.map_err(|err| {
+                log::error!("NESBOX_GPU: withdrawing {guest_addr:#x}: {err:#}");
+            });
+        }
+
+        let at = std::time::Instant::now();
+        let removed = self.mapper.unmap(guest_addr, resource.size);
+        self.metrics.counters.kvm_unmap.since(at);
+        removed.map_err(|err| {
+            log::error!("NESBOX_GPU: unmapping {guest_addr:#x}: {err:#}");
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn resource_unmap_blob(
+        &mut self,
+        resource_id: u32,
+        shm_region: &VirtioShmRegion,
+    ) -> VirtioGpuResult {
+        let resource = self
+            .resources
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        let size = resource.size;
+        let external = resource.rutabaga_external_mapping;
+        // Same helper `unref_resource` uses, so the two teardown paths cannot
+        // disagree about whether a resource is mapped or where.
+        let guest_addr = resource.mapped_at(shm_region).ok_or(ErrUnspec)?;
+
+        // Take it away from the guest first: the renderer's mapping must not be
+        // released while the guest can still reach it.
+        let snapshot = *resource;
+        if self.withdraw_mapping(&snapshot, guest_addr).is_err() {
+            // Not worth ending the VM over one resource.
+            return Err(ErrUnspec);
+        }
+        if external {
+            let at = std::time::Instant::now();
+            let released = self.rutabaga.unmap(resource_id);
+            self.metrics.counters.rutabaga_unmap.since(at);
+            if let Err(e) = released {
+                log::warn!(
+                    "NESBOX_GPU: unmap_blob: virglrenderer kept resource {resource_id} mapped: {e:?}"
+                );
+            }
+        }
+
+        let resource = self
+            .resources
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        resource.shmem_offset = None;
+        resource.rutabaga_external_mapping = false;
+        resource.placed = false;
+        self.window.release(size);
+        Ok(OkNoData)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_associated_scanouts() {
+        let mut s = AssociatedScanouts::default();
+        assert!(!s.has_any_enabled());
+        assert_eq!(s.iter_enabled().next(), None);
+
+        s.enable(1);
+        assert!(s.has_any_enabled());
+        s.disable(1);
+        assert!(!s.has_any_enabled());
+
+        for i in 0..VIRTIO_GPU_MAX_SCANOUTS {
+            s.enable(i);
+        }
+        assert!(s.has_any_enabled());
+        assert_eq!(
+            s.iter_enabled().collect::<Vec<_>>(),
+            (0..VIRTIO_GPU_MAX_SCANOUTS).collect::<Vec<_>>()
+        );
+
+        for i in (0..VIRTIO_GPU_MAX_SCANOUTS).filter(|x| x % 2 == 0) {
+            s.disable(i);
+        }
+        assert_eq!(
+            s.iter_enabled().collect::<Vec<_>>(),
+            (1..VIRTIO_GPU_MAX_SCANOUTS).step_by(2).collect::<Vec<_>>()
+        );
+    }
+
+    const WINDOW: VirtioShmRegion = VirtioShmRegion {
+        guest_addr: 0xfff0_0000_0000,
+        size: 0x2_0000_0000,
+    };
+
+    /// `unref_resource` and `resource_unmap_blob` both have to tear a mapping
+    /// down, and they disagreed: unmap keyed on `shmem_offset` and removed the
+    /// KVM slot, unref keyed on `rutabaga_external_mapping` and did not. A guest
+    /// that mapped a blob and then unref'd it without unmapping left the slot
+    /// registered -- finite, so a loop exhausted them, and worse, the guest went
+    /// on addressing host memory the renderer had already freed.
+    ///
+    /// Testing the whole path needs a rutabaga context and therefore a real GPU,
+    /// so what is locked here is the thing they disagreed about: one answer to
+    /// "is this mapped, and where".
+    #[test]
+    fn a_mapped_resource_reports_where_it_is_mapped() {
+        let mut resource = VirtioGpuResource::new(0x1000);
+        assert_eq!(
+            resource.mapped_at(&WINDOW),
+            None,
+            "a resource that was never mapped has no address to unmap"
+        );
+
+        // What a successful RESOURCE_MAP_BLOB records.
+        resource.shmem_offset = Some(0x4000);
+        resource.rutabaga_external_mapping = true;
+        assert_eq!(
+            resource.mapped_at(&WINDOW),
+            Some(WINDOW.guest_addr + 0x4000),
+            "and one that was mapped reports the address the slot is keyed by"
+        );
+
+        // What unmap clears. Both paths must then agree there is nothing to do,
+        // so a later unref does not try to remove a slot that is already gone.
+        resource.shmem_offset = None;
+        resource.rutabaga_external_mapping = false;
+        assert_eq!(resource.mapped_at(&WINDOW), None);
+    }
+
+    /// The specific inversion that caused the bug: `rutabaga_external_mapping`
+    /// is not the signal, and a teardown path that consults it instead of the
+    /// offset has no address to hand `HostMemoryMapper::unmap` at all.
+    #[test]
+    fn the_renderer_flag_is_not_what_says_a_slot_is_registered() {
+        let mut resource = VirtioGpuResource::new(0x1000);
+        resource.rutabaga_external_mapping = true;
+        assert_eq!(
+            resource.mapped_at(&WINDOW),
+            None,
+            "the renderer flag alone must never be read as 'a KVM slot exists'"
+        );
+    }
+}
