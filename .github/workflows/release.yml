@@ -109,6 +109,13 @@ jobs:
       - name: Build viewer
         run: packaging/build.sh viewer
 
+      # conduit-stream links the distro's glibc/EGL/GBM/OpenSSL, so it is
+      # built here in the distro container; rustup reads rust-toolchain.toml.
+      - name: Rust toolchain for the stream host
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Build stream host
         run: packaging/build.sh stream
 
