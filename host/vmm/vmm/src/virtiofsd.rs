@@ -153,7 +153,22 @@ impl Virtiofsd {
             })
             .stdin(Stdio::null())
             .stdout(Stdio::null());
-        if read_only {
+        // `--readonly` arrived in virtiofsd 1.11; Ubuntu 24.04 ships 1.10, which
+        // rejects it and exits. Ask the binary first and fall back to a
+        // writable share there rather than not starting the VM at all.
+        let supports_readonly = read_only
+            && Command::new(&binary)
+                .arg("--help")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains("--readonly"))
+                .unwrap_or(false);
+        if read_only && !supports_readonly {
+            log::warn!(
+                "virtiofsd at {} has no --readonly; sharing {tag} writable",
+                binary.display()
+            );
+        }
+        if supports_readonly {
             cmd.arg("--readonly");
         }
         if let Some(guest) = guest_owner {
