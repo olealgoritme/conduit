@@ -8,6 +8,7 @@
 #   packaging/build.sh deps                 install build dependencies (root; apt/dnf/pacman)
 #   packaging/build.sh rust                 backend, VMM and CLI      -> dist/rust/bin
 #   packaging/build.sh viewer               Wayland/X11 viewer        -> dist/viewer/bin
+#   packaging/build.sh stream               network stream host       -> dist/stream/bin
 #   packaging/build.sh qemu                 bundled QEMU 11.1         -> dist/qemu-root
 #   packaging/build.sh stage                assemble the install tree -> $STAGE
 #   packaging/build.sh bundle-libs          copy non-glibc .so deps into /opt/conduit/lib (tarball)
@@ -91,6 +92,7 @@ cmd_deps() {
             musl-tools \
             libwayland-dev wayland-protocols libxcb1-dev libxcb-dri3-dev \
             libxcb-present-dev libxcb-render0-dev libxcb-xinput-dev libgbm-dev \
+            libssl-dev libegl-dev \
             libglib2.0-dev libpixman-1-dev libslirp-dev libseccomp-dev \
             libcap-ng-dev libzstd-dev libaio-dev libfdt-dev
         ;;
@@ -101,13 +103,14 @@ cmd_deps() {
             python3 ninja-build meson flex bison bzip2 diffutils findutils \
             rpm-build \
             wayland-devel wayland-protocols-devel libxcb-devel mesa-libgbm-devel \
+            openssl-devel mesa-libEGL-devel \
             glib2-devel pixman-devel libslirp-devel libseccomp-devel \
             libcap-ng-devel libzstd-devel libaio-devel libfdt-devel
         ;;
     arch)
         pacman -Syu --noconfirm --needed \
             base-devel git curl xz file patchelf gnupg python ninja meson flex bison \
-            wayland wayland-protocols libxcb mesa \
+            wayland wayland-protocols libxcb mesa openssl \
             glib2 pixman libslirp libseccomp libcap-ng zstd libaio dtc
         ;;
     esac
@@ -180,6 +183,17 @@ cmd_viewer() {
     install -m0755 "$ROOT/host/viewer/$VIEWER_BIN_SRC" "$DIST/viewer/bin/conduit-viewer"
 }
 
+# -------------------------------------------------------------- stream -----
+# conduit-stream (host/stream): links glibc, libEGL, libgbm and OpenSSL, so it
+# is always built for the host target, like the viewer.
+cmd_stream() {
+    log "stream (conduit-stream)"
+    (cd "$ROOT/host/stream" && cargo build --locked --release)
+    mkdir -p "$DIST/stream/bin"
+    install -m0755 "$(target_dir "$ROOT/host/stream")/release/conduit-stream" \
+        "$DIST/stream/bin/conduit-stream"
+}
+
 # ---------------------------------------------------------------- qemu -----
 # host/qemu/build-qemu.sh fetches (signature-checked), patches, configures
 # with --prefix=$PREFIX and builds in $WORKDIR/build. It is run without
@@ -221,6 +235,11 @@ cmd_stage() {
     done
     [ -x "$DIST/viewer/bin/conduit-viewer" ] || die "missing viewer (run: build.sh viewer)"
     install -m0755 "$DIST/viewer/bin/conduit-viewer" "$o/bin/conduit-viewer"
+    if [ -x "$DIST/stream/bin/conduit-stream" ]; then
+        install -m0755 "$DIST/stream/bin/conduit-stream" "$o/bin/conduit-stream"
+    else
+        log "warning: no conduit-stream (run: build.sh stream); \`conduit stream\` will not work from this install"
+    fi
 
     if [ "$BUNDLE_QEMU" = 1 ]; then
         [ -d "$DIST/qemu-root$PREFIX" ] || die "missing QEMU (run: build.sh qemu)"
@@ -398,6 +417,7 @@ main() {
         deps) cmd_deps ;;
         rust) cmd_rust ;;
         viewer) cmd_viewer ;;
+        stream) cmd_stream ;;
         qemu) cmd_qemu ;;
         stage) cmd_stage ;;
         bundle-libs) cmd_bundle_libs ;;

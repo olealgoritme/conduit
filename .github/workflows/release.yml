@@ -109,6 +109,9 @@ jobs:
       - name: Build viewer
         run: packaging/build.sh viewer
 
+      - name: Build stream host
+        run: packaging/build.sh stream
+
       - name: Stage
         run: |
           if [ "${{ matrix.format }}" = tarball ]; then

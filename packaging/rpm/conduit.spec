@@ -26,6 +26,7 @@ BuildRequires:  rust >= 1.90
 BuildRequires:  gcc gcc-c++ make pkgconf-pkg-config file
 BuildRequires:  python3 ninja-build meson flex bison bzip2 diffutils findutils
 BuildRequires:  wayland-devel wayland-protocols-devel libxcb-devel mesa-libgbm-devel
+BuildRequires:  openssl-devel mesa-libEGL-devel
 BuildRequires:  glib2-devel pixman-devel libslirp-devel libseccomp-devel
 BuildRequires:  libcap-ng-devel libzstd-devel libaio-devel libfdt-devel
 Recommends:     policycoreutils-python-utils
@@ -44,6 +45,7 @@ the zero-copy viewer, a built-in VM runner and a bundled QEMU 11.1 in
 export VERSION=%{version} RUST_TARGET=host JOBS=%{_smp_build_ncpus}
 packaging/build.sh rust
 packaging/build.sh viewer
+packaging/build.sh stream
 packaging/build.sh qemu
 
 %install

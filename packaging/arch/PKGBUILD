@@ -13,7 +13,7 @@ arch=(x86_64)
 url="https://github.com/olealgoritme/conduit"
 license=('Apache-2.0' 'BSD-3-Clause' 'GPL-2.0-only')
 makedepends=(git rustup base-devel python ninja meson flex bison file
-             wayland wayland-protocols libxcb mesa
+             wayland wayland-protocols libxcb mesa openssl
              glib2 pixman libslirp libseccomp libcap-ng zstd libaio dtc)
 options=(!lto !debug)
 source=("$pkgbase::git+$url.git#tag=v$pkgver")
@@ -31,6 +31,7 @@ build() {
   export VERSION=$pkgver RUST_TARGET=host
   packaging/build.sh rust
   packaging/build.sh viewer
+  packaging/build.sh stream
   packaging/build.sh qemu
 }
 
