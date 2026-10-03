@@ -2375,6 +2375,22 @@ static bool nb_rate_exceeded(struct nb_sink *s)
 }
 
 /*
+ * CLIPBOARD RECORDS ARE NOT COUNTED ABOVE.  A 1 MiB copy in the VM is ~39k
+ * 27-byte records sent as fast as the socket takes them, which the general
+ * 20k/s limit took for a flood and answered by disconnecting the VMM.  They
+ * have their own budget (nb_clip_rate_exceeded drops a copy that overruns
+ * it); this is only the backstop against using them to burn the CPU: several
+ * times what the largest legitimate copy needs, in the same 1s window.
+ */
+#define NB_CLIP_FLOOD_PER_SEC (4u * NB_CLIP_LARGE_MAX_PER_SEC)
+
+static bool nb_clip_flood(const struct nb_sink *s)
+{
+    return nb_now_ms() - s->clip_rate_ms < 1000u &&
+           s->clip_rate_count > NB_CLIP_FLOOD_PER_SEC;
+}
+
+/*
  * AUDIT B-1.  This loop used to run until the socket drained, which a client
  * controls: it can keep data available indefinitely, and measured on hardware a
  * flood of valid COMMITs pinned the broker at 100% of a core with `syscall`
@@ -2489,7 +2505,8 @@ void nb_sink_readable(struct nb_sink *s)
             memcpy(&c, s->rx, sizeof(c));
             s->rxlen = 0;
             s->rxfd = -1;
-            if (nb_rate_exceeded(s)) {
+            if (c.type == NVKVM_BROKER_CMD_CLIPBOARD ? nb_clip_flood(s)
+                                                     : nb_rate_exceeded(s)) {
                 if (fd >= 0) {
                     close(fd);
                 }

@@ -94,6 +94,9 @@ extern int nb_trace_frames;
 
 /* Keys that mean "paste" and so trigger a host->guest send. */
 #define NB_CLIP_MAX_TRIGGERS 8
+/* A host clipboard owner that has sent nothing for this long is given up on:
+ * the held paste chord is released and later fetches are no longer -EBUSY. */
+#define NB_CLIP_FETCH_TIMEOUT_MS 2000u
 struct nb_clip_trigger {
     unsigned code;              /* evdev key code                           */
     bool     need_ctrl;

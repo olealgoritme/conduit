@@ -128,6 +128,26 @@ def test_push_both():
           "the echo of a pushed clipboard reached the host", log)
 
 
+def test_guest_to_host_1mib():
+    """A full 1 MiB copy in the VM is ~39k records in well under a second: it
+    must be applied, not taken for a command flood that disconnects the VMM."""
+    with tempfile.TemporaryDirectory() as tmp:
+        b = Broker(tmp, "both")
+        b.caps(CLIENT_CLIPBOARD | CLIENT_CLIP_LARGE)
+        b.stdin("f 1")
+        text = b"z" * (1 << 20)
+        b.send_guest(text)
+        time.sleep(0.5)
+        # Still connected: a later small copy is applied too.
+        b.send_guest(b"after")
+        log = b.close()
+    check(f"TEST clipboard from guest: {1 << 20} bytes" in log,
+          "a 1 MiB guest->host copy was not applied", log)
+    check("TEST clipboard from guest: 5 bytes" in log,
+          "the VMM was disconnected by a 1 MiB copy", log)
+    check("violation" not in log.lower(), "a 1 MiB copy was a violation", log)
+
+
 def test_legacy_client_capped():
     with tempfile.TemporaryDirectory() as tmp:
         b = Broker(tmp, "both")
@@ -169,6 +189,7 @@ def main():
         raise SystemExit("usage: test_clipboard_push.py /path/to/broker")
     BROKER = os.path.abspath(sys.argv[1])
     test_push_both()
+    test_guest_to_host_1mib()
     test_legacy_client_capped()
     test_to_guest_only()
     test_no_agent_no_push()

@@ -225,6 +225,58 @@ class AgentLoopTest(unittest.TestCase):
         self.host = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
 
 
+class StalledDeviceTest(unittest.TestCase):
+    """A 1 MiB copy to a host that is not draining must not stall the loop:
+    host->guest keeps working, and the record arrives whole once it drains."""
+
+    def setUp(self):
+        # A stream socket stands in for the device: unlike a datagram it
+        # holds 1 MiB, and a write blocks while nobody reads, as the driver's
+        # does while the host has not answered.
+        self.host, guest = socket.socketpair(socket.AF_UNIX,
+                                             socket.SOCK_STREAM)
+        for sk in (self.host, guest):
+            sk.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            sk.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        fd = guest.detach()
+        os.set_blocking(fd, False)    # as Device.ensure() opens it
+        self.dev = agent.Device(path="/nonexistent", fd=fd)
+        self.be = FakeBackend()
+        self.a = agent.Agent(self.dev, self.be)
+        self.a.start()
+
+    def tearDown(self):
+        self.host.close()
+        if self.dev.fd is not None:
+            os.close(self.dev.fd)
+        self.be.close()
+
+    def test_1mib_copy_does_not_block_the_loop(self):
+        big = b"q" * agent.MAX_BYTES
+        self.be.copy(big)
+        t = time.monotonic()
+        self.a.step(timeout=0.05)
+        self.assertLess(time.monotonic() - t, 1.0, "the loop waited")
+        self.assertTrue(self.dev.busy() or self.dev._thread.is_alive())
+        # Host -> guest still flows while the guest's write is stuck.
+        self.host.send(agent.encode_record(b"from host", 3))
+        for _ in range(5):
+            self.a.step(timeout=0.05)
+        self.assertEqual(self.be.set_calls, [b"from host"])
+        # Drain: one whole record, 1 MiB of data.
+        want = agent.HEADER_LEN + len(big)
+        got = bytearray()
+        self.host.settimeout(5)
+        while len(got) < want:
+            got += self.host.recv(1 << 16)
+        self.assertEqual(agent.decode_record(bytes(got))[2], big)
+        end = time.monotonic() + 2
+        while time.monotonic() < end and not self.dev._results:
+            time.sleep(0.01)
+        self.assertEqual([(len(t), e) for t, e in self.dev.results()],
+                         [(len(big), None)])
+
+
 @unittest.skipUnless(shutil.which("Xvfb") and shutil.which("xclip"),
                      "needs Xvfb and xclip")
 class X11Test(unittest.TestCase):

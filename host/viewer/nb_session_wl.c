@@ -440,6 +440,7 @@ struct nb_wl {
     size_t                         src_len;
     int                            fetch_fd;   /* pipe being read, or -1     */
     uint64_t                       fetch_generation;
+    uint64_t                       fetch_deadline_ms;  /* see wl_tick_fetch */
     uint64_t                       clip_notice_until;  /* title-bar notice   */
     /*
      * A guest copy is only PUT ON THE HOST CLIPBOARD while this window has
@@ -2158,6 +2159,7 @@ static int wl_fetch_clipboard(struct nb_session *s, struct nb_sink *sink,
     w->fetch_fd = fds[0];
     w->fetch_len = 0;
     w->fetch_generation = generation;
+    w->fetch_deadline_ms = nb_now_ms_wl() + NB_CLIP_FETCH_TIMEOUT_MS;
     return 0;
 }
 
@@ -2173,6 +2175,7 @@ static bool wl_fetch_pump(struct nb_wl *w, struct nb_sink *sink)
 
         if (n > 0) {
             w->fetch_len += (size_t)n;
+            w->fetch_deadline_ms = nb_now_ms_wl() + NB_CLIP_FETCH_TIMEOUT_MS;
             if (w->fetch_len > w->fetch_cap) {
                 nb_log("clipboard: host selection is larger than the %zu-byte "
                        "cap; not sending it", w->fetch_cap);
@@ -2924,10 +2927,12 @@ static int wl_tick_clip(struct nb_session *s);
 
 static int wl_tick_viewer(struct nb_wl *w, int next);
 
+static int wl_tick_fetch(struct nb_wl *w, int next);
+
 static int wl_tick(struct nb_session *s)
 {
     struct nb_wl *w = s->priv;
-    int r = wl_tick_clip(s);
+    int r = wl_tick_fetch(w, wl_tick_clip(s));
 
     return wl_tick_viewer(w, r);
 }
@@ -4588,6 +4593,39 @@ static int wl_tick_min(int a, uint64_t due_ms, uint64_t now)
     int b = due_ms > now ? (int)(due_ms - now) : 0;
 
     return a < 0 || b < a ? b : a;
+}
+
+/*
+ * A HOST CLIPBOARD OWNER THAT NEVER ANSWERS.  The selection is read through a
+ * pipe the owning program writes; one that never writes nor closes it (hung,
+ * or simply slow to notice) used to leave the paste chord held -- every later
+ * Ctrl+V swallowed -- and every later fetch -EBUSY, for good.  Give up after
+ * NB_CLIP_FETCH_TIMEOUT_MS without progress: release the chord, drop the pipe.
+ */
+static int wl_tick_fetch(struct nb_wl *w, int next)
+{
+    uint64_t now;
+
+    if (w->fetch_fd < 0) {
+        return next;
+    }
+    now = nb_now_ms_wl();
+    if (now < w->fetch_deadline_ms) {
+        return wl_tick_min(next, w->fetch_deadline_ms, now);
+    }
+    nb_log("clipboard: the program holding the host clipboard sent nothing "
+           "for %u ms; giving up on it", NB_CLIP_FETCH_TIMEOUT_MS);
+    if (w->sink) {
+        nb_sink_clip_finish(w->sink, w->fetch_generation, false);
+    }
+    close(w->fetch_fd);
+    w->fetch_fd = -1;
+    w->fetch_len = 0;
+    w->fetch_generation = 0;
+    free(w->fetch_buf);
+    w->fetch_buf = NULL;
+    w->fetch_cap = 0;
+    return next;
 }
 
 static int wl_tick_viewer(struct nb_wl *w, int next)

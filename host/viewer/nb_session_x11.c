@@ -122,6 +122,7 @@ struct nb_x11 {
     size_t            clip_pending_len;
     bool              fetch_active;   /* a paste is in flight                 */
     uint64_t          fetch_generation;
+    uint64_t          fetch_deadline_ms;  /* see x11_tick_fetch               */
     struct nb_sink   *fetch_sink;
     /* An INCR transfer being received (ICCCM 2.7.2): the owner streams the
      * selection in property-sized pieces, which large text from GTK and Qt
@@ -961,6 +962,7 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
             if (x->incr_active && pn->window == x->win &&
                 pn->atom == x->a_prop &&
                 pn->state == XCB_PROPERTY_NEW_VALUE) {
+                x->fetch_deadline_ms = x11_now_ms() + NB_CLIP_FETCH_TIMEOUT_MS;
                 x11_clip_incr_step(x);
             }
             break;
@@ -2267,6 +2269,7 @@ static int x11_fetch_clipboard(struct nb_session *s, struct nb_sink *sink,
     xcb_flush(x->c);
     x->fetch_active = true;
     x->fetch_generation = generation;
+    x->fetch_deadline_ms = x11_now_ms() + NB_CLIP_FETCH_TIMEOUT_MS;
     return 0;
 }
 
@@ -2492,7 +2495,41 @@ static void x11_notify_clipboard(struct nb_session *s)
 
 /* Clock-driven work: expire that notice.  Without this the main loop sleeps in
  * poll() forever and a "transient" notice is permanent. */
+static int x11_tick_pace(struct nb_session *s);
+
+/*
+ * A SELECTION OWNER THAT NEVER ANSWERS (no SelectionNotify, or an INCR
+ * transfer that stalls) used to leave the paste chord held and every later
+ * fetch -EBUSY.  Same deadline as the Wayland backend, renewed on progress.
+ */
 static int x11_tick(struct nb_session *s)
+{
+    struct nb_x11 *x = s->priv;
+    int next = x11_tick_pace(s);
+    uint64_t now;
+    int left;
+
+    if (!x->fetch_active) {
+        return next;
+    }
+    now = x11_now_ms();
+    if (now < x->fetch_deadline_ms) {
+        left = (int)(x->fetch_deadline_ms - now);
+        return next < 0 || left < next ? left : next;
+    }
+    nb_log("clipboard: the program holding the host clipboard did not hand "
+           "it over within %u ms; giving up on it", NB_CLIP_FETCH_TIMEOUT_MS);
+    x->fetch_active = false;
+    x11_clip_incr_reset(x);
+    if (x->fetch_sink) {
+        x11_clip_done(x, x->fetch_sink, NULL, 0);
+    } else {
+        x->fetch_generation = 0;
+    }
+    return next;
+}
+
+static int x11_tick_pace(struct nb_session *s)
 {
     struct nb_x11 *x = s->priv;
     uint64_t now;

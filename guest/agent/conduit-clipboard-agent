@@ -31,6 +31,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 DEVICE = "/dev/conduit-clipboard"
@@ -41,6 +42,8 @@ MAX_BYTES = 1 << 20
 HEADER = struct.Struct("<IIQII32s")  # magic, version, generation, len, flags, mime
 HEADER_LEN = HEADER.size  # 56
 RETRY_SECS = 5.0
+# A device write that makes no progress for this long is abandoned.
+WRITE_STALL_SECS = 30.0
 
 _quiet = False
 
@@ -637,19 +640,33 @@ def open_backend(names):
 # ── the device ──────────────────────────────────────────────────────────────
 
 class Device:
-    """/dev/conduit-clipboard, reopened when it goes away."""
+    """/dev/conduit-clipboard, reopened when it goes away.
+
+    Reads are non-blocking (O_NONBLOCK, driven by select). Writes go through
+    a writer thread: the driver sends a record to the host 4 KiB at a time and
+    returns only once the host has answered every piece, so a 1 MiB copy --
+    or a host that stopped draining -- would otherwise stall the whole loop,
+    host->guest clipboard and selection serving included. Only the newest
+    pending copy is kept; results come back through results().
+    """
 
     def __init__(self, path=DEVICE, fd=None):
         self.path = path
         self.fd = fd
         self.next_try = 0.0
         self.told = None
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._pending = None
+        self._results = []
+        self._thread = None
 
     def ensure(self):
         if self.fd is not None or time.monotonic() < self.next_try:
             return self.fd is not None
         try:
-            self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
+            self.fd = os.open(self.path,
+                              os.O_RDWR | os.O_CLOEXEC | os.O_NONBLOCK)
         except OSError as e:
             if self.told != e.errno:
                 self.told = e.errno
@@ -697,16 +714,75 @@ class Device:
             return None
 
     def write(self, text):
-        try:
-            os.write(self.fd, encode_record(text))
-            return True
-        except OSError as e:
-            if e.errno in (errno.ENODEV, errno.EIO, errno.EBADF):
-                self.drop(e.strerror)
-            else:
-                log("the host refused the clipboard (%d bytes): %s"
-                    % (len(text), e.strerror))
-            return False
+        """Queue `text` for the host; never blocks. A newer copy queued before
+        the writer got to this one replaces it."""
+        with self._lock:
+            self._pending = text
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._writer,
+                                                name="clipboard-writer",
+                                                daemon=True)
+                self._thread.start()
+        self._wake.set()
+        return True
+
+    def busy(self):
+        with self._lock:
+            return self._pending is not None
+
+    def results(self):
+        """(text, error) for every write finished since the last call;
+        error is None or an OSError."""
+        with self._lock:
+            out, self._results = self._results, []
+        return out
+
+    def _writer(self):
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            while True:
+                with self._lock:
+                    text, self._pending = self._pending, None
+                    fd = self.fd
+                if text is None:
+                    break
+                err = None
+                try:
+                    if fd is None:
+                        raise OSError(errno.ENODEV, os.strerror(errno.ENODEV))
+                    # Our own descriptor: the main loop may close or reopen
+                    # the device while this write is in flight.
+                    dup = os.dup(fd)
+                    try:
+                        self._write_all(dup, encode_record(text))
+                    finally:
+                        os.close(dup)
+                except OSError as e:
+                    err = e
+                with self._lock:
+                    self._results.append((text, err))
+
+    @staticmethod
+    def _write_all(fd, rec):
+        """One record in one write(): the device takes whole records only.
+        Waits out EAGAIN (a non-blocking descriptor), but not forever."""
+        deadline = time.monotonic() + WRITE_STALL_SECS
+        while True:
+            try:
+                n = os.write(fd, rec)
+            except BlockingIOError:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise OSError(errno.ETIMEDOUT, "the host is not taking "
+                                  "the clipboard")
+                select.select([], [fd], [], min(left, 1.0))
+                continue
+            if n == len(rec):
+                return
+            # A stream (the tests' stand-in) may take part of it.
+            rec = rec[n:]
+            deadline = time.monotonic() + WRITE_STALL_SECS
 
 
 # ── main loop ───────────────────────────────────────────────────────────────
@@ -732,10 +808,21 @@ class Agent:
         if self.dev.fd is None:
             return
         if self.sync.local_changed(text):
-            if self.dev.write(text):
+            self.dev.write(text)
+
+    def write_results(self):
+        for text, err in self.dev.results():
+            if err is None:
                 log("guest -> host: %d bytes" % len(text))
-            else:
+                continue
+            # Not sent: the same text copied again must be tried again.
+            if self.sync.current == Sync.digest(text):
                 self.sync.current = None
+            if err.errno in (errno.ENODEV, errno.EIO, errno.EBADF):
+                self.dev.drop(err.strerror)
+            else:
+                log("the host refused the clipboard (%d bytes): %s"
+                    % (len(text), err.strerror))
 
     def step(self, timeout=1.0):
         self.dev.ensure()
@@ -752,6 +839,7 @@ class Agent:
                 self.host_record(rec)
         for text in self.backend.process(set(r)):
             self.local_text(text)
+        self.write_results()
         self.backend.tick()
 
     def run(self):
