@@ -9,7 +9,7 @@
   # packages does not apply on NixOS (libvirt there uses neither by default).
   #
   # Layout: packages.default is a prefix that mirrors /opt/conduit
-  # ($out/bin/{conduit,conduit-backend,conduit-viewer,conduit-vmm,qemu-system-x86_64}),
+  # ($out/bin/{conduit,conduit-backend,conduit-stream,conduit-viewer,conduit-vmm,qemu-system-x86_64}),
   # and `conduit` is wrapped with CONDUIT_PREFIX=$out so it finds its helpers
   # there instead of /opt/conduit (see docs/PACKAGING.md, "CLI contract").
   description = "Conduit: share your NVIDIA GPU with a VM and see its desktop on yours";
@@ -27,6 +27,7 @@
       # Cargo/make binary names (same variables as packaging/build.sh).
       backendBin = "conduit-backend";
       userspaceBin = "conduit-userspace";
+      streamBin = "conduit-stream";
       viewerBin = "conduit-viewer";
       vmmBin = "conduit-vmm";
 
@@ -66,6 +67,29 @@
         };
         cargoLock.lockFile = ./Cargo.lock;
         cargoBuildFlags = [ "-p" "conduit" ];
+      };
+
+      # The network stream host (docs/STREAMING.md): C half needs EGL and GBM
+      # headers (pkg-config), the Rust half OpenSSL. NVENC and CUDA are
+      # dlopen()ed from the driver, so the binary gets the driver runpath
+      # (/run/opengl-driver/lib on NixOS).
+      stream = rustPkg {
+        pname = "conduit-stream";
+        src = ./host/stream;
+        cargoLock.lockFile = ./host/stream/Cargo.lock;
+        nativeBuildInputs = with pkgs; [
+          pkg-config
+          addDriverRunpath
+        ];
+        buildInputs = with pkgs; [
+          libGL
+          (pkgs.libgbm or pkgs.mesa)
+          openssl
+        ];
+        cargoBuildFlags = [ "--bin" streamBin ];
+        postFixup = ''
+          addDriverRunpath $out/bin/${streamBin}
+        '';
       };
 
       viewer = pkgs.stdenv.mkDerivation {
@@ -125,6 +149,7 @@
         ln -s ${backend}/bin/conduit-backend $out/bin/conduit-backend
         ln -s ${backend}/bin/conduit-userspace $out/bin/conduit-userspace
         ln -s ${vmm}/bin/conduit-vmm         $out/bin/conduit-vmm
+        ln -s ${stream}/bin/conduit-stream   $out/bin/conduit-stream
         ln -s ${viewer}/bin/conduit-viewer   $out/bin/conduit-viewer
         ln -s ${qemu}/bin/qemu-system-x86_64 $out/bin/qemu-system-x86_64
         makeWrapper ${cli}/bin/conduit $out/bin/conduit \
@@ -160,7 +185,7 @@
     {
       packages.${system} = {
         default = conduit;
-        inherit conduit backend viewer vmm cli qemu;
+        inherit conduit backend stream viewer vmm cli qemu;
         conduit-guest = mkGuestModule pkgs.linuxPackages_latest.kernel;
       };
 
