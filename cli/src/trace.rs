@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use conduit_trace::filter::Filter;
 use conduit_trace::read::{Format, Reader, Writer};
 use conduit_trace::summary::Summary;
-use conduit_trace::{Header, pretty};
+use conduit_trace::{pretty, Header};
 use std::io::{BufReader, BufWriter, IsTerminal, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -148,7 +148,8 @@ pub fn live(name: &str, o: Opts) -> Result<()> {
 
     let mut file = match &output {
         Some(p) => {
-            let f = std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?;
+            let f =
+                std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?;
             Some(Writer::new(BufWriter::new(f), format, header)?)
         }
         None => None,
