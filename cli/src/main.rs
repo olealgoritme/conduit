@@ -30,6 +30,10 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// `view`: clipboard sharing between your desktop and the VM's
+    /// (text; needs conduit-clipboard-agent in the VM, docs/CLIPBOARD.md)
+    #[arg(long, global = true, value_enum, default_value_t = run::Clipboard::Both)]
+    clipboard: run::Clipboard,
 }
 
 #[derive(Subcommand)]
@@ -214,6 +218,7 @@ fn list() -> Result<()> {
 
 fn main() {
     let cli = Cli::parse();
+    run::set_clipboard(cli.clipboard);
     let r = match cli.cmd {
         Cmd::Create {
             name,
@@ -328,6 +333,8 @@ mod tests {
                 "4",
             ],
             vec!["conduit", "view", "myvm"],
+            vec!["conduit", "view", "myvm", "--clipboard", "to-guest"],
+            vec!["conduit", "view", "myvm", "--clipboard", "off"],
             vec![
                 "conduit",
                 "view",

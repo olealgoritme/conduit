@@ -346,6 +346,53 @@ fn start_vm(c: &VmConfig, rt: &Rt, vmm: &Path, share: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Clipboard sharing for the viewer (`conduit view --clipboard`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Clipboard {
+    /// Both ways: the VM gets your clipboard when its window is focused, and
+    /// its copies reach yours while focused
+    Both,
+    /// Only copies made in the VM reach your clipboard
+    ToHost,
+    /// Only your clipboard reaches the VM
+    ToGuest,
+    /// Nothing crosses
+    Off,
+}
+
+impl Clipboard {
+    /// The viewer's `--clipboard` value.
+    pub fn viewer_arg(self) -> &'static str {
+        match self {
+            Clipboard::Both => "both",
+            Clipboard::ToHost => "guest-to-host",
+            Clipboard::ToGuest => "host-to-guest",
+            Clipboard::Off => "off",
+        }
+    }
+}
+
+static CLIPBOARD: std::sync::OnceLock<Clipboard> = std::sync::OnceLock::new();
+
+pub fn set_clipboard(c: Clipboard) {
+    let _ = CLIPBOARD.set(c);
+}
+
+fn clipboard() -> Clipboard {
+    CLIPBOARD.get().copied().unwrap_or(Clipboard::Both)
+}
+
+/// The viewer backend for this desktop: Wayland when there is one, else X11.
+fn viewer_session(wayland: bool, x11: bool) -> Option<&'static str> {
+    if wayland {
+        Some("wayland")
+    } else if x11 {
+        Some("x11")
+    } else {
+        None
+    }
+}
+
 fn viewer_supports_hook(viewer: &Path) -> bool {
     Command::new(viewer)
         .arg("--help")
@@ -375,8 +422,14 @@ fn start_viewer(
     }
     let _ = std::fs::remove_file(&dsock);
     let mut cmd = Command::new(viewer);
-    cmd.args(["--backend", "wayland", "--socket"])
+    let session = viewer_session(
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var_os("DISPLAY").is_some(),
+    )
+    .unwrap_or("wayland");
+    cmd.args(["--backend", session, "--socket"])
         .arg(&dsock)
+        .args(["--clipboard", clipboard().viewer_arg()])
         .args([
             "--size",
             &m.size(),
@@ -594,10 +647,15 @@ pub fn view(
     vmm: Option<VmmKind>,
 ) -> Result<()> {
     let c = VmConfig::load(name)?;
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+    if viewer_session(
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var_os("DISPLAY").is_some(),
+    )
+    .is_none()
+    {
         return Err(oops(
-            "no desktop session found (WAYLAND_DISPLAY is not set)",
-            "Run `conduit view` from a terminal inside your Wayland desktop, not over ssh or a text console",
+            "no desktop session found (neither WAYLAND_DISPLAY nor DISPLAY is set)",
+            "Run `conduit view` from a terminal inside your desktop (Wayland or X11), not over ssh or a text console",
         ));
     }
     let viewer = Tool::Viewer.require()?;
@@ -1006,4 +1064,24 @@ pub fn ssh(name: &str, user: Option<&str>, args: &[String]) -> Result<()> {
     let user = user.unwrap_or(&c.user).to_string();
     let err = ssh_cmd(&c, &user).args(args).exec();
     Err(err).context("could not run ssh (is openssh-client installed?)")
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_maps_to_the_viewer_modes() {
+        assert_eq!(Clipboard::Both.viewer_arg(), "both");
+        assert_eq!(Clipboard::ToHost.viewer_arg(), "guest-to-host");
+        assert_eq!(Clipboard::ToGuest.viewer_arg(), "host-to-guest");
+        assert_eq!(Clipboard::Off.viewer_arg(), "off");
+    }
+
+    #[test]
+    fn the_viewer_follows_the_desktop() {
+        assert_eq!(viewer_session(true, true), Some("wayland"));
+        assert_eq!(viewer_session(false, true), Some("x11"));
+        assert_eq!(viewer_session(false, false), None);
+    }
 }

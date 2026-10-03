@@ -10,7 +10,7 @@ Source: `cli/` (Rust, one static binary). Build: `cargo build --release -p condu
 | `conduit import PATH NAME [--move] [--user U] [--kernel VMLINUX] [--share DIR] [--net N]` | Adopts an existing raw ext4 disk image. It is copied sparsely, or moved with `--move`. |
 | `conduit list` | Your VMs, their state, disk use and address. |
 | `conduit up NAME [--display WxH@HZ \| --headless]` | Starts the network, GPU backend and VM in the background. It keeps a display ready so `conduit view` can attach later. |
-| `conduit view NAME [WxH@HZ] [--tune-hyprland] [--fullscreen]` | Opens the viewer window and starts the VM if it is not running. With no mode given, the VM gets your monitor's mode (Hyprland, then wlr-randr, then the kernel's preferred size, then 2560x1440@60). Closing the window shuts the VM down. |
+| `conduit view NAME [WxH@HZ] [--tune-hyprland] [--fullscreen] [--clipboard both\|to-host\|to-guest\|off]` | Opens the viewer window (Wayland, or X11 when there is no Wayland session) and starts the VM if it is not running. Clipboard sharing defaults to `both` (docs/CLIPBOARD.md). With no mode given, the VM gets your monitor's mode (Hyprland, then wlr-randr, then the kernel's preferred size, then 2560x1440@60). Closing the window shuts the VM down. |
 | `conduit down NAME` | Shuts the guest down cleanly over ssh, then stops the VM, backend and viewer, restores Hyprland and removes the network. |
 | `conduit status [NAME]` | Shows the processes, display, network and whether the guest can be reached. |
 | `conduit logs NAME [backend\|vm\|viewer] [-f] [-n N]` | Shows the logs. |
