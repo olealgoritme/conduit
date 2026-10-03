@@ -6,7 +6,7 @@ Source: `cli/` (Rust, one static binary). Build: `cargo build --release -p condu
 | Command | What it does |
 |---|---|
 | `conduit doctor` | Checks KVM, the NVIDIA open driver and whether Conduit supports its version, the Wayland session, sudo, tools, Conduit's own parts, disk space, and the display mode VMs will get. Prints fixes. |
-| `conduit create NAME [--size 64G] [--desktop gnome\|xfce\|none] [--ram 8G] [--cpus 4] [--user U] [--tarball FILE]` | Downloads Ubuntu 24.04's cloud root tarball (checked against Ubuntu's signed `SHA256SUMS`), then builds a sparse ext4 disk with the guest driver, the NVIDIA share setup, udev/seat rules, ssh keys and autologin (GDM on Wayland for GNOME). Building uses a loop mount and chroot, so it asks for sudo and says why. The steps are in `cli/assets/build-disk.sh`, and the files installed in the guest are in `cli/assets/guest/`. |
+| `conduit create NAME [--size 64G] [--desktop gnome\|xfce\|none] [--ram 4G] [--cpus 4] [--user U] [--tarball FILE]` | Downloads Ubuntu 24.04's cloud root tarball (checked against Ubuntu's signed `SHA256SUMS`), then builds a sparse ext4 disk with the guest driver, the NVIDIA share setup, udev/seat rules, ssh keys and autologin (GDM on Wayland for GNOME). Building uses a loop mount and chroot, so it asks for sudo and says why. The steps are in `cli/assets/build-disk.sh`, and the files installed in the guest are in `cli/assets/guest/`. |
 | `conduit import PATH NAME [--move] [--user U] [--kernel VMLINUX] [--share DIR] [--net N]` | Adopts an existing raw ext4 disk image. It is copied sparsely, or moved with `--move`. |
 | `conduit list` | Your VMs, their state, disk use and address. |
 | `conduit up NAME [--display WxH@HZ \| --headless]` | Starts the network, GPU backend and VM in the background. It keeps a display ready so `conduit view` can attach later. |
@@ -16,6 +16,16 @@ Source: `cli/` (Rust, one static binary). Build: `cargo build --release -p condu
 | `conduit logs NAME [backend\|vm\|viewer] [-f] [-n N]` | Shows the logs. |
 | `conduit ssh NAME [-u USER] [CMD...]` | Opens a terminal in the VM, or runs a command there. |
 | `conduit attach NAME [--dry-run] [-c URI]` | Changes a libvirt VM to use the GPU: sets the emulator (system QEMU at 11.1 or newer, else `/opt/conduit/bin`), adds memfd shared memory and `vhost-user-test-device-pci,virtio-id=45,config_size=4036`, and installs a libvirt hook that runs the backend. **Gated** until the backend supports QEMU: only `--dry-run` works, unless you set `CONDUIT_EXPERIMENTAL_QEMU=1`. |
+
+**Memory.** `up` and `view` refuse to start a VM when its RAM, plus host overhead
+(a quarter of it, at least 1 GiB) and a 2 GiB margin, exceeds `MemAvailable` minus the RAM the
+other running Conduit VMs have not touched yet; `--no-mem-check` overrides that. Guest RAM is
+faulted in as the guest uses it, never committed at boot. Each VM's backend, runner and
+virtiofsd run in one systemd user slice, `conduit-NAME.slice`, with `MemoryMax` = RAM +
+overhead and `memory.oom.group=1` (an OOM kill takes the whole VM, which is what frees its
+shared RAM), and with `oom_score_adj=500`, so under memory pressure the kernel kills a VM
+before your desktop. `conduit down` stops the slice. Without a systemd user session (or with
+`CONDUIT_NO_SCOPE=1`) the processes run unconfined.
 
 `--tune-hyprland` is opt-in. While the viewer runs, it sets `misc:no_direct_scanout 0`, `general:allow_tearing 1` and an `immediate` rule for the viewer, then restores the old values. If the viewer supports `--direct-hook`, Ctrl+Alt+D turns these settings on and off.
 

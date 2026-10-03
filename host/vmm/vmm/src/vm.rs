@@ -199,7 +199,19 @@ impl Vm {
         }
 
         if machine.prefault {
-            spawn_prefault(mem.clone(), regions.clone(), thp);
+            // A hugetlb pool is reserved already; anything else is committed
+            // from what the host has free, so only when it fits with room.
+            let available = mem_available();
+            if hugetlb.is_some() || prefault_fits(mem_size, available) {
+                spawn_prefault(mem.clone(), regions.clone(), thp);
+            } else {
+                log::warn!(
+                    "prefault skipped: guest RAM ({} MiB) is not under half of the host's \
+                     available memory ({}); it faults in on first touch instead",
+                    mem_size >> 20,
+                    available.map_or("unknown".to_owned(), |a| format!("{} MiB", a >> 20))
+                );
+            }
         }
 
         // Load kernel
@@ -582,6 +594,21 @@ fn spawn_prefault(
     }
 }
 
+/// The host's `MemAvailable` in bytes.
+fn mem_available() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    text.lines().find_map(|l| {
+        let kb = l.strip_prefix("MemAvailable:")?.trim().strip_suffix("kB")?;
+        Some(kb.trim().parse::<u64>().ok()? << 10)
+    })
+}
+
+/// Prefault commits all of guest RAM at once: only when it is under half of
+/// what the host has available. Unknown availability means no.
+fn prefault_fits(mem_size: u64, available: Option<u64>) -> bool {
+    available.is_some_and(|a| mem_size < a / 2)
+}
+
 /// Kilobytes of guest RAM mapped as 2 MiB pages, from `/proc/self/smaps`.
 ///
 /// Counted by the memory file's name rather than by address, so a mapping the
@@ -811,6 +838,15 @@ fn advise_huge(host_addr: *mut u8, size: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefault_only_when_ram_is_under_half_of_available() {
+        const G: u64 = 1 << 30;
+        assert!(prefault_fits(4 * G, Some(16 * G)));
+        assert!(!prefault_fits(8 * G, Some(16 * G)));
+        assert!(!prefault_fits(G, None));
+        assert!(mem_available().is_some());
+    }
 
     #[test]
     fn the_bracketed_policy_is_the_one_in_force() {

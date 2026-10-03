@@ -207,6 +207,9 @@ pub fn vmm_config(c: &VmConfig, kernel: &Path, gpu_sock: &Path, share: &Path) ->
         "machine-config": {
             "vcpu_count": c.cpus,
             "mem_size_mib": c.ram_mib,
+            // Never commit all guest RAM at boot: pages are faulted in as the
+            // guest touches them (several prefaulted VMs ran a host out of RAM).
+            "prefault": false,
         },
         "gpu-forward": { "socket": gpu_sock },
         "shared-directories": [{
@@ -281,6 +284,7 @@ mod tests {
         assert_eq!(v["drives"][0]["is_root_device"], true);
         assert_eq!(v["machine-config"]["vcpu_count"], 6);
         assert_eq!(v["machine-config"]["mem_size_mib"], 8192);
+        assert_eq!(v["machine-config"]["prefault"], false);
         assert_eq!(v["gpu-forward"]["socket"], "/run/gpu.sock");
         assert_eq!(v["shared-directories"][0]["tag"], "nvidia");
         assert_eq!(v["shared-directories"][0]["read-only"], true);

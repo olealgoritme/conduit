@@ -234,6 +234,33 @@ pub fn spawn_detached(cmd: &mut Command, log: &Path, append: bool) -> Result<u32
     Ok(child.id())
 }
 
+/// Start one of a VM's processes (backend, runner, virtiofsd) like
+/// [`spawn_detached`], inside the VM's slice when there is one, and marked as
+/// an early OOM victim so the kernel kills a VM before the desktop.
+pub fn spawn_vm_part(
+    cmd: &mut Command,
+    log: &Path,
+    append: bool,
+    slice: Option<&crate::scope::Slice>,
+) -> Result<u32> {
+    let mut wrapped = slice.map(|s| s.wrap(cmd));
+    let cmd = wrapped.as_mut().unwrap_or(cmd);
+    unsafe {
+        cmd.pre_exec(|| {
+            // Raising one's own score needs no privilege; inherited across exec.
+            let path = c"/proc/self/oom_score_adj";
+            let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if fd >= 0 {
+                let v = crate::scope::OOM_SCORE_ADJ.as_bytes();
+                libc::write(fd, v.as_ptr().cast(), v.len());
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+    spawn_detached(cmd, log, append)
+}
+
 /// Wait until `cond` is true or `timeout` passes; false on timeout.
 pub fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let t = Instant::now();

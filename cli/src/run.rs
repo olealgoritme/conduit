@@ -8,10 +8,12 @@
 //! generated runner config); logs in the VM's folder, logs/{backend,vm,viewer}.log.
 
 use crate::hypr;
+use crate::mem;
 use crate::mode::{self, Mode};
 use crate::net;
 use crate::paths::{self, comm_of, Tool};
 use crate::qemu;
+use crate::scope::Slice;
 use crate::sys::{self, live_pid};
 use crate::ui::{self, oops, shell_quote};
 use crate::vm::{self, VmConfig};
@@ -179,7 +181,8 @@ fn ensure_share(c: &VmConfig) -> Result<PathBuf> {
 
 // ---------------------------------------------------------------- start pieces
 
-fn start_backend(c: &VmConfig, rt: &Rt, backend: &Path, mode: Option<Mode>) -> Result<()> {
+fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result<()> {
+    let backend = &p.backend;
     let sock = rt.gpu_sock();
     sys::clear_stale_socket(&sock)?;
     let mut cmd = Command::new(backend);
@@ -201,8 +204,11 @@ fn start_backend(c: &VmConfig, rt: &Rt, backend: &Path, mode: Option<Mode>) -> R
     });
     cmd.env("RUST_LOG", level);
     let log = c.logs_dir().join("backend.log");
-    let pid = sys::spawn_detached(&mut cmd, &log, false)?;
+    let pid = sys::spawn_vm_part(&mut cmd, &log, false, p.slice.as_ref())?;
     sys::write_pid(&rt.p("backend.pid"), pid)?;
+    if let Some(s) = &p.slice {
+        s.group_oom();
+    }
     let pid = pid as i32;
     let ok = sys::wait_for(Duration::from_secs(10), || {
         sock.exists() || !sys::alive(pid)
@@ -243,12 +249,13 @@ fn vm_failed(log: &Path) -> anyhow::Error {
 }
 
 /// The NVIDIA share for QEMU: a virtiofsd QEMU connects to.
-fn start_virtiofsd(c: &VmConfig, rt: &Rt, vfsd: &Path, share: &Path) -> Result<()> {
+fn start_virtiofsd(c: &VmConfig, rt: &Rt, p: &Parts, vfsd: &Path) -> Result<()> {
+    let share = &p.share;
     let sock = rt.vfs_sock();
     sys::clear_stale_socket(&sock)?;
     let (mut cmd, ro) = qemu::virtiofsd_cmd(vfsd, &sock, share);
     let log = c.logs_dir().join("virtiofsd.log");
-    let pid = sys::spawn_detached(&mut cmd, &log, false)?;
+    let pid = sys::spawn_vm_part(&mut cmd, &log, false, p.slice.as_ref())?;
     sys::write_pid(&rt.p("virtiofsd.pid"), pid)?;
     if !ro {
         let _ = std::fs::OpenOptions::new()
@@ -304,7 +311,7 @@ fn start_qemu(c: &VmConfig, rt: &Rt, p: &Parts) -> Result<()> {
     )?;
     let mut cmd = Command::new(&p.vmm);
     cmd.args(&args);
-    let pid = sys::spawn_detached(&mut cmd, &log, true)?;
+    let pid = sys::spawn_vm_part(&mut cmd, &log, true, p.slice.as_ref())?;
     sys::write_pid(&rt.p("vm.pid"), pid)?;
     let pid = pid as i32;
     // QMP greets only once the machine is built and the main loop runs, so a
@@ -328,7 +335,8 @@ fn start_qemu(c: &VmConfig, rt: &Rt, p: &Parts) -> Result<()> {
     Ok(())
 }
 
-fn start_vm(c: &VmConfig, rt: &Rt, vmm: &Path, share: &Path) -> Result<()> {
+fn start_vm(c: &VmConfig, rt: &Rt, p: &Parts) -> Result<()> {
+    let (vmm, share) = (&p.vmm, &p.share);
     let kernel = c.kernel_path()?;
     check_disk(c)?;
     let cfg = vm::vmm_config(c, &kernel, &rt.gpu_sock(), share);
@@ -337,7 +345,7 @@ fn start_vm(c: &VmConfig, rt: &Rt, vmm: &Path, share: &Path) -> Result<()> {
     let log = c.logs_dir().join("vm.log");
     let mut cmd = Command::new(vmm);
     cmd.arg(&cfg_path);
-    let pid = sys::spawn_detached(&mut cmd, &log, false)?;
+    let pid = sys::spawn_vm_part(&mut cmd, &log, false, p.slice.as_ref())?;
     sys::write_pid(&rt.p("vm.pid"), pid)?;
     std::thread::sleep(Duration::from_secs(1));
     if !sys::alive(pid as i32) {
@@ -506,6 +514,8 @@ struct Parts {
     virtiofsd: Option<PathBuf>,
     audio: Option<qemu::Audio>,
     share: PathBuf,
+    /// The VM's systemd slice (memory limit), when there is a user systemd.
+    slice: Option<Slice>,
 }
 
 fn need_virtiofsd() -> Result<PathBuf> {
@@ -549,7 +559,35 @@ fn pick_vmm(want: Option<VmmKind>) -> Result<(VmmKind, PathBuf, Option<PathBuf>)
     }
 }
 
+/// `--no-mem-check`: start even when the host looks short of memory.
+static NO_MEM_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_no_mem_check(on: bool) {
+    NO_MEM_CHECK.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Refuse to start when the VM's RAM does not fit in what the host has free.
+fn check_memory(c: &VmConfig) -> Result<()> {
+    let others: Vec<(u64, i32)> = vm::all()
+        .into_iter()
+        .filter(|n| *n != c.name)
+        .filter_map(|n| {
+            let o = VmConfig::load(&n).ok()?;
+            let rt = Rt::new(&n).ok()?;
+            let pid = rt.pid("vm", &rt.state().vm_comm)?;
+            Some((o.ram_mib, pid))
+        })
+        .collect();
+    mem::admit(
+        &c.name,
+        c.ram_mib,
+        &others,
+        NO_MEM_CHECK.load(std::sync::atomic::Ordering::SeqCst),
+    )
+}
+
 fn preflight(c: &VmConfig, want: Option<VmmKind>) -> Result<Parts> {
+    check_memory(c)?;
     let backend = Tool::Backend.require()?;
     let (kind, vmm, virtiofsd) = pick_vmm(want)?;
     let audio = match kind {
@@ -577,6 +615,7 @@ fn preflight(c: &VmConfig, want: Option<VmmKind>) -> Result<Parts> {
         virtiofsd,
         audio,
         share,
+        slice: Slice::prepare(&c.name, c.ram_mib),
     })
 }
 
@@ -591,13 +630,13 @@ fn boot(c: &VmConfig, rt: &Rt, st: &mut State, p: &Parts, mode: Option<Mode>) ->
         st.virtiofsd_comm = comm_of(v);
     }
     rt.save_state(st)?;
-    start_backend(c, rt, &p.backend, mode)?;
+    start_backend(c, rt, p, mode)?;
     match (p.kind, &p.virtiofsd) {
         (VmmKind::Qemu, Some(vfsd)) => {
-            start_virtiofsd(c, rt, vfsd, &p.share)?;
+            start_virtiofsd(c, rt, p, vfsd)?;
             start_qemu(c, rt, p)?;
         }
-        _ => start_vm(c, rt, &p.vmm, &p.share)?,
+        _ => start_vm(c, rt, p)?,
     }
     Ok(())
 }
@@ -887,6 +926,9 @@ fn down_inner(c: &VmConfig, interactive: bool, verbose: bool) -> Result<()> {
             Duration::from_secs(5),
         );
     }
+    // Whatever is left in the VM's slice (a process that ignored SIGTERM, a
+    // child): stopping the slice ends it, so the shared guest RAM is freed.
+    Slice::stop(&c.name);
     let _ = sys::clear_stale_socket(&rt.gpu_sock());
     let _ = sys::clear_stale_socket(&rt.display_sock());
     let _ = sys::clear_stale_socket(&rt.vfs_sock());

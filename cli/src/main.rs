@@ -5,11 +5,13 @@ mod doctor;
 mod host;
 mod hypr;
 mod libvirt;
+mod mem;
 mod mode;
 mod net;
 mod paths;
 mod qemu;
 mod run;
+mod scope;
 mod sys;
 mod ui;
 mod vm;
@@ -34,6 +36,9 @@ struct Cli {
     /// (text; needs conduit-clipboard-agent in the VM, docs/CLIPBOARD.md)
     #[arg(long, global = true, value_enum, default_value_t = run::Clipboard::Both)]
     clipboard: run::Clipboard,
+    /// `up`/`view`: start even when the host looks short of free memory
+    #[arg(long, global = true)]
+    no_mem_check: bool,
 }
 
 #[derive(Subcommand)]
@@ -48,7 +53,7 @@ enum Cmd {
         #[arg(long, default_value = "gnome", value_parser = ["gnome", "xfce", "none"])]
         desktop: String,
         /// Memory for the VM
-        #[arg(long, default_value = "8G")]
+        #[arg(long, default_value = "4G")]
         ram: String,
         /// Number of CPU cores for the VM
         #[arg(long, default_value_t = 4)]
@@ -67,7 +72,8 @@ enum Cmd {
         /// Move the file instead of copying it
         #[arg(long = "move")]
         mv: bool,
-        #[arg(long, default_value = "8G")]
+        /// Memory for the VM
+        #[arg(long, default_value = "4G")]
         ram: String,
         #[arg(long, default_value_t = 4)]
         cpus: u32,
@@ -168,7 +174,7 @@ fn ram_mib(s: &str) -> Result<u64> {
     if b < 512 << 20 {
         return Err(ui::oops(
             format!("{s} of memory is too little"),
-            "Give the VM at least 512M; 8G is a good start",
+            "Give the VM at least 512M; 4G is a good start",
         ));
     }
     Ok(b >> 20)
@@ -219,6 +225,7 @@ fn list() -> Result<()> {
 fn main() {
     let cli = Cli::parse();
     run::set_clipboard(cli.clipboard);
+    run::set_no_mem_check(cli.no_mem_check);
     let r = match cli.cmd {
         Cmd::Create {
             name,
@@ -346,6 +353,7 @@ mod tests {
             vec!["conduit", "up", "myvm"],
             vec!["conduit", "up", "myvm", "--vmm", "qemu", "--headless"],
             vec!["conduit", "view", "myvm", "--vmm", "builtin"],
+            vec!["conduit", "up", "myvm", "--no-mem-check"],
             vec!["conduit", "down", "myvm"],
             vec!["conduit", "status"],
             vec!["conduit", "status", "myvm"],
