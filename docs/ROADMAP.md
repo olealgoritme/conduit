@@ -19,6 +19,7 @@
 - [x] CUDA managed memory beyond 64 MiB, pinned host memory beyond 256 MiB (`guest/tests/cuda-mem.c`)
 
 ## Later: more guests and VMMs
+- [ ] Snapshots / save / migration: GPU hot-plug first, then CUDA checkpoint, then full GPU state (see [TODO-snapshots.md](TODO-snapshots.md))
 - [ ] NVIDIA native context in virglrenderer: stock QEMU's virtio-gpu (≈9.2+), crosvm, libkrun
 - [ ] Windows guests, two candidate routes:
   - open stack: NVK (Mesa Vulkan) on RM + DXVK, on a virtio-gpu Windows driver (no CUDA)
