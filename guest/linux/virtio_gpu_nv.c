@@ -3477,11 +3477,18 @@ static int nvgpu_release(struct inode *inode, struct file *filp) {
 
 /* ───────── file_operations tables ───────── */
 
+/*
+ * 32-bit processes (Steam's client, Wine/Proton's 32-bit side) use the same
+ * ioctls: NVIDIA's parameter blocks carry pointers as NvP64 and have the same
+ * layout for both, which is why nvidia.ko routes compat_ioctl to its normal
+ * handler too. UVM has no 32-bit clients (CUDA is 64-bit only).
+ */
 static const struct file_operations nvgpu_gpu_fops = {
     .owner = THIS_MODULE,
     .open = nvgpu_gpu_open,
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_ioctl,
+    .compat_ioctl = nvgpu_ioctl,
     .mmap = nvgpu_mmap,
     .poll = nvgpu_poll,
 };
@@ -3491,6 +3498,7 @@ static const struct file_operations nvgpu_ctl_fops = {
     .open = nvgpu_ctl_open,
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_ioctl,
+    .compat_ioctl = nvgpu_ioctl,
     .mmap = nvgpu_mmap,
     .poll = nvgpu_poll,
 };
@@ -4403,6 +4411,7 @@ static const struct file_operations nvgpu_modeset_fops = {
     .open = nvgpu_modeset_open,
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_modeset_ioctl,
+    .compat_ioctl = nvgpu_modeset_ioctl,
     .mmap = nvgpu_mmap,
     .poll = nvgpu_poll,
 };
@@ -4708,6 +4717,7 @@ static const struct file_operations nvgpu_dri_fops = {
     .open = nvgpu_dri_open,
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_dri_ioctl,
+    .compat_ioctl = nvgpu_dri_ioctl,
     .mmap = nvgpu_mmap,
     .poll = nvgpu_poll,
 };
