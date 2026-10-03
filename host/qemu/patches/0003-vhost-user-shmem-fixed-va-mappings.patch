@@ -1,0 +1,156 @@
+diff --color -ru a/hw/virtio/vhost-user.c b/hw/virtio/vhost-user.c
+--- a/hw/virtio/vhost-user.c	2026-10-03 18:53:56.500726322 +0200
++++ b/hw/virtio/vhost-user.c	2026-10-03 18:53:56.509788272 +0200
+@@ -256,6 +256,13 @@
+ 
+ /* For the flags field of VhostUserMMap */
+ #define VHOST_USER_FLAG_MAP_RW (1u << 0)
++/*
++ * Conduit extension, not in the vhost-user spec: map the fd at host virtual
++ * address fd_offset (read-write, shared). A spec frontend ignores the bit
++ * and its mapping of such an fd simply fails. See
++ * virtio_shared_memory_mapping_new_fixed_va().
++ */
++#define VHOST_USER_FLAG_MAP_FIXED_VA (1u << 1)
+ 
+ typedef struct {
+     /* VIRTIO Shared Memory Region ID */
+@@ -1983,9 +1990,14 @@
+     memory_region_transaction_begin();
+ 
+     /* Create VirtioSharedMemoryMapping object */
+-    VirtioSharedMemoryMapping *mapping = virtio_shared_memory_mapping_new(
+-        vu_mmap->shmid, fd, vu_mmap->fd_offset, vu_mmap->shm_offset,
+-        vu_mmap->len, vu_mmap->flags & VHOST_USER_FLAG_MAP_RW);
++    VirtioSharedMemoryMapping *mapping =
++        (vu_mmap->flags & VHOST_USER_FLAG_MAP_FIXED_VA) ?
++        virtio_shared_memory_mapping_new_fixed_va(
++            vu_mmap->shmid, fd, vu_mmap->fd_offset, vu_mmap->shm_offset,
++            vu_mmap->len) :
++        virtio_shared_memory_mapping_new(
++            vu_mmap->shmid, fd, vu_mmap->fd_offset, vu_mmap->shm_offset,
++            vu_mmap->len, vu_mmap->flags & VHOST_USER_FLAG_MAP_RW);
+ 
+     if (!mapping) {
+         ret = -EFAULT;
+diff --color -ru a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+--- a/hw/virtio/virtio.c	2026-10-03 18:53:56.500791132 +0200
++++ b/hw/virtio/virtio.c	2026-10-03 18:53:56.509552476 +0200
+@@ -3178,6 +3178,15 @@
+         object_unparent(OBJECT(mapping->mr));
+         mapping->mr = NULL;
+     }
++    /*
++     * A fixed-VA mapping's MemoryRegion borrows the pages. The flatviews
++     * that used it each held a reference on this object, so nothing can
++     * reach the range by the time it is finalized.
++     */
++    if (mapping->fixed_va) {
++        munmap(mapping->fixed_va, mapping->len);
++        mapping->fixed_va = NULL;
++    }
+ }
+ 
+ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
+@@ -3238,6 +3247,67 @@
+     return mapping;
+ }
+ 
++VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new_fixed_va(
++    uint8_t shmid, int fd, uint64_t fd_offset, uint64_t shm_offset,
++    uint64_t len)
++{
++#ifdef MAP_FIXED_NOREPLACE
++    VirtioSharedMemoryMapping *mapping;
++    g_autoptr(GString) mr_name = g_string_new(NULL);
++    uintptr_t page = qemu_real_host_page_size();
++    MemoryRegion *mr;
++    void *p;
++
++    if (len == 0 || fd_offset == 0 || fd_offset % page || len % page ||
++        fd_offset + len < fd_offset || fd_offset + len > UINTPTR_MAX) {
++        error_report("Bad fixed-VA shared memory mapping %" PRIx64 "+%" PRIx64,
++                     fd_offset, len);
++        return NULL;
++    }
++
++    p = mmap((void *)(uintptr_t)fd_offset, len, PROT_READ | PROT_WRITE,
++             MAP_SHARED | MAP_FIXED_NOREPLACE, fd, fd_offset);
++    if (p == MAP_FAILED) {
++        error_report("Fixed-VA shared memory mapping at 0x%" PRIx64
++                     ": %s", fd_offset, strerror(errno));
++        return NULL;
++    }
++    if ((uintptr_t)p != fd_offset) {
++        /* A kernel without MAP_FIXED_NOREPLACE takes it as a hint. */
++        munmap(p, len);
++        error_report("Fixed-VA shared memory mapping at 0x%" PRIx64
++                     ": address in use", fd_offset);
++        return NULL;
++    }
++#ifdef MADV_POPULATE_WRITE
++    /* The pages must exist before a guest can be pointed at them. */
++    if (madvise(p, len, MADV_POPULATE_WRITE) != 0) {
++        error_report("Fixed-VA shared memory mapping at 0x%" PRIx64
++                     ": populate: %s", fd_offset, strerror(errno));
++        munmap(p, len);
++        return NULL;
++    }
++#endif
++
++    mapping = VIRTIO_SHARED_MEMORY_MAPPING(
++        object_new(TYPE_VIRTIO_SHARED_MEMORY_MAPPING));
++    mapping->shmid = shmid;
++    mapping->offset = shm_offset;
++    mapping->len = len;
++    mapping->fixed_va = p;
++
++    mr = g_new0(MemoryRegion, 1);
++    g_string_printf(mr_name, "virtio-shmem-%d-%" PRIx64 "-fixed", shmid,
++                    shm_offset);
++    memory_region_init_ram_ptr(mr, OBJECT(mapping), mr_name->str, len, p);
++    mapping->mr = mr;
++    return mapping;
++#else
++    error_report("Fixed-VA shared memory mappings need MAP_FIXED_NOREPLACE");
++    return NULL;
++#endif
++}
++
+ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
+                          VirtioSharedMemoryMapping *mapping)
+ {
+diff --color -ru a/include/hw/virtio/virtio.h b/include/hw/virtio/virtio.h
+--- a/include/hw/virtio/virtio.h	2026-10-03 18:53:56.501659107 +0200
++++ b/include/hw/virtio/virtio.h	2026-10-03 18:53:56.509213348 +0200
+@@ -127,6 +127,8 @@
+     hwaddr offset;
+     uint64_t len;
+     MemoryRegion *mr;
++    /* Set when mapped at a backend-chosen host address (fixed VA). */
++    void *fixed_va;
+     QTAILQ_ENTRY(VirtioSharedMemoryMapping) link;
+ };
+ 
+@@ -391,6 +393,21 @@
+                                                             bool allow_write);
+ 
+ /**
++ * virtio_shared_memory_mapping_new_fixed_va() - As above, at a fixed address
++ *
++ * Maps @fd shared and read-write at host virtual address @fd_offset, which is
++ * also the file offset. Some device files only accept a mapping whose address
++ * equals its offset (nvidia-uvm: vm_start == vm_pgoff << PAGE_SHIFT), so the
++ * usual mapping at an address of QEMU's choosing cannot reach them. Never
++ * replaces an existing mapping (MAP_FIXED_NOREPLACE).
++ *
++ * Return: A new VirtioSharedMemoryMapping on success, NULL on error.
++ */
++VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new_fixed_va(
++    uint8_t shmid, int fd, uint64_t fd_offset, uint64_t shm_offset,
++    uint64_t len);
++
++/**
+  * virtio_add_shmem_map() - Add a memory mapping to a shared region
+  * @shmem: VirtioSharedMemory region
+  * @mapping: VirtioSharedMemoryMapping to add (transfers ownership)

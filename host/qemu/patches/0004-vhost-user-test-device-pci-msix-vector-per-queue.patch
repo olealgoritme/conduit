@@ -1,0 +1,38 @@
+--- a/hw/virtio/vhost-user-test-device-pci.c	2026-10-03 18:55:58.673428567 +0200
++++ b/hw/virtio/vhost-user-test-device-pci.c	2026-10-03 18:55:59.270500239 +0200
+@@ -35,7 +35,14 @@
+ 
+     /* Keep modern 64-bit BARs (2 slots) away from the shared memory BAR. */
+     vpci_dev->modern_mem_bar_idx = 2;
+-    vpci_dev->nvectors = 1;
++    /*
++     * One vector per queue plus config. With a single vector a Linux guest
++     * driver of a device with more than one queue cannot use MSI-X at all
++     * and falls back to a shared INTx line.
++     */
++    if (vpci_dev->nvectors == DEV_NVECTORS_UNSPECIFIED) {
++        vpci_dev->nvectors = MAX(dev->vub.num_vqs, 1) + 1;
++    }
+     if (!qdev_realize(dev_state, BUS(&vpci_dev->bus), errp)) {
+         return;
+     }
+@@ -69,6 +76,11 @@
+     }
+ }
+ 
++static const Property vhost_user_device_pci_properties[] = {
++    DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors,
++                       DEV_NVECTORS_UNSPECIFIED),
++};
++
+ static void vhost_user_device_pci_class_init(ObjectClass *klass,
+                                              const void *data)
+ {
+@@ -77,6 +89,7 @@
+     PCIDeviceClass *pcidev_k = PCI_DEVICE_CLASS(klass);
+ 
+     k->realize = vhost_user_device_pci_realize;
++    device_class_set_props(dc, vhost_user_device_pci_properties);
+     set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
+     pcidev_k->vendor_id = PCI_VENDOR_ID_REDHAT_QUMRANET;
+     pcidev_k->device_id = 0; /* Set by virtio-pci based on virtio id */
