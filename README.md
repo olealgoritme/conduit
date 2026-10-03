@@ -59,7 +59,17 @@ automatically.
 > missing, Conduit falls back to its small built-in runner, which has no sound
 > (`--vmm builtin` picks it on purpose).
 
-### Keys inside the viewer
+### Build from source
+
+```bash
+git clone https://github.com/olealgoritme/conduit && cd conduit
+make deps      # build dependencies (asks for sudo)
+make           # backend, VM runner, CLI, viewer, guest module, bundled QEMU
+make test      # offline tests
+make install   # installs to /opt/conduit
+```
+
+## Keys inside the viewer
 
 | Keys | What it does |
 |---|---|
