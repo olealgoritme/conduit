@@ -7,6 +7,8 @@
 #   make package      build .deb/.rpm/Arch/tarball packages into dist/out
 #   make deps         install build dependencies (asks for sudo)
 #   make clean        remove build outputs
+#   make release      tag the next patch version and let GitHub build packages
+#                     (release-minor / release-major / packaging/release.sh X.Y.Z)
 #
 # Single parts: make backend | vmm | cli | viewer | guest | qemu
 # The guest module builds against this machine's kernel; KDIR=... overrides.
@@ -17,7 +19,7 @@ JOBS   ?= $(shell nproc)
 # Tests that open the real /dev/nvidiactl; kept out of `make test`.
 GPU_TESTS := --skip for_real --skip closing_the_fd --skip repeated_map_unmap
 
-.PHONY: all backend vmm cli viewer guest qemu test install package deps clean help
+.PHONY: all backend vmm cli viewer guest qemu test install package deps clean help release release-minor release-major
 
 all: backend vmm cli viewer guest qemu
 	@echo
@@ -78,3 +80,12 @@ clean:
 
 help:
 	@sed -n '1,14p' Makefile
+
+release:
+	packaging/release.sh patch
+
+release-minor:
+	packaging/release.sh minor
+
+release-major:
+	packaging/release.sh major

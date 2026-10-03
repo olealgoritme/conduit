@@ -69,6 +69,9 @@ make test      # offline tests
 make install   # installs to /opt/conduit
 ```
 
+Maintainers: `make release` tags the next version (`release-minor`, `release-major`,
+or `packaging/release.sh X.Y.Z`); GitHub then builds every package for that tag.
+
 ## Keys inside the viewer
 
 | Keys | What it does |
