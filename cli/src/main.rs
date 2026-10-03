@@ -1,11 +1,14 @@
 //! conduit: share your NVIDIA GPU with a Linux VM and see its desktop in a window.
 
 mod boot;
+mod config;
 mod create;
 mod doctor;
+mod guest;
 mod host;
 mod hypr;
 mod libvirt;
+mod lvrun;
 mod mem;
 mod mode;
 mod net;
@@ -16,6 +19,8 @@ mod scope;
 mod stream;
 mod sys;
 mod ui;
+mod units;
+mod virt;
 mod vm;
 
 use anyhow::Result;
@@ -66,6 +71,9 @@ enum Cmd {
         /// Use an already downloaded noble-server-cloudimg-amd64-root.tar.xz (still verified)
         #[arg(long, value_name = "FILE")]
         tarball: Option<PathBuf>,
+        /// Do not register the VM with libvirt (virt-manager / virsh)
+        #[arg(long)]
+        no_libvirt: bool,
     },
     /// Adopt an existing VM disk image (raw ext4), copying it (or --move)
     Import {
@@ -91,6 +99,9 @@ enum Cmd {
         /// VM network number N: the VM must use 172.30.N.2 (default: first free)
         #[arg(long, value_name = "N")]
         net: Option<u8>,
+        /// Do not register the VM with libvirt (virt-manager / virsh)
+        #[arg(long)]
+        no_libvirt: bool,
     },
     /// Switch a VM to its distro's own kernel: installs linux-image-generic,
     /// headers, DKMS and the conduit-guest driver into its disk (VM stopped)
@@ -111,7 +122,8 @@ enum Cmd {
         #[arg(long, value_enum)]
         vmm: Option<run::VmmKind>,
     },
-    /// Open a VM in a window, starting it if needed. Closing the window shuts it down.
+    /// Open a VM in a window, starting it if needed. Closing the window shuts
+    /// it down only if this command started it (see --keep-running)
     View {
         name: String,
         /// Screen mode, e.g. 1920x1080 or 2560x1440@240 (default: your monitor's)
@@ -125,6 +137,9 @@ enum Cmd {
         /// VM runner: qemu (default; has sound) or builtin (no sound)
         #[arg(long, value_enum)]
         vmm: Option<run::VmmKind>,
+        /// Closing the window leaves the VM running even if this command started it
+        #[arg(long)]
+        keep_running: bool,
     },
     /// Shut a VM down cleanly and stop everything that belongs to it
     Down { name: String },
@@ -151,15 +166,19 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// Add the Conduit GPU to an existing libvirt / virt-manager VM (QEMU 11.1+)
+    /// Give an existing libvirt / virt-manager VM Conduit's GPU (backs up its
+    /// definition first; `conduit detach` restores it)
     Attach {
         name: String,
         /// Only print the changed VM definition
         #[arg(long)]
         dry_run: bool,
-        /// libvirt connection, e.g. qemu:///system
+        /// libvirt connection, e.g. qemu:///system (default: whichever has the VM)
         #[arg(long, short = 'c')]
         connect: Option<String>,
+        /// Do not install the guest driver now; print the command for later
+        #[arg(long)]
+        guest_later: bool,
     },
     /// Stream a VM to Moonlight and Conduit viewers over the network (NVENC).
     /// Also: `stream pair PIN`, `stream clients`, `stream unpair CLIENT`, `stream status`
@@ -221,8 +240,24 @@ enum Cmd {
         #[arg(long)]
         fullscreen: bool,
     },
-    /// Check this computer and explain how to fix problems
-    Doctor,
+    /// Take Conduit's GPU off a libvirt VM: restore its original definition
+    Detach { name: String },
+    /// Make a Conduit VM a libvirt domain (virt-manager, virsh) or stop that
+    Libvirt {
+        #[arg(value_parser = ["enable", "disable"])]
+        action: String,
+        name: String,
+    },
+    /// Settings: `conduit config set view.close_stops_vm false`
+    Config {
+        #[arg(value_parser = ["get", "set", "unset"])]
+        action: String,
+        key: Option<String>,
+        value: Option<String>,
+    },
+    /// Check this computer and explain how to fix problems (with NAME: also
+    /// that VM's whole chain: libvirt domain, sockets, backend, guest driver)
+    Doctor { name: Option<String> },
     /// (internal) viewer direct-mode hook for Hyprland
     #[command(hide = true)]
     HyprHook {
@@ -233,6 +268,15 @@ enum Cmd {
     /// (internal) stop the VM when its viewer closes
     #[command(name = "_watch", hide = true)]
     Watch { name: String },
+    /// (internal) conduit-backend@NAME.service: become the GPU backend
+    #[command(name = "_backend", hide = true)]
+    Backend { name: String },
+    /// (internal) conduit-virtiofsd@NAME.service: become virtiofsd
+    #[command(name = "_virtiofsd", hide = true)]
+    Virtiofsd { name: String },
+    /// (internal) after the backend stopped with its VM
+    #[command(name = "_stopped", hide = true)]
+    Stopped { name: String },
 }
 
 fn ram_mib(s: &str) -> Result<u64> {
@@ -251,7 +295,7 @@ fn opt_mode(s: Option<&str>) -> Result<Option<Mode>> {
 }
 
 fn list() -> Result<()> {
-    let names = vm::all();
+    let names = lvrun::all_names();
     if names.is_empty() {
         println!("No VMs yet. Create one with `conduit create myvm`.");
         return Ok(());
@@ -261,15 +305,32 @@ fn list() -> Result<()> {
         "NAME", "STATE", "DISK", "RAM", "CPUS", "DESKTOP"
     );
     for n in names {
+        if vm::VmConfig::load(&n).is_err() {
+            if let Some(l) = virt::Link::load(&n) {
+                println!(
+                    "{:<20} {:<9} {:>9} {:>8} {:>5}  {:<8}  (libvirt VM {} on {})",
+                    n,
+                    lvrun::state_word(&n),
+                    "-",
+                    "-",
+                    "-",
+                    "attached",
+                    l.domain,
+                    l.uri
+                );
+                continue;
+            }
+        }
         match vm::VmConfig::load(&n) {
             Ok(c) => {
                 let disk = std::fs::metadata(c.disk_path())
                     .map(|m| ui::human_bytes(m.blocks() * 512))
                     .unwrap_or_else(|_| "missing".into());
-                let state = if run::is_running(&n) {
-                    "running"
+                let state = lvrun::state_word(&n);
+                let state = if virt::Link::load(&n).is_some() {
+                    format!("{state}*")
                 } else {
-                    "stopped"
+                    state
                 };
                 println!(
                     "{:<20} {:<9} {:>9} {:>8} {:>5}  {:<8}  {}",
@@ -284,6 +345,33 @@ fn list() -> Result<()> {
             }
             Err(e) => println!("{n:<20} (broken: {e})"),
         }
+    }
+    if names_have_libvirt() {
+        println!("* also a libvirt VM: start/stop it in virt-manager (QEMU/KVM user session) or with virsh");
+    }
+    Ok(())
+}
+
+fn names_have_libvirt() -> bool {
+    lvrun::all_names()
+        .iter()
+        .any(|n| virt::Link::load(n).is_some())
+}
+
+/// After `create`/`import`: register the VM with libvirt when it is there.
+fn register(name: &str, no_libvirt: bool) -> anyhow::Result<()> {
+    if no_libvirt {
+        return Ok(());
+    }
+    if !virt::session_available() {
+        ui::info("libvirt is not installed: the VM runs through `conduit up/view` only (install libvirt and run `conduit libvirt enable` to manage it from virt-manager)");
+        return Ok(());
+    }
+    if let Err(e) = virt::enable(name) {
+        ui::warn(format!("could not register {name} with libvirt: {e:#}"));
+        ui::info(format!(
+            "`conduit view {name}` works without it; retry with `conduit libvirt enable {name}`"
+        ));
     }
     Ok(())
 }
@@ -301,16 +389,18 @@ fn main() {
             cpus,
             user,
             tarball,
+            no_libvirt,
         } => (|| {
             create::create(create::CreateOpts {
-                name,
+                name: name.clone(),
                 size: ui::parse_size(&size, 'G')?,
                 desktop,
                 ram_mib: ram_mib(&ram)?,
                 cpus,
                 user,
                 tarball,
-            })
+            })?;
+            register(&name, no_libvirt)
         })(),
         Cmd::Import {
             path,
@@ -322,10 +412,11 @@ fn main() {
             kernel,
             share,
             net,
+            no_libvirt,
         } => (|| {
             create::import(create::ImportOpts {
                 path,
-                name,
+                name: name.clone(),
                 mv,
                 ram_mib: ram_mib(&ram)?,
                 cpus,
@@ -333,7 +424,8 @@ fn main() {
                 kernel,
                 share,
                 net_index: net,
-            })
+            })?;
+            register(&name, no_libvirt)
         })(),
         Cmd::StockKernel { name } => create::stock_kernel(&name),
         Cmd::List => list(),
@@ -349,8 +441,9 @@ fn main() {
             tune_hyprland,
             fullscreen,
             vmm,
+            keep_running,
         } => opt_mode(mode.as_deref())
-            .and_then(|m| run::view(&name, m, tune_hyprland, fullscreen, vmm)),
+            .and_then(|m| run::view(&name, m, tune_hyprland, fullscreen, vmm, keep_running)),
         Cmd::Down { name } => run::down(&name),
         Cmd::Status { name } => run::status(name.as_deref()),
         Cmd::Logs {
@@ -368,7 +461,8 @@ fn main() {
             name,
             dry_run,
             connect,
-        } => libvirt::attach(&name, dry_run, connect.as_deref()),
+            guest_later,
+        } => libvirt::attach(&name, dry_run, connect.as_deref(), guest_later),
         Cmd::Stream {
             target,
             arg,
@@ -422,7 +516,25 @@ fn main() {
             fullscreen,
             yuv444,
         }),
-        Cmd::Doctor => std::process::exit(doctor::run()),
+        Cmd::Detach { name } => libvirt::detach(&name),
+        Cmd::Libvirt { action, name } => match action.as_str() {
+            "enable" => virt::enable(&name),
+            _ => virt::disable(&name),
+        },
+        Cmd::Config { action, key, value } => match (action.as_str(), key, value) {
+            ("get", k, None) => config::get(k.as_deref()),
+            ("set", Some(k), Some(v)) => config::set(&k, &v),
+            ("unset", Some(k), None) => config::unset(&k),
+            _ => Err(ui::oops(
+                "usage: conduit config get [KEY] | set KEY VALUE | unset KEY",
+                "e.g. conduit config set view.close_stops_vm false",
+            )),
+        },
+        Cmd::Doctor { name: None } => std::process::exit(doctor::run()),
+        Cmd::Doctor { name: Some(n) } => std::process::exit(doctor::run_vm(&n)),
+        Cmd::Backend { name } => lvrun::backend_exec(&name),
+        Cmd::Virtiofsd { name } => lvrun::virtiofsd_exec(&name),
+        Cmd::Stopped { name } => lvrun::stopped(&name),
         Cmd::HyprHook { action, state } => hypr::hook(&action, &state),
         Cmd::Watch { name } => run::watch(&name),
     };
@@ -490,6 +602,22 @@ mod tests {
             vec!["conduit", "stream", "pair", "1234"],
             vec!["conduit", "stream", "clients"],
             vec!["conduit", "remote", "box", "--lossless"],
+            vec!["conduit", "doctor", "myvm"],
+            vec![
+                "conduit",
+                "attach",
+                "myvm",
+                "-c",
+                "qemu:///system",
+                "--guest-later",
+            ],
+            vec!["conduit", "detach", "myvm"],
+            vec!["conduit", "libvirt", "enable", "myvm"],
+            vec!["conduit", "libvirt", "disable", "myvm"],
+            vec!["conduit", "view", "myvm", "--keep-running"],
+            vec!["conduit", "config", "set", "view.close_stops_vm", "false"],
+            vec!["conduit", "config", "get"],
+            vec!["conduit", "create", "myvm", "--no-libvirt"],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }

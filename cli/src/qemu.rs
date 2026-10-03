@@ -209,7 +209,7 @@ pub fn args(c: &VmConfig, p: &Paths, audio: Option<Audio>) -> Vec<String> {
 
 // ---------------------------------------------------------------- virtiofsd
 
-fn supports_readonly(vfsd: &Path) -> bool {
+pub fn supports_readonly(vfsd: &Path) -> bool {
     Command::new(vfsd)
         .arg("--help")
         .output()

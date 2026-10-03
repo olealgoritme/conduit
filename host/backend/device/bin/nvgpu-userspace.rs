@@ -79,7 +79,9 @@ fn place(src: &Path, dst: &Path) -> Result<&'static str> {
     }
     match std::fs::hard_link(src, dst) {
         Ok(()) => Ok("hardlink"),
-        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+        // EXDEV: another filesystem. EPERM: fs.protected_hardlinks refuses a
+        // link to a file we do not own (root's /usr/bin/nvidia-smi).
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EXDEV) | Some(libc::EPERM)) => {
             // Resolve first: a manifest entry may itself be a symlink on the
             // host, and copying the link rather than its target reintroduces
             // the dangling-path problem this function exists to avoid.

@@ -21,8 +21,8 @@ conduit/
 │   ├── agent/     Python. conduit-clipboard-agent: the desktop session's
 │   │              clipboard <-> /dev/conduit-clipboard.
 │   └── windows/   Reserved for the Windows guest driver (see ROADMAP).
-├── cli/           The `conduit` command (create / attach / view / up / down /
-│                  stream / remote).
+├── cli/           The `conduit` command (create / view / up / down / stream /
+│                  remote; libvirt: attach / detach / libvirt enable, docs/LIBVIRT.md).
 ├── packaging/
 │   ├── deb/       Debian packages: conduit, conduit-guest
 │   └── dkms/      dkms.conf for the guest module

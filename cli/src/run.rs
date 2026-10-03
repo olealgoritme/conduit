@@ -43,40 +43,44 @@ impl VmmKind {
 
 /// What the running VM was started with (state.json in the runtime folder).
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct State {
-    mode: Option<String>,
-    backend_comm: String,
-    vm_comm: String,
-    viewer_comm: String,
-    watcher_comm: String,
+pub(crate) struct State {
+    pub(crate) mode: Option<String>,
+    pub(crate) backend_comm: String,
+    pub(crate) vm_comm: String,
+    pub(crate) viewer_comm: String,
+    pub(crate) watcher_comm: String,
     /// "qemu" or "builtin" (empty: started by an older conduit = builtin).
     #[serde(default)]
-    vmm: String,
+    pub(crate) vmm: String,
     /// QEMU only: the virtiofsd serving the NVIDIA share.
     #[serde(default)]
-    virtiofsd_comm: String,
+    pub(crate) virtiofsd_comm: String,
     /// QEMU only: the sound server the VM plays through.
     #[serde(default)]
-    audio: Option<String>,
+    pub(crate) audio: Option<String>,
+    /// Closing the viewer window shuts the VM down (`conduit view` booted it
+    /// and neither --keep-running nor `view.close_stops_vm false` said otherwise).
+    #[serde(default)]
+    pub(crate) close_stops_vm: bool,
 }
 
-struct Rt {
-    dir: PathBuf,
+pub(crate) struct Rt {
+    pub(crate) dir: PathBuf,
 }
 
 impl Rt {
-    fn new(name: &str) -> Result<Rt> {
+    pub(crate) fn new(name: &str) -> Result<Rt> {
         let dir = paths::run_dir(name);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(Rt { dir })
     }
-    fn p(&self, f: &str) -> PathBuf {
+    pub(crate) fn p(&self, f: &str) -> PathBuf {
         self.dir.join(f)
     }
     fn gpu_sock(&self) -> PathBuf {
         self.p("gpu.sock")
     }
-    fn display_sock(&self) -> PathBuf {
+    pub(crate) fn display_sock(&self) -> PathBuf {
         self.p("display.sock")
     }
     fn vfs_sock(&self) -> PathBuf {
@@ -85,20 +89,20 @@ impl Rt {
     fn qmp_sock(&self) -> PathBuf {
         self.p("qmp.sock")
     }
-    fn hypr_state(&self) -> PathBuf {
+    pub(crate) fn hypr_state(&self) -> PathBuf {
         self.p("hypr.saved")
     }
-    fn state(&self) -> State {
+    pub(crate) fn state(&self) -> State {
         std::fs::read_to_string(self.p("state.json"))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
-    fn save_state(&self, s: &State) -> Result<()> {
+    pub(crate) fn save_state(&self, s: &State) -> Result<()> {
         std::fs::write(self.p("state.json"), serde_json::to_string_pretty(s)?)?;
         Ok(())
     }
-    fn pid(&self, what: &str, comm: &str) -> Option<i32> {
+    pub(crate) fn pid(&self, what: &str, comm: &str) -> Option<i32> {
         if comm.is_empty() {
             return None;
         }
@@ -106,13 +110,25 @@ impl Rt {
     }
 }
 
-fn self_comm() -> String {
+pub(crate) fn self_comm() -> String {
     std::env::current_exe()
         .map(|p| comm_of(&p))
         .unwrap_or_else(|_| "conduit".into())
 }
 
+/// Running in any way: as a libvirt domain (also paused) or under `conduit up`.
 pub fn is_running(name: &str) -> bool {
+    match crate::virt::Link::load(name) {
+        Some(l) => l
+            .virsh()
+            .state(&l.domain)
+            .is_some_and(|s| crate::virt::state_is_up(&s)),
+        None => is_running_unmanaged(name),
+    }
+}
+
+/// Started by `conduit up`/`view` directly (not through libvirt).
+pub(crate) fn is_running_unmanaged(name: &str) -> bool {
     let Ok(rt) = Rt::new(name) else { return false };
     let st = rt.state();
     rt.pid("vm", &st.vm_comm).is_some()
@@ -122,20 +138,27 @@ pub fn is_running(name: &str) -> bool {
 
 /// The NVIDIA user-space folder the guest mounts. It must be the exact build of
 /// the host's loaded driver, so by default it is staged from the host itself.
-fn ensure_share(c: &VmConfig) -> Result<PathBuf> {
-    if let Some(s) = &c.share {
+pub(crate) fn ensure_share(c: &VmConfig) -> Result<PathBuf> {
+    ensure_share_for(c.share.as_deref(), &c.dir().join("vm.json"), &c.logs_dir())
+}
+
+/// The share for a VM with this `share` setting (None: staged from the host
+/// driver); `settings` is where the setting lives, `logs` the VM's log folder.
+pub(crate) fn ensure_share_for(
+    share: Option<&Path>,
+    settings: &Path,
+    logs: &Path,
+) -> Result<PathBuf> {
+    if let Some(s) = share {
         if s.is_dir() {
-            return Ok(s.clone());
+            return Ok(s.to_path_buf());
         }
         return Err(oops(
             format!(
                 "the NVIDIA share folder set for this VM is missing: {}",
                 s.display()
             ),
-            format!(
-                "Fix or remove \"share\" in {}",
-                c.dir().join("vm.json").display()
-            ),
+            format!("Fix or remove \"share\" in {}", settings.display()),
         ));
     }
     let drv = crate::host::driver().ok_or_else(|| {
@@ -153,10 +176,12 @@ fn ensure_share(c: &VmConfig) -> Result<PathBuf> {
         "preparing the NVIDIA {} files for VMs (once per driver version)",
         drv.version
     ));
-    let tmp = dir.with_extension("partial");
+    // Not with_extension: "610.57.04" would become "610.57.partial".
+    let tmp = dir.with_file_name(format!("{}.partial", drv.version));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(tmp.parent().unwrap())?;
-    let log = c.logs_dir().join("share.log");
+    std::fs::create_dir_all(logs)?;
+    let log = logs.join("share.log");
     let out = Command::new(&tool)
         .arg("--stage")
         .arg(&tmp)
@@ -412,18 +437,21 @@ fn viewer_supports_hook(viewer: &Path) -> bool {
 }
 
 /// Returns true if Hyprland must be tuned for the whole run (old viewer without hook support).
-fn start_viewer(
-    c: &VmConfig,
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_viewer(
+    name: &str,
+    logs: &Path,
     rt: &Rt,
     viewer: &Path,
     m: Mode,
     tune: Option<&str>,
     fullscreen: bool,
+    close_stops_vm: bool,
 ) -> Result<bool> {
     let dsock = rt.display_sock();
     if dsock.exists() && sys::socket_live(&dsock) {
         return Err(oops(
-            format!("a viewer for {} is already open", c.name),
+            format!("a viewer for {name} is already open"),
             "Look for its window, or close it first",
         ));
     }
@@ -441,7 +469,14 @@ fn start_viewer(
             "--size",
             &m.size(),
             "--title",
-            &format!("{} - Conduit", c.name),
+            &format!(
+                "{name} - Conduit{}",
+                if close_stops_vm {
+                    " (closing shuts the VM down)"
+                } else {
+                    " (closing leaves the VM running)"
+                }
+            ),
         ])
         .args([
             "--present-mode=native",
@@ -468,7 +503,7 @@ fn start_viewer(
             whole_run = true;
         }
     }
-    let log = c.logs_dir().join("viewer.log");
+    let log = logs.join("viewer.log");
     let pid = sys::spawn_detached(&mut cmd, &log, false)?;
     sys::write_pid(&rt.p("viewer.pid"), pid)?;
     let pid = pid as i32;
@@ -488,11 +523,11 @@ fn start_viewer(
     Ok(whole_run)
 }
 
-fn start_watcher(c: &VmConfig, rt: &Rt) -> Result<()> {
+pub(crate) fn start_watcher(name: &str, logs: &Path, rt: &Rt) -> Result<()> {
     let me = std::env::current_exe()?;
     let mut cmd = Command::new(me);
-    cmd.args(["_watch", &c.name]);
-    let pid = sys::spawn_detached(&mut cmd, &c.logs_dir().join("watcher.log"), true)?;
+    cmd.args(["_watch", name]);
+    let pid = sys::spawn_detached(&mut cmd, &logs.join("watcher.log"), true)?;
     sys::write_pid(&rt.p("watcher.pid"), pid)
 }
 
@@ -518,7 +553,7 @@ struct Parts {
     boot: crate::boot::Boot,
 }
 
-fn need_virtiofsd() -> Result<PathBuf> {
+pub(crate) fn need_virtiofsd() -> Result<PathBuf> {
     qemu::virtiofsd().ok_or_else(|| {
         oops(
             "virtiofsd is not installed (QEMU needs it to share the NVIDIA files with the VM)",
@@ -583,12 +618,15 @@ pub fn set_no_mem_check(on: bool) {
 }
 
 /// Refuse to start when the VM's RAM does not fit in what the host has free.
-fn check_memory(c: &VmConfig) -> Result<()> {
+pub(crate) fn check_memory(c: &VmConfig) -> Result<()> {
     let others: Vec<(u64, i32)> = vm::all()
         .into_iter()
         .filter(|n| *n != c.name)
         .filter_map(|n| {
             let o = VmConfig::load(&n).ok()?;
+            if let Some(l) = crate::virt::Link::load(&n) {
+                return Some((o.ram_mib, l.virsh().qemu_pid(&l.domain)?));
+            }
             let rt = Rt::new(&n).ok()?;
             let pid = rt.pid("vm", &rt.state().vm_comm)?;
             Some((o.ram_mib, pid))
@@ -663,6 +701,15 @@ fn boot(c: &VmConfig, rt: &Rt, st: &mut State, p: &Parts, mode: Option<Mode>) ->
 // ---------------------------------------------------------------- commands
 
 pub fn up(name: &str, display: Option<Mode>, headless: bool, vmm: Option<VmmKind>) -> Result<()> {
+    if let Some(link) = crate::virt::Link::load(name) {
+        if vmm == Some(VmmKind::Builtin) {
+            return Err(oops(
+                format!("{name} is a libvirt VM; it runs under Conduit's QEMU"),
+                format!("`conduit libvirt disable {name}` first to use the built-in runner"),
+            ));
+        }
+        return crate::lvrun::up(name, &link, display, headless);
+    }
     let c = VmConfig::load(name)?;
     if is_running(name) {
         ui::info(format!(
@@ -703,7 +750,11 @@ pub fn view(
     tune_hyprland: bool,
     fullscreen: bool,
     vmm: Option<VmmKind>,
+    keep_running: bool,
 ) -> Result<()> {
+    if let Some(link) = crate::virt::Link::load(name) {
+        return crate::lvrun::view(name, &link, req, tune_hyprland, fullscreen, keep_running);
+    }
     let c = VmConfig::load(name)?;
     if viewer_session(
         std::env::var_os("WAYLAND_DISPLAY").is_some(),
@@ -720,6 +771,8 @@ pub fn view(
     let (rt, lock) = prepare(&c)?;
     let mut st = rt.state();
     let running = rt.pid("vm", &st.vm_comm).is_some();
+    // Only a VM this command boots stops with its window.
+    let close_stops_vm = !running && !keep_running && crate::config::close_stops_vm();
 
     let mode = match (running, st.mode.as_deref()) {
         (true, Some(m)) => {
@@ -790,7 +843,16 @@ pub fn view(
 
     let result = (|| -> Result<()> {
         // Viewer first: the backend connects to its socket.
-        let whole_run = start_viewer(&c, &rt, &viewer, mode, tune.as_deref(), fullscreen)?;
+        let whole_run = start_viewer(
+            &c.name,
+            &c.logs_dir(),
+            &rt,
+            &viewer,
+            mode,
+            tune.as_deref(),
+            fullscreen,
+            close_stops_vm,
+        )?;
         st.viewer_comm = comm_of(&viewer);
         rt.save_state(&st)?;
         if whole_run {
@@ -802,8 +864,9 @@ pub fn view(
             st.viewer_comm = comm_of(&viewer);
         }
         st.watcher_comm = self_comm();
+        st.close_stops_vm = close_stops_vm;
         rt.save_state(&st)?;
-        start_watcher(&c, &rt)
+        start_watcher(&c.name, &c.logs_dir(), &rt)
     })();
     if let Err(e) = result {
         drop(lock);
@@ -811,10 +874,24 @@ pub fn view(
         return Err(e);
     }
     ui::info(format!(
-        "{name} is {}. Ctrl+Alt+F fullscreen, Ctrl+Alt+G capture mouse. Closing the window shuts the VM down.",
-        if running { "running; viewer opened" } else { "starting" }
+        "{name} is {}. Ctrl+Alt+F fullscreen, Ctrl+Alt+G capture mouse. {}",
+        if running {
+            "running; viewer opened"
+        } else {
+            "starting"
+        },
+        close_note(close_stops_vm, name)
     ));
     Ok(())
+}
+
+/// What closing the window will do, for `conduit view`'s output.
+pub(crate) fn close_note(close_stops_vm: bool, name: &str) -> String {
+    if close_stops_vm {
+        format!("Closing the window shuts {name} down (--keep-running, or `conduit config set view.close_stops_vm false`, leaves it running).")
+    } else {
+        format!("Closing the window leaves {name} running: `conduit view {name}` reattaches, `conduit down {name}` stops it.")
+    }
 }
 
 /// Clear pid files and sockets of processes that are gone (crash, reboot).
@@ -877,6 +954,9 @@ fn guest_poweroff(c: &VmConfig, vm_pid: i32) -> bool {
 }
 
 pub fn down(name: &str) -> Result<()> {
+    if let Some(link) = crate::virt::Link::load(name) {
+        return crate::lvrun::down(name, &link);
+    }
     let c = VmConfig::load(name)?;
     down_inner(&c, true, true)
 }
@@ -970,6 +1050,9 @@ fn down_inner(c: &VmConfig, interactive: bool, verbose: bool) -> Result<()> {
 /// Background: wait for the viewer window (or the VM) to go away, then stop everything.
 pub fn watch(name: &str) -> Result<()> {
     sys::sudo_noninteractive();
+    if let Some(link) = crate::virt::Link::load(name) {
+        return crate::lvrun::watch(name, &link);
+    }
     let c = VmConfig::load(name)?;
     let rt = Rt::new(name)?;
     let st = rt.state();
@@ -977,6 +1060,16 @@ pub fn watch(name: &str) -> Result<()> {
         std::thread::sleep(Duration::from_secs(1));
         let viewer = rt.pid("viewer", &st.viewer_comm).is_some();
         let vm = rt.pid("vm", &st.vm_comm).is_some();
+        if !viewer && vm && !st.close_stops_vm {
+            ui::info(format!("viewer window closed; {name} keeps running"));
+            let _ = std::fs::remove_file(rt.p("viewer.pid"));
+            let _ = std::fs::remove_file(rt.p("watcher.pid"));
+            if rt.hypr_state().exists() {
+                let _ = hypr::hook("restore", &rt.hypr_state());
+            }
+            let _ = sys::clear_stale_socket(&rt.display_sock());
+            return Ok(());
+        }
         if !viewer || !vm {
             ui::info(format!(
                 "{} closed; stopping {}",
@@ -990,12 +1083,19 @@ pub fn watch(name: &str) -> Result<()> {
 }
 
 pub fn status(name: Option<&str>) -> Result<()> {
+    if let Some(n) = name {
+        if let Some(link) = crate::virt::Link::load(n) {
+            return crate::lvrun::status(n, &link);
+        }
+    }
     let names = match name {
         Some(n) => {
-            VmConfig::load(n)?;
+            if crate::virt::Link::load(n).is_none() {
+                VmConfig::load(n)?;
+            }
             vec![n.to_string()]
         }
-        None => vm::all(),
+        None => crate::lvrun::all_names(),
     };
     if names.is_empty() {
         println!("No VMs yet. Create one with `conduit create myvm`.");
@@ -1004,6 +1104,10 @@ pub fn status(name: Option<&str>) -> Result<()> {
     for (i, n) in names.iter().enumerate() {
         if i > 0 {
             println!();
+        }
+        if let Some(link) = crate::virt::Link::load(n) {
+            crate::lvrun::status(n, &link)?;
+            continue;
         }
         let c = VmConfig::load(n)?;
         let rt = Rt::new(n)?;
@@ -1074,7 +1178,11 @@ pub fn status(name: Option<&str>) -> Result<()> {
 }
 
 pub fn logs(name: &str, which: Option<&str>, follow: bool, lines: usize) -> Result<()> {
-    let c = VmConfig::load(name)?;
+    let logs_dir = match VmConfig::load(name) {
+        Ok(c) => c.logs_dir(),
+        Err(_) if crate::virt::Link::load(name).is_some() => paths::vm_dir(name).join("logs"),
+        Err(e) => return Err(e),
+    };
     let all = ["backend", "vm", "viewer"];
     let pick: Vec<&str> = match which {
         None => all.to_vec(),
@@ -1088,7 +1196,7 @@ pub fn logs(name: &str, which: Option<&str>, follow: bool, lines: usize) -> Resu
     };
     let files: Vec<PathBuf> = pick
         .iter()
-        .map(|w| c.logs_dir().join(format!("{w}.log")))
+        .map(|w| logs_dir.join(format!("{w}.log")))
         .collect();
     if follow {
         use std::os::unix::process::CommandExt;

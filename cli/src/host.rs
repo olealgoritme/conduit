@@ -1,7 +1,6 @@
 //! Facts about the host: NVIDIA driver, supported driver versions, QEMU.
 
 use crate::paths;
-use std::path::PathBuf;
 
 #[derive(Debug, PartialEq)]
 pub struct Driver {
@@ -99,12 +98,6 @@ pub fn parse_qemu_version(text: &str) -> Option<(u32, u32)> {
         .parse()
         .ok()?;
     Some((maj, min))
-}
-
-pub fn system_qemu() -> Option<(PathBuf, (u32, u32))> {
-    let p = crate::sys::which("qemu-system-x86_64")?;
-    let out = crate::sys::output(p.to_str()?, &["--version"]).ok()?;
-    Some((p, parse_qemu_version(&out)?))
 }
 
 #[cfg(test)]

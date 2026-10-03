@@ -11,7 +11,7 @@ from GPU memory to your screen: no copying, no video compression.
 - Up to your monitor's refresh rate (tested at 240 Hz).
 - Mouse, keyboard, clipboard (copy/paste both ways) and sound just work.
 - Play it from another computer, phone or TV with [Moonlight](https://moonlight-stream.org).
-- Close the window and the VM shuts down cleanly.
+- Start, pause and stop VMs from virt-manager / virsh, or with `conduit` commands.
 
 ### What works
 
@@ -23,7 +23,7 @@ from GPU memory to your screen: no copying, no video compression.
 | Desktop in a window, up to 240 Hz, zero-copy | ✅ |
 | Clipboard both ways, sound (speakers + mic) | ✅ |
 | Streaming to Moonlight (AV1/HEVC/H.264, up to 240 fps) | ✅ |
-| virt-manager / libvirt | 🚧 in progress |
+| virt-manager / virsh (start, pause, reboot, stop; attach to existing VMs) | ✅ |
 | Windows VMs | ❌ not yet ([roadmap](docs/ROADMAP.md)) |
 
 > **Status: early.** Works on the developer's machine (RTX 5090, Ubuntu 24.04,
@@ -139,16 +139,45 @@ own viewer can connect too (`conduit stream myvm --link` here,
 `conduit remote THIS-PC --lossless` there; lossless needs ~1 Gbit/s+).
 Details: [docs/STREAMING.md](docs/STREAMING.md).
 
-## Using virt-manager or virsh (🚧 in progress)
+## virt-manager and virsh
 
-Already have VMs in virt-manager? Add Conduit to one of them:
+Conduit VMs are ordinary libvirt VMs: start, pause, resume, reboot and shut
+them down from virt-manager or `virsh` like any other, while the GPU, the
+`conduit view` window and the clipboard keep working. They live in libvirt's
+**user session** (`qemu:///session`, QEMU runs as you). In virt-manager, open it
+once with **File > Add Connection > Hypervisor: QEMU/KVM user session**.
+
+**A) Beginner: a new VM**
 
 ```bash
-conduit attach myvm      # adds the GPU device to an existing libvirt VM
-conduit view myvm
+conduit create myvm      # builds it and registers it with libvirt (--no-libvirt: don't)
+conduit view myvm        # starts it and opens its screen
 ```
 
-Inside that VM, install the guest driver: `sudo apt install ./conduit-guest_*.deb`.
+**B) A VM you already have in virt-manager**
+
+```bash
+conduit attach myvm      # backs up its definition, adds the GPU, installs the guest driver
+# start it in virt-manager (or: virsh -c qemu:///session start myvm)
+conduit view myvm        # its screen, in a Conduit window
+conduit detach myvm      # later, if you want: the original definition comes back
+```
+
+`attach` installs the guest driver through the QEMU guest agent when the VM
+runs one; otherwise it prints the one command to run. It works for VMs in
+`qemu:///system` too (`conduit attach myvm -c qemu:///system`).
+A VM made before this: `conduit libvirt enable myvm` (and `disable` to undo).
+
+The window and the VM have separate lives: closing the window leaves a VM
+running unless `conduit view` itself started it (then it shuts down, unless
+you pass `--keep-running` or set `conduit config set view.close_stops_vm false`).
+`conduit view myvm` reattaches at any time. Each VM also gets an app-menu entry,
+"myvm (Conduit VM)".
+
+Not supported for these VMs: saving their memory to disk (virt-manager "Save",
+`virsh managedsave`), snapshots with memory, and migration. The GPU's state
+lives in the host driver, and libvirt refuses these. `conduit doctor myvm`
+checks the whole chain. Details: [docs/LIBVIRT.md](docs/LIBVIRT.md).
 
 ## How it works (short version)
 

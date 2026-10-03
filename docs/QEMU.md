@@ -126,67 +126,23 @@ the two pflash drives.
 
 ## libvirt
 
-libvirt has no element for a generic vhost-user device, so the nvgpu device
-goes through `qemu:commandline`. Everything else is native.
-
-Use the session daemon (`virsh -c qemu:///session`). It runs QEMU as you, so
-QEMU can reach the backend socket, the tap you own, and the files in your
-home directory. The system daemon runs QEMU as `libvirt-qemu` under an
-AppArmor profile that knows nothing about the socket; to use it you would
-have to fix ownership and AppArmor yourself. Ubuntu 24.04 ships libvirt
-10.0. Point `<emulator>` at the patched QEMU.
+Conduit VMs are libvirt domains (`conduit libvirt enable`, done by `create` /
+`import`), and `conduit attach` adds this device to an existing libvirt VM.
+[LIBVIRT.md](LIBVIRT.md) has the domain XML Conduit writes, how the backend
+and virtiofsd start with the domain (systemd socket activation: QEMU connects
+to `conduit-backend@NAME.socket` and systemd starts the backend), and what
+virt-manager can and cannot do with these VMs. The GPU still goes through
+`<qemu:commandline>`, since libvirt has no element for a generic vhost-user
+device:
 
 ```xml
-<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
-  <name>conduit-nvgpu</name>
-  <memory unit='GiB'>4</memory>
-  <vcpu>4</vcpu>
-  <memoryBacking>
-    <source type='memfd'/>
-    <access mode='shared'/>
-  </memoryBacking>
-  <os>
-    <type arch='x86_64' machine='q35'>hvm</type>
-    <kernel>/home/user/code/nvgpu-lab/linux-7.2.9/vmlinux</kernel>
-    <cmdline>console=ttyS0 root=/dev/vda rw</cmdline>
-  </os>
-  <features><acpi/></features>
-  <cpu mode='host-passthrough'>
-    <maxphysaddr mode='passthrough'/>
-  </cpu>
-  <devices>
-    <emulator>/opt/conduit/bin/qemu-system-x86_64</emulator>
-    <disk type='file' device='disk'>
-      <driver name='qemu' type='raw' cache='none'/>
-      <source file='/home/user/code/nvgpu-lab/rootfs-ssh.ext4'/>
-      <target dev='vda' bus='virtio'/>
-    </disk>
-    <interface type='ethernet'>
-      <mac address='02:00:00:00:00:01'/>
-      <target dev='nesbox0' managed='no'/>
-      <model type='virtio'/>
-    </interface>
-    <!-- virtiofsd started by you, as above -->
-    <filesystem type='mount'>
-      <driver type='virtiofs' queue='1024'/>
-      <source socket='/run/user/1000/conduit/vfs.sock'/>
-      <target dir='nvidia'/>
-    </filesystem>
-    <serial type='pty'/>
-    <console type='pty'><target type='serial'/></console>
-  </devices>
   <qemu:commandline>
     <qemu:arg value='-chardev'/>
-    <qemu:arg value='socket,id=nvgpu,path=/run/user/1000/conduit/nvgpu.sock'/>
+    <qemu:arg value='socket,id=conduit-gpu,path=/run/user/1000/conduit/NAME/gpu-libvirt.sock'/>
     <qemu:arg value='-device'/>
-    <qemu:arg value='vhost-user-test-device-pci,chardev=nvgpu,virtio-id=45,num_vqs=2,vq_size=256,config_size=4036,bus=pcie.0,addr=0x10'/>
+    <qemu:arg value='vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,num_vqs=2,vq_size=256,config_size=4036,bus=pcie.0,addr=0x10'/>
   </qemu:commandline>
-</domain>
 ```
-
-The pinned `addr=0x10` keeps the device out of the slots libvirt assigns
-itself. Start the backend and virtiofsd before `virsh start`. libvirt
-neither starts nor supervises them.
 
 ## What the guest sees: QEMU compared with nesbox
 

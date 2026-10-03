@@ -231,11 +231,55 @@ pub fn run() -> i32 {
         }
     }
 
-    // QEMU (only matters for `conduit attach`)
-    match host::system_qemu() {
-        Some((_, v)) if v >= crate::libvirt::MIN_QEMU => r.line(Level::Ok, "QEMU (for attach)", &format!("system QEMU {}.{}", v.0, v.1), ""),
-        Some((_, v)) => r.line(Level::Ok, "QEMU (for attach)", &format!("system QEMU {}.{} is older than 11.1; Conduit will use its own (your QEMU is not touched)", v.0, v.1), ""),
-        None => r.line(Level::Ok, "QEMU (for attach)", "not installed (only needed for libvirt VMs)", ""),
+    // Conduit's QEMU and libvirt (virt-manager / virsh)
+    match Tool::BundledQemu.find() {
+        Some(q) => {
+            let v = sys::output(&q.to_string_lossy(), &["--version"])
+                .ok()
+                .and_then(|o| host::parse_qemu_version(&o));
+            match v {
+                Some(v) if v >= (11, 1) => r.line(
+                    Level::Ok,
+                    "Conduit's QEMU",
+                    &format!("{} ({}.{})", q.display(), v.0, v.1),
+                    "",
+                ),
+                _ => r.line(
+                    Level::Warn,
+                    "Conduit's QEMU",
+                    &format!("{} is not QEMU 11.1 or newer", q.display()),
+                    "Reinstall the conduit package (source checkout: host/qemu/build-qemu.sh)",
+                ),
+            }
+        }
+        None => r.line(
+            Level::Warn,
+            "Conduit's QEMU",
+            "missing (VMs fall back to the built-in runner, without sound or libvirt)",
+            "Reinstall the conduit package (in a source checkout: host/qemu/build-qemu.sh)",
+        ),
+    }
+    if !sys::have("virsh") {
+        r.line(
+            Level::Ok,
+            "libvirt",
+            "not installed (optional: manage VMs from virt-manager)",
+            "",
+        );
+    } else if crate::virt::session_available() {
+        r.line(
+            Level::Ok,
+            "libvirt",
+            "user session (qemu:///session) reachable: `conduit create` registers VMs there",
+            "",
+        );
+    } else {
+        r.line(
+            Level::Warn,
+            "libvirt",
+            "installed, but the user session (qemu:///session) does not answer",
+            "Run: virsh -c qemu:///session list   to see why",
+        );
     }
 
     println!();
@@ -253,5 +297,313 @@ pub fn run() -> i32 {
         1
     } else {
         0
+    }
+}
+
+/// `conduit doctor NAME`: one VM's whole chain, in the order a start uses it.
+pub fn run_vm(name: &str) -> i32 {
+    use crate::units;
+    use crate::virt::{self, Kind, Link};
+    let mut r = Report { fails: 0, warns: 0 };
+    println!("Checking the VM {name}…\n");
+    let cfg = crate::vm::VmConfig::load(name).ok();
+    let link = Link::load(name);
+    if cfg.is_none() && link.is_none() {
+        r.line(
+            Level::Fail,
+            "VM",
+            "unknown",
+            "See `conduit list`; `conduit attach NAME` adds Conduit to a virt-manager VM",
+        );
+        return 1;
+    }
+    if let Some(c) = &cfg {
+        let disk = c.disk_path();
+        if disk.is_file() {
+            r.line(Level::Ok, "Disk", &disk.display().to_string(), "");
+        } else {
+            r.line(
+                Level::Fail,
+                "Disk",
+                &format!("missing: {}", disk.display()),
+                "Re-create or `conduit import` the VM",
+            );
+        }
+        match &c.kernel {
+            Some(k) if !k.is_file() => r.line(
+                Level::Fail,
+                "Kernel",
+                &format!("missing: {}", k.display()),
+                "Fix \"kernel\" in vm.json",
+            ),
+            Some(k) => r.line(Level::Ok, "Kernel", &k.display().to_string(), ""),
+            None => r.line(
+                Level::Ok,
+                "Kernel",
+                "the one installed on the VM's disk (copied out at each start)",
+                "",
+            ),
+        }
+    }
+    for (t, fix) in [
+        (
+            Tool::Backend,
+            "Reinstall the conduit package, or build it in a checkout",
+        ),
+        (
+            Tool::BundledQemu,
+            "Reinstall the conduit package (source checkout: host/qemu/build-qemu.sh)",
+        ),
+    ] {
+        // A libvirt VM names its QEMU in the domain (checked below).
+        if t == Tool::BundledQemu && Link::load(name).is_some() {
+            continue;
+        }
+        match t.find() {
+            Some(p) => r.line(Level::Ok, t.label(), &p.display().to_string(), ""),
+            None => r.line(Level::Fail, t.label(), "missing", fix),
+        }
+    }
+    match crate::qemu::virtiofsd() {
+        Some(p) => r.line(Level::Ok, "virtiofsd", &p.display().to_string(), ""),
+        None => r.line(
+            Level::Fail,
+            "virtiofsd",
+            "missing",
+            "sudo apt install virtiofsd",
+        ),
+    }
+    let Some(link) = link else {
+        r.line(
+            Level::Ok,
+            "libvirt",
+            "not a libvirt VM: `conduit up/view` run it directly",
+            "",
+        );
+        println!("\n(`conduit libvirt enable {name}` makes it a virt-manager VM)");
+        return if r.fails > 0 { 1 } else { 0 };
+    };
+    let v = link.virsh();
+    if let Err(e) = v.reachable() {
+        r.line(Level::Fail, "libvirt", &format!("{e:#}"), "");
+        return 1;
+    }
+    r.line(
+        Level::Ok,
+        "libvirt",
+        &format!(
+            "{} ({})",
+            link.uri,
+            if link.kind == Kind::Managed {
+                "made by Conduit"
+            } else {
+                "attached VM"
+            }
+        ),
+        "",
+    );
+    let repair = if link.kind == Kind::Managed {
+        format!("conduit libvirt enable {name}")
+    } else {
+        format!("conduit attach {name}")
+    };
+    let Ok(xml) = v.inactive_xml(&link.domain) else {
+        r.line(
+            Level::Fail,
+            "Domain",
+            "not defined in libvirt any more",
+            &format!("Define it again: {repair}"),
+        );
+        return 1;
+    };
+    let scope = match link.scope() {
+        Ok(s) => s,
+        Err(e) => {
+            r.line(Level::Fail, "Units", &format!("{e:#}"), "");
+            return 1;
+        }
+    };
+    let gpu = units::socket_path(&scope, name, "backend");
+    let vfs = units::socket_path(&scope, name, "virtiofsd");
+    let checks = [
+        ("Conduit metadata", virt::is_ours(&xml)),
+        (
+            "memfd shared memory",
+            xml.contains("<source type='memfd'/>") && xml.contains("<access mode='shared'/>"),
+        ),
+        (
+            "GPU device",
+            xml.contains("vhost-user-test-device-pci")
+                && xml.contains(&format!("path={}", gpu.display())),
+        ),
+        (
+            "NVIDIA share",
+            xml.contains(&format!("socket='{}'", vfs.display())),
+        ),
+        ("Host address width", xml.contains("maxphysaddr")),
+    ];
+    for (what, ok) in checks {
+        if ok {
+            r.line(Level::Ok, &format!("Domain: {what}"), "present", "");
+        } else {
+            r.line(
+                Level::Fail,
+                &format!("Domain: {what}"),
+                "missing or stale",
+                &format!("Repair: {repair}"),
+            );
+        }
+    }
+    let emu = xml
+        .split("<emulator>")
+        .nth(1)
+        .and_then(|s| s.split("</emulator>").next())
+        .unwrap_or("")
+        .to_string();
+    let emu_ok = std::path::Path::new(&emu).is_file();
+    if !emu_ok {
+        r.line(
+            Level::Fail,
+            "Domain: emulator",
+            &format!("{emu} does not exist"),
+            &format!("Repair: {repair}"),
+        );
+    } else if !virt::libvirtd_may_exec(std::path::Path::new(&emu)) {
+        r.line(
+            Level::Fail,
+            "Domain: emulator",
+            &format!("{emu}: libvirt's AppArmor profile does not allow it"),
+            &format!("Repair: {repair} (adds the rule)"),
+        );
+    } else {
+        r.line(Level::Ok, "Domain: emulator", &emu, "");
+    }
+    for h in units::HELPERS {
+        let u = units::unit(h, name, "socket");
+        if units::active(&scope, name, h, "socket") {
+            r.line(Level::Ok, &format!("Socket {u}"), "listening", "");
+        } else {
+            r.line(
+                Level::Fail,
+                &format!("Socket {u}"),
+                "not listening",
+                &format!("Repair: {repair}"),
+            );
+        }
+    }
+    if let Some(c) = &cfg {
+        if units::net_installed(name) {
+            r.line(Level::Ok, "Network", &crate::net::describe(c), "");
+        } else {
+            r.line(
+                Level::Warn,
+                "Network",
+                "conduit-net unit missing (`conduit up` sets the tap up with sudo)",
+                &format!("Repair: {repair}"),
+            );
+        }
+    }
+    let state = v.state(&link.domain).unwrap_or_default();
+    r.line(Level::Ok, "State", &state, "");
+    let logs = crate::lvrun::logs_dir(name);
+    if virt::state_is_up(&state) {
+        if units::active(&scope, name, "backend", "service") {
+            r.line(Level::Ok, "GPU backend", "running", "");
+        } else {
+            r.line(Level::Fail, "GPU backend", "not running although the VM is",
+                &format!("Its log: conduit logs {name} backend\nRestart the VM (conduit down {name}; conduit up {name})"));
+        }
+        let ver = if let Some(c) = &cfg {
+            crate::run::ssh_cmd(c, "root")
+                .args([
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=3",
+                    crate::guest::VERSION_PROBE,
+                ])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        } else {
+            crate::guest::driver_version_via_agent(&link)
+        };
+        let host_ver = Tool::GuestDeb.find().and_then(|d| {
+            sys::output("dpkg-deb", &["-f", &d.to_string_lossy(), "Version"])
+                .ok()
+                .map(|s| s.trim().to_string())
+        });
+        match ver.filter(|v| !v.is_empty()) {
+            Some(v) => {
+                let same = host_ver
+                    .as_deref()
+                    .is_some_and(|h| v.starts_with(h.split('-').next().unwrap_or(h)));
+                let lvl = if same || host_ver.is_none() {
+                    Level::Ok
+                } else {
+                    Level::Warn
+                };
+                r.line(lvl, "Guest driver", &format!("{v}{}", host_ver.map(|h| format!(" (host ships {h})")).unwrap_or_default()),
+                    &format!("Update it inside the VM: conduit attach {name}  (or install the host's conduit-guest package there)"));
+            }
+            None => r.line(
+                Level::Warn,
+                "Guest driver",
+                "could not ask the VM (no ssh / guest agent answer)",
+                "",
+            ),
+        }
+    } else if let Some(c) = &cfg {
+        let avail = crate::mem::available_mib().unwrap_or(0);
+        let need = c.ram_mib + crate::mem::overhead_mib(c.ram_mib) + 2048;
+        if avail >= need {
+            r.line(
+                Level::Ok,
+                "Memory",
+                &format!("{avail} MiB free, the VM needs about {need} MiB"),
+                "",
+            );
+        } else {
+            r.line(
+                Level::Warn,
+                "Memory",
+                &format!("only {avail} MiB free, the VM needs about {need} MiB"),
+                "Close programs or stop another VM first",
+            );
+        }
+    }
+    let blog = logs.join("backend.log");
+    if blog.is_file() {
+        let t = sys::tail(&blog, 200);
+        if let Some(l) = t
+            .lines()
+            .rev()
+            .find(|l| l.contains("ERROR") || l.contains("error:"))
+        {
+            r.line(
+                Level::Warn,
+                "Backend log",
+                l.trim(),
+                &format!("Full log: conduit logs {name} backend"),
+            );
+        }
+    }
+    println!();
+    if r.fails == 0 {
+        println!(
+            "{name}: the chain looks complete{}.",
+            if r.warns > 0 {
+                " (see the warnings)"
+            } else {
+                ""
+            }
+        );
+        0
+    } else {
+        println!("{name}: {} problem(s); fix the FAIL lines first.", r.fails);
+        1
     }
 }

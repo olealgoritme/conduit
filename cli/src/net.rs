@@ -19,7 +19,7 @@ fn tap_ready(c: &VmConfig) -> bool {
     out.contains(&format!("{}/", n.host_ip)) && (out.contains(" UP ") || out.contains("UNKNOWN"))
 }
 
-fn rules(c: &VmConfig) -> Vec<Vec<String>> {
+pub(crate) fn rules(c: &VmConfig) -> Vec<Vec<String>> {
     let n = c.net();
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     vec![
@@ -51,7 +51,7 @@ fn rules(c: &VmConfig) -> Vec<Vec<String>> {
 }
 
 /// Split ["-t","nat","CHAIN",rest..] into the table part and the rule.
-fn with_op(rule: &[String], op: &str) -> Vec<String> {
+pub(crate) fn with_op(rule: &[String], op: &str) -> Vec<String> {
     let mut v = Vec::new();
     let mut r = rule;
     if r.first().map(String::as_str) == Some("-t") {

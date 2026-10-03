@@ -9,7 +9,9 @@
 #   AppArmor: one marked `include` line in /etc/apparmor.d/local/abstractions/libvirt-qemu
 #             (pulls in /etc/apparmor.d/abstractions/conduit), and one marked rule
 #             in local/usr.lib.libvirt.virt-aa-helper so libvirt's profile
-#             generator may read /opt/conduit.
+#             generator may read /opt/conduit, and one marked rule in
+#             local/usr.sbin.libvirtd so libvirtd itself (Ubuntu confines it, the
+#             per-user session daemon too) may start the bundled QEMU.
 #   SELinux:  labels the bundled QEMU qemu_exec_t, so svirt can transition to it.
 #   Desktop:  refreshes the desktop entry cache.
 set -u
@@ -18,6 +20,7 @@ MARK="# added by conduit-integrate"
 AA=/etc/apparmor.d
 AA_QEMU=$AA/local/abstractions/libvirt-qemu
 AA_HELPER=$AA/local/usr.lib.libvirt.virt-aa-helper
+AA_LIBVIRTD=$AA/local/usr.sbin.libvirtd
 QEMU=/opt/conduit/bin/qemu-system-x86_64
 
 say() { echo "conduit: $*"; }
@@ -33,11 +36,16 @@ drop_line() {  # file
     sed -i "\|$MARK|d" "$1" && say "cleaned $1"
 }
 
-aa_reload_helper() {
-    [ -f "$AA/usr.lib.libvirt.virt-aa-helper" ] || return 0
+aa_reload() {  # profile file name under /etc/apparmor.d
+    [ -f "$AA/$1" ] || return 0
     command -v apparmor_parser >/dev/null 2>&1 || return 0
     [ -d /sys/kernel/security/apparmor ] || return 0
-    apparmor_parser -r "$AA/usr.lib.libvirt.virt-aa-helper" 2>/dev/null || true
+    apparmor_parser -r "$AA/$1" 2>/dev/null || true
+}
+
+aa_reload_helper() {
+    aa_reload usr.lib.libvirt.virt-aa-helper
+    aa_reload usr.sbin.libvirtd
 }
 
 selinux_on() {
@@ -51,6 +59,7 @@ do_enable() {
         # needed for the qemu abstraction; virt-aa-helper's profile is static.
         add_line "$AA_QEMU" "include if exists <abstractions/conduit>"
         add_line "$AA_HELPER" "/opt/conduit/** r,"
+        [ -f "$AA/usr.sbin.libvirtd" ] && add_line "$AA_LIBVIRTD" "\"$QEMU\" PUx,"
         aa_reload_helper
     fi
     if selinux_on && [ -e "$QEMU" ]; then
@@ -66,6 +75,7 @@ do_enable() {
 do_disable() {
     drop_line "$AA_QEMU"
     drop_line "$AA_HELPER"
+    drop_line "$AA_LIBVIRTD"
     aa_reload_helper
     if selinux_on; then
         semanage fcontext -d "$QEMU" 2>/dev/null || true
