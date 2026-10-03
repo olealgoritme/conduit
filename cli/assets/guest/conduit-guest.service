@@ -1,0 +1,18 @@
+[Unit]
+Description=Conduit guest driver + host NVIDIA user-space share
+DefaultDependencies=no
+After=local-fs.target systemd-udevd.service
+Wants=systemd-udevd.service
+Before=gdm.service display-manager.service systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The driver is built for the kernel Conduit boots; a packaged (DKMS) module wins if present.
+ExecStart=/bin/sh -c "modprobe virtio_gpu_nv 2>/dev/null || insmod /opt/conduit-guest/virtio_gpu_nv.ko"
+ExecStart=/bin/sh -c "mountpoint -q /mnt/nvidia || mount -t virtiofs -o ro nvidia /mnt/nvidia"
+ExecStart=/sbin/ldconfig
+ExecStart=-/bin/udevadm settle -t 10
+
+[Install]
+WantedBy=multi-user.target graphical.target

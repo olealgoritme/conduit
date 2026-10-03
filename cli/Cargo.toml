@@ -1,0 +1,19 @@
+[package]
+name = "conduit"
+description = "Share your NVIDIA GPU with a Linux VM and see its desktop in a window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "conduit"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+xmltree = { version = "0.11", features = ["attribute-order"] }

@@ -1,0 +1,8 @@
+# One toolchain for every Rust crate in the repo (host/backend, host/vmm, cli).
+# rustup reads this file from any subdirectory. Remove any rust-toolchain.toml
+# imported into a subdirectory, or it overrides this one.
+[toolchain]
+channel = "1.90.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+profile = "minimal"

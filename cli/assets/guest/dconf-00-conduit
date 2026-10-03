@@ -1,0 +1,9 @@
+# Conduit: no screen lock or blanking inside the VM (your host already locks).
+[org/gnome/desktop/screensaver]
+lock-enabled=false
+
+[org/gnome/desktop/session]
+idle-delay=uint32 0
+
+[org/gnome/desktop/lockdown]
+disable-lock-screen=true

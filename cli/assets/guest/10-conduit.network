@@ -1,0 +1,8 @@
+[Match]
+Name=e*
+
+[Network]
+Address=@GUEST_IP@/24
+Gateway=@HOST_IP@
+DNS=1.1.1.1
+DNS=9.9.9.9

@@ -1,0 +1,2 @@
+# Conduit: the GPU nodes and virtual input devices are usable by the desktop user.
+KERNEL=="renderD*|card*|uinput", MODE="0666"
