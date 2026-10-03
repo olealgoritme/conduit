@@ -140,10 +140,10 @@ conduit stream pair 1234          # or: conduit-stream pair 1234
 ```
 
 The PIN goes to the running stream host through its control socket
-(`$XDG_RUNTIME_DIR/conduit/stream.sock`, owner-only). Pairing is the standard
+(`$XDG_RUNTIME_DIR/conduit-stream/NAME.sock`, owner-only). Pairing is the standard
 GameStream exchange (AES-128 keyed by SHA-256(salt‖PIN), RSA-2048 signatures,
 client certificate pinned). Paired clients are kept in
-`~/.config/conduit/stream/clients.json`; the host's key and certificate next
+`~/.config/conduit/stream/state.json`; the host's key and certificate next
 to it. Only paired clients can reach anything but `/serverinfo` and `/pair`.
 `conduit stream clients` lists them, `conduit stream unpair NAME` removes one.
 
