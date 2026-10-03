@@ -4,7 +4,9 @@
 #                     CLI, viewer, guest module, bundled QEMU)
 #   make test         run all offline tests (no GPU, no VMs)
 #   make install      install to /opt/conduit (+ /usr/local/bin/conduit)
-#   make package      build .deb/.rpm/Arch/tarball packages into dist/out
+#   make package      build every package (.deb/.rpm/Arch/tarball/guest) into dist/out
+#   make deb          just the .deb (also: rpm, archlinux, tarball, guest-deb, guest-rpm)
+#   make install-deb  build the .deb and install it on this machine
 #   make deps         install build dependencies (asks for sudo)
 #   make clean        remove build outputs
 #   make release      tag the next patch version and let GitHub build packages
@@ -19,7 +21,7 @@ JOBS   ?= $(shell nproc)
 # Tests that open the real /dev/nvidiactl; kept out of `make test`.
 GPU_TESTS := --skip for_real --skip closing_the_fd --skip repeated_map_unmap
 
-.PHONY: all backend vmm cli viewer guest qemu stream test install package deps clean help release release-minor release-major
+.PHONY: all backend vmm cli viewer guest qemu stream test install package deps clean help dist-stage deb rpm archlinux tarball guest-deb guest-rpm install-deb release release-minor release-major
 
 all: backend vmm cli viewer guest qemu stream
 	@echo
@@ -64,13 +66,31 @@ install:
 	tar -xzf $$(ls -t dist/out/conduit-*-x86_64-linux.tar.gz | head -1) -C dist/install
 	sudo dist/install/conduit/install.sh
 
-package:
-	packaging/build.sh package deb
-	packaging/build.sh package rpm
-	packaging/build.sh package archlinux
-	packaging/build.sh package tarball
-	packaging/build.sh package guest-deb
-	packaging/build.sh package guest-rpm
+# Full package pipeline (same steps as the GitHub release), one format each.
+dist-stage:
+	packaging/build.sh rust
+	packaging/build.sh viewer
+	packaging/build.sh stream
+	packaging/build.sh qemu
+	packaging/build.sh stage
+
+deb rpm archlinux tarball: dist-stage
+	packaging/build.sh package $@
+	@ls -t dist/out/ | head -3
+
+guest-deb guest-rpm:
+	packaging/build.sh package $@
+	@ls -t dist/out/ | head -3
+
+# Every package format at once, into dist/out/.
+package: dist-stage
+	for f in deb rpm archlinux tarball guest-deb guest-rpm; do packaging/build.sh package $$f || exit 1; done
+	@ls -t dist/out/
+
+# Build the .deb and install it on this machine (Ubuntu/Debian).
+install-deb: deb
+	sudo apt install -y ./$$(ls -t dist/out/conduit_*_amd64.deb | head -1)
+	conduit --version
 
 deps:
 	sudo packaging/build.sh deps
@@ -85,7 +105,7 @@ clean:
 	rm -rf dist
 
 help:
-	@sed -n '1,14p' Makefile
+	@sed -n '/^#/p;/^374064/q' Makefile
 
 release:
 	packaging/release.sh patch

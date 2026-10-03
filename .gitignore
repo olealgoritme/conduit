@@ -22,3 +22,4 @@ guest/linux/modules.order
 guest/linux/Module.symvers
 __pycache__/
 host/qemu/*.log
+host/viewer/test-overlay
