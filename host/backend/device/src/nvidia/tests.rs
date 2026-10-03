@@ -408,6 +408,26 @@ mod tests {
         );
     }
 
+    /// A release with tables of its own has none inexact; a point release
+    /// past it runs on the older tables, and says which.
+    #[test]
+    fn inexact_tables_are_named() {
+        use abi::version::DriverVersion as V;
+        let mut be = NvidiaBackend::for_test();
+        assert!(be.inexact_tables().is_empty(), "no release yet");
+        let own = abi::rmallow::supported_versions().last().unwrap();
+        be.set_host_driver_version(own).unwrap();
+        assert_eq!(be.inexact_tables(), Vec::<&str>::new(), "{own}");
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(V::new(own.major, own.minor, own.patch + 1))
+            .unwrap();
+        let t = be.inexact_tables();
+        assert!(
+            t.contains(&"RM allowlist") && t.contains(&"UVM command table"),
+            "{t:?}"
+        );
+    }
+
     /// A device reset (guest reboot under QEMU) leaves the backend as a fresh
     /// one: no host file open, every window extent free, no VRAM charged, no
     /// counters -- while the release, its tables and the caps survive, and
@@ -1089,6 +1109,42 @@ mod tests {
     const A_STATUS: usize = 40;
     const ALLOC_OUTER: usize = 48;
 
+    /// Places device memory over the backend's own SHM mapping, as an
+    /// in-process VMM would. Withdrawing needs nothing: freeing the extent
+    /// puts the memfd back under it.
+    struct LocalWindow(usize);
+
+    impl crate::shm::WindowPlacer for LocalWindow {
+        fn place(
+            &self,
+            shm_offset: u64,
+            len: u64,
+            fd: RawFd,
+            fd_offset: u64,
+            writable: bool,
+        ) -> crate::error::Result<()> {
+            let prot = libc::PROT_READ | if writable { libc::PROT_WRITE } else { 0 };
+            let ptr = unsafe {
+                libc::mmap(
+                    (self.0 + shm_offset as usize) as *mut libc::c_void,
+                    len as usize,
+                    prot,
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    fd,
+                    fd_offset as libc::off_t,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(())
+        }
+
+        fn withdraw(&self, _shm_offset: u64, _len: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
     struct Chain {
         be: NvidiaBackend,
         ctl: u64,
@@ -1101,6 +1157,20 @@ mod tests {
             // Not for_test(): its write-combine zone is 16 KiB, and the
             // smallest real mapping here is 64 KiB.
             let mut be = NvidiaBackend::with_default_zones();
+            // The host's own release, as the vhost-user binary selects it:
+            // without one the RM allowlist has no tables and refuses
+            // NV01_ROOT_CLIENT, the first allocation below.
+            let version =
+                crate::host::driver_version(std::path::Path::new(crate::host::PROC_NVIDIA))
+                    .expect("an NVIDIA driver is loaded");
+            be.set_host_driver_version(
+                abi::version::DriverVersion::parse(&version).expect("the version parses"),
+            )
+            .expect("the host release has tables");
+            // And a window: without one RM_MAP_MEMORY is refused (ENOTSUP),
+            // since nothing could reach the mapping.
+            let base = be.shm_base_ptr() as usize;
+            be.set_window(Box::new(LocalWindow(base)));
             let req = open_msg(DeviceKind::Ctl);
             let mut resp = vec![0u8; 64];
             be.dispatch(&req, &mut resp);

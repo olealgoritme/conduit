@@ -568,6 +568,37 @@ impl NvidiaBackend {
         Ok(())
     }
 
+    /// The tables chosen for the host release that are not that release's
+    /// own but the nearest older one's, by name. Empty when every table is
+    /// exact (or no release is set yet).
+    ///
+    /// A nearest table is not a working fallback: the RM allowlist then
+    /// requires every release to agree about a class or control, and refuses
+    /// one whose parameter size changed -- which a channel allocation's always
+    /// has, so a guest fails at its first channel rather than at start.
+    pub fn inexact_tables(&self) -> Vec<&'static str> {
+        if self.driver.is_none() {
+            return Vec::new();
+        }
+        // The escape profile is not counted: it comes from gVisor's nvproxy,
+        // which lags NVIDIA's releases, and the escapes it describes have
+        // kept their sizes across them (CHECK_VERSION_STR still guards it).
+        let mut out = Vec::new();
+        if self.rmctrl.is_some_and(|s| !s.exact) {
+            out.push("RM pointer table");
+        }
+        if self.rmallow.is_some_and(|s| !s.exact) {
+            out.push("RM allowlist");
+        }
+        if self.uvm.is_some_and(|s| !s.exact) {
+            out.push("UVM command table");
+        }
+        if self.vidmem.is_some_and(|s| !s.exact) {
+            out.push("video-memory table");
+        }
+        out
+    }
+
     /// Descriptors opened and closed since this was last called.
     ///
     /// A transport calls it after serving messages and keeps its poll set in

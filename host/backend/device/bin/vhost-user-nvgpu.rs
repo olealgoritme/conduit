@@ -106,6 +106,13 @@ struct Args {
     #[arg(long, value_name = "on|off", default_value = "on",
           value_parser = ["on", "off"])]
     display_cursor: String,
+
+    /// Start even when the host driver release has no ABI tables of its own,
+    /// using the nearest older release's. Expect guests to fail at their first
+    /// channel allocation: the allowlist refuses every class whose size
+    /// changed between releases.
+    #[arg(long)]
+    allow_nearest_abi: bool,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -613,6 +620,7 @@ impl NvGpuBackend {
     /// than in a guest as a bare -EINVAL from probe.
     fn new(
         proc_nvidia: &Path,
+        allow_nearest_abi: bool,
         caps: Caps,
         vram_limit_mib: Option<u64>,
         display: Option<(DisplayMode, Arc<DisplayLink>, bool)>,
@@ -637,6 +645,20 @@ impl NvGpuBackend {
         nvidia
             .set_host_driver_version(release)
             .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
+        let inexact = nvidia.inexact_tables();
+        if !inexact.is_empty() {
+            let what = format!(
+                "host driver {version} has no ABI tables of its own ({}); only an older release's",
+                inexact.join(", ")
+            );
+            anyhow::ensure!(
+                allow_nearest_abi,
+                "refusing to start: {what}. A guest would fail at its first channel allocation. \
+                 Install a supported driver release, update Conduit, or pass --allow-nearest-abi \
+                 to try anyway"
+            );
+            log::warn!("{what}: starting anyway (--allow-nearest-abi)");
+        }
         nvidia.set_caps(caps);
         nvidia
             .set_vram_limit_mib(vram_limit_mib)
@@ -1014,6 +1036,7 @@ fn main() -> anyhow::Result<()> {
 
     let backend = Arc::new(RwLock::new(NvGpuBackend::new(
         &args.proc_nvidia,
+        args.allow_nearest_abi,
         args.caps,
         args.vram_limit_mib,
         display,
