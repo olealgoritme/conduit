@@ -308,7 +308,7 @@ void nb_fs_title(char *buf, size_t n, const char *base, unsigned mode_w,
 /* ── overlay pixels ─────────────────────────────────────────────────────── */
 
 #define OV_COLS   28            /* characters per line                      */
-#define OV_LINES  11
+#define OV_LINES  12
 #define OV_GRAPH  24            /* graph height, in font pixels             */
 
 /* Premultiplied ARGB8888. */
@@ -346,6 +346,7 @@ void nb_ov_paint(uint32_t *px, unsigned w, unsigned h, unsigned sc,
     unsigned i, x, y;
 
     nb_placeholder_fill(px, w, h, w, OV_BG);
+    ov_line(px, w, h, sc, 0, "CONDUIT", OV_CYAN);
 
     if (in->mode_w) {
         snprintf(l, sizeof(l), "%uX%u@%u SCALE %.2f", in->mode_w, in->mode_h,
@@ -353,42 +354,42 @@ void nb_ov_paint(uint32_t *px, unsigned w, unsigned h, unsigned sc,
     } else {
         snprintf(l, sizeof(l), "NO GUEST FRAME YET");
     }
-    ov_line(px, w, h, sc, 0, l, OV_FG);
+    ov_line(px, w, h, sc, 1, l, OV_FG);
     snprintf(l, sizeof(l), "%s %s %s",
              s->direct > 0 ? "DIRECT" : s->direct == 0 ? "COMPOSITED" : "-",
              in->tearing ? "ASYNC" : "VSYNC",
              in->guest_resize ? "FOLLOW" : "FIT");
-    ov_line(px, w, h, sc, 1, l, s->direct > 0 ? OV_GREEN : OV_YELLOW);
+    ov_line(px, w, h, sc, 2, l, s->direct > 0 ? OV_GREEN : OV_YELLOW);
     snprintf(l, sizeof(l), "FPS %.0f SHOWN %.0f", s->fps, s->shown_fps);
-    ov_line(px, w, h, sc, 2, l, OV_FG);
+    ov_line(px, w, h, sc, 3, l, OV_FG);
     fmt_ms(a, sizeof(a), s->ft_now);
     fmt_ms(b, sizeof(b), s->ft_avg);
     snprintf(l, sizeof(l), "FRAME %s AVG %s MS", a, b);
-    ov_line(px, w, h, sc, 3, l, OV_FG);
+    ov_line(px, w, h, sc, 4, l, OV_FG);
     fmt_ms(a, sizeof(a), s->ft_p99);
     fmt_ms(b, sizeof(b), s->ft_max);
     snprintf(l, sizeof(l), "  P99 %s MAX %s MS", a, b);
-    ov_line(px, w, h, sc, 4, l, OV_FG);
+    ov_line(px, w, h, sc, 5, l, OV_FG);
     fmt_ms(a, sizeof(a), in->flip_known ? s->sr_ms : -1);
     fmt_ms(b, sizeof(b), s->rc_ms);
     fmt_ms(c, sizeof(c), s->cp_ms);
     fmt_ms(d, sizeof(d), s->tot_ms);
     snprintf(l, sizeof(l), "FLIP>RECV     %s MS", a);
-    ov_line(px, w, h, sc, 5, l, in->flip_known ? OV_FG : OV_DIM);
+    ov_line(px, w, h, sc, 6, l, in->flip_known ? OV_FG : OV_DIM);
     snprintf(l, sizeof(l), "RECV>COMMIT   %s MS", b);
-    ov_line(px, w, h, sc, 6, l, OV_FG);
-    snprintf(l, sizeof(l), "COMMIT>SCREEN %s MS", c);
     ov_line(px, w, h, sc, 7, l, OV_FG);
+    snprintf(l, sizeof(l), "COMMIT>SCREEN %s MS", c);
+    ov_line(px, w, h, sc, 8, l, OV_FG);
     snprintf(l, sizeof(l), "%s %s MS", in->flip_known ? "FLIP>SCREEN  "
                                                       : "RECV>SCREEN  ", d);
-    ov_line(px, w, h, sc, 8, l, OV_CYAN);
+    ov_line(px, w, h, sc, 9, l, OV_CYAN);
     snprintf(l, sizeof(l), "DROP %.0f SUPERSEDED %.0f /S", s->rejected_ps,
              s->superseded_ps);
-    ov_line(px, w, h, sc, 9, l,
+    ov_line(px, w, h, sc, 10, l,
             s->rejected_ps > 0 || s->superseded_ps > 0 ? OV_YELLOW : OV_FG);
     snprintf(l, sizeof(l), "INPUT %.0f/S CURSOR %s", s->input_ps,
              in->host_cursor ? "HOST" : "GUEST");
-    ov_line(px, w, h, sc, 10, l, OV_FG);
+    ov_line(px, w, h, sc, 11, l, OV_FG);
 
     /* The graph: the worst flip interval per bin over the last 2 s, scaled
      * so the refresh interval sits at 40% height. */
