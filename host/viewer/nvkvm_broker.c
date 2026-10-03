@@ -96,7 +96,7 @@ void nb_log(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    nb_vlog(stderr, "nvkvm-broker: ", fmt, ap);
+    nb_vlog(stderr, "conduit-viewer: ", fmt, ap);
     va_end(ap);
 }
 
@@ -104,7 +104,7 @@ void nb_err(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    nb_vlog(stderr, "nvkvm-broker: ERROR: ", fmt, ap);
+    nb_vlog(stderr, "conduit-viewer: ERROR: ", fmt, ap);
     va_end(ap);
 }
 
@@ -2970,7 +2970,7 @@ harden:
 static void usage(void)
 {
     fputs(
-"usage: nvkvm-display-broker --socket PATH [options]\n"
+"usage: conduit-viewer --socket PATH [options]\n"
 "\n"
 "  --socket PATH        unix socket to listen on (mode from --socket-mode)\n"
 "  --socket-mode OCTAL  socket permissions (default 0600).  0660 with\n"
@@ -3278,7 +3278,7 @@ int main(int argc, char **argv)
     cfg.clip_trigger[1] = (struct nb_clip_trigger){ KEY_V, true, true };
     cfg.clip_trigger[2] = (struct nb_clip_trigger){ KEY_INSERT, false, true };
     cfg.n_clip_trigger = 3;
-    cfg.title = "nvkvm";
+    cfg.title = "Conduit";
     cfg.overlay_mode = NB_OVERLAY_ALWAYS;
     cfg.hint_align = 1;
     cfg.win_w = 1920;

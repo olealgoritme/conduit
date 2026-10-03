@@ -1771,7 +1771,7 @@ static void tb_update(struct nb_wl *w, int width)
     if (width != w->tb_w) {
         stride = (size_t)width * 4;
         sz = stride * NB_TB_H;
-        fd = memfd_create("nvkvm-broker-titlebar", MFD_CLOEXEC);
+        fd = memfd_create("conduit-viewer-titlebar", MFD_CLOEXEC);
         if (fd < 0) {
             return;
         }
@@ -2507,7 +2507,7 @@ __attribute__((unused)) static void bg_build(struct nb_wl *w)
     if (w->bg_surf || !w->shm || !w->subcomp || !w->comp || !w->viewporter) {
         return;
     }
-    fd = memfd_create("nvkvm-broker-bg", MFD_CLOEXEC);
+    fd = memfd_create("conduit-viewer-bg", MFD_CLOEXEC);
     if (fd < 0) {
         return;
     }
@@ -2770,7 +2770,7 @@ static void dlg_show(struct nb_wl *w)
     if (!w->dlg_buf) {
         stride = (size_t)NB_DLG_W * 4;
         sz = stride * NB_DLG_H;
-        fd = memfd_create("nvkvm-broker-close", MFD_CLOEXEC);
+        fd = memfd_create("conduit-viewer-close", MFD_CLOEXEC);
         if (fd < 0) {
             w->quit = true;
             return;
@@ -2877,7 +2877,7 @@ static int wl_idle_make(struct nb_wl *w, int wd, int ht)
     if (!w->shm || wd <= 0 || ht <= 0) {
         return -ENOTSUP;
     }
-    fd = memfd_create("nvkvm-broker-idle", MFD_CLOEXEC);
+    fd = memfd_create("conduit-viewer-idle", MFD_CLOEXEC);
     if (fd < 0) {
         return -errno;
     }
@@ -3843,7 +3843,7 @@ static void cur_make(struct nb_wl *w, int slot, const char *const *art,
     if (!w->shm || !w->comp || slot < 0 || slot >= NB_CUR_N) {
         return;
     }
-    fd = memfd_create("nvkvm-broker-cursor", MFD_CLOEXEC);
+    fd = memfd_create("conduit-viewer-cursor", MFD_CLOEXEC);
     if (fd < 0) {
         return;
     }
@@ -4017,7 +4017,7 @@ static void bd_build(struct nb_wl *w)
     if (w->bd_buf || !w->shm || !w->subcomp || !w->viewporter) {
         return;
     }
-    fd = memfd_create("nvkvm-broker-border", MFD_CLOEXEC);
+    fd = memfd_create("conduit-viewer-border", MFD_CLOEXEC);
     if (fd < 0 || ftruncate(fd, 4) < 0) {
         if (fd >= 0) {
             close(fd);
@@ -5631,7 +5631,7 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     w->toplevel = xdg_surface_get_toplevel(w->xdg_surf);
     xdg_toplevel_add_listener(w->toplevel, &top_listener, w);
     xdg_toplevel_set_title(w->toplevel, cfg->title);
-    xdg_toplevel_set_app_id(w->toplevel, "nvkvm-display-broker");
+    xdg_toplevel_set_app_id(w->toplevel, "conduit-viewer");
     /* Tell the compositor the floor rather than only clamping after the
      * fact: a min size it knows about stops the small configure being sent,
      * and makes the resize edges stop at something usable. The geometry we
@@ -5659,7 +5659,7 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
      * worse than a truncated one.
      */
     {
-        const char *t = cfg->title && *cfg->title ? cfg->title : "nvkvm";
+        const char *t = cfg->title && *cfg->title ? cfg->title : "Conduit";
 
         if (strlen(t) > NB_TITLE_MAX) {
             snprintf(w->title, sizeof(w->title), "%.*s...",

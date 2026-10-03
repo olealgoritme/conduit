@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const VIEWER_CLASS: &str = "nvkvm-display-broker";
+pub const VIEWER_CLASS: &str = "conduit-viewer";
 
 /// Run hyprctl against one instance.
 pub fn hyprctl(sig: &str, args: &[&str]) -> Result<String> {

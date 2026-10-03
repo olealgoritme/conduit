@@ -1969,8 +1969,8 @@ skip_dmabuf_extensions:
                         cfg->title);
     xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win,
                         XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8,
-                        sizeof("nvkvm\0nvkvm-display-broker") - 1,
-                        "nvkvm\0nvkvm-display-broker");
+                        sizeof("conduit\0conduit-viewer") - 1,
+                        "conduit\0conduit-viewer");
 
     /*
      * The content child.  Depth 24 always: both XRGB8888 and ARGB8888 are
@@ -2013,7 +2013,7 @@ skip_dmabuf_extensions:
     x->a_clipboard = x11_atom(x->c, "CLIPBOARD");
     x->a_utf8      = x11_atom(x->c, "UTF8_STRING");
     x->a_targets   = x11_atom(x->c, "TARGETS");
-    x->a_prop      = x11_atom(x->c, "NVKVM_CLIP");
+    x->a_prop      = x11_atom(x->c, "CONDUIT_CLIP");
     x->a_incr      = x11_atom(x->c, "INCR");
     x->a_net_wm_name = x11_atom(x->c, "_NET_WM_NAME");
     if (x->a_wm_proto != XCB_ATOM_NONE && x->a_wm_delete != XCB_ATOM_NONE) {
