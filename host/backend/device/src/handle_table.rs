@@ -96,6 +96,23 @@ impl HandleTable {
         self.next = 1;
     }
 
+    /// Every open handle.
+    pub fn handles(&self) -> Vec<u64> {
+        self.table.keys().copied().collect()
+    }
+
+    /// The handle the next insert returns.
+    pub fn next_handle(&self) -> u64 {
+        self.next
+    }
+
+    /// Issue no handle below `next`: across a device reset, so a handle the
+    /// previous boot used (and the transport may still have a watch for)
+    /// is never handed out again.
+    pub fn skip_to(&mut self, next: u64) {
+        self.next = self.next.max(next);
+    }
+
     /// Number of open handles.
     pub fn len(&self) -> usize {
         self.table.len()

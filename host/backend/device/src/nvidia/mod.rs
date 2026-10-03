@@ -383,6 +383,10 @@ pub enum AbiCheck {
 impl NvidiaBackend {
     /// Create a backend with a custom SHM zone config.
     pub fn new(cfg: ZoneConfig) -> Self {
+        Self::with_shm(ShmAllocator::new(cfg))
+    }
+
+    fn with_shm(shm: ShmAllocator) -> Self {
         Self {
             window: None,
             dri_maps: std::collections::HashMap::new(),
@@ -417,7 +421,7 @@ impl NvidiaBackend {
             current_handle: 0,
             current_data_len: 0,
             handles: HandleTable::new(),
-            shm: ShmAllocator::new(cfg),
+            shm,
             active_maps: crate::mmap::MmapContext::new(),
             handle_kinds: std::collections::HashMap::new(),
             driver: None,
@@ -795,6 +799,77 @@ impl NvidiaBackend {
             }
         }
         self.handles.drain_all();
+    }
+
+    /// Device reset (a guest reboot, or its driver reloading): release
+    /// everything the previous boot held on the host -- every open file and
+    /// with it every RM client and object, VRAM charge, window and aperture
+    /// placement, registration of guest memory and scanout export -- and start
+    /// again as a freshly built backend would.
+    ///
+    /// What the transport and the command line set up is kept: the driver
+    /// release and its tables, caps, the VRAM limit (its usage starts at
+    /// zero), the window, guest RAM, the display link and the SHM allocator.
+    pub fn reset(&mut self) {
+        log::info!(
+            "device reset: releasing {} open file(s), {} window placement(s) and {} aperture pool(s) of the previous boot",
+            self.handles.len(),
+            self.live_maps.len() + self.active_maps.len(),
+            self.aperture.len()
+        );
+        // The frontend dropped every placement in the window and the aperture
+        // when it reset the device (QEMU's virtio_reset does, as the spec
+        // asks), so nothing is withdrawn: only this side's books are cleared.
+        let window = self.window.take();
+        // Placements made for DRM objects: these outlive the file that made them.
+        let live: Vec<u32> = self.live_maps.keys().copied().collect();
+        for id in live {
+            let Some(m) = self.live_maps.remove(&id) else {
+                continue;
+            };
+            self.active_maps.remove(m.region.offset);
+            if let Err(e) = self.shm.free(&m.region) {
+                log::warn!("device reset: freeing the window region of {id}: {e}");
+            }
+        }
+        self.dri_maps.clear();
+        // Every file, through the guest's own close path: it withdraws the
+        // file's placements, drops its pools, registrations and exports, and
+        // closing the host fd makes RM free every object made on it.
+        let mut scratch = [0u8; size_of::<MsgHeader>() + 64];
+        for handle in self.handles.handles() {
+            self.current_handle = handle as u32;
+            self.handle_close(0, &[], &mut scratch);
+        }
+        let next_handle = self.handles.next_handle();
+        self.teardown();
+
+        // Everything else back to how `new` left it.
+        let tiny = ShmAllocator::new(ZoneConfig {
+            uc_size: 4096,
+            wc_size: 0,
+            wb_size: 0,
+        });
+        let mut old = std::mem::replace(self, Self::with_shm(tiny));
+        std::mem::swap(&mut self.shm, &mut old.shm);
+        std::mem::swap(&mut self.host, &mut old.host);
+        self.window = window;
+        self.guest_ram = old.guest_ram.take();
+        self.display = old.display.take();
+        self.caps = old.caps;
+        self.driver = old.driver;
+        self.abi = old.abi;
+        self.rmctrl = old.rmctrl.take();
+        self.rmallow = old.rmallow.take();
+        self.uvm = old.uvm.take();
+        self.osdesc = old.osdesc.take();
+        self.vidmem = old.vidmem.take();
+        self.vram = crate::vram::Vram::new(old.vram.limit().map(|b| b >> 20));
+        // The transport still has to drop the watches of the files closed above.
+        self.watch_removed = std::mem::take(&mut old.watch_removed);
+        self.handles.skip_to(next_handle);
+        self.next_mapping_id = old.next_mapping_id;
+        log::info!("device reset: done; the backend is as freshly started");
     }
 
     // ------------------------------------------------------------------

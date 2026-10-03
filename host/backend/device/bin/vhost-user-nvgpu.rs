@@ -147,7 +147,8 @@ struct VhostWindow(Backend);
 
 /// Set once the frontend asks for `GET_SHMEM_CONFIG`: a spec frontend (QEMU
 /// >= 11.1) that lays the regions out and picks mapping addresses itself.
-/// > nesbox never asks. One process serves one VM, so this never resets.
+/// nesbox never asks. One process serves one VM, and a device reset keeps
+/// the same frontend, so this is never cleared.
 static SPEC_SHMEM_FRONTEND: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -599,6 +600,9 @@ struct NvGpuBackend {
     /// whole RM call, and only the bytes dispatch writes are sent back.
     req: Vec<u8>,
     resp: Vec<u8>,
+    /// A request was served since the device was last (re)started. A restart
+    /// that finds this set is a guest that rebooted or reloaded its driver.
+    served: bool,
 }
 
 impl NvGpuBackend {
@@ -659,6 +663,7 @@ impl NvGpuBackend {
             input_target,
             req: Vec::new(),
             resp: vec![0u8; RESP_MAX],
+            served: false,
         })
     }
 
@@ -708,6 +713,13 @@ impl NvGpuBackend {
         for handle in removed {
             let _ = tx.send(Watch::Remove(handle));
         }
+    }
+
+    /// Release everything the guest's previous boot held on the host.
+    fn reset(&mut self, why: &str) {
+        log::info!("{why}: resetting the device");
+        self.nvidia.lock().expect("backend mutex").reset();
+        self.served = false;
     }
 
     /// Drain one virtqueue, dispatching every chain.
@@ -768,6 +780,7 @@ impl NvGpuBackend {
                 .add_used(head, written as u32)
                 .map_err(|e| std::io::Error::other(format!("add_used: {e}")))?;
             used = true;
+            self.served = true;
         }
         Ok(used)
     }
@@ -802,6 +815,26 @@ impl VhostUserBackendMut for NvGpuBackend {
             // the VMM's address space, not ours.
             | VhostUserProtocolFeatures::BACKEND_REQ
             | VhostUserProtocolFeatures::SHMEM
+            // A frontend that resets the device on a guest reset says so,
+            // and every host object of the previous boot is released.
+            | VhostUserProtocolFeatures::RESET_DEVICE
+    }
+
+    fn reset_device(&mut self) {
+        self.reset("RESET_DEVICE");
+    }
+
+    /// Features are set each time the frontend starts the device. QEMU's
+    /// generic vhost-user device (`vhost-user-test-device-pci`) never sends
+    /// RESET_DEVICE: on a guest reset it stops the rings and, when the guest
+    /// boots again, starts the device anew -- which is where this is called.
+    /// Having served requests before then means they came from the previous
+    /// boot, whose files, RM objects and VRAM would otherwise stay held until
+    /// this process exits.
+    fn acked_features(&mut self, _features: u64) {
+        if self.served {
+            self.reset("device restarted (guest reboot or driver reload)");
+        }
     }
 
     fn set_backend_req_fd(&mut self, backend: Backend) {

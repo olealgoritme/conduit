@@ -118,6 +118,10 @@ impl Aperture {
             .collect()
     }
 
+    pub fn len(&self) -> usize {
+        self.pools.len()
+    }
+
     pub fn take_all(&mut self) -> Vec<(u32, Pool)> {
         std::mem::take(&mut self.pools).into_iter().collect()
     }

@@ -408,6 +408,74 @@ mod tests {
         );
     }
 
+    /// A device reset (guest reboot under QEMU) leaves the backend as a fresh
+    /// one: no host file open, every window extent free, no VRAM charged, no
+    /// counters -- while the release, its tables and the caps survive, and
+    /// the next boot is served as the first was.
+    #[test]
+    fn a_device_reset_leaves_the_backend_as_fresh() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let caps = crate::caps::Caps::parse("graphics,video").unwrap();
+        be.set_caps(caps);
+        let fresh_shm = NvidiaBackend::for_test().shm_free_bytes();
+
+        // The previous boot: two open files, an allocation, a live mapping.
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h2 = be.handles.insert(OwnedFd::from(null));
+        let mut nvos64 = vec![0u8; 48];
+        nvos64[12..16].copy_from_slice(&0xc7b7u32.to_le_bytes());
+        let mut resp = vec![0u8; 256];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_ALLOC, &nvos64),
+            &mut resp,
+        );
+        assert_eq!(parse_resp(&resp).status, 0);
+        let region = be
+            .shm
+            .alloc(4096, crate::shm::PgprotKind::WriteBack)
+            .expect("a window extent");
+        be.active_maps.insert(
+            region.offset,
+            crate::mmap::MmapEntry {
+                host_p_linear_address: 0,
+                shm_length: 4096,
+                h_client: 1,
+                h_memory: 2,
+                map_fd_handle: h2,
+                region,
+            },
+        );
+        assert_ne!(be.shm_free_bytes(), fresh_shm);
+        let _ = be.take_watch_updates();
+
+        be.reset();
+
+        assert_eq!(be.handle_count(), 0, "every host file closed");
+        assert_eq!(be.registration_count(), 0);
+        assert_eq!(be.active_maps.len(), 0);
+        assert_eq!(be.shm_free_bytes(), fresh_shm, "every window extent free");
+        assert_eq!(be.vram.in_use(), 0);
+        assert!(be.msg_counts.is_empty() && be.rm_classes.is_empty());
+        assert_eq!(be.caps(), caps);
+        assert!(be.driver.is_some() && be.rmallow.is_some() && be.uvm.is_some());
+        // The transport is told to drop its watches of the old files, and a
+        // new file never reuses an old handle.
+        let (_, removed) = be.take_watch_updates();
+        assert!(removed.contains(&(h as u32)) && removed.contains(&(h2 as u32)));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h3 = be.handles.insert(OwnedFd::from(null));
+        assert!(h3 > h2);
+        // And the next boot is served.
+        let before = host.calls().len();
+        be.dispatch(
+            &ioctl_msg(h3, abi::ioctl::NV_ESC_RM_ALLOC, &nvos64),
+            &mut resp,
+        );
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(host.calls().len(), before + 1);
+    }
+
     // ------------------------------------------------------------------
     // M4: RM's own privilege rule, applied on the guest's behalf.
     //
