@@ -154,23 +154,20 @@ impl Tool {
         let pf = prefix();
         let (installed, dev): (&[&str], &[&str]) = match self {
             Tool::Backend => (
-                &["bin/conduit-backend", "bin/vhost-user-nvgpu"],
+                &["bin/conduit-backend"],
                 &[
-                    "target/release/vhost-user-nvgpu",
-                    "host/backend/target/release/vhost-user-nvgpu",
+                    "target/release/conduit-backend",
+                    "host/backend/target/release/conduit-backend",
                 ],
             ),
             Tool::Vmm => (
-                &["bin/conduit-vmm", "bin/nesbox"],
-                &["target/release/nesbox", "host/vmm/target/release/nesbox"],
-            ),
-            Tool::Viewer => (
-                &["bin/conduit-viewer", "libexec/conduit/nvkvm-display-broker"],
+                &["bin/conduit-vmm"],
                 &[
-                    "host/viewer/nvkvm-display-broker",
-                    "host/viewer/build/nvkvm-display-broker",
+                    "target/release/conduit-vmm",
+                    "host/vmm/target/release/conduit-vmm",
                 ],
             ),
+            Tool::Viewer => (&["bin/conduit-viewer"], &["host/viewer/conduit-viewer"]),
             Tool::Userspace => (
                 &["bin/conduit-userspace", "bin/nvgpu-userspace"],
                 &[
@@ -234,12 +231,12 @@ mod tests {
 
     #[test]
     fn comm_is_truncated() {
-        assert_eq!(comm_of(Path::new("/x/vhost-user-nvgpu")), "vhost-user-nvgp");
         assert_eq!(
-            comm_of(Path::new("/x/nvkvm-display-broker")),
-            "nvkvm-display-b"
+            comm_of(Path::new("/x/qemu-system-x86_64")),
+            "qemu-system-x86"
         );
-        assert_eq!(comm_of(Path::new("nesbox")), "nesbox");
+        assert_eq!(comm_of(Path::new("/x/conduit-backend")), "conduit-backend");
+        assert_eq!(comm_of(Path::new("conduit-vmm")), "conduit-vmm");
     }
 
     #[test]

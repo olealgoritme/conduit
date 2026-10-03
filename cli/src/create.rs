@@ -446,7 +446,22 @@ pub fn import(o: ImportOpts) -> Result<()> {
         ));
     }
     let net_index = match o.net_index {
-        Some(i) => i,
+        Some(i) => {
+            if let Some(other) = vm::all()
+                .iter()
+                .filter_map(|n| VmConfig::load(n).ok())
+                .find(|v| v.net_index == i)
+            {
+                return Err(oops(
+                    format!("VM network #{i} is already used by \"{}\"", other.name),
+                    format!(
+                        "Pick another --net, e.g. {} (each VM needs its own)",
+                        vm::free_net_index()?
+                    ),
+                ));
+            }
+            i
+        }
         None => vm::free_net_index()?,
     };
     let mut c = VmConfig::new(&o.name, o.ram_mib, o.cpus, net_index, &o.user, "imported");

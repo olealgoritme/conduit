@@ -44,7 +44,7 @@ env_logger = ["dep:env_logger"]
 vmm-sys-util = ["dep:vmm-sys-util"]
 
 [[bin]]
-name = "vhost-user-nvgpu"
+name = "conduit-backend"
 path = "bin/vhost-user-nvgpu.rs"
 required-features = ["vhost-user"]
 

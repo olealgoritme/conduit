@@ -99,6 +99,13 @@ impl NvidiaBackend {
                 entry.region.offset,
                 entry.region.length
             );
+            // Give the range back to the frontend too: QEMU refuses a later
+            // mapping that overlaps one it still holds.
+            if let Some(window) = self.window.as_ref()
+                && let Err(e) = window.withdraw(entry.region.offset, entry.region.length)
+            {
+                log::warn!("close handle={handle}: the window would not give it back: {e}");
+            }
             if let Err(e) = self.shm.free(&entry.region) {
                 log::warn!("close handle={handle}: SHM free failed: {e}");
             }

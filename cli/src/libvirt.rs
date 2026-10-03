@@ -3,7 +3,8 @@
 //! The domain XML gets:
 //!   - <emulator>: system QEMU if it is 11.1 or newer, else the bundled one
 //!   - <memoryBacking> memfd + shared access (vhost-user maps guest RAM)
-//!   - <qemu:commandline> -chardev socket + -device vhost-user-device-pci,virtio-id=45
+//!   - <qemu:commandline> -chardev socket + -device vhost-user-test-device-pci,virtio-id=45
+//!     (the generic vhost-user device of QEMU 11.1; see docs/QEMU.md)
 //!
 //! A libvirt hook starts/stops a backend for that VM.
 //!
@@ -32,7 +33,7 @@ pub fn qemu_args(sock: &Path) -> Vec<String> {
         "-chardev".into(),
         format!("socket,id={CHARDEV_ID},path={}", sock.display()),
         "-device".into(),
-        format!("vhost-user-device-pci,chardev={CHARDEV_ID},virtio-id=45"),
+        crate::qemu::gpu_device(CHARDEV_ID),
     ]
 }
 
@@ -349,7 +350,9 @@ mod tests {
         assert!(
             out.contains("value=\"socket,id=conduit-gpu,path=/run/conduit/libvirt/myvm/gpu.sock\"")
         );
-        assert!(out.contains("value=\"vhost-user-device-pci,chardev=conduit-gpu,virtio-id=45\""));
+        assert!(out.contains(
+            "value=\"vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,num_vqs=2,vq_size=256,config_size=4036\""
+        ));
         assert!(out.contains("<name>myvm</name>"));
         assert!(out.contains("myvm.qcow2"));
     }

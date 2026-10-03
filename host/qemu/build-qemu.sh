@@ -11,7 +11,7 @@
 # cannot host virtio-nvgpu (256-byte vhost-user config limit); see README.md.
 #
 # Usage: build-qemu.sh [--version X.Y.Z] [--prefix DIR] [--no-slirp]
-#                      [--stock] [--jobs N] [--install]
+#                      [--no-audio] [--stock] [--jobs N] [--install]
 # Env:   QEMU_VERSION, PREFIX, JOBS, WORKDIR (defaults below).
 #
 # Builds as the calling user under host/qemu/{src,build}; installs only with
@@ -24,6 +24,7 @@ PREFIX="${PREFIX:-/opt/conduit}"
 JOBS="${JOBS:-$(nproc)}"
 WORKDIR="${WORKDIR:-$HERE}"
 SLIRP=enabled
+AUDIO=enabled
 INSTALL=0
 PATCHES=1
 
@@ -40,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --prefix)  PREFIX="$2"; shift 2 ;;
     --jobs)    JOBS="$2"; shift 2 ;;
     --no-slirp) SLIRP=disabled; shift ;;
+    --no-audio) AUDIO=disabled; shift ;;
     --install) INSTALL=1; shift ;;
     --stock)   PATCHES=0; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
@@ -115,8 +117,17 @@ fi
 # only what the Conduit VM needs. No GUI (gtk/sdl/spice/opengl): the guest
 # display is the zero-copy nvgpu scanout shown by the Conduit viewer.
 # VNC + pixman stay on for a headless firmware/console fallback.
+# Audio: the guest gets a virtio-sound card (speakers + mic) played through
+# the desktop's PipeWire, or PulseAudio (pipewire-pulse) as a fallback.
+# The options are part of the stamp below, so changing them reconfigures.
+if [[ $AUDIO == enabled ]]; then
+  AUDIO_OPTS=(--enable-pipewire --enable-pa --audio-drv-list=pipewire,pa)
+else
+  AUDIO_OPTS=(--disable-pipewire --disable-pa --audio-drv-list=)
+fi
+CONF_STAMP="slirp=$SLIRP audio=$AUDIO"
 cd "$BUILD_DIR"
-if [[ ! -f build.ninja ]]; then
+if [[ ! -f build.ninja || "$(cat .conduit-configured 2>/dev/null)" != "$CONF_STAMP" ]]; then
   "$SRC_DIR/qemu-$QEMU_VERSION/configure" \
     --prefix="$PREFIX" \
     --target-list=x86_64-softmmu \
@@ -131,9 +142,11 @@ if [[ ! -f build.ninja ]]; then
     --enable-vnc \
     --enable-fdt=system \
     --enable-malloc-trim \
+    "${AUDIO_OPTS[@]}" \
     --disable-gtk --disable-sdl --disable-spice --disable-opengl \
     --disable-docs \
     --disable-werror
+  echo "$CONF_STAMP" > .conduit-configured
 fi
 
 # ---- build ---------------------------------------------------------------
@@ -143,6 +156,10 @@ nice -n 10 ninja -j "$JOBS"
 ./qemu-system-x86_64 -device help 2>/dev/null \
   | grep -E '"vhost-user-test-device-pci"' \
   || { echo "vhost-user-test-device-pci missing from build" >&2; exit 1; }
+if [[ $AUDIO == enabled ]]; then
+  ./qemu-system-x86_64 -audiodev help 2>/dev/null | grep -qx pipewire \
+    || { echo "pipewire audio backend missing from build" >&2; exit 1; }
+fi
 
 if [[ $INSTALL == 1 ]]; then
   if [[ -w "$(dirname "$PREFIX")" || -w "$PREFIX" ]]; then

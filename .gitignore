@@ -20,3 +20,4 @@ guest/linux/*.mod*
 guest/linux/modules.order
 guest/linux/Module.symvers
 __pycache__/
+host/qemu/*.log

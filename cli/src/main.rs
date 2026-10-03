@@ -8,6 +8,7 @@ mod libvirt;
 mod mode;
 mod net;
 mod paths;
+mod qemu;
 mod run;
 mod sys;
 mod ui;
@@ -90,6 +91,9 @@ enum Cmd {
         /// No screen at all (compute/ssh only)
         #[arg(long, conflicts_with = "display")]
         headless: bool,
+        /// VM runner: qemu (default; has sound) or builtin (no sound)
+        #[arg(long, value_enum)]
+        vmm: Option<run::VmmKind>,
     },
     /// Open a VM in a window, starting it if needed. Closing the window shuts it down.
     View {
@@ -102,6 +106,9 @@ enum Cmd {
         /// Start fullscreen (Ctrl+Alt+F toggles)
         #[arg(long)]
         fullscreen: bool,
+        /// VM runner: qemu (default; has sound) or builtin (no sound)
+        #[arg(long, value_enum)]
+        vmm: Option<run::VmmKind>,
     },
     /// Shut a VM down cleanly and stop everything that belongs to it
     Down { name: String },
@@ -110,7 +117,7 @@ enum Cmd {
     /// Show a VM's logs: backend, vm (console) or viewer
     Logs {
         name: String,
-        #[arg(value_parser = ["backend", "vm", "viewer", "watcher", "share", "create"])]
+        #[arg(value_parser = ["backend", "vm", "viewer", "watcher", "share", "virtiofsd", "create"])]
         which: Option<String>,
         /// Keep printing new lines
         #[arg(short, long)]
@@ -255,13 +262,16 @@ fn main() {
             name,
             display,
             headless,
-        } => opt_mode(display.as_deref()).and_then(|m| run::up(&name, m, headless)),
+            vmm,
+        } => opt_mode(display.as_deref()).and_then(|m| run::up(&name, m, headless, vmm)),
         Cmd::View {
             name,
             mode,
             tune_hyprland,
             fullscreen,
-        } => opt_mode(mode.as_deref()).and_then(|m| run::view(&name, m, tune_hyprland, fullscreen)),
+            vmm,
+        } => opt_mode(mode.as_deref())
+            .and_then(|m| run::view(&name, m, tune_hyprland, fullscreen, vmm)),
         Cmd::Down { name } => run::down(&name),
         Cmd::Status { name } => run::status(name.as_deref()),
         Cmd::Logs {
@@ -327,6 +337,8 @@ mod tests {
             ],
             vec!["conduit", "attach", "myvm"],
             vec!["conduit", "up", "myvm"],
+            vec!["conduit", "up", "myvm", "--vmm", "qemu", "--headless"],
+            vec!["conduit", "view", "myvm", "--vmm", "builtin"],
             vec!["conduit", "down", "myvm"],
             vec!["conduit", "status"],
             vec!["conduit", "status", "myvm"],

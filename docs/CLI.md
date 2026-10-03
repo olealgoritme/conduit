@@ -15,7 +15,7 @@ Source: `cli/` (Rust, one static binary). Build: `cargo build --release -p condu
 | `conduit status [NAME]` | Shows the processes, display, network and whether the guest can be reached. |
 | `conduit logs NAME [backend\|vm\|viewer] [-f] [-n N]` | Shows the logs. |
 | `conduit ssh NAME [-u USER] [CMD...]` | Opens a terminal in the VM, or runs a command there. |
-| `conduit attach NAME [--dry-run] [-c URI]` | Changes a libvirt VM to use the GPU: sets the emulator (system QEMU at 11.1 or newer, else `/opt/conduit/bin`), adds memfd shared memory and `vhost-user-device-pci,virtio-id=45`, and installs a libvirt hook that runs the backend. **Gated** until the backend supports QEMU: only `--dry-run` works, unless you set `CONDUIT_EXPERIMENTAL_QEMU=1`. |
+| `conduit attach NAME [--dry-run] [-c URI]` | Changes a libvirt VM to use the GPU: sets the emulator (system QEMU at 11.1 or newer, else `/opt/conduit/bin`), adds memfd shared memory and `vhost-user-test-device-pci,virtio-id=45,config_size=4036`, and installs a libvirt hook that runs the backend. **Gated** until the backend supports QEMU: only `--dry-run` works, unless you set `CONDUIT_EXPERIMENTAL_QEMU=1`. |
 
 `--tune-hyprland` is opt-in. While the viewer runs, it sets `misc:no_direct_scanout 0`, `general:allow_tearing 1` and an `immediate` rule for the viewer, then restores the old values. If the viewer supports `--direct-hook`, Ctrl+Alt+D turns these settings on and off.
 

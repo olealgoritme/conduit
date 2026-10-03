@@ -427,8 +427,15 @@ impl NvidiaBackend {
         log::debug!("UNMAP_MEMORY: host status=0x{:x}", status);
 
         if status == 0 {
-            // Host unmap succeeded -- restore the SHM backing and return the
-            // extent to its zone, so the space can serve a later mapping.
+            // Host unmap succeeded -- take the range out of the guest's
+            // window (QEMU refuses a later mapping that overlaps one it still
+            // holds), restore the SHM backing and return the extent to its
+            // zone, so the space can serve a later mapping.
+            if let Some(window) = self.window.as_ref()
+                && let Err(e) = window.withdraw(entry.region.offset, entry.region.length)
+            {
+                log::warn!("UNMAP_MEMORY: the window would not give it back: {e}");
+            }
             if let Err(e) = self.shm.free(&entry.region) {
                 log::warn!("UNMAP_MEMORY: SHM free failed: {} (non-fatal)", e);
             }
