@@ -1092,9 +1092,13 @@ fn main() -> anyhow::Result<()> {
         // connection, then exit, so the backend lives exactly as long as the VM.
         Some(mut listener) => {
             log::info!("socket activation: serving the listener systemd passed in");
-            daemon
-                .start(&mut listener)
-                .and_then(|()| daemon.wait())
+            let served = daemon.start(&mut listener).and_then(|()| daemon.wait());
+            // As `serve` does: stop the vring workers, or dropping the daemon
+            // waits for them forever.
+            for h in daemon.get_epoll_handlers() {
+                h.send_exit_event();
+            }
+            served
                 .or_else(disconnect_is_ok)
                 .map_err(|e| anyhow::anyhow!("serve (socket activation): {e:?}"))?;
         }
@@ -1114,5 +1118,8 @@ fn main() -> anyhow::Result<()> {
         .expect("nvidia lock")
         .teardown();
     log::info!("backend exited");
-    Ok(())
+    // Exit now: the device is torn down, and dropping the daemon and the
+    // backend waits on worker threads (vring, events) that may never return.
+    // Socket activation relies on this process ending with the VM.
+    std::process::exit(0)
 }
