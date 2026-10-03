@@ -26,6 +26,13 @@
  * unless O_NONBLOCK; -EMSGSIZE, consuming nothing, if the buffer is short.
  * write() takes exactly one whole record and returns once the host answered.
  *
+ * The host only pushes its clipboard when it changes (or the viewer gains
+ * focus), and the first push usually races the guest's boot. So once this
+ * device is up -- and whenever a reader opens it before any host clipboard
+ * arrived -- the module asks for the current one (ClipboardRequest); the
+ * backend re-sends the newest it has. A backend that predates the request
+ * refuses it, which is harmless.
+ *
  * Interrupt context only copies a chunk onto a bounded list; reassembly runs
  * in a work item, so no large allocation ever happens with interrupts off.
  * The state is refcounted: open files outlive the device, and then read and
@@ -257,6 +264,8 @@ static void nvgpu_clip_event(struct nvgpu_device *dev, const u8 *p,
 
 /* ───────── the character device ───────── */
 
+static void nvgpu_clip_request(struct nvgpu_clip *c);
+
 static int nvgpu_clip_open(struct inode *inode, struct file *filp) {
   struct nvgpu_clip_file *f;
   struct nvgpu_clip *c;
@@ -275,6 +284,10 @@ static int nvgpu_clip_open(struct inode *inode, struct file *filp) {
   }
   f->clip = c;
   filp->private_data = f;
+  /* A reader before any host clipboard arrived: ask for it, in case the
+   * host's push came before this device was there to take it. */
+  if (!READ_ONCE(c->seq))
+    nvgpu_clip_request(c);
   return nonseekable_open(inode, filp);
 }
 
@@ -394,6 +407,29 @@ static int nvgpu_clip_send(struct nvgpu_clip *c, const u8 *text, u32 len) {
   return ret;
 }
 
+/* Ask the host to send its current clipboard again. Process context. */
+static void nvgpu_clip_request(struct nvgpu_clip *c) {
+  struct nvgpu_msg_hdr req, resp;
+  int ret;
+
+  if (mutex_lock_interruptible(&c->write_mutex))
+    return;
+  if (!c->dev) {
+    mutex_unlock(&c->write_mutex);
+    return;
+  }
+  memset(&req, 0, sizeof(req));
+  memset(&resp, 0, sizeof(resp));
+  req.msg_type = cpu_to_le32(NVGPU_MSG_CLIPBOARD_REQUEST);
+  ret = nvgpu_send_recv(c->dev, &req, sizeof(req), &resp, sizeof(resp));
+  if (ret >= 0 && (s32)le32_to_cpu(resp.status) < 0)
+    ret = (s32)le32_to_cpu(resp.status);
+  if (ret < 0)
+    dev_dbg(&c->dev->vdev->dev,
+            "virtio-gpu-nv: clipboard request not taken: %d\n", ret);
+  mutex_unlock(&c->write_mutex);
+}
+
 static ssize_t nvgpu_clip_write(struct file *filp, const char __user *buf,
                                 size_t count, loff_t *ppos) {
   struct nvgpu_clip_file *f = filp->private_data;
@@ -493,6 +529,8 @@ static void nvgpu_clip_init(struct nvgpu_device *dev) {
   /* Published last: the event interrupt may use it from here on. */
   WRITE_ONCE(dev->clip, c);
   dev_info(&dev->vdev->dev, "virtio-gpu-nv: clipboard at /dev/conduit-clipboard\n");
+  /* Whatever the host sent before now was dropped: ask for it again. */
+  nvgpu_clip_request(c);
 }
 
 /* Remove, before the device reset: no new opens, no more host traffic. */

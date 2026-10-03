@@ -429,12 +429,13 @@ struct nb_wl {
     struct wl_data_device_manager *ddm;
     struct wl_data_device         *ddev;
     struct wl_data_offer          *offer;      /* current selection, if text */
-    bool                           offer_text; /* it advertised our mime     */
+    int                            offer_text; /* best text mime it has, as a
+                                                * rank (nb_wl_text_mime), 0 = none */
     /* data_offer precedes the selection/enter event that says what the object
      * is for.  Keep that candidate separate so an ignored DnD offer cannot
      * replace the clipboard selection. */
     struct wl_data_offer          *pending_offer;
-    bool                           pending_offer_text;
+    int                            pending_offer_text;
     struct wl_data_source         *source;     /* ours, when we own it       */
     char                          *src_text;   /* what we would send         */
     size_t                         src_len;
@@ -1833,14 +1834,43 @@ static uint64_t nb_now_ms_wl(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
+/*
+ * Text types we read the host selection as, best first.  Not every program
+ * offers the canonical one: X11 programs through XWayland and some toolkits
+ * offer only UTF8_STRING or text/plain, and such a copy used to be skipped
+ * without a word.  Whatever arrives is validated as UTF-8 before it goes on.
+ */
+static const char *const nb_wl_text_mimes[] = {
+    NB_CLIP_MIME, "UTF8_STRING", "text/plain", "TEXT", "STRING",
+};
+#define NB_WL_TEXT_MIMES (int)(sizeof(nb_wl_text_mimes) / sizeof(nb_wl_text_mimes[0]))
+
+/* The rank of `mime` (higher is better), 0 if it is not text we take. */
+static int nb_wl_text_rank(const char *mime)
+{
+    for (int i = 0; i < NB_WL_TEXT_MIMES; i++) {
+        if (!strcmp(mime, nb_wl_text_mimes[i])) {
+            return NB_WL_TEXT_MIMES - i;
+        }
+    }
+    return 0;
+}
+
+static const char *nb_wl_text_mime(int rank)
+{
+    return rank > 0 && rank <= NB_WL_TEXT_MIMES
+        ? nb_wl_text_mimes[NB_WL_TEXT_MIMES - rank] : NB_CLIP_MIME;
+}
+
 static void doffer_offer(void *d, struct wl_data_offer *o, const char *mime)
 {
     struct nb_wl *w = d;
+    int rank = nb_wl_text_rank(mime);
 
-    if (w->offer == o && !strcmp(mime, NB_CLIP_MIME)) {
-        w->offer_text = true;
-    } else if (w->pending_offer == o && !strcmp(mime, NB_CLIP_MIME)) {
-        w->pending_offer_text = true;
+    if (w->offer == o && rank > w->offer_text) {
+        w->offer_text = rank;
+    } else if (w->pending_offer == o && rank > w->pending_offer_text) {
+        w->pending_offer_text = rank;
     }
 }
 static void doffer_source_actions(void *d, struct wl_data_offer *o, uint32_t a) {}
@@ -1863,7 +1893,7 @@ static void ddev_data_offer(void *d, struct wl_data_device *dev,
         wl_data_offer_destroy(w->pending_offer);
     }
     w->pending_offer = o;
-    w->pending_offer_text = false;
+    w->pending_offer_text = 0;
     wl_data_offer_add_listener(o, &doffer_listener, w);
 }
 static void ddev_selection(void *d, struct wl_data_device *dev,
@@ -1876,7 +1906,7 @@ static void ddev_selection(void *d, struct wl_data_device *dev,
             wl_data_offer_destroy(w->offer);
         }
         w->offer = NULL;
-        w->offer_text = false;
+        w->offer_text = 0;
         return;
     }
     /* The offer we were told about in data_offer is now THE selection. */
@@ -1887,15 +1917,21 @@ static void ddev_selection(void *d, struct wl_data_device *dev,
     if (w->pending_offer == o) {
         w->offer_text = w->pending_offer_text;
         w->pending_offer = NULL;
-        w->pending_offer_text = false;
+        w->pending_offer_text = 0;
     } else {
         /* The protocol promises data_offer first.  Fail this offer closed if a
          * compositor violates that ordering; it has no recorded MIME set. */
-        w->offer_text = false;
+        w->offer_text = 0;
     }
     /* Conduit push modes: a new host selection, seen only while focused --
-     * the core decides whether it goes to the guest. */
-    if (w->offer_text && w->sink) {
+     * the core decides whether it goes to the guest.  Compositors differ in
+     * whether this comes before or after wl_keyboard.enter (Hyprland may send
+     * it first); focus-in fetches too, and the core drops repeats by
+     * content, so either order sends each new text exactly once. */
+    if (!w->offer_text) {
+        nb_log("clipboard: the new host selection has no text type; not "
+               "sent to the VM");
+    } else if (w->sink) {
         nb_sink_host_clipboard_changed(w->sink);
     }
 }
@@ -1910,7 +1946,7 @@ static void ddev_enter(void *d, struct wl_data_device *v, uint32_t s,
     if (o && o == w->pending_offer) {
         wl_data_offer_destroy(o);
         w->pending_offer = NULL;
-        w->pending_offer_text = false;
+        w->pending_offer_text = 0;
     }
 }
 static void ddev_leave(void *d, struct wl_data_device *v) {}
@@ -2135,12 +2171,19 @@ static int wl_fetch_clipboard(struct nb_session *s, struct nb_sink *sink,
     if (w->fetch_fd >= 0) {
         return -EBUSY;              /* one at a time */
     }
-    if (!w->offer || !w->offer_text) {
-        return -ENOENT;             /* nothing, or nothing we accept */
+    if (!w->offer) {
+        nb_sink_clip_skip(sink, "the host clipboard is empty (no selection "
+                          "offered to this window yet)");
+        return -ENOENT;
+    }
+    if (!w->offer_text) {
+        nb_sink_clip_skip(sink, "the host clipboard holds no text");
+        return -ENOENT;
     }
     if (w->source) {
         /* The selection is OURS -- the guest's own text.  Reading it back
          * through the compositor would only echo it. */
+        nb_sink_clip_skip(sink, "the host clipboard is the VM's own copy");
         return -ENOENT;
     }
     w->fetch_cap = nb_sink_clip_cap(sink);
@@ -2153,7 +2196,7 @@ static int wl_fetch_clipboard(struct nb_session *s, struct nb_sink *sink,
     if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) < 0) {
         return -errno;
     }
-    wl_data_offer_receive(w->offer, NB_CLIP_MIME, fds[1]);
+    wl_data_offer_receive(w->offer, nb_wl_text_mime(w->offer_text), fds[1]);
     close(fds[1]);                  /* the compositor owns its end now */
     wl_display_flush(w->dpy);
     w->fetch_fd = fds[0];
@@ -3082,7 +3125,15 @@ static void kbd_enter(void *d, struct wl_keyboard *k, uint32_t serial,
     w->last_serial = serial;
     w->focused = true;
     if (w->sink) {
+        /* Focus-in fetches the host clipboard (nb_sink_focus); also when the
+         * core already believed it was focused, so no keyboard enter is ever
+         * a missed push. Repeats are dropped by content. */
+        bool was = nb_sink_focused(w->sink);
+
         nb_sink_focus(w->sink, true);
+        if (was) {
+            nb_sink_host_clipboard_changed(w->sink);
+        }
     }
     wl_clip_flush_pending(w);
 }

@@ -93,6 +93,13 @@ pub enum MsgType {
     /// [`ClipboardChunk`] followed by `len` data bytes; the reply is a bare
     /// header, status 0 or a negative errno.
     ClipboardToHost = 26,
+    /// Guest → host, control queue, no payload: the guest's clipboard device
+    /// is ready (or its reader found it empty); send the current host
+    /// clipboard again as `ClipboardFromHost`. Anything sent before the guest
+    /// driver was up is otherwise lost. The reply is a bare header, status 0
+    /// or `-ENODEV` without a display. Older backends answer it with an
+    /// unknown-type error, which the guest ignores.
+    ClipboardRequest = 27,
 }
 
 impl MsgType {
@@ -114,6 +121,7 @@ impl MsgType {
             24 => Self::CursorUpdate,
             25 => Self::ClipboardFromHost,
             26 => Self::ClipboardToHost,
+            27 => Self::ClipboardRequest,
             _ => return None,
         })
     }
@@ -914,6 +922,7 @@ mod tests {
             MsgType::CursorUpdate,
             MsgType::ClipboardFromHost,
             MsgType::ClipboardToHost,
+            MsgType::ClipboardRequest,
         ] {
             assert_eq!(MsgType::from_u32(t as u32), Some(t));
         }
@@ -926,7 +935,8 @@ mod tests {
         assert_eq!(MsgType::CursorUpdate as u32, 24);
         assert_eq!(MsgType::ClipboardFromHost as u32, 25);
         assert_eq!(MsgType::ClipboardToHost as u32, 26);
-        assert_eq!(MsgType::from_u32(27), None);
+        assert_eq!(MsgType::ClipboardRequest as u32, 27);
+        assert_eq!(MsgType::from_u32(28), None);
     }
 
     /// The event the guest's event-queue handler decodes: header, then

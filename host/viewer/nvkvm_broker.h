@@ -319,6 +319,8 @@ struct nb_sink {
     char    *clip_next;
     size_t   clip_next_len;
     bool     clip_have_last;
+    /* The last reason a push was skipped, logged once until it changes. */
+    const char *clip_skip_said;
     uint64_t clip_last_hash;
     size_t   clip_last_len;
     unsigned caps_seen;         /* what the client told us it can do        */
@@ -457,6 +459,11 @@ void nb_sink_clip_finish(struct nb_sink *s, uint64_t generation, bool paste);
  * Otherwise a no-op.
  */
 void nb_sink_host_clipboard_changed(struct nb_sink *s);
+/* A backend could not read the host clipboard for a push: say why (logged
+ * once per distinct reason, so a focus-in storm does not flood the log). */
+void nb_sink_clip_skip(struct nb_sink *s, const char *why);
+/* Whether the core currently treats the window as focused. */
+bool nb_sink_focused(const struct nb_sink *s);
 /* The largest clipboard text the current client and mode take, in bytes:
  * what a backend's fetch buffer must hold. */
 size_t nb_sink_clip_cap(const struct nb_sink *s);

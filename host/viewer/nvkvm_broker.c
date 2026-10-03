@@ -186,6 +186,7 @@ static void nb_client_state_reset(struct nb_sink *s)
     s->clip_next = NULL;
     s->clip_next_len = 0;
     s->clip_have_last = false;
+    s->clip_skip_said = NULL;
     s->clip_last_hash = 0;
     s->clip_last_len = 0;
     s->caps_seen = 0;
@@ -963,7 +964,10 @@ static bool nb_clip_push_queue(struct nb_sink *s, uint64_t generation,
         return false;
     }
     if (nb_clip_is_last(s, text, len)) {
-        return true;                /* already there: an echo or a re-focus */
+        /* already there: an echo or a re-focus */
+        nb_sink_clip_skip(s, "unchanged since it last crossed (the VM has "
+                          "it already)");
+        return true;
     }
     copy = malloc(len);
     if (!copy) {
@@ -974,9 +978,24 @@ static bool nb_clip_push_queue(struct nb_sink *s, uint64_t generation,
     s->clip_next = copy;
     s->clip_next_len = len;
     nb_clip_note_last(s, text, len);
+    s->clip_skip_said = NULL;
     nb_log("clipboard: sending %zu bytes of the host clipboard to the VM", len);
     nb_clip_out_pump(s);
     return true;
+}
+
+void nb_sink_clip_skip(struct nb_sink *s, const char *why)
+{
+    if (!s || (s->clip_skip_said && !strcmp(s->clip_skip_said, why))) {
+        return;
+    }
+    s->clip_skip_said = why;
+    nb_log("clipboard: host clipboard not sent to the VM: %s", why);
+}
+
+bool nb_sink_focused(const struct nb_sink *s)
+{
+    return s && s->focused;
 }
 
 void nb_sink_host_clipboard_changed(struct nb_sink *s)
@@ -984,8 +1003,14 @@ void nb_sink_host_clipboard_changed(struct nb_sink *s)
     int r;
 
     if (!s || !NB_CLIP_MODE_PUSH(s->cfg->clip_mode) || s->client_fd < 0 ||
-        !s->focused || !(s->caps_seen & NB_CLIENT_HAS_CLIPBOARD) ||
-        !s->sess->ops->fetch_clipboard) {
+        !s->focused || !s->sess->ops->fetch_clipboard) {
+        /* Not focused is the normal case (Wayland would not let us read it
+         * anyway); focus-in tries again. */
+        return;
+    }
+    if (!(s->caps_seen & NB_CLIENT_HAS_CLIPBOARD)) {
+        nb_sink_clip_skip(s, "the VM has not said it has a clipboard agent "
+                          "(old backend?)");
         return;
     }
     if (s->clip_held_key) {

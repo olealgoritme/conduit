@@ -59,6 +59,7 @@ Guest ↔ backend (`protocol/src/messages.rs`, `guest/linux/nvgpu_clipboard.h`):
 |---|---|---|---|
 | 25 | `ClipboardFromHost` | host → guest | event |
 | 26 | `ClipboardToHost` | guest → host | control (reply: header, status 0 / -errno) |
+| 27 | `ClipboardRequest` | guest → host | control, no payload: send the host clipboard again |
 
 ```c
 struct clipboard_chunk {   /* 56 bytes after the message header, then `len` bytes */
@@ -70,6 +71,15 @@ struct clipboard_chunk {   /* 56 bytes after the message header, then `len` byte
     char mime[32];         /* "text/plain;charset=utf-8", NUL-padded */
 };
 ```
+
+**Late guests.** The viewer pushes on connect and focus-in, which is usually
+before the VM has booted. The backend keeps the newest host clipboard (and
+holds a transfer while no guest driver is attached); the guest module sends
+`ClipboardRequest` once `/dev/conduit-clipboard` is up and whenever a reader
+opens it before any host clipboard arrived, and the backend re-sends what it
+has. The module keeps the newest host clipboard, so an agent that starts later
+still gets it on open. An older backend answers 27 with an unknown-type error,
+which the module ignores.
 
 Host → guest chunks fill the guest's event buffers (464 data bytes each with
 today's 520-byte payloads); input events always go first and clipboard chunks
@@ -102,7 +112,7 @@ Host (viewer):
 
 | Host session | Reads host clipboard | Writes host clipboard |
 |---|---|---|
-| Wayland (Hyprland, GNOME, KDE, sway…) | `wl_data_device` selection offer, on focus-in and on change while focused | `wl_data_source` (needs the focus serial; held until focus) |
+| Wayland (Hyprland, GNOME, KDE, sway…) | `wl_data_device` selection offer, on every keyboard focus-in and every new selection while focused (either order); text as `text/plain;charset=utf-8`, else `UTF8_STRING`, `text/plain`, `TEXT`, `STRING`; repeats dropped by content hash; a skipped push is logged with the reason | `wl_data_source` (needs the focus serial; held until focus) |
 | X11 (any WM) | `ConvertSelection(CLIPBOARD, UTF8_STRING)` on focus-in, INCR supported | owns `CLIPBOARD`, serves `UTF8_STRING`/`STRING`/`TARGETS` |
 
 `conduit view` starts the Wayland backend when `WAYLAND_DISPLAY` is set, else
@@ -118,6 +128,12 @@ Guest (`conduit-clipboard-agent`, picked from `WAYLAND_DISPLAY`, `DISPLAY`,
 | Wayland, wlroots (sway, labwc, Hyprland) | `wl-paste --watch` / `wl-copy` (wlr-data-control) | `wl-clipboard` |
 | Wayland, KDE Plasma 6 | same (KWin has wlr-data-control) | `wl-clipboard` |
 | Wayland, GNOME 46+ | Xlib + XFixes through XWayland; mutter mirrors its Wayland clipboard to the X11 `CLIPBOARD` both ways | XWayland (default; started on demand) |
+
+GNOME's XWayland serves two displays: the public one (`DISPLAY`, usually
+`:0`), whose `CLIPBOARD` mutter mirrors to Wayland, and a private one for its
+own services (`GNOME_SETUP_DISPLAY`, usually `:1`). The agent uses the public
+one; if it only sees the private one (or none) it takes `DISPLAY` from the
+systemd user environment, and logs which display it uses.
 
 GNOME has no data-control protocol, and a Wayland client only sees the
 selection while it has keyboard focus, which a background agent never has.

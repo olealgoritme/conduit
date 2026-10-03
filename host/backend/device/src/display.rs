@@ -42,7 +42,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -898,6 +898,8 @@ pub struct DisplayLink {
     /// The mode the guest boots with (device config); what "restore" means.
     configured: DisplayMode,
     state: Mutex<LinkState>,
+    /// The guest asked for the host clipboard again (ClipboardRequest).
+    clip_resend: AtomicBool,
     pub stats: LinkStats,
 }
 
@@ -913,8 +915,17 @@ impl DisplayLink {
             path,
             configured: mode,
             state: Mutex::new(LinkState::default()),
+            clip_resend: AtomicBool::new(false),
             stats: LinkStats::default(),
         })
+    }
+
+    /// The guest wants the current host clipboard (again): its driver just
+    /// came up, so anything sent earlier -- typically the viewer's push on
+    /// connect, which races the guest's boot -- never reached it. The link
+    /// thread re-sends the newest host clipboard it has, if any.
+    pub fn request_host_clipboard(&self) {
+        self.clip_resend.store(true, Ordering::Relaxed);
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -1304,6 +1315,11 @@ impl DisplayLink {
         // Host clipboard on its way to the guest: generation, text, offset.
         let mut pending_clip: Option<(u64, Vec<u8>, usize)> = None;
         let mut clip_gen: u64 = 0;
+        // The newest host clipboard, kept across transfers and reconnects so
+        // a guest that comes up later (ClipboardRequest) still gets it.
+        let mut latest_clip: Option<Vec<u8>> = None;
+        // The sink took nothing last time (no guest yet): retry slowly.
+        let mut clip_stalled = false;
 
         while !stop.load(Ordering::Relaxed) {
             let Some(sock) = self.current() else {
@@ -1341,11 +1357,11 @@ impl DisplayLink {
 
             // Undeliverable input (no buffer posted) is retried soon rather
             // than on the next packet: a lost key release is a stuck key.
-            let timeout = if pending.is_empty() && pending_mode.is_none() && pending_clip.is_none()
-            {
+            let clip_waiting = pending_clip.is_some() && !clip_stalled;
+            let timeout = if pending.is_empty() && pending_mode.is_none() && !clip_waiting {
                 if self.clip_owed() {
                     CLIP_BATCH_EVERY.as_millis() as i32
-                } else if self.cursor_owed() {
+                } else if self.cursor_owed() || pending_clip.is_some() {
                     20
                 } else {
                     500
@@ -1410,7 +1426,9 @@ impl DisplayLink {
                                 "display: host clipboard ({} bytes) -> guest, generation {clip_gen}",
                                 text.len()
                             );
+                            latest_clip = Some(text.clone());
                             pending_clip = Some((clip_gen, text, 0));
+                            clip_stalled = false;
                         }
                         if let Some(m) = policy.packet(&p) {
                             pending_mode = Some(m);
@@ -1436,11 +1454,29 @@ impl DisplayLink {
                     m.refresh_mhz % 1000
                 );
             }
+            if self.clip_resend.swap(false, Ordering::Relaxed) {
+                match latest_clip.as_ref() {
+                    Some(text) => {
+                        clip_gen += 1;
+                        log::info!(
+                            "display: the guest asked for the host clipboard: {} bytes -> guest again, generation {clip_gen}",
+                            text.len()
+                        );
+                        pending_clip = Some((clip_gen, text.clone(), 0));
+                        clip_stalled = false;
+                    }
+                    None => log::debug!(
+                        "display: the guest asked for the host clipboard; the viewer has sent none yet"
+                    ),
+                }
+            }
             // Input first: clipboard chunks only take buffers input left.
             if pending.is_empty()
                 && let Some((generation, text, off)) = pending_clip.as_mut()
             {
+                let before = *off;
                 *off = sink.clipboard(*generation, text, *off);
+                clip_stalled = *off == before;
                 if *off >= text.len() {
                     pending_clip = None;
                     self.stats.clip_to_guest.fetch_add(1, Ordering::Relaxed);
@@ -2499,16 +2535,24 @@ mod tests {
             .first()
             .is_some_and(|t| t.1 == text)));
         assert_eq!(got.lock().unwrap()[0].0, 1);
+        // The guest driver came up late and asks: the same text again.
+        link.request_host_clipboard();
+        assert!(wait_for(|| got
+            .lock()
+            .unwrap()
+            .get(1)
+            .is_some_and(|t| t.1 == text)));
+        assert_eq!(got.lock().unwrap()[1].0, 2);
         // A partial transfer, then the broker goes: nothing half-delivered.
         send(wire::Pkt::clip(b"half", false));
         stop.store(true, Ordering::Relaxed);
         drop(broker);
         th.join().unwrap();
-        assert_eq!(got.lock().unwrap().len(), 1);
+        assert_eq!(got.lock().unwrap().len(), 2);
         assert!(wait_for(|| link
             .stats
             .clip_to_guest
             .load(Ordering::Relaxed)
-            == 1));
+            == 2));
     }
 }

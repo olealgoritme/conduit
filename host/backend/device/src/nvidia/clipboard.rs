@@ -75,6 +75,16 @@ impl ClipIn {
 }
 
 impl NvidiaBackend {
+    /// ClipboardRequest: the guest's clipboard device came up (or its reader
+    /// found nothing yet). Have the link send the host clipboard again.
+    pub(super) fn handle_clipboard_request(&mut self, resp_buf: &mut [u8]) -> usize {
+        let Some(link) = self.display.clone() else {
+            return self.write_hdr(resp_buf, 0, -libc::ENODEV);
+        };
+        link.request_host_clipboard();
+        self.write_hdr(resp_buf, 0, 0)
+    }
+
     pub(super) fn handle_clipboard_to_host(
         &mut self,
         payload: &[u8],
@@ -190,6 +200,19 @@ mod tests {
         link.hello_for_test(wire::CAP_CLIP_LARGE);
         link.retry_clip_for_test();
         assert_eq!(broker_text(broker.as_raw_fd()), b"hello!");
+    }
+
+    #[test]
+    fn a_clipboard_request_is_answered() {
+        let mut be = NvidiaBackend::for_test();
+        let mut req = vec![0u8; 16];
+        req[0..4].copy_from_slice(&(MsgType::ClipboardRequest as u32).to_le_bytes());
+        let mut resp = [0u8; 64];
+        be.dispatch(&req, &mut resp);
+        assert_eq!(status(&resp), -libc::ENODEV);
+        be.set_display(DisplayLink::new(None));
+        assert_eq!(be.dispatch(&req, &mut resp), 16);
+        assert_eq!(status(&resp), 0);
     }
 
     #[test]

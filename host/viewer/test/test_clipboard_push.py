@@ -114,17 +114,24 @@ def test_push_both():
         # Re-focus with the same host clipboard: nothing new crosses.
         b.stdin("f 0", "f 1", "c 300000")
         again = b.clip_transfers()
+        # New host text on the next focus-in: sent, deduplicated by content.
+        b.stdin("f 0", "f 1", "c 25")
+        newer = b.clip_transfers()
         # A paste key is now an ordinary key: no fetch is started by it.
         b.stdin("k 29 1", "k 47 1", "k 47 0", "k 29 0")
         # Guest->host, large, and the echo of the pushed text is suppressed.
-        b.send_guest(b"x" * 300000)       # the agent echoing the push
+        b.send_guest(b"x" * 25)           # the agent echoing the push
         b.send_guest(b"y" * 40000)
         log = b.close()
     check(got == [b"x" * 300000], f"push: got {[len(t) for t in got]}", log)
     check(again == [], "re-focus re-sent an unchanged clipboard", log)
+    check(newer == [b"x" * 25], f"new text on re-focus: got "
+          f"{[len(t) for t in newer]}", log)
+    check("not sent to the VM: unchanged" in log,
+          "an unchanged clipboard was skipped without saying why", log)
     check("TEST clipboard from guest: 40000 bytes" in log,
           "large guest->host was not applied", log)
-    check("TEST clipboard from guest: 300000 bytes" not in log,
+    check("TEST clipboard from guest: 25 bytes" not in log,
           "the echo of a pushed clipboard reached the host", log)
 
 

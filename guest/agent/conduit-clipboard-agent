@@ -167,6 +167,58 @@ def candidates(env, forced="auto", have_wl_clipboard=True):
     return out
 
 
+def user_manager_env():
+    """The systemd user manager's environment (what the session exported)."""
+    try:
+        r = subprocess.run(["systemctl", "--user", "show-environment"],
+                           stdin=subprocess.DEVNULL, capture_output=True,
+                           timeout=5, text=True)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if r.returncode != 0:
+        return {}
+    out = {}
+    for line in r.stdout.splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            out[k] = v
+    return out
+
+
+def x11_display(env, session_env=None):
+    """The X display whose CLIPBOARD the session's apps share.
+
+    GNOME on Wayland starts XWayland with two displays: the public one
+    (DISPLAY, usually :0), whose selections mutter mirrors to Wayland, and a
+    private one for its own services (GNOME_SETUP_DISPLAY, usually :1). An
+    agent started from a context that only saw the private one, or with no
+    DISPLAY at all, takes the public one from the session's environment.
+    """
+    private = env.get("GNOME_SETUP_DISPLAY")
+    d = env.get("DISPLAY")
+    if d and d != private:
+        return d
+    if session_env is None:
+        session_env = user_manager_env()
+    s = session_env.get("DISPLAY")
+    if s and s != session_env.get("GNOME_SETUP_DISPLAY", private):
+        return s
+    return d
+
+
+def session_env(env):
+    """`env` with DISPLAY pointing at the public X display (see above)."""
+    wayland = bool(env.get("WAYLAND_DISPLAY")) or \
+        env.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+    if not wayland or (env.get("DISPLAY") and
+                       env.get("DISPLAY") != env.get("GNOME_SETUP_DISPLAY")):
+        return env
+    d = x11_display(env)
+    if d and d != env.get("DISPLAY"):
+        env = dict(env, DISPLAY=d)
+    return env
+
+
 # ── wayland: wl-clipboard ───────────────────────────────────────────────────
 
 class BackendUnavailable(RuntimeError):
@@ -623,13 +675,13 @@ class X11Backend:
             self.dpy = None
 
 
-def open_backend(names):
+def open_backend(names, display=None):
     errors = []
     for n in names:
         try:
             if n == "wayland":
                 return WaylandBackend()
-            return X11Backend()
+            return X11Backend(display)
         except BackendUnavailable as e:
             errors.append("%s: %s" % (n, e))
             log("backend %s unavailable: %s" % (n, e))
@@ -848,10 +900,10 @@ class Agent:
             self.step()
 
 
-def single_instance():
-    rt = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
-    disp = (os.environ.get("WAYLAND_DISPLAY") or
-            os.environ.get("DISPLAY") or "none").replace("/", "_")
+def single_instance(env):
+    rt = env.get("XDG_RUNTIME_DIR") or "/tmp"
+    disp = (env.get("WAYLAND_DISPLAY") or
+            env.get("DISPLAY") or "none").replace("/", "_")
     path = os.path.join(rt, "conduit-clipboard-%s.lock" % disp)
     f = open(path, "w")
     try:
@@ -872,20 +924,27 @@ def main(argv=None):
                    help="print the backends that would be tried, and exit")
     a = p.parse_args(argv)
     _quiet = a.quiet
-    names = candidates(os.environ, a.backend, bool(shutil.which("wl-paste")))
+    env = session_env(dict(os.environ))
+    names = candidates(env, a.backend, bool(shutil.which("wl-paste")))
     if a.print_backend:
         print(" ".join(names) or "none")
         return 0
-    lock = single_instance()
+    lock = single_instance(env)
     if lock is None:
         log("already running in this session")
         return 0
     try:
-        backend = open_backend(names)
+        backend = open_backend(names, env.get("DISPLAY"))
     except BackendUnavailable as e:
         log("no usable clipboard backend: %s" % e)
         return 1
-    log("using %s, device %s" % (backend.name, a.device))
+    where = ""
+    if isinstance(backend, X11Backend):
+        where = " on X display %s" % env.get("DISPLAY")
+        if env.get("GNOME_SETUP_DISPLAY"):
+            where += " (GNOME's private display %s is not used)" % \
+                env.get("GNOME_SETUP_DISPLAY")
+    log("using %s%s, device %s" % (backend.name, where, a.device))
     try:
         Agent(Device(a.device), backend).run()
     except KeyboardInterrupt:

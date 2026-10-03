@@ -96,6 +96,7 @@ extern struct kset *module_kset;
 #define NVGPU_MSG_CURSOR_UPDATE 24   /* guest -> host, control queue */
 #define NVGPU_MSG_CLIPBOARD_FROM_HOST 25 /* host -> guest, event queue */
 #define NVGPU_MSG_CLIPBOARD_TO_HOST 26   /* guest -> host, control queue */
+#define NVGPU_MSG_CLIPBOARD_REQUEST 27   /* guest -> host, control queue */
 
 /* "NVAL": opens the allocation-size section of a GET_SYS_FILES response. */
 #define NVGPU_ALLOC_SIZE_MAGIC 0x4e56414cu

@@ -111,6 +111,20 @@ class CandidatesTest(unittest.TestCase):
         self.assertEqual(self.c({}), [])
         self.assertEqual(self.c({"XDG_SESSION_TYPE": "wayland"}), ["wayland"])
 
+    def test_gnome_public_display(self):
+        gnome = {"WAYLAND_DISPLAY": "wayland-0", "XDG_SESSION_TYPE": "wayland",
+                 "XDG_CURRENT_DESKTOP": "GNOME", "GNOME_SETUP_DISPLAY": ":1"}
+        sess = {"DISPLAY": ":0", "GNOME_SETUP_DISPLAY": ":1"}
+        # DISPLAY is the public one: kept.
+        self.assertEqual(agent.x11_display(dict(gnome, DISPLAY=":0"), {}), ":0")
+        # Only the private one, or none: the session's public one.
+        self.assertEqual(agent.x11_display(dict(gnome, DISPLAY=":1"), sess),
+                         ":0")
+        self.assertEqual(agent.x11_display(gnome, sess), ":0")
+        # Nothing better known: unchanged.
+        self.assertEqual(agent.x11_display(dict(gnome, DISPLAY=":1"), {}), ":1")
+        self.assertIsNone(agent.x11_display(gnome, {}))
+
     def test_forced(self):
         self.assertEqual(self.c({}, "x11"), ["x11"])
         self.assertEqual(self.c({"DISPLAY": ":0"}, "wayland"), ["wayland"])

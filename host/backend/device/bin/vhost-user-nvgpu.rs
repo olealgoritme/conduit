@@ -399,8 +399,9 @@ impl InputSink for VqInputSink {
 
     fn clipboard(&mut self, generation: u64, data: &[u8], mut offset: usize) -> usize {
         let Some((vring, mem)) = self.target.lock().expect("event target").clone() else {
-            // No guest yet: nobody to paste into.
-            return data.len();
+            // No guest yet: kept, and retried once there is one. The guest
+            // also asks again (ClipboardRequest) once its driver is up.
+            return offset;
         };
         let guard = mem.memory();
         let mut signalled = false;

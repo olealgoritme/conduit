@@ -930,6 +930,7 @@ impl NvidiaBackend {
                 MsgType::CursorUpdate => "cursor_update",
                 MsgType::ClipboardFromHost => "clipboard_from_host",
                 MsgType::ClipboardToHost => "clipboard_to_host",
+                MsgType::ClipboardRequest => "clipboard_request",
             })
             .or_insert(0) += 1;
         // The handle travels in the header, not the payload -- every message
@@ -960,6 +961,7 @@ impl NvidiaBackend {
             MsgType::ScanoutDisable => self.handle_scanout_disable(payload, resp_buf),
             MsgType::CursorUpdate => self.handle_cursor_update(payload, resp_buf),
             MsgType::ClipboardToHost => self.handle_clipboard_to_host(payload, resp_buf),
+            MsgType::ClipboardRequest => self.handle_clipboard_request(resp_buf),
         }
     }
 }
