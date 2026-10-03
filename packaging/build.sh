@@ -94,7 +94,8 @@ cmd_deps() {
             libxcb-present-dev libxcb-render0-dev libxcb-xinput-dev libgbm-dev \
             libssl-dev libegl-dev \
             libglib2.0-dev libpixman-1-dev libslirp-dev libseccomp-dev \
-            libcap-ng-dev libzstd-dev libaio-dev libfdt-dev
+            libcap-ng-dev libzstd-dev libaio-dev libfdt-dev \
+            libpulse-dev libpipewire-0.3-dev
         ;;
     rpm)
         dnf install -y \
@@ -105,13 +106,15 @@ cmd_deps() {
             wayland-devel wayland-protocols-devel libxcb-devel mesa-libgbm-devel \
             openssl-devel mesa-libEGL-devel \
             glib2-devel pixman-devel libslirp-devel libseccomp-devel \
-            libcap-ng-devel libzstd-devel libaio-devel libfdt-devel
+            libcap-ng-devel libzstd-devel libaio-devel libfdt-devel \
+            pulseaudio-libs-devel pipewire-devel
         ;;
     arch)
         pacman -Syu --noconfirm --needed \
             base-devel git curl xz file patchelf gnupg python ninja meson flex bison \
             wayland wayland-protocols libxcb mesa openssl \
-            glib2 pixman libslirp libseccomp libcap-ng zstd libaio dtc
+            glib2 pixman libslirp libseccomp libcap-ng zstd libaio dtc \
+            libpulse pipewire
         ;;
     esac
 }

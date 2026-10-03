@@ -14,7 +14,8 @@ url="https://github.com/olealgoritme/conduit"
 license=('Apache-2.0' 'BSD-3-Clause' 'GPL-2.0-only')
 makedepends=(git rustup base-devel python ninja meson flex bison file
              wayland wayland-protocols libxcb mesa openssl
-             glib2 pixman libslirp libseccomp libcap-ng zstd libaio dtc)
+             glib2 pixman libslirp libseccomp libcap-ng zstd libaio dtc
+             libpulse pipewire)
 options=(!lto !debug)
 source=("$pkgbase::git+$url.git#tag=v$pkgver")
 sha256sums=('SKIP')
