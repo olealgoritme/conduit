@@ -1,0 +1,24 @@
+conduit-stream
+Copyright 2026 The Conduit authors. Licensed under the Apache License 2.0 (LICENSE).
+
+The GameStream host in src/gamestream/ is an independent implementation of
+the protocol spoken by Moonlight (https://moonlight-stream.org). The protocol's
+behaviour was learned from its open implementations, Sunshine
+(https://github.com/LizardByte/Sunshine) and moonlight-common-c
+(https://github.com/moonlight-stream/moonlight-common-c), both GPL-3.0; no code
+from either is included. "GameStream" and "NVIDIA" are trademarks of NVIDIA
+Corporation; Moonlight is a trademark of its authors. Conduit is not
+affiliated with either.
+
+This product includes, unchanged, in csrc/third_party/:
+
+- ENet, Moonlight's fork (https://github.com/cgutman/enet, commit aca87840),
+  Copyright (c) 2002-2020 Lee Salzman. MIT License: csrc/third_party/enet/LICENSE.
+
+- nanors (https://github.com/sleepybishop/nanors, commit b1e3c22c),
+  Copyright (c) 2021 Joseph Calderon. MIT License: csrc/third_party/nanors/LICENSE.
+
+- nv-codec-headers (https://github.com/FFmpeg/nv-codec-headers, commit eddcea9e),
+  NVIDIA Video Codec SDK headers, Copyright (c) 2010-2026 NVIDIA Corporation,
+  and the FFmpeg dynamic loader, Copyright (c) 2016 Timo Rothenpieler.
+  MIT License, reproduced in each header (csrc/third_party/nvcodec/ffnvcodec/).
