@@ -125,9 +125,10 @@ enum Cmd {
         vmm: Option<run::VmmKind>,
     },
     /// Open a VM in a window, starting it if needed. Closing the window shuts
-    /// it down only if this command started it (see --keep-running)
+    /// it down only if this command started it (see --keep-running).
+    /// Without NAME: the only VM, else the most recently used one
     View {
-        name: String,
+        name: Option<String>,
         /// Screen mode, e.g. 1920x1080 or 2560x1440@240 (default: your monitor's)
         mode: Option<String>,
         /// Hyprland only: allow tearing + direct scanout while the viewer runs (restored after)
@@ -354,6 +355,25 @@ fn opt_mode(s: Option<&str>) -> Result<Option<Mode>> {
     s.map(str::parse).transpose()
 }
 
+/// `conduit view [NAME] [MODE]`: a lone argument that is a screen mode and not
+/// a VM name means the mode (`conduit view 2560x1440`); no NAME means the
+/// default VM.
+fn view_target(name: Option<String>, mode: Option<String>) -> Result<(String, Option<String>)> {
+    let (name, mode) = split_view_args(name, mode, |n| lvrun::all_names().iter().any(|v| v == n));
+    Ok((name.map_or_else(lvrun::default_vm, Ok)?, mode))
+}
+
+fn split_view_args(
+    name: Option<String>,
+    mode: Option<String>,
+    is_vm: impl Fn(&str) -> bool,
+) -> (Option<String>, Option<String>) {
+    match (name, mode) {
+        (Some(n), None) if !is_vm(&n) && n.parse::<Mode>().is_ok() => (None, Some(n)),
+        other => other,
+    }
+}
+
 fn list() -> Result<()> {
     let names = lvrun::all_names();
     if names.is_empty() {
@@ -494,7 +514,10 @@ fn main() {
             display,
             headless,
             vmm,
-        } => opt_mode(display.as_deref()).and_then(|m| run::up(&name, m, headless, vmm)),
+        } => opt_mode(display.as_deref()).and_then(|m| {
+            lvrun::mark_used(&name);
+            run::up(&name, m, headless, vmm)
+        }),
         Cmd::View {
             name,
             mode,
@@ -502,8 +525,11 @@ fn main() {
             fullscreen,
             vmm,
             keep_running,
-        } => opt_mode(mode.as_deref())
-            .and_then(|m| run::view(&name, m, tune_hyprland, fullscreen, vmm, keep_running)),
+        } => view_target(name, mode).and_then(|(name, mode)| {
+            let m = opt_mode(mode.as_deref())?;
+            lvrun::mark_used(&name);
+            run::view(&name, m, tune_hyprland, fullscreen, vmm, keep_running)
+        }),
         Cmd::Down {
             name,
             timeout,
@@ -660,6 +686,63 @@ fn main() {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn view_without_name_parses() {
+        let c = Cli::try_parse_from(["conduit", "view"]).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Cmd::View {
+                name: None,
+                mode: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn view_lone_mode_is_a_mode() {
+        let vm = |n: &str| n == "myvm";
+        assert_eq!(
+            split_view_args(Some("2560x1440".into()), None, vm),
+            (None, Some("2560x1440".into()))
+        );
+        assert_eq!(
+            split_view_args(Some("myvm".into()), None, vm),
+            (Some("myvm".into()), None)
+        );
+        assert_eq!(split_view_args(None, None, vm), (None, None));
+    }
+
+    #[test]
+    fn default_vm_pick() {
+        use lvrun::{pick_default, DefaultVm};
+        use std::time::{Duration, SystemTime};
+        let t = |s| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(s));
+        assert_eq!(pick_default(vec![]), DefaultVm::None);
+        assert_eq!(
+            pick_default(vec![("a".into(), None)]),
+            DefaultVm::Only("a".into())
+        );
+        assert_eq!(
+            pick_default(vec![
+                ("a".into(), t(5)),
+                ("b".into(), t(9)),
+                ("c".into(), None)
+            ]),
+            DefaultVm::Recent("b".into(), vec!["a".into(), "c".into()])
+        );
+        assert_eq!(
+            pick_default(vec![("b".into(), None), ("a".into(), None)]),
+            DefaultVm::Recent("a".into(), vec!["b".into()])
+        );
+    }
+
+    #[test]
+    fn desktop_entries_name_the_vm() {
+        let e = virt::desktop_entry("myvm", std::path::Path::new("/opt/conduit/bin/conduit"));
+        assert!(e.contains("\nExec=/opt/conduit/bin/conduit view myvm\n"));
+    }
 
     #[test]
     fn cli_is_consistent() {

@@ -48,6 +48,77 @@ pub fn all_names() -> Vec<String> {
     v
 }
 
+/// Stamp file whose mtime says when a VM was last opened or started.
+const LAST_USED: &str = "last-used";
+
+/// Note that `name` was just used (`conduit view`/`up`), for the no-name default.
+pub fn mark_used(name: &str) {
+    if crate::vm::check_name(name).is_err() || !paths::vm_dir(name).is_dir() {
+        return;
+    }
+    let _ = std::fs::write(paths::vm_dir(name).join(LAST_USED), crate::vm::now() + "\n");
+}
+
+/// When a VM was last used: its stamp, else when its config last changed.
+fn last_used(name: &str) -> Option<std::time::SystemTime> {
+    let d = paths::vm_dir(name);
+    [LAST_USED, "vm.json", "libvirt.json"]
+        .iter()
+        .find_map(|f| std::fs::metadata(d.join(f)).and_then(|m| m.modified()).ok())
+}
+
+/// Which VM a command without a NAME means.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DefaultVm {
+    None,
+    Only(String),
+    /// The most recently used of several; the rest are listed in the hint.
+    Recent(String, Vec<String>),
+}
+
+/// The pick from (name, last used) pairs: the only one, or the newest
+/// (ties and unknown times go to the first name in sorted order).
+pub fn pick_default(mut vms: Vec<(String, Option<std::time::SystemTime>)>) -> DefaultVm {
+    vms.sort_by(|a, b| a.0.cmp(&b.0));
+    match vms.len() {
+        0 => DefaultVm::None,
+        1 => DefaultVm::Only(vms.remove(0).0),
+        _ => {
+            let mut best = 0;
+            for (i, v) in vms.iter().enumerate() {
+                if v.1 > vms[best].1 {
+                    best = i;
+                }
+            }
+            let pick = vms.remove(best).0;
+            DefaultVm::Recent(pick, vms.into_iter().map(|v| v.0).collect())
+        }
+    }
+}
+
+/// The VM `conduit view` without a NAME opens, saying which when there is a choice.
+pub fn default_vm() -> Result<String> {
+    let vms = all_names()
+        .into_iter()
+        .map(|n| {
+            let t = last_used(&n);
+            (n, t)
+        })
+        .collect();
+    match pick_default(vms) {
+        DefaultVm::None => Err(oops("no VMs yet", "Create one with `conduit create myvm`")),
+        DefaultVm::Only(n) => Ok(n),
+        DefaultVm::Recent(n, others) => {
+            eprintln!(
+                "Opening {n}, the most recently used VM (others: {}). \
+                 Pick another with `conduit view NAME`.",
+                others.join(", ")
+            );
+            Ok(n)
+        }
+    }
+}
+
 pub fn logs_dir(name: &str) -> PathBuf {
     paths::vm_dir(name).join("logs")
 }

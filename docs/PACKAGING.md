@@ -108,7 +108,8 @@ path; `CONDUIT_BACKEND`, `CONDUIT_QEMU`, ... override single tools). libvirt
 VMs of the system libvirt get their sockets under `/run/conduit/<vm>/`; user
 sessions use `$XDG_RUNTIME_DIR/conduit/<vm>/`. The AppArmor rules allow exactly
 these. The generic desktop entry runs `conduit view` with no argument, which
-the CLI does not accept yet (it needs a VM name); the per-VM entries
+opens the only VM, or the most recently used one (`conduit view`/`up` touch
+`~/.local/share/conduit/vms/NAME/last-used`); the per-VM entries
 (`~/.local/share/applications/conduit-NAME.desktop`) name their VM.
 
 **Rust toolchain.** `rust-toolchain.toml` at the repo root pins 1.90.0 with
