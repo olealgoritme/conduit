@@ -2393,8 +2393,10 @@ static void bg_layout(struct nb_wl *w, int dw, int dh)
      * the old below-the-parent bar surface is never mapped -- it hung OUTSIDE
      * the main surface, which is exactly what Hyprland cannot render. */
     want = false;
+    /* No legacy bar surface: nothing to map, but the picture's offset above
+     * still applies -- zeroing it here pinned letterboxed frames to the
+     * top-left of the window. */
     if (!w->bg_surf || !w->bg_vp) {
-        w->off_x = w->off_y = 0;
         return;
     }
     if (!want) {
