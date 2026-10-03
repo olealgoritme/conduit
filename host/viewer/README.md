@@ -37,6 +37,9 @@ host/viewer/test-standalone.sh 5 240 2560x1440    # no VM: GPU test pattern at 2
 `--direct-mode`, `--tearing`, `--stats`, ...). Only the invoking user and root
 may connect (SO_PEERCRED; see `--allow-user`).
 
+The window's app id (Wayland) and class (X11) are `conduit-viewer`, for
+compositor window rules.
+
 ## Keys
 
 | | |

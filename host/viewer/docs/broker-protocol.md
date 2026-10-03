@@ -2,16 +2,17 @@
 
 > Origin: nvkvm-pv's `docs/reference/broker-protocol.md` (see `../NOTICE`),
 > kept as the reference for the socket between `conduit-backend` /
-> `conduit-stream` and `conduit-viewer`. Paths below are upstream's; in
-> Conduit the header is `host/viewer/common/nvkvm_broker_proto.h`.
+> `conduit-stream` and `conduit-viewer`. The definition is
+> `host/viewer/common/nvkvm_broker_proto.h`; where this page and the header
+> disagree, the header wins.
 
 Reference for anyone implementing or auditing either side of the broker
 socket.  Both structures are fixed-size and byte-exact; a mismatch is a
 protocol violation and ends the connection rather than being negotiated.
 
-## 4. Wire protocol
+## Wire protocol
 
-Defined once, in `src/common/nvkvm_broker_proto.h`, and included verbatim by
+Defined once, in `common/nvkvm_broker_proto.h`, and included verbatim by
 both sides. Little-endian, fixed-size records, no length fields, version 2.
 
 **The wire format is identical on Wayland and X11.** The VMM cannot tell which
@@ -22,7 +23,7 @@ contain a bug conditional on it.
 
 | offset | field | notes |
 |---|---|---|
-| 0 | `uint16 type` | `ATTACH` 1, `COMMIT` 2, `WINDOW` 3 |
+| 0 | `uint16 type` | `ATTACH` 1, `COMMIT` 2, `WINDOW` 3, `CLIPBOARD` 4, `CAPS` 5, `QUERY_FORMAT` 6, `CURSOR` 7 |
 | 2 | `uint16 reserved0` | must be 0 |
 | 4 | `uint32 width` | |
 | 8 | `uint32 height` | |
@@ -34,7 +35,7 @@ contain a bug conditional on it.
 | 36 | `uint32 reserved1` | must be 0 |
 
 - **`ATTACH`** carries exactly one fd as `SCM_RIGHTS`, which must be a dma-buf.
-  The descriptor fields describe it. The broker validates (§3), imports, and
+  The descriptor fields describe it. The broker validates it, imports, and
   closes its copy; the buffer stays alive through the `wl_buffer`/pixmap.
 - **`COMMIT`** presents the most recently attached buffer. No fd, and every
   descriptor field must be zero. Split from `ATTACH` because a compositor
@@ -43,9 +44,15 @@ contain a bug conditional on it.
 - **`WINDOW`** asks for a window of `width`×`height` on guest resolution
   change. It is a request: the window manager may ignore it, and the size that
   actually took effect comes back as `EV_SURFACE`.
+- **`CLIPBOARD`** is one chunk of guest clipboard text (no fd), accepted only
+  when the clipboard mode allows guest → host and the window is focused.
+- **`CAPS`** is sent once after connecting; `width` carries the client's
+  `CLIENT_*` bits, every other field is zero.
+- **`QUERY_FORMAT`** asks whether the display can show a (`fourcc`,
+  `modifier`); the answer is `EV_FORMAT`.
 
-Single-plane only, on purpose: the nvkvm guest head advertises XRGB8888 and
-ARGB8888 (`src/guest/nvkvm_kms.c`), both single-plane, so multi-plane support
+Single-plane only, on purpose: the guest's KMS plane advertises single-plane
+formats only, so multi-plane support
 would be untested code on the privileged side. A multi-plane format is
 rejected as an unadvertised fourcc.
 
@@ -68,6 +75,9 @@ rejected as an unadvertised fourcc.
 | `FOCUS` 11 | `x` = 1 active / 0 inactive. While 0 no input at all is sent. |
 | `POINTER` 12 | `x` = 1 pointer over the window |
 | `BYE` 13 | `x` = reason (0 shutdown, 1 display lost, 2 protocol) |
+| `CLOSE` 14 | the user closed the window; the client decides what that means |
+| `CLIPBOARD` 15 | one chunk of host clipboard text for the guest |
+| `FORMAT` 16 | answer to `QUERY_FORMAT`: `x` = 1 can show it, `y` = fourcc, `w0`,`w1` = modifier |
 
 `flags` mirrors grab and focus state on **every** packet, so the client can
 never disagree with the broker about it whatever it did with the `GRAB` event.
@@ -83,6 +93,8 @@ Capability bits in `HELLO.w1`: `KEYBOARD`, `ABS_POINTER`, `REL_POINTER`,
 | `CAP_MODE_HINTS` (bit 10) | the broker sends `EV_MODE_HINT` = 17: x,y = the mode the guest should be in, in buffer pixels (0,0 = the client's configured mode), w0 = refresh mHz (0 = configured), w1 = reason (0 restore, 1 fullscreen, 2 window, 3 fixed). On change and at attach; windowed `--resize=guest` hints are debounced 150 ms. A client seeing the bit ignores `EV_SURFACE` for mode decisions. |
 | `CAP_CURSOR` (bit 11) | the broker takes `CMD_CURSOR` = 7: with one dma-buf fd, the guest cursor image (ATTACH's fields; ≤256x256, ARGB8888 only — no opaque-twin substitution — and `seq` = hot_x \| hot_y << 16, inside the image), validated like ATTACH and dropped (not disconnected) when bad; without an fd, hide (all fields 0). Shown as the host pointer's cursor over the guest, hidden under grab. Never send it to a broker without the bit. |
 | `CMD_CAPS` width bit 1 `CLIENT_SEQ_USEC` | ATTACH/COMMIT `seq` is the client's CLOCK_MONOTONIC µs at the flip; the broker then measures flip → screen. |
+| `CAP_CLIP_LARGE` (bit 12) + `CMD_CAPS` width bit 2 `CLIENT_CLIP_LARGE` | clipboard transfers up to 1 MiB, both directions (otherwise 7 KiB). |
+| `CAP_GAMEPAD` (bit 13) + `CMD_CAPS` width bit 3 `CLIENT_GAMEPAD` | the broker may send `EV_PAD` = 18 (x = evdev code, y = value, w0 = pad << 16 \| evdev type); conduit-stream does, the viewer does not. |
 | `CAP_IDLE` (bit 14) | the broker starts idle and sends `EV_ACTIVE` = 19 (x = 1 frames please, 0 stop) when it wants frames. A client with several brokers treats it as a session broker: while active, its mode hints take precedence. The viewer does not set it; conduit-stream does. |
 | `CMD_CAPS` width bit 4 `CLIENT_IDLE` | the client honours `EV_ACTIVE` and arbitrates the guest mode between brokers (docs/SCANOUT.md, "Several display clients"). |
 
@@ -101,22 +113,17 @@ was slow — so both sides are non-blocking by construction:
 - Reads from the client and writes to the display server are both
   `MSG_DONTWAIT` / non-blocking; a compositor socket that will not take a write
   gets `POLLOUT` on the next `poll()` rather than a blocking flush.
-- On the QEMU side PRESENT currently runs inline in the BQL-held virtqueue
-  callback.  The relay socket is main-loop/BQL-owned and every send uses
-  `MSG_DONTWAIT`; if the socket is full the frame is **dropped and counted**.
-  The newest dma-buf remains retained for reconnect, while older frames are
-  replaced.  A future worker offload must marshal submission back to the main
-  loop rather than creating a second socket owner.
+- On the client side, `conduit-backend` gives every broker its own
+  non-blocking socket: if one is full that broker misses the frame (latest
+  frame wins) and the newest one is re-sent when the socket drains; the guest
+  is never delayed (docs/SCANOUT.md, "Several display clients").
 
 One honest exception, stated rather than hidden: the **X11 backend's import**
 uses `xcb_request_check()`, which is a blocking round trip to the X server. It
 runs once per *new* buffer — three or four times for the whole life of a VM,
-because the 8-slot cache catches every repeat — not once per frame. It is there
+because the import cache catches every repeat — not once per frame. It is there
 because an unchecked DRI3 error arrives later as an event with nothing to
 attribute it to, and the pixmap id silently refers to nothing: the choice is
 between a sub-millisecond stall a handful of times and a black window with no
 explanation. Wayland has no equivalent: `create_immed` reports failure without
 a round trip, which is why it is used in preference to `create`.
-
----
-

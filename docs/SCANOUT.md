@@ -32,6 +32,7 @@ All little-endian, `#[repr(C)]`, after the common message header. Display
 | 24 | `CursorUpdate` | guest → host | control, fire-and-forget like `ScanoutFlip` (reply: header only) |
 | 25 | `ClipboardFromHost` | host → guest | event (see docs/CLIPBOARD.md) |
 | 26 | `ClipboardToHost` | guest → host | control (reply: header only, status) |
+| 27 | `ClipboardRequest` | guest → host | control, no payload: resend the host clipboard (reply: header only, status) |
 
 ```c
 struct scanout_flip {          /* 64 bytes */
@@ -164,6 +165,9 @@ types, no version bump; record sizes unchanged:
 | `CAP_CURSOR` (HELLO w1 bit 11) | broker → backend | the broker takes `CMD_CURSOR` |
 | `CMD_CURSOR` = 7 | backend → broker | with a dma-buf fd: the cursor image (ATTACH's fields, ≤256², AR24, `seq` = hot_x \| hot_y<<16); without: hide, all fields 0 |
 | `CMD_CAPS` width bit `CLIENT_SEQ_USEC` (1<<1) | backend → broker | ATTACH/COMMIT `seq` is the backend's CLOCK_MONOTONIC µs at the flip (lets the viewer measure flip → screen) |
+| `CAP_CLIP_LARGE` (HELLO w1 bit 12) / `CMD_CAPS` width bit `CLIENT_CLIP_LARGE` (1<<2) | both | clipboard transfers up to 1 MiB in chunks (docs/CLIPBOARD.md) |
+| `CAP_GAMEPAD` (HELLO w1 bit 13) | broker → backend | the broker may send `EV_PAD` (a stream host) |
+| `EV_PAD` = 18 | broker → backend | one gamepad event: x = evdev code, y = value, w0 = pad << 16 \| evdev type; only to a client that declared `CLIENT_GAMEPAD` (1<<3) |
 | `CAP_IDLE` (HELLO w1 bit 14) | broker → backend | the broker starts idle: no frames, no cursor until it sends `EV_ACTIVE`; it is a session client for the mode policy |
 | `EV_ACTIVE` = 19 | broker → backend | x = 1 send frames from now on, 0 stop (only from a `CAP_IDLE` broker) |
 | `CMD_CAPS` width bit `CLIENT_IDLE` (1<<4) | backend → broker | the backend honours `EV_ACTIVE` and arbitrates the mode between clients, so a session that ends goes idle instead of asking for a restore |
@@ -232,8 +236,9 @@ asks for the configured mode at session end instead, as before.
 
 ## Viewer (host/viewer, Wayland backend)
 
-- Default windowed behaviour: the whole guest picture fitted with aspect. The
-  main surface always covers the whole window (exact fit: it carries the guest
+- Whenever the guest's mode and the window differ (while the guest is
+  switching, or with `--resize=scale`), the whole guest picture is fitted with
+  aspect. The main surface always covers the whole window (exact fit: it carries the guest
   buffer; letterbox: it is a black backdrop and the guest buffer sits on a
   subsurface). Hyprland crops a main surface by the window geometry, so a
   picture surface smaller than the window would show smeared edge columns and

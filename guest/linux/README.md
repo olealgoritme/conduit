@@ -14,7 +14,8 @@ It also provides:
 - a KMS display (virtual CRTC, plane, connector) whose flips go to
   `conduit-viewer` / `conduit-stream` as dma-bufs (`nvgpu_kms.h`,
   `docs/SCANOUT.md`),
-- keyboard, mouse and power-key input from the viewer,
+- keyboard and mouse input from the viewer, and gamepads from the stream
+  host (`nvgpu_pad.h`),
 - `/dev/conduit-clipboard` for `guest/agent/conduit-clipboard-agent`
   (`docs/CLIPBOARD.md`).
 
@@ -38,6 +39,10 @@ The package also installs:
 - `/etc/sysctl.d/60-conduit-userns.conf`, which lifts Ubuntu's AppArmor
   restriction on unprivileged user namespaces (Steam's pressure-vessel,
   Flatpak and browser sandboxes need them),
+- `/usr/lib/systemd/logind.conf.d/50-conduit-powerkey.conf` (from
+  `guest/power/`), so the VM's power button shuts it down even with a desktop
+  session open,
+- the clipboard agent (`guest/agent/README.md`),
 
 and its post-install sets `en_US.UTF-8` as the default locale when the VM has
 no UTF-8 locale other than `C.UTF-8` (Steam's 32-bit client crashes in libc

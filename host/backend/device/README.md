@@ -17,11 +17,14 @@ it refuses to run as root. See `docs/ARCHITECTURE.md` and `docs/SECURITY.md`.
 |---|---|
 | `bin/conduit-backend.rs` | `conduit-backend`: the vhost-user transport and options |
 | `bin/conduit-userspace.rs` | `conduit-userspace`: stages the host's NVIDIA userspace for the guest's read-only share |
+| `bin/conduit-sandbox-selftest.rs` | `conduit-sandbox-selftest`: enters the backend's sandbox and checks what it refuses (run by `tests/sandbox.rs`; also tells whether a host kernel can carry the sandbox) |
 | `src/nvidia/` | per-VM state, ioctl/RM/UVM forwarding and refusals, memory placement |
 | `src/display.rs` | scanout, cursor, input, clipboard and mode hints to the viewer |
 | `src/caps.rs` | `--caps`: which device nodes and RM classes a guest is served |
 | `src/vram.rs`, `src/nvidia/vidmem.rs` | `--vram-limit-mib` |
 | `src/sandbox.rs`, `src/posture.rs` | seccomp, Landlock, privilege drop |
+| `src/trace.rs` | request tracing: `--trace`, `--trace-socket` (docs/TRACING.md) |
+| `src/shm_regions.rs` | the window and UVM aperture regions |
 
 ## Build and test
 

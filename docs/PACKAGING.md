@@ -10,14 +10,15 @@ layout, so a layout change is made in one place.
 |---|---|
 | `/opt/conduit/bin/conduit` | the CLI |
 | `/opt/conduit/bin/conduit-backend` | GPU backend (static musl in release builds) |
-| `/opt/conduit/bin/conduit-userspace` | userspace backend tool (`conduit-userspace`, same crate) |
+| `/opt/conduit/bin/conduit-userspace` | stages the host's NVIDIA user-space files for the guest (same crate as the backend) |
 | `/opt/conduit/bin/conduit-viewer` | Wayland/X11 viewer |
 | `/opt/conduit/bin/conduit-vmm` | built-in VM runner (static musl in release builds) |
+| `/opt/conduit/bin/conduit-stream` | stream host for Moonlight and `conduit remote` |
 | `/opt/conduit/bin/qemu-system-x86_64`, `share/qemu/` | bundled QEMU 11.1 |
 | `/opt/conduit/share/conduit/supported-drivers.txt` | driver releases with backend ABI tables (`conduit doctor`) |
 | `/opt/conduit/share/conduit/guest/conduit-guest.deb` | the guest driver package `conduit create` and `conduit stock-kernel` install into VMs (built at stage time with nfpm) |
 | `/opt/conduit/libexec/conduit-integrate` | AppArmor/SELinux/desktop hookup (`enable`/`disable`) |
-| `/opt/conduit/lib/` | tarball only: the viewer's and QEMU's shared libraries |
+| `/opt/conduit/lib/` | tarball only: the viewer's, stream host's and QEMU's shared libraries |
 | `/opt/conduit/share/doc/conduit/` | LICENSE and every component's LICENSE/NOTICE |
 | `/usr/bin/conduit` (packages), `/usr/local/bin/conduit` (tarball) | symlink to the CLI |
 | `/usr/share/applications/conduit.desktop` (`/usr/local/share/...` for the tarball) | desktop entry |
@@ -35,7 +36,7 @@ setup script every package format runs after install; see
 
 ```
 packaging/
-├── build.sh                   the build: deps, rust, viewer, qemu, stage, bundle-libs, guest-src, package
+├── build.sh                   the build: deps, rust, viewer, stream, qemu, stage, bundle-libs, guest-src, package
 ├── nfpm/conduit.yaml          host package: one template -> .deb, .rpm, Arch .pkg.tar.zst
 ├── nfpm/conduit-guest.yaml    guest DKMS package: .deb, .rpm
 ├── deb/conduit/               postinst, prerm (used by nfpm for all three formats)
@@ -44,7 +45,8 @@ packaging/
 ├── rpm/conduit.spec           source RPM build (COPR/OBS)
 ├── rpm/conduit-guest.spec     source RPM for the guest (DKMS, noarch)
 ├── arch/PKGBUILD              split package: conduit + conduit-guest-dkms (AUR)
-├── arch/conduit.install
+├── arch/conduit.install, arch/conduit-guest.install
+├── release.sh                 version bump + tag (make release / release-minor / release-major)
 ├── tarball/install.sh         -> /opt/conduit, /usr/local/bin/conduit
 ├── tarball/uninstall.sh       also installed as /opt/conduit/uninstall.sh
 └── common/                    desktop entry, AppArmor abstraction, conduit-integrate
@@ -56,6 +58,7 @@ packaging/
 sudo packaging/build.sh deps          # apt, dnf or pacman
 packaging/build.sh rust               # static musl; RUST_TARGET=host for a glibc build
 packaging/build.sh viewer
+packaging/build.sh stream
 packaging/build.sh qemu               # slow; BUNDLE_QEMU=0 to skip
 packaging/build.sh stage
 packaging/build.sh package deb        # or rpm, archlinux (needs nfpm)
@@ -83,9 +86,9 @@ alike). That is why each format is built in its own distribution's container.
 These are assumptions the packaging makes. Change them here and in
 `build.sh` together.
 
-**Binary names.** `build.sh` (top) and `flake.nix` hold the cargo/make output names
-as variables: `BACKEND_BIN_SRC=conduit-backend` (cargo package `device`,
-feature `vhost-user`), `VIEWER_BIN_SRC=conduit-viewer`,
+**Binary names.** `build.sh` (top) holds the cargo/make output names
+as variables (`flake.nix` has its own copies): `BACKEND_BIN_SRC=conduit-backend` (cargo package `device`,
+feature `vhost-user`), `USERSPACE_BIN_SRC=conduit-userspace`, `VIEWER_BIN_SRC=conduit-viewer`,
 `VMM_BIN_SRC=conduit-vmm` (built with `--no-default-features`),
 `CLI_BIN_SRC=conduit`. When a component is renamed, change the variable;
 installed names (`conduit-*`) stay.
@@ -102,10 +105,11 @@ expression.
 **CLI.** `cli/src/paths.rs` finds its helpers as `$CONDUIT_PREFIX/bin/<name>`
 (`CONDUIT_PREFIX` defaults to `/opt/conduit`; the flake sets it to its store
 path; `CONDUIT_BACKEND`, `CONDUIT_QEMU`, ... override single tools). libvirt
-VMs get their backend socket under `/run/conduit/libvirt/<vm>/`; user
-sessions use `$XDG_RUNTIME_DIR/conduit/`. The AppArmor rules allow exactly
-these. The desktop entry runs `conduit view` with no argument, which should
-open the default (or only) VM.
+VMs of the system libvirt get their sockets under `/run/conduit/<vm>/`; user
+sessions use `$XDG_RUNTIME_DIR/conduit/<vm>/`. The AppArmor rules allow exactly
+these. The generic desktop entry runs `conduit view` with no argument, which
+the CLI does not accept yet (it needs a VM name); the per-VM entries
+(`~/.local/share/applications/conduit-NAME.desktop`) name their VM.
 
 **Rust toolchain.** `rust-toolchain.toml` at the repo root pins 1.90.0 with
 the gnu and musl targets for all Rust projects. Don't add a
@@ -190,7 +194,8 @@ and the QEMU tarball.
 
 `flake.nix` exposes `packages.default` (a prefix mirroring `/opt/conduit`,
 with `conduit` wrapped to `CONDUIT_PREFIX=$out`), `apps.default`, the
-individual components, `packages.conduit-guest` (module for
+individual components (not `conduit-stream` yet, so `conduit stream` does not
+work from the flake), `packages.conduit-guest` (module for
 `linuxPackages_latest`) and `nixosModules.guest`. It uses nixpkgs' Rust and
 QEMU expression (switched to the 11.1.2 tarball when nixpkgs is older, plus
 `host/qemu/patches/`). Commit `flake.lock` after the first `nix flake lock`.
@@ -199,7 +204,7 @@ QEMU expression (switched to the 11.1.2 tarball when nixpkgs is older, plus
 
 | Workflow | When | What |
 |---|---|---|
-| `ci.yml` | push, PR | fmt/clippy/test per Rust project (GPU tests skipped by name), guest module vs Ubuntu 24.04 and Fedora headers, viewer `make check`, actionlint, shellcheck, DKMS package build |
+| `ci.yml` | push, PR | fmt/clippy/test per Rust project (backend, VMM, CLI, stream host; GPU tests skipped by name), guest module vs Ubuntu 24.04 and Fedora headers, viewer `make check`, guest agent unit tests, actionlint, shellcheck, DKMS package build |
 | `abi.yml` | Mondays, manual | new open-gpu-kernel-modules tags / gVisor nvproxy ABIs -> `.github/scripts/abi_update.py` runs the `host/backend/gen` generators -> tests -> PR on `abi/auto` (draft if tests fail). Set secret `ABI_BOT_TOKEN` so CI runs on its PRs. |
 | `release.yml` | tag `v*`, manual | static musl Rust binaries once; deb/rpm/Arch/tarball in their own containers with QEMU cached per week; guest .deb/.rpm; checksums, PKGBUILD, GitHub Release (tags only) |
 

@@ -41,10 +41,12 @@ host/stream/                     conduit-stream (Rust, Apache-2.0)
                                  takes ATTACH/COMMIT/CURSOR (dma-bufs), sends input + mode hints
   csrc/gpu.c                     EGL (device platform, no window) + GL + CUDA + NVENC/NVDEC
   src/gamestream/nvhttp.rs       HTTP 47989 / HTTPS 47984: serverinfo, PIN pairing, applist, launch
+  src/gamestream/pairing.rs      the GameStream PIN pairing exchange
   src/gamestream/rtsp.rs         RTSP 48010 (TCP): DESCRIBE/SETUP/ANNOUNCE/PLAY, AES-GCM optional
   src/gamestream/control.rs      ENet 47999: encrypted control (AES-GCM), IDR/RFI requests, input
   src/gamestream/video.rs        RTP video 47998: shards, Reed-Solomon FEC, optional AES-GCM
   src/gamestream/input.rs        Moonlight input → Linux evdev (Windows VK → KEY_*, pads)
+  src/gamestream/audio.rs        UDP 48000: RTP + FEC audio packetizer (no source yet)
   src/link.rs                    Conduit's own link (TLS over TCP) for the conduit viewer
   csrc/third_party/              enet (Moonlight fork), nanors, nv-codec-headers
 ```
@@ -83,7 +85,9 @@ fps, bitrate, codec) wins.
 | `top` | AV1 | 240 | 200 Mbit/s | native resolution (e.g. 5120x1440) |
 | `balanced` | HEVC | 120 | 80 Mbit/s | |
 | `compat` | H.264 | 60 | 30 Mbit/s | ≤ 4096 wide (H.264 limit) |
-| `lossless` (conduit link only) | HEVC 4:4:4 lossless, GBR | 240 | whatever it takes (10 GbE) | bit-exact pixels |
+
+`conduit remote --lossless` (Conduit link only, not a preset) encodes HEVC
+4:4:4 lossless as G/B/R planes: bit-exact pixels at whatever bitrate that takes.
 
 Moonlight settings for `top`: resolution "Native", 240 FPS, video codec AV1,
 bitrate 200 Mbps.
@@ -156,8 +160,9 @@ to it. Only paired clients can reach anything but `/serverinfo` and `/pair`.
 
 ```bash
 conduit stream myvm                  # start the VM if needed + stream it (top preset)
-conduit stream myvm --service        # same, as a systemd user service that keeps it running
-conduit stream myvm --stop           # stop streaming (the VM keeps running)
+conduit stream myvm --service        # same, as the user service conduit-stream-myvm.service
+conduit stream myvm --stop           # stop that service (the VM keeps running)
+conduit stream status                # running stream hosts and their sessions
 ```
 
 Add the host in Moonlight by IP, pair, start "myvm". One stream host per VM;
@@ -180,6 +185,7 @@ restarting it enables both.
 ```bash
 # on the host
 conduit stream myvm --link              # also accept conduit viewers (TCP 48100, TLS)
+                                        # --link-mbps 10000 on 10 GbE (default 1000)
 conduit stream token                    # prints the link token for clients
 # on the other machine
 conduit remote HOST --token TOKEN [--lossless] [--codec av1|hevc|h264] [--bitrate 300M]

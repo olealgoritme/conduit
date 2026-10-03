@@ -42,7 +42,7 @@ module.
 `ioctl()` and `mmap()` without interpreting RM calls, swaps guest file
 descriptors for backend handles, pins memory a process registers by address,
 and maps what the backend placed. It also provides a KMS display, input
-devices, a power key and `/dev/conduit-clipboard`. It is packaged with DKMS
+devices (keyboard, mouse, gamepads) and `/dev/conduit-clipboard`. It is packaged with DKMS
 (`conduit-guest`).
 
 ## Backend
@@ -101,14 +101,8 @@ supported: the GPU state lives in the host driver. Details:
 
 - NVIDIA only, Linux guests only (Windows: [ROADMAP.md](ROADMAP.md)).
 - Not hardware isolation; the host NVIDIA driver is trusted.
-- The window size is fixed when the VM starts.
+- The shared-memory window (1 GiB) is sized when the VM starts and cannot grow.
 - No HMM / pageable memory access, MIG or SR-IOV.
 - `--vram-limit-mib` does not count memory RM allocates internally.
 
-## Prior art
-
-gVisor's `nvproxy` showed that forwarding NVIDIA's kernel ABI works; its
-versioned tables are the model for `gen/`. The device and backend started from
-[virtio-nvgpu](https://github.com/nestrilabs/virtio-nvgpu), the built-in runner
-from [nesbox](https://github.com/nestrilabs/nesbox), and the viewer from the
-display broker of [nvkvm-pv](https://github.com/reindertpelsma/nvkvm-pv).
+The full list: [KNOWN-ISSUES.md](KNOWN-ISSUES.md).

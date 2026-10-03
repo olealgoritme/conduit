@@ -36,7 +36,7 @@ from GPU memory to your screen: no copying, no video compression.
 |---|---|
 | Host | Linux, x86-64, with KVM (`ls /dev/kvm` works) |
 | GPU | NVIDIA, Turing (RTX 20xx) or newer |
-| Host driver | NVIDIA **open** kernel modules, 580 or newer |
+| Host driver | NVIDIA **open** kernel modules, 580 or newer, a release Conduit has ABI tables for (580.178.04, 595.71.05, 595.104.02, 610.57.04, 615.71.09) |
 | Desktop | Any Wayland desktop (GNOME, KDE, Hyprland, Sway, …) |
 | VM | Linux (Ubuntu 24.04 recommended) |
 
@@ -104,7 +104,7 @@ git clone https://github.com/olealgoritme/conduit && cd conduit
 make deps      # build dependencies (asks for sudo)
 make           # backend, VM runner, CLI, viewer, guest module, bundled QEMU
 make test      # offline tests
-make install   # installs to /opt/conduit
+make install   # installs to /opt/conduit (+ /usr/local/bin/conduit)
 ```
 
 Maintainers: `make release` tags the next version (`release-minor`, `release-major`,
@@ -130,7 +130,7 @@ Conduit is the server.
 2. In Moonlight: click **+**, type this computer's IP (or `localhost` on the
    same machine). Moonlight shows a **PIN**.
 3. On this computer: `conduit stream pair 1234` (the PIN you see).
-4. In Moonlight: click the computer, then **Desktop**.
+4. In Moonlight: click the computer, then the app named after your VM (**myvm**).
 
 **Settings** (resolution, **FPS** up to 240, **bitrate**, **codec** AV1/HEVC/H.264):
 the **gear icon ⚙** on Moonlight's start screen, before you start the stream.
@@ -218,7 +218,7 @@ isolation like a dedicated GPU: only run VMs you trust. See
 | Overlay says `COMPOSITED` in fullscreen | Your desktop composites the window; see [direct scanout](docs/SCANOUT.md). On Hyprland: `conduit view myvm --tune-hyprland`, then `Ctrl+Alt+F`, `Ctrl+Alt+D` |
 | Stream: "ports are in use" | Another `conduit stream` or Sunshine is running; stop it, or use `--port 48089` |
 | Moonlight: Windows/Super key does nothing | Moonlight settings → *Capture system keyboard shortcuts* → **Always** |
-| Steam window errors | Steam is an X11 app (runs through XWayland); see [docs/CLIPBOARD.md](docs/CLIPBOARD.md) for the session setup and open an issue with `conduit logs myvm` |
+| Steam window errors | Steam is an X11 app and needs XWayland in the VM's session; open an issue with `conduit logs myvm` |
 | An app fails or is slow on the GPU inside the VM | `conduit trace myvm --follow --filter errors`, or `conduit trace myvm --summary` for latency; see [docs/TRACING.md](docs/TRACING.md) |
 | Anything else | `conduit doctor myvm` and `conduit logs myvm` |
 

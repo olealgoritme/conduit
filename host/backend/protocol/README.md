@@ -12,7 +12,7 @@ share one set of definitions.
 `guest/linux/conduit_gpu.c`. Nothing checks the two against each other
 automatically: change both in the same commit.
 
-Shared-memory regions (ids defined in `device/bin/conduit-backend.rs` and
+Shared-memory regions (ids defined in `device/src/shm_regions.rs` and
 the guest module): 1 = window (GPU mappings, DRM objects), 2 = UVM aperture
 (CUDA semaphore pools, managed memory).
 

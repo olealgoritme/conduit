@@ -92,12 +92,13 @@ Why each nvgpu-related argument is there:
   the backend for them with `GET_SHMEM_CONFIG`. The backend answers shmid 1
   (window, 1 GiB) and shmid 2 (UVM aperture, 32 GiB).
 - `-cpu host,host-phys-bits=on` matters because the shared-memory BAR is
-  2 GiB and 64-bit. The firmware places it above 4 GiB, which needs real
+  64 GiB and 64-bit. The firmware places it above 4 GiB, which needs real
   physical-address width.
 
-Networking is the same as with `conduit-vmm`. `conduit up` creates the `conduit0`
-tap, owned by you, with the host at 172.30.0.1. The guest configures itself
-statically to 172.30.0.2 on any `e*` interface, which includes QEMU's
+Networking is the same as with `conduit-vmm`. `conduit up` creates the VM's
+`conduitN` tap (N is the VM's network number; `conduit0` in the example),
+owned by you, with the host at 172.30.N.1. The guest configures itself
+statically to 172.30.N.2 on any `e*` interface, which includes QEMU's
 virtio-net `enp0s*`. For a VM without the tap, use
 `-netdev user,id=net0,hostfwd=tcp::2222-:22` and set the guest address
 another way.
