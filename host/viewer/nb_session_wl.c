@@ -704,7 +704,7 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
             snprintf(sp, sizeof(sp), " send->present %.0fus",
                      (double)w->st_sp_sum / w->st_sp_n);
         }
-        nb_log("stats: commit %.1f fps, presented %.1f fps (%u zero-copy), "
+        nb_log("stats: commit %.1f fps, presented %.1f fps (%u direct scanout), "
                "superseded %u | recv->commit avg %.0fus max %.0fus |%s "
                "commit->present avg %.0fus max %.0fus |%s",
                w->st_commits / secs, w->st_presented / secs, w->st_zc,
