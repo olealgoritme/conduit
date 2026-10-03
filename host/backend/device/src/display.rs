@@ -1587,11 +1587,11 @@ fn send_records(sock: RawFd, bytes: &[u8], fd: Option<RawFd>) -> io::Result<()> 
             let space = libc::CMSG_SPACE(size_of::<RawFd>() as u32) as usize;
             debug_assert!(space <= std::mem::size_of_val(&cbuf));
             msg.msg_control = cbuf.as_mut_ptr().cast();
-            msg.msg_controllen = space;
+            msg.msg_controllen = space as _;
             let c = libc::CMSG_FIRSTHDR(&msg);
             (*c).cmsg_level = libc::SOL_SOCKET;
             (*c).cmsg_type = libc::SCM_RIGHTS;
-            (*c).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as usize;
+            (*c).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
             std::ptr::write_unaligned(libc::CMSG_DATA(c) as *mut RawFd, fd);
         }
     }

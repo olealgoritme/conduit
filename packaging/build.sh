@@ -150,9 +150,12 @@ cmd_rust() {
     install -m0755 "$t/$USERSPACE_BIN_SRC" "$bin/conduit-userspace"
 
     log "vmm ($VMM_BIN_SRC -> conduit-vmm)"
+    # The built-in VM runner (the fallback; QEMU is the default) uses glibc-only
+    # calls (statx, STATX_DIOALIGN), so it is always built for the host's glibc
+    # target, never musl. Distros' glibc is older-compatible enough for it.
     (cd "$ROOT/host/vmm" && cargo build --locked --release --no-default-features \
-        "${CARGO_TARGET_ARGS[@]}" --bin "$VMM_BIN_SRC")
-    t=$(target_dir "$ROOT/host/vmm")/$TARGET_DIR_SUFFIX
+        --bin "$VMM_BIN_SRC")
+    t=$(target_dir "$ROOT/host/vmm")/release
     install -m0755 "$t/$VMM_BIN_SRC" "$bin/conduit-vmm"
 
     log "cli ($CLI_BIN_SRC -> conduit)"
@@ -162,6 +165,7 @@ cmd_rust() {
 
     if [ "$RUST_TARGET" != host ]; then
         for f in "$bin"/*; do
+            [ "$(basename "$f")" = conduit-vmm ] && continue   # glibc on purpose, see above
             file "$f" | grep -qE 'statically linked|static-pie linked' \
                 || die "$f is not static"
         done
