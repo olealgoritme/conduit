@@ -3,6 +3,33 @@
 use super::*;
 
 impl NvidiaBackend {
+    /// Take a mapping out of the window and give its extent back.
+    ///
+    /// Withdrawn first, freed second: the allocator hands a freed extent to
+    /// the next mapping, and a frontend that still has the old one there
+    /// (QEMU keeps every placement until it is told otherwise) refuses the
+    /// new one as an overlap -- or, on a frontend that maps over it, the guest
+    /// keeps reaching the old memory until something replaces it. Every path
+    /// that frees a placed extent goes through here.
+    pub(super) fn release_window_region(&mut self, region: &crate::shm::ShmRegion, why: &str) {
+        if let Some(window) = self.window.as_ref()
+            && let Err(e) = window.withdraw(region.offset, region.length)
+        {
+            log::warn!(
+                "{why}: the window would not give back {:#x}+{:#x}: {e}",
+                region.offset,
+                region.length
+            );
+        }
+        if let Err(e) = self.shm.free(region) {
+            log::warn!(
+                "{why}: SHM free of {:#x}+{:#x} failed: {e}",
+                region.offset,
+                region.length
+            );
+        }
+    }
+
     // ------------------------------------------------------------------
     // MMAP / MUNMAP
     // ------------------------------------------------------------------

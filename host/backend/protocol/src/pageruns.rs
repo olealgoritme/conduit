@@ -20,6 +20,14 @@
 //!
 //! A guest that does not know about this sends no deep block at all and its
 //! registration is refused, as it was before.
+//!
+//! A large buffer can scatter into more runs than one message should carry: a
+//! guest's 4 KiB pages are rarely contiguous for long, and 1 GiB of them is
+//! tens of thousands of runs. Then the table itself is left in guest memory
+//! and the deep block, marked [`PAGE_RUNS_INDIRECT`], is a table of the runs
+//! *that table* occupies, in the same format. The backend copies the big table
+//! out of guest memory before it reads a word of it, so a guest that rewrites
+//! it mid-call changes nothing.
 
 /// `deep_ptr_offset` when the deep block is a table of page runs.
 ///
@@ -28,6 +36,10 @@
 /// anywhere near either value.
 pub const PAGE_RUNS: u32 = u32::MAX - 1;
 
+/// `deep_ptr_offset` when the deep block is a table of the page runs that hold
+/// the real table, which lies in guest memory. One less again.
+pub const PAGE_RUNS_INDIRECT: u32 = u32::MAX - 2;
+
 /// The most runs one registration may describe.
 ///
 /// A fully fragmented buffer costs one run per page, so this covers 4 MiB at
@@ -35,6 +47,12 @@ pub const PAGE_RUNS: u32 = u32::MAX - 1;
 /// bound; this one keeps a guest from building a message it will only have
 /// refused.
 pub const MAX_RUNS: usize = 1024;
+
+/// The most runs an indirect table may describe: as many as fit in the
+/// `MAX_RUNS` pages a fully scattered direct table can name, 4 MiB. A buffer
+/// that coalesces into runs of 16 KiB on average can be 4 GiB; one whose
+/// pages coalesce at all better than that, larger.
+pub const MAX_RUNS_INDIRECT: usize = (MAX_RUNS * 4096 - 8) / 16;
 
 /// One run: a guest-physical address and a length, both whole pages.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,11 +100,17 @@ impl<'a> Runs<'a> {
     /// rather than something to repair: there is no way to guess what was
     /// meant, and guessing here maps the wrong memory.
     pub fn parse(bytes: &'a [u8]) -> Option<Self> {
+        Self::parse_up_to(bytes, MAX_RUNS)
+    }
+
+    /// [`Runs::parse`], for a table read out of guest memory, which may hold
+    /// up to `max` runs.
+    pub fn parse_up_to(bytes: &'a [u8], max: usize) -> Option<Self> {
         if bytes.len() < 8 {
             return None;
         }
         let count = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
-        if count == 0 || count > MAX_RUNS || bytes.len() < encoded_len(count) {
+        if count == 0 || count > max || bytes.len() < encoded_len(count) {
             return None;
         }
         Some(Runs { bytes, count })
@@ -182,7 +206,31 @@ mod tests {
     #[test]
     fn the_sentinels_do_not_collide() {
         assert_ne!(PAGE_RUNS, crate::segments::SEGMENTED);
-        // And neither can be a real offset into a parameter block.
-        assert!(PAGE_RUNS > u16::MAX as u32);
+        assert_ne!(PAGE_RUNS_INDIRECT, crate::segments::SEGMENTED);
+        assert_ne!(PAGE_RUNS_INDIRECT, PAGE_RUNS);
+        // And none can be a real offset into a parameter block.
+        assert!(PAGE_RUNS_INDIRECT > u16::MAX as u32);
+    }
+
+    /// The largest indirect table fits in the pages a direct table can name
+    /// even when every one of them is scattered.
+    #[test]
+    fn an_indirect_table_fits_in_a_direct_one() {
+        assert!(encoded_len(MAX_RUNS_INDIRECT) <= MAX_RUNS * 4096);
+        assert!(encoded_len(MAX_RUNS_INDIRECT + 1) > MAX_RUNS * 4096);
+    }
+
+    #[test]
+    fn a_long_table_parses_only_with_the_larger_bound() {
+        const N1: usize = MAX_RUNS + 1;
+        static mut LONG: [u8; encoded_len(N1)] = [0; encoded_len(N1)];
+        // SAFETY: single-threaded test, and the buffer is only used here.
+        let buf = unsafe { &mut *core::ptr::addr_of_mut!(LONG) };
+        buf[0..4].copy_from_slice(&(N1 as u32).to_le_bytes());
+        assert!(Runs::parse(&buf[..]).is_none());
+        assert_eq!(
+            Runs::parse_up_to(&buf[..], MAX_RUNS_INDIRECT).map(|r| r.len()),
+            Some(N1)
+        );
     }
 }

@@ -28,6 +28,16 @@ const UVM_PAGEABLE_MEM_ACCESS_SIZE: usize = 8;
 /// the `UVM_IOCTL_BASE` range: `uvm_linux_ioctl.h` numbers it separately.
 const UVM_INITIALIZE: u64 = 0x3000_0001;
 
+/// UVM commands whose parameters carry a raw user pointer UVM copies to or
+/// from: `UVM_TOOLS_READ_PROCESS_MEMORY` (0x3e, `copy_to_user` into
+/// `buffer`), `UVM_TOOLS_WRITE_PROCESS_MEMORY` (0x3f, reads `buffer`) and
+/// `UVM_TOOLS_GET_PROCESSOR_UUID_TABLE` (0x40, writes `tablePtr`). Forwarded,
+/// the guest's number would be read in this process, so a guest could read or
+/// write the backend's own memory with it. Nothing here can translate them,
+/// and CUDA does not issue them (they are debugger and profiler calls; gVisor's
+/// nvproxy refuses them too), so they are refused before the table is asked.
+const UVM_RAW_POINTER_CMDS: [u32; 3] = [0x3e, 0x3f, 0x40];
+
 impl NvidiaBackend {
     /// Serve one ioctl on a `/dev/nvidia-uvm` file.
     pub(super) fn dispatch_uvm(
@@ -64,6 +74,14 @@ impl NvidiaBackend {
             );
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOTTY);
         };
+
+        if UVM_RAW_POINTER_CMDS.contains(&num) {
+            self.note_allow_refusal(
+                format!("UVM {num:#x}"),
+                "it carries a user pointer UVM would read in this process, not the guest's".into(),
+            );
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EPERM);
+        }
 
         let Some(entry) = sel.entry(num) else {
             self.note_allow_refusal(

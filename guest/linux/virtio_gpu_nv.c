@@ -113,13 +113,22 @@ extern struct kset *module_kset;
  * anywhere near either. Must match protocol/src/pageruns.rs. */
 #define NVGPU_DEEP_PAGE_RUNS 0xfffffffeu
 
-/* The most runs one registration may describe; the backend holds the same
- * bound. A fully fragmented buffer costs one run per page, so this covers
- * 4 MiB at worst and more when pages coalesce at all. */
+/* The most runs one message may carry; the backend holds the same bound. A
+ * fully fragmented buffer costs one run per page, so this covers 4 MiB at
+ * worst and more when pages coalesce at all. */
 #define NVGPU_MAX_PAGE_RUNS 1024
-/* And the most pages, which is the backend's 256 MiB. A buffer that
- * coalesces well can be far larger than the run bound suggests. */
-#define NVGPU_MAX_PIN_PAGES (65536)
+/* `deep_ptr_offset` when the deep block is the runs of the pages that hold
+ * the real table, which stays in guest memory: a buffer that scatters into
+ * more runs than one message carries. Must match protocol/src/pageruns.rs. */
+#define NVGPU_DEEP_PAGE_RUNS_INDIRECT 0xfffffffdu
+/* The most runs such a table may hold: as many as fit in the pages a direct
+ * table can name, 4 MiB of them. 1 GiB of fully scattered 4 KiB pages, and
+ * far more when they coalesce. */
+#define NVGPU_MAX_PAGE_RUNS_INDIRECT                                           \
+  ((NVGPU_MAX_PAGE_RUNS * 4096u - 8) / 16)
+/* And the most pages, which is the backend's 64 GiB: a bound on one message,
+ * not on memory -- the guest can only pin what it has. */
+#define NVGPU_MAX_PIN_PAGES (16ul << 20)
 
 /* Which file a descriptor inside a UVM parameter block has to name. */
 #define NVGPU_UVM_FD_NONE 0
@@ -2602,7 +2611,7 @@ static int nvgpu_pin_region(struct nvgpu_device *dev, u64 uaddr, u64 len,
  */
 static int nvgpu_emit_page_runs(struct nvgpu_device *dev,
                                 const struct nvgpu_pin *pin, void *out,
-                                u32 out_cap, u32 *out_len) {
+                                u32 out_cap, u32 max_runs, u32 *out_len) {
   unsigned long i;
   u32 runs = 0;
   u64 run_gpa = 0, run_len = 0;
@@ -2619,11 +2628,12 @@ static int nvgpu_emit_page_runs(struct nvgpu_device *dev,
       __le64 v;
       u32 at = 8 + runs * 16;
 
-      if (runs == NVGPU_MAX_PAGE_RUNS || at + 16 > out_cap) {
-        dev_warn(&dev->vdev->dev,
-                 "virtio-gpu-nv: %lu pages scatter into more than %u runs; "
-                 "refusing to register them\n",
-                 pin->npages, (unsigned int)NVGPU_MAX_PAGE_RUNS);
+      if (runs == max_runs || at + 16 > out_cap) {
+        if (max_runs == NVGPU_MAX_PAGE_RUNS_INDIRECT)
+          dev_warn(&dev->vdev->dev,
+                   "virtio-gpu-nv: %lu pages scatter into more than %u runs; "
+                   "refusing to register them\n",
+                   pin->npages, max_runs);
         return -E2BIG;
       }
       v = cpu_to_le64(run_gpa);
@@ -2765,6 +2775,8 @@ static long nvgpu_ioctl_register_memory(struct nvgpu_fd *nfd, unsigned int cmd,
   void *req_buf = NULL, *resp_buf = NULL;
   u32 runs_cap = 8 + NVGPU_MAX_PAGE_RUNS * 16;
   u32 runs_len = 0;
+  u32 deep_kind = NVGPU_DEEP_PAGE_RUNS;
+  void *runs_at, *big = NULL;
   u64 addr, limit, length;
   int req_total, resp_max, ret;
 
@@ -2805,10 +2817,50 @@ static long nvgpu_ioctl_register_memory(struct nvgpu_fd *nfd, unsigned int cmd,
   if (params != outer)
     memcpy(req_buf + sizeof(*req) + outer_len, params, params_len);
 
-  ret = nvgpu_emit_page_runs(dev, pin,
-                             req_buf + sizeof(*req) + outer_len +
-                                 (params != outer ? params_len : 0),
-                             runs_cap, &runs_len);
+  runs_at = req_buf + sizeof(*req) + outer_len +
+            (params != outer ? params_len : 0);
+  ret = nvgpu_emit_page_runs(dev, pin, runs_at, runs_cap, NVGPU_MAX_PAGE_RUNS,
+                             &runs_len);
+  if (ret == -E2BIG) {
+    /*
+     * Too scattered for one message: write the table into memory of its own
+     * and send the runs of *that*, which the backend copies out of guest RAM.
+     * Whole pages, so the pages it names hold nothing but the table.
+     */
+    unsigned long n = min_t(unsigned long, pin->npages,
+                            NVGPU_MAX_PAGE_RUNS_INDIRECT);
+    u32 big_cap = PAGE_ALIGN(8 + n * 16), big_len = 0;
+    struct nvgpu_pin where = {0};
+    unsigned long i;
+
+    big = kvzalloc(big_cap, GFP_KERNEL);
+    where.npages = big_cap >> PAGE_SHIFT;
+    where.pages = kvmalloc_array(where.npages, sizeof(*where.pages),
+                                 GFP_KERNEL);
+    if (!big || !where.pages) {
+      kvfree(where.pages);
+      ret = -ENOMEM;
+      goto out;
+    }
+    ret = nvgpu_emit_page_runs(dev, pin, big, big_cap,
+                               NVGPU_MAX_PAGE_RUNS_INDIRECT, &big_len);
+    if (!ret) {
+      for (i = 0; i < where.npages; i++) {
+        void *va = (u8 *)big + (i << PAGE_SHIFT);
+
+        where.pages[i] =
+            is_vmalloc_addr(va) ? vmalloc_to_page(va) : virt_to_page(va);
+      }
+      /* At most NVGPU_MAX_PAGE_RUNS pages, so this always fits. */
+      ret = nvgpu_emit_page_runs(dev, &where, runs_at, runs_cap,
+                                 NVGPU_MAX_PAGE_RUNS, &runs_len);
+      deep_kind = NVGPU_DEEP_PAGE_RUNS_INDIRECT;
+      dev_dbg(&dev->vdev->dev,
+              "virtio-gpu-nv: %lu pages, %u-byte run table in %lu page(s)\n",
+              pin->npages, big_len, where.npages);
+    }
+    kvfree(where.pages);
+  }
   if (ret)
     goto out;
 
@@ -2826,7 +2878,7 @@ static long nvgpu_ioctl_register_memory(struct nvgpu_fd *nfd, unsigned int cmd,
     req->nested_offset = 0;
     req->nested_len = 0;
   }
-  req->deep_ptr_offset = cpu_to_le32(NVGPU_DEEP_PAGE_RUNS);
+  req->deep_ptr_offset = cpu_to_le32(deep_kind);
   req->deep_len = cpu_to_le32(runs_len);
 
   req_total = sizeof(*req) + outer_len +
@@ -2885,6 +2937,7 @@ static long nvgpu_ioctl_register_memory(struct nvgpu_fd *nfd, unsigned int cmd,
 out:
   /* Not kept means not registered, so the pages go back. */
   nvgpu_pin_free(pin);
+  kvfree(big);
   kvfree(req_buf);
   kvfree(resp_buf);
   return ret;
@@ -3144,6 +3197,58 @@ static const struct vm_operations_struct nvgpu_vm_ops = {
     .close = nvgpu_vma_close,
 };
 
+/*
+ * Put the leaf PTEs of [start, end) back to write-back.
+ *
+ * The aperture is a PCI BAR to this kernel, not System RAM, so
+ * remap_pfn_range() goes through the x86 PAT tracking, which turns the
+ * write-back protection asked for into UC- wherever the MTRRs over the range
+ * are not write-back -- and nothing says so. On an Intel host EPT ignores the
+ * guest's memory type for RAM-backed slots and the mistake is invisible. On
+ * AMD, NPT honours it, and CPU access to a managed allocation runs uncached:
+ * nvkvm-pv measured ~100x slower. What is behind the aperture is the host's
+ * ordinary RAM (UVM's pages), coherent with the GPU, so write-back is right.
+ *
+ * Only freshly made PTEs of a VMA still being set up in ->mmap, under the
+ * mmap lock, before userspace can have cached them, so no TLB flush is due.
+ * remap_pfn_range() maps 4 KiB PTEs only, so a huge leaf is not expected and
+ * is left alone.
+ *
+ * From nvkvm-pv (src/guest/nvkvm_mmap.c, nvkvm_force_range_wb), Copyright
+ * 2026 Reindert Pelsma, GPL-2.0; reduced to the 4 KiB case here.
+ */
+static void nvgpu_force_range_wb(struct mm_struct *mm, unsigned long start,
+                                 unsigned long end) {
+#ifdef CONFIG_X86
+  unsigned long a;
+
+  for (a = start; a < end; a += PAGE_SIZE) {
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *pte;
+
+    pgd = pgd_offset(mm, a);
+    if (pgd_none(*pgd) || pgd_bad(*pgd))
+      continue;
+    p4d = p4d_offset(pgd, a);
+    if (p4d_none(*p4d) || p4d_bad(*p4d))
+      continue;
+    pud = pud_offset(p4d, a);
+    if (pud_none(*pud) || pud_leaf(*pud))
+      continue;
+    pmd = pmd_offset(pud, a);
+    if (pmd_none(*pmd) || pmd_leaf(*pmd))
+      continue;
+    pte = pte_offset_kernel(pmd, a);
+    if (!(pte_val(*pte) & _PAGE_PRESENT))
+      continue;
+    set_pte(pte, __pte(pte_val(*pte) & ~(_PAGE_PCD | _PAGE_PWT | _PAGE_PAT)));
+  }
+#endif
+}
+
 static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
   struct nvgpu_fd *nfd = filp->private_data;
   u64 size = vma->vm_end - vma->vm_start;
@@ -3181,7 +3286,10 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
    * A UVM file maps one thing: a semaphore pool, at the address equal to its
    * offset. The host takes it only there, so it is not in the window but in
    * the aperture, where the VMM gave the pool a slot of its own. It is the
-   * host kernel's ordinary memory, so it is mapped write-back.
+   * host kernel's ordinary memory, so it is mapped write-back -- and kept
+   * write-back, see nvgpu_force_range_wb(). A managed allocation
+   * (cuMemAllocManaged) is a mapping of the UVM file too, and takes the same
+   * path at whatever size the application asked for.
    */
   if (nfd->device_type == NVGPU_DEV_UVM) {
     window_off = le64_to_cpu(resp->guest_phys_addr);
@@ -3198,6 +3306,7 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
                           size, vma->vm_page_prot);
     if (ret)
       goto out;
+    nvgpu_force_range_wb(vma->vm_mm, vma->vm_start, vma->vm_end);
     vma->vm_ops = &nvgpu_vm_ops;
     vma->vm_private_data =
         (void *)(unsigned long)le32_to_cpu(resp->mapping_id);

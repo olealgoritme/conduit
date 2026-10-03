@@ -820,14 +820,7 @@ impl NvidiaBackend {
             .map(|e| e.region)
             .collect();
         for region in leftovers {
-            if let Err(e) = self.shm.free(&region) {
-                log::warn!(
-                    "teardown: SHM free of {:#x}+{:#x} failed: {}",
-                    region.offset,
-                    region.length,
-                    e
-                );
-            }
+            self.release_window_region(&region, "teardown");
         }
         self.handles.drain_all();
     }

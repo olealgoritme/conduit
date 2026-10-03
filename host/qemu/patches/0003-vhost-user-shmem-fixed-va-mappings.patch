@@ -89,8 +89,8 @@ diff --color -ru a/hw/virtio/virtio.c b/hw/virtio/virtio.c
 +        return NULL;
 +    }
 +#ifdef MADV_POPULATE_WRITE
-+    /* The pages must exist before a guest can be pointed at them. */
-+    if (madvise(p, len, MADV_POPULATE_WRITE) != 0) {
++    /* Probe one page: a managed range's pages are UVM's to place. */
++    if (madvise(p, page, MADV_POPULATE_WRITE) != 0) {
 +        error_report("Fixed-VA shared memory mapping at 0x%" PRIx64
 +                     ": populate: %s", fd_offset, strerror(errno));
 +        munmap(p, len);

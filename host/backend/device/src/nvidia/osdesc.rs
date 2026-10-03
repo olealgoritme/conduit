@@ -145,26 +145,54 @@ impl NvidiaBackend {
                     .into(),
             );
         };
-        if off as u32 != protocol::pageruns::PAGE_RUNS {
-            return Err(format!(
-                "the block beside it is not a page-run table: the guest put a deep pointer at \
-                 byte {off} instead"
-            ));
-        }
-        let Some(table) = protocol::pageruns::Runs::parse(bytes) else {
+        use protocol::pageruns::{MAX_RUNS_INDIRECT, PAGE_RUNS, PAGE_RUNS_INDIRECT, Runs};
+        let indirect = match off as u32 {
+            PAGE_RUNS => false,
+            PAGE_RUNS_INDIRECT => true,
+            _ => {
+                return Err(format!(
+                    "the block beside it is not a page-run table: the guest put a deep pointer \
+                     at byte {off} instead"
+                ));
+            }
+        };
+        let Some(table) = Runs::parse(bytes) else {
             return Err(format!(
                 "the {} bytes beside it are not a page-run table",
                 bytes.len()
             ));
         };
-        let runs: Vec<crate::guestmem::Run> = table
-            .iter()
-            .map(|r| crate::guestmem::Run {
-                gpa: r.gpa,
-                len: r.len,
-            })
-            .collect();
-        crate::guestmem::stitch(ram, &runs, want)
+        let runs = |t: Runs<'_>| -> Vec<crate::guestmem::Run> {
+            t.iter()
+                .map(|r| crate::guestmem::Run {
+                    gpa: r.gpa,
+                    len: r.len,
+                })
+                .collect()
+        };
+        if !indirect {
+            return crate::guestmem::stitch(ram, &runs(table), want);
+        }
+
+        // The table is in guest memory, and the runs sent say where. Copied
+        // out whole before a word of it is read: the guest can write those
+        // pages at any time, and a count checked against one version of the
+        // table must not be used to read another.
+        let held: u64 = table.iter().map(|r| r.len).sum();
+        let copy = {
+            let span = crate::guestmem::stitch(ram, &runs(table), held)
+                .map_err(|why| format!("the page-run table in guest memory: {why}"))?;
+            // SAFETY: `span` maps exactly `span.len()` bytes of guest RAM,
+            // readable and alive until it drops at the end of this block.
+            unsafe { std::slice::from_raw_parts(span.addr() as *const u8, span.len()) }.to_vec()
+        };
+        let Some(big) = Runs::parse_up_to(&copy, MAX_RUNS_INDIRECT) else {
+            return Err(format!(
+                "the {} bytes of guest memory it points at are not a page-run table",
+                copy.len()
+            ));
+        };
+        crate::guestmem::stitch(ram, &runs(big), want)
     }
 
     /// Serve a registration by address: translate it if it can be, refuse it

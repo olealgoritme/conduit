@@ -22,10 +22,10 @@ both.
 
 **Stock QEMU 11.1 does not work.** It aborts on the guest's first device
 config read, because it caps vhost-user config at 256 bytes and nvgpu's is
-4036. Patch `0001` is required. Patches `0002` to `0005` fix correctness for
-the window, CUDA in the aperture, MSI-X, and mapping order (without 0005
-every Vulkan submit fails: Xid 13/32). `host/qemu/README.md` explains
-each one.
+4036. Patch `0001` is required. Patches `0002` to `0006` fix correctness for
+the window, CUDA in the aperture, MSI-X, mapping order (without 0005
+every Vulkan submit fails: Xid 13/32) and the shared-memory BAR size (without
+0006 QEMU aborts at startup). `host/qemu/README.md` explains each one.
 
 Don't run this VM while nesbox has the same `rootfs-ssh.ext4` open. Two
 writers on one ext4 image corrupt it.
@@ -88,7 +88,7 @@ Why each nvgpu-related argument is there:
     the same as nesbox.
 - The shared memory regions are not given on the command line. QEMU asks
   the backend for them with `GET_SHMEM_CONFIG`. The backend answers shmid 1
-  (window, 1 GiB) and shmid 2 (UVM aperture, 1 GiB).
+  (window, 1 GiB) and shmid 2 (UVM aperture, 32 GiB).
 - `-cpu host,host-phys-bits=on` matters because the shared-memory BAR is
   2 GiB and 64-bit. The firmware places it above 4 GiB, which needs real
   physical-address width.
@@ -200,7 +200,7 @@ layout below needs no driver change.
 | PCI id / class | 1af4:106d rev 1, class 0x0380 (display) | 1af4:106d rev 1, class 0x0780 (communication). The driver binds by virtio id and builds its own PCI device for NVIDIA userspace, so the class does not matter. |
 | virtio config structures | all in BAR 0 (32-bit, 16 KiB): common, isr, notify, MSI-X, device cfg at 0x1000 | BAR 2 (64-bit): common 0x0, isr 0x1000, device cfg 0x2000 (4 KiB window), notify 0x3000. MSI-X in BAR 1 |
 | window (shmid 1) | BAR 2, 1 GiB | BAR 4 at offset 0, 1 GiB |
-| aperture (shmid 2) | BAR 4, 1 GiB | BAR 4 at offset 1 GiB, 1 GiB (BAR 4 is 2 GiB) |
+| aperture (shmid 2) | BAR 4, 32 GiB | BAR 4 at offset 1 GiB, 32 GiB (BAR 4 is 64 GiB, rounded up to a power of two by patch 0006) |
 | MSI-X vectors | 3 | 3 with patch 0004, 1 stock (the guest then falls back to INTx) |
 | unplaced window range | backed by zero pages (memfd), so writes stick | a hole: KVM exits to QEMU, reads return 0 and writes are dropped |
 | window withdraw | the range is overwritten with zero pages | the range is unmapped and becomes a hole again |

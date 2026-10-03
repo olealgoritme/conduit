@@ -111,7 +111,8 @@ const NV_SHM_ID: u8 = 1;
 /// pages arrive only as the backend asks for them, one mapping at a time.
 const SHM_SIZE: u64 = 1 << 30; // 1 GiB
 
-/// BAR 4 is the UVM aperture: one memory slot per CUDA semaphore pool.
+/// BAR 4 is the UVM aperture: one memory slot per mapping of a UVM file, which
+/// is a CUDA semaphore pool or a managed allocation (`cuMemAllocManaged`).
 ///
 /// A pool cannot go in the window. CUDA makes it at an address of its own
 /// choosing and maps the UVM file there at an offset equal to that address,
@@ -119,20 +120,28 @@ const SHM_SIZE: u64 = 1 << 30; // 1 GiB
 /// is one reservation at an address this process picked, so each pool is
 /// mapped at its own address instead and given a slot inside this BAR, at an
 /// offset the backend chose. Nothing backs the BAR until then.
+///
+/// These match the backend's `nvidia/aperture.rs` and `shm_regions.rs`.
 const APERTURE_BAR: usize = 4;
 const NV_SHM_ID_APERTURE: u8 = 2;
-const APERTURE_SIZE: u64 = 1 << 30;
+/// Guest-physical address space only: an empty aperture costs no memory. It
+/// bounds the managed memory a VM can have at once.
+const APERTURE_SIZE: u64 = 32 << 30;
 /// Pools start on 2 MiB boundaries of the aperture.
 const APERTURE_ALIGN: u64 = 2 << 20;
-/// One pool, and all of them together. CUDA makes them at a few MiB.
-const POOL_MAX_LEN: u64 = 64 << 20;
-const MAX_POOLS: usize = 64;
-const MAX_POOL_BYTES: u64 = 256 << 20;
-/// The host addresses a pool may name. Below 4 GiB is where this process's own
-/// small mappings sit; the mapping is made without replacing anything anyway,
-/// so the band is a second wall, not the only one.
+/// One mapping, and all of them together. A managed allocation is as large as
+/// the application asks, so the aperture is the only bound on bytes; each
+/// mapping is a KVM memory slot, of which x86 gives a VM 32764.
+const POOL_MAX_LEN: u64 = APERTURE_SIZE;
+const MAX_POOLS: usize = 1024;
+const MAX_POOL_BYTES: u64 = APERTURE_SIZE;
+/// The host addresses a pool may name: user space above the first 4 GiB,
+/// where this process's own small mappings sit. A managed allocation lands
+/// near the top, wherever the guest's kernel put the process's mmap area. The
+/// mapping is made without replacing anything anyway, so the band is a second
+/// wall, not the only one.
 const POOL_HVA_MIN: u64 = 4 << 30;
-const POOL_HVA_MAX: u64 = 32 << 40;
+const POOL_HVA_MAX: u64 = 1 << 47;
 
 /// Places backend mappings into the shared window.
 ///
@@ -284,12 +293,16 @@ impl WindowMapper {
             unmap();
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
-        // The pages must be there before a slot points at them: UVM inserts
-        // them when it maps a pool, and a range it cannot fault is refused
-        // here rather than met by the guest.
+        // The first page is faulted in now, so a range UVM will not fault is
+        // refused here rather than met by the guest. Only the first: a
+        // semaphore pool's pages are already inserted when it is mapped, and a
+        // managed allocation's are UVM's to place -- populating 4 GiB of one
+        // would commit 4 GiB of host memory the application may only ever
+        // touch from the GPU. KVM faults the rest through UVM as the guest
+        // reaches them.
         //
         // SAFETY: advice on the range mapped above.
-        if unsafe { libc::madvise(p, len as usize, libc::MADV_POPULATE_WRITE) } != 0 {
+        if unsafe { libc::madvise(p, 4096, libc::MADV_POPULATE_WRITE) } != 0 {
             let e = std::io::Error::last_os_error();
             unmap();
             log::error!("UVM pool {hva:#x}+{len:#x}: the pages are not there: {e}");
@@ -1250,11 +1263,18 @@ mod tests {
             check_pool(&pools, hva + MIB, 4 * MIB, MIB, rw),
             Err(libc::EEXIST)
         );
-        for i in 1..4u64 {
-            pools.insert(i * 64 * MIB, (64 * MIB, hva + i * 64 * MIB));
-        }
+        // A managed allocation of 4 GiB near the top of user space fits.
         assert_eq!(
-            check_pool(&pools, hva + 512 * MIB, 512 * MIB, 64 * MIB, rw),
+            check_pool(&pools, 0x7f4b_9400_0000, 4 * MIB, 4 << 30, rw),
+            Ok(())
+        );
+        // Past the count, nothing more is placed.
+        for i in 1..MAX_POOLS as u64 {
+            pools.insert(i * 2 * MIB, (4096, hva + i * 2 * MIB));
+        }
+        let at = MAX_POOLS as u64 * 2 * MIB;
+        assert_eq!(
+            check_pool(&pools, hva + at, at, 4096, rw),
             Err(libc::ENOSPC)
         );
     }

@@ -23,17 +23,26 @@ pub const APERTURE_LEN: u64 = crate::shm_regions::APERTURE_LEN;
 /// Every pool starts on a 2 MiB boundary of the aperture, so a slot can be
 /// backed by huge pages where the host has them.
 pub const APERTURE_ALIGN: u64 = 2 << 20;
-/// Largest single pool. CUDA makes them at a few MiB.
-pub const POOL_MAX_LEN: u64 = 64 << 20;
-/// Pools and bytes across one VM.
-pub const MAX_POOLS: usize = 64;
-pub const MAX_POOL_BYTES: u64 = 256 << 20;
-/// The band of host addresses a pool may name. Below 4 GiB is where a VMM's
-/// own small mappings live; above 32 TiB is past what the VMM leaves free. The
-/// VMM checks the same band and maps without replacing anything, so this is
-/// the first of two checks, not the only one.
+/// Largest single mapping. Semaphore pools are a few MiB, but every
+/// `cuMemAllocManaged` is a mapping of the UVM file too, of whatever size the
+/// application asked for, so the only bound is the aperture itself.
+pub const POOL_MAX_LEN: u64 = APERTURE_LEN;
+/// Mappings and bytes across one VM. Each mapping is one memory slot in the
+/// VMM, and KVM gives a VM 32764 of them on x86; this leaves most of those to
+/// everything else. The bytes are guest-physical address space, not memory:
+/// nothing is committed until the guest or the GPU touches a page.
+pub const MAX_POOLS: usize = 1024;
+pub const MAX_POOL_BYTES: u64 = APERTURE_LEN;
+/// The band of host addresses a pool may name: every user address of a
+/// 4-level-paging process except its first 4 GiB, where a VMM's own small
+/// mappings live. A managed allocation sits wherever the guest's kernel put
+/// the guest process's mmap area, which is near the top of that range, so the
+/// band has to reach it. The VMM maps with `MAP_FIXED_NOREPLACE` and checks
+/// the same band, so a pool that lands on one of its own mappings is refused
+/// there rather than placed over it; this is the first of two checks, not the
+/// only one.
 pub const HVA_MIN: u64 = 4 << 30;
-pub const HVA_MAX: u64 = 32 << 40;
+pub const HVA_MAX: u64 = 1 << 47;
 
 /// One pool placed in the aperture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,11 +261,31 @@ mod tests {
         let mut ap = Aperture::default();
         ap.insert(1, ap.admit(1, HVA, 2 * MIB).unwrap());
         assert_eq!(ap.admit(1, HVA + MIB, MIB), Err(libc::EEXIST));
-        for i in 1..4u32 {
-            let p = ap.admit(1, HVA + i as u64 * 64 * MIB, 64 * MIB).unwrap();
-            ap.insert(i + 1, p);
+        // The aperture is the bound on bytes: fill it, then one page more.
+        let rest = APERTURE_LEN - 2 * MIB;
+        ap.insert(2, ap.admit(1, HVA + 2 * MIB, rest).unwrap());
+        assert_eq!(ap.admit(1, HVA + APERTURE_LEN, 4096), Err(libc::ENOSPC));
+        // And on count, with room to spare.
+        let mut ap = Aperture::default();
+        for i in 0..MAX_POOLS as u64 {
+            ap.insert(i as u32, ap.admit(1, HVA + i * 4096, 4096).unwrap());
         }
-        assert_eq!(ap.admit(1, HVA + 512 * MIB, 64 * MIB), Err(libc::ENOSPC));
+        assert_eq!(
+            ap.admit(1, HVA + MAX_POOLS as u64 * 4096, 4096),
+            Err(libc::ENOSPC)
+        );
+    }
+
+    #[test]
+    fn a_managed_allocation_near_the_top_of_user_space_fits() {
+        // Where a guest kernel's mmap puts a 4 GiB cuMemAllocManaged.
+        let ap = Aperture::default();
+        let p = ap.admit(1, 0x7f4b_9400_0000, 4 << 30).unwrap();
+        assert_eq!(p.offset, 0);
+        assert_eq!(
+            ap.admit(1, HVA_MAX - (4 << 30), 4 << 30).map(|p| p.len),
+            Ok(4 << 30)
+        );
     }
 
     #[test]

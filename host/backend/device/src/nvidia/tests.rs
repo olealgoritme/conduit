@@ -1755,6 +1755,13 @@ mod tests {
     }
 
     fn backend_for_registration(host: &RegisteringHost) -> (NvidiaBackend, u64) {
+        backend_for_registration_with(host, |_| {})
+    }
+
+    fn backend_for_registration_with(
+        host: &RegisteringHost,
+        prepare: impl FnOnce(&crate::guestmem::fake::FakeRam),
+    ) -> (NvidiaBackend, u64) {
         let mut be = NvidiaBackend::for_test();
         be.set_host_driver_version(abi::version::DriverVersion::new(615, 71, 9))
             .expect("615.71.09 has tables");
@@ -1762,6 +1769,7 @@ mod tests {
         let ram =
             crate::guestmem::fake::FakeRam::new(&[(0, 16 * TPAGE), (1024 * TPAGE, 16 * TPAGE)]);
         ram.fill();
+        prepare(&ram);
         be.set_guest_ram(Box::new(ram));
         let null = std::fs::File::open("/dev/null").expect("/dev/null");
         let h = be.handles.insert(OwnedFd::from(null));
@@ -1779,6 +1787,26 @@ mod tests {
         params: &[u8],
         runs: &[(u64, u64)],
     ) -> Vec<u8> {
+        ioctl_msg_with_table(handle, escape, params, runs, protocol::pageruns::PAGE_RUNS)
+    }
+
+    fn encode_runs(runs: &[(u64, u64)]) -> Vec<u8> {
+        let mut t = vec![0u8; protocol::pageruns::encoded_len(runs.len())];
+        t[0..4].copy_from_slice(&(runs.len() as u32).to_le_bytes());
+        for (i, &(gpa, len)) in runs.iter().enumerate() {
+            t[8 + i * 16..16 + i * 16].copy_from_slice(&gpa.to_le_bytes());
+            t[16 + i * 16..24 + i * 16].copy_from_slice(&len.to_le_bytes());
+        }
+        t
+    }
+
+    fn ioctl_msg_with_table(
+        handle: u64,
+        escape: u32,
+        params: &[u8],
+        runs: &[(u64, u64)],
+        kind: u32,
+    ) -> Vec<u8> {
         let runs: Vec<protocol::pageruns::Run> = runs
             .iter()
             .map(|&(gpa, len)| protocol::pageruns::Run { gpa, len })
@@ -1795,7 +1823,7 @@ mod tests {
                 data_len: params.len() as u32,
                 nested_offset: 0,
                 nested_len: 0,
-                deep_ptr_offset: protocol::pageruns::PAGE_RUNS,
+                deep_ptr_offset: kind,
                 deep_len: table.len() as u32,
             },
         );
@@ -1868,6 +1896,46 @@ mod tests {
             1,
             "the span is held for the object"
         );
+        be.teardown();
+    }
+
+    /// A table too long for one message stays in guest memory, and the
+    /// message says where: the host still reads exactly the guest's pages.
+    #[test]
+    fn an_indirect_table_is_read_from_guest_memory() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        // The real table, at guest page 8.
+        let big = encode_runs(&[(1024 * TPAGE, TPAGE), (0, TPAGE)]);
+        let (mut be, h) = backend_for_registration_with(&host, |ram| ram.write(8 * TPAGE, &big));
+
+        let p = heap_registration(&d, 0xc1d0_0001);
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_table(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &p,
+                &[(8 * TPAGE, TPAGE)],
+                protocol::pageruns::PAGE_RUNS_INDIRECT,
+            ),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(
+            host.seen(),
+            vec![
+                crate::guestmem::fake::mark(1024 * TPAGE),
+                crate::guestmem::fake::mark(0)
+            ],
+        );
+        assert_eq!(be.registration_count(), 1);
         be.teardown();
     }
 
@@ -2375,6 +2443,22 @@ mod tests {
         let resp = send_uvm(&mut be, uvm, 0x08, &[0u8; 24]);
         assert_ne!(parse_resp(&resp).status, 0);
         assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    /// The tools calls that copy through a raw pointer would read or write
+    /// this process's memory at a number the guest chose. Refused even at the
+    /// size the release defines, on both releases.
+    #[test]
+    fn uvm_calls_with_raw_pointers_never_reach_the_host() {
+        for v in [v615(), abi::version::DriverVersion::new(610, 57, 4)] {
+            let host = UvmHost::default();
+            let (mut be, uvm, _) = uvm_backend(&host, v);
+            for (num, size) in [(0x3eu64, 40usize), (0x3f, 40), (0x40, 16)] {
+                let resp = send_uvm(&mut be, uvm, num, &vec![0u8; size]);
+                assert_ne!(parse_resp(&resp).status, 0, "{v} {num:#x}");
+            }
+            assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+        }
     }
 
     /// UVM copies its own struct's worth of bytes whatever the guest declared,

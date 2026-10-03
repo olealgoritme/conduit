@@ -295,6 +295,9 @@ impl NvidiaBackend {
         };
         if let Err(e) = window.place(region.offset, length, host_map_fd, 0, true) {
             log::error!("NV_ESC_RM_MAP_MEMORY: placing in the window failed: {}", e);
+            if let Err(e) = self.shm.free(&region) {
+                log::warn!("NV_ESC_RM_MAP_MEMORY: freeing the unplaced region failed: {e}");
+            }
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
         }
 

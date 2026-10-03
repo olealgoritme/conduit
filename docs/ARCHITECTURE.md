@@ -100,9 +100,21 @@ semaphore pool at an address the program chose, and UVM only accepts that
 mapping at exactly that host address.
 
 So each pool gets its own memory slot in a second region, the UVM aperture
-(1 GiB), whereby the VMM maps the pool at the address it asked for, without replacing
-anything of its own. Pools are capped at 64 MiB each, and at 64 pools or
-256 MiB per VM. The backend checks those limits, and the VMM checks them again.
+(32 GiB of guest-physical address space, nothing committed), whereby the VMM
+maps the pool at the address it asked for, without replacing anything of its
+own. Managed memory (`cuMemAllocManaged`) is a mapping of the UVM file too and
+takes the same path: the VMM maps it at the guest's own address, the GPU uses
+that address, and UVM migrates pages between host RAM and VRAM as either side
+touches them (KVM follows through its MMU notifier). Only the first page is
+faulted in at placement, so host RAM is committed as pages are used, not up
+front. Limits: 32 GiB and 1024 mappings per VM, addresses between 4 GiB and
+128 TiB. The backend checks them, and the VMM checks them again.
+
+Pinned host memory (`cuMemHostAlloc`, `cuMemHostRegister`) is registered by
+address: the guest pins the pages and sends their guest-physical runs, and the
+backend maps exactly those pages into one span for RM (zero-copy). Up to 1024
+runs travel in the message; a more scattered buffer sends its run table
+through guest memory instead (up to 262143 runs, 64 GiB per registration).
 
 CUDA is opt-in: without `--caps ...,compute` the backend refuses
 `/dev/nvidia-uvm`.
@@ -160,7 +172,7 @@ end to end yet.
   generated from NVIDIA's own privilege tables), but passthrough or vGPU is
   stronger. See [`SECURITY.md`](SECURITY.md).
 - **The window size is fixed** when the VM is created.
-- **No unified memory** (`cudaMallocManaged`), MIG or SR-IOV (out of scope for now).
+- **No HMM / pageable memory access** (the GPU touching plain `malloc` memory), MIG or SR-IOV (out of scope for now). Managed memory works; see the UVM aperture above.
 - **VRAM limits are approximate.** `--vram-limit-mib` misses memory RM
   allocates internally, which is tens of MiB per guest (might be fixed in a future version).
 

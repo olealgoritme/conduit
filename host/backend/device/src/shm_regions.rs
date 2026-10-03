@@ -8,7 +8,7 @@
 //! | shmid | what | size |
 //! | --- | --- | --- |
 //! | 1 | the window: device memory the backend places (`shm.rs`) | the allocator's total, 1 GiB |
-//! | 2 | the UVM aperture: CUDA semaphore pools (`nvidia/aperture.rs`) | 1 GiB |
+//! | 2 | the UVM aperture: CUDA semaphore pools and managed memory (`nvidia/aperture.rs`) | 32 GiB |
 //!
 //! nesbox hard-codes both (BAR 2 and BAR 4). QEMU >= 11.1 asks instead, with
 //! `VHOST_USER_GET_SHMEM_CONFIG`, and lays the regions out itself -- one BAR
@@ -24,8 +24,15 @@ pub const SHM_ID_WINDOW: u8 = 1;
 /// The UVM aperture. Must match `NVGPU_SHM_ID_APERTURE`.
 pub const SHM_ID_APERTURE: u8 = 2;
 
-/// Size of the UVM aperture. nesbox's `APERTURE_SIZE` is the same number.
-pub const APERTURE_LEN: u64 = 1 << 30;
+/// Size of the UVM aperture. nesbox's `APERTURE_SIZE` is the same number, and
+/// QEMU takes it from the reply built here.
+///
+/// It is guest-physical address space and nothing else: a pool gets a memory
+/// slot only when it is placed, and the guest maps it with `remap_pfn_range`,
+/// so an empty aperture costs neither memory nor `struct page`s. It bounds the
+/// managed memory (`cuMemAllocManaged`) one VM can have at once, so it is the
+/// size of the largest GPU memory there is. A power of two, because a BAR is.
+pub const APERTURE_LEN: u64 = 32 << 30;
 
 /// `VhostUserMMap.flags` bit asking the frontend to map the descriptor at host
 /// address `fd_offset` (shared, read-write). Not in the vhost-user spec: a
@@ -90,13 +97,13 @@ mod tests {
     }
 
     #[test]
-    fn the_default_device_has_two_one_gib_regions() {
+    fn the_default_device_has_a_window_and_an_aperture() {
         let window = ZoneConfig::default_1gib().total();
         let (n, sizes) = region_sizes(window, APERTURE_LEN);
         assert_eq!(n, 2);
         assert_eq!(sizes[0], 0, "region 0 is unused");
         assert_eq!(sizes[1], 1 << 30, "window, as nesbox's SHM_SIZE");
-        assert_eq!(sizes[2], 1 << 30, "aperture, as nesbox's APERTURE_SIZE");
+        assert_eq!(sizes[2], 32 << 30, "aperture, as nesbox's APERTURE_SIZE");
         assert!(sizes[3..].iter().all(|&s| s == 0));
     }
 

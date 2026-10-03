@@ -16,7 +16,7 @@
 - [ ] Bundled QEMU 11.1 in `/opt/conduit` for older distros (Ubuntu 24.04)
 - [ ] Automatic support for new NVIDIA driver releases (CI regenerates ABI tables)
 - [ ] Lower per-call latency (doorbell ioeventfd, wake path)
-- [ ] CUDA managed memory beyond 64 MiB
+- [x] CUDA managed memory beyond 64 MiB, pinned host memory beyond 256 MiB (`guest/tests/cuda-mem.c`)
 
 ## Later: more guests and VMMs
 - [ ] NVIDIA native context in virglrenderer: stock QEMU's virtio-gpu (≈9.2+), crosvm, libkrun

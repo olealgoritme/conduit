@@ -28,18 +28,17 @@
 
 use std::os::fd::{AsRawFd, OwnedFd};
 
-/// The most runs one registration may carry.
-///
-/// A fully fragmented buffer costs one run per page, so this covers 4 MiB at
-/// worst and any larger buffer that coalesces at all. `cuCtxCreate` registers
-/// 2 MiB, which fits even with every page scattered. A guest that needs more
-/// is refused and logged rather than quietly truncated: the number to raise
-/// this to should come from a real workload, not from a guess.
-pub const MAX_RUNS: usize = 1024;
+/// The most runs one registration may carry: the larger of the protocol's two
+/// bounds, since a table read out of guest memory may hold that many (see
+/// `protocol::pageruns`). Each run is one `mmap` of guest RAM into this
+/// process, so a long table costs map count (`vm.max_map_count`), and the
+/// guest coalesces adjacent pages to keep it short.
+pub const MAX_RUNS: usize = protocol::pageruns::MAX_RUNS_INDIRECT;
 
 /// The most one registration may cover. Not a security bound -- the per-run
-/// checks are -- but a bound on what one message can be asked to describe.
-pub const MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// checks are, and a guest can only name its own RAM -- but a bound on what
+/// one message can be asked to describe. The guest driver holds the same.
+pub const MAX_BYTES: u64 = 64 << 30;
 
 const PAGE: u64 = 4096;
 
@@ -291,6 +290,23 @@ pub(crate) mod fake {
                     assert_eq!(n, PAGE as isize);
                 }
             }
+        }
+    }
+
+    impl FakeRam {
+        /// Write `bytes` at guest address `gpa`, inside one region.
+        pub(crate) fn write(&self, gpa: u64, bytes: &[u8]) {
+            let b = self.backing(gpa).expect("guest RAM");
+            assert!(bytes.len() as u64 <= b.len);
+            let n = unsafe {
+                libc::pwrite(
+                    b.fd.as_raw_fd(),
+                    bytes.as_ptr() as *const libc::c_void,
+                    bytes.len(),
+                    b.offset as libc::off_t,
+                )
+            };
+            assert_eq!(n, bytes.len() as isize);
         }
     }
 
