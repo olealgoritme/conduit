@@ -9,8 +9,22 @@ from GPU memory to your screen: no copying, no video compression.
 
 - One GPU, shared. No second graphics card, no passthrough, no vGPU license.
 - Up to your monitor's refresh rate (tested at 240 Hz).
-- Mouse and keyboard just work when the window is focused.
+- Mouse, keyboard, clipboard (copy/paste both ways) and sound just work.
+- Play it from another computer, phone or TV with [Moonlight](https://moonlight-stream.org).
 - Close the window and the VM shuts down cleanly.
+
+### What works
+
+| | |
+|---|---|
+| Vulkan, OpenGL, EGL (apps, games) | ✅ |
+| CUDA (incl. large managed and pinned memory) | ✅ |
+| Video encode/decode (NVENC/NVDEC) | ✅ |
+| Desktop in a window, up to 240 Hz, zero-copy | ✅ |
+| Clipboard both ways, sound (speakers + mic) | ✅ |
+| Streaming to Moonlight (AV1/HEVC/H.264, up to 240 fps) | ✅ |
+| virt-manager / libvirt | 🚧 in progress |
+| Windows VMs | ❌ not yet ([roadmap](docs/ROADMAP.md)) |
 
 > **Status: early.** Works on the developer's machine (RTX 5090, Ubuntu 24.04,
 > Hyprland). Expect rough edges. Windows guests are not supported yet
@@ -26,10 +40,20 @@ from GPU memory to your screen: no copying, no video compression.
 | Desktop | Any Wayland desktop (GNOME, KDE, Hyprland, Sway, …) |
 | VM | Linux (Ubuntu 24.04 recommended) |
 
+## Quick start
+
+1. **Download** the package for your Linux from the
+   **[latest release](https://github.com/olealgoritme/conduit/releases/latest)** and install it (table below).
+2. **Check your computer:** `conduit doctor`. Every line should say `ok`;
+   if not, it tells you what to fix.
+3. **Make a VM:** `conduit create myvm` (downloads Ubuntu, installs a GNOME
+   desktop and the GPU driver; takes a few minutes).
+4. **Open it:** `conduit view myvm`. A window with the VM's desktop appears.
+
 ## Install
 
 Download the package for your system from the
-[latest release](../../releases/latest), then:
+**[latest release](https://github.com/olealgoritme/conduit/releases/latest)**, then:
 
 | System | Install |
 |---|---|
@@ -42,15 +66,24 @@ Download the package for your system from the
 Then:
 
 ```bash
-# Create a ready-made Ubuntu VM with GNOME
-conduit create myvm
-
-# Open it
-conduit view myvm
+conduit doctor            # checks KVM, the NVIDIA driver, your desktop
+conduit create myvm       # a ready-made Ubuntu VM with GNOME
+conduit view myvm         # open it in a window
 ```
 
 That's it. The VM gets your monitor's resolution and refresh rate
 automatically.
+
+### Everyday commands
+
+| Command | What it does |
+|---|---|
+| `conduit view myvm` | Open the VM in a window (starts it if needed) |
+| `conduit up myvm` / `conduit down myvm` | Start in the background / shut down |
+| `conduit status` | What is running |
+| `conduit ssh myvm` | A terminal inside the VM |
+| `conduit logs myvm` | Logs when something goes wrong |
+| `conduit list` | Your VMs |
 
 > **VM runner:** the package brings its own QEMU 11.1 (in `/opt/conduit`), so
 > it works on systems whose QEMU is too old (for example Ubuntu 24.04). Your
@@ -82,20 +115,31 @@ or `packaging/release.sh X.Y.Z`); GitHub then builds every package for that tag.
 | `Ctrl+Alt+D` | Direct mode: lowest latency (fullscreen, no overlay) |
 | `Ctrl+Alt+R` | Window size changes the VM's resolution / just scales it |
 
-### Play it from another computer
+## Play it from another computer (Moonlight)
 
-```bash
-conduit stream myvm             # stream it (NVENC: AV1/HEVC/H.264, up to 240 fps)
-conduit stream pair 1234        # the PIN Moonlight shows when you add this computer
-```
+Stream the VM to any device with [Moonlight](https://moonlight-stream.org)
+(Windows, macOS, Linux, Android, iOS, TVs, Steam Deck). No Sunshine needed:
+Conduit is the server.
 
-Any [Moonlight](https://moonlight-stream.org) client works: add this computer,
-pair, start "myvm". Keyboard, mouse and gamepads go to the VM. `--service`
-keeps streaming in the background. Conduit's own viewer can connect too
-(`conduit stream myvm --link` here, `conduit remote THIS-PC` there), losslessly
-with `--lossless` on a 10 GbE link. Details: [docs/STREAMING.md](docs/STREAMING.md).
+1. On this computer: `conduit stream myvm`
+2. In Moonlight: click **+**, type this computer's IP (or `localhost` on the
+   same machine). Moonlight shows a **PIN**.
+3. On this computer: `conduit stream pair 1234` (the PIN you see).
+4. In Moonlight: click the computer, then **Desktop**.
 
-### Using virt-manager or virsh instead
+**Settings** (resolution, **FPS** up to 240, **bitrate**, **codec** AV1/HEVC/H.264):
+the **gear icon ⚙** on Moonlight's start screen, before you start the stream.
+The VM switches to the resolution you pick automatically.
+
+In a stream: **Ctrl+Alt+Shift+Q** quits, **Ctrl+Alt+Shift+Z** captures or
+releases mouse and keyboard. Keyboard, mouse and gamepads go to the VM.
+
+`conduit stream myvm --service` keeps streaming in the background. Conduit's
+own viewer can connect too (`conduit stream myvm --link` here,
+`conduit remote THIS-PC --lossless` there; lossless needs ~1 Gbit/s+).
+Details: [docs/STREAMING.md](docs/STREAMING.md).
+
+## Using virt-manager or virsh (🚧 in progress)
 
 Already have VMs in virt-manager? Add Conduit to one of them:
 
@@ -135,6 +179,12 @@ isolation like a dedicated GPU: only run VMs you trust. See
 | `conduit view` says no KVM | Enable virtualization (VT-x / AMD-V) in your BIOS |
 | Black window | `conduit status myvm`, then `conduit logs myvm` |
 | Low fps when idle | Normal: the VM only draws when something changes |
+| "not enough free memory" | Close apps or give the VM less RAM; `--no-mem-check` skips the check |
+| Overlay says `COMPOSITED` in fullscreen | Your desktop composites the window; see [direct scanout](docs/SCANOUT.md). On Hyprland: `conduit view myvm --tune-hyprland`, then `Ctrl+Alt+F`, `Ctrl+Alt+D` |
+| Stream: "ports are in use" | Another `conduit stream` or Sunshine is running; stop it, or use `--port 48089` |
+| Moonlight: Windows/Super key does nothing | Moonlight settings → *Capture system keyboard shortcuts* → **Always** |
+| Steam window errors | Steam is an X11 app (runs through XWayland); see [docs/CLIPBOARD.md](docs/CLIPBOARD.md) for the session setup and open an issue with `conduit logs myvm` |
+| Anything else | `conduit doctor myvm` and `conduit logs myvm` |
 
 ## Credits
 
