@@ -105,7 +105,7 @@ clean:
 	rm -rf dist
 
 help:
-	@sed -n '/^#/p;/^374064/q' Makefile
+	@awk 'NF==0{exit} {print}' Makefile
 
 release:
 	packaging/release.sh patch
