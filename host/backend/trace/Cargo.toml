@@ -1,0 +1,10 @@
+[package]
+name = "conduit-trace"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+description = "The backend's request trace: record format, decoding, filtering and summaries"
+
+[dependencies]
+protocol = { workspace = true }
+abi      = { workspace = true }

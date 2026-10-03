@@ -20,6 +20,8 @@ pub mod replay;
 pub mod sandbox;
 pub mod shm;
 pub mod shm_regions;
+#[cfg(feature = "trace")]
+pub mod trace;
 pub mod userspace;
 pub mod virtio;
 pub mod vram;

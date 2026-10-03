@@ -213,7 +213,9 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
     let mut cmd = Command::new(backend);
     cmd.arg("--socket")
         .arg(&sock)
-        .args(["--caps", "graphics,video,utility,compute"]);
+        .args(["--caps", "graphics,video,utility,compute"])
+        .arg("--trace-socket")
+        .arg(crate::trace::socket(&c.name));
     if let Some(m) = mode {
         cmd.arg("--display")
             .arg(m.to_string())

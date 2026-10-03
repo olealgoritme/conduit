@@ -2947,4 +2947,228 @@ mod tests {
         be.set_host_driver_version(v615()).unwrap();
         assert!(be.set_vram_limit_mib(Some(100)).is_ok());
     }
+
+    #[cfg(feature = "trace")]
+    mod trace_tests {
+        use super::*;
+        use conduit_trace::{Call, Kind, Refusal};
+
+        fn traced(be: &mut NvidiaBackend, msg: &[u8]) -> (Vec<u8>, conduit_trace::Record) {
+            let mut resp = vec![0u8; 4096];
+            let (n, r) = be.dispatch_traced(msg, &mut resp, crate::trace::now_ns());
+            resp.truncate(n);
+            (resp, r)
+        }
+
+        #[test]
+        fn a_forwarded_control_is_recorded_with_its_host_time() {
+            let host = CountingHost::default();
+            let (mut be, h) = backend_on(&host);
+            let cmd = allowed_control();
+            let msg = ioctl_msg(h, abi::ioctl::NV_ESC_RM_CONTROL, &rm_control(cmd, 0));
+            let (_, r) = traced(&mut be, &msg);
+            assert_eq!(host.calls().len(), 1);
+            assert_eq!((r.kind, r.call), (Kind::Ioctl, Call::Control));
+            assert_eq!(r.sub, Some(cmd));
+            assert_eq!(r.handle as u64, h);
+            assert_eq!((r.size_in, r.size_out), (32, 32));
+            assert_eq!((r.errno, r.nv_status), (0, Some(0)));
+            assert_eq!((r.refusal, r.host_calls), (Refusal::None, 1));
+            let (start, end) = r.host_ns.expect("the host was called");
+            assert!(start <= end, "{start} <= {end}");
+        }
+
+        #[test]
+        fn tracing_changes_nothing_the_guest_sees() {
+            let host = CountingHost::default();
+            let (mut be, h) = backend_on(&host);
+            let msg = ioctl_msg(
+                h,
+                abi::ioctl::NV_ESC_RM_CONTROL,
+                &rm_control(allowed_control(), 0),
+            );
+            let mut plain = vec![0u8; 4096];
+            let n = be.dispatch(&msg, &mut plain);
+            plain.truncate(n);
+            let (with_trace, _) = traced(&mut be, &msg);
+            assert_eq!(plain, with_trace);
+            // The host driver is put back: the next untraced call reaches it.
+            be.dispatch(&msg, &mut vec![0u8; 4096]);
+            assert_eq!(host.calls().len(), 3);
+        }
+
+        #[test]
+        fn an_allowlist_refusal_says_so_and_never_reaches_the_host() {
+            let host = CountingHost::default();
+            let (mut be, h) = backend_on(&host);
+            let msg = ioctl_msg(h, abi::ioctl::NV_ESC_RM_CONTROL, &rm_control(0x2080018d, 0));
+            let (_, r) = traced(&mut be, &msg);
+            assert!(host.calls().is_empty());
+            assert_eq!(r.refusal, Refusal::Allowlist);
+            assert_eq!(r.nv_status, Some(0x56), "NV_ERR_NOT_SUPPORTED");
+            assert_eq!((r.host_calls, r.host_ns), (0, None));
+            assert!(r.failed());
+        }
+
+        #[test]
+        fn a_caps_refusal_names_the_class() {
+            let host = CountingHost::default();
+            let (mut be, h) = backend_on(&host);
+            be.set_caps(crate::caps::Caps::parse("graphics,compute").unwrap());
+            let msg = ioctl_msg(h, abi::ioctl::NV_ESC_RM_ALLOC, &rm_alloc(0xc7b7));
+            let (_, r) = traced(&mut be, &msg);
+            assert_eq!((r.call, r.sub), (Call::Alloc, Some(0xc7b7)));
+            assert_eq!(r.refusal, Refusal::Caps);
+            assert_eq!(r.nv_status, Some(0x22), "NV_ERR_INVALID_CLASS");
+        }
+
+        #[test]
+        fn a_bad_handle_is_a_bad_request() {
+            let host = CountingHost::default();
+            let (mut be, _) = backend_on(&host);
+            let msg = ioctl_msg(999, abi::ioctl::NV_ESC_RM_CONTROL, &rm_control(1, 0));
+            let (_, r) = traced(&mut be, &msg);
+            assert_eq!(r.errno, libc::EBADF);
+            assert_eq!(r.refusal, Refusal::BadRequest);
+            // The mark does not leak into the next request.
+            let ok = ioctl_msg(
+                be.handles.handles()[0],
+                abi::ioctl::NV_ESC_RM_CONTROL,
+                &rm_control(allowed_control(), 0),
+            );
+            assert_eq!(traced(&mut be, &ok).1.refusal, Refusal::None);
+        }
+
+        #[test]
+        fn nvkms_and_uvm_are_told_apart_by_the_file() {
+            let host = CountingHost::default();
+            let (mut be, h) = backend_on(&host);
+            be.handle_kinds.insert(h, DeviceKind::Uvm);
+            let (_, r) = traced(&mut be, &ioctl_msg(h, 0x30, &[0u8; 8]));
+            assert_eq!(r.call, Call::Uvm);
+            be.handle_kinds.insert(h, DeviceKind::Modeset);
+            let mut p = vec![0u8; 16];
+            p[0..4].copy_from_slice(&17u32.to_le_bytes());
+            let (_, r) = traced(&mut be, &ioctl_msg(h, 0, &p));
+            assert_eq!((r.call, r.sub), (Call::Nvkms, Some(17)));
+        }
+    }
+
+    /// A control 615.71.09 serves to an unprivileged caller, with no
+    /// parameters to send.
+    fn allowed_control() -> u32 {
+        abi::rmallow::v615_71_09::CTRL
+            .iter()
+            .find(|e| e.params_size == 0 && abi::rmallow::denied(e.cmd).is_none())
+            .expect("a parameterless control")
+            .cmd
+    }
+
+    /// A host that answers at once and remembers nothing.
+    struct NullHost;
+    impl HostDriver for NullHost {
+        fn ioctl(&self, _: RawFd, _: u64, _: &mut [u8]) -> std::result::Result<(), i32> {
+            Ok(())
+        }
+    }
+
+    /// What tracing costs on the serving path, in nanoseconds per
+    /// request, against a host driver that answers instantly -- so the
+    /// numbers are the backend's own overhead and nothing else.
+    ///
+    /// ```text
+    /// cargo test --release -p device --lib bench_dispatch -- --ignored --nocapture
+    /// cargo test --release -p device --lib --no-default-features bench_dispatch -- --ignored --nocapture
+    /// ```
+    /// The second is the same untraced loop with the trace code compiled out.
+    #[test]
+    #[ignore]
+    fn bench_dispatch() {
+        let (mut be, h) = backend_on(&CountingHost::default());
+        be.set_host(Box::new(NullHost));
+        let msg = ioctl_msg(
+            h,
+            abi::ioctl::NV_ESC_RM_CONTROL,
+            &rm_control(allowed_control(), 0),
+        );
+        let mut resp = vec![0u8; 4096];
+        const N: u32 = 1_000_000;
+        let round = |be: &mut NvidiaBackend, resp: &mut Vec<u8>, mode: u8| {
+            let t = std::time::Instant::now();
+            for _ in 0..N {
+                match mode {
+                    // The untraced loop, as it is with tracing compiled out.
+                    0 => {
+                        std::hint::black_box(be.dispatch(&msg, resp));
+                    }
+                    // Tracing compiled in and off: one check per request
+                    // (the transport makes one per batch).
+                    #[cfg(feature = "trace")]
+                    1 => {
+                        if crate::trace::enabled() {
+                            let t0 = crate::trace::now_ns();
+                            let (_, mut r) = be.dispatch_traced(&msg, resp, t0);
+                            r.reply_ns = crate::trace::now_ns() - t0;
+                            crate::trace::emit(r);
+                        } else {
+                            std::hint::black_box(be.dispatch(&msg, resp));
+                        }
+                    }
+                    // Tracing on: everything the transport does per request.
+                    #[cfg(feature = "trace")]
+                    _ => {
+                        let t0 = crate::trace::now_ns();
+                        let (_, mut r) = be.dispatch_traced(&msg, resp, t0);
+                        r.reply_ns = crate::trace::now_ns() - t0;
+                        crate::trace::emit(r);
+                    }
+                    #[cfg(not(feature = "trace"))]
+                    _ => unreachable!(),
+                }
+            }
+            t.elapsed().as_nanos() as f64 / N as f64
+        };
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        round(&mut be, &mut resp, 0); // warm up
+        let mut base = Vec::new();
+        #[cfg(feature = "trace")]
+        let mut off = Vec::new();
+        for _ in 0..7 {
+            base.push(round(&mut be, &mut resp, 0));
+            #[cfg(feature = "trace")]
+            off.push(round(&mut be, &mut resp, 1));
+        }
+        let base = median(base);
+        #[cfg(not(feature = "trace"))]
+        println!("dispatch, ns/request (median of 7 x {N}), trace compiled out: {base:.1}");
+        #[cfg(feature = "trace")]
+        {
+            let off = median(off);
+
+            let null = std::fs::File::create("/dev/null").unwrap();
+            // Already started is fine: another test in this process did it.
+            let _ = crate::trace::start(crate::trace::Options {
+                file: Some((null, conduit_trace::read::Format::Binary)),
+                socket: None,
+            });
+            while !crate::trace::enabled() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let mut on = Vec::new();
+            for _ in 0..7 {
+                on.push(round(&mut be, &mut resp, 2));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let on = median(on);
+            println!(
+                "dispatch, ns/request (median of 7 x {N}):\n  untraced loop     {base:8.1}\n  \
+             trace off (check) {off:8.1}  ({:+.1}%)\n  trace on          {on:8.1}  ({:+.1} ns)",
+                (off - base) / base * 100.0,
+                on - base
+            );
+        }
+    }
 }

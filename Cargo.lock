@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "abi"
+version = "0.1.4"
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -117,10 +121,19 @@ version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
+ "conduit-trace",
  "libc",
  "serde",
  "serde_json",
  "xmltree",
+]
+
+[[package]]
+name = "conduit-trace"
+version = "0.1.4"
+dependencies = [
+ "abi",
+ "protocol",
 ]
 
 [[package]]
@@ -205,6 +218,10 @@ checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "protocol"
+version = "0.1.4"
 
 [[package]]
 name = "quote"

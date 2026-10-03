@@ -88,6 +88,12 @@ impl NvidiaBackend {
         _cookie: u64,
         errno: i32,
     ) -> usize {
+        #[cfg(feature = "trace")]
+        if matches!(status, Status::InvalidMsgType | Status::BadHandle)
+            && self.trace_refusal.get() == conduit_trace::Refusal::None
+        {
+            traced_refusal!(self, BadRequest);
+        }
         let e = if errno != 0 {
             errno.abs()
         } else {

@@ -10,6 +10,17 @@ use crate::error::{DeviceError, Result};
 use crate::handle_table::HandleTable;
 use crate::shm::{ShmAllocator, ZoneConfig};
 
+/// Note why the request being served is answered here, for the trace.
+///
+/// Used on refusal paths, never on the forwarding path. Expands to nothing
+/// when the `trace` feature is off.
+macro_rules! traced_refusal {
+    ($self:expr, $why:ident) => {
+        #[cfg(feature = "trace")]
+        $self.trace_refusal.set(conduit_trace::Refusal::$why);
+    };
+}
+
 // ============================================================
 // Device path helpers
 // ============================================================
@@ -335,6 +346,11 @@ pub struct NvidiaBackend {
     /// `crate::vram`. `Vram::new(None)` is no limit, which is what a VMM that
     /// never sets one gets.
     vram: crate::vram::Vram,
+    /// Why the request being served was answered here rather than by the
+    /// host, for the trace. Set on refusal paths only; read and cleared by
+    /// `dispatch_traced`. See docs/TRACING.md.
+    #[cfg(feature = "trace")]
+    trace_refusal: std::cell::Cell<conduit_trace::Refusal>,
 }
 
 /// A placement the guest can hand back, and everything needed to undo it.
@@ -423,6 +439,8 @@ impl NvidiaBackend {
             display: None,
             dmabufs: Default::default(),
             clip_in: Default::default(),
+            #[cfg(feature = "trace")]
+            trace_refusal: Default::default(),
         }
     }
 
@@ -484,6 +502,7 @@ impl NvidiaBackend {
 
     /// Count a refusal for want of a capability, and say which one once.
     fn refuse_for_caps(&mut self, what: String, needs: &str) {
+        traced_refusal!(self, Caps);
         let n = self.caps_refused.entry(what.clone()).or_insert(0);
         if *n == 0 {
             log::warn!(
@@ -1008,6 +1027,8 @@ mod rm_fd;
 mod rmctrl;
 mod scanout;
 mod simple;
+#[cfg(feature = "trace")]
+mod trace;
 mod uvm;
 mod vidmem;
 mod window;

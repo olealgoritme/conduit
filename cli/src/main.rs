@@ -19,6 +19,7 @@ mod run;
 mod scope;
 mod stream;
 mod sys;
+mod trace;
 mod ui;
 mod units;
 mod virt;
@@ -241,6 +242,38 @@ enum Cmd {
         /// (internal) leave the VM running when streaming ends
         #[arg(long, hide = true)]
         keep_vm: bool,
+    },
+    /// Trace the GPU requests a running VM makes: record them, watch them
+    /// live or summarise their latency (docs/TRACING.md).
+    /// Also: `trace NAME status`, `trace NAME on|off` (the backend's own
+    /// --trace file), `trace analyze FILE`
+    Trace {
+        /// The VM, or `analyze`
+        target: String,
+        /// For `analyze`: the trace file. For a VM: status, on or off
+        arg: Option<String>,
+        /// Print each request as it happens, coloured by latency
+        #[arg(short, long)]
+        follow: bool,
+        /// Show only these: alloc, control, free, map, rm, uvm, nvkms, drm,
+        /// open, close, mmap, munmap, event, errors, refused, slow:>1ms
+        /// (comma-separated or repeated)
+        #[arg(long, value_name = "WHAT")]
+        filter: Vec<String>,
+        /// When done, print counts, p50/p95/p99/max latency per call kind,
+        /// the slowest RM controls and the errors
+        #[arg(long)]
+        summary: bool,
+        /// Write the records to this file (default without --follow or
+        /// --summary: conduit-trace-NAME-TIME.jsonl)
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// json or bin (default: from the file name; .bin is binary)
+        #[arg(long, value_parser = ["json", "bin"])]
+        format: Option<String>,
+        /// Stop after this many seconds instead of at Ctrl-C
+        #[arg(long, value_name = "SECS")]
+        duration: Option<u64>,
     },
     /// Show a VM that another computer streams (`conduit stream NAME --link` there)
     Remote {
@@ -544,6 +577,38 @@ fn main() {
                 })
             }
         }
+        Cmd::Trace {
+            target,
+            arg,
+            follow,
+            filter,
+            summary,
+            output,
+            format,
+            duration,
+        } => match (target.as_str(), arg.as_deref()) {
+            ("analyze", Some(file)) => trace::analyze(std::path::Path::new(file), &filter, follow),
+            ("analyze", None) => Err(ui::oops(
+                "usage: conduit trace analyze FILE",
+                "FILE is a trace from `conduit trace NAME` or the backend's --trace",
+            )),
+            (name, Some(a @ ("status" | "on" | "off"))) => trace::action(name, a),
+            (_, Some(other)) => Err(ui::oops(
+                format!("unknown trace action {other:?}"),
+                "Use: conduit trace NAME [status|on|off] or conduit trace analyze FILE",
+            )),
+            (name, None) => trace::live(
+                name,
+                trace::Opts {
+                    follow,
+                    summary,
+                    output,
+                    format,
+                    filter,
+                    duration,
+                },
+            ),
+        },
         Cmd::Remote {
             host,
             token,

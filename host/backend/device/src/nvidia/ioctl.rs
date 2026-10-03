@@ -208,6 +208,7 @@ impl NvidiaBackend {
 
     /// Count a refusal, and say why the first time.
     pub(super) fn note_allow_refusal(&mut self, what: String, why: String) {
+        traced_refusal!(self, Allowlist);
         let n = self.allow_refused.entry(what.clone()).or_insert(0);
         *n += 1;
         if *n == 1 {
@@ -430,6 +431,7 @@ impl NvidiaBackend {
             };
 
             if refuse {
+                traced_refusal!(self, Abi);
                 *self.abi_refused.entry(escape).or_insert(0) += 1;
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
             }
@@ -468,11 +470,13 @@ impl NvidiaBackend {
                         combined[h..h + 4].copy_from_slice(&1u32.to_le_bytes());
                     }
                     log::debug!("NVKMS cmd={nvkms_cmd} answered locally (vblank sem control)");
+                    traced_refusal!(self, Local);
                     return self.write_ioctl_resp_deep(resp_buf, cookie, &combined, 0);
                 }
                 let allowed = nvkms_cmd <= 1 || (reg..=reg + 4).contains(&nvkms_cmd);
                 if !allowed {
                     log::warn!("NVKMS cmd={nvkms_cmd} refused: acts on the host display");
+                    traced_refusal!(self, HostDisplay);
                     return self.write_error_resp(
                         resp_buf,
                         Status::IoctlFailed,

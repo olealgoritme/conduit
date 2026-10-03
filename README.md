@@ -218,6 +218,7 @@ isolation like a dedicated GPU: only run VMs you trust. See
 | Stream: "ports are in use" | Another `conduit stream` or Sunshine is running; stop it, or use `--port 48089` |
 | Moonlight: Windows/Super key does nothing | Moonlight settings → *Capture system keyboard shortcuts* → **Always** |
 | Steam window errors | Steam is an X11 app (runs through XWayland); see [docs/CLIPBOARD.md](docs/CLIPBOARD.md) for the session setup and open an issue with `conduit logs myvm` |
+| An app fails or is slow on the GPU inside the VM | `conduit trace myvm --follow --filter errors`, or `conduit trace myvm --summary` for latency; see [docs/TRACING.md](docs/TRACING.md) |
 | Anything else | `conduit doctor myvm` and `conduit logs myvm` |
 
 ## Credits

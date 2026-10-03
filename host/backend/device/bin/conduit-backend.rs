@@ -113,6 +113,27 @@ struct Args {
     /// changed between releases.
     #[arg(long)]
     allow_nearest_abi: bool,
+
+    /// Record every guest request to this file (docs/TRACING.md). JSON Lines,
+    /// or the binary format for a name ending in .bin or with
+    /// --trace-format bin. Also taken from CONDUIT_TRACE. SIGUSR1 pauses and
+    /// resumes it.
+    #[cfg(feature = "trace")]
+    #[arg(long, value_name = "PATH")]
+    trace: Option<PathBuf>,
+
+    /// json or bin. Default: from the file name (.bin is binary), else json.
+    /// Also taken from CONDUIT_TRACE_FORMAT.
+    #[cfg(feature = "trace")]
+    #[arg(long, value_name = "json|bin", value_parser = ["json", "bin"])]
+    trace_format: Option<String>,
+
+    /// A control socket for tracing a running backend: `conduit trace NAME`
+    /// connects to it to stream records live. Must be in a directory the
+    /// backend can create sockets in.
+    #[cfg(feature = "trace")]
+    #[arg(long, value_name = "PATH")]
+    trace_socket: Option<PathBuf>,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -262,6 +283,43 @@ fn event_ready_bytes(handle: u32) -> Vec<u8> {
 /// a guest whose driver predates this queue having a use -- and a reason to
 /// drop the notification rather than to fail.
 fn push_event(vring: &VringRwLock, mem: &GuestMemoryAtomic<GuestMemoryMmap>, handle: u32) -> bool {
+    #[cfg(feature = "trace")]
+    if device::trace::enabled() {
+        return push_event_traced(vring, mem, handle);
+    }
+    deliver_event(vring, mem, handle)
+}
+
+/// `push_event`, recorded: an `event` record whose latency is the time it
+/// took to hand the notification to the guest. One the guest had no buffer
+/// posted for is recorded with errno ENOBUFS.
+#[cfg(feature = "trace")]
+#[cold]
+fn push_event_traced(
+    vring: &VringRwLock,
+    mem: &GuestMemoryAtomic<GuestMemoryMmap>,
+    handle: u32,
+) -> bool {
+    use device::trace::format::{Call, Kind, Record};
+    let t0 = device::trace::now_ns();
+    let delivered = deliver_event(vring, mem, handle);
+    device::trace::emit(Record {
+        ts_ns: t0,
+        handle,
+        kind: Kind::Event,
+        call: Call::Event,
+        errno: if delivered { 0 } else { libc::ENOBUFS },
+        reply_ns: device::trace::now_ns().saturating_sub(t0),
+        ..Default::default()
+    });
+    delivered
+}
+
+fn deliver_event(
+    vring: &VringRwLock,
+    mem: &GuestMemoryAtomic<GuestMemoryMmap>,
+    handle: u32,
+) -> bool {
     let guard = mem.memory();
     let mut vr = vring.get_mut();
     let Ok(mut avail) = vr.get_queue_mut().iter(guard.clone()) else {
@@ -746,7 +804,23 @@ impl NvGpuBackend {
     }
 
     /// Drain one virtqueue, dispatching every chain.
+    ///
+    /// Whether to trace is decided here, once per drain, and the drain itself
+    /// is compiled twice: with tracing off it is exactly the untraced loop,
+    /// with no per-request check at all (docs/TRACING.md).
     fn process(
+        &mut self,
+        vring: &VringRwLock,
+        mem: &GuestMemoryLoadGuard<GuestMemoryMmap>,
+    ) -> std::io::Result<bool> {
+        #[cfg(feature = "trace")]
+        if device::trace::enabled() {
+            return self.drain::<true>(vring, mem);
+        }
+        self.drain::<false>(vring, mem)
+    }
+
+    fn drain<const TRACE: bool>(
         &mut self,
         vring: &VringRwLock,
         mem: &GuestMemoryLoadGuard<GuestMemoryMmap>,
@@ -759,6 +833,10 @@ impl NvGpuBackend {
             };
             let Some(chain) = avail.next() else { break };
             drop(guard);
+            #[cfg(feature = "trace")]
+            let t_recv = if TRACE { device::trace::now_ns() } else { 0 };
+            #[cfg(feature = "trace")]
+            let mut record = None;
 
             let head = chain.head_index();
             let mut resp_desc = None;
@@ -781,11 +859,18 @@ impl NvGpuBackend {
                 Some(d) => {
                     let cap = std::cmp::min(d.len() as usize, RESP_MAX);
                     let resp = &mut self.resp[..cap];
-                    let n = self
-                        .nvidia
-                        .lock()
-                        .expect("backend mutex")
-                        .dispatch(&self.req, resp);
+                    let mut nvidia = self.nvidia.lock().expect("backend mutex");
+                    #[cfg(feature = "trace")]
+                    let n = if TRACE {
+                        let (n, r) = nvidia.dispatch_traced(&self.req, resp, t_recv);
+                        record = Some(r);
+                        n
+                    } else {
+                        nvidia.dispatch(&self.req, resp)
+                    };
+                    #[cfg(not(feature = "trace"))]
+                    let n = nvidia.dispatch(&self.req, resp);
+                    drop(nvidia);
                     if n > 0 {
                         mem.write_slice(&resp[..n], d.addr()).map_err(|e| {
                             std::io::Error::other(format!("write response descriptor: {e}"))
@@ -802,6 +887,11 @@ impl NvGpuBackend {
             vring
                 .add_used(head, written as u32)
                 .map_err(|e| std::io::Error::other(format!("add_used: {e}")))?;
+            #[cfg(feature = "trace")]
+            if TRACE && let Some(mut r) = record {
+                r.reply_ns = device::trace::now_ns().saturating_sub(t_recv);
+                device::trace::emit(r);
+            }
             used = true;
             self.served = true;
         }
@@ -977,6 +1067,39 @@ fn activated_listener() -> Option<vhost::vhost_user::Listener> {
     Some(unsafe { vhost::vhost_user::Listener::from_raw_fd(SD_LISTEN_FDS_START) })
 }
 
+/// The `--trace` file (or `CONDUIT_TRACE`), created and truncated.
+#[cfg(feature = "trace")]
+fn open_trace_file(
+    args: &Args,
+) -> anyhow::Result<Option<(std::fs::File, device::trace::format::read::Format)>> {
+    use device::trace::format::read::Format;
+    let Some(path) = args
+        .trace
+        .clone()
+        .or_else(|| std::env::var_os("CONDUIT_TRACE").map(PathBuf::from))
+        .filter(|p| !p.as_os_str().is_empty())
+    else {
+        return Ok(None);
+    };
+    let format = match args
+        .trace_format
+        .clone()
+        .or_else(|| std::env::var("CONDUIT_TRACE_FORMAT").ok())
+    {
+        Some(f) => Format::parse(&f)
+            .ok_or_else(|| anyhow::anyhow!("trace format {f:?}: expected json or bin"))?,
+        None => Format::for_path(&path),
+    };
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|e| anyhow::anyhow!("trace file {}: {e}", path.display()))?;
+    log::info!("trace: writing {format:?} records to {}", path.display());
+    Ok(Some((file, format)))
+}
+
 /// Like `VhostUserDaemon::serve`: a guest that quits mid-message is a normal end.
 fn disconnect_is_ok(e: vhost_user_backend::Error) -> Result<(), vhost_user_backend::Error> {
     use vhost::vhost_user::Error as VuError;
@@ -1001,11 +1124,25 @@ fn main() -> anyhow::Result<()> {
     // starts one. Everything the backend needs afterwards -- the GPU nodes,
     // the driver's own trees, and the directory its socket is bound in -- is
     // named here, because a ruleset cannot be added to once it is in force.
-    let socket_dir = Path::new(&args.socket)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let dir_of = |p: &Path| {
+        p.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    let socket_dir = dir_of(Path::new(&args.socket));
+    #[allow(unused_mut)]
+    let mut socket_dirs = vec![socket_dir];
+    // The trace file is opened now: under the sandbox no file can be created.
+    #[cfg(feature = "trace")]
+    let trace_file = open_trace_file(&args)?;
+    #[cfg(feature = "trace")]
+    if let Some(p) = &args.trace_socket {
+        let d = dir_of(p);
+        if !socket_dirs.contains(&d) {
+            socket_dirs.push(d);
+        }
+    }
     let report = device::sandbox::enter(&device::sandbox::Paths {
         devices: device::sandbox::gpu_nodes(),
         read_only: vec![
@@ -1014,7 +1151,7 @@ fn main() -> anyhow::Result<()> {
             PathBuf::from("/sys/bus/pci/devices"),
             PathBuf::from("/sys/devices"),
         ],
-        sockets: vec![socket_dir],
+        sockets: socket_dirs,
     })?;
     log::info!(
         "sandbox: landlock ABI {}, {} seccomp instructions; no path outside the GPU nodes, the \
@@ -1077,6 +1214,21 @@ fn main() -> anyhow::Result<()> {
         display,
         input_target,
     )?));
+    #[cfg(feature = "trace")]
+    {
+        if let Some(v) = host::driver_version(&args.proc_nvidia)
+            .as_deref()
+            .and_then(abi::version::DriverVersion::parse)
+        {
+            device::trace::set_driver(v);
+        }
+        device::trace::start(device::trace::Options {
+            file: trace_file,
+            socket: args.trace_socket.clone(),
+        })
+        .map_err(|e| anyhow::anyhow!("tracing: {e}"))?;
+    }
+
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.
     let mut daemon = VhostUserDaemon::new(

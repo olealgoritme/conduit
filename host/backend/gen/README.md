@@ -16,6 +16,7 @@ and checked in.
 | `osdesc_extract.py` | open-gpu-kernel-modules | `src/osdesc/` |
 | `vidmem_extract.py` | open-gpu-kernel-modules | `src/vidmem/` (`--vram-limit-mib`) |
 | `nvgpu_gen.py` | open-gpu-kernel-modules | `guest/linux/gen/` |
+| `names_extract.py` | open-gpu-kernel-modules (several releases), `drm.h` | `src/names/table.rs` (names in traces) |
 
 The `*_extract.py` scripts compile a small C probe against the release's own
 headers (Python 3 and a C compiler; no Go). An entry a script cannot classify

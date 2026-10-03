@@ -171,6 +171,7 @@ impl NvidiaBackend {
         if self.vram.admit(bytes) {
             return None;
         }
+        traced_refusal!(self, VramLimit);
         if self.vram.refused() == 1 {
             log::warn!(
                 "video memory: refused {} MiB with {} of {} MiB in use; further \

@@ -55,6 +55,7 @@ impl NvidiaBackend {
         // already initialised by then and cannot be un-initialised, so the
         // refusal has to attach to the handle.
         if self.uvm_denied.contains(&handle) {
+            traced_refusal!(self, UvmPageable);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EPERM);
         }
 
@@ -166,6 +167,7 @@ impl NvidiaBackend {
                     self.driver.expect("a UVM table implies a known release")
                 ),
             );
+            traced_refusal!(self, UvmPageable);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EPERM);
         }
 

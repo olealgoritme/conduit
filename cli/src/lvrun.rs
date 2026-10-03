@@ -532,7 +532,9 @@ pub fn backend_exec(name: &str) -> Result<()> {
     // folder its sandbox may reach (the viewer's display socket is there).
     cmd.arg("--socket")
         .arg(rt.p("gpu-libvirt.sock"))
-        .args(["--caps", "graphics,video,utility,compute"]);
+        .args(["--caps", "graphics,video,utility,compute"])
+        .arg("--trace-socket")
+        .arg(crate::trace::socket(name));
     if let Some(m) = mode {
         cmd.arg("--display")
             .arg(m.to_string())
