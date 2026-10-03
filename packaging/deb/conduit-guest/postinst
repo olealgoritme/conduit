@@ -16,6 +16,8 @@ if command -v udevadm >/dev/null 2>&1; then
 fi
 if command -v systemctl >/dev/null 2>&1; then
     systemctl --global enable conduit-clipboard.service 2>/dev/null || true
+    # 50-conduit-powerkey.conf: logind rereads its settings on SIGHUP.
+    systemctl kill -s HUP systemd-logind 2>/dev/null || true
 fi
 
 command -v dkms >/dev/null 2>&1 || { echo "$NAME: dkms not installed" >&2; exit 0; }

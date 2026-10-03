@@ -40,6 +40,7 @@ install -D -m0755 guest/agent/conduit-clipboard-agent %{buildroot}%{_bindir}/con
 install -D -m0644 guest/agent/conduit-clipboard.service %{buildroot}%{_userunitdir}/conduit-clipboard.service
 install -D -m0644 guest/agent/conduit-clipboard.desktop %{buildroot}%{_sysconfdir}/xdg/autostart/conduit-clipboard.desktop
 install -D -m0644 guest/agent/70-conduit-clipboard.rules %{buildroot}%{_udevrulesdir}/70-conduit-clipboard.rules
+install -D -m0644 guest/power/50-conduit-powerkey.conf %{buildroot}/usr/lib/systemd/logind.conf.d/50-conduit-powerkey.conf
 install -D -m0644 guest/agent/README.md %{buildroot}%{_docdir}/%{name}/README.clipboard.md
 
 %post
@@ -64,6 +65,7 @@ dkms remove -m %{name} -v %{version} --all -q 2>/dev/null || :
 %{_userunitdir}/conduit-clipboard.service
 %config(noreplace) %{_sysconfdir}/xdg/autostart/conduit-clipboard.desktop
 %{_udevrulesdir}/70-conduit-clipboard.rules
+/usr/lib/systemd/logind.conf.d/50-conduit-powerkey.conf
 %doc %{_docdir}/%{name}/README.clipboard.md
 
 %changelog

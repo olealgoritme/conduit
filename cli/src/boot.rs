@@ -87,7 +87,11 @@ fn debugfs() -> Result<PathBuf> {
 }
 
 fn run_debugfs(tool: &Path, disk: &Path, req: &str) -> Result<String> {
+    // -c (catastrophic mode): read without the allocation bitmaps, so a disk
+    // left unclean by a forced power-off (bitmap checksums not yet fixed by
+    // the guest's journal replay) still gives up its kernel. Read-only.
     let out = Command::new(tool)
+        .arg("-c")
         .arg("-R")
         .arg(req)
         .arg(disk)

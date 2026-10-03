@@ -534,7 +534,7 @@ pub(crate) fn start_watcher(name: &str, logs: &Path, rt: &Rt) -> Result<()> {
 fn prepare(c: &VmConfig) -> Result<(Rt, sys::Lock)> {
     std::fs::create_dir_all(c.logs_dir())?;
     let rt = Rt::new(&c.name)?;
-    let lock = sys::lock(&rt.p("lock"), Duration::from_secs(60))?;
+    let lock = sys::lock_vm(&rt.p("lock"), &c.name, LOCK_WAIT)?;
     Ok((rt, lock))
 }
 
@@ -711,13 +711,14 @@ pub fn up(name: &str, display: Option<Mode>, headless: bool, vmm: Option<VmmKind
         return crate::lvrun::up(name, &link, display, headless);
     }
     let c = VmConfig::load(name)?;
+    // First: a stop or start in progress finishes (we wait, and say so).
+    let (rt, _lock) = prepare(&c)?;
     if is_running(name) {
         ui::info(format!(
             "{name} is already running (`conduit status {name}`)"
         ));
         return Ok(());
     }
-    let (rt, _lock) = prepare(&c)?;
     stop_leftovers(&c, &rt);
     // A display (with no window yet) lets `conduit view` attach later.
     let mode = if headless {
@@ -728,7 +729,7 @@ pub fn up(name: &str, display: Option<Mode>, headless: bool, vmm: Option<VmmKind
     let mut st = State::default();
     if let Err(e) = preflight(&c, vmm).and_then(|p| boot(&c, &rt, &mut st, &p, mode)) {
         drop(_lock);
-        let _ = down_inner(&c, true, false);
+        let _ = down_inner(&c, true, false, Stop::Force);
         return Err(e);
     }
     let n = c.net();
@@ -821,7 +822,7 @@ pub fn view(
             Ok(p) => Some(p),
             Err(e) => {
                 drop(lock);
-                let _ = down_inner(&c, true, false);
+                let _ = down_inner(&c, true, false, Stop::Force);
                 return Err(e);
             }
         }
@@ -870,7 +871,7 @@ pub fn view(
     })();
     if let Err(e) = result {
         drop(lock);
-        let _ = down_inner(&c, true, false);
+        let _ = down_inner(&c, true, false, Stop::Force);
         return Err(e);
     }
     ui::info(format!(
@@ -937,7 +938,23 @@ pub fn ssh_cmd(c: &VmConfig, user: &str) -> Command {
     cmd
 }
 
-fn guest_poweroff(c: &VmConfig, vm_pid: i32) -> bool {
+/// How long a command waits for another one that is starting/stopping the VM
+/// (longer than a whole stop: grace + force).
+pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(90);
+/// How long a clean (ACPI) shutdown may take before the VM is forced off.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// How to stop a VM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// Power button (and `systemctl poweroff` over ssh); forced off after the grace.
+    Soft(Duration),
+    /// Pull the plug now.
+    Force,
+}
+
+/// Ask the guest over ssh to power off (or reboot); true when it accepted.
+pub(crate) fn guest_ask(c: &VmConfig, action: &str) -> bool {
     let ask = |user: &str, cmd: &str| {
         ssh_cmd(c, user)
             .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", cmd])
@@ -948,23 +965,72 @@ fn guest_poweroff(c: &VmConfig, vm_pid: i32) -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     };
-    let asked = ask("root", "sync; systemctl poweroff --no-block")
-        || ask(&c.user, "sync; sudo -n systemctl poweroff --no-block");
-    asked && sys::wait_for(Duration::from_secs(30), || !sys::alive(vm_pid))
+    ask("root", &format!("sync; systemctl {action} --no-block"))
+        || ask(
+            &c.user,
+            &format!("sync; sudo -n systemctl {action} --no-block"),
+        )
 }
 
-pub fn down(name: &str) -> Result<()> {
+/// Stop the VM process `v`: the power button, then ssh, within `grace`; then
+/// QEMU `quit`, then signals. Reports a forced stop. True when it went cleanly.
+fn stop_vm(c: &VmConfig, rt: &Rt, st: &State, v: i32, how: Stop, verbose: bool) -> bool {
+    let qemu = st.vmm == "qemu";
+    let clean = match how {
+        Stop::Force => false,
+        Stop::Soft(grace) => {
+            if verbose {
+                ui::info(format!(
+                    "shutting down {} cleanly (forced off after {} s)…",
+                    c.name,
+                    grace.as_secs()
+                ));
+            }
+            let t = std::time::Instant::now();
+            let acpi = qemu && qemu::ask(&rt.qmp_sock(), "system_powerdown");
+            // A desktop may ignore the power button: ask over ssh too, early,
+            // inside the same time budget.
+            let first = if acpi {
+                grace.min(Duration::from_secs(10))
+            } else {
+                Duration::ZERO
+            };
+            sys::wait_for(first, || !sys::alive(v)) || {
+                guest_ask(c, "poweroff");
+                sys::wait_for(grace.saturating_sub(t.elapsed()), || !sys::alive(v))
+            }
+        }
+    };
+    if !clean && sys::alive(v) {
+        if let Stop::Soft(grace) = how {
+            ui::warn(format!(
+                "{} did not power off within {} s (it ignored the power button and ssh); forcing it off",
+                c.name,
+                grace.as_secs()
+            ));
+        } else if verbose {
+            ui::info(format!("forcing {} off", c.name));
+        }
+        if qemu {
+            qemu::quit(&rt.qmp_sock(), v);
+        }
+    }
+    sys::stop_pid(&rt.p("vm.pid"), &st.vm_comm, "VM", Duration::from_secs(5));
+    clean
+}
+
+pub fn down(name: &str, how: Stop) -> Result<()> {
     if let Some(link) = crate::virt::Link::load(name) {
-        return crate::lvrun::down(name, &link);
+        return crate::lvrun::down(name, &link, how);
     }
     let c = VmConfig::load(name)?;
-    down_inner(&c, true, true)
+    down_inner(&c, true, true, how)
 }
 
 /// Stop everything for this VM. `interactive` false: background, no password prompts.
-fn down_inner(c: &VmConfig, interactive: bool, verbose: bool) -> Result<()> {
+fn down_inner(c: &VmConfig, interactive: bool, verbose: bool, how: Stop) -> Result<()> {
     let rt = Rt::new(&c.name)?;
-    let _lock = sys::lock(&rt.p("lock"), Duration::from_secs(60))?;
+    let _lock = sys::lock_vm(&rt.p("lock"), &c.name, LOCK_WAIT)?;
     let st = rt.state();
     let me = std::process::id() as i32;
     if let Some(w) = rt.pid("watcher", &st.watcher_comm) {
@@ -987,27 +1053,7 @@ fn down_inner(c: &VmConfig, interactive: bool, verbose: bool) -> Result<()> {
         );
     }
     if let Some(v) = rt.pid("vm", &st.vm_comm) {
-        if verbose {
-            ui::info(format!("shutting down {} cleanly…", c.name));
-        }
-        let clean = if st.vmm == "qemu" {
-            // ACPI power button first; ssh as a second try; then make QEMU quit.
-            let ok =
-                qemu::powerdown(&rt.qmp_sock(), v, Duration::from_secs(30)) || guest_poweroff(c, v);
-            if !ok && sys::alive(v) {
-                qemu::quit(&rt.qmp_sock(), v);
-            }
-            ok
-        } else {
-            guest_poweroff(c, v)
-        };
-        if !clean && sys::alive(v) {
-            ui::warn(format!(
-                "could not reach {} to shut it down cleanly; stopping it",
-                c.name
-            ));
-        }
-        sys::stop_pid(&rt.p("vm.pid"), &st.vm_comm, "VM", Duration::from_secs(5));
+        stop_vm(c, &rt, &st, v, how, verbose);
     }
     if !st.virtiofsd_comm.is_empty() {
         sys::stop_pid(
@@ -1079,7 +1125,7 @@ pub fn watch(name: &str) -> Result<()> {
             break;
         }
     }
-    down_inner(&c, false, true)
+    down_inner(&c, false, true, Stop::Soft(SHUTDOWN_GRACE))
 }
 
 pub fn status(name: Option<&str>) -> Result<()> {

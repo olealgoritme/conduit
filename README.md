@@ -79,7 +79,12 @@ automatically.
 | Command | What it does |
 |---|---|
 | `conduit view myvm` | Open the VM in a window (starts it if needed) |
-| `conduit up myvm` / `conduit down myvm` | Start in the background / shut down |
+| `conduit up myvm` | Start in the background (`conduit view myvm` attaches a window any time) |
+| `conduit down myvm` | Shut down cleanly; forced off after 30 s (`--timeout N`, `--force` = now) |
+| `conduit shutdown myvm` / `conduit reboot myvm` | Press the power button and wait / restart the guest cleanly |
+| `conduit pause myvm` / `conduit resume myvm` | Freeze / continue the VM |
+| `conduit reset myvm` / `conduit poweroff myvm` | Hard reset / turn off immediately |
+| `conduit doctor myvm` | Check everything one VM needs |
 | `conduit status` | What is running |
 | `conduit ssh myvm` | A terminal inside the VM |
 | `conduit logs myvm` | Logs when something goes wrong |

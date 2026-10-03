@@ -63,4 +63,5 @@ package_conduit-guest-dkms() {
   install -Dm0644 guest/agent/conduit-clipboard.service "$pkgdir/usr/lib/systemd/user/conduit-clipboard.service"
   install -Dm0644 guest/agent/conduit-clipboard.desktop "$pkgdir/etc/xdg/autostart/conduit-clipboard.desktop"
   install -Dm0644 guest/agent/70-conduit-clipboard.rules "$pkgdir/usr/lib/udev/rules.d/70-conduit-clipboard.rules"
+  install -Dm0644 guest/power/50-conduit-powerkey.conf "$pkgdir/usr/lib/systemd/logind.conf.d/50-conduit-powerkey.conf"
 }

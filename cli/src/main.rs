@@ -13,6 +13,7 @@ mod mem;
 mod mode;
 mod net;
 mod paths;
+mod power;
 mod qemu;
 mod run;
 mod scope;
@@ -141,8 +142,34 @@ enum Cmd {
         #[arg(long)]
         keep_running: bool,
     },
-    /// Shut a VM down cleanly and stop everything that belongs to it
-    Down { name: String },
+    /// Shut a VM down cleanly (power button), forced off after the timeout,
+    /// and stop everything that belongs to it
+    Down {
+        name: String,
+        /// Seconds to wait for a clean shutdown before forcing it off
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        /// Force it off now (like pulling the plug)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Press the VM's power button and wait for it to turn off (never forced)
+    Shutdown {
+        name: String,
+        /// Seconds to wait
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+    },
+    /// Restart the VM's operating system cleanly
+    Reboot { name: String },
+    /// Hard reset (the reset button)
+    Reset { name: String },
+    /// Turn the VM off immediately (same as `down --force`)
+    Poweroff { name: String },
+    /// Pause the VM (its vCPUs stop; memory and GPU state stay)
+    Pause { name: String },
+    /// Continue a paused VM
+    Resume { name: String },
     /// Show what is running
     Status { name: Option<String> },
     /// Show a VM's logs: backend, vm (console) or viewer
@@ -444,7 +471,27 @@ fn main() {
             keep_running,
         } => opt_mode(mode.as_deref())
             .and_then(|m| run::view(&name, m, tune_hyprland, fullscreen, vmm, keep_running)),
-        Cmd::Down { name } => run::down(&name),
+        Cmd::Down {
+            name,
+            timeout,
+            force,
+        } => run::down(
+            &name,
+            if force {
+                run::Stop::Force
+            } else {
+                run::Stop::Soft(std::time::Duration::from_secs(timeout))
+            },
+        ),
+        Cmd::Shutdown { name, timeout } => power::power(
+            &name,
+            power::Power::Shutdown(std::time::Duration::from_secs(timeout)),
+        ),
+        Cmd::Reboot { name } => power::power(&name, power::Power::Reboot),
+        Cmd::Reset { name } => power::power(&name, power::Power::Reset),
+        Cmd::Poweroff { name } => power::power(&name, power::Power::Poweroff),
+        Cmd::Pause { name } => power::power(&name, power::Power::Pause),
+        Cmd::Resume { name } => power::power(&name, power::Power::Resume),
         Cmd::Status { name } => run::status(name.as_deref()),
         Cmd::Logs {
             name,
@@ -612,6 +659,14 @@ mod tests {
                 "--guest-later",
             ],
             vec!["conduit", "detach", "myvm"],
+            vec!["conduit", "down", "myvm", "--timeout", "10"],
+            vec!["conduit", "down", "myvm", "--force"],
+            vec!["conduit", "shutdown", "myvm", "--timeout", "90"],
+            vec!["conduit", "reboot", "myvm"],
+            vec!["conduit", "reset", "myvm"],
+            vec!["conduit", "poweroff", "myvm"],
+            vec!["conduit", "pause", "myvm"],
+            vec!["conduit", "resume", "myvm"],
             vec!["conduit", "libvirt", "enable", "myvm"],
             vec!["conduit", "libvirt", "disable", "myvm"],
             vec!["conduit", "view", "myvm", "--keep-running"],

@@ -123,7 +123,16 @@ directly. Debian/Ubuntu guests only for now.
 | Resume / `virsh resume` | continues |
 | Reboot / `virsh reboot` / `reboot` inside | same QEMU, same backend; the GPU works after it |
 | Shut Down / `virsh shutdown` / `conduit down NAME` | ACPI power-off; QEMU exits; backend and virtiofsd exit; boot files refreshed; the window closes |
-| Force Off / `virsh destroy` | same, without asking the guest |
+| Force Off / `virsh destroy` / `conduit poweroff NAME` | same, without asking the guest |
+| `conduit pause` / `resume` / `reboot` / `reset` / `shutdown` | the same as the virt-manager buttons (`virsh suspend` / `resume` / `reboot` / `reset` / `shutdown`) |
+
+A clean shutdown that does not finish within 30 s (`conduit down --timeout N`,
+also when the window of a VM `conduit view` started closes) is forced off, and
+the command says so. GNOME takes the power button over and ignores it, so the
+`conduit-guest` package sets `HandlePowerKey=poweroff` and
+`PowerKeyIgnoreInhibited=yes` for logind
+(`/usr/lib/systemd/logind.conf.d/50-conduit-powerkey.conf`): the power button
+powers the VM off even with a desktop session open.
 
 **Not supported**: Save (`virsh save`, `managedsave`), snapshots that include
 memory, and migration. The GPU's state lives in the host driver, outside

@@ -30,7 +30,7 @@ use std::time::Duration;
 const NEXT_MODE: &str = "libvirt-next-mode";
 const MODE: &str = "libvirt-mode";
 /// How long an ACPI shutdown may take before the VM is forced off.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(60);
+const SHUTDOWN_GRACE: Duration = run::SHUTDOWN_GRACE;
 
 /// Conduit's VMs: its own, and libvirt VMs `conduit attach` added the GPU to.
 pub fn all_names() -> Vec<String> {
@@ -167,7 +167,22 @@ pub fn view(
     let rt = Rt::new(name)?;
     let logs = logs_dir(name);
     std::fs::create_dir_all(&logs)?;
-    let _lock = sys::lock(&rt.p("lock"), Duration::from_secs(60))?;
+    let _lock = sys::lock_vm(&rt.p("lock"), name, run::LOCK_WAIT)?;
+    // A VM on its way down (closed window, virt-manager Shut Down): let it
+    // finish, visibly and with a limit, then start it fresh.
+    if up_state(link).as_deref() == Some("in shutdown") {
+        ui::info(format!(
+            "{name} is shutting down; waiting for it (up to {} s)…",
+            SHUTDOWN_GRACE.as_secs()
+        ));
+        if !sys::wait_for(SHUTDOWN_GRACE, || !is_up(link)) {
+            ui::warn(format!(
+                "{name} did not finish shutting down; forcing it off"
+            ));
+            link.virsh().run(&["destroy", &link.domain])?;
+        }
+        after_stop(name, link);
+    }
     let running = is_up(link);
     let mode = if running {
         if up_state(link).as_deref() == Some("paused") {
@@ -274,7 +289,7 @@ pub fn view(
     Ok(())
 }
 
-fn stop_viewer(rt: &Rt) {
+pub(crate) fn stop_viewer(rt: &Rt) {
     let st = rt.state();
     let me = std::process::id() as i32;
     if let Some(w) = rt.pid("watcher", &st.watcher_comm) {
@@ -318,7 +333,15 @@ pub fn watch(name: &str, link: &Link) -> Result<()> {
         if !viewer {
             if st.close_stops_vm {
                 ui::info(format!("viewer window closed; shutting {name} down"));
-                virt::shutdown(link, SHUTDOWN_GRACE)?;
+                // Held while stopping: a new `conduit view` waits for it
+                // (and says so) instead of attaching to a VM about to go.
+                let _lock = sys::lock_vm(&rt.p("lock"), name, run::LOCK_WAIT)?;
+                if !virt::shutdown(link, SHUTDOWN_GRACE)? {
+                    ui::warn(format!(
+                        "{name} did not power off within {} s; it was forced off",
+                        SHUTDOWN_GRACE.as_secs()
+                    ));
+                }
             } else {
                 ui::info(format!("viewer window closed; {name} keeps running"));
             }
@@ -329,18 +352,40 @@ pub fn watch(name: &str, link: &Link) -> Result<()> {
     Ok(())
 }
 
-pub fn down(name: &str, link: &Link) -> Result<()> {
+pub fn down(name: &str, link: &Link, how: run::Stop) -> Result<()> {
     link.virsh().reachable()?;
     let rt = Rt::new(name)?;
+    let _lock = sys::lock_vm(&rt.p("lock"), name, run::LOCK_WAIT)?;
     if is_up(link) {
-        ui::info(format!("shutting down {name} cleanly…"));
-        if !virt::shutdown(link, SHUTDOWN_GRACE)? {
-            ui::warn(format!(
-                "{name} did not shut down within a minute; it was powered off"
-            ));
+        match how {
+            run::Stop::Soft(grace) => {
+                ui::info(format!(
+                    "shutting down {name} cleanly (forced off after {} s)…",
+                    grace.as_secs()
+                ));
+                if !virt::shutdown(link, grace)? {
+                    ui::warn(format!(
+                        "{name} did not power off within {} s (it ignored the power button); it was forced off",
+                        grace.as_secs()
+                    ));
+                }
+            }
+            run::Stop::Force => {
+                ui::info(format!("forcing {name} off"));
+                link.virsh().run(&["destroy", &link.domain])?;
+            }
         }
     }
-    stop_viewer(&rt);
+    after_stop(name, link);
+    ui::info(format!("{name} is stopped"));
+    Ok(())
+}
+
+/// After the domain stopped: close the window, make sure the helpers exited.
+pub fn after_stop(name: &str, link: &Link) {
+    if let Ok(rt) = Rt::new(name) {
+        stop_viewer(&rt);
+    }
     // The backend exits when QEMU disconnects; make sure.
     if let Ok(scope) = link.scope() {
         let gone = sys::wait_for(Duration::from_secs(10), || {
@@ -359,8 +404,6 @@ pub fn down(name: &str, link: &Link) -> Result<()> {
             }
         }
     }
-    ui::info(format!("{name} is stopped"));
-    Ok(())
 }
 
 pub fn status(name: &str, link: &Link) -> Result<()> {

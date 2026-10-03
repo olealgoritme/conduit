@@ -260,7 +260,7 @@ pub fn stream(name: &str, o: &Opts, keep_vm: bool) -> Result<()> {
     let st = child.wait()?;
     if started && !keep_vm {
         ui::info(format!("streaming ended; shutting {name} down"));
-        let _ = run::down(name);
+        let _ = run::down(name, run::Stop::Soft(run::SHUTDOWN_GRACE));
     }
     if !st.success() && st.code().is_some() {
         return Err(oops(

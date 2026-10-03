@@ -278,15 +278,12 @@ impl Qmp {
     }
 }
 
-/// ACPI power button, then wait. True when QEMU exited.
-pub fn powerdown(qmp_sock: &Path, pid: i32, timeout: Duration) -> bool {
-    let Ok(mut q) = Qmp::connect(qmp_sock) else {
-        return false;
-    };
-    if q.exec("system_powerdown").is_err() {
-        return false;
-    }
-    sys::wait_for(timeout, || !sys::alive(pid))
+/// Send one argument-less QMP command (system_powerdown, system_reset, stop,
+/// cont); true when QEMU accepted it.
+pub fn ask(qmp_sock: &Path, cmd: &str) -> bool {
+    Qmp::connect(qmp_sock)
+        .and_then(|mut q| q.exec(cmd).map(|_| ()))
+        .is_ok()
 }
 
 /// Ask QEMU to exit now (the guest is not asked). True when it exited.

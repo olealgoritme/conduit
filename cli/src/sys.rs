@@ -308,6 +308,24 @@ pub fn clear_stale_socket(p: &Path) -> Result<()> {
 /// An exclusive lock on a file, released on drop. Not inherited by children (O_CLOEXEC).
 pub struct Lock(#[allow(dead_code)] File);
 
+/// A VM's lock. If another conduit command holds it (starting or stopping the
+/// VM), say so and wait up to `timeout` instead of hanging silently.
+pub fn lock_vm(path: &Path, vm: &str, timeout: Duration) -> Result<Lock> {
+    if let Ok(l) = lock(path, Duration::ZERO) {
+        return Ok(l);
+    }
+    ui::info(format!(
+        "{vm} is busy: another conduit command is starting or stopping it; waiting up to {} s…",
+        timeout.as_secs()
+    ));
+    lock(path, timeout).map_err(|_| {
+        oops(
+            format!("{vm} is still busy after {} s", timeout.as_secs()),
+            format!("See `conduit status {vm}`; `conduit poweroff {vm}` forces it off"),
+        )
+    })
+}
+
 pub fn lock(path: &Path, timeout: Duration) -> Result<Lock> {
     let f = OpenOptions::new()
         .create(true)
