@@ -39,6 +39,11 @@ pub struct StreamConfig {
     /// x-nv-general.useReliableUdp == 13: the encrypted control protocol.
     pub control_v2: bool,
     pub hdr: bool,
+    /// Lossless (conduit link): RGB as G/B/R planes, HEVC 4:4:4.
+    pub lossless: bool,
+    /// The stream is always the guest picture's own size (conduit link):
+    /// the encoder follows it instead of scaling into a fixed size.
+    pub follow_guest: bool,
 }
 
 /// Parse `a=name:value` lines.
@@ -109,6 +114,8 @@ impl StreamConfig {
             audio_packet_ms: num("x-nv-aqos.packetDuration", 5).clamp(1, 20) as u32,
             control_v2: num("x-nv-general.useReliableUdp", 1) == 13,
             hdr: num("x-nv-video[0].dynamicRangeMode", 0) == 1,
+            lossless: false,
+            follow_guest: false,
         };
         Ok(cfg)
     }
@@ -121,8 +128,29 @@ pub struct Requests {
     pub rfi: Option<(u64, u64)>,
 }
 
+/// One encoded frame for a session's sender.
+pub struct Job {
+    pub data: Vec<u8>,
+    pub frame_index: u32,
+    pub idr: bool,
+    pub after_rfi: bool,
+    pub latency_tenth_ms: u16,
+    pub rtp_ts: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Where a session's frames go.
+pub enum Sink {
+    /// Moonlight: the pipeline starts a UDP sender thread (packetizer, FEC).
+    GameStream,
+    /// The conduit link: its connection thread takes the frames.
+    Link(std::sync::mpsc::SyncSender<Job>),
+}
+
 pub struct Session {
     pub id: u32,
+    pub sink: Sink,
     pub cfg: StreamConfig,
     pub launch: Launch,
     pub started: Instant,
@@ -183,9 +211,14 @@ pub fn mode_restore(host: &Host) {
 
 /// ANNOUNCE accepted: replace any running session with this one.
 pub fn start(host: &Arc<Host>, launch: Launch, cfg: StreamConfig) -> Arc<Session> {
+    start_with(host, launch, cfg, Sink::GameStream)
+}
+
+pub fn start_with(host: &Arc<Host>, launch: Launch, cfg: StreamConfig, sink: Sink) -> Arc<Session> {
     stop_current(host, "a new session starts");
     let s = Arc::new(Session {
         id: launch.id,
+        sink,
         cfg: cfg.clone(),
         launch,
         started: Instant::now(),
@@ -216,7 +249,9 @@ pub fn start(host: &Arc<Host>, launch: Launch, cfg: StreamConfig) -> Arc<Session
         cfg.encryption
     );
     *host.session.lock().unwrap() = Some(s.clone());
-    mode_hint(host, cfg.width, cfg.height, cfg.fps);
+    if !cfg.follow_guest {
+        mode_hint(host, cfg.width, cfg.height, cfg.fps);
+    }
     host.broker.kick();
     s
 }

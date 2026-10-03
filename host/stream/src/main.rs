@@ -7,6 +7,7 @@ mod ctl;
 mod gamestream;
 mod gpu;
 mod host;
+mod link;
 mod logging;
 mod pipeline;
 mod session;
@@ -21,6 +22,18 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn link_addresses() {
+        assert_eq!(super::link_addr("box"), "box:48100");
+        assert_eq!(super::link_addr("box:9000"), "box:9000");
+        assert_eq!(super::link_addr("10.0.0.2"), "10.0.0.2:48100");
+        assert_eq!(super::link_addr("fe80::1"), "[fe80::1]:48100");
+        assert_eq!(super::link_addr("[fe80::1]:7"), "[fe80::1]:7");
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -64,6 +77,40 @@ enum Cmd {
         /// Where identity and paired clients live
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Also accept Conduit viewers (`conduit-stream connect`) on this TCP port
+        #[arg(long)]
+        link: bool,
+        #[arg(long, default_value_t = link::DEFAULT_PORT)]
+        link_port: u16,
+    },
+    /// Show what a Conduit viewer needs to connect: the link token and certificate
+    Token {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Show a remote VM in the local viewer: connect to a host's conduit link
+    /// (the viewer must already listen on --socket)
+    Connect {
+        /// HOST or HOST:PORT (default port 48100)
+        host: String,
+        #[arg(long)]
+        token: String,
+        /// The local viewer's socket
+        #[arg(long)]
+        socket: PathBuf,
+        /// h264, hevc or av1 (default: the host's preset; lossless: hevc)
+        #[arg(long)]
+        codec: Option<gpu::Codec>,
+        /// Bit-exact pixels (HEVC 4:4:4 lossless); for 10 GbE links
+        #[arg(long)]
+        lossless: bool,
+        #[arg(long)]
+        yuv444: bool,
+        /// Kbit/s (lossy only; default: the host's preset)
+        #[arg(long, default_value_t = 0)]
+        bitrate_kbps: u32,
+        #[arg(long, default_value_t = 0)]
+        fps: u32,
     },
     /// Enter the PIN a Moonlight client shows, for whichever stream host it is pairing with
     Pair {
@@ -106,7 +153,24 @@ enum Cmd {
         frames: u32,
         #[arg(long)]
         out: PathBuf,
+        /// Only count frames (a stand-in viewer); no import, no encode
+        #[arg(long)]
+        null: bool,
     },
+}
+
+/// HOST, HOST:PORT, IPv6 or [IPv6]:PORT → something TcpStream::connect takes.
+pub fn link_addr(h: &str) -> String {
+    if h.parse::<std::net::SocketAddr>().is_ok() {
+        return h.to_string();
+    }
+    if h.parse::<std::net::Ipv6Addr>().is_ok() {
+        return format!("[{h}]:{}", link::DEFAULT_PORT);
+    }
+    match h.rsplit_once(':') {
+        Some((_, p)) if p.parse::<u16>().is_ok() => h.to_string(),
+        _ => format!("{h}:{}", link::DEFAULT_PORT),
+    }
 }
 
 pub fn parse_size(s: &str) -> Result<(u32, u32)> {
@@ -134,6 +198,8 @@ fn main() {
             link_mbps,
             video_encryption,
             state_dir,
+            link,
+            link_port,
         } => serve(ServeOpts {
             name,
             socket,
@@ -144,6 +210,36 @@ fn main() {
             link_mbps,
             video_encryption,
             state_dir,
+            link: link.then_some(link_port),
+        }),
+        Cmd::Token { state_dir } => (|| {
+            let st = state::State::open(&state_dir.unwrap_or_else(state::default_dir))?;
+            println!("token        {}", st.link_token);
+            println!("certificate  sha256 {}", st.fingerprint());
+            println!(
+                "on the other machine: conduit remote THIS-HOST --token {}",
+                st.link_token
+            );
+            Ok(())
+        })(),
+        Cmd::Connect {
+            host,
+            token,
+            socket,
+            codec,
+            lossless,
+            yuv444,
+            bitrate_kbps,
+            fps,
+        } => link::connect(link::ConnectOpts {
+            addr: link_addr(&host),
+            token,
+            socket,
+            codec,
+            lossless,
+            chroma444: yuv444,
+            bitrate_kbps,
+            fps,
         }),
         Cmd::Pair { pin, wait } => ctl::pair(&pin, Duration::from_secs(wait)).map(|d| {
             println!("paired: {d}");
@@ -186,8 +282,12 @@ fn main() {
             lossless,
             frames,
             out,
+            null,
         } => (|| {
             let (w, h) = parse_size(&size)?;
+            if null {
+                return null_viewer(&socket, frames);
+            }
             encode_test(
                 &socket,
                 gpu::EncParams {
@@ -222,6 +322,7 @@ struct ServeOpts {
     link_mbps: u32,
     video_encryption: bool,
     state_dir: Option<PathBuf>,
+    link: Option<u16>,
 }
 
 fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
@@ -302,6 +403,7 @@ fn serve(o: ServeOpts) -> Result<()> {
     let audio =
         Arc::new(udp::bind(ports.audio).with_context(|| format!("UDP port {}", ports.audio))?);
     let acc = Arc::new(nvhttp::tls_acceptor(&host)?);
+    let acc_link = acc.clone();
 
     host_tx.send((host.clone(), video.clone())).ok();
     {
@@ -342,6 +444,9 @@ fn serve(o: ServeOpts) -> Result<()> {
             }
         });
     }
+    if let Some(port) = o.link {
+        link::serve(host.clone(), port, acc_link)?;
+    }
     ctl::serve(host.clone(), &o.name)?;
     log::info!(
         "streaming {:?}: Moonlight → add this computer{} and pair (`conduit stream pair PIN`); preset {} ({} {} fps {} Mbit/s)",
@@ -356,6 +461,36 @@ fn serve(o: ServeOpts) -> Result<()> {
     loop {
         std::thread::park();
     }
+}
+
+/// A display that takes frames and drops them: measures what arrives.
+fn null_viewer(sock: &std::path::Path, n: u32) -> Result<()> {
+    let sh = broker::Shared::new(broker::CAP_DMABUF | broker::CAP_MODIFIERS);
+    let sock = sock.to_path_buf();
+    let sh2 = sh.clone();
+    std::thread::spawn(move || broker::serve(&sock, sh2, || {}));
+    let mut got = 0u32;
+    let mut t0 = None;
+    let mut sizes = std::collections::BTreeSet::new();
+    while got < n {
+        let mut ib = sh.inbox.lock().unwrap();
+        let (g2, to) = sh.cv.wait_timeout(ib, Duration::from_secs(10)).unwrap();
+        ib = g2;
+        if let Some(f) = ib.frame.take() {
+            t0.get_or_insert_with(Instant::now);
+            sizes.insert((f.desc.width, f.desc.height));
+            got += 1 + ib.superseded as u32;
+            ib.superseded = 0;
+        } else if to.timed_out() {
+            bail!("no frames for 10 s");
+        }
+    }
+    let secs = t0.map(|t| t.elapsed().as_secs_f64()).unwrap_or(1.0);
+    println!(
+        "{got} frames in {secs:.2}s ({:.1} fps), sizes {sizes:?}",
+        got as f64 / secs
+    );
+    Ok(())
 }
 
 fn encode_test(

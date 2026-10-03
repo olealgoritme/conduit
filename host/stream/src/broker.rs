@@ -42,6 +42,7 @@ pub const EV_GRAB: u16 = 10;
 pub const EV_FOCUS: u16 = 11;
 pub const EV_POINTER: u16 = 12;
 pub const EV_BYE: u16 = 13;
+pub const EV_CLOSE: u16 = 14;
 pub const EV_FORMAT: u16 = 16;
 pub const EV_MODE_HINT: u16 = 17;
 /// Gamepad (Conduit addition; only to a backend that announced

@@ -12,7 +12,7 @@ use crate::gamestream::input::Geometry;
 use crate::gamestream::{udp, video};
 use crate::gpu::{self, BufDesc, Codec, CodecCaps, EncParams, FrameOpts, Gpu};
 use crate::host::Host;
-use crate::session::{self, Session, SS_ENC_VIDEO};
+use crate::session::{self, Job, Session, Sink, SS_ENC_VIDEO};
 use std::collections::HashSet;
 use std::net::UdpSocket;
 use std::os::fd::AsRawFd;
@@ -36,14 +36,6 @@ pub const FOURCCS: [u32; 4] = [
     0x34324241, // AB24
 ];
 
-struct Job {
-    data: Vec<u8>,
-    frame_index: u32,
-    ftype: video::FrameType,
-    latency_tenth_ms: u16,
-    rtp_ts: u32,
-}
-
 struct Sender {
     session: u32,
     tx: SyncSender<Job>,
@@ -66,13 +58,14 @@ fn sender_thread(host: Arc<Host>, s: Arc<Session>, sock: Arc<UdpSocket>, rx: Rec
         let Some(to) = udp::video_peer(&s) else {
             continue;
         };
-        let dgrams = pk.frame(
-            &j.data,
-            j.frame_index,
-            j.ftype,
-            j.latency_tenth_ms,
-            j.rtp_ts,
-        );
+        let ftype = if j.idr {
+            video::FrameType::Idr
+        } else if j.after_rfi {
+            video::FrameType::AfterRfi
+        } else {
+            video::FrameType::P
+        };
+        let dgrams = pk.frame(&j.data, j.frame_index, ftype, j.latency_tenth_ms, j.rtp_ts);
         let n: usize = dgrams.iter().map(Vec::len).sum();
         udp::send_paced(&sock, to, &dgrams, host.link_mbps);
         frames += 1;
@@ -99,17 +92,23 @@ fn sender_thread(host: Arc<Host>, s: Arc<Session>, sock: Arc<UdpSocket>, rx: Rec
     }
 }
 
-fn enc_params(host: &Host, s: &Session) -> EncParams {
+/// `picture`: the guest picture's size, for sessions that follow it.
+fn enc_params(host: &Host, s: &Session, picture: (u32, u32)) -> EncParams {
     let c = &s.cfg;
     let caps = host.caps(c.codec);
+    let (width, height) = if c.follow_guest && picture.0 >= 64 && picture.1 >= 64 {
+        (picture.0 & !1, picture.1 & !1)
+    } else {
+        (c.width, c.height)
+    };
     EncParams {
         codec: c.codec as u32,
-        width: c.width,
-        height: c.height,
+        width,
+        height,
         fps: c.fps,
         bitrate_kbps: c.bitrate_kbps,
-        chroma444: (c.chroma444 && caps.yuv444) as u32,
-        lossless: 0,
+        chroma444: ((c.chroma444 || c.lossless) && caps.yuv444) as u32,
+        lossless: (c.lossless && caps.lossless) as u32,
         colorspace: c.colorspace,
         full_range: c.full_range as u32,
         preset: 0,
@@ -226,9 +225,19 @@ fn main_loop(g: &Gpu, host: &Arc<Host>, sock: &Arc<UdpSocket>) {
             continue;
         };
 
-        if enc.as_ref().map(|e| e.0) != Some(s.id) {
+        // A session that follows the guest's size reopens the encoder when it changes.
+        let picture = match &pending {
+            Some(f) => (f.desc.width, f.desc.height),
+            None => g.frame_size(),
+        };
+        let resized = s.cfg.follow_guest
+            && enc.as_ref().is_some_and(|(_, e)| {
+                let want = enc_params(host, &s, picture);
+                (want.width, want.height) != (e.params.width, e.params.height)
+            });
+        if enc.as_ref().map(|e| e.0) != Some(s.id) || resized {
             enc = None;
-            let p = enc_params(host, &s);
+            let p = enc_params(host, &s, picture);
             match g.encoder(&p) {
                 Ok(e) => {
                     log::info!(
@@ -248,14 +257,30 @@ fn main_loop(g: &Gpu, host: &Arc<Host>, sock: &Arc<UdpSocket>) {
                     continue;
                 }
             }
-            let (tx, rx) = sync_channel::<Job>(16);
-            let (h2, s2, k2) = (host.clone(), s.clone(), sock.clone());
-            std::thread::Builder::new()
-                .name("video-send".into())
-                .spawn(move || sender_thread(h2, s2, k2, rx))
-                .expect("thread");
-            sender = Some(Sender { session: s.id, tx });
-            stream_start = Instant::now();
+            match &s.sink {
+                Sink::GameStream => {
+                    if resized && sender.as_ref().is_some_and(|x| x.session == s.id) {
+                        // keep the sender (and its packet sequence)
+                    } else {
+                        let (tx, rx) = sync_channel::<Job>(16);
+                        let (h2, s2, k2) = (host.clone(), s.clone(), sock.clone());
+                        std::thread::Builder::new()
+                            .name("video-send".into())
+                            .spawn(move || sender_thread(h2, s2, k2, rx))
+                            .expect("thread");
+                        sender = Some(Sender { session: s.id, tx });
+                    }
+                }
+                Sink::Link(tx) => {
+                    sender = Some(Sender {
+                        session: s.id,
+                        tx: tx.clone(),
+                    });
+                }
+            }
+            if !resized {
+                stream_start = Instant::now();
+            }
             last_encode = Instant::now() - REPEAT;
             last_cursor = None;
         }
@@ -348,18 +373,14 @@ fn main_loop(g: &Gpu, host: &Arc<Host>, sock: &Arc<UdpSocket>) {
             pk.data.len(),
             if pk.idr { " IDR" } else { "" }
         );
-        let ftype = if pk.idr {
-            video::FrameType::Idr
-        } else if after_rfi {
-            video::FrameType::AfterRfi
-        } else {
-            video::FrameType::P
-        };
         let latency = last_encode.duration_since(received).as_micros() / 100;
         let job = Job {
             data: pk.data.to_vec(),
             frame_index: pk.frame_index as u32,
-            ftype,
+            idr: pk.idr,
+            after_rfi,
+            width: e.params.width,
+            height: e.params.height,
             latency_tenth_ms: latency.min(u16::MAX as u128) as u16,
             rtp_ts: (stream_start.elapsed().as_micros() * 9 / 100) as u32,
         };
