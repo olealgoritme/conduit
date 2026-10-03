@@ -25,8 +25,23 @@ conduit/
     │                  Ubuntu/Fedora headers, viewer selftests
     ├── abi.yml        weekly: new NVIDIA driver release → regenerate ABI
     │                  tables → open a PR
-    └── release.yml    tag → build .debs and attach them to the release
+    └── release.yml    tag → build every package below and attach to the release
 ```
+
+## Release artifacts (built by release.yml on every tag)
+
+| Artifact | For | Built how |
+|---|---|---|
+| `conduit_X_amd64.deb` | Ubuntu, Debian, Mint, Pop!_OS | in an Ubuntu 24.04 container |
+| `conduit-X.x86_64.rpm` | Fedora, RHEL, openSUSE | in a Fedora container |
+| `conduit-X.pkg.tar.zst` | Arch, Manjaro | in an Arch container (+ AUR PKGBUILD) |
+| `conduit-X-x86_64-linux.tar.gz` | everything else | backend and VMM static (musl), viewer with its libraries, `install.sh` |
+| `conduit-guest_X_all.deb` / `.rpm` | inside the VM | DKMS source package for the guest module |
+| `flake.nix` | NixOS | in the repo |
+
+Every package installs to its own prefix (`/opt/conduit` for the bundled QEMU
+and VMM), adds the `conduit` command, a desktop entry, and an AppArmor/SELinux
+rule for libvirt. It never replaces system QEMU or libvirt.
 
 Licenses stay per component: guest driver GPL-2.0, backend Apache-2.0,
 protocol BSD-3-Clause, viewer Apache-2.0 (with its NOTICE), VMM Apache-2.0.

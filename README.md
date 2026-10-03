@@ -28,19 +28,33 @@ from GPU memory to your screen: no copying, no video compression.
 
 ## Install
 
-```bash
-# 1. Install Conduit on your computer (the "host")
-sudo apt install ./conduit_*.deb
+Download the package for your system from the
+[latest release](../../releases/latest), then:
 
-# 2. Create a ready-made Ubuntu VM with GNOME
+| System | Install |
+|---|---|
+| Ubuntu / Debian / Pop!_OS / Mint | `sudo apt install ./conduit_*_amd64.deb` |
+| Fedora / RHEL / openSUSE | `sudo dnf install ./conduit-*.x86_64.rpm` (openSUSE: `sudo zypper install ./conduit-*.rpm`) |
+| Arch / Manjaro / EndeavourOS | `sudo pacman -U ./conduit-*.pkg.tar.zst` |
+| NixOS | `nix run github:olealgoritme/conduit` (flake) |
+| Anything else | `tar xf conduit-*-x86_64-linux.tar.gz && sudo ./conduit/install.sh` |
+
+Then:
+
+```bash
+# Create a ready-made Ubuntu VM with GNOME
 conduit create myvm
 
-# 3. Open it
+# Open it
 conduit view myvm
 ```
 
 That's it. The VM gets your monitor's resolution and refresh rate
 automatically.
+
+> **Older systems** (for example Ubuntu 24.04, whose QEMU is too old): the
+> package brings its own VM runner, so nothing else needs installing or
+> upgrading. Your system QEMU is never touched.
 
 ### Keys inside the viewer
 
