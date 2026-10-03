@@ -436,6 +436,8 @@ struct nb_wl {
      * replace the clipboard selection. */
     struct wl_data_offer          *pending_offer;
     int                            pending_offer_text;
+    bool                           offer_own;         /* selection is ours */
+    bool                           pending_offer_own;
     struct wl_data_source         *source;     /* ours, when we own it       */
     char                          *src_text;   /* what we would send         */
     size_t                         src_len;
@@ -1856,6 +1858,13 @@ static int nb_wl_text_rank(const char *mime)
     return 0;
 }
 
+/* Private MIME type our own data source also offers. A selection offer that
+ * carries it is ours (the guest's text); one without it belongs to someone
+ * else. This does not rely on wl_data_source.cancelled, which Hyprland 0.39
+ * did not deliver when another client took the selection -- the viewer then
+ * kept believing it owned the clipboard and never sent host copies. */
+#define NB_WL_OWN_MIME "application/x-conduit-own"
+
 static const char *nb_wl_text_mime(int rank)
 {
     return rank > 0 && rank <= NB_WL_TEXT_MIMES
@@ -1867,6 +1876,14 @@ static void doffer_offer(void *d, struct wl_data_offer *o, const char *mime)
     struct nb_wl *w = d;
     int rank = nb_wl_text_rank(mime);
 
+    if (!strcmp(mime, NB_WL_OWN_MIME)) {
+        if (w->offer == o) {
+            w->offer_own = true;
+        } else if (w->pending_offer == o) {
+            w->pending_offer_own = true;
+        }
+        return;
+    }
     if (w->offer == o && rank > w->offer_text) {
         w->offer_text = rank;
     } else if (w->pending_offer == o && rank > w->pending_offer_text) {
@@ -1894,6 +1911,7 @@ static void ddev_data_offer(void *d, struct wl_data_device *dev,
     }
     w->pending_offer = o;
     w->pending_offer_text = 0;
+    w->pending_offer_own = false;
     wl_data_offer_add_listener(o, &doffer_listener, w);
 }
 static void ddev_selection(void *d, struct wl_data_device *dev,
@@ -1907,6 +1925,7 @@ static void ddev_selection(void *d, struct wl_data_device *dev,
         }
         w->offer = NULL;
         w->offer_text = 0;
+        w->offer_own = false;
         return;
     }
     /* The offer we were told about in data_offer is now THE selection. */
@@ -1916,12 +1935,23 @@ static void ddev_selection(void *d, struct wl_data_device *dev,
     w->offer = o;
     if (w->pending_offer == o) {
         w->offer_text = w->pending_offer_text;
+        w->offer_own = w->pending_offer_own;
         w->pending_offer = NULL;
         w->pending_offer_text = 0;
+        w->pending_offer_own = false;
     } else {
+        w->offer_own = false;
         /* The protocol promises data_offer first.  Fail this offer closed if a
          * compositor violates that ordering; it has no recorded MIME set. */
         w->offer_text = 0;
+    }
+    /* Someone else's selection: ours is gone even if `cancelled` never came. */
+    if (!w->offer_own && w->source) {
+        wl_data_source_destroy(w->source);
+        w->source = NULL;
+        free(w->src_text);
+        w->src_text = NULL;
+        w->src_len = 0;
     }
     /* Conduit push modes: a new host selection, seen only while focused --
      * the core decides whether it goes to the guest.  Compositors differ in
@@ -2152,6 +2182,7 @@ static int wl_set_clipboard(struct nb_session *s, const char *text, size_t len)
     }
     wl_data_source_add_listener(w->source, &dsrc_listener, w);
     wl_data_source_offer(w->source, NB_CLIP_MIME);
+    wl_data_source_offer(w->source, NB_WL_OWN_MIME);
     /* The serial must be one from a real input event; the compositor rejects
      * a fabricated one, which is the protocol enforcing "only a focused client
      * that has seen input may take the selection". */
@@ -2180,7 +2211,7 @@ static int wl_fetch_clipboard(struct nb_session *s, struct nb_sink *sink,
         nb_sink_clip_skip(sink, "the host clipboard holds no text");
         return -ENOENT;
     }
-    if (w->source) {
+    if (w->offer_own) {
         /* The selection is OURS -- the guest's own text.  Reading it back
          * through the compositor would only echo it. */
         nb_sink_clip_skip(sink, "the host clipboard is the VM's own copy");

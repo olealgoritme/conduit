@@ -1,9 +1,0 @@
-[package]
-name = "nesprobe"
-version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0"
-
-[dependencies]
-# Straight from git as crates.io version is 2 years out-of-date, git is preferable for ash
-ash = { git = "https://github.com/ash-rs/ash", rev = "a9a1fb17e98a0cde146caada86200d809306200d" }
