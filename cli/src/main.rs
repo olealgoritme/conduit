@@ -13,6 +13,7 @@ mod paths;
 mod qemu;
 mod run;
 mod scope;
+mod stream;
 mod sys;
 mod ui;
 mod vm;
@@ -159,6 +160,66 @@ enum Cmd {
         /// libvirt connection, e.g. qemu:///system
         #[arg(long, short = 'c')]
         connect: Option<String>,
+    },
+    /// Stream a VM to Moonlight and Conduit viewers over the network (NVENC).
+    /// Also: `stream pair PIN`, `stream clients`, `stream unpair CLIENT`, `stream status`
+    Stream {
+        /// The VM, or one of: pair, clients, unpair, status, token
+        target: String,
+        /// The PIN (pair) or client name (unpair)
+        arg: Option<String>,
+        /// Defaults for what the client does not ask for: top (AV1 240 fps 200 Mbit/s), balanced, compat
+        #[arg(long, default_value = "top")]
+        preset: String,
+        /// GameStream base port; for a second VM use another, e.g. 48089 (add the host in Moonlight as IP:48089)
+        #[arg(long, default_value_t = 47989)]
+        port: u16,
+        /// Screen mode to start the VM with (the client's resolution takes over once connected)
+        #[arg(long, value_name = "WxH@HZ")]
+        display: Option<String>,
+        /// Keep streaming as a systemd user service (restarts on failure, starts at login)
+        #[arg(long)]
+        service: bool,
+        /// Stop the --service
+        #[arg(long, conflicts_with = "service")]
+        stop: bool,
+        /// Also accept Conduit viewers over the network (`conduit remote`)
+        #[arg(long)]
+        link: bool,
+        /// Offer video encryption to Moonlight clients that ask for it
+        #[arg(long)]
+        video_encryption: bool,
+        /// Pace video bursts to this many Mbit/s (default 1000; 10000 on 10 GbE)
+        #[arg(long)]
+        link_mbps: Option<u32>,
+        /// (internal) leave the VM running when streaming ends
+        #[arg(long, hide = true)]
+        keep_vm: bool,
+    },
+    /// Show a VM that another computer streams (`conduit stream NAME --link` there)
+    Remote {
+        /// The other computer: HOST or HOST:PORT (default port 48100)
+        host: String,
+        /// Its link token (`conduit stream token` there); remembered after the first connect
+        #[arg(long)]
+        token: Option<String>,
+        /// Bit-exact pixels (HEVC 4:4:4 lossless) for 10 GbE links
+        #[arg(long)]
+        lossless: bool,
+        /// h264, hevc or av1 (default: the host's preset)
+        #[arg(long)]
+        codec: Option<String>,
+        /// Video bitrate, e.g. 300M (lossy only)
+        #[arg(long)]
+        bitrate: Option<String>,
+        #[arg(long)]
+        fps: Option<u32>,
+        /// 4:4:4 chroma (lossy, sharper text)
+        #[arg(long)]
+        yuv444: bool,
+        /// Start fullscreen (Ctrl+Alt+F toggles)
+        #[arg(long)]
+        fullscreen: bool,
     },
     /// Check this computer and explain how to fix problems
     Doctor,
@@ -308,6 +369,59 @@ fn main() {
             dry_run,
             connect,
         } => libvirt::attach(&name, dry_run, connect.as_deref()),
+        Cmd::Stream {
+            target,
+            arg,
+            preset,
+            port,
+            display,
+            service,
+            stop,
+            link,
+            video_encryption,
+            link_mbps,
+            keep_vm,
+        } => {
+            if stream::ACTIONS.contains(&target.as_str()) {
+                stream::action(&target, arg.as_slice())
+            } else {
+                opt_mode(display.as_deref()).and_then(|display| {
+                    stream::stream(
+                        &target,
+                        &stream::Opts {
+                            preset,
+                            port,
+                            display,
+                            service,
+                            stop,
+                            link,
+                            video_encryption,
+                            link_mbps,
+                        },
+                        keep_vm,
+                    )
+                })
+            }
+        }
+        Cmd::Remote {
+            host,
+            token,
+            lossless,
+            codec,
+            bitrate,
+            fps,
+            yuv444,
+            fullscreen,
+        } => stream::remote(&stream::RemoteOpts {
+            host,
+            token,
+            lossless,
+            codec,
+            bitrate,
+            fps,
+            fullscreen,
+            yuv444,
+        }),
         Cmd::Doctor => std::process::exit(doctor::run()),
         Cmd::HyprHook { action, state } => hypr::hook(&action, &state),
         Cmd::Watch { name } => run::watch(&name),
@@ -370,6 +484,12 @@ mod tests {
             vec!["conduit", "list"],
             vec!["conduit", "stock-kernel", "lab"],
             vec!["conduit", "doctor"],
+            vec!["conduit", "stream", "myvm"],
+            vec!["conduit", "stream", "myvm", "--service"],
+            vec!["conduit", "stream", "myvm", "--stop"],
+            vec!["conduit", "stream", "pair", "1234"],
+            vec!["conduit", "stream", "clients"],
+            vec!["conduit", "remote", "box", "--lossless"],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }

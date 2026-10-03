@@ -116,6 +116,7 @@ pub enum Tool {
     Userspace,
     GuestDeb,
     BundledQemu,
+    Stream,
 }
 
 impl Tool {
@@ -127,6 +128,7 @@ impl Tool {
             Tool::Userspace => "driver share tool",
             Tool::GuestDeb => "guest driver package (conduit-guest .deb)",
             Tool::BundledQemu => "bundled QEMU",
+            Tool::Stream => "stream host (conduit-stream)",
         }
     }
 
@@ -138,6 +140,7 @@ impl Tool {
             Tool::Userspace => "CONDUIT_USERSPACE",
             Tool::GuestDeb => "CONDUIT_GUEST_DEB",
             Tool::BundledQemu => "CONDUIT_QEMU",
+            Tool::Stream => "CONDUIT_STREAM",
         }
     }
 
@@ -176,6 +179,10 @@ impl Tool {
             Tool::BundledQemu => (
                 &["bin/qemu-system-x86_64"],
                 &["host/qemu/build/qemu-system-x86_64"],
+            ),
+            Tool::Stream => (
+                &["bin/conduit-stream"],
+                &["host/stream/target/release/conduit-stream"],
             ),
         };
         v.extend(installed.iter().map(|p| pf.join(p)));

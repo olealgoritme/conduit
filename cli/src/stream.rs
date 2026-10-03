@@ -239,3 +239,214 @@ pub fn stream(name: &str, o: &Opts, keep_vm: bool) -> Result<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------- conduit remote
+
+pub struct RemoteOpts {
+    pub host: String,
+    pub token: Option<String>,
+    pub lossless: bool,
+    pub codec: Option<String>,
+    pub bitrate: Option<String>,
+    pub fps: Option<u32>,
+    pub fullscreen: bool,
+    pub yuv444: bool,
+}
+
+/// "300M", "80m", "50000k", "2G" → kbit/s.
+pub fn parse_bitrate(s: &str) -> Result<u32> {
+    let t = s.trim().to_ascii_lowercase();
+    let t = t
+        .trim_end_matches("bit/s")
+        .trim_end_matches("bps")
+        .trim_end_matches('b');
+    let (num, mult) = match t.chars().last() {
+        Some('k') => (&t[..t.len() - 1], 1.0),
+        Some('m') => (&t[..t.len() - 1], 1000.0),
+        Some('g') => (&t[..t.len() - 1], 1_000_000.0),
+        _ => (t, 1000.0), // a bare number is Mbit/s
+    };
+    let v: f64 = num.parse().map_err(|_| {
+        oops(
+            format!("\"{s}\" is not a bitrate"),
+            "Write it like 300M or 2G",
+        )
+    })?;
+    let k = (v * mult).round();
+    if !(500.0..=10_000_000.0).contains(&k) {
+        return Err(oops(
+            format!("bitrate {s} is out of range"),
+            "Between 0.5M and 10G",
+        ));
+    }
+    Ok(k as u32)
+}
+
+fn tokens_path() -> PathBuf {
+    paths::config_dir().join("remote-tokens")
+}
+
+fn remembered_token(host: &str) -> Option<String> {
+    let s = std::fs::read_to_string(tokens_path()).ok()?;
+    s.lines()
+        .filter_map(|l| l.split_once(' '))
+        .find(|(h, _)| *h == host)
+        .map(|(_, t)| t.trim().to_string())
+}
+
+fn remember_token(host: &str, token: &str) {
+    let p = tokens_path();
+    let mut lines: Vec<String> = std::fs::read_to_string(&p)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.split_once(' ').map(|(h, _)| h) != Some(host))
+        .map(str::to_string)
+        .collect();
+    lines.push(format!("{host} {token}"));
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&p)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", lines.join("\n"));
+    }
+}
+
+/// Show a VM streamed by another computer in the local viewer.
+pub fn remote(o: &RemoteOpts) -> Result<()> {
+    let viewer = Tool::Viewer.require()?;
+    let bin = Tool::Stream.require()?;
+    let token = match (&o.token, remembered_token(&o.host)) {
+        (Some(t), _) => t.clone(),
+        (None, Some(t)) => t,
+        (None, None) => {
+            return Err(oops(
+                format!("no link token for {}", o.host),
+                format!(
+                    "On {} run `conduit stream token`, then `conduit remote {} --token TOKEN` (remembered after that)",
+                    o.host, o.host
+                ),
+            ))
+        }
+    };
+    let safe: String = o
+        .host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let dir = paths::xdg_runtime().join("conduit");
+    std::fs::create_dir_all(&dir)?;
+    let sock = dir.join(format!("remote-{safe}.sock"));
+    if sock.exists() && sys::socket_live(&sock) {
+        return Err(oops(
+            format!("a remote window for {} is already open", o.host),
+            "Look for its window, or close it first",
+        ));
+    }
+    let _ = std::fs::remove_file(&sock);
+    let size = mode::detect().0;
+    let mut v = Command::new(&viewer);
+    let session = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        "wayland"
+    } else {
+        "x11"
+    };
+    v.args(["--backend", session, "--socket"]).arg(&sock).args([
+        "--size",
+        &size.size(),
+        "--title",
+        &format!("{} - Conduit (remote)", o.host),
+        "--present-mode=native",
+        "--scale",
+        "aspect",
+        "--stats",
+    ]);
+    if o.fullscreen {
+        v.arg("--fullscreen");
+    }
+    let log = paths::cache_dir().join(format!("remote-{safe}-viewer.log"));
+    if let Some(d) = log.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let vpid = sys::spawn_detached(&mut v, &log, false)? as i32;
+    if !sys::wait_for(std::time::Duration::from_secs(5), || {
+        sock.exists() || !sys::alive(vpid)
+    }) || !sys::alive(vpid)
+    {
+        return Err(oops(
+            "the viewer window could not open",
+            format!(
+                "Its log ({}) ends with:\n{}",
+                log.display(),
+                sys::tail(&log, 6)
+            ),
+        ));
+    }
+    let mut c = Command::new(&bin);
+    c.args(["connect", &o.host, "--token", &token, "--socket"])
+        .arg(&sock);
+    if o.lossless {
+        c.arg("--lossless");
+    }
+    if o.yuv444 {
+        c.arg("--yuv444");
+    }
+    if let Some(codec) = &o.codec {
+        c.args(["--codec", codec]);
+    }
+    if let Some(b) = &o.bitrate {
+        c.args(["--bitrate-kbps", &parse_bitrate(b)?.to_string()]);
+    }
+    if let Some(f) = o.fps {
+        c.args(["--fps", &f.to_string()]);
+    }
+    ui::info(format!(
+        "connecting to {}{}; close the window to disconnect",
+        o.host,
+        if o.lossless { " (lossless)" } else { "" }
+    ));
+    let mut child = c.spawn().context("could not run conduit-stream")?;
+    // SAFETY: our own SIGINT disposition, after the child exists.
+    unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+    let st = child.wait()?;
+    // SAFETY: plain kill of the viewer we started.
+    unsafe { libc::kill(vpid, libc::SIGTERM) };
+    if st.success() {
+        remember_token(&o.host, &token);
+        Ok(())
+    } else {
+        Err(oops(
+            format!("the link to {} ended with an error", o.host),
+            "Its message is above. Is `conduit stream NAME --link` running there?",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitrates() {
+        assert_eq!(parse_bitrate("300M").unwrap(), 300_000);
+        assert_eq!(parse_bitrate("2G").unwrap(), 2_000_000);
+        assert_eq!(parse_bitrate("50000k").unwrap(), 50_000);
+        assert_eq!(parse_bitrate("80").unwrap(), 80_000);
+        assert_eq!(parse_bitrate("1.5Mbit/s").unwrap(), 1_500);
+        assert!(parse_bitrate("fast").is_err());
+        assert!(parse_bitrate("100k").is_err());
+    }
+}
