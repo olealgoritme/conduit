@@ -26,6 +26,10 @@ allocation block is come from the backend at probe time. The module carries
 the RM control tables for every supported release and picks one by the host's
 version, which it reads from device config.
 
+With a display the module also registers `/dev/conduit-clipboard`
+(`nvgpu_clipboard.h`), which `guest/agent/conduit-clipboard-agent` connects to
+the desktop session's clipboard; see `docs/CLIPBOARD.md`.
+
 ## Building
 
 ```sh

@@ -14,17 +14,34 @@ description: |
   Conduit guest driver (virtio_gpu_nv), DKMS source.
   Install inside a Linux VM (kernel 6.4 or newer) that runs on a Conduit
   host. Lets NVIDIA's own user-space driver render on the host GPU and
-  provides the VM's display and input.
+  provides the VM's display, input and clipboard (conduit-clipboard-agent).
 vendor: Conduit
 homepage: https://github.com/olealgoritme/conduit
 license: GPL-2.0-only
 
-depends: [dkms]
+depends: [dkms, python3]
 
 contents:
   - src: "@GUEST_SRC@"
     dst: "/usr/src/conduit-guest-@VERSION@"
     type: tree
+  # The clipboard agent (guest/agent): runs in each desktop session.
+  - src: "@ROOT@/guest/agent/conduit-clipboard-agent"
+    dst: /usr/bin/conduit-clipboard-agent
+    file_info: {mode: 0755}
+  - src: "@ROOT@/guest/agent/conduit-clipboard.service"
+    dst: /usr/lib/systemd/user/conduit-clipboard.service
+    file_info: {mode: 0644}
+  - src: "@ROOT@/guest/agent/conduit-clipboard.desktop"
+    dst: /etc/xdg/autostart/conduit-clipboard.desktop
+    type: config
+    file_info: {mode: 0644}
+  - src: "@ROOT@/guest/agent/70-conduit-clipboard.rules"
+    dst: /usr/lib/udev/rules.d/70-conduit-clipboard.rules
+    file_info: {mode: 0644}
+  - src: "@ROOT@/guest/agent/README.md"
+    dst: /usr/share/doc/conduit-guest/README.clipboard.md
+    file_info: {mode: 0644}
 
 scripts:
   postinstall: "@SCRIPTS@/conduit-guest-postinst"
@@ -32,9 +49,9 @@ scripts:
 
 overrides:
   deb:
-    recommends: ["linux-headers-generic | linux-headers-amd64"]
+    recommends: ["linux-headers-generic | linux-headers-amd64", wl-clipboard, libx11-6, libxfixes3]
   rpm:
-    recommends: [kernel-devel]
+    recommends: [kernel-devel, wl-clipboard, libX11, libXfixes]
 
 rpm:
   summary: Conduit guest driver (DKMS source)

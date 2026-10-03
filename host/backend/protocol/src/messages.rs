@@ -85,6 +85,14 @@ pub enum MsgType {
     /// cursor plane's image or hotspot changed. Payload [`CursorUpdate`]; the
     /// reply is a bare header.
     CursorUpdate = 24,
+    /// **Host → guest**, on the event queue: one chunk of the host clipboard.
+    /// Payload [`ClipboardChunk`] followed by `len` data bytes. Chunks of one
+    /// transfer arrive in order; the guest reassembles them by `generation`.
+    ClipboardFromHost = 25,
+    /// Guest → host, control queue: one chunk of the guest clipboard. Payload
+    /// [`ClipboardChunk`] followed by `len` data bytes; the reply is a bare
+    /// header, status 0 or a negative errno.
+    ClipboardToHost = 26,
 }
 
 impl MsgType {
@@ -104,6 +112,8 @@ impl MsgType {
             22 => Self::InputEvent,
             23 => Self::DisplayMode,
             24 => Self::CursorUpdate,
+            25 => Self::ClipboardFromHost,
+            26 => Self::ClipboardToHost,
             _ => return None,
         })
     }
@@ -491,6 +501,122 @@ pub fn encode_display_mode(m: &DisplayModeEvent, out: &mut [u8]) -> Option<usize
     Some(DISPLAY_MODE_MESSAGE_LEN)
 }
 
+// ---------------------------------------------------------------------------
+// Clipboard (ClipboardFromHost / ClipboardToHost)
+// ---------------------------------------------------------------------------
+
+/// Largest clipboard transfer either direction carries, bytes.
+pub const CLIPBOARD_MAX_BYTES: u32 = 1 << 20;
+/// The one MIME type defined so far.
+pub const CLIPBOARD_MIME_TEXT: &str = "text/plain;charset=utf-8";
+/// Bytes of [`ClipboardChunk`] before the data.
+pub const CLIPBOARD_CHUNK_HEAD: usize = 56;
+/// Size of the `mime` field.
+pub const CLIPBOARD_MIME_LEN: usize = 32;
+
+/// `mime` field for `m`: NUL-padded ASCII, truncated to fit with a NUL.
+pub fn clipboard_mime(m: &str) -> [u8; CLIPBOARD_MIME_LEN] {
+    let mut o = [0u8; CLIPBOARD_MIME_LEN];
+    let b = m.as_bytes();
+    let n = b.len().min(CLIPBOARD_MIME_LEN - 1);
+    o[..n].copy_from_slice(&b[..n]);
+    o
+}
+
+/// One chunk of a clipboard transfer, following a `MsgHeader`; `len` data
+/// bytes follow it. Rules (both directions): offsets contiguous from 0, offset
+/// 0 starts a new transfer, complete when `offset + len == total_len`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClipboardChunk {
+    pub generation: u64,
+    pub total_len: u32,
+    pub offset: u32,
+    pub len: u32,
+    pub flags: u32,
+    pub mime: [u8; CLIPBOARD_MIME_LEN],
+}
+
+impl ClipboardChunk {
+    pub fn to_bytes(&self) -> [u8; CLIPBOARD_CHUNK_HEAD] {
+        let mut o = [0u8; CLIPBOARD_CHUNK_HEAD];
+        o[0..8].copy_from_slice(&self.generation.to_le_bytes());
+        for (i, v) in [self.total_len, self.offset, self.len, self.flags]
+            .iter()
+            .enumerate()
+        {
+            o[8 + i * 4..12 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        o[24..56].copy_from_slice(&self.mime);
+        o
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < CLIPBOARD_CHUNK_HEAD {
+            return None;
+        }
+        let w = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let mut mime = [0u8; CLIPBOARD_MIME_LEN];
+        mime.copy_from_slice(&b[24..56]);
+        Some(Self {
+            generation: u64::from_le_bytes(b[0..8].try_into().ok()?),
+            total_len: w(8),
+            offset: w(12),
+            len: w(16),
+            flags: w(20),
+            mime,
+        })
+    }
+
+    /// The MIME type up to its first NUL, if it is ASCII.
+    pub fn mime_str(&self) -> Option<&str> {
+        let n = self
+            .mime
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(CLIPBOARD_MIME_LEN);
+        let s = core::str::from_utf8(&self.mime[..n]).ok()?;
+        s.is_ascii().then_some(s)
+    }
+
+    /// True when the type is the defined text type.
+    pub fn is_text(&self) -> bool {
+        self.mime_str() == Some(CLIPBOARD_MIME_TEXT)
+    }
+}
+
+/// Bytes before the data of a whole clipboard message (header + chunk).
+pub const CLIPBOARD_MESSAGE_HEAD: usize = size_of::<MsgHeader>() + CLIPBOARD_CHUNK_HEAD;
+
+/// Encode one clipboard message of type `t` (header, chunk, `data`) into
+/// `out`. `c.len` is taken from `data`. Returns bytes written, or `None` if
+/// `out` is too small.
+pub fn encode_clipboard_chunk(
+    t: MsgType,
+    c: &ClipboardChunk,
+    data: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    let need = CLIPBOARD_MESSAGE_HEAD + data.len();
+    if out.len() < need {
+        return None;
+    }
+    let hdr = MsgHeader::ok(t, 0);
+    for (i, v) in [hdr.msg_type, hdr.handle, hdr.status as u32, hdr.padding]
+        .iter()
+        .enumerate()
+    {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let c = ClipboardChunk {
+        len: data.len() as u32,
+        ..*c
+    };
+    out[16..CLIPBOARD_MESSAGE_HEAD].copy_from_slice(&c.to_bytes());
+    out[CLIPBOARD_MESSAGE_HEAD..need].copy_from_slice(data);
+    Some(need)
+}
+
 /// `CursorUpdate::flags`: the cursor plane shows an image. Clear means the
 /// cursor is hidden (no framebuffer on the plane); the buffer fields are 0.
 pub const CURSOR_F_VISIBLE: u32 = 1 << 0;
@@ -723,6 +849,7 @@ const _: () = {
     assert!(size_of::<InputEventEntry>() == 8);
     assert!(size_of::<DisplayModeEvent>() == 16);
     assert!(size_of::<CursorUpdate>() == 64);
+    assert!(size_of::<ClipboardChunk>() == CLIPBOARD_CHUNK_HEAD);
 };
 
 #[cfg(test)]
@@ -785,6 +912,8 @@ mod tests {
             MsgType::InputEvent,
             MsgType::DisplayMode,
             MsgType::CursorUpdate,
+            MsgType::ClipboardFromHost,
+            MsgType::ClipboardToHost,
         ] {
             assert_eq!(MsgType::from_u32(t as u32), Some(t));
         }
@@ -795,7 +924,9 @@ mod tests {
         assert_eq!(MsgType::InputEvent as u32, 22);
         assert_eq!(MsgType::DisplayMode as u32, 23);
         assert_eq!(MsgType::CursorUpdate as u32, 24);
-        assert_eq!(MsgType::from_u32(25), None);
+        assert_eq!(MsgType::ClipboardFromHost as u32, 25);
+        assert_eq!(MsgType::ClipboardToHost as u32, 26);
+        assert_eq!(MsgType::from_u32(27), None);
     }
 
     /// The event the guest's event-queue handler decodes: header, then
@@ -908,5 +1039,41 @@ mod tests {
         assert_eq!(input_events_that_fit(16), 0);
         assert_eq!(input_events_that_fit(24), 0);
         assert_eq!(input_events_that_fit(24 + 8 * 5 + 7), 5);
+    }
+
+    #[test]
+    fn clipboard_chunk_has_the_c_layout_and_round_trips() {
+        use core::mem::offset_of;
+        assert_eq!(offset_of!(ClipboardChunk, total_len), 8);
+        assert_eq!(offset_of!(ClipboardChunk, offset), 12);
+        assert_eq!(offset_of!(ClipboardChunk, len), 16);
+        assert_eq!(offset_of!(ClipboardChunk, flags), 20);
+        assert_eq!(offset_of!(ClipboardChunk, mime), 24);
+        let c = ClipboardChunk {
+            generation: 0x1122_3344_5566_7788,
+            total_len: 10,
+            offset: 4,
+            len: 6,
+            flags: 0,
+            mime: clipboard_mime(CLIPBOARD_MIME_TEXT),
+        };
+        let b = c.to_bytes();
+        assert_eq!(&b[0..8], &0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(ClipboardChunk::from_bytes(&b), Some(c));
+        assert!(c.is_text());
+        assert_eq!(ClipboardChunk::from_bytes(&b[..55]), None);
+        assert!(!ClipboardChunk::default().is_text());
+
+        let mut out = [0u8; 128];
+        let n = encode_clipboard_chunk(MsgType::ClipboardFromHost, &c, b"abc", &mut out).unwrap();
+        assert_eq!(n, 16 + 56 + 3);
+        assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 25);
+        let back = ClipboardChunk::from_bytes(&out[16..]).unwrap();
+        assert_eq!(back.len, 3);
+        assert_eq!(&out[72..75], b"abc");
+        assert!(
+            encode_clipboard_chunk(MsgType::ClipboardFromHost, &c, b"abc", &mut out[..74])
+                .is_none()
+        );
     }
 }

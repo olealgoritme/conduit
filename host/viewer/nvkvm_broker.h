@@ -75,7 +75,22 @@ extern int nb_trace_frames;
 #define NB_CLIP_G2H      1  /* guest may write the host clipboard; the host
                              * clipboard is never readable by the guest      */
 #define NB_CLIP_CONSENT  2  /* G2H, plus host->guest ONLY on an explicit
-                             * paste trigger.  RECOMMENDED.                  */
+                             * paste trigger.                                */
+/*
+ * Conduit: SEAMLESS modes.  The host clipboard is pushed to the guest without
+ * a paste trigger -- on focus-in and whenever the selection changes while the
+ * window is focused, which is exactly when Wayland lets a client read it at
+ * all.  Paste keys are then ordinary keys.  The window-focus gate on the
+ * guest WRITING the host clipboard stays (held until focus-in).
+ */
+#define NB_CLIP_BOTH     3  /* G2H + host->guest push                       */
+#define NB_CLIP_H2G      4  /* host->guest push only; the guest can never
+                             * write the host clipboard                      */
+
+/* Does mode `m` let the guest write the host clipboard / push host->guest? */
+#define NB_CLIP_MODE_G2H(m)  ((m) == NB_CLIP_G2H || (m) == NB_CLIP_CONSENT || \
+                              (m) == NB_CLIP_BOTH)
+#define NB_CLIP_MODE_PUSH(m) ((m) == NB_CLIP_BOTH || (m) == NB_CLIP_H2G)
 
 /* Keys that mean "paste" and so trigger a host->guest send. */
 #define NB_CLIP_MAX_TRIGGERS 8
@@ -264,7 +279,8 @@ struct nb_sink {
      * count we keep ourselves; nothing the client sends decides how much we
      * store.
      */
-    char     clip_in[NVKVM_BROKER_CLIP_MAX_BYTES + 1];
+    char    *clip_in;           /* malloc'd at first use, clip_in_cap + 1   */
+    unsigned clip_in_cap;
     unsigned clip_in_len;
     unsigned clip_in_chunks;
     uint32_t clip_in_next_chunk;
@@ -283,6 +299,25 @@ struct nb_sink {
     bool     clip_held_ctrl;
     bool     clip_held_shift;
     uint64_t clip_held_generation;
+    /*
+     * Conduit push (NB_CLIP_BOTH / NB_CLIP_H2G).  One fetch in flight; a
+     * change noticed meanwhile is remembered and fetched after it.  The
+     * outbound transfer is STREAMED into the ring as it drains (clip_out),
+     * a newer one waits whole in clip_next -- transfers never interleave,
+     * because the framing has no start marker.  clip_last_* is the content
+     * that most recently crossed in EITHER direction: pushing it again is
+     * an echo (or a focus-in with nothing new) and is skipped.
+     */
+    bool     clip_push_active;
+    bool     clip_push_again;
+    uint64_t clip_push_generation;
+    char    *clip_out;
+    size_t   clip_out_len, clip_out_off;
+    char    *clip_next;
+    size_t   clip_next_len;
+    bool     clip_have_last;
+    uint64_t clip_last_hash;
+    size_t   clip_last_len;
     unsigned caps_seen;         /* what the client told us it can do        */
     const struct nb_config *cfg;
     bool     focused;
@@ -410,6 +445,18 @@ void nb_sink_paste_trigger(struct nb_sink *s);
  * after the clipboard packets.  False cancels it visibly without pasting stale
  * guest content. */
 void nb_sink_clip_finish(struct nb_sink *s, uint64_t generation, bool paste);
+/*
+ * Conduit: a backend saying "the host selection may have changed" (a new
+ * Wayland selection offer, a focus-in).  In a push mode, with a focused
+ * window and a connected client, the core fetches it through
+ * ops->fetch_clipboard and pushes it; the completion uses the same
+ * nb_sink_send_clipboard() / nb_sink_clip_finish() pair as a paste.
+ * Otherwise a no-op.
+ */
+void nb_sink_host_clipboard_changed(struct nb_sink *s);
+/* The largest clipboard text the current client and mode take, in bytes:
+ * what a backend's fetch buffer must hold. */
+size_t nb_sink_clip_cap(const struct nb_sink *s);
 void nb_sink_bye(struct nb_sink *s, int reason);
 
 /* ── session backends ────────────────────────────────────────────────────── */

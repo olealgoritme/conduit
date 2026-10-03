@@ -13,7 +13,9 @@ conduit/
 │   └── qemu/      Build script + patches for the bundled QEMU 11.1.
 ├── guest/
 │   ├── linux/     C. The guest kernel module (virtio GPU, KMS display,
-│   │              input). Packaged with DKMS.
+│   │              input, clipboard device). Packaged with DKMS.
+│   ├── agent/     Python. conduit-clipboard-agent: the desktop session's
+│   │              clipboard <-> /dev/conduit-clipboard.
 │   └── windows/   Reserved for the Windows guest driver (see ROADMAP).
 ├── cli/           The `conduit` command (create / attach / view / up / down).
 ├── packaging/

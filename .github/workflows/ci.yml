@@ -4,6 +4,7 @@
 #   guest-module  the guest kernel module against Ubuntu 24.04 (GA 6.8 and HWE),
 #                 Debian 13 (6.12) and Fedora (newest) headers
 #   viewer        the C viewer's own test suite (`make check`, no display needed)
+#   guest-agent   the guest clipboard agent's unit tests (Python, Xvfb)
 #   packaging     shellcheck the packaging scripts, build the DKMS source package
 #
 # Nothing here needs an NVIDIA GPU. Tests that open /dev/nvidiactl are skipped
@@ -151,6 +152,20 @@ jobs:
       - name: make check
         run: make -C host/viewer -j"$(nproc)" check
 
+  guest-agent:
+    # conduit-clipboard-agent: record format, echo suppression, backend
+    # choice, device loss, and the X11 backend against Xvfb (INCR included).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xclip libxfixes3 python3
+      - name: unittest
+        working-directory: guest/agent
+        run: python3 -m unittest -v test_agent
+
   packaging:
     runs-on: ubuntu-24.04
     steps:
@@ -173,3 +188,4 @@ jobs:
             | sudo tar -xz -C /usr/local/bin nfpm
           packaging/build.sh package guest-deb
           dpkg-deb -c dist/out/conduit-guest_*_all.deb
+          dpkg-deb -c dist/out/conduit-guest_*_all.deb | grep usr/bin/conduit-clipboard-agent

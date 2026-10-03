@@ -31,6 +31,8 @@ All little-endian, `#[repr(C)]`, after the existing message header. New
 | 22 | `InputEvent` | host → guest | event |
 | 23 | `DisplayMode` | host → guest | event |
 | 24 | `CursorUpdate` | guest → host | control, fire-and-forget like `ScanoutFlip` (reply: header only) |
+| 25 | `ClipboardFromHost` | host → guest | event (see docs/CLIPBOARD.md) |
+| 26 | `ClipboardToHost` | guest → host | control (reply: header only, status) |
 
 ```c
 struct scanout_flip {          /* 64 bytes */

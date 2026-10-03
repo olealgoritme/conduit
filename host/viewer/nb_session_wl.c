@@ -456,8 +456,23 @@ struct nb_wl {
     bool                           focused;
     char                          *clip_pending;
     size_t                         clip_pending_len;
-    char                           fetch_buf[NVKVM_BROKER_CLIP_MAX_BYTES + 1];
+    char                          *fetch_buf;  /* fetch_cap + 1, per fetch   */
+    size_t                         fetch_cap;
     size_t                         fetch_len;
+    int                            fetch_pfd;  /* index in w->pfd, or -1     */
+    /*
+     * Serving OUR selection (the guest's text) to a host requester.  Up to
+     * 1 MiB does not fit a pipe in one write, and the requester paces the
+     * read, so what does not go at once is finished from the poll loop --
+     * never by blocking the one thread that also carries the keyboard.
+     */
+#define NB_WL_MAX_SENDS 4
+    struct {
+        int    fd;                  /* -1 = free slot                      */
+        char  *buf;                 /* the remainder, owned                */
+        size_t len, off;
+        int    pfd;                 /* index in w->pfd, or -1              */
+    } send[NB_WL_MAX_SENDS];
 
     struct nb_formats formats;
 
@@ -1877,6 +1892,11 @@ static void ddev_selection(void *d, struct wl_data_device *dev,
          * compositor violates that ordering; it has no recorded MIME set. */
         w->offer_text = false;
     }
+    /* Conduit push modes: a new host selection, seen only while focused --
+     * the core decides whether it goes to the guest. */
+    if (w->offer_text && w->sink) {
+        nb_sink_host_clipboard_changed(w->sink);
+    }
 }
 static void ddev_enter(void *d, struct wl_data_device *v, uint32_t s,
                        struct wl_surface *su, wl_fixed_t x, wl_fixed_t y,
@@ -1912,16 +1932,15 @@ static void dsrc_send(void *d, struct wl_data_source *src, const char *mime,
 {
     struct nb_wl *w = d;
     size_t off = 0;
-    int flags;
+    int flags, slot = -1;
 
     if (!w->src_text || strcmp(mime, NB_CLIP_MIME)) {
         close(fd);
         return;
     }
     /* The requester owns this fd.  It must not be allowed to stop the single
-     * display/input loop by declining to read.  The selection is bounded and
-     * normally fits in one pipe write; under pressure, fail this request
-     * instead of blocking the user's keyboard. */
+     * display/input loop by declining to read: nonblocking, and whatever does
+     * not fit now is finished from the poll loop (wl_send_pump). */
     flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
         nb_err("clipboard: cannot make a host requester's selection fd "
@@ -1935,17 +1954,74 @@ static void dsrc_send(void *d, struct wl_data_source *src, const char *mime,
         if (n < 0 && errno == EINTR) {
             continue;
         }
-        if (n <= 0) {
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                nb_log("clipboard: a host requester stopped draining; "
-                       "abandoning its nonblocking selection transfer");
-            }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             break;
+        }
+        if (n <= 0) {
+            close(fd);
+            return;
         }
         off += (size_t)n;
     }
-    close(fd);
+    if (off == w->src_len) {
+        close(fd);
+        return;
+    }
+    for (int i = 0; i < NB_WL_MAX_SENDS; i++) {
+        if (w->send[i].fd < 0) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        nb_log("clipboard: too many host requesters reading at once; "
+               "refusing one");
+        close(fd);
+        return;
+    }
+    w->send[slot].buf = malloc(w->src_len - off);
+    if (!w->send[slot].buf) {
+        close(fd);
+        return;
+    }
+    memcpy(w->send[slot].buf, w->src_text + off, w->src_len - off);
+    w->send[slot].len = w->src_len - off;
+    w->send[slot].off = 0;
+    w->send[slot].fd = fd;
+    w->send[slot].pfd = -1;
 }
+
+static void wl_send_drop(struct nb_wl *w, int i)
+{
+    close(w->send[i].fd);
+    free(w->send[i].buf);
+    w->send[i].fd = -1;
+    w->send[i].buf = NULL;
+    w->send[i].len = w->send[i].off = 0;
+    w->send[i].pfd = -1;
+}
+
+/* Continue a selection transfer the requester is now ready for. */
+static void wl_send_pump(struct nb_wl *w, int i)
+{
+    while (w->send[i].off < w->send[i].len) {
+        ssize_t n = write(w->send[i].fd, w->send[i].buf + w->send[i].off,
+                          w->send[i].len - w->send[i].off);
+
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+        if (n <= 0) {
+            break;
+        }
+        w->send[i].off += (size_t)n;
+    }
+    wl_send_drop(w, i);
+}
+
 static void dsrc_cancelled(void *d, struct wl_data_source *src)
 {
     struct nb_wl *w = d;
@@ -2061,6 +2137,18 @@ static int wl_fetch_clipboard(struct nb_session *s, struct nb_sink *sink,
     if (!w->offer || !w->offer_text) {
         return -ENOENT;             /* nothing, or nothing we accept */
     }
+    if (w->source) {
+        /* The selection is OURS -- the guest's own text.  Reading it back
+         * through the compositor would only echo it. */
+        return -ENOENT;
+    }
+    w->fetch_cap = nb_sink_clip_cap(sink);
+    free(w->fetch_buf);
+    w->fetch_buf = malloc(w->fetch_cap + 1u);
+    if (!w->fetch_buf) {
+        w->fetch_cap = 0;
+        return -ENOMEM;
+    }
     if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) < 0) {
         return -errno;
     }
@@ -2081,14 +2169,13 @@ static bool wl_fetch_pump(struct nb_wl *w, struct nb_sink *sink)
 {
     for (;;) {
         ssize_t n = read(w->fetch_fd, w->fetch_buf + w->fetch_len,
-                         sizeof(w->fetch_buf) - w->fetch_len);
+                         w->fetch_cap + 1u - w->fetch_len);
 
         if (n > 0) {
             w->fetch_len += (size_t)n;
-            if (w->fetch_len > NVKVM_BROKER_CLIP_MAX_BYTES) {
-                nb_log("clipboard: host selection is larger than the %u-byte "
-                       "cap; not pasting it",
-                       NVKVM_BROKER_CLIP_MAX_BYTES);
+            if (w->fetch_len > w->fetch_cap) {
+                nb_log("clipboard: host selection is larger than the %zu-byte "
+                       "cap; not sending it", w->fetch_cap);
                 nb_sink_clip_finish(sink, w->fetch_generation, false);
                 break;
             }
@@ -2119,6 +2206,9 @@ static bool wl_fetch_pump(struct nb_wl *w, struct nb_sink *sink)
     w->fetch_fd = -1;
     w->fetch_len = 0;
     w->fetch_generation = 0;
+    free(w->fetch_buf);
+    w->fetch_buf = NULL;
+    w->fetch_cap = 0;
     return true;
 }
 
@@ -2131,6 +2221,9 @@ static void wl_client_detach(struct nb_session *s, uint64_t generation)
         w->fetch_fd = -1;
         w->fetch_len = 0;
         w->fetch_generation = 0;
+        free(w->fetch_buf);
+        w->fetch_buf = NULL;
+        w->fetch_cap = 0;
     }
     /*
      * DROP THE TEXT WE ARE HOLDING FOR A VM THAT HAS GONE (audit 2026-08-29).
@@ -4868,7 +4961,7 @@ static int wl_cursor(struct nb_session *s, const struct nb_buf_desc *d,
 static int wl_pollfds(struct nb_session *s, struct pollfd *out, int max)
 {
     struct nb_wl *w = s->priv;
-    int r;
+    int r, n;
 
     if (max < 1) {
         return 0;
@@ -4887,16 +4980,27 @@ static int wl_pollfds(struct nb_session *s, struct pollfd *out, int max)
     out[0].events = POLLIN | (w->flush_blocked ? POLLOUT : 0);
     out[0].revents = 0;
     w->pfd = out;
-    if (w->fetch_fd >= 0 && max >= 2) {
+    n = 1;
+    w->fetch_pfd = -1;
+    if (w->fetch_fd >= 0 && n < max) {
         /* The selection pipe.  Polled rather than read inline: the transfer is
          * the compositor's to pace, and blocking on it here would stall input
          * for as long as the other client takes to write. */
-        out[1].fd = w->fetch_fd;
-        out[1].events = POLLIN;
-        out[1].revents = 0;
-        return 2;
+        out[n].fd = w->fetch_fd;
+        out[n].events = POLLIN;
+        out[n].revents = 0;
+        w->fetch_pfd = n++;
     }
-    return 1;
+    for (int i = 0; i < NB_WL_MAX_SENDS; i++) {
+        w->send[i].pfd = -1;
+        if (w->send[i].fd >= 0 && n < max) {
+            out[n].fd = w->send[i].fd;
+            out[n].events = POLLOUT;
+            out[n].revents = 0;
+            w->send[i].pfd = n++;
+        }
+    }
+    return n;
 }
 
 /*
@@ -4917,8 +5021,20 @@ static int wl_dispatch_session(struct nb_session *s, struct nb_sink *sink)
      * CLIPBOARD, both halves, before the Wayland dispatch below -- the pipe is
      * a separate fd and its readiness has nothing to do with the compositor's.
      */
-    if (w->fetch_fd >= 0 && w->pfd && (w->pfd[1].revents & (POLLIN | POLLHUP))) {
+    if (w->fetch_fd >= 0 && w->pfd && w->fetch_pfd > 0 &&
+        (w->pfd[w->fetch_pfd].revents & (POLLIN | POLLHUP))) {
         (void)wl_fetch_pump(w, sink);
+    }
+    for (int i = 0; i < NB_WL_MAX_SENDS; i++) {
+        if (w->send[i].fd >= 0 && w->pfd && w->send[i].pfd > 0) {
+            short re = w->pfd[w->send[i].pfd].revents;
+
+            if (re & (POLLERR | POLLHUP | POLLNVAL)) {
+                wl_send_drop(w, i);
+            } else if (re & POLLOUT) {
+                wl_send_pump(w, i);
+            }
+        }
     }
 
     if (w->pfd && (w->pfd->revents & POLLOUT)) {
@@ -5093,6 +5209,13 @@ static void wl_close_session(struct nb_session *s)
     wl_set_grab(s, false);
     if (w->fetch_fd >= 0) {
         close(w->fetch_fd);
+    }
+    free(w->fetch_buf);
+    w->fetch_buf = NULL;
+    for (i = 0; i < NB_WL_MAX_SENDS; i++) {
+        if (w->send[i].fd >= 0) {
+            wl_send_drop(w, i);
+        }
     }
     if (w->pending_offer && w->pending_offer != w->offer) {
         wl_data_offer_destroy(w->pending_offer);
@@ -5644,6 +5767,12 @@ struct nb_session *nb_session_wayland(const struct nb_config *cfg)
     }
     s->ops = &wl_ops;
     s->priv = w;
+    w->fetch_fd = -1;
+    w->fetch_pfd = -1;
+    for (int i = 0; i < NB_WL_MAX_SENDS; i++) {
+        w->send[i].fd = -1;
+        w->send[i].pfd = -1;
+    }
 
     if (wl_ops.open(s, cfg) != 0) {
         free(w);

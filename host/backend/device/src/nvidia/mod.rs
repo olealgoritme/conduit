@@ -336,6 +336,8 @@ pub struct NvidiaBackend {
     display: Option<std::sync::Arc<crate::display::DisplayLink>>,
     /// dma-bufs exported for scanout, one per (owner file, host GEM handle).
     dmabufs: crate::display::DmabufCache,
+    /// The guest's clipboard transfer being reassembled (`ClipboardToHost`).
+    clip_in: clipboard::ClipIn,
     /// Video memory charged to this guest, against its limit. See
     /// `crate::vram`. `Vram::new(None)` is no limit, which is what a VMM that
     /// never sets one gets.
@@ -423,6 +425,7 @@ impl NvidiaBackend {
             host: Box::new(RealHost),
             display: None,
             dmabufs: Default::default(),
+            clip_in: Default::default(),
         }
     }
 
@@ -826,6 +829,8 @@ impl NvidiaBackend {
                 MsgType::InputEvent => "input_event",
                 MsgType::DisplayMode => "display_mode",
                 MsgType::CursorUpdate => "cursor_update",
+                MsgType::ClipboardFromHost => "clipboard_from_host",
+                MsgType::ClipboardToHost => "clipboard_to_host",
             })
             .or_insert(0) += 1;
         // The handle travels in the header, not the payload -- every message
@@ -843,7 +848,10 @@ impl NvidiaBackend {
             MsgType::GetSysFiles => self.handle_get_files(FileTree::Sys, resp_buf),
             // Host to guest only. A guest that sends one is confused about the
             // direction of the queue, and saying so beats serving it.
-            MsgType::EventReady | MsgType::InputEvent | MsgType::DisplayMode => {
+            MsgType::EventReady
+            | MsgType::InputEvent
+            | MsgType::DisplayMode
+            | MsgType::ClipboardFromHost => {
                 log::warn!(
                     "{msg_type:?} arrived from the guest; that message only travels outward"
                 );
@@ -852,6 +860,7 @@ impl NvidiaBackend {
             MsgType::ScanoutFlip => self.handle_scanout_flip(payload, resp_buf),
             MsgType::ScanoutDisable => self.handle_scanout_disable(payload, resp_buf),
             MsgType::CursorUpdate => self.handle_cursor_update(payload, resp_buf),
+            MsgType::ClipboardToHost => self.handle_clipboard_to_host(payload, resp_buf),
         }
     }
 }
@@ -891,6 +900,7 @@ fn write_struct<T: Copy>(buf: &mut [u8], val: &T) -> usize {
 }
 
 mod aperture;
+mod clipboard;
 mod files;
 pub use files::FileTree;
 mod host;

@@ -39,7 +39,8 @@ use device::shm_regions::{
 };
 use device::virtio::{NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use protocol::messages::{
-    DISPLAY_MODE_MESSAGE_LEN, DisplayModeEvent, InputEventEntry, MsgHeader, MsgType,
+    CLIPBOARD_MESSAGE_HEAD, CLIPBOARD_MIME_TEXT, ClipboardChunk, DISPLAY_MODE_MESSAGE_LEN,
+    DisplayModeEvent, InputEventEntry, MsgHeader, MsgType, clipboard_mime, encode_clipboard_chunk,
     encode_display_mode, encode_input_events, input_events_that_fit,
 };
 use std::os::fd::{BorrowedFd, RawFd};
@@ -291,8 +292,13 @@ type EventTarget = Arc<Mutex<Option<(VringRwLock, GuestMemoryAtomic<GuestMemoryM
 struct VqInputSink {
     target: EventTarget,
     warned_small: bool,
+    warned_clip_small: bool,
     msg: Vec<u8>,
 }
+
+/// Clipboard chunks put on the event queue per call: buffers are shared with
+/// input, which must not starve behind a large paste.
+const CLIP_CHUNKS_PER_PASS: usize = 16;
 
 impl InputSink for VqInputSink {
     fn push(&mut self, events: &[InputEventEntry]) -> usize {
@@ -381,6 +387,73 @@ impl InputSink for VqInputSink {
         }
         let _ = vring.signal_used_queue();
         true
+    }
+
+    fn clipboard(&mut self, generation: u64, data: &[u8], mut offset: usize) -> usize {
+        let Some((vring, mem)) = self.target.lock().expect("event target").clone() else {
+            // No guest yet: nobody to paste into.
+            return data.len();
+        };
+        let guard = mem.memory();
+        let mut signalled = false;
+        for _ in 0..CLIP_CHUNKS_PER_PASS {
+            if offset >= data.len() {
+                break;
+            }
+            let mut vr = vring.get_mut();
+            let Ok(mut avail) = vr.get_queue_mut().iter(guard.clone()) else {
+                break;
+            };
+            let Some(chain) = avail.next() else {
+                break; // no buffer posted; the rest is retried shortly
+            };
+            let head = chain.head_index();
+            drop(vr);
+            let mut written = 0u32;
+            if let Some(desc) = chain.clone().find(|d| d.is_write_only()) {
+                let room = (desc.len() as usize).saturating_sub(CLIPBOARD_MESSAGE_HEAD);
+                if room == 0 {
+                    if !self.warned_clip_small {
+                        log::warn!(
+                            "display: guest event buffers are {} bytes, too small for clipboard; host clipboard dropped (driver predates ClipboardFromHost?)",
+                            desc.len()
+                        );
+                        self.warned_clip_small = true;
+                    }
+                    offset = data.len();
+                } else {
+                    let take = room.min(data.len() - offset);
+                    let c = ClipboardChunk {
+                        generation,
+                        total_len: data.len() as u32,
+                        offset: offset as u32,
+                        len: take as u32,
+                        flags: 0,
+                        mime: clipboard_mime(CLIPBOARD_MIME_TEXT),
+                    };
+                    self.msg.resize(CLIPBOARD_MESSAGE_HEAD + take, 0);
+                    let n = encode_clipboard_chunk(
+                        MsgType::ClipboardFromHost,
+                        &c,
+                        &data[offset..offset + take],
+                        &mut self.msg,
+                    )
+                    .expect("sized for it");
+                    if guard.write_slice(&self.msg[..n], desc.addr()).is_ok() {
+                        written = n as u32;
+                    }
+                    offset += take;
+                }
+            }
+            if vring.add_used(head, written).is_err() {
+                break;
+            }
+            signalled = true;
+        }
+        if signalled {
+            let _ = vring.signal_used_queue();
+        }
+        offset
     }
 }
 
@@ -882,6 +955,7 @@ fn main() -> anyhow::Result<()> {
         let sink = VqInputSink {
             target: input_target.clone(),
             warned_small: false,
+            warned_clip_small: false,
             msg: Vec::new(),
         };
         if link.path().is_some() {

@@ -200,6 +200,7 @@ check: all test-utf8 test-overlay
 	bash selftest.sh
 	python3 test/test_adopted_socket.py ./$(BIN)
 	python3 test/test_clipboard.py ./$(BIN)
+	python3 test/test_clipboard_push.py ./$(BIN)
 	python3 test/test_lifecycle.py ./$(BIN)
 
 # Keep the sanitizer invocation reproducible locally and in CI.  A clean

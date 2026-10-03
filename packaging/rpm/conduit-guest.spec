@@ -17,12 +17,16 @@ BuildArch:      noarch
 
 Requires:       dkms
 Requires:       make gcc
+Requires:       python3
 Recommends:     kernel-devel
+Recommends:     wl-clipboard libX11 libXfixes
 
 %description
 Kernel module for Linux VMs (kernel 6.4 or newer) running on a Conduit host:
 lets NVIDIA's own user-space driver render on the host GPU and provides the
-VM's display and input. Built by DKMS for each installed kernel.
+VM's display, input and clipboard. Built by DKMS for each installed kernel.
+Includes conduit-clipboard-agent, which shares each desktop session's
+clipboard with the host.
 
 %prep
 %autosetup -n conduit-%{version}
@@ -32,8 +36,16 @@ VM's display and input. Built by DKMS for each installed kernel.
 
 %install
 VERSION=%{version} packaging/build.sh guest-src %{buildroot}%{_usrsrc}/%{name}-%{version}
+install -D -m0755 guest/agent/conduit-clipboard-agent %{buildroot}%{_bindir}/conduit-clipboard-agent
+install -D -m0644 guest/agent/conduit-clipboard.service %{buildroot}%{_userunitdir}/conduit-clipboard.service
+install -D -m0644 guest/agent/conduit-clipboard.desktop %{buildroot}%{_sysconfdir}/xdg/autostart/conduit-clipboard.desktop
+install -D -m0644 guest/agent/70-conduit-clipboard.rules %{buildroot}%{_udevrulesdir}/70-conduit-clipboard.rules
+install -D -m0644 guest/agent/README.md %{buildroot}%{_docdir}/%{name}/README.clipboard.md
 
 %post
+udevadm control --reload-rules 2>/dev/null || :
+udevadm trigger --subsystem-match=misc --sysname-match=conduit-clipboard 2>/dev/null || :
+systemctl --global enable conduit-clipboard.service 2>/dev/null || :
 dkms add -m %{name} -v %{version} -q 2>/dev/null || :
 for k in /lib/modules/*/build; do
     kver=$(basename "$(dirname "$k")")
@@ -41,10 +53,18 @@ for k in /lib/modules/*/build; do
 done
 
 %preun
+if [ "$1" = 0 ]; then
+    systemctl --global disable conduit-clipboard.service 2>/dev/null || :
+fi
 dkms remove -m %{name} -v %{version} --all -q 2>/dev/null || :
 
 %files
 %{_usrsrc}/%{name}-%{version}
+%{_bindir}/conduit-clipboard-agent
+%{_userunitdir}/conduit-clipboard.service
+%config(noreplace) %{_sysconfdir}/xdg/autostart/conduit-clipboard.desktop
+%{_udevrulesdir}/70-conduit-clipboard.rules
+%doc %{_docdir}/%{name}/README.clipboard.md
 
 %changelog
 * Sat Oct 03 2026 Ole Algoritme <olealgoritme@gmail.com> - 0.1.0-1

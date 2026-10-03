@@ -177,6 +177,11 @@ enum {
  * receiving side of each direction.
  */
 #define NVKVM_BROKER_CLIP_MAX_BYTES  7168u
+/* The cap with a CLIENT_CLIP_LARGE client (Conduit), both directions. */
+#define NVKVM_BROKER_CLIP_LARGE_MAX_BYTES (1u << 20)
+#define NVKVM_BROKER_CLIP_LARGE_MAX_CHUNKS_CMD \
+    ((NVKVM_BROKER_CLIP_LARGE_MAX_BYTES + NVKVM_BROKER_CLIP_CMD_BYTES - 1u) / \
+     NVKVM_BROKER_CLIP_CMD_BYTES)
 #define NVKVM_BROKER_CLIP_MAX_CHUNKS_PKT \
     ((NVKVM_BROKER_CLIP_MAX_BYTES + NVKVM_BROKER_CLIP_PKT_BYTES - 1u) / \
      NVKVM_BROKER_CLIP_PKT_BYTES)
@@ -241,6 +246,22 @@ enum {
  */
 #define NVKVM_BROKER_CAP_MODE_HINTS   (1u << 10)
 #define NVKVM_BROKER_CAP_CURSOR       (1u << 11)
+/*
+ * CAP_CLIP_LARGE (Conduit): the broker takes and sends clipboard transfers of
+ * up to NVKVM_BROKER_CLIP_LARGE_MAX_BYTES -- instead of the legacy 7 KiB --
+ * with a client that declared NVKVM_BROKER_CLIENT_CLIP_LARGE in CMD_CAPS.
+ * Framing is unchanged (fixed chunks, LAST marker, receiver-kept chunk
+ * count); only the caps and the clipboard rate budget grow.  Host->guest is
+ * STREAMED into the event ring as it drains, never queued whole, so the
+ * fixed ring and its control reserve are untouched.
+ *
+ * With --clipboard both / host-to-guest the broker also PUSHES the host
+ * clipboard unsolicited: on focus-in and whenever the selection changes while
+ * the window is focused.  Such a transfer is the EV_CLIPBOARD packets up to
+ * and including the one carrying LAST, possibly interleaved with other event
+ * types; two transfers never interleave.
+ */
+#define NVKVM_BROKER_CAP_CLIP_LARGE   (1u << 12)
 
 /* BYE reason codes. */
 enum {
@@ -431,6 +452,10 @@ enum {
  * configured.
  */
 #define NVKVM_BROKER_CLIENT_SEQ_USEC  (1u << 1)
+/* Conduit: the client handles clipboard transfers up to
+ * NVKVM_BROKER_CLIP_LARGE_MAX_BYTES.  Meaningful only to a broker that
+ * advertised NVKVM_BROKER_CAP_CLIP_LARGE. */
+#define NVKVM_BROKER_CLIENT_CLIP_LARGE (1u << 2)
 
 /*
  * Explicitly laid out so every field is naturally aligned and the struct is

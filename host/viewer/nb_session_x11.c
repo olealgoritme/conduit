@@ -122,6 +122,13 @@ struct nb_x11 {
     size_t            clip_pending_len;
     bool              fetch_active;   /* a paste is in flight                 */
     uint64_t          fetch_generation;
+    struct nb_sink   *fetch_sink;
+    /* An INCR transfer being received (ICCCM 2.7.2): the owner streams the
+     * selection in property-sized pieces, which large text from GTK and Qt
+     * does.  Bounded by the sink's cap, and abandoned on overflow. */
+    bool              incr_active;
+    char             *incr_buf;
+    size_t            incr_len, incr_cap;
     xcb_visualid_t    visual24;       /* the content window's visual          */
 
     struct nb_formats formats;
@@ -181,6 +188,7 @@ static void x11_clip_serve(struct nb_x11 *x,
                            const xcb_selection_request_event_t *rq);
 static void x11_clip_receive(struct nb_x11 *x, struct nb_sink *sink,
                              const xcb_selection_notify_event_t *sn);
+static void x11_clip_incr_step(struct nb_x11 *x);
 
 /* ── small helpers ───────────────────────────────────────────────────────── */
 
@@ -943,6 +951,21 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
             x11_clip_receive(x, sink, (xcb_selection_notify_event_t *)ev);
             break;
 
+        case XCB_PROPERTY_NOTIFY: {
+            xcb_property_notify_event_t *pn = (void *)ev;
+
+            /* A real server timestamp, usable for selection requests. */
+            if (pn->window == x->win) {
+                x->last_time = pn->time;
+            }
+            if (x->incr_active && pn->window == x->win &&
+                pn->atom == x->a_prop &&
+                pn->state == XCB_PROPERTY_NEW_VALUE) {
+                x11_clip_incr_step(x);
+            }
+            break;
+        }
+
         case XCB_CLIENT_MESSAGE: {
             xcb_client_message_event_t *cm = (void *)ev;
 
@@ -1682,6 +1705,8 @@ static void x11_close(struct nb_session *s)
     }
     free(x->src_text);
     x->src_text = NULL;
+    free(x->incr_buf);
+    x->incr_buf = NULL;
     free(x->clip_pending);
     x->clip_pending = NULL;
     if (x->c && !xcb_connection_has_error(x->c)) {
@@ -1879,7 +1904,9 @@ skip_dmabuf_extensions:
               XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
               XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_ENTER_WINDOW |
               XCB_EVENT_MASK_LEAVE_WINDOW | XCB_EVENT_MASK_FOCUS_CHANGE |
-              XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_EXPOSURE;
+              XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_EXPOSURE |
+              /* INCR selection transfers arrive as property changes */
+              XCB_EVENT_MASK_PROPERTY_CHANGE;
     xcb_create_window(x->c, XCB_COPY_FROM_PARENT, x->win, x->screen->root,
                       0, 0, (uint16_t)x->win_w, (uint16_t)x->win_h, 0,
                       XCB_WINDOW_CLASS_INPUT_OUTPUT, x->screen->root_visual,
@@ -2179,9 +2206,20 @@ static void x11_clip_serve(struct nb_x11 *x,
         ok = true;
     } else if (x->src_text &&
                (rq->target == x->a_utf8 || rq->target == XCB_ATOM_STRING)) {
-        xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, rq->requestor, prop,
-                            rq->target, 8, (uint32_t)x->src_len, x->src_text);
-        ok = true;
+        /* One ChangeProperty must fit a request.  With BIG-REQUESTS (every
+         * server there is) that is 16 MiB, far over our 1 MiB cap; a server
+         * without it gets a refusal rather than a killed connection. */
+        uint64_t max = (uint64_t)xcb_get_maximum_request_length(x->c) * 4u;
+
+        if (max > 64u && x->src_len <= max - 64u) {
+            xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, rq->requestor,
+                                prop, rq->target, 8, (uint32_t)x->src_len,
+                                x->src_text);
+            ok = true;
+        } else {
+            nb_log("clipboard: the VM's text (%zu bytes) does not fit one X "
+                   "request here; refusing it", x->src_len);
+        }
     }
 
     memset(&ev, 0, sizeof ev);
@@ -2215,10 +2253,13 @@ static int x11_fetch_clipboard(struct nb_session *s, struct nb_sink *sink,
         xcb_get_selection_owner_reply(x->c,
             xcb_get_selection_owner(x->c, x->a_clipboard), NULL);
     bool have_owner = own && own->owner != XCB_WINDOW_NONE;
+    /* Ours: the guest's own text.  Reading it back would only echo it. */
+    bool mine = own && own->owner == x->win;
     free(own);
-    if (!have_owner) {
+    if (!have_owner || mine) {
         return -ENOENT;
     }
+    x->fetch_sink = sink;
 
     xcb_delete_property(x->c, x->win, x->a_prop);
     xcb_convert_selection(x->c, x->win, x->a_clipboard, x->a_utf8,
@@ -2229,52 +2270,133 @@ static int x11_fetch_clipboard(struct nb_session *s, struct nb_sink *sink,
     return 0;
 }
 
+static void x11_clip_incr_reset(struct nb_x11 *x)
+{
+    x->incr_active = false;
+    free(x->incr_buf);
+    x->incr_buf = NULL;
+    x->incr_len = x->incr_cap = 0;
+}
+
+/* Finish a fetch: hand the text (or nothing) to the core exactly once. */
+static void x11_clip_done(struct nb_x11 *x, struct nb_sink *sink,
+                          const char *val, size_t len)
+{
+    bool sent = false;
+
+    if (val && len > 0) {
+        sent = nb_sink_send_clipboard(sink, x->fetch_generation, val, len);
+    }
+    nb_sink_clip_finish(sink, x->fetch_generation, sent);
+    x->fetch_generation = 0;
+    x->fetch_sink = NULL;
+}
+
 /* The selection we asked for has landed (or been refused). */
 static void x11_clip_receive(struct nb_x11 *x, struct nb_sink *sink,
                              const xcb_selection_notify_event_t *sn)
 {
     xcb_get_property_reply_t *pr;
-    bool sent = false;
+    size_t cap = nb_sink_clip_cap(sink);
 
-    if (!x->fetch_active) {
+    if (!x->fetch_active || x->incr_active) {
         return;
     }
     x->fetch_active = false;
 
     if (sn->property == XCB_ATOM_NONE) {
         nb_log("clipboard: the selection owner refused to give us text");
-        nb_sink_clip_finish(sink, x->fetch_generation, false);
-        x->fetch_generation = 0;
+        x11_clip_done(x, sink, NULL, 0);
         return;
     }
     pr = xcb_get_property_reply(x->c,
             xcb_get_property(x->c, 1 /* delete */, x->win, x->a_prop,
                              XCB_GET_PROPERTY_TYPE_ANY, 0,
-                             (NVKVM_BROKER_CLIP_MAX_BYTES + 3) / 4), NULL);
-    if (pr) {
+                             (uint32_t)((cap + 3) / 4 + 1)), NULL);
+    if (!pr) {
+        x11_clip_done(x, sink, NULL, 0);
+        return;
+    }
+    if (pr->type == x->a_incr) {
+        /*
+         * INCR: the owner streams it.  Deleting the property (done above, by
+         * the get) is the "go ahead"; each piece then arrives as a NewValue
+         * property change, and a zero-length piece ends it.
+         */
+        free(pr);
+        x->incr_buf = malloc(cap + 1u);
+        if (!x->incr_buf) {
+            x11_clip_done(x, sink, NULL, 0);
+            return;
+        }
+        x->incr_cap = cap;
+        x->incr_len = 0;
+        x->incr_active = true;
+        x->fetch_active = true;     /* still in flight */
+        xcb_flush(x->c);
+        return;
+    }
+    {
         int len = xcb_get_property_value_length(pr);
         const char *val = xcb_get_property_value(pr);
 
-        if (pr->type == x->a_incr) {
-            /*
-             * INCR means the owner wants to stream it in chunks, which it only
-             * does for something far larger than our 7 KiB cap.  Refuse rather
-             * than implement a protocol we would immediately truncate.
-             */
-            nb_log("clipboard: the host selection is too large to paste "
-                   "(offered incrementally; the cap is %u bytes)",
-                   NVKVM_BROKER_CLIP_MAX_BYTES);
-        } else if (len > 0 && (unsigned)len <= NVKVM_BROKER_CLIP_MAX_BYTES) {
-            sent = nb_sink_send_clipboard(sink, x->fetch_generation, val,
-                                          (size_t)len);
-        } else if (len > 0) {
-            nb_log("clipboard: host selection is larger than the %u-byte cap; "
-                   "not pasting it", NVKVM_BROKER_CLIP_MAX_BYTES);
+        if (pr->bytes_after > 0 || (len > 0 && (size_t)len > cap)) {
+            nb_log("clipboard: host selection is larger than the %zu-byte "
+                   "cap; not sending it", cap);
+            x11_clip_done(x, sink, NULL, 0);
+        } else {
+            x11_clip_done(x, sink, val, len > 0 ? (size_t)len : 0);
         }
-        free(pr);
     }
-    nb_sink_clip_finish(sink, x->fetch_generation, sent);
-    x->fetch_generation = 0;
+    free(pr);
+}
+
+/* One INCR piece is waiting in our property. */
+static void x11_clip_incr_step(struct nb_x11 *x)
+{
+    struct nb_sink *sink = x->fetch_sink;
+    xcb_get_property_reply_t *pr;
+    int len;
+
+    if (!sink) {
+        x11_clip_incr_reset(x);
+        x->fetch_active = false;
+        return;
+    }
+    pr = xcb_get_property_reply(x->c,
+            xcb_get_property(x->c, 1 /* delete: asks for the next piece */,
+                             x->win, x->a_prop, XCB_GET_PROPERTY_TYPE_ANY, 0,
+                             (uint32_t)((x->incr_cap + 3) / 4 + 1)), NULL);
+    xcb_flush(x->c);
+    if (!pr) {
+        return;
+    }
+    len = xcb_get_property_value_length(pr);
+    if (len <= 0) {
+        /* The end. */
+        free(pr);
+        x->fetch_active = false;
+        x->incr_active = false;
+        x11_clip_done(x, sink, x->incr_buf, x->incr_len);
+        x11_clip_incr_reset(x);
+        return;
+    }
+    if (pr->bytes_after > 0 || (size_t)len > x->incr_cap - x->incr_len) {
+        free(pr);
+        nb_log("clipboard: host selection is larger than the %zu-byte cap; "
+               "not sending it", x->incr_cap);
+        x->fetch_active = false;
+        x->incr_active = false;
+        x11_clip_done(x, sink, NULL, 0);
+        x11_clip_incr_reset(x);
+        /* The owner keeps streaming into a property nobody reads; it times
+         * out on its side.  Nothing of it reaches the guest. */
+        return;
+    }
+    memcpy(x->incr_buf + x->incr_len, xcb_get_property_value(pr),
+           (size_t)len);
+    x->incr_len += (size_t)len;
+    free(pr);
 }
 
 /*
@@ -2426,6 +2548,8 @@ static void x11_client_detach_clip(struct nb_session *s, uint64_t generation)
     if (x->fetch_active && x->fetch_generation == generation) {
         x->fetch_active = false;
         x->fetch_generation = 0;
+        x->fetch_sink = NULL;
+        x11_clip_incr_reset(x);
     }
     /*
      * DROP THE TEXT WE ARE HOLDING FOR A VM THAT HAS GONE (audit 2026-08-29).

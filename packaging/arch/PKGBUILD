@@ -48,9 +48,17 @@ package_conduit-guest-dkms() {
   pkgdesc="Conduit guest driver (virtio_gpu_nv) for Linux VMs, DKMS source"
   arch=(any)
   license=('GPL-2.0-only')
-  depends=(dkms)
+  depends=(dkms python)
+  optdepends=('wl-clipboard: clipboard on wlroots/KDE Wayland sessions'
+              'libxfixes: clipboard on X11 sessions and GNOME (XWayland)')
   provides=(conduit-guest)
   cd "$pkgbase"
   # Arch's dkms pacman hooks build and remove the module; no install script.
   VERSION=$pkgver packaging/build.sh guest-src "$pkgdir/usr/src/conduit-guest-$pkgver"
+  # The clipboard agent (enable per user: systemctl --user enable
+  # conduit-clipboard, or rely on the XDG autostart entry).
+  install -Dm0755 guest/agent/conduit-clipboard-agent "$pkgdir/usr/bin/conduit-clipboard-agent"
+  install -Dm0644 guest/agent/conduit-clipboard.service "$pkgdir/usr/lib/systemd/user/conduit-clipboard.service"
+  install -Dm0644 guest/agent/conduit-clipboard.desktop "$pkgdir/etc/xdg/autostart/conduit-clipboard.desktop"
+  install -Dm0644 guest/agent/70-conduit-clipboard.rules "$pkgdir/usr/lib/udev/rules.d/70-conduit-clipboard.rules"
 }

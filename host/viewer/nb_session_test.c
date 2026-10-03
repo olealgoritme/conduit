@@ -82,7 +82,7 @@ static int test_pollfds(struct nb_session *s, struct pollfd *out, int max)
 static void test_finish_fetch(struct nb_test *t, struct nb_sink *sink,
                               unsigned requested_len)
 {
-    static char text[NVKVM_BROKER_CLIP_MAX_BYTES + 1];
+    static char text[NVKVM_BROKER_CLIP_LARGE_MAX_BYTES + 1];
     static bool initialized;
     size_t len = requested_len ? requested_len : 19u;
     bool sent;

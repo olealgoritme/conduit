@@ -19,3 +19,4 @@ guest/linux/.*.cmd
 guest/linux/*.mod*
 guest/linux/modules.order
 guest/linux/Module.symvers
+__pycache__/

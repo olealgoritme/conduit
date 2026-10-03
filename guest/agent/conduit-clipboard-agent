@@ -1,0 +1,814 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""conduit-clipboard-agent: shares the guest desktop's clipboard with the host.
+
+Runs inside the user's graphical session in a Conduit VM. It moves text
+between the session's clipboard and /dev/conduit-clipboard, which the guest
+driver (virtio_gpu_nv) connects to the host viewer.
+
+    host clipboard --> /dev/conduit-clipboard (read)  --> local clipboard
+    local clipboard --> /dev/conduit-clipboard (write) --> host clipboard
+
+Local clipboard backends, picked from the session (see README.md):
+    wayland  wl-clipboard (wl-paste --watch / wl-copy); needs a compositor
+             with a data-control protocol (wlroots, KDE Plasma)
+    x11      Xlib + XFixes through ctypes; Xorg sessions, and GNOME Wayland
+             through XWayland (mutter mirrors its clipboard to X11)
+
+Python 3 standard library only. Text only (text/plain;charset=utf-8), up to
+1 MiB.
+"""
+
+import argparse
+import ctypes
+import ctypes.util
+import errno
+import fcntl
+import hashlib
+import os
+import select
+import shutil
+import struct
+import subprocess
+import sys
+import time
+
+DEVICE = "/dev/conduit-clipboard"
+MAGIC = 0x50494C43  # b"CLIP" little-endian
+VERSION = 1
+MIME_TEXT = "text/plain;charset=utf-8"
+MAX_BYTES = 1 << 20
+HEADER = struct.Struct("<IIQII32s")  # magic, version, generation, len, flags, mime
+HEADER_LEN = HEADER.size  # 56
+RETRY_SECS = 5.0
+
+_quiet = False
+
+
+def log(msg):
+    if not _quiet:
+        print("conduit-clipboard: " + msg, file=sys.stderr, flush=True)
+
+
+# ── the device record ───────────────────────────────────────────────────────
+
+class RecordError(ValueError):
+    pass
+
+
+def encode_record(text, generation=0, mime=MIME_TEXT):
+    """One /dev/conduit-clipboard record: 56-byte header + data."""
+    if not isinstance(text, bytes):
+        raise TypeError("text must be bytes")
+    if not text or len(text) > MAX_BYTES:
+        raise RecordError("length %d outside 1..%d" % (len(text), MAX_BYTES))
+    m = mime.encode("ascii")
+    if len(m) >= 32:
+        raise RecordError("mime too long")
+    return HEADER.pack(MAGIC, VERSION, generation, len(text), 0,
+                       m.ljust(32, b"\0")) + text
+
+
+def decode_record(buf):
+    """Returns (generation, mime, data). Raises RecordError on a bad record."""
+    if len(buf) < HEADER_LEN:
+        raise RecordError("short record (%d bytes)" % len(buf))
+    magic, version, gen, length, _flags, mime = HEADER.unpack_from(buf)
+    if magic != MAGIC or version != VERSION:
+        raise RecordError("bad magic/version %#x/%d" % (magic, version))
+    if length != len(buf) - HEADER_LEN:
+        raise RecordError("length %d but %d data bytes"
+                          % (length, len(buf) - HEADER_LEN))
+    mime = mime.split(b"\0", 1)[0].decode("ascii", "replace")
+    return gen, mime, bytes(buf[HEADER_LEN:])
+
+
+# ── echo suppression ────────────────────────────────────────────────────────
+
+def text_ok(text):
+    if not text or len(text) > MAX_BYTES:
+        return False
+    try:
+        text.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return b"\0" not in text
+
+
+class Sync:
+    """What both sides are known to hold right now.
+
+    Every exchange in either direction sets `current`. A local change equal to
+    `current` is our own write coming back (or nothing new) and is not sent;
+    anything else is a real copy. Keeping one value rather than "last received"
+    and "last sent" separately means copying the same text again after the
+    other side changed is still sent.
+    """
+
+    def __init__(self):
+        self.current = None
+
+    @staticmethod
+    def digest(text):
+        return hashlib.sha256(text).digest()
+
+    def baseline(self, text):
+        """Local content at startup: known, never sent on its own."""
+        if text:
+            self.current = self.digest(text)
+
+    def from_host(self, text):
+        """Host text arrived. True if the local clipboard should be set."""
+        if not text_ok(text):
+            return False
+        d = self.digest(text)
+        if d == self.current:
+            return False
+        self.current = d
+        return True
+
+    def local_changed(self, text):
+        """Local clipboard is `text`. True if it should go to the host."""
+        if not text_ok(text):
+            return False
+        d = self.digest(text)
+        if d == self.current:
+            return False
+        self.current = d
+        return True
+
+
+# ── backend choice ──────────────────────────────────────────────────────────
+
+def candidates(env, forced="auto", have_wl_clipboard=True):
+    """Ordered list of backends worth trying for this session."""
+    if forced in ("wayland", "x11"):
+        return [forced]
+    wayland = bool(env.get("WAYLAND_DISPLAY")) or \
+        env.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+    x11 = bool(env.get("DISPLAY"))
+    desktops = env.get("XDG_CURRENT_DESKTOP", "").upper().split(":")
+    gnome = "GNOME" in desktops
+    out = []
+    if wayland:
+        # mutter (GNOME) has no data-control protocol; its XWayland clipboard
+        # bridge is the way in. Everything else: data-control first.
+        if have_wl_clipboard and not gnome:
+            out.append("wayland")
+        if x11:
+            out.append("x11")
+        if have_wl_clipboard and gnome:
+            out.append("wayland")
+    elif x11:
+        out.append("x11")
+    return out
+
+
+# ── wayland: wl-clipboard ───────────────────────────────────────────────────
+
+class BackendUnavailable(RuntimeError):
+    pass
+
+
+class WaylandBackend:
+    name = "wayland (wl-clipboard, data-control)"
+
+    def __init__(self, probe_secs=0.7):
+        if not shutil.which("wl-paste") or not shutil.which("wl-copy"):
+            raise BackendUnavailable("wl-clipboard (wl-paste, wl-copy) is not "
+                                     "installed")
+        # Each selection change prints one line to our pipe; the content is
+        # read separately with the type we want.
+        self.watch = subprocess.Popen(
+            ["wl-paste", "--watch", "sh", "-c", "cat >/dev/null; echo"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        deadline = time.monotonic() + probe_secs
+        while time.monotonic() < deadline:
+            if self.watch.poll() is not None:
+                err = self.watch.stderr.read().decode("utf-8", "replace")
+                raise BackendUnavailable(
+                    "wl-paste --watch exited (%s): %s"
+                    % (self.watch.returncode, err.strip() or "no message"))
+            time.sleep(0.05)
+        os.set_blocking(self.watch.stdout.fileno(), False)
+
+    def fds(self):
+        return [self.watch.stdout.fileno()]
+
+    def queued(self):
+        return False
+
+    def read(self):
+        for t in (MIME_TEXT, "text/plain", "UTF8_STRING"):
+            try:
+                r = subprocess.run(["wl-paste", "--no-newline", "--type", t],
+                                   stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=5)
+            except subprocess.TimeoutExpired:
+                return None
+            if r.returncode == 0:
+                return r.stdout
+        return None
+
+    def initial(self):
+        return self.read()
+
+    def process(self, readable):
+        if self.watch.stdout.fileno() not in readable:
+            return []
+        try:
+            data = os.read(self.watch.stdout.fileno(), 4096)
+        except BlockingIOError:
+            return []
+        if not data:
+            raise RuntimeError("wl-paste --watch went away")
+        text = self.read()
+        return [text] if text else []
+
+    def set(self, text):
+        # wl-copy forks a server that holds the selection until replaced.
+        subprocess.run(["wl-copy", "--type", MIME_TEXT], input=text,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=5, check=False)
+
+    def tick(self):
+        if self.watch.poll() is not None:
+            raise RuntimeError("wl-paste --watch exited")
+
+    def close(self):
+        if self.watch.poll() is None:
+            self.watch.terminate()
+
+
+# ── x11: Xlib + XFixes via ctypes ───────────────────────────────────────────
+
+Atom = ctypes.c_ulong
+Window = ctypes.c_ulong
+Time = ctypes.c_ulong
+Bool = ctypes.c_int
+
+SELECTION_CLEAR, SELECTION_REQUEST, SELECTION_NOTIFY = 29, 30, 31
+PROPERTY_NOTIFY = 28
+PROPERTY_CHANGE_MASK = 1 << 22
+PROPERTY_NEW_VALUE = 0
+PROP_MODE_REPLACE = 0
+XFIXES_SET_SELECTION_OWNER_NOTIFY_MASK = 1
+ANY_PROPERTY_TYPE = 0
+CURRENT_TIME = 0
+NONE = 0
+XA_ATOM, XA_STRING = 4, 31
+
+
+class XAnyEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                ("send_event", Bool), ("display", ctypes.c_void_p),
+                ("window", Window)]
+
+
+class XSelectionRequestEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                ("send_event", Bool), ("display", ctypes.c_void_p),
+                ("owner", Window), ("requestor", Window),
+                ("selection", Atom), ("target", Atom), ("property", Atom),
+                ("time", Time)]
+
+
+class XSelectionEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                ("send_event", Bool), ("display", ctypes.c_void_p),
+                ("requestor", Window), ("selection", Atom), ("target", Atom),
+                ("property", Atom), ("time", Time)]
+
+
+class XSelectionClearEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                ("send_event", Bool), ("display", ctypes.c_void_p),
+                ("window", Window), ("selection", Atom), ("time", Time)]
+
+
+class XPropertyEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                ("send_event", Bool), ("display", ctypes.c_void_p),
+                ("window", Window), ("atom", Atom), ("time", Time),
+                ("state", ctypes.c_int)]
+
+
+class XFixesSelectionNotifyEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                ("send_event", Bool), ("display", ctypes.c_void_p),
+                ("window", Window), ("subtype", ctypes.c_int),
+                ("owner", Window), ("selection", Atom),
+                ("timestamp", Time), ("selection_timestamp", Time)]
+
+
+class XEvent(ctypes.Union):
+    _fields_ = [("type", ctypes.c_int), ("xany", XAnyEvent),
+                ("xselectionrequest", XSelectionRequestEvent),
+                ("xselection", XSelectionEvent),
+                ("xselectionclear", XSelectionClearEvent),
+                ("xproperty", XPropertyEvent),
+                ("xfixes", XFixesSelectionNotifyEvent),
+                ("pad", ctypes.c_long * 24)]
+
+
+XERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                                  ctypes.c_void_p)
+
+
+@XERROR_HANDLER
+def _x_error(_dpy, _ev):
+    # A requestor that vanished mid-transfer gives BadWindow; that is theirs
+    # to deal with, not a reason for Xlib to exit() us.
+    return 0
+
+
+def _load_x11():
+    x11 = ctypes.util.find_library("X11") or "libX11.so.6"
+    xfixes = ctypes.util.find_library("Xfixes") or "libXfixes.so.3"
+    try:
+        X = ctypes.CDLL(x11)
+        XF = ctypes.CDLL(xfixes)
+    except OSError as e:
+        raise BackendUnavailable("libX11/libXfixes not found: %s" % e)
+    vp, ul, ci = ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int
+    X.XOpenDisplay.restype = vp
+    X.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    X.XCloseDisplay.argtypes = [vp]
+    X.XDefaultRootWindow.restype = Window
+    X.XDefaultRootWindow.argtypes = [vp]
+    X.XCreateSimpleWindow.restype = Window
+    X.XCreateSimpleWindow.argtypes = [vp, Window, ci, ci, ctypes.c_uint,
+                                      ctypes.c_uint, ctypes.c_uint, ul, ul]
+    X.XSelectInput.argtypes = [vp, Window, ctypes.c_long]
+    X.XInternAtom.restype = Atom
+    X.XInternAtom.argtypes = [vp, ctypes.c_char_p, Bool]
+    X.XConnectionNumber.argtypes = [vp]
+    X.XPending.argtypes = [vp]
+    X.XEventsQueued.argtypes = [vp, ci]
+    X.XNextEvent.argtypes = [vp, ctypes.POINTER(XEvent)]
+    X.XFlush.argtypes = [vp]
+    X.XConvertSelection.argtypes = [vp, Atom, Atom, Atom, Window, Time]
+    X.XSetSelectionOwner.argtypes = [vp, Atom, Window, Time]
+    X.XGetSelectionOwner.restype = Window
+    X.XGetSelectionOwner.argtypes = [vp, Atom]
+    X.XGetWindowProperty.argtypes = [
+        vp, Window, Atom, ctypes.c_long, ctypes.c_long, Bool, Atom,
+        ctypes.POINTER(Atom), ctypes.POINTER(ci), ctypes.POINTER(ul),
+        ctypes.POINTER(ul), ctypes.POINTER(ctypes.c_void_p)]
+    X.XDeleteProperty.argtypes = [vp, Window, Atom]
+    X.XChangeProperty.argtypes = [vp, Window, Atom, Atom, ci, ci,
+                                  ctypes.c_void_p, ci]
+    X.XSendEvent.argtypes = [vp, Window, Bool, ctypes.c_long,
+                             ctypes.POINTER(XEvent)]
+    X.XFree.argtypes = [vp]
+    X.XMaxRequestSize.restype = ctypes.c_long
+    X.XMaxRequestSize.argtypes = [vp]
+    X.XExtendedMaxRequestSize.restype = ctypes.c_long
+    X.XExtendedMaxRequestSize.argtypes = [vp]
+    X.XSetErrorHandler.argtypes = [XERROR_HANDLER]
+    X.XSetErrorHandler.restype = vp
+    XF.XFixesQueryExtension.argtypes = [vp, ctypes.POINTER(ci),
+                                        ctypes.POINTER(ci)]
+    XF.XFixesSelectSelectionInput.argtypes = [vp, Window, Atom, ul]
+    return X, XF
+
+
+class X11Backend:
+    name = "x11 (Xlib + XFixes)"
+    INCR_TIMEOUT = 5.0
+
+    def __init__(self, display=None):
+        self.X, self.XF = _load_x11()
+        X = self.X
+        X.XSetErrorHandler(_x_error)
+        self.dpy = X.XOpenDisplay(display.encode() if display else None)
+        if not self.dpy:
+            raise BackendUnavailable("cannot open X display %r"
+                                     % (display or os.environ.get("DISPLAY")))
+        ev_base, err_base = ctypes.c_int(), ctypes.c_int()
+        if not self.XF.XFixesQueryExtension(self.dpy, ctypes.byref(ev_base),
+                                            ctypes.byref(err_base)):
+            X.XCloseDisplay(self.dpy)
+            raise BackendUnavailable("the X server has no XFixes extension")
+        self.xfixes_notify = ev_base.value  # XFixesSelectionNotify = base + 0
+        root = X.XDefaultRootWindow(self.dpy)
+        self.win = X.XCreateSimpleWindow(self.dpy, root, 0, 0, 1, 1, 0, 0, 0)
+        X.XSelectInput(self.dpy, self.win, PROPERTY_CHANGE_MASK)
+        a = lambda n: X.XInternAtom(self.dpy, n.encode(), False)
+        self.CLIPBOARD = a("CLIPBOARD")
+        self.UTF8 = a("UTF8_STRING")
+        self.TARGETS = a("TARGETS")
+        self.INCR = a("INCR")
+        self.TEXT = a("TEXT")
+        self.MIME = a(MIME_TEXT)
+        self.MIME_PLAIN = a("text/plain")
+        self.PROP = a("CONDUIT_CLIPBOARD")
+        self.XF.XFixesSelectSelectionInput(
+            self.dpy, self.win, self.CLIPBOARD,
+            XFIXES_SET_SELECTION_OWNER_NOTIFY_MASK)
+        maxreq = X.XExtendedMaxRequestSize(self.dpy) or \
+            X.XMaxRequestSize(self.dpy)
+        self.max_bytes = max(0, maxreq * 4 - 1024)
+        self.owned = None          # bytes we serve while we own CLIPBOARD
+        self.get_state = None      # None | "convert" | "incr"
+        self.get_target = None
+        self.get_buf = b""
+        self.get_deadline = 0.0
+        self.get_again = False
+        self.results = []
+        X.XFlush(self.dpy)
+
+    def fds(self):
+        return [self.X.XConnectionNumber(self.dpy)]
+
+    def queued(self):
+        # Events Xlib already read off the socket: select() would not see them.
+        return self.X.XEventsQueued(self.dpy, 0) > 0  # QueuedAlready
+
+    # -- reading the selection (asynchronous) --
+    def _start_get(self, target=None):
+        if self.get_state:
+            self.get_again = True
+            return
+        owner = self.X.XGetSelectionOwner(self.dpy, self.CLIPBOARD)
+        if owner == NONE or owner == self.win:
+            return
+        self.get_target = target or self.UTF8
+        self.get_state = "convert"
+        self.get_buf = b""
+        self.get_deadline = time.monotonic() + self.INCR_TIMEOUT
+        self.X.XDeleteProperty(self.dpy, self.win, self.PROP)
+        self.X.XConvertSelection(self.dpy, self.CLIPBOARD, self.get_target,
+                                 self.PROP, self.win, CURRENT_TIME)
+        self.X.XFlush(self.dpy)
+
+    def _finish_get(self, text):
+        self.get_state = None
+        if text:
+            self.results.append(text)
+        if self.get_again:
+            self.get_again = False
+            self._start_get()
+
+    def _read_prop(self, delete=True):
+        X = self.X
+        atype, fmt = Atom(), ctypes.c_int()
+        nitems, after = ctypes.c_ulong(), ctypes.c_ulong()
+        data = ctypes.c_void_p()
+        # long_length in 32-bit units; ask for everything we would accept.
+        r = X.XGetWindowProperty(self.dpy, self.win, self.PROP, 0,
+                                 (MAX_BYTES + 4096) // 4, delete,
+                                 ANY_PROPERTY_TYPE, ctypes.byref(atype),
+                                 ctypes.byref(fmt), ctypes.byref(nitems),
+                                 ctypes.byref(after), ctypes.byref(data))
+        if r != 0:
+            return None, None
+        try:
+            if fmt.value == 8 and data.value:
+                raw = ctypes.string_at(data.value, nitems.value)
+            else:
+                raw = b""
+        finally:
+            if data.value:
+                X.XFree(data)
+        return atype.value, raw
+
+    def _on_selection_notify(self, ev):
+        if self.get_state != "convert" or ev.requestor != self.win:
+            return
+        if ev.property == NONE:
+            # The owner has no UTF8_STRING; one older-style retry.
+            if self.get_target == self.UTF8:
+                self.get_state = None
+                again, self.get_again = self.get_again, False
+                self._start_get(self.MIME)
+                self.get_again = again
+                return
+            self._finish_get(None)
+            return
+        atype, raw = self._read_prop(delete=True)
+        self.X.XFlush(self.dpy)
+        if atype == self.INCR:
+            # Owner streams it: each new property value is a chunk, an empty
+            # one ends it. Deleting the property asks for the next one.
+            self.get_state = "incr"
+            self.get_buf = b""
+            self.get_deadline = time.monotonic() + self.INCR_TIMEOUT
+            return
+        self._finish_get(raw)
+
+    def _on_property(self, ev):
+        if (self.get_state != "incr" or ev.window != self.win or
+                ev.atom != self.PROP or ev.state != PROPERTY_NEW_VALUE):
+            return
+        _atype, raw = self._read_prop(delete=True)
+        self.X.XFlush(self.dpy)
+        self.get_deadline = time.monotonic() + self.INCR_TIMEOUT
+        if not raw:
+            self._finish_get(self.get_buf if len(self.get_buf) <= MAX_BYTES
+                             else None)
+            return
+        self.get_buf += raw
+        if len(self.get_buf) > MAX_BYTES + 4096:
+            log("x11: selection larger than %d bytes; ignored" % MAX_BYTES)
+            self.get_state = "incr-drain"  # keep draining, drop at the end
+
+    # -- owning the selection --
+    def _serve(self, rq):
+        X = self.X
+        prop = rq.property or rq.target
+        ok = False
+        if self.owned is not None and rq.selection == self.CLIPBOARD:
+            if rq.target == self.TARGETS:
+                atoms = (Atom * 6)(self.TARGETS, self.UTF8, self.MIME,
+                                   self.MIME_PLAIN, XA_STRING, self.TEXT)
+                X.XChangeProperty(self.dpy, rq.requestor, prop, XA_ATOM, 32,
+                                  PROP_MODE_REPLACE, atoms, 6)
+                ok = True
+            elif rq.target in (self.UTF8, self.MIME, self.MIME_PLAIN,
+                               XA_STRING, self.TEXT):
+                data = self.owned
+                ptype = rq.target
+                if rq.target == XA_STRING:
+                    data = data.decode("utf-8").encode("latin-1", "replace")
+                elif rq.target == self.TEXT:
+                    ptype = self.UTF8
+                if len(data) <= self.max_bytes:
+                    buf = ctypes.create_string_buffer(data, len(data))
+                    X.XChangeProperty(self.dpy, rq.requestor, prop, ptype, 8,
+                                      PROP_MODE_REPLACE, buf, len(data))
+                    ok = True
+                else:
+                    log("x11: %d bytes exceed the server's request size; "
+                        "refusing the paste" % len(data))
+        reply = XEvent()
+        reply.xselection.type = SELECTION_NOTIFY
+        reply.xselection.display = self.dpy
+        reply.xselection.requestor = rq.requestor
+        reply.xselection.selection = rq.selection
+        reply.xselection.target = rq.target
+        reply.xselection.property = prop if ok else NONE
+        reply.xselection.time = rq.time
+        X.XSendEvent(self.dpy, rq.requestor, False, 0, ctypes.byref(reply))
+        X.XFlush(self.dpy)
+
+    def set(self, text):
+        self.owned = text
+        self.X.XSetSelectionOwner(self.dpy, self.CLIPBOARD, self.win,
+                                  CURRENT_TIME)
+        self.X.XFlush(self.dpy)
+        if self.X.XGetSelectionOwner(self.dpy, self.CLIPBOARD) != self.win:
+            log("x11: could not take the CLIPBOARD selection")
+            self.owned = None
+
+    # -- loop --
+    def _pump(self):
+        X = self.X
+        ev = XEvent()
+        while X.XPending(self.dpy):
+            X.XNextEvent(self.dpy, ctypes.byref(ev))
+            t = ev.type
+            if t == self.xfixes_notify:
+                if ev.xfixes.owner not in (NONE, self.win):
+                    self._start_get()
+            elif t == SELECTION_REQUEST:
+                self._serve(ev.xselectionrequest)
+            elif t == SELECTION_CLEAR:
+                if ev.xselectionclear.selection == self.CLIPBOARD:
+                    self.owned = None
+            elif t == SELECTION_NOTIFY:
+                self._on_selection_notify(ev.xselection)
+            elif t == PROPERTY_NOTIFY:
+                if self.get_state == "incr-drain":
+                    if (ev.xproperty.window == self.win and
+                            ev.xproperty.atom == self.PROP and
+                            ev.xproperty.state == PROPERTY_NEW_VALUE):
+                        _t, raw = self._read_prop(delete=True)
+                        X.XFlush(self.dpy)
+                        if not raw:
+                            self._finish_get(None)
+                else:
+                    self._on_property(ev.xproperty)
+
+    def initial(self):
+        self._start_get()
+        end = time.monotonic() + 2.0
+        while self.get_state and time.monotonic() < end:
+            self._pump()
+            select.select(self.fds(), [], [], 0.05)
+        self._pump()
+        if self.get_state:
+            self.get_state = None
+        out, self.results = self.results, []
+        return out[-1] if out else None
+
+    def process(self, readable):
+        self._pump()
+        out, self.results = self.results, []
+        return out
+
+    def tick(self):
+        if self.get_state and time.monotonic() > self.get_deadline:
+            log("x11: selection transfer timed out")
+            self._finish_get(None)
+        self._pump()
+
+    def close(self):
+        if self.dpy:
+            self.X.XCloseDisplay(self.dpy)
+            self.dpy = None
+
+
+def open_backend(names):
+    errors = []
+    for n in names:
+        try:
+            if n == "wayland":
+                return WaylandBackend()
+            return X11Backend()
+        except BackendUnavailable as e:
+            errors.append("%s: %s" % (n, e))
+            log("backend %s unavailable: %s" % (n, e))
+    raise BackendUnavailable("; ".join(errors) or "no graphical session "
+                             "(neither WAYLAND_DISPLAY nor DISPLAY is set)")
+
+
+# ── the device ──────────────────────────────────────────────────────────────
+
+class Device:
+    """/dev/conduit-clipboard, reopened when it goes away."""
+
+    def __init__(self, path=DEVICE, fd=None):
+        self.path = path
+        self.fd = fd
+        self.next_try = 0.0
+        self.told = None
+
+    def ensure(self):
+        if self.fd is not None or time.monotonic() < self.next_try:
+            return self.fd is not None
+        try:
+            self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC)
+        except OSError as e:
+            if self.told != e.errno:
+                self.told = e.errno
+                hint = ""
+                if e.errno == errno.ENOENT:
+                    hint = " (is virtio_gpu_nv loaded, and is it new enough?)"
+                elif e.errno == errno.EACCES:
+                    hint = (" (install 70-conduit-clipboard.rules and log in "
+                            "again, or join the 'video' group)")
+                log("cannot open %s: %s%s; retrying every %ds"
+                    % (self.path, e.strerror, hint, RETRY_SECS))
+            self.next_try = time.monotonic() + RETRY_SECS
+            return False
+        if self.told is not None:
+            log("%s is open" % self.path)
+        self.told = None
+        return True
+
+    def drop(self, why):
+        log("%s: %s; reopening" % (self.path, why))
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        self.fd = None
+        self.next_try = time.monotonic() + 1.0
+
+    def read(self):
+        """One host record, or None (nothing / device lost)."""
+        try:
+            buf = os.read(self.fd, HEADER_LEN + MAX_BYTES + 4096)
+        except BlockingIOError:
+            return None
+        except OSError as e:
+            self.drop(e.strerror)
+            return None
+        if not buf:
+            self.drop("end of file")
+            return None
+        try:
+            return decode_record(buf)
+        except RecordError as e:
+            log("bad record from the device: %s" % e)
+            return None
+
+    def write(self, text):
+        try:
+            os.write(self.fd, encode_record(text))
+            return True
+        except OSError as e:
+            if e.errno in (errno.ENODEV, errno.EIO, errno.EBADF):
+                self.drop(e.strerror)
+            else:
+                log("the host refused the clipboard (%d bytes): %s"
+                    % (len(text), e.strerror))
+            return False
+
+
+# ── main loop ───────────────────────────────────────────────────────────────
+
+class Agent:
+    def __init__(self, device, backend):
+        self.dev = device
+        self.backend = backend
+        self.sync = Sync()
+
+    def start(self):
+        self.sync.baseline(self.backend.initial())
+
+    def host_record(self, rec):
+        gen, mime, data = rec
+        if mime != MIME_TEXT:
+            return
+        if self.sync.from_host(data):
+            self.backend.set(data)
+            log("host -> guest: %d bytes" % len(data))
+
+    def local_text(self, text):
+        if self.dev.fd is None:
+            return
+        if self.sync.local_changed(text):
+            if self.dev.write(text):
+                log("guest -> host: %d bytes" % len(text))
+            else:
+                self.sync.current = None
+
+    def step(self, timeout=1.0):
+        self.dev.ensure()
+        fds = list(self.backend.fds())
+        if self.dev.fd is not None:
+            fds.append(self.dev.fd)
+        queued = getattr(self.backend, "queued", None)
+        if queued and queued():
+            timeout = 0
+        r, _, _ = select.select(fds, [], [], timeout)
+        if self.dev.fd is not None and self.dev.fd in r:
+            rec = self.dev.read()
+            if rec:
+                self.host_record(rec)
+        for text in self.backend.process(set(r)):
+            self.local_text(text)
+        self.backend.tick()
+
+    def run(self):
+        self.start()
+        while True:
+            self.step()
+
+
+def single_instance():
+    rt = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    disp = (os.environ.get("WAYLAND_DISPLAY") or
+            os.environ.get("DISPLAY") or "none").replace("/", "_")
+    path = os.path.join(rt, "conduit-clipboard-%s.lock" % disp)
+    f = open(path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return None
+    return f
+
+
+def main(argv=None):
+    global _quiet
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("--backend", choices=["auto", "wayland", "x11"],
+                   default=os.environ.get("CONDUIT_CLIPBOARD_BACKEND", "auto"))
+    p.add_argument("--device", default=DEVICE)
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--print-backend", action="store_true",
+                   help="print the backends that would be tried, and exit")
+    a = p.parse_args(argv)
+    _quiet = a.quiet
+    names = candidates(os.environ, a.backend, bool(shutil.which("wl-paste")))
+    if a.print_backend:
+        print(" ".join(names) or "none")
+        return 0
+    lock = single_instance()
+    if lock is None:
+        log("already running in this session")
+        return 0
+    try:
+        backend = open_backend(names)
+    except BackendUnavailable as e:
+        log("no usable clipboard backend: %s" % e)
+        return 1
+    log("using %s, device %s" % (backend.name, a.device))
+    try:
+        Agent(Device(a.device), backend).run()
+    except KeyboardInterrupt:
+        return 0
+    except RuntimeError as e:
+        log("stopping: %s" % e)
+        return 1
+    finally:
+        backend.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,23 @@
+# Conduit clipboard agent: shares this desktop session's clipboard with the
+# host viewer through /dev/conduit-clipboard. Installed by conduit-guest.
+#
+# Enabled for every user by the package (`systemctl --global enable`). It runs
+# when the session starts graphical-session.target (GNOME, KDE, and wlroots
+# compositors started through uwsm or a systemd session). Desktops that do not
+# (XFCE, plain sway/labwc) start it from the XDG autostart entry instead; the
+# agent is single-instance per display, so having both is harmless.
+[Unit]
+Description=Conduit clipboard sharing with the host
+Documentation=file:///usr/share/doc/conduit-guest/README.clipboard.md
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionPathExists=/dev/conduit-clipboard
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/conduit-clipboard-agent
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

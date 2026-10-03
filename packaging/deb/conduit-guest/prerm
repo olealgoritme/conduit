@@ -6,6 +6,12 @@
 set -e
 NAME=conduit-guest
 VERSION=@VERSION@
+case "${1:-remove}" in
+    remove|purge|0)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl --global disable conduit-clipboard.service 2>/dev/null || true
+        fi ;;
+esac
 command -v dkms >/dev/null 2>&1 || exit 0
 dkms remove -m "$NAME" -v "$VERSION" --all 2>/dev/null || true
 exit 0

@@ -7,6 +7,16 @@ set -e
 NAME=conduit-guest
 VERSION=@VERSION@
 
+# Clipboard: the device node's permissions (70-conduit-clipboard.rules) and the
+# per-session agent. Best effort; none of it may fail the install.
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=misc --sysname-match=conduit-clipboard 2>/dev/null || true
+fi
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --global enable conduit-clipboard.service 2>/dev/null || true
+fi
+
 command -v dkms >/dev/null 2>&1 || { echo "$NAME: dkms not installed" >&2; exit 0; }
 
 if ! dkms status -m "$NAME" -v "$VERSION" 2>/dev/null | grep -q .; then

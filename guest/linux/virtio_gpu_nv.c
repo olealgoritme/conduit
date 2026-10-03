@@ -94,6 +94,8 @@ extern struct kset *module_kset;
 #define NVGPU_MSG_INPUT_EVENT 22     /* host -> guest, event queue */
 #define NVGPU_MSG_DISPLAY_MODE 23    /* host -> guest, event queue */
 #define NVGPU_MSG_CURSOR_UPDATE 24   /* guest -> host, control queue */
+#define NVGPU_MSG_CLIPBOARD_FROM_HOST 25 /* host -> guest, event queue */
+#define NVGPU_MSG_CLIPBOARD_TO_HOST 26   /* guest -> host, control queue */
 
 /* "NVAL": opens the allocation-size section of a GET_SYS_FILES response. */
 #define NVGPU_ALLOC_SIZE_MAGIC 0x4e56414cu
@@ -659,6 +661,9 @@ struct nvgpu_device {
   /* The head DisplayMode events go to; RCU-published like `input`, read
    * from the event-queue interrupt. */
   struct nvgpu_kms __rcu *kms_ev;
+  /* /dev/conduit-clipboard (nvgpu_clipboard.h); NULL without one. Read from
+   * the event-queue interrupt. */
+  struct nvgpu_clip *clip;
 
   /* Every open descriptor, so an event naming a handle can find its file. */
   struct list_head fds;
@@ -1590,6 +1595,9 @@ static void nvgpu_input_batch(struct nvgpu_device *dev, const u8 *p,
                               unsigned int len);
 static void nvgpu_kms_mode_event(struct nvgpu_device *dev, const u8 *p,
                                  unsigned int len);
+/* Defined with the clipboard device (nvgpu_clipboard.h). Interrupt context. */
+static void nvgpu_clip_event(struct nvgpu_device *dev, const u8 *p,
+                             unsigned int len);
 
 static void nvgpu_event_post(struct nvgpu_device *dev,
                              struct nvgpu_event_buf *buf) {
@@ -1648,6 +1656,11 @@ static void nvgpu_event_vq_cb(struct virtqueue *vq) {
       nvgpu_kms_mode_event(dev, buf->payload,
                            min_t(unsigned int, len - sizeof(buf->hdr),
                                  sizeof(buf->payload)));
+    else if (len >= sizeof(buf->hdr) &&
+             le32_to_cpu(buf->hdr.msg_type) == NVGPU_MSG_CLIPBOARD_FROM_HOST)
+      nvgpu_clip_event(dev, buf->payload,
+                       min_t(unsigned int, len - sizeof(buf->hdr),
+                             sizeof(buf->payload)));
     else if (len)
       dev_warn_ratelimited(&dev->vdev->dev,
                            "virtio-gpu-nv: event queue carried msg_type %u\n",
@@ -4769,6 +4782,9 @@ static const struct file_operations nvgpu_drm_fops = {
 /* The virtual KMS head and the input devices; see the header. */
 #include "nvgpu_kms.h"
 
+/* The shared clipboard, /dev/conduit-clipboard; see the header. */
+#include "nvgpu_clipboard.h"
+
 static const struct drm_driver nvgpu_drm_driver = {
     .driver_features = DRIVER_GEM | DRIVER_RENDER,
     /* Without this, a buffer this node exported cannot be imported back. */
@@ -6000,6 +6016,10 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   if (dev->caps & NVGPU_CAP_GRAPHICS)
     nvgpu_dri_init(dev); /* non-fatal */
 
+  /* The shared clipboard rides on the display's event queue. Non-fatal. */
+  if (dev->has_display)
+    nvgpu_clip_init(dev);
+
   dev_info(&vdev->dev, "virtio-gpu-nv: %u GPU(s), driver %s\n", dev->num_gpus,
            dev->driver_version);
   return 0;
@@ -6034,9 +6054,11 @@ static void nvgpu_remove(struct virtio_device *vdev) {
 
   /* Before the reset: no flip may go out on a queue that is being torn down,
    * and no input event may land on a device being unregistered. */
+  nvgpu_clip_detach(dev);
   nvgpu_display_quiesce(dev);
   vdev->config->reset(vdev);
   /* After the reset: the queue is quiet, so the buffers cannot be in use. */
+  nvgpu_clip_fini(dev);
   kfree(dev->event_bufs);
   dev->event_bufs = NULL;
 

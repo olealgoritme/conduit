@@ -32,6 +32,11 @@
 //! * The guest's cursor. A `CursorUpdate` from the guest becomes `CMD_CURSOR`
 //!   with the cursor plane's dma-buf; the broker makes it the host pointer's
 //!   image. The last one is kept and re-sent to a broker that (re)connects.
+//! * The clipboard (docs/CLIPBOARD.md). `EV_CLIPBOARD` transfers from the
+//!   broker are reassembled ([`ClipAssembler`]) and handed to the sink, which
+//!   chunks them onto the event queue as `ClipboardFromHost`; the guest's
+//!   `ClipboardToHost` text goes back as paced `CMD_CLIPBOARD` records
+//!   ([`ClipOut`]). The viewer decides which directions are allowed.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
@@ -39,7 +44,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use protocol::messages::{
     CursorUpdate, DisplayModeEvent, INPUT_ABS_MAX, InputEventEntry, ScanoutFlip, input,
@@ -241,6 +246,9 @@ pub mod wire {
     pub const CMD_ATTACH: u16 = 1;
     pub const CMD_COMMIT: u16 = 2;
     pub const CMD_WINDOW: u16 = 3;
+    /// One fixed-size chunk of guest clipboard text (`struct
+    /// nvkvm_broker_clip_cmd`): chunk index u32 at 4, info at 12, 27 data bytes.
+    pub const CMD_CLIPBOARD: u16 = 4;
     pub const CMD_CAPS: u16 = 5;
     pub const CMD_QUERY_FORMAT: u16 = 6;
     /// virtio-nvgpu: the guest cursor image; only to a broker with
@@ -261,6 +269,9 @@ pub mod wire {
     pub const EV_POINTER: u16 = 12;
     pub const EV_BYE: u16 = 13;
     pub const EV_CLOSE: u16 = 14;
+    /// One fixed-size chunk of host clipboard text (`struct
+    /// nvkvm_broker_clip_pkt`): info at byte 8, 15 data bytes after it.
+    pub const EV_CLIPBOARD: u16 = 15;
     pub const EV_FORMAT: u16 = 16;
     /// virtio-nvgpu: x,y = mode in buffer pixels (0,0 = the configured
     /// mode), w0 = refresh mHz (0 = configured), w1 = reason.
@@ -271,8 +282,47 @@ pub mod wire {
     /// HELLO capability bits this backend cares about.
     pub const CAP_MODE_HINTS: u32 = 1 << 10;
     pub const CAP_CURSOR: u32 = 1 << 11;
+    /// The broker takes and sends clipboard transfers up to
+    /// [`CLIP_LARGE_MAX`] with a client that declared [`CLIENT_CLIP_LARGE`].
+    pub const CAP_CLIP_LARGE: u32 = 1 << 12;
+    /// CMD_CAPS bit: a clipboard agent is behind this client.
+    pub const CLIENT_CLIPBOARD: u32 = 1 << 0;
     /// CMD_CAPS bit: ATTACH/COMMIT `seq` is our CLOCK_MONOTONIC microseconds.
     pub const CLIENT_SEQ_USEC: u32 = 1 << 1;
+    /// CMD_CAPS bit: we take and send large clipboard transfers.
+    pub const CLIENT_CLIP_LARGE: u32 = 1 << 2;
+
+    /// Clipboard framing: payload bytes per chunk, each direction.
+    pub const CLIP_PKT_BYTES: usize = 15;
+    pub const CLIP_CMD_BYTES: usize = 27;
+    /// `info`: low 5 bits = meaningful bytes, this bit = last chunk.
+    pub const CLIP_NBYTES_MASK: u8 = 0x1f;
+    pub const CLIP_LAST: u8 = 0x20;
+    /// Transfer caps: a broker without [`CAP_CLIP_LARGE`], and one with it.
+    pub const CLIP_LEGACY_MAX: usize = 7168;
+    pub const CLIP_LARGE_MAX: usize = 1 << 20;
+
+    /// The clipboard cap a broker with HELLO capabilities `caps` accepts.
+    pub const fn clip_cap(caps: u32) -> usize {
+        if caps & CAP_CLIP_LARGE != 0 {
+            CLIP_LARGE_MAX
+        } else {
+            CLIP_LEGACY_MAX
+        }
+    }
+
+    /// One CMD_CLIPBOARD record: chunk `chunk` carrying `data` (at most
+    /// [`CLIP_CMD_BYTES`]), flagged last if `last`.
+    pub fn clip_cmd(chunk: u32, data: &[u8], last: bool) -> [u8; CMD_SIZE] {
+        assert!(data.len() <= CLIP_CMD_BYTES);
+        let mut o = [0u8; CMD_SIZE];
+        o[0..2].copy_from_slice(&CMD_CLIPBOARD.to_le_bytes());
+        // 2..4 flags = 0, 8..12 reserved1 = 0.
+        o[4..8].copy_from_slice(&chunk.to_le_bytes());
+        o[12] = data.len() as u8 | if last { CLIP_LAST } else { 0 };
+        o[13..13 + data.len()].copy_from_slice(data);
+        o
+    }
     pub const CURSOR_MAX_DIM: u32 = 256;
 
     /// CMD_CURSOR `seq`: the hotspot, x low 16 bits, y high.
@@ -350,6 +400,29 @@ pub mod wire {
                 w0: w(16),
                 w1: w(20),
             }
+        }
+
+        /// An EV_CLIPBOARD packet's `info` byte and data bytes (the meaningful
+        /// prefix, bounded by the array: a lying `info` cannot reach past it).
+        /// `None` when nbytes claims more than the packet holds.
+        pub fn clip_payload(&self) -> Option<(bool, Vec<u8>)> {
+            let b = self.encode();
+            let info = b[8];
+            let n = (info & CLIP_NBYTES_MASK) as usize;
+            if n > CLIP_PKT_BYTES {
+                return None;
+            }
+            Some((info & CLIP_LAST != 0, b[9..9 + n].to_vec()))
+        }
+
+        /// An EV_CLIPBOARD packet (tests and fakes).
+        pub fn clip(data: &[u8], last: bool) -> Self {
+            assert!(data.len() <= CLIP_PKT_BYTES);
+            let mut b = [0u8; PKT_SIZE];
+            b[0..2].copy_from_slice(&EV_CLIPBOARD.to_le_bytes());
+            b[8] = data.len() as u8 | if last { CLIP_LAST } else { 0 };
+            b[9..9 + data.len()].copy_from_slice(data);
+            Self::decode(&b)
         }
 
         pub fn encode(&self) -> [u8; PKT_SIZE] {
@@ -606,6 +679,126 @@ impl ModePolicy {
 }
 
 // ---------------------------------------------------------------------------
+// Clipboard framing
+// ---------------------------------------------------------------------------
+
+/// Host -> guest: reassembles EV_CLIPBOARD chunks into one transfer. The cap
+/// is a size we keep ourselves; a transfer over it, or a malformed chunk, is
+/// abandoned up to its LAST and the next one starts clean.
+pub struct ClipAssembler {
+    buf: Vec<u8>,
+    cap: usize,
+    bad: bool,
+}
+
+impl Default for ClipAssembler {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            cap: wire::CLIP_LEGACY_MAX,
+            bad: false,
+        }
+    }
+}
+
+impl ClipAssembler {
+    /// The cap for transfers from now on (from the broker's HELLO).
+    pub fn set_cap(&mut self, cap: usize) {
+        self.cap = cap;
+    }
+
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Forget any partial transfer (a new connection).
+    pub fn reset(&mut self) {
+        self.buf = Vec::new();
+        self.bad = false;
+    }
+
+    /// Feed one packet. Returns the whole text when `p` completed a good,
+    /// non-empty transfer. Non-clipboard packets are ignored.
+    pub fn feed(&mut self, p: &wire::Pkt) -> Option<Vec<u8>> {
+        if p.ty != wire::EV_CLIPBOARD {
+            return None;
+        }
+        let (last, data) = match p.clip_payload() {
+            Some(v) => v,
+            None => {
+                if !self.bad {
+                    log::warn!(
+                        "display: malformed clipboard chunk from the broker; transfer dropped"
+                    );
+                }
+                self.bad = true;
+                // No LAST can be trusted from a malformed chunk; the info
+                // byte still says whether it was meant as the end.
+                (p.encode()[8] & wire::CLIP_LAST != 0, Vec::new())
+            }
+        };
+        if !self.bad {
+            if self.buf.len() + data.len() > self.cap {
+                log::warn!(
+                    "display: host clipboard is over the {}-byte cap; not sent to the guest",
+                    self.cap
+                );
+                self.bad = true;
+                self.buf = Vec::new();
+            } else {
+                self.buf.extend_from_slice(&data);
+            }
+        }
+        if !last {
+            return None;
+        }
+        let bad = std::mem::take(&mut self.bad);
+        let text = std::mem::take(&mut self.buf);
+        (!bad && !text.is_empty()).then_some(text)
+    }
+}
+
+/// Guest -> host: one transfer being sent as CMD_CLIPBOARD records.
+#[derive(Debug, Default)]
+pub struct ClipOut {
+    text: Vec<u8>,
+    next: u32,
+}
+
+impl ClipOut {
+    pub fn new(text: Vec<u8>) -> Self {
+        Self { text, next: 0 }
+    }
+
+    /// Total records the transfer takes.
+    pub fn chunks(&self) -> u32 {
+        self.text.len().div_ceil(wire::CLIP_CMD_BYTES).max(1) as u32
+    }
+
+    pub fn done(&self) -> bool {
+        self.next >= self.chunks()
+    }
+
+    /// Up to `max` next records, concatenated, and how many they are. Nothing
+    /// is consumed until [`ClipOut::commit`].
+    pub fn records(&self, max: u32) -> (Vec<u8>, u32) {
+        let total = self.chunks();
+        let end = total.min(self.next.saturating_add(max));
+        let mut out = Vec::with_capacity((end - self.next) as usize * wire::CMD_SIZE);
+        for i in self.next..end {
+            let at = i as usize * wire::CLIP_CMD_BYTES;
+            let stop = (at + wire::CLIP_CMD_BYTES).min(self.text.len());
+            out.extend_from_slice(&wire::clip_cmd(i, &self.text[at..stop], i + 1 == total));
+        }
+        (out, end - self.next)
+    }
+
+    pub fn commit(&mut self, n: u32) {
+        self.next += n;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The broker link
 // ---------------------------------------------------------------------------
 
@@ -621,6 +814,15 @@ pub trait InputSink: Send {
     fn mode(&mut self, m: &DisplayModeEvent) -> bool {
         let _ = m;
         true
+    }
+
+    /// Deliver host clipboard transfer `generation` (`data`, the whole text)
+    /// from byte `offset` on, as far as posted buffers allow. Returns the new
+    /// offset; `data.len()` when done (or deliberately dropped). The rest is
+    /// retried shortly; a newer transfer replaces this one.
+    fn clipboard(&mut self, generation: u64, data: &[u8], offset: usize) -> usize {
+        let _ = (generation, offset);
+        data.len()
     }
 }
 
@@ -659,7 +861,18 @@ struct LinkState {
     /// The guest's cursor, and whether this connection still needs it.
     cursor: Option<SentCursor>,
     cursor_dirty: bool,
+    /// HELLO arrived on this connection (CAPS sent, caps known).
+    hello: bool,
+    /// The guest's clipboard on its way to the broker.
+    clip_out: Option<ClipOut>,
+    /// When the last batch of it went, for pacing.
+    clip_sent_at: Option<Instant>,
 }
+
+/// Guest -> broker clipboard pacing: at most this many records per
+/// [`CLIP_BATCH_EVERY`] (32k records/s, under the broker's limit).
+const CLIP_BATCH: u32 = 128;
+const CLIP_BATCH_EVERY: Duration = Duration::from_millis(4);
 
 /// Counters, for the teardown log.
 #[derive(Default, Debug)]
@@ -673,6 +886,8 @@ pub struct LinkStats {
     pub connects: AtomicU64,
     pub cursors: AtomicU64,
     pub modes: AtomicU64,
+    pub clip_to_guest: AtomicU64,
+    pub clip_to_host: AtomicU64,
 }
 
 /// The backend's connection to the display broker. Shared between the
@@ -945,17 +1160,109 @@ impl DisplayLink {
     fn hello(&self, caps: u32) {
         let mut st = self.state.lock().unwrap();
         st.broker_caps = caps;
+        st.hello = true;
         st.cursor_dirty = st.cursor.is_some();
         if let Some(sock) = st.sock.clone() {
             let caps_cmd = wire::Cmd {
                 ty: wire::CMD_CAPS,
-                width: wire::CLIENT_SEQ_USEC,
+                width: wire::CLIENT_SEQ_USEC | wire::CLIENT_CLIPBOARD | wire::CLIENT_CLIP_LARGE,
                 ..Default::default()
             };
             if let Err(e) = send_records(sock.as_raw_fd(), &caps_cmd.encode(), None) {
                 log::debug!("display: CAPS not sent: {e}");
             }
         }
+    }
+
+    /// The guest copied `text` (validated UTF-8): send it to the broker,
+    /// paced, from the link thread. A newer copy replaces one still being sent
+    /// (chunk 0 restarts a transfer in the broker's framing). Dropped when no
+    /// broker is connected, or when it is over the broker's cap.
+    pub fn clipboard_to_host(&self, text: Vec<u8>) {
+        let mut st = self.state.lock().unwrap();
+        if st.sock.is_none() {
+            log::debug!(
+                "display: guest clipboard ({} bytes) dropped: no viewer",
+                text.len()
+            );
+            return;
+        }
+        if text.is_empty() {
+            return;
+        }
+        let cap = wire::clip_cap(st.broker_caps);
+        if text.len() > cap {
+            log::warn!(
+                "display: guest clipboard is {} bytes, over the viewer's {cap}-byte cap; dropped",
+                text.len()
+            );
+            return;
+        }
+        st.clip_out = Some(ClipOut::new(text));
+        st.clip_sent_at = None;
+        self.send_clip_locked(&mut st);
+    }
+
+    /// Send the next paced batch of the guest's clipboard, if one is due.
+    fn send_clip_locked(&self, st: &mut LinkState) {
+        if !st.hello {
+            return; // CAPS first; HELLO re-arms it.
+        }
+        let Some(sock) = st.sock.clone() else {
+            st.clip_out = None;
+            return;
+        };
+        if st
+            .clip_sent_at
+            .is_some_and(|t| t.elapsed() < CLIP_BATCH_EVERY)
+        {
+            return;
+        }
+        let Some(out) = st.clip_out.as_mut() else {
+            return;
+        };
+        let (bytes, n) = out.records(CLIP_BATCH);
+        match send_records(sock.as_raw_fd(), &bytes, None) {
+            Ok(()) => {
+                out.commit(n);
+                st.clip_sent_at = Some(Instant::now());
+                if out.done() {
+                    let len = out.text.len();
+                    st.clip_out = None;
+                    self.stats.clip_to_host.fetch_add(1, Ordering::Relaxed);
+                    log::info!("display: guest clipboard sent to the viewer ({len} bytes)");
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                log::warn!("display: broker send failed: {e}; reconnecting");
+                st.clip_out = None;
+                // SAFETY: shutdown on a live descriptor; the link thread
+                // notices and reconnects.
+                unsafe { libc::shutdown(sock.as_raw_fd(), libc::SHUT_RDWR) };
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hello_for_test(&self, caps: u32) {
+        self.hello(caps);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retry_clip_for_test(&self) {
+        self.retry_clip();
+    }
+
+    /// Guest clipboard still being sent on this connection.
+    fn clip_owed(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.clip_out.is_some() && st.hello
+    }
+
+    fn retry_clip(&self) {
+        let mut st = self.state.lock().unwrap();
+        self.send_clip_locked(&mut st);
     }
 
     /// The guest turned the scanout off. The broker protocol has no detach;
@@ -993,6 +1300,10 @@ impl DisplayLink {
         let mut policy = ModePolicy::new(self.configured);
         let mut pending_mode: Option<DisplayModeEvent> = None;
         let mut warned_absent = false;
+        let mut clip_in = ClipAssembler::default();
+        // Host clipboard on its way to the guest: generation, text, offset.
+        let mut pending_clip: Option<(u64, Vec<u8>, usize)> = None;
+        let mut clip_gen: u64 = 0;
 
         while !stop.load(Ordering::Relaxed) {
             let Some(sock) = self.current() else {
@@ -1000,6 +1311,8 @@ impl DisplayLink {
                 tr.release_all(&mut pending);
                 self.deliver(&mut *sink, &mut pending);
                 reader.reset();
+                clip_in.reset();
+                clip_in.set_cap(wire::CLIP_LEGACY_MAX);
                 match self.try_connect() {
                     Ok(true) => {
                         retry = RETRY_MIN;
@@ -1028,8 +1341,15 @@ impl DisplayLink {
 
             // Undeliverable input (no buffer posted) is retried soon rather
             // than on the next packet: a lost key release is a stuck key.
-            let timeout = if pending.is_empty() && pending_mode.is_none() {
-                if self.cursor_owed() { 20 } else { 500 }
+            let timeout = if pending.is_empty() && pending_mode.is_none() && pending_clip.is_none()
+            {
+                if self.clip_owed() {
+                    CLIP_BATCH_EVERY.as_millis() as i32
+                } else if self.cursor_owed() {
+                    20
+                } else {
+                    500
+                }
             } else {
                 2
             };
@@ -1081,6 +1401,17 @@ impl DisplayLink {
                         if p.ty == wire::EV_BYE {
                             bye = true;
                         }
+                        if p.ty == wire::EV_HELLO {
+                            clip_in.set_cap(wire::clip_cap(p.w1));
+                        }
+                        if let Some(text) = clip_in.feed(&p) {
+                            clip_gen += 1;
+                            log::info!(
+                                "display: host clipboard ({} bytes) -> guest, generation {clip_gen}",
+                                text.len()
+                            );
+                            pending_clip = Some((clip_gen, text, 0));
+                        }
                         if let Some(m) = policy.packet(&p) {
                             pending_mode = Some(m);
                         }
@@ -1105,8 +1436,21 @@ impl DisplayLink {
                     m.refresh_mhz % 1000
                 );
             }
+            // Input first: clipboard chunks only take buffers input left.
+            if pending.is_empty()
+                && let Some((generation, text, off)) = pending_clip.as_mut()
+            {
+                *off = sink.clipboard(*generation, text, *off);
+                if *off >= text.len() {
+                    pending_clip = None;
+                    self.stats.clip_to_guest.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             if self.cursor_owed() {
                 self.retry_cursor();
+            }
+            if self.clip_owed() {
+                self.retry_clip();
             }
         }
     }
@@ -1851,7 +2195,13 @@ mod tests {
         // A broker without CAP_CURSOR never sees one (it would be a violation).
         link.hello(0);
         let (c, _) = broker_recv(broker.as_raw_fd());
-        assert_eq!((c.ty, c.width), (wire::CMD_CAPS, wire::CLIENT_SEQ_USEC));
+        assert_eq!(
+            (c.ty, c.width),
+            (
+                wire::CMD_CAPS,
+                wire::CLIENT_SEQ_USEC | wire::CLIENT_CLIPBOARD | wire::CLIENT_CLIP_LARGE
+            )
+        );
         assert!(!link.cursor_owed());
         // A capable one gets the kept cursor.
         link.hello(wire::CAP_CURSOR);
@@ -1971,5 +2321,194 @@ mod tests {
         drop(conn);
         th.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clipboard_chunks_reassemble_with_a_cap() {
+        let mut a = ClipAssembler::default();
+        assert_eq!(a.cap(), wire::CLIP_LEGACY_MAX);
+        assert_eq!(a.feed(&wire::Pkt::clip(b"hello, ", false)), None);
+        // Other packets in between are not clipboard and change nothing.
+        assert_eq!(a.feed(&pkt(wire::EV_KEY, 0, 30, 1, 0, 0)), None);
+        assert_eq!(
+            a.feed(&wire::Pkt::clip(b"world", true)),
+            Some(b"hello, world".to_vec())
+        );
+        // Empty transfers carry nothing.
+        assert_eq!(a.feed(&wire::Pkt::clip(b"", true)), None);
+        // Over the cap: abandoned up to LAST, the next one is clean.
+        a.set_cap(20);
+        for _ in 0..2 {
+            assert_eq!(a.feed(&wire::Pkt::clip(&[b'x'; 15], false)), None);
+        }
+        assert_eq!(a.feed(&wire::Pkt::clip(b"y", true)), None);
+        assert_eq!(a.feed(&wire::Pkt::clip(b"ok", true)), Some(b"ok".to_vec()));
+        // A lying nbytes is malformed, not an overread.
+        let mut bad = wire::Pkt::clip(b"abc", false).encode();
+        bad[8] = 0x1f;
+        assert_eq!(a.feed(&wire::Pkt::decode(&bad)), None);
+        assert_eq!(a.feed(&wire::Pkt::clip(b"z", true)), None);
+        assert_eq!(a.feed(&wire::Pkt::clip(b"z", true)), Some(b"z".to_vec()));
+        // Reset drops a partial transfer.
+        a.feed(&wire::Pkt::clip(b"partial", false));
+        a.reset();
+        assert_eq!(
+            a.feed(&wire::Pkt::clip(b"new", true)),
+            Some(b"new".to_vec())
+        );
+    }
+
+    #[test]
+    fn clipboard_records_have_the_c_layout() {
+        let text: Vec<u8> = (0..60u8).collect();
+        let mut out = ClipOut::new(text.clone());
+        assert_eq!(out.chunks(), 3);
+        let (bytes, n) = out.records(2);
+        assert_eq!((bytes.len(), n), (80, 2));
+        let r0 = &bytes[..40];
+        assert_eq!(u16::from_le_bytes([r0[0], r0[1]]), wire::CMD_CLIPBOARD);
+        assert_eq!(&r0[2..4], &[0, 0]);
+        assert_eq!(u32::from_le_bytes(r0[4..8].try_into().unwrap()), 0);
+        assert_eq!(&r0[8..12], &[0; 4]);
+        assert_eq!(r0[12], 27);
+        assert_eq!(&r0[13..40], &text[..27]);
+        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 1);
+        out.commit(n);
+        assert!(!out.done());
+        let (bytes, n) = out.records(128);
+        assert_eq!(n, 1);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2);
+        assert_eq!(bytes[12], 6 | wire::CLIP_LAST);
+        assert_eq!(&bytes[13..19], &text[54..]);
+        out.commit(n);
+        assert!(out.done());
+    }
+
+    /// Read CMD_CLIPBOARD records until LAST (skipping others); the text and
+    /// how many records it took.
+    fn broker_clip(fd: RawFd) -> (Vec<u8>, u32) {
+        let mut text = Vec::new();
+        let mut next = 0u32;
+        loop {
+            let mut rec = [0u8; wire::CMD_SIZE];
+            let n =
+                unsafe { libc::recv(fd, rec.as_mut_ptr().cast(), rec.len(), libc::MSG_WAITALL) };
+            assert_eq!(n, wire::CMD_SIZE as isize);
+            if u16::from_le_bytes([rec[0], rec[1]]) != wire::CMD_CLIPBOARD {
+                continue;
+            }
+            assert_eq!(u32::from_le_bytes(rec[4..8].try_into().unwrap()), next);
+            next += 1;
+            text.extend_from_slice(&rec[13..13 + (rec[12] & 0x1f) as usize]);
+            if rec[12] & wire::CLIP_LAST != 0 {
+                return (text, next);
+            }
+        }
+    }
+
+    #[test]
+    fn guest_clipboard_goes_paced_and_capped() {
+        let (ours, broker) = socketpair();
+        let link = DisplayLink::new(None);
+        // No broker: dropped.
+        link.clipboard_to_host(b"lost".to_vec());
+        link.adopt(ours);
+        // A legacy broker takes at most 7168 bytes.
+        link.hello(0);
+        assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_CAPS);
+        link.clipboard_to_host(vec![b'a'; wire::CLIP_LEGACY_MAX + 1]);
+        assert!(!link.clip_owed());
+        // A large one gets a big copy, in paced batches.
+        link.hello(wire::CAP_CLIP_LARGE);
+        assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_CAPS);
+        let text: Vec<u8> = (0..20_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        link.clipboard_to_host(text.clone());
+        assert!(link.clip_owed(), "more than one batch");
+        let reader = {
+            let fd = broker.as_raw_fd();
+            std::thread::spawn(move || broker_clip(fd))
+        };
+        assert!(wait_for(|| {
+            link.retry_clip();
+            !link.clip_owed()
+        }));
+        let (got, recs) = reader.join().unwrap();
+        assert_eq!(got, text);
+        assert_eq!(recs as usize, text.len().div_ceil(wire::CLIP_CMD_BYTES));
+        assert_eq!(link.stats.clip_to_host.load(Ordering::Relaxed), 1);
+        // A reconnect forgets a transfer in progress.
+        link.clipboard_to_host(text.clone());
+        assert!(link.clip_owed());
+        let (ours2, _broker2) = socketpair();
+        link.adopt(ours2);
+        assert!(!link.clip_owed());
+    }
+
+    /// Records the clipboard the link hands over, a few bytes per call.
+    struct ClipSink(Arc<Mutex<Vec<(u64, Vec<u8>)>>>);
+    impl InputSink for ClipSink {
+        fn push(&mut self, events: &[InputEventEntry]) -> usize {
+            events.len()
+        }
+        fn clipboard(&mut self, generation: u64, data: &[u8], offset: usize) -> usize {
+            let end = (offset + 5).min(data.len());
+            let mut g = self.0.lock().unwrap();
+            if offset == 0 {
+                g.push((generation, Vec::new()));
+            }
+            g.last_mut()
+                .unwrap()
+                .1
+                .extend_from_slice(&data[offset..end]);
+            end
+        }
+    }
+
+    #[test]
+    fn host_clipboard_reaches_the_sink_and_reconnect_resets() {
+        let (ours, broker) = socketpair();
+        let link = DisplayLink::new(None);
+        link.adopt(ours);
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let th = {
+            let (link, got, stop) = (link.clone(), got.clone(), stop.clone());
+            std::thread::spawn(move || link.run(Box::new(ClipSink(got)), &stop))
+        };
+        let send = |p: wire::Pkt| {
+            let b = p.encode();
+            let n = unsafe { libc::send(broker.as_raw_fd(), b.as_ptr().cast(), b.len(), 0) };
+            assert_eq!(n, b.len() as isize);
+        };
+        send(wire::Pkt {
+            ty: wire::EV_HELLO,
+            w0: 2,
+            w1: wire::CAP_CLIP_LARGE,
+            ..Default::default()
+        });
+        let text: Vec<u8> = (0..40u8).map(|i| b'A' + i % 26).collect();
+        for (i, c) in text.chunks(wire::CLIP_PKT_BYTES).enumerate() {
+            send(wire::Pkt::clip(
+                c,
+                (i + 1) * wire::CLIP_PKT_BYTES >= text.len(),
+            ));
+        }
+        assert!(wait_for(|| got
+            .lock()
+            .unwrap()
+            .first()
+            .is_some_and(|t| t.1 == text)));
+        assert_eq!(got.lock().unwrap()[0].0, 1);
+        // A partial transfer, then the broker goes: nothing half-delivered.
+        send(wire::Pkt::clip(b"half", false));
+        stop.store(true, Ordering::Relaxed);
+        drop(broker);
+        th.join().unwrap();
+        assert_eq!(got.lock().unwrap().len(), 1);
+        assert!(wait_for(|| link
+            .stats
+            .clip_to_guest
+            .load(Ordering::Relaxed)
+            == 1));
     }
 }
