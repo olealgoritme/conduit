@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-/// `sizeof(struct virtio_gpu_nv_config)`; the guest driver reads all of it.
+/// `sizeof(struct conduit_gpu_config)`; the guest driver reads all of it.
 pub const NVGPU_CONFIG_SIZE: u32 = 4036;
 /// virtio device id the guest driver binds.
 pub const NVGPU_VIRTIO_ID: u32 = 45;

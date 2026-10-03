@@ -2,7 +2,7 @@
 
 Shares the clipboard of a desktop session inside a Conduit VM with the host.
 It moves text between the session's clipboard and `/dev/conduit-clipboard`,
-which the guest module (`virtio_gpu_nv`) connects to the host viewer. Design,
+which the guest module (`conduit_gpu`) connects to the host viewer. Design,
 wire formats and the host side: `docs/CLIPBOARD.md`.
 
 Python 3, standard library only (Xlib and XFixes are reached through ctypes).

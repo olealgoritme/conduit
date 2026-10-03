@@ -228,7 +228,7 @@ pub fn driver_version_via_agent(link: &Link) -> Option<String> {
 }
 
 /// Prints the conduit-guest package version and whether its module is loaded.
-pub const VERSION_PROBE: &str = "v=$(dpkg-query -W -f='${Version}' conduit-guest 2>/dev/null || rpm -q --qf '%{VERSION}-%{RELEASE}' conduit-guest 2>/dev/null); [ -n \"$v\" ] || exit 1; if grep -q '^virtio_gpu_nv ' /proc/modules; then echo \"$v (driver loaded)\"; else echo \"$v (driver NOT loaded)\"; fi";
+pub const VERSION_PROBE: &str = "v=$(dpkg-query -W -f='${Version}' conduit-guest 2>/dev/null || rpm -q --qf '%{VERSION}-%{RELEASE}' conduit-guest 2>/dev/null); [ -n \"$v\" ] || exit 1; if grep -q '^conduit_gpu ' /proc/modules; then echo \"$v (driver loaded)\"; else echo \"$v (driver NOT loaded)\"; fi";
 
 /// Minimal standard base64 (the agent's buf-b64 / out-data).
 mod base64_lite {

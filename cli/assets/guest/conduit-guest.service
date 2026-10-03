@@ -9,7 +9,7 @@ Before=gdm.service display-manager.service systemd-user-sessions.service
 Type=oneshot
 RemainAfterExit=yes
 # The driver comes from the conduit-guest package (DKMS builds it for each kernel).
-ExecStart=/sbin/modprobe virtio_gpu_nv
+ExecStart=/sbin/modprobe conduit_gpu
 ExecStart=/bin/sh -c "mountpoint -q /mnt/nvidia || mount -t virtiofs -o ro nvidia /mnt/nvidia"
 ExecStart=/sbin/ldconfig
 ExecStart=-/bin/udevadm settle -t 10

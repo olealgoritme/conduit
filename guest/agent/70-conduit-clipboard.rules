@@ -1,4 +1,4 @@
-# /dev/conduit-clipboard (virtio_gpu_nv): the host clipboard, for the clipboard
+# /dev/conduit-clipboard (conduit_gpu): the host clipboard, for the clipboard
 # agent in the user's desktop session. Group video for logins outside a seat,
 # and uaccess so the active local session's user gets it without any group.
 # The 70- prefix matters: uaccess must be tagged before 73-seat-late.rules.

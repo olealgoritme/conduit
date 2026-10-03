@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * virtio-gpu-nv: NVIDIA GPU ioctl proxy for libkrun VMs.
+ * conduit-gpu: Conduit's guest GPU driver, an NVIDIA ioctl proxy over virtio.
  *
  * Each guest open("/dev/nvidia*") creates a new host FD via the VMM.
  * Ioctls are forwarded over the control virtqueue; mmap requests result
@@ -8,7 +8,7 @@
  * through EPT — no VMM involvement in the render loop.
  *
  * Guest kernel driver — runs inside the VM.
- * Place in: drivers/virtio/virtio_gpu_nv.c (libkrunfw tree)
+ * Module name: conduit_gpu (in a kernel tree: CONFIG_CONDUIT_GPU).
  */
 
 #include <drm/drm.h>
@@ -317,7 +317,7 @@ struct nvgpu_proc_file_entry {
  * in one page, and 448 bytes leaves room for the ~278 these files actually
  * contain while keeping all eight slots.
  */
-struct virtio_gpu_nv_gpu_slot {
+struct conduit_gpu_slot {
   char pci_addr[16];    /*    0.. 16  directory name          */
   __le32 minor;         /*   16.. 20  /dev/nvidia<minor>      */
   __le32 info_len;      /*   20.. 24  valid bytes in info_text */
@@ -363,12 +363,12 @@ struct nvgpu_fd_translation_entry {
 } __packed;
 
 /* VMM config space layout */
-struct virtio_gpu_nv_config {
+struct conduit_gpu_config {
   char driver_version[32];               /* 0.. 32  */
   __le32 num_gpus;                       /* 32.. 36 */
   __le32 caps;                           /* 36.. 40 */
   __le32 gpu_device_ids[8];              /* 40.. 72 */
-  struct virtio_gpu_nv_gpu_slot gpus[8]; /* 72..    */
+  struct conduit_gpu_slot gpus[8]; /* 72..    */
   __le32 num_fd_translations;
   /*
    * What the backend can do beyond v0.1, as NVGPU_FEATURE_* bits. This field
@@ -379,18 +379,18 @@ struct virtio_gpu_nv_config {
   struct nvgpu_fd_translation_entry fd_translations[16];
 } __packed;
 
-static_assert(sizeof(struct virtio_gpu_nv_gpu_slot) == 476,
+static_assert(sizeof(struct conduit_gpu_slot) == 476,
               "gpu_slot size mismatch");
-static_assert(sizeof(struct virtio_gpu_nv_config) == 4016,
-              "virtio_gpu_nv_config size mismatch with VMM");
-static_assert(offsetof(struct virtio_gpu_nv_config, num_fd_translations) ==
+static_assert(sizeof(struct conduit_gpu_config) == 4016,
+              "conduit_gpu_config size mismatch with VMM");
+static_assert(offsetof(struct conduit_gpu_config, num_fd_translations) ==
                   3880,
               "fd_translations offset mismatch with VMM");
 
 /* The reason every number above is what it is. A guest cannot see past one
  * page of device config, so a layout that does not fit is not a tight fit --
  * it is unreadable. */
-static_assert(sizeof(struct virtio_gpu_nv_config) <= 4096,
+static_assert(sizeof(struct conduit_gpu_config) <= 4096,
               "config space must fit in one page; see virtio_pci_modern_dev.c");
 
 /* ───────── NVIDIA ioctl parameter structs ───────── */
@@ -655,7 +655,7 @@ struct nvgpu_device {
   spinlock_t vq_lock;
 
   /* GPU slots read from config space at probe */
-  struct virtio_gpu_nv_gpu_slot gpu_slots[8];
+  struct conduit_gpu_slot gpu_slots[8];
 
   /* FD translation table received from backend */
   struct nvgpu_fd_translation_entry fd_translations[16];
@@ -1106,7 +1106,7 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
      */
     if (_IOC_SIZE(cmd) != sizeof(info))
       dev_warn(&nfd->dev->vdev->dev,
-               "virtio-gpu-nv: GET_DEV_INFO size mismatch: caller wants %u "
+               "conduit-gpu: GET_DEV_INFO size mismatch: caller wants %u "
                "bytes, this build answers %zu\n",
                _IOC_SIZE(cmd), sizeof(info));
 
@@ -1336,7 +1336,7 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
      * its own turns up much later as a device that would not initialise.
      */
     dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                         "virtio-gpu-nv: unhandled nvidia-drm ioctl "
+                         "conduit-gpu: unhandled nvidia-drm ioctl "
                          "nr=0x%02x (DRM_NVIDIA_%u) size=%u dir=%u\n",
                          nr, nr - DRM_COMMAND_BASE, _IOC_SIZE(cmd),
                          _IOC_DIR(cmd));
@@ -1605,7 +1605,7 @@ static void nvgpu_ctrl_drain(struct nvgpu_device *dev) {
 
         if (st)
           dev_warn_ratelimited(&dev->vdev->dev,
-                               "virtio-gpu-nv: async msg_type %u refused: %d\n",
+                               "conduit-gpu: async msg_type %u refused: %d\n",
                                le32_to_cpu(((const struct nvgpu_msg_hdr *)
                                                 r->data)->msg_type),
                                st);
@@ -1676,7 +1676,7 @@ static void nvgpu_event_post(struct nvgpu_device *dev,
   ret = virtqueue_add_inbuf(dev->event_vq, &sg, 1, buf, GFP_ATOMIC);
   if (ret < 0)
     dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: event queue would not take a buffer: %d\n",
+                         "conduit-gpu: event queue would not take a buffer: %d\n",
                          ret);
 }
 
@@ -1731,7 +1731,7 @@ static void nvgpu_event_vq_cb(struct virtqueue *vq) {
                              sizeof(buf->payload)));
     else if (len)
       dev_warn_ratelimited(&dev->vdev->dev,
-                           "virtio-gpu-nv: event queue carried msg_type %u\n",
+                           "conduit-gpu: event queue carried msg_type %u\n",
                            len >= sizeof(buf->hdr)
                                ? le32_to_cpu(buf->hdr.msg_type)
                                : 0);
@@ -2334,7 +2334,7 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
     u32 hClass = le32_to_cpu(params.hClass);
     nested_size = nvgpu_host_alloc_param_size(nfd->dev, hClass);
     pr_debug(
-        "virtio-gpu-nv: RM_ALLOC hClass=0x%04x paramsSize=0 → copy %u bytes\n",
+        "conduit-gpu: RM_ALLOC hClass=0x%04x paramsSize=0 → copy %u bytes\n",
         hClass, nested_size);
   }
 
@@ -2615,7 +2615,7 @@ static int nvgpu_pin_region(struct nvgpu_device *dev, u64 uaddr, u64 len,
 
   if (!len || (uaddr & ~PAGE_MASK) || (len & ~PAGE_MASK)) {
     dev_dbg(&dev->vdev->dev,
-            "virtio-gpu-nv: registering %llu bytes at %#llx is not whole "
+            "conduit-gpu: registering %llu bytes at %#llx is not whole "
             "pages\n",
             len, uaddr);
     return -EINVAL;
@@ -2623,7 +2623,7 @@ static int nvgpu_pin_region(struct nvgpu_device *dev, u64 uaddr, u64 len,
   npages = len >> PAGE_SHIFT;
   if (npages > NVGPU_MAX_PIN_PAGES) {
     dev_warn(&dev->vdev->dev,
-             "virtio-gpu-nv: registering %lu pages, and this module carries "
+             "conduit-gpu: registering %lu pages, and this module carries "
              "%u\n",
              npages, (unsigned int)NVGPU_MAX_PIN_PAGES);
     return -E2BIG;
@@ -2650,7 +2650,7 @@ static int nvgpu_pin_region(struct nvgpu_device *dev, u64 uaddr, u64 len,
     kvfree(pin->pages);
     kfree(pin);
     dev_dbg(&dev->vdev->dev,
-            "virtio-gpu-nv: pinning %lu pages at %#llx gave %ld\n", npages,
+            "conduit-gpu: pinning %lu pages at %#llx gave %ld\n", npages,
             uaddr, got);
     return got < 0 ? (int)got : -EFAULT;
   }
@@ -2690,7 +2690,7 @@ static int nvgpu_emit_page_runs(struct nvgpu_device *dev,
       if (runs == max_runs || at + 16 > out_cap) {
         if (max_runs == NVGPU_MAX_PAGE_RUNS_INDIRECT)
           dev_warn(&dev->vdev->dev,
-                   "virtio-gpu-nv: %lu pages scatter into more than %u runs; "
+                   "conduit-gpu: %lu pages scatter into more than %u runs; "
                    "refusing to register them\n",
                    pin->npages, max_runs);
         return -E2BIG;
@@ -2710,7 +2710,7 @@ static int nvgpu_emit_page_runs(struct nvgpu_device *dev,
   memset(table, 0, 8);
   *(__le32 *)table = cpu_to_le32(runs);
   *out_len = 8 + runs * 16;
-  dev_dbg(&dev->vdev->dev, "virtio-gpu-nv: %lu pages in %u run(s)\n",
+  dev_dbg(&dev->vdev->dev, "conduit-gpu: %lu pages in %u run(s)\n",
           pin->npages, runs);
   return 0;
 }
@@ -2779,7 +2779,7 @@ static void nvgpu_pin_release(struct nvgpu_fd *nfd, u32 hclient, u32 hmemory) {
       list_del(&pin->link);
       mutex_unlock(&nfd->pins_lock);
       dev_dbg(&nfd->dev->vdev->dev,
-              "virtio-gpu-nv: unpinning %lu page(s) for object %#x/%#x\n",
+              "conduit-gpu: unpinning %lu page(s) for object %#x/%#x\n",
               pin->npages, hclient, hmemory);
       nvgpu_pin_free(pin);
       return;
@@ -2799,7 +2799,7 @@ static void nvgpu_pins_drain(struct nvgpu_fd *nfd) {
 
   list_for_each_entry_safe(pin, tmp, &dead, link) {
     dev_dbg(&nfd->dev->vdev->dev,
-            "virtio-gpu-nv: close leaves %lu pinned page(s) for %#x/%#x\n",
+            "conduit-gpu: close leaves %lu pinned page(s) for %#x/%#x\n",
             pin->npages, pin->hclient, pin->hmemory);
     list_del(&pin->link);
     nvgpu_pin_free(pin);
@@ -2845,7 +2845,7 @@ static long nvgpu_ioctl_register_memory(struct nvgpu_fd *nfd, unsigned int cmd,
   if (route->type_at != 0xffffffffu && params_len >= route->type_at + 4 &&
       nvgpu_read32(params, route->type_at) != dev->osdesc.virtual_address) {
     dev_dbg(&dev->vdev->dev,
-            "virtio-gpu-nv: registration descriptor type %u is not a user "
+            "conduit-gpu: registration descriptor type %u is not a user "
             "address\n",
             nvgpu_read32(params, route->type_at));
     return -ENOTTY;
@@ -2915,7 +2915,7 @@ static long nvgpu_ioctl_register_memory(struct nvgpu_fd *nfd, unsigned int cmd,
                                  NVGPU_MAX_PAGE_RUNS, &runs_len);
       deep_kind = NVGPU_DEEP_PAGE_RUNS_INDIRECT;
       dev_dbg(&dev->vdev->dev,
-              "virtio-gpu-nv: %lu pages, %u-byte run table in %lu page(s)\n",
+              "conduit-gpu: %lu pages, %u-byte run table in %lu page(s)\n",
               pin->npages, big_len, where.npages);
     }
     kvfree(where.pages);
@@ -2975,7 +2975,7 @@ static long nvgpu_ioctl_register_memory(struct nvgpu_fd *nfd, unsigned int cmd,
       list_add(&pin->link, &nfd->pins);
       mutex_unlock(&nfd->pins_lock);
       dev_dbg(&dev->vdev->dev,
-              "virtio-gpu-nv: registered %lu page(s) as object %#x/%#x\n",
+              "conduit-gpu: registered %lu page(s) as object %#x/%#x\n",
               pin->npages, pin->hclient, pin->hmemory);
       pin = NULL;
     }
@@ -3163,7 +3163,7 @@ static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
   uc = nvgpu_find_uvm_cmd(nfd->dev, cmd);
   if (!uc) {
     dev_dbg(&nfd->dev->vdev->dev,
-            "virtio-gpu-nv: UVM 0x%x is not one the host release takes\n", cmd);
+            "conduit-gpu: UVM 0x%x is not one the host release takes\n", cmd);
     return -ENOTTY;
   }
   sz = uc->params_size;
@@ -3354,7 +3354,7 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
     window_off = le64_to_cpu(resp->guest_phys_addr);
     if (!nfd->dev->aperture.len || window_off + size > nfd->dev->aperture.len) {
       dev_warn(&nfd->dev->vdev->dev,
-               "virtio-gpu-nv: UVM pool at %llu+%llu is outside the %llu-byte "
+               "conduit-gpu: UVM pool at %llu+%llu is outside the %llu-byte "
                "aperture\n",
                window_off, size, nfd->dev->aperture.len);
       ret = -ERANGE;
@@ -3383,7 +3383,7 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
    */
   if (!nfd->dev->window.len) {
     dev_warn_once(&nfd->dev->vdev->dev,
-                  "virtio-gpu-nv: no shared memory region, so device memory "
+                  "conduit-gpu: no shared memory region, so device memory "
                   "cannot be mapped\n");
     ret = -ENOTSUPP;
     goto out;
@@ -3392,7 +3392,7 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
   window_off = le64_to_cpu(resp->guest_phys_addr);
   if (window_off + size > nfd->dev->window.len) {
     dev_warn(&nfd->dev->vdev->dev,
-             "virtio-gpu-nv: mapping at %llu+%llu runs past the %llu-byte "
+             "conduit-gpu: mapping at %llu+%llu runs past the %llu-byte "
              "window\n",
              window_off, size, nfd->dev->window.len);
     ret = -ERANGE;
@@ -3703,7 +3703,7 @@ static long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
         } else {
           dev_warn_ratelimited(
               &nfd->dev->vdev->dev,
-              "virtio-gpu-nv: REGISTER_SURFACE names fd %d, which is not one "
+              "conduit-gpu: REGISTER_SURFACE names fd %d, which is not one "
               "of ours; forwarding it unchanged\n",
               guest_fd);
         }
@@ -3875,7 +3875,7 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
 
   if (!ng->dev->window.len) {
     dev_warn_once(&ng->dev->vdev->dev,
-                  "virtio-gpu-nv: no shared memory region, so a buffer's "
+                  "conduit-gpu: no shared memory region, so a buffer's "
                   "memory cannot be reached from the guest\n");
     return -ENOTSUPP;
   }
@@ -3891,7 +3891,7 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
                            NVGPU_IOCTL_GEM_MAP_OFFSET, &mo, sizeof(mo));
   if (ret < 0) {
     dev_warn(&ng->dev->vdev->dev,
-             "virtio-gpu-nv: the host would not give object %u an mmap "
+             "conduit-gpu: the host would not give object %u an mmap "
              "offset: %ld\n",
              ng->host_handle, ret);
     goto out;
@@ -3920,7 +3920,7 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   window_off = le64_to_cpu(resp->guest_phys_addr);
   if (window_off + obj->size > ng->dev->window.len) {
     dev_warn(&ng->dev->vdev->dev,
-             "virtio-gpu-nv: a buffer at %llu+%zu runs past the %llu-byte "
+             "conduit-gpu: a buffer at %llu+%zu runs past the %llu-byte "
              "window\n",
              window_off, obj->size, ng->dev->window.len);
     ret = -ERANGE;
@@ -4273,7 +4273,7 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
    */
   if (sz != d->size) {
     dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                         "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x carries %u "
+                         "conduit-gpu: nvidia-drm ioctl nr=0x%02x carries %u "
                          "bytes, this driver knows it as %u\n",
                          _IOC_NR(cmd), sz, d->size);
     return -EINVAL;
@@ -4365,7 +4365,7 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
       ret = nvgpu_handle_for_fd(guest_fd, &handle);
       if (ret) {
         dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                             "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x names "
+                             "conduit-gpu: nvidia-drm ioctl nr=0x%02x names "
                              "fd %d, which is not one of our devices\n",
                              _IOC_NR(cmd), guest_fd);
         goto out;
@@ -4645,7 +4645,7 @@ static int nvgpu_proc_init(struct nvgpu_device *dev) {
 
   ret = nvgpu_send_recv(dev, req, sizeof(*req), resp_buf, resp_size);
   if (ret < 0) {
-    dev_err(&dev->vdev->dev, "virtio-gpu-nv: GET_PROC_FILES failed: %d\n", ret);
+    dev_err(&dev->vdev->dev, "conduit-gpu: GET_PROC_FILES failed: %d\n", ret);
     goto out;
   }
 
@@ -4670,7 +4670,7 @@ static int nvgpu_proc_init(struct nvgpu_device *dev) {
       break; /* terminator */
 
     if (p + path_len + content_len > end) {
-      dev_warn(&dev->vdev->dev, "virtio-gpu-nv: proc stream truncated\n");
+      dev_warn(&dev->vdev->dev, "conduit-gpu: proc stream truncated\n");
       break;
     }
 
@@ -4700,7 +4700,7 @@ static int nvgpu_proc_init(struct nvgpu_device *dev) {
 
     parent = nvgpu_proc_mkdir_parents(pathbuf, &leaf);
     proc_create_data(leaf, 0444, parent, &nvgpu_proc_buf_ops, buf);
-    dev_dbg(&dev->vdev->dev, "virtio-gpu-nv: /proc/%s (%u bytes)\n", pathbuf,
+    dev_dbg(&dev->vdev->dev, "conduit-gpu: /proc/%s (%u bytes)\n", pathbuf,
             content_len);
 
     kfree(pathbuf);
@@ -4934,7 +4934,7 @@ static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
                        ((struct nvgpu_dri_dev *)file->minor->dev->dev_private)
                            ->kms))
         dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                             "virtio-gpu-nv: core DRM ioctl nr=0x%02x answered "
+                             "conduit-gpu: core DRM ioctl nr=0x%02x answered "
                              "locally with %ld\n",
                              nr, ret);
       return ret;
@@ -5052,13 +5052,13 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
 
   if (dev->num_dri_devs == 0) {
     dev_info(&dev->vdev->dev,
-             "virtio-gpu-nv: no DRI devices reported by VMM\n");
+             "conduit-gpu: no DRI devices reported by VMM\n");
     return 0;
   }
 
-  nvgpu_dri_class = class_create("nvgpu_dri");
+  nvgpu_dri_class = class_create("conduit_dri");
   if (IS_ERR(nvgpu_dri_class)) {
-    dev_err(&dev->vdev->dev, "virtio-gpu-nv: failed to create dri class: %ld\n",
+    dev_err(&dev->vdev->dev, "conduit-gpu: failed to create dri class: %ld\n",
             PTR_ERR(nvgpu_dri_class));
     nvgpu_dri_class = NULL;
     return PTR_ERR(nvgpu_dri_class);
@@ -5144,7 +5144,7 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
     drm = drm_dev_alloc(kms_drv ? &nvgpu_drm_kms_driver : &nvgpu_drm_driver,
                         pci_parent);
     if (IS_ERR(drm)) {
-      dev_warn(&dev->vdev->dev, "virtio-gpu-nv: drm_dev_alloc %s failed: %ld\n",
+      dev_warn(&dev->vdev->dev, "conduit-gpu: drm_dev_alloc %s failed: %ld\n",
                dri->name, PTR_ERR(drm));
       continue;
     }
@@ -5158,7 +5158,7 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
       drm = drm_dev_alloc(&nvgpu_drm_driver, pci_parent);
       if (IS_ERR(drm)) {
         dev_warn(&dev->vdev->dev,
-                 "virtio-gpu-nv: drm_dev_alloc %s failed: %ld\n", dri->name,
+                 "conduit-gpu: drm_dev_alloc %s failed: %ld\n", dri->name,
                  PTR_ERR(drm));
         continue;
       }
@@ -5166,7 +5166,7 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
     }
 
     if (drm_dev_register(drm, 0) != 0) {
-      dev_warn(&dev->vdev->dev, "virtio-gpu-nv: drm_dev_register %s failed\n",
+      dev_warn(&dev->vdev->dev, "conduit-gpu: drm_dev_register %s failed\n",
                dri->name);
       dri->kms = NULL;
       drm_dev_put(drm);
@@ -5178,7 +5178,7 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
     dri->drm = drm;
     dri->registered = true;
     dev_info(&dev->vdev->dev,
-             "virtio-gpu-nv: registered render node for %s, host (%u:%u) "
+             "conduit-gpu: registered render node for %s, host (%u:%u) "
              "gpu_id=0x%x\n",
              dri->name, dri->major, dri->minor, dri->dev_info[0]);
   }
@@ -5284,7 +5284,7 @@ static int nvgpu_pci_init(struct nvgpu_device *dev) {
 
     if (!root->slot.config_valid) {
       dev_warn(&dev->vdev->dev,
-               "virtio-gpu-nv: no config space for %s, skipping\n",
+               "conduit-gpu: no config space for %s, skipping\n",
                root->slot.pci_addr);
       continue;
     }
@@ -5292,7 +5292,7 @@ static int nvgpu_pci_init(struct nvgpu_device *dev) {
     bridge = pci_alloc_host_bridge(0);
     if (!bridge) {
       dev_err(&dev->vdev->dev,
-              "virtio-gpu-nv: pci_alloc_host_bridge failed for %s\n",
+              "conduit-gpu: pci_alloc_host_bridge failed for %s\n",
               root->slot.pci_addr);
       ret = -ENOMEM;
       continue;
@@ -5325,7 +5325,7 @@ static int nvgpu_pci_init(struct nvgpu_device *dev) {
     ret = pci_scan_root_bus_bridge(bridge);
     if (ret) {
       dev_err(&dev->vdev->dev,
-              "virtio-gpu-nv: pci_scan_root_bus_bridge %s: %d\n",
+              "conduit-gpu: pci_scan_root_bus_bridge %s: %d\n",
               root->slot.pci_addr, ret);
       pci_free_host_bridge(bridge);
       kfree(bus_res);
@@ -5345,7 +5345,7 @@ static int nvgpu_pci_init(struct nvgpu_device *dev) {
       }
     }
 
-    dev_info(&dev->vdev->dev, "virtio-gpu-nv: registered fake PCI device %s\n",
+    dev_info(&dev->vdev->dev, "conduit-gpu: registered fake PCI device %s\n",
              root->slot.pci_addr);
   }
 
@@ -5418,7 +5418,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
 
     if (p + path_len + content_len > end) {
       dev_warn(&dev->vdev->dev,
-               "virtio-gpu-nv: sys stream truncated at sysfs section\n");
+               "conduit-gpu: sys stream truncated at sysfs section\n");
       break;
     }
 
@@ -5430,7 +5430,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
 
     if (p + content_len > end) {
       dev_warn(&dev->vdev->dev,
-               "virtio-gpu-nv: sys stream truncated at content\n");
+               "conduit-gpu: sys stream truncated at content\n");
       break;
     }
 
@@ -5480,7 +5480,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
           memcpy(ps->config, p, copy);
           ps->config_valid = true;
           dev_dbg(&dev->vdev->dev,
-                  "virtio-gpu-nv: stored config space for %s (%u bytes)\n",
+                  "conduit-gpu: stored config space for %s (%u bytes)\n",
                   pci_addr, copy);
         }
       }
@@ -5495,7 +5495,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
   /* ── Section 2: DRI devices ─────────────────────────────────────── */
   if (p + 4 > end) {
     dev_warn(&dev->vdev->dev,
-             "virtio-gpu-nv: sys stream truncated before DRI section\n");
+             "conduit-gpu: sys stream truncated before DRI section\n");
     goto out;
   }
 
@@ -5519,7 +5519,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       /* name_len + major + minor + slot_index, then the dev_info words */
       if (p + NVGPU_DRI_RECORD_BYTES > end) {
         dev_warn(&dev->vdev->dev,
-                 "virtio-gpu-nv: DRI section truncated at entry %u\n", i);
+                 "conduit-gpu: DRI section truncated at entry %u\n", i);
         break;
       }
 
@@ -5539,7 +5539,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
 
       if (name_len == 0 || p + name_len > end) {
         dev_warn(&dev->vdev->dev,
-                 "virtio-gpu-nv: DRI entry %u bad name_len %u\n", i, name_len);
+                 "conduit-gpu: DRI entry %u bad name_len %u\n", i, name_len);
         break;
       }
 
@@ -5554,7 +5554,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       dev->num_dri_devs++;
 
       dev_info(&dev->vdev->dev,
-               "virtio-gpu-nv: DRI %s (%u:%u) slot %u, nvidia gpu_id=0x%x, "
+               "conduit-gpu: DRI %s (%u:%u) slot %u, nvidia gpu_id=0x%x, "
                "page kind %u/%u, sector layout %u\n",
                dev->dri_devs[idx].name, major, minor, slot_index, info[0],
                info[4], info[5], info[6]);
@@ -5581,7 +5581,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     magic = le32_to_cpu(raw);
     if (magic != NVGPU_ALLOC_SIZE_MAGIC) {
       dev_info(&dev->vdev->dev,
-               "virtio-gpu-nv: backend sent no allocation sizes; using the "
+               "conduit-gpu: backend sent no allocation sizes; using the "
                "table built into this module\n");
       goto out;
     }
@@ -5596,14 +5596,14 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
      */
     if (count > NVGPU_MAX_ALLOC_SIZES)
       dev_warn(&dev->vdev->dev,
-               "virtio-gpu-nv: backend sent %u allocation sizes, keeping %u\n",
+               "conduit-gpu: backend sent %u allocation sizes, keeping %u\n",
                count, (u32)NVGPU_MAX_ALLOC_SIZES);
 
     dev->num_alloc_sizes = 0;
     for (i = 0; i < count; i++) {
       if (p + 8 > end) {
         dev_warn(&dev->vdev->dev,
-                 "virtio-gpu-nv: allocation sizes truncated at entry %u\n", i);
+                 "conduit-gpu: allocation sizes truncated at entry %u\n", i);
         break;
       }
       if (dev->num_alloc_sizes < NVGPU_MAX_ALLOC_SIZES) {
@@ -5616,7 +5616,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       p += 8;
     }
     dev_info(&dev->vdev->dev,
-             "virtio-gpu-nv: the host's RM sizes %d allocation class(es)\n",
+             "conduit-gpu: the host's RM sizes %d allocation class(es)\n",
              dev->num_alloc_sizes);
   }
 
@@ -5637,7 +5637,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     magic = le32_to_cpu(raw);
     if (magic != NVGPU_UVM_CMD_MAGIC) {
       dev_info(&dev->vdev->dev,
-               "virtio-gpu-nv: backend sent no UVM command table; UVM calls "
+               "conduit-gpu: backend sent no UVM command table; UVM calls "
                "will be refused\n");
       goto out;
     }
@@ -5647,7 +5647,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
 
     if (count > NVGPU_MAX_UVM_CMDS)
       dev_warn(&dev->vdev->dev,
-               "virtio-gpu-nv: backend sent %u UVM commands, keeping %u; the "
+               "conduit-gpu: backend sent %u UVM commands, keeping %u; the "
                "rest will be refused\n",
                count, (u32)NVGPU_MAX_UVM_CMDS);
 
@@ -5657,7 +5657,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
 
       if (p + 16 > end) {
         dev_warn(&dev->vdev->dev,
-                 "virtio-gpu-nv: UVM commands truncated at entry %u\n", i);
+                 "conduit-gpu: UVM commands truncated at entry %u\n", i);
         break;
       }
       if (dev->num_uvm_cmds < NVGPU_MAX_UVM_CMDS) {
@@ -5680,7 +5680,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
         if (uc->fd_kind != NVGPU_UVM_FD_NONE &&
             (u64)uc->fd_at + 4 > (u64)uc->params_size) {
           dev_warn(&dev->vdev->dev,
-                   "virtio-gpu-nv: UVM 0x%x puts a descriptor at %u of %u "
+                   "conduit-gpu: UVM 0x%x puts a descriptor at %u of %u "
                    "bytes; refusing the call\n",
                    uc->num, uc->fd_at, uc->params_size);
           p += 16;
@@ -5691,7 +5691,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       p += 16;
     }
     dev_info(&dev->vdev->dev,
-             "virtio-gpu-nv: the host release takes %d UVM call(s)\n",
+             "conduit-gpu: the host release takes %d UVM call(s)\n",
              dev->num_uvm_cmds);
   }
 
@@ -5712,7 +5712,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     memcpy(&raw, p, sizeof(__le32));
     if (le32_to_cpu(raw) != NVGPU_OSDESC_MAGIC) {
       dev_info(&dev->vdev->dev,
-               "virtio-gpu-nv: backend says nothing about registering memory "
+               "conduit-gpu: backend says nothing about registering memory "
                "by address; such calls will be refused\n");
       goto out;
     }
@@ -5758,7 +5758,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
         if ((u64)r[i]->address_at + 8 > r[i]->params_size ||
             (u64)r[i]->limit_at + 8 > r[i]->params_size) {
           dev_warn(&dev->vdev->dev,
-                   "virtio-gpu-nv: route %d puts its address at %u of %u "
+                   "conduit-gpu: route %d puts its address at %u of %u "
                    "bytes; registering memory by address stays refused\n",
                    i, r[i]->address_at, r[i]->params_size);
           dev->osdesc.valid = false;
@@ -5767,7 +5767,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     }
     if (dev->osdesc.valid)
       dev_info(&dev->vdev->dev,
-               "virtio-gpu-nv: memory may be registered by address, class "
+               "conduit-gpu: memory may be registered by address, class "
                "0x%04x\n",
                dev->osdesc.class_id);
   }
@@ -5826,7 +5826,7 @@ static void nvgpu_module_sysfs_init(struct nvgpu_device *dev) {
 
   if (!mkset) {
     dev_warn(&dev->vdev->dev,
-             "virtio-gpu-nv: cannot reach /sys/module, skipping nvidia stubs\n");
+             "conduit-gpu: cannot reach /sys/module, skipping nvidia stubs\n");
     return;
   }
 
@@ -5841,36 +5841,36 @@ static void nvgpu_module_sysfs_init(struct nvgpu_device *dev) {
   nvgpu_module_kobj = kobject_create_and_add("nvidia", &mkset->kobj);
   if (!nvgpu_module_kobj) {
     dev_warn(&dev->vdev->dev,
-             "virtio-gpu-nv: failed to create /sys/module/nvidia\n");
+             "conduit-gpu: failed to create /sys/module/nvidia\n");
     return;
   }
   if (sysfs_create_file(nvgpu_module_kobj, &initstate_attr.attr))
-    dev_warn(&dev->vdev->dev, "virtio-gpu-nv: failed initstate under nvidia\n");
+    dev_warn(&dev->vdev->dev, "conduit-gpu: failed initstate under nvidia\n");
 
   nvgpu_uvm_module_kobj =
       kobject_create_and_add("nvidia_uvm", &mkset->kobj);
   if (!nvgpu_uvm_module_kobj) {
     dev_warn(&dev->vdev->dev,
-             "virtio-gpu-nv: failed to create /sys/module/nvidia_uvm\n");
+             "conduit-gpu: failed to create /sys/module/nvidia_uvm\n");
     return;
   }
   if (sysfs_create_file(nvgpu_uvm_module_kobj, &initstate_attr.attr))
     dev_warn(&dev->vdev->dev,
-             "virtio-gpu-nv: failed initstate under nvidia_uvm\n");
+             "conduit-gpu: failed initstate under nvidia_uvm\n");
 
   nvgpu_modeset_module_kobj =
       kobject_create_and_add("nvidia_modeset", &mkset->kobj);
   if (!nvgpu_modeset_module_kobj) {
     dev_warn(&dev->vdev->dev,
-             "virtio-gpu-nv: failed to create nvidia_modeset module kobj\n");
+             "conduit-gpu: failed to create nvidia_modeset module kobj\n");
   } else if (sysfs_create_file(nvgpu_modeset_module_kobj,
                                &initstate_attr.attr)) {
     dev_warn(&dev->vdev->dev,
-             "virtio-gpu-nv: failed initstate under nvidia_modeset\n");
+             "conduit-gpu: failed initstate under nvidia_modeset\n");
   }
 
   dev_info(&dev->vdev->dev,
-           "virtio-gpu-nv: created /sys/module/nvidia{,_uvm,_modeset}/initstate\n");
+           "conduit-gpu: created /sys/module/nvidia{,_uvm,_modeset}/initstate\n");
 }
 
 static void nvgpu_module_sysfs_cleanup(void) {
@@ -5974,7 +5974,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
     virtqueue_kick(dev->event_vq);
   } else {
     dev_warn(&vdev->dev,
-             "virtio-gpu-nv: no event buffers; waits will not be woken\n");
+             "conduit-gpu: no event buffers; waits will not be woken\n");
   }
 
   /* Read config space written by the VMM at device creation */
@@ -5986,18 +5986,18 @@ static int nvgpu_probe(struct virtio_device *vdev) {
              "no RM pointer table for host driver %s; controls whose "
              "parameters carry a pointer will be refused\n",
              dev->driver_version);
-  virtio_cread(vdev, struct virtio_gpu_nv_config, num_gpus, &dev->num_gpus);
-  virtio_cread(vdev, struct virtio_gpu_nv_config, caps, &dev->caps);
+  virtio_cread(vdev, struct conduit_gpu_config, num_gpus, &dev->num_gpus);
+  virtio_cread(vdev, struct conduit_gpu_config, caps, &dev->caps);
 
   if (dev->caps == 0) {
     dev->legacy_caps = true;
     dev->caps = NVGPU_CAP_ALL;
   }
-  dev_info(&vdev->dev, "virtio-gpu-nv: caps %#x%s\n", dev->caps,
+  dev_info(&vdev->dev, "conduit-gpu: caps %#x%s\n", dev->caps,
            dev->legacy_caps ? " (backend predates caps; serving all)" : "");
 
   if (dev->num_gpus == 0 || dev->num_gpus > 248) {
-    dev_err(&vdev->dev, "virtio-gpu-nv: bad num_gpus %u\n", dev->num_gpus);
+    dev_err(&vdev->dev, "conduit-gpu: bad num_gpus %u\n", dev->num_gpus);
     return -EINVAL;
   }
 
@@ -6005,7 +6005,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   {
     u32 i;
     for (i = 0; i < dev->num_gpus && i < 8; i++) {
-      size_t off = offsetof(struct virtio_gpu_nv_config, gpus[i]);
+      size_t off = offsetof(struct conduit_gpu_config, gpus[i]);
       virtio_cread_bytes(vdev, off, &dev->gpu_slots[i],
                          sizeof(dev->gpu_slots[i]));
 
@@ -6013,15 +6013,15 @@ static int nvgpu_probe(struct virtio_device *vdev) {
       dev->gpu_slots[i].pci_addr[15] = '\0';
 
       dev_info(&vdev->dev,
-               "virtio-gpu-nv: GPU%u  pci=%s  minor=%u  info_len=%u\n", i,
+               "conduit-gpu: GPU%u  pci=%s  minor=%u  info_len=%u\n", i,
                dev->gpu_slots[i].pci_addr, le32_to_cpu(dev->gpu_slots[i].minor),
                le32_to_cpu(dev->gpu_slots[i].info_len));
     }
   }
 
   /* FD translation table */
-  virtio_cread(vdev, struct virtio_gpu_nv_config, features, &dev->features);
-  virtio_cread(vdev, struct virtio_gpu_nv_config, num_fd_translations,
+  virtio_cread(vdev, struct conduit_gpu_config, features, &dev->features);
+  virtio_cread(vdev, struct conduit_gpu_config, num_fd_translations,
                &dev->num_fd_translations);
 
   if (dev->num_fd_translations > 16)
@@ -6041,20 +6041,20 @@ static int nvgpu_probe(struct virtio_device *vdev) {
     dev->display_width = le32_to_cpu(mode[0]);
     dev->display_height = le32_to_cpu(mode[1]);
     dev->display_refresh_hz = le32_to_cpu(mode[2]);
-    dev_info(&vdev->dev, "virtio-gpu-nv: display %ux%u@%u announced%s\n",
+    dev_info(&vdev->dev, "conduit-gpu: display %ux%u@%u announced%s\n",
              dev->display_width, dev->display_height,
              dev->display_refresh_hz,
              dev->has_cursor ? ", with a host cursor" : "");
   }
 
   if (dev->num_fd_translations > 0) {
-    size_t off = offsetof(struct virtio_gpu_nv_config, fd_translations);
+    size_t off = offsetof(struct conduit_gpu_config, fd_translations);
     virtio_cread_bytes(vdev, off, dev->fd_translations,
                        dev->num_fd_translations *
                            sizeof(dev->fd_translations[0]));
   }
 
-  dev_info(&vdev->dev, "virtio-gpu-nv: %u fd-translation ioctl(s) registered\n",
+  dev_info(&vdev->dev, "conduit-gpu: %u fd-translation ioctl(s) registered\n",
            dev->num_fd_translations);
 
   /* Ensure virtio is running before we open devices */
@@ -6145,7 +6145,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
                   "nvidia-modeset");
     dev->has_modeset = true;
     dev_info(&vdev->dev,
-             "virtio-gpu-nv: registered /dev/nvidia-modeset (%u:%u)\n",
+             "conduit-gpu: registered /dev/nvidia-modeset (%u:%u)\n",
              MAJOR(dev->modeset_devno), MINOR(dev->modeset_devno));
   }
 
@@ -6153,7 +6153,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   dev->caps_devno = MKDEV(NV_CAPS_MAJOR, 1);
   ret = register_chrdev_region(dev->caps_devno, 2, "nvidia-caps");
   if (ret) {
-    dev_warn(&vdev->dev, "virtio-gpu-nv: cannot register nvidia-caps: %d\n",
+    dev_warn(&vdev->dev, "conduit-gpu: cannot register nvidia-caps: %d\n",
              ret);
     /* non-fatal — continue without caps */
   } else {
@@ -6170,7 +6170,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
                       NULL, "nvidia-cap2");
         dev_info(
             &vdev->dev,
-            "virtio-gpu-nv: registered /dev/nvidia-caps/nvidia-cap{1,2}\n");
+            "conduit-gpu: registered /dev/nvidia-caps/nvidia-cap{1,2}\n");
       }
     }
   }
@@ -6186,18 +6186,18 @@ static int nvgpu_probe(struct virtio_device *vdev) {
    * an address the bus assigned after the backend was started.
    */
   if (virtio_get_shm_region(vdev, &dev->window, NVGPU_SHM_ID)) {
-    dev_info(&vdev->dev, "virtio-gpu-nv: window at %pa, %llu bytes\n",
+    dev_info(&vdev->dev, "conduit-gpu: window at %pa, %llu bytes\n",
              &dev->window.addr, dev->window.len);
   } else {
     dev->window.len = 0;
     dev_warn(&vdev->dev,
-             "virtio-gpu-nv: no shared memory region; device memory will not "
+             "conduit-gpu: no shared memory region; device memory will not "
              "be mappable\n");
   }
 
   /* Absent on a VMM without one; then CUDA cannot make a context. */
   if (virtio_get_shm_region(vdev, &dev->aperture, NVGPU_SHM_ID_APERTURE))
-    dev_info(&vdev->dev, "virtio-gpu-nv: UVM aperture at %pa, %llu bytes\n",
+    dev_info(&vdev->dev, "conduit-gpu: UVM aperture at %pa, %llu bytes\n",
              &dev->aperture.addr, dev->aperture.len);
   else
     dev->aperture.len = 0;
@@ -6205,12 +6205,12 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   /* Fetch host sysfs content + DRI device list from the VMM */
   ret = nvgpu_fetch_sys_files(dev);
   if (ret)
-    dev_warn(&vdev->dev, "virtio-gpu-nv: GET_SYS_FILES failed: %d\n", ret);
+    dev_warn(&vdev->dev, "conduit-gpu: GET_SYS_FILES failed: %d\n", ret);
 
   /* Register fake PCI devices — creates /sys/bus/pci/devices/<addr>/ */
   ret = nvgpu_pci_init(dev);
   if (ret)
-    dev_warn(&vdev->dev, "virtio-gpu-nv: PCI sysfs init failed: %d\n", ret);
+    dev_warn(&vdev->dev, "conduit-gpu: PCI sysfs init failed: %d\n", ret);
 
   nvgpu_module_sysfs_init(dev);
 
@@ -6226,7 +6226,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   if (dev->has_display)
     nvgpu_clip_init(dev);
 
-  dev_info(&vdev->dev, "virtio-gpu-nv: %u GPU(s), driver %s\n", dev->num_gpus,
+  dev_info(&vdev->dev, "conduit-gpu: %u GPU(s), driver %s\n", dev->num_gpus,
            dev->driver_version);
   return 0;
 
@@ -6333,7 +6333,7 @@ MODULE_DEVICE_TABLE(virtio, id_table);
  * this a parameter lets the same module be tested under QEMU without changing
  * the identity it uses in production.
  *
- *     insmod virtio_gpu_nv.ko virtio_id=41
+ *     insmod conduit_gpu.ko virtio_id=41
  */
 static unsigned int virtio_id = VIRTIO_ID_GPU_NV;
 module_param(virtio_id, uint, 0444);
@@ -6349,7 +6349,7 @@ static unsigned int features[] = {
 };
 
 static struct virtio_driver nvgpu_driver = {
-    .driver.name = "virtio-gpu-nv",
+    .driver.name = "conduit-gpu",
     .driver.owner = THIS_MODULE,
     .id_table = id_table,
     .feature_table = features,
@@ -6362,7 +6362,7 @@ static int __init nvgpu_init(void)
 {
     if (virtio_id != VIRTIO_ID_GPU_NV) {
         id_table[0].device = virtio_id;
-        pr_info("virtio-gpu-nv: binding virtio device id %u (default %u)\n",
+        pr_info("conduit-gpu: binding virtio device id %u (default %u)\n",
                 virtio_id, (unsigned int)VIRTIO_ID_GPU_NV);
     }
     return register_virtio_driver(&nvgpu_driver);
@@ -6378,4 +6378,4 @@ module_exit(nvgpu_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("libkrun-nv contributors");
-MODULE_DESCRIPTION("virtio-gpu-nv: NVIDIA GPU sharing for VMs via ioctl proxy");
+MODULE_DESCRIPTION("Conduit guest GPU driver: NVIDIA ioctl proxy over virtio");

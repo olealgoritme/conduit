@@ -1,6 +1,6 @@
 //! What the guest driver expects to find on the bus.
 //!
-//! Every constant and layout here is a contract with `driver/virtio_gpu_nv.c`,
+//! Every constant and layout here is a contract with `guest/linux/conduit_gpu.c`,
 //! and each one has been wrong at least once. A mismatch is not a build error
 //! in either half -- the device compiles, the driver compiles, and the guest
 //! simply fails to probe -- so the agreement is asserted by tests that mirror
@@ -8,7 +8,7 @@
 
 /// The virtio device ID the guest driver probes for.
 ///
-/// Must match `VIRTIO_ID_GPU_NV` in `driver/virtio_gpu_nv.c`. This said 0x8042
+/// Must match `VIRTIO_ID_GPU_NV` in `guest/linux/conduit_gpu.c`. This said 0x8042
 /// while the driver bound 45, so a device advertising it would never have been
 /// probed by its own guest driver.
 pub const VIRTIO_ID_GPU_NV: u32 = 45;
@@ -47,7 +47,7 @@ pub const MAX_FD_TRANSLATIONS: usize = 16;
 
 /// One GPU, as the guest driver reads it.
 ///
-/// Mirrors `struct virtio_gpu_nv_gpu_slot`, which the driver asserts is 476
+/// Mirrors `struct conduit_gpu_slot`, which the driver asserts is 476
 /// bytes.
 #[derive(Clone, Copy, Debug)]
 #[repr(C, packed)]
@@ -148,7 +148,7 @@ pub const FEATURE_RMCTRL_SEGMENTS: u32 = 1 << 0;
 
 /// Device configuration space.
 ///
-/// Mirrors `struct virtio_gpu_nv_config` up to 4016 bytes, which the driver
+/// Mirrors `struct conduit_gpu_config` up to 4016 bytes, which the driver
 /// asserts, with `num_fd_translations` at offset 3880. The guest reads no
 /// further: `vram_limit_mib` after it is for the VMM. The whole must fit in
 /// one page.

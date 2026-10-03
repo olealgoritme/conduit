@@ -9,7 +9,7 @@ Licensed BSD-3-Clause OR GPL-2.0+ (`../LICENSE-BSD-3-Clause`,
 share one set of definitions.
 
 `src/messages.rs` is the Rust side; the C side is in
-`guest/linux/virtio_gpu_nv.c`. Nothing checks the two against each other
+`guest/linux/conduit_gpu.c`. Nothing checks the two against each other
 automatically: change both in the same commit.
 
 Shared-memory regions (ids defined in `device/bin/conduit-backend.rs` and

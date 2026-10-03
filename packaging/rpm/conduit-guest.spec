@@ -9,7 +9,7 @@
 Name:           conduit-guest
 Version:        0.1.0
 Release:        1%{?dist}
-Summary:        Conduit guest driver (virtio_gpu_nv), DKMS source
+Summary:        Conduit guest driver (conduit_gpu), DKMS source
 License:        GPL-2.0-only
 URL:            https://github.com/olealgoritme/conduit
 Source0:        conduit-%{version}.tar.gz
@@ -42,8 +42,14 @@ install -D -m0644 guest/agent/conduit-clipboard.desktop %{buildroot}%{_sysconfdi
 install -D -m0644 guest/agent/70-conduit-clipboard.rules %{buildroot}%{_udevrulesdir}/70-conduit-clipboard.rules
 install -D -m0644 guest/power/50-conduit-powerkey.conf %{buildroot}/usr/lib/systemd/logind.conf.d/50-conduit-powerkey.conf
 install -D -m0644 guest/agent/README.md %{buildroot}%{_docdir}/%{name}/README.clipboard.md
+install -D -m0644 guest/system/modules-load.conf %{buildroot}%{_modulesloaddir}/conduit-gpu.conf
+install -D -m0644 guest/system/modprobe.conf %{buildroot}%{_modprobedir}/conduit-gpu.conf
+install -D -m0644 guest/system/60-conduit-userns.conf %{buildroot}%{_sysconfdir}/sysctl.d/60-conduit-userns.conf
+install -D -m0755 guest/system/conduit-guest-setup %{buildroot}%{_prefix}/lib/conduit-guest/setup
 
 %post
+# Retires the old module name (virtio_gpu_nv), sets a locale, applies sysctl.
+%{_prefix}/lib/conduit-guest/setup || :
 udevadm control --reload-rules 2>/dev/null || :
 udevadm trigger --subsystem-match=misc --sysname-match=conduit-clipboard 2>/dev/null || :
 systemctl --global enable conduit-clipboard.service 2>/dev/null || :
@@ -52,6 +58,7 @@ for k in /lib/modules/*/build; do
     kver=$(basename "$(dirname "$k")")
     dkms install -m %{name} -v %{version} -k "$kver" -q 2>/dev/null || :
 done
+echo "conduit-guest: reboot the VM to load the guest driver (conduit_gpu)."
 
 %preun
 if [ "$1" = 0 ]; then
@@ -66,6 +73,10 @@ dkms remove -m %{name} -v %{version} --all -q 2>/dev/null || :
 %config(noreplace) %{_sysconfdir}/xdg/autostart/conduit-clipboard.desktop
 %{_udevrulesdir}/70-conduit-clipboard.rules
 /usr/lib/systemd/logind.conf.d/50-conduit-powerkey.conf
+%{_modulesloaddir}/conduit-gpu.conf
+%{_modprobedir}/conduit-gpu.conf
+%config(noreplace) %{_sysconfdir}/sysctl.d/60-conduit-userns.conf
+%{_prefix}/lib/conduit-guest
 %doc %{_docdir}/%{name}/README.clipboard.md
 
 %changelog

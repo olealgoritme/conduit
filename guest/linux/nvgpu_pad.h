@@ -50,7 +50,7 @@ static struct input_dev *nvgpu_pad_new(struct nvgpu_pads *p, unsigned int i) {
   if (!in)
     return NULL;
   in->name = nvgpu_pad_names[i];
-  in->phys = "virtio-gpu-nv/pad";
+  in->phys = "conduit-gpu/pad";
   in->id.bustype = BUS_USB;
   in->id.vendor = 0x045e;  /* the Xbox 360 controller's ids: every game */
   in->id.product = 0x028e; /* and SDL know its layout */

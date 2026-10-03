@@ -1,0 +1,161 @@
+#!/bin/sh
+# conduit-guest-setup: system settings for a Conduit VM, run by the
+# conduit-guest package after every install and upgrade (deb/rpm postinst,
+# Arch install script). Safe to run again; prints what it changes.
+#
+#   1. Retire virtio_gpu_nv, the guest driver's name before it became
+#      conduit_gpu: DKMS registrations, leftover .ko files, boot-time module
+#      lists, the conduit-guest.service and udev rules `conduit create`
+#      installed, and initramfs images that carry the old module.
+#   2. A UTF-8 locale other than C.UTF-8 (en_US.UTF-8) when none is set:
+#      Steam's 32-bit client crashes in libc with LANG=C.UTF-8
+#      ("XOpenIM() failed").
+#   3. Apply 60-conduit-userns.conf (unprivileged user namespaces, for Steam,
+#      Flatpak and browser sandboxes).
+#
+# Inside a chroot (a disk being built by `conduit create`) nothing is applied
+# to the running kernel; the files are enough for the VM's first boot.
+set -u
+say() { echo "conduit-guest: $*"; }
+
+in_chroot() {
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        systemd-detect-virt -q --chroot
+        return
+    fi
+    [ "$(stat -c %d:%i / 2>/dev/null)" != "$(stat -c %d:%i /proc/1/root/. 2>/dev/null)" ]
+}
+CHROOT=0
+in_chroot && CHROOT=1
+
+# --- 1. the old module name ---------------------------------------------------
+OLD=virtio_gpu_nv
+OLD_DASH=virtio-gpu-nv
+NEW=conduit_gpu
+NEW_DASH=conduit-gpu
+
+# DKMS: any registered version whose dkms.conf builds the old module (an
+# older conduit-guest, or a tree added by hand).
+if [ -d /var/lib/dkms ] && command -v dkms >/dev/null 2>&1; then
+    for d in /var/lib/dkms/*/*/; do
+        d=${d%/}
+        [ -d "$d" ] || continue
+        v=${d##*/}; m=${d%/*}; m=${m##*/}
+        case "$v" in original_module|kernel-*) continue ;; esac
+        if grep -qs "BUILT_MODULE_NAME.*\"\?$OLD\"\?" "$d/source/dkms.conf" ||
+            ls "$d"/*/*/module/"$OLD".ko* >/dev/null 2>&1; then
+            say "removing DKMS module $m/$v (it builds the old $OLD)"
+            dkms remove -m "$m" -v "$v" --all >/dev/null 2>&1 || true
+            rm -rf "$d"
+        fi
+    done
+fi
+
+# Module files DKMS did not account for.
+for k in $(find /lib/modules/ -name "$OLD.ko*" 2>/dev/null | sed 's#^/lib/modules/\([^/]*\)/.*#\1#' | sort -u); do
+    find "/lib/modules/$k" -name "$OLD.ko*" | while read -r ko; do
+        say "removing $ko"
+        rm -f "$ko"
+    done
+    depmod -a "$k" 2>/dev/null || true
+done
+
+# Boot-time module lists: the package's own modules-load.d entry replaces them.
+for f in /etc/modules-load.d/*.conf /etc/modules; do
+    [ -f "$f" ] && grep -qs "^[[:space:]]*${OLD}[[:space:]]*$" "$f" || continue
+    sed -i "/^[[:space:]]*${OLD}[[:space:]]*$/d" "$f"
+    if grep -qv '^[[:space:]]*\(#.*\)\?$' "$f"; then
+        say "dropped $OLD from $f"
+    elif [ "$f" != /etc/modules ]; then
+        rm -f "$f"
+        say "removed $f (it only loaded $OLD)"
+    fi
+done
+
+# Units and udev rules installed by `conduit create` / `conduit attach`.
+changed_units=0
+for f in /etc/systemd/system/*.service /etc/systemd/system/*.service.d/*.conf; do
+    [ -f "$f" ] && grep -qs "modprobe $OLD\b" "$f" || continue
+    sed -i "s/modprobe $OLD\b/modprobe $NEW/g" "$f"
+    say "$f now loads $NEW"
+    changed_units=1
+done
+for f in /etc/udev/rules.d/*conduit*.rules; do
+    [ -f "$f" ] && grep -qs -e "$OLD" -e "$OLD_DASH" "$f" || continue
+    sed -i -e "s/$OLD_DASH/$NEW_DASH/g" -e "s/$OLD/$NEW/g" "$f"
+    say "$f now matches $NEW"
+done
+if [ "$CHROOT" = 0 ] && [ "$changed_units" = 1 ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload 2>/dev/null || true
+fi
+
+# Initramfs images that still carry the old module.
+for img in /boot/initrd.img-* /boot/initramfs-*.img; do
+    [ -f "$img" ] || continue
+    case "$img" in *.old-dkms|*.bak|*kdump*|*rescue*) continue ;; esac
+    if command -v lsinitramfs >/dev/null 2>&1; then
+        k=${img#/boot/initrd.img-}
+        lsinitramfs "$img" 2>/dev/null | grep -q "/$OLD\.ko" || continue
+        say "rebuilding the initramfs for $k (it carries $OLD)"
+        update-initramfs -u -k "$k" >/dev/null 2>&1 || say "update-initramfs -u -k $k failed"
+    elif command -v lsinitrd >/dev/null 2>&1; then
+        k=${img#/boot/initramfs-}; k=${k%.img}
+        lsinitrd "$img" 2>/dev/null | grep -q "/$OLD\.ko" || continue
+        say "rebuilding the initramfs for $k (it carries $OLD)"
+        dracut -f "$img" "$k" >/dev/null 2>&1 || say "dracut -f $img $k failed"
+    fi
+done
+
+# --- 2. locale ------------------------------------------------------------------
+LOCALE=en_US.UTF-8
+current_lang() {
+    for f in /etc/default/locale /etc/locale.conf; do
+        [ -f "$f" ] || continue
+        sed -n 's/^[[:space:]]*LANG=["'\'']\{0,1\}\([^"'\'']*\).*/\1/p' "$f" | tail -1
+        return
+    done
+}
+lang=$(current_lang)
+case "$lang" in
+    *.UTF-8|*.utf8|*.UTF8|*.utf-8)
+        case "$lang" in C.*|POSIX.*) need_locale=1 ;; *) need_locale=0 ;; esac ;;
+    *) need_locale=1 ;;
+esac
+if [ "$need_locale" = 1 ]; then
+    if command -v locale-gen >/dev/null 2>&1; then
+        # Debian/Ubuntu (the locales package). Debian's locale-gen builds what
+        # /etc/locale.gen lists; Ubuntu's takes the locale as an argument.
+        if [ -f /etc/locale.gen ] && ! grep -q "^[[:space:]]*${LOCALE}[[:space:]]\+UTF-8" /etc/locale.gen; then
+            if grep -q "^#[[:space:]]*${LOCALE}[[:space:]]\+UTF-8" /etc/locale.gen; then
+                sed -i "s/^#[[:space:]]*\(${LOCALE}[[:space:]]\+UTF-8\)/\1/" /etc/locale.gen
+            else
+                echo "$LOCALE UTF-8" >> /etc/locale.gen
+            fi
+        fi
+        locale-gen "$LOCALE" >/dev/null 2>&1 || true
+        if command -v update-locale >/dev/null 2>&1; then
+            update-locale "LANG=$LOCALE" 2>/dev/null || echo "LANG=$LOCALE" > /etc/default/locale
+        else
+            echo "LANG=$LOCALE" > /etc/default/locale
+        fi
+        say "default locale set to $LOCALE (was ${lang:-unset}); takes effect at the next login"
+    elif command -v localedef >/dev/null 2>&1; then
+        # Fedora, Arch and others: /etc/locale.conf.
+        locale -a 2>/dev/null | grep -qix 'en_US.utf8' ||
+            localedef -i en_US -f UTF-8 "$LOCALE" 2>/dev/null || true
+        if [ -f /etc/locale.conf ] && grep -q '^LANG=' /etc/locale.conf; then
+            sed -i "s/^LANG=.*/LANG=$LOCALE/" /etc/locale.conf
+        else
+            echo "LANG=$LOCALE" >> /etc/locale.conf
+        fi
+        say "default locale set to $LOCALE (was ${lang:-unset}); takes effect at the next login"
+    fi
+fi
+
+# --- 3. user namespaces ---------------------------------------------------------
+if [ "$CHROOT" = 0 ] && [ -f /etc/sysctl.d/60-conduit-userns.conf ] &&
+    [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+    sysctl --system >/dev/null 2>&1 || true
+fi
+
+exit 0

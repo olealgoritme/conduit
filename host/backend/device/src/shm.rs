@@ -224,7 +224,7 @@ impl ShmAllocator {
 
         // Create a memfd as fallback backing (used for tests and
         // before set_base_ptr is called).
-        let name = CString::new("virtio-gpu-nv-shm").unwrap();
+        let name = CString::new("conduit-gpu-shm").unwrap();
         let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
         assert!(
             raw_fd >= 0,

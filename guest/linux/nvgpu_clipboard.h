@@ -120,7 +120,7 @@ struct nvgpu_clip_file {
   u64 seen;
 };
 
-/* The one clipboard device; the first virtio-gpu-nv with a display owns it. */
+/* The one clipboard device; the first conduit-gpu with a display owns it. */
 static DEFINE_MUTEX(nvgpu_clip_global_mutex);
 static struct nvgpu_clip *nvgpu_clip_global;
 
@@ -239,7 +239,7 @@ static void nvgpu_clip_event(struct nvgpu_device *dev, const u8 *p,
   if (c->dead || c->pending_bytes + len > NVGPU_CLIP_PENDING_MAX) {
     spin_unlock_irqrestore(&c->lock, flags);
     dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: clipboard chunk dropped\n");
+                         "conduit-gpu: clipboard chunk dropped\n");
     return;
   }
   spin_unlock_irqrestore(&c->lock, flags);
@@ -426,7 +426,7 @@ static void nvgpu_clip_request(struct nvgpu_clip *c) {
     ret = (s32)le32_to_cpu(resp.status);
   if (ret < 0)
     dev_dbg(&c->dev->vdev->dev,
-            "virtio-gpu-nv: clipboard request not taken: %d\n", ret);
+            "conduit-gpu: clipboard request not taken: %d\n", ret);
   mutex_unlock(&c->write_mutex);
 }
 
@@ -521,14 +521,14 @@ static void nvgpu_clip_init(struct nvgpu_device *dev) {
     mutex_unlock(&nvgpu_clip_global_mutex);
     kfree(c);
     dev_warn(&dev->vdev->dev,
-             "virtio-gpu-nv: /dev/conduit-clipboard not registered: %d\n",
+             "conduit-gpu: /dev/conduit-clipboard not registered: %d\n",
              ret);
     return;
   }
   mutex_unlock(&nvgpu_clip_global_mutex);
   /* Published last: the event interrupt may use it from here on. */
   WRITE_ONCE(dev->clip, c);
-  dev_info(&dev->vdev->dev, "virtio-gpu-nv: clipboard at /dev/conduit-clipboard\n");
+  dev_info(&dev->vdev->dev, "conduit-gpu: clipboard at /dev/conduit-clipboard\n");
   /* Whatever the host sent before now was dropped: ask for it again. */
   nvgpu_clip_request(c);
 }

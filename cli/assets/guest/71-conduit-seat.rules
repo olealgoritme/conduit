@@ -1,4 +1,4 @@
 # Conduit: our KMS card is the seat0 master; its input devices belong to the seat user.
-SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DRIVERS=="virtio-gpu-nv|virtio_gpu_nv", TAG+="seat", TAG+="master-of-seat", TAG+="uaccess"
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DRIVERS=="conduit-gpu|conduit_gpu", TAG+="seat", TAG+="master-of-seat", TAG+="uaccess"
 SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{vendor}=="0x10de", TAG+="seat", TAG+="master-of-seat", TAG+="uaccess"
 SUBSYSTEM=="input", KERNEL=="event*|mouse*|js*", TAG+="seat", TAG+="uaccess"

@@ -9,7 +9,7 @@
  * exactly what the code said before. Each block names the release that
  * changed the API; delete a block once that release is the minimum.
  *
- * Included from virtio_gpu_nv.c after its kernel and DRM headers.
+ * Included from conduit_gpu.c after its kernel and DRM headers.
  */
 #ifndef NVGPU_COMPAT_H
 #define NVGPU_COMPAT_H

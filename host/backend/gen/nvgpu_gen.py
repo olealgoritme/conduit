@@ -1,5 +1,5 @@
 """
-nvgpu_gen.py — Generate virtio-gpu-nv guest driver tables from
+nvgpu_gen.py — Generate conduit-gpu guest driver tables from
                NVIDIA open-gpu-kernel-modules source tree.
 
 Usage:
@@ -1203,7 +1203,7 @@ def detect_driver_version(src_root: Path) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate virtio-gpu-nv driver tables from NVIDIA source"
+        description="Generate conduit-gpu driver tables from NVIDIA source"
     )
     parser.add_argument(
         "--src", required=True, type=Path,

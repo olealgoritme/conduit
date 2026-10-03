@@ -47,15 +47,18 @@ package_conduit() {
 }
 
 package_conduit-guest-dkms() {
-  pkgdesc="Conduit guest driver (virtio_gpu_nv) for Linux VMs, DKMS source"
+  pkgdesc="Conduit guest driver (conduit_gpu) for Linux VMs, DKMS source"
   arch=(any)
   license=('GPL-2.0-only')
   depends=(dkms python)
   optdepends=('wl-clipboard: clipboard on wlroots/KDE Wayland sessions'
               'libxfixes: clipboard on X11 sessions and GNOME (XWayland)')
   provides=(conduit-guest)
+  backup=(etc/sysctl.d/60-conduit-userns.conf)
+  # Arch's dkms pacman hooks build and remove the module; the install script
+  # runs guest/system/conduit-guest-setup (old module name, locale, sysctl).
+  install=conduit-guest.install
   cd "$pkgbase"
-  # Arch's dkms pacman hooks build and remove the module; no install script.
   VERSION=$pkgver packaging/build.sh guest-src "$pkgdir/usr/src/conduit-guest-$pkgver"
   # The clipboard agent (enable per user: systemctl --user enable
   # conduit-clipboard, or rely on the XDG autostart entry).
@@ -64,4 +67,8 @@ package_conduit-guest-dkms() {
   install -Dm0644 guest/agent/conduit-clipboard.desktop "$pkgdir/etc/xdg/autostart/conduit-clipboard.desktop"
   install -Dm0644 guest/agent/70-conduit-clipboard.rules "$pkgdir/usr/lib/udev/rules.d/70-conduit-clipboard.rules"
   install -Dm0644 guest/power/50-conduit-powerkey.conf "$pkgdir/usr/lib/systemd/logind.conf.d/50-conduit-powerkey.conf"
+  install -Dm0644 guest/system/modules-load.conf "$pkgdir/usr/lib/modules-load.d/conduit-gpu.conf"
+  install -Dm0644 guest/system/modprobe.conf "$pkgdir/usr/lib/modprobe.d/conduit-gpu.conf"
+  install -Dm0644 guest/system/60-conduit-userns.conf "$pkgdir/etc/sysctl.d/60-conduit-userns.conf"
+  install -Dm0755 guest/system/conduit-guest-setup "$pkgdir/usr/lib/conduit-guest/setup"
 }

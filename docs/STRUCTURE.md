@@ -16,8 +16,10 @@ conduit/
 │   └── qemu/      Build script + patches for the bundled QEMU 11.1, the
 │                  default VM runner (`conduit up/view --vmm qemu|builtin`).
 ├── guest/
-│   ├── linux/     C. The guest kernel module (virtio GPU, KMS display,
+│   ├── linux/     C. The guest kernel module, conduit_gpu (virtio GPU, KMS display,
 │   │              input, clipboard device). Packaged with DKMS.
+│   ├── system/    Files the conduit-guest package installs in the VM: module
+│   │              autoload, modprobe.d, sysctl, and its post-install setup.
 │   ├── agent/     Python. conduit-clipboard-agent: the desktop session's
 │   │              clipboard <-> /dev/conduit-clipboard.
 │   └── windows/   Reserved for the Windows guest driver (see ROADMAP).

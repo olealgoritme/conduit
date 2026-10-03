@@ -1,7 +1,7 @@
 # Two ways to build this module.
 #
-# In-tree (how libkrunfw builds it), selected by CONFIG_VIRTIO_GPU_NV:
-obj-$(CONFIG_VIRTIO_GPU_NV) += virtio_gpu_nv.o
+# In-tree (how libkrunfw builds it), selected by CONFIG_CONDUIT_GPU:
+obj-$(CONFIG_CONDUIT_GPU) += conduit_gpu.o
 
 # Out-of-tree, for loading into a test guest without rebuilding its kernel:
 #
@@ -14,7 +14,7 @@ PWD  := $(shell pwd)
 
 .PHONY: module clean
 module:
-	$(MAKE) -C $(KDIR) M=$(PWD) CONFIG_VIRTIO_GPU_NV=m modules
+	$(MAKE) -C $(KDIR) M=$(PWD) CONFIG_CONDUIT_GPU=m modules
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean

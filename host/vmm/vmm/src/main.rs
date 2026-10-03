@@ -407,10 +407,10 @@ fn main() -> Result<()> {
         );
         let vectors = irq
             .allocate_msi_vectors(3)
-            .context("virtio-gpu-nv MSI-X vectors")?;
+            .context("conduit-gpu MSI-X vectors")?;
         let intx = irq
             .legacy_irqfd(acpi_slot_gsi(next_slot))
-            .context("virtio-gpu-nv INTx")?;
+            .context("conduit-gpu INTx")?;
         device.bind_interrupts(vectors, irq.clone(), intx);
         device.bind_mapper(memory_slots.clone());
         let bdf = pci_bus.add_device_arc(device.clone())?;
@@ -418,11 +418,11 @@ fn main() -> Result<()> {
         // only learns its address now.
         let shm_addr = pci_bus
             .bar_address(bdf, NvGpuDevice::shm_bar())
-            .context("virtio-gpu-nv has no BAR 2")?;
+            .context("conduit-gpu has no BAR 2")?;
         device.set_shm_guest_addr(shm_addr);
         let aperture_addr = pci_bus
             .bar_address(bdf, NvGpuDevice::aperture_bar())
-            .context("virtio-gpu-nv has no BAR 4")?;
+            .context("conduit-gpu has no BAR 4")?;
         device.set_aperture_guest_addr(aperture_addr);
         // Reserved and registered once. A failure here is not fatal: the
         // backend is simply never offered a request channel, and every mapping
@@ -430,12 +430,12 @@ fn main() -> Result<()> {
         // was before the window existed.
         if let Err(err) = memory_slots.open_window(shm_addr, NvGpuDevice::shm_bar_size()) {
             log::warn!(
-                "virtio-gpu-nv window not reserved ({err:#}); device memory will not be \
+                "conduit-gpu window not reserved ({err:#}); device memory will not be \
                  mappable by the guest"
             );
         }
         info!(
-            "virtio-gpu-nv at {:02x}:{:02x}.{}, shared window at {shm_addr:#x}",
+            "conduit-gpu at {:02x}:{:02x}.{}, shared window at {shm_addr:#x}",
             bdf.0, bdf.1, bdf.2
         );
         next_slot += 1;

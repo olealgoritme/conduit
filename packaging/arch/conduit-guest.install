@@ -1,0 +1,8 @@
+# pacman install script for the `conduit-guest-dkms` package.
+post_install() {
+  /usr/lib/conduit-guest/setup || true
+  echo "conduit-guest: reboot the VM to load the guest driver (conduit_gpu)."
+}
+post_upgrade() {
+  post_install
+}

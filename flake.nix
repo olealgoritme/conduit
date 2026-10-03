@@ -144,13 +144,13 @@
         buildPhase = ''
           runHook preBuild
           make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build \
-            M=$PWD CONFIG_VIRTIO_GPU_NV=m modules
+            M=$PWD CONFIG_CONDUIT_GPU=m modules
           runHook postBuild
         '';
         installPhase = ''
           runHook preInstall
-          install -Dm644 virtio_gpu_nv.ko \
-            $out/lib/modules/${kernel.modDirVersion}/updates/virtio_gpu_nv.ko
+          install -Dm644 conduit_gpu.ko \
+            $out/lib/modules/${kernel.modDirVersion}/updates/conduit_gpu.ko
           runHook postInstall
         '';
         meta.license = lib.licenses.gpl2Only;
@@ -174,7 +174,7 @@
       # Inside a NixOS VM: imports = [ conduit.nixosModules.guest ];
       nixosModules.guest = { config, ... }: {
         boot.extraModulePackages = [ (mkGuestModule config.boot.kernelPackages.kernel) ];
-        boot.kernelModules = [ "virtio_gpu_nv" ];
+        boot.kernelModules = [ "conduit_gpu" ];
       };
 
       devShells.${system}.default = pkgs.mkShell {

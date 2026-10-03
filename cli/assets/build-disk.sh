@@ -80,7 +80,7 @@ install_kernel_and_driver() {
   in_vm apt-get update -q
   in_vm apt-get install -y -q --no-install-recommends \
     linux-image-generic linux-headers-generic \
-    initramfs-tools dkms gcc make kmod
+    initramfs-tools dkms gcc make kmod locales
   say "installing the Conduit guest driver (conduit-guest, DKMS)"
   cp "$W/conduit-guest.deb" "$MNT/tmp/conduit-guest.deb"
   in_vm apt-get install -y -q --no-install-recommends /tmp/conduit-guest.deb
@@ -91,14 +91,40 @@ install_kernel_and_driver() {
     # build is an absolute symlink into the VM's /usr/src: test it as a link.
     [ -L "$MNT/lib/modules/$k/build" ] || [ -e "$MNT/lib/modules/$k/build" ] || continue
     in_vm dkms autoinstall -k "$k"
-    if ls "$MNT/lib/modules/$k/updates/dkms/"virtio_gpu_nv.ko* >/dev/null 2>&1; then
+    if ls "$MNT/lib/modules/$k/updates/dkms/"conduit_gpu.ko* >/dev/null 2>&1; then
       say "guest driver built for $k"; ok=1
     fi
   done
   [ "$ok" = 1 ] || { echo "the guest driver did not build for any installed kernel" >&2; exit 1; }
-  # Loaded at boot by conduit-guest.service; also listed so udev-less boots load it.
-  echo virtio_gpu_nv > "$MNT/etc/modules-load.d/conduit.conf"
+  # conduit-guest loads the module at boot (conduit-guest.service, and
+  # /usr/lib/modules-load.d/conduit-gpu.conf for boots without that unit).
+  # Its postinst also moved an older disk off the driver's previous name and
+  # set up the locale and the user-namespace sysctl; make sure of the last two
+  # here, since an older package (CONDUIT_GUEST_DEB) does not do them.
+  configure_locale
+  if [ ! -e "$MNT/etc/sysctl.d/60-conduit-userns.conf" ]; then
+    cat > "$MNT/etc/sysctl.d/60-conduit-userns.conf" <<'EOS'
+# Conduit: allow unprivileged user namespaces inside the VM. Ubuntu 24.04
+# restricts them through AppArmor, and Steam (pressure-vessel), Flatpak and
+# the browser sandboxes need them.
+-kernel.apparmor_restrict_unprivileged_userns = 0
+EOS
+  fi
   in_vm apt-get clean
+}
+
+# en_US.UTF-8 as the default locale. Steam's 32-bit client crashes in libc
+# with LANG=C.UTF-8 ("XOpenIM() failed"). A new disk always gets it; a
+# converted one keeps any other UTF-8 locale it already has.
+configure_locale() {
+  local cur
+  cur=$(sed -n 's/^LANG=["'\'']\{0,1\}\([^"'\'']*\).*/\1/p' "$MNT/etc/default/locale" 2>/dev/null | tail -1)
+  if [ "$MODE" = convert ]; then
+    case "$cur" in C.*|POSIX*|"") ;; *.UTF-8|*.utf8) return 0 ;; esac
+  fi
+  say "setting the default locale to en_US.UTF-8"
+  in_vm locale-gen en_US.UTF-8 >/dev/null
+  in_vm update-locale LANG=en_US.UTF-8
 }
 
 # The Conduit guest services and settings (both modes).

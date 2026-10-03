@@ -82,7 +82,7 @@ Why each nvgpu-related argument is there:
     fails probe with fewer.
   - `vq_size=256` is the backend's `QUEUE_SIZE`. The default of 64 also
     works, but it is smaller.
-  - `config_size=4036` is `sizeof(struct virtio_gpu_nv_config)`, display
+  - `config_size=4036` is `sizeof(struct conduit_gpu_config)`, display
     fields included. A smaller value hides the display fields.
     `config_size=0` turns config reads off, and the guest driver then
     rejects the device.

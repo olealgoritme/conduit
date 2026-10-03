@@ -1,6 +1,6 @@
 # guest/linux
 
-Conduit's guest kernel module, `virtio_gpu_nv.ko`. Licensed GPL-2.0
+Conduit's guest kernel module, `conduit_gpu.ko`. Licensed GPL-2.0
 (`LICENSE`).
 
 Inside the VM it creates NVIDIA's device nodes (`/dev/nvidiactl`,
@@ -30,6 +30,30 @@ kernel. `conduit create` and `conduit attach` install it for you. To build the
 package: `make guest-deb` or `make guest-rpm` at the repo root. Linux 6.4 or
 newer is required.
 
+The package also installs:
+
+- `/usr/lib/modules-load.d/conduit-gpu.conf`, which loads the module at boot,
+- `/usr/lib/modprobe.d/conduit-gpu.conf` and `/usr/lib/conduit-guest/setup`
+  (from `guest/system/`), described below,
+- `/etc/sysctl.d/60-conduit-userns.conf`, which lifts Ubuntu's AppArmor
+  restriction on unprivileged user namespaces (Steam's pressure-vessel,
+  Flatpak and browser sandboxes need them),
+
+and its post-install sets `en_US.UTF-8` as the default locale when the VM has
+no UTF-8 locale other than `C.UTF-8` (Steam's 32-bit client crashes in libc
+under `C.UTF-8`).
+
+### Upgrading from virtio_gpu_nv
+
+The module was called `virtio_gpu_nv` before it was renamed to `conduit_gpu`.
+Installing the new `conduit-guest` package moves a VM over: the post-install
+script removes DKMS registrations and `.ko` files of the old module, drops it
+from `/etc/modules-load.d/`, points `conduit-guest.service` and the seat udev
+rule at the new name, and rebuilds any initramfs that carries it. The
+modprobe.d file blacklists the old name and redirects `modprobe
+virtio_gpu_nv` to `conduit_gpu`, so the two never load together. Reboot the
+VM afterwards; the old module holds the device until then.
+
 ## Build by hand
 
 ```sh
@@ -41,7 +65,7 @@ make -C guest/linux KDIR=/lib/modules/<ver>/build     # another kernel's headers
 guest's). Any distro kernel with headers installed works; CI builds against
 Ubuntu 24.04 (GA and HWE), Debian 13 and Fedora with zero warnings.
 `nvgpu_compat.h` covers API differences between kernel versions. In a kernel
-tree, `CONFIG_VIRTIO_GPU_NV` builds it in tree (`Kconfig`);
+tree, `CONFIG_CONDUIT_GPU` builds it in tree (`Kconfig`);
 `guest-kernel.config` is a minimal config for a custom guest `vmlinux`.
 
 `gen/` and `rmctrl/` are generated from NVIDIA's open kernel modules by

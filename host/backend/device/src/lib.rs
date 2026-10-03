@@ -1,6 +1,6 @@
 // crates/device/src/lib.rs
 //
-// VMM backend for virtio-gpu-nv.
+// VMM backend for conduit-gpu.
 //
 // Integrates with libkrun's virtio device infrastructure.  The backend holds
 // real host file descriptors for `/dev/nvidia*` and dispatches messages

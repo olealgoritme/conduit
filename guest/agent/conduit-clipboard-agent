@@ -4,7 +4,7 @@
 
 Runs inside the user's graphical session in a Conduit VM. It moves text
 between the session's clipboard and /dev/conduit-clipboard, which the guest
-driver (virtio_gpu_nv) connects to the host viewer.
+driver (conduit_gpu) connects to the host viewer.
 
     host clipboard --> /dev/conduit-clipboard (read)  --> local clipboard
     local clipboard --> /dev/conduit-clipboard (write) --> host clipboard
@@ -724,7 +724,7 @@ class Device:
                 self.told = e.errno
                 hint = ""
                 if e.errno == errno.ENOENT:
-                    hint = " (is virtio_gpu_nv loaded, and is it new enough?)"
+                    hint = " (is conduit_gpu loaded, and is it new enough?)"
                 elif e.errno == errno.EACCES:
                     hint = (" (install 70-conduit-clipboard.rules and log in "
                             "again, or join the 'video' group)")

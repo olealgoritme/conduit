@@ -8,16 +8,29 @@ NAME=conduit-guest
 VERSION=@VERSION@
 done_k=
 
+# Inside a chroot (`conduit create` building a disk) nothing touches the
+# running system: udev, logind and the loaded modules there are the host's.
+chroot=0
+if command -v systemd-detect-virt >/dev/null 2>&1; then
+    systemd-detect-virt -q --chroot && chroot=1
+elif [ "$(stat -c %d:%i / 2>/dev/null)" != "$(stat -c %d:%i /proc/1/root/. 2>/dev/null)" ]; then
+    chroot=1
+fi
+
+# Retire the driver's old name (virtio_gpu_nv), set a usable locale and apply
+# the user-namespace setting (see the script). Never fails the install.
+/usr/lib/conduit-guest/setup || true
+
 # Clipboard: the device node's permissions (70-conduit-clipboard.rules) and the
 # per-session agent. Best effort; none of it may fail the install.
-if command -v udevadm >/dev/null 2>&1; then
+if [ "$chroot" = 0 ] && command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger --subsystem-match=misc --sysname-match=conduit-clipboard 2>/dev/null || true
 fi
 if command -v systemctl >/dev/null 2>&1; then
     systemctl --global enable conduit-clipboard.service 2>/dev/null || true
     # 50-conduit-powerkey.conf: logind rereads its settings on SIGHUP.
-    systemctl kill -s HUP systemd-logind 2>/dev/null || true
+    [ "$chroot" = 1 ] || systemctl kill -s HUP systemd-logind 2>/dev/null || true
 fi
 
 command -v dkms >/dev/null 2>&1 || { echo "$NAME: dkms not installed" >&2; exit 0; }
@@ -48,5 +61,14 @@ for KVER in $(uname -r) $(ls /lib/modules 2>/dev/null); do
         echo "$NAME: no headers for $KVER (install linux-headers-$KVER / kernel-devel), module will build on next kernel install." >&2
     fi
 done
-[ "$built" = 1 ] && modprobe virtio_gpu_nv 2>/dev/null || true
+[ "$chroot" = 1 ] && exit 0
+if grep -q '^virtio_gpu_nv ' /proc/modules 2>/dev/null; then
+    # The old module holds the device until the VM restarts.
+    echo "$NAME: reboot the VM to switch to the new guest driver (conduit_gpu)."
+elif [ "$built" = 1 ] && ! grep -q '^conduit_gpu ' /proc/modules 2>/dev/null; then
+    modprobe conduit_gpu 2>/dev/null || true
+    echo "$NAME: reboot the VM to start the desktop on the new guest driver."
+else
+    echo "$NAME: reboot the VM to load the updated guest driver."
+fi
 exit 0

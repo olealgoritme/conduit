@@ -2,7 +2,7 @@
 /*
  * nvgpu_kms.h -- the guest half of zero-copy scanout (docs/SCANOUT.md).
  *
- * Included once, from virtio_gpu_nv.c, after the GEM proxy and the control
+ * Included once, from conduit_gpu.c, after the GEM proxy and the control
  * queue: it uses both directly and is not a separate translation unit, so the
  * module stays one object for the in-tree (libkrunfw) build.
  *
@@ -239,12 +239,12 @@ static void nvgpu_kms_send_flip(struct nvgpu_kms *kms,
   if (ret) {
     kms->n_flip_errors++;
     dev_warn_ratelimited(&kms->dev->vdev->dev,
-                         "virtio-gpu-nv: scanout flip dropped: %d\n", ret);
+                         "conduit-gpu: scanout flip dropped: %d\n", ret);
     return;
   }
   if (!kms->n_flips++)
     dev_info(&kms->dev->vdev->dev,
-             "virtio-gpu-nv: first scanout flip %ux%u fmt=%p4cc mod=%#llx "
+             "conduit-gpu: first scanout flip %ux%u fmt=%p4cc mod=%#llx "
              "pitch=%u owner=%u handle=%u\n",
              fb->width, fb->height, &fb->format->format, fb->modifier,
              fb->pitches[0], ng->owner_handle, ng->host_handle);
@@ -265,7 +265,7 @@ static void nvgpu_kms_send_disable(struct nvgpu_kms *kms) {
   if (nvgpu_send_async(kms->dev, &m, sizeof(m), sizeof(struct nvgpu_msg_hdr),
                        GFP_NOWAIT | __GFP_NOWARN))
     dev_warn_ratelimited(&kms->dev->vdev->dev,
-                         "virtio-gpu-nv: scanout disable dropped\n");
+                         "conduit-gpu: scanout disable dropped\n");
 }
 
 /* ───────── framebuffers: GEM proxies, untouched ───────── */
@@ -472,13 +472,13 @@ static void nvgpu_kms_send_cursor(struct nvgpu_kms *kms,
   if (ret) {
     /* Not remembered as sent: the next cursor commit tries again. */
     dev_warn_ratelimited(&kms->dev->vdev->dev,
-                         "virtio-gpu-nv: cursor update dropped: %d\n", ret);
+                         "conduit-gpu: cursor update dropped: %d\n", ret);
     kms->cur_sent = false;
     return;
   }
   if (!kms->n_cursor++)
     dev_info(&kms->dev->vdev->dev,
-             "virtio-gpu-nv: first cursor %ux%u hot %u,%u -> host pointer\n",
+             "conduit-gpu: first cursor %ux%u hot %u,%u -> host pointer\n",
              w, h, hx, hy);
   kms->cur_sent = true;
   kms->cur_vis = vis;
@@ -742,7 +742,7 @@ static void nvgpu_kms_mode_work(struct work_struct *work) {
   if (!changed)
     return;
   dev_info(&kms->dev->vdev->dev,
-           "virtio-gpu-nv: host asks for %ux%u@%u.%03u: preferred mode "
+           "conduit-gpu: host asks for %ux%u@%u.%03u: preferred mode "
            "changed, hotplug sent\n",
            w, h, mhz / 1000, mhz % 1000);
   drm_kms_helper_hotplug_event(drm);
@@ -964,7 +964,7 @@ static int nvgpu_kms_init(struct nvgpu_dri_dev *dri, struct drm_device *drm) {
 
   dri->kms = kms;
   dev_info(&dev->vdev->dev,
-           "virtio-gpu-nv: KMS head %ux%u@%u on %s, %d modifiers "
+           "conduit-gpu: KMS head %ux%u@%u on %s, %d modifiers "
            "(kind %#x gen %u sector %u)%s\n",
            kms->width, kms->height, kms->refresh_mhz / 1000, dri->name,
            kms->dri->dev_info[4] ? 7 : 1, kms->dri->dev_info[4],
@@ -1012,7 +1012,7 @@ static struct input_dev *nvgpu_input_alloc(struct nvgpu_device *dev,
   if (!in)
     return NULL;
   in->name = name;
-  in->phys = "virtio-gpu-nv/input0";
+  in->phys = "conduit-gpu/input0";
   in->id.bustype = BUS_VIRTUAL;
   in->id.vendor = 0x10de;
   in->id.product = product;
@@ -1046,7 +1046,7 @@ static int nvgpu_input_create(struct nvgpu_device *dev) {
 
   /* Separate devices, because libinput classifies a device by what it has:
    * relative and absolute axes on one device make neither work well. */
-  in->kbd = nvgpu_input_alloc(dev, "virtio-gpu-nv keyboard", 1);
+  in->kbd = nvgpu_input_alloc(dev, "conduit-gpu keyboard", 1);
   if (!in->kbd)
     goto err;
   __set_bit(EV_KEY, in->kbd->evbit);
@@ -1062,7 +1062,7 @@ static int nvgpu_input_create(struct nvgpu_device *dev) {
   }
 
   ret = -ENOMEM;
-  in->mouse = nvgpu_input_alloc(dev, "virtio-gpu-nv mouse", 2);
+  in->mouse = nvgpu_input_alloc(dev, "conduit-gpu mouse", 2);
   if (!in->mouse)
     goto err;
   nvgpu_input_set_pointer_caps(in->mouse);
@@ -1076,7 +1076,7 @@ static int nvgpu_input_create(struct nvgpu_device *dev) {
   }
 
   ret = -ENOMEM;
-  in->tablet = nvgpu_input_alloc(dev, "virtio-gpu-nv tablet", 3);
+  in->tablet = nvgpu_input_alloc(dev, "conduit-gpu tablet", 3);
   if (!in->tablet)
     goto err;
   nvgpu_input_set_pointer_caps(in->tablet);
@@ -1205,7 +1205,7 @@ static void nvgpu_kms_activate(struct nvgpu_dri_dev *dri) {
   ret = nvgpu_input_create(dev);
   if (ret)
     dev_warn(&dev->vdev->dev,
-             "virtio-gpu-nv: input devices not registered: %d\n", ret);
+             "conduit-gpu: input devices not registered: %d\n", ret);
 }
 
 /*
@@ -1244,7 +1244,7 @@ static void nvgpu_kms_fini(struct nvgpu_dri_dev *dri) {
   nvgpu_vblank_timer_fini(&kms->vblank);
 #endif
   dev_info(&dri->dev->vdev->dev,
-           "virtio-gpu-nv: KMS head down after %llu flips (%llu dropped), "
+           "conduit-gpu: KMS head down after %llu flips (%llu dropped), "
            "%llu cursor updates\n",
            kms->n_flips, kms->n_flip_errors, kms->n_cursor);
   nvgpu_input_destroy(dri->dev);

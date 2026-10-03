@@ -134,11 +134,12 @@ jobs:
           fi
       - name: Check the module
         run: |
-          ko=guest/linux/virtio_gpu_nv.ko
+          ko=guest/linux/conduit_gpu.ko
           test -f "$ko"
           # modinfo is not always installed; the .modinfo section is enough.
           objcopy -O binary --only-section=.modinfo "$ko" modinfo.bin
           tr '\0' '\n' < modinfo.bin | grep -E '^(license|vermagic|alias)='
+          tr '\0' '\n' < modinfo.bin | grep -qx 'name=conduit_gpu'
 
   viewer:
     runs-on: ubuntu-24.04
@@ -209,7 +210,8 @@ jobs:
         run: |
           shellcheck -S warning \
             packaging/build.sh packaging/common/conduit-integrate \
-            packaging/tarball/*.sh packaging/deb/*/*
+            packaging/tarball/*.sh packaging/deb/*/* \
+            guest/system/conduit-guest-setup cli/assets/build-disk.sh
       - name: DKMS source package
         run: |
           NFPM_VERSION=2.43.0
@@ -218,3 +220,5 @@ jobs:
           packaging/build.sh package guest-deb
           dpkg-deb -c dist/out/conduit-guest_*_all.deb
           dpkg-deb -c dist/out/conduit-guest_*_all.deb | grep usr/bin/conduit-clipboard-agent
+          dpkg-deb -c dist/out/conduit-guest_*_all.deb | grep usr/lib/conduit-guest/setup
+          dpkg-deb -c dist/out/conduit-guest_*_all.deb | grep 'usr/src/conduit-guest-.*/conduit_gpu\.c'

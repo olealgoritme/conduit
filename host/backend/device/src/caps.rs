@@ -3,7 +3,7 @@
 //! The backend takes one option, `--caps`, a comma list of `graphics`,
 //! `compute`, `video` and `utility`, named the way NVIDIA's container toolkit
 //! names driver capabilities. The bits travel to the guest in config `caps`
-//! (`NVGPU_CAP_*` in `driver/virtio_gpu_nv.c`), and the guest uses them to
+//! (`NVGPU_CAP_*` in `guest/linux/conduit_gpu.c`), and the guest uses them to
 //! decide which device nodes exist. The backend enforces them whatever the
 //! guest does with them.
 //!

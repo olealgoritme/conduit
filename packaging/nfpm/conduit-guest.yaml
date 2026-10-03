@@ -11,7 +11,7 @@ section: kernel
 priority: optional
 maintainer: "Ole Algoritme <olealgoritme@gmail.com>"
 description: |
-  Conduit guest driver (virtio_gpu_nv), DKMS source.
+  Conduit guest driver (conduit_gpu), DKMS source.
   Install inside a Linux VM (kernel 6.4 or newer) that runs on a Conduit
   host. Lets NVIDIA's own user-space driver render on the host GPU and
   provides the VM's display, input and clipboard (conduit-clipboard-agent).
@@ -39,6 +39,22 @@ contents:
   - src: "@ROOT@/guest/agent/70-conduit-clipboard.rules"
     dst: /usr/lib/udev/rules.d/70-conduit-clipboard.rules
     file_info: {mode: 0644}
+  # Loads conduit_gpu at boot and keeps the old virtio_gpu_nv from loading.
+  - src: "@ROOT@/guest/system/modules-load.conf"
+    dst: /usr/lib/modules-load.d/conduit-gpu.conf
+    file_info: {mode: 0644}
+  - src: "@ROOT@/guest/system/modprobe.conf"
+    dst: /usr/lib/modprobe.d/conduit-gpu.conf
+    file_info: {mode: 0644}
+  # Unprivileged user namespaces (Steam, Flatpak, browser sandboxes).
+  - src: "@ROOT@/guest/system/60-conduit-userns.conf"
+    dst: /etc/sysctl.d/60-conduit-userns.conf
+    type: config
+    file_info: {mode: 0644}
+  # Run by postinst: old module name, locale, sysctl (guest/system).
+  - src: "@ROOT@/guest/system/conduit-guest-setup"
+    dst: /usr/lib/conduit-guest/setup
+    file_info: {mode: 0755}
   # The VM's power button powers it off, even under GNOME (guest/power).
   - src: "@ROOT@/guest/power/50-conduit-powerkey.conf"
     dst: /usr/lib/systemd/logind.conf.d/50-conduit-powerkey.conf
@@ -53,9 +69,10 @@ scripts:
 
 overrides:
   deb:
+    depends: [dkms, python3, locales]
     recommends: ["linux-headers-generic | linux-headers-amd64", wl-clipboard, libx11-6, libxfixes3]
   rpm:
-    recommends: [kernel-devel, wl-clipboard, libX11, libXfixes]
+    recommends: [kernel-devel, wl-clipboard, libX11, libXfixes, glibc-langpack-en]
 
 rpm:
   summary: Conduit guest driver (DKMS source)

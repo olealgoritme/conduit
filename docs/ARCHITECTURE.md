@@ -11,7 +11,7 @@ How a Linux VM uses the host's NVIDIA GPU while the host keeps using it.
  NVIDIA user-mode driver, unmodified        (the host's own files, shared
    │ ioctl / mmap on /dev/nvidia*            read-only over virtiofs)
    ▼
- virtio_gpu_nv.ko  (guest/linux)
+ conduit_gpu.ko  (guest/linux)
    │ virtio: control + event queue ─────►  conduit-backend (host/backend)
    │ shared memory: window, UVM aperture      one per VM, sandboxed
    │                                          │ checks, translates, calls
@@ -37,7 +37,7 @@ NVENC/NVDEC. Its userspace files are the host's own, staged by
 ioctls are a private contract between one driver build's userspace and kernel
 module.
 
-`virtio_gpu_nv.ko` creates `/dev/nvidiactl`, `/dev/nvidia0..N`,
+`conduit_gpu.ko` creates `/dev/nvidiactl`, `/dev/nvidia0..N`,
 `/dev/nvidia-uvm`, `/dev/nvidia-modeset` and a DRM device. It forwards each
 `ioctl()` and `mmap()` without interpreting RM calls, swaps guest file
 descriptors for backend handles, pins memory a process registers by address,

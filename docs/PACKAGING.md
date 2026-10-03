@@ -24,8 +24,12 @@ layout, so a layout change is made in one place.
 | `/etc/apparmor.d/abstractions/conduit` | AppArmor rules for libvirt's QEMU |
 
 The guest package installs `/usr/src/conduit-guest-<version>/` (module source
-plus `dkms.conf`); DKMS builds `virtio_gpu_nv.ko` into
-`/lib/modules/<kver>/updates/dkms/` for every kernel 6.4 or newer.
+plus `dkms.conf`); DKMS builds `conduit_gpu.ko` into
+`/lib/modules/<kver>/updates/dkms/` for every kernel 6.4 or newer. It also
+ships the files in `guest/system/` (module autoload, the modprobe.d entry
+that retires the old `virtio_gpu_nv` name, the user-namespace sysctl, and the
+setup script every package format runs after install; see
+`guest/linux/README.md`).
 
 ## Files
 

@@ -75,7 +75,7 @@ conduit down lab
 cp --sparse=always --reflink=auto ~/.local/share/conduit/vms/lab/disk.img ~/lab-disk-backup.img   # optional backup
 conduit stock-kernel lab      # installs linux-image-generic, headers, dkms, conduit-guest
 conduit up lab                # boots 6.8.0-*-generic from the disk, under QEMU
-conduit ssh lab -- 'uname -r; lsmod | grep virtio_gpu_nv'
+conduit ssh lab -- 'uname -r; lsmod | grep conduit_gpu'
 ```
 
 To go back, put the `"kernel"` line back into vm.json (the command prints it)

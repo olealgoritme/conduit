@@ -19,7 +19,7 @@
 //! is none. Region 0 is unused because the driver predates this and looks the
 //! window up as 1.
 
-/// The window. Must match `NVGPU_SHM_ID` in `driver/virtio_gpu_nv.c`.
+/// The window. Must match `NVGPU_SHM_ID` in `guest/linux/conduit_gpu.c`.
 pub const SHM_ID_WINDOW: u8 = 1;
 /// The UVM aperture. Must match `NVGPU_SHM_ID_APERTURE`.
 pub const SHM_ID_APERTURE: u8 = 2;
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn ids_are_the_drivers() {
-        // driver/virtio_gpu_nv.c: NVGPU_SHM_ID 1, NVGPU_SHM_ID_APERTURE 2.
+        // guest/linux/conduit_gpu.c: NVGPU_SHM_ID 1, NVGPU_SHM_ID_APERTURE 2.
         assert_eq!(SHM_ID_WINDOW, 1);
         assert_eq!(SHM_ID_APERTURE, 2);
     }

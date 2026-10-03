@@ -525,7 +525,7 @@ impl Inner {
         }
 
         self.running = true;
-        log::info!("virtio-gpu-nv active");
+        log::info!("conduit-gpu active");
         Ok(())
     }
 
@@ -714,15 +714,15 @@ fn check_device_config(cfg: &[u8], host_version: &str, vram_limit_mib: Option<u6
             }
         ),
         None if announced != 0 => log::info!(
-            "virtio-gpu-nv: no video memory limit configured here; the backend enforces \
+            "conduit-gpu: no video memory limit configured here; the backend enforces \
              {announced} MiB"
         ),
         None => {
-            log::warn!("virtio-gpu-nv: no video memory limit; this guest may take the whole card")
+            log::warn!("conduit-gpu: no video memory limit; this guest may take the whole card")
         }
     }
     log::info!(
-        "virtio-gpu-nv: driver {version}, {gpus} GPU(s), {fds} descriptor-carrying ioctl(s), \
+        "conduit-gpu: driver {version}, {gpus} GPU(s), {fds} descriptor-carrying ioctl(s), \
          capabilities {:#x}",
         u32_at(36)
     );
@@ -761,12 +761,12 @@ impl NvGpuDevice {
         check_device_config(&device_config, &host_version, vram_limit_mib)?;
 
         let kick_fds = (0..NUM_QUEUES)
-            .map(|_| EventFd::new(0).context("failed to create virtio-gpu-nv kick eventfd"))
+            .map(|_| EventFd::new(0).context("failed to create conduit-gpu kick eventfd"))
             .collect::<Result<Vec<_>>>()?;
 
         let (cfg, msix_cap) = Self::build_pci_config();
         log::info!(
-            "virtio-gpu-nv: backend {} ({CONFIG_LEN}-byte config)",
+            "conduit-gpu: backend {} ({CONFIG_LEN}-byte config)",
             socket_path.display()
         );
         Ok(Self {
@@ -967,7 +967,7 @@ impl NvGpuDevice {
                 } else if v1 & STATUS_DRIVER_OK != 0
                     && let Err(err) = i.activate()
                 {
-                    log::error!("failed to start virtio-gpu-nv: {err:#}");
+                    log::error!("failed to start conduit-gpu: {err:#}");
                 }
             }
             CFG_QUEUE_SEL => i.qs = v2,
