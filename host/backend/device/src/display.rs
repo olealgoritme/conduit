@@ -886,6 +886,10 @@ struct LinkState {
     /// The guest's cursor, and whether this connection still needs it.
     cursor: Option<SentCursor>,
     cursor_dirty: bool,
+    /// The last frame the guest flipped (a dup of its dma-buf), kept across
+    /// connections so a viewer that (re)attaches shows it at once instead of
+    /// a black window until the guest's next flip.
+    frame: Option<(Arc<OwnedFd>, ScanoutFlip)>,
     /// HELLO arrived on this connection (CAPS sent, caps known).
     hello: bool,
     /// The guest's clipboard on its way to the broker.
@@ -968,9 +972,11 @@ impl DisplayLink {
         // The guest's cursor outlives a connection: the next broker gets it
         // once it has said HELLO (and whether it takes cursors at all).
         let cursor = st.cursor.take();
+        let frame = st.frame.take();
         *st = LinkState {
             sock: Some(Arc::new(sock)),
             cursor,
+            frame,
             ..Default::default()
         };
         self.stats.connects.fetch_add(1, Ordering::Relaxed);
@@ -987,8 +993,10 @@ impl DisplayLink {
             // SAFETY: shutdown on a live descriptor; wakes the reader's poll.
             unsafe { libc::shutdown(sock.as_raw_fd(), libc::SHUT_RDWR) };
             let cursor = st.cursor.take();
+            let frame = st.frame.take();
             *st = LinkState {
                 cursor,
+                frame,
                 ..Default::default()
             };
         }
@@ -997,6 +1005,18 @@ impl DisplayLink {
     /// Present `dmabuf` as described by `f`. Never blocks.
     pub fn flip(&self, dmabuf: RawFd, f: &ScanoutFlip) -> FlipOutcome {
         let mut st = self.state.lock().unwrap();
+        let resend = st
+            .frame
+            .as_ref()
+            .is_some_and(|(k, _)| k.as_raw_fd() == dmabuf);
+        if !resend {
+            // SAFETY: dup of a descriptor the caller keeps open for this call.
+            let kept = unsafe { libc::fcntl(dmabuf, libc::F_DUPFD_CLOEXEC, 0) };
+            st.frame = (kept >= 0).then(|| {
+                // SAFETY: `kept` is a fresh descriptor owned by nobody else.
+                (Arc::new(unsafe { OwnedFd::from_raw_fd(kept) }), *f)
+            });
+        }
         let Some(sock) = st.sock.clone() else {
             self.stats.no_broker.fetch_add(1, Ordering::Relaxed);
             return FlipOutcome::NoBroker;
@@ -1198,6 +1218,7 @@ impl DisplayLink {
         st.broker_caps = caps;
         st.hello = true;
         st.cursor_dirty = st.cursor.is_some();
+        let frame = st.frame.clone();
         if let Some(sock) = st.sock.clone() {
             let caps_cmd = wire::Cmd {
                 ty: wire::CMD_CAPS,
@@ -1210,6 +1231,13 @@ impl DisplayLink {
             if let Err(e) = send_records(sock.as_raw_fd(), &caps_cmd.encode(), None) {
                 log::debug!("display: CAPS not sent: {e}");
             }
+        }
+        drop(st);
+        // A viewer that (re)attaches gets the current picture now, not at the
+        // guest's next flip (an idle desktop may not flip for a long time).
+        if let Some((fd, f)) = frame {
+            let r = self.flip(fd.as_raw_fd(), &f);
+            log::info!("display: current frame re-sent to the new viewer: {r:?}");
         }
     }
 
@@ -2276,6 +2304,42 @@ mod tests {
 
     /// The cursor waits for a broker that can take it, then goes as CMD_CURSOR
     /// with the dma-buf and the hotspot packed into seq; a hide carries nothing.
+    #[test]
+    fn a_new_viewer_gets_the_current_frame_at_hello() {
+        let link = DisplayLink::new(None);
+        let buf = memfd();
+        // The guest flips while no viewer is attached: kept, not lost.
+        assert_eq!(
+            link.flip(buf.as_raw_fd(), &flip(1, 1920)),
+            FlipOutcome::NoBroker
+        );
+        let (ours, broker) = socketpair();
+        link.adopt(ours);
+        link.hello(0);
+        assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_CAPS);
+        assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_WINDOW);
+        assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_QUERY_FORMAT);
+        let (c, f) = broker_recv(broker.as_raw_fd());
+        assert_eq!((c.ty, c.width), (wire::CMD_ATTACH, 1920));
+        assert_eq!(
+            inode(f.expect("the frame").as_raw_fd()),
+            inode(buf.as_raw_fd())
+        );
+        assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_COMMIT);
+        // The viewer closes and another attaches: it gets the frame too.
+        drop(broker);
+        let (ours2, broker2) = socketpair();
+        link.adopt(ours2);
+        link.hello(0);
+        assert_eq!(broker_recv(broker2.as_raw_fd()).0.ty, wire::CMD_CAPS);
+        assert_eq!(broker_recv(broker2.as_raw_fd()).0.ty, wire::CMD_WINDOW);
+        assert_eq!(
+            broker_recv(broker2.as_raw_fd()).0.ty,
+            wire::CMD_QUERY_FORMAT
+        );
+        assert_eq!(broker_recv(broker2.as_raw_fd()).0.ty, wire::CMD_ATTACH);
+    }
+
     #[test]
     fn the_cursor_reaches_a_capable_broker_and_survives_reconnects() {
         let (ours, broker) = socketpair();

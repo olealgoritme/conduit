@@ -955,9 +955,43 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 }
 
+/// The listening socket systemd passes on socket activation (`sd_listen_fds`:
+/// `LISTEN_PID` is this process, `LISTEN_FDS` is 1, the socket is fd 3).
+fn activated_listener() -> Option<vhost::vhost_user::Listener> {
+    const SD_LISTEN_FDS_START: RawFd = 3;
+    let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
+    let n: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
+    if pid != std::process::id() || n != 1 {
+        return None;
+    }
+    // Only a listening unix stream socket will do.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat on a plain fd number into a local buffer.
+    if unsafe { libc::fstat(SD_LISTEN_FDS_START, &mut st) } != 0
+        || st.st_mode & libc::S_IFMT != libc::S_IFSOCK
+    {
+        return None;
+    }
+    // SAFETY: fd 3 is ours: the service manager handed it over and nothing
+    // else in this process owns it.
+    Some(unsafe { vhost::vhost_user::Listener::from_raw_fd(SD_LISTEN_FDS_START) })
+}
+
+/// Like `VhostUserDaemon::serve`: a guest that quits mid-message is a normal end.
+fn disconnect_is_ok(e: vhost_user_backend::Error) -> Result<(), vhost_user_backend::Error> {
+    use vhost::vhost_user::Error as VuError;
+    match e {
+        vhost_user_backend::Error::HandleRequest(VuError::Disconnected)
+        | vhost_user_backend::Error::HandleRequest(VuError::PartialMessage) => Ok(()),
+        e => Err(e),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    // Before the sandbox, which may not allow the fstat that checks it.
+    let activated = activated_listener();
     // Before any device is opened: the host driver judges every guest call by
     // this process's credentials (device::posture).
     device::posture::enforce()?;
@@ -1052,10 +1086,25 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("create daemon: {e:?}"))?;
 
-    let _ = std::fs::remove_file(&args.socket);
-    daemon
-        .serve(&args.socket)
-        .map_err(|e| anyhow::anyhow!("serve {}: {e:?}", args.socket))?;
+    match activated {
+        // systemd (conduit-backend@NAME.socket) holds the listening socket and
+        // started this process on QEMU's connection: serve that one
+        // connection, then exit, so the backend lives exactly as long as the VM.
+        Some(mut listener) => {
+            log::info!("socket activation: serving the listener systemd passed in");
+            daemon
+                .start(&mut listener)
+                .and_then(|()| daemon.wait())
+                .or_else(disconnect_is_ok)
+                .map_err(|e| anyhow::anyhow!("serve (socket activation): {e:?}"))?;
+        }
+        None => {
+            let _ = std::fs::remove_file(&args.socket);
+            daemon
+                .serve(&args.socket)
+                .map_err(|e| anyhow::anyhow!("serve {}: {e:?}", args.socket))?;
+        }
+    }
 
     backend
         .write()
