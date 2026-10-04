@@ -43,7 +43,7 @@ def main():
             r'^description = .*': f'description = "{product} {values[f"HELIOS_{role}_ROLE"]}"'
         }
     # Cargo author metadata belongs to the project, not to the upstream engines.
-    for crate in ["kmd_render", "umd", "umd12", "umd_common", "protocol", "kmd_logic", "tools/win-mcp"]:
+    for crate in ["kmd_render", "umd", "umd12", "umd_common", "protocol", "kmd_logic"]:
         fields = replacements.setdefault(f"{crate}/Cargo.toml", {})
         fields[r'^authors = .*'] = f'authors = ["{values["HELIOS_PUBLISHER"]}"]'
     stale = []
