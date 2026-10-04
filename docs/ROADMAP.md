@@ -42,6 +42,7 @@
 - [ ] Windows guests, two routes:
   - CUDA / NVML / NVENC on a small non-WDDM driver, using NVIDIA's own user-mode libraries
   - graphics through the open stack: NVK (Mesa Vulkan) on RM + DXVK / vkd3d-proton
+- [ ] Graphics via Venus (Vulkan forwarding) over Conduit's device ([VENUS.md](VENUS.md))
 - [ ] Multiple VMs sharing one GPU with fair scheduling
 - [ ] Per-VM GPU selection on multi-GPU hosts
 - [ ] Multiple monitors per VM, VRR and HDR

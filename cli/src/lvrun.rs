@@ -29,6 +29,8 @@ use std::time::Duration;
 
 const NEXT_MODE: &str = "libvirt-next-mode";
 const MODE: &str = "libvirt-mode";
+/// Present when the next backend start serves Venus (`--venus`).
+const NEXT_VENUS: &str = "libvirt-next-venus";
 /// How long an ACPI shutdown may take before the VM is forced off.
 const SHUTDOWN_GRACE: Duration = run::SHUTDOWN_GRACE;
 
@@ -165,6 +167,11 @@ fn before_start(name: &str, link: &Link) -> Result<()> {
 fn write_next_mode(rt: &Rt, mode: Option<Mode>) -> Result<()> {
     let v = mode.map(|m| m.to_string()).unwrap_or_else(|| "none".into());
     std::fs::write(rt.p(NEXT_MODE), v + "\n")?;
+    if run::venus() {
+        std::fs::write(rt.p(NEXT_VENUS), "1\n")?;
+    } else {
+        let _ = std::fs::remove_file(rt.p(NEXT_VENUS));
+    }
     Ok(())
 }
 
@@ -592,6 +599,7 @@ pub fn backend_exec(name: &str) -> Result<()> {
     log_to(&logs_dir(name).join("backend.log"), false)?;
     let next = std::fs::read_to_string(rt.p(NEXT_MODE)).ok();
     let _ = std::fs::remove_file(rt.p(NEXT_MODE));
+    let venus = std::fs::remove_file(rt.p(NEXT_VENUS)).is_ok();
     let mode: Option<Mode> = match next.as_deref().map(str::trim) {
         Some("none") => None,
         Some(s) if s.parse::<Mode>().is_ok() => s.parse().ok(),
@@ -610,6 +618,9 @@ pub fn backend_exec(name: &str) -> Result<()> {
         .args(["--caps", "graphics,video,utility,compute"])
         .arg("--trace-socket")
         .arg(crate::trace::socket(name));
+    if venus {
+        cmd.arg("--venus");
+    }
     if let Some(m) = mode {
         cmd.arg("--display")
             .arg(m.to_string())

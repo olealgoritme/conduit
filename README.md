@@ -24,7 +24,7 @@ from GPU memory to your screen: no copying, no video compression.
 | Clipboard both ways, sound (speakers + mic) | ✅ |
 | Streaming to Moonlight (AV1/HEVC/H.264, up to 240 fps) | ✅ |
 | virt-manager / virsh (start, pause, reboot, stop; attach to existing VMs) | ✅ |
-| Windows VMs | ❌ not yet ([roadmap](docs/ROADMAP.md)) |
+| Windows VMs | ❌ not yet (in progress: [Venus](docs/VENUS.md), [roadmap](docs/ROADMAP.md)) |
 
 > Conduit is early software, tested mainly on an RTX 5090 with Ubuntu 24.04
 > and Hyprland. Expect rough edges. Windows guests are not supported yet
@@ -228,6 +228,12 @@ Conduit builds on [virtio-nvgpu](https://github.com/nestrilabs/virtio-nvgpu)
 and [nesbox](https://github.com/nestrilabs/nesbox) (Nestri Labs), the display
 broker from [nvkvm-pv](https://github.com/reindertpelsma/nvkvm-pv), and ideas
 from gVisor's nvproxy and [kayfabe](https://github.com/reindertpelsma/kayfabe).
+The Windows guest components come from [Helios](https://github.com/winboat-org/helios)
+by the WinBoat project (rupansh, TibixDev), with
+[DXVK](https://github.com/doitsujin/dxvk),
+[vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton),
+[Mesa](https://mesa3d.org) (Venus) and
+[virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer).
 Licenses: see [LICENSE](LICENSE) and the `NOTICE` files in each component.
 
 NVIDIA, GeForce and RTX are trademarks of NVIDIA Corporation. Conduit is not

@@ -234,6 +234,9 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
         .args(["--caps", "graphics,video,utility,compute"])
         .arg("--trace-socket")
         .arg(crate::trace::socket(&c.name));
+    if venus() {
+        cmd.arg("--venus");
+    }
     if let Some(m) = mode {
         cmd.arg("--display")
             .arg(m.to_string())
@@ -637,6 +640,17 @@ static NO_MEM_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 
 pub fn set_no_mem_check(on: bool) {
     NO_MEM_CHECK.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `--venus` (experimental): the backend serves Venus (docs/VENUS.md).
+static VENUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_venus(on: bool) {
+    VENUS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn venus() -> bool {
+    VENUS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Refuse to start when the VM's RAM does not fit in what the host has free.
