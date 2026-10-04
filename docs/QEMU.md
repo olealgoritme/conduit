@@ -147,6 +147,13 @@ device:
   </qemu:commandline>
 ```
 
+The bundled QEMU is built with TPM support (`tpm-crb`, `tpm-tis`, and the
+`emulator` and `passthrough` backends), so domains with
+`<tpm model='tpm-crb'><backend type='emulator' version='2.0'/></tpm>` (the
+virt-install default, and required by Windows 11) start. The emulator
+backend needs `swtpm` and `swtpm_setup` on the host (Debian/Ubuntu: `swtpm`
+and `swtpm-tools`; Fedora: `swtpm` and `swtpm-tools`; Arch: `swtpm`).
+
 ## What the guest sees: QEMU compared with conduit-vmm
 
 The guest driver finds everything through virtio PCI capabilities. It calls

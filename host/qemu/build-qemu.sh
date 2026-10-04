@@ -119,13 +119,17 @@ fi
 # VNC + pixman stay on for a headless firmware/console fallback.
 # Audio: the guest gets a virtio-sound card (speakers + mic) played through
 # the desktop's PipeWire, or PulseAudio (pipewire-pulse) as a fallback.
+# TPM: libvirt domains with <tpm model='tpm-crb'><backend type='emulator'/>
+# (the virt-install default; Windows 11 needs a TPM 2.0) need the TPM
+# backends and the tpm-crb/tpm-tis devices. The emulator backend talks to an
+# external swtpm over a socket, so this adds no library dependency.
 # The options are part of the stamp below, so changing them reconfigures.
 if [[ $AUDIO == enabled ]]; then
   AUDIO_OPTS=(--enable-pipewire --enable-pa --audio-drv-list=pipewire,pa)
 else
   AUDIO_OPTS=(--disable-pipewire --disable-pa --audio-drv-list=)
 fi
-CONF_STAMP="slirp=$SLIRP audio=$AUDIO"
+CONF_STAMP="slirp=$SLIRP audio=$AUDIO tpm=enabled"
 cd "$BUILD_DIR"
 if [[ ! -f build.ninja || "$(cat .conduit-configured 2>/dev/null)" != "$CONF_STAMP" ]]; then
   "$SRC_DIR/qemu-$QEMU_VERSION/configure" \
@@ -142,6 +146,7 @@ if [[ ! -f build.ninja || "$(cat .conduit-configured 2>/dev/null)" != "$CONF_STA
     --enable-vnc \
     --enable-fdt=system \
     --enable-malloc-trim \
+    --enable-tpm \
     "${AUDIO_OPTS[@]}" \
     --disable-gtk --disable-sdl --disable-spice --disable-opengl \
     --disable-docs \
@@ -156,6 +161,10 @@ nice -n 10 ninja -j "$JOBS"
 ./qemu-system-x86_64 -device help 2>/dev/null \
   | grep -E '"vhost-user-test-device-pci"' \
   || { echo "vhost-user-test-device-pci missing from build" >&2; exit 1; }
+./qemu-system-x86_64 -tpmdev help 2>&1 | grep -qE '^ *emulator ' \
+  || { echo "TPM emulator backend missing from build" >&2; exit 1; }
+./qemu-system-x86_64 -device help 2>/dev/null | grep '"tpm-crb"' >/dev/null \
+  || { echo "tpm-crb device missing from build" >&2; exit 1; }
 if [[ $AUDIO == enabled ]]; then
   ./qemu-system-x86_64 -audiodev help 2>/dev/null | grep -qx pipewire \
     || { echo "pipewire audio backend missing from build" >&2; exit 1; }
