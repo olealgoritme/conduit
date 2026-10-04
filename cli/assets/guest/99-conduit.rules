@@ -1,2 +1,6 @@
 # Conduit: the GPU nodes and virtual input devices are usable by the desktop user.
 KERNEL=="renderD*|card*|uinput", MODE="0666"
+# A stable name for Conduit's display card. An attached VM also has the emulated
+# display its firmware draws on, so card numbers vary; compositors that take a
+# device list (Hyprland: AQ_DRM_DEVICES) are pointed here.
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DRIVERS=="conduit-gpu", SYMLINK+="dri/conduit-card"

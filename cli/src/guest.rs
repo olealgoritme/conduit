@@ -130,6 +130,16 @@ run install -m644 "$D/71-conduit-seat.rules" /etc/udev/rules.d/71-conduit-seat.r
 run install -m644 "$D/zz-conduit-nvidia.conf" /etc/ld.so.conf.d/zz-conduit-nvidia.conf
 run install -m644 "$D/conduit-nvidia.sh" /etc/profile.d/conduit-nvidia.sh
 run install -m644 "$D/90-conduit-nvidia.conf" /etc/environment.d/90-conduit-nvidia.conf
+# environment.d reaches systemd user sessions and profile.d login shells, but a
+# display manager's greeter (SDDM running Hyprland) gets neither; pam_env's
+# /etc/environment reaches every PAM session. Replace our block, keep the rest.
+if [ "$DRY" = 0 ]; then
+    touch /etc/environment
+    sed -i '/^# >>> conduit >>>$/,/^# <<< conduit <<<$/d' /etc/environment
+    { echo '# >>> conduit >>>'; grep -v '^#' "$D/90-conduit-nvidia.conf"; echo '# <<< conduit <<<'; } >> /etc/environment
+else
+    say "would add the 90-conduit-nvidia.conf variables to /etc/environment"
+fi
 # Only a booted systemd has units to reload (not a container or chroot).
 if [ -d /run/systemd/system ]; then
     run systemctl daemon-reload
