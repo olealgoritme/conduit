@@ -943,12 +943,6 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
      * definition, and the geometry bounds nb_validate_desc() already enforced
      * are what keep the compositor from reading past the mapping.
      */
-    if (d->is_shm && nb_tier != NB_TIER_SHM && nb_tier != NB_TIER_AUTO) {
-        nb_err("ATTACH: REFUSING a shared-memory frame: this viewer is "
-               "zero-copy only (--present-mode=%s).  Frame dropped.",
-               nb_tier == NB_TIER_LINEAR ? "linear" : "native");
-        return -EINVAL;
-    }
     if (d->is_shm) {
         struct wl_shm_pool *pool;
         struct wl_buffer *sb;
@@ -2920,7 +2914,7 @@ static int wl_idle_make(struct nb_wl *w, int wd, int ht)
                              "THE GUEST HAS NOT PRESENTED A FRAME");
     } else {
         nb_placeholder_paint(px, (unsigned)wd, (unsigned)ht, (unsigned)wd,
-                             "NVKVM DISPLAY BROKER", "WAITING FOR A VM");
+                             "CONDUIT", "WAITING FOR THE VM");
     }
     return 0;
 }
@@ -5838,9 +5832,12 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
      * and a memfd sent WITHOUT F_SHM went to
      * zwp_linux_buffer_params_v1_add() as though it were one.
      */
-    /* virtio-nvgpu: the shm tier exists only when explicitly asked for
-     * (--present-mode=shm / auto).  Zero-copy or a loud dropped frame. */
-    s->accept_shm = (nb_tier == NB_TIER_SHM || nb_tier == NB_TIER_AUTO);
+    /* Conduit: an F_SHM frame is always accepted.  The guest's own frames are
+     * dma-bufs and stay zero-copy (or a loud dropped frame) in the native and
+     * linear tiers; the backend sends shared memory only for its boot console
+     * -- the VM's firmware and boot screens, before the guest driver shows
+     * anything -- which has no dma-buf to offer. */
+    s->accept_shm = true;
     return 0;
 
 fail:
