@@ -1,0 +1,872 @@
+// tools/d3d12_bridge_probe.cpp — D12-G1 engine gate and native DDI draw acceptance.
+//
+// -DHELIOS_G1_NATIVE selects the Windows-runtime arm: load d3d12.dll and
+// dxgi.dll from the system directory, select the Helios hardware adapter, and
+// call D3D12CreateDevice. It exercises the shipping DDI's shader/PSO/draw path
+// with the same offscreen workload and pixel checks as the engine arms below.
+// Build both native architectures with tools/build-d3d12-draw-probe.ps1.
+// Run d3d12-draw.exe without arguments in the logged-in desktop session.
+// The remaining historical engine-arm description applies without this define.
+//
+// Proves the engine path `umd12` will actually use, one layer BELOW the DDI:
+//
+//     helios_vkd3d_create_device(luid, IID_ID3D12Device, &device)
+//       -> clear + draw into an offscreen ID3D12Resource
+//       -> copy to a READBACK heap, Map, and compare the pixels
+//
+// There is no d3d12.dll, no D3D12 runtime, no DXGI swapchain and nothing on
+// screen. Under DECISIONS.md D2 this and D12-G2 are the only early truth about
+// whether vkd3d runs on venus, so every step logs its own line: a failure must be
+// attributable to one step, not to "the probe".
+//
+// ── THREE ARMS, ONE SOURCE ──────────────────────────────────────────────────
+// `-DHELIOS_G1_STATIC` selects **the engine arm** (DECISIONS.md "✅ D4 IS
+// DECIDED — STATIC"): the two Helios entry points are ordinary `extern "C"`
+// symbols pulled out of `libhelios_d3d12_static.a` at link time, exactly as
+// `umd12/build.rs` pulls them at S4. There is no `LoadLibrary` and no engine
+// DLL anywhere in the process.
+//
+// `-DHELIOS_G1_UMD12` selects **the shipping arm** (S4): the same engine, but
+// reached through `helios_umd12.dll`'s three `helios_umd12_probe_*_v1` exports,
+// which sit on top of the cxx bridge (`umd12/bridge/vkd3d_bridge.cpp`) which
+// sits on top of the very same archive symbols. What this proves that the
+// static arm cannot: the engine works **inside `helios_umd12.dll`** — a Rust
+// `cdylib` built with `panic = "abort"`, `lto = "thin"`, cxx-generated glue and
+// the MSVC CRT linked into the same module. That is a materially different
+// artifact from the static arm's plain clang-cl probe `.exe`; a build that links
+// is not a device that draws, which is the whole reason the static arm existed.
+// ⛔ The probe `.exe` in this arm links **nothing but itself** — no archive, no
+// engine — so it also proves the exports are the only seam the engine needs.
+//
+// Without either define the probe keeps the **retired**
+// `LoadLibrary("helios_vkd3d.dll")` shape. That arm is kept only because it is
+// the configuration D12-G1 passed under on 2026-08-05 (mingw cross-build), so
+// the other two arms have something reproducible to be compared against; it is
+// not a supported path.
+// ⛔ Copy-pasting this file into a second probe instead of the `#ifdef` would be
+// the duplication D3b forbids: the 28 steps must be the SAME 28 steps, or the
+// comparison proves nothing. Concretely: only the prologue (steps 01–02) and
+// ONE line of teardown are allowed to differ per arm. Steps 03–27 are
+// byte-identical source across all three, and that identity is the entire
+// evidentiary value of `arm-diff.txt`.
+//
+// ── WHAT IS DELIBERATELY NOT LINKED ─────────────────────────────────────────
+//   * d3d12.lib  — the device must come from the Helios entry point, never from
+//                  the OS D3D12 runtime.
+//   * dxguid.lib — IIDs come from __uuidof().
+//   * dxgi.lib   — ⭐ NEW, and it is a pass criterion of the static arm, not a
+//                  tidy-up. `umd/build.rs`'s link-lib block states the rule for
+//                  D3D11 (cited without a line number on purpose: it has
+//                  already drifted once, when S4b added a .file() above it):
+//                  "a WDDM UMD sits below DXGI and implements the DXGI DDI; it
+//                  must not depend on dxgi.dll." The retired DLL arm violated it
+//                  twice over — the probe linked dxgi.lib for the adapter LUID
+//                  AND helios_vkd3d.dll carried a static `CreateDXGIFactory1`
+//                  import from `libs/d3d12core/main.c`. The static engine cannot
+//                  generate that import (main.c is not in the archive), so the
+//                  probe must not reintroduce it: the LUID now comes from
+//                  D3DKMT, which is what sits below DXGI, resolved by name out
+//                  of gdi32.dll so it is not even a link-time dependency.
+//                  `dumpbin /IMPORTS` showing no dxgi.dll is the assertion.
+//                  ⭐ In the `HELIOS_G1_UMD12` arm the same assertion moves to
+//                  where it now matters: it is `helios_umd12.dll` that must
+//                  import no dxgi.dll, since that DLL — not this probe — is what
+//                  ships under `UserModeDriverName[3]`.
+//
+// Build: tmp/dx12/build-g1-static.ps1 (static engine arm),
+// tmp/dx12/build-g1-umd12.ps1 (umd12 DLL arm), or tmp/dx12/build-g1-probe.ps1
+// (retired DLL arm). All three run dxc -T {vs,ps}_6_0 -Fh first.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <d3d12.h>
+#if defined(HELIOS_G1_NATIVE)
+#include <dxgi1_4.h>
+#endif
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <wchar.h>
+
+#include "d3d12_bridge_probe_vs.h"   // g_vs_main — generated by dxc -Fh
+#include "d3d12_bridge_probe_ps.h"   // g_ps_main — generated by dxc -Fh
+
+// ---- the two Helios entry points (DECISIONS.md D4) --------------------------
+// Same functions, same signatures, in both arms — D4 changed only their
+// delivery, from a DLL export to an archive symbol.
+#if defined(HELIOS_G1_NATIVE)
+#if defined(HELIOS_G1_STATIC) || defined(HELIOS_G1_UMD12)
+#error Select only one D3D12 probe arm.
+#endif
+static PFN_D3D12_CREATE_DEVICE g_runtime_create;
+static PFN_D3D12_SERIALIZE_ROOT_SIGNATURE g_runtime_serialize;
+typedef HRESULT(WINAPI *PFN_RUNTIME_FACTORY)(REFIID iid, void **factory);
+static PFN_RUNTIME_FACTORY g_runtime_factory;
+
+static HRESULT runtime_create_device(LUID luid, REFIID iid, void **out)
+{
+    if (iid != __uuidof(ID3D12Device)) return E_NOINTERFACE;
+    *out = nullptr;
+    IDXGIFactory4 *factory = nullptr;
+    HRESULT hr = g_runtime_factory(__uuidof(IDXGIFactory4), (void **)&factory);
+    if (FAILED(hr)) return hr;
+    IDXGIAdapter1 *adapter = nullptr;
+    hr = factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter1), (void **)&adapter);
+    factory->Release();
+    if (FAILED(hr)) return hr;
+    hr = g_runtime_create(adapter, D3D_FEATURE_LEVEL_11_0, iid, out);
+    adapter->Release();
+    if (SUCCEEDED(hr)) {
+        ID3D12Device *device = (ID3D12Device *)*out;
+        if (!device) return E_FAIL;
+        const LUID actual = device->GetAdapterLuid();
+        if (actual.LowPart != luid.LowPart || actual.HighPart != luid.HighPart) {
+            device->Release();
+            *out = nullptr;
+            return E_FAIL;
+        }
+    }
+    return hr;
+}
+
+#elif defined(HELIOS_G1_STATIC)
+extern "C" HRESULT helios_vkd3d_create_device(LUID adapter_luid, REFIID iid, void **device);
+extern "C" HRESULT helios_vkd3d_serialize_root_signature(
+        const D3D12_ROOT_SIGNATURE_DESC *desc, D3D_ROOT_SIGNATURE_VERSION version,
+        ID3DBlob **blob, ID3DBlob **error_blob);
+
+#elif defined(HELIOS_G1_UMD12)
+// ---- the umd12 arm: the engine reached through helios_umd12.dll -------------
+// The three exports are S4 §3.3's evidence instruments. They are deliberately
+// NOT in the `helios_umd_*` family the Mesa ICD resolves by name across all
+// loaded modules first-hit-wins (S4 guardrail 7); nothing but this probe ever
+// looks them up.
+// ⛔ The LUID crosses as two SCALARS, not as a `LUID` by value — parameters the
+// ABI cannot reorder. Step 04's `device reports AdapterLuid` line is what checks
+// it: the value read back off the created device must equal step 03's, and a
+// swapped pair would print the halves the other way round.
+// ⚠ That echo proves TRANSPORT, not SELECTION. The engine passes
+// `vk_physical_device = VK_NULL_HANDLE` and lets `vkd3d_select_physical_device`
+// choose (helios_entry.c:172-179, which says in as many words that this "is NOT
+// LUID matching"), so a *wrong* LUID would still draw a correct triangle on a
+// single-GPU guest.
+typedef HRESULT(*PFN_UMD12_CREATE)(unsigned int luid_low, int luid_high,
+                                   void **out_bridge, void **out_device);
+typedef void   (*PFN_UMD12_DESTROY)(void *bridge);
+typedef HRESULT(*PFN_UMD12_SERIALIZE)(const void *desc, unsigned int version,
+                                      void **blob_out, void **err_out);
+
+// The engine-facing serializer typedef is shared with the retired arm below so
+// that step 05's call site is byte-identical in all three arms.
+typedef HRESULT(*PFN_HELIOS_VKD3D_SERIALIZE_ROOT_SIGNATURE)(
+        const D3D12_ROOT_SIGNATURE_DESC *desc, D3D_ROOT_SIGNATURE_VERSION version,
+        ID3DBlob **blob, ID3DBlob **error_blob);
+
+// `umd-check.ps1 -Mode release -Crate umd12` builds in the local mirror with
+// CARGO_TARGET_DIR = <mirror>\umd12\target (tools/umd-check.ps1:83), so the
+// release cdylib lands here. Overridable by argv[1] exactly as the retired arm.
+static const wchar_t *DEFAULT_DLL =
+        L"C:\\Users\\Rupansh\\helios-vgpu\\umd12\\target\\release\\helios_umd12.dll";
+
+// File-static so steps 03+ can keep calling `create_device(luid, iid, &dev)`
+// unqualified and the teardown can drop the bridge without an extra local.
+static PFN_UMD12_CREATE  g_umd12_create;
+static PFN_UMD12_DESTROY g_umd12_destroy;
+static void             *g_umd12_bridge;
+
+// Adapts the umd12 export's (luid, out_bridge, out_device) shape to the engine
+// entry point's (luid, iid, out_device) shape, so the probe body below does not
+// have to know which arm it is in.
+static HRESULT umd12_create_device(LUID luid, REFIID iid, void **out)
+{
+    if (iid != __uuidof(ID3D12Device)) return E_NOINTERFACE;
+    void *dev = nullptr;
+    // The one place the LUID is split; the bridge's C++ side is the one place it
+    // is reassembled. LowPart is DWORD, HighPart is LONG (winnt.h).
+    HRESULT hr = g_umd12_create((unsigned int)luid.LowPart, (int)luid.HighPart,
+                                &g_umd12_bridge, &dev);
+    if (FAILED(hr)) return hr;
+    // The bridge hands back a BORROWED reference (S4 §3.3: `out_device` is
+    // borrowed, the bridge keeps the owning one); AddRef so the probe's
+    // symmetric Release at step 28 is correct, and so teardown is arm-identical.
+    ((IUnknown *)dev)->AddRef();
+    *out = dev;
+    return hr;
+}
+
+#else
+typedef HRESULT(*PFN_HELIOS_VKD3D_CREATE_DEVICE)(LUID adapter_luid, REFIID iid, void **device);
+typedef HRESULT(*PFN_HELIOS_VKD3D_SERIALIZE_ROOT_SIGNATURE)(
+        const D3D12_ROOT_SIGNATURE_DESC *desc, D3D_ROOT_SIGNATURE_VERSION version,
+        ID3DBlob **blob, ID3DBlob **error_blob);
+
+static const wchar_t *DEFAULT_DLL = L"Z:\\tmp\\dx12\\build\\vkd3d-win64\\libs\\d3d12core\\helios_vkd3d.dll";
+#endif
+
+// The render target, and the two colours the readback must find.
+static const UINT   RT_W = 256, RT_H = 256;
+// Chosen so every channel is exact in 8-bit UNORM: no rounding tolerance is
+// being spent to hide a real colour-space bug.
+static const float  CLEAR_RGBA[4] = { 32.0f / 255.0f, 96.0f / 255.0f, 192.0f / 255.0f, 1.0f };
+static const BYTE   EXPECT_CLEAR[4] = { 32, 96, 192, 255 };
+static const BYTE   EXPECT_TRI[4]   = { 255, 128, 64, 255 };
+
+struct Vertex { float pos[4]; float col[4]; };
+
+static int g_step = 0;
+static int g_failures = 0;
+
+#define STEP(fmt, ...)  printf("[%02d] " fmt "\n", ++g_step, __VA_ARGS__)
+#define FAILSTEP(fmt, ...)  do { printf("[%02d] FAIL: " fmt "\n", ++g_step, __VA_ARGS__); g_failures++; } while (0)
+
+static bool check(HRESULT hr, const char *what)
+{
+    if (SUCCEEDED(hr)) { printf("[%02d] ok    %s\n", ++g_step, what); return true; }
+    printf("[%02d] FAIL  %s -> hr=0x%08lx\n", ++g_step, what, (unsigned long)hr);
+    g_failures++;
+    return false;
+}
+
+static const char *sm_name(D3D_SHADER_MODEL sm)
+{
+    switch ((int)sm) {
+    case 0x60: return "6.0"; case 0x61: return "6.1"; case 0x62: return "6.2";
+    case 0x63: return "6.3"; case 0x64: return "6.4"; case 0x65: return "6.5";
+    case 0x66: return "6.6"; case 0x67: return "6.7"; case 0x68: return "6.8";
+    case 0x51: return "5.1"; default: return "?";
+    }
+}
+
+static const char *fl_name(D3D_FEATURE_LEVEL fl)
+{
+    switch ((int)fl) {
+    case 0xb000: return "11_0"; case 0xb100: return "11_1";
+    case 0xc000: return "12_0"; case 0xc100: return "12_1"; case 0xc200: return "12_2";
+    default: return "?";
+    }
+}
+
+// Report what the engine believes it can do. These are exactly the caps the DDI
+// arm must answer at P3/G7 (H4), so recording them here gives that work a
+// zero-point — and the SHADER_MODEL line is the end-to-end confirmation of H5
+// that the Vulkan-level driverID probe could only predict.
+static void dump_caps(ID3D12Device *dev)
+{
+    D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+                                   D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_12_1,
+                                   D3D_FEATURE_LEVEL_12_2 };
+    D3D12_FEATURE_DATA_FEATURE_LEVELS fls = {};
+    fls.NumFeatureLevels = ARRAYSIZE(levels);
+    fls.pFeatureLevelsRequested = levels;
+    if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fls, sizeof(fls))))
+        printf("       caps: MaxSupportedFeatureLevel = %s\n", fl_name(fls.MaxSupportedFeatureLevel));
+    else
+        printf("       caps: FEATURE_LEVELS query FAILED\n");
+
+    // The runtime clamps downward from whatever is asked for, so walk down until
+    // one succeeds; an SDK that knows a newer model than the driver returns
+    // E_INVALIDARG rather than clamping.
+    const D3D_SHADER_MODEL ask[] = { (D3D_SHADER_MODEL)0x68, (D3D_SHADER_MODEL)0x67,
+                                     (D3D_SHADER_MODEL)0x66, (D3D_SHADER_MODEL)0x60 };
+    for (int i = 0; i < ARRAYSIZE(ask); i++) {
+        D3D12_FEATURE_DATA_SHADER_MODEL sm = {};
+        sm.HighestShaderModel = ask[i];
+        if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) {
+            printf("       caps: HighestShaderModel = %s (asked %s)\n",
+                   sm_name(sm.HighestShaderModel), sm_name(ask[i]));
+            break;
+        }
+    }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
+    if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o))))
+        printf("       caps: ResourceBindingTier=%d TiledResourcesTier=%d ConservativeRasterTier=%d "
+               "TypedUAVLoadAdditionalFormats=%d ROVs=%d\n",
+               (int)o.ResourceBindingTier, (int)o.TiledResourcesTier,
+               (int)o.ConservativeRasterizationTier,
+               (int)o.TypedUAVLoadAdditionalFormats, (int)o.ROVsSupported);
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {};
+    if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5))))
+        printf("       caps: RaytracingTier=%d RenderPassesTier=%d\n",
+               (int)o5.RaytracingTier, (int)o5.RenderPassesTier);
+
+    LUID l = dev->GetAdapterLuid();
+    printf("       caps: device reports AdapterLuid = %08lx:%08lx\n",
+           (unsigned long)l.HighPart, (unsigned long)l.LowPart);
+}
+
+#if defined(HELIOS_G1_NATIVE)
+static bool find_helios_luid(LUID *out, wchar_t *name_out, size_t name_cch)
+{
+    IDXGIFactory4 *factory = nullptr;
+    if (FAILED(g_runtime_factory(__uuidof(IDXGIFactory4), (void **)&factory))) return false;
+    bool found = false;
+    for (UINT index = 0; ; ++index) {
+        IDXGIAdapter1 *adapter = nullptr;
+        const HRESULT hr = factory->EnumAdapters1(index, &adapter);
+        if (hr == DXGI_ERROR_NOT_FOUND) break;
+        if (FAILED(hr)) break;
+        DXGI_ADAPTER_DESC1 desc = {};
+        if (SUCCEEDED(adapter->GetDesc1(&desc))) {
+            printf("       adapter[%u] luid=%08lx:%08lx flags=0x%x desc=%ls\n", index,
+                   (unsigned long)desc.AdapterLuid.HighPart, (unsigned long)desc.AdapterLuid.LowPart,
+                   desc.Flags, desc.Description);
+            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && wcsstr(desc.Description, L"Helios")) {
+                *out = desc.AdapterLuid;
+                wcsncpy_s(name_out, name_cch, desc.Description, _TRUNCATE);
+                found = true;
+            }
+        }
+        adapter->Release();
+        if (found) break;
+    }
+    factory->Release();
+    return found;
+}
+#else
+// ---- D3DKMT adapter enumeration (replaces DXGI; see the dxgi.lib note above) --
+//
+// Hand-declared rather than #include <d3dkmthk.h> for the same reason
+// tools/adapter_type_probe.cpp:8 does it: that header is WDK-only and this probe
+// builds against the plain SDK. ⚠ These four shapes are ABI, so they are
+// transcribed from the staged tmp/dx12/sdk/d3dkmthk.h (SDK 10.0.26100.0):
+// D3DKMT_ADAPTERINFO :1839, D3DKMT_ENUMADAPTERS2 :1852, D3DKMT_ADAPTERREGISTRYINFO
+// :1907, KMTQAITYPE_ADAPTERREGISTRYINFO = 8 :2371, KMTQAITYPE_ADAPTERTYPE = 15.
+// They are read-only queries; nothing here is handed to a driver.
+typedef LONG KMT_NTSTATUS;
+typedef UINT D3DKMT_HANDLE;
+
+struct KmtAdapterInfo {
+    D3DKMT_HANDLE hAdapter;
+    LUID          AdapterLuid;
+    ULONG         NumOfSources;
+    BOOL          bPresentMoveRegionsPreferred;
+};
+struct KmtEnumAdapters2 {
+    ULONG            NumAdapters;
+    KmtAdapterInfo  *pAdapters;
+};
+struct KmtQueryAdapterInfo {
+    D3DKMT_HANDLE hAdapter;
+    UINT          Type;
+    VOID         *pPrivateDriverData;
+    UINT          PrivateDriverDataSize;
+};
+struct KmtCloseAdapter { D3DKMT_HANDLE hAdapter; };
+struct KmtAdapterRegistryInfo {
+    WCHAR AdapterString[MAX_PATH];
+    WCHAR BiosString[MAX_PATH];
+    WCHAR DacType[MAX_PATH];
+    WCHAR ChipType[MAX_PATH];
+};
+struct KmtUmdFileNameInfo {
+    UINT  Version;                  // KMTUMDVERSION, d3dkmthk.h:1830
+    WCHAR UmdFileName[MAX_PATH];
+};
+union KmtAdapterType {
+    struct {
+        UINT RenderSupported       : 1;
+        UINT DisplaySupported      : 1;
+        UINT SoftwareDevice        : 1;
+        UINT PostDevice            : 1;
+        UINT HybridDiscrete        : 1;
+        UINT HybridIntegrated      : 1;
+        UINT IndirectDisplayDevice : 1;
+        UINT Paravirtualized       : 1;
+        UINT Rest                  : 24;
+    };
+    UINT Value;
+};
+static const UINT KMTQAITYPE_UMDRIVERNAME        = 1;
+static const UINT KMTQAITYPE_ADAPTERREGISTRYINFO = 8;
+static const UINT KMTQAITYPE_ADAPTERTYPE         = 15;
+static const UINT KMTUMDVERSION_DX11             = 2;
+
+typedef KMT_NTSTATUS (WINAPI *PFN_KmtEnumAdapters2)(KmtEnumAdapters2 *);
+typedef KMT_NTSTATUS (WINAPI *PFN_KmtQueryAdapterInfo)(KmtQueryAdapterInfo *);
+typedef KMT_NTSTATUS (WINAPI *PFN_KmtCloseAdapter)(const KmtCloseAdapter *);
+
+// Find the Helios adapter's LUID. Never assume index 0 (GATES.md G1 trap).
+//
+// The LUID is a probe convenience — the D3D12 runtime hands `umd12` its adapter
+// for free at OpenAdapter12 — so how it is obtained is not part of the path under
+// test. What IS part of the test is that obtaining it costs no dxgi.dll import:
+// gdi32.dll is resolved by name, so even D3DKMT is not a link-time dependency.
+static bool find_helios_luid(LUID *out, wchar_t *name_out, size_t name_cch)
+{
+    HMODULE gdi = LoadLibraryA("gdi32.dll");
+    if (!gdi) { printf("       LoadLibraryA(gdi32.dll) -> %lu\n", GetLastError()); return false; }
+
+    auto EnumAdapters2    = (PFN_KmtEnumAdapters2)   GetProcAddress(gdi, "D3DKMTEnumAdapters2");
+    auto QueryAdapterInfo = (PFN_KmtQueryAdapterInfo)GetProcAddress(gdi, "D3DKMTQueryAdapterInfo");
+    auto CloseAdapter     = (PFN_KmtCloseAdapter)    GetProcAddress(gdi, "D3DKMTCloseAdapter");
+    if (!EnumAdapters2 || !QueryAdapterInfo || !CloseAdapter) {
+        printf("       D3DKMT entry points missing from gdi32.dll\n");
+        return false;
+    }
+
+    KmtEnumAdapters2 ea = {};
+    if (EnumAdapters2(&ea) < 0 || ea.NumAdapters == 0) {
+        printf("       D3DKMTEnumAdapters2(count) failed or reported 0 adapters\n");
+        return false;
+    }
+    ea.pAdapters = (KmtAdapterInfo *)calloc(ea.NumAdapters, sizeof(KmtAdapterInfo));
+    if (!ea.pAdapters) return false;
+    if (EnumAdapters2(&ea) < 0) { free(ea.pAdapters); return false; }
+
+    bool found = false;
+    for (ULONG i = 0; i < ea.NumAdapters; ++i) {
+        KmtAdapterInfo &a = ea.pAdapters[i];
+
+        KmtAdapterType t = {};
+        KmtQueryAdapterInfo qt = { a.hAdapter, KMTQAITYPE_ADAPTERTYPE, &t, sizeof(t) };
+        QueryAdapterInfo(&qt);
+
+        // ⭐ Identify by the UMD the kernel serves for this adapter, not by its
+        // marketing string. KMTQAITYPE_UMDRIVERNAME is the exact mechanism
+        // DECISIONS.md D3 rests on (`UserModeDriverName` indexed by
+        // KMTUMDVERSION), so "the adapter whose D3D11 UMD is helios_umd.dll" is
+        // a direct statement about the driver under test. It also survives an
+        // INF description change, which a name match would not.
+        // ⚠ KMTQAITYPE_ADAPTERREGISTRYINFO is queried too, but only for the log:
+        // measured 2026-08-05, it fails on every adapter on this box, so nothing
+        // may depend on it.
+        KmtUmdFileNameInfo umd = {};
+        umd.Version = KMTUMDVERSION_DX11;
+        KmtQueryAdapterInfo qu = { a.hAdapter, KMTQAITYPE_UMDRIVERNAME, &umd, sizeof(umd) };
+        const KMT_NTSTATUS us = QueryAdapterInfo(&qu);
+
+        KmtAdapterRegistryInfo ri = {};
+        KmtQueryAdapterInfo qr = { a.hAdapter, KMTQAITYPE_ADAPTERREGISTRYINFO, &ri, sizeof(ri) };
+        const KMT_NTSTATUS rs = QueryAdapterInfo(&qr);
+
+        printf("       adapter[%lu] luid=%08lx:%08lx type=0x%08x{Render=%u Display=%u Sw=%u Paravirt=%u}"
+               " umd[dx11]=%ls desc=%ls\n",
+               (unsigned long)i,
+               (unsigned long)a.AdapterLuid.HighPart, (unsigned long)a.AdapterLuid.LowPart,
+               t.Value, t.RenderSupported, t.DisplaySupported, t.SoftwareDevice, t.Paravirtualized,
+               us >= 0 ? umd.UmdFileName : L"(no umd name)",
+               rs >= 0 ? ri.AdapterString : L"(registry info unavailable)");
+
+        // SoftwareDevice excludes WARP / Basic Render Driver. `_wcslwr_s` is not
+        // used: the DriverStore path case is fixed by our own INF.
+        if (!found && us >= 0 && !t.SoftwareDevice && t.RenderSupported &&
+            wcsstr(umd.UmdFileName, L"helios_umd") != nullptr) {
+            *out = a.AdapterLuid;
+            wcsncpy_s(name_out, name_cch,
+                      (rs >= 0 && ri.AdapterString[0]) ? ri.AdapterString : umd.UmdFileName,
+                      _TRUNCATE);
+            found = true;
+        }
+
+        KmtCloseAdapter c = { a.hAdapter };
+        CloseAdapter(&c);
+    }
+    free(ea.pAdapters);
+    return found;
+}
+#endif
+
+int main(int argc, char **argv)
+{
+#if defined(HELIOS_G1_NATIVE)
+    (void)argv;
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    printf("d3d12-draw - Windows D3D12 runtime arm (%u-bit)\n", (unsigned)(sizeof(void *) * 8));
+    if (argc != 1) { FAILSTEP("native runtime arm takes no arguments%s", ""); return 1; }
+    DWORD session = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &session) || session == 0) {
+        FAILSTEP("run in the logged-in desktop session (session=%lu)", session);
+        return 1;
+    }
+    HMODULE runtime = LoadLibraryExW(L"d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE dxgi = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!runtime || !dxgi) { FAILSTEP("load Windows D3D12/DXGI runtime -> %lu", GetLastError()); return 1; }
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(runtime, path, ARRAYSIZE(path));
+    STEP("Windows D3D12 runtime loaded from %ls", path);
+    GetModuleFileNameW(dxgi, path, ARRAYSIZE(path));
+    printf("       Windows DXGI runtime loaded from %ls\n", path);
+    g_runtime_create = (PFN_D3D12_CREATE_DEVICE)GetProcAddress(runtime, "D3D12CreateDevice");
+    g_runtime_serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)GetProcAddress(runtime, "D3D12SerializeRootSignature");
+    g_runtime_factory = (PFN_RUNTIME_FACTORY)GetProcAddress(dxgi, "CreateDXGIFactory1");
+    if (!g_runtime_create || !g_runtime_serialize || !g_runtime_factory) {
+        FAILSTEP("Windows runtime entry point missing -> %lu", GetLastError());
+        return 1;
+    }
+    auto create_device = &runtime_create_device;
+    auto serialize_rs = g_runtime_serialize;
+    STEP("Windows runtime entry points resolved%s", "");
+#elif defined(HELIOS_G1_STATIC)
+    (void)argc; (void)argv;
+    printf("d3d12_bridge_probe — D12-G1 engine gate (STATIC arm, DECISIONS.md D4)\n");
+    printf("       engine = statically linked (libhelios_d3d12_static.a); no engine DLL\n");
+
+    // ---- 1. the engine is INSIDE this binary --------------------------------
+    // Not a formality: it is the assertion the DLL arm could never make. If the
+    // linker had resolved these against an import library instead of the
+    // archive, the owning module would be some other DLL and this step fails.
+    HMODULE owner = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)(void *)&helios_vkd3d_create_device, &owner)) {
+        FAILSTEP("GetModuleHandleExW(from &helios_vkd3d_create_device) -> %lu", GetLastError());
+        return 1;
+    }
+    wchar_t owner_path[MAX_PATH] = {};
+    GetModuleFileNameW(owner, owner_path, MAX_PATH);
+    if (owner != GetModuleHandleW(nullptr)) {
+        FAILSTEP("engine code lives in %ls, not in the probe image — not statically linked",
+                 owner_path);
+        return 1;
+    }
+    STEP("engine is in the probe image itself, base=%p", (void *)owner);
+    printf("       image = %ls\n", owner_path);
+
+    // The names are used unqualified below in all three arms.
+    auto create_device = &helios_vkd3d_create_device;
+    auto serialize_rs  = &helios_vkd3d_serialize_root_signature;
+    STEP("both Helios entry points linked (create_device=%p serialize_root_signature=%p)",
+         (void *)create_device, (void *)serialize_rs);
+#elif defined(HELIOS_G1_UMD12)
+    const wchar_t *dll_path = DEFAULT_DLL;
+    wchar_t dll_buf[MAX_PATH];
+    if (argc > 1) {
+        MultiByteToWideChar(CP_ACP, 0, argv[1], -1, dll_buf, MAX_PATH);
+        dll_path = dll_buf;
+    }
+
+    printf("d3d12_bridge_probe — D12-G1 engine gate (umd12 arm, S4)\n");
+    printf("       umd12 dll = %ls\n", dll_path);
+
+    // ---- 1. load helios_umd12.dll -------------------------------------------
+    // ⛔ Nothing but the probe is on this link line: no archive, no engine, no
+    // gdi32-for-the-engine. Everything vkd3d needs is already inside this DLL,
+    // and if it is not, this LoadLibraryW is where it shows up.
+    // ⚠ The resolved path is printed because the DriverStore keeps its own copy
+    // of a deployed UMD: loading Z:\... and testing C:\Windows\System32\... is
+    // the mistake that made a stale UMD look like a fixed one (memory 7th).
+    HMODULE umd12 = LoadLibraryW(dll_path);
+    if (!umd12) { FAILSTEP("LoadLibraryW(%ls) -> GetLastError=%lu", dll_path, GetLastError()); return 1; }
+    STEP("LoadLibraryW ok, base=%p", (void *)umd12);
+
+    wchar_t resolved[MAX_PATH] = {};
+    GetModuleFileNameW(umd12, resolved, MAX_PATH);
+    printf("       loaded from = %ls\n", resolved);
+
+    // ---- 2. resolve the three probe exports ---------------------------------
+    g_umd12_create  = (PFN_UMD12_CREATE)  GetProcAddress(umd12, "helios_umd12_probe_create_device_v1");
+    g_umd12_destroy = (PFN_UMD12_DESTROY) GetProcAddress(umd12, "helios_umd12_probe_destroy_device_v1");
+    auto umd12_serialize = (PFN_UMD12_SERIALIZE)
+            GetProcAddress(umd12, "helios_umd12_probe_serialize_root_signature_v1");
+    if (!g_umd12_create)  { FAILSTEP("GetProcAddress(helios_umd12_probe_create_device_v1) -> %lu", GetLastError()); return 1; }
+    if (!g_umd12_destroy) { FAILSTEP("GetProcAddress(helios_umd12_probe_destroy_device_v1) -> %lu", GetLastError()); return 1; }
+    if (!umd12_serialize) { FAILSTEP("GetProcAddress(helios_umd12_probe_serialize_root_signature_v1) -> %lu", GetLastError()); return 1; }
+
+    // The names are used unqualified below in all three arms.
+    auto create_device = &umd12_create_device;
+    // ⚠ Deliberate ABI-identical retype, not a reinterpretation: the export is
+    // declared `(const void*, unsigned int, void**, void**)` (S4 §3.3) purely so
+    // `probe12.rs` needs no D3D12 struct definitions. The bytes are the same
+    // four pointer-width arguments in the same order under the one x64 calling
+    // convention, and casting here is what keeps step 05's call site
+    // byte-identical to the other two arms.
+    auto serialize_rs = (PFN_HELIOS_VKD3D_SERIALIZE_ROOT_SIGNATURE)umd12_serialize;
+    STEP("all three umd12 probe exports resolved (create=%p destroy=%p serialize_root_signature=%p)",
+         (void *)g_umd12_create, (void *)g_umd12_destroy, (void *)serialize_rs);
+#else
+    const wchar_t *dll_path = DEFAULT_DLL;
+    wchar_t dll_buf[MAX_PATH];
+    if (argc > 1) {
+        MultiByteToWideChar(CP_ACP, 0, argv[1], -1, dll_buf, MAX_PATH);
+        dll_path = dll_buf;
+    }
+
+    printf("d3d12_bridge_probe — D12-G1 engine gate (retired DLL arm)\n");
+    printf("       engine dll = %ls\n", dll_path);
+
+    // ---- 1. resolve the engine and BOTH Helios exports ----------------------
+    HMODULE eng = LoadLibraryW(dll_path);
+    if (!eng) { FAILSTEP("LoadLibraryW(%ls) -> GetLastError=%lu", dll_path, GetLastError()); return 1; }
+    STEP("LoadLibraryW ok, base=%p", (void *)eng);
+
+    wchar_t resolved[MAX_PATH] = {};
+    GetModuleFileNameW(eng, resolved, MAX_PATH);
+    printf("       loaded from = %ls\n", resolved);
+
+    auto create_device = (PFN_HELIOS_VKD3D_CREATE_DEVICE)
+            GetProcAddress(eng, "helios_vkd3d_create_device");
+    auto serialize_rs = (PFN_HELIOS_VKD3D_SERIALIZE_ROOT_SIGNATURE)
+            GetProcAddress(eng, "helios_vkd3d_serialize_root_signature");
+    if (!create_device) { FAILSTEP("GetProcAddress(helios_vkd3d_create_device) -> %lu", GetLastError()); return 1; }
+    if (!serialize_rs)  { FAILSTEP("GetProcAddress(helios_vkd3d_serialize_root_signature) -> %lu", GetLastError()); return 1; }
+    STEP("both Helios exports resolved (create_device=%p serialize_root_signature=%p)",
+         (void *)create_device, (void *)serialize_rs);
+#endif
+
+    // ---- 2. the adapter LUID (probe convenience, not the path under test) ----
+    LUID luid = {};
+    wchar_t adapter_name[128] = L"(none)";
+    if (!find_helios_luid(&luid, adapter_name, ARRAYSIZE(adapter_name))) {
+        FAILSTEP("no Helios hardware adapter found%s", "");
+        return 1;
+    }
+    STEP("Helios adapter luid=%08lx:%08lx name=%ls",
+         (unsigned long)luid.HighPart, (unsigned long)luid.LowPart, adapter_name);
+
+    // ---- 3. the device, through the Helios export ---------------------------
+    ID3D12Device *dev = nullptr;
+    HRESULT hr = create_device(luid, __uuidof(ID3D12Device), (void **)&dev);
+#if defined(HELIOS_G1_NATIVE)
+    if (!check(hr, "D3D12CreateDevice(Helios, FL11_0, IID_ID3D12Device)")) return 1;
+#else
+    if (!check(hr, "helios_vkd3d_create_device(IID_ID3D12Device)")) return 1;
+#endif
+    dump_caps(dev);
+
+    // ---- 4. queue / allocator / list ----------------------------------------
+    ID3D12CommandQueue *queue = nullptr;
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (!check(dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void **)&queue),
+               "CreateCommandQueue(DIRECT)")) return 1;
+
+    ID3D12CommandAllocator *alloc = nullptr;
+    if (!check(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+               __uuidof(ID3D12CommandAllocator), (void **)&alloc), "CreateCommandAllocator")) return 1;
+
+    // ---- 5. root signature THROUGH THE SECOND HELIOS EXPORT ------------------
+    // This is the H3 re-serialization path umd12 must use: d3d12umddi delivers
+    // root signatures already parsed, so the UMD re-serializes to an RTS0 blob.
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    ID3DBlob *rs_blob = nullptr, *rs_err = nullptr;
+    if (!check(serialize_rs(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, &rs_err),
+               "serialize_root_signature")) {
+        if (rs_err) printf("       serializer said: %.*s\n",
+                           (int)rs_err->GetBufferSize(), (const char *)rs_err->GetBufferPointer());
+        return 1;
+    }
+    ID3D12RootSignature *rs = nullptr;
+    if (!check(dev->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
+               __uuidof(ID3D12RootSignature), (void **)&rs), "CreateRootSignature")) return 1;
+
+    // ---- 6. PSO with the DXIL SM 6.0 shaders --------------------------------
+    D3D12_INPUT_ELEMENT_DESC il[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = rs;
+    pd.VS = { g_vs_main, sizeof(g_vs_main) };
+    pd.PS = { g_ps_main, sizeof(g_ps_main) };
+    pd.InputLayout = { il, ARRAYSIZE(il) };
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    // Use legal enum values even for disabled operations: the native Windows
+    // runtime validates this descriptor before it reaches the engine.
+    pd.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+    pd.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ZERO;
+    pd.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    pd.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    pd.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+    pd.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    pd.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_NOOP;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.DepthStencilState.DepthEnable = FALSE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    pd.DepthStencilState.StencilEnable = FALSE;
+    pd.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    pd.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    pd.DepthStencilState.FrontFace = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                     D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS };
+    pd.DepthStencilState.BackFace = pd.DepthStencilState.FrontFace;
+    pd.SampleMask = UINT_MAX;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = nullptr;
+    if (!check(dev->CreateGraphicsPipelineState(&pd, __uuidof(ID3D12PipelineState), (void **)&pso),
+               "CreateGraphicsPipelineState (DXIL SM 6.0 vs+ps)")) return 1;
+
+    ID3D12GraphicsCommandList *cl = nullptr;
+    if (!check(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, pso,
+               __uuidof(ID3D12GraphicsCommandList), (void **)&cl), "CreateCommandList")) return 1;
+
+    // ---- 7. the render target, the vertex buffer, the readback buffer -------
+    D3D12_HEAP_PROPERTIES hp_default = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_HEAP_PROPERTIES hp_upload  = { D3D12_HEAP_TYPE_UPLOAD };
+    D3D12_HEAP_PROPERTIES hp_read    = { D3D12_HEAP_TYPE_READBACK };
+
+    D3D12_RESOURCE_DESC rt_desc = {};
+    rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rt_desc.Width = RT_W; rt_desc.Height = RT_H;
+    rt_desc.DepthOrArraySize = 1; rt_desc.MipLevels = 1;
+    rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rt_desc.SampleDesc.Count = 1;
+    rt_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    D3D12_CLEAR_VALUE cv = {};
+    cv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    memcpy(cv.Color, CLEAR_RGBA, sizeof(CLEAR_RGBA));
+
+    ID3D12Resource *rt = nullptr;
+    if (!check(dev->CreateCommittedResource(&hp_default, D3D12_HEAP_FLAG_NONE, &rt_desc,
+               D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, __uuidof(ID3D12Resource), (void **)&rt),
+               "CreateCommittedResource(DEFAULT, R8G8B8A8_UNORM 256x256, RENDER_TARGET)")) return 1;
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+    UINT rows = 0; UINT64 row_bytes = 0, total = 0;
+    dev->GetCopyableFootprints(&rt_desc, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+    printf("       readback footprint: rowpitch=%u rows=%u total=%llu\n",
+           fp.Footprint.RowPitch, rows, (unsigned long long)total);
+
+    D3D12_RESOURCE_DESC buf_desc = {};
+    buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buf_desc.Height = 1; buf_desc.DepthOrArraySize = 1; buf_desc.MipLevels = 1;
+    buf_desc.Format = DXGI_FORMAT_UNKNOWN;
+    buf_desc.SampleDesc.Count = 1;
+    buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    buf_desc.Width = total;
+    ID3D12Resource *rb = nullptr;
+    if (!check(dev->CreateCommittedResource(&hp_read, D3D12_HEAP_FLAG_NONE, &buf_desc,
+               D3D12_RESOURCE_STATE_COPY_DEST, nullptr, __uuidof(ID3D12Resource), (void **)&rb),
+               "CreateCommittedResource(READBACK)")) return 1;
+
+    const Vertex verts[3] = {
+        { {  0.0f,  0.5f, 0.0f, 1.0f }, { 1.0f, 128.0f / 255.0f, 64.0f / 255.0f, 1.0f } },
+        { {  0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 128.0f / 255.0f, 64.0f / 255.0f, 1.0f } },
+        { { -0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 128.0f / 255.0f, 64.0f / 255.0f, 1.0f } },
+    };
+    buf_desc.Width = sizeof(verts);
+    ID3D12Resource *vb = nullptr;
+    if (!check(dev->CreateCommittedResource(&hp_upload, D3D12_HEAP_FLAG_NONE, &buf_desc,
+               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, __uuidof(ID3D12Resource), (void **)&vb),
+               "CreateCommittedResource(UPLOAD, vertex buffer)")) return 1;
+    {
+        void *p = nullptr;
+        D3D12_RANGE none = { 0, 0 };
+        if (!check(vb->Map(0, &none, &p), "Map(vertex buffer)")) return 1;
+        memcpy(p, verts, sizeof(verts));
+        vb->Unmap(0, nullptr);
+    }
+
+    ID3D12DescriptorHeap *rtv_heap = nullptr;
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.NumDescriptors = 1;
+    if (!check(dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), (void **)&rtv_heap),
+               "CreateDescriptorHeap(RTV)")) return 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rt, nullptr, rtv);
+    STEP("CreateRenderTargetView ok (rtv.ptr=0x%llx, RTV stride=%u)",
+         (unsigned long long)rtv.ptr, dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV));
+
+    // ---- 8. record ----------------------------------------------------------
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)RT_W, (float)RT_H, 0.0f, 1.0f };
+    D3D12_RECT sc = { 0, 0, (LONG)RT_W, (LONG)RT_H };
+    D3D12_VERTEX_BUFFER_VIEW vbv = { vb->GetGPUVirtualAddress(), sizeof(verts), sizeof(Vertex) };
+
+    cl->SetGraphicsRootSignature(rs);
+    cl->RSSetViewports(1, &vp);
+    cl->RSSetScissorRects(1, &sc);
+    cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    cl->ClearRenderTargetView(rtv, CLEAR_RGBA, 0, nullptr);
+    cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->IASetVertexBuffers(0, 1, &vbv);
+    cl->DrawInstanced(3, 1, 0, 0);
+
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = rt;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->ResourceBarrier(1, &b);
+
+    D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
+    src.pResource = rt; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+    dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fp;
+    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    if (!check(cl->Close(), "command list Close")) return 1;
+
+    // ---- 9. submit and wait -------------------------------------------------
+    ID3D12CommandList *lists[] = { cl };
+    queue->ExecuteCommandLists(1, lists);
+    STEP("ExecuteCommandLists submitted%s", "");
+
+    ID3D12Fence *fence = nullptr;
+    if (!check(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void **)&fence),
+               "CreateFence")) return 1;
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!ev) { FAILSTEP("CreateEventW -> %lu", GetLastError()); return 1; }
+    if (!check(queue->Signal(fence, 1), "queue->Signal(1)")) return 1;
+    if (!check(fence->SetEventOnCompletion(1, ev), "SetEventOnCompletion")) return 1;
+    DWORD w = WaitForSingleObject(ev, 10000);
+    if (w != WAIT_OBJECT_0) { FAILSTEP("fence wait -> %lu (completed=%llu)", w,
+                                       (unsigned long long)fence->GetCompletedValue()); return 1; }
+    STEP("fence signalled, completed=%llu", (unsigned long long)fence->GetCompletedValue());
+
+    // ---- 10. read the pixels back and compare -------------------------------
+    BYTE *px = nullptr;
+    D3D12_RANGE whole = { 0, (SIZE_T)total };
+    if (!check(rb->Map(0, &whole, (void **)&px), "Map(readback)")) return 1;
+
+    struct Sample { const char *what; UINT x, y; const BYTE *expect; };
+    const Sample samples[] = {
+        { "top-left corner  (outside the triangle) == clear colour", 4,   4,   EXPECT_CLEAR },
+        { "top-right corner (outside the triangle) == clear colour", 251, 4,   EXPECT_CLEAR },
+        { "bottom-left      (outside the triangle) == clear colour", 4,   251, EXPECT_CLEAR },
+        { "centre           (inside  the triangle) == vertex colour", 128, 160, EXPECT_TRI },
+        { "lower-centre     (inside  the triangle) == vertex colour", 128, 180, EXPECT_TRI },
+    };
+    for (int i = 0; i < ARRAYSIZE(samples); i++) {
+        const BYTE *p = px + (size_t)samples[i].y * fp.Footprint.RowPitch + (size_t)samples[i].x * 4;
+        bool ok = true;
+        for (int c = 0; c < 4; c++) {
+            int d = (int)p[c] - (int)samples[i].expect[c];
+            if (d < -1 || d > 1) ok = false;
+        }
+        if (ok)
+            printf("[%02d] ok    %s  (%u,%u)=%u,%u,%u,%u\n", ++g_step, samples[i].what,
+                   samples[i].x, samples[i].y, p[0], p[1], p[2], p[3]);
+        else {
+            printf("[%02d] FAIL  %s  (%u,%u)=%u,%u,%u,%u expected %u,%u,%u,%u\n", ++g_step,
+                   samples[i].what, samples[i].x, samples[i].y, p[0], p[1], p[2], p[3],
+                   samples[i].expect[0], samples[i].expect[1], samples[i].expect[2], samples[i].expect[3]);
+            g_failures++;
+        }
+    }
+    D3D12_RANGE none = { 0, 0 };
+    rb->Unmap(0, &none);
+
+    // Release in reverse order; a clean teardown is part of the gate (a hang or
+    // a crash here is a real finding for the UMD, which tears devices down
+    // constantly — see the six-handles-per-device leak, memory 54th).
+    CloseHandle(ev);
+    fence->Release(); rtv_heap->Release(); vb->Release(); rb->Release(); rt->Release();
+    cl->Release(); pso->Release(); rs->Release(); rs_blob->Release(); if (rs_err) rs_err->Release();
+    alloc->Release(); queue->Release();
+#ifdef HELIOS_G1_UMD12
+    // Drop the bridge's own engine reference FIRST so the probe's Release
+    // below is the last one and step 28's "refcount 0" is arm-identical.
+    g_umd12_destroy(g_umd12_bridge);
+#endif
+    ULONG left = dev->Release();
+    printf("       device final Release() -> refcount %lu (0 expected)\n", left);
+    if (left != 0) g_failures++;
+
+#if defined(HELIOS_G1_NATIVE)
+    printf("\nWindows D3D12 draw %s - %d failure(s) across %d steps\n",
+#else
+    printf("\nD12-G1 %s — %d failure(s) across %d steps\n",
+#endif
+           g_failures ? "FAIL" : "PASS", g_failures, g_step);
+    return g_failures ? 1 : 0;
+}
