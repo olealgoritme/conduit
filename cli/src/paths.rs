@@ -2,6 +2,7 @@
 //!
 //! Installed layout ($CONDUIT_PREFIX, default /opt/conduit):
 //!   bin/conduit-backend   bin/conduit-vmm   bin/conduit-viewer   bin/conduit-userspace
+//!   bin/conduit-venus                   Venus renderer, only for `--venus`
 //!   bin/qemu-system-x86_64              bundled QEMU 11.1, the default VM runner
 //!   share/conduit/guest/conduit-guest.deb the guest driver (DKMS) `conduit create` installs
 //!   share/conduit/supported-drivers.txt  host driver versions the backend speaks
@@ -117,6 +118,7 @@ pub enum Tool {
     GuestDeb,
     BundledQemu,
     Stream,
+    Venus,
 }
 
 impl Tool {
@@ -129,6 +131,7 @@ impl Tool {
             Tool::GuestDeb => "guest driver package (conduit-guest .deb)",
             Tool::BundledQemu => "bundled QEMU",
             Tool::Stream => "stream host (conduit-stream)",
+            Tool::Venus => "Venus renderer (conduit-venus)",
         }
     }
 
@@ -141,6 +144,7 @@ impl Tool {
             Tool::GuestDeb => "CONDUIT_GUEST_DEB",
             Tool::BundledQemu => "CONDUIT_QEMU",
             Tool::Stream => "CONDUIT_STREAM",
+            Tool::Venus => "CONDUIT_VENUS",
         }
     }
 
@@ -184,8 +188,26 @@ impl Tool {
                 &["bin/conduit-stream"],
                 &["host/stream/target/release/conduit-stream"],
             ),
+            // Built apart (host/venus is its own workspace, `--features renderer`).
+            Tool::Venus => (
+                &["bin/conduit-venus"],
+                &[
+                    "host/venus/target/release/conduit-venus",
+                    "host/venus/target/debug/conduit-venus",
+                ],
+            ),
         };
         v.extend(installed.iter().map(|p| pf.join(p)));
+        // conduit-venus is not always installed with the rest: also look next
+        // to this binary.
+        if self == Tool::Venus {
+            if let Some(d) = env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(Path::to_path_buf))
+            {
+                v.push(d.join("conduit-venus"));
+            }
+        }
         if let Some(r) = repo_root() {
             v.extend(dev.iter().map(|p| r.join(p)));
             if self == Tool::GuestDeb {
@@ -210,12 +232,25 @@ impl Tool {
             oops(
                 format!("could not find the {}", self.label()),
                 format!(
-                    "Conduit looked in:\n{}\nReinstall the conduit package, or in a source checkout build it first.\nYou can also point to it with {}=/path/to/file",
+                    "Conduit looked in:\n{}\n{}\nYou can also point to it with {}=/path/to/file",
                     looked.join("\n"),
+                    self.build_hint(),
                     self.env_var()
                 ),
             )
         })
+    }
+}
+
+impl Tool {
+    fn build_hint(self) -> &'static str {
+        match self {
+            Tool::Venus => {
+                "Build it in a source checkout: host/venus/build-virglrenderer.sh, then \
+                            `cargo build --release --features renderer` in host/venus"
+            }
+            _ => "Reinstall the conduit package, or in a source checkout build it first.",
+        }
     }
 }
 

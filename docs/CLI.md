@@ -40,7 +40,7 @@ shared RAM), and with `oom_score_adj=500`, so under memory pressure the kernel k
 before your desktop. `conduit down` stops the slice. Without a systemd user session (or with
 `CONDUIT_NO_SCOPE=1`) the processes run unconfined.
 
-`--venus` (experimental, `up`/`view`, also libvirt VMs): the GPU backend serves Venus for a Windows guest (`conduit-backend --venus`, docs/VENUS.md). Off by default.
+`--venus` (experimental, `up`/`view`, also libvirt VMs): the GPU backend serves Venus for a Windows guest (`conduit-backend --venus`, docs/VENUS.md), rendered by a `conduit-venus` started with it (logs/venus.log; found like the other tools, or `CONDUIT_VENUS=PATH`; `CONDUIT_VENUS_LD_LIBRARY_PATH` becomes its `LD_LIBRARY_PATH`). Off by default.
 
 `--tune-hyprland` is opt-in. While the viewer runs, it sets `misc:no_direct_scanout 0`, `general:allow_tearing 1` and an `immediate` rule for the viewer, then restores the old values. If the viewer supports `--direct-hook`, Ctrl+Alt+D turns these settings on and off.
 

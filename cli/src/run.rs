@@ -6,6 +6,10 @@
 //!
 //! Runtime files live in /run/user/$UID/conduit/NAME/ (pid files, sockets, the
 //! generated runner config); logs in the VM's folder, logs/{backend,vm,viewer}.log.
+//!
+//! With `--venus` the Venus renderer (conduit-venus, docs/VENUS.md) starts
+//! first, in the same slice, logging to logs/venus.log; the backend connects to
+//! its socket and it exits when the backend hangs up.
 
 use crate::hypr;
 use crate::mem;
@@ -55,6 +59,9 @@ pub(crate) struct State {
     /// QEMU only: the virtiofsd serving the NVIDIA share.
     #[serde(default)]
     pub(crate) virtiofsd_comm: String,
+    /// `--venus` only: the Venus renderer (conduit-venus).
+    #[serde(default)]
+    pub(crate) venus_comm: String,
     /// QEMU only: the sound server the VM plays through.
     #[serde(default)]
     pub(crate) audio: Option<String>,
@@ -103,6 +110,10 @@ impl Rt {
     }
     fn vfs_sock(&self) -> PathBuf {
         self.p("vfs.sock")
+    }
+    /// conduit-venus listens here; the backend connects (`--venus-renderer`).
+    pub(crate) fn venus_sock(&self) -> PathBuf {
+        self.p("venus.sock")
     }
     fn qmp_sock(&self) -> PathBuf {
         self.p("qmp.sock")
@@ -234,8 +245,10 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
         .args(["--caps", "graphics,video,utility,compute"])
         .arg("--trace-socket")
         .arg(crate::trace::socket(&c.name));
-    if venus() {
-        cmd.arg("--venus");
+    if p.venus.is_some() {
+        cmd.arg("--venus")
+            .arg("--venus-renderer")
+            .arg(rt.venus_sock());
     }
     if let Some(m) = mode {
         cmd.arg("--display")
@@ -266,6 +279,53 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
     if !ok || !sock.exists() {
         return Err(oops(
             "the GPU backend did not start",
+            format!(
+                "Its log ({}) ends with:\n{}",
+                log.display(),
+                sys::tail(&log, 6)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// conduit-venus, located for `--venus`, with a build hint when it is missing.
+pub(crate) fn need_venus() -> Result<PathBuf> {
+    Tool::Venus.require()
+}
+
+/// The command that runs conduit-venus on `sock`. A virglrenderer built
+/// locally (host/venus/build-virglrenderer.sh) is found through the binary's
+/// rpath; CONDUIT_VENUS_LD_LIBRARY_PATH, when set, becomes its LD_LIBRARY_PATH
+/// (for a binary whose libraries moved, or another build).
+pub(crate) fn venus_cmd(bin: &Path, sock: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.arg("--socket").arg(sock);
+    if let Some(l) = std::env::var_os("CONDUIT_VENUS_LD_LIBRARY_PATH").filter(|l| !l.is_empty()) {
+        cmd.env("LD_LIBRARY_PATH", l);
+    }
+    if std::env::var_os("RUST_LOG").is_none() {
+        cmd.env("RUST_LOG", "info");
+    }
+    cmd
+}
+
+/// `--venus`: the renderer, before the backend that connects to it.
+fn start_venus(c: &VmConfig, rt: &Rt, p: &Parts, bin: &Path) -> Result<()> {
+    let sock = rt.venus_sock();
+    sys::clear_stale_socket(&sock)?;
+    let mut cmd = venus_cmd(bin, &sock);
+    let log = c.logs_dir().join("venus.log");
+    let pid = sys::spawn_vm_part(&mut cmd, &log, false, p.slice.as_ref())?;
+    sys::write_pid(&rt.p("venus.pid"), pid)?;
+    let pid = pid as i32;
+    // It brings Vulkan up before listening, which can take a few seconds.
+    let ok = sys::wait_for(Duration::from_secs(20), || {
+        sock.exists() || !sys::alive(pid)
+    });
+    if !ok || !sock.exists() {
+        return Err(oops(
+            "the Venus renderer (conduit-venus) did not start",
             format!(
                 "Its log ({}) ends with:\n{}",
                 log.display(),
@@ -571,6 +631,8 @@ struct Parts {
     vmm: PathBuf,
     /// QEMU only.
     virtiofsd: Option<PathBuf>,
+    /// `--venus` only: conduit-venus.
+    venus: Option<PathBuf>,
     audio: Option<qemu::Audio>,
     share: PathBuf,
     /// The VM's systemd slice (memory limit), when there is a user systemd.
@@ -679,6 +741,7 @@ pub(crate) fn check_memory(c: &VmConfig) -> Result<()> {
 fn preflight(c: &VmConfig, want: Option<VmmKind>) -> Result<Parts> {
     check_memory(c)?;
     let backend = Tool::Backend.require()?;
+    let venus = if venus() { Some(need_venus()?) } else { None };
     let (kind, vmm, virtiofsd) = pick_vmm(want, c.kernel.is_none())?;
     let audio = match kind {
         VmmKind::Qemu => qemu::pick_audio(&vmm),
@@ -705,6 +768,7 @@ fn preflight(c: &VmConfig, want: Option<VmmKind>) -> Result<Parts> {
         kind,
         vmm,
         virtiofsd,
+        venus,
         audio,
         share,
         slice: Slice::prepare(&c.name, c.ram_mib),
@@ -722,7 +786,13 @@ fn boot(c: &VmConfig, rt: &Rt, st: &mut State, p: &Parts, mode: Option<Mode>) ->
     if let Some(v) = &p.virtiofsd {
         st.virtiofsd_comm = comm_of(v);
     }
+    if let Some(v) = &p.venus {
+        st.venus_comm = comm_of(v);
+    }
     rt.save_state(st)?;
+    if let Some(v) = &p.venus {
+        start_venus(c, rt, p, v)?;
+    }
     start_backend(c, rt, p, mode)?;
     match (p.kind, &p.virtiofsd) {
         (VmmKind::Qemu, Some(vfsd)) => {
@@ -939,6 +1009,7 @@ fn stop_leftovers(c: &VmConfig, rt: &Rt) {
         ("backend", &st.backend_comm),
         ("vm", &st.vm_comm),
         ("virtiofsd", &st.virtiofsd_comm),
+        ("venus", &st.venus_comm),
     ] {
         if rt.pid(what, comm).is_none() {
             let _ = std::fs::remove_file(rt.p(&format!("{what}.pid")));
@@ -949,6 +1020,9 @@ fn stop_leftovers(c: &VmConfig, rt: &Rt) {
     }
     if rt.pid("virtiofsd", &st.virtiofsd_comm).is_none() {
         let _ = sys::clear_stale_socket(&rt.vfs_sock());
+    }
+    if rt.pid("venus", &st.venus_comm).is_none() {
+        let _ = sys::clear_stale_socket(&rt.venus_sock());
     }
     if rt.pid("vm", &st.vm_comm).is_none() {
         let _ = sys::clear_stale_socket(&rt.qmp_sock());
@@ -1107,6 +1181,15 @@ fn down_inner(c: &VmConfig, interactive: bool, verbose: bool, how: Stop) -> Resu
             Duration::from_secs(5),
         );
     }
+    // After the backend: it exits by itself once the backend hangs up.
+    if !st.venus_comm.is_empty() {
+        sys::stop_pid(
+            &rt.p("venus.pid"),
+            &st.venus_comm,
+            "Venus renderer",
+            Duration::from_secs(3),
+        );
+    }
     // Whatever is left in the VM's slice (a process that ignored SIGTERM, a
     // child): stopping the slice ends it, so the shared guest RAM is freed.
     Slice::stop(&c.name);
@@ -1114,6 +1197,7 @@ fn down_inner(c: &VmConfig, interactive: bool, verbose: bool, how: Stop) -> Resu
     let _ = sys::clear_stale_socket(&rt.display_sock());
     let _ = sys::clear_stale_socket(&rt.stream_sock());
     let _ = sys::clear_stale_socket(&rt.vfs_sock());
+    let _ = sys::clear_stale_socket(&rt.venus_sock());
     let _ = sys::clear_stale_socket(&rt.qmp_sock());
     if rt.hypr_state().exists() {
         let _ = hypr::hook("restore", &rt.hypr_state());
@@ -1227,10 +1311,11 @@ pub fn status(name: Option<&str>) -> Result<()> {
             ("vm", &st.vm_comm),
             ("backend", &st.backend_comm),
             ("virtiofsd", &st.virtiofsd_comm),
+            ("venus", &st.venus_comm),
             ("viewer", &st.viewer_comm),
             ("watcher", &st.watcher_comm),
         ] {
-            if what == "virtiofsd" && comm.is_empty() {
+            if (what == "virtiofsd" || what == "venus") && comm.is_empty() {
                 continue;
             }
             if let Some(p) = rt.pid(what, comm) {
@@ -1275,7 +1360,9 @@ pub fn logs(name: &str, which: Option<&str>, follow: bool, lines: usize) -> Resu
     let all = ["backend", "vm", "viewer"];
     let pick: Vec<&str> = match which {
         None => all.to_vec(),
-        Some(w) if all.contains(&w) || ["watcher", "share", "virtiofsd"].contains(&w) => vec![w],
+        Some(w) if all.contains(&w) || ["watcher", "share", "virtiofsd", "venus"].contains(&w) => {
+            vec![w]
+        }
         Some(w) => {
             return Err(oops(
                 format!("there is no \"{w}\" log"),
