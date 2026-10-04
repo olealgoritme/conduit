@@ -105,9 +105,9 @@ jobs:
           if command -v apt-get >/dev/null; then
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            apt-get install -y --no-install-recommends ${{ matrix.headers }} make gcc git ca-certificates
+            apt-get install -y --no-install-recommends ${{ matrix.headers }} make gcc libc6-dev git ca-certificates
           else
-            dnf install -y ${{ matrix.headers }} make gcc elfutils-libelf-devel git
+            dnf install -y ${{ matrix.headers }} make gcc elfutils-libelf-devel git libasan libubsan
           fi
       - uses: actions/checkout@v5
       - name: Find the header tree and its compiler
@@ -145,6 +145,8 @@ jobs:
           objcopy -O binary --only-section=.modinfo "$ko" modinfo.bin
           tr '\0' '\n' < modinfo.bin | grep -E '^(license|vermagic|alias)='
           tr '\0' '\n' < modinfo.bin | grep -qx 'name=conduit_gpu'
+      - name: Unit tests (plain-C parts, on the build host)
+        run: make -C guest/linux HOSTCC="$KCC" check
 
   viewer:
     runs-on: ubuntu-24.04

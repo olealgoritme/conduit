@@ -57,6 +57,7 @@
 #include "gen/nvgpu_rmalloc_classes.h"
 #include "gen/nvgpu_v1v2_rewrites.h"
 #include "nvgpu_rm_intercepts.h"
+#include "nvgpu_pcimap.h"
 #include "nvgpu_rmctrl.h"
 
 /*
@@ -164,6 +165,10 @@ extern struct kset *module_kset;
 #define NV_ESC_RM_CONTROL 0x2a
 #define NV_ESC_RM_ALLOC 0x2b
 #define NV_ESC_RM_VID_HEAP_CONTROL 0x4a
+/* nv-ioctl-numbers.h: NV_IOCTL_MAGIC 'F', NV_IOCTL_BASE 200. */
+#define NV_IOCTL_MAGIC 'F'
+#define NV_ESC_CARD_INFO (200 + 0)
+#define NV_ESC_STATUS_CODE (200 + 9)
 /* UVM_INITIALIZE ioctl nr */
 #define UVM_INITIALIZE_NR 0x30
 
@@ -574,7 +579,7 @@ struct nvgpu_numa_attr {
 
 /* ── Fake PCI device state ── */
 struct nvgpu_pci_slot {
-  char pci_addr[16]; /* "0000:08:00.0"      */
+  char pci_addr[16]; /* the guest's: "0010:08:00.0" (nvgpu_pcimap.h) */
   /*
    * Raw config space, the full extended 4 KiB of it and not the first 256
    * bytes.
@@ -588,7 +593,7 @@ struct nvgpu_pci_slot {
    */
   u8 config[4096];   /* raw config space    */
   bool config_valid;
-  u16 domain;
+  u32 domain; /* the guest domain, never the host's */
   u8 bus_nr;
   u8 slot;
   u8 func;
@@ -612,18 +617,36 @@ struct nvgpu_pci_slot {
  * Mirrored rather than embedded so the struct stays buildable where
  * `struct pci_sysdata` is not the arch's sysdata type; the layout is what
  * matters, and a wrong one is silent.
+ *
+ * The rest of x86's struct -- the ACPI companion, IOMMU data, MSI fwnode and
+ * VMD device pointers, as configured -- is read too: is_vmd() follows
+ * vmd_dev on any kernel built with CONFIG_VMD, which distribution kernels
+ * are. Those words used to be the address string and the first bytes of the
+ * config space; `arch_rest` keeps them NULL (the device struct is zeroed).
  */
 struct nvgpu_pci_root {
   int domain; /* MUST be first — x86 pci_domain_nr()
                * reads domain from sysdata offset 0 */
   int node;   /* MUST be second — x86 pcibus_to_node()
                * reads the NUMA node from sysdata offset 4 */
+  void *arch_rest[8]; /* the rest of struct pci_sysdata: all NULL */
   struct nvgpu_pci_slot slot;
+  int gpu_index; /* which of gpu_slots[] this mirrors */
   struct nvgpu_device *nvdev; /* back pointer        */
   struct pci_host_bridge *bridge;
   struct pci_dev *pdev; /* first (only) device on this bus */
   bool registered;
 };
+
+#ifdef CONFIG_X86
+static_assert(offsetof(struct nvgpu_pci_root, domain) ==
+                  offsetof(struct pci_sysdata, domain) &&
+              offsetof(struct nvgpu_pci_root, node) ==
+                  offsetof(struct pci_sysdata, node) &&
+              offsetof(struct nvgpu_pci_root, slot) >=
+                  sizeof(struct pci_sysdata),
+              "nvgpu_pci_root must cover x86's struct pci_sysdata");
+#endif
 
 struct nvgpu_device {
   /*
@@ -751,6 +774,9 @@ struct nvgpu_device {
 #define NVGPU_MAX_PCI_SLOTS 8
   struct nvgpu_pci_root pci_roots[NVGPU_MAX_PCI_SLOTS];
   int num_pci_roots;
+
+  /* Host <-> guest PCI addresses of the GPUs, fixed at probe. */
+  struct nvgpu_pcimap pcimap;
 };
 
 /*
@@ -1911,6 +1937,8 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
   void *req_buf, *resp_buf;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
+  struct nvgpu_pcimap_saved saved;
+  unsigned int pci_esc;
   int ret;
 
   req_buf = kmalloc(req_total, GFP_KERNEL);
@@ -1939,6 +1967,14 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
     }
   }
 
+  /* The escapes that name a GPU by PCI address speak the host's to RM and
+   * the guest's to the caller (nvgpu_pcimap.h). */
+  pci_esc = _IOC_TYPE(cmd) == NV_IOCTL_MAGIC ? _IOC_NR(cmd) : 0;
+  saved.at = -1;
+  if (pci_esc == NV_ESC_STATUS_CODE)
+    nvgpu_pcimap_status_code_in(&nfd->dev->pcimap, req_buf + sizeof(*req), sz,
+                                &saved);
+
   ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
   if (ret < 0)
     goto out;
@@ -1947,8 +1983,13 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
   ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
 
   if (sz > 0 && resp->data_len && le32_to_cpu(resp->data_len) <= sz) {
-    if (copy_to_user(uarg, resp_buf + sizeof(*resp),
-                     le32_to_cpu(resp->data_len)))
+    u8 *body = resp_buf + sizeof(*resp);
+    u32 back = le32_to_cpu(resp->data_len);
+
+    if (pci_esc == NV_ESC_CARD_INFO)
+      nvgpu_pcimap_card_info(&nfd->dev->pcimap, body, back);
+    nvgpu_pcimap_restore(&saved, body, back);
+    if (copy_to_user(uarg, body, back))
       ret = -EFAULT;
   }
 
@@ -2096,6 +2137,8 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
   int req_total, resp_max, ret;
+  /* A PCI location the caller sent, in the host's terms for RM. */
+  struct nvgpu_pcimap_saved pci_saved = {.at = -1};
 
   if (sz < sizeof(params))
     return -EINVAL;
@@ -2302,6 +2345,11 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
         }
       }
     }
+
+    /* RM knows the GPUs by the host's addresses (nvgpu_pcimap.h). */
+    nvgpu_pcimap_rmctrl_in(&nfd->dev->pcimap, ctl_cmd,
+                           req_buf + sizeof(*req) + sizeof(params),
+                           nested_size, &pci_saved);
   }
 
   if (nseg > 0) {
@@ -2357,14 +2405,21 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
       memcpy(resp_buf + sizeof(*resp) + sizeof(params) + nested_fd_offset,
              &nested_fd, sizeof(nested_fd));
 
+    /* And the caller by the guest's. */
+    nvgpu_pcimap_rmctrl_out(&nfd->dev->pcimap, ctl_cmd,
+                            resp_buf + sizeof(*resp) + sizeof(params),
+                            copy_back);
+    nvgpu_pcimap_restore(&pci_saved,
+                         resp_buf + sizeof(*resp) + sizeof(params), copy_back);
+
     if (copy_to_user(user_nested, resp_buf + sizeof(*resp) + sizeof(params),
                      copy_back))
       ret = -EFAULT;
   }
 
   if (nseg > 0 && le32_to_cpu(resp->deep_len) >= 8) {
-    const u8 *d = resp_buf + sizeof(*resp) + sizeof(params) +
-                  le32_to_cpu(resp->nested_len);
+    u8 *d = resp_buf + sizeof(*resp) + sizeof(params) +
+            le32_to_cpu(resp->nested_len);
     u32 have = min(deep_len, le32_to_cpu(resp->deep_len));
     u32 at, n;
     __le32 v;
@@ -2392,6 +2447,10 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
        */
       for (j = 0; j < nseg; j++) {
         if (seg[j].off == off && seg[j].user && len <= seg[j].len) {
+          /* BUS_GET_INFO's list: the domain entry, as the guest's. */
+          if (ctl_cmd == NVGPU_RM_BUS_GET_INFO)
+            nvgpu_pcimap_bus_info_list(&nfd->dev->pcimap, d + at, len, len / 8,
+                                       true);
           if (copy_to_user((void __user *)seg[j].user, d + at, len))
             ret = -EFAULT;
           break;
@@ -2401,10 +2460,13 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
     }
   } else if (deep_len > 0 && le32_to_cpu(resp->deep_len) > 0) {
     u32 copy_back = min(deep_len, le32_to_cpu(resp->deep_len));
-    if (copy_to_user((void __user *)deep_user_ptr,
-                     resp_buf + sizeof(*resp) + sizeof(params) +
-                         le32_to_cpu(resp->nested_len),
-                     copy_back))
+    u8 *d = resp_buf + sizeof(*resp) + sizeof(params) +
+            le32_to_cpu(resp->nested_len);
+
+    if (ctl_cmd == NVGPU_RM_BUS_GET_INFO)
+      nvgpu_pcimap_bus_info_list(&nfd->dev->pcimap, d, copy_back,
+                                 copy_back / 8, true);
+    if (copy_to_user((void __user *)deep_user_ptr, d, copy_back))
       ret = -EFAULT;
   }
 
@@ -4617,6 +4679,35 @@ static const struct file_operations nvgpu_modeset_fops = {
     .poll = nvgpu_poll,
 };
 
+/* ───────── Host <-> guest PCI addresses (nvgpu_pcimap.h) ───────── */
+
+/* Whether any root bus of the guest's is in this domain. */
+static bool nvgpu_pci_domain_in_use(u32 domain, void *ctx) {
+  struct pci_bus *bus = NULL;
+
+  while ((bus = pci_find_next_bus(bus)) != NULL)
+    if ((u32)pci_domain_nr(bus) == domain)
+      return true;
+  return false;
+}
+
+static void nvgpu_pcimap_init(struct nvgpu_device *dev) {
+  char addrs[8][NVGPU_PCI_ADDR_LEN];
+  int n = (int)min_t(u32, dev->num_gpus, 8), i;
+
+  for (i = 0; i < n; i++)
+    memcpy(addrs[i], dev->gpu_slots[i].pci_addr, NVGPU_PCI_ADDR_LEN);
+  nvgpu_pcimap_build(&dev->pcimap, addrs, n, nvgpu_pci_domain_in_use, NULL);
+
+  for (i = 0; i < dev->pcimap.num; i++)
+    dev_info(&dev->vdev->dev, "conduit-gpu: host GPU %s appears at %s\n",
+             dev->pcimap.gpu[i].host_addr, dev->pcimap.gpu[i].guest_addr);
+  if (dev->pcimap.num < n)
+    dev_warn(&dev->vdev->dev,
+             "conduit-gpu: %d of %d GPU address(es) could not be placed\n",
+             n - dev->pcimap.num, n);
+}
+
 /* ───────── /proc/driver/nvidia ───────── */
 
 static int nvgpu_proc_version_show(struct seq_file *m, void *v) {
@@ -4832,8 +4923,6 @@ static int nvgpu_proc_init(struct nvgpu_device *dev) {
       ret = -ENOMEM;
       goto out;
     }
-    buf->len = content_len;
-
     pathbuf = kmalloc(path_len + 1, GFP_KERNEL);
     if (!pathbuf) {
       kfree(buf->data);
@@ -4842,7 +4931,11 @@ static int nvgpu_proc_init(struct nvgpu_device *dev) {
       goto out;
     }
     memcpy(pathbuf, p, path_len);
-    pathbuf[path_len] = '\0';
+
+    /* The host names the GPU by its address in both: gpus/<addr>/ and
+     * "Bus Location: <addr>". Here it is at the guest's. */
+    buf->len = nvgpu_pcimap_text(&dev->pcimap, buf->data, content_len);
+    pathbuf[nvgpu_pcimap_text(&dev->pcimap, pathbuf, path_len)] = '\0';
 
     parent = nvgpu_proc_mkdir_parents(pathbuf, &leaf);
     proc_create_data(leaf, 0444, parent, &nvgpu_proc_buf_ops, buf);
@@ -5276,7 +5369,7 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
        * set from the host.  gpu_id is the 32-bit RM client GPU identifier,
        * but we stored minor there from the VMM side — see device.rs. */
       {
-        u32 slot_minor = le32_to_cpu(dev->gpu_slots[gi].minor);
+        u32 slot_minor = le32_to_cpu(dev->gpu_slots[root->gpu_index].minor);
         if (slot_minor != dri->slot_index && gi != 0)
           continue; /* only fall through for GPU 0 as a last resort */
       }
@@ -5432,26 +5525,27 @@ static int nvgpu_pci_write(struct pci_bus *bus, unsigned int devfn, int where,
   return PCIBIOS_FUNC_NOT_SUPPORTED;
 }
 
+/*
+ * No driver is called this, so a device overridden to it matches none. The
+ * override is the PCI core's own mechanism for "bind only this", and the
+ * mirror wants nothing bound: its driver is this module, on the virtio device.
+ */
+#define NVGPU_PCI_NO_DRIVER "conduit-gpu-mirror"
+
+static int nvgpu_pci_forbid_drivers(struct pci_dev *pdev) {
+#ifdef NVGPU_PCI_DEV_DRIVER_OVERRIDE
+  return driver_set_override(&pdev->dev, &pdev->driver_override,
+                             NVGPU_PCI_NO_DRIVER,
+                             sizeof(NVGPU_PCI_NO_DRIVER) - 1);
+#else
+  return device_set_driver_override(&pdev->dev, NVGPU_PCI_NO_DRIVER);
+#endif
+}
+
 static struct pci_ops nvgpu_pci_ops = {
     .read = nvgpu_pci_read,
     .write = nvgpu_pci_write,
 };
-
-/* Parse "DDDD:BB:SS.F" into components.
- * Returns 0 on success. */
-static int nvgpu_parse_pci_addr(const char *addr, u16 *domain, u8 *bus,
-                                u8 *slot, u8 *func) {
-  unsigned int d, b, s, f;
-
-  if (sscanf(addr, "%04x:%02x:%02x.%1x", &d, &b, &s, &f) != 4)
-    return -EINVAL;
-
-  *domain = (u16)d;
-  *bus = (u8)b;
-  *slot = (u8)s;
-  *func = (u8)f;
-  return 0;
-}
 
 static int nvgpu_pci_init(struct nvgpu_device *dev) {
   int i, ret = 0;
@@ -5490,7 +5584,7 @@ static int nvgpu_pci_init(struct nvgpu_device *dev) {
     pci_add_resource(&bridge->windows, bus_res);
 
     bridge->dev.parent = &dev->vdev->dev;
-    root->domain = (int)root->slot.domain;
+    root->domain = (int)root->slot.domain; /* the guest's (nvgpu_pcimap.h) */
     /* No node to claim: the GPU is the host's, and the guest's idea of
      * distance to it means nothing. NUMA_NO_NODE lets every allocation made
      * against this device fall back to the caller's node. */
@@ -5498,7 +5592,7 @@ static int nvgpu_pci_init(struct nvgpu_device *dev) {
     bridge->sysdata = root;
     bridge->ops = &nvgpu_pci_ops;
     bridge->busnr = root->slot.bus_nr;
-    bridge->domain_nr = root->slot.domain; /* parsed u16, not ASCII bytes */
+    bridge->domain_nr = (int)root->slot.domain;
     root->nvdev = dev;
 
     ret = pci_scan_root_bus_bridge(bridge);
@@ -5511,18 +5605,28 @@ static int nvgpu_pci_init(struct nvgpu_device *dev) {
       continue;
     }
 
-    pci_bus_add_devices(bridge->bus);
-    root->bridge = bridge;
-    root->registered = true;
-
-    /* Save the one pci_dev on this bus so DRI init can use it as a parent */
+    /*
+     * Save the one pci_dev on this bus so DRI init can use it as a parent,
+     * and keep every PCI driver off it before it is added. It answers with a
+     * real GPU's IDs, so nouveau -- in most distributions' kernels -- matches
+     * it by modalias and would try to drive a device that has config space
+     * and nothing else.
+     */
     {
       struct pci_dev *pdev;
       list_for_each_entry(pdev, &bridge->bus->devices, bus_list) {
-        root->pdev = pdev;
-        break;
+        if (nvgpu_pci_forbid_drivers(pdev))
+          dev_warn(&dev->vdev->dev,
+                   "conduit-gpu: cannot keep drivers off %s\n",
+                   pci_name(pdev));
+        if (!root->pdev)
+          root->pdev = pdev;
       }
     }
+
+    pci_bus_add_devices(bridge->bus);
+    root->bridge = bridge;
+    root->registered = true;
 
     dev_info(&dev->vdev->dev, "conduit-gpu: registered fake PCI device %s\n",
              root->slot.pci_addr);
@@ -5624,29 +5728,36 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
         memcpy(pci_addr, rest,
                min((size_t)(slash - rest), sizeof(pci_addr) - 1));
 
-        /* Find existing slot or allocate new one */
+        /*
+         * Find existing slot or allocate new one. The path names the GPU by
+         * the host's address, which is what the backend read it at; the
+         * root is built at the guest's (nvgpu_pcimap.h).
+         */
         for (pi = 0; pi < dev->num_pci_roots; pi++)
-          if (strcmp(dev->pci_roots[pi].slot.pci_addr, pci_addr) == 0)
+          if (strcmp(dev->gpu_slots[dev->pci_roots[pi].gpu_index].pci_addr,
+                     pci_addr) == 0)
             break;
 
         /* Match against known GPU slots to avoid creating
          * entries for unrelated PCI devices */
         if (pi == dev->num_pci_roots) {
+          const struct nvgpu_pcimap_gpu *g =
+              nvgpu_pcimap_find_host_addr(&dev->pcimap, pci_addr);
           int gi;
-          for (gi = 0; gi < (int)dev->num_gpus; gi++) {
+
+          for (gi = 0; g && gi < (int)dev->num_gpus && gi < 8; gi++) {
             if (strcmp(dev->gpu_slots[gi].pci_addr, pci_addr) == 0) {
               pi = dev->num_pci_roots;
               if (pi < NVGPU_MAX_PCI_SLOTS) {
-                memcpy(dev->pci_roots[pi].slot.pci_addr, pci_addr,
-                       sizeof(pci_addr));
-                if (nvgpu_parse_pci_addr(pci_addr,
-                                         &dev->pci_roots[pi].slot.domain,
-                                         &dev->pci_roots[pi].slot.bus_nr,
-                                         &dev->pci_roots[pi].slot.slot,
-                                         &dev->pci_roots[pi].slot.func) == 0)
-                  dev->num_pci_roots++;
-                else
-                  pi = dev->num_pci_roots; /* parse failed */
+                struct nvgpu_pci_slot *ps = &dev->pci_roots[pi].slot;
+
+                memcpy(ps->pci_addr, g->guest_addr, sizeof(ps->pci_addr));
+                ps->domain = g->guest_domain;
+                ps->bus_nr = g->bus;
+                ps->slot = g->slot;
+                ps->func = g->func;
+                dev->pci_roots[pi].gpu_index = gi;
+                dev->num_pci_roots++;
               }
               break;
             }
@@ -5660,7 +5771,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
           ps->config_valid = true;
           dev_dbg(&dev->vdev->dev,
                   "conduit-gpu: stored config space for %s (%u bytes)\n",
-                  pci_addr, copy);
+                  ps->pci_addr, copy);
         }
       }
       /* Other PCI sysfs files (vendor, device, etc.) are handled
@@ -6197,6 +6308,9 @@ static int nvgpu_probe(struct virtio_device *vdev) {
                le32_to_cpu(dev->gpu_slots[i].info_len));
     }
   }
+
+  /* Where they appear here: before /proc, which names them by address. */
+  nvgpu_pcimap_init(dev);
 
   /* FD translation table */
   virtio_cread(vdev, struct conduit_gpu_config, features, &dev->features);
