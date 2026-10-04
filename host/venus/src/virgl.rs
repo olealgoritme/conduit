@@ -14,7 +14,9 @@
 //! callback only queues into [`FENCES`] and signals an eventfd, so the serving
 //! thread never has to poll virglrenderer for fences.
 
-use crate::{Blob, CAPSET_VENUS, CapsetInfo, Dmabuf, Error, Renderer, Result, Signalled};
+use crate::{
+    Blob, CAPSET_VENUS, CapsetInfo, DRM_FORMAT_MOD_LINEAR, Dmabuf, Error, Renderer, Result, ScanoutLayout, Signalled,
+};
 use std::ffi::{c_char, c_int, c_void};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -116,8 +118,6 @@ mod ffi {
     }
 }
 
-const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
-const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
 /// Fences retired by virglrenderer's sync threads, waiting for
@@ -173,7 +173,7 @@ impl Virgl {
     /// the build).
     pub fn new() -> Result<Self> {
         if INITIALIZED.swap(true, Ordering::AcqRel) {
-            return Err(Error::Refused("virglrenderer already initialized"));
+            return Err(Error::Refused("virglrenderer already initialized".into()));
         }
         // SAFETY: eventfd returns a new descriptor or -1.
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -204,7 +204,7 @@ impl Virgl {
         // Venus registers its capset only when the render server came up and
         // found a Vulkan driver; without it every context would be refused.
         if me.venus_caps().1 == 0 {
-            return Err(Error::Refused("virglrenderer has no Venus capset (render server or Vulkan failed)"));
+            return Err(Error::Refused("virglrenderer has no Venus capset (render server or Vulkan failed)".into()));
         }
         Ok(me)
     }
@@ -221,7 +221,7 @@ impl Virgl {
         // SAFETY: out-params on the stack; on success fd is a new descriptor.
         check(unsafe { ffi::virgl_renderer_resource_export_blob(res_id, &mut ty, &mut fd) })?;
         if fd < 0 {
-            return Err(Error::Refused("export_blob returned no fd"));
+            return Err(Error::Refused("export_blob returned no fd".into()));
         }
         // SAFETY: virglrenderer handed us ownership of a dup.
         Ok((ty, unsafe { OwnedFd::from_raw_fd(fd) }))
@@ -259,7 +259,7 @@ fn mmappable(fd: BorrowedFd<'_>) -> bool {
 impl Renderer for Virgl {
     fn capset_info(&mut self, index: u32) -> Result<CapsetInfo> {
         if index != 0 {
-            return Err(Error::Refused("capset index"));
+            return Err(Error::Refused("capset index".into()));
         }
         let (max_version, max_size) = self.venus_caps();
         Ok(CapsetInfo { id: CAPSET_VENUS, max_version, max_size })
@@ -267,11 +267,11 @@ impl Renderer for Virgl {
 
     fn capset(&mut self, id: u32, version: u32) -> Result<Vec<u8>> {
         if id != CAPSET_VENUS {
-            return Err(Error::Refused("capset id"));
+            return Err(Error::Refused("capset id".into()));
         }
         let (max_ver, size) = self.venus_caps();
         if version > max_ver {
-            return Err(Error::Refused("capset version"));
+            return Err(Error::Refused("capset version".into()));
         }
         let mut caps = vec![0u8; size as usize];
         // SAFETY: caps is max_size bytes, which is what fill_caps writes.
@@ -281,7 +281,7 @@ impl Renderer for Virgl {
 
     fn ctx_create(&mut self, ctx_id: u32, capset_id: u32, debug_name: &[u8]) -> Result<()> {
         if capset_id != CAPSET_VENUS {
-            return Err(Error::Refused("capset id"));
+            return Err(Error::Refused("capset id".into()));
         }
         // virtio-gpu caps the name at 64 bytes; the backend has checked, but
         // the length goes to C as u32.
@@ -313,7 +313,7 @@ impl Renderer for Virgl {
 
     fn submit(&mut self, ctx_id: u32, commands: &[u8]) -> Result<()> {
         if !commands.len().is_multiple_of(4) {
-            return Err(Error::Refused("submit length not a multiple of 4"));
+            return Err(Error::Refused("submit length not a multiple of 4".into()));
         }
         // Copied into u64s: virglrenderer wants 4-byte alignment and copies
         // again internally below 8, and IPC hands us an unaligned slice.
@@ -346,7 +346,7 @@ impl Renderer for Virgl {
             let mut map_info = ffi::VIRGL_RENDERER_MAP_CACHE_NONE;
             if mappable {
                 if ty == ffi::VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE && !mmappable(fd.as_fd()) {
-                    return Err(Error::Refused("mappable blob exported as an opaque fd that cannot be mmapped"));
+                    return Err(Error::Refused("mappable blob exported as an opaque fd that cannot be mmapped".into()));
                 }
                 // SAFETY: out-param on the stack.
                 check(unsafe { ffi::virgl_renderer_resource_get_map_info(res_id, &mut map_info) })?;
@@ -376,7 +376,7 @@ impl Renderer for Virgl {
         self.event.as_fd()
     }
 
-    fn signalled(&mut self) -> Vec<Signalled> {
+    fn signalled(&mut self) -> Result<Vec<Signalled>> {
         let mut v: u64 = 0;
         // SAFETY: 8-byte read into a local; EAGAIN when nothing is pending.
         // Reset before taking so a fence pushed after the take re-signals.
@@ -384,19 +384,21 @@ impl Renderer for Virgl {
         // No virgl_renderer_poll here: with ASYNC_FENCE_CB the sync threads
         // own fence retirement, and polling from this thread too would race
         // them (proxy_context_retire_fences asserts against it).
-        std::mem::take(&mut *FENCES.lock().unwrap_or_else(|p| p.into_inner()))
+        // In-process: virglrenderer cannot die without taking this with it.
+        Ok(std::mem::take(&mut *FENCES.lock().unwrap_or_else(|p| p.into_inner())))
     }
 
-    /// The pinned virglrenderer knows nothing of a Venus blob's image layout:
-    /// its export query answers fourcc 0, stride 0, `DRM_FORMAT_MOD_INVALID`
-    /// for any untyped (blob) resource. Those are passed through when real,
-    /// and otherwise filled with the layout Venus scanouts use in practice
-    /// (XRGB8888, `width * 4`, linear), which the backend must overwrite
-    /// with what the guest's `SET_SCANOUT_BLOB` said.
-    fn export_scanout(&mut self, res_id: u32, width: u32, height: u32) -> Result<Dmabuf> {
+    /// The image is described by the guest's layout (see [`ScanoutLayout`]):
+    /// a Venus blob carries none the host can read back -- the pinned
+    /// virglrenderer's export query answers fourcc 0, stride 0 and
+    /// `DRM_FORMAT_MOD_INVALID` for any blob resource. The query is still
+    /// made, so that a virglrenderer that does know the layout cannot be
+    /// contradicted silently: a layout it reports must be the guest's, and
+    /// linear.
+    fn export_scanout(&mut self, res_id: u32, layout: ScanoutLayout) -> Result<Dmabuf> {
         let (ty, fd) = self.export(res_id)?;
         if ty != ffi::VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF {
-            return Err(Error::Refused("scanout resource does not export as a dma-buf"));
+            return Err(Error::Refused("scanout resource does not export as a dma-buf".into()));
         }
         let mut q = ffi::ExportQuery {
             hdr: ffi::Hdr {
@@ -416,20 +418,29 @@ impl Renderer for Virgl {
         };
         // SAFETY: q is a correctly sized export query; with in_export_fds = 0
         // no fds are created.
-        let queried = unsafe { ffi::virgl_renderer_execute((&mut q as *mut ffi::ExportQuery).cast(), q.hdr.size) } == 0;
-        let known = |v: u32| queried && v != 0;
+        if unsafe { ffi::virgl_renderer_execute((&mut q as *mut ffi::ExportQuery).cast(), q.hdr.size) } == 0 {
+            if q.out_modifier != DRM_FORMAT_MOD_INVALID && q.out_modifier != DRM_FORMAT_MOD_LINEAR {
+                return Err(Error::Refused(format!(
+                    "scanout resource {res_id} has modifier {:#x}; Venus scanouts must be linear",
+                    q.out_modifier
+                )));
+            }
+            let disagrees = |known: u32, guest: u32| known != 0 && known != guest;
+            if disagrees(q.out_strides[0], layout.stride) || disagrees(q.out_fourcc, layout.fourcc) {
+                return Err(Error::Refused(format!(
+                    "scanout resource {res_id} is stride {} fourcc {:#x}, the guest said stride {} fourcc {:#x}",
+                    q.out_strides[0], q.out_fourcc, layout.stride, layout.fourcc
+                )));
+            }
+        }
         Ok(Dmabuf {
             fd,
-            width,
-            height,
-            stride: if known(q.out_strides[0]) { q.out_strides[0] } else { width * 4 },
-            offset: if queried { q.out_offsets[0] } else { 0 },
-            fourcc: if known(q.out_fourcc) { q.out_fourcc } else { DRM_FORMAT_XRGB8888 },
-            modifier: if queried && q.out_modifier != DRM_FORMAT_MOD_INVALID {
-                q.out_modifier
-            } else {
-                DRM_FORMAT_MOD_LINEAR
-            },
+            width: layout.width,
+            height: layout.height,
+            stride: layout.stride,
+            offset: layout.offset,
+            fourcc: layout.fourcc,
+            modifier: DRM_FORMAT_MOD_LINEAR,
         })
     }
 }

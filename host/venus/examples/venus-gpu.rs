@@ -15,7 +15,7 @@
 //!   cargo run --example venus-gpu -- /tmp/venus.sock
 
 use conduit_venus::ipc::IpcClient;
-use conduit_venus::{CAPSET_VENUS, Renderer};
+use conduit_venus::{CAPSET_VENUS, Renderer, ScanoutLayout};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -98,7 +98,7 @@ impl Venus {
         self.c.create_fence(1, 0, self.fence).expect("create_fence");
         let t = Instant::now();
         loop {
-            if self.c.signalled().iter().any(|s| s.fence_id == self.fence) {
+            if self.c.signalled().expect("renderer gone").iter().any(|s| s.fence_id == self.fence) {
                 break;
             }
             assert!(t.elapsed() < Duration::from_secs(20), "fence {} never signalled", self.fence);
@@ -268,7 +268,16 @@ fn main() {
             match v.c.create_blob(1, RES_LOCAL, ID_MEM_LOCAL, 8 * MIB, SHAREABLE) {
                 Ok(_) => {
                     println!("create_blob(HOST3D, blob_id {ID_MEM_LOCAL}, 8 MiB, SHAREABLE) ok");
-                    match v.c.export_scanout(RES_LOCAL, 1920, 1080) {
+                    match v.c.export_scanout(
+                        RES_LOCAL,
+                        ScanoutLayout {
+                            width: 1920,
+                            height: 1080,
+                            stride: 1920 * 4,
+                            offset: 0,
+                            fourcc: u32::from_le_bytes(*b"XR24"),
+                        },
+                    ) {
                         Ok(d) => println!(
                             "export_scanout -> fd {}, {}x{} stride {} offset {} fourcc {:?} modifier {:#x}",
                             fd_kind(d.fd.as_raw_fd()),

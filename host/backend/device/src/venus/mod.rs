@@ -159,13 +159,35 @@ impl Venus {
     /// Responses for held chains whose fences have signalled, and for every
     /// held chain once the renderer is lost. Each is a whole response
     /// (`MsgHeader` and virtio-gpu header) for the chain with that token.
-    pub fn completions(&mut self) -> Vec<Completion> {
+    ///
+    /// This is where a renderer that dies between commands is found out
+    /// (docs/VENUS.md "Reset and close"): it is lost from then on, the
+    /// device is released through `env` as on any other loss, and the held
+    /// chains come back `RESP_ERR_UNSPEC`.
+    pub fn completions(&mut self, env: Env<'_>) -> Vec<Completion> {
         if !self.lost {
-            for s in self.renderer.signalled() {
-                self.fences.signal(s);
+            match self.renderer.signalled() {
+                Ok(signalled) => {
+                    for s in signalled {
+                        self.fences.signal(s);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("venus: asking for fences: {e}");
+                    self.renderer_lost();
+                }
+            }
+            if std::mem::take(&mut self.lose_pending) {
+                self.lose(env);
             }
         }
         self.fences.take_ready()
+    }
+
+    /// The renderer is gone for good: everything was released, and every
+    /// `GpuCmd` is answered `RESP_ERR_UNSPEC` from now on.
+    pub fn is_lost(&self) -> bool {
+        self.lost
     }
 
     /// Serve one `GpuCmd`: `payload` is everything after the `MsgHeader`.
@@ -325,19 +347,24 @@ impl Venus {
         use conduit_venus::Error as E;
         match e {
             E::Disconnected => {
-                if !self.lost {
-                    log::error!(
-                        "venus: the renderer is gone; releasing every context and resource"
-                    );
-                }
-                self.lose_pending |= !self.lost;
-                self.lost = true;
+                self.renderer_lost();
                 RESP_ERR_UNSPEC
             }
             E::NoContext(_) => RESP_ERR_INVALID_CONTEXT_ID,
             E::NoResource(_) => RESP_ERR_INVALID_RESOURCE_ID,
             E::Refused(_) | E::Io(_) => RESP_ERR_UNSPEC,
         }
+    }
+
+    /// Note the renderer as gone; the device is released after the command
+    /// (or in `completions`), while the transport is there to take region 3
+    /// back.
+    fn renderer_lost(&mut self) {
+        if !self.lost {
+            log::error!("venus: the renderer is gone; releasing every context and resource");
+        }
+        self.lose_pending |= !self.lost;
+        self.lost = true;
     }
 
     /// The renderer died: everything on this side goes, region 3 is emptied,

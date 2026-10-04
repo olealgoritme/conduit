@@ -25,8 +25,7 @@
 //! thread, so a message's fragments are never interleaved with another's.
 //! All integers are little-endian.
 
-use crate::{Blob, CapsetInfo, Dmabuf, Error, Renderer, Result, Signalled};
-use std::collections::HashSet;
+use crate::{Blob, CapsetInfo, Dmabuf, Error, Renderer, Result, ScanoutLayout, Signalled};
 use std::io;
 use std::mem::size_of;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -44,6 +43,8 @@ const MORE: u32 = 1;
 /// A reassembled message larger than this is a protocol error: the backend
 /// caps a submit at 4 MiB, and nothing else comes close.
 const MAX_MSG: usize = 8 << 20;
+/// A refusal's reason longer than this is cut: it only ends up in a log.
+const MAX_REASON: usize = 256;
 /// No message carries more than one fd; room for a few so that a confused
 /// peer's extra fds are received (and closed) rather than truncated.
 const MAX_FDS: usize = 4;
@@ -264,7 +265,7 @@ impl<'a> R<'a> {
 
 fn encode_err(e: &Error) -> Vec<u8> {
     let (code, arg, errno, text): (u32, u32, i32, &str) = match e {
-        Error::Refused(s) => (err::REFUSED, 0, 0, s),
+        Error::Refused(s) => (err::REFUSED, 0, 0, s.as_str()),
         Error::NoContext(id) => (err::NO_CONTEXT, *id, 0, ""),
         Error::NoResource(id) => (err::NO_RESOURCE, *id, 0, ""),
         Error::Disconnected => (err::DISCONNECTED, 0, 0, ""),
@@ -279,7 +280,7 @@ fn decode_err(body: &[u8]) -> Error {
         return proto("venus ipc: bad error reply");
     };
     match code {
-        err::REFUSED => Error::Refused(intern(r.rest())),
+        err::REFUSED => Error::Refused(reason(r.rest())),
         err::NO_CONTEXT => Error::NoContext(arg),
         err::NO_RESOURCE => Error::NoResource(arg),
         err::DISCONNECTED => Error::Disconnected,
@@ -287,27 +288,16 @@ fn decode_err(body: &[u8]) -> Error {
     }
 }
 
-/// `Error::Refused` holds a `&'static str`, so a reason that crossed the
-/// socket has to be leaked to be returned. Reasons are a small fixed set of
-/// literals in the renderer, so each is leaked once; past a bound (a
-/// misbehaving renderer) they collapse into one generic reason instead of
-/// growing without limit.
-fn intern(text: &[u8]) -> &'static str {
-    static SEEN: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
-    const LIMIT: usize = 64;
-    let Ok(text) = std::str::from_utf8(text) else {
-        return "renderer refused";
-    };
-    let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
-    let seen = seen.get_or_insert_with(HashSet::new);
-    if let Some(s) = seen.get(text) {
-        return s;
+/// A refusal's reason as it crossed the socket: whatever the renderer sent,
+/// made valid UTF-8 and cut to [`MAX_REASON`] bytes.
+fn reason(text: &[u8]) -> String {
+    let mut s = String::from_utf8_lossy(&text[..text.len().min(MAX_REASON)]).into_owned();
+    // Replacement characters can make it longer again; cut on a character.
+    let mut end = s.len().min(MAX_REASON);
+    while !s.is_char_boundary(end) {
+        end -= 1;
     }
-    if seen.len() >= LIMIT || text.len() > 128 {
-        return "renderer refused";
-    }
-    let s: &'static str = Box::leak(text.to_owned().into_boxed_str());
-    seen.insert(s);
+    s.truncate(end);
     s
 }
 
@@ -463,9 +453,9 @@ impl IpcClient {
         Ok(Self { sock, replies, shared, reader: Some(reader) })
     }
 
-    /// The renderer went away (closed, crashed, or broke protocol). The trait
-    /// has no way to say so outside a call, so the backend can check this
-    /// when [`Renderer::fence_fd`] wakes it with nothing signalled.
+    /// The renderer went away (closed, crashed, or broke protocol). Outside a
+    /// call the backend learns this from [`Renderer::signalled`], which
+    /// [`Renderer::fence_fd`] wakes it for.
     pub fn is_disconnected(&self) -> bool {
         self.shared.dead.load(Ordering::Acquire)
     }
@@ -585,18 +575,33 @@ impl Renderer for IpcClient {
         self.shared.event.as_fd()
     }
 
-    fn signalled(&mut self) -> Vec<Signalled> {
+    fn signalled(&mut self) -> Result<Vec<Signalled>> {
         // Reset before taking: a fence queued after the take signals the
         // eventfd again, so none is left without a wakeup. The opposite order
         // could swallow one.
-        // After the renderer dies this still resets: the death wakeup fires
-        // once rather than leaving the fd readable for a poll loop to spin on.
         eventfd_reset(self.shared.event.as_fd());
-        std::mem::take(&mut *self.shared.fences.lock().unwrap_or_else(|p| p.into_inner()))
+        // Death is read before the take: the reader queues every fence it got
+        // before marking itself dead, so if it was dead already, this take
+        // has all of them.
+        let dead = self.is_disconnected();
+        let f = std::mem::take(&mut *self.shared.fences.lock().unwrap_or_else(|p| p.into_inner()));
+        if !dead {
+            return Ok(f);
+        }
+        if f.is_empty() {
+            // Reported on every call; the eventfd stays reset, so a poll loop
+            // is woken for the death once rather than spinning on it.
+            return Err(Error::Disconnected);
+        }
+        // Fences the renderer signalled before it went are still good; the
+        // death is reported at the next call, which this wakes.
+        eventfd_signal(self.shared.event.as_fd());
+        Ok(f)
     }
 
-    fn export_scanout(&mut self, res_id: u32, width: u32, height: u32) -> Result<Dmabuf> {
-        let mut m = self.call(op::EXPORT_SCANOUT, &W::default().u32(res_id).u32(width).u32(height).0)?;
+    fn export_scanout(&mut self, res_id: u32, l: ScanoutLayout) -> Result<Dmabuf> {
+        let body = W::default().u32(res_id).u32(l.width).u32(l.height).u32(l.stride).u32(l.offset).u32(l.fourcc).0;
+        let mut m = self.call(op::EXPORT_SCANOUT, &body)?;
         let fd = expect_fd(&mut m)?;
         let mut r = R(&m.body);
         Ok(Dmabuf {
@@ -657,8 +662,10 @@ impl IpcServer {
         }
     }
 
+    /// A renderer that reports itself gone ends the connection: the backend
+    /// sees it close, which is how it learns of the death.
     fn forward_fences(&mut self) -> io::Result<()> {
-        let f = self.renderer.signalled();
+        let f = self.renderer.signalled().map_err(|e| io::Error::other(format!("venus renderer: {e}")))?;
         if f.is_empty() {
             return Ok(());
         }
@@ -730,9 +737,19 @@ impl IpcServer {
                 self.reply(res, None)
             }
             op::EXPORT_SCANOUT => {
-                let mut f = || -> Result<_> { Ok((r.u32()?, r.u32()?, r.u32()?)) };
-                let (res, w, h) = f().map_err(|_| bad())?;
-                match rd.export_scanout(res, w, h) {
+                let mut f = || -> Result<_> {
+                    let res = r.u32()?;
+                    let layout = ScanoutLayout {
+                        width: r.u32()?,
+                        height: r.u32()?,
+                        stride: r.u32()?,
+                        offset: r.u32()?,
+                        fourcc: r.u32()?,
+                    };
+                    Ok((res, layout))
+                };
+                let (res, layout) = f().map_err(|_| bad())?;
+                match rd.export_scanout(res, layout) {
                     Ok(d) => {
                         let body = W::default()
                             .u32(d.width)
@@ -773,6 +790,10 @@ mod tests {
         (IpcClient::new(a).unwrap(), server)
     }
 
+    fn layout(width: u32, height: u32) -> ScanoutLayout {
+        ScanoutLayout { width, height, stride: width * 4, offset: 0, fourcc: u32::from_le_bytes(*b"XR24") }
+    }
+
     fn file_size(fd: BorrowedFd<'_>) -> u64 {
         // SAFETY: fstat into a zeroed local.
         unsafe {
@@ -792,9 +813,9 @@ mod tests {
     fn capsets() {
         let (mut c, _s) = pair();
         assert_eq!(c.capset_info(0).unwrap(), CapsetInfo { id: CAPSET_VENUS, max_version: 0, max_size: 160 });
-        assert!(matches!(c.capset_info(1), Err(Error::Refused("capset index"))));
+        assert!(matches!(c.capset_info(1), Err(Error::Refused(s)) if s == "capset index"));
         assert_eq!(c.capset(CAPSET_VENUS, 0).unwrap(), vec![0; 160]);
-        assert!(matches!(c.capset(1, 0), Err(Error::Refused("capset id"))));
+        assert!(matches!(c.capset(1, 0), Err(Error::Refused(s)) if s == "capset id"));
     }
 
     #[test]
@@ -812,14 +833,14 @@ mod tests {
         c.ctx_attach(1, 7).unwrap();
         c.ctx_detach(1, 7);
 
-        let d = c.export_scanout(7, 1920, 1080).unwrap();
+        let d = c.export_scanout(7, layout(1920, 1080)).unwrap();
         assert_eq!((d.width, d.height, d.stride, d.offset), (1920, 1080, 1920 * 4, 0));
-        assert_eq!((d.fourcc, d.modifier), (u32::from_le_bytes(*b"XR24"), 0));
+        assert_eq!((d.fourcc, d.modifier), (u32::from_le_bytes(*b"XR24"), crate::DRM_FORMAT_MOD_LINEAR));
         assert_eq!(file_size(d.fd.as_fd()), 1920 * 1080 * 4);
 
         c.unref(7);
         // Ordered after the fire-and-forget unref.
-        assert!(matches!(c.export_scanout(7, 1, 1), Err(Error::NoResource(7))));
+        assert!(matches!(c.export_scanout(7, layout(1, 1)), Err(Error::NoResource(7))));
         c.ctx_destroy(1);
         assert!(matches!(c.submit(1, &[0; 4]), Err(Error::NoContext(1))));
 
@@ -889,11 +910,11 @@ mod tests {
             fn fence_fd(&self) -> BorrowedFd<'_> {
                 self.0.fence_fd()
             }
-            fn signalled(&mut self) -> Vec<Signalled> {
+            fn signalled(&mut self) -> Result<Vec<Signalled>> {
                 self.0.signalled()
             }
-            fn export_scanout(&mut self, r: u32, w: u32, h: u32) -> Result<Dmabuf> {
-                self.0.export_scanout(r, w, h)
+            fn export_scanout(&mut self, r: u32, l: ScanoutLayout) -> Result<Dmabuf> {
+                self.0.export_scanout(r, l)
             }
         }
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -918,7 +939,7 @@ mod tests {
         let (mut c, _s) = pair();
         c.ctx_create(1, CAPSET_VENUS, b"").unwrap();
         assert!(!readable(c.fence_fd(), 0));
-        assert!(c.signalled().is_empty());
+        assert!(c.signalled().unwrap().is_empty());
 
         c.create_fence(1, 0, 10).unwrap();
         c.create_fence(1, 2, 11).unwrap();
@@ -928,7 +949,7 @@ mod tests {
         let mut got = Vec::new();
         while got.len() < 2 {
             assert!(readable(c.fence_fd(), 5000));
-            got.extend(c.signalled());
+            got.extend(c.signalled().unwrap());
         }
         assert_eq!(
             got,
@@ -947,12 +968,119 @@ mod tests {
         drop(b);
         // The reader notices and wakes fence_fd so a poll loop finds out.
         assert!(readable(c.fence_fd(), 5000));
-        assert!(c.signalled().is_empty());
+        assert!(matches!(c.signalled(), Err(Error::Disconnected)));
         assert!(c.is_disconnected());
+        // Woken once, not left readable; and the death is still reported.
         assert!(!readable(c.fence_fd(), 0));
+        assert!(matches!(c.signalled(), Err(Error::Disconnected)));
         assert!(matches!(c.capset_info(0), Err(Error::Disconnected)));
         c.ctx_destroy(1);
         c.unref(1);
+    }
+
+    /// Fences the renderer signalled before it died are delivered first; the
+    /// death comes at the next call, with a wakeup for it.
+    #[test]
+    fn fences_before_death_are_delivered_then_death() {
+        let (a, b) = socketpair().unwrap();
+        let mut c = IpcClient::new(a).unwrap();
+        let f = [Signalled { ctx_id: 1, ring_idx: 0, fence_id: 5 }];
+        send_msg(b.as_fd(), op::FENCES, &encode_fences(&f), None).unwrap();
+        drop(b);
+        // Wait for the reader to have seen both.
+        let t = std::time::Instant::now();
+        while !c.is_disconnected() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(c.signalled().unwrap(), f);
+        assert!(readable(c.fence_fd(), 0));
+        assert!(matches!(c.signalled(), Err(Error::Disconnected)));
+        assert!(!readable(c.fence_fd(), 0));
+    }
+
+    /// A renderer whose `signalled` fails ends the connection, which is how
+    /// the client hears of it.
+    #[test]
+    fn server_ends_when_its_renderer_dies() {
+        struct Dying(Mock);
+        impl Renderer for Dying {
+            fn capset_info(&mut self, i: u32) -> Result<CapsetInfo> {
+                self.0.capset_info(i)
+            }
+            fn capset(&mut self, i: u32, v: u32) -> Result<Vec<u8>> {
+                self.0.capset(i, v)
+            }
+            fn ctx_create(&mut self, c: u32, s: u32, n: &[u8]) -> Result<()> {
+                self.0.ctx_create(c, s, n)
+            }
+            fn ctx_destroy(&mut self, c: u32) {
+                self.0.ctx_destroy(c)
+            }
+            fn ctx_attach(&mut self, c: u32, r: u32) -> Result<()> {
+                self.0.ctx_attach(c, r)
+            }
+            fn ctx_detach(&mut self, c: u32, r: u32) {
+                self.0.ctx_detach(c, r)
+            }
+            fn submit(&mut self, c: u32, cmd: &[u8]) -> Result<()> {
+                self.0.submit(c, cmd)
+            }
+            fn create_blob(&mut self, c: u32, r: u32, b: u64, s: u64, f: u32) -> Result<Blob> {
+                self.0.create_blob(c, r, b, s, f)
+            }
+            fn unref(&mut self, r: u32) {
+                self.0.unref(r)
+            }
+            fn create_fence(&mut self, c: u32, r: u32, f: u64) -> Result<()> {
+                self.0.create_fence(c, r, f)
+            }
+            fn fence_fd(&self) -> BorrowedFd<'_> {
+                self.0.fence_fd()
+            }
+            fn signalled(&mut self) -> Result<Vec<Signalled>> {
+                Err(Error::Disconnected)
+            }
+            fn export_scanout(&mut self, r: u32, l: ScanoutLayout) -> Result<Dmabuf> {
+                self.0.export_scanout(r, l)
+            }
+        }
+        let (a, b) = socketpair().unwrap();
+        let server = std::thread::spawn(move || IpcServer::new(b, Box::new(Dying(Mock::new()))).serve().map(|_| ()));
+        let mut c = IpcClient::new(a).unwrap();
+        // The request is answered, then the fence check after it ends serve.
+        c.ctx_create(1, CAPSET_VENUS, b"").unwrap();
+        assert!(server.join().unwrap().is_err());
+        assert!(readable(c.fence_fd(), 5000));
+        assert!(matches!(c.signalled(), Err(Error::Disconnected)));
+        assert!(matches!(c.capset_info(0), Err(Error::Disconnected)));
+    }
+
+    /// The guest's scanout layout crosses the socket whole, and comes back as
+    /// the dma-buf's.
+    #[test]
+    fn scanout_layout_round_trips() {
+        let (mut c, _s) = pair();
+        c.ctx_create(1, CAPSET_VENUS, b"").unwrap();
+        c.create_blob(1, 3, 0, 1 << 20, 1).unwrap();
+        let l =
+            ScanoutLayout { width: 300, height: 200, stride: 1280, offset: 4096, fourcc: u32::from_le_bytes(*b"AB24") };
+        let d = c.export_scanout(3, l).unwrap();
+        assert_eq!((d.width, d.height, d.stride, d.offset, d.fourcc), (300, 200, 1280, 4096, l.fourcc));
+        assert_eq!(d.modifier, crate::DRM_FORMAT_MOD_LINEAR);
+        assert_eq!(file_size(d.fd.as_fd()), 4096 + 1280 * 200);
+    }
+
+    /// A refusal's reason arrives as the renderer wrote it, bounded.
+    #[test]
+    fn refusal_reasons_are_owned_and_bounded() {
+        let e = Error::Refused("no such thing".into());
+        assert!(matches!(decode_err(&encode_err(&e)), Error::Refused(s) if s == "no such thing"));
+        let long = Error::Refused("x".repeat(10_000));
+        assert!(matches!(decode_err(&encode_err(&long)), Error::Refused(s) if s.len() == MAX_REASON));
+        let mut bad = encode_err(&Error::Refused(String::new()));
+        bad.extend_from_slice(&[0xff, b'a']);
+        assert!(matches!(decode_err(&bad), Error::Refused(s) if s == "\u{fffd}a"));
     }
 
     #[test]

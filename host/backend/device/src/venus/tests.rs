@@ -3,7 +3,7 @@
 
 use super::*;
 use conduit_venus::mock::Mock;
-use conduit_venus::{Blob, CapsetInfo, Dmabuf, Signalled};
+use conduit_venus::{Blob, CapsetInfo, Dmabuf, ScanoutLayout, Signalled};
 use std::os::fd::{AsFd, FromRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +18,8 @@ struct Shared {
     holdback: Arc<Mutex<Option<Vec<Signalled>>>>,
     /// Kept back, now let go: returned by the next `signalled`.
     released: Arc<Mutex<Vec<Signalled>>>,
+    /// Every `export_scanout` asked for: resource and layout.
+    exports: Arc<Mutex<Vec<(u32, ScanoutLayout)>>>,
 }
 
 impl Shared {
@@ -30,6 +32,7 @@ impl Shared {
             gone: Default::default(),
             holdback: Default::default(),
             released: Default::default(),
+            exports: Default::default(),
         }
     }
 
@@ -120,9 +123,10 @@ impl Renderer for Shared {
     fn fence_fd(&self) -> BorrowedFd<'_> {
         self.fence.as_fd()
     }
-    fn signalled(&mut self) -> Vec<Signalled> {
-        let mut now = self.mock.lock().unwrap().signalled();
-        match self.holdback.lock().unwrap().as_mut() {
+    fn signalled(&mut self) -> conduit_venus::Result<Vec<Signalled>> {
+        self.check()?;
+        let mut now = self.mock.lock().unwrap().signalled()?;
+        Ok(match self.holdback.lock().unwrap().as_mut() {
             Some(kept) => {
                 kept.append(&mut now);
                 Vec::new()
@@ -131,19 +135,16 @@ impl Renderer for Shared {
                 now.splice(0..0, std::mem::take(&mut *self.released.lock().unwrap()));
                 now
             }
-        }
+        })
     }
     fn export_scanout(
         &mut self,
         res_id: u32,
-        width: u32,
-        height: u32,
+        layout: ScanoutLayout,
     ) -> conduit_venus::Result<Dmabuf> {
         self.check()?;
-        self.mock
-            .lock()
-            .unwrap()
-            .export_scanout(res_id, width, height)
+        self.exports.lock().unwrap().push((res_id, layout));
+        self.mock.lock().unwrap().export_scanout(res_id, layout)
     }
 }
 
@@ -291,6 +292,16 @@ impl Rig {
         );
         let h = CtrlHdr::from_bytes(&self.resp[16..n]).unwrap();
         (h, self.resp[16 + CTRL_HDR_LEN..n].to_vec())
+    }
+
+    /// Completions, with region 3 there to be emptied if the renderer is
+    /// found dead.
+    fn completions(&mut self) -> Vec<Completion> {
+        let env = Env {
+            window: Some(&*self.region),
+            display: None,
+        };
+        self.venus.completions(env)
     }
 
     fn ty(&mut self, cmd: &[u8]) -> u32 {
@@ -494,9 +505,9 @@ fn a_guest_renders_a_frame_from_capset_to_reset() {
         panic!("a fenced submit must be held");
     };
     assert_eq!(t.venus.held(), 1);
-    assert!(t.venus.completions().is_empty(), "not signalled yet");
+    assert!(t.completions().is_empty(), "not signalled yet");
     t.r.release();
-    let done = t.venus.completions();
+    let done = t.completions();
     assert_eq!(done.len(), 1);
     assert_eq!(done[0].token, token);
     assert_eq!(status(&done[0].resp), 0);
@@ -820,7 +831,7 @@ fn fences_release_by_timeline() {
         ring_idx: 0,
         fence_id: 2,
     });
-    let done: Vec<u64> = t.venus.completions().iter().map(|c| c.token).collect();
+    let done: Vec<u64> = t.completions().iter().map(|c| c.token).collect();
     assert_eq!(done, vec![tokens[0], tokens[1]]);
     t.venus.fences.signal(Signalled {
         ctx_id: 2,
@@ -833,7 +844,6 @@ fn fences_release_by_timeline() {
         fence_id: 1,
     });
     let done: Vec<CtrlHdr> = t
-        .venus
         .completions()
         .iter()
         .map(|c| CtrlHdr::from_bytes(&c.resp[16..]).unwrap())
@@ -875,7 +885,7 @@ fn a_dead_renderer_releases_everything() {
         (t.venus.contexts(), t.venus.resources(), t.venus.mappings()),
         (0, 0, 0)
     );
-    let done = t.venus.completions();
+    let done = t.completions();
     assert_eq!(done.len(), 1);
     assert_eq!(done[0].token, token);
     assert_eq!(
@@ -890,6 +900,178 @@ fn a_dead_renderer_releases_everything() {
         ..Default::default()
     };
     assert_eq!(t.ty(&c.to_bytes()), RESP_ERR_UNSPEC);
+}
+
+/// A renderer that dies between commands is found out by the fence path:
+/// the held chains come back `RESP_ERR_UNSPEC` from there, the device is
+/// released, and every `GpuCmd` after is refused `RESP_ERR_UNSPEC`.
+#[test]
+fn renderer_death_fails_held_chains() {
+    let mut t = Rig::new();
+    t.ctx(1);
+    assert_eq!(t.blob(1, 10, 4096), RESP_OK_NODATA);
+    assert_eq!(t.map(10, 0), RESP_OK_MAP_INFO);
+    t.r.hold_fences();
+    let mut tokens = Vec::new();
+    for (ring, fence) in [(0, 1), (0, 2), (3, 1)] {
+        let mut h = fenced(CMD_SUBMIT_3D, 1, fence);
+        if ring != 0 {
+            h.flags |= FLAG_INFO_RING_IDX;
+            h.ring_idx = ring;
+        }
+        let Outcome::Held(token) = t.send_with(&submit_cmd(h, b""), None) else {
+            panic!("a fenced submit must be held");
+        };
+        tokens.push(token);
+    }
+    assert!(t.completions().is_empty(), "the GPU is busy");
+    assert_eq!(t.venus.held(), 3);
+
+    // The renderer goes while nothing is being sent.
+    t.r.gone.store(true, std::sync::atomic::Ordering::Relaxed);
+    let done = t.completions();
+    let mut got: Vec<u64> = done.iter().map(|c| c.token).collect();
+    got.sort_unstable();
+    assert_eq!(got, tokens);
+    for c in &done {
+        assert_eq!(
+            status(&c.resp),
+            0,
+            "a virtio-gpu error, not a transport one"
+        );
+        assert_eq!(
+            CtrlHdr::from_bytes(&c.resp[16..]).unwrap().ty,
+            RESP_ERR_UNSPEC
+        );
+    }
+    assert!(t.venus.is_lost());
+    assert_eq!(t.venus.held(), 0);
+    assert_eq!(t.region.calls().last(), Some(&("withdraw", 0, 4096)));
+    assert_eq!(
+        (t.venus.contexts(), t.venus.resources(), t.venus.mappings()),
+        (0, 0, 0)
+    );
+    assert!(t.completions().is_empty(), "failed once");
+
+    // Refused from now on, even with the renderer answering again, fenced
+    // commands included: nothing is held for a fence that cannot come.
+    t.r.gone.store(false, std::sync::atomic::Ordering::Relaxed);
+    let c = CtxCreate {
+        hdr: hdr(CMD_CTX_CREATE, 3),
+        context_init: CAPSET_VENUS,
+        ..Default::default()
+    };
+    assert_eq!(t.ty(&c.to_bytes()), RESP_ERR_UNSPEC);
+    assert_eq!(
+        t.ty(&submit_cmd(fenced(CMD_SUBMIT_3D, 1, 9), b"")),
+        RESP_ERR_UNSPEC
+    );
+    assert_eq!(
+        t.ty(&hdr(CMD_GET_DISPLAY_INFO, 0).to_bytes()),
+        RESP_ERR_UNSPEC
+    );
+    assert_eq!(t.venus.held(), 0);
+}
+
+/// The renderer exports the scanout with the guest's layout: its size,
+/// `strides[0]`, `offsets[0]` and format as the matching DRM fourcc, linear.
+/// A new layout is a new export; the same one is not.
+#[test]
+fn scanout_layout_is_the_guests() {
+    let mut t = Rig::new();
+    let (link, _broker) = display();
+    t.ctx(1);
+    assert_eq!(t.blob(1, 10, 1 << 20), RESP_OK_NODATA);
+    let cc = |s: &[u8; 4]| u32::from_le_bytes(*s);
+    let mut s = SetScanoutBlob::from_bytes(&scanout_cmd(10, 300, 200)).unwrap();
+    s.format = format::R8G8B8X8_UNORM;
+    s.strides[0] = 1280;
+    s.offsets[0] = 4096;
+    assert_eq!(t.ty(&s.to_bytes()), RESP_OK_NODATA);
+    for _ in 0..2 {
+        assert_eq!(t.send_on(&flush_cmd(10), Some(&link)).0.ty, RESP_OK_NODATA);
+    }
+    let want = ScanoutLayout {
+        width: 300,
+        height: 200,
+        stride: 1280,
+        offset: 4096,
+        fourcc: cc(b"XB24"),
+    };
+    assert_eq!(*t.r.exports.lock().unwrap(), vec![(10, want)]);
+    assert_eq!(t.venus.exported_layout(10), Some(want));
+
+    // Same size, another stride and format: exported again.
+    s.format = format::B8G8R8A8_UNORM;
+    s.strides[0] = 2048;
+    assert_eq!(t.ty(&s.to_bytes()), RESP_OK_NODATA);
+    assert_eq!(t.send_on(&flush_cmd(10), Some(&link)).0.ty, RESP_OK_NODATA);
+    let want2 = ScanoutLayout {
+        stride: 2048,
+        fourcc: cc(b"AR24"),
+        ..want
+    };
+    assert_eq!(*t.r.exports.lock().unwrap(), vec![(10, want), (10, want2)]);
+    use std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(link.stats.sent.load(Relaxed), 3);
+}
+
+/// Every virtio-gpu scanout format reaches the renderer as the DRM fourcc of
+/// the same memory layout.
+#[test]
+fn scanout_formats_map_to_drm_fourccs() {
+    let cc = |s: &[u8; 4]| u32::from_le_bytes(*s);
+    let table = [
+        (format::B8G8R8A8_UNORM, cc(b"AR24")),
+        (format::B8G8R8X8_UNORM, cc(b"XR24")),
+        (format::A8R8G8B8_UNORM, cc(b"BA24")),
+        (format::X8R8G8B8_UNORM, cc(b"BX24")),
+        (format::R8G8B8A8_UNORM, cc(b"AB24")),
+        (format::X8B8G8R8_UNORM, cc(b"RX24")),
+        (format::A8B8G8R8_UNORM, cc(b"RA24")),
+        (format::R8G8B8X8_UNORM, cc(b"XB24")),
+    ];
+    let mut t = Rig::new();
+    let (link, _broker) = display();
+    t.ctx(1);
+    assert_eq!(t.blob(1, 10, 64 * 64 * 4), RESP_OK_NODATA);
+    for (virtio, drm) in table {
+        let mut s = SetScanoutBlob::from_bytes(&scanout_cmd(10, 64, 64)).unwrap();
+        s.format = virtio;
+        assert_eq!(t.ty(&s.to_bytes()), RESP_OK_NODATA, "format {virtio}");
+        assert_eq!(t.send_on(&flush_cmd(10), Some(&link)).0.ty, RESP_OK_NODATA);
+        let l = t.venus.exported_layout(10).unwrap();
+        assert_eq!(l.fourcc, drm, "format {virtio}");
+        assert_eq!(t.r.exports.lock().unwrap().last().unwrap().1, l);
+    }
+}
+
+/// A format with no DRM fourcc is refused `RESP_ERR_INVALID_PARAMETER` at
+/// SET_SCANOUT_BLOB, and the scanout is left as it was.
+#[test]
+fn unknown_scanout_formats_are_refused() {
+    let mut t = Rig::new();
+    t.ctx(1);
+    assert_eq!(t.blob(1, 10, 64 * 64 * 4), RESP_OK_NODATA);
+    for f in [0, 5, 66, 69, 122, 133, 135, u32::MAX] {
+        let mut s = SetScanoutBlob::from_bytes(&scanout_cmd(10, 64, 64)).unwrap();
+        s.format = f;
+        assert_eq!(
+            t.ty(&s.to_bytes()),
+            RESP_ERR_INVALID_PARAMETER,
+            "format {f}"
+        );
+        assert_eq!(t.venus.scanout_state(), None);
+    }
+    assert_eq!(t.ty(&scanout_cmd(10, 64, 64)), RESP_OK_NODATA);
+    let mut s = SetScanoutBlob::from_bytes(&scanout_cmd(10, 64, 64)).unwrap();
+    s.format = 5;
+    assert_eq!(t.ty(&s.to_bytes()), RESP_ERR_INVALID_PARAMETER);
+    assert_eq!(
+        t.venus.scanout_state().map(|s| s.3),
+        Some(format::B8G8R8X8_UNORM)
+    );
+    assert!(t.r.exports.lock().unwrap().is_empty());
 }
 
 /// Scanout geometry is checked against the blob; resource 0 turns it off.

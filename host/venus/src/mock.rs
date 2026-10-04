@@ -44,18 +44,18 @@ impl Renderer for Mock {
     fn capset_info(&mut self, index: u32) -> Result<CapsetInfo> {
         match index {
             0 => Ok(CapsetInfo { id: CAPSET_VENUS, max_version: 0, max_size: 160 }),
-            _ => Err(Error::Refused("capset index")),
+            _ => Err(Error::Refused("capset index".into())),
         }
     }
     fn capset(&mut self, id: u32, _version: u32) -> Result<Vec<u8>> {
         if id != CAPSET_VENUS {
-            return Err(Error::Refused("capset id"));
+            return Err(Error::Refused("capset id".into()));
         }
         Ok(vec![0; 160])
     }
     fn ctx_create(&mut self, ctx_id: u32, capset_id: u32, _name: &[u8]) -> Result<()> {
         if capset_id != CAPSET_VENUS {
-            return Err(Error::Refused("capset id"));
+            return Err(Error::Refused("capset id".into()));
         }
         self.contexts.insert(ctx_id);
         Ok(())
@@ -98,21 +98,23 @@ impl Renderer for Mock {
     fn fence_fd(&self) -> BorrowedFd<'_> {
         self.event.as_ref().expect("Mock::new").as_fd()
     }
-    fn signalled(&mut self) -> Vec<Signalled> {
-        std::mem::take(&mut self.pending)
+    fn signalled(&mut self) -> Result<Vec<Signalled>> {
+        Ok(std::mem::take(&mut self.pending))
     }
-    fn export_scanout(&mut self, res_id: u32, width: u32, height: u32) -> Result<Dmabuf> {
+    /// The image as `layout` says, in a memfd just big enough for it.
+    fn export_scanout(&mut self, res_id: u32, layout: ScanoutLayout) -> Result<Dmabuf> {
         if !self.resources.contains_key(&res_id) {
             return Err(Error::NoResource(res_id));
         }
+        let size = u64::from(layout.offset) + u64::from(layout.stride) * u64::from(layout.height);
         Ok(Dmabuf {
-            fd: memfd(u64::from(width) * u64::from(height) * 4)?,
-            width,
-            height,
-            stride: width * 4,
-            offset: 0,
-            fourcc: u32::from_le_bytes(*b"XR24"),
-            modifier: 0,
+            fd: memfd(size)?,
+            width: layout.width,
+            height: layout.height,
+            stride: layout.stride,
+            offset: layout.offset,
+            fourcc: layout.fourcc,
+            modifier: DRM_FORMAT_MOD_LINEAR,
         })
     }
 }

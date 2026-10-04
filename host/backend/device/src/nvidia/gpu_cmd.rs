@@ -45,11 +45,22 @@ impl NvidiaBackend {
     }
 
     /// Responses for held chains that may now be returned.
+    /// A renderer found dead here releases the device as one found dead in
+    /// a command does, so this needs the window and display too.
     pub fn venus_completions(&mut self) -> Vec<crate::venus::Completion> {
+        let env = crate::venus::Env {
+            window: self.window.as_deref(),
+            display: self.display.as_deref(),
+        };
         self.venus
             .as_mut()
-            .map(|v| v.completions())
+            .map(|v| v.completions(env))
             .unwrap_or_default()
+    }
+
+    /// The Venus renderer is gone for good (see [`crate::venus::Venus::is_lost`]).
+    pub fn venus_lost(&self) -> bool {
+        self.venus.as_ref().is_some_and(|v| v.is_lost())
     }
 
     /// A descriptor readable when a fence may have signalled, for a

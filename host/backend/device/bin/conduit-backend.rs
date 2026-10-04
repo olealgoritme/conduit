@@ -745,6 +745,13 @@ fn deliver_completions(
 /// The descriptor is what wakes this; the timeout is a safety net for a
 /// wake that came while the backend lock was held elsewhere, short while
 /// chains are waiting and long while none are.
+///
+/// It is also how renderer death is found between commands (docs/VENUS.md
+/// "Reset and close"): the renderer reports it through the same descriptor,
+/// Venus releases everything and fails every held chain `RESP_ERR_UNSPEC`,
+/// which this returns, and from then on refuses every `GpuCmd`. No fence
+/// will ever signal again, so the pump then stops; chains failed later
+/// (none are held once the renderer is lost) go back from the queue handler.
 #[cfg(feature = "venus")]
 fn fence_pump(
     fd: OwnedFd,
@@ -775,6 +782,12 @@ fn fence_pump(
             return;
         }
         let delivered = deliver_completions(&nvidia, &held, &vring, &mem.memory());
+        if nvidia.lock().expect("backend mutex").venus_lost() {
+            log::error!(
+                "fence pump: the renderer is gone; held chains failed, GpuCmd refused from now on"
+            );
+            return;
+        }
         // Readable with nothing to deliver: do not spin on it.
         if n > 0 && !delivered {
             std::thread::sleep(Duration::from_millis(1));

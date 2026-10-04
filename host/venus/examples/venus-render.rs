@@ -29,7 +29,7 @@
 //!   cargo run --example venus-render -- /tmp/venus.sock
 
 use conduit_venus::ipc::IpcClient;
-use conduit_venus::{CAPSET_VENUS, Renderer};
+use conduit_venus::{CAPSET_VENUS, Renderer, ScanoutLayout};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -223,7 +223,7 @@ impl Venus {
     fn wait_fence(&mut self, id: u64, timeout: Duration) -> bool {
         let t = Instant::now();
         loop {
-            if self.c.signalled().iter().any(|s| s.fence_id == id) {
+            if self.c.signalled().expect("renderer gone").iter().any(|s| s.fence_id == id) {
                 return true;
             }
             if t.elapsed() > timeout {
@@ -658,8 +658,17 @@ fn main() {
     let bad = verify("blob mapping", pixels, lay_off, pitch);
     let mut pass = bad == 0;
 
-    // Export the same memory for scanout, and read it through the dma-buf.
-    match v.c.export_scanout(RES_IMAGE, W, H) {
+    // Export the same memory for scanout, with the layout a guest would give
+    // in SET_SCANOUT_BLOB (the linear image's own), and read it through the
+    // dma-buf. virtio B8G8R8A8 is DRM ARGB8888.
+    let layout = ScanoutLayout {
+        width: W,
+        height: H,
+        stride: pitch as u32,
+        offset: lay_off as u32,
+        fourcc: u32::from_le_bytes(*b"AR24"),
+    };
+    match v.c.export_scanout(RES_IMAGE, layout) {
         Ok(d) => {
             let fourcc = d.fourcc.to_le_bytes();
             println!(
@@ -672,11 +681,11 @@ fn main() {
                 std::str::from_utf8(&fourcc).unwrap_or("?"),
                 d.modifier
             );
-            if d.stride as u64 != pitch || d.offset as u64 != lay_off {
-                println!(
-                    "  NOTE: dma-buf layout (stride {}, offset {}) != image layout (rowPitch {pitch}, offset {lay_off})",
-                    d.stride, d.offset
-                );
+            if (d.width, d.height, d.stride, d.offset, d.fourcc, d.modifier)
+                != (W, H, layout.stride, layout.offset, layout.fourcc, conduit_venus::DRM_FORMAT_MOD_LINEAR)
+            {
+                println!("  dma-buf layout is not the guest's: {layout:?}");
+                pass = false;
             }
             match mmap(d.fd.as_raw_fd(), size as usize) {
                 Some(p) => {

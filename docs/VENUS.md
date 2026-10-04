@@ -74,8 +74,17 @@ Unfenced commands complete immediately.
 | `RESOURCE_MAP_BLOB` | the blob's fd placed in region 3 at the guest's offset; reply `RESP_OK_MAP_INFO` with the cache type |
 | `RESOURCE_UNMAP_BLOB` | withdrawn from region 3 |
 | `RESOURCE_UNREF` | unmapped if mapped, then freed |
-| `SET_SCANOUT_BLOB` | records scanout 0's resource, size, format, stride, offset |
-| `RESOURCE_FLUSH` | renderer exports the scanout resource as a dma-buf (cached per resource), sent to the viewer as a frame |
+| `SET_SCANOUT_BLOB` | records scanout 0's resource, size, format, stride, offset; a format with no DRM fourcc is `RESP_ERR_INVALID_PARAMETER` |
+| `RESOURCE_FLUSH` | renderer exports the scanout resource as a dma-buf with the guest's layout (cached per resource and layout), sent to the viewer as a frame |
+
+**Scanout layout.** The dma-buf the viewer gets is described entirely by the
+guest's `SET_SCANOUT_BLOB`: `width`, `height`, `strides[0]`, `offsets[0]`, and
+the format as the DRM fourcc of the same memory layout (`B8G8R8A8` →
+`ARGB8888`, `B8G8R8X8` → `XRGB8888`, `R8G8B8A8` → `ABGR8888`, `R8G8B8X8` →
+`XBGR8888`, and the other four `VIRTIO_GPU_FORMAT_*`), with modifier
+`DRM_FORMAT_MOD_LINEAR`. A Venus blob carries no image layout the host can
+read back, so **Venus scanout images must be linear for now**: guest drivers
+must allocate scanout images with linear tiling.
 
 **Checks** (backend, before the renderer sees anything): command length
 matches the type; `ctx_id` and `resource_id` exist and belong together;
@@ -85,7 +94,10 @@ page-aligned, inside region 3, not overlapping another mapping; scanout only
 
 **Reset and close.** Device reset, backend exit or renderer death: every
 context and resource is destroyed, region 3 emptied, held fenced chains
-returned with `RESP_ERR_UNSPEC`.
+returned with `RESP_ERR_UNSPEC`. Renderer death is noticed either by a call
+failing or, between commands, by the fence thread (`Renderer::signalled`
+returns `Disconnected`); from then on every `GpuCmd` is answered
+`RESP_ERR_UNSPEC`.
 
 ## Backend ↔ renderer
 

@@ -17,7 +17,7 @@ pub const CAPSET_VENUS: u32 = 4;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("renderer refused: {0}")]
-    Refused(&'static str),
+    Refused(String),
     #[error("unknown context {0}")]
     NoContext(u32),
     #[error("unknown resource {0}")]
@@ -45,6 +45,30 @@ pub struct Blob {
     /// `VIRTIO_GPU_MAP_CACHE_*` for `RESP_OK_MAP_INFO`.
     pub map_info: u32,
     pub size: u64,
+}
+
+/// `DRM_FORMAT_MOD_LINEAR`, the only modifier a Venus scanout has for now.
+pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+/// A scanout image's layout, as the guest gave it in `SET_SCANOUT_BLOB`
+/// (`width`, `height`, `strides[0]`, `offsets[0]`), with the virtio-gpu
+/// format already mapped to its `DRM_FORMAT_*` by the backend.
+///
+/// There is no modifier: a Venus blob carries no image layout the host could
+/// read back (virglrenderer's export query knows nothing of it), so the only
+/// layout both sides can agree on without one is linear. Venus scanout
+/// images must be linear for now: guest drivers must allocate scanout images
+/// with `VK_IMAGE_TILING_LINEAR` (or an explicit `DRM_FORMAT_MOD_LINEAR`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanoutLayout {
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per row of plane 0.
+    pub stride: u32,
+    /// Where plane 0 starts in the blob.
+    pub offset: u32,
+    /// `DRM_FORMAT_*`.
+    pub fourcc: u32,
 }
 
 /// A scanout resource exported for the viewer.
@@ -92,9 +116,13 @@ pub trait Renderer: Send {
     fn create_fence(&mut self, ctx_id: u32, ring_idx: u32, fence_id: u64) -> Result<()>;
     /// Readable when [`Renderer::signalled`] has something.
     fn fence_fd(&self) -> BorrowedFd<'_>;
-    /// Drain signalled fences.
-    fn signalled(&mut self) -> Vec<Signalled>;
+    /// Drain signalled fences. [`Error::Disconnected`] once the renderer is
+    /// gone (after any fences it signalled before going): its fences will
+    /// never signal, so whoever waits on them must give up.
+    fn signalled(&mut self) -> Result<Vec<Signalled>>;
 
-    /// Export `res_id` for scanout.
-    fn export_scanout(&mut self, res_id: u32, width: u32, height: u32) -> Result<Dmabuf>;
+    /// Export `res_id` for scanout. The returned [`Dmabuf`] describes the
+    /// image with `layout`'s size, stride, offset and format and
+    /// [`DRM_FORMAT_MOD_LINEAR`] (see [`ScanoutLayout`]).
+    fn export_scanout(&mut self, res_id: u32, layout: ScanoutLayout) -> Result<Dmabuf>;
 }

@@ -6,7 +6,7 @@
 //!   cargo run --example venus-smoke -- /tmp/venus.sock
 
 use conduit_venus::ipc::IpcClient;
-use conduit_venus::{CAPSET_VENUS, Renderer};
+use conduit_venus::{CAPSET_VENUS, Renderer, ScanoutLayout};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -51,7 +51,14 @@ fn main() {
         "create_blob(blob_id 77, no such VkDeviceMemory) = {:?}",
         c.create_blob(1, 2, 77, 1 << 20, MAPPABLE).err()
     );
-    println!("export_scanout(shm blob) = {:?}", c.export_scanout(1, 64, 64).err());
+    println!(
+        "export_scanout(shm blob) = {:?}",
+        c.export_scanout(
+            1,
+            ScanoutLayout { width: 64, height: 64, stride: 64 * 4, offset: 0, fourcc: u32::from_le_bytes(*b"XR24") }
+        )
+        .err()
+    );
 
     match c.create_fence(1, 0, 1) {
         Ok(()) => {
@@ -61,7 +68,7 @@ fn main() {
                 let mut p = libc::pollfd { fd: c.fence_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 };
                 // SAFETY: one pollfd on a live descriptor.
                 unsafe { libc::poll(&mut p, 1, 100) };
-                got = c.signalled();
+                got = c.signalled().expect("renderer gone");
             }
             println!("create_fence(1, ring 0, 1) -> signalled {got:?} after {:?}", t.elapsed());
         }
