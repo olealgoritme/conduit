@@ -2500,7 +2500,7 @@ impl VirtioGpu {
                 .map_err(|_| VirtioError::DeviceError)?;
         }
 
-        let wire_status = i32::from_le_bytes(resp_buf[8..12].try_into().unwrap());
+        let wire_status = i32::from_le_bytes([resp_buf[8], resp_buf[9], resp_buf[10], resp_buf[11]]);
         let resp: &VirtioGpuRespDisplayInfo =
             bytemuck::from_bytes(&resp_buf[MH..MH + resp_len]);
         if wire_status != 0 || !resp_is_ok(resp.hdr.type_) {
