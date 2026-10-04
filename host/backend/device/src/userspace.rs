@@ -159,6 +159,9 @@ pub const DEFAULT_SEARCH_PATHS: &[&str] = &[
     "/usr/share/vulkan/implicit_layer.d",
     "/usr/share/vulkansc/icd.d",
     "/usr/share/glvnd/egl_vendor.d",
+    // EGL platform glue (Wayland, GBM, X11): without it a guest Qt or GTK
+    // Wayland client finds no EGL and its GL context fails.
+    "/usr/share/egl/egl_external_platform.d",
     "/usr/share/nvidia",
     "/usr/lib/nvidia",
     "/usr/lib/xorg/modules/drivers",
