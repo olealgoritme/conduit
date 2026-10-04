@@ -1,0 +1,15 @@
+[submodule "guest/windows/third_party/mesa"]
+	path = guest/windows/third_party/mesa
+	url = https://github.com/winboat-org/mesa-helios.git
+[submodule "guest/windows/third_party/dxvk"]
+	path = guest/windows/third_party/dxvk
+	url = https://github.com/winboat-org/dxvk.git
+[submodule "guest/windows/third_party/vkd3d-proton"]
+	path = guest/windows/third_party/vkd3d-proton
+	url = https://github.com/winboat-org/vkd3d-proton.git
+[submodule "host/venus/third_party/virglrenderer"]
+	path = host/venus/third_party/virglrenderer
+	url = https://gitlab.freedesktop.org/virgl/virglrenderer.git
+[submodule "host/venus/third_party/venus-protocol"]
+	path = host/venus/third_party/venus-protocol
+	url = https://github.com/winboat-org/venus-protocol.git

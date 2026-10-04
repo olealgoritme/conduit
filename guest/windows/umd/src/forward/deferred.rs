@@ -1,0 +1,935 @@
+//! Native deferred contexts + command lists (Phase C of the command-list
+//! build; design in `tmp/handoff-perf-structural/PLAN-commandlists.md`).
+//!
+//! The D3D11 runtime emulates command lists against a driver that reports no
+//! COMMANDLISTS caps: worker threads record into runtime SWDC objects and the
+//! render thread replays them call-by-call — verified as the #1 render-thread
+//! cost under Fire Strike (`reports/p0-commandlist-verification.md`). These
+//! DDIs let the runtime hand the recordings to US instead: a deferred context
+//! forwards to DXVK's stock `D3D11DeferredContext` (already linked into this
+//! DLL, zero bridge changes), `pfnCreateCommandList` is a COM
+//! `FinishCommandList`, and `pfnCommandListExecute` is a COM
+//! `ExecuteCommandList` on the target context.
+//!
+//! # The DDI shape (WDK 10.0.26100; researched by the 66th session)
+//!
+//! - A deferred context IS a `D3D10DDI_HDEVICE`: created by
+//!   `pfnCreateDeferredContext` into `hDrvContext` private memory (sized by
+//!   `pfnCalcPrivateDeferredContextSize`), destroyed through
+//!   `pfnDestroyDevice` — hence the tag discrimination in
+//!   `device_funcs`/`state`.
+//! - The DRIVER fills the DC's own DEVICEFUNCS table (the
+//!   `D3D11DDIARG_CREATEDEFERREDCONTEXT` funcs union member matching the
+//!   device's negotiated level), with the WDK exclusion list NULLed and the
+//!   create/destroy slots replaced by context-local open/close shims.
+//! - **Context-local handles**: on first use of an object per DC the runtime
+//!   calls the DC table's `pfnCreate*` with the args NULL/dependency-only and
+//!   the hRT\* parameter equal to the IMMEDIATE context's driver handle. Our
+//!   DC-local region layout is a COPY of the IC region's identity word (COM
+//!   pointer or Box pointer), so every existing read path — `load_com`,
+//!   `resource_state`, the bind arrays, the box/COM-keyed caches — works
+//!   unchanged on both contexts. DC regions are BORROWS: closes clear the
+//!   word, never release/take.
+//! - **BUILD_2 recycle flow** (we report COMMANDLISTS_BUILD_2, so the four
+//!   Recycle DDIs are required): IC::RecycleDestroyCommandList first retires
+//!   an hCL region but leaves its owned COM word as escrow. The runtime then
+//!   drains zero or more of those through DC::RecycleCommandList, which moves
+//!   each owned list into that exact DC's DXVK cache. Separately, an IC
+//!   RecycleCreateCommandList reuses one hCL region for the next Finish, then
+//!   IC::RecycleCreateDeferredContext rebirths the DC. The callbacks are not
+//!   adjacent or one-to-one. Recycle-create DDIs return HRESULT directly, NOT
+//!   via pfnSetErrorCb; DC create errors go to the DC's OWN pfnSetErrorCb.
+//!
+//! The slots here are REAL and installed unconditionally; the `UmdCommandLists`
+//! knob only decides whether `threading_caps()` invites the runtime to use
+//! them (see `device_funcs::threading_caps` for the R812 pairing note).
+
+use super::*;
+use crate::adapter::NegotiatedInterface;
+use crate::device_funcs::{
+    ddi_destroy_device, deferred_context_private_size, log_backtrace, CtxBindings,
+    HeliosDeferredContext, HELIOS_TAG_DEFERRED,
+};
+
+// ---------------------------------------------------------------------------
+// Counters (log-line surface, like `ddi_refusal_summary`)
+// ---------------------------------------------------------------------------
+
+static DC_CREATED: AtomicUsize = AtomicUsize::new(0);
+static DC_DESTROYED: AtomicUsize = AtomicUsize::new(0);
+static DC_RECYCLED: AtomicUsize = AtomicUsize::new(0);
+/// A DC-table slot outside the installed set was called. Expected 0; the
+/// first hit logs a backtrace naming the caller.
+static DC_UNEXPECTED_SLOT: AtomicUsize = AtomicUsize::new(0);
+/// DC-local opens that copied a ZERO identity word from the IC handle (the
+/// IC-side create had failed). The open still "succeeds" — the runtime owns
+/// the failure of the original create — but it must be countable.
+static DC_OPEN_EMPTY: AtomicUsize = AtomicUsize::new(0);
+static CL_FINISHED: AtomicUsize = AtomicUsize::new(0);
+static CL_EXECUTED: AtomicUsize = AtomicUsize::new(0);
+static CL_ABANDONED: AtomicUsize = AtomicUsize::new(0);
+/// BUILD_2 IC::RecycleDestroy callbacks that left a command-list COM word in
+/// escrow for the later DC::RecycleCommandList handoff.
+static CL_RECYCLE_DESTROYED: AtomicUsize = AtomicUsize::new(0);
+/// Non-empty escrow slots observed by DC::RecycleCommandList.
+static CL_RECYCLE_HANDED_OFF: AtomicUsize = AtomicUsize::new(0);
+/// Empty (already normally destroyed, duplicate, or reordered) recycle slots.
+static CL_RECYCLE_EMPTY: AtomicUsize = AtomicUsize::new(0);
+/// Handoffs the bounded DXVK cache declined (disabled, full, or rejected).
+static CL_RECYCLE_DROPPED: AtomicUsize = AtomicUsize::new(0);
+/// A create/recycle-create overwrote a valid leftover hCL word; its owned ref
+/// was released first rather than leaked.
+static CL_REPLACED_STALE: AtomicUsize = AtomicUsize::new(0);
+/// `pfnCommandListExecute` with an empty command-list slot — refused.
+static CL_EXECUTE_EMPTY: AtomicUsize = AtomicUsize::new(0);
+static CHECK_HANDLE_SIZES_CALLS: AtomicUsize = AtomicUsize::new(0);
+static DC_LOG: LogThrottle = LogThrottle::new();
+
+/// One bounded line carrying the whole deferred-context surface, emitted at
+/// device DestroyDevice beside `ddi_refusal_summary` (an instrument nothing
+/// reads is not an instrument — T5's lesson).
+pub(crate) fn deferred_summary() -> String {
+    if !crate::umd_deferred_diagnostics() {
+        return format!(
+            "DC diagnostics=off cl_exec_empty={} dc_open_empty={} dc_unexpected_slot={}",
+            CL_EXECUTE_EMPTY.load(Ordering::Relaxed),
+            DC_OPEN_EMPTY.load(Ordering::Relaxed),
+            DC_UNEXPECTED_SLOT.load(Ordering::Relaxed),
+        );
+    }
+    format!(
+        "DC counters: dc_created={} dc_destroyed={} dc_recycled={} \
+         cl_finished={} cl_executed={} cl_abandoned={} cl_exec_empty={} \
+         cl_recycle_destroyed={} cl_recycle_handed_off={} cl_recycle_empty={} \
+         cl_recycle_dropped={} cl_replaced_stale={} dc_open_empty={} \
+         dc_unexpected_slot={} check_sizes_calls={}",
+        DC_CREATED.load(Ordering::Relaxed),
+        DC_DESTROYED.load(Ordering::Relaxed),
+        DC_RECYCLED.load(Ordering::Relaxed),
+        CL_FINISHED.load(Ordering::Relaxed),
+        CL_EXECUTED.load(Ordering::Relaxed),
+        CL_ABANDONED.load(Ordering::Relaxed),
+        CL_EXECUTE_EMPTY.load(Ordering::Relaxed),
+        CL_RECYCLE_DESTROYED.load(Ordering::Relaxed),
+        CL_RECYCLE_HANDED_OFF.load(Ordering::Relaxed),
+        CL_RECYCLE_EMPTY.load(Ordering::Relaxed),
+        CL_RECYCLE_DROPPED.load(Ordering::Relaxed),
+        CL_REPLACED_STALE.load(Ordering::Relaxed),
+        DC_OPEN_EMPTY.load(Ordering::Relaxed),
+        DC_UNEXPECTED_SLOT.load(Ordering::Relaxed),
+        CHECK_HANDLE_SIZES_CALLS.load(Ordering::Relaxed),
+    )
+}
+
+/// Called from `ddi_destroy_device`'s deferred arm (the teardown itself lives
+/// there beside the tag dispatch).
+pub(crate) fn note_deferred_context_destroyed() {
+    if !crate::umd_deferred_diagnostics() {
+        return;
+    }
+    let n = DC_DESTROYED.fetch_add(1, Ordering::Relaxed);
+    if n < 16 {
+        log_error!(
+            "DDI DestroyDevice(DC): deferred context destroyed (x{})",
+            n + 1
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sizes
+// ---------------------------------------------------------------------------
+
+/// Every DC-local handle region is ONE word: the copied IC identity word.
+/// `CheckDeferredContextHandleSizes` and `CalcDeferredContextHandleSize` must
+/// stay in lockstep (the WDK requires Calc's answer to be a member of the
+/// Check array) — both read this constant.
+const DC_HANDLE_WORD: usize = core::mem::size_of::<usize>();
+
+/// The handle types a DC of ours can hold locally: everything the DC-table
+/// open shim serves. One `D3D11DDI_HANDLESIZE` entry each, all
+/// [`DC_HANDLE_WORD`].
+const DC_HANDLE_TYPES: [ddi::D3D11DDI_HANDLETYPE; 13] = [
+    ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RESOURCE,
+    ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_SHADERRESOURCEVIEW,
+    ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RENDERTARGETVIEW,
+    ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_DEPTHSTENCILVIEW,
+    ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_SHADER,
+    ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_ELEMENTLAYOUT,
+    ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_BLENDSTATE,
+    ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_DEPTHSTENCILSTATE,
+    ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RASTERIZERSTATE,
+    ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_SAMPLERSTATE,
+    ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_QUERY,
+    ddi::D3D11DDI_HANDLETYPE_D3D11DDI_HT_COMMANDLIST,
+    ddi::D3D11DDI_HANDLETYPE_D3D11DDI_HT_UNORDEREDACCESSVIEW,
+];
+
+/// `pfnCheckDeferredContextHandleSizes` — a VOID writer with a count
+/// out-param, double-polled at device create: first call with a null array
+/// (count only), second with `*pHSizes` entries to fill. This firing at all
+/// is the first sign of deferred-context life (the runtime only polls it once
+/// it has seen the COMMANDLISTS caps bit).
+pub(crate) unsafe extern "system" fn check_deferred_context_handle_sizes(
+    _h_device: Hdevice,
+    p_h_sizes: *mut ddi::UINT,
+    sizes: *mut ddi::D3D11DDI_HANDLESIZE,
+) {
+    if !crate::umd_deferred_diagnostics() {
+        if !p_h_sizes.is_null() {
+            if !sizes.is_null() {
+                let want = (*p_h_sizes as usize).min(DC_HANDLE_TYPES.len());
+                for (i, &handle_type) in DC_HANDLE_TYPES.iter().take(want).enumerate() {
+                    *sizes.add(i) = ddi::D3D11DDI_HANDLESIZE {
+                        HandleType: handle_type,
+                        DriverPrivateSize: DC_HANDLE_WORD as ddi::SIZE_T,
+                    };
+                }
+            }
+            *p_h_sizes = DC_HANDLE_TYPES.len() as ddi::UINT;
+        }
+        return;
+    }
+    let n = CHECK_HANDLE_SIZES_CALLS.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        log_error!(
+            "DDI CheckDeferredContextHandleSizes (x{}) count_only={} caps={}",
+            n + 1,
+            sizes.is_null(),
+            crate::device_funcs::threading_caps()
+        );
+    }
+    if p_h_sizes.is_null() {
+        return;
+    }
+    if !sizes.is_null() {
+        let want = (*p_h_sizes as usize).min(DC_HANDLE_TYPES.len());
+        for (i, &handle_type) in DC_HANDLE_TYPES.iter().take(want).enumerate() {
+            *sizes.add(i) = ddi::D3D11DDI_HANDLESIZE {
+                HandleType: handle_type,
+                DriverPrivateSize: DC_HANDLE_WORD as ddi::SIZE_T,
+            };
+        }
+    }
+    *p_h_sizes = DC_HANDLE_TYPES.len() as ddi::UINT;
+}
+
+/// `pfnCalcDeferredContextHandleSize(hDevice, type, pICHandle)`, called on
+/// the IC table right after every IC create. Free-threaded by WDK retro-rule;
+/// trivially so — it reads no state. The answer must be a member of the
+/// Check array above, which every entry is.
+pub(crate) unsafe extern "system" fn calc_deferred_context_handle_size(
+    _h_device: Hdevice,
+    _handle_type: ddi::D3D11DDI_HANDLETYPE,
+    _p_ic_handle: *mut c_void,
+) -> ddi::SIZE_T {
+    DC_HANDLE_WORD as ddi::SIZE_T
+}
+
+pub(crate) unsafe extern "system" fn calc_private_deferred_context_size(
+    _h_device: Hdevice,
+    _args: *const ddi::D3D11DDIARG_CALCPRIVATEDEFERREDCONTEXTSIZE,
+) -> ddi::SIZE_T {
+    deferred_context_private_size() as ddi::SIZE_T
+}
+
+/// The IC-side command-list region: one owned `ID3D11CommandList` COM word,
+/// stored/loaded/released through the `Slot<Com<_>>` machinery like every
+/// bare-COM handle.
+pub(crate) unsafe extern "system" fn calc_private_command_list_size(
+    _h_device: Hdevice,
+    _args: *const ddi::D3D11DDIARG_CREATECOMMANDLIST,
+) -> ddi::SIZE_T {
+    core::mem::size_of::<usize>() as ddi::SIZE_T
+}
+
+// ---------------------------------------------------------------------------
+// Deferred-context lifecycle
+// ---------------------------------------------------------------------------
+
+/// Report an error through a DC's OWN corelayer channel. Used at create time,
+/// when the `HeliosDeferredContext` may not exist yet to route through
+/// `set_runtime_error`'s tag dispatch.
+unsafe fn report_dc_error(core_layer: *mut c_void, um_callbacks: *const c_void, hr: i32) {
+    if um_callbacks.is_null() {
+        log_error!(
+            "CreateDeferredContext: no DC corelayer callbacks to report hr=0x{:08x}",
+            hr as u32
+        );
+        return;
+    }
+    let cb = &*(um_callbacks as *const ddi::D3D11DDI_CORELAYER_DEVICECALLBACKS);
+    if let Some(f) = cb.pfnSetErrorCb {
+        f(ddi::D3D10DDI_HRTCORELAYER { handle: core_layer }, hr);
+    }
+}
+
+pub(crate) unsafe extern "system" fn create_deferred_context(
+    h: Hdevice,
+    args: *const ddi::D3D11DDIARG_CREATEDEFERREDCONTEXT,
+) {
+    if args.is_null() {
+        log_error!("DDI CreateDeferredContext: null args");
+        return;
+    }
+    let a = &*args;
+    let dc_priv = a.hDrvContext.pDrvPrivate;
+    let dc_core_layer = a.hRTCoreLayer.handle;
+    // p11UMCallbacks aliases every union member at offset 0; the corelayer
+    // callbacks are read through the 11.0 layout (pfnSetErrorCb is the first
+    // member of every revision).
+    let dc_um_callbacks = a.__bindgen_anon_2.p11UMCallbacks as *const c_void;
+    if dc_priv.is_null() {
+        log_error!("DDI CreateDeferredContext: null hDrvContext");
+        report_dc_error(dc_core_layer, dc_um_callbacks, E_INVALIDARG);
+        return;
+    }
+    let Some(DrvHandle::Device(dev)) = drv_handle(h) else {
+        log_error!("DDI CreateDeferredContext: parent handle is not a device");
+        report_dc_error(dc_core_layer, dc_um_callbacks, E_INVALIDARG);
+        return;
+    };
+    // Caps unreported ⇒ the runtime has no business here; refuse loudly
+    // rather than constructing a DC the rest of the knob-off path never
+    // expected. (E_OUTOFMEMORY is the documented DC-create failure code.)
+    if !crate::umd_command_lists() {
+        log_error!("DDI CreateDeferredContext: UmdCommandLists off — refused");
+        report_dc_error(dc_core_layer, dc_um_callbacks, E_OUTOFMEMORY);
+        return;
+    }
+    let Some(device) = dev.dxvk.d3d11_device() else {
+        report_dc_error(dc_core_layer, dc_um_callbacks, E_OUTOFMEMORY);
+        return;
+    };
+    let mut ctx: Option<ID3D11DeviceContext> = None;
+    let created = device.CreateDeferredContext(0, Some(&mut ctx));
+    let ctx = match (created, ctx) {
+        (Ok(()), Some(c)) => c,
+        (Ok(()), None) => {
+            report_dc_error(dc_core_layer, dc_um_callbacks, E_OUTOFMEMORY);
+            return;
+        }
+        (Err(e), _) => {
+            log_error!("DDI CreateDeferredContext: DXVK create failed {e:?}");
+            report_dc_error(dc_core_layer, dc_um_callbacks, create_error_hr(&e));
+            return;
+        }
+    };
+    if !dev
+        .dxvk
+        .enable_deferred_context_ddi_logical_reset(ctx.as_raw() as usize)
+    {
+        log_error!("DDI CreateDeferredContext: failed to mark DXVK DC fast-reset eligible");
+        report_dc_error(dc_core_layer, dc_um_callbacks, E_OUTOFMEMORY);
+        return;
+    }
+    core::ptr::write(
+        dc_priv as *mut HeliosDeferredContext,
+        HeliosDeferredContext {
+            tag: HELIOS_TAG_DEFERRED,
+            parent: dev as *const HeliosDevice,
+            dc: Some(ctx),
+            bindings: CtxBindings::default(),
+            dc_core_layer,
+            dc_um_callbacks,
+        },
+    );
+    fill_dc_funcs(dev.negotiated, &a.__bindgen_anon_1);
+    if crate::umd_deferred_diagnostics() {
+        let n = DC_CREATED.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            log_error!(
+                "DDI CreateDeferredContext: dc={dc_priv:p} flags=0x{:x} level={} (x{})",
+                a.Flags,
+                dev.negotiated.name(),
+                n + 1
+            );
+        }
+    }
+}
+
+/// `pfnRecycleCreateDeferredContext` (IC table): the DC is reborn for its
+/// next recording. DXVK's `FinishCommandList` already self-reset the deferred
+/// context, so the object-level work is only our shadow state + the funcs
+/// table + the per-DC error channel. Returns HRESULT directly (BUILD_2
+/// recycle contract), never pfnSetErrorCb.
+pub(crate) unsafe extern "system" fn recycle_create_deferred_context(
+    _h: Hdevice,
+    args: *const ddi::D3D11DDIARG_CREATEDEFERREDCONTEXT,
+) -> ddi::HRESULT {
+    if args.is_null() {
+        return E_OUTOFMEMORY;
+    }
+    let a = &*args;
+    // Raw access throughout: this DDI MUTATES the DC (error-channel refresh),
+    // so no shared borrow from `drv_handle` may be live across the writes.
+    let p = a.hDrvContext.pDrvPrivate as *mut HeliosDeferredContext;
+    if p.is_null() || *(p as *const usize) != HELIOS_TAG_DEFERRED {
+        log_error!("DDI RecycleCreateDeferredContext: handle is not a DC");
+        return E_OUTOFMEMORY;
+    }
+    (*p).bindings.reset_for_deferred_context_rebirth();
+    // The runtime may re-hand the corelayer/callback pointers on rebirth.
+    (*p).dc_core_layer = a.hRTCoreLayer.handle;
+    (*p).dc_um_callbacks = a.__bindgen_anon_2.p11UMCallbacks as *const c_void;
+    let negotiated = (*(*p).parent).negotiated;
+    fill_dc_funcs(negotiated, &a.__bindgen_anon_1);
+    if crate::umd_deferred_diagnostics() {
+        let n = DC_RECYCLED.fetch_add(1, Ordering::Relaxed);
+        if DC_LOG.first_n_then_every(8, 4096).is_some() {
+            log_error!("DDI RecycleCreateDeferredContext (x{})", n + 1);
+        }
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Command lists
+// ---------------------------------------------------------------------------
+
+/// The shared FinishCommandList core: close the DC's recording into an owned
+/// `ID3D11CommandList` stored in `h_cl`'s region. `recycled_region` is true
+/// only for BUILD_2 RecycleCreateCommandList, whose prior contents are a
+/// driver-owned COM word. A normal CreateCommandList receives fresh runtime
+/// private memory, which is not guaranteed to have been zero-initialized and
+/// must therefore be cleared without first interpreting it as a COM pointer.
+/// Returns 0 or an HRESULT from the create-legal set.
+unsafe fn finish_command_list_into(
+    args: *const ddi::D3D11DDIARG_CREATECOMMANDLIST,
+    h_cl: ddi::D3D11DDI_HCOMMANDLIST,
+    recycled_region: bool,
+) -> i32 {
+    if recycled_region {
+        // BUILD_2 has returned a region that was previously initialized by
+        // this driver. Move-and-drop an abnormal/reordered stale word rather
+        // than overwriting it and leaking its owned COM reference.
+        if let Some(stale) = take_com::<ID3D11CommandList>(h_cl) {
+            if crate::umd_deferred_diagnostics() {
+                CL_REPLACED_STALE.fetch_add(1, Ordering::Relaxed);
+            }
+            drop(stale);
+        }
+    } else {
+        // Never call take_com here: normal CreateCommandList private storage
+        // belongs to the runtime and may contain arbitrary bytes on first
+        // use. We have no owned pointer to inspect or release in this arm.
+        clear_handle(h_cl);
+    }
+    if args.is_null() {
+        return E_INVALIDARG;
+    }
+    let Some(DrvHandle::Deferred(dc)) = drv_handle((*args).hDeferredContext) else {
+        log_error!("DDI CreateCommandList: hDeferredContext is not a DC");
+        return E_INVALIDARG;
+    };
+    let Some(dc_ctx) = dc.dc.as_ref() else {
+        return E_OUTOFMEMORY;
+    };
+    let mut cl: Option<ID3D11CommandList> = None;
+    // RestoreDeferredContextState = FALSE: the runtime's clear-state
+    // convention, and what maps DXVK's self-reset onto the recycle flow with
+    // zero object churn.
+    match dc_ctx.FinishCommandList(false, Some(&mut cl)) {
+        Ok(()) => match cl {
+            Some(c) => {
+                store_com(h_cl, c);
+                if crate::umd_deferred_diagnostics() {
+                    let n = CL_FINISHED.fetch_add(1, Ordering::Relaxed);
+                    if DC_LOG.first_n_then_every(8, 4096).is_some() {
+                        log_error!("DDI CreateCommandList: finished (x{})", n + 1);
+                    }
+                }
+                0
+            }
+            None => E_OUTOFMEMORY,
+        },
+        Err(e) => {
+            log_error!("DDI CreateCommandList: FinishCommandList failed {e:?}");
+            create_error_hr(&e)
+        }
+    }
+}
+
+pub(crate) unsafe extern "system" fn create_command_list(
+    h: Hdevice,
+    args: *const ddi::D3D11DDIARG_CREATECOMMANDLIST,
+    h_cl: ddi::D3D11DDI_HCOMMANDLIST,
+    _h_rt_cl: ddi::D3D11DDI_HRTCOMMANDLIST,
+) {
+    let hr = finish_command_list_into(args, h_cl, false);
+    if hr != 0 {
+        set_runtime_error(h, hr);
+    }
+}
+
+/// BUILD_2: Finish into an already-allocated (recycled) region. Errors return
+/// as HRESULT directly — the WDK documents E_OUTOFMEMORY, so the create-set
+/// codes are clamped to it.
+pub(crate) unsafe extern "system" fn recycle_create_command_list(
+    _h: Hdevice,
+    args: *const ddi::D3D11DDIARG_CREATECOMMANDLIST,
+    h_cl: ddi::D3D11DDI_HCOMMANDLIST,
+    _h_rt_cl: ddi::D3D11DDI_HRTCOMMANDLIST,
+) -> ddi::HRESULT {
+    match finish_command_list_into(args, h_cl, true) {
+        0 => 0,
+        _ => E_OUTOFMEMORY,
+    }
+}
+
+/// Normal IC-side destroy: release the owned COM word and leave the slot
+/// empty. This is also the mandatory cleanup if a DC dies before its retired
+/// hCL escrow can reach `DC::RecycleCommandList`.
+pub(crate) unsafe extern "system" fn destroy_command_list(
+    _h: Hdevice,
+    h_cl: ddi::D3D11DDI_HCOMMANDLIST,
+) {
+    release_com(h_cl);
+}
+
+/// BUILD_2 IC-side recycle destroy. Unlike ordinary destroy this MUST NOT
+/// release or clear `h_cl`: the one-word IC slot is the owned COM escrow that
+/// the later DC::RecycleCommandList callback receives. This callback is
+/// free-threaded and deliberately has no DC/cache access.
+pub(crate) unsafe extern "system" fn recycle_destroy_command_list(
+    _h: Hdevice,
+    _h_cl: ddi::D3D11DDI_HCOMMANDLIST,
+) {
+    if crate::umd_deferred_diagnostics() {
+        CL_RECYCLE_DESTROYED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `pfnCommandListExecute`, with clear-state semantics: post-execute the
+/// runtime treats everything as unbound and rebinds lazily, so the target
+/// context's shadow resets. The target may be the immediate context or
+/// (nested execution) another DC — `d3d11_context`/`ctx_bindings` dispatch by
+/// tag.
+pub(crate) unsafe extern "system" fn command_list_execute(
+    h: Hdevice,
+    h_cl: ddi::D3D11DDI_HCOMMANDLIST,
+) {
+    let Some(cl) = load_com::<ID3D11CommandList>(h_cl) else {
+        let n = CL_EXECUTE_EMPTY.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            log_error!(
+                "DDI CommandListExecute: empty command-list slot (x{}) — refused",
+                n + 1
+            );
+        }
+        return;
+    };
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    // RestoreContextState = FALSE = the DDI's clear-state contract. The
+    // chunks dispatch through the immediate context's EmitCsChunk, so the
+    // present-time frame gate covers them with NO contract change.
+    context.ExecuteCommandList(&*cl, false);
+    if let Some(bindings) = ctx_bindings(h) {
+        bindings.reset_after_command_list_execute();
+    }
+    if crate::umd_deferred_diagnostics() {
+        let n = CL_EXECUTED.fetch_add(1, Ordering::Relaxed);
+        if DC_LOG.first_n_then_every(8, 4096).is_some() {
+            log_error!("DDI CommandListExecute (x{})", n + 1);
+        }
+    }
+}
+
+/// `pfnAbandonCommandList(hDC)`: the app/runtime abandoned a recording.
+/// DXVK has no discard primitive; Finish-and-drop both discards the recorded
+/// chunks and self-resets the DC for its next recording.
+pub(crate) unsafe extern "system" fn abandon_command_list(h: Hdevice) {
+    if crate::umd_deferred_diagnostics() {
+        let n = CL_ABANDONED.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            log_error!("DDI AbandonCommandList (x{})", n + 1);
+        }
+    }
+    let Some(DrvHandle::Deferred(dc)) = drv_handle(h) else {
+        log_error!("DDI AbandonCommandList: handle is not a DC");
+        return;
+    };
+    if let Some(dc_ctx) = dc.dc.as_ref() {
+        let mut cl: Option<ID3D11CommandList> = None;
+        let _ = dc_ctx.FinishCommandList(false, Some(&mut cl));
+        drop(cl);
+    }
+    dc.bindings.reset();
+}
+
+/// `pfnRecycleCommandList` (DC table): the serialized handoff point for the
+/// COM word IC::RecycleDestroyCommandList deliberately kept in escrow. Take
+/// (not borrow) the source word so duplicate/reordered callbacks become a
+/// normal empty no-op, then give the live object only to its originating DXVK
+/// deferred context. The owned raw reference transfers directly into an
+/// admitted DXVK cache entry; a rejection reconstructs and drops it here.
+pub(crate) unsafe extern "system" fn recycle_command_list(
+    h: Hdevice,
+    h_cl: ddi::D3D11DDI_HCOMMANDLIST,
+) {
+    let Some(command_list) = take_com::<ID3D11CommandList>(h_cl) else {
+        if crate::umd_deferred_diagnostics() {
+            CL_RECYCLE_EMPTY.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    };
+
+    let Some(DrvHandle::Deferred(dc)) = drv_handle(h) else {
+        // `command_list` drops here, releasing the escrow reference. A
+        // BUILD_2 recycle callback is DC-only; do not risk a generic cache
+        // handoff if a malformed handle says otherwise.
+        log_error!("DDI RecycleCommandList: target handle is not a DC");
+        return;
+    };
+    let Some(dc_context) = dc.dc.as_ref() else {
+        return;
+    };
+
+    // `take_com` moved the IC slot's one owned reference into `command_list`.
+    // Hand its raw form across only after all local rejection checks. A true
+    // result means DXVK attached that exact reference to its bounded cache;
+    // false means ownership remained here and must be reconstructed/dropped.
+    let raw_command_list = command_list.into_raw() as usize;
+    let cached = (*dc.parent)
+        .dxvk
+        .recycle_deferred_command_list(dc_context.as_raw() as usize, raw_command_list);
+    if !cached {
+        drop(ID3D11CommandList::from_raw(
+            raw_command_list as *mut core::ffi::c_void,
+        ));
+    }
+
+    if crate::umd_deferred_diagnostics() {
+        CL_RECYCLE_HANDED_OFF.fetch_add(1, Ordering::Relaxed);
+        if !cached {
+            CL_RECYCLE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The DC-table shims
+// ---------------------------------------------------------------------------
+
+/// A driver handle and its corresponding runtime handle. On a deferred
+/// context the latter carries the immediate-context private slot identity.
+trait DcHandle: DdiHandle {
+    type Runtime;
+    fn immediate_private(runtime: Self::Runtime) -> *mut c_void;
+}
+
+macro_rules! dc_handles {
+    ($($driver:ty => $runtime:ty),* $(,)?) => {$(
+        impl DcHandle for $driver {
+            type Runtime = $runtime;
+            fn immediate_private(runtime: Self::Runtime) -> *mut c_void { runtime.handle }
+        }
+    )*};
+}
+
+dc_handles!(
+    ddi::D3D10DDI_HRESOURCE => ddi::D3D10DDI_HRTRESOURCE,
+    ddi::D3D10DDI_HRENDERTARGETVIEW => ddi::D3D10DDI_HRTRENDERTARGETVIEW,
+    ddi::D3D10DDI_HDEPTHSTENCILVIEW => ddi::D3D10DDI_HRTDEPTHSTENCILVIEW,
+    ddi::D3D10DDI_HSHADER => ddi::D3D10DDI_HRTSHADER,
+    ddi::D3D10DDI_HRASTERIZERSTATE => ddi::D3D10DDI_HRTRASTERIZERSTATE,
+    ddi::D3D10DDI_HDEPTHSTENCILSTATE => ddi::D3D10DDI_HRTDEPTHSTENCILSTATE,
+    ddi::D3D10DDI_HSHADERRESOURCEVIEW => ddi::D3D10DDI_HRTSHADERRESOURCEVIEW,
+    ddi::D3D10DDI_HSAMPLER => ddi::D3D10DDI_HRTSAMPLER,
+    ddi::D3D10DDI_HQUERY => ddi::D3D10DDI_HRTQUERY,
+    ddi::D3D11DDI_HUNORDEREDACCESSVIEW => ddi::D3D11DDI_HRTUNORDEREDACCESSVIEW,
+    ddi::D3D10DDI_HELEMENTLAYOUT => ddi::D3D10DDI_HRTELEMENTLAYOUT,
+    ddi::D3D10DDI_HBLENDSTATE => ddi::D3D10DDI_HRTBLENDSTATE,
+    ddi::D3D11DDI_HCOMMANDLIST => ddi::D3D11DDI_HRTCOMMANDLIST,
+);
+
+/// Copy one borrowed identity. The IC allocation outlives the DC allocation
+/// under the runtime's deferred-context create/destroy ordering.
+unsafe fn dc_open_handle<H: DcHandle>(handle: H, runtime: H::Runtime) {
+    let private = handle.drv_private();
+    if private.is_null() {
+        return;
+    }
+    let immediate = H::immediate_private(runtime);
+    // SAFETY: both pointers name runtime-sized private slots; the IC identity
+    // was initialized before the DC open, and its lifetime spans this borrow.
+    let word = if immediate.is_null() {
+        0
+    } else {
+        unsafe { immediate.cast::<usize>().read() }
+    };
+    if word == 0 {
+        let n = DC_OPEN_EMPTY.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            log_error!(
+                "DC open: empty IC identity word ic_priv={immediate:p} (x{})",
+                n + 1
+            );
+        }
+    }
+    // SAFETY: private names the writable DC-local slot sized by Calc*.
+    unsafe { private.cast::<usize>().write(word) };
+}
+
+/// Every create entry gets its full signature, including trailing shader
+/// signatures. A four-argument universal thunk cannot pop five x86 arguments.
+trait DcOpen: Sized {
+    fn open() -> Self;
+}
+macro_rules! dc_open_signature {
+    ($($extra:ident),* $(,)?) => {
+        impl<A, H: DcHandle, $($extra,)*> DcOpen
+            for Option<unsafe extern "system" fn(Hdevice, A, H, H::Runtime, $($extra),*)>
+        {
+            fn open() -> Self {
+                unsafe extern "system" fn invoke<A, H: DcHandle, $($extra,)*>(
+                    _device: Hdevice, _args: A, handle: H, runtime: H::Runtime, $(_: $extra),*
+                ) {
+                    // SAFETY: this is the runtime's paired DC-create callback;
+                    // its typed handles identify the borrowed IC and writable DC slots.
+                    unsafe { dc_open_handle(handle, runtime) };
+                }
+                Some(invoke::<A, H, $($extra,)*>)
+            }
+        }
+    };
+}
+dc_open_signature!();
+dc_open_signature!(Extra);
+
+unsafe extern "system" fn dc_close_handle<H: DdiHandle>(_device: Hdevice, handle: H) {
+    let private = handle.drv_private();
+    if !private.is_null() {
+        // SAFETY: the runtime owns this writable DC slot. Clearing the borrow
+        // does not release the IC object and cannot touch its lifetime.
+        unsafe { private.cast::<usize>().write(0) };
+    }
+}
+
+pub(crate) fn note_dc_unexpected() {
+    let n = DC_UNEXPECTED_SLOT.fetch_add(1, Ordering::Relaxed);
+    if n == 0 {
+        // SAFETY: this is an ordinary user-mode DDI call outside unwinding.
+        unsafe { log_backtrace("DC DDI unexpected-slot") };
+    } else if n < 64 {
+        log_error!("DC DDI unexpected-slot hit (x{})", n + 1);
+    }
+}
+
+unsafe fn stub_fill_dc_table<T: crate::device_funcs::DdiStubTable>(
+    funcs: *mut T,
+) -> *mut ddi::D3D11DDI_DEVICEFUNCS {
+    // SAFETY: the caller supplies the complete negotiated DC table. Typed
+    // initialization gives every field its exact argument and return ABI.
+    unsafe { funcs.write(T::stubbed::<2>()) };
+    funcs.cast()
+}
+
+/// The DC-specific slot surgery applied AFTER the standard forwarder install
+/// chain: context-local open/close shims over every create/destroy, the WDK
+/// exclusion list NULLed, and the command-list slots.
+///
+/// # Safety
+/// `f` must be the D3D11.0-typed view of a DC table the install chain has
+/// already run over.
+unsafe fn apply_dc_overrides(f: &mut ddi::D3D11DDI_DEVICEFUNCS) {
+    // Context-local opens: one word-copy shim for every create. The 11.1
+    // typed-create overrides installed by `install_11_1` sit in these same
+    // prefix slots, so overriding through the 11.0 view covers every level.
+    macro_rules! open {
+        ($($field:ident),* $(,)?) => {$(
+            f.$field = DcOpen::open();
+        )*};
+    }
+    open!(
+        pfnCreateResource,
+        pfnCreateRenderTargetView,
+        pfnCreateDepthStencilView,
+        pfnCreateVertexShader,
+        pfnCreateGeometryShader,
+        pfnCreatePixelShader,
+        pfnCreateGeometryShaderWithStreamOutput,
+        pfnCreateHullShader,
+        pfnCreateDomainShader,
+        pfnCreateComputeShader,
+        pfnCreateRasterizerState,
+        pfnCreateDepthStencilState,
+        pfnCreateShaderResourceView,
+        pfnCreateSampler,
+        pfnCreateQuery,
+        pfnCreateUnorderedAccessView,
+        pfnCreateElementLayout,
+        pfnCreateBlendState,
+        pfnCreateCommandList,
+    );
+    // Context-local closes: clear-only. Includes DestroyCommandList — the
+    // DC-local command-list word is a borrow of the IC region's.
+    macro_rules! close {
+        ($($field:ident),* $(,)?) => {$(
+            f.$field = Some(dc_close_handle);
+        )*};
+    }
+    close!(
+        pfnDestroyResource,
+        pfnDestroyRenderTargetView,
+        pfnDestroyDepthStencilView,
+        pfnDestroyShader,
+        pfnDestroyRasterizerState,
+        pfnDestroyDepthStencilState,
+        pfnDestroyShaderResourceView,
+        pfnDestroySampler,
+        pfnDestroyQuery,
+        pfnDestroyUnorderedAccessView,
+        pfnDestroyElementLayout,
+        pfnDestroyBlendState,
+        pfnDestroyCommandList,
+    );
+    // The WDK exclusion list: the runtime documents it never calls these on a
+    // deferred context and expects NULL. The dynamic-map family deliberately
+    // STAYS — it is the DC map path (DXVK's deferred Map supports exactly
+    // DISCARD/NO_OVERWRITE; deferred Unmap is a no-op there).
+    f.pfnStagingResourceMap = None;
+    f.pfnStagingResourceUnmap = None;
+    f.pfnQueryGetData = None;
+    f.pfnFlush = None;
+    f.pfnResourceMap = None;
+    f.pfnResourceUnmap = None;
+    f.pfnResourceIsStagingBusy = None;
+    f.pfnOpenResource = None;
+    f.pfnSetResourceMinLOD = None;
+    f.pfnCalcPrivateResourceSize = None;
+    f.pfnCalcPrivateOpenedResourceSize = None;
+    f.pfnCalcPrivateShaderResourceViewSize = None;
+    f.pfnCalcPrivateRenderTargetViewSize = None;
+    f.pfnCalcPrivateDepthStencilViewSize = None;
+    f.pfnCalcPrivateElementLayoutSize = None;
+    f.pfnCalcPrivateBlendStateSize = None;
+    f.pfnCalcPrivateDepthStencilStateSize = None;
+    f.pfnCalcPrivateRasterizerStateSize = None;
+    f.pfnCalcPrivateShaderSize = None;
+    f.pfnCalcPrivateGeometryShaderWithStreamOutput = None;
+    f.pfnCalcPrivateSamplerSize = None;
+    f.pfnCalcPrivateQuerySize = None;
+    f.pfnCalcPrivateTessellationShaderSize = None;
+    f.pfnCalcPrivateUnorderedAccessViewSize = None;
+    f.pfnCalcPrivateDeferredContextSize = None;
+    f.pfnCalcPrivateCommandListSize = None;
+    f.pfnCalcDeferredContextHandleSize = None;
+    f.pfnCheckDeferredContextHandleSizes = None;
+    f.pfnCreateDeferredContext = None;
+    // Command-list execution is legal ON a DC (nested ExecuteCommandList —
+    // DXVK's deferred context splices), as are abandon/recycle notifications.
+    // BUILD_2 RecycleDestroy itself is IC-only: its IC hCL owns the COM escrow.
+    // If a DC-local borrowed alias ever reaches this slot, clear the borrow
+    // rather than retaining an alias to the IC word beyond its local lifetime.
+    f.pfnCommandListExecute = Some(command_list_execute);
+    f.pfnAbandonCommandList = Some(abandon_command_list);
+    f.pfnRecycleCommandList = Some(recycle_command_list);
+    f.pfnRecycleCreateCommandList = Some(recycle_create_command_list);
+    f.pfnRecycleCreateDeferredContext = Some(recycle_create_deferred_context);
+    f.pfnRecycleDestroyCommandList = Some(dc_close_handle);
+    f.pfnDestroyDevice = Some(ddi_destroy_device);
+}
+
+/// The 11.1 prefix changes the argument types of these slots. Install their
+/// DC shims through that exact view after applying the common 11.0 overrides.
+unsafe fn apply_dc_overrides_11_1(f: &mut ddi::D3D11_1DDI_DEVICEFUNCS) {
+    f.pfnCreateVertexShader = DcOpen::open();
+    f.pfnCreateGeometryShader = DcOpen::open();
+    f.pfnCreatePixelShader = DcOpen::open();
+    f.pfnCreateGeometryShaderWithStreamOutput = DcOpen::open();
+    f.pfnCreateHullShader = DcOpen::open();
+    f.pfnCreateDomainShader = DcOpen::open();
+    f.pfnCreateBlendState = DcOpen::open();
+}
+
+/// Notification-only, exactly like the device relocates (see
+/// `device_funcs::relocate_log` for the refill-race post-mortem): the runtime
+/// copies the table itself; refilling a LIVE table stub-sweeps slots that a
+/// concurrent thread may be calling through.
+static DC_RELOCATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn dc_relocate_log(tag: &str) {
+    let n = DC_RELOCATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n % 65536 == 0 {
+        log_error!(
+            "DDI RelocateDeviceFuncs(DC {tag}) (x{}) — noted, table untouched",
+            n + 1
+        );
+    }
+}
+
+unsafe extern "system" fn dc_relocate_11_0(
+    _h_device: Hdevice,
+    _funcs: *mut ddi::D3D11DDI_DEVICEFUNCS,
+) {
+    dc_relocate_log("11.0");
+}
+
+unsafe extern "system" fn dc_relocate_11_1(
+    _h_device: Hdevice,
+    _funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS,
+) {
+    dc_relocate_log("11.1");
+}
+
+unsafe extern "system" fn dc_relocate_wddm1_3(
+    _h_device: Hdevice,
+    _funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
+) {
+    dc_relocate_log("WDDM1.3");
+}
+
+pub(crate) unsafe fn fill_dc_11_0(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
+    if funcs.is_null() {
+        log_error!("DC fill: null 11.0 funcs table");
+        return;
+    }
+    let f = &mut *stub_fill_dc_table(funcs);
+    let _base = install(f);
+    apply_dc_overrides(f);
+    f.pfnRelocateDeviceFuncs = Some(dc_relocate_11_0);
+}
+
+pub(crate) unsafe fn fill_dc_11_1(funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS) {
+    if funcs.is_null() {
+        log_error!("DC fill: null 11.1 funcs table");
+        return;
+    }
+    let f = &mut *stub_fill_dc_table(funcs);
+    let base = install(f);
+    let _l1 = install_11_1(base, funcs);
+    apply_dc_overrides(f);
+    apply_dc_overrides_11_1(&mut *funcs);
+    (*funcs).pfnRelocateDeviceFuncs = Some(dc_relocate_11_1);
+}
+
+pub(crate) unsafe fn fill_dc_wddm1_3(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS) {
+    if funcs.is_null() {
+        log_error!("DC fill: null WDDM1.3 funcs table");
+        return;
+    }
+    let f = &mut *stub_fill_dc_table(funcs);
+    let base = install(f);
+    let l1 = install_11_1(base, funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
+    let _l13 = install_wddm1_3(l1, funcs);
+    apply_dc_overrides(f);
+    apply_dc_overrides_11_1(&mut *(funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS));
+    (*funcs).pfnRelocateDeviceFuncs = Some(dc_relocate_wddm1_3);
+}
+
+/// Fill the DC's context-funcs table through the union member matching the
+/// parent device's negotiated level — the same member/fill/level triple
+/// discipline as `create_device`'s step 3 (R802).
+unsafe fn fill_dc_funcs(
+    negotiated: NegotiatedInterface,
+    funcs: &ddi::D3D11DDIARG_CREATEDEFERREDCONTEXT__bindgen_ty_1,
+) {
+    match negotiated {
+        NegotiatedInterface::Wddm1_3 => fill_dc_wddm1_3(funcs.pWDDM1_3ContextFuncs),
+        NegotiatedInterface::D3D11_1 => fill_dc_11_1(funcs.p11_1ContextFuncs),
+        NegotiatedInterface::D3D11_0 => fill_dc_11_0(funcs.p11ContextFuncs),
+    }
+}

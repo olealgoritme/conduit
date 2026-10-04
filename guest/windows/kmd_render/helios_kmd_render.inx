@@ -1,0 +1,171 @@
+; helios_kmd_render.inx — Helios vGPU WDDM render and display miniport driver.
+; Matches the virtio-gpu PCI device (VEN_1AF4 & DEV_1050). The wdk-build
+; toolchain stamps DriverVer and produces helios_kmd_render.inf during packaging.
+; Test-signed package. FeatureScore is set below the inbox and virtual display
+; drivers so PnP selects Helios on its own PCI IDs; see Helios_Install below.
+; Branding strings are synchronized from metadata/helios.env by tools/sync-metadata.py.
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = Display
+ClassGUID   = {4D36E968-E325-11CE-BFC1-08002BE10318}
+Provider    = %ProviderName%
+CatalogFile = helios_kmd_render.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+Helios_CopyFiles = 13  ; driver store (DIRID 13) — required for a universal INF
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+helios_kmd_render.sys = 1,,
+helios_umd.dll = 1,,
+helios_umd12.dll = 1,,
+helios_umd32.dll = 1,,
+helios_umd12_32.dll = 1,,
+
+; ──── Manufacturer / Models ────────────────────────────────────────────────
+
+; TargetOSVersion decoration (...16299 = Win10 1709) — required because the
+; install section copies to DIRID 13 (driver store), introduced in 10.0.16299.
+[Manufacturer]
+%ProviderName% = Helios_Models,NTamd64.10.0...16299
+
+[Helios_Models.NTamd64.10.0...16299]
+%DeviceDesc% = Helios_Install, PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01, PCI\VEN_1AF4&DEV_1050
+
+; ──── Installation ─────────────────────────────────────────────────────────
+
+[Helios_Install]
+Include = msdv.inf
+
+; Driver rank is 0xSSGGTHHH (signature / feature / identifier); lower is better,
+; and the feature byte GG outranks the identifier byte. FeatureScore FF is
+; Windows' unspecified default, and it LOSES to every driver this device can
+; meet, because all of them declare a better score:
+;
+;   basicdisplay.inf (inbox Microsoft Basic Display fallback) = 0xFB
+;   stdvga           (QEMU standard VGA, reference convention) = 0xF8
+;   Red Hat VirtIO GPU DOD (same PCI IDs as Helios)           = 0xF9
+;
+; With FF the virtio-gpu device stayed on Microsoft Basic Display after a live
+; install, and packaging/windows/Install-Helios.ps1 threw "PnP did not select a
+; third-party Helios driver package". The package only ever bound when it was
+; staged into the image before the device first enumerated.
+;
+; F6 is below all three, so Helios wins the rank against Basic Display and
+; the Red Hat DOD and binds on a running system. It is not 0x00, so it makes no
+; absolute-best claim; the signature byte still carries the test-signing
+; penalty, and this cannot outrank a real GPU's driver because the Models
+; entries match only VEN_1AF4&DEV_1050.
+FeatureScore = F6
+CopyFiles = Helios_CopyFiles
+AddReg = Helios_DeviceSettings
+
+[Helios_CopyFiles]
+helios_kmd_render.sys
+helios_umd.dll
+helios_umd12.dll
+helios_umd32.dll
+helios_umd12_32.dll
+
+[Helios_Install.Services]
+AddService = helios_kmd_render, 0x00000002, Helios_ServiceInstall, Helios_EventLog
+
+[Helios_ServiceInstall]
+ServiceType    = 1                   ; SERVICE_KERNEL_DRIVER
+StartType      = 3                   ; SERVICE_DEMAND_START
+ErrorControl   = 0                   ; SERVICE_ERROR_IGNORE
+ServiceBinary  = %13%\helios_kmd_render.sys
+AddReg         = Helios_Service_AddReg
+
+[Helios_Service_AddReg]
+HKR,Parameters,SingleDeviceInstall,%REG_DWORD%,1
+
+[Helios_EventLog]
+AddReg = Helios_EventLog_AddReg
+
+[Helios_EventLog_AddReg]
+HKR,,EventMessageFile,%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR,,TypesSupported,%REG_DWORD%,7
+
+[Helios_Install.HW]
+AddReg = Helios_PCI_MSIX
+
+[Helios_PCI_MSIX]
+HKR, "Interrupt Management",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, %REG_DWORD%, 0
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, %REG_DWORD%, 1
+
+; ──── Software key / UMD registration ──────────────────────────────────────
+; TWO user-mode APIs, each built for AMD64 and x86, since stage S5 (docs/dx12/ARCHITECTURE.md 9.1
+; "Variant B", DECISIONS.md D3):
+;
+;   helios_umd.dll    - D3D9/D3D10/D3D11, the DXVK-backed driver DWM composites
+;                       on. Slots 0-2.
+;   helios_umd12.dll  - D3D12, the vkd3d-backed driver. Slot 3 only, and behind
+;                       the HKLM\SOFTWARE\Helios!UmdD3D12 kill switch, which is
+;                       enabled by default; UmdD3D12=0 disables new processes.
+;
+; UserModeDriverName is a REG_MULTI_SZ indexed by KMTUMDVERSION:
+; DX9=0, DX10=1, DX11=2, DX12=3.
+; FOUR entries, never six - D3DKMTQueryAdapterInfo(KMTQAITYPE_UMDRIVERNAME)
+; returns STATUS_INVALID_PARAMETER for versions 4/5 on this adapter, so
+; DX12_WSA32/DX12_WSA64 must not be written (DECISIONS.md D3).
+;
+; InstalledDisplayDrivers is NOT index-parallel to UserModeDriverName. It is a
+; flat list of the DISTINCT package binaries with the extension stripped - its
+; stated purpose is that WHQL test programs use it to check the driver binaries
+; are unchanged across a run. List all FOUR distinct package binaries, without
+; extensions; the WoW64 registration below has the same four API slots and
+; points to separate x86 binaries in the DriverStore. The kernel remains AMD64.
+
+[Helios_DeviceSettings]
+HKR,, UserModeDriverName,       %REG_MULTI_SZ%, %13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd12.dll
+HKR,, UserModeDriverNameWoW,    %REG_MULTI_SZ%, %13%\helios_umd32.dll,%13%\helios_umd32.dll,%13%\helios_umd32.dll,%13%\helios_umd12_32.dll
+HKR,, InstalledDisplayDrivers,  %REG_MULTI_SZ%, helios_umd,helios_umd12,helios_umd32,helios_umd12_32
+
+; ⛔⛔ HardwareInformation.AdapterString is LOAD-BEARING FOR THE VULKAN ICD, and
+; its absence here cost a full bring-up on 2026-09-05.
+;
+; Dxgkrnl answers KMTQAITYPE_ADAPTERREGISTRYINFO's AdapterString from THIS value.
+; The ICD's adapter discovery (icd/mesa/src/virtio/vulkan/vn_renderer_helios.c,
+; helios_open_d3dkmt) matches on wcsstr(AdapterString, L"Helios") or L"VIRTIO
+; GPU", and only falls back to probing every adapter when the query FAILS.
+;
+; ⚠ The failure mode when this value is unset is not "no match" — it is worse.
+; The value is not created by this INF, so the display class key RETAINS whatever
+; the previously bound driver wrote; on this VM that was the literal string
+; "Microsoft Basic Display Adapter". The query then SUCCEEDS with a foreign name,
+; so name_match is false AND the !query_ok fallback does not fire, and the real
+; Helios adapter is silently never probed. The ICD then probes only the Microsoft
+; Basic Render Drivers, which correctly reject the private escape with
+; STATUS_NOT_SUPPORTED (0xc00000bb) — so the symptom is "no Helios adapter passed
+; CTX_CREATE probe", DXVK gets no VkPhysicalDevice named "Virtio-GPU Venus",
+; D3D11 CreateDevice returns E_FAIL and dwm.exe crash-loops on 0x889800b0. None
+; of that names this registry value.
+;
+; ⇒ Setting it here makes discovery independent of what any earlier driver left
+; behind. Keep the literal "Helios" substring: the ICD matcher depends on it.
+HKR,, HardwareInformation.AdapterString, %REG_SZ%, %DeviceDesc%
+
+; ──── Vulkan ICD registration ──────────────────────────────────────────────
+; A universal INF may only write device-relative (HKR) registry keys, not the
+; absolute HKLM\SOFTWARE\Khronos\Vulkan\Drivers value the Vulkan loader reads.
+; ICD registration is therefore handled at ICD deployment (Phase 5/6) — via the
+; ICD's own installer / a setup step that registers helios_vulkan.json — not by
+; this KMD package.
+
+; ──── Strings ──────────────────────────────────────────────────────────────
+
+[Strings]
+ProviderName = "WinBoat"
+DeviceDesc   = "Helios vGPU"
+DiskName     = "Helios vGPU Driver Package"
+REG_SZ       = 0x00000000
+REG_DWORD    = 0x00010001
+REG_MULTI_SZ = 0x00010000
+REG_EXPAND_SZ = 0x00020000
