@@ -92,8 +92,9 @@ Why each nvgpu-related argument is there:
   the backend for them with `GET_SHMEM_CONFIG`. The backend answers shmid 1
   (window, 1 GiB) and shmid 2 (UVM aperture, 32 GiB).
 - `-cpu host,host-phys-bits=on` matters because the shared-memory BAR is
-  64 GiB and 64-bit. The firmware places it above 4 GiB, which needs real
-  physical-address width.
+  64 GiB and 64-bit (128 GiB with a large `--venus-hostmem-mib`). The
+  firmware places it above 4 GiB, which needs real physical-address width.
+  For OVMF see [VENUS.md](VENUS.md) "Windows/OVMF guests".
 
 Networking is the same as with `conduit-vmm`. `conduit up` creates the VM's
 `conduitN` tap (N is the VM's network number; `conduit0` in the example),

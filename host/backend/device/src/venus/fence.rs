@@ -5,9 +5,12 @@
 //! or that answers with data (`GET_CAPSET`, `RESOURCE_MAP_BLOB`), is
 //! answered at once, which is what QEMU does with them too.
 //!
-//! Fences on one `(ctx_id, ring)` timeline signal in order, so a signalled
-//! fence completes every held command on that timeline at or before it --
-//! the renderer may report only the newest.
+//! Fence ids are the guest's, passed through unchanged, and need not
+//! increase: 0 after 1000 is fine. The renderer retires the fences of one
+//! `(ctx_id, ring)` timeline in submission order and reports every one, so
+//! a signal completes that timeline's held commands in submission order up
+//! to and including the first one with the signalled id -- never by
+//! comparing ids.
 
 use super::*;
 use conduit_venus::Signalled;
@@ -45,18 +48,31 @@ impl Fences {
         self.next_token
     }
 
-    /// The renderer signalled `s`: everything at or before it on its
-    /// timeline is answered `RESP_OK_NODATA`.
+    /// The renderer signalled `s`: on its timeline, every held command up to
+    /// and including the oldest with its id is answered `RESP_OK_NODATA`.
+    /// A signal matching nothing held (a fence dropped by a reset) is ignored.
     pub(super) fn signal(&mut self, s: Signalled) {
-        let mut i = 0;
-        while i < self.held.len() {
-            let h = &self.held[i].hdr;
-            if h.ctx_id == s.ctx_id && h.ring() == s.ring_idx && h.fence_id <= s.fence_id {
-                let h = self.held.remove(i);
-                self.complete(h, RESP_OK_NODATA);
-            } else {
-                i += 1;
-            }
+        let on = |h: &Held| h.hdr.ctx_id == s.ctx_id && h.hdr.ring() == s.ring_idx;
+        let Some(last) = self
+            .held
+            .iter()
+            .position(|h| on(h) && h.hdr.fence_id == s.fence_id)
+        else {
+            log::debug!(
+                "venus: fence {} on ctx {} ring {} signalled, nothing held for it",
+                s.fence_id,
+                s.ctx_id,
+                s.ring_idx
+            );
+            return;
+        };
+        let (done, keep) = std::mem::take(&mut self.held)
+            .into_iter()
+            .enumerate()
+            .partition::<Vec<_>, _>(|(i, h)| *i <= last && on(h));
+        self.held = keep.into_iter().map(|(_, h)| h).collect();
+        for (_, h) in done {
+            self.complete(h, RESP_OK_NODATA);
         }
     }
 

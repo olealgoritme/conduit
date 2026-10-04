@@ -51,12 +51,28 @@ message itself is malformed); the virtio-gpu result is the response's
 
 Limits: a request is at most 4 MiB (Venus command streams are batched by the
 guest, a larger submit is split); a response fits the existing 64 KiB.
+The response may be split across several device-writable descriptors of the
+chain; the host fills them in order.
 
 **Fences.** A command with `VIRTIO_GPU_FLAG_FENCE` set completes (its chain is
 returned to the used ring) only after the renderer signals that fence, as QEMU
 does. With `VIRTIO_GPU_FLAG_INFO_RING_IDX` the fence is on `(ctx_id, ring_idx)`,
 otherwise on the context's ring 0. Completions may therefore be out of order.
 Unfenced commands complete immediately.
+
+Fence rules, which follow virglrenderer:
+
+- Fence ids are the guest's, passed through unchanged, and need not increase.
+- On one `(ctx_id, ring_idx)` the renderer retires fences in submission order
+  and reports each one. A signal completes that ring's held commands in
+  submission order up to and including the first with the signalled id; ids
+  are never compared.
+- `ring_idx` must be below 64 (virglrenderer's proxy has 64 timelines). A
+  fenced command naming ring 64 or above is refused with
+  `RESP_ERR_INVALID_PARAMETER` before it runs.
+- A fence on a ring other than 0 with no queue bound to it makes virglrenderer
+  destroy the whole context, which the backend cannot detect. Bind a queue to
+  a ring before fencing on it.
 
 **Commands served** (the set Helios's KMD sends). Anything else answers
 `RESP_ERR_UNSPEC`.
@@ -91,6 +107,15 @@ matches the type; `ctx_id` and `resource_id` exist and belong together;
 resource ids unique; blob size page-aligned and ≤ region 3; map offset
 page-aligned, inside region 3, not overlapping another mapping; scanout only
 0; at most 1024 contexts and 65536 resources per VM.
+
+**Windows/OVMF guests.** BAR 4 (the shared-memory BAR) is 64 GiB with or
+without `--venus`, and 128 GiB when `--venus-hostmem-mib` is above 31 GiB.
+OVMF places it only if the guest sees the host's physical address width:
+QEMU `-cpu host,host-phys-bits=on`, libvirt `<maxphysaddr mode='passthrough'/>`
+(`conduit up` and `conduit attach` already set this). Failing that, give OVMF
+a larger 64-bit MMIO window with
+`-fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=131072` (`262144` for a 128 GiB
+BAR).
 
 **Reset and close.** Device reset, backend exit or renderer death: every
 context and resource is destroyed, region 3 emptied, held fenced chains

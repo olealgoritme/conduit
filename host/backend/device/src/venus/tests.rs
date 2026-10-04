@@ -824,8 +824,8 @@ fn fences_release_by_timeline() {
         }
     }
     assert_eq!(t.venus.held(), 4);
-    // Only (ctx 1, ring 0) fence 2 signalled, as a renderer reporting only
-    // the newest would: both of that ring's commands complete, nothing else.
+    // Only (ctx 1, ring 0) fence 2 signalled: everything submitted on that
+    // ring up to it completes, in order, and nothing else.
     t.venus.fences.signal(Signalled {
         ctx_id: 1,
         ring_idx: 0,
@@ -860,6 +860,85 @@ fn fences_release_by_timeline() {
     m.hdr = fenced(CMD_RESOURCE_MAP_BLOB, 0, 4);
     assert_eq!(t.send(&m.to_bytes()).0.ty, RESP_OK_MAP_INFO);
     assert_eq!(t.venus.held(), 0);
+}
+
+/// Fence ids are the guest's and need not increase: a signal completes its
+/// timeline in submission order up to the first held command with that id.
+#[test]
+fn fences_complete_in_submission_order_not_by_id() {
+    let mut t = Rig::new();
+    t.ctx(1);
+    t.r.hold_fences();
+    let on = |ring: u8, fence: u64| CtrlHdr {
+        ty: CMD_SUBMIT_3D,
+        flags: FLAG_FENCE | FLAG_INFO_RING_IDX,
+        fence_id: fence,
+        ctx_id: 1,
+        ring_idx: ring,
+        padding: [0; 3],
+    };
+    let hold = |t: &mut Rig, h: CtrlHdr| match t.send_with(&submit_cmd(h, b""), None) {
+        Outcome::Held(tok) => tok,
+        Outcome::Done(_) => panic!("not held"),
+    };
+    let sig = |t: &mut Rig, ring: u32, fence_id: u64| {
+        t.venus.fences.signal(Signalled {
+            ctx_id: 1,
+            ring_idx: ring,
+            fence_id,
+        });
+        t.completions()
+            .iter()
+            .map(|c| c.token)
+            .collect::<Vec<u64>>()
+    };
+
+    // 1000 then 0: 1000's signal does not complete 0, which is newer.
+    let a = hold(&mut t, on(0, 1000));
+    let b = hold(&mut t, on(0, 0));
+    assert_eq!(sig(&mut t, 0, 1000), vec![a]);
+    assert_eq!(sig(&mut t, 0, 0), vec![b]);
+
+    // The same id twice on a ring: one signal each, oldest first.
+    let a = hold(&mut t, on(0, 5));
+    let b = hold(&mut t, on(0, 5));
+    assert_eq!(sig(&mut t, 0, 5), vec![a]);
+    assert_eq!(sig(&mut t, 0, 5), vec![b]);
+
+    // Rings are independent; a signal holding nothing completes nothing.
+    let a = hold(&mut t, on(0, 7));
+    let b = hold(&mut t, on(1, 7));
+    assert_eq!(sig(&mut t, 0, 8), Vec::<u64>::new());
+    assert_eq!(sig(&mut t, 2, 7), Vec::<u64>::new());
+    assert_eq!(sig(&mut t, 1, 7), vec![b]);
+    assert_eq!(t.venus.held(), 1);
+    assert_eq!(sig(&mut t, 0, 7), vec![a]);
+    assert_eq!(t.venus.held(), 0);
+}
+
+/// A fence on a ring the renderer has no timeline for is refused before the
+/// command runs or the renderer hears of it.
+#[test]
+fn fences_on_ring_64_and_up_are_refused() {
+    let mut t = Rig::new();
+    t.ctx(1);
+    t.r.hold_fences();
+    let mut h = fenced(CMD_SUBMIT_3D, 1, 3);
+    h.flags |= FLAG_INFO_RING_IDX;
+    h.ring_idx = MAX_RINGS as u8;
+    let (r, _) = t.send(&submit_cmd(h, b"x"));
+    assert_eq!((r.ty, r.fence_id), (RESP_ERR_INVALID_PARAMETER, 3));
+    assert_eq!(t.venus.held(), 0);
+    // Unfenced, ring_idx means nothing and is not checked.
+    h.flags = FLAG_INFO_RING_IDX;
+    assert_eq!(t.ty(&submit_cmd(h, b"x")), RESP_OK_NODATA);
+    // The last ring is fine.
+    h.flags = FLAG_FENCE | FLAG_INFO_RING_IDX;
+    h.ring_idx = (MAX_RINGS - 1) as u8;
+    assert!(matches!(
+        t.send_with(&submit_cmd(h, b"x"), None),
+        Outcome::Held(_)
+    ));
 }
 
 /// A renderer that goes away: everything is released, held chains come back

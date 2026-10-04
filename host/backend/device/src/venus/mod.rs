@@ -38,6 +38,9 @@ pub const MAX_CONTEXTS: usize = 1024;
 pub const MAX_RESOURCES: usize = 65536;
 
 const PAGE: u64 = 4096;
+/// Rings a fence may name: virglrenderer's proxy refuses `ring_idx` at or
+/// above `PROXY_CONTEXT_TIMELINE_COUNT` (64).
+pub const MAX_RINGS: u32 = 64;
 
 /// What became of one `GpuCmd`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,6 +205,15 @@ impl Venus {
         };
         let answer = if self.lost {
             Err(RESP_ERR_UNSPEC)
+        } else if hdr.fenced() && hdr.ring() >= MAX_RINGS {
+            // Refused before anything runs: the renderer would refuse the
+            // fence only after the command took effect. A fence on a ring
+            // below this with no queue bound to it (ring 0 needs none) is
+            // worse: vkr fails it and destroys the whole context
+            // (vkr_context.c submit_fence, render_context.c dispatch), which
+            // the host cannot see from here. Guests bind a queue to a ring
+            // before fencing on it.
+            Err(RESP_ERR_INVALID_PARAMETER)
         } else {
             self.serve(&hdr, payload, env)
         };
