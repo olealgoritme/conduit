@@ -169,6 +169,10 @@ cmd_rust() {
     t=$(target_dir "$ROOT/cli")/$TARGET_DIR_SUFFIX
     install -m0755 "$t/$CLI_BIN_SRC" "$bin/conduit"
 
+    # TODO: conduit-venus (host/venus, the Venus renderer for Windows guests)
+    # is not packaged yet. It is experimental and needs virglrenderer built with
+    # Venus (host/venus/build-virglrenderer.sh), so it is built by hand for now.
+
     if [ "$RUST_TARGET" != host ]; then
         for f in "$bin"/*; do
             [ "$(basename "$f")" = conduit-vmm ] && continue   # glibc on purpose, see above

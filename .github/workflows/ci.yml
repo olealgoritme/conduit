@@ -1,6 +1,6 @@
 # CI: every push and pull request.
 #
-#   rust          fmt, clippy and tests for each Rust project (backend, VMM, CLI)
+#   rust          fmt, clippy and tests for each Rust project (backend, VMM, venus, CLI)
 #   guest-module  the guest kernel module against Ubuntu 24.04 (GA 6.8 and HWE),
 #                 Debian 13 (6.12) and Fedora (newest) headers
 #   viewer        the C viewer's own test suite (`make check`, no display needed)
@@ -44,6 +44,11 @@ jobs:
             dir: host/vmm
             # Built without default features (no virglrenderer), as shipped.
             features: "--workspace --no-default-features"
+          - name: venus
+            dir: host/venus
+            # Default features only: the `renderer` feature (the conduit-venus
+            # binary) links a locally built virglrenderer, so it is not built here.
+            features: ""
           - name: cli
             # cli/ is a member of the workspace at the repo root.
             dir: "."
