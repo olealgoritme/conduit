@@ -1,6 +1,6 @@
 # CI: every push and pull request.
 #
-#   rust          fmt, clippy and tests for each Rust project (backend, VMM, CLI)
+#   rust          fmt, clippy and tests for each Rust project (backend, VMM, venus, CLI)
 #   guest-module  the guest kernel module against Ubuntu 24.04 (GA 6.8 and HWE),
 #                 Debian 13 (6.12) and Fedora (newest) headers
 #   viewer        the C viewer's own test suite (`make check`, no display needed)
@@ -44,6 +44,11 @@ jobs:
             dir: host/vmm
             # Built without default features (no virglrenderer), as shipped.
             features: "--workspace --no-default-features"
+          - name: venus
+            dir: host/venus
+            # Default features only: the `renderer` feature (the conduit-venus
+            # binary) links a locally built virglrenderer, so it is not built here.
+            features: ""
           - name: cli
             # cli/ is a member of the workspace at the repo root.
             dir: "."
@@ -100,9 +105,9 @@ jobs:
           if command -v apt-get >/dev/null; then
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            apt-get install -y --no-install-recommends ${{ matrix.headers }} make gcc git ca-certificates
+            apt-get install -y --no-install-recommends ${{ matrix.headers }} make gcc libc6-dev git ca-certificates
           else
-            dnf install -y ${{ matrix.headers }} make gcc elfutils-libelf-devel git
+            dnf install -y ${{ matrix.headers }} make gcc elfutils-libelf-devel git libasan libubsan
           fi
       - uses: actions/checkout@v5
       - name: Find the header tree and its compiler
@@ -140,6 +145,8 @@ jobs:
           objcopy -O binary --only-section=.modinfo "$ko" modinfo.bin
           tr '\0' '\n' < modinfo.bin | grep -E '^(license|vermagic|alias)='
           tr '\0' '\n' < modinfo.bin | grep -qx 'name=conduit_gpu'
+      - name: Unit tests (plain-C parts, on the build host)
+        run: make -C guest/linux HOSTCC="$KCC" check
 
   viewer:
     runs-on: ubuntu-24.04
@@ -222,3 +229,7 @@ jobs:
           dpkg-deb -c dist/out/conduit-guest_*_all.deb | grep usr/bin/conduit-clipboard-agent
           dpkg-deb -c dist/out/conduit-guest_*_all.deb | grep usr/lib/conduit-guest/setup
           dpkg-deb -c dist/out/conduit-guest_*_all.deb | grep 'usr/src/conduit-guest-.*/conduit_gpu\.c'
+          packaging/build.sh package guest-arch
+          tar -I zstd -tf dist/out/conduit-guest-*-any.pkg.tar.zst | grep -x usr/bin/conduit-clipboard-agent
+          tar -I zstd -tf dist/out/conduit-guest-*-any.pkg.tar.zst | grep -x '\.INSTALL'
+          tar -I zstd -tf dist/out/conduit-guest-*-any.pkg.tar.zst | grep 'usr/src/conduit-guest-.*/conduit_gpu\.c'

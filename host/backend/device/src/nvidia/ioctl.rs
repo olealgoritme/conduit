@@ -331,6 +331,35 @@ impl NvidiaBackend {
         }
     }
 
+    /// NVKMS_IOCTL_QUERY_DISP, answered without the host: success, and a disp
+    /// with no valid, boot or mux dpys, no framelock device, no connectors and
+    /// an empty GPU string. `param_in` is the 16-byte `NvKmsIoctlParams`
+    /// followed by the `NvKmsQueryDispParams` it points to.
+    fn answer_nvkms_query_disp(
+        &mut self,
+        resp_buf: &mut [u8],
+        cookie: u64,
+        param_in: &[u8],
+    ) -> usize {
+        const OUTER: usize = 16;
+        let size = u32::from_le_bytes(param_in[4..8].try_into().unwrap()) as usize;
+        // NVKMS itself fails a call whose size is not its own struct's; here
+        // the reply's size is whatever this release made it, so only a block
+        // too short to hold the request, or not all sent, is malformed.
+        if self.current_data_len as usize != OUTER
+            || size < super::NVKMS_QUERY_DISP_REQUEST
+            || param_in.len() != OUTER + size
+        {
+            traced_refusal!(self, BadRequest);
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+        }
+        let mut combined = param_in.to_vec();
+        combined[OUTER + super::NVKMS_QUERY_DISP_REQUEST..].fill(0);
+        log::debug!("NVKMS QUERY_DISP answered locally: no connectors, no dpys");
+        traced_refusal!(self, Local);
+        self.write_ioctl_resp_deep(resp_buf, cookie, &combined, 0)
+    }
+
     fn serve_ioctl(&mut self, cookie: u64, payload: &[u8], resp_buf: &mut [u8]) -> usize {
         if payload.len() < size_of::<IoctlReq>() {
             return self.write_error_resp(resp_buf, Status::InvalidMsgType, cookie, 0);
@@ -473,6 +502,20 @@ impl NvidiaBackend {
                     traced_refusal!(self, Local);
                     return self.write_ioctl_resp_deep(resp_buf, cookie, &combined, 0);
                 }
+                // QUERY_DISP is answered here too, with a disp that has no
+                // connectors and no dpys: what NVKMS itself reports for a
+                // display engine with nothing wired to it. Refusing it is not
+                // an option. NVIDIA's Vulkan driver asks while it builds the
+                // VK_KHR_display state, and on EPERM it leaves that state half
+                // made. The process then jumps into freed heap from
+                // libEGL_nvidia's exit handlers (SIGSEGV in every
+                // `vulkaninfo`). With nothing reported, the client never names
+                // a connector or a dpy, so the queries that would describe the
+                // host's monitors are never asked, and they stay refused if
+                // they are.
+                if nvkms_cmd == super::NVKMS_QUERY_DISP {
+                    return self.answer_nvkms_query_disp(resp_buf, cookie, param_in);
+                }
                 let allowed = nvkms_cmd <= 1 || (reg..=reg + 4).contains(&nvkms_cmd);
                 if !allowed {
                     log::warn!("NVKMS cmd={nvkms_cmd} refused: acts on the host display");
@@ -534,6 +577,64 @@ impl NvidiaBackend {
         // holds the same numbers in nvgpu_gem_import_nvkms /
         // nvgpu_gem_export_dmabuf. Both halves have to be changed together.
         if ioc_type == b'd' as u32 {
+            // Explicit sync (docs/SYNC.md). The two that carry a sync_file
+            // trade it for a handle here; the context import is nested like
+            // the GEM imports but its block holds an RM client, not a memFd.
+            match escape {
+                fence::SEMSURF_FENCE_CREATE => {
+                    return self
+                        .dispatch_fence_create(cookie, host_fd, request, param_in, resp_buf);
+                }
+                fence::SEMSURF_FENCE_WAIT => {
+                    return self.dispatch_fence_wait(cookie, host_fd, request, param_in, resp_buf);
+                }
+                fence::SEMSURF_FENCE_CTX_CREATE => {
+                    if self.current_data_len as usize != fence::CTX_CREATE_SIZE
+                        || param_in.len() < fence::CTX_CREATE_SIZE
+                        || !self.fence_ctx_import_allowed(&param_in[fence::CTX_CREATE_SIZE..])
+                    {
+                        return self.write_error_resp(
+                            resp_buf,
+                            Status::IoctlFailed,
+                            cookie,
+                            libc::EPERM,
+                        );
+                    }
+                    return self.dispatch_nested(
+                        cookie,
+                        host_fd,
+                        request,
+                        param_in,
+                        resp_buf,
+                        fence::CTX_CREATE_SIZE,
+                        fence::CTX_CREATE_PTR,
+                        fence::CTX_CREATE_LEN,
+                        deep_in,
+                        None,
+                    );
+                }
+                // Pointers and a memFd that mean nothing here, and a guest
+                // that has semaphore surfaces never needs it.
+                fence::PRIME_FENCE_CONTEXT_CREATE => {
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::IoctlFailed,
+                        cookie,
+                        libc::ENOTTY,
+                    );
+                }
+                // The core's syncobj ioctls are the guest kernel's own; here
+                // they would only make descriptors in this process.
+                0xbf..=0xcf => {
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::IoctlFailed,
+                        cookie,
+                        libc::ENOTTY,
+                    );
+                }
+                _ => {}
+            }
             // (outer_size, ptr_offset, size_offset)
             let nested = match escape {
                 0x41 => Some((32usize, 8usize, 16usize)), // GEM_IMPORT_NVKMS_MEMORY

@@ -1227,7 +1227,39 @@ static void nvgpu_display_quiesce(struct nvgpu_device *dev) {
   nvgpu_input_destroy(dev);
 }
 
-/* After drm_dev_unregister(), before the last drm_dev_put(). */
+/*
+ * The last file open on the node has closed: nobody owns the display any
+ * more, so turn it off, as a driver with fbdev emulation hands it back to
+ * the console at this point.
+ *
+ * Not leaving it lit matters because of what the frame left on it holds. A
+ * compositor that exits with DRM_IOCTL_MODE_CLOSEFB (mutter does) leaves its
+ * last framebuffer on the plane, and from 6.16 a framebuffer holds a GEM
+ * handle reference on its object -- which keeps the object's exported dma-buf
+ * alive, and a dma-buf holds the module that exported it. The session ended
+ * and conduit_gpu stayed in use, with no process holding anything.
+ *
+ * Called with dri->open_lock held. Not once the device is unplugged: remove()
+ * shuts the head down itself.
+ */
+static void nvgpu_kms_lastclose(struct nvgpu_dri_dev *dri,
+                                struct drm_device *drm) {
+  struct drm_modeset_acquire_ctx ctx;
+  int idx, ret;
+
+  if (!dri->kms || !drm_dev_enter(drm, &idx))
+    return;
+  DRM_MODESET_LOCK_ALL_BEGIN(drm, ctx, 0, ret);
+  ret = drm_atomic_helper_disable_all(drm, &ctx);
+  DRM_MODESET_LOCK_ALL_END(drm, ctx, ret);
+  if (ret)
+    dev_warn(&dri->dev->vdev->dev,
+             "conduit-gpu: display not turned off after the last close: %d\n",
+             ret);
+  drm_dev_exit(idx);
+}
+
+/* After drm_dev_unplug(), before the last drm_dev_put(). */
 static void nvgpu_kms_fini(struct nvgpu_dri_dev *dri) {
   struct nvgpu_kms *kms = dri->kms;
 

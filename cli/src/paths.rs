@@ -2,6 +2,7 @@
 //!
 //! Installed layout ($CONDUIT_PREFIX, default /opt/conduit):
 //!   bin/conduit-backend   bin/conduit-vmm   bin/conduit-viewer   bin/conduit-userspace
+//!   bin/conduit-venus                   Venus renderer, only for `--venus`
 //!   bin/qemu-system-x86_64              bundled QEMU 11.1, the default VM runner
 //!   share/conduit/guest/conduit-guest.deb the guest driver (DKMS) `conduit create` installs
 //!   share/conduit/supported-drivers.txt  host driver versions the backend speaks
@@ -115,8 +116,10 @@ pub enum Tool {
     Viewer,
     Userspace,
     GuestDeb,
+    GuestArch,
     BundledQemu,
     Stream,
+    Venus,
 }
 
 impl Tool {
@@ -127,8 +130,10 @@ impl Tool {
             Tool::Viewer => "viewer",
             Tool::Userspace => "driver share tool",
             Tool::GuestDeb => "guest driver package (conduit-guest .deb)",
+            Tool::GuestArch => "Arch guest driver package (conduit-guest .pkg.tar.zst)",
             Tool::BundledQemu => "bundled QEMU",
             Tool::Stream => "stream host (conduit-stream)",
+            Tool::Venus => "Venus renderer (conduit-venus)",
         }
     }
 
@@ -139,8 +144,10 @@ impl Tool {
             Tool::Viewer => "CONDUIT_VIEWER",
             Tool::Userspace => "CONDUIT_USERSPACE",
             Tool::GuestDeb => "CONDUIT_GUEST_DEB",
+            Tool::GuestArch => "CONDUIT_GUEST_ARCH",
             Tool::BundledQemu => "CONDUIT_QEMU",
             Tool::Stream => "CONDUIT_STREAM",
+            Tool::Venus => "CONDUIT_VENUS",
         }
     }
 
@@ -176,6 +183,8 @@ impl Tool {
             ),
             // In a checkout: `packaging/build.sh package guest-deb` (newest wins, below).
             Tool::GuestDeb => (&["share/conduit/guest/conduit-guest.deb"], &[]),
+            // `packaging/build.sh package guest-arch`, for `conduit attach` on Arch guests.
+            Tool::GuestArch => (&["share/conduit/guest/conduit-guest.pkg.tar.zst"], &[]),
             Tool::BundledQemu => (
                 &["bin/qemu-system-x86_64"],
                 &["host/qemu/build/qemu-system-x86_64"],
@@ -184,12 +193,34 @@ impl Tool {
                 &["bin/conduit-stream"],
                 &["host/stream/target/release/conduit-stream"],
             ),
+            // Built apart (host/venus is its own workspace, `--features renderer`).
+            Tool::Venus => (
+                &["bin/conduit-venus"],
+                &[
+                    "host/venus/target/release/conduit-venus",
+                    "host/venus/target/debug/conduit-venus",
+                ],
+            ),
         };
         v.extend(installed.iter().map(|p| pf.join(p)));
+        // conduit-venus is not always installed with the rest: also look next
+        // to this binary.
+        if self == Tool::Venus {
+            if let Some(d) = env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(Path::to_path_buf))
+            {
+                v.push(d.join("conduit-venus"));
+            }
+        }
         if let Some(r) = repo_root() {
             v.extend(dev.iter().map(|p| r.join(p)));
-            if self == Tool::GuestDeb {
-                v.extend(newest_guest_deb(&r.join("dist/out")));
+            match self {
+                Tool::GuestDeb => v.extend(newest_guest_pkg(&r.join("dist/out"), "_all.deb")),
+                Tool::GuestArch => {
+                    v.extend(newest_guest_pkg(&r.join("dist/out"), "-any.pkg.tar.zst"))
+                }
+                _ => {}
             }
         }
         v
@@ -210,8 +241,9 @@ impl Tool {
             oops(
                 format!("could not find the {}", self.label()),
                 format!(
-                    "Conduit looked in:\n{}\nReinstall the conduit package, or in a source checkout build it first.\nYou can also point to it with {}=/path/to/file",
+                    "Conduit looked in:\n{}\n{}\nYou can also point to it with {}=/path/to/file",
                     looked.join("\n"),
+                    self.build_hint(),
                     self.env_var()
                 ),
             )
@@ -219,14 +251,29 @@ impl Tool {
     }
 }
 
-/// The newest conduit-guest_*_all.deb in `dir` (by modification time).
-fn newest_guest_deb(dir: &Path) -> Option<PathBuf> {
+impl Tool {
+    fn build_hint(self) -> &'static str {
+        match self {
+            Tool::Venus => {
+                "Build it in a source checkout: host/venus/build-virglrenderer.sh, then \
+                            `cargo build --release --features renderer` in host/venus"
+            }
+            _ => "Reinstall the conduit package, or in a source checkout build it first.",
+        }
+    }
+}
+
+/// The newest conduit-guest package in `dir` whose name ends in `suffix`
+/// (conduit-guest_*_all.deb, conduit-guest-*-any.pkg.tar.zst), by
+/// modification time.
+fn newest_guest_pkg(dir: &Path, suffix: &str) -> Option<PathBuf> {
     std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .filter(|e| {
             let n = e.file_name().to_string_lossy().into_owned();
-            n.starts_with("conduit-guest_") && n.ends_with("_all.deb")
+            (n.starts_with("conduit-guest_") || n.starts_with("conduit-guest-"))
+                && n.ends_with(suffix)
         })
         .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
         .map(|e| e.path())

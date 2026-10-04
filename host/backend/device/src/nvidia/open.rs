@@ -131,6 +131,8 @@ impl NvidiaBackend {
         // dma-bufs exported for scanout from this file hold its objects alive.
         self.forget_scanout_file(handle);
 
+        self.fences.remove(&handle);
+
         match self.handles.remove(handle) {
             Ok(()) => {
                 log::debug!("close handle={handle}");

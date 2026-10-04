@@ -280,6 +280,21 @@ impl VirtioGpuNvConfig {
         self.features |= protocol::messages::NVGPU_CFG_CURSOR;
     }
 
+    /// Serve Venus (docs/VENUS.md): sets
+    /// [`protocol::messages::NVGPU_CFG_VENUS`]. Only with `--venus`; a guest
+    /// sends `GpuCmd` only when it sees the bit.
+    pub fn set_venus(&mut self) {
+        self.features |= protocol::messages::NVGPU_CFG_VENUS;
+    }
+
+    /// Turn host fences into guest fences (docs/SYNC.md): sets
+    /// [`protocol::messages::NVGPU_CFG_DRM_FENCES`]. Only by a transport that
+    /// delivers one-shot fence watches (`take_watch_updates`); without that
+    /// relay a guest fence would never signal.
+    pub fn set_drm_fences(&mut self) {
+        self.features |= protocol::messages::NVGPU_CFG_DRM_FENCES;
+    }
+
     /// Config space as the bytes a guest reads.
     pub fn as_bytes(&self) -> &[u8] {
         // Safe: `repr(C, packed)` with no padding and no pointers, so every
@@ -449,5 +464,38 @@ mod tests {
             FEATURE_RMCTRL_SEGMENTS | NVGPU_CFG_DISPLAY | protocol::messages::NVGPU_CFG_CURSOR
         );
         assert_eq!(protocol::messages::NVGPU_CFG_CURSOR, 1 << 9);
+    }
+
+    /// Venus is one feature bit, clear unless asked for.
+    #[test]
+    fn venus_is_announced_only_when_set() {
+        use protocol::messages::NVGPU_CFG_VENUS;
+        let mut cfg = VirtioGpuNvConfig::new("615.71.09", &[], crate::caps::Caps::DEFAULT, 0);
+        assert_eq!({ cfg.features } & NVGPU_CFG_VENUS, 0);
+        let before = cfg.as_bytes().to_vec();
+        cfg.set_venus();
+        assert_eq!({ cfg.features }, FEATURE_RMCTRL_SEGMENTS | NVGPU_CFG_VENUS);
+        let at = offset_of!(VirtioGpuNvConfig, features);
+        let changed: Vec<usize> = before
+            .iter()
+            .zip(cfg.as_bytes())
+            .enumerate()
+            .filter(|(_, (x, y))| x != y)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(changed.iter().all(|i| (at..at + 4).contains(i)));
+    }
+
+    /// Fences are one feature bit too, clear unless the transport asks.
+    #[test]
+    fn drm_fences_are_announced_only_when_set() {
+        use protocol::messages::NVGPU_CFG_DRM_FENCES;
+        let mut cfg = VirtioGpuNvConfig::new("615.71.09", &[], crate::caps::Caps::DEFAULT, 0);
+        assert_eq!({ cfg.features } & NVGPU_CFG_DRM_FENCES, 0);
+        cfg.set_drm_fences();
+        assert_eq!(
+            { cfg.features },
+            FEATURE_RMCTRL_SEGMENTS | NVGPU_CFG_DRM_FENCES
+        );
     }
 }

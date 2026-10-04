@@ -1,5 +1,6 @@
 #!/bin/sh
-# Post-install for `conduit-guest` (DKMS source package; shared by .deb and .rpm).
+# Post-install for `conduit-guest` (DKMS source package; shared by .deb, .rpm
+# and the nfpm Arch package, where it is post_install and post_upgrade).
 # Registers the module source with DKMS and builds it for the running kernel.
 # A missing kernel header package is reported, not fatal: DKMS builds the
 # module automatically once headers (and the kernel) are installed.
@@ -58,7 +59,7 @@ for KVER in $(uname -r) $(ls /lib/modules 2>/dev/null); do
             echo "$NAME: DKMS build for $KVER failed; see /var/lib/dkms/$NAME/$VERSION/build/make.log" >&2
         fi
     elif [ "$KVER" = "$(uname -r)" ] && [ -d "/lib/modules/$KVER/kernel" ]; then
-        echo "$NAME: no headers for $KVER (install linux-headers-$KVER / kernel-devel), module will build on next kernel install." >&2
+        echo "$NAME: no headers for $KVER (install linux-headers-$KVER / kernel-devel / linux-headers on Arch), module will build on next kernel install." >&2
     fi
 done
 [ "$chroot" = 1 ] && exit 0

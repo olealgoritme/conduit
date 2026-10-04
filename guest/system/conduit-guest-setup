@@ -121,10 +121,19 @@ case "$lang" in
         case "$lang" in C.*|POSIX.*) need_locale=1 ;; *) need_locale=0 ;; esac ;;
     *) need_locale=1 ;;
 esac
+# Fedora, Arch and others keep LANG in /etc/locale.conf.
+set_locale_conf() {
+    if [ -f /etc/locale.conf ] && grep -q '^LANG=' /etc/locale.conf; then
+        sed -i "s/^LANG=.*/LANG=$LOCALE/" /etc/locale.conf
+    else
+        echo "LANG=$LOCALE" >> /etc/locale.conf
+    fi
+}
 if [ "$need_locale" = 1 ]; then
     if command -v locale-gen >/dev/null 2>&1; then
-        # Debian/Ubuntu (the locales package). Debian's locale-gen builds what
-        # /etc/locale.gen lists; Ubuntu's takes the locale as an argument.
+        # Debian/Ubuntu (the locales package) and Arch (glibc). Debian's and
+        # Arch's locale-gen build what /etc/locale.gen lists; Ubuntu's takes
+        # the locale as an argument.
         if [ -f /etc/locale.gen ] && ! grep -q "^[[:space:]]*${LOCALE}[[:space:]]\+UTF-8" /etc/locale.gen; then
             if grep -q "^#[[:space:]]*${LOCALE}[[:space:]]\+UTF-8" /etc/locale.gen; then
                 sed -i "s/^#[[:space:]]*\(${LOCALE}[[:space:]]\+UTF-8\)/\1/" /etc/locale.gen
@@ -135,19 +144,17 @@ if [ "$need_locale" = 1 ]; then
         locale-gen "$LOCALE" >/dev/null 2>&1 || true
         if command -v update-locale >/dev/null 2>&1; then
             update-locale "LANG=$LOCALE" 2>/dev/null || echo "LANG=$LOCALE" > /etc/default/locale
-        else
+        elif [ -f /etc/debian_version ]; then
             echo "LANG=$LOCALE" > /etc/default/locale
+        else
+            set_locale_conf
         fi
         say "default locale set to $LOCALE (was ${lang:-unset}); takes effect at the next login"
     elif command -v localedef >/dev/null 2>&1; then
         # Fedora, Arch and others: /etc/locale.conf.
         locale -a 2>/dev/null | grep -qix 'en_US.utf8' ||
             localedef -i en_US -f UTF-8 "$LOCALE" 2>/dev/null || true
-        if [ -f /etc/locale.conf ] && grep -q '^LANG=' /etc/locale.conf; then
-            sed -i "s/^LANG=.*/LANG=$LOCALE/" /etc/locale.conf
-        else
-            echo "LANG=$LOCALE" >> /etc/locale.conf
-        fi
+        set_locale_conf
         say "default locale set to $LOCALE (was ${lang:-unset}); takes effect at the next login"
     fi
 fi

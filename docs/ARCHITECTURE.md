@@ -83,7 +83,7 @@ it over a Unix socket (the broker protocol,
   frames with NVENC and serves Moonlight (GameStream) clients or a remote
   Conduit viewer ([STREAMING.md](STREAMING.md)).
 
-Details: [SCANOUT.md](SCANOUT.md), [CLIPBOARD.md](CLIPBOARD.md).
+Details: [SCANOUT.md](SCANOUT.md), [CLIPBOARD.md](CLIPBOARD.md), [SYNC.md](SYNC.md) (GPU fences).
 
 ## Runners and libvirt
 

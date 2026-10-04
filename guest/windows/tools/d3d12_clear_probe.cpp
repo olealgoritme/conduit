@@ -1,0 +1,880 @@
+// d3d12_clear_probe.cpp -- D12-G8 rung 0: headless pixel correctness through the
+// D3D12 DDI, with no swapchain and no present path involved.
+//
+// `GATES.md` 4.9 names this probe as rung 0 and states why it must not be
+// skipped: *"a failure at rung 1 with no rung-0 result cannot be attributed."*
+// Rung 1 puts a triangle on the composed desktop, which is DWM, the flip path,
+// the KMD's scanout and `helios_paintcap` all at once. This probe is the control
+// for every one of those: it renders into an offscreen texture, copies it back to
+// CPU memory, and compares an integer. If rung 0 passes and rung 1 does not, the
+// defect is in presentation. If rung 0 fails, nothing downstream is worth reading.
+//
+// ASCII only, on purpose: this file lives on the Z:\ 9p share, which the VM's
+// tooling reads as ANSI.
+//
+// Build (on the VM, from an x64 developer prompt):
+//   cl /nologo /EHsc /W4 Z:\tools\d3d12_clear_probe.cpp
+//      /Fe:C:\Users\Rupansh\d12g8\clear.exe
+//      /link d3d12.lib dxgi.lib dxguid.lib
+//
+// Usage:
+//   clear.exe                        Helios, report only, exit 0
+//   clear.exe --expect ok            exit 0 iff the readback pixel is exact
+//   clear.exe --adapter warp         the CONTROL arm -- see below
+//   clear.exe --sentinel             stamp the readback buffer first -- see kSentinel
+//   clear.exe --settle 2000          re-survey after N ms, and again after a remap
+//   clear.exe --debug-layer          EnableDebugLayer + drain ID3D12InfoQueue
+//
+// == WHY --settle EXISTS ==
+//
+// The D3D12 DDI has no `pfnGetCompletedFenceValue` and no
+// `pfnSetEventOnCompletion`: the runtime services the application's
+// `ID3D12Fence` itself, and `umd12` makes no kernel submission at all
+// (`EclNoWddmSubmission=1`). vkd3d's `ExecuteCommandLists` only ENQUEUES; the
+// real `vkQueueSubmit2` happens later, on a worker thread. So the application's
+// fence can complete with NO causal dependency on the engine's Vulkan work, and
+// an all-sentinel readback then has a second reading the first round did not
+// separate:
+//
+//   * the work never lands            -> the buffer is still the sentinel, for
+//                                        ever, however long you wait;
+//   * the work lands LATE             -> the buffer is the sentinel at T+0 and
+//                                        the correct pixels a moment later.
+//
+// `--settle <ms>` sleeps and re-surveys, twice: once through the SAME still-live
+// mapping (which answers "did the bytes appear in memory the CPU already sees?")
+// and once after an Unmap/Map pair. The remap is not ceremony: vkd3d issues
+// `vkInvalidateMappedMemoryRanges` inside `ID3D12Resource::Map`, and the
+// heap-scoped D3D12 DDI only reaches that on a fresh `pfnMapHeap`. A buffer that
+// is correct only after the remap is a COHERENCY finding; correct after the
+// sleep alone is a pure ORDERING finding; still sentinel after both is a dead
+// path.
+//
+// ! The settle surveys are DIAGNOSTIC ONLY. `--expect ok` still grades the T+0
+//   survey and nothing else -- a late arrival is a failure with a mechanism, not
+//   a pass.
+//
+// == WHY THERE ARE NO SHADERS IN HERE ==
+//
+// Deliberate, and it is the same argument `GATES.md` 4.9 makes for running
+// `HelloWindow` before `HelloTriangle`: *"it has no shaders at all, so it
+// isolates device/queue/present from the DXIL path entirely."* A clear is the
+// smallest operation that still produces a pixel a human can check against a
+// number, and it needs no PSO, no root signature, no DXIL and no vertex data. So
+// a failure here cannot be the shader path, and that is most of what makes the
+// result attributable.
+//
+// == WHAT IT ACTUALLY EXERCISES, which is most of the driver ==
+//
+//   CreateCommandQueue      -- and with it the WDDM context, which the runtime
+//                              permits to be minted NOWHERE ELSE. Until this
+//                              probe runs, `QueueContextFailed` reads 0 because
+//                              no D3D12 queue has ever existed on this adapter,
+//                              not because queue creation works.
+//   CreateCommandAllocator  -- pfnCreateCommandPool + the recorder that gives it
+//                              a class at first bind
+//   CreateCommandList       -- and pfnSetCommandListDDITableCb, whose hRTTable
+//                              index has never been exercised either
+//   CreateDescriptorHeap, GetCPUDescriptorHandleForHeapStart, CreateRenderTargetView
+//   CreateCommittedResource -- pfnCreateHeapAndResource, both arms
+//   Reset / Close           -- the list-lifetime pair
+//   ClearRenderTargetView   -- the pixel this probe is about
+//   ResourceBarrier         -- the legacy arm, which is the one the shipping caps
+//                              select
+//   CopyTextureRegion       -- with a placed footprint, i.e. the DDI's
+//                              texture-copy-location union in both forms
+//   ExecuteCommandLists     -- the only submission entry point in the baseline set
+//   CreateFence, Signal, SetEventOnCompletion
+//   Map / Unmap             -- pfnMapHeap on a READBACK heap
+//
+// == THE CONTROL ARM ==
+//
+// `--adapter warp` runs the identical sequence against the Microsoft Basic
+// Render Driver. It answers the one question a failing run cannot otherwise
+// separate: *is the probe wrong, or is the driver?* WARP is a known-good D3D12
+// implementation on this same machine and this same runtime, so a WARP failure is
+// a probe bug and a Helios-only failure is a driver bug. Run it once when the
+// probe is new or when the result is surprising; it costs a second.
+//
+// == THE NUMBER ==
+//
+// The clear colour is `GATES.md` 4.9's, taken from the dx-samples HelloWindow so
+// that rung 0 and rung 2 are comparable without a second constant:
+//
+//     float  { 0.0f, 0.2f, 0.4f, 1.0f }   in DXGI_FORMAT_R8G8B8A8_UNORM
+//     8-bit  (0, 51, 102, 255)
+//
+// 0.2 * 255 = 51.0 and 0.4 * 255 = 102.0 both land exactly on integers, so there
+// is no rounding slack to argue about and PASS means EXACT. A +/-1 result is
+// reported as a SOFT PASS with the deviation printed, because a one-LSB error is
+// a real finding about the format conversion and must not be silently absorbed;
+// anything wider fails.
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
+#include <d3d12.h>
+// ! ID3D12Debug and ID3D12InfoQueue live HERE, not in d3d12.h -- only the
+//   D3D12GetDebugInterface entry point is declared there. Including it after
+//   windows.h is deliberate: winuser.h's `#define GetMessage GetMessageW` is
+//   then in force for the interface DECLARATION as well as for our call site,
+//   so both rename together and the call resolves.
+#include <d3d12sdklayers.h>
+#include <dxgi1_6.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cwchar>
+
+namespace {
+
+const wchar_t* kHeliosDescription = L"Helios";
+
+// The render target. Small on purpose: the whole point is one exact pixel, and a
+// 256x256 R8G8B8A8 surface is 256 KB, which keeps the readback copy trivial while
+// still being large enough that the copy has a non-degenerate row pitch to get
+// wrong (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT is 256, and 256 * 4 = 1024, so the
+// footprint pitch and the natural pitch coincide -- see the note at the readback).
+const UINT kWidth = 256;
+const UINT kHeight = 256;
+const DXGI_FORMAT kFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+const FLOAT kClearColour[4] = {0.0f, 0.2f, 0.4f, 1.0f};
+const BYTE kExpectR = 0;
+const BYTE kExpectG = 51;
+const BYTE kExpectB = 102;
+const BYTE kExpectA = 255;
+
+enum class Expect { Report, Ok };
+enum class Which { Helios, Warp };
+
+// `--sentinel` fills the readback buffer with this byte from the CPU BEFORE the
+// GPU work is recorded, and reports what survived.
+//
+// ⭐ It exists to split the one failure a plain readback cannot attribute. An
+// all-zero result has two completely different causes and the same appearance:
+//
+//   * the GPU work did not land   -> the buffer still holds what the CPU last
+//                                    wrote, i.e. the SENTINEL;
+//   * the second Map handed back memory that is not the buffer (a driver
+//     `pfnMapHeap` defect) -> the sentinel is GONE and the read is zeros,
+//                             because it is fresh, zeroed memory.
+//
+// One byte pattern separates them, and it needs no debugger, no host-side
+// capture and no second machine. ⚠ Off by default: it writes to a READBACK heap,
+// which is legal (the memory is CPU-accessible) but is not what the gate is
+// measuring, so the gate's arm must stay the plain one.
+const BYTE kSentinel = 0xAB;
+
+void print_hr(const char* what, HRESULT hr) {
+    printf("%-38s hr=0x%08lX\n", what, static_cast<unsigned long>(hr));
+}
+
+// Every step reports its own HRESULT and the first failure stops the run. A probe
+// that carries on after a failed create reports a second, derived failure and
+// hides which step was the real one.
+bool step(const char* what, HRESULT hr) {
+    print_hr(what, hr);
+    return SUCCEEDED(hr);
+}
+
+template <typename T>
+void release(T*& p) {
+    if (p) {
+        p->Release();
+        p = nullptr;
+    }
+}
+
+// The result of one pass over the readback buffer. Returned rather than printed
+// only, because `--settle` compares passes against each other: a T+0 that is
+// wrong and a +2000 ms that is exact is the LATE ARRIVAL finding, and that
+// comparison needs numbers, not stdout.
+struct SurveyResult {
+    UINT64 exact;
+    UINT64 near_miss;
+    UINT64 wrong;
+    UINT64 still_sentinel;
+    bool have_first_wrong;
+    UINT first_wrong_x;
+    UINT first_wrong_y;
+    BYTE first_wrong[4];
+};
+
+// ! ONE implementation, called up to three times. A second, hand-copied
+//   comparison for the settle passes would be a way for the three answers to
+//   disagree for a reason that is not the driver.
+SurveyResult survey(const BYTE* base, UINT row_pitch, UINT64 readback_bytes, bool sentinel,
+                    const char* label) {
+    SurveyResult r = {};
+
+    printf("\n---- %s ----\n", label);
+
+    // The attribution, when `--sentinel` is on. Counted over the whole buffer so
+    // a partial copy is visible as a mixture rather than rounded to one of the
+    // two stories.
+    if (sentinel) {
+        UINT64 zeroed = 0;
+        UINT64 other = 0;
+        for (UINT64 i = 0; i < readback_bytes; ++i) {
+            if (base[i] == kSentinel) {
+                ++r.still_sentinel;
+            } else if (base[i] == 0) {
+                ++zeroed;
+            } else {
+                ++other;
+            }
+        }
+        printf("sentinel survey: %llu still 0x%02X, %llu zeroed, %llu other (of %llu)\n",
+               static_cast<unsigned long long>(r.still_sentinel), kSentinel,
+               static_cast<unsigned long long>(zeroed),
+               static_cast<unsigned long long>(other),
+               static_cast<unsigned long long>(readback_bytes));
+        if (r.still_sentinel == readback_bytes) {
+            printf("  => the mapping is COHERENT and the GPU work has NOT landed (yet).\n");
+            printf("     Look at recording and submission, not at pfnMapHeap.\n");
+        } else if (zeroed == readback_bytes) {
+            printf("  => this Map returned memory that is NOT the buffer the CPU wrote: the\n");
+            printf("     sentinel is gone and the read is fresh zeros. This is a pfnMapHeap /\n");
+            printf("     heap-identity defect, not a rendering one.\n");
+        } else if (other > 0) {
+            printf("  => mixed: some bytes are neither the sentinel nor zero, so real GPU\n");
+            printf("     output reached this buffer.\n");
+        }
+    }
+
+    const BYTE* pixel0 = base;
+    printf("pixel(0,0)  = (%u, %u, %u, %u)\n", pixel0[0], pixel0[1], pixel0[2], pixel0[3]);
+    printf("expected    = (%u, %u, %u, %u)\n", kExpectR, kExpectG, kExpectB, kExpectA);
+
+    // Not only pixel 0. A clear that wrote one pixel, or wrote the first row and
+    // stopped, or ignored the row pitch, all pass a single-pixel check. Sweeping
+    // the whole surface costs nothing here and turns three different
+    // partial-write bugs into a count.
+    for (UINT y = 0; y < kHeight; ++y) {
+        const BYTE* row = base + static_cast<UINT64>(y) * row_pitch;
+        for (UINT x = 0; x < kWidth; ++x) {
+            const BYTE* p = row + static_cast<UINT64>(x) * 4;
+            const int dr = static_cast<int>(p[0]) - static_cast<int>(kExpectR);
+            const int dg = static_cast<int>(p[1]) - static_cast<int>(kExpectG);
+            const int db = static_cast<int>(p[2]) - static_cast<int>(kExpectB);
+            const int da = static_cast<int>(p[3]) - static_cast<int>(kExpectA);
+            if (dr == 0 && dg == 0 && db == 0 && da == 0) {
+                ++r.exact;
+            } else if (dr >= -1 && dr <= 1 && dg >= -1 && dg <= 1 && db >= -1 && db <= 1 &&
+                       da >= -1 && da <= 1) {
+                ++r.near_miss;
+            } else {
+                ++r.wrong;
+                if (!r.have_first_wrong) {
+                    r.first_wrong[0] = p[0];
+                    r.first_wrong[1] = p[1];
+                    r.first_wrong[2] = p[2];
+                    r.first_wrong[3] = p[3];
+                    r.first_wrong_x = x;
+                    r.first_wrong_y = y;
+                    r.have_first_wrong = true;
+                }
+            }
+        }
+    }
+    const UINT64 total = static_cast<UINT64>(kWidth) * kHeight;
+    printf("surface     = %llu exact, %llu within +/-1, %llu wrong (of %llu)\n",
+           static_cast<unsigned long long>(r.exact),
+           static_cast<unsigned long long>(r.near_miss),
+           static_cast<unsigned long long>(r.wrong),
+           static_cast<unsigned long long>(total));
+    if (r.have_first_wrong) {
+        printf("first wrong at (%u, %u) = (%u, %u, %u, %u)\n",
+               r.first_wrong_x, r.first_wrong_y,
+               r.first_wrong[0], r.first_wrong[1], r.first_wrong[2], r.first_wrong[3]);
+    }
+    return r;
+}
+
+// Both call sites print it the same way, and both matter: a device that is
+// already removed explains a fence that returns instantly, and one that is NOT
+// removed forbids that explanation.
+void print_removed_reason(ID3D12Device* device, const char* when) {
+    printf("%-38s 0x%08lX  (%s)\n", "GetDeviceRemovedReason",
+           static_cast<unsigned long>(device->GetDeviceRemovedReason()), when);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    Expect expect = Expect::Report;
+    Which which = Which::Helios;
+    bool sentinel = false;
+    unsigned settle_ms = 0;
+    bool debug_layer = false;
+
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--expect") == 0 && i + 1 < argc) {
+            ++i;
+            if (std::strcmp(argv[i], "ok") == 0) {
+                expect = Expect::Ok;
+            } else {
+                printf("FAIL: --expect takes 'ok', got '%s'\n", argv[i]);
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--adapter") == 0 && i + 1 < argc) {
+            ++i;
+            if (std::strcmp(argv[i], "helios") == 0) {
+                which = Which::Helios;
+            } else if (std::strcmp(argv[i], "warp") == 0) {
+                which = Which::Warp;
+            } else {
+                printf("FAIL: --adapter takes 'helios' or 'warp', got '%s'\n", argv[i]);
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--sentinel") == 0) {
+            sentinel = true;
+        } else if (std::strcmp(argv[i], "--settle") == 0 && i + 1 < argc) {
+            ++i;
+            const long ms = std::atol(argv[i]);
+            if (ms < 0 || ms > 600000) {
+                printf("FAIL: --settle takes 0..600000 ms, got '%s'\n", argv[i]);
+                return 2;
+            }
+            settle_ms = static_cast<unsigned>(ms);
+        } else if (std::strcmp(argv[i], "--debug-layer") == 0) {
+            debug_layer = true;
+        } else {
+            printf("FAIL: unrecognised argument '%s'\n", argv[i]);
+            return 2;
+        }
+    }
+
+    printf("d3d12_clear_probe: adapter=%s expect=%s sentinel=%s settle=%ums debugLayer=%s\n",
+           which == Which::Warp ? "WARP (control)" : "Helios",
+           expect == Expect::Ok ? "ok" : "report",
+           sentinel ? "on" : "off",
+           settle_ms,
+           debug_layer ? "on" : "off");
+    printf("target %ux%u R8G8B8A8_UNORM, clear {%.1f, %.1f, %.1f, %.1f} -> (%u, %u, %u, %u)\n\n",
+           kWidth, kHeight,
+           kClearColour[0], kClearColour[1], kClearColour[2], kClearColour[3],
+           kExpectR, kExpectG, kExpectB, kExpectA);
+
+    // ---- optional: the debug layer, which must be enabled BEFORE any device
+    // exists or it does not apply to it.
+    //
+    // ! Fails soft on purpose. The layer ships in the "Graphics Tools" optional
+    //   feature, so its absence is a configuration fact about this VM and not a
+    //   result about the driver; a probe that aborted here would lose the run it
+    //   was asked to make.
+    ID3D12Debug* debug = nullptr;
+    if (debug_layer) {
+        HRESULT dbg = D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
+        if (SUCCEEDED(dbg) && debug) {
+            debug->EnableDebugLayer();
+            printf("%-38s enabled\n", "D3D12 debug layer");
+        } else {
+            printf("debug layer unavailable hr=0x%08lX -- continuing without it\n",
+                   static_cast<unsigned long>(dbg));
+            release(debug);
+        }
+    }
+
+    IDXGIFactory4* factory = nullptr;
+    if (!step("CreateDXGIFactory2", CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
+        return 2;
+    }
+
+    IDXGIAdapter1* adapter = nullptr;
+    DXGI_ADAPTER_DESC1 adapter_desc = {};
+    if (which == Which::Warp) {
+        IDXGIAdapter* warp = nullptr;
+        if (!step("EnumWarpAdapter", factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)))) {
+            release(factory);
+            return 2;
+        }
+        HRESULT qi = warp->QueryInterface(IID_PPV_ARGS(&adapter));
+        release(warp);
+        if (!step("QueryInterface(IDXGIAdapter1)", qi)) {
+            release(factory);
+            return 2;
+        }
+        adapter->GetDesc1(&adapter_desc);
+    } else {
+        for (UINT i = 0;; ++i) {
+            IDXGIAdapter1* candidate = nullptr;
+            if (factory->EnumAdapters1(i, &candidate) == DXGI_ERROR_NOT_FOUND) {
+                break;
+            }
+            DXGI_ADAPTER_DESC1 desc = {};
+            candidate->GetDesc1(&desc);
+            if (!adapter && std::wcsstr(desc.Description, kHeliosDescription) != nullptr) {
+                adapter = candidate;
+                adapter_desc = desc;
+                continue;
+            }
+            candidate->Release();
+        }
+        if (!adapter) {
+            printf("FAIL: no adapter whose description contains '%ws'\n", kHeliosDescription);
+            release(factory);
+            return 2;
+        }
+    }
+    printf("%-38s %ws (luid=%08lX:%08lX)\n\n",
+           "adapter",
+           adapter_desc.Description,
+           static_cast<unsigned long>(adapter_desc.AdapterLuid.HighPart),
+           static_cast<unsigned long>(adapter_desc.AdapterLuid.LowPart));
+
+    // Everything below is one straight line of D3D12 with no branches, so the
+    // printed HRESULT trace IS the list of DDIs that were reached. A gate reading
+    // this file wants to know how far it got, not only whether it finished.
+    ID3D12Device* device = nullptr;
+    ID3D12CommandQueue* queue = nullptr;
+    ID3D12CommandAllocator* allocator = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12DescriptorHeap* rtv_heap = nullptr;
+    ID3D12Resource* target = nullptr;
+    ID3D12Resource* readback = nullptr;
+    ID3D12Fence* fence = nullptr;
+    ID3D12InfoQueue* info_queue = nullptr;
+    HANDLE fence_event = nullptr;
+    int rc = 2;
+    // Kept outside the loop so the epilogue can grade them after every `break`.
+    SurveyResult t0_survey = {};
+    SurveyResult settled_survey = {};
+    SurveyResult remap_survey = {};
+    bool have_t0 = false;
+    bool have_settled = false;
+    bool have_remap = false;
+
+    do {
+        if (!step("D3D12CreateDevice(FL 11_0)",
+                  D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) {
+            break;
+        }
+
+        // The info queue is a QI on the device and only exists when the debug
+        // layer is live. It is drained at the very end, not here, so that the
+        // messages a failing run produces are all in one block.
+        if (debug_layer) {
+            HRESULT iq = device->QueryInterface(IID_PPV_ARGS(&info_queue));
+            printf("%-38s hr=0x%08lX %s\n", "QueryInterface(ID3D12InfoQueue)",
+                   static_cast<unsigned long>(iq),
+                   SUCCEEDED(iq) ? "" : "-- no per-message detail this run");
+            if (FAILED(iq)) {
+                info_queue = nullptr;
+            }
+        }
+
+        // The queue, and with it the WDDM context. This is the first D3D12 queue
+        // this adapter has ever been asked for.
+        D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+        queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+        if (!step("CreateCommandQueue(DIRECT)",
+                  device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)))) {
+            break;
+        }
+        if (!step("CreateCommandAllocator(DIRECT)",
+                  device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                 IID_PPV_ARGS(&allocator)))) {
+            break;
+        }
+        if (!step("CreateCommandList(DIRECT)",
+                  device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator,
+                                            nullptr, IID_PPV_ARGS(&list)))) {
+            break;
+        }
+
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+        heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        heap_desc.NumDescriptors = 1;
+        heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        if (!step("CreateDescriptorHeap(RTV)",
+                  device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap)))) {
+            break;
+        }
+
+        D3D12_HEAP_PROPERTIES default_heap = {};
+        default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC target_desc = {};
+        target_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        target_desc.Width = kWidth;
+        target_desc.Height = kHeight;
+        target_desc.DepthOrArraySize = 1;
+        target_desc.MipLevels = 1;
+        target_desc.Format = kFormat;
+        target_desc.SampleDesc.Count = 1;
+        target_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        target_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+        // ⚠ The optimized clear value MUST match the colour actually cleared to,
+        // or the debug layer flags it and some drivers take a slow path. Passing
+        // it also exercises the DDI's D3D12DDI_CLEAR_VALUE, which a null would
+        // skip entirely.
+        D3D12_CLEAR_VALUE clear_value = {};
+        clear_value.Format = kFormat;
+        std::memcpy(clear_value.Color, kClearColour, sizeof(kClearColour));
+
+        // Created directly in RENDER_TARGET state, so the clear needs no barrier
+        // before it. One barrier in this probe, not two, and the one that is here
+        // is the one the copy requires.
+        if (!step("CreateCommittedResource(target)",
+                  device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE,
+                                                  &target_desc,
+                                                  D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                  &clear_value, IID_PPV_ARGS(&target)))) {
+            break;
+        }
+
+        // The footprint the copy must use. ⛔ Asked for rather than computed: the
+        // row pitch is the runtime's answer and hard-coding `width * 4` is how a
+        // readback silently reads the wrong bytes on any format or alignment this
+        // probe did not anticipate.
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+        UINT64 readback_bytes = 0;
+        UINT rows = 0;
+        UINT64 row_bytes = 0;
+        device->GetCopyableFootprints(&target_desc, 0, 1, 0, &footprint, &rows, &row_bytes,
+                                      &readback_bytes);
+        printf("%-38s pitch=%u rows=%u rowBytes=%llu total=%llu\n",
+               "GetCopyableFootprints",
+               footprint.Footprint.RowPitch, rows,
+               static_cast<unsigned long long>(row_bytes),
+               static_cast<unsigned long long>(readback_bytes));
+        if (readback_bytes == 0 || footprint.Footprint.RowPitch == 0 || rows == 0) {
+            printf("FAIL: GetCopyableFootprints returned a degenerate footprint.\n");
+            break;
+        }
+
+        D3D12_HEAP_PROPERTIES readback_heap = {};
+        readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC readback_desc = {};
+        readback_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        readback_desc.Width = readback_bytes;
+        readback_desc.Height = 1;
+        readback_desc.DepthOrArraySize = 1;
+        readback_desc.MipLevels = 1;
+        readback_desc.Format = DXGI_FORMAT_UNKNOWN;
+        readback_desc.SampleDesc.Count = 1;
+        readback_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (!step("CreateCommittedResource(readback)",
+                  device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE,
+                                                  &readback_desc,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  IID_PPV_ARGS(&readback)))) {
+            break;
+        }
+
+        // ---- optional: stamp the readback buffer from the CPU, before any GPU
+        // work exists to overwrite it. See `kSentinel`.
+        //
+        // ! Its POINTER is kept. The probe used to map twice and never compare
+        //   the two addresses, which left "the read map is a different buffer"
+        //   as an unfalsifiable story told from the byte values alone.
+        void* pre_ptr = nullptr;
+        if (sentinel) {
+            void* pre = nullptr;
+            D3D12_RANGE none = {0, 0};
+            if (!step("Map(readback, pre-fill)", readback->Map(0, &none, &pre)) || !pre) {
+                break;
+            }
+            pre_ptr = pre;
+            printf("%-38s ptr=0x%016llX\n", "Map(readback, pre-fill)",
+                   reinterpret_cast<unsigned long long>(pre));
+            std::memset(pre, kSentinel, static_cast<size_t>(readback_bytes));
+            D3D12_RANGE all = {0, static_cast<SIZE_T>(readback_bytes)};
+            readback->Unmap(0, &all);
+            printf("%-38s wrote 0x%02X over %llu bytes\n",
+                   "sentinel pre-fill",
+                   kSentinel,
+                   static_cast<unsigned long long>(readback_bytes));
+        }
+
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        printf("%-38s ptr=0x%016llX increment=%u\n",
+               "RTV heap start",
+               static_cast<unsigned long long>(rtv.ptr),
+               device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV));
+        if (rtv.ptr == 0) {
+            // vkd3d always assigns a real host pointer to a heap's cpu_va, so a
+            // zero here is a truncation across the by-value struct return and not
+            // the engine's answer. Named because it is the one failure this whole
+            // handle scheme was flagged as vulnerable to.
+            printf("FAIL: GetCPUDescriptorHandleForHeapStart returned 0 -- the by-value\n");
+            printf("      struct return is truncating. See descriptors.rs HAZARD 1.\n");
+            break;
+        }
+        device->CreateRenderTargetView(target, nullptr, rtv);
+
+        // ---- record ----
+        list->ClearRenderTargetView(rtv, kClearColour, 0, nullptr);
+
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = target;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        list->ResourceBarrier(1, &barrier);
+
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource = readback;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = footprint;
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource = target;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+        if (!step("Close", list->Close())) {
+            break;
+        }
+
+        // ---- submit and wait ----
+        ID3D12CommandList* lists[] = {list};
+        queue->ExecuteCommandLists(1, lists);
+
+        if (!step("CreateFence", device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                                    IID_PPV_ARGS(&fence)))) {
+            break;
+        }
+        fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!fence_event) {
+            printf("FAIL: CreateEventW returned NULL (GetLastError=%lu)\n", GetLastError());
+            break;
+        }
+        if (!step("CommandQueue::Signal", queue->Signal(fence, 1))) {
+            break;
+        }
+        if (!step("SetEventOnCompletion", fence->SetEventOnCompletion(1, fence_event))) {
+            break;
+        }
+        // ⚠ Bounded. An unbounded wait on a driver under bring-up is a hung gate
+        // with no output, which is strictly worse than a reported timeout -- and a
+        // frozen run is a defect to root-cause, never a retry.
+        //
+        // ! TIMED. The DDI has no `pfnGetCompletedFenceValue` and no
+        //   `pfnSetEventOnCompletion` -- the runtime services this fence itself
+        //   -- so the duration is evidence in its own right. A wait that returns
+        //   in a few microseconds did not wait for a GPU; it observed a value
+        //   that was already there.
+        const DWORD kTimeoutMs = 20000;
+        LARGE_INTEGER qpf = {};
+        LARGE_INTEGER wait_begin = {};
+        LARGE_INTEGER wait_end = {};
+        QueryPerformanceFrequency(&qpf);
+        QueryPerformanceCounter(&wait_begin);
+        DWORD waited = WaitForSingleObject(fence_event, kTimeoutMs);
+        QueryPerformanceCounter(&wait_end);
+        const double wait_us =
+            qpf.QuadPart
+                ? static_cast<double>(wait_end.QuadPart - wait_begin.QuadPart) * 1000000.0 /
+                      static_cast<double>(qpf.QuadPart)
+                : -1.0;
+        printf("%-38s %s in %.1f us (completed=%llu)\n",
+               "WaitForSingleObject",
+               waited == WAIT_OBJECT_0 ? "signalled" : (waited == WAIT_TIMEOUT ? "TIMEOUT" : "?"),
+               wait_us,
+               static_cast<unsigned long long>(fence->GetCompletedValue()));
+        print_removed_reason(device, "after the fence wait");
+        if (waited != WAIT_OBJECT_0) {
+            printf("FAIL: the GPU did not complete within %lu ms. This is a defect to\n",
+                   static_cast<unsigned long>(kTimeoutMs));
+            printf("      root-cause, not a run to retry.\n");
+            break;
+        }
+
+        // ---- read back ----
+        void* mapped = nullptr;
+        D3D12_RANGE read_range = {0, static_cast<SIZE_T>(readback_bytes)};
+        if (!step("Map(readback)", readback->Map(0, &read_range, &mapped)) || !mapped) {
+            break;
+        }
+        printf("%-38s ptr=0x%016llX\n", "Map(readback)",
+               reinterpret_cast<unsigned long long>(mapped));
+        if (sentinel) {
+            printf("%-38s %s\n", "  pre-fill ptr vs read ptr",
+                   pre_ptr == mapped ? "EQUAL -- the same mapping came back"
+                                     : "DIFFERENT -- the two Maps are different addresses");
+        }
+
+        const BYTE* base = static_cast<const BYTE*>(mapped);
+        const UINT64 total = static_cast<UINT64>(kWidth) * kHeight;
+
+        t0_survey = survey(base, footprint.Footprint.RowPitch, readback_bytes, sentinel,
+                           "survey @ T+0 (immediately after the fence wait)");
+        have_t0 = true;
+
+        // ---- optional: does it arrive LATE? ----
+        //
+        // ! Diagnostic only. `rc` below is decided by `t0_survey` and by nothing
+        //   here; a late arrival is a failure WITH A MECHANISM, not a pass.
+        if (settle_ms != 0) {
+            printf("\n--settle %u: sleeping, then re-reading the SAME mapping...\n", settle_ms);
+            Sleep(settle_ms);
+            char label[96];
+            _snprintf_s(label, sizeof(label), _TRUNCATE, "survey @ +%ums (same mapping)",
+                        settle_ms);
+            settled_survey =
+                survey(base, footprint.Footprint.RowPitch, readback_bytes, sentinel, label);
+            have_settled = true;
+
+            // The remap is not ceremony. vkd3d calls
+            // `vkInvalidateMappedMemoryRanges` inside `ID3D12Resource::Map`, and
+            // on a heap-scoped D3D12 DDI that invalidate is only reached through
+            // a fresh `pfnMapHeap`. If the bytes are in host memory but this
+            // process's view of them is stale, THIS is the pass that shows it.
+            D3D12_RANGE nothing_written = {0, 0};
+            readback->Unmap(0, &nothing_written);
+            void* remapped = nullptr;
+            if (!step("Map(readback, remap)", readback->Map(0, &read_range, &remapped)) ||
+                !remapped) {
+                printf("FAIL: the remap did not return a pointer; no post-remap survey.\n");
+                break;
+            }
+            printf("%-38s ptr=0x%016llX\n", "remap", reinterpret_cast<unsigned long long>(remapped));
+            printf("%-38s %s\n", "  read ptr vs remap ptr",
+                   remapped == mapped ? "EQUAL -- the same address was handed back"
+                                      : "DIFFERENT -- the remap moved the mapping");
+            mapped = remapped;
+            base = static_cast<const BYTE*>(remapped);
+            remap_survey =
+                survey(base, footprint.Footprint.RowPitch, readback_bytes, sentinel,
+                       "survey after remap (Unmap + Map, i.e. a fresh pfnMapHeap)");
+            have_remap = true;
+        }
+
+        D3D12_RANGE written = {0, 0};
+        readback->Unmap(0, &written);
+
+        const UINT64 exact = t0_survey.exact;
+        const UINT64 near_miss = t0_survey.near_miss;
+        const UINT64 wrong = t0_survey.wrong;
+
+        if (exact == total) {
+            printf("\nPASS: every one of %llu pixels is exactly (%u, %u, %u, %u).\n",
+                   static_cast<unsigned long long>(total), kExpectR, kExpectG, kExpectB, kExpectA);
+            rc = 0;
+        } else if (wrong == 0) {
+            printf("\nSOFT PASS: %llu pixels are within +/-1 of the expected value and none is\n",
+                   static_cast<unsigned long long>(near_miss));
+            printf("           further out. A one-LSB deviation is a real finding about the\n");
+            printf("           format conversion -- record it in notes.md, do not absorb it.\n");
+            rc = 0;
+        } else {
+            printf("\nFAIL: %llu pixels are outside +/-1. This is a colour-pipeline defect,\n",
+                   static_cast<unsigned long long>(wrong));
+            printf("      not tolerance. Do NOT widen the tolerance to make it pass.\n");
+            rc = 1;
+        }
+    } while (false);
+
+    // ---- the settle verdict -------------------------------------------------
+    //
+    // ! Printed AFTER the pass/fail line and it does not touch `rc`. This block
+    //   exists to split "the work lands late" from "the work never lands", which
+    //   are the same picture at T+0 and completely different defects.
+    if (have_t0 && (have_settled || have_remap)) {
+        const UINT64 total_px = static_cast<UINT64>(kWidth) * kHeight;
+        const bool t0_ok = (t0_survey.exact == total_px);
+        const bool settled_ok = have_settled && (settled_survey.exact == total_px);
+        const bool remap_ok = have_remap && (remap_survey.exact == total_px);
+
+        printf("\n---- settle verdict ----\n");
+        printf("exact pixels: T+0=%llu", static_cast<unsigned long long>(t0_survey.exact));
+        if (have_settled) {
+            printf("  +%ums=%llu", settle_ms,
+                   static_cast<unsigned long long>(settled_survey.exact));
+        }
+        if (have_remap) {
+            printf("  after-remap=%llu", static_cast<unsigned long long>(remap_survey.exact));
+        }
+        printf("  (of %llu)\n", static_cast<unsigned long long>(total_px));
+
+        if (!t0_ok && (settled_ok || remap_ok)) {
+            printf("*** LATE ARRIVAL: the pixels are correct at +%ums but were not at +0. ***\n",
+                   settle_ms);
+            printf("    The GPU work DOES land. The application's fence completed without a\n");
+            printf("    causal dependency on it -- an ORDERING defect, not a dead path.\n");
+            if (!settled_ok && remap_ok) {
+                printf("    ...and only AFTER the remap, so it is specifically the invalidate:\n");
+                printf("    the bytes were in host memory while this mapping's view was stale.\n");
+            }
+        } else if (!t0_ok) {
+            printf("NO LATE ARRIVAL: still wrong at +%ums and still wrong after a fresh\n",
+                   settle_ms);
+            printf("    pfnMapHeap. Waiting is not the missing ingredient; the work is not\n");
+            printf("    reaching this buffer at all.\n");
+        } else {
+            printf("T+0 was already exact; the settle passes are corroboration only.\n");
+        }
+    }
+
+    if (device) {
+        print_removed_reason(device, "at exit");
+    }
+
+    // ---- the debug layer's own account, if there is one ---------------------
+    if (info_queue) {
+        const UINT64 stored = info_queue->GetNumStoredMessages();
+        printf("\n---- ID3D12InfoQueue: %llu stored message(s) ----\n",
+               static_cast<unsigned long long>(stored));
+        for (UINT64 i = 0; i < stored; ++i) {
+            SIZE_T len = 0;
+            // Two-call idiom: the first asks the size, the second fills it. A
+            // fixed buffer would truncate exactly the long messages that carry
+            // the detail.
+            if (FAILED(info_queue->GetMessage(i, nullptr, &len)) || len == 0) {
+                continue;
+            }
+            D3D12_MESSAGE* msg = static_cast<D3D12_MESSAGE*>(std::malloc(len));
+            if (!msg) {
+                printf("  [%llu] out of memory reading the message\n",
+                       static_cast<unsigned long long>(i));
+                break;
+            }
+            if (SUCCEEDED(info_queue->GetMessage(i, msg, &len))) {
+                printf("  [%llu] cat=%d sev=%d id=%d: %s\n",
+                       static_cast<unsigned long long>(i),
+                       static_cast<int>(msg->Category), static_cast<int>(msg->Severity),
+                       static_cast<int>(msg->ID),
+                       msg->pDescription ? msg->pDescription : "(no description)");
+            }
+            std::free(msg);
+        }
+        if (stored == 0) {
+            printf("  (the debug layer had nothing to say -- an absence, and it is a finding:\n");
+            printf("   no invalid call, no leaked object, no state error was detected.)\n");
+        }
+    }
+
+    if (fence_event) {
+        CloseHandle(fence_event);
+    }
+    release(info_queue);
+    release(debug);
+    release(fence);
+    release(readback);
+    release(target);
+    release(rtv_heap);
+    release(list);
+    release(allocator);
+    release(queue);
+    release(device);
+    release(adapter);
+    release(factory);
+
+    if (expect == Expect::Report) {
+        printf("\nRESULT: rc would be %d (no --expect given, reporting only)\n", rc);
+        return 0;
+    }
+    if (rc != 0) {
+        printf("\nRead C:\\ProgramData\\Helios\\umd12-<pid>.log after the last 'UMD module:'\n");
+        printf("line: 'D3D12 DDI refusals:' names the step and 'D3D12 noop DDI hits:' names\n");
+        printf("every slot that is still a counting noop.\n");
+    }
+    return rc;
+}

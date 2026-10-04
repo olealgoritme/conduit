@@ -15,8 +15,10 @@ conduit/
 │   │              Conduit viewers; NVENC/NVDEC (docs/STREAMING.md).
 │   ├── vmm/       Rust. Small built-in VM runner `conduit-vmm`, the fallback
 │   │              when the bundled QEMU is missing.
-│   └── qemu/      Build script + patches for the bundled QEMU 11.1, the
-│                  default VM runner (`conduit up/view --vmm qemu|builtin`).
+│   ├── qemu/      Build script + patches for the bundled QEMU 11.1, the
+│   │              default VM runner (`conduit up/view --vmm qemu|builtin`).
+│   └── venus/     conduit-venus: Venus renderer process for Windows guests
+│                  (docs/VENUS.md).
 ├── guest/
 │   ├── linux/     C. The guest kernel module, conduit_gpu (virtio GPU, KMS display,
 │   │              input, clipboard device). Packaged with DKMS.
@@ -26,7 +28,8 @@ conduit/
 │   ├── agent/     Python. conduit-clipboard-agent: the desktop session's
 │   │              clipboard <-> /dev/conduit-clipboard.
 │   ├── tests/     Small in-guest test programs (CUDA memory).
-│   └── windows/   Reserved for the Windows guest driver (see ROADMAP).
+│   └── windows/   Helios-derived Windows guest components: KMD, UMDs,
+│                  installer (see guest/windows/HELIOS.md).
 ├── cli/           Rust. The `conduit` command (create / view / up / down / stream /
 │                  remote / trace; libvirt: attach / detach / libvirt enable,
 │                  docs/LIBVIRT.md). cli/assets holds the VM disk build script

@@ -540,6 +540,21 @@ pub trait WindowPlacer: Send {
         let _ = (offset, len);
         Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into())
     }
+
+    /// Put `len` bytes of a Venus blob's descriptor, from its start, at
+    /// `offset` within region 3 (`shm_regions::SHM_ID_VENUS`), read-write.
+    /// The guest chose the offset (docs/VENUS.md). A transport with no
+    /// region 3 says so.
+    fn place_blob(&self, offset: u64, len: u64, fd: RawFd) -> Result<()> {
+        let _ = (offset, len, fd);
+        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into())
+    }
+
+    /// Return a range of region 3 to empty.
+    fn withdraw_blob(&self, offset: u64, len: u64) -> Result<()> {
+        let _ = (offset, len);
+        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into())
+    }
 }
 
 #[cfg(test)]

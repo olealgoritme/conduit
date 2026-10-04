@@ -159,6 +159,9 @@ pub const DEFAULT_SEARCH_PATHS: &[&str] = &[
     "/usr/share/vulkan/implicit_layer.d",
     "/usr/share/vulkansc/icd.d",
     "/usr/share/glvnd/egl_vendor.d",
+    // EGL platform glue (Wayland, GBM, X11): without it a guest Qt or GTK
+    // Wayland client finds no EGL and its GL context fails.
+    "/usr/share/egl/egl_external_platform.d",
     "/usr/share/nvidia",
     "/usr/lib/nvidia",
     "/usr/lib/xorg/modules/drivers",
@@ -533,6 +536,12 @@ fn guest_dir(entry: &Entry, host_path: &Path) -> PathBuf {
                 }
             }
         }
+        // GBM backends (`nvidia-drm_gbm.so`) live in a `gbm` directory next to
+        // the libraries, where libgbm looks for them by DRM driver name; the
+        // guest's GBM_BACKENDS_PATH points at `lib/gbm`.
+        _ if host_path.parent().and_then(Path::file_name) == Some("gbm".as_ref()) => {
+            PathBuf::from("lib/gbm")
+        }
         _ => PathBuf::from("lib"),
     }
 }
@@ -571,9 +580,16 @@ pub fn resolve(
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_else(|| entry.name.clone());
 
+        // A GBM backend is not in the library directory itself but in its
+        // `gbm` subdirectory (`/usr/lib/x86_64-linux-gnu/gbm/nvidia-drm_gbm.so`).
+        let gbm = base.ends_with("_gbm.so");
         match search_paths
             .iter()
-            .map(|d| d.as_ref().join(&base))
+            .flat_map(|d| {
+                let d = d.as_ref();
+                [Some(d.join(&base)), gbm.then(|| d.join("gbm").join(&base))]
+            })
+            .flatten()
             .find(|p| p.exists())
         {
             Some(host_path) => {
@@ -929,6 +945,26 @@ mod tests {
             icd.guest_path.ends_with("vulkan/icd.d/nvidia_icd.json"),
             "an ICD landed at {:?}, where the Vulkan loader will not look",
             icd.guest_path
+        );
+    }
+
+    /// libgbm looks for `<driver>_gbm.so` in its backends directory, not among
+    /// the libraries. Missing it, a guest compositor that allocates through GBM
+    /// (Hyprland) cannot start on the GPU at all.
+    #[test]
+    fn a_gbm_backend_is_found_in_gbm_and_staged_under_lib_gbm() {
+        let dir = TempTree::new(&["lib/gbm/nvidia-drm_gbm.so"]);
+        let entries = parse_manifest(
+            r#"[{"name": "nvidia-drm_gbm.so", "type": "SYMLINK", "category": ["gbm"]}]"#,
+        )
+        .expect("manifest");
+        let (found, missing) =
+            resolve(&entries, &[Capability::Graphics], &[dir.path().join("lib")]);
+        assert!(missing.is_empty(), "not found: {missing:?}");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].guest_path,
+            PathBuf::from("lib/gbm/nvidia-drm_gbm.so")
         );
     }
 

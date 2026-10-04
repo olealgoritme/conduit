@@ -1,0 +1,67 @@
+[package]
+authors = ["WinBoat"]
+name = "helios_umd"
+version = "0.1.0"
+edition = "2021"
+description = "Helios vGPU Direct3D 11 User-Mode Driver"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cxx = "1"
+helios_protocol = { path = "../protocol" }
+# Shared with `umd12` (`DECISIONS.md` D3b). A path `rlib`, not a workspace
+# member — a workspace root would change CARGO_TARGET_DIR semantics for
+# kmd_render. ⚠ `tools/umd-check.ps1` and win_cargo must mirror `umd_common`
+# into the local build mirror or this dependency does not resolve there.
+helios_umd_common = { path = "../umd_common" }
+# `Win32_Graphics_Direct3D_Fxc` is deliberately ABSENT (T6/R909): it pulls
+# `D3DCompile` -- an HLSL runtime compiler -- into a shipped display-driver DLL.
+# Its only user was the deleted in-process selftest. Re-adding it means shipping
+# a compiler in the UMD; say why in the commit that does.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[build-dependencies]
+cxx-build = "1"
+# Parse bindgen output structurally even when rustfmt is not installed.
+syn = { version = "2", features = ["full"] }
+# ⭐ 0.70 -> 0.72 on 2026-09-05, forced by the installed libclang being 22.1.8.
+#
+# Under libclang 22, bindgen 0.70 binds the FORWARD DECLARATION instead of the
+# definition for a struct that `d3d10umddi.h` declares before it defines. The
+# generated `D3D11DDI_DEVICEFUNCS` came out as `pub _address: u8` (size 1) while
+# bindgen still emitted the real layout assertion beside it, so the build failed
+# 300 times over in two shapes at once:
+#
+#   error[E0609]: no field `pfnCalcPrivateResourceSize` on type
+#                 `&mut D3D11DDI_DEVICEFUNCS`
+#   error[E0080]: attempt to compute `1_usize - 1200_usize`, which would overflow
+#
+# ⚠ NOT a header or WDK problem, and that was checked rather than assumed: the
+# same run generated 37,385 lines with no clang diagnostic, and the tag struct
+# `_D3D11DDI_DEVICEFUNCS` came out COMPLETE with every field offset asserted --
+# only the typedef alias was opaque. The WDK include path resolves and
+# `bindgen/d3d10umddi_wrapper.h` is unchanged.
+#
+# Kept in lockstep with `umd12` (see its own note): both drivers' generated ABI
+# must come out of one code generator, or the two DDI surfaces are checked
+# against each other by nothing.
+bindgen = "0.72"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+opt-level = 2
+# Full debug info: the minidump symbolization workflow (dump_syms +
+# minidump-stackwalk) requires a GUID-matched PDB for the deployed DLL.
+debug = "full"

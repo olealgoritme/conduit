@@ -44,46 +44,169 @@ const FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Runs inside the guest as root. Idempotent.
-pub const SETUP: &str = r#"#!/bin/sh
+/// Runs inside the guest as root. Idempotent. Debian/Ubuntu (apt, the .deb)
+/// and Arch and its derivatives (pacman, the .pkg.tar.zst), picked from
+/// /etc/os-release. `--dry-run` prints the commands instead of running them.
+pub const SETUP: &str = r##"#!/bin/sh
 # Conduit guest setup, from `conduit attach` on the host. Safe to run again.
+#   sh setup.sh            install (as root)
+#   sh setup.sh --dry-run  print what it would run
 set -eu
 D=$(cd "$(dirname "$0")" && pwd)
-if ! command -v apt-get >/dev/null 2>&1; then
-    echo "conduit: this VM has no apt-get; install the conduit-guest package for your distribution by hand" >&2
-    exit 3
+DRY=0
+[ "${1:-}" = --dry-run ] && DRY=1
+run() {
+    if [ "$DRY" = 1 ]; then echo "+ $*"; else "$@"; fi
+}
+say() { echo "conduit: $*"; }
+warn() { echo "conduit: warning: $*" >&2; }
+die() { echo "conduit: $*" >&2; exit 3; }
+
+# --- which distribution -------------------------------------------------------
+ID=; ID_LIKE=
+# shellcheck disable=SC1091
+[ -r /etc/os-release ] && . /etc/os-release
+DISTRO=
+for i in $ID $ID_LIKE; do
+    case "$i" in
+        debian|ubuntu) DISTRO=debian; break ;;
+        arch|archlinux) DISTRO=arch; break ;;
+    esac
+done
+KVER=$(uname -r)
+
+case "$DISTRO" in
+debian)
+    command -v apt-get >/dev/null 2>&1 || die "this VM ($ID) has no apt-get"
+    [ -f "$D/conduit-guest.deb" ] || die "the bundle has no conduit-guest.deb; reinstall conduit on the host"
+    export DEBIAN_FRONTEND=noninteractive
+    run apt-get update -q || true
+    # DKMS builds the driver for the running kernel: it needs that kernel's headers.
+    run apt-get install -y -q --no-install-recommends "linux-headers-$KVER" \
+        || warn "no headers package for $KVER; the driver builds once they are installed"
+    run apt-get install -y -q --no-install-recommends "$D/conduit-guest.deb"
+    ;;
+arch)
+    # Arch, Omarchy, EndeavourOS, Manjaro, CachyOS, ...
+    command -v pacman >/dev/null 2>&1 || die "this VM ($ID) has no pacman"
+    [ -f "$D/conduit-guest.pkg.tar.zst" ] ||
+        die "the bundle has no Arch package (conduit-guest.pkg.tar.zst): this conduit on the host is too old or was built without nfpm. Update conduit on the host, or install conduit-guest-dkms from the AUR."
+    # The headers package of the running kernel's flavour: linux -> linux-headers,
+    # linux-lts -> linux-lts-headers, linux-zen, linux-hardened, linux612 (Manjaro), ...
+    kpkg=
+    [ -r "/usr/lib/modules/$KVER/pkgbase" ] && kpkg=$(cat "/usr/lib/modules/$KVER/pkgbase")
+    [ -n "$kpkg" ] || kpkg=$(pacman -Qqo "/usr/lib/modules/$KVER/vmlinuz" 2>/dev/null || true)
+    if [ -z "$kpkg" ]; then
+        warn "cannot tell which package the running kernel $KVER comes from; assuming linux"
+        kpkg=linux
+    fi
+    # The AUR package installs the same files; this one replaces it.
+    if pacman -Qq conduit-guest-dkms >/dev/null 2>&1; then
+        run pacman -R --noconfirm conduit-guest-dkms
+    fi
+    # No -y: refreshing the package lists without upgrading the system is a
+    # partial upgrade, and could fetch headers newer than the installed kernel.
+    # wl-clipboard: the clipboard agent on Hyprland/sway/KDE; libglvnd and the
+    # Vulkan loader: what the host's NVIDIA user-space plugs into.
+    if ! run pacman -S --needed --noconfirm dkms "$kpkg-headers" wl-clipboard libglvnd vulkan-icd-loader; then
+        die "pacman could not install dkms and $kpkg-headers. Update the VM (sudo pacman -Syu), reboot it, and run conduit attach again."
+    fi
+    # Same version again (a rebuilt bundle) reinstalls on purpose: no --needed.
+    run pacman -U --noconfirm "$D/conduit-guest.pkg.tar.zst"
+    if [ ! -e "/usr/lib/modules/$KVER/build" ]; then
+        warn "no headers for the running kernel $KVER (the system was upgraded since boot?); the driver is built for the installed kernel and loads after a reboot"
+    fi
+    ;;
+*)
+    die "unsupported distribution (${ID:-unknown}${ID_LIKE:+, like $ID_LIKE}). conduit attach sets up Debian, Ubuntu and Arch-based guests (Arch, Omarchy, EndeavourOS, Manjaro). Elsewhere install the conduit-guest package (.rpm for Fedora) by hand; see docs/LIBVIRT.md."
+    ;;
+esac
+
+# --- the host NVIDIA share, seat and loader files (same on every distribution) --
+# /mnt/nvidia is the read-only NVIDIA share once mounted (attach on a running
+# VM): install -d would fail chmod'ing it.
+[ -d /mnt/nvidia ] || run install -d /mnt/nvidia
+run install -d /etc/environment.d
+run install -m644 "$D/conduit-guest.service" /etc/systemd/system/conduit-guest.service
+run install -m644 "$D/99-conduit.rules" /etc/udev/rules.d/99-conduit.rules
+run install -m644 "$D/71-conduit-seat.rules" /etc/udev/rules.d/71-conduit-seat.rules
+run install -m644 "$D/zz-conduit-nvidia.conf" /etc/ld.so.conf.d/zz-conduit-nvidia.conf
+run install -m644 "$D/conduit-nvidia.sh" /etc/profile.d/conduit-nvidia.sh
+run install -m644 "$D/90-conduit-nvidia.conf" /etc/environment.d/90-conduit-nvidia.conf
+# environment.d reaches systemd user sessions and profile.d login shells, but a
+# display manager's greeter (SDDM running Hyprland) gets neither; pam_env's
+# /etc/environment reaches every PAM session. Replace our block, keep the rest.
+if [ "$DRY" = 0 ]; then
+    touch /etc/environment
+    sed -i '/^# >>> conduit >>>$/,/^# <<< conduit <<<$/d' /etc/environment
+    { echo '# >>> conduit >>>'; grep -v '^#' "$D/90-conduit-nvidia.conf"; echo '# <<< conduit <<<'; } >> /etc/environment
+else
+    say "would add the 90-conduit-nvidia.conf variables to /etc/environment"
 fi
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -q || true
-# DKMS builds the driver for the running kernel: it needs that kernel's headers.
-apt-get install -y -q --no-install-recommends "linux-headers-$(uname -r)" \
-    || echo "conduit: warning: no headers package for $(uname -r); the driver builds once they are installed" >&2
-apt-get install -y -q --no-install-recommends "$D/conduit-guest.deb"
-install -d /mnt/nvidia /etc/environment.d
-install -m644 "$D/conduit-guest.service" /etc/systemd/system/conduit-guest.service
-install -m644 "$D/99-conduit.rules" /etc/udev/rules.d/99-conduit.rules
-install -m644 "$D/71-conduit-seat.rules" /etc/udev/rules.d/71-conduit-seat.rules
-install -m644 "$D/zz-conduit-nvidia.conf" /etc/ld.so.conf.d/zz-conduit-nvidia.conf
-install -m644 "$D/conduit-nvidia.sh" /etc/profile.d/conduit-nvidia.sh
-install -m644 "$D/90-conduit-nvidia.conf" /etc/environment.d/90-conduit-nvidia.conf
-systemctl daemon-reload
-systemctl enable conduit-guest.service
-dkms status conduit-guest || true
-echo "conduit: guest side installed. Restart the VM to use Conduit's GPU."
-"#;
+# Only a booted systemd has units to reload (not a container or chroot).
+if [ -d /run/systemd/system ]; then
+    run systemctl daemon-reload
+fi
+run systemctl enable conduit-guest.service
+if [ "$DRY" = 0 ]; then
+    dkms status conduit-guest || true
+fi
+say "guest side installed. Restart the VM to use Conduit's GPU."
+"##;
 
 pub fn bundle_dir(name: &str) -> PathBuf {
     paths::vm_dir(name).join("guest-setup")
 }
 
-/// Write the bundle (setup.sh, the package, the files) and a tar of it.
+/// A guest package: installed with conduit, or in a source checkout built on
+/// first use (`packaging/build.sh package guest-deb|guest-arch`, needs nfpm).
+pub fn package(tool: Tool) -> Result<PathBuf> {
+    if let Some(p) = tool.find() {
+        return Ok(p);
+    }
+    let fmt = match tool {
+        Tool::GuestArch => "guest-arch",
+        _ => "guest-deb",
+    };
+    if let Some(root) = paths::repo_root() {
+        if sys::have("nfpm") {
+            ui::info(format!(
+                "building the conduit-guest package ({fmt}) from this checkout"
+            ));
+            let ok = Command::new(root.join("packaging/build.sh"))
+                .args(["package", fmt])
+                .stdout(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                if let Some(p) = tool.find() {
+                    return Ok(p);
+                }
+            }
+        }
+    }
+    tool.require()
+}
+
+/// Write the bundle (setup.sh, the packages, the files) and a tar of it.
+/// The .deb is required; the Arch package goes in when this install has one
+/// (setup.sh on an Arch guest says what to do when it is missing).
 pub fn bundle(name: &str) -> Result<PathBuf> {
-    let deb = Tool::GuestDeb.require()?;
+    let deb = package(Tool::GuestDeb)?;
+    let arch = package(Tool::GuestArch).ok();
     let dir = bundle_dir(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
-    std::fs::copy(&deb, dir.join("conduit-guest.deb"))
-        .with_context(|| format!("copying {}", deb.display()))?;
+    for (src, dst) in [
+        (Some(&deb), "conduit-guest.deb"),
+        (arch.as_ref(), "conduit-guest.pkg.tar.zst"),
+    ] {
+        if let Some(src) = src {
+            std::fs::copy(src, dir.join(dst))
+                .with_context(|| format!("copying {}", src.display()))?;
+        }
+    }
     std::fs::write(dir.join("setup.sh"), SETUP)?;
     for (f, body) in FILES {
         std::fs::write(dir.join(f), body)?;
@@ -203,7 +326,7 @@ pub fn install_via_agent(name: &str, link: &Link) -> Result<()> {
     let tar = bundle(name)?;
     ui::info("copying the guest driver into the VM (QEMU guest agent)…");
     upload(link, &tar, "/tmp/conduit-guest-setup.tar")?;
-    ui::info("installing it inside the VM (apt, DKMS build; this takes a minute or two)…");
+    ui::info("installing it inside the VM (kernel headers, package, DKMS build; this takes a minute or two)…");
     let (code, out) = agent_exec(
         link,
         "rm -rf /tmp/conduit-guest && mkdir -p /tmp/conduit-guest && tar -xf /tmp/conduit-guest-setup.tar -C /tmp/conduit-guest && sh /tmp/conduit-guest/setup.sh 2>&1",
@@ -228,7 +351,7 @@ pub fn driver_version_via_agent(link: &Link) -> Option<String> {
 }
 
 /// Prints the conduit-guest package version and whether its module is loaded.
-pub const VERSION_PROBE: &str = "v=$(dpkg-query -W -f='${Version}' conduit-guest 2>/dev/null || rpm -q --qf '%{VERSION}-%{RELEASE}' conduit-guest 2>/dev/null); [ -n \"$v\" ] || exit 1; if grep -q '^conduit_gpu ' /proc/modules; then echo \"$v (driver loaded)\"; else echo \"$v (driver NOT loaded)\"; fi";
+pub const VERSION_PROBE: &str = "v=$(dpkg-query -W -f='${Version}' conduit-guest 2>/dev/null || rpm -q --qf '%{VERSION}-%{RELEASE}' conduit-guest 2>/dev/null || pacman -Q conduit-guest 2>/dev/null | cut -d' ' -f2); [ -n \"$v\" ] || exit 1; if grep -q '^conduit_gpu ' /proc/modules; then echo \"$v (driver loaded)\"; else echo \"$v (driver NOT loaded)\"; fi";
 
 /// Minimal standard base64 (the agent's buf-b64 / out-data).
 mod base64_lite {
@@ -296,6 +419,9 @@ mod tests {
         assert!(s.starts_with("#!/bin/sh"));
         assert!(s.contains("set -eu"));
         assert!(s.contains("systemctl enable conduit-guest.service"));
+        assert!(s.contains("conduit-guest.deb"));
+        assert!(s.contains("conduit-guest.pkg.tar.zst"));
+        assert!(s.contains("/etc/os-release"));
         for (f, _) in super::FILES {
             assert!(s.contains(f), "setup.sh installs {f}");
         }

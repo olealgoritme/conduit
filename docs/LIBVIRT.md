@@ -53,7 +53,11 @@ matching window for a VM that is already running.
 
 System domains get the same units in `/etc/systemd/system`, with
 `SocketUser=libvirt-qemu` (or `qemu`), sockets in `/run/conduit/NAME/`, and
-`User=` you for the helpers.
+`User=` you for the helpers. The boot console's socket is the other way round
+(QEMU listens, the backend connects), so attach also installs
+`/etc/tmpfiles.d/conduit-NAME.conf`: `/run/conduit/NAME/console`, owned by
+the QEMU user, group yours, mode 2750. libvirt runs QEMU with umask 002, so the
+socket it creates there is group-writable in your group.
 
 ## The network
 
@@ -81,7 +85,8 @@ sudo. Attached VMs keep whatever network they had.
   the disk's `/boot` (refreshed after every run and before `conduit up`).
 - the raw disk (virtio, `cache=none`, `discard=unmap`), the tap, a virtio RNG,
   a serial console (virt-manager shows it; logged to `logs/vm.log`), no
-  emulated display (the screen is `conduit view`).
+  emulated display (the screen is `conduit view`; with direct kernel boot
+  there is no firmware screen to show, so no boot console either).
 - `<filesystem>` virtiofs, tag `nvidia`, on the socket above: the NVIDIA
   user-space share. libvirt's own virtiofsd launching is not used, because
   Ubuntu 24.04's virtiofsd 1.10 has no `--readonly`; `conduit _virtiofsd`
@@ -96,7 +101,25 @@ sudo. Attached VMs keep whatever network they had.
 `conduit attach` edits an existing definition instead: the same emulator,
 memfd, CPU, share, metadata and GPU (on the highest free slot of bus 0), and
 the machine type becomes the plain `q35` / `pc` alias (a versioned type such
-as `pc-q35-noble` belongs to the old QEMU). It keeps everything else. The
+as `pc-q35-noble` belongs to the old QEMU). Conduit's QEMU has VNC but no
+SPICE, OpenGL or USB redirection, so attach also changes the display side:
+
+- every `<graphics>` (SPICE, VNC on a port, ...) becomes one
+  `<graphics type='vnc' socket='SOCK'/>`: the **boot console**, which the
+  backend shows in the Conduit window until the guest driver displays (see
+  [SCANOUT.md](SCANOUT.md#boot-console)). SOCK is
+  `/run/user/UID/conduit/NAME/console.sock` (session) or
+  `/run/conduit/NAME/console/vnc.sock` (system);
+- SPICE-only devices go: `<channel>`, `<redirdev>`, `<smartcard>` (and any
+  other device) of type `spicevmc` / `spiceport`, and `<redirfilter>`;
+- `<audio type='spice'>` becomes `type='none'` (the sound card stays, silent);
+- QXL video becomes `virtio` (QXL exists only with SPICE) and
+  `<acceleration accel3d>` is dropped (no virgl). The emulated video device
+  itself stays: firmware, boot menu and disk-unlock prompt draw on it.
+- `<tpm>`, the guest agent channel, inputs and everything else are kept.
+
+virt-manager can still open the VM's console (it connects to the same
+socket); the Conduit window is the main screen. The
 definition from before the first attach is saved as
 `vms/NAME/libvirt-backup-TIME.xml`; `conduit detach` defines it again (libvirt
 may print elements in another order; the content is the same). Each step is
@@ -106,11 +129,38 @@ if libvirt refuses it nothing stays changed.
 ## Guest side (attach)
 
 `conduit attach` builds `vms/NAME/guest-setup.tar` (the `conduit-guest`
-package, the share mount unit, udev and loader files) and, if the VM runs and
-answers on the QEMU guest agent, uploads it and runs its `setup.sh` as root
-(apt: headers for the running kernel, the package, DKMS build). Otherwise it
-prints one `ssh ... < guest-setup.tar` command; `--guest-later` asks for that
-directly. Debian/Ubuntu guests only for now.
+packages, the share mount unit, udev and loader files) and, if the VM runs and
+answers on the QEMU guest agent, uploads it and runs its `setup.sh` as root.
+Otherwise it prints one `ssh ... < guest-setup.tar` command; `--guest-later`
+asks for that directly. `setup.sh` picks the distribution from
+`/etc/os-release` (`ID`, `ID_LIKE`); `sh setup.sh --dry-run` prints what it
+would run.
+
+| guest | what `setup.sh` does |
+|---|---|
+| Debian, Ubuntu (and `ID_LIKE` debian/ubuntu) | apt: `linux-headers-$(uname -r)`, then `conduit-guest.deb` (DKMS build) |
+| Arch and `ID_LIKE=arch` (Omarchy, EndeavourOS, Manjaro, CachyOS) | pacman: `dkms`, the running kernel's headers (`/usr/lib/modules/$(uname -r)/pkgbase` + `-headers`: `linux-headers`, `linux-lts-headers`, `linux-zen-headers`, ...), `wl-clipboard`, `libglvnd`, `vulkan-icd-loader`, then `conduit-guest.pkg.tar.zst` (DKMS build); replaces the AUR's `conduit-guest-dkms` |
+| anything else (Fedora, ...) | stops with an error; install the `conduit-guest` .rpm by hand |
+
+Both then install the same files: `conduit-guest.service` (loads
+`conduit_gpu`, mounts the `nvidia` virtiofs share read-only at `/mnt/nvidia`,
+runs `ldconfig`), the udev rules, `/etc/ld.so.conf.d/zz-conduit-nvidia.conf`
+and the Vulkan ICD / GLVND EGL / GBM paths into the share
+(`/etc/profile.d/conduit-nvidia.sh`, `/etc/environment.d/90-conduit-nvidia.conf`).
+The package itself brings the module autoload and modprobe entries, the
+user-namespace sysctl, the logind power-key drop-in and the clipboard agent
+(user unit enabled globally, plus an XDG autostart entry). Hyprland started
+through uwsm (Omarchy) reaches `graphical-session.target`, which starts it; a
+Hyprland started without uwsm runs neither, so add
+`exec-once = conduit-clipboard-agent` to `hyprland.conf` there.
+
+pacman runs without `-y` (no partial upgrade): if the headers are no longer
+on the mirror, update the VM (`sudo pacman -Syu`), reboot, and attach again.
+
+**Arch guest agent**: `sudo pacman -S qemu-guest-agent` and reboot the VM (or
+`sudo systemctl start qemu-guest-agent`); udev starts it on every boot when the
+VM has the `org.qemu.guest_agent.0` channel, which virt-manager adds to new
+VMs.
 
 ## Lifecycle
 

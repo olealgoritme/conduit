@@ -26,9 +26,9 @@
       VM's resolution
 - [ ] Lower per-call latency: an ioeventfd for the GPU device's notify register
       in `conduit-vmm`, backend thread placement, a short spin in the event pump
-- [ ] Display pacing and fences: forward buffer release, drive the guest vblank
-      from the host's presentation feedback, GPU fences across the boundary
-      ([KNOWN-ISSUES.md](KNOWN-ISSUES.md))
+- [ ] Display pacing: forward buffer release, drive the guest vblank from the
+      host's presentation feedback ([KNOWN-ISSUES.md](KNOWN-ISSUES.md)). GPU
+      fences across the boundary: done, [SYNC.md](SYNC.md)
 - [ ] Audio in the stream (Opus from the VM's sound card)
 - [ ] GPU hot-plug (`device_del` / `device_add`), so a VM can be snapshotted,
       saved and migrated with the GPU unplugged
@@ -42,6 +42,7 @@
 - [ ] Windows guests, two routes:
   - CUDA / NVML / NVENC on a small non-WDDM driver, using NVIDIA's own user-mode libraries
   - graphics through the open stack: NVK (Mesa Vulkan) on RM + DXVK / vkd3d-proton
+- [ ] Graphics via Venus (Vulkan forwarding) over Conduit's device ([VENUS.md](VENUS.md))
 - [ ] Multiple VMs sharing one GPU with fair scheduling
 - [ ] Per-VM GPU selection on multi-GPU hosts
 - [ ] Multiple monitors per VM, VRR and HDR

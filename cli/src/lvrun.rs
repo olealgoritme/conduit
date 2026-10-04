@@ -29,6 +29,8 @@ use std::time::Duration;
 
 const NEXT_MODE: &str = "libvirt-next-mode";
 const MODE: &str = "libvirt-mode";
+/// Present when the next backend start serves Venus (`--venus`).
+const NEXT_VENUS: &str = "libvirt-next-venus";
 /// How long an ACPI shutdown may take before the VM is forced off.
 const SHUTDOWN_GRACE: Duration = run::SHUTDOWN_GRACE;
 
@@ -148,6 +150,9 @@ fn before_start(name: &str, link: &Link) -> Result<()> {
         ));
     }
     Tool::Backend.require()?;
+    if run::venus() {
+        run::need_venus()?;
+    }
     if link.kind == Kind::Managed {
         let c = VmConfig::load(name)?;
         run::check_memory(&c)?;
@@ -165,6 +170,11 @@ fn before_start(name: &str, link: &Link) -> Result<()> {
 fn write_next_mode(rt: &Rt, mode: Option<Mode>) -> Result<()> {
     let v = mode.map(|m| m.to_string()).unwrap_or_else(|| "none".into());
     std::fs::write(rt.p(NEXT_MODE), v + "\n")?;
+    if run::venus() {
+        std::fs::write(rt.p(NEXT_VENUS), "1\n")?;
+    } else {
+        let _ = std::fs::remove_file(rt.p(NEXT_VENUS));
+    }
     Ok(())
 }
 
@@ -587,11 +597,12 @@ fn need_link(name: &str) -> Result<Link> {
 /// `conduit _backend NAME` (conduit-backend@NAME.service): pick the display,
 /// then become the backend, keeping systemd's listening socket (fd 3).
 pub fn backend_exec(name: &str) -> Result<()> {
-    let _link = need_link(name)?;
+    let link = need_link(name)?;
     let rt = Rt::new(name)?;
     log_to(&logs_dir(name).join("backend.log"), false)?;
     let next = std::fs::read_to_string(rt.p(NEXT_MODE)).ok();
     let _ = std::fs::remove_file(rt.p(NEXT_MODE));
+    let venus = std::fs::remove_file(rt.p(NEXT_VENUS)).is_ok();
     let mode: Option<Mode> = match next.as_deref().map(str::trim) {
         Some("none") => None,
         Some(s) if s.parse::<Mode>().is_ok() => s.parse().ok(),
@@ -602,6 +613,15 @@ pub fn backend_exec(name: &str) -> Result<()> {
         mode.map(|m| m.to_string()).unwrap_or_else(|| "none".into()) + "\n",
     )?;
     let backend = Tool::Backend.require()?;
+    // --venus: start the renderer here, then exec the backend. The renderer
+    // stays in conduit-backend@NAME.service's cgroup, so stopping the unit
+    // (the VM stopping) ends it too, and it exits by itself once the backend
+    // hangs up. Its exit is reaped by systemd after the backend's.
+    let venus_sock = if venus {
+        Some(spawn_venus(name, &rt)?)
+    } else {
+        None
+    };
     let mut cmd = Command::new(&backend);
     // With socket activation the backend serves fd 3; --socket only names the
     // folder its sandbox may reach (the viewer's display socket is there).
@@ -610,6 +630,15 @@ pub fn backend_exec(name: &str) -> Result<()> {
         .args(["--caps", "graphics,video,utility,compute"])
         .arg("--trace-socket")
         .arg(crate::trace::socket(name));
+    if let Some(s) = &venus_sock {
+        cmd.arg("--venus").arg("--venus-renderer").arg(s);
+    }
+    // The boot console (attached VMs): QEMU's VNC server, which the backend
+    // shows until the guest driver displays. QEMU opens it only after the
+    // GPU's vhost-user handshake, i.e. after this backend started.
+    if let (Some(c), Some(_)) = (&link.console, mode) {
+        cmd.arg("--console-vnc").arg(c);
+    }
     if let Some(m) = mode {
         cmd.arg("--display")
             .arg(m.to_string())
@@ -632,6 +661,38 @@ pub fn backend_exec(name: &str) -> Result<()> {
     );
     let e = cmd.exec();
     Err(e).with_context(|| format!("could not run {}", backend.display()))
+}
+
+/// conduit-venus for a libvirt VM's backend: started, logging to
+/// logs/venus.log, and listening once this returns its socket.
+fn spawn_venus(name: &str, rt: &Rt) -> Result<PathBuf> {
+    let bin = run::need_venus()?;
+    let sock = rt.venus_sock();
+    sys::clear_stale_socket(&sock)?;
+    let log = logs_dir(name).join("venus.log");
+    let out = std::fs::File::create(&log).with_context(|| format!("opening {}", log.display()))?;
+    let mut child = run::venus_cmd(&bin, &sock)
+        .stdin(std::process::Stdio::null())
+        .stdout(out.try_clone()?)
+        .stderr(out)
+        .spawn()
+        .with_context(|| format!("could not run {}", bin.display()))?;
+    eprintln!("conduit: started the Venus renderer (pid {})", child.id());
+    let ok = sys::wait_for(Duration::from_secs(20), || {
+        sock.exists() || !matches!(child.try_wait(), Ok(None))
+    });
+    if !ok || !sock.exists() {
+        let _ = child.kill();
+        return Err(oops(
+            "the Venus renderer (conduit-venus) did not start",
+            format!(
+                "Its log ({}) ends with:\n{}",
+                log.display(),
+                sys::tail(&log, 6)
+            ),
+        ));
+    }
+    Ok(sock)
 }
 
 /// `conduit _virtiofsd NAME` (conduit-virtiofsd@NAME.service): stage the

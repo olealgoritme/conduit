@@ -140,7 +140,7 @@ pub fn args(c: &VmConfig, p: &Paths, audio: Option<Audio>) -> Vec<String> {
         format!("guest={},debug-threads=on", c.name),
         s("-machine"),
         s("q35,accel=kvm,memory-backend=mem"),
-        // The nvgpu shared-memory BAR is 2 GiB and 64-bit: it goes above
+        // The nvgpu shared-memory BAR is 64 GiB and 64-bit: it goes above
         // 4 GiB, which needs the real physical address width.
         s("-cpu"),
         s("host,host-phys-bits=on"),

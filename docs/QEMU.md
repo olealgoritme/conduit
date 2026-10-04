@@ -92,8 +92,9 @@ Why each nvgpu-related argument is there:
   the backend for them with `GET_SHMEM_CONFIG`. The backend answers shmid 1
   (window, 1 GiB) and shmid 2 (UVM aperture, 32 GiB).
 - `-cpu host,host-phys-bits=on` matters because the shared-memory BAR is
-  64 GiB and 64-bit. The firmware places it above 4 GiB, which needs real
-  physical-address width.
+  64 GiB and 64-bit (128 GiB with a large `--venus-hostmem-mib`). The
+  firmware places it above 4 GiB, which needs real physical-address width.
+  For OVMF see [VENUS.md](VENUS.md) "Windows/OVMF guests".
 
 Networking is the same as with `conduit-vmm`. `conduit up` creates the VM's
 `conduitN` tap (N is the VM's network number; `conduit0` in the example),
@@ -145,6 +146,13 @@ device:
     <qemu:arg value='vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,num_vqs=2,vq_size=256,config_size=4036,bus=pcie.0,addr=0x10'/>
   </qemu:commandline>
 ```
+
+The bundled QEMU is built with TPM support (`tpm-crb`, `tpm-tis`, and the
+`emulator` and `passthrough` backends), so domains with
+`<tpm model='tpm-crb'><backend type='emulator' version='2.0'/></tpm>` (the
+virt-install default, and required by Windows 11) start. The emulator
+backend needs `swtpm` and `swtpm_setup` on the host (Debian/Ubuntu: `swtpm`
+and `swtpm-tools`; Fedora: `swtpm` and `swtpm-tools`; Arch: `swtpm`).
 
 ## What the guest sees: QEMU compared with conduit-vmm
 

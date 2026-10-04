@@ -332,6 +332,14 @@ pub struct NvidiaBackend {
     /// watchable; the transport decides how to watch it.
     watch_added: Vec<(u32, RawFd)>,
     watch_removed: Vec<u32>,
+    /// Host fences (sync_files) handed to the guest as handles, docs/SYNC.md.
+    /// Watched like a descriptor but reported once: a signalled sync_file
+    /// stays readable forever.
+    fences: std::collections::HashSet<u64>,
+    fence_watch_added: Vec<(u32, RawFd)>,
+    /// An already-signalled sync_file, made once on demand: what a guest
+    /// fence that has signalled becomes when the host GPU must wait on it.
+    signalled: Option<OwnedFd>,
     next_mapping_id: u32,
     /// Where forwarded ioctls go. The host driver, except under test.
     host: Box<dyn HostDriver>,
@@ -346,6 +354,14 @@ pub struct NvidiaBackend {
     /// `crate::vram`. `Vram::new(None)` is no limit, which is what a VMM that
     /// never sets one gets.
     vram: crate::vram::Vram,
+    /// Venus (docs/VENUS.md), with `--venus` only. `None`: `GpuCmd` is
+    /// refused as an unknown message is.
+    #[cfg(feature = "venus")]
+    venus: Option<crate::venus::Venus>,
+    /// The token of the `GpuCmd` just dispatched, when it was a fenced
+    /// command now waiting for its fence. See [`NvidiaBackend::take_held`].
+    #[cfg(feature = "venus")]
+    venus_held: Option<u64>,
     /// Why the request being served was answered here rather than by the
     /// host, for the trace. Set on refusal paths only; read and cleared by
     /// `dispatch_traced`. See docs/TRACING.md.
@@ -372,6 +388,12 @@ fn nvkms_register_surface(v: Option<abi::version::DriverVersion>) -> u32 {
         _ => 16,
     }
 }
+/// `NVKMS_IOCTL_QUERY_DISP`. Third in the enum since NVKMS's first release;
+/// the commands that moved (see above) all come after it.
+const NVKMS_QUERY_DISP: u32 = 2;
+/// `sizeof(struct NvKmsQueryDispRequest)`: a device handle and a disp handle.
+/// The reply follows it and is the part whose size varies between releases.
+const NVKMS_QUERY_DISP_REQUEST: usize = 8;
 /// Byte offset of `planes[0].u` inside `NvKmsRegisterSurfaceRequest`.
 const NVKMS_SURFACE_FD_OFFSET: usize = 16;
 
@@ -425,6 +447,9 @@ impl NvidiaBackend {
             ioctls_by_ns: std::collections::BTreeMap::new(),
             watch_added: Vec::new(),
             watch_removed: Vec::new(),
+            fences: std::collections::HashSet::new(),
+            fence_watch_added: Vec::new(),
+            signalled: None,
             next_mapping_id: 1,
             current_msg: MsgType::Ioctl,
             current_handle: 0,
@@ -439,6 +464,10 @@ impl NvidiaBackend {
             display: None,
             dmabufs: Default::default(),
             clip_in: Default::default(),
+            #[cfg(feature = "venus")]
+            venus: None,
+            #[cfg(feature = "venus")]
+            venus_held: None,
             #[cfg(feature = "trace")]
             trace_refusal: Default::default(),
         }
@@ -635,6 +664,14 @@ impl NvidiaBackend {
         )
     }
 
+    /// Host fences opened since this was last called, to be watched until
+    /// they first become readable and then dropped from the poll set (they
+    /// stay readable). Their removal comes through `take_watch_updates` like
+    /// any other handle's, when the guest closes them.
+    pub fn take_fence_watches(&mut self) -> Vec<(u32, RawFd)> {
+        std::mem::take(&mut self.fence_watch_added)
+    }
+
     /// Give the backend somewhere to place device memory.
     ///
     /// Until this is called every `RM_MAP_MEMORY` still succeeds on the host --
@@ -705,6 +742,8 @@ impl NvidiaBackend {
 
     pub fn teardown(&mut self) {
         self.teardown_scanout();
+        #[cfg(feature = "venus")]
+        self.teardown_venus();
         log::info!(
             "NvidiaBackend::teardown: video memory {} MiB in use, peak {} MiB, {} allocation(s) refused, limit {}",
             self.vram.in_use() >> 20,
@@ -890,6 +929,10 @@ impl NvidiaBackend {
             self.handle_close(0, &[], &mut scratch);
         }
         let next_handle = self.handles.next_handle();
+        // Venus first, with no window: its region 3 placements went with the
+        // rest. What it held is kept across the reset, emptied.
+        #[cfg(feature = "venus")]
+        let venus = self.reset_venus();
         self.teardown();
 
         // Everything else back to how `new` left it.
@@ -904,6 +947,12 @@ impl NvidiaBackend {
         self.window = window;
         self.guest_ram = old.guest_ram.take();
         self.display = old.display.take();
+        // The guest's picture went with it: the boot console (if any) shows
+        // the reboot -- firmware, boot menu, disk password -- until the
+        // guest's driver flips again.
+        if let Some(link) = self.display.as_ref() {
+            link.console_reset("device reset");
+        }
         self.caps = old.caps;
         self.driver = old.driver;
         self.abi = old.abi;
@@ -913,6 +962,10 @@ impl NvidiaBackend {
         self.osdesc = old.osdesc.take();
         self.vidmem = old.vidmem.take();
         self.vram = crate::vram::Vram::new(old.vram.limit().map(|b| b >> 20));
+        #[cfg(feature = "venus")]
+        {
+            self.venus = venus;
+        }
         // The transport still has to drop the watches of the files closed above.
         self.watch_removed = std::mem::take(&mut old.watch_removed);
         self.handles.skip_to(next_handle);
@@ -955,11 +1008,19 @@ impl NvidiaBackend {
                 MsgType::ClipboardFromHost => "clipboard_from_host",
                 MsgType::ClipboardToHost => "clipboard_to_host",
                 MsgType::ClipboardRequest => "clipboard_request",
+                MsgType::GpuCmd => "gpu_cmd",
             })
             .or_insert(0) += 1;
         // The handle travels in the header, not the payload -- every message
         // after Open acts on one, and Open's response returns one the same way.
         self.current_handle = hdr.handle;
+
+        // A fence handle is a sync_file, not a device: only Close may name
+        // it. Forwarded, an ioctl on it would reach the sync_file's own
+        // (SYNC_IOC_MERGE makes descriptors here).
+        if msg_type != MsgType::Close && self.fences.contains(&(hdr.handle as u64)) {
+            return self.write_error_resp(resp_buf, Status::BadHandle, 0, 0);
+        }
 
         let payload = &req_buf[size_of::<MsgHeader>()..];
         match msg_type {
@@ -986,6 +1047,7 @@ impl NvidiaBackend {
             MsgType::CursorUpdate => self.handle_cursor_update(payload, resp_buf),
             MsgType::ClipboardToHost => self.handle_clipboard_to_host(payload, resp_buf),
             MsgType::ClipboardRequest => self.handle_clipboard_request(resp_buf),
+            MsgType::GpuCmd => self.handle_gpu_cmd(payload, resp_buf),
         }
     }
 }
@@ -1026,8 +1088,10 @@ fn write_struct<T: Copy>(buf: &mut [u8], val: &T) -> usize {
 
 mod aperture;
 mod clipboard;
+mod fence;
 mod files;
 pub use files::FileTree;
+mod gpu_cmd;
 mod host;
 pub use host::{HostDriver, RealHost};
 mod ioctl;

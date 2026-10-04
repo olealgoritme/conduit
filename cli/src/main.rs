@@ -48,6 +48,10 @@ struct Cli {
     /// `up`/`view`: start even when the host looks short of free memory
     #[arg(long, global = true)]
     no_mem_check: bool,
+    /// `up`/`view` (experimental): serve Venus to a Windows guest
+    /// (conduit-backend --venus, docs/VENUS.md)
+    #[arg(long, global = true)]
+    venus: bool,
 }
 
 #[derive(Subcommand)]
@@ -460,6 +464,7 @@ fn main() {
     let cli = Cli::parse();
     run::set_clipboard(cli.clipboard);
     run::set_no_mem_check(cli.no_mem_check);
+    run::set_venus(cli.venus);
     let r = match cli.cmd {
         Cmd::Create {
             name,

@@ -185,26 +185,7 @@ fn get_image(local: Option<&Path>) -> Result<PathBuf> {
 /// The conduit-guest package (DKMS) that goes into new VMs. In a source
 /// checkout it is built on first use (`packaging/build.sh package guest-deb`).
 fn guest_deb() -> Result<PathBuf> {
-    if let Some(p) = Tool::GuestDeb.find() {
-        return Ok(p);
-    }
-    if let Some(root) = paths::repo_root() {
-        if sys::have("nfpm") {
-            ui::info("building the conduit-guest package from this checkout");
-            let ok = Command::new(root.join("packaging/build.sh"))
-                .args(["package", "guest-deb"])
-                .stdout(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if ok {
-                if let Some(p) = Tool::GuestDeb.find() {
-                    return Ok(p);
-                }
-            }
-        }
-    }
-    Tool::GuestDeb.require()
+    crate::guest::package(Tool::GuestDeb)
 }
 
 /// Conduit's own ssh key, used to log in to (and cleanly shut down) VMs.

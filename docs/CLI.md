@@ -22,7 +22,7 @@ Source: `cli/` (Rust, one static binary). Build: `cargo build --release -p condu
 | `conduit logs NAME [backend\|vm\|viewer\|watcher\|share\|virtiofsd\|create] [-f] [-n N]` | Shows the logs (default 40 lines). |
 | `conduit ssh NAME [-u USER] [CMD...]` | Opens a terminal in the VM, or runs a command there. |
 | `conduit libvirt enable\|disable NAME` | Makes a Conduit VM a libvirt domain in `qemu:///session` (virt-manager: File > Add Connection > QEMU/KVM user session), or removes that domain again. `create` and `import` enable it by default when libvirt is installed (`--no-libvirt` skips it). Installs the socket-activated `conduit-backend@NAME` / `conduit-virtiofsd@NAME` user units and the root `conduit-net-NAME.service` (sudo, once). See docs/LIBVIRT.md. |
-| `conduit attach NAME [-c URI] [--guest-later] [--dry-run]` | Gives an existing libvirt VM (session or system) Conduit's GPU: backs its definition up to `vms/NAME/libvirt-backup-TIME.xml`, installs the units, defines the edited domain in one step (rolled back if libvirt refuses it), and installs the guest driver through the QEMU guest agent when the VM runs one (else prints the command). Running it again changes nothing. |
+| `conduit attach NAME [-c URI] [--guest-later] [--dry-run]` | Gives an existing libvirt VM (session or system) Conduit's GPU: backs its definition up to `vms/NAME/libvirt-backup-TIME.xml`, installs the units, defines the edited domain in one step (rolled back if libvirt refuses it), and installs the guest driver through the QEMU guest agent when the VM runs one (else prints the command). SPICE graphics and devices are replaced by Conduit's boot console (a VNC socket the window shows until the guest driver displays; docs/LIBVIRT.md). Running it again changes nothing. |
 | `conduit detach NAME` | Restores the definition from before `attach` (VM shut off) and removes the units. |
 | `conduit config get [KEY] \| set KEY VALUE \| unset KEY` | Settings in `~/.config/conduit/config.json`. `view.close_stops_vm` (true/false, default true): closing the window of a VM that `conduit view` started shuts it down. |
 | `conduit stream NAME [--preset top\|balanced\|compat] [--port N] [--display WxH@HZ] [--service \| --stop] [--link] [--video-encryption] [--link-mbps N]` | Streams the VM to Moonlight (and, with `--link`, to `conduit remote`). Also `conduit stream pair PIN`, `clients`, `unpair CLIENT`, `status`, `token`. See docs/STREAMING.md. |
@@ -40,6 +40,8 @@ shared RAM), and with `oom_score_adj=500`, so under memory pressure the kernel k
 before your desktop. `conduit down` stops the slice. Without a systemd user session (or with
 `CONDUIT_NO_SCOPE=1`) the processes run unconfined.
 
+`--venus` (experimental, `up`/`view`, also libvirt VMs): the GPU backend serves Venus for a Windows guest (`conduit-backend --venus`, docs/VENUS.md), rendered by a `conduit-venus` started with it (logs/venus.log; found like the other tools, or `CONDUIT_VENUS=PATH`; `CONDUIT_VENUS_LD_LIBRARY_PATH` becomes its `LD_LIBRARY_PATH`). Off by default.
+
 `--tune-hyprland` is opt-in. While the viewer runs, it sets `misc:no_direct_scanout 0`, `general:allow_tearing 1` and an `immediate` rule for the viewer, then restores the old values. If the viewer supports `--direct-hook`, Ctrl+Alt+D turns these settings on and off.
 
 ## Where things are
@@ -52,7 +54,7 @@ before your desktop. `conduit down` stops the slice. Without a systemd user sess
 | libvirt | `vms/NAME/libvirt.json` (which domain), `vms/NAME/libvirt-backup-*.xml` (attach), `~/.config/systemd/user/conduit-{backend,virtiofsd}@*`, `/etc/systemd/system/conduit-net-NAME.service`, `~/.local/share/applications/conduit-NAME.desktop` |
 | Boot files | `~/.local/share/conduit/vms/NAME/boot/{vmlinuz,initrd.img}`: the newest kernel in the disk's `/boot`, copied out with `debugfs` before every start |
 | Cache | `~/.cache/conduit/` (Ubuntu image, the NVIDIA user-space files staged for each driver version) |
-| Programs | `$CONDUIT_PREFIX` (default `/opt/conduit`): `bin/conduit-{backend,vmm,viewer,userspace,stream}`, `bin/qemu-system-x86_64`, `share/conduit/guest/conduit-guest.deb`, `share/conduit/supported-drivers.txt`. In a source checkout it falls back to the build outputs (`host/*/target/release/…`, `host/viewer/conduit-viewer`, `host/qemu/build/…`, `dist/out/conduit-guest_*_all.deb`, built on demand with nfpm). |
+| Programs | `$CONDUIT_PREFIX` (default `/opt/conduit`): `bin/conduit-{backend,vmm,viewer,userspace,stream}`, `bin/qemu-system-x86_64`, `share/conduit/guest/conduit-guest.deb` (and `.pkg.tar.zst` for `attach` on Arch guests), `share/conduit/supported-drivers.txt`. In a source checkout it falls back to the build outputs (`host/*/target/release/…`, `host/viewer/conduit-viewer`, `host/qemu/build/…`, `dist/out/conduit-guest_*_all.deb` / `conduit-guest-*-any.pkg.tar.zst`, built on demand with nfpm). |
 
 To override a single part, set one of `CONDUIT_BACKEND`, `CONDUIT_VMM`, `CONDUIT_VIEWER`,
 `CONDUIT_USERSPACE`, `CONDUIT_STREAM`, `CONDUIT_GUEST_DEB`, `CONDUIT_QEMU` or `CONDUIT_VIRTIOFSD`.

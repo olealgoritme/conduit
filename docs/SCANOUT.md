@@ -234,6 +234,41 @@ The backend keeps the last request (`EV_MODE_HINT`, or the legacy
 A stream host talking to an older backend (no `CLIENT_IDLE` in `CMD_CAPS`)
 asks for the configured mode at session end instead, as before.
 
+## Boot console
+
+Until the guest's Conduit driver displays, there is nothing to scan out:
+firmware, the boot menu and a disk-unlock (LUKS) prompt draw on the VM's
+emulated video device. For VMs that have one, QEMU runs a VNC server on a
+Unix socket and the backend, started with `--console-vnc PATH`, connects to
+it as a client and shows that screen to the display clients instead. Input
+from the window goes to the emulated keyboard and tablet meanwhile. When the
+guest driver's first scanout arrives, the backend switches to it and input
+goes to the guest driver as usual.
+
+QEMU opens the VNC socket only after the GPU's vhost-user handshake, so the
+socket appears after the backend has started.
+
+Which VMs have it: `conduit attach`ed libvirt VMs (UEFI/BIOS firmware with an
+emulated video device; attach replaces their `<graphics>` with
+`<graphics type='vnc' socket=.../>`, see LIBVIRT.md). `conduit up` and
+Conduit's own libvirt domains boot the kernel directly with no emulated video
+(`-display none`), so they have no boot console: adding a VGA would give the
+guest a second DRM device, and a desktop (GNOME) may pick the wrong one.
+The CLI passes `--console-vnc` only when the VM has a display (not
+`--headless`) and its `vms/NAME/libvirt.json` names the socket (VMs attached
+before this existed get it on the next `conduit attach`).
+
+## When the session ends
+
+When the last file open on the guest's DRM node closes (the display manager
+stopped, the compositor exited and nothing else holds the node), the guest
+driver turns the display off, as a driver with fbdev emulation hands it back
+to the console then: the host gets a `ScanoutDisable`. A compositor that
+exits with `DRM_IOCTL_MODE_CLOSEFB` (mutter does) otherwise leaves its last
+frame on the plane, and that framebuffer keeps the buffer's dma-buf, and with
+it `conduit_gpu`, in use with no process holding anything. The next
+compositor modesets as usual.
+
 ## Viewer (host/viewer, Wayland backend)
 
 - Whenever the guest's mode and the window differ (while the guest is

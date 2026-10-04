@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use device::userspace::{
     Capability, DEFAULT_MANIFEST, DEFAULT_SEARCH_PATHS, LOADED_VERSION_PATH, load_manifest,
-    loaded_driver_version, resolve, retarget, staged_driver_version,
+    loaded_driver_version, resolve, retarget, soname, staged_driver_version,
 };
 use std::path::{Path, PathBuf};
 
@@ -215,9 +215,19 @@ fn main() -> Result<()> {
 
     // Which file names the share will actually contain. A symlink entry is
     // only worth staging if whatever it points at is one of them.
+    // That includes the soname links made below: nvidia-drm_gbm.so points at
+    // ../libnvidia-allocator.so.1, which the manifest never names.
     let staged_names: std::collections::BTreeSet<_> = found
         .iter()
         .filter_map(|r| r.guest_path.file_name().map(|n| n.to_owned()))
+        .chain(
+            found
+                .iter()
+                // Real files only: a symlink's soname is its target's
+                // (libGLX_indirect.so.0 reads as Mesa's libGLX_mesa.so.0).
+                .filter(|r| !r.host_path.is_symlink())
+                .filter_map(|r| soname(&r.host_path).map(Into::into)),
+        )
         .collect();
 
     let mut hard = 0usize;
@@ -233,6 +243,21 @@ fn main() -> Result<()> {
             let wanted = target.file_name().map(|n| n.to_owned());
             if !wanted.is_some_and(|n| staged_names.contains(&n)) {
                 dangling.push((r.guest_path.clone(), target));
+                continue;
+            }
+            // A relative link into the share stays a link. Copying it would
+            // load one library under two names: gbm/nvidia-drm_gbm.so ->
+            // ../libnvidia-allocator.so.1 is the allocator libnvidia-egl-gbm
+            // also opens by its soname.
+            if target.is_relative() {
+                let dst = root.join(&r.guest_path);
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("creating {}", parent.display()))?;
+                }
+                std::os::unix::fs::symlink(&target, &dst).with_context(|| {
+                    format!("linking {} -> {}", dst.display(), target.display())
+                })?;
                 continue;
             }
         }
@@ -252,6 +277,10 @@ fn main() -> Result<()> {
     let mut linked = 0usize;
     for r in &found {
         let staged = root.join(&r.guest_path);
+        // A staged link already has its target's soname link beside the target.
+        if staged.is_symlink() {
+            continue;
+        }
         let Some(soname) = device::userspace::soname(&staged) else {
             continue;
         };

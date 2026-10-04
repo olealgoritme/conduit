@@ -7,6 +7,9 @@
 // received from the guest driver over virtqueues.
 
 pub mod caps;
+#[cfg(feature = "vhost-user")]
+pub mod chain;
+pub mod console;
 pub mod display;
 pub mod error;
 pub mod guarded;
@@ -23,5 +26,7 @@ pub mod shm_regions;
 #[cfg(feature = "trace")]
 pub mod trace;
 pub mod userspace;
+#[cfg(feature = "venus")]
+pub mod venus;
 pub mod virtio;
 pub mod vram;

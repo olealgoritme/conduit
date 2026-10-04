@@ -3,6 +3,9 @@
 //! The guest driver (`guest/linux/conduit_gpu.c`) binds virtio device ID 45 and
 //! posts one descriptor chain per request: a readable descriptor holding the
 //! request, and a writable one for the response. That is the whole transport.
+//! Virtio allows either to be split across several descriptors, and another
+//! guest may post a reply as a header buffer and a body buffer, so every
+//! queue here reads and writes whole chains (`device::chain`).
 //!
 //! Attach it to QEMU >= 11.1 with the generic vhost-user device (named
 //! `vhost-user-test-device-pci` there), which asks for the shared-memory
@@ -21,7 +24,7 @@
 //! Guest memory must be shared (`memory-backend-memfd,share=on`) or the backend
 //! cannot read the request the guest wrote.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -30,13 +33,20 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use device::caps::Caps;
+use device::chain::{
+    ReadableAfterWritable, Segment, capacity, sort_chain, writable, write_scattered,
+};
 use device::display::{DisplayLink, DisplayMode, InputSink};
 use device::host;
 use device::nvidia::NvidiaBackend;
 use device::shm::WindowPlacer;
+#[cfg(not(feature = "venus"))]
+use device::shm_regions::region_sizes;
 use device::shm_regions::{
-    APERTURE_LEN, SHM_ID_APERTURE, SHM_ID_WINDOW, page_align, pool_map_flags, region_sizes,
+    APERTURE_LEN, SHM_ID_APERTURE, SHM_ID_WINDOW, page_align, pool_map_flags,
 };
+#[cfg(feature = "venus")]
+use device::shm_regions::{SHM_ID_VENUS, region_sizes_with_venus};
 use device::virtio::{NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use protocol::messages::{
     CLIPBOARD_MESSAGE_HEAD, CLIPBOARD_MIME_TEXT, ClipboardChunk, DISPLAY_MODE_MESSAGE_LEN,
@@ -52,7 +62,7 @@ use vhost::vhost_user::{Backend, VhostUserFrontendReqHandler};
 use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringRwLock, VringT};
 use virtio_bindings::bindings::virtio_config::{VIRTIO_F_NOTIFY_ON_EMPTY, VIRTIO_F_VERSION_1};
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use virtio_queue::QueueOwnedT;
+use virtio_queue::{QueueOwnedT, QueueT};
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend,
     GuestMemoryLoadGuard, GuestMemoryMmap, GuestMemoryRegion,
@@ -110,6 +120,16 @@ struct Args {
           value_parser = ["on", "off"])]
     display_cursor: String,
 
+    /// The VM's emulated screen as a VNC server on this unix socket (QEMU
+    /// `-vnc unix:PATH`): the boot console. Shown in the display clients,
+    /// with the keyboard and pointer, whenever the guest's driver is not
+    /// showing frames -- firmware setup, boot menu, disk password, early
+    /// kernel output. Connected lazily and reconnected; needs --display or
+    /// --display-socket. Frames go as shared memory (a viewer with
+    /// --present-mode=auto or shm shows them).
+    #[arg(long, value_name = "PATH")]
+    console_vnc: Option<PathBuf>,
+
     /// Start even when the host driver release has no ABI tables of its own,
     /// using the nearest older release's. Expect guests to fail at their first
     /// channel allocation: the allowlist refuses every class whose size
@@ -137,6 +157,25 @@ struct Args {
     #[cfg(feature = "trace")]
     #[arg(long, value_name = "PATH")]
     trace_socket: Option<PathBuf>,
+
+    /// Serve Venus to a Windows guest (docs/VENUS.md): sets the config bit,
+    /// answers GpuCmd and advertises shared memory region 3. Needs a frontend
+    /// that asks for the region table (QEMU); conduit-vmm's BARs are fixed.
+    #[cfg(feature = "venus")]
+    #[arg(long)]
+    venus: bool,
+
+    /// Size of region 3, where host-visible Venus blobs are mapped, in MiB.
+    /// A power of two.
+    #[cfg(feature = "venus")]
+    #[arg(long, value_name = "MIB",
+          default_value_t = device::shm_regions::VENUS_HOSTMEM_MIB_DEFAULT)]
+    venus_hostmem_mib: u64,
+
+    /// The conduit-venus renderer's socket. Required with --venus.
+    #[cfg(feature = "venus")]
+    #[arg(long, value_name = "PATH")]
+    venus_renderer: Option<PathBuf>,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -264,20 +303,78 @@ impl WindowPlacer for VhostWindow {
             .map(|_| ())
             .map_err(device::error::DeviceError::Io)
     }
+
+    #[cfg(feature = "venus")]
+    fn place_blob(&self, offset: u64, len: u64, fd: RawFd) -> device::error::Result<()> {
+        let req = VhostUserMMap {
+            shmid: SHM_ID_VENUS,
+            padding: [0; 7],
+            fd_offset: 0,
+            shm_offset: offset,
+            len: page_align(len),
+            flags: VhostUserMMapFlags::WRITABLE.bits(),
+        };
+        // SAFETY: the descriptor is owned by the Venus resource for the whole
+        // of this call, and is only borrowed to be sent.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        self.0
+            .shmem_map(&req, &borrowed)
+            .map(|_| ())
+            .map_err(device::error::DeviceError::Io)
+    }
+
+    #[cfg(feature = "venus")]
+    fn withdraw_blob(&self, offset: u64, len: u64) -> device::error::Result<()> {
+        let req = VhostUserMMap {
+            shmid: SHM_ID_VENUS,
+            padding: [0; 7],
+            fd_offset: 0,
+            shm_offset: offset,
+            len: page_align(len),
+            flags: 0,
+        };
+        self.0
+            .shmem_unmap(&req)
+            .map(|_| ())
+            .map_err(device::error::DeviceError::Io)
+    }
 }
 
 /// What the event thread is told to start and stop watching.
 enum Watch {
-    Add(u32, OwnedFd),
+    /// A descriptor, and whether it is a fence: reported once, with its
+    /// status, then dropped from the set (docs/SYNC.md).
+    Add(u32, OwnedFd, bool),
     Remove(u32),
 }
 
-/// One `EventReady` message: a bare header naming the descriptor.
-fn event_ready_bytes(handle: u32) -> Vec<u8> {
-    let hdr = MsgHeader::ok(MsgType::EventReady, handle);
+/// One `EventReady` message: a bare header naming the descriptor. `status`
+/// is 0, or a fence's error as a negative errno.
+fn event_ready_bytes(handle: u32, status: i32) -> Vec<u8> {
+    let mut hdr = MsgHeader::ok(MsgType::EventReady, handle);
+    hdr.status = status;
     // The wire form is the struct's bytes, which is what the driver reads.
     let p = &hdr as *const MsgHeader as *const u8;
     unsafe { std::slice::from_raw_parts(p, size_of::<MsgHeader>()) }.to_vec()
+}
+
+/// A signalled sync_file's outcome: 0, or its error as a negative errno (a
+/// host fence that timed out is `-ETIMEDOUT`).
+fn sync_file_status(fd: RawFd) -> i32 {
+    sync_file_raw_status(fd).map_or(0, |s| s.min(0))
+}
+
+/// `sync_file_info.status` as the kernel reports it: 1 signalled, 0 pending,
+/// negative an error. `None` for a descriptor that is not a sync_file.
+/// `SYNC_IOC_FILE_INFO` with no fence array asks for the status alone.
+fn sync_file_raw_status(fd: RawFd) -> Option<i32> {
+    // struct sync_file_info: char name[32]; s32 status; u32 flags;
+    // u32 num_fences; u32 pad; u64 sync_fence_info.
+    const SYNC_IOC_FILE_INFO: u64 = (3 << 30) | (56 << 16) | ((b'>' as u64) << 8) | 4;
+    let mut info = [0u8; 56];
+    // SAFETY: a live 56-byte buffer, the size the request declares.
+    let rc = unsafe { libc::ioctl(fd, SYNC_IOC_FILE_INFO as libc::Ioctl, info.as_mut_ptr()) };
+    (rc == 0).then(|| i32::from_le_bytes(info[32..36].try_into().expect("4 bytes")))
 }
 
 /// Put one message on the event queue, into a buffer the guest posted there.
@@ -285,12 +382,17 @@ fn event_ready_bytes(handle: u32) -> Vec<u8> {
 /// Returns false when the guest has posted none, which is the normal state of
 /// a guest whose driver predates this queue having a use -- and a reason to
 /// drop the notification rather than to fail.
-fn push_event(vring: &VringRwLock, mem: &GuestMemoryAtomic<GuestMemoryMmap>, handle: u32) -> bool {
+fn push_event(
+    vring: &VringRwLock,
+    mem: &GuestMemoryAtomic<GuestMemoryMmap>,
+    handle: u32,
+    status: i32,
+) -> bool {
     #[cfg(feature = "trace")]
     if device::trace::enabled() {
-        return push_event_traced(vring, mem, handle);
+        return push_event_traced(vring, mem, handle, status);
     }
-    deliver_event(vring, mem, handle)
+    deliver_event(vring, mem, handle, status)
 }
 
 /// `push_event`, recorded: an `event` record whose latency is the time it
@@ -302,10 +404,11 @@ fn push_event_traced(
     vring: &VringRwLock,
     mem: &GuestMemoryAtomic<GuestMemoryMmap>,
     handle: u32,
+    status: i32,
 ) -> bool {
     use device::trace::format::{Call, Kind, Record};
     let t0 = device::trace::now_ns();
-    let delivered = deliver_event(vring, mem, handle);
+    let delivered = deliver_event(vring, mem, handle, status);
     device::trace::emit(Record {
         ts_ns: t0,
         handle,
@@ -322,6 +425,7 @@ fn deliver_event(
     vring: &VringRwLock,
     mem: &GuestMemoryAtomic<GuestMemoryMmap>,
     handle: u32,
+    status: i32,
 ) -> bool {
     let guard = mem.memory();
     let mut vr = vring.get_mut();
@@ -334,17 +438,10 @@ fn deliver_event(
     let head = chain.head_index();
     drop(vr);
 
-    let bytes = event_ready_bytes(handle);
-    let mut written = 0usize;
-    for desc in chain {
-        if desc.is_write_only() {
-            let n = std::cmp::min(desc.len() as usize, bytes.len());
-            if guard.write_slice(&bytes[..n], desc.addr()).is_ok() {
-                written = n;
-            }
-            break;
-        }
-    }
+    // Across every writable buffer: a guest may post the event buffer split
+    // in two (header, body), where the Linux guest posts one.
+    let bytes = event_ready_bytes(handle, status);
+    let written = write_scattered(&*guard, &writable(chain), &bytes).unwrap_or(0);
 
     if vring.add_used(head, written as u32).is_err() {
         return false;
@@ -389,16 +486,19 @@ impl InputSink for VqInputSink {
             let head = chain.head_index();
             drop(vr);
 
+            // Sized to all its writable buffers together, which a guest may
+            // post split (header, body) where the Linux guest posts one.
+            let segs = writable(chain);
             let mut written = 0u32;
-            if let Some(desc) = chain.clone().find(|d| d.is_write_only()) {
-                let fit = input_events_that_fit(desc.len() as usize);
+            if !segs.is_empty() {
+                let fit = input_events_that_fit(capacity(&segs));
                 if fit == 0 {
                     // A driver whose event buffers hold only a header cannot
                     // take input at all; say so once and drop it.
                     if !self.warned_small {
                         log::warn!(
                             "display: guest event buffers are {} bytes, too small for input; input dropped (driver predates InputEvent?)",
-                            desc.len()
+                            capacity(&segs)
                         );
                         self.warned_small = true;
                     }
@@ -409,8 +509,8 @@ impl InputSink for VqInputSink {
                         .resize(protocol::messages::input_event_message_len(take), 0);
                     let n = encode_input_events(&events[done..done + take], &mut self.msg)
                         .expect("sized for it");
-                    if guard.write_slice(&self.msg[..n], desc.addr()).is_ok() {
-                        written = n as u32;
+                    if let Ok(w) = write_scattered(&*guard, &segs, &self.msg[..n]) {
+                        written = w as u32;
                     }
                     done += take;
                 }
@@ -441,14 +541,13 @@ impl InputSink for VqInputSink {
         };
         let head = chain.head_index();
         drop(vr);
+        let segs = writable(chain);
         let mut written = 0u32;
-        if let Some(desc) = chain.clone().find(|d| d.is_write_only())
-            && desc.len() as usize >= DISPLAY_MODE_MESSAGE_LEN
-        {
+        if capacity(&segs) >= DISPLAY_MODE_MESSAGE_LEN {
             let mut msg = [0u8; DISPLAY_MODE_MESSAGE_LEN];
             let n = encode_display_mode(m, &mut msg).expect("sized for it");
-            if guard.write_slice(&msg[..n], desc.addr()).is_ok() {
-                written = n as u32;
+            if let Ok(w) = write_scattered(&*guard, &segs, &msg[..n]) {
+                written = w as u32;
             }
         }
         if vring.add_used(head, written).is_err() {
@@ -479,14 +578,15 @@ impl InputSink for VqInputSink {
             };
             let head = chain.head_index();
             drop(vr);
+            let segs = writable(chain);
             let mut written = 0u32;
-            if let Some(desc) = chain.clone().find(|d| d.is_write_only()) {
-                let room = (desc.len() as usize).saturating_sub(CLIPBOARD_MESSAGE_HEAD);
+            if !segs.is_empty() {
+                let room = capacity(&segs).saturating_sub(CLIPBOARD_MESSAGE_HEAD);
                 if room == 0 {
                     if !self.warned_clip_small {
                         log::warn!(
                             "display: guest event buffers are {} bytes, too small for clipboard; host clipboard dropped (driver predates ClipboardFromHost?)",
-                            desc.len()
+                            capacity(&segs)
                         );
                         self.warned_clip_small = true;
                     }
@@ -509,8 +609,8 @@ impl InputSink for VqInputSink {
                         &mut self.msg,
                     )
                     .expect("sized for it");
-                    if guard.write_slice(&self.msg[..n], desc.addr()).is_ok() {
-                        written = n as u32;
+                    if let Ok(w) = write_scattered(&*guard, &segs, &self.msg[..n]) {
+                        written = w as u32;
                     }
                     offset += take;
                 }
@@ -559,6 +659,9 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
     let epfd = unsafe { OwnedFd::from_raw_fd(epfd) };
 
     let mut watched: HashMap<u64, OwnedFd> = HashMap::new();
+    // Fences: reported once and then forgotten, since a signalled sync_file
+    // never stops being readable and the sweep would re-send it every pass.
+    let mut once: HashSet<u64> = HashSet::new();
     let mut last_sweep = Instant::now();
 
     // Edge-triggered. Level-triggered would report a descriptor as readable
@@ -581,12 +684,16 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
         // thread must leave the set before it can be reported again.
         loop {
             match rx.try_recv() {
-                Ok(Watch::Add(handle, fd)) => {
+                Ok(Watch::Add(handle, fd, fence)) => {
                     if ctl(libc::EPOLL_CTL_ADD, fd.as_raw_fd(), handle) == 0 {
                         watched.insert(handle as u64, fd);
+                        if fence {
+                            once.insert(handle as u64);
+                        }
                     }
                 }
                 Ok(Watch::Remove(handle)) => {
+                    once.remove(&(handle as u64));
                     if let Some(fd) = watched.remove(&(handle as u64)) {
                         ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle);
                     }
@@ -601,6 +708,7 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
         // posted. Every 10 ms, ask the descriptors directly and re-notify the
         // ones that still have something to say. A lost wake costs a tenth of
         // a frame at 60 Hz rather than a hang.
+        let mut reported: Vec<u64> = Vec::new();
         if last_sweep.elapsed() >= SWEEP {
             last_sweep = Instant::now();
             for (&handle, fd) in watched.iter() {
@@ -610,7 +718,14 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
                     revents: 0,
                 };
                 if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & libc::POLLIN != 0 {
-                    push_event(&vring, &mem, handle as u32);
+                    let status = if once.contains(&handle) {
+                        sync_file_status(fd.as_raw_fd())
+                    } else {
+                        0
+                    };
+                    if push_event(&vring, &mem, handle as u32, status) && once.contains(&handle) {
+                        reported.push(handle);
+                    }
                 }
             }
         }
@@ -637,9 +752,123 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
             // Copied out first: epoll_event is packed, so its field cannot be
             // borrowed.
             let handle = { ev.u64 } as u32;
-            if !push_event(&vring, &mem, handle) {
-                log::debug!("event pump: no buffer posted for handle {handle}; dropped");
+            let fence = once.contains(&(handle as u64));
+            // Already sent by the sweep above: one EventReady per fence.
+            if fence && reported.contains(&(handle as u64)) {
+                continue;
             }
+            let status = match watched.get(&(handle as u64)) {
+                Some(fd) if fence => sync_file_status(fd.as_raw_fd()),
+                _ => 0,
+            };
+            if !push_event(&vring, &mem, handle, status) {
+                // A fence stays in the set, and the sweep sends it again.
+                log::debug!("event pump: no buffer posted for handle {handle}; dropped");
+            } else if fence {
+                reported.push(handle as u64);
+            }
+        }
+        // A fence the guest has heard about is done here. Its descriptor
+        // stays open until the guest closes the handle.
+        for handle in reported {
+            once.remove(&handle);
+            if let Some(fd) = watched.remove(&handle) {
+                ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle as u32);
+            }
+        }
+    }
+}
+
+/// Return held chains whose fences have signalled: write each response and
+/// put the chain on the used ring. Returns whether any was.
+#[cfg(feature = "venus")]
+fn deliver_completions(
+    nvidia: &Mutex<NvidiaBackend>,
+    held: &HeldChains,
+    vring: &VringRwLock,
+    mem: &GuestMemoryMmap,
+) -> bool {
+    let done = nvidia.lock().expect("backend mutex").venus_completions();
+    if done.is_empty() {
+        return false;
+    }
+    let mut chains = held.lock().expect("held chains");
+    let mut any = false;
+    for c in done {
+        let Some(chain) = chains.remove(&c.token) else {
+            continue; // its queue was reset meanwhile
+        };
+        // Capped as the control queue caps a response it builds itself.
+        let n = c.resp.len().min(capacity(&chain.resp)).min(RESP_MAX);
+        if let Err(e) = write_scattered(mem, &chain.resp, &c.resp[..n]) {
+            log::warn!("venus: writing the response of chain {}: {e}", chain.head);
+        }
+        if let Err(e) = vring.add_used(chain.head, n as u32) {
+            log::warn!("venus: returning chain {}: {e}", chain.head);
+            continue;
+        }
+        any = true;
+    }
+    drop(chains);
+    if any {
+        let _ = vring.signal_used_queue();
+    }
+    any
+}
+
+/// Wait on the renderer's fence descriptor and return chains as their
+/// fences signal (docs/VENUS.md "Fences"). Started with `--venus` only, once
+/// the control queue is up.
+///
+/// The descriptor is what wakes this; the timeout is a safety net for a
+/// wake that came while the backend lock was held elsewhere, short while
+/// chains are waiting and long while none are.
+///
+/// It is also how renderer death is found between commands (docs/VENUS.md
+/// "Reset and close"): the renderer reports it through the same descriptor,
+/// Venus releases everything and fails every held chain `RESP_ERR_UNSPEC`,
+/// which this returns, and from then on refuses every `GpuCmd`. No fence
+/// will ever signal again, so the pump then stops; chains failed later
+/// (none are held once the renderer is lost) go back from the queue handler.
+#[cfg(feature = "venus")]
+fn fence_pump(
+    fd: OwnedFd,
+    nvidia: Arc<Mutex<NvidiaBackend>>,
+    held: HeldChains,
+    vring: VringRwLock,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+) {
+    loop {
+        let waiting = !held.lock().expect("held chains").is_empty();
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live pollfd.
+        let n = unsafe { libc::poll(&mut pfd, 1, if waiting { 2 } else { 100 }) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            log::error!("fence pump: poll: {err}");
+            return;
+        }
+        if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            log::error!("fence pump: the renderer's fence descriptor is gone");
+            return;
+        }
+        let delivered = deliver_completions(&nvidia, &held, &vring, &mem.memory());
+        if nvidia.lock().expect("backend mutex").venus_lost() {
+            log::error!(
+                "fence pump: the renderer is gone; held chains failed, GpuCmd refused from now on"
+            );
+            return;
+        }
+        // Readable with nothing to deliver: do not spin on it.
+        if n > 0 && !delivered {
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }
@@ -669,9 +898,39 @@ struct NvGpuBackend {
     /// whole RM call, and only the bytes dispatch writes are sent back.
     req: Vec<u8>,
     resp: Vec<u8>,
+    /// The chain's readable and writable buffers, kept across chains for the
+    /// same reason.
+    readable: Vec<Segment>,
+    writable: Vec<Segment>,
     /// A request was served since the device was last (re)started. A restart
     /// that finds this set is a guest that rebooted or reloaded its driver.
     served: bool,
+    /// Venus, with `--venus`: the size of region 3 (0 without), and the
+    /// fenced chains waiting for their fences.
+    #[cfg(feature = "venus")]
+    venus: VenusChains,
+}
+
+/// A fenced `GpuCmd` chain, kept off the used ring until its fence signals
+/// (docs/VENUS.md "Fences"): where its response goes, every writable buffer
+/// of the chain in order.
+#[cfg(feature = "venus")]
+struct HeldChain {
+    head: u16,
+    resp: Vec<Segment>,
+}
+
+#[cfg(feature = "venus")]
+type HeldChains = Arc<Mutex<HashMap<u64, HeldChain>>>;
+
+#[cfg(feature = "venus")]
+#[derive(Default)]
+struct VenusChains {
+    /// Region 3's size; 0 is no Venus, and then nothing below is used.
+    hostmem_len: u64,
+    held: HeldChains,
+    /// The fence pump is running.
+    pump: bool,
 }
 
 impl NvGpuBackend {
@@ -728,6 +987,8 @@ impl NvGpuBackend {
 
         let nvidia_vram_mib = nvidia.vram_limit_mib();
         let mut config = VirtioGpuNvConfig::new(&version, &gpus, caps, nvidia_vram_mib);
+        // The event pump below reports fence handles once (docs/SYNC.md).
+        config.set_drm_fences();
         if let Some((mode, link, cursor)) = display {
             config.set_display(mode.width, mode.height, mode.refresh_hz);
             if cursor {
@@ -747,8 +1008,52 @@ impl NvGpuBackend {
             input_target,
             req: Vec::new(),
             resp: vec![0u8; RESP_MAX],
+            readable: Vec::new(),
+            writable: Vec::new(),
             served: false,
+            #[cfg(feature = "venus")]
+            venus: VenusChains::default(),
         })
+    }
+
+    /// Serve Venus (`--venus`): the config bit, `GpuCmd`, and region 3 of
+    /// `hostmem_len` bytes.
+    #[cfg(feature = "venus")]
+    fn enable_venus(&mut self, renderer: Box<dyn conduit_venus::Renderer>, hostmem_len: u64) {
+        let display = ({ self.config.features } & protocol::messages::NVGPU_CFG_DISPLAY != 0)
+            .then_some((self.config.display_width, self.config.display_height));
+        self.config.set_venus();
+        self.nvidia
+            .lock()
+            .expect("backend mutex")
+            .set_venus(device::venus::Venus::new(renderer, hostmem_len, display));
+        self.venus.hostmem_len = hostmem_len;
+    }
+
+    /// Return every held chain whose fence has signalled, and start the
+    /// thread that does so on its own once there is a queue to return them
+    /// to. Inert without `--venus`.
+    #[cfg(feature = "venus")]
+    fn venus_complete(&mut self, vring: &VringRwLock, mem: &GuestMemoryMmap) {
+        if self.venus.hostmem_len == 0 {
+            return;
+        }
+        deliver_completions(&self.nvidia, &self.venus.held, vring, mem);
+        if self.venus.pump {
+            return;
+        }
+        let (Some(atomic), Some(fd)) = (
+            self.mem.clone(),
+            self.nvidia.lock().expect("backend mutex").venus_fence_fd(),
+        ) else {
+            return;
+        };
+        let (nvidia, held, vring) = (self.nvidia.clone(), self.venus.held.clone(), vring.clone());
+        std::thread::Builder::new()
+            .name("nvgpu-fences".into())
+            .spawn(move || fence_pump(fd, nvidia, held, vring, atomic))
+            .map(|_| self.venus.pump = true)
+            .unwrap_or_else(|e| log::error!("fence pump would not start: {e}"));
     }
 
     /// Keep the event thread's poll set in step with the descriptors the
@@ -758,12 +1063,12 @@ impl NvGpuBackend {
     /// owns the original and may close it at any time; a watch holding the same
     /// number would then be watching whatever opened next.
     fn sync_watches(&mut self, vrings: &[VringRwLock]) {
-        let (added, removed) = self
-            .nvidia
-            .lock()
-            .expect("backend mutex")
-            .take_watch_updates();
-        if added.is_empty() && removed.is_empty() && self.watches.is_some() {
+        let (added, removed, fences) = {
+            let mut nvidia = self.nvidia.lock().expect("backend mutex");
+            let (added, removed) = nvidia.take_watch_updates();
+            (added, removed, nvidia.take_fence_watches())
+        };
+        if added.is_empty() && removed.is_empty() && fences.is_empty() && self.watches.is_some() {
             return;
         }
 
@@ -783,7 +1088,13 @@ impl NvGpuBackend {
             return;
         };
 
-        for (handle, fd) in added {
+        // Adds before removes: a fence made and closed between two passes
+        // must not be left watched.
+        let all = added
+            .into_iter()
+            .map(|(h, fd)| (h, fd, false))
+            .chain(fences.into_iter().map(|(h, fd)| (h, fd, true)));
+        for (handle, fd, fence) in all {
             let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
             if dup < 0 {
                 log::warn!(
@@ -792,7 +1103,11 @@ impl NvGpuBackend {
                 );
                 continue;
             }
-            let _ = tx.send(Watch::Add(handle, unsafe { OwnedFd::from_raw_fd(dup) }));
+            let _ = tx.send(Watch::Add(
+                handle,
+                unsafe { OwnedFd::from_raw_fd(dup) },
+                fence,
+            ));
         }
         for handle in removed {
             let _ = tx.send(Watch::Remove(handle));
@@ -803,6 +1118,9 @@ impl NvGpuBackend {
     fn reset(&mut self, why: &str) {
         log::info!("{why}: resetting the device");
         self.nvidia.lock().expect("backend mutex").reset();
+        // Held chains belonged to the queue the frontend just reset.
+        #[cfg(feature = "venus")]
+        self.venus.held.lock().expect("held chains").clear();
         self.served = false;
     }
 
@@ -842,25 +1160,35 @@ impl NvGpuBackend {
             let mut record = None;
 
             let head = chain.head_index();
-            let mut resp_desc = None;
             self.req.clear();
 
-            for desc in chain.clone() {
-                if desc.is_write_only() {
-                    resp_desc = Some(desc);
-                } else {
+            // The request may span several readable descriptors and the
+            // response several writable ones (virtio allows either; the
+            // Linux guest posts one of each), readable first.
+            let layout = sort_chain(chain.clone(), &mut self.readable, &mut self.writable);
+            if layout.is_ok() {
+                for &(addr, len) in &self.readable {
                     let at = self.req.len();
-                    self.req.resize(at + desc.len() as usize, 0);
-                    mem.read_slice(&mut self.req[at..], desc.addr())
-                        .map_err(|e| {
-                            std::io::Error::other(format!("read request descriptor: {e}"))
-                        })?;
+                    self.req.resize(at + len as usize, 0);
+                    mem.read_slice(&mut self.req[at..], addr).map_err(|e| {
+                        std::io::Error::other(format!("read request descriptor: {e}"))
+                    })?;
                 }
             }
 
-            let written = match resp_desc {
-                Some(d) => {
-                    let cap = std::cmp::min(d.len() as usize, RESP_MAX);
+            let written = match layout {
+                Err(ReadableAfterWritable) => {
+                    log::warn!(
+                        "chain {head} has a readable descriptor after a writable one; dropping"
+                    );
+                    0
+                }
+                Ok(()) if self.writable.is_empty() => {
+                    log::warn!("chain {head} has no writable descriptor; dropping");
+                    0
+                }
+                Ok(()) => {
+                    let cap = std::cmp::min(capacity(&self.writable), RESP_MAX);
                     let resp = &mut self.resp[..cap];
                     let mut nvidia = self.nvidia.lock().expect("backend mutex");
                     #[cfg(feature = "trace")]
@@ -873,17 +1201,36 @@ impl NvGpuBackend {
                     };
                     #[cfg(not(feature = "trace"))]
                     let n = nvidia.dispatch(&self.req, resp);
+                    // A fenced GpuCmd: nothing written, and the chain stays
+                    // off the used ring until the fence pump returns it.
+                    // Recorded under the backend lock, so its completion
+                    // cannot be looked for before it is here.
+                    #[cfg(feature = "venus")]
+                    if let Some(token) = nvidia.take_held() {
+                        self.venus.held.lock().expect("held chains").insert(
+                            token,
+                            HeldChain {
+                                head,
+                                resp: self.writable.clone(),
+                            },
+                        );
+                        drop(nvidia);
+                        #[cfg(feature = "trace")]
+                        if TRACE && let Some(mut r) = record {
+                            r.reply_ns = device::trace::now_ns().saturating_sub(t_recv);
+                            device::trace::emit(r);
+                        }
+                        used = true;
+                        self.served = true;
+                        continue;
+                    }
                     drop(nvidia);
                     if n > 0 {
-                        mem.write_slice(&resp[..n], d.addr()).map_err(|e| {
+                        write_scattered(&**mem, &self.writable, &resp[..n]).map_err(|e| {
                             std::io::Error::other(format!("write response descriptor: {e}"))
                         })?;
                     }
                     n
-                }
-                None => {
-                    log::warn!("chain {head} has no writable descriptor; dropping");
-                    0
                 }
             };
 
@@ -971,7 +1318,17 @@ impl VhostUserBackendMut for NvGpuBackend {
     fn get_shmem_config(&self) -> std::io::Result<VhostUserShMemConfig> {
         SPEC_SHMEM_FRONTEND.store(true, std::sync::atomic::Ordering::Relaxed);
         let window = self.nvidia.lock().expect("backend mutex").shm_total_size();
+        #[cfg(feature = "venus")]
+        let (n, sizes) = region_sizes_with_venus(window, APERTURE_LEN, self.venus.hostmem_len);
+        #[cfg(not(feature = "venus"))]
         let (n, sizes) = region_sizes(window, APERTURE_LEN);
+        #[cfg(feature = "venus")]
+        if self.venus.hostmem_len != 0 {
+            log::info!(
+                "shared memory: Venus host-visible region {} MiB (shmid {SHM_ID_VENUS})",
+                sizes[SHM_ID_VENUS as usize] >> 20
+            );
+        }
         log::info!(
             "shared memory: window {} MiB (shmid {SHM_ID_WINDOW}), aperture {} MiB (shmid {SHM_ID_APERTURE})",
             sizes[SHM_ID_WINDOW as usize] >> 20,
@@ -1038,6 +1395,8 @@ impl VhostUserBackendMut for NvGpuBackend {
         } else {
             self.process(vring, &mem)?;
         }
+        #[cfg(feature = "venus")]
+        self.venus_complete(vring, &mem);
         // After serving, not before: a message that opened a descriptor has to
         // have been served for the backend to know about it.
         self.sync_watches(vrings);
@@ -1101,6 +1460,52 @@ fn open_trace_file(
         .map_err(|e| anyhow::anyhow!("trace file {}: {e}", path.display()))?;
     log::info!("trace: writing {format:?} records to {}", path.display());
     Ok(Some((file, format)))
+}
+
+/// The renderer `--venus` talks to: the conduit-venus process at
+/// `--venus-renderer`. `CONDUIT_VENUS_MOCK=1` serves from the in-memory
+/// mock instead, which renders nothing, for testing the device without a
+/// renderer. Connected after the sandbox, as a display client is: the
+/// client starts a thread, which the sandbox must already cover.
+#[cfg(feature = "venus")]
+fn venus_renderer(args: &Args) -> anyhow::Result<Box<dyn conduit_venus::Renderer>> {
+    if std::env::var("CONDUIT_VENUS_MOCK").as_deref() == Ok("1") {
+        log::warn!(
+            "venus: CONDUIT_VENUS_MOCK=1: serving from the mock renderer, which draws nothing"
+        );
+        return Ok(Box::new(conduit_venus::mock::Mock::new()));
+    }
+    let path = args.venus_renderer.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "refusing to start: --venus needs --venus-renderer PATH (conduit-venus's socket)"
+        )
+    })?;
+    let client = conduit_venus::ipc::IpcClient::connect(path).map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to start: venus renderer at {}: {e}",
+            path.display()
+        )
+    })?;
+    log::info!("venus: renderer at {}", path.display());
+    Ok(Box::new(client))
+}
+
+/// Whether the guest still drives the device, for the boot console: its
+/// event queue was running and is not any more. QEMU stops a vhost-user
+/// device's rings on a guest reset, but (for its generic vhost-user device)
+/// says nothing else until the next boot's driver starts it again -- and the
+/// firmware screen in between is what the console is for.
+fn guest_queues_probe(target: EventTarget) -> device::console::GuestProbe {
+    let mut was_ready = false;
+    Box::new(move || {
+        let Some((vring, _)) = target.lock().expect("event target").clone() else {
+            return true; // no guest queues yet: nothing to judge by
+        };
+        let ready = vring.get_ref().get_queue().ready();
+        let stopped = was_ready && !ready;
+        was_ready = ready;
+        !stopped
+    })
 }
 
 /// Like `VhostUserDaemon::serve`: a guest that quits mid-message is a normal end.
@@ -1214,14 +1619,50 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    let backend = Arc::new(RwLock::new(NvGpuBackend::new(
+    // The boot console: QEMU's VNC screen while the guest's driver shows
+    // nothing. Its thread, like the display's, starts after the sandbox.
+    let _console = match (&args.console_vnc, &display) {
+        (Some(path), Some((_, link, _))) => {
+            let console = device::console::Console::start(
+                link.clone(),
+                path.clone(),
+                Some(guest_queues_probe(input_target.clone())),
+            )
+            .map_err(|e| anyhow::anyhow!("console thread: {e}"))?;
+            log::info!("console: the VM's screen from {}", path.display());
+            Some(console)
+        }
+        (Some(path), None) => {
+            log::warn!(
+                "console: --console-vnc {} ignored: the device has no display (--display or \
+                 --display-socket)",
+                path.display()
+            );
+            None
+        }
+        (None, _) => None,
+    };
+
+    #[allow(unused_mut)]
+    let mut nvgpu = NvGpuBackend::new(
         &args.proc_nvidia,
         args.allow_nearest_abi,
         args.caps,
         args.vram_limit_mib,
         display,
         input_target,
-    )?));
+    )?;
+    #[cfg(feature = "venus")]
+    if args.venus {
+        let len = device::shm_regions::venus_hostmem_len(args.venus_hostmem_mib)
+            .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
+        nvgpu.enable_venus(venus_renderer(&args)?, len);
+        log::info!(
+            "venus: serving GpuCmd, region 3 {} MiB",
+            args.venus_hostmem_mib
+        );
+    }
+    let backend = Arc::new(RwLock::new(nvgpu));
     #[cfg(feature = "trace")]
     {
         if let Some(v) = host::driver_version(&args.proc_nvidia)
@@ -1282,4 +1723,71 @@ fn main() -> anyhow::Result<()> {
     // backend waits on worker threads (vring, events) that may never return.
     // Socket activation relies on this process ending with the VM.
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fence's status rides in the header, signed, as the guest reads it.
+    #[test]
+    fn event_ready_carries_a_fence_status() {
+        let b = event_ready_bytes(42, -libc::ETIMEDOUT);
+        let hdr: MsgHeader = unsafe { std::ptr::read_unaligned(b.as_ptr() as *const MsgHeader) };
+        assert_eq!(hdr.msg_type, MsgType::EventReady as u32);
+        assert_eq!(hdr.handle, 42);
+        assert_eq!(hdr.status, -libc::ETIMEDOUT);
+        assert_eq!(event_ready_bytes(42, 0)[8..12], [0, 0, 0, 0]);
+    }
+
+    /// SYNC_IOC_FILE_INFO against the real kernel: a signalled sync_file
+    /// reads as 0, not as its raw status of 1. Skipped without a render node.
+    #[test]
+    fn a_signalled_sync_file_has_status_zero() {
+        let Some(node) = std::fs::read_dir("/dev/dri").ok().and_then(|d| {
+            d.flatten()
+                .map(|e| e.path())
+                .find(|p| p.to_string_lossy().contains("renderD"))
+        }) else {
+            eprintln!("SKIP: no /dev/dri/renderD*; this test passes without testing anything");
+            return;
+        };
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&node)
+        else {
+            eprintln!("SKIP: cannot open {}", node.display());
+            return;
+        };
+        let iowr = |nr: u64, size: u64| (3u64 << 30) | (size << 16) | ((b'd' as u64) << 8) | nr;
+        let mut create = [0u32, 1]; // handle, DRM_SYNCOBJ_CREATE_SIGNALED
+        let rc = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                iowr(0xbf, 8) as libc::Ioctl,
+                create.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "SYNCOBJ_CREATE");
+        let mut export = [create[0], 1, u32::MAX, 0]; // EXPORT_SYNC_FILE, fd -1
+        let rc = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                iowr(0xc1, 16) as libc::Ioctl,
+                export.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "SYNCOBJ_HANDLE_TO_FD");
+        let sync = unsafe { OwnedFd::from_raw_fd(export[2] as i32) };
+        assert_eq!(
+            sync_file_raw_status(sync.as_raw_fd()),
+            Some(1),
+            "the ioctl is right"
+        );
+        assert_eq!(sync_file_status(sync.as_raw_fd()), 0);
+        // Not a sync_file at all: no error invented.
+        assert_eq!(sync_file_raw_status(file.as_raw_fd()), None);
+        assert_eq!(sync_file_status(file.as_raw_fd()), 0);
+    }
 }

@@ -54,6 +54,12 @@ pub struct Link {
     /// The emulator the domain uses (for doctor).
     #[serde(default)]
     pub emulator: PathBuf,
+    /// The domain's VNC socket (the boot console), when it has one: the
+    /// backend shows it until the guest driver displays (`--console-vnc`).
+    /// Attached VMs (firmware + emulated video); managed ones boot the kernel
+    /// directly with no emulated display, so they have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<PathBuf>,
 }
 
 impl Link {
@@ -571,6 +577,7 @@ pub fn enable(name: &str) -> Result<()> {
         kind: Kind::Managed,
         backup: None,
         emulator: emu,
+        console: None,
     }
     .save(name)?;
     install_desktop_entry(name, &me);
@@ -759,6 +766,7 @@ mod tests {
             kind: Kind::Attached,
             backup: Some("/b.xml".into()),
             emulator: "/q".into(),
+            console: Some("/run/user/1000/conduit/x/console.sock".into()),
         };
         let s = serde_json::to_string(&l).unwrap();
         assert!(s.contains("\"kind\":\"attached\""));

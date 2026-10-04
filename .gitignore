@@ -23,3 +23,4 @@ guest/linux/Module.symvers
 __pycache__/
 host/qemu/*.log
 host/viewer/test-overlay
+guest/linux/test/pcimap_test
