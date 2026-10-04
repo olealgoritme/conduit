@@ -53,6 +53,20 @@ pub struct DmaBuffer {
     len: usize,
 }
 
+/// Conduit's `struct nvgpu_msg_hdr` (host/backend/protocol `MsgHeader`): 16 bytes.
+pub const MSG_HDR_LEN: usize = 16;
+/// `MsgType::GpuCmd` (docs/VENUS.md). Every control-queue message the KMD sends
+/// is a virtio-gpu command wrapped in `MsgHeader{msg_type = GPU_CMD}`.
+pub const MSG_TYPE_GPU_CMD: u32 = 30;
+/// Bytes reserved after a buffer's logical length: the request `MsgHeader`
+/// (device-read) then the response `MsgHeader` (device-written).
+pub const WIRE_TAIL_LEN: usize = 2 * MSG_HDR_LEN;
+
+/// Offset of the wire tail for a buffer of logical length `len`.
+const fn wire_tail_off(len: usize) -> usize {
+    (len + 7) & !7
+}
+
 impl DmaBuffer {
     /// Allocate a zeroed contiguous buffer of at least `len` bytes. Returns
     /// `None` on allocation failure or `len == 0`.
@@ -60,17 +74,52 @@ impl DmaBuffer {
         if len == 0 {
             return None;
         }
-        let pages = len.div_ceil(PAGE_SIZE);
+        let pages = (wire_tail_off(len) + WIRE_TAIL_LEN).div_ceil(PAGE_SIZE);
         let (pa, ptr) = WdkHal::dma_alloc(pages, BufferDirection::Both);
         if pa == 0 {
             return None;
         }
-        Some(Self {
+        let mut buf = Self {
             pa,
             ptr,
             pages,
             len,
-        })
+        };
+        buf.stamp_wire_header();
+        Some(buf)
+    }
+
+    /// Write the constant request `MsgHeader` into the wire tail. The response
+    /// header is device-written and never read before the device completes.
+    fn stamp_wire_header(&mut self) {
+        let off = wire_tail_off(self.len);
+        // SAFETY: `new`/`reset` guarantee `off + WIRE_TAIL_LEN <= capacity`.
+        unsafe {
+            let p = self.ptr.as_ptr().add(off);
+            core::ptr::write_bytes(p, 0, WIRE_TAIL_LEN);
+            core::ptr::write_unaligned(p as *mut u32, MSG_TYPE_GPU_CMD);
+        }
+    }
+
+    /// The request `MsgHeader` span (device-read) and the response `MsgHeader`
+    /// span (device-written) for this buffer's current logical length.
+    pub fn wire_spans(&self) -> (DmaSpan, DmaSpan) {
+        let off = wire_tail_off(self.len);
+        // SAFETY: the tail is inside the allocation (see `stamp_wire_header`).
+        unsafe {
+            let p = self.ptr.as_ptr().add(off);
+            (
+                DmaSpan { base: p, len: MSG_HDR_LEN },
+                DmaSpan { base: p.add(MSG_HDR_LEN), len: MSG_HDR_LEN },
+            )
+        }
+    }
+
+    /// The response `MsgHeader.status` (signed errno) the device wrote.
+    pub fn wire_status(&self) -> i32 {
+        let (_, resp) = self.wire_spans();
+        // SAFETY: inside the allocation; status is at +8 of `MsgHeader`.
+        unsafe { core::ptr::read_unaligned(resp.base.add(8) as *const i32) }
     }
 
     /// The buffer as a byte slice of its requested length.
@@ -102,14 +151,21 @@ impl DmaBuffer {
         self.pages * PAGE_SIZE
     }
 
+    /// True when [`Self::reset`] to `len` succeeds: `len` plus the wire tail
+    /// must fit the page-rounded capacity.
+    pub fn can_hold(&self, len: usize) -> bool {
+        len != 0 && wire_tail_off(len) + WIRE_TAIL_LEN <= self.capacity()
+    }
+
     /// Prepare a completed buffer for a new command. Returns false when the new
     /// logical length does not fit. Callers overwrite every device-read byte;
     /// the device overwrites every response byte, so no clearing is required.
     pub fn reset(&mut self, len: usize) -> bool {
-        if len == 0 || len > self.capacity() {
+        if len == 0 || wire_tail_off(len) + WIRE_TAIL_LEN > self.capacity() {
             return false;
         }
         self.len = len;
+        self.stamp_wire_header();
         true
     }
 

@@ -105,6 +105,19 @@ const WAIT_FENCE_MAX_MS: u64 = 120_000;
 /// MILLISECONDS, as above.
 const MAP_BUSY_MAX_MS: u64 = 30_000;
 
+/// Largest `GpuCmd` request the backend takes (docs/VENUS.md): 4 MiB including
+/// the `MsgHeader` and the SUBMIT_3D header. Larger streams are refused here
+/// rather than answered with a transport error after the copy.
+const GPU_CMD_MAX: usize = 4 << 20;
+
+/// True when `stream` plus its framing fits one `GpuCmd`.
+fn stream_fits(stream: &[u8]) -> bool {
+    stream.len()
+        <= GPU_CMD_MAX
+            - super::hal::MSG_HDR_LEN
+            - size_of::<helios_protocol::VirtioGpuCmdSubmit>()
+}
+
 /// One PASSIVE retry slice. See [`sleep_ms`] for why this is not really 1 ms.
 const RETRY_SLICE_MS: u64 = 1;
 
@@ -1308,7 +1321,7 @@ pub fn submit_3d_sync(
     ctx_id: u32,
     stream: &[u8],
 ) -> Result<(), VirtioError> {
-    if stream.is_empty() {
+    if stream.is_empty() || !stream_fits(stream) {
         return Err(VirtioError::DeviceError);
     }
     let mut cmd = helios_protocol::VirtioGpuCmdSubmit::zeroed();
@@ -1421,6 +1434,9 @@ fn submit_venus_async_inner(
         return Err(VirtioError::NotOwned);
     };
     let ctx_id = owned.id();
+    if !stream_fits(stream) {
+        return Err(VirtioError::DeviceError);
+    }
     reap_parked(passive, adapter);
     let mut meta = adapter
         .with_virtio(|v| v.take_dma_buffer(SUBMIT_META_BYTES))
@@ -1561,7 +1577,7 @@ fn stage_display_submit(
     adapter: &AdapterContext,
     stream: &[u8],
 ) -> Result<(DmaBuffer, DmaBuffer, usize), VirtioError> {
-    if stream.is_empty() {
+    if stream.is_empty() || !stream_fits(stream) {
         return Err(VirtioError::DeviceError);
     }
     reap_parked(passive, adapter);
