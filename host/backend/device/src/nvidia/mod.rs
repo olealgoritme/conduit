@@ -346,6 +346,14 @@ pub struct NvidiaBackend {
     /// `crate::vram`. `Vram::new(None)` is no limit, which is what a VMM that
     /// never sets one gets.
     vram: crate::vram::Vram,
+    /// Venus (docs/VENUS.md), with `--venus` only. `None`: `GpuCmd` is
+    /// refused as an unknown message is.
+    #[cfg(feature = "venus")]
+    venus: Option<crate::venus::Venus>,
+    /// The token of the `GpuCmd` just dispatched, when it was a fenced
+    /// command now waiting for its fence. See [`NvidiaBackend::take_held`].
+    #[cfg(feature = "venus")]
+    venus_held: Option<u64>,
     /// Why the request being served was answered here rather than by the
     /// host, for the trace. Set on refusal paths only; read and cleared by
     /// `dispatch_traced`. See docs/TRACING.md.
@@ -439,6 +447,10 @@ impl NvidiaBackend {
             display: None,
             dmabufs: Default::default(),
             clip_in: Default::default(),
+            #[cfg(feature = "venus")]
+            venus: None,
+            #[cfg(feature = "venus")]
+            venus_held: None,
             #[cfg(feature = "trace")]
             trace_refusal: Default::default(),
         }
@@ -705,6 +717,8 @@ impl NvidiaBackend {
 
     pub fn teardown(&mut self) {
         self.teardown_scanout();
+        #[cfg(feature = "venus")]
+        self.teardown_venus();
         log::info!(
             "NvidiaBackend::teardown: video memory {} MiB in use, peak {} MiB, {} allocation(s) refused, limit {}",
             self.vram.in_use() >> 20,
@@ -890,6 +904,10 @@ impl NvidiaBackend {
             self.handle_close(0, &[], &mut scratch);
         }
         let next_handle = self.handles.next_handle();
+        // Venus first, with no window: its region 3 placements went with the
+        // rest. What it held is kept across the reset, emptied.
+        #[cfg(feature = "venus")]
+        let venus = self.reset_venus();
         self.teardown();
 
         // Everything else back to how `new` left it.
@@ -913,6 +931,10 @@ impl NvidiaBackend {
         self.osdesc = old.osdesc.take();
         self.vidmem = old.vidmem.take();
         self.vram = crate::vram::Vram::new(old.vram.limit().map(|b| b >> 20));
+        #[cfg(feature = "venus")]
+        {
+            self.venus = venus;
+        }
         // The transport still has to drop the watches of the files closed above.
         self.watch_removed = std::mem::take(&mut old.watch_removed);
         self.handles.skip_to(next_handle);
@@ -955,6 +977,7 @@ impl NvidiaBackend {
                 MsgType::ClipboardFromHost => "clipboard_from_host",
                 MsgType::ClipboardToHost => "clipboard_to_host",
                 MsgType::ClipboardRequest => "clipboard_request",
+                MsgType::GpuCmd => "gpu_cmd",
             })
             .or_insert(0) += 1;
         // The handle travels in the header, not the payload -- every message
@@ -986,6 +1009,7 @@ impl NvidiaBackend {
             MsgType::CursorUpdate => self.handle_cursor_update(payload, resp_buf),
             MsgType::ClipboardToHost => self.handle_clipboard_to_host(payload, resp_buf),
             MsgType::ClipboardRequest => self.handle_clipboard_request(resp_buf),
+            MsgType::GpuCmd => self.handle_gpu_cmd(payload, resp_buf),
         }
     }
 }
@@ -1028,6 +1052,7 @@ mod aperture;
 mod clipboard;
 mod files;
 pub use files::FileTree;
+mod gpu_cmd;
 mod host;
 pub use host::{HostDriver, RealHost};
 mod ioctl;

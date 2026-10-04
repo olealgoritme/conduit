@@ -100,6 +100,11 @@ pub enum MsgType {
     /// or `-ENODEV` without a display. Older backends answer it with an
     /// unknown-type error, which the guest ignores.
     ClipboardRequest = 27,
+    /// Guest → host, control queue: one virtio-gpu control command for the
+    /// Venus renderer (docs/VENUS.md), laid out as `crate::venus` describes.
+    /// The reply is a header and the virtio-gpu response. Served only when
+    /// config `features` carries [`NVGPU_CFG_VENUS`]; refused otherwise.
+    GpuCmd = 30,
 }
 
 impl MsgType {
@@ -122,6 +127,7 @@ impl MsgType {
             25 => Self::ClipboardFromHost,
             26 => Self::ClipboardToHost,
             27 => Self::ClipboardRequest,
+            30 => Self::GpuCmd,
             _ => return None,
         })
     }
@@ -369,6 +375,11 @@ pub const NVGPU_CFG_DISPLAY: u32 = 1 << 8;
 /// so the guest head offers one. Without it the guest has no cursor plane and
 /// its compositor draws the cursor into the frame, as before.
 pub const NVGPU_CFG_CURSOR: u32 = 1 << 9;
+
+/// Device config `features` bit: the device serves `GpuCmd` (Venus, for
+/// Windows guests; docs/VENUS.md) and has shared memory region 3 for
+/// host-visible blobs. Set only when the backend runs with `--venus`.
+pub const NVGPU_CFG_VENUS: u32 = 1 << 10;
 
 /// Request payload for `MsgType::ScanoutFlip`, following a `MsgHeader`.
 #[repr(C)]
@@ -923,6 +934,7 @@ mod tests {
             MsgType::ClipboardFromHost,
             MsgType::ClipboardToHost,
             MsgType::ClipboardRequest,
+            MsgType::GpuCmd,
         ] {
             assert_eq!(MsgType::from_u32(t as u32), Some(t));
         }
@@ -937,6 +949,10 @@ mod tests {
         assert_eq!(MsgType::ClipboardToHost as u32, 26);
         assert_eq!(MsgType::ClipboardRequest as u32, 27);
         assert_eq!(MsgType::from_u32(28), None);
+        assert_eq!(MsgType::from_u32(29), None);
+        assert_eq!(MsgType::GpuCmd as u32, 30);
+        assert_eq!(MsgType::from_u32(31), None);
+        assert_eq!(NVGPU_CFG_VENUS, 1 << 10);
     }
 
     /// The event the guest's event-queue handler decodes: header, then

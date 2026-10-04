@@ -18,5 +18,6 @@
 pub mod messages;
 pub mod pageruns;
 pub mod segments;
+pub mod venus;
 
 pub use messages::*;

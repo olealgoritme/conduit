@@ -25,6 +25,7 @@ virtio-bindings = { version = "0.2.7", optional = true }
 vm-memory = { version = "0.18.0", features = ["backend-mmap"], optional = true }
 env_logger = { version = "0.11.11", optional = true }
 vmm-sys-util = { version = "0.15.0", optional = true }
+conduit-venus = { path = "../../venus", optional = true }
 
 [features]
 default = ["trace"]
@@ -46,6 +47,11 @@ vhost-user = [
     "dep:env_logger",
     "dep:vmm-sys-util",
 ]
+# Venus for Windows guests (docs/VENUS.md): `GpuCmd`, shared memory region 3
+# and the `--venus` flags. Off by default; without it nothing here names the
+# renderer and a guest's `GpuCmd` is refused like any unknown message.
+venus = ["dep:conduit-venus"]
+
 env_logger = ["dep:env_logger"]
 vmm-sys-util = ["dep:vmm-sys-util"]
 

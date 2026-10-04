@@ -993,6 +993,20 @@ pub trait InputSink: Send {
     }
 }
 
+/// Plane 0 of a frame handed over as a dma-buf (see
+/// [`DisplayLink::flip_dmabuf`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameGeometry {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub offset: u32,
+    /// `DRM_FORMAT_*`.
+    pub fourcc: u32,
+    /// `DRM_FORMAT_MOD_*`.
+    pub modifier: u64,
+}
+
 /// What became of one flip. None of these is an error to the guest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlipOutcome {
@@ -1462,6 +1476,41 @@ impl DisplayLink {
             }
         }
         out
+    }
+
+    /// Present a frame that is already a dma-buf, with no GEM object behind
+    /// it: Venus (docs/VENUS.md), where the renderer exports the scanout
+    /// image. The same send path as [`DisplayLink::flip`]; the difference is
+    /// what happens with nobody looking. A GEM buffer is parked unexported,
+    /// but this one is exported already (once per resource), so it is kept
+    /// as the frame a client that attaches later is shown first.
+    pub fn flip_dmabuf(&self, dmabuf: RawFd, g: &FrameGeometry) -> FlipOutcome {
+        let f = ScanoutFlip {
+            width: g.width,
+            height: g.height,
+            stride: g.stride,
+            offset: g.offset,
+            fourcc: g.fourcc,
+            modifier: g.modifier,
+            ..Default::default()
+        };
+        if !self.wants_frames() {
+            let mut st = self.state.lock().unwrap();
+            if !self.wants_frames() {
+                // SAFETY: dup of a descriptor the caller keeps open for this call.
+                let kept = unsafe { libc::fcntl(dmabuf, libc::F_DUPFD_CLOEXEC, 0) };
+                st.frame = (kept >= 0).then(|| {
+                    // SAFETY: `kept` is a fresh descriptor owned by nobody else.
+                    (Arc::new(unsafe { OwnedFd::from_raw_fd(kept) }), f)
+                });
+                if st.parked_frame.take().is_some() {
+                    self.note_parked(&st);
+                }
+                self.stats.no_broker.fetch_add(1, Ordering::Relaxed);
+                return FlipOutcome::NoBroker;
+            }
+        }
+        self.flip(dmabuf, &f)
     }
 
     /// One frame to client `i`. A full socket owes it the newest frame,

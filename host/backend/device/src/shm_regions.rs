@@ -3,12 +3,13 @@
 //!
 //! Two regions, found by the guest driver through
 //! `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` capabilities (`virtio_get_shm_region`),
-//! never by BAR number:
+//! never by BAR number, and a third with `--venus`:
 //!
 //! | shmid | what | size |
 //! | --- | --- | --- |
 //! | 1 | the window: device memory the backend places (`shm.rs`) | the allocator's total, 1 GiB |
 //! | 2 | the UVM aperture: CUDA semaphore pools and managed memory (`nvidia/aperture.rs`) | 32 GiB |
+//! | 3 | Venus host-visible blobs, at offsets the guest picks (docs/VENUS.md) | `--venus-hostmem-mib`, 8 GiB |
 //!
 //! conduit-vmm hard-codes both (BAR 2 and BAR 4). QEMU >= 11.1 asks instead, with
 //! `VHOST_USER_GET_SHMEM_CONFIG`, and lays the regions out itself -- one BAR
@@ -23,6 +24,24 @@
 pub const SHM_ID_WINDOW: u8 = 1;
 /// The UVM aperture. Must match `NVGPU_SHM_ID_APERTURE`.
 pub const SHM_ID_APERTURE: u8 = 2;
+
+/// Venus host-visible blobs (docs/VENUS.md). Advertised only with `--venus`,
+/// and only to a frontend that asks (QEMU): conduit-vmm's BARs are fixed.
+pub const SHM_ID_VENUS: u8 = 3;
+
+/// `--venus-hostmem-mib` when not given (docs/VENUS.md). Like the aperture
+/// it is address space, not memory: a blob costs only once it is mapped.
+pub const VENUS_HOSTMEM_MIB_DEFAULT: u64 = 8192;
+
+/// The size of region 3 for `--venus-hostmem-mib`, refused unless it is a
+/// power of two (a BAR is) of at least a page.
+pub fn venus_hostmem_len(mib: u64) -> Result<u64, String> {
+    if mib == 0 || !mib.is_power_of_two() {
+        return Err(format!("--venus-hostmem-mib {mib}: must be a power of two"));
+    }
+    mib.checked_mul(1 << 20)
+        .ok_or_else(|| format!("--venus-hostmem-mib {mib}: too large"))
+}
 
 /// Size of the UVM aperture. conduit-vmm's `APERTURE_SIZE` is the same number, and
 /// QEMU takes it from the reply built here.
@@ -65,9 +84,20 @@ const PAGE: u64 = 4096;
 /// Sizes are rounded up to a page, which the protocol requires and QEMU
 /// enforces by refusing the device; a zero size leaves the region out.
 pub fn region_sizes(window_len: u64, aperture_len: u64) -> (u32, [u64; MAX_SHM_REGIONS]) {
+    region_sizes_with_venus(window_len, aperture_len, 0)
+}
+
+/// [`region_sizes`] with region 3 as well; `venus_len` zero leaves it out,
+/// which is the device without `--venus`.
+pub fn region_sizes_with_venus(
+    window_len: u64,
+    aperture_len: u64,
+    venus_len: u64,
+) -> (u32, [u64; MAX_SHM_REGIONS]) {
     let mut sizes = [0u64; MAX_SHM_REGIONS];
     sizes[SHM_ID_WINDOW as usize] = page_align(window_len);
     sizes[SHM_ID_APERTURE as usize] = page_align(aperture_len);
+    sizes[SHM_ID_VENUS as usize] = page_align(venus_len);
     let n = sizes.iter().filter(|&&s| s != 0).count() as u32;
     (n, sizes)
 }
@@ -94,6 +124,8 @@ mod tests {
         // guest/linux/conduit_gpu.c: NVGPU_SHM_ID 1, NVGPU_SHM_ID_APERTURE 2.
         assert_eq!(SHM_ID_WINDOW, 1);
         assert_eq!(SHM_ID_APERTURE, 2);
+        // docs/VENUS.md: region 3.
+        assert_eq!(SHM_ID_VENUS, 3);
     }
 
     #[test]
@@ -116,6 +148,32 @@ mod tests {
         let (n, sizes) = region_sizes(1 << 30, 0);
         assert_eq!(n, 1);
         assert_eq!(sizes[SHM_ID_APERTURE as usize], 0);
+    }
+
+    /// Region 3 is there only when asked for, after the other two.
+    #[test]
+    fn the_venus_region_is_advertised_only_with_venus() {
+        let window = ZoneConfig::default_1gib().total();
+        assert_eq!(
+            region_sizes_with_venus(window, APERTURE_LEN, 0),
+            region_sizes(window, APERTURE_LEN)
+        );
+        let len = venus_hostmem_len(VENUS_HOSTMEM_MIB_DEFAULT).unwrap();
+        let (n, sizes) = region_sizes_with_venus(window, APERTURE_LEN, len);
+        assert_eq!(n, 3);
+        assert_eq!(sizes[SHM_ID_VENUS as usize], 8 << 30);
+        assert_eq!(sizes[1], 1 << 30);
+        assert_eq!(sizes[2], 32 << 30);
+        assert!(sizes[4..].iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn venus_hostmem_must_be_a_power_of_two() {
+        assert_eq!(venus_hostmem_len(1), Ok(1 << 20));
+        assert_eq!(venus_hostmem_len(8192), Ok(8 << 30));
+        assert!(venus_hostmem_len(0).is_err());
+        assert!(venus_hostmem_len(3000).is_err());
+        assert!(venus_hostmem_len(1 << 63).is_err(), "overflows bytes");
     }
 
     #[test]

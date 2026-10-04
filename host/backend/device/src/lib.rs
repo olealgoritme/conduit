@@ -23,5 +23,7 @@ pub mod shm_regions;
 #[cfg(feature = "trace")]
 pub mod trace;
 pub mod userspace;
+#[cfg(feature = "venus")]
+pub mod venus;
 pub mod virtio;
 pub mod vram;

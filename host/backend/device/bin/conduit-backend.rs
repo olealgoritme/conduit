@@ -34,9 +34,13 @@ use device::display::{DisplayLink, DisplayMode, InputSink};
 use device::host;
 use device::nvidia::NvidiaBackend;
 use device::shm::WindowPlacer;
+#[cfg(not(feature = "venus"))]
+use device::shm_regions::region_sizes;
 use device::shm_regions::{
-    APERTURE_LEN, SHM_ID_APERTURE, SHM_ID_WINDOW, page_align, pool_map_flags, region_sizes,
+    APERTURE_LEN, SHM_ID_APERTURE, SHM_ID_WINDOW, page_align, pool_map_flags,
 };
+#[cfg(feature = "venus")]
+use device::shm_regions::{SHM_ID_VENUS, region_sizes_with_venus};
 use device::virtio::{NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use protocol::messages::{
     CLIPBOARD_MESSAGE_HEAD, CLIPBOARD_MIME_TEXT, ClipboardChunk, DISPLAY_MODE_MESSAGE_LEN,
@@ -137,6 +141,25 @@ struct Args {
     #[cfg(feature = "trace")]
     #[arg(long, value_name = "PATH")]
     trace_socket: Option<PathBuf>,
+
+    /// Serve Venus to a Windows guest (docs/VENUS.md): sets the config bit,
+    /// answers GpuCmd and advertises shared memory region 3. Needs a frontend
+    /// that asks for the region table (QEMU); conduit-vmm's BARs are fixed.
+    #[cfg(feature = "venus")]
+    #[arg(long)]
+    venus: bool,
+
+    /// Size of region 3, where host-visible Venus blobs are mapped, in MiB.
+    /// A power of two.
+    #[cfg(feature = "venus")]
+    #[arg(long, value_name = "MIB",
+          default_value_t = device::shm_regions::VENUS_HOSTMEM_MIB_DEFAULT)]
+    venus_hostmem_mib: u64,
+
+    /// The conduit-venus renderer's socket. Required with --venus.
+    #[cfg(feature = "venus")]
+    #[arg(long, value_name = "PATH")]
+    venus_renderer: Option<PathBuf>,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -253,6 +276,41 @@ impl WindowPlacer for VhostWindow {
     fn withdraw_pool(&self, offset: u64, len: u64) -> device::error::Result<()> {
         let req = VhostUserMMap {
             shmid: NV_SHM_ID_APERTURE,
+            padding: [0; 7],
+            fd_offset: 0,
+            shm_offset: offset,
+            len: page_align(len),
+            flags: 0,
+        };
+        self.0
+            .shmem_unmap(&req)
+            .map(|_| ())
+            .map_err(device::error::DeviceError::Io)
+    }
+
+    #[cfg(feature = "venus")]
+    fn place_blob(&self, offset: u64, len: u64, fd: RawFd) -> device::error::Result<()> {
+        let req = VhostUserMMap {
+            shmid: SHM_ID_VENUS,
+            padding: [0; 7],
+            fd_offset: 0,
+            shm_offset: offset,
+            len: page_align(len),
+            flags: VhostUserMMapFlags::WRITABLE.bits(),
+        };
+        // SAFETY: the descriptor is owned by the Venus resource for the whole
+        // of this call, and is only borrowed to be sent.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        self.0
+            .shmem_map(&req, &borrowed)
+            .map(|_| ())
+            .map_err(device::error::DeviceError::Io)
+    }
+
+    #[cfg(feature = "venus")]
+    fn withdraw_blob(&self, offset: u64, len: u64) -> device::error::Result<()> {
+        let req = VhostUserMMap {
+            shmid: SHM_ID_VENUS,
             padding: [0; 7],
             fd_offset: 0,
             shm_offset: offset,
@@ -644,6 +702,86 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
     }
 }
 
+/// Return held chains whose fences have signalled: write each response and
+/// put the chain on the used ring. Returns whether any was.
+#[cfg(feature = "venus")]
+fn deliver_completions(
+    nvidia: &Mutex<NvidiaBackend>,
+    held: &HeldChains,
+    vring: &VringRwLock,
+    mem: &GuestMemoryMmap,
+) -> bool {
+    let done = nvidia.lock().expect("backend mutex").venus_completions();
+    if done.is_empty() {
+        return false;
+    }
+    let mut chains = held.lock().expect("held chains");
+    let mut any = false;
+    for c in done {
+        let Some(chain) = chains.remove(&c.token) else {
+            continue; // its queue was reset meanwhile
+        };
+        let n = c.resp.len().min(chain.cap);
+        if let Err(e) = mem.write_slice(&c.resp[..n], chain.resp) {
+            log::warn!("venus: writing the response of chain {}: {e}", chain.head);
+        }
+        if let Err(e) = vring.add_used(chain.head, n as u32) {
+            log::warn!("venus: returning chain {}: {e}", chain.head);
+            continue;
+        }
+        any = true;
+    }
+    drop(chains);
+    if any {
+        let _ = vring.signal_used_queue();
+    }
+    any
+}
+
+/// Wait on the renderer's fence descriptor and return chains as their
+/// fences signal (docs/VENUS.md "Fences"). Started with `--venus` only, once
+/// the control queue is up.
+///
+/// The descriptor is what wakes this; the timeout is a safety net for a
+/// wake that came while the backend lock was held elsewhere, short while
+/// chains are waiting and long while none are.
+#[cfg(feature = "venus")]
+fn fence_pump(
+    fd: OwnedFd,
+    nvidia: Arc<Mutex<NvidiaBackend>>,
+    held: HeldChains,
+    vring: VringRwLock,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+) {
+    loop {
+        let waiting = !held.lock().expect("held chains").is_empty();
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live pollfd.
+        let n = unsafe { libc::poll(&mut pfd, 1, if waiting { 2 } else { 100 }) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            log::error!("fence pump: poll: {err}");
+            return;
+        }
+        if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            log::error!("fence pump: the renderer's fence descriptor is gone");
+            return;
+        }
+        let delivered = deliver_completions(&nvidia, &held, &vring, &mem.memory());
+        // Readable with nothing to deliver: do not spin on it.
+        if n > 0 && !delivered {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 /// The queue the host posts events on. The guest posts empty buffers here and
 /// the event pump fills them; nothing the guest sends on it is a request.
 const EVENT_QUEUE: usize = 1;
@@ -672,6 +810,32 @@ struct NvGpuBackend {
     /// A request was served since the device was last (re)started. A restart
     /// that finds this set is a guest that rebooted or reloaded its driver.
     served: bool,
+    /// Venus, with `--venus`: the size of region 3 (0 without), and the
+    /// fenced chains waiting for their fences.
+    #[cfg(feature = "venus")]
+    venus: VenusChains,
+}
+
+/// A fenced `GpuCmd` chain, kept off the used ring until its fence signals
+/// (docs/VENUS.md "Fences"): where its response goes.
+#[cfg(feature = "venus")]
+struct HeldChain {
+    head: u16,
+    resp: GuestAddress,
+    cap: usize,
+}
+
+#[cfg(feature = "venus")]
+type HeldChains = Arc<Mutex<HashMap<u64, HeldChain>>>;
+
+#[cfg(feature = "venus")]
+#[derive(Default)]
+struct VenusChains {
+    /// Region 3's size; 0 is no Venus, and then nothing below is used.
+    hostmem_len: u64,
+    held: HeldChains,
+    /// The fence pump is running.
+    pump: bool,
 }
 
 impl NvGpuBackend {
@@ -748,7 +912,49 @@ impl NvGpuBackend {
             req: Vec::new(),
             resp: vec![0u8; RESP_MAX],
             served: false,
+            #[cfg(feature = "venus")]
+            venus: VenusChains::default(),
         })
+    }
+
+    /// Serve Venus (`--venus`): the config bit, `GpuCmd`, and region 3 of
+    /// `hostmem_len` bytes.
+    #[cfg(feature = "venus")]
+    fn enable_venus(&mut self, renderer: Box<dyn conduit_venus::Renderer>, hostmem_len: u64) {
+        let display = ({ self.config.features } & protocol::messages::NVGPU_CFG_DISPLAY != 0)
+            .then_some((self.config.display_width, self.config.display_height));
+        self.config.set_venus();
+        self.nvidia
+            .lock()
+            .expect("backend mutex")
+            .set_venus(device::venus::Venus::new(renderer, hostmem_len, display));
+        self.venus.hostmem_len = hostmem_len;
+    }
+
+    /// Return every held chain whose fence has signalled, and start the
+    /// thread that does so on its own once there is a queue to return them
+    /// to. Inert without `--venus`.
+    #[cfg(feature = "venus")]
+    fn venus_complete(&mut self, vring: &VringRwLock, mem: &GuestMemoryMmap) {
+        if self.venus.hostmem_len == 0 {
+            return;
+        }
+        deliver_completions(&self.nvidia, &self.venus.held, vring, mem);
+        if self.venus.pump {
+            return;
+        }
+        let (Some(atomic), Some(fd)) = (
+            self.mem.clone(),
+            self.nvidia.lock().expect("backend mutex").venus_fence_fd(),
+        ) else {
+            return;
+        };
+        let (nvidia, held, vring) = (self.nvidia.clone(), self.venus.held.clone(), vring.clone());
+        std::thread::Builder::new()
+            .name("nvgpu-fences".into())
+            .spawn(move || fence_pump(fd, nvidia, held, vring, atomic))
+            .map(|_| self.venus.pump = true)
+            .unwrap_or_else(|e| log::error!("fence pump would not start: {e}"));
     }
 
     /// Keep the event thread's poll set in step with the descriptors the
@@ -803,6 +1009,9 @@ impl NvGpuBackend {
     fn reset(&mut self, why: &str) {
         log::info!("{why}: resetting the device");
         self.nvidia.lock().expect("backend mutex").reset();
+        // Held chains belonged to the queue the frontend just reset.
+        #[cfg(feature = "venus")]
+        self.venus.held.lock().expect("held chains").clear();
         self.served = false;
     }
 
@@ -873,6 +1082,30 @@ impl NvGpuBackend {
                     };
                     #[cfg(not(feature = "trace"))]
                     let n = nvidia.dispatch(&self.req, resp);
+                    // A fenced GpuCmd: nothing written, and the chain stays
+                    // off the used ring until the fence pump returns it.
+                    // Recorded under the backend lock, so its completion
+                    // cannot be looked for before it is here.
+                    #[cfg(feature = "venus")]
+                    if let Some(token) = nvidia.take_held() {
+                        self.venus.held.lock().expect("held chains").insert(
+                            token,
+                            HeldChain {
+                                head,
+                                resp: d.addr(),
+                                cap,
+                            },
+                        );
+                        drop(nvidia);
+                        #[cfg(feature = "trace")]
+                        if TRACE && let Some(mut r) = record {
+                            r.reply_ns = device::trace::now_ns().saturating_sub(t_recv);
+                            device::trace::emit(r);
+                        }
+                        used = true;
+                        self.served = true;
+                        continue;
+                    }
                     drop(nvidia);
                     if n > 0 {
                         mem.write_slice(&resp[..n], d.addr()).map_err(|e| {
@@ -971,7 +1204,17 @@ impl VhostUserBackendMut for NvGpuBackend {
     fn get_shmem_config(&self) -> std::io::Result<VhostUserShMemConfig> {
         SPEC_SHMEM_FRONTEND.store(true, std::sync::atomic::Ordering::Relaxed);
         let window = self.nvidia.lock().expect("backend mutex").shm_total_size();
+        #[cfg(feature = "venus")]
+        let (n, sizes) = region_sizes_with_venus(window, APERTURE_LEN, self.venus.hostmem_len);
+        #[cfg(not(feature = "venus"))]
         let (n, sizes) = region_sizes(window, APERTURE_LEN);
+        #[cfg(feature = "venus")]
+        if self.venus.hostmem_len != 0 {
+            log::info!(
+                "shared memory: Venus host-visible region {} MiB (shmid {SHM_ID_VENUS})",
+                sizes[SHM_ID_VENUS as usize] >> 20
+            );
+        }
         log::info!(
             "shared memory: window {} MiB (shmid {SHM_ID_WINDOW}), aperture {} MiB (shmid {SHM_ID_APERTURE})",
             sizes[SHM_ID_WINDOW as usize] >> 20,
@@ -1038,6 +1281,8 @@ impl VhostUserBackendMut for NvGpuBackend {
         } else {
             self.process(vring, &mem)?;
         }
+        #[cfg(feature = "venus")]
+        self.venus_complete(vring, &mem);
         // After serving, not before: a message that opened a descriptor has to
         // have been served for the backend to know about it.
         self.sync_watches(vrings);
@@ -1101,6 +1346,34 @@ fn open_trace_file(
         .map_err(|e| anyhow::anyhow!("trace file {}: {e}", path.display()))?;
     log::info!("trace: writing {format:?} records to {}", path.display());
     Ok(Some((file, format)))
+}
+
+/// The renderer `--venus` talks to: the conduit-venus process at
+/// `--venus-renderer`. `CONDUIT_VENUS_MOCK=1` serves from the in-memory
+/// mock instead, which renders nothing, for testing the device without a
+/// renderer. Connected after the sandbox, as a display client is: the
+/// client starts a thread, which the sandbox must already cover.
+#[cfg(feature = "venus")]
+fn venus_renderer(args: &Args) -> anyhow::Result<Box<dyn conduit_venus::Renderer>> {
+    if std::env::var("CONDUIT_VENUS_MOCK").as_deref() == Ok("1") {
+        log::warn!(
+            "venus: CONDUIT_VENUS_MOCK=1: serving from the mock renderer, which draws nothing"
+        );
+        return Ok(Box::new(conduit_venus::mock::Mock::new()));
+    }
+    let path = args.venus_renderer.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "refusing to start: --venus needs --venus-renderer PATH (conduit-venus's socket)"
+        )
+    })?;
+    let client = conduit_venus::ipc::IpcClient::connect(path).map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to start: venus renderer at {}: {e}",
+            path.display()
+        )
+    })?;
+    log::info!("venus: renderer at {}", path.display());
+    Ok(Box::new(client))
 }
 
 /// Like `VhostUserDaemon::serve`: a guest that quits mid-message is a normal end.
@@ -1214,14 +1487,26 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    let backend = Arc::new(RwLock::new(NvGpuBackend::new(
+    #[allow(unused_mut)]
+    let mut nvgpu = NvGpuBackend::new(
         &args.proc_nvidia,
         args.allow_nearest_abi,
         args.caps,
         args.vram_limit_mib,
         display,
         input_target,
-    )?));
+    )?;
+    #[cfg(feature = "venus")]
+    if args.venus {
+        let len = device::shm_regions::venus_hostmem_len(args.venus_hostmem_mib)
+            .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
+        nvgpu.enable_venus(venus_renderer(&args)?, len);
+        log::info!(
+            "venus: serving GpuCmd, region 3 {} MiB",
+            args.venus_hostmem_mib
+        );
+    }
+    let backend = Arc::new(RwLock::new(nvgpu));
     #[cfg(feature = "trace")]
     {
         if let Some(v) = host::driver_version(&args.proc_nvidia)
