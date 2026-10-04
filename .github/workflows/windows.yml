@@ -4,12 +4,10 @@
 # package per configuration.
 name: Windows guest driver (Venus)
 
+# Manual only (Actions > Run workflow, or `gh workflow run windows.yml`): a
+# full run takes hours on Windows runners, which bill at twice the rate.
 on:
   workflow_dispatch:
-  push:
-    branches: [main, feat/windows-venus]
-  pull_request:
-    branches: [main]
 
 permissions:
   contents: read
