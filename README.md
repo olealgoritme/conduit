@@ -38,7 +38,7 @@ from GPU memory to your screen: no copying, no video compression.
 | GPU | NVIDIA, Turing (RTX 20xx) or newer |
 | Host driver | NVIDIA **open** kernel modules, 580 or newer, a release Conduit has ABI tables for (580.178.04, 595.71.05, 595.104.02, 610.57.04, 615.71.09) |
 | Desktop | Any Wayland desktop (GNOME, KDE, Hyprland, Sway, …) |
-| VM | Linux (Ubuntu 24.04 recommended) |
+| VM | Linux, kernel 6.4 or newer: Ubuntu 24.04 recommended (`conduit create`); `conduit attach` also sets up Debian and Arch-based VMs (Arch, Omarchy, EndeavourOS, Manjaro) |
 
 ## Quick start
 
@@ -59,7 +59,7 @@ Download the package for your system from the
 |---|---|
 | Ubuntu / Debian / Pop!_OS / Mint | `sudo apt install ./conduit_*_amd64.deb` |
 | Fedora / RHEL / openSUSE | `sudo dnf install ./conduit-*.x86_64.rpm` (openSUSE: `sudo zypper install ./conduit-*.rpm`) |
-| Arch / Manjaro / EndeavourOS | `sudo pacman -U ./conduit-*.pkg.tar.zst` |
+| Arch / Manjaro / EndeavourOS | `sudo pacman -U ./conduit-*-x86_64.pkg.tar.zst` |
 | NixOS | `nix run github:olealgoritme/conduit` (flake) |
 | Anything else | `tar xf conduit-*-x86_64-linux.tar.gz && sudo ./conduit/install.sh` |
 
@@ -170,7 +170,9 @@ conduit detach myvm      # later, if you want: the original definition comes bac
 ```
 
 `attach` installs the guest driver through the QEMU guest agent when the VM
-runs one; otherwise it prints the one command to run. It works for VMs in
+runs one (Debian/Ubuntu or Arch-based guests; on Arch install it first:
+`sudo pacman -S qemu-guest-agent`, then reboot the VM); otherwise it prints
+the one command to run. It works for VMs in
 `qemu:///system` too (`conduit attach myvm -c qemu:///system`).
 A VM made before this: `conduit libvirt enable myvm` (and `disable` to undo).
 

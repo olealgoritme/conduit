@@ -227,3 +227,7 @@ jobs:
           dpkg-deb -c dist/out/conduit-guest_*_all.deb | grep usr/bin/conduit-clipboard-agent
           dpkg-deb -c dist/out/conduit-guest_*_all.deb | grep usr/lib/conduit-guest/setup
           dpkg-deb -c dist/out/conduit-guest_*_all.deb | grep 'usr/src/conduit-guest-.*/conduit_gpu\.c'
+          packaging/build.sh package guest-arch
+          tar -I zstd -tf dist/out/conduit-guest-*-any.pkg.tar.zst | grep -x usr/bin/conduit-clipboard-agent
+          tar -I zstd -tf dist/out/conduit-guest-*-any.pkg.tar.zst | grep -x '\.INSTALL'
+          tar -I zstd -tf dist/out/conduit-guest-*-any.pkg.tar.zst | grep 'usr/src/conduit-guest-.*/conduit_gpu\.c'

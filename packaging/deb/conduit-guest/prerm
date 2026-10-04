@@ -2,12 +2,13 @@
 # Pre-remove for `conduit-guest`: drop this version from DKMS. On an upgrade
 # the new package's postinst has already added its own version (deb runs the
 # old prerm first, rpm runs %preun of the old package after the new %post), so
-# removing exactly @VERSION@ is right in both cases.
+# removing exactly @VERSION@ is right in both cases. Arch (nfpm .pkg.tar.zst)
+# runs it as pre_remove only on removal, with the old version as $1.
 set -e
 NAME=conduit-guest
 VERSION=@VERSION@
 case "${1:-remove}" in
-    remove|purge|0)
+    remove|purge|0|*.*)
         if command -v systemctl >/dev/null 2>&1; then
             systemctl --global disable conduit-clipboard.service 2>/dev/null || true
         fi ;;

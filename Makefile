@@ -5,7 +5,7 @@
 #   make test         run all offline tests (no GPU, no VMs)
 #   make install      install to /opt/conduit (+ /usr/local/bin/conduit)
 #   make package      build every package (.deb/.rpm/Arch/tarball/guest) into dist/out
-#   make deb          just the .deb (also: rpm, archlinux, tarball, guest-deb, guest-rpm)
+#   make deb          just the .deb (also: rpm, archlinux, tarball, guest-deb, guest-rpm, guest-arch)
 #   make install-deb  build the .deb and install it on this machine
 #   make deps         install build dependencies (asks for sudo)
 #   make clean        remove build outputs
@@ -21,7 +21,7 @@ JOBS   ?= $(shell nproc)
 # Tests that open the real /dev/nvidiactl; kept out of `make test`.
 GPU_TESTS := --skip for_real --skip closing_the_fd --skip repeated_map_unmap
 
-.PHONY: all backend vmm cli viewer guest qemu stream test install package deps clean help dist-stage deb rpm archlinux tarball guest-deb guest-rpm install-deb release release-minor release-major
+.PHONY: all backend vmm cli viewer guest qemu stream test install package deps clean help dist-stage deb rpm archlinux tarball guest-deb guest-rpm guest-arch install-deb release release-minor release-major
 
 all: backend vmm cli viewer guest qemu stream
 	@echo
@@ -78,13 +78,13 @@ deb rpm archlinux tarball: dist-stage
 	packaging/build.sh package $@
 	@ls -t dist/out/ | head -3
 
-guest-deb guest-rpm:
+guest-deb guest-rpm guest-arch:
 	packaging/build.sh package $@
 	@ls -t dist/out/ | head -3
 
 # Every package format at once, into dist/out/.
 package: dist-stage
-	for f in deb rpm archlinux tarball guest-deb guest-rpm; do packaging/build.sh package $$f || exit 1; done
+	for f in deb rpm archlinux tarball guest-deb guest-rpm guest-arch; do packaging/build.sh package $$f || exit 1; done
 	@ls -t dist/out/
 
 # Build the .deb and install it on this machine (Ubuntu/Debian).

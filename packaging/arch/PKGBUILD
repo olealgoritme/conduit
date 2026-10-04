@@ -53,7 +53,9 @@ package_conduit-guest-dkms() {
   depends=(dkms python)
   optdepends=('wl-clipboard: clipboard on wlroots/KDE Wayland sessions'
               'libxfixes: clipboard on X11 sessions and GNOME (XWayland)')
+  # conduit-guest: the same files, as nfpm builds them (`conduit attach`).
   provides=(conduit-guest)
+  conflicts=(conduit-guest)
   backup=(etc/sysctl.d/60-conduit-userns.conf)
   # Arch's dkms pacman hooks build and remove the module; the install script
   # runs guest/system/conduit-guest-setup (old module name, locale, sysctl).

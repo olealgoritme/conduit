@@ -1,6 +1,6 @@
 # nfpm config for `conduit-guest`: the guest kernel module as a DKMS source
-# package (.deb and .rpm), installed inside the VM. Rendered by
-# packaging/build.sh `package guest-deb|guest-rpm`.
+# package (.deb, .rpm and Arch .pkg.tar.zst), installed inside the VM.
+# Rendered by packaging/build.sh `package guest-deb|guest-rpm|guest-arch`.
 name: conduit-guest
 arch: all
 platform: linux
@@ -73,6 +73,15 @@ overrides:
     recommends: ["linux-headers-generic | linux-headers-amd64", wl-clipboard, libx11-6, libxfixes3]
   rpm:
     recommends: [kernel-devel, wl-clipboard, libX11, libXfixes, glibc-langpack-en]
+  # Arch and derivatives (Omarchy, EndeavourOS, Manjaro). Same package name as
+  # the AUR's conduit-guest-dkms provides. pacman's dkms hooks also build the
+  # module; the postinst's dkms add/install are no-ops when they already did.
+  archlinux:
+    depends: [dkms, python]
+
+archlinux:
+  scripts:
+    postupgrade: "@SCRIPTS@/conduit-guest-postinst"
 
 rpm:
   summary: Conduit guest driver (DKMS source)

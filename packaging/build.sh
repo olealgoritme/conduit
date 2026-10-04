@@ -13,7 +13,7 @@
 #   packaging/build.sh stage                assemble the install tree -> $STAGE
 #   packaging/build.sh bundle-libs          copy non-glibc .so deps into /opt/conduit/lib (tarball)
 #   packaging/build.sh guest-src [DIR]      DKMS source tree for the guest module
-#   packaging/build.sh package FORMAT       deb | rpm | archlinux | tarball | guest-deb | guest-rpm
+#   packaging/build.sh package FORMAT       deb | rpm | archlinux | tarball | guest-deb | guest-rpm | guest-arch
 #
 # Environment (all optional):
 #   VERSION            package version (default: git describe, without the leading v)
@@ -223,6 +223,7 @@ cmd_qemu() {
 #   /opt/conduit/bin/{conduit,conduit-backend,conduit-userspace,conduit-viewer,conduit-vmm,qemu-system-x86_64}
 #   /opt/conduit/share/conduit/supported-drivers.txt
 #   /opt/conduit/share/conduit/guest/conduit-guest.deb (what `conduit create` installs in VMs)
+#   /opt/conduit/share/conduit/guest/conduit-guest.pkg.tar.zst (`conduit attach` on Arch guests)
 #   /opt/conduit/share/qemu/...            (bundled QEMU data)
 #   /opt/conduit/libexec/conduit-integrate (AppArmor/SELinux/desktop hookup)
 #   /opt/conduit/share/conduit/...         (desktop entry, AppArmor sources)
@@ -259,19 +260,24 @@ cmd_stage() {
         "$PKG/supported-drivers.sh" "$ROOT/host/backend/gen/src"
     } > "$o/share/conduit/supported-drivers.txt"
 
-    # The guest driver package `conduit create` / `conduit stock-kernel`
-    # install into VMs (DKMS builds it there for the VM's stock kernel).
-    local gdeb="$OUT/conduit-guest_${v}-1_all.deb"
+    # The guest driver packages `conduit create` / `conduit stock-kernel` /
+    # `conduit attach` install into VMs (DKMS builds the module there for the
+    # VM's own kernel): the .deb, and the Arch package for Arch guests.
+    local gdeb="$OUT/conduit-guest_${v}-1_all.deb" garch="$DIST/guest-arch/conduit-guest.pkg.tar.zst"
     if [ ! -f "$gdeb" ] && command -v nfpm >/dev/null; then
-        install -d "$OUT"; render_scripts
-        cmd_guest_src
-        render_nfpm "$PKG/nfpm/conduit-guest.yaml" "$DIST/nfpm-conduit-guest.yaml" ""
-        nfpm package --config "$DIST/nfpm-conduit-guest.yaml" --packager deb --target "$gdeb" >/dev/null
+        guest_package deb "$gdeb"
     fi
     if [ -f "$gdeb" ]; then
         install -D -m0644 "$gdeb" "$o/share/conduit/guest/conduit-guest.deb"
     else
         log "warning: no conduit-guest .deb (nfpm missing); \`conduit create\` will not work from this install"
+    fi
+    if command -v nfpm >/dev/null; then
+        install -d "$DIST/guest-arch"
+        guest_package archlinux "$garch"
+        install -D -m0644 "$garch" "$o/share/conduit/guest/conduit-guest.pkg.tar.zst"
+    else
+        log "warning: no conduit-guest Arch package (nfpm missing); \`conduit attach\` will not set up Arch guests from this install"
     fi
 
     install -m0755 "$PKG/common/conduit-integrate" "$o/libexec/conduit-integrate"
@@ -383,6 +389,16 @@ render_scripts() {
     done
 }
 
+# The conduit-guest package in one nfpm format (deb | rpm | archlinux), to
+# TARGET (a file, or a directory for nfpm's own file name).
+guest_package() {   # packager target
+    install -d "$OUT"; render_scripts
+    cmd_guest_src
+    render_nfpm "$PKG/nfpm/conduit-guest.yaml" "$DIST/nfpm-conduit-guest.yaml" ""
+    nfpm package --config "$DIST/nfpm-conduit-guest.yaml" --packager "$1" --target "$2" >/dev/null
+    log "conduit-guest ($1) -> $2"
+}
+
 cmd_package() {
     local fmt=${1:?format} v; v=$(version)
     install -d "$OUT"
@@ -396,9 +412,11 @@ cmd_package() {
         ;;
     guest-deb|guest-rpm)
         command -v nfpm >/dev/null || die "nfpm not found"
-        cmd_guest_src
-        render_nfpm "$PKG/nfpm/conduit-guest.yaml" "$DIST/nfpm-conduit-guest.yaml" ""
-        nfpm package --config "$DIST/nfpm-conduit-guest.yaml" --packager "${fmt#guest-}" --target "$OUT/"
+        guest_package "${fmt#guest-}" "$OUT/"
+        ;;
+    guest-arch)
+        command -v nfpm >/dev/null || die "nfpm not found"
+        guest_package archlinux "$OUT/"
         ;;
     tarball)
         # LINK_DIR=/usr/local/bin stage, plus bundle-libs, must have run first.

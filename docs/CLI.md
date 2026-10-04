@@ -54,7 +54,7 @@ before your desktop. `conduit down` stops the slice. Without a systemd user sess
 | libvirt | `vms/NAME/libvirt.json` (which domain), `vms/NAME/libvirt-backup-*.xml` (attach), `~/.config/systemd/user/conduit-{backend,virtiofsd}@*`, `/etc/systemd/system/conduit-net-NAME.service`, `~/.local/share/applications/conduit-NAME.desktop` |
 | Boot files | `~/.local/share/conduit/vms/NAME/boot/{vmlinuz,initrd.img}`: the newest kernel in the disk's `/boot`, copied out with `debugfs` before every start |
 | Cache | `~/.cache/conduit/` (Ubuntu image, the NVIDIA user-space files staged for each driver version) |
-| Programs | `$CONDUIT_PREFIX` (default `/opt/conduit`): `bin/conduit-{backend,vmm,viewer,userspace,stream}`, `bin/qemu-system-x86_64`, `share/conduit/guest/conduit-guest.deb`, `share/conduit/supported-drivers.txt`. In a source checkout it falls back to the build outputs (`host/*/target/release/…`, `host/viewer/conduit-viewer`, `host/qemu/build/…`, `dist/out/conduit-guest_*_all.deb`, built on demand with nfpm). |
+| Programs | `$CONDUIT_PREFIX` (default `/opt/conduit`): `bin/conduit-{backend,vmm,viewer,userspace,stream}`, `bin/qemu-system-x86_64`, `share/conduit/guest/conduit-guest.deb` (and `.pkg.tar.zst` for `attach` on Arch guests), `share/conduit/supported-drivers.txt`. In a source checkout it falls back to the build outputs (`host/*/target/release/…`, `host/viewer/conduit-viewer`, `host/qemu/build/…`, `dist/out/conduit-guest_*_all.deb` / `conduit-guest-*-any.pkg.tar.zst`, built on demand with nfpm). |
 
 To override a single part, set one of `CONDUIT_BACKEND`, `CONDUIT_VMM`, `CONDUIT_VIEWER`,
 `CONDUIT_USERSPACE`, `CONDUIT_STREAM`, `CONDUIT_GUEST_DEB`, `CONDUIT_QEMU` or `CONDUIT_VIRTIOFSD`.

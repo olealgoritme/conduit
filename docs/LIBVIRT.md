@@ -106,11 +106,38 @@ if libvirt refuses it nothing stays changed.
 ## Guest side (attach)
 
 `conduit attach` builds `vms/NAME/guest-setup.tar` (the `conduit-guest`
-package, the share mount unit, udev and loader files) and, if the VM runs and
-answers on the QEMU guest agent, uploads it and runs its `setup.sh` as root
-(apt: headers for the running kernel, the package, DKMS build). Otherwise it
-prints one `ssh ... < guest-setup.tar` command; `--guest-later` asks for that
-directly. Debian/Ubuntu guests only for now.
+packages, the share mount unit, udev and loader files) and, if the VM runs and
+answers on the QEMU guest agent, uploads it and runs its `setup.sh` as root.
+Otherwise it prints one `ssh ... < guest-setup.tar` command; `--guest-later`
+asks for that directly. `setup.sh` picks the distribution from
+`/etc/os-release` (`ID`, `ID_LIKE`); `sh setup.sh --dry-run` prints what it
+would run.
+
+| guest | what `setup.sh` does |
+|---|---|
+| Debian, Ubuntu (and `ID_LIKE` debian/ubuntu) | apt: `linux-headers-$(uname -r)`, then `conduit-guest.deb` (DKMS build) |
+| Arch and `ID_LIKE=arch` (Omarchy, EndeavourOS, Manjaro, CachyOS) | pacman: `dkms`, the running kernel's headers (`/usr/lib/modules/$(uname -r)/pkgbase` + `-headers`: `linux-headers`, `linux-lts-headers`, `linux-zen-headers`, ...), `wl-clipboard`, `libglvnd`, `vulkan-icd-loader`, then `conduit-guest.pkg.tar.zst` (DKMS build); replaces the AUR's `conduit-guest-dkms` |
+| anything else (Fedora, ...) | stops with an error; install the `conduit-guest` .rpm by hand |
+
+Both then install the same files: `conduit-guest.service` (loads
+`conduit_gpu`, mounts the `nvidia` virtiofs share read-only at `/mnt/nvidia`,
+runs `ldconfig`), the udev rules, `/etc/ld.so.conf.d/zz-conduit-nvidia.conf`
+and the Vulkan ICD / GLVND EGL / GBM paths into the share
+(`/etc/profile.d/conduit-nvidia.sh`, `/etc/environment.d/90-conduit-nvidia.conf`).
+The package itself brings the module autoload and modprobe entries, the
+user-namespace sysctl, the logind power-key drop-in and the clipboard agent
+(user unit enabled globally, plus an XDG autostart entry). Hyprland started
+through uwsm (Omarchy) reaches `graphical-session.target`, which starts it; a
+Hyprland started without uwsm runs neither, so add
+`exec-once = conduit-clipboard-agent` to `hyprland.conf` there.
+
+pacman runs without `-y` (no partial upgrade): if the headers are no longer
+on the mirror, update the VM (`sudo pacman -Syu`), reboot, and attach again.
+
+**Arch guest agent**: `sudo pacman -S qemu-guest-agent` and reboot the VM (or
+`sudo systemctl start qemu-guest-agent`); udev starts it on every boot when the
+VM has the `org.qemu.guest_agent.0` channel, which virt-manager adds to new
+VMs.
 
 ## Lifecycle
 

@@ -6,7 +6,7 @@
 #   host         per-format container: viewer + bundled QEMU 11.1 (cached),
 #                staged and packaged with nfpm (deb/rpm/Arch) or as a tarball
 #                with its libraries bundled (Debian 12, the oldest glibc we build on)
-#   guest        conduit-guest DKMS source packages (.deb, .rpm)
+#   guest        conduit-guest DKMS source packages (.deb, .rpm, Arch)
 #   release      checksums, AUR PKGBUILD, GitHub Release
 #
 # workflow_dispatch builds everything without publishing (artifacts only).
@@ -119,6 +119,13 @@ jobs:
       - name: Build stream host
         run: packaging/build.sh stream
 
+      # Before Stage: stage builds the guest packages (deb, rpm, Arch) that
+      # attach ships, and skips them without nfpm.
+      - name: Install nfpm
+        run: |
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | tar -xz -C /usr/local/bin nfpm
+
       - name: Stage
         run: |
           if [ "${{ matrix.format }}" = tarball ]; then
@@ -129,11 +136,6 @@ jobs:
             packaging/build.sh stage
           fi
 
-      - name: Install nfpm
-        if: matrix.format != 'tarball'
-        run: |
-          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
-            | tar -xz -C /usr/local/bin nfpm
       - name: Package
         run: packaging/build.sh package "${{ matrix.format }}"
 
@@ -155,6 +157,7 @@ jobs:
         run: |
           packaging/build.sh package guest-deb
           packaging/build.sh package guest-rpm
+          packaging/build.sh package guest-arch
       - uses: actions/upload-artifact@v4
         with:
           name: pkg-guest

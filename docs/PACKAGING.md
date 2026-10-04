@@ -17,6 +17,7 @@ layout, so a layout change is made in one place.
 | `/opt/conduit/bin/qemu-system-x86_64`, `share/qemu/` | bundled QEMU 11.1 |
 | `/opt/conduit/share/conduit/supported-drivers.txt` | driver releases with backend ABI tables (`conduit doctor`) |
 | `/opt/conduit/share/conduit/guest/conduit-guest.deb` | the guest driver package `conduit create` and `conduit stock-kernel` install into VMs (built at stage time with nfpm) |
+| `/opt/conduit/share/conduit/guest/conduit-guest.pkg.tar.zst` | the same, as an Arch package, for `conduit attach` on Arch-based guests (built at stage time with nfpm) |
 | `/opt/conduit/libexec/conduit-integrate` | AppArmor/SELinux/desktop hookup (`enable`/`disable`) |
 | `/opt/conduit/lib/` | tarball only: the viewer's, stream host's and QEMU's shared libraries |
 | `/opt/conduit/share/doc/conduit/` | LICENSE and every component's LICENSE/NOTICE |
@@ -38,9 +39,9 @@ setup script every package format runs after install; see
 packaging/
 ├── build.sh                   the build: deps, rust, viewer, stream, qemu, stage, bundle-libs, guest-src, package
 ├── nfpm/conduit.yaml          host package: one template -> .deb, .rpm, Arch .pkg.tar.zst
-├── nfpm/conduit-guest.yaml    guest DKMS package: .deb, .rpm
+├── nfpm/conduit-guest.yaml    guest DKMS package: .deb, .rpm, Arch .pkg.tar.zst
 ├── deb/conduit/               postinst, prerm (used by nfpm for all three formats)
-├── deb/conduit-guest/         postinst, prerm (dkms add/install/remove)
+├── deb/conduit-guest/         postinst, prerm (dkms add/install/remove; all three guest formats)
 ├── dkms/dkms.conf             DKMS config, kernel >= 6.4 via BUILD_EXCLUSIVE_KERNEL
 ├── rpm/conduit.spec           source RPM build (COPR/OBS)
 ├── rpm/conduit-guest.spec     source RPM for the guest (DKMS, noarch)
@@ -69,7 +70,7 @@ packaging/build.sh bundle-libs
 packaging/build.sh package tarball
 
 # guest
-packaging/build.sh package guest-deb  # or guest-rpm
+packaging/build.sh package guest-deb  # or guest-rpm, guest-arch
 ```
 
 Output goes to `dist/out/`. `VERSION` overrides the version (default:
@@ -163,7 +164,9 @@ nothing.
 
 The guest package is DKMS-only on every distribution: one noarch source
 package works on Debian, Ubuntu, Fedora (`dkms` is in Fedora), RHEL (EPEL)
-and openSUSE. `dkms.conf` limits builds to Linux 6.4+ with a
+and openSUSE; Arch gets the same contents as `conduit-guest-*-any.pkg.tar.zst`
+(`package guest-arch`, nfpm: the postinst runs as `post_install`/`post_upgrade`,
+and pacman's own dkms hooks build the module as well). `dkms.conf` limits builds to Linux 6.4+ with a
 `BUILD_EXCLUSIVE_KERNEL` regex (works on old DKMS versions, unlike
 `BUILD_EXCLUSIVE_KERNEL_MIN`). The postinst builds for the running kernel and
 reports, rather than fails, when headers are missing.
@@ -207,7 +210,7 @@ QEMU expression (switched to the 11.1.2 tarball when nixpkgs is older, plus
 |---|---|---|
 | `ci.yml` | push, PR | fmt/clippy/test per Rust project (backend, VMM, CLI, stream host; GPU tests skipped by name), guest module vs Ubuntu 24.04 and Fedora headers, viewer `make check`, guest agent unit tests, actionlint, shellcheck, DKMS package build |
 | `abi.yml` | Mondays, manual | new open-gpu-kernel-modules tags / gVisor nvproxy ABIs -> `.github/scripts/abi_update.py` runs the `host/backend/gen` generators -> tests -> PR on `abi/auto` (draft if tests fail). Set secret `ABI_BOT_TOKEN` so CI runs on its PRs. |
-| `release.yml` | tag `v*`, manual | static musl Rust binaries once; deb/rpm/Arch/tarball in their own containers with QEMU cached per week; guest .deb/.rpm; checksums, PKGBUILD, GitHub Release (tags only) |
+| `release.yml` | tag `v*`, manual | static musl Rust binaries once; deb/rpm/Arch/tarball in their own containers with QEMU cached per week; guest .deb/.rpm/.pkg.tar.zst; checksums, PKGBUILD, GitHub Release (tags only) |
 
 ## Repository hygiene
 
