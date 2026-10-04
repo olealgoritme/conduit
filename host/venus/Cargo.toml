@@ -1,0 +1,19 @@
+[package]
+name = "conduit-venus"
+version = "0.1.4"
+edition = "2024"
+license = "Apache-2.0"
+description = "Venus renderer for Windows guests: the trait the backend calls, its IPC, and the renderer process"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+thiserror = "2"
+
+[features]
+default = []
+# The renderer process itself: links virglrenderer (Venus) and the host Vulkan
+# driver. Off by default so the backend builds without either.
+renderer = []
