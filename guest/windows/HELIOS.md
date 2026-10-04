@@ -13,6 +13,8 @@ directories copied unchanged:
 | `protocol/` | `protocol/` | UMD/ICD ↔ KMD escape ABI and wire structs |
 | `umd/`, `umd12/`, `umd_common/` | same | D3D11 / D3D12 user-mode drivers (DXVK, vkd3d-proton bridges) |
 | `installer/`, `packaging/` | same | Windows installer and install/verify scripts |
+| `ci/windows/` | `ci/windows/` | build scripts for the Windows workflow (`.github/workflows/windows.yml`), paths pointed at the submodules below |
+| `tools/`, `metadata/`, `icd/win-build/` | same (the files the build and packaging scripts use) | metadata check, signing, probes, Mesa build compat header |
 
 Submodules, pinned to the commits Helios pins:
 
@@ -35,8 +37,8 @@ the UMDs build unchanged.
 What changed in `kmd_render/src/virtio` (everything else is Helios's):
 
 - **Identity.** The INF and packaging scripts match virtio id 45 (`DEV_106D`)
-  and id 41 (`DEV_1069`): QEMU cannot express id 45, so QEMU test VMs run the
-  device as id 41, as `conduit_gpu.ko virtio_id=41` does on Linux.
+  and id 41 (`DEV_1069`). Conduit's QEMU runs the device as id 45
+  (`virtio-id=45`); id 41 is the alternative, as `conduit_gpu.ko virtio_id=41` is on Linux.
 - **Negotiation.** Only `VIRTIO_F_VERSION_1` is offered or required. Config
   `features` must carry `NVGPU_CFG_VENUS` (offset 3884), i.e. the backend runs
   with `--venus`, or the KMD fails `StartDevice` with a message.
@@ -51,5 +53,6 @@ What changed in `kmd_render/src/virtio` (everything else is Helios's):
   (`SHM_ID_VENUS`), found by `pci_caps::scan_host_visible_window`.
 - **Limit.** Submit streams larger than a 4 MiB `GpuCmd` are refused.
 
-Not built or run yet: the KMD needs the WDK, which this change was written
-without. First test is a Windows 11 QEMU guest with `--venus` and region 3.
+Built by `.github/workflows/windows.yml` (run by hand): the KMD and the D3D11/12
+UMDs compile and are test-signed, Release and Debug. Not yet run on a Windows
+guest; the first test is a Windows 11 QEMU guest with `--venus` and region 3.

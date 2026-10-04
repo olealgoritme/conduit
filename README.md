@@ -173,7 +173,9 @@ conduit detach myvm      # later, if you want: the original definition comes bac
 runs one (Debian/Ubuntu or Arch-based guests; on Arch install it first:
 `sudo pacman -S qemu-guest-agent`, then reboot the VM); otherwise it prints
 the one command to run. It works for VMs in
-`qemu:///system` too (`conduit attach myvm -c qemu:///system`).
+`qemu:///system` too (`conduit attach myvm -c qemu:///system`). Conduit's QEMU
+has no SPICE: attach replaces the VM's SPICE display with Conduit's boot
+console (firmware, boot menu and disk-unlock prompt in the Conduit window).
 A VM made before this: `conduit libvirt enable myvm` (and `disable` to undo).
 
 The window and the VM have separate lives: closing the window leaves a VM

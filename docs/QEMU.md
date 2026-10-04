@@ -77,7 +77,9 @@ Why each nvgpu-related argument is there:
   `size` must equal `-m`.
 - `vhost-user-test-device-pci` is the generic vhost-user device. QEMU 11.1
   has no `vhost-user-device-pci`.
-  - `virtio-id=45` is what the guest driver binds.
+  - `virtio-id=45` is what the guest driver binds. The virtio spec has
+    since given 45 to SPI controllers; `conduit-guest` blacklists the
+    guest's `spi_virtio` so it cannot take the device.
   - `num_vqs=2` gives the control queue and the event queue. The driver
     fails probe with fewer.
   - `vq_size=256` is the backend's `QUEUE_SIZE`. The default of 64 also
@@ -90,7 +92,8 @@ Why each nvgpu-related argument is there:
     the same as `conduit-vmm`.
 - The shared memory regions are not given on the command line. QEMU asks
   the backend for them with `GET_SHMEM_CONFIG`. The backend answers shmid 1
-  (window, 1 GiB) and shmid 2 (UVM aperture, 32 GiB).
+  (window, 1 GiB) and shmid 2 (UVM aperture, 32 GiB), and with `--venus`
+  shmid 3 (Venus host-visible blobs, `--venus-hostmem-mib`, default 8 GiB).
 - `-cpu host,host-phys-bits=on` matters because the shared-memory BAR is
   64 GiB and 64-bit (128 GiB with a large `--venus-hostmem-mib`). The
   firmware places it above 4 GiB, which needs real physical-address width.
@@ -157,16 +160,18 @@ and `swtpm-tools`; Fedora: `swtpm` and `swtpm-tools`; Arch: `swtpm`).
 ## What the guest sees: QEMU compared with conduit-vmm
 
 The guest driver finds everything through virtio PCI capabilities. It calls
-`virtio_get_shm_region()` for shmid 1 and 2, and reads config through the
+`virtio_get_shm_region()` for shmid 1 and 2 (a Windows guest's driver looks
+for 3), and reads config through the
 device-config capability. It never uses a BAR number, so the different
 layout below needs no driver change.
 
 | | conduit-vmm | QEMU 11.1 (+ patches) |
 | --- | --- | --- |
-| PCI id / class | 1af4:106d rev 1, class 0x0380 (display) | 1af4:106d rev 1, class 0x0780 (communication). The driver binds by virtio id and builds its own PCI device for NVIDIA userspace, so the class does not matter. |
+| PCI id / class | 1af4:106d rev 1, class 0x0380 (display) | 1af4:106d rev 1, class 0x0780 (communication). The driver binds by virtio id and builds its own PCI device for NVIDIA userspace (in a PCI domain of its own, see [ARCHITECTURE.md](ARCHITECTURE.md#guest-module)), so the class does not matter. |
 | virtio config structures | all in BAR 0 (32-bit, 16 KiB): common, isr, notify, MSI-X, device cfg at 0x1000 | BAR 2 (64-bit): common 0x0, isr 0x1000, device cfg 0x2000 (4 KiB window), notify 0x3000. MSI-X in BAR 1 |
 | window (shmid 1) | BAR 2, 1 GiB | BAR 4 at offset 0, 1 GiB |
 | aperture (shmid 2) | BAR 4, 32 GiB | BAR 4 at offset 1 GiB, 32 GiB (BAR 4 is 64 GiB, rounded up to a power of two by patch 0006) |
+| Venus blobs (shmid 3, `--venus`) | none | BAR 4 after the aperture (BAR 4 stays 64 GiB, 128 GiB when region 3 is 32 GiB or more) |
 | MSI-X vectors | 3 | 3 with patch 0004, 1 stock (the guest then falls back to INTx) |
 | unplaced window range | backed by zero pages (memfd), so writes stick | a hole: KVM exits to QEMU, reads return 0 and writes are dropped |
 | window withdraw | the range is overwritten with zero pages | the range is unmapped and becomes a hole again |

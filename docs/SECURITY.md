@@ -21,6 +21,14 @@ and the backend are therefore trusted.
   seccomp and Landlock before the first guest message: no `exec`, no files
   beyond the NVIDIA device nodes it needs, no sockets but AF_UNIX. It refuses
   to start on a kernel without seccomp or Landlock.
+- **Venus renderer (`--venus`, experimental).** A Windows guest's Vulkan
+  command streams run in `conduit-venus`, one process per VM, after the
+  backend has checked every command ([VENUS.md](VENUS.md)). It takes the
+  backend's posture (no root, capabilities dropped) with a wider sandbox,
+  because the NVIDIA Vulkan driver loads libraries and patches its own code:
+  Landlock to the system library and driver paths, the GPU device nodes and a
+  per-VM shader cache, nothing executable; a seccomp denylist (no exec, fork,
+  ptrace, mounts, namespaces; no new socket connections).
 - **Memory limits.** The runner, the backend and virtiofsd of a VM share one
   systemd user slice (`conduit-NAME.slice`) with `MemoryMax` = guest RAM +
   overhead and `memory.oom.group`, and a raised `oom_score_adj`, so a VM is

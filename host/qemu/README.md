@@ -2,9 +2,11 @@
 
 `build-qemu.sh` fetches QEMU, checks the tarball, applies the patches in
 `patches/`, and builds a small `qemu-system-x86_64`: x86_64-softmmu only,
-KVM (no TCG), vhost-user, virtio, slirp, VNC, PipeWire/PulseAudio audio. GTK, SDL, SPICE and OpenGL are
-off, because the guest display is the zero-copy nvgpu scanout shown by the
-Conduit viewer.
+KVM (no TCG), vhost-user, virtio, slirp, VNC, PipeWire/PulseAudio audio, TPM
+(`tpm-crb`/`tpm-tis`, emulator and passthrough backends; the emulator needs
+`swtpm` on the host). GTK, SDL, SPICE and OpenGL are off, because the guest
+display is the zero-copy nvgpu scanout shown by the Conduit viewer; VNC stays
+for the boot console of attached libvirt VMs (`docs/SCANOUT.md`).
 
 ```sh
 host/qemu/build-qemu.sh                      # build into host/qemu/build
@@ -30,8 +32,8 @@ protocol feature `VHOST_USER_PROTOCOL_F_SHMEM` (bit 22),
 `VHOST_USER_GET_SHMEM_CONFIG` (front-end request 44), and the back-end
 requests `VHOST_USER_BACKEND_SHMEM_MAP` and `_UNMAP` (9 and 10). It also adds
 shared-memory support to the generic vhost-user device. The backend uses
-these for its two regions: the window (shmid 1) and the UVM aperture
-(shmid 2). In 11.1 the generic device is called **`vhost-user-test-device-pci`**.
+these for its regions: the window (shmid 1), the UVM aperture (shmid 2) and,
+with `--venus`, Venus host-visible blobs (shmid 3). In 11.1 the generic device is called **`vhost-user-test-device-pci`**.
 There is no `vhost-user-device-pci`.
 
 ## Patches

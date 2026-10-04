@@ -24,7 +24,11 @@ in the guest. The guest driver stack comes from Helios
 ```
 
 Nothing here changes Linux guests. The backend serves Venus only with
-`--venus`; without it the config bit is clear and `GpuCmd` is refused.
+`--venus`; without it the config bit is clear and `GpuCmd` is refused. The
+flag exists only in a backend built with the device crate's `venus` feature
+(`cargo build --release -p device --features vhost-user,venus --bin
+conduit-backend` in `host/backend`); `make` and the packages build it
+without, so `conduit up --venus` needs such a backend (`CONDUIT_BACKEND=PATH`).
 
 ## Device
 
@@ -54,9 +58,10 @@ guest, a larger submit is split); a response fits the existing 64 KiB.
 The response may be split across several device-writable descriptors of the
 chain; the host fills them in order.
 
-**Fences.** A command with `VIRTIO_GPU_FLAG_FENCE` set completes (its chain is
-returned to the used ring) only after the renderer signals that fence, as QEMU
-does. With `VIRTIO_GPU_FLAG_INFO_RING_IDX` the fence is on `(ctx_id, ring_idx)`,
+**Fences.** A command with `VIRTIO_GPU_FLAG_FENCE` set that succeeds with
+`RESP_OK_NODATA` completes (its chain is returned to the used ring) only after
+the renderer signals that fence, as QEMU does; a fenced command that fails, or
+answers with data (`GET_CAPSET`, `RESOURCE_MAP_BLOB`), is answered at once. With `VIRTIO_GPU_FLAG_INFO_RING_IDX` the fence is on `(ctx_id, ring_idx)`,
 otherwise on the context's ring 0. Completions may therefore be out of order.
 Unfenced commands complete immediately.
 
@@ -90,7 +95,7 @@ Fence rules, which follow virglrenderer:
 | `RESOURCE_MAP_BLOB` | the blob's fd placed in region 3 at the guest's offset; reply `RESP_OK_MAP_INFO` with the cache type |
 | `RESOURCE_UNMAP_BLOB` | withdrawn from region 3 |
 | `RESOURCE_UNREF` | unmapped if mapped, then freed |
-| `SET_SCANOUT_BLOB` | records scanout 0's resource, size, format, stride, offset; a format with no DRM fourcc is `RESP_ERR_INVALID_PARAMETER` |
+| `SET_SCANOUT_BLOB` | records scanout 0's resource, size, format, stride, offset; resource 0 turns the scanout off (`ScanoutDisable` to the viewer); a format with no DRM fourcc is `RESP_ERR_INVALID_PARAMETER`, a scanout other than 0 `RESP_ERR_INVALID_SCANOUT_ID` |
 | `RESOURCE_FLUSH` | renderer exports the scanout resource as a dma-buf with the guest's layout (cached per resource and layout), sent to the viewer as a frame |
 
 **Scanout layout.** The dma-buf the viewer gets is described entirely by the
@@ -128,7 +133,26 @@ returns `Disconnected`); from then on every `GpuCmd` is answered
 
 `conduit-venus` runs as its own process: the NVIDIA Vulkan driver needs more
 than the backend's sandbox allows (its libraries, shader cache, more ioctls).
-The backend talks to it over a Unix socket, with blob and dma-buf fds passed
-by `SCM_RIGHTS`. Both sides use the `conduit_venus::Renderer` trait
-(`host/venus/src/lib.rs`): the backend through the IPC client, tests through
-`conduit_venus::mock::Mock`.
+The backend talks to it over a Unix `SOCK_SEQPACKET` socket
+(`host/venus/src/ipc.rs`): one request per call, replies in order, messages
+sent in 64 KiB fragments (a submit can be 4 MiB), blob and dma-buf fds passed
+by `SCM_RIGHTS`, and fence signals pushed by the renderer on their own. Both
+sides use the `conduit_venus::Renderer` trait (`host/venus/src/lib.rs`): the
+backend through the IPC client, tests through `conduit_venus::mock::Mock`.
+
+One `conduit-venus` per VM: `conduit up/view --venus` (and the libvirt
+backend unit) starts it before the backend, on `venus.sock` in the VM's run
+directory, logging to `logs/venus.log`; it serves that one backend and exits
+when it hangs up. It is not packaged yet: build it with
+`host/venus/build-virglrenderer.sh`, then `cargo build --release --features
+renderer` in `host/venus` (`CONDUIT_VENUS=PATH` points the CLI at it).
+
+**Sandbox** (`host/venus/src/sandbox.rs`), entered before the first request:
+the backend's posture (no root or `CAP_SYS_ADMIN`, capabilities dropped,
+`no_new_privs`), Landlock limited to the system library and driver
+configuration paths, the NVIDIA and `/dev/dri` device nodes and a per-VM
+shader cache (`$XDG_CACHE_HOME/conduit/venus/VM`), nothing executable; and a
+seccomp denylist (exec, fork, ptrace, mounts and namespaces, module loading,
+io_uring, bpf, ...; no sockets but AF_UNIX, and no new connections). It is
+wider than the backend's: the driver loads libraries and patches its own
+code. `--no-sandbox` is for debugging only.

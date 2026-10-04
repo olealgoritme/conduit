@@ -26,13 +26,32 @@ Current limitations, with the intended fix for each. Planned work is in
 | No physical size or EDID | GNOME picks scale 1 on HiDPI monitors | Report the host output's size, or synthesize an EDID |
 | One head | No multi-monitor | Several CRTCs/connectors, one viewer window per head |
 | No VRR or HDR properties | No adaptive sync or HDR in the guest | `vrr_capable` / `HDR_OUTPUT_METADATA` forwarded to the viewer |
-| No dumb buffers / fbcon | No boot console or Plymouth on the head | Host-backed pitch-linear dumb buffers |
+| No dumb buffers / fbcon | No text console or Plymouth on Conduit's head; firmware and early boot show only through the boot console, which only attached libvirt VMs have ([SCANOUT.md](SCANOUT.md#boot-console)) | Host-backed pitch-linear dumb buffers |
 
 ## Guest
 
 - One Conduit GPU device per guest (global classes, fixed device majors).
 - `CONFIG_INPUT_UINPUT` is off in `guest/linux/guest-kernel.config` (stock
   distro kernels have it).
+- The device's virtio ID, 45, has since been assigned to SPI controllers by
+  the virtio spec. Kernels with `spi_virtio` (Arch 7.2) race `conduit_gpu`
+  for the device; the `conduit-guest` package blacklists `spi_virtio`
+  (`guest/system/modprobe.conf`); a module built by hand needs the same
+  blacklist.
+
+## Windows guests (Venus)
+
+Experimental, behind `--venus` ([VENUS.md](VENUS.md)).
+
+- `conduit-venus` is not in the packages yet, and `make` and the packages
+  build the backend without its `venus` feature; build both by hand
+  ([VENUS.md](VENUS.md)).
+- Region 3 needs QEMU (`conduit-vmm` has fixed BARs).
+- Scanout images must be linear (a Venus blob carries no layout the host can
+  read back).
+- Only `HOST3D` blobs; guest-memory blobs are refused.
+- A fence on a ring with no queue bound makes virglrenderer destroy the
+  context, which the backend cannot see.
 
 ## QEMU
 

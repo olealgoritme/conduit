@@ -3,8 +3,11 @@
 The Wayland window that shows a Conduit VM's desktop. The guest's scanout
 buffers arrive from `conduit-backend` as dma-bufs over a Unix socket and are
 handed to the compositor with `zwp_linux_dmabuf_v1`: no copy, no readback, no
-EGL in the viewer. Keyboard, mouse, clipboard and mode hints (window size,
-refresh rate) go back over the same socket.
+EGL in the viewer. The one exception is the backend's boot console
+(docs/SCANOUT.md), which arrives as shared memory and is accepted in every
+present mode. Keyboard, mouse, clipboard and mode hints (window size,
+refresh rate) go back over the same socket. With no VM attached it shows a
+"CONDUIT / WAITING FOR THE VM" placeholder.
 
 It is a modified copy of the display broker from
 [nvkvm-pv](https://github.com/reindertpelsma/nvkvm-pv), Apache-2.0; see

@@ -181,7 +181,7 @@ enum Cmd {
     /// Show a VM's logs: backend, vm (console) or viewer
     Logs {
         name: String,
-        #[arg(value_parser = ["backend", "vm", "viewer", "watcher", "share", "virtiofsd", "create"])]
+        #[arg(value_parser = ["backend", "vm", "viewer", "watcher", "share", "virtiofsd", "venus", "create"])]
         which: Option<String>,
         /// Keep printing new lines
         #[arg(short, long)]

@@ -18,6 +18,9 @@
 - [x] Conduit's viewer over the network (`conduit remote`), including lossless
 - [x] Viewing and streaming the same VM at once
 - [x] GPU request tracing (`conduit trace`)
+- [x] Explicit sync: DRM syncobjs and GPU fences across the boundary ([SYNC.md](SYNC.md))
+- [x] `conduit attach` for Debian/Ubuntu and Arch-based guests (Arch, Omarchy, EndeavourOS, Manjaro)
+- [x] Boot console for attached VMs (firmware, boot menu, disk unlock) in place of SPICE
 
 ## Next
 - [ ] View and stream together: the VM keeps the highest refresh rate any
@@ -27,8 +30,10 @@
 - [ ] Lower per-call latency: an ioeventfd for the GPU device's notify register
       in `conduit-vmm`, backend thread placement, a short spin in the event pump
 - [ ] Display pacing: forward buffer release, drive the guest vblank from the
-      host's presentation feedback ([KNOWN-ISSUES.md](KNOWN-ISSUES.md)). GPU
-      fences across the boundary: done, [SYNC.md](SYNC.md)
+      host's presentation feedback ([KNOWN-ISSUES.md](KNOWN-ISSUES.md))
+- [ ] Windows guests through Venus (in progress, experimental `--venus`):
+      Helios's guest drivers over Conduit's device ([VENUS.md](VENUS.md));
+      package `conduit-venus`
 - [ ] Audio in the stream (Opus from the VM's sound card)
 - [ ] GPU hot-plug (`device_del` / `device_add`), so a VM can be snapshotted,
       saved and migrated with the GPU unplugged
@@ -39,10 +44,9 @@
 - [ ] Full GPU state in snapshots (record and recreate the VM's RM objects and
       VRAM contents)
 - [ ] NVIDIA native context in virglrenderer: stock QEMU's virtio-gpu, crosvm, libkrun
-- [ ] Windows guests, two routes:
+- [ ] Windows guests beyond Venus, two routes:
   - CUDA / NVML / NVENC on a small non-WDDM driver, using NVIDIA's own user-mode libraries
   - graphics through the open stack: NVK (Mesa Vulkan) on RM + DXVK / vkd3d-proton
-- [ ] Graphics via Venus (Vulkan forwarding) over Conduit's device ([VENUS.md](VENUS.md))
 - [ ] Multiple VMs sharing one GPU with fair scheduling
 - [ ] Per-VM GPU selection on multi-GPU hosts
 - [ ] Multiple monitors per VM, VRR and HDR

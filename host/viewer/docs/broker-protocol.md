@@ -24,7 +24,7 @@ contain a bug conditional on it.
 | offset | field | notes |
 |---|---|---|
 | 0 | `uint16 type` | `ATTACH` 1, `COMMIT` 2, `WINDOW` 3, `CLIPBOARD` 4, `CAPS` 5, `QUERY_FORMAT` 6, `CURSOR` 7 |
-| 2 | `uint16 reserved0` | must be 0 |
+| 2 | `uint16 flags` | `ATTACH` only: `F_SHM` (bit 0); 0 otherwise |
 | 4 | `uint32 width` | |
 | 8 | `uint32 height` | |
 | 12 | `uint32 stride` | bytes per row of plane 0 |
@@ -34,7 +34,9 @@ contain a bug conditional on it.
 | 32 | `uint32 seq` | advisory, logged only |
 | 36 | `uint32 reserved1` | must be 0 |
 
-- **`ATTACH`** carries exactly one fd as `SCM_RIGHTS`, which must be a dma-buf.
+- **`ATTACH`** carries exactly one fd as `SCM_RIGHTS`: a dma-buf, or with
+  `F_SHM` a memfd presented from shared memory (Wayland `wl_shm`, X11
+  `PutImage`; only the backend's boot console sends these, docs/SCANOUT.md).
   The descriptor fields describe it. The broker validates it, imports, and
   closes its copy; the buffer stays alive through the `wl_buffer`/pixmap.
 - **`COMMIT`** presents the most recently attached buffer. No fd, and every

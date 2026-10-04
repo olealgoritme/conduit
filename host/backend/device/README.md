@@ -24,7 +24,11 @@ it refuses to run as root. See `docs/ARCHITECTURE.md` and `docs/SECURITY.md`.
 | `src/vram.rs`, `src/nvidia/vidmem.rs` | `--vram-limit-mib` |
 | `src/sandbox.rs`, `src/posture.rs` | seccomp, Landlock, privilege drop |
 | `src/trace.rs` | request tracing: `--trace`, `--trace-socket` (docs/TRACING.md) |
-| `src/shm_regions.rs` | the window and UVM aperture regions |
+| `src/shm_regions.rs` | the window, UVM aperture and (`--venus`) Venus blob regions |
+| `src/chain.rs` | descriptor chains: requests read from every readable descriptor, replies scattered across every writable one |
+| `src/nvidia/fence.rs` | explicit sync: host semaphore-surface fences as guest fences (docs/SYNC.md) |
+| `src/console/` | the boot console: an RFB client of QEMU's VNC socket (`--console-vnc`, docs/SCANOUT.md) |
+| `src/venus/` | Venus `GpuCmd` for Windows guests, checked before `conduit-venus` sees it (`--venus`, docs/VENUS.md) |
 
 ## Build and test
 
@@ -41,7 +45,8 @@ against a fake host driver; the skipped ones open the real `/dev/nvidiactl`.
 ```sh
 conduit-backend --socket /run/user/1000/conduit/vm.sock \
     --caps graphics,video,utility,compute [--vram-limit-mib 8192] \
-    [--display-socket PATH]...
+    [--display-socket PATH]... [--console-vnc PATH] \
+    [--venus --venus-renderer PATH [--venus-hostmem-mib N]]
 ```
 
 `--display-socket` may be given several times (the CLI passes the viewer's

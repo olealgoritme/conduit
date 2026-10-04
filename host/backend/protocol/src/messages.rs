@@ -6,17 +6,22 @@
 //
 //   [readable: MsgHeader + payload] → [writable: MsgHeader + payload]
 //
+// Either part may span several descriptors (readable ones first): the backend
+// joins the readable ones into the request and writes the reply across the
+// writable ones in order. The Linux guest posts one of each; another guest
+// may post, say, a header buffer and a body buffer.
+//
 // The guest driver:
-//   1. Fills in the readable buffer (header + request payload).
-//   2. Adds the writable buffer to the chain.
+//   1. Fills in the readable buffer(s) (header + request payload).
+//   2. Adds the writable buffer(s) to the chain.
 //   3. Posts the chain to the virtqueue and waits for a used-ring notification.
-//   4. Reads the writable buffer (header + response payload).
+//   4. Reads the writable buffer(s) (header + response payload).
 //
 // The backend:
-//   1. Receives the readable buffer.
+//   1. Joins the readable buffers.
 //   2. Dispatches on `MsgHeader::msg_type`.
-//   3. Writes the response into the writable buffer.
-//   4. Pushes the chain back to the used ring.
+//   3. Writes the response across the writable buffers.
+//   4. Pushes the chain back to the used ring, with the bytes written.
 //
 // Every layout here mirrors `guest/linux/conduit_gpu.c`. That file is the wire
 // format: it is the half compiled into a guest kernel, and it cannot negotiate.

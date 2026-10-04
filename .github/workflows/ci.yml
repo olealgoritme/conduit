@@ -38,8 +38,9 @@ jobs:
         include:
           - name: backend
             dir: host/backend
-            # The vhost-user transport is feature-gated; lint and test it too.
-            features: "--workspace --features device/vhost-user"
+            # The vhost-user transport and the Venus path are feature-gated;
+            # lint and test them too (Venus needs no virglrenderer here).
+            features: "--workspace --features device/vhost-user,device/venus"
           - name: vmm
             dir: host/vmm
             # Built without default features (no virglrenderer), as shipped.

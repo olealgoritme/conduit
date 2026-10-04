@@ -233,13 +233,17 @@ actually has; for H.264/HEVC that same noise also exceeds the bitrate target
 ## Limitations
 
 - The backend does not forward `EV_FRAME`/`EV_RELEASE` (display.rs; with
-  several display clients a buffer would be free only once all released it) and does
-  not fence frames against unfinished guest GPU work (no sync_fd /
-  `DRIVER_SYNCOBJ`). conduit-stream copies each guest buffer into its own
-  planes the moment it arrives (one GL pass, finished before encoding) to
-  narrow the window, but a guest can still draw into a buffer while it is
-  read: occasional torn or partial frames until the backend gains release
-  and fence support.
+  several display clients a buffer would be free only once all released it).
+  The guest flips only once a frame's GPU fences have signalled
+  ([SYNC.md](SYNC.md); a buffer rendered with no fence at all is still
+  flipped unsynchronised), but without release it may start drawing into a
+  buffer again while it is read. conduit-stream copies each guest buffer into
+  its own planes the moment it arrives (one GL pass, finished before
+  encoding) to narrow the window: occasional torn frames remain possible
+  until the backend forwards release.
+- The boot console (attached libvirt VMs, [SCANOUT.md](SCANOUT.md#boot-console))
+  sends shared-memory frames; conduit-stream imports only dma-bufs, so a stream
+  shows the VM from the guest driver's first frame on.
 - No audio in the stream yet (see Audio above).
 - No HDR, touch/pen, rumble or motion yet; one stream client at a time.
 

@@ -240,10 +240,18 @@ Until the guest's Conduit driver displays, there is nothing to scan out:
 firmware, the boot menu and a disk-unlock (LUKS) prompt draw on the VM's
 emulated video device. For VMs that have one, QEMU runs a VNC server on a
 Unix socket and the backend, started with `--console-vnc PATH`, connects to
-it as a client and shows that screen to the display clients instead. Input
-from the window goes to the emulated keyboard and tablet meanwhile. When the
-guest driver's first scanout arrives, the backend switches to it and input
-goes to the guest driver as usual.
+it as an RFB client (`host/backend/device/src/console/`) and shows that screen
+instead. Input from the window goes to the emulated keyboard and tablet
+meanwhile. When the guest driver's first scanout arrives, the backend switches
+to it and input goes to the guest driver as usual. The console takes over
+again after a device reset, when the event queue stops, or when a
+`ScanoutDisable` is not followed by a flip within 250 ms.
+
+There is no dma-buf behind that screen, so its frames are the one exception to
+zero copy: XRGB8888 in a sealed memfd, sent with the ATTACH flag `F_SHM`
+(`nvkvm_broker_proto.h`). `conduit-viewer` presents them in every present mode
+(Wayland `wl_shm`, X11 `PutImage`); `conduit-stream` imports only dma-bufs and
+does not show the console.
 
 QEMU opens the VNC socket only after the GPU's vhost-user handshake, so the
 socket appears after the backend has started.
@@ -290,8 +298,9 @@ compositor modesets as usual.
 
 ## Invariants
 
-- No CPU copy anywhere. If an import fails, log and drop the frame; never fall
-  back to readback.
+- No CPU copy of a guest frame. If an import fails, log and drop the frame;
+  never fall back to readback. (The boot console's shared-memory frames are
+  QEMU's emulated screen, not a guest GPU buffer.)
 - A client that wants no frames costs the flip path nothing (no export, no
   descriptor, no syscall).
 - Nothing in this path calls NVKMS on the host. Only DRM PRIME export on the

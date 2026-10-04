@@ -45,6 +45,15 @@ and maps what the backend placed. It also provides a KMS display, input
 devices (keyboard, mouse, gamepads) and `/dev/conduit-clipboard`. It is packaged with DKMS
 (`conduit-guest`).
 
+NVIDIA's userspace expects to find the GPU on PCI, so the module builds a PCI
+root bus holding a device that answers with the host GPU's config space. It
+sits in a PCI domain of its own (the first unused one at or above `0x10`;
+bus, device and function stay the host's), so it cannot collide with the
+guest's own buses. The module translates the domain wherever userspace sees
+a PCI address (`/proc/driver/nvidia`, card info, the RM PCI and bus-info
+controls); RM keeps the host's (`guest/linux/nvgpu_pcimap.h`). The mirror
+device carries a `driver_override` so no other driver binds it.
+
 ## Backend
 
 `conduit-backend` holds the real `/dev/nvidia*` descriptors for one VM. For
@@ -65,6 +74,8 @@ at a fixed address, so they go into the **UVM aperture** (region 2, 32 GiB of
 address space, committed only as touched). Pinned host memory is registered as
 guest-physical page runs and mapped zero-copy. When a host descriptor becomes
 ready (GPU interrupt), the backend sends an event so the guest's `poll()` wakes.
+GPU fences cross the same way: a host sync_file is watched once and its
+signal becomes a guest dma_fence ([SYNC.md](SYNC.md)).
 
 See [SECURITY.md](SECURITY.md) for the sandbox and what is refused.
 
@@ -83,7 +94,22 @@ it over a Unix socket (the broker protocol,
   frames with NVENC and serves Moonlight (GameStream) clients or a remote
   Conduit viewer ([STREAMING.md](STREAMING.md)).
 
+Before the guest driver displays (firmware, boot menu, disk unlock), an
+attached libvirt VM's emulated screen is shown instead: the backend reads it
+from QEMU's VNC socket (`--console-vnc`) and sends it as shared-memory frames,
+the one copied path ([SCANOUT.md](SCANOUT.md#boot-console)).
+
 Details: [SCANOUT.md](SCANOUT.md), [CLIPBOARD.md](CLIPBOARD.md), [SYNC.md](SYNC.md) (GPU fences).
+
+## Windows guests (experimental)
+
+With `--venus` the backend also serves Venus: a Windows guest's Vulkan
+command streams (D3D through DXVK / vkd3d-proton, Helios's guest drivers)
+arrive as virtio-gpu commands in `GpuCmd` messages, are checked by the
+backend and executed by `conduit-venus` (`host/venus`), a separate sandboxed
+process running virglrenderer on the host's NVIDIA Vulkan driver. Its scanout
+reaches the viewer as a dma-buf like a Linux guest's. Details:
+[VENUS.md](VENUS.md).
 
 ## Runners and libvirt
 
@@ -99,7 +125,8 @@ supported: the GPU state lives in the host driver. Details:
 
 ## Limits
 
-- NVIDIA only, Linux guests only (Windows: [ROADMAP.md](ROADMAP.md)).
+- NVIDIA only. Linux guests; Windows guests (Venus) are experimental, not
+  supported yet ([VENUS.md](VENUS.md), [ROADMAP.md](ROADMAP.md)).
 - Not hardware isolation; the host NVIDIA driver is trusted.
 - The shared-memory window (1 GiB) is sized when the VM starts and cannot grow.
 - No HMM / pageable memory access, MIG or SR-IOV.

@@ -40,7 +40,7 @@ shared RAM), and with `oom_score_adj=500`, so under memory pressure the kernel k
 before your desktop. `conduit down` stops the slice. Without a systemd user session (or with
 `CONDUIT_NO_SCOPE=1`) the processes run unconfined.
 
-`--venus` (experimental, `up`/`view`, also libvirt VMs): the GPU backend serves Venus for a Windows guest (`conduit-backend --venus`, docs/VENUS.md), rendered by a `conduit-venus` started with it (logs/venus.log; found like the other tools, or `CONDUIT_VENUS=PATH`; `CONDUIT_VENUS_LD_LIBRARY_PATH` becomes its `LD_LIBRARY_PATH`). Off by default.
+`--venus` (experimental, `up`/`view`, also libvirt VMs): the GPU backend serves Venus for a Windows guest (`conduit-backend --venus`, docs/VENUS.md), rendered by a `conduit-venus` started with it (logs/venus.log; `CONDUIT_VENUS_LD_LIBRARY_PATH` becomes its `LD_LIBRARY_PATH`). Off by default. It needs a backend built with the `venus` cargo feature, which `make` and the packages do not enable (docs/VENUS.md; point `CONDUIT_BACKEND` at one), and `conduit-venus`, which is not in the packages yet: conduit looks for it in `$CONDUIT_PREFIX/bin`, next to the `conduit` binary, and in a checkout in `host/venus/target/{release,debug}` (or `CONDUIT_VENUS=PATH`); build it with `host/venus/build-virglrenderer.sh`, then `cargo build --release --features renderer` in `host/venus`. Region 3 needs QEMU, not `--vmm builtin`.
 
 `--tune-hyprland` is opt-in. While the viewer runs, it sets `misc:no_direct_scanout 0`, `general:allow_tearing 1` and an `immediate` rule for the viewer, then restores the old values. If the viewer supports `--direct-hook`, Ctrl+Alt+D turns these settings on and off.
 
@@ -50,14 +50,15 @@ before your desktop. `conduit down` stops the slice. Without a systemd user sess
 |---|---|
 | Settings | `~/.config/conduit/` (`ssh/id_ed25519` is the key used for VMs) |
 | VMs | `~/.local/share/conduit/vms/NAME/{disk.img, vm.json, logs/}` |
-| Running state | `/run/user/$UID/conduit/NAME/` (pid files, `gpu.sock`, `display.sock` (viewer), `stream.sock` (stream host), `trace.sock`, `vfs.sock`, `state.json`, `qmp.sock`, `qemu.args` or `vmm.json`; libvirt VMs: `gpu-libvirt.sock`, `vfs-libvirt.sock`, `libvirt-mode`) |
+| Running state | `/run/user/$UID/conduit/NAME/` (pid files, `gpu.sock`, `display.sock` (viewer), `stream.sock` (stream host), `trace.sock`, `vfs.sock`, `state.json`, `qmp.sock`, `qemu.args` or `vmm.json`, `venus.sock` with `--venus`; libvirt VMs: `gpu-libvirt.sock`, `vfs-libvirt.sock`, `libvirt-mode`, and `console.sock` (the boot console) for attached session VMs) |
 | libvirt | `vms/NAME/libvirt.json` (which domain), `vms/NAME/libvirt-backup-*.xml` (attach), `~/.config/systemd/user/conduit-{backend,virtiofsd}@*`, `/etc/systemd/system/conduit-net-NAME.service`, `~/.local/share/applications/conduit-NAME.desktop` |
 | Boot files | `~/.local/share/conduit/vms/NAME/boot/{vmlinuz,initrd.img}`: the newest kernel in the disk's `/boot`, copied out with `debugfs` before every start |
 | Cache | `~/.cache/conduit/` (Ubuntu image, the NVIDIA user-space files staged for each driver version) |
 | Programs | `$CONDUIT_PREFIX` (default `/opt/conduit`): `bin/conduit-{backend,vmm,viewer,userspace,stream}`, `bin/qemu-system-x86_64`, `share/conduit/guest/conduit-guest.deb` (and `.pkg.tar.zst` for `attach` on Arch guests), `share/conduit/supported-drivers.txt`. In a source checkout it falls back to the build outputs (`host/*/target/release/…`, `host/viewer/conduit-viewer`, `host/qemu/build/…`, `dist/out/conduit-guest_*_all.deb` / `conduit-guest-*-any.pkg.tar.zst`, built on demand with nfpm). |
 
 To override a single part, set one of `CONDUIT_BACKEND`, `CONDUIT_VMM`, `CONDUIT_VIEWER`,
-`CONDUIT_USERSPACE`, `CONDUIT_STREAM`, `CONDUIT_GUEST_DEB`, `CONDUIT_QEMU` or `CONDUIT_VIRTIOFSD`.
+`CONDUIT_USERSPACE`, `CONDUIT_STREAM`, `CONDUIT_VENUS`, `CONDUIT_GUEST_DEB`, `CONDUIT_GUEST_ARCH`,
+`CONDUIT_QEMU` or `CONDUIT_VIRTIOFSD`.
 
 Each VM gets its own network: tap `conduitN`, with the host at `172.30.N.1` and the VM at
 `172.30.N.2`. NAT uses MASQUERADE without naming an uplink, so it keeps working when a VPN

@@ -49,7 +49,10 @@ the VM's slice `conduit-NAME.slice` with `OOMScoreAdjust=500`.
 --display` / `conduit view` asked for (they leave it in
 `/run/user/UID/conduit/NAME/libvirt-next-mode`), else your monitor's. It
 records the mode in `libvirt-mode`, which `conduit view` reads to open a
-matching window for a VM that is already running.
+matching window for a VM that is already running. After `conduit up/view
+--venus` it also finds `libvirt-next-venus`, starts `conduit-venus` and runs
+the backend with `--venus` ([VENUS.md](VENUS.md)). For an attached VM with a display it
+passes `--console-vnc` with the boot console's socket (below).
 
 System domains get the same units in `/etc/systemd/system`, with
 `SocketUser=libvirt-qemu` (or `qemu`), sockets in `/run/conduit/NAME/`, and
@@ -145,8 +148,21 @@ would run.
 Both then install the same files: `conduit-guest.service` (loads
 `conduit_gpu`, mounts the `nvidia` virtiofs share read-only at `/mnt/nvidia`,
 runs `ldconfig`), the udev rules, `/etc/ld.so.conf.d/zz-conduit-nvidia.conf`
-and the Vulkan ICD / GLVND EGL / GBM paths into the share
-(`/etc/profile.d/conduit-nvidia.sh`, `/etc/environment.d/90-conduit-nvidia.conf`).
+and the loader paths into the share (`/etc/profile.d/conduit-nvidia.sh`,
+`/etc/environment.d/90-conduit-nvidia.conf`, and the same variables as a
+`# >>> conduit >>>` block in `/etc/environment`, which also reaches a display
+manager's greeter):
+
+- the Vulkan ICD and GLVND EGL vendor files from the share;
+- EGL external platforms from the share first, then the distribution's
+  (`/usr/share/egl/egl_external_platform.d`, so an installed egl-wayland is a
+  fallback);
+- GBM: NVIDIA's backend from the share first, then the distribution's
+  (`/usr/lib/x86_64-linux-gnu/gbm`, `/usr/lib/gbm`), which the emulated
+  display card needs;
+- `AQ_DRM_DEVICES=/dev/dri/conduit-card`: an attached VM has two DRM cards
+  (Conduit's and the emulated one), so a udev rule names Conduit's
+  `/dev/dri/conduit-card` and Hyprland is pointed at it.
 The package itself brings the module autoload and modprobe entries, the
 user-namespace sysctl, the logind power-key drop-in and the clipboard agent
 (user unit enabled globally, plus an XDG autostart entry). Hyprland started

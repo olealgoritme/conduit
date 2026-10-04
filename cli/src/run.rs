@@ -743,6 +743,12 @@ fn preflight(c: &VmConfig, want: Option<VmmKind>) -> Result<Parts> {
     let backend = Tool::Backend.require()?;
     let venus = if venus() { Some(need_venus()?) } else { None };
     let (kind, vmm, virtiofsd) = pick_vmm(want, c.kernel.is_none())?;
+    if venus.is_some() && kind == VmmKind::Builtin {
+        return Err(oops(
+            "--venus needs Conduit's QEMU: the built-in VM runner has no Venus shared memory region",
+            "Drop --vmm builtin (and install virtiofsd if `conduit doctor` says QEMU cannot run)",
+        ));
+    }
     let audio = match kind {
         VmmKind::Qemu => qemu::pick_audio(&vmm),
         VmmKind::Builtin => None,
@@ -1360,7 +1366,10 @@ pub fn logs(name: &str, which: Option<&str>, follow: bool, lines: usize) -> Resu
     let all = ["backend", "vm", "viewer"];
     let pick: Vec<&str> = match which {
         None => all.to_vec(),
-        Some(w) if all.contains(&w) || ["watcher", "share", "virtiofsd", "venus"].contains(&w) => {
+        Some(w)
+            if all.contains(&w)
+                || ["watcher", "share", "virtiofsd", "venus", "create"].contains(&w) =>
+        {
             vec![w]
         }
         Some(w) => {

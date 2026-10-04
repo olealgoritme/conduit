@@ -25,11 +25,17 @@ layout, so a layout change is made in one place.
 | `/usr/share/applications/conduit.desktop` (`/usr/local/share/...` for the tarball) | desktop entry |
 | `/etc/apparmor.d/abstractions/conduit` | AppArmor rules for libvirt's QEMU |
 
+Not packaged yet: `conduit-venus`, the Venus renderer for `--venus`
+(experimental, docs/VENUS.md). It needs virglrenderer built with Venus
+(`host/venus/build-virglrenderer.sh`), so it is built by hand; the packaged
+backend is also built without its `venus` feature.
+
 The guest package installs `/usr/src/conduit-guest-<version>/` (module source
 plus `dkms.conf`); DKMS builds `conduit_gpu.ko` into
 `/lib/modules/<kver>/updates/dkms/` for every kernel 6.4 or newer. It also
 ships the files in `guest/system/` (module autoload, the modprobe.d entry
-that retires the old `virtio_gpu_nv` name, the user-namespace sysctl, and the
+that retires the old `virtio_gpu_nv` name and blacklists `spi_virtio`, the
+user-namespace sysctl, and the
 setup script every package format runs after install; see
 `guest/linux/README.md`).
 
@@ -208,9 +214,10 @@ QEMU expression (switched to the 11.1.2 tarball when nixpkgs is older, plus
 
 | Workflow | When | What |
 |---|---|---|
-| `ci.yml` | push, PR | fmt/clippy/test per Rust project (backend, VMM, CLI, stream host; GPU tests skipped by name), guest module vs Ubuntu 24.04 and Fedora headers, viewer `make check`, guest agent unit tests, actionlint, shellcheck, DKMS package build |
+| `ci.yml` | push, PR, manual | fmt/clippy/test per Rust project (backend, VMM, `host/venus` without its `renderer` feature, CLI, stream host; GPU tests skipped by name), guest module vs Ubuntu 24.04 (GA and HWE), Debian 13 and Fedora headers plus its plain-C unit tests, viewer `make check`, guest agent unit tests, actionlint, shellcheck, DKMS package build |
 | `abi.yml` | Mondays, manual | new open-gpu-kernel-modules tags / gVisor nvproxy ABIs -> `.github/scripts/abi_update.py` runs the `host/backend/gen` generators -> tests -> PR on `abi/auto` (draft if tests fail). Set secret `ABI_BOT_TOKEN` so CI runs on its PRs. |
 | `release.yml` | tag `v*`, manual | static musl Rust binaries once; deb/rpm/Arch/tarball in their own containers with QEMU cached per week; guest .deb/.rpm/.pkg.tar.zst; checksums, PKGBUILD, GitHub Release (tags only) |
+| `windows.yml` | manual only (hours on Windows runners) | the Windows guest stack from `guest/windows` (WDDM driver, D3D11/12 UMDs, Mesa Venus ICD, loaders, installer); the package per configuration as an artifact, not attached to releases |
 
 ## Repository hygiene
 
