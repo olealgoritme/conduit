@@ -6,7 +6,7 @@
 //! the split makes a compile-time fact.
 
 use helios_protocol::{
-    VIRTIO_GPU_SHM_ID_HOST_VISIBLE, VIRTIO_PCI_CAP_ISR_CFG, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
+    VIRTIO_PCI_CAP_ISR_CFG, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
 };
 use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction};
 
@@ -98,8 +98,12 @@ fn bar_base(access: &DxgkConfigAccess, bar: u16) -> Option<u64> {
     }
 }
 
+/// Conduit device shared memory region 3, host-visible Venus blobs
+/// (`SHM_ID_VENUS`, docs/VENUS.md).
+const SHM_ID_VENUS: u32 = 3;
+
 /// Walk the PCI capability list for the virtio `SHARED_MEMORY_CFG` capability
-/// whose shmid is `HOST_VISIBLE`, returning its guest-physical (base, length).
+/// whose shmid is `SHM_ID_VENUS`, returning its guest-physical (base, length).
 /// virtio-drivers' `PciTransport` ignores cap type 8, so we scan it ourselves.
 /// Returns `None` if absent (a device built without blob/hostmem), which makes
 /// the blob map path unavailable rather than crashing.
@@ -126,7 +130,7 @@ pub(super) fn scan_host_visible_window(access: &DxgkConfigAccess) -> Option<Host
             let d1 = cfg_read32(access, cap + 4);
             let bar = (d1 & 0xFF) as u16;
             let shmid = (d1 >> 8) & 0xFF;
-            if shmid == VIRTIO_GPU_SHM_ID_HOST_VISIBLE as u32 {
+            if shmid == SHM_ID_VENUS {
                 // `virtio_pci_cap64`: offset lo/hi at +8/+16, length lo/hi at +12/+20.
                 let off = cfg_read32(access, cap + 8) as u64
                     | ((cfg_read32(access, cap + 16) as u64) << 32);

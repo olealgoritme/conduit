@@ -1,7 +1,7 @@
 //! Helios vGPU kernel-mode driver (KMD).
 //!
 //! A WDDM 3.2 render+display miniport driver for the virtio-gpu device
-//! (VEN_1AF4 & DEV_1050). `DriverEntry` registers our DDI table with Dxgkrnl via
+//! (VEN_1AF4 & DEV_106D, or DEV_1069 under QEMU). `DriverEntry` registers our DDI table with Dxgkrnl via
 //! `DxgkInitialize`; from there Dxgkrnl drives the device lifecycle through the
 //! callbacks below.
 //!

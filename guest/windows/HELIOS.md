@@ -29,3 +29,27 @@ QEMU's virtio-gpu; here the KMD talks to Conduit's device (virtio id 45) and
 the Venus messages in `host/backend/protocol`. The escape ABI between the
 user-mode drivers and the KMD stays Helios's, so Mesa, DXVK, vkd3d-proton and
 the UMDs build unchanged.
+
+## KMD transport on Conduit's device
+
+What changed in `kmd_render/src/virtio` (everything else is Helios's):
+
+- **Identity.** The INF and packaging scripts match virtio id 45 (`DEV_106D`)
+  and id 41 (`DEV_1069`): QEMU cannot express id 45, so QEMU test VMs run the
+  device as id 41, as `conduit_gpu.ko virtio_id=41` does on Linux.
+- **Negotiation.** Only `VIRTIO_F_VERSION_1` is offered or required. Config
+  `features` must carry `NVGPU_CFG_VENUS` (offset 3884), i.e. the backend runs
+  with `--venus`, or the KMD fails `StartDevice` with a message.
+- **Framing.** Every control-queue message is `MsgHeader{GpuCmd}` + the
+  virtio-gpu command, answered by `MsgHeader` + the virtio-gpu response. The two
+  headers sit in a 32-byte tail of each `DmaBuffer` (`hal.rs`), added to the
+  chain by `Chain::spans`. A response `MsgHeader.status < 0` is turned into
+  `RESP_ERR_UNSPEC` in `drain_used`. Fences are unchanged: the same
+  `VIRTIO_GPU_FLAG_FENCE` / `INFO_RING_IDX` commands complete out of order on
+  the used ring.
+- **Region 3.** The host-visible blob window is shared memory region 3
+  (`SHM_ID_VENUS`), found by `pci_caps::scan_host_visible_window`.
+- **Limit.** Submit streams larger than a 4 MiB `GpuCmd` are refused.
+
+Not built or run yet: the KMD needs the WDK, which this change was written
+without. First test is a Windows 11 QEMU guest with `--venus` and region 3.

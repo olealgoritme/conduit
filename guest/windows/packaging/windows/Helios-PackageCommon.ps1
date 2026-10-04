@@ -105,7 +105,7 @@ function Get-HeliosDeviceInstanceId {
     # between bootstrap and accelerated boots, leaving a non-present PCI
     # instance in CIM that must not receive the WGL registration.
     $presentDevices = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
-        Where-Object { $_.InstanceId -like "PCI\VEN_1AF4&DEV_1050*" })
+        Where-Object { $_.InstanceId -like "PCI\VEN_1AF4&DEV_106*" })
     $device = $presentDevices |
         Where-Object { $_.FriendlyName -like "Helios*" } |
         Select-Object -First 1
@@ -115,14 +115,14 @@ function Get-HeliosDeviceInstanceId {
     if ($device) { return [string]$device.InstanceId }
 
     $device = Get-CimInstance Win32_PnPEntity |
-        Where-Object { $_.PNPDeviceID -like "PCI\VEN_1AF4&DEV_1050*" -and $_.Name -like "Helios*" } |
+        Where-Object { $_.PNPDeviceID -like "PCI\VEN_1AF4&DEV_106*" -and $_.Name -like "Helios*" } |
         Select-Object -First 1
     if (-not $device) {
         $device = Get-CimInstance Win32_PnPEntity |
-            Where-Object { $_.PNPDeviceID -like "PCI\VEN_1AF4&DEV_1050*" } |
+            Where-Object { $_.PNPDeviceID -like "PCI\VEN_1AF4&DEV_106*" } |
             Select-Object -First 1
     }
-    if (-not $device) { throw "The Helios virtio-gpu PCI device (1af4:1050) was not found." }
+    if (-not $device) { throw "The Helios virtio-gpu PCI device (1af4:106d (or 1069 under QEMU)) was not found." }
     return [string]$device.PNPDeviceID
 }
 

@@ -48,7 +48,7 @@ use helios_kmd_logic::scanout_read_ledger::LedgerTicket;
 use helios_kmd_logic::scanout_refresh::{Marker as ScanoutRefreshMarker, State as RefreshState};
 use helios_protocol::{
     resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuRespDisplayInfo,
-    VirtioGpuSetScanoutBlob, HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES,
+    VirtioGpuSetScanoutBlob,
     VIRTIO_GPU_CMD_GET_DISPLAY_INFO, VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE,
     VIRTIO_GPU_FLAG_INFO_RING_IDX,
 };
@@ -81,6 +81,15 @@ use crate::virtio::venus::{
 const CTRL_QUEUE: u16 = 0;
 /// Control-queue ring size — power of two, conservatively ≤ the device's max.
 const CTRL_QUEUE_SIZE: usize = 64;
+
+/// Conduit's device offers `VIRTIO_F_VERSION_1` and nothing else (guest/linux/
+/// conduit_gpu.c `features[]`); what it can serve travels in config `features`.
+const CONDUIT_REQUIRED_FEATURES: u64 = helios_protocol::VIRTIO_F_VERSION_1;
+/// Byte offset of `features` in the device config (`VirtioGpuNvConfig`, right
+/// after `num_fd_translations` at 3880).
+const CONDUIT_CFG_FEATURES_OFFSET: usize = 3884;
+/// `NVGPU_CFG_VENUS`: the device serves `GpuCmd` (set only with `--venus`).
+const CONDUIT_CFG_VENUS: u32 = 1 << 10;
 /// One page of contiguous DMA scratch for `init`'s inline polled round-trip.
 const SCRATCH_BYTES: usize = 4096;
 /// Busy-poll bound for `init`'s inline GET_DISPLAY_INFO round-trip — the ONLY
@@ -1466,19 +1475,25 @@ impl Chain {
         meta: &DmaBuffer,
         venus: Option<&DmaBuffer>,
         resp_len: usize,
-    ) -> Option<([DmaSpan; 2], usize, DmaSpan)> {
+    ) -> Option<([DmaSpan; 3], usize, [DmaSpan; 2])> {
+        // Every message is `MsgHeader | virtio-gpu command` and is answered
+        // `MsgHeader | virtio-gpu response` (docs/VENUS.md). The two headers
+        // live in the meta buffer's wire tail, so the chain is
+        // `[req hdr, in0, in1?] -> [resp hdr, resp]`.
+        let (req_hdr, resp_hdr) = meta.wire_spans();
         let resp = meta.span(self.resp_offset(), resp_len)?;
+        let none = DmaSpan::EMPTY;
         Some(match self {
-            Self::Meta1 { in0_len } => ([meta.span(0, in0_len)?, DmaSpan::EMPTY], 1, resp),
+            Self::Meta1 { in0_len } => ([req_hdr, meta.span(0, in0_len)?, none], 2, [resp_hdr, resp]),
             Self::Meta2 { in0_len, in1_len } => (
-                [meta.span(0, in0_len)?, meta.span(in0_len, in1_len)?],
-                2,
-                resp,
+                [req_hdr, meta.span(0, in0_len)?, meta.span(in0_len, in1_len)?],
+                3,
+                [resp_hdr, resp],
             ),
             Self::MetaPlusVenus { hdr_len, venus_len } => (
-                [meta.span(0, hdr_len)?, venus?.span(0, venus_len)?],
-                2,
-                resp,
+                [req_hdr, meta.span(0, hdr_len)?, venus?.span(0, venus_len)?],
+                3,
+                [resp_hdr, resp],
             ),
         })
     }
@@ -2368,15 +2383,25 @@ impl VirtioGpu {
         transport.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
 
         let offered = transport.read_device_features();
-        let accepted = offered & (HELIOS_REQUIRED_FEATURES | HELIOS_OPTIONAL_FEATURES);
+        let accepted = offered & CONDUIT_REQUIRED_FEATURES;
         transport.write_driver_features(accepted);
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FEATURES_OK,
         );
         if !transport.get_status().contains(DeviceStatus::FEATURES_OK)
-            || accepted & HELIOS_REQUIRED_FEATURES != HELIOS_REQUIRED_FEATURES
+            || accepted & CONDUIT_REQUIRED_FEATURES != CONDUIT_REQUIRED_FEATURES
         {
             transport.set_status(DeviceStatus::FAILED);
+            return Err(VirtioError::FeatureRejected);
+        }
+
+        // The device only takes `GpuCmd` when the backend runs with `--venus`.
+        let cfg_features: u32 = transport
+            .read_config_space::<u32>(CONDUIT_CFG_FEATURES_OFFSET)
+            .map_err(|_| VirtioError::DeviceError)?;
+        if cfg_features & CONDUIT_CFG_VENUS == 0 {
+            transport.set_status(DeviceStatus::FAILED);
+            crate::kmsg(c"Conduit: backend not started with --venus\n");
             return Err(VirtioError::FeatureRejected);
         }
 
@@ -2439,15 +2464,22 @@ impl VirtioGpu {
         let resp_len = core::mem::size_of::<VirtioGpuRespDisplayInfo>();
         let mut req = VirtioGpuCtrlHdr::zeroed();
         req.type_ = VIRTIO_GPU_CMD_GET_DISPLAY_INFO;
-        req_buf[..hdr_len].copy_from_slice(bytemuck::bytes_of(&req));
+        // `MsgHeader{GpuCmd}` | command, answered `MsgHeader` | response.
+        const MH: usize = super::hal::MSG_HDR_LEN;
+        req_buf[..MH].fill(0);
+        req_buf[..4].copy_from_slice(&super::hal::MSG_TYPE_GPU_CMD.to_le_bytes());
+        req_buf[MH..MH + hdr_len].copy_from_slice(bytemuck::bytes_of(&req));
+        resp_buf[..MH].fill(0);
 
         // Bounded inline round-trip (`Self` does not exist yet, so the
         // `ctrl_queue_bounded_roundtrip` helper is unavailable): a host that
         // never answers GET_DISPLAY_INFO must fail StartDevice cleanly, not
         // hang it forever. PASSIVE_LEVEL, no spinlock held.
         {
-            let inputs: &[&[u8]] = &[&req_buf[..hdr_len]];
-            let outputs: &mut [&mut [u8]] = &mut [&mut resp_buf[..resp_len]];
+            let (rq_a, rq_b) = req_buf.split_at(MH);
+            let (rs_a, rs_b) = resp_buf.split_at_mut(MH);
+            let inputs: &[&[u8]] = &[rq_a, &rq_b[..hdr_len]];
+            let outputs: &mut [&mut [u8]] = &mut [rs_a, &mut rs_b[..resp_len]];
             // SAFETY: the scratch-page buffers stay valid for the whole block;
             // on timeout we bail out of init and never reuse this queue.
             let token =
@@ -2468,8 +2500,10 @@ impl VirtioGpu {
                 .map_err(|_| VirtioError::DeviceError)?;
         }
 
-        let resp: &VirtioGpuRespDisplayInfo = bytemuck::from_bytes(&resp_buf[..resp_len]);
-        if !resp_is_ok(resp.hdr.type_) {
+        let wire_status = i32::from_le_bytes(resp_buf[8..12].try_into().unwrap());
+        let resp: &VirtioGpuRespDisplayInfo =
+            bytemuck::from_bytes(&resp_buf[MH..MH + resp_len]);
+        if wire_status != 0 || !resp_is_ok(resp.hdr.type_) {
             return Err(VirtioError::DeviceError);
         }
         crate::kmsg(c"Helios: virtio-gpu GET_DISPLAY_INFO OK\n");
@@ -2706,9 +2740,11 @@ impl VirtioGpu {
         };
         // SAFETY: see the function's Safety note.
         let added = unsafe {
-            let reads = [reads[0].as_slice(), reads[1].as_slice()];
-            self.control
-                .add(&reads[..count], &mut [resp.as_mut_slice()])
+            let reads = [reads[0].as_slice(), reads[1].as_slice(), reads[2].as_slice()];
+            self.control.add(
+                &reads[..count],
+                &mut [resp[0].as_mut_slice(), resp[1].as_mut_slice()],
+            )
         };
         match added {
             Ok(token) => Ok(token),
@@ -4212,9 +4248,12 @@ impl VirtioGpu {
             // SAFETY: exactly the spans `add` was called with; the entry still
             // owns both buffers.
             let popped = unsafe {
-                let read_slices = [reads[0].as_slice(), reads[1].as_slice()];
-                self.control
-                    .pop_used(token, &read_slices[..count], &mut [resp.as_mut_slice()])
+                let read_slices = [reads[0].as_slice(), reads[1].as_slice(), reads[2].as_slice()];
+                self.control.pop_used(
+                    token,
+                    &read_slices[..count],
+                    &mut [resp[0].as_mut_slice(), resp[1].as_mut_slice()],
+                )
             };
             if popped.is_err() {
                 self.latch_failed_and_fail_inflight();
@@ -4228,8 +4267,17 @@ impl VirtioGpu {
             let scanout_flush = take_scanout_flush_token(&mut entry.kind);
             let resp_base = {
                 // SAFETY: the resp span is within the entry-owned meta buffer.
-                unsafe { resp.as_slice() }.as_ptr()
+                unsafe { resp[1].as_slice() }.as_ptr()
             };
+            // A transport-level refusal (`MsgHeader.status < 0`, malformed
+            // message) carries no virtio-gpu response; make the body read as
+            // an error instead of whatever the pooled buffer held.
+            if entry.meta.wire_status() != 0 {
+                // SAFETY: within the entry-owned meta buffer, >= 4 bytes.
+                unsafe {
+                    core::ptr::write_unaligned(resp_base as *mut u32, 0x1200 /* RESP_ERR_UNSPEC */);
+                }
+            }
             // First u32 of the device-written response = VIRTIO_GPU_RESP_*.
             // SAFETY: as above; unaligned because the offset is command-shaped.
             let resp_type = unsafe { core::ptr::read_unaligned(resp_base as *const u32) };
@@ -4733,7 +4781,7 @@ impl VirtioGpu {
             .dma_pool
             .iter()
             .enumerate()
-            .filter(|(_, buf)| buf.capacity() >= len)
+            .filter(|(_, buf)| buf.can_hold(len))
             .min_by_key(|(_, buf)| buf.capacity())
         else {
             DMA_POOL_MISSES.fetch_add(1, Ordering::Relaxed);
@@ -4742,7 +4790,7 @@ impl VirtioGpu {
         let mut buf = self.dma_pool.swap_remove(idx);
         self.dma_pool_bytes = self.dma_pool_bytes.saturating_sub(buf.capacity());
         DMA_POOL_CACHED_BYTES.store(self.dma_pool_bytes as u32, Ordering::Relaxed);
-        // Infallible here: the filter proved capacity >= len, and len > 0.
+        // Infallible here: the filter proved `can_hold(len)`.
         if !buf.reset(len) {
             DMA_POOL_MISSES.fetch_add(1, Ordering::Relaxed);
             return None;

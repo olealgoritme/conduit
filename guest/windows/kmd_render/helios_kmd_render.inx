@@ -1,5 +1,5 @@
 ; helios_kmd_render.inx — Helios vGPU WDDM render and display miniport driver.
-; Matches the virtio-gpu PCI device (VEN_1AF4 & DEV_1050). The wdk-build
+; Matches the virtio-gpu PCI device (VEN_1AF4 & DEV_106D / DEV_1069). The wdk-build
 ; toolchain stamps DriverVer and produces helios_kmd_render.inf during packaging.
 ; Test-signed package. FeatureScore is set below the inbox and virtual display
 ; drivers so PnP selects Helios on its own PCI IDs; see Helios_Install below.
@@ -34,7 +34,9 @@ helios_umd12_32.dll = 1,,
 %ProviderName% = Helios_Models,NTamd64.10.0...16299
 
 [Helios_Models.NTamd64.10.0...16299]
-%DeviceDesc% = Helios_Install, PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01, PCI\VEN_1AF4&DEV_1050
+; Conduit's device is virtio id 45 (DEV_106D). QEMU cannot express id 45, so
+; test VMs run it as id 41 (DEV_1069), as `insmod conduit_gpu.ko virtio_id=41`.
+%DeviceDesc% = Helios_Install, PCI\VEN_1AF4&DEV_106D, PCI\VEN_1AF4&DEV_1069
 
 ; ──── Installation ─────────────────────────────────────────────────────────
 
@@ -59,7 +61,7 @@ Include = msdv.inf
 ; the Red Hat DOD and binds on a running system. It is not 0x00, so it makes no
 ; absolute-best claim; the signature byte still carries the test-signing
 ; penalty, and this cannot outrank a real GPU's driver because the Models
-; entries match only VEN_1AF4&DEV_1050.
+; entries match only VEN_1AF4&DEV_106D / DEV_1069.
 FeatureScore = F6
 CopyFiles = Helios_CopyFiles
 AddReg = Helios_DeviceSettings

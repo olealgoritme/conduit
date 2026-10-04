@@ -191,7 +191,9 @@ BOOL CALLBACK discover_helios_adapter(PINIT_ONCE, PVOID, PVOID*) {
                 devices, &device, instance_id, sizeof(instance_id), nullptr)) {
             continue;
         }
-        if (!contains_ascii_case_insensitive(instance_id, "VEN_1AF4&DEV_1050"))
+        // Conduit's device: virtio id 45 (DEV_106D), or 41 (DEV_1069) under QEMU.
+        if (!contains_ascii_case_insensitive(instance_id, "VEN_1AF4&DEV_106D") &&
+            !contains_ascii_case_insensitive(instance_id, "VEN_1AF4&DEV_1069"))
             continue;
 
         char description[kAdlMaxPath] = {};
