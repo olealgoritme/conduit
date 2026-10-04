@@ -3,6 +3,9 @@
 //! The guest driver (`guest/linux/conduit_gpu.c`) binds virtio device ID 45 and
 //! posts one descriptor chain per request: a readable descriptor holding the
 //! request, and a writable one for the response. That is the whole transport.
+//! Virtio allows either to be split across several descriptors, and another
+//! guest may post a reply as a header buffer and a body buffer, so every
+//! queue here reads and writes whole chains (`device::chain`).
 //!
 //! Attach it to QEMU >= 11.1 with the generic vhost-user device (named
 //! `vhost-user-test-device-pci` there), which asks for the shared-memory
@@ -30,6 +33,9 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use device::caps::Caps;
+use device::chain::{
+    ReadableAfterWritable, Segment, capacity, sort_chain, writable, write_scattered,
+};
 use device::display::{DisplayLink, DisplayMode, InputSink};
 use device::host;
 use device::nvidia::NvidiaBackend;
@@ -392,17 +398,10 @@ fn deliver_event(
     let head = chain.head_index();
     drop(vr);
 
+    // Across every writable buffer: a guest may post the event buffer split
+    // in two (header, body), where the Linux guest posts one.
     let bytes = event_ready_bytes(handle);
-    let mut written = 0usize;
-    for desc in chain {
-        if desc.is_write_only() {
-            let n = std::cmp::min(desc.len() as usize, bytes.len());
-            if guard.write_slice(&bytes[..n], desc.addr()).is_ok() {
-                written = n;
-            }
-            break;
-        }
-    }
+    let written = write_scattered(&*guard, &writable(chain), &bytes).unwrap_or(0);
 
     if vring.add_used(head, written as u32).is_err() {
         return false;
@@ -447,16 +446,19 @@ impl InputSink for VqInputSink {
             let head = chain.head_index();
             drop(vr);
 
+            // Sized to all its writable buffers together, which a guest may
+            // post split (header, body) where the Linux guest posts one.
+            let segs = writable(chain);
             let mut written = 0u32;
-            if let Some(desc) = chain.clone().find(|d| d.is_write_only()) {
-                let fit = input_events_that_fit(desc.len() as usize);
+            if !segs.is_empty() {
+                let fit = input_events_that_fit(capacity(&segs));
                 if fit == 0 {
                     // A driver whose event buffers hold only a header cannot
                     // take input at all; say so once and drop it.
                     if !self.warned_small {
                         log::warn!(
                             "display: guest event buffers are {} bytes, too small for input; input dropped (driver predates InputEvent?)",
-                            desc.len()
+                            capacity(&segs)
                         );
                         self.warned_small = true;
                     }
@@ -467,8 +469,8 @@ impl InputSink for VqInputSink {
                         .resize(protocol::messages::input_event_message_len(take), 0);
                     let n = encode_input_events(&events[done..done + take], &mut self.msg)
                         .expect("sized for it");
-                    if guard.write_slice(&self.msg[..n], desc.addr()).is_ok() {
-                        written = n as u32;
+                    if let Ok(w) = write_scattered(&*guard, &segs, &self.msg[..n]) {
+                        written = w as u32;
                     }
                     done += take;
                 }
@@ -499,14 +501,13 @@ impl InputSink for VqInputSink {
         };
         let head = chain.head_index();
         drop(vr);
+        let segs = writable(chain);
         let mut written = 0u32;
-        if let Some(desc) = chain.clone().find(|d| d.is_write_only())
-            && desc.len() as usize >= DISPLAY_MODE_MESSAGE_LEN
-        {
+        if capacity(&segs) >= DISPLAY_MODE_MESSAGE_LEN {
             let mut msg = [0u8; DISPLAY_MODE_MESSAGE_LEN];
             let n = encode_display_mode(m, &mut msg).expect("sized for it");
-            if guard.write_slice(&msg[..n], desc.addr()).is_ok() {
-                written = n as u32;
+            if let Ok(w) = write_scattered(&*guard, &segs, &msg[..n]) {
+                written = w as u32;
             }
         }
         if vring.add_used(head, written).is_err() {
@@ -537,14 +538,15 @@ impl InputSink for VqInputSink {
             };
             let head = chain.head_index();
             drop(vr);
+            let segs = writable(chain);
             let mut written = 0u32;
-            if let Some(desc) = chain.clone().find(|d| d.is_write_only()) {
-                let room = (desc.len() as usize).saturating_sub(CLIPBOARD_MESSAGE_HEAD);
+            if !segs.is_empty() {
+                let room = capacity(&segs).saturating_sub(CLIPBOARD_MESSAGE_HEAD);
                 if room == 0 {
                     if !self.warned_clip_small {
                         log::warn!(
                             "display: guest event buffers are {} bytes, too small for clipboard; host clipboard dropped (driver predates ClipboardFromHost?)",
-                            desc.len()
+                            capacity(&segs)
                         );
                         self.warned_clip_small = true;
                     }
@@ -567,8 +569,8 @@ impl InputSink for VqInputSink {
                         &mut self.msg,
                     )
                     .expect("sized for it");
-                    if guard.write_slice(&self.msg[..n], desc.addr()).is_ok() {
-                        written = n as u32;
+                    if let Ok(w) = write_scattered(&*guard, &segs, &self.msg[..n]) {
+                        written = w as u32;
                     }
                     offset += take;
                 }
@@ -721,8 +723,9 @@ fn deliver_completions(
         let Some(chain) = chains.remove(&c.token) else {
             continue; // its queue was reset meanwhile
         };
-        let n = c.resp.len().min(chain.cap);
-        if let Err(e) = mem.write_slice(&c.resp[..n], chain.resp) {
+        // Capped as the control queue caps a response it builds itself.
+        let n = c.resp.len().min(capacity(&chain.resp)).min(RESP_MAX);
+        if let Err(e) = write_scattered(mem, &chain.resp, &c.resp[..n]) {
             log::warn!("venus: writing the response of chain {}: {e}", chain.head);
         }
         if let Err(e) = vring.add_used(chain.head, n as u32) {
@@ -820,6 +823,10 @@ struct NvGpuBackend {
     /// whole RM call, and only the bytes dispatch writes are sent back.
     req: Vec<u8>,
     resp: Vec<u8>,
+    /// The chain's readable and writable buffers, kept across chains for the
+    /// same reason.
+    readable: Vec<Segment>,
+    writable: Vec<Segment>,
     /// A request was served since the device was last (re)started. A restart
     /// that finds this set is a guest that rebooted or reloaded its driver.
     served: bool,
@@ -830,12 +837,12 @@ struct NvGpuBackend {
 }
 
 /// A fenced `GpuCmd` chain, kept off the used ring until its fence signals
-/// (docs/VENUS.md "Fences"): where its response goes.
+/// (docs/VENUS.md "Fences"): where its response goes, every writable buffer
+/// of the chain in order.
 #[cfg(feature = "venus")]
 struct HeldChain {
     head: u16,
-    resp: GuestAddress,
-    cap: usize,
+    resp: Vec<Segment>,
 }
 
 #[cfg(feature = "venus")]
@@ -924,6 +931,8 @@ impl NvGpuBackend {
             input_target,
             req: Vec::new(),
             resp: vec![0u8; RESP_MAX],
+            readable: Vec::new(),
+            writable: Vec::new(),
             served: false,
             #[cfg(feature = "venus")]
             venus: VenusChains::default(),
@@ -1064,25 +1073,35 @@ impl NvGpuBackend {
             let mut record = None;
 
             let head = chain.head_index();
-            let mut resp_desc = None;
             self.req.clear();
 
-            for desc in chain.clone() {
-                if desc.is_write_only() {
-                    resp_desc = Some(desc);
-                } else {
+            // The request may span several readable descriptors and the
+            // response several writable ones (virtio allows either; the
+            // Linux guest posts one of each), readable first.
+            let layout = sort_chain(chain.clone(), &mut self.readable, &mut self.writable);
+            if layout.is_ok() {
+                for &(addr, len) in &self.readable {
                     let at = self.req.len();
-                    self.req.resize(at + desc.len() as usize, 0);
-                    mem.read_slice(&mut self.req[at..], desc.addr())
-                        .map_err(|e| {
-                            std::io::Error::other(format!("read request descriptor: {e}"))
-                        })?;
+                    self.req.resize(at + len as usize, 0);
+                    mem.read_slice(&mut self.req[at..], addr).map_err(|e| {
+                        std::io::Error::other(format!("read request descriptor: {e}"))
+                    })?;
                 }
             }
 
-            let written = match resp_desc {
-                Some(d) => {
-                    let cap = std::cmp::min(d.len() as usize, RESP_MAX);
+            let written = match layout {
+                Err(ReadableAfterWritable) => {
+                    log::warn!(
+                        "chain {head} has a readable descriptor after a writable one; dropping"
+                    );
+                    0
+                }
+                Ok(()) if self.writable.is_empty() => {
+                    log::warn!("chain {head} has no writable descriptor; dropping");
+                    0
+                }
+                Ok(()) => {
+                    let cap = std::cmp::min(capacity(&self.writable), RESP_MAX);
                     let resp = &mut self.resp[..cap];
                     let mut nvidia = self.nvidia.lock().expect("backend mutex");
                     #[cfg(feature = "trace")]
@@ -1105,8 +1124,7 @@ impl NvGpuBackend {
                             token,
                             HeldChain {
                                 head,
-                                resp: d.addr(),
-                                cap,
+                                resp: self.writable.clone(),
                             },
                         );
                         drop(nvidia);
@@ -1121,15 +1139,11 @@ impl NvGpuBackend {
                     }
                     drop(nvidia);
                     if n > 0 {
-                        mem.write_slice(&resp[..n], d.addr()).map_err(|e| {
+                        write_scattered(&**mem, &self.writable, &resp[..n]).map_err(|e| {
                             std::io::Error::other(format!("write response descriptor: {e}"))
                         })?;
                     }
                     n
-                }
-                None => {
-                    log::warn!("chain {head} has no writable descriptor; dropping");
-                    0
                 }
             };
 

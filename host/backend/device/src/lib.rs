@@ -7,6 +7,8 @@
 // received from the guest driver over virtqueues.
 
 pub mod caps;
+#[cfg(feature = "vhost-user")]
+pub mod chain;
 pub mod display;
 pub mod error;
 pub mod guarded;
