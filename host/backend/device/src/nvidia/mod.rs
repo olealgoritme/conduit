@@ -388,6 +388,12 @@ fn nvkms_register_surface(v: Option<abi::version::DriverVersion>) -> u32 {
         _ => 16,
     }
 }
+/// `NVKMS_IOCTL_QUERY_DISP`. Third in the enum since NVKMS's first release;
+/// the commands that moved (see above) all come after it.
+const NVKMS_QUERY_DISP: u32 = 2;
+/// `sizeof(struct NvKmsQueryDispRequest)`: a device handle and a disp handle.
+/// The reply follows it and is the part whose size varies between releases.
+const NVKMS_QUERY_DISP_REQUEST: usize = 8;
 /// Byte offset of `planes[0].u` inside `NvKmsRegisterSurfaceRequest`.
 const NVKMS_SURFACE_FD_OFFSET: usize = 16;
 

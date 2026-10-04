@@ -3575,4 +3575,96 @@ mod fence_tests {
         // Kept: a second ask is the same descriptor.
         assert_eq!(be.signalled_sync_file(file.as_raw_fd()), Ok(fd));
     }
+
+    // ---- NVKMS: a GPU with no displays ----
+
+    /// One nvidia-modeset ioctl as the guest driver sends it: the 16-byte
+    /// `NvKmsIoctlParams` (cmd, size, pointer) and the block it points to.
+    fn nvkms_msg(handle: u64, cmd: u32, nested: &[u8]) -> Vec<u8> {
+        let mut outer = vec![0u8; 16];
+        outer[0..4].copy_from_slice(&cmd.to_le_bytes());
+        outer[4..8].copy_from_slice(&(nested.len() as u32).to_le_bytes());
+        outer[8..16].copy_from_slice(&0x7fff_1234_5000u64.to_le_bytes());
+        let mut v = hdr(MsgType::Ioctl, handle);
+        let req = IoctlReq {
+            cmd: (3 << 30) | (16 << 16) | ((b'm' as u32) << 8),
+            data_len: 16,
+            nested_offset: 16,
+            nested_len: nested.len() as u32,
+            deep_ptr_offset: 0,
+            deep_len: 0,
+        };
+        let at = v.len();
+        v.resize(at + size_of::<IoctlReq>(), 0);
+        write_struct(&mut v[at..], &req);
+        v.extend_from_slice(&outer);
+        v.extend_from_slice(nested);
+        v
+    }
+
+    /// `sizeof(struct NvKmsQueryDispParams)` in 610.57.04.
+    const QUERY_DISP_PARAMS: usize = 172;
+
+    /// QUERY_DISP never reaches the host, succeeds, and describes a disp with
+    /// nothing on it: no dpys, no framelock, no connectors, no GPU string.
+    /// The request half comes back as the guest sent it.
+    #[test]
+    fn nvkms_query_disp_reports_a_disp_with_nothing_on_it() {
+        let host = FenceHost::default();
+        let (mut be, h) = backend_on(&host);
+        let mut params = vec![0xa5u8; QUERY_DISP_PARAMS];
+        params[0..4].copy_from_slice(&0x11u32.to_le_bytes()); // deviceHandle
+        params[4..8].copy_from_slice(&0x22u32.to_le_bytes()); // dispHandle
+        let mut resp = vec![0u8; 1024];
+        let n = be.dispatch(&nvkms_msg(h, NVKMS_QUERY_DISP, &params), &mut resp);
+        assert_eq!(status(&resp), 0);
+        assert!(host.calls().is_empty(), "the host's NVKMS is not asked");
+        assert_eq!(n, BODY + 16 + QUERY_DISP_PARAMS);
+        let reply = &resp[BODY + 16..n];
+        assert_eq!(word(reply, 0), 0x11);
+        assert_eq!(word(reply, 4), 0x22);
+        assert!(reply[8..].iter().all(|&b| b == 0), "an empty disp");
+        // The outer struct comes back untouched, pointer included.
+        assert_eq!(word(&resp, BODY), NVKMS_QUERY_DISP);
+        assert_eq!(word(&resp, BODY + 4), QUERY_DISP_PARAMS as u32);
+    }
+
+    /// The reply's size is the release's own; the request part is not.
+    #[test]
+    fn nvkms_query_disp_too_short_for_its_request_is_einval() {
+        let host = FenceHost::default();
+        let (mut be, h) = backend_on(&host);
+        let mut resp = vec![0u8; 256];
+        be.dispatch(&nvkms_msg(h, NVKMS_QUERY_DISP, &[0u8; 4]), &mut resp);
+        assert_eq!(status(&resp), -libc::EINVAL);
+        assert!(host.calls().is_empty());
+    }
+
+    /// Everything that names a connector, a dpy or a head still never
+    /// reaches the host, and neither does anything that would change one.
+    #[test]
+    fn nvkms_display_commands_stay_refused() {
+        let host = FenceHost::default();
+        let (mut be, h) = backend_on(&host);
+        let mut resp = vec![0u8; 1024];
+        // QUERY_CONNECTOR_STATIC/DYNAMIC, QUERY_DPY_STATIC/DYNAMIC,
+        // VALIDATE_MODE_INDEX, VALIDATE_MODE, SET_MODE, ..., FLIP.
+        for cmd in 3..=14 {
+            be.dispatch(&nvkms_msg(h, cmd, &[0u8; 64]), &mut resp);
+            assert_eq!(status(&resp), -libc::EPERM, "cmd {cmd}");
+        }
+        assert!(host.calls().is_empty());
+    }
+
+    /// ALLOC_DEVICE still goes to the host: the guest needs a real device
+    /// handle for surface registration.
+    #[test]
+    fn nvkms_alloc_device_is_still_forwarded() {
+        let host = FenceHost::default();
+        let (mut be, h) = backend_on(&host);
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(&nvkms_msg(h, 0, &[0u8; 1440]), &mut resp);
+        assert_eq!(status(&resp), 0);
+        assert_eq!(host.calls().len(), 1);
+    }
 }

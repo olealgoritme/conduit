@@ -46,8 +46,12 @@ None of this can be switched off from the command line.
   buffer sharing needs reaches the host display driver: device alloc/free and
   the five surface commands (register, unregister, grant, acquire, release).
   Everything that would act on the host's displays (modesets, flips, LUTs,
-  vblank control) is refused; vblank semaphore setup is answered locally. The guest cannot change your
-  monitors or touch other apps' output.
+  vblank control) is refused; vblank semaphore setup is answered locally. The
+  guest sees its GPU as one with no displays: the disp query is answered
+  locally with no connectors and no monitors, so nothing about the host's
+  monitors is sent to the guest and the per-connector and per-monitor
+  queries stay refused. The guest cannot change your monitors or touch other
+  apps' output.
 - **Dangerous UVM calls.** `/dev/nvidia-uvm-tools` is never served. UVM
   commands that carry raw user pointers (`TOOLS_READ/WRITE_PROCESS_MEMORY`,
   `TOOLS_GET_PROCESSOR_UUID_TABLE`) are refused, as is a VA space with
