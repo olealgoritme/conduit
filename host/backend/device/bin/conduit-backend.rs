@@ -24,7 +24,7 @@
 //! Guest memory must be shared (`memory-backend-memfd,share=on`) or the backend
 //! cannot read the request the guest wrote.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -342,16 +342,39 @@ impl WindowPlacer for VhostWindow {
 
 /// What the event thread is told to start and stop watching.
 enum Watch {
-    Add(u32, OwnedFd),
+    /// A descriptor, and whether it is a fence: reported once, with its
+    /// status, then dropped from the set (docs/SYNC.md).
+    Add(u32, OwnedFd, bool),
     Remove(u32),
 }
 
-/// One `EventReady` message: a bare header naming the descriptor.
-fn event_ready_bytes(handle: u32) -> Vec<u8> {
-    let hdr = MsgHeader::ok(MsgType::EventReady, handle);
+/// One `EventReady` message: a bare header naming the descriptor. `status`
+/// is 0, or a fence's error as a negative errno.
+fn event_ready_bytes(handle: u32, status: i32) -> Vec<u8> {
+    let mut hdr = MsgHeader::ok(MsgType::EventReady, handle);
+    hdr.status = status;
     // The wire form is the struct's bytes, which is what the driver reads.
     let p = &hdr as *const MsgHeader as *const u8;
     unsafe { std::slice::from_raw_parts(p, size_of::<MsgHeader>()) }.to_vec()
+}
+
+/// A signalled sync_file's outcome: 0, or its error as a negative errno (a
+/// host fence that timed out is `-ETIMEDOUT`).
+fn sync_file_status(fd: RawFd) -> i32 {
+    sync_file_raw_status(fd).map_or(0, |s| s.min(0))
+}
+
+/// `sync_file_info.status` as the kernel reports it: 1 signalled, 0 pending,
+/// negative an error. `None` for a descriptor that is not a sync_file.
+/// `SYNC_IOC_FILE_INFO` with no fence array asks for the status alone.
+fn sync_file_raw_status(fd: RawFd) -> Option<i32> {
+    // struct sync_file_info: char name[32]; s32 status; u32 flags;
+    // u32 num_fences; u32 pad; u64 sync_fence_info.
+    const SYNC_IOC_FILE_INFO: u64 = (3 << 30) | (56 << 16) | ((b'>' as u64) << 8) | 4;
+    let mut info = [0u8; 56];
+    // SAFETY: a live 56-byte buffer, the size the request declares.
+    let rc = unsafe { libc::ioctl(fd, SYNC_IOC_FILE_INFO as libc::Ioctl, info.as_mut_ptr()) };
+    (rc == 0).then(|| i32::from_le_bytes(info[32..36].try_into().expect("4 bytes")))
 }
 
 /// Put one message on the event queue, into a buffer the guest posted there.
@@ -359,12 +382,17 @@ fn event_ready_bytes(handle: u32) -> Vec<u8> {
 /// Returns false when the guest has posted none, which is the normal state of
 /// a guest whose driver predates this queue having a use -- and a reason to
 /// drop the notification rather than to fail.
-fn push_event(vring: &VringRwLock, mem: &GuestMemoryAtomic<GuestMemoryMmap>, handle: u32) -> bool {
+fn push_event(
+    vring: &VringRwLock,
+    mem: &GuestMemoryAtomic<GuestMemoryMmap>,
+    handle: u32,
+    status: i32,
+) -> bool {
     #[cfg(feature = "trace")]
     if device::trace::enabled() {
-        return push_event_traced(vring, mem, handle);
+        return push_event_traced(vring, mem, handle, status);
     }
-    deliver_event(vring, mem, handle)
+    deliver_event(vring, mem, handle, status)
 }
 
 /// `push_event`, recorded: an `event` record whose latency is the time it
@@ -376,10 +404,11 @@ fn push_event_traced(
     vring: &VringRwLock,
     mem: &GuestMemoryAtomic<GuestMemoryMmap>,
     handle: u32,
+    status: i32,
 ) -> bool {
     use device::trace::format::{Call, Kind, Record};
     let t0 = device::trace::now_ns();
-    let delivered = deliver_event(vring, mem, handle);
+    let delivered = deliver_event(vring, mem, handle, status);
     device::trace::emit(Record {
         ts_ns: t0,
         handle,
@@ -396,6 +425,7 @@ fn deliver_event(
     vring: &VringRwLock,
     mem: &GuestMemoryAtomic<GuestMemoryMmap>,
     handle: u32,
+    status: i32,
 ) -> bool {
     let guard = mem.memory();
     let mut vr = vring.get_mut();
@@ -410,7 +440,7 @@ fn deliver_event(
 
     // Across every writable buffer: a guest may post the event buffer split
     // in two (header, body), where the Linux guest posts one.
-    let bytes = event_ready_bytes(handle);
+    let bytes = event_ready_bytes(handle, status);
     let written = write_scattered(&*guard, &writable(chain), &bytes).unwrap_or(0);
 
     if vring.add_used(head, written as u32).is_err() {
@@ -629,6 +659,9 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
     let epfd = unsafe { OwnedFd::from_raw_fd(epfd) };
 
     let mut watched: HashMap<u64, OwnedFd> = HashMap::new();
+    // Fences: reported once and then forgotten, since a signalled sync_file
+    // never stops being readable and the sweep would re-send it every pass.
+    let mut once: HashSet<u64> = HashSet::new();
     let mut last_sweep = Instant::now();
 
     // Edge-triggered. Level-triggered would report a descriptor as readable
@@ -651,12 +684,16 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
         // thread must leave the set before it can be reported again.
         loop {
             match rx.try_recv() {
-                Ok(Watch::Add(handle, fd)) => {
+                Ok(Watch::Add(handle, fd, fence)) => {
                     if ctl(libc::EPOLL_CTL_ADD, fd.as_raw_fd(), handle) == 0 {
                         watched.insert(handle as u64, fd);
+                        if fence {
+                            once.insert(handle as u64);
+                        }
                     }
                 }
                 Ok(Watch::Remove(handle)) => {
+                    once.remove(&(handle as u64));
                     if let Some(fd) = watched.remove(&(handle as u64)) {
                         ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle);
                     }
@@ -671,6 +708,7 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
         // posted. Every 10 ms, ask the descriptors directly and re-notify the
         // ones that still have something to say. A lost wake costs a tenth of
         // a frame at 60 Hz rather than a hang.
+        let mut reported: Vec<u64> = Vec::new();
         if last_sweep.elapsed() >= SWEEP {
             last_sweep = Instant::now();
             for (&handle, fd) in watched.iter() {
@@ -680,7 +718,14 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
                     revents: 0,
                 };
                 if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & libc::POLLIN != 0 {
-                    push_event(&vring, &mem, handle as u32);
+                    let status = if once.contains(&handle) {
+                        sync_file_status(fd.as_raw_fd())
+                    } else {
+                        0
+                    };
+                    if push_event(&vring, &mem, handle as u32, status) && once.contains(&handle) {
+                        reported.push(handle);
+                    }
                 }
             }
         }
@@ -707,8 +752,28 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
             // Copied out first: epoll_event is packed, so its field cannot be
             // borrowed.
             let handle = { ev.u64 } as u32;
-            if !push_event(&vring, &mem, handle) {
+            let fence = once.contains(&(handle as u64));
+            // Already sent by the sweep above: one EventReady per fence.
+            if fence && reported.contains(&(handle as u64)) {
+                continue;
+            }
+            let status = match watched.get(&(handle as u64)) {
+                Some(fd) if fence => sync_file_status(fd.as_raw_fd()),
+                _ => 0,
+            };
+            if !push_event(&vring, &mem, handle, status) {
+                // A fence stays in the set, and the sweep sends it again.
                 log::debug!("event pump: no buffer posted for handle {handle}; dropped");
+            } else if fence {
+                reported.push(handle as u64);
+            }
+        }
+        // A fence the guest has heard about is done here. Its descriptor
+        // stays open until the guest closes the handle.
+        for handle in reported {
+            once.remove(&handle);
+            if let Some(fd) = watched.remove(&handle) {
+                ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle as u32);
             }
         }
     }
@@ -922,6 +987,8 @@ impl NvGpuBackend {
 
         let nvidia_vram_mib = nvidia.vram_limit_mib();
         let mut config = VirtioGpuNvConfig::new(&version, &gpus, caps, nvidia_vram_mib);
+        // The event pump below reports fence handles once (docs/SYNC.md).
+        config.set_drm_fences();
         if let Some((mode, link, cursor)) = display {
             config.set_display(mode.width, mode.height, mode.refresh_hz);
             if cursor {
@@ -996,12 +1063,12 @@ impl NvGpuBackend {
     /// owns the original and may close it at any time; a watch holding the same
     /// number would then be watching whatever opened next.
     fn sync_watches(&mut self, vrings: &[VringRwLock]) {
-        let (added, removed) = self
-            .nvidia
-            .lock()
-            .expect("backend mutex")
-            .take_watch_updates();
-        if added.is_empty() && removed.is_empty() && self.watches.is_some() {
+        let (added, removed, fences) = {
+            let mut nvidia = self.nvidia.lock().expect("backend mutex");
+            let (added, removed) = nvidia.take_watch_updates();
+            (added, removed, nvidia.take_fence_watches())
+        };
+        if added.is_empty() && removed.is_empty() && fences.is_empty() && self.watches.is_some() {
             return;
         }
 
@@ -1021,7 +1088,13 @@ impl NvGpuBackend {
             return;
         };
 
-        for (handle, fd) in added {
+        // Adds before removes: a fence made and closed between two passes
+        // must not be left watched.
+        let all = added
+            .into_iter()
+            .map(|(h, fd)| (h, fd, false))
+            .chain(fences.into_iter().map(|(h, fd)| (h, fd, true)));
+        for (handle, fd, fence) in all {
             let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
             if dup < 0 {
                 log::warn!(
@@ -1030,7 +1103,11 @@ impl NvGpuBackend {
                 );
                 continue;
             }
-            let _ = tx.send(Watch::Add(handle, unsafe { OwnedFd::from_raw_fd(dup) }));
+            let _ = tx.send(Watch::Add(
+                handle,
+                unsafe { OwnedFd::from_raw_fd(dup) },
+                fence,
+            ));
         }
         for handle in removed {
             let _ = tx.send(Watch::Remove(handle));
@@ -1646,4 +1723,71 @@ fn main() -> anyhow::Result<()> {
     // backend waits on worker threads (vring, events) that may never return.
     // Socket activation relies on this process ending with the VM.
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fence's status rides in the header, signed, as the guest reads it.
+    #[test]
+    fn event_ready_carries_a_fence_status() {
+        let b = event_ready_bytes(42, -libc::ETIMEDOUT);
+        let hdr: MsgHeader = unsafe { std::ptr::read_unaligned(b.as_ptr() as *const MsgHeader) };
+        assert_eq!(hdr.msg_type, MsgType::EventReady as u32);
+        assert_eq!(hdr.handle, 42);
+        assert_eq!(hdr.status, -libc::ETIMEDOUT);
+        assert_eq!(event_ready_bytes(42, 0)[8..12], [0, 0, 0, 0]);
+    }
+
+    /// SYNC_IOC_FILE_INFO against the real kernel: a signalled sync_file
+    /// reads as 0, not as its raw status of 1. Skipped without a render node.
+    #[test]
+    fn a_signalled_sync_file_has_status_zero() {
+        let Some(node) = std::fs::read_dir("/dev/dri").ok().and_then(|d| {
+            d.flatten()
+                .map(|e| e.path())
+                .find(|p| p.to_string_lossy().contains("renderD"))
+        }) else {
+            eprintln!("SKIP: no /dev/dri/renderD*; this test passes without testing anything");
+            return;
+        };
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&node)
+        else {
+            eprintln!("SKIP: cannot open {}", node.display());
+            return;
+        };
+        let iowr = |nr: u64, size: u64| (3u64 << 30) | (size << 16) | ((b'd' as u64) << 8) | nr;
+        let mut create = [0u32, 1]; // handle, DRM_SYNCOBJ_CREATE_SIGNALED
+        let rc = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                iowr(0xbf, 8) as libc::Ioctl,
+                create.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "SYNCOBJ_CREATE");
+        let mut export = [create[0], 1, u32::MAX, 0]; // EXPORT_SYNC_FILE, fd -1
+        let rc = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                iowr(0xc1, 16) as libc::Ioctl,
+                export.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "SYNCOBJ_HANDLE_TO_FD");
+        let sync = unsafe { OwnedFd::from_raw_fd(export[2] as i32) };
+        assert_eq!(
+            sync_file_raw_status(sync.as_raw_fd()),
+            Some(1),
+            "the ioctl is right"
+        );
+        assert_eq!(sync_file_status(sync.as_raw_fd()), 0);
+        // Not a sync_file at all: no error invented.
+        assert_eq!(sync_file_raw_status(file.as_raw_fd()), None);
+        assert_eq!(sync_file_status(file.as_raw_fd()), 0);
+    }
 }

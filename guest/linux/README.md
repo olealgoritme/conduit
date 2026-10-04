@@ -17,7 +17,9 @@ It also provides:
 - keyboard and mouse input from the viewer, and gamepads from the stream
   host (`nvgpu_pad.h`),
 - `/dev/conduit-clipboard` for `guest/agent/conduit-clipboard-agent`
-  (`docs/CLIPBOARD.md`).
+  (`docs/CLIPBOARD.md`),
+- explicit sync: DRM syncobjs and nvidia-drm's semaphore-surface fences,
+  backed by the host's fences (`nvgpu_fence.h`, `docs/SYNC.md`).
 
 The module does not interpret RM calls. It only does what needs the guest
 kernel: swapping file descriptors for backend handles, pinning memory a

@@ -287,6 +287,14 @@ impl VirtioGpuNvConfig {
         self.features |= protocol::messages::NVGPU_CFG_VENUS;
     }
 
+    /// Turn host fences into guest fences (docs/SYNC.md): sets
+    /// [`protocol::messages::NVGPU_CFG_DRM_FENCES`]. Only by a transport that
+    /// delivers one-shot fence watches (`take_watch_updates`); without that
+    /// relay a guest fence would never signal.
+    pub fn set_drm_fences(&mut self) {
+        self.features |= protocol::messages::NVGPU_CFG_DRM_FENCES;
+    }
+
     /// Config space as the bytes a guest reads.
     pub fn as_bytes(&self) -> &[u8] {
         // Safe: `repr(C, packed)` with no padding and no pointers, so every
@@ -476,5 +484,18 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert!(changed.iter().all(|i| (at..at + 4).contains(i)));
+    }
+
+    /// Fences are one feature bit too, clear unless the transport asks.
+    #[test]
+    fn drm_fences_are_announced_only_when_set() {
+        use protocol::messages::NVGPU_CFG_DRM_FENCES;
+        let mut cfg = VirtioGpuNvConfig::new("615.71.09", &[], crate::caps::Caps::DEFAULT, 0);
+        assert_eq!({ cfg.features } & NVGPU_CFG_DRM_FENCES, 0);
+        cfg.set_drm_fences();
+        assert_eq!(
+            { cfg.features },
+            FEATURE_RMCTRL_SEGMENTS | NVGPU_CFG_DRM_FENCES
+        );
     }
 }

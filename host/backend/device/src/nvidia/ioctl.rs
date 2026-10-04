@@ -534,6 +534,64 @@ impl NvidiaBackend {
         // holds the same numbers in nvgpu_gem_import_nvkms /
         // nvgpu_gem_export_dmabuf. Both halves have to be changed together.
         if ioc_type == b'd' as u32 {
+            // Explicit sync (docs/SYNC.md). The two that carry a sync_file
+            // trade it for a handle here; the context import is nested like
+            // the GEM imports but its block holds an RM client, not a memFd.
+            match escape {
+                fence::SEMSURF_FENCE_CREATE => {
+                    return self
+                        .dispatch_fence_create(cookie, host_fd, request, param_in, resp_buf);
+                }
+                fence::SEMSURF_FENCE_WAIT => {
+                    return self.dispatch_fence_wait(cookie, host_fd, request, param_in, resp_buf);
+                }
+                fence::SEMSURF_FENCE_CTX_CREATE => {
+                    if self.current_data_len as usize != fence::CTX_CREATE_SIZE
+                        || param_in.len() < fence::CTX_CREATE_SIZE
+                        || !self.fence_ctx_import_allowed(&param_in[fence::CTX_CREATE_SIZE..])
+                    {
+                        return self.write_error_resp(
+                            resp_buf,
+                            Status::IoctlFailed,
+                            cookie,
+                            libc::EPERM,
+                        );
+                    }
+                    return self.dispatch_nested(
+                        cookie,
+                        host_fd,
+                        request,
+                        param_in,
+                        resp_buf,
+                        fence::CTX_CREATE_SIZE,
+                        fence::CTX_CREATE_PTR,
+                        fence::CTX_CREATE_LEN,
+                        deep_in,
+                        None,
+                    );
+                }
+                // Pointers and a memFd that mean nothing here, and a guest
+                // that has semaphore surfaces never needs it.
+                fence::PRIME_FENCE_CONTEXT_CREATE => {
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::IoctlFailed,
+                        cookie,
+                        libc::ENOTTY,
+                    );
+                }
+                // The core's syncobj ioctls are the guest kernel's own; here
+                // they would only make descriptors in this process.
+                0xbf..=0xcf => {
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::IoctlFailed,
+                        cookie,
+                        libc::ENOTTY,
+                    );
+                }
+                _ => {}
+            }
             // (outer_size, ptr_offset, size_offset)
             let nested = match escape {
                 0x41 => Some((32usize, 8usize, 16usize)), // GEM_IMPORT_NVKMS_MEMORY

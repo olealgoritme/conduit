@@ -230,6 +230,10 @@ struct nvgpu_open_resp {
 /* With NVGPU_CFG_DISPLAY: the host shows a cursor plane as its own pointer
  * image (CursorUpdate), so the head offers one. */
 #define NVGPU_CFG_CURSOR (1u << 9)
+/* The backend relays nvidia-drm's semaphore-surface fences: a FENCE_CREATE
+ * answers with a handle, which gets one EventReady when the host fence
+ * signals (docs/SYNC.md, nvgpu_fence.h). Bit 10 is Venus, for Windows. */
+#define NVGPU_CFG_DRM_FENCES (1u << 11)
 
 /*
  * The largest nvidia-drm GEM parameter struct this driver forwards, and the
@@ -434,6 +438,7 @@ static_assert(sizeof(struct NVOS64_PARAMETERS) == 48,
 struct nvgpu_device;
 struct nvgpu_kms;
 struct nvgpu_input;
+struct nvgpu_fence_dom;
 
 /* The shared memory region device memory is placed in, id 1. */
 #define NVGPU_SHM_ID 1
@@ -465,6 +470,18 @@ MODULE_PARM_DESC(claim_alloc, "GET_DEV_INFO reports supports_alloc");
 static int nvgpu_claim_sync_fd;
 module_param_named(claim_sync_fd, nvgpu_claim_sync_fd, int, 0444);
 MODULE_PARM_DESC(claim_sync_fd, "GET_DEV_INFO reports supports_sync_fd");
+
+/*
+ * Explicit sync (docs/SYNC.md): DRM syncobjs on the node, and the semaphore
+ * surface fences behind supports_semsurf and supports_sync_fd, which is what
+ * makes a compositor offer linux-drm-syncobj-v1 and NVIDIA's egl-wayland2
+ * work at all. On whenever the backend relays fences and the host's node has
+ * semaphore surfaces; a parameter so one boot can tell a fence problem from
+ * everything else.
+ */
+static int nvgpu_explicit_sync = 1;
+module_param_named(explicit_sync, nvgpu_explicit_sync, int, 0444);
+MODULE_PARM_DESC(explicit_sync, "DRM syncobjs and GPU fences, when the backend relays them");
 
 /*
  * Whether a wait on one of these descriptors can wait.
@@ -663,6 +680,10 @@ struct nvgpu_device {
   u32 features;
   u32 num_fd_translations;
 
+  /* Host fences as guest fences (nvgpu_fence.h); NULL without
+   * NVGPU_CFG_DRM_FENCES. Read from the event-queue interrupt. */
+  struct nvgpu_fence_dom *fences;
+
   /* NVGPU_CFG_DISPLAY: the preferred mode, and the input devices fed by
    * InputEvent batches. `input` is read from the event-queue interrupt. */
   bool has_display;
@@ -845,6 +866,8 @@ struct nvgpu_gem_nested_desc {
   bool handle_is_out;
   /* Offset of the u64 buffer size, used to size the proxy. -1 if none. */
   s32 size_field_offset;
+  /* The object made is a semaphore-surface fence context, not memory. */
+  bool fence_ctx;
 };
 
 #define NVGPU_GEM_NO_FD (-1)
@@ -891,6 +914,9 @@ struct nvgpu_gem_object {
   u32 owner_handle; /* backend handle of the drm_file owning the host object */
   u32 host_handle;  /* the GEM handle in the host's drm_file */
   u32 obj_type;     /* what GEM_IDENTIFY_OBJECT answers */
+  /* A semaphore-surface fence context (nvgpu_fence.h): no memory behind it,
+   * so never mapped or exported. */
+  bool fence_ctx;
   /*
    * Where the host's memory for this object sits in the shared window, and
    * whether it has been put there yet. Placed on the first map and not before:
@@ -913,7 +939,7 @@ struct nvgpu_gem_object {
 static const struct drm_gem_object_funcs nvgpu_gem_funcs;
 
 static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
-                                  u32 host_handle, size_t size,
+                                  u32 host_handle, size_t size, bool fence_ctx,
                                   u32 *guest_handle);
 static int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
                              u32 *host_handle, u32 *owner_handle);
@@ -946,6 +972,11 @@ struct nvgpu_drm_gem_close {
 #define DRM_NVIDIA_FENCE_SUPPORTED 0x04  /* abs nr 0x44 */
 #define DRM_NVIDIA_DMABUF_SUPPORTED 0x0f /* abs nr 0x4f */
 #define DRM_NVIDIA_GET_DRM_FILE_UNIQUE_ID 0x18 /* abs nr 0x58 */
+/* Explicit sync, nvgpu_fence.h. */
+#define DRM_NVIDIA_SEMSURF_FENCE_CTX_CREATE 0x14 /* abs nr 0x54 */
+#define DRM_NVIDIA_SEMSURF_FENCE_CREATE 0x15     /* abs nr 0x55 */
+#define DRM_NVIDIA_SEMSURF_FENCE_WAIT 0x16       /* abs nr 0x56 */
+#define DRM_NVIDIA_SEMSURF_FENCE_ATTACH 0x17     /* abs nr 0x57 */
 
 /*
  * The GEM ioctls, which are what a swapchain is made of: allocate or import
@@ -995,6 +1026,45 @@ static const struct nvgpu_gem_nested_desc nvgpu_gem_export_dmabuf = {
     .handle_is_out = false,
     .size_field_offset = NVGPU_GEM_NO_FIELD,
 };
+
+/*
+ * struct drm_nvidia_semsurf_fence_ctx_create_params:
+ *   u64 index; u64 nvkms_params_ptr; u64 nvkms_params_size;
+ *   u32 handle; u32 __pad;
+ * The block names the semaphore surface by RM client and handle, which are
+ * the host's already; no descriptor in it. The handle out is a fence context,
+ * a GEM object on the host, so it gets a proxy like memory does.
+ */
+static const struct nvgpu_gem_nested_desc nvgpu_gem_semsurf_ctx = {
+    .size = 32,
+    .ptr_offset = 8,
+    .size_offset = 16,
+    .fd_offset = NVGPU_GEM_NO_FD,
+    .handle_offset = 24,
+    .handle_is_out = true,
+    .size_field_offset = NVGPU_GEM_NO_FIELD,
+    .fence_ctx = true,
+};
+
+/* Defined with the fences (nvgpu_fence.h), reached from the ioctls below and
+ * the event queue. */
+static long nvgpu_semsurf_fence_create(struct nvgpu_fd *nfd,
+                                       struct drm_file *file, unsigned int cmd,
+                                       void __user *uarg);
+static long nvgpu_semsurf_fence_wait(struct nvgpu_fd *nfd,
+                                     struct drm_file *file, unsigned int cmd,
+                                     void __user *uarg);
+static long nvgpu_semsurf_fence_attach(struct nvgpu_fd *nfd,
+                                       struct drm_file *file, unsigned int cmd,
+                                       void __user *uarg);
+static bool nvgpu_fence_host_signalled(struct nvgpu_device *dev, u32 handle,
+                                       s32 status);
+
+/* Whether this node serves explicit sync: the backend relays fences and the
+ * host's own node has semaphore surfaces (its GET_DEV_INFO supports_semsurf). */
+static bool nvgpu_dri_fences(const struct nvgpu_dri_dev *dri) {
+  return nvgpu_explicit_sync && dri->dev->fences && dri->dev_info[8];
+}
 
 /*
  * struct drm_version — UAPI, stable since DRM was upstreamed.
@@ -1090,6 +1160,7 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
      * page kind correct only on the two architectures the comment named.
      */
     u32 info[NVGPU_DEV_INFO_WORDS];
+    bool fences;
 
     BUILD_BUG_ON(sizeof(struct drm_nvidia_get_dev_info_params) !=
                  NVGPU_DEV_INFO_WORDS * sizeof(u32));
@@ -1123,18 +1194,22 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
      *
      *   supports_alloc     GEM_ALLOC_NVKMS_MEMORY, GEM_MAP_OFFSET,
      *                      GEM_EXPORT_DMABUF_MEMORY (0x0b, 0x0a, 0x0d)
-     *   supports_sync_fd   PRIME_FENCE_CONTEXT_CREATE, GEM_PRIME_FENCE_ATTACH
-     *                      (0x05, 0x06)
      *   supports_semsurf   SEMSURF_FENCE_CTX_CREATE and the three that follow
-     *                      it (0x14..0x17)
+     *                      it (0x14..0x17): served when nvgpu_dri_fences()
+     *   supports_sync_fd   set beside it, as nvidia-drm sets the two: the
+     *                      sync_fds are the semaphore-surface ones. The
+     *                      legacy PRIME_FENCE_* (0x05, 0x06) stay unserved;
+     *                      the parameter can still force the bit on alone.
      *
      * gpu_id, primary_index and the page-kind and sector-layout fields stay
      * as the host reported them: they describe the card, which is genuinely
      * the host's, and the ICD matches a DRM node to an RM device by gpu_id.
      */
-    info[3] = nvgpu_claim_alloc;   /* supports_alloc */
-    info[7] = nvgpu_claim_sync_fd; /* supports_sync_fd */
-    info[8] = 0;                   /* supports_semsurf */
+    /* The fence ioctls need a drm_file, which the fallback cdev lacks. */
+    fences = file && nvgpu_dri_fences(dri);
+    info[3] = nvgpu_claim_alloc;            /* supports_alloc */
+    info[7] = nvgpu_claim_sync_fd || fences; /* supports_sync_fd */
+    info[8] = fences;                        /* supports_semsurf */
 
     /*
      * primary_index is the number of the DRM node this device is, and it has
@@ -1231,7 +1306,7 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
     obj = drm_gem_object_lookup(file, p.handle);
     if (!obj)
       return -ENOENT;
-    if (obj->funcs != &nvgpu_gem_funcs) {
+    if (obj->funcs != &nvgpu_gem_funcs || to_nvgpu_gem(obj)->fence_ctx) {
       drm_gem_object_put(obj);
       return -ENOENT;
     }
@@ -1277,7 +1352,7 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
       return ret;
 
     /* The host's handle never reaches userspace; a proxy stands in for it. */
-    ret = nvgpu_gem_proxy_create(file, nfd, p.handle, p.memory_size,
+    ret = nvgpu_gem_proxy_create(file, nfd, p.handle, p.memory_size, false,
                                  &guest_handle);
     if (ret) {
       struct nvgpu_drm_gem_close close = {.handle = p.handle};
@@ -1329,7 +1404,35 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
     return nvgpu_ioctl_drm_gem_nested(nfd, file, cmd, uarg,
                                       &nvgpu_gem_export_dmabuf);
 
+  /*
+   * ── Explicit sync, nvgpu_fence.h ──
+   *
+   * Only where GET_DEV_INFO said supports_semsurf; anywhere else they are
+   * unhandled, as before, and say so below.
+   */
+  case DRM_NVIDIA_SEMSURF_FENCE_CTX_CREATE:
+    if (!file || !nvgpu_dri_fences(dri))
+      goto unhandled;
+    return nvgpu_ioctl_drm_gem_nested(nfd, file, cmd, uarg,
+                                      &nvgpu_gem_semsurf_ctx);
+
+  case DRM_NVIDIA_SEMSURF_FENCE_CREATE:
+    if (!file || !nvgpu_dri_fences(dri))
+      goto unhandled;
+    return nvgpu_semsurf_fence_create(nfd, file, cmd, uarg);
+
+  case DRM_NVIDIA_SEMSURF_FENCE_WAIT:
+    if (!file || !nvgpu_dri_fences(dri))
+      goto unhandled;
+    return nvgpu_semsurf_fence_wait(nfd, file, cmd, uarg);
+
+  case DRM_NVIDIA_SEMSURF_FENCE_ATTACH:
+    if (!file || !nvgpu_dri_fences(dri))
+      goto unhandled;
+    return nvgpu_semsurf_fence_attach(nfd, file, cmd, uarg);
+
   default:
+  unhandled:
     /*
      * Named rather than silently refused. An ioctl this stub does not answer
      * is the ICD asking for something the node cannot do yet, and -ENOTTY on
@@ -1690,19 +1793,27 @@ static void nvgpu_event_post(struct nvgpu_device *dev,
  * re-sends while the descriptor stays readable, so a lost one costs a
  * millisecond rather than a hang.
  */
-static void nvgpu_event_deliver(struct nvgpu_device *dev, u32 handle) {
+static void nvgpu_event_deliver(struct nvgpu_device *dev, u32 handle,
+                                s32 status) {
   struct nvgpu_fd *nfd;
   unsigned long flags;
+  bool found = false;
 
   spin_lock_irqsave(&dev->fds_lock, flags);
   list_for_each_entry(nfd, &dev->fds, node) {
     if (nfd->handle == handle) {
       atomic_set(&nfd->pending, 1);
       wake_up_interruptible(&nfd->wq);
+      found = true;
       break;
     }
   }
   spin_unlock_irqrestore(&dev->fds_lock, flags);
+
+  /* No file by that handle: a host fence that signalled, if anything. The
+   * backend's handles are unique across both, so there is no ambiguity. */
+  if (!found)
+    nvgpu_fence_host_signalled(dev, handle, status);
 }
 
 static void nvgpu_event_vq_cb(struct virtqueue *vq) {
@@ -1713,7 +1824,8 @@ static void nvgpu_event_vq_cb(struct virtqueue *vq) {
   while ((buf = virtqueue_get_buf(vq, &len)) != NULL) {
     if (len >= sizeof(buf->hdr) &&
         le32_to_cpu(buf->hdr.msg_type) == NVGPU_MSG_EVENT_READY)
-      nvgpu_event_deliver(dev, le32_to_cpu(buf->hdr.handle));
+      nvgpu_event_deliver(dev, le32_to_cpu(buf->hdr.handle),
+                          (s32)le32_to_cpu(buf->hdr.status));
     else if (len >= sizeof(buf->hdr) &&
              le32_to_cpu(buf->hdr.msg_type) == NVGPU_MSG_INPUT_EVENT)
       nvgpu_input_batch(dev, buf->payload,
@@ -4101,6 +4213,10 @@ static const struct dma_buf_ops nvgpu_dmabuf_ops = {
 static struct dma_buf *nvgpu_gem_export(struct drm_gem_object *obj, int flags) {
   DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
 
+  /* A fence context has no memory to share; nvidia-drm exports none. */
+  if (to_nvgpu_gem(obj)->fence_ctx)
+    return ERR_PTR(-EINVAL);
+
   exp_info.ops = &nvgpu_dmabuf_ops;
   exp_info.size = obj->size;
   exp_info.flags = flags;
@@ -4176,7 +4292,7 @@ static const struct drm_gem_object_funcs nvgpu_gem_funcs = {
  * Page-aligned because the core rejects an object smaller than a page.
  */
 static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
-                                  u32 host_handle, size_t size,
+                                  u32 host_handle, size_t size, bool fence_ctx,
                                   u32 *guest_handle) {
   struct nvgpu_gem_object *ng;
   int ret;
@@ -4195,7 +4311,9 @@ static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
   ng->dev = nfd->dev;
   ng->owner_handle = nfd->handle;
   ng->host_handle = host_handle;
-  ng->obj_type = NVGPU_GEM_OBJECT_NVKMS;
+  /* nvidia-drm's fence contexts are none of its three object kinds. */
+  ng->obj_type = fence_ctx ? NVGPU_GEM_OBJECT_UNKNOWN : NVGPU_GEM_OBJECT_NVKMS;
+  ng->fence_ctx = fence_ctx;
 
   ret = drm_gem_handle_create(file, &ng->base, guest_handle);
   /* The handle holds the only reference now, or nothing does and it is freed. */
@@ -4433,7 +4551,7 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
           obj_size = get_unaligned_le64(out + d->size_field_offset);
 
         cret = nvgpu_gem_proxy_create(file, nfd, host_handle, (size_t)obj_size,
-                                      &guest_handle);
+                                      d->fence_ctx, &guest_handle);
         if (cret) {
           struct nvgpu_drm_gem_close close = {.handle = host_handle};
 
@@ -4957,10 +5075,11 @@ static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
       long ret = drm_ioctl(filp, cmd, arg);
 
       /* KMS ioctls (0xA0..) on a node with a head are the core's own, and a
-       * compositor's TEST_ONLY probes fail by design; not worth a line. */
-      if (ret < 0 && !(nr >= 0xA0 && file->minor->dev->dev_private &&
-                       ((struct nvgpu_dri_dev *)file->minor->dev->dev_private)
-                           ->kms))
+       * compositor's TEST_ONLY probes fail by design; not worth a line. Nor
+       * are syncobj ones (0xBF..0xCF): a wait that times out is -ETIME. */
+      if (ret < 0 && !(nr >= 0xBF && nr <= 0xCF) &&
+          !(nr >= 0xA0 && file->minor->dev->dev_private &&
+            ((struct nvgpu_dri_dev *)file->minor->dev->dev_private)->kms))
         dev_warn_ratelimited(&nfd->dev->vdev->dev,
                              "conduit-gpu: core DRM ioctl nr=0x%02x answered "
                              "locally with %ld\n",
@@ -5019,19 +5138,45 @@ static const struct file_operations nvgpu_drm_fops = {
 /* The shared clipboard, /dev/conduit-clipboard; see the header. */
 #include "nvgpu_clipboard.h"
 
+/* Explicit sync: host fences as guest fences; see the header. */
+#include "nvgpu_fence.h"
+
+/*
+ * Everything but the feature bits, which differ per node: a display or not,
+ * and explicit sync or not.
+ *
+ * `gem_prime_import`: without it, a buffer this node exported cannot be
+ * imported back.
+ */
+#define NVGPU_DRM_DRIVER_COMMON                                                \
+  .gem_prime_import = nvgpu_gem_prime_import,                                  \
+  .open = nvgpu_drm_open,                                                      \
+  .postclose = nvgpu_drm_postclose,                                            \
+  .fops = &nvgpu_drm_fops,                                                     \
+  .name = "nvidia-drm",                                                        \
+  .desc = "NVIDIA DRM driver",                                                 \
+  NVGPU_DRM_DRIVER_DATE                                                        \
+  .major = 0,                                                                  \
+  .minor = 0,                                                                  \
+  .patchlevel = 0
+
+/*
+ * DRM syncobjs, binary and timeline, as nvidia-drm offers them. The core
+ * serves every syncobj ioctl itself; what it needs from a driver is fences
+ * that signal, which only exist where nvgpu_dri_fences() says so -- so only
+ * those nodes say DRM_CAP_SYNCOBJ, and a compositor elsewhere keeps implicit
+ * sync rather than waiting on fences nothing will produce.
+ */
+#define NVGPU_DRIVER_SYNC (DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE)
+
 static const struct drm_driver nvgpu_drm_driver = {
     .driver_features = DRIVER_GEM | DRIVER_RENDER,
-    /* Without this, a buffer this node exported cannot be imported back. */
-    .gem_prime_import = nvgpu_gem_prime_import,
-    .open = nvgpu_drm_open,
-    .postclose = nvgpu_drm_postclose,
-    .fops = &nvgpu_drm_fops,
-    .name = "nvidia-drm",
-    .desc = "NVIDIA DRM driver",
-    NVGPU_DRM_DRIVER_DATE
-    .major = 0,
-    .minor = 0,
-    .patchlevel = 0,
+    NVGPU_DRM_DRIVER_COMMON,
+};
+
+static const struct drm_driver nvgpu_drm_sync_driver = {
+    .driver_features = DRIVER_GEM | DRIVER_RENDER | NVGPU_DRIVER_SYNC,
+    NVGPU_DRM_DRIVER_COMMON,
 };
 
 /*
@@ -5049,17 +5194,24 @@ static const struct drm_driver nvgpu_drm_kms_driver = {
      */
     .driver_features = DRIVER_GEM | DRIVER_RENDER | DRIVER_MODESET |
                        DRIVER_ATOMIC | NVGPU_DRIVER_CURSOR_HOTSPOT,
-    .gem_prime_import = nvgpu_gem_prime_import,
-    .open = nvgpu_drm_open,
-    .postclose = nvgpu_drm_postclose,
-    .fops = &nvgpu_drm_fops,
-    .name = "nvidia-drm",
-    .desc = "NVIDIA DRM driver",
-    NVGPU_DRM_DRIVER_DATE
-    .major = 0,
-    .minor = 0,
-    .patchlevel = 0,
+    NVGPU_DRM_DRIVER_COMMON,
 };
+
+static const struct drm_driver nvgpu_drm_kms_sync_driver = {
+    .driver_features = DRIVER_GEM | DRIVER_RENDER | DRIVER_MODESET |
+                       DRIVER_ATOMIC | NVGPU_DRIVER_CURSOR_HOTSPOT |
+                       NVGPU_DRIVER_SYNC,
+    NVGPU_DRM_DRIVER_COMMON,
+};
+
+static const struct drm_driver *nvgpu_drm_driver_for(struct nvgpu_dri_dev *dri,
+                                                     bool kms) {
+  bool sync = nvgpu_dri_fences(dri);
+
+  if (kms)
+    return sync ? &nvgpu_drm_kms_sync_driver : &nvgpu_drm_kms_driver;
+  return sync ? &nvgpu_drm_sync_driver : &nvgpu_drm_driver;
+}
 
 static char *nvgpu_devnode(const struct device *dev, umode_t *mode) {
   if (mode)
@@ -5169,8 +5321,7 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
      */
     /* One head, on the first node, and only when the device has a display. */
     kms_drv = i == 0 && dev->has_display;
-    drm = drm_dev_alloc(kms_drv ? &nvgpu_drm_kms_driver : &nvgpu_drm_driver,
-                        pci_parent);
+    drm = drm_dev_alloc(nvgpu_drm_driver_for(dri, kms_drv), pci_parent);
     if (IS_ERR(drm)) {
       dev_warn(&dev->vdev->dev, "conduit-gpu: drm_dev_alloc %s failed: %ld\n",
                dri->name, PTR_ERR(drm));
@@ -5183,7 +5334,7 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
     if (kms_drv && nvgpu_kms_init(dri, drm)) {
       drm_dev_put(drm);
       dri->kms = NULL;
-      drm = drm_dev_alloc(&nvgpu_drm_driver, pci_parent);
+      drm = drm_dev_alloc(nvgpu_drm_driver_for(dri, false), pci_parent);
       if (IS_ERR(drm)) {
         dev_warn(&dev->vdev->dev,
                  "conduit-gpu: drm_dev_alloc %s failed: %ld\n", dri->name,
@@ -6055,6 +6206,11 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   if (dev->num_fd_translations > 16)
     dev->num_fd_translations = 16;
 
+  /* Before any DRM node exists: whether one offers syncobjs depends on it. */
+  if ((dev->features & NVGPU_CFG_DRM_FENCES) && nvgpu_explicit_sync &&
+      nvgpu_fence_dom_init(dev))
+    dev_warn(&vdev->dev, "conduit-gpu: no memory for fences; explicit sync off\n");
+
   /*
    * The display's preferred mode, appended past the backend's 4024 bytes and
    * read only when the flag says it is there: a read past the end of an older
@@ -6093,6 +6249,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   if (IS_ERR(nvgpu_class)) {
     ret = PTR_ERR(nvgpu_class);
     nvgpu_class = NULL;
+    nvgpu_fence_dom_kill(dev);
     return ret;
   }
 
@@ -6279,6 +6436,7 @@ err_gpu_cdevs:
 err_class:
   class_destroy(nvgpu_class);
   nvgpu_class = NULL;
+  nvgpu_fence_dom_kill(dev);
   return ret;
 }
 
@@ -6290,6 +6448,8 @@ static void nvgpu_remove(struct virtio_device *vdev) {
    * and no input event may land on a device being unregistered. */
   nvgpu_clip_detach(dev);
   nvgpu_display_quiesce(dev);
+  /* While the control queue still answers: a work item mid-message ends. */
+  nvgpu_fence_dom_kill(dev);
   vdev->config->reset(vdev);
   /* After the reset: the queue is quiet, so the buffers cannot be in use. */
   nvgpu_clip_fini(dev);

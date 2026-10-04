@@ -3194,3 +3194,385 @@ mod tests {
         }
     }
 }
+
+/// Explicit sync (docs/SYNC.md): host sync_files in and out of the handle
+/// table, against a fake host that makes real descriptors.
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::sync::{Arc, Mutex};
+
+    /// What reached the fake host: the request and the bytes it was given.
+    type Calls = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+
+    /// A host that answers SEMSURF_FENCE_CREATE and SYNCOBJ_HANDLE_TO_FD with
+    /// a fresh eventfd, as the real driver answers with a sync_file, and
+    /// SYNCOBJ_CREATE with handle 7. Everything else succeeds untouched.
+    #[derive(Clone, Default)]
+    struct FenceHost {
+        calls: Calls,
+        /// SEMSURF_FENCE_CREATE succeeds but writes no descriptor.
+        no_fd: bool,
+    }
+
+    fn new_fd() -> i32 {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(fd >= 0);
+        fd
+    }
+
+    impl HostDriver for FenceHost {
+        fn ioctl(&self, _fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            self.calls.lock().unwrap().push((request, arg.to_vec()));
+            match request & 0xff {
+                0x55 if !self.no_fd => arg[16..20].copy_from_slice(&new_fd().to_le_bytes()),
+                0xbf => arg[0..4].copy_from_slice(&7u32.to_le_bytes()),
+                0xc1 => arg[8..12].copy_from_slice(&new_fd().to_le_bytes()),
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
+    impl FenceHost {
+        fn calls(&self) -> Vec<(u64, Vec<u8>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    fn backend_on(host: &FenceHost) -> (NvidiaBackend, u64) {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host(Box::new(host.clone()));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let drm = be.handles.insert(OwnedFd::from(null));
+        (be, drm)
+    }
+
+    fn hdr(msg_type: MsgType, handle: u64) -> Vec<u8> {
+        let mut v = vec![0u8; size_of::<MsgHeader>()];
+        write_struct(
+            &mut v,
+            &MsgHeader {
+                msg_type: msg_type as u32,
+                handle: handle as u32,
+                status: 0,
+                padding: 0,
+            },
+        );
+        v
+    }
+
+    /// An nvidia-drm ioctl: type 'd', `nr` absolute, `nested` after the struct.
+    fn drm_msg(handle: u64, nr: u32, params: &[u8], nested: &[u8]) -> Vec<u8> {
+        let mut v = hdr(MsgType::Ioctl, handle);
+        let req = IoctlReq {
+            cmd: (3 << 30) | ((params.len() as u32) << 16) | ((b'd' as u32) << 8) | nr,
+            data_len: params.len() as u32,
+            nested_offset: params.len() as u32,
+            nested_len: nested.len() as u32,
+            deep_ptr_offset: 0,
+            deep_len: 0,
+        };
+        let at = v.len();
+        v.resize(at + size_of::<IoctlReq>(), 0);
+        write_struct(&mut v[at..], &req);
+        v.extend_from_slice(params);
+        v.extend_from_slice(nested);
+        v
+    }
+
+    const BODY: usize = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+
+    fn status(resp: &[u8]) -> i32 {
+        read_struct::<MsgHeader>(resp, 0).status
+    }
+
+    fn word(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+
+    /// FENCE_CREATE params: ctx 3, timeout 0, wait_value 9, fd as given.
+    fn create_params(fd: i32) -> Vec<u8> {
+        let mut p = vec![0u8; 24];
+        p[0..4].copy_from_slice(&3u32.to_le_bytes());
+        p[8..16].copy_from_slice(&9u64.to_le_bytes());
+        p[16..20].copy_from_slice(&fd.to_le_bytes());
+        p
+    }
+
+    /// FENCE_WAIT params naming `fd` (a handle, or 0), pre 1, post 2.
+    fn wait_params(fd: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 24];
+        p[0..4].copy_from_slice(&3u32.to_le_bytes());
+        p[4..8].copy_from_slice(&fd.to_le_bytes());
+        p[8..16].copy_from_slice(&1u64.to_le_bytes());
+        p[16..24].copy_from_slice(&2u64.to_le_bytes());
+        p
+    }
+
+    fn create_fence(be: &mut NvidiaBackend, drm: u64) -> u64 {
+        let mut resp = vec![0u8; 256];
+        be.dispatch(&drm_msg(drm, 0x55, &create_params(12345), &[]), &mut resp);
+        assert_eq!(status(&resp), 0);
+        word(&resp, BODY + 16) as u64
+    }
+
+    /// The host's descriptor stays here; the guest gets a handle for it, the
+    /// transport is told to watch it once, and closing it lets it go.
+    #[test]
+    fn fence_create_trades_the_descriptor_for_a_handle() {
+        let host = FenceHost::default();
+        let (mut be, drm) = backend_on(&host);
+        let before = be.handle_count();
+
+        let fence = create_fence(&mut be, drm);
+
+        assert!(fence > drm, "a fresh handle, not the guest's 12345");
+        assert!(be.fences.contains(&fence));
+        assert_eq!(be.handle_count(), before + 1);
+        // The guest's number never reached the host: it saw -1 in the field.
+        let calls = host.calls();
+        assert_eq!(word(&calls[0].1, 16) as i32, -1);
+        let watches = be.take_fence_watches();
+        assert_eq!(watches.len(), 1);
+        assert_eq!(watches[0].0 as u64, fence);
+        assert_eq!(watches[0].1, be.handles.get_raw(fence).unwrap());
+        // Not a plain watch: those are re-sent while readable.
+        assert!(be.take_watch_updates().0.is_empty());
+
+        let mut resp = vec![0u8; 64];
+        be.dispatch(&hdr(MsgType::Close, fence), &mut resp);
+        assert_eq!(status(&resp), 0);
+        assert!(!be.fences.contains(&fence));
+        assert_eq!(be.handle_count(), before);
+        assert!(be.take_watch_updates().1.contains(&(fence as u32)));
+    }
+
+    /// A host that says yes without a descriptor is not taken at its word:
+    /// the guest's own number must never be adopted as ours.
+    #[test]
+    fn fence_create_without_a_descriptor_is_an_error() {
+        let host = FenceHost {
+            no_fd: true,
+            ..Default::default()
+        };
+        let (mut be, drm) = backend_on(&host);
+        let before = be.handle_count();
+        let mut resp = vec![0u8; 256];
+        be.dispatch(&drm_msg(drm, 0x55, &create_params(0), &[]), &mut resp);
+        assert_eq!(status(&resp), -libc::EIO);
+        assert_eq!(be.handle_count(), before);
+        assert!(be.fences.is_empty() && be.take_fence_watches().is_empty());
+    }
+
+    #[test]
+    fn fence_create_of_the_wrong_size_never_reaches_the_host() {
+        let host = FenceHost::default();
+        let (mut be, drm) = backend_on(&host);
+        let mut resp = vec![0u8; 256];
+        be.dispatch(&drm_msg(drm, 0x55, &[0u8; 16], &[]), &mut resp);
+        assert_eq!(status(&resp), -libc::EINVAL);
+        assert!(host.calls().is_empty());
+    }
+
+    /// A wait names one of our fences by handle, and the host sees the
+    /// descriptor behind it -- and the guest reads its handle back.
+    #[test]
+    fn fence_wait_substitutes_our_descriptor() {
+        let host = FenceHost::default();
+        let (mut be, drm) = backend_on(&host);
+        let fence = create_fence(&mut be, drm);
+        let raw = be.handles.get_raw(fence).unwrap();
+
+        let mut resp = vec![0u8; 256];
+        be.dispatch(
+            &drm_msg(drm, 0x56, &wait_params(fence as u32), &[]),
+            &mut resp,
+        );
+
+        assert_eq!(status(&resp), 0);
+        let calls = host.calls();
+        let (req, sent) = calls.last().unwrap();
+        assert_eq!(req & 0xff, 0x56);
+        assert_eq!(word(sent, 4) as i32, raw);
+        assert_eq!(word(&resp, BODY + 4) as u64, fence);
+    }
+
+    /// 0 is "already signalled": the host waits on a signalled sync_file,
+    /// made once from a signalled syncobj and kept.
+    #[test]
+    fn fence_wait_on_zero_uses_one_signalled_sync_file() {
+        let host = FenceHost::default();
+        let (mut be, drm) = backend_on(&host);
+        let mut resp = vec![0u8; 256];
+        be.dispatch(&drm_msg(drm, 0x56, &wait_params(0), &[]), &mut resp);
+        assert_eq!(status(&resp), 0);
+        be.dispatch(&drm_msg(drm, 0x56, &wait_params(0), &[]), &mut resp);
+        assert_eq!(status(&resp), 0);
+
+        let calls = host.calls();
+        let nrs: Vec<u64> = calls.iter().map(|(r, _)| r & 0xff).collect();
+        assert_eq!(
+            nrs,
+            vec![0xbf, 0xc1, 0xc0, 0x56, 0x56],
+            "made once, used twice"
+        );
+        // Created signalled, exported as a sync_file, the syncobj destroyed.
+        assert_eq!(word(&calls[0].1, 4), 1);
+        assert_eq!(word(&calls[1].1, 0), 7);
+        assert_eq!(word(&calls[1].1, 4), 1);
+        assert_eq!(word(&calls[2].1, 0), 7);
+        let signalled = be.signalled.as_ref().unwrap().as_raw_fd();
+        assert_eq!(word(&calls[3].1, 4) as i32, signalled);
+        assert_eq!(word(&calls[4].1, 4) as i32, signalled);
+        assert_eq!(word(&resp, BODY + 4), 0);
+    }
+
+    /// A handle that is not a live fence -- closed, or a device -- is ENOENT,
+    /// answered here. A device's descriptor must never be waited on as a fence.
+    #[test]
+    fn fence_wait_on_anything_but_a_live_fence_is_enoent() {
+        let host = FenceHost::default();
+        let (mut be, drm) = backend_on(&host);
+        let fence = create_fence(&mut be, drm);
+        let mut resp = vec![0u8; 256];
+        be.dispatch(&hdr(MsgType::Close, fence), &mut resp);
+        let before = host.calls().len();
+
+        for named in [fence, drm, 999] {
+            be.dispatch(
+                &drm_msg(drm, 0x56, &wait_params(named as u32), &[]),
+                &mut resp,
+            );
+            assert_eq!(status(&resp), -libc::ENOENT, "handle {named}");
+        }
+        assert_eq!(host.calls().len(), before);
+    }
+
+    /// A fence handle is a sync_file: nothing but Close may name it.
+    #[test]
+    fn a_fence_handle_takes_no_ioctl() {
+        let host = FenceHost::default();
+        let (mut be, drm) = backend_on(&host);
+        let fence = create_fence(&mut be, drm);
+        let before = host.calls().len();
+        let mut resp = vec![0u8; 256];
+        be.dispatch(&drm_msg(fence, 0x56, &wait_params(0), &[]), &mut resp);
+        assert_eq!(status(&resp), -libc::EBADF);
+        assert_eq!(host.calls().len(), before);
+    }
+
+    /// The context import names an RM client inside its NVKMS block; only one
+    /// this guest was given is forwarded.
+    #[test]
+    fn fence_ctx_create_needs_one_of_our_clients() {
+        let host = FenceHost::default();
+        let (mut be, drm) = backend_on(&host);
+        let mut outer = vec![0u8; 32];
+        outer[16..24].copy_from_slice(&16u64.to_le_bytes());
+        let mut nested = vec![0u8; 16];
+        nested[0..4].copy_from_slice(&0xc1d0_0001u32.to_le_bytes());
+        nested[4..8].copy_from_slice(&0x5000_0001u32.to_le_bytes());
+
+        let mut resp = vec![0u8; 256];
+        be.dispatch(&drm_msg(drm, 0x54, &outer, &nested), &mut resp);
+        assert_eq!(status(&resp), -libc::EPERM);
+        assert!(host.calls().is_empty());
+
+        be.vram.client_opened(drm, 0xc1d0_0001);
+        be.dispatch(&drm_msg(drm, 0x54, &outer, &nested), &mut resp);
+        assert_eq!(status(&resp), 0);
+        let calls = host.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0 & 0xff, 0x54);
+        // The pointer the host saw is ours, and the guest's comes back.
+        assert_ne!(u64::from_le_bytes(calls[0].1[8..16].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(resp[BODY + 8..BODY + 16].try_into().unwrap()),
+            0
+        );
+    }
+
+    /// The core's syncobj ioctls and the legacy prime fence context are not
+    /// forwarded: here they would only make descriptors in this process.
+    #[test]
+    fn syncobj_and_prime_fence_ioctls_are_refused_here() {
+        let host = FenceHost::default();
+        let (mut be, drm) = backend_on(&host);
+        let mut resp = vec![0u8; 256];
+        for nr in [0x45, 0xbf, 0xc1, 0xc2, 0xcf] {
+            be.dispatch(&drm_msg(drm, nr, &[0u8; 16], &[]), &mut resp);
+            assert_eq!(status(&resp), -libc::ENOTTY, "nr {nr:#x}");
+        }
+        assert!(host.calls().is_empty());
+    }
+
+    /// A guest cannot pile up host descriptors without bound.
+    #[test]
+    fn fences_are_capped() {
+        let host = FenceHost::default();
+        let (mut be, drm) = backend_on(&host);
+        // Stand-ins rather than real descriptors: a test must not need a
+        // raised RLIMIT_NOFILE.
+        be.fences
+            .extend((1u64 << 40)..(1u64 << 40) + fence::MAX_FENCES as u64);
+        let mut resp = vec![0u8; 256];
+        be.dispatch(&drm_msg(drm, 0x55, &create_params(0), &[]), &mut resp);
+        assert_eq!(status(&resp), -libc::EAGAIN);
+        assert_eq!(be.fences.len(), fence::MAX_FENCES);
+    }
+
+    /// A device reset closes every fence like every other file.
+    #[test]
+    fn reset_drops_every_fence() {
+        let host = FenceHost::default();
+        let (mut be, drm) = backend_on(&host);
+        let fence = create_fence(&mut be, drm);
+        let mut resp = vec![0u8; 256];
+        be.dispatch(&drm_msg(drm, 0x56, &wait_params(0), &[]), &mut resp);
+        be.reset();
+        assert!(be.fences.is_empty() && be.signalled.is_none());
+        assert_eq!(be.handle_count(), 0);
+        assert!(be.take_watch_updates().1.contains(&(fence as u32)));
+    }
+
+    /// The signalled sync_file, made by the real kernel: proves the syncobj
+    /// ioctl numbers and layouts. Any DRM render node with syncobjs will do;
+    /// skipped (and says so) without one.
+    #[test]
+    fn the_signalled_sync_file_is_real_and_readable() {
+        let Some(node) = std::fs::read_dir("/dev/dri").ok().and_then(|d| {
+            d.flatten()
+                .map(|e| e.path())
+                .find(|p| p.to_string_lossy().contains("renderD"))
+        }) else {
+            eprintln!("SKIP: no /dev/dri/renderD*; this test passes without testing anything");
+            return;
+        };
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&node)
+        else {
+            eprintln!("SKIP: cannot open {}", node.display());
+            return;
+        };
+        let mut be = NvidiaBackend::for_test();
+        let fd = be
+            .signalled_sync_file(file.as_raw_fd())
+            .expect("a signalled sync_file from a real node");
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut pfd, 1, 0) },
+            1,
+            "signalled = readable"
+        );
+        // Kept: a second ask is the same descriptor.
+        assert_eq!(be.signalled_sync_file(file.as_raw_fd()), Ok(fd));
+    }
+}

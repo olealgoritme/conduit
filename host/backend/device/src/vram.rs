@@ -237,6 +237,12 @@ impl Vram {
         self.files.get(&file).is_some_and(|v| v.contains(&client))
     }
 
+    /// Whether `client` was made on any file this guest has open. For a call
+    /// that names a client with no file beside it.
+    pub fn issued_anywhere(&self, client: Client) -> bool {
+        self.files.values().any(|v| v.contains(&client))
+    }
+
     /// `client` itself was freed, on whichever file it was made on.
     pub fn client_freed(&mut self, client: Client) {
         for v in self.files.values_mut() {

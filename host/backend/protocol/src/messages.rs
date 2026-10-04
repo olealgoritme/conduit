@@ -381,6 +381,15 @@ pub const NVGPU_CFG_CURSOR: u32 = 1 << 9;
 /// host-visible blobs. Set only when the backend runs with `--venus`.
 pub const NVGPU_CFG_VENUS: u32 = 1 << 10;
 
+/// Device config `features` bit: the backend turns nvidia-drm's semaphore
+/// surface fences into guest fences (docs/SYNC.md). With it the reply to
+/// `SEMSURF_FENCE_CREATE` carries a backend handle in its `fd` field, that
+/// handle gets one `EventReady` when the host fence signals (`status` the
+/// fence's error, if any), and `SEMSURF_FENCE_WAIT` names such a handle, or
+/// 0 for "already signalled", in the same field. A guest without the bit
+/// sends none of these and keeps explicit sync off.
+pub const NVGPU_CFG_DRM_FENCES: u32 = 1 << 11;
+
 /// Request payload for `MsgType::ScanoutFlip`, following a `MsgHeader`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -953,6 +962,7 @@ mod tests {
         assert_eq!(MsgType::GpuCmd as u32, 30);
         assert_eq!(MsgType::from_u32(31), None);
         assert_eq!(NVGPU_CFG_VENUS, 1 << 10);
+        assert_eq!(NVGPU_CFG_DRM_FENCES, 1 << 11);
     }
 
     /// The event the guest's event-queue handler decodes: header, then

@@ -20,7 +20,7 @@ Current limitations, with the intended fix for each. Planned work is in
 |---|---|---|
 | The guest ignores buffer release from the host | The guest may render into a buffer the host compositor still reads | Forward `EV_RELEASE` as a guest event; complete a flip only when the previous buffer is released |
 | Guest vblank is a free-running timer | Up to a frame of extra latency and phase drift against the host's refresh | Drive the guest vblank from the host's presentation feedback (`EV_FRAME`), keeping the timer as a fallback |
-| No GPU fences across the boundary (`supports_sync_fd` off, no `DRIVER_SYNCOBJ`) | A flip can be shown before the guest's rendering has finished | Forward the PRIME fence ioctls, attach fences to the proxy's `dma_resv`, wait on them in the backend before handing the frame on |
+| GPU fences cross the boundary only as semaphore-surface fences ([SYNC.md](SYNC.md)); the legacy PRIME fence ioctls are not served, and a buffer rendered without any fence is still flipped unsynchronised | Old userspace without `supports_semsurf`, or a client using neither explicit nor attached fences, can show a frame before its rendering finished | Serve PRIME_FENCE_* if anything still needs it |
 | No damage rectangles | The host recomposites and the encoder re-encodes the whole frame | `drm_plane_enable_fb_damage_clips()`, pass the bounding rectangle with the flip |
 | No `GAMMA_LUT` / CTM | Night light and colour profiles in the guest have no effect | Enable colour management on the CRTC and forward the LUT |
 | No physical size or EDID | GNOME picks scale 1 on HiDPI monitors | Report the host output's size, or synthesize an EDID |

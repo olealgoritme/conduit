@@ -332,6 +332,14 @@ pub struct NvidiaBackend {
     /// watchable; the transport decides how to watch it.
     watch_added: Vec<(u32, RawFd)>,
     watch_removed: Vec<u32>,
+    /// Host fences (sync_files) handed to the guest as handles, docs/SYNC.md.
+    /// Watched like a descriptor but reported once: a signalled sync_file
+    /// stays readable forever.
+    fences: std::collections::HashSet<u64>,
+    fence_watch_added: Vec<(u32, RawFd)>,
+    /// An already-signalled sync_file, made once on demand: what a guest
+    /// fence that has signalled becomes when the host GPU must wait on it.
+    signalled: Option<OwnedFd>,
     next_mapping_id: u32,
     /// Where forwarded ioctls go. The host driver, except under test.
     host: Box<dyn HostDriver>,
@@ -433,6 +441,9 @@ impl NvidiaBackend {
             ioctls_by_ns: std::collections::BTreeMap::new(),
             watch_added: Vec::new(),
             watch_removed: Vec::new(),
+            fences: std::collections::HashSet::new(),
+            fence_watch_added: Vec::new(),
+            signalled: None,
             next_mapping_id: 1,
             current_msg: MsgType::Ioctl,
             current_handle: 0,
@@ -645,6 +656,14 @@ impl NvidiaBackend {
             std::mem::take(&mut self.watch_added),
             std::mem::take(&mut self.watch_removed),
         )
+    }
+
+    /// Host fences opened since this was last called, to be watched until
+    /// they first become readable and then dropped from the poll set (they
+    /// stay readable). Their removal comes through `take_watch_updates` like
+    /// any other handle's, when the guest closes them.
+    pub fn take_fence_watches(&mut self) -> Vec<(u32, RawFd)> {
+        std::mem::take(&mut self.fence_watch_added)
     }
 
     /// Give the backend somewhere to place device memory.
@@ -990,6 +1009,13 @@ impl NvidiaBackend {
         // after Open acts on one, and Open's response returns one the same way.
         self.current_handle = hdr.handle;
 
+        // A fence handle is a sync_file, not a device: only Close may name
+        // it. Forwarded, an ioctl on it would reach the sync_file's own
+        // (SYNC_IOC_MERGE makes descriptors here).
+        if msg_type != MsgType::Close && self.fences.contains(&(hdr.handle as u64)) {
+            return self.write_error_resp(resp_buf, Status::BadHandle, 0, 0);
+        }
+
         let payload = &req_buf[size_of::<MsgHeader>()..];
         match msg_type {
             MsgType::Open => self.handle_open(0, payload, resp_buf),
@@ -1056,6 +1082,7 @@ fn write_struct<T: Copy>(buf: &mut [u8], val: &T) -> usize {
 
 mod aperture;
 mod clipboard;
+mod fence;
 mod files;
 pub use files::FileTree;
 mod gpu_cmd;
