@@ -8,6 +8,7 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 
 pub mod ipc;
 pub mod mock;
+pub mod sandbox;
 #[cfg(feature = "renderer")]
 pub mod virgl;
 
