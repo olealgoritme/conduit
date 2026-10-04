@@ -123,7 +123,10 @@ arch)
 esac
 
 # --- the host NVIDIA share, seat and loader files (same on every distribution) --
-run install -d /mnt/nvidia /etc/environment.d
+# /mnt/nvidia is the read-only NVIDIA share once mounted (attach on a running
+# VM): install -d would fail chmod'ing it.
+[ -d /mnt/nvidia ] || run install -d /mnt/nvidia
+run install -d /etc/environment.d
 run install -m644 "$D/conduit-guest.service" /etc/systemd/system/conduit-guest.service
 run install -m644 "$D/99-conduit.rules" /etc/udev/rules.d/99-conduit.rules
 run install -m644 "$D/71-conduit-seat.rules" /etc/udev/rules.d/71-conduit-seat.rules
