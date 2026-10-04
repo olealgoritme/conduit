@@ -285,6 +285,9 @@ pub mod wire {
     pub const EV_ACTIVE: u16 = 19;
 
     pub const F_FULLSCREEN: u16 = 1 << 2;
+    /// ATTACH flags: the fd is a sealed memfd to present from shared memory
+    /// (`NVKVM_BROKER_CMD_F_SHM`), not a dma-buf.
+    pub const CMD_F_SHM: u16 = 1 << 0;
 
     /// HELLO capability bits this backend cares about.
     pub const CAP_MODE_HINTS: u32 = 1 << 10;
@@ -993,6 +996,34 @@ pub trait InputSink: Send {
     }
 }
 
+/// The boot console (`crate::console`): where input goes while it is shown,
+/// and how it is told that the mode may have changed.
+pub trait ConsoleSink: Send + Sync {
+    /// Input for the console, already translated to Linux events (the same
+    /// triples the guest would have had). Must not block.
+    fn input(&self, events: &[InputEventEntry]);
+    /// The console mode changed or may have: look at
+    /// [`DisplayLink::console_poll`]. Must not block.
+    fn wake(&self);
+}
+
+/// Who owns the picture when a console is attached
+/// ([`DisplayLink::attach_console`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleMode {
+    /// The guest's driver is showing frames; the console is quiet.
+    Guest,
+    /// The guest turned its scanout off; the console takes over at this
+    /// instant unless the guest flips first (a mode set disables and
+    /// re-enables, and should not flash the firmware screen).
+    Pending(Instant),
+    /// The console is shown and gets the input.
+    Shown,
+}
+
+/// How long a disabled scanout waits before the console takes over.
+pub const CONSOLE_GRACE: Duration = Duration::from_millis(250);
+
 /// Plane 0 of a frame handed over as a dma-buf (see
 /// [`DisplayLink::flip_dmabuf`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1110,10 +1141,15 @@ struct LinkState {
     /// The last frame the guest flipped (a dup of its dma-buf), kept across
     /// connections so a viewer that (re)attaches shows it at once instead of
     /// a black window until the guest's next flip.
-    frame: Option<(Arc<OwnedFd>, ScanoutFlip)>,
+    /// The third field is the ATTACH flags ([`wire::CMD_F_SHM`] for the
+    /// console's shared-memory frames).
+    frame: Option<(Arc<OwnedFd>, ScanoutFlip, u16)>,
     /// The last frame / cursor while nobody wanted them (see [`Parked`]).
     parked_frame: Option<Parked<ScanoutFlip>>,
     parked_cursor: Option<Parked<CursorUpdate>>,
+    /// The boot console, when one is attached, and who owns the picture.
+    console: Option<Arc<dyn ConsoleSink>>,
+    console_mode: Option<ConsoleMode>,
 }
 
 /// Guest -> broker clipboard pacing: at most this many records per
@@ -1160,6 +1196,9 @@ pub struct DisplayLink {
     /// The guest asked for the host clipboard again (ClipboardRequest).
     clip_resend: AtomicBool,
     exporter: Mutex<Arc<Exporter>>,
+    /// The console is shown (input goes to it); read without the lock for
+    /// every input packet.
+    console_shown: AtomicBool,
     pub stats: LinkStats,
 }
 
@@ -1211,6 +1250,7 @@ impl DisplayLink {
             parked: AtomicBool::new(false),
             clip_resend: AtomicBool::new(false),
             exporter: Mutex::new(Arc::new(real_export)),
+            console_shown: AtomicBool::new(false),
             stats: LinkStats::default(),
         })
     }
@@ -1324,6 +1364,7 @@ impl DisplayLink {
     /// client became active meanwhile: then export and [`DisplayLink::flip`].
     pub fn park(&self, drm: RawFd, f: &ScanoutFlip) -> bool {
         let mut st = self.state.lock().unwrap();
+        self.guest_shows_locked(&mut st);
         if self.wants_frames() {
             return false;
         }
@@ -1426,7 +1467,7 @@ impl DisplayLink {
         let export = self.exporter.lock().unwrap().clone();
         if let Some(p) = st.parked_frame.take() {
             match export(p.drm.as_raw_fd(), p.host_handle) {
-                Ok(fd) => st.frame = Some((Arc::new(fd), p.what)),
+                Ok(fd) => st.frame = Some((Arc::new(fd), p.what, 0)),
                 Err(e) => log::warn!(
                     "display: export of the parked frame (handle {} on file {}): errno {e}",
                     p.host_handle,
@@ -1456,26 +1497,42 @@ impl DisplayLink {
     /// frames. Never blocks.
     pub fn flip(&self, dmabuf: RawFd, f: &ScanoutFlip) -> FlipOutcome {
         let mut st = self.state.lock().unwrap();
+        self.guest_shows_locked(&mut st);
         if !self.wants_frames() {
             self.stats.no_broker.fetch_add(1, Ordering::Relaxed);
             return FlipOutcome::NoBroker;
         }
-        // SAFETY: dup of a descriptor the caller keeps open for this call.
-        let kept = unsafe { libc::fcntl(dmabuf, libc::F_DUPFD_CLOEXEC, 0) };
-        st.frame = (kept >= 0).then(|| {
-            // SAFETY: `kept` is a fresh descriptor owned by nobody else.
-            (Arc::new(unsafe { OwnedFd::from_raw_fd(kept) }), *f)
-        });
+        self.present_locked(&mut st, dmabuf, f, 0)
+    }
+
+    /// Keep `fd` as the current frame and send it to every client that
+    /// wants frames.
+    fn present_locked(
+        &self,
+        st: &mut LinkState,
+        fd: RawFd,
+        f: &ScanoutFlip,
+        flags: u16,
+    ) -> FlipOutcome {
+        st.frame = Self::keep(fd).map(|k| (k, *f, flags));
         if st.parked_frame.take().is_some() {
-            self.note_parked(&st);
+            self.note_parked(st);
         }
         let mut out = FlipOutcome::NoBroker;
         for i in 0..st.clients.len() {
             if st.clients[i].wants_frames() {
-                out = out.merge(self.send_frame_locked(&mut st, i, dmabuf, f));
+                out = out.merge(self.send_frame_locked(st, i, fd, f, flags));
             }
         }
         out
+    }
+
+    /// A dup of `fd`, kept as the frame a client that attaches later is shown.
+    fn keep(fd: RawFd) -> Option<Arc<OwnedFd>> {
+        // SAFETY: dup of a descriptor the caller keeps open for this call.
+        let kept = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        // SAFETY: `kept` is a fresh descriptor owned by nobody else.
+        (kept >= 0).then(|| Arc::new(unsafe { OwnedFd::from_raw_fd(kept) }))
     }
 
     /// Present a frame that is already a dma-buf, with no GEM object behind
@@ -1496,13 +1553,9 @@ impl DisplayLink {
         };
         if !self.wants_frames() {
             let mut st = self.state.lock().unwrap();
+            self.guest_shows_locked(&mut st);
             if !self.wants_frames() {
-                // SAFETY: dup of a descriptor the caller keeps open for this call.
-                let kept = unsafe { libc::fcntl(dmabuf, libc::F_DUPFD_CLOEXEC, 0) };
-                st.frame = (kept >= 0).then(|| {
-                    // SAFETY: `kept` is a fresh descriptor owned by nobody else.
-                    (Arc::new(unsafe { OwnedFd::from_raw_fd(kept) }), f)
-                });
+                st.frame = Self::keep(dmabuf).map(|k| (k, f, 0));
                 if st.parked_frame.take().is_some() {
                     self.note_parked(&st);
                 }
@@ -1521,6 +1574,7 @@ impl DisplayLink {
         i: usize,
         dmabuf: RawFd,
         f: &ScanoutFlip,
+        flags: u16,
     ) -> FlipOutcome {
         let c = &mut st.clients[i];
         let Some(sock) = c.sock.clone() else {
@@ -1544,7 +1598,9 @@ impl DisplayLink {
             );
         }
         let fmt = (f.fourcc, f.modifier);
-        let ask = !c.queried.contains(&fmt);
+        // Shared memory is not a dma-buf format question: the broker checks
+        // it against its shm formats, not the display's modifiers.
+        let ask = flags & wire::CMD_F_SHM == 0 && !c.queried.contains(&fmt);
         if ask {
             ctl.extend_from_slice(
                 &wire::Cmd {
@@ -1586,6 +1642,7 @@ impl DisplayLink {
         frame[..wire::CMD_SIZE].copy_from_slice(
             &wire::Cmd {
                 ty: wire::CMD_ATTACH,
+                flags,
                 width: f.width,
                 height: f.height,
                 stride: f.stride,
@@ -1593,7 +1650,6 @@ impl DisplayLink {
                 fourcc: f.fourcc,
                 modifier: f.modifier,
                 seq: stamp,
-                ..Default::default()
             }
             .encode(),
         );
@@ -1630,8 +1686,8 @@ impl DisplayLink {
         if !st.clients.get(i).is_some_and(Client::wants_frames) {
             return None;
         }
-        let (fd, f) = st.frame.clone()?;
-        Some(self.send_frame_locked(st, i, fd.as_raw_fd(), &f))
+        let (fd, f, flags) = st.frame.clone()?;
+        Some(self.send_frame_locked(st, i, fd.as_raw_fd(), &f, flags))
     }
 
     /// The guest's cursor changed: `dmabuf` is the exported cursor plane
@@ -1691,8 +1747,10 @@ impl DisplayLink {
             cl.cursor_dirty = false;
             return FlipOutcome::Sent;
         };
+        // Over the boot console the guest's pointer image means nothing.
+        let console = self.console_shown.load(Ordering::Relaxed);
         let (cmd, fd) = match &cur.fd {
-            Some(fd) if cur.c.visible() => (
+            Some(fd) if cur.c.visible() && !console => (
                 wire::Cmd {
                     ty: wire::CMD_CURSOR,
                     width: cur.c.width,
@@ -1941,11 +1999,127 @@ impl DisplayLink {
     /// The guest turned the scanout off. The broker protocol has no detach;
     /// the window keeps the last frame. Forget the requested size so the next
     /// enable asks again.
+    ///
+    /// With a boot console attached, the console takes over after
+    /// [`CONSOLE_GRACE`] unless the guest flips again first.
     pub fn disable(&self) {
         let mut st = self.state.lock().unwrap();
         for c in st.clients.iter_mut() {
             c.last_size = None;
         }
+        if st.console_mode == Some(ConsoleMode::Guest) {
+            self.set_console_locked(
+                &mut st,
+                ConsoleMode::Pending(Instant::now() + CONSOLE_GRACE),
+            );
+        }
+    }
+
+    // -- The boot console (crate::console) ---------------------------------
+
+    /// Attach the boot console: it is shown from now (backend start) until
+    /// the guest's first flip.
+    pub fn attach_console(&self, sink: Arc<dyn ConsoleSink>) {
+        let mut st = self.state.lock().unwrap();
+        st.console = Some(sink);
+        self.set_console_locked(&mut st, ConsoleMode::Shown);
+    }
+
+    /// The console is shown, and gets the input.
+    #[inline]
+    pub fn console_shown(&self) -> bool {
+        self.console_shown.load(Ordering::Acquire)
+    }
+
+    /// The console's own view: promote a pending takeover that is due, and
+    /// say whether the console is shown and, if a takeover is pending, when
+    /// to ask again.
+    pub fn console_poll(&self) -> (bool, Option<Instant>) {
+        let mut st = self.state.lock().unwrap();
+        match st.console_mode {
+            Some(ConsoleMode::Pending(at)) if Instant::now() >= at => {
+                log::info!("display: the guest's scanout stayed off; boot console shown");
+                self.set_console_locked(&mut st, ConsoleMode::Shown);
+                (true, None)
+            }
+            Some(ConsoleMode::Pending(at)) => (false, Some(at)),
+            Some(ConsoleMode::Shown) => (true, None),
+            Some(ConsoleMode::Guest) | None => (false, None),
+        }
+    }
+
+    /// The guest is gone (device reset, a reboot, or its queues stopped):
+    /// the console takes over at once.
+    pub fn console_reset(&self, why: &str) {
+        let mut st = self.state.lock().unwrap();
+        if st.console_mode.is_some_and(|m| m != ConsoleMode::Shown) {
+            log::info!("display: {why}; boot console shown");
+            self.set_console_locked(&mut st, ConsoleMode::Shown);
+        }
+    }
+
+    /// Where the console stands (tests, logs).
+    pub fn console_mode(&self) -> Option<ConsoleMode> {
+        self.state.lock().unwrap().console_mode
+    }
+
+    /// A guest frame: the guest owns the picture from now.
+    fn guest_shows_locked(&self, st: &mut LinkState) {
+        if st.console_mode.is_some_and(|m| m != ConsoleMode::Guest) {
+            log::info!("display: the guest's driver is showing frames; boot console hidden");
+            self.set_console_locked(st, ConsoleMode::Guest);
+        }
+    }
+
+    fn set_console_locked(&self, st: &mut LinkState, mode: ConsoleMode) {
+        let Some(sink) = st.console.clone() else {
+            return;
+        };
+        let was = self.console_shown.load(Ordering::Relaxed);
+        let shown = mode == ConsoleMode::Shown;
+        st.console_mode = Some(mode);
+        self.console_shown.store(shown, Ordering::Release);
+        if was != shown {
+            // The guest's pointer image is hidden over the console and comes
+            // back with the guest.
+            for i in 0..st.clients.len() {
+                st.clients[i].cursor_dirty = true;
+                if st.clients[i].sock.is_some() {
+                    let _ = self.send_cursor_locked(st, i);
+                }
+            }
+        }
+        sink.wake();
+    }
+
+    /// Present one boot-console frame: `memfd` is a memfd sealed against
+    /// shrinking, linear, described by `g`, sent with
+    /// [`wire::CMD_F_SHM`]. Dropped (`NoBroker`) unless the console is shown:
+    /// checked under the lock a guest flip takes, so a console frame can
+    /// never land after the guest's first one. Kept for a client that
+    /// attaches later, as a guest frame is.
+    pub fn flip_console(&self, memfd: RawFd, g: &FrameGeometry) -> FlipOutcome {
+        let f = ScanoutFlip {
+            width: g.width,
+            height: g.height,
+            stride: g.stride,
+            offset: g.offset,
+            fourcc: g.fourcc,
+            modifier: g.modifier,
+            ..Default::default()
+        };
+        let mut st = self.state.lock().unwrap();
+        if st.console_mode != Some(ConsoleMode::Shown) {
+            return FlipOutcome::NoBroker;
+        }
+        if !self.wants_frames() {
+            st.frame = Self::keep(memfd).map(|k| (k, f, wire::CMD_F_SHM));
+            if st.parked_frame.take().is_some() {
+                self.note_parked(&st);
+            }
+            return FlipOutcome::NoBroker;
+        }
+        self.present_locked(&mut st, memfd, &f, wire::CMD_F_SHM)
     }
 
     /// Try once to connect client `i`. `Ok(false)` when it has no path.
@@ -2011,8 +2185,31 @@ impl DisplayLink {
         let mut latest_clip: Option<Vec<u8>> = None;
         // The sink took nothing last time (no guest yet): retry slowly.
         let mut clip_stalled = false;
+        // Input for the boot console while it is shown, and where input went
+        // last: on a change, what the old side holds is released there.
+        let mut to_console: Vec<InputEventEntry> = Vec::new();
+        let mut routed_console = false;
+        let console_switch = |rd: &mut Vec<Reader>,
+                              routed: &mut bool,
+                              pending: &mut Vec<InputEventEntry>,
+                              to_console: &mut Vec<InputEventEntry>| {
+            let shown = self.console_shown();
+            if shown == *routed {
+                return;
+            }
+            let old = if *routed {
+                &mut *to_console
+            } else {
+                &mut *pending
+            };
+            for r in rd.iter_mut() {
+                r.tr.release_all(old);
+            }
+            *routed = shown;
+        };
 
         while !stop.load(Ordering::Relaxed) {
+            console_switch(&mut rd, &mut routed_console, &mut pending, &mut to_console);
             // Connections that changed under us (a send broke one, a test
             // adopted one): the old one's held input is released.
             let socks = self.sockets();
@@ -2030,7 +2227,11 @@ impl DisplayLink {
                 };
                 if !same {
                     if r.seen.is_some() {
-                        r.tr.release_all(&mut pending);
+                        r.tr.release_all(if routed_console {
+                            &mut to_console
+                        } else {
+                            &mut pending
+                        });
                         if let Some(m) = policy.disconnect(i) {
                             pending_mode = Some(m);
                         }
@@ -2063,6 +2264,7 @@ impl DisplayLink {
                     }
                 }
             }
+            self.deliver_console(&mut to_console);
             self.deliver(&mut *sink, &mut pending);
             let socks = self.sockets();
             // Pick up a connection made just now on the next round.
@@ -2164,6 +2366,7 @@ impl DisplayLink {
                     continue;
                 }
                 let mut bye = false;
+                console_switch(&mut rd, &mut routed_console, &mut pending, &mut to_console);
                 let Reader {
                     tr,
                     reader,
@@ -2191,7 +2394,12 @@ impl DisplayLink {
                     if let Some(m) = policy.packet(i, &p) {
                         pending_mode = Some(m);
                     }
-                    tr.packet(&p, &mut pending);
+                    // Gamepads are the guest's whatever is shown.
+                    if routed_console && p.ty != wire::EV_PAD {
+                        tr.packet(&p, &mut to_console);
+                    } else {
+                        tr.packet(&p, &mut pending);
+                    }
                 });
                 if bye {
                     self.drop_conn(i, &sock);
@@ -2200,6 +2408,7 @@ impl DisplayLink {
             if !writable.is_empty() {
                 self.retry_frames(&writable);
             }
+            self.deliver_console(&mut to_console);
             self.deliver(&mut *sink, &mut pending);
             if let Some(m) = pending_mode
                 && sink.mode(&m)
@@ -2262,6 +2471,21 @@ impl DisplayLink {
             .iter()
             .map(|c| c.frame_owed && c.wants_frames())
             .collect()
+    }
+
+    /// Input routed to the boot console (it queues; never blocks).
+    fn deliver_console(&self, events: &mut Vec<InputEventEntry>) {
+        if events.is_empty() {
+            return;
+        }
+        let console = self.state.lock().unwrap().console.clone();
+        if let Some(c) = console {
+            c.input(events);
+            self.stats
+                .input_events
+                .fetch_add(events.len() as u64, Ordering::Relaxed);
+        }
+        events.clear();
     }
 
     fn deliver(&self, sink: &mut dyn InputSink, pending: &mut Vec<InputEventEntry>) {

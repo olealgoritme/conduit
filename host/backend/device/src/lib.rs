@@ -9,6 +9,7 @@
 pub mod caps;
 #[cfg(feature = "vhost-user")]
 pub mod chain;
+pub mod console;
 pub mod display;
 pub mod error;
 pub mod guarded;

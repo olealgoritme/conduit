@@ -819,6 +819,12 @@ pub fn selftest(allowed_dir: &Path, display_sock: Option<&Path>) -> Vec<String> 
         }
     }
 
+    // The boot console's frames: a memfd, sized, sealed and mapped shared.
+    check(
+        "make a sealed shared-memory frame (the boot console's)",
+        crate::console::ShmFrame::new(4, 4).is_ok(),
+    );
+
     // The legacy syscall numbers, which a static musl binary uses where glibc
     // uses the *at ones. This is checked here rather than left to a guest
     // probe: missing `open` cost a probe run, and it looked like a driver

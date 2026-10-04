@@ -62,7 +62,7 @@ use vhost::vhost_user::{Backend, VhostUserFrontendReqHandler};
 use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringRwLock, VringT};
 use virtio_bindings::bindings::virtio_config::{VIRTIO_F_NOTIFY_ON_EMPTY, VIRTIO_F_VERSION_1};
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use virtio_queue::QueueOwnedT;
+use virtio_queue::{QueueOwnedT, QueueT};
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend,
     GuestMemoryLoadGuard, GuestMemoryMmap, GuestMemoryRegion,
@@ -119,6 +119,16 @@ struct Args {
     #[arg(long, value_name = "on|off", default_value = "on",
           value_parser = ["on", "off"])]
     display_cursor: String,
+
+    /// The VM's emulated screen as a VNC server on this unix socket (QEMU
+    /// `-vnc unix:PATH`): the boot console. Shown in the display clients,
+    /// with the keyboard and pointer, whenever the guest's driver is not
+    /// showing frames -- firmware setup, boot menu, disk password, early
+    /// kernel output. Connected lazily and reconnected; needs --display or
+    /// --display-socket. Frames go as shared memory (a viewer with
+    /// --present-mode=auto or shm shows them).
+    #[arg(long, value_name = "PATH")]
+    console_vnc: Option<PathBuf>,
 
     /// Start even when the host driver release has no ABI tables of its own,
     /// using the nearest older release's. Expect guests to fail at their first
@@ -1403,6 +1413,24 @@ fn venus_renderer(args: &Args) -> anyhow::Result<Box<dyn conduit_venus::Renderer
     Ok(Box::new(client))
 }
 
+/// Whether the guest still drives the device, for the boot console: its
+/// event queue was running and is not any more. QEMU stops a vhost-user
+/// device's rings on a guest reset, but (for its generic vhost-user device)
+/// says nothing else until the next boot's driver starts it again -- and the
+/// firmware screen in between is what the console is for.
+fn guest_queues_probe(target: EventTarget) -> device::console::GuestProbe {
+    let mut was_ready = false;
+    Box::new(move || {
+        let Some((vring, _)) = target.lock().expect("event target").clone() else {
+            return true; // no guest queues yet: nothing to judge by
+        };
+        let ready = vring.get_ref().get_queue().ready();
+        let stopped = was_ready && !ready;
+        was_ready = ready;
+        !stopped
+    })
+}
+
 /// Like `VhostUserDaemon::serve`: a guest that quits mid-message is a normal end.
 fn disconnect_is_ok(e: vhost_user_backend::Error) -> Result<(), vhost_user_backend::Error> {
     use vhost::vhost_user::Error as VuError;
@@ -1512,6 +1540,30 @@ fn main() -> anyhow::Result<()> {
         Some((mode, link, cursor))
     } else {
         None
+    };
+
+    // The boot console: QEMU's VNC screen while the guest's driver shows
+    // nothing. Its thread, like the display's, starts after the sandbox.
+    let _console = match (&args.console_vnc, &display) {
+        (Some(path), Some((_, link, _))) => {
+            let console = device::console::Console::start(
+                link.clone(),
+                path.clone(),
+                Some(guest_queues_probe(input_target.clone())),
+            )
+            .map_err(|e| anyhow::anyhow!("console thread: {e}"))?;
+            log::info!("console: the VM's screen from {}", path.display());
+            Some(console)
+        }
+        (Some(path), None) => {
+            log::warn!(
+                "console: --console-vnc {} ignored: the device has no display (--display or \
+                 --display-socket)",
+                path.display()
+            );
+            None
+        }
+        (None, _) => None,
     };
 
     #[allow(unused_mut)]

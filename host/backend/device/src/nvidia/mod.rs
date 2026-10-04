@@ -922,6 +922,12 @@ impl NvidiaBackend {
         self.window = window;
         self.guest_ram = old.guest_ram.take();
         self.display = old.display.take();
+        // The guest's picture went with it: the boot console (if any) shows
+        // the reboot -- firmware, boot menu, disk password -- until the
+        // guest's driver flips again.
+        if let Some(link) = self.display.as_ref() {
+            link.console_reset("device reset");
+        }
         self.caps = old.caps;
         self.driver = old.driver;
         self.abi = old.abi;
