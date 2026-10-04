@@ -20,6 +20,10 @@
 - [x] GPU request tracing (`conduit trace`)
 
 ## Next
+- [ ] View and stream together: the VM keeps the highest refresh rate any
+      client needs (the stream drops frames to its own fps), and the stream
+      scales the local window's picture on the GPU instead of changing the
+      VM's resolution
 - [ ] Lower per-call latency: an ioeventfd for the GPU device's notify register
       in `conduit-vmm`, backend thread placement, a short spin in the event pump
 - [ ] Display pacing and fences: forward buffer release, drive the guest vblank
