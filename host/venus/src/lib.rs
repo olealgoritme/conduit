@@ -6,7 +6,10 @@
 
 use std::os::fd::{BorrowedFd, OwnedFd};
 
+pub mod ipc;
 pub mod mock;
+#[cfg(feature = "renderer")]
+pub mod virgl;
 
 /// `VIRTIO_GPU_CAPSET_VENUS`.
 pub const CAPSET_VENUS: u32 = 4;

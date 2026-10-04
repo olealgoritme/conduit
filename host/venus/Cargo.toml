@@ -17,3 +17,8 @@ default = []
 # The renderer process itself: links virglrenderer (Venus) and the host Vulkan
 # driver. Off by default so the backend builds without either.
 renderer = []
+
+[[bin]]
+name = "conduit-venus"
+path = "src/bin/conduit-venus.rs"
+required-features = ["renderer"]
