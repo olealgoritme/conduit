@@ -597,7 +597,7 @@ fn need_link(name: &str) -> Result<Link> {
 /// `conduit _backend NAME` (conduit-backend@NAME.service): pick the display,
 /// then become the backend, keeping systemd's listening socket (fd 3).
 pub fn backend_exec(name: &str) -> Result<()> {
-    let _link = need_link(name)?;
+    let link = need_link(name)?;
     let rt = Rt::new(name)?;
     log_to(&logs_dir(name).join("backend.log"), false)?;
     let next = std::fs::read_to_string(rt.p(NEXT_MODE)).ok();
@@ -632,6 +632,12 @@ pub fn backend_exec(name: &str) -> Result<()> {
         .arg(crate::trace::socket(name));
     if let Some(s) = &venus_sock {
         cmd.arg("--venus").arg("--venus-renderer").arg(s);
+    }
+    // The boot console (attached VMs): QEMU's VNC server, which the backend
+    // shows until the guest driver displays. QEMU opens it only after the
+    // GPU's vhost-user handshake, i.e. after this backend started.
+    if let (Some(c), Some(_)) = (&link.console, mode) {
+        cmd.arg("--console-vnc").arg(c);
     }
     if let Some(m) = mode {
         cmd.arg("--display")

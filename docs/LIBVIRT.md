@@ -53,7 +53,11 @@ matching window for a VM that is already running.
 
 System domains get the same units in `/etc/systemd/system`, with
 `SocketUser=libvirt-qemu` (or `qemu`), sockets in `/run/conduit/NAME/`, and
-`User=` you for the helpers.
+`User=` you for the helpers. The boot console's socket is the other way round
+(QEMU listens, the backend connects), so attach also installs
+`/etc/tmpfiles.d/conduit-NAME.conf`: `/run/conduit/NAME/console`, owned by
+the QEMU user, group yours, mode 2750. libvirt runs QEMU with umask 002, so the
+socket it creates there is group-writable in your group.
 
 ## The network
 
@@ -81,7 +85,8 @@ sudo. Attached VMs keep whatever network they had.
   the disk's `/boot` (refreshed after every run and before `conduit up`).
 - the raw disk (virtio, `cache=none`, `discard=unmap`), the tap, a virtio RNG,
   a serial console (virt-manager shows it; logged to `logs/vm.log`), no
-  emulated display (the screen is `conduit view`).
+  emulated display (the screen is `conduit view`; with direct kernel boot
+  there is no firmware screen to show, so no boot console either).
 - `<filesystem>` virtiofs, tag `nvidia`, on the socket above: the NVIDIA
   user-space share. libvirt's own virtiofsd launching is not used, because
   Ubuntu 24.04's virtiofsd 1.10 has no `--readonly`; `conduit _virtiofsd`
@@ -96,7 +101,25 @@ sudo. Attached VMs keep whatever network they had.
 `conduit attach` edits an existing definition instead: the same emulator,
 memfd, CPU, share, metadata and GPU (on the highest free slot of bus 0), and
 the machine type becomes the plain `q35` / `pc` alias (a versioned type such
-as `pc-q35-noble` belongs to the old QEMU). It keeps everything else. The
+as `pc-q35-noble` belongs to the old QEMU). Conduit's QEMU has VNC but no
+SPICE, OpenGL or USB redirection, so attach also changes the display side:
+
+- every `<graphics>` (SPICE, VNC on a port, ...) becomes one
+  `<graphics type='vnc' socket='SOCK'/>`: the **boot console**, which the
+  backend shows in the Conduit window until the guest driver displays (see
+  [SCANOUT.md](SCANOUT.md#boot-console)). SOCK is
+  `/run/user/UID/conduit/NAME/console.sock` (session) or
+  `/run/conduit/NAME/console/vnc.sock` (system);
+- SPICE-only devices go: `<channel>`, `<redirdev>`, `<smartcard>` (and any
+  other device) of type `spicevmc` / `spiceport`, and `<redirfilter>`;
+- `<audio type='spice'>` becomes `type='none'` (the sound card stays, silent);
+- QXL video becomes `virtio` (QXL exists only with SPICE) and
+  `<acceleration accel3d>` is dropped (no virgl). The emulated video device
+  itself stays: firmware, boot menu and disk-unlock prompt draw on it.
+- `<tpm>`, the guest agent channel, inputs and everything else are kept.
+
+virt-manager can still open the VM's console (it connects to the same
+socket); the Conduit window is the main screen. The
 definition from before the first attach is saved as
 `vms/NAME/libvirt-backup-TIME.xml`; `conduit detach` defines it again (libvirt
 may print elements in another order; the content is the same). Each step is

@@ -9,9 +9,11 @@
 //!   3. defines the edited domain in one step (`virsh define --validate`):
 //!      Conduit's QEMU as <emulator>, memfd shared memory, host-passthrough
 //!      CPU with the host's physical address width, the NVIDIA share
-//!      (virtiofs, tag "nvidia"), Conduit's metadata, and the GPU as
+//!      (virtiofs, tag "nvidia"), Conduit's metadata, the GPU as
 //!      <qemu:commandline> (libvirt has no element for a generic vhost-user
-//!      device). If libvirt refuses it, the units are removed again.
+//!      device), and the boot console: one VNC <graphics> on a Unix socket
+//!      the backend shows, in place of SPICE and its devices (Conduit's QEMU
+//!      has no SPICE). If libvirt refuses it, the units are removed again.
 //!   4. installs the guest side through the QEMU guest agent when the VM runs
 //!      one, or prints the one command to run inside it.
 //!
@@ -34,6 +36,8 @@ pub struct Wiring<'a> {
     pub emulator: &'a Path,
     pub gpu_sock: &'a Path,
     pub vfs_sock: &'a Path,
+    /// QEMU's VNC server (the boot console) listens here.
+    pub console_sock: &'a Path,
     pub vm: &'a str,
 }
 
@@ -113,6 +117,57 @@ fn previous_slot(args: &[String]) -> Option<u8> {
                 .find_map(|kv| kv.strip_prefix("addr="))
                 .and_then(|v| u8::from_str_radix(v.trim_start_matches("0x"), 16).ok())
         })
+}
+
+/// SPICE-only character devices (agent, USB redirection, smartcard, ports).
+fn is_spice_dev(e: &Element) -> bool {
+    matches!(
+        e.attributes.get("type").map(String::as_str),
+        Some("spicevmc" | "spiceport")
+    )
+}
+
+/// Make the devices runnable on Conduit's QEMU, which has VNC but no SPICE
+/// and no OpenGL: one VNC server on `console` (the boot console the backend
+/// shows), no SPICE devices, no SPICE audio, no QXL or 3D-accelerated video.
+/// The emulated video device stays: firmware and boot screens draw on it.
+fn edit_display(devices: &mut Element, console: &Path) {
+    let first = devices
+        .children
+        .iter()
+        .position(|n| matches!(n, XMLNode::Element(e) if e.name == "graphics"));
+    devices.children.retain(|n| match n {
+        XMLNode::Element(e) => e.name != "graphics" && e.name != "redirfilter" && !is_spice_dev(e),
+        _ => true,
+    });
+    let mut g = el("graphics", &[("type", "vnc")]);
+    g.attributes
+        .insert("socket".into(), console.display().to_string());
+    let at = first
+        .unwrap_or(devices.children.len())
+        .min(devices.children.len());
+    devices.children.insert(at, XMLNode::Element(g));
+    for n in devices.children.iter_mut() {
+        let XMLNode::Element(e) = n else { continue };
+        match e.name.as_str() {
+            "audio" if e.attributes.get("type").map(String::as_str) == Some("spice") => {
+                e.attributes.insert("type".into(), "none".into());
+            }
+            "video" => {
+                if let Some(m) = e.get_mut_child("model") {
+                    // virtio-gpu without virgl (no OpenGL in Conduit's QEMU).
+                    m.children
+                        .retain(|c| !matches!(c, XMLNode::Element(a) if a.name == "acceleration"));
+                    // QXL exists only with SPICE: virtio-vga, its heads kept.
+                    if m.attributes.get("type").map(String::as_str) == Some("qxl") {
+                        m.attributes.retain(|k, _| k == "heads" || k == "primary");
+                        m.attributes.insert("type".into(), "virtio".into());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Rewrite a libvirt domain XML for Conduit. Idempotent: applying it to its
@@ -215,6 +270,8 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
             .unwrap();
         let node = devices.children.remove(idx);
         devices.children.insert(0, node);
+        // Before the share is re-appended, so a new <graphics> keeps its place.
+        edit_display(devices, w.console_sock);
         devices.children.retain(|n| {
             !matches!(n, XMLNode::Element(e) if e.name == "filesystem"
                 && e.get_child("target").and_then(|t| t.attributes.get("dir")).map(String::as_str) == Some("nvidia"))
@@ -420,12 +477,14 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
     }
     let gpu = units::socket_path(&scope, name, "backend");
     let vfs = units::socket_path(&scope, name, "virtiofsd");
+    let console = units::console_path(&scope, name);
     let new_xml = edit_domain(
         &xml,
         &Wiring {
             emulator: &emu,
             gpu_sock: &gpu,
             vfs_sock: &vfs,
+            console_sock: &console,
             vm: name,
         },
     )?;
@@ -483,6 +542,7 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
         kind: Kind::Attached,
         backup: Some(backup.clone()),
         emulator: emu,
+        console: Some(console),
     }
     .save(name)?;
     virt::install_desktop_entry(name, &me);
@@ -614,6 +674,32 @@ mod tests {
   </devices>
 </domain>"#;
 
+    const CONSOLE: &str = "/run/user/1000/conduit/myvm/console.sock";
+
+    /// What virt-install / virt-manager write by default (SPICE desktop).
+    const VIRT_INSTALL: &str = r#"<domain type='kvm'>
+  <name>myvm</name>
+  <memory unit='KiB'>4194304</memory>
+  <os firmware='efi'><type arch='x86_64' machine='pc-q35-8.2'>hvm</type><boot dev='hd'/></os>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <controller type='usb' index='0' model='qemu-xhci' ports='15'/>
+    <controller type='virtio-serial' index='0'/>
+    <channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>
+    <channel type='spicevmc'><target type='virtio' name='com.redhat.spice.0'/></channel>
+    <input type='tablet' bus='usb'/>
+    <graphics type='spice' autoport='yes'><listen type='address'/><image compression='off'/><gl enable='no'/></graphics>
+    <sound model='ich9'/>
+    <audio id='1' type='spice'/>
+    <video><model type='qxl' ram='65536' vram='65536' vgamem='16384' heads='1' primary='yes'/></video>
+    <redirdev bus='usb' type='spicevmc'/>
+    <redirdev bus='usb' type='spicevmc'/>
+    <redirfilter><usbdev allow='yes'/></redirfilter>
+    <smartcard mode='passthrough' type='spicevmc'/>
+    <tpm model='tpm-crb'><backend type='emulator' version='2.0'/></tpm>
+  </devices>
+</domain>"#;
+
     fn edit(x: &str) -> String {
         edit_domain(
             x,
@@ -621,6 +707,7 @@ mod tests {
                 emulator: Path::new("/opt/conduit/bin/qemu-system-x86_64"),
                 gpu_sock: Path::new("/run/user/1000/conduit/myvm/gpu-libvirt.sock"),
                 vfs_sock: Path::new("/run/user/1000/conduit/myvm/vfs-libvirt.sock"),
+                console_sock: Path::new(CONSOLE),
                 vm: "myvm",
             },
         )
@@ -704,12 +791,73 @@ mod tests {
         assert!(root.get_child("memoryBacking").is_some());
     }
 
+    fn devices(out: &str) -> Element {
+        Element::parse(out.as_bytes())
+            .unwrap()
+            .get_child("devices")
+            .unwrap()
+            .clone()
+    }
+
+    fn all<'a>(dev: &'a Element, name: &'a str) -> Vec<&'a Element> {
+        elements(dev).filter(|e| e.name == name).collect()
+    }
+
+    #[test]
+    fn spice_becomes_the_boot_console() {
+        let out = edit(VIRT_INSTALL);
+        assert!(!out.contains("spice"), "{out}");
+        let dev = devices(&out);
+        let g = all(&dev, "graphics");
+        assert_eq!(g.len(), 1, "{out}");
+        assert_eq!(g[0].attributes["type"], "vnc");
+        assert_eq!(g[0].attributes["socket"], CONSOLE);
+        assert!(g[0].children.is_empty(), "no listen/gl children: {out}");
+        assert!(all(&dev, "redirdev").is_empty());
+        assert!(all(&dev, "redirfilter").is_empty());
+        assert!(all(&dev, "smartcard").is_empty());
+        let ch = all(&dev, "channel");
+        assert_eq!(ch.len(), 1, "the guest agent channel stays: {out}");
+        assert_eq!(ch[0].attributes["type"], "unix");
+        assert_eq!(all(&dev, "audio")[0].attributes["type"], "none");
+        assert_eq!(all(&dev, "sound").len(), 1, "the sound card stays");
+        let m = all(&dev, "video")[0].get_child("model").unwrap();
+        assert_eq!(m.attributes["type"], "virtio", "no QXL without SPICE");
+        assert_eq!(m.attributes["heads"], "1");
+        assert!(m.attributes.get("vram").is_none(), "{out}");
+        assert_eq!(all(&dev, "tpm").len(), 1, "the TPM stays");
+        assert_eq!(all(&dev, "input").len(), 1, "the tablet stays");
+        assert_eq!(edit(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn existing_vnc_moves_to_the_console_socket() {
+        let x = DOMAIN.replace(
+            "<video>",
+            "<graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'><listen type='address' address='127.0.0.1'/></graphics>\
+             <audio id='1' type='none'/>\
+             <video><model type='virtio' heads='1' primary='yes'><acceleration accel3d='yes'/></model></video><video>",
+        );
+        let out = edit(&x);
+        let dev = devices(&out);
+        let g = all(&dev, "graphics");
+        assert_eq!(g.len(), 1, "{out}");
+        assert_eq!(g[0].attributes.len(), 2, "{out}");
+        assert_eq!(g[0].attributes["socket"], CONSOLE);
+        assert!(!out.contains("127.0.0.1"), "{out}");
+        assert!(!out.contains("accel3d"), "no OpenGL: {out}");
+        assert_eq!(all(&dev, "audio")[0].attributes["type"], "none");
+        assert_eq!(all(&dev, "video").len(), 2);
+        assert_eq!(edit(&out), out);
+    }
+
     #[test]
     fn rejects_non_domain() {
         let w = Wiring {
             emulator: Path::new("/q"),
             gpu_sock: Path::new("/s"),
             vfs_sock: Path::new("/v"),
+            console_sock: Path::new("/c"),
             vm: "x",
         };
         assert!(edit_domain("<network/>", &w).is_err());

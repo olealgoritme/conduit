@@ -55,6 +55,37 @@ pub fn socket_path(scope: &Scope, vm: &str, helper: &str) -> PathBuf {
     }
 }
 
+/// Where the domain's QEMU listens with its VNC server (the boot console:
+/// firmware, boot menu, disk-unlock prompt). QEMU creates this socket and the
+/// backend connects to it (`--console-vnc`), the other way round from the
+/// helper sockets. Session: the VM's runtime folder (QEMU runs as you).
+/// System: QEMU runs as `qemu_user` and cannot create files in the
+/// root-owned `/run/conduit/VM`, so it gets a subfolder of its own (see
+/// [`console_tmpfiles`]).
+pub fn console_path(scope: &Scope, vm: &str) -> PathBuf {
+    match scope {
+        Scope::User => paths::run_dir(vm).join("console.sock"),
+        Scope::System { .. } => PathBuf::from(format!("/run/conduit/{vm}/console/vnc.sock")),
+    }
+}
+
+/// System domains: tmpfiles.d entry for the console socket's folder, owned by
+/// the QEMU user, group `group` (yours), setgid. libvirt starts QEMU with
+/// umask 002, so the socket it creates there is group-writable and in your
+/// group: the backend (running as you) can connect, nobody else can.
+pub fn console_tmpfiles(qemu_user: &str, group: &str, vm: &str) -> String {
+    format!(
+        "# Installed by `conduit attach` for VM {vm}: the boot console's VNC socket folder.\n\
+         d /run/conduit/{vm}/console 2750 {qemu_user} {group} -\n"
+    )
+}
+
+const TMPFILES_DIR: &str = "/etc/tmpfiles.d";
+
+fn tmpfiles_conf(vm: &str) -> String {
+    format!("{TMPFILES_DIR}/conduit-{vm}.conf")
+}
+
 fn short(helper: &str) -> &str {
     if helper == "backend" {
         "gpu"
@@ -292,6 +323,23 @@ pub fn install(scope: &Scope, vm: &str, conduit: &Path) -> Result<()> {
             )?;
         }
     }
+    if let Scope::System {
+        user, qemu_user, ..
+    } = scope
+    {
+        let group = sys::output("id", &["-gn", user])
+            .map(|g| g.trim().to_string())
+            .context("cannot tell your primary group")?;
+        let stage = paths::config_dir().join("staged-units");
+        std::fs::create_dir_all(&stage)?;
+        let tmp = stage.join(format!("conduit-{vm}.conf"));
+        std::fs::write(&tmp, console_tmpfiles(qemu_user, &group, vm))?;
+        let dst = tmpfiles_conf(vm);
+        sys::sudo("install", &["-D", "-m644", tmp.to_str().unwrap(), &dst])?;
+        let _ = std::fs::remove_file(tmp);
+        sys::sudo("systemd-tmpfiles", &["--create", &dst])
+            .context("could not create the boot console's socket folder")?;
+    }
     systemctl(scope, &["daemon-reload"])?;
     let socks: Vec<String> = HELPERS.iter().map(|h| unit(h, vm, "socket")).collect();
     let mut a = vec!["enable", "--now"];
@@ -312,6 +360,10 @@ pub fn remove(scope: &Scope, vm: &str) {
         rm(scope, &format!("{}.d/conduit.conf", unit(h, vm, "socket")));
     }
     let _ = systemctl(scope, &["daemon-reload"]);
+    if matches!(scope, Scope::System { .. }) {
+        let _ = sys::sudo("rm", &["-f", &tmpfiles_conf(vm)]);
+        let _ = sys::sudo("rm", &["-rf", &format!("/run/conduit/{vm}/console")]);
+    }
     // The helpers ran in the VM's slice; drop it too.
     let _ = systemctl(scope, &["stop", &scope::slice_name(vm)]);
 }
@@ -501,6 +553,26 @@ mod tests {
         assert_eq!(
             socket_path(&sys, "x", "backend"),
             PathBuf::from("/run/conduit/x/gpu.sock")
+        );
+    }
+
+    #[test]
+    fn console_socket_qemu_can_create_and_the_backend_reach() {
+        let sys = Scope::System {
+            user: "ana".into(),
+            uid: 1000,
+            home: "/home/ana".into(),
+            qemu_user: "libvirt-qemu".into(),
+        };
+        assert_eq!(
+            console_path(&sys, "x"),
+            PathBuf::from("/run/conduit/x/console/vnc.sock")
+        );
+        assert!(console_path(&Scope::User, "x").ends_with("conduit/x/console.sock"));
+        let t = console_tmpfiles("libvirt-qemu", "ana", "x");
+        assert!(
+            t.contains("d /run/conduit/x/console 2750 libvirt-qemu ana -"),
+            "{t}"
         );
     }
 
