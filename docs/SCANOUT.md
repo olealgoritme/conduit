@@ -258,6 +258,17 @@ The CLI passes `--console-vnc` only when the VM has a display (not
 `--headless`) and its `vms/NAME/libvirt.json` names the socket (VMs attached
 before this existed get it on the next `conduit attach`).
 
+## When the session ends
+
+When the last file open on the guest's DRM node closes (the display manager
+stopped, the compositor exited and nothing else holds the node), the guest
+driver turns the display off, as a driver with fbdev emulation hands it back
+to the console then: the host gets a `ScanoutDisable`. A compositor that
+exits with `DRM_IOCTL_MODE_CLOSEFB` (mutter does) otherwise leaves its last
+frame on the plane, and that framebuffer keeps the buffer's dma-buf, and with
+it `conduit_gpu`, in use with no process holding anything. The next
+compositor modesets as usual.
+
 ## Viewer (host/viewer, Wayland backend)
 
 - Whenever the guest's mode and the window differ (while the guest is

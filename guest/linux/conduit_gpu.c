@@ -18,6 +18,7 @@
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
+#include <linux/kobject.h>
 #include <linux/iosys-map.h>
 #include <linux/cpu.h>
 #include <linux/file.h>
@@ -50,6 +51,7 @@
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_ioctl.h>
+#include <drm/drm_managed.h>
 #include <drm/drm_prime.h>
 
 #include "nvgpu_compat.h"
@@ -566,6 +568,10 @@ struct nvgpu_dri_dev {
   bool registered;
   u32 index;
   struct nvgpu_device *dev;
+  /* Files open on the DRM node, counted by nvgpu_drm_open()/_postclose():
+   * the last one to close hands the display back (nvgpu_kms_lastclose()). */
+  struct mutex open_lock;
+  unsigned int open_files;
   /* sysfs drm tree under the PCI device — required by Vulkan ICD */
   struct kobject *drm_kobj;      /* .../pci_addr/drm          */
   struct kobject *drm_node_kobj; /* .../pci_addr/drm/<name>   */
@@ -650,6 +656,23 @@ static_assert(offsetof(struct nvgpu_pci_root, domain) ==
 
 struct nvgpu_device {
   /*
+   * The device's own lifetime, which is not the binding's. remove() is where
+   * the device goes away; this structure has to outlive it for as long as
+   * anything still names it: an open /dev/nvidia* (each cdev below names this
+   * as its parent, so the cdev core holds a reference until the last opener
+   * is gone) and a DRM device (a reference per drm_device, given back by a
+   * managed action once its last file and dma-buf are gone). Never added to
+   * sysfs; it is only the count. See nvgpu_dev_get() / nvgpu_dev_put().
+   */
+  struct kobject lifetime;
+  /*
+   * Set by remove() before it resets the device, under vq_lock: the control
+   * queue is going away, and every send from then on fails at once with
+   * -ENODEV instead of adding to a queue the device no longer serves.
+   */
+  bool dead;
+
+  /*
    * Where the VMM placed the window, read out of this device's own shared
    * memory region. Zero-length when the VMM offers none, in which case device
    * memory can be mapped on the host but never reached from here.
@@ -685,6 +708,9 @@ struct nvgpu_device {
   bool has_uvm;
   bool has_uvm_tools;
   bool has_modeset;
+  /* cdev_caps was added: only then may remove() delete it, since deleting
+   * a cdev gives back the reference its cdev_add() took on the device. */
+  bool has_caps_cdev;
 
   /*
    * Serialises every operation on the control queue: adding a request in
@@ -778,6 +804,36 @@ struct nvgpu_device {
   /* Host <-> guest PCI addresses of the GPUs, fixed at probe. */
   struct nvgpu_pcimap pcimap;
 };
+
+/* The last reference to the device is gone: nothing names it any more. */
+static void nvgpu_dev_release(struct kobject *kobj) {
+  kfree(container_of(kobj, struct nvgpu_device, lifetime));
+}
+
+static const struct kobj_type nvgpu_dev_ktype = {
+    .release = nvgpu_dev_release,
+};
+
+static struct nvgpu_device *nvgpu_dev_get(struct nvgpu_device *dev) {
+  kobject_get(&dev->lifetime);
+  return dev;
+}
+
+static void nvgpu_dev_put(struct nvgpu_device *dev) {
+  kobject_put(&dev->lifetime);
+}
+
+/*
+ * Before cdev_add(): the cdev holds the device until the cdev core lets go
+ * of it, which is after cdev_del() *and* after the last file opened on it is
+ * released -- later than remove() whenever a process still has it open.
+ */
+static void nvgpu_dev_cdev_init(struct nvgpu_device *dev, struct cdev *cdev,
+                                const struct file_operations *fops) {
+  cdev_init(cdev, fops);
+  cdev->owner = THIS_MODULE;
+  cdev_set_parent(cdev, &dev->lifetime);
+}
 
 /*
  * Per-open-fd state.
@@ -1605,6 +1661,8 @@ struct nvgpu_req {
   struct completion done;
   bool abandoned; /* under vq_lock */
   bool async;     /* nobody waits: nvgpu_send_async(); freed on completion */
+  /* Taken back unanswered by nvgpu_ctrl_reclaim(): the device is gone. */
+  bool failed;
   unsigned int written;
   int req_len, resp_len;
   u8 data[]; /* request, then response */
@@ -1631,6 +1689,7 @@ static int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
   init_completion(&r->done);
   r->abandoned = false;
   r->async = false;
+  r->failed = false;
   r->written = 0;
   r->req_len = req_len;
   r->resp_len = resp_len;
@@ -1640,7 +1699,9 @@ static int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
   sg_init_one(&sg_in, r->data + req_len, resp_len);
 
   spin_lock_irqsave(&dev->vq_lock, flags);
-  ret = virtqueue_add_sgs(dev->ctrl_vq, sgs, 1, 1, r, GFP_ATOMIC);
+  /* Removed: the queue is reset or about to be, and adding to it BUGs. */
+  ret = dev->dead ? -ENODEV
+                  : virtqueue_add_sgs(dev->ctrl_vq, sgs, 1, 1, r, GFP_ATOMIC);
   notify = ret == 0 && virtqueue_kick_prepare(dev->ctrl_vq);
   spin_unlock_irqrestore(&dev->vq_lock, flags);
   if (ret < 0) {
@@ -1664,6 +1725,11 @@ static int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
   }
   spin_unlock_irqrestore(&dev->vq_lock, flags);
 
+  if (r->failed) {
+    /* The device went away with this unanswered (nvgpu_ctrl_reclaim()). */
+    kfree(r);
+    return -ENODEV;
+  }
   memcpy(resp, r->data + req_len, min_t(int, r->written, resp_len));
   kfree(r);
   return 0;
@@ -1692,6 +1758,7 @@ static int nvgpu_send_async(struct nvgpu_device *dev, const void *req,
   init_completion(&r->done);
   r->abandoned = false;
   r->async = true;
+  r->failed = false;
   r->written = 0;
   r->req_len = req_len;
   r->resp_len = resp_len;
@@ -1702,7 +1769,9 @@ static int nvgpu_send_async(struct nvgpu_device *dev, const void *req,
   sg_init_one(&sg_in, r->data + req_len, resp_len);
 
   spin_lock_irqsave(&dev->vq_lock, flags);
-  ret = virtqueue_add_sgs(dev->ctrl_vq, sgs, 1, 1, r, GFP_ATOMIC);
+  /* Removed: the queue is reset or about to be, and adding to it BUGs. */
+  ret = dev->dead ? -ENODEV
+                  : virtqueue_add_sgs(dev->ctrl_vq, sgs, 1, 1, r, GFP_ATOMIC);
   notify = ret == 0 && virtqueue_kick_prepare(dev->ctrl_vq);
   spin_unlock_irqrestore(&dev->vq_lock, flags);
   if (ret < 0) {
@@ -1722,6 +1791,9 @@ static void nvgpu_ctrl_drain(struct nvgpu_device *dev) {
   struct nvgpu_req *r;
   unsigned int len;
 
+  /* Removed: what is left in the queue is nvgpu_ctrl_reclaim()'s to take. */
+  if (dev->dead)
+    return;
   while ((r = virtqueue_get_buf(dev->ctrl_vq, &len)) != NULL) {
     if (r->async) {
       /* Fire-and-forget: the reply is a bare header, and only a refusal is
@@ -1758,6 +1830,41 @@ static void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
 
   spin_lock_irqsave(&dev->vq_lock, flags);
   nvgpu_ctrl_drain(dev);
+  spin_unlock_irqrestore(&dev->vq_lock, flags);
+}
+
+/*
+ * remove(), first half, before the reset: from here on no send reaches the
+ * queue. Every sender checks `dead` under vq_lock before it adds, so once
+ * this returns nothing new is added and nothing drains -- whatever is in the
+ * queue stays there for nvgpu_ctrl_reclaim().
+ */
+static void nvgpu_ctrl_kill(struct nvgpu_device *dev) {
+  unsigned long flags;
+
+  spin_lock_irqsave(&dev->vq_lock, flags);
+  dev->dead = true;
+  spin_unlock_irqrestore(&dev->vq_lock, flags);
+}
+
+/*
+ * remove(), second half, after the reset: the device will answer nothing it
+ * still holds, so take every request back. One nobody waits for is freed; a
+ * caller still waiting is woken to -ENODEV and frees its own.
+ */
+static void nvgpu_ctrl_reclaim(struct nvgpu_device *dev) {
+  struct nvgpu_req *r;
+  unsigned long flags;
+
+  spin_lock_irqsave(&dev->vq_lock, flags);
+  while ((r = virtqueue_detach_unused_buf(dev->ctrl_vq)) != NULL) {
+    if (r->async || r->abandoned) {
+      kfree(r);
+      continue;
+    }
+    r->failed = true;
+    complete(&r->done);
+  }
   spin_unlock_irqrestore(&dev->vq_lock, flags);
 }
 
@@ -5021,6 +5128,10 @@ static const struct file_operations nvgpu_dri_fops = {
     .poll = nvgpu_poll,
 };
 
+/* Defined with the KMS head (nvgpu_kms.h). */
+static void nvgpu_kms_lastclose(struct nvgpu_dri_dev *dri,
+                                struct drm_device *drm);
+
 /*
  * The DRM side of a render node.
  *
@@ -5073,6 +5184,9 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
   nfd->handle = le32_to_cpu(resp->hdr.handle);
   nvgpu_fd_register(nfd->dev, nfd);
   file->driver_priv = nfd;
+  mutex_lock(&dri->open_lock);
+  dri->open_files++;
+  mutex_unlock(&dri->open_lock);
   kfree(req);
   kfree(resp);
   return 0;
@@ -5086,10 +5200,22 @@ err:
 
 static void nvgpu_drm_postclose(struct drm_device *drm, struct drm_file *file) {
   struct nvgpu_fd *nfd = file->driver_priv;
+  struct nvgpu_dri_dev *dri = drm->dev_private;
   struct nvgpu_msg_hdr *req, *resp;
 
   if (!nfd)
     return;
+
+  /*
+   * After the core has dropped this file's framebuffers and its mastership
+   * (postclose runs last in drm_file_free()), and under the same lock an
+   * open takes to count itself, so a file opened meanwhile either counts
+   * before the check or finds the display already off.
+   */
+  mutex_lock(&dri->open_lock);
+  if (!--dri->open_files)
+    nvgpu_kms_lastclose(dri, drm);
+  mutex_unlock(&dri->open_lock);
 
   req = kzalloc(sizeof(*req), GFP_KERNEL);
   resp = kzalloc(sizeof(*resp), GFP_KERNEL);
@@ -5148,10 +5274,18 @@ static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
   if (_IOC_TYPE(cmd) == DRM_IOCTL_BASE) {
     if (nr >= DRM_COMMAND_BASE && nr < DRM_COMMAND_END) {
       struct nvgpu_dri_dev *dri = file->minor->dev->dev_private;
+      long ret;
+      int idx;
 
       if (!dri)
         return -ENODEV;
-      return nvgpu_drm_handle_ioctl(nfd, dri, file, cmd, arg);
+      /* The core does this for its own range; this one is ours. Lets
+       * remove() wait out every call before it resets the device. */
+      if (!drm_dev_enter(file->minor->dev, &idx))
+        return -ENODEV;
+      ret = nvgpu_drm_handle_ioctl(nfd, dri, file, cmd, arg);
+      drm_dev_exit(idx);
+      return ret;
     }
 
     /*
@@ -5320,6 +5454,34 @@ static char *nvgpu_dri_devnode(const struct device *dev, umode_t *mode) {
   return kasprintf(GFP_KERNEL, "dri/%s", dev_name(dev));
 }
 
+/* A drm_device's reference on the device, given back with the drm_device. */
+static void nvgpu_drm_put_dev(struct drm_device *drm, void *dev) {
+  nvgpu_dev_put(dev);
+}
+
+/*
+ * The drm_device for one node, holding the device for as long as it lives:
+ * its files and the dma-bufs exported from it outlive remove(), and so do
+ * the GEM objects behind them, whose free path reads the device. Managed and
+ * added right after the allocation, so it runs after every later managed
+ * cleanup -- the mode config's, which frees the last framebuffers -- has.
+ */
+static struct drm_device *nvgpu_drm_alloc(struct nvgpu_dri_dev *dri, bool kms,
+                                          struct device *parent) {
+  struct drm_device *drm =
+      drm_dev_alloc(nvgpu_drm_driver_for(dri, kms), parent);
+
+  if (IS_ERR(drm))
+    return drm;
+  nvgpu_dev_get(dri->dev);
+  if (drmm_add_action_or_reset(drm, nvgpu_drm_put_dev, dri->dev)) {
+    drm_dev_put(drm);
+    return ERR_PTR(-ENOMEM);
+  }
+  drm->dev_private = dri;
+  return drm;
+}
+
 static int nvgpu_dri_init(struct nvgpu_device *dev) {
   int i;
 
@@ -5392,6 +5554,7 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
 
     dri->index = (u32)i;
     dri->dev = dev;
+    mutex_init(&dri->open_lock);
 
     /*
      * Register a real DRM device rather than a character device at the
@@ -5414,27 +5577,25 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
      */
     /* One head, on the first node, and only when the device has a display. */
     kms_drv = i == 0 && dev->has_display;
-    drm = drm_dev_alloc(nvgpu_drm_driver_for(dri, kms_drv), pci_parent);
+    drm = nvgpu_drm_alloc(dri, kms_drv, pci_parent);
     if (IS_ERR(drm)) {
       dev_warn(&dev->vdev->dev, "conduit-gpu: drm_dev_alloc %s failed: %ld\n",
                dri->name, PTR_ERR(drm));
       continue;
     }
-    drm->dev_private = dri;
 
     /* The KMS head goes on before registration: mode objects must exist by
      * the time the node is live. A failure leaves a render-only node. */
     if (kms_drv && nvgpu_kms_init(dri, drm)) {
       drm_dev_put(drm);
       dri->kms = NULL;
-      drm = drm_dev_alloc(nvgpu_drm_driver_for(dri, false), pci_parent);
+      drm = nvgpu_drm_alloc(dri, false, pci_parent);
       if (IS_ERR(drm)) {
         dev_warn(&dev->vdev->dev,
                  "conduit-gpu: drm_dev_alloc %s failed: %ld\n", dri->name,
                  PTR_ERR(drm));
         continue;
       }
-      drm->dev_private = dri;
     }
 
     if (drm_dev_register(drm, 0) != 0) {
@@ -5458,7 +5619,15 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
   return 0;
 }
 
-static void nvgpu_dri_cleanup(struct nvgpu_device *dev) {
+/*
+ * remove(), while the control queue still answers: no DRM ioctl is running
+ * once this returns, and none can start. drm_dev_unplug() waits for every
+ * one inside drm_dev_enter() (the driver range takes it in
+ * nvgpu_drm_unlocked_ioctl()) and makes the core refuse the rest. The
+ * drm_device itself lives on while a file or a dma-buf holds it, and its GEM
+ * objects with it; their free paths then find the queue dead.
+ */
+static void nvgpu_dri_unplug(struct nvgpu_device *dev) {
   int i;
 
   for (i = 0; i < dev->num_dri_devs; i++) {
@@ -5469,14 +5638,16 @@ static void nvgpu_dri_cleanup(struct nvgpu_device *dev) {
 
     /* The core owns the node and everything under it, including the sysfs
      * tree this used to build by hand. */
-    drm_dev_unregister(dri->drm);
+    drm_dev_unplug(dri->drm);
     if (dri->kms)
       nvgpu_kms_fini(dri);
     drm_dev_put(dri->drm);
     dri->drm = NULL;
     dri->registered = false;
   }
+}
 
+static void nvgpu_dri_cleanup(struct nvgpu_device *dev) {
   if (nvgpu_dri_class) {
     class_destroy(nvgpu_dri_class);
     nvgpu_dri_class = NULL;
@@ -6221,8 +6392,8 @@ static char *nvgpu_caps_devnode(const struct device *dev, umode_t *mode) {
 
 /* ───────── Probe / remove ───────── */
 
-static int nvgpu_probe(struct virtio_device *vdev) {
-  struct nvgpu_device *dev;
+static int nvgpu_probe_dev(struct virtio_device *vdev,
+                           struct nvgpu_device *dev) {
   struct virtqueue_info vqs_info[] = {
       {"control", nvgpu_ctrl_vq_cb},
       {"event", nvgpu_event_vq_cb},
@@ -6230,10 +6401,6 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   struct virtqueue *vqs[2];
   dev_t gpu_devno;
   int ret, i;
-
-  dev = devm_kzalloc(&vdev->dev, sizeof(*dev), GFP_KERNEL);
-  if (!dev)
-    return -ENOMEM;
 
   dev->vdev = vdev;
   vdev->priv = dev;
@@ -6377,8 +6544,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
     goto err_class;
 
   for (i = 0; i < (int)dev->num_gpus; i++) {
-    cdev_init(&dev->cdev_gpu[i], &nvgpu_gpu_fops);
-    dev->cdev_gpu[i].owner = THIS_MODULE;
+    nvgpu_dev_cdev_init(dev, &dev->cdev_gpu[i], &nvgpu_gpu_fops);
     ret = cdev_add(&dev->cdev_gpu[i], MKDEV(NV_MAJOR, i), 1);
     if (ret)
       goto err_gpu_cdevs;
@@ -6391,8 +6557,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   if (ret)
     goto err_gpu_cdevs;
 
-  cdev_init(&dev->cdev_ctl, &nvgpu_ctl_fops);
-  dev->cdev_ctl.owner = THIS_MODULE;
+  nvgpu_dev_cdev_init(dev, &dev->cdev_ctl, &nvgpu_ctl_fops);
   ret = cdev_add(&dev->cdev_ctl, MKDEV(NV_MAJOR, NV_CTL_MINOR), 1);
   if (ret)
     goto err_ctl_region;
@@ -6412,8 +6577,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
     if (ret)
       goto err_ctl_cdev;
 
-    cdev_init(&dev->cdev_uvm, &nvgpu_uvm_fops);
-    dev->cdev_uvm.owner = THIS_MODULE;
+    nvgpu_dev_cdev_init(dev, &dev->cdev_uvm, &nvgpu_uvm_fops);
     ret = cdev_add(&dev->cdev_uvm, dev->uvm_devno, 1);
     if (ret)
       goto err_uvm_region;
@@ -6434,8 +6598,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
     if (ret)
       goto err_uvm_region;
 
-    cdev_init(&dev->cdev_modeset, &nvgpu_modeset_fops);
-    dev->cdev_modeset.owner = THIS_MODULE;
+    nvgpu_dev_cdev_init(dev, &dev->cdev_modeset, &nvgpu_modeset_fops);
     ret = cdev_add(&dev->cdev_modeset, dev->modeset_devno, 1);
     if (ret)
       goto err_gpu_modeset;
@@ -6460,9 +6623,9 @@ static int nvgpu_probe(struct virtio_device *vdev) {
     if (!IS_ERR(nvgpu_caps_class)) {
       nvgpu_caps_class->devnode = nvgpu_caps_devnode;
 
-      cdev_init(&dev->cdev_caps, &nvgpu_caps_fops);
-      dev->cdev_caps.owner = THIS_MODULE;
+      nvgpu_dev_cdev_init(dev, &dev->cdev_caps, &nvgpu_caps_fops);
       if (cdev_add(&dev->cdev_caps, MKDEV(NV_CAPS_MAJOR, 1), 2) == 0) {
+        dev->has_caps_cdev = true;
         device_create(nvgpu_caps_class, &vdev->dev, MKDEV(NV_CAPS_MAJOR, 1),
                       NULL, "nvidia-cap1");
         device_create(nvgpu_caps_class, &vdev->dev, MKDEV(NV_CAPS_MAJOR, 2),
@@ -6554,6 +6717,35 @@ err_class:
   return ret;
 }
 
+/*
+ * Not device-managed: the structure outlives the binding whenever a file or a
+ * DRM device still names it (see `lifetime`), so remove() drops the probe's
+ * reference rather than freeing it.
+ */
+static int nvgpu_probe(struct virtio_device *vdev) {
+  struct nvgpu_device *dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+  int ret;
+
+  if (!dev)
+    return -ENOMEM;
+  kobject_init(&dev->lifetime, &nvgpu_dev_ktype);
+  ret = nvgpu_probe_dev(vdev, dev);
+  if (ret) {
+    /* The queues, if they were found: nothing is waiting on them now, and
+     * no interrupt may arrive for a device whose state is freed. */
+    if (dev->ctrl_vq) {
+      nvgpu_ctrl_kill(dev);
+      vdev->config->reset(vdev);
+      nvgpu_ctrl_reclaim(dev);
+      vdev->config->del_vqs(vdev);
+    }
+    kfree(dev->event_bufs);
+    vdev->priv = NULL;
+    nvgpu_dev_put(dev);
+  }
+  return ret;
+}
+
 static void nvgpu_remove(struct virtio_device *vdev) {
   struct nvgpu_device *dev = vdev->priv;
   int i;
@@ -6562,9 +6754,22 @@ static void nvgpu_remove(struct virtio_device *vdev) {
    * and no input event may land on a device being unregistered. */
   nvgpu_clip_detach(dev);
   nvgpu_display_quiesce(dev);
-  /* While the control queue still answers: a work item mid-message ends. */
+  /* While the control queue still answers: a work item mid-message ends,
+   * and a DRM ioctl waiting on a fence is released before the unplug waits
+   * for it. */
   nvgpu_fence_dom_kill(dev);
+  /* While the control queue still answers: DRM calls in flight finish, and
+   * the objects freed now still reach the host. */
+  nvgpu_dri_unplug(dev);
+  /*
+   * From here every send fails with -ENODEV, never touching the queue: a
+   * GEM object kept by a dma-buf, a file still open on /dev/nvidia*, all of
+   * them free into a device that is gone. Then the reset, and what the
+   * device was still holding comes back unanswered.
+   */
+  nvgpu_ctrl_kill(dev);
   vdev->config->reset(vdev);
+  nvgpu_ctrl_reclaim(dev);
   /* After the reset: the queue is quiet, so the buffers cannot be in use. */
   nvgpu_clip_fini(dev);
   kfree(dev->event_bufs);
@@ -6602,7 +6807,8 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   if (nvgpu_caps_class) {
     device_destroy(nvgpu_caps_class, MKDEV(NV_CAPS_MAJOR, 1));
     device_destroy(nvgpu_caps_class, MKDEV(NV_CAPS_MAJOR, 2));
-    cdev_del(&dev->cdev_caps);
+    if (dev->has_caps_cdev)
+      cdev_del(&dev->cdev_caps);
     unregister_chrdev_region(MKDEV(NV_CAPS_MAJOR, 1), 2);
     class_destroy(nvgpu_caps_class);
     nvgpu_caps_class = NULL;
@@ -6614,8 +6820,12 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   }
 
   vdev->config->del_vqs(vdev);
+  dev->ctrl_vq = NULL;
+  dev->event_vq = NULL;
 
   remove_proc_subtree("driver/nvidia", NULL);
+  /* The probe's reference. Open files and DRM devices hold their own. */
+  nvgpu_dev_put(dev);
 }
 
 /* ───────── Module boilerplate ───────── */
