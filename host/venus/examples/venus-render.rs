@@ -682,6 +682,17 @@ fn main() {
                 Some(p) => {
                     let bad = verify("dma-buf mapping", p, d.offset as u64, d.stride as u64);
                     pass &= bad == 0;
+                    // VENUS_DUMP=FILE: the dma-buf's pixels as raw BGRA rows, to look at.
+                    if let Some(out) = std::env::var_os("VENUS_DUMP") {
+                        let mut raw = Vec::with_capacity((W * H * 4) as usize);
+                        for y in 0..H as u64 {
+                            let row = (d.offset as u64 + y * d.stride as u64) as usize;
+                            // SAFETY: inside the mapping, as for verify.
+                            raw.extend_from_slice(unsafe { std::slice::from_raw_parts(p.add(row), W as usize * 4) });
+                        }
+                        std::fs::write(&out, raw).expect("VENUS_DUMP");
+                        println!("dumped {W}x{H} BGRA to {}", out.to_string_lossy());
+                    }
                     // SAFETY: the mapping made above.
                     unsafe { libc::munmap(p.cast(), size as usize) };
                 }
