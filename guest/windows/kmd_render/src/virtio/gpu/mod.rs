@@ -285,8 +285,10 @@ struct ContextSlot {
 // ── C3/M3.4 async submission machinery ───────────────────────────────────────
 
 /// Max in-flight control-queue entries. Tokens are descriptor-chain heads, so
-/// they are always `< CTRL_QUEUE_SIZE`; each chain uses ≥ 2 descriptors, which
-/// caps real concurrency at half this.
+/// they are always `< CTRL_QUEUE_SIZE`; each chain uses 4 descriptors (the
+/// request and response `MsgHeader`s plus the command and its response) or 5
+/// for a Venus submit (the stream rides its own), which caps real concurrency
+/// at about a quarter of this.
 pub const MAX_INFLIGHT: usize = CTRL_QUEUE_SIZE;
 /// Parked (completed, awaiting PASSIVE free) entry capacity. Enqueues are
 /// refused once `parked` crosses [`PARKED_ENQUEUE_GATE`], and one drain can
@@ -296,7 +298,9 @@ pub const MAX_PARKED: usize = 4 * MAX_INFLIGHT;
 /// and total bytes are all bounded: a rare large Venus CS must never pin a
 /// correspondingly large physically-contiguous allocation for device lifetime.
 const MAX_DMA_POOL: usize = 128;
-const MAX_DMA_POOL_BUFFER_BYTES: usize = 64 * 1024;
+/// 64 KiB of payload plus the page `DmaBuffer`'s 32-byte wire tail can add to
+/// the page-rounded capacity, so a 60-64 KiB command buffer stays poolable.
+const MAX_DMA_POOL_BUFFER_BYTES: usize = 64 * 1024 + 4096;
 const MAX_DMA_POOL_BYTES: usize = 2 * 1024 * 1024;
 /// Enqueue refusal threshold for the parked table (forces the PASSIVE caller
 /// to reap before submitting more).
@@ -4367,8 +4371,10 @@ impl VirtioGpu {
             // entry stays whole for the park below.
             let scanout_flush = take_scanout_flush_token(&mut entry.kind);
             let resp_base = {
-                // SAFETY: the resp span is within the entry-owned meta buffer.
-                unsafe { resp[1].as_slice() }.as_ptr()
+                // SAFETY: the resp span is within the entry-owned meta buffer,
+                // which the device wrote and nothing else aliases now. A mutable
+                // slice so the error write below has write provenance.
+                unsafe { resp[1].as_mut_slice() }.as_mut_ptr()
             };
             // A transport-level refusal (`MsgHeader.status < 0`, malformed
             // message) carries no virtio-gpu response; make the body read as
