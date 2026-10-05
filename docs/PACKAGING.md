@@ -31,11 +31,17 @@ docs/VENUS.md), is packaged in `/opt/conduit/bin` with its own virglrenderer
 `/opt/conduit/lib/libvirglrenderer.so.1`, found through a RUNPATH of
 `$ORIGIN/../lib` (`packaging/build.sh venus`; `build-virglrenderer.sh`
 applies `host/venus/patches/` to the pinned submodule first). The packaged
-backend is built with its `venus` feature. A stage without `build.sh venus`
-still packages, with a warning, and `--venus` does not work from that
-install. The release workflow, the RPM spec, the PKGBUILD and the flake do
-not run that step yet, so release packages ship without `conduit-venus`
-(and the flake's backend has no `venus` feature).
+backend is built with its `venus` feature. The release workflow, the RPM
+spec, the PKGBUILD, the flake and `make package` all build it, so `--venus`
+works from every install. It needs the two submodules
+`host/venus/third_party/{virglrenderer,venus-protocol}` (the release
+workflow checks out only those two; the RPM spec fetches them as Source1/2
+and the PKGBUILD and flake as git sources, at the pinned commits, which CI
+checks against the submodules). virglrenderer `dlopen()`s the host's Vulkan
+loader (`libvulkan.so.1`), so the packages depend on it explicitly
+(`libvulkan1`, `libvulkan.so.1()(64bit)`, `vulkan-icd-loader`) and the
+tarball never bundles it. A stage without `build.sh venus` still packages,
+with a warning, and `--venus` does not work from that install.
 
 The guest package installs `/usr/src/conduit-guest-<version>/` (module source
 plus `dkms.conf`); DKMS builds `conduit_gpu.ko` into
@@ -94,7 +100,9 @@ Runtime dependencies of the .deb/.rpm/Arch packages are not hand-written:
 `build.sh` reads the `NEEDED` libraries of the staged viewer and QEMU and maps
 them to Debian/Arch package names (`dpkg -S`, `pacman -Qo`) or RPM soname
 requirements (`libfoo.so.1()(64bit)`, which work on Fedora and openSUSE
-alike). That is why each format is built in its own distribution's container.
+alike), plus the Vulkan loader, which virglrenderer `dlopen()`s, when
+`conduit-venus` is staged. That is why each format is built in its own
+distribution's container.
 
 ## Contracts with the components
 
@@ -212,8 +220,11 @@ and the QEMU tarball.
 
 `flake.nix` exposes `packages.default` (a prefix mirroring `/opt/conduit`,
 with `conduit` wrapped to `CONDUIT_PREFIX=$out`), `apps.default`, the
-individual components (not `conduit-stream` yet, so `conduit stream` does not
-work from the flake), `packages.conduit-guest` (module for
+individual components (the backend with `vhost-user,venus`, like
+`build.sh`; `venus` is `conduit-venus` with `virglrenderer`, built from the
+pinned virglrenderer and venus-protocol revisions with `host/venus/patches/`,
+the loader's path on virglrenderer's RUNPATH for its `dlopen()` of
+`libvulkan.so.1`), `packages.conduit-guest` (module for
 `linuxPackages_latest`) and `nixosModules.guest`. It uses nixpkgs' Rust and
 QEMU expression (switched to the 11.1.2 tarball when nixpkgs is older, plus
 `host/qemu/patches/`). Commit `flake.lock` after the first `nix flake lock`.
@@ -222,9 +233,9 @@ QEMU expression (switched to the 11.1.2 tarball when nixpkgs is older, plus
 
 | Workflow | When | What |
 |---|---|---|
-| `ci.yml` | push, PR, manual | fmt/clippy/test per Rust project (backend, VMM, `host/venus` without its `renderer` feature, CLI, stream host; GPU tests skipped by name), guest module vs Ubuntu 24.04 (GA and HWE), Debian 13 and Fedora headers plus its plain-C unit tests, viewer `make check`, guest agent unit tests, actionlint, shellcheck, DKMS package build |
+| `ci.yml` | push, PR, manual | fmt/clippy/test per Rust project (backend, VMM, `host/venus` without its `renderer` feature, CLI, stream host; GPU tests skipped by name), guest module vs Ubuntu 24.04 (GA and HWE), Debian 13 and Fedora headers plus its plain-C unit tests, viewer `make check`, guest agent unit tests, actionlint, shellcheck, venus submodule pins in `flake.nix` and the RPM spec, DKMS package build |
 | `abi.yml` | Mondays, manual | new open-gpu-kernel-modules tags / gVisor nvproxy ABIs -> `.github/scripts/abi_update.py` runs the `host/backend/gen` generators -> tests -> PR on `abi/auto` (draft if tests fail). Set secret `ABI_BOT_TOKEN` so CI runs on its PRs. |
-| `release.yml` | tag `v*`, manual | static musl Rust binaries once; deb/rpm/Arch/tarball in their own containers with QEMU cached per week; guest .deb/.rpm/.pkg.tar.zst; checksums, PKGBUILD, GitHub Release (tags only) |
+| `release.yml` | tag `v*`, manual | static musl Rust binaries once; deb/rpm/Arch/tarball in their own containers (viewer, stream host, `conduit-venus` from the venus submodules) with QEMU cached per week; guest .deb/.rpm/.pkg.tar.zst; checksums, PKGBUILD, GitHub Release (tags only) |
 | `windows.yml` | manual only (hours on Windows runners) | the Windows guest stack from `guest/windows` (WDDM driver, D3D11/12 UMDs, Mesa Venus ICD, loaders, installer); the package per configuration as an artifact, not attached to releases. The driver alone also builds in a local Windows VM (`guest/windows/ci/vm/README.md`) |
 
 ## Repository hygiene

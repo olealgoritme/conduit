@@ -13,7 +13,7 @@
 #
 # Needs: meson, ninja, a C compiler, pkg-config, python3 with mako and yaml,
 # libdrm headers, Vulkan headers (`sudo packaging/build.sh deps` installs them).
-# No root.
+# No root. JOBS limits ninja's parallel jobs.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -48,7 +48,7 @@ meson setup --reconfigure "$build/venus-protocol" "$tp/venus-protocol" \
     --prefix "$prefix" -Dwerror=false 2>/dev/null ||
     meson setup "$build/venus-protocol" "$tp/venus-protocol" \
         --prefix "$prefix" -Dwerror=false
-ninja -C "$build/venus-protocol" install
+ninja -C "$build/venus-protocol" ${JOBS:+-j"$JOBS"} install
 
 export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/share/pkgconfig:$prefix/lib/x86_64-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
@@ -77,7 +77,7 @@ for p in "$here"/patches/*.patch; do
 done
 meson setup --reconfigure "$build/virglrenderer" "$tp/virglrenderer" "${opts[@]}" 2>/dev/null ||
     meson setup "$build/virglrenderer" "$tp/virglrenderer" "${opts[@]}"
-ninja -C "$build/virglrenderer" install
+ninja -C "$build/virglrenderer" ${JOBS:+-j"$JOBS"} install
 
 echo
 echo "built. for cargo:"

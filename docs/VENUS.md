@@ -246,8 +246,8 @@ backend unit) starts it before the backend, on `venus.sock` in the VM's run
 directory, logging to `logs/venus.log`; it serves that one backend and exits
 when it hangs up. `packaging/build.sh venus` builds it for the packages, as
 `/opt/conduit/bin/conduit-venus` with its virglrenderer in `/opt/conduit/lib`
-([PACKAGING.md](PACKAGING.md)); the release workflow, the RPM spec and the
-PKGBUILD do not run that step yet, so release packages come without it. In a
+([PACKAGING.md](PACKAGING.md)); the release workflow, the RPM spec, the
+PKGBUILD and the flake all build it, so every release install has it. In a
 checkout: `host/venus/build-virglrenderer.sh` (which applies
 `host/venus/patches`), then `cargo build --release --features renderer` in
 `host/venus` (`CONDUIT_VENUS=PATH` points the CLI at it).

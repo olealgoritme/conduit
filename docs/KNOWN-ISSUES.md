@@ -43,10 +43,9 @@ Current limitations, with the intended fix for each. Planned work is in
 
 Experimental, behind `--venus` ([WINDOWS.md](WINDOWS.md), [VENUS.md](VENUS.md)).
 
-- Release packages have a backend with the `venus` feature but no
-  `conduit-venus`: `packaging/build.sh venus` packages it, but the release
-  workflow, the RPM spec and the PKGBUILD do not run it yet. `make` builds
-  the backend without the feature. Build both by hand ([VENUS.md](VENUS.md)).
+- `make` builds the backend without the `venus` feature; the packages have
+  it and `conduit-venus`. From a checkout, build both by hand
+  ([VENUS.md](VENUS.md)).
 - `conduit attach` knows only Linux guests: run it with `--guest-later` for a
   Windows VM and install the driver by hand ([WINDOWS.md](WINDOWS.md)). It
   adds no Hyper-V enlightenments, which steady a Windows guest's frame pacing;

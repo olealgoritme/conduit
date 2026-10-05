@@ -10,10 +10,10 @@ limits listed in [KNOWN-ISSUES.md](KNOWN-ISSUES.md#windows-guests-venus).
 
 ## Host
 
-- A backend built with the `venus` feature and `conduit-venus`. Packages built
-  with `packaging/build.sh venus` have both; the release workflow does not run
-  that step yet, so build them from a checkout as [VENUS.md](VENUS.md)
-  describes and point `CONDUIT_BACKEND` / `CONDUIT_VENUS` at them.
+- A backend built with the `venus` feature and `conduit-venus`. The release
+  packages (and the flake) have both; from a checkout, build them as
+  [VENUS.md](VENUS.md) describes and point `CONDUIT_BACKEND` /
+  `CONDUIT_VENUS` at them.
 - QEMU (the bundled one); `--vmm builtin` has no region 3.
 
 ## The VM

@@ -34,9 +34,8 @@
 - [ ] Windows guests through Venus (in progress, experimental `--venus`):
       Helios's guest drivers over Conduit's device ([WINDOWS.md](WINDOWS.md),
       [VENUS.md](VENUS.md)); runs in a Windows 11 guest.
-      Left: `conduit-venus` in the release packages (`build.sh venus` exists,
-      release.yml does not run it), Windows guests in `conduit attach`
-      (driver install, Hyper-V enlightenments)
+      Left: Windows guests in `conduit attach` (driver install, Hyper-V
+      enlightenments)
 - [ ] Audio in the stream (Opus from the VM's sound card)
 - [ ] GPU hot-plug (`device_del` / `device_add`), so a VM can be snapshotted,
       saved and migrated with the GPU unplugged

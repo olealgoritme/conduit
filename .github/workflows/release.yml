@@ -3,9 +3,11 @@
 #
 #   rust-static  backend, VMM and CLI as static musl binaries, built once and
 #                shared by every package (they have no runtime dependencies)
-#   host         per-format container: viewer + bundled QEMU 11.1 (cached),
-#                staged and packaged with nfpm (deb/rpm/Arch) or as a tarball
-#                with its libraries bundled (Debian 12, the oldest glibc we build on)
+#   host         per-format container: viewer, stream host, Venus renderer
+#                (conduit-venus + its virglrenderer, from the host/venus
+#                submodules) and bundled QEMU 11.1 (cached), staged and
+#                packaged with nfpm (deb/rpm/Arch) or as a tarball with its
+#                libraries bundled (Debian 12, the oldest glibc we build on)
 #   guest        conduit-guest DKMS source packages (.deb, .rpm, Arch)
 #   release      checksums, AUR PKGBUILD, GitHub Release
 #
@@ -79,6 +81,11 @@ jobs:
       - uses: actions/checkout@v5
       - name: Mark the workspace safe for git (container runs as root)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # Only the two submodules `build.sh venus` builds (virglrenderer, with
+      # host/venus/patches applied, and venus-protocol); the Windows guest's
+      # (Mesa, DXVK, vkd3d-proton) are not needed for the host packages.
+      - name: Venus submodules
+        run: git submodule update --init host/venus/third_party/virglrenderer host/venus/third_party/venus-protocol
 
       - name: Build dependencies
         run: packaging/build.sh deps
@@ -118,6 +125,11 @@ jobs:
 
       - name: Build stream host
         run: packaging/build.sh stream
+
+      # conduit-venus (`--venus`, Windows guests) links the distro's glibc and
+      # Vulkan loader, so it is built here too, with its own virglrenderer.
+      - name: Build Venus renderer
+        run: packaging/build.sh venus
 
       # Before Stage: stage builds the guest packages (deb, rpm, Arch) that
       # attach ships, and skips them without nfpm.

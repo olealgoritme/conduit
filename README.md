@@ -28,9 +28,8 @@ from GPU memory to your screen: no copying, no video compression.
 | NVK (Mesa's open Vulkan driver) on NVIDIA's kernel driver, in a Linux VM | experimental, opt-in (`NVK_RM=1`: [guest/nvk-rm](guest/nvk-rm/README.md), [librmclient](guest/rmclient/README.md)) |
 
 > Conduit is early software, tested mainly on an RTX 5090 with Ubuntu 24.04
-> and Hyprland. Expect rough edges. Windows guests are experimental: the
-> release packages do not include the Venus renderer yet, and the guest
-> driver is test-signed ([docs/WINDOWS.md](docs/WINDOWS.md),
+> and Hyprland. Expect rough edges. Windows guests are experimental (`--venus`),
+> and the guest driver is test-signed ([docs/WINDOWS.md](docs/WINDOWS.md),
 > [Roadmap](docs/ROADMAP.md)).
 
 ## What you need

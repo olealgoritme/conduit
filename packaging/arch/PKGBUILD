@@ -11,17 +11,28 @@ pkgrel=1
 pkgdesc="Share your NVIDIA GPU with a virtual machine and see its desktop on yours"
 arch=(x86_64)
 url="https://github.com/olealgoritme/conduit"
-license=('Apache-2.0' 'BSD-3-Clause' 'GPL-2.0-only')
+license=('Apache-2.0' 'BSD-3-Clause' 'GPL-2.0-only' 'MIT')
 makedepends=(git rustup base-devel python ninja meson flex bison file
              wayland wayland-protocols libxcb mesa openssl
              glib2 pixman libslirp libseccomp libcap-ng zstd libaio dtc
-             libpulse pipewire)
+             libpulse pipewire
+             vulkan-headers vulkan-icd-loader libdrm python-mako python-yaml)
 options=(!lto !debug)
-source=("$pkgbase::git+$url.git#tag=v$pkgver")
-sha256sums=('SKIP')
+# The two submodules conduit-venus is built from (packaging/build.sh venus);
+# prepare() points the checkout's submodules at these clones.
+source=("$pkgbase::git+$url.git#tag=v$pkgver"
+        "virglrenderer::git+https://gitlab.freedesktop.org/virgl/virglrenderer.git"
+        "venus-protocol::git+https://github.com/winboat-org/venus-protocol.git")
+sha256sums=('SKIP' 'SKIP' 'SKIP')
 
 prepare() {
   cd "$pkgbase"
+  local sub
+  for sub in virglrenderer venus-protocol; do
+    git submodule init "host/venus/third_party/$sub"
+    git config "submodule.host/venus/third_party/$sub.url" "$srcdir/$sub"
+    git -c protocol.file.allow=always submodule update "host/venus/third_party/$sub"
+  done
   # rust-toolchain.toml pins the compiler; rustup fetches it here, before
   # build(), so a network-less build() still works.
   cargo --version
@@ -33,12 +44,13 @@ build() {
   packaging/build.sh rust
   packaging/build.sh viewer
   packaging/build.sh stream
+  packaging/build.sh venus
   packaging/build.sh qemu
 }
 
 package_conduit() {
   depends=(glibc gcc-libs wayland libxcb glib2 pixman libslirp libseccomp
-           libcap-ng zstd libaio dtc)
+           libcap-ng zstd libaio dtc vulkan-icd-loader)
   optdepends=('libvirt: virt-manager/virsh integration (conduit attach)')
   backup=(etc/apparmor.d/abstractions/conduit)
   install=conduit.install

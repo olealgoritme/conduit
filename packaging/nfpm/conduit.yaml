@@ -14,15 +14,16 @@ maintainer: "Ole Algoritme <olealgoritme@gmail.com>"
 description: |
   Share your NVIDIA GPU with a virtual machine and see its desktop on yours.
   Host side of Conduit: the GPU backend, the zero-copy Wayland viewer, a
-  small built-in VM runner and a bundled QEMU 11.1, all in /opt/conduit, plus
-  the `conduit` command. System QEMU and libvirt are never replaced.
+  small built-in VM runner, the Venus renderer for Windows guests and a
+  bundled QEMU 11.1, all in /opt/conduit, plus the `conduit` command. System
+  QEMU and libvirt are never replaced.
 vendor: Conduit
 homepage: https://github.com/olealgoritme/conduit
-license: Apache-2.0 AND BSD-3-Clause AND GPL-2.0-only
+license: Apache-2.0 AND BSD-3-Clause AND GPL-2.0-only AND MIT
 
-# Shared-library dependencies of the viewer and the bundled QEMU, detected at
-# build time (Debian/Arch package names, RPM sonames). The Rust binaries are
-# static and need nothing.
+# Shared-library dependencies of the viewer, stream host, Venus renderer and
+# the bundled QEMU, detected at build time (Debian/Arch package names, RPM
+# sonames). The static Rust binaries need nothing.
 depends: ["@DEPENDS@"]
 
 contents:

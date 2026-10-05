@@ -201,14 +201,17 @@ cmd_viewer() {
 # a RUNPATH of $ORIGIN/../lib.
 cmd_venus() {
     log "venus (conduit-venus, virglrenderer)"
-    "$ROOT/host/venus/build-virglrenderer.sh"
+    JOBS="$JOBS" "$ROOT/host/venus/build-virglrenderer.sh"
     (cd "$ROOT/host/venus" && CONDUIT_VENUS_RPATH='$ORIGIN/../lib' \
         cargo build --locked --release --features renderer --bin conduit-venus)
-    rm -rf "$DIST/venus"; install -d "$DIST/venus/bin" "$DIST/venus/lib"
+    rm -rf "$DIST/venus"; install -d "$DIST/venus/bin" "$DIST/venus/lib" "$DIST/venus/doc"
     install -m0755 "$(target_dir "$ROOT/host/venus")/release/conduit-venus" \
         "$DIST/venus/bin/conduit-venus"
     install -m0644 "$(readlink -f "$ROOT/host/venus/third_party/build/install/lib/libvirglrenderer.so.1")" \
         "$DIST/venus/lib/libvirglrenderer.so.1"
+    # virglrenderer is MIT: its license travels with the library.
+    install -m0644 "$ROOT/host/venus/third_party/virglrenderer/COPYING" \
+        "$DIST/venus/doc/virglrenderer_COPYING"
 }
 
 # -------------------------------------------------------------- stream -----
@@ -241,7 +244,8 @@ cmd_qemu() {
 
 # --------------------------------------------------------------- stage -----
 # Lays out the complete install tree under $STAGE, as it will be on disk:
-#   /opt/conduit/bin/{conduit,conduit-backend,conduit-userspace,conduit-viewer,conduit-vmm,qemu-system-x86_64}
+#   /opt/conduit/bin/{conduit,conduit-backend,conduit-userspace,conduit-viewer,conduit-vmm,conduit-stream,conduit-venus,qemu-system-x86_64}
+#   /opt/conduit/lib/libvirglrenderer.so.1 (conduit-venus's)
 #   /opt/conduit/share/conduit/supported-drivers.txt
 #   /opt/conduit/share/conduit/guest/conduit-guest.deb (what `conduit create` installs in VMs)
 #   /opt/conduit/share/conduit/guest/conduit-guest.pkg.tar.zst (`conduit attach` on Arch guests)
@@ -273,6 +277,7 @@ cmd_stage() {
         install -d "$o/lib"
         install -m0755 "$DIST/venus/bin/conduit-venus" "$o/bin/conduit-venus"
         install -m0644 "$DIST/venus/lib/libvirglrenderer.so.1" "$o/lib/libvirglrenderer.so.1"
+        install -m0644 "$DIST/venus/doc/virglrenderer_COPYING" "$o/share/doc/conduit/virglrenderer_COPYING"
     else
         log "warning: no conduit-venus (run: build.sh venus); \`--venus\` (Windows guests) will not work from this install"
     fi
@@ -332,10 +337,12 @@ cmd_stage() {
 }
 
 # --------------------------------------------------------- bundle-libs -----
-# For the distro-independent tarball: copy every shared library the viewer and
-# QEMU need, except the glibc family and driver-bound GPU libraries, into
-# /opt/conduit/lib and point each ELF's RUNPATH there. Built on an old glibc
-# (Debian 12) so the result runs on anything newer.
+# For the distro-independent tarball: copy every shared library the viewer,
+# stream host, conduit-venus and QEMU need, except the glibc family and
+# driver-bound GPU libraries, into /opt/conduit/lib and point each ELF's
+# RUNPATH there. Built on an old glibc (Debian 12) so the result runs on
+# anything newer. (virglrenderer dlopen()s the host's Vulkan loader, so that
+# is never bundled.)
 SKIP_LIBS='^(linux-vdso|ld-linux|libc|libm|libdl|libpthread|librt|libresolv|libutil|libanl|libmvec|libGL|libEGL|libGLX|libGLdispatch|libgbm|libdrm|libnvidia)[.-]'
 cmd_bundle_libs() {
     local o="$STAGE$PREFIX" libdir="$STAGE$PREFIX/lib" elf dep name rel
@@ -378,6 +385,7 @@ shlib_deps() {
     local fmt=$1 elf
     command -v file >/dev/null && command -v readelf >/dev/null \
         || die "shlib_deps needs file and readelf (run: build.sh deps)"
+    {
     while IFS= read -r elf; do
         file "$elf" | grep -q 'dynamically linked' || continue
         case "$fmt" in
@@ -395,8 +403,17 @@ shlib_deps() {
                 esac
             done | sed -E 's/^([^:]+):.*$/\1/; s/:amd64$//' ;;
         esac
-    done < <(find "$STAGE$PREFIX" -type f \( -path '*/bin/*' -o -path '*/libexec/*' -o -name '*.so*' \)) \
-      | sort -u | grep -v '^$' || true
+    done < <(find "$STAGE$PREFIX" -type f \( -path '*/bin/*' -o -path '*/libexec/*' -o -name '*.so*' \))
+    # dlopen()ed, so not NEEDED: conduit-venus's virglrenderer loads the
+    # Vulkan loader (libvulkan.so.1).
+    if [ -e "$STAGE$PREFIX/bin/conduit-venus" ]; then
+        case "$fmt" in
+        deb) echo libvulkan1 ;;
+        rpm) echo 'libvulkan.so.1()(64bit)' ;;
+        archlinux) echo vulkan-icd-loader ;;
+        esac
+    fi
+    } | sort -u | grep -v '^$' || true
 }
 
 render_nfpm() {   # template out format

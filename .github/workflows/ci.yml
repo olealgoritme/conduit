@@ -6,7 +6,8 @@
 #   viewer        the C viewer's own test suite (`make check`, no display needed)
 #   stream        conduit-stream (network streaming): fmt, clippy, tests
 #   guest-agent   the guest clipboard agent's unit tests (Python, Xvfb)
-#   packaging     shellcheck the packaging scripts, build the DKMS source package
+#   packaging     shellcheck the packaging scripts, check the venus submodule pins
+#                 in flake.nix and the RPM spec, build the DKMS source package
 #
 # Nothing here needs an NVIDIA GPU. Tests that open /dev/nvidiactl are skipped
 # by name (the --skip filters in the rust job); they run on the developer rig instead.
@@ -220,6 +221,16 @@ jobs:
             packaging/build.sh packaging/supported-drivers.sh packaging/common/conduit-integrate \
             packaging/tarball/*.sh packaging/deb/*/* \
             guest/system/conduit-guest-setup cli/assets/build-disk.sh
+      # The RPM spec and the flake fetch the venus submodules themselves
+      # (git archive and flake sources leave submodules out).
+      - name: Venus submodule pins in flake.nix and conduit.spec
+        run: |
+          for sub in virglrenderer venus-protocol; do
+            rev=$(git ls-tree HEAD "host/venus/third_party/$sub" | awk '{print $3}')
+            for f in flake.nix packaging/rpm/conduit.spec; do
+              grep -q "$rev" "$f" || { echo "::error file=$f::$sub is pinned at $rev, not in $f"; exit 1; }
+            done
+          done
       - name: DKMS source package
         run: |
           NFPM_VERSION=2.43.0

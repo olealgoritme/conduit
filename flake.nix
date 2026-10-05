@@ -9,7 +9,7 @@
   # packages does not apply on NixOS (libvirt there uses neither by default).
   #
   # Layout: packages.default is a prefix that mirrors /opt/conduit
-  # ($out/bin/{conduit,conduit-backend,conduit-stream,conduit-viewer,conduit-vmm,qemu-system-x86_64}),
+  # ($out/bin/{conduit,conduit-backend,conduit-stream,conduit-venus,conduit-viewer,conduit-vmm,qemu-system-x86_64}),
   # and `conduit` is wrapped with CONDUIT_PREFIX=$out so it finds its helpers
   # there instead of /opt/conduit (see docs/PACKAGING.md, "CLI contract").
   description = "Conduit: share your NVIDIA GPU with a VM and see its desktop on yours";
@@ -38,13 +38,105 @@
         doCheck = false; # CI runs the tests; some need /dev/nvidiactl
       } // args);
 
+      # conduit-venus's Rust sources (host/venus without its submodules): the
+      # backend's `venus` feature uses the crate (no virglrenderer), the
+      # renderer below builds its binary.
+      venusCrate = [
+        ./host/venus/Cargo.toml
+        ./host/venus/Cargo.lock
+        ./host/venus/build.rs
+        ./host/venus/src
+        ./host/venus/examples
+      ];
+
+      # Same features as packaging/build.sh (BACKEND_FEATURES). The `venus`
+      # feature pulls in ../../venus, so the source is host/ with only the
+      # backend and the venus crate in it.
       backend = rustPkg {
         pname = "conduit-backend";
-        src = ./host/backend;
+        src = lib.fileset.toSource {
+          root = ./host;
+          fileset = lib.fileset.unions ([ ./host/backend ] ++ venusCrate);
+        };
+        cargoRoot = "backend";
+        buildAndTestSubdir = "backend";
         cargoLock.lockFile = ./host/backend/Cargo.lock;
         cargoLock.allowBuiltinFetchGit = true;
-        buildFeatures = [ "vhost-user" ];
+        buildFeatures = [ "vhost-user" "venus" ];
         cargoBuildFlags = [ "-p" "device" "--bin" backendBin "--bin" userspaceBin ];
+      };
+
+      # The Venus renderer for Windows guests (docs/VENUS.md): conduit-venus
+      # and the virglrenderer it links, Venus only, built like
+      # host/venus/build-virglrenderer.sh does. Flake sources leave submodules
+      # out, so the two it is built from are fetched at the revisions
+      # host/venus/third_party/ pins (`git submodule status host/venus`; CI
+      # checks that they stay in step).
+      venusProtocol = pkgs.stdenv.mkDerivation {
+        pname = "venus-protocol";
+        version = "fe08e82";
+        src = builtins.fetchGit {
+          url = "https://github.com/winboat-org/venus-protocol.git";
+          rev = "fe08e82c3819e8ee3c547b1ea810fde61f46fa78";
+          allRefs = true;
+        };
+        nativeBuildInputs = with pkgs; [ meson ninja (python3.withPackages (p: [ p.mako ])) ];
+        mesonFlags = [ "-Dwerror=false" ];
+      };
+
+      venusPatches = lib.optionals (builtins.pathExists ./host/venus/patches)
+        (map (n: ./host/venus/patches + "/${n}")
+          (lib.sort lib.lessThan
+            (builtins.filter (lib.hasSuffix ".patch")
+              (builtins.attrNames (builtins.readDir ./host/venus/patches)))));
+
+      virglrenderer = pkgs.stdenv.mkDerivation {
+        pname = "virglrenderer-venus";
+        version = "aafa9bd";
+        src = builtins.fetchGit {
+          url = "https://gitlab.freedesktop.org/virgl/virglrenderer.git";
+          rev = "aafa9bd234a43c31004ec768ce000b21cf7b99ca";
+          allRefs = true;
+        };
+        patches = venusPatches;
+        postPatch = "patchShebangs .";
+        nativeBuildInputs = with pkgs; [
+          meson
+          ninja
+          pkg-config
+          (python3.withPackages (p: [ p.mako p.pyyaml ]))
+        ];
+        buildInputs = with pkgs; [ libdrm vulkan-headers vulkan-loader venusProtocol ];
+        mesonBuildType = "release";
+        mesonFlags = [
+          "-Dvenus=true"
+          "-Dvrend=false"
+          "-Dvideo=false"
+          "-Drender-server-mode=thread"
+          "-Drender-server-worker=thread"
+          "-Dtests=false"
+        ];
+        # virglrenderer dlopen()s libvulkan.so.1, which is searched for on
+        # its own RUNPATH (after fixup, which drops unused entries); the
+        # loader then finds the driver's ICD (/run/opengl-driver on NixOS).
+        postFixup = ''
+          patchelf --add-rpath ${pkgs.vulkan-loader}/lib $out/lib/libvirglrenderer.so.1
+        '';
+      };
+
+      # build.rs finds virglrenderer through pkg-config and puts its lib/ on
+      # the binary's RUNPATH.
+      venus = rustPkg {
+        pname = "conduit-venus";
+        src = lib.fileset.toSource {
+          root = ./host/venus;
+          fileset = lib.fileset.unions venusCrate;
+        };
+        cargoLock.lockFile = ./host/venus/Cargo.lock;
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        buildInputs = [ virglrenderer ];
+        buildFeatures = [ "renderer" ];
+        cargoBuildFlags = [ "--bin" "conduit-venus" ];
       };
 
       vmm = rustPkg {
@@ -150,6 +242,7 @@
         ln -s ${backend}/bin/conduit-userspace $out/bin/conduit-userspace
         ln -s ${vmm}/bin/conduit-vmm         $out/bin/conduit-vmm
         ln -s ${stream}/bin/conduit-stream   $out/bin/conduit-stream
+        ln -s ${venus}/bin/conduit-venus     $out/bin/conduit-venus
         ln -s ${viewer}/bin/conduit-viewer   $out/bin/conduit-viewer
         ln -s ${qemu}/bin/qemu-system-x86_64 $out/bin/qemu-system-x86_64
         makeWrapper ${cli}/bin/conduit $out/bin/conduit \
@@ -185,7 +278,7 @@
     {
       packages.${system} = {
         default = conduit;
-        inherit conduit backend stream viewer vmm cli qemu;
+        inherit conduit backend stream venus virglrenderer viewer vmm cli qemu;
         conduit-guest = mkGuestModule pkgs.linuxPackages_latest.kernel;
       };
 

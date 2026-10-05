@@ -67,10 +67,12 @@ install:
 	sudo dist/install/conduit/install.sh
 
 # Full package pipeline (same steps as the GitHub release), one format each.
+# `venus` needs the host/venus/third_party submodules checked out.
 dist-stage:
 	packaging/build.sh rust
 	packaging/build.sh viewer
 	packaging/build.sh stream
+	packaging/build.sh venus
 	packaging/build.sh qemu
 	packaging/build.sh stage
 
