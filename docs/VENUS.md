@@ -178,6 +178,13 @@ when it hangs up. Packages ship it as `/opt/conduit/bin/conduit-venus`
 `cargo build --release --features renderer` in `host/venus`
 (`CONDUIT_VENUS=PATH` points the CLI at it).
 
+**Open files.** Every guest GPU buffer holds a descriptor or two in
+`conduit-venus` (shared memory, a dma-buf, the NVIDIA driver's handle) and
+one in the backend, so both raise their soft `RLIMIT_NOFILE` to the hard
+limit at start (logged): a Windows desktop with one 3D application passes the
+usual 1024, and past it buffer creation fails and the guest's Vulkan driver
+aborts.
+
 **Sandbox** (`host/venus/src/sandbox.rs`), entered before the first request:
 the backend's posture (no root or `CAP_SYS_ADMIN`, capabilities dropped,
 `no_new_privs`), Landlock limited to the system library and driver

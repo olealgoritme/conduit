@@ -52,6 +52,9 @@ fn main() -> ExitCode {
         None => return usage(),
     };
 
+    let nofile = sandbox::raise_nofile();
+    eprintln!("conduit-venus: open file limit {nofile}");
+
     // Root and CAP_SYS_ADMIN are refused with or without the sandbox; the
     // shader cache goes to this VM's own directory either way.
     let vm = sandbox::vm_name(vm.as_deref(), &socket);

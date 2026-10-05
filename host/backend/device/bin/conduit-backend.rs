@@ -1565,6 +1565,7 @@ fn main() -> anyhow::Result<()> {
     // Before any device is opened: the host driver judges every guest call by
     // this process's credentials (device::posture).
     device::posture::enforce()?;
+    log::info!("open file limit {}", device::sandbox::raise_nofile());
 
     // The sandbox, before anything else: Landlock and seccomp cover this
     // thread and every thread started after them, and `VhostUserDaemon::new`

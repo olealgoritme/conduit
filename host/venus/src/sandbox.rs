@@ -422,6 +422,29 @@ fn drop_caps() -> io::Result<()> {
     Ok(())
 }
 
+/// Raise the soft open-file limit to the hard one. Every guest GPU buffer
+/// holds a descriptor or two (shared memory, a dma-buf, the NVIDIA driver's
+/// own handle), and a Windows desktop with one 3D application open passes
+/// the usual soft limit of 1024; past it, buffer creation fails and the
+/// guest's Vulkan driver aborts. Nothing here uses select(), so descriptors
+/// above FD_SETSIZE are fine. Best effort: the old limit stays on failure.
+pub fn raise_nofile() -> u64 {
+    let mut l = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit/setrlimit with a valid, owned struct.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) != 0 {
+            return 0;
+        }
+        if l.rlim_cur < l.rlim_max {
+            let raised = libc::rlimit { rlim_cur: l.rlim_max, rlim_max: l.rlim_max };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
+                l = raised;
+            }
+        }
+    }
+    l.rlim_cur
+}
+
 /// No core dumps, private files by default. Best effort.
 ///
 /// Not PR_SET_DUMPABLE 0, unlike the backend: it makes /proc/self/* owned by

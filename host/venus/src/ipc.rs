@@ -155,7 +155,7 @@ fn recv_frag(sock: BorrowedFd<'_>, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.as_mut_ptr().cast();
         msg.msg_controllen = libc::CMSG_SPACE((MAX_FDS * size_of::<RawFd>()) as u32) as _;
-        debug_assert!(msg.msg_controllen as usize <= size_of::<[u64; 8]>());
+        debug_assert!(size_of::<[u64; 8]>() >= msg.msg_controllen as _);
         let n = loop {
             let n = libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC);
             if n >= 0 {
