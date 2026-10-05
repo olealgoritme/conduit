@@ -64,11 +64,16 @@ use wdk_sys::{KEVENT, PVOID};
 mod nvrm_tables;
 mod resource_tables;
 
-pub use nvrm_tables::{MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER};
+pub use nvrm_tables::{
+    MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER, MAX_NVRM_MAPS, MAX_NVRM_MAPS_PER_OWNER,
+};
 
 use super::config::DxgkConfigAccess;
 use super::hal::{DmaBuffer, DmaSpan, WdkHal};
-use super::pci_caps::{map_isr_status_register, scan_host_visible_window, HostVisibleWindow};
+use super::pci_caps::{
+    map_isr_status_register, scan_host_visible_window, scan_shm_region, HostVisibleWindow,
+    SHM_ID_APERTURE, SHM_ID_WINDOW,
+};
 
 // R1103: the telemetry atomics moved to `super::counters`. Re-exported here so
 // all 53+ external `gpu::<COUNTER>` paths keep compiling unchanged; narrowing
@@ -2255,6 +2260,15 @@ pub struct VirtioGpu {
     nvrm_handles: Vec<nvrm_tables::NvrmHandleSlot>,
     /// Slots reserved by in-flight forwarded `Open`s.
     nvrm_reserved: usize,
+    /// Live HELIOS_NVRM_OP_MMAP mappings (the host's mapping id, the handle it
+    /// belongs to, the owner), so `Close` and device teardown can send the host
+    /// `Munmap`. Reserved to MAX_NVRM_MAPS at init. The user view itself is in
+    /// `AdapterContext::mappings`, under the key `nvrm::map_key(mapping_id)`.
+    nvrm_maps: Vec<nvrm_tables::NvrmMapSlot>,
+    /// Shared-memory regions 1 and 2, where an RM `Mmap` reply points (an
+    /// offset into one of them). `None` when the device lacks the region.
+    nvrm_window: Option<HostVisibleWindow>,
+    nvrm_aperture: Option<HostVisibleWindow>,
     /// Live virtio-gpu contexts, tagged with the owning device handle, so
     /// `DxgkDdiDestroyDevice` can `CTX_DESTROY` any context an ICD created but did
     /// not tear down (crash / skipped CTX_DESTROY) — otherwise leaked contexts
@@ -2726,6 +2740,14 @@ impl VirtioGpu {
             0x0B00_00E5
         });
 
+        // The RM window and UVM aperture (shared memory regions 1 and 2): where
+        // an RM `Mmap` reply points. Absent on a device built without them, in
+        // which case HELIOS_NVRM_OP_MMAP answers UNSUPPORTED.
+        let nvrm_window = scan_shm_region(&DxgkConfigAccess::new(dxgkrnl), SHM_ID_WINDOW);
+        let nvrm_aperture = scan_shm_region(&DxgkConfigAccess::new(dxgkrnl), SHM_ID_APERTURE);
+        crate::diag::record_named_bytes(b"NvWinMb", nvrm_window.map_or(0, |w| (w.len >> 20) as u32));
+        crate::diag::record_named_bytes(b"NvAptMb", nvrm_aperture.map_or(0, |w| (w.len >> 20) as u32));
+
         // Locate + map the ISR-status register so the (real) ISR can read-to-clear
         // the level-triggered INTx line and stop the unhandled-interrupt storm.
         let isr_status_va = map_isr_status_register(&DxgkConfigAccess::new(dxgkrnl));
@@ -2776,6 +2798,9 @@ impl VirtioGpu {
             contexts: Vec::with_capacity(MAX_CONTEXTS),
             nvrm_handles: Vec::with_capacity(MAX_NVRM_HANDLES),
             nvrm_reserved: 0,
+            nvrm_maps: Vec::with_capacity(MAX_NVRM_MAPS),
+            nvrm_window,
+            nvrm_aperture,
             window: WindowAllocator::new(host_visible.map_or(0, |w| w.len)),
             inflight: Vec::with_capacity(MAX_INFLIGHT),
             parked: Vec::with_capacity(MAX_PARKED),

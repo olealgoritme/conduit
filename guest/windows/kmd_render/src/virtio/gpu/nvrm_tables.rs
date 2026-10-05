@@ -19,11 +19,24 @@ use super::*;
 pub const MAX_NVRM_HANDLES: usize = 1024;
 /// Most one process may hold open at once (`QUERY_CAPS` reports it).
 pub const MAX_NVRM_HANDLES_PER_OWNER: usize = 128;
+/// Most live `MMAP` mappings across every process, and per process.
+pub const MAX_NVRM_MAPS: usize = 1024;
+pub const MAX_NVRM_MAPS_PER_OWNER: usize = 256;
 
 /// One tracked handle.
 pub(super) struct NvrmHandleSlot {
     owner: DeviceOwner,
     handle: u32,
+    /// The host `device_type` the handle was opened with (255 = control, a GPU
+    /// minor, 256/257 = UVM, 512+ = DRM); decides which region an `Mmap` is in.
+    device_type: u32,
+}
+
+/// One live mapping, for the host `Munmap` at `Close` / teardown.
+pub(super) struct NvrmMapSlot {
+    owner: DeviceOwner,
+    handle: u32,
+    mapping_id: u32,
 }
 
 impl VirtioGpu {
@@ -41,9 +54,76 @@ impl VirtioGpu {
     }
 
     /// Commit a reserved slot once the host has opened `handle`.
-    pub fn commit_nvrm_handle(&mut self, owner: DeviceOwner, handle: u32) {
+    pub fn commit_nvrm_handle(&mut self, owner: DeviceOwner, handle: u32, device_type: u32) {
         self.nvrm_reserved = self.nvrm_reserved.saturating_sub(1);
-        self.nvrm_handles.push(NvrmHandleSlot { owner, handle });
+        self.nvrm_handles.push(NvrmHandleSlot {
+            owner,
+            handle,
+            device_type,
+        });
+    }
+
+    /// The `device_type` `owner` opened `handle` with, or `None` if it is not
+    /// theirs.
+    pub fn nvrm_handle_device_type(&self, owner: DeviceOwner, handle: u32) -> Option<u32> {
+        self.nvrm_handles
+            .iter()
+            .find(|s| s.owner == owner && s.handle == handle)
+            .map(|s| s.device_type)
+    }
+
+    /// The shared-memory region an `Mmap` on a handle of `device_type` points
+    /// into: the UVM aperture for UVM, the RM window for everything else.
+    pub fn nvrm_region(&self, device_type: u32) -> Option<HostVisibleWindow> {
+        if device_type == 256 || device_type == 257 {
+            self.nvrm_aperture
+        } else {
+            self.nvrm_window
+        }
+    }
+
+    /// Track a new mapping. `false` when the table or `owner`'s quota is full.
+    pub fn push_nvrm_map(&mut self, owner: DeviceOwner, handle: u32, mapping_id: u32) -> bool {
+        let mine = self.nvrm_maps.iter().filter(|s| s.owner == owner).count();
+        if self.nvrm_maps.len() >= MAX_NVRM_MAPS || mine >= MAX_NVRM_MAPS_PER_OWNER {
+            return false;
+        }
+        self.nvrm_maps.push(NvrmMapSlot {
+            owner,
+            handle,
+            mapping_id,
+        });
+        true
+    }
+
+    /// How many mappings `owner` holds (for the quota check before asking the host).
+    pub fn nvrm_map_count(&self, owner: DeviceOwner) -> usize {
+        self.nvrm_maps.iter().filter(|s| s.owner == owner).count()
+    }
+
+    /// Forget `mapping_id` if `owner` made it, returning the handle it belongs to.
+    pub fn take_nvrm_map(&mut self, owner: DeviceOwner, mapping_id: u32) -> Option<u32> {
+        let idx = self
+            .nvrm_maps
+            .iter()
+            .position(|s| s.owner == owner && s.mapping_id == mapping_id)?;
+        Some(self.nvrm_maps.swap_remove(idx).handle)
+    }
+
+    /// Pop one mapping `owner` made on `handle` (`Close` releases them first).
+    pub fn take_nvrm_map_for_handle(&mut self, owner: DeviceOwner, handle: u32) -> Option<u32> {
+        let idx = self
+            .nvrm_maps
+            .iter()
+            .position(|s| s.owner == owner && s.handle == handle)?;
+        Some(self.nvrm_maps.swap_remove(idx).mapping_id)
+    }
+
+    /// Pop one mapping `owner` still holds (device teardown).
+    pub fn take_nvrm_map_for_owner(&mut self, owner: DeviceOwner) -> Option<(u32, u32)> {
+        let idx = self.nvrm_maps.iter().position(|s| s.owner == owner)?;
+        let s = self.nvrm_maps.swap_remove(idx);
+        Some((s.handle, s.mapping_id))
     }
 
     /// Release a reserved slot after a refused or failed `Open`.

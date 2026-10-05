@@ -406,6 +406,14 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"NvRef",
         crate::virtio::nvrm::NVRM_REFUSED.load(Ordering::Relaxed),
     );
+    crate::diag::record_named_bytes(
+        b"NvMap",
+        crate::virtio::nvrm::NVRM_MAPS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvMapErr",
+        crate::virtio::nvrm::NVRM_MAP_ERRORS.load(Ordering::Relaxed),
+    );
     // S-1's instrument (`docs/dx12/PENDING.md` §2). `DxgkDdiCalibrateGpuClock` is
     // the ONLY channel for the GPU timestamp frequency an application divides its
     // timestamp deltas by, and it used to zero-fill and return SUCCESS silently.

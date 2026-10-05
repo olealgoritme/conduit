@@ -384,7 +384,8 @@ pub struct HeliosNvrmMmap {
     pub out_user_va: u64,
     /// out: host mapping id; pass to `MUNMAP`.
     pub out_mapping_id: u32,
-    /// in: zero (reserved).
+    /// in: zero. out: when `status` is `DEVICE_ERROR` and the host refused the
+    /// mapping, the host's errno (positive); otherwise zero.
     pub flags: u32,
 }
 

@@ -98,8 +98,11 @@ fn bar_base(access: &DxgkConfigAccess, bar: u16) -> Option<u64> {
     }
 }
 
-/// Conduit device shared memory region 3, host-visible Venus blobs
-/// (`SHM_ID_VENUS`, docs/VENUS.md).
+/// Conduit device shared memory regions (host/backend/device/src/shm_regions.rs):
+/// 1 = the RM window (GPU memory mapped for HELIOS_ESCAPE_NVRM MMAP), 2 = the
+/// UVM aperture, 3 = host-visible Venus blobs (docs/VENUS.md).
+pub(super) const SHM_ID_WINDOW: u32 = 1;
+pub(super) const SHM_ID_APERTURE: u32 = 2;
 const SHM_ID_VENUS: u32 = 3;
 
 /// Walk the PCI capability list for the virtio `SHARED_MEMORY_CFG` capability
@@ -108,6 +111,11 @@ const SHM_ID_VENUS: u32 = 3;
 /// Returns `None` if absent (a device built without blob/hostmem), which makes
 /// the blob map path unavailable rather than crashing.
 pub(super) fn scan_host_visible_window(access: &DxgkConfigAccess) -> Option<HostVisibleWindow> {
+    scan_shm_region(access, SHM_ID_VENUS)
+}
+
+/// The same walk for any shared-memory region id.
+pub(super) fn scan_shm_region(access: &DxgkConfigAccess, want: u32) -> Option<HostVisibleWindow> {
     if (cfg_read32(access, PCI_CFG_STATUS) >> 16) & PCI_STATUS_CAP_LIST == 0 {
         return None;
     }
@@ -130,7 +138,7 @@ pub(super) fn scan_host_visible_window(access: &DxgkConfigAccess) -> Option<Host
             let d1 = cfg_read32(access, cap + 4);
             let bar = (d1 & 0xFF) as u16;
             let shmid = (d1 >> 8) & 0xFF;
-            if shmid == SHM_ID_VENUS {
+            if shmid == want {
                 // `virtio_pci_cap64`: offset lo/hi at +8/+16, length lo/hi at +12/+20.
                 let off = cfg_read32(access, cap + 8) as u64
                     | ((cfg_read32(access, cap + 16) as u64) << 32);

@@ -184,7 +184,8 @@ typedef struct HeliosNvrmMmap {
   uint32_t cache_effective; /* out: cache type used (never DEFAULT) */
   uint64_t out_user_va;     /* out: user VA of the mapping */
   uint32_t out_mapping_id;  /* out: host mapping id, for MUNMAP */
-  uint32_t flags;           /* in:  zero */
+  uint32_t flags;           /* in:  zero. out: the host's errno (positive) when
+                             *      status == DEVICE_ERROR because it refused */
 } HeliosNvrmMmap;
 #define HELIOS_NVRM_MMAP_BYTES 88u
 HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmMmap) == HELIOS_NVRM_MMAP_BYTES, "Mmap");
