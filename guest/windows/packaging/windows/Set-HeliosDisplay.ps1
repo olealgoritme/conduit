@@ -93,10 +93,17 @@ public static class HeliosDisplayConfig
     [StructLayout(LayoutKind.Sequential)]
     public struct PathInfo { public SourceInfo sourceInfo; public TargetInfo targetInfo; public uint flags; }
 
-    // DISPLAYCONFIG_MODE_INFO is 64 bytes: type, id, adapter, then a 48-byte union.
-    // The union is never read here, only copied whole.
-    [StructLayout(LayoutKind.Sequential, Size = 64)]
-    public struct ModeInfo { public uint infoType; public uint id; public LUID adapterId; }
+    // DISPLAYCONFIG_MODE_INFO is 64 bytes: type, id, adapter, then a 48-byte union
+    // (twelve uints here). For a SOURCE mode (infoType 1) the union is
+    // width, height, pixelFormat, position.x, position.y; other types are only
+    // copied whole.
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ModeInfo
+    {
+        public uint infoType; public uint id; public LUID adapterId;
+        public uint u0, u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11;
+    }
+    public const uint MODE_TYPE_SOURCE = 1;
 
     public class Config
     {
@@ -194,10 +201,41 @@ public static class HeliosDisplayConfig
         if (s == MODE_IDX_INVALID || t == MODE_IDX_INVALID || s >= c.Modes.Length || t >= c.Modes.Length)
             return false;
         modes = new ModeInfo[] { c.Modes[s], c.Modes[t] };
+        if (modes[0].infoType == MODE_TYPE_SOURCE) { modes[0].u3 = 0; modes[0].u4 = 0; }
         p.sourceInfo.modeInfoIdx = 0;
         p.targetInfo.modeInfoIdx = 1;
         paths = new PathInfo[] { p };
         return true;
+    }
+
+    // Every path and every mode, unchanged, except: paths with keep[i] == false
+    // lose PATH_ACTIVE (their mode indices stay valid into the same array), and
+    // the source mode of every kept path moves to desktop position (0,0), so one
+    // active source is at the origin once the others are gone.
+    public static void ActivateOnly(Config c, bool[] keep, out PathInfo[] paths, out ModeInfo[] modes)
+    {
+        paths = (PathInfo[])c.Paths.Clone();
+        modes = (ModeInfo[])c.Modes.Clone();
+        for (int i = 0; i < paths.Length; i++)
+        {
+            if (!keep[i]) { paths[i].flags &= ~PATH_ACTIVE; continue; }
+            uint s = paths[i].sourceInfo.modeInfoIdx;
+            if (s != MODE_IDX_INVALID && s < modes.Length && modes[s].infoType == MODE_TYPE_SOURCE)
+            {
+                modes[s].u3 = 0;
+                modes[s].u4 = 0;
+            }
+        }
+    }
+
+    // "WxH at (x,y)" for a path's source mode, or "no mode".
+    public static string SourceModeText(Config c, int pathIndex)
+    {
+        uint s = c.Paths[pathIndex].sourceInfo.modeInfoIdx;
+        if (s == MODE_IDX_INVALID || s >= c.Modes.Length || c.Modes[s].infoType != MODE_TYPE_SOURCE)
+            return "no source mode";
+        ModeInfo m = c.Modes[s];
+        return m.u0 + "x" + m.u1 + " at (" + (int)m.u3 + "," + (int)m.u4 + ")";
     }
 
     public static PathInfo[] One(PathInfo p) { return new PathInfo[] { p }; }
@@ -209,6 +247,8 @@ public static class HeliosDisplayConfig
     }
 }
 "@
+
+$sdc = [HeliosDisplayConfig]
 
 function Get-AdapterTable($paths) {
     $table = @{}
@@ -234,9 +274,10 @@ function Show-Paths($title, $config, $adapters) {
     $i = 0
     foreach ($path in $config.Paths) {
         $isHelios = Test-HeliosAdapterPath $adapters[(Get-AdapterKey $path.sourceInfo.adapterId)]
-        Write-Host ("  [{0}] adapter {1}{2} source {3} target {4} flags 0x{5:x} targetAvailable {6}" -f `
+        Write-Host ("  [{0}] adapter {1}{2} source {3} target {4} flags 0x{5:x} targetAvailable {6}; source mode {7}" -f `
             $i, (Get-AdapterKey $path.sourceInfo.adapterId), $(if ($isHelios) { " (Helios)" } else { "" }),
-            $path.sourceInfo.id, $path.targetInfo.id, $path.flags, $path.targetInfo.targetAvailable)
+            $path.sourceInfo.id, $path.targetInfo.id, $path.flags, $path.targetInfo.targetAvailable,
+            $sdc::SourceModeText($config, $i))
         $i++
     }
 }
@@ -282,8 +323,27 @@ if (Test-OnlyHeliosActive) {
 }
 
 # ---- Strategies, each validated before it is applied ------------------------
-$sdc = [HeliosDisplayConfig]
 $strategies = New-Object System.Collections.ArrayList
+
+# D: keep EVERY active path and mode (so every mode index stays valid), clear
+# PATH_ACTIVE on the non-Helios paths and put the Helios source at (0,0): the
+# recipe that normally works when the other adapter is the primary at the origin.
+$activeAdapters = Get-AdapterTable $active.Paths
+$keep = New-Object 'bool[]' $active.Paths.Count
+$anyHelios = $false
+for ($i = 0; $i -lt $active.Paths.Count; $i++) {
+    $keep[$i] = [bool](Test-HeliosAdapterPath $activeAdapters[(Get-AdapterKey $active.Paths[$i].sourceInfo.adapterId)])
+    if ($keep[$i]) { $anyHelios = $true }
+}
+if ($anyHelios) {
+    $dPaths = $null
+    $dModes = $null
+    $sdc::ActivateOnly($active, $keep, [ref]$dPaths, [ref]$dModes)
+    [void]$strategies.Add([pscustomobject]@{
+        Name = "D: all active paths and modes, others deactivated, Helios source at (0,0)"
+        Paths = $dPaths; Modes = $dModes
+        Flags = $sdc::SDC_USE_SUPPLIED_DISPLAY_CONFIG -bor $sdc::SDC_ALLOW_CHANGES })
+}
 
 # A: Helios is active already (as a second monitor): hand back only its active
 # path with its own source and target mode, and let Windows drop the rest.
@@ -294,7 +354,7 @@ for ($i = 0; $i -lt $active.Paths.Count; $i++) {
     $ownModes = $null
     if ($sdc::WithOwnModes($active, $i, [ref]$ownPaths, [ref]$ownModes)) {
         [void]$strategies.Add([pscustomobject]@{
-            Name = "A: only Helios' active path with its own modes"
+            Name = "A: only Helios' active path with its own modes (source at 0,0)"
             Paths = $ownPaths; Modes = $ownModes
             Flags = $sdc::SDC_USE_SUPPLIED_DISPLAY_CONFIG -bor $sdc::SDC_ALLOW_CHANGES -bor $sdc::SDC_ALLOW_PATH_ORDER_CHANGES })
     }
