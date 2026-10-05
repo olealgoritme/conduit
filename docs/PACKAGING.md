@@ -19,16 +19,19 @@ layout, so a layout change is made in one place.
 | `/opt/conduit/share/conduit/guest/conduit-guest.deb` | the guest driver package `conduit create` and `conduit stock-kernel` install into VMs (built at stage time with nfpm) |
 | `/opt/conduit/share/conduit/guest/conduit-guest.pkg.tar.zst` | the same, as an Arch package, for `conduit attach` on Arch-based guests (built at stage time with nfpm) |
 | `/opt/conduit/libexec/conduit-integrate` | AppArmor/SELinux/desktop hookup (`enable`/`disable`) |
-| `/opt/conduit/lib/` | tarball only: the viewer's, stream host's and QEMU's shared libraries |
+| `/opt/conduit/lib/` | `libvirglrenderer.so.1` for `conduit-venus`; in the tarball also the viewer's, stream host's and QEMU's shared libraries |
 | `/opt/conduit/share/doc/conduit/` | LICENSE and every component's LICENSE/NOTICE |
 | `/usr/bin/conduit` (packages), `/usr/local/bin/conduit` (tarball) | symlink to the CLI |
 | `/usr/share/applications/conduit.desktop` (`/usr/local/share/...` for the tarball) | desktop entry |
 | `/etc/apparmor.d/abstractions/conduit` | AppArmor rules for libvirt's QEMU |
 
-Not packaged yet: `conduit-venus`, the Venus renderer for `--venus`
-(experimental, docs/VENUS.md). It needs virglrenderer built with Venus
-(`host/venus/build-virglrenderer.sh`), so it is built by hand; the packaged
-backend is also built without its `venus` feature.
+`conduit-venus`, the Venus renderer for `--venus` (experimental,
+docs/VENUS.md), is packaged in `/opt/conduit/bin` with its own virglrenderer
+(Venus only, built by `host/venus/build-virglrenderer.sh`) in
+`/opt/conduit/lib/libvirglrenderer.so.1`, found through a RUNPATH of
+`$ORIGIN/../lib` (`packaging/build.sh venus`). The packaged backend is built
+with its `venus` feature. A stage without `build.sh venus` still packages,
+with a warning, and `--venus` does not work from that install.
 
 The guest package installs `/usr/src/conduit-guest-<version>/` (module source
 plus `dkms.conf`); DKMS builds `conduit_gpu.ko` into

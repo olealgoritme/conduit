@@ -117,15 +117,15 @@ fn send_frag(sock: BorrowedFd<'_>, hdr: &[u8], payload: &[u8], fd: Option<Borrow
     unsafe {
         let mut msg: libc::msghdr = std::mem::zeroed();
         msg.msg_iov = iov.as_mut_ptr();
-        msg.msg_iovlen = iov.len();
+        msg.msg_iovlen = iov.len() as _;
         if let Some(fd) = fd {
             let space = libc::CMSG_SPACE(size_of::<RawFd>() as u32) as usize;
             msg.msg_control = cbuf.as_mut_ptr().cast();
-            msg.msg_controllen = space;
+            msg.msg_controllen = space as _;
             let c = libc::CMSG_FIRSTHDR(&msg);
             (*c).cmsg_level = libc::SOL_SOCKET;
             (*c).cmsg_type = libc::SCM_RIGHTS;
-            (*c).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as usize;
+            (*c).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
             std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<RawFd>(), fd.as_raw_fd());
         }
         loop {
@@ -154,8 +154,8 @@ fn recv_frag(sock: BorrowedFd<'_>, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.as_mut_ptr().cast();
-        msg.msg_controllen = libc::CMSG_SPACE((MAX_FDS * size_of::<RawFd>()) as u32) as usize;
-        debug_assert!(msg.msg_controllen <= size_of::<[u64; 8]>());
+        msg.msg_controllen = libc::CMSG_SPACE((MAX_FDS * size_of::<RawFd>()) as u32) as _;
+        debug_assert!(msg.msg_controllen as usize <= size_of::<[u64; 8]>());
         let n = loop {
             let n = libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC);
             if n >= 0 {
@@ -170,7 +170,7 @@ fn recv_frag(sock: BorrowedFd<'_>, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io
         while !c.is_null() {
             if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
                 let data = libc::CMSG_DATA(c);
-                let len = (*c).cmsg_len - libc::CMSG_LEN(0) as usize;
+                let len = (*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
                 for i in 0..len / size_of::<RawFd>() {
                     let fd = std::ptr::read_unaligned(data.cast::<RawFd>().add(i));
                     fds.push(OwnedFd::from_raw_fd(fd));

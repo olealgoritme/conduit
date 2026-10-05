@@ -9,6 +9,7 @@
 #   packaging/build.sh rust                 backend, VMM and CLI      -> dist/rust/bin
 #   packaging/build.sh viewer               Wayland/X11 viewer        -> dist/viewer/bin
 #   packaging/build.sh stream               network stream host       -> dist/stream/bin
+#   packaging/build.sh venus                Venus renderer (Windows)  -> dist/venus/{bin,lib}
 #   packaging/build.sh qemu                 bundled QEMU 11.1         -> dist/qemu-root
 #   packaging/build.sh stage                assemble the install tree -> $STAGE
 #   packaging/build.sh bundle-libs          copy non-glibc .so deps into /opt/conduit/lib (tarball)
@@ -31,7 +32,7 @@ set -euo pipefail
 
 BACKEND_BIN_SRC=${BACKEND_BIN_SRC:-conduit-backend}       # cargo bin name
 BACKEND_PKG=${BACKEND_PKG:-device}                         # cargo package that owns it
-BACKEND_FEATURES=${BACKEND_FEATURES:-vhost-user}
+BACKEND_FEATURES=${BACKEND_FEATURES:-vhost-user,venus}
 USERSPACE_BIN_SRC=${USERSPACE_BIN_SRC:-conduit-userspace} # same package as the backend
 VIEWER_BIN_SRC=${VIEWER_BIN_SRC:-conduit-viewer}          # Makefile target
 VMM_BIN_SRC=${VMM_BIN_SRC:-conduit-vmm}                    # cargo bin name
@@ -169,10 +170,6 @@ cmd_rust() {
     t=$(target_dir "$ROOT/cli")/$TARGET_DIR_SUFFIX
     install -m0755 "$t/$CLI_BIN_SRC" "$bin/conduit"
 
-    # TODO: conduit-venus (host/venus, the Venus renderer for Windows guests)
-    # is not packaged yet. It is experimental and needs virglrenderer built with
-    # Venus (host/venus/build-virglrenderer.sh), so it is built by hand for now.
-
     if [ "$RUST_TARGET" != host ]; then
         for f in "$bin"/*; do
             [ "$(basename "$f")" = conduit-vmm ] && continue   # glibc on purpose, see above
@@ -188,6 +185,24 @@ cmd_viewer() {
     make -C "$ROOT/host/viewer" -j"$JOBS" all
     mkdir -p "$DIST/viewer/bin"
     install -m0755 "$ROOT/host/viewer/$VIEWER_BIN_SRC" "$DIST/viewer/bin/conduit-viewer"
+}
+
+# --------------------------------------------------------------- venus -----
+# conduit-venus (host/venus), the Venus renderer for Windows guests: links
+# glibc, the Vulkan loader and its own virglrenderer (Venus only, built by
+# host/venus/build-virglrenderer.sh), so it is built for the host target, like
+# the viewer. virglrenderer ships next to it in /opt/conduit/lib, found through
+# a RUNPATH of $ORIGIN/../lib.
+cmd_venus() {
+    log "venus (conduit-venus, virglrenderer)"
+    "$ROOT/host/venus/build-virglrenderer.sh"
+    (cd "$ROOT/host/venus" && CONDUIT_VENUS_RPATH='$ORIGIN/../lib' \
+        cargo build --locked --release --features renderer --bin conduit-venus)
+    rm -rf "$DIST/venus"; install -d "$DIST/venus/bin" "$DIST/venus/lib"
+    install -m0755 "$(target_dir "$ROOT/host/venus")/release/conduit-venus" \
+        "$DIST/venus/bin/conduit-venus"
+    install -m0644 "$(readlink -f "$ROOT/host/venus/third_party/build/install/lib/libvirglrenderer.so.1")" \
+        "$DIST/venus/lib/libvirglrenderer.so.1"
 }
 
 # -------------------------------------------------------------- stream -----
@@ -247,6 +262,13 @@ cmd_stage() {
         install -m0755 "$DIST/stream/bin/conduit-stream" "$o/bin/conduit-stream"
     else
         log "warning: no conduit-stream (run: build.sh stream); \`conduit stream\` will not work from this install"
+    fi
+    if [ -x "$DIST/venus/bin/conduit-venus" ]; then
+        install -d "$o/lib"
+        install -m0755 "$DIST/venus/bin/conduit-venus" "$o/bin/conduit-venus"
+        install -m0644 "$DIST/venus/lib/libvirglrenderer.so.1" "$o/lib/libvirglrenderer.so.1"
+    else
+        log "warning: no conduit-venus (run: build.sh venus); \`--venus\` (Windows guests) will not work from this install"
     fi
 
     if [ "$BUNDLE_QEMU" = 1 ]; then
@@ -354,7 +376,10 @@ shlib_deps() {
         file "$elf" | grep -q 'dynamically linked' || continue
         case "$fmt" in
         rpm)
-            readelf -d "$elf" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1()(64bit)/p' ;;
+            # Libraries shipped in /opt/conduit/lib are not dependencies.
+            readelf -d "$elf" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | while read -r so; do
+                [ -e "$STAGE$PREFIX/lib/$so" ] || echo "$so()(64bit)"
+            done ;;
         *)
             ldd "$elf" | awk '/=> \//{print $3}' | while read -r lib; do
                 case "$fmt" in
@@ -442,6 +467,7 @@ main() {
         rust) cmd_rust ;;
         viewer) cmd_viewer ;;
         stream) cmd_stream ;;
+        venus) cmd_venus ;;
         qemu) cmd_qemu ;;
         stage) cmd_stage ;;
         bundle-libs) cmd_bundle_libs ;;

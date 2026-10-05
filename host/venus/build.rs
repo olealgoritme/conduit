@@ -13,6 +13,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+    println!("cargo:rerun-if-env-changed=CONDUIT_VENUS_RPATH");
     if std::env::var_os("CARGO_FEATURE_RENDERER").is_none() {
         return;
     }
@@ -37,7 +38,10 @@ fn main() {
             println!("cargo:rustc-link-search=native={dir}");
             // A private build is not on the loader path; an rpath lets the
             // binary run without LD_LIBRARY_PATH. Harmless for a system one.
-            println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{dir}");
+            // Packages ship the library elsewhere and set CONDUIT_VENUS_RPATH
+            // (packaging/build.sh venus: $ORIGIN/../lib).
+            let rpath = std::env::var("CONDUIT_VENUS_RPATH").unwrap_or_else(|_| dir.to_string());
+            println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{rpath}");
         } else if let Some(lib) = flag.strip_prefix("-l") {
             println!("cargo:rustc-link-lib=dylib={lib}");
         }

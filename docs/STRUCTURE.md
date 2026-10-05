@@ -20,7 +20,7 @@ conduit/
 │   └── venus/     Rust. conduit-venus: the sandboxed Venus renderer process for
 │                  Windows guests (virglrenderer on the host's NVIDIA Vulkan),
 │                  its IPC and the Renderer trait the backend uses; own
-│                  workspace, not packaged yet (docs/VENUS.md).
+│                  workspace (docs/VENUS.md).
 │                  third_party/: virglrenderer, venus-protocol (submodules).
 ├── guest/
 │   ├── linux/     C. The guest kernel module, conduit_gpu (virtio GPU, KMS display,

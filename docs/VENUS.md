@@ -173,9 +173,10 @@ backend through the IPC client, tests through `conduit_venus::mock::Mock`.
 One `conduit-venus` per VM: `conduit up/view --venus` (and the libvirt
 backend unit) starts it before the backend, on `venus.sock` in the VM's run
 directory, logging to `logs/venus.log`; it serves that one backend and exits
-when it hangs up. It is not packaged yet: build it with
-`host/venus/build-virglrenderer.sh`, then `cargo build --release --features
-renderer` in `host/venus` (`CONDUIT_VENUS=PATH` points the CLI at it).
+when it hangs up. Packages ship it as `/opt/conduit/bin/conduit-venus`
+(docs/PACKAGING.md). In a checkout: `host/venus/build-virglrenderer.sh`, then
+`cargo build --release --features renderer` in `host/venus`
+(`CONDUIT_VENUS=PATH` points the CLI at it).
 
 **Sandbox** (`host/venus/src/sandbox.rs`), entered before the first request:
 the backend's posture (no root or `CAP_SYS_ADMIN`, capabilities dropped,
