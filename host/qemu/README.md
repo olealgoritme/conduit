@@ -49,6 +49,7 @@ correctness and performance.
 | 0004 vhost-user-test-device-pci: vectors | The stock device hard-codes 1 MSI-X vector. A guest driver with 2 queues then falls back to INTx. With this patch the default is `num_vqs + 1`, and a `vectors=` property is added. |
 | 0005 vhost-user: commit a shmem mapping before replying | QEMU acks `SHMEM_MAP` before it commits the memory transaction, so the KVM memory slot appears only after the backend has told the guest the mapping exists. Guest writes in that gap land in a hole and are dropped: on the GPU device that showed up as corrupted push buffers and shader headers (Xid 32 / Xid 13, every Vulkan submit failed its fence). Committing first is safe because patch 0002 keeps these mappings out of the vhost memory table, so the commit sends nothing to the backend that is waiting for the reply. |
 | 0006 vhost-user-test-device-pci: power-of-two shmem BAR | The generic device sizes its shared-memory BAR as the sum of the regions, and `pci_register_bar` asserts a power of two. The window (1 GiB) plus the UVM aperture (32 GiB) is 33 GiB, so stock QEMU aborts at startup. The BAR is rounded up; the tail stays unbacked address space. |
+| 0007 vhost-user-test-device-pci: `class` property | The generic device always reports PCI class 0x0780 (communication controller). Windows' display stack (DXGK) does not start a display driver on such a device; Conduit passes `class=0x0380` (display controller), as virtio-blk-pci's `class` property does for storage. |
 
 ## Build dependencies (Ubuntu 24.04)
 

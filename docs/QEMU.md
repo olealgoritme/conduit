@@ -167,7 +167,7 @@ layout below needs no driver change.
 
 | | conduit-vmm | QEMU 11.1 (+ patches) |
 | --- | --- | --- |
-| PCI id / class | 1af4:106d rev 1, class 0x0380 (display) | 1af4:106d rev 1, class 0x0780 (communication). The driver binds by virtio id and builds its own PCI device for NVIDIA userspace (in a PCI domain of its own, see [ARCHITECTURE.md](ARCHITECTURE.md#guest-module)), so the class does not matter. |
+| PCI id / class | 1af4:106d rev 1, class 0x0380 (display) | 1af4:106d rev 1, class 0x0380 (display), set with the `class` property (patch 0007). The Linux driver binds by virtio id either way and builds its own PCI device for NVIDIA userspace (in a PCI domain of its own, see [ARCHITECTURE.md](ARCHITECTURE.md#guest-module)); Windows' display stack needs a display class to start its driver. |
 | virtio config structures | all in BAR 0 (32-bit, 16 KiB): common, isr, notify, MSI-X, device cfg at 0x1000 | BAR 2 (64-bit): common 0x0, isr 0x1000, device cfg 0x2000 (4 KiB window), notify 0x3000. MSI-X in BAR 1 |
 | window (shmid 1) | BAR 2, 1 GiB | BAR 4 at offset 0, 1 GiB |
 | aperture (shmid 2) | BAR 4, 32 GiB | BAR 4 at offset 1 GiB, 32 GiB (BAR 4 is 64 GiB, rounded up to a power of two by patch 0006) |

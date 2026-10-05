@@ -742,7 +742,7 @@ mod tests {
             "<source socket='/run/user/1000/conduit/t-1/vfs-libvirt.sock'/>",
             "<target dir='nvidia'/>",
             "socket,id=conduit-gpu,path=/run/user/1000/conduit/t-1/gpu-libvirt.sock",
-            "vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,num_vqs=2,vq_size=256,config_size=4036,bus=pcie.0,addr=0x10",
+            "vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,class=0x0380,num_vqs=2,vq_size=256,config_size=4036,bus=pcie.0,addr=0x10",
             "pipewire,id=conduit-snd,out.name=conduit-t-1,in.name=conduit-t-1",
             "virtio-sound-pci,audiodev=conduit-snd,streams=2",
             "<qemu:env name='XDG_RUNTIME_DIR' value='/run/user/1000'/>",
