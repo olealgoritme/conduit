@@ -8,17 +8,22 @@
 #
 # The VM must have been set up once with ci/vm/Setup-BuildVm.ps1.
 # Environment: WIN_SSH (default "Ole Algoritme@127.0.0.1"), WIN_PORT (2222),
-# WIN_ROOT (W:), OUT (dist/windows-driver/<Configuration> in the checkout).
+# WIN_ROOT (W:), OUT (dist/windows-driver/<Configuration> in the checkout),
+# WIN_SRC (another checkout or worktree whose guest/windows to build; the
+# build scripts in ci/vm still come from this one).
 set -euo pipefail
 config=${1:-Release}
 case "$config" in Release|Debug) ;; *) echo "usage: $0 [Release|Debug]" >&2; exit 2 ;; esac
 here="$(cd "$(dirname "$0")" && pwd)"
-win="$(cd "$here/../.." && pwd)"
-repo="$(cd "$win/../.." && pwd)"
+self="$(cd "$here/../../../.." && pwd)"
+repo="$(cd "${WIN_SRC:-$self}" && pwd)"
+win="$repo/guest/windows"
 ssh_to=${WIN_SSH:-Ole Algoritme@127.0.0.1}
 port=${WIN_PORT:-2222}
+# No trailing backslash: Windows' command line would read "W:\"" as an
+# escaped quote. Build-InVm.ps1 adds the backslash itself.
 root=${WIN_ROOT:-W:}
-out=${OUT:-$repo/dist/windows-driver/$config}
+out=${OUT:-$self/dist/windows-driver/$config}
 ssh_win() { ssh -o ConnectTimeout=10 -o ServerAliveInterval=30 -p "$port" "$ssh_to" "$@"; }
 
 for sub in dxvk vkd3d-proton; do
@@ -34,10 +39,13 @@ ssh_win "if (Test-Path $root\\src\\guest) { Remove-Item -Recurse -Force $root\\s
 # driver job, and build trees and .git are not needed.
 tar -C "$repo" -cf - --exclude=.git --exclude=target --exclude='guest/windows/third_party/mesa' guest/windows \
     | ssh_win "tar -xf - -C $root\\src"
+if [ "$repo" != "$self" ]; then
+    tar -C "$self" -cf - guest/windows/ci/vm | ssh_win "tar -xf - -C $root\\src"
+fi
 
 echo "==> building $config in the VM"
 # PowerShell 7, as windows.yml's `shell: pwsh` steps.
-ssh_win "& \"\$env:ProgramFiles\\PowerShell\\7\\pwsh.exe\" -NoProfile -ExecutionPolicy Bypass -File $root\\src\\guest\\windows\\ci\\vm\\Build-InVm.ps1 -Configuration $config -Root $root\\"
+ssh_win "& \"\$env:ProgramFiles\\PowerShell\\7\\pwsh.exe\" -NoProfile -ExecutionPolicy Bypass -File $root\\src\\guest\\windows\\ci\\vm\\Build-InVm.ps1 -Configuration $config -Root $root"
 
 echo "==> copying the package to $out"
 rm -rf "$out"; mkdir -p "$out"
