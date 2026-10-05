@@ -220,6 +220,18 @@ impl Venus {
         if let Err(e) = answer {
             self.count(err_name(e));
         }
+        // One line per command at debug: what a guest driver asked for and
+        // what it got is the first thing bring-up needs.
+        log::debug!(
+            "venus: command {:#06x} ctx {} ({} bytes) -> {}",
+            hdr.ty,
+            hdr.ctx_id,
+            payload.len(),
+            match &answer {
+                Ok(_) => "ok",
+                Err(e) => err_name(*e),
+            }
+        );
         // The renderer went away while serving this: release everything
         // now, while the transport is here to take region 3 back.
         if std::mem::take(&mut self.lose_pending) {

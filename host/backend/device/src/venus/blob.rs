@@ -54,6 +54,16 @@ impl Venus {
     /// `blob_mem = HOST3D` only; guest-memory blobs are refused for now.
     pub(super) fn create_blob(&mut self, c: &ResourceCreateBlob) -> Answer {
         let ctx = c.hdr.ctx_id;
+        log::debug!(
+            "venus: create blob res {} ctx {}: blob_mem {} flags {:#x} blob_id {} size {} entries {}",
+            c.resource_id,
+            ctx,
+            c.blob_mem,
+            c.blob_flags,
+            c.blob_id,
+            c.size,
+            c.nr_entries
+        );
         if !self.contexts.contains(&ctx) {
             return Err(RESP_ERR_INVALID_CONTEXT_ID);
         }
@@ -63,7 +73,10 @@ impl Venus {
         if c.blob_mem != BLOB_MEM_HOST3D || c.nr_entries != 0 {
             return Err(RESP_ERR_INVALID_PARAMETER);
         }
-        if c.size == 0 || !c.size.is_multiple_of(PAGE) || c.size > self.hostmem_len {
+        // Any nonzero size, as QEMU's virtio-gpu takes it: Mesa's Venus ring
+        // and reply buffers are not page multiples (the Windows guest's shared
+        // ring is 128 KiB + 196). A mapping covers whole pages (map_blob).
+        if c.size == 0 || page_align(c.size) > self.hostmem_len {
             return Err(RESP_ERR_INVALID_PARAMETER);
         }
         if self.resources.len() >= MAX_RESOURCES {

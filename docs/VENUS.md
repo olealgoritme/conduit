@@ -109,7 +109,7 @@ must allocate scanout images with linear tiling.
 
 **Checks** (backend, before the renderer sees anything): command length
 matches the type; `ctx_id` and `resource_id` exist and belong together;
-resource ids unique; blob size page-aligned and ≤ region 3; map offset
+resource ids unique; blob size nonzero and ≤ region 3 once rounded up to a page (any size, as QEMU takes it; a mapping covers whole pages); map offset
 page-aligned, inside region 3, not overlapping another mapping; scanout only
 0; at most 1024 contexts and 65536 resources per VM.
 

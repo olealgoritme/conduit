@@ -667,15 +667,28 @@ fn bad_ids_are_refused_before_the_renderer() {
     assert!(t.r.mock.lock().unwrap().submitted.is_empty());
 }
 
+/// A blob need not be a page multiple (Mesa's Venus ring is 128 KiB + 196,
+/// as the Windows guest asks): it is served and maps as whole pages.
+#[test]
+fn blobs_of_any_size_map_as_whole_pages() {
+    let mut t = Rig::new();
+    t.ctx(1);
+    assert_eq!(t.blob(1, 13, 131_268), RESP_OK_NODATA);
+    // 33 pages: one page short of room at the end of region 3 is refused...
+    assert_eq!(t.map(13, HOSTMEM - 131_072), RESP_ERR_INVALID_PARAMETER);
+    // ...and exactly 33 pages of room fits.
+    assert_eq!(t.map(13, HOSTMEM - 135_168), RESP_OK_MAP_INFO);
+}
+
 /// Blob sizes and region 3 placements.
 #[test]
 fn region_3_placements_are_checked() {
     let mut t = Rig::new();
     t.ctx(1);
-    // Size: page-aligned, nonzero, inside region 3.
-    assert_eq!(t.blob(1, 10, 4097), RESP_ERR_INVALID_PARAMETER);
+    // Size: nonzero, inside region 3 once rounded up to a page.
     assert_eq!(t.blob(1, 10, 0), RESP_ERR_INVALID_PARAMETER);
     assert_eq!(t.blob(1, 10, HOSTMEM + 4096), RESP_ERR_INVALID_PARAMETER);
+    assert_eq!(t.blob(1, 10, HOSTMEM + 1), RESP_ERR_INVALID_PARAMETER);
     // Guest-memory blobs are not served.
     let mut g = ResourceCreateBlob::from_bytes(&blob_cmd(1, 10, 4096)).unwrap();
     g.blob_mem = BLOB_MEM_GUEST;
