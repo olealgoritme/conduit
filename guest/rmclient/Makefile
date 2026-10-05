@@ -13,7 +13,7 @@ O       ?= build-make
 SRCS := src/rmclient.c src/status.c src/transport_linux.c src/transport_windows.c
 OBJS := $(SRCS:src/%.c=$(O)/%.o)
 
-all: $(O)/librmclient.a $(O)/librmclient.so $(O)/test_unit $(O)/crm_smoke $(O)/crm_event_smoke
+all: $(O)/librmclient.a $(O)/librmclient.so $(O)/test_unit $(O)/test_win_wire $(O)/crm_smoke $(O)/crm_event_smoke
 
 $(O):
 	mkdir -p $(O)
@@ -30,14 +30,18 @@ $(O)/librmclient.so: $(OBJS)
 $(O)/test_unit: tests/test_unit.c $(O)/librmclient.a
 	$(CC) $(XCFLAGS) $< $(O)/librmclient.a $(XLDFLAGS) -o $@
 
+$(O)/test_win_wire: tests/test_win_wire.c src/win_wire.h | $(O)
+	$(CC) $(XCFLAGS) $< -o $@
+
 $(O)/crm_smoke: tests/crm_smoke.c $(O)/librmclient.a
 	$(CC) $(XCFLAGS) $< $(O)/librmclient.a $(XLDFLAGS) -o $@
 
 $(O)/crm_event_smoke: tests/crm_event_smoke.c $(O)/librmclient.a
 	$(CC) $(XCFLAGS) $< $(O)/librmclient.a $(XLDFLAGS) -o $@
 
-check: $(O)/test_unit
+check: $(O)/test_unit $(O)/test_win_wire
 	$(O)/test_unit
+	$(O)/test_win_wire
 
 smoke: $(O)/crm_smoke
 	$(O)/crm_smoke

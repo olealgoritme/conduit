@@ -95,11 +95,24 @@ of the struct: `event_wait(fd, timeout_ms)`, `alloc_pages(size)` and
 count as missing, and the wrappers answer `-ENOSYS`.
 
 `crm_linux_transport()` is the Linux one. `crm_windows_transport()` is the
-Windows one (`src/transport_windows.c`): a **stub** until the Conduit KMD's
-escape ABI exists. `open`, `ioctl`, `map_memory`/`unmap_memory` and
-`event_wait` return `-ENOSYS`, so `crm_open` fails cleanly with `-ENOSYS`;
-`alloc_pages` already works (`VirtualAlloc`). The comment at the top of the
-file describes what each callback has to do over `D3DKMTEscape`.
+Windows one (`src/transport_windows.c`): RM escapes through the Conduit KMD as
+`HELIOS_ESCAPE_NVRM` calls on `D3DKMTEscape` (the ABI is
+`guest/windows/protocol/src/nvrm.rs`, mirrored in `src/helios_nvrm_escape.h`).
+It finds the Helios adapter by probing the verb, then does what the Linux guest
+module does in its kernel: builds the host's wire messages (`src/win_wire.h`,
+unit-tested on any host by `tests/test_win_wire.c`) from each NVIDIA escape and
+the blocks its pointers address. The KMD only forwards them and owns handles.
+A transport "fd" is the backend handle the host returned from Open, so fds
+written into payloads already mean what the host expects.
+
+Implemented: `open`, `close`, `ioctl` (including the parameter block of
+`NV_ESC_RM_CONTROL` and `NV_ESC_RM_ALLOC`), `map_memory`/`unmap_memory` (CPU
+mapping: Linux's channel-per-mapping protocol, with the KMD doing the final map)
+and `alloc_pages`. Still `-ENOSYS`, each waiting for its KMD verb: `event_wait`
+(OS events) and registering user memory as an OS descriptor.
+Controls whose parameters hold a pointer of their own are sent without it. The
+Windows build needs the vendored WDK headers
+(`guest/windows/icd/win-build/wdk-include`), which `meson.build` adds.
 `crm_open(&c, NULL)` uses `crm_default_transport()` (Linux or Windows).
 `$CRM_DEV_DIR` overrides `/dev` for tests.
 
@@ -149,5 +162,8 @@ works. Polling the fd for a real notification has not been tested. The backend's
 ABI profile needs 0x52, a 16-byte `NVOS41` whose `pEvent` is a nested
 16-byte user pointer, before event data can be read.
 
-Not done yet: the real Windows transport (needs the KMD escape ABI),
-`NV_ESC_RM_DUP_OBJECT`, and export/import of objects by fd.
+Not done yet: the Windows transport's events and OS-descriptor registration
+(the KMD verbs are reserved in the ABI but not implemented),
+`NV_ESC_RM_DUP_OBJECT`, and export/import of objects by fd. The Windows
+transport has been compiled (MinGW, x86_64 and i686) and its wire format
+unit-tested, but not yet run against a KMD.

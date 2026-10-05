@@ -123,9 +123,9 @@ struct crm_transport {
 const struct crm_transport *crm_linux_transport(void);
 
 /* The Windows transport: escapes through the Conduit KMD
- * (D3DKMTEscape). A stub for now: open/ioctl/map/event_wait answer -ENOSYS
- * until the KMD escape ABI exists; alloc_pages works (VirtualAlloc). NULL on
- * non-Windows builds. */
+ * (HELIOS_ESCAPE_NVRM on D3DKMTEscape). open/close/ioctl, CPU mapping and
+ * alloc_pages work; event_wait answers -ENOSYS until the KMD provides OS
+ * events. NULL on non-Windows builds. */
 const struct crm_transport *crm_windows_transport(void);
 
 /* The platform default transport (what crm_open(.., NULL) uses). */

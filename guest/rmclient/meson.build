@@ -17,10 +17,16 @@ deps = is_windows ? [] : [dependency('threads')]
 
 inc = include_directories('include')
 
+# The Windows transport talks to the Conduit KMD through D3DKMTEscape. mingw-w64
+# ships no D3DKMT headers, so it builds against the vendored WDK ones the Helios
+# ICD also uses (system include: they carry MSVC pragmas).
+wdk_inc = is_windows ? include_directories(
+  '../windows/icd/win-build/wdk-include', is_system : true) : []
+
 rmclient_lib = library('rmclient',
   'src/rmclient.c', 'src/status.c', 'src/transport_linux.c',
   'src/transport_windows.c',
-  include_directories : inc,
+  include_directories : [inc, include_directories('src'), wdk_inc],
   dependencies : deps,
   gnu_symbol_visibility : 'default',
   # MinGW: no libgcc DLL next to librmclient.dll
@@ -37,6 +43,12 @@ test_unit = executable('test_unit', 'tests/test_unit.c',
   include_directories : [inc, include_directories('src')],
   dependencies : [rmclient_dep] + deps)
 test('unit', test_unit)
+
+# The wire format the Windows transport speaks (src/win_wire.h): pure C, no OS
+# calls, so it is checked on every host.
+test_win_wire = executable('test_win_wire', 'tests/test_win_wire.c',
+  include_directories : include_directories('src'))
+test('win_wire', test_win_wire)
 
 # Needs a real (or Conduit-forwarded) NVIDIA GPU: built, never run by `meson test`.
 executable('crm_smoke', 'tests/crm_smoke.c',

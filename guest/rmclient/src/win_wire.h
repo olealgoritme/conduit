@@ -1,0 +1,250 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Wire format of Conduit's RM forwarding protocol (host/backend/protocol
+ * messages.rs), as the Windows transport builds and reads it.
+ *
+ * The Linux guest module (guest/linux/conduit_gpu.c) turns an RM escape into
+ * these messages inside the kernel; on Windows the KMD forwards them verbatim
+ * (HELIOS_ESCAPE_NVRM, FORWARD) and this code builds them in user mode. There
+ * is nothing OS-specific here, so it is exercised by tests/test_win_wire.c on
+ * any host.
+ *
+ * Everything is little-endian, which every host this runs on is.
+ *
+ *   request  = MsgHeader(16) | payload
+ *   MsgHeader = { u32 msg_type, u32 handle, i32 status, u32 padding }
+ *   Open     payload = { u32 device_type, u32 flags }
+ *   Ioctl    payload = IoctlReq(24) | data | nested | deep
+ *   IoctlReq = { u32 cmd, data_len, nested_offset, nested_len,
+ *                deep_ptr_offset, deep_len }
+ *   reply    = MsgHeader | (Ioctl) IoctlResp(12) | data | nested | deep
+ *   IoctlResp = { u32 data_len, nested_len, deep_len }
+ *
+ * `status` in a reply is the host's verdict on the call: 0, or a NEGATIVE
+ * errno. RM's own NV_STATUS stays inside the payload.
+ */
+#ifndef CRM_WIN_WIRE_H
+#define CRM_WIN_WIRE_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#define CRM_WIRE_MSG_OPEN 1u
+#define CRM_WIRE_MSG_CLOSE 2u
+#define CRM_WIRE_MSG_IOCTL 3u
+#define CRM_WIRE_MSG_GET_PROC_FILES 6u
+#define CRM_WIRE_MSG_GET_SYS_FILES 7u
+
+#define CRM_WIRE_DEV_CTL 255u /* /dev/nvidiactl */
+
+#define CRM_WIRE_HDR 16u
+#define CRM_WIRE_IOCTL_REQ 24u
+#define CRM_WIRE_IOCTL_RESP 12u
+
+/* The backend caps one Ioctl's blocks at 1 MiB each (the guest module does). */
+#define CRM_WIRE_BLOCK_MAX (1024u * 1024u)
+
+/* open(2) flags the host is told. O_RDWR; the host only reads the access mode. */
+#define CRM_WIRE_OPEN_FLAGS 2u
+
+/* Linux ioctl number for an NVIDIA escape: _IOWR('F', nr, size). The host
+ * dispatches on the full number, exactly as the guest module forwards it. */
+static inline uint32_t crm_wire_cmd(uint32_t nr, uint32_t size)
+{
+    return (3u << 30) | ((size & 0x3fffu) << 16) | ((uint32_t)'F' << 8) | (nr & 0xffu);
+}
+
+static inline void crm_put32(uint8_t *p, uint32_t v)
+{
+    memcpy(p, &v, sizeof(v));
+}
+
+static inline uint32_t crm_get32(const uint8_t *p)
+{
+    uint32_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static inline void crm_wire_header(uint8_t *out, uint32_t type, uint32_t handle)
+{
+    crm_put32(out + 0, type);
+    crm_put32(out + 4, handle);
+    crm_put32(out + 8, 0); /* status */
+    crm_put32(out + 12, 0);
+}
+
+/* Open: MsgHeader | { device_type, flags }. Returns the request length (24). */
+static inline size_t crm_wire_open(uint8_t *out, uint32_t device_type)
+{
+    crm_wire_header(out, CRM_WIRE_MSG_OPEN, 0);
+    crm_put32(out + 16, device_type);
+    crm_put32(out + 20, CRM_WIRE_OPEN_FLAGS);
+    return CRM_WIRE_HDR + 8;
+}
+
+/* Close: a bare header. Returns 16. */
+static inline size_t crm_wire_close(uint8_t *out, uint32_t handle)
+{
+    crm_wire_header(out, CRM_WIRE_MSG_CLOSE, handle);
+    return CRM_WIRE_HDR;
+}
+
+/* GetSysFiles: a bare header. Returns 16. */
+static inline size_t crm_wire_get_sys_files(uint8_t *out)
+{
+    crm_wire_header(out, CRM_WIRE_MSG_GET_SYS_FILES, 0);
+    return CRM_WIRE_HDR;
+}
+
+/* Request and reply sizes of an Ioctl carrying `data` plus one nested block. */
+static inline size_t crm_wire_ioctl_req_size(uint32_t data_len, uint32_t nested_len)
+{
+    return (size_t)CRM_WIRE_HDR + CRM_WIRE_IOCTL_REQ + data_len + nested_len;
+}
+
+static inline size_t crm_wire_ioctl_resp_max(uint32_t data_len, uint32_t nested_len)
+{
+    return (size_t)CRM_WIRE_HDR + CRM_WIRE_IOCTL_RESP + data_len + nested_len;
+}
+
+/* Ioctl with a data block and (optionally) one nested block, no deep block.
+ * `out` must hold crm_wire_ioctl_req_size() bytes; `nested` may be NULL when
+ * nested_len is 0. Returns the request length. The nested block is placed
+ * straight after the data block, and nested_offset equals data_len, which is
+ * how the guest module lays it out. */
+static inline size_t crm_wire_ioctl(uint8_t *out, uint32_t handle, uint32_t cmd,
+                                    const void *data, uint32_t data_len,
+                                    const void *nested, uint32_t nested_len)
+{
+    crm_wire_header(out, CRM_WIRE_MSG_IOCTL, handle);
+    crm_put32(out + 16, cmd);
+    crm_put32(out + 20, data_len);
+    crm_put32(out + 24, nested_len ? data_len : 0);
+    crm_put32(out + 28, nested_len);
+    crm_put32(out + 32, 0); /* deep_ptr_offset */
+    crm_put32(out + 36, 0); /* deep_len */
+    uint8_t *body = out + CRM_WIRE_HDR + CRM_WIRE_IOCTL_REQ;
+    if (data_len)
+        memcpy(body, data, data_len);
+    if (nested_len)
+        memcpy(body + data_len, nested, nested_len);
+    return crm_wire_ioctl_req_size(data_len, nested_len);
+}
+
+/* A parsed Ioctl reply. `data` and `nested` point into the reply buffer. */
+struct crm_wire_reply {
+    int32_t status;       /* MsgHeader.status: 0 or a negative errno */
+    uint32_t data_len;    /* bytes of data the host returned */
+    uint32_t nested_len;  /* bytes of nested block the host returned */
+    const uint8_t *data;
+    const uint8_t *nested;
+};
+
+/* Parse `MsgHeader | IoctlResp | data | nested | deep`. A reply that is only a
+ * header (the host refused the call, status < 0) parses with zero lengths; a
+ * short reply with status >= 0 is malformed. Returns 0, or -1 if the reply is
+ * shorter than what it claims. Lengths are clamped to what
+ * the caller can take (`data_cap`, `nested_cap`), never beyond the reply. */
+static inline int crm_wire_parse_ioctl_reply(const uint8_t *resp, size_t resp_len,
+                                             uint32_t data_cap, uint32_t nested_cap,
+                                             struct crm_wire_reply *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (resp_len < CRM_WIRE_HDR)
+        return -1;
+    out->status = (int32_t)crm_get32(resp + 8);
+    if (resp_len < CRM_WIRE_HDR + CRM_WIRE_IOCTL_RESP) {
+        /* Header only: the host refused the call, which it signals with a negative
+         * errno. A short reply that claims success is a malformed one, and handing
+         * the caller "success" with its struct untouched would be worse than an
+         * error. */
+        return out->status < 0 ? 0 : -1;
+    }
+    const uint8_t *body = resp + CRM_WIRE_HDR + CRM_WIRE_IOCTL_RESP;
+    size_t avail = resp_len - CRM_WIRE_HDR - CRM_WIRE_IOCTL_RESP;
+    uint32_t data_len = crm_get32(resp + CRM_WIRE_HDR + 0);
+    uint32_t nested_len = crm_get32(resp + CRM_WIRE_HDR + 4);
+    if (data_len > avail)
+        return -1;
+    if (nested_len > avail - data_len)
+        return -1;
+    out->data_len = data_len < data_cap ? data_len : data_cap;
+    out->nested_len = nested_len < nested_cap ? nested_len : nested_cap;
+    out->data = body;
+    out->nested = body + data_len;
+    return 0;
+}
+
+/*
+ * GetSysFiles stream -> the host's per-class allocation parameter sizes.
+ *
+ * The stream is: section 1, (path_len, content_len, path, content)* ended by a
+ * (0, 0) record; section 2, u32 count then count DRI records of
+ * (16 + 4 * 9) bytes plus a name; section 3, magic 'NVAL' (0x4e56414c), u32
+ * count, then count (u32 class, u32 params_size) pairs. Sections 4 and 5
+ * follow and are not read here. Section 3 is guarded by its magic, not by
+ * position, because a backend too old to send it leaves zeroes there.
+ *
+ * Writes up to `cap` {class, size} pairs to `pairs` (2 words each) and returns
+ * how many were found (0 if the stream has no section 3 or is malformed).
+ */
+#define CRM_WIRE_DEV_INFO_WORDS 9u
+#define CRM_WIRE_DRI_RECORD_BYTES (16u + 4u * CRM_WIRE_DEV_INFO_WORDS)
+#define CRM_WIRE_ALLOC_SIZE_MAGIC 0x4e56414cu
+
+static inline uint32_t crm_wire_parse_alloc_sizes(const uint8_t *s, size_t len,
+                                                  uint32_t *pairs, uint32_t cap)
+{
+    size_t at = 0;
+
+    /* section 1 */
+    for (;;) {
+        if (at + 8 > len)
+            return 0;
+        uint32_t path_len = crm_get32(s + at);
+        uint32_t content_len = crm_get32(s + at + 4);
+        at += 8;
+        if (path_len == 0 && content_len == 0)
+            break;
+        if ((size_t)path_len + content_len > len - at)
+            return 0;
+        at += (size_t)path_len + content_len;
+    }
+
+    /* section 2 */
+    if (at + 4 > len)
+        return 0;
+    uint32_t ndri = crm_get32(s + at);
+    at += 4;
+    for (uint32_t i = 0; i < ndri; i++) {
+        if (at + CRM_WIRE_DRI_RECORD_BYTES > len)
+            return 0;
+        uint32_t name_len = crm_get32(s + at);
+        at += CRM_WIRE_DRI_RECORD_BYTES;
+        if (name_len == 0 || name_len > len - at)
+            return 0;
+        at += name_len;
+    }
+
+    /* section 3 */
+    if (at + 8 > len || crm_get32(s + at) != CRM_WIRE_ALLOC_SIZE_MAGIC)
+        return 0;
+    uint32_t count = crm_get32(s + at + 4);
+    at += 8;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (at + 8 > len)
+            break;
+        if (n < cap) {
+            pairs[2 * n] = crm_get32(s + at);
+            pairs[2 * n + 1] = crm_get32(s + at + 4);
+            n++;
+        }
+        at += 8;
+    }
+    return n;
+}
+
+#endif /* CRM_WIN_WIRE_H */
