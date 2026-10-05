@@ -113,6 +113,14 @@ struct win_ctx {
     } *pend;
     uint32_t n_pend, cap_pend;
     int ctl_handle; /* the control channel, -1 until opened */
+
+    /* One manual-reset event per channel that has been waited on: the KMD signals
+     * it when the host reports the channel readable (HELIOS_NVRM_OP_EVENT_REGISTER). */
+    struct win_ev {
+        int fd;
+        HANDLE ev;
+    } *evs;
+    uint32_t n_evs, cap_evs;
 };
 
 static struct win_ctx g_ctx = { .lock = SRWLOCK_INIT, .ctl_handle = -1 };
@@ -486,8 +494,41 @@ static void win_close(void *vctx, int fd)
     win_close_one(c, fd);
 }
 
+/* HELIOS_NVRM_OP_EVENT_REGISTER / UNREGISTER for channel `fd`, kind READY. */
+static int nvrm_event_call(struct win_ctx *c, uint32_t op, uint32_t fd, HANDLE ev)
+{
+    HeliosNvrmEvent e;
+    memset(&e, 0, sizeof(e));
+    helios_nvrm_init(&e.head, op, sizeof(e));
+    e.handle = fd;
+    e.kind = HELIOS_NVRM_EVENT_READY;
+    e.event_handle = (uint64_t)(uintptr_t)ev;
+    int r = nvrm_escape(c, &e, sizeof(e));
+    return r ? r : kmd_status_to_errno(e.head.status);
+}
+
+/* Forget channel `fd`'s event (before the channel itself closes). */
+static void ev_drop(struct win_ctx *c, int fd)
+{
+    HANDLE ev = NULL;
+    AcquireSRWLockExclusive(&c->lock);
+    for (uint32_t i = 0; i < c->n_evs; i++) {
+        if (c->evs[i].fd == fd) {
+            ev = c->evs[i].ev;
+            c->evs[i] = c->evs[--c->n_evs];
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&c->lock);
+    if (ev) {
+        (void)nvrm_event_call(c, HELIOS_NVRM_OP_EVENT_UNREGISTER, (uint32_t)fd, ev);
+        CloseHandle(ev);
+    }
+}
+
 static void win_close_one(struct win_ctx *c, int fd)
 {
+    ev_drop(c, fd);
     uint8_t req[CRM_WIRE_HDR];
     uint8_t resp[CRM_WIRE_HDR + REPLY_SLACK];
     uint32_t n = 0;
@@ -888,12 +929,70 @@ static int win_unmap_memory(void *vctx, int ctl_fd, const struct crm_map_request
     return 0;
 }
 
-static int win_event_wait(void *ctx, int fd, uint32_t timeout_ms)
+/* The event of channel `fd`, created and registered with the KMD on first use. */
+static int ev_get(struct win_ctx *c, int fd, HANDLE *out)
 {
-    (void)ctx;
-    (void)fd;
-    (void)timeout_ms;
-    return -ENOSYS; /* HELIOS_NVRM_OP_EVENT_REGISTER: not implemented by the KMD yet */
+    int r = 0;
+    AcquireSRWLockExclusive(&c->lock);
+    for (uint32_t i = 0; i < c->n_evs; i++) {
+        if (c->evs[i].fd == fd) {
+            *out = c->evs[i].ev;
+            ReleaseSRWLockExclusive(&c->lock);
+            return 0;
+        }
+    }
+    if (c->n_evs == c->cap_evs) {
+        uint32_t ncap = c->cap_evs ? c->cap_evs * 2 : 4;
+        struct win_ev *n = realloc(c->evs, (size_t)ncap * sizeof(*n));
+        if (!n)
+            r = -ENOMEM;
+        else {
+            c->evs = n;
+            c->cap_evs = ncap;
+        }
+    }
+    if (r == 0) {
+        HANDLE ev = CreateEventW(NULL, TRUE /* manual reset */, FALSE, NULL);
+        if (!ev) {
+            r = -ENOMEM;
+        } else {
+            /* The KMD latches a wake that arrived before the registration and
+             * signals it at once, so nothing is lost here. */
+            r = nvrm_event_call(c, HELIOS_NVRM_OP_EVENT_REGISTER, (uint32_t)fd, ev);
+            if (r == 0) {
+                c->evs[c->n_evs++] = (struct win_ev){ .fd = fd, .ev = ev };
+                *out = ev;
+            } else {
+                CloseHandle(ev);
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&c->lock);
+    return r;
+}
+
+/* Block until the host reports channel `fd` readable. The event is level style:
+ * a wake that arrives while nobody waits stays signalled. Reset it on the way out
+ * (before the caller drains), so a wake after the reset is seen by the next wait. */
+static int win_event_wait(void *vctx, int fd, uint32_t timeout_ms)
+{
+    struct win_ctx *c = vctx;
+    if (fd < 0)
+        return -EBADF;
+    HANDLE ev = NULL;
+    int r = ev_get(c, fd, &ev);
+    if (r)
+        return r;
+    const DWORD ms = timeout_ms == 0xFFFFFFFFu ? INFINITE : (DWORD)timeout_ms;
+    switch (WaitForSingleObject(ev, ms)) {
+    case WAIT_OBJECT_0:
+        ResetEvent(ev);
+        return 1;
+    case WAIT_TIMEOUT:
+        return 0;
+    default:
+        return -EIO;
+    }
 }
 
 static int win_alloc_pages(void *ctx, uint64_t size, void **ptr)
