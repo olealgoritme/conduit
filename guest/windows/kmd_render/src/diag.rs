@@ -590,6 +590,15 @@ pub mod knobs {
     /// 0 is coerced to 1 (a zero-depth flip queue is not representable) and the
     /// value actually advertised is mirrored in the `FlipQueV` counter.
     pub const FLIP_QUEUE_DEPTH: KnobName = KnobName::new(b"FlipQueueN");
+    /// `OutputTech` (default 1): the connector type the virtual monitor's child
+    /// device reports to Windows. 1 = DisplayPort (external), 2 = HDMI, 3 = DVI,
+    /// 4 = internal, 0 = HD15 (analog VGA, the historical value). Anything else
+    /// is DisplayPort. A real GPU reports a digital connection; as HD15 Windows
+    /// applies analog-monitor frequency rules, which is why modes above 60 Hz
+    /// never came up. Read in `QueryChildRelations`, so `pnputil /restart-device`
+    /// applies a change without a rebuild; the value in force is mirrored in the
+    /// `OutTech` counter.
+    pub const OUTPUT_TECH: KnobName = KnobName::new(b"OutputTech");
     /// `PresentWmk` (default 1 = ON since 22.22.244.0). Gate a WDDM submission
     /// that carries a LIVE present stream boundary on that exact boundary
     /// alone, rather than additionally on every transport entry enqueued before
