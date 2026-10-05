@@ -29,6 +29,8 @@ positive `NV_STATUS` when RM refused the call. `crm_status_name()` and
 | `crm_gpu_count`, `crm_gpu_info`, `crm_gpu_pci` | the `NV_ESC_CARD_INFO` read at open |
 | `crm_alloc_os_descriptor(c, device, &h, addr, size, flags)` | `NV_ESC_RM_ALLOC_MEMORY` (NVOS02 + fd) on the GPU channel: `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` over the caller's own pages. RM accepts a user address only on this route; `NV_ESC_RM_ALLOC` of the class answers `NV_ERR_NOT_SUPPORTED`. |
 | `crm_event_open` / `crm_event_drain` / `crm_event_close` | a new control fd, `NV_ESC_ALLOC_OS_EVENT`, `NV01_EVENT_OS_EVENT` with `data = fd` / `NV_ESC_RM_GET_EVENT_DATA` / `NV_ESC_FREE_OS_EVENT` |
+| `crm_event_wait(c, fd, timeout_ms)` | none: waits for the event channel (Linux: `poll` POLLIN). 1 signalled, 0 timeout, `-ENOSYS` if the transport cannot wait |
+| `crm_alloc_pages` / `crm_free_pages` | none: host pages for `crm_alloc_os_descriptor` (Linux: anonymous `mmap` with `MAP_POPULATE`, `MADV_DONTFORK`; Windows: `VirtualAlloc`) |
 | `crm_escape(c, fd, nr, arg, size)` | any escape, unwrapped |
 | `crm_new_handle`, `crm_release_handle`, `crm_free_quiet`, `crm_object_count`, `crm_mapping_count`, `crm_rm_version`, `crm_ctl_fd` | helpers |
 
@@ -64,8 +66,11 @@ What the library does for the caller:
   passed through unchanged, so a driver that manages its own VA (NVK) can
   allocate one large VirtualMemory and map with `NVOS46_FLAGS_DMA_OFFSET_FIXED`
   itself.
-- **Threads.** The client's bookkeeping is protected by a C11 `mtx_t`. RM calls
-  run concurrently.
+- **Threads.** The client's bookkeeping is protected by a C11 `mtx_t` (an SRW
+  lock on Windows, `src/crm_mutex.h`). RM calls run concurrently.
+- **OS services.** Everything else OS-specific that a driver on RM needs (event
+  waits, pinnable host pages) also goes through the library, so NVK's RM
+  backend calls neither `mmap` nor `poll` and builds for Windows unchanged.
 
 ## Transports (`include/rmclient_transport.h`)
 
@@ -84,8 +89,19 @@ way, such as a Windows KMD that maps into the process and returns the address,
 sets the optional `map_memory` / `unmap_memory` hooks instead, and the library
 skips its own protocol.
 
-`crm_linux_transport()` is the Linux one. `crm_open(&c, NULL)` uses
-`crm_default_transport()`. `$CRM_DEV_DIR` overrides `/dev` for tests.
+Transport ABI 2 (`CRM_TRANSPORT_ABI`) adds three optional callbacks at the end
+of the struct: `event_wait(fd, timeout_ms)`, `alloc_pages(size)` and
+`free_pages`. `crm_open` still accepts ABI 1 transports; their ABI 2 callbacks
+count as missing, and the wrappers answer `-ENOSYS`.
+
+`crm_linux_transport()` is the Linux one. `crm_windows_transport()` is the
+Windows one (`src/transport_windows.c`): a **stub** until the Conduit KMD's
+escape ABI exists. `open`, `ioctl`, `map_memory`/`unmap_memory` and
+`event_wait` return `-ENOSYS`, so `crm_open` fails cleanly with `-ENOSYS`;
+`alloc_pages` already works (`VirtualAlloc`). The comment at the top of the
+file describes what each callback has to do over `D3DKMTEscape`.
+`crm_open(&c, NULL)` uses `crm_default_transport()` (Linux or Windows).
+`$CRM_DEV_DIR` overrides `/dev` for tests.
 
 ## Build and test
 
@@ -94,6 +110,18 @@ meson setup build && meson test -C build        # unit tests (fake transport, no
 make check                                      # same without meson (build-make/)
 make smoke                                      # tests/crm_smoke.c against a real RM
 ```
+
+Windows (cross-compiled on Linux with MinGW-w64; `guest/nvk-rm/build-windows.sh`
+does this as part of the NVK build):
+
+```sh
+meson setup build-win --cross-file ../nvk-rm/windows/mingw-x86_64.ini
+ninja -C build-win                 # librmclient.dll, librmclient.dll.a, test_unit.exe, ...
+wine build-win/test_unit.exe       # unit tests pass under wine (wine64 9.0)
+```
+
+`librmclient.dll` depends on system DLLs only (KERNEL32, msvcrt). MinGW
+exports every non-static function (there is no `.def` file yet).
 
 `tests/test_unit.c` runs the library against a fake transport that acts as a
 small RM. It covers handle allocation and reuse, table growth, NVOS
@@ -121,5 +149,5 @@ works. Polling the fd for a real notification has not been tested. The backend's
 ABI profile needs 0x52, a 16-byte `NVOS41` whose `pEvent` is a nested
 16-byte user pointer, before event data can be read.
 
-Not done yet: the Windows transport, `NV_ESC_RM_DUP_OBJECT`, and
-export/import of objects by fd.
+Not done yet: the real Windows transport (needs the KMD escape ABI),
+`NV_ESC_RM_DUP_OBJECT`, and export/import of objects by fd.

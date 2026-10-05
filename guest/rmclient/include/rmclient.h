@@ -135,6 +135,20 @@ int crm_event_drain(crm_client *c, int event_fd, struct crm_event_data *out, int
 int crm_alloc_os_descriptor(crm_client *c, uint32_t device, uint32_t *object,
                             void *addr, uint64_t size, uint32_t nvos02_flags);
 
+/* Wait for an event channel from crm_event_open to be signalled (Linux:
+ * poll() for POLLIN). Returns 1 if it is (drain it with crm_event_drain to
+ * re-arm), 0 after timeout_ms, or -errno; -ENOSYS when the transport cannot
+ * wait, and callers then sleep-poll instead. */
+int crm_event_wait(crm_client *c, int event_fd, uint32_t timeout_ms);
+
+/* Host memory for crm_alloc_os_descriptor: `size` bytes (a multiple of the
+ * page size), page aligned, zero filled and resident, from the transport
+ * (Linux: private anonymous mmap with MAP_POPULATE and MADV_DONTFORK, since
+ * RM pins the pages; Windows: VirtualAlloc). Free it with crm_free_pages and
+ * the same size, after the OS-descriptor object is gone. */
+int crm_alloc_pages(crm_client *c, uint64_t size, void **addr);
+int crm_free_pages(crm_client *c, void *addr, uint64_t size);
+
 /* Raw escape on the control channel (fd = -1) or a transport fd, for escapes
  * this API does not wrap. Returns 0 or -errno; RM status stays in *arg. */
 int crm_escape(crm_client *c, int fd, uint32_t nr, void *arg, uint32_t size);

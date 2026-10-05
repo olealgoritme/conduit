@@ -25,6 +25,12 @@
  * unmap_memory instead; librmclient then calls those and skips its own
  * protocol.
  *
+ * Everything else a user-mode driver needs from the OS around RM also goes
+ * through the transport (ABI 2), so that the driver itself stays portable:
+ * waiting for an OS event channel to be signalled (Linux: poll() on the
+ * event fd) and allocating the host pages that become
+ * NV01_MEMORY_SYSTEM_OS_DESCRIPTOR memory (Linux: anonymous mmap).
+ *
  * All callbacks return 0 or a negative errno. Escape status from RM is not a
  * transport error: an escape that reached RM returns 0 and RM's NV_STATUS is
  * in the payload.
@@ -39,7 +45,9 @@
 extern "C" {
 #endif
 
-#define CRM_TRANSPORT_ABI 1
+/* 2 added event_wait, alloc_pages and free_pages at the end of the struct.
+ * crm_open still takes ABI 1 transports (those callbacks are then NULL). */
+#define CRM_TRANSPORT_ABI 2
 
 /* Channel ("node") to open: the control channel or a GPU minor number. */
 #define CRM_NODE_CTL (-1)
@@ -94,12 +102,31 @@ struct crm_transport {
 
     /* Optional: called by crm_close after the last channel is closed. */
     void (*destroy)(void *ctx);
+
+    /* ---- ABI 2 ---- */
+
+    /* Optional: block until the event channel fd (from crm_event_open) is
+     * signalled or timeout_ms passes. Returns 1 if signalled, 0 on timeout,
+     * or a negative errno. NULL: crm_event_wait answers -ENOSYS. */
+    int  (*event_wait)(void *ctx, int fd, uint32_t timeout_ms);
+
+    /* Optional: page-aligned, zero-filled, resident host memory that RM can
+     * pin as an OS descriptor (crm_alloc_os_descriptor). NULL:
+     * crm_alloc_pages answers -ENOSYS. */
+    int  (*alloc_pages)(void *ctx, uint64_t size, void **ptr);
+    void (*free_pages)(void *ctx, void *ptr, uint64_t size);
 };
 
 /* The Linux transport: /dev/nvidiactl, /dev/nvidiaN, ioctl(_IOWR('F', nr,
  * size)), mmap(MAP_SHARED). Device directory defaults to /dev and can be
  * overridden with $CRM_DEV_DIR (tests). NULL on non-Linux builds. */
 const struct crm_transport *crm_linux_transport(void);
+
+/* The Windows transport: escapes through the Conduit KMD
+ * (D3DKMTEscape). A stub for now: open/ioctl/map/event_wait answer -ENOSYS
+ * until the KMD escape ABI exists; alloc_pages works (VirtualAlloc). NULL on
+ * non-Windows builds. */
+const struct crm_transport *crm_windows_transport(void);
 
 /* The platform default transport (what crm_open(.., NULL) uses). */
 const struct crm_transport *crm_default_transport(void);
