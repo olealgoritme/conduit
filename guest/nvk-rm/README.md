@@ -10,9 +10,13 @@ through [librmclient](../rmclient), which it loads at runtime.
 Status: **runs on an RTX 5090 (GB202, GSP firmware, RM 610.57.04) in the
 `lab` guest.** `vulkaninfo` enumerates the GPU through NVK, a compute test
 (storage buffer, dispatch, device-local buffer + copy, 5000 back-to-back
-submits) passes, and `vkcube` renders through the software X11 WSI. See
-"First run" at the end for what was run and what is still open. dEQP has not
-been run yet.
+submits) passes, and `vkcube` presents **zero-copy** on the guest desktop
+through Mesa's native X11 (DRI3/Present via Xwayland) and Wayland
+(linux-dmabuf) WSI: the swapchain images stay in VRAM, block-linear with
+NVIDIA DRM format modifiers, and go to the compositor as dma-bufs through
+Conduit's nvidia-drm node (see "Zero-copy presentation"). See "First run"
+and "Zero-copy run" at the end for what was run and what is still open.
+dEQP has not been run yet.
 
 Design background: `docs/research/nvk-rm.md` (on the `feat/nvk-rm` branch).
 
@@ -32,6 +36,10 @@ Mesa `main` at **`70c4c018cbe5b78a1db7e9413bc7e511b366fd95`**
 | 7 | `nvk/rm: timeline syncs on RM semaphores` | `vk_sync` type on 64-bit semaphores in memory |
 | 8 | `nvk/rm: fixes from the first run on an RTX 5090 (GB202, GSP)` | OS descriptors via `crm_alloc_os_descriptor`, RM's VA alignment rules, the device VA space, SYNC subcontext + channel bind, `cls_m2mf`, sync features |
 | 9 | `nvk/rm: track GPFIFO progress with a semaphore; binary sync move` | ring progress without USERD GP_GET, `move` for binary syncs |
+| 10 | `nvk/rm: report VA ranges at the size NVK asked for` | RM's 2 MiB rounding stays internal (`rm_size_B`); fixes the bind assert for images of 2 MiB and more (vkcube at 1280x720+) |
+| 11 | `nvk/rm: stop polling a non-stall event whose data cannot be read` | a refused `NV_ESC_RM_GET_EVENT_DATA` leaves the event readable for good; waits sleep instead of spinning through refused escapes |
+| 12 | `vulkan/wsi, nvk: wait for rendering before presenting without implicit sync` | `wsi_device::wait_before_present`, set by NVK when the backend has dma-bufs but no sync_file export (RM) |
+| 13 | `nvk/rm: dma-buf export and import through nvidia-drm, DRM format modifiers` | `has_dma_buf` + `has_alloc_tiled` for RM: export/import of RM memory as dma-bufs via `OS_UNIX_EXPORT/IMPORT_OBJECT` and nvidia-drm's GEM import/export; DRM node discovery; `VK_EXT_image_drm_format_modifier` |
 
 Each patch builds on its own.
 
@@ -85,9 +93,123 @@ vulkaninfo --summary
   610.57.04; `CRM_RM_VERSION=any` relaxes that.
 - The VM needs `--caps graphics`: NVK allocates the 3D class on every queue,
   compute included.
-- `NVK_DEBUG=vm` prints what RM reported for the GPU (classes, VRAM, GPCs)
-  and every VA operation; `NVK_DEBUG=push_sync,push_dump` syncs and dumps
-  every submit.
+- `NVK_DEBUG=vm` prints what RM reported for the GPU (classes, VRAM, GPCs),
+  the DRM node used for dma-bufs (with its page kind, kind generation and
+  sector layout), every export and every VA operation;
+  `NVK_DEBUG=push_sync,push_dump` syncs and dumps every submit.
+- A GNOME session in a Conduit guest exports `VK_DRIVER_FILES` (NVIDIA's
+  ICD), which takes precedence over `VK_ICD_FILENAMES`: from a desktop
+  terminal set `VK_DRIVER_FILES` to NVK's ICD as well, or apps silently run
+  on NVIDIA's driver.
+- Presentation is zero-copy whenever an nvidia-drm node is found;
+  `MESA_VK_WSI_DEBUG=sw` forces the software WSI (CPU copy per frame), and
+  `NVK_RM_DMABUF=0` turns dma-bufs off altogether (no external memory
+  extensions, software WSI).
+
+In `lab`, `~/nvk-cube.sh` does all of that (from ssh it picks the desktop
+session's `DISPLAY=:0`, Xwayland auth and `wayland-0`):
+
+```sh
+~/nvk-cube.sh                      # vkcube --wsi xcb, zero-copy
+~/nvk-cube.sh --wsi wayland        # Wayland, zero-copy
+~/nvk-cube.sh --sw [...]           # software WSI, the first-run path
+~/nvk-cube.sh --present_mode 0 --c 5000 --width 1920 --height 1080
+```
+
+## Zero-copy presentation
+
+```
+NVK (RM backend)                         guest kernel (conduit_gpu)            host
+NV01_MEMORY_LOCAL_USER (VRAM) ──OS_UNIX_EXPORT_OBJECT_TO_FD──► fresh /dev/nvidiactl fd
+          │                              (fd swapped for the backend's)
+          └─DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY on renderD128 ──► forwarded ──► host nvidia-drm GEM object
+                                         guest GEM proxy ◄───────────────────┘
+                     PRIME_HANDLE_TO_FD ─► dma-buf (guest)
+                                              │ DRI3 PixmapFromBuffers / zwp_linux_dmabuf_v1
+                                              ▼
+                     Xwayland / gnome-shell (NVIDIA EGL/GBM): PRIME_FD_TO_HANDLE,
+                     GEM_EXPORT_NVKMS_MEMORY ─► RM import into their client: same VRAM
+                                              │ composited frame, guest KMS flip
+                                              ▼
+                     ScanoutFlip ─► backend PRIME export ─► conduit-viewer (docs/SCANOUT.md)
+```
+
+- **Export** (`nvkmd_rm_mem.c`): on the first `vkGetMemoryFdKHR` the memory
+  object is exported to a freshly opened `/dev/nvidiactl`
+  (`NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD`, 0x3d05), nvidia-drm imports
+  that descriptor (`DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY` with an
+  `NvKmsKapiPrivImportMemoryParams`: block-linear or pitch, log2 GOBs per
+  block from the image's tile mode) and the GEM handle is kept for the
+  memory's lifetime, so every export is the same dma-buf. This is exactly
+  how NVIDIA's own userspace hands RM memory to nvidia-drm, so Conduit's
+  guest module and host backend already forward all of it (the fd inside
+  the nested parameters is swapped for the backend's on both routes).
+  Exportable system memory is RM's `NV01_MEMORY_SYSTEM`, never our own
+  OS-descriptor pages.
+- **Import**: `PRIME_FD_TO_HANDLE`, `DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY` to a
+  fresh `/dev/nvidiactl`, `NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD`
+  (0x3d06) into our client under a `crm_new_handle` handle, placement from
+  `NV0041_CTRL_CMD_GET_SURFACE_INFO`; mapped into our VA space like our own
+  memory. dma-bufs from other drivers fail at `GEM_EXPORT_NVKMS_MEMORY`.
+- **DRM node** (`nvkmd_rm_pdev.c`): the DRM device at the GPU's PCI address
+  (Conduit's PCI mirror `0010:01:00.0`, which RM also reports), named
+  `nvidia-drm` by `DRM_IOCTL_VERSION`, answering `DRM_NVIDIA_GET_DEV_INFO`.
+  Its render/primary dev_t become `VK_EXT_physical_device_drm`, so Mesa's
+  WSI recognises the X server's DRI3 device and the compositor's
+  linux-dmabuf main device as ours (no prime blit).
+- **Modifiers**: `VK_EXT_image_drm_format_modifier` with NIL's list. For
+  32 bpp color on GB202 that is `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1,
+  2, 0x06, h)` = `0x030000000060601h` (h = log2 GOB height 0..5), plus
+  LINEAR. nvidia-drm reports generic kind 0x06, kind generation 2, sector
+  layout 1 for this GPU, which is what Conduit's guest KMS advertises and
+  NVIDIA's EGL/GBM pick from, so the lists intersect; vkcube's 500x500
+  images use h = 5 (`0x0300000000606015`). Kinds are still applied per
+  mapping (the image's own VA); `has_alloc_tiled` only records the layout.
+- **Sync**: RM attaches no fences to dma-bufs and our syncs cannot become
+  sync_files yet, so the WSI waits on the CPU for each image's rendering
+  before presenting it (`wait_before_present`, patch 12). The compositor's
+  reads are ordered by the WSI's buffer release / Present idle events.
+  vk_sync_binary's emulated sync_file import/export is removed for RM: the
+  WSI took it for real support and failed the first acquire.
+
+No guest kernel module change and no host change was needed.
+
+## Zero-copy run (2026-10-05, `lab`, RTX 5090, GNOME Shell 50.1 on Wayland, Xwayland 24.1.10)
+
+- `vkcube --wsi xcb` and `--wsi wayland` render correctly (an `xwd` of the
+  window read back through Xwayland's glamor, i.e. NVIDIA's EGL importing
+  NVK's block-linear dma-buf); `NVK_DEBUG=vm` shows the three swapchain
+  images exported with kind 0x6, tile 0x50.
+- No CPU copy: over 200 frames at 1920x1080, vkcube writes 23 KB in total to
+  its sockets on the zero-copy path and 1.66 GB (one 8 MB `PutImage` per
+  frame) with `--sw`.
+- Frame rate, 5000 frames, uncapped present modes (IMMEDIATE on X11,
+  MAILBOX on Wayland; IMMEDIATE is not offered on Wayland):
+
+  | window | X11 zero-copy | X11 `--sw` | Wayland zero-copy | Wayland `--sw` |
+  |---|---|---|---|---|
+  | 500x500 | 3560 fps | 2200 fps | 5510 fps | 2290 fps |
+  | 1920x1080 | 2900 fps | 630 fps | 4880 fps | 590 fps |
+  | 3840x1400 | 3060 fps | 230 fps | 4090 fps | 240 fps |
+
+  With FIFO, X11 runs at the 240 Hz display rate (229-237 fps) either way.
+  Wayland FIFO paces at ~235 fps for a 500x500 window but ~60 fps for larger
+  ones; NVIDIA's own Vulkan driver gets 55 fps in the same windows, so that
+  is gnome-shell's frame-callback pacing, not NVK.
+- `tests/vk_dmabuf_test.c`: device A fills a device-local exportable buffer
+  and exports it, device B (a second RM client) imports the dma-buf and
+  reads back all 1 Mi values; two exports are the same dma-buf. Passes
+  (`cc -O1 tests/vk_dmabuf_test.c -lvulkan -o vk_dmabuf_test`, run with the
+  environment above). The compute test still passes.
+- Host: with `conduit view lab` open, the viewer shows the cube at 240 fps
+  (`commit 240.0 fps ... 0 rejected`), all dma-buf ATTACH/COMMIT. Those are
+  gnome-shell's composited frames: neither NVK's nor NVIDIA's vkcube gets
+  direct scanout from gnome-shell here, even fullscreen, so NVK's buffer
+  itself is not what the guest KMS flips; the whole chain still has no CPU
+  copy.
+- No refusals in the backend log, apart from `GET_EVENT_DATA` (escape
+  0x52; the running backend predates the change that serves it): patch 11
+  turns the ~5800/s of those into one per device.
 
 ## NVK on Blackwell (Mesa main)
 
@@ -179,8 +301,10 @@ added (the runtime needs it for binary semaphores in assisted mode). GPU signal:
 `SEM_EXECUTE ACQ_STRICT_GEQ` with TSG switch. CPU wait: read the value, spin
 briefly, then `poll()` the non-stall event fd (bounded at 10 ms per round, so
 a lost wakeup costs at most that) or sleep with backoff without an event.
-Event payloads are never needed (`crm_event_drain` is best effort; Conduit
-refuses `NV_ESC_RM_GET_EVENT_DATA` in guests). `WAIT_PENDING` uses a
+Event payloads are never needed, but the event has to be drained to re-arm:
+a host that refuses `NV_ESC_RM_GET_EVENT_DATA` leaves it readable for good,
+so after the first failed drain waits sleep with backoff instead of polling
+(patch 11). `WAIT_PENDING` uses a
 per-sync "highest submitted value". `WAIT_BEFORE_SIGNAL` is not advertised,
 so Vulkan runs in assisted timeline mode (a submit thread holds back waits on
 unsubmitted values instead of leaving GPU acquires spinning).
@@ -189,10 +313,11 @@ unsubmitted values instead of leaving GPU acquires spinning).
 
 | item | state | needs |
 |---|---|---|
-| dma-buf import/export, external memory/semaphore/fence fds | not supported (extensions not advertised) | nvidia-drm GEM import of RM memory or `NV0000_CTRL_CMD_OS_UNIX_EXPORT/IMPORT_OBJECT_*`; `NV_SEMAPHORE_SURFACE` + nvidia-drm sync_file bridge |
-| presentation | software WSI (CPU copy per frame), untested | the above, for zero-copy |
+| dma-buf / opaque-fd memory export and import | done (see "Zero-copy presentation") | cross-driver import (a dma-buf nvidia-drm cannot name) is refused |
+| external semaphore/fence fds, explicit sync | not supported (no handle types) | `NV_SEMAPHORE_SURFACE` + nvidia-drm's `SEMSURF_FENCE_*` (Conduit forwards them) for sync_files and syncobjs; then drop `wait_before_present` and use Wayland explicit sync / DRI3 syncobj |
+| presentation | zero-copy (dma-buf + modifiers), CPU wait before each present | explicit sync, above |
 | host-visible VRAM, BAR heap | off | Conduit's 1 GiB mapping window question |
-| tiled BOs / DRM modifiers, compression | off | comptags (`NVOS32_ATTR_COMPR_REQUIRED`) |
+| compression | off | comptags (`NVOS32_ATTR_COMPR_REQUIRED`) and compressed modifiers |
 | transfer queue (async CE channel), video decode | off | a second TSG with `NV2080_ENGINE_TYPE_COPY(n)` |
 | zcull info | not queried | `NV2080_CTRL_CMD_GR_GET_ZCULL_INFO` |
 | fixed CPU maps, overmap (`VK_EXT_map_memory_placed`) | off | |
@@ -203,7 +328,8 @@ unsubmitted values instead of leaving GPU acquires spinning).
 ## librmclient
 
 Used: the base contract plus `crm_map_dma2` (PTE kind), `crm_free_quiet`,
-`crm_event_open/close/drain`. All additions are looked up with `dlsym` and
+`crm_event_open/close/drain`, `crm_alloc_os_descriptor`, and for dma-buf
+import `crm_new_handle/crm_release_handle`. All additions are looked up with `dlsym` and
 optional: without `crm_map_dma2` images get the physical (generic) kind,
 without events CPU waits sleep-poll.
 
@@ -229,9 +355,12 @@ table with the parameter sizes the backend sends (`NV01_ROOT_CLIENT`,
 `BLACKWELL_COMPUTE_B`, `BLACKWELL_DMA_COPY_B`, `BLACKWELL_USERMODE_A`,
 `NV01_EVENT_OS_EVENT`; controls 0x205, 0x21b, 0x800292, 0x20801701,
 0x20801801, 0x20800110, 0x20801303, 0x20801228, 0x20800403, 0x20800301,
-0xc36f010a, 0xc36f0108, 0xa06c0101, 0xa06f0104) and the
-`NV_ESC_RM_ALLOC_MEMORY` route for OS descriptors. Confirmed in the first
-run: nothing NVK sends is refused. Operationally:
+0xc36f010a, 0xc36f0108, 0xa06c0101, 0xa06f0104; for dma-bufs 0x3d05,
+0x3d06, 0x410110) and the `NV_ESC_RM_ALLOC_MEMORY` route for OS
+descriptors; the nvidia-drm ioctls (`GET_DEV_INFO`, `GEM_IMPORT_NVKMS_MEMORY`,
+`GEM_EXPORT_NVKMS_MEMORY`, PRIME) are the ones Conduit already serves for
+NVIDIA's own userspace. Confirmed in the first run: nothing NVK sends is
+refused. Operationally:
 
 - the VM needs `--caps graphics`;
 - worth checking in the first run: that the backend's OS-descriptor
@@ -239,9 +368,9 @@ run: nothing NVK sends is refused. Operationally:
   passes (with `MADV_DONTFORK`), and that RM-allocated system memory used
   for USERD and the error notifier is mappable within the window budget
   (8 KiB per queue);
-- the non-stall event wakeup: whether `poll()` on a dataless event fd
-  re-arms without `GET_EVENT_DATA` under the guest module (if it stays
-  readable, waits degrade to spinning on `poll()`, still correct).
+- the non-stall event stays readable unless `GET_EVENT_DATA` drains it; a
+  backend built before `5a4b99c` refuses that escape (NVK then sleeps in
+  CPU waits, patch 11), a newer one serves it.
 
 ## Test plan (Linux `lab` guest, RTX 5090)
 
@@ -320,6 +449,5 @@ with GP_GET never written back (`DEVICE_LOST` after 1023 entries).
 
 Still to do: dEQP-VK (not built: the host had about 2 GiB of memory to
 spare), test plan steps 5 (bad pushbuffer → `DEVICE_LOST`) and 7 (sparse,
-many fences), a Mesa build inside the guest, and a look at whether
-`poll()` on the dataless non-stall event re-arms (waits were fast, so the
-fallback paths are at least not slow).
+many fences), a Mesa build inside the guest. (The non-stall event does not
+re-arm without `GET_EVENT_DATA`; found in the zero-copy run, patch 11.)

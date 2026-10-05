@@ -1,7 +1,8 @@
 From d35e85a388c6e89e438cde9818d664eabe7a28db Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 21:21:27 +0200
-Subject: [PATCH 3/9] nvk/rm: enumerate RM GPUs and fill in the physical device
+Subject: [PATCH 03/13] nvk/rm: enumerate RM GPUs and fill in the physical
+ device
 
 With NVK_RM=1 in the environment, NVK asks librmclient for the GPUs RM
 knows about before looking at DRM devices.  For each one it opens an RM

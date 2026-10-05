@@ -1,7 +1,7 @@
 From c56e7de11802fcecfbe2a2586c683d0f30e75be6 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 21:23:55 +0200
-Subject: [PATCH 4/9] nvk/rm: logical device and memory
+Subject: [PATCH 04/13] nvk/rm: logical device and memory
 
 Each nvkmd_rm_dev opens its own RM client with its own NV01_DEVICE_0 and
 NV20_SUBDEVICE_0, and sets up:

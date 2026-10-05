@@ -400,7 +400,9 @@ local process gets from RM, inside its own RM client and VA space.
 
 - dma-buf export/import via nvidia-drm GEM (`GEM_IMPORT_NVKMS_MEMORY` and
   related ioctls, already forwarded) or the RM `EXPORT_OBJECT_TO_FD` controls;
-  then `has_dma_buf` and zero-copy present.
+  then `has_dma_buf` and zero-copy present. **Done** (both, combined:
+  `EXPORT_OBJECT_TO_FD` then `GEM_IMPORT_NVKMS_MEMORY`, as NVIDIA's
+  userspace does; see guest/nvk-rm/README.md, "Zero-copy presentation").
 - Semaphore surface + nvidia-drm sync_file → DRM syncobj interop (explicit-sync
   WSI, external semaphores).
 - Compression (comptags, `has_compression`), host-visible VRAM once the window

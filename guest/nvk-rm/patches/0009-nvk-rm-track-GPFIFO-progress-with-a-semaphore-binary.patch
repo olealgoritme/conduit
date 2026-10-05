@@ -1,7 +1,7 @@
 From 56bc857b218b02ba40a154f2478d215b901dff62 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 22:15:15 +0200
-Subject: [PATCH 9/9] nvk/rm: track GPFIFO progress with a semaphore; binary
+Subject: [PATCH 09/13] nvk/rm: track GPFIFO progress with a semaphore; binary
  sync move
 
 Two failures from running vkcube on GB202 under GSP:

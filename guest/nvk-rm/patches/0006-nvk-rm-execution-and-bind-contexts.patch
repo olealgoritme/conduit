@@ -1,7 +1,7 @@
 From a1d52b465aa8bb793e706f482f262caeccc12431 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 21:31:07 +0200
-Subject: [PATCH 6/9] nvk/rm: execution and bind contexts
+Subject: [PATCH 06/13] nvk/rm: execution and bind contexts
 
 Exec contexts follow NVIDIA's own channel setup (nvidia-push-init.c and
 nv_gpu_ops.c in open-gpu-kernel-modules):

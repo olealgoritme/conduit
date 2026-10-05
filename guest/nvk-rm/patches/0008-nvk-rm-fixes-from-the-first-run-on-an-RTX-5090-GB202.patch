@@ -1,7 +1,7 @@
 From 99ba8583c5cbf1720ee9fc1efce351aebecfab1e Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 22:07:16 +0200
-Subject: [PATCH 8/9] nvk/rm: fixes from the first run on an RTX 5090 (GB202,
+Subject: [PATCH 08/13] nvk/rm: fixes from the first run on an RTX 5090 (GB202,
  GSP)
 
 vkCreateDevice now succeeds on RM 610.57.04 under Conduit. What the

@@ -1,7 +1,7 @@
 From 6f84e19996e94ca40097f900ee8a6d6d354a2634 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 21:11:11 +0200
-Subject: [PATCH 1/9] nvk: prepare for an nvkmd backend that is not DRM
+Subject: [PATCH 01/13] nvk: prepare for an nvkmd backend that is not DRM
 
 Split nvk_create_drm_physical_device() so that the part which turns an
 nvkmd_pdev into an nvk_physical_device can be reused, and add an
