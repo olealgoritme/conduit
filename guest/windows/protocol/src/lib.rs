@@ -23,6 +23,7 @@
 pub mod escape;
 pub mod features;
 pub mod ioctl;
+pub mod nvrm;
 pub mod producer;
 pub mod virtio_gpu;
 pub mod wddm;
@@ -30,6 +31,7 @@ pub mod wddm;
 pub use escape::*;
 pub use features::*;
 pub use ioctl::*;
+pub use nvrm::*;
 pub use producer::*;
 pub use virtio_gpu::*;
 pub use wddm::*;
