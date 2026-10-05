@@ -31,7 +31,11 @@ which OVMF needs to place the 64 GiB shared-memory BAR ([VENUS.md](VENUS.md),
 "Windows/OVMF guests"). The display mode is your monitor's, as for a Linux
 guest; the guest learns it from the EDID the backend serves. Keyboard and
 pointer reach Windows through the boot console's emulated PS/2 keyboard and
-USB tablet ([SCANOUT.md](SCANOUT.md#boot-console)).
+USB tablet ([SCANOUT.md](SCANOUT.md#boot-console)). The backend sends a guest
+Conduit `InputEvent`s only when its driver acks the virtio feature
+`NVGPU_CFG_TAKES_INPUT` (bit 12) and runs the event queue; the Helios KMD
+never acks it, so starting the event queue (for `EventReady`) leaves input
+where it is.
 
 **Hyper-V enlightenments.** Neither `attach` nor `conduit up` adds them. On
 the test machine these, in the domain XML (`virsh -c qemu:///session edit

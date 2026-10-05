@@ -82,8 +82,10 @@ const CTRL_QUEUE: u16 = 0;
 /// Control-queue ring size — power of two, conservatively ≤ the device's max.
 const CTRL_QUEUE_SIZE: usize = 64;
 
-/// Conduit's device offers `VIRTIO_F_VERSION_1` and nothing else (guest/linux/
-/// conduit_gpu.c `features[]`); what it can serve travels in config `features`.
+/// Conduit's device needs only `VIRTIO_F_VERSION_1`; what it can serve travels in
+/// config `features`. It also offers bit 12, `NVGPU_CFG_TAKES_INPUT`, which only
+/// a driver that consumes `InputEvent` acks (the Linux module): this one must
+/// not, or keyboard and mouse leave QEMU's emulated devices for the event queue.
 const CONDUIT_REQUIRED_FEATURES: u64 = helios_protocol::VIRTIO_F_VERSION_1;
 /// Byte offset of `features` in the device config (`VirtioGpuNvConfig`, right
 /// after `num_fd_translations` at 3880).

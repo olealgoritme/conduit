@@ -395,6 +395,23 @@ pub const NVGPU_CFG_VENUS: u32 = 1 << 10;
 /// sends none of these and keeps explicit sync off.
 pub const NVGPU_CFG_DRM_FENCES: u32 = 1 << 11;
 
+/// The one bit that travels the other way: a **virtio device feature** the
+/// guest acks, not a config `features` bit. The backend offers feature bit 12
+/// in its device features; a guest driver that consumes `InputEvent` lists it
+/// in its feature table (the Linux module does), and the backend sees it in
+/// the driver features the frontend acks (`VHOST_USER_SET_FEATURES`). The
+/// Windows KMD acks only `VIRTIO_F_VERSION_1`, never this.
+///
+/// Viewer input goes to the guest as `InputEvent`s only when the guest acked
+/// this and its event queue is live; otherwise it stays on the VM's emulated
+/// keyboard and tablet (with a boot console attached). A guest module from
+/// before the bit is still recognised: it is the only guest that sends
+/// `GetSysFiles`/`GetProcFiles`, at probe (docs/SCANOUT.md "Input").
+///
+/// Numbered after the config bits, and bit 12 of the config `features` word
+/// stays unused, so the number means the same thing in both words.
+pub const NVGPU_CFG_TAKES_INPUT: u32 = 1 << 12;
+
 /// Request payload for `MsgType::ScanoutFlip`, following a `MsgHeader`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -968,6 +985,9 @@ mod tests {
         assert_eq!(MsgType::from_u32(31), None);
         assert_eq!(NVGPU_CFG_VENUS, 1 << 10);
         assert_eq!(NVGPU_CFG_DRM_FENCES, 1 << 11);
+        // Below the transport bits (24..), and what guest/linux/conduit_gpu.c
+        // lists in its feature table as NVGPU_F_TAKES_INPUT (12).
+        assert_eq!(NVGPU_CFG_TAKES_INPUT, 1 << 12);
     }
 
     /// The event the guest's event-queue handler decodes: header, then

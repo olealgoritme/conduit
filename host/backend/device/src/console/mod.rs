@@ -21,8 +21,9 @@
 // double-buffered.
 //
 // Input follows the picture for a guest that takes Conduit input (Linux:
-// its driver posts event-queue buffers at probe). A guest that takes none
-// (Windows, whose driver runs only the control queue) keeps its input here
+// its driver acks NVGPU_CFG_TAKES_INPUT and posts event-queue buffers at
+// probe; `display::guest_takes_input`). A guest that takes none (Windows,
+// whose driver never acks the bit, event queue or not) keeps its input here
 // -- QEMU's emulated keyboard and tablet -- even while its own frames are
 // shown (`DisplayLink::input_to_console`); the pointer is then placed by the
 // guest's frame, not by the hidden console screen (`InputEncoder`).
