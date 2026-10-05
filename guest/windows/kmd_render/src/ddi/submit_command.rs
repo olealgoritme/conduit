@@ -165,6 +165,10 @@ pub(crate) fn publish_nvrm_counters() {
         b"NvMapErr",
         crate::virtio::nvrm::NVRM_MAP_ERRORS.load(Ordering::Relaxed),
     );
+    crate::diag::record_named_bytes(
+        b"NvFlip",
+        crate::virtio::nvrm::NVRM_FLIPS.load(Ordering::Relaxed),
+    );
     // Pins made / released / failed: `NvPin - NvUnpin` is what is locked now.
     crate::diag::record_named_bytes(
         b"NvPin",

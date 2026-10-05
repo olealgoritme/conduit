@@ -52,14 +52,22 @@ pub const MAX_NVRM_EVENTS_PER_OWNER: usize = MAX_NVRM_HANDLES_PER_OWNER + 1;
 /// ack (see the module docs). Named only for the assertion below.
 const NEVER_ACKED_TAKES_INPUT: u64 = 1 << 12;
 
-/// The event queue's index and size. 64 buffers, as the Linux module posts.
+/// The event queue's index and size (16 buffers; see `EVENT_QUEUE_SIZE`).
 const EVENT_QUEUE: u16 = 1;
-const EVENT_QUEUE_SIZE: usize = 64;
+/// Small on purpose: `VirtQueue<_, N>::new` returns a by-value slot that grows
+/// with N and sits on the boot stack under `VirtioGpu::init` (see
+/// tools/kmd-frame-sizes.ps1). Events are rare and level-triggered on the host,
+/// so a handful of buffers is plenty.
+const EVENT_QUEUE_SIZE: usize = 16;
 /// Bytes of one posted buffer: room for the 16-byte `EventReady`, and, should a
 /// host send one anyway, a short `DisplayMode` (anything longer is the host's to
 /// truncate or drop; this driver only reads the header). Divides a page, so no
 /// buffer straddles one.
 const EVENT_BUF_BYTES: usize = 256;
+
+/// Messages other than `EventReady` after which the queue is no longer kicked on
+/// repost (see `drain_nvrm_events`).
+const OTHER_KICK_LIMIT: u32 = 1024;
 /// Host `MsgType::EventReady`.
 const MSG_EVENT_READY: u32 = 8;
 
@@ -250,10 +258,10 @@ impl VirtioGpu {
         self.cfg_features
     }
 
-    /// Give the host its buffers. Once, after `init` built the device and before
-    /// anything else can see it, so a failed `init` never leaves posted buffers
-    /// behind. PASSIVE (or any IRQL: nothing here allocates).
-    pub(super) fn post_nvrm_event_buffers(&mut self) {
+    /// Give the host its buffers. Once, from `StartDevice` after the ISR address is
+    /// published (a host push landing in a posted buffer raises the interrupt).
+    /// PASSIVE (or any IRQL: nothing here allocates).
+    pub fn post_nvrm_event_buffers(&mut self) {
         let Some(ring) = self.nvrm_event_ring.as_mut() else {
             return;
         };
@@ -403,7 +411,11 @@ impl VirtioGpu {
                 }
             }
         }
-        if reposted {
+        // A host that serves queue-1 kicks as requests would answer every kick
+        // with another message and keep this loop spinning at DPC rate (an old
+        // backend did): past this many dropped messages, stop kicking. Current
+        // backends need no kick for it; the buffers stay posted.
+        if reposted && NVRM_EV_OTHER.load(Ordering::Relaxed) <= OTHER_KICK_LIMIT {
             let notify = self
                 .nvrm_event_ring
                 .as_ref()

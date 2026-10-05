@@ -48,6 +48,9 @@ param(
     [string[]] $Symbols = @(
         '9lifecycle20dxgkddi_start_device',
         '9VirtioGpu4init',
+        # The event queue is built from init (before DRIVER_OK), beside the
+        # control queue's constructor.
+        '14new_event_ring',
         # VirtQueue::new's concrete PciTransport argument. Deliberately WITHOUT
         # the const queue size before it (`Kj40_` for 64): that prefix made this
         # symbol vanish from the gate when the ring size changed, silently
@@ -69,6 +72,7 @@ param(
     [string[]] $Chains = @(
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,E3newNtNtNtB5_9transport3pci12PciTransport',
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,14new_event_ring,E3newNtNtNtB5_9transport3pci12PciTransport',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,24allocate_present_streams',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,30allocate_scanout_refresh_state',
         '9lifecycle20dxgkddi_start_device,14bring_up_venus,26allocate_host_visible_blob,13VenusInstance11into_device,13VenusInstance29create_device_with_ext_ladder'

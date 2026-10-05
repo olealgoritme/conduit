@@ -300,6 +300,8 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 .isr_status
                 .store(gpu.isr_status_addr(), core::sync::atomic::Ordering::Release);
             adapter.set_virtio(Some(gpu));
+            // Now the interrupt can be claimed: hand the host its event buffers.
+            let _ = adapter.with_virtio(|v| v.post_nvrm_event_buffers());
 
             // An explicit VidMmVramMB registry value remains authoritative.
             // When it is absent, use the exact virtio shared-memory capability

@@ -42,6 +42,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use helios_kmd_logic::page_runs;
 use helios_protocol::{
     HELIOS_NVRM_DEEP_PAGE_RUNS, HELIOS_NVRM_DEEP_PAGE_RUNS_INDIRECT, HELIOS_NVRM_FORWARD_MSG_TYPES,
+    HELIOS_NVRM_SCANOUT_FLIP_BYTES,
 };
 use wdk_sys::{KEVENT, MDL, PMDL};
 
@@ -59,6 +60,9 @@ const MSG_CLOSE: u32 = 2;
 const MSG_IOCTL: u32 = 3;
 const MSG_MMAP: u32 = 4;
 const MSG_MUNMAP: u32 = 5;
+const MSG_SCANOUT_FLIP: u32 = 20;
+/// `device_type` from which an `Open` names a DRM node (`512 + minor`).
+const DEVICE_TYPE_DRI_FIRST: u32 = 512;
 
 /// `NV_ESC_RM_FREE` as the low 16 bits of the Linux ioctl number the guest sends:
 /// `('F' << 8) | 0x29`.
@@ -96,6 +100,8 @@ pub static NVRM_MAP_ERRORS: AtomicU32 = AtomicU32::new(0);
 /// Pins made, pins released, pin failures. `NvPin - NvUnpin` is what is locked
 /// now; a count that only grows is a leak. Published as `NvPin`, `NvUnpin`,
 /// `NvPinErr`.
+/// Forwarded `ScanoutFlip`s (zero-copy presents).
+pub static NVRM_FLIPS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_PINS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_UNPINS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_PIN_ERRORS: AtomicU32 = AtomicU32::new(0);
@@ -204,9 +210,6 @@ pub fn forward(
                 return Err(refused(Refusal::NotOwned));
             };
             NVRM_CLOSES.fetch_add(1, Ordering::Relaxed);
-            // No event may fire for a handle the host is about to close (and may
-            // hand to another process): registrations go before anything else.
-            release_events_for_handle(adapter, owner, handle);
             // Mappings go first (the ABI's teardown order: unmap, close): no user
             // address may outlive the host mapping it points at.
             release_maps_for_handle(passive, adapter, owner, handle);
@@ -221,6 +224,11 @@ pub fn forward(
             match ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms) {
                 Ok(n) => {
                     if n >= MSG_HDR && rd_i32(resp, 8) == Some(0) {
+                        // The handle is closed: its event registrations go (a
+                        // wake for a handle nobody holds is dropped by the router
+                        // already, so the gap is harmless). A failed Close keeps
+                        // them, because the handle stays open.
+                        release_events_for_handle(adapter, owner, handle);
                         // The host's objects, and its alias of the pinned pages,
                         // are gone: the pins hang off this handle and unlock now.
                         release_pins_for_handle(adapter, owner, handle);
@@ -230,7 +238,10 @@ pub fn forward(
                     Ok(n)
                 }
                 // A timeout is indeterminate (it may have closed): stay forgotten.
-                Err(VirtioError::Timeout) => Err(Refusal::Transport(VirtioError::Timeout)),
+                Err(VirtioError::Timeout) => {
+                    release_events_for_handle(adapter, owner, handle);
+                    Err(Refusal::Transport(VirtioError::Timeout))
+                }
                 // Anything else never reached the host.
                 Err(e) => {
                     restore();
@@ -264,6 +275,34 @@ pub fn forward(
                 .map_err(Refusal::Transport)?;
             after_ioctl(adapter, owner, req, resp, n);
             Ok(n)
+        }
+        MSG_SCANOUT_FLIP => {
+            // ScanoutFlip { scanout, owner_handle, host_handle, .. } (64 bytes):
+            // the host exports the GEM object in `owner_handle`'s DRM file and
+            // hands it to the display. The only things worth checking here: it is
+            // the one scanout, and the file is the caller's own DRM node.
+            if req.len() != MSG_HDR + HELIOS_NVRM_SCANOUT_FLIP_BYTES {
+                return Err(refused(Refusal::BadRange));
+            }
+            let (Some(scanout), Some(owner_handle)) =
+                (rd_u32(req, MSG_HDR), rd_u32(req, MSG_HDR + 4))
+            else {
+                return Err(refused(Refusal::BadRange));
+            };
+            if scanout != 0 {
+                return Err(refused(Refusal::BadRange));
+            }
+            let device_type = adapter
+                .with_virtio(|v| v.nvrm_handle_device_type(owner, owner_handle))
+                .ok()
+                .flatten();
+            match device_type {
+                None => return Err(refused(Refusal::NotOwned)),
+                Some(t) if t < DEVICE_TYPE_DRI_FIRST => return Err(refused(Refusal::Forbidden)),
+                Some(_) => {}
+            }
+            NVRM_FLIPS.fetch_add(1, Ordering::Relaxed);
+            ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms).map_err(Refusal::Transport)
         }
         // GetProcFiles / GetSysFiles: no handle, nothing to track.
         _ => {

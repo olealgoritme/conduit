@@ -2929,9 +2929,10 @@ impl VirtioGpu {
                 gpu.host_edid_len = n;
             }
         }
-        // Hand the host its event buffers. After the last fallible step above, so a
-        // failed `init` never leaves buffers posted on a queue it is about to free.
-        gpu.post_nvrm_event_buffers();
+        // The event buffers are posted by `StartDevice` once the ISR address is
+        // published (`post_nvrm_event_buffers`): a host push (display mode,
+        // clipboard) landing in a posted buffer raises the interrupt, and the ISR
+        // must already know where the status register is.
         // `WddmHoldMs` (UV1's instrument). Snapshotted here with every other knob
         // so `reg add` + `pnputil /restart-device` applies it with no reboot, and
         // CLAMPED here rather than trusted: see `WDDM_HOLD_MS_MAX`.

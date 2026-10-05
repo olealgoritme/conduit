@@ -266,14 +266,22 @@ pub const HELIOS_NVRM_PIN_DEEP_BIT_INDIRECT: u32 = 1 << 1;
 // ---------------------------------------------------------------------------
 
 /// `msg_type` values (host `MsgType`) that `FORWARD` accepts: Open 1, Close 2,
-/// Ioctl 3, GetProcFiles 6, GetSysFiles 7. As a bitmask over the value.
+/// Ioctl 3, GetProcFiles 6, GetSysFiles 7, ScanoutFlip 20. As a bitmask over the
+/// value.
+///
+/// `ScanoutFlip` (20) presents a host GEM object zero-copy: the KMD requires
+/// `scanout == 0` and an `owner_handle` that the caller opened as a DRM node
+/// (`device_type >= 512`), and forwards the 64-byte `ScanoutFlip` payload as is
+/// (`HELIOS_NVRM_SCANOUT_FLIP_BYTES`).
 ///
 /// `Mmap` (4) / `Munmap` (5) are refused — they need KMD mapping work and have
-/// their own ops. Everything else (EventReady 8, scanout/input/clipboard
-/// 20–27, GpuCmd 30) is refused; those have dedicated paths or are
-/// host → guest only.
+/// their own ops. Everything else (EventReady 8, input/clipboard 21–27, GpuCmd
+/// 30) is refused; those have dedicated paths or are host → guest only.
 pub const HELIOS_NVRM_FORWARD_MSG_TYPES: u32 =
-    (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 7);
+    (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 20);
+
+/// Bytes of the `ScanoutFlip` payload that follows the `MsgHeader`.
+pub const HELIOS_NVRM_SCANOUT_FLIP_BYTES: usize = 64;
 
 /// Bytes of the host `MsgHeader` at the start of every request and reply.
 pub const HELIOS_NVRM_MSG_HEADER_BYTES: usize = 16;
