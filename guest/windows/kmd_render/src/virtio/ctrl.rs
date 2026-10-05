@@ -482,10 +482,13 @@ pub fn raw_roundtrip(
 ) -> Result<usize, VirtioError> {
     const MH: usize = super::hal::MSG_HDR_LEN;
     let req_len = req.len();
-    let resp_len = resp_out.len();
-    if req_len < MH || resp_len <= MH {
+    let want = resp_out.len();
+    if req_len < MH || want < MH {
         return Err(VirtioError::DeviceError);
     }
+    // What the device is told it may write: one byte more than a bare header, so
+    // the reply is two non-empty descriptors (see `Chain::Raw`).
+    let resp_len = want.max(MH + 1);
     // The reply's landing buffer: driver heap (non-paged), sized exactly as the
     // device is told. Reserved fallibly — the size is caller-controlled — and
     // declared before the wait block so it outlives the abandon path.
@@ -554,7 +557,7 @@ pub fn raw_roundtrip(
     })
     .and_then(|used| {
         // PASSIVE: now the reply may go to the caller's buffer.
-        let n = used.min(resp_len);
+        let n = used.min(want);
         resp_out[..n].copy_from_slice(&reply[..n]);
         Ok(n)
     })

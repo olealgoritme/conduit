@@ -293,7 +293,7 @@ pub static ESCAPE_BATCH_MAX: AtomicU32 = AtomicU32::new(0);
 /// `EscC<i>Calls` (escapes), `EscC<i>Sub` (submits) and `EscC<i>R0` (the
 /// ring_idx 0 subset of those submits: ring wake-ups and roundtrips, which
 /// retire at host decode). `EscCOvf` counts escapes that found the table full.
-pub const ESC_CTX_SLOTS: usize = 8;
+pub const ESC_CTX_SLOTS: usize = 32;
 
 pub struct EscCtxSlot {
     ctx: AtomicU32,
@@ -342,30 +342,54 @@ pub fn note_escape_ctx(ctx_id: u32, calls: u32, submits: u32, ring0: u32) {
     ESCAPE_CTX_OVERFLOW.fetch_add(1, Ordering::Relaxed);
 }
 
+/// `EscC<idx><suffix>` into `buf` (<= 14 bytes, the registry value-name limit of
+/// `record_named_bytes`). Writes through `get_mut`, so a name that did not fit
+/// would be cut short rather than fault.
+fn esc_row_name<'a>(buf: &'a mut [u8; 14], idx: usize, suffix: &[u8]) -> &'a [u8] {
+    let mut n = 0usize;
+    let mut put = |b: u8| {
+        if let Some(slot) = buf.get_mut(n) {
+            *slot = b;
+            n += 1;
+        }
+    };
+    for b in b"EscC" {
+        put(*b);
+    }
+    if idx >= 10 {
+        put(b'0' + ((idx / 10) % 10) as u8);
+    }
+    put(b'0' + (idx % 10) as u8);
+    for b in suffix {
+        put(*b);
+    }
+    buf.get(..n).unwrap_or(&[])
+}
+
 /// Mirror the per-context rows to the registry. PASSIVE only.
 pub fn publish_escape_ctx_counters() {
-    const NAMES: [[&[u8]; 4]; ESC_CTX_SLOTS] = [
-        [b"EscC0Id", b"EscC0Calls", b"EscC0Sub", b"EscC0R0"],
-        [b"EscC1Id", b"EscC1Calls", b"EscC1Sub", b"EscC1R0"],
-        [b"EscC2Id", b"EscC2Calls", b"EscC2Sub", b"EscC2R0"],
-        [b"EscC3Id", b"EscC3Calls", b"EscC3Sub", b"EscC3R0"],
-        [b"EscC4Id", b"EscC4Calls", b"EscC4Sub", b"EscC4R0"],
-        [b"EscC5Id", b"EscC5Calls", b"EscC5Sub", b"EscC5R0"],
-        [b"EscC6Id", b"EscC6Calls", b"EscC6Sub", b"EscC6R0"],
-        [b"EscC7Id", b"EscC7Calls", b"EscC7Sub", b"EscC7R0"],
-    ];
     for (i, slot) in ESCAPE_CTX.iter().enumerate() {
         let id = slot.ctx.load(Ordering::Relaxed);
         if id == 0 {
             continue;
         }
-        let Some(names) = NAMES.get(i) else {
-            continue;
-        };
-        crate::diag::record_named_bytes(names[0], id);
-        crate::diag::record_named_bytes(names[1], slot.calls.load(Ordering::Relaxed));
-        crate::diag::record_named_bytes(names[2], slot.submits.load(Ordering::Relaxed));
-        crate::diag::record_named_bytes(names[3], slot.ring0.load(Ordering::Relaxed));
+        let mut name = [0u8; 14];
+        crate::diag::record_named_bytes(esc_row_name(&mut name, i, b"Id"), id);
+        let mut name = [0u8; 14];
+        crate::diag::record_named_bytes(
+            esc_row_name(&mut name, i, b"Calls"),
+            slot.calls.load(Ordering::Relaxed),
+        );
+        let mut name = [0u8; 14];
+        crate::diag::record_named_bytes(
+            esc_row_name(&mut name, i, b"Sub"),
+            slot.submits.load(Ordering::Relaxed),
+        );
+        let mut name = [0u8; 14];
+        crate::diag::record_named_bytes(
+            esc_row_name(&mut name, i, b"R0"),
+            slot.ring0.load(Ordering::Relaxed),
+        );
     }
     crate::diag::record_named_bytes(b"EscCOvf", ESCAPE_CTX_OVERFLOW.load(Ordering::Relaxed));
 }

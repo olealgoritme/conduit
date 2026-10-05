@@ -1819,7 +1819,11 @@ fn nvrm_forward(
     };
     // A message is `MsgHeader | payload` both ways, so each side must be longer
     // than the 16-byte header.
-    if req_len <= 16 || resp_cap <= 16 || total > buf.len() || total > HELIOS_NVRM_MAX_BUFFER as usize
+    if req_len < 16
+        || resp_cap < 16
+        || total > buf.len()
+        || total > HELIOS_NVRM_MAX_BUFFER as usize
+        || total != hdr.size as usize
     {
         return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch);
     }

@@ -100,18 +100,39 @@ pub fn forward(
     match msg {
         MSG_OPEN => open(passive, adapter, owner, req, resp, timeout_ms),
         MSG_CLOSE => {
-            if !owned(adapter, owner, handle) {
+            // Take the entry off the table FIRST. The host may hand this number
+            // to another process the moment it closes it, and a stale entry here
+            // would let the old owner (or a second concurrent Close) name it.
+            let had = adapter
+                .with_virtio(|v| v.take_nvrm_handle(owner, handle))
+                .unwrap_or(false);
+            if !had {
                 return Err(refused(Refusal::NotOwned));
             }
             NVRM_CLOSES.fetch_add(1, Ordering::Relaxed);
-            let n = ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms)
-                .map_err(Refusal::Transport)?;
-            // Forget it only when the host closed it: a refused close leaves the
-            // handle valid there, and still ours.
-            if n >= MSG_HDR && rd_i32(resp, 8) == Some(0) {
-                let _ = adapter.with_virtio(|v| v.take_nvrm_handle(owner, handle));
+            let restore = || {
+                // The host did not close it, so it is still ours.
+                let _ = adapter.with_virtio(|v| {
+                    if v.reserve_nvrm_handle_slot(owner) {
+                        v.commit_nvrm_handle(owner, handle);
+                    }
+                });
+            };
+            match ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms) {
+                Ok(n) => {
+                    if !(n >= MSG_HDR && rd_i32(resp, 8) == Some(0)) {
+                        restore();
+                    }
+                    Ok(n)
+                }
+                // A timeout is indeterminate (it may have closed): stay forgotten.
+                Err(VirtioError::Timeout) => Err(Refusal::Transport(VirtioError::Timeout)),
+                // Anything else never reached the host.
+                Err(e) => {
+                    restore();
+                    Err(Refusal::Transport(e))
+                }
             }
-            Ok(n)
         }
         MSG_IOCTL => {
             if !owned(adapter, owner, handle) {
@@ -210,6 +231,10 @@ pub fn close_all_for_owner(
     owner: DeviceOwner,
 ) -> u32 {
     let mut closed = 0u32;
+    // After the first transport failure the host is not answering: stop sending
+    // (a wedged host would cost seconds per handle) but keep clearing the table,
+    // so no entry outlives the device handle it names.
+    let mut sending = true;
     loop {
         let taken = adapter
             .with_virtio(|v| v.take_nvrm_handle_for_owner(owner))
@@ -218,11 +243,16 @@ pub fn close_all_for_owner(
         let Some(handle) = taken else {
             break;
         };
-        let mut req = [0u8; MSG_HDR];
-        req[..4].copy_from_slice(&MSG_CLOSE.to_le_bytes());
-        req[4..8].copy_from_slice(&handle.to_le_bytes());
-        let mut resp = [0u8; 2 * MSG_HDR];
-        let _ = ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, 5_000);
+        if sending {
+            let mut req = [0u8; MSG_HDR];
+            req[..4].copy_from_slice(&MSG_CLOSE.to_le_bytes());
+            req[4..8].copy_from_slice(&handle.to_le_bytes());
+            let mut resp = [0u8; MSG_HDR];
+            match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, 5_000) {
+                Err(VirtioError::Timeout) | Err(VirtioError::DeviceError) => sending = false,
+                _ => {}
+            }
+        }
         closed += 1;
     }
     closed

@@ -1556,13 +1556,18 @@ impl Chain {
             ),
             Self::Raw { req_len } => {
                 const MH: usize = super::hal::MSG_HDR_LEN;
+                // Never a zero-length descriptor: virtio-drivers asserts on one.
+                // A header-only request (Close, GetSysFiles) is one read span;
+                // the reply side is always two because `resp_len > MH` is
+                // enforced at enqueue.
+                let (reads, n_reads) = if req_len > MH {
+                    ([meta.span(0, MH)?, meta.span(MH, req_len - MH)?, none], 2)
+                } else {
+                    ([meta.span(0, req_len)?, none, none], 1)
+                };
                 (
-                    [
-                        meta.span(0, MH)?,
-                        meta.span(MH, req_len.checked_sub(MH)?)?,
-                        none,
-                    ],
-                    2,
+                    reads,
+                    n_reads,
                     [
                         meta.span(req_len, MH)?,
                         meta.span(req_len.checked_add(MH)?, resp_len.checked_sub(MH)?)?,
