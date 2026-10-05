@@ -79,10 +79,19 @@ use crate::virtio::venus::{
 
 /// Control queue index (virtio-gpu controlq = 0; cursorq = 1 is unused).
 const CTRL_QUEUE: u16 = 0;
-/// Control-queue ring size — power of two, ≤ the device's max (256). A Venus submit
-/// uses 5 descriptors, so 128 allows ~25 in flight (64 allowed ~12, which a Heaven
-/// run saturated: IfHi 13, QfRet/QSpTout nonzero).
-const CTRL_QUEUE_SIZE: usize = 128;
+/// Control-queue ring size — power of two, ≤ the device's max (256).
+///
+/// 64 allows ~12 Venus submits in flight (5 descriptors each), which a Heaven run
+/// saturates (IfHi 13, QfRet/QSpTout nonzero). 22.22.298.0 tried 128 and the
+/// adapter came up with NO transport: the host saw no command at all, not even
+/// GET_DISPLAY_INFO. Root cause unconfirmed -- measured frames rule out the stack
+/// (start_device 2904 B with init inlined, venus chain ~6.5 KB, ceiling 17936 B),
+/// the backend allows 256 and QEMU is `vq_size=256`. Do not raise this again
+/// without reading the `InitStg` / `VqMax` / `StVio` breadcrumbs of that boot;
+/// `InitStg` names the last stage init reached and `VqMax` is the max queue size
+/// the device reported for queue 0. Ring pressure is instead cut by sending fewer
+/// descriptors per submit (see the batched SUBMIT_VENUS escape).
+const CTRL_QUEUE_SIZE: usize = 64;
 
 /// Conduit's device offers `VIRTIO_F_VERSION_1` and nothing else (guest/linux/
 /// conduit_gpu.c `features[]`); what it can serve travels in config `features`.
@@ -2445,6 +2454,10 @@ impl VirtioGpu {
         };
         let mut transport = PciTransport::new::<WdkHal, _>(&mut root, device_function)
             .map_err(|_| VirtioError::DeviceError)?;
+        // Init-stage breadcrumb: the last value written names the stage init
+        // reached, so a transport that never comes up says where. 1 = PCI
+        // transport discovered.
+        crate::diag::record_named_bytes(b"InitStg", 1);
 
         // ── M2: feature negotiation (VirtIO 1.2 spec §3.1.1) ────────────────
         transport.set_status(DeviceStatus::empty()); // reset
@@ -2478,6 +2491,7 @@ impl VirtioGpu {
             return Err(VirtioError::FeatureRejected);
         }
 
+        crate::diag::record_named_bytes(b"InitStg", 2); // features negotiated
         // The device only takes `GpuCmd` when the backend runs with `--venus`.
         let cfg_features: u32 = transport
             .read_config_space::<u32>(CONDUIT_CFG_FEATURES_OFFSET)
@@ -2487,6 +2501,13 @@ impl VirtioGpu {
             crate::kmsg(c"Conduit: backend not started with --venus\n");
             return Err(VirtioError::FeatureRejected);
         }
+
+        crate::diag::record_named_bytes(b"InitStg", 3); // config features ok
+        // The largest ring the device accepts for queue 0, next to the size asked
+        // for: `VirtQueue::new` refuses (InvalidParam) when the device's max is
+        // below CTRL_QUEUE_SIZE, and nothing else says so.
+        crate::diag::record_named_bytes(b"VqMax", transport.max_queue_size(CTRL_QUEUE));
+        crate::diag::record_named_bytes(b"VqWant", CTRL_QUEUE_SIZE as u32);
 
         // ── M3: control virtqueue (queue 0), then DRIVER_OK ─────────────────
         // Spell out the error arm instead of `map_err(...)?`. In the measured
@@ -2501,8 +2522,12 @@ impl VirtioGpu {
             /* event_idx */ false,
         ) {
             Ok(control) => control,
-            Err(_) => return Err(VirtioError::DeviceError),
+            Err(_) => {
+                crate::diag::record_named_bytes(b"InitStg", 0xE4); // queue setup refused
+                return Err(VirtioError::DeviceError);
+            }
         };
+        crate::diag::record_named_bytes(b"InitStg", 4); // control queue created
         // Runtime ctrl completion is interrupt-driven. Be explicit instead of
         // relying on the freshly-zeroed avail.flags value: bit 0 clear asks the
         // device to interrupt after it adds a used element.
@@ -2590,6 +2615,7 @@ impl VirtioGpu {
             return Err(VirtioError::DeviceError);
         }
         crate::kmsg(c"Helios: virtio-gpu GET_DISPLAY_INFO OK\n");
+        crate::diag::record_named_bytes(b"InitStg", 5); // GET_DISPLAY_INFO answered
         // Remember scanout 0's host-preferred size for the display half's VidPn
         // mode + generated EDID. QEMU reports it in `pmodes[0].r` even before a
         // scanout is bound; take it only when both dimensions look sane (a
@@ -2618,6 +2644,7 @@ impl VirtioGpu {
             None
         };
         crate::diag::record_named_bytes(b"HostEdid", host_edid_len.map_or(0, |n| n as u32));
+        crate::diag::record_named_bytes(b"InitStg", 6); // EDID handshake done
 
         // Discover the host-visible blob window (a fresh config accessor — the
         // original `access` was moved into `PciRoot` above; `DxgkConfigAccess` is
@@ -2660,6 +2687,7 @@ impl VirtioGpu {
         let present_buffer_syncs = allocate_present_buffer_syncs()?;
         let present_buffer_opens = allocate_present_buffer_opens()?;
 
+        crate::diag::record_named_bytes(b"InitStg", 7); // building the device object
         // `VirtioGpu` contains the control virtqueue and many ownership tables.
         // Return it heap-owned so StartDevice never reserves a second by-value
         // copy of this large state while `init`'s own frame is live.

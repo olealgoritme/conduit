@@ -48,9 +48,11 @@ param(
     [string[]] $Symbols = @(
         '9lifecycle20dxgkddi_start_device',
         '9VirtioGpu4init',
-        # Unique across crate-hash changes: const queue size 0x40 followed by
-        # VirtQueue::new's concrete PciTransport argument.
-        'Kj40_E3newNtNtNtB5_9transport3pci12PciTransport',
+        # VirtQueue::new's concrete PciTransport argument. Deliberately WITHOUT
+        # the const queue size before it (`Kj40_` for 64): that prefix made this
+        # symbol vanish from the gate when the ring size changed, silently
+        # dropping its by-value return slot from the budget.
+        'E3newNtNtNtB5_9transport3pci12PciTransport',
         '24allocate_present_streams',
         '30allocate_scanout_refresh_state',
         '14bring_up_venus',
@@ -66,7 +68,7 @@ param(
     # $Symbols entries, outermost first.
     [string[]] $Chains = @(
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init',
-        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,Kj40_E3newNtNtNtB5_9transport3pci12PciTransport',
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,E3newNtNtNtB5_9transport3pci12PciTransport',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,24allocate_present_streams',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,30allocate_scanout_refresh_state',
         '9lifecycle20dxgkddi_start_device,14bring_up_venus,26allocate_host_visible_blob,13VenusInstance11into_device,13VenusInstance29create_device_with_ext_ladder'
