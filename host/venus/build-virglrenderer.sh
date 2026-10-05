@@ -12,7 +12,8 @@
 # without vrend virglrenderer needs neither EGL nor GBM.
 #
 # Needs: meson, ninja, a C compiler, pkg-config, python3 with mako and yaml,
-# libdrm headers, Vulkan headers. No root.
+# libdrm headers, Vulkan headers (`sudo packaging/build.sh deps` installs them).
+# No root.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"

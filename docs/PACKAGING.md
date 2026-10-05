@@ -73,7 +73,7 @@ sudo packaging/build.sh deps          # apt, dnf or pacman
 packaging/build.sh rust               # static musl; RUST_TARGET=host for a glibc build
 packaging/build.sh viewer
 packaging/build.sh stream
-packaging/build.sh venus              # optional: conduit-venus + virglrenderer (needs meson, Vulkan and libdrm headers, python3 mako/yaml)
+packaging/build.sh venus              # conduit-venus + virglrenderer (needs the venus submodules; meson, Vulkan and libdrm headers, python3 mako/yaml: `deps` installs them)
 packaging/build.sh qemu               # slow; BUNDLE_QEMU=0 to skip
 packaging/build.sh stage
 packaging/build.sh package deb        # or rpm, archlinux (needs nfpm)

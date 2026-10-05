@@ -80,6 +80,9 @@ distro_family() {
 # ---------------------------------------------------------------- deps -----
 # Build dependencies for every step. QEMU's list matches a headless build
 # (no GTK/SDL: the viewer is the display); adjust together with host/qemu/.
+# The last line of each list is for `venus` (virglrenderer): Vulkan and libdrm
+# headers, python3 mako and yaml; keep it in step with the checks at the top
+# of host/venus/build-virglrenderer.sh.
 cmd_deps() {
     local fam; fam=$(distro_family)
     case "$fam" in
@@ -96,7 +99,8 @@ cmd_deps() {
             libssl-dev libegl-dev \
             libglib2.0-dev libpixman-1-dev libslirp-dev libseccomp-dev \
             libcap-ng-dev libzstd-dev libaio-dev libfdt-dev \
-            libpulse-dev libpipewire-0.3-dev
+            libpulse-dev libpipewire-0.3-dev \
+            libvulkan-dev libdrm-dev python3-mako python3-yaml
         ;;
     rpm)
         dnf install -y \
@@ -108,14 +112,16 @@ cmd_deps() {
             openssl-devel mesa-libEGL-devel \
             glib2-devel pixman-devel libslirp-devel libseccomp-devel \
             libcap-ng-devel libzstd-devel libaio-devel libfdt-devel \
-            pulseaudio-libs-devel pipewire-devel
+            pulseaudio-libs-devel pipewire-devel \
+            vulkan-headers vulkan-loader-devel libdrm-devel python3-mako python3-pyyaml
         ;;
     arch)
         pacman -Syu --noconfirm --needed \
             base-devel git curl xz file patchelf gnupg python ninja meson flex bison \
             wayland wayland-protocols libxcb mesa openssl \
             glib2 pixman libslirp libseccomp libcap-ng zstd libaio dtc \
-            libpulse pipewire
+            libpulse pipewire \
+            vulkan-headers vulkan-icd-loader libdrm python-mako python-yaml
         ;;
     esac
 }
