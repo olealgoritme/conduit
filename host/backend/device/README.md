@@ -26,9 +26,10 @@ it refuses to run as root. See `docs/ARCHITECTURE.md` and `docs/SECURITY.md`.
 | `src/trace.rs` | request tracing: `--trace`, `--trace-socket` (docs/TRACING.md) |
 | `src/shm_regions.rs` | the window, UVM aperture and (`--venus`) Venus blob regions |
 | `src/chain.rs` | descriptor chains: requests read from every readable descriptor, replies scattered across every writable one |
+| `src/nvidia/os_event.rs` | RM OS events: `NV_ESC_RM_GET_EVENT_DATA` served only on a file holding one (docs/SECURITY.md) |
 | `src/nvidia/fence.rs` | explicit sync: host semaphore-surface fences as guest fences (docs/SYNC.md) |
 | `src/console/` | the boot console: an RFB client of QEMU's VNC socket (`--console-vnc`, docs/SCANOUT.md) |
-| `src/venus/` | Venus `GpuCmd` for Windows guests, checked before `conduit-venus` sees it (`--venus`, docs/VENUS.md) |
+| `src/venus/` | Venus `GpuCmd` for Windows guests, checked before `conduit-venus` sees it (`--venus`, docs/VENUS.md): the EDID, scanout modifier inference, fence holding and latency logging |
 
 ## Build and test
 
@@ -39,7 +40,9 @@ cargo test --workspace --features device/vhost-user -- \
     --skip for_real --skip closing_the_fd --skip repeated_map_unmap
 ```
 
-`make backend` / `make test` at the repo root do the same. The tests run
+`make backend` / `make test` at the repo root do the same. `--venus` exists
+only with the `venus` feature (`--features vhost-user,venus`), which
+`packaging/build.sh` enables and `make` does not. The tests run
 against a fake host driver; the skipped ones open the real `/dev/nvidiactl`.
 
 ```sh

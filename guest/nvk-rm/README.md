@@ -18,7 +18,8 @@ Conduit's nvidia-drm node (see "Zero-copy presentation"). See "First run"
 and "Zero-copy run" at the end for what was run and what is still open.
 dEQP has not been run yet.
 
-Design background: `docs/research/nvk-rm.md` (on the `feat/nvk-rm` branch).
+Experimental and opt-in (`NVK_RM=1`); nothing changes for a guest that does
+not set it. Design background: [docs/research/nvk-rm.md](../../docs/research/nvk-rm.md).
 
 ## Base and patches
 
@@ -369,7 +370,7 @@ refused. Operationally:
   for USERD and the error notifier is mappable within the window budget
   (8 KiB per queue);
 - the non-stall event stays readable unless `GET_EVENT_DATA` drains it; a
-  backend built before `5a4b99c` refuses that escape (NVK then sleeps in
+  backend built before `5b0ed72` refuses that escape (NVK then sleeps in
   CPU waits, patch 11), a newer one serves it.
 
 ## Test plan (Linux `lab` guest, RTX 5090)

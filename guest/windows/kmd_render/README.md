@@ -1,5 +1,10 @@
 # Helios WDDM Render KMD Bring-Up
 
+> Upstream Helios's early bring-up notes, kept as imported and out of date:
+> the KMD is now the render + display miniport Conduit ships. Current state
+> and Conduit's changes: [../HELIOS.md](../HELIOS.md); building it:
+> [../ci/vm/README.md](../ci/vm/README.md).
+
 This crate starts the WDDM render-only implementation. It is separate from
 `../kmd`, which remains the working System-class KMDF Venus driver.
 

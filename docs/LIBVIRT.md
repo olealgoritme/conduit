@@ -51,7 +51,8 @@ the VM's slice `conduit-NAME.slice` with `OOMScoreAdjust=500`.
 records the mode in `libvirt-mode`, which `conduit view` reads to open a
 matching window for a VM that is already running. After `conduit up/view
 --venus` it also finds `libvirt-next-venus`, starts `conduit-venus` and runs
-the backend with `--venus` ([VENUS.md](VENUS.md)). For an attached VM with a display it
+the backend with `--venus` ([VENUS.md](VENUS.md); a Windows VM:
+[WINDOWS.md](WINDOWS.md)). For an attached VM with a display it
 passes `--console-vnc` with the boot console's socket (below).
 
 System domains get the same units in `/etc/systemd/system`, with

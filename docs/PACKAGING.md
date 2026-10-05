@@ -29,9 +29,13 @@ layout, so a layout change is made in one place.
 docs/VENUS.md), is packaged in `/opt/conduit/bin` with its own virglrenderer
 (Venus only, built by `host/venus/build-virglrenderer.sh`) in
 `/opt/conduit/lib/libvirglrenderer.so.1`, found through a RUNPATH of
-`$ORIGIN/../lib` (`packaging/build.sh venus`). The packaged backend is built
-with its `venus` feature. A stage without `build.sh venus` still packages,
-with a warning, and `--venus` does not work from that install.
+`$ORIGIN/../lib` (`packaging/build.sh venus`; `build-virglrenderer.sh`
+applies `host/venus/patches/` to the pinned submodule first). The packaged
+backend is built with its `venus` feature. A stage without `build.sh venus`
+still packages, with a warning, and `--venus` does not work from that
+install. The release workflow, the RPM spec, the PKGBUILD and the flake do
+not run that step yet, so release packages ship without `conduit-venus`
+(and the flake's backend has no `venus` feature).
 
 The guest package installs `/usr/src/conduit-guest-<version>/` (module source
 plus `dkms.conf`); DKMS builds `conduit_gpu.ko` into
@@ -46,7 +50,7 @@ setup script every package format runs after install; see
 
 ```
 packaging/
-├── build.sh                   the build: deps, rust, viewer, stream, qemu, stage, bundle-libs, guest-src, package
+├── build.sh                   the build: deps, rust, viewer, stream, venus, qemu, stage, bundle-libs, guest-src, package
 ├── nfpm/conduit.yaml          host package: one template -> .deb, .rpm, Arch .pkg.tar.zst
 ├── nfpm/conduit-guest.yaml    guest DKMS package: .deb, .rpm, Arch .pkg.tar.zst
 ├── deb/conduit/               postinst, prerm (used by nfpm for all three formats)
@@ -69,6 +73,7 @@ sudo packaging/build.sh deps          # apt, dnf or pacman
 packaging/build.sh rust               # static musl; RUST_TARGET=host for a glibc build
 packaging/build.sh viewer
 packaging/build.sh stream
+packaging/build.sh venus              # optional: conduit-venus + virglrenderer (needs meson, Vulkan and libdrm headers, python3 mako/yaml)
 packaging/build.sh qemu               # slow; BUNDLE_QEMU=0 to skip
 packaging/build.sh stage
 packaging/build.sh package deb        # or rpm, archlinux (needs nfpm)
@@ -98,7 +103,7 @@ These are assumptions the packaging makes. Change them here and in
 
 **Binary names.** `build.sh` (top) holds the cargo/make output names
 as variables (`flake.nix` has its own copies): `BACKEND_BIN_SRC=conduit-backend` (cargo package `device`,
-feature `vhost-user`), `USERSPACE_BIN_SRC=conduit-userspace`, `VIEWER_BIN_SRC=conduit-viewer`,
+features `BACKEND_FEATURES=vhost-user,venus`), `USERSPACE_BIN_SRC=conduit-userspace`, `VIEWER_BIN_SRC=conduit-viewer`,
 `VMM_BIN_SRC=conduit-vmm` (built with `--no-default-features`),
 `CLI_BIN_SRC=conduit`. When a component is renamed, change the variable;
 installed names (`conduit-*`) stay.
@@ -220,7 +225,7 @@ QEMU expression (switched to the 11.1.2 tarball when nixpkgs is older, plus
 | `ci.yml` | push, PR, manual | fmt/clippy/test per Rust project (backend, VMM, `host/venus` without its `renderer` feature, CLI, stream host; GPU tests skipped by name), guest module vs Ubuntu 24.04 (GA and HWE), Debian 13 and Fedora headers plus its plain-C unit tests, viewer `make check`, guest agent unit tests, actionlint, shellcheck, DKMS package build |
 | `abi.yml` | Mondays, manual | new open-gpu-kernel-modules tags / gVisor nvproxy ABIs -> `.github/scripts/abi_update.py` runs the `host/backend/gen` generators -> tests -> PR on `abi/auto` (draft if tests fail). Set secret `ABI_BOT_TOKEN` so CI runs on its PRs. |
 | `release.yml` | tag `v*`, manual | static musl Rust binaries once; deb/rpm/Arch/tarball in their own containers with QEMU cached per week; guest .deb/.rpm/.pkg.tar.zst; checksums, PKGBUILD, GitHub Release (tags only) |
-| `windows.yml` | manual only (hours on Windows runners) | the Windows guest stack from `guest/windows` (WDDM driver, D3D11/12 UMDs, Mesa Venus ICD, loaders, installer); the package per configuration as an artifact, not attached to releases |
+| `windows.yml` | manual only (hours on Windows runners) | the Windows guest stack from `guest/windows` (WDDM driver, D3D11/12 UMDs, Mesa Venus ICD, loaders, installer); the package per configuration as an artifact, not attached to releases. The driver alone also builds in a local Windows VM (`guest/windows/ci/vm/README.md`) |
 
 ## Repository hygiene
 

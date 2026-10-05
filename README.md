@@ -24,11 +24,14 @@ from GPU memory to your screen: no copying, no video compression.
 | Clipboard both ways, sound (speakers + mic) | ✅ |
 | Streaming to Moonlight (AV1/HEVC/H.264, up to 240 fps) | ✅ |
 | virt-manager / virsh (start, pause, reboot, stop; attach to existing VMs) | ✅ |
-| Windows VMs | ❌ not yet (in progress: [Venus](docs/VENUS.md), [roadmap](docs/ROADMAP.md)) |
+| Windows VMs (D3D11/12, Vulkan) | experimental, opt-in (`--venus`, built by hand: [Windows guests](docs/WINDOWS.md)) |
+| NVK (Mesa's open Vulkan driver) on NVIDIA's kernel driver, in a Linux VM | experimental, opt-in (`NVK_RM=1`: [guest/nvk-rm](guest/nvk-rm/README.md), [librmclient](guest/rmclient/README.md)) |
 
 > Conduit is early software, tested mainly on an RTX 5090 with Ubuntu 24.04
-> and Hyprland. Expect rough edges. Windows guests are not supported yet
-> (see [Roadmap](docs/ROADMAP.md)).
+> and Hyprland. Expect rough edges. Windows guests are experimental: the
+> release packages do not include the Venus renderer yet, and the guest
+> driver is test-signed ([docs/WINDOWS.md](docs/WINDOWS.md),
+> [Roadmap](docs/ROADMAP.md)).
 
 ## What you need
 
@@ -38,7 +41,7 @@ from GPU memory to your screen: no copying, no video compression.
 | GPU | NVIDIA, Turing (RTX 20xx) or newer |
 | Host driver | NVIDIA **open** kernel modules, 580 or newer, a release Conduit has ABI tables for (580.178.04, 595.71.05, 595.104.02, 610.57.04, 615.71.09) |
 | Desktop | Any Wayland desktop (GNOME, KDE, Hyprland, Sway, …) |
-| VM | Linux, kernel 6.4 or newer: Ubuntu 24.04 recommended (`conduit create`); `conduit attach` also sets up Debian and Arch-based VMs (Arch, Omarchy, EndeavourOS, Manjaro) |
+| VM | Linux, kernel 6.4 or newer: Ubuntu 24.04 recommended (`conduit create`); `conduit attach` also sets up Debian and Arch-based VMs (Arch, Omarchy, EndeavourOS, Manjaro). Windows 11: experimental ([docs/WINDOWS.md](docs/WINDOWS.md)) |
 
 ## Quick start
 

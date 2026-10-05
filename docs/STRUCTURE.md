@@ -21,7 +21,9 @@ conduit/
 │                  Windows guests (virglrenderer on the host's NVIDIA Vulkan),
 │                  its IPC and the Renderer trait the backend uses; own
 │                  workspace (docs/VENUS.md).
-│                  third_party/: virglrenderer, venus-protocol (submodules).
+│                  third_party/: virglrenderer, venus-protocol (submodules);
+│                  patches/: Conduit's virglrenderer patches, applied by
+│                  build-virglrenderer.sh.
 ├── guest/
 │   ├── linux/     C. The guest kernel module, conduit_gpu (virtio GPU, KMS display,
 │   │              input, clipboard device, explicit sync, PCI mirror). Packaged
@@ -33,11 +35,14 @@ conduit/
 │   │              clipboard <-> /dev/conduit-clipboard.
 │   ├── tests/     Small in-guest test programs (CUDA memory).
 │   ├── rmclient/  C. librmclient (MIT): RM client library for user-mode drivers (NVK).
+│   ├── nvk-rm/    Mesa patch series: NVK on RM through librmclient
+│   │              (experimental, opt-in with NVK_RM=1), build script, tests.
 │   └── windows/   Helios-derived Windows guest components (guest/windows/HELIOS.md):
 │                  kmd_render/ + kmd_logic/ (WDDM KMD), protocol/ (escape ABI),
 │                  umd/, umd12/, umd_common/ (D3D11/D3D12 UMDs), icd/ (Mesa
 │                  Venus ICD build), installer/, packaging/, metadata/, ci/
-│                  (build scripts for windows.yml), tools/ (probes, helpers),
+│                  (windows/: build scripts for windows.yml; vm/: local build
+│                  VM), tools/ (probes, helpers),
 │                  third_party/ (Mesa, DXVK, vkd3d-proton submodules).
 ├── cli/           Rust. The `conduit` command (create / view / up / down / stream /
 │                  remote / trace; libvirt: attach / detach / libvirt enable,
@@ -49,7 +54,8 @@ conduit/
 │                  common/ (desktop entry, AppArmor, conduit-integrate)
 ├── flake.nix      Nix package and app
 ├── docs/          User and contributor documentation; research/: background
-│                  surveys (Windows guest prior art)
+│                  surveys (Windows guest prior art, a thinner Windows path,
+│                  NVK on RM)
 └── .github/workflows/
     ├── ci.yml         every push: Rust tests, guest module build against
     │                  Ubuntu/Debian/Fedora headers, viewer selftests, agent tests
@@ -71,10 +77,14 @@ conduit/
 | `flake.nix` | NixOS | in the repo |
 | `SHA256SUMS` | | checksums of the files above |
 
+No release artifact has `conduit-venus` yet: release.yml does not run
+`packaging/build.sh venus` (docs/PACKAGING.md).
+
 Every package installs to its own prefix (`/opt/conduit` for the bundled QEMU
 and VMM), adds the `conduit` command, a desktop entry, and an AppArmor/SELinux
 rule for libvirt. It never replaces system QEMU or libvirt.
 
 Licenses stay per component: guest driver GPL-2.0, backend Apache-2.0,
 protocol BSD-3-Clause or GPL-2.0-or-later, viewer Apache-2.0 (with its NOTICE), VMM Apache-2.0,
-stream host Apache-2.0 (with its NOTICE: vendored ENet, nanors, nv-codec-headers, all MIT).
+stream host Apache-2.0 (with its NOTICE: vendored ENet, nanors, nv-codec-headers, all MIT),
+Venus renderer Apache-2.0 (virglrenderer MIT), librmclient MIT.

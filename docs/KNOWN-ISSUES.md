@@ -23,7 +23,7 @@ Current limitations, with the intended fix for each. Planned work is in
 | GPU fences cross the boundary only as semaphore-surface fences ([SYNC.md](SYNC.md)); the legacy PRIME fence ioctls are not served, and a buffer rendered without any fence is still flipped unsynchronised | Old userspace without `supports_semsurf`, or a client using neither explicit nor attached fences, can show a frame before its rendering finished | Serve PRIME_FENCE_* if anything still needs it |
 | No damage rectangles | The host recomposites and the encoder re-encodes the whole frame | `drm_plane_enable_fb_damage_clips()`, pass the bounding rectangle with the flip |
 | No `GAMMA_LUT` / CTM | Night light and colour profiles in the guest have no effect | Enable colour management on the CRTC and forward the LUT |
-| No physical size or EDID | GNOME picks scale 1 on HiDPI monitors | Report the host output's size, or synthesize an EDID |
+| No physical size or EDID (Linux guests; Windows guests get one, [VENUS.md](VENUS.md)) | GNOME picks scale 1 on HiDPI monitors | Report the host output's size, or synthesize an EDID |
 | One head | No multi-monitor | Several CRTCs/connectors, one viewer window per head |
 | No VRR or HDR properties | No adaptive sync or HDR in the guest | `vrr_capable` / `HDR_OUTPUT_METADATA` forwarded to the viewer |
 | No dumb buffers / fbcon | No text console or Plymouth on Conduit's head; firmware and early boot show only through the boot console, which only attached libvirt VMs have ([SCANOUT.md](SCANOUT.md#boot-console)) | Host-backed pitch-linear dumb buffers |
@@ -41,11 +41,21 @@ Current limitations, with the intended fix for each. Planned work is in
 
 ## Windows guests (Venus)
 
-Experimental, behind `--venus` ([VENUS.md](VENUS.md)).
+Experimental, behind `--venus` ([WINDOWS.md](WINDOWS.md), [VENUS.md](VENUS.md)).
 
-- `conduit-venus` is not in the packages yet, and `make` and the packages
-  build the backend without its `venus` feature; build both by hand
-  ([VENUS.md](VENUS.md)).
+- Release packages have a backend with the `venus` feature but no
+  `conduit-venus`: `packaging/build.sh venus` packages it, but the release
+  workflow, the RPM spec and the PKGBUILD do not run it yet. `make` builds
+  the backend without the feature. Build both by hand ([VENUS.md](VENUS.md)).
+- `conduit attach` knows only Linux guests: run it with `--guest-later` for a
+  Windows VM and install the driver by hand ([WINDOWS.md](WINDOWS.md)). It
+  adds no Hyper-V enlightenments, which steady a Windows guest's frame pacing;
+  add them to the domain by hand.
+- The guest driver is test-signed: Secure Boot off, test-signing on.
+- The guest's keyboard and pointer go through the boot console's emulated
+  PS/2 keyboard and USB tablet (no gamepads); no clipboard sharing.
+- `virglrenderer` needs Conduit's patch (`host/venus/patches`) for usable
+  frame rates on NVIDIA; an unpatched build waits about 10 ms per ring fence.
 - Region 3 needs QEMU (`conduit-vmm` has fixed BARs).
 - A Venus blob carries no layout the host can read back; the scanout's
   modifier is inferred from the blob's size (linear, or NVIDIA block-linear

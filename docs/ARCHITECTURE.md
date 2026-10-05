@@ -117,7 +117,16 @@ arrive as virtio-gpu commands in `GpuCmd` messages, are checked by the
 backend and executed by `conduit-venus` (`host/venus`), a separate sandboxed
 process running virglrenderer on the host's NVIDIA Vulkan driver. Its scanout
 reaches the viewer as a dma-buf like a Linux guest's. Details:
-[VENUS.md](VENUS.md).
+[VENUS.md](VENUS.md); setting up a guest: [WINDOWS.md](WINDOWS.md).
+
+## NVK on RM (experimental)
+
+`guest/nvk-rm` is a Mesa patch series that lets NVK, Mesa's open Vulkan
+driver, run on RM through Conduit's forwarding instead of on nouveau, using
+`guest/rmclient` (librmclient). It is opt-in in the guest (`NVK_RM=1`) and
+needs no host change beyond serving `NV_ESC_RM_GET_EVENT_DATA` (above).
+Details: [guest/nvk-rm/README.md](../guest/nvk-rm/README.md),
+[research/nvk-rm.md](research/nvk-rm.md).
 
 ## Runners and libvirt
 
@@ -133,8 +142,8 @@ supported: the GPU state lives in the host driver. Details:
 
 ## Limits
 
-- NVIDIA only. Linux guests; Windows guests (Venus) are experimental, not
-  supported yet ([VENUS.md](VENUS.md), [ROADMAP.md](ROADMAP.md)).
+- NVIDIA only. Linux guests; Windows guests (Venus) are experimental
+  ([WINDOWS.md](WINDOWS.md), [ROADMAP.md](ROADMAP.md)).
 - Not hardware isolation; the host NVIDIA driver is trusted.
 - The shared-memory window (1 GiB) is sized when the VM starts and cannot grow.
 - No HMM / pageable memory access, MIG or SR-IOV.

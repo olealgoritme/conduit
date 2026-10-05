@@ -25,10 +25,13 @@ in the guest. The guest driver stack comes from Helios
 
 Nothing here changes Linux guests. The backend serves Venus only with
 `--venus`; without it the config bit is clear and `GpuCmd` is refused. The
-flag exists only in a backend built with the device crate's `venus` feature
-(`cargo build --release -p device --features vhost-user,venus --bin
-conduit-backend` in `host/backend`); `make` and the packages build it
-without, so `conduit up --venus` needs such a backend (`CONDUIT_BACKEND=PATH`).
+flag exists only in a backend built with the device crate's `venus` feature:
+`packaging/build.sh` (so every package) builds the backend with it, `make`
+does not (`cargo build --release -p device --features vhost-user,venus --bin
+conduit-backend` in `host/backend`, then `CONDUIT_BACKEND=PATH`).
+
+Setting up a Windows VM, installing the guest driver and tuning it:
+[WINDOWS.md](WINDOWS.md).
 
 ## Device
 
@@ -79,6 +82,23 @@ Fence rules, which follow virglrenderer:
   destroy the whole context, which the backend cannot detect. Bind a queue to
   a ring before fencing on it.
 
+**Fence latency.** A Windows frame waits on several ring fences, so their
+latency sets the frame rate. virglrenderer creates each queue's sync fences
+exportable as `SYNC_FD` when the driver offers it, and NVIDIA's driver waits
+on such a fence in steps of about 10 ms (measured: 10.08 ms per fence,
+0.03 ms for a plain one). The fences are only waited on by virglrenderer's
+own sync thread, never exported, so Conduit's patch
+`host/venus/patches/0001-vkr-queue-plain-sync-fences.patch` makes them plain;
+`build-virglrenderer.sh` applies `host/venus/patches/*.patch` to the pinned
+submodule in order (a patch already applied is skipped). Unigine Heaven in
+a Windows guest went from 36 to about 150 fps with it.
+
+Both sides log fence latency every 2 s while fences flow: `conduit-venus`
+the time from `create_fence` to virglrenderer's signal (count, p50, p90,
+max, in `logs/venus.log`), the backend the time from holding a fenced
+command to the signal reaching it, per `(ctx_id, ring)`, at `info`
+(`venus: fence latency ctx C ring R: ...`).
+
 **Commands served** (the set Helios's KMD sends). Anything else answers
 `RESP_ERR_UNSPEC`.
 
@@ -106,7 +126,8 @@ with `RESP_OK_EDID` (`0x1104`): header, `size` = 256, padding, then
 
 - an EDID 1.4 base block: manufacturer `CDT`, product 1, made 2026, digital
   8 bpc, size unknown, sRGB, the monitor name `Conduit` (`0x0A`, then
-  spaces), two dummy descriptors, one extension. Its first detailed timing
+  spaces), a Display Range Limits descriptor (below), one dummy
+  descriptor, one extension. Its first detailed timing
   is the configured mode if a detailed timing can hold it (each side at most
   4095, clock at most 655.35 MHz; a vertical front porch over 63 lines gives
   the rest to the back porch), and the preferred-is-native feature bit is
@@ -114,6 +135,14 @@ with `RESP_OK_EDID` (`0x1104`): header, `size` = 256, padding, then
   keeping the aspect ratio, then the refresh lowered a hertz at a time until
   the clock fits (5120×1440@240 → 2560×720@240, 3840×2160@144 →
   3840×2160@74, 7680×4320@60 → 3840×2160@60);
+- the range limits (`0xFD`, "range limits only", no GTF/CVT formula): 24 Hz
+  up to the highest refresh, the lowest to the highest line rate in kHz and
+  the highest pixel clock (10 MHz units, at most 2550 MHz) of the base
+  timing and the configured mode, with the EDID 1.4 "+255" offsets for
+  rates above 255 (5120×1440@240: 24–240 Hz, 194–389 kHz, 2030 MHz).
+  Windows checks modes against them when it treats the monitor as
+  continuous-frequency (as it did while the KMD reported an analog
+  connector), and without them kept it at 60 Hz;
 - a DisplayID 2.0 extension (tag `0x70`, version `0x20`, primary use
   "generic display") with Product Identification (`0x20`, no OUI), Display
   Parameters (`0x21`, native size = the configured one), one Type VII
@@ -215,10 +244,13 @@ backend through the IPC client, tests through `conduit_venus::mock::Mock`.
 One `conduit-venus` per VM: `conduit up/view --venus` (and the libvirt
 backend unit) starts it before the backend, on `venus.sock` in the VM's run
 directory, logging to `logs/venus.log`; it serves that one backend and exits
-when it hangs up. Packages ship it as `/opt/conduit/bin/conduit-venus`
-(docs/PACKAGING.md). In a checkout: `host/venus/build-virglrenderer.sh`, then
-`cargo build --release --features renderer` in `host/venus`
-(`CONDUIT_VENUS=PATH` points the CLI at it).
+when it hangs up. `packaging/build.sh venus` builds it for the packages, as
+`/opt/conduit/bin/conduit-venus` with its virglrenderer in `/opt/conduit/lib`
+([PACKAGING.md](PACKAGING.md)); the release workflow, the RPM spec and the
+PKGBUILD do not run that step yet, so release packages come without it. In a
+checkout: `host/venus/build-virglrenderer.sh` (which applies
+`host/venus/patches`), then `cargo build --release --features renderer` in
+`host/venus` (`CONDUIT_VENUS=PATH` points the CLI at it).
 
 **Open files.** Every guest GPU buffer holds a descriptor or two in
 `conduit-venus` (shared memory, a dma-buf, the NVIDIA driver's handle) and

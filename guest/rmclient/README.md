@@ -102,24 +102,26 @@ mapping, fallback, cookies, cleanup on free and close), VA-space GPU mappings,
 events, the version check and a custom-map transport. It also passes under
 ASan/UBSan.
 
-Run `tests/crm_smoke.c` inside a Conduit guest, not on the host, so a GPU fault
-stays contained. It opens a client, reads CARD_INFO, allocates a device and a
+Run `tests/crm_smoke.c` and `tests/crm_event_smoke.c` inside a Conduit guest,
+not on the host, so a GPU fault stays contained. It opens a client, reads CARD_INFO, allocates a device and a
 subdevice, reads the GPU name and arch, allocates a VA space plus 2 MiB of
 video memory and 2 MiB of system memory, CPU-maps the system memory and
 writes/reads it, GPU-maps both, then unmaps and frees everything. Extra steps
 CPU-map video memory over BAR1, map the usermode doorbell object through the
 subdevice, and open/drain/close an OS event. Each step is printed.
+`crm_event_smoke` arms the subdevice's software notifier, triggers it and
+reads the events back with `crm_event_drain`.
 
 ## Status
 
 Tested in the `lab` guest (RTX 5090, GB20x, host driver 610.57.04):
-`crm_smoke` passes every required step and every extra step. One gap is in
-Conduit, not in the library. The host backend refuses `NV_ESC_RM_GET_EVENT_DATA`
-(0x52) with `-EINVAL` ("escape 0x52 is not in the ABI profile for host driver
-610.57.04"), so `crm_event_drain` fails in Conduit guests. Event allocation
-works. Polling the fd for a real notification has not been tested. The backend's
-ABI profile needs 0x52, a 16-byte `NVOS41` whose `pEvent` is a nested
-16-byte user pointer, before event data can be read.
+`crm_smoke` passes every required step and every extra step. Conduit serves
+`NV_ESC_RM_GET_EVENT_DATA` (0x52) on a file that holds an OS event (the guest
+module carries the 16-byte event buffer, the backend checks it,
+`host/backend/device/src/nvidia/os_event.rs`), so `crm_event_drain` works in
+Conduit guests; a backend from before that refuses 0x52 with `-EINVAL`. NVK on
+RM (`guest/nvk-rm`) is the first user.
 
 Not done yet: the Windows transport, `NV_ESC_RM_DUP_OBJECT`, and
-export/import of objects by fd.
+export/import of objects by fd (NVK on RM does that itself with the RM
+controls `OS_UNIX_EXPORT_OBJECT_TO_FD` / `IMPORT_OBJECT_FROM_FD`).

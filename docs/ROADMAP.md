@@ -32,8 +32,11 @@
 - [ ] Display pacing: forward buffer release, drive the guest vblank from the
       host's presentation feedback ([KNOWN-ISSUES.md](KNOWN-ISSUES.md))
 - [ ] Windows guests through Venus (in progress, experimental `--venus`):
-      Helios's guest drivers over Conduit's device ([VENUS.md](VENUS.md));
-      package `conduit-venus`
+      Helios's guest drivers over Conduit's device ([WINDOWS.md](WINDOWS.md),
+      [VENUS.md](VENUS.md)); runs in a Windows 11 guest.
+      Left: `conduit-venus` in the release packages (`build.sh venus` exists,
+      release.yml does not run it), Windows guests in `conduit attach`
+      (driver install, Hyper-V enlightenments)
 - [ ] Audio in the stream (Opus from the VM's sound card)
 - [ ] GPU hot-plug (`device_del` / `device_add`), so a VM can be snapshotted,
       saved and migrated with the GPU unplugged
@@ -46,7 +49,9 @@
 - [ ] NVIDIA native context in virglrenderer: stock QEMU's virtio-gpu, crosvm, libkrun
 - [ ] Windows guests beyond Venus, two routes (assessment: [research/windows-thin-path.md](research/windows-thin-path.md)):
   - CUDA / NVML / NVENC on a small non-WDDM driver, using NVIDIA's own user-mode libraries
-  - graphics through the open stack: NVK (Mesa Vulkan) on RM + DXVK / vkd3d-proton
+  - graphics through the open stack: NVK (Mesa Vulkan) on RM + DXVK / vkd3d-proton;
+    started in a Linux guest: `guest/nvk-rm` (experimental, opt-in `NVK_RM=1`,
+    [README](../guest/nvk-rm/README.md)) on `guest/rmclient`
 - [ ] Multiple VMs sharing one GPU with fair scheduling
 - [ ] Per-VM GPU selection on multi-GPU hosts
 - [ ] Multiple monitors per VM, VRR and HDR
