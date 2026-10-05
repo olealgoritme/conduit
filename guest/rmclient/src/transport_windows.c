@@ -25,6 +25,11 @@
  * their own (a "deep" block) are sent without it; RM then answers its own error
  * for them.
  *
+ * Beyond the transport vtable, crm_win_open_device / crm_win_ioctl /
+ * crm_win_scanout_flip (rmclient_transport.h) send what presenting RM memory
+ * takes: an Open of a DRM render node, a DRM ioctl with its NVKMS block as the
+ * nested block, and a ScanoutFlip.
+ *
  * CPU mapping follows Linux's protocol, which the host's backend ties to a
  * channel: open a fresh channel, NV_ESC_RM_MAP_MEMORY on the control channel
  * naming it, then map that channel at offset 0 for the page-rounded length. The
@@ -547,9 +552,9 @@ static uint32_t host_alloc_param_size(const struct win_ctx *c, uint32_t cls)
 /* One Ioctl message: `arg` (size bytes) plus an optional nested block that the
  * payload's own pointer addresses. The reply's blocks are copied back to the
  * same two places. Returns 0, or the host's negative errno. */
-static int ioctl_wire(struct win_ctx *c, int fd, uint32_t nr, void *arg, uint32_t size,
-                      void *nested, uint32_t nested_len, uint32_t pin_id,
-                      uint32_t rm_status_off)
+static int ioctl_wire_cmd(struct win_ctx *c, int fd, uint32_t cmd, void *arg, uint32_t size,
+                          void *nested, uint32_t nested_len, uint32_t pin_id,
+                          uint32_t rm_status_off)
 {
     if (fd < 0)
         return -EBADF;
@@ -565,7 +570,7 @@ static int ioctl_wire(struct win_ctx *c, int fd, uint32_t nr, void *arg, uint32_
         ret = -ENOMEM;
         goto out;
     }
-    (void)crm_wire_ioctl(req, (uint32_t)fd, crm_wire_cmd(nr, size), arg, size, nested, nested_len);
+    (void)crm_wire_ioctl(req, (uint32_t)fd, cmd, arg, size, nested, nested_len);
 
     uint32_t n = 0;
     ret = win_forward(c, req, (uint32_t)req_len, resp, (uint32_t)resp_cap, &n, pin_id,
@@ -587,6 +592,15 @@ out:
     free(req);
     free(resp);
     return ret;
+}
+
+/* An NVIDIA escape: _IOWR('F', nr, size). */
+static int ioctl_wire(struct win_ctx *c, int fd, uint32_t nr, void *arg, uint32_t size,
+                      void *nested, uint32_t nested_len, uint32_t pin_id,
+                      uint32_t rm_status_off)
+{
+    return ioctl_wire_cmd(c, fd, crm_wire_cmd(nr, size), arg, size, nested, nested_len, pin_id,
+                          rm_status_off);
 }
 
 /* HELIOS_NVRM_OP_PIN: the KMD locks [va, va + length) of this process and keeps the
@@ -1016,6 +1030,73 @@ static void win_free_pages(void *ctx, void *ptr, uint64_t size)
     VirtualFree(ptr, 0, MEM_RELEASE);
 }
 
+/* ---- extras: DRM node, raw ioctl, ScanoutFlip (rmclient_transport.h) ----- */
+
+int crm_win_open_device(uint32_t device_type, int *fd)
+{
+    struct win_ctx *c = &g_ctx;
+    *fd = -1;
+    int r = win_init(c);
+    if (r)
+        return r;
+    uint8_t req[CRM_WIRE_HDR + 8];
+    uint8_t resp[CRM_WIRE_HDR + REPLY_SLACK];
+    uint32_t n = 0;
+    const size_t req_len = crm_wire_open(req, device_type);
+    r = win_forward(c, req, (uint32_t)req_len, resp, sizeof(resp), &n, 0, 0);
+    if (r)
+        return r;
+    r = reply_status(resp, n);
+    if (r < 0)
+        return r;
+    const uint32_t handle = crm_get32(resp + 4);
+    if (handle == 0 || handle > 0x7fffffffu)
+        return -EIO;
+    *fd = (int)handle;
+    return 0;
+}
+
+void crm_win_close_device(int fd)
+{
+    if (fd >= 0 && g_ctx.ready)
+        win_close_one(&g_ctx, fd);
+}
+
+int crm_win_ioctl(int fd, uint32_t cmd, void *arg, uint32_t size, void *nested,
+                  uint32_t nested_len)
+{
+    if (!g_ctx.ready)
+        return -ENODEV;
+    if (!nested)
+        nested_len = 0;
+    return ioctl_wire_cmd(&g_ctx, fd, cmd, arg, size, nested, nested_len, 0, 0);
+}
+
+int crm_win_scanout_flip(const struct crm_scanout_flip *flip)
+{
+    struct win_ctx *c = &g_ctx;
+    if (!c->ready)
+        return -ENODEV;
+    const struct crm_wire_flip f = {
+        .scanout = flip->scanout,
+        .owner_handle = flip->owner_handle,
+        .host_handle = flip->host_handle,
+        .width = flip->width,
+        .height = flip->height,
+        .stride = flip->stride,
+        .offset = flip->offset,
+        .fourcc = flip->fourcc,
+        .modifier = flip->modifier,
+        .seq = flip->seq,
+    };
+    uint8_t req[CRM_WIRE_HDR + CRM_WIRE_SCANOUT_FLIP];
+    uint8_t resp[CRM_WIRE_HDR + REPLY_SLACK];
+    uint32_t n = 0;
+    const size_t req_len = crm_wire_scanout_flip(req, &f);
+    const int r = win_forward(c, req, (uint32_t)req_len, resp, sizeof(resp), &n, 0, 0);
+    return r ? r : reply_status(resp, n);
+}
+
 static struct crm_transport windows_transport = {
     .abi = CRM_TRANSPORT_ABI,
     .flags = 0,
@@ -1045,5 +1126,29 @@ const struct crm_transport *crm_default_transport(void)
 #else /* !_WIN32 */
 
 const struct crm_transport *crm_windows_transport(void) { return NULL; }
+
+#include <errno.h>
+
+int crm_win_open_device(uint32_t device_type, int *fd)
+{
+    (void)device_type;
+    *fd = -1;
+    return -ENOSYS;
+}
+
+void crm_win_close_device(int fd) { (void)fd; }
+
+int crm_win_ioctl(int fd, uint32_t cmd, void *arg, uint32_t size, void *nested,
+                  uint32_t nested_len)
+{
+    (void)fd; (void)cmd; (void)arg; (void)size; (void)nested; (void)nested_len;
+    return -ENOSYS;
+}
+
+int crm_win_scanout_flip(const struct crm_scanout_flip *flip)
+{
+    (void)flip;
+    return -ENOSYS;
+}
 
 #endif

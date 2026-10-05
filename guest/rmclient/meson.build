@@ -62,3 +62,8 @@ executable('crm_event_smoke', 'tests/crm_event_smoke.c',
 executable('crm_pin_smoke', 'tests/crm_pin_smoke.c',
   include_directories : [inc, include_directories('src')],
   dependencies : rmclient_dep)
+# Zero-copy present of RM video memory on a Windows guest (DRM node, GEM import,
+# ScanoutFlip through the KMD); exits 77 elsewhere.
+executable('crm_scanout_smoke', 'tests/crm_scanout_smoke.c',
+  include_directories : [inc, include_directories('src')],
+  dependencies : rmclient_dep)

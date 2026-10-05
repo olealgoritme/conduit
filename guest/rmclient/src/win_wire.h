@@ -15,6 +15,9 @@
  *   MsgHeader = { u32 msg_type, u32 handle, i32 status, u32 padding }
  *   Open     payload = { u32 device_type, u32 flags }
  *   Ioctl    payload = IoctlReq(24) | data | nested | deep
+ *   ScanoutFlip payload = { u32 scanout, owner_handle, host_handle, width,
+ *                height, stride, offset, fourcc; u64 modifier, seq;
+ *                u32 reserved[4] } (64 bytes); the reply is a bare header
  *   IoctlReq = { u32 cmd, data_len, nested_offset, nested_len,
  *                deep_ptr_offset, deep_len }
  *   reply    = MsgHeader | (Ioctl) IoctlResp(12) | data | nested | deep
@@ -35,12 +38,16 @@
 #define CRM_WIRE_MSG_IOCTL 3u
 #define CRM_WIRE_MSG_GET_PROC_FILES 6u
 #define CRM_WIRE_MSG_GET_SYS_FILES 7u
+#define CRM_WIRE_MSG_SCANOUT_FLIP 20u
 
 #define CRM_WIRE_DEV_CTL 255u /* /dev/nvidiactl */
+/* DRM render node n of the host's GetSysFiles DRI list (DeviceKind::Dri). */
+#define CRM_WIRE_DEV_DRI_BASE 512u
 
 #define CRM_WIRE_HDR 16u
 #define CRM_WIRE_IOCTL_REQ 24u
 #define CRM_WIRE_IOCTL_RESP 12u
+#define CRM_WIRE_SCANOUT_FLIP 64u
 
 /* The backend caps one Ioctl's blocks at 1 MiB each (the guest module does). */
 #define CRM_WIRE_BLOCK_MAX (1024u * 1024u)
@@ -48,11 +55,18 @@
 /* open(2) flags the host is told. O_RDWR; the host only reads the access mode. */
 #define CRM_WIRE_OPEN_FLAGS 2u
 
+/* Any Linux ioctl number: _IOC(dir, type, nr, size). dir 1 = write (_IOW),
+ * 2 = read (_IOR), 3 = both (_IOWR). DRM's are type 'd'. */
+static inline uint32_t crm_wire_ioc(uint32_t dir, uint32_t type, uint32_t nr, uint32_t size)
+{
+    return ((dir & 3u) << 30) | ((size & 0x3fffu) << 16) | ((type & 0xffu) << 8) | (nr & 0xffu);
+}
+
 /* Linux ioctl number for an NVIDIA escape: _IOWR('F', nr, size). The host
  * dispatches on the full number, exactly as the guest module forwards it. */
 static inline uint32_t crm_wire_cmd(uint32_t nr, uint32_t size)
 {
-    return (3u << 30) | ((size & 0x3fffu) << 16) | ((uint32_t)'F' << 8) | (nr & 0xffu);
+    return crm_wire_ioc(3u, 'F', nr, size);
 }
 
 static inline void crm_put32(uint8_t *p, uint32_t v)
@@ -96,6 +110,38 @@ static inline size_t crm_wire_get_sys_files(uint8_t *out)
 {
     crm_wire_header(out, CRM_WIRE_MSG_GET_SYS_FILES, 0);
     return CRM_WIRE_HDR;
+}
+
+/* ScanoutFlip (messages.rs ScanoutFlip). The request's MsgHeader.handle is 0:
+ * the buffer is named by owner_handle (a DRM-node file the guest opened) and
+ * host_handle (a GEM handle in that file). */
+struct crm_wire_flip {
+    uint32_t scanout, owner_handle, host_handle, width, height, stride, offset, fourcc;
+    uint64_t modifier, seq;
+};
+
+static inline void crm_put64(uint8_t *p, uint64_t v)
+{
+    memcpy(p, &v, sizeof(v));
+}
+
+/* MsgHeader | ScanoutFlip. Returns the request length (80). */
+static inline size_t crm_wire_scanout_flip(uint8_t *out, const struct crm_wire_flip *f)
+{
+    crm_wire_header(out, CRM_WIRE_MSG_SCANOUT_FLIP, 0);
+    uint8_t *p = out + CRM_WIRE_HDR;
+    crm_put32(p + 0, f->scanout);
+    crm_put32(p + 4, f->owner_handle);
+    crm_put32(p + 8, f->host_handle);
+    crm_put32(p + 12, f->width);
+    crm_put32(p + 16, f->height);
+    crm_put32(p + 20, f->stride);
+    crm_put32(p + 24, f->offset);
+    crm_put32(p + 28, f->fourcc);
+    crm_put64(p + 32, f->modifier);
+    crm_put64(p + 40, f->seq);
+    memset(p + 48, 0, 16); /* reserved */
+    return CRM_WIRE_HDR + CRM_WIRE_SCANOUT_FLIP;
 }
 
 /* Request and reply sizes of an Ioctl carrying `data` plus one nested block. */

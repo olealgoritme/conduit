@@ -128,6 +128,48 @@ const struct crm_transport *crm_linux_transport(void);
  * events. NULL on non-Windows builds. */
 const struct crm_transport *crm_windows_transport(void);
 
+/*
+ * Windows transport extras: Conduit messages that are not RM escapes, for
+ * presenting RM memory through Conduit's zero-copy scanout (docs/SCANOUT.md),
+ * the way a Linux guest's KMS does it in its kernel: open one of the host's DRM
+ * render nodes, import RM memory there as a GEM object
+ * (DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY, after NV0000_CTRL_CMD_OS_UNIX_EXPORT_
+ * OBJECT_TO_FD into a fresh control channel), and name that GEM object in a
+ * ScanoutFlip. fds are backend handles, as everywhere in this transport, so an
+ * fd written into a payload (the export's fd, the import's memFd) is already
+ * what the host resolves. Each answers -ENOSYS on non-Windows builds.
+ */
+#define CRM_WIN_DEV_CTL 255u      /* a fresh control channel (/dev/nvidiactl) */
+#define CRM_WIN_DEV_DRI_BASE 512u /* + n: render node n of the host's DRI list */
+
+/* Open a channel of any device type (Open message). *fd >= 0 on success. */
+int crm_win_open_device(uint32_t device_type, int *fd);
+/* Close what crm_win_open_device opened. */
+void crm_win_close_device(int fd);
+/* One ioctl with its full Linux number `cmd` (e.g. DRM_IOWR('d', ...)) on fd:
+ * `arg` (size bytes) is the top-level struct; `nested` (nested_len bytes, may
+ * be NULL) is the block a pointer inside it addresses, sent after it. Both are
+ * written back from the reply. Returns 0 or a negative errno (the host's). */
+int crm_win_ioctl(int fd, uint32_t cmd, void *arg, uint32_t size, void *nested,
+                  uint32_t nested_len);
+
+/* ScanoutFlip (host messages.rs): show GEM object host_handle of the DRM-node
+ * file owner_handle (an fd from crm_win_open_device(CRM_WIN_DEV_DRI_BASE + n)). */
+struct crm_scanout_flip {
+    uint32_t scanout;      /* 0 */
+    uint32_t owner_handle;
+    uint32_t host_handle;
+    uint32_t width, height;
+    uint32_t stride;       /* plane 0 pitch, bytes */
+    uint32_t offset;       /* plane 0 offset, bytes */
+    uint32_t fourcc;       /* DRM_FORMAT_* */
+    uint64_t modifier;     /* DRM_FORMAT_MOD_*; 0 = linear */
+    uint64_t seq;          /* increasing per flip */
+};
+/* Returns 0, or a negative errno: the host's verdict, or -EPERM when the KMD
+ * does not forward ScanoutFlip (KMD before 22.22.307). */
+int crm_win_scanout_flip(const struct crm_scanout_flip *flip);
+
 /* The platform default transport (what crm_open(.., NULL) uses). */
 const struct crm_transport *crm_default_transport(void);
 

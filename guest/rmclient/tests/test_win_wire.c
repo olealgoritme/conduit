@@ -210,6 +210,72 @@ static void test_alloc_sizes(void)
     }
 }
 
+/* What a Windows program sends to present RM memory: Open of a DRM render node,
+ * DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY with its NVKMS block, ScanoutFlip. */
+static void test_scanout_path(void)
+{
+    uint8_t b[128];
+
+    /* Open of render node 0: DeviceKind::Dri(0). */
+    CHECK(crm_wire_open(b, CRM_WIRE_DEV_DRI_BASE + 0) == 24);
+    CHECK(crm_get32(b + 16) == 512);
+
+    /* DRM_IOWR(DRM_COMMAND_BASE + 0x01, 32-byte params): nvidia-drm's
+     * GEM_IMPORT_NVKMS_MEMORY, which the backend matches as 'd' nr 0x41. */
+    const uint32_t imp = crm_wire_ioc(3, 'd', 0x41, 32);
+    CHECK(imp == 0xC0206441u);
+    /* DRM_IOW(0x09, struct drm_gem_close) */
+    CHECK(crm_wire_ioc(1, 'd', 0x09, 8) == 0x40086409u);
+    /* the 'F' helper is the same encoding */
+    CHECK(crm_wire_cmd(0x2A, 32) == crm_wire_ioc(3, 'F', 0x2A, 32));
+
+    /* data = { mem_size, nvkms_params_ptr, nvkms_params_size, handle, pad },
+     * nested = NvKmsKapiPrivImportMemoryParams (28 bytes, memFd first). The
+     * backend reads the nested block at outer_size 32 and the memFd at 0. */
+    uint8_t data[32] = { 0 }, nested[28] = { 0 };
+    crm_put32(data + 16, 28);
+    crm_put32(nested + 0, 9);  /* memFd: a backend handle */
+    crm_put32(nested + 4, 1);  /* layout PITCH */
+    memset(b, 0xEE, sizeof(b));
+    CHECK(crm_wire_ioctl(b, 5, imp, data, 32, nested, 28) == 16 + 24 + 32 + 28);
+    CHECK(crm_get32(b + 4) == 5);
+    CHECK(crm_get32(b + 16) == imp);
+    CHECK(crm_get32(b + 20) == 32);
+    CHECK(crm_get32(b + 24) == 32);  /* nested_offset */
+    CHECK(crm_get32(b + 28) == 28);
+    CHECK(crm_get32(b + 40 + 16) == 28);
+    CHECK(crm_get32(b + 40 + 32) == 9);
+    CHECK(crm_get32(b + 40 + 36) == 1);
+
+    /* ScanoutFlip */
+    struct crm_wire_flip f = {
+        .scanout = 0, .owner_handle = 7, .host_handle = 3, .width = 1920,
+        .height = 1080, .stride = 7680, .offset = 0, .fourcc = 0x34325258u,
+        .modifier = 0x0300000000606015ull, .seq = 0x100000002ull,
+    };
+    memset(b, 0xEE, sizeof(b));
+    CHECK(crm_wire_scanout_flip(b, &f) == 80);
+    CHECK(crm_get32(b + 0) == 20);   /* msg_type ScanoutFlip */
+    CHECK(crm_get32(b + 4) == 0);    /* handle */
+    CHECK(crm_get32(b + 8) == 0);
+    CHECK(crm_get32(b + 12) == 0);
+    CHECK(crm_get32(b + 16) == 0);   /* scanout */
+    CHECK(crm_get32(b + 20) == 7);   /* owner_handle */
+    CHECK(crm_get32(b + 24) == 3);   /* host_handle */
+    CHECK(crm_get32(b + 28) == 1920);
+    CHECK(crm_get32(b + 32) == 1080);
+    CHECK(crm_get32(b + 36) == 7680);
+    CHECK(crm_get32(b + 40) == 0);
+    CHECK(crm_get32(b + 44) == 0x34325258u);
+    CHECK(crm_get32(b + 48) == 0x00606015u); /* modifier, low word first */
+    CHECK(crm_get32(b + 52) == 0x03000000u);
+    CHECK(crm_get32(b + 56) == 2);           /* seq */
+    CHECK(crm_get32(b + 60) == 1);
+    for (int i = 64; i < 80; i++)
+        CHECK(b[i] == 0);                    /* reserved */
+    CHECK(b[80] == 0xEE);                    /* nothing past the message */
+}
+
 int main(void)
 {
     test_cmd_encoding();
@@ -217,6 +283,7 @@ int main(void)
     test_ioctl_layout();
     test_reply_parse();
     test_alloc_sizes();
+    test_scanout_path();
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
