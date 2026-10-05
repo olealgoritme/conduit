@@ -162,7 +162,7 @@ pub fn edid(width: u32, height: u32, hz: u32) -> [u8; EDID_LEN] {
     let native = cvt_rb2(width, height, hz);
     let (base, exact) = base_timing(width, height, hz);
     let mut out = [0u8; EDID_LEN];
-    out[..BLOCK].copy_from_slice(&base_block(&base, exact));
+    out[..BLOCK].copy_from_slice(&base_block(&base, exact, &native));
     out[BLOCK..].copy_from_slice(&displayid_block(&native));
     out
 }
@@ -174,7 +174,7 @@ fn checksum(b: &mut [u8]) {
 }
 
 /// The EDID 1.4 base block (VESA E-EDID A2 §3).
-fn base_block(t: &Timing, exact: bool) -> [u8; BLOCK] {
+fn base_block(t: &Timing, exact: bool, native: &Timing) -> [u8; BLOCK] {
     let mut b = [0u8; BLOCK];
     b[..8].copy_from_slice(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]);
     // Three letters, 5 bits each ('A' = 1), big-endian.
@@ -210,14 +210,73 @@ fn base_block(t: &Timing, exact: bool) -> [u8; BLOCK] {
     b[38..54].fill(0x01);
     b[54..72].copy_from_slice(&dtd(t));
     b[72..90].copy_from_slice(&text_descriptor(0xfc, NAME));
-    // Two dummy descriptors. No range limits: EDID 1.4 asks for them only
-    // of a continuous-frequency display, and they could not cover every
-    // refresh `--display` takes anyway.
-    b[93] = 0x10;
+    // Range limits covering both timings. Windows checks every mode against
+    // them when it treats the monitor as continuous-frequency (an analog
+    // target, as the Helios driver reports it); without them it keeps to a
+    // conservative 60 Hz and refuses the configured refresh.
+    b[90..108].copy_from_slice(&range_limits(&[*t, *native]));
+    // One dummy descriptor.
     b[111] = 0x10;
     b[126] = 1;
     checksum(&mut b);
     b
+}
+
+/// A Display Range Limits descriptor (tag 0xFD, E-EDID A2 §3.10.3.3, with the
+/// EDID 1.4 offsets for rates above 255) that admits every timing in `ts`:
+/// vertical 24 Hz up to the highest refresh, horizontal from the lowest to
+/// the highest line rate (kHz, rounded outwards), and the highest pixel clock
+/// in 10 MHz units (rounded up, at most 2550 MHz). "Range limits only": no
+/// GTF or CVT formula is offered beyond the listed timings.
+fn range_limits(ts: &[Timing]) -> [u8; 18] {
+    // Up to 510 in a byte plus its "+255" flag.
+    fn split(v: u32) -> (u8, bool) {
+        let v = v.min(510);
+        if v > 255 {
+            ((v - 255) as u8, true)
+        } else {
+            (v as u8, false)
+        }
+    }
+    let khz = |t: &Timing| t.clock_khz as u64 * 1000 / t.htotal() as u64; // line rate, Hz
+    let vmax = ts
+        .iter()
+        .map(|t| t.refresh_mhz().div_ceil(1000))
+        .max()
+        .unwrap_or(60)
+        .max(24);
+    let hmin = ts
+        .iter()
+        .map(|t| (khz(t) / 1000) as u32)
+        .min()
+        .unwrap_or(30)
+        .max(1);
+    let hmax = ts
+        .iter()
+        .map(|t| khz(t).div_ceil(1000) as u32)
+        .max()
+        .unwrap_or(30);
+    let clock = ts
+        .iter()
+        .map(|t| t.clock_khz.div_ceil(10_000))
+        .max()
+        .unwrap_or(1)
+        .clamp(1, 255);
+    let (vmin, vmin_hi) = split(24);
+    let (vmax, vmax_hi) = split(vmax);
+    let (hmin, hmin_hi) = split(hmin);
+    let (hmax, hmax_hi) = split(hmax);
+    let mut d = [0u8; 18];
+    d[3] = 0xfd;
+    // Bit 0/1: vertical min/max +255; bit 2/3: horizontal min/max +255. A
+    // minimum can only be offset when its maximum is too.
+    d[4] = vmin_hi as u8 | (vmax_hi as u8) << 1 | (hmin_hi as u8) << 2 | (hmax_hi as u8) << 3;
+    (d[5], d[6], d[7], d[8], d[9]) = (vmin, vmax, hmin, hmax, clock as u8);
+    // Range limits only; then the unused bytes as a terminated string.
+    d[10] = 0x01;
+    d[11] = 0x0a;
+    d[12..].fill(0x20);
+    d
 }
 
 /// An 18-byte detailed timing descriptor (E-EDID A2 §3.10.2). `t` must
@@ -621,6 +680,24 @@ mod tests {
         let at = BLOCK + TYPE_VII_AT;
         let (t, ..) = parse_type_vii(&got[at..at + 20]);
         assert_eq!((t.hactive, t.vactive, t.clock_khz), (5120, 1440, 2_020_512));
+    }
+
+    #[test]
+    fn range_limits_admit_the_configured_mode() {
+        let b = edid(5120, 1440, 240);
+        let d = &b[90..108];
+        assert_eq!(d[..4], [0, 0, 0, 0xfd]);
+        // 24..240 Hz; 194..389 kHz (the stand-in's and the real line rates,
+        // the maximum as 134 + 255); 2030 MHz; range limits only.
+        assert_eq!(d[4], 0b1000, "horizontal max offset");
+        assert_eq!(
+            (d[5], d[6], d[7], d[8], d[9], d[10]),
+            (24, 240, 194, 134, 203, 0x01)
+        );
+        // Every timing's line rate and clock inside the limits.
+        let b = edid(1920, 1080, 60);
+        assert_eq!((b[93], b[95], b[96]), (0xfd, 24, 60));
+        assert_eq!(b[111], 0x10, "one dummy descriptor left");
     }
 
     #[test]
