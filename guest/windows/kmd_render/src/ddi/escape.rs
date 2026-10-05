@@ -32,13 +32,15 @@ use helios_protocol::{
     HeliosEscapeQueryScanout, HeliosEscapeQueryScanoutTimeline, HeliosEscapeQueryStats,
     HeliosEscapeQueryStatsV2, HeliosEscapeQueryStatsV3, HeliosEscapeQueryStatsV4,
     HeliosEscapeReleaseBlob, HeliosEscapeScanoutEvent, HeliosEscapeSubmitVenus,
-    HeliosEscapeWaitFence, HeliosEscapeWaitFenceLegacy, HELIOS_ESCAPE_ALLOC_BLOB,
+    HeliosEscapeSubmitVenusBatch, HeliosEscapeWaitFence, HeliosEscapeWaitFenceLegacy, HELIOS_ESCAPE_ALLOC_BLOB,
     HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY,
     HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_MAP_READ_LEDGER, HELIOS_ESCAPE_PRESENT_BUFFER_READ,
     HELIOS_ESCAPE_PRESENT_STREAM, HELIOS_ESCAPE_QUERY_SCANOUT,
     HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE, HELIOS_ESCAPE_QUERY_STATS,
     HELIOS_ESCAPE_REGISTER_FENCE_EVENT, HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SCANOUT_EVENT,
-    HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT, HELIOS_ESCAPE_WAIT_FENCE,
+    HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_SUBMIT_VENUS_BATCH,
+    HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT, HELIOS_ESCAPE_WAIT_FENCE,
+    HELIOS_SUBMIT_BATCH_MAX_ENTRIES, HeliosSubmitBatchEntry,
     HELIOS_FENCE_EVENT_ALREADY_COMPLETE, HELIOS_FENCE_EVENT_CANCELLED,
     HELIOS_FENCE_EVENT_NOT_FOUND, HELIOS_FENCE_EVENT_PROBE_ACK, HELIOS_FENCE_EVENT_REGISTERED,
     HELIOS_PRESENT_BUFFER_READ_ACCEPTED, HELIOS_PRESENT_BUFFER_READ_BUSY,
@@ -367,6 +369,10 @@ pub unsafe extern "C" fn dxgkddi_escape(
         },
         HELIOS_ESCAPE_SUBMIT_VENUS => match owner {
             Some(owner) => escape_submit_venus(passive, adapter, buf, &hdr, owner),
+            None => refuse_no_device(),
+        },
+        HELIOS_ESCAPE_SUBMIT_VENUS_BATCH => match owner {
+            Some(owner) => escape_submit_venus_batch(passive, adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_PRESENT_STREAM => match owner {
@@ -1489,6 +1495,7 @@ fn escape_submit_venus(
         Err(st) => return st,
     };
     let req = wire.read();
+    ctrl::count_submit_escape();
 
     // TRUST BOUNDARY, and THE ONE PLACE `hdr.size` MUST NOT BE THE BOUND.
     // SUBMIT_VENUS sets hdr.size = sizeof(HeliosEscapeSubmitVenus) = 40 while
@@ -1502,31 +1509,16 @@ fn escape_submit_venus(
         return STATUS_INVALID_PARAMETER;
     }
 
-    // `present_value32 == 0` is byte-for-byte legacy behavior: the incoming
-    // fence id remains ignored and the KMD assigns a normal wire fence.  A
-    // tagged submit reinterprets only the INPUT fence id as the registered
-    // stream capability; writeback below still returns that same normal fence.
-    let queued = if req.present_value32 == 0 {
-        ctrl::submit_venus_async(
-            passive,
-            adapter,
-            Some(owner),
-            req.ctx_id,
-            req.ring_idx,
-            &stream[..payload],
-        )
-    } else {
-        ctrl::submit_venus_async_present_stream(
-            passive,
-            adapter,
-            owner,
-            req.ctx_id,
-            req.ring_idx,
-            req.fence_id,
-            req.present_value32,
-            &stream[..payload],
-        )
-    };
+    let queued = submit_one(
+        passive,
+        adapter,
+        owner,
+        req.ctx_id,
+        req.ring_idx,
+        req.fence_id,
+        req.present_value32,
+        &stream[..payload],
+    );
     match queued {
         Ok(wire_fence) => {
             // Report the assigned wire fence id back (in/out escape buffer).
@@ -1538,6 +1530,147 @@ fn escape_submit_venus(
         Err(crate::virtio::VirtioError::NotOwned) => refuse_foreign_context(),
         Err(ve) => ve.into(),
     }
+}
+
+/// `STATUS_CANCELLED` (0xC0000120): a batch entry that was not submitted because an
+/// earlier entry of the same batch was refused.
+const STATUS_CANCELLED: NTSTATUS = 0xC000_0120_u32 as i32;
+
+/// One submission, shared by `HELIOS_ESCAPE_SUBMIT_VENUS` and every entry of
+/// `HELIOS_ESCAPE_SUBMIT_VENUS_BATCH`, so a batched submit takes exactly the path
+/// a single one does.
+///
+/// `present_value32 == 0` is byte-for-byte legacy behavior: the incoming fence id
+/// remains ignored and the KMD assigns a normal wire fence.  A tagged submit
+/// reinterprets only the INPUT fence id as the registered stream capability; the
+/// returned fence is still the normal wire fence.
+#[allow(clippy::too_many_arguments)]
+fn submit_one(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    ctx_id: u32,
+    ring_idx: u32,
+    fence_id: u64,
+    present_value32: u32,
+    stream: &[u8],
+) -> Result<u64, crate::virtio::VirtioError> {
+    if present_value32 == 0 {
+        ctrl::submit_venus_async(passive, adapter, Some(owner), ctx_id, ring_idx, stream)
+    } else {
+        ctrl::submit_venus_async_present_stream(
+            passive,
+            adapter,
+            owner,
+            ctx_id,
+            ring_idx,
+            fence_id,
+            present_value32,
+            stream,
+        )
+    }
+}
+
+/// `HELIOS_ESCAPE_SUBMIT_VENUS_BATCH` — N submissions, one escape. Each entry runs
+/// through [`submit_one`] in order, so fences and ordering are those of N single
+/// escapes; see the verb's docs in `helios_protocol::escape` for the layout and
+/// the failure rule.
+fn escape_submit_venus_batch(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+) -> NTSTATUS {
+    use crate::virtio::gpu::{ESCAPE_BATCH_COUNT, ESCAPE_BATCH_ENTRIES, ESCAPE_BATCH_MAX};
+    let mut wire = match EscapeBuf::<HeliosEscapeSubmitVenusBatch>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let head = wire.read();
+    ctrl::count_submit_escape();
+    if head.flags != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Capability probe: an up-to-date KMD acknowledges and does nothing.
+    if head.count == 0 {
+        return STATUS_SUCCESS;
+    }
+    if head.count > HELIOS_SUBMIT_BATCH_MAX_ENTRIES {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let count = head.count as usize;
+    let entry_size = size_of::<HeliosSubmitBatchEntry>();
+    let tail = wire.trailing_mut();
+    // `count` is at most 64, so this cannot overflow.
+    let table_len = count * entry_size;
+    if tail.len() < table_len {
+        return refuse_short_buffer();
+    }
+    let (table, streams) = tail.split_at_mut(table_len);
+
+    // Validate EVERYTHING before submitting anything: a malformed batch must not
+    // leave a prefix of it queued.
+    let mut total = 0usize;
+    for i in 0..count {
+        let e: HeliosSubmitBatchEntry =
+            pod_read_unaligned(&table[i * entry_size..(i + 1) * entry_size]);
+        if e.buffer_size == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        total = match total.checked_add(e.buffer_size as usize) {
+            Some(t) if t <= streams.len() => t,
+            _ => return STATUS_INVALID_PARAMETER,
+        };
+    }
+
+    let mut offset = 0usize;
+    let mut accepted = 0u32;
+    let mut failed = false;
+    for i in 0..count {
+        let slot = i * entry_size..(i + 1) * entry_size;
+        let mut e: HeliosSubmitBatchEntry = pod_read_unaligned(&table[slot.clone()]);
+        let len = e.buffer_size as usize;
+        if failed {
+            // Nothing of this entry was submitted.
+            e.out_status = STATUS_CANCELLED;
+            table[slot].copy_from_slice(bytes_of(&e));
+            offset += len;
+            continue;
+        }
+        let queued = submit_one(
+            passive,
+            adapter,
+            owner,
+            e.ctx_id,
+            e.ring_idx,
+            e.fence_id,
+            e.present_value32,
+            &streams[offset..offset + len],
+        );
+        offset += len;
+        match queued {
+            Ok(wire_fence) => {
+                e.fence_id = wire_fence;
+                e.out_status = 0;
+                accepted += 1;
+            }
+            Err(crate::virtio::VirtioError::NotOwned) => {
+                e.out_status = refuse_foreign_context();
+                failed = true;
+            }
+            Err(ve) => {
+                let st: NTSTATUS = ve.into();
+                e.out_status = st;
+                failed = true;
+            }
+        }
+        table[slot].copy_from_slice(bytes_of(&e));
+    }
+    ESCAPE_BATCH_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    ESCAPE_BATCH_ENTRIES.fetch_add(accepted, core::sync::atomic::Ordering::Relaxed);
+    ESCAPE_BATCH_MAX.fetch_max(head.count, core::sync::atomic::Ordering::Relaxed);
+    STATUS_SUCCESS
 }
 
 /// `HELIOS_ESCAPE_WAIT_FENCE` → REAL wait (C3/M3.4): block (PASSIVE, KEVENT)

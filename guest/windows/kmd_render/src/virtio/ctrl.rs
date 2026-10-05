@@ -63,7 +63,8 @@ use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 use super::gpu::{
     BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner, FenceWaitPrep,
     OwnerFilter, SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, CTRL_TEARDOWN_ABANDONS,
-    CTRL_TIMEOUT_COUNT, ESCAPE_SUBMIT_COUNT, ESCAPE_SUBMIT_RING_COUNT, FENCE_WAIT_TABLE_FULL,
+    CTRL_TIMEOUT_COUNT, ESCAPE_SUBMIT_CALLS, ESCAPE_SUBMIT_COUNT, ESCAPE_SUBMIT_RING_COUNT,
+    FENCE_WAIT_TABLE_FULL,
     FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
@@ -1559,6 +1560,12 @@ fn submit_venus_async_inner(
             Ok(Err((_m, _v, e))) => return Err(e), // buffers dropped at PASSIVE
         }
     }
+}
+
+/// Count one received submission escape (`EscCalls`); see
+/// `ESCAPE_SUBMIT_CALLS`. Counted on receipt, accepted or not.
+pub fn count_submit_escape() {
+    ESCAPE_SUBMIT_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The prologue both per-frame display submitters share: refuse an empty

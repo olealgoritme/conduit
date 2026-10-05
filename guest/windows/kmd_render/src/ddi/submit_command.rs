@@ -364,6 +364,25 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"EscSubRing",
         crate::virtio::gpu::ESCAPE_SUBMIT_RING_COUNT.load(Ordering::Relaxed),
     );
+    // Submission escapes received vs submits accepted: `EscSub / EscCalls` is the
+    // average submits per user->kernel transition, `EscBat*` describe the batch
+    // verb (virtio/counters.rs).
+    crate::diag::record_named_bytes(
+        b"EscCalls",
+        crate::virtio::gpu::ESCAPE_SUBMIT_CALLS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"EscBat",
+        crate::virtio::gpu::ESCAPE_BATCH_COUNT.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"EscBatEnt",
+        crate::virtio::gpu::ESCAPE_BATCH_ENTRIES.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"EscBatMax",
+        crate::virtio::gpu::ESCAPE_BATCH_MAX.load(Ordering::Relaxed),
+    );
     // S-1's instrument (`docs/dx12/PENDING.md` §2). `DxgkDdiCalibrateGpuClock` is
     // the ONLY channel for the GPU timestamp frequency an application divides its
     // timestamp deltas by, and it used to zero-fill and return SUCCESS silently.

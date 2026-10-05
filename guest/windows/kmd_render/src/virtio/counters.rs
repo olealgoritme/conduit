@@ -269,6 +269,18 @@ pub static ESCAPE_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// this subset is exactly the set of submits that carried
 /// `VIRTIO_GPU_FLAG_INFO_RING_IDX` onto the wire.
 pub static ESCAPE_SUBMIT_RING_COUNT: AtomicU32 = AtomicU32::new(0);
+/// `HELIOS_ESCAPE_SUBMIT_VENUS` and `HELIOS_ESCAPE_SUBMIT_VENUS_BATCH` escapes
+/// RECEIVED (accepted or refused), i.e. user→kernel transitions spent on
+/// submission. `EscSub / EscCalls` over a window is submits per escape; its rate
+/// is escapes/s. Published as `EscCalls`.
+pub static ESCAPE_SUBMIT_CALLS: AtomicU32 = AtomicU32::new(0);
+/// `HELIOS_ESCAPE_SUBMIT_VENUS_BATCH` escapes that carried at least one entry
+/// (`EscBat`), the entries they carried that the transport accepted
+/// (`EscBatEnt`, a subset of `EscSub`), and the largest entry count seen
+/// (`EscBatMax`).
+pub static ESCAPE_BATCH_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static ESCAPE_BATCH_ENTRIES: AtomicU32 = AtomicU32::new(0);
+pub static ESCAPE_BATCH_MAX: AtomicU32 = AtomicU32::new(0);
 /// Guest-supplied completion boundaries REPLACED by `next_wire_fence` because
 /// they were zero-or-beyond the fences this driver has actually assigned.
 ///

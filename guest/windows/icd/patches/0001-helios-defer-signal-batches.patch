@@ -1,0 +1,1261 @@
+From: Conduit Windows driver
+Subject: [PATCH] venus helios: defer small signal batches into one batch escape
+
+Applies to winboat-org/mesa-helios @ 89bd0676a4e69740d9900fb13561b14acc4997d6 (src/virtio/vulkan/vn_renderer_helios.c).
+Needs KMD >= 22.22.300.0 (HELIOS_ESCAPE_SUBMIT_VENUS_BATCH). Default OFF;
+enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/README.md).
+---
+--- a/src/virtio/vulkan/vn_renderer_helios.c	2026-10-06 00:18:50.318845372 +0200
++++ b/src/virtio/vulkan/vn_renderer_helios.c	2026-10-06 00:18:50.319474311 +0200
+@@ -110,6 +110,7 @@
+ #define HELIOS_ESCAPE_VERSION 1u
+ 
+ #define HELIOS_ESCAPE_SUBMIT_VENUS 0x0001u
++#define HELIOS_ESCAPE_SUBMIT_VENUS_BATCH 0x0017u
+ #define HELIOS_ESCAPE_CTX_CREATE   0x0002u
+ #define HELIOS_ESCAPE_CTX_DESTROY  0x0003u
+ #define HELIOS_ESCAPE_ALLOC_BLOB   0x0004u
+@@ -191,6 +192,27 @@
+    uint32_t present_value32; /* 0 = legacy; nonzero tags fence_id as cookie */
+ };
+ 
++/* HELIOS_ESCAPE_SUBMIT_VENUS_BATCH (KMD 22.22.300.0+, protocol/src/escape.rs):
++ * N submissions in one escape. Buffer = head | entry[count] | streams. Each
++ * entry is what one SUBMIT_VENUS would have carried; the KMD runs them in order
++ * as separate fenced SUBMIT_3Ds. count == 0 is a capability probe. */
++#define HELIOS_SUBMIT_BATCH_MAX_ENTRIES 64u
++struct helios_escape_submit_venus_batch {
++   struct helios_escape_header hdr;
++   uint32_t count;
++   uint32_t flags; /* zero */
++};
++
++struct helios_submit_batch_entry {
++   uint64_t fence_id; /* out: KMD wire fence id */
++   uint32_t ctx_id;
++   uint32_t ring_idx;
++   uint32_t buffer_size;
++   uint32_t present_value32; /* zero: never deferred */
++   int32_t out_status;       /* out: 0 or the entry's NTSTATUS */
++   uint32_t reserved;
++};
++
+ struct helios_escape_present_stream {
+    struct helios_escape_header hdr;
+    uint64_t cookie; /* out on REGISTER; exact in on UNREGISTER */
+@@ -344,6 +366,8 @@
+ _Static_assert(sizeof(struct helios_escape_ctx_create) == 24, "ctx_create size");
+ _Static_assert(sizeof(struct helios_escape_ctx_destroy) == 24, "ctx_destroy size");
+ _Static_assert(sizeof(struct helios_escape_submit_venus) == 40, "submit size");
++_Static_assert(sizeof(struct helios_escape_submit_venus_batch) == 24, "batch head size");
++_Static_assert(sizeof(struct helios_submit_batch_entry) == 32, "batch entry size");
+ _Static_assert(sizeof(struct helios_escape_present_stream) == 32,
+                "present_stream size");
+ _Static_assert(sizeof(struct helios_escape_present_buffer_read) == 40,
+@@ -527,6 +551,43 @@
+    struct helios_present_stream *next;
+ };
+ 
++/* ── Deferred SUBMIT_VENUS batching (HELIOS_SUBMIT_BATCH=1, default OFF) ────────
++ *
++ * What is deferred, and why that is safe: ONLY a small submit (cs <= 256 bytes)
++ * that carries at least one sync — in practice vn_signal_win32_external_semaphore
++ * and vn_create_sync_file, a `vkWaitRingSeqnoMESA` waiter plus a semaphore to
++ * signal. It carries no GPU work (that went through the shared ring) so delaying
++ * it cannot reorder execution; it can only delay WHEN a semaphore signals, by at
++ * most the flush bound. A submit without syncs (a ring notify — latency
++ * sensitive), a present-tagged submit, or anything larger goes out directly,
++ * after flushing the queue so submission order is the call order.
++ *
++ * The queue is flushed as ONE HELIOS_ESCAPE_SUBMIT_VENUS_BATCH: by every
++ * dev_mutex acquisition except ops.submit's own (see helios_dev_lock — this is
++ * the invariant that makes the rest safe: nobody but a submitter ever sees
++ * unflushed state), before any other escape, when the entry/byte cap is hit,
++ * and by a flusher thread HELIOS_SUBMIT_BATCH_US after the queue became
++ * non-empty.
++ *
++ * Fence ids: a deferred entry's syncs are appended to immediately with a
++ * LAZY placeholder fence id (high bit set); flush patches them to the KMD's wire
++ * fence id in place and hands shared (WDDM) syncs to the retire thread then.
++ * Everything below is protected by dev_mutex. */
++#define HELIOS_BATCH_SYNCS_MAX 4
++#define HELIOS_BATCH_CS_MAX 256u
++#define HELIOS_BATCH_LAZY_FENCE (1ull << 63)
++
++struct helios_batch_entry {
++   uint32_t ring_idx;
++   uint32_t size;
++   uint64_t placeholder;
++   uint32_t sync_count;
++   struct {
++      struct helios_sync *sync;
++      uint64_t value;
++   } syncs[HELIOS_BATCH_SYNCS_MAX];
++};
++
+ struct helios {
+    struct vn_renderer base;
+ 
+@@ -603,8 +664,67 @@
+ 
+    struct vn_renderer_shmem_cache shmem_cache;
+    struct helios_perf_stats perf;
++
++   /* Thread currently holding dev_mutex (0 = none); see helios_dev_lock. */
++   volatile DWORD dev_owner;
++
++   /* Deferred SUBMIT_VENUS batching — see the block comment above. */
++   bool batch_enabled;
++   bool batch_lost;           /* a flush failed: every later op fails DEVICE_LOST */
++   uint32_t batch_max_entries;
++   uint32_t batch_age_us;
++   int64_t batch_age_qpc;
++   volatile uint32_t batch_count; /* read unlocked as a fast path only */
++   uint32_t batch_bytes;
++   int64_t batch_first_qpc;
++   struct helios_batch_entry batch_entries[HELIOS_SUBMIT_BATCH_MAX_ENTRIES];
++   uint8_t batch_streams[HELIOS_SUBMIT_BATCH_MAX_ENTRIES * HELIOS_BATCH_CS_MAX];
++   uint8_t batch_escape[sizeof(struct helios_escape_submit_venus_batch) +
++                        HELIOS_SUBMIT_BATCH_MAX_ENTRIES *
++                           sizeof(struct helios_submit_batch_entry) +
++                        HELIOS_SUBMIT_BATCH_MAX_ENTRIES * HELIOS_BATCH_CS_MAX];
++   HANDLE batch_event;      /* auto-reset: queue became non-empty */
++   HANDLE batch_stop_event; /* manual-reset: flusher stop */
++   HANDLE batch_timer;
++   thrd_t batch_thread;
++   bool batch_thread_live;
+ };
+ 
++/* dev_mutex with owner tracking. mtx_plain is not recursive, and the flush has
++ * to know whether its caller already holds the lock.
++ *
++ * helios_dev_lock FLUSHES any deferred batch on acquire. ops.submit alone takes
++ * helios_dev_lock_nf (no flush) — it is the only producer of deferred entries. */
++static bool helios_flush_locked(struct helios *helios);
++
++static inline void
++helios_dev_lock_nf(struct helios *helios)
++{
++   mtx_lock(&helios->dev_mutex);
++   helios->dev_owner = GetCurrentThreadId();
++}
++
++static inline void
++helios_dev_lock(struct helios *helios)
++{
++   helios_dev_lock_nf(helios);
++   if (helios->batch_count)
++      (void)helios_flush_locked(helios);
++}
++
++static inline void
++helios_dev_unlock(struct helios *helios)
++{
++   helios->dev_owner = 0;
++   mtx_unlock(&helios->dev_mutex);
++}
++
++static inline bool
++helios_dev_owned(const struct helios *helios)
++{
++   return helios->dev_owner == GetCurrentThreadId();
++}
++
+ /* Process-wide fence-event wait telemetry (printed by helios_perf_write; kept
+  * as interlocked statics because the wait path deliberately holds NO lock). */
+ static volatile LONG helios_fence_event_waits;     /* event-path parks */
+@@ -835,14 +955,14 @@
+       return false;
+    struct vn_device *dev = vn_device_from_vk(vk_dev);
+    struct helios *helios = (struct helios *)dev->renderer;
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    const bool already_complete =
+       mem->helios_vidmm_resource && mem->helios_vidmm_allocation &&
+       mem->helios_vidmm_global_share && mem->helios_vidmm_cookie;
+    const bool already_partial =
+       mem->helios_vidmm_resource || mem->helios_vidmm_allocation ||
+       mem->helios_vidmm_global_share || mem->helios_vidmm_cookie;
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    if (already_complete || already_partial)
+       return already_complete;
+ 
+@@ -879,7 +999,7 @@
+    /* The bridge normally calls once per freshly imported memory. Keep the
+     * install serialized anyway: a duplicate concurrent call frees its local
+     * reference instead of overwriting and leaking the winner's handles. */
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    const bool empty = !mem->helios_vidmm_resource &&
+                       !mem->helios_vidmm_allocation &&
+                       !mem->helios_vidmm_global_share &&
+@@ -894,7 +1014,7 @@
+                          mem->helios_vidmm_allocation &&
+                          mem->helios_vidmm_global_share &&
+                          mem->helios_vidmm_cookie;
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    if (!empty)
+       vn_renderer_helios_vidmm_free(dev->renderer, resource, allocation);
+    return complete;
+@@ -1310,6 +1430,7 @@
+ }
+ 
+ static void helios_perf_write(struct helios *helios, bool final);
++static void helios_flush_deferred(struct helios *helios);
+ static bool helios_ioctl_wait_fence(struct helios *helios,
+                                     uint64_t fence_id,
+                                     uint64_t timeout_ns);
+@@ -1426,7 +1547,7 @@
+ }
+ 
+ static bool
+-helios_escape_ex(struct helios *helios, void *buf, uint32_t size, bool hardware_access)
++helios_escape_raw(struct helios *helios, void *buf, uint32_t size, bool hardware_access)
+ {
+    if (!helios->adapter) {
+       helios_diag("escape skipped: no adapter size=%u", size);
+@@ -1462,6 +1583,16 @@
+    return true;
+ }
+ 
++/* Every escape but the batch flush itself goes out AFTER any deferred signal
++ * batches, so submission order is the order of the calls. (A no-op when nothing
++ * is deferred, which is always the case unless HELIOS_SUBMIT_BATCH=1.) */
++static bool
++helios_escape_ex(struct helios *helios, void *buf, uint32_t size, bool hardware_access)
++{
++   helios_flush_deferred(helios);
++   return helios_escape_raw(helios, buf, size, hardware_access);
++}
++
+ /* HardwareAccess for the default escape wrapper — now 0 (26th session).
+  *
+  * HardwareAccess=1 makes DxgkEscape take the dxgkrnl adapter CORE resource
+@@ -1548,7 +1679,7 @@
+ 
+    struct helios *helios = (struct helios *)renderer;
+    uint64_t cookie = 0;
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    /* Each semaphore has an exact cookie and every per-frame marker carries
+     * that cookie, so multiple timelines in one Venus context remain
+     * unambiguous. The KMD's fixed stream table is the admission bound. */
+@@ -1560,7 +1691,7 @@
+       helios->present_streams = entry;
+       *out_cookie = cookie;
+    }
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ 
+    if (!ok)
+       free(entry);
+@@ -1578,7 +1709,7 @@
+ 
+    struct helios *helios = (struct helios *)renderer;
+    bool accepted = false;
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+ 
+    const struct helios_present_stream *entry = helios->present_streams;
+    while (entry && entry->cookie != cookie)
+@@ -1595,7 +1726,7 @@
+          req.out_state == HELIOS_PRESENT_BUFFER_READ_ACCEPTED;
+    }
+ 
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    return accepted;
+ }
+ 
+@@ -1607,7 +1738,7 @@
+       return;
+ 
+    struct helios *helios = (struct helios *)renderer;
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    struct helios_present_stream **link = &helios->present_streams;
+    while (*link && (*link)->cookie != cookie)
+       link = &(*link)->next;
+@@ -1621,7 +1752,7 @@
+          helios, HELIOS_PRESENT_STREAM_OP_UNREGISTER, &cookie);
+       free(entry);
+    }
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ }
+ 
+ static void
+@@ -1658,9 +1789,9 @@
+ 
+    struct helios_escape_query_scanout req = { 0 };
+    helios_hdr_init(&req.hdr, HELIOS_ESCAPE_QUERY_SCANOUT, sizeof(req));
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    const bool ok = helios_escape(helios, &req, sizeof(req));
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    ReleaseSRWLockExclusive(&helios_current_renderer_lock);
+    if (!ok || !req.out_resource_id || !req.out_alloc_size ||
+        !req.out_width || !req.out_height || !req.out_pitch)
+@@ -2810,7 +2941,7 @@
+       }
+ 
+       bool free_sync;
+-      mtx_lock(&helios->dev_mutex);
++      helios_dev_lock(helios);
+       if (complete) {
+          helios_sync_mark_fence_locked(renderer, entry->sync, entry->fence_id);
+          if (helios->perf.enabled) {
+@@ -2831,7 +2962,7 @@
+          }
+       }
+       free_sync = helios_sync_unref_locked(renderer, entry->sync);
+-      mtx_unlock(&helios->dev_mutex);
++      helios_dev_unlock(helios);
+       if (free_sync)
+          free(entry->sync);
+       free(entry);
+@@ -2890,6 +3021,299 @@
+    return true;
+ }
+ 
++/* BEGIN helios-batch ------------------------------------------------------- */
++
++/* Process-wide counters (interlocked: the flusher thread and submitters race). */
++static volatile LONG helios_batch_flushes;  /* batch escapes issued */
++static volatile LONG helios_batch_entries;  /* entries they carried */
++static volatile LONG helios_batch_direct;   /* submits sent directly while batching is on */
++static volatile LONG helios_batch_max_seen; /* largest batch */
++
++static bool
++helios_batch_can_defer(const struct helios *helios,
++                       const struct vn_renderer_submit_batch *batch)
++{
++   return helios->batch_enabled && !helios->batch_lost && batch->cs_size > 0 &&
++          batch->cs_size <= HELIOS_BATCH_CS_MAX && batch->sync_count >= 1 &&
++          batch->sync_count <= HELIOS_BATCH_SYNCS_MAX &&
++          !batch->present_value32 && !batch->present_cookie;
++}
++
++/* Send the queue as one escape and resolve every deferred fence id. Caller holds
++ * dev_mutex. Returns false (and latches batch_lost) if the escape failed. */
++static bool
++helios_flush_locked(struct helios *helios)
++{
++   const uint32_t n = helios->batch_count;
++   if (!n)
++      return true;
++
++   const size_t head_size = sizeof(struct helios_escape_submit_venus_batch);
++   const size_t entry_size = sizeof(struct helios_submit_batch_entry);
++   const size_t table_size = (size_t)n * entry_size;
++   const size_t total = head_size + table_size + helios->batch_bytes;
++   uint8_t *buf = helios->batch_escape;
++
++   struct helios_escape_submit_venus_batch head = { 0 };
++   helios_hdr_init(&head.hdr, HELIOS_ESCAPE_SUBMIT_VENUS_BATCH,
++                   (uint32_t)(head_size + table_size));
++   head.count = n;
++   memcpy(buf, &head, head_size);
++   for (uint32_t i = 0; i < n; i++) {
++      struct helios_submit_batch_entry t = { 0 };
++      t.ctx_id = helios->ctx_id;
++      t.ring_idx = helios->batch_entries[i].ring_idx;
++      t.buffer_size = helios->batch_entries[i].size;
++      memcpy(buf + head_size + i * entry_size, &t, entry_size);
++   }
++   memcpy(buf + head_size + table_size, helios->batch_streams,
++          helios->batch_bytes);
++
++   const bool ok = helios_escape_raw(helios, buf, (uint32_t)total,
++                                     helios_escape_hw_forced());
++
++   /* Detach the queue BEFORE resolving it: resolution takes other locks and must
++    * never find a non-empty queue (it would flush again). The entries stay in
++    * the array until the next enqueue, which needs the dev_mutex we hold. */
++   helios->batch_count = 0;
++   helios->batch_bytes = 0;
++
++   for (uint32_t i = 0; i < n; i++) {
++      struct helios_submit_batch_entry t = { 0 };
++      if (ok)
++         memcpy(&t, buf + head_size + i * entry_size, entry_size);
++      const bool good = ok && t.out_status == 0 && t.fence_id != 0;
++      struct helios_batch_entry *e = &helios->batch_entries[i];
++
++      for (uint32_t s = 0; s < e->sync_count; s++) {
++         struct helios_sync *sync = e->syncs[s].sync;
++         for (uint32_t p = 0; p < sync->pending_count; p++) {
++            if (sync->pending[p].fence_id != e->placeholder)
++               continue;
++            if (good)
++               sync->pending[p].fence_id = t.fence_id;
++            else
++               sync->pending[p].complete = true; /* never strand a waiter */
++         }
++         if (good && sync->wddm_local)
++            (void)helios_retire_enqueue_locked(helios, sync, t.fence_id);
++         if (helios_sync_unref_locked(&helios->base, sync))
++            free(sync);
++      }
++      if (!good)
++         helios->batch_lost = true;
++   }
++
++   if (ok) {
++      const LONG flushes = InterlockedIncrement(&helios_batch_flushes);
++      InterlockedExchangeAdd(&helios_batch_entries, (LONG)n);
++      if ((LONG)n > helios_batch_max_seen)
++         helios_batch_max_seen = (LONG)n;
++      if ((flushes & 0x1FFF) == 0)
++         helios_diag("submit-batch: flushes=%ld entries=%ld direct=%ld max=%ld",
++                     (long)flushes, (long)helios_batch_entries,
++                     (long)helios_batch_direct, (long)helios_batch_max_seen);
++   } else {
++      helios_diag("submit-batch: flush of %u entries FAILED — renderer lost", n);
++   }
++   return ok && !helios->batch_lost;
++}
++
++/* Flush from a context that may or may not hold dev_mutex (the escape wrapper,
++ * the flusher thread). Unlocked fast path: nothing queued. */
++static void
++helios_flush_deferred(struct helios *helios)
++{
++   if (!helios->batch_count)
++      return;
++   if (helios_dev_owned(helios)) {
++      (void)helios_flush_locked(helios);
++      return;
++   }
++   helios_dev_lock(helios); /* flushes on acquire */
++   helios_dev_unlock(helios);
++}
++
++/* ops.submit, under dev_mutex: flush on the entry cap or the age bound (the
++ * flusher thread covers the case where no further submit arrives). */
++static void
++helios_batch_maybe_flush_locked(struct helios *helios)
++{
++   if (!helios->batch_count)
++      return;
++   if (helios->batch_count >= helios->batch_max_entries) {
++      (void)helios_flush_locked(helios);
++      return;
++   }
++   LARGE_INTEGER now;
++   QueryPerformanceCounter(&now);
++   if (now.QuadPart - helios->batch_first_qpc >= helios->batch_age_qpc)
++      (void)helios_flush_locked(helios);
++}
++
++/* Queue one deferrable submit; `*out_placeholder` receives the lazy fence id its
++ * syncs are appended with. Caller holds dev_mutex and has checked
++ * helios_batch_can_defer. */
++static bool
++helios_batch_queue_locked(struct helios *helios,
++                          const struct vn_renderer_submit_batch *batch,
++                          uint64_t *out_placeholder)
++{
++   if (helios->batch_count >= helios->batch_max_entries &&
++       !helios_flush_locked(helios))
++      return false;
++
++   struct helios_batch_entry *e = &helios->batch_entries[helios->batch_count];
++   memcpy(helios->batch_streams + helios->batch_bytes, batch->cs_data,
++          batch->cs_size);
++   e->ring_idx = batch->ring_idx;
++   e->size = (uint32_t)batch->cs_size;
++   e->placeholder = HELIOS_BATCH_LAZY_FENCE | ++helios->next_fence_id;
++   e->sync_count = 0;
++
++   if (!helios->batch_count) {
++      LARGE_INTEGER now;
++      QueryPerformanceCounter(&now);
++      helios->batch_first_qpc = now.QuadPart;
++      SetEvent(helios->batch_event); /* arm the flusher */
++   }
++   helios->batch_bytes += (uint32_t)batch->cs_size;
++   helios->batch_count++;
++   *out_placeholder = e->placeholder;
++   return true;
++}
++
++/* The entry owns a reference on each sync until flush resolves it. */
++static void
++helios_batch_record_sync(struct helios_batch_entry *e,
++                         struct helios_sync *sync,
++                         uint64_t value)
++{
++   assert(e->sync_count < HELIOS_BATCH_SYNCS_MAX);
++   e->syncs[e->sync_count].sync = sync;
++   e->syncs[e->sync_count].value = value;
++   e->sync_count++;
++   sync->refs++;
++}
++
++/* Flusher: HELIOS_SUBMIT_BATCH_US after the queue became non-empty, flush it.
++ * The queue is otherwise flushed by the next submit, wait, sync op or escape;
++ * this bounds how long a signal can sit when the app goes quiet. */
++static int
++helios_batch_flusher(void *arg)
++{
++   struct helios *helios = arg;
++   HANDLE armed[2] = { helios->batch_stop_event, helios->batch_event };
++   HANDLE aged[2] = { helios->batch_stop_event, helios->batch_timer };
++   for (;;) {
++      if (WaitForMultipleObjects(2, armed, FALSE, INFINITE) == WAIT_OBJECT_0)
++         break;
++      LARGE_INTEGER due;
++      due.QuadPart = -(LONGLONG)helios->batch_age_us * 10; /* 100 ns units */
++      if (SetWaitableTimer(helios->batch_timer, &due, 0, NULL, NULL, FALSE)) {
++         if (WaitForMultipleObjects(2, aged, FALSE, INFINITE) == WAIT_OBJECT_0)
++            break;
++      } else {
++         Sleep(1);
++      }
++      helios_flush_deferred(helios);
++   }
++   return 0;
++}
++
++static uint32_t
++helios_env_u32(const char *name, uint32_t def, uint32_t lo, uint32_t hi)
++{
++   char v[16];
++   if (!GetEnvironmentVariableA(name, v, sizeof(v)) || !v[0])
++      return def;
++   const unsigned long parsed = strtoul(v, NULL, 10);
++   return parsed < lo ? lo : parsed > hi ? hi : (uint32_t)parsed;
++}
++
++/* Capability probe (count == 0): an up-to-date KMD answers STATUS_SUCCESS, an
++ * older one rejects the unknown verb. Quiet, like helios_probe_fence_events. */
++static void
++helios_batch_init(struct helios *helios)
++{
++   char v[16];
++   if (!GetEnvironmentVariableA("HELIOS_SUBMIT_BATCH", v, sizeof(v)) || !v[0] ||
++       v[0] == '0')
++      return; /* default OFF: DWM and every other process keep today's path */
++
++   struct helios_escape_submit_venus_batch probe = { 0 };
++   helios_hdr_init(&probe.hdr, HELIOS_ESCAPE_SUBMIT_VENUS_BATCH, sizeof(probe));
++
++   D3DKMT_ESCAPE esc;
++   memset(&esc, 0, sizeof(esc));
++   esc.hAdapter = helios->adapter;
++   esc.hDevice = helios->device;
++   esc.hContext = helios->context;
++   esc.Type = D3DKMT_ESCAPE_DRIVERPRIVATE;
++   esc.pPrivateDriverData = &probe;
++   esc.PrivateDriverDataSize = sizeof(probe);
++   const NTSTATUS st = D3DKMTEscape(&esc);
++   if (st != 0) {
++      helios_diag("submit-batch: KMD verb unsupported (status=0x%08x) — off",
++                  (unsigned)st);
++      return;
++   }
++
++   helios->batch_max_entries =
++      helios_env_u32("HELIOS_SUBMIT_BATCH_MAX", 16, 2, HELIOS_SUBMIT_BATCH_MAX_ENTRIES);
++   helios->batch_age_us = helios_env_u32("HELIOS_SUBMIT_BATCH_US", 300, 50, 5000);
++   LARGE_INTEGER freq;
++   QueryPerformanceFrequency(&freq);
++   helios->batch_age_qpc =
++      (int64_t)freq.QuadPart * helios->batch_age_us / 1000000;
++
++   helios->batch_event = CreateEventW(NULL, FALSE, FALSE, NULL);
++   helios->batch_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
++   /* High-resolution timer (Windows 10 1803+); the ordinary timer otherwise. */
++   helios->batch_timer =
++      CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */,
++                             TIMER_ALL_ACCESS);
++   if (!helios->batch_timer)
++      helios->batch_timer = CreateWaitableTimerW(NULL, FALSE, NULL);
++   if (!helios->batch_event || !helios->batch_stop_event || !helios->batch_timer ||
++       u_thread_create(&helios->batch_thread, helios_batch_flusher, helios) !=
++          thrd_success) {
++      helios_diag("submit-batch: flusher setup FAILED — off");
++      if (helios->batch_event) CloseHandle(helios->batch_event);
++      if (helios->batch_stop_event) CloseHandle(helios->batch_stop_event);
++      if (helios->batch_timer) CloseHandle(helios->batch_timer);
++      helios->batch_event = helios->batch_stop_event = helios->batch_timer = NULL;
++      return;
++   }
++   helios->batch_thread_live = true;
++   helios->batch_enabled = true;
++   helios_diag("submit-batch: ON max_entries=%u age=%uus (cs<=%u bytes, with syncs)",
++               helios->batch_max_entries, helios->batch_age_us,
++               HELIOS_BATCH_CS_MAX);
++}
++
++static void
++helios_batch_fini(struct helios *helios)
++{
++   if (!helios->batch_enabled)
++      return;
++   helios_flush_deferred(helios); /* escapes still work here */
++   helios->batch_enabled = false;
++   SetEvent(helios->batch_stop_event);
++   if (helios->batch_thread_live)
++      thrd_join(helios->batch_thread, NULL);
++   helios->batch_thread_live = false;
++   CloseHandle(helios->batch_event);
++   CloseHandle(helios->batch_stop_event);
++   CloseHandle(helios->batch_timer);
++   helios->batch_event = helios->batch_stop_event = helios->batch_timer = NULL;
++   helios_diag("submit-batch: final flushes=%ld entries=%ld direct=%ld max=%ld",
++               (long)helios_batch_flushes, (long)helios_batch_entries,
++               (long)helios_batch_direct, (long)helios_batch_max_seen);
++}
++
++/* END helios-batch --------------------------------------------------------- */
++
+ static bool
+ helios_wait_fence_list_contains(const uint64_t *fences, uint32_t count, uint64_t fence_id)
+ {
+@@ -2991,6 +3415,10 @@
+            helios_fence_event_immediate, helios_fence_event_raced,
+            helios_fence_event_timeouts, helios_fence_event_fallbacks,
+            helios_fence_event_lost);
++   fprintf(f, "submit_batch enabled=%d flushes=%ld entries=%ld direct=%ld max=%ld\n",
++           helios->batch_enabled ? 1 : 0, (long)helios_batch_flushes,
++           (long)helios_batch_entries, (long)helios_batch_direct,
++           (long)helios_batch_max_seen);
+    fprintf(f, "shmem_creates=%llu shmem_cache_hits=%llu bo_creates=%llu bo_maps=%llu\n",
+            (unsigned long long)helios->perf.shmem_creates,
+            (unsigned long long)helios->perf.shmem_cache_hits,
+@@ -3361,10 +3789,10 @@
+    create.NumAllocations = 1;
+    create.pAllocationInfo2 = &allocation_info;
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    NTSTATUS st = D3DKMTCreateAllocation2(&create);
+    if (st != 0) {
+-      mtx_unlock(&helios->dev_mutex);
++      helios_dev_unlock(helios);
+       helios_diag("VidMm CreateAllocation2 size=%llu failed status=0x%08x",
+                   (unsigned long long)size, (unsigned)st);
+       return false;
+@@ -3379,7 +3807,7 @@
+       if (residency != HELIOS_VIDMM_NOT_ACQUIRED)
+          helios_vidmm_evict_locked(helios, allocation);
+       helios_vidmm_destroy_locked(helios, create.hResource, allocation);
+-      mtx_unlock(&helios->dev_mutex);
++      helios_dev_unlock(helios);
+       helios_diag("VidMm shared tracker invalid resource=0x%x allocation=0x%x global=0x%x",
+                   (unsigned)create.hResource, (unsigned)allocation,
+                   (unsigned)create.hGlobalShare);
+@@ -3390,7 +3818,7 @@
+    *allocation_handle = allocation;
+    *global_share = create.hGlobalShare;
+    *tracker_cookie = private_data.map_cache;
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    return true;
+ }
+ 
+@@ -3419,13 +3847,13 @@
+    query.hDevice = helios->device;
+    query.hGlobalShare = global_share;
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    NTSTATUS st = D3DKMTQueryResourceInfo(&query);
+    if (st != 0 || query.NumAllocations != 1 ||
+        query.PrivateRuntimeDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT ||
+        query.ResourcePrivateDriverDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT ||
+        query.TotalPrivateDriverDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT) {
+-      mtx_unlock(&helios->dev_mutex);
++      helios_dev_unlock(helios);
+       helios_diag("VidMm QueryResourceInfo global=0x%x failed status=0x%08x allocs=%u private=%u/%u/%u",
+                   global_share, (unsigned)st, query.NumAllocations,
+                   query.PrivateRuntimeDataSize,
+@@ -3446,7 +3874,7 @@
+       free(runtime_data);
+       free(resource_private);
+       free(total_private);
+-      mtx_unlock(&helios->dev_mutex);
++      helios_dev_unlock(helios);
+       return false;
+    }
+ 
+@@ -3457,7 +3885,7 @@
+          free(runtime_data);
+          free(resource_private);
+          free(total_private);
+-         mtx_unlock(&helios->dev_mutex);
++         helios_dev_unlock(helios);
+          helios_diag("VidMm QueryResourceInfo data global=0x%x failed status=0x%08x",
+                      global_share, (unsigned)st);
+          return false;
+@@ -3514,7 +3942,7 @@
+    free(runtime_data);
+    free(resource_private);
+    free(total_private);
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    return *resource_handle != 0 && *allocation_handle != 0;
+ }
+ 
+@@ -3527,10 +3955,10 @@
+    if (!resource_handle || !allocation_handle)
+       return;
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    helios_vidmm_evict_locked(helios, allocation_handle);
+    helios_vidmm_destroy_locked(helios, resource_handle, allocation_handle);
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ }
+ 
+ static void
+@@ -3603,7 +4031,7 @@
+    create.NumAllocations = 1;
+    create.pAllocationInfo2 = &allocation_info;
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    const NTSTATUS st = D3DKMTCreateAllocation2(&create);
+    if (st == 0 && create.hResource && allocation_info.hAllocation) {
+       /* The KMD atomically re-owns this resource id for the allocation.  The
+@@ -3624,7 +4052,7 @@
+                   (unsigned)st, (unsigned)create.hResource,
+                   (unsigned)allocation_info.hAllocation, bo->base.res_id);
+    }
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ 
+    if (!external->resource || !external->allocation) {
+       free(external);
+@@ -3691,11 +4119,11 @@
+    OBJECT_ATTRIBUTES attr;
+    memset(&attr, 0, sizeof(attr));
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    if (!nt_handle) {
+       if (!helios_nt_object_path(import_info->name, path, ARRAY_SIZE(path),
+                                  &us)) {
+-         mtx_unlock(&helios->dev_mutex);
++         helios_dev_unlock(helios);
+          return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+       }
+ 
+@@ -3708,7 +4136,7 @@
+       open_name.pObjAttrib = &attr;
+       const NTSTATUS name_st = D3DKMTOpenNtHandleFromName(&open_name);
+       if (name_st != 0 || !open_name.hNtHandle) {
+-         mtx_unlock(&helios->dev_mutex);
++         helios_dev_unlock(helios);
+          helios_diag("external memory open name failed status=0x%08x",
+                      (unsigned)name_st);
+          return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+@@ -3728,7 +4156,7 @@
+        query.TotalPrivateDriverDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT) {
+       if (close_nt_handle)
+          CloseHandle(nt_handle);
+-      mtx_unlock(&helios->dev_mutex);
++      helios_dev_unlock(helios);
+       helios_diag("external memory query failed status=0x%08x allocs=%u private=%u/%u/%u",
+                   (unsigned)st, query.NumAllocations,
+                   query.PrivateRuntimeDataSize,
+@@ -3752,7 +4180,7 @@
+       free(total_private);
+       if (close_nt_handle)
+          CloseHandle(nt_handle);
+-      mtx_unlock(&helios->dev_mutex);
++      helios_dev_unlock(helios);
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+ 
+@@ -3815,7 +4243,7 @@
+    free(total_private);
+    if (close_nt_handle)
+       CloseHandle(nt_handle);
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ 
+    if (!external) {
+       helios_diag("external memory open failed status=0x%08x resource=0x%x allocation=0x%x identity=%u/%u/%u kind=%u/%u blob=%llu/%llu size=%llu/%llu type=%u/%u valid=%u",
+@@ -3877,7 +4305,7 @@
+    const DWORD access = export_info ? export_info->dwAccess
+                                     : SHARED_ALLOCATION_ALL_ACCESS;
+    HANDLE handle = NULL;
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    const NTSTATUS st =
+       D3DKMTShareObjects(1, &external->resource, &attr, access, &handle);
+    if (st == 0 && handle) {
+@@ -3886,7 +4314,7 @@
+          export_info && export_info->pAttributes &&
+          export_info->pAttributes->bInheritHandle;
+    }
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ 
+    if (st != 0 || !handle) {
+       helios_diag("external memory ShareObjects failed status=0x%08x resource=0x%x",
+@@ -3927,9 +4355,9 @@
+       return;
+ 
+    struct helios *helios = (struct helios *)renderer;
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    helios_external_memory_destroy_locked(helios, external);
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    free(external);
+ }
+ 
+@@ -3945,12 +4373,16 @@
+ 
+    if (perf)
+       QueryPerformanceCounter(&t0);
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock_nf(helios); /* the producer of deferred entries: no flush */
+    if (perf) {
+       QueryPerformanceCounter(&t1);
+       helios->perf.submit_mutex_ticks += t1.QuadPart - t0.QuadPart;
+       helios->perf.submit_calls++;
+    }
++   if (helios->batch_lost) {
++      helios_dev_unlock(helios);
++      return VK_ERROR_DEVICE_LOST;
++   }
+    for (uint32_t i = 0; i < submit->batch_count; i++) {
+       const struct vn_renderer_submit_batch *batch = &submit->batches[i];
+ 
+@@ -3963,7 +4395,23 @@
+       }
+ 
+       uint64_t fence_id = 0;
+-      if (batch->cs_size) {
++      bool deferred = false;
++      struct helios_batch_entry *dq = NULL;
++      if (batch->cs_size && helios_batch_can_defer(helios, batch)) {
++         if (!helios_batch_queue_locked(helios, batch, &fence_id)) {
++            result = VK_ERROR_DEVICE_LOST;
++            break;
++         }
++         deferred = true;
++         dq = &helios->batch_entries[helios->batch_count - 1];
++      } else if (batch->cs_size) {
++         /* Direct submit: anything deferred before it goes out first. */
++         if (helios->batch_count && !helios_flush_locked(helios)) {
++            result = VK_ERROR_DEVICE_LOST;
++            break;
++         }
++         if (helios->batch_enabled)
++            InterlockedIncrement(&helios_batch_direct);
+          if (perf)
+             QueryPerformanceCounter(&t1);
+          const bool ok = helios_ioctl_submit_cs(
+@@ -3992,8 +4440,11 @@
+          /* A SHARED sync must signal its WDDM fence at wire-fence retirement
+           * without relying on this process ever waiting on it — hand the
+           * (sync, fence) pair to the retire thread. */
+-         if (fence_id && sync->wddm_local &&
+-             !helios_retire_enqueue_locked(helios, sync, fence_id)) {
++         if (deferred) {
++            /* The retire hand-off needs the wire fence: flush does it. */
++            helios_batch_record_sync(dq, sync, batch->sync_values[j]);
++         } else if (fence_id && sync->wddm_local &&
++                    !helios_retire_enqueue_locked(helios, sync, fence_id)) {
+             result = VK_ERROR_OUT_OF_HOST_MEMORY;
+             break;
+          }
+@@ -4005,12 +4456,16 @@
+       if (result != VK_SUCCESS)
+          break;
+    }
++   if (helios->batch_count && result == VK_SUCCESS)
++      helios_batch_maybe_flush_locked(helios);
++   if (helios->batch_lost && result == VK_SUCCESS)
++      result = VK_ERROR_DEVICE_LOST;
+    /* Periodic summary: atexit never runs under taskkill /F, so the phase
+     * telemetry must land during the run. Bounded: one multi-line append
+     * per 512 renderer submits. */
+    const bool write_summary =
+       perf && (helios->perf.submit_calls & 511) == 0;
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    if (write_summary)
+       helios_perf_write(helios, false);
+ 
+@@ -4026,10 +4481,12 @@
+    uint32_t wait_fence_count = 0;
+    VkResult result = VK_SUCCESS;
+ 
++   if (helios->batch_lost)
++      return VK_ERROR_DEVICE_LOST;
+    if (helios->perf.enabled)
+       helios->perf.wait_calls++;
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    bool satisfied = !wait->wait_any; /* wait_all starts true, wait_any starts false */
+    for (uint32_t i = 0; i < wait->sync_count; i++) {
+       struct helios_sync *sync = (struct helios_sync *)wait->syncs[i];
+@@ -4045,7 +4502,7 @@
+          satisfied = satisfied && reached;
+       }
+    }
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ 
+    if (satisfied) {
+       if (helios->perf.enabled)
+@@ -4066,7 +4523,7 @@
+          return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    for (uint32_t i = 0; i < wait->sync_count; i++) {
+       const struct helios_sync *sync = (const struct helios_sync *)wait->syncs[i];
+       if (sync->val >= wait->sync_values[i])
+@@ -4083,47 +4540,47 @@
+             wait_fences[wait_fence_count++] = pending->fence_id;
+       }
+    }
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ 
+    if (!wait_fence_count) {
+       result = VK_SUCCESS;
+       for (uint32_t i = 0; i < wait->sync_count; i++) {
+          D3DKMT_HANDLE wddm_local = 0;
+          struct helios_sync *sync = (struct helios_sync *)wait->syncs[i];
+-         mtx_lock(&helios->dev_mutex);
++         helios_dev_lock(helios);
+          if (sync->wddm_cpu_va) {
+             const uint64_t wddm_val = *(const volatile uint64_t *)sync->wddm_cpu_va;
+             if (sync->val < wddm_val)
+                sync->val = wddm_val;
+          }
+          if (sync->val >= wait->sync_values[i]) {
+-            mtx_unlock(&helios->dev_mutex);
++            helios_dev_unlock(helios);
+             continue;
+          }
+          if (!sync->wddm_local) {
+-            mtx_unlock(&helios->dev_mutex);
++            helios_dev_unlock(helios);
+             result = VK_TIMEOUT;
+             break;
+          }
+          wddm_local = sync->wddm_local;
+-         mtx_unlock(&helios->dev_mutex);
++         helios_dev_unlock(helios);
+ 
+          result = helios_wddm_sync_wait(renderer, wddm_local,
+                                         wait->sync_values[i], wait->timeout);
+          if (result != VK_SUCCESS)
+             break;
+-         mtx_lock(&helios->dev_mutex);
++         helios_dev_lock(helios);
+          sync = (struct helios_sync *)wait->syncs[i];
+          if (sync->val < wait->sync_values[i])
+             sync->val = wait->sync_values[i];
+-         mtx_unlock(&helios->dev_mutex);
++         helios_dev_unlock(helios);
+          if (wait->wait_any)
+             break;
+       }
+       if (result != VK_SUCCESS && helios->perf.enabled) {
+-         mtx_lock(&helios->dev_mutex);
++         helios_dev_lock(helios);
+          helios->perf.wait_timeout++;
+-         mtx_unlock(&helios->dev_mutex);
++         helios_dev_unlock(helios);
+       }
+       if (wait_fences != stack_wait_fences)
+          free(wait_fences);
+@@ -4131,9 +4588,9 @@
+    }
+ 
+    if (helios->perf.enabled) {
+-      mtx_lock(&helios->dev_mutex);
++      helios_dev_lock(helios);
+       helios->perf.wait_slow++;
+-      mtx_unlock(&helios->dev_mutex);
++      helios_dev_unlock(helios);
+    }
+ 
+    for (uint32_t i = 0; i < wait_fence_count; i++) {
+@@ -4144,18 +4601,18 @@
+    }
+ 
+    if (result == VK_SUCCESS) {
+-      mtx_lock(&helios->dev_mutex);
++      helios_dev_lock(helios);
+       for (uint32_t i = 0; i < wait->sync_count; i++) {
+          struct helios_sync *sync = (struct helios_sync *)wait->syncs[i];
+          for (uint32_t j = 0; j < wait_fence_count; j++) {
+             helios_sync_mark_fence_locked(renderer, sync, wait_fences[j]);
+          }
+       }
+-      mtx_unlock(&helios->dev_mutex);
++      helios_dev_unlock(helios);
+    } else if (helios->perf.enabled) {
+-      mtx_lock(&helios->dev_mutex);
++      helios_dev_lock(helios);
+       helios->perf.wait_timeout++;
+-      mtx_unlock(&helios->dev_mutex);
++      helios_dev_unlock(helios);
+    }
+ 
+    if (wait_fences != stack_wait_fences)
+@@ -4173,9 +4630,9 @@
+    struct helios *helios = (struct helios *)renderer;
+    struct helios_shmem *hshmem = (struct helios_shmem *)shmem;
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    helios_ioctl_release_blob(helios, hshmem->ctx_id, shmem->res_id);
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    helios_trace_shmem("release", helios->device, helios->context,
+                       hshmem->ctx_id, shmem->res_id, shmem->mmap_size,
+                       (uint64_t)(uintptr_t)shmem->mmap_ptr);
+@@ -4215,14 +4672,14 @@
+     * mappable memory the renderer can both read and write (vn_ring head/status).
+     * A HOST3D mappable blob with blob_id=0 is exactly that (virtgpu shmem path);
+     * the host-visible window is mapped into this process by MAP_BLOB. */
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    const uint32_t res_id =
+       helios_ioctl_alloc_blob(helios, VIRTIO_GPU_BLOB_MEM_HOST3D,
+                               VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, 0, size);
+    uint64_t user_va = 0;
+    if (res_id)
+       user_va = helios_ioctl_map_blob(helios, res_id, 0, NULL);
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    helios_trace_shmem("create", helios->device, helios->context, helios->ctx_id,
+                       res_id, size, user_va);
+ 
+@@ -4230,18 +4687,18 @@
+       vn_log(helios->instance, "shmem create failed (res_id=%u, mapped=%d)", res_id,
+              user_va != 0);
+       if (res_id) {
+-         mtx_lock(&helios->dev_mutex);
++         helios_dev_lock(helios);
+          helios_ioctl_release_blob(helios, helios->ctx_id, res_id);
+-         mtx_unlock(&helios->dev_mutex);
++         helios_dev_unlock(helios);
+       }
+       return NULL;
+    }
+ 
+    struct helios_shmem *shmem = calloc(1, sizeof(*shmem));
+    if (!shmem) {
+-      mtx_lock(&helios->dev_mutex);
++      helios_dev_lock(helios);
+       helios_ioctl_release_blob(helios, helios->ctx_id, res_id);
+-      mtx_unlock(&helios->dev_mutex);
++      helios_dev_unlock(helios);
+       return NULL;
+    }
+ 
+@@ -4280,7 +4737,7 @@
+    if (external_handles)
+       blob_flags |= VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    /* The optional batch orders the host's vkAllocateMemory before the blob binds
+     * to it ("venus: let resource_create_blob wait for mem alloc"). Submit it
+     * first (synchronous) so the device memory exists when ALLOC_BLOB references
+@@ -4291,7 +4748,7 @@
+           !helios_ioctl_submit_cs(helios, batch->cs_data, batch->cs_size,
+                                   batch->ring_idx, batch->present_cookie,
+                                   batch->present_value32, &fence_id)) {
+-         mtx_unlock(&helios->dev_mutex);
++         helios_dev_unlock(helios);
+          return VK_ERROR_DEVICE_LOST;
+       }
+       /* Record the batch's syncs against its real wire fence (a sync-only
+@@ -4312,7 +4769,7 @@
+ 
+    const uint32_t res_id = helios_ioctl_alloc_blob(
+       helios, VIRTIO_GPU_BLOB_MEM_HOST3D, blob_flags, mem_id, size);
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ 
+    if (!res_id)
+       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+@@ -4335,9 +4792,9 @@
+ 
+    struct helios_bo *bo = calloc(1, sizeof(*bo));
+    if (!bo) {
+-      mtx_lock(&helios->dev_mutex);
++      helios_dev_lock(helios);
+       helios_ioctl_release_blob(helios, helios->ctx_id, res_id);
+-      mtx_unlock(&helios->dev_mutex);
++      helios_dev_unlock(helios);
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+ 
+@@ -4364,10 +4821,10 @@
+    if (!res_id)
+       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    const bool attached =
+       helios_ioctl_attach_resource(helios, helios->ctx_id, res_id);
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ 
+    if (!attached)
+       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+@@ -4413,7 +4870,7 @@
+ 
+    /* map-once; the vtable contract allows this to be non-thread-safe but we
+     * serialize anyway (MAP_BLOB must be serialized in the KMD). */
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    if (!bo->base.mmap_ptr && mappable) {
+       uint32_t map_cache = 0;
+       const uint32_t requested_map_cache = bo->base.prefer_cached_map ?
+@@ -4442,7 +4899,7 @@
+          }
+       }
+    }
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ 
+    return bo->base.mmap_ptr;
+ }
+@@ -4468,9 +4925,9 @@
+    if (hbo->resource_released)
+       return;
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    helios_ioctl_release_blob(helios, hbo->ctx_id, bo->res_id);
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    hbo->resource_released = true;
+ }
+ 
+@@ -4558,9 +5015,9 @@
+ 
+    /* Drop the owner reference; a queued retire entry may still hold one, in
+     * which case the retire thread frees the struct after its WAIT_FENCE. */
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    const bool free_sync = helios_sync_unref_locked(renderer, sync);
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ 
+    if (free_sync)
+       free(sync);
+@@ -4574,12 +5031,12 @@
+    struct helios *helios = (struct helios *)renderer;
+    struct helios_sync *sync = (struct helios_sync *)_sync;
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    sync->val = initial_val;
+    sync->pending_count = 0;
+    if (sync->wddm_local)
+       (void)helios_wddm_sync_signal(renderer, sync->wddm_local, initial_val);
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    return VK_SUCCESS;
+ }
+ 
+@@ -4593,33 +5050,33 @@
+    uint64_t fences[HELIOS_SYNC_PENDING_MAX];
+    uint32_t fence_count = 0;
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    for (uint32_t i = 0; i < sync->pending_count; i++) {
+       const uint64_t fence_id = sync->pending[i].fence_id;
+       if (!sync->pending[i].complete &&
+           !helios_wait_fence_list_contains(fences, fence_count, fence_id))
+          fences[fence_count++] = fence_id;
+    }
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ 
+    for (uint32_t i = 0; i < fence_count; i++) {
+       if (helios_ioctl_wait_fence(helios, fences[i], 0)) {
+-         mtx_lock(&helios->dev_mutex);
++         helios_dev_lock(helios);
+          helios_sync_mark_fence_locked(renderer, sync, fences[i]);
+-         mtx_unlock(&helios->dev_mutex);
++         helios_dev_unlock(helios);
+       } else {
+          break;
+       }
+    }
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    if (sync->wddm_cpu_va) {
+       const uint64_t wddm_val = *(const volatile uint64_t *)sync->wddm_cpu_va;
+       if (sync->val < wddm_val)
+          sync->val = wddm_val;
+    }
+    *val = sync->val;
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    return VK_SUCCESS;
+ }
+ 
+@@ -4631,12 +5088,12 @@
+    struct helios *helios = (struct helios *)renderer;
+    struct helios_sync *sync = (struct helios_sync *)_sync;
+ 
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    sync->val = val;
+    sync->pending_count = 0;
+    if (sync->wddm_local)
+       (void)helios_wddm_sync_signal(renderer, sync->wddm_local, val);
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+    return VK_SUCCESS;
+ }
+ 
+@@ -4984,6 +5441,10 @@
+    if (helios_perf_at_exit_renderer == helios)
+       helios_perf_at_exit_renderer = NULL;
+ 
++   /* Flush and stop deferred batching first: its flush hands shared syncs to the
++    * retire thread, which the next step then drains. */
++   helios_batch_fini(helios);
++
+    /* Stop the retire thread BEFORE tearing down the escape channel: it blocks
+     * only in bounded WAIT_FENCE slices and re-checks retire_stop between them,
+     * so the join is prompt. Entries still queued drain WITHOUT marking (the
+@@ -5007,9 +5468,9 @@
+     * registered stream table is also a context-teardown backstop.  UNREGISTER
+     * while the D3DKMT context is still valid; a failed best-effort escape does
+     * not retain a stale local cookie. */
+-   mtx_lock(&helios->dev_mutex);
++   helios_dev_lock(helios);
+    helios_present_stream_unregister_all_locked(helios);
+-   mtx_unlock(&helios->dev_mutex);
++   helios_dev_unlock(helios);
+ 
+    vn_renderer_shmem_cache_fini(&helios->shmem_cache);
+ 
+@@ -5139,6 +5600,7 @@
+    /* Versioned ICD↔KMD capability handshake (no deploy-order assumptions):
+     * one quiet probe decides event waits vs the blocking-escape fallback. */
+    helios_probe_fence_events(helios);
++   helios_batch_init(helios);
+    helios->retire_stop_event = CreateEventW(NULL, /*bManualReset*/ TRUE, FALSE, NULL);
+    if (helios->fence_events_supported && !helios->retire_stop_event)
+       helios_diag("retire_stop_event creation FAILED — retire thread will use "
