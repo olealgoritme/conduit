@@ -333,12 +333,14 @@ impl AdapterContext {
         // SAFETY: KTIMER/KDPC were initialized at this stable address by
         // `init_kernel_events`, before the adapter became visible to dxgkrnl.
         unsafe {
-            // VidPn advertises 60/1 Hz. Arm the first exact-phase one-shot in
-            // 100 ns units; the DPC advances the stored deadline from this
-            // anchor instead of accumulating its own dispatch latency.
+            // VidPn advertises the host's refresh rate (60 Hz without one). Arm
+            // the first exact-phase one-shot in 100 ns units; the DPC advances
+            // the stored deadline from this anchor instead of accumulating its
+            // own dispatch latency.
             let mut qpc_timestamp = 0;
             let now = KeQueryInterruptTimePrecise(&mut qpc_timestamp);
-            let Some(deadline) = helios_kmd_logic::vsync_deadline::next(now, now) else {
+            let period = helios_kmd_logic::vsync_deadline::period_100ns(self.display_refresh_mhz());
+            let Some(deadline) = helios_kmd_logic::vsync_deadline::next(now, now, period) else {
                 self.vsync_armed
                     .store(0, core::sync::atomic::Ordering::Release);
                 self.vsync_deadline_100ns
@@ -496,7 +498,8 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     }
     // A one-shot timer is required because the fallback KTIMER's recurring
     // period is integer milliseconds: 16 ms is 62.5 Hz and 17 ms is 58.8 Hz,
-    // while the mode contract exposed to Windows is exactly 60/1. Advance from
+    // while the mode contract exposed to Windows is the host's exact rate
+    // (60/1 by default, `period_100ns` for any other). Advance from
     // the prior interrupt-time deadline so ordinary callback latency does not
     // become drift; if delayed across several periods, skip to one future
     // deadline rather than emitting a burst of synthetic retraces.
@@ -510,7 +513,9 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         // `now` whenever the DPC is late would turn normal dispatch latency
         // into cumulative phase drift, defeating the one-shot scheme.
         let anchor = if previous == 0 { now } else { previous };
-        let Some(deadline) = helios_kmd_logic::vsync_deadline::next(anchor, now) else {
+        let period =
+            helios_kmd_logic::vsync_deadline::period_100ns(adapter.display_refresh_mhz());
+        let Some(deadline) = helios_kmd_logic::vsync_deadline::next(anchor, now, period) else {
             // Interrupt-time representation exhausted. The current one-shot
             // has fired; leave it disarmed rather than schedule an immediate
             // 100 ns retry loop.

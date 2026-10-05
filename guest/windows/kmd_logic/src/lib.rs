@@ -34,8 +34,27 @@ pub mod execution_completion;
 /// generating a catch-up burst.
 pub mod vsync_deadline {
     /// 16.6667 ms in the kernel timer's 100 ns units. This is 60 Hz to within
-    /// 0.0002%, versus the old 16 ms period's 4.17% error.
+    /// 0.0002%, versus the old 16 ms period's 4.17% error. The default, and
+    /// what [`period_100ns`] returns for 60_000 mHz.
     pub const PERIOD_100NS: u64 = 166_667;
+
+    /// The retrace period for a refresh rate in millihertz, in 100 ns units
+    /// (1e7 per second, so `1e10 / mHz`), rounded to nearest. A rate of 0, or
+    /// anything faster than 10 kHz, falls back to 60 Hz: the caller already
+    /// bounds the rate (`DisplayMode::from_native`), this only keeps a bad
+    /// value from becoming a zero-length period and a rearm storm.
+    pub const fn period_100ns(refresh_mhz: u32) -> u64 {
+        if refresh_mhz == 0 {
+            return PERIOD_100NS;
+        }
+        let rate = refresh_mhz as u64;
+        let period = (10_000_000_000u64 + rate / 2) / rate;
+        if period < 1_000 {
+            PERIOD_100NS
+        } else {
+            period
+        }
+    }
 
     /// Return the first fixed-phase deadline strictly after `now`.
     ///
@@ -43,8 +62,11 @@ pub mod vsync_deadline {
     /// first tick). `None` is terminal: the interrupt-time representation is
     /// exhausted, so the KMD must leave the one-shot timer unarmed rather than
     /// turn a saturated deadline into an immediate rearm storm.
-    pub const fn next(previous: u64, now: u64) -> Option<u64> {
-        let Some(candidate) = previous.checked_add(PERIOD_100NS) else {
+    pub const fn next(previous: u64, now: u64, period: u64) -> Option<u64> {
+        if period == 0 {
+            return None;
+        }
+        let Some(candidate) = previous.checked_add(period) else {
             return None;
         };
         if candidate > now {
@@ -52,8 +74,8 @@ pub mod vsync_deadline {
         }
 
         let late = now.saturating_sub(candidate);
-        let intervals = late / PERIOD_100NS + 1;
-        let Some(advance) = intervals.checked_mul(PERIOD_100NS) else {
+        let intervals = late / period + 1;
+        let Some(advance) = intervals.checked_mul(period) else {
             return None;
         };
         candidate.checked_add(advance)
@@ -79,20 +101,20 @@ pub mod vsync_deadline {
 
         #[test]
         fn initial_arm_is_one_sixtieth_second() {
-            assert_eq!(next(10_000_000, 10_000_000), Some(10_166_667));
+            assert_eq!(next(10_000_000, 10_000_000, PERIOD_100NS), Some(10_166_667));
         }
 
         #[test]
         fn ordinary_lateness_does_not_accumulate_phase_drift() {
             let fired = 1_166_667;
-            assert_eq!(next(fired, fired + 4_000), Some(1_333_334));
+            assert_eq!(next(fired, fired + 4_000, PERIOD_100NS), Some(1_333_334));
         }
 
         #[test]
         fn missed_ticks_skip_to_one_future_deadline_without_burst() {
             let fired = 1_166_667;
             let now = fired + PERIOD_100NS * 4 + 7;
-            let Some(deadline) = next(fired, now) else {
+            let Some(deadline) = next(fired, now, PERIOD_100NS) else {
                 panic!("a representable deadline must remain armable");
             };
             assert!(deadline > now);
@@ -108,8 +130,31 @@ pub mod vsync_deadline {
 
         #[test]
         fn deadline_overflow_is_terminal_not_an_immediate_rearm() {
-            assert_eq!(next(u64::MAX - PERIOD_100NS + 1, 0), None);
-            assert_eq!(next(u64::MAX - PERIOD_100NS, u64::MAX), None);
+            assert_eq!(next(u64::MAX - PERIOD_100NS + 1, 0, PERIOD_100NS), None);
+            assert_eq!(next(u64::MAX - PERIOD_100NS, u64::MAX, PERIOD_100NS), None);
+        }
+
+        #[test]
+        fn period_follows_the_refresh_rate() {
+            assert_eq!(period_100ns(60_000), PERIOD_100NS);
+            assert_eq!(period_100ns(240_000), 41_667);
+            assert_eq!(period_100ns(144_000), 69_444);
+            assert_eq!(period_100ns(59_940), 166_834);
+            assert_eq!(period_100ns(1_000_000), 10_000); // 1 kHz
+            assert_eq!(period_100ns(1_000), 10_000_000); // 1 Hz
+            // Bad input never yields a zero or tiny period.
+            assert_eq!(period_100ns(0), PERIOD_100NS);
+            assert_eq!(period_100ns(u32::MAX), PERIOD_100NS);
+        }
+
+        #[test]
+        fn a_240_hz_period_keeps_its_phase_and_never_bursts() {
+            let p = period_100ns(240_000);
+            assert_eq!(next(10_000_000, 10_000_000, p), Some(10_000_000 + p));
+            let fired = 1_000_000 + p;
+            let now = fired + p * 3 + 5;
+            assert_eq!(next(fired, now, p), Some(fired + p * 4));
+            assert_eq!(next(5, 5, 0), None);
         }
     }
 }

@@ -28,7 +28,6 @@ pub const CHILD_UID: u32 = 0;
 /// [`AdapterContext::display_mode`](crate::adapter::AdapterContext::display_mode).
 pub const DEFAULT_MODE_WIDTH: u32 = 1920;
 pub const DEFAULT_MODE_HEIGHT: u32 = 1080;
-const REFRESH_HZ: u32 = 60;
 
 mod monitor_metadata {
     include!(concat!(env!("OUT_DIR"), "/monitor_metadata.rs"));
@@ -189,20 +188,24 @@ impl<'a> VidPn<'a> {
     }
 }
 
-/// Build a fully-specified 1080p60 progressive video signal (source and target
-/// modes share it so cofunctional-mode validation stays consistent).
-fn video_signal_info(w: u32, h: u32) -> D3DKMDT_VIDEO_SIGNAL_INFO {
+/// Build a fully-specified progressive video signal at the host's size and
+/// refresh rate (source and target modes share it so cofunctional-mode
+/// validation stays consistent). `refresh_mhz` is millihertz, so the vsync
+/// frequency is the exact rational `refresh_mhz / 1000`.
+fn video_signal_info(w: u32, h: u32, refresh_mhz: u32) -> D3DKMDT_VIDEO_SIGNAL_INFO {
     // SAFETY: an all-zero VIDEO_SIGNAL_INFO is a valid starting point.
     let mut sig: D3DKMDT_VIDEO_SIGNAL_INFO = unsafe { core::mem::zeroed() };
     sig.VideoStandard = _D3DKMDT_VIDEO_SIGNAL_STANDARD::D3DKMDT_VSS_OTHER;
     sig.TotalSize.cx = w;
     sig.TotalSize.cy = h;
     sig.ActiveSize = sig.TotalSize;
-    sig.VSyncFreq.Numerator = REFRESH_HZ;
-    sig.VSyncFreq.Denominator = 1;
-    sig.HSyncFreq.Numerator = h * REFRESH_HZ;
-    sig.HSyncFreq.Denominator = 1;
-    sig.PixelRate = (w as SIZE_T) * (h as SIZE_T) * (REFRESH_HZ as SIZE_T);
+    sig.VSyncFreq.Numerator = refresh_mhz;
+    sig.VSyncFreq.Denominator = 1000;
+    // u64 so 5120x2560 at 240 Hz and larger cannot wrap the 32-bit fields.
+    sig.HSyncFreq.Numerator =
+        (u64::from(h) * u64::from(refresh_mhz)).min(u64::from(u32::MAX)) as u32;
+    sig.HSyncFreq.Denominator = 1000;
+    sig.PixelRate = ((u64::from(w) * u64::from(h) * u64::from(refresh_mhz)) / 1000) as SIZE_T;
     // ScanLineOrdering shares a union with the (unused) additional-signal-info
     // bitfield; the whole struct was zeroed, so selecting this arm is a plain
     // union write (safe — only union reads are unsafe).
@@ -301,6 +304,7 @@ unsafe fn add_single_target_mode(
     h_set: D3DKMDT_HVIDPNTARGETMODESET,
     w: u32,
     h: u32,
+    refresh_mhz: u32,
 ) -> NTSTATUS {
     // SAFETY: iface valid per the fn contract.
     let iface = unsafe { &*iface };
@@ -323,7 +327,7 @@ unsafe fn add_single_target_mode(
     }
     // SAFETY: `mode` is writable; Preference lives in the Copy union's bitfield arm.
     unsafe {
-        (*mode).VideoSignalInfo = video_signal_info(w, h);
+        (*mode).VideoSignalInfo = video_signal_info(w, h, refresh_mhz);
         (*mode)
             .__bindgen_anon_1
             .__bindgen_anon_1
@@ -355,6 +359,7 @@ pub unsafe fn recommend_monitor_modes(
         return STATUS_INVALID_PARAMETER;
     }
     let (w, h) = adapter.display_mode();
+    let refresh_mhz = adapter.display_refresh_mhz();
     // SAFETY: valid per fn contract.
     let a = unsafe { &*arg };
     if a.pMonitorSourceModeSetInterface.is_null() {
@@ -382,7 +387,7 @@ pub unsafe fn recommend_monitor_modes(
     }
     // SAFETY: `mode` is writable.
     unsafe {
-        (*mode).VideoSignalInfo = video_signal_info(w, h);
+        (*mode).VideoSignalInfo = video_signal_info(w, h, refresh_mhz);
         (*mode).ColorBasis = _D3DKMDT_COLOR_BASIS::D3DKMDT_CB_SRGB;
         (*mode).ColorCoeffDynamicRanges.FirstChannel = 8;
         (*mode).ColorCoeffDynamicRanges.SecondChannel = 8;
@@ -719,6 +724,7 @@ pub unsafe fn enum_cofunc_modality(
     let a = unsafe { &*arg };
     let h_vidpn = a.hConstrainingVidPn;
     let (mode_w, mode_h) = adapter.display_mode();
+    let mode_refresh_mhz = adapter.display_refresh_mhz();
 
     // Resolve the VidPn + topology interfaces (nothing held yet → early return).
     // The borrow that bounds the interface: the DDI argument struct, which
@@ -937,7 +943,15 @@ pub unsafe fn enum_cofunc_modality(
                 };
                 // SAFETY: live set interface + handle.
                 status =
-                    unsafe { add_single_target_mode(created.iface, created.h_set, mode_w, mode_h) };
+                    unsafe {
+                        add_single_target_mode(
+                            created.iface,
+                            created.h_set,
+                            mode_w,
+                            mode_h,
+                            mode_refresh_mhz,
+                        )
+                    };
                 if !ok(status) {
                     stage = CofuncStage::AddTargetMode;
                     break; // `created` drops → released

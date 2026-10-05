@@ -42,6 +42,72 @@ fn zero_linear_scanout_breadcrumbs() {
     }
 }
 
+/// Resolve the display half's scan-out mode and EDID: the host's EDID when it
+/// served one (size AND refresh rate, DisplayID extension included), else the
+/// host's `GET_DISPLAY_INFO` size with a generated EDID, else the 1920x1080
+/// fallback. `None` only if no valid EDID could be built at all.
+///
+/// ⚠ `#[inline(never)]` is a STACK BUDGET decision, like `bring_up_venus`: the
+/// 256-byte EDID copy below must not widen `dxgkddi_start_device`'s frame, which
+/// is already shared with `VirtioGpu::init` on the 24 KB boot stack. This runs
+/// after `init` has returned, so its frame never overlaps init's.
+#[inline(never)]
+fn resolve_scanout_mode(
+    adapter: &AdapterContext,
+    display_half: bool,
+) -> Option<crate::adapter::ScanoutMode> {
+    // The render-only surface advertises no monitor, so its EDID is empty and
+    // QueryDeviceDescriptor answers NOT_SUPPORTED before ever reading it.
+    if !display_half {
+        return Some(crate::adapter::ScanoutMode::render_only());
+    }
+    // The host's EDID, copied out of the transport so the registry writes in
+    // `adopt` run at PASSIVE outside the virtio spinlock.
+    let mut host_edid_buf = [0u8; 256];
+    let host_edid_len = match adapter.with_virtio(|v| {
+        let e = v.host_edid()?;
+        host_edid_buf.get_mut(..e.len())?.copy_from_slice(e);
+        Some(e.len())
+    }) {
+        Ok(Some(n)) => n,
+        _ => 0,
+    };
+    let host_edid = host_edid_buf.get(..host_edid_len).filter(|e| !e.is_empty());
+
+    // Adopt the host's scanout-0 size (GET_DISPLAY_INFO, captured at transport
+    // init) as the VidPn mode + generated-EDID native resolution, so Helios
+    // presents the size QEMU actually wants on scanout 0. Falls back to the
+    // default in `display_mode()` if the host reported nothing usable.
+    //
+    // The two failure arms are NOT the same thing and neither is benign: the
+    // fallback fabricates a mode, so the OS is handed an EDID for a monitor
+    // whose size we invented. Distinguish them - `Err` means the transport is
+    // gone (and therefore nothing can ever scan out), `Ok(None)` means the
+    // host answered but reported nothing usable.
+    let mut host_mode = None;
+    match adapter.with_virtio(|v| v.display_mode()) {
+        Ok(Some((w, h))) => {
+            host_mode = Some((w, h));
+        }
+        Ok(None) => {
+            crate::diag::fault(crate::diag::FaultCounter::StMdB, 1);
+        }
+        Err(e) => {
+            let status: NTSTATUS = e.into();
+            crate::diag::fault(crate::diag::FaultCounter::StTxG, status as u32);
+        }
+    }
+    // ONE value: the constructor validates the extent and generates (or adopts)
+    // the matching EDID, so the two cannot disagree.
+    let mode = crate::adapter::ScanoutMode::adopt(host_mode, host_edid);
+    if mode.is_none() {
+        // Invalid identity or fallback metadata must not become a zero EDID
+        // attached to a supposedly working display child.
+        crate::diag::record_named_bytes(b"EdidBuildFailed", 1);
+    }
+    mode
+}
+
 /// Stand up the persistent venus context + page-table blob. Returns the venus
 /// context id, or 0 on any failure.
 ///
@@ -319,48 +385,11 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     crate::ddi::scanout_trace::reset(adapter);
 
     // The scan-out mode and its EDID, resolved BEFORE publication because
-    // `StartedState` is published exactly once.
-    let mut host_mode = None;
-    if knobs.display_half {
-        // Adopt the host's scanout-0 size (GET_DISPLAY_INFO, captured at transport
-        // init) as the VidPn mode + generated-EDID native resolution, so Helios
-        // presents the size QEMU actually wants on scanout 0. Falls back to the
-        // default in `display_mode()` if the host reported nothing usable.
-        //
-        // The two failure arms are NOT the same thing and neither is benign: the
-        // fallback fabricates a mode, so the OS is handed an EDID for a monitor
-        // whose size we invented. Distinguish them - `Err` means the transport is
-        // gone (and therefore nothing can ever scan out), `Ok(None)` means the
-        // host answered but reported nothing usable.
-        match adapter.with_virtio(|v| v.display_mode()) {
-            Ok(Some((w, h))) => {
-                host_mode = Some((w, h));
-            }
-            Ok(None) => {
-                crate::diag::fault(crate::diag::FaultCounter::StMdB, 1);
-            }
-            Err(e) => {
-                let status: NTSTATUS = e.into();
-                crate::diag::fault(crate::diag::FaultCounter::StTxG, status as u32);
-            }
-        }
-    }
-    // ONE value: the constructor validates the extent and generates the matching
-    // EDID, so the two cannot disagree. The render-only surface advertises no
-    // monitor, so its EDID is zeroed and QueryDeviceDescriptor answers
-    // NOT_SUPPORTED before ever reading it.
-    let scanout_mode = if knobs.display_half {
-        match crate::adapter::ScanoutMode::adopt(host_mode) {
-            Some(mode) => mode,
-            None => {
-                // Invalid identity or fallback metadata must not become a zero
-                // EDID attached to a supposedly working display child.
-                crate::diag::record_named_bytes(b"EdidBuildFailed", 1);
-                return STATUS_UNSUCCESSFUL;
-            }
-        }
-    } else {
-        crate::adapter::ScanoutMode::render_only()
+    // `StartedState` is published exactly once. In its own transient frame: the
+    // 256-byte EDID copy lives there, not in this frame (see the stack-budget
+    // note on `bring_up_venus`).
+    let Some(scanout_mode) = resolve_scanout_mode(adapter, knobs.display_half) else {
+        return STATUS_UNSUCCESSFUL;
     };
 
     // ── The reported segment table, built ONCE from the same locals every other

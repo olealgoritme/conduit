@@ -47,10 +47,10 @@ use bytemuck::Zeroable;
 use helios_kmd_logic::scanout_read_ledger::LedgerTicket;
 use helios_kmd_logic::scanout_refresh::{Marker as ScanoutRefreshMarker, State as RefreshState};
 use helios_protocol::{
-    resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuRespDisplayInfo,
-    VirtioGpuSetScanoutBlob,
-    VIRTIO_GPU_CMD_GET_DISPLAY_INFO, VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE,
-    VIRTIO_GPU_FLAG_INFO_RING_IDX,
+    resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuGetEdid, VirtioGpuRespDisplayInfo,
+    VirtioGpuRespEdid, VirtioGpuSetScanoutBlob,
+    VIRTIO_GPU_CMD_GET_DISPLAY_INFO, VIRTIO_GPU_CMD_GET_EDID, VIRTIO_GPU_CMD_SUBMIT_3D,
+    VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_RESP_OK_EDID,
 };
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::bus::{DeviceFunction, PciRoot};
@@ -2333,6 +2333,83 @@ pub struct VirtioGpu {
     /// generated-EDID native resolution so we present the size QEMU actually wants
     /// on scanout 0 (instead of a hardcoded guess). Read once by StartDevice.
     display_mode: Option<(u32, u32)>,
+    /// The EDID the host answered `GET_EDID` with (docs/VENUS.md), or empty. A
+    /// host that serves it carries the real native mode in a DisplayID
+    /// extension, which can describe sizes and rates the base block cannot.
+    host_edid: [u8; 256],
+    host_edid_len: usize,
+}
+
+/// Where the EDID bytes sit in the response buffer `fetch_host_edid` filled:
+/// after the `MsgHeader`, the `ctrl_hdr`, `size` and padding.
+const EDID_RESP_OFFSET: usize = super::hal::MSG_HDR_LEN + 32;
+
+/// Ask the host for scanout 0's EDID (`GET_EDID`, docs/VENUS.md).
+///
+/// `Ok(Some(len))`: `resp_buf[EDID_RESP_OFFSET..][..len]` holds a 128- or
+/// 256-byte EDID. `Ok(None)`: the host answered, but with an error or an EDID
+/// of another size (an older backend, or no display configured); the caller
+/// keeps its own generated EDID. `Err`: the queue misbehaved or the host never
+/// answered. As with `GET_DISPLAY_INFO`, that fails init, because the buffers
+/// are about to be freed under a chain the device may still own.
+///
+/// Its own function so the request/response locals do not widen `init`'s frame
+/// (see `crate::irql` on the StartDevice stack budget).
+#[inline(never)]
+fn fetch_host_edid(
+    control: &mut VirtQueue<WdkHal, CTRL_QUEUE_SIZE>,
+    transport: &mut PciTransport,
+    req_buf: &mut [u8],
+    resp_buf: &mut [u8],
+) -> Result<Option<usize>, VirtioError> {
+    const MH: usize = super::hal::MSG_HDR_LEN;
+    let cmd_len = core::mem::size_of::<VirtioGpuGetEdid>();
+    let resp_len = core::mem::size_of::<VirtioGpuRespEdid>();
+    if req_buf.len() < MH + cmd_len || resp_buf.len() < MH + resp_len {
+        return Ok(None);
+    }
+    let mut cmd = VirtioGpuGetEdid::zeroed();
+    cmd.hdr.type_ = VIRTIO_GPU_CMD_GET_EDID;
+    req_buf[..MH].fill(0);
+    req_buf[..4].copy_from_slice(&super::hal::MSG_TYPE_GPU_CMD.to_le_bytes());
+    req_buf[MH..MH + cmd_len].copy_from_slice(bytemuck::bytes_of(&cmd));
+    resp_buf[..MH + resp_len].fill(0);
+    {
+        let (rq_a, rq_b) = req_buf.split_at(MH);
+        let (rs_a, rs_b) = resp_buf.split_at_mut(MH);
+        let inputs: &[&[u8]] = &[rq_a, &rq_b[..cmd_len]];
+        let outputs: &mut [&mut [u8]] = &mut [rs_a, &mut rs_b[..resp_len]];
+        // SAFETY: the scratch buffers outlive this block; on timeout the caller
+        // fails init and never reuses the queue, as for GET_DISPLAY_INFO.
+        let token =
+            unsafe { control.add(inputs, outputs) }.map_err(|_| VirtioError::DeviceError)?;
+        if control.should_notify() {
+            transport.notify(CTRL_QUEUE);
+        }
+        let mut spins = 0u64;
+        while !control.can_pop() {
+            spins += 1;
+            if spins >= CTRL_POLL_SPINS {
+                return Err(VirtioError::DeviceError);
+            }
+            core::hint::spin_loop();
+        }
+        // SAFETY: same buffers as `add`, still valid; `can_pop()` was true.
+        unsafe { control.pop_used(token, inputs, outputs) }
+            .map_err(|_| VirtioError::DeviceError)?;
+    }
+    let rd32 = |at: usize| -> Option<u32> {
+        let b = resp_buf.get(at..at + 4)?;
+        Some(u32::from_le_bytes([*b.first()?, *b.get(1)?, *b.get(2)?, *b.get(3)?]))
+    };
+    let (Some(status), Some(kind), Some(size)) = (rd32(8), rd32(MH), rd32(MH + 24)) else {
+        return Ok(None);
+    };
+    let size = size as usize;
+    if status != 0 || kind != VIRTIO_GPU_RESP_OK_EDID || !(size == 128 || size == 256) {
+        return Ok(None);
+    }
+    Ok(Some(size))
 }
 
 impl VirtioGpu {
@@ -2513,6 +2590,7 @@ impl VirtioGpu {
         // 0×0 / not-yet-configured scanout falls back to the default in
         // StartDevice). Recorded so the host's report is visible live.
         let m0 = resp.pmodes[0].r;
+        let scanout_enabled = resp.pmodes[0].enabled != 0;
         let display_mode =
             if m0.width >= 320 && m0.height >= 240 && m0.width <= 16384 && m0.height <= 16384 {
                 Some((m0.width, m0.height))
@@ -2523,6 +2601,17 @@ impl VirtioGpu {
             b"DpInf",
             (m0.width.min(0xFFFF) << 16) | (m0.height & 0xFFFF),
         );
+
+        // The host's EDID, when it serves one and a display is configured. It
+        // overrides the size above and carries the refresh rate. An error answer
+        // is not a failure: older backends refuse the command and the KMD keeps
+        // generating its own EDID.
+        let host_edid_len = if scanout_enabled {
+            fetch_host_edid(&mut control, &mut transport, req_buf, resp_buf)?
+        } else {
+            None
+        };
+        crate::diag::record_named_bytes(b"HostEdid", host_edid_len.map_or(0, |n| n as u32));
 
         // Discover the host-visible blob window (a fresh config accessor — the
         // original `access` was moved into `PciRoot` above; `DxgkConfigAccess` is
@@ -2637,7 +2726,19 @@ impl VirtioGpu {
             failed: false,
             control_space_epoch: 0,
             display_mode,
+            host_edid: [0; 256],
+            host_edid_len: 0,
         });
+        let mut gpu = gpu;
+        if let Some(n) = host_edid_len {
+            if let (Some(src), Some(dst)) = (
+                resp_buf.get(EDID_RESP_OFFSET..EDID_RESP_OFFSET + n),
+                gpu.host_edid.get_mut(..n),
+            ) {
+                dst.copy_from_slice(src);
+                gpu.host_edid_len = n;
+            }
+        }
         // `WddmHoldMs` (UV1's instrument). Snapshotted here with every other knob
         // so `reg add` + `pnputil /restart-device` applies it with no reboot, and
         // CLAMPED here rather than trusted: see `WDDM_HOLD_MS_MAX`.
@@ -7437,6 +7538,12 @@ impl VirtioGpu {
     /// its VidPn mode + generated EDID from this so it presents the size QEMU wants.
     pub fn display_mode(&self) -> Option<(u32, u32)> {
         self.display_mode
+    }
+
+    /// The EDID the host served for scanout 0 (one or two 128-byte blocks), or
+    /// `None` if it served none.
+    pub fn host_edid(&self) -> Option<&[u8]> {
+        self.host_edid.get(..self.host_edid_len).filter(|e| !e.is_empty())
     }
 
     /// Mapped kernel VA of the virtio ISR-status register (read-to-clear), or 0 if

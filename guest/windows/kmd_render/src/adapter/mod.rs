@@ -352,10 +352,22 @@ impl StartedState {
 ///
 /// The only constructor generates the EDID from the mode, so there is no way to
 /// obtain a `ScanoutMode` whose EDID disagrees with its extent.
-#[derive(Clone, Copy)]
 pub(crate) struct ScanoutMode {
     mode: DisplayMode,
-    edid: [u8; 128],
+    /// One base block, or a base block plus extension blocks; empty for the
+    /// render-only surface. On the heap on purpose: `StartDevice` builds this by
+    /// value on a boot stack with a few hundred bytes of headroom, and an inline
+    /// 256-byte EDID would more than eat it.
+    edid: Box<[u8]>,
+}
+
+/// An EDID copied to the heap without the infallible-OOM path: a failed
+/// allocation is `None`, which fails StartDevice cleanly.
+fn boxed_edid(bytes: &[u8]) -> Option<Box<[u8]>> {
+    let mut v = alloc::vec::Vec::new();
+    v.try_reserve_exact(bytes.len()).ok()?;
+    v.extend_from_slice(bytes);
+    Some(v.into_boxed_slice())
 }
 
 impl ScanoutMode {
@@ -365,10 +377,22 @@ impl ScanoutMode {
     /// `host` is `VirtioGpu::display_mode`'s answer — note that method and
     /// `AdapterContext::display_mode` are different methods with the same name;
     /// only the latter reads this value.
-    pub(crate) fn adopt(host: Option<(u32, u32)>) -> Option<Self> {
+    pub(crate) fn adopt(host: Option<(u32, u32)>, host_edid: Option<&[u8]>) -> Option<Self> {
+        // The host's own EDID wins: it carries the native size AND refresh rate,
+        // and its DisplayID extension can describe modes the 128-byte base block
+        // cannot (above 4095 pixels or 655.35 MHz). It is passed to Windows
+        // unchanged, so the monitor Windows sees is the host's.
+        if let Some(raw) = host_edid {
+            if let Some(value) = Self::from_host_edid(raw) {
+                return Some(value);
+            }
+            static EDID_REJECTIONS: AtomicU32 = AtomicU32::new(0);
+            let count = EDID_REJECTIONS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            crate::diag::record_named_bytes(b"HostEdidReject", count);
+        }
         let build = |mode: DisplayMode| {
             crate::ddi::vidpn::build_edid(mode.width(), mode.height())
-                .map(|edid| Self { mode, edid })
+                .and_then(|base| Some(Self { mode, edid: boxed_edid(&base)? }))
         };
         if let Some((w, h)) = host {
             if let Some(value) = DisplayMode::from_host(w, h).and_then(build) {
@@ -388,11 +412,22 @@ impl ScanoutMode {
     pub(crate) fn render_only() -> Self {
         Self {
             mode: DEFAULT_SCANOUT_EXTENT,
-            edid: [0u8; 128],
+            edid: Box::default(),
         }
     }
 
-    pub(crate) fn edid(&self) -> &[u8; 128] {
+    /// A mode and EDID taken from an EDID the host served, or `None` if it
+    /// describes no timing the KMD can adopt (see `DisplayMode::from_native`).
+    fn from_host_edid(raw: &[u8]) -> Option<Self> {
+        let timing = helios_kmd_logic::edid::native_timing(raw)?;
+        let mode = DisplayMode::from_native(timing.width, timing.height, timing.refresh_mhz)?;
+        Some(Self {
+            mode,
+            edid: boxed_edid(raw)?,
+        })
+    }
+
+    pub(crate) fn edid(&self) -> &[u8] {
         &self.edid
     }
 }
@@ -1317,6 +1352,14 @@ impl AdapterContext {
             .into()
     }
 
+    /// The display half's refresh rate in millihertz (60 Hz = 60_000): the host
+    /// EDID's, or 60 Hz when the host gave only a size.
+    pub fn display_refresh_mhz(&self) -> u32 {
+        self.started()
+            .map_or(DEFAULT_SCANOUT_EXTENT, |s| s.scanout_mode.mode)
+            .refresh_mhz()
+    }
+
     /// The packed `(w << 16) | h` the `DspMd` breadcrumb reports.
     pub(crate) fn display_mode_packed(&self) -> u32 {
         self.started()
@@ -1538,7 +1581,7 @@ impl AdapterContext {
     ///
     /// Generated from — and therefore always consistent with — the extent
     /// `display_mode()` reports: they are one value.
-    pub fn edid(&self) -> Option<&[u8; 128]> {
+    pub fn edid(&self) -> Option<&[u8]> {
         self.started().map(|s| s.scanout_mode.edid())
     }
 

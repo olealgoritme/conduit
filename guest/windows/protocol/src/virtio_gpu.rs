@@ -275,6 +275,29 @@ pub struct VirtioGpuRespDisplayInfo {
     pub pmodes: [VirtioGpuDisplayOne; VIRTIO_GPU_MAX_SCANOUTS],
 }
 
+/// `VIRTIO_GPU_CMD_GET_EDID` — ask for scanout `scanout`'s EDID. 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct VirtioGpuGetEdid {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub scanout: u32,
+    pub padding: u32,
+}
+
+/// Capacity of the `edid` array in a `GET_EDID` reply (the spec's 1024).
+pub const VIRTIO_GPU_EDID_MAX: usize = 1024;
+
+/// `VIRTIO_GPU_RESP_OK_EDID`. `size` bytes of `edid` are valid: one 128-byte
+/// base block plus zero or more 128-byte extension blocks. 1056 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct VirtioGpuRespEdid {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub size: u32,
+    pub padding: u32,
+    pub edid: [u8; VIRTIO_GPU_EDID_MAX],
+}
+
 // ── Scanout / present (Phase 7 display engine) ──────────────────────────────
 
 /// `VIRTIO_GPU_CMD_SET_SCANOUT_BLOB` (0x010d) — bind a blob resource to a
