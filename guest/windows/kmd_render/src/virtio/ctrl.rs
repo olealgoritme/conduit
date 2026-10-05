@@ -1424,30 +1424,31 @@ fn submit_venus_async_inner(
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }
-    // Ownership is resolved under the device lock, the same lock the enqueue
-    // below takes, so a foreign command stream cannot reach another process's
-    // Venus ring. This costs no extra acquisition on the ~89 us submit path.
-    let owned = adapter
-        .with_virtio(|v| v.resolve_owned_ctx(owner, ctx_id))
-        .map_err(|_| VirtioError::DeviceError)?;
-    let Some(owned) = owned else {
-        return Err(VirtioError::NotOwned);
-    };
-    let ctx_id = owned.id();
     if !stream_fits(stream) {
         return Err(VirtioError::DeviceError);
     }
     reap_parked(passive, adapter);
-    let mut meta = adapter
-        .with_virtio(|v| v.take_dma_buffer(SUBMIT_META_BYTES))
-        .ok()
-        .flatten()
+    // Ownership is resolved under the device lock, the same lock the enqueue
+    // below takes, so a foreign command stream cannot reach another process's
+    // Venus ring. The two staging buffers come out of the pool in the SAME hold
+    // (one acquisition instead of three per submit, ~2000 submits/s); a buffer
+    // the pool cannot supply is allocated below at PASSIVE, never under the lock.
+    let staged = adapter
+        .with_virtio(|v| {
+            let owned = v.resolve_owned_ctx(owner, ctx_id)?;
+            let meta = v.take_dma_buffer(SUBMIT_META_BYTES);
+            let venus = v.take_dma_buffer(stream.len());
+            Some((owned, meta, venus))
+        })
+        .map_err(|_| VirtioError::DeviceError)?;
+    let Some((owned, pooled_meta, pooled_venus)) = staged else {
+        return Err(VirtioError::NotOwned);
+    };
+    let ctx_id = owned.id();
+    let mut meta = pooled_meta
         .or_else(|| DmaBuffer::new(passive, SUBMIT_META_BYTES))
         .ok_or(VirtioError::OutOfMemory)?;
-    let mut venus = adapter
-        .with_virtio(|v| v.take_dma_buffer(stream.len()))
-        .ok()
-        .flatten()
+    let mut venus = pooled_venus
         .or_else(|| DmaBuffer::new(passive, stream.len()))
         .ok_or(VirtioError::OutOfMemory)?;
     venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);

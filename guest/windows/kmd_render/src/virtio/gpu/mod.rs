@@ -79,8 +79,10 @@ use crate::virtio::venus::{
 
 /// Control queue index (virtio-gpu controlq = 0; cursorq = 1 is unused).
 const CTRL_QUEUE: u16 = 0;
-/// Control-queue ring size — power of two, conservatively ≤ the device's max.
-const CTRL_QUEUE_SIZE: usize = 64;
+/// Control-queue ring size — power of two, ≤ the device's max (256). A Venus submit
+/// uses 5 descriptors, so 128 allows ~25 in flight (64 allowed ~12, which a Heaven
+/// run saturated: IfHi 13, QfRet/QSpTout nonzero).
+const CTRL_QUEUE_SIZE: usize = 128;
 
 /// Conduit's device offers `VIRTIO_F_VERSION_1` and nothing else (guest/linux/
 /// conduit_gpu.c `features[]`); what it can serve travels in config `features`.
@@ -297,11 +299,11 @@ pub const MAX_PARKED: usize = 4 * MAX_INFLIGHT;
 /// Completed command buffers retained for reuse. Count, individual capacity,
 /// and total bytes are all bounded: a rare large Venus CS must never pin a
 /// correspondingly large physically-contiguous allocation for device lifetime.
-const MAX_DMA_POOL: usize = 128;
-/// 64 KiB of payload plus the page `DmaBuffer`'s 32-byte wire tail can add to
-/// the page-rounded capacity, so a 60-64 KiB command buffer stays poolable.
-const MAX_DMA_POOL_BUFFER_BYTES: usize = 64 * 1024 + 4096;
-const MAX_DMA_POOL_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DMA_POOL: usize = 256;
+/// 256 KiB of payload plus the page `DmaBuffer`'s 32-byte wire tail can add to
+/// the page-rounded capacity, so a 252-256 KiB command buffer stays poolable.
+const MAX_DMA_POOL_BUFFER_BYTES: usize = 256 * 1024 + 4096;
+const MAX_DMA_POOL_BYTES: usize = 8 * 1024 * 1024;
 /// Enqueue refusal threshold for the parked table (forces the PASSIVE caller
 /// to reap before submitting more).
 const PARKED_ENQUEUE_GATE: usize = MAX_PARKED - MAX_INFLIGHT;
