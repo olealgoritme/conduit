@@ -3404,8 +3404,22 @@ pub unsafe extern "C" fn dxgkddi_describe_allocation(
     };
     args.MultisampleMethod.NumSamples = 1;
     args.MultisampleMethod.NumQualityLevels = 1;
-    args.RefreshRate.Numerator = 60;
-    args.RefreshRate.Denominator = 1;
+    // `RefreshRate` is "the refresh rate that the primary surface was created
+    // with" (DXGKARG_DESCRIBEALLOCATION), and dxgkrnl is the only reader of it:
+    // D3DDDICB_ALLOCATE carries no primary description, so this DDI is where it
+    // learns the mode a flip chain belongs to. It used to be the constant 60/1,
+    // which matches the committed mode only at 60 Hz; above that the primary
+    // describes itself as a 60 Hz surface on a 120/240 Hz mode and DWM never
+    // gets a flip (it falls back to interval-0 Blt presents). Report the mode's
+    // rate in lowest terms (240/1, 2997/50), the same rational the VidPn
+    // target mode carries. 60 Hz before the display half is up, as before.
+    //
+    // SAFETY: `h_adapter` is our AdapterContext, as in every adapter-level DDI.
+    let adapter = unsafe { &*(h_adapter as *const crate::adapter::AdapterContext) };
+    let (rate_n, rate_d) =
+        helios_kmd_logic::reduce_ratio(u64::from(adapter.display_refresh_mhz()), 1000);
+    args.RefreshRate.Numerator = rate_n as u32;
+    args.RefreshRate.Denominator = rate_d as u32;
     args.PrivateDriverFormatAttribute = 0;
     STATUS_SUCCESS
 }
