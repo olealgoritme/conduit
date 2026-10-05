@@ -449,6 +449,48 @@ impl DisplayMode {
 pub const FALLBACK_DISPLAY_WIDTH: u32 = 1920;
 pub const FALLBACK_DISPLAY_HEIGHT: u32 = 1080;
 
+/// The refresh rates the KMD offers Windows for a host rate, in millihertz,
+/// highest (the host's, the preferred one) first, and how many there are. Below
+/// the host rate it adds 144, 120 and 60 Hz where they are lower, so Windows
+/// has valid fallbacks and Display Settings can list them. A host rate of 60 Hz
+/// or less is offered alone.
+pub const fn refresh_ladder(host_mhz: u32) -> ([u32; 4], usize) {
+    let mut out = [0u32; 4];
+    out[0] = host_mhz;
+    let mut n = 1;
+    let steps = [144_000u32, 120_000, 60_000];
+    let mut i = 0;
+    while i < steps.len() {
+        if steps[i] < host_mhz && n < out.len() {
+            out[n] = steps[i];
+            n += 1;
+        }
+        i += 1;
+    }
+    (out, n)
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::refresh_ladder;
+
+    #[test]
+    fn the_host_rate_comes_first_with_fallbacks_below_it() {
+        assert_eq!(refresh_ladder(240_000), ([240_000, 144_000, 120_000, 60_000], 4));
+        assert_eq!(refresh_ladder(165_000), ([165_000, 144_000, 120_000, 60_000], 4));
+        assert_eq!(refresh_ladder(144_000), ([144_000, 120_000, 60_000, 0], 3));
+        assert_eq!(refresh_ladder(120_000), ([120_000, 60_000, 0, 0], 2));
+        assert_eq!(refresh_ladder(90_000), ([90_000, 60_000, 0, 0], 2));
+    }
+
+    #[test]
+    fn sixty_hertz_and_below_are_offered_alone() {
+        assert_eq!(refresh_ladder(60_000), ([60_000, 0, 0, 0], 1));
+        assert_eq!(refresh_ladder(59_940), ([59_940, 0, 0, 0], 1));
+        assert_eq!(refresh_ladder(30_000), ([30_000, 0, 0, 0], 1));
+    }
+}
+
 /// `n / d` in lowest terms (`d == 0` is returned unchanged). WDDM matches display
 /// modes by comparing their refresh rationals, and DXGI hands them back to the
 /// application as it read them, so `240000/1000` is reported as the canonical

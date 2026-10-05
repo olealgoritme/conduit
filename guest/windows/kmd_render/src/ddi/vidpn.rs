@@ -298,7 +298,8 @@ unsafe fn add_source_modes(
     STATUS_SUCCESS
 }
 
-/// Create + add our single target mode into `h_set`.
+/// Create + add one target mode (size and refresh) into `h_set`. The caller adds
+/// one per offered refresh rate; the first is the preferred one.
 ///
 /// # Safety
 /// `iface` is a live `DXGK_VIDPNTARGETMODESET_INTERFACE` for `h_set`.
@@ -308,6 +309,7 @@ unsafe fn add_single_target_mode(
     w: u32,
     h: u32,
     refresh_mhz: u32,
+    preferred: bool,
 ) -> NTSTATUS {
     // SAFETY: iface valid per the fn contract.
     let iface = unsafe { &*iface };
@@ -334,7 +336,11 @@ unsafe fn add_single_target_mode(
         (*mode)
             .__bindgen_anon_1
             .__bindgen_anon_1
-            .set_Preference(_D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_PREFERRED);
+            .set_Preference(if preferred {
+                _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_PREFERRED
+            } else {
+                _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_NOTPREFERRED
+            });
     }
     // SAFETY: add/release take the mode we filled.
     let st = unsafe { add(h_set, mode) };
@@ -378,38 +384,50 @@ pub unsafe fn recommend_monitor_modes(
         return STATUS_GRAPHICS_INVALID_VIDPN;
     };
     let h_set = a.hMonitorSourceModeSet;
-    let mut mode: *mut D3DKMDT_MONITOR_SOURCE_MODE = null_mut();
-    // SAFETY: valid out-pointer.
-    let st = unsafe { create(h_set, &mut mode) };
-    if !ok(st) || mode.is_null() {
-        return if ok(st) {
-            STATUS_GRAPHICS_INVALID_VIDPN
-        } else {
-            st
-        };
-    }
-    // SAFETY: `mode` is writable.
-    unsafe {
-        (*mode).VideoSignalInfo = video_signal_info(w, h, refresh_mhz);
-        (*mode).ColorBasis = _D3DKMDT_COLOR_BASIS::D3DKMDT_CB_SRGB;
-        (*mode).ColorCoeffDynamicRanges.FirstChannel = 8;
-        (*mode).ColorCoeffDynamicRanges.SecondChannel = 8;
-        (*mode).ColorCoeffDynamicRanges.ThirdChannel = 8;
-        (*mode).ColorCoeffDynamicRanges.FourthChannel = 8;
-        (*mode).Origin = _D3DKMDT_MONITOR_CAPABILITIES_ORIGIN::D3DKMDT_MCO_DRIVER;
-        (*mode).Preference = _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_PREFERRED;
-    }
-    // SAFETY: add/release take the mode we filled.
-    let st = unsafe { add(h_set, mode) };
-    if !ok(st) {
-        let _ = unsafe { release(h_set, mode) };
-        if st == STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET {
-            return STATUS_SUCCESS;
+    // The host's rate (preferred) plus 144/120/60 Hz below it, so Windows has
+    // valid fallbacks and Display Settings can list them.
+    let (rates, rate_count) = helios_kmd_logic::refresh_ladder(refresh_mhz);
+    rec(b"MmRfr", refresh_mhz);
+    let mut i = 0;
+    while i < rate_count {
+        let mut mode: *mut D3DKMDT_MONITOR_SOURCE_MODE = null_mut();
+        // SAFETY: valid out-pointer.
+        let st = unsafe { create(h_set, &mut mode) };
+        if !ok(st) || mode.is_null() {
+            return if ok(st) {
+                STATUS_GRAPHICS_INVALID_VIDPN
+            } else {
+                st
+            };
         }
-        // Record the raw pfnAddMode failure so we can tell if the MONITOR mode is
-        // what a callback rejects (the caller legalizes the escaping status).
-        rec(b"VpMMe", st as u32);
-        return st;
+        // SAFETY: `mode` is writable.
+        unsafe {
+            (*mode).VideoSignalInfo = video_signal_info(w, h, rates[i]);
+            (*mode).ColorBasis = _D3DKMDT_COLOR_BASIS::D3DKMDT_CB_SRGB;
+            (*mode).ColorCoeffDynamicRanges.FirstChannel = 8;
+            (*mode).ColorCoeffDynamicRanges.SecondChannel = 8;
+            (*mode).ColorCoeffDynamicRanges.ThirdChannel = 8;
+            (*mode).ColorCoeffDynamicRanges.FourthChannel = 8;
+            (*mode).Origin = _D3DKMDT_MONITOR_CAPABILITIES_ORIGIN::D3DKMDT_MCO_DRIVER;
+            (*mode).Preference = if i == 0 {
+                _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_PREFERRED
+            } else {
+                _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_NOTPREFERRED
+            };
+        }
+        // SAFETY: add/release take the mode we filled.
+        let st = unsafe { add(h_set, mode) };
+        if !ok(st) {
+            let _ = unsafe { release(h_set, mode) };
+            if st != STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET {
+                // Record the raw pfnAddMode failure so we can tell if the MONITOR
+                // mode is what a callback rejects (the caller legalizes the
+                // escaping status).
+                rec(b"VpMMe", st as u32);
+                return st;
+            }
+        }
+        i += 1;
     }
     STATUS_SUCCESS
 }
@@ -728,6 +746,7 @@ pub unsafe fn enum_cofunc_modality(
     let h_vidpn = a.hConstrainingVidPn;
     let (mode_w, mode_h) = adapter.display_mode();
     let mode_refresh_mhz = adapter.display_refresh_mhz();
+    rec(b"VpRfr", mode_refresh_mhz);
 
     // Resolve the VidPn + topology interfaces (nothing held yet → early return).
     // The borrow that bounds the interface: the DDI argument struct, which
@@ -945,16 +964,27 @@ pub unsafe fn enum_cofunc_modality(
                     iface: new_iface,
                 };
                 // SAFETY: live set interface + handle.
-                status =
-                    unsafe {
+                // One target mode per offered refresh rate, the host's first and
+                // preferred.
+                let (rates, rate_count) = helios_kmd_logic::refresh_ladder(mode_refresh_mhz);
+                status = STATUS_SUCCESS;
+                let mut r = 0;
+                while r < rate_count {
+                    status = unsafe {
                         add_single_target_mode(
                             created.iface,
                             created.h_set,
                             mode_w,
                             mode_h,
-                            mode_refresh_mhz,
+                            rates[r],
+                            r == 0,
                         )
                     };
+                    if !ok(status) {
+                        break;
+                    }
+                    r += 1;
+                }
                 if !ok(status) {
                     stage = CofuncStage::AddTargetMode;
                     break; // `created` drops → released
