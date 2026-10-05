@@ -1,7 +1,7 @@
 From a0af9dd1e5e5d8f7dd642cf8513ec2edcd23e749 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 21:18:05 +0200
-Subject: [PATCH 2/7] nvk/rm: build glue, RM API subset and librmclient loader
+Subject: [PATCH 2/9] nvk/rm: build glue, RM API subset and librmclient loader
 
 Add -Dnvk-rm (feature, default disabled) for an nvkmd backend that drives
 the GPU through the NVIDIA Resource Manager of the open kernel modules

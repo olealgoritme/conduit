@@ -1,7 +1,7 @@
 From ead804ed19967b6d1ae639833693026cb7a272f6 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 21:25:27 +0200
-Subject: [PATCH 5/7] nvk/rm: GPU VA allocation and binding
+Subject: [PATCH 5/9] nvk/rm: GPU VA allocation and binding
 
 NVK keeps choosing every GPU address from its own util_vma_heap (with the
 replay heap for capture/replay).  Each nvkmd_va is backed by an

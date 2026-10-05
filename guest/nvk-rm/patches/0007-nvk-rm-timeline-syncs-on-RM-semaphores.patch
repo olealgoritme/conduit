@@ -1,7 +1,7 @@
 From 8aa0d7d39849735c18673b10a9edc296ecf30f64 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 21:32:03 +0200
-Subject: [PATCH 7/7] nvk/rm: timeline syncs on RM semaphores
+Subject: [PATCH 7/9] nvk/rm: timeline syncs on RM semaphores
 
 A vk_sync is a 64-bit value in a per-device pool of GPU-visible,
 CPU-cached system memory (our own pages, 64 KiB chunks).  The physical

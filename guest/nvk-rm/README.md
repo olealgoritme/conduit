@@ -7,9 +7,12 @@ upstream Mesa that adds a second implementation of NVK's kernel abstraction,
 `src/nouveau/vulkan/nvkmd/rm/`, next to `nvkmd/nouveau/`. It talks to RM
 through [librmclient](../rmclient), which it loads at runtime.
 
-Status: **compiles; not yet run on a GPU.** Everything below "What is
-implemented" is written against the RM API and NVIDIA's own channel code,
-but untested. The test plan at the end is the next step.
+Status: **runs on an RTX 5090 (GB202, GSP firmware, RM 610.57.04) in the
+`lab` guest.** `vulkaninfo` enumerates the GPU through NVK, a compute test
+(storage buffer, dispatch, device-local buffer + copy, 5000 back-to-back
+submits) passes, and `vkcube` renders through the software X11 WSI. See
+"First run" at the end for what was run and what is still open. dEQP has not
+been run yet.
 
 Design background: `docs/research/nvk-rm.md` (on the `feat/nvk-rm` branch).
 
@@ -27,6 +30,8 @@ Mesa `main` at **`70c4c018cbe5b78a1db7e9413bc7e511b366fd95`**
 | 5 | `nvk/rm: GPU VA allocation and binding` | NVK-chosen VAs via fixed `NV50_MEMORY_VIRTUAL`, `crm_map_dma2` with PTE kind |
 | 6 | `nvk/rm: execution and bind contexts` | TSG + subcontext + GPFIFO channel + engine objects, doorbell submission |
 | 7 | `nvk/rm: timeline syncs on RM semaphores` | `vk_sync` type on 64-bit semaphores in memory |
+| 8 | `nvk/rm: fixes from the first run on an RTX 5090 (GB202, GSP)` | OS descriptors via `crm_alloc_os_descriptor`, RM's VA alignment rules, the device VA space, SYNC subcontext + channel bind, `cls_m2mf`, sync features |
+| 9 | `nvk/rm: track GPFIFO progress with a semaphore; binary sync move` | ring progress without USERD GP_GET, `move` for binary syncs |
 
 Each patch builds on its own.
 
@@ -111,9 +116,15 @@ VRAM size and usage from `NV2080_CTRL_CMD_FB_GET_INFO_V2` (`HEAP_SIZE`,
 or newer is required (doorbell submission). `kmd_info`: only
 `has_get_vram_used`.
 
-**Device** (`nvkmd_rm_dev.c`). Its own RM client per `VkDevice`;
-`FERMI_VASPACE_A` with 64 KiB big pages and `VA_INTERNAL_LIMIT`, which keeps
-RM's internal mappings (GR context buffers) in [4 GiB, 4.5 GiB);
+**Device** (`nvkmd_rm_dev.c`). Its own RM client per `VkDevice`; the
+device's own VA space (64 KiB big pages), named through `FERMI_VASPACE_A`
+with index `GPU_DEVICE`, as NVIDIA's driver does. Not a new
+`FERMI_VASPACE_A`: under GSP, `VA_INTERNAL_LIMIT` pins RM's internal range
+to [4 GiB, 4.5 GiB), which a GSP client reserves entirely for GSP-RM, so GR
+context buffers have nowhere to go (3D object: `NV_ERR_NO_MEMORY`); and
+`RESTRICT_RESERVED_VALIMITS` on the device is refused by GSP. RM's internal
+mappings land wherever its allocator puts them; NVK's heap skips
+[4 GiB, 4.5 GiB);
 `*_USERMODE_A` (BAR1, write-only) mapped through the subdevice for the
 doorbell; an `NV01_EVENT_OS_EVENT` on the FIFO non-stall interrupt via
 `crm_event_open` (created without event data) plus
@@ -122,7 +133,10 @@ doorbell; an `NV01_EVENT_OS_EVENT` on the FIFO non-stall interrupt via
 
 **Memory** (`nvkmd_rm_mem.c`). CPU-mappable and GART memory: our own
 anonymous pages wrapped in `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR`, so the CPU map
-is the allocation itself (zero-copy, coherent, no host window space);
+is the allocation itself (zero-copy, coherent, no host window space). It is
+registered with `crm_alloc_os_descriptor` (`NV_ESC_RM_ALLOC_MEMORY` on the
+GPU channel): RM takes a user address only on that route, `NV_ESC_RM_ALLOC`
+of the class answers `NV_ERR_NOT_SUPPORTED`;
 fallback `NV01_MEMORY_SYSTEM`. Device-local memory: `NV01_MEMORY_LOCAL_USER`,
 64 KiB pages, no compression. No host-visible VRAM type is exposed
 (`bar_size_B = 0`, `has_host_visible_vram = false`); an explicit
@@ -134,7 +148,9 @@ memory is coherent.
 [256 GiB, 512 GiB); all below 2^40 as GPFIFO entries require). Each
 `nvkmd_va` is an `NV50_MEMORY_VIRTUAL` at exactly that address
 (`FIXED_ADDRESS_ALLOCATE`, `SPARSE` for sparse ranges; RM collisions are
-retried elsewhere). Binds are `crm_map_dma2` into it with
+retried elsewhere). Ranges follow RM's own alignment for a default page
+size virtual allocation, or RM moves them: 64 KiB, and offset and size
+aligned to 2 MiB from 2 MiB up (RM then uses huge pages). Binds are `crm_map_dma2` into it with
 `DMA_OFFSET_FIXED`, 64 KiB PTEs for VRAM, snooped 4 KiB PTEs for system
 memory and `PAGE_KIND_OVERRIDE` with the VA's PTE kind. RM unmaps whole
 mappings only, so each VA tracks its mappings and partial unbinds unmap and
@@ -142,18 +158,23 @@ re-map the remainders.
 
 **Exec contexts** (`nvkmd_rm_ctx.c`), after `nvidia-push-init.c`:
 `KEPLER_CHANNEL_GROUP_A` (GR, our VA space) → `FERMI_CONTEXT_SHARE_A`
-(async) → GPFIFO channel (1024 entries; ring and push slots in our system
-pages; error notifier + USERD in RM system memory) → 3D / compute / copy
-objects without parameters → `SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX`,
+(SYNC, VEID 0: GSP refuses the 3D object on an async subcontext) → GPFIFO
+channel (1024 entries; ring and push slots in our system pages; error
+notifier + USERD in RM system memory) → `NVA06F_CTRL_CMD_BIND` (GR) → 3D /
+compute / copy objects without parameters → `SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX`,
 `GET_WORK_SUBMIT_TOKEN` → `NVA06C_CTRL_CMD_GPFIFO_SCHEDULE`. Submission has
 no RM call: GPFIFO entries (`NO_PREFETCH` → `SYNC_WAIT`), GP_PUT in USERD,
-token to `usermode + 0x90`. A full ring waits for GP_GET (10 s, then
+token to `usermode + 0x90`. GP_GET in USERD is not written back while the
+channel runs (it stays 0), so every kick ends with a semaphore release
+(no WFI) of a sequence number and the ring counts as read up to the newest
+release that has landed. A full ring waits for that (10 s, then
 `DEVICE_LOST`); a non-zero error notifier is `VK_ERROR_DEVICE_LOST`.
 
 **Bind contexts**: synchronous; waits and signals on the CPU.
 
 **Syncs** (`nvkmd_rm_sync.c`). Timeline `vk_sync` = 64-bit value in a
-per-device pool of system memory; `vk_sync_binary` on top. GPU signal:
+per-device pool of system memory; `vk_sync_binary` on top, with a `move`
+added (the runtime needs it for binary semaphores in assisted mode). GPU signal:
 `SEM_EXECUTE` release (64-bit, WFI) + `NON_STALL_INTERRUPT`; GPU wait:
 `SEM_EXECUTE ACQ_STRICT_GEQ` with TSG switch. CPU wait: read the value, spin
 briefly, then `poll()` the non-stall event fd (bounded at 10 ms per round, so
@@ -208,7 +229,9 @@ table with the parameter sizes the backend sends (`NV01_ROOT_CLIENT`,
 `BLACKWELL_COMPUTE_B`, `BLACKWELL_DMA_COPY_B`, `BLACKWELL_USERMODE_A`,
 `NV01_EVENT_OS_EVENT`; controls 0x205, 0x21b, 0x800292, 0x20801701,
 0x20801801, 0x20800110, 0x20801303, 0x20801228, 0x20800403, 0x20800301,
-0xc36f010a, 0xc36f0108, 0xa06c0101). Operationally:
+0xc36f010a, 0xc36f0108, 0xa06c0101, 0xa06f0104) and the
+`NV_ESC_RM_ALLOC_MEMORY` route for OS descriptors. Confirmed in the first
+run: nothing NVK sends is refused. Operationally:
 
 - the VM needs `--caps graphics`;
 - worth checking in the first run: that the backend's OS-descriptor
@@ -244,3 +267,59 @@ the guest, then:
    WSI, CPU copy).
 7. **Stress**: GPFIFO wrap (more than 1024 submits without waiting), many
    fences (semaphore pool growth), sparse binding tests.
+
+## First run (2026-10-05, `lab`, RTX 5090, RM 610.57.04 with GSP)
+
+Setup: the `lab` guest (Ubuntu 26.04) at 3 GiB RAM because the host was
+short of memory (win11 holds 20 GiB). Mesa was built on the host (Ubuntu
+24.04, older glibc than the guest; `-Ddisplay-info=disabled` because the
+guest's libdisplay-info soname differs), installed with `--destdir` and
+copied to `~/nvk-prefix` in the guest; librmclient was built in the guest
+with its Makefile. Environment:
+
+```sh
+export NVK_RM=1
+export VK_ICD_FILENAMES=$HOME/nvk-prefix/share/vulkan/icd.d/nouveau_icd.x86_64.json
+export NVK_RMCLIENT_LIB=$HOME/nvk-rm/rmclient/build-make/librmclient.so
+```
+
+The compute test is `tests/vk_compute_test.c`:
+
+```sh
+glslc --target-env=vulkan1.3 tests/compute.comp -o compute.spv
+cc -O1 -g tests/vk_compute_test.c -lvulkan -o vk_compute_test
+./vk_compute_test compute.spv [copy] [N]     # LOOPS=n, NOWAIT=1 for stress
+```
+
+Results:
+
+- `vulkaninfo --summary`: `NVIDIA GeForce RTX 5090 (NVK GB202)`,
+  `DRIVER_ID_MESA_NVK`, API 1.4.363, conformance version 1.4.3.0, PCI
+  0x10de:0x2b85; `NVK_DEBUG=vm` shows 3D 0xce97, compute 0xcec0, copy
+  0xcab5, GPFIFO 0xca6f, usermode 0xc761, 32146 MiB VRAM, 12 GPCs, 85 TPCs.
+  Without `NVK_RM` NVK declines; with both ICDs one process sees NVIDIA's
+  driver and NVK side by side.
+- Compute test (one storage buffer, a 64-wide shader writing
+  `i * 3 + 7`, read back): host-visible buffer (4096 and 1 Mi values),
+  device-local buffer + `vkCmdCopyBuffer` (4096 and 16 Mi values),
+  `NVK_DEBUG=push_sync`, 5000 submit + fence-wait round trips (0.22 s for the
+  whole process) and 20000 submits without waiting: all pass.
+- `vkcube --wsi xcb --c 20000` on Xvfb: renders the textured cube
+  (screenshot checked), about 3500 frames per second, exits cleanly.
+- No refusals in the backend log, no NVRM errors in the host kernel log
+  once the fixes were in.
+
+What failed on the way (all fixed in patches 8 and 9, plus
+`crm_alloc_os_descriptor` in librmclient): OS descriptor via RM_ALLOC
+(`NV_ERR_NOT_SUPPORTED`); `NV50_MEMORY_VIRTUAL` moved by RM's alignment;
+the timeline sync type's binary-only feature (assert); GR context buffers
+with no VA (`NV_ERR_NO_MEMORY`, `kgraphicsMapCtxBuffer`); 3D object on an
+async subcontext (`NV_ERR_INVALID_OBJECT` from GSP); `cls_m2mf` 0 (Fermi
+path, push assert); binary semaphores without `move` (assert); GPFIFO wrap
+with GP_GET never written back (`DEVICE_LOST` after 1023 entries).
+
+Still to do: dEQP-VK (not built: the host had about 2 GiB of memory to
+spare), test plan steps 5 (bad pushbuffer → `DEVICE_LOST`) and 7 (sparse,
+many fences), a Mesa build inside the guest, and a look at whether
+`poll()` on the dataless non-stall event re-arms (waits were fast, so the
+fallback paths are at least not slow).

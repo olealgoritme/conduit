@@ -1,0 +1,297 @@
+From 56bc857b218b02ba40a154f2478d215b901dff62 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 5 Oct 2026 22:15:15 +0200
+Subject: [PATCH 9/9] nvk/rm: track GPFIFO progress with a semaphore; binary
+ sync move
+
+Two failures from running vkcube on GB202 under GSP:
+
+- GP_GET in USERD is never written back while the channel runs (it
+  stayed 0 after 1023 completed entries), so the ring looked full
+  forever and the 1024th entry timed out with VK_ERROR_DEVICE_LOST.
+  Every kick now ends with a semaphore release (no WFI) of a sequence
+  number, and the ring position after each one is remembered; the ring
+  is read up to the position of the newest release that has landed.
+  One entry is kept free for that release.
+- vk_sync_binary has no move, which the runtime requires for binary
+  semaphores when it runs a submit thread (assisted timeline mode):
+  vkCreateSemaphore asserted.  Add one: swap the two binaries' timelines
+  and points, then reset the source past any signal still in flight.
+
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  2 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c  | 99 ++++++++++++++++++---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c |  2 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c | 57 +++++++++++-
+ 4 files changed, 145 insertions(+), 15 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 496d284..ef8b54c 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -273,6 +273,8 @@ struct nvkmd_rm_sync {
+ };
+ 
+ struct vk_sync_type nvkmd_rm_sync_get_type(void);
++void nvkmd_rm_binary_sync_type_init(struct vk_sync_binary_type *binary,
++                                    const struct vk_sync_type *timeline);
+ 
+ VkResult nvkmd_rm_sync_init(struct vk_device *device,
+                             struct vk_sync *sync,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index e42a09e..4c1dc38 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -91,6 +91,23 @@ struct nvkmd_rm_exec_ctx {
+    uint32_t put;
+    uint32_t kicked_put;
+ 
++   /* How far the GPU has read the ring.  GP_GET in USERD is not written
++    * back while the channel runs (it stays 0 on GB202 under GSP), so every
++    * kick ends with a semaphore release (no WFI) of track_seqno, and
++    * track[] remembers the ring position after each one.  get is the
++    * position after the newest release that has landed.  One ring entry is
++    * always kept free for that release.
++    */
++   volatile uint64_t *track_sema;
++   uint64_t track_sema_va;
++   uint64_t track_seqno;
++   uint32_t get;
++   uint32_t track_head, track_tail;
++   struct {
++      uint64_t seqno;
++      uint32_t put;
++   } track[NVKMD_RM_GPFIFO_ENTRIES];
++
+    /* Semaphore acquires queued by wait(), emitted before the next push */
+    uint32_t pending_op_count;
+    struct nvkmd_rm_sem_op pending_ops[NVKMD_RM_MAX_PENDING_OPS];
+@@ -126,11 +143,25 @@ check_channel_error(struct nvkmd_rm_exec_ctx *ctx,
+                     ctx->notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR].info32);
+ }
+ 
++static uint32_t
++ring_free(struct nvkmd_rm_exec_ctx *ctx)
++{
++   const uint64_t completed = p_atomic_read(ctx->track_sema);
++   while (ctx->track_tail != ctx->track_head &&
++          ctx->track[ctx->track_tail].seqno <= completed) {
++      ctx->get = ctx->track[ctx->track_tail].put;
++      ctx->track_tail = (ctx->track_tail + 1) % NVKMD_RM_GPFIFO_ENTRIES;
++   }
++
++   return (ctx->get + NVKMD_RM_GPFIFO_ENTRIES - ctx->put - 1) %
++          NVKMD_RM_GPFIFO_ENTRIES;
++}
++
++/* Room for one entry plus the tracking release a kick appends */
+ static VkResult
+ wait_ring_space(struct nvkmd_rm_exec_ctx *ctx, struct vk_object_base *log_obj)
+ {
+-   const uint32_t next = (ctx->put + 1) % NVKMD_RM_GPFIFO_ENTRIES;
+-   if (next != ctx->userd[NVRM_USERD_GP_GET / 4])
++   if (ring_free(ctx) >= 2)
+       return VK_SUCCESS;
+ 
+    /* The ring is full of entries that may not have been kicked yet */
+@@ -141,15 +172,17 @@ wait_ring_space(struct nvkmd_rm_exec_ctx *ctx, struct vk_object_base *log_obj)
+    }
+ 
+    const uint64_t deadline = os_time_get_nano() + NVKMD_RM_RING_TIMEOUT_NS;
+-   while (next == ctx->userd[NVRM_USERD_GP_GET / 4]) {
++   while (ring_free(ctx) < 2) {
+       VkResult result = check_channel_error(ctx, log_obj);
+       if (result != VK_SUCCESS)
+          return result;
+ 
+       if (os_time_get_nano() > deadline) {
+          return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST,
+-                          "GPFIFO did not drain (GP_GET stuck at %u)",
+-                          ctx->userd[NVRM_USERD_GP_GET / 4]);
++                          "GPFIFO did not drain (put %u, read up to %u, "
++                          "tracking semaphore %" PRIu64 " of %" PRIu64 ")",
++                          ctx->put, ctx->get, *ctx->track_sema,
++                          ctx->track_seqno);
+       }
+ 
+       os_time_sleep(10);
+@@ -158,15 +191,10 @@ wait_ring_space(struct nvkmd_rm_exec_ctx *ctx, struct vk_object_base *log_obj)
+    return VK_SUCCESS;
+ }
+ 
+-static VkResult
+-push_gpfifo_entry(struct nvkmd_rm_exec_ctx *ctx,
+-                  struct vk_object_base *log_obj,
+-                  uint64_t addr, uint32_t size_B, bool no_prefetch)
++static void
++write_gpfifo_entry(struct nvkmd_rm_exec_ctx *ctx,
++                   uint64_t addr, uint32_t size_B, bool no_prefetch)
+ {
+-   VkResult result = wait_ring_space(ctx, log_obj);
+-   if (result != VK_SUCCESS)
+-      return result;
+-
+    /* GP_ENTRY1_GET_HI is 8 bits; see NVKMD_RM_HEAP_END */
+    assert(addr < (1ull << 40));
+    assert((addr % 4) == 0 && (size_B % 4) == 0);
+@@ -180,6 +208,47 @@ push_gpfifo_entry(struct nvkmd_rm_exec_ctx *ctx,
+ 
+    ctx->gpfifo[ctx->put] = (uint64_t)entry1 << 32 | entry0;
+    ctx->put = (ctx->put + 1) % NVKMD_RM_GPFIFO_ENTRIES;
++}
++
++/* The release that tells us how far the ring has been read; uses the
++ * entry wait_ring_space() keeps free.
++ */
++static void
++emit_track_release(struct nvkmd_rm_exec_ctx *ctx)
++{
++   assert(ring_free(ctx) >= 1);
++
++   const uint32_t slot = ctx->put;
++   uint32_t *p = ctx->push_slots + slot * NVKMD_RM_PUSH_SLOT_DW;
++   const uint64_t value = ++ctx->track_seqno;
++   uint32_t dw = 0;
++   p[dw++] = host_mthd_incr(NVRM_GPFIFO_SEM_ADDR_LO, 5);
++   p[dw++] = (uint32_t)ctx->track_sema_va;
++   p[dw++] = (uint32_t)(ctx->track_sema_va >> 32);
++   p[dw++] = (uint32_t)value;
++   p[dw++] = (uint32_t)(value >> 32);
++   p[dw++] = NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _OPERATION, _RELEASE) |
++             NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _PAYLOAD_SIZE, _64BIT);
++
++   write_gpfifo_entry(ctx, ctx->push_slots_va + slot * NVKMD_RM_PUSH_SLOT_B,
++                      dw * 4, false);
++
++   ctx->track[ctx->track_head].seqno = value;
++   ctx->track[ctx->track_head].put = ctx->put;
++   ctx->track_head = (ctx->track_head + 1) % NVKMD_RM_GPFIFO_ENTRIES;
++   assert(ctx->track_head != ctx->track_tail);
++}
++
++static VkResult
++push_gpfifo_entry(struct nvkmd_rm_exec_ctx *ctx,
++                  struct vk_object_base *log_obj,
++                  uint64_t addr, uint32_t size_B, bool no_prefetch)
++{
++   VkResult result = wait_ring_space(ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   write_gpfifo_entry(ctx, addr, size_B, no_prefetch);
+ 
+    return VK_SUCCESS;
+ }
+@@ -271,6 +340,8 @@ nvkmd_rm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+       return result;
+ 
+    if (ctx->kicked_put != ctx->put) {
++      emit_track_release(ctx);
++
+       /* GPFIFO entries (and push slots) before GP_PUT, GP_PUT before the
+        * doorbell.
+        */
+@@ -528,6 +599,8 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+    ctx->push_slots_va = ctx->ring_mem->va->addr + NVKMD_RM_RING_PUSH_OFFSET;
+    ctx->ctx_sema = (volatile uint64_t *)((uint8_t *)map + NVKMD_RM_RING_SEMA_OFFSET);
+    ctx->ctx_sema_va = ctx->ring_mem->va->addr + NVKMD_RM_RING_SEMA_OFFSET;
++   ctx->track_sema = ctx->ctx_sema + 1;
++   ctx->track_sema_va = ctx->ctx_sema_va + 8;
+ 
+    /* Error notifier and USERD.  RM writes the notifier and the GPU writes
+     * GP_GET; we read both and write GP_PUT.  This uses RM-allocated system
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index e3164c0..53ad97a 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -362,7 +362,7 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+    pdev->base.drm.primary_dev = 0;
+ 
+    pdev->sync_type = nvkmd_rm_sync_get_type();
+-   pdev->binary_sync_type = vk_sync_binary_get_type(&pdev->sync_type);
++   nvkmd_rm_binary_sync_type_init(&pdev->binary_sync_type, &pdev->sync_type);
+    pdev->sync_types[0] = &pdev->sync_type;
+    pdev->sync_types[1] = &pdev->binary_sync_type.sync;
+    pdev->sync_types[2] = NULL;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+index c33ee30..b7afc37 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+@@ -8,6 +8,7 @@
+ #include "../../nvk_device.h"
+ 
+ #include "util/os_time.h"
++#include "vk_sync_binary.h"
+ #include "vk_log.h"
+ 
+ /*
+@@ -17,7 +18,8 @@
+  * in the device's semaphore pool).  The GPU signals it with a host
+  * semaphore release and waits on it with a semaphore acquire
+  * (nvkmd_rm_ctx.c); the CPU reads and writes it directly.  Binary
+- * semaphores and fences use Mesa's vk_sync_binary on top.
++ * semaphores and fences use Mesa's vk_sync_binary on top, with a move
++ * added (nvkmd_rm_binary_move()).
+  *
+  * CPU waits poll the value, blocking on the RM non-stall interrupt event
+  * when there is one (nvkmd_rm_wait_step()).
+@@ -254,3 +256,56 @@ nvkmd_rm_sync_get_type(void)
+       .wait_many = nvkmd_rm_sync_wait_many,
+    };
+ }
++
++static void
++fix_cpu_only_pointer(struct nvkmd_rm_sync *sync, uint64_t value)
++{
++   if (sync->dev == NULL) {
++      sync->value = &sync->cpu_only_value;
++      *sync->value = value;
++   }
++}
++
++/* vk_sync_binary has no move, but the runtime needs one for permanent binary
++ * semaphores whenever it runs a submit thread (assisted timeline mode, which
++ * this backend uses).  A binary on top of our timeline is (timeline,
++ * next_point), signaled once the timeline reaches next_point, so moving is
++ * swapping the two binaries' timelines and points and then resetting the
++ * source.  A GPU signal still in flight for the source's new timeline writes
++ * at most its old next_point, which the reset has moved past.
++ */
++static VkResult
++nvkmd_rm_binary_move(struct vk_device *device,
++                     struct vk_sync *_dst, struct vk_sync *_src)
++{
++   struct vk_sync_binary *dst = vk_sync_as_binary(_dst);
++   struct vk_sync_binary *src = vk_sync_as_binary(_src);
++   assert(dst != NULL && src != NULL);
++   assert(dst->timeline.type == src->timeline.type);
++
++   struct nvkmd_rm_sync *d = nvkmd_rm_sync(&dst->timeline);
++   struct nvkmd_rm_sync *s = nvkmd_rm_sync(&src->timeline);
++   const uint64_t d_val = p_atomic_read(d->value);
++   const uint64_t s_val = p_atomic_read(s->value);
++
++   struct nvkmd_rm_sync tmp = *d;
++   *d = *s;
++   *s = tmp;
++   fix_cpu_only_pointer(d, s_val);
++   fix_cpu_only_pointer(s, d_val);
++
++   const uint64_t point = dst->next_point;
++   dst->next_point = src->next_point;
++   src->next_point = point + 1;
++
++   return VK_SUCCESS;
++}
++
++void
++nvkmd_rm_binary_sync_type_init(struct vk_sync_binary_type *binary,
++                               const struct vk_sync_type *timeline)
++{
++   *binary = vk_sync_binary_get_type(timeline);
++   assert(timeline->size == sizeof(struct nvkmd_rm_sync));
++   binary->sync.move = nvkmd_rm_binary_move;
++}
+-- 
+2.43.0
+
