@@ -202,6 +202,7 @@ impl Venus {
                 self.lose(env);
             }
         }
+        self.fences.flush_latency();
         self.fences.take_ready()
     }
 

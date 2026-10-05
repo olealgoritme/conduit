@@ -14,6 +14,7 @@
 //! callback only queues into [`FENCES`] and signals an eventfd, so the serving
 //! thread never has to poll virglrenderer for fences.
 
+use crate::latency;
 use crate::{
     Blob, CAPSET_VENUS, CapsetInfo, DRM_FORMAT_MOD_LINEAR, Dmabuf, Error, Renderer, Result, ScanoutLayout, Signalled,
 };
@@ -127,30 +128,42 @@ static FENCES: Mutex<Vec<Signalled>> = Mutex::new(Vec::new());
 /// When each pending fence was created, for the create-to-signal latency
 /// summary (`fence_latency`), keyed by `(ctx_id, ring_idx, fence_id)`.
 static CREATED: Mutex<Option<std::collections::HashMap<(u32, u32, u64), std::time::Instant>>> = Mutex::new(None);
-/// Create-to-signal latencies in microseconds since the last summary.
-static LATENCY: Mutex<(Vec<u32>, Option<std::time::Instant>)> = Mutex::new((Vec::new(), None));
+/// Create-to-signal latencies of the current summary window.
+static LATENCY: Mutex<latency::Window<()>> = Mutex::new(latency::Window::new(latency::PERIOD));
 
-/// Record one fence's create-to-signal time; every two seconds print the
-/// count, median, 90th percentile and maximum to the log (stderr).
+/// Record one fence's create-to-signal time (on a virglrenderer thread).
 fn fence_latency(key: (u32, u32, u64)) {
     let Some(at) = CREATED.lock().unwrap_or_else(|p| p.into_inner()).as_mut().and_then(|m| m.remove(&key)) else {
         return;
     };
-    let us = at.elapsed().as_micros().min(u32::MAX as u128) as u32;
+    let now = std::time::Instant::now();
+    let ended = LATENCY.lock().unwrap_or_else(|p| p.into_inner()).add((), now.saturating_duration_since(at), now);
+    if let Some(s) = ended {
+        log_latency(&s);
+    }
+}
+
+/// Close the latency window if it is over (from the serve loop, through
+/// [`Renderer::tick`]); how long until the open one is.
+fn flush_latency() -> Option<std::time::Duration> {
+    let now = std::time::Instant::now();
     let mut l = LATENCY.lock().unwrap_or_else(|p| p.into_inner());
-    l.0.push(us);
-    let since = *l.1.get_or_insert_with(std::time::Instant::now);
-    if since.elapsed() >= std::time::Duration::from_secs(2) {
-        let mut v = std::mem::take(&mut l.0);
-        l.1 = None;
-        v.sort_unstable();
-        let at = |q: usize| v[(v.len() - 1) * q / 100];
+    if let Some(s) = l.flush(now) {
+        log_latency(&s);
+    }
+    l.due(now)
+}
+
+/// The count, median, 90th percentile and maximum, to the log (stderr).
+fn log_latency(s: &latency::Summary<()>) {
+    for (_, st) in &s.by_key {
         eprintln!(
-            "conduit-venus: fence create-to-signal: {} fences, p50 {} us, p90 {} us, max {} us",
-            v.len(),
-            at(50),
-            at(90),
-            v[v.len() - 1]
+            "conduit-venus: fence create-to-signal: {} fences in {:.1} s, p50 {} us, p90 {} us, max {} us",
+            st.count,
+            s.span.as_secs_f64(),
+            st.p50,
+            st.p90,
+            st.max
         );
     }
 }
@@ -422,6 +435,10 @@ impl Renderer for Virgl {
         // them (proxy_context_retire_fences asserts against it).
         // In-process: virglrenderer cannot die without taking this with it.
         Ok(std::mem::take(&mut *FENCES.lock().unwrap_or_else(|p| p.into_inner())))
+    }
+
+    fn tick(&mut self) -> Option<std::time::Duration> {
+        flush_latency()
     }
 
     /// The image is described by the guest's layout (see [`ScanoutLayout`]):

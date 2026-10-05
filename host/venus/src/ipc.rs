@@ -640,8 +640,12 @@ impl IpcServer {
                 libc::pollfd { fd: self.sock.as_raw_fd(), events: libc::POLLIN, revents: 0 },
                 libc::pollfd { fd: self.renderer.fence_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 },
             ];
+            // Wait for a request or a fence, or until the renderer's upkeep is
+            // due (rounded up, so it is due when the wait ends).
+            let timeout =
+                self.renderer.tick().map_or(-1, |d| d.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32);
             // SAFETY: polls two descriptors we hold for the call's duration.
-            let n = unsafe { libc::poll(pfd.as_mut_ptr(), 2, -1) };
+            let n = unsafe { libc::poll(pfd.as_mut_ptr(), 2, timeout) };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {

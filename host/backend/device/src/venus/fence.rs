@@ -14,10 +14,8 @@
 
 use super::*;
 use conduit_venus::Signalled;
-use std::time::{Duration, Instant};
-
-/// How often the fence latency summary is logged while fences flow.
-const LATENCY_REPORT: Duration = Duration::from_secs(2);
+use conduit_venus::latency::{Summary, Window};
+use std::time::Instant;
 
 /// A response for a chain that was [`Outcome::Held`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,43 +35,19 @@ struct Held {
     at: Instant,
 }
 
-/// Submit-to-signal latencies seen since the last summary, in microseconds,
-/// per `(ctx_id, ring)`.
-#[derive(Default)]
-struct Latency {
-    samples: Vec<(u32, u32, u32)>,
-    since: Option<Instant>,
-}
-
-impl Latency {
-    fn add(&mut self, ctx: u32, ring: u32, held: Duration) {
-        let us = held.as_micros().min(u32::MAX as u128) as u32;
-        self.samples.push((ctx, ring, us));
-        let since = *self.since.get_or_insert_with(Instant::now);
-        if since.elapsed() >= LATENCY_REPORT {
-            self.report();
-        }
-    }
-
-    /// One info line per timeline: count, median, 90th percentile and
-    /// maximum submit-to-signal time.
-    fn report(&mut self) {
-        let mut by: std::collections::BTreeMap<(u32, u32), Vec<u32>> = Default::default();
-        for (c, r, us) in self.samples.drain(..) {
-            by.entry((c, r)).or_default().push(us);
-        }
-        for ((c, r), mut v) in by {
-            v.sort_unstable();
-            let at = |q: usize| v[(v.len() - 1) * q / 100];
-            log::info!(
-                "venus: fence latency ctx {c} ring {r}: {} fences, p50 {} us, p90 {} us, max {} us",
-                v.len(),
-                at(50),
-                at(90),
-                v[v.len() - 1]
-            );
-        }
-        self.since = None;
+/// One info line per `(ctx_id, ring)` of a closed latency window: count
+/// over the window's span, median, 90th percentile and maximum
+/// submit-to-signal time.
+fn log_latency(s: &Summary<(u32, u32)>) {
+    for ((c, r), st) in &s.by_key {
+        log::info!(
+            "venus: fence latency ctx {c} ring {r}: {} fences in {:.1} s, p50 {} us, p90 {} us, max {} us",
+            st.count,
+            s.span.as_secs_f64(),
+            st.p50,
+            st.p90,
+            st.max
+        );
     }
 }
 
@@ -82,7 +56,8 @@ pub(super) struct Fences {
     held: Vec<Held>,
     ready: Vec<Completion>,
     next_token: u64,
-    latency: Latency,
+    /// Submit-to-signal latencies per `(ctx_id, ring)`.
+    latency: Window<(u32, u32)>,
 }
 
 impl Fences {
@@ -120,9 +95,22 @@ impl Fences {
             .enumerate()
             .partition::<Vec<_>, _>(|(i, h)| *i <= last && on(h));
         self.held = keep.into_iter().map(|(_, h)| h).collect();
+        let now = Instant::now();
         for (_, h) in done {
-            self.latency.add(h.hdr.ctx_id, h.hdr.ring(), h.at.elapsed());
+            let held = now.saturating_duration_since(h.at);
+            if let Some(s) = self.latency.add((h.hdr.ctx_id, h.hdr.ring()), held, now) {
+                log_latency(&s);
+            }
             self.complete(h, RESP_OK_NODATA);
+        }
+    }
+
+    /// Log the latency window if it is over. Called whenever the transport
+    /// asks for completions (the fence pump does at least every 100 ms), so
+    /// the line comes on time when fences stop; nothing while idle.
+    pub(super) fn flush_latency(&mut self) {
+        if let Some(s) = self.latency.flush(Instant::now()) {
+            log_latency(&s);
         }
     }
 

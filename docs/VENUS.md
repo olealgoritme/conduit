@@ -93,11 +93,18 @@ own sync thread, never exported, so Conduit's patch
 submodule in order (a patch already applied is skipped). Unigine Heaven in
 a Windows guest went from 36 to about 150 fps with it.
 
-Both sides log fence latency every 2 s while fences flow: `conduit-venus`
-the time from `create_fence` to virglrenderer's signal (count, p50, p90,
-max, in `logs/venus.log`), the backend the time from holding a fenced
-command to the signal reaching it, per `(ctx_id, ring)`, at `info`
-(`venus: fence latency ctx C ring R: ...`).
+Both sides log fence latency in 2 s windows while fences flow:
+`conduit-venus` the time from `create_fence` to virglrenderer's signal
+(count, p50, p90, max, in `logs/venus.log`), the backend the time from
+holding a fenced command to the signal reaching it, per `(ctx_id, ring)`,
+at `info` (`venus: fence latency ctx C ring R: N fences in S s, ...`). A
+window opens with its first fence and closes 2 s later, on time: the
+backend's fence pump asks for completions at least every 100 ms, and
+`conduit-venus`'s serve loop waits no longer than the open window has left
+(`Renderer::tick`). `S` is the window's span from its first fence to its
+last, so a burst that stopped early shows as such; a fence after an idle
+spell opens a new window. An idle guest logs nothing
+(`host/venus/src/latency.rs`, shared by both).
 
 **Commands served** (the set Helios's KMD sends). Anything else answers
 `RESP_ERR_UNSPEC`.

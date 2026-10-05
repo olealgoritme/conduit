@@ -7,6 +7,7 @@
 use std::os::fd::{BorrowedFd, OwnedFd};
 
 pub mod ipc;
+pub mod latency;
 pub mod mock;
 pub mod sandbox;
 #[cfg(feature = "renderer")]
@@ -121,6 +122,13 @@ pub trait Renderer: Send {
     /// gone (after any fences it signalled before going): its fences will
     /// never signal, so whoever waits on them must give up.
     fn signalled(&mut self) -> Result<Vec<Signalled>>;
+
+    /// Upkeep between requests (closing a fence latency window on time):
+    /// the serve loop calls it before each wait and wakes again within the
+    /// returned time, or only for the next request or fence on `None`.
+    fn tick(&mut self) -> Option<std::time::Duration> {
+        None
+    }
 
     /// Export `res_id` for scanout. The returned [`Dmabuf`] describes the
     /// image with `layout`'s size, stride, offset and format and
