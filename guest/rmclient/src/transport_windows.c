@@ -167,7 +167,8 @@ static int nvrm_escape(struct win_ctx *c, void *buf, uint32_t size)
  * the reply's MsgHeader.status, which the callers read.
  */
 static int win_forward(struct win_ctx *c, const void *req, uint32_t req_len, void *resp,
-                       uint32_t resp_cap, uint32_t *resp_len)
+                       uint32_t resp_cap, uint32_t *resp_len, uint32_t pin_id,
+                       uint32_t rm_status_off)
 {
     const size_t resp_off = helios_nvrm_forward_resp_offset(req_len);
     const size_t total = resp_off + resp_cap;
@@ -180,6 +181,8 @@ static int win_forward(struct win_ctx *c, const void *req, uint32_t req_len, voi
     helios_nvrm_init(&f->head, HELIOS_NVRM_OP_FORWARD, (uint32_t)total);
     f->req_len = req_len;
     f->resp_cap = resp_cap;
+    f->pin_id = pin_id;
+    f->rm_status_off = rm_status_off;
     memcpy(buf + HELIOS_NVRM_FORWARD_REQ_OFFSET, req, req_len);
 
     int r = nvrm_escape(c, buf, (uint32_t)total);
@@ -359,7 +362,7 @@ static void read_host_tables(struct win_ctx *c)
         return;
     const size_t req_len = crm_wire_get_sys_files(req);
     uint32_t n = 0;
-    if (win_forward(c, req, (uint32_t)req_len, resp, cap, &n) == 0 && n > 0) {
+    if (win_forward(c, req, (uint32_t)req_len, resp, cap, &n, 0, 0) == 0 && n > 0) {
         /* The reply is the bare stream: GetSysFiles (like GetProcFiles) is the one
          * answer with no MsgHeader in front (host messages.rs, FileEntry). */
         uint32_t pairs[2 * 256];
@@ -419,7 +422,7 @@ static int win_open(void *vctx, int32_t node, int *fd)
     uint32_t n = 0;
     const size_t req_len =
         crm_wire_open(req, node == CRM_NODE_CTL ? CRM_WIRE_DEV_CTL : (uint32_t)node);
-    r = win_forward(c, req, (uint32_t)req_len, resp, sizeof(resp), &n);
+    r = win_forward(c, req, (uint32_t)req_len, resp, sizeof(resp), &n, 0, 0);
     if (r)
         return r;
     r = reply_status(resp, n);
@@ -442,7 +445,7 @@ static void win_close(void *vctx, int fd)
     uint8_t resp[CRM_WIRE_HDR + REPLY_SLACK];
     uint32_t n = 0;
     const size_t req_len = crm_wire_close(req, (uint32_t)fd);
-    (void)win_forward(c, req, (uint32_t)req_len, resp, sizeof(resp), &n);
+    (void)win_forward(c, req, (uint32_t)req_len, resp, sizeof(resp), &n, 0, 0);
 }
 
 static uint32_t host_alloc_param_size(const struct win_ctx *c, uint32_t cls)
@@ -457,7 +460,8 @@ static uint32_t host_alloc_param_size(const struct win_ctx *c, uint32_t cls)
  * payload's own pointer addresses. The reply's blocks are copied back to the
  * same two places. Returns 0, or the host's negative errno. */
 static int ioctl_wire(struct win_ctx *c, int fd, uint32_t nr, void *arg, uint32_t size,
-                      void *nested, uint32_t nested_len)
+                      void *nested, uint32_t nested_len, uint32_t pin_id,
+                      uint32_t rm_status_off)
 {
     if (fd < 0)
         return -EBADF;
@@ -476,7 +480,8 @@ static int ioctl_wire(struct win_ctx *c, int fd, uint32_t nr, void *arg, uint32_
     (void)crm_wire_ioctl(req, (uint32_t)fd, crm_wire_cmd(nr, size), arg, size, nested, nested_len);
 
     uint32_t n = 0;
-    ret = win_forward(c, req, (uint32_t)req_len, resp, (uint32_t)resp_cap, &n);
+    ret = win_forward(c, req, (uint32_t)req_len, resp, (uint32_t)resp_cap, &n, pin_id,
+                      rm_status_off);
     if (ret)
         goto out;
 
@@ -494,6 +499,70 @@ out:
     free(req);
     free(resp);
     return ret;
+}
+
+/* HELIOS_NVRM_OP_PIN: the KMD locks [va, va + length) of this process and keeps the
+ * page-run table; all we get back is an id for the registration's FORWARD. */
+static int nvrm_pin_call(struct win_ctx *c, uint32_t fd, const void *va, uint64_t length,
+                         uint32_t h_root, uint32_t h_object, uint32_t *pin_id)
+{
+    HeliosNvrmPin p;
+    memset(&p, 0, sizeof(p));
+    helios_nvrm_init(&p.head, HELIOS_NVRM_OP_PIN, sizeof(p));
+    p.handle = fd;
+    p.user_va = (uint64_t)(uintptr_t)va;
+    p.length = length;
+    p.h_root = h_root;
+    p.h_object = h_object;
+    int r = nvrm_escape(c, &p, sizeof(p));
+    if (r)
+        return r;
+    if (p.head.status != HELIOS_NVRM_ST_OK)
+        return p.head.status == HELIOS_NVRM_ST_TOO_SCATTERED ? -ENOMEM
+                                                              : kmd_status_to_errno(p.head.status);
+    if (p.out_pin_id == 0)
+        return -EIO;
+    *pin_id = p.out_pin_id;
+    return 0;
+}
+
+/* Release a pin no registration used (a failure path); a used pin is the KMD's. */
+static void nvrm_unpin_call(struct win_ctx *c, uint32_t pin_id)
+{
+    HeliosNvrmUnpin u;
+    memset(&u, 0, sizeof(u));
+    helios_nvrm_init(&u.head, HELIOS_NVRM_OP_UNPIN, sizeof(u));
+    u.pin_id = pin_id;
+    (void)nvrm_escape(c, &u, sizeof(u));
+}
+
+/* NV_ESC_RM_ALLOC_MEMORY of an OS descriptor: pMemory names pages of this process
+ * that the GPU will read and write. Pin them in the KMD, then send the allocation
+ * with the pin's page-run table in place of the pointer. Any other class goes
+ * through unchanged. */
+static int alloc_memory_pinned(struct win_ctx *c, int fd, uint32_t nr, void *arg, uint32_t size)
+{
+    if (size < sizeof(NVOS02_PARAMETERS))
+        return -EINVAL;
+    NVOS02_PARAMETERS *p = arg;
+    if (p->hClass != NV01_MEMORY_SYSTEM_OS_DESCRIPTOR || p->pMemory == 0)
+        return ioctl_wire(c, fd, nr, arg, size, NULL, 0, 0, 0);
+
+    const uint64_t length = p->limit + 1;
+    if (length == 0 || (p->pMemory & 4095u) || (length & 4095u))
+        return -EINVAL;
+    uint32_t pin_id = 0;
+    int r = nvrm_pin_call(c, (uint32_t)fd, (const void *)(uintptr_t)p->pMemory, length,
+                          p->hRoot, p->hObjectNew, &pin_id);
+    if (r)
+        return r;
+    /* The RM status of the registration is the block's `status`; the KMD keeps the
+     * pin only if it and the host's status are both 0. */
+    r = ioctl_wire(c, fd, nr, arg, size, NULL, 0, pin_id,
+                   (uint32_t)offsetof(NVOS02_PARAMETERS, status));
+    if (r)
+        nvrm_unpin_call(c, pin_id); /* never reached RM: PIN_IN_USE if it did, harmless */
+    return r;
 }
 
 static int win_ioctl(void *vctx, int fd, uint32_t nr, void *arg, uint32_t size)
@@ -531,12 +600,14 @@ static int win_ioctl(void *vctx, int fd, uint32_t nr, void *arg, uint32_t size)
             size = (uint32_t)sizeof(NVOS64_PARAMETERS);
         }
         break;
+    case NV_ESC_RM_ALLOC_MEMORY:
+        return alloc_memory_pinned(c, fd, nr, arg, size);
     default:
         break;
     }
     if (!nested)
         nested_len = 0;
-    return ioctl_wire(c, fd, nr, arg, size, nested, nested_len);
+    return ioctl_wire(c, fd, nr, arg, size, nested, nested_len, 0, 0);
 }
 
 /* HELIOS_NVRM_OP_MMAP on backend handle `fd`. */
