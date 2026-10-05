@@ -32,7 +32,7 @@ pub static VSYNC_RATE_OVERRIDE_MHZ: AtomicU32 = AtomicU32::new(0);
 /// The retrace rate the vsync heartbeat runs at, in millihertz.
 fn vsync_rate_mhz(adapter: &AdapterContext) -> u32 {
     match VSYNC_RATE_OVERRIDE_MHZ.load(core::sync::atomic::Ordering::Relaxed) {
-        0 => adapter.display_refresh_mhz(),
+        0 => adapter.effective_refresh_mhz(),
         forced => forced,
     }
 }

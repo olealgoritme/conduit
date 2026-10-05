@@ -616,6 +616,13 @@ pub struct AdapterContext {
     /// toggled by `DxgkDdiControlInterrupt(DXGK_INTERRUPT_CRTC_VSYNC, enable)`.
     /// The DPC only synthesizes an interrupt while this is nonzero.
     pub vsync_enabled: AtomicU32,
+    /// The refresh rate (millihertz) of the target mode dxgkrnl last COMMITTED,
+    /// read from the pinned target mode in `CommitVidPn`; 0 = none committed yet
+    /// (reset at StartDevice). It differs from the host's preferred rate when the
+    /// user picks another rate from the offered ladder in Display Settings, and
+    /// it is the rate the primary surface is described with and the vsync
+    /// heartbeat runs at (see [`Self::effective_refresh_mhz`]).
+    committed_refresh_mhz: AtomicU32,
     /// Count of CRTC_VSYNC interrupts synthesized this boot (diag `ScVs`).
     pub vsync_count: AtomicU32,
     /// Physical address of the last primary actually programmed for display,
@@ -1148,6 +1155,7 @@ impl AdapterContext {
             vsync_ex_timer: AtomicUsize::new(0),
             vsync_deadline_100ns: AtomicU64::new(0),
             vsync_enabled: AtomicU32::new(0),
+            committed_refresh_mhz: AtomicU32::new(0),
             vsync_count: AtomicU32::new(0),
             last_primary_address: AtomicU64::new(0),
             active_scanout_resource: AtomicU32::new(0),
@@ -1368,6 +1376,21 @@ impl AdapterContext {
         self.started()
             .map_or(DEFAULT_SCANOUT_EXTENT, |s| s.scanout_mode.mode)
             .refresh_mhz()
+    }
+
+    /// Record the committed target mode's refresh rate (millihertz); 0 clears it.
+    pub fn set_committed_refresh_mhz(&self, mhz: u32) {
+        self.committed_refresh_mhz.store(mhz, Ordering::Release);
+    }
+
+    /// The refresh rate the display actually runs at, in millihertz: the
+    /// committed target mode's if dxgkrnl has committed one, else the host's
+    /// preferred rate (`display_refresh_mhz`).
+    pub fn effective_refresh_mhz(&self) -> u32 {
+        match self.committed_refresh_mhz.load(Ordering::Acquire) {
+            0 => self.display_refresh_mhz(),
+            committed => committed,
+        }
     }
 
     /// The packed `(w << 16) | h` the `DspMd` breadcrumb reports.

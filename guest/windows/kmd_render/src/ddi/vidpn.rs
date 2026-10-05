@@ -1232,5 +1232,66 @@ pub unsafe fn commit_vidpn(adapter: &AdapterContext, arg: *const DXGKARG_COMMITV
 
     rec(b"VpCP", pinned);
     rec(b"VpCW", wh);
+
+    // The committed TARGET mode carries the refresh rate. Remember it: the
+    // primary surface is described with it (DescribeAllocation) and the vsync
+    // heartbeat runs at it, which differs from the host's preferred rate once
+    // the user picks another offered rate in Display Settings.
+    // SAFETY: `vidpn` is the live VidPn interface for this DDI call.
+    if let Some(mhz) = unsafe { committed_target_refresh_mhz(vidpn, h_vidpn, CHILD_UID) } {
+        adapter.set_committed_refresh_mhz(mhz);
+        rec(b"VpCRf", mhz);
+    }
     STATUS_SUCCESS
+}
+
+/// The refresh rate, in millihertz, of `target_id`'s pinned target mode in this
+/// VidPn, or `None` if no target mode is pinned or it carries no usable rate.
+///
+/// # Safety
+/// `vidpn`/`h_vidpn` are the live VidPn interface and handle of the current DDI call.
+unsafe fn committed_target_refresh_mhz(
+    vidpn: &DXGK_VIDPN_INTERFACE,
+    h_vidpn: D3DKMDT_HVIDPN,
+    target_id: u32,
+) -> Option<u32> {
+    let acquire = vidpn.pfnAcquireTargetModeSet?;
+    vidpn.pfnReleaseTargetModeSet?;
+    let mut h_set: D3DKMDT_HVIDPNTARGETMODESET = null_mut();
+    let mut set_iface: *const DXGK_VIDPNTARGETMODESET_INTERFACE = null();
+    // SAFETY: valid out-pointers.
+    let st = unsafe { acquire(h_vidpn, target_id, &mut h_set, &mut set_iface) };
+    if !ok(st) || set_iface.is_null() {
+        return None;
+    }
+    // Released on every exit from here.
+    let _set = TargetModeSet {
+        vidpn,
+        h_vidpn,
+        target_id,
+        h_set,
+        iface: set_iface,
+    };
+    // SAFETY: `set_iface` came from the acquire above.
+    let iface = unsafe { &*set_iface };
+    let acquire_pinned = iface.pfnAcquirePinnedModeInfo?;
+    let release_mode = iface.pfnReleaseModeInfo?;
+    let mut mode: *const D3DKMDT_VIDPN_TARGET_MODE = null();
+    // SAFETY: valid out-pointer.
+    if !ok(unsafe { acquire_pinned(h_set, &mut mode) }) || mode.is_null() {
+        return None;
+    }
+    // SAFETY: `mode` is a live pinned target mode until released just below.
+    let rate = unsafe { (*mode).VideoSignalInfo.VSyncFreq };
+    // SAFETY: releases the pinned mode info acquired above, once.
+    let _ = unsafe { release_mode(h_set, mode) };
+    if rate.Denominator == 0 {
+        return None;
+    }
+    let mhz = u64::from(rate.Numerator) * 1000 / u64::from(rate.Denominator);
+    // The same bounds `DisplayMode::from_native` applies; anything else is not
+    // a rate this driver offered.
+    u32::try_from(mhz)
+        .ok()
+        .filter(|m| (helios_kmd_logic::MIN_REFRESH_MHZ..=helios_kmd_logic::MAX_REFRESH_MHZ).contains(m))
 }
