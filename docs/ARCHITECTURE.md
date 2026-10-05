@@ -74,6 +74,14 @@ at a fixed address, so they go into the **UVM aperture** (region 2, 32 GiB of
 address space, committed only as touched). Pinned host memory is registered as
 guest-physical page runs and mapped zero-copy. When a host descriptor becomes
 ready (GPU interrupt), the backend sends an event so the guest's `poll()` wakes.
+RM's OS events work this way: the guest opens a control file, allocates an OS
+event on it (`NV_ESC_ALLOC_OS_EVENT`, the descriptor translated) and an event
+object naming it; RM queues each notification on that file, `poll()` wakes,
+and `NV_ESC_RM_GET_EVENT_DATA` on the same file reads the payload (which
+object, notifier index, `info32`/`info16`) until `MoreEvents` is clear. The
+guest module sends the 16-byte event buffer as the call's nested block and
+the backend gives RM a buffer of its own, accepting the call only on a file
+that holds an OS event (`host/backend/device/src/nvidia/os_event.rs`).
 GPU fences cross the same way: a host sync_file is watched once and its
 signal becomes a guest dma_fence ([SYNC.md](SYNC.md)).
 

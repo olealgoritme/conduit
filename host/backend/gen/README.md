@@ -9,7 +9,7 @@ and checked in.
 
 | script | reads | writes |
 |---|---|---|
-| `nvabi_gen.py` | gVisor nvproxy | `src/versions/` (escape sizes) |
+| `nvabi_gen.py` | gVisor nvproxy, plus its `CONDUIT_EXTRA` list (escapes nvproxy does not serve, e.g. `NV_ESC_RM_GET_EVENT_DATA`) | `src/versions/` (escape sizes) |
 | `rmctrl_extract.py` | open-gpu-kernel-modules | `src/rmctrl/`, `guest/linux/rmctrl/` |
 | `rmallow_extract.py` | open-gpu-kernel-modules | `src/rmallow/` (RM allowlist) |
 | `uvm_extract.py` | open-gpu-kernel-modules | `src/uvm/` |

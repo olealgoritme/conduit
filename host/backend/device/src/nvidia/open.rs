@@ -132,6 +132,7 @@ impl NvidiaBackend {
         self.forget_scanout_file(handle);
 
         self.fences.remove(&handle);
+        self.forget_os_events(handle);
 
         match self.handles.remove(handle) {
             Ok(()) => {

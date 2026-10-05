@@ -3668,3 +3668,391 @@ mod fence_tests {
         assert_eq!(host.calls().len(), 1);
     }
 }
+
+/// `NV_ESC_RM_GET_EVENT_DATA` (os_event.rs): served only on a file that holds
+/// an OS event, with an `NvUnixEvent` buffer of the backend's own.
+#[cfg(test)]
+mod os_event_tests {
+    use super::*;
+    use abi::ioctl::*;
+
+    const NV_ERR_OPERATING_SYSTEM: u32 = 0x59;
+    /// The address a guest process would have passed as `pEvent`.
+    const GUEST_PTR: u64 = 0x7ffd_1234_5670;
+    const BODY: usize = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+
+    /// One notification, as RM queues it: hObject, index, info32, info16.
+    type Ev = (u32, u32, u32, u16);
+
+    #[derive(Default)]
+    struct Inner {
+        queue: std::collections::VecDeque<Ev>,
+        /// (fd, escape, the parameter block as it reached the host)
+        calls: Vec<(RawFd, u32, Vec<u8>)>,
+        /// The OS-event status RM answers ALLOC_OS_EVENT with.
+        alloc_status: u32,
+    }
+
+    /// A fake RM: ALLOC/FREE_OS_EVENT succeed (or answer `alloc_status`),
+    /// GET_EVENT_DATA pops the queue the way `get_os_event_data` does --
+    /// writing through `pEvent` only when there is an event.
+    #[derive(Clone, Default)]
+    struct EventHost(std::sync::Arc<std::sync::Mutex<Inner>>);
+
+    impl HostDriver for EventHost {
+        fn ioctl(&self, fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            let mut s = self.0.lock().unwrap();
+            let escape = (request & 0xff) as u32;
+            s.calls.push((fd, escape, arg.to_vec()));
+            match escape {
+                NV_ESC_ALLOC_OS_EVENT => {
+                    let st = s.alloc_status;
+                    arg[12..16].copy_from_slice(&st.to_le_bytes());
+                }
+                NV_ESC_RM_GET_EVENT_DATA => {
+                    assert_eq!(arg.len(), 16, "NVOS41 is 16 bytes");
+                    let ptr = u64::from_le_bytes(arg[0..8].try_into().unwrap());
+                    match s.queue.pop_front() {
+                        Some((obj, idx, i32_, i16_)) => {
+                            let mut ev = [0u8; 16];
+                            ev[0..4].copy_from_slice(&obj.to_le_bytes());
+                            ev[4..8].copy_from_slice(&idx.to_le_bytes());
+                            ev[8..12].copy_from_slice(&i32_.to_le_bytes());
+                            ev[12..14].copy_from_slice(&i16_.to_le_bytes());
+                            // SAFETY: the backend promises `pEvent` is a live
+                            // 16-byte buffer of its own for this call; a guest
+                            // address here would fault the test, as it should.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(ev.as_ptr(), ptr as *mut u8, 16)
+                            };
+                            let more = !s.queue.is_empty() as u32;
+                            arg[8..12].copy_from_slice(&more.to_le_bytes());
+                            arg[12..16].copy_from_slice(&NV_OK.to_le_bytes());
+                        }
+                        None => {
+                            arg[8..12].copy_from_slice(&0u32.to_le_bytes());
+                            arg[12..16].copy_from_slice(&NV_ERR_OPERATING_SYSTEM.to_le_bytes());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
+    impl EventHost {
+        fn push(&self, ev: Ev) {
+            self.0.lock().unwrap().queue.push_back(ev);
+        }
+        fn calls(&self, escape: u32) -> Vec<(RawFd, Vec<u8>)> {
+            let s = self.0.lock().unwrap();
+            s.calls
+                .iter()
+                .filter(|c| c.1 == escape)
+                .map(|c| (c.0, c.2.clone()))
+                .collect()
+        }
+    }
+
+    fn backend_on(host: &EventHost) -> NvidiaBackend {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(abi::version::DriverVersion::new(610, 57, 4))
+            .expect("610.57.04 has tables");
+        be.set_host(Box::new(host.clone()));
+        be
+    }
+
+    fn open_null(be: &mut NvidiaBackend) -> u64 {
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        be.handles.insert(OwnedFd::from(null))
+    }
+
+    fn header(msg_type: MsgType, handle: u64) -> Vec<u8> {
+        let mut v = vec![0u8; size_of::<MsgHeader>()];
+        write_struct(
+            &mut v,
+            &MsgHeader {
+                msg_type: msg_type as u32,
+                handle: handle as u32,
+                status: 0,
+                padding: 0,
+            },
+        );
+        v
+    }
+
+    fn msg(handle: u64, escape: u32, params: &[u8], nested: &[u8], deep: &[u8]) -> Vec<u8> {
+        let mut v = header(MsgType::Ioctl, handle);
+        let at = v.len();
+        v.resize(at + size_of::<IoctlReq>(), 0);
+        write_struct(
+            &mut v[at..],
+            &IoctlReq {
+                cmd: _IOWR(escape, params.len() as u32) as u32,
+                data_len: params.len() as u32,
+                nested_offset: params.len() as u32,
+                nested_len: nested.len() as u32,
+                deep_ptr_offset: 0,
+                deep_len: deep.len() as u32,
+            },
+        );
+        v.extend_from_slice(params);
+        v.extend_from_slice(nested);
+        v.extend_from_slice(deep);
+        v
+    }
+
+    /// nv_ioctl_alloc_os_event_t / free: hClient, hDevice, fd, Status.
+    fn os_event_params(client: u32, fd: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 16];
+        p[0..4].copy_from_slice(&client.to_le_bytes());
+        p[4..8].copy_from_slice(&0xbeef_0001u32.to_le_bytes());
+        p[8..12].copy_from_slice(&fd.to_le_bytes());
+        p
+    }
+
+    fn alloc_os_event(be: &mut NvidiaBackend, file: u64, fd_field: u64) -> Vec<u8> {
+        let mut resp = vec![0u8; 256];
+        let p = os_event_params(0xc1d0_0001, fd_field as u32);
+        let n = be.dispatch(&msg(file, NV_ESC_ALLOC_OS_EVENT, &p, &[], &[]), &mut resp);
+        resp.truncate(n);
+        resp
+    }
+
+    fn nvos41() -> Vec<u8> {
+        let mut p = vec![0u8; 16];
+        p[0..8].copy_from_slice(&GUEST_PTR.to_le_bytes());
+        p
+    }
+
+    fn get_event(be: &mut NvidiaBackend, file: u64) -> Vec<u8> {
+        let mut resp = vec![0u8; 256];
+        let n = be.dispatch(
+            &msg(file, NV_ESC_RM_GET_EVENT_DATA, &nvos41(), &[0u8; 16], &[]),
+            &mut resp,
+        );
+        resp.truncate(n);
+        resp
+    }
+
+    fn status(resp: &[u8]) -> i32 {
+        read_struct::<MsgHeader>(resp, 0).status
+    }
+
+    fn lens(resp: &[u8]) -> (u32, u32, u32) {
+        let r = read_struct::<IoctlResp>(resp, size_of::<MsgHeader>());
+        (r.data_len, r.nested_len, r.deep_len)
+    }
+
+    fn word(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn get_event_data_is_in_every_profile_at_16_bytes() {
+        for v in abi::versions::supported_versions() {
+            let t = abi::versions::table_for(v).unwrap();
+            let e = abi::versions::lookup(t, NV_ESC_RM_GET_EVENT_DATA).expect("0x52");
+            assert_eq!(e.param_size, Some(16), "{v}");
+            assert_eq!(e.kind, abi::versions::IoctlKind::EventData, "{v}");
+        }
+    }
+
+    #[test]
+    fn refused_on_a_file_with_no_os_event() {
+        let host = EventHost::default();
+        let mut be = backend_on(&host);
+        let ev_file = open_null(&mut be);
+        let other = open_null(&mut be);
+        host.push((1, 2, 3, 4));
+
+        // Nothing allocated anywhere yet.
+        assert_eq!(status(&get_event(&mut be, ev_file)), -libc::EINVAL);
+        // An OS event on one file does not open another.
+        assert_eq!(status(&alloc_os_event(&mut be, ev_file, ev_file)), 0);
+        assert_eq!(status(&get_event(&mut be, other)), -libc::EINVAL);
+        assert!(host.calls(NV_ESC_RM_GET_EVENT_DATA).is_empty());
+
+        // Freed (on whichever file), it is refused again.
+        let mut resp = vec![0u8; 256];
+        let p = os_event_params(0xc1d0_0001, ev_file as u32);
+        be.dispatch(&msg(other, NV_ESC_FREE_OS_EVENT, &p, &[], &[]), &mut resp);
+        assert_eq!(status(&resp), 0);
+        assert_eq!(status(&get_event(&mut be, ev_file)), -libc::EINVAL);
+        assert!(host.calls(NV_ESC_RM_GET_EVENT_DATA).is_empty());
+    }
+
+    #[test]
+    fn an_os_event_rm_refused_does_not_count() {
+        let host = EventHost::default();
+        host.0.lock().unwrap().alloc_status = 0x1a; // NV_ERR_INSUFFICIENT_RESOURCES
+        let mut be = backend_on(&host);
+        let f = open_null(&mut be);
+        let resp = alloc_os_event(&mut be, f, f);
+        assert_eq!(status(&resp), 0, "the ioctl succeeds, RM's status says no");
+        assert_eq!(status(&get_event(&mut be, f)), -libc::EINVAL);
+        assert!(host.calls(NV_ESC_RM_GET_EVENT_DATA).is_empty());
+    }
+
+    #[test]
+    fn closing_the_file_forgets_its_os_event() {
+        let host = EventHost::default();
+        let mut be = backend_on(&host);
+        let f = open_null(&mut be);
+        alloc_os_event(&mut be, f, f);
+        assert!(be.has_os_event(f));
+        let mut resp = vec![0u8; 64];
+        be.dispatch(&header(MsgType::Close, f), &mut resp);
+        assert_eq!(status(&resp), 0);
+        assert!(!be.has_os_event(f));
+        assert!(be.os_events.is_empty());
+    }
+
+    #[test]
+    fn sizes_are_checked_before_the_host_hears_of_it() {
+        let host = EventHost::default();
+        let mut be = backend_on(&host);
+        let f = open_null(&mut be);
+        alloc_os_event(&mut be, f, f);
+        host.push((1, 2, 3, 4));
+        let mut resp = vec![0u8; 256];
+        let good = nvos41();
+        let cases: &[(&[u8], &[u8], &[u8])] = &[
+            // An older guest module: the bare 16 bytes with the guest's
+            // pointer in them and no buffer. Forwarding it would hand RM a
+            // guest address.
+            (&good, &[], &[]),
+            (&good, &[0u8; 8], &[]),
+            (&good, &[0u8; 32], &[]),
+            (&good, &[0u8; 16], &[0u8; 8]),
+            // The wrong NVOS41: refused by the ABI profile.
+            (&[0u8; 24], &[0u8; 16], &[]),
+            (&[0u8; 8], &[0u8; 16], &[]),
+        ];
+        for (i, (p, n, d)) in cases.iter().enumerate() {
+            resp.fill(0);
+            be.dispatch(&msg(f, NV_ESC_RM_GET_EVENT_DATA, p, n, d), &mut resp);
+            assert_eq!(status(&resp), -libc::EINVAL, "case {i}");
+        }
+        assert!(host.calls(NV_ESC_RM_GET_EVENT_DATA).is_empty());
+    }
+
+    #[test]
+    fn one_event_is_read_through_a_buffer_of_ours() {
+        let host = EventHost::default();
+        let mut be = backend_on(&host);
+        let f = open_null(&mut be);
+        alloc_os_event(&mut be, f, f);
+        host.push((0xcaf0_0042, 7, 0xdead_beef, 0x1234));
+
+        let resp = get_event(&mut be, f);
+        assert_eq!(status(&resp), 0);
+        assert_eq!(lens(&resp), (16, 16, 0));
+        let out = &resp[BODY..];
+        // The caller's pointer comes back as it went in...
+        assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), GUEST_PTR);
+        assert_eq!(word(out, 8), 0, "MoreEvents");
+        assert_eq!(word(out, 12), NV_OK);
+        // ...and the event follows as the nested block.
+        assert_eq!(word(out, 16), 0xcaf0_0042);
+        assert_eq!(word(out, 20), 7);
+        assert_eq!(word(out, 24), 0xdead_beef);
+        assert_eq!(u16::from_le_bytes(out[28..30].try_into().unwrap()), 0x1234);
+
+        // The host saw our descriptor and our buffer, never the guest's.
+        let calls = host.calls(NV_ESC_RM_GET_EVENT_DATA);
+        assert_eq!(calls.len(), 1);
+        let (fd, params) = &calls[0];
+        assert_eq!(*fd, be.handles.get_raw(f).unwrap());
+        let seen = u64::from_le_bytes(params[0..8].try_into().unwrap());
+        assert_ne!(seen, GUEST_PTR);
+        assert_ne!(seen, 0);
+    }
+
+    #[test]
+    fn an_empty_queue_writes_nothing_back() {
+        let host = EventHost::default();
+        let mut be = backend_on(&host);
+        let f = open_null(&mut be);
+        alloc_os_event(&mut be, f, f);
+        let resp = get_event(&mut be, f);
+        assert_eq!(status(&resp), 0, "RM's answer is a status, not an errno");
+        assert_eq!(
+            lens(&resp),
+            (16, 0, 0),
+            "no event block for the guest to copy"
+        );
+        let out = &resp[BODY..];
+        assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), GUEST_PTR);
+        assert_eq!(word(out, 12), NV_ERR_OPERATING_SYSTEM);
+    }
+
+    /// crm_event_drain's loop: read until MoreEvents is clear.
+    #[test]
+    fn more_events_drains_the_queue_in_order() {
+        let host = EventHost::default();
+        let mut be = backend_on(&host);
+        let f = open_null(&mut be);
+        alloc_os_event(&mut be, f, f);
+        for i in 0..3u32 {
+            host.push((0x5c00_0000 + i, i, i * 10, i as u16));
+        }
+        let mut got = Vec::new();
+        loop {
+            let resp = get_event(&mut be, f);
+            assert_eq!(status(&resp), 0);
+            let out = &resp[BODY..];
+            assert_eq!(word(out, 12), NV_OK);
+            got.push((word(out, 16), word(out, 20), word(out, 24)));
+            if word(out, 8) == 0 {
+                break;
+            }
+            assert!(got.len() < 10, "MoreEvents never cleared");
+        }
+        assert_eq!(
+            got,
+            vec![
+                (0x5c00_0000, 0, 0),
+                (0x5c00_0001, 1, 10),
+                (0x5c00_0002, 2, 20)
+            ]
+        );
+        let last = get_event(&mut be, f);
+        assert_eq!(word(&last[BODY..], 12), NV_ERR_OPERATING_SYSTEM);
+    }
+
+    /// The descriptor in ALLOC_OS_EVENT is one of our handles on the wire and
+    /// our own descriptor at RM; the guest reads its handle back. RM handles
+    /// are not translated by this backend, so hObject comes back as RM wrote
+    /// it -- which is the guest's own handle for the object.
+    #[test]
+    fn descriptors_are_translated_and_rm_handles_are_not() {
+        let host = EventHost::default();
+        let mut be = backend_on(&host);
+        let ctl = open_null(&mut be);
+        let ev_file = open_null(&mut be);
+        // Issued on the event file, naming itself, as libnvidia does.
+        let resp = alloc_os_event(&mut be, ev_file, ev_file);
+        assert_eq!(status(&resp), 0);
+        assert_eq!(
+            word(&resp[BODY..], 8),
+            ev_file as u32,
+            "the guest's value comes back"
+        );
+        let alloc = host.calls(NV_ESC_ALLOC_OS_EVENT);
+        let host_fd = be.handles.get_raw(ev_file).unwrap();
+        assert_eq!(alloc[0].0, host_fd);
+        assert_eq!(
+            word(&alloc[0].1, 8),
+            host_fd as u32,
+            "RM sees our descriptor"
+        );
+        assert!(be.has_os_event(ev_file) && !be.has_os_event(ctl));
+
+        host.push((0xc1d0_0007, 3, 0, 0));
+        let resp = get_event(&mut be, ev_file);
+        assert_eq!(word(&resp[BODY..], 16), 0xc1d0_0007);
+        assert_eq!(host.calls(NV_ESC_RM_GET_EVENT_DATA)[0].0, host_fd);
+    }
+}

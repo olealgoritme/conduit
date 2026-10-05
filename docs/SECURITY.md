@@ -50,6 +50,13 @@ None of this can be switched off from the command line.
   USERD isolation switches.
 - **Guest pointers.** No guest address reaches RM. The backend supplies every
   pointer-carrying buffer itself, with size caps per pointer and per call.
+- **Event payloads (`NV_ESC_RM_GET_EVENT_DATA`, 0x52).** Served only on a file
+  that holds an OS event RM accepted (`NV_ESC_ALLOC_OS_EVENT`), until it is
+  freed or the file closed; anywhere else it is refused before the host sees
+  it. It reads one queued notification of the guest's own (object handle,
+  notifier index, `info32`, `info16`) into a 16-byte buffer the backend owns;
+  any other parameter or buffer size is refused, and the guest's `pEvent` is
+  never forwarded.
 - **Host display access (NVKMS filter).** On `/dev/nvidia-modeset` only what
   buffer sharing needs reaches the host display driver: device alloc/free and
   the five surface commands (register, unregister, grant, acquire, release).
