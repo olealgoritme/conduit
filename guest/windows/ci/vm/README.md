@@ -50,9 +50,20 @@ guest/windows/third_party/dxvk guest/windows/third_party/vkd3d-proton`):
 WIN_SSH=user@127.0.0.1 guest/windows/ci/vm/win-build.sh [Release|Debug]
 ```
 
+`WIN_SSH` has no default; without it the script stops and says how to set
+it. To not type it every time, put it (and any other variable below) in
+`~/.config/conduit/win-build.env` (`$XDG_CONFIG_HOME/conduit/win-build.env`;
+`WIN_BUILD_ENV` names another file), as shell assignments; the environment
+wins over the file:
+
+```sh
+mkdir -p ~/.config/conduit
+echo "WIN_SSH='user@127.0.0.1'" >> ~/.config/conduit/win-build.env
+```
+
 | Variable | Default | |
 |---|---|---|
-| `WIN_SSH` | `Ole Algoritme@127.0.0.1` | SSH destination; set it to your VM user |
+| `WIN_SSH` | none (required) | SSH destination: your user in the VM, e.g. `user@127.0.0.1` (quote a user name with spaces) |
 | `WIN_PORT` | `2222` | SSH port |
 | `WIN_ROOT` | `W:` | build drive, without a trailing backslash |
 | `OUT` | `dist/windows-driver/<Configuration>` | where the package lands on the host |
@@ -91,8 +102,8 @@ ICD, Zink, the loaders and the installer come from the full package
 (`windows.yml`, `HeliosSetup.exe`; see `packaging/windows/README.md`), which
 a Windows guest needs once; this package then replaces the driver.
 
-In the Windows guest (Secure Boot off), from an administrator prompt, with
-the package copied in:
+`win-build.sh` ends by pointing here. In the Windows guest (Secure Boot
+off), from an administrator prompt, with the package copied in:
 
 ```bat
 bcdedit /set testsigning on

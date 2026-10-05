@@ -43,8 +43,9 @@ $started = Get-Date
 # Sign as Assemble-Package.ps1 does in CI, with the development certificate
 # (tools/sign-helios-development.ps1 makes it once and reuses it): the SYS
 # and the four UMDs, then a fresh catalog over their final bytes, then the
-# catalog. The certificate is copied into the package for install.cmd to
-# trust; it goes to its own directory first, as the script needs.
+# catalog. The certificate is copied into the package so the guest can trust
+# it (ci/vm/README.md, "Installing the package"); it goes to its own
+# directory first, as the script needs.
 . (Join-Path $repo "ci\windows\Initialize-HeliosBuild.ps1")
 $kitBin = Split-Path -Parent (Find-WindowsKitTool "signtool.exe")
 $env:PATH = "$kitBin;$env:PATH"

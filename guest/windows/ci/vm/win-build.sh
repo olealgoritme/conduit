@@ -7,18 +7,43 @@
 #   guest/windows/ci/vm/win-build.sh [Release|Debug]
 #
 # The VM must have been set up once with ci/vm/Setup-BuildVm.ps1.
-# Environment: WIN_SSH (default "Ole Algoritme@127.0.0.1"), WIN_PORT (2222),
-# WIN_ROOT (W:), OUT (dist/windows-driver/<Configuration> in the checkout),
-# WIN_SRC (another checkout or worktree whose guest/windows to build; the
-# build scripts in ci/vm still come from this one).
+# Settings, from the environment or else from
+# ${XDG_CONFIG_HOME:-~/.config}/conduit/win-build.env (shell assignments,
+# e.g. WIN_SSH='me@127.0.0.1'; WIN_BUILD_ENV names another file):
+# WIN_SSH (required: the VM's SSH destination), WIN_PORT (2222), WIN_ROOT
+# (W:), OUT (dist/windows-driver/<Configuration> in the checkout), WIN_SRC
+# (another checkout or worktree whose guest/windows to build; the build
+# scripts in ci/vm still come from this one), CLEAN (0).
 set -euo pipefail
 config=${1:-Release}
 case "$config" in Release|Debug) ;; *) echo "usage: $0 [Release|Debug]" >&2; exit 2 ;; esac
+
+conf=${WIN_BUILD_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/conduit/win-build.env}
+if [ -f "$conf" ]; then
+    # What the environment sets wins over the file.
+    declare -A from_env=()
+    for k in WIN_SSH WIN_PORT WIN_ROOT OUT WIN_SRC CLEAN; do
+        if [ -n "${!k+x}" ]; then from_env[$k]=${!k}; fi
+    done
+    # shellcheck source=/dev/null
+    . "$conf"
+    for k in "${!from_env[@]}"; do printf -v "$k" '%s' "${from_env[$k]}"; done
+fi
+if [ -z "${WIN_SSH:-}" ]; then
+    cat >&2 <<EOF
+WIN_SSH is not set: the build VM's SSH destination (USER@HOST, your user in
+the VM). Set it in the environment or in $conf, e.g.:
+  mkdir -p "$(dirname "$conf")" && echo "WIN_SSH='you@127.0.0.1'" >> "$conf"
+See guest/windows/ci/vm/README.md.
+EOF
+    exit 2
+fi
+
 here="$(cd "$(dirname "$0")" && pwd)"
 self="$(cd "$here/../../../.." && pwd)"
 repo="$(cd "${WIN_SRC:-$self}" && pwd)"
 win="$repo/guest/windows"
-ssh_to=${WIN_SSH:-Ole Algoritme@127.0.0.1}
+ssh_to=$WIN_SSH
 port=${WIN_PORT:-2222}
 # No trailing backslash: Windows' command line would read "W:\"" as an
 # escaped quote. Build-InVm.ps1 adds the backslash itself.
@@ -81,4 +106,5 @@ echo "==> copying the package to $out"
 rm -rf "$out"; mkdir -p "$out"
 ssh_win "tar -cf - -C $root\\out\\$config ." | tar -xf - -C "$out"
 ls "$out"
-echo "Done: $out (install it in the VM with the Install-Helios.ps1 / install.cmd on the driver CD)"
+echo "Done: $out"
+echo "Install it in the Windows guest with pnputil: guest/windows/ci/vm/README.md, \"Installing the package\"."
