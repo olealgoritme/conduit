@@ -9,7 +9,8 @@
 # <Root>\out\<Configuration>.
 param(
     [ValidateSet("Debug", "Release")][string]$Configuration = "Release",
-    [string]$Root = "W:\"
+    [string]$Root = "W:\",
+    [switch]$Clean
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -33,6 +34,9 @@ if (-not (Test-Path (Join-Path $repo "ci\windows\Build-Driver.ps1"))) {
 }
 if (Test-Path $out) { Remove-Item -LiteralPath $out -Recurse -Force }
 
+# Reuse the configured DXVK/vkd3d trees between local builds (see
+# Build-Driver.ps1); -Clean starts from scratch as CI does.
+if (-not $Clean) { $env:HELIOS_KEEP_ENGINE_BUILDS = "1" }
 $started = Get-Date
 & (Join-Path $repo "ci\windows\Build-Driver.ps1") -RepoRoot $repo -OutputDir $out `
     -Configuration $Configuration -BuildRoot (Join-Path $Root "helios-build")

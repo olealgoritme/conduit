@@ -167,6 +167,7 @@ extern struct kset *module_kset;
 #define NV_ESC_RM_CONTROL 0x2a
 #define NV_ESC_RM_ALLOC 0x2b
 #define NV_ESC_RM_VID_HEAP_CONTROL 0x4a
+#define NV_ESC_RM_GET_EVENT_DATA 0x52
 /* nv-ioctl-numbers.h: NV_IOCTL_MAGIC 'F', NV_IOCTL_BASE 200. */
 #define NV_IOCTL_MAGIC 'F'
 #define NV_ESC_CARD_INFO (200 + 0)
@@ -439,6 +440,19 @@ struct NVOS64_PARAMETERS {
 
 static_assert(sizeof(struct NVOS64_PARAMETERS) == 48,
               "RM_ALLOC parameter struct must match the host driver ABI");
+
+/* NV_ESC_RM_GET_EVENT_DATA (nvos.h): RM copies one NvUnixEvent -- hObject,
+ * NotifyIndex, info32, info16 -- to pEvent. */
+struct NVOS41_PARAMETERS {
+  __le64 pEvent;
+  __le32 MoreEvents;
+  __le32 status;
+};
+
+#define NVGPU_NV_UNIX_EVENT_SIZE 16
+
+static_assert(sizeof(struct NVOS41_PARAMETERS) == 16,
+              "GET_EVENT_DATA parameter struct must match the host driver ABI");
 
 /* ───────── Driver state ───────── */
 
@@ -2770,6 +2784,79 @@ out:
 }
 
 /*
+ * nvgpu_ioctl_get_event_data -- NV_ESC_RM_GET_EVENT_DATA, on the file an OS
+ * event was allocated on.
+ *
+ * NVOS41 carries a pointer, pEvent, to the 16-byte NvUnixEvent RM fills in. A
+ * guest address means nothing to the backend, so the buffer travels as the
+ * nested block, as pAllocParms does for RM_ALLOC: zeroes on the way out (RM
+ * only writes it), and on the way back the backend returns it only when RM
+ * wrote an event. Then, and only then, it is copied to the caller's pEvent --
+ * RM leaves that memory alone when the queue is empty, and so does this.
+ */
+static long nvgpu_ioctl_get_event_data(struct nvgpu_fd *nfd, unsigned int cmd,
+                                       void __user *uarg, unsigned int sz) {
+  struct NVOS41_PARAMETERS params;
+  struct nvgpu_ioctl_req *req;
+  struct nvgpu_ioctl_resp *resp;
+  void *req_buf = NULL, *resp_buf = NULL;
+  void __user *user_event;
+  int req_total, resp_max, ret;
+
+  /* RM's own rule (osapi.c rm_ioctl): exactly sizeof(NVOS41_PARAMETERS). */
+  if (sz != sizeof(params))
+    return -EINVAL;
+  if (copy_from_user(&params, uarg, sizeof(params)))
+    return -EFAULT;
+  user_event = (void __user *)(unsigned long)le64_to_cpu(params.pEvent);
+
+  req_total = sizeof(*req) + sizeof(params) + NVGPU_NV_UNIX_EVENT_SIZE;
+  resp_max = sizeof(*resp) + sizeof(params) + NVGPU_NV_UNIX_EVENT_SIZE;
+  req_buf = kzalloc(req_total, GFP_KERNEL);
+  resp_buf = kzalloc(resp_max, GFP_KERNEL);
+  if (!req_buf || !resp_buf) {
+    ret = -ENOMEM;
+    goto out;
+  }
+
+  req = (struct nvgpu_ioctl_req *)req_buf;
+  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
+  req->hdr.handle = cpu_to_le32(nfd->handle);
+  req->cmd = cpu_to_le32(cmd);
+  req->data_len = cpu_to_le32(sizeof(params));
+  req->nested_offset = cpu_to_le32(sizeof(params));
+  req->nested_len = cpu_to_le32(NVGPU_NV_UNIX_EVENT_SIZE);
+  memcpy(req_buf + sizeof(*req), &params, sizeof(params));
+
+  ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
+  if (ret < 0)
+    goto out;
+
+  resp = (struct nvgpu_ioctl_resp *)resp_buf;
+  ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
+  if (ret != 0)
+    goto out;
+  if (le32_to_cpu(resp->data_len) != sizeof(params)) {
+    ret = -EIO;
+    goto out;
+  }
+
+  if (le32_to_cpu(resp->nested_len) == NVGPU_NV_UNIX_EVENT_SIZE &&
+      copy_to_user(user_event, resp_buf + sizeof(*resp) + sizeof(params),
+                   NVGPU_NV_UNIX_EVENT_SIZE)) {
+    ret = -EFAULT;
+    goto out;
+  }
+  if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(params)))
+    ret = -EFAULT;
+
+out:
+  kfree(req_buf);
+  kfree(resp_buf);
+  return ret;
+}
+
+/*
  * NOTE: The only subtlety worth noting: copy_to_user on the way back writes the
  * VMM handle value (not a host fd number) back into the guest's buffer. That's
  * fine — nvidia-smi doesn't read the payload back after REGISTER_FD, it only
@@ -3410,6 +3497,8 @@ static long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
     return nvgpu_ioctl_rm_control(nfd, cmd, uarg, sz);
   case NV_ESC_RM_ALLOC:
     return nvgpu_ioctl_rm_alloc(nfd, cmd, uarg, sz);
+  case NV_ESC_RM_GET_EVENT_DATA:
+    return nvgpu_ioctl_get_event_data(nfd, cmd, uarg, sz);
   case NV_ESC_RM_FREE:
     /* Whatever RM makes of it, the object is not ours to hold pages for
      * any longer. NVOS00: hRoot at 0, hObjectOld at 8. */

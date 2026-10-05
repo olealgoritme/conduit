@@ -262,6 +262,11 @@ pub struct NvidiaBackend {
     /// release with no flag to forbid it. The host file is initialised by the
     /// time the answer comes back, so the refusal attaches to the handle.
     uvm_denied: std::collections::HashSet<u64>,
+    /// Files with an OS event allocated on them (`NV_ESC_ALLOC_OS_EVENT`
+    /// that RM accepted), by handle, each with the (client, fd) pairs RM
+    /// holds. `NV_ESC_RM_GET_EVENT_DATA` is served only on these. See
+    /// `os_event.rs`.
+    os_events: std::collections::HashMap<u64, std::collections::HashSet<(u32, u32)>>,
     /// Controls and classes refused by the RM allowlist, by what was asked
     /// for and why. Reported at teardown.
     ///
@@ -440,6 +445,7 @@ impl NvidiaBackend {
             registrations_served: 0,
             registrations_peak: 0,
             uvm_denied: std::collections::HashSet::new(),
+            os_events: std::collections::HashMap::new(),
             allow_refused: std::collections::BTreeMap::new(),
             abi_refused: std::collections::BTreeMap::new(),
             rm_classes: std::collections::BTreeMap::new(),
@@ -1097,6 +1103,7 @@ pub use host::{HostDriver, RealHost};
 mod ioctl;
 mod nested;
 mod open;
+mod os_event;
 mod osdesc;
 mod resp;
 mod rm_fd;

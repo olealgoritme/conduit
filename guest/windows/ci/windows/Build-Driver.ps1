@@ -52,8 +52,17 @@ foreach ($architecture in @("x64", "x86")) {
     $nativeFile = Join-Path $RepoRoot "ci\windows\$nativeName"
     $dxvkBuild = Join-Path $BuildRoot "$Configuration\dxvk-$architecture"
     $vkd3dBuild = Join-Path $BuildRoot "$Configuration\vkd3d-$architecture"
+    # CI starts clean. A local build VM (ci/vm/Build-InVm.ps1) sets
+    # HELIOS_KEEP_ENGINE_BUILDS=1 to reuse configured engine trees, so a
+    # driver-only change does not rebuild DXVK and vkd3d; ninja still
+    # rebuilds whatever changed in them.
+    $keepEngines = $env:HELIOS_KEEP_ENGINE_BUILDS -eq "1"
     foreach ($directory in @($dxvkBuild, $vkd3dBuild)) {
-        if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force }
+        $configured = Test-Path -LiteralPath (Join-Path $directory "build.ninja")
+        if (Test-Path -LiteralPath $directory) {
+            if ($keepEngines -and $configured) { continue }
+            Remove-Item -LiteralPath $directory -Recurse -Force
+        }
     }
     $dxvkCppArgs = @(
         "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
@@ -64,22 +73,26 @@ foreach ($architecture in @("x64", "x86")) {
         "-Wno-c++20-extensions"
         "-Wno-unused-const-variable"
     ) -join " "
+    if (-not (Test-Path -LiteralPath (Join-Path $dxvkBuild "build.ninja"))) {
     & meson.exe setup $dxvkBuild $dxvkSource `
         --native-file $nativeFile --buildtype $mesonBuildType -Db_vscrt=mt `
         "-Dcpp_args=$dxvkCppArgs" "-Dc_args=/FI$compatHeader" `
         -Denable_d3d8=false -Denable_d3d9=false -Denable_d3d10=false `
         -Denable_d3d11=true -Denable_dxgi=true
     if ($LASTEXITCODE -ne 0) { throw "DXVK $architecture meson setup failed with exit code $LASTEXITCODE." }
+    }
     & meson.exe compile -C $dxvkBuild
     if ($LASTEXITCODE -ne 0) { throw "DXVK $architecture build failed with exit code $LASTEXITCODE." }
 
     # Static CRT for BOTH engines, so no VC++ redistributable is needed on the
     # target: DXVK and vkd3d are /MT, and the umd/umd12 crates are crt-static.
     # clang-cl uses the MSVC ABI; MinGW archives cannot be linked here.
+    if (-not (Test-Path -LiteralPath (Join-Path $vkd3dBuild "build.ninja"))) {
     & meson.exe setup $vkd3dBuild $vkd3dSource `
         --native-file $nativeFile --buildtype $mesonBuildType -Db_vscrt=mt `
         -Denable_tests=false "-Dc_args=-Wno-error=incompatible-pointer-types"
     if ($LASTEXITCODE -ne 0) { throw "vkd3d $architecture meson setup failed with exit code $LASTEXITCODE." }
+    }
     & meson.exe compile -C $vkd3dBuild helios_d3d12_static
     if ($LASTEXITCODE -ne 0) { throw "vkd3d $architecture static engine build failed with exit code $LASTEXITCODE." }
     $engineBuilds[$architecture] = @{ dxvk = $dxvkBuild; vkd3d = $vkd3dBuild }
