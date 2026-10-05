@@ -85,6 +85,7 @@ Fence rules, which follow virglrenderer:
 | Command | Host action |
 |---|---|
 | `GET_DISPLAY_INFO` | one scanout, from the config display size; enabled iff a display is configured |
+| `GET_EDID` | scanout 0's EDID for the configured `--display WxH@HZ` (below): `RESP_OK_EDID` with `size` 256 and the rest of the 1024-byte `edid` zero; another scanout `RESP_ERR_INVALID_SCANOUT_ID`; no display configured `RESP_ERR_UNSPEC`. Served without `VIRTIO_GPU_F_EDID`: the guest just sends it and uses its own EDID on any error |
 | `GET_CAPSET_INFO` | index 0 → `VIRTIO_GPU_CAPSET_VENUS` (4); other indices `RESP_ERR_INVALID_PARAMETER` |
 | `GET_CAPSET` | Venus capset from the renderer |
 | `CTX_CREATE` | context with `context_init` capset Venus only |
@@ -97,6 +98,47 @@ Fence rules, which follow virglrenderer:
 | `RESOURCE_UNREF` | unmapped if mapped, then freed |
 | `SET_SCANOUT_BLOB` | records scanout 0's resource, size, format, stride, offset, and the modifier its blob's size implies (below); resource 0 turns the scanout off (`ScanoutDisable` to the viewer); a format with no DRM fourcc is `RESP_ERR_INVALID_PARAMETER`, a scanout other than 0 `RESP_ERR_INVALID_SCANOUT_ID` |
 | `RESOURCE_FLUSH` | renderer exports the scanout resource as a dma-buf with the guest's layout (cached per resource and layout), sent to the viewer as a frame |
+
+**EDID.** `GET_EDID` (`0x010a`: header, `scanout_id`, padding) is answered
+with `RESP_OK_EDID` (`0x1104`): header, `size` = 256, padding, then
+`edid[1024]`, zero after the first 256 bytes; 16 + 1056 bytes with the
+`MsgHeader`. The 256 bytes (`host/backend/device/src/venus/edid.rs`) are:
+
+- an EDID 1.4 base block: manufacturer `CDT`, product 1, made 2026, digital
+  8 bpc, size unknown, sRGB, the monitor name `Conduit` (`0x0A`, then
+  spaces), two dummy descriptors, one extension. Its first detailed timing
+  is the configured mode if a detailed timing can hold it (each side at most
+  4095, clock at most 655.35 MHz; a vertical front porch over 63 lines gives
+  the rest to the back porch), and the preferred-is-native feature bit is
+  then set. Otherwise it is a stand-in: the size halved until it fits,
+  keeping the aspect ratio, then the refresh lowered a hertz at a time until
+  the clock fits (5120×1440@240 → 2560×720@240, 3840×2160@144 →
+  3840×2160@74, 7680×4320@60 → 3840×2160@60);
+- a DisplayID 2.0 extension (tag `0x70`, version `0x20`, primary use
+  "generic display") with Product Identification (`0x20`, no OUI), Display
+  Parameters (`0x21`, native size = the configured one), one Type VII
+  detailed timing (`0x22`, revision 0) with the configured mode, marked
+  preferred, and Display Interface Features (`0x26`, RGB 8 bpc, sRGB).
+
+The Type VII descriptor is 20 bytes, little-endian, every field stored as
+its value minus one (Linux `drm_mode_displayid_detailed`, edid-decode
+`parse_displayid_type_1_7_timing`): 0–2 pixel clock in kHz; 3 options (bit 7
+preferred, 6:5 stereo, 4 interlaced, 3:0 aspect: 0 1:1, 1 5:4, 2 4:3, 3 15:9,
+4 16:9, 5 16:10, 6 64:27, 7 256:135, 8 other); 4–5 H active; 6–7 H blank;
+8–9 H front porch (bit 15: H sync positive); 10–11 H sync width; 12–13 V
+active; 14–15 V blank; 16–17 V front porch (bit 15: V sync positive); 18–19
+V sync width.
+
+Every timing is CVT reduced blanking v2: H blank 80 (front porch 8, sync 32,
+back porch 40, sync positive); V sync 8, back porch 6 (sync negative), and
+`V blank = max(floor(460 µs / ((1/HZ − 460 µs) / H)) + 1, 15)` lines, so the
+blanking is at least 460 µs; clock = `(W + 80) × (H + V blank) × HZ`,
+rounded down to a kHz (the refresh comes out a hair under `HZ`).
+5120×1440@240 is 5200 × 1619 at 2020.512 MHz. With no refresh known, 60.
+A sample and `edid-decode --check`'s reading of it (PASS; the one warning is
+the zero OUI) are in `host/backend/device/src/venus/testdata/`. (edid-decode
+releases from 2023 print the Display Parameters' 8 bpc as 10 bpc; later
+ones read it correctly.)
 
 **Scanout layout.** The dma-buf the viewer gets is described entirely by the
 guest's `SET_SCANOUT_BLOB`: `width`, `height`, `strides[0]`, `offsets[0]`, and

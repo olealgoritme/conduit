@@ -5,8 +5,9 @@
 // Layout: `MsgHeader{msg_type = GpuCmd}` | one virtio-gpu command, exactly as
 // VIRTIO 1.3 §5.7.6 lays it out. The reply is `MsgHeader` | one virtio-gpu
 // response. Only the commands a Venus guest sends (Helios's KMD) are defined
-// here; the rest of virtio-gpu (2D resources, transfers, cursor queue, EDID)
-// is never served.
+// here; the rest of virtio-gpu (2D resources, transfers, cursor queue) is
+// never served. `GET_EDID` is served although no `VIRTIO_GPU_F_EDID` is
+// negotiated: the guest sends it and falls back on any error.
 //
 // Every value is the spec's, checked against Linux's
 // include/uapi/linux/virtio_gpu.h, which is what Mesa and the Windows KMD
@@ -28,6 +29,7 @@ pub const CMD_RESOURCE_UNREF: u32 = 0x0102;
 pub const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 pub const CMD_GET_CAPSET_INFO: u32 = 0x0108;
 pub const CMD_GET_CAPSET: u32 = 0x0109;
+pub const CMD_GET_EDID: u32 = 0x010a;
 pub const CMD_RESOURCE_CREATE_BLOB: u32 = 0x010c;
 pub const CMD_SET_SCANOUT_BLOB: u32 = 0x010d;
 
@@ -45,6 +47,7 @@ pub const RESP_OK_NODATA: u32 = 0x1100;
 pub const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 pub const RESP_OK_CAPSET_INFO: u32 = 0x1102;
 pub const RESP_OK_CAPSET: u32 = 0x1103;
+pub const RESP_OK_EDID: u32 = 0x1104;
 pub const RESP_OK_MAP_INFO: u32 = 0x1106;
 
 /// Error responses.
@@ -442,6 +445,38 @@ impl CtxCreate {
     }
 }
 
+/// `struct virtio_gpu_cmd_get_edid`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GetEdid {
+    pub hdr: CtrlHdr,
+    pub scanout: u32,
+    pub padding: u32,
+}
+
+impl GetEdid {
+    pub const LEN: usize = 32;
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < Self::LEN {
+            return None;
+        }
+        Some(Self {
+            hdr: CtrlHdr::from_bytes(b)?,
+            scanout: w(b, 24),
+            padding: w(b, 28),
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut o = [0u8; Self::LEN];
+        o[..CTRL_HDR_LEN].copy_from_slice(&self.hdr.to_bytes());
+        put_w(&mut o, 24, self.scanout);
+        put_w(&mut o, 28, self.padding);
+        o
+    }
+}
+
 /// `CTX_DESTROY` is a bare header.
 pub const CTX_DESTROY_LEN: usize = CTRL_HDR_LEN;
 /// `GET_DISPLAY_INFO` is a bare header.
@@ -728,6 +763,57 @@ impl RespCapsetInfo {
 /// `struct virtio_gpu_resp_capset` is a header and the capset's bytes.
 pub const RESP_CAPSET_HEAD: usize = CTRL_HDR_LEN;
 
+/// `struct virtio_gpu_resp_edid`: `size` bytes of EDID, the rest of the
+/// 1024 zero.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RespEdid {
+    pub hdr: CtrlHdr,
+    pub size: u32,
+    pub padding: u32,
+    pub edid: [u8; RespEdid::EDID_MAX],
+}
+
+impl Default for RespEdid {
+    fn default() -> Self {
+        Self {
+            hdr: CtrlHdr::default(),
+            size: 0,
+            padding: 0,
+            edid: [0; Self::EDID_MAX],
+        }
+    }
+}
+
+impl RespEdid {
+    /// The `edid` array.
+    pub const EDID_MAX: usize = 1024;
+    pub const LEN: usize = CTRL_HDR_LEN + 8 + Self::EDID_MAX;
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < Self::LEN {
+            return None;
+        }
+        let mut edid = [0u8; Self::EDID_MAX];
+        edid.copy_from_slice(&b[32..Self::LEN]);
+        Some(Self {
+            hdr: CtrlHdr::from_bytes(b)?,
+            size: w(b, 24),
+            padding: w(b, 28),
+            edid,
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut o = [0u8; Self::LEN];
+        o[..CTRL_HDR_LEN].copy_from_slice(&self.hdr.to_bytes());
+        put_w(&mut o, 24, self.size);
+        put_w(&mut o, 28, self.padding);
+        o[32..].copy_from_slice(&self.edid);
+        o
+    }
+}
+
 /// `struct virtio_gpu_resp_map_info`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -778,6 +864,9 @@ const _: () = {
     assert!(size_of::<RespDisplayInfo>() == 408);
     assert!(size_of::<RespCapsetInfo>() == RespCapsetInfo::LEN);
     assert!(size_of::<RespMapInfo>() == RespMapInfo::LEN);
+    assert!(size_of::<GetEdid>() == GetEdid::LEN);
+    assert!(size_of::<RespEdid>() == RespEdid::LEN);
+    assert!(size_of::<RespEdid>() == 1056);
 };
 
 #[cfg(test)]
@@ -794,6 +883,7 @@ mod tests {
         assert_eq!(CMD_RESOURCE_FLUSH, 260);
         assert_eq!(CMD_GET_CAPSET_INFO, 264);
         assert_eq!(CMD_GET_CAPSET, 265);
+        assert_eq!(CMD_GET_EDID, 266);
         assert_eq!(CMD_RESOURCE_CREATE_BLOB, 268);
         assert_eq!(CMD_SET_SCANOUT_BLOB, 269);
         assert_eq!(CMD_CTX_CREATE, 512);
@@ -807,6 +897,7 @@ mod tests {
         assert_eq!(RESP_OK_DISPLAY_INFO, 4353);
         assert_eq!(RESP_OK_CAPSET_INFO, 4354);
         assert_eq!(RESP_OK_CAPSET, 4355);
+        assert_eq!(RESP_OK_EDID, 4356);
         assert_eq!(RESP_OK_MAP_INFO, 4358);
         assert_eq!(RESP_ERR_UNSPEC, 4608);
         assert_eq!(RESP_ERR_INVALID_SCANOUT_ID, 4610);
@@ -1029,6 +1120,22 @@ mod tests {
         };
         di.pmodes[15].flags = 0xabcd;
         round_trip!(RespDisplayInfo, di);
+        round_trip!(
+            GetEdid,
+            GetEdid {
+                hdr,
+                scanout: 3,
+                padding: 0
+            }
+        );
+        let mut e = RespEdid {
+            hdr,
+            size: 256,
+            ..Default::default()
+        };
+        e.edid[1] = 0xff;
+        e.edid[1023] = 0x5a;
+        round_trip!(RespEdid, e);
     }
 
     /// Field offsets the kernel's structs have.
@@ -1047,6 +1154,9 @@ mod tests {
         assert_eq!(offset_of!(CtxCreate, debug_name), 32);
         assert_eq!(offset_of!(RespCapsetInfo, capset_max_size), 32);
         assert_eq!(offset_of!(RespMapInfo, map_info), 24);
+        assert_eq!(offset_of!(GetEdid, scanout), 24);
+        assert_eq!(offset_of!(RespEdid, size), 24);
+        assert_eq!(offset_of!(RespEdid, edid), 32);
     }
 
     #[test]

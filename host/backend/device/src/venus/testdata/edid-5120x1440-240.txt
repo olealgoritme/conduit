@@ -1,0 +1,102 @@
+edid-decode (hex):
+
+00 ff ff ff ff ff ff 00 0c 94 01 00 00 00 00 00
+00 24 01 04 a0 00 00 78 04 ee 91 a3 54 4c 99 26
+0f 50 54 00 00 00 01 01 01 01 01 01 01 01 01 01
+01 01 01 01 01 01 79 c8 00 50 a0 d0 5a 20 08 20
+f8 0c 00 00 00 00 00 1a 00 00 00 fc 00 43 6f 6e
+64 75 69 74 0a 20 20 20 20 20 00 00 00 10 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 10
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 7e
+
+70 20 59 02 00 20 00 13 00 00 00 01 00 00 00 00
+00 00 1a 07 43 6f 6e 64 75 69 74 21 00 1d 00 00
+00 00 00 14 a0 05 80 3d 8a 54 cd a4 99 66 62 0f
+01 45 54 00 80 00 80 00 80 02 78 22 00 14 9f d4
+1e 88 ff 13 4f 00 07 80 1f 00 9f 05 b2 00 a4 00
+07 00 26 00 09 02 00 00 00 00 00 01 00 00 ca 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 90
+
+----------------
+
+Block 0, Base EDID:
+  EDID Structure Version & Revision: 1.4
+  Vendor & Product Identification:
+    Manufacturer: CDT
+    Model: 1
+    Made in: 2026
+  Basic Display Parameters & Features:
+    Digital display
+    Bits per primary color channel: 8
+    Digital interface is not defined
+    Image size is variable
+    Gamma: 2.20
+    Supported color formats: RGB 4:4:4
+    Default (sRGB) color space is primary color space
+    First detailed timing does not include the native pixel format and preferred refresh rate
+  Color Characteristics:
+    Red  : 0.6396, 0.3300
+    Green: 0.2998, 0.5996
+    Blue : 0.1503, 0.0595
+    White: 0.3125, 0.3291
+  Established Timings I & II: none
+  Standard Timings: none
+  Detailed Timing Descriptors:
+    DTD 1:  2560x720   239.997194 Hz  32:9    194.398 kHz    513.210000 MHz
+                 Hfront    8 Hsync  32 Hback   40 Hpol P
+                 Vfront   63 Vsync   8 Vback   19 Vpol N
+    Display Product Name: 'Conduit'
+    Dummy Descriptor:
+    Dummy Descriptor:
+  Extension blocks: 1
+Checksum: 0x7e
+
+----------------
+
+Block 1, DisplayID Extension Block:
+  Version: 2.0
+  Extension Count: 0
+  Display Product Primary Use Case: None of the listed primary use cases; generic display
+  Product Identification Data Block (0x20), OUI 00-00-00:
+    Product Code: 1
+    Year of Manufacture: 2026
+    Product ID: Conduit
+  Display Parameters Data Block (0x21):
+    Image size: 0.0 mm x 0.0 mm
+    Display native pixel format: 5120x1440
+    Scan Orientation: Left to Right, Top to Bottom
+    Luminance Information: Minimum guaranteed value
+    Color Information: CIE 1931
+    Audio Speaker Information: not integrated
+    Native Color Chromaticity:
+      Primary #1:  (0.639893, 0.330078)
+      Primary #2:  (0.300049, 0.600098)
+      Primary #3:  (0.149902, 0.060059)
+      White Point: (0.312744, 0.329102)
+    Native Maximum Luminance (Full Coverage): do not use
+    Native Maximum Luminance (10% Rectangular Coverage): do not use
+    Native Minimum Luminance: do not use
+    Native Color Depth: 10 bpc
+    Display Device Technology: Not Specified
+    Native Gamma EOTF: 2.20
+  Video Timing Modes Type 7 - Detailed Timings Data Block:
+    DTD:  5120x1440  240.000000 Hz   0:0    388.560 kHz   2020.512000 MHz (aspect undefined, no 3D stereo, preferred)
+               Hfront    8 Hsync  32 Hback   40 Hpol P
+               Vfront  165 Vsync   8 Vback    6 Vpol N
+  Display Interface Features Data Block:
+    Supported bpc for RGB encoding: 8
+    Supported color space and EOTF standard combination 1: sRGB
+  Checksum: 0xca
+Checksum: 0x90
+
+----------------
+
+edid-decode SHA: cb74358c2896 2023-12-07 20:32:06
+
+Warnings:
+
+Block 1, DisplayID Extension Block:
+  Product Identification Data Block (0x20), OUI 00-00-00: Unknown OUI 00-00-00.
+
+EDID conformity: PASS

@@ -9,8 +9,8 @@
 //! without overlapping another. The renderer never sees a guest's id that
 //! this side has not seen created.
 //!
-//! `mod.rs` holds the state and the dispatch; contexts and capsets are in
-//! `cmd.rs`, blobs and region 3 in `blob.rs`, fences in `fence.rs` and the
+//! `mod.rs` holds the state and the dispatch; display info, the EDID,
+//! contexts and capsets are in `cmd.rs` (the EDID's bytes in `edid.rs`), blobs and region 3 in `blob.rs`, fences in `fence.rs` and the
 //! scanout in `scanout.rs`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -20,11 +20,12 @@ use conduit_venus::Renderer;
 use protocol::messages::{MsgHeader, MsgType};
 use protocol::venus::*;
 
-use crate::display::DisplayLink;
+use crate::display::{DisplayLink, DisplayMode};
 use crate::shm::WindowPlacer;
 
 mod blob;
 mod cmd;
+pub mod edid;
 mod fence;
 mod scanout;
 #[cfg(test)]
@@ -95,8 +96,9 @@ pub struct Venus {
     renderer: Box<dyn Renderer>,
     /// Size of region 3.
     hostmem_len: u64,
-    /// The configured display, for `GET_DISPLAY_INFO`; `None` without one.
-    display: Option<(u32, u32)>,
+    /// The configured display, for `GET_DISPLAY_INFO` and `GET_EDID`;
+    /// `None` without one.
+    display: Option<DisplayMode>,
     contexts: HashSet<u32>,
     resources: HashMap<u32, Resource>,
     /// What is placed in region 3.
@@ -117,8 +119,20 @@ pub struct Venus {
 
 impl Venus {
     /// A Venus device over `renderer`, with a region 3 of `hostmem_len` bytes
-    /// and the display of `display` (width, height), if any.
-    pub fn new(renderer: Box<dyn Renderer>, hostmem_len: u64, display: Option<(u32, u32)>) -> Self {
+    /// and the display of `display`, if any. A refresh of 0 is taken as
+    /// [`edid::DEFAULT_REFRESH_HZ`].
+    pub fn new(
+        renderer: Box<dyn Renderer>,
+        hostmem_len: u64,
+        display: Option<DisplayMode>,
+    ) -> Self {
+        let display = display.map(|d| DisplayMode {
+            refresh_hz: match d.refresh_hz {
+                0 => edid::DEFAULT_REFRESH_HZ,
+                hz => hz,
+            },
+            ..d
+        });
         Self {
             renderer,
             hostmem_len,
@@ -284,6 +298,11 @@ impl Venus {
                 exact(GET_DISPLAY_INFO_LEN)?;
                 self.count("get_display_info");
                 Ok(self.display_info())
+            }
+            CMD_GET_EDID => {
+                exact(GetEdid::LEN)?;
+                self.count("get_edid");
+                self.edid(&GetEdid::from_bytes(b).expect("length checked"))
             }
             CMD_GET_CAPSET_INFO => {
                 exact(GetCapsetInfo::LEN)?;

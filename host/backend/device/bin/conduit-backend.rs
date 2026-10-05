@@ -1060,7 +1060,11 @@ impl NvGpuBackend {
     #[cfg(feature = "venus")]
     fn enable_venus(&mut self, renderer: Box<dyn conduit_venus::Renderer>, hostmem_len: u64) {
         let display = ({ self.config.features } & protocol::messages::NVGPU_CFG_DISPLAY != 0)
-            .then_some((self.config.display_width, self.config.display_height));
+            .then_some(device::display::DisplayMode {
+                width: self.config.display_width,
+                height: self.config.display_height,
+                refresh_hz: self.config.display_refresh_hz,
+            });
         self.config.set_venus();
         self.nvidia
             .lock()

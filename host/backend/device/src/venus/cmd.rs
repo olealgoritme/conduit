@@ -1,4 +1,4 @@
-//! Display info, capsets, contexts and command submission.
+//! Display info, the EDID, capsets, contexts and command submission.
 
 use super::*;
 
@@ -7,13 +7,13 @@ impl Venus {
     /// display. The other fifteen are off.
     pub(super) fn display_info(&self) -> Reply {
         let mut info = RespDisplayInfo::default();
-        if let Some((width, height)) = self.display {
+        if let Some(d) = self.display {
             info.pmodes[0] = DisplayOne {
                 r: Rect {
                     x: 0,
                     y: 0,
-                    width,
-                    height,
+                    width: d.width,
+                    height: d.height,
                 },
                 enabled: 1,
                 flags: 0,
@@ -23,6 +23,30 @@ impl Venus {
             RESP_OK_DISPLAY_INFO,
             info.to_bytes()[CTRL_HDR_LEN..].to_vec(),
         )
+    }
+
+    /// Scanout 0's EDID (`edid.rs`): the configured display's size and
+    /// refresh, in an EDID 1.4 block and a DisplayID 2.0 extension. Another
+    /// scanout is `RESP_ERR_INVALID_SCANOUT_ID`; without a display there is
+    /// no monitor to describe, and the answer is `RESP_ERR_UNSPEC` (the
+    /// guest then uses its own EDID, as on any error).
+    pub(super) fn edid(&self, c: &GetEdid) -> Answer {
+        if c.scanout != 0 {
+            return Err(RESP_ERR_INVALID_SCANOUT_ID);
+        }
+        let Some(d) = self.display else {
+            return Err(RESP_ERR_UNSPEC);
+        };
+        let bytes = edid::edid(d.width, d.height, d.refresh_hz);
+        let mut r = RespEdid {
+            size: bytes.len() as u32,
+            ..Default::default()
+        };
+        r.edid[..bytes.len()].copy_from_slice(&bytes);
+        Ok(Reply::With(
+            RESP_OK_EDID,
+            r.to_bytes()[CTRL_HDR_LEN..].to_vec(),
+        ))
     }
 
     /// Index 0 is Venus; there is no other.

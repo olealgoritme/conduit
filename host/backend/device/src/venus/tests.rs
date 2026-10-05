@@ -262,7 +262,15 @@ impl Rig {
     fn new() -> Self {
         let r = Shared::new();
         Self {
-            venus: Venus::new(Box::new(r.clone()), HOSTMEM, Some((1280, 720))),
+            venus: Venus::new(
+                Box::new(r.clone()),
+                HOSTMEM,
+                Some(DisplayMode {
+                    width: 1280,
+                    height: 720,
+                    refresh_hz: 60,
+                }),
+            ),
             r,
             region: Region::new(HOSTMEM),
             resp: vec![0u8; 64 * 1024],
@@ -1210,6 +1218,100 @@ fn no_display_means_no_enabled_scanout() {
     let di = RespDisplayInfo::from_bytes(&resp[16..n]).unwrap();
     assert_eq!(di.hdr.ty, RESP_OK_DISPLAY_INFO);
     assert!(di.pmodes.iter().all(|p| p.enabled == 0));
+}
+
+fn get_edid(scanout: u32) -> [u8; GetEdid::LEN] {
+    GetEdid {
+        hdr: hdr(CMD_GET_EDID, 0),
+        scanout,
+        padding: 0,
+    }
+    .to_bytes()
+}
+
+/// `GET_EDID` through the dispatch: the whole `virtio_gpu_resp_edid`, 256
+/// bytes of EDID for the configured mode and the rest zero.
+#[test]
+fn get_edid_describes_the_configured_display() {
+    for (w, h, hz) in [
+        (5120, 1440, 240),
+        (3840, 2160, 144),
+        (2560, 1440, 240),
+        (1920, 1080, 60),
+        (7680, 4320, 60),
+    ] {
+        let mode = DisplayMode {
+            width: w,
+            height: h,
+            refresh_hz: hz,
+        };
+        let mut v = Venus::new(Box::new(Shared::new()), HOSTMEM, Some(mode));
+        let mut resp = vec![0xeeu8; 4096];
+        let Outcome::Done(n) = v.dispatch(&get_edid(0), &mut resp, Env::default()) else {
+            panic!("held");
+        };
+        assert_eq!(status(&resp), 0);
+        assert_eq!(n, 16 + RespEdid::LEN);
+        let r = RespEdid::from_bytes(&resp[16..n]).unwrap();
+        assert_eq!(r.hdr.ty, RESP_OK_EDID);
+        assert_eq!((r.size, r.padding), (256, 0));
+        assert_eq!(r.edid[..256], edid::edid(w, h, hz));
+        assert!(r.edid[256..].iter().all(|&b| b == 0), "zero after size");
+        // The DisplayID Type VII timing is the configured size.
+        let le = |at: usize| u16::from_le_bytes([r.edid[at], r.edid[at + 1]]) as u32 + 1;
+        let at = 128 + edid::TYPE_VII_AT;
+        assert_eq!((le(at + 4), le(at + 12)), (w, h));
+    }
+    // No refresh known: 60.
+    let mode = DisplayMode {
+        width: 1920,
+        height: 1080,
+        refresh_hz: 0,
+    };
+    let mut v = Venus::new(Box::new(Shared::new()), HOSTMEM, Some(mode));
+    let mut resp = vec![0u8; 4096];
+    let Outcome::Done(n) = v.dispatch(&get_edid(0), &mut resp, Env::default()) else {
+        panic!("held");
+    };
+    let r = RespEdid::from_bytes(&resp[16..n]).unwrap();
+    assert_eq!(r.edid[..256], edid::edid(1920, 1080, 60));
+}
+
+/// Only scanout 0 has an EDID, only with a display, and the command is
+/// exactly its struct.
+#[test]
+fn get_edid_refusals() {
+    let mut t = Rig::new();
+    assert_eq!(t.ty(&get_edid(0)), RESP_OK_EDID);
+    assert_eq!(t.ty(&get_edid(1)), RESP_ERR_INVALID_SCANOUT_ID);
+    assert_eq!(t.ty(&get_edid(16)), RESP_ERR_INVALID_SCANOUT_ID);
+    let (h, body) = t.send(&get_edid(1));
+    assert_eq!(h.ty, RESP_ERR_INVALID_SCANOUT_ID);
+    assert!(body.is_empty());
+    assert_eq!(t.ty(&get_edid(0)[..GetEdid::LEN - 4]), RESP_ERR_UNSPEC);
+    let mut long = get_edid(0).to_vec();
+    long.push(0);
+    assert_eq!(t.ty(&long), RESP_ERR_UNSPEC);
+
+    let mut v = Venus::new(Box::new(Shared::new()), HOSTMEM, None);
+    let mut resp = vec![0u8; 4096];
+    let Outcome::Done(n) = v.dispatch(&get_edid(0), &mut resp, Env::default()) else {
+        panic!("held");
+    };
+    assert_eq!(n, 16 + CTRL_HDR_LEN);
+    assert_eq!(
+        CtrlHdr::from_bytes(&resp[16..]).unwrap().ty,
+        RESP_ERR_UNSPEC
+    );
+
+    // A response buffer too small for the reply is a transport error.
+    let mut small = vec![0u8; 512];
+    let mut t = Rig::new();
+    let Outcome::Done(n) = t.venus.dispatch(&get_edid(0), &mut small, Env::default()) else {
+        panic!("held");
+    };
+    assert_eq!(n, 16);
+    assert_eq!(status(&small), -libc::ENOSPC);
 }
 
 /// The limits per VM.
