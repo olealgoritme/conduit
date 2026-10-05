@@ -122,6 +122,16 @@ SPICE, OpenGL or USB redirection, so attach also changes the display side:
   itself stays: firmware, boot menu and disk-unlock prompt draw on it.
 - `<tpm>`, the guest agent channel, inputs and everything else are kept.
 
+A Windows domain also gets the Hyper-V enlightenments it lacks (`vpindex`,
+`runtime`, `synic`, `stimer` with `direct`, `reset`, `frequencies`,
+`tlbflush`, `ipi`, besides virt-manager's `relaxed`, `vapic`, `spinlocks`)
+and `<timer name='hypervclock' present='yes'/>`; settings the domain has stay
+([WINDOWS.md](WINDOWS.md)). attach takes a domain for Windows when its
+`<metadata>` names a libosinfo Windows OS (`http://microsoft.com/win/...`,
+what virt-manager records), when it has `<features><hyperv>`, or when the
+running VM's guest agent answers `guest-get-osinfo` with `mswindows`. That is
+decided before anything changes.
+
 virt-manager can still open the VM's console (it connects to the same
 socket); the Conduit window is the main screen. The
 definition from before the first attach is saved as
@@ -133,10 +143,12 @@ if libvirt refuses it nothing stays changed.
 ## Guest side (attach)
 
 `conduit attach` builds `vms/NAME/guest-setup.tar` (the `conduit-guest`
-packages, the share mount unit, udev and loader files) and, if the VM runs and
-answers on the QEMU guest agent, uploads it and runs its `setup.sh` as root.
-Otherwise it prints one `ssh ... < guest-setup.tar` command; `--guest-later`
-asks for that directly. `setup.sh` picks the distribution from
+packages, the share mount unit, udev and loader files) before it changes the
+domain and, if the VM runs and answers on the QEMU guest agent, uploads it
+and runs its `setup.sh` as root. Otherwise it prints one
+`ssh ... < guest-setup.tar` command; `--guest-later` asks for that directly.
+For a Windows domain none of this happens: attach prints the steps for the
+Helios driver package instead (`HeliosSetup.exe`, [WINDOWS.md](WINDOWS.md)). `setup.sh` picks the distribution from
 `/etc/os-release` (`ID`, `ID_LIKE`); `sh setup.sh --dry-run` prints what it
 would run.
 

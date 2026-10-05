@@ -17,6 +17,11 @@
 //!   4. installs the guest side through the QEMU guest agent when the VM runs
 //!      one, or prints the one command to run inside it.
 //!
+//! Windows guests (libosinfo metadata, Hyper-V features, or the guest agent's
+//! guest-get-osinfo; decided before step 1) also get the Hyper-V
+//! enlightenments in step 3, and step 4 is replaced by a note: the guest
+//! driver there is the Helios package (docs/WINDOWS.md).
+//!
 //! Running it again re-applies the same edit (nothing changes); detach
 //! defines the backup again and removes the units.
 
@@ -39,6 +44,112 @@ pub struct Wiring<'a> {
     /// QEMU's VNC server (the boot console) listens here.
     pub console_sock: &'a Path,
     pub vm: &'a str,
+    /// A Windows guest ([`is_windows`]): add the Hyper-V enlightenments.
+    pub windows: bool,
+}
+
+/// libosinfo's namespace in a domain's <metadata>, where virt-manager and
+/// virt-install record the OS a VM was installed as.
+const OSINFO_NS: &str = "http://libosinfo.org/xmlns/libvirt/domain/1.0";
+
+/// Does the definition say the guest is Windows? Either the libosinfo OS
+/// virt-manager recorded (`http://microsoft.com/win/...`) or Hyper-V
+/// enlightenments, which only Windows guests are given.
+pub fn is_windows(xml: &str) -> bool {
+    let Ok(root) = Element::parse(xml.as_bytes()) else {
+        return false;
+    };
+    let osinfo = root.get_child("metadata").is_some_and(|md| {
+        elements(md)
+            .filter(|e| {
+                e.name == "libosinfo"
+                    && (e.namespace.as_deref() == Some(OSINFO_NS)
+                        || e.prefix.as_deref() == Some("libosinfo"))
+            })
+            .flat_map(elements)
+            .any(|os| {
+                os.name == "os"
+                    && os
+                        .attributes
+                        .get("id")
+                        .is_some_and(|id| id.starts_with("http://microsoft.com/win"))
+            })
+    });
+    let hyperv = root
+        .get_child("features")
+        .and_then(|f| f.get_child("hyperv"))
+        .is_some();
+    osinfo || hyperv
+}
+
+/// Hyper-V enlightenments for Windows guests (docs/WINDOWS.md), with the one
+/// each needs: an enlightenment whose prerequisite the domain turns off is
+/// not added (QEMU would refuse to start).
+const HYPERV: &[(&str, Option<&str>)] = &[
+    ("relaxed", None),
+    ("vapic", None),
+    ("spinlocks", None), // retries='8191'
+    ("vpindex", None),
+    ("runtime", None),
+    ("synic", Some("vpindex")),
+    ("stimer", Some("synic")), // <direct state='on'/>
+    ("reset", None),
+    ("frequencies", None),
+    ("tlbflush", Some("vpindex")),
+    ("ipi", Some("vpindex")),
+];
+
+fn is_off(e: &Element) -> bool {
+    e.attributes.get("state").map(String::as_str) == Some("off")
+}
+
+/// Add the Hyper-V enlightenments and the Hyper-V clock a Windows domain
+/// lacks; whatever it already sets (on or off) stays. `<hyperv
+/// mode='passthrough'>` already gives the guest everything and is left alone.
+fn add_hyperv(root: &mut Element) {
+    let hv = child_mut(child_mut(root, "features"), "hyperv");
+    if hv.attributes.get("mode").map(String::as_str) != Some("passthrough") {
+        for (name, needs) in HYPERV {
+            if needs.is_some_and(|n| hv.get_child(n).is_some_and(is_off)) {
+                continue;
+            }
+            match hv.get_mut_child(*name) {
+                // stimer runs best in direct mode (no SynIC message per tick).
+                Some(e) if *name == "stimer" && !is_off(e) && e.get_child("direct").is_none() => {
+                    e.children
+                        .push(XMLNode::Element(el("direct", &[("state", "on")])));
+                }
+                Some(_) => {}
+                None => {
+                    let mut e = el(name, &[("state", "on")]);
+                    if *name == "spinlocks" {
+                        e.attributes.insert("retries".into(), "8191".into());
+                    }
+                    if *name == "stimer" {
+                        e.children
+                            .push(XMLNode::Element(el("direct", &[("state", "on")])));
+                    }
+                    hv.children.push(XMLNode::Element(e));
+                }
+            }
+        }
+    }
+    // <clock>: Windows keeps local time in the RTC (what virt-manager writes
+    // for it), plus the Hyper-V reference clock.
+    let new = root.get_child("clock").is_none();
+    let clock = child_mut(root, "clock");
+    if new {
+        clock.attributes.insert("offset".into(), "localtime".into());
+    }
+    let has = elements(clock).any(|t| {
+        t.name == "timer" && t.attributes.get("name").map(String::as_str) == Some("hypervclock")
+    });
+    if !has {
+        clock.children.push(XMLNode::Element(el(
+            "timer",
+            &[("name", "hypervclock"), ("present", "yes")],
+        )));
+    }
 }
 
 fn child_mut<'a>(e: &'a mut Element, name: &str) -> &'a mut Element {
@@ -289,6 +400,10 @@ pub fn edit_domain(xml: &str, w: &Wiring) -> Result<String> {
         devices.children.push(XMLNode::Element(fs));
     }
 
+    if w.windows {
+        add_hyperv(&mut root);
+    }
+
     // <qemu:commandline>: drop our old args (if any), append the current ones.
     let pos = root
         .children
@@ -439,6 +554,19 @@ fn system_apparmor() -> Result<()> {
     Ok(())
 }
 
+/// What a Windows guest needs after attach, in place of the Linux guest setup.
+fn windows_guest_note(name: &str, running: bool) -> String {
+    let mut s = format!(
+        "{name} is a Windows guest: Conduit's Linux guest setup does not apply, and Hyper-V enlightenments were added.\n\
+         Inside the VM, install the Helios driver package (HeliosSetup.exe; see docs/WINDOWS.md, \"Guest driver\")."
+    );
+    if running {
+        s += &format!("\nRestart {name} so the GPU and the enlightenments take effect (shut it down and start it again).");
+    }
+    s += &format!("\nThen: `conduit view {name} --venus` starts it with the Venus renderer and shows its screen.");
+    s
+}
+
 pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -> Result<()> {
     crate::vm::check_name(name)?;
     // ---- validate everything first
@@ -460,6 +588,10 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
     let scope = virt::scope_for(&uri)?;
     let xml = v.inactive_xml(name)?;
     let already = virt::is_ours(&xml);
+    let running = v.state(name).is_some_and(|s| virt::state_is_up(&s));
+    // Decided before anything changes: a Windows guest gets the Hyper-V
+    // enlightenments and none of the Linux guest setup.
+    let windows = is_windows(&xml) || (running && guest::agent_says_windows(&v, name));
     let emu = virt::emulator()?;
     if matches!(scope, Scope::System { .. })
         && !emu.starts_with("/opt/conduit")
@@ -486,15 +618,23 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
             vfs_sock: &vfs,
             console_sock: &console,
             vm: name,
+            windows,
         },
     )?;
     if dry_run {
         ui::info(format!("libvirt: {uri}; emulator: {}", emu.display()));
+        if windows {
+            ui::info("a Windows guest: Hyper-V enlightenments added, no Linux guest setup");
+        }
         println!("{new_xml}");
         ui::info("dry run: nothing was changed");
         return Ok(());
     }
-    let running = v.state(name).is_some_and(|s| virt::state_is_up(&s));
+    // The Linux guest bundle (the conduit-guest packages) before anything
+    // changes, so a missing package cannot leave the domain half done.
+    if !windows {
+        guest::bundle(name)?;
+    }
     let me = virt::conduit_exe()?;
 
     // ---- apply
@@ -557,7 +697,10 @@ pub fn attach(name: &str, dry_run: bool, uri: Option<&str>, guest_later: bool) -
     );
 
     // ---- the guest side
-    guest::bundle(name)?;
+    if windows {
+        println!("{}", windows_guest_note(name, running));
+        return Ok(());
+    }
     let link = Link::load(name).unwrap();
     if guest_later {
         println!(
@@ -700,7 +843,7 @@ mod tests {
   </devices>
 </domain>"#;
 
-    fn edit(x: &str) -> String {
+    fn edit_as(x: &str, windows: bool) -> String {
         edit_domain(
             x,
             &Wiring {
@@ -709,9 +852,183 @@ mod tests {
                 vfs_sock: Path::new("/run/user/1000/conduit/myvm/vfs-libvirt.sock"),
                 console_sock: Path::new(CONSOLE),
                 vm: "myvm",
+                windows,
             },
         )
         .unwrap()
+    }
+
+    fn edit(x: &str) -> String {
+        edit_as(x, false)
+    }
+
+    /// What virt-manager writes for a Windows 11 VM (trimmed).
+    const WIN11: &str = r#"<domain type='kvm'>
+  <name>win11</name>
+  <metadata>
+    <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">
+      <libosinfo:os id="http://microsoft.com/win/11"/>
+    </libosinfo:libosinfo>
+  </metadata>
+  <memory unit='KiB'>16777216</memory>
+  <os firmware='efi'><type arch='x86_64' machine='pc-q35-8.2'>hvm</type></os>
+  <features>
+    <acpi/>
+    <apic/>
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='4096'/>
+    </hyperv>
+    <vmport state='off'/>
+  </features>
+  <clock offset='localtime'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+  </clock>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <channel type='spicevmc'><target type='virtio' name='com.redhat.spice.0'/></channel>
+    <graphics type='spice' autoport='yes'/>
+    <video><model type='qxl' heads='1' primary='yes'/></video>
+    <tpm model='tpm-crb'><backend type='emulator' version='2.0'/></tpm>
+  </devices>
+</domain>"#;
+
+    fn hyperv(out: &str) -> Element {
+        Element::parse(out.as_bytes())
+            .unwrap()
+            .get_child("features")
+            .unwrap()
+            .get_child("hyperv")
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn detects_windows() {
+        assert!(is_windows(WIN11));
+        // Only the libosinfo id, or only Hyper-V features, is enough.
+        let no_hv = WIN11
+            .replace("<hyperv mode='custom'>", "<!--")
+            .replace("</hyperv>", "-->");
+        assert!(is_windows(&no_hv), "{no_hv}");
+        let no_osinfo = WIN11.replace("microsoft.com/win/11", "ubuntu.com/ubuntu/24.04");
+        assert!(is_windows(&no_osinfo));
+        let linux = no_osinfo
+            .replace("<hyperv mode='custom'>", "<!--")
+            .replace("</hyperv>", "-->");
+        assert!(!is_windows(&linux), "{linux}");
+        assert!(!is_windows(DOMAIN));
+        assert!(!is_windows(VIRT_INSTALL));
+        assert!(!is_windows("not xml"));
+        // Linux guests attach without enlightenments, and stay Linux.
+        assert!(!is_windows(&edit(VIRT_INSTALL)));
+    }
+
+    #[test]
+    fn windows_gets_the_hyperv_enlightenments() {
+        let out = edit_as(WIN11, true);
+        let hv = hyperv(&out);
+        assert_eq!(hv.attributes["mode"], "custom");
+        for n in [
+            "relaxed",
+            "vapic",
+            "spinlocks",
+            "vpindex",
+            "runtime",
+            "synic",
+            "stimer",
+            "reset",
+            "frequencies",
+            "tlbflush",
+            "ipi",
+        ] {
+            let e = all(&hv, n);
+            assert_eq!(e.len(), 1, "{n}: {out}");
+            assert_eq!(e[0].attributes["state"], "on", "{n}");
+        }
+        assert_eq!(
+            all(&hv, "spinlocks")[0].attributes["retries"],
+            "4096",
+            "an existing setting is kept"
+        );
+        let stimer = all(&hv, "stimer")[0];
+        assert_eq!(
+            stimer.get_child("direct").unwrap().attributes["state"],
+            "on"
+        );
+        let root = Element::parse(out.as_bytes()).unwrap();
+        let clock = root.get_child("clock").unwrap();
+        assert_eq!(clock.attributes["offset"], "localtime");
+        let timers: Vec<_> = all(clock, "timer");
+        assert_eq!(timers.len(), 4, "rtc, pit and hpet are kept: {out}");
+        let hvc: Vec<_> = timers
+            .iter()
+            .filter(|t| t.attributes["name"] == "hypervclock")
+            .collect();
+        assert_eq!(hvc.len(), 1);
+        assert_eq!(hvc[0].attributes["present"], "yes");
+        let features = root.get_child("features").unwrap();
+        assert!(features.get_child("acpi").is_some() && features.get_child("vmport").is_some());
+        // The rest of attach's edit applies as for Linux guests.
+        assert!(virt::is_ours(&out));
+        assert!(!out.contains("spice"), "{out}");
+        assert_eq!(edit_as(&out, true), out, "idempotent");
+    }
+
+    #[test]
+    fn hyperv_respects_what_the_domain_sets() {
+        // No <features>/<clock> at all: both are created.
+        let bare = edit_as(DOMAIN, true);
+        assert_eq!(all(&hyperv(&bare), "stimer").len(), 1, "{bare}");
+        assert_eq!(
+            all(&hyperv(&bare), "spinlocks")[0].attributes["retries"],
+            "8191"
+        );
+        let root = Element::parse(bare.as_bytes()).unwrap();
+        assert_eq!(
+            root.get_child("clock").unwrap().attributes["offset"],
+            "localtime"
+        );
+        // A setting turned off stays off, and what depends on it is not added.
+        let off = WIN11.replace(
+            "<relaxed state='on'/>",
+            "<relaxed state='off'/><synic state='off'/><stimer state='on'/>",
+        );
+        let out = edit_as(&off, true);
+        let hv = hyperv(&out);
+        assert_eq!(all(&hv, "relaxed")[0].attributes["state"], "off");
+        assert_eq!(all(&hv, "synic")[0].attributes["state"], "off");
+        assert!(
+            all(&hv, "stimer")[0].get_child("direct").is_none(),
+            "stimer is the user's (QEMU refuses it without synic anyway): {out}"
+        );
+        assert_eq!(all(&hv, "vpindex").len(), 1);
+        // An existing hypervclock timer is kept as it is.
+        let clk = WIN11.replace(
+            "<timer name='hpet' present='no'/>",
+            "<timer name='hypervclock' present='no'/>",
+        );
+        let out = edit_as(&clk, true);
+        assert!(out.contains("name=\"hypervclock\" present=\"no\""), "{out}");
+        assert_eq!(out.matches("hypervclock").count(), 1);
+        // Passthrough mode already exposes everything.
+        let pt = WIN11.replace("<hyperv mode='custom'>", "<hyperv mode='passthrough'>");
+        assert_eq!(elements(&hyperv(&edit_as(&pt, true))).count(), 3);
+    }
+
+    #[test]
+    fn windows_note_points_at_the_helios_package() {
+        let n = windows_guest_note("win11", true);
+        assert!(
+            n.contains("HeliosSetup.exe") && n.contains("docs/WINDOWS.md"),
+            "{n}"
+        );
+        assert!(n.contains("conduit view win11 --venus"), "{n}");
+        assert!(n.contains("Restart win11"));
+        assert!(!windows_guest_note("win11", false).contains("Restart"));
     }
 
     #[test]
@@ -859,6 +1176,7 @@ mod tests {
             vfs_sock: Path::new("/v"),
             console_sock: Path::new("/c"),
             vm: "x",
+            windows: false,
         };
         assert!(edit_domain("<network/>", &w).is_err());
         assert!(edit_domain("not xml", &w).is_err());

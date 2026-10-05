@@ -47,10 +47,9 @@ Experimental, behind `--venus` ([WINDOWS.md](WINDOWS.md), [VENUS.md](VENUS.md)).
   not `conduit-venus` (it needs the venus submodules and a local
   virglrenderer); build that by hand ([VENUS.md](VENUS.md)). The packages
   have both.
-- `conduit attach` knows only Linux guests: run it with `--guest-later` for a
-  Windows VM and install the driver by hand ([WINDOWS.md](WINDOWS.md)). It
-  adds no Hyper-V enlightenments, which steady a Windows guest's frame pacing;
-  add them to the domain by hand.
+- `conduit attach` recognizes a Windows VM and adds the Hyper-V
+  enlightenments, but does not install its guest driver: install the Helios
+  package inside the VM by hand ([WINDOWS.md](WINDOWS.md)).
 - The guest driver is test-signed: Secure Boot off, test-signing on.
 - The guest's keyboard and pointer go through the boot console's emulated
   PS/2 keyboard and USB tablet (no gamepads); no clipboard sharing.

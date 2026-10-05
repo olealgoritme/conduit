@@ -9,7 +9,7 @@
 use crate::paths::{self, Tool};
 use crate::sys;
 use crate::ui::{self, oops};
-use crate::virt::Link;
+use crate::virt::{Link, Virsh};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -239,15 +239,34 @@ pub fn manual_command(name: &str) -> String {
 // ---------------------------------------------------------------- guest agent
 
 fn agent(link: &Link, cmd: Value, timeout_s: u32) -> Result<Value> {
-    let out = link.virsh().run(&[
+    agent_on(&link.virsh(), &link.domain, cmd, timeout_s)
+}
+
+fn agent_on(v: &Virsh, dom: &str, cmd: Value, timeout_s: u32) -> Result<Value> {
+    let out = v.run(&[
         "qemu-agent-command",
-        &link.domain,
+        dom,
         &cmd.to_string(),
         "--timeout",
         &timeout_s.to_string(),
     ])?;
     let v: Value = serde_json::from_str(out.trim()).context("the guest agent's answer")?;
     Ok(v.get("return").cloned().unwrap_or(Value::Null))
+}
+
+/// Does a running domain's guest agent say it is Windows
+/// (`guest-get-osinfo`)? False when it runs none or does not answer.
+pub fn agent_says_windows(v: &Virsh, dom: &str) -> bool {
+    agent_on(v, dom, json!({"execute": "guest-get-osinfo"}), 5).is_ok_and(|r| osinfo_is_windows(&r))
+}
+
+/// `guest-get-osinfo`'s answer names Windows: id "mswindows" (qemu-ga's
+/// Windows build), or a Windows kernel name.
+pub fn osinfo_is_windows(r: &Value) -> bool {
+    r.get("id").and_then(Value::as_str) == Some("mswindows")
+        || r.get("kernel-name")
+            .and_then(Value::as_str)
+            .is_some_and(|k| k.to_ascii_lowercase().starts_with("windows"))
 }
 
 /// Does the running VM answer on the QEMU guest agent channel?
@@ -396,6 +415,8 @@ mod base64_lite {
 #[cfg(test)]
 mod tests {
     use super::base64_lite::{decode, encode};
+    use super::osinfo_is_windows;
+    use serde_json::{json, Value};
 
     #[test]
     fn base64_roundtrip() {
@@ -411,6 +432,20 @@ mod tests {
         }
         let bin: Vec<u8> = (0..=255u8).collect();
         assert_eq!(decode(&encode(&bin)).unwrap(), bin);
+    }
+
+    #[test]
+    fn windows_osinfo() {
+        // qemu-ga on Windows 11 and on Ubuntu.
+        assert!(osinfo_is_windows(&json!({
+            "id": "mswindows", "name": "Microsoft Windows",
+            "kernel-name": "Windows_NT", "version-id": "11"
+        })));
+        assert!(osinfo_is_windows(&json!({"kernel-name": "Windows_NT"})));
+        assert!(!osinfo_is_windows(&json!({
+            "id": "ubuntu", "name": "Ubuntu", "kernel-name": "Linux"
+        })));
+        assert!(!osinfo_is_windows(&Value::Null));
     }
 
     #[test]

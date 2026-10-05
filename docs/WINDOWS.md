@@ -22,20 +22,29 @@ Make a Windows 11 VM in virt-manager as usual (UEFI/OVMF, Secure Boot off:
 the driver is test-signed), then give it Conduit's GPU with the VM shut off:
 
 ```bash
-conduit attach win11 --guest-later    # the guest step of attach is for Linux guests
+conduit attach win11                  # recognizes Windows: no Linux guest setup
 conduit view win11 --venus            # or: conduit up win11 --venus
 ```
 
-`attach` sets a host-passthrough CPU with the host's physical address width,
-which OVMF needs to place the 64 GiB shared-memory BAR ([VENUS.md](VENUS.md),
-"Windows/OVMF guests"). The display mode is your monitor's, as for a Linux
+`attach` tells a Windows VM from a Linux one by the OS virt-manager recorded
+(libosinfo `http://microsoft.com/win/...` in `<metadata>`), Hyper-V features
+in the definition, or, for a running VM, the guest agent's
+`guest-get-osinfo`. It decides that before it changes anything; for Windows
+it skips the Linux guest setup (the guest driver is the Helios package,
+below) and prints what to do instead. `attach` sets a host-passthrough CPU
+with the host's physical address width, which OVMF needs to place the 64 GiB
+shared-memory BAR ([VENUS.md](VENUS.md), "Windows/OVMF guests"). The display
+mode is your monitor's, as for a Linux
 guest; the guest learns it from the EDID the backend serves. Keyboard and
 pointer reach Windows through the boot console's emulated PS/2 keyboard and
 USB tablet ([SCANOUT.md](SCANOUT.md#boot-console)).
 
-**Hyper-V enlightenments.** Neither `attach` nor `conduit up` adds them. On
-the test machine these, in the domain XML (`virsh -c qemu:///session edit
-win11`), made frame pacing noticeably steadier:
+**Hyper-V enlightenments.** `attach` adds these to a Windows domain (on the
+test machine they made frame pacing noticeably steadier); each one the domain
+already has, on or off, stays as it is, one whose prerequisite is off
+(`synic`, `tlbflush` and `ipi` need `vpindex`, `stimer` needs `synic`) is
+left out, `<hyperv mode='passthrough'>` is left alone, and a domain without
+`<clock>` gets `offset='localtime'`:
 
 ```xml
 <features>
@@ -55,12 +64,13 @@ win11`), made frame pacing noticeably steadier:
 </features>
 <clock offset='localtime'>
   <timer name='hypervclock' present='yes'/>
-  <!-- keep the rtc, pit and hpet timers virt-manager wrote -->
+  <!-- the rtc, pit and hpet timers virt-manager wrote are kept -->
 </clock>
 ```
 
 (virt-manager already writes `relaxed`, `vapic` and `spinlocks` for a Windows
-VM.) Pinning the vCPUs to one CCD made no measurable difference.
+VM.) `conduit attach --dry-run win11` prints the result. Pinning the vCPUs to
+one CCD made no measurable difference.
 
 ## Guest driver
 
