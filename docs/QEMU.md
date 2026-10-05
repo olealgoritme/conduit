@@ -15,7 +15,7 @@ both.
 | piece | where |
 | --- | --- |
 | QEMU 11.1.x with the Conduit patches | `host/qemu/build-qemu.sh` (see `host/qemu/README.md`). It builds `host/qemu/build/qemu-system-x86_64`, and `--install` puts it in `/opt/conduit/bin`. |
-| backend (`conduit-backend`) | `cd host/backend && cargo build --release -p device --features vhost-user --bin conduit-backend` |
+| backend (`conduit-backend`) | `cd host/backend && cargo build --release -p device --features vhost-user,venus --bin conduit-backend` |
 | virtiofsd (NVIDIA userspace share) | `/usr/libexec/virtiofsd` (Ubuntu package `virtiofsd`) |
 | guest kernel | the VM's own stock kernel: `conduit` copies the newest `/boot/vmlinuz-*` and its `initrd.img-*` out of the disk (`debugfs`) and passes them as `-kernel`/`-initrd`. The guest driver comes from DKMS (`conduit-guest`). A custom ELF `vmlinux` (`CONFIG_PVH=y`) also boots, without `-initrd`; that is what the commands below show. |
 | guest disk | a `conduit create` disk (`~/.local/share/conduit/vms/NAME/disk.img`): a bare ext4 filesystem with no partition table or bootloader, mounted as `/dev/vda` |
