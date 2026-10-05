@@ -63,6 +63,17 @@ opts=(
     -Drender-server-worker=thread
     -Dtests=false
 )
+# Conduit's changes to the pinned virglrenderer (patches/*.patch, in order),
+# applied to the submodule's working tree once; a patch already in it is
+# skipped, so running this again is harmless.
+for p in "$here"/patches/*.patch; do
+    [ -e "$p" ] || continue
+    if git -C "$tp/virglrenderer" apply --reverse --check "$p" 2>/dev/null; then
+        continue
+    fi
+    git -C "$tp/virglrenderer" apply "$p" || { echo "failed to apply $p" >&2; exit 1; }
+    echo "applied $(basename "$p")"
+done
 meson setup --reconfigure "$build/virglrenderer" "$tp/virglrenderer" "${opts[@]}" 2>/dev/null ||
     meson setup "$build/virglrenderer" "$tp/virglrenderer" "${opts[@]}"
 ninja -C "$build/virglrenderer" install

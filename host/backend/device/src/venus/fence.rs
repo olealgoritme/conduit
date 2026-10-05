@@ -14,6 +14,10 @@
 
 use super::*;
 use conduit_venus::Signalled;
+use std::time::{Duration, Instant};
+
+/// How often the fence latency summary is logged while fences flow.
+const LATENCY_REPORT: Duration = Duration::from_secs(2);
 
 /// A response for a chain that was [`Outcome::Held`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +32,49 @@ struct Held {
     token: u64,
     /// The request's header: the response echoes its fence.
     hdr: CtrlHdr,
+    /// When the backend held it: the fence latency is measured from here to
+    /// the renderer's signal reaching the backend.
+    at: Instant,
+}
+
+/// Submit-to-signal latencies seen since the last summary, in microseconds,
+/// per `(ctx_id, ring)`.
+#[derive(Default)]
+struct Latency {
+    samples: Vec<(u32, u32, u32)>,
+    since: Option<Instant>,
+}
+
+impl Latency {
+    fn add(&mut self, ctx: u32, ring: u32, held: Duration) {
+        let us = held.as_micros().min(u32::MAX as u128) as u32;
+        self.samples.push((ctx, ring, us));
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= LATENCY_REPORT {
+            self.report();
+        }
+    }
+
+    /// One info line per timeline: count, median, 90th percentile and
+    /// maximum submit-to-signal time.
+    fn report(&mut self) {
+        let mut by: std::collections::BTreeMap<(u32, u32), Vec<u32>> = Default::default();
+        for (c, r, us) in self.samples.drain(..) {
+            by.entry((c, r)).or_default().push(us);
+        }
+        for ((c, r), mut v) in by {
+            v.sort_unstable();
+            let at = |q: usize| v[(v.len() - 1) * q / 100];
+            log::info!(
+                "venus: fence latency ctx {c} ring {r}: {} fences, p50 {} us, p90 {} us, max {} us",
+                v.len(),
+                at(50),
+                at(90),
+                v[v.len() - 1]
+            );
+        }
+        self.since = None;
+    }
 }
 
 #[derive(Default)]
@@ -35,6 +82,7 @@ pub(super) struct Fences {
     held: Vec<Held>,
     ready: Vec<Completion>,
     next_token: u64,
+    latency: Latency,
 }
 
 impl Fences {
@@ -44,6 +92,7 @@ impl Fences {
         self.held.push(Held {
             token: self.next_token,
             hdr: *hdr,
+            at: Instant::now(),
         });
         self.next_token
     }
@@ -72,6 +121,7 @@ impl Fences {
             .partition::<Vec<_>, _>(|(i, h)| *i <= last && on(h));
         self.held = keep.into_iter().map(|(_, h)| h).collect();
         for (_, h) in done {
+            self.latency.add(h.hdr.ctx_id, h.hdr.ring(), h.at.elapsed());
             self.complete(h, RESP_OK_NODATA);
         }
     }

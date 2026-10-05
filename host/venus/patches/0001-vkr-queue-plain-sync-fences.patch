@@ -1,0 +1,21 @@
+diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
+index d75a229..fbda972 100644
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -32,9 +32,15 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+          .sType = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO,
+          .handleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
+       };
++      /* Conduit: a plain fence. These queue-sync fences are only waited on
++       * by the sync thread, never exported, and NVIDIA's driver waits on an
++       * exportable SYNC_FD fence in ~10 ms steps (0.03 ms for a plain one),
++       * which put a flat 10 ms on every ring fence a Windows frame waits on.
++       */
++      (void)export_info;
+       const struct VkFenceCreateInfo create_info = {
+          .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+-         .pNext = dev->physical_device->KHR_external_fence_fd ? &export_info : NULL,
++         .pNext = NULL,
+       };
+       VkResult result =
+          vk->CreateFence(dev->base.handle.device, &create_info, NULL, &sync->fence);

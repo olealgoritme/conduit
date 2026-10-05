@@ -124,6 +124,36 @@ const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// [`Renderer::signalled`]. Global because the callback gets only the
 /// init-time cookie and virglrenderer is a per-process singleton anyway.
 static FENCES: Mutex<Vec<Signalled>> = Mutex::new(Vec::new());
+/// When each pending fence was created, for the create-to-signal latency
+/// summary (`fence_latency`), keyed by `(ctx_id, ring_idx, fence_id)`.
+static CREATED: Mutex<Option<std::collections::HashMap<(u32, u32, u64), std::time::Instant>>> = Mutex::new(None);
+/// Create-to-signal latencies in microseconds since the last summary.
+static LATENCY: Mutex<(Vec<u32>, Option<std::time::Instant>)> = Mutex::new((Vec::new(), None));
+
+/// Record one fence's create-to-signal time; every two seconds print the
+/// count, median, 90th percentile and maximum to the log (stderr).
+fn fence_latency(key: (u32, u32, u64)) {
+    let Some(at) = CREATED.lock().unwrap_or_else(|p| p.into_inner()).as_mut().and_then(|m| m.remove(&key)) else {
+        return;
+    };
+    let us = at.elapsed().as_micros().min(u32::MAX as u128) as u32;
+    let mut l = LATENCY.lock().unwrap_or_else(|p| p.into_inner());
+    l.0.push(us);
+    let since = *l.1.get_or_insert_with(std::time::Instant::now);
+    if since.elapsed() >= std::time::Duration::from_secs(2) {
+        let mut v = std::mem::take(&mut l.0);
+        l.1 = None;
+        v.sort_unstable();
+        let at = |q: usize| v[(v.len() - 1) * q / 100];
+        eprintln!(
+            "conduit-venus: fence create-to-signal: {} fences, p50 {} us, p90 {} us, max {} us",
+            v.len(),
+            at(50),
+            at(90),
+            v[v.len() - 1]
+        );
+    }
+}
 static EVENT: AtomicI32 = AtomicI32::new(-1);
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -135,6 +165,7 @@ extern "C" fn write_context_fence(_cookie: *mut c_void, ctx_id: u32, ring_idx: u
     // Runs on a virglrenderer thread: no panics across the FFI boundary, so a
     // poisoned lock is used as is.
     FENCES.lock().unwrap_or_else(|p| p.into_inner()).push(Signalled { ctx_id, ring_idx, fence_id });
+    fence_latency((ctx_id, ring_idx, fence_id));
     let fd = EVENT.load(Ordering::Acquire);
     if fd >= 0 {
         let one: u64 = 1;
@@ -368,6 +399,11 @@ impl Renderer for Virgl {
     fn create_fence(&mut self, ctx_id: u32, ring_idx: u32, fence_id: u64) -> Result<()> {
         // Not MERGEABLE: every fenced guest command holds a descriptor chain
         // that only this fence's callback releases.
+        CREATED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert((ctx_id, ring_idx, fence_id), std::time::Instant::now());
         // SAFETY: plain values.
         check(unsafe { ffi::virgl_renderer_context_create_fence(ctx_id, 0, ring_idx, fence_id) })
     }
