@@ -18,10 +18,18 @@
 //!   lock exactly as long as the GPU may use the pages (see `helios_protocol::nvrm`
 //!   `HeliosNvrmPin`). Of RM it recognises one call, `NV_ESC_RM_FREE`.
 //!
+//! * usermode events: `register_event` / `unregister_event` tie a process's
+//!   `KEVENT` to a backend handle (or to the loss of the transport); `Close` and
+//!   `close_all_for_owner` drop what a handle or a process registered, at PASSIVE
+//!   and outside every lock (the DPC side is `virtio::gpu::nvrm_events`).
+//!
 //! Everything else in an RM message is opaque here.
 
 use super::ctrl;
-use super::gpu::{DeviceOwner, NvrmPin, MAX_NVRM_PINS_PER_OWNER, MAX_NVRM_PIN_PAGES};
+use super::gpu::{
+    release_nvrm_event, DeviceOwner, NvrmEventRefusal, NvrmPin, MAX_NVRM_PINS_PER_OWNER,
+    MAX_NVRM_PIN_PAGES,
+};
 use super::hal::DmaBuffer;
 use super::VirtioError;
 use crate::adapter::AdapterContext;
@@ -29,12 +37,13 @@ use crate::irql::PassiveLevel;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 use helios_kmd_logic::page_runs;
 use helios_protocol::{
     HELIOS_NVRM_DEEP_PAGE_RUNS, HELIOS_NVRM_DEEP_PAGE_RUNS_INDIRECT, HELIOS_NVRM_FORWARD_MSG_TYPES,
 };
-use wdk_sys::{MDL, PMDL};
+use wdk_sys::{KEVENT, MDL, PMDL};
 
 extern "C" {
     /// `MmProbeAndLockPages` for USER memory raises on a bad range; the C shim
@@ -90,6 +99,27 @@ pub static NVRM_MAP_ERRORS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_PINS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_UNPINS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_PIN_ERRORS: AtomicU32 = AtomicU32::new(0);
+/// Event registrations made, removed by `EVENT_UNREGISTER`, and refused. Published
+/// as `NvEvReg`, `NvEvUnreg`, `NvEvRef`. `Close`, process exit and reset remove
+/// registrations too and are not counted separately, so only the order of
+/// magnitude is a check: a count far above anything that removes is a leak.
+pub static NVRM_EV_REGS: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_EV_UNREGS: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_EV_REFUSED: AtomicU32 = AtomicU32::new(0);
+/// `KeSetEvent`s for an `EventReady` (or a latched one at registration), and the
+/// notifications latched / dropped because nothing was registered. `NvEvSig`,
+/// `NvEvLatch`, `NvEvDrop`.
+pub static NVRM_EV_SIGNALS: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_EV_LATCHED: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_EV_DROPS: AtomicU32 = AtomicU32::new(0);
+/// Registrations woken because the transport was lost (`NvEvLost`); event-queue
+/// messages other than `EventReady` (`NvEvOther`: nonzero means the host sent
+/// something this driver does not consume, e.g. `InputEvent`); and faults of the
+/// event queue itself (`NvEvErr`: a buffer that would not repost, a bad token,
+/// a handle that would not resolve). `NvEvErr` should read 0.
+pub static NVRM_EV_LOST: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_EV_OTHER: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_EV_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// Why a forward did not reach (or come back from) the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +204,9 @@ pub fn forward(
                 return Err(refused(Refusal::NotOwned));
             };
             NVRM_CLOSES.fetch_add(1, Ordering::Relaxed);
+            // No event may fire for a handle the host is about to close (and may
+            // hand to another process): registrations go before anything else.
+            release_events_for_handle(adapter, owner, handle);
             // Mappings go first (the ABI's teardown order: unmap, close): no user
             // address may outlive the host mapping it points at.
             release_maps_for_handle(passive, adapter, owner, handle);
@@ -804,6 +837,119 @@ fn release_maps_for_handle(
     }
 }
 
+// ---- events -------------------------------------------------------------------------
+
+/// What a successful `REGISTER` did, as `HeliosNvrmEvent.out_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventState {
+    Registered,
+    Replaced,
+    /// A notification had been latched: the event was signalled at once.
+    LatchedSignaled,
+}
+
+/// Why a `REGISTER` was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventRefusal {
+    /// The event queue is not up (see `gpu::nvrm_events`).
+    Unsupported,
+    TransportLost,
+    NotOwned,
+    NoResources,
+    /// There is no transport at all.
+    NoTransport,
+}
+
+/// `EVENT_REGISTER`: record `event` for `(owner, handle, kind)`. PASSIVE, in the
+/// caller's process (the reference was just taken there). TAKES OVER the caller's
+/// object reference in every case: on success the table owns it (and the one a
+/// replacement displaced is released here), on refusal it is released here.
+pub fn register_event(
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    handle: u32,
+    kind: u32,
+    event: NonNull<KEVENT>,
+) -> Result<EventState, EventRefusal> {
+    // `event` is Copy, so the closure takes a copy and the original is still ours
+    // to release if the closure never runs (the transport is gone).
+    let result = adapter.with_virtio(|v| v.register_nvrm_event(owner, handle, kind, event));
+    let refused = |r: EventRefusal| {
+        NVRM_EV_REFUSED.fetch_add(1, Ordering::Relaxed);
+        release_nvrm_event(event);
+        r
+    };
+    match result {
+        Err(_) => Err(refused(EventRefusal::NoTransport)),
+        Ok(Err(NvrmEventRefusal::Unavailable)) => Err(refused(EventRefusal::Unsupported)),
+        Ok(Err(NvrmEventRefusal::TransportLost)) => Err(refused(EventRefusal::TransportLost)),
+        Ok(Err(NvrmEventRefusal::NotOwned)) => Err(refused(EventRefusal::NotOwned)),
+        Ok(Err(NvrmEventRefusal::NoResources)) => Err(refused(EventRefusal::NoResources)),
+        Ok(Ok(done)) => {
+            NVRM_EV_REGS.fetch_add(1, Ordering::Relaxed);
+            let replaced = done.replaced.is_some();
+            if let Some(old) = done.replaced {
+                release_nvrm_event(old);
+            }
+            Ok(if done.latched {
+                EventState::LatchedSignaled
+            } else if replaced {
+                EventState::Replaced
+            } else {
+                EventState::Registered
+            })
+        }
+    }
+}
+
+/// `EVENT_UNREGISTER`: `Some(true)` if it removed one, `Some(false)` if there was
+/// none, `None` if there is no transport. PASSIVE.
+pub fn unregister_event(
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    handle: u32,
+    kind: u32,
+) -> Option<bool> {
+    match adapter.with_virtio(|v| v.unregister_nvrm_event(owner, handle, kind)) {
+        Ok(Some(old)) => {
+            NVRM_EV_UNREGS.fetch_add(1, Ordering::Relaxed);
+            release_nvrm_event(old);
+            Some(true)
+        }
+        Ok(None) => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// `Close` of `handle`: drop what `owner` registered on it.
+fn release_events_for_handle(adapter: &AdapterContext, owner: DeviceOwner, handle: u32) {
+    loop {
+        let event = adapter
+            .with_virtio(|v| v.take_nvrm_event_for_handle(owner, handle))
+            .ok()
+            .flatten();
+        let Some(event) = event else {
+            break;
+        };
+        release_nvrm_event(event);
+    }
+}
+
+/// Device teardown: drop everything `owner` registered, `TRANSPORT_LOST`
+/// registrations included.
+fn release_events_for_owner(adapter: &AdapterContext, owner: DeviceOwner) {
+    loop {
+        let event = adapter
+            .with_virtio(|v| v.take_nvrm_event_for_owner(owner))
+            .ok()
+            .flatten();
+        let Some(event) = event else {
+            break;
+        };
+        release_nvrm_event(event);
+    }
+}
+
 // ---- teardown ----------------------------------------------------------------------
 
 /// Device teardown: release, on the host, everything `owner` left behind — its
@@ -816,6 +962,9 @@ pub fn close_all_for_owner(
     owner: DeviceOwner,
 ) -> u32 {
     let mut closed = 0u32;
+    // Events first: nothing of this owner's may be signalled from here on, and the
+    // references are PASSIVE-only to drop.
+    release_events_for_owner(adapter, owner);
     // After the first transport failure the host is not answering: stop sending
     // (a wedged host would cost seconds per handle) but keep clearing the tables,
     // so no entry outlives the device handle it names.

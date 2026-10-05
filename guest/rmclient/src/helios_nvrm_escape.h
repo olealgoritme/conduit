@@ -118,8 +118,10 @@ typedef struct HeliosNvrmQueryCaps {
   HeliosNvrmHeader head;
   uint32_t max_buffer_bytes;      /* out */
   uint32_t default_timeout_ms;    /* out: FORWARD default for timeout_ms == 0 */
-  uint64_t supported_ops;         /* out: bit n <=> HELIOS_NVRM_OP_* == n */
-  uint32_t supported_event_kinds; /* out: bit n <=> HELIOS_NVRM_EVENT_* == n */
+  uint64_t supported_ops;         /* out: bit n <=> HELIOS_NVRM_OP_* == n (ops 5, 6
+                                     only while events are usable) */
+  uint32_t supported_event_kinds; /* out: bit n <=> HELIOS_NVRM_EVENT_* == n;
+                                     0 when events are not usable */
   uint32_t supported_cache_types; /* out: bit n <=> HELIOS_NVRM_CACHE_* == n */
   uint32_t device_features;       /* out: virtio config `features` (NVGPU_CFG_*) */
   uint32_t max_handles;           /* out: per process */
@@ -211,7 +213,17 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmMunmap, mapping_id) == 40, "munmap.
 
 /* ---- events (persistent, level-triggered, no lost wakeup) ------------------ */
 #define HELIOS_NVRM_EVENT_READY 1u          /* host EventReady for `handle` */
-#define HELIOS_NVRM_EVENT_TRANSPORT_LOST 2u /* device reset; handle ignored (0) */
+#define HELIOS_NVRM_EVENT_TRANSPORT_LOST 2u /* device reset; handle ignored (0);
+                                               wakes EVERY registration */
+/* what QUERY_CAPS.supported_event_kinds reports while events are usable */
+#define HELIOS_NVRM_EVENT_KINDS_ALL                                            \
+  ((1u << HELIOS_NVRM_EVENT_READY) | (1u << HELIOS_NVRM_EVENT_TRANSPORT_LOST))
+/* EVENT_REGISTER needs the KMD's event queue (virtqueue 1) to be up; if it is
+ * not, REGISTER answers HELIOS_NVRM_ST_UNSUPPORTED and supported_event_kinds is
+ * 0. No feature bit is involved (the KMD never acks the input bit). A registration is keyed (process, handle, kind);
+ * registering it again replaces the event (STATE_REPLACED). A transport that has
+ * already failed answers HELIOS_NVRM_ST_TRANSPORT_RESET. UNREGISTER ignores
+ * event_handle and does not signal. Full contract: the Rust file. */
 
 #define HELIOS_NVRM_EVENT_STATE_REGISTERED 1u
 #define HELIOS_NVRM_EVENT_STATE_REPLACED 2u
@@ -229,8 +241,12 @@ typedef struct HeliosNvrmEvent {
 } HeliosNvrmEvent;
 #define HELIOS_NVRM_EVENT_BYTES 64u
 HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmEvent) == HELIOS_NVRM_EVENT_BYTES, "Event");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmEvent, handle) == 40, "event.handle");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmEvent, kind) == 44, "event.kind");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmEvent, event_handle) == 48, "event.event_handle");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmEvent, flags) == 56, "event.flags");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmEvent, out_state) == 60, "event.out_state");
+HELIOS_NVRM_STATIC_ASSERT(HELIOS_NVRM_EVENT_KINDS_ALL == 6u, "event kinds");
 
 /* ---- PIN / UNPIN: memory registered by CPU address ------------------------- */
 /* IoctlReq.deep_ptr_offset values the host reads as a page-run table (host

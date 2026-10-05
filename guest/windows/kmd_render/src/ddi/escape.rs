@@ -56,8 +56,11 @@ use helios_protocol::{
 };
 
 use helios_protocol::{
-    HeliosNvrmForward, HeliosNvrmHeader, HeliosNvrmMmap, HeliosNvrmMunmap, HeliosNvrmPin,
-    HeliosNvrmQueryCaps, HeliosNvrmUnpin, HELIOS_NVRM_PIN_DEEP_BIT_DIRECT,
+    HeliosNvrmEvent, HeliosNvrmForward, HeliosNvrmHeader, HeliosNvrmMmap, HeliosNvrmMunmap,
+    HeliosNvrmPin, HeliosNvrmQueryCaps, HeliosNvrmUnpin, HELIOS_NVRM_EVENT_STATE_LATCHED_SIGNALED,
+    HELIOS_NVRM_EVENT_STATE_NOT_FOUND, HELIOS_NVRM_EVENT_STATE_REGISTERED,
+    HELIOS_NVRM_EVENT_STATE_REPLACED, HELIOS_NVRM_EVENT_STATE_UNREGISTERED,
+    HELIOS_NVRM_ST_TRANSPORT_RESET, HELIOS_NVRM_PIN_DEEP_BIT_DIRECT,
     HELIOS_NVRM_PIN_DEEP_BIT_INDIRECT, HELIOS_NVRM_ST_PIN_IN_USE, HELIOS_NVRM_ST_TOO_SCATTERED,
     HELIOS_ESCAPE_NVRM, HELIOS_NVRM_CACHE_DEFAULT, HELIOS_NVRM_CACHE_UC, HELIOS_NVRM_CACHE_WB,
     HELIOS_NVRM_CACHE_WC, HELIOS_NVRM_PROT_READ, HELIOS_NVRM_PROT_WRITE,
@@ -1720,6 +1723,10 @@ const NVRM_OPS_IMPLEMENTED: u64 = (1 << HELIOS_NVRM_OP_QUERY_CAPS)
     | (1 << HELIOS_NVRM_OP_MUNMAP)
     | (1 << HELIOS_NVRM_OP_PIN)
     | (1 << HELIOS_NVRM_OP_UNPIN);
+/// The event ops, reported (`QUERY_CAPS.supported_ops`) only while events are
+/// usable on this device; see `virtio::gpu::nvrm_events`.
+const NVRM_EVENT_OPS: u64 =
+    (1 << HELIOS_NVRM_OP_EVENT_REGISTER) | (1 << HELIOS_NVRM_OP_EVENT_UNREGISTER);
 /// Cache types `MMAP` provides, as a bitmask over `HELIOS_NVRM_CACHE_*`.
 const NVRM_CACHE_TYPES: u32 = (1 << HELIOS_NVRM_CACHE_DEFAULT)
     | (1 << HELIOS_NVRM_CACHE_UC)
@@ -1759,7 +1766,7 @@ fn escape_nvrm(
 }
 
 /// Write the `Nv*` registry counters when a session-shaping count moved
-/// (open / close / map / pin) or every 256th call. The registry write is far too
+/// (open / close / map / pin / event registration) or every 256th call. The registry write is far too
 /// slow for every forward, but these escapes can run for a whole session with no
 /// present, which is the other place the counters are published.
 fn nvrm_publish_counters_if_due() {
@@ -1767,8 +1774,16 @@ fn nvrm_publish_counters_if_due() {
     use core::sync::atomic::{AtomicU32, Ordering};
     static LAST_SHAPE: AtomicU32 = AtomicU32::new(0);
     static CALLS: AtomicU32 = AtomicU32::new(0);
-    let shape = [&n::NVRM_OPENS, &n::NVRM_CLOSES, &n::NVRM_MAPS, &n::NVRM_PINS, &n::NVRM_UNPINS]
-        .iter()
+    let shape = [
+        &n::NVRM_OPENS,
+        &n::NVRM_CLOSES,
+        &n::NVRM_MAPS,
+        &n::NVRM_PINS,
+        &n::NVRM_UNPINS,
+        &n::NVRM_EV_REGS,
+        &n::NVRM_EV_UNREGS,
+    ]
+    .iter()
         .fold(0u32, |a, c| a.wrapping_mul(31).wrapping_add(c.load(Ordering::Relaxed)));
     let tick = CALLS.fetch_add(1, Ordering::Relaxed).wrapping_add(1) & 0xFF == 0;
     if LAST_SHAPE.swap(shape, Ordering::Relaxed) != shape || tick {
@@ -1807,10 +1822,16 @@ fn escape_nvrm_op(
             let mut caps = wire.read();
             caps.max_buffer_bytes = HELIOS_NVRM_MAX_BUFFER;
             caps.default_timeout_ms = NVRM_DEFAULT_TIMEOUT_MS;
-            caps.supported_ops = NVRM_OPS_IMPLEMENTED;
-            caps.supported_event_kinds = 0;
+            // Events exist only while the KMD's event queue is up and the transport is
+            // up; the transport being down is not an error for QUERY_CAPS.
+            let (event_kinds, device_features) = adapter
+                .with_virtio(|v| (v.nvrm_event_kinds(), v.nvrm_device_features()))
+                .unwrap_or((0, 0));
+            caps.supported_ops =
+                NVRM_OPS_IMPLEMENTED | if event_kinds != 0 { NVRM_EVENT_OPS } else { 0 };
+            caps.supported_event_kinds = event_kinds;
             caps.supported_cache_types = NVRM_CACHE_TYPES;
-            caps.device_features = 0;
+            caps.device_features = device_features;
             caps.max_handles = crate::virtio::gpu::MAX_NVRM_HANDLES_PER_OWNER as u32;
             caps.max_mappings = crate::virtio::gpu::MAX_NVRM_MAPS_PER_OWNER as u32;
             caps.max_pins = crate::virtio::gpu::MAX_NVRM_PINS_PER_OWNER as u32;
@@ -1827,11 +1848,135 @@ fn escape_nvrm_op(
         HELIOS_NVRM_OP_MUNMAP => nvrm_munmap(passive, adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_PIN => nvrm_pin(passive, adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_UNPIN => nvrm_unpin(adapter, buf, hdr, owner, epoch),
-        HELIOS_NVRM_OP_EVENT_REGISTER | HELIOS_NVRM_OP_EVENT_UNREGISTER => {
-            nvrm_finish(buf, head, HELIOS_NVRM_ST_UNSUPPORTED, epoch)
-        }
+        HELIOS_NVRM_OP_EVENT_REGISTER => nvrm_event_register(adapter, buf, hdr, owner, epoch),
+        HELIOS_NVRM_OP_EVENT_UNREGISTER => nvrm_event_unregister(adapter, buf, hdr, owner, epoch),
         _ => STATUS_INVALID_PARAMETER,
     }
+}
+
+/// `HELIOS_NVRM_OP_EVENT_REGISTER`: tie the caller's event to `(handle, kind)`, so
+/// the host's `EventReady` for the handle (or the loss of the transport) signals
+/// it. PASSIVE, in the caller's process: the event handle is resolved in ITS
+/// handle table. The contract is `helios_protocol::nvrm::HeliosNvrmEvent`.
+fn nvrm_event_register(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    epoch: u64,
+) -> NTSTATUS {
+    use crate::virtio::gpu::NvrmEventsState;
+    use crate::virtio::nvrm::{self, EventRefusal, EventState};
+    use core::sync::atomic::Ordering;
+    let mut wire = match EscapeBuf::<HeliosNvrmEvent>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut e = wire.read();
+    e.head.epoch = epoch;
+    e.out_state = 0;
+    if e.flags != 0 || e.kind == 0 || e.event_handle == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Availability is checked before the handle is touched, so an unsupported
+    // device costs no object reference. No transport at all is the escape-level verdict.
+    let state = match adapter.with_virtio(|v| v.nvrm_events_state()) {
+        Ok(s) => s,
+        Err(_) => return STATUS_DEVICE_NOT_READY,
+    };
+    // These refusals are counted here; `register_event` counts its own.
+    match state {
+        NvrmEventsState::Unavailable | NvrmEventsState::Lost => {
+            crate::virtio::nvrm::NVRM_EV_REFUSED.fetch_add(1, Ordering::Relaxed);
+            let st = if state == NvrmEventsState::Lost {
+                HELIOS_NVRM_ST_TRANSPORT_RESET
+            } else {
+                HELIOS_NVRM_ST_UNSUPPORTED
+            };
+            return nvrm_event_answer(&mut wire, &mut e, st);
+        }
+        NvrmEventsState::Ready => {}
+    }
+    // A kind this build does not know is valid in the ABI but not provided.
+    if !helios_kmd_logic::nvrm_events::kind_known(e.kind) {
+        crate::virtio::nvrm::NVRM_EV_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_UNSUPPORTED);
+    }
+    let Some(event) = reference_user_event(e.event_handle) else {
+        crate::virtio::nvrm::NVRM_EV_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    };
+    // `register_event` takes over `event`'s reference whatever the outcome.
+    match nvrm::register_event(adapter, owner, e.handle, e.kind, event) {
+        Ok(st) => {
+            e.out_state = match st {
+                EventState::Registered => HELIOS_NVRM_EVENT_STATE_REGISTERED,
+                EventState::Replaced => HELIOS_NVRM_EVENT_STATE_REPLACED,
+                EventState::LatchedSignaled => HELIOS_NVRM_EVENT_STATE_LATCHED_SIGNALED,
+            };
+            nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_OK)
+        }
+        Err(EventRefusal::NoTransport) => STATUS_DEVICE_NOT_READY,
+        Err(EventRefusal::Unsupported) => {
+            nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_UNSUPPORTED)
+        }
+        Err(EventRefusal::TransportLost) => {
+            nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_TRANSPORT_RESET)
+        }
+        Err(EventRefusal::NotOwned) => {
+            nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_NOT_OWNED)
+        }
+        Err(EventRefusal::NoResources) => {
+            nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_NO_RESOURCES)
+        }
+    }
+}
+
+/// Write an event op's reply with the KMD verdict `status`.
+fn nvrm_event_answer(
+    wire: &mut EscapeBuf<'_, HeliosNvrmEvent>,
+    e: &mut HeliosNvrmEvent,
+    status: i32,
+) -> NTSTATUS {
+    e.head.status = status;
+    wire.write_back(e);
+    STATUS_SUCCESS
+}
+
+/// `HELIOS_NVRM_OP_EVENT_UNREGISTER`: remove the registration `(handle, kind)` of
+/// the calling process. Not gated: without events there is nothing to find.
+fn nvrm_event_unregister(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    epoch: u64,
+) -> NTSTATUS {
+    use crate::virtio::nvrm;
+    let mut wire = match EscapeBuf::<HeliosNvrmEvent>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut e = wire.read();
+    e.head.epoch = epoch;
+    e.out_state = 0;
+    if e.flags != 0 || e.kind == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let removed = if helios_kmd_logic::nvrm_events::kind_known(e.kind) {
+        match nvrm::unregister_event(adapter, owner, e.handle, e.kind) {
+            Some(removed) => removed,
+            None => return STATUS_DEVICE_NOT_READY,
+        }
+    } else {
+        false
+    };
+    e.out_state = if removed {
+        HELIOS_NVRM_EVENT_STATE_UNREGISTERED
+    } else {
+        HELIOS_NVRM_EVENT_STATE_NOT_FOUND
+    };
+    nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_OK)
 }
 
 /// `HELIOS_NVRM_OP_MMAP`: ask the host to `Mmap`, then map the returned range of
