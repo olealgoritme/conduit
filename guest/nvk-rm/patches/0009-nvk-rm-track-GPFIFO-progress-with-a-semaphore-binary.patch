@@ -1,4 +1,4 @@
-From 56bc857b218b02ba40a154f2478d215b901dff62 Mon Sep 17 00:00:00 2001
+From 2a05530352a856c0a491428c79fb7e77d3a10e31 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 22:15:15 +0200
 Subject: [PATCH 09/13] nvk/rm: track GPFIFO progress with a semaphore; binary
@@ -17,7 +17,6 @@ Two failures from running vkcube on GB202 under GSP:
   semaphores when it runs a submit thread (assisted timeline mode):
   vkCreateSemaphore asserted.  Add one: swap the two binaries' timelines
   and points, then reset the source past any signal still in flight.
-
 ---
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  2 +
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c  | 99 ++++++++++++++++++---

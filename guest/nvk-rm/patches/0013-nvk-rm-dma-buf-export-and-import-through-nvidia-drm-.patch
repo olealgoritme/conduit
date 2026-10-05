@@ -1,4 +1,4 @@
-From d93f51536cf0e2ba4f62249fe10ef5c538300bff Mon Sep 17 00:00:00 2001
+From e3c363fb45a6b022dab9a3a5eb3bd4fd8a1b0140 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 23:12:40 +0200
 Subject: [PATCH 13/13] nvk/rm: dma-buf export and import through nvidia-drm,
@@ -47,7 +47,6 @@ On an RTX 5090 in a Conduit guest (GNOME 50, Xwayland): vkcube renders
 through the native X11 and Wayland WSI paths with no CPU copy; at
 1920x1080 with uncapped present modes, 2900 fps on X11 (software WSI:
 630) and 4900 fps on Wayland (software: 590).
-
 ---
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  27 ++
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  |  15 +

@@ -1,4 +1,4 @@
-From d35e85a388c6e89e438cde9818d664eabe7a28db Mon Sep 17 00:00:00 2001
+From aa06d88a7fcdcc6c3a253f1337c1040d1b7e3712 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 21:21:27 +0200
 Subject: [PATCH 03/13] nvk/rm: enumerate RM GPUs and fill in the physical
@@ -20,7 +20,6 @@ nv_device_info from RM:
 
 No BAR heap is advertised: CPU-mappable memory will be backed by system
 pages.  Logical devices are not implemented yet.
-
 ---
  src/nouveau/vulkan/meson.build              |   2 +
  src/nouveau/vulkan/nvkmd/nvkmd.c            |   8 +

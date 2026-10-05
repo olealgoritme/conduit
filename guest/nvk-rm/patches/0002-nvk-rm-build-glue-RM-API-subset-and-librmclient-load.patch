@@ -1,4 +1,4 @@
-From a0af9dd1e5e5d8f7dd642cf8513ec2edcd23e749 Mon Sep 17 00:00:00 2001
+From 6b24cae7f654e8fb5ef31c753c8cfcbd437def9a Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 21:18:05 +0200
 Subject: [PATCH 02/13] nvk/rm: build glue, RM API subset and librmclient
@@ -21,7 +21,6 @@ nvrm/nvrm_api.h carries the minimal subset of NVIDIA's RM API this backend
 uses (classes, alloc parameters, controls, host methods), copied from
 open-gpu-kernel-modules 610.57.04 (MIT), with static asserts on the
 parameter sizes RM expects.
-
 ---
  meson.options                                 |   9 +
  src/nouveau/vulkan/meson.build                |  20 +

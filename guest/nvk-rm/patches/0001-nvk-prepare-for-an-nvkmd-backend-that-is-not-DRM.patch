@@ -1,4 +1,4 @@
-From 6f84e19996e94ca40097f900ee8a6d6d354a2634 Mon Sep 17 00:00:00 2001
+From c02c7a1267132d098962c9bb4e7bf81982381cb9 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 21:11:11 +0200
 Subject: [PATCH 01/13] nvk: prepare for an nvkmd backend that is not DRM
@@ -23,7 +23,6 @@ Also:
 
 nouveau sets has_dma_buf and has_host_visible_vram, so there is no
 functional change for nouveau.
-
 ---
  src/nouveau/vulkan/nvk_device.c               |  8 +-
  src/nouveau/vulkan/nvk_instance.c             |  1 +

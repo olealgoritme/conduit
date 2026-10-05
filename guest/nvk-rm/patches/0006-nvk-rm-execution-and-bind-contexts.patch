@@ -1,4 +1,4 @@
-From a1d52b465aa8bb793e706f482f262caeccc12431 Mon Sep 17 00:00:00 2001
+From 8c7a0e3fd4b780111e65552d79d283d449cea2de Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 21:31:07 +0200
 Subject: [PATCH 06/13] nvk/rm: execution and bind contexts
@@ -35,7 +35,6 @@ Bind contexts have no RM queue: binds are applied synchronously with
 NV_ESC_RM_MAP/UNMAP_MEMORY_DMA.
 
 Waiting on and signaling vk_syncs is not wired up yet.
-
 ---
  src/nouveau/vulkan/meson.build              |   1 +
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  19 +-

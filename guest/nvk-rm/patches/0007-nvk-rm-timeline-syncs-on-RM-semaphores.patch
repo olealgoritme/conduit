@@ -1,4 +1,4 @@
-From 8aa0d7d39849735c18673b10a9edc296ecf30f64 Mon Sep 17 00:00:00 2001
+From 2d95fd0da25dc35817bcd16a901ae0009961e1b0 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 21:32:03 +0200
 Subject: [PATCH 07/13] nvk/rm: timeline syncs on RM semaphores
@@ -23,7 +23,6 @@ timeline mode and holds back submits that wait on unsubmitted values,
 rather than leaving a GPU acquire spinning on a value nobody submitted.
 Export/import (sync_file, opaque fd) is not supported yet: that needs an
 RM semaphore surface bridged to DRM syncobjs through nvidia-drm.
-
 ---
  src/nouveau/vulkan/meson.build              |   1 +
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c  | 105 ++++++--

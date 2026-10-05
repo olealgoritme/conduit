@@ -1,4 +1,4 @@
-From d4de8b95433d68c298545f34e6067becad229d51 Mon Sep 17 00:00:00 2001
+From b97c531d38fcae741423d254a608edd1fa9462b3 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 23:11:54 +0200
 Subject: [PATCH 10/13] nvk/rm: report VA ranges at the size NVK asked for
@@ -12,7 +12,6 @@ nvkmd_va_bind_mem asserted (vkcube at 1280x720 or more, with either WSI).
 
 Keep the rounded size for RM and our heap (nvkmd_rm_va::rm_size_B) and
 report the requested size, aligned to the big page, to NVK.
-
 ---
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h    |  5 ++++-
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c | 10 ++++++++--

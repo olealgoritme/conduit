@@ -1,4 +1,4 @@
-From ead804ed19967b6d1ae639833693026cb7a272f6 Mon Sep 17 00:00:00 2001
+From 91745c756a477da8de45b7928d6cdd8f0d9bee4b Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 21:25:27 +0200
 Subject: [PATCH 05/13] nvk/rm: GPU VA allocation and binding
@@ -16,7 +16,6 @@ for VRAM and snooped 4 KiB pages for system memory, and the VA's PTE kind
 through kindOverride when librmclient has crm_map_dma2.  RM unmaps whole
 mappings only, so each VA tracks its mappings and a partial unbind
 unmaps the overlapping ones and maps back the remainders.
-
 ---
  src/nouveau/vulkan/meson.build             |   1 +
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |   2 +

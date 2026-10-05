@@ -1,4 +1,4 @@
-From eb12ff0189b065cd4c87a6fe26255016e94755b4 Mon Sep 17 00:00:00 2001
+From bb0747a219d725552266f7e6340a2b38e6c8c5f6 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 23:12:10 +0200
 Subject: [PATCH 12/13] vulkan/wsi, nvk: wait for rendering before presenting
@@ -16,7 +16,6 @@ software path already does (only for images without explicit sync or a
 dma-buf semaphore).  NVK sets it when the backend has dma-bufs but its
 sync type cannot export sync_files, i.e. for RM; nothing changes for
 nouveau.
-
 ---
  src/nouveau/vulkan/nvk_wsi.c | 8 ++++++++
  src/vulkan/wsi/wsi_common.c  | 4 +++-

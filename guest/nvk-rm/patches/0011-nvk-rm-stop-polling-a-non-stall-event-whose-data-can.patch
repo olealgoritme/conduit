@@ -1,4 +1,4 @@
-From 472277bf1cf4f3ac0699cfab8152051ac1bbec0c Mon Sep 17 00:00:00 2001
+From 7d9b541eddab3de1aa485a309fd0a61d032cca58 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Mon, 5 Oct 2026 23:12:01 +0200
 Subject: [PATCH 11/13] nvk/rm: stop polling a non-stall event whose data
@@ -10,7 +10,6 @@ leaves the event readable for good, so every wait spun through poll()
 and refused escapes: about 5800 refusals (and backend log lines) per
 second while vkcube ran.  Once a drain fails, waits sleep with backoff
 instead, as without an event.
-
 ---
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |  2 ++
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c | 18 ++++++++++++++----
