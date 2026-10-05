@@ -56,7 +56,9 @@ use helios_protocol::{
 };
 
 use helios_protocol::{
-    HeliosNvrmForward, HeliosNvrmHeader, HeliosNvrmMmap, HeliosNvrmMunmap, HeliosNvrmQueryCaps,
+    HeliosNvrmForward, HeliosNvrmHeader, HeliosNvrmMmap, HeliosNvrmMunmap, HeliosNvrmPin,
+    HeliosNvrmQueryCaps, HeliosNvrmUnpin, HELIOS_NVRM_PIN_DEEP_BIT_DIRECT,
+    HELIOS_NVRM_PIN_DEEP_BIT_INDIRECT, HELIOS_NVRM_ST_PIN_IN_USE, HELIOS_NVRM_ST_TOO_SCATTERED,
     HELIOS_ESCAPE_NVRM, HELIOS_NVRM_CACHE_DEFAULT, HELIOS_NVRM_CACHE_UC, HELIOS_NVRM_CACHE_WB,
     HELIOS_NVRM_CACHE_WC, HELIOS_NVRM_PROT_READ, HELIOS_NVRM_PROT_WRITE,
     HELIOS_NVRM_ABI_VERSION, HELIOS_NVRM_FORWARD_BYTES, HELIOS_NVRM_MAX_BUFFER,
@@ -69,8 +71,8 @@ use helios_protocol::{
 };
 
 use super::blob_map::{
-    effective_map_cache, map_cache_to_mm, map_io_pages_to_user, map_nonpaged_page_to_user_readonly,
-    unmap_io_pages_from_user,
+    effective_map_cache, map_cache_to_mm, map_io_pages_to_user, map_io_pages_to_user_prot,
+    map_nonpaged_page_to_user_readonly, unmap_io_pages_from_user,
 };
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
@@ -1715,7 +1717,9 @@ const NVRM_DEFAULT_TIMEOUT_MS: u32 = 30_000;
 const NVRM_OPS_IMPLEMENTED: u64 = (1 << HELIOS_NVRM_OP_QUERY_CAPS)
     | (1 << HELIOS_NVRM_OP_FORWARD)
     | (1 << HELIOS_NVRM_OP_MMAP)
-    | (1 << HELIOS_NVRM_OP_MUNMAP);
+    | (1 << HELIOS_NVRM_OP_MUNMAP)
+    | (1 << HELIOS_NVRM_OP_PIN)
+    | (1 << HELIOS_NVRM_OP_UNPIN);
 /// Cache types `MMAP` provides, as a bitmask over `HELIOS_NVRM_CACHE_*`.
 const NVRM_CACHE_TYPES: u32 = (1 << HELIOS_NVRM_CACHE_DEFAULT)
     | (1 << HELIOS_NVRM_CACHE_UC)
@@ -1743,6 +1747,36 @@ fn nvrm_finish(buf: &mut [u8], mut head: HeliosNvrmHeader, status: i32, epoch: u
 /// KMD's own verdict in `HeliosNvrmHeader.status`; the RM's answer travels in the
 /// forwarded reply bytes and is never interpreted here.
 fn escape_nvrm(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+) -> NTSTATUS {
+    let st = escape_nvrm_op(passive, adapter, buf, hdr, owner);
+    nvrm_publish_counters_if_due();
+    st
+}
+
+/// Write the `Nv*` registry counters when a session-shaping count moved
+/// (open / close / map / pin) or every 256th call. The registry write is far too
+/// slow for every forward, but these escapes can run for a whole session with no
+/// present, which is the other place the counters are published.
+fn nvrm_publish_counters_if_due() {
+    use crate::virtio::nvrm as n;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static LAST_SHAPE: AtomicU32 = AtomicU32::new(0);
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let shape = [&n::NVRM_OPENS, &n::NVRM_CLOSES, &n::NVRM_MAPS, &n::NVRM_PINS, &n::NVRM_UNPINS]
+        .iter()
+        .fold(0u32, |a, c| a.wrapping_mul(31).wrapping_add(c.load(Ordering::Relaxed)));
+    let tick = CALLS.fetch_add(1, Ordering::Relaxed).wrapping_add(1) & 0xFF == 0;
+    if LAST_SHAPE.swap(shape, Ordering::Relaxed) != shape || tick {
+        crate::ddi::publish_nvrm_counters();
+    }
+}
+
+fn escape_nvrm_op(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
@@ -1779,9 +1813,9 @@ fn escape_nvrm(
             caps.device_features = 0;
             caps.max_handles = crate::virtio::gpu::MAX_NVRM_HANDLES_PER_OWNER as u32;
             caps.max_mappings = crate::virtio::gpu::MAX_NVRM_MAPS_PER_OWNER as u32;
-            caps.max_pins = 0;
-            caps.max_pin_pages = 0;
-            caps.pin_deep_kinds = 0;
+            caps.max_pins = crate::virtio::gpu::MAX_NVRM_PINS_PER_OWNER as u32;
+            caps.max_pin_pages = crate::virtio::gpu::MAX_NVRM_PIN_PAGES as u32;
+            caps.pin_deep_kinds = HELIOS_NVRM_PIN_DEEP_BIT_DIRECT | HELIOS_NVRM_PIN_DEEP_BIT_INDIRECT;
             caps.head.status = HELIOS_NVRM_ST_OK;
             caps.head.epoch = epoch;
             wire.write_back(&caps);
@@ -1791,19 +1825,22 @@ fn escape_nvrm(
         // Valid in the ABI, not implemented by this KMD build: QUERY_CAPS says so.
         HELIOS_NVRM_OP_MMAP => nvrm_mmap(passive, adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_MUNMAP => nvrm_munmap(passive, adapter, buf, hdr, owner, epoch),
-        HELIOS_NVRM_OP_EVENT_REGISTER
-        | HELIOS_NVRM_OP_EVENT_UNREGISTER
-        | HELIOS_NVRM_OP_PIN
-        | HELIOS_NVRM_OP_UNPIN => nvrm_finish(buf, head, HELIOS_NVRM_ST_UNSUPPORTED, epoch),
+        HELIOS_NVRM_OP_PIN => nvrm_pin(passive, adapter, buf, hdr, owner, epoch),
+        HELIOS_NVRM_OP_UNPIN => nvrm_unpin(adapter, buf, hdr, owner, epoch),
+        HELIOS_NVRM_OP_EVENT_REGISTER | HELIOS_NVRM_OP_EVENT_UNREGISTER => {
+            nvrm_finish(buf, head, HELIOS_NVRM_ST_UNSUPPORTED, epoch)
+        }
         _ => STATUS_INVALID_PARAMETER,
     }
 }
 
 /// `HELIOS_NVRM_OP_MMAP`: ask the host to `Mmap`, then map the returned range of
 /// the RM window (or the UVM aperture) into the calling process. The mapping
-/// lives in `AdapterContext::mappings` under `nvrm::map_key(mapping_id)`, so the
-/// device teardown that already unmaps blob views unmaps these too; the host's
-/// side is released by `Close`, `MUNMAP` or `nvrm::close_all_for_owner`.
+/// lives in `AdapterContext::mappings` under `nvrm::map_key(kmd_id)`, where
+/// `kmd_id` is OURS (the host's mapping ids are not unique: the RM path answers 0
+/// for every one), so the device teardown that already unmaps blob views unmaps
+/// these too; the host's side is released by `Close`, `MUNMAP` or
+/// `nvrm::close_all_for_owner`.
 fn nvrm_mmap(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -1844,7 +1881,6 @@ fn nvrm_mmap(
                 MapRefusal::NotOwned => finish(&mut m, HELIOS_NVRM_ST_NOT_OWNED, 0),
                 MapRefusal::BadRange => finish(&mut m, HELIOS_NVRM_ST_BAD_RANGE, 0),
                 MapRefusal::NoResources => finish(&mut m, HELIOS_NVRM_ST_NO_RESOURCES, 0),
-                MapRefusal::Unsupported => finish(&mut m, HELIOS_NVRM_ST_UNSUPPORTED, 0),
                 MapRefusal::Host(errno) => finish(&mut m, HELIOS_NVRM_ST_DEVICE_ERROR, errno),
                 MapRefusal::Transport(crate::virtio::VirtioError::Timeout) => {
                     finish(&mut m, HELIOS_NVRM_ST_TIMEOUT, 0)
@@ -1854,12 +1890,14 @@ fn nvrm_mmap(
         }
     };
 
-    // From here the host holds a mapping: every failure releases it.
+    // From here the host holds a mapping: every failure releases it (unless a
+    // live mapping still carries the same nonzero host id, or the id is 0 and RM
+    // releases it itself — `release_host_map` knows both).
+    let handle = m.handle;
     let undo = |status: i32| {
-        let _ = nvrm::host_munmap(passive, adapter, m.handle, host.mapping_id);
+        let _ = nvrm::release_host_map(passive, adapter, handle, host.host_id);
         status
     };
-    let key_ok = host.mapping_id != 0 && host.mapping_id & 0x8000_0000 == 0;
     let region = nvrm::region_for(adapter, host.device_type);
     let in_range = |r: &crate::virtio::pci_caps::HostVisibleWindow| {
         host.offset % 4096 == 0
@@ -1869,7 +1907,7 @@ fn nvrm_mmap(
                 .checked_add(m.size)
                 .is_some_and(|end| end <= r.len)
     };
-    let Some(region) = region.filter(|r| key_ok && in_range(r)) else {
+    let Some(region) = region.filter(|r| in_range(r)) else {
         let status = undo(if region.is_none() {
             HELIOS_NVRM_ST_UNSUPPORTED
         } else {
@@ -1880,9 +1918,9 @@ fn nvrm_mmap(
     };
 
     // UVM memory is the host kernel's ordinary RAM, coherent with the GPU:
-    // write-back. Everything else defaults to write-combined, as the Linux module
-    // maps it. An explicit request is honoured for non-UVM.
-    let uvm = host.device_type == 256 || host.device_type == 257;
+    // write-back. Everything else (UVM tools included) defaults to write-combined,
+    // as the Linux module maps it. An explicit request is honoured for non-UVM.
+    let uvm = host.device_type == 256;
     let effective = if uvm {
         HELIOS_NVRM_CACHE_WB
     } else if m.cache_request == HELIOS_NVRM_CACHE_DEFAULT {
@@ -1898,41 +1936,46 @@ fn nvrm_mmap(
     // SAFETY: PASSIVE_LEVEL escape in the caller's process, no lock held;
     // `region.base + host.offset .. + m.size` was just checked to lie inside the
     // region's BAR range, and is page aligned.
-    let mapped = unsafe { map_io_pages_to_user(region.base + host.offset, m.size, cache) };
+    let mapped =
+        unsafe { map_io_pages_to_user_prot(region.base + host.offset, m.size, cache, !write) };
     let Some((user_va, mdl)) = mapped else {
         crate::virtio::gpu::MAP_PAGES_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         crate::virtio::nvrm::NVRM_MAP_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let status = undo(HELIOS_NVRM_ST_NO_RESOURCES);
         return finish(&mut m, status, 0);
     };
-    let key = nvrm::map_key(host.mapping_id);
-    let inserted = matches!(
-        adapter
-            .mappings
-            .insert_unique(owner.raw(), key, user_va, mdl as usize),
-        crate::mapping::InsertResult::Inserted
-    );
-    let tracked = inserted
-        && adapter
-            .with_virtio(|v| v.push_nvrm_map(owner, m.handle, host.mapping_id))
-            .unwrap_or(false);
-    if !tracked {
-        if inserted {
-            let _ = adapter.mappings.take_for_resource(owner.raw(), key);
+
+    // Track it and mint its id under one lock hold, which also re-checks that the
+    // handle is still ours (a concurrent Close may have forgotten it).
+    let kmd_id = adapter
+        .with_virtio(|v| v.push_nvrm_map(owner, m.handle, host.host_id))
+        .ok()
+        .flatten();
+    let inserted = kmd_id.is_some_and(|id| {
+        matches!(
+            adapter
+                .mappings
+                .insert_unique(owner.raw(), nvrm::map_key(id), user_va, mdl as usize),
+            crate::mapping::InsertResult::Inserted
+        )
+    });
+    let Some(kmd_id) = kmd_id.filter(|_| inserted) else {
+        if let Some(id) = kmd_id {
+            // The slot was made but the view could not be recorded: take both back.
+            let _ = adapter.with_virtio(|v| v.take_nvrm_map(owner, id));
         }
         // SAFETY: still in the owning process at PASSIVE; the pair is the one
-        // `map_io_pages_to_user` returned and is not in any table now.
+        // `map_io_pages_to_user_prot` returned and is not in any table now.
         unsafe { unmap_io_pages_from_user(user_va, mdl) };
         crate::virtio::nvrm::NVRM_MAP_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let status = undo(HELIOS_NVRM_ST_NO_RESOURCES);
         return finish(&mut m, status, 0);
-    }
+    };
 
     crate::virtio::nvrm::NVRM_MAPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     m.out_user_va = user_va;
-    m.out_mapping_id = host.mapping_id;
+    m.out_mapping_id = kmd_id;
     m.cache_effective = effective;
-    m.size = m.size.min(host.size);
     finish(&mut m, HELIOS_NVRM_ST_OK, 0)
 }
 
@@ -1955,11 +1998,11 @@ fn nvrm_munmap(
     if u.flags != 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    let handle = adapter
+    let slot = adapter
         .with_virtio(|v| v.take_nvrm_map(owner, u.mapping_id))
         .ok()
         .flatten();
-    let Some(handle) = handle else {
+    let Some((handle, host_id)) = slot else {
         u.head.status = HELIOS_NVRM_ST_NOT_OWNED;
         wire.write_back(&u);
         return STATUS_SUCCESS;
@@ -1969,13 +2012,92 @@ fn nvrm_munmap(
         .take_for_resource(owner.raw(), nvrm::map_key(u.mapping_id))
     {
         // SAFETY: PASSIVE, in the process that mapped it (an escape from the
-        // same device handle); the pair came from `map_io_pages_to_user` and was
-        // removed from the table just now.
+        // same device handle); the pair came from `map_io_pages_to_user_prot` and
+        // was removed from the table just now.
         unsafe { unmap_io_pages_from_user(va, mdl as *mut wdk_sys::MDL) };
     }
-    u.head.status = match nvrm::host_munmap(passive, adapter, handle, u.mapping_id) {
+    u.head.status = match nvrm::release_host_map(passive, adapter, handle, host_id) {
         Ok(()) => HELIOS_NVRM_ST_OK,
         Err(crate::virtio::VirtioError::Timeout) => HELIOS_NVRM_ST_TIMEOUT,
+        Err(_) => HELIOS_NVRM_ST_DEVICE_ERROR,
+    };
+    wire.write_back(&u);
+    STATUS_SUCCESS
+}
+
+/// `HELIOS_NVRM_OP_PIN`: lock a range of the caller's memory for an OS-descriptor
+/// registration and return the id the registration `FORWARD` names. The page-run
+/// table stays in the KMD (user mode never supplies or sees a physical address).
+fn nvrm_pin(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    epoch: u64,
+) -> NTSTATUS {
+    use crate::virtio::nvrm::{self, PinRefusal};
+    let mut wire = match EscapeBuf::<HeliosNvrmPin>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut p = wire.read();
+    p.head.epoch = epoch;
+    if p.flags != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    p.out_pin_id = 0;
+    p.out_npages = 0;
+    p.head.status = match nvrm::pin_pages(
+        passive,
+        adapter,
+        owner,
+        p.handle,
+        p.user_va,
+        p.length,
+        p.h_root,
+        p.h_object,
+    ) {
+        Ok(out) => {
+            p.out_pin_id = out.id;
+            p.out_npages = out.npages;
+            HELIOS_NVRM_ST_OK
+        }
+        Err(PinRefusal::NotOwned) => HELIOS_NVRM_ST_NOT_OWNED,
+        Err(PinRefusal::BadRange) => HELIOS_NVRM_ST_BAD_RANGE,
+        Err(PinRefusal::NoResources) => HELIOS_NVRM_ST_NO_RESOURCES,
+        Err(PinRefusal::TooScattered) => HELIOS_NVRM_ST_TOO_SCATTERED,
+    };
+    wire.write_back(&p);
+    STATUS_SUCCESS
+}
+
+/// `HELIOS_NVRM_OP_UNPIN`: release a pin no registration has used (a failure path
+/// in the caller). A used pin is the KMD's to release.
+fn nvrm_unpin(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    epoch: u64,
+) -> NTSTATUS {
+    use crate::virtio::gpu::PinTake;
+    let mut wire = match EscapeBuf::<HeliosNvrmUnpin>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut u = wire.read();
+    u.head.epoch = epoch;
+    if u.flags != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    u.head.status = match adapter.with_virtio(|v| v.take_nvrm_unused_pin(owner, u.pin_id)) {
+        Ok(PinTake::Taken(pin)) => {
+            crate::virtio::nvrm::release_pin(pin);
+            HELIOS_NVRM_ST_OK
+        }
+        Ok(PinTake::InUse) => HELIOS_NVRM_ST_PIN_IN_USE,
+        Ok(PinTake::NotFound) => HELIOS_NVRM_ST_NOT_OWNED,
         Err(_) => HELIOS_NVRM_ST_DEVICE_ERROR,
     };
     wire.write_back(&u);
@@ -2011,6 +2133,9 @@ fn nvrm_forward(
     };
     // A message is `MsgHeader | payload` both ways, so each side must be longer
     // than the 16-byte header.
+    if fwd.pin_id == 0 && fwd.rm_status_off != 0 {
+        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch);
+    }
     if req_len < 16
         || resp_cap < 16
         || total > buf.len()
@@ -2033,7 +2158,16 @@ fn nvrm_forward(
         return refuse_short_buffer();
     };
 
-    let outcome = nvrm::forward(passive, adapter, owner, req, resp, u64::from(timeout_ms));
+    let outcome = nvrm::forward(
+        passive,
+        adapter,
+        owner,
+        req,
+        resp,
+        u64::from(timeout_ms),
+        fwd.pin_id,
+        fwd.rm_status_off,
+    );
     let (status, resp_len) = match outcome {
         Ok(n) => (HELIOS_NVRM_ST_OK, n as u32),
         Err(Refusal::MsgType) => (HELIOS_NVRM_ST_MSG_TYPE_REFUSED, 0),

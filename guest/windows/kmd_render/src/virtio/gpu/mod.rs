@@ -65,7 +65,8 @@ mod nvrm_tables;
 mod resource_tables;
 
 pub use nvrm_tables::{
-    MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER, MAX_NVRM_MAPS, MAX_NVRM_MAPS_PER_OWNER,
+    NvrmPin, PinTake, MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER, MAX_NVRM_MAPS,
+    MAX_NVRM_MAPS_PER_OWNER, MAX_NVRM_PINS, MAX_NVRM_PINS_PER_OWNER, MAX_NVRM_PIN_PAGES,
 };
 
 use super::config::DxgkConfigAccess;
@@ -2265,6 +2266,15 @@ pub struct VirtioGpu {
     /// `Munmap`. Reserved to MAX_NVRM_MAPS at init. The user view itself is in
     /// `AdapterContext::mappings`, under the key `nvrm::map_key(mapping_id)`.
     nvrm_maps: Vec<nvrm_tables::NvrmMapSlot>,
+    /// The next KMD-assigned mapping id (starts at 1; the host's own ids are not
+    /// unique, the RM path answers 0 for all of them).
+    nvrm_next_map: u32,
+    /// User pages locked for OS-descriptor registrations, with the page-run table
+    /// each carries. Reserved to MAX_NVRM_PINS at init. Pins hold PASSIVE-only
+    /// resources: they are only ever removed by value and released outside the lock.
+    nvrm_pins: Vec<NvrmPin>,
+    /// The next pin id (starts at 1, never reused; 0 once exhausted).
+    nvrm_next_pin: u32,
     /// Shared-memory regions 1 and 2, where an RM `Mmap` reply points (an
     /// offset into one of them). `None` when the device lacks the region.
     nvrm_window: Option<HostVisibleWindow>,
@@ -2799,6 +2809,9 @@ impl VirtioGpu {
             nvrm_handles: Vec::with_capacity(MAX_NVRM_HANDLES),
             nvrm_reserved: 0,
             nvrm_maps: Vec::with_capacity(MAX_NVRM_MAPS),
+            nvrm_next_map: 1,
+            nvrm_pins: Vec::with_capacity(MAX_NVRM_PINS),
+            nvrm_next_pin: 1,
             nvrm_window,
             nvrm_aperture,
             window: WindowAllocator::new(host_visible.map_or(0, |w| w.len)),

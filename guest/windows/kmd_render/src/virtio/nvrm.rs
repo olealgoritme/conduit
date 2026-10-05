@@ -12,19 +12,37 @@
 //!   teardown closes what a process left open;
 //! * for an `Ioctl`, the 24-byte `IoctlReq` is read to refuse a page-run deep
 //!   block (user mode never supplies a physical address) and a request whose
-//!   declared lengths overrun it.
+//!   declared lengths overrun it;
+//! * pinned user pages: the KMD locks them, builds the page-run table itself and
+//!   splices it into the registration `Ioctl` (`forward_pinned`), then keeps the
+//!   lock exactly as long as the GPU may use the pages (see `helios_protocol::nvrm`
+//!   `HeliosNvrmPin`). Of RM it recognises one call, `NV_ESC_RM_FREE`.
 //!
 //! Everything else in an RM message is opaque here.
 
 use super::ctrl;
-use super::gpu::DeviceOwner;
+use super::gpu::{DeviceOwner, NvrmPin, MAX_NVRM_PINS_PER_OWNER, MAX_NVRM_PIN_PAGES};
+use super::hal::DmaBuffer;
 use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
+use helios_kmd_logic::page_runs;
 use helios_protocol::{
     HELIOS_NVRM_DEEP_PAGE_RUNS, HELIOS_NVRM_DEEP_PAGE_RUNS_INDIRECT, HELIOS_NVRM_FORWARD_MSG_TYPES,
 };
+use wdk_sys::{MDL, PMDL};
+
+extern "C" {
+    /// `MmProbeAndLockPages` for USER memory raises on a bad range; the C shim
+    /// (`src/seh_shim.c`) turns that into NULL. PASSIVE, in the owning process.
+    fn helios_lock_user_pages_seh(virtual_address: *mut c_void, length: u32) -> PMDL;
+    /// `MmUnlockPages` + `IoFreeMdl`; callable from any process context.
+    fn helios_unlock_system_buffer(mdl: PMDL);
+}
 
 /// Host `MsgType` values that need KMD attention (see `helios_protocol::nvrm`).
 const MSG_OPEN: u32 = 1;
@@ -33,21 +51,28 @@ const MSG_IOCTL: u32 = 3;
 const MSG_MMAP: u32 = 4;
 const MSG_MUNMAP: u32 = 5;
 
+/// `NV_ESC_RM_FREE` as the low 16 bits of the Linux ioctl number the guest sends:
+/// `('F' << 8) | 0x29`.
+const CMD_RM_FREE_LOW16: u32 = 0x4629;
+
 /// Key of an NVRM mapping in `AdapterContext::mappings`, which is shared with
-/// blob mappings (keyed by a small KMD-assigned resource id). The host's mapping
-/// id is device-wide unique; the high bit keeps the two namespaces apart.
-pub fn map_key(mapping_id: u32) -> u32 {
-    mapping_id | 0x8000_0000
+/// blob mappings (keyed by a small KMD-assigned resource id). The KMD-assigned
+/// mapping ids stay below `0x7FFF_FFF0`; the high bit keeps the two namespaces
+/// apart.
+pub fn map_key(kmd_id: u32) -> u32 {
+    kmd_id | 0x8000_0000
 }
 
 const PAGE: u64 = 4096;
-/// Largest single mapping. `IoAllocateMdl` takes a ULONG length; this is well
-/// inside it and far above anything an RM client maps in one piece.
-pub const MAX_MAP_BYTES: u64 = 1 << 30;
+/// Largest single mapping. Its MDL is 2 KiB per MiB of non-paged pool, so this
+/// bounds one mapping's pool cost to about half a megabyte.
+pub const MAX_MAP_BYTES: u64 = 256 << 20;
 
 const MSG_HDR: usize = super::hal::MSG_HDR_LEN;
 /// `MsgHeader` plus the `IoctlReq` that follows it on an `Ioctl`.
 const IOCTL_HDR: usize = MSG_HDR + 24;
+/// `MsgHeader` plus the 12-byte `IoctlResp`: where an Ioctl reply's data begins.
+const REPLY_DATA: usize = MSG_HDR + 12;
 
 /// Forwarded messages by kind, and refusals. Published as `NvOpen`, `NvClose`,
 /// `NvIoctl`, `NvOther` and `NvRef`.
@@ -59,6 +84,12 @@ pub static NVRM_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// Live mappings made, and their failures. Published as `NvMap`, `NvMapErr`.
 pub static NVRM_MAPS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_MAP_ERRORS: AtomicU32 = AtomicU32::new(0);
+/// Pins made, pins released, pin failures. `NvPin - NvUnpin` is what is locked
+/// now; a count that only grows is a leak. Published as `NvPin`, `NvUnpin`,
+/// `NvPinErr`.
+pub static NVRM_PINS: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_UNPINS: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_PIN_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// Why a forward did not reach (or come back from) the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +100,7 @@ pub enum Refusal {
     NotOwned,
     /// The handle table or the caller's quota is full.
     NoResources,
-    /// The request carries a page-run deep block.
+    /// The request carries something user mode may not supply.
     Forbidden,
     /// A length in the request does not fit it.
     BadRange,
@@ -93,8 +124,15 @@ fn owned(adapter: &AdapterContext, owner: DeviceOwner, handle: u32) -> bool {
         .unwrap_or(false)
 }
 
+// ---- forwarding ------------------------------------------------------------------
+
 /// Forward `req` (`MsgHeader | payload`) for `owner` and return how many reply
 /// bytes were written to `resp`.
+///
+/// `pin_id != 0` (an `Ioctl` only) splices the KMD-built page-run table of that
+/// pin into the request; `rm_status_off` says where RM's status sits in the reply
+/// so the pin is kept only if the registration worked.
+#[allow(clippy::too_many_arguments)]
 pub fn forward(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -102,6 +140,8 @@ pub fn forward(
     req: &[u8],
     resp: &mut [u8],
     timeout_ms: u64,
+    pin_id: u32,
+    rm_status_off: u32,
 ) -> Result<usize, Refusal> {
     let refused = |r: Refusal| {
         NVRM_REFUSED.fetch_add(1, Ordering::Relaxed);
@@ -113,6 +153,9 @@ pub fn forward(
     // `msg >= 32` first: the mask is a u32 bitmap over the value.
     if msg >= 32 || (HELIOS_NVRM_FORWARD_MSG_TYPES >> msg) & 1 == 0 {
         return Err(refused(Refusal::MsgType));
+    }
+    if pin_id != 0 && msg != MSG_IOCTL {
+        return Err(refused(Refusal::Forbidden));
     }
     match msg {
         MSG_OPEN => open(passive, adapter, owner, req, resp, timeout_ms),
@@ -144,7 +187,11 @@ pub fn forward(
             };
             match ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms) {
                 Ok(n) => {
-                    if !(n >= MSG_HDR && rd_i32(resp, 8) == Some(0)) {
+                    if n >= MSG_HDR && rd_i32(resp, 8) == Some(0) {
+                        // The host's objects, and its alias of the pinned pages,
+                        // are gone: the pins hang off this handle and unlock now.
+                        release_pins_for_handle(adapter, owner, handle);
+                    } else {
                         restore();
                     }
                     Ok(n)
@@ -162,11 +209,28 @@ pub fn forward(
             if !owned(adapter, owner, handle) {
                 return Err(refused(Refusal::NotOwned));
             }
-            if let Err(r) = check_ioctl(req) {
+            if let Err(r) = check_ioctl(req, pin_id != 0) {
                 return Err(refused(r));
             }
+            if pin_id != 0 {
+                return forward_pinned(
+                    passive,
+                    adapter,
+                    owner,
+                    handle,
+                    req,
+                    resp,
+                    timeout_ms,
+                    pin_id,
+                    rm_status_off,
+                )
+                .map_err(refused);
+            }
             NVRM_IOCTLS.fetch_add(1, Ordering::Relaxed);
-            ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms).map_err(Refusal::Transport)
+            let n = ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms)
+                .map_err(Refusal::Transport)?;
+            after_ioctl(adapter, owner, req, resp, n);
+            Ok(n)
         }
         // GetProcFiles / GetSysFiles: no handle, nothing to track.
         _ => {
@@ -219,9 +283,11 @@ fn open(
     }
 }
 
-/// The two checks an `Ioctl` gets (see the module docs): no page-run deep block,
-/// and the declared data/nested/deep lengths must fit the request.
-fn check_ioctl(req: &[u8]) -> Result<(), Refusal> {
+/// The checks an `Ioctl` gets (see the module docs): the declared data / nested /
+/// deep lengths must fit the request, and the deep block must not be a page-run
+/// table. With `pinned`, the KMD writes the deep fields itself, so the caller's
+/// must be empty.
+fn check_ioctl(req: &[u8], pinned: bool) -> Result<(), Refusal> {
     if req.len() < IOCTL_HDR {
         return Err(Refusal::BadRange);
     }
@@ -241,6 +307,9 @@ fn check_ioctl(req: &[u8]) -> Result<(), Refusal> {
     if deep_ptr == HELIOS_NVRM_DEEP_PAGE_RUNS || deep_ptr == HELIOS_NVRM_DEEP_PAGE_RUNS_INDIRECT {
         return Err(Refusal::Forbidden);
     }
+    if pinned && (deep_ptr != 0 || deep_len != 0) {
+        return Err(Refusal::Forbidden);
+    }
     let declared = IOCTL_HDR as u64 + u64::from(data_len) + u64::from(nested_len) + u64::from(deep_len);
     if declared > req.len() as u64 {
         return Err(Refusal::BadRange);
@@ -248,13 +317,324 @@ fn check_ioctl(req: &[u8]) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// After a forwarded `Ioctl` that was not a registration: the one RM call the KMD
+/// recognises is `NV_ESC_RM_FREE`, and when the host confirms one, the pins it
+/// freed are unlocked. The flat 16-byte `NVOS00 { hRoot, hObjectParent,
+/// hObjectOld, status }` starts at the data block.
+fn after_ioctl(adapter: &AdapterContext, owner: DeviceOwner, req: &[u8], resp: &[u8], n: usize) {
+    let (Some(cmd), Some(data_len)) = (rd_u32(req, 16), rd_u32(req, 20)) else {
+        return;
+    };
+    if cmd & 0xFFFF != CMD_RM_FREE_LOW16 || data_len != 16 {
+        return;
+    }
+    let (Some(h_root), Some(h_old)) = (rd_u32(req, IOCTL_HDR), rd_u32(req, IOCTL_HDR + 8)) else {
+        return;
+    };
+    // The host's verdict and RM's own `status` (data + 12) must both be success.
+    let ok = n >= REPLY_DATA + 16
+        && rd_i32(resp, 8) == Some(0)
+        && rd_u32(resp, REPLY_DATA + 12) == Some(0);
+    if !ok {
+        return;
+    }
+    loop {
+        let pin = adapter
+            .with_virtio(|v| v.take_nvrm_pin_for_free(owner, h_root, h_old))
+            .ok()
+            .flatten();
+        let Some(pin) = pin else {
+            break;
+        };
+        release_pin(pin);
+    }
+}
+
+// ---- pins ----------------------------------------------------------------------------
+
+/// Why a pin could not be made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinRefusal {
+    NotOwned,
+    BadRange,
+    NoResources,
+    TooScattered,
+}
+
+/// A made pin.
+pub struct PinOut {
+    pub id: u32,
+    pub npages: u32,
+}
+
+/// Unlock a pin's pages and free its tables. PASSIVE, outside every lock: the
+/// contiguous table buffer cannot be freed above PASSIVE, and the pin was just
+/// removed from the table, so this is its only owner.
+pub fn release_pin(pin: NvrmPin) {
+    // SAFETY: `pin.mdl` is the locked MDL `helios_lock_user_pages_seh` returned,
+    // released exactly once here.
+    unsafe { helios_unlock_system_buffer(pin.mdl as PMDL) };
+    NVRM_UNPINS.fetch_add(1, Ordering::Relaxed);
+    drop(pin);
+}
+
+fn discard_pin(adapter: &AdapterContext, owner: DeviceOwner, id: u32) {
+    let pin = adapter
+        .with_virtio(|v| v.take_nvrm_pin(owner, id))
+        .ok()
+        .flatten();
+    if let Some(pin) = pin {
+        release_pin(pin);
+    }
+}
+
+fn release_pins_for_handle(adapter: &AdapterContext, owner: DeviceOwner, handle: u32) {
+    loop {
+        let pin = adapter
+            .with_virtio(|v| v.take_nvrm_pin_for_handle(owner, handle))
+            .ok()
+            .flatten();
+        let Some(pin) = pin else {
+            break;
+        };
+        release_pin(pin);
+    }
+}
+
+/// The deep block for a locked MDL: the run table itself when it fits a message,
+/// else a one-run table pointing at a big one the KMD keeps in contiguous memory.
+fn build_table(
+    passive: PassiveLevel,
+    mdl: PMDL,
+    pages: usize,
+) -> Result<(u32, Box<[u8]>, Option<DmaBuffer>), PinRefusal> {
+    // SAFETY: a locked MDL's page-frame array follows its header and holds one
+    // entry per page (the range is page aligned), valid while the pages stay locked.
+    let pfns = unsafe {
+        core::slice::from_raw_parts(
+            (mdl as *const u8).add(core::mem::size_of::<MDL>()) as *const u64,
+            pages,
+        )
+    };
+    let runs = page_runs::count_runs(pfns);
+    if runs == 0 {
+        return Err(PinRefusal::BadRange);
+    }
+    if runs <= page_runs::DIRECT_MAX_RUNS {
+        let bytes = page_runs::table_bytes(runs);
+        let mut table = Vec::<u8>::new();
+        if table.try_reserve_exact(bytes).is_err() {
+            return Err(PinRefusal::NoResources);
+        }
+        table.resize(bytes, 0);
+        let written = page_runs::encode(pfns, &mut table).ok_or(PinRefusal::BadRange)?;
+        table.truncate(written);
+        return Ok((HELIOS_NVRM_DEEP_PAGE_RUNS, table.into_boxed_slice(), None));
+    }
+    if runs > page_runs::INDIRECT_MAX_RUNS {
+        return Err(PinRefusal::TooScattered);
+    }
+    // Too scattered for a message: the table stays in guest memory and the
+    // message names the pages that hold it. Contiguous, so ONE run.
+    let bytes = page_runs::table_bytes(runs);
+    let mut big = DmaBuffer::new(passive, bytes).ok_or(PinRefusal::NoResources)?;
+    page_runs::encode(pfns, big.as_mut_slice()).ok_or(PinRefusal::BadRange)?;
+    let span = (bytes as u64 + PAGE - 1) & !(PAGE - 1);
+    let mut head = Vec::<u8>::new();
+    let head_bytes = page_runs::table_bytes(1);
+    if head.try_reserve_exact(head_bytes).is_err() {
+        return Err(PinRefusal::NoResources);
+    }
+    head.resize(head_bytes, 0);
+    page_runs::encode_single_run(big.physical_address(), span, &mut head)
+        .ok_or(PinRefusal::BadRange)?;
+    Ok((
+        HELIOS_NVRM_DEEP_PAGE_RUNS_INDIRECT,
+        head.into_boxed_slice(),
+        Some(big),
+    ))
+}
+
+/// `HELIOS_NVRM_OP_PIN`: lock `[user_va, user_va + length)` of the CALLING process
+/// and remember it, with the page-run table the registration will carry. Must run
+/// at PASSIVE in the owning process (an escape from its device handle).
+#[allow(clippy::too_many_arguments)]
+pub fn pin_pages(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    handle: u32,
+    user_va: u64,
+    length: u64,
+    h_root: u32,
+    h_object: u32,
+) -> Result<PinOut, PinRefusal> {
+    if !owned(adapter, owner, handle) {
+        return Err(PinRefusal::NotOwned);
+    }
+    if length == 0 || user_va % PAGE != 0 || length % PAGE != 0 {
+        return Err(PinRefusal::BadRange);
+    }
+    let pages = length / PAGE;
+    if pages > MAX_NVRM_PIN_PAGES as u64 {
+        return Err(PinRefusal::BadRange);
+    }
+    let quota_ok = adapter
+        .with_virtio(|v| v.nvrm_pin_count(owner) < MAX_NVRM_PINS_PER_OWNER)
+        .unwrap_or(false);
+    if !quota_ok {
+        return Err(PinRefusal::NoResources);
+    }
+
+    // SAFETY: PASSIVE_LEVEL in the owning process; `length` is at most
+    // `MAX_NVRM_PIN_PAGES` pages, so it fits a ULONG. A bad range comes back NULL.
+    let mdl = unsafe { helios_lock_user_pages_seh(user_va as *mut c_void, length as u32) };
+    if mdl.is_null() {
+        NVRM_PIN_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return Err(PinRefusal::BadRange);
+    }
+    let (deep_kind, deep, big) = match build_table(passive, mdl, pages as usize) {
+        Ok(t) => t,
+        Err(r) => {
+            // SAFETY: just locked above, not yet recorded anywhere.
+            unsafe { helios_unlock_system_buffer(mdl) };
+            NVRM_PIN_ERRORS.fetch_add(1, Ordering::Relaxed);
+            return Err(r);
+        }
+    };
+    NVRM_PINS.fetch_add(1, Ordering::Relaxed);
+    let pin = NvrmPin::new(
+        owner,
+        handle,
+        h_root,
+        h_object,
+        mdl as usize,
+        deep_kind,
+        deep,
+        big,
+        pages as u32,
+    );
+    // The pin must come back out if the closure never runs (the transport is
+    // gone) as well as if the table refuses it, or its pages stay locked.
+    let mut slot = Some(pin);
+    let pushed = adapter.with_virtio(|v| slot.take().map(|p| v.push_nvrm_pin(p)));
+    match pushed {
+        Ok(Some(Ok(id))) => Ok(PinOut {
+            id,
+            npages: pages as u32,
+        }),
+        Ok(Some(Err(pin))) => {
+            release_pin(pin);
+            NVRM_PIN_ERRORS.fetch_add(1, Ordering::Relaxed);
+            Err(PinRefusal::NoResources)
+        }
+        _ => {
+            if let Some(pin) = slot.take() {
+                release_pin(pin);
+            }
+            NVRM_PIN_ERRORS.fetch_add(1, Ordering::Relaxed);
+            Err(PinRefusal::NoResources)
+        }
+    }
+}
+
+/// RM's own status word in an Ioctl reply of `n` bytes, `off` bytes into the data
+/// block; `None` when the reply does not reach it.
+fn rm_status_word(resp: &[u8], n: usize, off: u32) -> Option<u32> {
+    let at = REPLY_DATA.checked_add(off as usize)?;
+    if at.checked_add(4)? > n {
+        return None;
+    }
+    rd_u32(resp, at)
+}
+
+/// The registration `Ioctl` of a pin: send the caller's request with the pin's
+/// table appended as its deep block (the KMD, not the caller, says where it is
+/// and what it holds), and keep the pin only if the registration succeeded.
+#[allow(clippy::too_many_arguments)]
+fn forward_pinned(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    handle: u32,
+    req: &[u8],
+    resp: &mut [u8],
+    timeout_ms: u64,
+    pin_id: u32,
+    rm_status_off: u32,
+) -> Result<usize, Refusal> {
+    // The status word must be inside the reply the caller made room for, or the
+    // outcome could never be judged.
+    if (REPLY_DATA as u64) + u64::from(rm_status_off) + 4 > resp.len() as u64 {
+        return Err(Refusal::BadRange);
+    }
+    // The host takes the deep block directly after the declared data and nested
+    // blocks, so the table goes there: bytes the caller left past them must not
+    // end up in its place.
+    let (Some(data_len), Some(nested_len)) = (rd_u32(req, 20), rd_u32(req, 28)) else {
+        return Err(Refusal::BadRange);
+    };
+    let declared = IOCTL_HDR as u64 + u64::from(data_len) + u64::from(nested_len);
+    let req = req.get(..declared as usize).ok_or(Refusal::BadRange)?;
+    let deep_len = adapter
+        .with_virtio(|v| v.nvrm_pin_deep_len(owner, handle, pin_id))
+        .ok()
+        .flatten()
+        .ok_or(Refusal::NotOwned)?;
+    let total = req.len().checked_add(deep_len).ok_or(Refusal::BadRange)?;
+    let mut buf = Vec::<u8>::new();
+    if buf.try_reserve_exact(total).is_err() {
+        return Err(Refusal::Transport(VirtioError::OutOfMemory));
+    }
+    buf.extend_from_slice(req);
+    buf.resize(total, 0);
+    let kind = {
+        let tail = buf.get_mut(req.len()..).ok_or(Refusal::BadRange)?;
+        adapter
+            .with_virtio(|v| v.claim_nvrm_pin_deep(owner, handle, pin_id, tail))
+            .ok()
+            .flatten()
+            .ok_or(Refusal::NotOwned)?
+    };
+    // IoctlReq.deep_ptr_offset@32 deep_len@36 (the caller's were checked empty).
+    if let Some(d) = buf.get_mut(32..36) {
+        d.copy_from_slice(&kind.to_le_bytes());
+    }
+    if let Some(d) = buf.get_mut(36..40) {
+        d.copy_from_slice(&(deep_len as u32).to_le_bytes());
+    }
+    NVRM_IOCTLS.fetch_add(1, Ordering::Relaxed);
+    let result = ctrl::raw_roundtrip(passive, adapter, &buf, resp, timeout_ms);
+    let keep = match &result {
+        Ok(n) => {
+            *n >= MSG_HDR
+                && rd_i32(resp, 8) == Some(0)
+                // A status the reply does not reach is indeterminate, as a timeout
+                // is: the host succeeded and may hold the pages, so keep the pin.
+                && rm_status_word(resp, *n, rm_status_off).is_none_or(|w| w == 0)
+        }
+        // A timeout is indeterminate: the GPU may hold the pages. Keep the pin;
+        // `Close`, process exit or reset releases it.
+        Err(VirtioError::Timeout) => true,
+        Err(_) => false,
+    };
+    if !keep {
+        discard_pin(adapter, owner, pin_id);
+    }
+    result.map_err(Refusal::Transport)
+}
+
+// ---- mappings -----------------------------------------------------------------------
+
 /// The result of a host `Mmap`.
 pub struct HostMapping {
     /// Offset of the mapping inside the region (`guest_phys_addr` in the wire
     /// struct: an offset, not an address).
     pub offset: u64,
     pub size: u64,
-    pub mapping_id: u32,
+    /// The host's mapping id. NOT unique and not necessarily nonzero (the RM path
+    /// answers 0 for every mapping): the KMD mints its own.
+    pub host_id: u32,
     /// The `device_type` of the handle, which selects the region.
     pub device_type: u32,
 }
@@ -265,7 +645,6 @@ pub enum MapRefusal {
     NotOwned,
     BadRange,
     NoResources,
-    Unsupported,
     /// The host refused: its errno, positive.
     Host(i32),
     Transport(VirtioError),
@@ -284,8 +663,8 @@ pub fn region_for(
 
 /// Ask the host to `Mmap` `size` bytes at `offset` of the file `handle`. Nothing
 /// is mapped here; the caller maps `region[offset..]` into the process and, on
-/// ANY later failure, must call [`host_munmap`] so the host does not keep the
-/// mapping.
+/// ANY later failure, must call [`release_host_map`] so the host does not keep
+/// the mapping.
 pub fn host_mmap(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -332,7 +711,7 @@ pub fn host_mmap(
     if n < MSG_HDR + 24 {
         return Err(MapRefusal::Transport(VirtioError::DeviceError));
     }
-    let (Some(lo), Some(hi), Some(slo), Some(shi), Some(mapping_id)) = (
+    let (Some(lo), Some(hi), Some(slo), Some(shi), Some(host_id)) = (
         rd_u32(&resp, 16),
         rd_u32(&resp, 20),
         rd_u32(&resp, 24),
@@ -344,54 +723,92 @@ pub fn host_mmap(
     Ok(HostMapping {
         offset: u64::from(lo) | (u64::from(hi) << 32),
         size: u64::from(slo) | (u64::from(shi) << 32),
-        mapping_id,
+        host_id,
         device_type,
     })
 }
 
-/// Tell the host to drop mapping `mapping_id` of `handle`. Best effort.
+/// Tell the host to drop mapping `host_id` of `handle`. Best effort.
 pub fn host_munmap(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     handle: u32,
-    mapping_id: u32,
+    host_id: u32,
 ) -> Result<(), VirtioError> {
     // MsgHeader{Munmap, handle} | MunmapReq { mapping_id u32, pad u32 }.
     let mut req = [0u8; MSG_HDR + 8];
     req[..4].copy_from_slice(&MSG_MUNMAP.to_le_bytes());
     req[4..8].copy_from_slice(&handle.to_le_bytes());
-    req[16..20].copy_from_slice(&mapping_id.to_le_bytes());
+    req[16..20].copy_from_slice(&host_id.to_le_bytes());
     let mut resp = [0u8; MSG_HDR];
     ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, 5_000).map(|_| ())
 }
 
+/// Release the HOST side of a mapping whose table slot is already gone (or was
+/// never made). Skipped for id 0 — the RM path's mappings are released by RM
+/// itself (`NV_ESC_RM_UNMAP_MEMORY`), and the host ignores a zero id — and while
+/// another live mapping still carries the same nonzero id, which a repeat mapping
+/// of one DRM object can: sending it would free the window under the survivor.
+pub fn release_host_map(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    handle: u32,
+    host_id: u32,
+) -> Result<(), VirtioError> {
+    if host_id == 0 {
+        return Ok(());
+    }
+    let still_used = adapter
+        .with_virtio(|v| v.nvrm_host_map_tracked(handle, host_id))
+        .unwrap_or(false);
+    if still_used {
+        return Ok(());
+    }
+    host_munmap(passive, adapter, handle, host_id)
+}
+
 /// `Close` of `handle`: unmap each view this process holds on it, then tell the
 /// host. Runs in the owning process (a `Close` escape), as the unmap requires.
+/// Stops sending after the first failure (a wedged host would cost seconds per
+/// mapping) but still unmaps every view.
 fn release_maps_for_handle(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     owner: DeviceOwner,
     handle: u32,
 ) {
+    let mut sending = true;
     loop {
-        let id = adapter
+        let slot = adapter
             .with_virtio(|v| v.take_nvrm_map_for_handle(owner, handle))
             .ok()
             .flatten();
-        let Some(id) = id else {
+        let Some((kmd_id, host_id)) = slot else {
             break;
         };
-        if let Some((va, mdl)) = adapter.mappings.take_for_resource(owner.raw(), map_key(id)) {
+        if let Some((va, mdl)) = adapter
+            .mappings
+            .take_for_resource(owner.raw(), map_key(kmd_id))
+        {
             // SAFETY: PASSIVE, in the process that mapped it; the pair came from
             // `map_io_pages_to_user` and was removed from the table just now.
             unsafe { crate::ddi::unmap_io_pages_from_user(va, mdl as *mut wdk_sys::MDL) };
         }
-        let _ = host_munmap(passive, adapter, handle, id);
+        if sending {
+            if let Err(VirtioError::Timeout) | Err(VirtioError::DeviceError) =
+                release_host_map(passive, adapter, handle, host_id)
+            {
+                sending = false;
+            }
+        }
     }
 }
 
-/// Device teardown: close, on the host, every handle `owner` left open. Returns
-/// how many. A close that fails is dropped — the device may be going away, and
+// ---- teardown ----------------------------------------------------------------------
+
+/// Device teardown: release, on the host, everything `owner` left behind — its
+/// mappings, then its handles — and unlock its pins. Returns how many handles
+/// were closed. A close that fails is dropped — the device may be going away, and
 /// the table entry is already gone, so nothing is retried.
 pub fn close_all_for_owner(
     passive: PassiveLevel,
@@ -400,7 +817,7 @@ pub fn close_all_for_owner(
 ) -> u32 {
     let mut closed = 0u32;
     // After the first transport failure the host is not answering: stop sending
-    // (a wedged host would cost seconds per handle) but keep clearing the table,
+    // (a wedged host would cost seconds per handle) but keep clearing the tables,
     // so no entry outlives the device handle it names.
     let mut sending = true;
     // Mappings first. Their user views were already unmapped by the device
@@ -411,13 +828,14 @@ pub fn close_all_for_owner(
             .with_virtio(|v| v.take_nvrm_map_for_owner(owner))
             .ok()
             .flatten();
-        let Some((handle, id)) = map else {
+        let Some((handle, _kmd_id, host_id)) = map else {
             break;
         };
         if sending {
-            match host_munmap(passive, adapter, handle, id) {
-                Err(VirtioError::Timeout) | Err(VirtioError::DeviceError) => sending = false,
-                _ => {}
+            if let Err(VirtioError::Timeout) | Err(VirtioError::DeviceError) =
+                release_host_map(passive, adapter, handle, host_id)
+            {
+                sending = false;
             }
         }
     }
@@ -440,6 +858,18 @@ pub fn close_all_for_owner(
             }
         }
         closed += 1;
+    }
+    // Last: the host no longer holds an alias of the pinned pages (or is not
+    // answering and the VM is going away), so they may be unlocked.
+    loop {
+        let pin = adapter
+            .with_virtio(|v| v.take_nvrm_pin_for_owner(owner))
+            .ok()
+            .flatten();
+        let Some(pin) = pin else {
+            break;
+        };
+        release_pin(pin);
     }
     closed
 }

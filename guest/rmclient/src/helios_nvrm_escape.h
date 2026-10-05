@@ -150,7 +150,10 @@ typedef struct HeliosNvrmForward {
   uint32_t pin_id;     /* in:  PIN id whose KMD-built page-run table rides this
                         *      Ioctl (request deep_ptr_offset/deep_len must be 0),
                         *      or 0 */
-  uint32_t reserved1;  /* in:  zero */
+  uint32_t rm_status_off; /* in: with pin_id, the byte offset in the reply's data
+                           *     block (after MsgHeader + the 12-byte IoctlResp)
+                           *     of the 32-bit RM status; the pin is kept only if
+                           *     it and the host status are 0. Zero otherwise. */
 } HeliosNvrmForward;
 #define HELIOS_NVRM_FORWARD_BYTES 64u
 HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmForward) == HELIOS_NVRM_FORWARD_BYTES, "Forward");
@@ -159,6 +162,7 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmForward, resp_cap) == 44, "resp_cap
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmForward, resp_len) == 48, "resp_len");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmForward, timeout_ms) == 52, "timeout_ms");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmForward, pin_id) == 56, "pin_id");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmForward, rm_status_off) == 60, "rm_status_off");
 
 #define HELIOS_NVRM_FORWARD_REQ_OFFSET HELIOS_NVRM_FORWARD_BYTES
 static inline size_t helios_nvrm_forward_resp_offset(uint32_t req_len) {
@@ -239,23 +243,30 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmEvent, out_state) == 60, "event.out
 #define HELIOS_NVRM_PAGE_RUNS_DIRECT_BYTES (8u + HELIOS_NVRM_PAGE_RUNS_MAX * 16u)
 
 /* The KMD locks the pages and keeps the page-run table; user mode gets only an
- * id. A pin used by a FORWARD is committed and is released only by Close of its
- * handle, process exit or reset (UNPIN -> PIN_IN_USE). */
+ * id. A pin a FORWARD has used is released only by the KMD: at once if the
+ * registration failed (see rm_status_off), when an RM_FREE succeeds for
+ * (h_root, h_object) or for h_root, or at Close of its handle, process exit or
+ * reset (UNPIN of a used pin -> PIN_IN_USE). h_root / h_object are the client and
+ * memory object handles the registration will create. */
 typedef struct HeliosNvrmPin {
   HeliosNvrmHeader head;
   uint32_t handle;     /* in:  backend handle the registration is made under */
   uint32_t flags;      /* in:  zero */
   uint64_t user_va;    /* in:  page-aligned start in the caller */
   uint64_t length;     /* in:  bytes, page multiple */
+  uint32_t h_root;     /* in:  RM client handle of the registration */
+  uint32_t h_object;   /* in:  memory object handle it will create */
   uint32_t out_pin_id; /* out: for FORWARD.pin_id / UNPIN */
   uint32_t out_npages; /* out */
 } HeliosNvrmPin;
-#define HELIOS_NVRM_PIN_BYTES 72u
+#define HELIOS_NVRM_PIN_BYTES 80u
 HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmPin) == HELIOS_NVRM_PIN_BYTES, "Pin");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmPin, user_va) == 48, "pin.user_va");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmPin, length) == 56, "pin.length");
-HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmPin, out_pin_id) == 64, "pin.out_pin_id");
-HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmPin, out_npages) == 68, "pin.out_npages");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmPin, h_root) == 64, "pin.h_root");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmPin, h_object) == 68, "pin.h_object");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmPin, out_pin_id) == 72, "pin.out_pin_id");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmPin, out_npages) == 76, "pin.out_npages");
 
 typedef struct HeliosNvrmUnpin {
   HeliosNvrmHeader head;

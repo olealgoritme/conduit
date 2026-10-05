@@ -302,9 +302,9 @@ pub const HELIOS_NVRM_MSG_HEADER_BYTES: usize = 16;
 /// `pin_id != 0` (an `Ioctl` only): the KMD appends the page-run table of that
 /// pin (owned by the caller and made under the same `handle`) as the request's
 /// deep block and sets `deep_ptr_offset`/`deep_len` itself; the request must
-/// carry `deep_ptr_offset == 0 && deep_len == 0`. The pin becomes committed
-/// (see [`HeliosNvrmPin`]). With `pin_id == 0` a page-run `deep_ptr_offset` is
-/// `FORBIDDEN`.
+/// carry `deep_ptr_offset == 0 && deep_len == 0`. The pin becomes committed if
+/// the registration succeeds, judged by `rm_status_off` (see [`HeliosNvrmPin`]).
+/// With `pin_id == 0` a page-run `deep_ptr_offset` is `FORBIDDEN`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosNvrmForward {
@@ -319,8 +319,12 @@ pub struct HeliosNvrmForward {
     pub timeout_ms: u32,
     /// in: a `PIN` id whose KMD-built page-run table rides this request, or 0.
     pub pin_id: u32,
-    /// in: zero.
-    pub reserved1: u32,
+    /// in: with `pin_id != 0`, the byte offset, inside the reply's data block
+    /// (after the `MsgHeader` and the 12-byte `IoctlResp`), of the 32-bit RM
+    /// status the registration returns (e.g. `NVOS02_PARAMETERS.status`). The KMD
+    /// keeps the pin only if the host's status and that word are both 0, and
+    /// releases it otherwise. Zero when `pin_id == 0`.
+    pub rm_status_off: u32,
 }
 
 pub const HELIOS_NVRM_FORWARD_BYTES: usize = 64;
@@ -478,7 +482,7 @@ pub const HELIOS_NVRM_PAGE_RUNS_MAX: u32 = 1024;
 /// Bytes of a full direct table: `u32 runs, u32 reserved, runs × {u64 gpa, u64 len}`.
 pub const HELIOS_NVRM_PAGE_RUNS_DIRECT_BYTES: u32 = 8 + HELIOS_NVRM_PAGE_RUNS_MAX * 16;
 
-/// `PIN`. 72 bytes, no trailing data. Locks user pages for an OS-descriptor
+/// `PIN`. 80 bytes, no trailing data. Locks user pages for an OS-descriptor
 /// registration (`NV01_MEMORY_SYSTEM_OS_DESCRIPTOR`) and returns an opaque id.
 ///
 /// Why: RM registers memory by a CPU address and reads it in the caller's address
@@ -497,8 +501,23 @@ pub const HELIOS_NVRM_PAGE_RUNS_DIRECT_BYTES: u32 = 8 + HELIOS_NVRM_PAGE_RUNS_MA
 /// runs than the KMD can describe is `TOO_SCATTERED`. Windows user memory
 /// scatters badly, so expect INDIRECT tables beyond a few MiB.
 ///
-/// Lifetime: a pin never used by a `FORWARD` may be `UNPIN`ned. Once used it is
-/// committed and lives until `Close` of `handle`, process exit, or reset.
+/// Lifetime. A pin the registration `FORWARD` has not used may be `UNPIN`ned (a
+/// failure path). Once a `FORWARD` has used it the GPU may hold the pages, so it
+/// is released only by the KMD, when:
+///
+/// * the registration failed (the host's status or the word at `rm_status_off`
+///   is nonzero), immediately;
+/// * an `RM_FREE` (`NV_ESC_RM_FREE`, nr 0x29, the flat 16-byte `NVOS00`) succeeds
+///   for `(h_root, h_object)`, or for `h_root` itself (`h_object == h_root` frees
+///   the client and everything under it) — the one RM call the KMD recognises;
+/// * `Close` of `handle`, process exit, or device reset.
+///
+/// `h_root` and `h_object` are the client and the memory object the registration
+/// will create (RM_ALLOC_MEMORY's `hRoot` / `hObjectNew`, chosen by the caller).
+/// The tags are the caller's word and the KMD does not verify them against the
+/// registration, so they decide only WHEN the KMD releases the pin: a process that
+/// mis-tags can have its own pages unlocked while the host still maps them
+/// (hardening TODO: take the object handle from the registration itself).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosNvrmPin {
@@ -512,13 +531,17 @@ pub struct HeliosNvrmPin {
     pub user_va: u64,
     /// in: length in bytes (page multiple, > 0).
     pub length: u64,
+    /// in: the RM client handle the registration will be made under.
+    pub h_root: u32,
+    /// in: the memory object handle the registration will create.
+    pub h_object: u32,
     /// out: id for `FORWARD.pin_id` / `UNPIN`.
     pub out_pin_id: u32,
     /// out: pages locked.
     pub out_npages: u32,
 }
 
-pub const HELIOS_NVRM_PIN_BYTES: usize = 72;
+pub const HELIOS_NVRM_PIN_BYTES: usize = 80;
 
 /// `UNPIN`. 48 bytes. Releases the locked pages (and any indirect table) of a pin
 /// that no `FORWARD` has used; `PIN_IN_USE` otherwise (see [`HeliosNvrmPin`]).
@@ -554,6 +577,7 @@ const _: () = {
     assert!(offset_of!(HeliosNvrmForward, resp_len) == 48);
     assert!(offset_of!(HeliosNvrmForward, timeout_ms) == 52);
     assert!(offset_of!(HeliosNvrmForward, pin_id) == 56);
+    assert!(offset_of!(HeliosNvrmForward, rm_status_off) == 60);
 
     assert!(size_of::<HeliosNvrmMmap>() == HELIOS_NVRM_MMAP_BYTES);
     assert!(offset_of!(HeliosNvrmMmap, handle) == 40);
@@ -573,8 +597,10 @@ const _: () = {
     assert!(size_of::<HeliosNvrmPin>() == HELIOS_NVRM_PIN_BYTES);
     assert!(offset_of!(HeliosNvrmPin, user_va) == 48);
     assert!(offset_of!(HeliosNvrmPin, length) == 56);
-    assert!(offset_of!(HeliosNvrmPin, out_pin_id) == 64);
-    assert!(offset_of!(HeliosNvrmPin, out_npages) == 68);
+    assert!(offset_of!(HeliosNvrmPin, h_root) == 64);
+    assert!(offset_of!(HeliosNvrmPin, h_object) == 68);
+    assert!(offset_of!(HeliosNvrmPin, out_pin_id) == 72);
+    assert!(offset_of!(HeliosNvrmPin, out_npages) == 76);
 
     assert!(size_of::<HeliosNvrmUnpin>() == HELIOS_NVRM_UNPIN_BYTES);
     assert!(offset_of!(HeliosNvrmUnpin, pin_id) == 40);

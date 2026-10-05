@@ -1,19 +1,27 @@
-//! Ownership of the backend handles a process opened through
-//! `HELIOS_ESCAPE_NVRM` (a forwarded RM `Open`).
+//! Ownership of what a process holds through `HELIOS_ESCAPE_NVRM`: backend RM
+//! handles (a forwarded `Open`), CPU mappings of host memory (`MMAP`) and pinned
+//! user pages (`PIN`).
 //!
 //! The host hands out one handle per opened RM file (`/dev/nvidiactl`, a GPU, a
 //! DRM node, UVM). Without a table here any process could name any other's
 //! handle in a forwarded `Ioctl`/`Close`/`Mmap`, so a handle is recorded against
 //! the device that opened it and every handle-taking request is checked against
-//! it. The table also lets device teardown close what a crashed process left
-//! open — the host keeps those objects, and their VRAM, until the file is closed.
+//! it. The tables also let device teardown release what a crashed process left
+//! behind — the host keeps those objects, and their VRAM, until the file is
+//! closed, and pinned pages stay locked until someone unlocks them.
 //!
 //! Field-disjoint from the control queue and the fence tables, like
 //! `resource_tables`; capacity is reserved at init so no push allocates under the
-//! spinlock, and slots are reserved before the wire round trip and committed
-//! after it so "open on the host but untracked" cannot exist for a refused open.
+//! spinlock, and handle slots are reserved before the wire round trip and
+//! committed after it so "open on the host but untracked" cannot exist for a
+//! refused open.
+//!
+//! Anything with a `Drop` that must run at PASSIVE (a locked MDL, a contiguous
+//! buffer) is never dropped under the lock: the `take_*` methods hand it back by
+//! value and the caller releases it after the lock is gone.
 
 use super::*;
+use alloc::boxed::Box;
 
 /// Most backend handles tracked across every process.
 pub const MAX_NVRM_HANDLES: usize = 1024;
@@ -22,24 +30,104 @@ pub const MAX_NVRM_HANDLES_PER_OWNER: usize = 128;
 /// Most live `MMAP` mappings across every process, and per process.
 pub const MAX_NVRM_MAPS: usize = 1024;
 pub const MAX_NVRM_MAPS_PER_OWNER: usize = 256;
+/// Most live pins across every process, and per process.
+pub const MAX_NVRM_PINS: usize = 1024;
+pub const MAX_NVRM_PINS_PER_OWNER: usize = 256;
+/// Most pages one pin may lock (just under 1 GiB). Also keeps the page-run table
+/// within `page_runs::INDIRECT_MAX_RUNS`, whatever the scatter.
+pub const MAX_NVRM_PIN_PAGES: usize = 262_143;
+
+/// KMD-assigned mapping ids stay below this: above it live the fixed ids other
+/// mapping kinds use in the shared user-mapping table (`mapping.rs`).
+const NVRM_MAP_ID_LIMIT: u32 = 0x7FFF_FFF0;
 
 /// One tracked handle.
 pub(super) struct NvrmHandleSlot {
     owner: DeviceOwner,
     handle: u32,
     /// The host `device_type` the handle was opened with (255 = control, a GPU
-    /// minor, 256/257 = UVM, 512+ = DRM); decides which region an `Mmap` is in.
+    /// minor, 256 = UVM, 257 = UVM tools, 512+ = DRM); decides which region an
+    /// `Mmap` is in.
     device_type: u32,
 }
 
 /// One live mapping, for the host `Munmap` at `Close` / teardown.
+///
+/// `kmd_id` is OURS: unique, nonzero, the key in `AdapterContext::mappings` and
+/// what the ABI hands out as the mapping id. `host_id` is what the host answered
+/// and is NOT unique — the RM path replies 0 for every mapping, and a repeat
+/// mapping of the same DRM object can reply the same nonzero id.
 pub(super) struct NvrmMapSlot {
     owner: DeviceOwner,
     handle: u32,
-    mapping_id: u32,
+    kmd_id: u32,
+    host_id: u32,
+}
+
+/// One pin: user pages locked for an OS-descriptor registration, and the
+/// page-run table that names them to the host.
+pub struct NvrmPin {
+    owner: DeviceOwner,
+    handle: u32,
+    id: u32,
+    h_root: u32,
+    h_object: u32,
+    /// The locked MDL (a `PMDL` as an address); unlocked with
+    /// `helios_unlock_system_buffer` at PASSIVE.
+    pub(crate) mdl: usize,
+    /// `HELIOS_NVRM_DEEP_PAGE_RUNS` or `_INDIRECT`: what goes in `deep_ptr_offset`.
+    pub(crate) deep_kind: u32,
+    /// The deep block the message carries: the whole run table (direct), or the
+    /// one-run table that says where the big one lives (indirect).
+    pub(crate) deep: Box<[u8]>,
+    /// The indirect case's big table, in contiguous non-paged memory that must
+    /// outlive the pin. PASSIVE-only to drop.
+    pub(crate) big: Option<DmaBuffer>,
+    /// A `FORWARD` has claimed the table: the GPU may hold the pages.
+    used: bool,
+    pub(crate) npages: u32,
+}
+
+impl NvrmPin {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        owner: DeviceOwner,
+        handle: u32,
+        h_root: u32,
+        h_object: u32,
+        mdl: usize,
+        deep_kind: u32,
+        deep: Box<[u8]>,
+        big: Option<DmaBuffer>,
+        npages: u32,
+    ) -> Self {
+        Self {
+            owner,
+            handle,
+            id: 0,
+            h_root,
+            h_object,
+            mdl,
+            deep_kind,
+            deep,
+            big,
+            used: false,
+            npages,
+        }
+    }
+}
+
+/// What `take_nvrm_unused_pin` found.
+pub enum PinTake {
+    Taken(NvrmPin),
+    /// A `FORWARD` already used it: only the KMD releases it now.
+    InUse,
+    NotFound,
 }
 
 impl VirtioGpu {
+    // ---- handles -----------------------------------------------------------------
+
     /// Reserve a tracking slot for an in-flight `Open`. Refuses when the table
     /// or this owner's quota is full, BEFORE the host is asked to open anything.
     pub fn reserve_nvrm_handle_slot(&mut self, owner: DeviceOwner) -> bool {
@@ -63,69 +151,6 @@ impl VirtioGpu {
         });
     }
 
-    /// The `device_type` `owner` opened `handle` with, or `None` if it is not
-    /// theirs.
-    pub fn nvrm_handle_device_type(&self, owner: DeviceOwner, handle: u32) -> Option<u32> {
-        self.nvrm_handles
-            .iter()
-            .find(|s| s.owner == owner && s.handle == handle)
-            .map(|s| s.device_type)
-    }
-
-    /// The shared-memory region an `Mmap` on a handle of `device_type` points
-    /// into: the UVM aperture for UVM, the RM window for everything else.
-    pub fn nvrm_region(&self, device_type: u32) -> Option<HostVisibleWindow> {
-        if device_type == 256 || device_type == 257 {
-            self.nvrm_aperture
-        } else {
-            self.nvrm_window
-        }
-    }
-
-    /// Track a new mapping. `false` when the table or `owner`'s quota is full.
-    pub fn push_nvrm_map(&mut self, owner: DeviceOwner, handle: u32, mapping_id: u32) -> bool {
-        let mine = self.nvrm_maps.iter().filter(|s| s.owner == owner).count();
-        if self.nvrm_maps.len() >= MAX_NVRM_MAPS || mine >= MAX_NVRM_MAPS_PER_OWNER {
-            return false;
-        }
-        self.nvrm_maps.push(NvrmMapSlot {
-            owner,
-            handle,
-            mapping_id,
-        });
-        true
-    }
-
-    /// How many mappings `owner` holds (for the quota check before asking the host).
-    pub fn nvrm_map_count(&self, owner: DeviceOwner) -> usize {
-        self.nvrm_maps.iter().filter(|s| s.owner == owner).count()
-    }
-
-    /// Forget `mapping_id` if `owner` made it, returning the handle it belongs to.
-    pub fn take_nvrm_map(&mut self, owner: DeviceOwner, mapping_id: u32) -> Option<u32> {
-        let idx = self
-            .nvrm_maps
-            .iter()
-            .position(|s| s.owner == owner && s.mapping_id == mapping_id)?;
-        Some(self.nvrm_maps.swap_remove(idx).handle)
-    }
-
-    /// Pop one mapping `owner` made on `handle` (`Close` releases them first).
-    pub fn take_nvrm_map_for_handle(&mut self, owner: DeviceOwner, handle: u32) -> Option<u32> {
-        let idx = self
-            .nvrm_maps
-            .iter()
-            .position(|s| s.owner == owner && s.handle == handle)?;
-        Some(self.nvrm_maps.swap_remove(idx).mapping_id)
-    }
-
-    /// Pop one mapping `owner` still holds (device teardown).
-    pub fn take_nvrm_map_for_owner(&mut self, owner: DeviceOwner) -> Option<(u32, u32)> {
-        let idx = self.nvrm_maps.iter().position(|s| s.owner == owner)?;
-        let s = self.nvrm_maps.swap_remove(idx);
-        Some((s.handle, s.mapping_id))
-    }
-
     /// Release a reserved slot after a refused or failed `Open`.
     pub fn cancel_nvrm_reservation(&mut self) {
         self.nvrm_reserved = self.nvrm_reserved.saturating_sub(1);
@@ -136,6 +161,15 @@ impl VirtioGpu {
         self.nvrm_handles
             .iter()
             .any(|s| s.owner == owner && s.handle == handle)
+    }
+
+    /// The `device_type` `owner` opened `handle` with, or `None` if it is not
+    /// theirs.
+    pub fn nvrm_handle_device_type(&self, owner: DeviceOwner, handle: u32) -> Option<u32> {
+        self.nvrm_handles
+            .iter()
+            .find(|s| s.owner == owner && s.handle == handle)
+            .map(|s| s.device_type)
     }
 
     /// Forget `handle` after the host closed it. `false` if `owner` does not own it.
@@ -164,5 +198,206 @@ impl VirtioGpu {
     /// base is already stride-separated per transport instance.
     pub fn nvrm_epoch(&self) -> u64 {
         self.wire_fence_base
+    }
+
+    // ---- mappings -----------------------------------------------------------------
+
+    /// The shared-memory region an `Mmap` on a handle of `device_type` points
+    /// into: the UVM aperture for UVM proper (256), the RM window for everything
+    /// else — UVM tools (257) included, as in the guest module and the host.
+    pub fn nvrm_region(&self, device_type: u32) -> Option<HostVisibleWindow> {
+        if device_type == 256 {
+            self.nvrm_aperture
+        } else {
+            self.nvrm_window
+        }
+    }
+
+    /// How many mappings `owner` holds (for the quota check before asking the host).
+    pub fn nvrm_map_count(&self, owner: DeviceOwner) -> usize {
+        self.nvrm_maps.iter().filter(|s| s.owner == owner).count()
+    }
+
+    /// Track a new mapping and mint its id. `None` when the handle is no longer
+    /// `owner`'s (a concurrent `Close` got there first — the host may already have
+    /// reused the number), or the table or `owner`'s quota is full, or ids ran out.
+    /// Checked and pushed under one lock hold, so a mapping can never be recorded
+    /// against a handle that is gone.
+    pub fn push_nvrm_map(&mut self, owner: DeviceOwner, handle: u32, host_id: u32) -> Option<u32> {
+        if !self.nvrm_handle_owned(owner, handle) {
+            return None;
+        }
+        let mine = self.nvrm_maps.iter().filter(|s| s.owner == owner).count();
+        if self.nvrm_maps.len() >= MAX_NVRM_MAPS || mine >= MAX_NVRM_MAPS_PER_OWNER {
+            return None;
+        }
+        let kmd_id = self.nvrm_next_map;
+        if kmd_id == 0 || kmd_id >= NVRM_MAP_ID_LIMIT {
+            return None;
+        }
+        self.nvrm_next_map = kmd_id + 1;
+        self.nvrm_maps.push(NvrmMapSlot {
+            owner,
+            handle,
+            kmd_id,
+            host_id,
+        });
+        Some(kmd_id)
+    }
+
+    /// Whether a live mapping already carries this nonzero host id on `handle`.
+    /// A repeat mapping of the same object can come back with the same id, and the
+    /// host `Munmap` of the first must not be sent for the second's failure (or the
+    /// first's removal while the second lives).
+    pub fn nvrm_host_map_tracked(&self, handle: u32, host_id: u32) -> bool {
+        host_id != 0
+            && self
+                .nvrm_maps
+                .iter()
+                .any(|s| s.handle == handle && s.host_id == host_id)
+    }
+
+    /// Forget mapping `kmd_id` if `owner` made it: its handle and host id.
+    pub fn take_nvrm_map(&mut self, owner: DeviceOwner, kmd_id: u32) -> Option<(u32, u32)> {
+        let idx = self
+            .nvrm_maps
+            .iter()
+            .position(|s| s.owner == owner && s.kmd_id == kmd_id)?;
+        let s = self.nvrm_maps.swap_remove(idx);
+        Some((s.handle, s.host_id))
+    }
+
+    /// Pop one mapping `owner` made on `handle` (`Close` releases them first):
+    /// its id and host id.
+    pub fn take_nvrm_map_for_handle(
+        &mut self,
+        owner: DeviceOwner,
+        handle: u32,
+    ) -> Option<(u32, u32)> {
+        let idx = self
+            .nvrm_maps
+            .iter()
+            .position(|s| s.owner == owner && s.handle == handle)?;
+        let s = self.nvrm_maps.swap_remove(idx);
+        Some((s.kmd_id, s.host_id))
+    }
+
+    /// Pop one mapping `owner` still holds (device teardown): its handle, id and
+    /// host id.
+    pub fn take_nvrm_map_for_owner(&mut self, owner: DeviceOwner) -> Option<(u32, u32, u32)> {
+        let idx = self.nvrm_maps.iter().position(|s| s.owner == owner)?;
+        let s = self.nvrm_maps.swap_remove(idx);
+        Some((s.handle, s.kmd_id, s.host_id))
+    }
+
+    // ---- pins ------------------------------------------------------------------------
+
+    /// How many pins `owner` holds (for the quota check before locking pages).
+    pub fn nvrm_pin_count(&self, owner: DeviceOwner) -> usize {
+        self.nvrm_pins.iter().filter(|p| p.owner == owner).count()
+    }
+
+    /// Track a new pin and mint its id. Hands the pin BACK if the handle is no
+    /// longer `owner`'s, a quota is full or ids ran out, so the caller unlocks it
+    /// outside the lock.
+    pub fn push_nvrm_pin(&mut self, mut pin: NvrmPin) -> Result<u32, NvrmPin> {
+        let mine = self.nvrm_pins.iter().filter(|p| p.owner == pin.owner).count();
+        if !self.nvrm_handle_owned(pin.owner, pin.handle)
+            || self.nvrm_pins.len() >= MAX_NVRM_PINS
+            || mine >= MAX_NVRM_PINS_PER_OWNER
+            || self.nvrm_next_pin == 0
+        {
+            return Err(pin);
+        }
+        pin.id = self.nvrm_next_pin;
+        // Never reuse an id; on exhaustion further pins are refused (0 = none).
+        self.nvrm_next_pin = self.nvrm_next_pin.checked_add(1).unwrap_or(0);
+        let id = pin.id;
+        self.nvrm_pins.push(pin);
+        Ok(id)
+    }
+
+    /// The length of the deep block of pin `id`, if it is `owner`'s, was made on
+    /// `handle` and no `FORWARD` has claimed it yet.
+    pub fn nvrm_pin_deep_len(&self, owner: DeviceOwner, handle: u32, id: u32) -> Option<usize> {
+        self.nvrm_pins
+            .iter()
+            .find(|p| p.owner == owner && p.handle == handle && p.id == id && !p.used)
+            .map(|p| p.deep.len())
+    }
+
+    /// Copy pin `id`'s deep block into `out` (exactly its length) and mark the pin
+    /// claimed by a `FORWARD`. Returns the `deep_ptr_offset` value to write.
+    pub fn claim_nvrm_pin_deep(
+        &mut self,
+        owner: DeviceOwner,
+        handle: u32,
+        id: u32,
+        out: &mut [u8],
+    ) -> Option<u32> {
+        let pin = self
+            .nvrm_pins
+            .iter_mut()
+            .find(|p| p.owner == owner && p.handle == handle && p.id == id && !p.used)?;
+        if pin.deep.len() != out.len() {
+            return None;
+        }
+        out.copy_from_slice(&pin.deep);
+        pin.used = true;
+        Some(pin.deep_kind)
+    }
+
+    /// Remove pin `id` whatever its state (the registration failed, or teardown).
+    pub fn take_nvrm_pin(&mut self, owner: DeviceOwner, id: u32) -> Option<NvrmPin> {
+        let idx = self
+            .nvrm_pins
+            .iter()
+            .position(|p| p.owner == owner && p.id == id)?;
+        Some(self.nvrm_pins.swap_remove(idx))
+    }
+
+    /// `UNPIN`: remove pin `id` only if no `FORWARD` has claimed it.
+    pub fn take_nvrm_unused_pin(&mut self, owner: DeviceOwner, id: u32) -> PinTake {
+        let Some(idx) = self
+            .nvrm_pins
+            .iter()
+            .position(|p| p.owner == owner && p.id == id)
+        else {
+            return PinTake::NotFound;
+        };
+        if self.nvrm_pins.get(idx).is_some_and(|p| p.used) {
+            return PinTake::InUse;
+        }
+        PinTake::Taken(self.nvrm_pins.swap_remove(idx))
+    }
+
+    /// A successful `RM_FREE` of `(h_root, h_old)`: pop one claimed pin it frees —
+    /// the one tagged with that object, or any under the client when the client
+    /// itself is freed (`h_old == h_root`).
+    pub fn take_nvrm_pin_for_free(
+        &mut self,
+        owner: DeviceOwner,
+        h_root: u32,
+        h_old: u32,
+    ) -> Option<NvrmPin> {
+        let idx = self.nvrm_pins.iter().position(|p| {
+            p.owner == owner && p.used && p.h_root == h_root && (p.h_object == h_old || h_old == h_root)
+        })?;
+        Some(self.nvrm_pins.swap_remove(idx))
+    }
+
+    /// `Close` of `handle`: pop one pin made on it.
+    pub fn take_nvrm_pin_for_handle(&mut self, owner: DeviceOwner, handle: u32) -> Option<NvrmPin> {
+        let idx = self
+            .nvrm_pins
+            .iter()
+            .position(|p| p.owner == owner && p.handle == handle)?;
+        Some(self.nvrm_pins.swap_remove(idx))
+    }
+
+    /// Device teardown: pop one pin `owner` still holds.
+    pub fn take_nvrm_pin_for_owner(&mut self, owner: DeviceOwner) -> Option<NvrmPin> {
+        let idx = self.nvrm_pins.iter().position(|p| p.owner == owner)?;
+        Some(self.nvrm_pins.swap_remove(idx))
     }
 }

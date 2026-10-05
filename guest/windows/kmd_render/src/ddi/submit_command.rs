@@ -132,6 +132,54 @@ pub static D3D12_SUBMIT_MERGED: AtomicU32 = AtomicU32::new(0);
 /// Retired prefix-clearing diagnostic. HE12 v2 keeps a separate immutable execution tail; always zero.
 pub static D3D12_STALE_RECORD_CLEARED: AtomicU32 = AtomicU32::new(0);
 
+/// Mirror the HELIOS_ESCAPE_NVRM counters into the registry. PASSIVE_LEVEL only.
+/// Called on the present edge with the rest, and by the NVRM escape itself (which
+/// can run for a whole session without a single present).
+pub(crate) fn publish_nvrm_counters() {
+    // HELIOS_ESCAPE_NVRM: forwarded RM messages by kind, and refusals.
+    crate::diag::record_named_bytes(
+        b"NvOpen",
+        crate::virtio::nvrm::NVRM_OPENS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvClose",
+        crate::virtio::nvrm::NVRM_CLOSES.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvIoctl",
+        crate::virtio::nvrm::NVRM_IOCTLS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvOther",
+        crate::virtio::nvrm::NVRM_OTHER.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvRef",
+        crate::virtio::nvrm::NVRM_REFUSED.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvMap",
+        crate::virtio::nvrm::NVRM_MAPS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvMapErr",
+        crate::virtio::nvrm::NVRM_MAP_ERRORS.load(Ordering::Relaxed),
+    );
+    // Pins made / released / failed: `NvPin - NvUnpin` is what is locked now.
+    crate::diag::record_named_bytes(
+        b"NvPin",
+        crate::virtio::nvrm::NVRM_PINS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvUnpin",
+        crate::virtio::nvrm::NVRM_UNPINS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvPinErr",
+        crate::virtio::nvrm::NVRM_PIN_ERRORS.load(Ordering::Relaxed),
+    );
+}
+
 /// Mirror the scheduler private-data handoff evidence at PASSIVE_LEVEL.
 pub(crate) fn record_present_handoff_telemetry() {
     use crate::ddi::present_packet::{
@@ -385,35 +433,7 @@ pub(crate) fn record_present_handoff_telemetry() {
     );
     // The same counts per Venus context (= per ICD instance = per process).
     crate::virtio::gpu::publish_escape_ctx_counters();
-    // HELIOS_ESCAPE_NVRM: forwarded RM messages by kind, and refusals.
-    crate::diag::record_named_bytes(
-        b"NvOpen",
-        crate::virtio::nvrm::NVRM_OPENS.load(Ordering::Relaxed),
-    );
-    crate::diag::record_named_bytes(
-        b"NvClose",
-        crate::virtio::nvrm::NVRM_CLOSES.load(Ordering::Relaxed),
-    );
-    crate::diag::record_named_bytes(
-        b"NvIoctl",
-        crate::virtio::nvrm::NVRM_IOCTLS.load(Ordering::Relaxed),
-    );
-    crate::diag::record_named_bytes(
-        b"NvOther",
-        crate::virtio::nvrm::NVRM_OTHER.load(Ordering::Relaxed),
-    );
-    crate::diag::record_named_bytes(
-        b"NvRef",
-        crate::virtio::nvrm::NVRM_REFUSED.load(Ordering::Relaxed),
-    );
-    crate::diag::record_named_bytes(
-        b"NvMap",
-        crate::virtio::nvrm::NVRM_MAPS.load(Ordering::Relaxed),
-    );
-    crate::diag::record_named_bytes(
-        b"NvMapErr",
-        crate::virtio::nvrm::NVRM_MAP_ERRORS.load(Ordering::Relaxed),
-    );
+    publish_nvrm_counters();
     // S-1's instrument (`docs/dx12/PENDING.md` §2). `DxgkDdiCalibrateGpuClock` is
     // the ONLY channel for the GPU timestamp frequency an application divides its
     // timestamp deltas by, and it used to zero-fill and return SUCCESS silently.

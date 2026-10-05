@@ -117,6 +117,34 @@ helios_lock_system_buffer_seh(
     return mdl;
 }
 
+/*
+ * Lock a range of the CALLING process's user memory for the lifetime of the lock,
+ * for HELIOS_ESCAPE_NVRM PIN. MmProbeAndLockPages RAISES on an invalid or
+ * non-writable range, and the range comes from user mode, so the raise is
+ * converted to a NULL return. Must run at PASSIVE_LEVEL in the owning process.
+ * Release with helios_unlock_system_buffer (MmUnlockPages + IoFreeMdl), which may
+ * run in any process context. UserMode=1, IoWriteAccess=1 are stable WDK ABI values.
+ */
+PMDL
+helios_lock_user_pages_seh(PVOID VirtualAddress, ULONG Length)
+{
+    PMDL mdl;
+
+    if (!VirtualAddress || !Length)
+        return (PMDL)0;
+    mdl = IoAllocateMdl(VirtualAddress, Length,
+                        /*SecondaryBuffer*/ 0, /*ChargeQuota*/ 0, (PVOID)0);
+    if (!mdl)
+        return (PMDL)0;
+    __try {
+        MmProbeAndLockPages(mdl, /*UserMode*/ 1, /*IoWriteAccess*/ 1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        IoFreeMdl(mdl);
+        return (PMDL)0;
+    }
+    return mdl;
+}
+
 void
 helios_unlock_system_buffer(PMDL Mdl)
 {
