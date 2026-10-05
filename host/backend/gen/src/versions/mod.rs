@@ -36,6 +36,10 @@ pub enum IoctlKind {
     /// A variable-length byte array with no fixed parameter struct, sized by
     /// the ioctl number at call time.
     Bytes,
+    /// `NV_ESC_RM_GET_EVENT_DATA`: carries a pointer to the one fixed-size
+    /// `NvUnixEvent` RM writes; the device supplies that buffer. Not in
+    /// nvproxy -- added by `nvabi_gen.py`'s `CONDUIT_EXTRA`.
+    EventData,
 }
 
 /// One entry in a per-version ioctl table.

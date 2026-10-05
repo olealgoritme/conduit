@@ -1,0 +1,499 @@
+From ead804ed19967b6d1ae639833693026cb7a272f6 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 5 Oct 2026 21:25:27 +0200
+Subject: [PATCH 05/13] nvk/rm: GPU VA allocation and binding
+
+NVK keeps choosing every GPU address from its own util_vma_heap (with the
+replay heap for capture/replay).  Each nvkmd_va is backed by an
+NV50_MEMORY_VIRTUAL that RM allocates at exactly that address
+(FIXED_ADDRESS_ALLOCATE), with NVOS32_ALLOC_FLAGS_SPARSE for sparse
+ranges.  If RM already has something there, the range stays reserved in
+our heap and another one is tried.
+
+Binding maps the memory into that virtual object with
+NV_ESC_RM_MAP_MEMORY_DMA and DMA_OFFSET_FIXED (absolute VA), 64 KiB pages
+for VRAM and snooped 4 KiB pages for system memory, and the VA's PTE kind
+through kindOverride when librmclient has crm_map_dma2.  RM unmaps whole
+mappings only, so each VA tracks its mappings and a partial unbind
+unmaps the overlapping ones and maps back the remainders.
+
+---
+ src/nouveau/vulkan/meson.build             |   1 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |   2 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c |  13 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c  | 408 +++++++++++++++++++++
+ 4 files changed, 412 insertions(+), 12 deletions(-)
+ create mode 100644 src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+
+diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
+index 8e85081..2a949a2 100644
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -295,6 +295,7 @@ if not get_option('nvk-rm').disabled()
+     'nvkmd/rm/nvkmd_rm_lib.c',
+     'nvkmd/rm/nvkmd_rm_mem.c',
+     'nvkmd/rm/nvkmd_rm_pdev.c',
++    'nvkmd/rm/nvkmd_rm_va.c',
+     'nvkmd/rm/nvrm/nvrm_api.h',
+   )
+ endif
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 980004f..bc4f2cb 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -211,6 +211,8 @@ struct nvkmd_rm_mapping {
+    uint64_t range_B;
+    uint32_t h_memory;
+    uint64_t mem_offset_B;
++   uint32_t flags;   /* NVOS46 flags used */
++   uint32_t kind;    /* kindOverride used */
+ };
+ 
+ struct nvkmd_rm_va {
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 12d7020..77565b9 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -248,17 +248,6 @@ nvkmd_rm_dev_get_gpu_timestamp(struct nvkmd_dev *_dev)
+    return params.time_nsec;
+ }
+ 
+-static VkResult
+-nvkmd_rm_alloc_va_stub(struct nvkmd_dev *dev,
+-                       struct vk_object_base *log_obj,
+-                       enum nvkmd_va_flags flags, uint8_t pte_kind,
+-                       uint64_t size_B, uint64_t align_B,
+-                       uint64_t fixed_addr, struct nvkmd_va **va_out)
+-{
+-   return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
+-                    "NVK on RM: GPU VA is not implemented yet");
+-}
+-
+ static VkResult
+ nvkmd_rm_create_ctx_stub(struct nvkmd_dev *dev,
+                          struct vk_object_base *log_obj,
+@@ -275,6 +264,6 @@ const struct nvkmd_dev_ops nvkmd_rm_dev_ops = {
+    .alloc_mem = nvkmd_rm_alloc_mem,
+    .alloc_tiled_mem = nvkmd_rm_alloc_tiled_mem,
+    .import_dma_buf = nvkmd_rm_import_dma_buf,
+-   .alloc_va = nvkmd_rm_alloc_va_stub,
++   .alloc_va = nvkmd_rm_alloc_va,
+    .create_ctx = nvkmd_rm_create_ctx_stub,
+ };
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+new file mode 100644
+index 0000000..c368c7b
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+@@ -0,0 +1,408 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_rm.h"
++
++#include "util/log.h"
++#include "util/u_math.h"
++#include "vk_log.h"
++
++#include <inttypes.h>
++
++/*
++ * GPU VA management
++ *
++ * NVK picks every address itself from a util_vma_heap, like on nouveau.
++ * Each nvkmd_va is backed by an NV50_MEMORY_VIRTUAL allocated at exactly
++ * that address (NVOS32_ALLOC_FLAGS_FIXED_ADDRESS_ALLOCATE), optionally
++ * sparse.  RM cannot map into a FERMI_VASPACE_A handle directly; binds map
++ * memory into the virtual object with DMA_OFFSET_FIXED (dmaOffset is then
++ * the absolute GPU VA) and, when librmclient has crm_map_dma2, the PTE kind
++ * the image needs via kindOverride.
++ *
++ * RM unmaps whole mappings (crm_unmap_dma has no size), so each va keeps
++ * the list of its mappings and a partial unbind unmaps the overlapping
++ * mappings and maps back what is left of them.
++ */
++
++#define NVKMD_RM_VA_MAX_COLLISION_RETRIES 8
++
++static VkResult
++alloc_heap_addr_locked(struct nvkmd_rm_dev *dev,
++                       struct vk_object_base *log_obj,
++                       enum nvkmd_va_flags flags,
++                       uint64_t size_B, uint64_t align_B,
++                       uint64_t fixed_addr, uint64_t *addr_out)
++{
++   if (flags & NVKMD_VA_ALLOC_FIXED) {
++      assert(flags & NVKMD_VA_REPLAY);
++      if (fixed_addr < NVKMD_RM_REPLAY_HEAP_START ||
++          fixed_addr >= NVKMD_RM_REPLAY_HEAP_END) {
++         return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
++                          "Capture address 0x%" PRIx64 " not in the replay "
++                          "heap address range [0x%" PRIx64 ", 0x%" PRIx64 ")",
++                          fixed_addr, NVKMD_RM_REPLAY_HEAP_START,
++                          NVKMD_RM_REPLAY_HEAP_END);
++      }
++
++      if (fixed_addr & (align_B - 1)) {
++         return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
++                          "Unaligned capture address: 0x%" PRIx64, fixed_addr);
++      }
++
++      if (!util_vma_heap_alloc_addr(&dev->replay_heap, fixed_addr, size_B)) {
++         return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
++                          "Replay address collision: 0x%" PRIx64, fixed_addr);
++      }
++
++      *addr_out = fixed_addr;
++   } else {
++      struct util_vma_heap *heap = (flags & NVKMD_VA_REPLAY) ?
++                                   &dev->replay_heap : &dev->heap;
++      *addr_out = util_vma_heap_alloc(heap, size_B, align_B);
++      if (*addr_out == 0)
++         return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                          "Failed to allocate virtual address range");
++   }
++
++   return VK_SUCCESS;
++}
++
++static void
++free_heap_addr(struct nvkmd_rm_dev *dev, enum nvkmd_va_flags flags,
++               uint64_t addr, uint64_t size_B)
++{
++   simple_mtx_lock(&dev->heap_mutex);
++   if (flags & NVKMD_VA_REPLAY)
++      util_vma_heap_free(&dev->replay_heap, addr, size_B);
++   else
++      util_vma_heap_free(&dev->heap, addr, size_B);
++   simple_mtx_unlock(&dev->heap_mutex);
++}
++
++static int
++alloc_virtual(struct nvkmd_rm_dev *dev, enum nvkmd_va_flags flags,
++              uint64_t addr, uint64_t size_B, uint64_t align_B,
++              uint32_t *h_virtual_out)
++{
++   NV_MEMORY_ALLOCATION_PARAMS params = {
++      .owner = dev->lib->root(dev->client),
++      .type = NVOS32_TYPE_IMAGE,
++      .flags = NVOS32_ALLOC_FLAGS_VIRTUAL |
++               NVOS32_ALLOC_FLAGS_FIXED_ADDRESS_ALLOCATE |
++               NVOS32_ALLOC_FLAGS_MEMORY_HANDLE_PROVIDED,
++      .size = size_B,
++      .alignment = align_B,
++      .offset = addr,
++      .hVASpace = dev->h_vaspace,
++   };
++   if (flags & NVKMD_VA_SPARSE)
++      params.flags |= NVOS32_ALLOC_FLAGS_SPARSE;
++
++   uint32_t h_virtual = 0;
++   int ret = dev->lib->alloc(dev->client, dev->h_device, &h_virtual,
++                             NV50_MEMORY_VIRTUAL, &params, sizeof(params));
++   if (ret != 0)
++      return ret;
++
++   if (params.offset != addr) {
++      /* RM placed it somewhere else; we can't use that */
++      dev->lib->free(dev->client, dev->h_device, h_virtual);
++      return NV_ERR_NOT_SUPPORTED;
++   }
++
++   *h_virtual_out = h_virtual;
++   return 0;
++}
++
++VkResult
++nvkmd_rm_alloc_va(struct nvkmd_dev *_dev,
++                  struct vk_object_base *log_obj,
++                  enum nvkmd_va_flags flags, uint8_t pte_kind,
++                  uint64_t size_B, uint64_t align_B,
++                  uint64_t fixed_addr, struct nvkmd_va **va_out)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++   VkResult result;
++
++   struct nvkmd_rm_va *va = CALLOC_STRUCT(nvkmd_rm_va);
++   if (va == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   /* GART-only ranges can use 4 KiB alignment; everything else may get
++    * VRAM with 64 KiB pages bound into it.
++    */
++   const uint32_t min_align_B = (flags & NVKMD_VA_GART) ? 4096 :
++                                _dev->pdev->bind_align_B;
++   assert(util_is_power_of_two_or_zero64(align_B));
++   align_B = MAX2(align_B, min_align_B);
++   size_B = align64(size_B, align_B);
++
++   assert((fixed_addr == 0) == !(flags & NVKMD_VA_ALLOC_FIXED));
++
++   simple_mtx_lock(&dev->heap_mutex);
++   int ret = 0;
++   for (unsigned attempt = 0;; attempt++) {
++      result = alloc_heap_addr_locked(dev, log_obj, flags, size_B, align_B,
++                                      fixed_addr, &va->base.addr);
++      if (result != VK_SUCCESS)
++         break;
++
++      ret = alloc_virtual(dev, flags, va->base.addr, size_B, align_B,
++                          &va->h_virtual);
++      if (ret == 0)
++         break;
++
++      /* Something of RM's may already sit there.  Leave that range
++       * allocated in our heap so we never try it again, and retry
++       * elsewhere.
++       */
++      if ((flags & NVKMD_VA_ALLOC_FIXED) ||
++          attempt >= NVKMD_RM_VA_MAX_COLLISION_RETRIES) {
++         result = NVKMD_RM_CHECK(dev->lib, log_obj,
++                                 VK_ERROR_OUT_OF_DEVICE_MEMORY, ret,
++                                 "alloc NV50_MEMORY_VIRTUAL");
++         if (flags & NVKMD_VA_ALLOC_FIXED) {
++            util_vma_heap_free(&dev->replay_heap, va->base.addr, size_B);
++            result = VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
++         }
++         break;
++      }
++
++      mesa_logd("NVK: RM refused VA [0x%" PRIx64 ", 0x%" PRIx64 "): %s, "
++                "retrying", va->base.addr, va->base.addr + size_B,
++                dev->lib->status_name(ret));
++   }
++   simple_mtx_unlock(&dev->heap_mutex);
++
++   if (result != VK_SUCCESS) {
++      FREE(va);
++      return result;
++   }
++
++   va->base.ops = &nvkmd_rm_va_ops;
++   va->base.dev = &dev->base;
++   va->base.flags = flags;
++   va->base.pte_kind = pte_kind;
++   va->base.size_B = size_B;
++
++   simple_mtx_init(&va->mutex, mtx_plain);
++   va->mappings = UTIL_DYNARRAY_INIT;
++
++   *va_out = &va->base;
++
++   return VK_SUCCESS;
++}
++
++static int
++map_range(struct nvkmd_rm_dev *dev, struct nvkmd_rm_va *va,
++          const struct nvkmd_rm_mapping *m)
++{
++   const struct nvkmd_rm_lib *lib = dev->lib;
++   uint64_t gpu_va = va->base.addr + m->va_offset_B;
++
++   int ret;
++   if (lib->map_dma2 != NULL) {
++      ret = lib->map_dma2(dev->client, dev->h_device, va->h_virtual,
++                          m->h_memory, m->mem_offset_B, m->range_B,
++                          m->flags, 0 /* flags2 */, m->kind, &gpu_va);
++   } else {
++      ret = lib->map_dma(dev->client, dev->h_device, va->h_virtual,
++                         m->h_memory, m->mem_offset_B, m->range_B,
++                         m->flags, &gpu_va);
++   }
++
++   if (ret == 0 && gpu_va != va->base.addr + m->va_offset_B) {
++      /* DMA_OFFSET_FIXED should have made this impossible */
++      lib->unmap_dma(dev->client, dev->h_device, va->h_virtual,
++                     m->h_memory, 0, gpu_va);
++      ret = NV_ERR_NOT_SUPPORTED;
++   }
++
++   return ret;
++}
++
++static int
++unmap_range(struct nvkmd_rm_dev *dev, struct nvkmd_rm_va *va,
++            const struct nvkmd_rm_mapping *m)
++{
++   return dev->lib->unmap_dma(dev->client, dev->h_device, va->h_virtual,
++                              m->h_memory, 0,
++                              va->base.addr + m->va_offset_B);
++}
++
++/* Unmaps [va_offset_B, va_offset_B + range_B), mapping back the parts of
++ * partially covered mappings.  Called with va->mutex held.
++ */
++static VkResult
++unbind_locked(struct nvkmd_rm_dev *dev, struct nvkmd_rm_va *va,
++              struct vk_object_base *log_obj,
++              uint64_t va_offset_B, uint64_t range_B)
++{
++   const uint64_t start = va_offset_B;
++   const uint64_t end = va_offset_B + range_B;
++   VkResult result = VK_SUCCESS;
++
++   unsigned i = 0;
++   while (i < util_dynarray_num_elements(&va->mappings,
++                                         struct nvkmd_rm_mapping)) {
++      struct nvkmd_rm_mapping m =
++         *util_dynarray_element(&va->mappings, struct nvkmd_rm_mapping, i);
++      const uint64_t m_end = m.va_offset_B + m.range_B;
++
++      if (m_end <= start || m.va_offset_B >= end) {
++         i++;
++         continue;
++      }
++
++      int ret = unmap_range(dev, va, &m);
++      if (ret != 0) {
++         result = NVKMD_RM_CHECK(dev->lib, log_obj, VK_ERROR_UNKNOWN, ret,
++                                 "unmap memory dma");
++         i++;
++         continue;
++      }
++
++      /* Remove it (swap with the last one) */
++      struct nvkmd_rm_mapping *last =
++         util_dynarray_top_ptr(&va->mappings, struct nvkmd_rm_mapping);
++      *util_dynarray_element(&va->mappings, struct nvkmd_rm_mapping, i) =
++         *last;
++      (void)util_dynarray_pop(&va->mappings, struct nvkmd_rm_mapping);
++
++      /* Map back what lies outside the unbound range */
++      if (m.va_offset_B < start) {
++         struct nvkmd_rm_mapping left = m;
++         left.range_B = start - m.va_offset_B;
++         if (map_range(dev, va, &left) == 0)
++            util_dynarray_append(&va->mappings, left);
++         else
++            result = vk_error(log_obj, VK_ERROR_UNKNOWN);
++      }
++      if (m_end > end) {
++         struct nvkmd_rm_mapping right = m;
++         right.va_offset_B = end;
++         right.mem_offset_B = m.mem_offset_B + (end - m.va_offset_B);
++         right.range_B = m_end - end;
++         if (map_range(dev, va, &right) == 0)
++            util_dynarray_append(&va->mappings, right);
++         else
++            result = vk_error(log_obj, VK_ERROR_UNKNOWN);
++      }
++
++      /* Elements were reordered; start over (lists are short) */
++      i = 0;
++   }
++
++   return result;
++}
++
++static void
++nvkmd_rm_va_free(struct nvkmd_va *_va)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_va->dev);
++   struct nvkmd_rm_va *va = nvkmd_rm_va(_va);
++
++   simple_mtx_lock(&va->mutex);
++   util_dynarray_foreach(&va->mappings, struct nvkmd_rm_mapping, m)
++      unmap_range(dev, va, m);
++   util_dynarray_fini(&va->mappings);
++   simple_mtx_unlock(&va->mutex);
++   simple_mtx_destroy(&va->mutex);
++
++   int ret = dev->lib->free(dev->client, dev->h_device, va->h_virtual);
++
++   /* If RM still holds the range, leak it rather than hand it out again */
++   if (ret == 0)
++      free_heap_addr(dev, va->base.flags, va->base.addr, va->base.size_B);
++
++   FREE(va);
++}
++
++static VkResult
++nvkmd_rm_va_bind_mem(struct nvkmd_va *_va,
++                     struct vk_object_base *log_obj,
++                     uint64_t va_offset_B,
++                     struct nvkmd_mem *_mem,
++                     uint64_t mem_offset_B,
++                     uint64_t range_B)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_va->dev);
++   struct nvkmd_rm_va *va = nvkmd_rm_va(_va);
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++   VkResult result = VK_SUCCESS;
++
++   assert(_mem->dev == _va->dev);
++
++   uint32_t flags = NVRM_DEF(OS46, _FLAGS, _ACCESS, _READ_WRITE) |
++                    NVRM_DEF(OS46, _FLAGS, _DMA_OFFSET_FIXED, _TRUE);
++   if (mem->vram) {
++      flags |= NVRM_DEF(OS46, _FLAGS, _PAGE_SIZE, _BIG);
++   } else {
++      flags |= NVRM_DEF(OS46, _FLAGS, _PAGE_SIZE, _4KB) |
++               NVRM_DEF(OS46, _FLAGS, _CACHE_SNOOP, _ENABLE);
++   }
++
++   uint32_t kind = 0;
++   if (va->base.pte_kind != 0) {
++      if (dev->lib->map_dma2 != NULL) {
++         flags |= NVRM_DEF(OS46, _FLAGS, _PAGE_KIND_OVERRIDE, _YES);
++         kind = va->base.pte_kind;
++      } else {
++         static bool warned;
++         if (!warned) {
++            mesa_logw("NVK: librmclient lacks crm_map_dma2, images are "
++                      "mapped with the generic PTE kind");
++            warned = true;
++         }
++      }
++   }
++
++   struct nvkmd_rm_mapping m = {
++      .va_offset_B = va_offset_B,
++      .range_B = range_B,
++      .h_memory = mem->h_memory,
++      .mem_offset_B = mem_offset_B,
++      .flags = flags,
++      .kind = kind,
++   };
++
++   simple_mtx_lock(&va->mutex);
++
++   /* Binding over something replaces it */
++   result = unbind_locked(dev, va, log_obj, va_offset_B, range_B);
++   if (result == VK_SUCCESS) {
++      result = NVKMD_RM_CHECK(dev->lib, log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                              map_range(dev, va, &m), "map memory dma");
++   }
++   if (result == VK_SUCCESS)
++      util_dynarray_append(&va->mappings, m);
++
++   simple_mtx_unlock(&va->mutex);
++
++   return result;
++}
++
++static VkResult
++nvkmd_rm_va_unbind(struct nvkmd_va *_va,
++                   struct vk_object_base *log_obj,
++                   uint64_t va_offset_B,
++                   uint64_t range_B)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_va->dev);
++   struct nvkmd_rm_va *va = nvkmd_rm_va(_va);
++
++   simple_mtx_lock(&va->mutex);
++   VkResult result = unbind_locked(dev, va, log_obj, va_offset_B, range_B);
++   simple_mtx_unlock(&va->mutex);
++
++   return result;
++}
++
++const struct nvkmd_va_ops nvkmd_rm_va_ops = {
++   .free = nvkmd_rm_va_free,
++   .bind_mem = nvkmd_rm_va_bind_mem,
++   .unbind = nvkmd_rm_va_unbind,
++};
+-- 
+2.43.0
+

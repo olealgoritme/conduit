@@ -1,0 +1,75 @@
+From d4de8b95433d68c298545f34e6067becad229d51 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 5 Oct 2026 23:11:54 +0200
+Subject: [PATCH 10/13] nvk/rm: report VA ranges at the size NVK asked for
+
+RM aligns a default-page-size NV50_MEMORY_VIRTUAL of 2 MiB or more to
+2 MiB in offset and size, and the backend follows that rounding so RM
+does not move the range.  It also reported the rounded size as
+nvkmd_va::size_B, and NVK binds an image plane's VA over its whole size:
+a 3.5 MiB image in 3.5 MiB of memory was bound over 4 MiB and
+nvkmd_va_bind_mem asserted (vkcube at 1280x720 or more, with either WSI).
+
+Keep the rounded size for RM and our heap (nvkmd_rm_va::rm_size_B) and
+report the requested size, aligned to the big page, to NVK.
+
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h    |  5 ++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c | 10 ++++++++--
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index ef8b54c..bd19568 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -229,8 +229,11 @@ struct nvkmd_rm_mapping {
+ struct nvkmd_rm_va {
+    struct nvkmd_va base;
+ 
+-   /* NV50_MEMORY_VIRTUAL reserving [addr, addr + size_B) in RM */
++   /* NV50_MEMORY_VIRTUAL reserving [addr, addr + rm_size_B) in RM and in
++    * our heap.  rm_size_B >= base.size_B: RM's alignment rules round it up.
++    */
+    uint32_t h_virtual;
++   uint64_t rm_size_B;
+ 
+    simple_mtx_t mutex;
+    struct util_dynarray mappings; /* struct nvkmd_rm_mapping */
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+index 00232e1..49ef5ac 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+@@ -150,6 +150,7 @@ nvkmd_rm_alloc_va(struct nvkmd_dev *_dev,
+     * (gvaspaceApplyDefaultAlignment).  Do the same, or RM moves the range
+     * off the address we picked.
+     */
++   const uint64_t user_size_B = align64(size_B, min_align_B);
+    if (size_B >= NVKMD_RM_HUGE_PAGE_SIZE)
+       align_B = MAX2(align_B, NVKMD_RM_HUGE_PAGE_SIZE);
+    size_B = align64(size_B, align_B);
+@@ -200,7 +201,12 @@ nvkmd_rm_alloc_va(struct nvkmd_dev *_dev,
+    va->base.dev = &dev->base;
+    va->base.flags = flags;
+    va->base.pte_kind = pte_kind;
+-   va->base.size_B = size_B;
++   /* NVK binds whole VAs (an image plane's VA is bound over its full size),
++    * so it sees the size it asked for, not RM's 2 MiB rounding: a 3.5 MiB
++    * image in 3.5 MiB of memory must not be bound over 4 MiB.
++    */
++   va->base.size_B = user_size_B;
++   va->rm_size_B = size_B;
+ 
+    simple_mtx_init(&va->mutex, mtx_plain);
+    va->mappings = UTIL_DYNARRAY_INIT;
+@@ -330,7 +336,7 @@ nvkmd_rm_va_free(struct nvkmd_va *_va)
+ 
+    /* If RM still holds the range, leak it rather than hand it out again */
+    if (ret == 0)
+-      free_heap_addr(dev, va->base.flags, va->base.addr, va->base.size_B);
++      free_heap_addr(dev, va->base.flags, va->base.addr, va->rm_size_B);
+ 
+    FREE(va);
+ }
+-- 
+2.43.0
+

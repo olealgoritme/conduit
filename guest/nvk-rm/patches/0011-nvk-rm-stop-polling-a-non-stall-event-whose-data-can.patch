@@ -1,0 +1,70 @@
+From 472277bf1cf4f3ac0699cfab8152051ac1bbec0c Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 5 Oct 2026 23:12:01 +0200
+Subject: [PATCH 11/13] nvk/rm: stop polling a non-stall event whose data
+ cannot be read
+
+CPU waits poll() the non-stall interrupt event and drain it with
+NV_ESC_RM_GET_EVENT_DATA.  A Conduit host that refuses that escape
+leaves the event readable for good, so every wait spun through poll()
+and refused escapes: about 5800 refusals (and backend log lines) per
+second while vkcube ran.  Once a drain fails, waits sleep with backoff
+instead, as without an event.
+
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |  2 ++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c | 18 ++++++++++++++----
+ 2 files changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index bd19568..2d5d9ac 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -155,6 +155,8 @@ struct nvkmd_rm_dev {
+    /* Non-stall interrupt event, for CPU waits.  fd < 0 if unavailable. */
+    uint32_t h_nonstall_event;
+    int nonstall_fd;
++   /* Set once draining the event failed: poll() is useless then */
++   bool nonstall_undrainable;
+ 
+    simple_mtx_t heap_mutex;
+    struct util_vma_heap heap;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 839e138..675cfdb 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -294,17 +294,27 @@ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+ 
+    if (*iter < NVKMD_RM_WAIT_SPIN_ITERS) {
+       sched_yield();
+-   } else if (dev != NULL && dev->nonstall_fd >= 0) {
++   } else if (dev != NULL && dev->nonstall_fd >= 0 &&
++              !p_atomic_read(&dev->nonstall_undrainable)) {
+       const int ms = MIN2(remaining_ns / 1000000 + 1, NVKMD_RM_WAIT_POLL_MS);
+       struct pollfd pfd = {
+          .fd = dev->nonstall_fd,
+          .events = POLLIN,
+       };
+       if (poll(&pfd, 1, ms) > 0 && dev->lib->event_drain != NULL) {
+-         /* Best effort: event data may not be readable (Conduit guests) */
+          struct crm_event_data data[8];
+-         dev->lib->event_drain(dev->client, dev->nonstall_fd,
+-                               data, ARRAY_SIZE(data));
++         int n = dev->lib->event_drain(dev->client, dev->nonstall_fd,
++                                       data, ARRAY_SIZE(data));
++         /* An event whose data cannot be read (a Conduit host that refuses
++          * NV_ESC_RM_GET_EVENT_DATA) stays readable forever: poll() would
++          * return at once and every wait would spin through refused
++          * escapes.  Sleep instead from now on.
++          */
++         if (n < 0) {
++            mesa_logd("NVK: RM event data unreadable (%d); CPU waits sleep",
++                      n);
++            p_atomic_set(&dev->nonstall_undrainable, true);
++         }
+       }
+    } else {
+       const uint64_t us = *iter < 4 * NVKMD_RM_WAIT_SPIN_ITERS ? 10 : 200;
+-- 
+2.43.0
+

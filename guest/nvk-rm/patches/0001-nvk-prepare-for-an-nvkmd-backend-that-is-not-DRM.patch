@@ -1,0 +1,389 @@
+From 6f84e19996e94ca40097f900ee8a6d6d354a2634 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 5 Oct 2026 21:11:11 +0200
+Subject: [PATCH 01/13] nvk: prepare for an nvkmd backend that is not DRM
+
+Split nvk_create_drm_physical_device() so that the part which turns an
+nvkmd_pdev into an nvk_physical_device can be reused, and add an
+instance-level enumerate hook backed by nvkmd_enumerate_non_drm_pdevs().
+When that returns VK_ERROR_INCOMPATIBLE_DRIVER (always, for now) the
+common code falls back to DRM enumeration exactly as before.
+
+Also:
+ - only install vk_drm_syncobj_copy_payloads when the nvkmd device has a
+   DRM fd,
+ - advertise the fd/dma-buf external memory, semaphore and fence
+   extensions only when nvkmd_info::has_dma_buf is set, and use a
+   software WSI device (CPU copy on present) when it is not,
+ - add nvkmd_info::has_host_visible_vram and only expose the
+   DEVICE_LOCAL|HOST_VISIBLE memory type when it is set,
+ - export nouveau_ws_device_info_init_limits() from the winsys so that a
+   backend which only knows the chipset can fill in the SM version and
+   per-SM limits the same way nouveau does.
+
+nouveau sets has_dma_buf and has_host_visible_vram, so there is no
+functional change for nouveau.
+
+---
+ src/nouveau/vulkan/nvk_device.c               |  8 +-
+ src/nouveau/vulkan/nvk_instance.c             |  1 +
+ src/nouveau/vulkan/nvk_physical_device.c      | 92 +++++++++++++++----
+ src/nouveau/vulkan/nvk_physical_device.h      |  2 +
+ src/nouveau/vulkan/nvk_wsi.c                  |  3 +-
+ .../vulkan/nvkmd/nouveau/nvkmd_nouveau_pdev.c |  1 +
+ src/nouveau/vulkan/nvkmd/nvkmd.c              | 10 ++
+ src/nouveau/vulkan/nvkmd/nvkmd.h              | 19 ++++
+ src/nouveau/winsys/nouveau_device.c           | 17 ++--
+ src/nouveau/winsys/nouveau_device.h           |  6 ++
+ 10 files changed, 134 insertions(+), 25 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_device.c b/src/nouveau/vulkan/nvk_device.c
+index 40decf9..e43e68c 100644
+--- a/src/nouveau/vulkan/nvk_device.c
++++ b/src/nouveau/vulkan/nvk_device.c
+@@ -257,11 +257,15 @@ nvk_CreateDevice(VkPhysicalDevice physicalDevice,
+       if (result != VK_SUCCESS)
+          goto fail_init;
+ 
+-      vk_device_set_drm_fd(&dev->vk, nvkmd_dev_get_drm_fd(dev->nvkmd));
++      const int drm_fd = nvkmd_dev_get_drm_fd(dev->nvkmd);
++      vk_device_set_drm_fd(&dev->vk, drm_fd);
+       dev->vk.command_buffer_ops = &nvk_cmd_buffer_ops;
+ 
+       dev->vk.get_timestamp = nvk_device_get_timestamp;
+-      dev->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
++
++      /* Only DRM syncobjs can copy payloads this way */
++      if (drm_fd >= 0)
++         dev->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
+ 
+       result = nvk_upload_queue_init(dev, &dev->upload);
+       if (result != VK_SUCCESS)
+diff --git a/src/nouveau/vulkan/nvk_instance.c b/src/nouveau/vulkan/nvk_instance.c
+index ce217ce..2db0c8a 100644
+--- a/src/nouveau/vulkan/nvk_instance.c
++++ b/src/nouveau/vulkan/nvk_instance.c
+@@ -161,6 +161,7 @@ nvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+    nvk_init_experimental_flags(instance);
+    nvk_init_dri_options(instance);
+ 
++   instance->vk.physical_devices.enumerate = nvk_enumerate_physical_devices;
+    instance->vk.physical_devices.try_create_for_drm =
+       nvk_create_drm_physical_device;
+    instance->vk.physical_devices.destroy = nvk_physical_device_destroy;
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index 0e00fad..7f3f9fc 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -112,6 +112,7 @@ static void
+ nvk_get_device_extensions(const struct nvk_instance *instance,
+                           const struct nv_device_info *info,
+                           bool has_tiled_bos,
++                          bool has_dma_buf,
+                           struct vk_device_extension_table *ext)
+ {
+    const bool h264dec = nvk_video_enabled(instance, info);
+@@ -142,11 +143,11 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
+       .KHR_dynamic_rendering = true,
+       .KHR_dynamic_rendering_local_read = true,
+       .KHR_external_fence = true,
+-      .KHR_external_fence_fd = true,
++      .KHR_external_fence_fd = has_dma_buf,
+       .KHR_external_memory = true,
+-      .KHR_external_memory_fd = true,
++      .KHR_external_memory_fd = has_dma_buf,
+       .KHR_external_semaphore = true,
+-      .KHR_external_semaphore_fd = true,
++      .KHR_external_semaphore_fd = has_dma_buf,
+       .KHR_format_feature_flags2 = true,
+       .KHR_fragment_shader_barycentric = info->cls_eng3d >= TURING_A,
+       .KHR_fragment_shading_rate = info->cls_eng3d >= TURING_A,
+@@ -254,7 +255,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
+       .EXT_extended_dynamic_state = true,
+       .EXT_extended_dynamic_state2 = true,
+       .EXT_extended_dynamic_state3 = true,
+-      .EXT_external_memory_dma_buf = true,
++      .EXT_external_memory_dma_buf = has_dma_buf,
+       .EXT_global_priority = true,
+       .EXT_global_priority_query = true,
+       .EXT_graphics_pipeline_library = true,
+@@ -1516,20 +1517,14 @@ nvk_get_vram_heap_available(struct nvk_physical_device *pdev)
+    return pdev->info.vram_size_B - used;
+ }
+ 
+-VkResult
+-nvk_create_drm_physical_device(struct vk_instance *_instance,
+-                               struct _drmDevice *drm_device,
+-                               struct vk_physical_device **pdev_out)
++/* Takes ownership of nvkmd, which is destroyed on failure. */
++static VkResult
++nvk_create_physical_device_for_nvkmd(struct nvk_instance *instance,
++                                     struct nvkmd_pdev *nvkmd,
++                                     struct vk_physical_device **pdev_out)
+ {
+-   struct nvk_instance *instance = (struct nvk_instance *)_instance;
+    VkResult result;
+ 
+-   struct nvkmd_pdev *nvkmd;
+-   result = nvkmd_try_create_pdev_for_drm(drm_device, &instance->vk.base,
+-                                          instance->debug_flags, &nvkmd);
+-   if (result != VK_SUCCESS)
+-      return result;
+-
+    /* We don't support anything pre-Kepler */
+    if (nvkmd->dev_info.cls_eng3d < KEPLER_A) {
+       result = VK_ERROR_INCOMPATIBLE_DRIVER;
+@@ -1571,6 +1566,7 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
+    struct vk_device_extension_table supported_extensions;
+    nvk_get_device_extensions(instance, &nvkmd->dev_info,
+                              nvkmd->kmd_info.has_alloc_tiled,
++                             nvkmd->kmd_info.has_dma_buf,
+                              &supported_extensions);
+ 
+    struct vk_features supported_features;
+@@ -1648,7 +1644,8 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
+          .heapIndex = vram_heap_idx,
+       };
+ 
+-      if (pdev->info.cls_eng3d >= MAXWELL_A) {
++      if (pdev->info.cls_eng3d >= MAXWELL_A &&
++          nvkmd->kmd_info.has_host_visible_vram) {
+          pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
+             .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+@@ -1748,6 +1745,69 @@ fail_nvkmd:
+    return result;
+ }
+ 
++VkResult
++nvk_create_drm_physical_device(struct vk_instance *_instance,
++                               struct _drmDevice *drm_device,
++                               struct vk_physical_device **pdev_out)
++{
++   struct nvk_instance *instance = (struct nvk_instance *)_instance;
++   VkResult result;
++
++   struct nvkmd_pdev *nvkmd;
++   result = nvkmd_try_create_pdev_for_drm(drm_device, &instance->vk.base,
++                                          instance->debug_flags, &nvkmd);
++   if (result != VK_SUCCESS)
++      return result;
++
++   return nvk_create_physical_device_for_nvkmd(instance, nvkmd, pdev_out);
++}
++
++/* Enumerates GPUs which are driven by something other than a DRM driver
++ * (see nvkmd_enumerate_non_drm_pdevs()).  Returns
++ * VK_ERROR_INCOMPATIBLE_DRIVER if there are none, in which case the common
++ * code falls back to enumerating DRM devices.
++ */
++VkResult
++nvk_enumerate_physical_devices(struct vk_instance *_instance)
++{
++   struct nvk_instance *instance = (struct nvk_instance *)_instance;
++   struct nvkmd_pdev *nvkmds[NVKMD_MAX_NON_DRM_PDEVS];
++   uint32_t nvkmd_count = ARRAY_SIZE(nvkmds);
++   VkResult result;
++
++   result = nvkmd_enumerate_non_drm_pdevs(&instance->vk.base,
++                                          instance->debug_flags,
++                                          &nvkmd_count, nvkmds);
++   if (result != VK_SUCCESS)
++      return result;
++
++   uint32_t pdev_count = 0;
++   for (uint32_t i = 0; i < nvkmd_count; i++) {
++      if (result != VK_SUCCESS) {
++         nvkmd_pdev_destroy(nvkmds[i]);
++         continue;
++      }
++
++      struct vk_physical_device *pdev;
++      result = nvk_create_physical_device_for_nvkmd(instance, nvkmds[i],
++                                                    &pdev);
++      if (result == VK_ERROR_INCOMPATIBLE_DRIVER) {
++         result = VK_SUCCESS;
++         continue;
++      }
++
++      if (result == VK_SUCCESS) {
++         list_addtail(&pdev->link, &instance->vk.physical_devices.list);
++         pdev_count++;
++      }
++   }
++
++   if (result != VK_SUCCESS)
++      return result;
++
++   return pdev_count > 0 ? VK_SUCCESS : VK_ERROR_INCOMPATIBLE_DRIVER;
++}
++
+ void
+ nvk_physical_device_destroy(struct vk_physical_device *vk_pdev)
+ {
+diff --git a/src/nouveau/vulkan/nvk_physical_device.h b/src/nouveau/vulkan/nvk_physical_device.h
+index 69cbe03..26d7e34 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.h
++++ b/src/nouveau/vulkan/nvk_physical_device.h
+@@ -97,6 +97,8 @@ VkResult nvk_create_drm_physical_device(struct vk_instance *vk_instance,
+                                         struct _drmDevice *drm_device,
+                                         struct vk_physical_device **pdev_out);
+ 
++VkResult nvk_enumerate_physical_devices(struct vk_instance *vk_instance);
++
+ void nvk_physical_device_destroy(struct vk_physical_device *vk_device);
+ 
+ VkExtent2D nvk_max_shading_rate(const struct nvk_physical_device *pdev,
+diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
+index ae36a88..c5c3a54 100644
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -23,7 +23,8 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
+    if (pdev->vk.instance->enabled_extensions.KHR_display)
+       display_fd = nvkmd_pdev_get_drm_primary_fd(pdev->nvkmd);
+    struct wsi_device_options wsi_options = {
+-      .sw_device = false
++      /* Without dma-buf, presentation goes through a CPU copy */
++      .sw_device = !pdev->nvkmd->kmd_info.has_dma_buf,
+    };
+    result = wsi_device_init(&pdev->wsi_device,
+                             nvk_physical_device_to_handle(pdev),
+diff --git a/src/nouveau/vulkan/nvkmd/nouveau/nvkmd_nouveau_pdev.c b/src/nouveau/vulkan/nvkmd/nouveau/nvkmd_nouveau_pdev.c
+index 10042cd..e5f5617 100644
+--- a/src/nouveau/vulkan/nvkmd/nouveau/nvkmd_nouveau_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/nouveau/nvkmd_nouveau_pdev.c
+@@ -106,6 +106,7 @@ nvkmd_nouveau_try_create_pdev(struct _drmDevice *drm_device,
+                           ws_dev->info.cls_eng3d >= TURING_A) ||
+                          (ws_dev->nouveau_version >= 0x01000402 &&
+                           ws_dev->info.cls_eng3d >= AMPERE_A),
++      .has_host_visible_vram = true,
+    };
+ 
+    /* We get this ourselves */
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.c b/src/nouveau/vulkan/nvkmd/nvkmd.c
+index c6ffb94..c0e23fb 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.c
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.c
+@@ -92,6 +92,16 @@ nvkmd_try_create_pdev_for_drm(struct _drmDevice *drm_device,
+                                         debug_flags, pdev_out);
+ }
+ 
++VkResult
++nvkmd_enumerate_non_drm_pdevs(struct vk_object_base *log_obj,
++                              enum nvk_debug debug_flags,
++                              uint32_t *pdev_count,
++                              struct nvkmd_pdev **pdevs_out)
++{
++   *pdev_count = 0;
++   return VK_ERROR_INCOMPATIBLE_DRIVER;
++}
++
+ VkResult MUST_CHECK
+ nvkmd_dev_alloc_mem(struct nvkmd_dev *dev,
+                     struct vk_object_base *log_obj,
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
+index 6f580b4..9cb83f6 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+@@ -122,6 +122,9 @@ struct nvkmd_info {
+    bool has_map_fixed;
+    bool has_overmap;
+    bool has_compression;
++
++   /** VRAM may be mapped by the CPU (exposes a host-visible VRAM type) */
++   bool has_host_visible_vram;
+ };
+ 
+ struct nvkmd_pdev_ops {
+@@ -385,6 +388,22 @@ nvkmd_try_create_pdev_for_drm(struct _drmDevice *drm_device,
+                               enum nvk_debug debug_flags,
+                               struct nvkmd_pdev **pdev_out);
+ 
++#define NVKMD_MAX_NON_DRM_PDEVS 16
++
++/** Enumerates GPUs driven by a kernel interface other than DRM
++ *
++ * On input, *pdev_count is the size of pdevs_out.  On success, *pdev_count
++ * is set to the number of nvkmd_pdev objects written to pdevs_out, which the
++ * caller owns.  Returns VK_ERROR_INCOMPATIBLE_DRIVER if no such interface is
++ * built in, enabled or present, in which case the caller should fall back to
++ * enumerating DRM devices.
++ */
++VkResult MUST_CHECK
++nvkmd_enumerate_non_drm_pdevs(struct vk_object_base *log_obj,
++                              enum nvk_debug debug_flags,
++                              uint32_t *pdev_count,
++                              struct nvkmd_pdev **pdevs_out);
++
+ static inline void
+ nvkmd_pdev_destroy(struct nvkmd_pdev *pdev)
+ {
+diff --git a/src/nouveau/winsys/nouveau_device.c b/src/nouveau/winsys/nouveau_device.c
+index 6e430b7..43d39d8 100644
+--- a/src/nouveau/winsys/nouveau_device.c
++++ b/src/nouveau/winsys/nouveau_device.c
+@@ -354,6 +354,16 @@ init_shared_mem_sizes(struct nv_device_info *info)
+    }
+ }
+ 
++void
++nouveau_ws_device_info_init_limits(struct nv_device_info *info)
++{
++   info->sm = sm_for_chipset(info->chipset);
++   info->max_warps_per_mp = max_warps_per_mp_for_sm(info->sm);
++   info->max_blocks_per_mp = max_blocks_per_mp_for_sm(info->sm);
++   info->mp_per_tpc = mp_per_tpc_for_chipset(info->chipset);
++   init_shared_mem_sizes(info);
++}
++
+ static int
+ nouveau_ws_param(int fd, uint64_t param, uint64_t *value)
+ {
+@@ -571,7 +581,6 @@ nouveau_ws_device_new(drmDevicePtr drm_device)
+    if (nouveau_ws_context_create(device, NOUVEAU_WS_ALL_3D_ENGINES, &tmp_ctx))
+       goto out_err;
+ 
+-   device->info.sm = sm_for_chipset(device->info.chipset);
+    device->info.cls_copy = tmp_ctx->copy.cls;
+    device->info.cls_eng2d = tmp_ctx->eng2d.cls;
+    device->info.cls_eng3d = tmp_ctx->eng3d.cls;
+@@ -587,9 +596,7 @@ nouveau_ws_device_new(drmDevicePtr drm_device)
+ 
+    // for now we hardcode those values, but in the future Nouveau could provide that information to
+    // us instead.
+-   device->info.max_warps_per_mp = max_warps_per_mp_for_sm(device->info.sm);
+-   device->info.max_blocks_per_mp = max_blocks_per_mp_for_sm(device->info.sm);
+-   device->info.mp_per_tpc = mp_per_tpc_for_chipset(device->info.chipset);
++   nouveau_ws_device_info_init_limits(&device->info);
+ 
+    /* Transfer queues require two kernel fixes:
+     *   0ef5c4e4db ("nouveau: fix disabling the nonstall irq due to storm code")
+@@ -611,8 +618,6 @@ nouveau_ws_device_new(drmDevicePtr drm_device)
+    device->info.has_video = device->nouveau_version >= 0x01000403 &&
+                             device->info.cls_vdec != 0;
+ 
+-   init_shared_mem_sizes(&device->info);
+-
+    simple_mtx_init(&device->bos_lock, mtx_plain);
+    device->bos = _mesa_pointer_hash_table_create(NULL);
+ 
+diff --git a/src/nouveau/winsys/nouveau_device.h b/src/nouveau/winsys/nouveau_device.h
+index 53cb00c..6aedc92 100644
+--- a/src/nouveau/winsys/nouveau_device.h
++++ b/src/nouveau/winsys/nouveau_device.h
+@@ -39,6 +39,12 @@ uint64_t nouveau_ws_device_vram_used(struct nouveau_ws_device *);
+ uint64_t nouveau_ws_device_timestamp(struct nouveau_ws_device *device);
+ bool nouveau_ws_device_has_tiled_bo(struct nouveau_ws_device *device);
+ 
++/* Fills the SM version and the per-SM limits (warps, blocks, shared memory
++ * configurations) that are derived from nv_device_info::chipset.  Used by
++ * kernel interfaces other than nouveau which only know the chipset.
++ */
++void nouveau_ws_device_info_init_limits(struct nv_device_info *info);
++
+ #ifdef __cplusplus
+ }
+ #endif
+-- 
+2.43.0
+

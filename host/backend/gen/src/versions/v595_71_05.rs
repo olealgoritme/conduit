@@ -13,7 +13,8 @@
 //
 // Struct sizes are computed from gVisor's pkg/abi/nvgpu declarations, not
 // transcribed. Sizes marked `None` are variable-length ioctls with no fixed
-// parameter struct.
+// parameter struct. Escapes nvproxy does not serve come from CONDUIT_EXTRA in
+// nvabi_gen.py, with their sizes stated there.
 
 use super::{IoctlEntry, IoctlKind};
 use crate::ioctl::*;
@@ -80,6 +81,12 @@ pub fn table() -> &'static [IoctlEntry] {
             escape: NV_ESC_RM_UNMAP_MEMORY,
             param_size: Some(32),
             kind: IoctlKind::Simple,
+        },
+        // NVOS41_PARAMETERS
+        IoctlEntry {
+            escape: NV_ESC_RM_GET_EVENT_DATA,
+            param_size: Some(16),
+            kind: IoctlKind::EventData,
         },
         // NVOS39_PARAMETERS
         IoctlEntry {

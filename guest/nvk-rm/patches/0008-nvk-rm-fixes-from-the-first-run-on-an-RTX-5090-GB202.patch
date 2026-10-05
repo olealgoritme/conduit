@@ -1,0 +1,332 @@
+From 99ba8583c5cbf1720ee9fc1efce351aebecfab1e Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 5 Oct 2026 22:07:16 +0200
+Subject: [PATCH 08/13] nvk/rm: fixes from the first run on an RTX 5090 (GB202,
+ GSP)
+
+vkCreateDevice now succeeds on RM 610.57.04 under Conduit. What the
+first run found:
+
+- NV01_MEMORY_SYSTEM_OS_DESCRIPTOR through NV_ESC_RM_ALLOC fails with
+  NV_ERR_NOT_SUPPORTED: RM takes a user address only through
+  NV_ESC_RM_ALLOC_MEMORY, where the Unix escape layer pins the pages.
+  Use librmclient's new crm_alloc_os_descriptor when it is there.
+- RM aligns a default-page-size NV50_MEMORY_VIRTUAL to 64 KiB, and to
+  2 MiB (offset and size) once it is 2 MiB or larger, even with
+  FIXED_ADDRESS_ALLOCATE.  Align our ranges the same way; log when RM
+  moves one anyway.
+- The timeline vk_sync type advertised GPU_MULTI_WAIT, a binary-only
+  feature (vk_sync_type_validate asserts).
+- A new FERMI_VASPACE_A cannot hold a GR context under GSP:
+  VA_INTERNAL_LIMIT pins RM's internal range to [4 GiB, 4.5 GiB), which
+  a GSP client reserves entirely for GSP-RM, so the 3D object fails with
+  NV_ERR_NO_MEMORY mapping its context buffers.  Use the device's VA
+  space (FERMI_VASPACE_A index GPU_DEVICE) like NVIDIA's driver;
+  RESTRICT_RESERVED_VALIMITS on the device is refused by GSP.
+- The subcontext must be SYNC (VEID 0): GSP-RM refuses the 3D object on
+  an ASYNC subcontext with NV_ERR_INVALID_OBJECT.  Also bind the channel
+  to GR (NVA06F_CTRL_CMD_BIND) before allocating engine objects, as
+  NVIDIA's driver does.
+- cls_m2mf came out 0 on Blackwell (0xcd40 was outside the range), which
+  NVK takes for Fermi and pushes on an M2MF subchannel it has not got.
+
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h        | 13 +++++++----
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c    | 22 +++++++++++++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c    | 23 ++++++++++++++-----
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c    |  1 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c    | 17 +++++++++++---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c   |  8 ++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c   |  4 +++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c     | 22 ++++++++++++++----
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h   |  3 +++
+ .../nvkmd/rm/rmclient-fallback/rmclient.h     | 13 +++++++++++
+ 10 files changed, 106 insertions(+), 20 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 8e35a98..496d284 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -63,6 +63,9 @@ struct nvkmd_rm_lib {
+    int (*event_close)(crm_client *c, uint32_t event_handle, int event_fd);
+    int (*event_drain)(crm_client *c, int event_fd,
+                       struct crm_event_data *out, int max);
++   int (*alloc_os_descriptor)(crm_client *c, uint32_t device,
++                              uint32_t *object, void *addr, uint64_t size,
++                              uint32_t nvos02_flags);
+ };
+ 
+ /* Returns NULL if librmclient cannot be loaded */
+@@ -114,10 +117,11 @@ VkResult nvkmd_rm_enumerate_pdevs(struct vk_object_base *log_obj,
+  */
+ 
+ /* GPU VA layout.  Everything NVK places is chosen here and handed to RM as
+- * a fixed address.  RM's own mappings (GR context buffers and the like) are
+- * confined to [INTERNAL_START, INTERNAL_END) with VA_INTERNAL_LIMIT, and the
+- * heap skips that range.  Pushbuffers must stay below 2^40 (GP_ENTRY1_GET_HI
+- * is 8 bits).
++ * a fixed address.  [INTERNAL_START, INTERNAL_END) is the range a GSP
++ * client's VA spaces reserve for GSP-RM (SPLIT_VAS_SERVER_RM_MANAGED_VA_*);
++ * the heap skips it.  RM's other internal mappings (GR context buffers)
++ * land wherever RM's allocator puts them.  Pushbuffers must stay below 2^40
++ * (GP_ENTRY1_GET_HI is 8 bits).
+  */
+ #define NVKMD_RM_HEAP_START            ((uint64_t)1 << 21)
+ #define NVKMD_RM_INTERNAL_START        ((uint64_t)1 << 32)
+@@ -128,6 +132,7 @@ VkResult nvkmd_rm_enumerate_pdevs(struct vk_object_base *log_obj,
+ 
+ /* Big page size we ask RM for (FERMI_VASPACE_A bigPageSize) */
+ #define NVKMD_RM_BIG_PAGE_SIZE         (64u << 10)
++#define NVKMD_RM_HUGE_PAGE_SIZE        (2ull << 20)
+ 
+ struct nvkmd_rm_sema_pool {
+    simple_mtx_t mutex;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index 2cb85f5..e42a09e 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -559,9 +559,13 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
++   /* SYNC: the subcontext with VEID 0, the only one that can run graphics.
++    * GSP-RM refuses the 3D object on an ASYNC (compute-only) subcontext
++    * with NV_ERR_INVALID_OBJECT.
++    */
+    NV_CTXSHARE_ALLOCATION_PARAMETERS ctxshare_params = {
+       .hVASpace = dev->h_vaspace,
+-      .flags = NVRM_DEF(_CTXSHARE, _ALLOCATION_FLAGS, _SUBCONTEXT, _ASYNC),
++      .flags = NVRM_DEF(_CTXSHARE, _ALLOCATION_FLAGS, _SUBCONTEXT, _SYNC),
+    };
+    result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
+                            lib->alloc(dev->client, ctx->h_tsg,
+@@ -589,6 +593,22 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
++   /* Bind the channel to GR before allocating engine objects, as NVIDIA's
++    * driver does.  Under GSP the engine objects are refused
++    * (NV_ERR_INVALID_OBJECT from GSP-RM) on a channel that is not bound to
++    * a runlist yet; engineType in the allocation parameters is not enough.
++    */
++   NVA06F_CTRL_BIND_PARAMS bind_params = {
++      .engineType = NV2080_ENGINE_TYPE_GRAPHICS,
++   };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->control(dev->client, ctx->h_channel,
++                                        NVA06F_CTRL_CMD_BIND,
++                                        &bind_params, sizeof(bind_params)),
++                           "NVA06F_CTRL_CMD_BIND");
++   if (result != VK_SUCCESS)
++      goto fail;
++
+    if (engines & NVKMD_ENGINE_3D) {
+       result = alloc_engine_object(ctx, log_obj, info->cls_eng3d,
+                                    "alloc 3D object");
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index fb42f97..839e138 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -134,9 +134,18 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+    if (result != VK_SUCCESS)
+       goto fail_alloc;
+ 
++   /* The device's own VA space is the one NVK uses (see below).  No
++    * RESTRICT_RESERVED_VALIMITS: GSP-RM refuses the device with
++    * NV_ERR_INVALID_ARGUMENT when it is set.  RM's internal mappings then
++    * go wherever RM's allocator puts them (outside our fixed ranges, which
++    * RM knows about; collisions the other way are retried in alloc_va),
++    * and [4 GiB, 4.5 GiB) belongs to GSP-RM.
++    */
+    NV0080_ALLOC_PARAMETERS dev_params = {
+       .deviceId = pdev->device_instance,
+       .hClientShare = lib->root(dev->client),
++      .flags = NV_DEVICE_ALLOCATION_FLAGS_VASPACE_BIG_PAGE_SIZE_64k,
++      .vaMode = NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES,
+    };
+    result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
+                            lib->alloc(dev->client, lib->root(dev->client),
+@@ -157,14 +166,16 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+    if (result != VK_SUCCESS)
+       goto fail_client;
+ 
+-   /* One GPU VA space per device.  VA_INTERNAL_LIMIT keeps RM's own
+-    * mappings (GR context buffers etc.) in [4 GiB, 4.5 GiB), which our heap
+-    * leaves alone.
++   /* A handle on the device's VA space (one per VkDevice, since each has
++    * its own client and device).  A new FERMI_VASPACE_A does not work under
++    * GSP: VA_INTERNAL_LIMIT fixes RM's internal range at exactly
++    * [4 GiB, 4.5 GiB), all of which goes to GSP-RM, so allocating the 3D
++    * object fails with NV_ERR_NO_MEMORY mapping its context buffers, and
++    * without the flag GSP refuses the 3D object (NV_ERR_INVALID_OBJECT).
++    * NVIDIA's own driver uses the device VA space too.
+     */
+    NV_VASPACE_ALLOCATION_PARAMETERS vas_params = {
+-      .index = 0,
+-      .flags = NV_VASPACE_ALLOCATION_FLAGS_VA_INTERNAL_LIMIT,
+-      .bigPageSize = NVKMD_RM_BIG_PAGE_SIZE,
++      .index = NV_VASPACE_ALLOCATION_INDEX_GPU_DEVICE,
+    };
+    result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
+                            lib->alloc(dev->client, dev->h_device,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index bcd3736..f0fd095 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -76,6 +76,7 @@ nvkmd_rm_lib_load(void)
+    LOAD(event_open,   "crm_event_open",   false);
+    LOAD(event_close,  "crm_event_close",  false);
+    LOAD(event_drain,  "crm_event_drain",  false);
++   LOAD(alloc_os_descriptor, "crm_alloc_os_descriptor", false);
+ 
+    rm_lib_ok = true;
+    return;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 1a05fc2..413219e 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -56,10 +56,21 @@ alloc_os_pages(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+       .descriptorType = NVOS32_DESCRIPTOR_TYPE_VIRTUAL_ADDRESS,
+    };
+ 
++   /* RM's Unix escape layer only takes a user address for an OS descriptor
++    * through NV_ESC_RM_ALLOC_MEMORY (it pins the pages and hands RM a page
++    * array); NV_ESC_RM_ALLOC with a VIRTUAL_ADDRESS descriptor is
++    * NV_ERR_NOT_SUPPORTED.  crm_alloc_os_descriptor takes that route.
++    */
+    uint32_t h_memory = 0;
+-   int ret = lib->alloc(dev->client, dev->h_device, &h_memory,
+-                        NV01_MEMORY_SYSTEM_OS_DESCRIPTOR,
+-                        &params, sizeof(params));
++   int ret;
++   if (lib->alloc_os_descriptor != NULL) {
++      ret = lib->alloc_os_descriptor(dev->client, dev->h_device, &h_memory,
++                                     pages, size_B, 0);
++   } else {
++      ret = lib->alloc(dev->client, dev->h_device, &h_memory,
++                       NV01_MEMORY_SYSTEM_OS_DESCRIPTOR,
++                       &params, sizeof(params));
++   }
+    if (ret != 0) {
+       munmap(pages, size_B);
+       return NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index b4622cf..e3164c0 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -143,7 +143,13 @@ fill_device_info(struct nvkmd_rm_pdev *pdev,
+    info->cls_compute = pick_class(classes, 0xc0, 0xa0c0, 0xcec0);
+    info->cls_copy    = pick_class(classes, 0xb5, 0xa0b5, 0xcab5);
+    info->cls_gpfifo  = pick_class(classes, 0x6f, 0xc36f, 0xca6f);
+-   info->cls_m2mf    = pick_class(classes, 0x40, 0xa040, 0xa140);
++   /* Inline-to-memory: 0xa040, 0xa140 up to Blackwell's 0xcd40.  NVK only
++    * looks at it to tell Fermi (<= 0x9039, needs a SET_OBJECT on its own
++    * subchannel) from everything newer, so a 0 here must not happen.
++    */
++   info->cls_m2mf    = pick_class(classes, 0x40, 0xa040, 0xffff);
++   if (info->cls_m2mf == 0)
++      info->cls_m2mf = 0xa140; /* KEPLER_INLINE_TO_MEMORY_B */
+    info->cls_eng2d   = has_class(classes, 0x902d) ? 0x902d : 0;
+ 
+    static const uint32_t usermode_classes[] = {
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+index e995548..c33ee30 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+@@ -238,9 +238,11 @@ nvkmd_rm_sync_get_type(void)
+ {
+    return (struct vk_sync_type) {
+       .size = sizeof(struct nvkmd_rm_sync),
++      /* GPU_MULTI_WAIT and CPU_RESET are binary-only features in
++       * vk_sync; vk_sync_binary on top of this type covers binaries.
++       */
+       .features = VK_SYNC_FEATURE_TIMELINE |
+                   VK_SYNC_FEATURE_GPU_WAIT |
+-                  VK_SYNC_FEATURE_GPU_MULTI_WAIT |
+                   VK_SYNC_FEATURE_CPU_WAIT |
+                   VK_SYNC_FEATURE_CPU_SIGNAL |
+                   VK_SYNC_FEATURE_WAIT_ANY |
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+index c368c7b..00232e1 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+@@ -109,6 +109,9 @@ alloc_virtual(struct nvkmd_rm_dev *dev, enum nvkmd_va_flags flags,
+ 
+    if (params.offset != addr) {
+       /* RM placed it somewhere else; we can't use that */
++      mesa_logw("NVK: RM placed NV50_MEMORY_VIRTUAL [0x%" PRIx64 ", +0x%"
++                PRIx64 ") at 0x%" PRIx64 " instead",
++                addr, size_B, (uint64_t)params.offset);
+       dev->lib->free(dev->client, dev->h_device, h_virtual);
+       return NV_ERR_NOT_SUPPORTED;
+    }
+@@ -131,13 +134,24 @@ nvkmd_rm_alloc_va(struct nvkmd_dev *_dev,
+    if (va == NULL)
+       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+-   /* GART-only ranges can use 4 KiB alignment; everything else may get
+-    * VRAM with 64 KiB pages bound into it.
++   /* RM places an NV50_MEMORY_VIRTUAL with the default page size on a big
++    * page boundary even with FIXED_ADDRESS_ALLOCATE (a 4 KiB aligned GART
++    * range at 0x...dd000 comes back at 0x...d0000), so every range, GART
++    * included, is aligned to the big page size.
+     */
+-   const uint32_t min_align_B = (flags & NVKMD_VA_GART) ? 4096 :
+-                                _dev->pdev->bind_align_B;
++   const uint32_t min_align_B = MAX2(_dev->pdev->bind_align_B,
++                                     NVKMD_RM_BIG_PAGE_SIZE);
+    assert(util_is_power_of_two_or_zero64(align_B));
+    align_B = MAX2(align_B, min_align_B);
++
++   /* RM picks the huge (2 MiB) page size for a default-page-size virtual
++    * allocation of 2 MiB or more (_memmgrPickDefaultGpuPageSize) and then
++    * aligns both its offset and its size to 2 MiB
++    * (gvaspaceApplyDefaultAlignment).  Do the same, or RM moves the range
++    * off the address we picked.
++    */
++   if (size_B >= NVKMD_RM_HUGE_PAGE_SIZE)
++      align_B = MAX2(align_B, NVKMD_RM_HUGE_PAGE_SIZE);
+    size_B = align64(size_B, align_B);
+ 
+    assert((fixed_addr == 0) == !(flags & NVKMD_VA_ALLOC_FIXED));
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+index e284dc0..0cb7175 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -192,6 +192,9 @@ typedef NvU32 NvHandle;
+ #define NV_CHANNELGPFIFO_NOTIFICATION_TYPE__SIZE_1            3
+ 
+ #define NV_VASPACE_ALLOCATION_FLAGS_NONE                      (0x00000000)
++#define NV_VASPACE_ALLOCATION_INDEX_GPU_DEVICE                (0x00000003)
++#define NV_DEVICE_ALLOCATION_FLAGS_VASPACE_BIG_PAGE_SIZE_64k   (0x00000200)
++#define NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES (0x00000000)
+ #define NV_VASPACE_ALLOCATION_FLAGS_VA_INTERNAL_LIMIT         (1u << 7)
+ #define NV_VASPACE_ALLOCATION_FLAGS_REQUIRE_FIXED_OFFSET      (1u << 12)
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/rm/rmclient-fallback/rmclient.h b/src/nouveau/vulkan/nvkmd/rm/rmclient-fallback/rmclient.h
+index ba8bd60..92ed427 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/rmclient-fallback/rmclient.h
++++ b/src/nouveau/vulkan/nvkmd/rm/rmclient-fallback/rmclient.h
+@@ -122,6 +122,19 @@ struct crm_event_data {
+  * returns 0. Never blocks. */
+ int crm_event_drain(crm_client *c, int event_fd, struct crm_event_data *out, int max);
+ 
++/* NV01_MEMORY_SYSTEM_OS_DESCRIPTOR over `size` bytes of the caller's own
++ * page-aligned memory at `addr` (e.g. an anonymous mmap), parent `device`
++ * (NV01_DEVICE_0). RM pins the pages for the object's lifetime; the CPU keeps
++ * using `addr`. This is NV_ESC_RM_ALLOC_MEMORY (NVOS02) on the device's GPU
++ * channel, the route RM's Unix escape layer serves for user addresses:
++ * NV_ESC_RM_ALLOC of the same class with a VIRTUAL_ADDRESS descriptor is
++ * refused with NV_ERR_NOT_SUPPORTED. `nvos02_flags` = 0 picks
++ * PCI | CACHED | NONCONTIGUOUS | MAPPING_NO_MAP (RM requires PCI and NO_MAP);
++ * otherwise NVOS02_FLAGS_* as RM defines them. *object = 0 lets the library
++ * pick the handle. */
++int crm_alloc_os_descriptor(crm_client *c, uint32_t device, uint32_t *object,
++                            void *addr, uint64_t size, uint32_t nvos02_flags);
++
+ /* Raw escape on the control channel (fd = -1) or a transport fd, for escapes
+  * this API does not wrap. Returns 0 or -errno; RM status stays in *arg. */
+ int crm_escape(crm_client *c, int fd, uint32_t nr, void *arg, uint32_t size);
+-- 
+2.43.0
+

@@ -1,0 +1,1214 @@
+From a0af9dd1e5e5d8f7dd642cf8513ec2edcd23e749 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 5 Oct 2026 21:18:05 +0200
+Subject: [PATCH 02/13] nvk/rm: build glue, RM API subset and librmclient
+ loader
+
+Add -Dnvk-rm (feature, default disabled) for an nvkmd backend that drives
+the GPU through the NVIDIA Resource Manager of the open kernel modules
+(open-gpu-kernel-modules), using librmclient (Conduit, guest/rmclient,
+MIT) for the /dev/nvidiactl escape interface, or a forwarded equivalent
+in a VM.
+
+librmclient is dlopen()ed at runtime (librmclient.so.0, librmclient.so,
+or $NVK_RMCLIENT_LIB), so building only needs its header.  If pkg-config
+does not find "rmclient", a verbatim copy of librmclient's rmclient.h is
+used.  Entry points beyond the base contract (crm_map_dma2,
+crm_free_quiet, crm_event_open/close/drain) are looked up and used when
+present.
+
+nvrm/nvrm_api.h carries the minimal subset of NVIDIA's RM API this backend
+uses (classes, alloc parameters, controls, host methods), copied from
+open-gpu-kernel-modules 610.57.04 (MIT), with static asserts on the
+parameter sizes RM expects.
+
+---
+ meson.options                                 |   9 +
+ src/nouveau/vulkan/meson.build                |  20 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h        | 295 ++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c    | 119 ++++
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h   | 547 ++++++++++++++++++
+ .../nvkmd/rm/rmclient-fallback/rmclient.h     | 138 +++++
+ 6 files changed, 1128 insertions(+)
+ create mode 100644 src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+ create mode 100644 src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+ create mode 100644 src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+ create mode 100644 src/nouveau/vulkan/nvkmd/rm/rmclient-fallback/rmclient.h
+
+diff --git a/meson.options b/meson.options
+index f9c2250..5605614 100644
+--- a/meson.options
++++ b/meson.options
+@@ -774,6 +774,15 @@ option(
+   description : 'Override build id for shader cache keys (hex string). '
+ )
+ 
++option(
++  'nvk-rm',
++  type : 'feature',
++  value : 'disabled',
++  description : 'Build the experimental NVK backend that drives the GPU ' +
++                'through the NVIDIA Resource Manager (open-gpu-kernel-modules) ' +
++                'via librmclient, which is loaded at runtime.'
++)
++
+ option(
+   'nvk-build-id',
+   type : 'string',
+diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
+index 029ecbd..0920a68 100644
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -276,6 +276,26 @@ if with_platform_android
+   nvk_files += files('nvk_android.c')
+ endif
+ 
++# The RM backend talks to NVIDIA's Resource Manager through librmclient.  It
++# is dlopen()ed at runtime, so only its header is needed to build.
++if not get_option('nvk-rm').disabled()
++  dep_rmclient = dependency('rmclient', required : false)
++  if dep_rmclient.found()
++    nvk_deps += dep_rmclient.partial_dependency(compile_args : true,
++                                                includes : true)
++  else
++    nvk_include_directories += include_directories('nvkmd/rm/rmclient-fallback')
++  endif
++  nvk_include_directories += include_directories('nvkmd/rm')
++  nvk_deps += dep_dl
++  nvk_flags += '-DNVK_WITH_RM=1'
++  nvk_files += files(
++    'nvkmd/rm/nvkmd_rm.h',
++    'nvkmd/rm/nvkmd_rm_lib.c',
++    'nvkmd/rm/nvrm/nvrm_api.h',
++  )
++endif
++
+ libnvk = static_library(
+   'nvk',
+   [
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+new file mode 100644
+index 0000000..1775869
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -0,0 +1,295 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * nvkmd backend on top of the NVIDIA Resource Manager (RM), reached through
++ * librmclient (Conduit's guest/rmclient: NVIDIA's open kernel modules'
++ * /dev/nvidiactl escape interface, possibly forwarded over virtio).
++ */
++#ifndef NVKMD_RM_H
++#define NVKMD_RM_H 1
++
++#include "nvkmd/nvkmd.h"
++#include "util/u_dynarray.h"
++#include "util/vma.h"
++#include "vk_sync.h"
++#include "vk_sync_binary.h"
++
++#include "rmclient.h"
++#include "nvrm/nvrm_api.h"
++
++/*
++ * librmclient, loaded at runtime
++ */
++
++struct nvkmd_rm_lib {
++   void *handle;
++
++   int (*open)(crm_client **out, const struct crm_transport *transport);
++   void (*close)(crm_client *c);
++   uint32_t (*root)(const crm_client *c);
++   int (*alloc)(crm_client *c, uint32_t parent, uint32_t *object,
++                uint32_t hclass, void *params, uint32_t params_size);
++   int (*control)(crm_client *c, uint32_t object, uint32_t cmd,
++                  void *params, uint32_t params_size);
++   int (*free)(crm_client *c, uint32_t parent, uint32_t object);
++   int (*map_memory)(crm_client *c, uint32_t device, uint32_t memory,
++                     uint64_t offset, uint64_t length, uint32_t flags,
++                     void **cpu_ptr);
++   int (*unmap_memory)(crm_client *c, uint32_t device, uint32_t memory,
++                       void *cpu_ptr, uint64_t length, uint32_t flags);
++   int (*map_dma)(crm_client *c, uint32_t device, uint32_t dma,
++                  uint32_t memory, uint64_t offset, uint64_t length,
++                  uint32_t flags, uint64_t *gpu_va);
++   int (*unmap_dma)(crm_client *c, uint32_t device, uint32_t dma,
++                    uint32_t memory, uint32_t flags, uint64_t gpu_va);
++   int (*gpu_count)(crm_client *c);
++   int (*gpu_info)(crm_client *c, int index, uint32_t *gpu_id,
++                   uint32_t *minor, uint32_t *pci_device_id);
++   const char *(*status_name)(int status);
++
++   /* Entry points beyond the base contract (librmclient "additions").
++    * NULL if the library does not export them; the backend then falls back
++    * to something slower or less complete.
++    */
++   int (*map_dma2)(crm_client *c, uint32_t device, uint32_t dma,
++                   uint32_t memory, uint64_t offset, uint64_t length,
++                   uint32_t flags, uint32_t flags2, uint32_t kind_override,
++                   uint64_t *gpu_va);
++   int (*free_quiet)(crm_client *c, uint32_t parent, uint32_t object);
++   int (*event_open)(crm_client *c, uint32_t parent, uint32_t notify_index,
++                     uint32_t *event_handle, int *event_fd);
++   int (*event_close)(crm_client *c, uint32_t event_handle, int event_fd);
++   int (*event_drain)(crm_client *c, int event_fd,
++                      struct crm_event_data *out, int max);
++};
++
++/* Returns NULL if librmclient cannot be loaded */
++const struct nvkmd_rm_lib *nvkmd_rm_lib_get(void);
++
++/* Turns a librmclient return value into a VkResult, logging failures */
++VkResult nvkmd_rm_result(const struct nvkmd_rm_lib *lib,
++                         struct vk_object_base *log_obj,
++                         VkResult default_error, int ret,
++                         const char *what);
++
++#define NVKMD_RM_CHECK(lib, log_obj, err, call, what) \
++   nvkmd_rm_result((lib), (log_obj), (err), (call), (what))
++
++/*
++ * Physical device
++ */
++
++struct nvkmd_rm_pdev {
++   struct nvkmd_pdev base;
++
++   const struct nvkmd_rm_lib *lib;
++
++   /* Client used for queries (VRAM usage) */
++   crm_client *client;
++   uint32_t h_device;
++   uint32_t h_subdevice;
++
++   uint32_t gpu_id;
++   uint32_t device_instance;
++   uint32_t subdevice_instance;
++
++   uint32_t cls_usermode;
++
++   struct vk_sync_type sync_type;
++   struct vk_sync_binary_type binary_sync_type;
++   const struct vk_sync_type *sync_types[3];
++};
++
++NVKMD_DECL_SUBCLASS(pdev, rm);
++
++VkResult nvkmd_rm_enumerate_pdevs(struct vk_object_base *log_obj,
++                                  enum nvk_debug debug_flags,
++                                  uint32_t *pdev_count,
++                                  struct nvkmd_pdev **pdevs_out);
++
++/*
++ * Logical device
++ */
++
++/* GPU VA layout.  Everything NVK places is chosen here and handed to RM as
++ * a fixed address.  RM's own mappings (GR context buffers and the like) are
++ * confined to [INTERNAL_START, INTERNAL_END) with VA_INTERNAL_LIMIT, and the
++ * heap skips that range.  Pushbuffers must stay below 2^40 (GP_ENTRY1_GET_HI
++ * is 8 bits).
++ */
++#define NVKMD_RM_HEAP_START            ((uint64_t)1 << 21)
++#define NVKMD_RM_INTERNAL_START        ((uint64_t)1 << 32)
++#define NVKMD_RM_INTERNAL_END          (NVKMD_RM_INTERNAL_START + (512ull << 20))
++#define NVKMD_RM_HEAP_END              ((uint64_t)1 << 38)
++#define NVKMD_RM_REPLAY_HEAP_START     NVKMD_RM_HEAP_END
++#define NVKMD_RM_REPLAY_HEAP_END       ((uint64_t)1 << 39)
++
++/* Big page size we ask RM for (FERMI_VASPACE_A bigPageSize) */
++#define NVKMD_RM_BIG_PAGE_SIZE         (64u << 10)
++
++struct nvkmd_rm_sema_pool {
++   simple_mtx_t mutex;
++   struct util_dynarray chunks;     /* struct nvkmd_mem * */
++   struct util_dynarray free_slots; /* uint32_t */
++};
++
++struct nvkmd_rm_dev {
++   struct nvkmd_dev base;
++
++   const struct nvkmd_rm_lib *lib;
++   crm_client *client;
++
++   uint32_t h_device;
++   uint32_t h_subdevice;
++   uint32_t h_vaspace;
++   uint32_t h_usermode;
++   void *usermode_map;
++
++   /* Non-stall interrupt event, for CPU waits.  fd < 0 if unavailable. */
++   uint32_t h_nonstall_event;
++   int nonstall_fd;
++
++   simple_mtx_t heap_mutex;
++   struct util_vma_heap heap;
++   struct util_vma_heap replay_heap;
++
++   struct nvkmd_rm_sema_pool sema_pool;
++};
++
++NVKMD_DECL_SUBCLASS(dev, rm);
++
++VkResult nvkmd_rm_create_dev(struct nvkmd_pdev *pdev,
++                             struct vk_object_base *log_obj,
++                             struct nvkmd_dev **dev_out);
++
++/*
++ * Memory
++ */
++
++struct nvkmd_rm_mem {
++   struct nvkmd_mem base;
++
++   uint32_t h_memory;
++
++   /* Placement actually used */
++   bool vram;
++
++   /* For memory backed by our own pages (NV01_MEMORY_SYSTEM_OS_DESCRIPTOR),
++    * the CPU mapping is the allocation itself.
++    */
++   void *os_pages;
++};
++
++NVKMD_DECL_SUBCLASS(mem, rm);
++
++VkResult nvkmd_rm_alloc_mem(struct nvkmd_dev *dev,
++                            struct vk_object_base *log_obj,
++                            uint64_t size_B, uint64_t align_B,
++                            enum nvkmd_mem_flags flags,
++                            struct nvkmd_mem **mem_out);
++
++VkResult nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *dev,
++                                  struct vk_object_base *log_obj,
++                                  uint64_t size_B, uint64_t align_B,
++                                  uint8_t pte_kind, uint16_t tile_mode,
++                                  enum nvkmd_mem_flags flags,
++                                  struct nvkmd_mem **mem_out);
++
++VkResult nvkmd_rm_import_dma_buf(struct nvkmd_dev *dev,
++                                 struct vk_object_base *log_obj,
++                                 int fd, struct nvkmd_mem **mem_out);
++
++/*
++ * GPU virtual address ranges
++ */
++
++/* One RM DMA mapping inside an nvkmd_rm_va */
++struct nvkmd_rm_mapping {
++   uint64_t va_offset_B;
++   uint64_t range_B;
++   uint32_t h_memory;
++   uint64_t mem_offset_B;
++};
++
++struct nvkmd_rm_va {
++   struct nvkmd_va base;
++
++   /* NV50_MEMORY_VIRTUAL reserving [addr, addr + size_B) in RM */
++   uint32_t h_virtual;
++
++   simple_mtx_t mutex;
++   struct util_dynarray mappings; /* struct nvkmd_rm_mapping */
++};
++
++NVKMD_DECL_SUBCLASS(va, rm);
++
++VkResult nvkmd_rm_alloc_va(struct nvkmd_dev *dev,
++                           struct vk_object_base *log_obj,
++                           enum nvkmd_va_flags flags, uint8_t pte_kind,
++                           uint64_t size_B, uint64_t align_B,
++                           uint64_t fixed_addr, struct nvkmd_va **va_out);
++
++/*
++ * Contexts
++ */
++
++VkResult nvkmd_rm_create_ctx(struct nvkmd_dev *dev,
++                             struct vk_object_base *log_obj,
++                             enum nvkmd_engines engines,
++                             struct nvkmd_ctx **ctx_out);
++
++/*
++ * Syncs: 64-bit timeline values in GPU-visible system memory
++ */
++
++struct nvkmd_rm_sync {
++   struct vk_sync base;
++
++   struct nvkmd_rm_dev *dev;   /* NULL for CPU-only syncs */
++   uint32_t slot;
++
++   volatile uint64_t *value;   /* CPU pointer to the semaphore */
++   uint64_t gpu_va;            /* 0 for CPU-only syncs */
++
++   /* Highest value a signal operation has been submitted for */
++   uint64_t pending;
++
++   uint64_t cpu_only_value;
++};
++
++struct vk_sync_type nvkmd_rm_sync_get_type(void);
++
++static inline bool
++nvkmd_rm_sync_type_is(const struct vk_sync_type *type)
++{
++   extern VkResult nvkmd_rm_sync_init(struct vk_device *device,
++                                      struct vk_sync *sync,
++                                      uint64_t initial_value);
++   return type->init == nvkmd_rm_sync_init;
++}
++
++static inline struct nvkmd_rm_sync *
++nvkmd_rm_sync(struct vk_sync *sync)
++{
++   assert(nvkmd_rm_sync_type_is(sync->type));
++   return container_of(sync, struct nvkmd_rm_sync, base);
++}
++
++/* Records that a signal of at least value has been submitted */
++void nvkmd_rm_sync_mark_pending(struct nvkmd_rm_sync *sync, uint64_t value);
++
++/* Waits on the CPU until *value >= wait_value or the timeout expires */
++VkResult nvkmd_rm_wait_value(struct nvkmd_rm_dev *dev,
++                             volatile uint64_t *value, uint64_t wait_value,
++                             uint64_t abs_timeout_ns);
++
++VkResult nvkmd_rm_sema_pool_alloc(struct nvkmd_rm_dev *dev,
++                                  struct vk_object_base *log_obj,
++                                  uint32_t *slot_out,
++                                  volatile uint64_t **cpu_out,
++                                  uint64_t *gpu_va_out);
++void nvkmd_rm_sema_pool_free(struct nvkmd_rm_dev *dev, uint32_t slot);
++void nvkmd_rm_sema_pool_finish(struct nvkmd_rm_dev *dev);
++
++#endif /* NVKMD_RM_H */
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+new file mode 100644
+index 0000000..bcd3736
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -0,0 +1,119 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_rm.h"
++
++#include "util/log.h"
++#include "util/os_misc.h"
++#include "util/u_call_once.h"
++#include "vk_log.h"
++
++#include <dlfcn.h>
++#include <errno.h>
++#include <stdio.h>
++#include <string.h>
++
++/* NVK does not link against librmclient.  It is loaded the first time an RM
++ * device is enumerated so that a Mesa built with -Dnvk-rm=enabled still
++ * works (with nouveau only) on systems without it.
++ */
++static struct nvkmd_rm_lib rm_lib;
++static bool rm_lib_ok;
++static util_once_flag rm_lib_once = UTIL_ONCE_FLAG_INIT;
++
++#define LOAD(field, name, required)                                  \
++   do {                                                              \
++      *(void **)&rm_lib.field = dlsym(rm_lib.handle, name);          \
++      if ((required) && rm_lib.field == NULL) {                      \
++         mesa_logw("NVK: %s does not export %s", path, name);        \
++         goto fail;                                                  \
++      }                                                              \
++   } while (0)
++
++static void
++nvkmd_rm_lib_load(void)
++{
++   static const char *const default_paths[] = {
++      "librmclient.so.0",
++      "librmclient.so",
++   };
++   const char *path = os_get_option("NVK_RMCLIENT_LIB");
++
++   if (path != NULL) {
++      rm_lib.handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
++   } else {
++      for (unsigned i = 0; i < ARRAY_SIZE(default_paths); i++) {
++         path = default_paths[i];
++         rm_lib.handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
++         if (rm_lib.handle != NULL)
++            break;
++      }
++   }
++
++   if (rm_lib.handle == NULL) {
++      mesa_logd("NVK: failed to load librmclient: %s", dlerror());
++      return;
++   }
++
++   LOAD(open,         "crm_open",         true);
++   LOAD(close,        "crm_close",        true);
++   LOAD(root,         "crm_root",         true);
++   LOAD(alloc,        "crm_alloc",        true);
++   LOAD(control,      "crm_control",      true);
++   LOAD(free,         "crm_free",         true);
++   LOAD(map_memory,   "crm_map_memory",   true);
++   LOAD(unmap_memory, "crm_unmap_memory", true);
++   LOAD(map_dma,      "crm_map_dma",      true);
++   LOAD(unmap_dma,    "crm_unmap_dma",    true);
++   LOAD(gpu_count,    "crm_gpu_count",    true);
++   LOAD(gpu_info,     "crm_gpu_info",     true);
++   LOAD(status_name,  "crm_status_name",  true);
++
++   LOAD(map_dma2,     "crm_map_dma2",     false);
++   LOAD(free_quiet,   "crm_free_quiet",   false);
++   LOAD(event_open,   "crm_event_open",   false);
++   LOAD(event_close,  "crm_event_close",  false);
++   LOAD(event_drain,  "crm_event_drain",  false);
++
++   rm_lib_ok = true;
++   return;
++
++fail:
++   dlclose(rm_lib.handle);
++   memset(&rm_lib, 0, sizeof(rm_lib));
++}
++
++const struct nvkmd_rm_lib *
++nvkmd_rm_lib_get(void)
++{
++   util_call_once(&rm_lib_once, nvkmd_rm_lib_load);
++   return rm_lib_ok ? &rm_lib : NULL;
++}
++
++VkResult
++nvkmd_rm_result(const struct nvkmd_rm_lib *lib,
++                struct vk_object_base *log_obj,
++                VkResult default_error, int ret,
++                const char *what)
++{
++   if (ret == 0)
++      return VK_SUCCESS;
++
++   VkResult result = default_error;
++   if (ret == NV_ERR_NO_MEMORY || ret == NV_ERR_INSUFFICIENT_RESOURCES)
++      result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   else if (ret == -ENOMEM)
++      result = VK_ERROR_OUT_OF_HOST_MEMORY;
++   else if (ret == -ENODEV || ret == -EIO)
++      result = VK_ERROR_DEVICE_LOST;
++
++   if (ret < 0) {
++      return vk_errorf(log_obj, result, "RM %s failed: %s", what,
++                       strerror(-ret));
++   } else {
++      return vk_errorf(log_obj, result, "RM %s failed: 0x%x (%s)", what,
++                       ret, lib->status_name ? lib->status_name(ret) : "?");
++   }
++}
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+new file mode 100644
+index 0000000..0ef6db5
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -0,0 +1,547 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: MIT
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ */
++
++/*
++ * Minimal subset of the NVIDIA Resource Manager (RM) API used by the NVK
++ * nvkmd "rm" backend.
++ *
++ * Every definition below is copied verbatim (names, values, field order)
++ * from NVIDIA's open-gpu-kernel-modules, tag 610.57.04
++ * (https://github.com/NVIDIA/open-gpu-kernel-modules), files under
++ * src/common/sdk/nvidia/inc/: nvos.h, alloc/alloc_channel.h, class/cl*.h,
++ * ctrl/ctrl0000/ctrl0000gpu.h, ctrl/ctrl0080/ctrl0080gpu.h,
++ * ctrl/ctrl0080/ctrl0080gr.h, ctrl/ctrl2080/ctrl2080{mc,fb,bus,gr,gpu,tmr,
++ * event}.h, ctrl/ctrla06c.h, ctrl/ctrla06f/ctrla06fgpfifo.h,
++ * ctrl/ctrlc36f.h and class/cl2080_notification.h.  Only the integer types
++ * were mapped onto Mesa's nvtypes.h.  Struct sizes are checked against the
++ * sizes RM expects with STATIC_ASSERTs at the end of this file.
++ *
++ * The RM ABI changes between driver releases; this subset matches 610.57.04
++ * (and, for these particular structs, every release since 535).
++ */
++#ifndef NVRM_API_H
++#define NVRM_API_H
++
++#include "nvtypes.h"
++#include "drf.h"
++
++#include <assert.h>
++
++typedef NvU32 NvHandle;
++
++#define NVRM_ALIGN8 __attribute__((aligned(8)))
++
++/* DRF helpers in the style of NVIDIA's nvmisc.h, on top of Mesa's drf.h */
++#define NVRM_DEF(d, r, f, c) \
++   (((NvU32)NV##d##r##f##c) << DRF_LO(NV##d##r##f))
++#define NVRM_NUM(d, r, f, n) \
++   ((((NvU32)(n)) & DRF_MASK(NV##d##r##f)) << DRF_LO(NV##d##r##f))
++
++/* nvstatuscodes.h */
++#define NV_OK                                     0x00000000
++#define NV_ERR_INSUFFICIENT_RESOURCES             0x0000001A
++#define NV_ERR_NO_MEMORY                          0x00000051
++#define NV_ERR_NOT_SUPPORTED                      0x00000056
++
++/*
++ * Classes (class/cl*.h)
++ */
++#define NV01_ROOT_CLIENT                          (0x00000041)
++#define NV01_DEVICE_0                             (0x00000080)
++#define NV20_SUBDEVICE_0                          (0x00002080)
++#define NV01_MEMORY_SYSTEM                        (0x0000003E)
++#define NV01_MEMORY_LOCAL_USER                    (0x00000040)
++#define NV01_MEMORY_SYSTEM_OS_DESCRIPTOR          (0x00000071)
++#define NV01_EVENT_OS_EVENT                       (0x00000079)
++#define NV50_MEMORY_VIRTUAL                       (0x000050a0)
++#define FERMI_CONTEXT_SHARE_A                     (0x00009067)
++#define FERMI_VASPACE_A                           (0x000090f1)
++#define KEPLER_CHANNEL_GROUP_A                    (0x0000A06C)
++
++#define NVRM_VOLTA_USERMODE_A                     (0xc361)
++#define NVRM_TURING_USERMODE_A                    (0xc461)
++#define NVRM_AMPERE_USERMODE_A                    (0xc561)
++#define NVRM_HOPPER_USERMODE_A                    (0xc661)
++#define NVRM_BLACKWELL_USERMODE_A                 (0xc761)
++
++/* clc361.h */
++#define NVC361_NV_USERMODE__SIZE                  65536
++#define NVC361_TIME_0                             0x00000080
++#define NVC361_TIME_1                             0x00000084
++#define NVC361_NOTIFY_CHANNEL_PENDING             0x00000090
++
++/* cl2080_notification.h */
++#define NV2080_ENGINE_TYPE_GRAPHICS               (0x00000001)
++#define NV2080_ENGINE_TYPE_COPY0                  (0x00000009)
++#define NV2080_NOTIFIERS_FIFO_EVENT_MTHD          (35)
++#define NV2080_NOTIFIERS_RC_ERROR                 (37)
++
++/*
++ * nvos.h
++ */
++#define NV01_EVENT_NONSTALL_INTR                  (0x08000000)
++
++#define NVOS32_TYPE_IMAGE                         0
++#define NVOS32_TYPE_DMA                           6
++
++#define NVOS32_DESCRIPTOR_TYPE_VIRTUAL_ADDRESS    0
++
++#define NVOS32_ATTR_COMPR                         13:12
++#define NVOS32_ATTR_COMPR_NONE                    0x00000000
++#define NVOS32_ATTR_PAGE_SIZE                     24:23
++#define NVOS32_ATTR_PAGE_SIZE_DEFAULT             0x00000000
++#define NVOS32_ATTR_PAGE_SIZE_4KB                 0x00000001
++#define NVOS32_ATTR_PAGE_SIZE_BIG                 0x00000002
++#define NVOS32_ATTR_PAGE_SIZE_HUGE                0x00000003
++#define NVOS32_ATTR_LOCATION                      26:25
++#define NVOS32_ATTR_LOCATION_VIDMEM               0x00000000
++#define NVOS32_ATTR_LOCATION_PCI                  0x00000001
++#define NVOS32_ATTR_PHYSICALITY                   28:27
++#define NVOS32_ATTR_PHYSICALITY_DEFAULT           0x00000000
++#define NVOS32_ATTR_PHYSICALITY_NONCONTIGUOUS     0x00000001
++#define NVOS32_ATTR_PHYSICALITY_CONTIGUOUS        0x00000002
++#define NVOS32_ATTR_PHYSICALITY_ALLOW_NONCONTIGUOUS 0x00000003
++#define NVOS32_ATTR_COHERENCY                     31:29
++#define NVOS32_ATTR_COHERENCY_UNCACHED            0x00000000
++#define NVOS32_ATTR_COHERENCY_CACHED              0x00000001
++#define NVOS32_ATTR_COHERENCY_WRITE_COMBINE       0x00000002
++
++#define NVOS32_ATTR2_ZBC                          1:0
++#define NVOS32_ATTR2_ZBC_PREFER_NO_ZBC            0x00000001
++#define NVOS32_ATTR2_GPU_CACHEABLE                3:2
++#define NVOS32_ATTR2_GPU_CACHEABLE_DEFAULT        0x00000000
++#define NVOS32_ATTR2_GPU_CACHEABLE_YES            0x00000001
++#define NVOS32_ATTR2_GPU_CACHEABLE_NO             0x00000002
++#define NVOS32_ATTR2_PAGE_SIZE_HUGE               21:20
++#define NVOS32_ATTR2_PAGE_SIZE_HUGE_DEFAULT       0x00000000
++#define NVOS32_ATTR2_PAGE_SIZE_HUGE_2MB           0x00000001
++
++#define NVOS32_ALLOC_FLAGS_IGNORE_BANK_PLACEMENT  0x00000001
++#define NVOS32_ALLOC_FLAGS_FIXED_ADDRESS_ALLOCATE 0x00000010
++#define NVOS32_ALLOC_FLAGS_ALIGNMENT_HINT         0x00000080
++#define NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE        0x00000100
++#define NVOS32_ALLOC_FLAGS_MEMORY_HANDLE_PROVIDED 0x00004000
++#define NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED       0x00008000
++#define NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM      0x00010000
++#define NVOS32_ALLOC_FLAGS_VIRTUAL                0x00080000
++#define NVOS32_ALLOC_FLAGS_SPARSE                 0x04000000
++
++/* NVOS33: CPU mappings (NV_ESC_RM_MAP_MEMORY) */
++#define NVOS33_FLAGS_ACCESS                       1:0
++#define NVOS33_FLAGS_ACCESS_READ_WRITE            (0x00000000)
++#define NVOS33_FLAGS_ACCESS_READ_ONLY             (0x00000001)
++#define NVOS33_FLAGS_ACCESS_WRITE_ONLY            (0x00000002)
++#define NVOS33_FLAGS_CACHING_TYPE                 25:23
++#define NVOS33_FLAGS_CACHING_TYPE_CACHED          0
++#define NVOS33_FLAGS_CACHING_TYPE_UNCACHED        1
++#define NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED   2
++#define NVOS33_FLAGS_CACHING_TYPE_DEFAULT         6
++
++/* NVOS46: GPU mappings (NV_ESC_RM_MAP_MEMORY_DMA) */
++#define NVOS46_FLAGS_ACCESS                       1:0
++#define NVOS46_FLAGS_ACCESS_READ_WRITE            (0x00000000)
++#define NVOS46_FLAGS_PAGE_KIND                    3:3
++#define NVOS46_FLAGS_PAGE_KIND_PHYSICAL           (0x00000000)
++#define NVOS46_FLAGS_PAGE_KIND_VIRTUAL            (0x00000001)
++#define NVOS46_FLAGS_CACHE_SNOOP                  4:4
++#define NVOS46_FLAGS_CACHE_SNOOP_DISABLE          (0x00000000)
++#define NVOS46_FLAGS_CACHE_SNOOP_ENABLE           (0x00000001)
++#define NVOS46_FLAGS_PAGE_SIZE                    11:8
++#define NVOS46_FLAGS_PAGE_SIZE_DEFAULT            (0x00000000)
++#define NVOS46_FLAGS_PAGE_SIZE_4KB                (0x00000001)
++#define NVOS46_FLAGS_PAGE_SIZE_BIG                (0x00000002)
++#define NVOS46_FLAGS_PAGE_SIZE_BOTH               (0x00000003)
++#define NVOS46_FLAGS_PAGE_SIZE_HUGE               (0x00000004)
++#define NVOS46_FLAGS_DMA_OFFSET_FIXED             15:15
++#define NVOS46_FLAGS_DMA_OFFSET_FIXED_FALSE       (0x00000000)
++#define NVOS46_FLAGS_DMA_OFFSET_FIXED_TRUE        (0x00000001)
++#define NVOS46_FLAGS_GPU_CACHEABLE                18:17
++#define NVOS46_FLAGS_GPU_CACHEABLE_DEFAULT        (0x00000000)
++#define NVOS46_FLAGS_PAGE_KIND_OVERRIDE           19:19
++#define NVOS46_FLAGS_PAGE_KIND_OVERRIDE_NO        (0x00000000)
++#define NVOS46_FLAGS_PAGE_KIND_OVERRIDE_YES       (0x00000001)
++
++/* alloc/alloc_channel.h */
++#define NV_MAX_SUBDEVICES                         8
++#define CC_CHAN_ALLOC_IV_SIZE_DWORD               3U
++#define CC_CHAN_ALLOC_NONCE_SIZE_DWORD            8U
++
++#define NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR              0x00000000
++#define NV_CHANNELGPFIFO_NOTIFICATION_TYPE_WORK_SUBMIT_TOKEN  0x00000001
++#define NV_CHANNELGPFIFO_NOTIFICATION_TYPE__SIZE_1            3
++
++#define NV_VASPACE_ALLOCATION_FLAGS_NONE                      (0x00000000)
++#define NV_VASPACE_ALLOCATION_FLAGS_VA_INTERNAL_LIMIT         (1u << 7)
++#define NV_VASPACE_ALLOCATION_FLAGS_REQUIRE_FIXED_OFFSET      (1u << 12)
++
++#define NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT               1:0
++#define NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_SYNC          (0x00000000)
++#define NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC         (0x00000001)
++
++/* nvgputypes.h */
++typedef volatile struct NvNotificationRec {
++   struct {
++      NvU32 nanoseconds[2];
++   } timeStamp;
++   NvV32 info32;
++   NvV16 info16;
++   NvV16 status;
++} NvNotification;
++
++/* cl0080.h */
++typedef struct NV0080_ALLOC_PARAMETERS {
++   NvU32    deviceId;
++   NvHandle hClientShare;
++   NvHandle hTargetClient;
++   NvHandle hTargetDevice;
++   NvV32    flags;
++   NvU64    vaSpaceSize NVRM_ALIGN8;
++   NvU64    vaStartInternal NVRM_ALIGN8;
++   NvU64    vaLimitInternal NVRM_ALIGN8;
++   NvV32    vaMode;
++} NV0080_ALLOC_PARAMETERS;
++
++/* cl2080.h */
++typedef struct NV2080_ALLOC_PARAMETERS {
++   NvU32 subDeviceId;
++} NV2080_ALLOC_PARAMETERS;
++
++/* nvos.h */
++typedef struct {
++   NvU32     owner;
++   NvU32     type;
++   NvU32     flags;
++   NvU32     width;
++   NvU32     height;
++   NvS32     pitch;
++   NvU32     attr;
++   NvU32     attr2;
++   NvU32     format;
++   NvU32     comprCovg;
++   NvU32     zcullCovg;
++   NvU64     rangeLo   NVRM_ALIGN8;
++   NvU64     rangeHi   NVRM_ALIGN8;
++   NvU64     size      NVRM_ALIGN8;
++   NvU64     alignment NVRM_ALIGN8;
++   NvU64     offset    NVRM_ALIGN8;
++   NvU64     limit     NVRM_ALIGN8;
++   NvU64     address   NVRM_ALIGN8; /* NvP64 */
++   NvU32     ctagOffset;
++   NvHandle  hVASpace;
++   NvU32     internalflags;
++   NvU32     tag;
++   NvS32     numaNode;
++} NV_MEMORY_ALLOCATION_PARAMS;
++
++typedef struct {
++   NvU32     type;
++   NvU32     flags;
++   NvU32     attr;
++   NvU32     attr2;
++   NvU64     descriptor NVRM_ALIGN8; /* NvP64 */
++   NvU64     limit      NVRM_ALIGN8;
++   NvU32     descriptorType;
++   NvU32     tag;
++} NV_OS_DESC_MEMORY_ALLOCATION_PARAMS;
++
++typedef struct {
++   NvU32   index;
++   NvV32   flags;
++   NvU64   vaSize NVRM_ALIGN8;
++   NvU64   vaStartInternal NVRM_ALIGN8;
++   NvU64   vaLimitInternal NVRM_ALIGN8;
++   NvU32   bigPageSize;
++   NvU64   vaBase NVRM_ALIGN8;
++   NvU32   pasid;
++} NV_VASPACE_ALLOCATION_PARAMETERS;
++
++typedef struct {
++   NvHandle hObjectError;
++   NvHandle hObjectEccError;
++   NvHandle hVASpace;
++   NvU32    engineType;
++   NvBool   bIsCallingContextVgpuPlugin;
++} NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS;
++
++typedef struct {
++   NvHandle hVASpace;
++   NvU32    flags;
++   NvU32    subctxId;
++} NV_CTXSHARE_ALLOCATION_PARAMETERS;
++
++typedef struct {
++   NvBool bBar1Mapping;
++   NvBool bPriv;
++} NV_HOPPER_USERMODE_A_PARAMS;
++
++/* alloc/alloc_channel.h */
++typedef struct NV_MEMORY_DESC_PARAMS {
++   NvU64 base NVRM_ALIGN8;
++   NvU64 size NVRM_ALIGN8;
++   NvU32 addressSpace;
++   NvU32 cacheAttrib;
++} NV_MEMORY_DESC_PARAMS;
++
++typedef struct NV_CHANNEL_ALLOC_PARAMS {
++   NvHandle hObjectError;
++   NvHandle hObjectBuffer;
++   NvU64    gpFifoOffset NVRM_ALIGN8;
++   NvU32    gpFifoEntries;
++   NvU32    flags;
++   NvHandle hContextShare;
++   NvHandle hVASpace;
++   NvHandle hHandleVASpace;
++   NvHandle hUserdMemory[NV_MAX_SUBDEVICES];
++   NvU64    userdOffset[NV_MAX_SUBDEVICES] NVRM_ALIGN8;
++   NvU32    engineType;
++   NvU32    cid;
++   NvU32    subDeviceId;
++   NvHandle hObjectEccError;
++   NV_MEMORY_DESC_PARAMS instanceMem NVRM_ALIGN8;
++   NV_MEMORY_DESC_PARAMS userdMem NVRM_ALIGN8;
++   NV_MEMORY_DESC_PARAMS ramfcMem NVRM_ALIGN8;
++   NV_MEMORY_DESC_PARAMS mthdbufMem NVRM_ALIGN8;
++   NvHandle hPhysChannelGroup;
++   NvU32    internalFlags;
++   NV_MEMORY_DESC_PARAMS errorNotifierMem NVRM_ALIGN8;
++   NV_MEMORY_DESC_PARAMS eccErrorNotifierMem NVRM_ALIGN8;
++   NvU32    ProcessID;
++   NvU32    SubProcessID;
++   NvU32    encryptIv[CC_CHAN_ALLOC_IV_SIZE_DWORD];
++   NvU32    decryptIv[CC_CHAN_ALLOC_IV_SIZE_DWORD];
++   NvU32    hmacNonce[CC_CHAN_ALLOC_NONCE_SIZE_DWORD];
++   NvU32    tpcConfigID;
++} NV_CHANNEL_ALLOC_PARAMS;
++
++/*
++ * Controls
++ */
++
++/* ctrl0000gpu.h */
++#define NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2        (0x205U)
++typedef struct NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS {
++   NvU32 gpuId;
++   NvU32 gpuFlags;
++   NvU32 deviceInstance;
++   NvU32 subDeviceInstance;
++   NvU32 sliStatus;
++   NvU32 boardId;
++   NvU32 gpuInstance;
++   NvS32 numaId;
++} NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS;
++
++#define NV0000_CTRL_CMD_GPU_GET_PCI_INFO          (0x21bU)
++typedef struct NV0000_CTRL_GPU_GET_PCI_INFO_PARAMS {
++   NvU32 gpuId;
++   NvU32 domain;
++   NvU16 bus;
++   NvU16 slot;
++} NV0000_CTRL_GPU_GET_PCI_INFO_PARAMS;
++
++/* ctrl0080gpu.h */
++#define NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2      (0x800292)
++#define NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE        200
++typedef struct NV0080_CTRL_GPU_GET_CLASSLIST_V2_PARAMS {
++   NvU32 numClasses;
++   NvU32 classList[NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE];
++} NV0080_CTRL_GPU_GET_CLASSLIST_V2_PARAMS;
++
++/* ctrl2080mc.h */
++#define NV2080_CTRL_CMD_MC_GET_ARCH_INFO          (0x20801701)
++typedef struct NV2080_CTRL_MC_GET_ARCH_INFO_PARAMS {
++   NvU32 architecture;
++   NvU32 implementation;
++   NvU32 revision;
++   NvU8  subRevision;
++} NV2080_CTRL_MC_GET_ARCH_INFO_PARAMS;
++
++#define NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_GV100 (0x00000140)
++#define NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_TU100 (0x00000160)
++#define NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_GA100 (0x00000170)
++#define NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_GH100 (0x00000180)
++#define NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_AD100 (0x00000190)
++#define NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_GB100 (0x000001A0)
++#define NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_GB200 (0x000001B0)
++
++/* ctrlxxxx.h, ctrl2080fb.h */
++typedef struct NVXXXX_CTRL_XXX_INFO {
++   NvU32 index;
++   NvU32 data;
++} NVXXXX_CTRL_XXX_INFO;
++
++typedef NVXXXX_CTRL_XXX_INFO NV2080_CTRL_FB_INFO;
++
++#define NV2080_CTRL_CMD_FB_GET_INFO_V2            (0x20801303U)
++#define NV2080_CTRL_FB_INFO_MAX_LIST_SIZE         (0x00000080U)
++#define NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE       (0x00000005U)
++#define NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE        (0x00000007U)
++#define NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE       (0x00000009U)
++#define NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE       (0x00000016U)
++typedef struct NV2080_CTRL_FB_GET_INFO_V2_PARAMS {
++   NvU32               fbInfoListSize;
++   NV2080_CTRL_FB_INFO fbInfoList[NV2080_CTRL_FB_INFO_MAX_LIST_SIZE];
++} NV2080_CTRL_FB_GET_INFO_V2_PARAMS;
++
++/* ctrl2080bus.h */
++#define NV2080_CTRL_CMD_BUS_GET_PCI_INFO          (0x20801801)
++typedef struct NV2080_CTRL_BUS_GET_PCI_INFO_PARAMS {
++   NvU32 pciDeviceId;
++   NvU32 pciSubSystemId;
++   NvU32 pciRevisionId;
++   NvU32 pciExtDeviceId;
++} NV2080_CTRL_BUS_GET_PCI_INFO_PARAMS;
++
++/* ctrl0080gr.h, ctrl2080gr.h */
++typedef NVXXXX_CTRL_XXX_INFO NV0080_CTRL_GR_INFO;
++#define NV0080_CTRL_GR_INFO_MAX_SIZE              (0x3f)
++typedef struct NV0080_CTRL_GR_ROUTE_INFO {
++   NvU32 flags;
++   NvU64 route NVRM_ALIGN8;
++} NV0080_CTRL_GR_ROUTE_INFO;
++typedef struct NV0080_CTRL_GR_GET_INFO_V2_PARAMS {
++   NvU32               grInfoListSize;
++   NV0080_CTRL_GR_INFO grInfoList[NV0080_CTRL_GR_INFO_MAX_SIZE];
++   NV0080_CTRL_GR_ROUTE_INFO grRouteInfo NVRM_ALIGN8;
++} NV0080_CTRL_GR_GET_INFO_V2_PARAMS;
++typedef NV0080_CTRL_GR_GET_INFO_V2_PARAMS NV2080_CTRL_GR_GET_INFO_V2_PARAMS;
++
++#define NV2080_CTRL_CMD_GR_GET_INFO_V2                    (0x20801228U)
++#define NV2080_CTRL_GR_INFO_INDEX_SHADER_PIPE_SUB_COUNT   (0x00000009)
++#define NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_GPCS         (0x00000014)
++
++/* ctrl2080gpu.h */
++#define NV2080_CTRL_CMD_GPU_GET_NAME_STRING       (0x20800110U)
++#define NV2080_GPU_MAX_NAME_STRING_LENGTH         (0x0000040U)
++#define NV2080_CTRL_GPU_GET_NAME_STRING_FLAGS_TYPE_ASCII (0x00000000U)
++typedef struct NV2080_CTRL_GPU_GET_NAME_STRING_PARAMS {
++   NvU32 gpuNameStringFlags;
++   struct {
++      NvU8 ascii[NV2080_GPU_MAX_NAME_STRING_LENGTH];
++   } gpuNameString;
++} NV2080_CTRL_GPU_GET_NAME_STRING_PARAMS;
++
++/* ctrl2080tmr.h */
++#define NV2080_CTRL_CMD_TIMER_GET_TIME            (0x20800403)
++typedef struct NV2080_CTRL_TIMER_GET_TIME_PARAMS {
++   NvU64 time_nsec NVRM_ALIGN8;
++} NV2080_CTRL_TIMER_GET_TIME_PARAMS;
++
++/* ctrl2080event.h */
++#define NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION    (0x20800301)
++#define NV2080_CTRL_EVENT_SET_NOTIFICATION_ACTION_REPEAT (0x00000002)
++typedef struct NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS {
++   NvU32  event;
++   NvU32  action;
++   NvBool bNotifyState;
++   NvU32  info32;
++   NvU16  info16;
++} NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS;
++
++/* ctrla06f/ctrla06fgpfifo.h, ctrla06c.h */
++typedef struct NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS {
++   NvBool bEnable;
++   NvBool bSkipSubmit;
++   NvBool bSkipEnable;
++} NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS;
++typedef NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS;
++#define NVA06F_CTRL_CMD_GPFIFO_SCHEDULE           (0xa06f0103)
++#define NVA06C_CTRL_CMD_GPFIFO_SCHEDULE           (0xa06c0101)
++
++#define NVA06F_CTRL_CMD_BIND                      (0xa06f0104)
++typedef struct NVA06F_CTRL_BIND_PARAMS {
++   NvU32 engineType;
++} NVA06F_CTRL_BIND_PARAMS;
++
++/* ctrlc36f.h */
++#define NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN (0xc36f0108)
++typedef struct NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS {
++   NvU32 workSubmitToken;
++} NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS;
++
++#define NVC36F_CTRL_CMD_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX (0xc36f010a)
++typedef struct NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS {
++   NvU32 index;
++} NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS;
++
++/*
++ * Host (GPFIFO class) methods and GPFIFO entry format, identical from
++ * VOLTA_CHANNEL_GPFIFO_A through BLACKWELL_CHANNEL_GPFIFO_B (clc36f.h ..
++ * clca6f.h).  Mesa has these headers too, but only per class.
++ */
++#define NVRM_GPFIFO_GP_ENTRY__SIZE                8
++#define NVRM_GPFIFO_GP_ENTRY0_GET                 31:2
++#define NVRM_GPFIFO_GP_ENTRY1_GET_HI              7:0
++#define NVRM_GPFIFO_GP_ENTRY1_LENGTH              30:10
++#define NVRM_GPFIFO_GP_ENTRY1_SYNC                31:31
++#define NVRM_GPFIFO_GP_ENTRY1_SYNC_WAIT           0x00000001
++
++#define NVRM_GPFIFO_NON_STALL_INTERRUPT           (0x00000020)
++#define NVRM_GPFIFO_SEM_ADDR_LO                   (0x0000005c)
++#define NVRM_GPFIFO_SEM_ADDR_HI                   (0x00000060)
++#define NVRM_GPFIFO_SEM_PAYLOAD_LO                (0x00000064)
++#define NVRM_GPFIFO_SEM_PAYLOAD_HI                (0x00000068)
++#define NVRM_GPFIFO_SEM_EXECUTE                   (0x0000006c)
++#define NVRM_GPFIFO_SEM_EXECUTE_OPERATION                 2:0
++#define NVRM_GPFIFO_SEM_EXECUTE_OPERATION_RELEASE         0x00000001
++#define NVRM_GPFIFO_SEM_EXECUTE_OPERATION_ACQ_STRICT_GEQ  0x00000002
++#define NVRM_GPFIFO_SEM_EXECUTE_ACQUIRE_SWITCH_TSG        12:12
++#define NVRM_GPFIFO_SEM_EXECUTE_ACQUIRE_SWITCH_TSG_EN     0x00000001
++#define NVRM_GPFIFO_SEM_EXECUTE_RELEASE_WFI               20:20
++#define NVRM_GPFIFO_SEM_EXECUTE_RELEASE_WFI_EN            0x00000001
++#define NVRM_GPFIFO_SEM_EXECUTE_PAYLOAD_SIZE              24:24
++#define NVRM_GPFIFO_SEM_EXECUTE_PAYLOAD_SIZE_64BIT        0x00000001
++
++/* USERD layout (Nvc36fControl .. Nvca6fControl) */
++#define NVRM_USERD_GP_GET                         0x88
++#define NVRM_USERD_GP_PUT                         0x8c
++#define NVRM_USERD_SIZE                           0x200
++
++/*
++ * Parameter sizes RM (and the Conduit host allowlist for 610.57.04) expects.
++ */
++static_assert(sizeof(NV0080_ALLOC_PARAMETERS) == 56, "NV0080_ALLOC_PARAMETERS");
++static_assert(sizeof(NV2080_ALLOC_PARAMETERS) == 4, "NV2080_ALLOC_PARAMETERS");
++static_assert(sizeof(NV_MEMORY_ALLOCATION_PARAMS) == 128, "NV_MEMORY_ALLOCATION_PARAMS");
++static_assert(sizeof(NV_OS_DESC_MEMORY_ALLOCATION_PARAMS) == 40, "NV_OS_DESC_MEMORY_ALLOCATION_PARAMS");
++static_assert(sizeof(NV_VASPACE_ALLOCATION_PARAMETERS) == 56, "NV_VASPACE_ALLOCATION_PARAMETERS");
++static_assert(sizeof(NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS) == 20, "NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS");
++static_assert(sizeof(NV_CTXSHARE_ALLOCATION_PARAMETERS) == 12, "NV_CTXSHARE_ALLOCATION_PARAMETERS");
++static_assert(sizeof(NV_HOPPER_USERMODE_A_PARAMS) == 2, "NV_HOPPER_USERMODE_A_PARAMS");
++static_assert(sizeof(NV_CHANNEL_ALLOC_PARAMS) == 376, "NV_CHANNEL_ALLOC_PARAMS");
++static_assert(sizeof(NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS) == 32, "GET_ID_INFO_V2");
++static_assert(sizeof(NV0000_CTRL_GPU_GET_PCI_INFO_PARAMS) == 12, "GET_PCI_INFO");
++static_assert(sizeof(NV0080_CTRL_GPU_GET_CLASSLIST_V2_PARAMS) == 804, "GET_CLASSLIST_V2");
++static_assert(sizeof(NV2080_CTRL_MC_GET_ARCH_INFO_PARAMS) == 16, "MC_GET_ARCH_INFO");
++static_assert(sizeof(NV2080_CTRL_FB_GET_INFO_V2_PARAMS) == 1028, "FB_GET_INFO_V2");
++static_assert(sizeof(NV2080_CTRL_BUS_GET_PCI_INFO_PARAMS) == 16, "BUS_GET_PCI_INFO");
++static_assert(sizeof(NV2080_CTRL_GR_GET_INFO_V2_PARAMS) == 528, "GR_GET_INFO_V2");
++static_assert(sizeof(NV2080_CTRL_GPU_GET_NAME_STRING_PARAMS) == 68, "GET_NAME_STRING");
++static_assert(sizeof(NV2080_CTRL_TIMER_GET_TIME_PARAMS) == 8, "TIMER_GET_TIME");
++static_assert(sizeof(NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS) == 20, "EVENT_SET_NOTIFICATION");
++static_assert(sizeof(NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS) == 3, "GPFIFO_SCHEDULE");
++static_assert(sizeof(NVA06F_CTRL_BIND_PARAMS) == 4, "BIND");
++static_assert(sizeof(NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS) == 4, "GET_WORK_SUBMIT_TOKEN");
++static_assert(sizeof(NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS) == 4, "SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX");
++static_assert(sizeof(NvNotification) == 16, "NvNotification");
++
++#endif /* NVRM_API_H */
+diff --git a/src/nouveau/vulkan/nvkmd/rm/rmclient-fallback/rmclient.h b/src/nouveau/vulkan/nvkmd/rm/rmclient-fallback/rmclient.h
+new file mode 100644
+index 0000000..ba8bd60
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/rm/rmclient-fallback/rmclient.h
+@@ -0,0 +1,138 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * librmclient: a small client for NVIDIA's Resource Manager (RM) API.
++ *
++ * A user-mode driver allocates RM objects, sends controls, frees them and maps
++ * memory through this API; the OS-specific escapes (Linux ioctls on
++ * /dev/nvidiactl and /dev/nvidiaN, a Windows KMD later) live behind the
++ * transport vtable in rmclient_transport.h.
++ *
++ * Return values: 0 on success, a negative errno for transport/library
++ * failures (-ENOMEM, -EINVAL, -ENOENT, ...), or a positive NV_STATUS when RM
++ * itself refused the call (e.g. 0x22 NV_ERR_INVALID_CLASS). crm_status_name()
++ * turns either into text.
++ *
++ * Thread safety: every function may be called from several threads on the
++ * same client; the client serialises its own bookkeeping, RM calls run
++ * concurrently.
++ */
++#ifndef RMCLIENT_H
++#define RMCLIENT_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct crm_client crm_client;
++struct crm_transport;                       /* OS backend vtable, see rmclient_transport.h */
++
++/* Open a client: allocates NV01_ROOT_CLIENT. transport NULL = the platform default (Linux: /dev/nvidiactl). Returns 0 or -errno. */
++int  crm_open(crm_client **out, const struct crm_transport *transport);
++void crm_close(crm_client *c);              /* frees the root client and everything under it */
++uint32_t crm_root(const crm_client *c);     /* the root client handle */
++/* params is in/out: RM's answer (e.g. NV_MEMORY_ALLOCATION_PARAMS.offset/size, VA space size) is written back into it in place. */
++/* hObject in/out: 0 = the library picks a fresh handle. Returns 0, -errno for transport failures, or a positive NV_STATUS from RM. */
++int crm_alloc(crm_client *c, uint32_t parent, uint32_t *object, uint32_t hclass, void *params, uint32_t params_size);
++int crm_control(crm_client *c, uint32_t object, uint32_t cmd, void *params, uint32_t params_size);
++int crm_free(crm_client *c, uint32_t parent, uint32_t object);
++/* CPU-map an RM memory object (NV_ESC_RM_MAP_MEMORY + mmap on the device fd). device = the NV01_DEVICE_0 (or subdevice) handle. */
++/* Each mapping gets its own fresh channel (Linux: /dev/nvidiaN for video/BAR
++ * memory, /dev/nvidiactl for system memory), which RM requires; it stays open
++ * until crm_unmap_memory. A subdevice handle works as `device` (e.g. for the
++ * usermode doorbell object, which lives under the subdevice). */
++int crm_map_memory(crm_client *c, uint32_t device, uint32_t memory, uint64_t offset, uint64_t length, uint32_t flags, void **cpu_ptr);
++int crm_unmap_memory(crm_client *c, uint32_t device, uint32_t memory, void *cpu_ptr, uint64_t length, uint32_t flags);
++/* GPU-VA map (NvRmMapMemoryDma / NV_ESC_RM_MAP_MEMORY_DMA) and unmap. */
++/* `dma` may be a VirtualMemory (NV50_MEMORY_VIRTUAL / NV01_MEMORY_VIRTUAL) or
++ * a ctxdma, passed to RM unchanged, or a FERMI_VASPACE_A allocated through
++ * this client: RM cannot map into a VA space handle directly, so then the
++ * library allocates an NV50_MEMORY_VIRTUAL of `length` in that VA space per
++ * mapping (at *gpu_va when it is non-zero, else wherever RM places it), maps
++ * into it, and frees it again in crm_unmap_dma. */
++int crm_map_dma(crm_client *c, uint32_t device, uint32_t dma /* VA space or ctxdma */, uint32_t memory, uint64_t offset, uint64_t length, uint32_t flags, uint64_t *gpu_va /* in/out */);
++int crm_unmap_dma(crm_client *c, uint32_t device, uint32_t dma, uint32_t memory, uint32_t flags, uint64_t gpu_va);
++/* Number of GPUs and their minor numbers (for /dev/nvidiaN) and device ids, from NV_ESC_CARD_INFO. */
++int crm_gpu_count(crm_client *c);
++int crm_gpu_info(crm_client *c, int index, uint32_t *gpu_id, uint32_t *minor, uint32_t *pci_device_id);
++const char *crm_status_name(int status);    /* NV_STATUS / -errno to text */
++
++/* ------------------------------------------------------------------------
++ * Additions beyond the core contract.
++ * ------------------------------------------------------------------------ */
++
++/* The RM version string the kernel reported (e.g. "610.57.04"). */
++const char *crm_rm_version(const crm_client *c);
++
++/* Version this library's structure layouts were taken from. crm_open does
++ * NV_ESC_CHECK_VERSION_STR (strict, as libnvidia does) against this string,
++ * or against $CRM_RM_VERSION when set; CRM_RM_VERSION=any accepts whatever
++ * the kernel reports. A mismatch makes crm_open fail with -EPROTO. */
++#define CRM_RM_BUILD_VERSION "610.57.04"
++
++/* crm_map_dma with NVOS46's flags2 and kindOverride (PTE kind, applied when
++ * NVOS46_FLAGS_PAGE_KIND_OVERRIDE is set in flags). */
++int crm_map_dma2(crm_client *c, uint32_t device, uint32_t dma, uint32_t memory,
++                 uint64_t offset, uint64_t length, uint32_t flags, uint32_t flags2,
++                 uint32_t kind_override, uint64_t *gpu_va);
++
++/* NV_STATUS / -errno to a description ("Given class-id not valid", "No such file or
++ * directory"); crm_status_name gives the symbolic name. */
++const char *crm_status_string(int status);
++
++/* Extended GPU info from NV_ESC_CARD_INFO. Any pointer may be NULL. */
++int crm_gpu_pci(crm_client *c, int index, uint32_t *domain, uint8_t *bus,
++                uint8_t *slot, uint8_t *function, uint16_t *vendor_id);
++
++/* Like crm_free but tolerant: frees and forgets the handle even if RM
++ * reports it already gone (NV_ERR_OBJECT_NOT_FOUND counts as success). */
++int crm_free_quiet(crm_client *c, uint32_t parent, uint32_t object);
++
++/* Pick a fresh handle without allocating anything (for callers that build
++ * NVOS structures themselves, e.g. to pass handles inside alloc params). The
++ * handle is reserved until crm_alloc uses it or crm_release_handle drops it. */
++uint32_t crm_new_handle(crm_client *c);
++void     crm_release_handle(crm_client *c, uint32_t handle);
++
++/* OS events, as libnvidia sets them up: a fresh event channel (Linux: a new
++ * /dev/nvidiactl fd, pollable for POLLIN), NV_ESC_ALLOC_OS_EVENT on it, then
++ * an NV01_EVENT_OS_EVENT object under `parent` (NV0005_ALLOC_PARAMETERS:
++ * hSrcResource = parent, notifyIndex = notify_index (callers may OR in
++ * NV01_EVENT_* flags), data = the channel fd). Returns the event object's
++ * handle and the channel fd. crm_event_close frees the object, the OS event
++ * and the channel. */
++int crm_event_open(crm_client *c, uint32_t parent, uint32_t notify_index,
++                   uint32_t *event_handle, int *event_fd);
++int crm_event_close(crm_client *c, uint32_t event_handle, int event_fd);
++
++/* One notification read back by crm_event_drain (NvUnixEvent). */
++struct crm_event_data {
++    uint32_t object;        /* hObject the notification came from */
++    uint32_t notify_index;
++    uint32_t info32;
++    uint16_t info16;
++};
++
++/* Consume pending notifications on an event fd (NV_ESC_RM_GET_EVENT_DATA
++ * until RM has no more). Stores up to `max` of them in `out` (may be NULL)
++ * and returns how many were consumed (>= 0), or -errno. Events allocated
++ * with NV01_EVENT_WITHOUT_EVENT_DATA carry no data: poll() wakes, drain
++ * returns 0. Never blocks. */
++int crm_event_drain(crm_client *c, int event_fd, struct crm_event_data *out, int max);
++
++/* Raw escape on the control channel (fd = -1) or a transport fd, for escapes
++ * this API does not wrap. Returns 0 or -errno; RM status stays in *arg. */
++int crm_escape(crm_client *c, int fd, uint32_t nr, void *arg, uint32_t size);
++int crm_ctl_fd(const crm_client *c);
++
++/* Number of objects / CPU mappings the client tracks (tests, leak checks). */
++size_t crm_object_count(const crm_client *c);
++size_t crm_mapping_count(const crm_client *c);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* RMCLIENT_H */
+-- 
+2.43.0
+

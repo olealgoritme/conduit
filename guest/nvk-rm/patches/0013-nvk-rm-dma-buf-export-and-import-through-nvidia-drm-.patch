@@ -1,0 +1,901 @@
+From d93f51536cf0e2ba4f62249fe10ef5c538300bff Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 5 Oct 2026 23:12:40 +0200
+Subject: [PATCH 13/13] nvk/rm: dma-buf export and import through nvidia-drm,
+ DRM format modifiers
+
+Zero-copy presentation for the RM backend.  RM memory becomes a dma-buf
+the way NVIDIA's own userspace does it: the memory object is exported to
+a fresh /dev/nvidiactl descriptor (NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD),
+nvidia-drm imports that descriptor as a GEM object
+(DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY, with the NVKMS surface parameters of
+the image the memory was allocated for) and PRIME makes the dma-buf.
+Import is the reverse: PRIME_FD_TO_HANDLE, DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY
+to a /dev/nvidiactl descriptor, NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD
+into our client under a handle from crm_new_handle, placement from
+NV0041_CTRL_CMD_GET_SURFACE_INFO.
+
+Under Conduit the DRM node is the guest's nvidia-drm stand-in, which
+forwards both GEM ioctls to the host's nvidia-drm and puts a guest GEM
+object in front of the host's, so Xwayland, the compositor (NVIDIA's EGL
+and GBM) and Conduit's scanout to the host all use the VRAM NVK rendered
+into.
+
+- pdev: find the nvidia-drm node at the GPU's PCI address (Conduit's PCI
+  mirror, which is also what RM reports), check DRM_IOCTL_VERSION and
+  DRM_NVIDIA_GET_DEV_INFO, fill drm.render_dev/primary_dev (so the WSI
+  sees the same device as the X server and the compositor), and set
+  has_dma_buf.  NVK_RM_DMABUF=0 turns it off.  has_alloc_tiled is set:
+  kinds are applied per mapping as before, a tiled allocation just
+  records the layout; this enables VK_EXT_image_drm_format_modifier with
+  NIL's NVIDIA block-linear modifiers, which match what nvidia-drm
+  reports for GB202 (generic kind 0x06, kind generation 2, sector layout
+  1, e.g. 0x0300000000606015).
+- dev: its own open of the node for GEM handles.
+- mem: one GEM object per memory, made on first export (every export is
+  then the same dma-buf); shared system memory is RM's NV01_MEMORY_SYSTEM,
+  never our own pages, which another client cannot use.
+- sync: drop vk_sync_binary's emulated sync_file import/export.  The WSI
+  took it for real sync_file support and the first vkAcquireNextImageKHR
+  failed with VK_ERROR_INVALID_EXTERNAL_HANDLE; without it the WSI asks
+  for implicit sync and waits before presenting (wait_before_present).
+- nvrm_api.h: the OS_UNIX export/import controls, GET_SURFACE_INFO and the
+  nvidia-drm/NVKMS structures, with size checks.
+- lib: crm_new_handle/crm_release_handle (optional).
+
+On an RTX 5090 in a Conduit guest (GNOME 50, Xwayland): vkcube renders
+through the native X11 and Wayland WSI paths with no CPU copy; at
+1920x1080 with uncapped present modes, 2900 fps on X11 (software WSI:
+630) and 4900 fps on Wayland (software: 590).
+
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  27 ++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  |  15 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c  |   2 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c  | 337 +++++++++++++++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c | 116 ++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c |  10 +
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h | 115 +++++++
+ 7 files changed, 607 insertions(+), 15 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 2d5d9ac..bd51149 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -66,6 +66,8 @@ struct nvkmd_rm_lib {
+    int (*alloc_os_descriptor)(crm_client *c, uint32_t device,
+                               uint32_t *object, void *addr, uint64_t size,
+                               uint32_t nvos02_flags);
++   uint32_t (*new_handle)(crm_client *c);
++   void (*release_handle)(crm_client *c, uint32_t handle);
+ };
+ 
+ /* Returns NULL if librmclient cannot be loaded */
+@@ -100,6 +102,12 @@ struct nvkmd_rm_pdev {
+ 
+    uint32_t cls_usermode;
+ 
++   /* The nvidia-drm node for this GPU (Conduit's guest DRM device, or
++    * nvidia-drm itself), used to turn RM memory into dma-bufs.  Empty if
++    * there is none, and then has_dma_buf is false.
++    */
++   char drm_path[64];
++
+    struct vk_sync_type sync_type;
+    struct vk_sync_binary_type binary_sync_type;
+    const struct vk_sync_type *sync_types[3];
+@@ -158,6 +166,9 @@ struct nvkmd_rm_dev {
+    /* Set once draining the event failed: poll() is useless then */
+    bool nonstall_undrainable;
+ 
++   /* Open nvidia-drm node for dma-buf export/import, -1 if none */
++   int drm_fd;
++
+    simple_mtx_t heap_mutex;
+    struct util_vma_heap heap;
+    struct util_vma_heap replay_heap;
+@@ -187,6 +198,22 @@ struct nvkmd_rm_mem {
+     * the CPU mapping is the allocation itself.
+     */
+    void *os_pages;
++
++   /* Imported from a dma-buf: h_memory came from
++    * NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD and its handle was
++    * reserved with crm_new_handle.
++    */
++   bool imported;
++
++   /* Layout of the image this memory was allocated for (alloc_tiled_mem),
++    * passed on to NVKMS when the memory is exported.
++    */
++   uint8_t pte_kind;
++   uint16_t tile_mode;
++
++   /* GEM handle on dev->drm_fd once the memory has been exported, 0 before */
++   simple_mtx_t export_mutex;
++   uint32_t gem_handle;
+ };
+ 
+ NVKMD_DECL_SUBCLASS(mem, rm);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 675cfdb..f6f864c 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -10,6 +10,7 @@
+ #include "util/u_math.h"
+ #include "vk_log.h"
+ 
++#include <fcntl.h>
+ #include <poll.h>
+ #include <sched.h>
+ #include <unistd.h>
+@@ -122,6 +123,7 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+    dev->base.va_end = NVKMD_RM_REPLAY_HEAP_END;
+    dev->lib = lib;
+    dev->nonstall_fd = -1;
++   dev->drm_fd = -1;
+ 
+    list_inithead(&dev->base.mems);
+    simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
+@@ -210,6 +212,15 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+    dev->sema_pool.chunks = UTIL_DYNARRAY_INIT;
+    dev->sema_pool.free_slots = UTIL_DYNARRAY_INIT;
+ 
++   /* For dma-buf export/import (nvkmd_rm_mem.c).  Our own open, so the GEM
++    * handles we make are ours alone, as nouveau's are per device fd.
++    */
++   if (pdev->drm_path[0] != '\0') {
++      dev->drm_fd = open(pdev->drm_path, O_RDWR | O_CLOEXEC);
++      if (dev->drm_fd < 0)
++         mesa_logw("NVK: cannot open %s, no dma-bufs", pdev->drm_path);
++   }
++
+    *dev_out = &dev->base;
+ 
+    return VK_SUCCESS;
+@@ -249,6 +260,10 @@ nvkmd_rm_dev_destroy(struct nvkmd_dev *_dev)
+    /* Closing the client frees every RM object under it */
+    lib->close(dev->client);
+ 
++   /* GEM objects made from our memory go with the file */
++   if (dev->drm_fd >= 0)
++      close(dev->drm_fd);
++
+    simple_mtx_destroy(&dev->base.mems_mutex);
+    FREE(dev);
+ }
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index f0fd095..a6bb6d6 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -77,6 +77,8 @@ nvkmd_rm_lib_load(void)
+    LOAD(event_close,  "crm_event_close",  false);
+    LOAD(event_drain,  "crm_event_drain",  false);
+    LOAD(alloc_os_descriptor, "crm_alloc_os_descriptor", false);
++   LOAD(new_handle,   "crm_new_handle",   false);
++   LOAD(release_handle, "crm_release_handle", false);
+ 
+    rm_lib_ok = true;
+    return;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 413219e..24aab04 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -10,7 +10,12 @@
+ #include "util/u_math.h"
+ #include "vk_log.h"
+ 
++#include <fcntl.h>
++#include <inttypes.h>
++#include <stdio.h>
+ #include <sys/mman.h>
++#include <unistd.h>
++#include <xf86drm.h>
+ 
+ /*
+  * Placement policy
+@@ -19,7 +24,9 @@
+  *    anonymous pages, described to RM with NV01_MEMORY_SYSTEM_OS_DESCRIPTOR.
+  *    The CPU mapping is the allocation itself: zero-copy, coherent, and
+  *    under Conduit it does not use the small host-visible window.  If RM
+- *    refuses that, fall back to RM-allocated NV01_MEMORY_SYSTEM.
++ *    refuses that, fall back to RM-allocated NV01_MEMORY_SYSTEM.  Shared
++ *    (exportable) system memory is always NV01_MEMORY_SYSTEM: our own
++ *    pages cannot be handed to another RM client.
+  *  - Everything else that may live in VRAM is NV01_MEMORY_LOCAL_USER with
+  *    64 KiB pages.  RM does not migrate it, so NVKMD_MEM_LOCAL means VRAM.
+  *  - VRAM which must be CPU-mapped (NVKMD_MEM_VRAM | CAN_MAP, which NVK
+@@ -166,11 +173,16 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    const struct nv_device_info *dev_info = &dev->base.pdev->dev_info;
+    VkResult result;
+ 
+-   const bool force_rm_sysmem = flags & NVKMD_RM_MEM_RM_SYSMEM;
++   /* Shared system memory has to be RM's own: OS-descriptor memory is our
++    * process's pages and cannot be handed to another client.
++    */
++   const bool force_rm_sysmem = (flags & NVKMD_RM_MEM_RM_SYSMEM) ||
++                                (flags & NVKMD_MEM_SHARED);
+    flags &= ~NVKMD_RM_MEM_RM_SYSMEM;
+ 
+-   /* has_alloc_tiled is false: kinds are applied per mapping instead */
+-   assert(pte_kind == 0 && tile_mode == 0);
++   /* Kinds are applied per mapping (the image's own VA).  The layout is only
++    * remembered, for NVKMS if the memory is exported.
++    */
+ 
+    /* Only one placement flag may be specified */
+    assert(util_bitcount(flags & NVKMD_MEM_PLACEMENT_FLAGS) == 1);
+@@ -216,6 +228,9 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+       goto fail_mem;
+ 
+    mem->vram = vram;
++   mem->pte_kind = pte_kind;
++   mem->tile_mode = tile_mode;
++   simple_mtx_init(&mem->export_mutex, mtx_plain);
+ 
+    /* Discrete GPU: sysmem is snooped, VRAM maps are uncached/WC */
+    flags |= NVKMD_MEM_COHERENT;
+@@ -245,6 +260,7 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+ fail_va:
+    nvkmd_va_free(mem->base.va);
+ fail_rm:
++   simple_mtx_destroy(&mem->export_mutex);
+    free_rm_memory(dev, mem->h_memory);
+    if (mem->os_pages != NULL)
+       munmap(mem->os_pages, size_B);
+@@ -254,13 +270,273 @@ fail_mem:
+    return result;
+ }
+ 
++/*
++ * dma-bufs
++ *
++ * RM memory reaches DRM the way NVIDIA's own userspace sends it: the memory
++ * object is exported to a fresh /dev/nvidiactl descriptor
++ * (NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD) and nvidia-drm imports that
++ * descriptor as a GEM object (DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY), which PRIME
++ * turns into a dma-buf.  The other way round, nvidia-drm exports the memory
++ * behind a GEM object to a descriptor (DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY) and
++ * we import it into our client (NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD).
++ *
++ * Under Conduit the DRM node is the guest's nvidia-drm stand-in, which
++ * forwards both ioctls (descriptors swapped for the backend's) to the host's
++ * nvidia-drm and keeps a guest GEM object in front of the host's.  The
++ * memory never moves: a compositor in the guest, and Conduit's scanout to
++ * the host viewer, see the very VRAM NVK rendered into.
++ */
++
++static int
++open_export_fd(void)
++{
++   return open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
++}
++
++static VkResult
++export_to_gem(struct nvkmd_rm_dev *dev, struct nvkmd_rm_mem *mem,
++              struct vk_object_base *log_obj, uint32_t *gem_handle_out)
++{
++   const struct nvkmd_rm_lib *lib = dev->lib;
++   VkResult result;
++
++   if (mem->os_pages != NULL) {
++      return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
++                       "RM: memory backed by our own pages cannot be "
++                       "exported");
++   }
++
++   int ctl_fd = open_export_fd();
++   if (ctl_fd < 0) {
++      return vk_errorf(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY,
++                       "open /dev/nvidiactl: %m");
++   }
++
++   NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS ex = {
++      .object = {
++         .type = NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM,
++         .rmObject = {
++            .hDevice = dev->h_device,
++            .hParent = dev->h_device,
++            .hObject = mem->h_memory,
++         },
++      },
++      .fd = ctl_fd,
++   };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_OUT_OF_HOST_MEMORY,
++                           lib->control(dev->client, lib->root(dev->client),
++                                        NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD,
++                                        &ex, sizeof(ex)),
++                           "OS_UNIX_EXPORT_OBJECT_TO_FD");
++   if (result != VK_SUCCESS)
++      goto out;
++
++   /* NVKMS keeps the layout for scanout through nvidia-drm's own KMS; a
++    * dma-buf importer uses the DRM format modifier instead.
++    */
++   struct nvrm_nvkms_kapi_priv_import_memory_params nvkms = {
++      .memFd = ctl_fd,
++      .surfaceParams = {
++         .layout = mem->pte_kind != 0 ?
++                   NVRM_NVKMS_SURFACE_MEMORY_LAYOUT_BLOCK_LINEAR :
++                   NVRM_NVKMS_SURFACE_MEMORY_LAYOUT_PITCH,
++         .blockLinear = {
++            .log2GobsPerBlock = {
++               .x = 0,
++               .y = (mem->tile_mode >> 4) & 0xf,
++               .z = (mem->tile_mode >> 8) & 0xf,
++            },
++            .pitchInBlocks = 0,
++            .genericMemory = mem->pte_kind != 0,
++         },
++      },
++   };
++   struct nvrm_drm_nvidia_gem_import_nvkms_memory_params imp = {
++      .mem_size = mem->base.size_B,
++      .nvkms_params_ptr = (uint64_t)(uintptr_t)&nvkms,
++      .nvkms_params_size = sizeof(nvkms),
++   };
++   if (drmIoctl(dev->drm_fd,
++                DRM_IOWR(DRM_COMMAND_BASE +
++                         NVRM_DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY,
++                         struct nvrm_drm_nvidia_gem_import_nvkms_memory_params),
++                &imp) != 0) {
++      result = vk_errorf(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY,
++                         "DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY: %m");
++      goto out;
++   }
++
++   *gem_handle_out = imp.handle;
++
++out:
++   /* nvidia-drm has its own reference now; the descriptor was only the
++    * envelope.
++    */
++   close(ctl_fd);
++
++   return result;
++}
++
++static bool
++query_is_vram(struct nvkmd_rm_dev *dev, uint32_t h_memory)
++{
++   NV0041_CTRL_SURFACE_INFO info = {
++      .index = NV0041_CTRL_SURFACE_INFO_INDEX_ADDR_SPACE_TYPE,
++   };
++   NV0041_CTRL_GET_SURFACE_INFO_PARAMS params = {
++      .surfaceInfoListSize = 1,
++      .surfaceInfoList = (uint64_t)(uintptr_t)&info,
++   };
++   if (dev->lib->control(dev->client, h_memory,
++                         NV0041_CTRL_CMD_GET_SURFACE_INFO,
++                         &params, sizeof(params)) != 0)
++      return true; /* what a dma-buf from nvidia-drm on a dGPU usually is */
++
++   return info.data != NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE_SYSMEM;
++}
++
+ VkResult
+-nvkmd_rm_import_dma_buf(struct nvkmd_dev *dev,
++nvkmd_rm_import_dma_buf(struct nvkmd_dev *_dev,
+                         struct vk_object_base *log_obj,
+                         int fd, struct nvkmd_mem **mem_out)
+ {
+-   /* has_dma_buf is false */
+-   return vk_error(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++   const struct nvkmd_rm_lib *lib = dev->lib;
++   VkResult result;
++   int ret;
++
++   if (dev->drm_fd < 0 || lib->new_handle == NULL)
++      return vk_error(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++
++   const off_t size = lseek(fd, 0, SEEK_END);
++   if (size <= 0)
++      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                       "dma-buf size: %m");
++   lseek(fd, 0, SEEK_SET);
++
++   /* A dma-buf from another driver is not something nvidia-drm can name
++    * by RM memory; GEM_EXPORT_NVKMS_MEMORY fails for it.
++    */
++   uint32_t gem_handle;
++   if (drmPrimeFDToHandle(dev->drm_fd, fd, &gem_handle) != 0)
++      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                       "PRIME_FD_TO_HANDLE: %m");
++
++   int ctl_fd = open_export_fd();
++   if (ctl_fd < 0) {
++      result = vk_errorf(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY,
++                         "open /dev/nvidiactl: %m");
++      goto fail_gem;
++   }
++
++   struct nvrm_nvkms_kapi_priv_export_memory_params nvkms = {
++      .memFd = ctl_fd,
++   };
++   struct nvrm_drm_nvidia_gem_export_nvkms_memory_params exp = {
++      .handle = gem_handle,
++      .nvkms_params_ptr = (uint64_t)(uintptr_t)&nvkms,
++      .nvkms_params_size = sizeof(nvkms),
++   };
++   if (drmIoctl(dev->drm_fd,
++                DRM_IOWR(DRM_COMMAND_BASE +
++                         NVRM_DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY,
++                         struct nvrm_drm_nvidia_gem_export_nvkms_memory_params),
++                &exp) != 0) {
++      result = vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                         "DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY: %m");
++      goto fail_ctl;
++   }
++
++   const uint32_t h_memory = lib->new_handle(dev->client);
++   NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS im = {
++      .fd = ctl_fd,
++      .object = {
++         .type = NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM,
++         .rmObject = {
++            .hDevice = dev->h_device,
++            .hParent = dev->h_device,
++            .hObject = h_memory,
++         },
++      },
++   };
++   ret = lib->control(dev->client, lib->root(dev->client),
++                      NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD,
++                      &im, sizeof(im));
++   if (ret != 0) {
++      if (lib->release_handle != NULL)
++         lib->release_handle(dev->client, h_memory);
++      result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                              ret, "OS_UNIX_IMPORT_OBJECT_FROM_FD");
++      goto fail_ctl;
++   }
++   close(ctl_fd);
++
++   /* The GEM handle is per file and shared by every import of the same
++    * dma-buf, so it is not ours to keep.  A later export of this memory
++    * goes through GEM_IMPORT_NVKMS_MEMORY like any other.
++    */
++   struct drm_gem_close gem_close = { .handle = gem_handle };
++   drmIoctl(dev->drm_fd, DRM_IOCTL_GEM_CLOSE, &gem_close);
++
++   struct nvkmd_rm_mem *mem = CALLOC_STRUCT(nvkmd_rm_mem);
++   if (mem == NULL) {
++      free_rm_memory(dev, h_memory);
++      if (lib->release_handle != NULL)
++         lib->release_handle(dev->client, h_memory);
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++   }
++
++   mem->h_memory = h_memory;
++   mem->imported = true;
++   mem->vram = query_is_vram(dev, h_memory);
++   simple_mtx_init(&mem->export_mutex, mtx_plain);
++
++   /* As nouveau: LOCAL for anything shared, we do not pick the placement */
++   enum nvkmd_mem_flags flags = NVKMD_MEM_SHARED | NVKMD_MEM_LOCAL |
++                                NVKMD_MEM_COHERENT;
++   if (!mem->vram)
++      flags |= NVKMD_MEM_CAN_MAP;
++
++   const uint32_t page_size_B = mem->vram ? NVKMD_RM_BIG_PAGE_SIZE
++                                          : NVKMD_RM_SYSMEM_PAGE_SIZE;
++   const uint64_t size_B = align64(size, page_size_B);
++   nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_rm_mem_ops,
++                  flags, size_B, page_size_B);
++
++   enum nvkmd_va_flags va_flags = mem->vram ? 0 : NVKMD_VA_GART;
++   result = nvkmd_dev_alloc_va(&dev->base, log_obj, va_flags, 0 /* kind */,
++                               size_B, page_size_B, 0 /* fixed_addr */,
++                               &mem->base.va);
++   if (result != VK_SUCCESS)
++      goto fail_mem;
++
++   result = nvkmd_va_bind_mem(mem->base.va, log_obj, 0, &mem->base,
++                              0, size_B);
++   if (result != VK_SUCCESS)
++      goto fail_va;
++
++   *mem_out = &mem->base;
++
++   return VK_SUCCESS;
++
++fail_va:
++   nvkmd_va_free(mem->base.va);
++fail_mem:
++   simple_mtx_destroy(&mem->export_mutex);
++   free_rm_memory(dev, h_memory);
++   if (lib->release_handle != NULL)
++      lib->release_handle(dev->client, h_memory);
++   FREE(mem);
++   return result;
++
++fail_ctl:
++   close(ctl_fd);
++fail_gem: {
++   struct drm_gem_close gc = { .handle = gem_handle };
++   drmIoctl(dev->drm_fd, DRM_IOCTL_GEM_CLOSE, &gc);
++}
++   return result;
+ }
+ 
+ static void
+@@ -272,7 +548,18 @@ nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
+    /* The GPU mapping has to go before the memory object */
+    nvkmd_va_free(mem->base.va);
+ 
++   /* nvidia-drm holds its own reference to the memory for as long as a
++    * dma-buf of it is alive; this only drops our GEM name for it.
++    */
++   if (mem->gem_handle != 0) {
++      struct drm_gem_close gem_close = { .handle = mem->gem_handle };
++      drmIoctl(dev->drm_fd, DRM_IOCTL_GEM_CLOSE, &gem_close);
++   }
++   simple_mtx_destroy(&mem->export_mutex);
++
+    free_rm_memory(dev, mem->h_memory);
++   if (mem->imported && dev->lib->release_handle != NULL)
++      dev->lib->release_handle(dev->client, mem->h_memory);
+    if (mem->os_pages != NULL)
+       munmap(mem->os_pages, mem->base.size_B);
+ 
+@@ -348,12 +635,42 @@ nvkmd_rm_mem_overmap(struct nvkmd_mem *mem,
+ }
+ 
+ static VkResult
+-nvkmd_rm_mem_export_dma_buf(struct nvkmd_mem *mem,
++nvkmd_rm_mem_export_dma_buf(struct nvkmd_mem *_mem,
+                             struct vk_object_base *log_obj,
+                             int *fd_out)
+ {
+-   /* has_dma_buf is false */
+-   return vk_error(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
++   VkResult result = VK_SUCCESS;
++
++   if (dev->drm_fd < 0)
++      return vk_error(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
++
++   /* One GEM object per memory: every export is then the same dma-buf, as
++    * with a nouveau BO.
++    */
++   simple_mtx_lock(&mem->export_mutex);
++   if (mem->gem_handle == 0)
++      result = export_to_gem(dev, mem, log_obj, &mem->gem_handle);
++   const uint32_t gem_handle = mem->gem_handle;
++   simple_mtx_unlock(&mem->export_mutex);
++   if (result != VK_SUCCESS)
++      return result;
++
++   if (drmPrimeHandleToFD(dev->drm_fd, gem_handle, DRM_CLOEXEC | DRM_RDWR,
++                          fd_out) != 0) {
++      return vk_errorf(log_obj, VK_ERROR_TOO_MANY_OBJECTS,
++                       "PRIME_HANDLE_TO_FD: %m");
++   }
++
++   if (dev->base.pdev->debug_flags & NVK_DEBUG_VM) {
++      fprintf(stderr, "NVK: RM memory 0x%x (%" PRIu64 " B, kind 0x%x, "
++              "tile 0x%x) exported as GEM %u, dma-buf fd %d\n",
++              mem->h_memory, mem->base.size_B, mem->pte_kind,
++              mem->tile_mode, gem_handle, *fd_out);
++   }
++
++   return VK_SUCCESS;
+ }
+ 
+ static void
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index 53ad97a..2ff8e12 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -12,9 +12,15 @@
+ #include "util/u_math.h"
+ #include "vk_log.h"
+ 
++#include <errno.h>
++#include <fcntl.h>
+ #include <inttypes.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <xf86drm.h>
+ 
+ static uint32_t
+ pick_class(const NV0080_CTRL_GPU_GET_CLASSLIST_V2_PARAMS *classes,
+@@ -267,6 +273,102 @@ fill_device_info(struct nvkmd_rm_pdev *pdev,
+    return VK_SUCCESS;
+ }
+ 
++/* Opens path and checks that it is an nvidia-drm node.  Fills info. */
++static int
++open_nvidia_drm(const char *path,
++                struct nvrm_drm_nvidia_get_dev_info_params *info)
++{
++   int fd = open(path, O_RDWR | O_CLOEXEC);
++   if (fd < 0)
++      return -1;
++
++   drmVersionPtr ver = drmGetVersion(fd);
++   const bool is_nvidia = ver != NULL && ver->name != NULL &&
++                          strcmp(ver->name, "nvidia-drm") == 0;
++   drmFreeVersion(ver);
++
++   memset(info, 0, sizeof(*info));
++   if (!is_nvidia ||
++       drmIoctl(fd, DRM_IOWR(DRM_COMMAND_BASE + NVRM_DRM_NVIDIA_GET_DEV_INFO,
++                             struct nvrm_drm_nvidia_get_dev_info_params),
++                info) != 0) {
++      close(fd);
++      return -1;
++   }
++
++   return fd;
++}
++
++/*
++ * Finds the nvidia-drm node of this GPU: the DRM device at the same PCI
++ * address (under Conduit, the guest's PCI mirror of the host GPU, which is
++ * also what RM reports) whose driver calls itself nvidia-drm.  Its GEM
++ * import of RM memory is what turns our memory into dma-bufs.
++ */
++static void
++find_drm_node(struct nvkmd_rm_pdev *pdev, enum nvk_debug debug_flags)
++{
++   const struct nv_device_info *info = &pdev->base.dev_info;
++
++   if (!debug_get_bool_option("NVK_RM_DMABUF", true))
++      return;
++
++   drmDevicePtr devices[16];
++   int count = drmGetDevices2(0, devices, ARRAY_SIZE(devices));
++   if (count <= 0)
++      return;
++
++   for (int i = 0; i < count && pdev->drm_path[0] == '\0'; i++) {
++      drmDevicePtr d = devices[i];
++      if (d->bustype != DRM_BUS_PCI ||
++          d->businfo.pci->domain != info->pci.domain ||
++          d->businfo.pci->bus != info->pci.bus ||
++          d->businfo.pci->dev != info->pci.dev ||
++          d->businfo.pci->func != info->pci.func)
++         continue;
++
++      /* Prefer the render node: no DRM master, no authentication */
++      static const int node_types[] = { DRM_NODE_RENDER, DRM_NODE_PRIMARY };
++      for (unsigned n = 0; n < ARRAY_SIZE(node_types); n++) {
++         if (!(d->available_nodes & (1 << node_types[n])))
++            continue;
++
++         const char *path = d->nodes[node_types[n]];
++         struct nvrm_drm_nvidia_get_dev_info_params drm_info;
++         int fd = open_nvidia_drm(path, &drm_info);
++         if (fd < 0)
++            continue;
++         close(fd);
++
++         if (drm_info.gpu_id != pdev->gpu_id) {
++            mesa_logw("NVK: %s is gpu_id 0x%x, RM says 0x%x; using it anyway",
++                      path, drm_info.gpu_id, pdev->gpu_id);
++         }
++
++         snprintf(pdev->drm_path, sizeof(pdev->drm_path), "%s", path);
++
++         struct stat st;
++         if ((d->available_nodes & (1 << DRM_NODE_RENDER)) &&
++             stat(d->nodes[DRM_NODE_RENDER], &st) == 0)
++            pdev->base.drm.render_dev = st.st_rdev;
++         if ((d->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
++             stat(d->nodes[DRM_NODE_PRIMARY], &st) == 0)
++            pdev->base.drm.primary_dev = st.st_rdev;
++
++         if (debug_flags & NVK_DEBUG_VM) {
++            fprintf(stderr, "NVK: RM GPU %u: dma-bufs through %s (gpu_id "
++                    "0x%x, generic kind 0x%x, kind generation %u, sector "
++                    "layout %u)\n", pdev->gpu_id, path, drm_info.gpu_id,
++                    drm_info.generic_page_kind,
++                    drm_info.page_kind_generation, drm_info.sector_layout);
++         }
++         break;
++      }
++   }
++
++   drmFreeDevices(devices, count);
++}
++
+ static VkResult
+ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+                          int gpu_index,
+@@ -342,10 +444,17 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+ 
+    pdev->base.ops = &nvkmd_rm_pdev_ops;
+    pdev->base.debug_flags = debug_flags;
++   find_drm_node(pdev, debug_flags);
++
+    pdev->base.kmd_info = (struct nvkmd_info) {
+-      .has_dma_buf = false,
++      /* Memory becomes a dma-buf through nvidia-drm (nvkmd_rm_mem.c) */
++      .has_dma_buf = pdev->drm_path[0] != '\0',
+       .has_get_vram_used = true,
+-      .has_alloc_tiled = false,
++      /* Kinds are applied per mapping; a "tiled" allocation only records
++       * the layout for NVKMS.  This is what enables
++       * VK_EXT_image_drm_format_modifier.
++       */
++      .has_alloc_tiled = true,
+       .has_map_fixed = false,
+       .has_overmap = false,
+       .has_compression = false,
+@@ -357,9 +466,6 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+     */
+    pdev->base.bind_align_B = NVKMD_RM_BIG_PAGE_SIZE;
+ 
+-   /* No DRM nodes */
+-   pdev->base.drm.render_dev = 0;
+-   pdev->base.drm.primary_dev = 0;
+ 
+    pdev->sync_type = nvkmd_rm_sync_get_type();
+    nvkmd_rm_binary_sync_type_init(&pdev->binary_sync_type, &pdev->sync_type);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+index b7afc37..2544f43 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+@@ -308,4 +308,14 @@ nvkmd_rm_binary_sync_type_init(struct vk_sync_binary_type *binary,
+    *binary = vk_sync_binary_get_type(timeline);
+    assert(timeline->size == sizeof(struct nvkmd_rm_sync));
+    binary->sync.move = nvkmd_rm_binary_move;
++
++   /* vk_sync_binary's sync_file "export" is a CPU wait that hands out -1,
++    * and its import takes nothing but -1.  Advertised, it makes the WSI
++    * believe it can move real sync_files between our syncs and dma-bufs
++    * (DMA_BUF_IOCTL_EXPORT/IMPORT_SYNC_FILE), and the first acquire fails
++    * with VK_ERROR_INVALID_EXTERNAL_HANDLE.  Without it the WSI asks for
++    * implicit sync, which nvk_wsi.c turns into a wait before presenting.
++    */
++   binary->sync.import_sync_file = NULL;
++   binary->sync.export_sync_file = NULL;
+ }
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+index 0cb7175..9123690 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -362,6 +362,49 @@ typedef struct NV0000_CTRL_GPU_GET_PCI_INFO_PARAMS {
+    NvU16 slot;
+ } NV0000_CTRL_GPU_GET_PCI_INFO_PARAMS;
+ 
++/* ctrl0000unix.h: hand an RM object to another client through a file
++ * descriptor (a fresh /dev/nvidiactl open).  This is how memory reaches
++ * nvidia-drm (DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY) and comes back from it
++ * (DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY).
++ */
++#define NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD   (0x3d05U)
++#define NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD (0x3d06U)
++#define NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM     1
++typedef struct NV0000_CTRL_OS_UNIX_EXPORT_OBJECT {
++   NvU32 type;
++   struct {
++      NvHandle hDevice;
++      NvHandle hParent;
++      NvHandle hObject;
++   } rmObject;
++} NV0000_CTRL_OS_UNIX_EXPORT_OBJECT;
++
++typedef struct NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS {
++   NV0000_CTRL_OS_UNIX_EXPORT_OBJECT object;
++   NvS32 fd;
++   NvU32 flags;
++} NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS;
++
++typedef struct NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS {
++   NvS32 fd;
++   NV0000_CTRL_OS_UNIX_EXPORT_OBJECT object;
++} NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS;
++
++/* ctrl0041.h: where a memory object lives (used for imported memory) */
++#define NV0041_CTRL_CMD_GET_SURFACE_INFO               (0x410110U)
++#define NV0041_CTRL_SURFACE_INFO_INDEX_ADDR_SPACE_TYPE 9
++#define NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE_SYSMEM 1
++#define NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE_VIDMEM 2
++typedef struct NV0041_CTRL_SURFACE_INFO {
++   NvU32 index;
++   NvU32 data;
++} NV0041_CTRL_SURFACE_INFO;
++
++typedef struct NV0041_CTRL_GET_SURFACE_INFO_PARAMS {
++   NvU32 surfaceInfoListSize;
++   NvU64 surfaceInfoList NVRM_ALIGN8; /* NvP64 */
++} NV0041_CTRL_GET_SURFACE_INFO_PARAMS;
++
+ /* ctrl0080gpu.h */
+ #define NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2      (0x800292)
+ #define NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE        200
+@@ -515,6 +558,70 @@ typedef struct NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS {
+ #define NVRM_GPFIFO_SEM_EXECUTE_PAYLOAD_SIZE              24:24
+ #define NVRM_GPFIFO_SEM_EXECUTE_PAYLOAD_SIZE_64BIT        0x00000001
+ 
++/*
++ * nvidia-drm (kernel-open/nvidia-drm/nvidia-drm-ioctl.h) and the NVKMS
++ * parameter blocks its GEM import/export take
++ * (src/nvidia-modeset/kapi/interface/nvkms-kapi-private.h).  A GEM object
++ * made from RM memory this way is a normal DRM object: PRIME turns it into a
++ * dma-buf, and NVIDIA's EGL/GBM (or another NVK) take it back to RM memory
++ * with GEM_EXPORT_NVKMS_MEMORY.
++ */
++#define NVRM_DRM_NVIDIA_GET_DEV_INFO              0x03
++#define NVRM_DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY   0x01
++#define NVRM_DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY   0x09
++
++struct nvrm_drm_nvidia_get_dev_info_params {
++   uint32_t gpu_id;
++   uint32_t mig_device;
++   uint32_t primary_index;
++   uint32_t supports_alloc;
++   uint32_t generic_page_kind;
++   uint32_t page_kind_generation;
++   uint32_t sector_layout;
++   uint32_t supports_sync_fd;
++   uint32_t supports_semsurf;
++};
++
++struct nvrm_drm_nvidia_gem_import_nvkms_memory_params {
++   uint64_t mem_size;
++   uint64_t nvkms_params_ptr;
++   uint64_t nvkms_params_size;
++   uint32_t handle;
++   uint32_t __pad;
++};
++
++struct nvrm_drm_nvidia_gem_export_nvkms_memory_params {
++   uint32_t handle;
++   uint32_t __pad;
++   uint64_t nvkms_params_ptr;
++   uint64_t nvkms_params_size;
++};
++
++#define NVRM_NVKMS_SURFACE_MEMORY_LAYOUT_BLOCK_LINEAR 0
++#define NVRM_NVKMS_SURFACE_MEMORY_LAYOUT_PITCH        1
++
++struct nvrm_nvkms_kapi_priv_surface_params {
++   uint32_t layout; /* enum NvKmsSurfaceMemoryLayout */
++   struct {
++      struct {
++         NvU32 x;
++         NvU32 y;
++         NvU32 z;
++      } log2GobsPerBlock;
++      NvU32 pitchInBlocks;
++      NvBool genericMemory;
++   } blockLinear;
++};
++
++struct nvrm_nvkms_kapi_priv_import_memory_params {
++   int memFd;
++   struct nvrm_nvkms_kapi_priv_surface_params surfaceParams;
++};
++
++struct nvrm_nvkms_kapi_priv_export_memory_params {
++   int memFd;
++};
++
+ /* USERD layout (Nvc36fControl .. Nvca6fControl) */
+ #define NVRM_USERD_GP_GET                         0x88
+ #define NVRM_USERD_GP_PUT                         0x8c
+@@ -547,5 +654,13 @@ static_assert(sizeof(NVA06F_CTRL_BIND_PARAMS) == 4, "BIND");
+ static_assert(sizeof(NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS) == 4, "GET_WORK_SUBMIT_TOKEN");
+ static_assert(sizeof(NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS) == 4, "SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX");
+ static_assert(sizeof(NvNotification) == 16, "NvNotification");
++static_assert(sizeof(NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS) == 24, "OS_UNIX_EXPORT_OBJECT_TO_FD");
++static_assert(sizeof(NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS) == 20, "OS_UNIX_IMPORT_OBJECT_FROM_FD");
++static_assert(sizeof(NV0041_CTRL_GET_SURFACE_INFO_PARAMS) == 16, "GET_SURFACE_INFO");
++static_assert(sizeof(struct nvrm_drm_nvidia_get_dev_info_params) == 36, "drm GET_DEV_INFO");
++static_assert(sizeof(struct nvrm_drm_nvidia_gem_import_nvkms_memory_params) == 32, "drm GEM_IMPORT_NVKMS_MEMORY");
++static_assert(sizeof(struct nvrm_drm_nvidia_gem_export_nvkms_memory_params) == 24, "drm GEM_EXPORT_NVKMS_MEMORY");
++static_assert(sizeof(struct nvrm_nvkms_kapi_priv_import_memory_params) == 28, "NvKmsKapiPrivImportMemoryParams");
++static_assert(sizeof(struct nvrm_nvkms_kapi_priv_export_memory_params) == 4, "NvKmsKapiPrivExportMemoryParams");
+ 
+ #endif /* NVRM_API_H */
+-- 
+2.43.0
+

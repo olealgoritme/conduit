@@ -253,6 +253,7 @@ impl NvidiaBackend {
         self.vidmem_note(payload, &mut resp_buf[..n]);
         self.note_clients(payload, &resp_buf[..n]);
         self.note_registrations(payload, &resp_buf[..n]);
+        self.note_os_events(payload, &resp_buf[..n]);
         n
     }
 
@@ -677,6 +678,19 @@ impl NvidiaBackend {
             NV_ESC_REGISTER_FD | NV_ESC_ALLOC_OS_EVENT | NV_ESC_FREE_OS_EVENT => {
                 self.dispatch_fd_carrying(cookie, host_fd, request, escape, param_in, resp_buf)
             }
+
+            // Reads one queued notification through a pointer to an
+            // NvUnixEvent, which the guest sends as the nested block.
+            NV_ESC_RM_GET_EVENT_DATA => self.dispatch_get_event_data(
+                cookie,
+                host_fd,
+                request,
+                ireq.data_len,
+                ireq.nested_len,
+                ireq.deep_len,
+                param_in,
+                resp_buf,
+            ),
 
             NV_ESC_RM_ALLOC_MEMORY => {
                 // The older of the two allocation escapes, and it carries its

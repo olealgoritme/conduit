@@ -32,6 +32,7 @@ conduit/
 │   ├── agent/     Python. conduit-clipboard-agent: the desktop session's
 │   │              clipboard <-> /dev/conduit-clipboard.
 │   ├── tests/     Small in-guest test programs (CUDA memory).
+│   ├── rmclient/  C. librmclient (MIT): RM client library for user-mode drivers (NVK).
 │   └── windows/   Helios-derived Windows guest components (guest/windows/HELIOS.md):
 │                  kmd_render/ + kmd_logic/ (WDDM KMD), protocol/ (escape ABI),
 │                  umd/, umd12/, umd_common/ (D3D11/D3D12 UMDs), icd/ (Mesa

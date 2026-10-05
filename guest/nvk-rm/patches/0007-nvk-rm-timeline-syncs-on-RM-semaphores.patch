@@ -1,0 +1,495 @@
+From 8aa0d7d39849735c18673b10a9edc296ecf30f64 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 5 Oct 2026 21:32:03 +0200
+Subject: [PATCH 07/13] nvk/rm: timeline syncs on RM semaphores
+
+A vk_sync is a 64-bit value in a per-device pool of GPU-visible,
+CPU-cached system memory (our own pages, 64 KiB chunks).  The physical
+device exposes it as its timeline type, plus Mesa's vk_sync_binary on top
+for binary semaphores and fences.
+
+  - GPU signal: host SEM_EXECUTE release (64-bit payload, RELEASE_WFI)
+    followed by NON_STALL_INTERRUPT, emitted in the context's push slots
+    after the submit, then GP_PUT and the doorbell.
+  - GPU wait: SEM_EXECUTE ACQ_STRICT_GEQ with ACQUIRE_SWITCH_TSG, emitted
+    before the next push.  Values already reached are skipped.
+  - CPU signal: store; CPU wait/get_value: read, spin briefly, then
+    poll() the non-stall interrupt event (or sleep with backoff).
+  - WAIT_PENDING: a per-sync "highest submitted signal" value.
+  - Bind contexts wait and signal on the CPU.
+
+WAIT_BEFORE_SIGNAL is not advertised, so the runtime runs in assisted
+timeline mode and holds back submits that wait on unsubmitted values,
+rather than leaving a GPU acquire spinning on a value nobody submitted.
+Export/import (sync_file, opaque fd) is not supported yet: that needs an
+RM semaphore surface bridged to DRM syncobjs through nvidia-drm.
+
+---
+ src/nouveau/vulkan/meson.build              |   1 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c  | 105 ++++++--
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  |   7 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c |   7 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c | 254 ++++++++++++++++++++
+ 5 files changed, 356 insertions(+), 18 deletions(-)
+ create mode 100644 src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+
+diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
+index 8f31d1f..1df0b8f 100644
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -296,6 +296,7 @@ if not get_option('nvk-rm').disabled()
+     'nvkmd/rm/nvkmd_rm_lib.c',
+     'nvkmd/rm/nvkmd_rm_mem.c',
+     'nvkmd/rm/nvkmd_rm_pdev.c',
++    'nvkmd/rm/nvkmd_rm_sync.c',
+     'nvkmd/rm/nvkmd_rm_va.c',
+     'nvkmd/rm/nvrm/nvrm_api.h',
+   )
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index 86c0c05..2cb85f5 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -320,11 +320,42 @@ nvkmd_rm_exec_ctx_wait(struct nvkmd_ctx *_ctx,
+                        uint32_t wait_count,
+                        const struct vk_sync_wait *waits)
+ {
+-   if (wait_count == 0)
+-      return VK_SUCCESS;
++   struct nvkmd_rm_exec_ctx *ctx = nvkmd_rm_exec_ctx(_ctx);
++
++   for (uint32_t i = 0; i < wait_count; i++) {
++      struct nvkmd_rm_sync *sync = nvkmd_rm_sync(waits[i].sync);
++      const uint64_t value = waits[i].wait_value;
++
++      if (sync->dev == NULL) {
++         /* CPU-only sync (created before any queue existed): the GPU can't
++          * see it, so wait for it here.
++          */
++         VkResult result =
++            nvkmd_rm_wait_value(nvkmd_rm_dev(ctx->base.dev), sync->value,
++                                value, UINT64_MAX);
++         if (result != VK_SUCCESS)
++            return result;
++         continue;
++      }
++
++      /* Already signaled: nothing to do */
++      if (*sync->value >= value)
++         continue;
+ 
+-   return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
+-                    "NVK on RM: syncs are not implemented yet");
++      if (ctx->pending_op_count >= NVKMD_RM_MAX_PENDING_OPS) {
++         VkResult result = emit_pending_waits(ctx, log_obj);
++         if (result != VK_SUCCESS)
++            return result;
++      }
++
++      ctx->pending_ops[ctx->pending_op_count++] = (struct nvkmd_rm_sem_op) {
++         .gpu_va = sync->gpu_va,
++         .value = value,
++         .release = false,
++      };
++   }
++
++   return VK_SUCCESS;
+ }
+ 
+ static VkResult
+@@ -333,12 +364,45 @@ nvkmd_rm_exec_ctx_signal(struct nvkmd_ctx *_ctx,
+                          uint32_t signal_count,
+                          const struct vk_sync_signal *signals)
+ {
+-   if (signal_count > 0) {
+-      return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
+-                       "NVK on RM: syncs are not implemented yet");
++   struct nvkmd_rm_exec_ctx *ctx = nvkmd_rm_exec_ctx(_ctx);
++   VkResult result;
++
++   result = emit_pending_waits(ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   for (uint32_t i = 0; i < signal_count;) {
++      struct nvkmd_rm_sem_op ops[16];
++      uint32_t op_count = 0;
++      for (; i < signal_count && op_count < ARRAY_SIZE(ops); i++) {
++         struct nvkmd_rm_sync *sync = nvkmd_rm_sync(signals[i].sync);
++         if (sync->dev == NULL) {
++            return vk_errorf(log_obj, VK_ERROR_UNKNOWN,
++                             "GPU signal of a CPU-only sync");
++         }
++
++         ops[op_count++] = (struct nvkmd_rm_sem_op) {
++            .gpu_va = sync->gpu_va,
++            .value = signals[i].signal_value,
++            .release = true,
++         };
++      }
++
++      result = emit_sem_ops(ctx, log_obj, op_count, ops);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   result = nvkmd_rm_exec_ctx_flush(&ctx->base, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   for (uint32_t i = 0; i < signal_count; i++) {
++      nvkmd_rm_sync_mark_pending(nvkmd_rm_sync(signals[i].sync),
++                                 signals[i].signal_value);
+    }
+ 
+-   return nvkmd_rm_exec_ctx_flush(_ctx, log_obj);
++   return VK_SUCCESS;
+ }
+ 
+ static VkResult
+@@ -614,11 +678,17 @@ nvkmd_rm_bind_ctx_wait(struct nvkmd_ctx *_ctx,
+                        uint32_t wait_count,
+                        const struct vk_sync_wait *waits)
+ {
+-   if (wait_count == 0)
+-      return VK_SUCCESS;
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_ctx->dev);
++
++   for (uint32_t i = 0; i < wait_count; i++) {
++      struct nvkmd_rm_sync *sync = nvkmd_rm_sync(waits[i].sync);
++      VkResult result = nvkmd_rm_wait_value(dev, sync->value,
++                                            waits[i].wait_value, UINT64_MAX);
++      if (result != VK_SUCCESS)
++         return result;
++   }
+ 
+-   return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
+-                    "NVK on RM: syncs are not implemented yet");
++   return VK_SUCCESS;
+ }
+ 
+ static VkResult
+@@ -653,11 +723,14 @@ nvkmd_rm_bind_ctx_signal(struct nvkmd_ctx *_ctx,
+                          uint32_t signal_count,
+                          const struct vk_sync_signal *signals)
+ {
+-   if (signal_count == 0)
+-      return VK_SUCCESS;
++   for (uint32_t i = 0; i < signal_count; i++) {
++      struct nvkmd_rm_sync *sync = nvkmd_rm_sync(signals[i].sync);
++      nvkmd_rm_sync_mark_pending(sync, signals[i].signal_value);
++      __atomic_thread_fence(__ATOMIC_SEQ_CST);
++      *sync->value = signals[i].signal_value;
++   }
+ 
+-   return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
+-                    "NVK on RM: syncs are not implemented yet");
++   return VK_SUCCESS;
+ }
+ 
+ static VkResult
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 0169448..fb42f97 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -195,6 +195,10 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+    util_vma_heap_init(&dev->replay_heap, NVKMD_RM_REPLAY_HEAP_START,
+                       NVKMD_RM_REPLAY_HEAP_END - NVKMD_RM_REPLAY_HEAP_START);
+ 
++   simple_mtx_init(&dev->sema_pool.mutex, mtx_plain);
++   dev->sema_pool.chunks = UTIL_DYNARRAY_INIT;
++   dev->sema_pool.free_slots = UTIL_DYNARRAY_INIT;
++
+    *dev_out = &dev->base;
+ 
+    return VK_SUCCESS;
+@@ -218,6 +222,9 @@ nvkmd_rm_dev_destroy(struct nvkmd_dev *_dev)
+    struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
+    const struct nvkmd_rm_lib *lib = dev->lib;
+ 
++   /* Frees memory, so it needs the heaps and the client */
++   nvkmd_rm_sema_pool_finish(dev);
++
+    util_vma_heap_finish(&dev->heap);
+    util_vma_heap_finish(&dev->replay_heap);
+    simple_mtx_destroy(&dev->heap_mutex);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index 028c378..b4622cf 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -355,8 +355,11 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+    pdev->base.drm.render_dev = 0;
+    pdev->base.drm.primary_dev = 0;
+ 
+-   /* No sync types yet */
+-   pdev->sync_types[0] = NULL;
++   pdev->sync_type = nvkmd_rm_sync_get_type();
++   pdev->binary_sync_type = vk_sync_binary_get_type(&pdev->sync_type);
++   pdev->sync_types[0] = &pdev->sync_type;
++   pdev->sync_types[1] = &pdev->binary_sync_type.sync;
++   pdev->sync_types[2] = NULL;
+    pdev->base.sync_types = pdev->sync_types;
+ 
+    if (debug_flags & NVK_DEBUG_VM) {
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+new file mode 100644
+index 0000000..e995548
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+@@ -0,0 +1,254 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_rm.h"
++
++#include "../../nvk_device.h"
++
++#include "util/os_time.h"
++#include "vk_log.h"
++
++/*
++ * Timeline syncs
++ *
++ * A sync is a 64-bit value in GPU-visible, CPU-cached system memory (a slot
++ * in the device's semaphore pool).  The GPU signals it with a host
++ * semaphore release and waits on it with a semaphore acquire
++ * (nvkmd_rm_ctx.c); the CPU reads and writes it directly.  Binary
++ * semaphores and fences use Mesa's vk_sync_binary on top.
++ *
++ * CPU waits poll the value, blocking on the RM non-stall interrupt event
++ * when there is one (nvkmd_rm_wait_step()).
++ *
++ * Not done yet (see the README): exporting/importing (sync_file, opaque
++ * fd), which needs an RM semaphore surface (NV_SEMAPHORE_SURFACE) bridged
++ * to DRM syncobjs through nvidia-drm, and WAIT_BEFORE_SIGNAL (GPU acquires
++ * on values nobody has submitted yet are avoided until the channel's
++ * acquire timeout behaviour is known; the runtime's submit thread holds
++ * such submits back instead).
++ */
++
++#define NVKMD_RM_SEMA_CHUNK_SIZE  (64u << 10)
++#define NVKMD_RM_SEMA_SLOT_SIZE   8u
++#define NVKMD_RM_SEMA_PER_CHUNK   (NVKMD_RM_SEMA_CHUNK_SIZE / \
++                                   NVKMD_RM_SEMA_SLOT_SIZE)
++
++VkResult
++nvkmd_rm_sema_pool_alloc(struct nvkmd_rm_dev *dev,
++                         struct vk_object_base *log_obj,
++                         uint32_t *slot_out,
++                         volatile uint64_t **cpu_out,
++                         uint64_t *gpu_va_out)
++{
++   struct nvkmd_rm_sema_pool *pool = &dev->sema_pool;
++   VkResult result = VK_SUCCESS;
++
++   simple_mtx_lock(&pool->mutex);
++
++   if (util_dynarray_num_elements(&pool->free_slots, uint32_t) == 0) {
++      struct nvkmd_mem *chunk;
++      result = nvkmd_dev_alloc_mapped_mem(&dev->base, log_obj,
++                                          NVKMD_RM_SEMA_CHUNK_SIZE, 0,
++                                          NVKMD_MEM_GART,
++                                          NVKMD_MEM_MAP_RDWR, &chunk);
++      if (result != VK_SUCCESS)
++         goto out;
++
++      memset(chunk->map, 0, NVKMD_RM_SEMA_CHUNK_SIZE);
++
++      const uint32_t chunk_idx =
++         util_dynarray_num_elements(&pool->chunks, struct nvkmd_mem *);
++      util_dynarray_append(&pool->chunks, chunk);
++
++      /* Push in reverse so slots are handed out in address order */
++      for (uint32_t i = NVKMD_RM_SEMA_PER_CHUNK; i-- > 0;) {
++         const uint32_t slot = chunk_idx * NVKMD_RM_SEMA_PER_CHUNK + i;
++         util_dynarray_append(&pool->free_slots, slot);
++      }
++   }
++
++   const uint32_t slot = util_dynarray_pop(&pool->free_slots, uint32_t);
++   struct nvkmd_mem *chunk =
++      *util_dynarray_element(&pool->chunks, struct nvkmd_mem *,
++                             slot / NVKMD_RM_SEMA_PER_CHUNK);
++   const uint32_t offset_B =
++      (slot % NVKMD_RM_SEMA_PER_CHUNK) * NVKMD_RM_SEMA_SLOT_SIZE;
++
++   *slot_out = slot;
++   *cpu_out = (volatile uint64_t *)((uint8_t *)chunk->map + offset_B);
++   *gpu_va_out = chunk->va->addr + offset_B;
++
++out:
++   simple_mtx_unlock(&pool->mutex);
++   return result;
++}
++
++void
++nvkmd_rm_sema_pool_free(struct nvkmd_rm_dev *dev, uint32_t slot)
++{
++   struct nvkmd_rm_sema_pool *pool = &dev->sema_pool;
++
++   simple_mtx_lock(&pool->mutex);
++   util_dynarray_append(&pool->free_slots, slot);
++   simple_mtx_unlock(&pool->mutex);
++}
++
++void
++nvkmd_rm_sema_pool_finish(struct nvkmd_rm_dev *dev)
++{
++   struct nvkmd_rm_sema_pool *pool = &dev->sema_pool;
++
++   util_dynarray_foreach(&pool->chunks, struct nvkmd_mem *, chunk)
++      nvkmd_mem_unref(*chunk);
++   util_dynarray_fini(&pool->chunks);
++   util_dynarray_fini(&pool->free_slots);
++   simple_mtx_destroy(&pool->mutex);
++}
++
++void
++nvkmd_rm_sync_mark_pending(struct nvkmd_rm_sync *sync, uint64_t value)
++{
++   uint64_t old = p_atomic_read(&sync->pending);
++   while (old < value) {
++      const uint64_t prev = p_atomic_cmpxchg(&sync->pending, old, value);
++      if (prev == old)
++         break;
++      old = prev;
++   }
++}
++
++/* The nvkmd device behind a vk_device, if it has one (devices created
++ * without queues have none).
++ */
++static struct nvkmd_rm_dev *
++vk_device_to_rm_dev(struct vk_device *vk_dev)
++{
++   struct nvk_device *dev = container_of(vk_dev, struct nvk_device, vk);
++   return dev->nvkmd != NULL ? nvkmd_rm_dev(dev->nvkmd) : NULL;
++}
++
++VkResult
++nvkmd_rm_sync_init(struct vk_device *device,
++                   struct vk_sync *_sync,
++                   uint64_t initial_value)
++{
++   struct nvkmd_rm_sync *sync = nvkmd_rm_sync(_sync);
++   struct nvkmd_rm_dev *dev = vk_device_to_rm_dev(device);
++
++   if (dev != NULL) {
++      VkResult result = nvkmd_rm_sema_pool_alloc(dev, &device->base,
++                                                 &sync->slot, &sync->value,
++                                                 &sync->gpu_va);
++      if (result != VK_SUCCESS)
++         return result;
++      sync->dev = dev;
++   } else {
++      /* No GPU can signal or wait on it; CPU-only */
++      sync->dev = NULL;
++      sync->value = &sync->cpu_only_value;
++      sync->gpu_va = 0;
++   }
++
++   *sync->value = initial_value;
++   sync->pending = initial_value;
++
++   return VK_SUCCESS;
++}
++
++static void
++nvkmd_rm_sync_finish(struct vk_device *device, struct vk_sync *_sync)
++{
++   struct nvkmd_rm_sync *sync = nvkmd_rm_sync(_sync);
++
++   if (sync->dev != NULL)
++      nvkmd_rm_sema_pool_free(sync->dev, sync->slot);
++}
++
++static VkResult
++nvkmd_rm_sync_signal(struct vk_device *device, struct vk_sync *_sync,
++                     uint64_t value)
++{
++   struct nvkmd_rm_sync *sync = nvkmd_rm_sync(_sync);
++
++   nvkmd_rm_sync_mark_pending(sync, value);
++   __atomic_thread_fence(__ATOMIC_SEQ_CST);
++   *sync->value = value;
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_rm_sync_get_value(struct vk_device *device, struct vk_sync *_sync,
++                        uint64_t *value)
++{
++   struct nvkmd_rm_sync *sync = nvkmd_rm_sync(_sync);
++
++   *value = p_atomic_read(sync->value);
++
++   return VK_SUCCESS;
++}
++
++static bool
++wait_satisfied(const struct vk_sync_wait *wait,
++               enum vk_sync_wait_flags wait_flags)
++{
++   struct nvkmd_rm_sync *sync = nvkmd_rm_sync(wait->sync);
++
++   if (wait_flags & VK_SYNC_WAIT_PENDING)
++      return p_atomic_read(&sync->pending) >= wait->wait_value;
++   else
++      return p_atomic_read(sync->value) >= wait->wait_value;
++}
++
++static VkResult
++nvkmd_rm_sync_wait_many(struct vk_device *device,
++                        uint32_t wait_count,
++                        const struct vk_sync_wait *waits,
++                        enum vk_sync_wait_flags wait_flags,
++                        uint64_t abs_timeout_ns)
++{
++   struct nvkmd_rm_dev *dev = vk_device_to_rm_dev(device);
++   uint32_t iter = 0;
++
++   while (true) {
++      bool all = true, any = false;
++      for (uint32_t i = 0; i < wait_count; i++) {
++         if (wait_satisfied(&waits[i], wait_flags))
++            any = true;
++         else
++            all = false;
++      }
++
++      if ((wait_flags & VK_SYNC_WAIT_ANY) ? any : all)
++         return VK_SUCCESS;
++
++      VkResult result = nvkmd_rm_wait_step(dev, &iter, abs_timeout_ns);
++      if (result != VK_SUCCESS)
++         return result;
++
++      if (vk_device_is_lost(device))
++         return VK_ERROR_DEVICE_LOST;
++   }
++}
++
++struct vk_sync_type
++nvkmd_rm_sync_get_type(void)
++{
++   return (struct vk_sync_type) {
++      .size = sizeof(struct nvkmd_rm_sync),
++      .features = VK_SYNC_FEATURE_TIMELINE |
++                  VK_SYNC_FEATURE_GPU_WAIT |
++                  VK_SYNC_FEATURE_GPU_MULTI_WAIT |
++                  VK_SYNC_FEATURE_CPU_WAIT |
++                  VK_SYNC_FEATURE_CPU_SIGNAL |
++                  VK_SYNC_FEATURE_WAIT_ANY |
++                  VK_SYNC_FEATURE_WAIT_PENDING,
++      .init = nvkmd_rm_sync_init,
++      .finish = nvkmd_rm_sync_finish,
++      .signal = nvkmd_rm_sync_signal,
++      .get_value = nvkmd_rm_sync_get_value,
++      .wait_many = nvkmd_rm_sync_wait_many,
++   };
++}
+-- 
+2.43.0
+

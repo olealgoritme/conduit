@@ -1,0 +1,80 @@
+From eb12ff0189b065cd4c87a6fe26255016e94755b4 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 5 Oct 2026 23:12:10 +0200
+Subject: [PATCH 12/13] vulkan/wsi, nvk: wait for rendering before presenting
+ without implicit sync
+
+A native (dma-buf) WSI image is ordered against the window system's
+reads by implicit sync in the kernel, by a sync_file the WSI attaches to
+the dma-buf, or by explicit sync.  NVK's RM backend has none of them:
+RM does not attach fences to dma-bufs and its syncs cannot become
+sync_files yet.
+
+Add wsi_device::wait_before_present: the present then waits on the CPU
+for the image's present fence before handing the image over, as the
+software path already does (only for images without explicit sync or a
+dma-buf semaphore).  NVK sets it when the backend has dma-bufs but its
+sync type cannot export sync_files, i.e. for RM; nothing changes for
+nouveau.
+
+---
+ src/nouveau/vulkan/nvk_wsi.c | 8 ++++++++
+ src/vulkan/wsi/wsi_common.c  | 4 +++-
+ src/vulkan/wsi/wsi_common.h  | 7 +++++++
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
+index c5c3a54..8a6f7da 100644
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -39,6 +39,14 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
+    pdev->wsi_device.supports_modifiers =
+       pdev->vk.supported_extensions.table.EXT_image_drm_format_modifier;
+ 
++   /* A backend whose syncs cannot become sync_files (RM) has nothing to
++    * order a compositor's reads after our rendering: wait for it before
++    * presenting.  nouveau's syncobjs can, and its kernel syncs implicitly.
++    */
++   pdev->wsi_device.wait_before_present =
++      pdev->nvkmd->kmd_info.has_dma_buf &&
++      pdev->nvkmd->sync_types[0]->export_sync_file == NULL;
++
+    pdev->vk.wsi_device = &pdev->wsi_device;
+ 
+    return result;
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index f40f078..a4841aa 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -2886,7 +2886,9 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+ #endif
+       }
+ 
+-      if (wsi->sw) {
++      if (wsi->sw ||
++          (wsi->wait_before_present && !swapchain->image_info.explicit_sync &&
++           swapchain->dma_buf_semaphore == VK_NULL_HANDLE)) {
+          wsi->WaitForFences(vk_device_to_handle(dev),
+                             1, &swapchain->fences[image_index], true, ~0ull);
+       }
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index cfb921d..5677eec 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -165,6 +165,13 @@ struct wsi_device {
+ 
+    bool sw;
+ 
++   /* Set by drivers whose native (dma-buf) images have neither implicit
++    * sync nor a sync_file the WSI could attach to the dma-buf: the present
++    * then waits on the CPU for the image's rendering to finish before the
++    * image is handed to the window system, as the software path does.
++    */
++   bool wait_before_present;
++
+    /* Set to true if the implementation is ok with linear WSI images. */
+    bool wants_linear;
+ 
+-- 
+2.43.0
+
