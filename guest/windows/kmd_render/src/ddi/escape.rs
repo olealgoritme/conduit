@@ -1588,17 +1588,18 @@ fn escape_submit_venus_batch(
         Err(st) => return st,
     };
     let head = wire.read();
-    ctrl::count_submit_escape();
     if head.flags != 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    // Capability probe: an up-to-date KMD acknowledges and does nothing.
+    // Capability probe: an up-to-date KMD acknowledges and does nothing. It is
+    // not a submission, so it is not counted in `EscCalls`.
     if head.count == 0 {
         return STATUS_SUCCESS;
     }
     if head.count > HELIOS_SUBMIT_BATCH_MAX_ENTRIES {
         return STATUS_INVALID_PARAMETER;
     }
+    ctrl::count_submit_escape();
     let count = head.count as usize;
     let entry_size = size_of::<HeliosSubmitBatchEntry>();
     let tail = wire.trailing_mut();
@@ -1615,7 +1616,7 @@ fn escape_submit_venus_batch(
     for i in 0..count {
         let e: HeliosSubmitBatchEntry =
             pod_read_unaligned(&table[i * entry_size..(i + 1) * entry_size]);
-        if e.buffer_size == 0 {
+        if e.buffer_size == 0 || e.reserved != 0 {
             return STATUS_INVALID_PARAMETER;
         }
         total = match total.checked_add(e.buffer_size as usize) {
@@ -1638,6 +1639,17 @@ fn escape_submit_venus_batch(
             offset += len;
             continue;
         }
+        // In range by the validation pass above; checked again because this pass
+        // re-reads the entry from the caller's buffer.
+        let Some(stream) = offset
+            .checked_add(len)
+            .and_then(|end| streams.get(offset..end))
+        else {
+            e.out_status = STATUS_INVALID_PARAMETER;
+            failed = true;
+            table[slot].copy_from_slice(bytes_of(&e));
+            continue;
+        };
         let queued = submit_one(
             passive,
             adapter,
@@ -1646,7 +1658,7 @@ fn escape_submit_venus_batch(
             e.ring_idx,
             e.fence_id,
             e.present_value32,
-            &streams[offset..offset + len],
+            stream,
         );
         offset += len;
         match queued {
