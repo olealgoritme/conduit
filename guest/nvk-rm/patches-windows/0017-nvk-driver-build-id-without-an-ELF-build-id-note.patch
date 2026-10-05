@@ -1,0 +1,64 @@
+From 178673f62c94e9d7d61265942f9a865d87da32d6 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 00:19:52 +0200
+Subject: [PATCH 17/20] nvk: driver build id without an ELF build-id note
+
+PE binaries have no NT_GNU_BUILD_ID. Without dl_iterate_phdr (Windows),
+hash the Mesa version with disk_cache_get_function_identifier(), which is
+the module timestamp on Windows, as dozen does. Linux is unchanged.
+---
+ src/nouveau/vulkan/nvk_instance.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvk_instance.c b/src/nouveau/vulkan/nvk_instance.c
+index 2db0c8a..71cc04a 100644
+--- a/src/nouveau/vulkan/nvk_instance.c
++++ b/src/nouveau/vulkan/nvk_instance.c
+@@ -10,8 +10,10 @@
+ 
+ #include "vulkan/wsi/wsi_common.h"
+ 
++#include "git_sha1.h"
+ #include "util/build_id.h"
+ #include "util/detect_os.h"
++#include "util/disk_cache.h"
+ #include "util/mesa-blake3.h"
+ #include "util/os_misc.h"
+ #include "util/u_debug.h"
+@@ -166,6 +168,7 @@ nvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+       nvk_create_drm_physical_device;
+    instance->vk.physical_devices.destroy = nvk_physical_device_destroy;
+ 
++#ifdef HAVE_DL_ITERATE_PHDR
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(nvk_CreateInstance);
+    if (!note) {
+@@ -183,6 +186,25 @@ nvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+ 
+    STATIC_ASSERT(sizeof(instance->driver_build_sha) == BLAKE3_KEY_LEN);
+    copy_build_id_to_sha1(instance->driver_build_sha, note);
++#else
++   /* No ELF build-id (Windows): the Mesa version plus what the OS says
++    * about the module this function lives in (its timestamp on Windows).
++    */
++   {
++      static const char mesa_version[] = PACKAGE_VERSION MESA_GIT_SHA1;
++      blake3_hasher blake3_ctx;
++      _mesa_blake3_init(&blake3_ctx);
++      _mesa_blake3_update(&blake3_ctx, mesa_version, strlen(mesa_version));
++      if (!disk_cache_get_function_identifier(nvk_CreateInstance,
++                                              &blake3_ctx)) {
++         result = vk_errorf(NULL, VK_ERROR_INITIALIZATION_FAILED,
++                            "Failed to identify the driver build");
++         goto fail_init;
++      }
++      STATIC_ASSERT(sizeof(instance->driver_build_sha) == BLAKE3_KEY_LEN);
++      _mesa_blake3_final(&blake3_ctx, instance->driver_build_sha);
++   }
++#endif
+ 
+    *pInstance = nvk_instance_to_handle(instance);
+    return VK_SUCCESS;
+-- 
+2.43.0
+

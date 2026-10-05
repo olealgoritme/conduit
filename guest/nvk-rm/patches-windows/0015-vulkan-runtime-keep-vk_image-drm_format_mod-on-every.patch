@@ -1,0 +1,57 @@
+From 1d2ebf9738da0501a463b4a74f66e866484c6fb9 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 00:19:51 +0200
+Subject: [PATCH 15/20] vulkan/runtime: keep vk_image::drm_format_mod on every
+ OS
+
+The field was only there on Linux and BSD. NVK shares its image code
+between Linux and Windows (with the RM backend) and reads and writes the
+modifier in many places; with the field always present (and always
+initialized to DRM_FORMAT_MOD_INVALID) that code needs no #ifdefs. Only
+Linux and BSD ever set a real modifier; vk_common_GetImageDrmFormat-
+ModifierPropertiesEXT stays Linux/BSD only.
+---
+ src/vulkan/runtime/vk_image.c | 5 +++--
+ src/vulkan/runtime/vk_image.h | 2 --
+ 2 files changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/src/vulkan/runtime/vk_image.c b/src/vulkan/runtime/vk_image.c
+index 1813634..e959699 100644
+--- a/src/vulkan/runtime/vk_image.c
++++ b/src/vulkan/runtime/vk_image.c
+@@ -111,9 +111,10 @@ vk_image_init(struct vk_device *device,
+       vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
+    image->wsi_legacy_scanout = wsi_info && wsi_info->scanout;
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++   /* Present on every OS so that drivers sharing code with Linux (NVK on
++    * Windows) need no #ifdefs; only Linux and BSD ever set a real modifier.
++    */
+    image->drm_format_mod = ((1ULL << 56) - 1) /* DRM_FORMAT_MOD_INVALID */;
+-#endif
+ 
+ #ifdef VK_USE_PLATFORM_ANDROID_KHR
+    if (image->external_handle_types &
+diff --git a/src/vulkan/runtime/vk_image.h b/src/vulkan/runtime/vk_image.h
+index f560519..c3de4b7 100644
+--- a/src/vulkan/runtime/vk_image.h
++++ b/src/vulkan/runtime/vk_image.h
+@@ -77,7 +77,6 @@ struct vk_image {
+    /* wsi_image_create_info::scanout */
+    bool wsi_legacy_scanout;
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
+    /* VK_EXT_drm_format_modifier
+     *
+     * Initialized by vk_image_create/init() to DRM_FORMAT_MOD_INVALID.  It's
+@@ -88,7 +87,6 @@ struct vk_image {
+     * VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT.
+     */
+    uint64_t drm_format_mod;
+-#endif
+ 
+ #ifdef VK_USE_PLATFORM_ANDROID_KHR
+    enum android_buffer_type android_buffer_type;
+-- 
+2.43.0
+

@@ -1,0 +1,100 @@
+From 8894ccbac24b7b0c29249ff14a2a4b1393bc29a5 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 00:19:52 +0200
+Subject: [PATCH 16/20] nvk: build without libelf on Windows (no CUDA modules)
+
+libelf is only used to parse CUDA cubins (nv_cubin.c), and there is no
+libelf for MinGW. On Windows NVK builds without it and nv_cubin_nolibelf.c
+rejects every module. Nothing exposes CUDA kernel launch yet, so nothing
+user-visible changes. Linux still requires libelf.
+---
+ meson.build                           |  4 ++-
+ src/nouveau/cubin/meson.build         |  7 ++++-
+ src/nouveau/cubin/nv_cubin_nolibelf.c | 40 +++++++++++++++++++++++++++
+ 3 files changed, 49 insertions(+), 2 deletions(-)
+ create mode 100644 src/nouveau/cubin/nv_cubin_nolibelf.c
+
+diff --git a/meson.build b/meson.build
+index d467651..1d818fc 100644
+--- a/meson.build
++++ b/meson.build
+@@ -2158,7 +2158,9 @@ if dep_elf.found()
+   pre_args += '-DUSE_LIBELF'
+ elif with_gallium_radeonsi and with_gfx_compute
+   error('Gallium driver radeonsi requires libelf')
+-elif with_nouveau_vk
++elif with_nouveau_vk and not with_platform_windows
++  # On Windows NVK builds without libelf: only CUDA module (cubin) parsing
++  # needs it, and that is compiled out there.
+   error('NVK requires libelf')
+ endif
+ 
+diff --git a/src/nouveau/cubin/meson.build b/src/nouveau/cubin/meson.build
+index 8251295..2d3a33b 100644
+--- a/src/nouveau/cubin/meson.build
++++ b/src/nouveau/cubin/meson.build
+@@ -2,9 +2,14 @@
+ # SPDX-License-Identifier: MIT
+ 
+ libnouveau_cubin_files = files(
+-  'nv_cubin.c',
+   'nv_fatbin.c',
+ )
++if dep_elf.found()
++  libnouveau_cubin_files += files('nv_cubin.c')
++else
++  # Without libelf (Windows) CUDA modules cannot be parsed
++  libnouveau_cubin_files += files('nv_cubin_nolibelf.c')
++endif
+ 
+ _libnouveau_cubin = static_library(
+   'nouveau_cubin',
+diff --git a/src/nouveau/cubin/nv_cubin_nolibelf.c b/src/nouveau/cubin/nv_cubin_nolibelf.c
+new file mode 100644
+index 0000000..280b375
+--- /dev/null
++++ b/src/nouveau/cubin/nv_cubin_nolibelf.c
+@@ -0,0 +1,40 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * nv_cubin for builds without libelf (Windows): every CUDA module is
++ * rejected.
++ */
++#include "nv_cubin.h"
++
++#include "util/log.h"
++
++#include <string.h>
++
++bool
++nv_cubin_module_init(struct nv_cubin_module *module, const void *data,
++                     size_t size)
++{
++   memset(module, 0, sizeof(*module));
++   mesa_loge("nvk: CUDA modules are not supported in a build without libelf");
++   return false;
++}
++
++void
++nv_cubin_module_fini(struct nv_cubin_module *module)
++{
++}
++
++const struct nv_cubin_function *
++nv_cubin_module_find_function(const struct nv_cubin_module *module,
++                              const char *name)
++{
++   return NULL;
++}
++
++const struct nv_cubin_function_param_info *
++nv_cubin_function_get_param_info(const struct nv_cubin_function *function,
++                                 uint32_t index)
++{
++   return NULL;
++}
+-- 
+2.43.0
+
