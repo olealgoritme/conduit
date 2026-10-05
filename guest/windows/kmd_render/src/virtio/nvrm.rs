@@ -1,0 +1,229 @@
+//! Forwarding of NVIDIA-RM messages for `HELIOS_ESCAPE_NVRM` (the verb itself is
+//! in `ddi/escape.rs`; the ABI is `helios_protocol::nvrm`).
+//!
+//! The KMD is a pipe with ownership, not an RM client: a request is forwarded
+//! VERBATIM (`ctrl::raw_roundtrip`) and its reply returned as the device wrote
+//! it. What this module adds is exactly the part a process must not be able to
+//! get wrong about another:
+//!
+//! * which `msg_type`s may be forwarded at all;
+//! * handle ownership — `Open` records the new handle against the caller,
+//!   `Ioctl` and `Close` require it, a successful `Close` forgets it, and device
+//!   teardown closes what a process left open;
+//! * for an `Ioctl`, the 24-byte `IoctlReq` is read to refuse a page-run deep
+//!   block (user mode never supplies a physical address) and a request whose
+//!   declared lengths overrun it.
+//!
+//! Everything else in an RM message is opaque here.
+
+use super::ctrl;
+use super::gpu::DeviceOwner;
+use super::VirtioError;
+use crate::adapter::AdapterContext;
+use crate::irql::PassiveLevel;
+use core::sync::atomic::{AtomicU32, Ordering};
+use helios_protocol::{
+    HELIOS_NVRM_DEEP_PAGE_RUNS, HELIOS_NVRM_DEEP_PAGE_RUNS_INDIRECT, HELIOS_NVRM_FORWARD_MSG_TYPES,
+};
+
+/// Host `MsgType` values that need KMD attention (see `helios_protocol::nvrm`).
+const MSG_OPEN: u32 = 1;
+const MSG_CLOSE: u32 = 2;
+const MSG_IOCTL: u32 = 3;
+
+const MSG_HDR: usize = super::hal::MSG_HDR_LEN;
+/// `MsgHeader` plus the `IoctlReq` that follows it on an `Ioctl`.
+const IOCTL_HDR: usize = MSG_HDR + 24;
+
+/// Forwarded messages by kind, and refusals. Published as `NvOpen`, `NvClose`,
+/// `NvIoctl`, `NvOther` and `NvRef`.
+pub static NVRM_OPENS: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_CLOSES: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_IOCTLS: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_OTHER: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_REFUSED: AtomicU32 = AtomicU32::new(0);
+
+/// Why a forward did not reach (or come back from) the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// `msg_type` is not one `FORWARD` carries.
+    MsgType,
+    /// The handle is not one the caller opened.
+    NotOwned,
+    /// The handle table or the caller's quota is full.
+    NoResources,
+    /// The request carries a page-run deep block.
+    Forbidden,
+    /// A length in the request does not fit it.
+    BadRange,
+    /// The transport failed, timed out or is gone.
+    Transport(VirtioError),
+}
+
+fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
+    let s = b.get(at..at.checked_add(4)?)?;
+    let a: [u8; 4] = s.try_into().ok()?;
+    Some(u32::from_le_bytes(a))
+}
+
+fn rd_i32(b: &[u8], at: usize) -> Option<i32> {
+    rd_u32(b, at).map(|v| v as i32)
+}
+
+fn owned(adapter: &AdapterContext, owner: DeviceOwner, handle: u32) -> bool {
+    adapter
+        .with_virtio(|v| v.nvrm_handle_owned(owner, handle))
+        .unwrap_or(false)
+}
+
+/// Forward `req` (`MsgHeader | payload`) for `owner` and return how many reply
+/// bytes were written to `resp`.
+pub fn forward(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    req: &[u8],
+    resp: &mut [u8],
+    timeout_ms: u64,
+) -> Result<usize, Refusal> {
+    let refused = |r: Refusal| {
+        NVRM_REFUSED.fetch_add(1, Ordering::Relaxed);
+        r
+    };
+    let (Some(msg), Some(handle)) = (rd_u32(req, 0), rd_u32(req, 4)) else {
+        return Err(refused(Refusal::BadRange));
+    };
+    // `msg >= 32` first: the mask is a u32 bitmap over the value.
+    if msg >= 32 || (HELIOS_NVRM_FORWARD_MSG_TYPES >> msg) & 1 == 0 {
+        return Err(refused(Refusal::MsgType));
+    }
+    match msg {
+        MSG_OPEN => open(passive, adapter, owner, req, resp, timeout_ms),
+        MSG_CLOSE => {
+            if !owned(adapter, owner, handle) {
+                return Err(refused(Refusal::NotOwned));
+            }
+            NVRM_CLOSES.fetch_add(1, Ordering::Relaxed);
+            let n = ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms)
+                .map_err(Refusal::Transport)?;
+            // Forget it only when the host closed it: a refused close leaves the
+            // handle valid there, and still ours.
+            if n >= MSG_HDR && rd_i32(resp, 8) == Some(0) {
+                let _ = adapter.with_virtio(|v| v.take_nvrm_handle(owner, handle));
+            }
+            Ok(n)
+        }
+        MSG_IOCTL => {
+            if !owned(adapter, owner, handle) {
+                return Err(refused(Refusal::NotOwned));
+            }
+            if let Err(r) = check_ioctl(req) {
+                return Err(refused(r));
+            }
+            NVRM_IOCTLS.fetch_add(1, Ordering::Relaxed);
+            ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms).map_err(Refusal::Transport)
+        }
+        // GetProcFiles / GetSysFiles: no handle, nothing to track.
+        _ => {
+            NVRM_OTHER.fetch_add(1, Ordering::Relaxed);
+            ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms).map_err(Refusal::Transport)
+        }
+    }
+}
+
+/// `Open`: reserve the slot first, so a full table refuses before the host opens
+/// anything, then record the handle the host returned.
+fn open(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    req: &[u8],
+    resp: &mut [u8],
+    timeout_ms: u64,
+) -> Result<usize, Refusal> {
+    let reserved = adapter
+        .with_virtio(|v| v.reserve_nvrm_handle_slot(owner))
+        .map_err(|_| Refusal::Transport(VirtioError::DeviceError))?;
+    if !reserved {
+        NVRM_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return Err(Refusal::NoResources);
+    }
+    NVRM_OPENS.fetch_add(1, Ordering::Relaxed);
+    match ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms) {
+        Ok(n) => {
+            // The reply header carries the new handle and a signed status.
+            let handle = rd_u32(resp, 4).unwrap_or(0);
+            let ok = n >= MSG_HDR && handle != 0 && rd_i32(resp, 8) == Some(0);
+            let _ = adapter.with_virtio(|v| {
+                if ok {
+                    v.commit_nvrm_handle(owner, handle);
+                } else {
+                    v.cancel_nvrm_reservation();
+                }
+            });
+            Ok(n)
+        }
+        Err(e) => {
+            // A timeout may still have opened it on the host; that handle is then
+            // untracked until the next device reset. Rare, and bounded by quota.
+            let _ = adapter.with_virtio(|v| v.cancel_nvrm_reservation());
+            Err(Refusal::Transport(e))
+        }
+    }
+}
+
+/// The two checks an `Ioctl` gets (see the module docs): no page-run deep block,
+/// and the declared data/nested/deep lengths must fit the request.
+fn check_ioctl(req: &[u8]) -> Result<(), Refusal> {
+    if req.len() < IOCTL_HDR {
+        return Err(Refusal::BadRange);
+    }
+    // IoctlReq: cmd@16 data_len@20 nested_offset@24 nested_len@28
+    // deep_ptr_offset@32 deep_len@36.
+    let (Some(data_len), Some(nested_len), Some(deep_ptr), Some(deep_len)) = (
+        rd_u32(req, 20),
+        rd_u32(req, 28),
+        rd_u32(req, 32),
+        rd_u32(req, 36),
+    ) else {
+        return Err(Refusal::BadRange);
+    };
+    // Only the KMD ever writes these sentinels, and only from pages it locked
+    // itself: a table from user mode would name guest-physical memory the host
+    // then maps.
+    if deep_ptr == HELIOS_NVRM_DEEP_PAGE_RUNS || deep_ptr == HELIOS_NVRM_DEEP_PAGE_RUNS_INDIRECT {
+        return Err(Refusal::Forbidden);
+    }
+    let declared = IOCTL_HDR as u64 + u64::from(data_len) + u64::from(nested_len) + u64::from(deep_len);
+    if declared > req.len() as u64 {
+        return Err(Refusal::BadRange);
+    }
+    Ok(())
+}
+
+/// Device teardown: close, on the host, every handle `owner` left open. Returns
+/// how many. A close that fails is dropped — the device may be going away, and
+/// the table entry is already gone, so nothing is retried.
+pub fn close_all_for_owner(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+) -> u32 {
+    let mut closed = 0u32;
+    loop {
+        let taken = adapter
+            .with_virtio(|v| v.take_nvrm_handle_for_owner(owner))
+            .ok()
+            .flatten();
+        let Some(handle) = taken else {
+            break;
+        };
+        let mut req = [0u8; MSG_HDR];
+        req[..4].copy_from_slice(&MSG_CLOSE.to_le_bytes());
+        req[4..8].copy_from_slice(&handle.to_le_bytes());
+        let mut resp = [0u8; 2 * MSG_HDR];
+        let _ = ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, 5_000);
+        closed += 1;
+    }
+    closed
+}

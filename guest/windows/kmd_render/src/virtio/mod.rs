@@ -18,6 +18,7 @@ pub mod counters;
 pub mod ctrl;
 pub mod gpu;
 pub mod hal;
+pub mod nvrm;
 pub mod pci_caps;
 pub mod venus;
 

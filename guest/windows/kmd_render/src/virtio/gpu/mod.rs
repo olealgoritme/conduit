@@ -61,7 +61,10 @@ use wdk_sys::ntddk::{
 };
 use wdk_sys::{KEVENT, PVOID};
 
+mod nvrm_tables;
 mod resource_tables;
+
+pub use nvrm_tables::{MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER};
 
 use super::config::DxgkConfigAccess;
 use super::hal::{DmaBuffer, DmaSpan, WdkHal};
@@ -491,6 +494,11 @@ pub struct SyncWaitBlock {
     /// The device-written response bytes, copied out of the entry's DMA buffer
     /// by `drain_used` before the event is signaled.
     resp: UnsafeCell<[u8; SYNC_RESP_MAX]>,
+    /// A raw forward only (`InFlightKind::Raw`): how many reply bytes the drain
+    /// copied to the waiter's destination. Stays 0 on every failure path, and a
+    /// real reply is never empty (it starts with a 16-byte `MsgHeader`), so 0
+    /// means "no reply". Stored (Release) before `done`.
+    used: AtomicU32,
 }
 
 /// Stable adapter-owned notification target for a scanout copy submitted on a
@@ -779,6 +787,7 @@ impl SyncWaitBlock {
         // SAFETY: valid, stable KEVENT storage per the fn contract.
         unsafe { KeInitializeEvent(&mut self.event, NOTIFICATION_EVENT, 0) };
         self.done.store(false, Ordering::Relaxed);
+        self.used.store(0, Ordering::Relaxed);
     }
 
     /// Copy the response bytes out.
@@ -826,6 +835,14 @@ impl WaitBlockRef<'_> {
         // SAFETY: as above; `copy_resp`'s own contract covers the ordering.
         unsafe { self.ptr.as_ref() }.copy_resp(out);
     }
+
+    /// Reply bytes a raw forward received (see `SyncWaitBlock::used`). Valid
+    /// after the wait was satisfied, like `copy_resp`.
+    pub fn used(&self) -> u32 {
+        // SAFETY: the block outlives this borrow; the drain stored the value
+        // (Release) before signalling the event this waiter's wait observed.
+        unsafe { self.ptr.as_ref() }.used.load(Ordering::Acquire)
+    }
 }
 
 /// What an in-flight entry is.
@@ -839,6 +856,26 @@ enum InFlightKind {
         /// changes the host's scanout selection and must remain visible to
         /// DestroyAllocation's lifetime barrier.
         scanout_bind: Option<SyncScanoutBind>,
+    },
+    /// A RAW forwarded message (HELIOS_ESCAPE_NVRM FORWARD): the caller's
+    /// `MsgHeader | payload` goes out verbatim and the device's reply is copied
+    /// to `dest`, a driver-owned non-paged buffer the waiter holds, at
+    /// completion.
+    ///
+    /// The reply cannot ride `SyncWaitBlock::resp` (64 bytes, the size of a
+    /// virtio-gpu response), and it cannot stay in `meta` for the waiter to read
+    /// after the wake: the entry is parked at completion and a PASSIVE reap may
+    /// recycle that buffer the moment the waiter is running. So the drain copies
+    /// it, under the lock, before signalling.
+    ///
+    /// `dest` has exactly `InFlight::resp_len` writable bytes and outlives the
+    /// waiter's wait; `waiter` is cleared by `abandon_sync` under this same lock
+    /// when the wait times out, after which the drain neither copies nor signals,
+    /// so a late completion never writes a buffer its owner has left. That is the
+    /// argument `InFlightKind::Sync` already rests on, for a larger payload.
+    Raw {
+        waiter: Option<NonNull<SyncWaitBlock>>,
+        dest: NonNull<u8>,
     },
     /// An async fenced SUBMIT_3D carrying `fence_id` (KMD-assigned wire id).
     /// `ring_idx` 0 = host CPU ring (retires at decode); >= 1 = a per-queue
@@ -1461,6 +1498,12 @@ enum Chain {
     Meta2 { in0_len: usize, in1_len: usize },
     /// `[hdr, venus stream] -> [resp]`, the stream in its own buffer.
     MetaPlusVenus { hdr_len: usize, venus_len: usize },
+    /// `[req[..16], req[16..]] -> [resp[..16], resp[16..]]`: a forwarded RM
+    /// message verbatim, with NO `GpuCmd` header stamped — the caller's own
+    /// 16-byte `MsgHeader` is the first device-read span, and the reply's is the
+    /// first device-written one. The two halves of each side are adjacent in
+    /// `meta`, so the device's bytes land contiguously at `req_len`.
+    Raw { req_len: usize },
 }
 
 impl Chain {
@@ -1475,6 +1518,7 @@ impl Chain {
             Self::Meta1 { in0_len } => in0_len,
             Self::Meta2 { in0_len, in1_len } => in0_len + in1_len,
             Self::MetaPlusVenus { hdr_len, .. } => hdr_len,
+            Self::Raw { req_len } => req_len,
         }
     }
 
@@ -1510,6 +1554,21 @@ impl Chain {
                 3,
                 [resp_hdr, resp],
             ),
+            Self::Raw { req_len } => {
+                const MH: usize = super::hal::MSG_HDR_LEN;
+                (
+                    [
+                        meta.span(0, MH)?,
+                        meta.span(MH, req_len.checked_sub(MH)?)?,
+                        none,
+                    ],
+                    2,
+                    [
+                        meta.span(req_len, MH)?,
+                        meta.span(req_len.checked_add(MH)?, resp_len.checked_sub(MH)?)?,
+                    ],
+                )
+            }
         })
     }
 }
@@ -2185,6 +2244,12 @@ pub struct VirtioGpu {
     /// MANDATORY (see `reserve_context_slot`), so a context is reserved before
     /// the wire round-trip and committed after it.
     contexts_reserved: usize,
+    /// Backend RM handles opened through HELIOS_ESCAPE_NVRM, tagged with the
+    /// owning device so a process cannot name another's, and closed at device
+    /// teardown. Reserved to MAX_NVRM_HANDLES at init. See `nvrm_tables`.
+    nvrm_handles: Vec<nvrm_tables::NvrmHandleSlot>,
+    /// Slots reserved by in-flight forwarded `Open`s.
+    nvrm_reserved: usize,
     /// Live virtio-gpu contexts, tagged with the owning device handle, so
     /// `DxgkDdiDestroyDevice` can `CTX_DESTROY` any context an ICD created but did
     /// not tear down (crash / skipped CTX_DESTROY) — otherwise leaked contexts
@@ -2704,6 +2769,8 @@ impl VirtioGpu {
             resources_reserved: 0,
             contexts_reserved: 0,
             contexts: Vec::with_capacity(MAX_CONTEXTS),
+            nvrm_handles: Vec::with_capacity(MAX_NVRM_HANDLES),
+            nvrm_reserved: 0,
             window: WindowAllocator::new(host_visible.map_or(0, |w| w.len)),
             inflight: Vec::with_capacity(MAX_INFLIGHT),
             parked: Vec::with_capacity(MAX_PARKED),
@@ -3006,6 +3073,42 @@ impl VirtioGpu {
             venus: None,
         });
         Ok((SyncTicket { token }, scanout_bind_seq))
+    }
+
+    /// Enqueue a RAW forwarded message (`InFlightKind::Raw`). `meta` holds the
+    /// request at `[0, req_len)` and has room for the reply at
+    /// `[req_len, req_len + resp_len)`; both are `MsgHeader | payload`, so each
+    /// must be longer than a header. `dest` receives the reply at completion
+    /// (see the variant's contract). On refusal the buffer is handed back.
+    pub fn enqueue_raw(
+        &mut self,
+        meta: DmaBuffer,
+        req_len: usize,
+        resp_len: usize,
+        waiter: NonNull<SyncWaitBlock>,
+        dest: NonNull<u8>,
+    ) -> Result<SyncTicket, (DmaBuffer, VirtioError)> {
+        const MH: usize = super::hal::MSG_HDR_LEN;
+        if req_len < MH || resp_len <= MH {
+            return Err((meta, VirtioError::DeviceError));
+        }
+        let chain = Chain::Raw { req_len };
+        let token = match self.enqueue_core(chain, &meta, None, resp_len) {
+            Ok(token) => token,
+            Err(e) => return Err((meta, e)),
+        };
+        self.publish_then_notify(InFlight {
+            token,
+            kind: InFlightKind::Raw {
+                waiter: Some(waiter),
+                dest,
+            },
+            meta,
+            chain,
+            resp_len,
+            venus: None,
+        });
+        Ok(SyncTicket { token })
     }
 
     /// Enqueue a control command without a blocking waiter.  Completion still
@@ -4196,6 +4299,19 @@ impl VirtioGpu {
             // host read that never happened.
             let scanout_flush = take_scanout_flush_token(&mut entry.kind);
             match entry.kind {
+                InFlightKind::Raw { waiter, .. } => {
+                    if let Some(block) = waiter {
+                        // No reply: `used` stays 0, which the waiter reads as
+                        // failure. Same exits and same argument as the Sync arm.
+                        //
+                        // SAFETY: as the Sync arm below.
+                        unsafe {
+                            let b = block.as_ptr();
+                            (*b).done.store(true, Ordering::Release);
+                            KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                        }
+                    }
+                }
                 InFlightKind::Sync { waiter, .. } => {
                     if let Some(block) = waiter {
                         // No response is copied on purpose: `SyncWaitBlock::new_zeroed`
@@ -4390,16 +4506,64 @@ impl VirtioGpu {
                     &mut [resp[0].as_mut_slice(), resp[1].as_mut_slice()],
                 )
             };
-            if popped.is_err() {
+            let Ok(written) = popped else {
                 self.latch_failed_and_fail_inflight();
                 return;
-            }
+            };
             self.control_space_epoch = self.control_space_epoch.wrapping_add(1);
             let mut entry = self.inflight.swap_remove(idx);
             // As in `latch_failed_and_fail_inflight`: take the ownership token
             // out before the `match entry.kind` moves the other fields, so the
             // entry stays whole for the park below.
             let scanout_flush = take_scanout_flush_token(&mut entry.kind);
+            // A raw forward carries no virtio-gpu response and no wire-tail
+            // status, so it must not reach the interpretation below: that would
+            // overwrite four bytes of the reply with RESP_ERR_UNSPEC whenever the
+            // pooled buffer's stale tail status was nonzero.
+            if let InFlightKind::Raw { waiter, dest } = &entry.kind {
+                let (waiter, dest) = (*waiter, *dest);
+                if let Some(block) = waiter {
+                    // What the device wrote, bounded by what we gave it and by
+                    // the destination (which is exactly `resp_len` bytes).
+                    let wrote = (written as usize).min(resp_len);
+                    // The two device-written descriptors are adjacent in `meta`
+                    // starting at the response offset, so the reply is one
+                    // contiguous range there.
+                    let src = entry.meta.span(entry.chain.resp_offset(), wrote);
+                    // SAFETY: `block` and `dest` outlive every access here for
+                    // the reason on `InFlightKind::Raw` (the waiter has two exits
+                    // and `abandon_sync`, under this lock, clears `waiter` before
+                    // either could free them); `src` is a span of the entry-owned
+                    // buffer the device has finished writing. `used` and `done`
+                    // are stored (Release) before the signal, inside the critical
+                    // section, exactly as the Sync arm orders them.
+                    unsafe {
+                        let b = block.as_ptr();
+                        let n = match src {
+                            Some(span) => {
+                                core::ptr::copy_nonoverlapping(
+                                    span.as_slice().as_ptr(),
+                                    dest.as_ptr(),
+                                    wrote,
+                                );
+                                wrote
+                            }
+                            None => 0,
+                        };
+                        (*b).used.store(n as u32, Ordering::Release);
+                        (*b).done.store(true, Ordering::Release);
+                        KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                    }
+                }
+                if self.parked.len() < MAX_PARKED {
+                    self.parked.push(entry);
+                    bump_high_water(&PARKED_HIGH_WATER, self.parked.len());
+                } else {
+                    PARKED_LEAKS.fetch_add(1, Ordering::Relaxed);
+                    core::mem::forget(entry);
+                }
+                continue;
+            }
             let resp_base = {
                 // SAFETY: the resp span is within the entry-owned meta buffer,
                 // which the device wrote and nothing else aliases now. A mutable
@@ -4419,6 +4583,8 @@ impl VirtioGpu {
             // SAFETY: as above; unaligned because the offset is command-shaped.
             let resp_type = unsafe { core::ptr::read_unaligned(resp_base as *const u32) };
             match entry.kind {
+                // Completed and parked above; never reaches here.
+                InFlightKind::Raw { .. } => {}
                 InFlightKind::Sync {
                     waiter,
                     scanout_bind,
@@ -4970,6 +5136,13 @@ impl VirtioGpu {
         for e in self.inflight.iter_mut() {
             if e.token != ticket.token {
                 continue;
+            }
+            if let InFlightKind::Raw { waiter, .. } = &mut e.kind {
+                if *waiter == Some(block) {
+                    *waiter = None;
+                    return SyncOutcome::Abandoned;
+                }
+                return SyncOutcome::NotOurs;
             }
             if let InFlightKind::Sync { waiter, .. } = &mut e.kind {
                 if *waiter == Some(block) {

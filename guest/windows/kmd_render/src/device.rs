@@ -396,6 +396,11 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         let blobs = crate::virtio::ctrl::release_blobs_for_owner(passive, adapter, device_owner);
         let contexts =
             crate::virtio::ctrl::destroy_contexts_for_owner(passive, adapter, device_owner);
+        // RM handles the process left open (HELIOS_ESCAPE_NVRM): the host keeps
+        // each opened RM file, and what it allocated, until it is closed.
+        if let Some(owner) = device_owner {
+            let _ = crate::virtio::nvrm::close_all_for_owner(passive, adapter, owner);
+        }
         // Opportunistic PASSIVE reap of completed transport entries.
         crate::virtio::ctrl::reap_parked(passive, adapter);
         // 0x0E02_BBBB = blob-table size BEFORE reclaim (saturated to 16 bits).

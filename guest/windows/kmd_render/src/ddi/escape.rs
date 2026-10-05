@@ -55,6 +55,17 @@ use helios_protocol::{
     HELIOS_SCANOUT_TIMELINE_OP_READ, HELIOS_SCANOUT_TIMELINE_TIME_100NS,
 };
 
+use helios_protocol::{
+    HeliosNvrmForward, HeliosNvrmHeader, HeliosNvrmQueryCaps, HELIOS_ESCAPE_NVRM,
+    HELIOS_NVRM_ABI_VERSION, HELIOS_NVRM_FORWARD_BYTES, HELIOS_NVRM_MAX_BUFFER,
+    HELIOS_NVRM_OP_EVENT_REGISTER, HELIOS_NVRM_OP_EVENT_UNREGISTER, HELIOS_NVRM_OP_FORWARD,
+    HELIOS_NVRM_OP_MMAP, HELIOS_NVRM_OP_MUNMAP, HELIOS_NVRM_OP_PIN, HELIOS_NVRM_OP_QUERY_CAPS,
+    HELIOS_NVRM_OP_UNPIN, HELIOS_NVRM_ST_BAD_RANGE, HELIOS_NVRM_ST_DEVICE_ERROR,
+    HELIOS_NVRM_ST_FORBIDDEN, HELIOS_NVRM_ST_MSG_TYPE_REFUSED, HELIOS_NVRM_ST_NOT_OWNED,
+    HELIOS_NVRM_ST_NO_RESOURCES, HELIOS_NVRM_ST_OK, HELIOS_NVRM_ST_TIMEOUT,
+    HELIOS_NVRM_ST_UNSUPPORTED,
+};
+
 use super::blob_map::{
     effective_map_cache, map_cache_to_mm, map_io_pages_to_user, map_nonpaged_page_to_user_readonly,
     unmap_io_pages_from_user,
@@ -369,6 +380,10 @@ pub unsafe extern "C" fn dxgkddi_escape(
         },
         HELIOS_ESCAPE_SUBMIT_VENUS => match owner {
             Some(owner) => escape_submit_venus(passive, adapter, buf, &hdr, owner),
+            None => refuse_no_device(),
+        },
+        HELIOS_ESCAPE_NVRM => match owner {
+            Some(owner) => escape_nvrm(passive, adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_SUBMIT_VENUS_BATCH => match owner {
@@ -1689,6 +1704,166 @@ fn escape_submit_venus_batch(
     ESCAPE_BATCH_ENTRIES.fetch_add(accepted, core::sync::atomic::Ordering::Relaxed);
     ESCAPE_BATCH_MAX.fetch_max(head.count, core::sync::atomic::Ordering::Relaxed);
     STATUS_SUCCESS
+}
+
+/// Default `FORWARD` wait when `timeout_ms == 0`. RM calls can legitimately run
+/// for seconds (first-time init, large allocations).
+const NVRM_DEFAULT_TIMEOUT_MS: u32 = 30_000;
+/// The operations this build implements, as a bitmask over the op value.
+const NVRM_OPS_IMPLEMENTED: u64 =
+    (1 << HELIOS_NVRM_OP_QUERY_CAPS) | (1 << HELIOS_NVRM_OP_FORWARD);
+
+/// Write the common header back (status + epoch) over a buffer whose first 40
+/// bytes are a `HeliosNvrmHeader`.
+fn nvrm_finish(buf: &mut [u8], mut head: HeliosNvrmHeader, status: i32, epoch: u64) -> NTSTATUS {
+    head.status = status;
+    head.epoch = epoch;
+    match buf.get_mut(..size_of::<HeliosNvrmHeader>()) {
+        Some(dst) => {
+            dst.copy_from_slice(bytes_of(&head));
+            STATUS_SUCCESS
+        }
+        None => refuse_short_buffer(),
+    }
+}
+
+/// `HELIOS_ESCAPE_NVRM` — the RM forwarding escape (`helios_protocol::nvrm`).
+///
+/// NTSTATUS is the transport verdict: a malformed request fails with a status
+/// and the buffer is not written. A well-formed request returns SUCCESS and the
+/// KMD's own verdict in `HeliosNvrmHeader.status`; the RM's answer travels in the
+/// forwarded reply bytes and is never interpreted here.
+fn escape_nvrm(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+) -> NTSTATUS {
+    let head_size = size_of::<HeliosNvrmHeader>();
+    if buf.len() < head_size || (hdr.size as usize) < head_size {
+        return refuse_short_buffer();
+    }
+    if buf.len() > HELIOS_NVRM_MAX_BUFFER as usize {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let head: HeliosNvrmHeader = pod_read_unaligned(&buf[..head_size]);
+    if head.abi_version != HELIOS_NVRM_ABI_VERSION || head.reserved != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // 0 when the transport is down: QUERY_CAPS still answers (it touches no
+    // device state), and every other op then fails as the transport does.
+    let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
+
+    match head.op {
+        HELIOS_NVRM_OP_QUERY_CAPS => {
+            let mut wire = match EscapeBuf::<HeliosNvrmQueryCaps>::new(buf, hdr) {
+                Ok(w) => w,
+                Err(st) => return st,
+            };
+            let mut caps = wire.read();
+            caps.max_buffer_bytes = HELIOS_NVRM_MAX_BUFFER;
+            caps.default_timeout_ms = NVRM_DEFAULT_TIMEOUT_MS;
+            caps.supported_ops = NVRM_OPS_IMPLEMENTED;
+            caps.supported_event_kinds = 0;
+            caps.supported_cache_types = 0;
+            caps.device_features = 0;
+            caps.max_handles = crate::virtio::gpu::MAX_NVRM_HANDLES_PER_OWNER as u32;
+            caps.max_mappings = 0;
+            caps.max_pins = 0;
+            caps.max_pin_pages = 0;
+            caps.pin_deep_kinds = 0;
+            caps.head.status = HELIOS_NVRM_ST_OK;
+            caps.head.epoch = epoch;
+            wire.write_back(&caps);
+            STATUS_SUCCESS
+        }
+        HELIOS_NVRM_OP_FORWARD => nvrm_forward(passive, adapter, buf, hdr, owner, head, epoch),
+        // Valid in the ABI, not implemented by this KMD build: QUERY_CAPS says so.
+        HELIOS_NVRM_OP_MMAP
+        | HELIOS_NVRM_OP_MUNMAP
+        | HELIOS_NVRM_OP_EVENT_REGISTER
+        | HELIOS_NVRM_OP_EVENT_UNREGISTER
+        | HELIOS_NVRM_OP_PIN
+        | HELIOS_NVRM_OP_UNPIN => nvrm_finish(buf, head, HELIOS_NVRM_ST_UNSUPPORTED, epoch),
+        _ => STATUS_INVALID_PARAMETER,
+    }
+}
+
+/// `HELIOS_NVRM_OP_FORWARD`: validate the layout, forward, report.
+fn nvrm_forward(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    head: HeliosNvrmHeader,
+    epoch: u64,
+) -> NTSTATUS {
+    use crate::virtio::nvrm::{self, Refusal};
+    let mut fwd = match EscapeBuf::<HeliosNvrmForward>::new(buf, hdr) {
+        Ok(w) => w.read(),
+        Err(st) => return st,
+    };
+    let req_len = fwd.req_len as usize;
+    let resp_cap = fwd.resp_cap as usize;
+    // Layout: struct | request | (pad to 8) | response area. Checked arithmetic
+    // throughout — every one of these is caller-controlled.
+    let layout = req_len
+        .checked_add(7)
+        .map(|n| n & !7usize)
+        .and_then(|padded| HELIOS_NVRM_FORWARD_BYTES.checked_add(padded))
+        .and_then(|resp_off| resp_off.checked_add(resp_cap).map(|total| (resp_off, total)));
+    let Some((resp_off, total)) = layout else {
+        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch);
+    };
+    // A message is `MsgHeader | payload` both ways, so each side must be longer
+    // than the 16-byte header.
+    if req_len <= 16 || resp_cap <= 16 || total > buf.len() || total > HELIOS_NVRM_MAX_BUFFER as usize
+    {
+        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch);
+    }
+    let timeout_ms = match fwd.timeout_ms {
+        0 => NVRM_DEFAULT_TIMEOUT_MS,
+        t => t,
+    };
+
+    // `total <= buf.len()` and `HELIOS_NVRM_FORWARD_BYTES <= resp_off <= total`
+    // were checked above, so these splits are in range. `get` for the two
+    // views, so a change to the checks above cannot turn into a fault.
+    let (_, rest) = buf.split_at_mut(HELIOS_NVRM_FORWARD_BYTES);
+    let (req_area, resp_area) = rest.split_at_mut(resp_off - HELIOS_NVRM_FORWARD_BYTES);
+    let (Some(req), Some(resp)) = (req_area.get(..req_len), resp_area.get_mut(..resp_cap)) else {
+        return refuse_short_buffer();
+    };
+
+    let outcome = nvrm::forward(passive, adapter, owner, req, resp, u64::from(timeout_ms));
+    let (status, resp_len) = match outcome {
+        Ok(n) => (HELIOS_NVRM_ST_OK, n as u32),
+        Err(Refusal::MsgType) => (HELIOS_NVRM_ST_MSG_TYPE_REFUSED, 0),
+        Err(Refusal::NotOwned) => (HELIOS_NVRM_ST_NOT_OWNED, 0),
+        Err(Refusal::NoResources) => (HELIOS_NVRM_ST_NO_RESOURCES, 0),
+        Err(Refusal::Forbidden) => (HELIOS_NVRM_ST_FORBIDDEN, 0),
+        Err(Refusal::BadRange) => (HELIOS_NVRM_ST_BAD_RANGE, 0),
+        Err(Refusal::Transport(crate::virtio::VirtioError::Timeout)) => {
+            (HELIOS_NVRM_ST_TIMEOUT, 0)
+        }
+        Err(Refusal::Transport(crate::virtio::VirtioError::QueueFull))
+        | Err(Refusal::Transport(crate::virtio::VirtioError::OutOfMemory)) => {
+            (HELIOS_NVRM_ST_NO_RESOURCES, 0)
+        }
+        Err(Refusal::Transport(_)) => (HELIOS_NVRM_ST_DEVICE_ERROR, 0),
+    };
+    fwd.resp_len = resp_len;
+    fwd.head.status = status;
+    fwd.head.epoch = epoch;
+    match buf.get_mut(..HELIOS_NVRM_FORWARD_BYTES) {
+        Some(dst) => {
+            dst.copy_from_slice(bytes_of(&fwd));
+            STATUS_SUCCESS
+        }
+        None => refuse_short_buffer(),
+    }
 }
 
 /// `HELIOS_ESCAPE_WAIT_FENCE` → REAL wait (C3/M3.4): block (PASSIVE, KEVENT)

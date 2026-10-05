@@ -456,6 +456,110 @@ fn ctrl_roundtrip(
     })
 }
 
+/// Forward one RM message VERBATIM and wait for the reply (HELIOS_ESCAPE_NVRM).
+///
+/// `req` is `MsgHeader | payload` exactly as the caller built it — nothing is
+/// stamped or interpreted here — and the device's reply (`MsgHeader | payload`,
+/// or the header-less stream of `GetSysFiles`) is written into `resp_out`, whose
+/// length is the capacity the device is given. Returns how many reply bytes the
+/// device wrote, which is never 0 on success.
+///
+/// The drain runs at DISPATCH under the device lock, so it cannot be trusted to
+/// write `resp_out` (the runtime's copy of the escape's private data, whose
+/// paging is not ours to assume): it copies the reply into a driver-owned
+/// non-paged buffer instead (see `InFlightKind::Raw`), and the copy into
+/// `resp_out` happens here, at PASSIVE, after the wake.
+///
+/// A timeout abandons the entry; its eventual completion neither copies nor
+/// signals. An RM call that outlives `timeout_ms` may still have taken effect on
+/// the host, so the caller must treat the handle as indeterminate.
+pub fn raw_roundtrip(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    resp_out: &mut [u8],
+    timeout_ms: u64,
+) -> Result<usize, VirtioError> {
+    const MH: usize = super::hal::MSG_HDR_LEN;
+    let req_len = req.len();
+    let resp_len = resp_out.len();
+    if req_len < MH || resp_len <= MH {
+        return Err(VirtioError::DeviceError);
+    }
+    // The reply's landing buffer: driver heap (non-paged), sized exactly as the
+    // device is told. Reserved fallibly — the size is caller-controlled — and
+    // declared before the wait block so it outlives the abandon path.
+    let mut reply = alloc::vec::Vec::<u8>::new();
+    if reply.try_reserve_exact(resp_len).is_err() {
+        return Err(VirtioError::OutOfMemory);
+    }
+    reply.resize(resp_len, 0);
+    let Some(dest) = core::ptr::NonNull::new(reply.as_mut_ptr()) else {
+        return Err(VirtioError::DeviceError);
+    };
+    reap_parked(passive, adapter);
+
+    let total = req_len + resp_len;
+    let mut meta = adapter
+        .with_virtio(|v| v.take_dma_buffer(total))
+        .ok()
+        .flatten()
+        .or_else(|| DmaBuffer::new(passive, total))
+        .ok_or(VirtioError::OutOfMemory)?;
+    meta.as_mut_slice()[..req_len].copy_from_slice(req);
+
+    SyncWaitBlock::with(|block| {
+        // As in `ctrl_roundtrip`: the buffer is a loop value, handed back by every
+        // refusal arm, so a retry that forgets it does not compile.
+        let mut budget = Budget::new(ENQUEUE_RETRY_MAX_MS);
+        let ticket = loop {
+            let res = adapter.with_virtio(move |v| {
+                v.drain_used();
+                v.enqueue_raw(meta, req_len, resp_len, block.as_ptr(), dest)
+            });
+            match res {
+                Err(_) => return Err(VirtioError::DeviceError), // transport gone
+                Ok(Ok(ticket)) => break ticket,
+                Ok(Err((m_back, VirtioError::QueueFull))) => {
+                    meta = m_back;
+                    if budget.charge_slice() {
+                        return Err(VirtioError::QueueFull);
+                    }
+                    reap_parked(passive, adapter);
+                    sleep_ms(passive, RETRY_SLICE_MS);
+                }
+                Ok(Err((_m, e))) => return Err(e), // buffer dropped at PASSIVE
+            }
+        };
+
+        if !wait_block(passive, adapter, block, timeout_ms) {
+            match adapter.with_virtio(|v| {
+                v.drain_used();
+                v.abandon_sync(ticket, block.as_ptr())
+            }) {
+                // The drain already completed it; the reply is in `resp_out`.
+                Ok(SyncOutcome::AlreadyCompleted) => {}
+                Ok(SyncOutcome::Abandoned) => {
+                    CTRL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    return Err(VirtioError::Timeout);
+                }
+                Ok(SyncOutcome::NotOurs) => return Err(VirtioError::DeviceError),
+                Err(_) => return Err(VirtioError::DeviceError),
+            }
+        }
+        match block.used() as usize {
+            0 => Err(VirtioError::DeviceError),
+            n => Ok(n),
+        }
+    })
+    .and_then(|used| {
+        // PASSIVE: now the reply may go to the caller's buffer.
+        let n = used.min(resp_len);
+        resp_out[..n].copy_from_slice(&reply[..n]);
+        Ok(n)
+    })
+}
+
 /// Round-trip expecting a bare `VirtioGpuCtrlHdr` response; checks RESP_OK.
 fn ctrl_roundtrip_ok(
     passive: PassiveLevel,

@@ -385,6 +385,27 @@ pub(crate) fn record_present_handoff_telemetry() {
     );
     // The same counts per Venus context (= per ICD instance = per process).
     crate::virtio::gpu::publish_escape_ctx_counters();
+    // HELIOS_ESCAPE_NVRM: forwarded RM messages by kind, and refusals.
+    crate::diag::record_named_bytes(
+        b"NvOpen",
+        crate::virtio::nvrm::NVRM_OPENS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvClose",
+        crate::virtio::nvrm::NVRM_CLOSES.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvIoctl",
+        crate::virtio::nvrm::NVRM_IOCTLS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvOther",
+        crate::virtio::nvrm::NVRM_OTHER.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvRef",
+        crate::virtio::nvrm::NVRM_REFUSED.load(Ordering::Relaxed),
+    );
     // S-1's instrument (`docs/dx12/PENDING.md` §2). `DxgkDdiCalibrateGpuClock` is
     // the ONLY channel for the GPU timestamp frequency an application divides its
     // timestamp deltas by, and it used to zero-fill and return SUCCESS silently.
