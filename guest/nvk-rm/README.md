@@ -106,7 +106,7 @@ vulkaninfo --summary
   `NVK_RM_DMABUF=0` turns dma-bufs off altogether (no external memory
   extensions, software WSI).
 
-In `lab`, `~/nvk-cube.sh` does all of that (from ssh it picks the desktop
+In `lab`, `~/nvk-cube.sh` (a copy is `guest/nvk-rm/nvk-cube.sh`) does all of that (from ssh it picks the desktop
 session's `DISPLAY=:0`, Xwayland auth and `wayland-0`):
 
 ```sh

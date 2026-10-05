@@ -31,3 +31,7 @@ test('unit', test_unit)
 executable('crm_smoke', 'tests/crm_smoke.c',
   include_directories : [inc, include_directories('src')],
   dependencies : rmclient_dep)
+# NV_ESC_RM_GET_EVENT_DATA end to end (needs a backend and guest module that serve it).
+executable('crm_event_smoke', 'tests/crm_event_smoke.c',
+  include_directories : [inc, include_directories('src')],
+  dependencies : rmclient_dep)
