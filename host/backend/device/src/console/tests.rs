@@ -18,6 +18,8 @@ fn syn() -> InputEventEntry {
     ev(input::EV_SYN, input::SYN_REPORT, 0)
 }
 
+const VGA: Sizes = Sizes::console((640, 480));
+
 #[test]
 fn keys_become_qemu_extended_key_events_with_qnums() {
     // evdev code, qnum, keysym
@@ -32,12 +34,12 @@ fn keys_become_qemu_extended_key_events_with_qnums() {
     for (code, qnum, sym) in cases {
         let mut e = InputEncoder::default();
         let mut out = Vec::new();
-        e.event(&ev(input::EV_KEY, code, 1), (640, 480), true, &mut out);
-        e.event(&syn(), (640, 480), true, &mut out);
+        e.event(&ev(input::EV_KEY, code, 1), VGA, true, &mut out);
+        e.event(&syn(), VGA, true, &mut out);
         assert_eq!(out, rfb::qemu_key_event(true, sym, qnum), "code {code}");
         assert_eq!(keymap::qnum(code), Some(qnum as u8));
         out.clear();
-        e.event(&ev(input::EV_KEY, code, 0), (640, 480), true, &mut out);
+        e.event(&ev(input::EV_KEY, code, 0), VGA, true, &mut out);
         assert_eq!(out, rfb::qemu_key_event(false, sym, qnum), "code {code}");
     }
 }
@@ -47,16 +49,11 @@ fn held_keys_are_released_and_strays_dropped() {
     let mut e = InputEncoder::default();
     let mut out = Vec::new();
     // A release for a key pressed while the guest had the input: dropped.
-    e.event(&ev(input::EV_KEY, 30, 0), (640, 480), true, &mut out);
+    e.event(&ev(input::EV_KEY, 30, 0), VGA, true, &mut out);
     assert!(out.is_empty());
-    e.event(&ev(input::EV_KEY, 42, 1), (640, 480), true, &mut out);
-    e.event(
-        &ev(input::EV_KEY, input::KEY_MAX, 1),
-        (640, 480),
-        true,
-        &mut out,
-    );
-    e.event(&ev(input::EV_KEY, BTN_LEFT, 1), (640, 480), true, &mut out);
+    e.event(&ev(input::EV_KEY, 42, 1), VGA, true, &mut out);
+    e.event(&ev(input::EV_KEY, input::KEY_MAX, 1), VGA, true, &mut out);
+    e.event(&ev(input::EV_KEY, BTN_LEFT, 1), VGA, true, &mut out);
     assert_eq!(e.held(), 2);
     out.clear();
     e.release_all(true, &mut out);
@@ -67,7 +64,7 @@ fn held_keys_are_released_and_strays_dropped() {
     assert_eq!(e.held(), 0);
     // Without the extension, keysyms.
     out.clear();
-    e.event(&ev(input::EV_KEY, 28, 1), (640, 480), false, &mut out);
+    e.event(&ev(input::EV_KEY, 28, 1), VGA, false, &mut out);
     assert_eq!(out, rfb::key_event(true, 0xff0d));
 }
 
@@ -79,7 +76,7 @@ fn the_pointer_scales_to_the_framebuffer_with_a_button_mask() {
     assert_eq!(InputEncoder::scale(-5, 640), 0);
     assert_eq!(InputEncoder::scale(INPUT_ABS_MAX + 9, 480), 479);
 
-    let size = (800, 600);
+    let size = Sizes::console((800, 600));
     let mut e = InputEncoder::default();
     let mut out = Vec::new();
     e.event(
@@ -823,4 +820,278 @@ fn without_a_console_nothing_changes() {
         link.flip_console(f.fd(), &f.geometry()),
         FlipOutcome::NoBroker
     );
+}
+
+// -- input for a guest that takes no Conduit input (Windows) ----------------
+
+#[test]
+fn input_goes_to_the_console_by_whether_the_guest_takes_input() {
+    // No console: always the guest, as before there was one.
+    let link = DisplayLink::new(None);
+    assert!(!link.input_to_console(true));
+    assert!(!link.input_to_console(false));
+
+    struct Nop;
+    impl ConsoleSink for Nop {
+        fn input(&self, _: &[InputEventEntry]) {}
+        fn wake(&self) {}
+    }
+    link.attach_console(Arc::new(Nop));
+    // The console shown: the console, whoever the guest is.
+    assert!(link.input_to_console(true));
+    assert!(link.input_to_console(false));
+    // The guest's frames shown: the guest if it takes input, else the
+    // console still.
+    let buf = memfd();
+    guest_flip(&link, &buf);
+    assert!(!link.input_to_console(true));
+    assert!(link.input_to_console(false));
+    // A takeover pending: still the guest's frames.
+    link.disable();
+    assert!(!link.input_to_console(true));
+    assert!(link.input_to_console(false));
+    // Back to the console.
+    link.console_reset("test");
+    assert!(link.input_to_console(true));
+    assert!(link.input_to_console(false));
+}
+
+#[test]
+fn the_pointer_follows_the_guest_picture_over_a_smaller_framebuffer() {
+    // QEMU's screen is 1280x800 behind a 2560x1440 guest picture.
+    let sizes = Sizes {
+        fb: (1280, 800),
+        view: (2560, 1440),
+    };
+    let mut e = InputEncoder::default();
+    let mut out = Vec::new();
+    // Absolute positions are fractions of the picture: the same fraction of
+    // the framebuffer, which QEMU scales onto the tablet's range.
+    e.event(
+        &ev(input::EV_ABS, input::ABS_X, INPUT_ABS_MAX),
+        sizes,
+        true,
+        &mut out,
+    );
+    e.event(
+        &ev(input::EV_ABS, input::ABS_Y, INPUT_ABS_MAX / 2),
+        sizes,
+        true,
+        &mut out,
+    );
+    e.event(&syn(), sizes, true, &mut out);
+    assert_eq!(out, rfb::pointer_event(0, 1279, 399));
+
+    // Relative motion is in pixels of the picture: from the left edge,
+    // half the guest's width is half the framebuffer's, and two guest
+    // pixels are one framebuffer pixel.
+    out.clear();
+    e.event(&ev(input::EV_ABS, input::ABS_X, 0), sizes, true, &mut out);
+    e.event(
+        &ev(input::EV_REL, input::REL_X, 1280),
+        sizes,
+        true,
+        &mut out,
+    );
+    e.event(&syn(), sizes, true, &mut out);
+    assert_eq!(e.position().0, 640);
+    let before = e.position().0;
+    e.event(&ev(input::EV_REL, input::REL_X, 2), sizes, true, &mut out);
+    assert_eq!(e.position().0, before + 1);
+    // Small steps add up instead of rounding away.
+    for _ in 0..10 {
+        e.event(&ev(input::EV_REL, input::REL_X, 1), sizes, true, &mut out);
+    }
+    assert_eq!(e.position().0, before + 6);
+    // And stay inside it.
+    e.event(
+        &ev(input::EV_REL, input::REL_Y, -5000),
+        sizes,
+        true,
+        &mut out,
+    );
+    e.event(
+        &ev(input::EV_REL, input::REL_X, 9000),
+        sizes,
+        true,
+        &mut out,
+    );
+    assert_eq!(e.position(), (1279, 0));
+
+    // The framebuffer resizes under a held position: the same fraction.
+    let sizes = Sizes {
+        fb: (640, 480),
+        view: (2560, 1440),
+    };
+    out.clear();
+    e.event(&syn(), sizes, true, &mut out);
+    e.event(&ev(input::EV_KEY, BTN_LEFT, 1), sizes, true, &mut out);
+    let mut want = rfb::pointer_event(0, 639, 0).to_vec();
+    want.extend_from_slice(&rfb::pointer_event(MASK_LEFT, 639, 0));
+    assert_eq!(out, want);
+}
+
+/// A console sink that records, and a guest sink whose `takes_input` the
+/// test sets.
+struct Rec(Arc<Mutex<Vec<InputEventEntry>>>);
+impl ConsoleSink for Rec {
+    fn input(&self, events: &[InputEventEntry]) {
+        self.0.lock().unwrap().extend_from_slice(events);
+    }
+    fn wake(&self) {}
+}
+struct Guest {
+    got: Arc<Mutex<Vec<InputEventEntry>>>,
+    takes: Arc<AtomicBool>,
+}
+impl crate::display::InputSink for Guest {
+    fn push(&mut self, events: &[InputEventEntry]) -> usize {
+        self.got.lock().unwrap().extend_from_slice(events);
+        events.len()
+    }
+    fn takes_input(&mut self) -> bool {
+        self.takes.load(Ordering::Relaxed)
+    }
+}
+
+/// The link thread routes a guest that takes no Conduit input to the console
+/// before and after its frames take over; once it takes input, input follows
+/// the picture, and on each switch what was held is released where it was.
+#[test]
+fn a_guest_without_conduit_input_keeps_the_console_input() {
+    let dir = std::env::temp_dir().join(format!("nvgpu-console-noinput-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("broker.sock");
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).unwrap();
+    let link = DisplayLink::new(Some(path.clone()));
+    let to_console = Arc::new(Mutex::new(Vec::new()));
+    let to_guest = Arc::new(Mutex::new(Vec::new()));
+    let takes = Arc::new(AtomicBool::new(false));
+    link.attach_console(Arc::new(Rec(to_console.clone())));
+    let stop = Arc::new(AtomicBool::new(false));
+    let th = {
+        let sink = Guest {
+            got: to_guest.clone(),
+            takes: takes.clone(),
+        };
+        let (link, stop) = (link.clone(), stop.clone());
+        std::thread::spawn(move || link.run(Box::new(sink), &stop))
+    };
+    let (mut viewer, _) = listener.accept().unwrap();
+    let key = |code: i32, down: i32| wire::Pkt {
+        ty: wire::EV_KEY,
+        x: code,
+        y: down,
+        ..Default::default()
+    };
+    let pad = wire::Pkt {
+        ty: wire::EV_PAD,
+        x: 0x130, // BTN_SOUTH
+        y: 1,
+        w0: input::EV_KEY as u32,
+        ..Default::default()
+    };
+    let hello = wire::Pkt {
+        ty: wire::EV_HELLO,
+        w0: wire::PROTO_VERSION,
+        ..Default::default()
+    };
+    let console_len = || to_console.lock().unwrap().len();
+    viewer.write_all(&hello.encode()).unwrap();
+
+    // Before the guest's frames: the console.
+    viewer.write_all(&key(30, 1).encode()).unwrap();
+    assert!(wait_for(|| console_len() == 2));
+
+    // The guest's frames take over with KEY_A held: nothing is released,
+    // and what follows still goes to the console -- the release of KEY_A
+    // too. A gamepad stays the guest's, which takes none: dropped.
+    let buf = memfd();
+    guest_flip(&link, &buf);
+    assert!(!link.console_shown());
+    viewer.write_all(&pad.encode()).unwrap();
+    viewer.write_all(&key(30, 0).encode()).unwrap();
+    viewer.write_all(&key(48, 1).encode()).unwrap();
+    assert!(wait_for(|| console_len() == 6));
+    {
+        let c = to_console.lock().unwrap();
+        assert_eq!(c[2], ev(input::EV_KEY, 30, 0));
+        assert_eq!(c[4], ev(input::EV_KEY, 48, 1));
+    }
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(to_guest.lock().unwrap().is_empty(), "nothing for the guest");
+    assert!(link.stats.input_dropped.load(Ordering::Relaxed) >= 1);
+
+    // The guest starts taking input (a driver that posts event buffers)
+    // while its frames are shown: KEY_B is released on the console, and the
+    // guest gets what follows, gamepads included.
+    takes.store(true, Ordering::Relaxed);
+    viewer.write_all(&key(30, 1).encode()).unwrap();
+    viewer.write_all(&pad.encode()).unwrap();
+    assert!(wait_for(|| to_guest.lock().unwrap().len() == 3));
+    assert_eq!(console_len(), 8);
+    assert_eq!(to_console.lock().unwrap()[6], ev(input::EV_KEY, 48, 0));
+    {
+        let g = to_guest.lock().unwrap();
+        assert_eq!(g[0], ev(input::EV_KEY, 30, 1));
+        assert_eq!(g[2].ev_type, (1 << 8) | input::EV_KEY, "pad 0");
+    }
+
+    // It stops (the queue went with a reset): input is the console's again.
+    // KEY_A's release is the guest's, which takes nothing now: dropped, not
+    // kept for a later driver.
+    let dropped = link.stats.input_dropped.load(Ordering::Relaxed);
+    takes.store(false, Ordering::Relaxed);
+    viewer.write_all(&key(31, 1).encode()).unwrap();
+    assert!(wait_for(|| console_len() == 10));
+    assert_eq!(to_console.lock().unwrap()[8], ev(input::EV_KEY, 31, 1));
+    assert_eq!(to_guest.lock().unwrap().len(), 3);
+    assert_eq!(
+        link.stats.input_dropped.load(Ordering::Relaxed),
+        dropped + 2
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    drop(viewer);
+    th.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Hidden behind a guest that takes no Conduit input, the console still
+/// sends input to the server, with relative motion measured against the
+/// guest's picture rather than QEMU's screen.
+#[test]
+fn input_reaches_the_server_behind_the_guest_picture() {
+    let server = Server::new("behind");
+    let (link, _viewer, console) = setup(&server);
+    let mut c = server.accept(100, 50);
+    assert!(matches!(c.request(), Msg::Request { .. }));
+    c.update(&[(0, 0, 0, 0, rfb::ENC_QEMU_EXT_KEY, vec![])]);
+    // The guest's 64x32 frames take over.
+    let buf = memfd();
+    guest_flip(&link, &buf);
+    assert!(!link.console_shown());
+    assert_eq!(link.guest_picture_size(), Some((64, 32)));
+    std::thread::sleep(Duration::from_millis(30));
+    let sink: Arc<dyn ConsoleSink> = console.shared.clone();
+    sink.input(&[
+        ev(input::EV_KEY, 60, 1),
+        syn(),
+        ev(input::EV_ABS, input::ABS_X, 0),
+        ev(input::EV_ABS, input::ABS_Y, 0),
+        ev(input::EV_REL, input::REL_X, 32),
+        ev(input::EV_REL, input::REL_Y, 31),
+        syn(),
+    ]);
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        if let Msg::Other(m) = c.msg() {
+            got.push(m);
+        }
+    }
+    assert_eq!(got[0], rfb::qemu_key_event(true, 0xffbf, 0x3c));
+    // Half the guest's width is half QEMU's; its full height is QEMU's.
+    assert_eq!(got[1], rfb::pointer_event(0, 50, 49));
+    console.stop();
 }

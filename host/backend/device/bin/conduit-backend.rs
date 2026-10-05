@@ -460,6 +460,31 @@ struct VqInputSink {
     warned_small: bool,
     warned_clip_small: bool,
     msg: Vec<u8>,
+    /// The guest has posted event-queue buffers since the queue last
+    /// started (see `takes_input`).
+    posted: bool,
+}
+
+/// Whether the guest has posted buffers on the event queue since it last
+/// started it: the queue is running and the guest's avail index has moved
+/// (or the device has consumed from it). `latch` is the answer so far; it is
+/// kept while the queue runs, so a guest that has every buffer out at the
+/// moment still counts, and cleared when the queue stops (a reset or reboot:
+/// the next driver has to post again).
+fn event_buffers_posted(
+    vring: &VringRwLock,
+    mem: &GuestMemoryAtomic<GuestMemoryMmap>,
+    latch: bool,
+) -> bool {
+    let vr = vring.get_ref();
+    let q = vr.get_queue();
+    if !q.ready() || q.avail_ring() == 0 {
+        return false;
+    }
+    latch
+        || q.next_avail() != 0
+        || q.avail_idx(&*mem.memory(), std::sync::atomic::Ordering::Acquire)
+            .is_ok_and(|i| i.0 != 0)
 }
 
 /// Clipboard chunks put on the event queue per call: buffers are shared with
@@ -467,6 +492,20 @@ struct VqInputSink {
 const CLIP_CHUNKS_PER_PASS: usize = 16;
 
 impl InputSink for VqInputSink {
+    /// The guest takes `InputEvent`s if its driver posts event-queue
+    /// buffers. The Linux guest posts 64 at probe, long before its first
+    /// frame; the Windows KMD never starts the queue at all (it runs only
+    /// the control queue), and has nowhere to put an `InputEvent` anyway.
+    fn takes_input(&mut self) -> bool {
+        let target = self.target.lock().expect("event target").clone();
+        self.posted = match target {
+            Some((vring, mem)) => event_buffers_posted(&vring, &mem, self.posted),
+            // No guest request served yet: nothing posted that we know of.
+            None => false,
+        };
+        self.posted
+    }
+
     fn push(&mut self, events: &[InputEventEntry]) -> usize {
         let Some((vring, mem)) = self.target.lock().expect("event target").clone() else {
             // No guest yet: nobody to type at. Dropped, not queued.
@@ -1592,6 +1631,7 @@ fn main() -> anyhow::Result<()> {
             warned_small: false,
             warned_clip_small: false,
             msg: Vec::new(),
+            posted: false,
         };
         if link.path().is_some() {
             let l = link.clone();
@@ -1728,6 +1768,36 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guest takes input once it has posted event-queue buffers (the
+    /// Linux guest, at probe), never while the queue is not running (the
+    /// Windows KMD never starts it), and not again after it stops until the
+    /// next driver posts anew.
+    #[test]
+    fn event_buffers_count_once_the_guest_posts_them() {
+        let gm = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryAtomic::new(gm);
+        let vring = VringRwLock::new(mem.clone(), 256).unwrap();
+        // A guest that never starts the queue.
+        assert!(!event_buffers_posted(&vring, &mem, false));
+        vring.set_queue_size(16);
+        vring.set_queue_info(0x1000, 0x2000, 0x3000).unwrap();
+        vring.set_queue_ready(true);
+        // Started, nothing posted yet.
+        assert!(!event_buffers_posted(&vring, &mem, false));
+        // Posted: the avail index moved.
+        let avail_idx = GuestAddress(0x2002);
+        mem.memory().write_obj(64u16.to_le(), avail_idx).unwrap();
+        assert!(event_buffers_posted(&vring, &mem, false));
+        // Kept while the queue runs, whatever the index reads (wrapped).
+        mem.memory().write_obj(0u16, avail_idx).unwrap();
+        assert!(event_buffers_posted(&vring, &mem, true));
+        assert!(!event_buffers_posted(&vring, &mem, false));
+        // Stopped (a reset): gone, latch or not.
+        mem.memory().write_obj(64u16.to_le(), avail_idx).unwrap();
+        vring.set_queue_ready(false);
+        assert!(!event_buffers_posted(&vring, &mem, true));
+    }
 
     /// A fence's status rides in the header, signed, as the guest reads it.
     #[test]

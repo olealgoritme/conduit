@@ -247,6 +247,20 @@ to it and input goes to the guest driver as usual. The console takes over
 again after a device reset, when the event queue stops, or when a
 `ScanoutDisable` is not followed by a flip within 250 ms.
 
+Input follows the picture only for a guest that takes Conduit input, which
+the backend reads from the event queue: the guest has started it and posted
+buffers on it (the Linux driver posts them at probe; cleared when the queue
+stops). A guest that never does -- Windows, whose Helios KMD runs only the
+control queue -- keeps its keyboard and pointer on the emulated PS/2 keyboard
+and USB tablet through the console's VNC connection even while its own
+frames are shown, since that is all it understands. The pointer is then
+placed by the guest's picture: absolute positions as the same fraction of
+QEMU's screen (which QEMU scales onto the tablet's range), relative motion in
+guest-frame pixels. Held keys and buttons are released on the side input
+leaves at every switch; gamepads only ever go to the guest (dropped, with a
+debug line, for one that takes no input). Without `--console-vnc` all input
+goes to the guest as before.
+
 There is no dma-buf behind that screen, so its frames are the one exception to
 zero copy: XRGB8888 in a sealed memfd, sent with the ATTACH flag `F_SHM`
 (`nvkvm_broker_proto.h`). `conduit-viewer` presents them in every present mode

@@ -994,6 +994,17 @@ pub trait InputSink: Send {
         let _ = (generation, offset);
         data.len()
     }
+
+    /// Whether the guest takes Conduit input at all: its driver has brought
+    /// up the event queue and posted buffers on it (the Linux guest posts
+    /// them at probe). A guest whose driver never does (Windows: the Helios
+    /// KMD runs only the control queue) has no use for `InputEvent`s; with a
+    /// boot console attached, its input goes to the VM's emulated keyboard
+    /// and tablet instead, whoever shows the picture. Asked by the link
+    /// thread at every turn; must be cheap and must not block.
+    fn takes_input(&mut self) -> bool {
+        true
+    }
 }
 
 /// The boot console (`crate::console`): where input goes while it is shown,
@@ -1150,6 +1161,9 @@ struct LinkState {
     /// The boot console, when one is attached, and who owns the picture.
     console: Option<Arc<dyn ConsoleSink>>,
     console_mode: Option<ConsoleMode>,
+    /// The size of the guest's last frame: what the viewer shows while the
+    /// guest owns the picture.
+    guest_size: Option<(u32, u32)>,
 }
 
 /// Guest -> broker clipboard pacing: at most this many records per
@@ -1199,6 +1213,8 @@ pub struct DisplayLink {
     /// The console is shown (input goes to it); read without the lock for
     /// every input packet.
     console_shown: AtomicBool,
+    /// A console is attached ([`DisplayLink::attach_console`]).
+    console_attached: AtomicBool,
     pub stats: LinkStats,
 }
 
@@ -1251,6 +1267,7 @@ impl DisplayLink {
             clip_resend: AtomicBool::new(false),
             exporter: Mutex::new(Arc::new(real_export)),
             console_shown: AtomicBool::new(false),
+            console_attached: AtomicBool::new(false),
             stats: LinkStats::default(),
         })
     }
@@ -1364,7 +1381,7 @@ impl DisplayLink {
     /// client became active meanwhile: then export and [`DisplayLink::flip`].
     pub fn park(&self, drm: RawFd, f: &ScanoutFlip) -> bool {
         let mut st = self.state.lock().unwrap();
-        self.guest_shows_locked(&mut st);
+        self.guest_shows_locked(&mut st, f);
         if self.wants_frames() {
             return false;
         }
@@ -1497,7 +1514,7 @@ impl DisplayLink {
     /// frames. Never blocks.
     pub fn flip(&self, dmabuf: RawFd, f: &ScanoutFlip) -> FlipOutcome {
         let mut st = self.state.lock().unwrap();
-        self.guest_shows_locked(&mut st);
+        self.guest_shows_locked(&mut st, f);
         if !self.wants_frames() {
             self.stats.no_broker.fetch_add(1, Ordering::Relaxed);
             return FlipOutcome::NoBroker;
@@ -1553,7 +1570,7 @@ impl DisplayLink {
         };
         if !self.wants_frames() {
             let mut st = self.state.lock().unwrap();
-            self.guest_shows_locked(&mut st);
+            self.guest_shows_locked(&mut st, &f);
             if !self.wants_frames() {
                 st.frame = Self::keep(dmabuf).map(|k| (k, f, 0));
                 if st.parked_frame.take().is_some() {
@@ -2022,13 +2039,36 @@ impl DisplayLink {
     pub fn attach_console(&self, sink: Arc<dyn ConsoleSink>) {
         let mut st = self.state.lock().unwrap();
         st.console = Some(sink);
+        self.console_attached.store(true, Ordering::Release);
         self.set_console_locked(&mut st, ConsoleMode::Shown);
     }
 
-    /// The console is shown, and gets the input.
+    /// The console is shown. It gets the input then, and also while the
+    /// guest takes no Conduit input ([`InputSink::takes_input`]).
     #[inline]
     pub fn console_shown(&self) -> bool {
         self.console_shown.load(Ordering::Acquire)
+    }
+
+    /// Where viewer input goes, given whether the guest takes Conduit input:
+    /// `true` for the console. With no console attached, always the guest
+    /// (as before there was one); with one, the console while it is shown,
+    /// and for a guest that takes no Conduit input whoever shows the picture
+    /// -- the VM's emulated keyboard and tablet are all such a guest has.
+    pub fn input_to_console(&self, guest_takes_input: bool) -> bool {
+        self.console_attached.load(Ordering::Acquire)
+            && (self.console_shown() || !guest_takes_input)
+    }
+
+    /// What the viewer shows: the size of the guest's last frame while the
+    /// guest owns the picture, `None` while the console does (its own
+    /// framebuffer then) or before the guest's first frame.
+    pub fn guest_picture_size(&self) -> Option<(u32, u32)> {
+        let st = self.state.lock().unwrap();
+        match st.console_mode {
+            Some(ConsoleMode::Shown) => None,
+            _ => st.guest_size.filter(|&(w, h)| w > 0 && h > 0),
+        }
     }
 
     /// The console's own view: promote a pending takeover that is due, and
@@ -2064,7 +2104,8 @@ impl DisplayLink {
     }
 
     /// A guest frame: the guest owns the picture from now.
-    fn guest_shows_locked(&self, st: &mut LinkState) {
+    fn guest_shows_locked(&self, st: &mut LinkState, f: &ScanoutFlip) {
+        st.guest_size = Some((f.width, f.height));
         if st.console_mode.is_some_and(|m| m != ConsoleMode::Guest) {
             log::info!("display: the guest's driver is showing frames; boot console hidden");
             self.set_console_locked(st, ConsoleMode::Guest);
@@ -2185,16 +2226,42 @@ impl DisplayLink {
         let mut latest_clip: Option<Vec<u8>> = None;
         // The sink took nothing last time (no guest yet): retry slowly.
         let mut clip_stalled = false;
-        // Input for the boot console while it is shown, and where input went
-        // last: on a change, what the old side holds is released there.
+        // Input for the boot console (see `input_to_console`), and where
+        // input went last: on a change, what the old side holds is released
+        // there.
         let mut to_console: Vec<InputEventEntry> = Vec::new();
         let mut routed_console = false;
+        // Whether the guest takes Conduit input, as last asked (`None` until
+        // first asked), and whether input stays on the console behind the
+        // guest's frames (logged once per stretch).
+        let mut guest_input: Option<bool> = None;
+        let mut kept_on_console = false;
+        // Guest-bound input dropped since the guest last took input, for
+        // one debug line per stretch.
+        let mut dropped_note = false;
         let console_switch = |rd: &mut Vec<Reader>,
                               routed: &mut bool,
                               pending: &mut Vec<InputEventEntry>,
-                              to_console: &mut Vec<InputEventEntry>| {
-            let shown = self.console_shown();
-            if shown == *routed {
+                              to_console: &mut Vec<InputEventEntry>,
+                              guest_input: &mut Option<bool>,
+                              kept: &mut bool,
+                              sink: &mut dyn InputSink| {
+            let takes = sink.takes_input();
+            let attached = self.console_attached.load(Ordering::Relaxed);
+            if attached && takes && *guest_input == Some(false) {
+                log::info!("display: the guest posted event-queue buffers; it takes input events");
+            }
+            *guest_input = Some(takes);
+            let console = self.input_to_console(takes);
+            let now_kept = console && !self.console_shown();
+            if now_kept && !*kept {
+                log::info!(
+                    "display: the guest's frames are shown, but it posts no event-queue buffers \
+                     (no Conduit input driver); input stays on the VM's emulated keyboard and tablet"
+                );
+            }
+            *kept = now_kept;
+            if console == *routed {
                 return;
             }
             let old = if *routed {
@@ -2205,11 +2272,19 @@ impl DisplayLink {
             for r in rd.iter_mut() {
                 r.tr.release_all(old);
             }
-            *routed = shown;
+            *routed = console;
         };
 
         while !stop.load(Ordering::Relaxed) {
-            console_switch(&mut rd, &mut routed_console, &mut pending, &mut to_console);
+            console_switch(
+                &mut rd,
+                &mut routed_console,
+                &mut pending,
+                &mut to_console,
+                &mut guest_input,
+                &mut kept_on_console,
+                &mut *sink,
+            );
             // Connections that changed under us (a send broke one, a test
             // adopted one): the old one's held input is released.
             let socks = self.sockets();
@@ -2265,7 +2340,7 @@ impl DisplayLink {
                 }
             }
             self.deliver_console(&mut to_console);
-            self.deliver(&mut *sink, &mut pending);
+            self.deliver(&mut *sink, &mut pending, guest_input, &mut dropped_note);
             let socks = self.sockets();
             // Pick up a connection made just now on the next round.
             if socks
@@ -2366,7 +2441,15 @@ impl DisplayLink {
                     continue;
                 }
                 let mut bye = false;
-                console_switch(&mut rd, &mut routed_console, &mut pending, &mut to_console);
+                console_switch(
+                    &mut rd,
+                    &mut routed_console,
+                    &mut pending,
+                    &mut to_console,
+                    &mut guest_input,
+                    &mut kept_on_console,
+                    &mut *sink,
+                );
                 let Reader {
                     tr,
                     reader,
@@ -2394,7 +2477,8 @@ impl DisplayLink {
                     if let Some(m) = policy.packet(i, &p) {
                         pending_mode = Some(m);
                     }
-                    // Gamepads are the guest's whatever is shown.
+                    // Gamepads are the guest's whatever is shown: the
+                    // console has no gamepad to give them to.
                     if routed_console && p.ty != wire::EV_PAD {
                         tr.packet(&p, &mut to_console);
                     } else {
@@ -2409,7 +2493,7 @@ impl DisplayLink {
                 self.retry_frames(&writable);
             }
             self.deliver_console(&mut to_console);
-            self.deliver(&mut *sink, &mut pending);
+            self.deliver(&mut *sink, &mut pending, guest_input, &mut dropped_note);
             if let Some(m) = pending_mode
                 && sink.mode(&m)
             {
@@ -2488,8 +2572,36 @@ impl DisplayLink {
         events.clear();
     }
 
-    fn deliver(&self, sink: &mut dyn InputSink, pending: &mut Vec<InputEventEntry>) {
+    /// Input for the guest, as far as its posted buffers take it. With a
+    /// console attached and a guest that takes no Conduit input, what is
+    /// left for it (gamepads, which have nowhere else to go) is dropped:
+    /// nothing would ever take it.
+    fn deliver(
+        &self,
+        sink: &mut dyn InputSink,
+        pending: &mut Vec<InputEventEntry>,
+        guest_input: Option<bool>,
+        dropped_note: &mut bool,
+    ) {
+        if guest_input == Some(true) {
+            *dropped_note = false;
+        }
         if pending.is_empty() {
+            return;
+        }
+        if guest_input == Some(false) && self.console_attached.load(Ordering::Relaxed) {
+            if !*dropped_note {
+                log::debug!(
+                    "display: {} input events for a guest that takes none (gamepad?) dropped; \
+                     more are dropped silently until it does",
+                    pending.len()
+                );
+                *dropped_note = true;
+            }
+            self.stats
+                .input_dropped
+                .fetch_add(pending.len() as u64, Ordering::Relaxed);
+            pending.clear();
             return;
         }
         let n = sink.push(pending).min(pending.len());

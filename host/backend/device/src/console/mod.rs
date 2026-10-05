@@ -3,7 +3,8 @@
 // The boot console (`--console-vnc PATH`): the VM's emulated screen --
 // firmware setup, the boot menu, a disk password prompt, early kernel output
 // -- shown in the viewer whenever the guest's Conduit driver is not, with the
-// keyboard and pointer routed to it.
+// keyboard and pointer routed to it (always, for a guest without Conduit
+// input; see below).
 //
 // QEMU serves that screen over VNC on a unix socket (`-vnc unix:PATH`); this
 // is a minimal RFB 3.8 client for it (`rfb`): security None, raw pixels in
@@ -18,6 +19,13 @@
 // updates at most every `FRAME_EVERY` and publishes each finished update as
 // a shared-memory frame (`DisplayLink::flip_console`), from a sealed memfd,
 // double-buffered.
+//
+// Input follows the picture for a guest that takes Conduit input (Linux:
+// its driver posts event-queue buffers at probe). A guest that takes none
+// (Windows, whose driver runs only the control queue) keeps its input here
+// -- QEMU's emulated keyboard and tablet -- even while its own frames are
+// shown (`DisplayLink::input_to_console`); the pointer is then placed by the
+// guest's frame, not by the hidden console screen (`InputEncoder`).
 //
 // It runs on a thread of its own, polling the socket and an eventfd the link
 // kicks; nothing here can stall the control queue or the link thread. QEMU
@@ -89,13 +97,46 @@ pub type GuestProbe = Box<dyn FnMut() -> bool + Send>;
 /// QEMU Extended Key Events (or plain keysyms for a server without the
 /// extension), the pointer as absolute positions in the framebuffer with a
 /// button mask. Remembers what is held, so the console can let go of it.
+///
+/// The pointer is kept as a position in the picture the viewer shows, in
+/// `0..=INPUT_ABS_MAX` on each axis, and placed at the same fraction of the
+/// VNC framebuffer: QEMU scales a VNC position by its framebuffer's size onto
+/// the emulated tablet's range, and the guest maps that range onto its
+/// screen. So the pointer lands where the viewer shows it whether the
+/// picture is the console's or, for a guest that takes no Conduit input
+/// ([`crate::display::InputSink::takes_input`]), the guest's own frames at
+/// any size. Relative motion is in pixels of the picture shown.
 #[derive(Default, Debug)]
 pub struct InputEncoder {
     held: BTreeSet<u16>,
     buttons: u8,
-    x: u16,
-    y: u16,
+    /// The position, in `0..=INPUT_ABS_MAX` of the picture shown.
+    ax: i32,
+    ay: i32,
+    /// The framebuffer the last pointer message was encoded for.
+    fb: (u16, u16),
     moved: bool,
+}
+
+/// The sizes one event is encoded against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sizes {
+    /// The VNC server's framebuffer: what pointer positions are in.
+    pub fb: (u16, u16),
+    /// The picture the viewer shows: what relative motion is in. The
+    /// framebuffer while the console is shown; the guest's frame size while
+    /// the guest's frames are.
+    pub view: (u32, u32),
+}
+
+impl Sizes {
+    /// The console shown: the picture is the framebuffer.
+    pub const fn console(fb: (u16, u16)) -> Self {
+        Self {
+            fb,
+            view: (fb.0 as u32, fb.1 as u32),
+        }
+    }
 }
 
 impl InputEncoder {
@@ -109,6 +150,14 @@ impl InputEncoder {
         ((v * (dim as i64 - 1) + max / 2) / max) as u16
     }
 
+    /// `d` pixels of a `dim`-pixel axis added to `a` in `0..=INPUT_ABS_MAX`.
+    fn nudge(a: i32, d: i32, dim: u32) -> i32 {
+        let max = INPUT_ABS_MAX as i64;
+        let span = (dim.max(2) - 1) as i64;
+        let step = (d as i64 * max + d.signum() as i64 * span / 2) / span;
+        (a as i64 + step).clamp(0, max) as i32
+    }
+
     fn key(code: u16, down: bool, ext_key: bool, out: &mut Vec<u8>) {
         let sym = keymap::keysym(code);
         if ext_key {
@@ -120,20 +169,23 @@ impl InputEncoder {
         }
     }
 
-    fn pointer(&self, mask: u8, out: &mut Vec<u8>) {
-        out.extend_from_slice(&rfb::pointer_event(mask, self.x, self.y));
+    /// The pointer position in the framebuffer.
+    pub fn position(&self) -> (u16, u16) {
+        (
+            Self::scale(self.ax, self.fb.0),
+            Self::scale(self.ay, self.fb.1),
+        )
     }
 
-    /// One event; `size` is the framebuffer's, `ext_key` whether the server
-    /// takes Extended Key Events.
-    pub fn event(
-        &mut self,
-        e: &InputEventEntry,
-        size: (u16, u16),
-        ext_key: bool,
-        out: &mut Vec<u8>,
-    ) {
-        let (w, h) = size;
+    fn pointer(&self, mask: u8, out: &mut Vec<u8>) {
+        let (x, y) = self.position();
+        out.extend_from_slice(&rfb::pointer_event(mask, x, y));
+    }
+
+    /// One event; `ext_key` is whether the server takes Extended Key Events.
+    pub fn event(&mut self, e: &InputEventEntry, sizes: Sizes, ext_key: bool, out: &mut Vec<u8>) {
+        self.fb = sizes.fb;
+        let (vw, vh) = sizes.view;
         match e.ev_type {
             input::EV_KEY => {
                 let down = e.value != 0;
@@ -167,19 +219,19 @@ impl InputEncoder {
             }
             input::EV_ABS => {
                 match e.code {
-                    input::ABS_X => self.x = Self::scale(e.value, w),
-                    input::ABS_Y => self.y = Self::scale(e.value, h),
+                    input::ABS_X => self.ax = e.value.clamp(0, INPUT_ABS_MAX),
+                    input::ABS_Y => self.ay = e.value.clamp(0, INPUT_ABS_MAX),
                     _ => return,
                 }
                 self.moved = true;
             }
             input::EV_REL => match e.code {
                 input::REL_X => {
-                    self.x = (self.x as i64 + e.value as i64).clamp(0, w.max(1) as i64 - 1) as u16;
+                    self.ax = Self::nudge(self.ax, e.value, vw);
                     self.moved = true;
                 }
                 input::REL_Y => {
-                    self.y = (self.y as i64 + e.value as i64).clamp(0, h.max(1) as i64 - 1) as u16;
+                    self.ay = Self::nudge(self.ay, e.value, vh);
                     self.moved = true;
                 }
                 // A wheel detent is a press and release of a wheel button.
@@ -219,12 +271,6 @@ impl InputEncoder {
 
     pub fn held(&self) -> usize {
         self.held.len()
-    }
-
-    /// The framebuffer changed size: keep the pointer inside it.
-    fn clamp(&mut self, size: (u16, u16)) {
-        self.x = self.x.min(size.0.saturating_sub(1));
-        self.y = self.y.min(size.1.saturating_sub(1));
     }
 }
 
@@ -645,7 +691,6 @@ impl Worker {
     fn session(&mut self, sock: UnixStream, init: &rfb::ServerInit) -> io::Result<()> {
         check_size(init.width, init.height)?;
         self.frames.resize(init.width, init.height);
-        self.enc.clamp((init.width, init.height));
         self.out.clear();
         let mut s = Session {
             sock,
@@ -667,11 +712,19 @@ impl Worker {
             }
             s.shown = shown;
 
-            // Input, encoded against the current framebuffer size.
+            // Input, encoded against the current framebuffer and the picture
+            // the viewer shows: the console's, or the guest's frames for a
+            // guest that takes no Conduit input (`DisplayLink::input_to_console`).
             let events = std::mem::take(&mut *self.shared.input.lock().unwrap());
-            let size = (self.frames.width, self.frames.height);
-            for e in &events {
-                self.enc.event(e, size, s.ext_key, &mut self.out);
+            if !events.is_empty() {
+                let fb = (self.frames.width, self.frames.height);
+                let mut sizes = Sizes::console(fb);
+                if !shown && let Some(view) = self.link.guest_picture_size() {
+                    sizes.view = view;
+                }
+                for e in &events {
+                    self.enc.event(e, sizes, s.ext_key, &mut self.out);
+                }
             }
 
             // Ask for the next frame, paced, and only while shown.
@@ -766,7 +819,6 @@ impl Worker {
                     check_size(r.w, r.h)?;
                     log::info!("console: the VM's screen is now {}x{}", r.w, r.h);
                     self.frames.resize(r.w, r.h);
-                    self.enc.clamp((r.w, r.h));
                     // Shown with the pixels the full update brings, not as
                     // a black frame now.
                     s.need_full = true;
