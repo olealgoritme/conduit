@@ -257,15 +257,17 @@ rule (`device::display::guest_takes_input`) has two parts, both required:
    it in its feature table and so acks it; the backend sees the acked
    features at device start. A Linux module from before the bit acks only
    `VIRTIO_F_VERSION_1`, but it is recognised anyway: it is the only guest
-   that sends `GetSysFiles`/`GetProcFiles`, which every version does at
-   probe. Both are forgotten when the device restarts or resets.
+   that sends `GetSysFiles`/`GetProcFiles` before any `Open`, `Ioctl`,
+   `ScanoutFlip` or `GpuCmd`, which every version does at probe. Both are
+   forgotten when the device restarts or resets.
 2. **Its event queue is live**: the guest has started it and posted buffers
    on it (the Linux driver posts them at probe; cleared when the queue
    stops).
 
 A guest that does not declare it -- Windows, whose Helios KMD acks only
-`VIRTIO_F_VERSION_1` and never sends `GetSysFiles`, even once it runs the
-event queue for `EventReady` -- keeps its keyboard and pointer on the emulated
+`VIRTIO_F_VERSION_1` and runs the event queue for `EventReady`, but sends
+`GetSysFiles` only when an application's NVK on RM forwards one, long after
+its own scanout and Venus traffic -- keeps its keyboard and pointer on the emulated
 PS/2 keyboard and USB tablet through the console's VNC connection even while
 its own frames are shown, since that is all it understands. The frontend must
 pass device feature bits through: QEMU's generic vhost-user device does;

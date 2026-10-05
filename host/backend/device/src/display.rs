@@ -1017,10 +1017,16 @@ pub trait InputSink: Send {
 pub struct GuestInputClaims {
     /// The guest acked the virtio feature `NVGPU_CFG_TAKES_INPUT`.
     acked: AtomicBool,
-    /// The guest asked for `GetSysFiles` or `GetProcFiles`: only the Linux
-    /// guest module does (at probe, in every version), so this is a Linux
-    /// guest even when its module predates the feature bit.
+    /// The guest asked for `GetSysFiles` or `GetProcFiles` before anything
+    /// else that identifies a driver: the Linux guest module does, at probe,
+    /// in every version, so this is a Linux guest even when its module
+    /// predates the feature bit.
     linux: AtomicBool,
+    /// An `Open`, `Ioctl`, `ScanoutFlip` or `GpuCmd` came first. The Windows
+    /// KMD has always sent scanout or Venus traffic by the time an
+    /// application's NVK forwards its own `GetSysFiles` (librmclient asks for
+    /// it at `crm_open`), so a later one says nothing about the driver.
+    other_first: AtomicBool,
 }
 
 impl GuestInputClaims {
@@ -1031,6 +1037,7 @@ impl GuestInputClaims {
         self.acked
             .store(acked_features & bit != 0, Ordering::Release);
         self.linux.store(false, Ordering::Release);
+        self.other_first.store(false, Ordering::Release);
     }
 
     /// The device was reset: nothing is known about the next driver.
@@ -1042,10 +1049,17 @@ impl GuestInputClaims {
     #[inline]
     pub fn saw_request(&self, msg_type: u32) {
         use protocol::messages::MsgType;
-        if (msg_type == MsgType::GetSysFiles as u32 || msg_type == MsgType::GetProcFiles as u32)
-            && !self.linux.load(Ordering::Relaxed)
-        {
+        if self.linux.load(Ordering::Relaxed) || self.other_first.load(Ordering::Relaxed) {
+            return;
+        }
+        if msg_type == MsgType::GetSysFiles as u32 || msg_type == MsgType::GetProcFiles as u32 {
             self.linux.store(true, Ordering::Release);
+        } else if msg_type == MsgType::Open as u32
+            || msg_type == MsgType::Ioctl as u32
+            || msg_type == MsgType::ScanoutFlip as u32
+            || msg_type == MsgType::GpuCmd as u32
+        {
+            self.other_first.store(true, Ordering::Release);
         }
     }
 
@@ -1070,8 +1084,10 @@ impl GuestInputClaims {
 /// consumes `InputEvent`s -- it acked `NVGPU_CFG_TAKES_INPUT`, or, for a
 /// Linux guest module from before that bit, it is the Linux module
 /// (`linux_guest`). A queue alone is not enough: the Windows KMD runs one to
-/// receive `EventReady`, never acks the bit and never asks for
-/// `GetSysFiles`, and its keyboard and mouse are QEMU's emulated devices.
+/// receive `EventReady`, never acks the bit, never asks for `GetSysFiles`
+/// before its own scanout or Venus traffic (NVK on RM forwards one later,
+/// from an application), and its keyboard and mouse are QEMU's emulated
+/// devices.
 pub fn guest_takes_input(event_queue_live: bool, acked_bit: bool, linux_guest: bool) -> bool {
     event_queue_live && (acked_bit || linux_guest)
 }
@@ -2881,13 +2897,13 @@ mod tests {
         assert!(claims.takes_input(true));
 
         // Linux, a module from before the bit: acks only VERSION_1, but asks
-        // for sys or proc files at probe.
+        // for sys or proc files at probe, before anything else.
         claims.device_started(VERSION_1);
         assert!(!claims.takes_input(true), "not yet identified");
-        claims.saw_request(MsgType::Open as u32);
-        assert!(!claims.takes_input(true));
         claims.saw_request(MsgType::GetSysFiles as u32);
         assert!(claims.takes_input(true));
+        claims.saw_request(MsgType::Open as u32);
+        assert!(claims.takes_input(true), "later traffic does not undo it");
         assert!(!claims.takes_input(false));
         claims.device_started(VERSION_1);
         claims.saw_request(MsgType::GetProcFiles as u32);
@@ -2906,6 +2922,11 @@ mod tests {
             claims.saw_request(t as u32);
         }
         assert!(!claims.takes_input(true));
+        // ...and then NVK on RM in an application, whose librmclient
+        // forwards GetSysFiles through the KMD: still not the Linux module.
+        claims.saw_request(MsgType::GetSysFiles as u32);
+        claims.saw_request(MsgType::GetProcFiles as u32);
+        assert!(!claims.takes_input(true), "Windows NVK's GetSysFiles came late");
 
         // A Linux guest reboots into Windows: the restart forgets it.
         claims.device_started(VERSION_1 | u64::from(NVGPU_CFG_TAKES_INPUT));

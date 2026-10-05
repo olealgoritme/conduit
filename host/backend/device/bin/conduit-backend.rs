@@ -1887,9 +1887,14 @@ mod tests {
 
         // Windows: event queue live and posted, no bit, no sys files.
         claims.device_started(VERSION_1);
+        claims.saw_request(MsgType::ScanoutFlip as u32);
         claims.saw_request(MsgType::Open as u32);
         claims.saw_request(MsgType::GpuCmd as u32);
         assert!(!sink.takes_input(), "input stays on QEMU's devices");
+        // NVK on RM there forwards GetSysFiles from user mode: too late to
+        // be the Linux module.
+        claims.saw_request(MsgType::GetSysFiles as u32);
+        assert!(!sink.takes_input(), "Windows NVK is not the Linux module");
     }
 
     /// A fence's status rides in the header, signed, as the guest reads it.
