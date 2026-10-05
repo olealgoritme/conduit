@@ -281,6 +281,94 @@ pub static ESCAPE_SUBMIT_CALLS: AtomicU32 = AtomicU32::new(0);
 pub static ESCAPE_BATCH_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static ESCAPE_BATCH_ENTRIES: AtomicU32 = AtomicU32::new(0);
 pub static ESCAPE_BATCH_MAX: AtomicU32 = AtomicU32::new(0);
+
+/// Submission escapes attributed to the Venus context that sent them.
+///
+/// `EscSub`/`EscSubRing`/`EscCalls` are ADAPTER-GLOBAL: DWM's own ICD instance
+/// submits through the same escape and moves all of them, so a before/after of
+/// one application's environment switch cannot be read from them. Every ICD
+/// instance creates its own context and logs `CTX_CREATE OK ctx_id=N` in its
+/// diag log, so a per-context row is attributable to a process without any
+/// process-identity API. Published (occupied slots only) as `EscC<i>Id`,
+/// `EscC<i>Calls` (escapes), `EscC<i>Sub` (submits) and `EscC<i>R0` (the
+/// ring_idx 0 subset of those submits: ring wake-ups and roundtrips, which
+/// retire at host decode). `EscCOvf` counts escapes that found the table full.
+pub const ESC_CTX_SLOTS: usize = 8;
+
+pub struct EscCtxSlot {
+    ctx: AtomicU32,
+    calls: AtomicU32,
+    submits: AtomicU32,
+    ring0: AtomicU32,
+}
+
+impl EscCtxSlot {
+    const NEW: Self = Self {
+        ctx: AtomicU32::new(0),
+        calls: AtomicU32::new(0),
+        submits: AtomicU32::new(0),
+        ring0: AtomicU32::new(0),
+    };
+}
+
+pub static ESCAPE_CTX: [EscCtxSlot; ESC_CTX_SLOTS] = [EscCtxSlot::NEW; ESC_CTX_SLOTS];
+pub static ESCAPE_CTX_OVERFLOW: AtomicU32 = AtomicU32::new(0);
+
+/// Attribute `calls` escapes, `submits` accepted-or-attempted submits and
+/// `ring0` of them on ring 0 to `ctx_id`. DISPATCH-safe (atomics only).
+pub fn note_escape_ctx(ctx_id: u32, calls: u32, submits: u32, ring0: u32) {
+    if ctx_id == 0 {
+        return;
+    }
+    for slot in ESCAPE_CTX.iter() {
+        let mut cur = slot.ctx.load(Ordering::Relaxed);
+        if cur == 0 {
+            // Claim a free slot; a racing claimant of the same id is fine.
+            cur = match slot
+                .ctx
+                .compare_exchange(0, ctx_id, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => ctx_id,
+                Err(other) => other,
+            };
+        }
+        if cur == ctx_id {
+            slot.calls.fetch_add(calls, Ordering::Relaxed);
+            slot.submits.fetch_add(submits, Ordering::Relaxed);
+            slot.ring0.fetch_add(ring0, Ordering::Relaxed);
+            return;
+        }
+    }
+    ESCAPE_CTX_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Mirror the per-context rows to the registry. PASSIVE only.
+pub fn publish_escape_ctx_counters() {
+    const NAMES: [[&[u8]; 4]; ESC_CTX_SLOTS] = [
+        [b"EscC0Id", b"EscC0Calls", b"EscC0Sub", b"EscC0R0"],
+        [b"EscC1Id", b"EscC1Calls", b"EscC1Sub", b"EscC1R0"],
+        [b"EscC2Id", b"EscC2Calls", b"EscC2Sub", b"EscC2R0"],
+        [b"EscC3Id", b"EscC3Calls", b"EscC3Sub", b"EscC3R0"],
+        [b"EscC4Id", b"EscC4Calls", b"EscC4Sub", b"EscC4R0"],
+        [b"EscC5Id", b"EscC5Calls", b"EscC5Sub", b"EscC5R0"],
+        [b"EscC6Id", b"EscC6Calls", b"EscC6Sub", b"EscC6R0"],
+        [b"EscC7Id", b"EscC7Calls", b"EscC7Sub", b"EscC7R0"],
+    ];
+    for (i, slot) in ESCAPE_CTX.iter().enumerate() {
+        let id = slot.ctx.load(Ordering::Relaxed);
+        if id == 0 {
+            continue;
+        }
+        let Some(names) = NAMES.get(i) else {
+            continue;
+        };
+        crate::diag::record_named_bytes(names[0], id);
+        crate::diag::record_named_bytes(names[1], slot.calls.load(Ordering::Relaxed));
+        crate::diag::record_named_bytes(names[2], slot.submits.load(Ordering::Relaxed));
+        crate::diag::record_named_bytes(names[3], slot.ring0.load(Ordering::Relaxed));
+    }
+    crate::diag::record_named_bytes(b"EscCOvf", ESCAPE_CTX_OVERFLOW.load(Ordering::Relaxed));
+}
 /// Guest-supplied completion boundaries REPLACED by `next_wire_fence` because
 /// they were zero-or-beyond the fences this driver has actually assigned.
 ///

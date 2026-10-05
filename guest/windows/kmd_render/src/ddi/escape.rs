@@ -1496,6 +1496,7 @@ fn escape_submit_venus(
     };
     let req = wire.read();
     ctrl::count_submit_escape();
+    crate::virtio::gpu::note_escape_ctx(req.ctx_id, 1, 1, u32::from(req.ring_idx == 0));
 
     // TRUST BOUNDARY, and THE ONE PLACE `hdr.size` MUST NOT BE THE BOUND.
     // SUBMIT_VENUS sets hdr.size = sizeof(HeliosEscapeSubmitVenus) = 40 while
@@ -1628,6 +1629,10 @@ fn escape_submit_venus_batch(
     let mut offset = 0usize;
     let mut accepted = 0u32;
     let mut failed = false;
+    // One escape, attributed to the first entry's context; each entry's submit
+    // (and its ring) to its own.
+    let first: HeliosSubmitBatchEntry = pod_read_unaligned(&table[..entry_size]);
+    crate::virtio::gpu::note_escape_ctx(first.ctx_id, 1, 0, 0);
     for i in 0..count {
         let slot = i * entry_size..(i + 1) * entry_size;
         let mut e: HeliosSubmitBatchEntry = pod_read_unaligned(&table[slot.clone()]);
@@ -1650,6 +1655,7 @@ fn escape_submit_venus_batch(
             table[slot].copy_from_slice(bytes_of(&e));
             continue;
         };
+        crate::virtio::gpu::note_escape_ctx(e.ctx_id, 0, 1, u32::from(e.ring_idx == 0));
         let queued = submit_one(
             passive,
             adapter,

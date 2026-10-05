@@ -383,6 +383,8 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"EscBatMax",
         crate::virtio::gpu::ESCAPE_BATCH_MAX.load(Ordering::Relaxed),
     );
+    // The same counts per Venus context (= per ICD instance = per process).
+    crate::virtio::gpu::publish_escape_ctx_counters();
     // S-1's instrument (`docs/dx12/PENDING.md` §2). `DxgkDdiCalibrateGpuClock` is
     // the ONLY channel for the GPU timestamp frequency an application divides its
     // timestamp deltas by, and it used to zero-fill and return SUCCESS silently.
