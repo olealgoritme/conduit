@@ -34,7 +34,13 @@ for sub in dxvk vkd3d-proton; do
 done
 
 echo "==> copying guest/windows to $root\\src"
-ssh_win "if (Test-Path $root\\src\\guest) { Remove-Item -Recurse -Force $root\\src\\guest }; New-Item -ItemType Directory -Force $root\\src\\guest | Out-Null"
+# Copied over the previous tree, not into an empty one, so cargo's target
+# directories survive and a driver-only change rebuilds only what changed.
+# CLEAN=1 wipes it first (and rebuilds DXVK and vkd3d too).
+if [ "${CLEAN:-0}" = 1 ]; then
+    ssh_win "if (Test-Path $root\\src\\guest) { Remove-Item -Recurse -Force $root\\src\\guest }"
+fi
+ssh_win "New-Item -ItemType Directory -Force $root\\src\\guest | Out-Null"
 # tar on both ends: Windows ships bsdtar as tar.exe. Mesa is not part of the
 # driver job, and build trees and .git are not needed.
 tar -C "$repo" -cf - --exclude=.git --exclude=target --exclude='guest/windows/third_party/mesa' guest/windows \
@@ -45,7 +51,7 @@ fi
 
 echo "==> building $config in the VM"
 # PowerShell 7, as windows.yml's `shell: pwsh` steps.
-ssh_win "& \"\$env:ProgramFiles\\PowerShell\\7\\pwsh.exe\" -NoProfile -ExecutionPolicy Bypass -File $root\\src\\guest\\windows\\ci\\vm\\Build-InVm.ps1 -Configuration $config -Root $root"
+ssh_win "& \"\$env:ProgramFiles\\PowerShell\\7\\pwsh.exe\" -NoProfile -ExecutionPolicy Bypass -File $root\\src\\guest\\windows\\ci\\vm\\Build-InVm.ps1 -Configuration $config -Root $root$( [ "${CLEAN:-0}" = 1 ] && echo ' -Clean' )"
 
 echo "==> copying the package to $out"
 rm -rf "$out"; mkdir -p "$out"
