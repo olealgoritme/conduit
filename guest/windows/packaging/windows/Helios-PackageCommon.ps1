@@ -107,7 +107,7 @@ function Get-HeliosDeviceInstanceId {
     $presentDevices = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
         Where-Object { $_.InstanceId -like "PCI\VEN_1AF4&DEV_106*" })
     $device = $presentDevices |
-        Where-Object { $_.FriendlyName -like "Helios*" } |
+        Where-Object { $_.FriendlyName -like "*Helios*" } |
         Select-Object -First 1
     if (-not $device) {
         $device = $presentDevices | Select-Object -First 1
@@ -115,7 +115,7 @@ function Get-HeliosDeviceInstanceId {
     if ($device) { return [string]$device.InstanceId }
 
     $device = Get-CimInstance Win32_PnPEntity |
-        Where-Object { $_.PNPDeviceID -like "PCI\VEN_1AF4&DEV_106*" -and $_.Name -like "Helios*" } |
+        Where-Object { $_.PNPDeviceID -like "PCI\VEN_1AF4&DEV_106*" -and $_.Name -like "*Helios*" } |
         Select-Object -First 1
     if (-not $device) {
         $device = Get-CimInstance Win32_PnPEntity |

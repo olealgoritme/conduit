@@ -16,11 +16,11 @@ function Read-HeliosMetadata([Parameter(Mandatory)][string]$RepoRoot) {
             $values[$key] = $value
         }
     }
-    foreach ($key in @("HELIOS_PRODUCT", "HELIOS_PUBLISHER", "HELIOS_KMD_ROLE",
+    foreach ($key in @("HELIOS_PRODUCT", "HELIOS_MONITOR_NAME", "HELIOS_PUBLISHER", "HELIOS_KMD_ROLE",
         "HELIOS_UMD_ROLE", "HELIOS_UMD12_ROLE", "HELIOS_ADL_ROLE", "HELIOS_KMD_VERSION", "HELIOS_MONITOR_MODEL_YEAR")) {
         if (-not $values.ContainsKey($key)) { throw "Missing metadata key: $key" }
     }
-    if ($values.HELIOS_PRODUCT.Length -gt 12) { throw "Product name exceeds the EDID limit (12 bytes)." }
+    if ($values.HELIOS_MONITOR_NAME.Length -gt 12) { throw "Monitor name exceeds the EDID limit (12 bytes)." }
     if ($values.HELIOS_KMD_VERSION -notmatch '^\d+\.\d+\.\d+\.\d+$') {
         throw "Driver version must have four numeric components."
     }
