@@ -61,8 +61,14 @@ use wdk_sys::ntddk::{
 };
 use wdk_sys::{KEVENT, PVOID};
 
+mod nvrm_events;
 mod nvrm_tables;
 mod resource_tables;
+
+pub use nvrm_events::{
+    release_nvrm_event, NvrmEventRefusal, NvrmEventRegistered, NvrmEventsState, MAX_NVRM_EVENTS,
+    MAX_NVRM_EVENTS_PER_OWNER,
+};
 
 pub use nvrm_tables::{
     NvrmPin, PinTake, MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER, MAX_NVRM_MAPS,
@@ -2255,6 +2261,18 @@ pub struct VirtioGpu {
     /// MANDATORY (see `reserve_context_slot`), so a context is reserved before
     /// the wire round-trip and committed after it.
     contexts_reserved: usize,
+    /// The event virtqueue (index 1) and its posted buffers, where the host's
+    /// `EventReady` arrives. `None` if the queue could not be brought up: then
+    /// events are unsupported. See `nvrm_events`.
+    nvrm_event_ring: Option<Box<nvrm_events::EventRing>>,
+    /// Usermode events registered against RM handles (and `TRANSPORT_LOST`),
+    /// reserved at init so no registration allocates under the spinlock. Each
+    /// holds an object reference that only a PASSIVE caller may drop: every
+    /// removal hands the event back by value.
+    nvrm_events: helios_kmd_logic::nvrm_events::Registry<NonNull<KEVENT>>,
+    /// The device's config `features` word (`NVGPU_CFG_*`), read at init, for
+    /// `HELIOS_NVRM_OP_QUERY_CAPS`.
+    cfg_features: u32,
     /// Backend RM handles opened through HELIOS_ESCAPE_NVRM, tagged with the
     /// owning device so a process cannot name another's, and closed at device
     /// teardown. Reserved to MAX_NVRM_HANDLES at init. See `nvrm_tables`.
@@ -2626,6 +2644,14 @@ impl VirtioGpu {
         // relying on the freshly-zeroed avail.flags value: bit 0 clear asks the
         // device to interrupt after it adds a used element.
         control.set_dev_notify(true);
+        // The event queue (index 1), where the host's `EventReady` arrives (see
+        // `nvrm_events`). Created before DRIVER_OK like the control queue; its
+        // buffers are posted once the device object exists. No feature is acked
+        // for it, and the input bit (12) is never acked: `accepted` above is the
+        // only thing written back.
+        let nvrm_event_ring = nvrm_events::new_event_ring(passive, &mut transport);
+        // 1 when the event queue is up, 0 when RM events are unsupported.
+        crate::diag::record_named_bytes(b"NvEvQ", u32::from(nvrm_event_ring.is_some()));
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
                 | DeviceStatus::DRIVER
@@ -2788,6 +2814,16 @@ impl VirtioGpu {
         let present_streams = allocate_present_streams()?;
         let present_buffer_syncs = allocate_present_buffer_syncs()?;
         let present_buffer_opens = allocate_present_buffer_opens()?;
+        // Nothing to register against without the event queue: reserve nothing.
+        let nvrm_events = helios_kmd_logic::nvrm_events::Registry::try_new(
+            if nvrm_event_ring.is_some() {
+                MAX_NVRM_EVENTS
+            } else {
+                0
+            },
+            MAX_NVRM_EVENTS_PER_OWNER,
+        )
+        .ok_or(VirtioError::OutOfMemory)?;
 
         crate::diag::record_named_bytes(b"InitStg", 7); // building the device object
         // `VirtioGpu` contains the control virtqueue and many ownership tables.
@@ -2806,6 +2842,9 @@ impl VirtioGpu {
             resources_reserved: 0,
             contexts_reserved: 0,
             contexts: Vec::with_capacity(MAX_CONTEXTS),
+            nvrm_event_ring,
+            nvrm_events,
+            cfg_features,
             nvrm_handles: Vec::with_capacity(MAX_NVRM_HANDLES),
             nvrm_reserved: 0,
             nvrm_maps: Vec::with_capacity(MAX_NVRM_MAPS),
@@ -2883,6 +2922,9 @@ impl VirtioGpu {
                 gpu.host_edid_len = n;
             }
         }
+        // Hand the host its event buffers. After the last fallible step above, so a
+        // failed `init` never leaves buffers posted on a queue it is about to free.
+        gpu.post_nvrm_event_buffers();
         // `WddmHoldMs` (UV1's instrument). Snapshotted here with every other knob
         // so `reg add` + `pnputil /restart-device` applies it with no reboot, and
         // CLAMPED here rather than trusted: see `WDDM_HOLD_MS_MAX`.
@@ -4501,6 +4543,10 @@ impl VirtioGpu {
             }
             FENCE_EVENT_SIGNALS.fetch_add(1, Ordering::Relaxed);
         }
+        // RM event waiters have nothing left to wait for either: wake them so they
+        // see the loss. Signal only; the references are dropped by their owners'
+        // `Close` / exit or by this transport's `Drop`, at PASSIVE.
+        self.signal_nvrm_events_lost();
     }
 
     /// Drain every completed entry off the used ring: pop the descriptor chain
@@ -7837,6 +7883,10 @@ impl Drop for VirtioGpu {
             // SAFETY: the entry owns an object reference taken at registration.
             unsafe { ObDereferenceObjectDeferDelete(e.event.as_ptr() as PVOID) };
         }
+        // RM event registrations: unlike the fence events above, these WAKE their
+        // waiters (a process blocked on one must give up and see the loss), then
+        // drop the references. PASSIVE, outside the device lock.
+        self.teardown_nvrm_events();
 
         // The reset above quiesced the device before the in-flight/parked entry
         // buffers free with this struct.

@@ -49,6 +49,10 @@ pub(super) struct NvrmHandleSlot {
     /// minor, 256 = UVM, 257 = UVM tools, 512+ = DRM); decides which region an
     /// `Mmap` is in.
     device_type: u32,
+    /// The host said the file was readable (`EventReady`) while no event was
+    /// registered for it; the next `EVENT_REGISTER` consumes it and signals at
+    /// once. A flag, not a count: the consumer drains until empty.
+    ready_latched: bool,
 }
 
 /// One live mapping, for the host `Munmap` at `Close` / teardown.
@@ -148,6 +152,7 @@ impl VirtioGpu {
             owner,
             handle,
             device_type,
+            ready_latched: false,
         });
     }
 
@@ -190,6 +195,30 @@ impl VirtioGpu {
     pub fn take_nvrm_handle_for_owner(&mut self, owner: DeviceOwner) -> Option<u32> {
         let idx = self.nvrm_handles.iter().position(|s| s.owner == owner)?;
         Some(self.nvrm_handles.swap_remove(idx).handle)
+    }
+
+    /// Latch an `EventReady` for `handle` (see `NvrmHandleSlot::ready_latched`).
+    /// `false` if no process has it open.
+    pub(super) fn latch_nvrm_ready(&mut self, handle: u32) -> bool {
+        match self.nvrm_handles.iter_mut().find(|s| s.handle == handle) {
+            Some(s) => {
+                s.ready_latched = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Consume the latch of `handle` if `owner` has it open and one is set.
+    pub(super) fn take_nvrm_ready_latch(&mut self, owner: DeviceOwner, handle: u32) -> bool {
+        match self
+            .nvrm_handles
+            .iter_mut()
+            .find(|s| s.owner == owner && s.handle == handle)
+        {
+            Some(s) => core::mem::replace(&mut s.ready_latched, false),
+            None => false,
+        }
     }
 
     /// The transport generation, for `HeliosNvrmHeader.epoch`: it changes when

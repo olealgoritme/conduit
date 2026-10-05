@@ -230,9 +230,13 @@ pub struct HeliosNvrmQueryCaps {
     pub max_buffer_bytes: u32,
     /// out: `FORWARD` default when `timeout_ms == 0`, in milliseconds.
     pub default_timeout_ms: u32,
-    /// out: bit `n` set ⇔ `HELIOS_NVRM_OP_*` value `n` is implemented.
+    /// out: bit `n` set ⇔ `HELIOS_NVRM_OP_*` value `n` is implemented. The two
+    /// event ops (5, 6) are set only while events are usable (see the Events
+    /// section: the KMD's event queue must be up), so a client can probe for them
+    /// here.
     pub supported_ops: u64,
-    /// out: bit `n` set ⇔ event kind `n` (`HELIOS_NVRM_EVENT_*`) is implemented.
+    /// out: bit `n` set ⇔ event kind `n` (`HELIOS_NVRM_EVENT_*`) is implemented;
+    /// 0 when events are not usable, whatever the build knows.
     pub supported_event_kinds: u32,
     /// out: bit `n` set ⇔ cache type `n` (`HELIOS_NVRM_CACHE_*`) is implemented.
     pub supported_cache_types: u32,
@@ -416,8 +420,13 @@ pub const HELIOS_NVRM_MUNMAP_BYTES: usize = 48;
 pub const HELIOS_NVRM_EVENT_READY: u32 = 1;
 /// The device was reset / the transport replaced / is being removed: every
 /// handle of the earlier epoch is dead. `handle` is ignored (use 0). Wakes every
-/// registration of this kind in the process so a blocked waiter can give up.
+/// registration in the process, of EVERY kind, so a blocked waiter can give up
+/// and see the loss (its next escape fails or reports a new `epoch`).
 pub const HELIOS_NVRM_EVENT_TRANSPORT_LOST: u32 = 2;
+/// Bitmask over the kinds above (bit `n` ⇔ kind `n`): what `QUERY_CAPS`
+/// reports in `supported_event_kinds` while events are usable.
+pub const HELIOS_NVRM_EVENT_KINDS_ALL: u32 =
+    (1 << HELIOS_NVRM_EVENT_READY) | (1 << HELIOS_NVRM_EVENT_TRANSPORT_LOST);
 
 /// `HeliosNvrmEvent.out_state`.
 pub const HELIOS_NVRM_EVENT_STATE_REGISTERED: u32 = 1;
@@ -443,12 +452,42 @@ pub const HELIOS_NVRM_EVENT_STATE_NOT_FOUND: u32 = 5;
 /// notification does `KeSetEvent`; the registration stays until UNREGISTER,
 /// `Close` of `handle`, process exit, or reset. Consumers must therefore drain
 /// the RM event source until empty after every wake (the same contract as
-/// `poll()`), and reset a manual-reset event themselves.
+/// `poll()`), and reset a manual-reset event themselves. A registration is
+/// identified by `(process, handle, kind)`; there is no separate id.
 ///
-/// **No lost wakeups.** The KMD latches a notification that arrives for a
-/// `(handle, kind)` with no registration (and for a registration in the window
-/// before the event is armed); REGISTER consumes the latch and signals at once
-/// (`LATCHED_SIGNALED`). `EVENT_TRANSPORT_LOST` latches the same way.
+/// **No lost wakeups.** The KMD latches ONE notification per live backend
+/// handle that arrives while no `EVENT_READY` registration exists for it (a
+/// flag, not a count: the contract is "drain until empty"); REGISTER consumes
+/// the latch and signals at once (`LATCHED_SIGNALED`). `TRANSPORT_LOST` does not
+/// latch: a registration made on a transport that has already failed is refused
+/// with `HELIOS_NVRM_ST_TRANSPORT_RESET`, which tells the caller the same thing.
+///
+/// # Availability
+///
+/// Events ride the device's event queue (virtqueue 1), which the KMD brings up at
+/// transport start. If it could not (a device without a second queue, no memory),
+/// `EVENT_REGISTER` answers `HELIOS_NVRM_ST_UNSUPPORTED`, `QUERY_CAPS` reports no
+/// event ops and `supported_event_kinds == 0`, and a client falls back to polling.
+/// No feature bit is involved. In particular the KMD never acknowledges the
+/// device's input feature bit (12, `NVGPU_CFG_TAKES_INPUT`): acking it would move
+/// the keyboard and mouse onto `InputEvent`s the Windows driver cannot use.
+/// `EventReady` is "wake and drain": the host re-reports a readable handle, so a
+/// spurious wake is harmless.
+///
+/// # Results
+///
+/// `REGISTER`: `OK` with `out_state` `REGISTERED` / `REPLACED` /
+/// `LATCHED_SIGNALED`; `UNSUPPORTED` (event queue not up, or a `kind` this build lacks);
+/// `NOT_OWNED` (`READY` on a handle the caller did not open); `NO_RESOURCES`
+/// (the per-process or the device-wide table is full); `TRANSPORT_RESET` (the
+/// transport has failed). `STATUS_INVALID_PARAMETER` for `event_handle == 0`, a
+/// handle that is not an event the caller may signal, `kind == 0`, nonzero
+/// `flags`. `STATUS_DEVICE_NOT_READY` when there is no transport at all.
+/// `UNREGISTER`: `OK` with `UNREGISTERED` or `NOT_FOUND`.
+///
+/// `REGISTER` for a `(handle, kind)` that already has a registration in the
+/// process replaces its event (`REPLACED`); the old reference is released.
+/// `UNREGISTER` ignores `event_handle` and does not signal.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosNvrmEvent {
@@ -591,8 +630,12 @@ const _: () = {
     assert!(offset_of!(HeliosNvrmMunmap, mapping_id) == 40);
 
     assert!(size_of::<HeliosNvrmEvent>() == HELIOS_NVRM_EVENT_BYTES);
+    assert!(offset_of!(HeliosNvrmEvent, handle) == 40);
+    assert!(offset_of!(HeliosNvrmEvent, kind) == 44);
     assert!(offset_of!(HeliosNvrmEvent, event_handle) == 48);
+    assert!(offset_of!(HeliosNvrmEvent, flags) == 56);
     assert!(offset_of!(HeliosNvrmEvent, out_state) == 60);
+    assert!(HELIOS_NVRM_EVENT_KINDS_ALL == 0b110);
 
     assert!(size_of::<HeliosNvrmPin>() == HELIOS_NVRM_PIN_BYTES);
     assert!(offset_of!(HeliosNvrmPin, user_va) == 48);

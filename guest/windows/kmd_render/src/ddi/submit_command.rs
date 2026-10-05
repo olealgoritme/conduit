@@ -178,6 +178,49 @@ pub(crate) fn publish_nvrm_counters() {
         b"NvPinErr",
         crate::virtio::nvrm::NVRM_PIN_ERRORS.load(Ordering::Relaxed),
     );
+    // RM events (HELIOS_NVRM_OP_EVENT_*). `NvEvQ` (written once at transport init)
+    // says whether the event queue is up (1) or events are unsupported (0). `NvEvReg` / `NvEvUnreg` / `NvEvRef` are registrations made / removed
+    // by UNREGISTER / refused; `NvEvSig` is KeSetEvents for an EventReady and
+    // `NvEvLatch` / `NvEvDrop` the EventReadys that found nothing registered
+    // (latched on an open handle / for a handle nobody has open); `NvEvLost` is
+    // registrations woken by a lost transport. `NvEvOther` (a message other than
+    // EventReady on the queue) and `NvEvErr` (queue faults) should read 0.
+    crate::diag::record_named_bytes(
+        b"NvEvReg",
+        crate::virtio::nvrm::NVRM_EV_REGS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvUnreg",
+        crate::virtio::nvrm::NVRM_EV_UNREGS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvRef",
+        crate::virtio::nvrm::NVRM_EV_REFUSED.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvSig",
+        crate::virtio::nvrm::NVRM_EV_SIGNALS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvLatch",
+        crate::virtio::nvrm::NVRM_EV_LATCHED.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvDrop",
+        crate::virtio::nvrm::NVRM_EV_DROPS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvLost",
+        crate::virtio::nvrm::NVRM_EV_LOST.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvOther",
+        crate::virtio::nvrm::NVRM_EV_OTHER.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvErr",
+        crate::virtio::nvrm::NVRM_EV_ERRORS.load(Ordering::Relaxed),
+    );
 }
 
 /// Mirror the scheduler private-data handoff evidence at PASSIVE_LEVEL.

@@ -6,7 +6,8 @@
 //! ISR-status register. The ISR reads that register (deasserting the line),
 //! claims the interrupt, and queues the DPC via `DxgkCbQueueDpc`; the DPC
 //! drains the used ring under the device spinlock (`VirtioGpu::drain_used` —
-//! signaling sync/fence KEVENT waiters) and then completes every WDDM
+//! signaling sync/fence KEVENT waiters, and `drain_nvrm_events` for the event
+//! queue's `EventReady` -> RM event registrations) and then completes every WDDM
 //! submission whose venus watermark has been reached
 //! (`DXGK_INTERRUPT_DMA_COMPLETED` at DIRQL via `signal_dma_completed`).
 //!
@@ -55,7 +56,14 @@ pub(crate) fn request_wddm_completion_dpc(adapter: &AdapterContext) {
 /// The bind application lives HERE rather than in `drain_used` because of the
 /// lock order — see the comment on it below.
 pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
-    let _ = adapter.with_virtio(|v| v.drain_used());
+    // The event queue's consumer rides the same lock hold: an `EventReady` becomes
+    // a `KeSetEvent` on the process's registered event (HELIOS_NVRM_OP_EVENT_*).
+    // The device raises the same INTx for either queue, so this is the one place
+    // that sees it. Allocation-free and wait-free; a no-op without the queue.
+    let _ = adapter.with_virtio(|v| {
+        v.drain_used();
+        v.drain_nvrm_events();
+    });
 
     // A producer completion may have made the one deferred fast bind safe.
     // Promotion and sequence minting share this virtio-lock hold, so the host
