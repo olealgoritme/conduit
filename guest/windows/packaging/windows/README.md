@@ -128,3 +128,19 @@ this package originally installed, but only if their hashes are unchanged.
 - CI uses an ephemeral public test certificate whose private key is destroyed
   after signing. A public release requires Microsoft attestation/WHQL signing
   or another production signing process.
+
+## Display topology
+
+Windows keeps the Microsoft Basic Display (QXL) adapter as DISPLAY1 and adds Helios as an
+extended second monitor. `Set-HeliosDisplay.ps1` makes Helios the **only active** display,
+chosen by adapter (the virtio device, PCI vendor 1AF4), not with `DisplaySwitch.exe`, whose
+internal/external mapping is Windows' own guess. The Basic Display device stays enabled and is only
+inactive in the topology, so it is still the picture if Helios fails. It uses
+`QueryDisplayConfig`/`SetDisplayConfig`, saves the topology (it persists across reboots), reads
+it back, and does nothing if Helios is already the only active display.
+
+`SetDisplayConfig` only works in the interactive user session, so the installer registers a
+logon task (`HeliosDisplayTopology`, group `BUILTIN\Users`) that runs it there; run it by hand in
+the desktop session with `C:\ProgramData\Helios\Set-HeliosDisplay.ps1` (`-DryRun` lists the
+adapters and validates without changing anything). Set DWORD `ManageDisplay=0` under
+`HKLM\SOFTWARE\Helios` to opt out. The task is removed on uninstall.

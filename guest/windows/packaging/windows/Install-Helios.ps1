@@ -24,6 +24,7 @@ $statePath = Join-Path $stateRoot "install-state.json"
 $provisioningRoot = Join-Path $stateRoot "provisioning"
 $provisioningStatusPath = Join-Path $stateRoot "provisioning-status.json"
 $provisioningTaskName = "HeliosGraphicsProvisioning"
+$displayTaskName = "HeliosDisplayTopology"
 
 function Write-HeliosProvisioningStatus(
     [Parameter(Mandatory)]
@@ -478,6 +479,23 @@ if ($previousState -and [string]$previousState.installRoot -and
 Copy-Item -LiteralPath (Join-Path $bundleRoot "Helios-PackageCommon.ps1") -Destination $stateRoot -Force
 Copy-Item -LiteralPath (Join-Path $bundleRoot "Uninstall-Helios.ps1") -Destination $stateRoot -Force
 Copy-Item -LiteralPath (Join-Path $bundleRoot "Verify-Helios.ps1") -Destination $stateRoot -Force
+Copy-Item -LiteralPath (Join-Path $bundleRoot "Set-HeliosDisplay.ps1") -Destination $stateRoot -Force
+# Windows keeps the Microsoft Basic Display adapter as DISPLAY1 and adds Helios as
+# an extended second monitor, so the desktop is not on the Helios screen.
+# Set-HeliosDisplay.ps1 makes Helios the only ACTIVE display (the Basic Display
+# device stays enabled, merely inactive in the topology). SetDisplayConfig only
+# works in the interactive session, so it runs from a logon task for every user,
+# not from this (system) install; it is idempotent, so running at each logon is
+# harmless. HKLM\SOFTWARE\Helios ManageDisplay=0 turns it off.
+$displayScript = Join-Path $stateRoot "Set-HeliosDisplay.ps1"
+$displayPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+$displayAction = New-ScheduledTaskAction -Execute $displayPowerShell -Argument (
+    "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$displayScript`" -WaitSeconds 90"
+)
+$displayTrigger = New-ScheduledTaskTrigger -AtLogOn
+$displayPrincipal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Limited
+Register-ScheduledTask -TaskName $displayTaskName -Action $displayAction -Trigger $displayTrigger `
+    -Principal $displayPrincipal -Force | Out-Null
 # Keep the manifest beside the scripts so a stored uninstaller can read the
 # version. The installer exe is NOT copied: it is self-contained and embedding it
 # in its own payload would duplicate the whole bundle.
