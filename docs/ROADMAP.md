@@ -44,7 +44,7 @@
 - [ ] Full GPU state in snapshots (record and recreate the VM's RM objects and
       VRAM contents)
 - [ ] NVIDIA native context in virglrenderer: stock QEMU's virtio-gpu, crosvm, libkrun
-- [ ] Windows guests beyond Venus, two routes:
+- [ ] Windows guests beyond Venus, two routes (assessment: [research/windows-thin-path.md](research/windows-thin-path.md)):
   - CUDA / NVML / NVENC on a small non-WDDM driver, using NVIDIA's own user-mode libraries
   - graphics through the open stack: NVK (Mesa Vulkan) on RM + DXVK / vkd3d-proton
 - [ ] Multiple VMs sharing one GPU with fair scheduling
