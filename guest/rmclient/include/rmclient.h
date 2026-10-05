@@ -122,6 +122,19 @@ struct crm_event_data {
  * returns 0. Never blocks. */
 int crm_event_drain(crm_client *c, int event_fd, struct crm_event_data *out, int max);
 
+/* NV01_MEMORY_SYSTEM_OS_DESCRIPTOR over `size` bytes of the caller's own
+ * page-aligned memory at `addr` (e.g. an anonymous mmap), parent `device`
+ * (NV01_DEVICE_0). RM pins the pages for the object's lifetime; the CPU keeps
+ * using `addr`. This is NV_ESC_RM_ALLOC_MEMORY (NVOS02) on the device's GPU
+ * channel, the route RM's Unix escape layer serves for user addresses:
+ * NV_ESC_RM_ALLOC of the same class with a VIRTUAL_ADDRESS descriptor is
+ * refused with NV_ERR_NOT_SUPPORTED. `nvos02_flags` = 0 picks
+ * PCI | CACHED | NONCONTIGUOUS | MAPPING_NO_MAP (RM requires PCI and NO_MAP);
+ * otherwise NVOS02_FLAGS_* as RM defines them. *object = 0 lets the library
+ * pick the handle. */
+int crm_alloc_os_descriptor(crm_client *c, uint32_t device, uint32_t *object,
+                            void *addr, uint64_t size, uint32_t nvos02_flags);
+
 /* Raw escape on the control channel (fd = -1) or a transport fd, for escapes
  * this API does not wrap. Returns 0 or -errno; RM status stays in *arg. */
 int crm_escape(crm_client *c, int fd, uint32_t nr, void *arg, uint32_t size);

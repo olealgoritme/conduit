@@ -51,6 +51,7 @@
 #define NV_ESC_FREE_OS_EVENT         (NV_IOCTL_BASE + 7)
 #define NV_ESC_CHECK_VERSION_STR     (NV_IOCTL_BASE + 10)
 
+#define NV_ESC_RM_ALLOC_MEMORY       0x27
 #define NV_ESC_RM_FREE               0x29
 #define NV_ESC_RM_CONTROL            0x2A
 #define NV_ESC_RM_ALLOC              0x2B
@@ -131,6 +132,29 @@ typedef struct {
     uint32_t paramsSize;
     uint32_t status;
 } NVOS21_PARAMETERS;
+
+/* nvos.h NVOS02_PARAMETERS; nv-ioctl.h nv_ioctl_nvos02_parameters_with_fd */
+typedef struct {
+    uint32_t hRoot;
+    uint32_t hObjectParent;
+    uint32_t hObjectNew;
+    uint32_t hClass;
+    uint32_t flags;
+    NV_A8 uint64_t pMemory;
+    NV_A8 uint64_t limit;
+    uint32_t status;
+} NVOS02_PARAMETERS;
+
+typedef struct {
+    NVOS02_PARAMETERS params;
+    int fd;
+} nv_ioctl_nvos02_parameters_with_fd;
+
+/* NVOS02_FLAGS_* (nvos.h) */
+#define NVOS02_FLAGS_PHYSICALITY_NONCONTIGUOUS  (0x1u << 4)   /* 7:4 */
+#define NVOS02_FLAGS_LOCATION_PCI               (0x0u << 8)   /* 11:8 */
+#define NVOS02_FLAGS_COHERENCY_CACHED           (0x1u << 12)  /* 15:12 */
+#define NVOS02_FLAGS_MAPPING_NO_MAP             (0x1u << 30)  /* 31:30 */
 
 typedef struct {
     uint32_t hRoot;
@@ -370,6 +394,8 @@ _Static_assert(sizeof(nv_ioctl_alloc_os_event_t) == 16, "alloc_os_event");
 _Static_assert(sizeof(nv_ioctl_register_fd_t) == 4, "register_fd");
 _Static_assert(sizeof(NVOS00_PARAMETERS) == 16, "NVOS00");
 _Static_assert(sizeof(NVOS21_PARAMETERS) == 32, "NVOS21");
+_Static_assert(sizeof(NVOS02_PARAMETERS) == 48, "NVOS02");
+_Static_assert(sizeof(nv_ioctl_nvos02_parameters_with_fd) == 56, "NVOS02 with fd");
 _Static_assert(sizeof(NVOS64_PARAMETERS) == 48, "NVOS64");
 _Static_assert(sizeof(NVOS54_PARAMETERS) == 32, "NVOS54");
 _Static_assert(sizeof(NVOS33_PARAMETERS) == 48, "NVOS33");

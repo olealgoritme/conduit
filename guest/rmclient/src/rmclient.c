@@ -997,6 +997,111 @@ int crm_unmap_dma(crm_client *c, uint32_t device, uint32_t dma, uint32_t memory,
 /* ---------------------------------------------------------------------- */
 /* GPUs, events, raw escapes.                                              */
 
+/* The GPU channel of the GPU `device` (or anything under it) belongs to. */
+static int device_gpu_fd(crm_client *c, uint32_t device)
+{
+    int32_t node = -1;
+    uint32_t devinst = 0;
+    int have_dev = 0;
+
+    mtx_lock(&c->lock);
+    uint32_t h = device;
+    for (int depth = 0; depth < 8 && h && h != c->root; depth++) {
+        struct crm_obj *o = obj_find(c, h);
+        if (!o || o->state != SLOT_USED)
+            break;
+        if (o->hclass == NV01_DEVICE_0) {
+            devinst = o->devinst;
+            have_dev = 1;
+            break;
+        }
+        h = o->parent;
+    }
+    mtx_unlock(&c->lock);
+
+    if (c->gpu_count == 0)
+        return -ENODEV;
+    if (c->gpu_count == 1 || !have_dev) {
+        node = 0;
+    } else {
+        for (int i = 0; i < c->gpu_count; i++) {
+            struct crm_gpu *g = &c->gpus[i];
+            if (g->devinst < 0) {
+                NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS q;
+                memset(&q, 0, sizeof(q));
+                q.gpuId = g->info.gpu_id;
+                if (crm_control(c, c->root, NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2, &q, sizeof(q)) == 0)
+                    g->devinst = (int32_t)q.deviceInstance;
+            }
+            if (g->devinst >= 0 && (uint32_t)g->devinst == devinst) {
+                node = i;
+                break;
+            }
+        }
+        if (node < 0)
+            node = 0;
+    }
+    return c->gpus[node].fd >= 0 ? c->gpus[node].fd : -ENODEV;
+}
+
+int crm_alloc_os_descriptor(crm_client *c, uint32_t device, uint32_t *object,
+                            void *addr, uint64_t size, uint32_t nvos02_flags)
+{
+    if (!c || !object || !addr || size == 0 || device == 0)
+        return -EINVAL;
+    int fd = device_gpu_fd(c, device);
+    if (fd < 0)
+        return fd;
+    if (nvos02_flags == 0)
+        nvos02_flags = NVOS02_FLAGS_LOCATION_PCI | NVOS02_FLAGS_COHERENCY_CACHED |
+                       NVOS02_FLAGS_PHYSICALITY_NONCONTIGUOUS | NVOS02_FLAGS_MAPPING_NO_MAP;
+
+    uint32_t h = *object;
+    int picked = 0;
+    if (h == 0) {
+        mtx_lock(&c->lock);
+        h = handle_reserve(c);
+        mtx_unlock(&c->lock);
+        if (!h)
+            return -ENOMEM;
+        picked = 1;
+    }
+
+    nv_ioctl_nvos02_parameters_with_fd p;
+    memset(&p, 0, sizeof(p));
+    p.params.hRoot = c->root;
+    p.params.hObjectParent = device;
+    p.params.hObjectNew = h;
+    p.params.hClass = NV01_MEMORY_SYSTEM_OS_DESCRIPTOR;
+    p.params.flags = nvos02_flags;
+    p.params.pMemory = (uint64_t)(uintptr_t)addr;
+    p.params.limit = size - 1;
+    p.fd = -1;
+    int r = esc(c, fd, NV_ESC_RM_ALLOC_MEMORY, &p, sizeof(p));
+    if (r == 0 && p.params.status != NV_OK)
+        r = (int)p.params.status;
+
+    mtx_lock(&c->lock);
+    if (r != 0) {
+        if (picked)
+            handle_unreserve(c, h);
+        mtx_unlock(&c->lock);
+        return r;
+    }
+    struct crm_obj *o = obj_put(c, h, SLOT_USED);
+    if (o) {
+        o->parent = device;
+        o->hclass = NV01_MEMORY_SYSTEM_OS_DESCRIPTOR;
+        o->devinst = 0;
+        struct crm_obj *po = obj_find(c, device);
+        if (po && po->state == SLOT_USED)
+            po->children++;
+    }
+    mtx_unlock(&c->lock);
+    *object = h;
+    return 0;
+}
+
 int crm_gpu_count(crm_client *c)
 {
     return c ? c->gpu_count : -EINVAL;

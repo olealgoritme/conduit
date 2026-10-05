@@ -59,6 +59,7 @@ struct fake {
     int map_attempts, mmaps, munmaps, unmaps, register_fds, strict_checks;
     NV_MEMORY_ALLOCATION_PARAMS last_virt_params;
     NV0005_ALLOC_PARAMETERS last_event_params;
+    nv_ioctl_nvos02_parameters_with_fd last_alloc_memory;
     NvUnixEvent queue[8];
     int queued;
     int64_t live_mmaps;
@@ -218,6 +219,23 @@ static int f_ioctl(void *ctx, int fd, uint32_t nr, void *arg, uint32_t size)
             data = ap->data;
         }
         F.objs[F.nobj++] = (struct fobj){ p->hObjectNew, p->hObjectParent, p->hClass, 1, va, data };
+        p->status = NV_OK;
+        return 0;
+    }
+    case NV_ESC_RM_ALLOC_MEMORY: {
+        nv_ioctl_nvos02_parameters_with_fd *w = arg;
+        NVOS02_PARAMETERS *p = &w->params;
+        if (size != sizeof(*w)) return -EINVAL;
+        if (F.fd_node[fd] == CRM_NODE_CTL) return -EINVAL; /* NV_ACTUAL_DEVICE_ONLY */
+        F.last_alloc_memory = *w;
+        struct fobj *par = fobj_find(p->hObjectParent);
+        if (!par || par->hclass != NV01_DEVICE_0) { p->status = NV_ERR_OBJECT_NOT_FOUND; return 0; }
+        if (p->hClass != NV01_MEMORY_SYSTEM_OS_DESCRIPTOR || !(p->flags & NVOS02_FLAGS_MAPPING_NO_MAP)) {
+            p->status = 0x29u; /* INVALID_FLAGS */
+            return 0;
+        }
+        if (p->hObjectNew == 0 || fobj_find(p->hObjectNew)) { p->status = NV_ERR_INVALID_OBJECT_HANDLE; return 0; }
+        F.objs[F.nobj++] = (struct fobj){ p->hObjectNew, p->hObjectParent, p->hClass, 1, 0, 0 };
         p->status = NV_OK;
         return 0;
     }
@@ -793,6 +811,44 @@ static void test_gpu_mappings(void)
     crm_close(c);
 }
 
+static void test_os_descriptor(void)
+{
+    fake_reset();
+    crm_client *c = open_client();
+    if (!c) return;
+    uint32_t dev = 0, mem = 0, vas = 0;
+    CHECK_EQ(crm_alloc(c, 0, &dev, NV01_DEVICE_0, NULL, 0), 0);
+    CHECK_EQ(crm_alloc(c, dev, &vas, FERMI_VASPACE_A, NULL, 0), 0);
+    static char pages[3 * 4096] __attribute__((aligned(4096)));
+    CHECK_EQ(crm_alloc_os_descriptor(c, dev, &mem, pages, sizeof(pages), 0), 0);
+    CHECK(mem != 0);
+    CHECK_EQ(F.last_alloc_memory.params.hRoot, FAKE_CLIENT);
+    CHECK_EQ(F.last_alloc_memory.params.hObjectParent, dev);
+    CHECK_EQ(F.last_alloc_memory.params.hClass, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
+    CHECK_EQ(F.last_alloc_memory.params.pMemory, (uint64_t)(uintptr_t)pages);
+    CHECK_EQ(F.last_alloc_memory.params.limit, sizeof(pages) - 1);
+    CHECK_EQ(F.last_alloc_memory.params.flags,
+             NVOS02_FLAGS_COHERENCY_CACHED | NVOS02_FLAGS_PHYSICALITY_NONCONTIGUOUS |
+             NVOS02_FLAGS_MAPPING_NO_MAP);
+    CHECK_EQ(F.last_alloc_memory.fd, -1);
+    CHECK_EQ(crm_object_count(c), 3);
+
+    /* tracked like any object: maps into a VA space and frees */
+    uint64_t va = 0;
+    CHECK_EQ(crm_map_dma(c, dev, vas, mem, 0, sizeof(pages), 0, &va), 0);
+    CHECK_EQ(crm_unmap_dma(c, dev, vas, mem, 0, va), 0);
+    CHECK_EQ(crm_free(c, dev, mem), 0);
+    CHECK_EQ(crm_object_count(c), 2);
+
+    /* RM's refusal comes back as its status; the handle is not kept */
+    uint32_t bad = 0;
+    CHECK_EQ(crm_alloc_os_descriptor(c, dev, &bad, pages, sizeof(pages), 0x1u /* no NO_MAP */), 0x29);
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(crm_object_count(c), 2);
+    CHECK_EQ(crm_alloc_os_descriptor(c, dev, &bad, NULL, 4096, 0), -EINVAL);
+    crm_close(c);
+}
+
 static void test_events(void)
 {
     fake_reset();
@@ -906,6 +962,7 @@ int main(void)
     test_cpu_mappings();
     test_gpu_mappings();
     test_events();
+    test_os_descriptor();
     test_custom_map_transport();
     printf("rmclient unit tests: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

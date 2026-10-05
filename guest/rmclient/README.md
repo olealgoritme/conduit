@@ -27,6 +27,7 @@ positive `NV_STATUS` when RM refused the call. `crm_status_name()` and
 | `crm_map_memory` / `crm_unmap_memory` | `NV_ESC_RM_MAP_MEMORY` (NVOS33 + fd) + `mmap` / `munmap` + `NV_ESC_RM_UNMAP_MEMORY` (NVOS34) |
 | `crm_map_dma[2]` / `crm_unmap_dma` | `NV_ESC_RM_MAP_MEMORY_DMA` (NVOS46) / `NV_ESC_RM_UNMAP_MEMORY_DMA` (NVOS47) |
 | `crm_gpu_count`, `crm_gpu_info`, `crm_gpu_pci` | the `NV_ESC_CARD_INFO` read at open |
+| `crm_alloc_os_descriptor(c, device, &h, addr, size, flags)` | `NV_ESC_RM_ALLOC_MEMORY` (NVOS02 + fd) on the GPU channel: `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` over the caller's own pages. RM accepts a user address only on this route; `NV_ESC_RM_ALLOC` of the class answers `NV_ERR_NOT_SUPPORTED`. |
 | `crm_event_open` / `crm_event_drain` / `crm_event_close` | a new control fd, `NV_ESC_ALLOC_OS_EVENT`, `NV01_EVENT_OS_EVENT` with `data = fd` / `NV_ESC_RM_GET_EVENT_DATA` / `NV_ESC_FREE_OS_EVENT` |
 | `crm_escape(c, fd, nr, arg, size)` | any escape, unwrapped |
 | `crm_new_handle`, `crm_release_handle`, `crm_free_quiet`, `crm_object_count`, `crm_mapping_count`, `crm_rm_version`, `crm_ctl_fd` | helpers |
