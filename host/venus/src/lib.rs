@@ -48,7 +48,7 @@ pub struct Blob {
     pub size: u64,
 }
 
-/// `DRM_FORMAT_MOD_LINEAR`, the only modifier a Venus scanout has for now.
+/// `DRM_FORMAT_MOD_LINEAR`, the only modifier the renderer reports.
 pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 /// A scanout image's layout, as the guest gave it in `SET_SCANOUT_BLOB`
@@ -56,10 +56,10 @@ pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// format already mapped to its `DRM_FORMAT_*` by the backend.
 ///
 /// There is no modifier: a Venus blob carries no image layout the host could
-/// read back (virglrenderer's export query knows nothing of it), so the only
-/// layout both sides can agree on without one is linear. Venus scanout
-/// images must be linear for now: guest drivers must allocate scanout images
-/// with `VK_IMAGE_TILING_LINEAR` (or an explicit `DRM_FORMAT_MOD_LINEAR`).
+/// read back (virglrenderer's export query knows nothing of it), so the
+/// renderer reports linear. The backend, which knows the blob's size, infers
+/// the modifier the viewer is told (block-linear for a blob padded the way an
+/// optimal-tiling image is; docs/VENUS.md "Scanout layout").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanoutLayout {
     pub width: u32,

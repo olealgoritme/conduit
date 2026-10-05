@@ -95,17 +95,47 @@ Fence rules, which follow virglrenderer:
 | `RESOURCE_MAP_BLOB` | the blob's fd placed in region 3 at the guest's offset; reply `RESP_OK_MAP_INFO` with the cache type |
 | `RESOURCE_UNMAP_BLOB` | withdrawn from region 3 |
 | `RESOURCE_UNREF` | unmapped if mapped, then freed |
-| `SET_SCANOUT_BLOB` | records scanout 0's resource, size, format, stride, offset; resource 0 turns the scanout off (`ScanoutDisable` to the viewer); a format with no DRM fourcc is `RESP_ERR_INVALID_PARAMETER`, a scanout other than 0 `RESP_ERR_INVALID_SCANOUT_ID` |
+| `SET_SCANOUT_BLOB` | records scanout 0's resource, size, format, stride, offset, and the modifier its blob's size implies (below); resource 0 turns the scanout off (`ScanoutDisable` to the viewer); a format with no DRM fourcc is `RESP_ERR_INVALID_PARAMETER`, a scanout other than 0 `RESP_ERR_INVALID_SCANOUT_ID` |
 | `RESOURCE_FLUSH` | renderer exports the scanout resource as a dma-buf with the guest's layout (cached per resource and layout), sent to the viewer as a frame |
 
 **Scanout layout.** The dma-buf the viewer gets is described entirely by the
 guest's `SET_SCANOUT_BLOB`: `width`, `height`, `strides[0]`, `offsets[0]`, and
 the format as the DRM fourcc of the same memory layout (`B8G8R8A8` →
 `ARGB8888`, `B8G8R8X8` → `XRGB8888`, `R8G8B8A8` → `ABGR8888`, `R8G8B8X8` →
-`XBGR8888`, and the other four `VIRTIO_GPU_FORMAT_*`), with modifier
-`DRM_FORMAT_MOD_LINEAR`. A Venus blob carries no image layout the host can
-read back, so **Venus scanout images must be linear for now**: guest drivers
-must allocate scanout images with linear tiling.
+`XBGR8888`, and the other four `VIRTIO_GPU_FORMAT_*`). A Venus blob carries
+no image layout the host can read back, so the backend infers the modifier
+from the blob's size (`host/backend/device/src/venus/scanout.rs`):
+
+- A blob with room for `offset + stride × roundup(height, 8 × 2^h)` bytes,
+  where `height` is not already a whole number of blocks and `stride` is a
+  multiple of 64, is NVIDIA block-linear: `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c=0,
+  s=1, g=2, k=0x06, h)`. That is how the NVIDIA driver lays out a
+  `VK_IMAGE_TILING_OPTIMAL` image: blocks of `2^h` GOBs (8 rows × 64 bytes),
+  `h = min(4, ceil(log2(ceil(height / 8))))`, so 4 for any screen-sized image
+  (`0x0300000000606014`). A 1920×1080 `XRGB8888` image is 7680 × 1152 bytes.
+  The host driver advertises this modifier (with `h` 0 to 5) for every scanout
+  format on Turing and later.
+- Anything else is `DRM_FORMAT_MOD_LINEAR`: a linear image is exactly
+  `stride × height` bytes, perhaps rounded up to a page or 64 KiB.
+
+When `height` is a whole number of blocks (768, 1024) the two layouts have
+the same size, and linear is assumed: a guest scanning out an optimal image
+of that height shows garbage. Linear tiling is always safe.
+
+`SET_SCANOUT_BLOB` logs the resource, blob size, geometry, format and the
+modifier chosen at `debug` (`RUST_LOG=device::venus=debug`).
+
+**Debugging: `CONDUIT_VENUS_SCANOUT_MODIFIER`.** In the backend's
+environment, forces the modifier of every Venus scanout: `linear`, or a hex
+modifier such as `0x0300000000606010` (block-linear, one-GOB blocks; the last
+hex digit is `h`). It is for trying layouts without a rebuild, not for
+production; the backend logs it at start. With `conduit up` the backend
+inherits the shell's environment (`CONDUIT_VENUS_SCANOUT_MODIFIER=0x... conduit
+up NAME --venus`); for a libvirt VM it comes from the
+`conduit-backend@NAME.service` unit: `systemctl --user edit
+conduit-backend@NAME.service` (add `[Service]` and
+`Environment=CONDUIT_VENUS_SCANOUT_MODIFIER=0x...`; without `--user` for a
+`qemu:///system` VM), then restart the VM.
 
 **Checks** (backend, before the renderer sees anything): command length
 matches the type; `ctx_id` and `resource_id` exist and belong together;

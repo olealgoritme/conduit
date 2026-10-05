@@ -102,6 +102,9 @@ pub struct Venus {
     /// What is placed in region 3.
     maps: blob::Maps,
     scanout: Option<scanout::Scanout>,
+    /// `CONDUIT_VENUS_SCANOUT_MODIFIER`: the modifier every scanout is shown
+    /// with, in place of the one its size suggests. For experiments.
+    forced_modifier: Option<u64>,
     fences: fence::Fences,
     /// The renderer said it is gone. Everything was released then, and every
     /// command since is answered `RESP_ERR_UNSPEC`.
@@ -124,6 +127,7 @@ impl Venus {
             resources: HashMap::new(),
             maps: Default::default(),
             scanout: None,
+            forced_modifier: scanout::modifier_override(),
             fences: Default::default(),
             lost: false,
             lose_pending: false,

@@ -5,10 +5,11 @@
 //!
 //! The image's layout is the guest's: `SET_SCANOUT_BLOB`'s size, `strides[0]`,
 //! `offsets[0]`, and its virtio-gpu format as the `DRM_FORMAT_*` of the same
-//! memory layout. A Venus blob carries no layout the host could check it
-//! against, and no modifier, so Venus scanout images must be linear for now:
-//! a guest driver must allocate its scanout images with linear tiling, or
-//! the viewer shows garbage.
+//! memory layout. A Venus blob carries no modifier, so the backend infers one
+//! from the blob's size: a blob exactly as big as the image is linear, and one
+//! with room for the rows NVIDIA pads an optimal-tiling image to is
+//! block-linear ([`modifier_for`]). `CONDUIT_VENUS_SCANOUT_MODIFIER` overrides
+//! the guess, for experiments.
 
 use super::*;
 use crate::display::FrameGeometry;
@@ -22,6 +23,78 @@ pub(super) struct Scanout {
     pub(super) format: u32,
     /// The image, with `format` as its `DRM_FORMAT_*`.
     pub(super) layout: ScanoutLayout,
+    /// `DRM_FORMAT_MOD_*` the image is shown with.
+    pub(super) modifier: u64,
+}
+
+/// `DRM_FORMAT_MOD_LINEAR`.
+const MOD_LINEAR: u64 = conduit_venus::DRM_FORMAT_MOD_LINEAR;
+
+/// `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c=0, s=1, g=2, k=0x06, h)`: an
+/// uncompressed block-linear image of a desktop Turing-or-later GPU, with
+/// blocks `2^h` GOBs (of 8 rows by 64 bytes) high. The host's NVIDIA driver
+/// advertises it for every scanout format with `h` 0..=5 (measured with
+/// eglQueryDmaBufModifiersEXT on an RTX 5090, driver 610), and it is what
+/// Linux guests already flip.
+const fn nvidia_block_linear(h: u32) -> u64 {
+    0x0300_0000_0060_6010 | h as u64
+}
+
+/// The modifier a scanout image has, from the size of the blob holding it.
+///
+/// The NVIDIA driver lays a `VK_IMAGE_TILING_OPTIMAL` image out block-linear,
+/// with blocks `min(16, next_pow2(ceil(rows / 8)))` GOBs high (16 for any
+/// screen-sized image), and its memory holds whole blocks: `roundup(rows,
+/// 8 << h)` rows of `stride` bytes, the stride a whole number of 64-byte
+/// GOBs. A 1920x1080 XRGB8888 image takes 7680 * 1152 bytes, a linear one
+/// 7680 * 1080. A blob with room for the padded rows (and possibly more) is
+/// taken as block-linear; one without, as linear. Where there is no padding
+/// (a height that is a multiple of the block height: 768, 1024) the two
+/// cannot be told apart and linear is assumed.
+pub(super) fn modifier_for(layout: &ScanoutLayout, blob_size: u64) -> u64 {
+    if !layout.stride.is_multiple_of(64) {
+        return MOD_LINEAR;
+    }
+    let h = layout
+        .height
+        .div_ceil(8)
+        .next_power_of_two()
+        .trailing_zeros()
+        .min(4);
+    let rows = u64::from(layout.height).next_multiple_of(8 << h);
+    let need = u64::from(layout.offset) + u64::from(layout.stride) * rows;
+    if rows > u64::from(layout.height) && blob_size >= need {
+        nvidia_block_linear(h)
+    } else {
+        MOD_LINEAR
+    }
+}
+
+/// `CONDUIT_VENUS_SCANOUT_MODIFIER`, read once: `linear` or a hex modifier.
+pub(super) fn modifier_override() -> Option<u64> {
+    let v = std::env::var("CONDUIT_VENUS_SCANOUT_MODIFIER").ok()?;
+    let m = parse_modifier(&v);
+    match m {
+        Some(m) => log::info!(
+            "venus: scanouts are shown with modifier {m:#018x} (CONDUIT_VENUS_SCANOUT_MODIFIER)"
+        ),
+        None => log::warn!(
+            "venus: CONDUIT_VENUS_SCANOUT_MODIFIER={v:?} is neither `linear` nor a hex modifier; ignored"
+        ),
+    }
+    m
+}
+
+pub(super) fn parse_modifier(v: &str) -> Option<u64> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("linear") {
+        return Some(MOD_LINEAR);
+    }
+    let hex = v
+        .strip_prefix("0x")
+        .or_else(|| v.strip_prefix("0X"))
+        .unwrap_or(v);
+    u64::from_str_radix(hex, 16).ok()
 }
 
 /// A resource exported for scanout, with one layout.
@@ -66,16 +139,31 @@ impl Venus {
         {
             return Err(RESP_ERR_INVALID_PARAMETER);
         }
+        let layout = ScanoutLayout {
+            width: s.width,
+            height: s.height,
+            stride: s.strides[0],
+            offset: s.offsets[0],
+            fourcc,
+        };
+        let modifier = self
+            .forced_modifier
+            .unwrap_or_else(|| modifier_for(&layout, r.size));
+        log::debug!(
+            "venus: scanout is resource {} ({} bytes): {}x{} format {} stride {} offset {} modifier {modifier:#018x}",
+            s.resource_id,
+            r.size,
+            s.width,
+            s.height,
+            s.format,
+            s.strides[0],
+            s.offsets[0]
+        );
         self.scanout = Some(Scanout {
             resource_id: s.resource_id,
             format: s.format,
-            layout: ScanoutLayout {
-                width: s.width,
-                height: s.height,
-                stride: s.strides[0],
-                offset: s.offsets[0],
-                fourcc,
-            },
+            layout,
+            modifier,
         });
         Ok(Reply::NoData)
     }
@@ -96,7 +184,7 @@ impl Venus {
         let Some(link) = env.display else {
             return Ok(Reply::NoData);
         };
-        let (id, layout, format) = (s.resource_id, s.layout, s.format);
+        let (id, layout, format, modifier) = (s.resource_id, s.layout, s.format, s.modifier);
         let r = self.resources.get_mut(&id).expect("checked above");
         if r.export.as_ref().is_none_or(|e| e.layout != layout) {
             r.export = None;
@@ -122,18 +210,25 @@ impl Venus {
             .as_ref()
             .expect("exported above")
             .dmabuf;
-        // The guest's layout, which the renderer echoes into the dma-buf;
-        // the modifier is the renderer's (linear).
+        // The guest's layout, which the renderer echoes into the dma-buf,
+        // and the modifier SET_SCANOUT_BLOB inferred: the renderer's is
+        // always linear, as it cannot know better.
         let g = FrameGeometry {
             width: layout.width,
             height: layout.height,
             stride: layout.stride,
             offset: layout.offset,
             fourcc: layout.fourcc,
-            modifier: e.modifier,
+            modifier,
         };
         link.flip_dmabuf(e.fd.as_raw_fd(), &g);
         Ok(Reply::NoData)
+    }
+
+    /// The modifier the scanout is shown with, for tests.
+    #[cfg(test)]
+    pub(super) fn scanout_modifier(&self) -> Option<u64> {
+        self.scanout.as_ref().map(|s| s.modifier)
     }
 
     /// What the scanout shows, for tests: (resource, width, height, format,

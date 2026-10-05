@@ -2,9 +2,10 @@
 //! 3 and the scanout, without a GPU.
 
 use super::*;
+use crate::display::wire;
 use conduit_venus::mock::Mock;
 use conduit_venus::{Blob, CapsetInfo, Dmabuf, ScanoutLayout, Signalled};
-use std::os::fd::{AsFd, FromRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
 /// The mock behind a handle the test keeps, so what reached the renderer can
@@ -1224,4 +1225,96 @@ fn contexts_are_limited() {
         ..Default::default()
     };
     assert_eq!(t.ty(&c.to_bytes()), RESP_ERR_OUT_OF_MEMORY);
+}
+
+/// The modifier is inferred from the blob's size: exactly the image is
+/// linear; room for the rows NVIDIA pads an optimal image to is block-linear
+/// with the block height the driver picks for that many rows.
+#[test]
+fn scanout_modifier_follows_the_blob_size() {
+    use super::scanout::modifier_for;
+    const BL16: u64 = 0x0300_0000_0060_6014;
+    let l = |width: u32, height: u32| ScanoutLayout {
+        width,
+        height,
+        stride: width * 4,
+        offset: 0,
+        fourcc: u32::from_le_bytes(*b"XR24"),
+    };
+    // What a Windows guest bound: 1920x1080 in 7680 * 1152 bytes.
+    assert_eq!(modifier_for(&l(1920, 1080), 7680 * 1152), BL16);
+    // With a 64 KiB tail, too.
+    assert_eq!(modifier_for(&l(1920, 1080), 7680 * 1152 + 65536), BL16);
+    // Linear: exactly the image, or rounded up to a page or 64 KiB.
+    assert_eq!(modifier_for(&l(1920, 1080), 1920 * 1080 * 4), 0);
+    assert_eq!(modifier_for(&l(1920, 1080), 8_323_072), 0);
+    // One row short of the padding.
+    assert_eq!(modifier_for(&l(1920, 1080), 7680 * 1151), 0);
+    // Other sizes: 1440 pads to 1536, 2160 to 2176, 800 to 896.
+    assert_eq!(modifier_for(&l(2560, 1440), 10240 * 1536), BL16);
+    assert_eq!(modifier_for(&l(3840, 2160), 15360 * 2176), BL16);
+    assert_eq!(modifier_for(&l(1280, 800), 5120 * 896), BL16);
+    // No padding to see: 768 and 1024 are whole blocks.
+    assert_eq!(modifier_for(&l(1024, 768), 4096 * 768), 0);
+    assert_eq!(modifier_for(&l(1280, 1024), 5120 * 1024 * 2), 0);
+    // Short images get short blocks: 40 rows are 5 GOBs, blocks of 8 (h=3).
+    assert_eq!(modifier_for(&l(64, 40), 256 * 64), 0x0300_0000_0060_6013);
+    // The offset counts.
+    let mut o = l(1920, 1080);
+    o.offset = 4096;
+    assert_eq!(modifier_for(&o, 7680 * 1152), 0);
+    assert_eq!(modifier_for(&o, 7680 * 1152 + 4096), BL16);
+    // A stride that is not whole GOBs is not block-linear.
+    let mut s = l(1920, 1080);
+    s.stride = 7684;
+    assert_eq!(modifier_for(&s, 1 << 30), 0);
+}
+
+/// `CONDUIT_VENUS_SCANOUT_MODIFIER` is `linear` or hex, with or without `0x`.
+#[test]
+fn scanout_modifier_override_parses() {
+    use super::scanout::parse_modifier;
+    assert_eq!(parse_modifier("linear"), Some(0));
+    assert_eq!(parse_modifier(" LINEAR\n"), Some(0));
+    assert_eq!(
+        parse_modifier("0x0300000000606010"),
+        Some(0x0300_0000_0060_6010)
+    );
+    assert_eq!(
+        parse_modifier("300000000606015"),
+        Some(0x0300_0000_0060_6015)
+    );
+    assert_eq!(parse_modifier("0x"), None);
+    assert_eq!(parse_modifier("block-linear"), None);
+}
+
+/// The inferred modifier is the one the viewer gets, and an override wins.
+#[test]
+fn scanout_modifier_reaches_the_viewer() {
+    let mut t = Rig::new();
+    let (link, broker) = display();
+    t.ctx(1);
+    assert_eq!(t.blob(1, 10, 7680 * 1152), RESP_OK_NODATA);
+    assert_eq!(t.blob(1, 11, 7680 * 1080), RESP_OK_NODATA);
+    let attached = |broker: &OwnedFd| {
+        let mut buf = vec![0u8; 64 * wire::CMD_SIZE];
+        // SAFETY: a read into a local buffer.
+        let n = unsafe { libc::read(broker.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        assert!(n > 0);
+        buf[..n as usize]
+            .chunks_exact(wire::CMD_SIZE)
+            .map(|c| wire::Cmd::decode(c.try_into().unwrap()))
+            .filter(|c| c.ty == wire::CMD_ATTACH)
+            .map(|c| c.modifier)
+            .collect::<Vec<_>>()
+    };
+    for (res, want) in [(10, 0x0300_0000_0060_6014), (11, 0)] {
+        assert_eq!(t.ty(&scanout_cmd(res, 1920, 1080)), RESP_OK_NODATA);
+        assert_eq!(t.venus.scanout_modifier(), Some(want));
+        assert_eq!(t.send_on(&flush_cmd(res), Some(&link)).0.ty, RESP_OK_NODATA);
+        assert_eq!(attached(&broker), vec![want]);
+    }
+    t.venus.forced_modifier = Some(0x0300_0000_0060_6010);
+    assert_eq!(t.ty(&scanout_cmd(11, 1920, 1080)), RESP_OK_NODATA);
+    assert_eq!(t.venus.scanout_modifier(), Some(0x0300_0000_0060_6010));
 }

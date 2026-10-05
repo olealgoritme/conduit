@@ -47,8 +47,11 @@ Experimental, behind `--venus` ([VENUS.md](VENUS.md)).
   build the backend without its `venus` feature; build both by hand
   ([VENUS.md](VENUS.md)).
 - Region 3 needs QEMU (`conduit-vmm` has fixed BARs).
-- Scanout images must be linear (a Venus blob carries no layout the host can
-  read back).
+- A Venus blob carries no layout the host can read back; the scanout's
+  modifier is inferred from the blob's size (linear, or NVIDIA block-linear
+  when the blob holds the padded rows). An optimal-tiling scanout whose
+  height is a whole number of blocks (768, 1024) is taken as linear and shows
+  garbage.
 - Only `HOST3D` blobs; guest-memory blobs are refused.
 - A fence on a ring with no queue bound makes virglrenderer destroy the
   context, which the backend cannot see.
