@@ -21,6 +21,7 @@
 pub mod edid;
 pub mod external_memory;
 pub mod nvrm_events;
+pub mod foreign_resource;
 pub mod page_runs;
 pub mod producer_completion;
 pub mod execution_completion;

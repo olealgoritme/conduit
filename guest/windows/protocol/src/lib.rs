@@ -22,6 +22,7 @@
 
 pub mod escape;
 pub mod features;
+pub mod foreign;
 pub mod ioctl;
 pub mod nvrm;
 pub mod producer;
@@ -30,6 +31,7 @@ pub mod wddm;
 
 pub use escape::*;
 pub use features::*;
+pub use foreign::*;
 pub use ioctl::*;
 pub use nvrm::*;
 pub use producer::*;

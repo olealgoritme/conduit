@@ -447,6 +447,12 @@ pub unsafe extern "C" fn dxgkddi_escape(
             Some(owner) => escape_scanout_event(adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
+        helios_protocol::HELIOS_ESCAPE_FOREIGN_RESOURCE => match owner {
+            Some(owner) => {
+                super::escape_foreign::escape_foreign_resource(passive, adapter, buf, &hdr, owner)
+            }
+            None => refuse_no_device(),
+        },
         // Unknown verbs are rejected — and counted, because an unhandled verb is
         // how an ICD/KMD protocol skew presents (HELIOS_ESCAPE_PRESENT_BLOB
         // = 0x0007 exists in the protocol and lands here).

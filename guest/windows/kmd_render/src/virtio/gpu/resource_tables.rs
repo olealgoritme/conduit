@@ -186,6 +186,7 @@ impl VirtioGpu {
             s.owner == Some(owner) && s.ctx_id == ctx_id && s.resource_id == resource_id
         })?;
         let slot = self.blobs.swap_remove(idx);
+        self.foreign.remove(slot.resource_id);
         Some((slot.resource_id, slot.mapped, slot.map_offset, slot.map_len))
     }
 
@@ -197,6 +198,7 @@ impl VirtioGpu {
     ) -> Option<(u32, u32, bool, u64, u64)> {
         let idx = self.blobs.iter().position(|s| s.owner == owner)?;
         let slot = self.blobs.swap_remove(idx);
+        self.foreign.remove(slot.resource_id);
         Some((
             slot.ctx_id,
             slot.resource_id,
@@ -287,6 +289,11 @@ impl VirtioGpu {
     /// while stale clients unwind) and also names the KMD-owned slots as
     /// `Exactly(None)`.
     pub fn blob_map_begin(&mut self, owner: OwnerFilter, resource_id: u32) -> BlobMapBegin {
+        // A foreign resource has no CPU view, whoever asks and whatever the path.
+        if self.foreign.contains(resource_id) {
+            crate::virtio::foreign::MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return BlobMapBegin::Failed(VirtioError::DeviceError);
+        }
         let Some(window) = self.host_visible else {
             return BlobMapBegin::Failed(VirtioError::DeviceError);
         };
@@ -409,6 +416,10 @@ impl VirtioGpu {
     /// blob content is intrinsic to the host memory object, so a remap is
     /// content-preserving. Any-owner resolve (kernel path, like the executor).
     pub fn blob_remap_begin(&mut self, resource_id: u32, offset: u64) -> BlobRemapBegin {
+        if self.foreign.contains(resource_id) {
+            crate::virtio::foreign::MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return BlobRemapBegin::Failed(VirtioError::DeviceError);
+        }
         if self.host_visible.is_none() {
             return BlobRemapBegin::Failed(VirtioError::DeviceError);
         }
@@ -561,7 +572,10 @@ impl VirtioGpu {
             return None;
         };
         slot.owner = None;
-        Some(slot.size)
+        let size = slot.size;
+        // A foreign resource is KMD-owned from here: its creator's quota is freed.
+        self.foreign.adopt(resource_id);
+        Some(size)
     }
 
     /// Drop the KMD-internal (KMD-owned) tracking slot for an allocation's blob at
@@ -576,6 +590,7 @@ impl VirtioGpu {
             .iter()
             .position(|s| s.owner.is_none() && s.resource_id == resource_id)?;
         let slot = self.blobs.swap_remove(idx);
+        self.foreign.remove(resource_id);
         Some((slot.mapped, slot.map_offset, slot.map_len))
     }
 

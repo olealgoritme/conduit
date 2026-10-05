@@ -16,6 +16,7 @@
 pub mod config;
 pub mod counters;
 pub mod ctrl;
+pub mod foreign;
 pub mod gpu;
 pub mod hal;
 pub mod nvrm;
