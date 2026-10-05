@@ -7,7 +7,9 @@
 //! (`libvirt-next-mode`, "none" = headless) right before starting the domain;
 //! a start from virt-manager or virsh uses the monitor's mode. The backend
 //! records what it got in `libvirt-mode`, which `conduit view` reads to size a
-//! window for a VM that is already running.
+//! window for a VM that is already running. A backend that systemd starts
+//! again within the same QEMU run (the first one exited) serves what the first
+//! one did (`libvirt-last-start`).
 
 use crate::boot;
 use crate::config;
@@ -31,6 +33,9 @@ const NEXT_MODE: &str = "libvirt-next-mode";
 const MODE: &str = "libvirt-mode";
 /// Present when the next backend start serves Venus (`--venus`).
 const NEXT_VENUS: &str = "libvirt-next-venus";
+/// What the latest backend start served, and for which QEMU run, so that a
+/// backend systemd starts again within that run serves the same.
+const LAST_START: &str = "libvirt-last-start";
 /// How long an ACPI shutdown may take before the VM is forced off.
 const SHUTDOWN_GRACE: Duration = run::SHUTDOWN_GRACE;
 
@@ -602,12 +607,52 @@ pub fn backend_exec(name: &str) -> Result<()> {
     log_to(&logs_dir(name).join("backend.log"), false)?;
     let next = std::fs::read_to_string(rt.p(NEXT_MODE)).ok();
     let _ = std::fs::remove_file(rt.p(NEXT_MODE));
-    let venus = std::fs::remove_file(rt.p(NEXT_VENUS)).is_ok();
-    let mode: Option<Mode> = match next.as_deref().map(str::trim) {
-        Some("none") => None,
-        Some(s) if s.parse::<Mode>().is_ok() => s.parse().ok(),
-        _ => Some(mode::detect().0),
+    let next_venus = std::fs::remove_file(rt.p(NEXT_VENUS)).is_ok();
+    let asked = (next.is_some() || next_venus).then(|| Start {
+        venus: next_venus,
+        mode: match next.as_deref().map(str::trim) {
+            Some("none") => None,
+            Some(s) if s.parse::<Mode>().is_ok() => s.parse().ok(),
+            _ => Some(mode::detect().0),
+        },
+    });
+    // The markers are consumed by the first start of a VM run. When that
+    // backend exits (a crash, a binary that refuses an option), systemd starts
+    // the unit again as QEMU reconnects, and that start finds no markers: it
+    // would come up without Venus and with the monitor's mode, and the guest
+    // would silently get a basic display. So a start without markers keeps
+    // what the previous start of the same QEMU run served. A new run without
+    // markers (started from virt-manager or virsh) still gets the defaults,
+    // since its QEMU is a different process.
+    let run = qemu_run(&link);
+    let last = std::fs::read_to_string(rt.p(LAST_START))
+        .ok()
+        .and_then(|s| parse_last_start(&s));
+    let start = match choose_start(asked, last, run.as_deref()) {
+        Choice::Asked(s) => s,
+        Choice::Kept(s) => {
+            eprintln!(
+                "conduit: backend restarted within the same VM run; keeping venus {} and display {}",
+                if s.venus { "on" } else { "off" },
+                s.mode.map(|m| m.to_string()).unwrap_or_else(|| "none".into())
+            );
+            s
+        }
+        Choice::Default => Start {
+            venus: false,
+            mode: Some(mode::detect().0),
+        },
     };
+    let Start { venus, mode } = start;
+    // Recorded only when the run is known: a record without one could never
+    // be matched. `_stopped` leaves it, since it also runs after a backend
+    // that crashed; a stale record is harmless, as no later run matches it.
+    match &run {
+        Some(r) => std::fs::write(rt.p(LAST_START), format_last_start(r, start))?,
+        None => {
+            let _ = std::fs::remove_file(rt.p(LAST_START));
+        }
+    }
     std::fs::write(
         rt.p(MODE),
         mode.map(|m| m.to_string()).unwrap_or_else(|| "none".into()) + "\n",
@@ -671,6 +716,80 @@ pub fn backend_exec(name: &str) -> Result<()> {
     );
     let e = cmd.exec();
     Err(e).with_context(|| format!("could not run {}", backend.display()))
+}
+
+/// What a backend start serves: Venus or not, and the display (None =
+/// headless).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Start {
+    venus: bool,
+    mode: Option<Mode>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Choice {
+    /// `conduit up` / `conduit view` left markers for this start.
+    Asked(Start),
+    /// No markers, but the previous backend of the same QEMU run served this.
+    Kept(Start),
+    /// No markers and nothing to keep: no Venus, the monitor's mode.
+    Default,
+}
+
+/// Markers win; without them, a start keeps what the previous start of the
+/// same QEMU run served. An unknown run never matches, so settings carry over
+/// only between backends of one QEMU process, never into the next VM run.
+fn choose_start(asked: Option<Start>, last: Option<(String, Start)>, run: Option<&str>) -> Choice {
+    if let Some(s) = asked {
+        return Choice::Asked(s);
+    }
+    match (last, run) {
+        (Some((was, s)), Some(now)) if was == now => Choice::Kept(s),
+        _ => Choice::Default,
+    }
+}
+
+/// The domain's QEMU run as "PID:STARTTIME": the start time tells a reused
+/// pid apart from the process that wrote a record. None when libvirt's pid
+/// file cannot be read (the system daemon's belongs to root) or QEMU is gone.
+fn qemu_run(link: &Link) -> Option<String> {
+    let pid = link.virsh().qemu_pid(&link.domain)?;
+    let t = sys::start_time(pid)?;
+    Some(format!("{pid}:{t}"))
+}
+
+fn format_last_start(run: &str, s: Start) -> String {
+    format!(
+        "run={run}\nvenus={}\nmode={}\n",
+        u8::from(s.venus),
+        s.mode
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "none".into())
+    )
+}
+
+fn parse_last_start(text: &str) -> Option<(String, Start)> {
+    let (mut run, mut venus, mut mode) = (None, None, None);
+    for l in text.lines() {
+        let Some((k, v)) = l.split_once('=') else {
+            continue;
+        };
+        let v = v.trim();
+        match k {
+            "run" => run = Some(v.to_string()),
+            "venus" => venus = Some(v == "1"),
+            "mode" if v == "none" => mode = Some(None),
+            "mode" => mode = Some(Some(v.parse().ok()?)),
+            _ => {}
+        }
+    }
+    Some((
+        run?,
+        Start {
+            venus: venus?,
+            mode: mode?,
+        },
+    ))
 }
 
 /// conduit-venus for a libvirt VM's backend: started, logging to
@@ -769,5 +888,59 @@ pub fn state_word(name: &str) -> String {
                 "stopped".into()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st(venus: bool, mode: Option<&str>) -> Start {
+        Start {
+            venus,
+            mode: mode.map(|m| m.parse().unwrap()),
+        }
+    }
+
+    #[test]
+    fn markers_win() {
+        let a = st(false, Some("1920x1080@60"));
+        let last = Some(("1:2".to_string(), st(true, Some("5120x1440@240"))));
+        assert_eq!(choose_start(Some(a), last, Some("1:2")), Choice::Asked(a));
+    }
+
+    #[test]
+    fn a_restart_within_the_run_keeps_venus_and_the_mode() {
+        for s in [st(true, Some("5120x1440@240")), st(true, None)] {
+            let last = Some(("4242:991".to_string(), s));
+            assert_eq!(choose_start(None, last, Some("4242:991")), Choice::Kept(s));
+        }
+    }
+
+    #[test]
+    fn a_new_run_gets_the_defaults() {
+        let last = Some(("4242:991".to_string(), st(true, Some("5120x1440@240"))));
+        // Another QEMU, and the same pid reused by a later process.
+        assert_eq!(
+            choose_start(None, last.clone(), Some("5000:1200")),
+            Choice::Default
+        );
+        assert_eq!(
+            choose_start(None, last.clone(), Some("4242:1200")),
+            Choice::Default
+        );
+        // When the run cannot be told, nothing carries over.
+        assert_eq!(choose_start(None, last, None), Choice::Default);
+        assert_eq!(choose_start(None, None, Some("4242:991")), Choice::Default);
+    }
+
+    #[test]
+    fn the_last_start_record_round_trips() {
+        for s in [st(true, Some("5120x1440@240")), st(false, None)] {
+            let text = format_last_start("77:123", s);
+            assert_eq!(parse_last_start(&text), Some(("77:123".to_string(), s)));
+        }
+        assert_eq!(parse_last_start("run=1:2\nvenus=1\n"), None);
+        assert_eq!(parse_last_start("run=1:2\nvenus=1\nmode=bogus\n"), None);
     }
 }

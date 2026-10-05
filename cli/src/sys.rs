@@ -166,6 +166,20 @@ pub fn comm(pid: i32) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// When the process started (clock ticks after boot, field 22 of
+/// /proc/PID/stat). With the pid it names one process, even once the pid is
+/// reused.
+pub fn start_time(pid: i32) -> Option<u64> {
+    parse_start_time(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+fn parse_start_time(stat: &str) -> Option<u64> {
+    // The command name (field 2) is in parentheses and may itself hold spaces
+    // or parentheses, so count from the last ')': field 3 comes right after.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(22 - 3)?.parse().ok()
+}
+
 pub fn read_pid(file: &Path) -> Option<i32> {
     fs::read_to_string(file).ok()?.trim().parse().ok()
 }
@@ -356,4 +370,22 @@ pub fn free_bytes(p: &Path) -> Option<u64> {
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
     (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0)
         .then(|| s.f_bavail as u64 * s.f_frsize as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_time_counts_from_the_last_paren() {
+        let stat = "4242 (qemu (x) 1) S 1 4242 4242 0 -1 4194560 100 0 0 0 5 6 0 0 20 0 9 0 \
+                    123456 1000000 500 18446744073709551615";
+        assert_eq!(parse_start_time(stat), Some(123456));
+        assert_eq!(parse_start_time("garbage"), None);
+    }
+
+    #[test]
+    fn start_time_of_this_process() {
+        assert!(start_time(std::process::id() as i32).is_some());
+    }
 }
