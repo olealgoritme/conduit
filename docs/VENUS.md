@@ -142,7 +142,9 @@ with `RESP_OK_EDID` (`0x1104`): header, `size` = 256, padding, then
   rates above 255 (5120×1440@240: 24–240 Hz, 194–389 kHz, 2030 MHz).
   Windows checks modes against them when it treats the monitor as
   continuous-frequency (as it did while the KMD reported an analog
-  connector), and without them kept it at 60 Hz;
+  connector; it reports DisplayPort by default now, `OutputTech` in
+  [WINDOWS.md](WINDOWS.md#registry-knobs), and analog only with
+  `OutputTech=0`), and without them kept it at 60 Hz;
 - a DisplayID 2.0 extension (tag `0x70`, version `0x20`, primary use
   "generic display") with Product Identification (`0x20`, no OUI), Display
   Parameters (`0x21`, native size = the configured one), one Type VII

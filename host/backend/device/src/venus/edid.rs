@@ -211,9 +211,12 @@ fn base_block(t: &Timing, exact: bool, native: &Timing) -> [u8; BLOCK] {
     b[54..72].copy_from_slice(&dtd(t));
     b[72..90].copy_from_slice(&text_descriptor(0xfc, NAME));
     // Range limits covering both timings. Windows checks every mode against
-    // them when it treats the monitor as continuous-frequency (an analog
-    // target, as the Helios driver reports it); without them it keeps to a
-    // conservative 60 Hz and refuses the configured refresh.
+    // them when it treats the monitor as continuous-frequency, as it does
+    // for an analog target; without them it keeps to a conservative 60 Hz
+    // and refuses the configured refresh. The Helios driver reports
+    // DisplayPort by default (its OutputTech knob, 1 = DisplayPort; 0 is
+    // analog VGA); the limits stay, since they are correct for any connector
+    // and keep OutputTech=0 working.
     b[90..108].copy_from_slice(&range_limits(&[*t, *native]));
     // One dummy descriptor.
     b[111] = 0x10;
