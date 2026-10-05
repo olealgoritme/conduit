@@ -35,14 +35,14 @@ it refuses to run as root. See `docs/ARCHITECTURE.md` and `docs/SECURITY.md`.
 
 ```sh
 cd host/backend
-cargo build --release -p device --features vhost-user --bins
-cargo test --workspace --features device/vhost-user -- \
+cargo build --release -p device --features vhost-user,venus --bins
+cargo test --workspace --features device/vhost-user,device/venus -- \
     --skip for_real --skip closing_the_fd --skip repeated_map_unmap
 ```
 
-`make backend` / `make test` at the repo root do the same. `--venus` exists
-only with the `venus` feature (`--features vhost-user,venus`), which
-`packaging/build.sh` enables and `make` does not. The tests run
+`make backend` / `make test` at the repo root do the same, as do
+`packaging/build.sh` and CI. `--venus` exists only with the `venus` feature
+(it needs no virglrenderer; that is `conduit-venus`'s). The tests run
 against a fake host driver; the skipped ones open the real `/dev/nvidiactl`.
 
 ```sh

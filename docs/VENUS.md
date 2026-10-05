@@ -26,9 +26,9 @@ in the guest. The guest driver stack comes from Helios
 Nothing here changes Linux guests. The backend serves Venus only with
 `--venus`; without it the config bit is clear and `GpuCmd` is refused. The
 flag exists only in a backend built with the device crate's `venus` feature:
-`packaging/build.sh` (so every package) builds the backend with it, `make`
-does not (`cargo build --release -p device --features vhost-user,venus --bin
-conduit-backend` in `host/backend`, then `CONDUIT_BACKEND=PATH`).
+`packaging/build.sh` (so every package) and `make backend` build the backend
+with it (by hand: `cargo build --release -p device --features
+vhost-user,venus --bin conduit-backend` in `host/backend`).
 
 Setting up a Windows VM, installing the guest driver and tuning it:
 [WINDOWS.md](WINDOWS.md).

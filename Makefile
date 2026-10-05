@@ -18,7 +18,8 @@
 CARGO  ?= cargo
 KDIR   ?= /lib/modules/$(shell uname -r)/build
 JOBS   ?= $(shell nproc)
-# Tests that open the real /dev/nvidiactl; kept out of `make test`.
+# Tests that open the real /dev/nvidiactl; kept out of `make test`. The
+# feature sets match CI (.github/workflows/ci.yml).
 GPU_TESTS := --skip for_real --skip closing_the_fd --skip repeated_map_unmap
 
 .PHONY: all backend vmm cli viewer guest qemu stream test install package deps clean help dist-stage deb rpm archlinux tarball guest-deb guest-rpm guest-arch install-deb release release-minor release-major
@@ -27,8 +28,9 @@ all: backend vmm cli viewer guest qemu stream
 	@echo
 	@echo "Built. Try: ./target/release/conduit doctor"
 
+# Same features as the packages (packaging/build.sh BACKEND_FEATURES).
 backend:
-	cd host/backend && $(CARGO) build --release -p device --features vhost-user --bins
+	cd host/backend && $(CARGO) build --release -p device --features vhost-user,venus --bins
 
 vmm:
 	cd host/vmm && $(CARGO) build --release --no-default-features
@@ -54,8 +56,9 @@ qemu:
 
 test:
 	$(CARGO) test -p conduit
-	cd host/backend && $(CARGO) test --workspace --features device/vhost-user -- $(GPU_TESTS)
+	cd host/backend && $(CARGO) test --workspace --features device/vhost-user,device/venus -- $(GPU_TESTS)
 	cd host/vmm && $(CARGO) test --workspace --no-default-features
+	cd host/venus && $(CARGO) test
 	cd host/stream && $(CARGO) test
 	$(MAKE) -C host/viewer check
 
