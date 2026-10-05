@@ -151,6 +151,12 @@ writes/reads it, GPU-maps both, then unmaps and frees everything. Extra steps
 CPU-map video memory over BAR1, map the usermode doorbell object through the
 subdevice, and open/drain/close an OS event. Each step is printed.
 
+`tests/crm_pin_smoke.c` registers the caller's own memory with RM: it takes
+pages from `crm_alloc_pages`, makes an `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR`
+over them, GPU-maps and unmaps it, checks the CPU's pattern survived, and
+frees it, at 2 MiB and at 512 MiB (past what a direct page-run table holds on
+Windows, where the KMD pins the range).
+
 ## Status
 
 Tested in the `lab` guest (RTX 5090, GB20x, host driver 610.57.04):
@@ -162,8 +168,11 @@ works. Polling the fd for a real notification has not been tested. The backend's
 ABI profile needs 0x52, a 16-byte `NVOS41` whose `pEvent` is a nested
 16-byte user pointer, before event data can be read.
 
-Not done yet: the Windows transport's events and OS-descriptor registration
-(the KMD verbs are reserved in the ABI but not implemented),
-`NV_ESC_RM_DUP_OBJECT`, and export/import of objects by fd. The Windows
-transport has been compiled (MinGW, x86_64 and i686) and its wire format
-unit-tested, but not yet run against a KMD.
+Windows, in the `win11` guest with Helios KMD 22.22.306.0 (same GPU and
+host driver): `crm_smoke` passes every required and extra step except the OS
+event, and `crm_pin_smoke` passes, with the KMD's NvPin and NvUnpin counters
+equal afterwards.
+
+Not done yet: the Windows transport's events (the KMD's EVENT verbs are
+reserved in the ABI but not implemented), `NV_ESC_RM_DUP_OBJECT`, and
+export/import of objects by fd.

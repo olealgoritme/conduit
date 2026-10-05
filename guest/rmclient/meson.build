@@ -58,3 +58,7 @@ executable('crm_smoke', 'tests/crm_smoke.c',
 executable('crm_event_smoke', 'tests/crm_event_smoke.c',
   include_directories : [inc, include_directories('src')],
   dependencies : rmclient_dep)
+# NV01_MEMORY_SYSTEM_OS_DESCRIPTOR over the caller's own pages (on Windows the KMD's PIN).
+executable('crm_pin_smoke', 'tests/crm_pin_smoke.c',
+  include_directories : [inc, include_directories('src')],
+  dependencies : rmclient_dep)
