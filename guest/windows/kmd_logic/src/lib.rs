@@ -305,7 +305,19 @@ pub const MIN_DISPLAY_HEIGHT: u32 = 240;
 pub struct DisplayMode {
     width: core::num::NonZeroU32,
     height: core::num::NonZeroU32,
+    /// Refresh rate in millihertz (60 Hz = 60_000).
+    refresh_mhz: u32,
 }
+
+/// Refresh rate used when the host gave only a size (`GET_DISPLAY_INFO` has no
+/// rate field): 60 Hz, in millihertz.
+pub const DEFAULT_REFRESH_MHZ: u32 = 60_000;
+/// Largest extent per side the KMD adopts from the host. Matches the bound the
+/// transport already applied to `GET_DISPLAY_INFO`.
+pub const MAX_DISPLAY_EXTENT: u32 = 16384;
+/// Refresh rates the KMD adopts: 1 Hz to 1 kHz, in millihertz.
+pub const MIN_REFRESH_MHZ: u32 = 1_000;
+pub const MAX_REFRESH_MHZ: u32 = 1_000_000;
 
 impl DisplayMode {
     /// Adopt the host-reported extent, or `None` if it is unusable.
@@ -317,11 +329,33 @@ impl DisplayMode {
             core::num::NonZeroU32::new(width),
             core::num::NonZeroU32::new(height),
         ) {
-            (Some(width), Some(height)) => Some(Self { width, height }),
+            (Some(width), Some(height)) => Some(Self {
+                width,
+                height,
+                refresh_mhz: DEFAULT_REFRESH_MHZ,
+            }),
             // Unreachable: both are >= the minimums above. Written as a match
             // rather than `unwrap` because a panic in a DDI is a silent graphics
             // deadlock.
             _ => None,
+        }
+    }
+
+    /// Adopt a size and refresh rate the host described (its EDID), or `None`
+    /// if either is outside what the KMD supports. There is no table of
+    /// allowed modes: any size from the minimum to [`MAX_DISPLAY_EXTENT`] and
+    /// any rate from 1 Hz to 1 kHz is taken as given.
+    pub const fn from_native(width: u32, height: u32, refresh_mhz: u32) -> Option<Self> {
+        if width > MAX_DISPLAY_EXTENT
+            || height > MAX_DISPLAY_EXTENT
+            || refresh_mhz < MIN_REFRESH_MHZ
+            || refresh_mhz > MAX_REFRESH_MHZ
+        {
+            return None;
+        }
+        match Self::from_host(width, height) {
+            Some(mode) => Some(Self { refresh_mhz, ..mode }),
+            None => None,
         }
     }
 
@@ -331,6 +365,11 @@ impl DisplayMode {
 
     pub const fn height(self) -> u32 {
         self.height.get()
+    }
+
+    /// Refresh rate in millihertz.
+    pub const fn refresh_mhz(self) -> u32 {
+        self.refresh_mhz
     }
 
     /// The `(w << 16) | h` form the `DspMd` breadcrumb reports.
@@ -356,6 +395,7 @@ impl DisplayMode {
             Some(h) => h,
             None => core::num::NonZeroU32::MIN,
         },
+        refresh_mhz: DEFAULT_REFRESH_MHZ,
     };
 }
 
@@ -1589,6 +1629,27 @@ mod tests {
         // width, since DspMd masks only the height.
         let wide = DisplayMode::from_host(4096, 2160).expect("4K");
         assert_eq!(wide.packed() >> 16, 4096);
+    }
+
+    #[test]
+    fn native_modes_take_any_size_and_rate_in_range() {
+        let m = DisplayMode::from_native(5120, 2560, 240_000).expect("5120x2560@240");
+        assert_eq!(<(u32, u32)>::from(m), (5120, 2560));
+        assert_eq!(m.refresh_mhz(), 240_000);
+        // A size-only host answer keeps 60 Hz.
+        assert_eq!(
+            DisplayMode::from_host(3840, 1080).map(DisplayMode::refresh_mhz),
+            Some(DEFAULT_REFRESH_MHZ)
+        );
+        assert_eq!(DisplayMode::FALLBACK.refresh_mhz(), 60_000);
+        // 59.94 Hz and 1 kHz survive; the edges outside them do not.
+        assert!(DisplayMode::from_native(1920, 1080, 59_940).is_some());
+        assert!(DisplayMode::from_native(1920, 1080, MAX_REFRESH_MHZ).is_some());
+        assert!(DisplayMode::from_native(1920, 1080, MAX_REFRESH_MHZ + 1).is_none());
+        assert!(DisplayMode::from_native(1920, 1080, MIN_REFRESH_MHZ - 1).is_none());
+        assert!(DisplayMode::from_native(MAX_DISPLAY_EXTENT, 1080, 60_000).is_some());
+        assert!(DisplayMode::from_native(MAX_DISPLAY_EXTENT + 1, 1080, 60_000).is_none());
+        assert!(DisplayMode::from_native(100, 1080, 60_000).is_none());
     }
 
     /// `DisplayMode::FALLBACK`'s `None` arms are unreachable — this is what says
