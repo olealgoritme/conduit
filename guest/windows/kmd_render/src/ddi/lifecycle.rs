@@ -216,6 +216,11 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // before anything can fail, so the gate's "verify movement, not presence"
     // rule applies to every counter below.
     crate::diag::reset_fault_counters();
+    // Diagnostic override of the vsync heartbeat rate (0 = follow the mode).
+    let forced_vsync_mhz = crate::diag::read_config_dword(crate::diag::knobs::VSYNC_RATE_MHZ, 0);
+    crate::adapter::kobj::VSYNC_RATE_OVERRIDE_MHZ
+        .store(forced_vsync_mhz, core::sync::atomic::Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"VsRate", forced_vsync_mhz);
 
     // Carried over from a previous start on this same context, if any: these
     // blocks are allocated once and freed only in Drop, and today's code gets

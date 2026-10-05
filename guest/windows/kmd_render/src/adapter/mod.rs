@@ -22,7 +22,7 @@ use crate::virtio::VirtioGpu;
 use helios_kmd_logic::DisplayMode;
 
 mod backing;
-mod kobj;
+pub(crate) mod kobj;
 mod locks;
 pub(crate) use locks::ControlSpaceWaiter;
 pub(crate) mod producer;

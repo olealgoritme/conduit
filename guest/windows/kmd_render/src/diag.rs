@@ -599,6 +599,12 @@ pub mod knobs {
     /// applies a change without a rebuild; the value in force is mirrored in the
     /// `OutTech` counter.
     pub const OUTPUT_TECH: KnobName = KnobName::new(b"OutputTech");
+    /// `VsyncRateMhz` (default 0 = follow the mode): force the retrace rate of the
+    /// vsync heartbeat, in millihertz (60000 = 60 Hz), independent of the refresh
+    /// rate the mode advertises. A diagnostic for "modes above 60 Hz never flip":
+    /// 60000 with a 120 Hz mode tells whether the timer cadence is the cause.
+    /// Read at StartDevice and mirrored in the `VsRate` counter.
+    pub const VSYNC_RATE_MHZ: KnobName = KnobName::new(b"VsyncRateMhz");
     /// `PresentWmk` (default 1 = ON since 22.22.244.0). Gate a WDDM submission
     /// that carries a LIVE present stream boundary on that exact boundary
     /// alone, rather than additionally on every transport entry enqueued before
