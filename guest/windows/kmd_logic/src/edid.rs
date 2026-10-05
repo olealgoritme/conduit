@@ -327,6 +327,22 @@ mod tests {
         }
     }
 
+    /// The EDID the Conduit host generates for `--display 5120x1440@240`
+    /// (host/backend/device/src/venus/testdata, checked there with
+    /// `edid-decode --check`): a 2560x720 placeholder in the base block and the
+    /// real mode in a DisplayID 2.0 Type VII timing.
+    #[test]
+    fn the_hosts_real_5120x1440_at_240_edid_is_read() {
+        let edid = include_bytes!("testdata/edid-5120x1440-240.bin");
+        assert_eq!(edid.len(), 256);
+        // The placeholder alone would say 2560x720.
+        let base_only = native_timing(&edid[..128]).unwrap();
+        assert_eq!((base_only.width, base_only.height), (2560, 720));
+        let t = native_timing(edid).unwrap();
+        assert_eq!((t.width, t.height), (5120, 1440));
+        assert!(t.refresh_mhz.abs_diff(240_000) <= 50, "{}", t.refresh_mhz);
+    }
+
     #[test]
     fn displayid_type_i_is_accepted_too() {
         let base = build_edid(1920, 1080, "Helios vGPU", "WinBoat", 2026).unwrap();
