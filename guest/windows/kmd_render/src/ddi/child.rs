@@ -68,8 +68,22 @@ pub unsafe extern "C" fn dxgkddi_query_child_relations(
         // non-forceable VOT_OTHER target whose virtual-monitor connection the OS
         // doesn't fully recognize is never given a path → 0-path VidPn commits
         // (36th-session root cause). viogpu3d's non-VGA output is likewise VOT_HD15.
-        d.ChildCapabilities.Type.VideoOutput.InterfaceTechnology =
-            _D3DKMDT_VIDEO_OUTPUT_TECHNOLOGY::D3DKMDT_VOT_HD15;
+        //
+        // That comment is the reason HD15 stayed, but it also made Windows treat
+        // the monitor as an analog VGA display and validate modes against analog
+        // frequency ranges, so nothing above 60 Hz came up. The connector type is
+        // now the `OutputTech` knob, default DisplayPort: a digital, connected
+        // output with no analog range rules. `OutputTech=0` restores HD15 if a
+        // target ever fails to get a path again.
+        let output_tech = crate::diag::read_config_dword(crate::diag::knobs::OUTPUT_TECH, 1);
+        crate::diag::record_named_bytes(b"OutTech", output_tech);
+        d.ChildCapabilities.Type.VideoOutput.InterfaceTechnology = match output_tech {
+            0 => _D3DKMDT_VIDEO_OUTPUT_TECHNOLOGY::D3DKMDT_VOT_HD15,
+            2 => _D3DKMDT_VIDEO_OUTPUT_TECHNOLOGY::D3DKMDT_VOT_HDMI,
+            3 => _D3DKMDT_VIDEO_OUTPUT_TECHNOLOGY::D3DKMDT_VOT_DVI,
+            4 => _D3DKMDT_VIDEO_OUTPUT_TECHNOLOGY::D3DKMDT_VOT_INTERNAL,
+            _ => _D3DKMDT_VIDEO_OUTPUT_TECHNOLOGY::D3DKMDT_VOT_DISPLAYPORT_EXTERNAL,
+        };
         d.ChildCapabilities
             .Type
             .VideoOutput

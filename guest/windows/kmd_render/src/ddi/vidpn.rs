@@ -28,7 +28,6 @@ pub const CHILD_UID: u32 = 0;
 /// [`AdapterContext::display_mode`](crate::adapter::AdapterContext::display_mode).
 pub const DEFAULT_MODE_WIDTH: u32 = 1920;
 pub const DEFAULT_MODE_HEIGHT: u32 = 1080;
-const REFRESH_HZ: u32 = 60;
 
 mod monitor_metadata {
     include!(concat!(env!("OUT_DIR"), "/monitor_metadata.rs"));
@@ -189,20 +188,27 @@ impl<'a> VidPn<'a> {
     }
 }
 
-/// Build a fully-specified 1080p60 progressive video signal (source and target
-/// modes share it so cofunctional-mode validation stays consistent).
-fn video_signal_info(w: u32, h: u32) -> D3DKMDT_VIDEO_SIGNAL_INFO {
+/// Build a fully-specified progressive video signal at the host's size and
+/// refresh rate (source and target modes share it so cofunctional-mode
+/// validation stays consistent). `refresh_mhz` is millihertz, so the vsync
+/// frequency is the exact rational `refresh_mhz / 1000`.
+fn video_signal_info(w: u32, h: u32, refresh_mhz: u32) -> D3DKMDT_VIDEO_SIGNAL_INFO {
     // SAFETY: an all-zero VIDEO_SIGNAL_INFO is a valid starting point.
     let mut sig: D3DKMDT_VIDEO_SIGNAL_INFO = unsafe { core::mem::zeroed() };
     sig.VideoStandard = _D3DKMDT_VIDEO_SIGNAL_STANDARD::D3DKMDT_VSS_OTHER;
     sig.TotalSize.cx = w;
     sig.TotalSize.cy = h;
     sig.ActiveSize = sig.TotalSize;
-    sig.VSyncFreq.Numerator = REFRESH_HZ;
-    sig.VSyncFreq.Denominator = 1;
-    sig.HSyncFreq.Numerator = h * REFRESH_HZ;
-    sig.HSyncFreq.Denominator = 1;
-    sig.PixelRate = (w as SIZE_T) * (h as SIZE_T) * (REFRESH_HZ as SIZE_T);
+    // Both frequencies in lowest terms (240/1, not 240000/1000): WDDM compares
+    // mode rationals and DXGI returns them to the application as written.
+    let (v_n, v_d) = helios_kmd_logic::reduce_ratio(u64::from(refresh_mhz), 1000);
+    sig.VSyncFreq.Numerator = v_n as u32;
+    sig.VSyncFreq.Denominator = v_d as u32;
+    // u64 so 5120x2560 at 240 Hz and larger cannot wrap the 32-bit fields.
+    let (h_n, h_d) = helios_kmd_logic::reduce_ratio(u64::from(h) * u64::from(refresh_mhz), 1000);
+    sig.HSyncFreq.Numerator = h_n.min(u64::from(u32::MAX)) as u32;
+    sig.HSyncFreq.Denominator = h_d as u32;
+    sig.PixelRate = ((u64::from(w) * u64::from(h) * u64::from(refresh_mhz)) / 1000) as SIZE_T;
     // ScanLineOrdering shares a union with the (unused) additional-signal-info
     // bitfield; the whole struct was zeroed, so selecting this arm is a plain
     // union write (safe — only union reads are unsafe).
@@ -292,7 +298,8 @@ unsafe fn add_source_modes(
     STATUS_SUCCESS
 }
 
-/// Create + add our single target mode into `h_set`.
+/// Create + add one target mode (size and refresh) into `h_set`. The caller adds
+/// one per offered refresh rate; the first is the preferred one.
 ///
 /// # Safety
 /// `iface` is a live `DXGK_VIDPNTARGETMODESET_INTERFACE` for `h_set`.
@@ -301,6 +308,8 @@ unsafe fn add_single_target_mode(
     h_set: D3DKMDT_HVIDPNTARGETMODESET,
     w: u32,
     h: u32,
+    refresh_mhz: u32,
+    preferred: bool,
 ) -> NTSTATUS {
     // SAFETY: iface valid per the fn contract.
     let iface = unsafe { &*iface };
@@ -323,11 +332,15 @@ unsafe fn add_single_target_mode(
     }
     // SAFETY: `mode` is writable; Preference lives in the Copy union's bitfield arm.
     unsafe {
-        (*mode).VideoSignalInfo = video_signal_info(w, h);
+        (*mode).VideoSignalInfo = video_signal_info(w, h, refresh_mhz);
         (*mode)
             .__bindgen_anon_1
             .__bindgen_anon_1
-            .set_Preference(_D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_PREFERRED);
+            .set_Preference(if preferred {
+                _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_PREFERRED
+            } else {
+                _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_NOTPREFERRED
+            });
     }
     // SAFETY: add/release take the mode we filled.
     let st = unsafe { add(h_set, mode) };
@@ -355,6 +368,7 @@ pub unsafe fn recommend_monitor_modes(
         return STATUS_INVALID_PARAMETER;
     }
     let (w, h) = adapter.display_mode();
+    let refresh_mhz = adapter.display_refresh_mhz();
     // SAFETY: valid per fn contract.
     let a = unsafe { &*arg };
     if a.pMonitorSourceModeSetInterface.is_null() {
@@ -370,38 +384,50 @@ pub unsafe fn recommend_monitor_modes(
         return STATUS_GRAPHICS_INVALID_VIDPN;
     };
     let h_set = a.hMonitorSourceModeSet;
-    let mut mode: *mut D3DKMDT_MONITOR_SOURCE_MODE = null_mut();
-    // SAFETY: valid out-pointer.
-    let st = unsafe { create(h_set, &mut mode) };
-    if !ok(st) || mode.is_null() {
-        return if ok(st) {
-            STATUS_GRAPHICS_INVALID_VIDPN
-        } else {
-            st
-        };
-    }
-    // SAFETY: `mode` is writable.
-    unsafe {
-        (*mode).VideoSignalInfo = video_signal_info(w, h);
-        (*mode).ColorBasis = _D3DKMDT_COLOR_BASIS::D3DKMDT_CB_SRGB;
-        (*mode).ColorCoeffDynamicRanges.FirstChannel = 8;
-        (*mode).ColorCoeffDynamicRanges.SecondChannel = 8;
-        (*mode).ColorCoeffDynamicRanges.ThirdChannel = 8;
-        (*mode).ColorCoeffDynamicRanges.FourthChannel = 8;
-        (*mode).Origin = _D3DKMDT_MONITOR_CAPABILITIES_ORIGIN::D3DKMDT_MCO_DRIVER;
-        (*mode).Preference = _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_PREFERRED;
-    }
-    // SAFETY: add/release take the mode we filled.
-    let st = unsafe { add(h_set, mode) };
-    if !ok(st) {
-        let _ = unsafe { release(h_set, mode) };
-        if st == STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET {
-            return STATUS_SUCCESS;
+    // The host's rate (preferred) plus 144/120/60 Hz below it, so Windows has
+    // valid fallbacks and Display Settings can list them.
+    let (rates, rate_count) = helios_kmd_logic::refresh_ladder(refresh_mhz);
+    rec(b"MmRfr", refresh_mhz);
+    let mut i = 0;
+    while i < rate_count {
+        let mut mode: *mut D3DKMDT_MONITOR_SOURCE_MODE = null_mut();
+        // SAFETY: valid out-pointer.
+        let st = unsafe { create(h_set, &mut mode) };
+        if !ok(st) || mode.is_null() {
+            return if ok(st) {
+                STATUS_GRAPHICS_INVALID_VIDPN
+            } else {
+                st
+            };
         }
-        // Record the raw pfnAddMode failure so we can tell if the MONITOR mode is
-        // what a callback rejects (the caller legalizes the escaping status).
-        rec(b"VpMMe", st as u32);
-        return st;
+        // SAFETY: `mode` is writable.
+        unsafe {
+            (*mode).VideoSignalInfo = video_signal_info(w, h, rates[i]);
+            (*mode).ColorBasis = _D3DKMDT_COLOR_BASIS::D3DKMDT_CB_SRGB;
+            (*mode).ColorCoeffDynamicRanges.FirstChannel = 8;
+            (*mode).ColorCoeffDynamicRanges.SecondChannel = 8;
+            (*mode).ColorCoeffDynamicRanges.ThirdChannel = 8;
+            (*mode).ColorCoeffDynamicRanges.FourthChannel = 8;
+            (*mode).Origin = _D3DKMDT_MONITOR_CAPABILITIES_ORIGIN::D3DKMDT_MCO_DRIVER;
+            (*mode).Preference = if i == 0 {
+                _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_PREFERRED
+            } else {
+                _D3DKMDT_MODE_PREFERENCE::D3DKMDT_MP_NOTPREFERRED
+            };
+        }
+        // SAFETY: add/release take the mode we filled.
+        let st = unsafe { add(h_set, mode) };
+        if !ok(st) {
+            let _ = unsafe { release(h_set, mode) };
+            if st != STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET {
+                // Record the raw pfnAddMode failure so we can tell if the MONITOR
+                // mode is what a callback rejects (the caller legalizes the
+                // escaping status).
+                rec(b"VpMMe", st as u32);
+                return st;
+            }
+        }
+        i += 1;
     }
     STATUS_SUCCESS
 }
@@ -719,6 +745,8 @@ pub unsafe fn enum_cofunc_modality(
     let a = unsafe { &*arg };
     let h_vidpn = a.hConstrainingVidPn;
     let (mode_w, mode_h) = adapter.display_mode();
+    let mode_refresh_mhz = adapter.display_refresh_mhz();
+    rec(b"VpRfr", mode_refresh_mhz);
 
     // Resolve the VidPn + topology interfaces (nothing held yet → early return).
     // The borrow that bounds the interface: the DDI argument struct, which
@@ -936,8 +964,27 @@ pub unsafe fn enum_cofunc_modality(
                     iface: new_iface,
                 };
                 // SAFETY: live set interface + handle.
-                status =
-                    unsafe { add_single_target_mode(created.iface, created.h_set, mode_w, mode_h) };
+                // One target mode per offered refresh rate, the host's first and
+                // preferred.
+                let (rates, rate_count) = helios_kmd_logic::refresh_ladder(mode_refresh_mhz);
+                status = STATUS_SUCCESS;
+                let mut r = 0;
+                while r < rate_count {
+                    status = unsafe {
+                        add_single_target_mode(
+                            created.iface,
+                            created.h_set,
+                            mode_w,
+                            mode_h,
+                            rates[r],
+                            r == 0,
+                        )
+                    };
+                    if !ok(status) {
+                        break;
+                    }
+                    r += 1;
+                }
                 if !ok(status) {
                     stage = CofuncStage::AddTargetMode;
                     break; // `created` drops → released
@@ -1185,5 +1232,66 @@ pub unsafe fn commit_vidpn(adapter: &AdapterContext, arg: *const DXGKARG_COMMITV
 
     rec(b"VpCP", pinned);
     rec(b"VpCW", wh);
+
+    // The committed TARGET mode carries the refresh rate. Remember it: the
+    // primary surface is described with it (DescribeAllocation) and the vsync
+    // heartbeat runs at it, which differs from the host's preferred rate once
+    // the user picks another offered rate in Display Settings.
+    // SAFETY: `vidpn` is the live VidPn interface for this DDI call.
+    if let Some(mhz) = unsafe { committed_target_refresh_mhz(vidpn, h_vidpn, CHILD_UID) } {
+        adapter.set_committed_refresh_mhz(mhz);
+        rec(b"VpCRf", mhz);
+    }
     STATUS_SUCCESS
+}
+
+/// The refresh rate, in millihertz, of `target_id`'s pinned target mode in this
+/// VidPn, or `None` if no target mode is pinned or it carries no usable rate.
+///
+/// # Safety
+/// `vidpn`/`h_vidpn` are the live VidPn interface and handle of the current DDI call.
+unsafe fn committed_target_refresh_mhz(
+    vidpn: &DXGK_VIDPN_INTERFACE,
+    h_vidpn: D3DKMDT_HVIDPN,
+    target_id: u32,
+) -> Option<u32> {
+    let acquire = vidpn.pfnAcquireTargetModeSet?;
+    vidpn.pfnReleaseTargetModeSet?;
+    let mut h_set: D3DKMDT_HVIDPNTARGETMODESET = null_mut();
+    let mut set_iface: *const DXGK_VIDPNTARGETMODESET_INTERFACE = null();
+    // SAFETY: valid out-pointers.
+    let st = unsafe { acquire(h_vidpn, target_id, &mut h_set, &mut set_iface) };
+    if !ok(st) || set_iface.is_null() {
+        return None;
+    }
+    // Released on every exit from here.
+    let _set = TargetModeSet {
+        vidpn,
+        h_vidpn,
+        target_id,
+        h_set,
+        iface: set_iface,
+    };
+    // SAFETY: `set_iface` came from the acquire above.
+    let iface = unsafe { &*set_iface };
+    let acquire_pinned = iface.pfnAcquirePinnedModeInfo?;
+    let release_mode = iface.pfnReleaseModeInfo?;
+    let mut mode: *const D3DKMDT_VIDPN_TARGET_MODE = null();
+    // SAFETY: valid out-pointer.
+    if !ok(unsafe { acquire_pinned(h_set, &mut mode) }) || mode.is_null() {
+        return None;
+    }
+    // SAFETY: `mode` is a live pinned target mode until released just below.
+    let rate = unsafe { (*mode).VideoSignalInfo.VSyncFreq };
+    // SAFETY: releases the pinned mode info acquired above, once.
+    let _ = unsafe { release_mode(h_set, mode) };
+    if rate.Denominator == 0 {
+        return None;
+    }
+    let mhz = u64::from(rate.Numerator) * 1000 / u64::from(rate.Denominator);
+    // The same bounds `DisplayMode::from_native` applies; anything else is not
+    // a rate this driver offered.
+    u32::try_from(mhz)
+        .ok()
+        .filter(|m| (helios_kmd_logic::MIN_REFRESH_MHZ..=helios_kmd_logic::MAX_REFRESH_MHZ).contains(m))
 }

@@ -20,6 +20,7 @@ if (Test-Path -LiteralPath $resolveCompatibilityState -PathType Leaf) {
     Write-Warning "Close Resolve and run 'C:\ProgramData\Helios\compatibility\DaVinci Resolve\Uninstall-Resolve-Compatibility.ps1' to remove it."
 }
 Unregister-ScheduledTask -TaskName "HeliosGraphicsProvisioning" -Confirm:$false -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "HeliosDisplayTopology" -Confirm:$false -ErrorAction SilentlyContinue
 if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
     throw "No package-managed Helios installation was found at $statePath."
 }

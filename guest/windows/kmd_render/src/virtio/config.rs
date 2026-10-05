@@ -32,6 +32,23 @@ impl DxgkConfigAccess {
     }
 }
 
+/// virtio-drivers 0.13 knows device types up to 25 and `PciTransport::new`
+/// refuses any other PCI device id, so Conduit's device (virtio id 45, PCI
+/// `0x106D`; id 41, `0x1069`, under some QEMU setups) never got a transport and
+/// `StartDevice` silently left the device off. The transport only reads the
+/// vendor/device word at offset 0 and keeps the type for nothing we use, so
+/// report the virtio-gpu id (`0x1050`) for those two and leave every other read,
+/// including the KMD's own capability scans, untouched.
+fn known_device_id(vendor_device: u32) -> u32 {
+    const CONDUIT_IDS: [u32; 2] = [0x106D, 0x1069];
+    const VIRTIO_GPU_ID: u32 = 0x1050;
+    if CONDUIT_IDS.contains(&(vendor_device >> 16)) {
+        (VIRTIO_GPU_ID << 16) | (vendor_device & 0xFFFF)
+    } else {
+        vendor_device
+    }
+}
+
 impl ConfigurationAccess for DxgkConfigAccess {
     fn read_word(&self, _device_function: DeviceFunction, register_offset: u8) -> u32 {
         let mut val: u32 = 0;
@@ -49,6 +66,9 @@ impl ConfigurationAccess for DxgkConfigAccess {
                     &mut bytes_read,
                 );
             }
+        }
+        if register_offset == 0 {
+            val = known_device_id(val);
         }
         val
     }

@@ -3,7 +3,7 @@ authors = ["WinBoat"]
 name = "helios_umd"
 version = "0.1.0"
 edition = "2021"
-description = "Helios vGPU Direct3D 11 User-Mode Driver"
+description = "Conduit Helios Direct3D 11 User-Mode Driver"
 
 [lib]
 crate-type = ["cdylib"]

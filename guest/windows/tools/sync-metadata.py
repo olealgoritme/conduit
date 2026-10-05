@@ -23,8 +23,8 @@ def main():
             raise ValueError(f"Invalid metadata assignment: {key}")
         values[key] = value
     product = values["HELIOS_PRODUCT"]
-    if len(product) > 12:
-        raise ValueError("Product name must fit EDID: at most 12 ASCII bytes")
+    if len(values["HELIOS_MONITOR_NAME"]) > 12:
+        raise ValueError("Monitor name must fit EDID: at most 12 ASCII bytes")
     if len(values["HELIOS_PUBLISHER"]) > 12:
         raise ValueError("Publisher text must fit the EDID descriptor (12 bytes)")
     if not 1990 <= int(values["HELIOS_MONITOR_MODEL_YEAR"]) <= 2245:

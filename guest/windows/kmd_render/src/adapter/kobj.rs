@@ -12,7 +12,7 @@
 //! being split across two modules.
 
 use core::ffi::c_void;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU32, AtomicU64};
 
 use wdk_sys::ntddk::{KeInitializeEvent, KeSetEvent, KeWaitForSingleObject};
 use wdk_sys::PVOID;
@@ -24,6 +24,18 @@ use super::AdapterContext;
 /// One event per epoch, not one per timer tick. This is a diagnostic cursor
 /// only; the VSync protocol remains untouched.
 static LAST_TIMELINE_VSYNC_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// `VsyncRateMhz` knob, read at StartDevice: 0 = the vsync heartbeat follows the
+/// mode's refresh rate, nonzero forces its rate (millihertz).
+pub static VSYNC_RATE_OVERRIDE_MHZ: AtomicU32 = AtomicU32::new(0);
+
+/// The retrace rate the vsync heartbeat runs at, in millihertz.
+fn vsync_rate_mhz(adapter: &AdapterContext) -> u32 {
+    match VSYNC_RATE_OVERRIDE_MHZ.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => adapter.effective_refresh_mhz(),
+        forced => forced,
+    }
+}
 
 /// Opaque `PEX_TIMER` storage. `wdk-sys` 0.5.1 does not bind the Windows 8.1
 /// ExXxx timer API yet, so retain only the pointer representation the WDK
@@ -333,12 +345,14 @@ impl AdapterContext {
         // SAFETY: KTIMER/KDPC were initialized at this stable address by
         // `init_kernel_events`, before the adapter became visible to dxgkrnl.
         unsafe {
-            // VidPn advertises 60/1 Hz. Arm the first exact-phase one-shot in
-            // 100 ns units; the DPC advances the stored deadline from this
-            // anchor instead of accumulating its own dispatch latency.
+            // VidPn advertises the host's refresh rate (60 Hz without one). Arm
+            // the first exact-phase one-shot in 100 ns units; the DPC advances
+            // the stored deadline from this anchor instead of accumulating its
+            // own dispatch latency.
             let mut qpc_timestamp = 0;
             let now = KeQueryInterruptTimePrecise(&mut qpc_timestamp);
-            let Some(deadline) = helios_kmd_logic::vsync_deadline::next(now, now) else {
+            let period = helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(self));
+            let Some(deadline) = helios_kmd_logic::vsync_deadline::next(now, now, period) else {
                 self.vsync_armed
                     .store(0, core::sync::atomic::Ordering::Release);
                 self.vsync_deadline_100ns
@@ -496,7 +510,8 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     }
     // A one-shot timer is required because the fallback KTIMER's recurring
     // period is integer milliseconds: 16 ms is 62.5 Hz and 17 ms is 58.8 Hz,
-    // while the mode contract exposed to Windows is exactly 60/1. Advance from
+    // while the mode contract exposed to Windows is the host's exact rate
+    // (60/1 by default, `period_100ns` for any other). Advance from
     // the prior interrupt-time deadline so ordinary callback latency does not
     // become drift; if delayed across several periods, skip to one future
     // deadline rather than emitting a burst of synthetic retraces.
@@ -510,7 +525,8 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         // `now` whenever the DPC is late would turn normal dispatch latency
         // into cumulative phase drift, defeating the one-shot scheme.
         let anchor = if previous == 0 { now } else { previous };
-        let Some(deadline) = helios_kmd_logic::vsync_deadline::next(anchor, now) else {
+        let period = helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(adapter));
+        let Some(deadline) = helios_kmd_logic::vsync_deadline::next(anchor, now, period) else {
             // Interrupt-time representation exhausted. The current one-shot
             // has fired; leave it disarmed rather than schedule an immediate
             // 100 ns retry loop.

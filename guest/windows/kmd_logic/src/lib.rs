@@ -34,8 +34,27 @@ pub mod execution_completion;
 /// generating a catch-up burst.
 pub mod vsync_deadline {
     /// 16.6667 ms in the kernel timer's 100 ns units. This is 60 Hz to within
-    /// 0.0002%, versus the old 16 ms period's 4.17% error.
+    /// 0.0002%, versus the old 16 ms period's 4.17% error. The default, and
+    /// what [`period_100ns`] returns for 60_000 mHz.
     pub const PERIOD_100NS: u64 = 166_667;
+
+    /// The retrace period for a refresh rate in millihertz, in 100 ns units
+    /// (1e7 per second, so `1e10 / mHz`), rounded to nearest. A rate of 0, or
+    /// anything faster than 10 kHz, falls back to 60 Hz: the caller already
+    /// bounds the rate (`DisplayMode::from_native`), this only keeps a bad
+    /// value from becoming a zero-length period and a rearm storm.
+    pub const fn period_100ns(refresh_mhz: u32) -> u64 {
+        if refresh_mhz == 0 {
+            return PERIOD_100NS;
+        }
+        let rate = refresh_mhz as u64;
+        let period = (10_000_000_000u64 + rate / 2) / rate;
+        if period < 1_000 {
+            PERIOD_100NS
+        } else {
+            period
+        }
+    }
 
     /// Return the first fixed-phase deadline strictly after `now`.
     ///
@@ -43,8 +62,11 @@ pub mod vsync_deadline {
     /// first tick). `None` is terminal: the interrupt-time representation is
     /// exhausted, so the KMD must leave the one-shot timer unarmed rather than
     /// turn a saturated deadline into an immediate rearm storm.
-    pub const fn next(previous: u64, now: u64) -> Option<u64> {
-        let Some(candidate) = previous.checked_add(PERIOD_100NS) else {
+    pub const fn next(previous: u64, now: u64, period: u64) -> Option<u64> {
+        if period == 0 {
+            return None;
+        }
+        let Some(candidate) = previous.checked_add(period) else {
             return None;
         };
         if candidate > now {
@@ -52,8 +74,8 @@ pub mod vsync_deadline {
         }
 
         let late = now.saturating_sub(candidate);
-        let intervals = late / PERIOD_100NS + 1;
-        let Some(advance) = intervals.checked_mul(PERIOD_100NS) else {
+        let intervals = late / period + 1;
+        let Some(advance) = intervals.checked_mul(period) else {
             return None;
         };
         candidate.checked_add(advance)
@@ -79,20 +101,20 @@ pub mod vsync_deadline {
 
         #[test]
         fn initial_arm_is_one_sixtieth_second() {
-            assert_eq!(next(10_000_000, 10_000_000), Some(10_166_667));
+            assert_eq!(next(10_000_000, 10_000_000, PERIOD_100NS), Some(10_166_667));
         }
 
         #[test]
         fn ordinary_lateness_does_not_accumulate_phase_drift() {
             let fired = 1_166_667;
-            assert_eq!(next(fired, fired + 4_000), Some(1_333_334));
+            assert_eq!(next(fired, fired + 4_000, PERIOD_100NS), Some(1_333_334));
         }
 
         #[test]
         fn missed_ticks_skip_to_one_future_deadline_without_burst() {
             let fired = 1_166_667;
             let now = fired + PERIOD_100NS * 4 + 7;
-            let Some(deadline) = next(fired, now) else {
+            let Some(deadline) = next(fired, now, PERIOD_100NS) else {
                 panic!("a representable deadline must remain armable");
             };
             assert!(deadline > now);
@@ -108,8 +130,31 @@ pub mod vsync_deadline {
 
         #[test]
         fn deadline_overflow_is_terminal_not_an_immediate_rearm() {
-            assert_eq!(next(u64::MAX - PERIOD_100NS + 1, 0), None);
-            assert_eq!(next(u64::MAX - PERIOD_100NS, u64::MAX), None);
+            assert_eq!(next(u64::MAX - PERIOD_100NS + 1, 0, PERIOD_100NS), None);
+            assert_eq!(next(u64::MAX - PERIOD_100NS, u64::MAX, PERIOD_100NS), None);
+        }
+
+        #[test]
+        fn period_follows_the_refresh_rate() {
+            assert_eq!(period_100ns(60_000), PERIOD_100NS);
+            assert_eq!(period_100ns(240_000), 41_667);
+            assert_eq!(period_100ns(144_000), 69_444);
+            assert_eq!(period_100ns(59_940), 166_834);
+            assert_eq!(period_100ns(1_000_000), 10_000); // 1 kHz
+            assert_eq!(period_100ns(1_000), 10_000_000); // 1 Hz
+            // Bad input never yields a zero or tiny period.
+            assert_eq!(period_100ns(0), PERIOD_100NS);
+            assert_eq!(period_100ns(u32::MAX), PERIOD_100NS);
+        }
+
+        #[test]
+        fn a_240_hz_period_keeps_its_phase_and_never_bursts() {
+            let p = period_100ns(240_000);
+            assert_eq!(next(10_000_000, 10_000_000, p), Some(10_000_000 + p));
+            let fired = 1_000_000 + p;
+            let now = fired + p * 3 + 5;
+            assert_eq!(next(fired, now, p), Some(fired + p * 4));
+            assert_eq!(next(5, 5, 0), None);
         }
     }
 }
@@ -305,7 +350,19 @@ pub const MIN_DISPLAY_HEIGHT: u32 = 240;
 pub struct DisplayMode {
     width: core::num::NonZeroU32,
     height: core::num::NonZeroU32,
+    /// Refresh rate in millihertz (60 Hz = 60_000).
+    refresh_mhz: u32,
 }
+
+/// Refresh rate used when the host gave only a size (`GET_DISPLAY_INFO` has no
+/// rate field): 60 Hz, in millihertz.
+pub const DEFAULT_REFRESH_MHZ: u32 = 60_000;
+/// Largest extent per side the KMD adopts from the host. Matches the bound the
+/// transport already applied to `GET_DISPLAY_INFO`.
+pub const MAX_DISPLAY_EXTENT: u32 = 16384;
+/// Refresh rates the KMD adopts: 1 Hz to 1 kHz, in millihertz.
+pub const MIN_REFRESH_MHZ: u32 = 1_000;
+pub const MAX_REFRESH_MHZ: u32 = 1_000_000;
 
 impl DisplayMode {
     /// Adopt the host-reported extent, or `None` if it is unusable.
@@ -317,11 +374,33 @@ impl DisplayMode {
             core::num::NonZeroU32::new(width),
             core::num::NonZeroU32::new(height),
         ) {
-            (Some(width), Some(height)) => Some(Self { width, height }),
+            (Some(width), Some(height)) => Some(Self {
+                width,
+                height,
+                refresh_mhz: DEFAULT_REFRESH_MHZ,
+            }),
             // Unreachable: both are >= the minimums above. Written as a match
             // rather than `unwrap` because a panic in a DDI is a silent graphics
             // deadlock.
             _ => None,
+        }
+    }
+
+    /// Adopt a size and refresh rate the host described (its EDID), or `None`
+    /// if either is outside what the KMD supports. There is no table of
+    /// allowed modes: any size from the minimum to [`MAX_DISPLAY_EXTENT`] and
+    /// any rate from 1 Hz to 1 kHz is taken as given.
+    pub const fn from_native(width: u32, height: u32, refresh_mhz: u32) -> Option<Self> {
+        if width > MAX_DISPLAY_EXTENT
+            || height > MAX_DISPLAY_EXTENT
+            || refresh_mhz < MIN_REFRESH_MHZ
+            || refresh_mhz > MAX_REFRESH_MHZ
+        {
+            return None;
+        }
+        match Self::from_host(width, height) {
+            Some(mode) => Some(Self { refresh_mhz, ..mode }),
+            None => None,
         }
     }
 
@@ -331,6 +410,11 @@ impl DisplayMode {
 
     pub const fn height(self) -> u32 {
         self.height.get()
+    }
+
+    /// Refresh rate in millihertz.
+    pub const fn refresh_mhz(self) -> u32 {
+        self.refresh_mhz
     }
 
     /// The `(w << 16) | h` form the `DspMd` breadcrumb reports.
@@ -356,6 +440,7 @@ impl DisplayMode {
             Some(h) => h,
             None => core::num::NonZeroU32::MIN,
         },
+        refresh_mhz: DEFAULT_REFRESH_MHZ,
     };
 }
 
@@ -363,6 +448,94 @@ impl DisplayMode {
 /// usable scanout-0 size. Mirrored by `ddi::vidpn::DEFAULT_MODE_*`.
 pub const FALLBACK_DISPLAY_WIDTH: u32 = 1920;
 pub const FALLBACK_DISPLAY_HEIGHT: u32 = 1080;
+
+/// The refresh rates the KMD offers Windows for a host rate, in millihertz,
+/// highest (the host's, the preferred one) first, and how many there are. Below
+/// the host rate it adds 144, 120 and 60 Hz where they are lower, so Windows
+/// has valid fallbacks and Display Settings can list them. A host rate of 60 Hz
+/// or less is offered alone.
+pub const fn refresh_ladder(host_mhz: u32) -> ([u32; 4], usize) {
+    let mut out = [0u32; 4];
+    out[0] = host_mhz;
+    let mut n = 1;
+    let steps = [144_000u32, 120_000, 60_000];
+    let mut i = 0;
+    while i < steps.len() {
+        if steps[i] < host_mhz && n < out.len() {
+            out[n] = steps[i];
+            n += 1;
+        }
+        i += 1;
+    }
+    (out, n)
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::refresh_ladder;
+
+    #[test]
+    fn the_host_rate_comes_first_with_fallbacks_below_it() {
+        assert_eq!(refresh_ladder(240_000), ([240_000, 144_000, 120_000, 60_000], 4));
+        assert_eq!(refresh_ladder(165_000), ([165_000, 144_000, 120_000, 60_000], 4));
+        assert_eq!(refresh_ladder(144_000), ([144_000, 120_000, 60_000, 0], 3));
+        assert_eq!(refresh_ladder(120_000), ([120_000, 60_000, 0, 0], 2));
+        assert_eq!(refresh_ladder(90_000), ([90_000, 60_000, 0, 0], 2));
+    }
+
+    #[test]
+    fn sixty_hertz_and_below_are_offered_alone() {
+        assert_eq!(refresh_ladder(60_000), ([60_000, 0, 0, 0], 1));
+        assert_eq!(refresh_ladder(59_940), ([59_940, 0, 0, 0], 1));
+        assert_eq!(refresh_ladder(30_000), ([30_000, 0, 0, 0], 1));
+    }
+}
+
+/// `n / d` in lowest terms (`d == 0` is returned unchanged). WDDM matches display
+/// modes by comparing their refresh rationals, and DXGI hands them back to the
+/// application as it read them, so `240000/1000` is reported as the canonical
+/// `240/1` and `59940/1000` as `2997/50`, the way every other driver does.
+pub const fn reduce_ratio(n: u64, d: u64) -> (u64, u64) {
+    if d == 0 {
+        return (n, d);
+    }
+    let (mut a, mut b) = (n, d);
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    if a == 0 {
+        (n, d)
+    } else {
+        (n / a, d / a)
+    }
+}
+
+#[cfg(test)]
+mod ratio_tests {
+    use super::reduce_ratio;
+
+    #[test]
+    fn refresh_rates_reduce_to_lowest_terms() {
+        assert_eq!(reduce_ratio(240_000, 1000), (240, 1));
+        assert_eq!(reduce_ratio(60_000, 1000), (60, 1));
+        assert_eq!(reduce_ratio(59_940, 1000), (2997, 50));
+        assert_eq!(reduce_ratio(143_856, 1000), (17982, 125));
+        assert_eq!(reduce_ratio(1_000, 1000), (1, 1));
+        // Degenerate input comes back unchanged.
+        assert_eq!(reduce_ratio(0, 1000), (0, 1));
+        assert_eq!(reduce_ratio(5, 0), (5, 0));
+    }
+
+    #[test]
+    fn horizontal_sync_stays_in_32_bits_once_reduced() {
+        // 16384 lines at 1 kHz would not fit unreduced (1.6e10 / 1000).
+        let (n, d) = reduce_ratio(16384 * 1_000_000, 1000);
+        assert_eq!((n, d), (16_384_000, 1));
+        assert!(n <= u64::from(u32::MAX));
+    }
+}
 
 impl From<DisplayMode> for (u32, u32) {
     fn from(mode: DisplayMode) -> Self {
@@ -1589,6 +1762,27 @@ mod tests {
         // width, since DspMd masks only the height.
         let wide = DisplayMode::from_host(4096, 2160).expect("4K");
         assert_eq!(wide.packed() >> 16, 4096);
+    }
+
+    #[test]
+    fn native_modes_take_any_size_and_rate_in_range() {
+        let m = DisplayMode::from_native(5120, 2560, 240_000).expect("5120x2560@240");
+        assert_eq!(<(u32, u32)>::from(m), (5120, 2560));
+        assert_eq!(m.refresh_mhz(), 240_000);
+        // A size-only host answer keeps 60 Hz.
+        assert_eq!(
+            DisplayMode::from_host(3840, 1080).map(DisplayMode::refresh_mhz),
+            Some(DEFAULT_REFRESH_MHZ)
+        );
+        assert_eq!(DisplayMode::FALLBACK.refresh_mhz(), 60_000);
+        // 59.94 Hz and 1 kHz survive; the edges outside them do not.
+        assert!(DisplayMode::from_native(1920, 1080, 59_940).is_some());
+        assert!(DisplayMode::from_native(1920, 1080, MAX_REFRESH_MHZ).is_some());
+        assert!(DisplayMode::from_native(1920, 1080, MAX_REFRESH_MHZ + 1).is_none());
+        assert!(DisplayMode::from_native(1920, 1080, MIN_REFRESH_MHZ - 1).is_none());
+        assert!(DisplayMode::from_native(MAX_DISPLAY_EXTENT, 1080, 60_000).is_some());
+        assert!(DisplayMode::from_native(MAX_DISPLAY_EXTENT + 1, 1080, 60_000).is_none());
+        assert!(DisplayMode::from_native(100, 1080, 60_000).is_none());
     }
 
     /// `DisplayMode::FALLBACK`'s `None` arms are unreachable — this is what says

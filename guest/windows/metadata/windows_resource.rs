@@ -52,10 +52,6 @@ pub fn render(root: &Path, component: &str) -> Result<String> {
             .ok_or_else(|| format!("missing {key}"))
     };
     let product = get("HELIOS_PRODUCT")?;
-    // EDID has 13 bytes: at most 12 printable name bytes plus a newline.
-    if product.len() > 12 {
-        return Err("HELIOS_PRODUCT exceeds the EDID monitor-name limit (12 bytes)".into());
-    }
     let publisher = get("HELIOS_PUBLISHER")?;
     let (role, filename, file_type, subtype) = match component {
         "kmd_render" => ("HELIOS_KMD_ROLE", "helios_kmd_render.sys", 3, 4),
@@ -125,6 +121,15 @@ pub fn compile(component: &str) -> Result<()> {
                 .into());
             }
         }
+        // EDID text descriptors have 13 bytes: at most 12 printable bytes plus a
+        // newline. The monitor name is its own key because the product name is
+        // longer.
+        let monitor_name = values
+            .get("HELIOS_MONITOR_NAME")
+            .ok_or("missing HELIOS_MONITOR_NAME")?;
+        if monitor_name.len() > 12 {
+            return Err("HELIOS_MONITOR_NAME exceeds the EDID monitor-name limit (12 bytes)".into());
+        }
         let publisher = &values["HELIOS_PUBLISHER"];
         if publisher.len() > 12 {
             return Err("publisher exceeds the EDID ASCII-text limit (12 bytes)".into());
@@ -138,7 +143,7 @@ pub fn compile(component: &str) -> Result<()> {
         }
         let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
         std::fs::write(out.join("monitor_metadata.rs"), format!(
-            "pub const NAME: &str = {product:?};\npub const PUBLISHER: &str = {publisher:?};\npub const MODEL_YEAR: u16 = {year};\n"
+            "pub const NAME: &str = {monitor_name:?};\npub const PUBLISHER: &str = {publisher:?};\npub const MODEL_YEAR: u16 = {year};\n"
         ))?;
     }
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
