@@ -63,6 +63,8 @@ use wdk_sys::{KEVENT, PVOID};
 
 mod nvrm_tables;
 mod resource_tables;
+mod foreign_tables;
+pub use foreign_tables::{ForeignBegin, ForeignCommit};
 
 pub use nvrm_tables::{
     NvrmPin, PinTake, MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER, MAX_NVRM_MAPS,
@@ -2244,6 +2246,10 @@ pub struct VirtioGpu {
     /// against MAX_BLOBS so a burst of concurrent creates cannot overshoot the
     /// reserved capacity (push under the spinlock must never reallocate).
     blobs_reserved: usize,
+    /// Side record of the blobs that are foreign (RM-exported) resources: quotas,
+    /// provenance, the host-verified size. Their `blobs` and `resources` entries
+    /// are ordinary; see `foreign_tables`. Reserved to its cap at init.
+    foreign: helios_kmd_logic::foreign_resource::ForeignTable,
     /// Every host-live virtio resource id created through this transport.
     /// Removal is one-shot and gates CTX_DETACH_RESOURCE/RESOURCE_UNREF, avoiding
     /// qemu `RESOURCE_UNREF: resource does not exist` errors from duplicate DDI
@@ -2802,6 +2808,7 @@ impl VirtioGpu {
             isr_status_va,
             blobs: Vec::with_capacity(MAX_BLOBS),
             blobs_reserved: 0,
+            foreign: helios_kmd_logic::foreign_resource::ForeignTable::new(),
             resources: Vec::with_capacity(MAX_RESOURCES),
             resources_reserved: 0,
             contexts_reserved: 0,
