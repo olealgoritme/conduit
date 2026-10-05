@@ -449,6 +449,52 @@ impl DisplayMode {
 pub const FALLBACK_DISPLAY_WIDTH: u32 = 1920;
 pub const FALLBACK_DISPLAY_HEIGHT: u32 = 1080;
 
+/// `n / d` in lowest terms (`d == 0` is returned unchanged). WDDM matches display
+/// modes by comparing their refresh rationals, and DXGI hands them back to the
+/// application as it read them, so `240000/1000` is reported as the canonical
+/// `240/1` and `59940/1000` as `2997/50`, the way every other driver does.
+pub const fn reduce_ratio(n: u64, d: u64) -> (u64, u64) {
+    if d == 0 {
+        return (n, d);
+    }
+    let (mut a, mut b) = (n, d);
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    if a == 0 {
+        (n, d)
+    } else {
+        (n / a, d / a)
+    }
+}
+
+#[cfg(test)]
+mod ratio_tests {
+    use super::reduce_ratio;
+
+    #[test]
+    fn refresh_rates_reduce_to_lowest_terms() {
+        assert_eq!(reduce_ratio(240_000, 1000), (240, 1));
+        assert_eq!(reduce_ratio(60_000, 1000), (60, 1));
+        assert_eq!(reduce_ratio(59_940, 1000), (2997, 50));
+        assert_eq!(reduce_ratio(143_856, 1000), (17982, 125));
+        assert_eq!(reduce_ratio(1_000, 1000), (1, 1));
+        // Degenerate input comes back unchanged.
+        assert_eq!(reduce_ratio(0, 1000), (0, 1));
+        assert_eq!(reduce_ratio(5, 0), (5, 0));
+    }
+
+    #[test]
+    fn horizontal_sync_stays_in_32_bits_once_reduced() {
+        // 16384 lines at 1 kHz would not fit unreduced (1.6e10 / 1000).
+        let (n, d) = reduce_ratio(16384 * 1_000_000, 1000);
+        assert_eq!((n, d), (16_384_000, 1));
+        assert!(n <= u64::from(u32::MAX));
+    }
+}
+
 impl From<DisplayMode> for (u32, u32) {
     fn from(mode: DisplayMode) -> Self {
         (mode.width(), mode.height())

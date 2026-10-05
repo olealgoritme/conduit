@@ -199,12 +199,15 @@ fn video_signal_info(w: u32, h: u32, refresh_mhz: u32) -> D3DKMDT_VIDEO_SIGNAL_I
     sig.TotalSize.cx = w;
     sig.TotalSize.cy = h;
     sig.ActiveSize = sig.TotalSize;
-    sig.VSyncFreq.Numerator = refresh_mhz;
-    sig.VSyncFreq.Denominator = 1000;
+    // Both frequencies in lowest terms (240/1, not 240000/1000): WDDM compares
+    // mode rationals and DXGI returns them to the application as written.
+    let (v_n, v_d) = helios_kmd_logic::reduce_ratio(u64::from(refresh_mhz), 1000);
+    sig.VSyncFreq.Numerator = v_n as u32;
+    sig.VSyncFreq.Denominator = v_d as u32;
     // u64 so 5120x2560 at 240 Hz and larger cannot wrap the 32-bit fields.
-    sig.HSyncFreq.Numerator =
-        (u64::from(h) * u64::from(refresh_mhz)).min(u64::from(u32::MAX)) as u32;
-    sig.HSyncFreq.Denominator = 1000;
+    let (h_n, h_d) = helios_kmd_logic::reduce_ratio(u64::from(h) * u64::from(refresh_mhz), 1000);
+    sig.HSyncFreq.Numerator = h_n.min(u64::from(u32::MAX)) as u32;
+    sig.HSyncFreq.Denominator = h_d as u32;
     sig.PixelRate = ((u64::from(w) * u64::from(h) * u64::from(refresh_mhz)) / 1000) as SIZE_T;
     // ScanLineOrdering shares a union with the (unused) additional-signal-info
     // bitfield; the whole struct was zeroed, so selecting this arm is a plain
