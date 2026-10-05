@@ -1,12 +1,13 @@
 From: Conduit Windows driver
 Subject: [PATCH] venus helios: defer small signal batches into one batch escape
 
-Applies to winboat-org/mesa-helios @ 89bd0676a4e69740d9900fb13561b14acc4997d6 (src/virtio/vulkan/vn_renderer_helios.c).
-Needs KMD >= 22.22.300.0 (HELIOS_ESCAPE_SUBMIT_VENUS_BATCH). Default OFF;
-enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/README.md).
+Applies to winboat-org/mesa-helios @ 89bd0676a4e69740d9900fb13561b14acc4997d6 (src/virtio/vulkan/vn_renderer_helios.c and
+vn_renderer_helios_producer.h). Needs KMD >= 22.22.300.0 (HELIOS_ESCAPE_SUBMIT_VENUS_BATCH).
+Default OFF; enable per process with HELIOS_SUBMIT_BATCH=1
+(see guest/windows/icd/patches/README.md).
 ---
---- a/src/virtio/vulkan/vn_renderer_helios.c	2026-10-06 00:18:50.318845372 +0200
-+++ b/src/virtio/vulkan/vn_renderer_helios.c	2026-10-06 00:18:50.319474311 +0200
+--- a/src/virtio/vulkan/vn_renderer_helios.c	2026-10-06 00:31:51.601691398 +0200
++++ b/src/virtio/vulkan/vn_renderer_helios.c	2026-10-06 00:31:51.602551754 +0200
 @@ -110,6 +110,7 @@
  #define HELIOS_ESCAPE_VERSION 1u
  
@@ -52,7 +53,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  _Static_assert(sizeof(struct helios_escape_present_stream) == 32,
                 "present_stream size");
  _Static_assert(sizeof(struct helios_escape_present_buffer_read) == 40,
-@@ -527,6 +551,43 @@
+@@ -527,6 +551,40 @@
     struct helios_present_stream *next;
  };
  
@@ -87,16 +88,13 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
 +   uint32_t size;
 +   uint64_t placeholder;
 +   uint32_t sync_count;
-+   struct {
-+      struct helios_sync *sync;
-+      uint64_t value;
-+   } syncs[HELIOS_BATCH_SYNCS_MAX];
++   struct helios_sync *syncs[HELIOS_BATCH_SYNCS_MAX];
 +};
 +
  struct helios {
     struct vn_renderer base;
  
-@@ -603,8 +664,67 @@
+@@ -603,8 +661,68 @@
  
     struct vn_renderer_shmem_cache shmem_cache;
     struct helios_perf_stats perf;
@@ -136,6 +134,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
 +static inline void
 +helios_dev_lock_nf(struct helios *helios)
 +{
++   assert(helios->dev_owner != GetCurrentThreadId()); /* mtx_plain: no recursion */
 +   mtx_lock(&helios->dev_mutex);
 +   helios->dev_owner = GetCurrentThreadId();
 +}
@@ -164,7 +163,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  /* Process-wide fence-event wait telemetry (printed by helios_perf_write; kept
   * as interlocked statics because the wait path deliberately holds NO lock). */
  static volatile LONG helios_fence_event_waits;     /* event-path parks */
-@@ -835,14 +955,14 @@
+@@ -835,14 +953,14 @@
        return false;
     struct vn_device *dev = vn_device_from_vk(vk_dev);
     struct helios *helios = (struct helios *)dev->renderer;
@@ -181,7 +180,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     if (already_complete || already_partial)
        return already_complete;
  
-@@ -879,7 +999,7 @@
+@@ -879,7 +997,7 @@
     /* The bridge normally calls once per freshly imported memory. Keep the
      * install serialized anyway: a duplicate concurrent call frees its local
      * reference instead of overwriting and leaking the winner's handles. */
@@ -190,7 +189,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     const bool empty = !mem->helios_vidmm_resource &&
                        !mem->helios_vidmm_allocation &&
                        !mem->helios_vidmm_global_share &&
-@@ -894,7 +1014,7 @@
+@@ -894,7 +1012,7 @@
                           mem->helios_vidmm_allocation &&
                           mem->helios_vidmm_global_share &&
                           mem->helios_vidmm_cookie;
@@ -199,41 +198,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     if (!empty)
        vn_renderer_helios_vidmm_free(dev->renderer, resource, allocation);
     return complete;
-@@ -1310,6 +1430,7 @@
- }
- 
- static void helios_perf_write(struct helios *helios, bool final);
-+static void helios_flush_deferred(struct helios *helios);
- static bool helios_ioctl_wait_fence(struct helios *helios,
-                                     uint64_t fence_id,
-                                     uint64_t timeout_ns);
-@@ -1426,7 +1547,7 @@
- }
- 
- static bool
--helios_escape_ex(struct helios *helios, void *buf, uint32_t size, bool hardware_access)
-+helios_escape_raw(struct helios *helios, void *buf, uint32_t size, bool hardware_access)
- {
-    if (!helios->adapter) {
-       helios_diag("escape skipped: no adapter size=%u", size);
-@@ -1462,6 +1583,16 @@
-    return true;
- }
- 
-+/* Every escape but the batch flush itself goes out AFTER any deferred signal
-+ * batches, so submission order is the order of the calls. (A no-op when nothing
-+ * is deferred, which is always the case unless HELIOS_SUBMIT_BATCH=1.) */
-+static bool
-+helios_escape_ex(struct helios *helios, void *buf, uint32_t size, bool hardware_access)
-+{
-+   helios_flush_deferred(helios);
-+   return helios_escape_raw(helios, buf, size, hardware_access);
-+}
-+
- /* HardwareAccess for the default escape wrapper — now 0 (26th session).
-  *
-  * HardwareAccess=1 makes DxgkEscape take the dxgkrnl adapter CORE resource
-@@ -1548,7 +1679,7 @@
+@@ -1548,7 +1666,7 @@
  
     struct helios *helios = (struct helios *)renderer;
     uint64_t cookie = 0;
@@ -242,7 +207,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     /* Each semaphore has an exact cookie and every per-frame marker carries
      * that cookie, so multiple timelines in one Venus context remain
      * unambiguous. The KMD's fixed stream table is the admission bound. */
-@@ -1560,7 +1691,7 @@
+@@ -1560,7 +1678,7 @@
        helios->present_streams = entry;
        *out_cookie = cookie;
     }
@@ -251,7 +216,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  
     if (!ok)
        free(entry);
-@@ -1578,7 +1709,7 @@
+@@ -1578,7 +1696,7 @@
  
     struct helios *helios = (struct helios *)renderer;
     bool accepted = false;
@@ -260,7 +225,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  
     const struct helios_present_stream *entry = helios->present_streams;
     while (entry && entry->cookie != cookie)
-@@ -1595,7 +1726,7 @@
+@@ -1595,7 +1713,7 @@
           req.out_state == HELIOS_PRESENT_BUFFER_READ_ACCEPTED;
     }
  
@@ -269,7 +234,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     return accepted;
  }
  
-@@ -1607,7 +1738,7 @@
+@@ -1607,7 +1725,7 @@
        return;
  
     struct helios *helios = (struct helios *)renderer;
@@ -278,7 +243,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     struct helios_present_stream **link = &helios->present_streams;
     while (*link && (*link)->cookie != cookie)
        link = &(*link)->next;
-@@ -1621,7 +1752,7 @@
+@@ -1621,7 +1739,7 @@
           helios, HELIOS_PRESENT_STREAM_OP_UNREGISTER, &cookie);
        free(entry);
     }
@@ -287,7 +252,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  }
  
  static void
-@@ -1658,9 +1789,9 @@
+@@ -1658,9 +1776,9 @@
  
     struct helios_escape_query_scanout req = { 0 };
     helios_hdr_init(&req.hdr, HELIOS_ESCAPE_QUERY_SCANOUT, sizeof(req));
@@ -299,7 +264,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     ReleaseSRWLockExclusive(&helios_current_renderer_lock);
     if (!ok || !req.out_resource_id || !req.out_alloc_size ||
         !req.out_width || !req.out_height || !req.out_pitch)
-@@ -2810,7 +2941,7 @@
+@@ -2810,7 +2928,7 @@
        }
  
        bool free_sync;
@@ -308,7 +273,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
        if (complete) {
           helios_sync_mark_fence_locked(renderer, entry->sync, entry->fence_id);
           if (helios->perf.enabled) {
-@@ -2831,7 +2962,7 @@
+@@ -2831,7 +2949,7 @@
           }
        }
        free_sync = helios_sync_unref_locked(renderer, entry->sync);
@@ -317,7 +282,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
        if (free_sync)
           free(entry->sync);
        free(entry);
-@@ -2890,6 +3021,299 @@
+@@ -2890,6 +3008,316 @@
     return true;
  }
  
@@ -369,8 +334,8 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
 +   memcpy(buf + head_size + table_size, helios->batch_streams,
 +          helios->batch_bytes);
 +
-+   const bool ok = helios_escape_raw(helios, buf, (uint32_t)total,
-+                                     helios_escape_hw_forced());
++   const bool ok = helios_escape_ex(helios, buf, (uint32_t)total,
++                                    helios_escape_hw_forced());
 +
 +   /* Detach the queue BEFORE resolving it: resolution takes other locks and must
 +    * never find a non-empty queue (it would flush again). The entries stay in
@@ -386,22 +351,30 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
 +      struct helios_batch_entry *e = &helios->batch_entries[i];
 +
 +      for (uint32_t s = 0; s < e->sync_count; s++) {
-+         struct helios_sync *sync = e->syncs[s].sync;
++         struct helios_sync *sync = e->syncs[s];
 +         for (uint32_t p = 0; p < sync->pending_count; p++) {
-+            if (sync->pending[p].fence_id != e->placeholder)
-+               continue;
-+            if (good)
++            /* A failed entry is left INCOMPLETE on purpose: it never ran, and
++             * completing it would advance sync->val and signal the shared WDDM
++             * fence for work that did not happen. batch_lost fails every later
++             * submit and wait instead. */
++            if (good && sync->pending[p].fence_id == e->placeholder)
 +               sync->pending[p].fence_id = t.fence_id;
-+            else
-+               sync->pending[p].complete = true; /* never strand a waiter */
 +         }
-+         if (good && sync->wddm_local)
-+            (void)helios_retire_enqueue_locked(helios, sync, t.fence_id);
++         if (good && sync->wddm_local &&
++             !helios_retire_enqueue_locked(helios, sync, t.fence_id)) {
++            /* The pre-batching path failed the submit here. The shared fence
++             * would never signal at retirement, so treat it the same way. */
++            helios_diag("submit-batch: retire hand-off FAILED for entry %u", i);
++            helios->batch_lost = true;
++         }
 +         if (helios_sync_unref_locked(&helios->base, sync))
 +            free(sync);
 +      }
-+      if (!good)
++      if (!good) {
++         helios_diag("submit-batch: entry %u/%u failed (escape %s, status 0x%08x)",
++                     i, n, ok ? "ok" : "FAILED", (unsigned)t.out_status);
 +         helios->batch_lost = true;
++      }
 +   }
 +
 +   if (ok) {
@@ -490,9 +463,8 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
 +                         uint64_t value)
 +{
 +   assert(e->sync_count < HELIOS_BATCH_SYNCS_MAX);
-+   e->syncs[e->sync_count].sync = sync;
-+   e->syncs[e->sync_count].value = value;
-+   e->sync_count++;
++   (void)value; /* the placeholder identifies the pending entry */
++   e->syncs[e->sync_count++] = sync;
 +   sync->refs++;
 +}
 +
@@ -521,11 +493,21 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
 +   return 0;
 +}
 +
++/* GetEnvironmentVariableA returns the needed size and writes NOTHING when the
++ * value does not fit, so a bare "> 0" would read an uninitialised buffer. */
++static bool
++helios_env_get(const char *name, char *v, size_t size)
++{
++   v[0] = 0;
++   const DWORD n = GetEnvironmentVariableA(name, v, (DWORD)size);
++   return n > 0 && n < size;
++}
++
 +static uint32_t
 +helios_env_u32(const char *name, uint32_t def, uint32_t lo, uint32_t hi)
 +{
 +   char v[16];
-+   if (!GetEnvironmentVariableA(name, v, sizeof(v)) || !v[0])
++   if (!helios_env_get(name, v, sizeof(v)) || !v[0])
 +      return def;
 +   const unsigned long parsed = strtoul(v, NULL, 10);
 +   return parsed < lo ? lo : parsed > hi ? hi : (uint32_t)parsed;
@@ -537,7 +519,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
 +helios_batch_init(struct helios *helios)
 +{
 +   char v[16];
-+   if (!GetEnvironmentVariableA("HELIOS_SUBMIT_BATCH", v, sizeof(v)) || !v[0] ||
++   if (!helios_env_get("HELIOS_SUBMIT_BATCH", v, sizeof(v)) || !v[0] ||
 +       v[0] == '0')
 +      return; /* default OFF: DWM and every other process keep today's path */
 +
@@ -617,7 +599,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  static bool
  helios_wait_fence_list_contains(const uint64_t *fences, uint32_t count, uint64_t fence_id)
  {
-@@ -2991,6 +3415,10 @@
+@@ -2991,6 +3419,10 @@
             helios_fence_event_immediate, helios_fence_event_raced,
             helios_fence_event_timeouts, helios_fence_event_fallbacks,
             helios_fence_event_lost);
@@ -628,7 +610,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     fprintf(f, "shmem_creates=%llu shmem_cache_hits=%llu bo_creates=%llu bo_maps=%llu\n",
             (unsigned long long)helios->perf.shmem_creates,
             (unsigned long long)helios->perf.shmem_cache_hits,
-@@ -3361,10 +3789,10 @@
+@@ -3361,10 +3793,10 @@
     create.NumAllocations = 1;
     create.pAllocationInfo2 = &allocation_info;
  
@@ -641,7 +623,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
        helios_diag("VidMm CreateAllocation2 size=%llu failed status=0x%08x",
                    (unsigned long long)size, (unsigned)st);
        return false;
-@@ -3379,7 +3807,7 @@
+@@ -3379,7 +3811,7 @@
        if (residency != HELIOS_VIDMM_NOT_ACQUIRED)
           helios_vidmm_evict_locked(helios, allocation);
        helios_vidmm_destroy_locked(helios, create.hResource, allocation);
@@ -650,7 +632,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
        helios_diag("VidMm shared tracker invalid resource=0x%x allocation=0x%x global=0x%x",
                    (unsigned)create.hResource, (unsigned)allocation,
                    (unsigned)create.hGlobalShare);
-@@ -3390,7 +3818,7 @@
+@@ -3390,7 +3822,7 @@
     *allocation_handle = allocation;
     *global_share = create.hGlobalShare;
     *tracker_cookie = private_data.map_cache;
@@ -659,7 +641,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     return true;
  }
  
-@@ -3419,13 +3847,13 @@
+@@ -3419,13 +3851,13 @@
     query.hDevice = helios->device;
     query.hGlobalShare = global_share;
  
@@ -675,7 +657,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
        helios_diag("VidMm QueryResourceInfo global=0x%x failed status=0x%08x allocs=%u private=%u/%u/%u",
                    global_share, (unsigned)st, query.NumAllocations,
                    query.PrivateRuntimeDataSize,
-@@ -3446,7 +3874,7 @@
+@@ -3446,7 +3878,7 @@
        free(runtime_data);
        free(resource_private);
        free(total_private);
@@ -684,7 +666,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
        return false;
     }
  
-@@ -3457,7 +3885,7 @@
+@@ -3457,7 +3889,7 @@
           free(runtime_data);
           free(resource_private);
           free(total_private);
@@ -693,7 +675,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
           helios_diag("VidMm QueryResourceInfo data global=0x%x failed status=0x%08x",
                       global_share, (unsigned)st);
           return false;
-@@ -3514,7 +3942,7 @@
+@@ -3514,7 +3946,7 @@
     free(runtime_data);
     free(resource_private);
     free(total_private);
@@ -702,7 +684,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     return *resource_handle != 0 && *allocation_handle != 0;
  }
  
-@@ -3527,10 +3955,10 @@
+@@ -3527,10 +3959,10 @@
     if (!resource_handle || !allocation_handle)
        return;
  
@@ -715,7 +697,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  }
  
  static void
-@@ -3603,7 +4031,7 @@
+@@ -3603,7 +4035,7 @@
     create.NumAllocations = 1;
     create.pAllocationInfo2 = &allocation_info;
  
@@ -724,7 +706,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     const NTSTATUS st = D3DKMTCreateAllocation2(&create);
     if (st == 0 && create.hResource && allocation_info.hAllocation) {
        /* The KMD atomically re-owns this resource id for the allocation.  The
-@@ -3624,7 +4052,7 @@
+@@ -3624,7 +4056,7 @@
                    (unsigned)st, (unsigned)create.hResource,
                    (unsigned)allocation_info.hAllocation, bo->base.res_id);
     }
@@ -733,7 +715,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  
     if (!external->resource || !external->allocation) {
        free(external);
-@@ -3691,11 +4119,11 @@
+@@ -3691,11 +4123,11 @@
     OBJECT_ATTRIBUTES attr;
     memset(&attr, 0, sizeof(attr));
  
@@ -747,7 +729,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
           return VK_ERROR_INVALID_EXTERNAL_HANDLE;
        }
  
-@@ -3708,7 +4136,7 @@
+@@ -3708,7 +4140,7 @@
        open_name.pObjAttrib = &attr;
        const NTSTATUS name_st = D3DKMTOpenNtHandleFromName(&open_name);
        if (name_st != 0 || !open_name.hNtHandle) {
@@ -756,7 +738,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
           helios_diag("external memory open name failed status=0x%08x",
                       (unsigned)name_st);
           return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-@@ -3728,7 +4156,7 @@
+@@ -3728,7 +4160,7 @@
         query.TotalPrivateDriverDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT) {
        if (close_nt_handle)
           CloseHandle(nt_handle);
@@ -765,7 +747,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
        helios_diag("external memory query failed status=0x%08x allocs=%u private=%u/%u/%u",
                    (unsigned)st, query.NumAllocations,
                    query.PrivateRuntimeDataSize,
-@@ -3752,7 +4180,7 @@
+@@ -3752,7 +4184,7 @@
        free(total_private);
        if (close_nt_handle)
           CloseHandle(nt_handle);
@@ -774,7 +756,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
        return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
  
-@@ -3815,7 +4243,7 @@
+@@ -3815,7 +4247,7 @@
     free(total_private);
     if (close_nt_handle)
        CloseHandle(nt_handle);
@@ -783,7 +765,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  
     if (!external) {
        helios_diag("external memory open failed status=0x%08x resource=0x%x allocation=0x%x identity=%u/%u/%u kind=%u/%u blob=%llu/%llu size=%llu/%llu type=%u/%u valid=%u",
-@@ -3877,7 +4305,7 @@
+@@ -3877,7 +4309,7 @@
     const DWORD access = export_info ? export_info->dwAccess
                                      : SHARED_ALLOCATION_ALL_ACCESS;
     HANDLE handle = NULL;
@@ -792,7 +774,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     const NTSTATUS st =
        D3DKMTShareObjects(1, &external->resource, &attr, access, &handle);
     if (st == 0 && handle) {
-@@ -3886,7 +4314,7 @@
+@@ -3886,7 +4318,7 @@
           export_info && export_info->pAttributes &&
           export_info->pAttributes->bInheritHandle;
     }
@@ -801,7 +783,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  
     if (st != 0 || !handle) {
        helios_diag("external memory ShareObjects failed status=0x%08x resource=0x%x",
-@@ -3927,9 +4355,9 @@
+@@ -3927,9 +4359,9 @@
        return;
  
     struct helios *helios = (struct helios *)renderer;
@@ -813,7 +795,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     free(external);
  }
  
-@@ -3945,12 +4373,16 @@
+@@ -3945,12 +4377,16 @@
  
     if (perf)
        QueryPerformanceCounter(&t0);
@@ -831,7 +813,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     for (uint32_t i = 0; i < submit->batch_count; i++) {
        const struct vn_renderer_submit_batch *batch = &submit->batches[i];
  
-@@ -3963,7 +4395,23 @@
+@@ -3963,7 +4399,23 @@
        }
  
        uint64_t fence_id = 0;
@@ -856,7 +838,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
           if (perf)
              QueryPerformanceCounter(&t1);
           const bool ok = helios_ioctl_submit_cs(
-@@ -3992,8 +4440,11 @@
+@@ -3992,8 +4444,11 @@
           /* A SHARED sync must signal its WDDM fence at wire-fence retirement
            * without relying on this process ever waiting on it — hand the
            * (sync, fence) pair to the retire thread. */
@@ -870,7 +852,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
              result = VK_ERROR_OUT_OF_HOST_MEMORY;
              break;
           }
-@@ -4005,12 +4456,16 @@
+@@ -4005,12 +4460,16 @@
        if (result != VK_SUCCESS)
           break;
     }
@@ -888,7 +870,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     if (write_summary)
        helios_perf_write(helios, false);
  
-@@ -4026,10 +4481,12 @@
+@@ -4026,10 +4485,12 @@
     uint32_t wait_fence_count = 0;
     VkResult result = VK_SUCCESS;
  
@@ -902,7 +884,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     bool satisfied = !wait->wait_any; /* wait_all starts true, wait_any starts false */
     for (uint32_t i = 0; i < wait->sync_count; i++) {
        struct helios_sync *sync = (struct helios_sync *)wait->syncs[i];
-@@ -4045,7 +4502,7 @@
+@@ -4045,7 +4506,7 @@
           satisfied = satisfied && reached;
        }
     }
@@ -911,7 +893,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  
     if (satisfied) {
        if (helios->perf.enabled)
-@@ -4066,7 +4523,7 @@
+@@ -4066,7 +4527,7 @@
           return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
  
@@ -920,7 +902,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     for (uint32_t i = 0; i < wait->sync_count; i++) {
        const struct helios_sync *sync = (const struct helios_sync *)wait->syncs[i];
        if (sync->val >= wait->sync_values[i])
-@@ -4083,47 +4540,47 @@
+@@ -4083,47 +4544,47 @@
              wait_fences[wait_fence_count++] = pending->fence_id;
        }
     }
@@ -977,7 +959,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
        }
        if (wait_fences != stack_wait_fences)
           free(wait_fences);
-@@ -4131,9 +4588,9 @@
+@@ -4131,9 +4592,9 @@
     }
  
     if (helios->perf.enabled) {
@@ -989,7 +971,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     }
  
     for (uint32_t i = 0; i < wait_fence_count; i++) {
-@@ -4144,18 +4601,18 @@
+@@ -4144,18 +4605,18 @@
     }
  
     if (result == VK_SUCCESS) {
@@ -1012,7 +994,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     }
  
     if (wait_fences != stack_wait_fences)
-@@ -4173,9 +4630,9 @@
+@@ -4173,9 +4634,9 @@
     struct helios *helios = (struct helios *)renderer;
     struct helios_shmem *hshmem = (struct helios_shmem *)shmem;
  
@@ -1024,7 +1006,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     helios_trace_shmem("release", helios->device, helios->context,
                        hshmem->ctx_id, shmem->res_id, shmem->mmap_size,
                        (uint64_t)(uintptr_t)shmem->mmap_ptr);
-@@ -4215,14 +4672,14 @@
+@@ -4215,14 +4676,14 @@
      * mappable memory the renderer can both read and write (vn_ring head/status).
      * A HOST3D mappable blob with blob_id=0 is exactly that (virtgpu shmem path);
      * the host-visible window is mapped into this process by MAP_BLOB. */
@@ -1041,7 +1023,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     helios_trace_shmem("create", helios->device, helios->context, helios->ctx_id,
                        res_id, size, user_va);
  
-@@ -4230,18 +4687,18 @@
+@@ -4230,18 +4691,18 @@
        vn_log(helios->instance, "shmem create failed (res_id=%u, mapped=%d)", res_id,
               user_va != 0);
        if (res_id) {
@@ -1064,7 +1046,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
        return NULL;
     }
  
-@@ -4280,7 +4737,7 @@
+@@ -4280,7 +4741,7 @@
     if (external_handles)
        blob_flags |= VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
  
@@ -1073,7 +1055,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     /* The optional batch orders the host's vkAllocateMemory before the blob binds
      * to it ("venus: let resource_create_blob wait for mem alloc"). Submit it
      * first (synchronous) so the device memory exists when ALLOC_BLOB references
-@@ -4291,7 +4748,7 @@
+@@ -4291,7 +4752,7 @@
            !helios_ioctl_submit_cs(helios, batch->cs_data, batch->cs_size,
                                    batch->ring_idx, batch->present_cookie,
                                    batch->present_value32, &fence_id)) {
@@ -1082,7 +1064,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
           return VK_ERROR_DEVICE_LOST;
        }
        /* Record the batch's syncs against its real wire fence (a sync-only
-@@ -4312,7 +4769,7 @@
+@@ -4312,7 +4773,7 @@
  
     const uint32_t res_id = helios_ioctl_alloc_blob(
        helios, VIRTIO_GPU_BLOB_MEM_HOST3D, blob_flags, mem_id, size);
@@ -1091,7 +1073,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  
     if (!res_id)
        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-@@ -4335,9 +4792,9 @@
+@@ -4335,9 +4796,9 @@
  
     struct helios_bo *bo = calloc(1, sizeof(*bo));
     if (!bo) {
@@ -1103,7 +1085,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
        return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
  
-@@ -4364,10 +4821,10 @@
+@@ -4364,10 +4825,10 @@
     if (!res_id)
        return VK_ERROR_INVALID_EXTERNAL_HANDLE;
  
@@ -1116,7 +1098,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  
     if (!attached)
        return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-@@ -4413,7 +4870,7 @@
+@@ -4413,7 +4874,7 @@
  
     /* map-once; the vtable contract allows this to be non-thread-safe but we
      * serialize anyway (MAP_BLOB must be serialized in the KMD). */
@@ -1125,7 +1107,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     if (!bo->base.mmap_ptr && mappable) {
        uint32_t map_cache = 0;
        const uint32_t requested_map_cache = bo->base.prefer_cached_map ?
-@@ -4442,7 +4899,7 @@
+@@ -4442,7 +4903,7 @@
           }
        }
     }
@@ -1134,7 +1116,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  
     return bo->base.mmap_ptr;
  }
-@@ -4468,9 +4925,9 @@
+@@ -4468,9 +4929,9 @@
     if (hbo->resource_released)
        return;
  
@@ -1146,7 +1128,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     hbo->resource_released = true;
  }
  
-@@ -4558,9 +5015,9 @@
+@@ -4558,9 +5019,9 @@
  
     /* Drop the owner reference; a queued retire entry may still hold one, in
      * which case the retire thread frees the struct after its WAIT_FENCE. */
@@ -1158,7 +1140,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  
     if (free_sync)
        free(sync);
-@@ -4574,12 +5031,12 @@
+@@ -4574,12 +5035,12 @@
     struct helios *helios = (struct helios *)renderer;
     struct helios_sync *sync = (struct helios_sync *)_sync;
  
@@ -1173,7 +1155,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     return VK_SUCCESS;
  }
  
-@@ -4593,33 +5050,33 @@
+@@ -4593,33 +5054,33 @@
     uint64_t fences[HELIOS_SYNC_PENDING_MAX];
     uint32_t fence_count = 0;
  
@@ -1213,7 +1195,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     return VK_SUCCESS;
  }
  
-@@ -4631,12 +5088,12 @@
+@@ -4631,12 +5092,12 @@
     struct helios *helios = (struct helios *)renderer;
     struct helios_sync *sync = (struct helios_sync *)_sync;
  
@@ -1228,7 +1210,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     return VK_SUCCESS;
  }
  
-@@ -4984,6 +5441,10 @@
+@@ -4984,6 +5445,10 @@
     if (helios_perf_at_exit_renderer == helios)
        helios_perf_at_exit_renderer = NULL;
  
@@ -1239,7 +1221,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     /* Stop the retire thread BEFORE tearing down the escape channel: it blocks
      * only in bounded WAIT_FENCE slices and re-checks retire_stop between them,
      * so the join is prompt. Entries still queued drain WITHOUT marking (the
-@@ -5007,9 +5468,9 @@
+@@ -5007,9 +5472,9 @@
      * registered stream table is also a context-teardown backstop.  UNREGISTER
      * while the D3DKMT context is still valid; a failed best-effort escape does
      * not retain a stale local cookie. */
@@ -1251,7 +1233,7 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
  
     vn_renderer_shmem_cache_fini(&helios->shmem_cache);
  
-@@ -5139,6 +5600,7 @@
+@@ -5139,6 +5604,7 @@
     /* Versioned ICD↔KMD capability handshake (no deploy-order assumptions):
      * one quiet probe decides event waits vs the blocking-escape fallback. */
     helios_probe_fence_events(helios);
@@ -1259,3 +1241,23 @@ enable per process with HELIOS_SUBMIT_BATCH=1 (see guest/windows/icd/patches/REA
     helios->retire_stop_event = CreateEventW(NULL, /*bManualReset*/ TRUE, FALSE, NULL);
     if (helios->fence_events_supported && !helios->retire_stop_event)
        helios_diag("retire_stop_event creation FAILED — retire thread will use "
+--- a/src/virtio/vulkan/vn_renderer_helios_producer.h	2026-10-06 00:31:51.603341348 +0200
++++ b/src/virtio/vulkan/vn_renderer_helios_producer.h	2026-10-06 00:31:51.604053247 +0200
+@@ -72,7 +72,7 @@
+       CloseHandle(b->event); free(b); return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    struct helios_producer_control r = helios_producer_request(HP_MAP, 0);
+-   mtx_lock(&h->dev_mutex);
++   helios_dev_lock(h);
+    bool ok = true;
+    if (!h->producer_status) {
+       ok = helios_escape(h, &r, sizeof(r)) && r.user_va && r.size == 8192 * 64;
+@@ -81,7 +81,7 @@
+    r = helios_producer_request(HP_BIND, 0);
+    r.allocation = allocation;
+    ok = ok && helios_escape(h, &r, sizeof(r));
+-   mtx_unlock(&h->dev_mutex);
++   helios_dev_unlock(h);
+    if (!ok || !r.binding || !r.generation || r.slot >= 8192) {
+       mtx_destroy(&b->wait_mutex); CloseHandle(b->event); free(b);
+       return helios_producer_error();

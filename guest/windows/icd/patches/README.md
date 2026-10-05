@@ -15,7 +15,8 @@ then rebuild `vulkan_virtio.dll` and install it as usual
 
 ## 0001 — defer small signal batches into one batch escape
 
-Base: `winboat-org/mesa-helios` @ `89bd0676a4e69740d9900fb13561b14acc4997d6`.
+Base: `winboat-org/mesa-helios` @ `89bd0676a4e69740d9900fb13561b14acc4997d6`
+(`vn_renderer_helios.c` and `vn_renderer_helios_producer.h`).
 Needs the KMD verb `HELIOS_ESCAPE_SUBMIT_VENUS_BATCH` (driver ≥ 22.22.300.0);
 against an older KMD the probe fails and the ICD behaves exactly as before.
 
@@ -39,9 +40,18 @@ shared (WDDM) syncs reach the retire thread then.
 reorder execution — it only delays *when a semaphore signals*, by at most the
 flush bound. The invariant that keeps the rest simple: every `dev_mutex`
 acquisition except `ops.submit`'s own flushes the queue first, so no other code
-ever sees an unflushed entry. The queue is flushed by that, before every other
-escape, at the entry cap, and by a flusher thread a fixed time after the queue
-became non-empty.
+ever sees an unflushed entry (and an escape issued by a lock holder is ordered
+after it). `vn_renderer_helios_producer.h` takes that mutex directly, so it is
+patched to use the same lock. The escapes that deliberately take no lock — fence
+waits and events, the GPU-fence barrier — need no ordering against queued
+waiters and are left alone, so they never wait on the mutex. The queue is
+flushed on every lock acquire, before a direct submit, at the entry cap, and by
+a flusher thread a fixed time after the queue became non-empty.
+
+A flush that fails (the escape, an entry, or the retire hand-off) latches the
+renderer lost: later submits and waits fail with `VK_ERROR_DEVICE_LOST`, and the
+affected syncs are left incomplete rather than signalled for work that never
+ran.
 
 **Default OFF.** DWM loads this same ICD, so nothing changes unless a process
 opts in. Per process:
