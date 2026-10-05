@@ -98,6 +98,9 @@ pub struct NativeTiming {
     pub width: u32,
     pub height: u32,
     pub refresh_mhz: u32,
+    /// True when the timing came from a DisplayID extension, false when it is the
+    /// base block's first detailed timing.
+    pub from_displayid: bool,
 }
 
 /// DisplayID 2.0 data block tag: Type VII Detailed Timing (3-byte pixel clock
@@ -211,6 +214,7 @@ fn displayid_timing(entry: &[u8], khz_per_unit: u64) -> Option<NativeTiming> {
     let v_active = le16(12)? + 1;
     let v_blank = le16(14)? + 1;
     timing_from(clock_khz, h_active, h_blank, v_active, v_blank)
+        .map(|t| NativeTiming { from_displayid: true, ..t })
 }
 
 /// The base block's first detailed timing descriptor (bytes 54..72).
@@ -246,6 +250,7 @@ fn timing_from(
         width: u32::try_from(h_active).ok()?,
         height: u32::try_from(v_active).ok()?,
         refresh_mhz: u32::try_from(refresh_mhz).ok()?,
+        from_displayid: false,
     })
 }
 
@@ -341,6 +346,7 @@ mod tests {
         let t = native_timing(edid).unwrap();
         assert_eq!((t.width, t.height), (5120, 1440));
         assert!(t.refresh_mhz.abs_diff(240_000) <= 50, "{}", t.refresh_mhz);
+        assert!(t.from_displayid && !base_only.from_displayid);
     }
 
     #[test]

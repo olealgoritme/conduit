@@ -384,6 +384,7 @@ impl ScanoutMode {
         // unchanged, so the monitor Windows sees is the host's.
         if let Some(raw) = host_edid {
             if let Some(value) = Self::from_host_edid(raw) {
+                crate::diag::record_named_bytes(b"AdoptPath", 1);
                 return Some(value);
             }
             static EDID_REJECTIONS: AtomicU32 = AtomicU32::new(0);
@@ -396,6 +397,7 @@ impl ScanoutMode {
         };
         if let Some((w, h)) = host {
             if let Some(value) = DisplayMode::from_host(w, h).and_then(build) {
+                crate::diag::record_named_bytes(b"AdoptPath", 2);
                 return Some(value);
             }
             // StartDevice/PASSIVE only. Reject an extent the base EDID cannot
@@ -404,6 +406,7 @@ impl ScanoutMode {
             let count = REJECTIONS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             crate::diag::record_named_bytes(b"EdidModeRejectCount", count);
         }
+        crate::diag::record_named_bytes(b"AdoptPath", 3);
         build(DEFAULT_SCANOUT_EXTENT)
     }
 
@@ -420,6 +423,13 @@ impl ScanoutMode {
     /// describes no timing the KMD can adopt (see `DisplayMode::from_native`).
     fn from_host_edid(raw: &[u8]) -> Option<Self> {
         let timing = helios_kmd_logic::edid::native_timing(raw)?;
+        // What the EDID said, before any validation (the answer to "where did
+        // this refresh rate come from"): size, refresh in mHz, and whether the
+        // timing came from the DisplayID extension (1) or the base block (0).
+        crate::diag::record_named_bytes(b"EdTimW", timing.width);
+        crate::diag::record_named_bytes(b"EdTimH", timing.height);
+        crate::diag::record_named_bytes(b"EdTimR", timing.refresh_mhz);
+        crate::diag::record_named_bytes(b"EdTimD", u32::from(timing.from_displayid));
         let mode = DisplayMode::from_native(timing.width, timing.height, timing.refresh_mhz)?;
         Some(Self {
             mode,
