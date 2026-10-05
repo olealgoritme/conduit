@@ -3,17 +3,22 @@
   Make the Helios adapter the ONLY active display, selected by adapter.
 
 .DESCRIPTION
-  After Helios binds, Windows keeps the Microsoft Basic Display / QXL adapter as
-  DISPLAY1 and adds Helios as an extended second monitor, so the desktop is not on
-  the Helios screen. DisplaySwitch.exe cannot be used: its /internal and /external
-  choices are Windows' own guess about which monitor is which, and on this device
-  /external picked the Basic Display and /internal picked Helios.
+  After Helios binds, Windows keeps the Microsoft Basic Display adapter (the
+  Bochs/std VGA or QXL device: PCI vendor 1234 or 1B36) as DISPLAY1 and adds Helios
+  as an extended second monitor, so the desktop is not on the Helios screen.
+  DisplaySwitch.exe cannot be used: its /internal and /external choices are
+  Windows' own guess about which monitor is which, and on this device /external
+  picked the Basic Display and /internal picked Helios.
 
   This script asks Windows for every display path (QueryDisplayConfig), finds the
-  adapter whose PCI vendor is virtio (VEN_1AF4, which is Helios; QXL is VEN_1B36),
-  and applies a topology containing only that adapter's path (SetDisplayConfig,
-  saved to the display database, so it persists across reboots). It then reads the
-  active topology back and fails if anything else is still active.
+  adapter whose PCI vendor is virtio (VEN_1AF4, which is Helios), and applies a
+  topology containing only that adapter's path (SetDisplayConfig, saved to the
+  display database, so it persists across reboots). It then reads the active
+  topology back and fails if anything else is still active.
+
+  SetDisplayConfig is picky, so several strategies are tried in turn. Each is
+  VALIDATED first (SDC_VALIDATE, which changes nothing); the first one that
+  validates is applied. The return code of every attempt is printed.
 
   It does NOT disable the Basic Display device. That adapter stays enabled and is
   only inactive in the topology, so it remains the picture if Helios fails.
@@ -30,10 +35,12 @@
   there until the driver has started). Default 60.
 
 .PARAMETER DryRun
-  Print the display paths and what would be done; change nothing.
+  Print the display paths, validate each strategy, change nothing. Exits nonzero
+  if no strategy validates.
 
 .NOTES
-  Exit codes: 0 done or already correct (or opted out), 1 failed, 2 not in an
+  Exit codes: 0 done / already correct / opted out / dry run with a valid
+  strategy, 1 failed (including a dry run where nothing validates), 2 not in an
   interactive session, 3 Helios adapter or display never appeared.
 #>
 param(
@@ -87,8 +94,15 @@ public static class HeliosDisplayConfig
     public struct PathInfo { public SourceInfo sourceInfo; public TargetInfo targetInfo; public uint flags; }
 
     // DISPLAYCONFIG_MODE_INFO is 64 bytes: type, id, adapter, then a 48-byte union.
+    // The union is never read here, only copied whole.
     [StructLayout(LayoutKind.Sequential, Size = 64)]
     public struct ModeInfo { public uint infoType; public uint id; public LUID adapterId; }
+
+    public class Config
+    {
+        public PathInfo[] Paths;
+        public ModeInfo[] Modes;
+    }
 
     [DllImport("user32.dll")]
     static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPaths, out uint numModes);
@@ -106,27 +120,32 @@ public static class HeliosDisplayConfig
 
     const uint QDC_ALL_PATHS = 1;
     const uint QDC_ONLY_ACTIVE_PATHS = 2;
-    const uint PATH_ACTIVE = 1;
-    const uint MODE_IDX_INVALID = 0xFFFFFFFF;
-    const uint SDC_TOPOLOGY_SUPPLIED = 0x10;
-    const uint SDC_APPLY = 0x80;
-    const uint SDC_SAVE_TO_DATABASE = 0x200;
-    const uint SDC_ALLOW_PATH_ORDER_CHANGES = 0x2000;
-    const uint SDC_VALIDATE = 0x40;
+    public const uint PATH_ACTIVE = 1;
+    public const uint MODE_IDX_INVALID = 0xFFFFFFFF;
+    public const uint SDC_TOPOLOGY_SUPPLIED = 0x10;
+    public const uint SDC_USE_SUPPLIED_DISPLAY_CONFIG = 0x20;
+    public const uint SDC_VALIDATE = 0x40;
+    public const uint SDC_APPLY = 0x80;
+    public const uint SDC_SAVE_TO_DATABASE = 0x200;
+    public const uint SDC_ALLOW_CHANGES = 0x400;
+    public const uint SDC_ALLOW_PATH_ORDER_CHANGES = 0x2000;
 
-    public static PathInfo[] Query(bool activeOnly)
+    public static Config Query(bool activeOnly)
     {
+        uint flags = activeOnly ? QDC_ONLY_ACTIVE_PATHS : QDC_ALL_PATHS;
         uint np, nm;
-        int r = GetDisplayConfigBufferSizes(activeOnly ? QDC_ONLY_ACTIVE_PATHS : QDC_ALL_PATHS, out np, out nm);
+        int r = GetDisplayConfigBufferSizes(flags, out np, out nm);
         if (r != 0) throw new InvalidOperationException("GetDisplayConfigBufferSizes failed: " + r);
         PathInfo[] paths = new PathInfo[np];
         ModeInfo[] modes = new ModeInfo[nm];
-        r = QueryDisplayConfig(activeOnly ? QDC_ONLY_ACTIVE_PATHS : QDC_ALL_PATHS,
-            ref np, paths, ref nm, modes, IntPtr.Zero);
+        r = QueryDisplayConfig(flags, ref np, paths, ref nm, modes, IntPtr.Zero);
         if (r != 0) throw new InvalidOperationException("QueryDisplayConfig failed: " + r);
-        PathInfo[] trimmed = new PathInfo[np];
-        Array.Copy(paths, trimmed, (int)np);
-        return trimmed;
+        Config c = new Config();
+        c.Paths = new PathInfo[np];
+        Array.Copy(paths, c.Paths, (int)np);
+        c.Modes = new ModeInfo[nm];
+        Array.Copy(modes, c.Modes, (int)nm);
+        return c;
     }
 
     // DISPLAYCONFIG_ADAPTER_NAME: header (type, size, adapterId, id) = 20 bytes,
@@ -150,101 +169,176 @@ public static class HeliosDisplayConfig
 
     public static bool SameAdapter(LUID a, LUID b) { return a.LowPart == b.LowPart && a.HighPart == b.HighPart; }
 
-    // Apply a topology made of exactly these paths, saved to the display database.
-    public static int ApplyOnly(PathInfo[] chosen, bool validateOnly)
+    // Nested struct fields cannot be assigned from PowerShell (it edits a copy),
+    // so every path edit is done here.
+
+    // A path as SetDisplayConfig wants it for a topology: active, status cleared,
+    // source and target modes left for Windows to pick.
+    public static PathInfo TopologyPath(PathInfo p)
     {
-        PathInfo[] paths = new PathInfo[chosen.Length];
-        for (int i = 0; i < chosen.Length; i++)
-        {
-            paths[i] = chosen[i];
-            paths[i].flags |= PATH_ACTIVE;
-            paths[i].sourceInfo.modeInfoIdx = MODE_IDX_INVALID;
-            paths[i].targetInfo.modeInfoIdx = MODE_IDX_INVALID;
-        }
-        uint flags = SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES;
-        flags |= validateOnly ? SDC_VALIDATE : (SDC_APPLY | SDC_SAVE_TO_DATABASE);
-        return SetDisplayConfig((uint)paths.Length, paths, 0, null, flags);
+        p.flags = PATH_ACTIVE;
+        p.sourceInfo.modeInfoIdx = MODE_IDX_INVALID;
+        p.sourceInfo.statusFlags = 0;
+        p.targetInfo.modeInfoIdx = MODE_IDX_INVALID;
+        p.targetInfo.statusFlags = 0;
+        return p;
+    }
+
+    // The path with its source and target mode re-based to a two-entry mode array
+    // [source, target], plus that array; null if the path has no usable modes.
+    public static bool WithOwnModes(Config c, int pathIndex, out PathInfo[] paths, out ModeInfo[] modes)
+    {
+        paths = null; modes = null;
+        PathInfo p = c.Paths[pathIndex];
+        uint s = p.sourceInfo.modeInfoIdx, t = p.targetInfo.modeInfoIdx;
+        if (s == MODE_IDX_INVALID || t == MODE_IDX_INVALID || s >= c.Modes.Length || t >= c.Modes.Length)
+            return false;
+        modes = new ModeInfo[] { c.Modes[s], c.Modes[t] };
+        p.sourceInfo.modeInfoIdx = 0;
+        p.targetInfo.modeInfoIdx = 1;
+        paths = new PathInfo[] { p };
+        return true;
+    }
+
+    public static PathInfo[] One(PathInfo p) { return new PathInfo[] { p }; }
+
+    public static int Set(PathInfo[] paths, ModeInfo[] modes, uint flags)
+    {
+        uint nm = (modes == null) ? 0u : (uint)modes.Length;
+        return SetDisplayConfig((uint)paths.Length, paths, nm, nm == 0 ? null : modes, flags);
     }
 }
 "@
 
-function Get-HeliosDisplayState {
-    $all = [HeliosDisplayConfig]::Query($false)
-    $adapters = @{}
-    foreach ($path in $all) {
-        $key = "{0}:{1}" -f $path.sourceInfo.adapterId.HighPart, $path.sourceInfo.adapterId.LowPart
-        if (-not $adapters.ContainsKey($key)) {
-            $adapters[$key] = [HeliosDisplayConfig]::AdapterPath($path.sourceInfo.adapterId)
+function Get-AdapterTable($paths) {
+    $table = @{}
+    foreach ($path in $paths) {
+        foreach ($luid in @($path.sourceInfo.adapterId, $path.targetInfo.adapterId)) {
+            $key = "{0}:{1}" -f $luid.HighPart, $luid.LowPart
+            if (-not $table.ContainsKey($key)) { $table[$key] = [HeliosDisplayConfig]::AdapterPath($luid) }
         }
     }
-    [pscustomobject]@{ Paths = $all; Adapters = $adapters }
+    return $table
 }
 
+function Get-AdapterKey($luid) { return "{0}:{1}" -f $luid.HighPart, $luid.LowPart }
+
 function Test-HeliosAdapterPath([string]$DevicePath) {
-    # Helios is the virtio device: PCI vendor 1AF4 (QXL / Basic Display is 1B36).
+    # Helios is the virtio device: PCI vendor 1AF4. The Basic Display adapter is
+    # Bochs/std VGA (1234) or QXL (1B36); do not rely on either of those.
     return $DevicePath -match "ven_1af4"
 }
 
+function Show-Paths($title, $config, $adapters) {
+    Write-Host $title
+    $i = 0
+    foreach ($path in $config.Paths) {
+        $isHelios = Test-HeliosAdapterPath $adapters[(Get-AdapterKey $path.sourceInfo.adapterId)]
+        Write-Host ("  [{0}] adapter {1}{2} source {3} target {4} flags 0x{5:x} targetAvailable {6}" -f `
+            $i, (Get-AdapterKey $path.sourceInfo.adapterId), $(if ($isHelios) { " (Helios)" } else { "" }),
+            $path.sourceInfo.id, $path.targetInfo.id, $path.flags, $path.targetInfo.targetAvailable)
+        $i++
+    }
+}
+
+function Test-OnlyHeliosActive {
+    $active = [HeliosDisplayConfig]::Query($true)
+    if ($active.Paths.Count -eq 0) { return $false }
+    $adapters = Get-AdapterTable $active.Paths
+    foreach ($path in $active.Paths) {
+        if (-not (Test-HeliosAdapterPath $adapters[(Get-AdapterKey $path.sourceInfo.adapterId)])) { return $false }
+    }
+    return $true
+}
+
+# ---- Wait for an available Helios display path ------------------------------
 $deadline = (Get-Date).AddSeconds($WaitSeconds)
 $chosen = $null
 do {
-    $state = Get-HeliosDisplayState
-    $heliosPaths = @($state.Paths | Where-Object {
-        $key = "{0}:{1}" -f $_.sourceInfo.adapterId.HighPart, $_.sourceInfo.adapterId.LowPart
-        (Test-HeliosAdapterPath $state.Adapters[$key]) -and $_.targetInfo.targetAvailable -ne 0
+    $all = [HeliosDisplayConfig]::Query($false)
+    $adapters = Get-AdapterTable $all.Paths
+    $heliosPaths = @($all.Paths | Where-Object {
+        (Test-HeliosAdapterPath $adapters[(Get-AdapterKey $_.sourceInfo.adapterId)]) -and $_.targetInfo.targetAvailable -ne 0
     })
-    if ($heliosPaths.Count -gt 0) {
-        # One display: the first available Helios path.
-        $chosen = $heliosPaths[0]
-        break
-    }
+    if ($heliosPaths.Count -gt 0) { $chosen = $heliosPaths[0]; break }
     if ($DryRun) { break }
     Start-Sleep -Seconds 3
 } while ((Get-Date) -lt $deadline)
 
 Write-Host "Display adapters seen by Windows:"
-foreach ($entry in $state.Adapters.GetEnumerator()) { Write-Host ("  {0}  {1}" -f $entry.Key, $entry.Value) }
+foreach ($entry in $adapters.GetEnumerator()) { Write-Host ("  {0}  {1}" -f $entry.Key, $entry.Value) }
 
 if (-not $chosen) {
     Write-Warning "No available display path on a Helios (VEN_1AF4) adapter. Is the Helios driver started?"
     exit 3
 }
 
-function Test-OnlyHeliosActive {
-    $active = [HeliosDisplayConfig]::Query($true)
-    if ($active.Count -eq 0) { return $false }
-    $adapters = @{}
-    foreach ($path in $active) {
-        $key = "{0}:{1}" -f $path.sourceInfo.adapterId.HighPart, $path.sourceInfo.adapterId.LowPart
-        if (-not $adapters.ContainsKey($key)) {
-            $adapters[$key] = [HeliosDisplayConfig]::AdapterPath($path.sourceInfo.adapterId)
-        }
-        if (-not (Test-HeliosAdapterPath $adapters[$key])) { return $false }
-    }
-    return $true
-}
+$active = [HeliosDisplayConfig]::Query($true)
+Show-Paths "Active display paths now:" $active (Get-AdapterTable $active.Paths)
 
 if (Test-OnlyHeliosActive) {
     Write-Host "Helios is already the only active display."
     exit 0
 }
 
+# ---- Strategies, each validated before it is applied ------------------------
+$sdc = [HeliosDisplayConfig]
+$strategies = New-Object System.Collections.ArrayList
+
+# A: Helios is active already (as a second monitor): hand back only its active
+# path with its own source and target mode, and let Windows drop the rest.
+for ($i = 0; $i -lt $active.Paths.Count; $i++) {
+    $a = Get-AdapterTable @($active.Paths[$i])
+    if (-not (Test-HeliosAdapterPath $a[(Get-AdapterKey $active.Paths[$i].sourceInfo.adapterId)])) { continue }
+    $ownPaths = $null
+    $ownModes = $null
+    if ($sdc::WithOwnModes($active, $i, [ref]$ownPaths, [ref]$ownModes)) {
+        [void]$strategies.Add([pscustomobject]@{
+            Name = "A: only Helios' active path with its own modes"
+            Paths = $ownPaths; Modes = $ownModes
+            Flags = $sdc::SDC_USE_SUPPLIED_DISPLAY_CONFIG -bor $sdc::SDC_ALLOW_CHANGES -bor $sdc::SDC_ALLOW_PATH_ORDER_CHANGES })
+    }
+    break
+}
+# B: the Helios path with no modes: Windows chooses them.
+$topologyPaths = $sdc::One($sdc::TopologyPath($chosen))
+[void]$strategies.Add([pscustomobject]@{
+    Name = "B: Helios path, supplied display config, Windows picks modes"
+    Paths = $topologyPaths; Modes = $null
+    Flags = $sdc::SDC_USE_SUPPLIED_DISPLAY_CONFIG -bor $sdc::SDC_ALLOW_CHANGES -bor $sdc::SDC_ALLOW_PATH_ORDER_CHANGES })
+# C: topology only.
+[void]$strategies.Add([pscustomobject]@{
+    Name = "C: Helios path as the supplied topology"
+    Paths = $topologyPaths; Modes = $null
+    Flags = $sdc::SDC_TOPOLOGY_SUPPLIED -bor $sdc::SDC_ALLOW_PATH_ORDER_CHANGES })
+
+$winner = $null
+foreach ($s in $strategies) {
+    $rc = $sdc::Set($s.Paths, $s.Modes, ($s.Flags -bor $sdc::SDC_VALIDATE))
+    Write-Host ("Validate {0}: {1}{2}" -f $s.Name, $rc, $(if ($rc -eq 0) { " (ok)" } else { "" }))
+    if ($rc -eq 0 -and -not $winner) { $winner = $s }
+}
+
+if (-not $winner) {
+    Write-Warning "No SetDisplayConfig strategy validated; the topology was not changed."
+    exit 1
+}
 if ($DryRun) {
-    Write-Host "Dry run: would activate only the Helios path (target id $($chosen.targetInfo.id))."
-    $rc = [HeliosDisplayConfig]::ApplyOnly(@($chosen), $true)
-    Write-Host "SetDisplayConfig validation returned $rc."
+    Write-Host "Dry run: would apply strategy '$($winner.Name)'. Nothing was changed."
     exit 0
 }
 
-$rc = [HeliosDisplayConfig]::ApplyOnly(@($chosen), $false)
+$rc = $sdc::Set($winner.Paths, $winner.Modes, ($winner.Flags -bor $sdc::SDC_APPLY -bor $sdc::SDC_SAVE_TO_DATABASE))
 if ($rc -ne 0) {
-    Write-Warning "SetDisplayConfig failed with $rc; the topology was not changed."
+    Write-Warning "SetDisplayConfig ($($winner.Name)) failed with $rc; the topology was not changed."
     exit 1
 }
 Start-Sleep -Seconds 2
 if (-not (Test-OnlyHeliosActive)) {
+    $after = [HeliosDisplayConfig]::Query($true)
+    Show-Paths "Active display paths after applying:" $after (Get-AdapterTable $after.Paths)
     Write-Warning "SetDisplayConfig succeeded but a non-Helios display is still active."
     exit 1
 }
-Write-Host "Helios is now the only active display; the topology is saved."
+Write-Host "Helios is now the only active display ($($winner.Name)); the topology is saved."
 exit 0
