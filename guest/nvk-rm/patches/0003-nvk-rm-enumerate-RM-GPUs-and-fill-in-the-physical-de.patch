@@ -1,0 +1,583 @@
+From d35e85a388c6e89e438cde9818d664eabe7a28db Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 5 Oct 2026 21:21:27 +0200
+Subject: [PATCH 3/7] nvk/rm: enumerate RM GPUs and fill in the physical device
+
+With NVK_RM=1 in the environment, NVK asks librmclient for the GPUs RM
+knows about before looking at DRM devices.  For each one it opens an RM
+client, allocates NV01_DEVICE_0 and NV20_SUBDEVICE_0 and fills
+nv_device_info from RM:
+
+  - chipset from NV2080_CTRL_CMD_MC_GET_ARCH_INFO (0x1b2 on GB202),
+  - classes from NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2 (highest 3D,
+    compute, copy, GPFIFO and usermode class Mesa knows about; Volta or
+    newer is required for doorbell submission),
+  - PCI ids, bus location, marketing name,
+  - VRAM size and usage from NV2080_CTRL_CMD_FB_GET_INFO_V2,
+  - GPC/TPC counts from NV2080_CTRL_CMD_GR_GET_INFO_V2,
+  - SM limits the same way nouveau computes them.
+
+No BAR heap is advertised: CPU-mappable memory will be backed by system
+pages.  Logical devices are not implemented yet.
+
+---
+ src/nouveau/vulkan/meson.build              |   2 +
+ src/nouveau/vulkan/nvkmd/nvkmd.c            |   8 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  |  17 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c | 478 ++++++++++++++++++++
+ 4 files changed, 505 insertions(+)
+ create mode 100644 src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+ create mode 100644 src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+
+diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
+index 0920a68..2d73477 100644
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -291,7 +291,9 @@ if not get_option('nvk-rm').disabled()
+   nvk_flags += '-DNVK_WITH_RM=1'
+   nvk_files += files(
+     'nvkmd/rm/nvkmd_rm.h',
++    'nvkmd/rm/nvkmd_rm_dev.c',
+     'nvkmd/rm/nvkmd_rm_lib.c',
++    'nvkmd/rm/nvkmd_rm_pdev.c',
+     'nvkmd/rm/nvrm/nvrm_api.h',
+   )
+ endif
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.c b/src/nouveau/vulkan/nvkmd/nvkmd.c
+index c0e23fb..75e962e 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.c
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.c
+@@ -5,6 +5,9 @@
+ 
+ #include "nvkmd.h"
+ #include "nouveau/nvkmd_nouveau.h"
++#ifdef NVK_WITH_RM
++#include "rm/nvkmd_rm.h"
++#endif
+ #include "nv_push.h"
+ #include "util/cache_ops.h"
+ #include "util/u_math.h"
+@@ -98,8 +101,13 @@ nvkmd_enumerate_non_drm_pdevs(struct vk_object_base *log_obj,
+                               uint32_t *pdev_count,
+                               struct nvkmd_pdev **pdevs_out)
+ {
++#ifdef NVK_WITH_RM
++   return nvkmd_rm_enumerate_pdevs(log_obj, debug_flags,
++                                   pdev_count, pdevs_out);
++#else
+    *pdev_count = 0;
+    return VK_ERROR_INCOMPATIBLE_DRIVER;
++#endif
+ }
+ 
+ VkResult MUST_CHECK
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+new file mode 100644
+index 0000000..ce58219
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -0,0 +1,17 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_rm.h"
++
++#include "vk_log.h"
++
++VkResult
++nvkmd_rm_create_dev(struct nvkmd_pdev *pdev,
++                    struct vk_object_base *log_obj,
++                    struct nvkmd_dev **dev_out)
++{
++   return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
++                    "NVK on RM: logical devices are not implemented yet");
++}
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+new file mode 100644
+index 0000000..ed85c95
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -0,0 +1,478 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_rm.h"
++
++#include "nouveau_device.h"
++#include "util/cache_ops.h"
++#include "util/log.h"
++#include "util/u_debug.h"
++#include "util/u_math.h"
++#include "vk_log.h"
++
++#include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++
++static uint32_t
++pick_class(const NV0080_CTRL_GPU_GET_CLASSLIST_V2_PARAMS *classes,
++           uint8_t low_byte, uint32_t min_cls, uint32_t max_cls)
++{
++   uint32_t best = 0;
++   for (uint32_t i = 0; i < classes->numClasses &&
++                        i < NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE; i++) {
++      const uint32_t cls = classes->classList[i];
++      if ((cls & 0xff) != low_byte || cls < min_cls || cls > max_cls)
++         continue;
++      best = MAX2(best, cls);
++   }
++   return best;
++}
++
++static bool
++has_class(const NV0080_CTRL_GPU_GET_CLASSLIST_V2_PARAMS *classes,
++          uint32_t cls)
++{
++   for (uint32_t i = 0; i < classes->numClasses &&
++                        i < NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE; i++) {
++      if (classes->classList[i] == cls)
++         return true;
++   }
++   return false;
++}
++
++static const char *
++chipset_prefix(uint32_t arch)
++{
++   switch (arch) {
++   case NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_GV100: return "GV1";
++   case NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_TU100: return "TU1";
++   case NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_GA100: return "GA1";
++   case NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_GH100: return "GH1";
++   case NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_AD100: return "AD1";
++   case NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_GB100: return "GB1";
++   case NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_GB200: return "GB2";
++   default: return NULL;
++   }
++}
++
++static uint64_t
++fb_info_get(const NV2080_CTRL_FB_GET_INFO_V2_PARAMS *fb, uint32_t index)
++{
++   for (uint32_t i = 0; i < fb->fbInfoListSize; i++) {
++      if (fb->fbInfoList[i].index == index)
++         return fb->fbInfoList[i].data;
++   }
++   return 0;
++}
++
++static VkResult
++query_fb_info(const struct nvkmd_rm_lib *lib, crm_client *client,
++              uint32_t h_subdevice, struct vk_object_base *log_obj,
++              NV2080_CTRL_FB_GET_INFO_V2_PARAMS *fb)
++{
++   static const uint32_t indices[] = {
++      NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE,
++      NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE,
++      NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE,
++      NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE,
++   };
++
++   memset(fb, 0, sizeof(*fb));
++   fb->fbInfoListSize = ARRAY_SIZE(indices);
++   for (uint32_t i = 0; i < ARRAY_SIZE(indices); i++)
++      fb->fbInfoList[i].index = indices[i];
++
++   return NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                         lib->control(client, h_subdevice,
++                                      NV2080_CTRL_CMD_FB_GET_INFO_V2,
++                                      fb, sizeof(*fb)),
++                         "FB_GET_INFO_V2");
++}
++
++static VkResult
++fill_device_info(struct nvkmd_rm_pdev *pdev,
++                 struct vk_object_base *log_obj,
++                 uint32_t pci_device_id)
++{
++   const struct nvkmd_rm_lib *lib = pdev->lib;
++   crm_client *client = pdev->client;
++   struct nv_device_info *info = &pdev->base.dev_info;
++   VkResult result;
++
++   NV2080_CTRL_MC_GET_ARCH_INFO_PARAMS arch = { 0 };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->control(client, pdev->h_subdevice,
++                                        NV2080_CTRL_CMD_MC_GET_ARCH_INFO,
++                                        &arch, sizeof(arch)),
++                           "MC_GET_ARCH_INFO");
++   if (result != VK_SUCCESS)
++      return result;
++
++   const char *prefix = chipset_prefix(arch.architecture);
++   if (prefix == NULL) {
++      mesa_logd("NVK: RM GPU architecture 0x%x is not supported",
++                arch.architecture);
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   }
++
++   info->type = NV_DEVICE_TYPE_DIS;
++   info->chipset = arch.architecture | arch.implementation;
++   snprintf(info->chipset_name, sizeof(info->chipset_name), "%s%02X",
++            prefix, arch.implementation);
++
++   NV0080_CTRL_GPU_GET_CLASSLIST_V2_PARAMS *classes =
++      calloc(1, sizeof(*classes));
++   if (classes == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->control(client, pdev->h_device,
++                                        NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2,
++                                        classes, sizeof(*classes)),
++                           "GPU_GET_CLASSLIST_V2");
++   if (result != VK_SUCCESS) {
++      free(classes);
++      return result;
++   }
++
++   /* The upper bounds are the newest classes Mesa has headers for */
++   info->cls_eng3d   = pick_class(classes, 0x97, 0xa097, 0xce97);
++   info->cls_compute = pick_class(classes, 0xc0, 0xa0c0, 0xcec0);
++   info->cls_copy    = pick_class(classes, 0xb5, 0xa0b5, 0xcab5);
++   info->cls_gpfifo  = pick_class(classes, 0x6f, 0xc36f, 0xca6f);
++   info->cls_m2mf    = pick_class(classes, 0x40, 0xa040, 0xa140);
++   info->cls_eng2d   = has_class(classes, 0x902d) ? 0x902d : 0;
++
++   static const uint32_t usermode_classes[] = {
++      NVRM_BLACKWELL_USERMODE_A,
++      NVRM_HOPPER_USERMODE_A,
++      NVRM_AMPERE_USERMODE_A,
++      NVRM_TURING_USERMODE_A,
++      NVRM_VOLTA_USERMODE_A,
++   };
++   for (uint32_t i = 0; i < ARRAY_SIZE(usermode_classes); i++) {
++      if (has_class(classes, usermode_classes[i])) {
++         pdev->cls_usermode = usermode_classes[i];
++         break;
++      }
++   }
++   free(classes);
++
++   /* Work submission needs a usermode doorbell (Volta+) */
++   if (info->cls_eng3d == 0 || info->cls_compute == 0 ||
++       info->cls_copy == 0 || info->cls_gpfifo == 0 ||
++       pdev->cls_usermode == 0) {
++      mesa_logd("NVK: RM GPU lacks a class NVK needs "
++                "(3d %04x compute %04x copy %04x gpfifo %04x usermode %04x)",
++                info->cls_eng3d, info->cls_compute, info->cls_copy,
++                info->cls_gpfifo, pdev->cls_usermode);
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   }
++
++   NV2080_CTRL_BUS_GET_PCI_INFO_PARAMS pci = { 0 };
++   if (lib->control(client, pdev->h_subdevice,
++                    NV2080_CTRL_CMD_BUS_GET_PCI_INFO,
++                    &pci, sizeof(pci)) == 0) {
++      info->device_id = pci.pciExtDeviceId ? pci.pciExtDeviceId
++                                           : pci.pciDeviceId >> 16;
++      info->pci.revision_id = pci.pciRevisionId;
++   } else {
++      info->device_id = pci_device_id;
++   }
++
++   NV0000_CTRL_GPU_GET_PCI_INFO_PARAMS bdf = { .gpuId = pdev->gpu_id };
++   if (lib->control(client, lib->root(client),
++                    NV0000_CTRL_CMD_GPU_GET_PCI_INFO,
++                    &bdf, sizeof(bdf)) == 0) {
++      info->pci.domain = bdf.domain;
++      info->pci.bus = bdf.bus;
++      info->pci.dev = bdf.slot;
++      info->pci.func = 0;
++   }
++
++   NV2080_CTRL_GPU_GET_NAME_STRING_PARAMS name = {
++      .gpuNameStringFlags = NV2080_CTRL_GPU_GET_NAME_STRING_FLAGS_TYPE_ASCII,
++   };
++   if (lib->control(client, pdev->h_subdevice,
++                    NV2080_CTRL_CMD_GPU_GET_NAME_STRING,
++                    &name, sizeof(name)) == 0 &&
++       name.gpuNameString.ascii[0] != 0) {
++      STATIC_ASSERT(sizeof(info->device_name) >=
++                    NV2080_GPU_MAX_NAME_STRING_LENGTH);
++      memcpy(info->device_name, name.gpuNameString.ascii,
++             NV2080_GPU_MAX_NAME_STRING_LENGTH);
++      info->device_name[sizeof(info->device_name) - 1] = 0;
++   } else {
++      snprintf(info->device_name, sizeof(info->device_name),
++               "NVIDIA %s", info->chipset_name);
++   }
++
++   NV2080_CTRL_FB_GET_INFO_V2_PARAMS *fb = calloc(1, sizeof(*fb));
++   if (fb == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   result = query_fb_info(lib, client, pdev->h_subdevice, log_obj, fb);
++   if (result != VK_SUCCESS) {
++      free(fb);
++      return result;
++   }
++
++   /* Sizes are in KiB.  HEAP_SIZE is what can actually be allocated (and
++    * what Conduit clamps to --vram-limit-mib).
++    */
++   uint64_t heap_KiB = fb_info_get(fb, NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE);
++   uint64_t ram_KiB = fb_info_get(fb, NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE);
++   info->vram_size_B = (heap_KiB ? heap_KiB : ram_KiB) * 1024;
++   free(fb);
++
++   /* CPU-mappable memory is backed by system pages in this backend (CPU
++    * maps of VRAM go through BAR1 and, under Conduit, through a small
++    * shared window), so don't advertise a BAR heap.
++    */
++   info->bar_size_B = 0;
++
++   NV2080_CTRL_GR_GET_INFO_V2_PARAMS gr = { 0 };
++   gr.grInfoListSize = 2;
++   gr.grInfoList[0].index = NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_GPCS;
++   gr.grInfoList[1].index = NV2080_CTRL_GR_INFO_INDEX_SHADER_PIPE_SUB_COUNT;
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->control(client, pdev->h_subdevice,
++                                        NV2080_CTRL_CMD_GR_GET_INFO_V2,
++                                        &gr, sizeof(gr)),
++                           "GR_GET_INFO_V2");
++   if (result != VK_SUCCESS)
++      return result;
++
++   info->gpc_count = gr.grInfoList[0].data;
++   info->tpc_count = gr.grInfoList[1].data;
++
++   info->nc_atom_size_B = util_cache_granularity();
++
++   /* Not exposed in the first cut */
++   info->has_transfer_queue = false;
++   info->has_video = false;
++   info->has_zcull_info = false;
++
++   nouveau_ws_device_info_init_limits(info);
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
++                         int gpu_index,
++                         struct vk_object_base *log_obj,
++                         enum nvk_debug debug_flags,
++                         struct nvkmd_pdev **pdev_out)
++{
++   VkResult result;
++   int ret;
++
++   struct nvkmd_rm_pdev *pdev = CALLOC_STRUCT(nvkmd_rm_pdev);
++   if (pdev == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   pdev->lib = lib;
++
++   ret = lib->open(&pdev->client, NULL);
++   if (ret != 0) {
++      FREE(pdev);
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   }
++
++   uint32_t minor = 0, pci_device_id = 0;
++   ret = lib->gpu_info(pdev->client, gpu_index, &pdev->gpu_id,
++                       &minor, &pci_device_id);
++   if (ret != 0) {
++      result = VK_ERROR_INCOMPATIBLE_DRIVER;
++      goto fail_client;
++   }
++
++   if ((pci_device_id >> 16) == NVIDIA_VENDOR_ID)
++      pci_device_id &= 0xffff;
++
++   NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS id_info = {
++      .gpuId = pdev->gpu_id,
++   };
++   if (lib->control(pdev->client, lib->root(pdev->client),
++                    NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2,
++                    &id_info, sizeof(id_info)) == 0) {
++      pdev->device_instance = id_info.deviceInstance;
++      pdev->subdevice_instance = id_info.subDeviceInstance;
++   } else {
++      pdev->device_instance = gpu_index;
++      pdev->subdevice_instance = 0;
++   }
++
++   NV0080_ALLOC_PARAMETERS dev_params = {
++      .deviceId = pdev->device_instance,
++      .hClientShare = lib->root(pdev->client),
++   };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INCOMPATIBLE_DRIVER,
++                           lib->alloc(pdev->client, lib->root(pdev->client),
++                                      &pdev->h_device, NV01_DEVICE_0,
++                                      &dev_params, sizeof(dev_params)),
++                           "alloc NV01_DEVICE_0");
++   if (result != VK_SUCCESS)
++      goto fail_client;
++
++   NV2080_ALLOC_PARAMETERS subdev_params = {
++      .subDeviceId = pdev->subdevice_instance,
++   };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INCOMPATIBLE_DRIVER,
++                           lib->alloc(pdev->client, pdev->h_device,
++                                      &pdev->h_subdevice, NV20_SUBDEVICE_0,
++                                      &subdev_params, sizeof(subdev_params)),
++                           "alloc NV20_SUBDEVICE_0");
++   if (result != VK_SUCCESS)
++      goto fail_client;
++
++   result = fill_device_info(pdev, log_obj, pci_device_id);
++   if (result != VK_SUCCESS)
++      goto fail_client;
++
++   pdev->base.ops = &nvkmd_rm_pdev_ops;
++   pdev->base.debug_flags = debug_flags;
++   pdev->base.kmd_info = (struct nvkmd_info) {
++      .has_dma_buf = false,
++      .has_get_vram_used = true,
++      .has_alloc_tiled = false,
++      .has_map_fixed = false,
++      .has_overmap = false,
++      .has_compression = false,
++      .has_host_visible_vram = false,
++   };
++
++   /* VRAM is allocated with 64 KiB pages; system memory BOs get their own
++    * 4 KiB bind alignment (nvkmd_mem::bind_align_B).
++    */
++   pdev->base.bind_align_B = NVKMD_RM_BIG_PAGE_SIZE;
++
++   /* No DRM nodes */
++   pdev->base.drm.render_dev = 0;
++   pdev->base.drm.primary_dev = 0;
++
++   pdev->sync_types[0] = NULL;
++   pdev->base.sync_types = pdev->sync_types;
++
++   if (debug_flags & NVK_DEBUG_VM) {
++      fprintf(stderr, "NVK: RM GPU %u: %s (%s, chipset 0x%x) 3d %04x "
++              "compute %04x copy %04x gpfifo %04x usermode %04x "
++              "vram %" PRIu64 " MiB, %u GPCs, %u TPCs\n",
++              pdev->gpu_id, pdev->base.dev_info.device_name,
++              pdev->base.dev_info.chipset_name,
++              pdev->base.dev_info.chipset, pdev->base.dev_info.cls_eng3d,
++              pdev->base.dev_info.cls_compute, pdev->base.dev_info.cls_copy,
++              pdev->base.dev_info.cls_gpfifo, pdev->cls_usermode,
++              pdev->base.dev_info.vram_size_B >> 20,
++              pdev->base.dev_info.gpc_count, pdev->base.dev_info.tpc_count);
++   }
++
++   *pdev_out = &pdev->base;
++
++   return VK_SUCCESS;
++
++fail_client:
++   /* Freeing the client frees every object under it */
++   lib->close(pdev->client);
++   FREE(pdev);
++
++   return result;
++}
++
++VkResult
++nvkmd_rm_enumerate_pdevs(struct vk_object_base *log_obj,
++                         enum nvk_debug debug_flags,
++                         uint32_t *pdev_count,
++                         struct nvkmd_pdev **pdevs_out)
++{
++   const uint32_t max_pdevs = *pdev_count;
++   *pdev_count = 0;
++
++   /* Opt-in: on a machine with NVIDIA's own driver stack this would expose
++    * the same GPU twice.
++    */
++   if (!debug_get_bool_option("NVK_RM", false))
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++
++   const struct nvkmd_rm_lib *lib = nvkmd_rm_lib_get();
++   if (lib == NULL) {
++      mesa_logw("NVK_RM is set but librmclient could not be loaded");
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   }
++
++   crm_client *client;
++   int ret = lib->open(&client, NULL);
++   if (ret != 0) {
++      mesa_logw("NVK_RM: crm_open failed: %d", ret);
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   }
++
++   const int gpu_count = lib->gpu_count(client);
++   lib->close(client);
++
++   VkResult result = VK_SUCCESS;
++   for (int i = 0; i < gpu_count && *pdev_count < max_pdevs; i++) {
++      struct nvkmd_pdev *pdev = NULL;
++      result = nvkmd_rm_try_create_pdev(lib, i, log_obj, debug_flags, &pdev);
++      if (result == VK_ERROR_INCOMPATIBLE_DRIVER) {
++         result = VK_SUCCESS;
++         continue;
++      }
++      if (result != VK_SUCCESS)
++         break;
++
++      pdevs_out[(*pdev_count)++] = pdev;
++   }
++
++   if (result != VK_SUCCESS) {
++      for (uint32_t i = 0; i < *pdev_count; i++)
++         nvkmd_pdev_destroy(pdevs_out[i]);
++      *pdev_count = 0;
++      return result;
++   }
++
++   return *pdev_count > 0 ? VK_SUCCESS : VK_ERROR_INCOMPATIBLE_DRIVER;
++}
++
++static void
++nvkmd_rm_pdev_destroy(struct nvkmd_pdev *_pdev)
++{
++   struct nvkmd_rm_pdev *pdev = nvkmd_rm_pdev(_pdev);
++
++   pdev->lib->close(pdev->client);
++   FREE(pdev);
++}
++
++static uint64_t
++nvkmd_rm_pdev_get_vram_used(struct nvkmd_pdev *_pdev)
++{
++   struct nvkmd_rm_pdev *pdev = nvkmd_rm_pdev(_pdev);
++
++   NV2080_CTRL_FB_GET_INFO_V2_PARAMS *fb = calloc(1, sizeof(*fb));
++   if (fb == NULL)
++      return 0;
++
++   uint64_t used = 0;
++   if (query_fb_info(pdev->lib, pdev->client, pdev->h_subdevice,
++                     NULL, fb) == VK_SUCCESS) {
++      const uint64_t heap_KiB =
++         fb_info_get(fb, NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE);
++      const uint64_t free_KiB =
++         fb_info_get(fb, NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE);
++      if (heap_KiB > free_KiB)
++         used = (heap_KiB - free_KiB) * 1024;
++   }
++   free(fb);
++
++   return used;
++}
++
++const struct nvkmd_pdev_ops nvkmd_rm_pdev_ops = {
++   .destroy = nvkmd_rm_pdev_destroy,
++   .get_vram_used = nvkmd_rm_pdev_get_vram_used,
++   .create_dev = nvkmd_rm_create_dev,
++};
+-- 
+2.43.0
+
