@@ -101,9 +101,21 @@ struct win_ctx {
         uint32_t id;      /* the KMD/host mapping id */
     } *maps;
     uint32_t n_maps, cap_maps;
+
+    /* Channels of CPU mappings whose view and host mapping are gone but whose
+     * NV_ESC_RM_UNMAP_MEMORY has not been issued yet: RM ties the mapping to the
+     * channel, so the channel must outlive that call (Linux closes it after). Closed
+     * when the matching RM_UNMAP_MEMORY returns, or with the control channel. */
+    struct win_pend {
+        uint32_t memory;
+        uint64_t cookie;
+        int fd;
+    } *pend;
+    uint32_t n_pend, cap_pend;
+    int ctl_handle; /* the control channel, -1 until opened */
 };
 
-static struct win_ctx g_ctx = { .lock = SRWLOCK_INIT };
+static struct win_ctx g_ctx = { .lock = SRWLOCK_INIT, .ctl_handle = -1 };
 
 #define STATUS_NOT_IMPLEMENTED_NT ((NTSTATUS)0xC0000002L)
 
@@ -432,7 +444,29 @@ static int win_open(void *vctx, int32_t node, int *fd)
     if (handle == 0 || handle > 0x7fffffffu)
         return -EIO;
     *fd = (int)handle;
+    if (node == CRM_NODE_CTL) {
+        AcquireSRWLockExclusive(&c->lock);
+        c->ctl_handle = (int)handle;
+        ReleaseSRWLockExclusive(&c->lock);
+    }
     return 0;
+}
+
+static void win_close_one(struct win_ctx *c, int fd);
+
+/* Close every channel still waiting for its RM_UNMAP_MEMORY. */
+static void pend_flush(struct win_ctx *c)
+{
+    for (;;) {
+        int fd = -1;
+        AcquireSRWLockExclusive(&c->lock);
+        if (c->n_pend)
+            fd = c->pend[--c->n_pend].fd;
+        ReleaseSRWLockExclusive(&c->lock);
+        if (fd < 0)
+            return;
+        win_close_one(c, fd);
+    }
 }
 
 static void win_close(void *vctx, int fd)
@@ -441,6 +475,19 @@ static void win_close(void *vctx, int fd)
     /* A valid fd implies init completed (it came from win_open). */
     if (fd < 0)
         return;
+    /* The library releases CPU mappings before closing channels, so by now none of
+     * their RM_UNMAP_MEMORY is coming: free those channels first. */
+    if (fd == c->ctl_handle) {
+        pend_flush(c);
+        AcquireSRWLockExclusive(&c->lock);
+        c->ctl_handle = -1;
+        ReleaseSRWLockExclusive(&c->lock);
+    }
+    win_close_one(c, fd);
+}
+
+static void win_close_one(struct win_ctx *c, int fd)
+{
     uint8_t req[CRM_WIRE_HDR];
     uint8_t resp[CRM_WIRE_HDR + REPLY_SLACK];
     uint32_t n = 0;
@@ -536,6 +583,43 @@ static void nvrm_unpin_call(struct win_ctx *c, uint32_t pin_id)
     (void)nvrm_escape(c, &u, sizeof(u));
 }
 
+/* Park `fd` until the RM_UNMAP_MEMORY of (memory, cookie). 0, or -ENOMEM. */
+static int pend_add(struct win_ctx *c, uint32_t memory, uint64_t cookie, int fd)
+{
+    int r = 0;
+    AcquireSRWLockExclusive(&c->lock);
+    if (c->n_pend == c->cap_pend) {
+        uint32_t ncap = c->cap_pend ? c->cap_pend * 2 : 8;
+        struct win_pend *n = realloc(c->pend, (size_t)ncap * sizeof(*n));
+        if (!n) {
+            r = -ENOMEM;
+        } else {
+            c->pend = n;
+            c->cap_pend = ncap;
+        }
+    }
+    if (r == 0)
+        c->pend[c->n_pend++] = (struct win_pend){ .memory = memory, .cookie = cookie, .fd = fd };
+    ReleaseSRWLockExclusive(&c->lock);
+    return r;
+}
+
+/* The parked channel of (memory, cookie), removed; -1 if none. */
+static int pend_take(struct win_ctx *c, uint32_t memory, uint64_t cookie)
+{
+    int fd = -1;
+    AcquireSRWLockExclusive(&c->lock);
+    for (uint32_t i = 0; i < c->n_pend; i++) {
+        if (c->pend[i].memory == memory && c->pend[i].cookie == cookie) {
+            fd = c->pend[i].fd;
+            c->pend[i] = c->pend[--c->n_pend];
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&c->lock);
+    return fd;
+}
+
 /* NV_ESC_RM_ALLOC_MEMORY of an OS descriptor: pMemory names pages of this process
  * that the GPU will read and write. Pin them in the KMD, then send the allocation
  * with the pin's page-run table in place of the pointer. Any other class goes
@@ -602,6 +686,20 @@ static int win_ioctl(void *vctx, int fd, uint32_t nr, void *arg, uint32_t size)
         break;
     case NV_ESC_RM_ALLOC_MEMORY:
         return alloc_memory_pinned(c, fd, nr, arg, size);
+    case NV_ESC_RM_UNMAP_MEMORY:
+        if (size >= sizeof(NVOS34_PARAMETERS)) {
+            const NVOS34_PARAMETERS *u = arg;
+            const uint32_t memory = u->hMemory;
+            const uint64_t cookie = u->pLinearAddress;
+            const int r = ioctl_wire(c, fd, nr, arg, size, NULL, 0, 0, 0);
+            /* RM has dropped (or refused to drop) the mapping: the channel it was
+             * armed on can go now. */
+            const int held = pend_take(c, memory, cookie);
+            if (held >= 0)
+                win_close_one(c, held);
+            return r;
+        }
+        break;
     default:
         break;
     }
@@ -778,15 +876,15 @@ static int win_unmap_memory(void *vctx, int ctl_fd, const struct crm_map_request
 {
     struct win_ctx *c = vctx;
     (void)ctl_fd;
-    (void)req;
-    (void)cookie; /* the library issues NV_ESC_RM_UNMAP_MEMORY with it afterwards */
     struct win_map m;
     if (map_table_take(c, cpu_ptr, &m) != 0)
         return -ENOENT;
-    /* The view goes first, then the host's mapping, then the channel it hangs
-     * off — the order the KMD uses for Close. */
+    /* The view goes first, then the host's mapping. The channel RM armed the
+     * mapping on stays open until the library's NV_ESC_RM_UNMAP_MEMORY (win_ioctl
+     * closes it then), or until the control channel closes. */
     (void)nvrm_munmap_call(c, m.id);
-    win_close(c, m.fd);
+    if (pend_add(c, req->h_memory, cookie, m.fd) != 0)
+        win_close(c, m.fd);
     return 0;
 }
 
