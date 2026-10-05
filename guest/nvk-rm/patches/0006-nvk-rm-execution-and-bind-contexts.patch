@@ -1,0 +1,960 @@
+From a1d52b465aa8bb793e706f482f262caeccc12431 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 5 Oct 2026 21:31:07 +0200
+Subject: [PATCH 6/7] nvk/rm: execution and bind contexts
+
+Exec contexts follow NVIDIA's own channel setup (nvidia-push-init.c and
+nv_gpu_ops.c in open-gpu-kernel-modules):
+
+  KEPLER_CHANNEL_GROUP_A (GR engine, our VA space) under the device
+    FERMI_CONTEXT_SHARE_A (async subcontext)
+    the GPU's GPFIFO class (BLACKWELL_CHANNEL_GPFIFO_B on GB20x) with a
+    client-allocated 1024-entry ring, USERD and error notifier
+      3D, compute and copy objects as requested (no parameters; RM
+      allocates the GR context buffers in the VA space's internal range)
+  SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX + GET_WORK_SUBMIT_TOKEN, then
+  NVA06C_CTRL_CMD_GPFIFO_SCHEDULE on the TSG.
+
+The GPFIFO ring and per-entry push slots are our own system pages; the
+error notifier and USERD are RM-allocated system memory, since RM writes
+the notifier itself.
+
+Submission needs no RM call: exec() writes GPFIFO entries (NO_PREFETCH
+becomes SYNC_WAIT, an incomplete push is simply followed by the next
+entry), flush() publishes GP_PUT in USERD and writes the work-submit
+token to the usermode doorbell.  A full ring waits for GP_GET.  Channel
+errors reported in the error notifier turn into VK_ERROR_DEVICE_LOST.
+
+sync() releases a context-private 64-bit semaphore with WFI from the
+pushbuffer, raises a non-stall interrupt and waits for the value on the
+CPU: a short spin, then poll() on the non-stall OS event when librmclient
+provides one (only as a wakeup, the value in memory decides), else
+sleeping with backoff.
+
+Bind contexts have no RM queue: binds are applied synchronously with
+NV_ESC_RM_MAP/UNMAP_MEMORY_DMA.
+
+Waiting on and signaling vk_syncs is not wired up yet.
+
+---
+ src/nouveau/vulkan/meson.build              |   1 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  19 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c  | 702 ++++++++++++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  |  72 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c  |  13 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c |   1 +
+ 6 files changed, 794 insertions(+), 14 deletions(-)
+ create mode 100644 src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+
+diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
+index 2a949a2..8f31d1f 100644
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -291,6 +291,7 @@ if not get_option('nvk-rm').disabled()
+   nvk_flags += '-DNVK_WITH_RM=1'
+   nvk_files += files(
+     'nvkmd/rm/nvkmd_rm.h',
++    'nvkmd/rm/nvkmd_rm_ctx.c',
+     'nvkmd/rm/nvkmd_rm_dev.c',
+     'nvkmd/rm/nvkmd_rm_lib.c',
+     'nvkmd/rm/nvkmd_rm_mem.c',
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index bc4f2cb..8e35a98 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -184,6 +184,12 @@ struct nvkmd_rm_mem {
+ 
+ NVKMD_DECL_SUBCLASS(mem, rm);
+ 
++/* Private nvkmd_mem_flags bit: back GART memory with RM-allocated
++ * NV01_MEMORY_SYSTEM instead of our own pages (for memory RM itself writes
++ * through a kernel mapping, like channel error notifiers).
++ */
++#define NVKMD_RM_MEM_RM_SYSMEM ((enum nvkmd_mem_flags)(1u << 30))
++
+ VkResult nvkmd_rm_alloc_mem(struct nvkmd_dev *dev,
+                             struct vk_object_base *log_obj,
+                             uint64_t size_B, uint64_t align_B,
+@@ -263,12 +269,13 @@ struct nvkmd_rm_sync {
+ 
+ struct vk_sync_type nvkmd_rm_sync_get_type(void);
+ 
++VkResult nvkmd_rm_sync_init(struct vk_device *device,
++                            struct vk_sync *sync,
++                            uint64_t initial_value);
++
+ static inline bool
+ nvkmd_rm_sync_type_is(const struct vk_sync_type *type)
+ {
+-   extern VkResult nvkmd_rm_sync_init(struct vk_device *device,
+-                                      struct vk_sync *sync,
+-                                      uint64_t initial_value);
+    return type->init == nvkmd_rm_sync_init;
+ }
+ 
+@@ -282,6 +289,12 @@ nvkmd_rm_sync(struct vk_sync *sync)
+ /* Records that a signal of at least value has been submitted */
+ void nvkmd_rm_sync_mark_pending(struct nvkmd_rm_sync *sync, uint64_t value);
+ 
++/* One step of a CPU wait loop: spin, poll() the non-stall event or sleep.
++ * Returns VK_TIMEOUT once abs_timeout_ns has passed.  dev may be NULL.
++ */
++VkResult nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
++                            uint64_t abs_timeout_ns);
++
+ /* Waits on the CPU until *value >= wait_value or the timeout expires */
+ VkResult nvkmd_rm_wait_value(struct nvkmd_rm_dev *dev,
+                              volatile uint64_t *value, uint64_t wait_value,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+new file mode 100644
+index 0000000..86c0c05
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -0,0 +1,702 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_rm.h"
++
++#include "util/log.h"
++#include "util/os_time.h"
++#include "util/u_math.h"
++#include "vk_log.h"
++#include "vk_sync.h"
++
++#include <inttypes.h>
++
++/*
++ * Execution contexts
++ *
++ * One RM channel per context, following NVIDIA's own channel setup
++ * (open-gpu-kernel-modules src/common/unix/nvidia-push/src/nvidia-push-init.c
++ * and src/nvidia/src/kernel/rmapi/nv_gpu_ops.c):
++ *
++ *   KEPLER_CHANNEL_GROUP_A (TSG, GR runlist) under the device
++ *     FERMI_CONTEXT_SHARE_A (subcontext in our VA space)
++ *     *_CHANNEL_GPFIFO_* with a client-allocated GPFIFO ring and USERD
++ *       3D, compute and copy objects (RM allocates GR context buffers)
++ *
++ * Submission needs no RM call: GPFIFO entries go into the ring, GP_PUT
++ * into USERD, and the channel's work-submit token into the usermode
++ * doorbell.
++ *
++ * Waits and signals are host semaphore acquires/releases on 64-bit
++ * timeline values in system memory (see nvkmd_rm_sync.c), written into
++ * small per-GPFIFO-entry push slots that belong to this context.  A slot
++ * is reused only when its GPFIFO entry is, i.e. after GP_GET passed it.
++ */
++
++#define NVKMD_RM_GPFIFO_ENTRIES     1024
++#define NVKMD_RM_PUSH_SLOT_DW       32
++#define NVKMD_RM_PUSH_SLOT_B        (NVKMD_RM_PUSH_SLOT_DW * 4)
++
++#define NVKMD_RM_RING_GPFIFO_OFFSET 0
++#define NVKMD_RM_RING_PUSH_OFFSET   (NVKMD_RM_GPFIFO_ENTRIES * 8)
++#define NVKMD_RM_RING_SEMA_OFFSET   (NVKMD_RM_RING_PUSH_OFFSET + \
++                                     NVKMD_RM_GPFIFO_ENTRIES * \
++                                     NVKMD_RM_PUSH_SLOT_B)
++#define NVKMD_RM_RING_SIZE          (NVKMD_RM_RING_SEMA_OFFSET + 4096)
++
++/* Control memory: error notifiers at offset 0 (where RM writes them), and
++ * USERD at a 512 B aligned offset.
++ */
++#define NVKMD_RM_CTL_NOTIFIER_OFFSET 0
++#define NVKMD_RM_CTL_USERD_OFFSET    4096
++#define NVKMD_RM_CTL_SIZE            8192
++
++/* How long to wait for GPFIFO space before declaring the device lost */
++#define NVKMD_RM_RING_TIMEOUT_NS     (10ull * 1000 * 1000 * 1000)
++
++#define NVKMD_RM_MAX_PENDING_OPS     64
++
++struct nvkmd_rm_sem_op {
++   uint64_t gpu_va;
++   uint64_t value;
++   bool release;
++};
++
++struct nvkmd_rm_exec_ctx {
++   struct nvkmd_ctx base;
++
++   uint32_t h_tsg;
++   uint32_t h_ctxshare;
++   uint32_t h_channel;
++   uint32_t h_objects[3];
++   uint32_t object_count;
++
++   struct nvkmd_mem *ring_mem;
++   uint64_t *gpfifo;
++   uint64_t gpfifo_va;
++   uint32_t *push_slots;
++   uint64_t push_slots_va;
++   volatile uint64_t *ctx_sema;
++   uint64_t ctx_sema_va;
++   uint64_t ctx_seqno;
++
++   struct nvkmd_mem *ctl_mem;
++   volatile NvNotification *notifiers;
++   volatile uint32_t *userd;
++
++   uint32_t work_submit_token;
++
++   uint32_t put;
++   uint32_t kicked_put;
++
++   /* Semaphore acquires queued by wait(), emitted before the next push */
++   uint32_t pending_op_count;
++   struct nvkmd_rm_sem_op pending_ops[NVKMD_RM_MAX_PENDING_OPS];
++};
++
++NVKMD_DECL_SUBCLASS(ctx, rm_exec);
++
++struct nvkmd_rm_bind_ctx {
++   struct nvkmd_ctx base;
++};
++
++NVKMD_DECL_SUBCLASS(ctx, rm_bind);
++
++static inline uint32_t
++host_mthd_incr(uint32_t mthd, uint32_t count)
++{
++   /* SEC_OP = INC_METHOD, subchannel 0; host methods ignore the subchannel */
++   return (1u << 29) | (count << 16) | (0u << 13) | (mthd >> 2);
++}
++
++static VkResult
++check_channel_error(struct nvkmd_rm_exec_ctx *ctx,
++                    struct vk_object_base *log_obj)
++{
++   const uint16_t status =
++      ctx->notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR].status;
++   if (likely(status == 0))
++      return VK_SUCCESS;
++
++   return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST,
++                    "RM channel error: status 0x%x, info32 0x%x "
++                    "(RC error type)", status,
++                    ctx->notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR].info32);
++}
++
++static VkResult
++wait_ring_space(struct nvkmd_rm_exec_ctx *ctx, struct vk_object_base *log_obj)
++{
++   const uint32_t next = (ctx->put + 1) % NVKMD_RM_GPFIFO_ENTRIES;
++   if (next != ctx->userd[NVRM_USERD_GP_GET / 4])
++      return VK_SUCCESS;
++
++   /* The ring is full of entries that may not have been kicked yet */
++   if (ctx->kicked_put != ctx->put) {
++      VkResult result = ctx->base.ops->flush(&ctx->base, log_obj);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   const uint64_t deadline = os_time_get_nano() + NVKMD_RM_RING_TIMEOUT_NS;
++   while (next == ctx->userd[NVRM_USERD_GP_GET / 4]) {
++      VkResult result = check_channel_error(ctx, log_obj);
++      if (result != VK_SUCCESS)
++         return result;
++
++      if (os_time_get_nano() > deadline) {
++         return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST,
++                          "GPFIFO did not drain (GP_GET stuck at %u)",
++                          ctx->userd[NVRM_USERD_GP_GET / 4]);
++      }
++
++      os_time_sleep(10);
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++push_gpfifo_entry(struct nvkmd_rm_exec_ctx *ctx,
++                  struct vk_object_base *log_obj,
++                  uint64_t addr, uint32_t size_B, bool no_prefetch)
++{
++   VkResult result = wait_ring_space(ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* GP_ENTRY1_GET_HI is 8 bits; see NVKMD_RM_HEAP_END */
++   assert(addr < (1ull << 40));
++   assert((addr % 4) == 0 && (size_B % 4) == 0);
++   assert(size_B / 4 < (1u << 21));
++
++   const uint32_t entry0 = (uint32_t)addr & ~3u;
++   const uint32_t entry1 =
++      NVRM_NUM(RM_GPFIFO, _GP_ENTRY1, _GET_HI, addr >> 32) |
++      NVRM_NUM(RM_GPFIFO, _GP_ENTRY1, _LENGTH, size_B / 4) |
++      (no_prefetch ? NVRM_DEF(RM_GPFIFO, _GP_ENTRY1, _SYNC, _WAIT) : 0);
++
++   ctx->gpfifo[ctx->put] = (uint64_t)entry1 << 32 | entry0;
++   ctx->put = (ctx->put + 1) % NVKMD_RM_GPFIFO_ENTRIES;
++
++   return VK_SUCCESS;
++}
++
++/* Writes semaphore operations into push slots and queues them */
++static VkResult
++emit_sem_ops(struct nvkmd_rm_exec_ctx *ctx, struct vk_object_base *log_obj,
++             uint32_t op_count, const struct nvkmd_rm_sem_op *ops)
++{
++   uint32_t i = 0;
++   while (i < op_count) {
++      VkResult result = wait_ring_space(ctx, log_obj);
++      if (result != VK_SUCCESS)
++         return result;
++
++      /* The slot that belongs to the GPFIFO entry we are about to write */
++      const uint32_t slot = ctx->put;
++      uint32_t *p = ctx->push_slots + slot * NVKMD_RM_PUSH_SLOT_DW;
++      uint32_t dw = 0;
++      bool any_release = false;
++
++      for (; i < op_count; i++) {
++         if (dw + 6 + 2 > NVKMD_RM_PUSH_SLOT_DW)
++            break;
++
++         uint32_t exec;
++         if (ops[i].release) {
++            exec = NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _OPERATION, _RELEASE) |
++                   NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _RELEASE_WFI, _EN) |
++                   NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _PAYLOAD_SIZE, _64BIT);
++            any_release = true;
++         } else {
++            exec = NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _OPERATION,
++                            _ACQ_STRICT_GEQ) |
++                   NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _ACQUIRE_SWITCH_TSG, _EN) |
++                   NVRM_DEF(RM_GPFIFO, _SEM_EXECUTE, _PAYLOAD_SIZE, _64BIT);
++         }
++
++         p[dw++] = host_mthd_incr(NVRM_GPFIFO_SEM_ADDR_LO, 5);
++         p[dw++] = (uint32_t)ops[i].gpu_va;
++         p[dw++] = (uint32_t)(ops[i].gpu_va >> 32);
++         p[dw++] = (uint32_t)ops[i].value;
++         p[dw++] = (uint32_t)(ops[i].value >> 32);
++         p[dw++] = exec;
++      }
++
++      /* Wake CPU waiters (see nvkmd_rm_wait_value()) */
++      if (any_release) {
++         p[dw++] = host_mthd_incr(NVRM_GPFIFO_NON_STALL_INTERRUPT, 1);
++         p[dw++] = 0;
++      }
++
++      result = push_gpfifo_entry(ctx, log_obj,
++                                 ctx->push_slots_va +
++                                 slot * NVKMD_RM_PUSH_SLOT_B,
++                                 dw * 4, false);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++emit_pending_waits(struct nvkmd_rm_exec_ctx *ctx,
++                   struct vk_object_base *log_obj)
++{
++   if (ctx->pending_op_count == 0)
++      return VK_SUCCESS;
++
++   /* Clear first: emitting may flush, which emits pending waits */
++   struct nvkmd_rm_sem_op ops[NVKMD_RM_MAX_PENDING_OPS];
++   const uint32_t op_count = ctx->pending_op_count;
++   memcpy(ops, ctx->pending_ops, op_count * sizeof(ops[0]));
++   ctx->pending_op_count = 0;
++
++   return emit_sem_ops(ctx, log_obj, op_count, ops);
++}
++
++static VkResult
++nvkmd_rm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
++                        struct vk_object_base *log_obj)
++{
++   struct nvkmd_rm_exec_ctx *ctx = nvkmd_rm_exec_ctx(_ctx);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_ctx->dev);
++
++   VkResult result = emit_pending_waits(ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   if (ctx->kicked_put != ctx->put) {
++      /* GPFIFO entries (and push slots) before GP_PUT, GP_PUT before the
++       * doorbell.
++       */
++      __atomic_thread_fence(__ATOMIC_SEQ_CST);
++      ctx->userd[NVRM_USERD_GP_PUT / 4] = ctx->put;
++      __atomic_thread_fence(__ATOMIC_SEQ_CST);
++
++      volatile uint32_t *doorbell =
++         (volatile uint32_t *)((uint8_t *)dev->usermode_map +
++                               NVC361_NOTIFY_CHANNEL_PENDING);
++      *doorbell = ctx->work_submit_token;
++
++      ctx->kicked_put = ctx->put;
++   }
++
++   return check_channel_error(ctx, log_obj);
++}
++
++static VkResult
++nvkmd_rm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
++                       struct vk_object_base *log_obj,
++                       uint32_t exec_count,
++                       const struct nvkmd_ctx_exec *execs)
++{
++   struct nvkmd_rm_exec_ctx *ctx = nvkmd_rm_exec_ctx(_ctx);
++
++   VkResult result = emit_pending_waits(ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* All entries of a submit are written before GP_PUT moves, so an
++    * "incomplete" push is simply followed by the next entry.
++    */
++   for (uint32_t i = 0; i < exec_count; i++) {
++      result = push_gpfifo_entry(ctx, log_obj, execs[i].addr,
++                                 execs[i].size_B, execs[i].no_prefetch);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_rm_exec_ctx_wait(struct nvkmd_ctx *_ctx,
++                       struct vk_object_base *log_obj,
++                       uint32_t wait_count,
++                       const struct vk_sync_wait *waits)
++{
++   if (wait_count == 0)
++      return VK_SUCCESS;
++
++   return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
++                    "NVK on RM: syncs are not implemented yet");
++}
++
++static VkResult
++nvkmd_rm_exec_ctx_signal(struct nvkmd_ctx *_ctx,
++                         struct vk_object_base *log_obj,
++                         uint32_t signal_count,
++                         const struct vk_sync_signal *signals)
++{
++   if (signal_count > 0) {
++      return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
++                       "NVK on RM: syncs are not implemented yet");
++   }
++
++   return nvkmd_rm_exec_ctx_flush(_ctx, log_obj);
++}
++
++static VkResult
++nvkmd_rm_exec_ctx_sync(struct nvkmd_ctx *_ctx,
++                       struct vk_object_base *log_obj)
++{
++   struct nvkmd_rm_exec_ctx *ctx = nvkmd_rm_exec_ctx(_ctx);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_ctx->dev);
++   VkResult result;
++
++   const struct nvkmd_rm_sem_op op = {
++      .gpu_va = ctx->ctx_sema_va,
++      .value = ++ctx->ctx_seqno,
++      .release = true,
++   };
++   result = emit_pending_waits(ctx, log_obj);
++   if (result == VK_SUCCESS)
++      result = emit_sem_ops(ctx, log_obj, 1, &op);
++   if (result == VK_SUCCESS)
++      result = nvkmd_rm_exec_ctx_flush(&ctx->base, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   while (true) {
++      result = nvkmd_rm_wait_value(dev, ctx->ctx_sema, op.value,
++                                   os_time_get_absolute_timeout(
++                                      100 * 1000 * 1000));
++      if (result == VK_SUCCESS)
++         break;
++      if (result != VK_TIMEOUT)
++         return result;
++
++      /* Still running: make sure the channel didn't die */
++      result = check_channel_error(ctx, log_obj);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   return check_channel_error(ctx, log_obj);
++}
++
++static void
++nvkmd_rm_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
++{
++   struct nvkmd_rm_exec_ctx *ctx = nvkmd_rm_exec_ctx(_ctx);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_ctx->dev);
++   const struct nvkmd_rm_lib *lib = dev->lib;
++
++   /* Freeing the TSG frees the channel and the engine objects under it */
++   if (ctx->h_tsg != 0) {
++      NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS sched = { .bEnable = false };
++      lib->control(dev->client, ctx->h_tsg, NVA06C_CTRL_CMD_GPFIFO_SCHEDULE,
++                   &sched, sizeof(sched));
++      lib->free(dev->client, dev->h_device, ctx->h_tsg);
++   }
++
++   if (ctx->ctl_mem != NULL)
++      nvkmd_mem_unref(ctx->ctl_mem);
++   if (ctx->ring_mem != NULL)
++      nvkmd_mem_unref(ctx->ring_mem);
++
++   FREE(ctx);
++}
++
++static VkResult
++alloc_engine_object(struct nvkmd_rm_exec_ctx *ctx,
++                    struct vk_object_base *log_obj,
++                    uint32_t cls, const char *what)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(ctx->base.dev);
++   const struct nvkmd_rm_lib *lib = dev->lib;
++
++   assert(ctx->object_count < ARRAY_SIZE(ctx->h_objects));
++   uint32_t *h = &ctx->h_objects[ctx->object_count];
++
++   /* Parameters are optional for all three; RM allocates the GR context
++    * buffers (mapped into our VA space's internal range) for 3D/compute,
++    * and picks the GR copy engine for the copy object.
++    */
++   VkResult result =
++      NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                     lib->alloc(dev->client, ctx->h_channel, h, cls, NULL, 0),
++                     what);
++   if (result == VK_SUCCESS)
++      ctx->object_count++;
++
++   return result;
++}
++
++static VkResult
++nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
++                         struct vk_object_base *log_obj,
++                         enum nvkmd_engines engines,
++                         struct nvkmd_ctx **ctx_out)
++{
++   const struct nvkmd_rm_lib *lib = dev->lib;
++   const struct nv_device_info *info = &dev->base.pdev->dev_info;
++   VkResult result;
++   void *map;
++
++   struct nvkmd_rm_exec_ctx *ctx = CALLOC_STRUCT(nvkmd_rm_exec_ctx);
++   if (ctx == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   ctx->base.ops = &nvkmd_rm_exec_ctx_ops;
++   ctx->base.dev = &dev->base;
++
++   /* GPFIFO ring, push slots and the context semaphore: GPU-read system
++    * memory (our own pages).
++    */
++   result = nvkmd_dev_alloc_mapped_mem(&dev->base, log_obj,
++                                       NVKMD_RM_RING_SIZE, 0,
++                                       NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR,
++                                       &ctx->ring_mem);
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   map = ctx->ring_mem->map;
++   memset(map, 0, NVKMD_RM_RING_SIZE);
++   ctx->gpfifo = (uint64_t *)((uint8_t *)map + NVKMD_RM_RING_GPFIFO_OFFSET);
++   ctx->gpfifo_va = ctx->ring_mem->va->addr + NVKMD_RM_RING_GPFIFO_OFFSET;
++   ctx->push_slots = (uint32_t *)((uint8_t *)map + NVKMD_RM_RING_PUSH_OFFSET);
++   ctx->push_slots_va = ctx->ring_mem->va->addr + NVKMD_RM_RING_PUSH_OFFSET;
++   ctx->ctx_sema = (volatile uint64_t *)((uint8_t *)map + NVKMD_RM_RING_SEMA_OFFSET);
++   ctx->ctx_sema_va = ctx->ring_mem->va->addr + NVKMD_RM_RING_SEMA_OFFSET;
++
++   /* Error notifier and USERD.  RM writes the notifier and the GPU writes
++    * GP_GET; we read both and write GP_PUT.  This uses RM-allocated system
++    * memory, which is what NVIDIA's own channel code does.
++    */
++   result = nvkmd_dev_alloc_mapped_mem(&dev->base, log_obj,
++                                       NVKMD_RM_CTL_SIZE, 0,
++                                       NVKMD_MEM_GART |
++                                       NVKMD_RM_MEM_RM_SYSMEM,
++                                       NVKMD_MEM_MAP_RDWR, &ctx->ctl_mem);
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   map = ctx->ctl_mem->map;
++   memset(map, 0, NVKMD_RM_CTL_SIZE);
++   ctx->notifiers = (volatile NvNotification *)((uint8_t *)map + NVKMD_RM_CTL_NOTIFIER_OFFSET);
++   ctx->userd = (volatile uint32_t *)((uint8_t *)map + NVKMD_RM_CTL_USERD_OFFSET);
++   const uint32_t h_ctl = nvkmd_rm_mem(ctx->ctl_mem)->h_memory;
++
++   NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS tsg_params = {
++      .hVASpace = dev->h_vaspace,
++      .engineType = NV2080_ENGINE_TYPE_GRAPHICS,
++   };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->alloc(dev->client, dev->h_device, &ctx->h_tsg,
++                                      KEPLER_CHANNEL_GROUP_A,
++                                      &tsg_params, sizeof(tsg_params)),
++                           "alloc KEPLER_CHANNEL_GROUP_A");
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   NV_CTXSHARE_ALLOCATION_PARAMETERS ctxshare_params = {
++      .hVASpace = dev->h_vaspace,
++      .flags = NVRM_DEF(_CTXSHARE, _ALLOCATION_FLAGS, _SUBCONTEXT, _ASYNC),
++   };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->alloc(dev->client, ctx->h_tsg,
++                                      &ctx->h_ctxshare, FERMI_CONTEXT_SHARE_A,
++                                      &ctxshare_params,
++                                      sizeof(ctxshare_params)),
++                           "alloc FERMI_CONTEXT_SHARE_A");
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   NV_CHANNEL_ALLOC_PARAMS chan_params = {
++      .hObjectError = h_ctl,
++      .gpFifoOffset = ctx->gpfifo_va,
++      .gpFifoEntries = NVKMD_RM_GPFIFO_ENTRIES,
++      .hContextShare = ctx->h_ctxshare,
++      .hUserdMemory = { h_ctl },
++      .userdOffset = { NVKMD_RM_CTL_USERD_OFFSET },
++      .engineType = NV2080_ENGINE_TYPE_GRAPHICS,
++   };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->alloc(dev->client, ctx->h_tsg,
++                                      &ctx->h_channel, info->cls_gpfifo,
++                                      &chan_params, sizeof(chan_params)),
++                           "alloc GPFIFO channel");
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   if (engines & NVKMD_ENGINE_3D) {
++      result = alloc_engine_object(ctx, log_obj, info->cls_eng3d,
++                                   "alloc 3D object");
++      if (result != VK_SUCCESS)
++         goto fail;
++   }
++   if (engines & NVKMD_ENGINE_COMPUTE) {
++      result = alloc_engine_object(ctx, log_obj, info->cls_compute,
++                                   "alloc compute object");
++      if (result != VK_SUCCESS)
++         goto fail;
++   }
++   if (engines & NVKMD_ENGINE_COPY) {
++      result = alloc_engine_object(ctx, log_obj, info->cls_copy,
++                                   "alloc copy object");
++      if (result != VK_SUCCESS)
++         goto fail;
++   }
++
++   /* RM writes the token into this notifier too; we use the control */
++   NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS notif_params = {
++      .index = NV_CHANNELGPFIFO_NOTIFICATION_TYPE__SIZE_1,
++   };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->control(dev->client, ctx->h_channel,
++                              NVC36F_CTRL_CMD_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX,
++                              &notif_params, sizeof(notif_params)),
++                           "SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX");
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS token = { 0 };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->control(dev->client, ctx->h_channel,
++                              NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN,
++                              &token, sizeof(token)),
++                           "GET_WORK_SUBMIT_TOKEN");
++   if (result != VK_SUCCESS)
++      goto fail;
++   ctx->work_submit_token = token.workSubmitToken;
++
++   NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS sched = { .bEnable = true };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->control(dev->client, ctx->h_tsg,
++                                        NVA06C_CTRL_CMD_GPFIFO_SCHEDULE,
++                                        &sched, sizeof(sched)),
++                           "GPFIFO_SCHEDULE");
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   ctx->put = ctx->kicked_put = 0;
++
++   *ctx_out = &ctx->base;
++
++   return VK_SUCCESS;
++
++fail:
++   nvkmd_rm_exec_ctx_destroy(&ctx->base);
++   return result;
++}
++
++const struct nvkmd_ctx_ops nvkmd_rm_exec_ctx_ops = {
++   .destroy = nvkmd_rm_exec_ctx_destroy,
++   .wait = nvkmd_rm_exec_ctx_wait,
++   .exec = nvkmd_rm_exec_ctx_exec,
++   .signal = nvkmd_rm_exec_ctx_signal,
++   .flush = nvkmd_rm_exec_ctx_flush,
++   .sync = nvkmd_rm_exec_ctx_sync,
++};
++
++/*
++ * Bind contexts
++ *
++ * RM has no queue for VA updates: wait for the syncs on the CPU, map and
++ * unmap synchronously, then signal on the CPU.
++ */
++
++static void
++nvkmd_rm_bind_ctx_destroy(struct nvkmd_ctx *_ctx)
++{
++   FREE(nvkmd_rm_bind_ctx(_ctx));
++}
++
++static VkResult
++nvkmd_rm_bind_ctx_wait(struct nvkmd_ctx *_ctx,
++                       struct vk_object_base *log_obj,
++                       uint32_t wait_count,
++                       const struct vk_sync_wait *waits)
++{
++   if (wait_count == 0)
++      return VK_SUCCESS;
++
++   return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
++                    "NVK on RM: syncs are not implemented yet");
++}
++
++static VkResult
++nvkmd_rm_bind_ctx_bind(struct nvkmd_ctx *_ctx,
++                       struct vk_object_base *log_obj,
++                       uint32_t bind_count,
++                       const struct nvkmd_ctx_bind *binds)
++{
++   for (uint32_t i = 0; i < bind_count; i++) {
++      VkResult result;
++      if (binds[i].op == NVKMD_BIND_OP_BIND) {
++         result = binds[i].va->ops->bind_mem(binds[i].va, log_obj,
++                                             binds[i].va_offset_B,
++                                             binds[i].mem,
++                                             binds[i].mem_offset_B,
++                                             binds[i].range_B);
++      } else {
++         result = binds[i].va->ops->unbind(binds[i].va, log_obj,
++                                           binds[i].va_offset_B,
++                                           binds[i].range_B);
++      }
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_rm_bind_ctx_signal(struct nvkmd_ctx *_ctx,
++                         struct vk_object_base *log_obj,
++                         uint32_t signal_count,
++                         const struct vk_sync_signal *signals)
++{
++   if (signal_count == 0)
++      return VK_SUCCESS;
++
++   return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
++                    "NVK on RM: syncs are not implemented yet");
++}
++
++static VkResult
++nvkmd_rm_bind_ctx_flush(struct nvkmd_ctx *ctx,
++                        struct vk_object_base *log_obj)
++{
++   return VK_SUCCESS;
++}
++
++const struct nvkmd_ctx_ops nvkmd_rm_bind_ctx_ops = {
++   .destroy = nvkmd_rm_bind_ctx_destroy,
++   .wait = nvkmd_rm_bind_ctx_wait,
++   .bind = nvkmd_rm_bind_ctx_bind,
++   .signal = nvkmd_rm_bind_ctx_signal,
++   .flush = nvkmd_rm_bind_ctx_flush,
++};
++
++VkResult
++nvkmd_rm_create_ctx(struct nvkmd_dev *_dev,
++                    struct vk_object_base *log_obj,
++                    enum nvkmd_engines engines,
++                    struct nvkmd_ctx **ctx_out)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++
++   if (engines == NVKMD_ENGINE_BIND) {
++      struct nvkmd_rm_bind_ctx *ctx = CALLOC_STRUCT(nvkmd_rm_bind_ctx);
++      if (ctx == NULL)
++         return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++      ctx->base.ops = &nvkmd_rm_bind_ctx_ops;
++      ctx->base.dev = &dev->base;
++      *ctx_out = &ctx->base;
++      return VK_SUCCESS;
++   }
++
++   assert(!(engines & NVKMD_ENGINE_BIND));
++   if (engines & NVKMD_ENGINE_VDEC)
++      return vk_error(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
++
++   return nvkmd_rm_create_exec_ctx(dev, log_obj, engines, ctx_out);
++}
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 77565b9..0169448 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -6,8 +6,12 @@
+ #include "nvkmd_rm.h"
+ 
+ #include "util/log.h"
++#include "util/os_time.h"
++#include "util/u_math.h"
+ #include "vk_log.h"
+ 
++#include <poll.h>
++#include <sched.h>
+ #include <unistd.h>
+ 
+ static VkResult
+@@ -248,14 +252,66 @@ nvkmd_rm_dev_get_gpu_timestamp(struct nvkmd_dev *_dev)
+    return params.time_nsec;
+ }
+ 
+-static VkResult
+-nvkmd_rm_create_ctx_stub(struct nvkmd_dev *dev,
+-                         struct vk_object_base *log_obj,
+-                         enum nvkmd_engines engines,
+-                         struct nvkmd_ctx **ctx_out)
++/*
++ * CPU waits
++ *
++ * Spin briefly, then block in poll() on the non-stall interrupt event (the
++ * pushbuffer raises one after each semaphore release), or sleep with
++ * backoff if there is no event.  The value in memory is always what
++ * decides; the event is only a wakeup, so a missed or spurious one costs at
++ * most one poll timeout.
++ */
++#define NVKMD_RM_WAIT_SPIN_ITERS 64
++#define NVKMD_RM_WAIT_POLL_MS    10
++
++VkResult
++nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
++                   uint64_t abs_timeout_ns)
+ {
+-   return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
+-                    "NVK on RM: contexts are not implemented yet");
++   const uint64_t now = os_time_get_nano();
++   if (now >= abs_timeout_ns)
++      return VK_TIMEOUT;
++
++   const uint64_t remaining_ns = abs_timeout_ns - now;
++
++   if (*iter < NVKMD_RM_WAIT_SPIN_ITERS) {
++      sched_yield();
++   } else if (dev != NULL && dev->nonstall_fd >= 0) {
++      const int ms = MIN2(remaining_ns / 1000000 + 1, NVKMD_RM_WAIT_POLL_MS);
++      struct pollfd pfd = {
++         .fd = dev->nonstall_fd,
++         .events = POLLIN,
++      };
++      if (poll(&pfd, 1, ms) > 0 && dev->lib->event_drain != NULL) {
++         /* Best effort: event data may not be readable (Conduit guests) */
++         struct crm_event_data data[8];
++         dev->lib->event_drain(dev->client, dev->nonstall_fd,
++                               data, ARRAY_SIZE(data));
++      }
++   } else {
++      const uint64_t us = *iter < 4 * NVKMD_RM_WAIT_SPIN_ITERS ? 10 : 200;
++      os_time_sleep(MIN2(us, remaining_ns / 1000 + 1));
++   }
++
++   (*iter)++;
++
++   return VK_SUCCESS;
++}
++
++VkResult
++nvkmd_rm_wait_value(struct nvkmd_rm_dev *dev,
++                    volatile uint64_t *value, uint64_t wait_value,
++                    uint64_t abs_timeout_ns)
++{
++   uint32_t iter = 0;
++   while (true) {
++      if (p_atomic_read(value) >= wait_value)
++         return VK_SUCCESS;
++
++      VkResult result = nvkmd_rm_wait_step(dev, &iter, abs_timeout_ns);
++      if (result != VK_SUCCESS)
++         return result;
++   }
+ }
+ 
+ const struct nvkmd_dev_ops nvkmd_rm_dev_ops = {
+@@ -265,5 +321,5 @@ const struct nvkmd_dev_ops nvkmd_rm_dev_ops = {
+    .alloc_tiled_mem = nvkmd_rm_alloc_tiled_mem,
+    .import_dma_buf = nvkmd_rm_import_dma_buf,
+    .alloc_va = nvkmd_rm_alloc_va,
+-   .create_ctx = nvkmd_rm_create_ctx_stub,
++   .create_ctx = nvkmd_rm_create_ctx,
+ };
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 88e4fdb..1a05fc2 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -155,6 +155,9 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    const struct nv_device_info *dev_info = &dev->base.pdev->dev_info;
+    VkResult result;
+ 
++   const bool force_rm_sysmem = flags & NVKMD_RM_MEM_RM_SYSMEM;
++   flags &= ~NVKMD_RM_MEM_RM_SYSMEM;
++
+    /* has_alloc_tiled is false: kinds are applied per mapping instead */
+    assert(pte_kind == 0 && tile_mode == 0);
+ 
+@@ -186,10 +189,14 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+       result = alloc_rm_memory(dev, log_obj, true, size_B, align_B,
+                                flags & NVKMD_MEM_CAN_MAP, &mem->h_memory);
+    } else {
+-      result = alloc_os_pages(dev, log_obj, size_B,
+-                              &mem->h_memory, &mem->os_pages);
++      result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      if (!force_rm_sysmem) {
++         result = alloc_os_pages(dev, log_obj, size_B,
++                                 &mem->h_memory, &mem->os_pages);
++      }
+       if (result != VK_SUCCESS) {
+-         mesa_logd("NVK: OS-descriptor memory failed, using RM sysmem");
++         if (!force_rm_sysmem)
++            mesa_logd("NVK: OS-descriptor memory failed, using RM sysmem");
+          result = alloc_rm_memory(dev, log_obj, false, size_B, align_B,
+                                   flags & NVKMD_MEM_CAN_MAP, &mem->h_memory);
+       }
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index ed85c95..028c378 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -355,6 +355,7 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+    pdev->base.drm.render_dev = 0;
+    pdev->base.drm.primary_dev = 0;
+ 
++   /* No sync types yet */
+    pdev->sync_types[0] = NULL;
+    pdev->base.sync_types = pdev->sync_types;
+ 
+-- 
+2.43.0
+

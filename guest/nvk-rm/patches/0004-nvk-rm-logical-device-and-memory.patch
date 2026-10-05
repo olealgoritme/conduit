@@ -1,0 +1,728 @@
+From c56e7de11802fcecfbe2a2586c683d0f30e75be6 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 5 Oct 2026 21:23:55 +0200
+Subject: [PATCH 4/7] nvk/rm: logical device and memory
+
+Each nvkmd_rm_dev opens its own RM client with its own NV01_DEVICE_0 and
+NV20_SUBDEVICE_0, and sets up:
+
+  - a FERMI_VASPACE_A (64 KiB big pages) with VA_INTERNAL_LIMIT, so RM's
+    internal mappings stay in [4 GiB, 4.5 GiB), which is carved out of
+    NVK's VA heap,
+  - the usermode doorbell region (VOLTA..BLACKWELL_USERMODE_A, BAR1,
+    write-only) mapped through the subdevice,
+  - if librmclient has crm_event_open, an OS event on the FIFO non-stall
+    interrupt (without event data, the payload is not needed and Conduit
+    guests cannot read it), for CPU waits later,
+  - the GPU timestamp via NV2080_CTRL_CMD_TIMER_GET_TIME.
+
+Memory:
+  - CPU-mappable and GART memory is our own anonymous pages wrapped in
+    NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: the CPU map is the allocation
+    itself.  RM-allocated NV01_MEMORY_SYSTEM is the fallback.
+  - Device-local memory is NV01_MEMORY_LOCAL_USER with 64 KiB pages.
+  - Explicit VRAM | CAN_MAP is mapped through BAR1 with crm_map_memory.
+  - All memory is coherent; no dma-buf, tiled BOs, fixed maps or
+    overmaps.
+
+GPU VA and contexts are still stubs.
+
+---
+ src/nouveau/vulkan/meson.build              |   1 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |   1 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  | 267 ++++++++++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c  | 362 ++++++++++++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h |   1 +
+ 5 files changed, 630 insertions(+), 2 deletions(-)
+ create mode 100644 src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+
+diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
+index 2d73477..8e85081 100644
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -293,6 +293,7 @@ if not get_option('nvk-rm').disabled()
+     'nvkmd/rm/nvkmd_rm.h',
+     'nvkmd/rm/nvkmd_rm_dev.c',
+     'nvkmd/rm/nvkmd_rm_lib.c',
++    'nvkmd/rm/nvkmd_rm_mem.c',
+     'nvkmd/rm/nvkmd_rm_pdev.c',
+     'nvkmd/rm/nvrm/nvrm_api.h',
+   )
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 1775869..980004f 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -11,6 +11,7 @@
+ 
+ #include "nvkmd/nvkmd.h"
+ #include "util/u_dynarray.h"
++#include "util/u_memory.h"
+ #include "util/vma.h"
+ #include "vk_sync.h"
+ #include "vk_sync_binary.h"
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index ce58219..12d7020 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -5,13 +5,276 @@
+ 
+ #include "nvkmd_rm.h"
+ 
++#include "util/log.h"
+ #include "vk_log.h"
+ 
++#include <unistd.h>
++
++static VkResult
++nvkmd_rm_dev_init_usermode(struct nvkmd_rm_dev *dev,
++                           struct nvkmd_rm_pdev *pdev,
++                           struct vk_object_base *log_obj)
++{
++   const struct nvkmd_rm_lib *lib = dev->lib;
++   VkResult result;
++
++   /* Hopper+ usermode takes parameters.  The BAR1 mapping is write-only,
++    * which is all the doorbell needs.  bPriv needs kernel privilege.
++    */
++   NV_HOPPER_USERMODE_A_PARAMS hopper_params = {
++      .bBar1Mapping = true,
++      .bPriv = false,
++   };
++   void *params = NULL;
++   uint32_t params_size = 0;
++   if (pdev->cls_usermode >= NVRM_HOPPER_USERMODE_A) {
++      params = &hopper_params;
++      params_size = sizeof(hopper_params);
++   }
++
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->alloc(dev->client, dev->h_subdevice,
++                                      &dev->h_usermode, pdev->cls_usermode,
++                                      params, params_size),
++                           "alloc usermode");
++   if (result != VK_SUCCESS)
++      return result;
++
++   return NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                         lib->map_memory(dev->client, dev->h_subdevice,
++                                         dev->h_usermode, 0,
++                                         NVC361_NV_USERMODE__SIZE,
++                                         NVRM_DEF(OS33, _FLAGS, _ACCESS,
++                                                  _WRITE_ONLY),
++                                         &dev->usermode_map),
++                         "map usermode");
++}
++
++/* Sets up an OS event that fires on non-stall interrupts, which the
++ * pushbuffer raises after every semaphore release.  CPU waits poll() it
++ * instead of spinning.  This is optional: without it, waits poll memory.
++ *
++ * The event is created without event data: under Conduit the guest cannot
++ * read event payloads (NV_ESC_RM_GET_EVENT_DATA is refused), and we only
++ * need the wakeup.  The semaphore value in memory is the source of truth.
++ */
++static void
++nvkmd_rm_dev_init_nonstall_event(struct nvkmd_rm_dev *dev)
++{
++   const struct nvkmd_rm_lib *lib = dev->lib;
++
++   dev->nonstall_fd = -1;
++
++   if (lib->event_open == NULL)
++      return;
++
++   const uint32_t notify = NV2080_NOTIFIERS_FIFO_EVENT_MTHD |
++                           NV01_EVENT_NONSTALL_INTR |
++                           NV01_EVENT_WITHOUT_EVENT_DATA;
++   int fd = -1;
++   int ret = lib->event_open(dev->client, dev->h_subdevice, notify,
++                             &dev->h_nonstall_event, &fd);
++   if (ret != 0) {
++      mesa_logd("NVK: RM non-stall event unavailable (%s), CPU waits "
++                "will poll", lib->status_name(ret));
++      return;
++   }
++
++   NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS notif = {
++      .event = NV2080_NOTIFIERS_FIFO_EVENT_MTHD,
++      .action = NV2080_CTRL_EVENT_SET_NOTIFICATION_ACTION_REPEAT,
++   };
++   ret = lib->control(dev->client, dev->h_subdevice,
++                      NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION,
++                      &notif, sizeof(notif));
++   if (ret != 0) {
++      mesa_logd("NVK: EVENT_SET_NOTIFICATION failed (%s), CPU waits "
++                "will poll", lib->status_name(ret));
++      if (lib->event_close != NULL)
++         lib->event_close(dev->client, dev->h_nonstall_event, fd);
++      dev->h_nonstall_event = 0;
++      return;
++   }
++
++   dev->nonstall_fd = fd;
++}
++
+ VkResult
+-nvkmd_rm_create_dev(struct nvkmd_pdev *pdev,
++nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+                     struct vk_object_base *log_obj,
+                     struct nvkmd_dev **dev_out)
++{
++   struct nvkmd_rm_pdev *pdev = nvkmd_rm_pdev(_pdev);
++   const struct nvkmd_rm_lib *lib = pdev->lib;
++   VkResult result;
++
++   struct nvkmd_rm_dev *dev = CALLOC_STRUCT(nvkmd_rm_dev);
++   if (dev == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   dev->base.ops = &nvkmd_rm_dev_ops;
++   dev->base.pdev = &pdev->base;
++   dev->base.va_start = NVKMD_RM_HEAP_START;
++   dev->base.va_end = NVKMD_RM_REPLAY_HEAP_END;
++   dev->lib = lib;
++   dev->nonstall_fd = -1;
++
++   list_inithead(&dev->base.mems);
++   simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
++
++   /* Each logical device gets its own RM client, like each nouveau device
++    * gets its own DRM fd.
++    */
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->open(&dev->client, NULL), "crm_open");
++   if (result != VK_SUCCESS)
++      goto fail_alloc;
++
++   NV0080_ALLOC_PARAMETERS dev_params = {
++      .deviceId = pdev->device_instance,
++      .hClientShare = lib->root(dev->client),
++   };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->alloc(dev->client, lib->root(dev->client),
++                                      &dev->h_device, NV01_DEVICE_0,
++                                      &dev_params, sizeof(dev_params)),
++                           "alloc NV01_DEVICE_0");
++   if (result != VK_SUCCESS)
++      goto fail_client;
++
++   NV2080_ALLOC_PARAMETERS subdev_params = {
++      .subDeviceId = pdev->subdevice_instance,
++   };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->alloc(dev->client, dev->h_device,
++                                      &dev->h_subdevice, NV20_SUBDEVICE_0,
++                                      &subdev_params, sizeof(subdev_params)),
++                           "alloc NV20_SUBDEVICE_0");
++   if (result != VK_SUCCESS)
++      goto fail_client;
++
++   /* One GPU VA space per device.  VA_INTERNAL_LIMIT keeps RM's own
++    * mappings (GR context buffers etc.) in [4 GiB, 4.5 GiB), which our heap
++    * leaves alone.
++    */
++   NV_VASPACE_ALLOCATION_PARAMETERS vas_params = {
++      .index = 0,
++      .flags = NV_VASPACE_ALLOCATION_FLAGS_VA_INTERNAL_LIMIT,
++      .bigPageSize = NVKMD_RM_BIG_PAGE_SIZE,
++   };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                           lib->alloc(dev->client, dev->h_device,
++                                      &dev->h_vaspace, FERMI_VASPACE_A,
++                                      &vas_params, sizeof(vas_params)),
++                           "alloc FERMI_VASPACE_A");
++   if (result != VK_SUCCESS)
++      goto fail_client;
++
++   result = nvkmd_rm_dev_init_usermode(dev, pdev, log_obj);
++   if (result != VK_SUCCESS)
++      goto fail_client;
++
++   nvkmd_rm_dev_init_nonstall_event(dev);
++
++   simple_mtx_init(&dev->heap_mutex, mtx_plain);
++
++   STATIC_ASSERT(NVKMD_RM_HEAP_START < NVKMD_RM_INTERNAL_START);
++   STATIC_ASSERT(NVKMD_RM_INTERNAL_END < NVKMD_RM_HEAP_END);
++   util_vma_heap_init(&dev->heap, NVKMD_RM_HEAP_START,
++                      NVKMD_RM_HEAP_END - NVKMD_RM_HEAP_START);
++   ASSERTED bool carved =
++      util_vma_heap_alloc_addr(&dev->heap, NVKMD_RM_INTERNAL_START,
++                               NVKMD_RM_INTERNAL_END -
++                               NVKMD_RM_INTERNAL_START);
++   assert(carved);
++
++   util_vma_heap_init(&dev->replay_heap, NVKMD_RM_REPLAY_HEAP_START,
++                      NVKMD_RM_REPLAY_HEAP_END - NVKMD_RM_REPLAY_HEAP_START);
++
++   *dev_out = &dev->base;
++
++   return VK_SUCCESS;
++
++fail_client:
++   if (dev->usermode_map != NULL) {
++      lib->unmap_memory(dev->client, dev->h_subdevice, dev->h_usermode,
++                        dev->usermode_map, NVC361_NV_USERMODE__SIZE, 0);
++   }
++   lib->close(dev->client);
++fail_alloc:
++   simple_mtx_destroy(&dev->base.mems_mutex);
++   FREE(dev);
++
++   return result;
++}
++
++static void
++nvkmd_rm_dev_destroy(struct nvkmd_dev *_dev)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++   const struct nvkmd_rm_lib *lib = dev->lib;
++
++   util_vma_heap_finish(&dev->heap);
++   util_vma_heap_finish(&dev->replay_heap);
++   simple_mtx_destroy(&dev->heap_mutex);
++
++   if (dev->nonstall_fd >= 0 && lib->event_close != NULL)
++      lib->event_close(dev->client, dev->h_nonstall_event, dev->nonstall_fd);
++
++   lib->unmap_memory(dev->client, dev->h_subdevice, dev->h_usermode,
++                     dev->usermode_map, NVC361_NV_USERMODE__SIZE, 0);
++
++   /* Closing the client frees every RM object under it */
++   lib->close(dev->client);
++
++   simple_mtx_destroy(&dev->base.mems_mutex);
++   FREE(dev);
++}
++
++static uint64_t
++nvkmd_rm_dev_get_gpu_timestamp(struct nvkmd_dev *_dev)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++
++   /* The usermode TIME_0/1 registers would avoid the round trip, but our
++    * BAR1 usermode mapping is write-only.
++    */
++   NV2080_CTRL_TIMER_GET_TIME_PARAMS params = { 0 };
++   if (dev->lib->control(dev->client, dev->h_subdevice,
++                         NV2080_CTRL_CMD_TIMER_GET_TIME,
++                         &params, sizeof(params)) != 0)
++      return 0;
++
++   return params.time_nsec;
++}
++
++static VkResult
++nvkmd_rm_alloc_va_stub(struct nvkmd_dev *dev,
++                       struct vk_object_base *log_obj,
++                       enum nvkmd_va_flags flags, uint8_t pte_kind,
++                       uint64_t size_B, uint64_t align_B,
++                       uint64_t fixed_addr, struct nvkmd_va **va_out)
++{
++   return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
++                    "NVK on RM: GPU VA is not implemented yet");
++}
++
++static VkResult
++nvkmd_rm_create_ctx_stub(struct nvkmd_dev *dev,
++                         struct vk_object_base *log_obj,
++                         enum nvkmd_engines engines,
++                         struct nvkmd_ctx **ctx_out)
+ {
+    return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
+-                    "NVK on RM: logical devices are not implemented yet");
++                    "NVK on RM: contexts are not implemented yet");
+ }
++
++const struct nvkmd_dev_ops nvkmd_rm_dev_ops = {
++   .destroy = nvkmd_rm_dev_destroy,
++   .get_gpu_timestamp = nvkmd_rm_dev_get_gpu_timestamp,
++   .alloc_mem = nvkmd_rm_alloc_mem,
++   .alloc_tiled_mem = nvkmd_rm_alloc_tiled_mem,
++   .import_dma_buf = nvkmd_rm_import_dma_buf,
++   .alloc_va = nvkmd_rm_alloc_va_stub,
++   .create_ctx = nvkmd_rm_create_ctx_stub,
++};
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+new file mode 100644
+index 0000000..88e4fdb
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -0,0 +1,362 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_rm.h"
++
++#include "util/log.h"
++#include "util/os_misc.h"
++#include "util/u_math.h"
++#include "vk_log.h"
++
++#include <sys/mman.h>
++
++/*
++ * Placement policy
++ *
++ *  - Memory the CPU may map (CAN_MAP) and GART memory is backed by our own
++ *    anonymous pages, described to RM with NV01_MEMORY_SYSTEM_OS_DESCRIPTOR.
++ *    The CPU mapping is the allocation itself: zero-copy, coherent, and
++ *    under Conduit it does not use the small host-visible window.  If RM
++ *    refuses that, fall back to RM-allocated NV01_MEMORY_SYSTEM.
++ *  - Everything else that may live in VRAM is NV01_MEMORY_LOCAL_USER with
++ *    64 KiB pages.  RM does not migrate it, so NVKMD_MEM_LOCAL means VRAM.
++ *  - VRAM which must be CPU-mapped (NVKMD_MEM_VRAM | CAN_MAP, which NVK
++ *    only asks for when has_host_visible_vram is set) goes through a BAR1
++ *    mapping from crm_map_memory.
++ */
++
++#define NVKMD_RM_SYSMEM_PAGE_SIZE (4096u)
++
++static VkResult
++alloc_os_pages(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
++               uint64_t size_B, uint32_t *h_memory_out, void **pages_out)
++{
++   const struct nvkmd_rm_lib *lib = dev->lib;
++
++   void *pages = mmap(NULL, size_B, PROT_READ | PROT_WRITE,
++                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
++   if (pages == MAP_FAILED)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   /* RM pins these pages; a child process must not get COW copies */
++   madvise(pages, size_B, MADV_DONTFORK);
++
++   NV_OS_DESC_MEMORY_ALLOCATION_PARAMS params = {
++      .type = NVOS32_TYPE_IMAGE,
++      .flags = 0,
++      .attr = NVRM_DEF(OS32, _ATTR, _LOCATION, _PCI) |
++              NVRM_DEF(OS32, _ATTR, _PAGE_SIZE, _4KB) |
++              NVRM_DEF(OS32, _ATTR, _PHYSICALITY, _NONCONTIGUOUS) |
++              NVRM_DEF(OS32, _ATTR, _COHERENCY, _CACHED),
++      .attr2 = NVRM_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _NO),
++      .descriptor = (uint64_t)(uintptr_t)pages,
++      .limit = size_B - 1,
++      .descriptorType = NVOS32_DESCRIPTOR_TYPE_VIRTUAL_ADDRESS,
++   };
++
++   uint32_t h_memory = 0;
++   int ret = lib->alloc(dev->client, dev->h_device, &h_memory,
++                        NV01_MEMORY_SYSTEM_OS_DESCRIPTOR,
++                        &params, sizeof(params));
++   if (ret != 0) {
++      munmap(pages, size_B);
++      return NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                            ret, "alloc NV01_MEMORY_SYSTEM_OS_DESCRIPTOR");
++   }
++
++   *h_memory_out = h_memory;
++   *pages_out = pages;
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++alloc_rm_memory(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
++                bool vram, uint64_t size_B, uint64_t align_B, bool can_map,
++                uint32_t *h_memory_out)
++{
++   const struct nvkmd_rm_lib *lib = dev->lib;
++
++   NV_MEMORY_ALLOCATION_PARAMS params = {
++      .owner = lib->root(dev->client),
++      .type = NVOS32_TYPE_IMAGE,
++      .flags = NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE,
++      .size = size_B,
++      .alignment = align_B,
++   };
++
++   uint32_t hclass;
++   if (vram) {
++      hclass = NV01_MEMORY_LOCAL_USER;
++      params.attr = NVRM_DEF(OS32, _ATTR, _LOCATION, _VIDMEM) |
++                    NVRM_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG) |
++                    NVRM_DEF(OS32, _ATTR, _PHYSICALITY, _ALLOW_NONCONTIGUOUS) |
++                    NVRM_DEF(OS32, _ATTR, _COMPR, _NONE);
++      params.attr2 = NVRM_DEF(OS32, _ATTR2, _ZBC, _PREFER_NO_ZBC) |
++                     NVRM_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _YES);
++      if (!can_map)
++         params.flags |= NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED;
++   } else {
++      hclass = NV01_MEMORY_SYSTEM;
++      params.attr = NVRM_DEF(OS32, _ATTR, _LOCATION, _PCI) |
++                    NVRM_DEF(OS32, _ATTR, _PAGE_SIZE, _4KB) |
++                    NVRM_DEF(OS32, _ATTR, _PHYSICALITY, _NONCONTIGUOUS) |
++                    NVRM_DEF(OS32, _ATTR, _COHERENCY, _CACHED);
++      params.attr2 = NVRM_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _NO);
++   }
++
++   uint32_t h_memory = 0;
++   VkResult result =
++      NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                     lib->alloc(dev->client, dev->h_device, &h_memory,
++                                hclass, &params, sizeof(params)),
++                     vram ? "alloc NV01_MEMORY_LOCAL_USER"
++                          : "alloc NV01_MEMORY_SYSTEM");
++   if (result != VK_SUCCESS)
++      return result;
++
++   *h_memory_out = h_memory;
++
++   return VK_SUCCESS;
++}
++
++static void
++free_rm_memory(struct nvkmd_rm_dev *dev, uint32_t h_memory)
++{
++   if (dev->lib->free_quiet != NULL)
++      dev->lib->free_quiet(dev->client, dev->h_device, h_memory);
++   else
++      dev->lib->free(dev->client, dev->h_device, h_memory);
++}
++
++VkResult
++nvkmd_rm_alloc_mem(struct nvkmd_dev *dev,
++                   struct vk_object_base *log_obj,
++                   uint64_t size_B, uint64_t align_B,
++                   enum nvkmd_mem_flags flags,
++                   struct nvkmd_mem **mem_out)
++{
++   return nvkmd_rm_alloc_tiled_mem(dev, log_obj, size_B, align_B,
++                                   0 /* pte_kind */, 0 /* tile_mode */,
++                                   flags, mem_out);
++}
++
++VkResult
++nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
++                         struct vk_object_base *log_obj,
++                         uint64_t size_B, uint64_t align_B,
++                         uint8_t pte_kind, uint16_t tile_mode,
++                         enum nvkmd_mem_flags flags,
++                         struct nvkmd_mem **mem_out)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++   const struct nv_device_info *dev_info = &dev->base.pdev->dev_info;
++   VkResult result;
++
++   /* has_alloc_tiled is false: kinds are applied per mapping instead */
++   assert(pte_kind == 0 && tile_mode == 0);
++
++   /* Only one placement flag may be specified */
++   assert(util_bitcount(flags & NVKMD_MEM_PLACEMENT_FLAGS) == 1);
++
++   bool vram;
++   if (flags & NVKMD_MEM_VRAM)
++      vram = true;
++   else if (flags & NVKMD_MEM_GART)
++      vram = false;
++   else /* NVKMD_MEM_LOCAL */
++      vram = dev_info->vram_size_B > 0 && !(flags & NVKMD_MEM_CAN_MAP);
++
++   if (dev->base.pdev->debug_flags & NVK_DEBUG_FORCE_GART)
++      vram = false;
++
++   assert(util_is_power_of_two_or_zero64(align_B));
++   const uint32_t page_size_B = vram ? NVKMD_RM_BIG_PAGE_SIZE
++                                     : NVKMD_RM_SYSMEM_PAGE_SIZE;
++   align_B = MAX2(align_B, page_size_B);
++   size_B = align64(size_B, align_B);
++
++   struct nvkmd_rm_mem *mem = CALLOC_STRUCT(nvkmd_rm_mem);
++   if (mem == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   if (vram) {
++      result = alloc_rm_memory(dev, log_obj, true, size_B, align_B,
++                               flags & NVKMD_MEM_CAN_MAP, &mem->h_memory);
++   } else {
++      result = alloc_os_pages(dev, log_obj, size_B,
++                              &mem->h_memory, &mem->os_pages);
++      if (result != VK_SUCCESS) {
++         mesa_logd("NVK: OS-descriptor memory failed, using RM sysmem");
++         result = alloc_rm_memory(dev, log_obj, false, size_B, align_B,
++                                  flags & NVKMD_MEM_CAN_MAP, &mem->h_memory);
++      }
++   }
++   if (result != VK_SUCCESS)
++      goto fail_mem;
++
++   mem->vram = vram;
++
++   /* Discrete GPU: sysmem is snooped, VRAM maps are uncached/WC */
++   flags |= NVKMD_MEM_COHERENT;
++
++   /* RM picks big pages for VRAM; system memory is mapped with 4 KiB PTEs
++    * so it may be bound at 4 KiB granularity.
++    */
++   nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_rm_mem_ops,
++                  flags, size_B, page_size_B);
++
++   enum nvkmd_va_flags va_flags = vram ? 0 : NVKMD_VA_GART;
++   result = nvkmd_dev_alloc_va(&dev->base, log_obj, va_flags, 0 /* kind */,
++                               size_B, align_B, 0 /* fixed_addr */,
++                               &mem->base.va);
++   if (result != VK_SUCCESS)
++      goto fail_rm;
++
++   result = nvkmd_va_bind_mem(mem->base.va, log_obj, 0, &mem->base,
++                              0, size_B);
++   if (result != VK_SUCCESS)
++      goto fail_va;
++
++   *mem_out = &mem->base;
++
++   return VK_SUCCESS;
++
++fail_va:
++   nvkmd_va_free(mem->base.va);
++fail_rm:
++   free_rm_memory(dev, mem->h_memory);
++   if (mem->os_pages != NULL)
++      munmap(mem->os_pages, size_B);
++fail_mem:
++   FREE(mem);
++
++   return result;
++}
++
++VkResult
++nvkmd_rm_import_dma_buf(struct nvkmd_dev *dev,
++                        struct vk_object_base *log_obj,
++                        int fd, struct nvkmd_mem **mem_out)
++{
++   /* has_dma_buf is false */
++   return vk_error(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++}
++
++static void
++nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
++{
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
++
++   /* The GPU mapping has to go before the memory object */
++   nvkmd_va_free(mem->base.va);
++
++   free_rm_memory(dev, mem->h_memory);
++   if (mem->os_pages != NULL)
++      munmap(mem->os_pages, mem->base.size_B);
++
++   FREE(mem);
++}
++
++static VkResult
++nvkmd_rm_mem_map(struct nvkmd_mem *_mem,
++                 struct vk_object_base *log_obj,
++                 enum nvkmd_mem_map_flags map_flags,
++                 void *fixed_addr,
++                 void **map_out)
++{
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
++
++   /* has_map_fixed is false */
++   if (map_flags & NVKMD_MEM_MAP_FIXED)
++      return vk_error(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
++
++   if (mem->os_pages != NULL) {
++      /* Internal and client maps alias the same pages */
++      *map_out = mem->os_pages;
++      return VK_SUCCESS;
++   }
++
++   uint32_t access;
++   if ((map_flags & NVKMD_MEM_MAP_RDWR) == NVKMD_MEM_MAP_RD)
++      access = NVRM_DEF(OS33, _FLAGS, _ACCESS, _READ_ONLY);
++   else if ((map_flags & NVKMD_MEM_MAP_RDWR) == NVKMD_MEM_MAP_WR)
++      access = NVRM_DEF(OS33, _FLAGS, _ACCESS, _WRITE_ONLY);
++   else
++      access = NVRM_DEF(OS33, _FLAGS, _ACCESS, _READ_WRITE);
++
++   void *map = NULL;
++   VkResult result =
++      NVKMD_RM_CHECK(dev->lib, log_obj, VK_ERROR_MEMORY_MAP_FAILED,
++                     dev->lib->map_memory(dev->client, dev->h_device,
++                                          mem->h_memory, 0,
++                                          mem->base.size_B, access, &map),
++                     "map memory");
++   if (result != VK_SUCCESS)
++      return result;
++
++   *map_out = map;
++
++   return VK_SUCCESS;
++}
++
++static void
++nvkmd_rm_mem_unmap(struct nvkmd_mem *_mem,
++                   enum nvkmd_mem_map_flags flags,
++                   void *map)
++{
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
++
++   if (mem->os_pages != NULL)
++      return;
++
++   dev->lib->unmap_memory(dev->client, dev->h_device, mem->h_memory,
++                          map, mem->base.size_B, 0);
++}
++
++static VkResult
++nvkmd_rm_mem_overmap(struct nvkmd_mem *mem,
++                     struct vk_object_base *log_obj,
++                     enum nvkmd_mem_map_flags flags,
++                     void *map)
++{
++   /* has_overmap is false */
++   return vk_error(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
++}
++
++static VkResult
++nvkmd_rm_mem_export_dma_buf(struct nvkmd_mem *mem,
++                            struct vk_object_base *log_obj,
++                            int *fd_out)
++{
++   /* has_dma_buf is false */
++   return vk_error(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
++}
++
++static void
++nvkmd_rm_mem_sync(struct nvkmd_mem *mem, uint64_t offset_B, uint64_t range_B)
++{
++   /* All memory is NVKMD_MEM_COHERENT; nothing to do */
++}
++
++static uint32_t
++nvkmd_rm_mem_log_handle(struct nvkmd_mem *mem)
++{
++   return nvkmd_rm_mem(mem)->h_memory;
++}
++
++const struct nvkmd_mem_ops nvkmd_rm_mem_ops = {
++   .free = nvkmd_rm_mem_free,
++   .map = nvkmd_rm_mem_map,
++   .unmap = nvkmd_rm_mem_unmap,
++   .overmap = nvkmd_rm_mem_overmap,
++   .sync_to_gpu = nvkmd_rm_mem_sync,
++   .sync_from_gpu = nvkmd_rm_mem_sync,
++   .export_dma_buf = nvkmd_rm_mem_export_dma_buf,
++   .log_handle = nvkmd_rm_mem_log_handle,
++};
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+index 0ef6db5..e284dc0 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -99,6 +99,7 @@ typedef NvU32 NvHandle;
+ /*
+  * nvos.h
+  */
++#define NV01_EVENT_WITHOUT_EVENT_DATA             (0x10000000)
+ #define NV01_EVENT_NONSTALL_INTR                  (0x08000000)
+ 
+ #define NVOS32_TYPE_IMAGE                         0
+-- 
+2.43.0
+
