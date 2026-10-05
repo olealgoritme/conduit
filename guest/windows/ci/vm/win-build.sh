@@ -34,17 +34,41 @@ for sub in dxvk vkd3d-proton; do
 done
 
 echo "==> copying guest/windows to $root\\src"
-# Copied over the previous tree, not into an empty one, so cargo's target
-# directories survive and a driver-only change rebuilds only what changed.
-# CLEAN=1 wipes it first (and rebuilds DXVK and vkd3d too).
-if [ "${CLEAN:-0}" = 1 ]; then
-    ssh_win "if (Test-Path $root\\src\\guest) { Remove-Item -Recurse -Force $root\\src\\guest }"
+# Incremental by default: only files whose content changed since the last
+# copy from this checkout (a sha256 manifest under dist/windows-driver/) are
+# sent, and they land with the current time, so cargo and ninja see them as
+# newer than their last build however the two clocks or the copied mtimes
+# compare; unchanged files keep their times and stay built. Files gone from
+# the checkout are deleted in the VM. CLEAN=1 (or no manifest yet) wipes the
+# VM tree and copies everything, and Build-InVm.ps1 -Clean rebuilds DXVK and
+# vkd3d too.
+manifest_dir="$self/dist/windows-driver"
+mkdir -p "$manifest_dir"
+manifest="$manifest_dir/.sync-$(printf '%s' "$repo" | sha256sum | cut -c1-12)"
+files() {
+    (cd "$repo" && find guest/windows -type f \
+        -not -path '*/.git/*' -not -path '*/target/*' -not -path 'guest/windows/third_party/mesa/*' \
+        -print0 | sort -z | xargs -0 sha256sum)
+}
+files > "$manifest.new"
+if [ "${CLEAN:-0}" = 1 ] || [ ! -s "$manifest" ]; then
+    ssh_win "if (Test-Path $root\\src\\guest) { Remove-Item -Recurse -Force $root\\src\\guest }; New-Item -ItemType Directory -Force $root\\src\\guest | Out-Null"
+    tar -C "$repo" -cf - --exclude=.git --exclude=target --exclude='guest/windows/third_party/mesa' guest/windows \
+        | ssh_win "tar -xf - -C $root\\src"
+else
+    changed=$(comm -13 <(sort "$manifest") <(sort "$manifest.new") | cut -c67-)
+    gone=$(comm -23 <(cut -c67- "$manifest" | sort) <(cut -c67- "$manifest.new" | sort))
+    echo "    $(printf '%s' "$changed" | grep -c . || true) changed, $(printf '%s' "$gone" | grep -c . || true) removed"
+    if [ -n "$changed" ]; then
+        printf '%s\n' "$changed" | tar -C "$repo" -cf - -T - | ssh_win "tar -xmf - -C $root\\src"
+    fi
+    if [ -n "$gone" ]; then
+        printf '%s\n' "$gone" | sed 's|/|\\|g' | while IFS= read -r f; do
+            ssh_win "Remove-Item -LiteralPath '$root\\src\\$f' -Force -ErrorAction SilentlyContinue"
+        done
+    fi
 fi
-ssh_win "New-Item -ItemType Directory -Force $root\\src\\guest | Out-Null"
-# tar on both ends: Windows ships bsdtar as tar.exe. Mesa is not part of the
-# driver job, and build trees and .git are not needed.
-tar -C "$repo" -cf - --exclude=.git --exclude=target --exclude='guest/windows/third_party/mesa' guest/windows \
-    | ssh_win "tar -xf - -C $root\\src"
+mv "$manifest.new" "$manifest"
 if [ "$repo" != "$self" ]; then
     tar -C "$self" -cf - guest/windows/ci/vm | ssh_win "tar -xf - -C $root\\src"
 fi
