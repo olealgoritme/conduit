@@ -166,6 +166,7 @@ static BAR_LAST_MDL_OFF: AtomicU32 = AtomicU32::new(0);
 // Loud failure counters — any nonzero value after boot is a design gap to chase.
 static BAR_ERR_IRQL: AtomicU32 = AtomicU32::new(0); // content op arrived > PASSIVE
 static BAR_ERR_MAP: AtomicU32 = AtomicU32::new(0); // blob map / kernel map failed
+static BAR_ERR_TX_GONE: AtomicU32 = AtomicU32::new(0); // paging transfer with no transport (restart/loss)
 static BAR_ERR_BOUNDS: AtomicU32 = AtomicU32::new(0); // op range outside the blob
 static BAR_ERR_DISCONTIG: AtomicU32 = AtomicU32::new(0); // leaf PTEs not contiguous
 static BAR_ERR_VIRTUAL: AtomicU32 = AtomicU32::new(0); // unresolved paging-process VA
@@ -222,6 +223,7 @@ static PAGING_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(b"PgTd", &BAR_LAST_MDL_OFF),
         f(b"PgEi", &BAR_ERR_IRQL),
         f(b"PgEm", &BAR_ERR_MAP),
+        f(b"PgTxG", &BAR_ERR_TX_GONE),
         f(b"PgEb", &BAR_ERR_BOUNDS),
         f(b"PgEc", &BAR_ERR_DISCONTIG),
         f(b"PgEv", &BAR_ERR_VIRTUAL),
@@ -932,6 +934,17 @@ unsafe fn bar_transfer(
     let dst_seg = t.Destination.SegmentId;
     if src_seg != bar_id && dst_seg != bar_id {
         return PagingOpOutcome::NotOurs; // aperture/system transfer — null engine
+    }
+    // No transport (StopDevice, a live `pnputil /restart-device`, host loss): there
+    // is no blob to read or write and no host copy of the content to keep
+    // truthful, because VidMm is tearing this adapter down. Failing the paging
+    // operation anyway hands VidMm a status it cannot tolerate (0x10E
+    // VIDEO_MEMORY_MANAGEMENT_INTERNAL, 0xC000009A, measured on a restart under
+    // DWM load), so count it and report that nothing needed doing. With the
+    // transport UP a failed copy still fails the operation, as before.
+    if adapter.with_virtio(|_| ()).is_err() {
+        BAR_ERR_TX_GONE.fetch_add(1, Ordering::Relaxed);
+        return PagingOpOutcome::NotOurs;
     }
     let Some(alloc) = (unsafe { paging_alloc_info(t.hAllocation) }) else {
         // The transfer names the BAR segment but no live Helios allocation:
