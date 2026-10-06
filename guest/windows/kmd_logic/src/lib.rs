@@ -60,6 +60,7 @@ pub mod msi;
 pub mod paging;
 pub mod shared_placeholder;
 pub mod restart_flip;
+pub mod generation_id;
 pub mod stall_diag;
 pub mod sweep_budget;
 pub mod vsync_rate;
