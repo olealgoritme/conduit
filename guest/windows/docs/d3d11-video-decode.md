@@ -9,7 +9,7 @@ D3D11 video *decoder*, so every app in the guest decoded on the CPU
 This adds:
 
 1. **A D3D11 video decoder in the Helios DXVK fork** on Vulkan Video
-   (`third_party/patches/dxvk/0002-helios-d3d11-video-decoder-on-vulkan-video.patch`).
+   (`third_party/patches/dxvk/0004-helios-d3d11-video-decoder-on-vulkan-video.patch`).
    H.264 (`D3D11_DECODER_PROFILE_H264_VLD_NOFGT`), NV12 output, decoded
    straight into the app's D3D11 texture, which the video processor, shaders
    and copies then use like any other texture.
@@ -158,7 +158,7 @@ DXVK app-local (MinGW, on the host):
 
 ```sh
 cd guest/windows/third_party/dxvk
-git apply ../patches/dxvk/0001-*.patch ../patches/dxvk/0002-*.patch
+git apply ../patches/dxvk/0001-*.patch ../patches/dxvk/0002-*.patch ../patches/dxvk/0003-*.patch ../patches/dxvk/0004-*.patch
 meson setup build64 --cross-file build-win64.txt --buildtype release \
     -Denable_d3d8=false -Denable_d3d9=false -Denable_d3d10=false -Db_vscrt=none
 ninja -C build64    # build64/src/d3d11/d3d11.dll, build64/src/dxgi/dxgi.dll
