@@ -1978,6 +1978,14 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         if previous != 0 && previous != h_alloc as usize {
             crate::ddi::scanout_trace::note_ddi_coalesced(previous);
         }
+        // `FfAsyncWin`: wake the worker NOW, through the DPC (`DxgkCbQueueDpc` is legal at
+        // DIRQL; `KeSetEvent` on the worker's event is not), instead of leaving the pending
+        // slot to the next vsync tick: at 240 Hz that tick is up to 4.17 ms away, a whole frame
+        // of publication latency. Atomics and the one DPC request only.
+        if crate::virtio::foreign_flip::early_wake() {
+            crate::virtio::foreign_flip::note_early_queued();
+            crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+        }
         return STATUS_SUCCESS;
     }
 

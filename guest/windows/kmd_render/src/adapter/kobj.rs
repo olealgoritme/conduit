@@ -619,6 +619,16 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     // one-shot heartbeat free-running while disabled so a later enable needs no
     // illegal timer operation and resumes on the next nominal retrace.
     if adapter.vsync_enabled.load(Ordering::Acquire) == 0 {
+        // `VsOffN` (`ddi::stall_diag`): ticks that ran with the delivery gate closed.
+        crate::ddi::stall_diag::note_gate_closed_tick();
+        // `FfAsyncWin`: a programming pending behind a closed gate is not waited on for a tick
+        // that will deliver; the heartbeat runs regardless, so it wakes the worker here.
+        if crate::virtio::foreign_flip::early_wake()
+            && adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0
+        {
+            crate::virtio::foreign_flip::note_gate_wake();
+            adapter.signal_hpd();
+        }
         return;
     }
     let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
