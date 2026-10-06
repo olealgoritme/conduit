@@ -275,3 +275,60 @@ present.
   whether the swap to the wire prefix lengthens the wait in practice.
 * Head-of-line cost with DWM among the gated devices (it holds shared surfaces).
 * The `d3d11_share` keyed-load test (400 copies, 20 rounds) on v313 + this change, Venus and NVK.
+
+## 9. Why the gate does not order the key release (investigation, `kmd/flush-gate-why`; INCOMPLETE)
+
+Status: findings from reading the code only; nothing was built or run. Only the pure part of the
+diagnostics exists (`kmd_logic/src/flush_trace.rs`, host-tested: a 64-event atomics-only ring, the
+`submit_matches` / `lag_us` rules, the `Verdict` reduction of the counters, `clamp_sync_ms`). The
+KMD wiring is NOT done (it was reverted before commit so the tree builds as v317).
+
+### Finding (ranked)
+
+1. **Most likely, structural: the acquirer's work is not ordered, whatever the releaser's fence does.**
+   `d3dkmthk.h` (`D3DKMT_RELEASEKEYEDMUTEX.FenceValue` "new fence value to use for GPU sync object",
+   `D3DKMT_ACQUIREKEYEDMUTEX.FenceValue` "current fence value of the GPU sync object") says dxgkrnl's
+   keyed mutex orders GPU work through a GPU sync object: the acquirer's context queue waits on it.
+   That orders only the acquirer's DMA buffers. B's reads run through DXVK into the Venus ring / NVK's
+   RM channel (escapes), never in a DMA buffer, so nothing holds them; B's only DMA packet is its own
+   `HEFL`, queued after the work was already forwarded and never waited for by the UMD. `AcquireSync`
+   returns on the CPU as soon as A calls the release, so B reads while A's 400 copies run. This explains
+   "same on Venus and NVK", "unchanged with the gate active" and "A always sees B's writes" (B's write is
+   small and long finished). It is also the gap `shared-surfaces.md` section 4 named ("the acquirer still
+   issues NVK work dxgkrnl does not see: it needs a GPU wait") and the v1 CPU rule hid: "the acquirer needs
+   nothing" held only while the releaser waited on the CPU. The gate removed that wait.
+2. (a) dxgkrnl eliding the packet: unlikely. `dxgkddi_render` copies the 48 bytes into `pDmaBuffer` and
+   advances it (`submit_command.rs` end of `dxgkddi_render`), so the buffer is non-empty; the counters
+   `FlGRec` = 95 prove Render runs. Whether each packet reaches SubmitCommand is UNMEASURED (no counter).
+3. (b) wrong context: unlikely. The UMD creates one context per device (`device_funcs.rs` CreateDevice) and
+   `send_flush_gate` uses it, like presents.
+4. (c) early retire: not found in the code. `take_one_ready_wddm` retires a stream/RM boundary only when
+   `present_stream_slot_ready` (`retired >= value`); the host retires a fenced SUBMIT_3D only after the
+   renderer signals its fence (`host/backend/device/src/venus/fence.rs`). Unverified traps: a stream point
+   of value 0 ("already complete"), the 250 ms rebase, and the assumption of section 8 that SubmitCommand
+   reads the private-data offset Render wrote (`FlGStrm` counts at Render, not at SubmitCommand).
+5. (d) async submission order of the runtime's signal vs our Render: cannot be seen from the KMD.
+
+### Fix options (none implemented)
+
+* Cheapest and testable without a UMD change: a registry knob `FlGSyncMs` (designed, not written): the
+  `HEFL` Render waits (bounded, clamped by `clamp_sync_ms`) until its boundary retired
+  (`VirtioGpu::flush_gate_ready`, read-only on `scanout_boundary_ready` / `async_retired_up_to`), so the
+  key release follows completion on the CPU. If `d3d11_share keyed-load` passes with it, finding 1 is
+  confirmed. Cost: a GPU-latency stall per flush of every shared-resource device (DWM too), hence a knob.
+* Proper fix, UMD: the acquirer must not forward work before its own context's pending GPU waits are
+  satisfied, e.g. send a barrier `HEFL` first and wait for its WDDM fence before releasing the batch.
+  Not in this session's scope (umd/ is read-only).
+
+### Unfinished (to do next)
+
+* KMD wiring of the ring: `ContextContext` pending-HEFL fields (Render to SubmitCommand pairing),
+  events at Render / SubmitCommand (`note_and_maybe_signal`, with the `signal_now` flag) / the DPC retire
+  (`interrupt.rs`, `WddmReady::rebased`), `abandon_pending_submissions` reset, `publish_flush_gate_counters`
+  (`FlGSub FlGBat FlGMat FlGMis FlGImm FlGRet FlGReb FlGLag* FlGPre* FlGUnord FlGVerdict`, called from
+  `publish_nvrm_counters`), the overlap hook in `enqueue_submit_inner`, the `FlGSyncMs` wait. An
+  ICD submit of another context while a gate is open also counts DWM's: it is evidence of "nothing holds
+  other contexts", not of B specifically.
+* Harness type-check and rustfmt of the kmd_render changes; none was run.
+* Read after the next run once wired: `FlGSub` vs `FlGRec` (packets submitted), `FlGMis` (boundary lost),
+  `FlGImm` (retired at submit), `FlGLagAvg` (real wait), `FlGVerdict` (`flush_trace::Verdict`).
