@@ -110,6 +110,15 @@ pub enum MsgType {
     /// The reply is a header and the virtio-gpu response. Served only when
     /// config `features` carries [`NVGPU_CFG_VENUS`]; refused otherwise.
     GpuCmd = 30,
+    /// Guest → host, control queue: make the memory behind an RM-export
+    /// resource (docs/VENUS.md "RM-export blobs") a GEM object of one of the
+    /// guest's render nodes, so a second NVK process can import it into its
+    /// own RM client (`DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY`, then
+    /// `OS_UNIX_IMPORT_OBJECT_FROM_FD`). Payload [`RmResourceImport`]; the
+    /// reply is a header and [`RmResourceImportReply`]. Served only with
+    /// [`NVGPU_CFG_RM_RESOURCE_IMPORT`]. See docs/VENUS.md "RM-export
+    /// resources in a second process".
+    RmResourceImport = 31,
 }
 
 impl MsgType {
@@ -133,6 +142,7 @@ impl MsgType {
             26 => Self::ClipboardToHost,
             27 => Self::ClipboardRequest,
             30 => Self::GpuCmd,
+            31 => Self::RmResourceImport,
             _ => return None,
         })
     }
@@ -422,6 +432,112 @@ pub const NVGPU_CFG_TAKES_INPUT: u32 = 1 << 12;
 /// when the backend runs with `--venus` and its renderer can import a
 /// dma-buf. Bit 12 is skipped (see [`NVGPU_CFG_TAKES_INPUT`]).
 pub const NVGPU_CFG_RM_IMPORT: u32 = 1 << 13;
+
+/// Device config `features` bit, only together with [`NVGPU_CFG_RM_IMPORT`]:
+/// the backend serves `RmResourceImport` (an RM-export resource as a GEM
+/// object of the caller's render node). Set whenever RM import is.
+pub const NVGPU_CFG_RM_RESOURCE_IMPORT: u32 = 1 << 14;
+
+/// Request payload for `MsgType::RmResourceImport`, following a `MsgHeader`
+/// (whose `handle` is 0). 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RmResourceImport {
+    /// The backend handle of a render node the guest opened (an `Open`
+    /// reply's handle for a `device_type >= 512` node): the file the new GEM
+    /// handle will belong to.
+    pub owner_handle: u32,
+    /// An RM-export resource (`RESOURCE_CREATE_BLOB` with
+    /// [`crate::venus::BLOB_MEM_RM_EXPORT`]) that still exists.
+    pub resource_id: u32,
+    /// 0.
+    pub flags: u32,
+    /// 0.
+    pub reserved: u32,
+}
+
+/// [`RmResourceImportReply::flags`]: `modifier` is known.
+pub const RM_RESOURCE_IMPORT_MODIFIER: u32 = 1 << 0;
+
+/// Response payload for `MsgType::RmResourceImport`, following a
+/// `MsgHeader` with status 0. 24 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RmResourceImportReply {
+    /// GEM handle in `owner_handle`'s file. The guest owns it and closes it
+    /// with `DRM_IOCTL_GEM_CLOSE` (or the file's `Close`); importing the same
+    /// resource on the same file again answers the same handle (GEM handles
+    /// are per object per file), so one close undoes any number of imports.
+    pub gem_handle: u32,
+    /// [`RM_RESOURCE_IMPORT_MODIFIER`].
+    pub flags: u32,
+    /// The size of the object (the dma-buf's), bytes.
+    pub size: u64,
+    /// The DRM format modifier the resource was created with, when known.
+    pub modifier: u64,
+}
+
+impl RmResourceImport {
+    /// Decode from the bytes after the header. `None` if too short.
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < size_of::<Self>() {
+            return None;
+        }
+        let w = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        Some(Self {
+            owner_handle: w(0),
+            resource_id: w(4),
+            flags: w(8),
+            reserved: w(12),
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut o = [0u8; 16];
+        for (i, v) in [
+            self.owner_handle,
+            self.resource_id,
+            self.flags,
+            self.reserved,
+        ]
+        .iter()
+        .enumerate()
+        {
+            o[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        o
+    }
+}
+
+impl RmResourceImportReply {
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < size_of::<Self>() {
+            return None;
+        }
+        let w = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let q = |at: usize| (w(at) as u64) | ((w(at + 4) as u64) << 32);
+        Some(Self {
+            gem_handle: w(0),
+            flags: w(4),
+            size: q(8),
+            modifier: q(16),
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; 24] {
+        let mut o = [0u8; 24];
+        o[0..4].copy_from_slice(&self.gem_handle.to_le_bytes());
+        o[4..8].copy_from_slice(&self.flags.to_le_bytes());
+        o[8..16].copy_from_slice(&self.size.to_le_bytes());
+        o[16..24].copy_from_slice(&self.modifier.to_le_bytes());
+        o
+    }
+}
+
+const _: () = {
+    assert!(size_of::<RmResourceImport>() == 16);
+    assert!(size_of::<RmResourceImportReply>() == 24);
+};
 
 /// Request payload for `MsgType::ScanoutFlip`, following a `MsgHeader`.
 #[repr(C)]
@@ -977,6 +1093,7 @@ mod tests {
             MsgType::ClipboardToHost,
             MsgType::ClipboardRequest,
             MsgType::GpuCmd,
+            MsgType::RmResourceImport,
         ] {
             assert_eq!(MsgType::from_u32(t as u32), Some(t));
         }
@@ -993,7 +1110,23 @@ mod tests {
         assert_eq!(MsgType::from_u32(28), None);
         assert_eq!(MsgType::from_u32(29), None);
         assert_eq!(MsgType::GpuCmd as u32, 30);
-        assert_eq!(MsgType::from_u32(31), None);
+        assert_eq!(MsgType::RmResourceImport as u32, 31);
+        assert_eq!(MsgType::from_u32(32), None);
+        assert_eq!(NVGPU_CFG_RM_RESOURCE_IMPORT, 1 << 14);
+        let r = RmResourceImport {
+            owner_handle: 9,
+            resource_id: 50,
+            flags: 0,
+            reserved: 0,
+        };
+        assert_eq!(RmResourceImport::from_bytes(&r.to_bytes()), Some(r));
+        let a = RmResourceImportReply {
+            gem_handle: 88,
+            flags: RM_RESOURCE_IMPORT_MODIFIER,
+            size: 1 << 20,
+            modifier: 0x0300_0000_0060_6015,
+        };
+        assert_eq!(RmResourceImportReply::from_bytes(&a.to_bytes()), Some(a));
         assert_eq!(NVGPU_CFG_VENUS, 1 << 10);
         assert_eq!(NVGPU_CFG_DRM_FENCES, 1 << 11);
         // Below the transport bits (24..), and what guest/linux/conduit_gpu.c

@@ -356,6 +356,8 @@ pub struct NvidiaBackend {
     /// The modifier of each GEM object NVK imported through nvidia-drm, for
     /// RM-export blobs (`rm_import.rs`).
     rm_layouts: rm_import::RmLayouts,
+    /// `RmResourceImport`s served (rm_resource.rs).
+    rm_resource_imports: u64,
     /// The guest's clipboard transfer being reassembled (`ClipboardToHost`).
     clip_in: clipboard::ClipIn,
     /// Video memory charged to this guest, against its limit. See
@@ -473,6 +475,7 @@ impl NvidiaBackend {
             display: None,
             dmabufs: Default::default(),
             rm_layouts: Default::default(),
+            rm_resource_imports: 0,
             clip_in: Default::default(),
             #[cfg(feature = "venus")]
             venus: None,
@@ -1027,6 +1030,7 @@ impl NvidiaBackend {
                 MsgType::ClipboardToHost => "clipboard_to_host",
                 MsgType::ClipboardRequest => "clipboard_request",
                 MsgType::GpuCmd => "gpu_cmd",
+                MsgType::RmResourceImport => "rm_resource_import",
             })
             .or_insert(0) += 1;
         // The handle travels in the header, not the payload -- every message
@@ -1066,6 +1070,7 @@ impl NvidiaBackend {
             MsgType::ClipboardToHost => self.handle_clipboard_to_host(payload, resp_buf),
             MsgType::ClipboardRequest => self.handle_clipboard_request(resp_buf),
             MsgType::GpuCmd => self.handle_gpu_cmd(payload, resp_buf),
+            MsgType::RmResourceImport => self.handle_rm_resource_import(payload, resp_buf),
         }
     }
 }
@@ -1121,6 +1126,7 @@ mod resp;
 mod rm_fd;
 mod rm_import;
 pub use rm_import::{RmObject, SurfaceLayout, Tiling};
+mod rm_resource;
 mod rmctrl;
 mod scanout;
 mod simple;

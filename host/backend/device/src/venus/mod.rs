@@ -33,6 +33,7 @@ mod scanout;
 mod tests;
 
 pub use fence::Completion;
+pub use rm::RmResource;
 
 /// Contexts one VM may hold at once.
 pub const MAX_CONTEXTS: usize = 1024;

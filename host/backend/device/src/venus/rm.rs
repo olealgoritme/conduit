@@ -31,6 +31,16 @@ pub(super) fn dmabuf_size(fd: BorrowedFd<'_>) -> Option<u64> {
     (end > 0).then_some(end as u64)
 }
 
+/// An RM-export resource as `RmResourceImport` sees it.
+pub struct RmResource<'a> {
+    /// The backend's own dma-buf of the object, borrowed.
+    pub dmabuf: BorrowedFd<'a>,
+    /// The object's size (the dma-buf's).
+    pub size: u64,
+    /// The modifier its GEM import had, when the backend saw it.
+    pub modifier: Option<u64>,
+}
+
 impl Venus {
     /// Refuse with a `RESP_ERR_*` and the errno the guest is told
     /// (`errno_padding`).
@@ -156,6 +166,23 @@ impl Venus {
             },
         );
         Ok(Reply::NoData)
+    }
+
+    /// An RM-export resource's memory, for `RmResourceImport`: the
+    /// backend's own dma-buf reference, the object's size and the modifier
+    /// the resource was created with. `Err` is an errno: `ENOENT` for no such
+    /// resource, `EINVAL` for a resource that is not an RM-export blob (host
+    /// Vulkan memory is not nvidia-drm's to name as RM memory), `EIO` when
+    /// the object's size cannot be read.
+    pub fn rm_resource(&self, res_id: u32) -> std::result::Result<RmResource<'_>, i32> {
+        let r = self.resources.get(&res_id).ok_or(libc::ENOENT)?;
+        let rm = r.rm.ok_or(libc::EINVAL)?;
+        let size = dmabuf_size(r.fd.as_fd()).ok_or(libc::EIO)?;
+        Ok(RmResource {
+            dmabuf: r.fd.as_fd(),
+            size,
+            modifier: rm.modifier,
+        })
     }
 
     /// The modifier an RM-export blob was imported with, for tests:
