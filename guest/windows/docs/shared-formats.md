@@ -126,9 +126,7 @@ Files and rules, exactly:
    * `Layout` gains `plane1: Option<Plane>` with
      `pub struct Plane { pub stride: u32, pub offset: u32, pub modifier: u64 }`.
    * `Layout::validate` takes the fourcc table from
-     `helios_protocol::share_format` (unknown: `LayoutError::Format`). When the
-     KMD does not advertise `CAP_LAYOUT_FORMATS` it keeps today's four-format
-     check.
+     `helios_protocol::share_format` (unknown: `LayoutError::Format`).
    * Per plane `p` (plane 1 extent `ceil(w/2) x ceil(h/2)`):
      `stride_p >= ShareFormat::row_bytes(p, width)`,
      `stride_p % ShareFormat::stride_align(p) == 0` (1, 2 or 4),
