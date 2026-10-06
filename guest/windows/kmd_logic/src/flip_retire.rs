@@ -75,8 +75,9 @@ pub const fn gap_bucket(gap_100ns: u64, period_100ns: u64) -> usize {
     }
     let mut i = 0;
     while i < BUCKETS - 1 {
-        // gap < edge/2 periods  <=>  2 * gap < edge * period
-        if (gap_100ns as u128) * 2 < (GAP_EDGES_HALF[i] as u128) * (period_100ns as u128) {
+        // gap < edge/2 periods  <=>  2 * gap < edge * period (saturating u64: no 128-bit
+        // arithmetic in the kernel; a gap that saturates is far past every edge anyway)
+        if gap_100ns.saturating_mul(2) < (GAP_EDGES_HALF[i] as u64).saturating_mul(period_100ns) {
             return i;
         }
         i += 1;
@@ -223,6 +224,23 @@ pub fn retire_match(
     phys: u64,
     tick_t: u64,
 ) -> Option<Hit> {
+    retire_match_at(addrs, times, live, head, phys, tick_t, tick_t)
+}
+
+/// [`retire_match`] with two clocks: `match_t` is the instant AFTER `phys` was read (a flip
+/// issued at or before it may be what `phys` names; one issued later cannot be), `lat_t` the
+/// tick's start, the end of the latency measured. Reading the tick's start time, then the
+/// address, left a window in which an announce that landed between the two (the address already
+/// in `phys`, its issue time after the start) was refused and credited one tick late.
+pub fn retire_match_at(
+    addrs: &[u64; RING],
+    times: &[u64; RING],
+    live: u32,
+    head: u32,
+    phys: u64,
+    match_t: u64,
+    lat_t: u64,
+) -> Option<Hit> {
     if phys == 0 {
         return None;
     }
@@ -235,7 +253,7 @@ pub fn retire_match(
         }
         match hit {
             None => {
-                if addrs[idx] == phys && times[idx] <= tick_t {
+                if addrs[idx] == phys && times[idx] <= match_t {
                     hit = Some(idx);
                 }
             }
@@ -244,7 +262,7 @@ pub fn retire_match(
     }
     hit.map(|idx| Hit {
         idx,
-        latency_100ns: tick_t - times[idx],
+        latency_100ns: lat_t.saturating_sub(times[idx]),
         skipped,
     })
 }
@@ -757,6 +775,20 @@ mod tests {
     }
 
     #[test]
+    fn an_announce_between_the_tick_start_and_the_address_read_is_carried_by_that_tick() {
+        // flip issued at 5_200, the tick started at 5_000 and read the address at 5_300
+        let (a, t, live, head) = ring_with(&[(0x100, 1_000), (0x200, 5_200)]);
+        // the old single-clock rule refuses it (issued after the tick's start): one tick late
+        assert_eq!(retire_match(&a, &t, live, head, 0x200, 5_000), None);
+        let h = retire_match_at(&a, &t, live, head, 0x200, 5_300, 5_000).unwrap();
+        assert_eq!(h.idx, 1);
+        // latency never underflows when the flip is newer than the tick's start
+        assert_eq!(h.latency_100ns, 0);
+        // a flip issued AFTER the address read cannot have been in it
+        assert_eq!(retire_match_at(&a, &t, live, head, 0x200, 5_100, 5_000), None);
+    }
+
+    #[test]
     fn retire_match_prefers_the_newest_of_two_flips_to_one_address() {
         let (a, t, live, head) = ring_with(&[(0x100, 1_000), (0x200, 2_000), (0x100, 3_000)]);
         let h = retire_match(&a, &t, live, head, 0x100, 9_000).unwrap();
@@ -1074,16 +1106,31 @@ mod tests {
         }
     }
 
+    /// The sibling `kmd_render/src`, or `None` when this copy of the crate has none. With
+    /// `HELIOS_REQUIRE_NAME_SCAN=1` an absent sibling FAILS the test instead of skipping it, so a
+    /// pre-push run that forgot to copy `kmd_render` next to `kmd_logic` cannot pass silently.
+    fn render_src() -> Option<std::path::PathBuf> {
+        let render = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kmd_render/src");
+        if render.exists() {
+            return Some(render);
+        }
+        assert!(
+            std::env::var("HELIOS_REQUIRE_NAME_SCAN").map_or(true, |v| v != "1"),
+            "HELIOS_REQUIRE_NAME_SCAN=1 but {} does not exist: copy kmd_render next to kmd_logic",
+            render.display()
+        );
+        None
+    }
+
     const INDEXED: [&str; 6] = ["FlipLat", "FlipPrgLat", "FlipHostLat", "IfGap", "VsLate", "FlipPh"];
     const KNOBS: [&str; 3] = ["FlipAnnounce", "FlipEarlyWake", "FlipLat"];
 
     #[test]
     fn the_counters_the_driver_writes_are_exactly_the_ones_listed() {
         // Needs `kmd_render` as a sibling of this crate (the pre-push scripts copy both).
-        let render = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kmd_render/src");
-        if !render.exists() {
+        let Some(render) = render_src() else {
             return;
-        }
+        };
         // The byte-string literals of the two I/O files.
         let mut literals: std::vec::Vec<std::string::String> = std::vec::Vec::new();
         for file in ["ddi/flip_lat.rs", "ddi/flip_announce.rs"] {
@@ -1134,10 +1181,9 @@ mod tests {
 
     #[test]
     fn no_other_file_writes_these_names() {
-        let render = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kmd_render/src");
-        if !render.exists() {
+        let Some(render) = render_src() else {
             return;
-        }
+        };
         let mut stack = std::vec![render];
         let mut checked = 0;
         while let Some(dir) = stack.pop() {
