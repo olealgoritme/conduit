@@ -30,7 +30,7 @@ $(O)/librmclient.so: $(OBJS)
 $(O)/test_unit: tests/test_unit.c $(O)/librmclient.a
 	$(CC) $(XCFLAGS) $< $(O)/librmclient.a $(XLDFLAGS) -o $@
 
-$(O)/test_win_wire: tests/test_win_wire.c src/win_wire.h | $(O)
+$(O)/test_win_wire: tests/test_win_wire.c src/win_wire.h src/win_gen.h src/helios_nvrm_escape.h | $(O)
 	$(CC) $(XCFLAGS) $< -o $@
 
 $(O)/crm_smoke: tests/crm_smoke.c $(O)/librmclient.a

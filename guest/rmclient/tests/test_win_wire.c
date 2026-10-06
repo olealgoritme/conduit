@@ -4,11 +4,15 @@
  * Pure C, no OS calls: runs anywhere. The expected layouts are the ones in
  * host/backend/protocol/src/messages.rs (MsgHeader, OpenReq, IoctlReq,
  * IoctlResp) and the sections guest/linux/conduit_gpu.c reads from GetSysFiles.
+ * Also the loss rules (helios_nvrm_escape.h) and the per-generation loss state
+ * (src/win_gen.h) the transport latches a lost transport and reopens by.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "helios_nvrm_escape.h"
+#include "win_gen.h"
 #include "win_wire.h"
 
 static int failures;
@@ -276,8 +280,119 @@ static void test_scanout_path(void)
     CHECK(b[80] == 0xEE);                    /* nothing past the message */
 }
 
+/* The rules the Windows transport judges every reply by (helios_nvrm_escape.h;
+ * the KMD side is nvrm_events.rs / escape.rs). */
+static void test_transport_loss_rules(void)
+{
+    HeliosNvrmHeader h;
+    memset(&h, 0, sizeof(h));
+    const uint64_t init_epoch = (1ull << 32) * 3 + 1; /* a stride-separated generation */
+
+    /* An ordinary reply of the same generation is not a loss, whatever the KMD
+     * verdict is (a refusal is not the transport going away). */
+    h.epoch = init_epoch;
+    h.status = HELIOS_NVRM_ST_OK;
+    CHECK(!helios_nvrm_reply_is_lost(init_epoch, &h));
+    h.status = HELIOS_NVRM_ST_NOT_OWNED;
+    CHECK(!helios_nvrm_reply_is_lost(init_epoch, &h));
+    h.status = HELIOS_NVRM_ST_DEVICE_ERROR;
+    CHECK(!helios_nvrm_reply_is_lost(init_epoch, &h));
+    h.status = HELIOS_NVRM_ST_TIMEOUT;
+    CHECK(!helios_nvrm_reply_is_lost(init_epoch, &h));
+
+    /* TRANSPORT_RESET is a loss even with an unchanged epoch (a failed transport
+     * that was not replaced). */
+    h.status = HELIOS_NVRM_ST_TRANSPORT_RESET;
+    CHECK(helios_nvrm_reply_is_lost(init_epoch, &h));
+
+    /* A changed epoch is a loss with an OK status (a new generation answered)... */
+    h.status = HELIOS_NVRM_ST_OK;
+    h.epoch = init_epoch + (1ull << 32);
+    CHECK(helios_nvrm_reply_is_lost(init_epoch, &h));
+    /* ...and so is epoch 0, which is "no transport at all". */
+    h.epoch = 0;
+    CHECK(helios_nvrm_reply_is_lost(init_epoch, &h));
+    h.status = HELIOS_NVRM_ST_NOT_OWNED;
+    CHECK(helios_nvrm_reply_is_lost(init_epoch, &h));
+
+    /* NTSTATUS: only "not ready" and "removed" mean the device is gone. */
+    CHECK(helios_nvrm_ntstatus_is_lost((int32_t)0xC00000A3u)); /* STATUS_DEVICE_NOT_READY */
+    CHECK(helios_nvrm_ntstatus_is_lost((int32_t)0xC00002B6u)); /* STATUS_DEVICE_REMOVED */
+    CHECK(!helios_nvrm_ntstatus_is_lost(0));
+    CHECK(!helios_nvrm_ntstatus_is_lost((int32_t)0xC0000002u)); /* NOT_IMPLEMENTED: old KMD */
+    CHECK(!helios_nvrm_ntstatus_is_lost((int32_t)0xC000000Du)); /* INVALID_PARAMETER */
+    CHECK(!helios_nvrm_ntstatus_is_lost((int32_t)0xC00000BBu)); /* NOT_SUPPORTED */
+
+    /* The status/ABI numbers the transport relies on. */
+    CHECK(HELIOS_NVRM_ST_TRANSPORT_RESET == 4);
+    CHECK(HELIOS_NVRM_EVENT_TRANSPORT_LOST == 2u);
+    CHECK((HELIOS_NVRM_EVENT_KINDS_ALL & (1u << HELIOS_NVRM_EVENT_TRANSPORT_LOST)) != 0);
+}
+
+/* One loss state per generation (src/win_gen.h): a loss ends the generation,
+ * the next open starts a new one that is not lost, and a reply of the old
+ * transport is still a loss for the new one. `table` stands for the process's
+ * loss table epoch (helios_kmdmap.h), which moves once per observed loss. */
+static void test_generation_loss_restart(void)
+{
+    struct crm_win_gen g;
+    memset(&g, 0, sizeof(g));
+    int32_t table = 7;
+    HeliosNvrmHeader h;
+    memset(&h, 0, sizeof(h));
+
+    /* Nothing is lost or judged before the first init. */
+    CHECK(!crm_win_gen_lost(&g, table));
+    h.epoch = 123;
+    CHECK(!crm_win_gen_reply_lost(&g, &h));
+
+    /* Init refuses "no transport" (epoch 0) and stays uninitialised... */
+    CHECK(crm_win_gen_accept(&g, 0, table) != 0);
+    CHECK(g.generation == 0);
+    /* ...and accepts a live one: generation 1, attached at the table's epoch. */
+    const uint64_t e1 = 0x00000001a5a50001ull; /* image salt in the high word */
+    CHECK(crm_win_gen_accept(&g, e1, table) == 0);
+    CHECK(g.generation == 1 && g.loss_epoch0 == 7 && g.init_epoch == e1);
+    CHECK(!crm_win_gen_lost(&g, table));
+    h.epoch = e1;
+    h.status = HELIOS_NVRM_ST_OK;
+    CHECK(!crm_win_gen_reply_lost(&g, &h));
+
+    /* A driver image reload: with the KMD's per-image salt the new transport's
+     * epoch differs even when the transport counter restarted at the same
+     * value, so the first reply from it ends generation 1. */
+    const uint64_t e2 = 0x000000015a5a0001ull;
+    h.epoch = e2;
+    CHECK(crm_win_gen_reply_lost(&g, &h));
+    table++; /* helios_kmdmap_mark_lost moves the table */
+    CHECK(crm_win_gen_lost(&g, table));
+
+    /* The next open: a new generation, attached at the moved epoch, not lost. */
+    crm_win_gen_restart(&g, table);
+    CHECK(g.generation == 2 && g.loss_epoch0 == 8 && g.init_epoch == 0);
+    CHECK(!crm_win_gen_lost(&g, table));
+    CHECK(crm_win_gen_accept(&g, e2, table) == 0);
+    CHECK(g.generation == 2 && g.loss_epoch0 == 8 && g.init_epoch == e2);
+    CHECK(!crm_win_gen_reply_lost(&g, &h)); /* the new transport answers */
+    CHECK(!crm_win_gen_lost(&g, table));
+
+    /* A reply of the old transport (a straggler) is a loss for generation 2
+     * too: nothing of generation 1 may be taken as an answer now. */
+    h.epoch = e1;
+    CHECK(crm_win_gen_reply_lost(&g, &h));
+
+    /* A loss someone else saw (the UMD, a vanished view) moves the table: lost,
+     * and the restart after it is clean again. */
+    table++;
+    CHECK(crm_win_gen_lost(&g, table));
+    crm_win_gen_restart(&g, table);
+    CHECK(g.generation == 3 && !crm_win_gen_lost(&g, table));
+}
+
 int main(void)
 {
+    test_transport_loss_rules();
+    test_generation_loss_restart();
     test_cmd_encoding();
     test_open_close();
     test_ioctl_layout();

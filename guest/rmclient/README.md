@@ -108,9 +108,23 @@ written into payloads already mean what the host expects.
 
 Implemented: `open`, `close`, `ioctl` (including the parameter block of
 `NV_ESC_RM_CONTROL` and `NV_ESC_RM_ALLOC`), `map_memory`/`unmap_memory` (CPU
-mapping: Linux's channel-per-mapping protocol, with the KMD doing the final map)
-and `alloc_pages`. Still `-ENOSYS`, each waiting for its KMD verb: `event_wait`
-(OS events) and registering user memory as an OS descriptor.
+mapping: Linux's channel-per-mapping protocol, with the KMD doing the final map),
+`alloc_pages`, `event_wait` (a manual-reset event per channel, registered with the
+KMD's EVENT_REGISTER) and pinning user memory as an OS descriptor (PIN/UNPIN).
+
+Device loss is tracked per generation (`src/win_gen.h`). A generation starts
+when init accepts QUERY_CAPS and records the transport's epoch; it ends when a
+reply says the transport is gone (`helios_nvrm_reply_is_lost`: TRANSPORT_RESET,
+or an epoch other than the init epoch, which with the KMD's per-image salt also
+catches a reloaded driver image), when a D3DKMT status says the device is gone,
+or when the process's loss table (`helios_kmdmap.h`) moved for any other reason.
+The loss table's epoch is the one latch. From then on every call answers
+`-ENODEV` without an escape, and the process's TRANSPORT_LOST event wakes every
+blocked `event_wait`. The next `open` starts a new generation on the KMD that
+came back: the old generation's channels are stale (refused, forgotten at their
+close), its CPU views are dropped (never unmapped through the new KMD), and
+nothing of it is ever sent again, because ids restart per transport and an old
+MUNMAP, UNPIN or EVENT_UNREGISTER could tear down a new object with the same id.
 Controls whose parameters hold a pointer of their own are sent without it. The
 Windows build needs the vendored WDK headers
 (`guest/windows/icd/win-build/wdk-include`), which `meson.build` adds.

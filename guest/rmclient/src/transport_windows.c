@@ -64,6 +64,7 @@ typedef LONG NTSTATUS, *PNTSTATUS;
 
 #include "helios_nvrm_escape.h"
 #include "nv_ioctl_defs.h"
+#include "win_gen.h"
 #include "win_wire.h"
 
 /* ---- device loss: KMD views that vanish under a live process -------------
@@ -115,9 +116,22 @@ struct win_ctx {
     int ready;
 
     /* Device loss (helios_kmdmap.h): attached to the shared table once, at
-     * the first successful init; the loss epoch then. */
+     * the first successful init. `gen` is this generation's record (win_gen.h):
+     * the table epoch it attached at, which is the one loss latch, and the
+     * transport epoch QUERY_CAPS gave. */
     int kmdmap_attached;
-    int32_t loss_epoch0;
+    struct crm_win_gen gen;
+
+    /* Wakes every thread blocked in event_wait when the transport is lost:
+     * set by win_mark_lost, and by the KMD through the TRANSPORT_LOST
+     * registration (handle 0) when it resets the device. One manual-reset event
+     * for the life of the process (closing it under a waiter would be a race);
+     * generation_restart resets it and the next init registers it again with
+     * the KMD that came back. */
+    HANDLE lost_ev;
+    int events_ok;       /* QUERY_CAPS: EVENT_REGISTER and the TRANSPORT_LOST kind usable */
+    int lost_registered; /* this generation's KMD holds our TRANSPORT_LOST registration */
+    volatile LONG lost_logged; /* the loss of this generation was logged */
 
     pfn_enum_adapters2 enum_adapters2;
     pfn_create_device create_device;
@@ -137,7 +151,7 @@ struct win_ctx {
                                bits 32..63 HELIOS_NVRM_CAP_* */
     uint32_t device_features; /* QUERY_CAPS.device_features (NVGPU_CFG_*) */
     uint64_t foreign_ops;   /* FOREIGN_RESOURCE QUERY_CAPS.supported_ops, 0 until asked */
-    uint64_t epoch;      /* the KMD's device generation at init */
+    uint64_t caps_epoch; /* the transport epoch of the last accepted QUERY_CAPS */
     LUID luid;           /* the chosen adapter's LUID (D3DKMTEnumAdapters2) */
 
     /* Host's per-class allocation parameter sizes (GetSysFiles section 3). */
@@ -178,9 +192,9 @@ struct win_ctx {
      * by crm_win_scanout_wait_released: an auto-reset event, under `lock`. */
     HANDLE release_ev;
 
-    /* Generations (see generation_restart): 1 from the first init, +1 each
-     * time the KMD came back after a loss and the library reopened it. */
-    uint32_t generation;
+    /* Generations (see generation_restart and win_gen.h): gen.generation is 1
+     * from the first init, +1 each time the KMD came back after a loss and the
+     * library reopened it. */
     /* Channels opened in this generation (win_open, crm_win_open_device) and
      * channels of earlier generations still open in some caller: the latter
      * are refused without an escape and only forgotten at their close. */
@@ -340,14 +354,33 @@ static int nvrm_escape(struct win_ctx *c, void *buf, uint32_t size)
     return r;
 }
 
-/* Has the KMD gone away under this process since init? */
+/* Has the KMD gone away under this process since this generation began? */
 static int win_lost(struct win_ctx *c)
 {
-    return c->kmdmap_attached && helios_kmdmap_lost(c->loss_epoch0);
+    return c->kmdmap_attached && helios_kmdmap_lost(c->gen.loss_epoch0);
+}
+
+/* This generation's transport is gone: move the loss table (once per
+ * generation, helios_kmdmap_mark_lost) and wake every blocked event_wait. The
+ * next open starts a new generation (generation_restart). */
+static void win_mark_lost(struct win_ctx *c, const char *why, unsigned long detail)
+{
+    if (!c->kmdmap_attached)
+        return;
+    if (InterlockedExchange(&c->lost_logged, 1) == 0)
+        crm_kmdmap_log("device-lost: %s 0x%08lx in generation %u (transport epoch 0x%llx); "
+                       "no more RM escapes until the next open starts a new generation",
+                       why, detail, c->gen.generation, (unsigned long long)c->gen.init_epoch);
+    helios_kmdmap_mark_lost(c->gen.loss_epoch0);
+    if (c->lost_ev)
+        SetEvent(c->lost_ev);
 }
 
 static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size)
 {
+    /* Nothing of a lost generation reaches the KMD, not even a release: ids
+     * restart per transport, so an old MUNMAP / UNPIN / EVENT_UNREGISTER could
+     * tear down a new object with the same id. */
     if (win_lost(c))
         return -ENODEV;
 
@@ -361,14 +394,27 @@ static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size)
     esc.pPrivateDriverData = buf;
     esc.PrivateDriverDataSize = size;
     const NTSTATUS st = c->escape(&esc);
-    if (st != 0 && c->kmdmap_attached && helios_kmdmap_status_is_device_gone(st)) {
-        if (!win_lost(c))
-            crm_kmdmap_log("device-lost: D3DKMTEscape status=0x%08lx, no more RM "
-                           "escapes in this process", (unsigned long)st);
-        helios_kmdmap_mark_lost(c->loss_epoch0);
+    if (st != 0) {
+        if (c->ready && (helios_kmdmap_status_is_device_gone(st) ||
+                         helios_nvrm_ntstatus_is_lost((int32_t)st))) {
+            win_mark_lost(c, "D3DKMTEscape status", (unsigned long)st);
+            return -ENODEV;
+        }
+        return nt_to_errno(st);
+    }
+    /* A reply from another transport (a changed epoch: another StartDevice or,
+     * with the KMD's per-image salt, a reloaded driver image) or a reset verdict
+     * is not an answer to what was asked: the handles it named are gone. `ready`
+     * is set only after init accepted the epoch, so init's own QUERY_CAPS is not
+     * judged. */
+    const HeliosNvrmHeader *h = (const HeliosNvrmHeader *)buf;
+    if (c->ready && crm_win_gen_reply_lost(&c->gen, h)) {
+        win_mark_lost(c, h->status == HELIOS_NVRM_ST_TRANSPORT_RESET ? "TRANSPORT_RESET, epoch"
+                                                                      : "reply from another transport, epoch",
+                      (unsigned long)h->epoch);
         return -ENODEV;
     }
-    return st == 0 ? 0 : nt_to_errno(st);
+    return 0;
 }
 
 /*
@@ -486,10 +532,19 @@ static int probe_adapter(struct win_ctx *c, D3DKMT_HANDLE adapter, D3DKMT_HANDLE
         /* Every call needs room for the FORWARD struct, a request and a reply. */
         if (caps.max_buffer_bytes < 4096)
             goto reject;
+        /* Epoch 0 is the KMD saying there is no transport (a live one is never 0):
+         * nothing could be forwarded, and there would be no generation to watch.
+         * Not latched: the next open tries again. */
+        if (caps.head.epoch == 0) {
+            r = -ENODEV;
+            goto reject;
+        }
         c->max_buffer = caps.max_buffer_bytes;
         c->supported_ops = caps.supported_ops;
         c->device_features = caps.device_features;
-        c->epoch = caps.head.epoch;
+        c->caps_epoch = caps.head.epoch;
+        c->events_ok = (caps.supported_ops & (1ull << HELIOS_NVRM_OP_EVENT_REGISTER)) != 0 &&
+                       (caps.supported_event_kinds & (1u << HELIOS_NVRM_EVENT_TRANSPORT_LOST)) != 0;
         *out_device = cd.hDevice;
         *out_context = context;
         return 0;
@@ -660,7 +715,7 @@ static int fd_stale(struct win_ctx *c, int fd)
  */
 static void generation_restart(struct win_ctx *c)
 {
-    const uint32_t old_gen = c->generation;
+    const uint32_t old_gen = c->gen.generation;
     const int32_t epoch =
         helios_kmdmap_t ? (int32_t)InterlockedCompareExchange(&helios_kmdmap_t->epoch, 0, 0) : 0;
 
@@ -689,13 +744,46 @@ static void generation_restart(struct win_ctx *c)
     c->alloc_pairs = NULL;
     c->n_alloc = 0;
     c->foreign_ops = 0;
-    c->loss_epoch0 = epoch;
+    /* The old generation's CPU views are dead: the library never reads, writes
+     * or unmaps them again (the KMD that made them is gone; a MUNMAP would reach
+     * the new one). They are forgotten here; whatever is at their addresses (the
+     * loss table's zero backing for a pointer someone still holds) stays until
+     * the process exits, and a later unmap of one is a no-op. */
+    const uint32_t dropped = c->n_maps;
+    c->n_maps = 0;
+    /* The loss event: left SET, so anyone still blocked on the old generation
+     * wakes (a set-then-reset pulse can be missed by a waiter in an APC). The
+     * first wait of the new generation sees it set, asks the transport, finds
+     * it alive and resets it (win_event_wait); win_init registers it again with
+     * the KMD that came back. */
+    if (c->lost_ev)
+        SetEvent(c->lost_ev);
+    c->lost_registered = 0;
+    c->events_ok = 0;
     c->ready = 0;
-    c->generation = old_gen + 1;
+    crm_win_gen_restart(&c->gen, epoch);
+    InterlockedExchange(&c->lost_logged, 0);
     crm_kmdmap_log("generation %u -> %u: the KMD came back after a loss (loss epoch %d); "
-                   "%u channel(s) of generation %u are stale, %u CPU view(s) kept in the "
-                   "loss table until their unmap",
-                   old_gen, c->generation, (int)epoch, moved, old_gen, c->n_maps);
+                   "%u channel(s) of generation %u are stale, %u CPU view(s) dropped",
+                   old_gen, c->gen.generation, (int)epoch, moved, old_gen, dropped);
+}
+
+static int nvrm_event_call_kind(struct win_ctx *c, uint32_t op, uint32_t fd, uint32_t kind,
+                                HANDLE ev);
+
+/* Register the process's loss event as this generation's TRANSPORT_LOST event
+ * (handle 0: the KMD keys it by process). The KMD then signals it when it
+ * resets the device, which wakes every blocked event_wait. Without it (no event
+ * queue in this KMD) the loss is still seen through every reply's epoch, and
+ * win_mark_lost still wakes the waiters when any thread notices. Not fatal.
+ * Needs `ready`; called with c->lock held. */
+static void register_lost_event(struct win_ctx *c)
+{
+    if (!c->events_ok || !c->lost_ev || c->lost_registered)
+        return;
+    if (nvrm_event_call_kind(c, HELIOS_NVRM_OP_EVENT_REGISTER, 0, HELIOS_NVRM_EVENT_TRANSPORT_LOST,
+                             c->lost_ev) == 0)
+        c->lost_registered = 1;
 }
 
 static int win_init(struct win_ctx *c)
@@ -704,20 +792,35 @@ static int win_init(struct win_ctx *c)
     int r = 0;
     if (c->ready && win_lost(c))
         generation_restart(c);
+    if (!c->lost_ev) {
+        c->lost_ev = CreateEventW(NULL, TRUE /* manual reset */, FALSE, NULL);
+        if (!c->lost_ev)
+            r = -ENOMEM;
+    }
     /* A failed init is NOT latched: the adapter or the KMD may simply not be up
      * yet on the first crm_open, and the next one should get another try. */
-    if (!c->ready) {
+    if (!c->ready && r == 0) {
         r = resolve_api(c);
         if (r == 0)
             r = find_adapter(c);
         if (r == 0) {
-            c->ready = 1;
-            if (c->generation == 0)
-                c->generation = 1;
+            /* The first generation attaches at the table's epoch then; a later
+             * one was rebased by generation_restart. */
+            int32_t table_epoch = c->gen.loss_epoch0;
             if (!c->kmdmap_attached) {
-                c->loss_epoch0 = helios_kmdmap_attach();
+                table_epoch = helios_kmdmap_attach();
                 c->kmdmap_attached = 1;
             }
+            if (crm_win_gen_accept(&c->gen, c->caps_epoch, table_epoch) != 0) {
+                /* probe_adapter already refuses epoch 0; not reached. */
+                close_handles(c, c->adapter, c->device, c->context);
+                c->adapter = c->device = c->context = 0;
+                r = -ENODEV;
+            }
+        }
+        if (r == 0) {
+            c->ready = 1;
+            register_lost_event(c);
             read_host_tables(c);
         }
     }
@@ -1163,7 +1266,7 @@ static int map_table_add(struct win_ctx *c, void *ptr, void *base, int fd, uint3
     }
     if (r == 0)
         c->maps[c->n_maps++] =
-            (struct win_map){ .ptr = ptr, .base = base, .fd = fd, .id = id, .gen = c->generation };
+            (struct win_map){ .ptr = ptr, .base = base, .fd = fd, .id = id, .gen = c->gen.generation };
     ReleaseSRWLockExclusive(&c->lock);
     return r;
 }
@@ -1284,14 +1387,9 @@ static int win_unmap_memory(void *vctx, int ctl_fd, const struct crm_map_request
     (void)ctl_fd;
     struct win_map m;
     if (map_table_take(c, cpu_ptr, &m) != 0)
-        return -ENOENT;
-    if (m.gen != c->generation) {
-        /* A view of an earlier generation: the KMD and host that made it are
-         * gone (the KMD unmapped it, the host reset freed it); only its zero
-         * backing in the loss table is left to release. */
-        helios_kmdmap_unregister(m.base);
-        return 0;
-    }
+        /* Not ours, or a view of an earlier generation that generation_restart
+         * dropped: nothing to send (the KMD and host that made it are gone). */
+        return c->gen.generation > 1 ? 0 : -ENOENT;
     /* The view goes first, then the host's mapping. The channel RM armed the
      * mapping on stays open until the library's NV_ESC_RM_UNMAP_MEMORY (win_ioctl
      * closes it then), or until the control channel closes. Out of the loss
@@ -1345,6 +1443,16 @@ static int ev_get(struct win_ctx *c, int fd, HANDLE *out)
     return r;
 }
 
+/* One QUERY_CAPS round trip, judged like any reply: marks the loss when the
+ * transport answering is not this generation's. */
+static void probe_transport(struct win_ctx *c)
+{
+    HeliosNvrmQueryCaps caps;
+    memset(&caps, 0, sizeof(caps));
+    helios_nvrm_init(&caps.head, HELIOS_NVRM_OP_QUERY_CAPS, sizeof(caps));
+    (void)nvrm_escape(c, &caps, sizeof(caps));
+}
+
 /* Block until the host reports channel `fd` readable. The event is level style:
  * a wake that arrives while nobody waits stays signalled. Reset it on the way out
  * (before the caller drains), so a wake after the reset is seen by the next wait. */
@@ -1363,20 +1471,41 @@ static int win_event_wait(void *vctx, int fd, uint32_t timeout_ms)
     LARGE_INTEGER t0, t1;
     if (g_prof_on > 0)
         QueryPerformanceCounter(&t0);
-    const DWORD w = WaitForSingleObject(ev, ms);
-    if (g_prof_on > 0) {
-        /* evwait 0x0 = woken by the event, 0x1 = timed out */
-        QueryPerformanceCounter(&t1);
-        prof_record(((uint64_t)PROF_WAIT << 32) | (w == WAIT_OBJECT_0 ? 0u : 1u), t0, t1);
-    }
-    switch (w) {
-    case WAIT_OBJECT_0:
-        ResetEvent(ev);
-        return 1;
-    case WAIT_TIMEOUT:
-        return 0;
-    default:
-        return -EIO;
+    const ULONGLONG deadline = ms == INFINITE ? 0 : GetTickCount64() + ms;
+    for (;;) {
+        DWORD left = ms;
+        if (ms != INFINITE) {
+            const ULONGLONG now = GetTickCount64();
+            left = now >= deadline ? 0 : (DWORD)(deadline - now);
+        }
+        HANDLE waits[2] = { ev, c->lost_ev };
+        const DWORD w = WaitForMultipleObjects(c->lost_ev ? 2 : 1, waits, FALSE, left);
+        if (g_prof_on > 0) {
+            /* evwait 0x0 = woken by the event, 0x1 = timed out */
+            QueryPerformanceCounter(&t1);
+            prof_record(((uint64_t)PROF_WAIT << 32) | (w == WAIT_OBJECT_0 ? 0u : 1u), t0, t1);
+        }
+        switch (w) {
+        case WAIT_OBJECT_0:
+            ResetEvent(ev);
+            /* The KMD signals every registration when it resets the device. */
+            return win_lost(c) || fd_stale(c, fd) ? -ENODEV : 1;
+        case WAIT_OBJECT_0 + 1:
+            /* The loss event: set by win_mark_lost, or by the KMD. A late signal
+             * from a KMD that is already gone can arrive after generation_restart
+             * re-armed it, so ask the transport before believing it: QUERY_CAPS's
+             * reply is judged like every other (a changed epoch marks the loss). */
+            if (!win_lost(c) && !fd_stale(c, fd))
+                probe_transport(c);
+            if (win_lost(c) || fd_stale(c, fd))
+                return -ENODEV;
+            ResetEvent(c->lost_ev); /* stale wake: this generation is alive */
+            continue;
+        case WAIT_TIMEOUT:
+            return 0;
+        default:
+            return -EIO;
+        }
     }
 }
 
@@ -2075,7 +2204,7 @@ int32_t crm_win_loss_epoch(void)
         return 0;
     /* A "lost" answer also backs views the KMD unmapped since (rate-limited). */
     if (g_ctx.kmdmap_attached)
-        (void)helios_kmdmap_lost(g_ctx.loss_epoch0);
+        (void)helios_kmdmap_lost(g_ctx.gen.loss_epoch0);
     return (int32_t)InterlockedCompareExchange(&t->epoch, 0, 0);
 }
 
