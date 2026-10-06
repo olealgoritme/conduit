@@ -2791,8 +2791,9 @@ unverified here (24.8).
 | producer boundary live and NOT ready; or live and the mirror is on; or an older copy for the destination is still queued | DEFERRED |
 | producer boundary live and ready, mirror off, nothing queued for the destination, table room | DIRECT |
 | no boundary (the UMD waited on the CPU), mirror off, nothing queued | DIRECT |
-| no boundary and the mirror is on; dead boundary; full table; the queue or the token refused | legacy arm (counted `BltAsyncFall`, reason `BltAsyncWhy`) |
-| no boundary, an older copy for the destination is queued | wait (bounded) for the queue to drain, then the legacy arm (`BltDrainN`) |
+| no boundary and the mirror is on; dead boundary; full table, with nothing queued for the destination | legacy arm (counted `BltAsyncFall`, reason `BltAsyncWhy`) |
+| no boundary or a dead one, an older copy for the destination is queued (whatever the mirror knob says: v337) | wait (bounded) for the queue to drain, then the legacy arm (`BltDrainN`) |
+| any of the above where the queue, the token or the submission was refused after the decision | the same drain, then the legacy arm (v337) |
 
 DIRECT (`ddi/blt_async.rs::direct`, `virtio/gpu/blt_async.rs::enqueue_async_submit_blt`). The destination ownership is taken, or
 joined, in the same critical section of the transport lock as the ring-1 enqueue, and the copy is recorded in a small fixed
@@ -2808,8 +2809,8 @@ transaction a DXVK snapshot Blt has): SubmitCommand admits it once the destinati
 (`service_windowed_blt`) submits it when BOTH the boundary is ready (`scanout_boundary_ready`: an RM gate fires through the
 EventReady DPC, `rm_gate_fire`, and the worker is woken) and the destination can be written (`try_begin_present_buffer_write`;
 a completion wakes the worker), and the ring completion terminalizes the token the Present's DMA fence waits for. The two
-additions to the request are `async_blt` (timed and counted) and `no_mirror`; an NVK source is not a snapshot, so no read
-ledger slot is taken. With the mirror on, the worker's existing PASSIVE mirror runs after the ring completion and the token
+additions to the request are `async_blt` (timed and counted) and `no_mirror`; the source is ledgered like a snapshot's
+(24.10.3; a full ledger leaves it unledgered, it does not refuse the request). With the mirror on, the worker's existing PASSIVE mirror runs after the ring completion and the token
 terminalizes after it; with `BltNoMirror` the ring completion hands the buffer back and terminalizes at once.
 
 `BltNoMirror` (default 0, independent of `BltAsync`): for the same class of Blt the CPU mirror is not made. Instead the
@@ -2838,7 +2839,7 @@ the worker for DEFERRED), so the window in which a page-in can see pages older t
 5. A failed copy still completes the Present. The host's error response for a ring-1 command means it touched nothing: the wire
    fence retires regardless (the DMA fence signals), the destination keeps the previous frame, `BltAsyncFail` counts it, and the
    buffer is handed back. (The legacy arm pinned the buffer for ever in this case. A transport latch is different: everything
-   is abandoned with the transport generation.)
+   is abandoned with the transport generation. Why releasing is safe: 24.10.2.)
 6. Nothing sleeps in the DDI except the legacy fallbacks (`BltAsyncBusy`, `BltDrainN`).
 
 ### 24.5 Hazards
@@ -2863,8 +2864,8 @@ the worker for DEFERRED), so the window in which a page-in can see pages older t
   this change); a queued request whose stream dies is cancelled by the existing teardown paths.
 * A deferred request makes the Present's DMA fence depend on the worker. A wedged worker stalls composed presents; the
   existing `WddmHeadMs` rebase bounds it as for snapshot Blts.
-* `KmdRmClient` 5: the level 5 `primary_changed` edge after a Blt is not raised by the asynchronous routes. The only
-  destination it names is an RM sysmem primary, which never takes this arm (`sysmem_blt::primary`).
+* `KmdRmClient` 5: the level 5 frame edge is raised by the asynchronous routes at their own end (24.10.1; the first version
+  of this section argued it was never owed and was wrong).
 
 ### 24.6 Counters (at most 14 characters, unique across `kmd_render` and `kmd_logic`; `kmd_logic::blt_async::COUNTERS`)
 
@@ -2878,6 +2879,8 @@ the worker for DEFERRED), so the window in which a page-in can see pages older t
 | `BltAsyncFail` | copies the host answered with an error |
 | `BltAsyncFall`, `BltAsyncWhy`, `BltAsyncMask` | eligible Blts that took the legacy arm; last reason code and the set of reasons seen (bit `code - 1`: 2 not foreign, 3 not a buffer, 4 no boundary with the mirror on, 5 dead boundary, 6 queue refused, 7 token refused, 8 submit refused, 9 older copy queued and no boundary, 10 table full, 11 destination busy) |
 | `BltAsyncBusy`, `BltDrainN` | of those, destination busy; legacy Blts that drained the queue first |
+| `BltSrcBusy` | Presents of a source an earlier asynchronous copy was still reading (24.10.3) |
+| `BltLookKnob`, `BltLookN` | worker lookahead depth in force; copies dispatched ahead of a front entry that could not go (24.10.4) |
 | `BltWaitN`, `BltWaitUs`, `BltWait0..7` | the legacy arm's CPU wait for the copy (same buckets): what `BltAsync` saves |
 | `BltMirrorN`, `BltMirrorSk`, `BltMirrorUs` | CPU mirrors done (legacy and worker), skipped by `BltNoMirror`, microseconds spent in them |
 | `BltNoMirInv` | destination system copies newly marked invalid (an Already mark is not counted) |
@@ -2928,3 +2931,136 @@ a GDI app (Notepad, Explorer) beside it stays correct with `BltNoMirror` 1 (the 
 with the app running returns and the counters restart from 0. Compare rows 1, 3, 5 and 6 on `msInPresentAPI` (the saved
 wait), `msBetweenPresents`, fps and host GPU utilization. Recommend the defaults only after rows 3 and 6 are clean; turn
 `BltNoMirror` on separately, after the question of who reads the system pages is settled.
+
+### 24.10 Follow-ups after review (v337)
+
+Five findings of the review of v336, and what was done about each. The pure parts are in `kmd_logic/src/blt_async.rs`
+(1355 tests in the crate now, nine of them new); the rest is in the same three files as 24.7.
+
+#### 24.10.1 Level 5 (`KmdRmClient` 5) lost its frame edge (fixed)
+
+The legacy arm calls `primary_changed(Edge::PresentBlt)` after a copy that completed, and the worker's mirror stage calls
+`primary_changed(Edge::WindowedBlt)`. The asynchronous routes reached neither: the DIRECT route returns before the arm's
+tail, and a DEFERRED copy with `BltNoMirror` ends in `complete_windowed_blt_ring`, which has no mirror stage. A destination
+that is the shown RM primary would then never be flipped. Now:
+
+* DIRECT: the completion DPC (`blt_async_retire`) raises `Edge::PresentBlt` for the destination when the copy succeeded.
+* DEFERRED with `BltNoMirror`: `complete_windowed_blt_ring` raises `Edge::WindowedBlt` at the terminal.
+* DEFERRED with the mirror on: unchanged, the worker's mirror stage raises it.
+* A failed copy raises nothing (the screen did not change; the legacy arm returned before its edge as well).
+
+The decision is the pure `blt_async::edge_owed(Finish, copy_ok)` (tested for every finish and both outcomes); whether the
+destination is the shown RM primary stays `rm_refresh::judge`'s question, asked inside `primary_changed`. That function is
+atomics and `KeSetEvent(Wait = FALSE)` only, so it is legal in the DPC; the DPC reaches the adapter through the pointer the
+first direct submission stored in the in-flight state (`BltAsyncState::adapter`, with the same lifetime argument as
+`WindowedBltPending::adapter`: every entry is retired or forgotten before the transport goes). The earlier text of 24.5
+(the edge "is not raised ... never takes this arm") was an argument, not a guarantee, and is superseded by this.
+
+#### 24.10.2 A failed copy releases the destination (decided, documented)
+
+The legacy arm leaves the buffer `KmdWriter`-poisoned after a rejected host response, with this reasoning in the code: "a
+retired wire id is not enough: a rejected host response leaves KmdWriter poisoned and must never authorize a CPU read or
+external reacquire". The asynchronous routes with `BltNoMirror` hand it back. This is a deliberate change of the invariant,
+for these reasons and no wider than these:
+
+* What the poison protected is a CPU read (the mirror) of a destination the copy may have half written. With `BltNoMirror`
+  there is no CPU read. The same invariant holds where it still applies: a DEFERRED copy with the mirror on keeps the
+  legacy behaviour (its ring failure never reaches the mirror stage, the buffer stays pinned), and so does every
+  `BltAsync` 0 Blt.
+* What it costs when it is kept: the buffer is never writable again, so every later Present to that destination waits the
+  full 5 s budget of `begin_present_buffer_write_legacy` and then fails, and no consumer (DWM) can read it either: the window
+  is dead for the session, for a single rejected command.
+* What it costs when it is released: if the host started the copy and then failed, an external reader may take one frame that
+  is partly the new one. The next Present rewrites the buffer. The host's error answer for a ring-1 SUBMIT_3D is a rejection
+  at decode or at fence level, i.e. a command that did not run to completion; this is a belief from the transport code
+  (`resp_is_ok`), not something measured, and is why the case is counted, not hidden.
+* It is counted: every failed asynchronous copy bumps `BltAsyncFail` (DIRECT in `blt_async_retire`, DEFERRED in
+  `complete_windowed_blt_ring`), and the Present's DMA fence retires with the wire fence regardless. A transport latch is a
+  different event: all entries are forgotten with their ledger tickets retired as failures, and nothing is handed back.
+
+`BltAsyncFail` should read 0 on a healthy run. A nonzero value with torn frames in the same window is the evidence that the
+belief is wrong; the knob that restores the old behaviour is `BltAsync` 0.
+
+#### 24.10.3 Source reuse after the Present returns (highest risk: UMD requirements, plus a KMD-side claim)
+
+Check of what orders the next render. The UMD's RM-fence carrier (b) gates the NEXT PRESENT's DMA fence on the producer, it
+does not gate the next RENDER on anything of this Present: NVK on RM submits its work through its own channel, which neither
+dxgkrnl nor this KMD sees. Before v336 the DDI returned after the copy had read the source, so nothing could overwrite it
+afterwards; with `BltAsync` the Present returns while the copy is still queued behind the producer (and, deferred, until the
+worker submits it), so the source's next-frame render is not ordered after this copy by anything in the KMD. The source of
+a Blt is a swap-chain back buffer the application may draw into as soon as Present returns (blt-model swap chains), so
+the hazard is real and cannot be closed from the KMD alone: the KMD has no way to stop an RM channel.
+
+What the UMD must guarantee (requirement list for the UMD session):
+
+1. Do not let any work that WRITES a swap-chain buffer (or a resource that was the source of a Blt) start until the DMA fence of
+   the Present that read it has signalled. The Present's fence is the one `DxgkDdiPresent` returned with: it is the copy's
+   wire fence (DIRECT) or the copy's terminal token (DEFERRED), and it signals only after the host GPU finished reading.
+2. The wait has to be a GPU-side or a CPU-side wait the UMD owns, because the KMD cannot gate an RM channel: a CPU wait on
+   the fence before the next Draw/Clear/Present of that buffer (`D3DKMTWaitForSynchronizationObject`-style on the Present's
+   monitored/DMA fence, or the swap chain's frame-latency semaphore / buffer-ready that is signalled from it), or an RM
+   semaphore acquire inserted ahead of the next render that the UMD releases from that fence.
+3. With composed presents the runtime's present queue and `SetMaximumFrameLatency` bound the number of Presents in flight, and
+   the back-buffer rotation depth decides which buffer the next frame renders into. The UMD must verify that depth: if the
+   number of buffers is not larger than the latency of (producer + deferred queue + copy), which is milliseconds here, the
+   rotation hands the app a buffer an earlier Present is still reading. The safe configuration is a rotation depth of at least
+   the frame latency plus one AND requirement 1 on top (the rotation alone is an assumption about timing).
+4. The same holds for a buffer that is Present'd twice in a row: the second Present's copy reads it again, and the first one may
+   still be in flight (`BltSrcBusy` counts exactly this, below).
+5. The RM-fence carrier must keep attaching the fence of the work that WRITES the frame the Present reads (it does today); the
+   KMD only orders the copy after it.
+
+Not verified: that the NVK UMD does any of this today. It is not in this tree (the Mesa side), and this change cannot know. Treat
+it as the first thing to check on hardware (24.9): tearing or one-frame-early content in Heaven's moving scene with `BltAsync`
+1 and the RM fence present on.
+
+KMD-side safety added: the source is CLAIMED in the read ledger for the life of the copy, the same ledger a DXVK snapshot
+reader is published in (`HELIOS_ESCAPE_MAP_READ_LEDGER`: a slot per resource id, `issued > retired` while a host read is in
+flight). DIRECT takes the ticket in the same critical section as the enqueue and the completion DPC retires it (a failed
+copy and a transport latch included); DEFERRED takes it when the request is queued and the existing ring completion and
+terminal paths retire it. A full ledger (`RdOvf`) leaves the copy unledgered, loudly, and never refuses it; `RdIss` and `RdRet`
+stay balanced. This is a claim a consumer can read, not a wall: nothing in the KMD waits on it, and the NVK UMD does not
+read the ledger today. It lets the UMD (or a probe) see the source busy without a KMD change, and it makes the copy's
+read lifetime visible in the same place as every other.
+
+`BltSrcBusy` counts Presents whose source an earlier asynchronous copy was still reading when the next Present of it arrived
+(the in-flight table and the queued requests are searched in the same critical section as the route decision). Nonzero means
+the buffer rotation is shallower than the copy's latency or a buffer is Present'd again before it was released: with the
+requirements above violated, this is the Present at which the frame can be torn.
+
+#### 24.10.4 Head-of-line blocking of the deferred queue (fixed, `BltLookahead`)
+
+`take_ready_windowed_blt` looked only at the FRONT of the ready queue. A live producer boundary that has not finished (an NVK
+frame in flight) held every later windowed copy of every other window behind it, so one slow producer stalled DWM's other
+windows. Now the worker looks at the first `BltLookahead` ready entries (default 1 = the old behaviour, so a plain build is unchanged; set 4 together with `BltAsync`; clamped 1 to 8, read at every StartDevice,
+mirrored as `BltLookKnob`; 1 is exactly the old behaviour) and dispatches the first that can go: admitted, its producer's
+boundary reached, its destination writable. Per-destination order is kept by construction: an entry never goes ahead of an
+earlier LIVE entry of its own destination, whether or not that earlier one could go (`blt_async::pick`; the test enumerates
+every window of four entries over three destinations and every ready pattern: the pick is the first entry that could go, is
+never preceded by a live entry of its own destination, and nothing is picked only when nothing could go). A stale token in
+the window neither dispatches nor blocks (the front is still healed exactly as before, `WbStaleRdy`). `BltLookN` counts
+dispatches made ahead of a front entry that could not go. This changes the dispatcher the DXVK snapshot Blts share, which is
+why the depth is a knob; with 1 the behaviour is byte for byte the old one.
+
+Order across destinations is not preserved by design: the WDDM fence of each Present waits for its own token's terminal, not for
+an earlier token's. Order across entries beyond the window, and of entries not yet admitted, is as before.
+
+#### 24.10.5 Ordering gap with `BltNoMirror` 0, no boundary and queued older copies (fixed)
+
+`decide` tested the mirror knob before the queued-copy test, so a Blt with no boundary, the mirror on and older deferred copies
+for the same destination took the plain legacy route and its copy could land BEFORE the older frame. A dead boundary had the
+same gap. Now the queued-copy test comes first for both: the route is `LegacyAfterDrain`, whatever the mirror knob says. Beyond
+`decide`, every way out to the legacy arm (a refused queue, a refused token, a refused submission, a busy destination) now
+drains the destination's queue before the arm runs (`try_async` does it once, at the single exit), so no fallback can overtake
+a queued frame either. Tests: an older queued copy is drained for every mirror setting and both boundary states, and an
+exhaustive property over the whole input space: a plain `Legacy` route with a queued copy exists only for the Presents this
+feature never touches (knob off, not foreign, not a buffer).
+
+#### 24.10.6 Counters added, and what to read
+
+`BltSrcBusy`, `BltLookKnob`, `BltLookN` (24.6 plus these). `BltAsyncFall` / `BltAsyncWhy` bit 9 (`PendingNoBoundary`) and bit 5
+(`BoundaryDead`) now also mean "drained first". Checklist additions (24.9): read `BltSrcBusy` (expect 0 with a sound buffer
+rotation), `RdIss == RdRet` after a quiescent run, and, with `KmdRmClient` 5 and Heaven windowed onto the RM primary, that the
+frame edge `RmSysEdBlt` / `RmSysEdWBlt` (the per-edge counters of `sysmem_flip`) move with `BltAsync` 1 as they do with 0. Two
+Heaven windows at once, one of them slowed by a heavy producer, with `BltLookahead` 1 and 4: the other window's frame rate
+should stop following the slow one's at 4 (`BltLookN` > 0).

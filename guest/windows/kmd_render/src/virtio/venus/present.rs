@@ -1389,6 +1389,7 @@ impl VenusClient {
             self.ctx_id(),
             submit.as_slice()?,
             buffer.resource_id,
+            source.resource_id(),
         )?;
         if let ctrl::BltSubmit::Fence(fence_id) = outcome {
             self.note_prepared_present_blt_submit(adapter, prepared, blt_index, fence_id);
