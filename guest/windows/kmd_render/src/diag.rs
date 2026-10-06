@@ -619,6 +619,17 @@ pub mod knobs {
     /// flips it without a reboot.
     pub const PRESENT_EXACT_WATERMARK: KnobName = KnobName::new(b"PresentWmk");
 
+    /// `MsiVectors` (default 0 = per-source vectors when the OS granted enough
+    /// messages). 1 forces ONE shared message 0 for every queue even when more
+    /// were granted: the same-boot A/B between per-queue and shared vectors.
+    ///
+    /// This is NOT a switch back to INTx. Whether the OS hands the driver
+    /// messages or the INTx line is decided by PnP before `StartDevice` from the
+    /// device key's `MSISupported`; see `docs/msi-interrupts.md` for the one
+    /// `reg add` that forces INTx. Snapshotted at transport init, so
+    /// `pnputil /restart-device` applies it without a reboot.
+    pub const MSI_VECTORS: KnobName = KnobName::new(b"MsiVectors");
+
     /// Default-enabled capacity notification for retry of a full Venus transport
     /// queue. 0 preserves historical 1 ms polling; no capacity change.
     pub const SUBMIT_SPACE_WAKE: KnobName = KnobName::new(b"SubSpaceWake");

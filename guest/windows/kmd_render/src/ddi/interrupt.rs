@@ -1,6 +1,16 @@
 //! ISR / DPC DDIs — the C3/M3.4 interrupt-driven used-ring drain.
 //!
-//! The virtio-gpu device is line-based INTx (`MSISupported=0`), i.e. *level*-
+//! Two delivery modes, chosen by PnP before `StartDevice` and published to the
+//! ISR as `AdapterContext::msi_state` (see `virtio::msi` and
+//! `docs/msi-interrupts.md`):
+//!
+//! * **MSI/MSI-X** (`msi_state != 0`): the device raises a message per source
+//!   (config change / used ring). There is no shared line and nothing to
+//!   acknowledge, so the ISR never touches the ISR-status register: it routes by
+//!   `MessageNumber`, latches a config change for the DPC, and queues the DPC.
+//! * **INTx** (`msi_state == 0`, the historical and fallback path, below).
+//!
+//! The INTx path: the virtio-gpu device is line-based INTx, i.e. *level*-
 //! triggered: it asserts the shared INTx line when it pushes used-ring entries
 //! and keeps it asserted until the driver reads the read-to-clear virtio
 //! ISR-status register. The ISR reads that register (deasserting the line),
@@ -12,8 +22,11 @@
 //! (`DXGK_INTERRUPT_DMA_COMPLETED` at DIRQL via `signal_dma_completed`).
 //!
 //! IRQL: the ISR runs at the device's DIRQL — no allocations, no spinlocks, no
-//! pageable calls; it touches only the lock-free published ISR-status VA and
-//! the saved dxgkrnl callback table. The DPC runs at DISPATCH_LEVEL.
+//! pageable calls; it touches only the lock-free published `msi_state` /
+//! ISR-status VA and the saved dxgkrnl callback table. With several messages
+//! the ISR can run concurrently on different CPUs, which is safe because it
+//! writes nothing but atomics and calls `DxgkCbQueueDpc`. The DPC runs at
+//! DISPATCH_LEVEL.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -28,6 +41,8 @@ use crate::dxgk::*;
 pub static INT_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DPC_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CONTROL_INT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Interrupts taken in message mode (a subset of `INT_ROUTINE_COUNT`).
+pub static MSI_INT_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Ask dxgkrnl to run the normal completion DPC after PASSIVE-side lifecycle
 /// code changed a WDDM wait predicate.  The caller has already preserved the
@@ -317,7 +332,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
 // — so a nonzero `isr_status` implies a valid callback table.
 pub unsafe extern "C" fn dxgkddi_interrupt_routine(
     miniport_device_context: *mut c_void,
-    _message_number: u32,
+    message_number: u32,
 ) -> BOOLEAN {
     if miniport_device_context.is_null() {
         return 0;
@@ -325,6 +340,13 @@ pub unsafe extern "C" fn dxgkddi_interrupt_routine(
     // SAFETY: dxgkrnl passes our AdapterContext as the miniport device context;
     // it is valid for the device's lifetime and `isr_status` is an atomic.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+    // Message mode: no line to acknowledge, so the ISR-status register is not
+    // read (the virtio spec says not to once MSI-X is enabled). Published by
+    // StartDevice before the transport goes live; 0 means INTx.
+    let msi_state = adapter.msi_state.load(Ordering::Acquire);
+    if msi_state != 0 {
+        return msi_interrupt(adapter, msi_state, message_number);
+    }
     let isr_va = adapter.isr_status.load(Ordering::Acquire);
     if isr_va == 0 {
         // Transport not up yet (or torn down): not in a position to claim it.
@@ -357,6 +379,30 @@ pub unsafe extern "C" fn dxgkddi_interrupt_routine(
         }
     }
     1 // claimed + acknowledged (line now deasserted)
+}
+
+/// The message-signalled half of the ISR. DIRQL: atomics and `DxgkCbQueueDpc`
+/// only. Always claims (TRUE): a message is not shared, so it is ours by
+/// construction; one that arrives before the transport is live merely finds
+/// nothing to drain.
+fn msi_interrupt(adapter: &AdapterContext, msi_state: u32, message_number: u32) -> BOOLEAN {
+    use helios_kmd_logic::msi::{isr_route, IsrRoute};
+    INT_ROUTINE_COUNT.fetch_add(1, Ordering::Relaxed);
+    MSI_INT_COUNT.fetch_add(1, Ordering::Relaxed);
+    // The config-change message (vector 0 when the device has one of its own):
+    // latch it for the DPC, which wakes the HPD worker. Every other message —
+    // and the single shared one — is queue work.
+    if isr_route(msi_state, message_number) == IsrRoute::Config {
+        adapter.config_change_pending.store(1, Ordering::Release);
+    }
+    if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
+        if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
+            // SAFETY: DxgkCbQueueDpc is callable from the ISR at DIRQL;
+            // DeviceHandle is the live dxgkrnl device handle.
+            unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
+        }
+    }
+    1
 }
 
 /// `DxgkDdiDpcRoutine` — runs at DISPATCH_LEVEL after the ISR (or a

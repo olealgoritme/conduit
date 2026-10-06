@@ -19,6 +19,7 @@ pub mod ctrl;
 pub mod foreign;
 pub mod gpu;
 pub mod hal;
+pub mod msi;
 pub mod nvrm;
 pub mod pci_caps;
 pub mod venus;

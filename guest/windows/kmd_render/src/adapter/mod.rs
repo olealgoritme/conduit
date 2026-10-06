@@ -515,12 +515,21 @@ pub struct AdapterContext {
     wddm_notify_lock: UnsafeCell<KSPIN_LOCK>,
     /// Mapped kernel VA of the virtio ISR-status register (read-to-clear), or 0
     /// until StartDevice wires it. `DxgkDdiInterruptRoutine` reads this at DIRQL to
-    /// acknowledge the level-triggered INTx line (the device is `MSISupported=0`);
+    /// acknowledge the level-triggered INTx line when PnP gave the device INTx (see `msi_state`);
     /// without it the line stays asserted → interrupt storm → Windows disables the
     /// adapter (Code 43). Set once in StartDevice, read lock-free in the ISR — an
     /// atomic (not behind `virtio_lock`) because the ISR runs at DIRQL and cannot
     /// take the spinlock.
     pub isr_status: AtomicUsize,
+    /// Message-mode state for the DIRQL ISR (`helios_kmd_logic::msi::isr_state`):
+    /// 0 = the device is on the INTx line and `isr_status` is the ISR's ack
+    /// register; nonzero = the device's MSI-X vectors were programmed, so the ISR
+    /// routes by message number and never reads the ISR-status register (there is
+    /// no shared line to acknowledge). Published by StartDevice with `Release`
+    /// BEFORE the transport goes live, cleared first thing in StopDevice, read
+    /// lock-free with `Acquire` in the ISR. An atomic for the same reason as
+    /// `isr_status`: DIRQL cannot take `virtio_lock`.
+    pub msi_state: AtomicU32,
     /// Serializes ALL access to `virtio` (the control virtqueue + the shared
     /// scratch page). Held by escape submissions at PASSIVE_LEVEL and, from M3.4,
     /// by the used-ring DPC at DISPATCH_LEVEL — a spinlock (not a mutex) is
@@ -1130,6 +1139,7 @@ impl AdapterContext {
             last_completed_fence: AtomicU32::new(0),
             wddm_notify_lock: UnsafeCell::new(0),
             isr_status: AtomicUsize::new(0),
+            msi_state: AtomicU32::new(0),
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
             // SAFETY: inert placeholder, initialized in place before publication.
