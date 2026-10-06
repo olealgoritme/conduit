@@ -45,6 +45,7 @@ pub mod rm_fence_present;
 pub mod msi;
 pub mod paging;
 pub mod sweep_budget;
+pub mod vsync_rate;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///

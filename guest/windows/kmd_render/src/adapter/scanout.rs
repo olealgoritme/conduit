@@ -704,6 +704,7 @@ impl AdapterContext {
         );
 
         crate::diag::record_named_bytes(b"VsCnt", self.vsync_count.load(Ordering::Relaxed));
+        crate::diag::record_named_bytes(b"VsCntT", self.vsync_last_ms());
         crate::diag::record_named_bytes(b"VsEn", self.vsync_enabled.load(Ordering::Relaxed));
         crate::diag::record_named_bytes(
             b"SaCnt",
