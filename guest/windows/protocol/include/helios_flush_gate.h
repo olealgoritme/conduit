@@ -16,8 +16,8 @@
  * nothing and does NOT take an RM fence handle.
  *
  * The KMD never fails the Render for anything about the boundary. What it cannot honour
- * degrades to the legacy rule (the packet retires when every transport entry enqueued
- * before SubmitCommand has retired, GPU completion included) and is counted (FlGDeg).
+ * degrades to the wire rung (the packet retires when every transport entry enqueued
+ * before the Render has retired, GPU completion included) and is counted (FlGDeg).
  * An RM fence handle in the tail is the KMD's afterwards, attached or not: never Close,
  * EVENT_REGISTER or reuse it. */
 #ifndef HELIOS_FLUSH_GATE_H

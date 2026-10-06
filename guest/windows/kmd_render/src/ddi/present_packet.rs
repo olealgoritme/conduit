@@ -338,6 +338,36 @@ impl PresentSubmissionPrivate {
         private_size: u32,
         gpu_fence_id: u64,
     ) -> Result<(), NTSTATUS> {
+        // SAFETY: forwarded: the same private range.
+        let merged = unsafe { Self::merge_fence_record(private_data, private_size, gpu_fence_id) }?;
+        PRESENT_MARKER_LAST_FENCE.store(merged as u32, Ordering::Relaxed);
+        PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
+        PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The flush gate's wire floor (`flush_gate::wire_floor`): [`Self::merge_fence`]
+    /// without the present-marker diagnostics. A flush is not a present, and
+    /// `PRESENT_MARKER_WRITES` / `PRESENT_MARKER_LAST_*` are what the Present path and
+    /// the private-data scan (`diagnostic_scan_present_private`) read.
+    ///
+    /// # Safety
+    /// As [`Self::merge_fence`].
+    pub(crate) unsafe fn merge_flush_fence(
+        private_data: *mut c_void,
+        private_size: u32,
+        gpu_fence_id: u64,
+    ) -> Result<(), NTSTATUS> {
+        // SAFETY: forwarded: the same private range.
+        unsafe { Self::merge_fence_record(private_data, private_size, gpu_fence_id) }.map(|_| ())
+    }
+
+    /// Write the merged record; returns the merged `gpu_fence_id`. No counters.
+    unsafe fn merge_fence_record(
+        private_data: *mut c_void,
+        private_size: u32,
+        gpu_fence_id: u64,
+    ) -> Result<u64, NTSTATUS> {
         if private_data.is_null()
             || (private_size as usize) < core::mem::size_of::<PresentSubmissionPrivate>()
         {
@@ -363,10 +393,7 @@ impl PresentSubmissionPrivate {
                 ),
             );
         }
-        PRESENT_MARKER_LAST_FENCE.store(merged as u32, Ordering::Relaxed);
-        PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
-        PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(merged)
     }
 
     /// Merge one same-context registered stream boundary into this submission.
@@ -385,6 +412,41 @@ impl PresentSubmissionPrivate {
         private_size: u32,
         boundary: u64,
     ) -> Result<(), NTSTATUS> {
+        // SAFETY: forwarded: the same private range.
+        let merged =
+            unsafe { Self::merge_stream_boundary_record(private_data, private_size, boundary) }?;
+        if merged.dropped {
+            PRESENT_BOUNDARY_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
+        PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The flush gate's merge: [`Self::merge_stream_boundary`] without the present
+    /// diagnostics (`PrBndDrop`, `PRESENT_MARKER_WRITES`, `PRESENT_MARKER_LAST_SIZE`),
+    /// which a flush must not move. Returns the boundary the record carries afterwards,
+    /// so the caller can tell that the buffer kept an older record's wait instead
+    /// (`flush_gate::boundary_kept`).
+    ///
+    /// # Safety
+    /// As [`Self::merge_stream_boundary`].
+    pub(crate) unsafe fn merge_flush_boundary(
+        private_data: *mut c_void,
+        private_size: u32,
+        boundary: u64,
+    ) -> Result<u64, NTSTATUS> {
+        // SAFETY: forwarded: the same private range.
+        unsafe { Self::merge_stream_boundary_record(private_data, private_size, boundary) }
+            .map(|merged| merged.boundary)
+    }
+
+    /// Write the merged record. No counters; the caller counts what it owns.
+    unsafe fn merge_stream_boundary_record(
+        private_data: *mut c_void,
+        private_size: u32,
+        boundary: u64,
+    ) -> Result<helios_kmd_logic::rm_fence_present::BoundaryMerge, NTSTATUS> {
         if private_data.is_null()
             || (private_size as usize) < core::mem::size_of::<PresentSubmissionPrivate>()
         {
@@ -413,24 +475,18 @@ impl PresentSubmissionPrivate {
             boundary,
             blt_token != 0,
         );
-        if merged.dropped {
-            PRESENT_BOUNDARY_DROPPED.fetch_add(1, Ordering::Relaxed);
-        }
-        let merged_boundary = merged.boundary;
         unsafe {
             core::ptr::write_unaligned(
                 private_data.cast::<PresentSubmissionPrivate>(),
                 Self::for_parts(
                     PRESENT_SUBMISSION_MAGIC,
                     gpu_fence_id,
-                    merged_boundary,
+                    merged.boundary,
                     blt_token,
                 ),
             );
         }
-        PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
-        PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(merged)
     }
 
     /// Carry a bounded WindowedBlt request token into the exact DMA submission

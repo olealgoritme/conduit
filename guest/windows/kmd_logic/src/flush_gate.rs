@@ -137,6 +137,49 @@ pub const fn plan(r: Request) -> Plan {
     }
 }
 
+/// The wire-fence id a flush packet is stamped with when it has no boundary of its own
+/// (`Carrier::Wire`, a degrade, a merge error, a boundary the buffer did not keep):
+/// the last fence this transport generation has issued, `next_wire_fence - 1`, so the
+/// packet's watermark (`id + 1`, an exclusive prefix) is every transport entry enqueued
+/// before the Render.
+///
+/// Why it is stamped at all: dxgkrnl recycles the DMA buffer's private data and
+/// `SubmitCommand` only peeks at the Present prefix, so a record left by an earlier
+/// Present of the context would otherwise be inherited by the packet. A stale
+/// `gpu_fence_id` becomes the watermark (waits only up to that old id), a stale live
+/// same-stream boundary selects the exact-present-watermark arm (watermark 0, no wire
+/// wait). Naming a fence of its own wins over both: `note_wddm_submission` evaluates
+/// the `gpu_completion_fence` arm before the stream relaxation.
+///
+/// `None` when this generation has issued nothing (`next_wire_fence <= wire_fence_base`):
+/// there is no fence to name and nothing to wait for; an id of a previous generation is
+/// clamped to the full prefix, which is empty here (`wddm_boundary::select`).
+pub const fn wire_floor(wire_fence_base: u64, next_wire_fence: u64) -> Option<u64> {
+    if next_wire_fence <= wire_fence_base || next_wire_fence < 2 {
+        return None;
+    }
+    Some(next_wire_fence - 1)
+}
+
+/// Whether the boundary the packet asked for is the one its private record holds after
+/// the merge (`requested` is what was merged in, `merged` what the record carries now).
+///
+/// `false` means the packet must be stamped with [`wire_floor`]: the buffer kept an
+/// older record's boundary and dropped this flush's wait (a different handle with both
+/// waiting, `PrBndDrop`), or the requested boundary is unusable. Same handle: the
+/// record holds the larger value, which only waits longer. A requested value of 0
+/// ("already complete") waits for nothing, so whatever the buffer kept satisfies it.
+pub fn boundary_kept(requested: u64, merged: u64) -> bool {
+    use crate::present_stream::decode_boundary;
+    let Some((rh, rv)) = decode_boundary(requested) else {
+        return false;
+    };
+    if rv == 0 {
+        return true;
+    }
+    matches!(decode_boundary(merged), Some((mh, mv)) if mh == rh && mv >= rv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +358,80 @@ mod tests {
         });
         assert_eq!(p.carrier, Carrier::Wire);
         assert!(!p.take_tail);
+    }
+    fn enc(handle: u32, value: u32) -> u64 {
+        crate::present_stream::encode_boundary(handle, value)
+    }
+
+    #[test]
+    fn wire_floor_names_the_last_issued_fence_of_this_generation() {
+        let base = 1 + (3u64 << 32);
+        assert_eq!(wire_floor(base, base), None);
+        assert_eq!(wire_floor(base, base + 1), Some(base));
+        assert_eq!(wire_floor(base, base + 40), Some(base + 39));
+        // A degenerate base: never name fence 0, the "no dependency" id.
+        assert_eq!(wire_floor(0, 0), None);
+        assert_eq!(wire_floor(0, 1), None);
+        assert_eq!(wire_floor(1, 2), Some(1));
+        // next below base cannot happen; it must not underflow into a bogus id.
+        assert_eq!(wire_floor(base, base - 1), None);
+    }
+
+    #[test]
+    fn wire_floor_is_accepted_by_the_boundary_table_as_a_prefix_of_everything_issued() {
+        use crate::wddm_boundary::{select, Kind, Rejection};
+        let (base, next) = (1 + (3u64 << 32), 1 + (3u64 << 32) + 40);
+        let id = wire_floor(base, next).unwrap();
+        let s = select(id, base, next, false);
+        assert_eq!(s.rejection, Rejection::Accepted);
+        assert_eq!(s.kind, Kind::Prefix);
+        // Exactly "every transport entry enqueued before": the legacy watermark.
+        assert_eq!(s.watermark, next);
+    }
+
+    #[test]
+    fn a_stale_id_would_have_weakened_the_watermark_and_the_floor_does_not() {
+        use crate::wddm_boundary::select;
+        let (base, next) = (1 + (3u64 << 32), 1 + (3u64 << 32) + 40);
+        // What a recycled prefix carried before the floor existed.
+        let stale = select(base + 2, base, next, false);
+        assert_eq!(stale.watermark, base + 3);
+        // The merge keeps the larger gpu_fence_id, so the floor wins over any stale id
+        // of this generation (ids are monotonic).
+        assert!(wire_floor(base, next).unwrap() + 1 > stale.watermark);
+    }
+
+    #[test]
+    fn a_merged_boundary_is_kept_when_it_is_the_requested_one_or_a_larger_of_its_handle() {
+        assert!(boundary_kept(enc(5, 9), enc(5, 9)));
+        assert!(boundary_kept(enc(5, 9), enc(5, 12)));
+        // Gate handles share the namespace.
+        assert!(boundary_kept(enc(0x82, 1), enc(0x82, 1)));
+    }
+
+    #[test]
+    fn a_boundary_the_buffer_replaced_with_another_handles_wait_is_not_kept() {
+        // Old record of a different handle with a real wait: the merge keeps the old
+        // one and drops this flush's (`PrBndDrop`).
+        assert!(!boundary_kept(enc(5, 9), enc(7, 3)));
+        // The same handle at a lower value cannot come out of a merge, but if it did
+        // the flush's point is not covered.
+        assert!(!boundary_kept(enc(5, 9), enc(5, 8)));
+        // Record emptied or untagged.
+        assert!(!boundary_kept(enc(5, 9), 0));
+        assert!(!boundary_kept(enc(5, 9), 12345));
+    }
+
+    #[test]
+    fn value_zero_waits_for_nothing_so_whatever_the_buffer_kept_satisfies_it() {
+        assert!(boundary_kept(enc(5, 0), enc(5, 0)));
+        assert!(boundary_kept(enc(5, 0), enc(7, 3)));
+        assert!(boundary_kept(enc(5, 0), 0));
+    }
+
+    #[test]
+    fn an_unusable_requested_boundary_is_never_kept() {
+        assert!(!boundary_kept(0, enc(5, 1)));
+        assert!(!boundary_kept(12345, enc(5, 1)));
     }
 }

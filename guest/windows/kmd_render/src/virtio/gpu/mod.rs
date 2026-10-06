@@ -5960,6 +5960,41 @@ impl VirtioGpu {
         cookie: u64,
         creator_process: usize,
     ) -> Option<u64> {
+        self.present_stream_marker_boundary_counted(ctx_id, value, cookie, creator_process, true)
+    }
+
+    /// [`Self::present_stream_marker_boundary`] for the flush gate (`HEFL`): the same
+    /// resolution, none of the present-marker calibration counters
+    /// (`PRESENT_STREAM_MARKERS`, `PsMkAhd` / `PsMkAhdHi`, `PsMkCpl`,
+    /// `PRESENT_STREAM_REJECTS`). Those are read against the PRESENT path's pipeline
+    /// depth (`PsMkAhdHi` against DXVK's 32 queued command buffers, rejects expected
+    /// zero), and a flush point is a different producer pattern that must not distort
+    /// them; the gate counts its own outcomes (`FlGStrm`, `FlGDeg`).
+    pub fn flush_stream_marker_boundary(
+        &self,
+        ctx_id: u32,
+        value: u32,
+        cookie: u64,
+        creator_process: usize,
+    ) -> Option<u64> {
+        self.present_stream_marker_boundary_counted(ctx_id, value, cookie, creator_process, false)
+    }
+
+    /// The wire-fence id a flush packet with no boundary of its own is stamped with
+    /// (`helios_kmd_logic::flush_gate::wire_floor`): the last fence this transport
+    /// generation issued, or `None` when it has issued none.
+    pub fn flush_wire_floor(&self) -> Option<u64> {
+        helios_kmd_logic::flush_gate::wire_floor(self.wire_fence_base, self.next_wire_fence)
+    }
+
+    fn present_stream_marker_boundary_counted(
+        &self,
+        ctx_id: u32,
+        value: u32,
+        cookie: u64,
+        creator_process: usize,
+        count: bool,
+    ) -> Option<u64> {
         // `value == 0` is admitted: "already complete" (see
         // `present_stream::MarkerTail`). It still has to name a live registered
         // stream of this process, exactly like a nonzero point; for every
@@ -5970,7 +6005,9 @@ impl VirtioGpu {
             cookie,
             creator_process,
         ) {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
+            if count {
+                PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
+            }
             return None;
         }
         let found = self.present_streams.iter().enumerate().find(|(_, slot)| {
@@ -5981,7 +6018,9 @@ impl VirtioGpu {
                 && slot.creator_process == creator_process
         });
         let Some((index, slot)) = found else {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
+            if count {
+                PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
+            }
             return None;
         };
         // INSTRUMENT ONLY — nothing below refuses, and the boundary returned is
@@ -6011,12 +6050,14 @@ impl VirtioGpu {
         // `virtio/counters.rs` beside the statics.
         let lookahead =
             helios_kmd_logic::present_stream::marker_lookahead(value, slot.submitted_value);
-        if lookahead != 0 {
+        if count && lookahead != 0 {
             PRESENT_STREAM_MARKER_AHEAD.fetch_add(1, Ordering::Relaxed);
             bump_high_water(&PRESENT_STREAM_MARKER_AHEAD_HIGH_WATER, lookahead as usize);
         }
-        PRESENT_STREAM_MARKERS.fetch_add(1, Ordering::Relaxed);
-        if value == 0 {
+        if count {
+            PRESENT_STREAM_MARKERS.fetch_add(1, Ordering::Relaxed);
+        }
+        if count && value == 0 {
             // A boundary at point 0 of a live stream: `slot_ready` holds for any
             // retirement, so the bind it gates does not wait on a Venus
             // timeline, yet it stays in the tagged namespace and dies with its

@@ -44,7 +44,7 @@ pub const HELIOS_FLUSH_GATE_FLAGS_ALL: u32 =
 /// with `NumAllocations = NumPatchLocations = 0`.
 ///
 /// `flags == 0` is the WIRE rung: no boundary of its own, the packet retires by the
-/// ordinary rule (every transport entry enqueued before `SubmitCommand`, GPU
+/// ordinary rule (every transport entry enqueued before the Render, GPU
 /// completion included). That is only a proof for work that already reached the
 /// transport, so a producer that sends it waits for its own submission thread first.
 /// `STREAM` and `RM_FENCE` are exclusive: with both, a complete stream point is
