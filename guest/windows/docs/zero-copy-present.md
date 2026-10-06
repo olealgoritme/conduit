@@ -1160,6 +1160,7 @@ full zero block once per generation even if nothing is ever seen.
 | `KmdRmSysCache` | each level 5 primary bring-up | state | `RmSysCache` (level 5 counter block) |
 | `KmdRmSysPollMs` | lazily at level 5, per transport generation (`forget` resets it) | static | `RmSysPollMs` (now on every read, 0 included) |
 | `ForeignFlip` | StartDevice, after `retire_transport` (via `foreign_flip::publish_counters`), lazily otherwise; `forget` resets it | static | `FfKnob` (now on every read, 0 included) |
+| `RestSeed` (section 20.3a) | each StartDevice (`stall_diag::load_rest_seed`, from `note_start_entry`) | statics | `RestSeedEff` (every start, 0 included), `RestSeedLo`, `RestSeedHi`, `RestSeedUse` (published with `ScRest*`) |
 | `FlipWdogMs`, `DeferBudget` | each StartDevice (`stall_diag::reread_knobs`, from `reread_cached_knobs`) | statics | `FlWdMsEff`, `DefBudEff` (clamped value in force, 0 included; section 14) |
 
 Event-gated counter blocks, and what resets them: `Ff*` (`foreign_flip::forget` zeroes the counters at every
@@ -2221,9 +2222,14 @@ flip it issued LAST is not seen retired and everything queues behind it.
 
 ### 20.3 What changed
 
-* **The heartbeat's address survives the restart.** `ddi::stall_diag::LAST_ISSUED` records the newest address dxgkrnl ever
+* **The heartbeat's address survives the restart (v329: statics only; image reload found on hardware, then persisted).**
+  `ddi::stall_diag::LAST_ISSUED` records the newest address dxgkrnl ever
   issued in a flip (`note_flip_issued`: every `SetVidPnSourceAddress` and every DMA flip record; process-lifetime,
-  `start_generation` leaves it alone). `reset_display_publication_state` stores `restart_flip::seed_address(LAST_ISSUED)` in
+  `start_generation` leaves it alone). The v329 design assumed a process-lifetime static survives
+  `pnputil /restart-device`. That was WRONG: the restart RELOADS the driver image (hardware: `StartN` is 1 after each
+  restart, `EntHpdN`, `EntHpdTh` and `EntVsTk` are 0 at the start), so every static is zero at the new start, the seed was
+  inert and `ScRestAdr0` / `ScRestIss` read 0. The restart passed 5/5 on 328.1 and 330.1 without the seed; the persisted
+  seed (20.3a) is robustness work, not a fix of an observed failure. `reset_display_publication_state` stores `restart_flip::seed_address(LAST_ISSUED)` in
   `last_primary_address` instead of 0, at its start and again at its end (the lease teardown can publish a withheld
   old-generation address over it). Only the ADDRESS word is kept: the displayed identity, the binding, the gate, the
   pending slot and every resource-id keyed table are still cleared. A new flip's programming still publishes its own
@@ -2241,10 +2247,58 @@ flip it issued LAST is not seen retired and everything queues behind it.
   exit 0..7), `ScRestSig` (worker wakes StartDevice owed). The wake is one `signal_hpd` at the end of StartDevice when
   `restart_flip::needs_worker_signal` (the reset clears both, so it fires only for a programming raised while the start
   ran). The `ScRest*` values are never zeroed by `start_generation`: they describe the restart itself.
-* Pure logic and tests: `kmd_logic/src/restart_flip.rs`; the counter lists are `stall_diag::COUNTERS` (`ScRest*`) and
-  `flip_completion::COUNTERS` (`FkGen`, `FkStale`).
+* **The seed survives an image reload (20.3a).**
+* Pure logic and tests: `kmd_logic/src/restart_flip.rs`; the counter lists are `stall_diag::COUNTERS` (`ScRest*`,
+  `RestSeed*`; the persisted words are spelled once in `restart_flip`) and `flip_completion::COUNTERS` (`FkGen`, `FkStale`).
+
+### 20.3a The persisted seed (`RestSeed`, default 1)
+
+The newest issued flip address is kept in the SERVICE KEY (the key of the other knobs and counters; a hive value outlives
+an image reload, a static does not). `RtlWriteRegistryValue` writes DWORDs here, so the 64-bit address is two DWORDs:
+
+| value | content |
+|---|---|
+| `RestIssLo`, `RestIssHi` | the address, low and high dword |
+| `RestUpS` | interrupt time in whole seconds when it was written (`KeQueryInterruptTimePrecise`; zero at every boot) |
+| `RestChk` | check word over the three (`restart_flip::persist_check`), written LAST, so a write torn by a crash reads as damaged |
+
+*Written* (PASSIVE only, never on the flip path; `ddi::stall_diag::persist_rest_seed`): (1) at the top of StopDevice,
+before the first hive flush (`StopFlush`), (2) again in `note_stop_entry` (after the worker and heartbeat stopped, before
+`reset_display_publication_state`; the later `stop_flush` stages cover it), and (3) from the HPD worker's every pass
+(right after `publish_live_if_wanted`), when `LAST_ISSUED` changed and at least 2 s passed since the last write
+(`restart_flip::persist_due`; two loads and a compare otherwise). A crash, bugcheck or unclean stop therefore leaves a value at
+most about 2 s old (the lazy hive writer decides when it reaches the disk; the stop flushes force it). Only a sane address
+is written: nonzero, page aligned, below 2^52 (`sane_address`).
+
+*Read* (`load_rest_seed`, from `note_start_entry`, the first thing StartDevice does with it: before `ScRestIss` is
+captured, before the first `reset_display_publication_state` and before the heartbeat starts) with max-of semantics
+(`restart_flip::choose_seed`):
+
+| `RestSeedUse` | meaning | seed |
+|---|---|---|
+| 0 | knob off, or nothing persisted and no static | the static (0 with the knob off after a reload) |
+| 1 | the persisted address was used and stored into `LAST_ISSUED` | persisted |
+| 2 | rejected: stale. `RestUpS` is later than this boot's uptime, so the value is from an earlier boot (dxgkrnl's flip queue is empty at boot; a stale address is harmless but pointless) | none |
+| 3 | rejected: insane (unaligned, bit 52 or above, or `RestChk` does not match: torn or hand-edited) | none |
+| 4 | the image was NOT reloaded, `LAST_ISSUED` is nonzero: the static is used, the persisted value was not consulted for the seed | static |
+
+A rejected value (2, 3) is erased (all four words zeroed) so a later, longer boot cannot accept it by its uptime. The boot
+test is the monotonic interrupt time, as there is no boot id: a value written in an earlier boot whose uptime was SHORTER
+than the new driver start's reads as fresh. That is the harmless case (a stale address names no flip; the heartbeat reports a
+picture's address that dxgkrnl is not waiting for), not a stall. Hibernate keeps interrupt time running and a restart is not
+a boot, so a restart after hibernation is accepted as it should be.
+
+*Mirrors*, written at EVERY StartDevice, zero included, in the `ScRest*` block (`publish_restart`): `RestSeedEff` (the knob
+in force), `RestSeedLo` / `RestSeedHi` (the persisted address as read, 0 with the knob off), `RestSeedUse` (above).
+`RestSeed` 0 is exactly the v329 behaviour: nothing is read, written or fed to `LAST_ISSUED`.
 
 ### 20.4 State that survives StopDevice / StartDevice: the audit and the decisions
+
+CORRECTION (hardware): the table below was written assuming that process-lifetime statics survive
+`pnputil /restart-device`. They do not: the restart reloads the image and every static is zero at the new start
+(`StartN` 1, `EntHpdN` / `EntHpdTh` / `EntVsTk` 0). Rows that say KEPT or LEFT for a static therefore mean "kept across a
+StopDevice / StartDevice pair of the SAME image" (a stop and start without an unload); after an image reload they are zero,
+and the only state that crosses it is the service key (the persisted seed above, the knobs and the counters).
 
 Every process-lifetime static and `AdapterContext` field that holds scanout, flip, present, fence, vsync, retry, epoch,
 lease, bind-sequence, producer-stream or generation state was read for what StopDevice / StartDevice does to it
@@ -2276,7 +2330,9 @@ worker wake. Decision column: RESET (already), CHANGED (this section), KEPT (on 
 The doc comment on `reset_display_publication_state` says `pnputil /restart-device` re-runs AddDevice and allocates a fresh context;
 section 19 says the context is kept (the Ex timers and the adapter survive). The two cannot both hold. `StartN` rising while
 `EntArm`, `EntHpdTh` and `EntVsTk` show the old generation's heartbeat and worker in the statics, together with a matching `HpdN`, says
-the context is reused; the fix is correct either way (`LAST_ISSUED` is a static).
+the context is reused; the fix is correct either way (`LAST_ISSUED` is a static). Hardware then showed `StartN` 1 and the
+`Ent*` counters 0 at the start of every restart: the image IS reloaded, and the audit's conclusions about statics hold
+only for a stop and start without an unload (20.3a closes the one that matters, the newest issued address).
 
 ### 20.5 Hardware checklist
 
@@ -2288,6 +2344,14 @@ After `pnputil /restart-device` with a Venus `d3d11_spin` window and DWM running
    `ScRestAdr0` and `ScRestIss` are nonzero and `ScRestAddr` equals `ScRestIss` (low 32 bits). On a pre-fix image
    `ScRestAddr` read 0 and that is the H1 signature.
 3. `SaLo` / `SaHi` and `VpLpa` just after the restart equal `ScRestIss` until the first new flip is programmed.
+   With the persisted seed (`RestSeed` 1, the default), after `pnputil /restart-device` of an image that issued flips
+   (the image is reloaded: `StartN` 1): `RestSeedEff` 1, `RestSeedLo` / `RestSeedHi` the persisted address (the same as
+   `RestIssLo` / `RestIssHi` in the key), `RestSeedUse` 1, `ScRestIss` NONZERO (it was 0 on 328.1 / 330.1: the seed was
+   inert), `ScRestAddr` equal to `ScRestIss` (low 32 bits) and `SaLo` / `SaHi` / `VpLpa` equal to the seed until the first
+   new flip. `RestSeedUse` 0 with nonzero `RestIssLo` means the address was not read (knob off); 2 is a boot in between
+   (expected after a reboot, erased); 3 an address that is not page aligned or damaged (check `RestIssLo`, `RestChk`);
+   4 an image that was not reloaded. A reboot, then a first start: `RestSeedUse` 0 or 2 and `ScRestIss` 0. With
+   `RestSeed` 0 the run is the v329 behaviour (`RestSeedUse` 0, `ScRestIss` 0 after a reload).
 4. `FkKeep`, `FkStale`, `FkGen`, `FkKeep05`, `FkKeep08`, `PBRetSite`, `VpPend`, `VpGate`, `VpPrF`, `PgStale`: small or 0.
    A nonzero `FkStale` after a restart means H2 was also live.
 5. If DWM still stalls: `VsPendN`, `HpdLoopN`, `HpdSite`, `FlipIss - FlipPub - VpCoal` (14.5 rows 1c, 2, 2b), `DeferBudget` 240
@@ -2305,6 +2369,14 @@ stall. If dxgkrnl does not wait for the address of the newest issued flip (H1 wr
 address that matches no flip, exactly as 0 did) and the stall has another cause: H3 and H4 are the next reads. Verified:
 host tests of `restart_flip`, the whole `kmd_render` through the stub harness with the error set identical to the base.
 NOT verified: anything on hardware, the WDK build, that dxgkrnl keeps its flip queue across the restart.
+
+The persisted seed (20.3a) is verified by host tests of its pure decisions (`restart_flip`: the choice table, the sanity and
+torn-write checks, the persist rule) and by the stub type-check of the whole `kmd_render`; NOT on hardware or the WDK. Open
+points: the flip addresses must be page aligned for the persisted value to be written (an address that is not never reaches
+the key and `RestSeedUse` stays 0: read `RestIssLo` and `ScRestIss`); the registry writes add about half a millisecond each on the
+worker's pass (four, at most once per 2 s while flips change the address) and at StopDevice; `RtlWriteRegistryValue` on the
+service key may reach the disk late, so a bugcheck within the lazy writer's interval loses the newest value (the stop
+flushes cover a clean stop).
 
 ## 21. Default flip: `VsPowerMode=1`, `VsWatchdog=1` (v330)
 

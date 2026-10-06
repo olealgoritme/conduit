@@ -275,6 +275,10 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // The independent watchdog timer asked for the heartbeat block (`VsLiveT`): without it a
         // worker asleep in its infinite wait leaves the mirror frozen at its last pass.
         stall_diag::publish_live_if_wanted();
+        // The newest issued flip address, to the service key when it changed (at most once per
+        // 2 s; two loads and a compare otherwise): a crash or an unclean stop still leaves a
+        // recent seed for the next image (`RestSeed`).
+        stall_diag::persist_rest_seed(false);
 
         // The KEVENT is the primary completion path (ISR -> DPC -> drain ->
         // signal). If that device interrupt is delayed, poll only while one

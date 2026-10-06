@@ -183,7 +183,7 @@ pub mod site {
 ///   `VsWdSCbI`, `VsWdSCbO`, `VsWdSSyT`: what it saw the last time it acted (when, armed, the
 ///   reference and deadline in ms, the silence, the callback counts, when the last synchronized
 ///   call began).
-pub const COUNTERS: [&str; 129] = [
+pub const COUNTERS: [&str; 133] = [
     "HpdLoopN",
     "HpdLoopT",
     "HpdSite",
@@ -329,6 +329,14 @@ pub const COUNTERS: [&str; 129] = [
     "ScRestIss",
     "ScRestHi",
     "ScRestSig",
+    // The restart seed that survives an image reload (`restart_flip::choose_seed`): the knob in
+    // force, the persisted address as read at StartDevice (low and high dword), and why it was or
+    // was not used. The persisted words themselves (`RestIssLo`, ...) are state, not counters:
+    // they are spelled once, in `restart_flip`.
+    "RestSeedEff",
+    "RestSeedLo",
+    "RestSeedHi",
+    "RestSeedUse",
 ];
 
 // ---- the scanout mutex -----------------------------------------------------------------------
