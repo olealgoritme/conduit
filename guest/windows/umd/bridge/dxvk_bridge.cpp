@@ -1038,7 +1038,8 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       // Hand back an ordinary blank texture of the same size instead: the
       // window composes black, and the NVK app shows its frames on scanout 0
       // as designed (NvkPresent auto picks scanout without ForeignImport).
-      if (foreign && !dxvk::heliosForeignImport()) {
+      if (foreign && impl->backend == helios_bridge::IcdBackend::Venus
+          && !dxvk::heliosForeignImport()) {
         D3D11_TEXTURE2D_DESC td = { };
         td.Width = width;
         td.Height = height;
