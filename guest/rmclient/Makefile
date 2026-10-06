@@ -10,15 +10,15 @@ XCFLAGS := -std=c11 -Wall -Wextra -Wpedantic -fPIC -pthread -Iinclude -Isrc $(CF
 XLDFLAGS := -pthread $(LDFLAGS)
 O       ?= build-make
 
-SRCS := src/rmclient.c src/status.c src/transport_linux.c
+SRCS := src/rmclient.c src/status.c src/transport_linux.c src/transport_windows.c
 OBJS := $(SRCS:src/%.c=$(O)/%.o)
 
-all: $(O)/librmclient.a $(O)/librmclient.so $(O)/test_unit $(O)/crm_smoke $(O)/crm_event_smoke
+all: $(O)/librmclient.a $(O)/librmclient.so $(O)/test_unit $(O)/test_win_wire $(O)/crm_smoke $(O)/crm_event_smoke $(O)/crm_pin_smoke $(O)/crm_scanout_smoke
 
 $(O):
 	mkdir -p $(O)
 
-$(O)/%.o: src/%.c include/rmclient.h include/rmclient_transport.h src/nv_ioctl_defs.h | $(O)
+$(O)/%.o: src/%.c include/rmclient.h include/rmclient_transport.h src/nv_ioctl_defs.h src/crm_mutex.h | $(O)
 	$(CC) $(XCFLAGS) -c $< -o $@
 
 $(O)/librmclient.a: $(OBJS)
@@ -30,14 +30,24 @@ $(O)/librmclient.so: $(OBJS)
 $(O)/test_unit: tests/test_unit.c $(O)/librmclient.a
 	$(CC) $(XCFLAGS) $< $(O)/librmclient.a $(XLDFLAGS) -o $@
 
+$(O)/test_win_wire: tests/test_win_wire.c src/win_wire.h | $(O)
+	$(CC) $(XCFLAGS) $< -o $@
+
 $(O)/crm_smoke: tests/crm_smoke.c $(O)/librmclient.a
 	$(CC) $(XCFLAGS) $< $(O)/librmclient.a $(XLDFLAGS) -o $@
 
 $(O)/crm_event_smoke: tests/crm_event_smoke.c $(O)/librmclient.a
 	$(CC) $(XCFLAGS) $< $(O)/librmclient.a $(XLDFLAGS) -o $@
 
-check: $(O)/test_unit
+$(O)/crm_pin_smoke: tests/crm_pin_smoke.c $(O)/librmclient.a
+	$(CC) $(XCFLAGS) $< $(O)/librmclient.a $(XLDFLAGS) -o $@
+
+$(O)/crm_scanout_smoke: tests/crm_scanout_smoke.c $(O)/librmclient.a
+	$(CC) $(XCFLAGS) $< $(O)/librmclient.a $(XLDFLAGS) -o $@
+
+check: $(O)/test_unit $(O)/test_win_wire
 	$(O)/test_unit
+	$(O)/test_win_wire
 
 smoke: $(O)/crm_smoke
 	$(O)/crm_smoke

@@ -77,6 +77,236 @@ deps (libdrm, libelf, wayland, xcb, glslang, python3-mako/yaml).
 Verified on the host: the series applies to the base commit and builds, both
 with `-Dnvk-rm=enabled` and without it (plain nouveau NVK).
 
+## Windows build (cross-compiled, first bring-up)
+
+NVK with the RM backend builds for **Windows x86_64** with MinGW-w64 on a
+Linux host: `vulkan_nouveau.dll`, its ICD manifest and `librmclient.dll`.
+With librmclient's real Windows transport (RM escapes through the Helios
+KMD) it **runs on the RTX 5090 in the `win11` guest**: enumeration, compute
+and offscreen rendering pass (see "First run on Windows" below); presenting
+is the next step. Seven more Mesa patches on top of the 13 above, in `patches-windows/` (Mesa branch `nvk-rm-windows`):
+
+| # | patch | what |
+|---|---|---|
+| 14 | `nvk/rm: event waits and host pages through librmclient, LoadLibrary on Windows` | the backend no longer calls `mmap`/`poll`: `crm_event_wait`, `crm_alloc_pages`/`crm_free_pages` (librmclient transport ABI 2), Linux compat fallback for an older librmclient; `LoadLibrary` of `librmclient.dll` next to the ICD |
+| 15 | `vulkan/runtime: keep vk_image::drm_format_mod on every OS` | the field exists on Windows too (always `DRM_FORMAT_MOD_INVALID` there) |
+| 16 | `nvk: build without libelf on Windows (no CUDA modules)` | `nv_cubin_nolibelf.c` |
+| 17 | `nvk: driver build id without an ELF build-id note` | Mesa version + module timestamp (`disk_cache_get_function_identifier`), as dozen |
+| 18 | `nak: leave nouveau's winsys and DRM out of the bindings on Windows` | only NAK's Linux hardware tests use them |
+| 19 | `nvk: build for Windows with the RM backend only` | `with_nouveau_drm` (false on Windows): no nouveau winsys / `nvkmd/nouveau`; chipset limits split into `nouveau_device_limits.[ch]`; the RM backend's DRM side moved to `nvkmd_rm_drm.c` (Linux only, stubs otherwise); `VK_EXT_physical_device_drm` and DRM syncobj copies Linux only; empty `<sys/ioccom.h>` for `drm.h`; `TRUE`/`FALSE` from `<windows.h>`; `vulkan_nouveau.dll` with `vulkan_api.def` exports |
+| 20 | `nvk: Win32 WSI` | `VK_KHR_win32_surface` + swapchain through Mesa's win32 WSI, as a software device (CPU copy per present) |
+| 21 | `nvk/rm, wsi: Win32 zero-copy present by Helios scanout` | swapchain images in VRAM, imported once on a host render node as GEM objects and shown with ScanoutFlip (see "Zero-copy present on Windows" below); GDI stays the fallback |
+
+Linux behaviour is unchanged: the full series (20 patches) builds the Linux
+NVK (nouveau + RM) as before, with the same `.so` exports; the patches apply
+with `git am` on the base commit and give exactly branch `nvk-rm-windows`.
+
+```sh
+guest/nvk-rm/build-windows.sh            # ~/code/mesa-nvk-rm-windows, build dir build-win
+guest/nvk-rm/build-windows.sh /path/to/mesa build-dir
+MESA_CLC_DIR=/path/to/linux/build/bin guest/nvk-rm/build-windows.sh   # reuse host mesa_clc/vtn_bindgen2
+```
+
+The script applies `patches/` and `patches-windows/` on branch
+`nvk-rm-windows` (skipped if already applied), builds the native
+`mesa_clc` + `vtn_bindgen2` NVK's OpenCL kernels need (or takes them from
+`MESA_CLC_DIR`, e.g. a Linux `build-rm`'s `src/compiler/clc` and
+`src/compiler/spirv`), cross-builds `librmclient.dll` from `guest/rmclient`,
+configures Mesa with `windows/mingw-x86_64.ini` and
+
+```sh
+meson setup build-win --cross-file guest/nvk-rm/windows/mingw-x86_64.ini \
+    -Dvulkan-drivers=nouveau -Dnvk-rm=enabled -Dgallium-drivers= \
+    -Dplatforms=windows -Dllvm=disabled -Dmesa-clc=system -Dprecomp-compiler=system \
+    -Dvideo-codecs= -Dvulkan-layers= -Degl=disabled -Dgbm=disabled -Dglx=disabled \
+    -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dshader-cache=disabled \
+    -Dzlib=disabled -Dzstd=disabled -Dexpat=disabled -Dxmlconfig=disabled \
+    -Dperfetto=false -Dbuild-tests=false -Dbuildtype=debugoptimized
+```
+
+and stages stripped DLLs, `nouveau_icd.json` (`library_path`
+`.\vulkan_nouveau.dll`, relative to the manifest), `imports.txt` and
+`exports.txt` in `BUILD_DIR/dist`. Compiles run under `systemd-run --user
+--scope -p MemoryMax=2500M` with `-j2` by default (`MEMORY_MAX`, `JOBS`).
+
+Host needs (Ubuntu 24.04): `gcc-mingw-w64-x86-64` (GCC 13, win32 threads),
+`rustup target add x86_64-pc-windows-gnu`, meson >= 1.7, bindgen + libclang,
+cbindgen; `wine64` only to run the tests. LLVM is off for the Windows build
+(NAK is Rust and needs no LLVM; only the host `mesa_clc` does).
+
+The cross file uses **`-mno-ms-bitfields`** (C, C++ and bindgen): MinGW
+defaults to MSVC bitfield layout, bindgen only models the GCC one, and NAK
+and NIR share structs with mixed-type bitfields between C and Rust (NAK
+asserts `sizeof(struct nak_nir_tex_flags) == 4`, which fails with the MSVC
+layout). Nothing that crosses the DLL boundary has mixed-type bitfields
+(Vulkan API, RM parameter structs).
+
+Result (debugoptimized):
+
+| file | size (stripped / with DWARF) | exports | imports |
+|---|---|---|---|
+| `vulkan_nouveau.dll` | 18.3 MB / 145 MB | `vk_icdGetInstanceProcAddr`, `vk_icdGetPhysicalDeviceProcAddr`, `vk_icdNegotiateLoaderICDInterfaceVersion` | GDI32, KERNEL32, msvcrt, ntdll, USER32, USERENV, WS2_32, bcryptprimitives, api-ms-win-core-synch-l1-2-0 |
+| `librmclient.dll` | 71 KB / 254 KB | every `crm_*` (MinGW auto-export) | KERNEL32, msvcrt |
+
+No MinGW runtime DLL is needed (`-static-libgcc`, no libstdc++ or
+winpthread). `windows/icd_smoke.c` loads the driver as the loader does
+(`vk_icdNegotiate...`, instance extensions, `vkCreateInstance`,
+`vkEnumeratePhysicalDevices`); under wine with `NVK_RM=1`:
+
+```
+vk_icdNegotiateLoaderICDInterfaceVersion: 0, interface version 7
+vkCreateInstance: 0
+MESA: warning: NVK_RM: crm_open failed: -40          # -ENOSYS: stub transport
+vkEnumeratePhysicalDevices: 0, 0 physical devices
+```
+
+### First run on Windows (2026-10-06, `win11`, KMD 22.22.307.0, RTX 5090)
+
+The series above, unchanged, with librmclient's real Windows transport
+(`guest/rmclient`, `src/transport_windows.c`: RM escapes over
+`HELIOS_ESCAPE_NVRM`, CPU mappings, OS-descriptor pinning and event waits
+through the KMD). Files in one directory: `vulkan_nouveau.dll`,
+`librmclient.dll`, `nouveau_icd.json`; the tests from
+`windows/build-tests.sh`. Run with `NVK_RM=1`.
+
+The Vulkan loader ignores `VK_DRIVER_FILES` / `VK_ICD_FILENAMES` (and
+`VK_ADD_DRIVER_FILES`) in an elevated process, which an administrator's ssh
+session is ("Loader is running with elevated permissions. Environment
+variable VK_DRIVER_FILES will be ignored"): `vulkaninfo` there only shows
+the registered Venus ICD. The tests therefore take
+`VK_DIRECT_DRIVER=C:\...\vulkan_nouveau.dll` and hand the ICD to the loader
+through `VK_LUNARG_direct_driver_loading` (exclusive mode,
+`tests/vk_direct_driver.h`). From a normal (non-elevated) desktop session
+`VK_DRIVER_FILES` works as on Linux.
+
+| test | result |
+|---|---|
+| `icd_smoke.exe vulkan_nouveau.dll` (no loader) | 1 physical device: `NVIDIA GeForce RTX 5090 (NVK GB202) (0x10de:0x2b85)` |
+| `vk_summary.exe` (loader 1.4.309) | NVK, API 1.4.363, driver `Mesa 26.3.0-devel`, conformance 1.4.3.0, heap 0 32146 MiB VRAM, heap 1 15356 MiB system (host-visible), queue family flags 0xf, 183 device extensions |
+| `vk_compute_test.exe compute.spv` | `PASS: 4096/4096 values correct (host-visible)` |
+| `vk_compute_test.exe compute.spv copy 1048576` | `PASS: 1048576/1048576 values correct (device-local + copy)` |
+| `vk_offscreen_test.exe 5000` | `PASS: offscreen triangle 256x256, 5000 frame(s)`, 1.4 s in all (~0.2 ms per submit + fence wait); the readback is the expected RGB triangle |
+
+No RM refusal in the host backend log for any of these (no
+"not in the ABI profile", no failed `RM_ALLOC`/`RM_CONTROL`). The first run
+after copying new binaries takes a few seconds longer (Defender scanning the
+new files), later runs do not.
+
+(and "librmclient could not be loaded" without the DLL next to the driver).
+librmclient's unit tests (`test_unit.exe`, 300 checks) pass under wine.
+
+### Zero-copy present on Windows (patch 21, Helios WSI)
+
+On the Helios adapter the Win32 WSI does not copy frames to a window: the
+swapchain images are linear images in dedicated VRAM which NVK makes
+presentable once, the way patch 13 makes a dma-buf on Linux, except that
+librmclient's Windows transport carries the DRM side to the host:
+`NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD` into a fresh control channel
+(`crm_win_open_device(255)`), `DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY` on host
+render node `NVK_HELIOS_DRI` (default 0, `crm_win_open_device(512 + n)`),
+one GEM handle per image. `vkQueuePresentKHR` waits for the image's
+rendering on the CPU, then shows the image:
+
+- KMD 22.22.308 and later (QUERY_CAPS ops 9..11, "Option B",
+  `guest/windows/docs/foreign-scanout.md`): `crm_win_scanout_set` once per
+  layout (render node, size, stride, `XRGB8888`/`XBGR8888`, linear),
+  `crm_win_scanout_present` with the image's GEM handle per frame (set
+  again when it answers `-ENOENT`, i.e. the source lapsed), and
+  `crm_win_scanout_release` when a swapchain that presented is destroyed
+  and with the device. The KMD sends the ScanoutFlip itself and keeps the
+  desktop's own flips off scanout 0 meanwhile, so they no longer alternate
+  with ours (the flicker when the mouse moves).
+- Older KMD (`-ENOSYS`) or librmclient: `crm_win_scanout_flip` (raw
+  ScanoutFlip through FORWARD, increasing seq).
+
+The host exports the GEM object as a dma-buf for the viewer. The window is
+never used, so a hidden window on an invisible desktop (an ssh session)
+presents fine.
+
+- `NVK_HELIOS_WSI=0`: off (GDI copy, which fails with
+  `VK_ERROR_MEMORY_MAP_FAILED` on an invisible desktop).
+- Unpaced by default (FIFO pacing is to come from the KMD's present path,
+  not a timer); `MESA_WSI_SCANOUT_HZ=N` caps presents at N per second.
+- No release event from the host yet: an image comes back two presents
+  after it was shown, so use three or more images.
+- If the images cannot be exported (no render node, old librmclient without
+  `crm_win_*`) the swapchain falls back to GDI.
+
+`tests/vk_scanout_present.c` (from `windows/build-tests.sh`): a spinning
+triangle on a hidden window, `vk_scanout_present [seconds] [width height]
+[images]`. In `win11` (RTX 5090, KMD 22.22.307.0), 1920x1080, three images:
+
+| run | result |
+|---|---|
+| KMD 22.22.308, scanout source (SET/PRESENT/RELEASE), unpaced, 10 s | 1234 fps, 12338 flips, 0 failed; source 1920x1080 stride 7680 XR24 linear, lapse 2000 ms, released on destroy |
+| KMD 22.22.307, raw ScanoutFlip, unpaced, 10 s | 2784 fps, 27841 flips, 0 failed; KMD `NvFlip` +27841 |
+| KMD 22.22.307, `MESA_WSI_SCANOUT_HZ=60`, 30 s | 60.0 fps, 1801 flips, 0 failed; `NvFlip` +1801 |
+| `NVK_HELIOS_DRI=99` | "cannot open host render node 99", falls back to GDI |
+
+Next: block-linear images with NVIDIA's DRM modifier (a linear image is
+rendered through NVK's tiled shadow plus a copy), a host release event
+instead of the fixed hold, vblank pacing.
+
+### Linux-only code and how the Windows build handles it
+
+| where | Linux-only thing | on Windows |
+|---|---|---|
+| `nvkmd_rm_lib.c` | `dlopen`/`dlsym` | `LoadLibrary`/`GetProcAddress`, `librmclient.dll` next to `vulkan_nouveau.dll` first |
+| `nvkmd_rm_mem.c` | anonymous `mmap` + `MADV_DONTFORK` for OS-descriptor pages | `crm_alloc_pages` (librmclient: `VirtualAlloc`) |
+| `nvkmd_rm_dev.c` | `poll()` on the non-stall event fd, `sched_yield` | `crm_event_wait` (stub: `-ENOSYS` → waits sleep with backoff), `thrd_yield` |
+| `nvkmd_rm_pdev.c`, `_mem.c`, `_dev.c` | nvidia-drm node discovery (libdrm, `stat`), `/dev/nvidiactl` export fds, PRIME/GEM ioctls, `lseek` on dma-bufs | moved to `nvkmd_rm_drm.c`, not built; stubs: no dma-buf, no import, `has_alloc_tiled = false` (no DRM modifiers) |
+| `nvkmd.c`, `nvkmd/nouveau/*`, `winsys/*` | nouveau DRM backend, libdrm | not built (`with_nouveau_drm`); `nouveau_device_limits.c` (chipset tables) is built |
+| `nvk_physical_device.c` | `major()`/`minor()` of DRM nodes, `VK_EXT_physical_device_drm` | compiled out / extension off |
+| `nvk_device.c` | `vk_drm_syncobj_copy_payloads` | compiled out |
+| `nvk_instance.c` | ELF build-id | module timestamp hash |
+| `nv_cubin.c` | libelf | stub, CUDA modules rejected |
+| `nak_bindings.h` | `xf86drm.h`, nouveau winsys | left out (hardware tests only) |
+| `nil.h` → `drm_fourcc.h` → `drm.h` | `<sys/ioccom.h>` | empty header in `src/nouveau/compat/win32` |
+| `nvk_descriptor_table.c`, `nvk_device_memory.c` | `<sys/mman.h>` (unused) | dropped / `<unistd.h>` |
+
+External memory/semaphore fd extensions were already gated on
+`has_dma_buf` (patch 1), which is false on Windows. The WSI is Mesa's
+win32 one (patch 20) as a software device, since there are no dma-bufs:
+instance extensions under wine are `VK_KHR_surface`, `VK_KHR_win32_surface`,
+`VK_KHR_get_surface_capabilities2`, the surface/swapchain maintenance ones and
+the usual capability queries.
+
+### What the KMD and the Windows transport must provide next
+
+librmclient's `src/transport_windows.c` documents it per callback; in short:
+
+1. **Escape ABI** (`D3DKMTEscape` to the Conduit adapter): a header
+   `{ magic, version, channel, nr, size }` + the NV escape payload in place,
+   RM status in the payload. The KMD copies nested user pointers (NVOS54
+   params, NVOS21 alloc params, NVOS41 event data, ...) the way the Linux
+   guest module does, and forwards to the host's RM.
+2. **Channels**: open/close of the control channel and per-GPU channels,
+   returning small integer ids; the KMD resolves those ids where payloads
+   carry an fd (`register_fd.ctl_fd`, `nvos33_with_fd.fd`,
+   `alloc_os_event.fd`, `NV0005_ALLOC_PARAMETERS.data`).
+3. **CPU mappings** (`map_memory`/`unmap_memory`): `NV_ESC_RM_MAP_MEMORY`
+   plus a mapping into the calling process (BAR1 doorbell, RM system memory
+   such as USERD and error notifiers), returning the user address and RM's
+   cookie. There is no channel `mmap` on Windows.
+4. **OS descriptors**: `NV_ESC_RM_ALLOC_MEMORY` with a user VA from
+   `VirtualAlloc` (`crm_alloc_pages`); the KMD pins it (`MmProbeAndLockPages`)
+   and hands RM the page list.
+5. **Events** (`event_wait`): a Win32 event per event channel that the KMD
+   signals when RM posts the OS event (the non-stall interrupt NVK waits
+   on), plus `NV_ESC_RM_GET_EVENT_DATA`. Without it NVK still works, with
+   sleeping CPU waits.
+6. **Presentation, zero-copy**: the Windows WSI in this build copies
+   through the CPU (no dma-bufs). Zero-copy on Windows needs a
+   shared-resource path instead: RM memory exported as an NT handle / D3DKMT
+   shared allocation the compositor (DWM) can scan out or compose, and the
+   WSI taught to use it (the dma-buf path of patch 13 is the Linux
+   counterpart). That is the next design item after the transport.
+
+Not tried yet: building on Windows itself (MSVC/clang-cl would need the
+same NAK bitfield question answered with the MSVC layout), presenting
+through the win32 WSI, `vkcube` (it cannot be pointed at NVK from an
+elevated session, see above) and dEQP.
+
 ## Running (in a guest)
 
 ```sh
@@ -300,7 +530,7 @@ per-device pool of system memory; `vk_sync_binary` on top, with a `move`
 added (the runtime needs it for binary semaphores in assisted mode). GPU signal:
 `SEM_EXECUTE` release (64-bit, WFI) + `NON_STALL_INTERRUPT`; GPU wait:
 `SEM_EXECUTE ACQ_STRICT_GEQ` with TSG switch. CPU wait: read the value, spin
-briefly, then `poll()` the non-stall event fd (bounded at 10 ms per round, so
+briefly, then wait on the non-stall event fd with `crm_event_wait` (Linux: `poll()`; bounded at 10 ms per round, so
 a lost wakeup costs at most that) or sleep with backoff without an event.
 Event payloads are never needed, but the event has to be drained to re-arm:
 a host that refuses `NV_ESC_RM_GET_EVENT_DATA` leaves it readable for good,
@@ -330,9 +560,13 @@ unsubmitted values instead of leaving GPU acquires spinning).
 
 Used: the base contract plus `crm_map_dma2` (PTE kind), `crm_free_quiet`,
 `crm_event_open/close/drain`, `crm_alloc_os_descriptor`, and for dma-buf
-import `crm_new_handle/crm_release_handle`. All additions are looked up with `dlsym` and
-optional: without `crm_map_dma2` images get the physical (generic) kind,
-without events CPU waits sleep-poll.
+import `crm_new_handle/crm_release_handle`, and (patch 14) `crm_event_wait`
+and `crm_alloc_pages/crm_free_pages`, so the backend itself never calls
+`mmap` or `poll`. All additions are looked up with `dlsym` (`GetProcAddress`
+on Windows) and optional: without `crm_map_dma2` images get the physical
+(generic) kind, without events CPU waits sleep-poll, and on Linux a
+librmclient without the patch 14 calls gets the same `poll`/`mmap` code from
+`nvkmd_rm_lib.c`.
 
 Still missing / wanted:
 

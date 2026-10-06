@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
@@ -93,6 +94,36 @@ static int linux_munmap(void *ctx, void *ptr, uint64_t length)
     return munmap(ptr, (size_t)length) < 0 ? -errno : 0;
 }
 
+static int linux_event_wait(void *ctx, int fd, uint32_t timeout_ms)
+{
+    (void)ctx;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int timeout = timeout_ms > (uint32_t)INT32_MAX ? -1 : (int)timeout_ms;
+    int r = poll(&pfd, 1, timeout);
+    if (r < 0)
+        return errno == EINTR ? 0 : -errno; /* a signal counts as a timeout */
+    return r > 0 ? 1 : 0;
+}
+
+static int linux_alloc_pages(void *ctx, uint64_t size, void **ptr)
+{
+    (void)ctx;
+    void *p = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+    if (p == MAP_FAILED)
+        return -errno;
+    /* RM pins these pages; a child process must not get COW copies */
+    (void)madvise(p, (size_t)size, MADV_DONTFORK);
+    *ptr = p;
+    return 0;
+}
+
+static void linux_free_pages(void *ctx, void *ptr, uint64_t size)
+{
+    (void)ctx;
+    munmap(ptr, (size_t)size);
+}
+
 static struct crm_transport linux_transport = {
     .abi = CRM_TRANSPORT_ABI,
     .flags = 0,
@@ -104,6 +135,9 @@ static struct crm_transport linux_transport = {
     .ioctl = linux_ioctl,
     .mmap = linux_mmap,
     .munmap = linux_munmap,
+    .event_wait = linux_event_wait,
+    .alloc_pages = linux_alloc_pages,
+    .free_pages = linux_free_pages,
 };
 
 const struct crm_transport *crm_linux_transport(void)
@@ -123,6 +157,8 @@ const struct crm_transport *crm_default_transport(void)
 #else /* !__linux__ */
 
 const struct crm_transport *crm_linux_transport(void) { return NULL; }
+#if !defined(_WIN32) /* Windows: transport_windows.c */
 const struct crm_transport *crm_default_transport(void) { return NULL; }
+#endif
 
 #endif

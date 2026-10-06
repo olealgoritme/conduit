@@ -14,6 +14,21 @@
 #include "rmclient_transport.h"
 #include "nv_ioctl_defs.h"
 
+#ifdef _WIN32
+/* MinGW has no setenv/unsetenv (_putenv_s with "" removes the variable)
+ * and no C11 aligned_alloc */
+static int setenv(const char *name, const char *value, int overwrite)
+{
+    (void)overwrite;
+    return _putenv_s(name, value);
+}
+static int unsetenv(const char *name) { return _putenv_s(name, ""); }
+#define aligned_alloc(align, size) _aligned_malloc((size), (align))
+#define aligned_free(ptr) _aligned_free(ptr)
+#else
+#define aligned_free(ptr) free(ptr)
+#endif
+
 #define NV_ERR_INVALID_CLASS      0x22u
 #define NV_ERR_NOT_SUPPORTED      0x56u
 #define FAKE_CLIENT               0xc1d00001u
@@ -367,7 +382,7 @@ static int f_mmap(void *ctx, int fd, uint64_t offset, uint64_t length, uint32_t 
 static int f_munmap(void *ctx, void *ptr, uint64_t length)
 {
     (void)ctx; (void)length;
-    free(ptr);
+    aligned_free(ptr);
     F.munmaps++;
     F.live_mmaps--;
     return 0;
@@ -951,6 +966,80 @@ static void test_custom_map_transport(void)
     CHECK_EQ(crm_open(&c, &t), -EINVAL); /* neither mmap nor map_memory */
 }
 
+/* ABI 2 OS services: forwarded to the transport, -ENOSYS without them, and
+ * an ABI 1 transport (shorter struct) is still accepted. */
+static int os_waits, os_allocs, os_frees;
+static unsigned char os_pages[2 * 4096];
+
+static int o_event_wait(void *ctx, int fd, uint32_t timeout_ms)
+{
+    (void)ctx;
+    os_waits++;
+    return fd == 5 && timeout_ms == 7 ? 1 : 0;
+}
+
+static int o_alloc_pages(void *ctx, uint64_t size, void **ptr)
+{
+    (void)ctx;
+    os_allocs++;
+    if (size > sizeof(os_pages))
+        return -ENOMEM;
+    *ptr = os_pages;
+    return 0;
+}
+
+static void o_free_pages(void *ctx, void *ptr, uint64_t size)
+{
+    (void)ctx;
+    (void)size;
+    if (ptr == os_pages)
+        os_frees++;
+}
+
+static void test_os_services(void)
+{
+    fake_reset();
+    crm_client *c = open_client();
+    if (!c) return;
+    void *p = (void *)1;
+    CHECK_EQ(crm_event_wait(c, 5, 7), -ENOSYS);
+    CHECK_EQ(crm_alloc_pages(c, 4096, &p), -ENOSYS);
+    CHECK(p == NULL);
+    CHECK_EQ(crm_free_pages(c, os_pages, 4096), -ENOSYS);
+    crm_close(c);
+
+    fake_reset();
+    struct crm_transport t = fake_transport;
+    t.event_wait = o_event_wait;
+    t.alloc_pages = o_alloc_pages;
+    t.free_pages = o_free_pages;
+    CHECK_EQ(crm_open(&c, &t), 0);
+    if (!c) return;
+    CHECK_EQ(crm_event_wait(c, 5, 7), 1);
+    CHECK_EQ(crm_event_wait(c, 5, 8), 0);
+    CHECK_EQ(crm_event_wait(c, -1, 7), -EINVAL);
+    CHECK_EQ(os_waits, 2);
+    CHECK_EQ(crm_alloc_pages(c, 100, &p), -EINVAL); /* not page sized */
+    CHECK_EQ(crm_alloc_pages(c, 2 * 4096, &p), 0);
+    CHECK(p == os_pages);
+    CHECK_EQ(crm_free_pages(c, p, 2 * 4096), 0);
+    CHECK_EQ(os_allocs, 1);
+    CHECK_EQ(os_frees, 1);
+    crm_close(c);
+
+    /* ABI 1: whatever follows destroy in the caller's memory is ignored */
+    fake_reset();
+    t.abi = 1;
+    CHECK_EQ(crm_open(&c, &t), 0);
+    if (!c) return;
+    CHECK_EQ(crm_event_wait(c, 5, 7), -ENOSYS);
+    CHECK_EQ(os_waits, 2);
+    crm_close(c);
+
+    t.abi = 3;
+    CHECK_EQ(crm_open(&c, &t), -EINVAL);
+}
+
 int main(void)
 {
     unsetenv("CRM_RM_VERSION");
@@ -964,6 +1053,7 @@ int main(void)
     test_events();
     test_os_descriptor();
     test_custom_map_transport();
+    test_os_services();
     printf("rmclient unit tests: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

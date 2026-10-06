@@ -1,0 +1,47 @@
+From 8f51651cb80cc018d5f06d65f2b5d22c584cd44f Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 00:24:04 +0200
+Subject: [PATCH 20/20] nvk: Win32 WSI
+
+Enables VK_KHR_win32_surface and with it the swapchain extensions on
+Windows through Mesa's win32 WSI. With the RM backend there are no
+dma-bufs, so the WSI runs as a software device: each present is a CPU copy
+of the rendered image (GDI). Zero-copy presentation on Windows needs RM
+memory shared with the compositor through the KMD (a D3DKMT shared
+allocation), which does not exist yet.
+---
+ src/nouveau/vulkan/nvk_instance.c        | 3 +++
+ src/nouveau/vulkan/nvk_physical_device.h | 3 ++-
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvk_instance.c b/src/nouveau/vulkan/nvk_instance.c
+index 71cc04a..051aa26 100644
+--- a/src/nouveau/vulkan/nvk_instance.c
++++ b/src/nouveau/vulkan/nvk_instance.c
+@@ -40,6 +40,9 @@ static const struct vk_instance_extension_table instance_extensions = {
+ #ifdef VK_USE_PLATFORM_WAYLAND_KHR
+    .KHR_wayland_surface = true,
+ #endif
++#ifdef VK_USE_PLATFORM_WIN32_KHR
++   .KHR_win32_surface = true,
++#endif
+ #ifdef VK_USE_PLATFORM_XCB_KHR
+    .KHR_xcb_surface = true,
+ #endif
+diff --git a/src/nouveau/vulkan/nvk_physical_device.h b/src/nouveau/vulkan/nvk_physical_device.h
+index 26d7e34..65594b6 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.h
++++ b/src/nouveau/vulkan/nvk_physical_device.h
+@@ -107,7 +107,8 @@ VkExtent2D nvk_max_shading_rate(const struct nvk_physical_device *pdev,
+ #if defined(VK_USE_PLATFORM_WAYLAND_KHR) || \
+     defined(VK_USE_PLATFORM_XCB_KHR) || \
+     defined(VK_USE_PLATFORM_XLIB_KHR) || \
+-    defined(VK_USE_PLATFORM_DISPLAY_KHR)
++    defined(VK_USE_PLATFORM_DISPLAY_KHR) || \
++    defined(VK_USE_PLATFORM_WIN32_KHR)
+ #define NVK_USE_WSI_PLATFORM
+ #endif
+ 
+-- 
+2.43.0
+
