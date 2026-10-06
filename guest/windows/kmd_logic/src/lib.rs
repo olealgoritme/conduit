@@ -27,6 +27,7 @@ pub mod nvrm_fence;
 pub mod nvrm_views;
 pub mod foreign_copy;
 pub mod foreign_errno;
+pub mod foreign_flip;
 pub mod foreign_resource;
 pub mod foreign_scanout;
 pub mod rm_resource_import;
@@ -46,6 +47,7 @@ pub mod present_foreign;
 pub mod msi;
 pub mod paging;
 pub mod sweep_budget;
+pub mod vsync_rate;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///

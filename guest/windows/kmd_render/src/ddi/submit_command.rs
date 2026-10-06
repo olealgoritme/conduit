@@ -293,6 +293,9 @@ pub(crate) fn publish_nvrm_counters() {
     );
     // The KMD's own RM client (`KmdRmClient`): `Rm*`, written only once it has run.
     crate::virtio::rm_client::publish_counters();
+    // The KMD's flip of a foreign allocation (`ForeignFlip`): `Ff*`, written only once the
+    // knob was on and an allocation was programmed.
+    crate::virtio::foreign_flip::publish_counters();
     // The KMD copy of a foreign resource into the scan-out image (`Fc*`): imports
     // made (`FcImp`, split `FcScan` / `FcBlt`), refusals (`FcRefuse`, last reason
     // `FcRefCode`), host refusals (`FcHostErr`), device without the extension

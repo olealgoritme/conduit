@@ -376,6 +376,32 @@ pub struct Entry {
     /// by the KMD's own service only ([`ForeignTable::mark_sysmem`]), between the import
     /// and the adoption; no user-mode request can set it.
     pub sysmem: bool,
+    /// The device token that imported it, KEPT after a WDDM allocation adopted it
+    /// (`creator` is `None` from then on). Only the KMD's own foreign flip reads it
+    /// (`ForeignFlip`, `docs/kmd-rm-client.md` 15.18): a flip names the DRM file of the
+    /// device that made the resource, and the arbiter's source is that device's.
+    pub origin: u64,
+    /// The importer closed the DRM file `rm_handle` names (or the importer's device went
+    /// away) since this record was made. The `(rm_handle, gem_handle)` pair of such a
+    /// record is never to be flipped again: the host may have reused the file number for
+    /// another file. Set by [`ForeignTable::file_closed`] / [`ForeignTable::owner_closed`],
+    /// never cleared.
+    pub file_closed: bool,
+}
+
+/// What the KMD's own flip reads of a record (see [`ForeignTable::flip_record`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlipRecord {
+    pub origin: u64,
+    /// A WDDM allocation owns the resource (the creator is gone from the record).
+    pub adopted: bool,
+    pub destroyed: bool,
+    pub sysmem: bool,
+    pub file_closed: bool,
+    pub rm_handle: u32,
+    pub gem_handle: u32,
+    pub layout: Layout,
+    pub size: u64,
 }
 
 /// Why a request that never became a resource was turned away, for
@@ -763,6 +789,8 @@ impl ForeignTable {
             layout,
             destroyed: false,
             sysmem: false,
+            origin: r.owner,
+            file_closed: false,
         });
         self.counters.imported = self.counters.imported.saturating_add(1);
         let live = self.entries.len() as u32;
@@ -827,6 +855,49 @@ impl ForeignTable {
         self.get(resource_id)
             .filter(|e| e.sysmem && e.creator.is_none() && !e.destroyed)
             .map(|e| (e.rm_handle, e.gem_handle, e.layout, e.size))
+    }
+
+    /// The facts the KMD's flip of an allocation that adopted a foreign resource decides
+    /// on (`foreign_flip::decide`): who imported it, which DRM file and GEM, the layout, and
+    /// where the record is in its life. `None` for an id with no record.
+    pub fn flip_record(&self, resource_id: u32) -> Option<FlipRecord> {
+        self.get(resource_id).map(|e| FlipRecord {
+            origin: e.origin,
+            adopted: e.creator.is_none(),
+            destroyed: e.destroyed,
+            sysmem: e.sysmem,
+            file_closed: e.file_closed,
+            rm_handle: e.rm_handle,
+            gem_handle: e.gem_handle,
+            layout: e.layout,
+            size: e.size,
+        })
+    }
+
+    /// `owner` closed the DRM file `rm_handle`: every record it imported from that file
+    /// is poisoned for flipping (the host may reuse the number). Returns how many.
+    pub fn file_closed(&mut self, owner: u64, rm_handle: u32) -> usize {
+        let mut n = 0;
+        for e in self.entries.iter_mut() {
+            if e.origin == owner && e.rm_handle == rm_handle && !e.file_closed {
+                e.file_closed = true;
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// `owner`'s device is gone (its files are closed with it, and the token may be
+    /// handed to a new device): every record it imported is poisoned for flipping.
+    pub fn owner_closed(&mut self, owner: u64) -> usize {
+        let mut n = 0;
+        for e in self.entries.iter_mut() {
+            if e.origin == owner && !e.file_closed {
+                e.file_closed = true;
+                n += 1;
+            }
+        }
+        n
     }
 
     /// The layout recorded for `resource_id`, for a scanout flip or an importer.

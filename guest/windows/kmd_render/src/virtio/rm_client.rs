@@ -107,6 +107,13 @@ pub(super) fn ring_level_on() -> bool {
     level != KNOB_UNREAD && (3..=4).contains(&level)
 }
 
+/// The `KmdRmClient` level of this transport generation if the worker has read it, `None`
+/// before that (`ForeignFlip` refuses to decide on an unknown level).
+pub(super) fn level_if_read() -> Option<u32> {
+    let level = KNOB_LEVEL.load(Ordering::Relaxed);
+    (level != KNOB_UNREAD).then_some(level)
+}
+
 /// Whether the RM system-memory level (5) is in force this generation: one relaxed load.
 fn sysmem_level_on() -> bool {
     let level = KNOB_LEVEL.load(Ordering::Relaxed);

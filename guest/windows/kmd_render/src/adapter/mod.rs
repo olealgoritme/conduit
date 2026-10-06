@@ -662,6 +662,21 @@ pub struct AdapterContext {
     committed_refresh_mhz: AtomicU32,
     /// Count of CRTC_VSYNC interrupts synthesized this boot (diag `ScVs`).
     pub vsync_count: AtomicU32,
+    /// Interrupt time (100 ns units) of the tick that last advanced
+    /// `vsync_count`; 0 before the first. Published as milliseconds beside every
+    /// mirror of the count (`ScVsT`, `VpVsT`, `VsCntT`), because a count with no
+    /// time cannot be turned into a rate. See `kmd_logic::vsync_rate`.
+    pub vsync_last_100ns: AtomicU64,
+    /// Interrupt time of the previous timer tick, for the gap statistics; 0 =
+    /// none yet, which is how the first tick after an arm is ignored (arm and
+    /// disarm both store 0).
+    pub vsync_gap_prev_100ns: AtomicU64,
+    /// Smallest gap between two consecutive ticks seen this boot (100 ns
+    /// units); `u64::MAX` = none measured (diag `VsMinGap`).
+    pub vsync_min_gap_100ns: AtomicU64,
+    /// Ticks that came closer than half a period to the previous one this boot
+    /// (diag `VsFast`). 0 on a healthy heartbeat.
+    pub vsync_fast: AtomicU32,
     /// Physical address of the last primary actually programmed for display,
     /// reported in each CRTC_VSYNC packet so dxgkrnl can retire the matching
     /// queued flip (viogpu3d `m_sourceAddress`). Direct scanout publishes only
@@ -1195,6 +1210,10 @@ impl AdapterContext {
             vsync_enabled: AtomicU32::new(0),
             committed_refresh_mhz: AtomicU32::new(0),
             vsync_count: AtomicU32::new(0),
+            vsync_last_100ns: AtomicU64::new(0),
+            vsync_gap_prev_100ns: AtomicU64::new(0),
+            vsync_min_gap_100ns: AtomicU64::new(u64::MAX),
+            vsync_fast: AtomicU32::new(0),
             last_primary_address: AtomicU64::new(0),
             active_scanout_resource: AtomicU32::new(0),
             active_scanout_wh: AtomicU64::new(0),
