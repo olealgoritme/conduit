@@ -1465,7 +1465,14 @@ impl Client {
         }
         if let Some(s) = self.cur.surface {
             let wanted = want.surface;
-            if wanted.is_some() && wanted != Some((s.layout.width, s.layout.height)) {
+            // An export file that was closed as an undo (the extent changed mid-surface)
+            // leaves the stage where it was: the stages that need that file cannot go
+            // on, whatever the extent is now, so the surface goes.
+            let export_lost = self.cur.export_ch == 0
+                && matches!(s.stage, SurfStage::ExportChOpen | SurfStage::Exported);
+            if export_lost
+                || (wanted.is_some() && wanted != Some((s.layout.width, s.layout.height)))
+            {
                 // A different extent: tear the surface down; the next call makes
                 // the new one. An export file still open (stages `ExportChOpen` ..
                 // `Imported`) goes first: nothing else would close it, and the next
@@ -3215,5 +3222,39 @@ mod tests {
         // A working slot that holds a surface cannot take another.
         c.finish(Step::Unpark, Ok(Out::Unit));
         assert!(c.is_dead());
+    }
+
+    #[test]
+    fn a_surface_whose_export_file_was_undone_is_torn_down_even_if_the_extent_comes_back() {
+        // Stage `Exported`, then the extent changes and the export file is closed as an
+        // undo; before the surface is freed the wanted extent returns to the old one.
+        let mut c = client_at(3);
+        assert_eq!(c.next(OTHER_EXTENT), Action::Step(Step::CloseExportChUndo));
+        c.finish(Step::CloseExportChUndo, Ok(Out::Unit));
+        assert_eq!(c.export_ch(), 0);
+        let act = c.next(WANT1);
+        assert!(
+            matches!(act, Action::Step(Step::FreeMemory | Step::GemClose)),
+            "{act:?}: GemImport on a closed export file would kill the client"
+        );
+        // And with no primary at all.
+        let none = Want {
+            level: 1,
+            surface: None,
+        };
+        assert!(matches!(
+            c.next(none),
+            Action::Step(Step::FreeMemory | Step::GemClose)
+        ));
+        // It then makes the surface again, from the start.
+        let mut guard = 0;
+        while let Action::Step(s) = c.next(WANT1) {
+            guard += 1;
+            assert!(guard < 16);
+            let out = ok_out(s, &c);
+            c.finish(s, Ok(out));
+        }
+        assert!(c.ready_surface().is_some());
+        assert!(!c.is_dead());
     }
 }

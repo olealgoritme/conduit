@@ -61,6 +61,9 @@ const MIRROR_EVERY_FRAMES: u32 = 600;
 /// backend sends without waiting for the viewer, so this is generous; it is short
 /// because the HPD worker flips every frame and StopDevice joins it for a bounded time.
 const FLIP_TIMEOUT_MS: u64 = 1_000;
+/// How long after a frame that could not be shown the worker is woken to try again
+/// (100 ms): the failure counter, and so giving up, moves only if it does.
+const RETRY_AFTER_100NS: u64 = 1_000_000;
 /// Consecutive flips that found the source yielded before it counts as a failure (a
 /// registration the arbiter keeps refusing to let us show, with no user source).
 pub const MAX_YIELDS: u32 = 8;
@@ -149,6 +152,33 @@ pub(crate) fn publish_counters() {
     rec(b"RmSrcWhy", RM_SRC_WHY.load(Ordering::Relaxed));
 }
 
+/// Whether this generation's giving up has been counted (`RmGaveUp`).
+static GAVE_UP_COUNTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Time of the last throttled counter mirror / source-verdict record, 100 ns.
+static LAST_MIRROR: AtomicU64 = AtomicU64::new(0);
+/// At most one throttled registry mirror a second: a source verdict or a registration
+/// that flaps (a UMD image bound and unbound) must not make the worker a registry
+/// writer.
+const MIRROR_MIN_INTERVAL_100NS: u64 = 10_000_000;
+
+/// [`publish_counters`], at most once per [`MIRROR_MIN_INTERVAL_100NS`]. PASSIVE.
+fn publish_counters_throttled() {
+    if mirror_due() {
+        publish_counters();
+    }
+}
+
+/// Whether a throttled registry write may happen now (and claims the slot).
+fn mirror_due() -> bool {
+    let now = now_100ns();
+    let last = LAST_MIRROR.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < MIRROR_MIN_INTERVAL_100NS {
+        return false;
+    }
+    LAST_MIRROR.store(now, Ordering::Relaxed);
+    true
+}
+
 // ---- edges -------------------------------------------------------------------------
 
 /// The desktop wanted a host flush and the gate withheld it (the resident source is on
@@ -200,6 +230,7 @@ pub(crate) fn reset() {
     RESUME_EDGE.store(0, Ordering::Release);
     WAKE_AT.store(0, Ordering::Release);
     YIELDS.store(0, Ordering::Release);
+    GAVE_UP_COUNTED.store(false, Ordering::Release);
 }
 
 // ---- the pass ----------------------------------------------------------------------
@@ -258,8 +289,9 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, epoch: u6
             None => Err(SourceRefusal::NoSource),
         };
         let why = source.as_ref().err().map_or(0, |e| *e as u32 + 1);
-        if RM_SRC_WHY.swap(why, Ordering::Relaxed) != why {
-            // A change of verdict is an event: name it in the registry once.
+        if RM_SRC_WHY.swap(why, Ordering::Relaxed) != why && mirror_due() {
+            // A change of verdict is an event: name it in the registry (throttled; the
+            // value is also in every counter mirror).
             crate::diag::record_named_bytes(b"RmSrcWhy", why);
         }
         let (has_resident, foreground) = adapter.foreign_scanout_resident_state();
@@ -283,7 +315,12 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, epoch: u6
             }
             let act = g.p.decide(inputs);
             let g_word = word(&g.p);
+            let gave_up = g.p.gave_up();
             drop(g);
+            if gave_up && !GAVE_UP_COUNTED.swap(true, Ordering::Relaxed) {
+                RM_GAVE_UP.fetch_add(1, Ordering::Relaxed);
+                crate::diag::record_named_bytes(b"RmGaveUp", RM_GAVE_UP.load(Ordering::Relaxed));
+            }
             RM_PRES.store(g_word, Ordering::Relaxed);
             act
         };
@@ -310,12 +347,24 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, epoch: u6
                 };
                 finish_flip(epoch, slot, true, result);
                 if result != FlipResult::Shown {
+                    // The frame is still owed and nothing else will wake the worker
+                    // on an idle desktop: ask for a retry.
+                    WAKE_AT.store(
+                        now_100ns().saturating_add(RETRY_AFTER_100NS),
+                        Ordering::Release,
+                    );
                     return;
                 }
             }
             Act::Reflip { slot } => {
                 let result = reflip(passive, adapter, epoch, want, slot);
                 finish_flip(epoch, slot, false, result);
+                if result != FlipResult::Shown {
+                    WAKE_AT.store(
+                        now_100ns().saturating_add(RETRY_AFTER_100NS),
+                        Ordering::Release,
+                    );
+                }
                 return;
             }
         }
@@ -351,7 +400,7 @@ fn register(adapter: &AdapterContext, epoch: u64) -> bool {
         }
     }
     crate::diag::record_named_bytes(b"RmReg", u32::from(ok));
-    publish_counters();
+    publish_counters_throttled();
     ok
 }
 
@@ -361,12 +410,8 @@ fn withdraw(adapter: &AdapterContext) {
     RM_PSTAGE.store(2, Ordering::Relaxed);
     let _ = adapter.foreign_scanout_resident_drop();
     RM_WITHDRAWN.fetch_add(1, Ordering::Relaxed);
-    if PRESENTER.lock().p.gave_up() {
-        RM_GAVE_UP.fetch_add(1, Ordering::Relaxed);
-        crate::diag::record_named_bytes(b"RmGaveUp", RM_GAVE_UP.load(Ordering::Relaxed));
-    }
     FRAME_EDGE.store(0, Ordering::Release);
-    publish_counters();
+    publish_counters_throttled();
 }
 
 /// Report a flip to the presenter and count it.
@@ -436,6 +481,10 @@ fn judge(r: Result<u64, PresentRefusal>) -> FlipResult {
 }
 
 /// Copy the primary into ring surface `slot` and flip it.
+///
+/// The source is mapped FIRST (host round trips, up to seconds); the view lease is
+/// taken only for the row loop, so the retire path never waits on, or times out
+/// against, a host call.
 #[inline(never)]
 fn copy_flip(
     passive: PassiveLevel,
@@ -446,16 +495,38 @@ fn copy_flip(
     src: &SourceLayout,
     resid: u32,
 ) -> FlipResult {
-    let Some(lease) = lease_slot(epoch, want, usize::from(slot)) else {
-        // The ring went away under the pass (a retire, a mode change): not a failure.
-        return FlipResult::Yielded;
-    };
     RM_PSTAGE.store(3, Ordering::Relaxed);
-    let copied = copy_into(passive, adapter, &lease, src, resid);
-    end_lease();
-    if !copied {
+    // A blob that is already gone has nothing to read.
+    if !adapter
+        .with_virtio(|v| v.resource_is_live(resid))
+        .unwrap_or(false)
+    {
         return FlipResult::SourceFailed;
     }
+    let Ok(prep) = crate::virtio::ctrl::map_blob_prepare(passive, adapter, OwnerFilter::Any, resid)
+    else {
+        return FlipResult::SourceFailed;
+    };
+    let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
+    pa.QuadPart = prep.gpa as i64;
+    // The cache attribute MUST be the host's (`MAP_INFO`): an alias with another one
+    // is architecturally invalid, and reading a WC view is slow but correct.
+    let cache = crate::ddi::blob_map::map_cache_to_mm(prep.map_cache);
+    // SAFETY: PASSIVE (the HPD worker); the range was RESOURCE_MAP_BLOB'd into the
+    // host-visible window by `map_blob_prepare`, so the pages are backed. Unmapped
+    // below, on every path.
+    let src_va = unsafe { MmMapIoSpace(pa, prep.size, cache) } as *const u8;
+    if src_va.is_null() {
+        return FlipResult::SourceFailed;
+    }
+    // Nothing below may start a host round trip until the lease ends.
+    let copied = copy_leased(adapter, epoch, want, slot, src, src_va, prep.size);
+    // SAFETY: the mapping made above, exact size.
+    unsafe { MmUnmapIoSpace(src_va as *mut core::ffi::c_void, prep.size) };
+    let lease = match copied {
+        Ok(lease) => lease,
+        Err(r) => return r,
+    };
     RM_PSTAGE.store(5, Ordering::Relaxed);
     judge(present_within(
         passive,
@@ -465,6 +536,53 @@ fn copy_flip(
         lease.gem,
         FLIP_TIMEOUT_MS,
     ))
+}
+
+/// With the source mapped: lease the slot, copy the rows, end the lease. No host call
+/// and nothing that can block between the lease and its end.
+#[inline(never)]
+fn copy_leased(
+    adapter: &AdapterContext,
+    epoch: u64,
+    want: Want,
+    slot: u8,
+    src: &SourceLayout,
+    src_va: *const u8,
+    src_len: u64,
+) -> Result<rm_client::Lease, FlipResult> {
+    // The worker is being stopped: the retire path is on its way and must not find a
+    // lease it has to wait for.
+    if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
+        return Err(FlipResult::Yielded);
+    }
+    let Some(lease) = lease_slot(epoch, want, usize::from(slot)) else {
+        // The ring went away under the pass (a retire, a mode change): not a failure.
+        return Err(FlipResult::Yielded);
+    };
+    let (dst_va, dst_len) = lease.view;
+    let plan = if dst_va == 0 {
+        None
+    } else {
+        CopyPlan::new(src, src_len, lease.layout.pitch, dst_len, 0, src.height)
+    };
+    let Some(plan) = plan else {
+        end_lease();
+        return Err(FlipResult::SourceFailed);
+    };
+    RM_PSTAGE.store(4, Ordering::Relaxed);
+    let started = now_100ns();
+    // SAFETY: `plan` proved every row of both mappings in range (`src_len` = the blob
+    // mapping the caller holds, `dst_len` = the leased view); the view stays mapped
+    // while the lease is held (the retire path waits for it), the source until the
+    // caller unmaps it, after this returns.
+    unsafe { copy_frame(&plan, src_va, dst_va as *mut u8) };
+    end_lease();
+    let ms = (now_100ns().wrapping_sub(started) / 10_000).min(u64::from(u32::MAX)) as u32;
+    RM_COPY_MS.store(ms, Ordering::Relaxed);
+    RM_COPY_MAX_MS.fetch_max(ms, Ordering::Relaxed);
+    let mb_before = COPIED_BYTES.fetch_add(plan.bytes(), Ordering::Relaxed);
+    RM_COPY_MB.store(((mb_before + plan.bytes()) >> 20) as u32, Ordering::Relaxed);
+    Ok(lease)
 }
 
 /// Flip ring surface `slot` again, with no copy.
@@ -490,63 +608,6 @@ fn reflip(
         lease.gem,
         FLIP_TIMEOUT_MS,
     ))
-}
-
-/// Map the primary's blob, copy `src`'s rows into the leased view, unmap. `false` if
-/// anything could not be done (counted by the caller).
-#[inline(never)]
-fn copy_into(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    lease: &rm_client::Lease,
-    src: &SourceLayout,
-    resid: u32,
-) -> bool {
-    // A blob that is already gone has nothing to read.
-    if !adapter
-        .with_virtio(|v| v.resource_is_live(resid))
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    let Ok(prep) = crate::virtio::ctrl::map_blob_prepare(passive, adapter, OwnerFilter::Any, resid)
-    else {
-        return false;
-    };
-    let (dst_va, dst_len) = lease.view;
-    if dst_va == 0 {
-        return false;
-    }
-    let Some(plan) = CopyPlan::new(src, prep.size, lease.layout.pitch, dst_len, 0, src.height)
-    else {
-        return false;
-    };
-    let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
-    pa.QuadPart = prep.gpa as i64;
-    // The cache attribute MUST be the host's (`MAP_INFO`): an alias with another one
-    // is architecturally invalid, and reading a WC view is slow but correct.
-    let cache = crate::ddi::blob_map::map_cache_to_mm(prep.map_cache);
-    // SAFETY: PASSIVE (the HPD worker); the range was RESOURCE_MAP_BLOB'd into the
-    // host-visible window by `map_blob_prepare`, so the pages are backed. Unmapped
-    // below, on every path.
-    let src_va = unsafe { MmMapIoSpace(pa, prep.size, cache) } as *const u8;
-    if src_va.is_null() {
-        return false;
-    }
-    RM_PSTAGE.store(4, Ordering::Relaxed);
-    let started = now_100ns();
-    // SAFETY: `plan` proved every row of both mappings in range (`src_len` = the blob
-    // mapping just made, `dst_len` = the leased view); the view stays mapped while the
-    // lease is held (the retire path waits for it), and `src_va` until the unmap below.
-    unsafe { copy_frame(&plan, src_va, dst_va as *mut u8) };
-    // SAFETY: the mapping made above, exact size.
-    unsafe { MmUnmapIoSpace(src_va as *mut core::ffi::c_void, prep.size) };
-    let ms = (now_100ns().wrapping_sub(started) / 10_000).min(u64::from(u32::MAX)) as u32;
-    RM_COPY_MS.store(ms, Ordering::Relaxed);
-    RM_COPY_MAX_MS.fetch_max(ms, Ordering::Relaxed);
-    let mb_before = COPIED_BYTES.fetch_add(plan.bytes(), Ordering::Relaxed);
-    RM_COPY_MB.store(((mb_before + plan.bytes()) >> 20) as u32, Ordering::Relaxed);
-    true
 }
 
 /// Bytes copied since boot, for `RmCopyMB`.

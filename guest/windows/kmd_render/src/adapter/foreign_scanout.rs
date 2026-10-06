@@ -255,8 +255,13 @@ impl AdapterContext {
     /// with them, are gone. Called from `reset_display_publication_state`, which
     /// rebuilds the display state from scratch, so no restore is owed.
     pub(crate) fn foreign_scanout_reset(&self) {
-        if STATE.lock().reset() {
-            FS_ENDED.fetch_add(1, Ordering::Relaxed);
+        let (ended, was_resident) = {
+            let mut g = STATE.lock();
+            let was = g.resident_foreground();
+            (g.reset(), was)
+        };
+        if ended {
+            self.count_end(was_resident);
         }
     }
 
