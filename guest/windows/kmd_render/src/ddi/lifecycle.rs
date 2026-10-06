@@ -205,6 +205,8 @@ fn reread_cached_knobs() {
     let _ = crate::diag::reread_level();
     let _ = crate::virtio::nvrm_harden::reread_mode();
     let _ = crate::virtio::ctrl::reread_spin_knob();
+    // `FlipWdogMs` and `DeferBudget` (`FlWdMsEff`, `DefBudEff`): 0 = off, today's behaviour.
+    crate::ddi::stall_diag::reread_knobs();
 }
 
 /// After the previous transport's state was forgotten (`retire_transport`): the new generation's
@@ -221,6 +223,9 @@ fn start_generation_mirrors() {
     // mirroring `FfKnob` first), as does the `Fk*` block.
     crate::virtio::foreign_flip::publish_counters();
     crate::ddi::flip_keep::publish_counters();
+    // The stall-diagnosis block (`HpdLoopN`, `FlipIss`, `VsPendN`, ...): zeroed, `StartN` bumped,
+    // written once. After the worker of the previous generation was stopped.
+    crate::ddi::stall_diag::start_generation();
 }
 
 /// Flush the service key (when `flush`) so the stage just recorded survives a

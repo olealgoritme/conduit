@@ -279,12 +279,17 @@ impl AdapterContext {
                 core::ptr::null_mut(),
             )
         };
+        // `ScLkN` / `ScLkAcqT` / `ScLkRelT` (`ddi::stall_diag`): when the mutex was last taken
+        // and last given back, so a stall dump can tell "the worker waits on a mutex somebody
+        // holds for seconds" from "the worker holds it". Atomics and a clock read.
+        crate::ddi::stall_diag::note_lock_acquired();
         let guard = ScanoutGuard {
             adapter: self,
             passive,
             _not_send: PhantomData,
         };
         let result = f(&guard);
+        crate::ddi::stall_diag::note_lock_released();
         // SAFETY: release the synchronization-event mutex acquired above.
         unsafe { KeSetEvent(self.scanout_mutex.get(), 0, 0) };
         result
