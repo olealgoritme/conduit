@@ -29,6 +29,9 @@
 #include "shaders/tess_tesc.h"
 #include "shaders/tess_tese.h"
 #include "shaders/tess_vert.h"
+#include "shaders/tri_vert.h"
+#include "shaders/tri_tesc.h"
+#include "shaders/tri_tese.h"
 #include "shaders/tex_frag.h"
 #include "shaders/ubo_vert.h"
 
@@ -214,7 +217,7 @@ static VkDescriptorPool dpool;
 struct gfx_desc {
    VkShaderModule vs, tcs, tes, fs;
    VkFormat color;
-   bool blend, depth, mesh_vb;
+   bool blend, depth, mesh_vb, patch3;
    VkPrimitiveTopology topo;
 };
 
@@ -247,7 +250,7 @@ make_gfx(const struct gfx_desc *d)
    };
    VkPipelineTessellationStateCreateInfo ts = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
-      .patchControlPoints = 4,
+      .patchControlPoints = d->patch3 ? 3 : 4,
    };
    VkViewport vp = { 0, 0, W, H, 0, 1 };
    VkRect2D sc = { { 0, 0 }, { W, H } };
@@ -432,7 +435,7 @@ ts_end(VkCommandBuffer cmd)
 
 static struct img rt8, rt8b, rt16, depth, tex;
 static VkSampler sampler;
-static VkShaderModule m_fsqz, m_fsq, m_alu, m_tex, m_blend, m_ubo, m_color, m_colortex,
+static VkShaderModule m_trivs, m_tritcs, m_trites, m_fsqz, m_fsq, m_alu, m_tex, m_blend, m_ubo, m_color, m_colortex,
    m_mesh, m_meshubo, m_tvs, m_tcs, m_tes, m_copy;
 
 static void
@@ -611,10 +614,12 @@ test_ubo_draws(VkPipeline p, enum placement pl, int ndraws, bool switch_sets,
    ts_begin(cmd);
    begin_render(cmd, &rt8, true, false);
    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+   const bool bind_once = label[0] == 'p'; /* "plain draws" */
    for (int i = 0; i < ndraws; i++) {
       uint32_t off = i * UBO_STRIDE;
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl_gfx, 0,
-                              1, &sets[i % nsets], 1, &off);
+      if (!bind_once || i == 0)
+         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl_gfx, 0,
+                                 1, &sets[i % nsets], 1, &off);
       vkCmdDraw(cmd, 4, 1, 0, 0);
    }
    vkCmdEndRendering(cmd);
@@ -1005,6 +1010,50 @@ test_zcull(VkPipeline p, bool front_to_back)
    vkFreeCommandBuffers(dev, cpool, 1, &cmd);
 }
 
+/* Displacement-mapped terrain: triangle patches, distance-based levels
+ * from a UBO in the TCS, three texture fetches in the TES; ndraws draws
+ * of grid x grid cells with their own dynamic UBO each. */
+static void
+test_tess_terrain(VkPipeline p, float level, int grid, int ndraws)
+{
+   struct buf ubo;
+   make_draw_ubos(&ubo, ndraws, PL_DEVICE, 1.0f);
+   float *m = calloc(ndraws, UBO_STRIDE);
+   for (int i = 0; i < ndraws; i++) {
+      float *q = m + i * UBO_STRIDE / 4;
+      q[0] = q[5] = q[10] = q[15] = 1.0f;
+      q[12] = (i % 4) * 0.05f; q[13] = (i / 4 % 4) * 0.05f;
+      q[16] = q[17] = q[18] = q[19] = 1.0f;
+   }
+   free_buffer(&ubo);
+   upload_buffer(&ubo, m, (VkDeviceSize)ndraws * UBO_STRIDE,
+                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, PL_DEVICE);
+   free(m);
+   VkDescriptorSet set = alloc_set(dsl_gfx);
+   write_gfx_set(set, ubo.buf);
+   VkCommandBuffer cmd = begin_cmd();
+   ts_begin(cmd);
+   begin_render(cmd, &rt8, true, true);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+   float pc[4] = { level, (float)grid, 0, 0 };
+   vkCmdPushConstants(cmd, pl_gfx, VK_SHADER_STAGE_ALL, 0, 16, pc);
+   for (int i = 0; i < ndraws; i++) {
+      uint32_t off = i * UBO_STRIDE;
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl_gfx, 0,
+                              1, &set, 1, &off);
+      vkCmdDraw(cmd, grid * grid * 6, 1, 0, 0);
+   }
+   vkCmdEndRendering(cmd);
+   ts_end(cmd);
+   double cpu, gpu = time_cmd(cmd, &cpu);
+   char name[64];
+   snprintf(name, sizeof(name), "terrain L%.0f %dx%d x%d", level, grid, grid, ndraws);
+   report(name, "Mpatch/s", (double)grid * grid * 2 * ndraws, gpu, cpu);
+   vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+   free_buffer(&ubo);
+   reset_sets();
+}
+
 static bool
 want(const char *tests, const char *t)
 {
@@ -1206,6 +1255,9 @@ main(int argc, char **argv)
    write_gfx_set(set_default, dummy_ubo.buf);
 
    m_fsq = SHADER(spv_fsq_vert);
+   m_trivs = SHADER(spv_tri_vert);
+   m_tritcs = SHADER(spv_tri_tesc);
+   m_trites = SHADER(spv_tri_tese);
    m_fsqz = SHADER(spv_fsqz_vert);
    m_alu = SHADER(spv_alu_frag);
    m_tex = SHADER(spv_tex_frag);
@@ -1225,6 +1277,9 @@ main(int argc, char **argv)
       .color = VK_FORMAT_R8G8B8A8_UNORM, .topo = TL });
    VkPipeline p_aluz = make_gfx(&(struct gfx_desc){ .vs = m_fsqz, .fs = m_alu,
       .color = VK_FORMAT_R8G8B8A8_UNORM, .depth = true, .topo = TL });
+   VkPipeline p_tess2 = make_gfx(&(struct gfx_desc){ .vs = m_trivs, .tcs = m_tritcs,
+      .tes = m_trites, .fs = m_color, .color = VK_FORMAT_R8G8B8A8_UNORM,
+      .depth = true, .topo = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST, .patch3 = true });
    VkPipeline p_tex = make_gfx(&(struct gfx_desc){ .vs = m_fsq, .fs = m_tex,
       .color = VK_FORMAT_R8G8B8A8_UNORM, .topo = TL });
    VkPipeline p_blend = make_gfx(&(struct gfx_desc){ .vs = m_fsq, .fs = m_blend,
@@ -1277,6 +1332,7 @@ main(int argc, char **argv)
    if (want(tests, "clear"))
       test_clear();
    if (want(tests, "ubo")) {
+      test_ubo_draws(p_ubo, PL_DEVICE, 20000, false, "plain draws");
       test_ubo_draws(p_ubo, PL_DEVICE, 20000, false, "ubo draws");
       test_ubo_draws(p_ubo, PL_HOST, 20000, false, "ubo draws");
       test_ubo_draws(p_ubo, PL_DEVICE_HOST, 20000, false, "ubo draws");
@@ -1296,6 +1352,11 @@ main(int argc, char **argv)
    if (want(tests, "tess")) {
       test_tess(p_tess, 16, 64);
       test_tess(p_tess, 64, 16);
+   }
+   if (want(tests, "terrain")) {
+      test_tess_terrain(p_tess2, 4, 128, 4);
+      test_tess_terrain(p_tess2, 16, 64, 4);
+      test_tess_terrain(p_tess2, 16, 8, 500);
    }
    if (want(tests, "copy")) {
       test_copy(p_copy, 256ull << 20, PL_DEVICE, 4);
