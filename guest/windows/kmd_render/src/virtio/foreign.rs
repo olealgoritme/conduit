@@ -7,8 +7,9 @@
 //!
 //! 1. **Gate.** Until the host serves the import (`RM_IMPORT_SERVED`), nothing
 //!    is touched: no reservation, no wire traffic.
-//! 2. **Structure.** `validate_request`: ids nonzero, flags zero, a whole number
-//!    of pages within the per-resource cap. Pure.
+//! 2. **Structure.** `validate_request`: ids nonzero, flags known, a whole number
+//!    of pages within the per-resource cap, and a layout (mandatory) that is valid
+//!    and fits the size. Pure.
 //! 3. **Ownership and quota, one lock hold.** The caller must own the DRM file
 //!    and the Venus context, and the reservation is taken in the same hold, so
 //!    neither answer can be stale when the reservation exists.
@@ -29,7 +30,7 @@ use super::gpu::{DeviceOwner, ForeignBegin, ForeignCommit};
 use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
-use helios_kmd_logic::foreign_resource::{foreign_blob_id, validate_request, RefusalKind};
+use helios_kmd_logic::foreign_resource::{foreign_blob_id, validate_request, Layout, RefusalKind};
 use helios_protocol::HELIOS_BLOB_MEM_RM_EXPORT;
 
 /// Whether the whole path is served: this KMD AND a host that creates a
@@ -40,10 +41,26 @@ use helios_protocol::HELIOS_BLOB_MEM_RM_EXPORT;
 /// `HELIOS_FOREIGN_CAP_RM_IMPORT` clear and `IMPORT_RM` answers `UNSUPPORTED`
 /// without doing anything.
 ///
-/// To open the gate: set it to `true` when the host change lands, and make it
-/// follow a host config feature bit if the host grows one (the KMD reads
-/// config `features` once at init, `CONDUIT_CFG_*`). The open questions are in
-/// the design note, section "Open questions".
+/// # Opening the gate: a one-line change, with preconditions
+///
+/// Change this to `true`, and nothing else in the KMD. Everything downstream
+/// (the caps bit, `IMPORT_RM`, adoption of the resulting resid by a WDDM
+/// allocation, the layout record) is already written and is dead code while
+/// this is `false`. Do it only when ALL of these hold:
+///
+/// 1. The host serves `RESOURCE_CREATE_BLOB` with `blob_mem = 0x80000001`
+///    (zero-copy-present.md H1 to H4): GEM lookup in the DRM file, dma-buf
+///    import into the renderer, size check, own reference.
+/// 2. The host has advertised it with a config `features` bit, and this const is
+///    replaced by a read of that bit at init (the KMD reads config features
+///    once, `CONDUIT_CFG_*`); a KMD must never serve the verb to a host that
+///    would answer `DEVICE_ERROR` to every call.
+/// 3. The host imports the object with the layout the KMD records. The record's
+///    layout is NOT on the `RESOURCE_CREATE_BLOB` wire (the 56-byte command has
+///    no room); the host must obtain it another way (it holds the GEM object)
+///    or a layout-carrying message must be added: see "Open questions" in the
+///    design note.
+/// 4. The deferred review findings in the design note are fixed or accepted.
 pub const RM_IMPORT_SERVED: bool = false;
 
 /// `IMPORT_RM` requests turned away because the gate is closed (`FgUns`).
@@ -85,15 +102,16 @@ pub fn import_rm(
     gem_handle: u32,
     flags: u32,
     size: u64,
+    layout: Option<Layout>,
 ) -> Result<u32, ImportError> {
     if !RM_IMPORT_SERVED {
         IMPORT_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
         return Err(ImportError::Unsupported);
     }
-    if validate_request(ctx_id, rm_handle, gem_handle, flags, size).is_err() {
+    let Ok(layout) = validate_request(ctx_id, rm_handle, gem_handle, flags, size, layout) else {
         let _ = adapter.with_virtio(|v| v.foreign_note_refusal(RefusalKind::BadRequest));
         return Err(ImportError::BadRequest);
-    }
+    };
     let begin = adapter
         .with_virtio(|v| v.foreign_begin_import(owner, ctx_id, rm_handle, size))
         .map_err(|_| ImportError::NoTransport)?;
@@ -133,6 +151,7 @@ pub fn import_rm(
             ctx_id,
             rm_handle,
             gem_handle,
+            layout,
         )
     });
     match committed {
@@ -169,6 +188,7 @@ pub fn publish_counters(adapter: &AdapterContext, owner: DeviceOwner) {
         crate::diag::record_named_bytes(b"FgRefC", c.refused_context);
         crate::diag::record_named_bytes(b"FgRefR", c.refused_request);
         crate::diag::record_named_bytes(b"FgRefH", c.refused_host);
+        crate::diag::record_named_bytes(b"FgRefA", c.refused_adopt);
     }
     crate::diag::record_named_bytes(b"FgUns", IMPORT_UNSUPPORTED.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"FgMapRf", MAP_REFUSED.load(Ordering::Relaxed));

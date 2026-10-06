@@ -18,13 +18,15 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bytemuck::{bytes_of, pod_read_unaligned, Zeroable};
 use helios_protocol::{
-    HeliosWddmAllocMeta, HeliosWddmAllocPrivate, HeliosWddmOpenIdentity,
-    HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD,
-    HELIOS_WDDM_ALLOC_KIND_TRACKING, HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT,
-    HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK, HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT,
-    HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE, HELIOS_WDDM_ALLOC_MISC_PRIMARY,
-    HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED, HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK,
-    HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT, HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING,
+    HeliosWddmAllocLayout, HeliosWddmAllocMeta, HeliosWddmAllocPrivate, HeliosWddmOpenIdentity,
+    HELIOS_BLOB_MEM_RM_EXPORT, HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+    HELIOS_WDDM_ALLOC_KIND_STANDARD, HELIOS_WDDM_ALLOC_KIND_TRACKING,
+    HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT, HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK,
+    HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT, HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE,
+    HELIOS_WDDM_ALLOC_MISC_PRIMARY, HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED,
+    HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK, HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT,
+    HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER, HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING,
+    HELIOS_WDDM_LAYOUT_OFFSET, HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES,
     VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
     VIRTIO_GPU_MAP_CACHE_WC,
 };
@@ -38,6 +40,8 @@ use crate::dxgk::_D3DKMDT_STANDARDALLOCATION_TYPE::{
 };
 use crate::dxgk::*;
 use crate::irql::PassiveLevel;
+use crate::virtio::gpu::AllocAdopt;
+use helios_kmd_logic::foreign_resource::{self as fr, AdoptRequest};
 use helios_kmd_logic::snapshot_bind::SnapshotDescriptor;
 use helios_kmd_logic::ScanoutFormat;
 
@@ -1565,6 +1569,29 @@ unsafe fn read_standard_meta(
     Some(pod_read_unaligned(&raw))
 }
 
+/// The creator's optional [`HeliosWddmAllocLayout`] trailer (foreign adoption
+/// only). `None` when the buffer cannot hold it or the record is not a valid
+/// one: absent and malformed read alike, and the adoption then simply has no
+/// supplied layout to compare (the recorded one is what counts).
+unsafe fn read_layout_trailer(
+    private: *const c_void,
+    private_size: UINT,
+) -> Option<HeliosWddmAllocLayout> {
+    if private.is_null() || (private_size as usize) < HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES {
+        return None;
+    }
+    // SAFETY: the length check above proves HELIOS_WDDM_LAYOUT_OFFSET + 32 bytes
+    // exist at `private`; read unaligned like every other private-data read.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (private as *const u8).add(HELIOS_WDDM_LAYOUT_OFFSET),
+            size_of::<HeliosWddmAllocLayout>(),
+        )
+    };
+    let layout: HeliosWddmAllocLayout = pod_read_unaligned(bytes);
+    layout.is_valid().then_some(layout)
+}
+
 /// Identity summary parsed from an allocation's private driver data at
 /// OpenAllocation time. Sourced from either layout the buffer may hold:
 /// the creator's [`HeliosWddmAllocPrivate`] (with the create-time adopt id
@@ -2071,6 +2098,42 @@ impl BackingSize {
     }
 }
 
+/// Whether the backing is a foreign (RM-exported) resource this allocation just
+/// adopted, and if so the layout the KMD recorded for it. An enum rather than
+/// an `Option` for the reason [`CreatedBacking`] gives: every arm must say.
+#[derive(Clone, Copy)]
+enum ForeignBacking {
+    /// An ordinary Venus or KMD-created backing.
+    No,
+    /// A foreign resource, adopted: write this layout back for openers.
+    Adopted(fr::Layout),
+}
+
+/// What `create_one` read from the private data that only a foreign adoption
+/// consults. Built once, handed to [`build_backing`].
+#[derive(Clone, Copy)]
+struct ForeignAdoptInput {
+    /// `blob_mem == HELIOS_BLOB_MEM_RM_EXPORT` outside the typed-tracker shape
+    /// (where `blob_mem` is a cookie, never a memory type).
+    declares_foreign: bool,
+    /// The creator's optional layout trailer, with the meta's extent filled in.
+    supplied_layout: Option<fr::Layout>,
+    /// The per-allocation buffer is large enough for the trailer the KMD writes.
+    trailer_room: bool,
+}
+
+/// Foreign-adoption refusals, for the registry trace (`FgAdRf`): first and every
+/// 64th, since the path is guest-reachable. PASSIVE only, like every caller.
+static FOREIGN_ADOPT_REFUSED: AtomicU32 = AtomicU32::new(0);
+
+fn note_foreign_adopt_refusal(code: u32) {
+    let n = FOREIGN_ADOPT_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 64 == 0 {
+        crate::diag::record_named_bytes(b"FgAdRf", code);
+        crate::diag::record_named_bytes(b"FgAdRfN", n);
+    }
+}
+
 /// Everything one [`helios_protocol::AllocationBacking`] arm must answer.
 ///
 /// NO `Option` fields and NO `Default`, deliberately: that is what forces every
@@ -2104,6 +2167,8 @@ struct CreatedBacking {
     /// Cross-process Vulkan object identity for the exported allocation. This
     /// is deliberately not derived later from the paging policy.
     dedicated_present_buffer: bool,
+    /// Foreign-resource adoption result; `No` for every other arm.
+    foreign: ForeignBacking,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2125,6 +2190,7 @@ fn build_backing(
     backing: helios_protocol::AllocationBacking,
     ap: &HeliosWddmAllocPrivate,
     meta: &HeliosWddmAllocMeta,
+    foreign: &ForeignAdoptInput,
 ) -> Result<CreatedBacking, NTSTATUS> {
     use helios_protocol::AllocationBacking as Backing;
 
@@ -2171,6 +2237,7 @@ fn build_backing(
                 blob_size: BackingSize::NonHostAuthoritative(size),
                 system_backing_policy: SystemBackingPolicy::None,
                 dedicated_present_buffer: false,
+                foreign: ForeignBacking::No,
             })
         }
         Backing::AdoptedUmdResource {
@@ -2184,31 +2251,62 @@ fn build_backing(
             // res-45 invalid-import class). Adopting a DEAD resid is a hard
             // error: succeeding here would create a permanently-black shared
             // surface that poisons every opener's venus ring at import time.
-            let adopted_blob_size = match adapter.with_virtio(|v| {
-                if take_ownership {
-                    v.adopt_blob_for_allocation(resource_id)
-                } else {
-                    v.live_blob_size(resource_id)
-                }
-            }) {
-                Ok(Some(size)) if size != 0 => size,
-                Ok(_) => {
-                    crate::diag::record(0x0C01_00E4);
-                    return Err(STATUS_INVALID_PARAMETER);
-                }
-                Err(_de) => {
-                    crate::diag::record(0x0C01_00E1);
-                    return Err(STATUS_DEVICE_NOT_READY);
+            //
+            // A FOREIGN resource (RM-exported, `IMPORT_RM`) takes the same
+            // transfer under stricter rules, decided in one device-lock hold by
+            // `adopt_for_allocation` (see `ForeignTable::adopt_for_allocation`):
+            // declared and recorded must agree, DEVICE_MEMORY only, once only,
+            // the holder context of the import, and the layout repeated.
+            let request = AdoptRequest {
+                declares_foreign: foreign.declares_foreign,
+                take_ownership,
+                ctx_id: ap.ctx_id,
+                width: meta.width,
+                height: meta.height,
+                pitch: meta.pitch,
+                plane_offset: meta.plane_offset,
+                claimed_alloc_size: meta.venus_alloc_size,
+                supplied_layout: foreign.supplied_layout,
+                trailer_room: foreign.trailer_room,
+            };
+            let (adopted_blob_size, foreign_backing) =
+                match adapter.with_virtio(|v| v.adopt_for_allocation(resource_id, &request)) {
+                    Ok(AllocAdopt::Legacy(Some(size))) if size != 0 => (size, ForeignBacking::No),
+                    Ok(AllocAdopt::Legacy(_)) => {
+                        crate::diag::record(0x0C01_00E4);
+                        return Err(STATUS_INVALID_PARAMETER);
+                    }
+                    // The recorded size is the host-verified one (never 0: the
+                    // import refuses a zero size).
+                    Ok(AllocAdopt::Foreign(adopted)) => {
+                        (adopted.size, ForeignBacking::Adopted(adopted.layout))
+                    }
+                    Ok(AllocAdopt::Refused(refusal)) => {
+                        note_foreign_adopt_refusal(refusal.code());
+                        return Err(STATUS_INVALID_PARAMETER);
+                    }
+                    Err(_de) => {
+                        crate::diag::record(0x0C01_00E1);
+                        return Err(STATUS_DEVICE_NOT_READY);
+                    }
+                };
+            // For a foreign resource the layout, not the creator's trailer, is
+            // authoritative for the row geometry, and the recorded size is the
+            // exact import size (there is no creator-side vkAllocateMemory).
+            let (pitch, plane_offset, venus_alloc_size) = match foreign_backing {
+                ForeignBacking::No => (meta.pitch, meta.plane_offset, claimed_alloc_size),
+                ForeignBacking::Adopted(layout) => {
+                    (layout.stride, u64::from(layout.offset), adopted_blob_size)
                 }
             };
             Ok(CreatedBacking {
                 resource_id,
                 venus_memory_id: 0,
                 venus_image_id: 0,
-                pitch: meta.pitch,
-                plane_offset: meta.plane_offset,
+                pitch,
+                plane_offset,
                 dxgi_format: meta.dxgi_format,
-                venus_alloc_size: claimed_alloc_size,
+                venus_alloc_size,
                 memory_type_index: meta.memory_type_index,
                 // The escape-time blob table records the size that actually
                 // created this resource. Keep the non-host-authoritative
@@ -2217,6 +2315,7 @@ fn build_backing(
                 blob_size: BackingSize::NonHostAuthoritative(adopted_blob_size),
                 system_backing_policy: SystemBackingPolicy::None,
                 dedicated_present_buffer: false,
+                foreign: foreign_backing,
             })
         }
         Backing::KmdLinearPrimary { width, height } => {
@@ -2237,6 +2336,7 @@ fn build_backing(
                     blob_size: BackingSize::HostAuthoritative(scanout.blob.size),
                     system_backing_policy: SystemBackingPolicy::None,
                     dedicated_present_buffer: false,
+                    foreign: ForeignBacking::No,
                 }),
                 Ok(Err(_ve)) => {
                     crate::diag::record(0x0C01_00E5);
@@ -2282,6 +2382,7 @@ fn build_backing(
                     blob_size: BackingSize::HostAuthoritative(image.blob.size),
                     system_backing_policy: SystemBackingPolicy::None,
                     dedicated_present_buffer: false,
+                    foreign: ForeignBacking::No,
                 }),
                 Ok(Err(_ve)) => {
                     crate::diag::record_named_bytes(b"GdiOImg", 0xE1);
@@ -2339,6 +2440,7 @@ fn build_backing(
                         SystemBackingPolicy::PresentLinearBuffer
                     },
                     dedicated_present_buffer: !primary,
+                    foreign: ForeignBacking::No,
                 }),
                 Ok(Err(_ve)) => {
                     crate::diag::record(0x0C01_00E3);
@@ -2377,6 +2479,7 @@ fn build_backing(
                     blob_size: BackingSize::NonHostAuthoritative(size),
                     system_backing_policy: SystemBackingPolicy::None,
                     dedicated_present_buffer: false,
+                    foreign: ForeignBacking::No,
                 })
             }
             Err(_ve) => {
@@ -2498,10 +2601,42 @@ unsafe fn create_one(
             return Err(STATUS_NOT_SUPPORTED);
         }
     };
+    // A raw HOST3D blob forwards `blob_mem` to the host verbatim. The vendor
+    // RM-export type is only ever minted by `IMPORT_RM`, which proves the
+    // caller owns the DRM file and context and meters the quota; letting a
+    // create-allocation private-data word reach the host with it would bypass
+    // all three. Refused whether or not the gate is open.
+    if matches!(
+        backing,
+        helios_protocol::AllocationBacking::RawHost3dBlob { blob_mem, .. }
+            if blob_mem == HELIOS_BLOB_MEM_RM_EXPORT
+    ) {
+        note_foreign_adopt_refusal(0x100);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
     let adopt_supplied_resource = matches!(
         backing,
         helios_protocol::AllocationBacking::AdoptedUmdResource { .. }
     );
+    // Only an adoption consults these. `blob_mem` is a memory type everywhere
+    // except the typed global-tracker shape, where it is the association cookie.
+    let foreign_input = ForeignAdoptInput {
+        declares_foreign: ap.blob_mem == HELIOS_BLOB_MEM_RM_EXPORT
+            && ap.blob_flags & HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER == 0,
+        supplied_layout: unsafe {
+            read_layout_trailer(priv_ptr as *const c_void, priv_len as UINT)
+        }
+        .map(|t| fr::Layout {
+            width: meta.width,
+            height: meta.height,
+            stride: t.stride,
+            offset: t.plane_offset,
+            fourcc: t.fourcc,
+            modifier: t.modifier,
+        }),
+        trailer_room: !write_target.is_null()
+            && write_target_len >= HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES,
+    };
     let is_primary = (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_PRIMARY) != 0;
     // Deliberately the FLAG, not the backing arm. This is a VidMm policy input
     // (CpuVisible=0, no Cached, not BAR-eligible), not a backing class, and
@@ -2509,7 +2644,7 @@ unsafe fn create_one(
     // PRIMARY | OPTIMAL_GDI_TEXTURE combination, which classifies as the primary.
     let is_optimal_gdi_texture = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
         && (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE) != 0;
-    let created = build_backing(passive, adapter, backing, &ap, &meta)?;
+    let created = build_backing(passive, adapter, backing, &ap, &meta, &foreign_input)?;
 
     // THE one update site. `meta`/`ap` used to be mutated in place by each arm
     // and read again 100-470 lines later, with nothing stating which fields an
@@ -2519,6 +2654,7 @@ unsafe fn create_one(
     let venus_image_id = created.venus_image_id;
     let system_backing_policy = created.system_backing_policy;
     let dedicated_present_buffer = created.dedicated_present_buffer;
+    let foreign_backing = created.foreign;
     meta.pitch = created.pitch;
     meta.plane_offset = created.plane_offset;
     meta.dxgi_format = created.dxgi_format;
@@ -2612,6 +2748,30 @@ unsafe fn create_one(
                 )
             };
             meta_dst.copy_from_slice(bytes_of(&meta));
+        }
+        if let ForeignBacking::Adopted(layout) = foreign_backing {
+            // The KMD-validated layout, for the creator and every opener, in
+            // place of whatever the creator wrote there. `trailer_room` was
+            // proven for this exact buffer before the adoption could succeed.
+            let trailer = HeliosWddmAllocLayout {
+                modifier: layout.modifier,
+                magic: helios_protocol::HELIOS_WDDM_LAYOUT_MAGIC,
+                version: helios_protocol::HELIOS_WDDM_LAYOUT_VERSION,
+                fourcc: layout.fourcc,
+                stride: layout.stride,
+                plane_offset: layout.offset,
+                reserved: 0,
+            };
+            // SAFETY: `write_target_len >= HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES`
+            // was checked (non-null too) as `trailer_room`; the buffer is the
+            // per-allocation runtime-owned one, writable for this DDI call.
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (write_target as *mut u8).add(HELIOS_WDDM_LAYOUT_OFFSET),
+                    size_of::<HeliosWddmAllocLayout>(),
+                )
+            };
+            dst.copy_from_slice(bytes_of(&trailer));
         }
         crate::diag::record(0x0C3B_0000 | (resource_id & 0xFFFF));
     }

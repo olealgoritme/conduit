@@ -363,6 +363,13 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"PsMkAhdHi",
         crate::virtio::gpu::PRESENT_STREAM_MARKER_AHEAD_HIGH_WATER.load(Ordering::Relaxed),
     );
+    // S3: markers that named a stream with value 0 ("already complete", a
+    // CPU-complete present). Movement here with no PsMkAhd movement is the NVK
+    // path; see `virtio/counters.rs`.
+    crate::diag::record_named_bytes(
+        b"PsMkCpl",
+        crate::virtio::gpu::PRESENT_STREAM_MARKER_COMPLETE.load(Ordering::Relaxed),
+    );
     // HE12 v2: accepted exact records and validation failures. D12Zero is a
     // retired diagnostic; a zero boundary is refused before submission.
     crate::diag::record_named_bytes(b"D12Rec", D3D12_SUBMIT_RECORDS.load(Ordering::Relaxed));
@@ -1541,6 +1548,9 @@ pub unsafe extern "C" fn dxgkddi_render(
             if !command.is_valid() {
                 return None;
             }
+            // `command.is_valid()` above refuses `value == 0` (an ECL record's
+            // value is the exact worker point DMA completion waits for), so the
+            // marker boundary's admission of value 0 does not reach this arm.
             let context = execution_context.as_ref()?;
             let adapter = context.adapter()?;
             let process = context.creator_process()?;
@@ -1628,10 +1638,11 @@ pub unsafe extern "C" fn dxgkddi_render(
             let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
             if let Some(adapter) = context.as_ref().and_then(|c| c.adapter()) {
                 let stream_marker = if take >= size_of::<helios_protocol::HeliosPresentRefreshCmd>()
-                    && command.present_ctx_id != 0
-                    && command.present_value != 0
-                    && command.present_cookie != 0
-                {
+                    && helios_kmd_logic::present_stream::tail_selects_boundary(
+                        command.present_ctx_id,
+                        command.present_value,
+                        command.present_cookie,
+                    ) {
                     context
                         .as_ref()
                         .and_then(|c| c.creator_process())
@@ -1779,10 +1790,11 @@ pub unsafe extern "C" fn dxgkddi_render(
                                     snapshot_memory_type_index
                                 );
                         let stream_marker = if take >= PRESENT_RENDER_STREAM_BYTES
-                            && private.present_ctx_id != 0
-                            && private.present_value != 0
-                            && private.present_cookie != 0
-                        {
+                            && helios_kmd_logic::present_stream::tail_selects_boundary(
+                                private.present_ctx_id,
+                                private.present_value,
+                                private.present_cookie,
+                            ) {
                             context.as_ref().and_then(|c| c.creator_process()).map(
                                 |creator_process| crate::adapter::PresentStreamMarker {
                                     ctx_id: private.present_ctx_id,

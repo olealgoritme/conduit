@@ -196,12 +196,16 @@ impl<'a> ContextHandleRef<'a> {
         })
     }
 
-    /// Stash one complete nonzero stream marker for the immediately following
+    /// Stash one complete stream marker for the immediately following
     /// Present on this context.  The KMD validates registry/process ownership
     /// while consuming it; this handoff only preserves the exact UMD boundary
     /// until the WDDM private-data buffer exists.
+    ///
+    /// "Complete" includes `value == 0` ("already complete", a CPU-complete
+    /// present): dropping it here would silently turn that present into a
+    /// legacy current-wire wait. Only an absent or partial tail is not stashed.
     pub fn stash_present_stream_marker(&self, ctx_id: u32, value: u32, cookie: u64) {
-        if ctx_id == 0 || value == 0 || cookie == 0 {
+        if !helios_kmd_logic::present_stream::tail_selects_boundary(ctx_id, value, cookie) {
             return;
         }
         *self.context.present_stream_marker.lock() = Some((ctx_id, value, cookie));

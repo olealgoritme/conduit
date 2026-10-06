@@ -65,7 +65,7 @@ mod nvrm_events;
 mod nvrm_tables;
 mod resource_tables;
 mod foreign_tables;
-pub use foreign_tables::{ForeignBegin, ForeignCommit};
+pub use foreign_tables::{AllocAdopt, ForeignBegin, ForeignCommit};
 
 pub use nvrm_events::{
     release_nvrm_event, NvrmEventRefusal, NvrmEventRegistered, NvrmEventsState, MAX_NVRM_EVENTS,
@@ -5532,7 +5532,10 @@ impl VirtioGpu {
         value: u32,
     ) -> Result<u64, helios_kmd_logic::producer_completion::Error> {
         use helios_kmd_logic::producer_completion::Error;
-        if self.failed || value == 0 {
+        // `value == 0` publishes an already-complete epoch on the allocation
+        // (`producer_completion::Table::publish`); the stream still has to be
+        // this device's live registration.
+        if self.failed {
             return Err(Error::Invalid);
         }
         let (i, s) = self
@@ -5928,7 +5931,16 @@ impl VirtioGpu {
         cookie: u64,
         creator_process: usize,
     ) -> Option<u64> {
-        if ctx_id == 0 || value == 0 || cookie == 0 || creator_process == 0 {
+        // `value == 0` is admitted: "already complete" (see
+        // `present_stream::MarkerTail`). It still has to name a live registered
+        // stream of this process, exactly like a nonzero point; for every
+        // nonzero `value` this gate is the one it always was.
+        if !helios_kmd_logic::present_stream::marker_admissible(
+            ctx_id,
+            value,
+            cookie,
+            creator_process,
+        ) {
             PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -5975,6 +5987,13 @@ impl VirtioGpu {
             bump_high_water(&PRESENT_STREAM_MARKER_AHEAD_HIGH_WATER, lookahead as usize);
         }
         PRESENT_STREAM_MARKERS.fetch_add(1, Ordering::Relaxed);
+        if value == 0 {
+            // A boundary at point 0 of a live stream: `slot_ready` holds for any
+            // retirement, so the bind it gates does not wait on a Venus
+            // timeline, yet it stays in the tagged namespace and dies with its
+            // stream like every other marker (a dead stream is never success).
+            PRESENT_STREAM_MARKER_COMPLETE.fetch_add(1, Ordering::Relaxed);
+        }
         Some(encode_present_stream_boundary(slot.handle(index), value))
     }
 

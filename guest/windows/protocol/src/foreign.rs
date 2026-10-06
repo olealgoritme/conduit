@@ -155,7 +155,17 @@ pub struct HeliosForeignQueryCaps {
 
 pub const HELIOS_FOREIGN_QUERY_CAPS_BYTES: usize = 96;
 
-/// `IMPORT_RM`. 72 bytes, no trailing data.
+/// `IMPORT_RM.flags` bit: a [`HeliosForeignLayout`] follows the 72-byte request
+/// ([`HeliosForeignImportRmLayout`], 104 bytes). **The layout is not optional**:
+/// a request without this bit (the 72-byte form) is refused `BAD_RANGE`, because
+/// a foreign resource whose layout the KMD does not know cannot be scanned out
+/// or imported without guessing, and the guess (from the size) is wrong for
+/// heights that are a whole number of blocks. The 72-byte struct itself is
+/// unchanged so a client can still build it as the prefix of the 104-byte one.
+pub const HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT: u32 = 1 << 0;
+
+/// `IMPORT_RM`. 72 bytes, followed by the 32-byte [`HeliosForeignLayout`] when
+/// [`HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT`] is set (always, in a served gate).
 ///
 /// `rm_handle` is the backend handle (from an `Open` of a DRM node) in whose
 /// file `gem_handle` was created, typically by `DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY`
@@ -176,7 +186,8 @@ pub struct HeliosForeignImportRm {
     pub rm_handle: u32,
     /// in: GEM handle in that file.
     pub gem_handle: u32,
-    /// in: zero (reserved: a later revision may carry layout or sync hints).
+    /// in: [`HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT`]; every other bit zero (a later
+    /// revision may add sync hints).
     pub flags: u32,
     /// in: bytes of the exported object, a page multiple, at most
     /// `max_bytes_per_resource`.
@@ -189,6 +200,51 @@ pub struct HeliosForeignImportRm {
 }
 
 pub const HELIOS_FOREIGN_IMPORT_RM_BYTES: usize = 72;
+
+/// What is inside the exported object. 32 bytes. Plane 0 only. The KMD validates
+/// it against `size` once (`helios_kmd_logic::foreign_resource::Layout`) and
+/// records it with the resource; the allocation that adopts the resource must
+/// repeat it (`HeliosWddmAllocMeta` geometry plus `HeliosWddmAllocLayout`).
+///
+/// Accepted: `fourcc` one of `DRM_FORMAT_{XRGB,ARGB,XBGR,ABGR}8888`; `modifier`
+/// `DRM_FORMAT_MOD_LINEAR` (0) or `0x0300000000606010 | h`, `h` in `0..=5` (what
+/// NVK builds for B8G8R8A8 / R8G8B8A8); `width`/`height` in `1..=16384`;
+/// `stride` a multiple of 4, at least `width * 4`, at most 1 MiB; and
+/// `offset + stride * rows <= size` where `rows` is `height` (LINEAR) or `height`
+/// rounded up to `8 << h` (block-linear). The last is a lower bound on the image,
+/// never an equality: RM rounds allocations up to 64 KiB.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosForeignLayout {
+    /// in: pixels, 1..=16384.
+    pub width: u32,
+    /// in: rows, 1..=16384.
+    pub height: u32,
+    /// in: plane 0 pitch in bytes (`rowPitch`).
+    pub stride: u32,
+    /// in: plane 0 offset in bytes from the start of the object.
+    pub offset: u32,
+    /// in: `DRM_FORMAT_*`.
+    pub fourcc: u32,
+    /// in: zero.
+    pub reserved: u32,
+    /// in: `DRM_FORMAT_MOD_*`.
+    pub modifier: u64,
+}
+
+pub const HELIOS_FOREIGN_LAYOUT_BYTES: usize = 32;
+
+/// `IMPORT_RM` with its layout: the request a served gate requires. 104 bytes.
+/// Only the 72-byte `base` is written back (`out_resource_id`,
+/// `out_host_errno`, the header's `status` and `epoch`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosForeignImportRmLayout {
+    pub base: HeliosForeignImportRm,
+    pub layout: HeliosForeignLayout,
+}
+
+pub const HELIOS_FOREIGN_IMPORT_RM_LAYOUT_BYTES: usize = 104;
 
 const _: () = {
     use core::mem::{offset_of, size_of};
@@ -220,6 +276,19 @@ const _: () = {
     assert!(offset_of!(HeliosForeignImportRm, size) == 56);
     assert!(offset_of!(HeliosForeignImportRm, out_resource_id) == 64);
     assert!(offset_of!(HeliosForeignImportRm, out_host_errno) == 68);
+
+    assert!(size_of::<HeliosForeignLayout>() == HELIOS_FOREIGN_LAYOUT_BYTES);
+    assert!(offset_of!(HeliosForeignLayout, width) == 0);
+    assert!(offset_of!(HeliosForeignLayout, height) == 4);
+    assert!(offset_of!(HeliosForeignLayout, stride) == 8);
+    assert!(offset_of!(HeliosForeignLayout, offset) == 12);
+    assert!(offset_of!(HeliosForeignLayout, fourcc) == 16);
+    assert!(offset_of!(HeliosForeignLayout, reserved) == 20);
+    assert!(offset_of!(HeliosForeignLayout, modifier) == 24);
+
+    assert!(size_of::<HeliosForeignImportRmLayout>() == HELIOS_FOREIGN_IMPORT_RM_LAYOUT_BYTES);
+    assert!(offset_of!(HeliosForeignImportRmLayout, base) == 0);
+    assert!(offset_of!(HeliosForeignImportRmLayout, layout) == HELIOS_FOREIGN_IMPORT_RM_BYTES);
 
     // Distinct from every other verb in the protocol crate.
     assert!(HELIOS_ESCAPE_FOREIGN_RESOURCE != crate::HELIOS_ESCAPE_NVRM);
@@ -292,6 +361,10 @@ mod tests {
             HELIOS_FOREIGN_CAP_RM_IMPORT as u64
         );
         assert_eq!(
+            c_define("HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT"),
+            HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT as u64
+        );
+        assert_eq!(
             c_define("HELIOS_FOREIGN_ST_OK"),
             HELIOS_FOREIGN_ST_OK as u64
         );
@@ -323,6 +396,33 @@ mod tests {
             c_define("HELIOS_BLOB_MEM_RM_EXPORT"),
             HELIOS_BLOB_MEM_RM_EXPORT as u64
         );
+    }
+
+    #[test]
+    fn layout_extension_is_a_prefix_compatible_tail() {
+        // The 104-byte request starts with the unchanged 72-byte one.
+        let mut ext = HeliosForeignImportRmLayout::zeroed();
+        ext.base.flags = HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT;
+        ext.base.size = 0x7f_0000;
+        ext.layout = HeliosForeignLayout {
+            width: 1920,
+            height: 1080,
+            stride: 7680,
+            offset: 0,
+            fourcc: 0x3432_5258,
+            reserved: 0,
+            modifier: 0x0300_0000_0060_6015,
+        };
+        let bytes = bytemuck::bytes_of(&ext);
+        assert_eq!(bytes.len(), 104);
+        let base: HeliosForeignImportRm =
+            bytemuck::pod_read_unaligned(&bytes[..HELIOS_FOREIGN_IMPORT_RM_BYTES]);
+        assert_eq!(base.flags, 1);
+        assert_eq!(base.size, 0x7f_0000);
+        let tail: HeliosForeignLayout =
+            bytemuck::pod_read_unaligned(&bytes[HELIOS_FOREIGN_IMPORT_RM_BYTES..]);
+        assert_eq!(tail.modifier, 0x0300_0000_0060_6015);
+        assert_eq!(tail.stride, 7680);
     }
 
     #[test]
