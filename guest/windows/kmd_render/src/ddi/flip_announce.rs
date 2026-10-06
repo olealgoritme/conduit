@@ -263,24 +263,24 @@ pub(crate) fn note_worker_refused(h_alloc: HANDLE) {
 
 /// Mirror the counters. PASSIVE only (the stall-diagnosis mirror).
 pub(crate) fn publish_counters() {
-    use crate::diag::record_named_bytes as rec;
+    let mut mr = crate::ddi::flip_lat::Mirror::new(crate::ddi::flip_lat::ANNOUNCE_BASE);
     let owed = MIRROR_PENDING.swap(0, Ordering::AcqRel) != 0;
     let m = MODE.load(Ordering::Relaxed);
     let e = EARLY.load(Ordering::Relaxed);
     if !owed && m == 0 && e == 0 {
         return;
     }
-    rec(b"FaKnob", m | (e << 8));
-    rec(b"FaEarly", EARLY_N.load(Ordering::Relaxed));
-    rec(b"FaDdi", DDI.load(Ordering::Relaxed));
-    rec(b"FaWorker", WORKER.load(Ordering::Relaxed));
-    rec(b"FaRefuse", REFUSE.load(Ordering::Relaxed));
-    rec(b"FaLate", LATE.load(Ordering::Relaxed));
-    rec(b"FaTick", crate::ddi::flip_lat::announced_ticks());
-    rec(b"FaNo", NO.load(Ordering::Relaxed));
-    rec(b"FaNoWhy", NO_WHY.load(Ordering::Relaxed));
-    rec(b"FaNoBusy", NO_BUSY.load(Ordering::Relaxed));
-    rec(b"FaNoUnk", NO_UNK.load(Ordering::Relaxed));
-    rec(b"FaNoFail", NO_FAIL.load(Ordering::Relaxed));
-    rec(b"FaNoOther", NO_OTHER.load(Ordering::Relaxed));
+    mr.rec(b"FaKnob", m | (e << 8));
+    mr.rec(b"FaEarly", EARLY_N.load(Ordering::Relaxed));
+    mr.rec(b"FaDdi", DDI.load(Ordering::Relaxed));
+    mr.rec(b"FaWorker", WORKER.load(Ordering::Relaxed));
+    mr.rec(b"FaRefuse", REFUSE.load(Ordering::Relaxed));
+    mr.rec(b"FaLate", LATE.load(Ordering::Relaxed));
+    mr.rec(b"FaTick", crate::ddi::flip_lat::announced_ticks());
+    mr.rec(b"FaNo", NO.load(Ordering::Relaxed));
+    mr.rec(b"FaNoWhy", NO_WHY.load(Ordering::Relaxed));
+    mr.rec(b"FaNoBusy", NO_BUSY.load(Ordering::Relaxed));
+    mr.rec(b"FaNoUnk", NO_UNK.load(Ordering::Relaxed));
+    mr.rec(b"FaNoFail", NO_FAIL.load(Ordering::Relaxed));
+    mr.rec(b"FaNoOther", NO_OTHER.load(Ordering::Relaxed));
 }

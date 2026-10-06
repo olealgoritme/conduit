@@ -319,7 +319,7 @@ pub(crate) fn publish_nvrm_counters() {
     // The stall-diagnosis block: HPD worker breadcrumbs, flips issued / published, the vsync
     // pending run, `StartN` (`ddi::stall_diag`). The escape thread also writes it directly
     // (`publish_from_escape`), so it refreshes when this worker-run mirror cannot.
-    crate::ddi::stall_diag::publish_counters();
+    crate::ddi::stall_diag::request_publish();
     // Cross-client hardening of forwarded RM ioctls (`NvDupHarden`): clients recorded /
     // dropped / refused for room (`NvCli*`), and requests that named a client or file
     // that is not the caller's (`NvDup*`). Nonzero `NvDupDeny` / `NvDupWould` outside a

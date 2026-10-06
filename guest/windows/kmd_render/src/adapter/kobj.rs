@@ -115,6 +115,10 @@ impl AdapterContext {
         };
         if st == STATUS_SUCCESS && !handle.is_null() {
             self.hpd_thread.store(handle as usize, Ordering::Release);
+            // The registry mirror's own thread (`ddi::mirror_thread`): the worker only requests
+            // a publish pass, it does not spend tens of milliseconds between two flips on one.
+            // SAFETY: PASSIVE_LEVEL (StartDevice).
+            unsafe { crate::ddi::mirror_thread::start() };
         } else {
             // 0x0B00_00EA = HPD-worker-create-failed. It was 0x0B00_00E7, which
             // ddi/lifecycle.rs also records for venus-bring-up-failed — and BOTH
@@ -151,6 +155,8 @@ impl AdapterContext {
     /// PASSIVE_LEVEL — it blocks on the worker's exit.
     pub fn stop_hpd(&self) {
         use core::sync::atomic::Ordering;
+        // The mirror thread first (idempotent): from here the callers publish inline again.
+        crate::ddi::mirror_thread::stop();
         let h = self.hpd_thread.swap(0, Ordering::AcqRel);
         if h == 0 {
             return;
@@ -931,6 +937,8 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     // is therefore the truthful address to report.
     //
     let phys = adapter.last_primary_address.load(Ordering::Acquire) as i64;
+    // `FlipLat`: the instant just after the address was read (a flip issued later is not in it).
+    let phys_t = crate::adapter::foreign_scanout::now_100ns();
     // SAFETY: live callback interface; signal_crtc_vsync raises to DIRQL internally
     // via DxgkCbSynchronizeExecution and delivers the CRTC_VSYNC packet.
     // `VsCbSyncB` / `VsCbSyncOk` / `VsCbSyncT`: a sync that begins and never returns is visible.
@@ -949,6 +957,7 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
             adapter,
             phys as u64,
             tick_time_100ns,
+            phys_t,
             helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(adapter)),
         );
         // Record every callback that actually reached dxgkrnl. At ~60 Hz the

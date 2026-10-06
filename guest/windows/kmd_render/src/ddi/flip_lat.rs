@@ -48,6 +48,7 @@ const Z32: AtomicU32 = AtomicU32::new(0);
 // carried by a tick), the announced mask and the "programming time taken" mask.
 static ADDR: [AtomicU64; RING] = [Z64; RING];
 static TIME: [AtomicU64; RING] = [Z64; RING];
+static SEQ: [AtomicU32; RING] = [Z32; RING];
 static LIVE: AtomicU32 = AtomicU32::new(0);
 static ANNOUNCED: AtomicU32 = AtomicU32::new(0);
 static PROGRAMMED: AtomicU32 = AtomicU32::new(0);
@@ -80,8 +81,20 @@ static LATE: [AtomicU32; BUCKETS] = [Z32; BUCKETS];
 static LATE_MAX_US: AtomicU32 = AtomicU32::new(0);
 static PHASE: [AtomicU32; 4] = [Z32; 4];
 static IN_DPC_N: AtomicU32 = AtomicU32::new(0);
-/// Non-zero while this driver's device DPC is inside `DxgkCbNotifyDpc`.
+/// Non-zero while this driver's device DPC is inside `DxgkCbNotifyDpc`: the processor number + 1
+/// it runs on (a DDI counts as "inside" only on that same processor).
 static IN_DPC: AtomicU32 = AtomicU32::new(0);
+
+extern "system" {
+    /// `KeGetCurrentProcessorNumberEx(NULL)`: callable at any IRQL.
+    fn KeGetCurrentProcessorNumberEx(proc_number: *mut core::ffi::c_void) -> u32;
+}
+
+/// The current processor number + 1 (never 0).
+fn cpu_tag() -> u32 {
+    // SAFETY: a NULL argument asks only for the system-wide processor index; any IRQL.
+    unsafe { KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) }.wrapping_add(1)
+}
 static LAST_TICK_AT: AtomicU64 = AtomicU64::new(0);
 static PERIOD: AtomicU64 = AtomicU64::new(0);
 /// The announce counters of `flip_announce` that ride the retire match.
@@ -142,6 +155,12 @@ pub(crate) fn start_generation() {
     {
         h.store(0, Ordering::Relaxed);
     }
+    for c in &CACHE {
+        c.store(u64::MAX, Ordering::Relaxed);
+    }
+    for c in &SEQ {
+        c.store(0, Ordering::Relaxed);
+    }
     PROG_T.store(0, Ordering::Relaxed);
     LAST_RETIRE.store(0, Ordering::Relaxed);
     LAST_TICK_AT.store(0, Ordering::Relaxed);
@@ -155,14 +174,17 @@ pub(crate) fn note_issue(address: u64) {
         return;
     }
     let t = now();
-    // Where in the period the DDI ran: quarters after the last tick.
+    // Where in the period the DDI ran: quarters after the last tick (u64 arithmetic only).
     let tick = LAST_TICK_AT.load(Ordering::Relaxed);
     let period = PERIOD.load(Ordering::Relaxed);
     if tick != 0 && period != 0 && t >= tick {
-        let q = (((t - tick) as u128 * 4) / period as u128).min(3) as usize;
+        let q = ((t - tick) / (period / 4).max(1)).min(3) as usize;
         PHASE[q].fetch_add(1, Ordering::Relaxed);
     }
-    if IN_DPC.load(Ordering::Relaxed) != 0 {
+    // Inside the device DPC's `DxgkCbNotifyDpc` ON THIS CPU: the flip dxgkrnl issued as part of
+    // retiring the previous one. A DDI on another CPU while a DPC runs is not that.
+    let dpc_cpu = IN_DPC.load(Ordering::Relaxed);
+    if dpc_cpu != 0 && dpc_cpu == cpu_tag() {
         IN_DPC_N.fetch_add(1, Ordering::Relaxed);
     }
     let n = HEAD.fetch_add(1, Ordering::AcqRel);
@@ -171,8 +193,12 @@ pub(crate) fn note_issue(address: u64) {
     LIVE.fetch_and(!bit, Ordering::AcqRel);
     ANNOUNCED.fetch_and(!bit, Ordering::Relaxed);
     PROGRAMMED.fetch_and(!bit, Ordering::Relaxed);
+    // Seqlock: odd while the slot's pair is being written, so a reader never matches a torn
+    // (address of one flip, time of another) pair of a recycled slot.
+    SEQ[i].fetch_add(1, Ordering::AcqRel);
     ADDR[i].store(address, Ordering::Relaxed);
     TIME[i].store(t, Ordering::Relaxed);
+    SEQ[i].fetch_add(1, Ordering::AcqRel);
     LAST_SLOT.store(i as u32, Ordering::Relaxed);
     LIVE.fetch_or(bit, Ordering::AcqRel);
 }
@@ -188,20 +214,30 @@ pub(crate) fn mark_announced() {
 
 /// The device DPC entered / left `DxgkCbNotifyDpc`.
 pub(crate) fn dpc_enter() {
-    IN_DPC.store(1, Ordering::Relaxed);
+    if on() {
+        IN_DPC.store(cpu_tag(), Ordering::Relaxed);
+    }
 }
 pub(crate) fn dpc_leave() {
     IN_DPC.store(0, Ordering::Relaxed);
 }
 
-fn load_ring() -> ([u64; RING], [u64; RING]) {
+/// The ring's pairs, and the mask of slots read consistently (the slot's seqlock was even and
+/// unchanged across the read; a slot being recycled is left out).
+fn load_ring() -> ([u64; RING], [u64; RING], u32) {
     let mut a = [0u64; RING];
     let mut t = [0u64; RING];
+    let mut ok = 0u32;
     for i in 0..RING {
+        let s1 = SEQ[i].load(Ordering::Acquire);
         a[i] = ADDR[i].load(Ordering::Relaxed);
         t[i] = TIME[i].load(Ordering::Relaxed);
+        let s2 = SEQ[i].load(Ordering::Acquire);
+        if s1 == s2 && s1 & 1 == 0 {
+            ok |= 1 << i;
+        }
     }
-    (a, t)
+    (a, t, ok)
 }
 
 /// The heartbeat tick ran `now` against its scheduled `deadline` (100 ns). DISPATCH.
@@ -216,20 +252,36 @@ pub(crate) fn note_tick_late(now: u64, deadline: u64) {
 
 /// A `CRTC_VSYNC` carrying `phys` was delivered by the tick that started at `tick_t`
 /// (`period` = the vblank period, 100 ns). DISPATCH, atomics only.
-pub(crate) fn on_delivered_tick(adapter: &crate::adapter::AdapterContext, phys: u64, tick_t: u64, period: u64) {
+pub(crate) fn on_delivered_tick(
+    adapter: &crate::adapter::AdapterContext,
+    phys: u64,
+    tick_t: u64,
+    match_t: u64,
+    period: u64,
+) {
     if !on() {
         return;
     }
+    // `match_t`: the instant right AFTER the caller read `phys`: a flip issued at or before it
+    // may be what `phys` names. The latency still ends at the tick's start.
     LAST_TICK_AT.store(tick_t, Ordering::Relaxed);
     PERIOD.store(period, Ordering::Relaxed);
     if phys == 0 {
         return;
     }
     VB_TICKS.fetch_add(1, Ordering::Relaxed);
-    let (addrs, times) = load_ring();
     let live = LIVE.load(Ordering::Acquire);
+    let (addrs, times, consistent) = load_ring();
     let head = HEAD.load(Ordering::Acquire);
-    let Some(hit) = fr::retire_match(&addrs, &times, live, head, phys, tick_t) else {
+    let Some(hit) = fr::retire_match_at(
+        &addrs,
+        &times,
+        live & consistent,
+        head,
+        phys,
+        match_t,
+        tick_t,
+    ) else {
         return;
     };
     // Claim the slot: a tick races nothing but itself, but the DDI can recycle a slot.
@@ -346,13 +398,47 @@ fn load_hist(h: &[AtomicU32; BUCKETS]) -> [u32; BUCKETS] {
     out
 }
 
+/// Changed-only registry writes for the `FlipLat*` / `Fa*` blocks (a per-value last-written
+/// cache, as `stall_diag::rec_live`): a value is written only if it differs from what this module
+/// wrote last. The slot of a value is its call position in the (fixed-order) publish function, so
+/// a [`Mirror`] is created per publish call with that function's base: `flip_lat` 0, `flip_announce`
+/// [`ANNOUNCE_BASE`]. Every writer of these names goes through it, so the cache is the
+/// registry's content; [`start_generation`] makes it unknown again before the zero write.
+const CACHE_N: usize = 192;
+/// First cache slot of `flip_announce`'s block.
+pub(crate) const ANNOUNCE_BASE: usize = 128;
+#[allow(clippy::declare_interior_mutable_const)]
+const UNKNOWN: AtomicU64 = AtomicU64::new(u64::MAX);
+static CACHE: [AtomicU64; CACHE_N] = [UNKNOWN; CACHE_N];
+
+pub(crate) struct Mirror {
+    next: usize,
+}
+
+impl Mirror {
+    pub(crate) fn new(base: usize) -> Self {
+        Self { next: base }
+    }
+    /// Write `name = value` unless the registry already holds it. PASSIVE.
+    pub(crate) fn rec(&mut self, name: &[u8], value: u32) {
+        let slot = self.next;
+        self.next += 1;
+        if let Some(c) = CACHE.get(slot) {
+            if c.swap(value as u64, Ordering::Relaxed) == value as u64 {
+                return;
+            }
+        }
+        crate::diag::record_named_bytes(name, value);
+    }
+}
+
 /// `prefix` followed by one decimal digit, for the indexed histograms.
-fn rec_hist(prefix: &[u8], counts: &[u32]) {
+fn rec_hist(m: &mut Mirror, prefix: &[u8], counts: &[u32]) {
     let mut name = [0u8; 16];
     name[..prefix.len()].copy_from_slice(prefix);
     for (i, &c) in counts.iter().enumerate() {
         name[prefix.len()] = b'0' + i as u8;
-        crate::diag::record_named_bytes(&name[..prefix.len() + 1], c);
+        m.rec(&name[..prefix.len() + 1], c);
     }
 }
 
@@ -366,9 +452,9 @@ pub(crate) fn announced_ticks() -> u32 {
 /// or a tick delivered, except once per generation (zeros), so a value an earlier run left is
 /// never read as this one's.
 pub(crate) fn publish_counters() {
-    use crate::diag::record_named_bytes as rec;
+    let mut m = Mirror::new(0);
     let owed = MIRROR_PENDING.swap(0, Ordering::AcqRel) != 0;
-    rec(b"FlipLatOn", ON.load(Ordering::Relaxed));
+    m.rec(b"FlipLatOn", ON.load(Ordering::Relaxed));
     if !on() {
         return;
     }
@@ -377,40 +463,40 @@ pub(crate) fn publish_counters() {
     }
     let lat = load_hist(&LAT);
     let max_us = LAT_MAX_US.load(Ordering::Relaxed);
-    rec_hist(b"FlipLat", &lat);
-    rec(b"FlipMaxUs", max_us);
-    rec(b"FlipMaxT", LAT_MAX_T.load(Ordering::Relaxed));
-    rec(b"FlipMaxSite", LAT_MAX_SITE.load(Ordering::Relaxed));
-    rec(b"FlipMaxFl", LAT_MAX_FL.load(Ordering::Relaxed));
-    rec(b"FlipP50Us", fr::lat_percentile_us(&lat, 500, max_us));
-    rec(b"FlipP99Us", fr::lat_percentile_us(&lat, 990, max_us));
-    rec(b"FlipRetN", RET_N.load(Ordering::Relaxed));
-    rec(b"FlipSkip", SKIPPED.load(Ordering::Relaxed));
-    rec(b"FlipLive", LIVE.load(Ordering::Relaxed).count_ones());
+    rec_hist(&mut m, b"FlipLat", &lat);
+    m.rec(b"FlipMaxUs", max_us);
+    m.rec(b"FlipMaxT", LAT_MAX_T.load(Ordering::Relaxed));
+    m.rec(b"FlipMaxSite", LAT_MAX_SITE.load(Ordering::Relaxed));
+    m.rec(b"FlipMaxFl", LAT_MAX_FL.load(Ordering::Relaxed));
+    m.rec(b"FlipP50Us", fr::lat_percentile_us(&lat, 500, max_us));
+    m.rec(b"FlipP99Us", fr::lat_percentile_us(&lat, 990, max_us));
+    m.rec(b"FlipRetN", RET_N.load(Ordering::Relaxed));
+    m.rec(b"FlipSkip", SKIPPED.load(Ordering::Relaxed));
+    m.rec(b"FlipLive", LIVE.load(Ordering::Relaxed).count_ones());
     let prg = load_hist(&PRG);
-    rec_hist(b"FlipPrgLat", &prg);
+    rec_hist(&mut m, b"FlipPrgLat", &prg);
     let prg_max = PRG_MAX_US.load(Ordering::Relaxed);
-    rec(b"FlipPrgMax", prg_max);
-    rec(b"FlipPrgP99", fr::lat_percentile_us(&prg, 990, prg_max));
+    m.rec(b"FlipPrgMax", prg_max);
+    m.rec(b"FlipPrgP99", fr::lat_percentile_us(&prg, 990, prg_max));
     let host = load_hist(&HOST);
-    rec_hist(b"FlipHostLat", &host);
+    rec_hist(&mut m, b"FlipHostLat", &host);
     let host_max = HOST_MAX_US.load(Ordering::Relaxed);
-    rec(b"FlipHostMax", host_max);
-    rec(b"FlipHostP99", fr::lat_percentile_us(&host, 990, host_max));
-    rec(b"FlipInDpc", IN_DPC_N.load(Ordering::Relaxed));
+    m.rec(b"FlipHostMax", host_max);
+    m.rec(b"FlipHostP99", fr::lat_percentile_us(&host, 990, host_max));
+    m.rec(b"FlipInDpc", IN_DPC_N.load(Ordering::Relaxed));
     let mut phase = [0u32; 4];
     for (p, c) in phase.iter_mut().zip(PHASE.iter()) {
         *p = c.load(Ordering::Relaxed);
     }
-    rec_hist(b"FlipPh", &phase);
+    rec_hist(&mut m, b"FlipPh", &phase);
     let gap = load_hist(&GAP);
     let gap_max = GAP_MAX_MS.load(Ordering::Relaxed);
-    rec_hist(b"IfGap", &gap);
-    rec(b"IfGapMax", gap_max);
-    rec(b"IfN", GAP_N.load(Ordering::Relaxed));
-    rec(b"IfIdle", GAP_IDLE.load(Ordering::Relaxed));
-    rec(b"IfStall8", GAP_STALL.load(Ordering::Relaxed));
-    rec(
+    rec_hist(&mut m, b"IfGap", &gap);
+    m.rec(b"IfGapMax", gap_max);
+    m.rec(b"IfN", GAP_N.load(Ordering::Relaxed));
+    m.rec(b"IfIdle", GAP_IDLE.load(Ordering::Relaxed));
+    m.rec(b"IfStall8", GAP_STALL.load(Ordering::Relaxed));
+    m.rec(
         b"IfP99Us",
         fr::gap_percentile_us(
             &gap,
@@ -421,9 +507,9 @@ pub(crate) fn publish_counters() {
     );
     let ticks = VB_TICKS.load(Ordering::Relaxed);
     let used = VB_USED.load(Ordering::Relaxed);
-    rec(b"VbTicks", ticks);
-    rec(b"VbUsed", used);
-    rec(b"VbUsedPm", fr::used_permille(used, ticks));
-    rec_hist(b"VsLate", &load_hist(&LATE));
-    rec(b"VsLateMaxUs", LATE_MAX_US.load(Ordering::Relaxed));
+    m.rec(b"VbTicks", ticks);
+    m.rec(b"VbUsed", used);
+    m.rec(b"VbUsedPm", fr::used_permille(used, ticks));
+    rec_hist(&mut m, b"VsLate", &load_hist(&LATE));
+    m.rec(b"VsLateMaxUs", LATE_MAX_US.load(Ordering::Relaxed));
 }
