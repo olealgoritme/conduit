@@ -2369,6 +2369,9 @@ pub(crate) fn process_deferred_vidpn_source_address(
         }
         Some(unsafe { apply_deferred_vidpn_source_address_locked(adapter, lock, raw as HANDLE) })
     });
+    // The mutex is free again: the `VpDSt` registry write below must not run under a site that
+    // says it is held.
+    crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::DEFERRED_POST);
     if let Some(status) = status {
         crate::diag::record_named_bytes(b"VpDSt", status as u32);
     }

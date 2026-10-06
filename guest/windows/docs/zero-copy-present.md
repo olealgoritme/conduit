@@ -1237,6 +1237,8 @@ arithmetic), the clock of `VpDmpT`, `VpVsT` and `VsCntT`.
 | 13 | the one-shot Present probe (a fence wait and a host map round trip) |
 | 14 | `queue_active_scanout_refresh`, WAITING for the scanout mutex |
 | 17 | the same with the mutex HELD |
+| 18 | `process_deferred_vidpn_source_address` AFTER the mutex was released (the `VpDSt` registry write) |
+| 19 | `queue_active_scanout_refresh` AFTER the mutex was released (the pacing snapshot, about 40 registry writes) |
 | 15 | the worker is terminating |
 
 Where the numbers come from, and why they survive a stuck worker. The worker's own stores (`HpdLoopN`, `HpdSite`, ...) are

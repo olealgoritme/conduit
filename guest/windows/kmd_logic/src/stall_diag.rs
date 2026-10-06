@@ -63,9 +63,15 @@ pub mod site {
     pub const DEFERRED_LOCKED: u32 = 16;
     /// Inside `queue_active_scanout_refresh` with the scanout mutex held (id 14 is waiting for it).
     pub const REFRESH_LOCKED: u32 = 17;
+    /// `process_deferred_vidpn_source_address` AFTER the scanout mutex was released: the `VpDSt`
+    /// registry write.
+    pub const DEFERRED_POST: u32 = 18;
+    /// `queue_active_scanout_refresh` AFTER the scanout mutex was released: the pacing snapshot
+    /// (about 40 registry writes).
+    pub const REFRESH_POST: u32 = 19;
 
     /// Every id with its name, for the doc and the host tests.
-    pub const ALL: [(u32, &str); 18] = [
+    pub const ALL: [(u32, &str); 20] = [
         (NONE, "none"),
         (WAIT, "wait"),
         (START_WAIT, "start_wait"),
@@ -87,6 +93,8 @@ pub mod site {
             "process_deferred_vidpn_source_address (mutex held)",
         ),
         (REFRESH_LOCKED, "queue_active_scanout_refresh (mutex held)"),
+        (DEFERRED_POST, "process_deferred_vidpn_source_address (mutex released)"),
+        (REFRESH_POST, "queue_active_scanout_refresh (mutex released)"),
     ];
 }
 
