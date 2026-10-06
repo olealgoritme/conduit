@@ -365,8 +365,16 @@ pub(crate) static NVK_PRESENT: DwordKnob = DwordKnob::new(c"NvkPresent", 0);
 pub(crate) static NVK_PLACEHOLDER_ALLOCATIONS: BoolKnob =
     BoolKnob::new(c"NvkPlaceholderAllocations", false);
 
+/// `NvkPresent`, or `HELIOS_NVK_PRESENT` from the process environment (tests:
+/// one process, no registry write).
 pub(crate) fn nvk_present_mode() -> u32 {
-    NVK_PRESENT.get()
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("HELIOS_NVK_PRESENT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| NVK_PRESENT.get())
+    })
 }
 
 pub(crate) fn nvk_placeholder_allocations() -> bool {
