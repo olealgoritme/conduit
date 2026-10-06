@@ -2914,11 +2914,96 @@ Read every counter twice 10 s apart; PresentMon on `dwm.exe` alongside. Knobs: s
    to grow with `FlipLive` bounded by 2 means dxgkrnl retires coalesced flips (U1 holds); `FlipLive` stuck at 2 with `FlipIss` flat means it does not: go back to 1.
 6. **Restart / open / close**: `pnputil /restart-device` twice with a moving window: `IfStall8`, `IfGapMax` and `FlipMaxUs` over the restart; open and close a window and a fullscreen app; `FaLate` and `FaRefuse` stay 0.
 
+##### 15.18.15.6 Hardware results on 332.1, and the corrections they forced
+
+**Venus DWM, 5120x1440@240.** Row A (no knobs): PresentMon `dwm.exe` 108 a second, between-presents p50 8.48 / p99 9.12 ms; `FlipLat` all in
+bucket 4 (4.2 to 8.4 ms); `VbUsed` 113 of 227 ticks; `IfStall8` 113 a second. Row B (`FlipAnnounce` 2): 225 a second, p50 4.04 / p99 4.72 ms, until-displayed p50
+3.80 ms; `FlipLat` in bucket 3; `VbUsed` 244 of 248; `FaDdi` 243, `FaWorker` 241, `FaRefuse` 0, `FaLate` 0; viewer overlay 238 fps, no artifacts. That
+confirms the chain of 15.18.15.1 (two ticks to one) and step 3 (`FlipInDpc`). `FlipAnnounce` 2 is therefore the DEFAULT now (`flip_retire::DEFAULT_KNOB`; the
+service value 0 turns it off), for the Venus class only (`FlipAnnForeign`, below).
+Both rows show one 29 ms `FlipMaxUs` at `HpdSite` 19 (`REFRESH_POST`): the registry mirror running on the flip worker. Two corrections follow.
+
+* **The mirror was on the flip worker.** `stall_diag::publish_counters` (stall block, `Vs*`, device-lost block, `FlipLat*`, `Fa*`: the 332 estimate of "about 55 writes a second"
+  was wrong: well over a hundred `RtlWriteRegistryValue` calls a pass, about 85 of them this section's, each a few tens of microseconds to a few milliseconds) ran from `queue_active_scanout_refresh`, the dump and the `Nv*` mirror,
+  between two flips. It now runs on its own thread (`ddi/mirror_thread.rs`), at most once a second; the three callers only request a pass
+  (`stall_diag::request_publish`: two atomics and a `KeSetEvent`, any IRQL up to DISPATCH). `MirRuns`, `MirLastUs`, `MirMaxUs`, `MirReqs` measure it. `FlipLat*` / `Fa*` write
+  only changed values. The `scanout_trace` dump's and the `Nv*` mirror's own writes (about 100 more) still run on the worker; `HpdMx00..31` (the longest dwell in each worker step, by
+  `site` id, microseconds) say whether one of them is the next long step (`HpdMx12` DUMP, `HpdMx11` NVRM_PUBLISH).
+* **The idle rule was incomplete for the foreign lane.** `worker_idle` tested the pending slot and the programming gate, which drop when `take()` returns; the
+  ForeignFlip host flip of that picture is the worker's LATER step. `foreign_flip::busy()` (atomics only) now adds: a frame owed (`OWED`, or a programming taken and not served
+  by a service pass: waiting for the presenter's pacing, a full window, a retry), a pipelined host flip within its timeout (`FLYING`, above `FlipBusyFly`), a synchronous
+  round trip inside the pass. The sentence "the previous flip's bind, copy and completion are all finished" of 15.18.15.3 holds for the Venus classes (the gate drops at the bind, or at
+  the ring-1 copy completion DPC) and for the foreign lane only through `busy()`. Also fixed: the ring-1 copy completion DPC stored the address directly and never confirmed the announcement
+  (a later publication of another address was dropped as late); it goes through the funnel now, and an unconfirmed announcement is forgotten at every issued flip (the DMA lane included) and at restart.
+
+**NVK DWM, `ForeignFlip` 1, 332.1.** `FlipAnnounce` 1: `FfProg` 224 a second but `FfFrames` 149; `FlipHostLat` mass in 2 to 8.4 ms; overlay 150 with tearing (the missing foreign busy check).
+`FlipAnnounce` 2 with foreign announced: `FfProg` 231, `FfFrames` 155. The KMD side reaches 240; the host flip stage shows 150.
+
+##### 15.18.15.7 Why `FfFrames` < `FfProg`: what the host flip stage drops (from the code)
+
+`FfProg` counts `take()` (a programming the worker drained from the pending slot; `FlipIss - FfProg` is what the slot coalesced). `FfFrames` counts host flips of a copied frame. The
+difference is programmings that never got a host flip of their own, and the code has three places they go:
+
+1. **One owed flag.** `take()` sets `OWED`; the service pass swaps it into the presenter's single `owed_frame` boolean and the target is one slot (`Book::cur`). Two takes before one flip
+   are one flip of the newest picture. `FfCoal` counts a take that found `OWED` still set; `FfDropped` counts, at every host flip, the programmings taken since the previous host flip, less the
+   one it shows (`TAKEN` against its value at the previous flip).
+2. **The pacing clock.** `Presenter::decide` flips only when `now >= last_flip + min_interval` (`min_interval` = one refresh period, 4.17 ms at 240 Hz) and answers `WaitUntil(due)` otherwise,
+   a timed wait that cannot be shorter than about a millisecond. `last_flip` is set where the presenter is told the answer: for the SYNCHRONOUS flip at the END of the round trip (`finish` ->
+   `Presenter::flipped(.., now)`), so the spacing between two host flips is **the round trip plus a whole period**, not a period: 4.17 ms plus a mean round trip of 2.3 ms is 6.5 ms, 155 a
+   second, which is the measured `FfFrames`. For the pipelined flip it is set at the submit (`Presenter::submitted`), so the spacing is the period.
+3. **The beat.** With announce the flips arrive once a tick; the worker's wake-to-submit latency varies, so a flip that arrives 0.1 ms after the previous one's latency was 2 ms is "early" against
+   a due time of exactly one period, waits at least a millisecond and is overwritten by the next arrival when the wait runs late, and the lag then carries to the flip after it. A 3/4 period slack
+   (`flip_retire::paced_interval`) removes the beat for the pipelined flip (a host that gets flips 3.1 ms apart in a burst takes them in order: the pacing exists to bound host load, not for correctness).
+
+`FfSame` / `FfMoved` are not drops: they classify the new target against the old one (the same allocation again, another of the same device).
+
+So the sync host flip is a round trip on the one worker (`present_within`, `FfAsyncWin` 0): while it is in flight the worker drains nothing, the pending slot coalesces (`VpCoal`), and every flip's spacing is
+RTT + period. `FfRttN` / `FfRttUsSum` / `FfRttUsMax` existed; `FfRttB0..7` (<0.25, <0.5, <1, <2, <4.2, <8.4, <17 ms, the rest) now give the distribution, in both modes (sync: the whole `present_within`; async: submit to the pass that read the answer, so
+it includes the worker's own wake latency).
+
+##### 15.18.15.8 The Linux guest's model, and the Windows one (read from the repo; `host/` untouched)
+
+| | Linux guest (`guest/linux/nvgpu_kms.h`, `conduit_gpu.c`, `host/backend/device/src/nvidia/scanout.rs`, `docs/SCANOUT.md`) | Windows KMD, `FfAsyncWin` 0 | Windows KMD, `FfAsyncWin` >= 1 |
+|---|---|---|---|
+| queue | control queue (virtqueue 0), message `ScanoutFlip` (20), 64 bytes | the same message, `ctrl::raw_roundtrip` | the same, `ctrl::raw_submit_async` |
+| submit | `nvgpu_send_async`: `virtqueue_add_sgs` + notify under the queue lock, `GFP_NOWAIT`, returns at once; sent from the commit tail ("the commit never waits for the host") | enqueue, notify, spin, then sleep in slices until the used ring answers (250 ms timeout), on the HPD worker | enqueue and go on; the answer is one word written by the used-ring drain, settled by a later pass |
+| in flight | not bounded by the driver: the ring's size; each request is freed when the used ring returns it (`nvgpu_ctrl_drain`) | 1 | the window, 1 to 4 (`FfAsyncWin`) |
+| ack | the used ring (async), a bare header; only a refusal is logged; **no state depends on it** | the same reply, awaited | the same reply, read asynchronously; it settles strikes, the timeout, the release book, and backpressure (`drain_blocked`) |
+| the page flip's / retire's timing | the guest's own **timer vblank** (`DRM_CRTC_VBLANK_TIMER_FUNCS`, hrtimer at the mode's rate): a synchronous flip completes at the next tick, an async one at once, independent of the host | the CRTC_VSYNC tick that carries the address the worker published AFTER the flip was taken | the same; with `FlipAnnounce` the address is published at the DDI (the Linux timing: retire is the next tick, whatever the host does) |
+| previous buffer's release | no release tracking: the buffer is reusable at the page-flip event (the vblank); the backend "does not forward `EV_RELEASE`" (`docs/SCANOUT.md`, Buffer release); a viewer that still reads it tears, accepted | the conservative rule (15.18.5): nothing waits | the same, bounded by the window (and, with announce, by `busy()`) |
+| host handling | the control queue is served by ONE vhost-user thread under the backend mutex (`conduit-backend.rs` `dispatch`), message by message, header-only reply added to the used ring when the handler returns. `handle_scanout_flip`: handle lookup, a cached PRIME export, `DisplayLink::flip` (a dup of the fd, `sendmsg` to each client that wants frames, never blocking: a full socket costs that client the frame, the newest is re-sent when it drains) | the **same thread and the same handler**: flips queue behind RM ioctls, allocations, fences | the same |
+| coalescing | at the host link: "latest frame wins, per client" | the presenter's single owed frame | the same |
+
+The Linux guest reaches 240 on the same host and viewer because nothing it does waits for the host: the retire is the guest's timer, the flip is fire-and-forget, the host's answer is not read for anything. The Windows
+KMD's synchronous round trip, its pacing from the END of the round trip, and (with announce off) the publication after programming are what the Linux model does not have. `ScanoutReleased` (msg 28,
+`NVGPU_F_SCANOUT_RELEASE`) is **not in this tree's host** (no hit under `host/` or `guest/linux/`; it lives on `feat/host-s6-flip-release`), and the Linux guest does not use it either.
+
+**The minimal change that matches the Linux model (done in this series, default on with `FlipAnnounce` on):** the pipelined flip (`FfAsyncWin`, the code that already existed: submit and go on, answer on the used ring) with the window defaulting to 2 when
+`FlipAnnounce` is on (an explicit `FfAsyncWin`, 0 included, wins), the pacing clock at the submit with 3/4-period slack, and retire by announce. The remaining difference is deliberate: the Windows window bounds the flips in flight and
+holds the drain while it is full (`FfDrainHeld`), where Linux relies on the host link's latest-wins; with a host that answers in a few milliseconds this does not bind, and `FfWinFull` / `FfDrainHeld` say when it does.
+
+**Host requirements: none for this series.** What would help only if `FfRttB4..7` still carry mass on the next run: (i) the backend answers `ScanoutFlip` BEFORE exporting (the reply is header-only and nothing in it depends on the export), so the used-ring ack
+is not behind a `PRIME_HANDLE_TO_FD` or a `sendmsg`; (ii) a flip that is behind an unanswered RM ioctl on the same thread is served by a second thread or at least ahead of non-blocking RM work; (iii) when a newer `ScanoutFlip` for the same scanout is already in the avail
+ring, serve only the newest. These are requests to the host session, not done here.
+
+**The buffer-pinning invariant and its check.** With window `w` the host can hold the shown buffer and `w` buffers in flight: `w + 1`. DWM's desktop chain is 3 buffers (the assumption, not read from dxgkrnl): `w` = 2 pins all three, which stalls DWM on the host (backpressure), it cannot tear a buffer
+the host still shows, because a buffer is not released until a flip that replaced it retired, and with announce that is the case only when `busy()` says no host flip is flying (`FlipBusyFly` 0, strict). `FfPinPeak` is the peak of in-flight + 1 at a submit: it
+must not exceed the window + 1; at 2 and a 3-deep chain a value of 3 means every buffer was host-pinned at once. `FlipBusyFly` 1 (the tester's experiment) lets the announce run with one host flip in flight: it removes the stall of the announce behind a slow host flip and costs a tear exposure of one more host round trip;
+`FaNoBusy` against `FfFrames` is the trade.
+
+**Knobs added in this series** (service key, REG_DWORD, read at StartDevice unless noted): `FlipAnnForeign` (default 0; the name is 14 characters, the lookup buffer's limit: a longer name would read as its default for ever), `FlipBusyFly` (default 0, at most 4, per transport generation),
+`FfAsyncWin` (default 2 with `FlipAnnounce` on, else 0), `FlipAnnounce` default 2. **Counters added:** `FfRttB0..7`, `FfDropped`, `FfCoal`, `FfPinPeak`, `FaNoFgn`, `MirReqs` / `MirRuns` / `MirLastUs` / `MirMaxUs`, `HpdMx00..31`.
+`HELIOS_REQUIRE_NAME_SCAN=1` (an environment variable of the HOST test run, not a registry value): the two name-scan tests of `kmd_logic/src/flip_retire.rs` fail instead of skipping when `kmd_render` is not a sibling directory of `kmd_logic`; the pre-push scripts copy both and set it.
+
+**NVK checklist (T6b, `DwmIcd` nvk, `ForeignFlip` 1):** (1) `FlipAnnounce` 2, `FlipAnnForeign` 0: the foreign flips are not announced (`FaNoFgn` grows), `FfAsyWin` 2, `FfProg`, `FfFrames`, `FfDropped`, `FfCoal`, `FfRttB*`, `FfWaitN`, `FfWinFull`, `FfDrainHeld`, `FfPinPeak`, PresentMon and the overlay. Expect
+`FfFrames` close to `FfProg` and `FfDropped` small (the pacing no longer adds the round trip); if `FfFrames` stays near 150 with `FfRttB4..7` heavy, the host is the limit (the requests above). (2) `FlipAnnForeign` 1: `FaDdi` grows for the foreign class; `FaNoBusy` explains declines; look for tearing against (1).
+(3) `FlipBusyFly` 1 with (2). (4) `FfAsyncWin` 0 (explicit) to compare the synchronous flip. In every row read `MirMaxUs` and `HpdMx*` for the next long worker step, and `FlipMaxUs` / `FlipMaxSite` / `FlipMaxFl` for the 400 to 900 ms PresentMon gaps.
+
 **Verified here:** the model, the bucket functions, the percentile estimate (an upper bound, tested against a sampled population), the ring match, the
 announce decision table, the idle rule's behaviour for a fast and a slow worker, the counter names (length, uniqueness, exactly the listed set written by the two
-I/O files and by nobody else); `kmd_logic` (1244 tests) and `protocol` pass, the whole tree parses, the stub type-check shows no new error kind.
+I/O files and by nobody else); `kmd_logic` (1273 tests, with `kmd_render` as a sibling so the name scans run) and `protocol` (38) pass, the whole tree parses, the stub type-check shows no new error kind.
 **Not verified:** anything that runs: that dxgkrnl issues the next flip inside the retirement (step 3, which `FlipInDpc` / `FlipPh0` test), that it
-retires on the address alone, the tear exposure, the cost of the measurement (a few dozen atomics per flip and tick, about 55 registry writes a second in the existing mirror).
+retires on the address alone, the tear exposure, the cost of the measurement (a few dozen atomics per flip and tick; its registry writes now run on the mirror thread, once a second, changed values only: 15.18.15.6).
 With `FlipAnnounce` 0 and `FlipEarlyWake` 0 the flip path is the old one: one relaxed load at the DDI, in the funnel and in the DPC; `FlipLat` 0 removes the measurement.
 
 
