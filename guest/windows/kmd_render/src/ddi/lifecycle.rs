@@ -231,6 +231,8 @@ fn start_generation_mirrors() {
     crate::ddi::onscanout::reset_for_start();
     // `BltAsync` / `BltNoMirror` (default 0): the knobs read again and mirrored, counters zeroed.
     crate::ddi::blt_async::reset_for_start();
+    // `GuestBlob` (default 0): the knob read again and mirrored (`GbKnob`), counters zeroed.
+    crate::ddi::guest_blob::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
     crate::ddi::std_census::reset_for_start();

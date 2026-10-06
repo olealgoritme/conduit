@@ -3171,6 +3171,200 @@ screen in the composed desktop while PresentMon counted 223 presents/s and `BltM
 was live. Read the knob as valid only when every reader of the redirection buffer reads the host blob (a Venus DWM). It stays 0 by
 default. With the mirror on, the worker mirrors after the ring copy and the Present's fence retires after the mirror.
 
+### 24.12 The Blt copy into the destination's own system pages (`GuestBlob`, guest-memory blob)
+
+The KMD half of "Candidate B" (`rm-backed-standard.md` 13.3). The question it answers is 13.1's: in steady state the Blt
+destination (a KMD standard Present buffer) lives in guest system pages that VidMm supplied, dxgkrnl's CPU view (which an NVK DWM
+reads) is those pages, and the KMD keeps `MmProbeAndLockPages` leases on them in `adapter.system_backings`. Today the copy writes
+the Venus blob and the CPU mirror (`mirror_present_system_backing`, 0.4 to 0.7 ms) copies it into the pages. With `GuestBlob` the
+copy writes the pages: the KMD describes them to the host as one virtio-gpu GUEST blob, imports that blob into its own Venus
+device as a buffer, and points the copy at it. The mirror and the stale mark go for that destination, and `BltAsync` DIRECT
+(which needs no mirror) becomes valid for it even with `BltNoMirror` 0. Built, host-tested where pure, type-checked against stubs;
+NOT run on hardware (24.12.8).
+
+#### 24.12.1 Host contract (as reconciled with the host prototype, `feat/host-guest-blob-copy-dst`, `docs/VENUS.md` "Guest-memory blobs")
+
+Every host-facing value is in ONE place, `kmd_logic/src/guest_blob.rs` module `contract`, except the feature bit, which is
+`protocol/src/features.rs` `NVGPU_CFG_GUEST_BLOB` (the host's name; the same line exists on the host branch). The KMD assumes:
+
+1. **Detection.** Device config `features` bit 16, `NVGPU_CFG_GUEST_BLOB = 1 << 16`, valid only together with `NVGPU_CFG_VENUS`
+   (bit 10, `contract::CFG_VENUS`). Read through `nvrm_device_features()` like `CFG_RM_IMPORT`. The host sets it only with
+   `--venus-guest-blobs`. Without it the feature is dead code behind the knob (`GbFeat` 0, `GbWhy` 2).
+2. **Create.** `VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB` (the 56-byte struct, `contract::CREATE_BYTES`), `hdr.ctx_id` = the KMD's
+   Venus context, `blob_mem` = `VIRTIO_GPU_BLOB_MEM_GUEST` (1), `blob_flags` = `USE_SHAREABLE` (accepted, no effect;
+   `USE_MAPPABLE` and `USE_CROSS_DEVICE` are refused and never set), `blob_id` 0, `size` = the sum of the entry lengths, followed in
+   the same request by `nr_entries` `virtio_gpu_mem_entry { u64 addr; u32 length; u32 padding = 0 }` (16 bytes each).
+3. **Entries.** `addr` is a guest PHYSICAL address (`PFN << 12` from the lease's MDL); every `addr` page-aligned, every `length` a
+   nonzero multiple of 4096; all inside guest RAM and one RAM backing file; any order; the host merges adjacent runs, the KMD
+   coalesces consecutive PFNs anyway. The KMD covers `[0, round_up(pitch * height, 4096))` and refuses (legacy copy) when a page of
+   it is not one whole, page-aligned physical page of one lease.
+4. **Limits.** At most 4096 entries per create (`MAX_ENTRIES`); at most 256 MiB per blob (`MAX_BLOB_BYTES`); at most 32768 live
+   runs and 1024 live guest blobs per device (`MAX_LIVE_RUNS`, `MAX_LIVE_BLOBS`), beyond which the host answers
+   `OUT_OF_MEMORY`. The KMD tracks both totals (`guest_blob::Budget`, charged before the create, refunded after the UNREF or a
+   refused create) and refuses before sending. A run is never longer than `MAX_RUN_BYTES` (the `u32` length field cut to pages).
+5. **Attach.** The host attaches a guest blob to `hdr.ctx_id` itself; the KMD sends no `CTX_ATTACH_RESOURCE` (and no detach).
+6. **Pages.** The host maps the pages AT CREATE TIME; the PFNs must stay locked until `RESOURCE_UNREF` has answered. A device
+   reset drops every host resource, guest blobs and their mappings included (assumed; the generation reset relies on it).
+7. **Import** on the KMD's Venus device: `vkGetMemoryResourcePropertiesMESA(resource)` (command 192, `sType` 1000384001, empty
+   `pNext`) gives `memoryTypeBits` (host-pointer types; HOST_VISIBLE|HOST_COHERENT on the prototype, types 2 and 3); the KMD takes
+   the first HOST_VISIBLE|HOST_COHERENT type among them (`contract::choose_memory_type`) and refuses otherwise; `vkAllocateMemory`
+   with `VkImportMemoryResourceInfoMESA { resourceId }` and `allocationSize` = the blob size; a plain `vkCreateBuffer` (no
+   external-memory struct, exclusive, `TRANSFER_DST`) of the blob size; `vkBindBufferMemory` at offset 0. The memory is never mapped
+   through Venus.
+8. **Coherence.** Snooped (x86, HOST_COHERENT). The copy command ends with `TRANSFER/TRANSFER_WRITE -> HOST/HOST_READ` on the
+   buffer, before the fence; CPU readers read only after the fence.
+9. **Release order.** After the last copy's fence: `vkDestroyBuffer` + `vkFreeMemory`, THEN a fence after the free (Venus ring
+   commands are asynchronous to the control queue's UNREF), THEN `RESOURCE_UNREF`, THEN the pages may be unlocked.
+10. **Errors** and their `GbWhy` codes. Create: `RESP_ERR_UNSPEC`+`EOPNOTSUPP` (feature off) 12, `INVALID_CONTEXT_ID` 13,
+    `INVALID_RESOURCE_ID` 14, `INVALID_PARAMETER`+`EINVAL` (shape) 15, `INVALID_PARAMETER`+`EFAULT` (outside RAM, or across a RAM
+    region boundary) 16, `OUT_OF_MEMORY`+`ENOMEM` (limits) 17, `UNSPEC`+`EIO` (renderer) 18, anything else 19,
+    `INVALID_PARAMETER`+`EXDEV` (entries from more than one RAM backing file) 28; no answer (transport) 20. Import:
+    `VK_ERROR_INVALID_EXTERNAL_HANDLE` 21, `VK_ERROR_OUT_OF_DEVICE_MEMORY` 22, any other Venus failure 23, no usable memory type
+    24. The errno is read from the response header the way `foreign_errno::from_resp_hdr` reads it.
+11. **Cost** (host numbers): the import costs about 1.9 + 2.9 ms once per destination; the per-frame copy into the guest pages is
+    0.207 ms with the barrier.
+
+#### 24.12.2 Lifecycle (`guest_blob::Record`, one per destination, in `SystemBackingTable`)
+
+`None -> Creating -> Ready -> Draining -> Gone`, and `Gone -> Creating` again on a later eviction.
+
+* **Create** (`ddi/guest_blob.rs` `prepare` -> `create`, on the Blt arm before any copy path, PASSIVE, no lock held). Lazily, on
+  the first Blt that finds the destination leased (a spinlock check first: a BAR-resident destination costs no mutex). Under the
+  content transaction (`system_backings.serialize`) for the whole create, so no lease can change in between: snapshot, cover
+  (`cover_len`), page runs (`build_runs`, counted, then filled), budget admit + `begin_create` + charge in one spinlock section,
+  a PIN of the lease set (an `Arc` clone of the snapshot's ranges), `RESOURCE_CREATE_BLOB`, then the Venus import (content ->
+  Venus -> virtio). Success: `Ready`, the pin stored with the record. The import's few milliseconds are paid once per destination
+  on that Present (accepted; moving it to the HPD worker is a follow-up).
+* **Copy** (`VenusClient::prepare_present_blt_to`). The ONE predicate `guest_target_for` (a live, non-retired guest buffer of the
+  destination large enough for the copy's extent), under the Venus mutex, picks the guest buffer as the copy target and as the
+  `present_blits` cache key (the guest blob's resource id; a second reusable command per source). The result carries
+  `guest_target()`, which every arm uses for its mirror and stale decisions (`present_effect`): a guest copy never mirrors and
+  never marks stale; `GuestBlob` wins over `BltNoMirror`. Ownership (`begin_present_buffer_write_legacy`, the DIRECT in-flight
+  table, the DPC hand-back) still runs on the Venus resource id, unchanged. The WindowedBlt snapshot arm never copies into a guest
+  buffer (its worker mirrors unconditionally).
+  * Legacy arm (`ddi/display.rs`): copies, waits, and records `PBSyCp` 4 instead of mirroring.
+  * `BltAsync` DIRECT (`ddi/blt_async.rs`): the route may be DIRECT for a destination whose record is `Ready` even with
+    `BltNoMirror` 0. Under the Venus mutex the arm re-checks `guest_target_live`: no guest buffer and no `BltNoMirror` -> nothing is
+    submitted, the legacy arm (with the mirror) runs; otherwise the stale mark is set only for a non-guest copy.
+  * `BltAsync` DEFERRED: prepared with the guest target when there is one; the queued request then carries `no_mirror`, and the
+    worker skips the stale mark for it. A guest buffer retired between the Present and the worker's submission makes the
+    submission fail (its command was released): the copy is dropped (`GbLost`), the destination keeps the previous frame.
+* **Retire** (`ddi/guest_blob.rs` `retire`, content transaction held), in this order (the teardown order of 13.3 step 4 and the
+  host's release order):
+  1. `Ready -> Draining`; the Venus record is marked retired: no new copy targets it.
+  2. Drain: a bounded wait (1 s each) on the wire fence of the last copy of every cached command into the guest buffer, then a
+     queue fence marker (`create_fence` + empty submit + wait).
+  3. Release those cached commands (`PreparedPresentBlt::release`).
+  4. `vkDestroyBuffer` + `vkFreeMemory`.
+  5. A fence marker after the free.
+  6. `RESOURCE_UNREF` (`ctrl::release_guest_blob`, once, guarded by the live-resource table).
+  7. `Draining -> Gone`, budget refunded, and only now the pin is dropped.
+
+  Then the caller changes the leases; only that change can unlock pages, and only those no pin holds.
+* **Where retire runs.** Before EVERY change to the leases or the pages they name: `bar_virtual_transfer_inner` (both
+  directions, after the direction is known, before the page-in-blocked check and any copy), `bar_transfer` (before either arm),
+  `DiscardContent` (before `remove_all`), `destroy_allocation_ctx` (`destination_gone`: retire, then forget the record, before
+  `remove_all`), and the Present path when a foreign consumer appeared. `BuildPagingBuffer` still answers success whatever the
+  retire did. A page-in after the retire copies the pages (which hold the current frame) into the Venus blob: no paging semantics
+  change, no invalid mark is ever set by this feature.
+* **Generation reset** (`reset_generation`): the transport and the Venus client of the generation are gone (the device was
+  reset), so every record is forgotten and every pin dropped with no host contact, then the leases go as before.
+* **The structural safety net.** The pin is an extra owner of the very lease objects the host blob names. Whatever the table does
+  with its entry (replace, remove, relock slices), those pages stay locked until the pin is dropped, and the pin is dropped only
+  after the UNREF answered (`Record::may_unlock`). A retire that is missed somewhere costs a stale frame, never a use of unlocked
+  pages.
+
+#### 24.12.3 Strikes, poisoning, and the fallback matrix
+
+| Where | What | Result |
+|---|---|---|
+| knob 0 | `GuestBlob` = 0 | today's behaviour, one relaxed load per Blt, nothing counted |
+| decision | host does not advertise, not a standard buffer, uncovered (BAR-resident or partly evicted), page not aligned or split, too many runs, too big, budget, foreign consumer, busy | legacy copy (and mirror), `GbRefuse`, `GbWhy` 2 to 11, no strike |
+| create | host refused (12 to 19, 28), transport (20), live-resource table full (25) | legacy copy, `GbFail`, one strike, budget refunded, nothing left on the host |
+| import | Venus refused (21 to 24) and the unwind (destroy, free, fence) succeeded | blob unref'd, then pages may go; legacy copy, one strike |
+| import | the unwind or the UNREF failed | record poisoned (`Draining`, pin kept), `GbLeak`; legacy copy for this destination for good |
+| retire | a drain wait timed out (26) or a release step failed (27), or no Venus client | record poisoned, pin kept (pages stay locked until the generation ends), `GbLeak`, `GbStrike`; the paging operation goes on |
+| strikes | 3 failures on one destination | `Disabled`: legacy copy for that destination until it is destroyed (`GbStrike`) |
+| foreign consumer | a process other than the presenter has the destination open (`present_buffer_foreign_open`) | a `Ready` guest blob is retired first, then legacy copy |
+
+"Foreign consumer" assumes the destination's creator is the presenting process (the S-A0 census: every Shadow/Staging was opened
+by the app itself, `rm-backed-standard.md` 8); an unknown presenter counts every open as foreign.
+
+#### 24.12.4 Locking, IRQL, stack
+
+* Lock order everywhere: content transaction (PASSIVE mutex) -> Venus mutex -> virtio spinlock. New: the paging thread takes the
+  Venus mutex while holding the content transaction (retire). No holder of the Venus mutex waits for the content transaction
+  (the worker's mirror runs after its Venus section; `mark_stale` is spinlocks only); the worker takes scanout -> content, the
+  paging path never takes scanout. The guest-record table has its own spinlock; pins are never dropped under it.
+* IRQL: everything new is PASSIVE except the counters (atomics) and the record lookups (spinlock). The knob is read from the
+  registry only at StartDevice and on first use (PASSIVE).
+* Stack: nothing new in StartDevice or `VirtioGpu::init`; `prepare`, `create` and `retire` are `#[inline(never)]`; the entries
+  buffer (at most 64 KiB) and the piece list are heap allocations (fallible).
+
+#### 24.12.5 Knob
+
+`GuestBlob` (REG_DWORD in the service key, default 0; `diag::knobs::GUEST_BLOB`), read at every StartDevice and mirrored as
+`GbKnob` with the value in force. Needs the host's `--venus-guest-blobs`. Independent of `BltAsync` / `BltNoMirror`; with
+`BltAsync` it also opens the DIRECT route to a guest destination.
+
+#### 24.12.6 Counters (`kmd_logic::guest_blob::COUNTERS`, all written by `ddi/guest_blob.rs` only, published with the other event-gated blocks)
+
+| Counter | Meaning |
+|---|---|
+| `GbKnob` / `GbFeat` | knob in force / host advertises the feature |
+| `GbMade` | guest blobs created and imported |
+| `GbHit` | Present copies submitted into a guest buffer (all three arms) |
+| `GbDrop` | guest blobs retired and released (paging, discard, destroy, foreign consumer) |
+| `GbDrainUs` / `GbDrainMax` | total / longest microseconds of the retires (drain + release + UNREF) |
+| `GbFail` / `GbStrike` / `GbLeak` | failures (strikes) / destinations disabled / destinations whose pages stay pinned |
+| `GbWhy` / `GbMask` | last reason / every reason seen (bit `code - 1`, codes in 24.12.1 item 10 and `guest_blob::Why`) |
+| `GbRefuse` | Blts a decision kept on the legacy copy |
+| `GbRuns` / `GbBytes` | runs and bytes of the last create |
+| `GbLive` / `GbLiveRuns` | live guest blobs and their runs (the host's totals) |
+| `GbLost` | deferred copies whose guest buffer was retired before their submission |
+
+Also `PBSyCp` 4 (legacy arm: the copy went into the guest buffer) and `VnGbBits` (the last import's `memoryTypeBits`).
+
+Pass conditions on hardware (Heaven windowed, NVK DWM, `GuestBlob=1`, host `--venus-guest-blobs`):
+
+* `GbFeat` 1, `GbMade` >= 1, `GbFail` 0, `GbLeak` 0.
+* `GbHit` grows with the Blt count while `BltMirrorN` and `PgSm` stay flat, and the window is live.
+* `PrDdiBltUs / PrDdiBltN` drops by at least the old `BltMirrorUs / BltMirrorN` (legacy arm); with `BltAsync=1` and
+  `BltNoMirror=0`, `BltAsyncDir` grows.
+* Under window drags and memory pressure: `PgTo`, `PgTi` and `GbDrop` grow, `GbMade` follows `GbDrop` (recreated after the next
+  eviction), `GbLive` returns to the number of leased destinations, `PgSe` / `PgInvOvf` / `GbLeak` stay 0, `GbDrainMax` is a few
+  milliseconds.
+* `GbLost` stays small (only Presents racing a paging operation).
+
+#### 24.12.7 Where the code is
+
+* Pure: `kmd_logic/src/guest_blob.rs` (contract, `build_runs`, `cover_len`, `Budget`, `Record`, `eligible`, `present_effect`,
+  `foreign_consumer`, `COUNTERS`; 39 tests including the name scans).
+* Knob and counters, create, retire, the paging hooks' entry points: `kmd_render/src/ddi/guest_blob.rs`.
+* Venus: `kmd_render/src/virtio/venus/guest_blob.rs` (import, retire, the copy recorder); the target switch in
+  `virtio/venus/present.rs` (`prepare_present_blt_to`, `submit_present_blt_guest`, `PreparedPresentBltSubmission::guest_target`).
+* Control queue: `virtio/ctrl.rs` `create_guest_blob`, `release_guest_blob`.
+* Records and pins: `adapter/backing.rs` (`GuestPin`, `SystemBackingSnapshot::pieces`, the `guest_*` methods, `reset_generation`).
+* Arms: `ddi/display.rs` (legacy arm, worker), `ddi/blt_async.rs` (`try_async`, `direct`, `deferred`).
+* Hooks: `ddi/build_paging_buffer.rs` (both transfers, discard), `ddi/create_allocation.rs` (destroy).
+* Foreign consumers: `virtio/gpu/mod.rs` `present_buffer_foreign_open`.
+
+#### 24.12.8 Verified, and not
+
+* Verified: `kmd_logic` host tests (the run builder over covered, uncovered, unaligned, split, overlapping and over-limit leases,
+  the Heaven 1600x900 shape, the budget, every state transition, strikes and poisoning, the decision order, the effect table, the
+  foreign-consumer rule, the error classes, the memory-type choice, and golden bytes of the two new Venus commands), with the
+  counter-name scan over `kmd_render`; a stub type-check of `kmd_render` (no new error against the base other than two stub
+  artefacts on the MDL fields, which are read the way `build_paging_buffer.rs` already reads them).
+* NOT verified: anything on hardware or against the real host. In particular: that the host accepts the create and the import
+  exactly as built (the wire layout of `vkGetMemoryResourcePropertiesMESA` was written from the Venus protocol headers); that the
+  MDL PFN array of a lease is what the host expects (`PFN << 12` as a guest physical address); that DWM sees the frame
+  (coherence through the guest's write-back view); the drain under real paging (a paging thread waiting on the Venus mutex and on
+  host fences); the deferred-race loss rate; the cost of the lazy import on the first Present; and that a device reset releases
+  guest-blob mappings on the host (24.12.1 item 6).
+* Not done: creating the guest blob off the Present path (on the HPD worker); a periodic first-row checksum (`GbBad` in 13.3's
+  test plan).
+
 ## 25. Wrong buffer on scanout after a device restart (v337 incident; identity fix, StopDevice unbind)
 
 ### 25.1 The incident

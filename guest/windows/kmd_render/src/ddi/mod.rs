@@ -27,6 +27,7 @@ pub(crate) mod flip_announce;
 pub(crate) mod flip_keep;
 pub(crate) mod flip_lat;
 pub(crate) mod flush_trace;
+pub(crate) mod guest_blob;
 mod gpummu;
 pub(crate) mod hpd;
 pub(crate) mod interrupt;
