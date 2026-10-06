@@ -38,6 +38,7 @@ pub mod flip_retire;
 pub mod foreign_flip;
 pub mod foreign_resource;
 pub mod foreign_scanout;
+pub mod host_vblank;
 pub mod hpd_wake;
 pub mod rm_resource_import;
 pub mod page_runs;

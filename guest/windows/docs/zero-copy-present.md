@@ -271,6 +271,10 @@ hardening items below.
   applies. If that is awkward, relax step 3 to "same creator process" (needs the process in the
   NVRM handle slot).
 - **O6 The vehicle's `PresentSource` for a foreign image** (section 6): who owns the change.
+- **O7 Pacing to the host's real scanout.** The vsync heartbeat is a free-running timer that
+  beats against the host viewer's presentation (frame slips, a latency sawtooth). The opt-in
+  alternative that follows the host's presentation feedback, its host requirements and its
+  measurement-first recommendation are in `docs/host-vblank-pacing.md` (design only).
 
 ## Review findings, deferred (IMPORT_RM, gated off)
 
