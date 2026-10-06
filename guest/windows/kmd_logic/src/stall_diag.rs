@@ -145,7 +145,15 @@ pub mod site {
 ///   exhausted; `VsRevN`: heartbeats the watchdog found dead and re-armed.
 /// * `PwrN`, `PwrUid`, `PwrD3N`: `DxgkDdiSetPowerState` calls, the last one's `DeviceUid`
 ///   (0xFFFFFFFF = the adapter), and those that were not D0.
-pub const COUNTERS: [&str; 74] = [
+/// * `HpdLongSite`, `HpdLongUs`, `HpdLongT`, `HpdLongInfl`: the STEP (a [`site`] id) of the worker
+///   that held it longest in one go, for how many microseconds, when it ended (interrupt ms),
+///   and the DDIs in flight then (`device_lost` ids 0..32 as a bitmask). `HpdStep100N`: steps of
+///   100 ms or more. `HpdPass100N`, `HpdPass500N`: whole passes of 100 ms / 500 ms or more.
+/// * `VsGap100N`, `VsGap1000N`: silences of the vsync heartbeat of 100 ms / 1 s or more.
+///   `VsGapT`, `VsGapSite`, `VsGapFlg`, `VsGapInfl`: for the longest (`VsGapMaxMs`): when it
+///   ended, the worker's `HpdSite` then, flags (bit 0 scanout mutex held, 1 Venus mutex held, 2
+///   worker idle in its wait, 3 programming pending), the DDIs in flight (ids 0..32).
+pub const COUNTERS: [&str; 87] = [
     "HpdLoopN",
     "HpdLoopT",
     "HpdSite",
@@ -225,6 +233,21 @@ pub const COUNTERS: [&str; 74] = [
     "ModeStgT",
     "ModeN",
     "ModeSt",
+    // The "Adapter-wide device removed" incident (docs/zero-copy-present.md): the longest worker
+    // STEP and the longest vsync silence, each with the context it ended in.
+    "HpdLongSite",
+    "HpdLongUs",
+    "HpdLongT",
+    "HpdLongInfl",
+    "HpdStep100N",
+    "HpdPass100N",
+    "HpdPass500N",
+    "VsGap100N",
+    "VsGap1000N",
+    "VsGapT",
+    "VsGapSite",
+    "VsGapFlg",
+    "VsGapInfl",
 ];
 
 // ---- the scanout mutex -----------------------------------------------------------------------

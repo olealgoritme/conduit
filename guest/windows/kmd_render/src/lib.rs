@@ -104,11 +104,11 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
 
     // ── PnP / power lifecycle (Phase 1, real) ──────────────────────────────
     data.DxgkDdiAddDevice = Some(ddi::dxgkddi_add_device);
-    data.DxgkDdiStartDevice = Some(ddi::dxgkddi_start_device);
-    data.DxgkDdiStopDevice = Some(ddi::dxgkddi_stop_device);
-    data.DxgkDdiRemoveDevice = Some(ddi::dxgkddi_remove_device);
+    data.DxgkDdiStartDevice = Some(ddi::traced::start_device);
+    data.DxgkDdiStopDevice = Some(ddi::traced::stop_device);
+    data.DxgkDdiRemoveDevice = Some(ddi::traced::remove_device);
     data.DxgkDdiDispatchIoRequest = Some(ddi::dxgkddi_dispatch_io_request);
-    data.DxgkDdiSetPowerState = Some(ddi::dxgkddi_set_power_state);
+    data.DxgkDdiSetPowerState = Some(ddi::traced::set_power_state);
 
     // ── Base driver/adapter lifecycle DDIs ──────────────────────────────────
     // Non-version-gated base-block DDIs that the MSDN DxgkInitialize sample
@@ -123,13 +123,13 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiNotifyAcpiEvent = Some(ddi::dxgkddi_notify_acpi_event);
 
     // ── Child/adapter queries (Phase 1, real — render-only: no children) ────
-    data.DxgkDdiQueryChildRelations = Some(ddi::dxgkddi_query_child_relations);
-    data.DxgkDdiQueryChildStatus = Some(ddi::dxgkddi_query_child_status);
+    data.DxgkDdiQueryChildRelations = Some(ddi::traced::query_child_relations);
+    data.DxgkDdiQueryChildStatus = Some(ddi::traced::query_child_status);
     data.DxgkDdiQueryDeviceDescriptor = Some(ddi::dxgkddi_query_device_descriptor);
     // Child container id — only meaningful when the DisplayHalf child video
     // output is advertised; returns NOT_SUPPORTED otherwise (Option A, #1).
     data.DxgkDdiGetChildContainerId = Some(ddi::dxgkddi_get_child_container_id);
-    data.DxgkDdiQueryAdapterInfo = Some(ddi::dxgkddi_query_adapter_info);
+    data.DxgkDdiQueryAdapterInfo = Some(ddi::traced::query_adapter_info);
     data.DxgkDdiStopDeviceAndReleasePostDisplayOwnership =
         Some(ddi::dxgkddi_stop_device_and_release_post_display_ownership);
     data.DxgkDdiSystemDisplayEnable = Some(ddi::dxgkddi_system_display_enable);
@@ -140,29 +140,29 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiDpcRoutine = Some(ddi::dxgkddi_dpc_routine);
 
     // ── Device / context / process (Phase 1 device alloc; rest stubbed) ─────
-    data.DxgkDdiCreateDevice = Some(device::dxgkddi_create_device);
-    data.DxgkDdiDestroyDevice = Some(device::dxgkddi_destroy_device);
-    data.DxgkDdiCreateContext = Some(device::dxgkddi_create_context);
-    data.DxgkDdiDestroyContext = Some(device::dxgkddi_destroy_context);
-    data.DxgkDdiCreateProcess = Some(device::dxgkddi_create_process);
-    data.DxgkDdiDestroyProcess = Some(device::dxgkddi_destroy_process);
+    data.DxgkDdiCreateDevice = Some(ddi::traced::create_device);
+    data.DxgkDdiDestroyDevice = Some(ddi::traced::destroy_device);
+    data.DxgkDdiCreateContext = Some(ddi::traced::create_context);
+    data.DxgkDdiDestroyContext = Some(ddi::traced::destroy_context);
+    data.DxgkDdiCreateProcess = Some(ddi::traced::create_process);
+    data.DxgkDdiDestroyProcess = Some(ddi::traced::destroy_process);
 
     // ── Memory management (registered, but fails honestly until implemented) ─
-    data.DxgkDdiCreateAllocation = Some(ddi::dxgkddi_create_allocation);
-    data.DxgkDdiDestroyAllocation = Some(ddi::dxgkddi_destroy_allocation);
-    data.DxgkDdiBuildPagingBuffer = Some(ddi::dxgkddi_build_paging_buffer);
-    data.DxgkDdiMapCpuHostAperture = Some(ddi::dxgkddi_map_cpu_host_aperture);
-    data.DxgkDdiUnmapCpuHostAperture = Some(ddi::dxgkddi_unmap_cpu_host_aperture);
+    data.DxgkDdiCreateAllocation = Some(ddi::traced::create_allocation);
+    data.DxgkDdiDestroyAllocation = Some(ddi::traced::destroy_allocation);
+    data.DxgkDdiBuildPagingBuffer = Some(ddi::traced::build_paging_buffer);
+    data.DxgkDdiMapCpuHostAperture = Some(ddi::traced::map_cpu_host_aperture);
+    data.DxgkDdiUnmapCpuHostAperture = Some(ddi::traced::unmap_cpu_host_aperture);
 
     // ── Command submission (registered, but not advertised as usable yet) ────
-    data.DxgkDdiSubmitCommand = Some(ddi::dxgkddi_submit_command);
-    data.DxgkDdiSubmitCommandVirtual = Some(ddi::dxgkddi_submit_command_virtual);
-    data.DxgkDdiPreemptCommand = Some(ddi::dxgkddi_preempt_command);
-    data.DxgkDdiResetFromTimeout = Some(ddi::dxgkddi_reset_from_timeout);
-    data.DxgkDdiRestartFromTimeout = Some(ddi::dxgkddi_restart_from_timeout);
+    data.DxgkDdiSubmitCommand = Some(ddi::traced::submit_command);
+    data.DxgkDdiSubmitCommandVirtual = Some(ddi::traced::submit_command_virtual);
+    data.DxgkDdiPreemptCommand = Some(ddi::traced::preempt_command);
+    data.DxgkDdiResetFromTimeout = Some(ddi::traced::reset_from_timeout);
+    data.DxgkDdiRestartFromTimeout = Some(ddi::traced::restart_from_timeout);
     data.DxgkDdiQueryDependentEngineGroup = Some(ddi::dxgkddi_query_dependent_engine_group);
-    data.DxgkDdiQueryEngineStatus = Some(ddi::dxgkddi_query_engine_status);
-    data.DxgkDdiResetEngine = Some(ddi::dxgkddi_reset_engine);
+    data.DxgkDdiQueryEngineStatus = Some(ddi::traced::query_engine_status);
+    data.DxgkDdiResetEngine = Some(ddi::traced::reset_engine);
     data.DxgkDdiCreateHwContext = Some(ddi::dxgkddi_create_hw_context);
     data.DxgkDdiDestroyHwContext = Some(ddi::dxgkddi_destroy_hw_context);
     data.DxgkDdiCreateHwQueue = Some(ddi::dxgkddi_create_hw_queue);
@@ -179,20 +179,20 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiSetVirtualMachineData = Some(ddi::dxgkddi_set_virtual_machine_data);
 
     // ── Private diagnostics/control only; not the render ABI ────────────────
-    data.DxgkDdiEscape = Some(ddi::dxgkddi_escape);
+    data.DxgkDdiEscape = Some(ddi::traced::escape);
 
     // ── Display/VidPn paths. Registered explicitly, but all return unsupported
     // while StartDevice reports zero sources and children.
-    data.DxgkDdiPresent = Some(ddi::dxgkddi_present);
+    data.DxgkDdiPresent = Some(ddi::traced::present);
     data.DxgkDdiSetPointerPosition = Some(ddi::dxgkddi_set_pointer_position);
     data.DxgkDdiSetPointerShape = Some(ddi::dxgkddi_set_pointer_shape);
-    data.DxgkDdiIsSupportedVidPn = Some(ddi::dxgkddi_is_supported_vidpn);
-    data.DxgkDdiRecommendFunctionalVidPn = Some(ddi::dxgkddi_recommend_functional_vidpn);
-    data.DxgkDdiEnumVidPnCofuncModality = Some(ddi::dxgkddi_enum_vidpn_cofunc_modality);
-    data.DxgkDdiSetVidPnSourceVisibility = Some(ddi::dxgkddi_set_vidpn_source_visibility);
-    data.DxgkDdiCommitVidPn = Some(ddi::dxgkddi_commit_vidpn);
-    data.DxgkDdiUpdateActiveVidPnPresentPath = Some(ddi::dxgkddi_update_active_vidpn_present_path);
-    data.DxgkDdiSetVidPnSourceAddress = Some(ddi::dxgkddi_set_vidpn_source_address);
+    data.DxgkDdiIsSupportedVidPn = Some(ddi::traced::is_supported_vidpn);
+    data.DxgkDdiRecommendFunctionalVidPn = Some(ddi::traced::recommend_functional_vidpn);
+    data.DxgkDdiEnumVidPnCofuncModality = Some(ddi::traced::enum_vidpn_cofunc_modality);
+    data.DxgkDdiSetVidPnSourceVisibility = Some(ddi::traced::set_vidpn_source_visibility);
+    data.DxgkDdiCommitVidPn = Some(ddi::traced::commit_vidpn);
+    data.DxgkDdiUpdateActiveVidPnPresentPath = Some(ddi::traced::update_active_vidpn_present_path);
+    data.DxgkDdiSetVidPnSourceAddress = Some(ddi::traced::set_vidpn_source_address);
     data.DxgkDdiRecommendMonitorModes = Some(ddi::dxgkddi_recommend_monitor_modes);
     data.DxgkDdiQueryVidPnHWCapability = Some(ddi::dxgkddi_query_vidpn_hw_capability);
     data.DxgkDdiGetScanLine = Some(ddi::dxgkddi_get_scan_line);
@@ -204,12 +204,12 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     // ── Render-path & GPU-VA DDIs. They are registered so the table shape is
     // explicit, but return unsupported until the corresponding capability is
     // implemented and advertised.
-    data.DxgkDdiRender = Some(ddi::dxgkddi_render);
-    data.DxgkDdiRenderKm = Some(ddi::dxgkddi_render_km);
-    data.DxgkDdiRenderGdi = Some(ddi::dxgkddi_render_gdi);
-    data.DxgkDdiPatch = Some(ddi::dxgkddi_patch);
-    data.DxgkDdiOpenAllocation = Some(ddi::dxgkddi_open_allocation);
-    data.DxgkDdiCloseAllocation = Some(ddi::dxgkddi_close_allocation);
+    data.DxgkDdiRender = Some(ddi::traced::render);
+    data.DxgkDdiRenderKm = Some(ddi::traced::render_km);
+    data.DxgkDdiRenderGdi = Some(ddi::traced::render_gdi);
+    data.DxgkDdiPatch = Some(ddi::traced::patch);
+    data.DxgkDdiOpenAllocation = Some(ddi::traced::open_allocation);
+    data.DxgkDdiCloseAllocation = Some(ddi::traced::close_allocation);
     data.DxgkDdiDescribeAllocation = Some(ddi::dxgkddi_describe_allocation);
     data.DxgkDdiGetStandardAllocationDriverData =
         Some(ddi::dxgkddi_get_standard_allocation_driver_data);
@@ -217,7 +217,7 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiSetRootPageTable = Some(ddi::dxgkddi_set_root_page_table);
     data.DxgkDdiGetRootPageTableSize = Some(ddi::dxgkddi_get_root_page_table_size);
     data.DxgkDdiCollectDbgInfo = Some(ddi::dxgkddi_collect_dbg_info);
-    data.DxgkDdiControlInterrupt = Some(ddi::dxgkddi_control_interrupt);
+    data.DxgkDdiControlInterrupt = Some(ddi::traced::control_interrupt);
     data.DxgkDdiQueryCurrentFence = Some(ddi::dxgkddi_query_current_fence);
 
     data
