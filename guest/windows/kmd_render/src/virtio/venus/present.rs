@@ -329,6 +329,18 @@ pub(super) struct PreparedPresentBlt {
 pub(crate) struct PreparedPresentBltSubmission {
     command_buffer_id: VkCommandBufferId,
     destination: PresentDestinationDesc,
+    /// The `present_blits` key of the recorded command: the destination's resource id, or
+    /// the guest blob's when the copy goes into a guest buffer (`GuestBlob`).
+    cache_destination: u32,
+    /// The copy writes the destination's leased system pages through a guest buffer.
+    guest: bool,
+}
+
+impl PreparedPresentBltSubmission {
+    /// The copy goes into a guest buffer: nothing to mirror, nothing stale (`GuestBlob`).
+    pub(crate) fn guest_target(&self) -> bool {
+        self.guest
+    }
 }
 
 impl PreparedPresentBlt {
@@ -1168,6 +1180,29 @@ impl VenusClient {
         source: OptimalPresentImageDesc,
         destination: PresentDestinationDesc,
     ) -> Result<PreparedPresentBltSubmission, VirtioError> {
+        self.prepare_present_blt_to(adapter, source, destination, false)
+    }
+
+    /// [`Self::prepare_present_blt`] for the arms that may copy into a guest buffer
+    /// (`GuestBlob`): the legacy Blt arm and both `BltAsync` arms. Their callers skip the
+    /// mirror and the stale mark when [`PreparedPresentBltSubmission::guest_target`] says so.
+    /// A WindowedBlt snapshot never does (its worker mirrors unconditionally).
+    pub fn prepare_present_blt_guest(
+        &mut self,
+        adapter: &AdapterContext,
+        source: OptimalPresentImageDesc,
+        destination: PresentDestinationDesc,
+    ) -> Result<PreparedPresentBltSubmission, VirtioError> {
+        self.prepare_present_blt_to(adapter, source, destination, true)
+    }
+
+    fn prepare_present_blt_to(
+        &mut self,
+        adapter: &AdapterContext,
+        source: OptimalPresentImageDesc,
+        destination: PresentDestinationDesc,
+        allow_guest: bool,
+    ) -> Result<PreparedPresentBltSubmission, VirtioError> {
         if source.resource_id == destination.resource_id()
             || source.width != destination.width()
             || source.height != destination.height()
@@ -1203,9 +1238,18 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
 
+        // `GuestBlob`: a live guest buffer of a standard destination is the copy target and
+        // the cache key (one predicate, under this mutex: `guest_target_for`).
+        let guest = match destination {
+            PresentDestinationDesc::StandardBuffer(desc) if allow_guest => {
+                self.guest_target_for(&desc)
+            }
+            _ => None,
+        };
+        let cache_destination = guest.map_or(destination.resource_id(), |g| g.guest);
         let existing = self.present_blits.iter().position(|blt| {
             blt.source_resource_id == source.resource_id
-                && blt.destination_resource_id == destination.resource_id()
+                && blt.destination_resource_id == cache_destination
         });
         if existing.is_none() {
             reserve_present_cache_slot(&mut self.present_blits, MAX_PRESENT_BLITS, b"PBLRef")?;
@@ -1229,6 +1273,49 @@ impl VenusClient {
                 let mut conversion_memory_id = None;
                 let mut conversion_init_pool_id = None;
                 let command_result = match destination {
+                    PresentDestinationDesc::StandardBuffer(desc) if guest.is_some() => {
+                        let guest = guest.ok_or(VirtioError::DeviceError)?;
+                        let conversion = if requires_conversion {
+                            let conversion = self.create_bound_present_conversion_image(
+                                adapter,
+                                source.width,
+                                source.height,
+                                destination_pixel_format,
+                            )?;
+                            conversion_image_id = Some(conversion.0);
+                            conversion_memory_id = Some(conversion.1);
+                            Some(conversion)
+                        } else {
+                            None
+                        };
+                        let command = match self.record_reusable_guest_blt(
+                            adapter,
+                            source_image.image_id,
+                            conversion.map(|c| c.0),
+                            guest.buffer_id,
+                            guest.size,
+                            source.width,
+                            source.height,
+                            desc.pitch,
+                            destination_pixel_format.bytes_per_pixel(),
+                        ) {
+                            Ok(command) => command,
+                            Err(error) => {
+                                // Never submitted: safe to unwind completely.
+                                if let Some(conversion) = conversion {
+                                    let _ = self.destroy_image_on_ring(adapter, conversion.0);
+                                    let _ = self.free_memory_object(adapter, conversion.1);
+                                }
+                                return Err(error);
+                            }
+                        };
+                        if let Some(conversion) = conversion {
+                            conversion_init_pool_id = Some(
+                                self.initialize_present_conversion_image(adapter, conversion.0)?,
+                            );
+                        }
+                        Ok(command)
+                    }
                     PresentDestinationDesc::StandardBuffer(desc) => {
                         let destination_buffer =
                             destination_buffer.ok_or(VirtioError::DeviceError)?;
@@ -1312,7 +1399,7 @@ impl VenusClient {
                 };
                 self.present_blits.push(PreparedPresentBlt {
                     source_resource_id: source.resource_id,
-                    destination_resource_id: destination.resource_id(),
+                    destination_resource_id: cache_destination,
                     command_pool_id,
                     command_buffer_id,
                     conversion_image_id,
@@ -1320,8 +1407,10 @@ impl VenusClient {
                     conversion_init_pool_id,
                     last_wire_fence_id: 0,
                     submit_count: 0,
-                    // Only a standard buffer is CPU-mappable for the diagnostic.
-                    probe_done: matches!(destination, PresentDestinationDesc::OptimalImage(_)),
+                    // Only a standard buffer is CPU-mappable for the diagnostic (and a guest
+                    // buffer is never mapped through Venus).
+                    probe_done: guest.is_some()
+                        || matches!(destination, PresentDestinationDesc::OptimalImage(_)),
                 });
                 record_present_cache_high_water(
                     self.present_blits.len(),
@@ -1336,6 +1425,8 @@ impl VenusClient {
         Ok(PreparedPresentBltSubmission {
             command_buffer_id,
             destination,
+            cache_destination,
+            guest: guest.is_some(),
         })
     }
 
@@ -1349,7 +1440,29 @@ impl VenusClient {
         source: OptimalPresentImageDesc,
         destination: PresentDestinationDesc,
     ) -> Result<u64, VirtioError> {
-        let prepared = self.prepare_present_blt(adapter, source, destination)?;
+        self.submit_present_blt_to(adapter, source, destination, false)
+            .map(|(fence, _)| fence)
+    }
+
+    /// [`Self::submit_present_blt`] for the legacy Blt arm, which may copy into a guest buffer
+    /// (`GuestBlob`): returns the wire fence and whether it did.
+    pub fn submit_present_blt_guest(
+        &mut self,
+        adapter: &AdapterContext,
+        source: OptimalPresentImageDesc,
+        destination: PresentDestinationDesc,
+    ) -> Result<(u64, bool), VirtioError> {
+        self.submit_present_blt_to(adapter, source, destination, true)
+    }
+
+    fn submit_present_blt_to(
+        &mut self,
+        adapter: &AdapterContext,
+        source: OptimalPresentImageDesc,
+        destination: PresentDestinationDesc,
+        allow_guest: bool,
+    ) -> Result<(u64, bool), VirtioError> {
+        let prepared = self.prepare_present_blt_to(adapter, source, destination, allow_guest)?;
         let blt_index = self.validate_prepared_present_blt(prepared)?;
         let submit = self.encode_command_buffer_submit(prepared.command_buffer_id);
         let present_buffer_write = match prepared.destination {
@@ -1364,7 +1477,7 @@ impl VenusClient {
             present_buffer_write,
         )?;
         self.note_prepared_present_blt_submit(adapter, prepared, blt_index, fence_id);
-        Ok(fence_id)
+        Ok((fence_id, prepared.guest))
     }
 
     /// The DIRECT asynchronous Blt (`BltAsync`): [`Self::submit_present_blt`] for a standard-buffer
@@ -1377,7 +1490,9 @@ impl VenusClient {
         source: OptimalPresentImageDesc,
         destination: PresentDestinationDesc,
     ) -> Result<ctrl::BltSubmit, VirtioError> {
-        let prepared = self.prepare_present_blt(adapter, source, destination)?;
+        // May copy into a guest buffer: the caller decided the stale mark under this same
+        // mutex with `guest_target_live`, the predicate `prepare_present_blt_to` applies.
+        let prepared = self.prepare_present_blt_to(adapter, source, destination, true)?;
         let blt_index = self.validate_prepared_present_blt(prepared)?;
         let PresentDestinationDesc::StandardBuffer(buffer) = prepared.destination else {
             return Err(VirtioError::DeviceError);
@@ -1408,7 +1523,7 @@ impl VenusClient {
                 (blt.command_buffer_id.get(), blt.destination_resource_id)
             }),
             prepared.command_buffer_id.get(),
-            prepared.destination.resource_id(),
+            prepared.cache_destination,
         )
         .ok_or(VirtioError::DeviceError)
     }
@@ -1422,6 +1537,9 @@ impl VenusClient {
     ) {
         // Validation and submission hold the same Venus lock, so the resolved
         // index cannot move before this update.
+        if prepared.guest {
+            crate::ddi::guest_blob::note_hit();
+        }
         let blt = &mut self.present_blits[blt_index];
         blt.last_wire_fence_id = fence_id;
         blt.submit_count = blt.submit_count.saturating_add(1);

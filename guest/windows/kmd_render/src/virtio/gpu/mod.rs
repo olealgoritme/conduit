@@ -6555,6 +6555,19 @@ impl VirtioGpu {
         true
     }
 
+    /// Whether a process other than `presenter` has the Present buffer `resource_id` open
+    /// (`GuestBlob` refuses such a destination: that consumer samples the Venus blob).
+    /// `helios_kmd_logic::guest_blob::foreign_consumer`. Spinlock-only.
+    pub(crate) fn present_buffer_foreign_open(&self, resource_id: u32, presenter: usize) -> bool {
+        helios_kmd_logic::guest_blob::foreign_consumer(
+            self.present_buffer_opens
+                .iter()
+                .map(|slot| (slot.resource_id, slot.creator_process, slot.refs)),
+            resource_id,
+            presenter,
+        )
+    }
+
     fn present_buffer_is_open_for_process(&self, resource_id: u32, creator_process: usize) -> bool {
         self.present_buffer_opens.iter().any(|slot| {
             slot.resource_id == resource_id

@@ -51,6 +51,7 @@ mod bringup;
 mod commands;
 mod diagnostics;
 mod foreign_copy;
+mod guest_blob;
 mod present;
 mod protocol;
 mod ring;
@@ -62,6 +63,7 @@ pub(crate) use foreign_copy::{
     foreign_source_if_enabled, publish_counters as publish_foreign_copy_counters, ForeignSource,
     FC_BLT, FC_SCANOUT,
 };
+pub(crate) use guest_blob::ImportFailed;
 pub(crate) use present::*;
 pub(crate) use protocol::*;
 use ring::*;
@@ -336,6 +338,10 @@ pub struct VenusClient {
     /// primary needed one: at levels below 5 nothing ever allocates it.
     rm_blt_stage: Option<RmBltStage>,
     rm_blt_stage_allocs: u32,
+    /// Imported guest-memory blobs, the copy destinations of KMD standard buffers whose system
+    /// backing is fully leased (`GuestBlob`, `guest_blob.rs`). Empty unless the knob is on and
+    /// the host serves guest blobs.
+    guest_buffers: Vec<guest_blob::GuestBuffer>,
 }
 
 impl VenusClient {

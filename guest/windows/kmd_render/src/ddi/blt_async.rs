@@ -524,9 +524,17 @@ pub(crate) unsafe fn try_async(
     }
     let (boundary_state, deferred_pending, room) =
         (facts.boundary, facts.deferred_pending, facts.room);
+    // `GuestBlob`: a destination with a live guest blob needs no mirror, so the DIRECT route is
+    // open to it as with `BltNoMirror` (one spinlock; the copy re-checks under the Venus mutex
+    // and falls back when the guest blob went in between).
+    let no_mirror = no_mirror_on();
+    let guest_ready = adapter
+        .system_backings
+        .guest_record(destination_resource)
+        .is_some_and(|record| record.copy_target());
     let route = ba::decide(ba::Facts {
         async_on: true,
-        no_mirror_on: no_mirror_on(),
+        no_mirror_on: no_mirror || guest_ready,
         foreign_source: true,
         snapshot: false,
         dst_standard_buffer: matches!(destination, PresentDestinationDesc::StandardBuffer(_)),
@@ -536,7 +544,9 @@ pub(crate) unsafe fn try_async(
     });
     let taken = match route {
         Route::Legacy { why } | Route::LegacyAfterDrain { why } => Ok(fall(why)),
-        Route::Direct => unsafe { direct(passive, adapter, args, source, destination) },
+        Route::Direct => unsafe {
+            direct(passive, adapter, args, source, destination, !no_mirror)
+        },
         Route::Deferred => unsafe {
             deferred(passive, adapter, args, source, destination, boundary)
         },
@@ -575,16 +585,30 @@ fn drain(passive: PassiveLevel, adapter: &AdapterContext, resource_id: u32) {
 /// same transport critical section as the enqueue and handed back by the completion DPC; the
 /// Present's DMA fence retires with the copy's wire fence exactly as it did when the DDI waited
 /// (`PresentSubmissionPrivate::merge_fence`).
+///
+/// `need_guest`: the route was open only because of the destination's guest blob (`GuestBlob`
+/// with `BltNoMirror` 0). If the guest blob is gone by the time the Venus mutex is held, nothing
+/// is submitted and the legacy arm (which mirrors) runs.
 unsafe fn direct(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     args: &DXGKARG_PRESENT,
     source: OptimalPresentImageDesc,
     destination: PresentDestinationDesc,
+    need_guest: bool,
 ) -> Result<Taken, NTSTATUS> {
-    // Before the copy: from here the system pages are older than the blob.
-    mark_stale(adapter, destination.resource_id());
+    let destination_resource = destination.resource_id();
     let copy = adapter.with_venus_client(passive, |client| {
+        // Decided under the Venus mutex, with the predicate the copy applies: a copy into the
+        // guest buffer writes the system pages themselves; any other copy makes them older
+        // than the blob from here on (marked before the copy, spinlocks only).
+        let guest = client.guest_target_live(destination_resource);
+        if need_guest && !guest {
+            return Err(VirtioError::DeviceError);
+        }
+        if !guest {
+            mark_stale(adapter, destination_resource);
+        }
         client.submit_present_blt_direct(adapter, source, destination)
     });
     // (`submit_present_blt_direct` passes the source's id down: the in-flight table holds a
@@ -628,19 +652,22 @@ unsafe fn deferred(
     let Some(boundary) = boundary else {
         return Ok(fall(Why::NoBoundaryMirror));
     };
-    let no_mirror = no_mirror_on();
+    let no_mirror_knob = no_mirror_on();
     // SAFETY of the lock order: scanout -> venus -> virtio, as the snapshot arm of the same
     // DDI. Cache preparation may block only while the Venus mutex is held; the FIFO insertion is
     // a preallocated spinlock-only mutation.
     let queued = adapter.with_scanout_lifecycle(passive, |lock| {
+        // May copy into the destination's guest buffer (`GuestBlob`): such a copy owes no
+        // mirror, so the worker gets `no_mirror` for it and marks nothing stale.
         let prepared = lock.with_venus_client(|client| {
-            client.prepare_present_blt(adapter, source, destination)
+            client.prepare_present_blt_guest(adapter, source, destination)
         });
         let prepared = match prepared {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(VirtioError::DeviceError),
         };
+        let no_mirror = no_mirror_knob || prepared.guest_target();
         adapter
             .with_virtio(|v| {
                 v.queue_async_blt(adapter, source, destination, prepared, boundary, no_mirror)

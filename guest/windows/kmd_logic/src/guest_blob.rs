@@ -70,6 +70,8 @@ pub mod contract {
     pub const EFAULT: u32 = 14;
     pub const EINVAL: u32 = 22;
     pub const EOPNOTSUPP: u32 = 95;
+    /// Entries from more than one guest RAM backing file (never with QEMU's single `pc.ram`).
+    pub const EXDEV: u32 = 18;
 
     /// `VK_COMMAND_TYPE_vkGetMemoryResourcePropertiesMESA_EXT`.
     pub const CMD_GET_MEMORY_RESOURCE_PROPERTIES_MESA: u32 = 192;
@@ -118,8 +120,7 @@ pub mod contract {
             && i < crate::VK_MAX_MEMORY_TYPES
             && (i as usize) < memory_type_flags.len()
         {
-            if memory_type_bits & (1u32 << i) != 0 && memory_type_flags[i as usize] & want == want
-            {
+            if memory_type_bits & (1u32 << i) != 0 && memory_type_flags[i as usize] & want == want {
                 return Some(i);
             }
             i += 1;
@@ -173,6 +174,7 @@ pub mod contract {
             (RESP_ERR_INVALID_CONTEXT_ID, _) => Why::HostContext,
             (RESP_ERR_INVALID_RESOURCE_ID, _) => Why::HostResourceId,
             (RESP_ERR_INVALID_PARAMETER, EFAULT) => Why::HostFault,
+            (RESP_ERR_INVALID_PARAMETER, EXDEV) => Why::HostCrossFile,
             (RESP_ERR_INVALID_PARAMETER, _) => Why::HostShape,
             (RESP_ERR_OUT_OF_MEMORY, _) => Why::HostNoMemory,
             _ => Why::HostOther,
@@ -194,7 +196,7 @@ use contract::{MAX_BLOB_BYTES, MAX_ENTRIES, MAX_LIVE_BLOBS, MAX_LIVE_RUNS, MAX_R
 
 /// Why a destination does not (or no longer) use a guest blob. `code` is what `GbWhy` holds,
 /// `bit` what `GbMask` collects. Codes 1 to 11 are decisions (no strike); 12 and above are
-/// failures, each a strike ([`Why::strikes`]).
+/// failures, each a strike ([`Why::strikes`]). New codes are appended, never renumbered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Why {
     /// `GuestBlob` is 0.
@@ -254,10 +256,13 @@ pub enum Why {
     DrainTimeout,
     /// A step of the release (destroy, free, fence, unref) failed: the pages stay pinned.
     ReleaseFailed,
+    /// `RESP_ERR_INVALID_PARAMETER` + `EXDEV`: the entries span more than one guest RAM
+    /// backing file.
+    HostCrossFile,
 }
 
 impl Why {
-    pub const ALL: [Why; 27] = [
+    pub const ALL: [Why; 28] = [
         Why::KnobOff,
         Why::NotAdvertised,
         Why::NotBuffer,
@@ -285,6 +290,7 @@ impl Why {
         Why::Kmd,
         Why::DrainTimeout,
         Why::ReleaseFailed,
+        Why::HostCrossFile,
     ];
 
     /// 1-based, stable: the value of `GbWhy`.
@@ -317,6 +323,7 @@ impl Why {
             Why::Kmd => 25,
             Why::DrainTimeout => 26,
             Why::ReleaseFailed => 27,
+            Why::HostCrossFile => 28,
         }
     }
 
@@ -433,7 +440,10 @@ pub fn build_runs(
                 Why::Uncovered
             });
         }
-        let in_piece = p.byte_offset.checked_add(offset - p.blob_offset).ok_or(Why::Unaligned)?;
+        let in_piece = p
+            .byte_offset
+            .checked_add(offset - p.blob_offset)
+            .ok_or(Why::Unaligned)?;
         if in_piece % PAGE != 0 {
             return Err(Why::Unaligned);
         }
@@ -884,7 +894,13 @@ mod tests {
         let pfns = [1, 2, 3, 4, 5];
         let p = [piece(0, 5 * PAGE, 0, &pfns)];
         let r = runs(&p, 2 * PAGE).unwrap();
-        assert_eq!(r, [Run { addr: PAGE, len: 2 * PAGE }]);
+        assert_eq!(
+            r,
+            [Run {
+                addr: PAGE,
+                len: 2 * PAGE
+            }]
+        );
     }
 
     #[test]
@@ -941,7 +957,13 @@ mod tests {
         // A lease of a range that started one page into its MDL's first page run.
         let pfns = [50, 51, 52];
         let p = [piece(0, 2 * PAGE, PAGE, &pfns)];
-        assert_eq!(runs(&p, 2 * PAGE).unwrap(), [Run { addr: 51 * PAGE, len: 2 * PAGE }]);
+        assert_eq!(
+            runs(&p, 2 * PAGE).unwrap(),
+            [Run {
+                addr: 51 * PAGE,
+                len: 2 * PAGE
+            }]
+        );
     }
 
     #[test]
@@ -988,8 +1010,16 @@ mod tests {
         let pfns: Vec<u64> = (0..4096u64).collect();
         let p = [piece(0, 4096 * PAGE, 0, &pfns)];
         let r = runs(&p, 4096 * PAGE).unwrap();
-        assert_eq!(r, [Run { addr: 0, len: 4096 * PAGE }]);
-        assert!(r.iter().all(|r| r.len <= MAX_RUN_BYTES && r.len % PAGE == 0));
+        assert_eq!(
+            r,
+            [Run {
+                addr: 0,
+                len: 4096 * PAGE
+            }]
+        );
+        assert!(r
+            .iter()
+            .all(|r| r.len <= MAX_RUN_BYTES && r.len % PAGE == 0));
     }
 
     #[test]
@@ -1263,17 +1293,46 @@ mod tests {
 
     #[test]
     fn contract_error_classes() {
-        assert_eq!(classify_create(RESP_ERR_UNSPEC, EOPNOTSUPP), Why::HostUnsupported);
+        assert_eq!(
+            classify_create(RESP_ERR_UNSPEC, EOPNOTSUPP),
+            Why::HostUnsupported
+        );
         assert_eq!(classify_create(RESP_ERR_UNSPEC, EIO), Why::HostRenderer);
         assert_eq!(classify_create(RESP_ERR_UNSPEC, 0), Why::HostOther);
-        assert_eq!(classify_create(RESP_ERR_INVALID_CONTEXT_ID, 0), Why::HostContext);
-        assert_eq!(classify_create(RESP_ERR_INVALID_RESOURCE_ID, 0), Why::HostResourceId);
-        assert_eq!(classify_create(RESP_ERR_INVALID_PARAMETER, EINVAL), Why::HostShape);
-        assert_eq!(classify_create(RESP_ERR_INVALID_PARAMETER, EFAULT), Why::HostFault);
-        assert_eq!(classify_create(RESP_ERR_OUT_OF_MEMORY, ENOMEM), Why::HostNoMemory);
+        assert_eq!(
+            classify_create(RESP_ERR_INVALID_CONTEXT_ID, 0),
+            Why::HostContext
+        );
+        assert_eq!(
+            classify_create(RESP_ERR_INVALID_RESOURCE_ID, 0),
+            Why::HostResourceId
+        );
+        assert_eq!(
+            classify_create(RESP_ERR_INVALID_PARAMETER, EINVAL),
+            Why::HostShape
+        );
+        assert_eq!(
+            classify_create(RESP_ERR_INVALID_PARAMETER, EFAULT),
+            Why::HostFault
+        );
+        assert_eq!(
+            classify_create(RESP_ERR_INVALID_PARAMETER, EXDEV),
+            Why::HostCrossFile
+        );
+        assert!(Why::HostCrossFile.strikes() && !Why::HostCrossFile.poisons());
+        assert_eq!(
+            classify_create(RESP_ERR_OUT_OF_MEMORY, ENOMEM),
+            Why::HostNoMemory
+        );
         assert_eq!(classify_create(0x1234, 0), Why::HostOther);
-        assert_eq!(classify_import(VK_ERROR_INVALID_EXTERNAL_HANDLE), Why::ImportHandle);
-        assert_eq!(classify_import(VK_ERROR_OUT_OF_DEVICE_MEMORY), Why::ImportNoMemory);
+        assert_eq!(
+            classify_import(VK_ERROR_INVALID_EXTERNAL_HANDLE),
+            Why::ImportHandle
+        );
+        assert_eq!(
+            classify_import(VK_ERROR_OUT_OF_DEVICE_MEMORY),
+            Why::ImportNoMemory
+        );
         assert_eq!(classify_import(-1), Why::ImportOther);
         for w in [
             classify_create(RESP_ERR_UNSPEC, EOPNOTSUPP),

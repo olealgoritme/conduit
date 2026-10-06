@@ -14,6 +14,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use wdk_sys::{PMDL, PVOID};
 
+use helios_kmd_logic::guest_blob::{Budget, Piece, Record};
+
 use crate::irql::PassiveLevel;
 use crate::sync::FallibleArc;
 
@@ -168,6 +170,25 @@ impl SystemBackingLease {
     }
 }
 
+impl SystemBackingLease {
+    /// The physical pages of this lease, from its locked MDL: `(byte offset of the first byte
+    /// in the first page, PFN array)`. The PFNs stay valid while the lease lives (the MDL is
+    /// locked for exactly that long).
+    fn pages(&self) -> (u64, &[u64]) {
+        // SAFETY: `mdl` is this lease's own locked MDL (see `acquire`); a locked MDL is
+        // followed by its PFN array (`MmGetMdlPfnArray`: `(PPFN_NUMBER)(Mdl + 1)`, PFN_NUMBER
+        // is pointer-sized, 8 bytes on the only target), `ADDRESS_AND_SIZE_TO_SPAN_PAGES`
+        // entries long. The slice borrows `self`, which owns the MDL.
+        unsafe {
+            let byte_offset = u64::from((*self.mdl).ByteOffset);
+            let byte_count = u64::from((*self.mdl).ByteCount);
+            let pages = (byte_offset + byte_count).div_ceil(4096) as usize;
+            let pfns = self.mdl.add(1).cast::<u64>().cast_const();
+            (byte_offset, core::slice::from_raw_parts(pfns, pages))
+        }
+    }
+}
+
 impl Drop for SystemBackingLease {
     fn drop(&mut self) {
         // SAFETY: `mdl` came from helios_lock_system_buffer_seh and is released
@@ -300,7 +321,40 @@ pub(crate) struct SystemBackingSnapshot<'guard> {
     _guard: PhantomData<&'guard ()>,
 }
 
+/// One destination's lease set, held by its guest blob (`GuestBlob`): while a pin lives, none
+/// of the pages the host blob names can be unlocked, whatever the backing table does with its
+/// own entry. Dropped (PASSIVE only: it may hold the last owner of a lease) only after the guest
+/// blob was released on the host (`helios_kmd_logic::guest_blob::Record::may_unlock`).
+pub(crate) struct GuestPin {
+    _ranges: FallibleArc<Vec<SystemBackingRange>>,
+}
+
 impl SystemBackingSnapshot<'_> {
+    /// A pin of exactly these leases. `None` only when the reference count would overflow.
+    pub(crate) fn pin(&self) -> Option<GuestPin> {
+        Some(GuestPin {
+            _ranges: self.ranges.try_clone()?,
+        })
+    }
+
+    /// The leases as `guest_blob::Piece`s (sorted by allocation offset, as stored), appended to
+    /// `out`. `false` when `out` could not grow.
+    pub(crate) fn pieces<'s>(&'s self, out: &mut Vec<Piece<'s>>) -> bool {
+        if out.try_reserve_exact(self.ranges.len()).is_err() {
+            return false;
+        }
+        for range in self.ranges.iter() {
+            let (byte_offset, pfns) = range.lease.pages();
+            out.push(Piece {
+                blob_offset: range.blob_offset,
+                size: range.size,
+                byte_offset,
+                pfns,
+            });
+        }
+        true
+    }
+
     pub(crate) unsafe fn copy_from_blob(&self, blob: *const u8, blob_size: u64) -> bool {
         self.ranges
             .iter()
@@ -344,6 +398,21 @@ pub(crate) struct SystemBackingTable {
     /// Shared by every lease so the bound applies before probing, including
     /// temporary relocks during a partial-range transaction.
     budget: Option<FallibleArc<PinnedBackingBudget>>,
+    /// `GuestBlob`: per destination, the guest blob's state (`guest_blob::Record`) and the pin
+    /// of the leases it names; and the host's live-blob/run totals. Mutated only by a holder of
+    /// the content transaction (creation and every lease change hold it); read under this
+    /// spinlock alone by the Present path. A pin is never dropped under the spinlock.
+    guest: crate::sync::SpinLock<GuestTable>,
+}
+
+struct GuestEntry {
+    record: Record,
+    pin: Option<GuestPin>,
+}
+
+struct GuestTable {
+    entries: crate::sync::FixedVec<GuestEntry>,
+    budget: Budget,
 }
 
 impl SystemBackingTable {
@@ -360,7 +429,37 @@ impl SystemBackingTable {
                 bytes: AtomicU64::new(0),
             })
             .ok(),
+            guest: crate::sync::SpinLock::new(GuestTable {
+                entries: crate::sync::FixedVec::with_max(Self::MAX_ALLOCATIONS),
+                budget: Budget::new(),
+            }),
         }
+    }
+
+    /// Whether `resource_id` has system-backing leases at all. Spinlock only.
+    pub(crate) fn is_backed(&self, resource_id: u32) -> bool {
+        self.entries
+            .lock()
+            .as_slice()
+            .iter()
+            .any(|entry| entry.resource_id == resource_id)
+    }
+
+    /// `resource_id`'s guest-blob record, if it has one. Spinlock only (any IRQL <= DISPATCH).
+    pub(crate) fn guest_record(&self, resource_id: u32) -> Option<Record> {
+        self.guest
+            .lock()
+            .entries
+            .as_slice()
+            .iter()
+            .find(|entry| entry.record.resource_id == resource_id)
+            .map(|entry| entry.record)
+    }
+
+    /// The host's live guest-blob totals `(blobs, runs)`. Spinlock only.
+    pub(crate) fn guest_live(&self) -> (u32, u32) {
+        let table = self.guest.lock();
+        (table.budget.live_blobs(), table.budget.live_runs())
     }
 
     /// Remember that `resource_id`'s system copy is invalid. Callable without the
@@ -629,6 +728,86 @@ impl SystemBackingGuard<'_> {
             .evict_chunk_done(resource_id, alloc_size, offset, moved)
     }
 
+    /// Run `f` on `resource_id`'s guest-blob record and the live totals, creating a fresh
+    /// record when `create` is set and there is none. `None`: no record (and `create` unset,
+    /// or the table is full). Spinlock only; `f` must not block.
+    pub(crate) fn guest_update<R>(
+        &self,
+        resource_id: u32,
+        create: bool,
+        f: impl FnOnce(&mut Record, &mut Budget) -> R,
+    ) -> Option<R> {
+        let mut table = self.table.guest.lock();
+        let GuestTable { entries, budget } = &mut *table;
+        let index = match entries
+            .as_slice()
+            .iter()
+            .position(|entry| entry.record.resource_id == resource_id)
+        {
+            Some(index) => index,
+            None if create => {
+                let fresh = GuestEntry {
+                    record: Record::new(resource_id),
+                    pin: None,
+                };
+                // A fresh entry holds no pin, so a refused push drops nothing PASSIVE-only.
+                if entries.try_push(fresh).is_err() {
+                    return None;
+                }
+                entries.len() - 1
+            }
+            None => return None,
+        };
+        Some(f(&mut entries.as_mut_slice()[index].record, budget))
+    }
+
+    /// Hand `pin` to `resource_id`'s guest-blob record. A pin that cannot be stored (no record)
+    /// is handed back, to be dropped by the caller at PASSIVE outside the spinlock.
+    pub(crate) fn guest_set_pin(&self, resource_id: u32, pin: GuestPin) -> Result<(), GuestPin> {
+        let old = {
+            let mut table = self.table.guest.lock();
+            match table
+                .entries
+                .as_mut_slice()
+                .iter_mut()
+                .find(|entry| entry.record.resource_id == resource_id)
+            {
+                Some(entry) => entry.pin.replace(pin),
+                None => return Err(pin),
+            }
+        };
+        drop(old);
+        Ok(())
+    }
+
+    /// Take `resource_id`'s pin, ONLY when its record allows the pages to be unlocked
+    /// (`Record::may_unlock`). The caller drops it (PASSIVE, outside every spinlock).
+    pub(crate) fn guest_take_pin(&self, resource_id: u32) -> Option<GuestPin> {
+        let mut table = self.table.guest.lock();
+        table
+            .entries
+            .as_mut_slice()
+            .iter_mut()
+            .find(|entry| entry.record.resource_id == resource_id && entry.record.may_unlock())
+            .and_then(|entry| entry.pin.take())
+    }
+
+    /// The destination is gone: forget its record, unless the record forbids unlocking (a
+    /// failed release), in which case record and pin stay until the generation ends.
+    pub(crate) fn guest_forget(&self, resource_id: u32) {
+        let removed = {
+            let mut table = self.table.guest.lock();
+            let index = table
+                .entries
+                .as_slice()
+                .iter()
+                .position(|entry| entry.record.resource_id == resource_id && entry.record.may_unlock());
+            index.map(|index| table.entries.swap_remove(index))
+        };
+        // PASSIVE (guard holder), outside the spinlock: may release the last lease owner.
+        drop(removed);
+    }
+
     /// The allocation's content is discarded or the allocation is gone: drop its
     /// backing ranges AND its invalid mark. Use this, not [`Self::remove`], for
     /// DISCARD_CONTENT and DestroyAllocation.
@@ -643,6 +822,24 @@ impl SystemBackingGuard<'_> {
     /// to a different live resource. Leases are released outside the spinlock.
     pub(crate) fn reset_generation(&self) {
         self.table.invalid.lock().clear_all();
+        // Guest blobs first: the transport of their generation is gone (the device was reset,
+        // which drops every host resource, guest blobs and their page mappings included), so
+        // no host object names these pages any more and every pin may go, poisoned ones too.
+        loop {
+            let taken = {
+                let mut table = self.table.guest.lock();
+                table.budget.clear();
+                if table.entries.len() == 0 {
+                    None
+                } else {
+                    Some(table.entries.swap_remove(0))
+                }
+            };
+            match taken {
+                Some(entry) => drop(entry),
+                None => break,
+            }
+        }
         loop {
             let taken = {
                 let mut entries = self.table.entries.lock();
