@@ -335,6 +335,21 @@ impl AdapterContext {
     /// the same adapter and resume the same timer source. `wait=TRUE` is the
     /// no-UAF proof for the callback's immutable adapter context.
     pub(crate) fn delete_vsync_ex_timer(&mut self) {
+        let wd_timer = self
+            .vsync_wd_timer
+            .swap(0, core::sync::atomic::Ordering::AcqRel);
+        if wd_timer != 0 {
+            // SAFETY: as below; `stop_vsync` already cleared `vsync_wd_on`, so the callback
+            // does not re-arm, and cancel+wait drains one in flight.
+            unsafe {
+                ExDeleteTimer(
+                    wd_timer as ExTimer,
+                    BOOLEAN_TRUE,
+                    BOOLEAN_TRUE,
+                    core::ptr::null_mut(),
+                );
+            }
+        }
         let ex_timer = self
             .vsync_ex_timer
             .swap(0, core::sync::atomic::Ordering::AcqRel);
@@ -366,6 +381,9 @@ impl AdapterContext {
         self.vsync_enabled
             .store(1, core::sync::atomic::Ordering::Release);
         unsafe { self.arm_vsync() };
+        // The independent watchdog starts after the chain it watches, with the heartbeat's
+        // reference already set by the arm.
+        unsafe { self.start_vsync_wd() };
     }
 
     /// Re-arm after a transient D3 quiesce. Keeps the delivery decision most
@@ -462,25 +480,7 @@ impl AdapterContext {
         ) {
             VsyncWatch::Ok => {}
             VsyncWatch::Revive => {
-                // One of several racing callers wins and re-bases the watchdog's reference.
-                if !crate::ddi::stall_diag::note_vsync_revived(reference, now) {
-                    return;
-                }
-                let Some(deadline) = helios_kmd_logic::vsync_deadline::next(now, now, period)
-                else {
-                    return;
-                };
-                self.vsync_gap_prev_100ns.store(0, Ordering::Relaxed);
-                self.vsync_deadline_100ns.store(deadline, Ordering::Release);
-                let due = helios_kmd_logic::vsync_deadline::relative_due(deadline, now);
-                // SAFETY: the one-shot was initialized at AddDevice; setting it is legal at
-                // DISPATCH_LEVEL and below, and replaces a pending expiry.
-                unsafe { self.set_vsync_one_shot(due) };
-                if self.vsync_armed.load(Ordering::Acquire) == 0 {
-                    // A quiesce raced the revive: it wins, as in `arm_vsync`.
-                    // SAFETY: as above.
-                    unsafe { self.cancel_vsync_one_shot() };
-                }
+                self.revive_heartbeat(reference, now, period);
             }
             VsyncWatch::Resume => {
                 if may_arm {
@@ -488,6 +488,159 @@ impl AdapterContext {
                     unsafe { self.arm_vsync() };
                 }
             }
+        }
+    }
+
+    /// Set the one-shot again for a heartbeat found silent (the worker-side watchdog and the
+    /// independent watchdog timer). `reference` is the silence reference the caller read: one of
+    /// several racing callers wins and re-bases it, the others do nothing. `true` for the winner
+    /// that set the one-shot. Legal at any IRQL up to DISPATCH (`ExSetTimer` is).
+    pub(crate) fn revive_heartbeat(&self, reference: u64, now: u64, period: u64) -> bool {
+        use core::sync::atomic::Ordering;
+        if !crate::ddi::stall_diag::note_vsync_revived(reference, now) {
+            return false;
+        }
+        let Some(deadline) = helios_kmd_logic::vsync_deadline::next(now, now, period) else {
+            return false;
+        };
+        self.vsync_gap_prev_100ns.store(0, Ordering::Relaxed);
+        self.vsync_deadline_100ns.store(deadline, Ordering::Release);
+        let due = helios_kmd_logic::vsync_deadline::relative_due(deadline, now);
+        // SAFETY: the one-shot was initialized at AddDevice; setting it is legal at
+        // DISPATCH_LEVEL and below, and replaces a pending expiry.
+        unsafe { self.set_vsync_one_shot(due) };
+        if self.vsync_armed.load(Ordering::Acquire) == 0 {
+            // A quiesce raced the revive: it wins, as in `arm_vsync`.
+            // SAFETY: as above.
+            unsafe { self.cancel_vsync_one_shot() };
+        }
+        true
+    }
+
+    /// Arm the independent watchdog timer (v329): a 250 ms one-shot chain of its own, started at
+    /// StartDevice and cancelled at StopDevice, that does not depend on the heartbeat chain, the
+    /// worker or an escape. A no-op when `VsWdTimer` is 0 or no timer could be allocated.
+    unsafe fn start_vsync_wd(&self) {
+        use core::sync::atomic::Ordering;
+        let timer = self.vsync_wd_timer.load(Ordering::Acquire);
+        if timer == 0 || !crate::ddi::stall_diag::vs_wd_timer() {
+            return;
+        }
+        if self.vsync_wd_on.swap(1, Ordering::AcqRel) != 0 {
+            return;
+        }
+        crate::ddi::stall_diag::note_wd_on(true);
+        // SAFETY: allocated at AddDevice; one-shot, relative due time.
+        unsafe {
+            ExSetTimer(
+                timer as ExTimer,
+                helios_kmd_logic::vsync_wd::WD_PERIOD_100NS,
+                0,
+                core::ptr::null_mut(),
+            );
+        }
+        if self.vsync_wd_on.load(Ordering::Acquire) == 0 {
+            // SAFETY: as above; a StopDevice raced this start and wins.
+            unsafe { ExCancelTimer(timer as ExTimer, core::ptr::null_mut()) };
+        }
+    }
+
+    /// Stop the watchdog timer (StopDevice / RemoveDevice, PASSIVE). An expiry already running
+    /// re-checks `vsync_wd_on` after it re-arms, so it ends cancelled; `ExDeleteTimer(wait)` at
+    /// RemoveDevice drains it before the context is freed.
+    fn stop_vsync_wd(&self) {
+        use core::sync::atomic::Ordering;
+        self.vsync_wd_on.store(0, Ordering::Release);
+        crate::ddi::stall_diag::note_wd_on(false);
+        let timer = self.vsync_wd_timer.load(Ordering::Acquire);
+        if timer != 0 {
+            // SAFETY: valid system timer for the adapter lifetime; NULL parameters per the WDK.
+            unsafe { ExCancelTimer(timer as ExTimer, core::ptr::null_mut()) };
+        }
+    }
+
+    /// One tick of the independent watchdog timer (DISPATCH, atomics and `ExSetTimer` only). It
+    /// re-arms ITSELF FIRST, then looks at the heartbeat: armed, in D0 and silent for at least
+    /// max(250 ms, 16 periods) is re-armed (`VsRevN`, `VsWdFixN`); a silent heartbeat with a tick
+    /// callback entered and not returned is counted (`VsWdHungN`: a blocked callback cannot be
+    /// helped by a re-arm). What it saw when it acted is kept (`VsWdS*`), and every
+    /// `PUBLISH_EVERY_TICKS` ticks, or at once after acting, the HPD worker is woken to write
+    /// the heartbeat block (`VsLiveT`), because the worker is otherwise asleep with an infinite
+    /// wait and the registry mirror stays at its last pass.
+    fn vsync_wd_tick(&self) {
+        use core::sync::atomic::Ordering;
+        use helios_kmd_logic::vsync_wd::{self, WdAction};
+        use wdk_sys::ntddk::KeQueryInterruptTimePrecise;
+        if self.vsync_wd_on.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let timer = self.vsync_wd_timer.load(Ordering::Acquire);
+        // SAFETY: nonzero while `vsync_wd_on` is, one-shot, relative due time.
+        unsafe {
+            ExSetTimer(
+                timer as ExTimer,
+                vsync_wd::WD_PERIOD_100NS,
+                0,
+                core::ptr::null_mut(),
+            );
+        }
+        if self.vsync_wd_on.load(Ordering::Acquire) == 0 {
+            // SAFETY: as above; StopDevice raced the re-arm and wins.
+            unsafe { ExCancelTimer(timer as ExTimer, core::ptr::null_mut()) };
+            return;
+        }
+        let mut qpc_timestamp = 0;
+        // SAFETY: a scalar clock read; `qpc_timestamp` is a live local.
+        let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
+        let armed = self.vsync_armed.load(Ordering::Acquire) != 0;
+        let reference = crate::ddi::stall_diag::vsync_reference();
+        let last_tick = crate::ddi::stall_diag::vsync_last_tick();
+        let period = helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(self));
+        let (cb_entered, cb_returned) = crate::ddi::stall_diag::cb_counts();
+        let display_half = self.display_half();
+        let action = vsync_wd::decide(vsync_wd::WdInput {
+            armed,
+            display_half,
+            adapter_d0: crate::ddi::stall_diag::adapter_d0(),
+            now,
+            last_tick,
+            reference,
+            period,
+            cb_entered,
+            cb_returned,
+        });
+        let silent = if armed && display_half {
+            vsync_wd::silent_for_100ns(now, last_tick, reference)
+        } else {
+            None
+        };
+        let age_ms = vsync_wd::age_ms(silent);
+        let now_ms = helios_kmd_logic::vsync_rate::ms_from_100ns(now);
+        let tick_n = crate::ddi::stall_diag::note_wd_tick(now_ms, age_ms);
+        let acted = action != WdAction::Idle;
+        if acted {
+            crate::ddi::stall_diag::note_wd_snapshot(
+                now_ms,
+                armed,
+                helios_kmd_logic::vsync_rate::ms_from_100ns(reference),
+                helios_kmd_logic::vsync_rate::ms_from_100ns(
+                    self.vsync_deadline_100ns.load(Ordering::Acquire),
+                ),
+                age_ms,
+            );
+            match action {
+                WdAction::Fix => {
+                    if self.revive_heartbeat(reference, now, period) {
+                        crate::ddi::stall_diag::note_wd_acted(true);
+                    }
+                }
+                WdAction::Hung => crate::ddi::stall_diag::note_wd_acted(false),
+                WdAction::Idle => {}
+            }
+        }
+        if display_half && vsync_wd::publish_due(tick_n, acted) && self.hpd_running() {
+            crate::ddi::stall_diag::request_live_publish();
+            self.signal_hpd();
         }
     }
 
@@ -503,6 +656,7 @@ impl AdapterContext {
     pub fn stop_vsync(&self) {
         self.vsync_enabled
             .store(0, core::sync::atomic::Ordering::Release);
+        self.stop_vsync_wd();
         self.disarm_vsync();
     }
 
@@ -590,6 +744,18 @@ impl AdapterContext {
         if !ex_timer.is_null() {
             self.vsync_ex_timer
                 .store(ex_timer as usize, core::sync::atomic::Ordering::Release);
+        }
+        // The independent watchdog's timer (v329): default resolution (it ticks every 250 ms), its
+        // own callback, the same immutable context. NULL = no watchdog this adapter lifetime
+        // (`VsWdNoTm`); the heartbeat itself is unaffected.
+        // SAFETY: as above.
+        let wd_timer =
+            unsafe { ExAllocateTimer(Some(vsync_wd_callback), self as *const _ as PVOID, 0) };
+        if wd_timer.is_null() {
+            crate::ddi::stall_diag::note_wd_no_timer();
+        } else {
+            self.vsync_wd_timer
+                .store(wd_timer as usize, core::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -732,9 +898,14 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     let phys = adapter.last_primary_address.load(Ordering::Acquire) as i64;
     // SAFETY: live callback interface; signal_crtc_vsync raises to DIRQL internally
     // via DxgkCbSynchronizeExecution and delivers the CRTC_VSYNC packet.
+    // `VsCbSyncB` / `VsCbSyncOk` / `VsCbSyncT`: a sync that begins and never returns is visible.
+    crate::ddi::stall_diag::cb_sync_begin(helios_kmd_logic::vsync_rate::ms_from_100ns(
+        tick_time_100ns,
+    ));
     let status = unsafe {
         crate::ddi::submit_command::signal_crtc_vsync(dxgkrnl, phys, crate::ddi::vidpn::CHILD_UID)
     };
+    crate::ddi::stall_diag::cb_sync_end(status);
     let epoch = adapter.scanout_bound_epoch.load(Ordering::Acquire);
     if status == STATUS_SUCCESS {
         // Record every callback that actually reached dxgkrnl. At ~60 Hz the
@@ -797,7 +968,22 @@ unsafe extern "system" fn vsync_ex_timer_callback(_timer: ExTimer, context: PVOI
     // before publication. ExDeleteTimer(cancel=TRUE, wait=TRUE) in Drop keeps it
     // live until this callback has returned.
     let adapter = unsafe { &*(context as *const AdapterContext) };
+    // `VsCbIn` / `VsCbOut`: entered and returned; a blocked callback is `VsCbIn` above `VsCbOut`.
+    crate::ddi::stall_diag::cb_enter();
     unsafe { service_vsync_tick(adapter) };
+    crate::ddi::stall_diag::cb_leave();
+}
+
+/// `EXT_CALLBACK` of the independent watchdog timer (DISPATCH_LEVEL). Same context rule as
+/// [`vsync_ex_timer_callback`].
+unsafe extern "system" fn vsync_wd_callback(_timer: ExTimer, context: PVOID) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: the final adapter address, live until `ExDeleteTimer(wait=TRUE)` has drained this
+    // callback at RemoveDevice.
+    let adapter = unsafe { &*(context as *const AdapterContext) };
+    adapter.vsync_wd_tick();
 }
 
 /// Embedded KTIMER fallback DPC. It is selected only if ExAllocateTimer failed
@@ -816,5 +1002,8 @@ pub unsafe extern "C" fn vsync_dpc_routine(
     // for the adapter lifetime (final removal cancels and flushes this fallback
     // DPC before freeing the context).
     let adapter = unsafe { &*(context as *const AdapterContext) };
+    // `VsCbIn` / `VsCbOut`: entered and returned; a blocked callback is `VsCbIn` above `VsCbOut`.
+    crate::ddi::stall_diag::cb_enter();
     unsafe { service_vsync_tick(adapter) };
+    crate::ddi::stall_diag::cb_leave();
 }

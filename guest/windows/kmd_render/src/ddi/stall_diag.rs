@@ -481,6 +481,32 @@ pub(crate) fn publish_vsync_ticks() {
     rec(b"LkWaitMs", LK_WAIT_MS.load(Ordering::Relaxed));
     rec(b"StopSub", STOP_SUB.load(Ordering::Relaxed));
     rec(b"StopSubT", STOP_SUB_T.load(Ordering::Relaxed));
+    // v329: when this block was written (every value above is a snapshot as of this time: the
+    // heartbeat is judged by `VsLiveT` against `VsTickT`, never by a count that did not move
+    // between two reads of a mirror nothing refreshed), the callback breadcrumbs, the watchdog.
+    rec(b"VsLiveT", AdapterContext::interrupt_time_ms());
+    rec(b"VsCbIn", VS_CB_IN.load(Ordering::Relaxed));
+    rec(b"VsCbOut", VS_CB_OUT.load(Ordering::Relaxed));
+    rec(b"VsCbSyncB", VS_CB_SYNC_B.load(Ordering::Relaxed));
+    rec(b"VsCbSyncOk", VS_CB_SYNC_OK.load(Ordering::Relaxed));
+    rec(b"VsCbSyncSt", VS_CB_SYNC_ST.load(Ordering::Relaxed));
+    rec(b"VsCbSyncT", VS_CB_SYNC_T.load(Ordering::Relaxed));
+    rec(b"VsWdTkN", VS_WD_TK_N.load(Ordering::Relaxed));
+    rec(b"VsWdTkT", VS_WD_TK_T.load(Ordering::Relaxed));
+    rec(b"VsWdAgeMs", VS_WD_AGE_MS.load(Ordering::Relaxed));
+    rec(b"VsWdFixN", VS_WD_FIX_N.load(Ordering::Relaxed));
+    rec(b"VsWdHungN", VS_WD_HUNG_N.load(Ordering::Relaxed));
+    rec(b"VsWdPubN", VS_WD_PUB_N.load(Ordering::Relaxed));
+    rec(b"VsWdOn", VS_WD_ON.load(Ordering::Relaxed));
+    rec(b"VsWdNoTm", VS_WD_NO_TIMER.load(Ordering::Relaxed));
+    rec(b"VsWdSAt", VS_WD_S_AT.load(Ordering::Relaxed));
+    rec(b"VsWdSArm", VS_WD_S_ARM.load(Ordering::Relaxed));
+    rec(b"VsWdSRef", VS_WD_S_REF.load(Ordering::Relaxed));
+    rec(b"VsWdSDl", VS_WD_S_DL.load(Ordering::Relaxed));
+    rec(b"VsWdSAge", VS_WD_S_AGE.load(Ordering::Relaxed));
+    rec(b"VsWdSCbI", VS_WD_S_CB_I.load(Ordering::Relaxed));
+    rec(b"VsWdSCbO", VS_WD_S_CB_O.load(Ordering::Relaxed));
+    rec(b"VsWdSSyT", VS_WD_S_SY_T.load(Ordering::Relaxed));
 }
 
 // ---- the heartbeat's life (T5 anomaly 2) -----------------------------------------------------
@@ -617,6 +643,147 @@ pub(crate) fn note_vsync_revived(reference: u64, now: u64) -> bool {
     true
 }
 
+// ---- v329: tick callback breadcrumbs and the independent watchdog timer ----------------------
+
+/// Tick callbacks entered and returned (`VsCbIn`, `VsCbOut`; either timer source). NEVER zeroed
+/// (a callback of the previous generation may still be inside): `VsCbIn` above `VsCbOut` for
+/// more than a few milliseconds is a callback that is blocked. The synchronized call inside the
+/// tick (`DxgkCbSynchronizeExecution` through `signal_crtc_vsync`): begun (`VsCbSyncB`),
+/// returned (`VsCbSyncOk`, whatever the status), the status of the last return (`VsCbSyncSt`)
+/// and the interrupt time (ms) the last one began (`VsCbSyncT`).
+static VS_CB_IN: AtomicU32 = AtomicU32::new(0);
+static VS_CB_OUT: AtomicU32 = AtomicU32::new(0);
+static VS_CB_SYNC_B: AtomicU32 = AtomicU32::new(0);
+static VS_CB_SYNC_OK: AtomicU32 = AtomicU32::new(0);
+static VS_CB_SYNC_ST: AtomicU32 = AtomicU32::new(0);
+static VS_CB_SYNC_T: AtomicU32 = AtomicU32::new(0);
+/// The watchdog timer: its ticks (`VsWdTkN`) and the time of the last (`VsWdTkT`), the silence
+/// of the heartbeat it saw at the last tick (`VsWdAgeMs`), re-arms it did (`VsWdFixN`), ticks that
+/// found a blocked callback (`VsWdHungN`), mirror refreshes it asked the worker for
+/// (`VsWdPubN`), whether it is armed (`VsWdOn`), the `VsWdTimer` knob in force (`VsWdTmEff`) and
+/// whether the timer could not be allocated (`VsWdNoTm`).
+static VS_WD_TK_N: AtomicU32 = AtomicU32::new(0);
+static VS_WD_TK_T: AtomicU32 = AtomicU32::new(0);
+static VS_WD_AGE_MS: AtomicU32 = AtomicU32::new(0);
+static VS_WD_FIX_N: AtomicU32 = AtomicU32::new(0);
+static VS_WD_HUNG_N: AtomicU32 = AtomicU32::new(0);
+static VS_WD_PUB_N: AtomicU32 = AtomicU32::new(0);
+static VS_WD_ON: AtomicU32 = AtomicU32::new(0);
+static VS_WD_TIMER: AtomicU32 = AtomicU32::new(1);
+static VS_WD_NO_TIMER: AtomicU32 = AtomicU32::new(0);
+/// What the watchdog saw the last time it acted (a fix or a hang): when (`VsWdSAt`), whether the
+/// heartbeat was armed (`VsWdSArm`), the reference and the pending deadline in interrupt ms
+/// (`VsWdSRef`, `VsWdSDl`), the silence (`VsWdSAge`), the callback counts (`VsWdSCbI`,
+/// `VsWdSCbO`) and when the last synchronized call began (`VsWdSSyT`).
+static VS_WD_S_AT: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_ARM: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_REF: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_DL: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_AGE: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_CB_I: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_CB_O: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_SY_T: AtomicU32 = AtomicU32::new(0);
+/// The watchdog asked for the heartbeat block to be written; the worker takes it.
+static LIVE_WANTED: AtomicU32 = AtomicU32::new(0);
+
+/// A tick callback was entered / returned (any IRQL <= DISPATCH, atomics only).
+pub(crate) fn cb_enter() {
+    VS_CB_IN.fetch_add(1, Ordering::AcqRel);
+}
+pub(crate) fn cb_leave() {
+    VS_CB_OUT.fetch_add(1, Ordering::AcqRel);
+}
+
+/// The callback counts `(entered, returned)`; returned is read FIRST so a callback that finishes
+/// between the two loads reads as in flight, never as the impossible "returned before entered".
+pub(crate) fn cb_counts() -> (u32, u32) {
+    let out = VS_CB_OUT.load(Ordering::Acquire);
+    let inn = VS_CB_IN.load(Ordering::Acquire);
+    (inn, out)
+}
+
+/// The tick is about to call `DxgkCbSynchronizeExecution` (`now_ms`: interrupt time, ms).
+pub(crate) fn cb_sync_begin(now_ms: u32) {
+    VS_CB_SYNC_T.store(now_ms, Ordering::Relaxed);
+    VS_CB_SYNC_B.fetch_add(1, Ordering::AcqRel);
+}
+
+/// The synchronized call returned with `status`.
+pub(crate) fn cb_sync_end(status: i32) {
+    VS_CB_SYNC_ST.store(status as u32, Ordering::Relaxed);
+    VS_CB_SYNC_OK.fetch_add(1, Ordering::AcqRel);
+}
+
+/// `VsWdTimer` in force (0 = the watchdog timer is never armed).
+pub(crate) fn vs_wd_timer() -> bool {
+    VS_WD_TIMER.load(Ordering::Relaxed) != 0
+}
+
+/// The watchdog timer is armed (1) or stopped (0).
+pub(crate) fn note_wd_on(on: bool) {
+    VS_WD_ON.store(on as u32, Ordering::Relaxed);
+}
+
+/// `ExAllocateTimer` for the watchdog returned NULL: there is none this adapter lifetime.
+pub(crate) fn note_wd_no_timer() {
+    VS_WD_NO_TIMER.store(1, Ordering::Relaxed);
+}
+
+/// One watchdog tick: its count and time, and the heartbeat's silence it saw. Returns the new
+/// tick count. DISPATCH, atomics only.
+pub(crate) fn note_wd_tick(now_ms: u32, age_ms: u32) -> u32 {
+    VS_WD_TK_T.store(now_ms, Ordering::Relaxed);
+    VS_WD_AGE_MS.store(age_ms, Ordering::Relaxed);
+    VS_WD_TK_N.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+}
+
+/// The watchdog re-armed a silent heartbeat (`fix`) or found a blocked callback.
+pub(crate) fn note_wd_acted(fix: bool) {
+    if fix {
+        VS_WD_FIX_N.fetch_add(1, Ordering::Relaxed);
+    } else {
+        VS_WD_HUNG_N.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The state the watchdog acted on, before it acted (`VsWdS*`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn note_wd_snapshot(
+    now_ms: u32,
+    armed: bool,
+    reference_ms: u32,
+    deadline_ms: u32,
+    age_ms: u32,
+) {
+    let (inn, out) = cb_counts();
+    VS_WD_S_AT.store(now_ms, Ordering::Relaxed);
+    VS_WD_S_ARM.store(armed as u32, Ordering::Relaxed);
+    VS_WD_S_REF.store(reference_ms, Ordering::Relaxed);
+    VS_WD_S_DL.store(deadline_ms, Ordering::Relaxed);
+    VS_WD_S_AGE.store(age_ms, Ordering::Relaxed);
+    VS_WD_S_CB_I.store(inn, Ordering::Relaxed);
+    VS_WD_S_CB_O.store(out, Ordering::Relaxed);
+    VS_WD_S_SY_T.store(VS_CB_SYNC_T.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// The heartbeat's last tick time in 100 ns (0 = none since the arm).
+pub(crate) fn vsync_last_tick() -> u64 {
+    VS_TICK_AT.load(Ordering::Relaxed)
+}
+
+/// Ask the HPD worker to write the heartbeat block on its next pass (DISPATCH, atomics only).
+pub(crate) fn request_live_publish() {
+    VS_WD_PUB_N.fetch_add(1, Ordering::Relaxed);
+    LIVE_WANTED.store(1, Ordering::Release);
+}
+
+/// The worker's pass: write the heartbeat block if the watchdog asked. PASSIVE.
+pub(crate) fn publish_live_if_wanted() {
+    if LIVE_WANTED.swap(0, Ordering::AcqRel) != 0 {
+        publish_vsync_ticks();
+    }
+}
+
 /// `DxgkDdiSetPowerState` was called for `device_uid`; `d0` is whether the state is D0.
 pub(crate) fn note_power(device_uid: u32, d0: bool) {
     PWR_N.fetch_add(1, Ordering::Relaxed);
@@ -725,6 +892,12 @@ pub(crate) fn reread_knobs() {
     crate::diag::record_named_bytes(b"VsPwrEff", pm);
     crate::diag::record_named_bytes(b"VsWdgEff", wd);
     crate::diag::record_named_bytes(b"VsIdlEff", idle);
+    let wd_timer = helios_kmd_logic::vsync_wd::clamp_wd_timer(crate::diag::read_config_dword(
+        crate::diag::knobs::VS_WD_TIMER,
+        1,
+    ));
+    VS_WD_TIMER.store(wd_timer, Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"VsWdTmEff", wd_timer);
 }
 
 // ---- v327 breadcrumbs: what the previous generation left, where the worker and the mode set are
@@ -913,6 +1086,21 @@ pub(crate) fn start_generation() {
         &VS_GAP_SITE,
         &VS_GAP_FLAGS,
         &VS_GAP_INFL,
+        &VS_WD_TK_N,
+        &VS_WD_TK_T,
+        &VS_WD_AGE_MS,
+        &VS_WD_FIX_N,
+        &VS_WD_HUNG_N,
+        &VS_WD_PUB_N,
+        &VS_WD_S_AT,
+        &VS_WD_S_ARM,
+        &VS_WD_S_REF,
+        &VS_WD_S_DL,
+        &VS_WD_S_AGE,
+        &VS_WD_S_CB_I,
+        &VS_WD_S_CB_O,
+        &VS_WD_S_SY_T,
+        &LIVE_WANTED,
     ] {
         c.store(0, Ordering::Relaxed);
     }

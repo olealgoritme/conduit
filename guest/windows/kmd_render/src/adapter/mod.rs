@@ -661,6 +661,11 @@ pub struct AdapterContext {
     /// The pointer is deleted exactly once from `Drop` at final RemoveDevice,
     /// after `stop_vsync` has cancelled it.
     pub vsync_ex_timer: AtomicUsize,
+    /// The independent heartbeat watchdog's `PEX_TIMER` (0 = allocation failed or not yet
+    /// allocated) and whether it is meant to run (set by `start_vsync`, cleared by `stop_vsync`).
+    /// Deleted with `vsync_ex_timer` at RemoveDevice.
+    pub vsync_wd_timer: AtomicUsize,
+    pub vsync_wd_on: AtomicU32,
     /// Interrupt-time deadline (100 ns units) of the one-shot tick currently
     /// armed. Advancing this fixed phase avoids both the old 16 ms/62.5 Hz mode
     /// mismatch and cumulative DPC-latency drift.
@@ -1245,6 +1250,8 @@ impl AdapterContext {
             vsync_timer: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             vsync_dpc: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             vsync_ex_timer: AtomicUsize::new(0),
+            vsync_wd_timer: AtomicUsize::new(0),
+            vsync_wd_on: AtomicU32::new(0),
             vsync_deadline_100ns: AtomicU64::new(0),
             vsync_enabled: AtomicU32::new(0),
             committed_refresh_mhz: AtomicU32::new(0),
