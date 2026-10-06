@@ -296,7 +296,9 @@ pub(crate) fn note_shape_return(result: Result<(), i32>) {
     let record = if status != 0 {
         fails <= FLAG_SAMPLES || fails % 64 == 0
     } else {
-        seen <= FLAG_SAMPLES || seen % 64 == 0
+        // A success never overwrites the status of an earlier failure: ShPhRet keeps the last
+        // failing status once ShPhFail is nonzero.
+        fails == 0 && (seen <= FLAG_SAMPLES || seen % 64 == 0)
     };
     if record {
         crate::diag::record_named_bytes(b"ShPhRet", status);
