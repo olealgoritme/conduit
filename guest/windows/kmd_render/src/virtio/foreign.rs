@@ -31,7 +31,7 @@ use super::gpu::{DeviceOwner, ForeignBegin, ForeignCommit};
 use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
-use helios_kmd_logic::foreign_resource::{foreign_blob_id, validate_request, Layout, RefusalKind};
+use helios_kmd_logic::foreign_resource::{foreign_blob_id, validate_request, Layout};
 use helios_protocol::HELIOS_BLOB_MEM_RM_EXPORT;
 
 /// Whether the whole path is served: this KMD AND a host that creates a
@@ -107,6 +107,17 @@ pub static RELEASE_DUP: AtomicU32 = AtomicU32::new(0);
 /// the device spinlock, hence an atomic.
 pub static MAP_REFUSED: AtomicU32 = AtomicU32::new(0);
 
+/// Version-2 (two-plane) layout trailers the KMD wrote into an allocation's private data, at
+/// create and at every open of one (`FgTrl2W`).
+pub static TRAILER_V2_WRITTEN: AtomicU32 = AtomicU32::new(0);
+/// Two-plane trailer writes that found the buffer too small for plane 1 and wrote nothing
+/// (`FgTrl2NoRm`). Adoption refuses such a buffer (`FgAdoNoPln`), so nonzero means an open
+/// whose buffer is shorter than the creator's.
+pub static TRAILER_V2_NO_ROOM: AtomicU32 = AtomicU32::new(0);
+/// Version-2 trailers read out of a private-data buffer (`FgTrl2Rd`): the creator's hint at
+/// create time, and the KMD's own record at an open.
+pub static TRAILER_V2_READ: AtomicU32 = AtomicU32::new(0);
+
 /// Why an import did not produce a resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportError {
@@ -154,9 +165,15 @@ pub fn import_rm(
         IMPORT_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
         return Err(ImportError::Unsupported);
     }
-    let Ok(layout) = validate_request(ctx_id, rm_handle, gem_handle, flags, size, layout) else {
-        let _ = adapter.with_virtio(|v| v.foreign_note_refusal(RefusalKind::BadRequest));
-        return Err(ImportError::BadRequest);
+    // Every layout fault, the shared-format ones included (`Format`, `Planes`, a plane's own
+    // stride / modifier / offset, an odd extent), is `BadRequest`, which the escape answers
+    // `BAD_RANGE`: there is no finer status, and the counters below say which.
+    let layout = match validate_request(ctx_id, rm_handle, gem_handle, flags, size, layout) {
+        Ok(l) => l,
+        Err(why) => {
+            let _ = adapter.with_virtio(|v| v.foreign_note_request_refusal(why, layout.as_ref()));
+            return Err(ImportError::BadRequest);
+        }
     };
     let begin = adapter
         .with_virtio(|v| v.foreign_begin_import(owner, ctx_id, rm_handle, size))
@@ -267,8 +284,21 @@ fn publish_snapshot(snap: Option<super::gpu::ForeignSnapshot>) {
         crate::diag::record_named_bytes(b"FgRefR", c.refused_request);
         crate::diag::record_named_bytes(b"FgRefH", c.refused_host);
         crate::diag::record_named_bytes(b"FgRefA", c.refused_adopt);
+        // Shared formats beyond 32 bpp RGB (`docs/shared-formats.md`): the imports and adoptions
+        // of them, and why requests for them were turned away. All are included in the totals
+        // above (`FgImp`, `FgAdo`, `FgRefR`, `FgRefA`); none is bumped by the 32 bpp formats.
+        crate::diag::record_named_bytes(b"FgImpFmt", c.imported_format);
+        crate::diag::record_named_bytes(b"FgImp2P", c.imported_planes);
+        crate::diag::record_named_bytes(b"FgAdo2P", c.adopted_planes);
+        crate::diag::record_named_bytes(b"FgRefFmt", c.refused_format);
+        crate::diag::record_named_bytes(b"FgRefPln", c.refused_planes);
+        crate::diag::record_named_bytes(b"FgRefNewG", c.refused_new_geometry);
+        crate::diag::record_named_bytes(b"FgAdoNoPln", c.refused_no_plane_room);
     }
     crate::diag::record_named_bytes(b"FgUns", IMPORT_UNSUPPORTED.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"FgMapRf", MAP_REFUSED.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"FgTrl2W", TRAILER_V2_WRITTEN.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"FgTrl2NoRm", TRAILER_V2_NO_ROOM.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"FgTrl2Rd", TRAILER_V2_READ.load(Ordering::Relaxed));
     super::rm_resource_import::publish_counters();
 }

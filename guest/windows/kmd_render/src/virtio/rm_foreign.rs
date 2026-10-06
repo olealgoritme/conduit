@@ -100,6 +100,7 @@ pub fn surface_foreign_layout(l: &helios_kmd_logic::rm_client::SurfaceLayout) ->
         offset: 0,
         fourcc: FOURCC_XRGB8888,
         modifier: MOD_LINEAR,
+        plane1: None,
     }
 }
 

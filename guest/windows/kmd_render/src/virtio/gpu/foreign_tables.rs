@@ -321,6 +321,17 @@ impl VirtioGpu {
         self.foreign.note_refusal(kind);
     }
 
+    /// Count an `IMPORT_RM` request `validate_request` refused: a bad request, and which
+    /// shared-format reason (`ForeignTable::note_request_refusal`). `layout` is the decoded
+    /// layout the request carried, if any.
+    pub fn foreign_note_request_refusal(
+        &mut self,
+        why: fr::RequestError,
+        layout: Option<&fr::Layout>,
+    ) {
+        self.foreign.note_request_refusal(why, layout);
+    }
+
     /// Limits, occupancy and counters; `owner` is the caller, whose own count
     /// is reported separately.
     pub fn foreign_snapshot(&self, owner: DeviceOwner) -> ForeignSnapshot {
