@@ -372,7 +372,7 @@ new file mode 100644
 index 00000000..32805922
 --- /dev/null
 +++ b/src/d3d11/d3d11_video_decoder.cpp
-@@ -0,0 +1,1148 @@
+@@ -0,0 +1,1153 @@
 +#include <algorithm>
 +#include <cstddef>
 +#include <cstring>
@@ -906,7 +906,12 @@ index 00000000..32805922
 +
 +    ctx->signalFence(m_graphicsFence, ++m_graphicsValue);
 +
++    // The submission thread stores the result into `status`, and
++    // waitForSubmission only waits while it reads VK_NOT_READY. Left at
++    // its default (VK_SUCCESS) the wait returns at once and the late store
++    // lands in this frame after it is gone, on the CS thread's stack.
 +    DxvkSubmitStatus status;
++    status.result = VK_NOT_READY;
 +    ctx->flushCommandList(nullptr, &status);
 +
 +    // The graphics signal must have reached vkQueueSubmit before the decode
