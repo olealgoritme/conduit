@@ -82,6 +82,32 @@ Download the package for your system from the
 | NixOS | `nix run github:olealgoritme/conduit` (flake) |
 | Anything else | `tar xf conduit-*-x86_64-linux.tar.gz && sudo ./conduit/install.sh` |
 
+### Ubuntu: everything else the host needs
+
+The package brings Conduit's own QEMU, virglrenderer and the viewer. The rest
+comes from Ubuntu:
+
+```bash
+sudo apt install libvirt-daemon-system libvirt-clients virt-manager \
+                 qemu-utils ovmf swtpm swtpm-tools       # VMs; OVMF + swtpm for Windows 11
+sudo usermod -aG kvm,libvirt "$USER"                      # then log out and back in
+```
+
+Plus the NVIDIA **open** kernel modules and the NVIDIA Vulkan driver of a
+supported release (`conduit doctor` names it; list in
+[docs/SECOND-MACHINE.md](docs/SECOND-MACHINE.md)). For Windows 11 also grab
+the ISOs with `quickget windows 11` (`sudo apt install quickemu`), see
+[docs/SECOND-MACHINE.md](docs/SECOND-MACHINE.md).
+
+**AppArmor** (Ubuntu confines libvirt) needs nothing by hand: installing the
+package runs `/opt/conduit/libexec/conduit-integrate enable`, which adds one
+marked line each to `/etc/apparmor.d/local/abstractions/libvirt-qemu`,
+`local/usr.lib.libvirt.virt-aa-helper` and `local/usr.sbin.libvirtd` (so
+libvirt may start the bundled QEMU and open its sockets) and reloads those
+profiles. `conduit doctor NAME` checks it; `conduit-integrate disable` (run on
+package removal) takes the lines out again. Details:
+[docs/LIBVIRT.md](docs/LIBVIRT.md).
+
 Then:
 
 ```bash
