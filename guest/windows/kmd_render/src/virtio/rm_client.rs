@@ -65,6 +65,7 @@ use wdk_sys::{PHYSICAL_ADDRESS, _MEMORY_CACHING_TYPE};
 // Level 5 (`KmdRmClient` = 5): the KMD's own allocations from RM system memory. Children of
 // this module because they drive the same `Io` and bring-up steps, which stay private.
 pub(crate) mod sysmem;
+pub(crate) mod sysmem_blt;
 pub(crate) mod sysmem_flip;
 
 /// The one owner of every handle this client opens.

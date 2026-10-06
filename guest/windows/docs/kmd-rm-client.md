@@ -1404,13 +1404,14 @@ that waited. Tests: `a_reflipped_buffer_is_never_something_a_close_waits_for`,
 | `RmSysCoal` | edges that got no flip of their own (folded into one flip per refresh) | grows under load |
 | `RmSysTail` / `RmSysPoll` | flips of the tail after the last reported change / of the `KmdRmSysPollMs` heartbeat | up to 5 per burst / 0 unless the knob is set |
 | `RmSysIvl` / `RmSysPollMs` | the flip interval in 100 ns (the mode's refresh period: 41667 at 240 Hz, 166667 at 60 Hz) / the heartbeat knob | the mode's / 0 |
+| `RmSysBltCpu` / `RmSysBltBytes` / `RmSysBltUs` / `RmSysBltMaxUs` / `RmSysBltSkip` / `RmSysBltWhy` / `RmSysBltStg` | the Blt CPU-copy fallback (15.17): Presents copied / MiB written / microseconds / the slowest one / skipped with success / the last skip reason / the staging image's resource id | grow with the Blt presents / grows / the average is milliseconds / under about a second / 0 / 0 / one id |
 
 `FgMapRf` must stay 0 for the primary (the map is no longer refused for it); `FsSupp` grows with the withheld
 flushes; `RfUnb` is expected to count only if a Venus flush of the RM primary is ever attempted.
 
 ### 15.12 Verified here, and not
 
-Verified on the host (`cargo test` in `guest/windows/kmd_logic`, 729 tests; in `guest/windows/protocol`, 30):
+Verified on the host (`cargo test` in `guest/windows/kmd_logic`, 789 tests with the Blt fallback of 15.17; in `guest/windows/protocol`, 30):
 which kinds go to RM; sizes and the page-granular rule against the aperture count and the paging clamp; the RM
 parameter block byte for byte (`attr` words against `nvos.h` 610.57.04's bit positions, `0x3a000000` /
 `0x5a000000`, and the written-back `0x2a800000` / `0x4a800000` the host decides from); RM's rounded answer; the
@@ -1431,7 +1432,7 @@ unmarked record is never a source).
 Type-checked (`cargo check`, no codegen) against a harness generated from the REAL module declarations: module
 visibility from the real `mod` lines (never typed by hand), signatures cut from the real sources, and the files
 under test included unchanged: `rm_client.rs` (as a directory module over its real children), `rm_client/sysmem.rs`,
-`rm_client/sysmem_flip.rs`, `rm_present.rs`, `rm_foreign.rs`, `virtio/foreign_scanout.rs`,
+`rm_client/sysmem_flip.rs`, `rm_client/sysmem_blt.rs` (15.17), `rm_present.rs`, `rm_foreign.rs`, `virtio/foreign_scanout.rs`,
 `virtio/scanout_release.rs`, `adapter/foreign_scanout.rs`. A deliberately wrong path is rejected by it (checked).
 Every `crate::` / `super::` path of those files and of `create_allocation.rs`, `display.rs`, `ctrl.rs`,
 `foreign_tables.rs` and `resource_tables.rs` was resolved against the real `mod` lines and item visibilities
@@ -1505,6 +1506,9 @@ here sets `KmdRmSysCache` before step 7: steps 1 to 6 run on the default, write-
 13. **Soak**: ten minutes of window dragging with `RmSysFlipFail=0`, `RmSysGaveUp=0`, `RmSysSoft=0`,
     `RmSysRelTmo=0`. Then the give-up path: with the host refusing `ScanoutFlip`, `RmSysGaveUp` grows by one
     per five seconds (three failed flips each, 100 ms apart), not per frame edge.
+14. **A Blt workload** (the CPU-copy fallback, 15.17: steps 13a to 13c there). Only after steps 2 to 5 have shown
+    the picture and its flips: a Blt present into the RM primary used to fail the Present, and now counts in
+    `RmSysBlt*`.
 
 ### 15.14 Open questions
 
@@ -1514,7 +1518,8 @@ here sets `KmdRmSysCache` before step 7: steps 1 to 6 run on the default, write-
 2. **Whether the viewer needs a flip per change** or samples the attached buffer continuously: the host session's
    answer is that it commits only on a `ScanoutFlip` (15.16), so the edge-driven flips ARE the damage signal; what
    is open is only the cost of a refresh flip on the real viewer (checklist step 11).
-3. **An existing RM primary has no Venus fallback** (15.8). The seam is `program`'s `Retry` / the presenter's
+3. **An existing RM primary has no Venus fallback** (15.8; the KMD's own Blt present into it is now answered by the
+   CPU copy of 15.17, not this). The seam is `program`'s `Retry` / the presenter's
    restart; the candidates are a CPU copy sysmem -> the dedicated LINEAR image (the default sysmem is write-combined: reads
    are slow, about 75 MB/s; this wants a cached opt-in, 15.5) through the existing bind and flush, or asking dxgkrnl to recreate the primary.
 4. **DWM into an RM primary** (15.8): the host's Venus import of RM-export memory by resource id, the
@@ -1796,7 +1801,9 @@ value, other kind), the identity version stays 2 and a reader that knows only bi
    opaque-fd image (`open_texture2d`, "the .38 regression" comment forbids DRM-modifier rebuilds for DWM imports).
    It must branch on `foreign_sysmem_primary()` to the modifier import with the table above. Out of this branch's
    scope (`umd/` is not touched); until it does, a DWM process that opens the primary imports the wrong shape.
-3. **The KMD's own blit into the primary.** The Present Blt arm treats a `PitchedStandardBuffer` destination as a
+3. **The KMD's own blit into the primary** (answered since by the CPU-copy fallback of 15.17: the paragraph below
+   describes the failure it removes, and the `PresentDestinationDesc` arm it proposes is still the GPU alternative).
+   The Present Blt arm treats a `PitchedStandardBuffer` destination as a
    registered Present buffer: `begin_present_buffer_write_legacy` answers `NotFound` for the RM primary (it has
    `SystemBackingPolicy::None`, no `present_buffer_syncs` slot), so `PBOwn 0xE1` and `STATUS_DEVICE_NOT_READY` come
    first; the two-phase path would strand a request whose `complete_present_buffer_gpu_write` is false. The fix is a
@@ -1830,36 +1837,167 @@ heartbeat's cost; the compile of the three hooks in `display.rs`, `build_paging_
 (read against the real definitions; the files `sysmem_flip.rs`, `rm_present.rs` and the rest of 15.12's list were
 type-checked in the generated harness); that the STANDARD identity's new bit is ignored by the shipped UMD.
 
-### 15.17 The CPU-copy fallback for a Blt into the level 5 RM primary (NOT BUILT: design notes only)
+### 15.17 The CPU-copy fallback for a Blt into the level 5 RM primary (built; compiled by nothing, run by nothing)
 
-Status: **unfinished. No code was written for this on `kmd/level5-blt-cpu`.** The work stopped after reading
-15.1 to 15.16 and starting on `ddi/display.rs` (`dxgkddi_present_inner`, the Blt arm near the
-`Edge::PresentBlt` hook). Nothing here was compiled, host-tested or run. Open point 3 of 15.14 and "Not done"
-item 3 of 15.16 still stand: at level 5 a Present Blt whose destination is the RM primary still fails with
-`STATUS_DEVICE_NOT_READY` (`begin_present_buffer_write_legacy` answers `NotFound`).
+Status: written on `kmd/level5-blt-cpu2` over v318 (`5fe6e8d`), after `kmd/level5-blt-cpu`'s design notes (the earlier
+text of this section). A Present Blt whose destination is the RM system-memory primary no longer fails with
+`STATUS_DEVICE_NOT_READY`: it is copied by the CPU, or counted and skipped with success. The pure half is host-tested
+(`kmd_logic::rm_blt`, 39 tests); the I/O halves were type-checked against generated harnesses (15.12); nothing was
+compiled as a whole or run. This closes open point 3 of 15.14 only for the KMD's own Blt arm (the DWM import,
+15.8, is another question) and "Not done" item 3 of 15.16 for its first sentence; the `WindowedBlt` edge still has
+nothing to fire for.
 
-The intended design (none of it verified):
+**How the Blt present works for an ordinary (Venus) primary** (read, `ddi/display.rs` `dxgkddi_present_inner`).
+`DxgkDdiPresent` is documented PASSIVE_LEVEL. `DXGKARG_PRESENT` carries `DstRect` and `SrcRect` (`RECT`),
+`SubRectCnt` / `pDstSubRects` (sub-rectangles in destination space) and the two allocation-list entries; it has no
+move rectangles (those are `DXGKARG_PRESENT_DISPLAYONLY`). The KMD's Blt arm (flag bit 0) reads NONE of the rects: it
+requires source and destination to have the same extent and copies the whole surface. The source must be a
+`DEVICE_MEMORY` allocation (anything else is `PBCpy 0xE6`, `STATUS_INVALID_PARAMETER`); the destination's
+`PresentAllocationStorage` picks the copy:
 
-1. Source is a Venus-backed image: reuse the existing GPU copy of the source into the adapter's LINEAR
-   host-visible image (`prepare_optimal_scanout_copy` / `PreparedImageCopy`), wait for its completion as the
-   existing arm does, then copy the destination rect(s) row by row from that image's guest mapping into the RM
-   primary's own CPU mapping (the host's `map_info` cache type through `map_cache_to_mm`, never another
-   attribute), `sfence`, then `primary_changed(.., Edge::PresentBlt, resid)` once per Present.
-2. Source is a CPU-visible allocation (GDI): copy directly, rect by rect.
-3. Never fail the Present: on an internal failure count `RmSysBltSkip` and return success (a visual glitch),
-   unless the source is unreadable.
-4. Cost: limit the copy to the Present's dst rect(s). Counters `RmSysBltCpu`, `RmSysBltBytes` (MiB),
-   `RmSysBltUs`, `RmSysBltMaxUs`, `RmSysBltSkip` through `publish_nvrm_counters` (names of 14 characters or
-   fewer). At the host-measured write-combined speeds (writes about 28 MB/s, reads about 75 MB/s) a full
-   5120x1440 frame (29,491,200 bytes) is on the order of 0.4 s to read from a write-combined source mapping and
-   1 s to write; the rect limit is what makes it bearable.
-5. PASSIVE, no spinlock across the GPU wait or the row copy, the Venus lock order (scanout mutex, Venus,
-   virtio) unchanged.
-6. Pure parts (clip and clamp rects to the primary size and pitch, the row-copy plan, byte accounting, empty
-   rects, zero `SubRectCnt` meaning the full rect, 5120x1440 pitch 20480) belong in `kmd_logic` with host
-   tests: not written.
-7. The Venus path stays byte-identical for every destination that is not the RM primary: trivially true,
-   since nothing was changed.
+| allocation | `kind` / `storage` | as a source today | as a destination today |
+|---|---|---|---|
+| Venus-backed OPTIMAL D3D11/DXVK image (GPU-only tiled memory) | `DEVICE_MEMORY` / `OptimalOpaqueFdImage` | imported once (`ensure_present_image`), copied by a reusable command | an image-to-image copy or blit |
+| direct-scanout image, KMD GDI texture (`KmdOptimalGdiTexture`) | `DEVICE_MEMORY` + DIRECT_SCANOUT, or `STANDARD` + OPTIMAL_GDI_TEXTURE / `OptimalCrossContextImage` | the first only | an image-to-image copy or blit |
+| adopted foreign (NVK-on-RM) image | `DEVICE_MEMORY` with a layout record | `new_foreign_dma_buf` | not a destination |
+| CPU-visible linear blob (a Present buffer, a GDI surface, the Venus primary) | `STANDARD` / `PitchedStandardBuffer` | refused (`0xE6`) | a registered Present buffer: `begin_present_buffer_write_legacy`, an image-to-buffer copy (`record_reusable_present_blt`), the wire fence waited for, the mirror into system backing, `Edge::PresentBlt` |
+| typed WindowedBlt snapshot | a stashed `SnapshotDescriptor` | the two-phase queue (`queue_windowed_blt`, a deferred submit after SubmitCommand admits it) | the same destinations |
 
-Not done, all of it: the source-kind mapping, the arms, the counters, the `kmd_logic` module and its tests, the
-harness type-check and the protocol test run.
+The completion the Present path expects: the GPU fence of the copy is merged into the DMA buffer's private data
+(`PresentSubmissionPrivate::merge_fence`) so SubmitCommand retires the DMA fence behind it; then the tail writes the
+refresh marker into the DMA buffer. The adapter's LINEAR scanout image (`allocate_linear_scanout_image_blob`,
+`dedicated_scanout_*`, `prepare_optimal_scanout_copy` / `PreparedImageCopy`) is not part of the Blt arm: it is what
+`SetVidPnSourceAddress` copies an OPTIMAL primary into for the viewer. The RM primary has no Venus object at all
+(`venus_image_id` and `venus_memory_id` are 0), which is why the legacy arm cannot reach it.
+
+**What was built.**
+
+1. **The hook** (`display.rs`): before the legacy Blt arm, `sysmem_blt::primary(adapter, destination.resource_id)`
+   (one relaxed load with the knob below 5; at level 5 `foreign_sysmem_source`: an adopted RM sysmem record). If it
+   is `Some`, `present_blt_to_rm_primary` runs INSTEAD of the legacy arm (the old arm is now `} else if present_flags
+   & 1 != 0 {`: the only line of the old code that changed; everything else in `display.rs` is added). It first does
+   what dxgkrnl's protocol needs and the legacy arm did before any host work (a DMA buffer and private data big enough,
+   `validate_patch_capacity`: an insufficient-buffer retry cannot copy twice), refuses a source handle that names no
+   allocation (`STATUS_INVALID_PARAMETER`, nothing to read), and otherwise ALWAYS returns success.
+2. **Source = a Venus-backed image** (`Source::Image`: the ordinary OPTIMAL image, the cross-context GDI texture, the
+   foreign image; the descriptor is built exactly as the legacy arm builds it): `VenusClient::rm_blt_copy_to_stage`
+   GPU-copies the whole source into a private LINEAR host-visible BGRA STAGING image (a second
+   `allocate_linear_scanout_image_blob`, not the adapter's dedicated one: that one is published as the primary scanout
+   (`primary_scanout_*`, `SET_SCANOUT_BLOB`) and sharing it would publish the wrong identity). The reusable command is
+   the scanout copy's own (`record_reusable_image_copy`, or `record_reusable_converted_image_copy` through a BGRA
+   conversion image when the source's Vulkan format is not B8G8R8A8_UNORM), baked once per (source, stage) pair in
+   the same `present_blits` cache as an ordinary Present BLT, so `release_present_blits_for_resource` of the source
+   releases it with the rest; the import is the cached `ensure_present_image`; the submit is
+   `submit_venus_async_present` with no destination buffer (ring 1, no scanout notify). The GPU copy is the whole
+   image (the machinery has no rect-limited command; the reusable command is what makes the steady state one
+   enqueue). The caller waits for the wire fence with `wait_fence` (5 s) OUTSIDE the Venus mutex. The stage grows
+   (never shrinks) when a larger source appears; a replaced one stays until the Venus context is torn down, bounded
+   at 8 allocation attempts.
+3. **Source = a CPU-visible allocation** (`Source::Cpu`: a `STANDARD` / `PitchedStandardBuffer` allocation, its
+   authoritative pitch, a 32-bit 8-bit-per-channel format): read through its own blob mapping, no GPU, no stage.
+4. **The row copy** (both arms): `rm_blt::plan` turns (`DstRect`, `SrcRect`, `SubRectCnt`, `pDstSubRects`) into at
+   most 32 rects, clipped to the primary and to what the source has; each rect is cut into row bands of at most
+   about 4 MiB of either surface; for each band the source window and the primary window are mapped
+   (`map_blob_prepare`, idempotent: the primary is normally already mapped at dxgkrnl's aperture offset, and the same
+   pages are viewed), `MmMapIoSpace`d with the cache attribute of the HOST's `map_info` for that blob
+   (`map_cache_to_mm`; for the primary that is the attribute it was created and trial-mapped with, 15.5: no alias is
+   made), the rows copied with `rm_present::copy_row` (streaming stores where 16-byte aligned), `sfence` on THIS core
+   (its write-combined buffers: the flip worker's own `sfence` cannot drain them), unmapped. A pixel-order mismatch
+   (an RGBA source into an `ABGR8888` primary or the reverse) is a byte swap of each pixel (`rm_blt::swap_rb_row`).
+5. **Then**, if any bytes were written, `primary_changed(adapter, Edge::PresentBlt, primary)` once per Present: the
+   re-flip is scheduled by 15.16's machinery. The GPU copy's fence, which is already complete, is merged into the
+   private data (a record that names no pending work, instead of one a recycled DMA buffer left); a Present with no GPU
+   fence merges 0.
+6. **Never fail** (`rm_blt::Skip`, `RmSysBltWhy` is the last code): 1 layout (the primary is not a 32-bit format of
+   known order, or a surface does not hold its rows), 2 snapshot, 3 source format, 4 source kind, 5 source is the
+   destination, 6 no memory for the stage or the cache, 7 GPU copy not submitted, 8 GPU copy not complete in 5 s, 9
+   staging image busy for 2 s, 10 source not mappable, 11 primary not mappable, 12 the rect arithmetic found a layout
+   that does not hold the copy, 13 no Venus client. Each is a counted success with a stale picture. A typed WindowedBlt
+   snapshot source is skipped (2): its content is ready only when its stream boundary is, which a synchronous copy
+   cannot wait for; the two-phase path has no RM destination (open question 2).
+
+**The rect rules** (all tested in `rm_blt`): an EMPTY `DstRect` (all zero, inverted) is the whole primary (the legacy
+arm never read a rect, so an unset one must keep meaning that); a `DstRect` partly outside is clamped, entirely
+outside copies nothing and succeeds; `SubRectCnt` 0 is the whole clamped `DstRect`; otherwise each sub-rect is clipped
+to it and the survivors copied (all empty or outside: nothing, not everything); more than 32 survivors, or a count
+over 4096, fall back to their bounding box / the whole `DstRect` (more bytes, never fewer); `SrcRect` places the
+source by its origin delta from `DstRect` when both are non-empty and the same size, otherwise the source is read at
+the same coordinates (what a full-surface copy did); everything is clamped so no byte outside either surface is
+addressed (`Surface::valid`, a last proof in `finish`). 5120x1440, pitch 20480: a full frame is 29,491,200 bytes (28
+MiB), one 400x40 text line 64,000.
+
+**Counters** (`RmSysBlt*`, mirrored by `sysmem::publish_counters`, which `publish_nvrm_counters` reaches through
+`virtio::rm_client::publish_counters` at level 5; written once the fallback ran; names at most 14 characters):
+
+| value | what | healthy |
+|---|---|---|
+| `RmSysBltCpu` | Presents the fallback answered with a copy (also one with nothing to copy) | grows with the Blt presents |
+| `RmSysBltBytes` | cumulative MiB of pixels written to the primary (a skipped Present adds what it wrote before it stopped) | grows with the dirty area |
+| `RmSysBltUs` / `RmSysBltMaxUs` | cumulative microseconds of the whole fallback (the GPU wait included) over the copied Presents / the slowest one (both saturate at `u32::MAX`) | the average (`Us / Cpu`) is the cost of a Present; a max near 1 s is a full-frame write at 28 MB/s |
+| `RmSysBltSkip` / `RmSysBltWhy` | Presents answered with success without a complete copy / the last reason (above) | 0 / 0 |
+| `RmSysBltStg` | the staging image's resource id, written when it is made (`0x80000000` plus the attempts once the 8 are used up) | one id per boot |
+
+`PBCpy` is 3 after a CPU copy and 4 after a skip (written when the value changes: no per-Present registry write).
+
+**Locking and IRQL.** PASSIVE (the Present DDI). The Venus mutex is taken ALONE, for the submit, exactly as the legacy Blt
+arm takes it (it takes no scanout mutex: the lock order scanout -> Venus -> virtio is untouched, and nothing here
+needs the first); the fence wait, the mapping and the row copy run with no lock and no spinlock held. The only
+thing held across them is `STAGE_BUSY`, an atomic flag serializing users of the staging image (two Presents on two
+contexts must not share the stage between their GPU copy and their read); a Present that finds it taken sleeps in
+1 ms slices for at most 2 s and then skips (9). `primary_changed` takes no lock (atomics, `KeSetEvent`).
+
+**Cost model.** Per Present: the rects, not the frame, on the CPU; the GPU copy of the whole source into the stage
+(GPU time, one enqueue and one fence wait: the Present thread blocks for it, as the legacy arm does for a Present
+buffer). Reads from the stage and writes to the primary run at the mapping's speed: the host measured write-combined
+reads at about 75 MB/s and writes at about 28 MB/s, so a full 5120x1440 frame is about 0.4 s to read and 1 s to write
+(rows are read and written one after the other, so the two add), a 400x40 line about 2 ms, and each band costs two
+`MmMapIoSpace` / unmap pairs (about 4 MiB each at most). The stage's memory is host-visible Vulkan memory: whether its `map_info` is cached (fast
+reads) or write-combined is the host's (`RmSysCache` for the primary, the same nibble logic). A Present that carries
+no rects (DstRect unset) is a full-frame copy: `RmSysBltBytes / RmSysBltCpu` is the measure of whether real
+Presents carry rects.
+
+**Verified here:** `kmd_logic::rm_blt` against a model of the row loop (39 tests: empty and inverted rects, rects
+partly and entirely outside, extreme `RECT` values, `SubRectCnt` 0, a list longer than 32 and over 4096, a short
+list, the source placement and its clamps, pitch 20480 at 5120x1440, the band split covering every row once, map
+windows page-aligned and inside the mapping, the byte order of every format, the swap, the accounting); the I/O
+halves type-check (borrowck included) in three generated harnesses whose stubs carry the REAL signatures cut from the
+real sources: `sysmem_blt.rs` as a real child of `rm_client.rs` (module visibility from the real `mod` lines), the new
+`present.rs` block against stubs of the `VenusClient` members it uses, and `present_blt_to_rm_primary` plus the real
+hook text (cut unchanged out of `dxgkddi_present_inner`) in a function whose parameters have the types the real locals
+have. `git diff -w` of `display.rs` against v318 removes one line (the `if present_flags & 1 != 0 {` that became the
+`else if`): the Venus path is byte-identical for every destination that is not an adopted RM primary.
+
+**Not verified by anything, and open:**
+
+1. That `kmd_render` compiles (as before: bindgen types, `DXGKARG_PRESENT`'s real field types), and that any of it
+   runs: the GPU copy into a second LINEAR image, `map_blob_prepare` of the stage, `MmMapIoSpace` sub-ranges, the
+   fence wait, the swizzle, the cost numbers.
+2. **The source-kind mapping is read from the allocation identity, not run.** A STANDARD `OptimalCrossContextImage`
+   source (the KMD's GDI texture) was never a legal source of the legacy arm; here it is imported as a
+   cross-context dma-buf image exactly like a destination of the same kind is. Whether the host accepts it as a
+   source, and whether DWM/GDI Presents ever name a CPU-visible STANDARD source, is for the run (`RmSysBltWhy` 3, 4,
+   7 and 10 are the signals).
+3. **WindowedBlt snapshot sources are skipped.** At level 5 a DWM present that carries a snapshot into the primary
+   leaves the previous picture; the fix is the two-phase path with an RM destination (a `PresentDestinationDesc` arm
+   that finishes with this copy after the producer boundary), which is Venus-client work with no destination object
+   to hang it on.
+4. **A CPU-visible source that is not resident.** The Present DDI runs before residency is effective
+   (`SubmitCommand` admits it): a pitched source paged out to system memory is read from its blob, which is stale. The
+   legacy arm has the same ordering for a GPU source.
+5. **The primary's mapping can move.** The view is the host's `map_info` of whatever offset the blob is mapped at; a
+   remap by `MapCpuHostAperture` while a band is mapped is not excluded (the paging copies hold a content mutex that
+   this path does not take).
+6. **The staging image is whole-image and grows only**; a replaced stage and the blits baked against it stay until
+   teardown (bounded: 8 attempts, the blit cache's own ceiling).
+7. **The `ABGR8888` (RGBA) primary and RGBA sources** go through a byte swap that was tested only on vectors.
+
+**Hardware checklist** (after 15.13 step 13, only once steps 2 to 5 pass: the picture and its flips are proven
+first). 13a. **A Blt workload at level 5:** run an app that presents by Blt (a windowed DXVK/D3D11 swapchain composed by
+the legacy path, or a GDI redirection test) for a minute. Expect `RmSysBltCpu` growing with the Blt presents,
+`RmSysBltSkip=0` (otherwise `RmSysBltWhy` names the arm), `PBCpy=3`, no `PBCpy 0xE5` and no `STATUS_DEVICE_NOT_READY`
+from `PBRet`, `RmSysEdBlt` growing with `RmSysBltCpu`, the window's content visible in the viewer, and
+`RmSysBltUs / RmSysBltCpu` in the low milliseconds (a full-frame average is the sign that Presents carry no rects:
+read `RmSysBltBytes`). 13b. **A window drag with a Blt app:** the frame rate of the app against `RmSysBltMaxUs`; if
+the rects are the whole frame the CPU copy bounds the frame rate at about one per second and the answer is the cached
+opt-in (15.5) or the Venus fallback of 15.14 point 3. 13c. **Two apps at once:** no `RmSysBltWhy` 9.
+

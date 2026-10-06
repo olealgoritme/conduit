@@ -781,7 +781,7 @@ unsafe fn copy_frame(plan: &CopyPlan, src: *const u8, dst: *mut u8) {
 ///
 /// # Safety
 /// `n` bytes readable at `src` and writable at `dst`, not overlapping.
-unsafe fn copy_row(src: *const u8, dst: *mut u8, n: usize) {
+pub(crate) unsafe fn copy_row(src: *const u8, dst: *mut u8, n: usize) {
     use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_stream_si128};
     let mut i = 0usize;
     if (dst as usize) & 15 == 0 {
