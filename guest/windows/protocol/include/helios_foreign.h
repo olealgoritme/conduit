@@ -30,11 +30,42 @@
 /* RM_RESOURCE_IMPORT is served end to end (this KMD and a host that serves
  * RmResourceImport). Without it the op answers HELIOS_FOREIGN_ST_UNSUPPORTED. */
 #define HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT (1u << 2)
+/* The layout record takes every format of the shared-format table below (not
+ * only the four 32 bpp RGB ones), the PLANE1 tail for two-plane formats, and the
+ * KMD writes the version-2 WDDM trailer for two-plane records
+ * (guest/windows/docs/shared-formats.md). Without it: 32 bpp RGB only. */
+#define HELIOS_FOREIGN_CAP_LAYOUT_FORMATS (1u << 3)
 
 /* IMPORT_RM.flags: a helios_foreign_layout follows the 72-byte request
  * (helios_foreign_import_rm_layout, 104 bytes). Not optional: a request without
  * it is refused HELIOS_FOREIGN_ST_BAD_RANGE. */
 #define HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT (1u << 0)
+/* IMPORT_RM.flags (CAP_LAYOUT_FORMATS): plane 1 of a two-plane format follows
+ * the layout (helios_foreign_import_rm_planes, 120 bytes). Only with
+ * FLAG_LAYOUT; set iff the fourcc has two planes. */
+#define HELIOS_FOREIGN_IMPORT_FLAG_PLANE1 (1u << 1)
+
+/* Shared formats (DRM fourcc = the layout record's format code). Bytes per
+ * texel of plane 0 / plane 1; plane 1 of the 4:2:0 formats is w/2 x h/2.
+ *   XRGB/ARGB/XBGR/ABGR8888 4         (always accepted)
+ *   R8 1, GR88 2, R16 2, GR1616 4, RGB565 2, ARGB1555 2, ARGB4444 2,
+ *   ABGR2101010 4, ABGR16161616F 8, ABGR16161616 8,
+ *   YUYV 4 per two pixels (even width),
+ *   NV12 1 / 2, P010 2 / 4, P016 2 / 4 (two planes, even width and height) */
+#define HELIOS_DRM_FORMAT_R8 0x20203852u
+#define HELIOS_DRM_FORMAT_GR88 0x38385247u
+#define HELIOS_DRM_FORMAT_R16 0x20363152u
+#define HELIOS_DRM_FORMAT_GR1616 0x32335247u
+#define HELIOS_DRM_FORMAT_RGB565 0x36314752u
+#define HELIOS_DRM_FORMAT_ARGB1555 0x35315241u
+#define HELIOS_DRM_FORMAT_ARGB4444 0x32315241u
+#define HELIOS_DRM_FORMAT_ABGR2101010 0x30334241u
+#define HELIOS_DRM_FORMAT_ABGR16161616F 0x48344241u
+#define HELIOS_DRM_FORMAT_ABGR16161616 0x38344241u
+#define HELIOS_DRM_FORMAT_YUYV 0x56595559u
+#define HELIOS_DRM_FORMAT_NV12 0x3231564Eu
+#define HELIOS_DRM_FORMAT_P010 0x30313050u
+#define HELIOS_DRM_FORMAT_P016 0x36313050u
 
 /* RM_RESOURCE_IMPORT.out_flags: out_modifier is known. */
 #define HELIOS_FOREIGN_RM_RESOURCE_IMPORT_MODIFIER (1u << 0)
@@ -130,6 +161,26 @@ struct helios_foreign_import_rm_layout {
    struct helios_foreign_layout layout;
 };
 
+/* Plane 1 of a two-plane format (NV12/P010/P016): its own modifier (LINEAR iff
+ * plane 0's is), pitch and offset (past plane 0). Also the WDDM trailer's
+ * plane-1 record (HeliosWddmAllocPlane, private-data offset 128). */
+struct helios_foreign_plane {
+   uint64_t modifier;
+   uint32_t stride;
+   uint32_t offset;
+};
+
+struct helios_foreign_import_rm_planes {
+   struct helios_foreign_import_rm_layout base;
+   struct helios_foreign_plane plane1;
+};
+
+/* WDDM private data of a two-plane foreign allocation: the layout trailer at 96
+ * has version 2 and reserved = 2 (plane count), plane 1 at 128, 144 bytes. */
+#define HELIOS_WDDM_LAYOUT_VERSION_PLANES 2u
+#define HELIOS_WDDM_LAYOUT_PLANE1_OFFSET 128u
+#define HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES 144u
+
 _Static_assert(sizeof(struct helios_escape_header) == 16, "hdr");
 _Static_assert(sizeof(struct helios_foreign_header) == 40, "head");
 _Static_assert(offsetof(struct helios_foreign_header, abi_version) == 16, "abi");
@@ -172,6 +223,12 @@ _Static_assert(offsetof(struct helios_foreign_layout, modifier) == 24, "layout")
 _Static_assert(sizeof(struct helios_foreign_import_rm_layout) == 104, "import+layout size");
 _Static_assert(offsetof(struct helios_foreign_import_rm_layout, base) == 0, "import+layout");
 _Static_assert(offsetof(struct helios_foreign_import_rm_layout, layout) == 72, "import+layout");
+
+_Static_assert(sizeof(struct helios_foreign_plane) == 16, "plane size");
+_Static_assert(offsetof(struct helios_foreign_plane, stride) == 8, "plane");
+_Static_assert(offsetof(struct helios_foreign_plane, offset) == 12, "plane");
+_Static_assert(sizeof(struct helios_foreign_import_rm_planes) == 120, "import+planes size");
+_Static_assert(offsetof(struct helios_foreign_import_rm_planes, plane1) == 104, "import+planes");
 
 _Static_assert(sizeof(struct helios_foreign_rm_resource_import) == 80, "rri size");
 _Static_assert(offsetof(struct helios_foreign_rm_resource_import, rm_handle) == 40, "rri");
