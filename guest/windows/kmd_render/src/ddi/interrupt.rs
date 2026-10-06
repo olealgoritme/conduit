@@ -432,10 +432,12 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
 
     // `FfAsyncWin`: a `SetVidPnSourceAddress` (DIRQL) left a programming pending and asked for
     // this DPC; wake the worker that drains it (it used to wait for the next vsync tick).
-    if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0
-        && crate::virtio::foreign_flip::early_wake()
-    {
-        crate::virtio::foreign_flip::note_early_woke();
+    let early = crate::virtio::foreign_flip::early_wake();
+    let ann_early = crate::ddi::flip_announce::wakes_early();
+    if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 && (early || ann_early) {
+        if early {
+            crate::virtio::foreign_flip::note_early_woke();
+        }
         adapter.signal_hpd();
     }
 
@@ -444,8 +446,22 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
     // call drains their packets — the viogpu3d NotifyDpcRoutine ordering).
     if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
         if let Some(notify_dpc) = dxgkrnl.DxgkCbNotifyDpc {
+            // `FlipInDpc`: a `SetVidPnSourceAddress` that runs inside this call is dxgkrnl
+            // issuing the next flip as part of retiring the previous one.
+            crate::ddi::flip_lat::dpc_enter();
             // SAFETY: DISPATCH_LEVEL DPC context; live device handle.
             unsafe { notify_dpc(dxgkrnl.DeviceHandle) };
+            crate::ddi::flip_lat::dpc_leave();
+            // A flip issued by that call left a programming pending and asked for another DPC;
+            // wake the worker now rather than one DPC round later.
+            if (early || ann_early)
+                && adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0
+            {
+                if early {
+                    crate::virtio::foreign_flip::note_early_woke();
+                }
+                adapter.signal_hpd();
+            }
         }
     }
 

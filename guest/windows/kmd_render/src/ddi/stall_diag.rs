@@ -55,6 +55,9 @@ pub(crate) fn hpd_enter(step: u32) {
         if us >= 100_000 {
             HPD_STEP_100_N.fetch_add(1, Ordering::Relaxed);
         }
+        if let Some(c) = STEP_MAX_US.get(left as usize) {
+            c.fetch_max(us, Ordering::Relaxed);
+        }
         let ms = helios_kmd_logic::vsync_rate::ms_from_100ns(now);
         if HPD_LONG.note(us, left, ms) {
             // What else was going on when the longest step ended: the DDIs inside the driver.
@@ -76,6 +79,10 @@ static HPD_SITE_AT: AtomicU64 = AtomicU64::new(0);
 static HPD_LONG: helios_kmd_logic::device_lost::Longest = helios_kmd_logic::device_lost::Longest::new();
 static HPD_LONG_INFL: AtomicU32 = AtomicU32::new(0);
 static HPD_STEP_100_N: AtomicU32 = AtomicU32::new(0);
+/// The longest dwell (microseconds) in each worker step, by `site` id (`HpdMx00`..`HpdMx31`).
+#[allow(clippy::declare_interior_mutable_const)]
+const Z32: AtomicU32 = AtomicU32::new(0);
+static STEP_MAX_US: [AtomicU32; 32] = [Z32; 32];
 /// Passes of the worker that took 100 ms or more, and 500 ms or more.
 static HPD_PASS_100_N: AtomicU32 = AtomicU32::new(0);
 static HPD_PASS_500_N: AtomicU32 = AtomicU32::new(0);
@@ -282,6 +289,8 @@ static FLIP_PUB_T: AtomicU32 = AtomicU32::new(0);
 /// newer flip replaced. An address the word cannot carry (zero, or 40 bits or more) clears the
 /// word instead, so an OLDER flip's address is never fired for this one (`FlipWdBig`).
 pub(crate) fn note_flip_issued(address: u64) {
+    // `FlipLat*` / `IfGap*` (`ddi::flip_lat`): the issue time of this flip, for its retire latency.
+    crate::ddi::flip_lat::note_issue(address);
     let seq = FLIP_ISS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     // The newest address dxgkrnl issued, for the restart seed (`restart_flip::seed_address`).
     // Never zeroed by a generation, and a zero address (nothing assigned) never replaces it.
@@ -1001,7 +1010,127 @@ pub(crate) fn note_start_entry(adapter: &AdapterContext, hpd_indicates: u32) {
     // The programming state this StartDevice inherited (the stop's reset already cleared it, so
     // anything here is a start with no stop before it) and the address the heartbeat carries.
     REST_PEND_START.store(adapter.restart_programming_flags(), Ordering::Relaxed);
+    // After a driver image reload every static is zero: take the newest issued address of the
+    // previous image from the service key BEFORE `ScRestIss` is read and before the first
+    // `reset_display_publication_state` seeds the heartbeat from `LAST_ISSUED`.
+    load_rest_seed();
     REST_ISS.store(last_issued_address(), Ordering::Relaxed);
+}
+
+// ---- the restart seed that survives an image reload ----------------------------------------
+
+/// `RestSeed` in force (0 = off: statics only, the v329 behaviour), the persisted address as read
+/// at the last StartDevice (low and high dword; 0 when the knob is off), and `RestSeedUse`
+/// (`restart_flip::USE_*`). Written at every StartDevice, zero included; mirrored by
+/// [`publish_restart`].
+static SEED_EFF: AtomicU32 = AtomicU32::new(0);
+static SEED_LO: AtomicU32 = AtomicU32::new(0);
+static SEED_HI: AtomicU32 = AtomicU32::new(0);
+static SEED_USE: AtomicU32 = AtomicU32::new(0);
+/// The address the service key holds now (as written, or as read back and used), and the
+/// interrupt time (100 ns) of the last write: the worker's change-and-rate test is two loads.
+static SEED_PERSISTED: AtomicU64 = AtomicU64::new(0);
+static SEED_WRITE_T: AtomicU64 = AtomicU64::new(0);
+/// One writer at a time: the worker's periodic write and StopDevice's can overlap.
+static SEED_WRITING: AtomicU32 = AtomicU32::new(0);
+
+/// StartDevice entry, PASSIVE: read the knob and the persisted words, choose the seed
+/// (`restart_flip::choose_seed`) and, when the persisted address wins, store it as `LAST_ISSUED`
+/// so every later seed site (`reset_display_publication_state`, the worker's dead-source exit)
+/// sees it. A rejected value is erased, so that a later and longer boot cannot accept it by its
+/// uptime. Nothing is read or written with the knob off.
+fn load_rest_seed() {
+    use helios_kmd_logic::restart_flip as rf;
+    let on = rf::clamp_knob(crate::diag::read_config_dword(
+        crate::diag::knobs::REST_SEED,
+        1,
+    ));
+    let persisted = if on != 0 {
+        rf::Persisted::from_words(
+            crate::diag::read_config_dword(crate::diag::knobs::REST_ISS_LO, 0),
+            crate::diag::read_config_dword(crate::diag::knobs::REST_ISS_HI, 0),
+            crate::diag::read_config_dword(crate::diag::knobs::REST_UPTIME, 0),
+            crate::diag::read_config_dword(crate::diag::knobs::REST_CHECK, 0),
+        )
+    } else {
+        rf::Persisted::NONE
+    };
+    SEED_EFF.store(on, Ordering::Relaxed);
+    SEED_LO.store(persisted.address as u32, Ordering::Relaxed);
+    SEED_HI.store((persisted.address >> 32) as u32, Ordering::Relaxed);
+    let now = crate::adapter::foreign_scanout::now_100ns();
+    let choice = rf::choose_seed(
+        on != 0,
+        LAST_ISSUED.load(Ordering::Acquire),
+        persisted,
+        rf::uptime_seconds(now),
+    );
+    SEED_USE.store(choice.reason, Ordering::Relaxed);
+    match choice.reason {
+        rf::USE_PERSISTED => {
+            // Only into an empty slot: a flip issued since the check wins.
+            let _ = LAST_ISSUED.compare_exchange(
+                0,
+                choice.address,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            SEED_PERSISTED.store(choice.address, Ordering::Relaxed);
+            SEED_WRITE_T.store(now, Ordering::Relaxed);
+        }
+        rf::USE_STALE | rf::USE_INSANE => {
+            write_rest_words(0, 0);
+            SEED_PERSISTED.store(0, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+/// The four persisted words, check LAST (`restart_flip::persist_words`). PASSIVE.
+fn write_rest_words(address: u64, uptime_s: u32) {
+    use helios_kmd_logic::restart_flip as rf;
+    let w = if address == 0 {
+        [0; 4]
+    } else {
+        rf::persist_words(address, uptime_s)
+    };
+    crate::diag::record_named_bytes(rf::NAME_ISS_LO, w[0]);
+    crate::diag::record_named_bytes(rf::NAME_ISS_HI, w[1]);
+    crate::diag::record_named_bytes(rf::NAME_UPTIME, w[2]);
+    crate::diag::record_named_bytes(rf::NAME_CHECK, w[3]);
+}
+
+/// Write the newest issued address to the service key when it changed (`restart_flip::persist_due`):
+/// `force` (StopDevice) writes at once, otherwise at most once per 2 s. The common call, from the
+/// HPD worker's every pass, is two atomic loads and a compare. PASSIVE only (registry); never on
+/// the flip path. A no-op with the knob off.
+pub(crate) fn persist_rest_seed(force: bool) {
+    use helios_kmd_logic::restart_flip as rf;
+    let current = LAST_ISSUED.load(Ordering::Acquire);
+    let persisted = SEED_PERSISTED.load(Ordering::Relaxed);
+    if current == persisted || SEED_EFF.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let now = crate::adapter::foreign_scanout::now_100ns();
+    if !rf::persist_due(
+        current,
+        persisted,
+        now,
+        SEED_WRITE_T.load(Ordering::Relaxed),
+        force,
+    ) {
+        return;
+    }
+    if SEED_WRITING
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    write_rest_words(current, rf::uptime_seconds(now));
+    SEED_PERSISTED.store(current, Ordering::Relaxed);
+    SEED_WRITE_T.store(now, Ordering::Relaxed);
+    SEED_WRITING.store(0, Ordering::Release);
 }
 
 /// Flip retirement across a restart (`restart_flip`): the programming state at StopDevice and at
@@ -1018,6 +1147,9 @@ static REST_SIG: AtomicU32 = AtomicU32::new(0);
 /// StopDevice, after the worker and the heartbeat were stopped and BEFORE the display state is
 /// reset: what was pending, and the address the heartbeat was carrying. PASSIVE.
 pub(crate) fn note_stop_entry(adapter: &AdapterContext) {
+    // The newest issued address goes to the service key before anything below can fail: the
+    // StopDevice flushes that follow cover it (the next image reads it at StartDevice).
+    persist_rest_seed(true);
     REST_PEND_STOP.store(adapter.restart_programming_flags(), Ordering::Relaxed);
     REST_ADDR_STOP.store(
         adapter.last_primary_address.load(Ordering::Acquire),
@@ -1062,6 +1194,11 @@ pub(crate) fn publish_restart() {
         helios_kmd_logic::restart_flip::high_bytes(stop, iss, exit),
     );
     rec(b"ScRestSig", REST_SIG.load(Ordering::Relaxed));
+    // The persisted seed (`restart_flip::choose_seed`), as this StartDevice read it.
+    rec(b"RestSeedEff", SEED_EFF.load(Ordering::Relaxed));
+    rec(b"RestSeedLo", SEED_LO.load(Ordering::Relaxed));
+    rec(b"RestSeedHi", SEED_HI.load(Ordering::Relaxed));
+    rec(b"RestSeedUse", SEED_USE.load(Ordering::Relaxed));
 }
 
 /// The HPD worker's phase this generation (1 thread entered, 2 StartDevice's return seen, 3 first
@@ -1117,6 +1254,12 @@ pub(crate) fn publish_mode() {
 /// The longest worker step and the longest vsync silence, with the context each ended in.
 fn publish_long_events() {
     use crate::diag::record_named_bytes as rec;
+    // The longest dwell in each worker step, microseconds (`HpdMx00`.. = `site` id): which step of
+    // a pass is the long one, whatever the pass total.
+    for (i, c) in STEP_MAX_US.iter().enumerate() {
+        let name = [b'H', b'p', b'd', b'M', b'x', b'0' + (i / 10) as u8, b'0' + (i % 10) as u8];
+        rec(&name, c.load(Ordering::Relaxed));
+    }
     rec(b"HpdLongSite", HPD_LONG.tag.load(Ordering::Relaxed));
     rec(b"HpdLongUs", HPD_LONG.value.load(Ordering::Relaxed));
     rec(b"HpdLongT", HPD_LONG.t.load(Ordering::Relaxed));
@@ -1154,6 +1297,9 @@ fn publish_breadcrumbs() {
 /// once (zeros included) so values an earlier run left in the service key are never read as this
 /// one's. PASSIVE.
 pub(crate) fn start_generation() {
+    for c in &STEP_MAX_US {
+        c.store(0, Ordering::Relaxed);
+    }
     for c in [
         &HPD_LOOP_N,
         &HPD_LOOP_T,
@@ -1273,6 +1419,19 @@ pub(crate) fn start_generation() {
     publish_counters();
 }
 
+/// Ask for [`publish_counters`] without running it on the caller's thread: the mirror thread
+/// (`ddi::mirror_thread`) takes the pass, at most once a second, so the HPD worker is not away from
+/// its flips for the length of well over a hundred registry writes (`FlipMaxUs` 29 ms at site 19 on
+/// 332.1). Inline when the thread does not exist. Any IRQL up to DISPATCH when it does, PASSIVE
+/// when it does not.
+pub(crate) fn request_publish() {
+    if crate::ddi::mirror_thread::running() {
+        crate::ddi::mirror_thread::request();
+    } else {
+        publish_counters();
+    }
+}
+
 /// Mirror the counters to the service key. PASSIVE_LEVEL only; a few dozen microseconds of
 /// registry writes, so callers rate-limit it (`publish_from_escape`) or run it from a path that
 /// is already a mirror.
@@ -1307,6 +1466,15 @@ pub(crate) fn publish_counters() {
     rec(b"FlipWd", WD_COUNT.load(Ordering::Relaxed));
     rec(b"FlipWdT", WD_T.load(Ordering::Relaxed));
     rec(b"FlipWdBig", WD_BIG.load(Ordering::Relaxed));
+    // The flip retire latency, the inter-flip interval, the vblank utilisation and the
+    // announce counters (`docs/kmd-rm-client.md` 15.18.15).
+    crate::ddi::flip_lat::publish_counters();
+    crate::ddi::flip_announce::publish_counters();
+}
+
+/// The HPD worker's current step (`site::*`), for the longest flip's breadcrumb.
+pub(crate) fn hpd_site() -> u32 {
+    HPD_SITE.load(Ordering::Relaxed)
 }
 
 /// Interrupt time (ms, never 0) of the last publication from an escape.

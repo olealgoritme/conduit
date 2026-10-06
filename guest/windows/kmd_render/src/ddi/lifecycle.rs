@@ -218,6 +218,7 @@ fn start_generation_mirrors() {
     let _ = crate::virtio::rm_client::reread_knob_at_start();
     crate::ddi::flip_keep::reset_for_start();
     crate::ddi::present_foreign::reset_for_start();
+    crate::ddi::onscanout::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // `foreign_flip::forget` zeroed its counters and owes the block; this writes it (reading and
     // mirroring `FfKnob` first), as does the `Fk*` block.
@@ -225,6 +226,10 @@ fn start_generation_mirrors() {
     crate::ddi::flip_keep::publish_counters();
     // The stall-diagnosis block (`HpdLoopN`, `FlipIss`, `VsPendN`, ...): zeroed, `StartN` bumped,
     // written once. After the worker of the previous generation was stopped.
+    // The flip retire measurement and the announce knobs (`FlipLat`, `FlipAnnounce`,
+    // `FlipEarlyWake`), read and zeroed before the block above is first written.
+    crate::ddi::flip_lat::start_generation();
+    crate::ddi::flip_announce::start_generation();
     crate::ddi::stall_diag::start_generation();
 }
 
@@ -644,6 +649,11 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // (`ddi::device_lost`): written BEFORE the flush below, so a stop that follows an
         // adapter-wide device loss leaves them on disk. PASSIVE.
         crate::ddi::device_lost::publish_block(crate::ddi::device_lost::Trigger::Stop);
+        // The newest issued flip address (`RestSeed`: the next image reads it at StartDevice,
+        // `pnputil /restart-device` reloads the image and zeroes every static), written before
+        // the first flush so that one covers it; `note_stop_entry` writes it again if a flip
+        // arrived while the worker and the heartbeat were being stopped.
+        crate::ddi::stall_diag::persist_rest_seed(true);
         // The first stage reaches the disk before anything that could bugcheck.
         let flush = crate::diag::read_config_dword(crate::diag::knobs::STOP_FLUSH, 1) != 0;
         if flush {

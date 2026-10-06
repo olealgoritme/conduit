@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 18:10:00 +0200
+Subject: [PATCH] nvk/rm: a refused scanout export says why, once per device
+
+The Win32 WSI reports a scanout swapchain that could not be made as
+"MESA-WSI: scanout images unavailable (-8), presenting through GDI" and
+nothing else: nvkmd_rm_mem_export_scanout's reasons go through vk_error*(),
+which a release build drops unless the application installed a debug
+messenger.  Superposition's OpenGL path through Zink hit this on
+22.22.320.1 (zero-copy lost, GDI present) while wgl_test got scanout, and
+there was no way to tell which refusal it was.
+
+The first refusal per device is now also logged with mesa_logw: no
+Helios scanout, memory backed by system pages instead of VRAM, or a PTE
+kind / tile mode that does not match the modifier.  Counter
+nvkmd_rm_dev::scanout_export_refusals.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |  5 +++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c | 19 ++++++++++++++++++-
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -309,6 +309,11 @@
+     * given system memory instead (nvkmd_rm_mem.c).
+     */
+    uint32_t bar_fallbacks;
++
++   /* Scanout exports refused (nvkmd_rm_mem_export_scanout): the first is
++    * logged with its reason.
++    */
++   uint32_t scanout_export_refusals;
+ };
+ 
+ NVKMD_DECL_SUBCLASS(dev, rm);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+@@ -130,6 +130,10 @@
+    int ret;
+ 
+    if (mem->os_pages != NULL) {
++      if (p_atomic_inc_return(&dev->scanout_export_refusals) == 1)
++         mesa_logw("NVK: scanout export refused: memory 0x%x (%" PRIu64 " B) "
++                   "is backed by system pages, not VRAM", mem->h_memory,
++                   mem->base.size_B);
+       return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
+                        "RM: memory backed by our own pages cannot be "
+                        "exported");
+@@ -239,10 +243,23 @@
+    struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
+    VkResult result = VK_SUCCESS;
+ 
+-   if (!nvkmd_rm_scanout_supported(dev->base.pdev))
++   /* vk_error*() is silent in release builds unless the app installed a
++    * debug messenger, and the WSI only prints the VkResult ("scanout images
++    * unavailable (-8)"): say why, once per device.
++    */
++   if (!nvkmd_rm_scanout_supported(dev->base.pdev)) {
++      if (p_atomic_inc_return(&dev->scanout_export_refusals) == 1)
++         mesa_logw("NVK: scanout export refused: no Helios scanout "
++                   "(NVK_HELIOS_WSI=0 or librmclient without the flip entries)");
+       return vk_error(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
++   }
+ 
+    if (!layout_matches_modifier(mem, modifier)) {
++      if (p_atomic_inc_return(&dev->scanout_export_refusals) == 1)
++         mesa_logw("NVK: scanout export refused: memory 0x%x (%" PRIu64 " B, "
++                   "kind 0x%x, tile 0x%x) cannot be shown as modifier 0x%016"
++                   PRIx64, mem->h_memory, mem->base.size_B, mem->pte_kind,
++                   mem->tile_mode, modifier);
+       return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
+                        "RM: memory 0x%x (kind 0x%x, tile 0x%x) cannot be "
+                        "shown as modifier 0x%016" PRIx64, mem->h_memory,
+--
+2.43.0
+

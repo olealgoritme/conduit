@@ -722,6 +722,17 @@ pub mod knobs {
     /// the worker to refresh the heartbeat block every 2 s. 0 never arms it. Read at every
     /// StartDevice; mirrored as `VsWdTmEff`.
     pub const VS_WD_TIMER: KnobName = KnobName::new(b"VsWdTimer");
+    /// `RestSeed` (default 1 = on): persist the newest flip address dxgkrnl issued in the
+    /// service key (`RestIssLo` / `RestIssHi` / `RestUpS` / `RestChk`) and seed the restarted
+    /// heartbeat from it after a `pnputil /restart-device` that RELOADED the image (every static
+    /// zero). 0 = the v329 behaviour, statics only, nothing written or read. Read at every
+    /// StartDevice; mirrored as `RestSeedEff` (docs/zero-copy-present.md section 20).
+    pub const REST_SEED: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_KNOB);
+    /// The persisted words, read at StartDevice (`restart_flip::Persisted`).
+    pub const REST_ISS_LO: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_ISS_LO);
+    pub const REST_ISS_HI: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_ISS_HI);
+    pub const REST_UPTIME: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_UPTIME);
+    pub const REST_CHECK: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_CHECK);
     /// Segment topology. Legal values 0 and 10 only — see `BarSegTopology`.
     pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
     /// CpuVisible cached-allocation kill switch (default 1 = cached).
@@ -852,6 +863,44 @@ pub mod knobs {
     /// 0 is coerced to 1 (a zero-depth flip queue is not representable) and the
     /// value actually advertised is mirrored in the `FlipQueV` counter.
     pub const FLIP_QUEUE_DEPTH: KnobName = KnobName::new(b"FlipQueueN");
+    /// `FlipAnnounce` (default 2 since the 332.1 hardware rows; 0 = off, the old behaviour): publish a flip's address toward
+    /// dxgkrnl AT `SetVidPnSourceAddress` (atomics only, DIRQL) so the very next CRTC_VSYNC tick
+    /// retires it (one tick per flip instead of two), while the HPD worker does the real
+    /// programming afterwards. 1 = only flips of foreign allocations `ForeignFlip` already
+    /// accepted; 2 = every flip, Venus direct and copy paths included. Only when the worker is
+    /// idle at the DDI (at most one unprogrammed announced flip); a flip that finds it busy
+    /// retires the normal way. Any non-zero value also wakes the worker early (`FlipEarlyWake`).
+    /// Read at every StartDevice (`pnputil /restart-device` applies it); mirrored as `FaKnob`.
+    /// `docs/kmd-rm-client.md` 15.18.15.
+    pub const FLIP_ANNOUNCE: KnobName = KnobName::new(b"FlipAnnounce");
+    /// `FlipAnnForeign` (default 0): with `FlipAnnounce` 2, also announce flips of foreign or
+    /// hollow allocations (the NVK DWM's swap chain). 0 announces the Venus class only.
+    /// `FlipAnnounce` 1 (the explicit foreign mode) ignores it. Read at every StartDevice; mirrored
+    /// in `FaKnob` (bit 16). The name is 14 characters, the lookup buffer's limit.
+    pub const FLIP_ANN_FOREIGN: KnobName = KnobName::new(b"FlipAnnForeign");
+    /// `MirrorThread` (default 1, 0 = off): run the registry mirror (`stall_diag::publish_counters`)
+    /// on its own thread, one pass a second (`ddi/mirror_thread.rs`). 0 is the kill switch: every
+    /// caller publishes inline on the HPD worker, as before v332. Read at every StartDevice and
+    /// mirrored as `MirThrEff`; a thread that could not be joined (`MirLeak` 1) turns it off for
+    /// the rest of the driver image's life.
+    pub const MIRROR_THREAD: KnobName = KnobName::new(b"MirrorThread");
+    /// `FlipBusyFly` (default 0, at most 4): how many pipelined `ForeignFlip` host flips may be in
+    /// flight while the worker still counts as idle for a `FlipAnnounce` (0 = none: strict: the
+    /// previous buffer is certainly no longer read when the next flip is announced; 1 lets the
+    /// announce run with one host flip in flight, trading a tear exposure of up to one more host
+    /// round trip for throughput). Only with `ForeignFlip` and `FfAsyncWin`; read once per
+    /// transport generation. `docs/kmd-rm-client.md` 15.18.15.
+    pub const FLIP_BUSY_FLY: KnobName = KnobName::new(b"FlipBusyFly");
+    /// `FlipEarlyWake` (default 0): the DDI asks for the device DPC that wakes the HPD worker the
+    /// moment a flip is pending, instead of the worker waiting for the next vsync tick; without
+    /// an announce the retire still waits for the worker's publication (one tick earlier on
+    /// average). Read at every StartDevice.
+    pub const FLIP_EARLY_WAKE: KnobName = KnobName::new(b"FlipEarlyWake");
+    /// `FlipLat` (default 1 = on, 0 = off): the flip retire latency / inter-flip interval /
+    /// vblank utilisation measurement (`FlipLat*`, `IfGap*`, `FlipP99Us`, `VbUsed`,
+    /// `VsLate*`): atomics in the DDI and the tick, mirrored once a second. Read at every
+    /// StartDevice.
+    pub const FLIP_LAT: KnobName = KnobName::new(b"FlipLat");
     /// `OutputTech` (default 1): the connector type the virtual monitor's child
     /// device reports to Windows. 1 = DisplayPort (external), 2 = HDMI, 3 = DVI,
     /// 4 = internal, 0 = HD15 (analog VGA, the historical value). Anything else

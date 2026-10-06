@@ -668,6 +668,7 @@ The canonical Windows build: every finished NVK-on-RM patch in one series.
 | 2 | `patches-windows/0014-0022` | Windows build, Win32 WSI, zero-copy Helios scanout (21), BAR heap (22) |
 | 3 | `patches-windows/0024` | block-linear scanout swapchains |
 | 4 | `patches-windows/0025` | BAR heap falls back to system memory when the CPU map fails |
+| 47 | `nvk/rm: a refused scanout export says why, once per device` | the WSI only printed `scanout images unavailable (-8)`: `nvkmd_rm_mem_export_scanout`'s reasons go through `vk_error*()`, silent in release builds. The first refusal per device is now a `mesa_logw` naming the cause (no Helios scanout, system-page backing, or a PTE kind / tile mode that does not match the modifier). For Superposition GL through Zink losing zero-copy on 22.22.320.1 |
 | 5 | `patches-windows/0026` | shader cache on Windows |
 | 6 | `patches-windows/0027-0029` | L2-cached sysmem, compression, ZCULL info (`NVK_RM_SYSMEM_CACHED=0`, `NVK_RM_COMPRESSION=0`, `NVK_RM_ZCULL=0`) |
 | 7 | `patches-windows/0035` | H.264 decode on NVDEC (`NVK_EXPERIMENTAL=video`) |

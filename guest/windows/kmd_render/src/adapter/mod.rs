@@ -1478,6 +1478,8 @@ impl AdapterContext {
 
         // The seed again, last: ending the leases above publishes a withheld old-generation
         // address (`publish_displayed_primary`) that must not displace what dxgkrnl waits for.
+        // An unconfirmed announcement of the old generation must not drop the next publication.
+        crate::ddi::flip_announce::forget_unconfirmed();
         self.last_primary_address.store(
             helios_kmd_logic::restart_flip::seed_address(
                 crate::ddi::stall_diag::last_issued_address(),
@@ -1622,6 +1624,14 @@ impl AdapterContext {
     /// addresses, and the desktop froze with two overwritten DWORDs as the only
     /// trace — a failure indistinguishable from a hang.
     pub(crate) fn publish_displayed_primary(&self, primary: ProgrammedPrimary) {
+        // `FlipAnnounce` (`ddi::flip_announce`): with nothing announced this is one acquire load
+        // and the store below, exactly as before. The announced flip's own publication is
+        // already stored (swallowed), and an OLDER address after a newer announce is dropped.
+        // `FlipPrgLat*`: the programming of this flip is done (announced or not).
+        crate::ddi::flip_lat::note_published(primary.address);
+        if !crate::ddi::flip_announce::funnel(primary.address) {
+            return;
+        }
         self.last_primary_address
             .store(primary.address, Ordering::Release);
         // `FlipPub` / `FlipPubT` (`ddi::stall_diag`): every publication, bound or kept, any

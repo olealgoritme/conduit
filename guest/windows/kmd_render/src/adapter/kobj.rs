@@ -115,6 +115,10 @@ impl AdapterContext {
         };
         if st == STATUS_SUCCESS && !handle.is_null() {
             self.hpd_thread.store(handle as usize, Ordering::Release);
+            // The registry mirror's own thread (`ddi::mirror_thread`): the worker only requests
+            // a publish pass, it does not spend tens of milliseconds between two flips on one.
+            // SAFETY: PASSIVE_LEVEL (StartDevice).
+            unsafe { crate::ddi::mirror_thread::start() };
         } else {
             // 0x0B00_00EA = HPD-worker-create-failed. It was 0x0B00_00E7, which
             // ddi/lifecycle.rs also records for venus-bring-up-failed — and BOTH
@@ -151,6 +155,8 @@ impl AdapterContext {
     /// PASSIVE_LEVEL — it blocks on the worker's exit.
     pub fn stop_hpd(&self) {
         use core::sync::atomic::Ordering;
+        // The mirror thread first (idempotent): from here the callers publish inline again.
+        crate::ddi::mirror_thread::stop();
         let h = self.hpd_thread.swap(0, Ordering::AcqRel);
         if h == 0 {
             return;
@@ -855,6 +861,8 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         // `now` whenever the DPC is late would turn normal dispatch latency
         // into cumulative phase drift, defeating the one-shot scheme.
         let anchor = if previous == 0 { now } else { previous };
+        // `VsLate*`: how late this tick ran against the deadline it was scheduled for.
+        crate::ddi::flip_lat::note_tick_late(now, anchor);
         let period = helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(adapter));
         // Gap statistics (diag `VsMinGap` / `VsFast`): the evidence that the
         // heartbeat does not burst. A few relaxed accesses, no lock and no
@@ -910,7 +918,7 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         crate::ddi::stall_diag::note_gate_closed_tick();
         // `FfAsyncWin`: a programming pending behind a closed gate is not waited on for a tick
         // that will deliver; the heartbeat runs regardless, so it wakes the worker here.
-        if crate::virtio::foreign_flip::early_wake()
+        if (crate::virtio::foreign_flip::early_wake() || crate::ddi::flip_announce::wakes_early())
             && adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0
         {
             crate::virtio::foreign_flip::note_gate_wake();
@@ -929,6 +937,8 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     // is therefore the truthful address to report.
     //
     let phys = adapter.last_primary_address.load(Ordering::Acquire) as i64;
+    // `FlipLat`: the instant just after the address was read (a flip issued later is not in it).
+    let phys_t = crate::adapter::foreign_scanout::now_100ns();
     // SAFETY: live callback interface; signal_crtc_vsync raises to DIRQL internally
     // via DxgkCbSynchronizeExecution and delivers the CRTC_VSYNC packet.
     // `VsCbSyncB` / `VsCbSyncOk` / `VsCbSyncT`: a sync that begins and never returns is visible.
@@ -941,6 +951,15 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     crate::ddi::stall_diag::cb_sync_end(status);
     let epoch = adapter.scanout_bound_epoch.load(Ordering::Acquire);
     if status == STATUS_SUCCESS {
+        // `FlipLat*` / `IfGap*` / `VbUsed`: a CRTC_VSYNC carrying `phys` was delivered; the flip
+        // with that address (if any) retires here.
+        crate::ddi::flip_lat::on_delivered_tick(
+            adapter,
+            phys as u64,
+            tick_time_100ns,
+            phys_t,
+            helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(adapter)),
+        );
         // Record every callback that actually reached dxgkrnl. At ~60 Hz the
         // fixed 32768-entry ring retains several minutes, and this is the
         // causal heartbeat a trace needs rather than a stale sampled mirror.

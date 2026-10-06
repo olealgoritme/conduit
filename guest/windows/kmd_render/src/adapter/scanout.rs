@@ -206,6 +206,18 @@ impl AdapterContext {
         self.publish_displayed_primary(super::ProgrammedPrimary::kept_picture(address));
     }
 
+    /// `FlipAnnounce`: publish a flip's address AT `SetVidPnSourceAddress` (DIRQL), before the
+    /// worker programmed it, so the very next CRTC_VSYNC tick retires the flip. One atomic store
+    /// plus the `FlipPub` census, legal at any IRQL; it does NOT go through
+    /// `publish_displayed_primary` (whose funnel would swallow it as the worker's confirmation)
+    /// and does not feed the lease census (`LsPub`): nothing was bound. The caller
+    /// (`ddi::flip_announce::at_ddi`) has decided; the worker's later publication of the same
+    /// address is swallowed by the funnel.
+    pub(crate) fn publish_announced_primary(&self, address: u64) {
+        self.last_primary_address.store(address, Ordering::Release);
+        crate::ddi::stall_diag::note_published(address);
+    }
+
     /// Mark already-completed scanout contents dirty. The normal copied path
     /// does this from the ring-1 GPU-completion DPC; the direct-primary
     /// zero-copy case has no KMD GPU submission, so SetVidPn uses this after
@@ -698,7 +710,7 @@ impl AdapterContext {
         }
 
         // The stall-diagnosis block rides the same periodic mirror (`ddi::stall_diag`).
-        crate::ddi::stall_diag::publish_counters();
+        crate::ddi::stall_diag::request_publish();
         crate::diag::record_named_bytes(b"RfRid", resource_id);
         crate::diag::record_named_bytes(b"RfWH", (width << 16) | (height & 0xFFFF));
         crate::diag::record_named_bytes(b"RfCnt", n);
