@@ -3223,11 +3223,13 @@ unsafe fn create_one(
         if is_primary {
             crate::diag::record(0x0C3E_0000 | (resource_id & 0xFFFF));
         }
-        // `KmdRmSysCache` = 2: the RM system-memory primary asks dxgkrnl for a write-back
-        // view too (an experiment: the Cached-with-Primary refusal of the 36th session).
+        // `KmdRmSysCache` = 2 (an opt-in; the default is write-combined memory with no
+        // `Cached`): the RM system-memory primary asks dxgkrnl for a write-back view too (an
+        // experiment: the Cached-with-Primary refusal of the 36th session). Only for a primary
+        // the RM service made.
         let rm_primary_cached = is_primary
             && matches!(foreign_backing, ForeignBacking::Adopted(_))
-            && crate::virtio::rm_client::sysmem::primary_cached_flag();
+            && crate::virtio::rm_client::sysmem::primary_cached_flag(resource_id);
         if adapter.alloc_cached() && (placement.cached || rm_primary_cached) {
             info.__bindgen_anon_4
                 .FlagsWddm2

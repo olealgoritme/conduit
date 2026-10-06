@@ -29,6 +29,8 @@ use crate::foreign_resource::{
 };
 use crate::foreign_scanout::{Layout as FlipLayout, MAX_DIM, MAX_STRIDE, MIN_DIM};
 use crate::rm_client::{MAX_SURFACE_BYTES, MEM_ALLOC_BYTES};
+use crate::rm_present::Inputs;
+use crate::scanout_release::{ring_wait, Wait};
 
 /// The `KmdRmClient` value that turns this on.
 pub const LEVEL: u32 = 5;
@@ -336,28 +338,47 @@ impl Cache {
 ///
 /// dxgkrnl maps a CpuVisible allocation's aperture write-combined unless the allocation
 /// carries `Cached`, and rejected `Cached` together with the primary (the 36th-session
-/// finding), so the primary's own CPU view is write-combined by default. The host
-/// measured write-combined access to this memory at 28 MB/s (writes) and 75 MB/s
-/// (reads) against 28 GB/s for cached reads, so the default is cached memory and the
-/// alias with dxgkrnl's view is the first thing the hardware run checks (15.7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// finding), so the primary's own CPU view is write-combined whatever memory sits behind
+/// it. Cached memory behind that view would be a write-back / write-combined ALIAS of the
+/// same physical pages, a mixed-attribute mapping that is architecturally invalid and that
+/// nobody has measured on this stack, so it is NOT the default: the default is
+/// write-combined memory, every view of which agrees with dxgkrnl's (parity with the
+/// Venus primary, whose aperture view was write-combined too: GDI reads were already
+/// write-combined). The cached variants are explicit opt-ins for the hardware run that
+/// measures them (15.5, 15.13).
+///
+/// The knob values (anything else, 0 included, is the default: an unknown value never
+/// picks an alias):
+///
+/// | value | variant | memory | dxgkrnl's view | alias |
+/// |---|---|---|---|---|
+/// | 0 (absent) | [`PrimaryCache::WriteCombine`] | write-combined | write-combined | no |
+/// | 1 | [`PrimaryCache::WriteCombine`] | the same, spelled out | | no |
+/// | 2 | [`PrimaryCache::CachedFlag`] | cached | write-back (asked with `Cached`) | no if dxgkrnl takes it |
+/// | 3 | [`PrimaryCache::CachedAlias`] | cached | write-combined | YES |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PrimaryCache {
-    /// 0 (default): cached system memory; dxgkrnl's view stays write-combined.
-    Cached,
-    /// 1: write-combined system memory: every view agrees with dxgkrnl's, no alias, and
-    /// reads and writes are slow. The kill switch for the alias.
+    /// 0 / 1 (default): write-combined system memory: every view agrees with dxgkrnl's, no
+    /// alias. Slow reads and writes (the host measured 75 MB/s and 28 MB/s), the same as the
+    /// primary's mapping is today.
+    #[default]
     WriteCombine,
-    /// 2: cached system memory AND the `Cached` flag on the primary, so dxgkrnl maps it
-    /// write-back too. An experiment: dxgkrnl may refuse the allocation.
+    /// 2 (opt-in experiment): cached system memory AND the `Cached` flag on the primary, so
+    /// dxgkrnl maps it write-back too and there is no alias. dxgkrnl may refuse the
+    /// allocation.
     CachedFlag,
+    /// 3 (opt-in): cached system memory while dxgkrnl's view stays write-combined: a mixed
+    /// attribute alias of the same pages (counted, `RmSysAlias`), fast for the KMD's own
+    /// kernel maps. Only for a run that watches for stale lines.
+    CachedAlias,
 }
 
 impl PrimaryCache {
     pub const fn from_knob(v: u32) -> Self {
         match v {
-            1 => PrimaryCache::WriteCombine,
             2 => PrimaryCache::CachedFlag,
-            _ => PrimaryCache::Cached,
+            3 => PrimaryCache::CachedAlias,
+            _ => PrimaryCache::WriteCombine,
         }
     }
 
@@ -365,7 +386,7 @@ impl PrimaryCache {
     pub const fn sysmem(self) -> Cache {
         match self {
             PrimaryCache::WriteCombine => Cache::WriteCombine,
-            _ => Cache::Cached,
+            PrimaryCache::CachedFlag | PrimaryCache::CachedAlias => Cache::Cached,
         }
     }
 
@@ -385,7 +406,9 @@ impl PrimaryCache {
     }
 
     /// Whether the memory and dxgkrnl's view of it differ in cache attribute (an alias
-    /// of the same pages). Counted (`RmSysAlias`), never a refusal: it is the default.
+    /// of the same pages). Counted (`RmSysAlias`), never a refusal. It exists only when the
+    /// alias was asked for (`CachedAlias`), or `Cached` was asked for and `AllocCached`
+    /// took it away; the default never has one.
     pub const fn aliases(self, alloc_cached: bool) -> bool {
         !matches!(
             (self.sysmem(), self.dxgkrnl_view(alloc_cached)),
@@ -708,6 +731,140 @@ pub fn target_ready(t: Option<&Target>, epoch: u64) -> bool {
     t.is_some_and(|t| t.epoch == epoch && epoch != 0)
 }
 
+// ---- the flip service's inputs, and the release seam ------------------------------------
+
+/// The presenter inputs of one level 5 pass. The flip service is the level 3 presenter
+/// with a ring of ONE, and a ring of one never waits for a release: the one buffer is
+/// the one on the scanout, and the host never releases the buffer on the scanout (it is
+/// replaced only by itself, a re-flip, and "a buffer flipped again is released again
+/// later"). `release_tracked` is therefore always `false` here: the answer to "has the
+/// host released the surface the next frame writes" is not asked, because the surface the
+/// next frame writes is the one on screen (the CPU keeps writing the primary in place,
+/// the flip only tells the viewer it changed). The presenter itself agrees
+/// (`Presenter::back_wait_seq` is `None` for a one-surface ring, tested below), so even
+/// real release answers could not hold a flip; this makes it a fact of the call, not a
+/// property to rediscover.
+pub const fn flip_inputs(
+    now: u64,
+    ready: bool,
+    arbiter_has_resident: bool,
+    foreground: bool,
+    frame_edge: bool,
+    resume_edge: bool,
+) -> Inputs {
+    Inputs {
+        now,
+        ring_ready: ready,
+        source_ok: ready,
+        arbiter_has_resident,
+        foreground,
+        frame_edge,
+        resume_edge,
+        release_tracked: false,
+        back_released: true,
+    }
+}
+
+/// What the viewer was last told to show, and the buffer that flip replaced: the facts the
+/// one place that can WAIT for the host's `ScanoutReleased` needs, which is the close of a
+/// GEM (a flip never waits, see [`CloseWait`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlipLog {
+    /// `(gem, seq)` of the newest flip the host took.
+    cur: Option<(u32, u64)>,
+    /// The previous DIFFERENT buffer: `(gem, its newest seq, when the flip that replaced
+    /// it was taken)`. Only one is kept: a buffer replaced twice ago is long released (or
+    /// aged out of the book) and a close that finds nothing goes ahead.
+    prev: Option<(u32, u64, u64)>,
+}
+
+/// What closing GEM `gem` has to wait for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseWait {
+    /// Nothing: the GEM was never flipped, is the buffer ON the scanout (the host never
+    /// releases that one: waiting would last until the limit for nothing), or is older
+    /// than the log remembers.
+    Free,
+    /// The GEM was shown and then replaced by another buffer's flip taken at `at`
+    /// (100 ns): the host's release of flip `seq` is due, and the book answers
+    /// `is_done(seq)`.
+    Replaced { seq: u64, at: u64 },
+}
+
+impl FlipLog {
+    pub const fn new() -> Self {
+        FlipLog {
+            cur: None,
+            prev: None,
+        }
+    }
+
+    /// The host took the flip of `gem` as `seq` at `now`.
+    pub fn flipped(&mut self, gem: u32, seq: u64, now: u64) {
+        match self.cur {
+            // A re-flip of the buffer on the scanout (the ring of one's whole life): still
+            // the current buffer, nothing was replaced.
+            Some((g, _)) if g == gem => self.cur = Some((gem, seq)),
+            Some((g, s)) => {
+                self.prev = Some((g, s, now.max(1)));
+                self.cur = Some((gem, seq));
+            }
+            None => self.cur = Some((gem, seq)),
+        }
+        // A buffer that is shown again is not a replaced one any more.
+        if matches!(self.prev, Some((g, _, _)) if g == gem) {
+            self.prev = None;
+        }
+    }
+
+    /// What a close of `gem` must wait for.
+    pub fn closing(&self, gem: u32) -> CloseWait {
+        match self.prev {
+            Some((g, seq, at)) if g == gem => CloseWait::Replaced { seq, at },
+            _ => CloseWait::Free,
+        }
+    }
+
+    /// `gem` was closed: nothing is remembered of it (the host forgets it with no event).
+    pub fn forget(&mut self, gem: u32) {
+        if matches!(self.cur, Some((g, _)) if g == gem) {
+            self.cur = None;
+        }
+        if matches!(self.prev, Some((g, _, _)) if g == gem) {
+            self.prev = None;
+        }
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::new();
+    }
+}
+
+impl Default for FlipLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The wait rule of a GEM close: `released` is the book's answer for `w`'s `seq`. The
+/// same rule and the same 500 ms limit, from the replacing flip, as the level 3 ring
+/// presenter's wait (`scanout_release::ring_wait`: the host overrules a client that holds
+/// a replaced buffer after 500 ms, and so does the close).
+///
+/// THE RELEASE SEAM, decided. A level 5 FLIP never waits for a release: the buffer it
+/// shows is either the one already on the scanout (a re-flip: never released while shown,
+/// so a wait would last the whole limit for nothing, every frame) or ANOTHER primary (a
+/// mode change), whose flip is itself what makes the host release the previous one: a
+/// wait before it could only time out. The one thing that can need a release is giving
+/// the memory back: the GEM of a primary that WAS replaced is closed (and its RM memory
+/// freed) only once the host released it, or the limit passed.
+pub fn close_gate(w: CloseWait, released: bool, now: u64) -> Wait {
+    match w {
+        CloseWait::Free => Wait::Go,
+        CloseWait::Replaced { at, .. } => ring_wait(released, at, now),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -881,25 +1038,99 @@ mod tests {
     // ---- the cache attribute -------------------------------------------------------
 
     #[test]
-    fn the_primary_is_cached_by_default_and_the_alias_is_named() {
-        let d = PrimaryCache::from_knob(0);
-        assert_eq!(d, PrimaryCache::Cached);
-        assert_eq!(d.sysmem(), Cache::Cached);
-        assert!(!d.cached_flag());
-        assert_eq!(d.dxgkrnl_view(true), Cache::WriteCombine);
-        assert!(d.aliases(true), "cached memory under dxgkrnl's WC view");
-        let wc = PrimaryCache::from_knob(1);
-        assert_eq!(wc.sysmem(), Cache::WriteCombine);
-        assert!(!wc.aliases(true));
-        assert!(!wc.aliases(false));
+    fn the_primary_is_write_combined_by_default_and_has_no_alias() {
+        // The default, the absent knob and the explicit 1 are the same thing.
+        for v in [0, 1] {
+            let d = PrimaryCache::from_knob(v);
+            assert_eq!(d, PrimaryCache::WriteCombine);
+            assert_eq!(d, PrimaryCache::default());
+            assert_eq!(d.sysmem(), Cache::WriteCombine);
+            assert!(
+                !d.cached_flag(),
+                "the default never asks dxgkrnl for Cached"
+            );
+            assert_eq!(d.dxgkrnl_view(true), Cache::WriteCombine);
+            assert_eq!(d.dxgkrnl_view(false), Cache::WriteCombine);
+            assert!(
+                !d.aliases(true),
+                "write-combined memory, write-combined view"
+            );
+            assert!(
+                !d.aliases(false),
+                "the AllocCached kill switch changes nothing"
+            );
+        }
+        // An unknown value is the default, never an alias.
+        for v in [4, 5, 77, u32::MAX] {
+            let d = PrimaryCache::from_knob(v);
+            assert_eq!(d, PrimaryCache::WriteCombine);
+            assert!(!d.aliases(true));
+        }
+    }
+
+    #[test]
+    fn the_cached_variants_are_explicit_opt_ins() {
+        // 2: cached memory and the Cached flag: no alias if dxgkrnl takes it.
         let flag = PrimaryCache::from_knob(2);
+        assert_eq!(flag, PrimaryCache::CachedFlag);
+        assert_eq!(flag.sysmem(), Cache::Cached);
         assert!(flag.cached_flag());
         assert_eq!(flag.dxgkrnl_view(true), Cache::Cached);
         assert!(!flag.aliases(true));
-        // The AllocCached kill switch takes the flag away again.
+        // The AllocCached kill switch takes the flag away again: now it IS an alias.
         assert_eq!(flag.dxgkrnl_view(false), Cache::WriteCombine);
         assert!(flag.aliases(false));
-        assert_eq!(PrimaryCache::from_knob(77), PrimaryCache::Cached);
+        // 3: cached memory under dxgkrnl's write-combined view: the named alias.
+        let alias = PrimaryCache::from_knob(3);
+        assert_eq!(alias, PrimaryCache::CachedAlias);
+        assert_eq!(alias.sysmem(), Cache::Cached);
+        assert!(!alias.cached_flag());
+        assert_eq!(alias.dxgkrnl_view(true), Cache::WriteCombine);
+        assert!(alias.aliases(true), "cached memory under dxgkrnl's WC view");
+        assert!(alias.aliases(false));
+    }
+
+    /// Whatever the knob says, the memory is aliased only by an opt-in value.
+    #[test]
+    fn only_the_opt_in_values_can_alias() {
+        for v in 0..=8u32 {
+            for alloc_cached in [false, true] {
+                let aliases = PrimaryCache::from_knob(v).aliases(alloc_cached);
+                let opted_in = v == 3 || (v == 2 && !alloc_cached);
+                assert_eq!(aliases, opted_in, "knob {v} alloc_cached {alloc_cached}");
+            }
+        }
+    }
+
+    /// The request the default sends is write-combined system memory, decoded the way the
+    /// host decodes what RM writes back (`RmPlacement`: location in bits 26:25, coherency in
+    /// 31:29): PCI, coherency 2 = write-combine. RM answers `0x4a800000` for it (and
+    /// `0x2a800000` for the cached request: the same transformation, bit 28 cleared and bit
+    /// 23 set).
+    #[test]
+    fn the_default_request_asks_rm_for_write_combined_system_memory() {
+        let want = PrimaryCache::default().sysmem();
+        let p = params(7, want, 4096);
+        let attr = rd32(&p, 24);
+        assert_eq!(attr, 0x5a00_0000);
+        assert_eq!(attr, ATTR_WC);
+        assert_eq!(
+            (attr >> 25) & 3,
+            1,
+            "NVOS32_ATTR_LOCATION_PCI: system memory"
+        );
+        assert_eq!(attr >> 29, 2, "NVOS32_ATTR_COHERENCY_WRITE_COMBINE");
+        // What RM writes back: the host's contract values.
+        let written_back = |a: u32| (a & !0x1000_0000) | 0x0080_0000;
+        assert_eq!(written_back(ATTR_WC), 0x4a80_0000);
+        assert_eq!(written_back(ATTR_CACHED), 0x2a80_0000);
+        assert_eq!(written_back(ATTR_WC) >> 29, 2);
+        assert_eq!(written_back(ATTR_CACHED) >> 29, 1);
+        // The cached request is only ever made by an opt-in value.
+        for v in [2, 3] {
+            let c = PrimaryCache::from_knob(v).sysmem();
+            assert_eq!(rd32(&params(7, c, 4096), 24), ATTR_CACHED);
+        }
     }
 
     #[test]
@@ -910,6 +1141,32 @@ mod tests {
         assert!(!host_cache_ok(Cache::Cached, MAP_CACHE_UNCACHED));
         assert!(!host_cache_ok(Cache::WriteCombine, MAP_CACHE_CACHED));
         assert!(!host_cache_ok(Cache::WriteCombine, 0));
+    }
+
+    /// The trial map's check follows what the memory was made with, so it guards the
+    /// DEFAULT too: a host that reports cached or uncached for the write-combined memory
+    /// the default asks for is refused (Venus), for every knob value.
+    #[test]
+    fn the_trial_check_guards_the_default_and_every_opt_in() {
+        let default = PrimaryCache::default().sysmem();
+        assert!(host_cache_ok(default, MAP_CACHE_WC));
+        assert!(!host_cache_ok(default, MAP_CACHE_CACHED));
+        assert!(!host_cache_ok(default, MAP_CACHE_UNCACHED));
+        for v in 0..=8u32 {
+            let made = PrimaryCache::from_knob(v).sysmem();
+            let agrees = if made == Cache::WriteCombine {
+                MAP_CACHE_WC
+            } else {
+                MAP_CACHE_CACHED
+            };
+            for nibble in [0, MAP_CACHE_CACHED, MAP_CACHE_UNCACHED, MAP_CACHE_WC, 0xf] {
+                assert_eq!(
+                    host_cache_ok(made, nibble),
+                    nibble == agrees,
+                    "knob {v} nibble {nibble}"
+                );
+            }
+        }
     }
 
     // ---- the service ---------------------------------------------------------------
@@ -1092,15 +1349,7 @@ mod tests {
                 self.arb.resident().is_some(),
                 self.arb.resident_foreground(),
             );
-            let i = Inputs {
-                now: self.now,
-                ring_ready: self.tgt.is_some(),
-                source_ok: self.tgt.is_some(),
-                arbiter_has_resident: has,
-                foreground: fg,
-                frame_edge: frame,
-                resume_edge: resume,
-            };
+            let i = flip_inputs(self.now, self.tgt.is_some(), has, fg, frame, resume);
             let act = self.p.decide(i);
             match act {
                 Act::Register => {
@@ -1249,5 +1498,158 @@ mod tests {
         assert!(m.p.gave_up());
         assert!(m.arb.resident().is_none());
         assert_eq!(m.flips, [10]);
+    }
+
+    // ---- the release seam ---------------------------------------------------------------
+
+    use crate::scanout_release::{ReleaseBook, RING_WAIT_100NS};
+
+    /// Even the real release answers could not hold a one-surface ring's flip: the surface
+    /// to write is the one on screen, which the host never releases.
+    #[test]
+    fn a_ring_of_one_never_waits_for_a_release_that_cannot_come() {
+        let mut p = Presenter::new(1);
+        let mut t = 10 * MS;
+        let first = Inputs {
+            now: t,
+            ring_ready: true,
+            source_ok: true,
+            arbiter_has_resident: false,
+            foreground: true,
+            frame_edge: true,
+            resume_edge: false,
+            // The values a ring client would pass: releases tracked, nothing released.
+            release_tracked: true,
+            back_released: false,
+        };
+        assert_eq!(p.decide(first), Act::Register);
+        p.registration(true, t);
+        let mut i = Inputs {
+            arbiter_has_resident: true,
+            ..first
+        };
+        assert_eq!(p.decide(i), Act::CopyFlip { slot: 0 });
+        p.flipped(0, true, FlipResult::Shown, t);
+        p.note_seq(0, 5);
+        assert_eq!(
+            p.back_wait_seq(),
+            None,
+            "the buffer to write is the one shown"
+        );
+        // Frame after frame, a re-flip of the same buffer is never held, at any time.
+        for k in 1..50u64 {
+            t += 20 * MS + k;
+            i.now = t;
+            i.frame_edge = true;
+            assert_eq!(p.decide(i), Act::CopyFlip { slot: 0 }, "frame {k}");
+            p.flipped(0, true, FlipResult::Shown, t);
+            p.note_seq(0, 5 + k);
+        }
+        // And the inputs the driver actually passes never ask.
+        let d = flip_inputs(t, true, true, true, true, false);
+        assert!(!d.release_tracked && d.back_released);
+        assert!(d.ring_ready && d.source_ok);
+    }
+
+    #[test]
+    fn a_reflipped_buffer_is_never_something_a_close_waits_for() {
+        let mut log = FlipLog::new();
+        log.flipped(10, 1, 100);
+        // The same buffer again and again: the current one, never released while shown.
+        for k in 2..20u64 {
+            log.flipped(10, k, 100 + k);
+            assert_eq!(log.closing(10), CloseWait::Free);
+        }
+        // Whatever the book says (the book never releases the buffer on the scanout), the
+        // gate lets a free close through at once and at any time.
+        for released in [false, true] {
+            assert_eq!(close_gate(CloseWait::Free, released, 0), Wait::Go);
+            assert_eq!(close_gate(CloseWait::Free, released, u64::MAX), Wait::Go);
+        }
+        assert_eq!(log.closing(99), CloseWait::Free, "never flipped");
+    }
+
+    #[test]
+    fn a_replaced_primary_is_waited_for_until_the_host_releases_it_or_the_limit() {
+        let mut log = FlipLog::new();
+        log.flipped(10, 1, 100);
+        log.flipped(10, 2, 200); // re-flip
+        log.flipped(11, 3, 1_000); // a new primary replaces it
+        assert_eq!(log.closing(11), CloseWait::Free, "the shown one");
+        let w = log.closing(10);
+        assert_eq!(w, CloseWait::Replaced { seq: 2, at: 1_000 });
+        let until = 1_000 + RING_WAIT_100NS;
+        // Not released: held until the limit, counted from the replacing flip.
+        assert_eq!(close_gate(w, false, 1_001), Wait::Hold { until });
+        assert_eq!(close_gate(w, false, until - 1), Wait::Hold { until });
+        // The limit passes: the close goes ahead (the same overrule as the host's).
+        assert_eq!(close_gate(w, false, until), Wait::TimedOut);
+        assert_eq!(close_gate(w, false, until + 5 * MS), Wait::TimedOut);
+        // Released: go.
+        assert_eq!(close_gate(w, true, 1_001), Wait::Go);
+    }
+
+    #[test]
+    fn the_log_follows_a_buffer_that_comes_back_and_forgets_a_closed_one() {
+        let mut log = FlipLog::new();
+        log.flipped(10, 1, 100);
+        log.flipped(11, 2, 200);
+        assert!(matches!(log.closing(10), CloseWait::Replaced { .. }));
+        // 10 is shown again: it is current, not replaced; 11 is the replaced one now.
+        log.flipped(10, 3, 300);
+        assert_eq!(log.closing(10), CloseWait::Free);
+        assert_eq!(log.closing(11), CloseWait::Replaced { seq: 2, at: 300 });
+        log.forget(11);
+        assert_eq!(log.closing(11), CloseWait::Free);
+        log.forget(10);
+        log.flipped(12, 4, 400); // nothing current: nothing replaced
+        assert_eq!(log.closing(10), CloseWait::Free);
+        log.clear();
+        assert_eq!(log, FlipLog::new());
+    }
+
+    /// The release book's own account of the same facts: the buffer on the scanout is
+    /// never done (so nothing may wait for it), a replaced one is once the host says so.
+    #[test]
+    fn the_book_agrees_with_the_log_on_what_can_be_waited_for() {
+        const DRM: u32 = 5;
+        const KMD: usize = usize::MAX;
+        let mut b = ReleaseBook::new();
+        let mut log = FlipLog::new();
+        let mut seq = 0u64;
+        let mut flip = |b: &mut ReleaseBook, log: &mut FlipLog, gem: u32, t: u64| {
+            seq += 1;
+            b.minted(seq, KMD, DRM, gem);
+            assert!(b.sent(seq, t).is_some());
+            log.flipped(gem, seq, t);
+            seq
+        };
+        flip(&mut b, &mut log, 10, 100);
+        let s2 = flip(&mut b, &mut log, 10, 200);
+        // The current buffer: the book says "not done" for ever, the log says "do not wait".
+        assert!(!b.is_done(s2, 10 * RING_WAIT_100NS));
+        assert_eq!(log.closing(10), CloseWait::Free);
+        // A new primary replaces it: now the host's release is expected.
+        let s3 = flip(&mut b, &mut log, 11, 1_000);
+        let CloseWait::Replaced { seq: waits_for, at } = log.closing(10) else {
+            panic!("replaced");
+        };
+        assert_eq!((waits_for, at), (s2, 1_000));
+        assert!(!b.is_done(s2, 1_001));
+        assert_eq!(
+            close_gate(log.closing(10), b.is_done(s2, 1_001), 1_001),
+            Wait::Hold {
+                until: 1_000 + RING_WAIT_100NS
+            }
+        );
+        // The host's ScanoutReleased(owner handle, gem, newest seq of that gem).
+        b.released(DRM, 10, s2);
+        assert_eq!(
+            close_gate(log.closing(10), b.is_done(s2, 1_002), 1_002),
+            Wait::Go
+        );
+        // The new current buffer is still never done.
+        assert!(!b.is_done(s3, 1_002));
+        assert_eq!(log.closing(11), CloseWait::Free);
     }
 }

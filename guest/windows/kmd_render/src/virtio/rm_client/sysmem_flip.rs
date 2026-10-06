@@ -17,14 +17,19 @@
 //! alone for every other allocation, and withdraws the resident source when the screen's
 //! source stops being an RM primary ([`other_source`]).
 //!
-//! THE RELEASE SEAM. A flip's `seq` is recorded ([`LAST_SEQ`] with [`LAST_GEM`]). When the
-//! viewer's release event (`ScanoutReleased`, the other agent's `kmd/scanout-release`)
-//! arrives it names a `seq`: the places that will want it are marked `RELEASE SEAM` below
-//! and in `sysmem::released` (a GEM must not be closed while the viewer still samples
-//! it: today the host's own dma-buf reference makes closing safe, and nothing waits).
+//! THE RELEASE SEAM (`docs/kmd-rm-client.md` 15.7, decided). The KMD's flips are entered in the
+//! host-release book by `present_within` like every other flip (`virtio/scanout_release.rs`).
+//! A flip here NEVER waits for a release: the buffer it shows is the one already on the
+//! scanout (a re-flip, the whole life of a ring of one: the host never releases the buffer on
+//! the scanout, so a wait could only last its limit, every frame) or another primary (a mode
+//! change), whose flip is what makes the host release the previous one. The presenter is
+//! given `release_tracked = false` for that reason (`rm_sysmem::flip_inputs`). What CAN wait
+//! is giving the memory back: [`log_flip`] keeps which buffer the newest flip replaced, and
+//! `sysmem::released` holds the GEM close of a REPLACED primary until the host released it,
+//! for at most 500 ms from the replacing flip (`rm_sysmem::close_gate`).
 //!
-//! LOCKING. `TARGET` and `PRES` are leaf spinlocks over plain data, never held across I/O
-//! or another lock and never held together. Everything that sends runs with no lock.
+//! LOCKING. `TARGET`, `PRES` and `FLIPS` are leaf spinlocks over plain data, never held across
+//! I/O or another lock and never held together. Everything that sends runs with no lock.
 
 use super::sysmem::live_gem;
 use crate::adapter::AdapterContext;
@@ -34,8 +39,8 @@ use crate::virtio::foreign_scanout::{present_within, PresentRefusal};
 use crate::virtio::gpu::DeviceOwner;
 use crate::virtio::rm_present;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use helios_kmd_logic::rm_present::{Act, FlipResult, Inputs, Presenter};
-use helios_kmd_logic::rm_sysmem::{self as rs, Change, Target, TargetBook};
+use helios_kmd_logic::rm_present::{Act, FlipResult, Presenter};
+use helios_kmd_logic::rm_sysmem::{self as rs, Change, CloseWait, FlipLog, Target, TargetBook};
 
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;
 
@@ -60,9 +65,11 @@ static PRES: SpinLock<PState> = SpinLock::new(PState {
 });
 static TARGET: SpinLock<TargetBook> = SpinLock::new(TargetBook::new());
 static YIELDS: AtomicU32 = AtomicU32::new(0);
-/// The `seq` of the last flip the host took and the GEM it named (the RELEASE SEAM).
+/// What the host was last told to show and the buffer that replaced (the release seam: a
+/// leaf spinlock over plain data, held for a few stores, never across I/O).
+static FLIPS: SpinLock<FlipLog> = SpinLock::new(FlipLog::new());
+/// The `seq` of the last flip the host took.
 pub static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
-pub static LAST_GEM: AtomicU32 = AtomicU32::new(0);
 
 // Counters (names at most 14 characters): `RmSysProg` primaries programmed (each is a
 // `SetVidPnSourceAddress` of an RM primary), `RmSysProgBad` refused (a layout that is not
@@ -115,7 +122,7 @@ pub(super) fn reset() {
     }
     YIELDS.store(0, Ordering::Relaxed);
     LAST_SEQ.store(0, Ordering::Relaxed);
-    LAST_GEM.store(0, Ordering::Relaxed);
+    FLIPS.lock().clear();
     rm_present::clear_wake_at();
 }
 
@@ -252,15 +259,8 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         let target = TARGET.lock().current();
         let ready = rs::target_ready(target.as_ref(), epoch);
         let (has_resident, foreground) = adapter.foreign_scanout_resident_state();
-        let inputs = Inputs {
-            now: t,
-            ring_ready: ready,
-            source_ok: ready,
-            arbiter_has_resident: has_resident,
-            foreground,
-            frame_edge,
-            resume_edge,
-        };
+        // A ring of one: no release is ever waited for (`rm_sysmem::flip_inputs`).
+        let inputs = rs::flip_inputs(t, ready, has_resident, foreground, frame_edge, resume_edge);
         frame_edge = false;
         resume_edge = false;
         let (act, word, gave_up) = {
@@ -367,18 +367,32 @@ fn flip(passive: PassiveLevel, adapter: &AdapterContext, target: Option<Target>)
     }
     // SAFETY: SSE2 is baseline on x86_64.
     unsafe { core::arch::x86_64::_mm_sfence() };
-    // RELEASE SEAM: when the viewer's release event exists, the previous GEM's release is
-    // what a flip to ANOTHER primary would wait for; a re-flip of the same one never waits
-    // (the viewer holds it for as long as it is shown).
+    // No wait for a release here, by design (module docs): a re-flip of the shown buffer is
+    // never released, and a flip to another primary is what releases the previous one.
     match present_within(passive, adapter, KMD, t.drm, t.gem, FLIP_TIMEOUT_MS) {
         Ok(seq) => {
             LAST_SEQ.store(seq, Ordering::Relaxed);
-            LAST_GEM.store(t.gem, Ordering::Relaxed);
+            log_flip(t.gem, seq);
             FlipResult::Shown
         }
         Err(PresentRefusal::NoSource) => FlipResult::Yielded,
         Err(_) => FlipResult::Failed,
     }
+}
+
+/// The host took the flip of `gem` as `seq`: remember it for the close of a replaced primary.
+fn log_flip(gem: u32, seq: u64) {
+    FLIPS.lock().flipped(gem, seq, now());
+}
+
+/// What closing `gem` has to wait for (`sysmem::released`, PASSIVE, no lock held).
+pub(super) fn close_wait(gem: u32) -> CloseWait {
+    FLIPS.lock().closing(gem)
+}
+
+/// `gem` was closed: nothing is remembered of it.
+pub(super) fn gem_closed(gem: u32) {
+    FLIPS.lock().forget(gem);
 }
 
 fn finish(epoch: u64, slot: u8, copied: bool, result: FlipResult) {

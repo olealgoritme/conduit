@@ -47,7 +47,10 @@ use helios_kmd_logic::foreign_resource::{
     foreign_blob_id, validate_request, AdoptRequest, Layout as FrLayout, RefusalKind, FLAG_LAYOUT,
 };
 use helios_kmd_logic::rm_client::{self as rc, Action, Client, Fail, FailKind, Want};
-use helios_kmd_logic::rm_sysmem::{self as rs, Admit, Cache, Kind, PrimaryCache, Svc, Why};
+use helios_kmd_logic::rm_sysmem::{
+    self as rs, Admit, Cache, CloseWait, Kind, PrimaryCache, Svc, Why,
+};
+use helios_kmd_logic::scanout_release::Wait;
 use helios_kmd_logic::sweep_budget::{SweepBudget, UNITS_PER_MS};
 use helios_protocol::{HELIOS_BLOB_MEM_RM_EXPORT, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE};
 
@@ -93,7 +96,7 @@ struct State {
 static STATE: SpinLock<State> = SpinLock::new(State {
     svc: Svc::new(),
     h: Handles::NONE,
-    cache: PrimaryCache::Cached,
+    cache: PrimaryCache::WriteCombine,
 });
 
 /// Allocations alive, mirrored out of `STATE` so [`released`] costs one load when the
@@ -111,9 +114,10 @@ static LIVE: AtomicU32 = AtomicU32::new(0);
 // creation (ms), `RmSysTrial` / `RmSysTrialFail` trial maps that worked / failed,
 // `RmSysCache` the last `map_info` nibble the host reported, `RmSysMis` creations refused
 // because it was not the attribute asked for, `RmSysAlias` creations whose memory and
-// dxgkrnl's view of it differ in cache attribute (the default: see `PrimaryCache`),
+// dxgkrnl's view of it differ in cache attribute (0 by default: see `PrimaryCache`),
 // `RmSysSoft` undo steps that failed, `RmSysLeak` allocations whose RM objects were left to
-// the transport sweep.
+// the transport sweep, `RmSysRelWait` / `RmSysRelTmo` GEM closes of a REPLACED primary that
+// waited for the host's release / went ahead at the 500 ms limit (the release seam, 15.7).
 pub static SYS_TRY: AtomicU32 = AtomicU32::new(0);
 pub static SYS_OK: AtomicU32 = AtomicU32::new(0);
 pub static SYS_VENUS: AtomicU32 = AtomicU32::new(0);
@@ -131,6 +135,8 @@ pub static SYS_MIS: AtomicU32 = AtomicU32::new(0);
 pub static SYS_ALIAS: AtomicU32 = AtomicU32::new(0);
 pub static SYS_SOFT: AtomicU32 = AtomicU32::new(0);
 pub static SYS_LEAK: AtomicU32 = AtomicU32::new(0);
+pub static SYS_REL_WAIT: AtomicU32 = AtomicU32::new(0);
+pub static SYS_REL_TMO: AtomicU32 = AtomicU32::new(0);
 
 /// The stages, as `RmSysStage` / the first byte of `RmSysFail` name them.
 mod stage {
@@ -148,6 +154,7 @@ mod stage {
     pub const GEM_CLOSE: u32 = 20;
     pub const FREE: u32 = 21;
     pub const UNDO: u32 = 22;
+    pub const REL_WAIT: u32 = 23;
 }
 
 /// Mirror the counters to the registry. PASSIVE only; nothing is written until the service
@@ -180,6 +187,8 @@ pub(crate) fn publish_counters() {
     rec(b"RmSysAlias", SYS_ALIAS.load(Ordering::Relaxed));
     rec(b"RmSysSoft", SYS_SOFT.load(Ordering::Relaxed));
     rec(b"RmSysLeak", SYS_LEAK.load(Ordering::Relaxed));
+    rec(b"RmSysRelWait", SYS_REL_WAIT.load(Ordering::Relaxed));
+    rec(b"RmSysRelTmo", SYS_REL_TMO.load(Ordering::Relaxed));
     super::sysmem_flip::publish_counters();
 }
 
@@ -232,10 +241,13 @@ pub(crate) struct Created {
     pub size: u64,
 }
 
-/// Whether the primary's `Cached` flag is asked of dxgkrnl (`KmdRmSysCache` = 2): read
-/// at bring-up, so it is only meaningful once a creation has run. One lock hold.
-pub(crate) fn primary_cached_flag() -> bool {
-    STATE.lock().cache.cached_flag()
+/// Whether the primary `resource_id` is created with the `Cached` flag (`KmdRmSysCache` = 2,
+/// an opt-in; the default write-combined memory never asks): only for a primary this service
+/// made (a UMD-adopted foreign primary is none of its business), read at bring-up, so it is
+/// only meaningful once a creation has run. One lock hold.
+pub(crate) fn primary_cached_flag(resource_id: u32) -> bool {
+    let g = STATE.lock();
+    g.cache.cached_flag() && g.svc.find(resource_id).is_some()
 }
 
 /// Make the VidPn primary from RM system memory, or say (`None`) that Venus must make it.
@@ -890,6 +902,9 @@ pub(crate) fn released(passive: PassiveLevel, adapter: &AdapterContext, resource
             epoch: t.epoch,
         };
         let mut leaked = false;
+        // A primary the screen has moved off is closed once the host released it (the
+        // release seam, 15.7): bounded, and never for the one on the scanout.
+        wait_released(&io, super::sysmem_flip::close_wait(t.gem));
         note_stage(stage::GEM_CLOSE);
         if gem_close(&io, &h, t.gem).is_err() {
             SYS_SOFT.fetch_add(1, Ordering::Relaxed);
@@ -905,6 +920,7 @@ pub(crate) fn released(passive: PassiveLevel, adapter: &AdapterContext, resource
             SYS_LEAK.fetch_add(1, Ordering::Relaxed);
         }
     }
+    super::sysmem_flip::gem_closed(t.gem);
     // A slot whose RM object could not be freed stays taken (Closing): its handle is still
     // RM's, and reusing the number would make the next `RM_ALLOC` fail as a duplicate. The
     // sweep of the transport closes the client and the generation reset frees the slot.
@@ -914,6 +930,42 @@ pub(crate) fn released(passive: PassiveLevel, adapter: &AdapterContext, resource
     mirror_live();
     SYS_FREED.fetch_add(1, Ordering::Relaxed);
     publish_counters();
+}
+
+/// Hold the GEM close of a primary the host was told to stop showing until the host says it is
+/// done with it (`ScanoutReleased`, tracked in `scanout_release`), or 500 ms after the flip
+/// that replaced it: the level 3 ring's rule (`rm_sysmem::close_gate`). Nothing to wait for
+/// (`Free`: the shown buffer, which the host never releases; one never flipped; release events
+/// not tracked) is two loads. PASSIVE, no lock held, polled every 2 ms (the interrupt side's
+/// release signals the HPD worker, not this thread); StopDevice ends it.
+#[inline(never)]
+fn wait_released(io: &Io<'_>, w: CloseWait) {
+    let CloseWait::Replaced { seq, .. } = w else {
+        return;
+    };
+    let mut began = false;
+    loop {
+        let t = now();
+        let done = crate::virtio::scanout_release::is_done(seq, t);
+        match rs::close_gate(w, done, t) {
+            Wait::Go => return,
+            Wait::TimedOut => {
+                SYS_REL_TMO.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Wait::Hold { .. } => {
+                if io.stopping() {
+                    return;
+                }
+                if !began {
+                    began = true;
+                    SYS_REL_WAIT.fetch_add(1, Ordering::Relaxed);
+                    note_stage(stage::REL_WAIT);
+                }
+                ctrl::sleep_ms(io.passive, 2);
+            }
+        }
+    }
 }
 
 /// The live slot of `resource_id`, for a flip: `(gem, epoch)`.
@@ -932,6 +984,9 @@ pub(super) fn forget() {
         let mut g = STATE.lock();
         g.svc.reset();
         g.h = Handles::NONE;
+        // The next generation reads the knob again at its bring-up; until then nothing asks
+        // dxgkrnl for `Cached`.
+        g.cache = PrimaryCache::WriteCombine;
     }
     LIVE.store(0, Ordering::Relaxed);
     super::sysmem_flip::reset();
