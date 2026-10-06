@@ -551,9 +551,12 @@ pub const HELIOS_READ_LEDGER_SLOTS: usize = 65;
 ///
 /// All fields are written KMD-side with Release stores and must be read with
 /// Acquire loads. A reader first matches `resid`, then samples `generation`,
-/// `issued`, and `retired`, and finally revalidates both `generation` and
-/// `resid`. A changed generation is a same-resid re-claim, not a no-read
-/// verdict; the reader must retry the full scan.
+/// then re-reads `resid` (a reader that matched an old claim must not pair
+/// the generation of the next claim with its not yet written counters), then
+/// samples `issued` and `retired`, and finally revalidates both `generation`
+/// and `resid`. A changed generation is a same-resid re-claim, not a no-read
+/// verdict; the reader must retry the full scan. The C reader is
+/// `helios_read_ledger_lookup` in `include/helios_read_ledger.h`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosReadLedgerSlot {
@@ -907,5 +910,203 @@ mod scanout_timeline_tests {
         );
         assert_eq!(core::mem::size_of::<HeliosReadLedgerPage>(), 2112);
         assert!(core::mem::size_of::<HeliosReadLedgerPage>() <= 4096);
+    }
+}
+
+/// The C mirror `include/helios_read_ledger.h` against the Rust types and constants:
+/// every `#define` value, every `sizeof` and `offsetof` its static assertions pin, in
+/// both the C (`_Static_assert`) and the C++ (`static_assert`) branch.
+#[cfg(test)]
+mod read_ledger_c_header_tests {
+    extern crate std;
+    use super::*;
+    use std::string::String;
+    use std::vec::Vec;
+
+    const HEADER: &str = include_str!("../include/helios_read_ledger.h");
+
+    /// The numeric value of `#define name ...`: one literal (`u` suffix, decimal or hex)
+    /// or `(1u << n)`, followed by an optional comment.
+    fn c_define(name: &str) -> u64 {
+        for line in HEADER.lines() {
+            let Some(rest) = line.strip_prefix("#define ") else {
+                continue;
+            };
+            let Some(value) = rest.strip_prefix(name) else {
+                continue;
+            };
+            // `name` must be the whole identifier.
+            if !value.starts_with(' ') {
+                continue;
+            }
+            let value = value.split("/*").next().unwrap_or("").trim();
+            if let Some(bits) = value.strip_prefix("(1u << ") {
+                return 1u64 << bits.trim_end_matches(')').parse::<u32>().unwrap();
+            }
+            let value = value.trim_end_matches('u');
+            return match value.strip_prefix("0x") {
+                Some(hex) => u64::from_str_radix(hex, 16).unwrap(),
+                None => value.parse().unwrap(),
+            };
+        }
+        panic!("{name} is not defined in helios_read_ledger.h");
+    }
+
+    /// The right-hand sides of the assertions on `lhs` (`sizeof(struct X)` or
+    /// `offsetof(struct X, f)`) in one branch; `cxx` selects the C++ spelling (no
+    /// `struct` keyword, `static_assert`).
+    fn c_asserted(lhs: &str, cxx: bool) -> Vec<u64> {
+        let (macro_name, lhs) = if cxx {
+            ("static_assert(", lhs.replace("struct ", ""))
+        } else {
+            ("_Static_assert(", String::from(lhs))
+        };
+        let needle = std::format!("{macro_name}{lhs} == ");
+        let mut out = Vec::new();
+        for line in HEADER.lines() {
+            let Some(rest) = line.strip_prefix(needle.as_str()) else {
+                continue;
+            };
+            let rhs = rest.split(',').next().unwrap().trim();
+            out.push(match rhs {
+                "HELIOS_READ_LEDGER_PAGE_BYTES" => c_define(rhs),
+                _ => rhs.parse().unwrap(),
+            });
+        }
+        out
+    }
+
+    fn pinned(lhs: &str, rust: usize) {
+        for cxx in [false, true] {
+            assert_eq!(
+                c_asserted(lhs, cxx),
+                [rust as u64],
+                "{lhs} ({}): the header must pin exactly the Rust value",
+                if cxx { "C++" } else { "C" }
+            );
+        }
+    }
+
+    macro_rules! size {
+        ($c:literal, $t:ty) => {
+            pinned(
+                concat!("sizeof(struct ", $c, ")"),
+                core::mem::size_of::<$t>(),
+            )
+        };
+    }
+    macro_rules! off {
+        ($c:literal, $t:ty, $f:ident) => {
+            pinned(
+                concat!("offsetof(struct ", $c, ", ", stringify!($f), ")"),
+                core::mem::offset_of!($t, $f),
+            )
+        };
+    }
+
+    #[test]
+    fn defines_match_the_rust_constants() {
+        for (name, v) in [
+            ("HELIOS_ESCAPE_MAGIC", HELIOS_ESCAPE_MAGIC as u64),
+            ("HELIOS_ESCAPE_VERSION", HELIOS_ESCAPE_VERSION as u64),
+            ("HELIOS_ESCAPE_MAP_READ_LEDGER", HELIOS_ESCAPE_MAP_READ_LEDGER as u64),
+            ("HELIOS_ESCAPE_SCANOUT_EVENT", HELIOS_ESCAPE_SCANOUT_EVENT as u64),
+            ("HELIOS_READ_LEDGER_MAGIC", HELIOS_READ_LEDGER_MAGIC as u64),
+            ("HELIOS_READ_LEDGER_VERSION", HELIOS_READ_LEDGER_VERSION as u64),
+            ("HELIOS_READ_LEDGER_SLOTS", HELIOS_READ_LEDGER_SLOTS as u64),
+            (
+                "HELIOS_READ_LEDGER_PAGE_BYTES",
+                core::mem::size_of::<HeliosReadLedgerPage>() as u64,
+            ),
+            ("HELIOS_SCANOUT_ACQ_OP_PROBE", HELIOS_SCANOUT_ACQ_OP_PROBE as u64),
+            ("HELIOS_SCANOUT_ACQ_OP_MAP", HELIOS_SCANOUT_ACQ_OP_MAP as u64),
+            ("HELIOS_SCANOUT_ACQ_OP_UNMAP", HELIOS_SCANOUT_ACQ_OP_UNMAP as u64),
+            ("HELIOS_SCANOUT_ACQ_OP_REGISTER", HELIOS_SCANOUT_ACQ_OP_REGISTER as u64),
+            ("HELIOS_SCANOUT_ACQ_OP_UNREGISTER", HELIOS_SCANOUT_ACQ_OP_UNREGISTER as u64),
+            ("HELIOS_SCANOUT_CAP_READ_LEDGER", HELIOS_SCANOUT_CAP_READ_LEDGER as u64),
+            ("HELIOS_SCANOUT_CAP_SNAPSHOT_BIND", HELIOS_SCANOUT_CAP_SNAPSHOT_BIND as u64),
+            (
+                "HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM",
+                HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM as u64,
+            ),
+            (
+                "HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT",
+                HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT as u64,
+            ),
+            ("HELIOS_SCANOUT_CAP_SNAPSHOT_STATUS", HELIOS_SCANOUT_CAP_SNAPSHOT_STATUS as u64),
+            ("HELIOS_SCANOUT_CAP_FLUSH_GATE", HELIOS_SCANOUT_CAP_FLUSH_GATE as u64),
+            ("HELIOS_SCANOUT_ACQ_OK", HELIOS_SCANOUT_ACQ_OK as u64),
+            ("HELIOS_SCANOUT_ACQ_PROBE_ACK", HELIOS_SCANOUT_ACQ_PROBE_ACK as u64),
+            ("HELIOS_SCANOUT_ACQ_NOT_FOUND", HELIOS_SCANOUT_ACQ_NOT_FOUND as u64),
+            ("HELIOS_SCANOUT_ACQ_TABLE_FULL", HELIOS_SCANOUT_ACQ_TABLE_FULL as u64),
+        ] {
+            assert_eq!(c_define(name), v, "{name}");
+        }
+        // The two verbs the header names, as the escape header carries them.
+        assert_eq!(HELIOS_ESCAPE_MAP_READ_LEDGER, 0x000E);
+        assert_eq!(HELIOS_ESCAPE_SCANOUT_EVENT, 0x000F);
+        // `"HLRL"` read as a little-endian word.
+        assert_eq!(HELIOS_READ_LEDGER_MAGIC, u32::from_le_bytes(*b"HLRL"));
+    }
+
+    #[test]
+    fn the_capability_defines_are_exactly_bits_zero_to_five() {
+        let mut seen = 0u64;
+        for line in HEADER.lines() {
+            if let Some(rest) = line.strip_prefix("#define HELIOS_SCANOUT_CAP_") {
+                let name = rest.split(' ').next().unwrap();
+                let bit = c_define(&std::format!("HELIOS_SCANOUT_CAP_{name}"));
+                assert_eq!(bit.count_ones(), 1, "{name}");
+                assert_eq!(seen & bit, 0, "{name} reuses a bit");
+                seen |= bit;
+            }
+        }
+        assert_eq!(seen, 0b11_1111);
+    }
+
+    #[test]
+    fn struct_sizes_and_offsets_match_the_rust_types() {
+        size!("HeliosEscapeHeader", HeliosEscapeHeader);
+        size!("HeliosEscapeMapReadLedger", HeliosEscapeMapReadLedger);
+        off!("HeliosEscapeMapReadLedger", HeliosEscapeMapReadLedger, out_user_va);
+        off!("HeliosEscapeMapReadLedger", HeliosEscapeMapReadLedger, op);
+        off!("HeliosEscapeMapReadLedger", HeliosEscapeMapReadLedger, out_size);
+        off!("HeliosEscapeMapReadLedger", HeliosEscapeMapReadLedger, out_state);
+        size!("HeliosEscapeScanoutEvent", HeliosEscapeScanoutEvent);
+        off!("HeliosEscapeScanoutEvent", HeliosEscapeScanoutEvent, event_handle);
+        off!("HeliosEscapeScanoutEvent", HeliosEscapeScanoutEvent, op);
+        off!("HeliosEscapeScanoutEvent", HeliosEscapeScanoutEvent, out_state);
+        size!("HeliosReadLedgerSlot", HeliosReadLedgerSlot);
+        off!("HeliosReadLedgerSlot", HeliosReadLedgerSlot, generation);
+        off!("HeliosReadLedgerSlot", HeliosReadLedgerSlot, issued);
+        off!("HeliosReadLedgerSlot", HeliosReadLedgerSlot, retired);
+        size!("HeliosReadLedgerPage", HeliosReadLedgerPage);
+        off!("HeliosReadLedgerPage", HeliosReadLedgerPage, slots);
+        off!("HeliosReadLedgerPage", HeliosReadLedgerPage, slot_overflow);
+        // The sizes the doc comments and the escape numbers promise.
+        assert_eq!(core::mem::size_of::<HeliosEscapeMapReadLedger>(), 40);
+        assert_eq!(core::mem::size_of::<HeliosEscapeScanoutEvent>(), 32);
+        assert_eq!(core::mem::size_of::<HeliosReadLedgerPage>(), 2112);
+    }
+
+    #[test]
+    fn the_c_and_cxx_branches_assert_the_same_things() {
+        let count = |m: &str| HEADER.lines().filter(|l| l.starts_with(m)).count();
+        assert_eq!(count("_Static_assert("), count("static_assert("));
+        assert_eq!(count("_Static_assert("), 17);
+    }
+
+    #[test]
+    fn the_reader_exports_exist() {
+        for name in [
+            "helios_read_ledger_lookup(",
+            "helios_read_ledger_page_valid(",
+            "helios_read_ledger_overflow(",
+        ] {
+            assert!(HEADER.contains(name), "{name}");
+        }
+        // The seqlock-style fence and the retry on a changed generation or resid.
+        assert!(HEADER.contains("helios_rl_fence_acquire();"));
+        assert!(HEADER.contains("restart = 1;"));
     }
 }
