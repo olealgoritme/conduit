@@ -1029,6 +1029,18 @@ pub mod knobs {
     /// extension tier it needs. 0, the default, is the pre-feature device and import;
     /// read at AddAdapter/StartDevice like every knob.
     pub const FOREIGN_COPY: KnobName = KnobName::new(b"ForeignCopy");
+    /// `BltAsync` (default 0 = the previous behaviour). 1: a Blt Present of an adopted foreign
+    /// (NVK-on-RM) source into a KMD standard buffer returns from `DxgkDdiPresent` without a CPU
+    /// wait: the copy is submitted by the DDI, or queued for the HPD worker until the producer's
+    /// boundary has been reached, and the Present's DMA fence retires with the copy. Read at every
+    /// StartDevice; mirrored as `BltAsyncKnob`. `docs/zero-copy-present.md`, "Asynchronous
+    /// composed present (BltAsync, BltNoMirror)".
+    pub const BLT_ASYNC: KnobName = KnobName::new(b"BltAsync");
+    /// `BltNoMirror` (default 0 = the previous behaviour). 1: such a Blt does not CPU-copy the
+    /// frame into the destination's system-memory backing; the backing is marked "system copy
+    /// invalid" instead. Independent of `BltAsync`. Read at every StartDevice; mirrored as
+    /// `BltNoMirKnob`.
+    pub const BLT_NO_MIRROR: KnobName = KnobName::new(b"BltNoMirror");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");

@@ -670,6 +670,9 @@ unsafe fn dxgkddi_present_inner(
                 },
                 None => None,
             };
+            // The source is an adopted foreign (NVK-on-RM) allocation: the only source `BltAsync`
+            // and `BltNoMirror` act on (`ddi/blt_async.rs`).
+            let mut source_foreign = false;
             let source_desc = if let Some(snapshot) = snapshot_source {
                 // D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET. The
                 // image was created by the UMD snapshot ring with exactly these
@@ -694,6 +697,7 @@ unsafe fn dxgkddi_present_inner(
                 // explicit-modifier dma-buf image from its layout record. The
                 // pixel format is the record's fourcc. Every other source takes
                 // the match below, unchanged.
+                source_foreign = true;
                 OptimalPresentImageDesc::new_foreign_dma_buf(
                     source.resource_id,
                     source.width,
@@ -872,6 +876,62 @@ unsafe fn dxgkddi_present_inner(
                     PresentDestinationDesc::StandardBuffer(desc) => Some(desc.resource_id()),
                     PresentDestinationDesc::OptimalImage(_) => None,
                 };
+                // `BltNoMirror` applies to a foreign source into a standard buffer, whichever arm
+                // below copies it; `BltAsync` takes such a Blt out of this arm altogether.
+                let skip_mirror = helios_kmd_logic::blt_async::no_mirror_applies(
+                    crate::ddi::blt_async::no_mirror_on(),
+                    source_foreign,
+                    false,
+                    destination_buffer.is_some(),
+                );
+                if source_foreign && destination_buffer.is_some() && crate::ddi::blt_async::async_on()
+                {
+                    // SAFETY: `args` is dxgkrnl's present struct for this call (PASSIVE_LEVEL)
+                    // and the capacity of its private data was validated above.
+                    match unsafe {
+                        crate::ddi::blt_async::try_async(
+                            passive,
+                            adapter,
+                            args,
+                            source_desc,
+                            destination_desc,
+                            present_stream_boundary,
+                        )
+                    } {
+                        Ok(crate::ddi::blt_async::Taken::Legacy) => {}
+                        Ok(taken) => {
+                            // Submitted (a wire fence) or queued (a WindowedBlt token): the
+                            // DMA fence retires with the copy, and nothing here waits for it.
+                            let (copy, id) = match taken {
+                                crate::ddi::blt_async::Taken::Direct(fence) => (3, fence),
+                                crate::ddi::blt_async::Taken::Deferred(token) => (4, token),
+                                crate::ddi::blt_async::Taken::Legacy => (0, 0),
+                            };
+                            crate::diag::record_named_bytes(b"PBCpy", copy);
+                            crate::diag::record_named_bytes(b"PBFnc", id as u32);
+                            return unsafe {
+                                present_complete(
+                                    args,
+                                    present_allocations,
+                                    patch_capacity.take(),
+                                    present_stream_boundary,
+                                    present_arm,
+                                    Some(adapter),
+                                    src_info,
+                                    dst_info,
+                                )
+                            };
+                        }
+                        Err(status) => {
+                            crate::diag::record_named_bytes(b"PBCpy", 0xE6);
+                            PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+                            return crate::ddi::present_foreign::site(
+                                site::BLT_FENCE_MERGE,
+                                status,
+                            );
+                        }
+                    }
+                }
                 if let Some(resource_id) = destination_buffer {
                     if crate::virtio::ctrl::begin_present_buffer_write_legacy(
                         passive,
@@ -936,12 +996,16 @@ unsafe fn dxgkddi_present_inner(
                 // mirror into those pages before Present retires; otherwise later
                 // frames update only the stale BAR blob.
                 if destination_buffer.is_some() {
-                    match crate::virtio::ctrl::wait_fence(
+                    let wait_started = crate::ddi::blt_async::now_100ns();
+                    let waited = crate::virtio::ctrl::wait_fence(
                         passive,
                         adapter,
                         gpu_fence,
                         5_000_000_000,
-                    ) {
+                    );
+                    // What `BltAsync` saves: the app thread's CPU wait for the copy (`BltWait*`).
+                    crate::ddi::blt_async::note_wait(wait_started);
+                    match waited {
                         crate::virtio::ctrl::WaitFenceOutcome::Complete => {
                             crate::diag::record_named_bytes(b"PBSyWt", 1);
                         }
@@ -982,14 +1046,25 @@ unsafe fn dxgkddi_present_inner(
                         );
                     }
                 }
-                let mirror_ok = if destination_buffer.is_some() {
-                    match unsafe {
+                let mirror_ok = if destination_buffer.is_some() && skip_mirror {
+                    // `BltNoMirror`: DWM reads the GPU copy. The system pages VidMm may hold for
+                    // the destination are now older than the blob: marked invalid, so a page-in
+                    // does not copy them back over it and a later eviction pulls from the blob.
+                    crate::ddi::blt_async::note_mirror_skipped();
+                    crate::ddi::blt_async::mark_stale(adapter, destination.resource_id);
+                    crate::diag::record_named_bytes(b"PBSyCp", 3);
+                    true
+                } else if destination_buffer.is_some() {
+                    let mirror_started = crate::ddi::blt_async::now_100ns();
+                    let mirrored = unsafe {
                         crate::ddi::build_paging_buffer::mirror_present_system_backing(
                             passive,
                             adapter,
                             destination.resource_id,
                         )
-                    } {
+                    };
+                    crate::ddi::blt_async::note_mirror(mirror_started);
+                    match mirrored {
                         Some(true) => {
                             crate::diag::record_named_bytes(b"PBSyCp", 1);
                             true
@@ -1738,6 +1813,12 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 .ok()
                 .flatten();
             request.map(|request| {
+                // `BltNoMirror`: from this submission the system pages VidMm may hold for the
+                // destination are older than its blob and nothing will mirror them.
+                if request.async_blt && request.no_mirror {
+                    crate::ddi::blt_async::mark_stale(adapter, request.destination_resource_id);
+                    crate::ddi::blt_async::note_mirror_skipped();
+                }
                 (
                     request.token,
                     request.stream_boundary,
@@ -1783,6 +1864,7 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
             .ok()
             .flatten();
         if let Some(request) = mirror {
+            let mirror_started = crate::ddi::blt_async::now_100ns();
             let ok = match unsafe {
                 crate::ddi::build_paging_buffer::mirror_present_system_backing(
                     passive,
@@ -1793,6 +1875,7 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 Some(true) | None => true,
                 Some(false) => false,
             };
+            crate::ddi::blt_async::note_mirror(mirror_started);
             let _ = adapter.with_virtio(|v| {
                 v.complete_windowed_blt_mirror(adapter, request.token, request.stream_boundary, ok)
             });
