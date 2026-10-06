@@ -390,7 +390,7 @@ static int keyed_load(UINT w, UINT h, UINT rounds, UINT load, bool perf) {
 // The UMD's hand-off ledger header (umd/bridge/dxvk_bridge.cpp helios_handoff):
 // records and slots in use, fallbacks to the CPU wait, sweeps, hand-offs.
 static bool read_ledger(unsigned *out) {
-  HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Local\\HeliosHandoffLedger4");
+  HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Local\\HeliosHandoffLedger5");
   if (!m)
     return false;
   const unsigned *v = static_cast<const unsigned *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, 32));
@@ -400,7 +400,7 @@ static bool read_ledger(unsigned *out) {
   for (int i = 0; i < 8; i++)
     out[i] = v[i];
   UnmapViewOfFile(v);
-  return out[0] == 0x344C4448u;
+  return out[0] == 0x354C4448u;
 }
 
 static void print_ledger(const char *when) {
