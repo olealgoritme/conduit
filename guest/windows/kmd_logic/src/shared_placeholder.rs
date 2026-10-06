@@ -65,6 +65,73 @@ pub mod identity {
     pub const ALL: u32 = (1 << 8) - 1;
 }
 
+/// `DXGK_CREATEALLOCATIONFLAGS` bit 0, `Resource` (read by `dxgkddi_create_allocation`).
+pub const CREATE_FLAG_RESOURCE: u32 = 0x0000_0001;
+
+/// Protocol words the identity mapping reads; each is pinned to the protocol's constant by a
+/// `const` assertion in `kmd_render/src/ddi/shared_placeholder.rs`.
+pub mod words {
+    /// `HELIOS_BLOB_MEM_RM_EXPORT`.
+    pub const BLOB_MEM_RM_EXPORT: u32 = 0x8000_0001;
+    /// `HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER`.
+    pub const BLOB_FLAG_GLOBAL_VIDMM_TRACKER: u32 = 0x2000_0000;
+    /// `HELIOS_WDDM_ALLOC_MISC_PRIMARY`.
+    pub const MISC_PRIMARY: u32 = 0x8000_0000;
+    /// `HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT`.
+    pub const MISC_DIRECT_SCANOUT: u32 = 0x4000_0000;
+    /// `HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE`.
+    pub const MISC_OPTIMAL_GDI_TEXTURE: u32 = 0x2000_0000;
+    /// `HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK`.
+    pub const MISC_STANDARD_TYPE_MASK: u32 = 0x0F00_0000;
+    /// `HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK`.
+    pub const MISC_GDI_TYPE_MASK: u32 = 0x00F0_0000;
+}
+
+/// The private-data fields the identity mapping reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PrivateFacts {
+    /// `HeliosWddmAllocPrivate::blob_id`.
+    pub blob_id: u64,
+    /// `HeliosWddmAllocPrivate::blob_mem`.
+    pub blob_mem: u32,
+    /// `HeliosWddmAllocPrivate::blob_flags`.
+    pub blob_flags: u32,
+    /// `HeliosWddmAllocMeta::misc_flags` (0 when the meta is absent).
+    pub misc_flags: u32,
+    /// A valid `HeliosWddmAllocLayout` trailer is present.
+    pub layout_trailer: bool,
+}
+
+/// The [`identity`] bits of one allocation's private data.
+pub const fn identity_bits(f: &PrivateFacts) -> u32 {
+    let mut bits = 0;
+    if f.blob_id != 0 {
+        bits |= identity::BLOB_ID;
+    }
+    if f.blob_mem == words::BLOB_MEM_RM_EXPORT {
+        bits |= identity::RM_EXPORT;
+    }
+    if f.blob_flags & words::BLOB_FLAG_GLOBAL_VIDMM_TRACKER != 0 {
+        bits |= identity::TRACKER;
+    }
+    if f.layout_trailer {
+        bits |= identity::LAYOUT_TRAILER;
+    }
+    if f.misc_flags & words::MISC_PRIMARY != 0 {
+        bits |= identity::PRIMARY;
+    }
+    if f.misc_flags & words::MISC_OPTIMAL_GDI_TEXTURE != 0 {
+        bits |= identity::GDI_TEXTURE;
+    }
+    if f.misc_flags & words::MISC_DIRECT_SCANOUT != 0 {
+        bits |= identity::DIRECT_SCANOUT;
+    }
+    if f.misc_flags & (words::MISC_STANDARD_TYPE_MASK | words::MISC_GDI_TYPE_MASK) != 0 {
+        bits |= identity::STANDARD_TYPE;
+    }
+    bits
+}
+
 /// Everything the decision reads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Input {
@@ -179,6 +246,13 @@ pub const fn has_placeholder_shape(i: &Input) -> bool {
         }),
         Verdict::Placeholder
     )
+}
+
+/// A STANDARD allocation with no identity at all, whatever its private size and creation
+/// flags: the shape a placeholder has, used to make a wrong shared-bit or size assumption
+/// visible (the allocation is counted and its flags recorded even when the gate says no).
+pub const fn is_identityless_standard(i: &Input) -> bool {
+    i.kind == KIND_STANDARD && i.adopt_resource_id == 0 && i.ctx_id == 0 && i.identity == 0
 }
 
 #[cfg(test)]
@@ -324,13 +398,135 @@ mod tests {
         assert_eq!(decide(&unshared_huge), Verdict::Existing(Existing::NotShared));
     }
 
+    /// Real `DXGKARG_CREATEALLOCATION::Flags` words. `Resource | CreateShared` reads 3 in the
+    /// `CARFlg` breadcrumb of a shared texture (the documented value to confirm on the VM; the
+    /// user-mode `D3DKMT_CREATEALLOCATIONFLAGS` has `CreateShared` at 0x2 too).
     #[test]
-    fn the_shared_bit_is_bit_one_and_only_bit_one() {
-        assert!(!is_shared(0));
-        assert!(!is_shared(1));
-        assert!(is_shared(2));
-        assert!(is_shared(3));
-        assert!(!is_shared(!2));
+    fn the_shared_flag_is_extracted_from_real_flag_words() {
+        assert_eq!(CREATE_FLAG_RESOURCE, 1);
+        assert_eq!(CREATE_FLAG_SHARED, 2);
+        let cases: [(u32, bool); 9] = [
+            (0x0, false),
+            (0x1, false),
+            (0x2, true),
+            (0x3, true),
+            (0x5, false),
+            (0x7, true),
+            (0x4, false),
+            (0xFFFF_FFFD, false),
+            (0xFFFF_FFFF, true),
+        ];
+        for (word, shared) in cases {
+            assert_eq!(is_shared(word), shared, "{word:#x}");
+        }
+    }
+
+    #[test]
+    fn identity_words_match_the_protocol_values_documented_here() {
+        // The render crate pins each of these to the protocol constant at build time.
+        assert_eq!(words::BLOB_MEM_RM_EXPORT, 0x8000_0001);
+        assert_eq!(words::BLOB_FLAG_GLOBAL_VIDMM_TRACKER, 0x2000_0000);
+        assert_eq!(words::MISC_PRIMARY, 0x8000_0000);
+        assert_eq!(words::MISC_DIRECT_SCANOUT, 0x4000_0000);
+        assert_eq!(words::MISC_OPTIMAL_GDI_TEXTURE, 0x2000_0000);
+        assert_eq!(words::MISC_STANDARD_TYPE_MASK, 0x0F00_0000);
+        assert_eq!(words::MISC_GDI_TYPE_MASK, 0x00F0_0000);
+    }
+
+    #[test]
+    fn a_bare_placeholder_has_no_identity_bits() {
+        // What the UMD sends: HOST3D (2) blob_mem, MAPPABLE (1) flags, misc = the D3D10 DDI
+        // flags (SHARED 0x2, KEYEDMUTEX 0x100), no trailer.
+        for misc in [0u32, 0x2, 0x100, 0x102, 0x0000_0008, 0x1000_0000] {
+            let f = PrivateFacts {
+                blob_id: 0,
+                blob_mem: 2,
+                blob_flags: 1,
+                misc_flags: misc,
+                layout_trailer: false,
+            };
+            assert_eq!(identity_bits(&f), 0, "misc {misc:#x}");
+        }
+    }
+
+    #[test]
+    fn every_identity_bit_is_produced_by_its_own_fact_and_only_it() {
+        let base = PrivateFacts {
+            blob_mem: 2,
+            blob_flags: 1,
+            ..Default::default()
+        };
+        let tracker_flags = 1 | words::BLOB_FLAG_GLOBAL_VIDMM_TRACKER;
+        let singles: [(PrivateFacts, u32); 12] = [
+            (PrivateFacts { blob_id: 7, ..base }, identity::BLOB_ID),
+            (PrivateFacts { blob_id: u64::MAX, ..base }, identity::BLOB_ID),
+            (PrivateFacts { blob_mem: words::BLOB_MEM_RM_EXPORT, ..base }, identity::RM_EXPORT),
+            (PrivateFacts { blob_flags: tracker_flags, ..base }, identity::TRACKER),
+            (PrivateFacts { layout_trailer: true, ..base }, identity::LAYOUT_TRAILER),
+            (PrivateFacts { misc_flags: words::MISC_PRIMARY, ..base }, identity::PRIMARY),
+            (
+                PrivateFacts { misc_flags: words::MISC_OPTIMAL_GDI_TEXTURE, ..base },
+                identity::GDI_TEXTURE,
+            ),
+            (
+                PrivateFacts { misc_flags: words::MISC_DIRECT_SCANOUT, ..base },
+                identity::DIRECT_SCANOUT,
+            ),
+            (PrivateFacts { misc_flags: 0x0100_0000, ..base }, identity::STANDARD_TYPE),
+            (PrivateFacts { misc_flags: 0x0800_0000, ..base }, identity::STANDARD_TYPE),
+            (PrivateFacts { misc_flags: 0x0010_0000, ..base }, identity::STANDARD_TYPE),
+            (PrivateFacts { misc_flags: 0x0080_0000, ..base }, identity::STANDARD_TYPE),
+        ];
+        for (f, want) in singles {
+            assert_eq!(identity_bits(&f), want, "{f:?}");
+        }
+    }
+
+    /// Every one of the 2^8 combinations of facts maps to exactly that combination of bits.
+    #[test]
+    fn every_identity_combination() {
+        for mask in 0u32..(1 << 8) {
+            let pick = |bit: u32, word: u32| if mask & bit != 0 { word } else { 0 };
+            let f = PrivateFacts {
+                blob_id: if mask & identity::BLOB_ID != 0 { 0x1234 } else { 0 },
+                blob_mem: if mask & identity::RM_EXPORT != 0 {
+                    words::BLOB_MEM_RM_EXPORT
+                } else {
+                    2
+                },
+                blob_flags: 1 | pick(identity::TRACKER, words::BLOB_FLAG_GLOBAL_VIDMM_TRACKER),
+                layout_trailer: mask & identity::LAYOUT_TRAILER != 0,
+                misc_flags: pick(identity::PRIMARY, words::MISC_PRIMARY)
+                    | pick(identity::GDI_TEXTURE, words::MISC_OPTIMAL_GDI_TEXTURE)
+                    | pick(identity::DIRECT_SCANOUT, words::MISC_DIRECT_SCANOUT)
+                    | pick(identity::STANDARD_TYPE, 0x0200_0000),
+            };
+            assert_eq!(identity_bits(&f), mask, "{f:?}");
+            // And through the decision: any bit means "not a placeholder".
+            let i = Input { identity: identity_bits(&f), ..PLAIN };
+            assert_eq!(
+                decide(&i),
+                if mask == 0 {
+                    Verdict::Placeholder
+                } else {
+                    Verdict::Existing(Existing::Identity)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn the_identityless_shape_ignores_flags_and_size() {
+        for flags in [0u32, 1, 2, 3] {
+            for size in [0u32, 96, 128] {
+                let i = Input { create_flags: flags, private_size: size, ..PLAIN };
+                assert!(is_identityless_standard(&i));
+            }
+        }
+        assert!(!is_identityless_standard(&Input { adopt_resource_id: 1, ..PLAIN }));
+        assert!(!is_identityless_standard(&Input { ctx_id: 1, ..PLAIN }));
+        assert!(!is_identityless_standard(&Input { kind: 1, ..PLAIN }));
+        assert!(!is_identityless_standard(&Input { identity: identity::BLOB_ID, ..PLAIN }));
     }
 
     #[test]
