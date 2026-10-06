@@ -68,12 +68,18 @@ static NO_OTHER: AtomicU32 = AtomicU32::new(0);
 static EARLY_N: AtomicU32 = AtomicU32::new(0);
 static MIRROR_PENDING: AtomicU32 = AtomicU32::new(1);
 
+/// The `FlipAnnounce` mode the service key asks for (default `flip_retire::DEFAULT_KNOB`: 2).
+/// PASSIVE (registry read).
+pub(crate) fn configured_mode() -> AnnounceMode {
+    AnnounceMode::from_knob(crate::diag::read_config_dword(
+        crate::diag::knobs::FLIP_ANNOUNCE,
+        fr::DEFAULT_KNOB,
+    ))
+}
+
 /// `FlipAnnounce` and `FlipEarlyWake` for this start, and the zeroed counters. PASSIVE.
 pub(crate) fn start_generation() {
-    let mode = AnnounceMode::from_knob(crate::diag::read_config_dword(
-        crate::diag::knobs::FLIP_ANNOUNCE,
-        0,
-    ));
+    let mode = configured_mode();
     let early = crate::diag::read_config_dword(crate::diag::knobs::FLIP_EARLY_WAKE, 0);
     FOREIGN_OK.store(
         u32::from(crate::diag::read_config_dword(crate::diag::knobs::FLIP_ANN_FOREIGN, 0) != 0),

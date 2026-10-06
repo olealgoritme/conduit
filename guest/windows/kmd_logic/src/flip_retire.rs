@@ -414,6 +414,11 @@ impl AnnounceMode {
     }
 }
 
+/// The `FlipAnnounce` value when the service key has none: 2, the Venus class announced (the
+/// foreign class waits for `FlipAnnForeign`). 2 on 332.1 hardware: 238 fps overlay, 244 flips and
+/// 244 used vblanks a second, no artifacts. `FlipAnnounce` 0 in the service key turns it off.
+pub const DEFAULT_KNOB: u32 = 2;
+
 /// Whether the DDI asks for the DPC that wakes the worker at issue: an announce mode, or the
 /// `FlipEarlyWake` knob alone (early programming without an early retire).
 pub const fn wakes_early(mode: AnnounceMode, early_wake_knob: u32) -> bool {
@@ -965,6 +970,21 @@ mod tests {
             accepted: true,
             failing: false,
         }
+    }
+
+    #[test]
+    fn the_default_announces_the_venus_class_only() {
+        assert_eq!(AnnounceMode::from_knob(DEFAULT_KNOB), AnnounceMode::All);
+        let venus = AnnounceFacts {
+            mode: AnnounceMode::from_knob(DEFAULT_KNOB),
+            foreign_class: false,
+            foreign_ok: false,
+            accepted: false,
+            ..facts()
+        };
+        assert_eq!(announce_decide(&venus), Announce::Yes);
+        let foreign = AnnounceFacts { foreign_class: true, accepted: true, ..venus };
+        assert_eq!(announce_decide(&foreign), Announce::No(NoAnnounce::ForeignOff));
     }
 
     #[test]

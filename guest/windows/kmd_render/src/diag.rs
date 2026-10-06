@@ -841,7 +841,7 @@ pub mod knobs {
     /// 0 is coerced to 1 (a zero-depth flip queue is not representable) and the
     /// value actually advertised is mirrored in the `FlipQueV` counter.
     pub const FLIP_QUEUE_DEPTH: KnobName = KnobName::new(b"FlipQueueN");
-    /// `FlipAnnounce` (default 0 = off, today's behaviour): publish a flip's address toward
+    /// `FlipAnnounce` (default 2 since the 332.1 hardware rows; 0 = off, the old behaviour): publish a flip's address toward
     /// dxgkrnl AT `SetVidPnSourceAddress` (atomics only, DIRQL) so the very next CRTC_VSYNC tick
     /// retires it (one tick per flip instead of two), while the HPD worker does the real
     /// programming afterwards. 1 = only flips of foreign allocations `ForeignFlip` already
