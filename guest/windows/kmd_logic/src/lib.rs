@@ -26,6 +26,7 @@ pub mod nvrm_fence;
 pub mod nvrm_views;
 pub mod foreign_copy;
 pub mod foreign_errno;
+pub mod foreign_flip;
 pub mod foreign_resource;
 pub mod foreign_scanout;
 pub mod rm_resource_import;
