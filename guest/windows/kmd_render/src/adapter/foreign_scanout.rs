@@ -43,7 +43,6 @@ use crate::ddi::scanout_trace::LeaseEnd;
 use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
 use crate::virtio::gpu::{DeviceOwner, FenceClaim, FenceRefusal};
-use wdk_sys::ntddk::KeSetEvent;
 
 static STATE: SpinLock<ForeignScanout> = SpinLock::new(ForeignScanout::new());
 
@@ -324,9 +323,7 @@ impl AdapterContext {
                 // The HPD worker arms the lapse deadline when it loops: wake a
                 // worker parked in an untimed wait so it sees this (new or shorter)
                 // deadline, or a hung owner on an idle desktop is never timed out.
-                // SAFETY: hpd_event is an embedded, in-place initialized KEVENT;
-                // KeSetEvent(Wait = FALSE) is legal through DISPATCH_LEVEL.
-                unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
+                self.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::FS_SET);
                 FS_SETS.fetch_add(1, Ordering::Relaxed);
                 if o.kind == SetKind::TookOver {
                     FS_TAKEOVERS.fetch_add(1, Ordering::Relaxed);
@@ -586,7 +583,12 @@ impl AdapterContext {
         if src.resident {
             // The desktop wanted a flush and the KMD's own source is what is on screen:
             // that flush is a frame to copy and flip, which the worker does next.
-            crate::virtio::rm_present::note_frame_edge(self);
+            if src.owner == crate::virtio::gpu::DeviceOwner::KMD_RM.raw() as u64 {
+                crate::virtio::rm_present::note_frame_edge(self);
+            } else {
+                // `ForeignFlip`'s resident source (a user device's token): gated, `FfEdgeSup`.
+                crate::virtio::foreign_flip::refresh_edge(self);
+            }
         } else {
             // A user source is on screen: a parked resident source is out of date, and
             // owes a fresh frame when the user source ends.

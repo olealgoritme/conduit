@@ -755,6 +755,12 @@ pub mod knobs {
     /// tick wake it with the vsync delivery gate closed. Read once per transport generation
     /// (`docs/kmd-rm-client.md` 15.18.13).
     pub const FOREIGN_FLIP_WIN: KnobName = KnobName::new(b"FfAsyncWin");
+    /// `FfRepeatMs` (default 100, 0 = off, at most 10000), only with `ForeignFlip` on: the least
+    /// time between two host flips that only REPEAT the picture the previous flip showed (a
+    /// desktop refresh edge, as opposed to a programming dxgkrnl issued). 0 flips on every edge,
+    /// as KMD 325 did (155 flips a second of an unchanged picture in the T5 run). Read once per
+    /// transport generation (`docs/kmd-rm-client.md` 15.18.14).
+    pub const FOREIGN_FLIP_REPEAT: KnobName = KnobName::new(b"FfRepeatMs");
     /// `BindFlushMode` (default 0). Selects when the bind edge tells the host
     /// to READ the freshly bound primary (ROADMAP defect 0ab-B):
     ///   0 = completion-ordered against the boundary this buffer's own present

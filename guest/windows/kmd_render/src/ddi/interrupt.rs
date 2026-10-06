@@ -84,7 +84,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
     if fence_work {
         // A fence a present waits on fired: the PASSIVE worker sends the flip and
         // closes the handle (the host round trips are not DPC work).
-        adapter.signal_hpd();
+        adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::FENCE);
     }
 
     // A producer completion may have made the one deferred fast bind safe.

@@ -143,7 +143,7 @@ pub(crate) fn sent(seq: u64, now: u64) -> Option<usize> {
 /// PASSIVE (takes the virtio lock); the DPC does the same inline.
 pub(crate) fn wake(adapter: &AdapterContext, owner: usize) {
     if owner == DeviceOwner::KMD_RM.raw() {
-        adapter.signal_hpd();
+        adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::RELEASE);
         return;
     }
     let _ = adapter.with_virtio(|v| v.signal_scanout_released(owner));
