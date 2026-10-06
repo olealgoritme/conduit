@@ -1527,7 +1527,8 @@ here sets `KmdRmSysCache` before step 7: steps 1 to 6 run on the default, write-
 4. **DWM into an RM primary** (15.8): the host's Venus import of RM-export memory by resource id, the
    STANDARD identity not carrying the FOREIGN flag, `memory_type_index` 0.
 5. **The standard buffers** (15.2): worth moving once 1 and 4 are answered; the cost is the Present-buffer
-   registration in an RM arm.
+   registration in an RM arm. Scoped in `rm-backed-standard.md` (15.19): the first step there is not an RM
+   allocation (the Venus blob is made importable), the RM-backed arm is its second.
 6. **The release event** (15.7, 15.15): decided: the flip never waits, the close of a replaced primary does. Open: whether
    the host really sends `ScanoutReleased` for a level 5 flip's replaced buffer on this viewer (checklist step 9),
    and whether a user source that replaced our buffer should enter the flip log (today the close then does not wait).
@@ -2364,3 +2365,15 @@ it must not):
    `program_vidpn_source_inner` runs under the scanout lifecycle lock).
 6. **A withdrawn source owes the Venus desktop a flush** of an unbound foreign resource (`RfUnb`): the screen keeps its last
    flip. A copy-based fallback for an existing foreign primary is not built (the same limit as 15.14 point 3).
+
+### 15.19 KMD-made STANDARD allocations for DWM on NVK (design only; `rm-backed-standard.md`)
+
+The question of 15.2 and 15.14 item 5, asked by the DWM-on-NVK work: what is the smallest step that lets an NVK DWM open the
+KMD's own standard allocations (shadow, staging, GDI redirection surfaces) instead of composing a blank placeholder. The
+answer, with the file and line evidence of what creates them today, is in `docs/rm-backed-standard.md`: stage S-A0 (a census
+of the standard types DWM opens; `kmd_logic::rm_standard::hist_slot`), S-A (the Venus blob gets a foreign layout record and
+is imported through `RM_RESOURCE_IMPORT`: no allocation change), S-B (the allocation comes from CACHED RM system memory
+through this section's service, behind a knob, for the CPU-visible kinds only: cached because dxgkrnl maps these allocations
+write-back, so there is no alias; the primary's write-combined default of 15.5 stays the primary's), S-C (the GPU-only
+`GDISURFACE_TEXTURE`, only if the census asks for it). Pure logic written and tested for it: `kmd_logic::rm_standard`
+(allocation criteria, layout record, the 128 / 256 pitch fact, the census slots). Nothing in `kmd_render` calls it.

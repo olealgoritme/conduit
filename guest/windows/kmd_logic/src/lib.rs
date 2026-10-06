@@ -37,6 +37,7 @@ pub mod rm_present;
 pub mod rm_refresh;
 pub mod rm_blt;
 pub mod scanout_release;
+pub mod rm_standard;
 pub mod rm_sysmem;
 pub mod producer_completion;
 pub mod execution_completion;
