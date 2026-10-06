@@ -3032,7 +3032,7 @@ requirements above violated, this is the Present at which the frame can be torn.
 
 `take_ready_windowed_blt` looked only at the FRONT of the ready queue. A live producer boundary that has not finished (an NVK
 frame in flight) held every later windowed copy of every other window behind it, so one slow producer stalled DWM's other
-windows. Now the worker looks at the first `BltLookahead` ready entries (default 4, clamped 1 to 8, read at every StartDevice,
+windows. Now the worker looks at the first `BltLookahead` ready entries (default 1 = the old behaviour, so a plain build is unchanged; set 4 together with `BltAsync`; clamped 1 to 8, read at every StartDevice,
 mirrored as `BltLookKnob`; 1 is exactly the old behaviour) and dispatches the first that can go: admitted, its producer's
 boundary reached, its destination writable. Per-destination order is kept by construction: an entry never goes ahead of an
 earlier LIVE entry of its own destination, whether or not that earlier one could go (`blt_async::pick`; the test enumerates

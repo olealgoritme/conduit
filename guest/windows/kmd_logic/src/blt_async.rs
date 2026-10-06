@@ -475,8 +475,8 @@ pub const fn edge_owed(finish: Finish, copy_ok: bool) -> Option<Edge> {
 
 /// Most ready-queue entries the worker looks at (`BltLookahead`).
 pub const LOOKAHEAD_MAX: usize = 8;
-/// `BltLookahead` default: the first four ready entries.
-pub const LOOKAHEAD_DEFAULT: u32 = 4;
+/// `BltLookahead` default: 1 = the front only, the behaviour before v337 (the lookahead also changes the dispatch order of the DXVK snapshot copies that share the dispatcher, so it is opt-in: set 4 together with `BltAsync`).
+pub const LOOKAHEAD_DEFAULT: u32 = 1;
 
 /// `BltLookahead` as the driver uses it: 1 is the old behaviour (the front only), 0 is read as 1,
 /// anything above the maximum is cut to it.
@@ -899,7 +899,7 @@ mod tests {
     fn lookahead_is_clamped() {
         assert_eq!(clamp_lookahead(0), 1);
         assert_eq!(clamp_lookahead(1), 1);
-        assert_eq!(clamp_lookahead(LOOKAHEAD_DEFAULT), 4);
+        assert_eq!(clamp_lookahead(LOOKAHEAD_DEFAULT), 1);
         assert_eq!(clamp_lookahead(8), 8);
         assert_eq!(clamp_lookahead(9), LOOKAHEAD_MAX);
         assert_eq!(clamp_lookahead(u32::MAX), LOOKAHEAD_MAX);

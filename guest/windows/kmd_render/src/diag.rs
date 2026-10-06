@@ -1041,7 +1041,7 @@ pub mod knobs {
     /// invalid" instead. Independent of `BltAsync`. Read at every StartDevice; mirrored as
     /// `BltNoMirKnob`.
     pub const BLT_NO_MIRROR: KnobName = KnobName::new(b"BltNoMirror");
-    /// `BltLookahead` (default 4, 1 = the front of the ready queue only, the behaviour before
+    /// `BltLookahead` (default 1 = the front of the ready queue only, the behaviour before
     /// v337). How many entries of the WindowedBlt ready queue the HPD worker looks at when it
     /// picks the next copy to submit: a request whose producer has not finished, or whose
     /// destination is still being read, no longer holds the requests of unrelated destinations
