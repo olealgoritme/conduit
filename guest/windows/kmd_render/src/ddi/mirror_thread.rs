@@ -104,8 +104,8 @@ extern "C" {
 }
 
 extern "system" {
-    /// `KeGetCurrentThread()`: any IRQL.
-    fn KeGetCurrentThread() -> usize;
+    /// `PsGetCurrentThread()` (exported; `KeGetCurrentThread` is an inline in wdm.h and is not): any IRQL.
+    fn PsGetCurrentThread() -> usize;
     /// `KeSetPriorityThread(PKTHREAD, KPRIORITY)`: the previous priority. PASSIVE..DISPATCH.
     fn KeSetPriorityThread(thread: usize, priority: i32) -> i32;
 }
@@ -298,7 +298,7 @@ fn lower_priority() {
         return;
     }
     // SAFETY: the current thread, PASSIVE; KeSetPriorityThread returns the previous priority.
-    let old = unsafe { KeSetPriorityThread(KeGetCurrentThread(), prio as i32) };
+    let old = unsafe { KeSetPriorityThread(PsGetCurrentThread(), prio as i32) };
     PRIO_OLD.store(old.max(0) as u32, Ordering::Relaxed);
 }
 
