@@ -3091,6 +3091,11 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
   if (backend == helios_bridge::IcdBackend::NvkRm) {
     configure_dxvk_env_once(backend);
     auto nvk = run_with_stack([&]() -> std::unique_ptr<HeliosDxvkDevice> {
+      // NVK's own policy (Mesa 0032) hides its GPU from a process that Icd,
+      // the deny-list or HELIOS_ICD send to Venus; the UMD chose NVK past
+      // them (DwmIcd=nvk under Icd=venus: DWM got "Failed to initialize
+      // DXVK", docs/dwm-on-nvk.md T2), so NVK is told the same here.
+      helios_bridge::NvkPolicyScope policy;
       return bridge_guard<std::unique_ptr<HeliosDxvkDevice>>(
           "helios_dxvk_create_device(nvk)", nullptr,
           [&]() -> std::unique_ptr<HeliosDxvkDevice> {
