@@ -1230,6 +1230,34 @@ int crm_win_scanout_flip(const struct crm_scanout_flip *flip)
     return r ? r : reply_status(resp, n);
 }
 
+int crm_win_rm_resource_import(uint32_t rm_handle, uint32_t resource_id, uint32_t *gem_handle,
+                               uint64_t *size, uint64_t *modifier, uint32_t *flags)
+{
+    struct win_ctx *c = &g_ctx;
+    *gem_handle = 0;
+    if (!c->ready)
+        return -ENODEV;
+    uint8_t req[CRM_WIRE_HDR + CRM_WIRE_RM_RESOURCE_IMPORT];
+    uint8_t resp[CRM_WIRE_HDR + CRM_WIRE_RM_RESOURCE_IMPORT_REPLY + REPLY_SLACK];
+    uint32_t n = 0;
+    const size_t req_len = crm_wire_rm_resource_import(req, rm_handle, resource_id);
+    int r = win_forward(c, req, (uint32_t)req_len, resp, sizeof(resp), &n, 0, 0);
+    if (r)
+        return r;
+    struct crm_wire_rm_import_reply a;
+    r = crm_wire_parse_rm_resource_import(resp, n, &a);
+    if (r)
+        return r;
+    *gem_handle = a.gem_handle;
+    if (size)
+        *size = a.size;
+    if (modifier)
+        *modifier = a.modifier;
+    if (flags)
+        *flags = a.flags & CRM_RM_IMPORT_MODIFIER_VALID;
+    return 0;
+}
+
 /* Foreign scanout source (KMD 22.22.308+, QUERY_CAPS bits 9..11): the KMD owns
  * the ScanoutFlip, mints its seq and keeps the desktop's own flips off scanout 0
  * while the source is live. -ENOSYS from a KMD without the ops: send ScanoutFlip
@@ -1548,6 +1576,14 @@ int crm_win_ioctl(int fd, uint32_t cmd, void *arg, uint32_t size, void *nested,
 int crm_win_scanout_flip(const struct crm_scanout_flip *flip)
 {
     (void)flip;
+    return -ENOSYS;
+}
+
+int crm_win_rm_resource_import(uint32_t rm_handle, uint32_t resource_id, uint32_t *gem_handle,
+                               uint64_t *size, uint64_t *modifier, uint32_t *flags)
+{
+    (void)rm_handle; (void)resource_id; (void)size; (void)modifier; (void)flags;
+    *gem_handle = 0;
     return -ENOSYS;
 }
 

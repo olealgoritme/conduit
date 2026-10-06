@@ -234,6 +234,19 @@ struct crm_foreign_import {
 int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id,
                       uint32_t *host_errno);
 
+/* RmResourceImport (backend MsgType 31, docs/VENUS.md "RM-export resources in
+ * a second process"): the memory behind RM-export resource `resource_id`
+ * (another process's shared surface) becomes a GEM handle of the render node
+ * `rm_handle` (from crm_win_open_device), which the caller then imports into
+ * its own RM client (DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY,
+ * OS_UNIX_IMPORT_OBJECT_FROM_FD) and closes. *modifier_valid says whether the
+ * host knows the resource's layout. -EPROTO from a backend without the
+ * message, the KMD's refusal (-EPERM/-EBADF) for a resource this device did
+ * not create or open, else the host's -errno. */
+#define CRM_RM_IMPORT_MODIFIER_VALID 1u
+int crm_win_rm_resource_import(uint32_t rm_handle, uint32_t resource_id, uint32_t *gem_handle,
+                               uint64_t *size, uint64_t *modifier, uint32_t *flags);
+
 /* The platform default transport (what crm_open(.., NULL) uses). */
 const struct crm_transport *crm_default_transport(void);
 

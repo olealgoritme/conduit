@@ -1,0 +1,87 @@
+Helios DXVK fork: an NVK device opens another NVK process's surface
+
+Conduit guest/windows/docs/shared-surfaces.md, dxvk-on-nvk.md S6. Applied after
+0001 by ci/windows/Build-Driver.ps1 (the fork is not ours to push to).
+
+- An NVK device (HELIOS_DXVK_BACKEND=nvk) importing a shared texture that is a
+  foreign resource (the KMD's layout trailer, D3D11_HELIOS_IMPORT_INFO::Foreign,
+  with its resource id) builds the image as the creator did (OPTIMAL, the same
+  description) and allocates dedicated memory with HeliosImportMemoryResourceInfo
+  (sType 1000384004: resource id, object size, modifier, row pitch, offset).
+  NVK maps the creator's memory by resource id and checks the image's layout
+  against the trailer. Any other import on NVK still fails.
+
+diff --git a/src/dxvk/dxvk_helios_backend.h b/src/dxvk/dxvk_helios_backend.h
+index 653f208a..56224b43 100644
+--- a/src/dxvk/dxvk_helios_backend.h
++++ b/src/dxvk/dxvk_helios_backend.h
+@@ -54,4 +54,26 @@ namespace dxvk {
+   constexpr VkStructureType VK_STRUCTURE_TYPE_EXPORT_MEMORY_RESOURCE_INFO_HELIOS =
+     VkStructureType(1000384003);
+ 
++  /**
++   * \brief VkMemoryAllocateInfo pNext: map another NVK process's surface
++   *
++   * Mirrors helios_import_memory_resource_info in Conduit's
++   * guest/windows/protocol/include/helios_icd_interface.h. With a dedicated
++   * image laid out as the creator's (the KMD's layout trailer), NVK maps the
++   * memory behind the resource id instead of allocating.
++   */
++  struct HeliosImportMemoryResourceInfo {
++    VkStructureType sType;
++    const void*     pNext;
++    uint32_t        resourceId;
++    uint32_t        flags;
++    uint64_t        size;
++    uint64_t        modifier;
++    uint32_t        stride;
++    uint32_t        offset;
++  };
++
++  constexpr VkStructureType VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_HELIOS =
++    VkStructureType(1000384004);
++
+ }
+diff --git a/src/dxvk/dxvk_image.cpp b/src/dxvk/dxvk_image.cpp
+index 7ce24a2e..6a221464 100644
+--- a/src/dxvk/dxvk_image.cpp
++++ b/src/dxvk/dxvk_image.cpp
+@@ -454,11 +454,15 @@ namespace dxvk {
+ 
+     // Helios on NVK: no Venus external memory. An exported image gets dedicated
+     // memory with the Helios export request (NVK mints the KMD resource id from
+-    // it); an NVK device cannot import a resource made by another device.
++    // it). An imported one must be another NVK process's (a foreign resource,
++    // the KMD's layout trailer): NVK maps it by resource id, with this image
++    // built as the creator built it. A Venus-made resource cannot be imported.
+     const bool heliosNvk = m_shared && heliosBackendNvk();
++    const bool heliosNvkImport = heliosNvk
++      && m_info.sharing.mode == DxvkSharedHandleMode::Import;
+     if (heliosNvk) {
+-      if (m_info.sharing.mode == DxvkSharedHandleMode::Import)
+-        throw DxvkError("DxvkImage: NVK cannot import a shared resource");
++      if (heliosNvkImport && (!m_info.sharing.heliosForeign || !m_info.sharing.heliosResourceId))
++        throw DxvkError("DxvkImage: NVK can only import another NVK process's resource");
+       useVulkanExternalMemory = false;
+       useHeliosRendererExternalMemory = false;
+     }
+@@ -723,6 +727,19 @@ namespace dxvk {
+     if (heliosNvk && m_info.sharing.mode == DxvkSharedHandleMode::Export)
+       heliosNvkExport.pNext = std::exchange(sharedMemoryInfo, &heliosNvkExport);
+ 
++    HeliosImportMemoryResourceInfo heliosNvkImportInfo = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_HELIOS };
++    if (heliosNvkImport) {
++      heliosNvkImportInfo.resourceId = m_info.sharing.heliosResourceId;
++      heliosNvkImportInfo.size       = m_info.sharing.heliosAllocSize;
++      heliosNvkImportInfo.modifier   = m_info.sharing.heliosForeignModifier;
++      heliosNvkImportInfo.stride     = m_info.sharing.heliosForeignStride;
++      heliosNvkImportInfo.offset     = m_info.sharing.heliosForeignOffset;
++      heliosNvkImportInfo.pNext = std::exchange(sharedMemoryInfo, &heliosNvkImportInfo);
++      Logger::info(str::format("DxvkImage: NVK import of resource ", m_info.sharing.heliosResourceId,
++        " ", m_info.extent.width, "x", m_info.extent.height, " modifier 0x", std::hex,
++        m_info.sharing.heliosForeignModifier, std::dec, " pitch ", m_info.sharing.heliosForeignStride));
++    }
++
+     DxvkAllocationInfo allocationInfo = { };
+     allocationInfo.resourceCookie = cookie();
+     allocationInfo.properties = m_properties;

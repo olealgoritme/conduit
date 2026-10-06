@@ -57,6 +57,12 @@ enum helios_icd_backend {
 /* The producer interface (escape 0x13 streams keyed on a Venus timeline)
  * exists. NVK: no; presents are CPU-complete (value 0 markers). */
 #define HELIOS_ICD_CAP_PRODUCER (1u << 3)
+/* Surfaces another process of this backend made can be opened
+ * (guest/windows/docs/shared-surfaces.md): HELIOS_STRUCTURE_TYPE_IMPORT_
+ * MEMORY_RESOURCE_INFO is accepted. NVK: librmclient has
+ * crm_win_rm_resource_import; whether the KMD and host serve it shows only
+ * when it is tried. */
+#define HELIOS_ICD_CAP_SHARED_IMPORT (1u << 4)
 
 /* DRM fourcc / modifier values used below (drm_fourcc.h). */
 #define HELIOS_DRM_FORMAT_XRGB8888 0x34325258u
@@ -94,6 +100,32 @@ struct helios_export_memory_resource_info {
    const void *pNext;
    uint32_t flags;        /* 0 */
    uint32_t reserved;     /* 0 */
+};
+
+/* Chained into VkMemoryAllocateInfo by the opener's DXVK, together with a
+ * VkMemoryDedicatedAllocateInfo naming the image that will be bound, when a
+ * D3D app on NVK opens a surface another NVK process made (a foreign resource
+ * id the KMD let this device open): NVK maps the creator's memory instead of
+ * allocating. The resource id is the only name that crosses processes; NVK
+ * asks the host to make its memory a GEM object of NVK's own render node
+ * (backend RmResourceImport, docs/VENUS.md "RM-export resources in a second
+ * process") and imports that into its own RM client
+ * (DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY, OS_UNIX_IMPORT_OBJECT_FROM_FD). The
+ * image must have the layout the KMD recorded for the resource (the open's
+ * HeliosWddmAllocLayout trailer): NVK on Windows has no
+ * VK_EXT_image_drm_format_modifier, so it checks instead of building one.
+ * The memory takes the resource id as its own (memory_res_id answers it;
+ * nothing is released with the memory: the WDDM allocation owns the id). */
+#define HELIOS_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO ((VkStructureType)1000384004)
+struct helios_import_memory_resource_info {
+   VkStructureType sType; /* HELIOS_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO */
+   const void *pNext;
+   uint32_t resource_id;  /* the opened allocation's foreign resource id */
+   uint32_t flags;        /* 0 */
+   uint64_t size;         /* the object's size from the open (blob_size), 0: unknown */
+   uint64_t modifier;     /* DRM_FORMAT_MOD_* the image must have */
+   uint32_t stride;       /* plane 0 row pitch the image must have */
+   uint32_t offset;       /* plane 0 offset the image must have */
 };
 
 struct helios_icd_api {

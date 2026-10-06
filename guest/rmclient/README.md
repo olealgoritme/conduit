@@ -24,6 +24,7 @@ positive `NV_STATUS` when RM refused the call. `crm_status_name()` and
 | `crm_alloc(c, parent, &h, class, params, size)` | `NV_ESC_RM_ALLOC` (NVOS64). `h = 0` lets the library pick a handle. `params` is in/out. |
 | `crm_control(c, object, cmd, params, size)` | `NV_ESC_RM_CONTROL` (NVOS54) |
 | `crm_free(c, parent, object)` | `NV_ESC_RM_FREE` (NVOS00). `parent = 0` looks the parent up. |
+| `crm_dup_object(c, parent, &h, client_src, object_src, hclass, flags)` | `NV_ESC_RM_DUP_OBJECT` (NVOS55): another client's object as a new handle of this one, tracked like an allocation |
 | `crm_map_memory` / `crm_unmap_memory` | `NV_ESC_RM_MAP_MEMORY` (NVOS33 + fd) + `mmap` / `munmap` + `NV_ESC_RM_UNMAP_MEMORY` (NVOS34) |
 | `crm_map_dma[2]` / `crm_unmap_dma` | `NV_ESC_RM_MAP_MEMORY_DMA` (NVOS46) / `NV_ESC_RM_UNMAP_MEMORY_DMA` (NVOS47) |
 | `crm_gpu_count`, `crm_gpu_info`, `crm_gpu_pci` | the `NV_ESC_CARD_INFO` read at open |
@@ -174,6 +175,14 @@ host driver): `crm_smoke` passes every required and extra step except the OS
 event, and `crm_pin_smoke` passes, with the KMD's NvPin and NvUnpin counters
 equal afterwards.
 
+`crm_dup_object` (`NV_ESC_RM_DUP_OBJECT`) works across processes of a
+Windows guest (`tests/crm_share_smoke.c`, win11, KMD 22.22.311.0): every RM
+client of a VM lives in the one backend process, so RM lets any of them dup
+from any other. The sanctioned route for shared surfaces is the resource id
+instead (`crm_win_rm_resource_import`, backend `RmResourceImport`,
+`guest/windows/docs/shared-surfaces.md`); the KMD is to refuse a dup whose
+source client is another process's.
+
 Not done yet: the Windows transport's events (the KMD's EVENT verbs are
-reserved in the ABI but not implemented), `NV_ESC_RM_DUP_OBJECT`, and
-export/import of objects by fd.
+reserved in the ABI but not implemented), and export/import of objects by fd
+outside the nvidia-drm paths.

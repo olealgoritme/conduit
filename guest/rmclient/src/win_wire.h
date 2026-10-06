@@ -30,6 +30,7 @@
 #define CRM_WIN_WIRE_H
 
 #include <stddef.h>
+#include <errno.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -39,6 +40,9 @@
 #define CRM_WIRE_MSG_GET_PROC_FILES 6u
 #define CRM_WIRE_MSG_GET_SYS_FILES 7u
 #define CRM_WIRE_MSG_SCANOUT_FLIP 20u
+/* An RM-export resource as a GEM handle of one of our render nodes
+ * (docs/VENUS.md "RM-export resources in a second process"). */
+#define CRM_WIRE_MSG_RM_RESOURCE_IMPORT 31u
 
 #define CRM_WIRE_DEV_CTL 255u /* /dev/nvidiactl */
 /* DRM render node n of the host's GetSysFiles DRI list (DeviceKind::Dri). */
@@ -48,6 +52,8 @@
 #define CRM_WIRE_IOCTL_REQ 24u
 #define CRM_WIRE_IOCTL_RESP 12u
 #define CRM_WIRE_SCANOUT_FLIP 64u
+#define CRM_WIRE_RM_RESOURCE_IMPORT 16u
+#define CRM_WIRE_RM_RESOURCE_IMPORT_REPLY 24u
 
 /* The backend caps one Ioctl's blocks at 1 MiB each (the guest module does). */
 #define CRM_WIRE_BLOCK_MAX (1024u * 1024u)
@@ -142,6 +148,45 @@ static inline size_t crm_wire_scanout_flip(uint8_t *out, const struct crm_wire_f
     crm_put64(p + 40, f->seq);
     memset(p + 48, 0, 16); /* reserved */
     return CRM_WIRE_HDR + CRM_WIRE_SCANOUT_FLIP;
+}
+
+/* MsgHeader | RmResourceImport{owner_handle, resource_id, flags 0, reserved 0}.
+ * Returns the request length (32). */
+static inline size_t crm_wire_rm_resource_import(uint8_t *out, uint32_t owner_handle,
+                                                 uint32_t resource_id)
+{
+    crm_wire_header(out, CRM_WIRE_MSG_RM_RESOURCE_IMPORT, 0);
+    uint8_t *p = out + CRM_WIRE_HDR;
+    crm_put32(p + 0, owner_handle);
+    crm_put32(p + 4, resource_id);
+    crm_put32(p + 8, 0);
+    crm_put32(p + 12, 0);
+    return CRM_WIRE_HDR + CRM_WIRE_RM_RESOURCE_IMPORT;
+}
+
+struct crm_wire_rm_import_reply {
+    uint32_t gem_handle, flags;
+    uint64_t size, modifier;
+};
+
+/* The reply: 0 and *out filled, the header's negative status, or -EIO for a
+ * reply too short to hold the body. */
+static inline int crm_wire_parse_rm_resource_import(const uint8_t *resp, uint32_t n,
+                                                    struct crm_wire_rm_import_reply *out)
+{
+    if (n < CRM_WIRE_HDR)
+        return -EIO;
+    const int32_t status = (int32_t)crm_get32(resp + 8);
+    if (status)
+        return status;
+    if (n < CRM_WIRE_HDR + CRM_WIRE_RM_RESOURCE_IMPORT_REPLY)
+        return -EIO;
+    const uint8_t *p = resp + CRM_WIRE_HDR;
+    out->gem_handle = crm_get32(p + 0);
+    out->flags = crm_get32(p + 4);
+    out->size = (uint64_t)crm_get32(p + 8) | ((uint64_t)crm_get32(p + 12) << 32);
+    out->modifier = (uint64_t)crm_get32(p + 16) | ((uint64_t)crm_get32(p + 20) << 32);
+    return out->gem_handle ? 0 : -EIO;
 }
 
 /* Request and reply sizes of an Ioctl carrying `data` plus one nested block. */
