@@ -38,6 +38,8 @@ use crate::adapter::{gate_active, AdapterContext};
 /// `FlipAnnounce` in force (`AnnounceMode::code`), `FlipEarlyWake` in force.
 static MODE: AtomicU32 = AtomicU32::new(0);
 static EARLY: AtomicU32 = AtomicU32::new(0);
+/// `FlipAnnForeign` in force.
+static FOREIGN_OK: AtomicU32 = AtomicU32::new(0);
 
 /// The address (and handle) the newest announce waits for the worker to confirm; 0 = none.
 static ANN_ADDR: AtomicU64 = AtomicU64::new(0);
@@ -61,24 +63,35 @@ static NO_WHY: AtomicU32 = AtomicU32::new(0);
 static NO_BUSY: AtomicU32 = AtomicU32::new(0);
 static NO_UNK: AtomicU32 = AtomicU32::new(0);
 static NO_FAIL: AtomicU32 = AtomicU32::new(0);
+static NO_FGN: AtomicU32 = AtomicU32::new(0);
 static NO_OTHER: AtomicU32 = AtomicU32::new(0);
 static EARLY_N: AtomicU32 = AtomicU32::new(0);
 static MIRROR_PENDING: AtomicU32 = AtomicU32::new(1);
 
+/// The `FlipAnnounce` mode the service key asks for (default `flip_retire::DEFAULT_KNOB`: 2).
+/// PASSIVE (registry read).
+pub(crate) fn configured_mode() -> AnnounceMode {
+    AnnounceMode::from_knob(crate::diag::read_config_dword(
+        crate::diag::knobs::FLIP_ANNOUNCE,
+        fr::DEFAULT_KNOB,
+    ))
+}
+
 /// `FlipAnnounce` and `FlipEarlyWake` for this start, and the zeroed counters. PASSIVE.
 pub(crate) fn start_generation() {
-    let mode = AnnounceMode::from_knob(crate::diag::read_config_dword(
-        crate::diag::knobs::FLIP_ANNOUNCE,
-        0,
-    ));
+    let mode = configured_mode();
     let early = crate::diag::read_config_dword(crate::diag::knobs::FLIP_EARLY_WAKE, 0);
+    FOREIGN_OK.store(
+        u32::from(crate::diag::read_config_dword(crate::diag::knobs::FLIP_ANN_FOREIGN, 0) != 0),
+        Ordering::Relaxed,
+    );
     MODE.store(mode.code(), Ordering::Relaxed);
     EARLY.store(u32::from(early != 0), Ordering::Relaxed);
     ANN_ADDR.store(0, Ordering::Release);
     ANN_HANDLE.store(0, Ordering::Release);
     invalidate_all();
     for c in [
-        &DDI, &WORKER, &REFUSE, &LATE, &NO, &NO_WHY, &NO_BUSY, &NO_UNK, &NO_FAIL, &NO_OTHER,
+        &DDI, &WORKER, &REFUSE, &LATE, &NO, &NO_WHY, &NO_BUSY, &NO_UNK, &NO_FAIL, &NO_OTHER, &NO_FGN,
         &EARLY_N,
     ] {
         c.store(0, Ordering::Relaxed);
@@ -138,6 +151,10 @@ fn accepted(resource: u32) -> bool {
 pub(crate) fn worker_idle(adapter: &AdapterContext) -> bool {
     adapter.pending_vidpn_allocation.load(Ordering::Acquire) == 0
         && !gate_active(adapter.vidpn_programming.load(Ordering::Acquire))
+        // The gate drops when the programming (bind, `take`) returns, but the ForeignFlip host
+        // flip of that picture is the worker's LATER step (paced, windowed, asynchronous): the
+        // previous buffer is still read until it is done.
+        && !crate::virtio::foreign_flip::busy()
 }
 
 /// First thing in every `SetVidPnSourceAddress` with a mode on: forget an announcement the
@@ -147,11 +164,21 @@ pub(crate) fn worker_idle(adapter: &AdapterContext) -> bool {
 #[inline]
 pub(crate) fn on_ddi_entry(adapter: &AdapterContext) -> bool {
     if mode().announces() {
-        ANN_ADDR.store(0, Ordering::Release);
-        ANN_HANDLE.store(0, Ordering::Release);
+        forget_unconfirmed();
         return worker_idle(adapter);
     }
     false
+}
+
+/// Forget an announcement nobody confirmed. Called at every flip dxgkrnl issues (the MMIO DDI
+/// above, and the DMA lane's submit and keep record, which do not announce but publish through
+/// the funnel too) and when the display publication state is reset. Atomics only.
+#[inline]
+pub(crate) fn forget_unconfirmed() {
+    if ANN_ADDR.load(Ordering::Relaxed) != 0 {
+        ANN_ADDR.store(0, Ordering::Release);
+        ANN_HANDLE.store(0, Ordering::Release);
+    }
 }
 
 /// The paired flip `h_alloc` naming `address` reached the DDI (DIRQL; `idle` is
@@ -168,10 +195,16 @@ pub(crate) unsafe fn at_ddi(adapter: &AdapterContext, h_alloc: HANDLE, address: 
     // SAFETY: the same lock-free resolution `set_vidpn_primary_address` just made.
     let resource = unsafe { crate::ddi::create_allocation::allocation_resource_id(adapter, h_alloc) };
     let accepted = resource.is_some_and(accepted);
+    // The KMD's own lock-free record of the allocation: a foreign or hollow one is not Venus.
+    // SAFETY: as above.
+    let foreign_class = unsafe { crate::ddi::create_allocation::flip_completion_info(adapter, h_alloc) }
+        .is_some_and(|(source, _)| source != helios_kmd_logic::flip_completion::Source::Venus);
     let facts = AnnounceFacts {
         mode,
         address,
         resource,
+        foreign_class,
+        foreign_ok: FOREIGN_OK.load(Ordering::Relaxed) != 0,
         idle,
         accepted,
         failing: crate::virtio::foreign_flip::failing_atomics(),
@@ -191,6 +224,7 @@ pub(crate) unsafe fn at_ddi(adapter: &AdapterContext, h_alloc: HANDLE, address: 
                 NoAnnounce::Busy => NO_BUSY.fetch_add(1, Ordering::Relaxed),
                 NoAnnounce::Unknown => NO_UNK.fetch_add(1, Ordering::Relaxed),
                 NoAnnounce::Failing => NO_FAIL.fetch_add(1, Ordering::Relaxed),
+                NoAnnounce::ForeignOff => NO_FGN.fetch_add(1, Ordering::Relaxed),
                 _ => NO_OTHER.fetch_add(1, Ordering::Relaxed),
             };
         }
@@ -228,6 +262,16 @@ pub(crate) fn funnel(address: u64) -> bool {
     }
 }
 
+/// A ring-1 copy completion DPC is about to store `address` as the displayed one (it stores
+/// through a pointer, not through `publish_displayed_primary`): the same funnel. Returns whether
+/// to store. The announced flip's own copy completion confirms the announcement (the store is
+/// skipped: already published), and a completion of an OLDER copy after a newer announce is
+/// dropped instead of regressing the heartbeat's address.
+#[inline]
+pub(crate) fn funnel_dpc(address: u64) -> bool {
+    funnel(address)
+}
+
 /// The worker's programming of `h_alloc` ended in a refusal. If that flip was announced the
 /// flip already retired (the screen keeps the previous picture: the kept-picture semantics
 /// every foreign refusal had): count it. Atomics only.
@@ -239,24 +283,28 @@ pub(crate) fn note_worker_refused(h_alloc: HANDLE) {
 
 /// Mirror the counters. PASSIVE only (the stall-diagnosis mirror).
 pub(crate) fn publish_counters() {
-    use crate::diag::record_named_bytes as rec;
+    let mut mr = crate::ddi::flip_lat::Mirror::new(crate::ddi::flip_lat::ANNOUNCE_BASE);
     let owed = MIRROR_PENDING.swap(0, Ordering::AcqRel) != 0;
     let m = MODE.load(Ordering::Relaxed);
     let e = EARLY.load(Ordering::Relaxed);
     if !owed && m == 0 && e == 0 {
         return;
     }
-    rec(b"FaKnob", m | (e << 8));
-    rec(b"FaEarly", EARLY_N.load(Ordering::Relaxed));
-    rec(b"FaDdi", DDI.load(Ordering::Relaxed));
-    rec(b"FaWorker", WORKER.load(Ordering::Relaxed));
-    rec(b"FaRefuse", REFUSE.load(Ordering::Relaxed));
-    rec(b"FaLate", LATE.load(Ordering::Relaxed));
-    rec(b"FaTick", crate::ddi::flip_lat::announced_ticks());
-    rec(b"FaNo", NO.load(Ordering::Relaxed));
-    rec(b"FaNoWhy", NO_WHY.load(Ordering::Relaxed));
-    rec(b"FaNoBusy", NO_BUSY.load(Ordering::Relaxed));
-    rec(b"FaNoUnk", NO_UNK.load(Ordering::Relaxed));
-    rec(b"FaNoFail", NO_FAIL.load(Ordering::Relaxed));
-    rec(b"FaNoOther", NO_OTHER.load(Ordering::Relaxed));
+    mr.rec(
+        b"FaKnob",
+        m | (e << 8) | (FOREIGN_OK.load(Ordering::Relaxed) << 16),
+    );
+    mr.rec(b"FaEarly", EARLY_N.load(Ordering::Relaxed));
+    mr.rec(b"FaDdi", DDI.load(Ordering::Relaxed));
+    mr.rec(b"FaWorker", WORKER.load(Ordering::Relaxed));
+    mr.rec(b"FaRefuse", REFUSE.load(Ordering::Relaxed));
+    mr.rec(b"FaLate", LATE.load(Ordering::Relaxed));
+    mr.rec(b"FaTick", crate::ddi::flip_lat::announced_ticks());
+    mr.rec(b"FaNo", NO.load(Ordering::Relaxed));
+    mr.rec(b"FaNoWhy", NO_WHY.load(Ordering::Relaxed));
+    mr.rec(b"FaNoBusy", NO_BUSY.load(Ordering::Relaxed));
+    mr.rec(b"FaNoUnk", NO_UNK.load(Ordering::Relaxed));
+    mr.rec(b"FaNoFail", NO_FAIL.load(Ordering::Relaxed));
+    mr.rec(b"FaNoOther", NO_OTHER.load(Ordering::Relaxed));
+    mr.rec(b"FaNoFgn", NO_FGN.load(Ordering::Relaxed));
 }

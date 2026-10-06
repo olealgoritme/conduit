@@ -5356,13 +5356,23 @@ impl VirtioGpu {
                             // every in-flight entry.
                             unsafe {
                                 if response_ok {
-                                    notify
-                                        .displayed_primary
-                                        .as_ref()
-                                        .store(notify.primary_address, Ordering::Release);
-                                    // `FlipPub`: this DPC stores through the pointer, not
-                                    // through `publish_displayed_primary`.
-                                    crate::ddi::stall_diag::note_published(notify.primary_address);
+                                    // `FlipAnnounce`: the same funnel as
+                                    // `publish_displayed_primary` (this DPC stores through the
+                                    // pointer): the announced flip's own completion confirms the
+                                    // announcement, an older one never regresses a newer announce.
+                                    crate::ddi::flip_lat::note_published(notify.primary_address);
+                                    if crate::ddi::flip_announce::funnel_dpc(notify.primary_address)
+                                    {
+                                        notify
+                                            .displayed_primary
+                                            .as_ref()
+                                            .store(notify.primary_address, Ordering::Release);
+                                        // `FlipPub`: this DPC stores through the pointer, not
+                                        // through `publish_displayed_primary`.
+                                        crate::ddi::stall_diag::note_published(
+                                            notify.primary_address,
+                                        );
+                                    }
                                     notify.pending.as_ref().store(1, Ordering::Release);
                                 } else if notify.keep_on_failure
                                     && notify.primary_address != 0
@@ -5373,11 +5383,17 @@ impl VirtioGpu {
                                     // hold the flip. Publish it as a kept picture (the screen
                                     // keeps what it showed; no refresh is requested): the same
                                     // atomic store as above, legal at this DISPATCH_LEVEL.
-                                    notify
-                                        .displayed_primary
-                                        .as_ref()
-                                        .store(notify.primary_address, Ordering::Release);
-                                    crate::ddi::stall_diag::note_published(notify.primary_address);
+                                    crate::ddi::flip_lat::note_published(notify.primary_address);
+                                    if crate::ddi::flip_announce::funnel_dpc(notify.primary_address)
+                                    {
+                                        notify
+                                            .displayed_primary
+                                            .as_ref()
+                                            .store(notify.primary_address, Ordering::Release);
+                                        crate::ddi::stall_diag::note_published(
+                                            notify.primary_address,
+                                        );
+                                    }
                                     crate::ddi::flip_keep::count(
                                         helios_kmd_logic::flip_completion::KeepWhy::AsyncCopyFailed,
                                         crate::ddi::flip_keep::Lane::Async,

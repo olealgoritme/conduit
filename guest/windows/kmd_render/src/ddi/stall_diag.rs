@@ -55,6 +55,9 @@ pub(crate) fn hpd_enter(step: u32) {
         if us >= 100_000 {
             HPD_STEP_100_N.fetch_add(1, Ordering::Relaxed);
         }
+        if let Some(c) = STEP_MAX_US.get(left as usize) {
+            c.fetch_max(us, Ordering::Relaxed);
+        }
         let ms = helios_kmd_logic::vsync_rate::ms_from_100ns(now);
         if HPD_LONG.note(us, left, ms) {
             // What else was going on when the longest step ended: the DDIs inside the driver.
@@ -76,6 +79,10 @@ static HPD_SITE_AT: AtomicU64 = AtomicU64::new(0);
 static HPD_LONG: helios_kmd_logic::device_lost::Longest = helios_kmd_logic::device_lost::Longest::new();
 static HPD_LONG_INFL: AtomicU32 = AtomicU32::new(0);
 static HPD_STEP_100_N: AtomicU32 = AtomicU32::new(0);
+/// The longest dwell (microseconds) in each worker step, by `site` id (`HpdMx00`..`HpdMx31`).
+#[allow(clippy::declare_interior_mutable_const)]
+const Z32: AtomicU32 = AtomicU32::new(0);
+static STEP_MAX_US: [AtomicU32; 32] = [Z32; 32];
 /// Passes of the worker that took 100 ms or more, and 500 ms or more.
 static HPD_PASS_100_N: AtomicU32 = AtomicU32::new(0);
 static HPD_PASS_500_N: AtomicU32 = AtomicU32::new(0);
@@ -1247,6 +1254,12 @@ pub(crate) fn publish_mode() {
 /// The longest worker step and the longest vsync silence, with the context each ended in.
 fn publish_long_events() {
     use crate::diag::record_named_bytes as rec;
+    // The longest dwell in each worker step, microseconds (`HpdMx00`.. = `site` id): which step of
+    // a pass is the long one, whatever the pass total.
+    for (i, c) in STEP_MAX_US.iter().enumerate() {
+        let name = [b'H', b'p', b'd', b'M', b'x', b'0' + (i / 10) as u8, b'0' + (i % 10) as u8];
+        rec(&name, c.load(Ordering::Relaxed));
+    }
     rec(b"HpdLongSite", HPD_LONG.tag.load(Ordering::Relaxed));
     rec(b"HpdLongUs", HPD_LONG.value.load(Ordering::Relaxed));
     rec(b"HpdLongT", HPD_LONG.t.load(Ordering::Relaxed));
@@ -1284,6 +1297,9 @@ fn publish_breadcrumbs() {
 /// once (zeros included) so values an earlier run left in the service key are never read as this
 /// one's. PASSIVE.
 pub(crate) fn start_generation() {
+    for c in &STEP_MAX_US {
+        c.store(0, Ordering::Relaxed);
+    }
     for c in [
         &HPD_LOOP_N,
         &HPD_LOOP_T,
@@ -1401,6 +1417,19 @@ pub(crate) fn start_generation() {
     START_N.fetch_add(1, Ordering::Relaxed);
     START_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
     publish_counters();
+}
+
+/// Ask for [`publish_counters`] without running it on the caller's thread: the mirror thread
+/// (`ddi::mirror_thread`) takes the pass, at most once a second, so the HPD worker is not away from
+/// its flips for the length of well over a hundred registry writes (`FlipMaxUs` 29 ms at site 19 on
+/// 332.1). Inline when the thread does not exist. Any IRQL up to DISPATCH when it does, PASSIVE
+/// when it does not.
+pub(crate) fn request_publish() {
+    if crate::ddi::mirror_thread::running() {
+        crate::ddi::mirror_thread::request();
+    } else {
+        publish_counters();
+    }
 }
 
 /// Mirror the counters to the service key. PASSIVE_LEVEL only; a few dozen microseconds of

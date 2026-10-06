@@ -841,7 +841,7 @@ pub mod knobs {
     /// 0 is coerced to 1 (a zero-depth flip queue is not representable) and the
     /// value actually advertised is mirrored in the `FlipQueV` counter.
     pub const FLIP_QUEUE_DEPTH: KnobName = KnobName::new(b"FlipQueueN");
-    /// `FlipAnnounce` (default 0 = off, today's behaviour): publish a flip's address toward
+    /// `FlipAnnounce` (default 2 since the 332.1 hardware rows; 0 = off, the old behaviour): publish a flip's address toward
     /// dxgkrnl AT `SetVidPnSourceAddress` (atomics only, DIRQL) so the very next CRTC_VSYNC tick
     /// retires it (one tick per flip instead of two), while the HPD worker does the real
     /// programming afterwards. 1 = only flips of foreign allocations `ForeignFlip` already
@@ -851,6 +851,11 @@ pub mod knobs {
     /// Read at every StartDevice (`pnputil /restart-device` applies it); mirrored as `FaKnob`.
     /// `docs/kmd-rm-client.md` 15.18.15.
     pub const FLIP_ANNOUNCE: KnobName = KnobName::new(b"FlipAnnounce");
+    /// `FlipAnnForeign` (default 0): with `FlipAnnounce` 2, also announce flips of foreign or
+    /// hollow allocations (the NVK DWM's swap chain). 0 announces the Venus class only.
+    /// `FlipAnnounce` 1 (the explicit foreign mode) ignores it. Read at every StartDevice; mirrored
+    /// in `FaKnob` (bit 16). The name is 14 characters, the lookup buffer's limit.
+    pub const FLIP_ANN_FOREIGN: KnobName = KnobName::new(b"FlipAnnForeign");
     /// `FlipEarlyWake` (default 0): the DDI asks for the device DPC that wakes the HPD worker the
     /// moment a flip is pending, instead of the worker waiting for the next vsync tick; without
     /// an announce the retire still waits for the worker's publication (one tick earlier on

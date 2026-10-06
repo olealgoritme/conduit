@@ -29,6 +29,7 @@ mod gpummu;
 pub(crate) mod hpd;
 pub(crate) mod interrupt;
 mod lifecycle;
+pub(crate) mod mirror_thread;
 pub(crate) mod onscanout;
 pub(crate) mod present_foreign;
 pub(crate) mod present_packet;

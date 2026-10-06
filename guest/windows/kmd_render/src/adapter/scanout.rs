@@ -710,7 +710,7 @@ impl AdapterContext {
         }
 
         // The stall-diagnosis block rides the same periodic mirror (`ddi::stall_diag`).
-        crate::ddi::stall_diag::publish_counters();
+        crate::ddi::stall_diag::request_publish();
         crate::diag::record_named_bytes(b"RfRid", resource_id);
         crate::diag::record_named_bytes(b"RfWH", (width << 16) | (height & 0xFFFF));
         crate::diag::record_named_bytes(b"RfCnt", n);
