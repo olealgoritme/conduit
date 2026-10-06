@@ -173,12 +173,24 @@ never drained) with user-mode state only; its cost is the reader's submission-wo
 the read needs anyway. A GPU-side wait can replace the CPU wait in the reader's submission worker
 later without changing the ledger.
 
-Limits: slots are never freed (32768 keys per session, then the releaser falls back to the CPU
-wait), the device records are not reused (65536 per session, likewise), reads other than copies
-and sampled views (resolves, blits from a shared image) do not wait. Knobs:
-`HELIOS_HANDOFF_LEDGER=0` (the previous behaviour), `HELIOS_FLUSH_GATE_CPU_WAIT=1` (also the
-releaser CPU wait). `d3d11_share keyed-load W H ROUNDS COPIES perf` reports the producer's
-flush+release time and hand-offs/s without readbacks.
+Reclamation (ledger v2, `Local\\HeliosHandoffLedger2`): a slot lists the processes holding its
+resource id (four pids, more are counted); `DestroyResource` of the last registration in a process
+removes its pid, and the slot becomes a tombstone when no holder is left. Device records (4096)
+carry a generation that is part of every published point: a record is freed when its device is
+destroyed (after its last point completed, bounded 2 s) and taken over when its process is gone,
+and a reader ignores points of a record whose generation moved on. When a probe window is full or
+no record is free, slots and records of dead processes are swept; only then does a hand-off fall
+back to the releaser CPU wait, counted. Header counters (records in use, slots in use, fallbacks,
+sweeps, hand-offs) are in the UMD log every 4096 hand-offs and from `d3d11_share ledger`;
+`d3d11_share churn N` creates, hands off and destroys N shared textures and checks that the slots
+in use come back.
+
+Any access waits (DXVK patch 0008): the ledger is sampled where DXVK tracks every resource
+access, at the first tracking of a shared image in a submission, so render targets, clears, UAV
+writes and blending wait for a pending hand-off too (write-after-write); one wait per image per
+submission. Knobs: `HELIOS_HANDOFF_LEDGER=0` (the previous behaviour),
+`HELIOS_FLUSH_GATE_CPU_WAIT=1` (also the releaser CPU wait). `d3d11_share keyed-load W H ROUNDS
+COPIES perf` reports the producer's flush+release time and hand-offs/s without readbacks.
 
 ## 5. Implementation on this branch
 

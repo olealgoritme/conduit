@@ -5,6 +5,10 @@
 //   d3d11_share.exe [nt|nt-keyed|kmt] [width=1920 height=1080]
 //   d3d11_share.exe keyed-load [width height [rounds=20 [copies=400 [perf]]]]
 //
+//   d3d11_share.exe churn [count=2000]   create/hand off/destroy shared textures,
+//                                        the ledger's slots must not leak
+//   d3d11_share.exe ledger               print the ledger's counters
+//
 // `perf` skips the readbacks (no correctness check) and reports the
 // producer's flush+release time and hand-offs per second.
 //
@@ -47,6 +51,8 @@ static void check(const char *what, bool ok) {
   std::fflush(stdout);
   if (!ok) failed = 1;
 }
+
+static void print_ledger(const char *when);
 
 static UINT32 texel(UINT x, UINT y, UINT32 seed) {
   return ((x * 7919u) ^ (y * 104729u) ^ seed) | 0xff000000u;
@@ -356,6 +362,7 @@ static int keyed_load(UINT w, UINT h, UINT rounds, UINT load, bool perf) {
   DWORD counters_after[kFlushGateCounterCount];
   read_flush_gate_counters(counters_after);
   print_flush_gate_counters(counters_before, counters_after);
+  print_ledger("end");
   WaitForSingleObject(pi.hProcess, 120000);
   DWORD code = 1;
   GetExitCodeProcess(pi.hProcess, &code);
@@ -374,6 +381,84 @@ static int keyed_load(UINT w, UINT h, UINT rounds, UINT load, bool perf) {
   return failed;
 }
 
+// The UMD's hand-off ledger header (umd/bridge/dxvk_bridge.cpp helios_handoff):
+// records and slots in use, fallbacks to the CPU wait, sweeps, hand-offs.
+static bool read_ledger(unsigned *out) {
+  HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Local\\HeliosHandoffLedger2");
+  if (!m)
+    return false;
+  const unsigned *v = static_cast<const unsigned *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, 32));
+  CloseHandle(m);
+  if (!v)
+    return false;
+  for (int i = 0; i < 8; i++)
+    out[i] = v[i];
+  UnmapViewOfFile(v);
+  return out[0] == 0x324C4448u;
+}
+
+static void print_ledger(const char *when) {
+  unsigned l[8];
+  if (!read_ledger(l)) {
+    std::printf("       ledger (%s): absent\n", when);
+    return;
+  }
+  std::printf("       ledger (%s): %u records, %u slots in use, %u fallbacks, %u sweeps, %u hand-offs\n",
+              when, l[3], l[4], l[5], l[6], l[7]);
+}
+
+// churn: create, hand off and destroy `count` shared textures; the ledger's
+// slots in use must come back to where they started.
+static int churn(UINT count) {
+  ID3D11Device1 *dev = nullptr;
+  ID3D11DeviceContext *ctx = nullptr;
+  if (!make_device(&dev, &ctx)) {
+    check("a D3D11 device", false);
+    return 1;
+  }
+  print_ledger("before");
+  unsigned before[8] = {}, after[8] = {};
+  read_ledger(before);
+  for (UINT i = 0; i < count; i++) {
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = 256;
+    d.Height = 256;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    ID3D11Texture2D *t = nullptr;
+    if (FAILED(dev->CreateTexture2D(&d, nullptr, &t)) || !t) {
+      check("a shared texture", false);
+      return 1;
+    }
+    ID3D11RenderTargetView *rtv = nullptr;
+    dev->CreateRenderTargetView(t, nullptr, &rtv);
+    const float c[4] = {float(i & 1), 0, 0, 1};
+    if (rtv) ctx->ClearRenderTargetView(rtv, c);
+    ctx->Flush(); // a hand-off: publishes on the texture
+    if (rtv) rtv->Release();
+    t->Release();
+    if (i % 64 == 63) {
+      ctx->Flush();
+      print_ledger("during");
+    }
+  }
+  ctx->ClearState();
+  ctx->Flush();
+  Sleep(200);
+  read_ledger(after);
+  print_ledger("after");
+  check("slots in use came back (no leak per texture)", after[4] <= before[4] + 1);
+  ctx->Release();
+  dev->Release();
+  std::printf("%s\n", failed ? "CHURN FAILED" : "CHURN PASSED");
+  return failed;
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   if (argc >= 6 && !std::strcmp(argv[1], "open") && !std::strcmp(argv[2], "keyed-load"))
@@ -381,6 +466,12 @@ int main(int argc, char **argv) {
                              argc > 6 && std::atoi(argv[6]) != 0);
   if (argc >= 5 && !std::strcmp(argv[1], "open"))
     return opener(argv[2], UINT(std::atoi(argv[3])), UINT(std::atoi(argv[4])), argc > 5 ? argv[5] : "0");
+  if (argc > 1 && !std::strcmp(argv[1], "churn"))
+    return churn(argc > 2 ? UINT(std::atoi(argv[2])) : 2000);
+  if (argc > 1 && !std::strcmp(argv[1], "ledger")) {
+    print_ledger("now");
+    return 0;
+  }
   if (argc > 1 && !std::strcmp(argv[1], "keyed-load")) {
     std::printf("       A: mode keyed-load, HELIOS_ICD=%s\n", std::getenv("HELIOS_ICD") ? std::getenv("HELIOS_ICD") : "(unset)");
     return keyed_load(argc > 3 ? UINT(std::atoi(argv[2])) : 1920, argc > 3 ? UINT(std::atoi(argv[3])) : 1080,

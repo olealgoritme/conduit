@@ -171,6 +171,9 @@ mod ffi {
         /// Hand-off ledger: give a shared resource its key now.
         /// # Safety: a live `ID3D11Resource*`.
         unsafe fn handoff_register(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize);
+        /// Hand-off ledger: the resource goes; this process lets go of its key.
+        /// # Safety: a live `ID3D11Resource*`.
+        unsafe fn handoff_unregister(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize);
         /// Hand-off ledger: publish a point on `resources`. 0 nothing new,
         /// 1 published, -1 unavailable/full, -2 failed.
         /// # Safety: `resources` addresses `resource_count` live resources.
@@ -822,6 +825,14 @@ impl BridgeDevice {
         if let Some(d) = self.get() {
             // SAFETY: the caller passes a live resource pointer.
             unsafe { d.handoff_register(res) };
+        }
+    }
+
+    /// Hand-off ledger: `res` goes; this process stops holding its key.
+    pub(crate) fn handoff_unregister(&self, res: usize) {
+        if let Some(d) = self.get() {
+            // SAFETY: the caller passes a live resource pointer.
+            unsafe { d.handoff_unregister(res) };
         }
     }
 
