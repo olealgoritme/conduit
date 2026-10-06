@@ -137,6 +137,14 @@ impl Progress {
         self.retired
     }
 
+    /// Advance to `value` (never backwards). The one writer that is not a Venus
+    /// used-ring response is an RM gate (`rm_fence_present::Gate`), whose points
+    /// retire from a host `EventReady` for a fence handle: there is no wire fence to
+    /// check, and the gate itself owns the prefix rule.
+    pub fn advance_to(&mut self, value: u32) {
+        self.retired = self.retired.max(value);
+    }
+
     /// Called only on a successful used-ring response for the original tag.
     pub fn wire(&mut self, handle: u32, tag: Submission) -> bool {
         if tag.stream != handle || handle == 0 || tag.value == 0 || tag.wire_fence == 0 {

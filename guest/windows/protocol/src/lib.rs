@@ -27,6 +27,7 @@ pub mod ioctl;
 pub mod nvrm;
 pub mod nvrm_scanout;
 pub mod producer;
+pub mod rm_fence;
 pub mod virtio_gpu;
 pub mod wddm;
 
@@ -37,5 +38,6 @@ pub use ioctl::*;
 pub use nvrm::*;
 pub use nvrm_scanout::*;
 pub use producer::*;
+pub use rm_fence::*;
 pub use virtio_gpu::*;
 pub use wddm::*;

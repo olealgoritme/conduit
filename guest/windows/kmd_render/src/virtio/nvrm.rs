@@ -186,6 +186,11 @@ pub static NVRM_FENCES_CLOSED: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_FENCE_FIRED: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_FENCE_EARLY: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_FENCE_ERRORS: AtomicU32 = AtomicU32::new(0);
+/// Set whenever the KMD owes the host a `Close` of a fence handle it took over
+/// (`docs/rm-fence-marker.md`); the HPD worker swaps it to 0 and closes them.
+pub static FENCE_CLOSE_OWED: AtomicU32 = AtomicU32::new(0);
+/// Closes of KMD-owned fence handles the host did not take (`FnCloseErr`).
+pub static FENCE_CLOSE_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// Why a forward did not reach (or come back from) the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,13 +505,22 @@ fn forward_fence_create(
         return Err(Refusal::NoResources);
     }
     NVRM_IOCTLS.fetch_add(1, Ordering::Relaxed);
+    // The process the creating device belongs to, recorded with the fence: a WDDM
+    // carrier (`docs/rm-fence-marker.md`) checks it against the presenting
+    // context's process, because the presenting device is not this one. Read now,
+    // while this escape keeps `owner`'s device alive; 0 (never matches) if the
+    // handle cannot be resolved.
+    // SAFETY: `owner` is the `hDevice` of the escape being served, which dxgkrnl
+    // keeps alive until the escape returns.
+    let process = unsafe { crate::device::DeviceHandleRef::from_raw(owner.raw() as *mut core::ffi::c_void) }
+        .map_or(0, |d| d.creator_process());
     match ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms) {
         Ok(n) => {
             let handle = nvrm_fence::fence_handle_from_reply(resp, n);
             // A host status of 0 with no handle to own is a fence we cannot see.
             let host_ok = n >= MSG_HDR && rd_i32(resp, 8) == Some(0);
             let committed = adapter.with_virtio(|v| match handle {
-                Some(h) => Some(v.commit_nvrm_fence(owner, h)),
+                Some(h) => Some(v.commit_nvrm_fence(owner, h, process)),
                 None => {
                     v.cancel_nvrm_fence_create();
                     None
@@ -1238,6 +1252,53 @@ pub fn reclaim_stale_views(_passive: PassiveLevel, adapter: &AdapterContext, own
         }
         if n < BATCH {
             break;
+        }
+    }
+}
+
+/// Close, on the host, the fence handles the KMD took over and now owes a `Close`
+/// (they fired, or their present was dropped). Take-then-send, one at a time, as a
+/// user `Close` does: the host may hand the number to someone else the moment it
+/// closes it. PASSIVE. A transport that has failed is not asked: the sweep that
+/// retires it closes every handle.
+pub fn close_owed_fences(passive: PassiveLevel, adapter: &AdapterContext) {
+    if FENCE_CLOSE_OWED.swap(0, Ordering::AcqRel) == 0 {
+        return;
+    }
+    let alive = adapter
+        .with_virtio(|v| !v.transport_failed())
+        .unwrap_or(false);
+    if !alive {
+        return;
+    }
+    loop {
+        let taken = adapter
+            .with_virtio(|v| v.take_fence_to_close())
+            .ok()
+            .flatten();
+        let Some(handle) = taken else {
+            break;
+        };
+        NVRM_FENCES_CLOSED.fetch_add(1, Ordering::Relaxed);
+        let mut req = [0u8; MSG_HDR];
+        req[..4].copy_from_slice(&MSG_CLOSE.to_le_bytes());
+        req[4..8].copy_from_slice(&handle.to_le_bytes());
+        let mut resp = [0u8; MSG_HDR];
+        match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, 5_000) {
+            Ok(n) if n >= MSG_HDR && rd_i32(&resp, 8) == Some(0) => {}
+            // The host answered no (it no longer knows the number): nothing to keep.
+            Ok(_) => {
+                FENCE_CLOSE_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            // Indeterminate (it may have closed): stay forgotten, as `Close` does.
+            Err(VirtioError::Timeout) => {
+                FENCE_CLOSE_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            // Never reached the host: still the KMD's, for the transport sweep.
+            Err(_) => {
+                FENCE_CLOSE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                let _ = adapter.with_virtio(|v| v.restore_fence_after_failed_close(handle));
+            }
         }
     }
 }

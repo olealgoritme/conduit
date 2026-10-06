@@ -63,6 +63,13 @@ A forwarded `ScanoutFlip` (FORWARD) from a device that does not hold a live sour
 refused `FORBIDDEN`; with no source live FORWARD flips behave as before (and race the
 desktop, as before).
 
+## Fenced presents
+
+`PRESENT` can also queue the flip behind an RM fence and return at once; the flip is sent
+by the HPD worker when the fence fires (flags bit 0, `rm_fence_handle` at offset 52,
+capability bit `HELIOS_NVRM_CAP_SCANOUT_FENCE`). See `rm-fence-marker.md` (ordering, the
+image reuse rule, ownership of the fence handle, counters).
+
 ## Counters (`publish_nvrm_counters`, also on SET/RELEASE/lapse)
 
 `FsSet FsPres FsRel FsLapse FsEnd FsTake FsSupp FsRest FsRef FsErr`. Live sources =

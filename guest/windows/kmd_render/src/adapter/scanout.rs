@@ -45,6 +45,10 @@ pub(crate) struct PresentStreamMarker {
     pub value: u32,
     pub cookie: u64,
     pub creator_process: usize,
+    /// Nonzero: an RM fence already attached at Render
+    /// (`docs/rm-fence-marker.md`), and the boundary naming it. `ctx_id`, `value` and
+    /// `cookie` are then zero; the marker is not a Venus stream point.
+    pub rm_boundary: u64,
 }
 
 impl AdapterContext {
@@ -257,6 +261,9 @@ impl AdapterContext {
                 .with_virtio(|order, v| {
                     let watermark = stream_marker
                         .and_then(|marker| {
+                            if marker.rm_boundary != 0 {
+                                return Some(marker.rm_boundary);
+                            }
                             v.present_stream_marker_boundary(
                                 marker.ctx_id,
                                 marker.value,

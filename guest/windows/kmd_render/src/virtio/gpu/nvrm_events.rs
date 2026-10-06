@@ -43,6 +43,8 @@ use crate::virtio::nvrm::{
 };
 use helios_kmd_logic::nvrm_events::{kind_known, Added, KINDS_ALL, KIND_LOST, KIND_READY};
 use helios_kmd_logic::nvrm_fence::Noted;
+use helios_kmd_logic::rm_fence_present::Attach;
+use super::nvrm_tables::FenceFire;
 
 /// Most registrations across every process (each is one object reference).
 pub const MAX_NVRM_EVENTS: usize = 1024;
@@ -145,8 +147,9 @@ fn post_slot(ring: &mut EventRing, slot: usize) -> bool {
 enum Taken {
     /// The queue is empty.
     Empty,
-    /// `EventReady` for this backend handle.
-    Ready(u32),
+    /// `EventReady` for this backend handle, with the header `status` (0, or a
+    /// fence's error such as `-ETIMEDOUT`).
+    Ready(u32, i32),
     /// Some other message (or a short or bad one): dropped.
     Other,
     /// The queue misbehaved: stop draining this pass.
@@ -185,8 +188,10 @@ fn take_event(ring: &mut EventRing) -> Taken {
                 .and_then(|b| <[u8; 4]>::try_from(b).ok())
                 .map(u32::from_le_bytes)
         };
-        match (len >= 16, word(0), word(4)) {
-            (true, Some(MSG_EVENT_READY), Some(handle)) => Taken::Ready(handle),
+        match (len >= 16, word(0), word(4), word(8)) {
+            (true, Some(MSG_EVENT_READY), Some(handle), Some(status)) => {
+                Taken::Ready(handle, status as i32)
+            }
             _ => Taken::Other,
         }
     };
@@ -371,11 +376,34 @@ impl VirtioGpu {
     /// open is dropped (a closed file's) unless a `SEMSURF_FENCE_CREATE` is in
     /// flight: its fence may have fired before the reply that names it was
     /// recorded, so the notification is kept for that create (`nvrm_fences`).
-    fn deliver_nvrm_ready(&mut self, handle: u32) {
+    ///
+    /// Returns whether the HPD worker has work now: a fence a carrier is waiting on
+    /// fired (a queued `SCANOUT_PRESENT` to send, a handle to close).
+    fn deliver_nvrm_ready(&mut self, handle: u32, status: i32) -> bool {
         // A fence fires once, so every notification for one is a fire. Counted
-        // whatever became of it (woken, latched), before the lookup is lost.
-        if self.nvrm_handle_is_fence(handle) {
-            NVRM_FENCE_FIRED.fetch_add(1, Ordering::Relaxed);
+        // whatever became of it (woken, latched), before the lookup is lost. The
+        // first one also routes to what the fence was attached to
+        // (`docs/rm-fence-marker.md`): both are flag writes under this lock.
+        let mut wake_worker = false;
+        match self.fence_note_fired(handle, status) {
+            FenceFire::NotFence => {}
+            FenceFire::Repeat => {
+                NVRM_FENCE_FIRED.fetch_add(1, Ordering::Relaxed);
+            }
+            FenceFire::Fired(attach) => {
+                NVRM_FENCE_FIRED.fetch_add(1, Ordering::Relaxed);
+                match attach {
+                    Attach::None => {}
+                    Attach::Scanout => {
+                        crate::adapter::foreign_scanout::note_fence_fired(status);
+                        wake_worker = true;
+                    }
+                    Attach::Gate(gate) => {
+                        self.rm_gate_fire(gate, handle, status);
+                        wake_worker = true;
+                    }
+                }
+            }
         }
         let woke = self.nvrm_events.signal_handle(handle, KIND_READY, |event| {
             // SAFETY: the table holds a reference to the event; Wait = FALSE is
@@ -398,26 +426,31 @@ impl VirtioGpu {
                 }
             }
         }
+        wake_worker
     }
 
     /// The event queue's consumer, from the interrupt DPC (under the virtio
     /// lock): hand each `EventReady` to the registered events and give the
     /// buffers back. At most one ring's worth per call, so a host that floods it
     /// cannot hold the DPC; the rest waits for the next interrupt.
-    pub fn drain_nvrm_events(&mut self) {
+    ///
+    /// Returns whether a fence a carrier waits on fired: the caller then wakes the
+    /// HPD worker (`KeSetEvent`, legal here) to send the flip / close the handle.
+    pub fn drain_nvrm_events(&mut self) -> bool {
         if self.failed {
-            return;
+            return false;
         }
         let mut reposted = false;
+        let mut wake_worker = false;
         for _ in 0..EVENT_QUEUE_SIZE {
             let Some(ring) = self.nvrm_event_ring.as_mut() else {
-                return;
+                return wake_worker;
             };
             match take_event(ring) {
                 Taken::Empty => break,
-                Taken::Ready(handle) => {
+                Taken::Ready(handle, status) => {
                     reposted = true;
-                    self.deliver_nvrm_ready(handle);
+                    wake_worker |= self.deliver_nvrm_ready(handle, status);
                 }
                 Taken::Other => {
                     reposted = true;
@@ -442,5 +475,6 @@ impl VirtioGpu {
                 self.transport.notify(EVENT_QUEUE);
             }
         }
+        wake_worker
     }
 }

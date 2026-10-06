@@ -16,9 +16,11 @@ use helios_kmd_logic::foreign_scanout::{Layout, ReleaseOutcome, SetError};
 use helios_protocol::{
     HeliosEscapeHeader, HeliosNvrmHeader, HeliosNvrmScanoutPresent, HeliosNvrmScanoutRelease,
     HeliosNvrmScanoutSet, HELIOS_NVRM_OP_SCANOUT_PRESENT, HELIOS_NVRM_OP_SCANOUT_RELEASE,
-    HELIOS_NVRM_OP_SCANOUT_SET, HELIOS_NVRM_ST_BAD_RANGE, HELIOS_NVRM_ST_DEVICE_ERROR,
+    HELIOS_NVRM_OP_SCANOUT_SET, HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE,
+    HELIOS_NVRM_ST_BAD_RANGE, HELIOS_NVRM_ST_DEVICE_ERROR, HELIOS_NVRM_ST_FENCE_ATTACHED,
     HELIOS_NVRM_ST_FORBIDDEN, HELIOS_NVRM_ST_NOT_OWNED, HELIOS_NVRM_ST_NO_SOURCE,
-    HELIOS_NVRM_ST_OK, HELIOS_NVRM_ST_SCANOUT_BUSY,
+    HELIOS_NVRM_ST_OK, HELIOS_NVRM_ST_QUEUE_FULL, HELIOS_NVRM_ST_SCANOUT_BUSY,
+    HELIOS_NVRM_ST_UNSUPPORTED,
 };
 
 use crate::adapter::AdapterContext;
@@ -144,19 +146,43 @@ fn scanout_present(
         Err(st) => return st,
     };
     req.out_seq = 0;
-    let status = if req.flags != 0 || req.reserved != 0 || req.gem == 0 {
+    // `rm_fence_handle` is nonzero exactly when the RM_FENCE flag is set; any other
+    // flag bit is unknown. Either mismatch is a malformed request, whatever the
+    // KMD serves.
+    let fenced = req.flags & HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE != 0;
+    let status = if req.flags & !HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE != 0
+        || fenced != (req.rm_fence_handle != 0)
+        || req.gem == 0
+    {
         HELIOS_NVRM_ST_BAD_RANGE
     } else {
-        match flip::present(passive, adapter, owner, req.handle, req.gem) {
+        let sent = if fenced {
+            flip::present_fenced(
+                passive,
+                adapter,
+                owner,
+                req.handle,
+                req.gem,
+                req.rm_fence_handle,
+            )
+        } else {
+            flip::present(passive, adapter, owner, req.handle, req.gem)
+        };
+        match sent {
             Ok(seq) => {
                 req.out_seq = seq;
                 HELIOS_NVRM_ST_OK
             }
             Err(PresentRefusal::NoTransport) => return STATUS_DEVICE_NOT_READY,
             Err(PresentRefusal::NotOwned) => HELIOS_NVRM_ST_NOT_OWNED,
-            Err(PresentRefusal::Forbidden) => HELIOS_NVRM_ST_FORBIDDEN,
+            Err(PresentRefusal::Forbidden) | Err(PresentRefusal::NotFence) => {
+                HELIOS_NVRM_ST_FORBIDDEN
+            }
             Err(PresentRefusal::NoSource) => HELIOS_NVRM_ST_NO_SOURCE,
             Err(PresentRefusal::Device(_)) => HELIOS_NVRM_ST_DEVICE_ERROR,
+            Err(PresentRefusal::Unsupported) => HELIOS_NVRM_ST_UNSUPPORTED,
+            Err(PresentRefusal::AlreadyAttached) => HELIOS_NVRM_ST_FENCE_ATTACHED,
+            Err(PresentRefusal::QueueFull) => HELIOS_NVRM_ST_QUEUE_FULL,
         }
     };
     finish(&mut req.head, status, epoch);

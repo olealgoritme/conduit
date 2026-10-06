@@ -251,6 +251,10 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // for the desktop's restore flush, consumed by the refresh arm below).
         adapter.foreign_scanout_service();
 
+        // Fenced presents: send the flips whose fences fired (in order) and close
+        // the fence handles the KMD owes the host. A no-op with nothing queued.
+        adapter.foreign_fence_service(passive);
+
         // Consume only the allocation identity supplied by Windows through
         // SetVidPnSourceAddress. The DDI can be called at DIRQL, where neither
         // Venus waits nor registry diagnostics are legal; this worker is the
