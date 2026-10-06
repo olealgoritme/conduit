@@ -67,3 +67,8 @@ executable('crm_pin_smoke', 'tests/crm_pin_smoke.c',
 executable('crm_scanout_smoke', 'tests/crm_scanout_smoke.c',
   include_directories : [inc, include_directories('src')],
   dependencies : rmclient_dep)
+# One RM memory object in two processes (NV_ESC_RM_DUP_OBJECT across clients),
+# the base of shared surfaces between NVK processes on Windows.
+executable('crm_share_smoke', 'tests/crm_share_smoke.c',
+  include_directories : [inc, include_directories('src')],
+  dependencies : rmclient_dep)
