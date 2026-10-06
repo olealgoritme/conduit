@@ -678,6 +678,16 @@ pub mod knobs {
     /// (`rm_refresh::TAIL_100NS`, always on) covers what trails it. Read once per transport
     /// generation (`docs/kmd-rm-client.md` 15.16).
     pub const KMD_RM_SYS_POLL_MS: KnobName = KnobName::new(b"KmdRmSysPollMs");
+    /// `ForeignFlip` (default 0 = off: the foreign-allocation flip does not exist and every
+    /// allocation takes the path it took before). Nonzero: a WDDM allocation that adopted an
+    /// RM resource a user-mode device imported (DWM-on-NVK's swap-chain buffers, open identity
+    /// FOREIGN) is shown by the KMD's own `ScanoutFlip` of its DRM file and GEM, with the
+    /// arbiter's resident source registered under the importing device, instead of
+    /// `SET_SCANOUT_BLOB` plus a Venus flush (`virtio::foreign_flip`,
+    /// `docs/kmd-rm-client.md` 15.18). Refused, with a counted reason (`FfRef<NN>`), and the
+    /// old path runs, when the importer's file is gone, the layout is unusable, the host lacks
+    /// the import, or `KmdRmClient` is 3 or 4. Read once per transport generation.
+    pub const FOREIGN_FLIP: KnobName = KnobName::new(b"ForeignFlip");
     /// `BindFlushMode` (default 0). Selects when the bind edge tells the host
     /// to READ the freshly bound primary (ROADMAP defect 0ab-B):
     ///   0 = completion-ordered against the boundary this buffer's own present

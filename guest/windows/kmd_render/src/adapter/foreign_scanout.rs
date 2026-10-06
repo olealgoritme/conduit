@@ -335,12 +335,18 @@ impl AdapterContext {
             self.count_end(was_resident);
             self.foreign_scanout_restore_desktop();
         }
+        // `ForeignFlip`: what the device imported is not flippable any more (its token may
+        // be handed to a new device). After `STATE` was released; PASSIVE.
+        crate::virtio::foreign_flip::owner_closed(self, owner);
     }
 
     /// The owner closed `handle` (a successful forwarded `Close`).
     pub(crate) fn foreign_scanout_release_handle(&self, owner: DeviceOwner, handle: u32) {
         // The file is closed: the host forgets its buffers with no release event.
         crate::virtio::scanout_release::forget_handle(handle);
+        // `ForeignFlip`: records made from this file are poisoned and a shown allocation of
+        // it is dropped (the host may reuse the file number). PASSIVE, no lock held.
+        crate::virtio::foreign_flip::file_closed(self, owner, handle);
         let (ended, was_resident) = {
             let mut g = STATE.lock();
             let was = g.resident_foreground();
@@ -520,6 +526,27 @@ impl AdapterContext {
     pub(crate) fn foreign_scanout_resident_state(&self) -> (bool, bool) {
         let g = STATE.lock();
         (g.resident().is_some(), g.resident_foreground())
+    }
+
+    /// As [`Self::foreign_scanout_resident_state`] for one class of resident source: the
+    /// KMD's own (`kmd_class`, the RM client's ring and primary) or a user device's
+    /// (`ForeignFlip`). Each flip service asks only about its own class.
+    pub(crate) fn foreign_scanout_resident_state_of(&self, kmd_class: bool) -> (bool, bool) {
+        STATE
+            .lock()
+            .resident_state_of(DeviceOwner::KMD_RM.raw() as u64, kmd_class)
+    }
+
+    /// As [`Self::foreign_scanout_resident_drop`] for one class only: a resident source of
+    /// the other class is left alone.
+    pub(crate) fn foreign_scanout_resident_drop_of(&self, kmd_class: bool) -> ResidentDrop {
+        let result = STATE
+            .lock()
+            .resident_drop_of(DeviceOwner::KMD_RM.raw() as u64, kmd_class);
+        if result == ResidentDrop::Ended {
+            self.foreign_scanout_restore_desktop();
+        }
+        result
     }
 
     // ---- fenced presents (`docs/rm-fence-marker.md`, carrier (a)) -----------------

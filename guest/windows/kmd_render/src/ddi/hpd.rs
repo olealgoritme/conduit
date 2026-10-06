@@ -271,6 +271,11 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // the deferred programming above, so a primary bound in this very pass is seen.
         crate::virtio::rm_client::service(passive, adapter);
 
+        // `ForeignFlip`: the flips of a foreign allocation Windows is showing (off by default:
+        // one atomic load). After the level 5 service, which leaves the shared edges to it
+        // while it holds the screen.
+        crate::virtio::foreign_flip::service(passive, adapter);
+
         // The `Nv*` registry mirror the NVRM escapes asked for. It used to run
         // inside the escape (about a millisecond added to every Open / Close /
         // Map / Pin and to every 256th forward); here it costs nobody's latency.

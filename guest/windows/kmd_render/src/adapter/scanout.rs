@@ -1223,6 +1223,9 @@ impl AdapterContext {
         if resource_id == 0 {
             return true;
         }
+        // `ForeignFlip`: a shown foreign allocation that is destroyed stops being the source
+        // before its importer can close the GEM (one load when it shows nothing).
+        crate::virtio::foreign_flip::target_gone(self, resource_id);
         // Freeze the DISPATCH bind producer before resolving the final host
         // selection. The PASSIVE worker is already excluded by `scanout_mutex`.
         // Any SET issued before this point is ahead of the pure-query FIFO
