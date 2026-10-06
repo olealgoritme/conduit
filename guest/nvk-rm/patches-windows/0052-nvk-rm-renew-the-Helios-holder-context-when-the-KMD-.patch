@@ -1,0 +1,114 @@
+From 5057e0debf2b7d7d5a5cd3bc0cbcead0935ac6e4 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 22:53:21 +0200
+Subject: [PATCH] nvk/rm: renew the Helios holder context when the KMD calls it
+ stale
+
+The holder context is made once per process. After a KMD restart
+(pnputil /restart-device) a long-lived process such as DWM recreates its
+devices, but every IMPORT_RM still names the context of the dead
+generation, the KMD refuses it with BAD_CONTEXT, no resource ids can be
+made, and DWM crash-loops (dwmcore 0x8898008d) until Windows restarts it.
+
+On BAD_CONTEXT (-ESRCH from librmclient) forget that context, unless
+another thread already replaced it, make a new one and retry the import
+once. Memory imported before the restart belonged to devices that are
+gone with it, so nothing else needs re-adopting.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c | 50 ++++++++++++++++++++--
+ 1 file changed, 46 insertions(+), 4 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+index 556b097..acb45d9 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+@@ -590,6 +590,37 @@ get_holder_ctx(const struct nvkmd_rm_lib *lib)
+    return ctx;
+ }
+ 
++/* The KMD refused `stale` as a holder context (BAD_CONTEXT): it belongs to a
++ * transport generation that ended, e.g. a pnputil /restart-device under a
++ * long-lived process such as DWM, whose new devices would otherwise import
++ * against the dead context forever. Forget it (unless another thread already
++ * replaced it) and make a new one. Returns the context to retry with, 0 if
++ * none could be made.
++ */
++static uint32_t
++renew_holder_ctx(const struct nvkmd_rm_lib *lib, uint32_t stale)
++{
++   simple_mtx_lock(&helios_ctx_mutex);
++   if (helios_holder_ctx == stale) {
++      helios_holder_ctx = 0;
++      helios_holder_failed = false;
++      uint32_t ctx = 0;
++      int ret = lib->win_venus_ctx_create(&ctx);
++      if (ret != 0 || ctx == 0) {
++         helios_holder_failed = true;
++         mesa_logw("NVK: Helios holder context %u went stale and no new one "
++                   "could be made (%d)", stale, ret);
++      } else {
++         helios_holder_ctx = ctx;
++         mesa_logi("NVK: Helios holder context %u went stale (KMD restart); "
++                   "now %u", stale, ctx);
++      }
++   }
++   const uint32_t ctx = helios_holder_ctx;
++   simple_mtx_unlock(&helios_ctx_mutex);
++   return ctx;
++}
++
+ void
+ nvkmd_rm_mem_set_export_layout(struct nvkmd_mem *_mem, uint8_t pte_kind,
+                                uint16_t tile_mode)
+@@ -645,9 +676,10 @@ nvkmd_rm_mem_helios_res_id(struct nvkmd_mem *_mem,
+    }
+    if (mem->gem_handle == 0)
+       result = export_to_gem(dev, mem, log_obj, &mem->gem_handle);
+-   if (result == VK_SUCCESS) {
++   uint32_t import_ctx = ctx;
++   for (unsigned attempt = 0; result == VK_SUCCESS && attempt < 2; attempt++) {
+       const struct nvrm_crm_foreign_import imp = {
+-         .ctx_id = ctx,
++         .ctx_id = import_ctx,
+          .rm_handle = (uint32_t)dev->drm_fd,
+          .gem_handle = mem->gem_handle,
+          .fourcc = layout->fourcc,
+@@ -673,9 +705,18 @@ nvkmd_rm_mem_helios_res_id(struct nvkmd_mem *_mem,
+       } else {
+          ret = lib->win_import_rm(&imp, &res_id, &host_errno);
+       }
++      if (ret == -ESRCH && attempt == 0) {
++         /* BAD_CONTEXT: the holder context died with an earlier KMD
++          * generation. Renew it and retry once. The mutex order is
++          * export_mutex -> helios_ctx_mutex, as in no other path.
++          */
++         import_ctx = renew_holder_ctx(lib, import_ctx);
++         if (import_ctx != 0)
++            continue;
++      }
+       if (ret == 0 && res_id != 0) {
+          mem->helios_res_id = res_id;
+-         mem->helios_res_ctx = ctx;
++         mem->helios_res_ctx = import_ctx;
+          *res_id_out = res_id;
+       } else {
+          result = vk_errorf(log_obj, ret == -ENOSYS ?
+@@ -688,13 +729,14 @@ nvkmd_rm_mem_helios_res_id(struct nvkmd_mem *_mem,
+                             layout->fourcc, layout->modifier,
+                             mem->base.size_B, ret, host_errno);
+       }
++      break;
+    }
+    simple_mtx_unlock(&mem->export_mutex);
+ 
+    if (result == VK_SUCCESS && (dev->base.pdev->debug_flags & NVK_DEBUG_VM)) {
+       fprintf(stderr, "NVK: RM memory 0x%x is Helios resource %u (ctx %u, "
+               "GEM %u, %ux%u stride %u modifier 0x%" PRIx64 ")\n",
+-              mem->h_memory, *res_id_out, ctx, mem->gem_handle,
++              mem->h_memory, *res_id_out, mem->helios_res_ctx, mem->gem_handle,
+               layout->width, layout->height, layout->stride,
+               layout->modifier);
+    }
+-- 
+2.43.0
+
