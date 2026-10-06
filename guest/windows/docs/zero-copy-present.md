@@ -2007,3 +2007,121 @@ worker is blocked in a registry write and the publisher thread becomes the fix.
 
 Tester: set the display idle timeout to 0 (`powercfg /x monitor-timeout-ac 0` and `-dc 0`) in the test image, or wake the
 display with input, before a user NVK run; the sleeping display is the reason DWM "stalled".
+
+## 19. Heartbeat stops after (re)start (v327 device-restart round 1; breadcrumbs and watchdog timer, v329)
+
+### 19.1 The report
+
+KMD 327.1, `VsPowerMode` 1, `VsWatchdog` 1, an NVK `d3d11_spin` running, `pnputil /restart-device`: the mode was kept
+(5120x1440@240), DWM stopped presenting, and `VsTickN` read 2135 and stayed 2135 (2135 ticks at 240 Hz is 8.9 s after the
+restart). `VsDisN`, `VsCanN`, `VsEarlyN`, `VsExhN`, `VsRevN` all 0, `VsArmN` 1. Restarting DWM moved the counters (`VsTickN`
+36380) and they stopped again. A second stopped state (`VsTickN` 46496, `VsTickT` 623181, `StallT` 623184, read at uptime
+662609): the one thread with `helios_kmd_render` on its stack was the HPD worker, idle in `KeWaitForSingleObject`; the
+system was responsive.
+
+### 19.2 What the code says, ranked
+
+1. **H0, the counters are a lazily written mirror, so "VsTickN did not move" does not mean "no ticks".** Nothing in the
+   tick path writes the registry (`service_vsync_tick` and `on_vsync_tick` are atomics only, DISPATCH). `VsTickN`,
+   `VsTickT`, `VsRevN`, `VsDisN` ... reach the service key only from `stall_diag::publish_counters` /
+   `publish_vsync_ticks`, which run from the HPD worker's periodic dump (`scanout_trace::dump_periodic`, first pass, then
+   128 passes AND 1 s) and from an escape (`publish_from_escape`, only when the worker looks stuck or the snapshot is
+   older than 5 s). The worker waits with no timeout when nothing is due (`VsIdleWake` 0, `hpd_wake::idle_watch`), and
+   the tick wakes it only while a programming is pending (`pending_vidpn_allocation != 0`). A desktop that stopped
+   changing therefore leaves the worker asleep and the whole block frozen at its last pass, with every counter in it
+   frozen too (`VsRevN` and `VsEarlyN` included: a 0 there means "0 as of the last pass"). Facts that fit H0 and not a
+   dead chain: (a) `StallT` - `VsTickT` was 3 ms, less than one 240 Hz period (4.17 ms), which is what ANY mirror taken
+   from a running chain reads; a chain that died by itself would have to die within 3 ms of a worker pass; (b)
+   `VsTickN` 46496 over `StartT` 428489 to `VsTickT` 623181 (194.7 s) is 238.8 Hz, a chain that ran the whole time with
+   `VsGapMaxMs` 95; (c) 34245 ticks between two reads in round 1 is 142.7 s at 240 Hz; (d) "DWM stopped presenting" after a
+   device restart is the designed outcome (the UMD reports `device removed (KMD gone: true)`), and DWM on a static desktop
+   presents nothing; (e) a LiveKD with the worker as the only Helios thread, idle, and a responsive system says no
+   callback is blocked (H1 is out), not that the timer is not queued. A stack cannot show a missing timer.
+   Discriminate on hardware by LIVE state, not the mirror: see 19.6.
+2. **H1, a blocked `DxgkCbSynchronizeExecution` inside the tick** (the coordinator's list item 1). In the code the
+   count is incremented BEFORE the synchronized call (`on_vsync_tick`, `VS_TICKS.fetch_add`, then the call in
+   `service_vsync_tick` via `signal_crtc_vsync`) and the one-shot is re-armed BEFORE both (`set_vsync_one_shot`, then the
+   `vsync_armed` re-check), so a long sync does NOT end the chain by itself; it would end it only if an Ex timer never
+   calls back while its callback runs (not documented either way) AND the sync never returns. The LiveKD refutes a
+   stuck callback for the second stop. Not fixed (the condition for the "queue the notify to a DPC" change, a confirmed
+   hung callback, is not met); `VsCbIn` / `VsCbOut` / `VsCbSync*` (19.4) settle it on the next run.
+3. **H2, a re-arm path that is skipped.** Every return in `service_vsync_tick` was checked. Before the re-arm: the display
+   half off or `vsync_armed` 0 (counted `VsEarlyN`), deadline exhaustion (`VsExhN`; `vsync_deadline::next` is `None`
+   only on a zero period or a `u64` overflow, and `period_100ns` never returns 0), and the Ex callback's null context.
+   After the re-arm: the post-arm `vsync_armed == 0` re-check (cancels, counted `VsCanN`), the closed delivery gate
+   (`vsync_enabled == 0`, returns after the re-arm), and `dxgkrnl_opt()` `None` (after the re-arm). A failed or refused
+   `DxgkCbSynchronizeExecution` / notify does not return early (the status only skips the timeline note); the pending-
+   programming `signal_hpd` and the count follow regardless. `ExSetTimer`'s return value is "the timer was already set",
+   not an error, and is rightly ignored. No path was found that leaves `vsync_armed` 1 with no timer queued. Races
+   examined: `arm_vsync` returns early when `vsync_armed` is already 1, so a dead chain with a stale flag is not
+   re-armed by a D0 resume (it IS by the revive paths below); `disarm_vsync` sets the flag before cancelling and the
+   tick re-checks it after re-arming, so StopDevice ends cancelled; a callback of the previous generation that
+   re-arms while the new `arm_vsync` sets the one-shot replaces a pending expiry with one a period later, harmless. The
+   Ex timer is allocated once per adapter and survives a restart (`pnputil /restart-device` keeps the same
+   `AdapterContext`; only RemoveDevice deletes it), so no stale timer object or callback context can exist.
+4. **H3, the deadline.** `vsync_deadline::next(anchor, now, period)` with the stored deadline as the anchor skips any
+   gap to the first future deadline, so a long gap or a stale `VS_REF_AT` cannot produce a far deadline (`VS_REF_AT` is
+   only the watchdog's silence reference, zeroed by `start_generation` and set by the arm, not an input to the deadline);
+   `relative_due` is clamped to at least 100 ns and at most `i64::MAX`. `period_100ns(0)` is 60 Hz.
+5. **H4, the delivery gate and notify failure.** A closed gate (`ControlInterrupt` disable) only counts `VsOffN`; the
+   re-arm precedes it. A notify failure never stops the chain.
+6. **H5, the old watchdog is blind exactly when needed** (confirmed from code): `vsync_watch` runs on a worker pass or an
+   escape only, and the worker has no timeout by default. That is a real defect whatever H0 turns out to be, and is the
+   reason for 19.3.
+
+### 19.3 The independent watchdog timer (default on, `VsWdTimer`)
+
+A second Ex timer (`ExAllocateTimer`, default resolution, its own callback `vsync_wd_callback`), allocated at AddDevice
+beside the heartbeat's, armed in `start_vsync` AFTER the heartbeat and stopped in `stop_vsync` (so StopDevice and
+RemoveDevice), deleted with cancel+wait at RemoveDevice. A 250 ms one-shot chain that re-arms itself FIRST and checks
+`vsync_wd_on` after, like the heartbeat's own cancel rule. It does not depend on the heartbeat chain, the worker or an
+escape. Each tick (`AdapterContext::vsync_wd_tick`, DISPATCH, atomics and `ExSetTimer` only), decisions in
+`kmd_logic::vsync_wd` (host-tested):
+
+* heartbeat armed, display half up, adapter in D0, and silent for more than `max(250 ms, 16 periods)` (newest of the last
+  tick and the reference), and no tick callback in flight: re-arm it (`revive_heartbeat`, shared with the old watchdog;
+  counted `VsRevN` and `VsWdFixN`);
+* the same silence with a tick callback entered and not returned (`VsCbIn` above `VsCbOut`): count `VsWdHungN` and do not
+  re-arm (a re-arm cannot unblock a callback);
+* every 8th tick (2 s), and at once after acting: ask the worker to write the heartbeat block (`request_live_publish`,
+  then `signal_hpd`; the worker calls `publish_live_if_wanted` after its watchdog call). This is what keeps the mirror
+  from going stale while the worker is otherwise asleep: `VsLiveT` is the time of the write.
+
+A healthy chain never meets it: the silence limit is 60 periods at 240 Hz. Cost: one DISPATCH callback and a few atomics
+every 250 ms, one worker wake and about 40 registry writes every 2 s. The wake shows as `HpdSgOth` and `HpdLoopN` rising
+about every 2 s on an idle desktop: that is this timer, not a regression. It also changes the `HpdWait` accounting not at
+all (the worker's wait stays infinite; the event is set). `VsWdTimer` 0 turns the timer off (KMD 328 behaviour).
+
+### 19.4 New breadcrumbs (all in the heartbeat block, written by `publish_vsync_ticks`)
+
+| value | meaning |
+|---|---|
+| `VsLiveT` | interrupt time (ms) the heartbeat block was written; EVERY value below and `VsTickN`/`VsTickT`/`VsRevN`/... is as of this time |
+| `VsCbIn`, `VsCbOut` | tick callbacks entered / returned (either timer source; NEVER zeroed). `VsCbIn` > `VsCbOut` for more than a tick is a blocked callback |
+| `VsCbSyncB`, `VsCbSyncOk` | `DxgkCbSynchronizeExecution` calls the tick began / returned (any status); `B` > `Ok` is a hung sync |
+| `VsCbSyncSt`, `VsCbSyncT` | status of the last return; interrupt ms the last sync began |
+| `VsWdTkN`, `VsWdTkT` | watchdog timer ticks, time of the last |
+| `VsWdAgeMs` | the heartbeat's silence the watchdog saw at its last tick (0 = not armed / unknown) |
+| `VsWdFixN`, `VsWdHungN`, `VsWdPubN` | re-arms done, blocked callbacks found, worker refreshes asked for |
+| `VsWdOn`, `VsWdNoTm`, `VsWdTmEff` | watchdog armed; no timer could be allocated; `VsWdTimer` in force |
+| `VsWdSAt`, `VsWdSArm`, `VsWdSRef`, `VsWdSDl`, `VsWdSAge`, `VsWdSCbI`, `VsWdSCbO`, `VsWdSSyT` | what it saw the last time it acted: when, armed flag, reference and pending deadline (ms), silence, callback counts, when the last sync began |
+
+### 19.5 Not done
+
+The tick callback was not changed to hand the synchronized notify to a DPC or work item: hypothesis H1 is not supported
+by the code (the re-arm precedes the call) nor by the LiveKD of the second stop. If `VsCbIn` > `VsCbOut` or `VsCbSyncB` >
+`VsCbSyncOk` is ever read, that becomes the fix.
+
+### 19.6 What to read next on hardware
+
+1. **Live state, not the mirror.** With LiveKD, twice, a second apart: `dd helios_kmd_render!*VS_TICKS*` (the symbol is
+   in `ddi::stall_diag`; `x helios_kmd_render!*VS_TICKS*` finds it) or, from the adapter, `vsync_count` and
+   `vsync_last_100ns`. Moving = the heartbeat is alive and H0 is the answer. Also `!timer` and look for the Helios Ex
+   timer's expiry; the kernel's high-resolution timer list shows an armed one-shot.
+2. With the v329 build: wait 5 s on an idle desktop and read `VsLiveT` against the uptime (it must be under 3 s old),
+   then `VsTickT` against `VsLiveT` (within a period = alive), `VsTickN` twice.
+3. If `VsTickT` is old against `VsLiveT`: `VsWdFixN`, `VsWdHungN`, `VsWdAgeMs`, `VsWdS*`, `VsCbIn` vs `VsCbOut`,
+   `VsCbSyncB` vs `VsCbSyncOk`, `VsCbSyncSt`, `VsDisN`, `VsCanN`, `VsEarlyN`, `VsExhN`, `VsArmN`, `VsWdOn`, `VsWdNoTm`.
+   `VsWdFixN` above 0 is a lost one-shot the old code left dead; read `VsWdSArm`, `VsWdSRef` and `VsWdSDl` for the state it
+   found.
+4. `HpdLoopN` rising about every 2 s with `HpdSgOth` is the watchdog's refresh wake.
