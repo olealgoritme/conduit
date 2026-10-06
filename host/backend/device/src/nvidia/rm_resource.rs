@@ -14,6 +14,12 @@
 //! to a control descriptor of its own and `OS_UNIX_IMPORT_OBJECT_FROM_FD` into
 //! its client (both forwarded ioctls, already served).
 //!
+//! A Venus blob (host Vulkan memory a Venus context allocated) is served the
+//! same way when the renderer exported it as a dma-buf: spike X4 showed
+//! NVIDIA's Vulkan driver's `DMA_BUF` exports import into an RM client
+//! exactly (`OPAQUE_FD` ones do not, and are refused with `EINVAL`). Its
+//! modifier is not known to the host; the reply says so.
+//!
 //! The resource id is the only name that crosses processes, so the KMD's
 //! checks (the caller opened that resource) are the ones that matter; the
 //! backend checks what it can see: the file is a render node of this guest
@@ -98,8 +104,12 @@ impl NvidiaBackend {
         let res = venus.rm_resource(r.resource_id)?;
         let gem = prime_import(&*self.host, drm_fd, res.dmabuf.as_raw_fd())?;
         let (size, modifier) = (res.size, res.modifier);
-        // As if the caller had imported it with that layout itself.
-        self.rm_layouts.insert(r.owner_handle, gem, modifier);
+        // As if the caller had imported it with that layout itself. An
+        // unknown layout (a Venus blob's) is not recorded as one: the
+        // caller's own GEM import, if it makes one, says what it is.
+        if modifier.is_some() {
+            self.rm_layouts.insert(r.owner_handle, gem, modifier);
+        }
         self.rm_resource_imports += 1;
         log::debug!(
             "rm resource import: resource {} is GEM handle {gem} on file {} ({size} bytes, \

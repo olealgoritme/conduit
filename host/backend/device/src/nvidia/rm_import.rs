@@ -507,10 +507,7 @@ mod tests {
             Some(Some(0x0300_0000_0060_6015))
         );
         assert!(
-            calls
-                .lock()
-                .unwrap()
-                .contains(&GET_DEV_INFO),
+            calls.lock().unwrap().contains(&GET_DEV_INFO),
             "the node's own tiling was asked"
         );
         let o = be.rm_view().export(dri as u32, GEM_HANDLE).unwrap();
@@ -808,6 +805,17 @@ mod tests {
         assert_eq!(ask(&mut be, dri2, 6, 0).0, -libc::EINVAL);
         assert_eq!(ask(&mut be, dri2, 5, 1).0, -libc::EINVAL);
         assert_eq!(be.rm_resource_imports(), 1);
+
+        // A Venus blob whose renderer export is a dma-buf (the mock's memfd
+        // taken for one) is imported the same way, with no modifier.
+        be.venus.as_mut().unwrap().assume_dmabufs(true);
+        let (status, reply) = ask(&mut be, dri2, 6, 0);
+        assert_eq!(status, 0);
+        let reply = reply.expect("a reply body");
+        assert_eq!(reply.gem_handle, IMPORTED_HANDLE);
+        assert_eq!((reply.flags, reply.modifier), (0, 0), "layout unknown");
+        assert_eq!(be.rm_resource_imports(), 2);
+        be.venus.as_mut().unwrap().assume_dmabufs(false);
 
         // The creator's file closes: the resource, and the import, live on.
         let mut v = vec![0u8; size_of::<MsgHeader>()];

@@ -365,18 +365,36 @@ response: MsgHeader{msg_type=31, handle=0, status=0}
 | Field | Meaning |
 |---|---|
 | `owner_handle` | backend handle of a render node the guest opened (an `Open` reply's handle for `device_type >= 512`): the file the GEM handle will belong to |
-| `resource_id` | an RM-export resource (`RESOURCE_CREATE_BLOB` with `BLOB_MEM_RM_EXPORT`) that still exists, whoever created it |
+| `resource_id` | an RM-export resource (`RESOURCE_CREATE_BLOB` with `BLOB_MEM_RM_EXPORT`), or a Venus blob (`BLOB_MEM_HOST3D`) whose renderer export is a dma-buf (below), that still exists, whoever created it |
 | `gem_handle` | GEM handle in `owner_handle`'s file, the guest's to close (`DRM_IOCTL_GEM_CLOSE`, or the file's `Close`). The same resource on the same file answers the same handle (GEM handles are per object per file), so one close undoes any number of imports |
 | `flags` | bit 0 (`RM_RESOURCE_IMPORT_MODIFIER`): `modifier` is known |
 | `size` | the object's size (the dma-buf's), bytes |
-| `modifier` | the modifier the resource was created with (its GEM import's layout); also remembered for the new handle, so a `ScanoutFlip` of it or a second RM-export blob made from it carries it |
+| `modifier` | the modifier the resource was created with (its GEM import's layout); also remembered for the new handle, so a `ScanoutFlip` of it or a second RM-export blob made from it carries it. Never known for a Venus blob (flags 0) |
+
+**Venus blobs.** A Venus app's surface (DWM on NVK composing a Venus
+process's window) is host Vulkan memory, held as the descriptor the renderer
+exported when the blob was made (`virgl_renderer_resource_export_blob`).
+When that descriptor is a dma-buf (its file system is dma-buf's,
+`DMA_BUF_MAGIC`), the backend imports it on the caller's render node exactly
+like an RM-export blob's: spike X4 (`guest/nvk-rm/tests/vk_dmabuf_to_rm.c`)
+showed memory NVIDIA's Vulkan driver exports as `DMA_BUF` imports into an RM
+client through the same nvidia-drm calls, exactly. An `OPAQUE_FD` export (a
+driver handle, which nvidia-drm cannot take) is refused with `EINVAL`, as
+before. The reply carries no modifier: the image layout belongs to the Venus
+context that created the image, the memory does not record it, and the
+backend does not guess; the importer takes it from the surface's metadata
+(which then must carry it, `dxvk-on-nvk.md` 3.2). For this to work the Venus
+side must allocate such surfaces exportable as `DMA_BUF`, as
+`VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` images with an explicit modifier
+(NVIDIA imports `DMA_BUF` memory only into such images), and record that
+modifier and row pitch where the importer reads them.
 
 What the backend checks: the shape (16 bytes, `flags` and `reserved` 0:
 `EINVAL`), that the backend serves RM-export blobs (`EOPNOTSUPP`), that
 `owner_handle` is a render node of this guest (`EBADF`), that the resource
-exists (`ENOENT`) and is an RM-export blob (`EINVAL`: host Vulkan memory is
-not nvidia-drm's to name as RM memory). `PRIME_FD_TO_HANDLE`'s own errno
-otherwise. Resource ids are the VM's, so "a resource of the same guest" holds
+exists (`ENOENT`) and is an RM-export blob or a Venus blob exported as a
+dma-buf (`EINVAL` otherwise: an `OPAQUE_FD` is not nvidia-drm's to import).
+`PRIME_FD_TO_HANDLE`'s own errno otherwise. Resource ids are the VM's, so "a resource of the same guest" holds
 by construction; which process may name which resource is the KMD's to decide
 (it forwards the message only for a resource the caller created or opened).
 
