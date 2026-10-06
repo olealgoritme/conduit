@@ -172,15 +172,6 @@ bool find_nvk_icd(wchar_t* out, std::size_t cap) {
   return file_exists(out);
 }
 
-#if defined(HELIOS_ICD_BACKEND_D3D12)
-bool reg_dword(const char* name, DWORD* out) {
-  DWORD size = sizeof(*out);
-  return RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", name,
-                      RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, nullptr, out,
-                      &size) == ERROR_SUCCESS;
-}
-#endif
-
 IcdBackendChoice decide() {
   IcdBackendChoice c = {};
   c.backend = IcdBackend::Venus;
