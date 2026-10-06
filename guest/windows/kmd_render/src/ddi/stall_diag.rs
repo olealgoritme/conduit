@@ -379,4 +379,7 @@ pub(crate) fn publish_from_escape(adapter: &AdapterContext) {
         return;
     }
     publish_counters();
+    // The foreign scanout block, when the DISPATCH watchdog ended a source and the (stuck)
+    // worker cannot mirror its counters: one load when not due.
+    crate::adapter::foreign_scanout::publish_if_due();
 }

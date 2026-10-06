@@ -422,6 +422,12 @@ pub static WDDM_HOLD_MS: AtomicU32 = AtomicU32::new(0);
 /// A static, not a `VirtioGpu` field, for the same reason as [`WDDM_HOLD_MS`]: one
 /// read site, and readable without `virtio_lock`.
 pub static WDDM_HEAD_MS: AtomicU32 = AtomicU32::new(WDDM_HEAD_MS_DEFAULT);
+/// `WbStaleRdy`: front tokens of the WindowedBlt ready queue popped because no undispatched
+/// request stood behind them (`helios_kmd_logic::windowed_ready`). Must read 0 on a healthy
+/// boot; a nonzero value is a request that was retired without its token (a killed process
+/// whose snapshot resource was torn down with admitted blts queued) and was healed by the
+/// worker instead of wedging every later windowed present.
+pub static WINDOWED_READY_STALE: AtomicU32 = AtomicU32::new(0);
 /// `WddmHeadMs`'s shipping default, in ms, and it is a DECISION (AGENTS.md rule 8).
 ///
 /// The bound exists because `present_stream_marker_boundary` accepts any nonzero
@@ -5934,7 +5940,16 @@ impl VirtioGpu {
     /// claimed-but-never-submitted and in-flight consumer ownership before
     /// releasing the closing stream slots. This is never called on an
     /// ambiguous or rejected destroy.
-    pub fn finalize_closed_present_streams_for_context(&mut self, ctx_id: u32) -> u32 {
+    ///
+    /// Retiring a closing slot turns every WDDM FIFO entry whose boundary names it into one
+    /// that names a dead stream, which the purges' `discharge_dead_present_stream_waits`
+    /// cancels; that sweep ran at purge time, when the slot still counted as live, so it is
+    /// repeated here (it takes the notification-ordered token the callers already hold).
+    pub fn finalize_closed_present_streams_for_context(
+        &mut self,
+        order: &crate::adapter::NotifyOrdered<'_>,
+        ctx_id: u32,
+    ) -> u32 {
         let mut finalized = 0u32;
         for index in 0..self.present_streams.len() {
             let slot = self.present_streams[index];
@@ -5954,6 +5969,15 @@ impl VirtioGpu {
             }
             self.retire_present_stream_slot(index);
             finalized += 1;
+        }
+        if finalized != 0 {
+            // The purge that closed these slots ran these sweeps while they still counted as
+            // live (a closing slot keeps its handle until now): the FIFO entries and the
+            // undispatched requests of a stream that just died are cancelled here, or they
+            // wait on a boundary that is never satisfied and keep their ledger tickets and
+            // token slots until some unrelated purge comes along. Same order as the purges.
+            let _ = self.discharge_dead_present_stream_waits(order);
+            self.cancel_dead_undispatched_windowed_blt();
         }
         finalized
     }
@@ -7011,12 +7035,31 @@ impl VirtioGpu {
     /// boundary are mandatory; a retired producer without residency admission
     /// remains inert in `pending`.
     pub fn take_ready_windowed_blt(&mut self) -> Option<WindowedBltPending> {
-        let token = *self.windowed_blt.ready.front()?;
-        let index = self
-            .windowed_blt
-            .pending
-            .iter()
-            .position(|request| request.token == token)?;
+        // A front token with no undispatched request behind it can never be dispatched
+        // (the request was retired through a terminal, or already went out): pop it, or
+        // it holds every later request of every process behind it for the rest of the
+        // boot (`helios_kmd_logic::windowed_ready`). Counted in `WbStaleRdy`.
+        let index = loop {
+            let front = self.windowed_blt.ready.front().copied();
+            let index = front.and_then(|token| {
+                self.windowed_blt
+                    .pending
+                    .iter()
+                    .position(|request| request.token == token)
+            });
+            let entry = index.map(|index| self.windowed_blt.pending[index].dispatched);
+            match helios_kmd_logic::windowed_ready::classify(front, entry) {
+                helios_kmd_logic::windowed_ready::Head::Empty => return None,
+                helios_kmd_logic::windowed_ready::Head::Stale => {
+                    self.windowed_blt.ready.pop_front();
+                    WINDOWED_READY_STALE.fetch_add(1, Ordering::Relaxed);
+                }
+                helios_kmd_logic::windowed_ready::Head::Candidate => {
+                    // `Candidate` means a front token with a pending, undispatched request.
+                    break index?;
+                }
+            }
+        };
         let boundary = self.windowed_blt.pending[index].stream_boundary;
         if !self.windowed_blt.pending[index].admitted
             || self.windowed_blt.pending[index].dispatched
@@ -7068,6 +7111,14 @@ impl VirtioGpu {
         let Some(request) = self.windowed_blt.pending.remove(index) else {
             return;
         };
+        if !request.dispatched {
+            // Retired before the worker took it (the teardown of its snapshot resource
+            // gives an admitted request a terminal): its token must not stay at the
+            // front of `ready`, where nothing would ever dispatch it or pop it.
+            self.windowed_blt
+                .ready
+                .retain(|known| *known != request.token);
+        }
         if !request.ledger_retired {
             adapter.read_ledger.retire(request.ledger_ticket, !ok);
         }

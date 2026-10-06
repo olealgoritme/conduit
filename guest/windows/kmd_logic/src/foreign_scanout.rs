@@ -265,6 +265,56 @@ pub enum Poll {
     },
 }
 
+/// How far past its deadline a user source may sit, unpolled, before the DISPATCH-level
+/// watchdog (the vsync tick) ends it itself: 250 ms, in 100 ns units. The HPD worker's
+/// timed wait expires AT the deadline, so on a healthy driver the worker always wins.
+pub const WATCHDOG_GRACE_100NS: u64 = 250 * NS100_PER_MS;
+
+/// The live source as breadcrumbs show it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveView {
+    pub owner: u64,
+    pub handle: u32,
+    pub generation: u32,
+    /// Deadline in 100 ns units of the monotonic clock the driver feeds in.
+    pub deadline: u64,
+    pub resident: bool,
+}
+
+/// Who ended a user source (`FsEndBy`). Stable codes: they are read off a registry mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum EndCause {
+    /// No source has ended yet.
+    None = 0,
+    /// `SCANOUT_RELEASE` (or the resident source's own release).
+    Release = 1,
+    /// The HPD worker's lapse poll.
+    LapseWorker = 2,
+    /// The DISPATCH watchdog (the vsync tick) found it overdue past the grace.
+    LapseWatchdog = 3,
+    /// The owner's next `SCANOUT_PRESENT` found it lapsed.
+    LapsePresent = 4,
+    /// `DestroyDevice` of the owner, at its entry (before the blob / context sweeps).
+    OwnerExit = 5,
+    /// The owner's device teardown reached `close_all_for_owner`.
+    OwnerTeardown = 6,
+    /// A forwarded `Close` of the source's DRM file, or the transport sweep of it.
+    HandleClosed = 7,
+    /// The suppression gate found the handle no longer the owner's (or another epoch).
+    Invalid = 8,
+    /// Transport reset / `StopDevice`.
+    Reset = 9,
+    /// Another owner's `SCANOUT_SET` replaced it after its lapse.
+    TookOver = 10,
+}
+
+impl EndCause {
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ForeignScanout {
     state: State,
@@ -480,6 +530,44 @@ impl ForeignScanout {
                 Poll::Lapsed { generation }
             }
             _ => Poll::Nothing,
+        }
+    }
+
+    /// [`Self::poll`] for the DISPATCH-level watchdog: a user source ends only once its
+    /// deadline is overdue by `grace`, so the HPD worker, whose own timed wait expires at
+    /// the deadline, always gets to do it first and a healthy driver never sees the
+    /// watchdog act. A resident source never lapses.
+    pub fn poll_overdue(&mut self, now: u64, grace: u64) -> Poll {
+        match &self.state {
+            State::Active(a) if !a.resident && now >= a.deadline.saturating_add(grace) => {
+                self.poll(now)
+            }
+            _ => Poll::Nothing,
+        }
+    }
+
+    /// When the watchdog next has something to look at: the deadline of the live USER
+    /// source plus `grace`, or 0 for none (no source, or a resident one). A hint the
+    /// driver mirrors in one atomic so the tick costs a load while nothing is live.
+    pub fn watch_at(&self, grace: u64) -> u64 {
+        match &self.state {
+            State::Active(a) if !a.resident => a.deadline.saturating_add(grace).max(1),
+            _ => 0,
+        }
+    }
+
+    /// The live source's identity and deadline, for breadcrumbs (owner token, generation,
+    /// deadline, whether it is the KMD's resident one). `None` unless `Active`.
+    pub fn live(&self) -> Option<LiveView> {
+        match &self.state {
+            State::Active(a) => Some(LiveView {
+                owner: a.owner,
+                handle: a.handle,
+                generation: a.generation,
+                deadline: a.deadline,
+                resident: a.resident,
+            }),
+            _ => None,
         }
     }
 
@@ -825,6 +913,115 @@ mod tests {
         assert_eq!(s.poll(2_001 * MS), Poll::Nothing);
         assert_eq!(s.next_deadline(), None);
         assert!(s.desktop_restored());
+    }
+
+    #[test]
+    fn the_watchdog_ends_a_source_only_past_its_deadline_plus_grace() {
+        let mut s = ForeignScanout::new();
+        assert_eq!(s.watch_at(WATCHDOG_GRACE_100NS), 0);
+        assert_eq!(
+            s.poll_overdue(u64::MAX, WATCHDOG_GRACE_100NS),
+            Poll::Nothing
+        );
+        let o = active(&mut s, A, 0);
+        let due = 2_000 * MS + WATCHDOG_GRACE_100NS;
+        assert_eq!(s.watch_at(WATCHDOG_GRACE_100NS), due);
+        // the worker's own poll window (the deadline itself) is left to the worker
+        assert_eq!(
+            s.poll_overdue(2_000 * MS, WATCHDOG_GRACE_100NS),
+            Poll::Nothing
+        );
+        assert_eq!(s.poll_overdue(due - 1, WATCHDOG_GRACE_100NS), Poll::Nothing);
+        assert!(s.suppress_desktop(due - 1).is_none());
+        assert_eq!(
+            s.poll_overdue(due, WATCHDOG_GRACE_100NS),
+            Poll::Lapsed {
+                generation: o.generation
+            }
+        );
+        // ended exactly like the worker's lapse: the desktop is owed one flush
+        assert!(s.restore_pending());
+        assert_eq!(s.watch_at(WATCHDOG_GRACE_100NS), 0);
+        assert_eq!(s.poll_overdue(due + 1, WATCHDOG_GRACE_100NS), Poll::Nothing);
+    }
+
+    #[test]
+    fn the_watchdog_follows_an_extended_deadline_and_skips_the_resident_source() {
+        let mut s = ForeignScanout::new();
+        let o = active(&mut s, A, 0);
+        let f = s.present(A, 7, 1_000 * MS).unwrap();
+        assert!(s.extend(f.generation, 1_000 * MS));
+        let due = 3_000 * MS + WATCHDOG_GRACE_100NS;
+        assert_eq!(s.watch_at(WATCHDOG_GRACE_100NS), due);
+        assert_eq!(s.poll_overdue(due - 1, WATCHDOG_GRACE_100NS), Poll::Nothing);
+        assert_eq!(
+            s.poll_overdue(due, WATCHDOG_GRACE_100NS),
+            Poll::Lapsed {
+                generation: o.generation
+            }
+        );
+        // a resident source has no lapse and no watch
+        let mut r = ForeignScanout::new();
+        r.resident_set(A, 7, 3, layout(), 0).unwrap();
+        assert!(r.resident_foreground());
+        assert_eq!(r.watch_at(WATCHDOG_GRACE_100NS), 0);
+        assert_eq!(
+            r.poll_overdue(u64::MAX, WATCHDOG_GRACE_100NS),
+            Poll::Nothing
+        );
+        assert!(r.resident_foreground());
+    }
+
+    #[test]
+    fn live_view_names_the_source_and_its_deadline() {
+        let mut s = ForeignScanout::new();
+        assert_eq!(s.live(), None);
+        let o = active(&mut s, A, 5 * MS);
+        let v = s.live().unwrap();
+        assert_eq!(
+            (v.owner, v.handle, v.generation, v.deadline, v.resident),
+            (A, 7, o.generation, 5 * MS + 2_000 * MS, false)
+        );
+        s.release(A, None);
+        assert_eq!(s.live(), None);
+    }
+
+    #[test]
+    fn end_cause_codes_are_stable_and_distinct() {
+        let all = [
+            EndCause::None,
+            EndCause::Release,
+            EndCause::LapseWorker,
+            EndCause::LapseWatchdog,
+            EndCause::LapsePresent,
+            EndCause::OwnerExit,
+            EndCause::OwnerTeardown,
+            EndCause::HandleClosed,
+            EndCause::Invalid,
+            EndCause::Reset,
+            EndCause::TookOver,
+        ];
+        for (i, c) in all.iter().enumerate() {
+            assert_eq!(c.code() as usize, i);
+        }
+    }
+
+    #[test]
+    fn a_dead_owner_ends_at_its_first_hook_and_the_second_finds_nothing() {
+        // DestroyDevice ends the source at its entry; the later close_all_for_owner
+        // finds nothing and owes no second restore.
+        let mut s = ForeignScanout::new();
+        active(&mut s, A, 0);
+        assert!(s.release_owner(A));
+        assert!(s.restore_pending());
+        assert!(!s.release_owner(A));
+        assert!(s.desktop_restored());
+        assert!(!s.restore_pending());
+        // another owner's source is untouched by a dead owner's hooks
+        active(&mut s, B, 1);
+        assert!(!s.release_owner(A));
+        assert!(!s.release_handle(A, 7));
+        assert!(s.suppress_desktop(2).is_some());
     }
 
     #[test]

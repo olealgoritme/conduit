@@ -52,6 +52,8 @@ pub mod shared_placeholder;
 pub mod stall_diag;
 pub mod sweep_budget;
 pub mod vsync_rate;
+pub mod windowed_ready;
+pub mod slice_budget;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///
