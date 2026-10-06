@@ -39,8 +39,10 @@
 use super::*;
 use crate::virtio::nvrm::{
     NVRM_EV_DROPS, NVRM_EV_ERRORS, NVRM_EV_LATCHED, NVRM_EV_LOST, NVRM_EV_OTHER, NVRM_EV_SIGNALS,
+    NVRM_FENCE_ERRORS, NVRM_FENCE_FIRED,
 };
 use helios_kmd_logic::nvrm_events::{kind_known, Added, KINDS_ALL, KIND_LOST, KIND_READY};
+use helios_kmd_logic::nvrm_fence::Noted;
 
 /// Most registrations across every process (each is one object reference).
 pub const MAX_NVRM_EVENTS: usize = 1024;
@@ -366,8 +368,15 @@ impl VirtioGpu {
 
     /// One `EventReady{handle}`: wake the registered events; failing that, latch
     /// it on the handle so the next `REGISTER` wakes at once. A handle nobody has
-    /// open (a host fence's, a closed file's) is dropped.
+    /// open is dropped (a closed file's) unless a `SEMSURF_FENCE_CREATE` is in
+    /// flight: its fence may have fired before the reply that names it was
+    /// recorded, so the notification is kept for that create (`nvrm_fences`).
     fn deliver_nvrm_ready(&mut self, handle: u32) {
+        // A fence fires once, so every notification for one is a fire. Counted
+        // whatever became of it (woken, latched), before the lookup is lost.
+        if self.nvrm_handle_is_fence(handle) {
+            NVRM_FENCE_FIRED.fetch_add(1, Ordering::Relaxed);
+        }
         let woke = self.nvrm_events.signal_handle(handle, KIND_READY, |event| {
             // SAFETY: the table holds a reference to the event; Wait = FALSE is
             // legal at DISPATCH_LEVEL under a spinlock.
@@ -378,7 +387,16 @@ impl VirtioGpu {
         } else if self.latch_nvrm_ready(handle) {
             NVRM_EV_LATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
-            NVRM_EV_DROPS.fetch_add(1, Ordering::Relaxed);
+            match self.note_nvrm_fence_ready(handle) {
+                Noted::Kept => {}
+                Noted::NotTracking => {
+                    NVRM_EV_DROPS.fetch_add(1, Ordering::Relaxed);
+                }
+                Noted::Overflow => {
+                    NVRM_FENCE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    NVRM_EV_DROPS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
     }
 

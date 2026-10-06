@@ -237,6 +237,31 @@ pub(crate) fn publish_nvrm_counters() {
     // Foreign scanout source (HELIOS_NVRM_OP_SCANOUT_*): `FsSet`, `FsPres`, `FsRel`,
     // `FsLapse`, `FsEnd`, `FsTake`, `FsSupp`, `FsRest`, `FsRef`, `FsErr`.
     crate::adapter::foreign_scanout::publish_counters();
+    // RM fence handles (a forwarded SEMSURF_FENCE_CREATE): `NvFence` made and
+    // recorded, `NvFenceCl` released (Close or teardown; the difference is what is
+    // live), `NvFenceSig` EventReadys seen for fences, `NvFenceEarly` of those that
+    // beat the recording of their handle, `NvFenceErr` unusable replies and lost
+    // notifications (should read 0).
+    crate::diag::record_named_bytes(
+        b"NvFence",
+        crate::virtio::nvrm::NVRM_FENCES.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvFenceCl",
+        crate::virtio::nvrm::NVRM_FENCES_CLOSED.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvFenceSig",
+        crate::virtio::nvrm::NVRM_FENCE_FIRED.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvFenceEarly",
+        crate::virtio::nvrm::NVRM_FENCE_EARLY.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvFenceErr",
+        crate::virtio::nvrm::NVRM_FENCE_ERRORS.load(Ordering::Relaxed),
+    );
 }
 
 /// Mirror the scheduler private-data handoff evidence at PASSIVE_LEVEL.

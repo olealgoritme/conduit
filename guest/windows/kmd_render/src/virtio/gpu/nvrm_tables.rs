@@ -22,6 +22,7 @@
 
 use super::*;
 use alloc::boxed::Box;
+use helios_kmd_logic::nvrm_fence::{is_fence as is_fence_type, Noted, DEVICE_TYPE_FENCE};
 
 /// Most backend handles tracked across every process.
 pub const MAX_NVRM_HANDLES: usize = 1024;
@@ -121,12 +122,28 @@ impl NvrmPin {
     }
 }
 
+/// What `commit_nvrm_fence` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceCommit {
+    /// Recorded as the caller's. `fired`: its `EventReady` had already arrived and
+    /// is latched.
+    Recorded { fired: bool },
+    /// The number is already a live handle: nothing was recorded.
+    Duplicate,
+}
+
 /// What `take_nvrm_unused_pin` found.
 pub enum PinTake {
     Taken(NvrmPin),
     /// A `FORWARD` already used it: only the KMD releases it now.
     InUse,
     NotFound,
+}
+
+/// Build the fence book in its own (popped) frame; see the field's comment.
+#[inline(never)]
+pub(super) fn new_fence_book() -> Box<helios_kmd_logic::nvrm_fence::FenceBook> {
+    Box::new(helios_kmd_logic::nvrm_fence::FenceBook::new())
 }
 
 impl VirtioGpu {
@@ -191,10 +208,11 @@ impl VirtioGpu {
     }
 
     /// Pop one handle still owned by `owner` (device teardown closes it on the
-    /// host outside the lock, one at a time).
-    pub fn take_nvrm_handle_for_owner(&mut self, owner: DeviceOwner) -> Option<u32> {
+    /// host outside the lock, one at a time): the handle and its `device_type`.
+    pub fn take_nvrm_handle_for_owner(&mut self, owner: DeviceOwner) -> Option<(u32, u32)> {
         let idx = self.nvrm_handles.iter().position(|s| s.owner == owner)?;
-        Some(self.nvrm_handles.swap_remove(idx).handle)
+        let s = self.nvrm_handles.swap_remove(idx);
+        Some((s.handle, s.device_type))
     }
 
     /// Latch an `EventReady` for `handle` (see `NvrmHandleSlot::ready_latched`).
@@ -219,6 +237,65 @@ impl VirtioGpu {
             Some(s) => core::mem::replace(&mut s.ready_latched, false),
             None => false,
         }
+    }
+
+    // ---- fence handles -------------------------------------------------------------
+    //
+    // A handle a forwarded `SEMSURF_FENCE_CREATE` returned (`kmd_logic::nvrm_fence`).
+    // It lives in `nvrm_handles` like any other, recorded under
+    // `DEVICE_TYPE_FENCE`, so quotas, `EVENT_REGISTER`, the latch, `Close` and
+    // teardown all apply unchanged.
+
+    /// A create is about to be forwarded: reserve a tracking slot exactly as an
+    /// `Open` does (a full table or quota refuses BEFORE the host makes a fence)
+    /// and start keeping `EventReady`s for handles nobody owns yet. `false`: no
+    /// room, nothing was started.
+    pub fn begin_nvrm_fence_create(&mut self, owner: DeviceOwner) -> bool {
+        if !self.reserve_nvrm_handle_slot(owner) {
+            return false;
+        }
+        self.nvrm_fences.begin();
+        true
+    }
+
+    /// The create failed or its reply held no usable handle: undo `begin`.
+    pub fn cancel_nvrm_fence_create(&mut self) {
+        self.cancel_nvrm_reservation();
+        self.nvrm_fences.finish(None);
+    }
+
+    /// The host made fence `handle`: record it as `owner`'s, in one lock hold with
+    /// taking whatever `EventReady` already arrived for it, which is latched so the
+    /// first `EVENT_REGISTER` signals at once.
+    pub fn commit_nvrm_fence(&mut self, owner: DeviceOwner, handle: u32) -> FenceCommit {
+        // The host never hands out a number that is live. If one is, recording it
+        // would make two owners of one handle; refuse and leave the other alone.
+        if self.nvrm_handles.iter().any(|s| s.handle == handle) {
+            self.cancel_nvrm_fence_create();
+            return FenceCommit::Duplicate;
+        }
+        let fired = self.nvrm_fences.finish(Some(handle));
+        self.commit_nvrm_handle(owner, handle, DEVICE_TYPE_FENCE);
+        if fired {
+            if let Some(s) = self.nvrm_handles.last_mut() {
+                s.ready_latched = true;
+            }
+        }
+        FenceCommit::Recorded { fired }
+    }
+
+    /// Whether `handle` is a fence some process holds (any owner: an `EventReady`
+    /// names no owner).
+    pub(super) fn nvrm_handle_is_fence(&self, handle: u32) -> bool {
+        self.nvrm_handles
+            .iter()
+            .any(|s| s.handle == handle && is_fence_type(s.device_type))
+    }
+
+    /// An `EventReady` for a handle nobody has open: keep it if a create is in
+    /// flight that may own it.
+    pub(super) fn note_nvrm_fence_ready(&mut self, handle: u32) -> Noted {
+        self.nvrm_fences.note_ready(handle)
     }
 
     /// The transport generation, for `HeliosNvrmHeader.epoch`: it changes when
