@@ -856,6 +856,12 @@ pub mod knobs {
     /// `FlipAnnounce` 1 (the explicit foreign mode) ignores it. Read at every StartDevice; mirrored
     /// in `FaKnob` (bit 16). The name is 14 characters, the lookup buffer's limit.
     pub const FLIP_ANN_FOREIGN: KnobName = KnobName::new(b"FlipAnnForeign");
+    /// `MirrorThread` (default 1, 0 = off): run the registry mirror (`stall_diag::publish_counters`)
+    /// on its own thread, one pass a second (`ddi/mirror_thread.rs`). 0 is the kill switch: every
+    /// caller publishes inline on the HPD worker, as before v332. Read at every StartDevice and
+    /// mirrored as `MirThrEff`; a thread that could not be joined (`MirLeak` 1) turns it off for
+    /// the rest of the driver image's life.
+    pub const MIRROR_THREAD: KnobName = KnobName::new(b"MirrorThread");
     /// `FlipBusyFly` (default 0, at most 4): how many pipelined `ForeignFlip` host flips may be in
     /// flight while the worker still counts as idle for a `FlipAnnounce` (0 = none: strict: the
     /// previous buffer is certainly no longer read when the next flip is announced; 1 lets the

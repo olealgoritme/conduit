@@ -2999,6 +2999,21 @@ must not exceed the window + 1; at 2 and a 3-deep chain a value of 3 means every
 `FfFrames` close to `FfProg` and `FfDropped` small (the pacing no longer adds the round trip); if `FfFrames` stays near 150 with `FfRttB4..7` heavy, the host is the limit (the requests above). (2) `FlipAnnForeign` 1: `FaDdi` grows for the foreign class; `FaNoBusy` explains declines; look for tearing against (1).
 (3) `FlipBusyFly` 1 with (2). (4) `FfAsyncWin` 0 (explicit) to compare the synchronous flip. In every row read `MirMaxUs` and `HpdMx*` for the next long worker step, and `FlipMaxUs` / `FlipMaxSite` / `FlipMaxFl` for the 400 to 900 ms PresentMon gaps.
 
+##### 15.18.15.9 Mirror thread: kill switch, leak safety, reading the registry; the async window under announce
+
+* **`MirrorThread`** (REG_DWORD, default 1, read at every StartDevice, mirrored as `MirThrEff`): 0 starts no mirror thread, `mirror_thread::running()` is false and every
+  caller publishes inline on the HPD worker, as before v332 (the 29 ms pass between two flips returns: use it only to rule the thread out). **`MirLeak`**: the thread did not end within the 5 s join
+  (both the exit latch and the thread object are checked); it is left alive, `MirLeak` is 1 and `start` refuses to run again for the life of the driver image (initialising events a live thread may still wait on corrupts them), so the
+  mirror is inline from then on. The `Mir*` counters are zeroed at every start.
+* **Reading the registry after an escape or any event: wait about 1.5 s.** The mirror thread publishes at most once a second and only when asked (the dump, the pacing snapshot, the `Nv*` mirror); a value read right after an
+  escape may be up to a second older than the escape. `StallT` / `VsLiveT` say when the block was written.
+* **`busy()` cannot stay true:** every early return of the foreign service pass (restart pause, no transport, epoch 0, a failed registration) now serves what was taken before it; the new
+  generation resets `TAKEN` and `SERVED`; the only exits that leave a frame owed are the intended ones (window full, a yielded flip, pacing), each bounded by an answer, a strike or a timeout.
+* **The async window default with `FlipAnnounce` on, checked in the code.** `ForeignFlip` 0: `read_knob` sets the window to 0 whatever the default (the default is consulted only when `ForeignFlip` is on), so `WINDOW`, `FLYING`, `OCCUPIED` stay 0, no cell is armed,
+  `early_wake()` is false (the announce's own early wake is separate and counts as `FaEarly`), and `busy()` reads three zero atomics. `ForeignFlip` 1 at 240 flips a second: a full window ends the pass with the frame still owed and the presenter told `Yielded` (no strike, `FfWinFull`); the slot is not
+  drained while it is full (`FfDrainHeld`), so an announced flip behind it is declined by `worker_idle` and retires the normal way (backpressure, bounded by the answer or the 250 ms timeout); the late-answer tag check at cell recycling and the 8-cell / window-4 ratio are as 15.18.13 and tested in `flip_pipeline`; the used-ring drain in the
+  DPC writes one word and signals one event per answer (no allocation); the 3-strike fallback is unchanged (a refused announced flip leaves the previous picture: `FaRefuse`). Not verified on hardware.
+
 **Verified here:** the model, the bucket functions, the percentile estimate (an upper bound, tested against a sampled population), the ring match, the
 announce decision table, the idle rule's behaviour for a fast and a slow worker, the counter names (length, uniqueness, exactly the listed set written by the two
 I/O files and by nobody else); `kmd_logic` (1273 tests, with `kmd_render` as a sibling so the name scans run) and `protocol` (38) pass, the whole tree parses, the stub type-check shows no new error kind.

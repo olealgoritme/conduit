@@ -1015,14 +1015,20 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
     let seen = TAKEN.load(Ordering::Acquire);
     // A presenter that gave up waits out its pause whatever wakes the worker.
     let restart_at = RESTART_AT.load(Ordering::Acquire);
+    // An early return below flips nothing, and nothing taken so far will be flipped by this
+    // pass: it is served, or `busy()` (hence `FlipAnnounce`, for every class) would stay true until
+    // some later pass got further.
     if let Some(wake) = rs::restart_pause(restart_at, now()) {
         rm_present::set_wake_at(wake);
+        served(seen);
         return;
     }
     let Ok(epoch) = adapter.with_virtio(|v| v.nvrm_epoch()) else {
+        served(seen);
         return;
     };
     if epoch == 0 {
+        served(seen);
         return;
     }
     // The shared edges are this arm's only while it holds the screen (the level 5 service
@@ -1139,6 +1145,8 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
                     rm_present::set_wake_at(
                         now().saturating_add(helios_kmd_logic::rm_present::RETRY_AFTER_FAIL_100NS),
                     );
+                    // The presenter stands down for its retry pause: nothing is flying or owed here.
+                    served(seen);
                     return;
                 }
             }
