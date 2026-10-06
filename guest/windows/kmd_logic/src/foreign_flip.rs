@@ -366,7 +366,7 @@ pub fn target_ready(t: Option<&Target>, epoch: u64) -> bool {
 /// [`ref_name`]). At most 13 characters each, all with the `Ff` prefix no other counter uses.
 /// `FfKnob` (when the knob is read) and `FfGaveUp` (at the event) are also written at their
 /// event; everything else only by the throttled mirror.
-pub const COUNTERS: [&str; 37] = [
+pub const COUNTERS: [&str; 41] = [
     "FfKnob",
     "FfProg",
     "FfSame",
@@ -405,6 +405,10 @@ pub const COUNTERS: [&str; 37] = [
     "FfEarlyQ",
     "FfEarlyWake",
     "FfGateWake",
+    "FfAsOrph",
+    "FfAsRecyc",
+    "FfStrikeSkip",
+    "FfDrainHeld",
 ];
 
 /// Name of the per-reason refusal counter: `FfRef01` .. `FfRef15`.
