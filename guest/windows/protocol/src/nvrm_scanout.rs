@@ -59,7 +59,7 @@ pub const HELIOS_NVRM_SCANOUT_OPS: u64 = (1 << HELIOS_NVRM_OP_SCANOUT_SET)
     | (1 << HELIOS_NVRM_OP_SCANOUT_RELEASE);
 /// The op bit of `SCANOUT_STATUS`, ORed in only on a device with buffer releases.
 pub const HELIOS_NVRM_SCANOUT_STATUS_OPS: u64 = 1 << HELIOS_NVRM_OP_SCANOUT_STATUS;
-/// `supported_ops` bit 34 (a capability, like bits 32 and 33 in `rm_fence`): the KMD acked
+/// `supported_ops` bit 35 (a capability, like bits 32 to 34 in `rm_fence`): the KMD acked
 /// the host's `NVGPU_F_SCANOUT_RELEASE`, so `SCANOUT_STATUS` and the event kind
 /// `HELIOS_NVRM_EVENT_SCANOUT_RELEASED` work and the KMD's own ring presenter waits for
 /// releases. Gate on this bit, never on the op bit alone.
@@ -231,7 +231,7 @@ const _: () = {
     assert!(offset_of!(HeliosNvrmScanoutStatus, out_last_seq) == 56);
     assert!(HELIOS_NVRM_SCANOUT_STATUS_OPS == 0x1000);
     // The capability bit is above every op number and apart from the fence caps.
-    assert!(HELIOS_NVRM_CAP_SCANOUT_RELEASE >> 34 == 1);
+    assert!(HELIOS_NVRM_CAP_SCANOUT_RELEASE >> 35 == 1);
 
     assert!(size_of::<HeliosNvrmScanoutRelease>() == HELIOS_NVRM_SCANOUT_RELEASE_BYTES);
     assert!(offset_of!(HeliosNvrmScanoutRelease, handle) == 40);
