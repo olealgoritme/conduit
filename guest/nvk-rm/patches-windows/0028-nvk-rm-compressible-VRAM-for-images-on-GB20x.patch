@@ -25,7 +25,7 @@ Rendered images are bit-identical with and without compression.
  3 files changed, 75 insertions(+), 7 deletions(-)
 
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
-index 1f050e4..72759af 100644
+index 38fbfdf..ecf357d 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
 @@ -5,6 +5,8 @@
@@ -37,7 +37,7 @@ index 1f050e4..72759af 100644
  #include "util/log.h"
  #include "util/u_atomic.h"
  #include "util/os_misc.h"
-@@ -129,10 +131,26 @@ alloc_os_pages(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+@@ -165,10 +167,26 @@ alloc_os_pages(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
     return VK_SUCCESS;
  }
  
@@ -65,7 +65,7 @@ index 1f050e4..72759af 100644
  {
     const struct nvkmd_rm_lib *lib = dev->lib;
  
-@@ -149,8 +167,19 @@ alloc_rm_memory(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+@@ -185,8 +203,19 @@ alloc_rm_memory(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
        hclass = NV01_MEMORY_LOCAL_USER;
        params.attr = NVRM_DEF(OS32, _ATTR, _LOCATION, _VIDMEM) |
                      NVRM_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG) |
@@ -87,7 +87,7 @@ index 1f050e4..72759af 100644
        params.attr2 = NVRM_DEF(OS32, _ATTR2, _ZBC, _PREFER_NO_ZBC) |
                       NVRM_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _YES);
        if (!can_map)
-@@ -174,6 +203,11 @@ alloc_rm_memory(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+@@ -210,6 +239,11 @@ alloc_rm_memory(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
     if (result != VK_SUCCESS)
        return result;
  
@@ -99,7 +99,7 @@ index 1f050e4..72759af 100644
     *h_memory_out = h_memory;
  
     return VK_SUCCESS;
-@@ -262,9 +296,24 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+@@ -298,9 +332,24 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
                         dev_info->bar_size_B >> 20);
     }
  
@@ -123,9 +123,9 @@ index 1f050e4..72759af 100644
 +         pte_kind = NVKMD_RM_PTE_KIND_GENERIC_MEMORY;
 +      }
        if (result == VK_SUCCESS && bar) {
-          result = NVKMD_RM_CHECK(dev->lib, log_obj,
-                                  VK_ERROR_OUT_OF_DEVICE_MEMORY,
-@@ -288,8 +337,10 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+          const int ret =
+             dev->lib->map_memory(dev->client, dev->h_device, mem->h_memory,
+@@ -330,8 +379,10 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
        if (result != VK_SUCCESS) {
           if (!force_rm_sysmem)
              mesa_logd("NVK: OS-descriptor memory failed, using RM sysmem");
@@ -137,7 +137,7 @@ index 1f050e4..72759af 100644
        }
     }
     if (result != VK_SUCCESS)
-@@ -310,8 +361,14 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+@@ -353,8 +404,14 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
     nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_rm_mem_ops,
                    flags, size_B, page_size_B);
  

@@ -28,7 +28,7 @@ RTX 5090, 2000 draws of a 2k-triangle mesh with a dynamic UBO each:
  6 files changed, 69 insertions(+)
 
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
-index 5751e9a..a2c477b 100644
+index 9bbb1f9..25b7b8e 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
 @@ -209,6 +209,9 @@ struct nvkmd_rm_dev {
@@ -41,7 +41,7 @@ index 5751e9a..a2c477b 100644
     simple_mtx_t heap_mutex;
     struct util_vma_heap heap;
     struct util_vma_heap replay_heap;
-@@ -241,6 +244,9 @@ struct nvkmd_rm_mem {
+@@ -246,6 +249,9 @@ struct nvkmd_rm_mem {
     /* Placement actually used */
     bool vram;
  
@@ -122,13 +122,13 @@ index ea123cf..dd10c4a 100644
     list_inithead(&dev->base.mems);
     simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
-index 4fbad77..1f050e4 100644
+index a683868..38fbfdf 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
-@@ -34,6 +34,21 @@
-  *    the host and a slot in the shared window, so apps that map and unmap
-  *    per frame must not pay for it each time.  The heap's size,
-  *    dev_info.bar_size_B, is enforced here.
+@@ -47,6 +47,21 @@
+  *    the next type).  Failing the allocation on a map error instead would
+  *    take down apps that do not retry, and the window can fill at any time
+  *    from other processes.
 + *
 + * GPU caching of system memory
 + *
@@ -147,7 +147,7 @@ index 4fbad77..1f050e4 100644
   */
  
  static bool
-@@ -202,6 +217,9 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+@@ -238,6 +253,9 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
      */
     const bool force_rm_sysmem = (flags & NVKMD_RM_MEM_RM_SYSMEM) ||
                                  (flags & NVKMD_MEM_SHARED);
@@ -157,10 +157,10 @@ index 4fbad77..1f050e4 100644
     flags &= ~NVKMD_RM_MEM_RM_SYSMEM;
  
     /* Kinds are applied per mapping (the image's own VA).  The layout is only
-@@ -278,6 +296,7 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
-       goto fail_bar;
+@@ -321,6 +339,7 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
  
     mem->vram = vram;
+    mem->bar_charged = bar;
 +   mem->gpu_cached = !vram && gpu_cacheable;
     mem->pte_kind = pte_kind;
     mem->tile_mode = tile_mode;
