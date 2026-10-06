@@ -1,0 +1,15 @@
+[package]
+name = "helios_kmd_render"
+version = "0.1.0"
+edition = "2021"
+[lib]
+crate-type = ["rlib"]
+[dependencies]
+wdk = { path = "../stubs/wdk" }
+wdk-sys = { path = "../stubs/wdk_sys", package = "wdk_sys" }
+wdk-alloc = { path = "../stubs/wdk_alloc", package = "wdk_alloc" }
+wdk-panic = { path = "../stubs/wdk_panic", package = "wdk_panic" }
+helios_protocol = { path = "../protocol" }
+helios_kmd_logic = { path = "../kmd_logic" }
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
+virtio-drivers = { version = "0.13", default-features = false }

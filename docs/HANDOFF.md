@@ -7,7 +7,9 @@ things are tested. The staged plan and architecture are in
 guest-blob contract in
 [zero-copy-present.md](../guest/windows/docs/zero-copy-present.md) (24.x) and
 [VENUS.md](VENUS.md) "Guest-memory blobs"; DWM on NVK in
-[dwm-on-nvk.md](dwm-on-nvk.md); the test scripts in
+[dwm-on-nvk.md](dwm-on-nvk.md); the KMD session's own handoff (latency budget, counter traps, MSI-X plan,
+next KMD steps) in
+[kmd-handoff-2026-10.md](../guest/windows/docs/kmd-handoff-2026-10.md); the test scripts in
 [guest/windows/ci/vmtest](../guest/windows/ci/vmtest/README.md).
 
 ## Goal and the bar
