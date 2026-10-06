@@ -177,7 +177,110 @@ static int kmd_status_to_errno(int32_t status)
 /* One HELIOS_ESCAPE_NVRM call on an already-built buffer. Returns 0 and leaves
  * the KMD's verdict in head->status, or a negative errno for a transport
  * failure (an older KMD without the verb answers STATUS_NOT_IMPLEMENTED). */
+/*
+ * CRM_WIN_PROF_FILE=path: count and time every escape by kind, from any
+ * thread, and rewrite `path` with the cumulative table at most once a second
+ * (so a killed process still leaves one; diff two snapshots for a rate).
+ * Kinds: op (QUERY_CAPS/MMAP, MUNMAP, EVENT_REGISTER, PIN, ...), FORWARD by message type,
+ * Ioctl by NVIDIA escape number, and NV_ESC_RM_CONTROL (0x2a) by control cmd.
+ * Off (one predictable branch per call) unless the variable is set.
+ */
+#define PROF_SLOTS 1024
+struct prof_ent {
+    uint64_t key; /* kind << 32 | sub; 0 = free */
+    uint64_t n;
+    double sum_us, max_us;
+};
+static struct prof_ent g_prof[PROF_SLOTS];
+static SRWLOCK g_prof_lock = SRWLOCK_INIT;
+static int g_prof_on = -1;
+static char g_prof_path[MAX_PATH];
+static LARGE_INTEGER g_prof_freq, g_prof_t0, g_prof_last;
+
+enum { PROF_OP = 1, PROF_MSG = 2, PROF_IOCTL = 3, PROF_CTRL = 4, PROF_WAIT = 5 };
+
+static uint64_t prof_key(const void *buf)
+{
+    const HeliosNvrmHeader *h = buf;
+    if (h->op != HELIOS_NVRM_OP_FORWARD)
+        return ((uint64_t)PROF_OP << 32) | h->op;
+    const uint8_t *req = (const uint8_t *)buf + HELIOS_NVRM_FORWARD_REQ_OFFSET;
+    const uint32_t type = crm_get32(req);
+    if (type != CRM_WIRE_MSG_IOCTL)
+        return ((uint64_t)PROF_MSG << 32) | type;
+    const uint32_t nr = crm_get32(req + CRM_WIRE_HDR) & 0xffu;
+    const uint32_t data_len = crm_get32(req + CRM_WIRE_HDR + 4);
+    if (nr == 0x2a && data_len >= 12) /* NVOS54_PARAMETERS.cmd at offset 8 */
+        return ((uint64_t)PROF_CTRL << 32) |
+               crm_get32(req + CRM_WIRE_HDR + CRM_WIRE_IOCTL_REQ + 8);
+    return ((uint64_t)PROF_IOCTL << 32) | nr;
+}
+
+static void prof_write(double now_ms)
+{
+    FILE *f = fopen(g_prof_path, "w");
+    if (!f)
+        return;
+    fprintf(f, "# t_ms %.1f pid %lu\nkind,sub,calls,total_us,max_us\n", now_ms,
+            (unsigned long)GetCurrentProcessId());
+    static const char *kinds[] = { "?", "op", "msg", "ioctl", "control", "evwait", "?", "?" };
+    for (int i = 0; i < PROF_SLOTS; i++) {
+        const struct prof_ent *e = &g_prof[i];
+        if (!e->key)
+            continue;
+        fprintf(f, "%s,0x%x,%llu,%.1f,%.1f\n", kinds[(e->key >> 32) & 7],
+                (unsigned)(e->key & 0xffffffffu), (unsigned long long)e->n, e->sum_us,
+                e->max_us);
+    }
+    fclose(f);
+}
+
+static void prof_record(uint64_t key, LARGE_INTEGER t0, LARGE_INTEGER t1)
+{
+    const double us = (double)(t1.QuadPart - t0.QuadPart) * 1e6 / (double)g_prof_freq.QuadPart;
+    AcquireSRWLockExclusive(&g_prof_lock);
+    uint32_t h = (uint32_t)(key ^ (key >> 29)) * 2654435761u;
+    for (int probe = 0; probe < PROF_SLOTS; probe++) {
+        struct prof_ent *e = &g_prof[(h + probe) % PROF_SLOTS];
+        if (e->key != key && e->key)
+            continue;
+        e->key = key;
+        e->n++;
+        e->sum_us += us;
+        if (us > e->max_us)
+            e->max_us = us;
+        break;
+    }
+    if (t1.QuadPart - g_prof_last.QuadPart > g_prof_freq.QuadPart) {
+        g_prof_last = t1;
+        prof_write((double)(t1.QuadPart - g_prof_t0.QuadPart) * 1e3 / (double)g_prof_freq.QuadPart);
+    }
+    ReleaseSRWLockExclusive(&g_prof_lock);
+}
+
+static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size);
+
 static int nvrm_escape(struct win_ctx *c, void *buf, uint32_t size)
+{
+    if (g_prof_on < 0) {
+        const DWORD n = GetEnvironmentVariableA("CRM_WIN_PROF_FILE", g_prof_path, sizeof(g_prof_path));
+        QueryPerformanceFrequency(&g_prof_freq);
+        QueryPerformanceCounter(&g_prof_t0);
+        g_prof_last = g_prof_t0;
+        g_prof_on = n > 0 && n < sizeof(g_prof_path);
+    }
+    if (!g_prof_on)
+        return nvrm_escape_raw(c, buf, size);
+    const uint64_t key = prof_key(buf);
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    const int r = nvrm_escape_raw(c, buf, size);
+    QueryPerformanceCounter(&t1);
+    prof_record(key, t0, t1);
+    return r;
+}
+
+static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size)
 {
     D3DKMT_ESCAPE esc;
     memset(&esc, 0, sizeof(esc));
@@ -1019,7 +1122,16 @@ static int win_event_wait(void *vctx, int fd, uint32_t timeout_ms)
     if (r)
         return r;
     const DWORD ms = timeout_ms == 0xFFFFFFFFu ? INFINITE : (DWORD)timeout_ms;
-    switch (WaitForSingleObject(ev, ms)) {
+    LARGE_INTEGER t0, t1;
+    if (g_prof_on > 0)
+        QueryPerformanceCounter(&t0);
+    const DWORD w = WaitForSingleObject(ev, ms);
+    if (g_prof_on > 0) {
+        /* evwait 0x0 = woken by the event, 0x1 = timed out */
+        QueryPerformanceCounter(&t1);
+        prof_record(((uint64_t)PROF_WAIT << 32) | (w == WAIT_OBJECT_0 ? 0u : 1u), t0, t1);
+    }
+    switch (w) {
     case WAIT_OBJECT_0:
         ResetEvent(ev);
         return 1;

@@ -84,7 +84,7 @@ Linux host: `vulkan_nouveau.dll`, its ICD manifest and `librmclient.dll`.
 With librmclient's real Windows transport (RM escapes through the Helios
 KMD) it **runs on the RTX 5090 in the `win11` guest**: enumeration, compute
 and offscreen rendering pass (see "First run on Windows" below); presenting
-is the next step. Seven more Mesa patches on top of the 13 above, in `patches-windows/` (Mesa branch `nvk-rm-windows`):
+is the next step. Nine more Mesa patches on top of the 13 above, in `patches-windows/` (Mesa branch `nvk-rm-windows`):
 
 | # | patch | what |
 |---|---|---|
@@ -96,6 +96,7 @@ is the next step. Seven more Mesa patches on top of the 13 above, in `patches-wi
 | 19 | `nvk: build for Windows with the RM backend only` | `with_nouveau_drm` (false on Windows): no nouveau winsys / `nvkmd/nouveau`; chipset limits split into `nouveau_device_limits.[ch]`; the RM backend's DRM side moved to `nvkmd_rm_drm.c` (Linux only, stubs otherwise); `VK_EXT_physical_device_drm` and DRM syncobj copies Linux only; empty `<sys/ioccom.h>` for `drm.h`; `TRUE`/`FALSE` from `<windows.h>`; `vulkan_nouveau.dll` with `vulkan_api.def` exports |
 | 20 | `nvk: Win32 WSI` | `VK_KHR_win32_surface` + swapchain through Mesa's win32 WSI, as a software device (CPU copy per present) |
 | 21 | `nvk/rm, wsi: Win32 zero-copy present by Helios scanout` | swapchain images in VRAM, imported once on a host render node as GEM objects and shown with ScanoutFlip (see "Zero-copy present on Windows" below); GDI stays the fallback |
+| 22 | `nvk/rm: host-visible VRAM (a BAR heap)` | a DEVICE_LOCAL \| HOST_VISIBLE \| HOST_COHERENT type on a heap of its own, backed by vidmem mapped once through BAR1 (see "Host-visible VRAM" below). Generic RM code, Linux too |
 
 Linux behaviour is unchanged: the full series (20 patches) builds the Linux
 NVK (nouveau + RM) as before, with the same `.so` exports; the patches apply
@@ -307,6 +308,170 @@ same NAK bitfield question answered with the MSVC layout), presenting
 through the win32 WSI, `vkcube` (it cannot be pointed at NVK from an
 elevated session, see above) and dEQP.
 
+### D3D11 games through DXVK: Unigine Heaven (2026-10-06, `win11`, KMD 22.22.308.0)
+
+Heaven 4.0 runs as D3D11 -> DXVK -> NVK -> RM, without touching the Helios
+WDDM driver or registering anything system-wide. Every file sits next to
+`Heaven.exe` in a private copy of Heaven.
+
+**Heaven is a 32-bit (WoW64) application.** That means a 32-bit NVK and
+librmclient. The 64-bit `vulkan_nouveau.dll` fails to load in it
+(`LoadLibrary` error 193). In that case the shim below falls back to the
+system loader, and DXVK silently runs on the Venus ICD instead. Check
+`logs\nvk-shim.log` and `Heaven_dxgi.log` ("Found device: ... (NVK GB202)").
+The RM transport works from WoW64 as it is: the escape ABI is
+pointer-free, and the KMD's user mappings land below 4 GiB. The 32-bit
+`crm_smoke`, `crm_pin_smoke` and `crm_event_smoke` all pass.
+
+Build (host):
+
+    ARCH=i686 OUT_DIR=dist32 guest/nvk-rm/build-windows.sh ~/code/mesa-nvk-rm-win32 build-win32
+    # DXVK: the Helios fork, built plain with MinGW, no source changes
+    # (its Helios hooks find no helios_* exports outside helios_umd.dll and stay off):
+    cd guest/windows/third_party/dxvk && meson setup build32 --cross-file build-win32.txt \
+        --buildtype release --strip -Denable_d3d8=false -Denable_d3d9=false \
+        -Denable_d3d10=false -Db_vscrt=none && ninja -C build32
+    guest/nvk-rm/windows/stage-dxvk-app.sh i686 dist32 <dir with the fork's d3d11.dll+dxgi.dll> stage
+
+Requirements for `ARCH=i686`: `gcc-mingw-w64-i686` (dwarf2) and the
+`i686-pc-windows-gnu` rustup target for the toolchain meson uses. Install it
+with `rustup target add --toolchain stable ...` if a `rust-toolchain` file
+pins another one. `patches-windows-dxvk/` is applied after
+`patches-windows/`:
+
+| # | patch | why |
+|---|---|---|
+| 1 | VKAPI_CALL on `nvk_CmdCopyMemoryToImageIndirectKHR` | 32-bit Windows (`__stdcall`) build error |
+| 2 | no `VK_KHR_present_id`/`present_wait(2)` on Windows | the Win32 WSI has no `wait_for_present`; DXVK uses present wait when offered and hit `assert(swapchain->wait_for_present)` |
+| 3 | R/B swizzle in the GDI present for R8G8B8A8 swapchains | the DIB is BGRA; DXVK picked `R8G8B8A8_UNORM`, so the sky came out orange |
+| 4 | `NVK_RM_WAIT_SPIN`, `NVK_RM_WAIT_POLL_MS` | knobs for measuring the CPU wait path |
+
+The upstream DXVK 3.1.1 release `d3d11.dll` is quarantined by Windows
+Defender in the guest (a false positive). The fork build is not.
+
+Guest: copy `W:\Heaven` to `C:\Users\Public\heaven-nvk`, then put the staged
+files in its `bin\` and `run-heaven-nvk.bat` + `heaven-nvk-fps.ps1` in
+its root. Double-clicking `run-heaven-nvk.bat` runs it on the desktop. Its
+arguments are `[dir [w h [prof]]]`. An optional `env.cmd` next to it is
+`call`ed first (e.g. `set HEAVEN_TESS=TESSELLATION_DISABLED`,
+`set NVK_HELIOS_WSI=0`).
+
+- `vulkan-1.dll` (`windows/vulkan_shim.c`) forwards to the system loader.
+  In `vkCreateInstance` it chains `VK_LUNARG_direct_driver_loading`
+  (exclusive) with the `vulkan_nouveau.dll` next to it. The loader ignores
+  `VK_DRIVER_FILES` in elevated processes, and this sidesteps that.
+  `NVK_SHIM_FRAMES=file` logs every `vkQueuePresentKHR`. It is the only
+  frame clock here: an app-local `dxgi.dll` emits no DXGI ETW events, so
+  PresentMon sees nothing.
+- `heaven-nvk-fps.ps1 [-Seconds 30] [-Warmup 45] [-Width] [-Height] [-Prof]`
+  starts it through a scheduled task in the user's session, prints fps,
+  frame-time median/p99 and 5 s buckets, and stops it by PID. `-Prof` adds
+  librmclient's per-escape table (`CRM_WIN_PROF_FILE`, which also counts
+  event waits) for the timed window.
+
+Results, 1600x900 Medium, tessellation normal, the same RTX 5090. The NVK
+rows are a 30 s window after 45 s; Venus is `heaven-fps.ps1`, 30 s after 25 s:
+
+| path | fps | median / p99 ms | host SM % (nvidia-smi dmon) | power |
+|---|---|---|---|---|
+| Venus, Helios UMD (embedded DXVK) | 138.8 | 6.75 / 13.3 | 25-40 | ~165 W |
+| NVK, GDI copy present | 62.5-62.8 | 15.2-17.1 / 22-41 | 68-94 | ~160 W |
+| NVK, GDI, 800x450 | 85.2 | 10.5 / 18.6 | 93-99 | ~155 W |
+| NVK, GDI, pure spin waits (`NVK_RM_WAIT_SPIN=1e8`) | 61.8 | 17.7 / 22.6 | | |
+| NVK, zero-copy Helios WSI (patch 21, SCANOUT_PRESENT, unpaced) | 59.7 | 15.6 / 57.6 | 72-99 | ~150-170 W |
+| NVK, zero-copy, tessellation disabled | 96.6 | 8.7 / 18.7 | | |
+| app-local DXVK fork on Venus (64-bit NVK DLL failed to load) | ~50 | | 16-20 | ~100 W |
+
+Rendering is correct: geometry, textures, tessellation, and colors after
+patch 3. The per-bucket fps follows the camera path identically from run
+to run, 48-175 fps.
+
+RM traffic per frame (GDI run): 10.4 `NV_ESC_RM_GET_EVENT_DATA` at ~100 us
+each, from the event drain in `nvkmd_rm_wait_step()`, so ~1 ms. There are
+10.4 event waits, almost all woken by the event, not the 10 ms timeout.
+Zero-copy adds one `SCANOUT_PRESENT` (op 10) per frame, 0.1-1.9 ms.
+Everything else is under 0.05 per frame: no per-frame mmap, Open/Close,
+alloc/free or event registration.
+
+What limits NVK here is NVK's GPU work, not the transport or the present:
+
+- removing the GDI copy changes nothing;
+- removing event waits (pure spinning) changes nothing;
+- the GPU is busy 70-99% of the time at 60 fps, where the NVIDIA driver
+  (Venus) needs 25-40% at 139 fps. That is ~5-6x more GPU time per frame,
+  at low power, so stalls more likely than math;
+- a quarter of the pixels only goes from 62 to 85 fps;
+- turning tessellation off gives +60%.
+
+NVK reports no host-visible VRAM (`bar_size_B = 0` in
+`nvkmd_rm_pdev.c`). The memory types are type 0 DEVICE_LOCAL (heap 0,
+31.4 GiB) and type 1 HOST_VISIBLE|HOST_COHERENT|HOST_CACHED (heap 1,
+15 GiB sysmem). So DXVK keeps its dynamic and upload buffers in snooped
+system memory, which the GPU reads over PCIe on every draw. This is the
+first suspect (`feat/nvk-rm-bar-heap`). After that come NVK/NAK on
+Blackwell itself and tessellation.
+
+It was the cause: see the next section.
+
+### Host-visible VRAM (patch 22, 2026-10-06, `win11`, KMD 22.22.310.0)
+
+Patch 22 adds the BAR heap NVK on nouveau (without ReBAR) and NVIDIA's own
+driver have. On the RTX 5090 in `win11`:
+
+| | heaps | types |
+|---|---|---|
+| before (`NVK_RM_BAR_MB=0`) | 0: 32146 MiB VRAM; 1: 15356 MiB sysmem | 0: DEVICE_LOCAL (heap 0); 1: HOST_VISIBLE \| HOST_COHERENT \| HOST_CACHED (heap 1) |
+| after (default) | 0: 32146 MiB VRAM; **1: 256 MiB VRAM (BAR)**; 2: 15356 MiB sysmem | 0: DEVICE_LOCAL (heap 0); **1: DEVICE_LOCAL \| HOST_VISIBLE \| HOST_COHERENT (heap 1)**; 2: HOST_VISIBLE \| HOST_COHERENT \| HOST_CACHED (heap 2) |
+
+- Why it was 0: the first cut set `bar_size_B = 0` on purpose. CPU maps of
+  VRAM go through BAR1 and, under Conduit, through the host-visible window
+  every CPU mapping in the guest shares (1 GiB, `NvWinMb`), and each map
+  cost a host round trip (5.7 ms before KMD 309, 0.4 ms now).
+- What it uses now: `bar_size_B = min(NVK_RM_BAR_MB (default 256, 0 = off),
+  BAR1 / 2)`, BAR1 from `NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE`. NVK's other
+  mappable memory is its own system pages (OS descriptors) and takes no
+  window space, so 256 MiB per device fits. Each allocation from the type
+  is mapped once (`crm_map_memory`, write-combined in the KMD) when it is
+  allocated and stays mapped until freed; internal and client maps alias
+  that mapping, so mapping per frame costs nothing. An allocation that
+  does not fit the heap fails with `VK_ERROR_OUT_OF_DEVICE_MEMORY`.
+- Only that type lands in the BAR: `nvkmd_info::host_visible_vram_is_pinned`
+  makes NVK ask for `NVKMD_MEM_VRAM` there, while NVK's own
+  `LOCAL | CAN_MAP` buffers (push, queries, events, upload) stay in system
+  memory, where the CPU can also read them fast.
+
+`tests/vk_bar_test.c` (`vk_bar_test bar.comp.spv 4194304 fill`, 64-bit):
+
+    host-visible VRAM: type 1, heap 1 (256 MiB)
+    vkAllocateMemory 16 MiB (incl. its BAR mapping): 1.54 ms
+    map+unmap: 0.039 us each (1000)
+    CPU write 16 MiB: 13.49 ms (1244 MB/s)
+    CPU read 16 MiB: 1147.64 ms (15 MB/s; reads through a WC mapping are slow)
+    PASS: 4194304/4194304 values correct (CPU write -> GPU read/write -> CPU read, host-visible VRAM)
+    fill: 15 x 16 MiB more, then -2 (256 MiB in use, heap 256 MiB), 2.37 ms per block
+    PASS: heap limit enforced, freed space reusable
+
+`vk_summary`, `vk_compute_test copy` and `vk_offscreen_test` pass as before.
+
+Heaven 4.0 (32-bit build, `ARCH=i686`), 1600x900 Medium, tessellation
+normal, GDI present, `heaven-nvk-fps.ps1` (the same 30 s window after 25 s
+warm-up for every run), host `nvidia-smi dmon -s pu` over the window. The
+same `vulkan_nouveau.dll`, BAR heap off through `env.cmd`
+(`set NVK_RM_BAR_MB=0`) or on (default):
+
+| run | fps | median / p99 ms | SM % | power |
+|---|---|---|---|---|
+| BAR heap off, run 1 | 95.3 | 9.05 / 20.5 | 96-100 | 159-182 W |
+| BAR heap off, run 2 | 92.9 | 9.72 / 20.4 | 98-99 | 162-181 W |
+| **BAR heap on, run 1** | **298.1** | **3.05 / 6.0** | 77-97 | 183-232 W |
+| **BAR heap on, run 2** | **296.2** | **3.11 / 6.5** | 89-97 | 184-240 W |
+
+3.1x, on the same camera path (5 s buckets 143-432 fps on, 44-154 off).
+The GPU was busy all the time either way, but at higher power: it was
+stalled on PCIe reads of DXVK's dynamic buffers in system memory, not
+computing. (The "off" rows are faster than the 62 fps in the table above
+because KMD 22.22.309/310 and the backend got faster in between.)
+
 ## Running (in a guest)
 
 ```sh
@@ -491,9 +656,9 @@ registered with `crm_alloc_os_descriptor` (`NV_ESC_RM_ALLOC_MEMORY` on the
 GPU channel): RM takes a user address only on that route, `NV_ESC_RM_ALLOC`
 of the class answers `NV_ERR_NOT_SUPPORTED`;
 fallback `NV01_MEMORY_SYSTEM`. Device-local memory: `NV01_MEMORY_LOCAL_USER`,
-64 KiB pages, no compression. No host-visible VRAM type is exposed
-(`bar_size_B = 0`, `has_host_visible_vram = false`); an explicit
-`VRAM | CAN_MAP` request would map through BAR1 with `crm_map_memory`. All
+64 KiB pages, no compression. Host-visible VRAM (patch 22, Windows
+series): a 256 MiB BAR heap (`NVK_RM_BAR_MB`), vidmem mapped once through
+BAR1 with `crm_map_memory` at allocation; see "Host-visible VRAM". All
 memory is coherent.
 
 **VA** (`nvkmd_rm_va.c`). NVK keeps picking addresses from its
@@ -547,7 +712,7 @@ unsubmitted values instead of leaving GPU acquires spinning).
 | dma-buf / opaque-fd memory export and import | done (see "Zero-copy presentation") | cross-driver import (a dma-buf nvidia-drm cannot name) is refused |
 | external semaphore/fence fds, explicit sync | not supported (no handle types) | `NV_SEMAPHORE_SURFACE` + nvidia-drm's `SEMSURF_FENCE_*` (Conduit forwards them) for sync_files and syncobjs; then drop `wait_before_present` and use Wayland explicit sync / DRI3 syncobj |
 | presentation | zero-copy (dma-buf + modifiers), CPU wait before each present | explicit sync, above |
-| host-visible VRAM, BAR heap | off | Conduit's 1 GiB mapping window question |
+| host-visible VRAM, BAR heap | 256 MiB (patch 22, `NVK_RM_BAR_MB`) | the window size from the KMD/backend, to size the heap from it |
 | compression | off | comptags (`NVOS32_ATTR_COMPR_REQUIRED`) and compressed modifiers |
 | transfer queue (async CE channel), video decode | off | a second TSG with `NV2080_ENGINE_TYPE_COPY(n)` |
 | zcull info | not queried | `NV2080_CTRL_CMD_GR_GET_ZCULL_INFO` |
