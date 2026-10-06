@@ -623,7 +623,7 @@ fn a_guest_renders_a_frame_from_capset_to_reset() {
         panic!("held");
     };
     let region = t.region.clone();
-    let done = t.venus.reset(Some(&*region));
+    let done = t.venus.reset(Some(&*region), None);
     assert_eq!(done.len(), 1);
     assert_eq!(done[0].token, token);
     assert_eq!(
@@ -1479,3 +1479,34 @@ fn scanout_modifier_reaches_the_viewer() {
 }
 
 mod rm;
+
+/// A reset with the display: the scanout goes off on the link, and a late
+/// flush naming the old generation's scanout resource shows nothing -- not
+/// while the id is unknown, and not once the new generation reuses the id
+/// for a resource it never made the scanout.
+#[test]
+fn a_reset_turns_the_scanout_off_and_late_flushes_show_nothing() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut t = Rig::new();
+    let (link, _broker) = display();
+    t.ctx(1);
+    assert_eq!(t.blob(1, 11, 1280 * 720 * 4), RESP_OK_NODATA);
+    assert_eq!(t.ty(&scanout_cmd(11, 1280, 720)), RESP_OK_NODATA);
+    assert_eq!(t.send_on(&flush_cmd(11), Some(&link)).0.ty, RESP_OK_NODATA);
+    assert_eq!(link.stats.sent.load(Relaxed), 1);
+
+    t.venus.reset(None, Some(&link));
+    assert_eq!(t.venus.scanout_state(), None);
+    assert_eq!(t.venus.resources(), 0);
+
+    // Late: the id is gone.
+    assert_eq!(
+        t.send_on(&flush_cmd(11), Some(&link)).0.ty,
+        RESP_ERR_INVALID_RESOURCE_ID
+    );
+    // The next generation reuses the id; it is not the scanout.
+    t.ctx(1);
+    assert_eq!(t.blob(1, 11, 1280 * 720 * 4), RESP_OK_NODATA);
+    assert_eq!(t.send_on(&flush_cmd(11), Some(&link)).0.ty, RESP_OK_NODATA);
+    assert_eq!(link.stats.sent.load(Relaxed), 1, "nothing shown");
+}

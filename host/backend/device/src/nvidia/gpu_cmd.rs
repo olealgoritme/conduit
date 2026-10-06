@@ -92,7 +92,7 @@ impl NvidiaBackend {
     pub(super) fn reset_venus(&mut self) -> Option<crate::venus::Venus> {
         self.venus_held = None;
         let mut venus = self.venus.take()?;
-        let dropped = venus.reset(None).len();
+        let dropped = venus.reset(None, self.display.as_deref()).len();
         if dropped > 0 {
             log::info!("device reset: {dropped} held Venus chain(s) went with the queue");
         }
@@ -102,7 +102,7 @@ impl NvidiaBackend {
     pub(super) fn teardown_venus(&mut self) {
         if let Some(v) = self.venus.as_mut() {
             v.report();
-            v.reset(None);
+            v.reset(None, self.display.as_deref());
         }
     }
 }

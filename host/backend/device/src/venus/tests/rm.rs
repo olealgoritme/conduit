@@ -318,7 +318,7 @@ fn a_reset_lets_go_of_every_rm_blob() {
     );
     // The backend's descriptor and the renderer's both go with a reset.
     let ino = inode(t.venus.resources[&50].fd.as_fd());
-    t.venus.reset(None);
+    t.venus.reset(None, None);
     assert_eq!(t.venus.resources(), 0);
     assert!(t.r.mock.lock().unwrap().imported.is_empty());
     // No descriptor in this process still names the object.

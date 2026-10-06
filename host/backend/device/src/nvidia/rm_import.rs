@@ -256,6 +256,12 @@ impl RmLayouts {
         self.1.retain(|(o, _), _| *o != owner);
     }
 
+    /// The guest's generation ended: every file it named is gone.
+    pub(super) fn clear(&mut self) {
+        self.0.clear();
+        self.1.clear();
+    }
+
     pub(super) fn len(&self) -> usize {
         self.0.len()
     }

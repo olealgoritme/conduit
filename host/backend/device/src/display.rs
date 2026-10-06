@@ -1334,6 +1334,8 @@ pub struct DisplayLink {
     /// The guest wants `ScanoutReleased` (lock-free check on every flip).
     release_on: AtomicBool,
     release_sink: Mutex<Option<Arc<dyn ReleaseSink>>>,
+    /// Guest generations ended so far ([`DisplayLink::guest_gone`]).
+    generation: AtomicU64,
     pub stats: LinkStats,
 }
 
@@ -1407,6 +1409,7 @@ impl DisplayLink {
             console_attached: AtomicBool::new(false),
             release_on: AtomicBool::new(false),
             release_sink: Mutex::new(None),
+            generation: AtomicU64::new(0),
             stats: LinkStats::default(),
         })
     }
@@ -2453,6 +2456,111 @@ impl DisplayLink {
         }
     }
 
+    /// The guest's transport generation ended (device reset, a driver reload
+    /// such as `pnputil /restart-device`, or backend teardown): nothing the
+    /// guest showed before may be shown again.
+    ///
+    /// Every buffer of the old generation goes: the kept frame and cursor
+    /// (dups of dma-bufs whose memory the guest's RM clients owned, which RM
+    /// frees and reissues to the next generation -- re-sent, they show
+    /// whatever lands there next), what was parked by GEM identity (resource
+    /// ids and GEM numbers restart), and every buffer awaiting a release.
+    /// The clients are sent a black shared-memory frame at once, so a viewer
+    /// stops presenting the old dma-buf, and it is the frame a client that
+    /// attaches later is shown, until the guest flips again or the boot
+    /// console (if attached) takes over, which it does now.
+    pub fn guest_gone(&self, why: &str) {
+        let mut st = self.state.lock().unwrap();
+        let had_frame = st.frame_key.is_some()
+            || st.parked_frame.is_some()
+            || st
+                .frame
+                .as_ref()
+                .is_some_and(|f| f.2 & wire::CMD_F_SHM == 0);
+        // The size the viewer shows now: the guest's last frame's.
+        let last_size = st
+            .guest_size
+            .or_else(|| st.frame.as_ref().map(|f| (f.1.width, f.1.height)))
+            .filter(|&(w, h)| w > 0 && h > 0);
+        st.parked_frame = None;
+        st.parked_cursor = None;
+        self.note_parked(&st);
+        st.release.forget(|_| true);
+        st.guest_size = None;
+        // The guest's pointer image is hidden until the guest sets one again.
+        if st.cursor.take().is_some() {
+            st.cursor = Some(SentCursor {
+                fd: None,
+                c: CursorUpdate::default(),
+            });
+            for i in 0..st.clients.len() {
+                st.clients[i].cursor_dirty = true;
+                if st.clients[i].sock.is_some() {
+                    let _ = self.send_cursor_locked(&mut st, i);
+                }
+            }
+        }
+        // The console's own frame (shown already) stays; a guest frame goes,
+        // replaced by black at the size the viewer has now.
+        let console_frame = st.console_mode == Some(ConsoleMode::Shown)
+            && st.frame_key.is_none()
+            && st
+                .frame
+                .as_ref()
+                .is_some_and(|f| f.2 & wire::CMD_F_SHM != 0);
+        let blanked = if console_frame {
+            false
+        } else {
+            let size = last_size.unwrap_or((self.configured.width, self.configured.height));
+            st.frame = None;
+            st.frame_key = None;
+            match black_frame(size.0, size.1) {
+                Ok(fd) => {
+                    let f = ScanoutFlip {
+                        width: size.0,
+                        height: size.1,
+                        stride: size.0 * 4,
+                        fourcc: DRM_FORMAT_XRGB8888,
+                        ..Default::default()
+                    };
+                    if self.wants_frames() {
+                        self.present_locked(&mut st, fd.as_raw_fd(), &f, wire::CMD_F_SHM, None);
+                    } else {
+                        st.frame = Some((Arc::new(fd), f, wire::CMD_F_SHM));
+                    }
+                    true
+                }
+                Err(e) => {
+                    log::warn!("display: a black {}x{} frame: {e}", size.0, size.1);
+                    // Nothing kept is better than the old buffer.
+                    for c in st.clients.iter_mut() {
+                        c.frame_owed = false;
+                    }
+                    false
+                }
+            }
+        };
+        log::info!(
+            "display: {why}: guest scanout generation ended; {}{}",
+            if had_frame {
+                "stale frame dropped"
+            } else {
+                "no frame was kept"
+            },
+            if blanked { ", viewer blanked" } else { "" }
+        );
+        if st.console_mode.is_some_and(|m| m != ConsoleMode::Shown) {
+            log::info!("display: {why}; boot console shown");
+            self.set_console_locked(&mut st, ConsoleMode::Shown);
+        }
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// How many guest generations ended ([`DisplayLink::guest_gone`]).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     /// Where the console stands (tests, logs).
     pub fn console_mode(&self) -> Option<ConsoleMode> {
         self.state.lock().unwrap().console_mode
@@ -3099,6 +3207,41 @@ fn send_records(sock: RawFd, bytes: &[u8], fd: Option<RawFd>) -> io::Result<()> 
         }
         return Ok(());
     }
+}
+
+/// `DRM_FORMAT_XRGB8888`.
+const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+
+/// A `width` x `height` XRGB8888 frame of black: a memfd of zeros (sparse,
+/// nothing written), sealed against shrinking as the viewer requires of a
+/// [`wire::CMD_F_SHM`] frame.
+fn black_frame(width: u32, height: u32) -> io::Result<OwnedFd> {
+    let len = u64::from(width) * u64::from(height) * 4;
+    if len == 0 {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    // SAFETY: plain memfd_create with a NUL-terminated name.
+    let fd = unsafe {
+        libc::memfd_create(
+            c"conduit-blank".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh descriptor nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: integer arguments on a descriptor we hold.
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    // SAFETY: integer arguments on a descriptor we hold.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
 }
 
 fn set_nonblocking(fd: RawFd) {
@@ -4774,5 +4917,162 @@ mod tests {
         assert_eq!(link.tick_releases(), None);
         assert_eq!(released(&sink), vec![(10, 1, NOT_SHOWN)]);
         assert_eq!(link.stats.released.load(Ordering::Relaxed), 1);
+    }
+
+    /// A memfd's size and seals, to tell the black frame from a guest buffer.
+    fn blank_info(fd: RawFd) -> (u64, i32) {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0);
+        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+        (st.st_size as u64, seals)
+    }
+
+    fn assert_black(c: &wire::Cmd, f: &OwnedFd, w: u32, h: u32) {
+        assert_eq!(c.ty, wire::CMD_ATTACH);
+        assert_eq!(c.flags & wire::CMD_F_SHM, wire::CMD_F_SHM, "shared memory");
+        assert_eq!((c.width, c.height, c.stride), (w, h, w * 4));
+        assert_eq!(c.fourcc, DRM_FORMAT_XRGB8888);
+        let (size, seals) = blank_info(f.as_raw_fd());
+        assert_eq!(size, u64::from(w) * u64::from(h) * 4);
+        assert_ne!(seals & libc::F_SEAL_SHRINK, 0, "the viewer requires it");
+        // All zeros: black.
+        let mut buf = vec![0xffu8; 4096];
+        let n = unsafe { libc::pread(f.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        assert_eq!(n, 4096);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    /// The guest's transport generation ends with a viewer attached: the
+    /// viewer is sent black at the size it shows, and the old buffer is never
+    /// sent again -- not on a refresh, not to a viewer that attaches later.
+    #[test]
+    fn a_guest_generation_ending_blanks_the_viewer_and_drops_the_frame() {
+        for venus in [false, true] {
+            let link = DisplayLink::new(None);
+            let (ours, broker) = socketpair();
+            link.adopt(ours);
+            link.note_packet(0, &pkt(wire::EV_HELLO, 0, 0, 0, 2, 0));
+            let buf = memfd();
+            if venus {
+                let g = FrameGeometry {
+                    width: 1920,
+                    height: 1080,
+                    stride: 7680,
+                    fourcc: 0x3432_5258,
+                    ..Default::default()
+                };
+                link.set_release_enabled(true);
+                link.flip_dmabuf(buf.as_raw_fd(), &g, Some(7));
+            } else {
+                link.flip(buf.as_raw_fd(), &flip(1, 1920));
+            }
+            let (_, f) = next_frame(broker.as_raw_fd());
+            assert_eq!(inode(f.as_raw_fd()), inode(buf.as_raw_fd()));
+            assert_eq!(link.generation(), 0);
+
+            link.guest_gone("test reset");
+            assert_eq!(link.generation(), 1);
+            let h = if venus { 1080 } else { 1440 };
+            let (c, f) = next_frame(broker.as_raw_fd());
+            assert_black(&c, &f, 1920, h);
+            assert_ne!(inode(f.as_raw_fd()), inode(buf.as_raw_fd()));
+            assert_eq!(pending_bytes(broker.as_raw_fd()), 0, "one frame");
+            assert_eq!(link.guest_picture_size(), None);
+            {
+                let st = link.state.lock().unwrap();
+                assert_eq!(st.frame_key, None);
+                assert_eq!(st.release.tracked(), 0, "venus {venus}");
+            }
+
+            // A refresh re-sends black, not the old buffer.
+            link.note_packet(0, &pkt(wire::EV_REFRESH, 0, 0, 0, 0, 0));
+            let (c, f) = next_frame(broker.as_raw_fd());
+            assert_black(&c, &f, 1920, h);
+            // So does a viewer that attaches now.
+            let (ours2, broker2) = socketpair();
+            link.adopt_at(0, ours2);
+            link.note_packet(0, &pkt(wire::EV_HELLO, 0, 0, 0, 2, 0));
+            let (c, f) = next_frame(broker2.as_raw_fd());
+            assert_black(&c, &f, 1920, h);
+
+            // The next generation's flip is shown as usual.
+            let buf2 = memfd();
+            link.flip(buf2.as_raw_fd(), &flip(2, 1920));
+            let (_, f) = next_frame(broker2.as_raw_fd());
+            assert_eq!(inode(f.as_raw_fd()), inode(buf2.as_raw_fd()));
+        }
+    }
+
+    /// Nobody looking when the generation ends: what was parked by GEM
+    /// identity (and the drm file dup that kept the old GEM alive) goes, and
+    /// a viewer that attaches later is shown black, never the old buffer.
+    #[test]
+    fn a_guest_generation_ending_drops_what_was_parked() {
+        let link = DisplayLink::new(None);
+        let buf = memfd();
+        let exports = fake_exporter(&link, &buf);
+        let drm = memfd();
+        assert!(link.park(drm.as_raw_fd(), &flip(1, 1920)));
+        assert!(link.park_cursor(drm.as_raw_fd(), &cursor(5, 0, 0)));
+        assert!(link.has_parked());
+        link.guest_gone("test reset");
+        assert!(!link.has_parked());
+        let (ours, broker) = socketpair();
+        link.adopt(ours);
+        link.hello(wire::CAP_CURSOR);
+        assert_eq!(
+            *exports.lock().unwrap(),
+            0,
+            "nothing of the old generation exported"
+        );
+        let (c, f) = next_frame(broker.as_raw_fd());
+        assert_black(&c, &f, 1920, 1440);
+    }
+
+    /// No frame ever shown: the black frame has the configured mode's size.
+    #[test]
+    fn a_guest_generation_ending_before_any_frame_blanks_at_the_configured_size() {
+        let link = DisplayLink::with_mode(None, DisplayMode::parse("1280x720").unwrap());
+        let (ours, broker) = socketpair();
+        link.adopt(ours);
+        link.note_packet(0, &pkt(wire::EV_HELLO, 0, 0, 0, 2, 0));
+        link.guest_gone("test reset");
+        let (c, f) = next_frame(broker.as_raw_fd());
+        assert_black(&c, &f, 1280, 720);
+    }
+
+    /// With a boot console attached, it takes over at once (as on a device
+    /// reset); a console frame already shown is not replaced by black.
+    #[test]
+    fn a_guest_generation_ending_shows_the_console() {
+        struct Nop;
+        impl ConsoleSink for Nop {
+            fn input(&self, _: &[InputEventEntry]) {}
+            fn wake(&self) {}
+        }
+        let link = DisplayLink::new(None);
+        link.attach_console(Arc::new(Nop));
+        let buf = memfd();
+        link.flip(buf.as_raw_fd(), &flip(1, 1920));
+        assert_eq!(link.console_mode(), Some(ConsoleMode::Guest));
+        link.guest_gone("test reset");
+        assert_eq!(link.console_mode(), Some(ConsoleMode::Shown));
+        assert!(link.console_shown());
+
+        // The console's frame now; a second end keeps it.
+        let shm = black_frame(640, 480).unwrap();
+        let g = FrameGeometry {
+            width: 640,
+            height: 480,
+            stride: 2560,
+            fourcc: DRM_FORMAT_XRGB8888,
+            ..Default::default()
+        };
+        link.flip_console(shm.as_raw_fd(), &g);
+        link.guest_gone("test reset again");
+        let st = link.state.lock().unwrap();
+        let (fd, f, _) = st.frame.as_ref().expect("the console's frame");
+        assert_eq!(inode(fd.as_raw_fd()), inode(shm.as_raw_fd()));
+        assert_eq!(f.width, 640);
     }
 }
