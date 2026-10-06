@@ -384,6 +384,7 @@ pub unsafe extern "C" fn dxgkddi_create_device(
 /// frame and turns an 8192-mapping teardown from 8192 acquisitions into 128.
 const MAPPING_DRAIN_BATCH: usize = 64;
 
+#[inline(never)]
 pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTATUS {
     if !h_device.is_null() {
         // SAFETY: h_device came from Box::into_raw in create_device; its `adapter`

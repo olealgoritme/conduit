@@ -827,13 +827,30 @@ unsafe fn notify_at_dirql(
         };
         DMA_SYNC_STATUS_LOW.store(status as u32, Ordering::Relaxed);
         DMA_SYNC_RET.store(ret as u32, Ordering::Relaxed);
+        // A refusal of the completion callback, in the DDI failure rings
+        // (`ddi::device_lost`, atomics only: legal at DISPATCH).
         if status != STATUS_SUCCESS {
+            crate::ddi::device_lost::note_cb(
+                helios_kmd_logic::device_lost::ddi::CB_NOTIFY_DMA,
+                status,
+                1,
+            );
             return status;
         }
         if ret == 0 {
+            crate::ddi::device_lost::note_cb(
+                helios_kmd_logic::device_lost::ddi::CB_NOTIFY_DMA,
+                STATUS_DEVICE_NOT_READY,
+                2,
+            );
             return STATUS_DEVICE_NOT_READY;
         }
     } else {
+        crate::ddi::device_lost::note_cb(
+            helios_kmd_logic::device_lost::ddi::CB_NOTIFY_DMA,
+            STATUS_DEVICE_NOT_READY,
+            3,
+        );
         return STATUS_DEVICE_NOT_READY;
     }
     STATUS_SUCCESS

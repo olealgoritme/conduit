@@ -244,6 +244,12 @@ fn stop_flush(
 }
 
 /// `DxgkDdiStartDevice` — bring the adapter online.
+///
+/// NOT wrapped by `ddi::traced` and `#[inline(never)]`: this frame plus `VirtioGpu::init` is the
+/// nested pair the 24 KB kernel stack budget is measured on (17936 B known good, 18800 B did
+/// not boot, `tools/kmd-frame-sizes.ps1`). A wrapper in front of it would add a frame to the
+/// pair, and it runs once per start: its failures are visible through `StVio` / `InitStg`.
+#[inline(never)]
 pub unsafe extern "C" fn dxgkddi_start_device(
     miniport_device_context: *mut c_void,
     _dxgk_start_info: *mut DXGK_START_INFO,
@@ -612,6 +618,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 }
 
 /// `DxgkDdiStopDevice` — quiesce the adapter (inverse of StartDevice).
+#[inline(never)]
 pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_void) -> NTSTATUS {
     crate::kmsg(c"Helios: StopDevice\n");
     if !miniport_device_context.is_null() {
@@ -628,6 +635,10 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // Stage 1 is recorded with a clock of its own: the budget below must not
         // start until the flush after it has finished.
         stop_stage(crate::adapter::foreign_scanout::now_100ns(), 1);
+        // The DDI failure rings, the sticky first-fatal record and the paging/lock records
+        // (`ddi::device_lost`): written BEFORE the flush below, so a stop that follows an
+        // adapter-wide device loss leaves them on disk. PASSIVE.
+        crate::ddi::device_lost::publish_block(crate::ddi::device_lost::Trigger::Stop);
         // The first stage reaches the disk before anything that could bugcheck.
         let flush = crate::diag::read_config_dword(crate::diag::knobs::STOP_FLUSH, 1) != 0;
         if flush {

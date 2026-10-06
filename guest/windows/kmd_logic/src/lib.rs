@@ -18,6 +18,7 @@
 
 #![no_std]
 
+pub mod device_lost;
 pub mod edid;
 pub mod external_memory;
 pub mod nvrm_clients;
