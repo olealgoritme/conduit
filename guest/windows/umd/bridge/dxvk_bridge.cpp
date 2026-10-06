@@ -927,7 +927,7 @@ namespace helios_handoff {
   // The work the CS thread records now was issued before the device's next
   // own point it has not reached; a point published after that one cannot
   // be a dependency, and waiting for it could close a cycle with the other
-  // process (DXVK patch 0009).
+  // process (DXVK patch 0011).
   std::uint32_t sample_before(std::uint32_t key, const void* device, std::uint64_t* out,
                               std::uint32_t max) {
     std::uint64_t bound = kPointMask;

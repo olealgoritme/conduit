@@ -1,6 +1,6 @@
 Helios DXVK fork: hand-off waits bounded by the device's next own point
 
-Conduit guest/windows/docs/shared-surfaces.md section 4. Applied after 0008
+Conduit guest/windows/docs/shared-surfaces.md section 4. Applied after 0010
 by ci/windows/Build-Driver.ps1.
 
 The ledger is sampled on the CS thread, which can run well behind the
