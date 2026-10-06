@@ -582,9 +582,10 @@ impl AdapterContext {
     /// max(250 ms, 16 periods) is re-armed (`VsRevN`, `VsWdFixN`); a silent heartbeat with a tick
     /// callback entered and not returned is counted (`VsWdHungN`: a blocked callback cannot be
     /// helped by a re-arm). What it saw when it acted is kept (`VsWdS*`), and every
-    /// `PUBLISH_EVERY_TICKS` ticks, or at once after acting, the HPD worker is woken to write
-    /// the heartbeat block (`VsLiveT`), because the worker is otherwise asleep with an infinite
-    /// wait and the registry mirror stays at its last pass.
+    /// `PUBLISH_EVERY_TICKS` ticks (2 s) the HPD worker is woken to write the ten live values
+    /// (`VsLiveT` ...), and after acting the whole heartbeat block, at most once per 2 s
+    /// (`vsync_wd::publish_plan`), because the worker is otherwise asleep with an infinite wait
+    /// and the registry mirror stays at its last pass.
     fn vsync_wd_tick(&self) {
         use core::sync::atomic::Ordering;
         use helios_kmd_logic::vsync_wd::{self, WdAction};
@@ -665,8 +666,12 @@ impl AdapterContext {
                 WdAction::Idle => {}
             }
         }
-        if display_half && vsync_wd::publish_due(tick_n, acted) && self.hpd_running() {
-            crate::ddi::stall_diag::request_live_publish();
+        // The adapter is in D0 here (checked above). `request_live_publish` is the rate limit: the
+        // ten-value block every 2 s, the full block after an action but at most once per 2 s.
+        if display_half
+            && self.hpd_running()
+            && crate::ddi::stall_diag::request_live_publish(tick_n, acted)
+        {
             self.signal_hpd();
         }
     }

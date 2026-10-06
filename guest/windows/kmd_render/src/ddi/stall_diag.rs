@@ -454,11 +454,11 @@ pub(crate) fn on_vsync_tick(adapter: &AdapterContext, period_100ns: u64) {
 /// mirror, which does not). PASSIVE.
 pub(crate) fn publish_vsync_ticks() {
     use crate::diag::record_named_bytes as rec;
-    rec(b"VsTickN", VS_TICKS.load(Ordering::Relaxed));
+    rec_live(1, b"VsTickN", VS_TICKS.load(Ordering::Relaxed));
     rec(b"VsOffN", VS_OFF.load(Ordering::Relaxed));
     // The time of the last tick, written in the same call as the count: a count that stays put
     // while `StallT` (or `VpDmpT`) moves is a heartbeat that stopped, whatever the mirror's age.
-    rec(b"VsTickT", VS_TICK_T.load(Ordering::Relaxed));
+    rec_live(2, b"VsTickT", VS_TICK_T.load(Ordering::Relaxed));
     rec(b"VsGapMaxMs", VS_GAP_MAX_MS.load(Ordering::Relaxed));
     rec(b"VsArmN", VS_ARM_N.load(Ordering::Relaxed));
     rec(b"VsDisN", VS_DIS_N.load(Ordering::Relaxed));
@@ -484,18 +484,18 @@ pub(crate) fn publish_vsync_ticks() {
     // v329: when this block was written (every value above is a snapshot as of this time: the
     // heartbeat is judged by `VsLiveT` against `VsTickT`, never by a count that did not move
     // between two reads of a mirror nothing refreshed), the callback breadcrumbs, the watchdog.
-    rec(b"VsLiveT", AdapterContext::interrupt_time_ms());
-    rec(b"VsCbIn", VS_CB_IN.load(Ordering::Relaxed));
-    rec(b"VsCbOut", VS_CB_OUT.load(Ordering::Relaxed));
+    rec_live(0, b"VsLiveT", AdapterContext::interrupt_time_ms());
+    rec_live(3, b"VsCbIn", VS_CB_IN.load(Ordering::Relaxed));
+    rec_live(4, b"VsCbOut", VS_CB_OUT.load(Ordering::Relaxed));
     rec(b"VsCbSyncB", VS_CB_SYNC_B.load(Ordering::Relaxed));
     rec(b"VsCbSyncOk", VS_CB_SYNC_OK.load(Ordering::Relaxed));
     rec(b"VsCbSyncSt", VS_CB_SYNC_ST.load(Ordering::Relaxed));
     rec(b"VsCbSyncT", VS_CB_SYNC_T.load(Ordering::Relaxed));
-    rec(b"VsWdTkN", VS_WD_TK_N.load(Ordering::Relaxed));
-    rec(b"VsWdTkT", VS_WD_TK_T.load(Ordering::Relaxed));
-    rec(b"VsWdAgeMs", VS_WD_AGE_MS.load(Ordering::Relaxed));
-    rec(b"VsWdFixN", VS_WD_FIX_N.load(Ordering::Relaxed));
-    rec(b"VsWdHungN", VS_WD_HUNG_N.load(Ordering::Relaxed));
+    rec_live(5, b"VsWdTkN", VS_WD_TK_N.load(Ordering::Relaxed));
+    rec_live(6, b"VsWdTkT", VS_WD_TK_T.load(Ordering::Relaxed));
+    rec_live(7, b"VsWdAgeMs", VS_WD_AGE_MS.load(Ordering::Relaxed));
+    rec_live(8, b"VsWdFixN", VS_WD_FIX_N.load(Ordering::Relaxed));
+    rec_live(9, b"VsWdHungN", VS_WD_HUNG_N.load(Ordering::Relaxed));
     rec(b"VsWdPubN", VS_WD_PUB_N.load(Ordering::Relaxed));
     rec(b"VsWdOn", VS_WD_ON.load(Ordering::Relaxed));
     rec(b"VsWdNoTm", VS_WD_NO_TIMER.load(Ordering::Relaxed));
@@ -683,8 +683,35 @@ static VS_WD_S_AGE: AtomicU32 = AtomicU32::new(0);
 static VS_WD_S_CB_I: AtomicU32 = AtomicU32::new(0);
 static VS_WD_S_CB_O: AtomicU32 = AtomicU32::new(0);
 static VS_WD_S_SY_T: AtomicU32 = AtomicU32::new(0);
-/// The watchdog asked for the heartbeat block to be written; the worker takes it.
+/// What the watchdog asked the worker to write (0 nothing, 1 the ten-value live block, 2 the
+/// whole heartbeat block); the worker takes it. `VS_WD_LAST_FULL` is the watchdog tick number of
+/// the last full request (0 = none this generation), for `vsync_wd::publish_plan`.
 static LIVE_WANTED: AtomicU32 = AtomicU32::new(0);
+static VS_WD_LAST_FULL: AtomicU32 = AtomicU32::new(0);
+/// The last value written for each of the ten live values (`u64::MAX` = unknown: written next
+/// time). Every writer of those names goes through [`rec_live`], so the cache is the registry's
+/// content; [`start_generation`] makes it unknown again before it writes the block's zeros.
+const LIVE_N: usize = 10;
+static LIVE_CACHE: [AtomicU64; LIVE_N] = [
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+];
+
+/// Write one of the ten live values unless it is what the registry already holds. PASSIVE.
+fn rec_live(slot: usize, name: &[u8], value: u32) {
+    if LIVE_CACHE[slot].swap(value as u64, Ordering::Relaxed) == value as u64 {
+        return;
+    }
+    crate::diag::record_named_bytes(name, value);
+}
 
 /// A tick callback was entered / returned (any IRQL <= DISPATCH, atomics only).
 pub(crate) fn cb_enter() {
@@ -771,17 +798,45 @@ pub(crate) fn vsync_last_tick() -> u64 {
     VS_TICK_AT.load(Ordering::Relaxed)
 }
 
-/// Ask the HPD worker to write the heartbeat block on its next pass (DISPATCH, atomics only).
-pub(crate) fn request_live_publish() {
+/// This watchdog tick (`tick_n`) acted or not: the publication it asks the worker for
+/// (`vsync_wd::publish_plan`; DISPATCH, atomics only). `true` when the worker must be woken.
+pub(crate) fn request_live_publish(tick_n: u32, acted: bool) -> bool {
+    use helios_kmd_logic::vsync_wd::{publish_plan, Publish};
+    let want = match publish_plan(tick_n, acted, VS_WD_LAST_FULL.load(Ordering::Relaxed)) {
+        Publish::None => return false,
+        Publish::Small => 1,
+        Publish::Full => {
+            VS_WD_LAST_FULL.store(tick_n, Ordering::Relaxed);
+            2
+        }
+    };
     VS_WD_PUB_N.fetch_add(1, Ordering::Relaxed);
-    LIVE_WANTED.store(1, Ordering::Release);
+    LIVE_WANTED.fetch_max(want, Ordering::AcqRel);
+    true
 }
 
-/// The worker's pass: write the heartbeat block if the watchdog asked. PASSIVE.
+/// The worker's pass: write what the watchdog asked for. PASSIVE.
 pub(crate) fn publish_live_if_wanted() {
-    if LIVE_WANTED.swap(0, Ordering::AcqRel) != 0 {
-        publish_vsync_ticks();
+    match LIVE_WANTED.swap(0, Ordering::AcqRel) {
+        0 => {}
+        1 => publish_live_small(),
+        _ => publish_vsync_ticks(),
     }
+}
+
+/// The ten values that say whether the heartbeat is alive (`VsLiveT` first: the time of the
+/// write), unchanged ones skipped.
+pub(crate) fn publish_live_small() {
+    rec_live(0, b"VsLiveT", AdapterContext::interrupt_time_ms());
+    rec_live(1, b"VsTickN", VS_TICKS.load(Ordering::Relaxed));
+    rec_live(2, b"VsTickT", VS_TICK_T.load(Ordering::Relaxed));
+    rec_live(3, b"VsCbIn", VS_CB_IN.load(Ordering::Relaxed));
+    rec_live(4, b"VsCbOut", VS_CB_OUT.load(Ordering::Relaxed));
+    rec_live(5, b"VsWdTkN", VS_WD_TK_N.load(Ordering::Relaxed));
+    rec_live(6, b"VsWdTkT", VS_WD_TK_T.load(Ordering::Relaxed));
+    rec_live(7, b"VsWdAgeMs", VS_WD_AGE_MS.load(Ordering::Relaxed));
+    rec_live(8, b"VsWdFixN", VS_WD_FIX_N.load(Ordering::Relaxed));
+    rec_live(9, b"VsWdHungN", VS_WD_HUNG_N.load(Ordering::Relaxed));
 }
 
 /// `DxgkDdiSetPowerState` was called for `device_uid`; `d0` is whether the state is D0.
@@ -1101,8 +1156,13 @@ pub(crate) fn start_generation() {
         &VS_WD_S_CB_O,
         &VS_WD_S_SY_T,
         &LIVE_WANTED,
+        &VS_WD_LAST_FULL,
     ] {
         c.store(0, Ordering::Relaxed);
+    }
+    // The registry is about to be rewritten with this generation's zeros: forget what was cached.
+    for c in &LIVE_CACHE {
+        c.store(u64::MAX, Ordering::Relaxed);
     }
     HPD_SITE_AT.store(0, Ordering::Relaxed);
     // Every v326 static that outlives a StopDevice starts the generation in its initial state: the

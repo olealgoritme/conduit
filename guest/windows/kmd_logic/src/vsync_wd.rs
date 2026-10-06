@@ -106,10 +106,35 @@ pub const fn decide(i: WdInput) -> WdAction {
     }
 }
 
-/// Whether this watchdog tick (`tick_n`, counted from 1) also asks the worker to refresh the
-/// registry mirror. A fix or a hang always does.
-pub const fn publish_due(tick_n: u32, acted: bool) -> bool {
-    acted || tick_n % PUBLISH_EVERY_TICKS == 0
+/// What one watchdog tick asks of the HPD worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Publish {
+    /// Nothing.
+    None,
+    /// The ten-value live block (`VsLiveT`, `VsTickN`, `VsTickT`, `VsCbIn`, `VsCbOut`, `VsWdTkN`,
+    /// `VsWdTkT`, `VsWdAgeMs`, `VsWdFixN`, `VsWdHungN`), unchanged values skipped.
+    Small,
+    /// The whole heartbeat block.
+    Full,
+}
+
+/// The publication this watchdog tick (`tick_n`, counted from 1) asks for. `last_full` is the tick
+/// number of the last full block requested (0 = none this generation). The small block goes out
+/// every [`PUBLISH_EVERY_TICKS`] ticks; the full block only after an action (a fix or a hang), and
+/// at most once per [`PUBLISH_EVERY_TICKS`] ticks however often the watchdog acts (and the small
+/// block is skipped when a full one went out in that time): a state that
+/// acts every tick (a blocked callback, a fix repeating every 500 ms) must not become four worker
+/// wakes and ~190 registry writes a second. At most one wake per [`PUBLISH_EVERY_TICKS`] ticks.
+pub const fn publish_plan(tick_n: u32, acted: bool, last_full: u32) -> Publish {
+    let due = last_full == 0 || tick_n.wrapping_sub(last_full) >= PUBLISH_EVERY_TICKS;
+    if acted && due {
+        Publish::Full
+    } else if tick_n % PUBLISH_EVERY_TICKS == 0 && due {
+        // A full block written in the last 2 s already carried the ten live values.
+        Publish::Small
+    } else {
+        Publish::None
+    }
 }
 
 /// The silence in milliseconds for the `VsWdAgeMs` value (0 when unknown), saturated to 32 bits.
@@ -252,11 +277,60 @@ mod tests {
 
     #[test]
     fn publish_cadence() {
-        assert!(!publish_due(1, false));
-        assert!(!publish_due(7, false));
-        assert!(publish_due(8, false));
-        assert!(publish_due(16, false));
-        assert!(publish_due(3, true));
+        assert_eq!(publish_plan(1, false, 0), Publish::None);
+        assert_eq!(publish_plan(7, false, 0), Publish::None);
+        assert_eq!(publish_plan(8, false, 0), Publish::Small);
+        assert_eq!(publish_plan(16, false, 8), Publish::Small);
+        // A full block 3 ticks ago already carried the live values: no small one on top.
+        assert_eq!(publish_plan(16, false, 13), Publish::None);
+        // The first action of a generation publishes the full block at once.
+        assert_eq!(publish_plan(3, true, 0), Publish::Full);
+    }
+
+    #[test]
+    fn repeated_actions_publish_at_most_once_per_two_seconds() {
+        // A state that acts on every tick: one full block per 8 ticks, and nothing between.
+        let mut last = 0;
+        let mut full = 0;
+        let mut wakes = 0;
+        for tick in 1..=80u32 {
+            match publish_plan(tick, true, last) {
+                Publish::Full => {
+                    last = tick;
+                    full += 1;
+                    wakes += 1;
+                }
+                Publish::Small => wakes += 1,
+                Publish::None => {}
+            }
+        }
+        assert_eq!(full, 10);
+        assert_eq!(wakes, 10);
+        // A fix repeating every 2nd tick (500 ms) is no more frequent.
+        let mut last = 0;
+        let mut wakes = 0;
+        for tick in 1..=80u32 {
+            let acted = tick % 2 == 0;
+            match publish_plan(tick, acted, last) {
+                Publish::Full => {
+                    last = tick;
+                    wakes += 1;
+                }
+                Publish::Small => wakes += 1,
+                Publish::None => {}
+            }
+        }
+        assert!(wakes <= 10, "{wakes}");
+    }
+
+    #[test]
+    fn a_full_block_is_not_repeated_by_the_small_cadence() {
+        // Tick 9 acts and the last full block was at tick 1: due, so Full (not Small).
+        assert_eq!(publish_plan(9, true, 1), Publish::Full);
+        // Tick 8 acts but the last full block was at tick 1 (7 ticks ago): too soon for a full
+        // one, and it carried the live values: nothing.
+        assert_eq!(publish_plan(8, true, 1), Publish::None);
+        assert_eq!(publish_plan(5, true, 4), Publish::None);
     }
 
     #[test]
