@@ -451,6 +451,16 @@ these apps. If `StdOpenN` stays still (or `StdOpenPid` is the app's own pid, the
 open it and the windowed legacy-blt black window has another cause. Not counted: whether the opener is the creating
 process (the identity records no creator for these; compare the two pids by hand).
 
+#### S-A0 result (340.1, hardware)
+
+NVK DWM (pid 7744), fresh after a device restart, Heaven (pid 2824) composed with the mirror on: `StdNPrimary` 5 / `StdOPrimary` 5,
+`StdNShadow` 5 / `StdOShadow` 5, `StdNStaging` 1 / `StdOStaging` 1, every Gdi slot and `StdNOther` 0, `StdBytesMiB` 317,
+`StdMaxMiB` 31, `StdMkPid` 2824, `StdOpenN` 6, `StdOpenSlot` 2, `StdOpenPid` 2824. The only opener of a KMD-made STANDARD
+allocation is the app itself; DWM opened none (the NVK DWM's UMD log shows no `kind=2` opens either, only `kind=1`). So route D
+of S-A is not on the path that shows a windowed legacy-blt app in an NVK DWM: DWM reads the redirected content some other way,
+and that way depends on the KMD's CPU mirror of the Blt destination (`BltNoMirror=1` froze the window; 24.11.5 of
+`zero-copy-present.md`). S-A and S-B stay parked until a census names the object DWM samples for such a window.
+
 ### S-A: make the existing Venus standard buffers importable (route D)
 
 * Scope: section 6. Knob `KmdRmStd` = 1 (R, S-B, adds the value 2).
