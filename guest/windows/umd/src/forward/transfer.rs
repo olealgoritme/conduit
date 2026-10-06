@@ -848,11 +848,39 @@ pub(crate) unsafe extern "system" fn resource_update_subresource(
         }
         return;
     };
-    // `alloc` selects the gate below, so the summary read stays out here; every
-    // other operand is log-only and now lives inside it. The two
-    // `read_unaligned` probes in particular are two dependent cache misses into
-    // the CALLER's buffer, and they used to be paid on every BGRA/RGBA tex2d
-    // update purely to produce a log field.
+    // Untraced: nothing below the trace gate is needed, so the allocation
+    // read (a dependent load into the resource slot) and the two counters
+    // are skipped on this per-draw path.
+    if crate::trace_enabled() {
+        trace_update_subresource(h_res, subresource, box_, data, row_pitch, depth_pitch);
+    }
+    let bx;
+    let bx_ptr = if box_.is_null() {
+        None
+    } else {
+        let b = &*box_;
+        bx = D3D11_BOX {
+            left: b.left as u32,
+            top: b.top as u32,
+            front: b.front as u32,
+            right: b.right as u32,
+            bottom: b.bottom as u32,
+            back: b.back as u32,
+        };
+        Some(&bx as *const D3D11_BOX)
+    };
+    context.UpdateSubresource(&*res, subresource, bx_ptr, data, row_pitch, depth_pitch);
+}
+
+/// The UpdateSubresource trace line (UmdTrace only).
+unsafe fn trace_update_subresource(
+    h_res: ddi::D3D10DDI_HRESOURCE,
+    subresource: u32,
+    box_: *const ddi::D3D10_DDI_BOX,
+    data: *const c_void,
+    row_pitch: u32,
+    depth_pitch: u32,
+) {
     let alloc = resource_allocation(h_res);
     let n = UPDATE_LOG_COUNT.next();
     // DECLARED diagnostic change: the old gate's `|| alloc != 0` disjunct
@@ -937,22 +965,6 @@ pub(crate) unsafe extern "system" fn resource_update_subresource(
             );
         }
     }
-    let bx;
-    let bx_ptr = if box_.is_null() {
-        None
-    } else {
-        let b = &*box_;
-        bx = D3D11_BOX {
-            left: b.left as u32,
-            top: b.top as u32,
-            front: b.front as u32,
-            right: b.right as u32,
-            bottom: b.bottom as u32,
-            back: b.back as u32,
-        };
-        Some(&bx as *const D3D11_BOX)
-    };
-    context.UpdateSubresource(&*res, subresource, bx_ptr, data, row_pitch, depth_pitch);
 }
 
 pub(crate) unsafe extern "system" fn resource_update_subresource_11_1(
