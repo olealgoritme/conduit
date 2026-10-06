@@ -494,6 +494,11 @@ static NVRM_SPIN_STATE: AtomicU32 =
 /// with forwards running means the spin is off (`NvSpinUs = 0`).
 pub static NVRM_SPIN_HITS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_SPIN_MISSES: AtomicU32 = AtomicU32::new(0);
+/// `BlbAbandoned`: blob teardowns of a destroyed device that were not sent to the host
+/// because an earlier blob of the same device was ambiguous (a blit still in flight, a
+/// failed release): the ambiguous one itself and every blob taken out of the table after it
+/// (`release_blobs_for_owner_within`). Must read 0 on a healthy session.
+pub static BLOB_SWEEP_ABANDONED: AtomicU32 = AtomicU32::new(0);
 
 /// Read `NvSpinUs` (clamped), cache it and mirror it. PASSIVE.
 fn read_spin_knob() -> u32 {
@@ -1784,6 +1789,11 @@ pub fn release_blobs_for_owner_within(
     budget: Option<&SweepBudget>,
 ) -> u32 {
     let mut reclaimed = 0u32;
+    // Set once one blob's teardown was ambiguous (see below): the rest of the owner's table
+    // entries are still taken out, so a dead owner cannot hold blob slots for ever, but they
+    // are not sent to the host (the first ambiguity already says the host or an in-flight
+    // blit cannot be trusted to answer), and only the host-free part runs for them.
+    let mut abandoned = false;
     loop {
         let taken = adapter
             .with_virtio(|v| v.take_blob_for_owner(owner))
@@ -1791,6 +1801,15 @@ pub fn release_blobs_for_owner_within(
         let Some((ctx_id, res, mapped, map_offset, map_len)) = taken else {
             return reclaimed;
         };
+        if abandoned {
+            // Undispatched windowed blts that name this resource have no host reader: end
+            // them, or each keeps a ledger ticket and one of the 64 token slots for ever.
+            // Nothing else: the host objects stay until the Venus teardown, as for the
+            // blob that was ambiguous.
+            let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
+            BLOB_SWEEP_ABANDONED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let terminal = adapter.with_scanout_lifecycle(passive, |lock| {
             let cache_release = lock.with_venus_client(|client| {
                 let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
@@ -1826,7 +1845,15 @@ pub fn release_blobs_for_owner_within(
             // The blob tracking entry was intentionally taken first. Retaining
             // the host objects on an ambiguous drain leaks safely until Venus
             // teardown; continuing would detach a possibly in-flight resource.
-            return reclaimed;
+            //
+            // Returning here used to leave every REMAINING blob of the owner in the table
+            // with a dead owner token (the device is being destroyed: nothing will ever
+            // sweep them again) and their windowed blts pending, which fills the blob table
+            // and the 64 WindowedBlt token slots across a few killed processes. The rest
+            // are drained without host commands (`abandoned`, above).
+            abandoned = true;
+            BLOB_SWEEP_ABANDONED.fetch_add(1, Ordering::Relaxed);
+            continue;
         }
         if mapped {
             if let Some(timeout_ms) = sweep_timeout_ms(budget) {

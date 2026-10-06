@@ -30,11 +30,11 @@
 //! `with_virtio` is never called with `STATE` held, and `STATE` is never taken
 //! under `virtio_lock`.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use helios_kmd_logic::foreign_scanout::{
-    Flip, ForeignScanout, Layout, LayoutError, Poll, PresentError, ReleaseOutcome, ResidentDrop,
-    ResidentOutcome, SetError, SetKind, SetOutcome,
+    EndCause, Flip, ForeignScanout, Layout, LayoutError, Poll, PresentError, ReleaseOutcome,
+    ResidentDrop, ResidentOutcome, SetError, SetKind, SetOutcome, WATCHDOG_GRACE_100NS,
 };
 use helios_kmd_logic::rm_fence_present::{Attach, QEntry, ScanoutQueue};
 
@@ -126,6 +126,37 @@ pub static FS_FENCE_DROPPED: AtomicU32 = AtomicU32::new(0);
 pub static FS_FENCE_REFUSED: AtomicU32 = AtomicU32::new(0);
 pub static FS_FENCE_FULL: AtomicU32 = AtomicU32::new(0);
 
+/// Owner-death and watchdog breadcrumbs (`docs/foreign-scanout.md`, "Owner death and
+/// killed processes"). `FsDpcLps`: user sources the DISPATCH watchdog (the vsync tick)
+/// ended because the HPD worker had not polled their lapse `WATCHDOG_GRACE_100NS` after
+/// the deadline; counted in `FsLapse` as well, so the live-source arithmetic holds (a
+/// nonzero value means the worker was not looping on time). `FsXitEnd`: user sources
+/// ended by `DestroyDevice`'s entry hook, before its blob and context sweeps; counted in
+/// `FsEnd` as well.
+pub static FS_DPC_LAPSES: AtomicU32 = AtomicU32::new(0);
+pub static FS_OWNER_EXIT_ENDS: AtomicU32 = AtomicU32::new(0);
+/// Lock-free hint for the vsync tick: when the live USER source's deadline plus the
+/// grace passes (100 ns, `KeQueryInterruptTimePrecise` clock); 0 = no such source. Only
+/// ever written under `STATE`, from the value the state machine computes, so it is never
+/// later than the truth; stale-early costs the tick one lock hold.
+static FS_WATCH_AT: AtomicU64 = AtomicU64::new(0);
+/// The newest user source's generation (0 = none ever / none live): what an end that
+/// does not know it (a lapse found by a present) names in `FsEndGen`.
+static FS_CUR_GEN: AtomicU32 = AtomicU32::new(0);
+/// Interrupt time (100 ns) of the last flip the host took for a user source (`FsLastP`).
+static FS_LAST_PRESENT_100NS: AtomicU64 = AtomicU64::new(0);
+/// Who ended the last user source (`EndCause::code`), which generation, and when.
+static FS_END_BY: AtomicU32 = AtomicU32::new(0);
+static FS_END_GEN: AtomicU32 = AtomicU32::new(0);
+static FS_END_AT_100NS: AtomicU64 = AtomicU64::new(0);
+
+/// Remember how the last user source ended. Atomics only: legal at any IRQL.
+fn note_end(cause: EndCause) {
+    FS_END_GEN.store(FS_CUR_GEN.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+    FS_END_AT_100NS.store(now_100ns(), Ordering::Relaxed);
+    FS_END_BY.store(cause.code(), Ordering::Relaxed);
+}
+
 /// A fence a queued present waits on fired (from the DPC: atomics only).
 pub(crate) fn note_fence_fired(status: i32) {
     FS_FENCE_FIRED.fetch_add(1, Ordering::Relaxed);
@@ -166,6 +197,7 @@ pub(crate) fn publish_counters() {
     rec(b"FsRef", FS_REFUSED.load(Ordering::Relaxed));
     rec(b"FsFmtRef", FS_FORMAT_REFUSED.load(Ordering::Relaxed));
     rec(b"FsErr", FS_SEND_ERRORS.load(Ordering::Relaxed));
+    publish_breadcrumbs();
     rec(b"FsFQue", FS_FENCE_QUEUED.load(Ordering::Relaxed));
     rec(b"FsFSent", FS_FENCE_SENT.load(Ordering::Relaxed));
     rec(b"FsFFire", FS_FENCE_FIRED.load(Ordering::Relaxed));
@@ -176,12 +208,50 @@ pub(crate) fn publish_counters() {
     rec(b"FsFRef", FS_FENCE_REFUSED.load(Ordering::Relaxed));
     rec(b"FsFFull", FS_FENCE_FULL.load(Ordering::Relaxed));
     rec(
+        b"BlbAbandoned",
+        crate::virtio::ctrl::BLOB_SWEEP_ABANDONED.load(Ordering::Relaxed),
+    );
+    rec(
+        b"WbStaleRdy",
+        crate::virtio::gpu::WINDOWED_READY_STALE.load(Ordering::Relaxed),
+    );
+    rec(
         b"FnCloseErr",
         crate::virtio::nvrm::FENCE_CLOSE_ERRORS.load(Ordering::Relaxed),
     );
     crate::virtio::gpu::publish_rm_gate_counters();
     // The host's buffer releases (`Rel*`), written only on a boot that had them on.
     crate::virtio::scanout_release::publish_counters();
+}
+
+/// The live-source breadcrumbs: who holds scanout 0 (if anyone), when it last presented,
+/// when it lapses, how the last one ended, and the time of this very publication (the
+/// mirror is only written at edges, so `FsPubT` is how old the picture is). PASSIVE.
+///
+/// `FsLive` 1 = a user source, 2 = the KMD's resident one, 0 = none (`FsOwner`, `FsGen`,
+/// `FsDeadl` then read 0). Times are interrupt-time milliseconds mod 2^32 (the clock of
+/// `VpDmpT`); `FsDeadl` earlier than `FsPubT` on a live source is a lapse nobody polled.
+fn publish_breadcrumbs() {
+    use crate::diag::record_named_bytes as rec;
+    use helios_kmd_logic::vsync_rate::ms_from_100ns as ms;
+    let live = STATE.lock().live();
+    rec(
+        b"FsLive",
+        live.map_or(0, |v| if v.resident { 2 } else { 1 }),
+    );
+    rec(b"FsOwner", live.map_or(0, |v| v.owner as u32));
+    rec(b"FsGen", live.map_or(0, |v| v.generation));
+    rec(b"FsDeadl", live.map_or(0, |v| ms(v.deadline)));
+    rec(
+        b"FsLastP",
+        ms(FS_LAST_PRESENT_100NS.load(Ordering::Relaxed)),
+    );
+    rec(b"FsEndBy", FS_END_BY.load(Ordering::Relaxed));
+    rec(b"FsEndGen", FS_END_GEN.load(Ordering::Relaxed));
+    rec(b"FsEndT", ms(FS_END_AT_100NS.load(Ordering::Relaxed)));
+    rec(b"FsDpcLps", FS_DPC_LAPSES.load(Ordering::Relaxed));
+    rec(b"FsXitEnd", FS_OWNER_EXIT_ENDS.load(Ordering::Relaxed));
+    rec(b"FsPubT", ms(now_100ns()));
 }
 
 impl AdapterContext {
@@ -218,11 +288,24 @@ impl AdapterContext {
         lapse_ms: u32,
     ) -> Result<SetOutcome, SetError> {
         let now = now_100ns();
-        let result = STATE
-            .lock()
-            .set(owner.raw() as u64, handle, epoch, layout, lapse_ms, now);
+        let result = {
+            let mut g = STATE.lock();
+            let result = g.set(owner.raw() as u64, handle, epoch, layout, lapse_ms, now);
+            if result.is_ok() {
+                // The watchdog's hint follows the new deadline (same lock hold).
+                FS_WATCH_AT.store(g.watch_at(WATCHDOG_GRACE_100NS), Ordering::Relaxed);
+            }
+            result
+        };
         match &result {
             Ok(o) => {
+                if o.kind == SetKind::TookOver {
+                    // The replaced source's lapse had run out and nobody ended it.
+                    note_end(EndCause::TookOver);
+                }
+                if o.kind != SetKind::Updated {
+                    FS_CUR_GEN.store(o.generation, Ordering::Relaxed);
+                }
                 // The HPD worker arms the lapse deadline when it loops: wake a
                 // worker parked in an untimed wait so it sees this (new or shorter)
                 // deadline, or a hung owner on an idle desktop is never timed out.
@@ -261,6 +344,7 @@ impl AdapterContext {
             Err(PresentError::Lapsed) => {
                 FS_LAPSES.fetch_add(1, Ordering::Relaxed);
                 FS_REFUSED.fetch_add(1, Ordering::Relaxed);
+                note_end(EndCause::LapsePresent);
                 self.foreign_scanout_restore_desktop();
             }
             Err(PresentError::NoSource) => {
@@ -288,7 +372,10 @@ impl AdapterContext {
             // runs from acceptance, not from when it was minted); a failed one
             // does not.
             if sent {
-                g.extend(generation, now);
+                if g.extend(generation, now) {
+                    FS_WATCH_AT.store(g.watch_at(WATCHDOG_GRACE_100NS), Ordering::Relaxed);
+                    FS_LAST_PRESENT_100NS.store(now, Ordering::Relaxed);
+                }
             }
             g.suppress_desktop(now)
                 .is_some_and(|a| a.generation == generation)
@@ -318,6 +405,7 @@ impl AdapterContext {
                     crate::virtio::rm_present::RM_RES_ENDED.fetch_add(1, Ordering::Relaxed);
                 } else {
                     FS_RELEASES.fetch_add(1, Ordering::Relaxed);
+                    note_end(EndCause::Release);
                 }
                 self.foreign_scanout_restore_desktop();
             }
@@ -329,8 +417,23 @@ impl AdapterContext {
         result
     }
 
+    /// `DestroyDevice` of `owner`, at its ENTRY (before the mapping drain and the blob and
+    /// context sweeps, which are host round trips of up to 30 s each and take the scanout
+    /// and Venus mutexes): the process behind the device is gone, so whatever source it
+    /// held ends now and the desktop is restored, instead of waiting for the lapse behind
+    /// those sweeps. The same end as [`Self::foreign_scanout_release_owner`], which
+    /// `close_all_for_owner` calls later and which then finds nothing (idempotent).
+    /// PASSIVE.
+    pub(crate) fn foreign_scanout_owner_exit(&self, owner: DeviceOwner) {
+        self.end_owner_source(owner, EndCause::OwnerExit);
+    }
+
     /// Device teardown (`DestroyDevice`, `StopDevice`): the owner is gone.
     pub(crate) fn foreign_scanout_release_owner(&self, owner: DeviceOwner) {
+        self.end_owner_source(owner, EndCause::OwnerTeardown);
+    }
+
+    fn end_owner_source(&self, owner: DeviceOwner, cause: EndCause) {
         // The device is gone: nothing of its flips is waited for, and the host sends no
         // release for the buffers of the files it closed.
         crate::virtio::scanout_release::forget_owner(owner.raw());
@@ -346,7 +449,15 @@ impl AdapterContext {
         };
         if ended {
             self.count_end(was_resident);
+            if !was_resident {
+                note_end(cause);
+                if cause == EndCause::OwnerExit {
+                    FS_OWNER_EXIT_ENDS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             self.foreign_scanout_restore_desktop();
+            // PASSIVE, and the one edge a killed process leaves no other trace of.
+            publish_counters();
         }
     }
 
@@ -364,6 +475,9 @@ impl AdapterContext {
         };
         if ended {
             self.count_end(was_resident);
+            if !was_resident {
+                note_end(EndCause::HandleClosed);
+            }
             self.foreign_scanout_restore_desktop();
         }
     }
@@ -390,7 +504,11 @@ impl AdapterContext {
         };
         if ended {
             self.count_end(was_resident);
+            if !was_resident {
+                note_end(EndCause::Reset);
+            }
         }
+        FS_WATCH_AT.store(0, Ordering::Relaxed);
         // Queued fenced flips die with the transport; their fence handles are
         // closed by the transport sweep.
         let dropped = FENCES.lock().clear();
@@ -439,6 +557,9 @@ impl AdapterContext {
             crate::virtio::scanout_release::forget_handle(src.handle);
             if STATE.lock().invalidate(src.generation) {
                 self.count_end(src.resident);
+                if !src.resident {
+                    note_end(EndCause::Invalid);
+                }
                 self.foreign_scanout_restore_desktop();
             }
             return false;
@@ -470,8 +591,46 @@ impl AdapterContext {
         let polled = STATE.lock().poll(now);
         if let Poll::Lapsed { .. } = polled {
             FS_LAPSES.fetch_add(1, Ordering::Relaxed);
+            note_end(EndCause::LapseWorker);
             self.foreign_scanout_restore_desktop();
             publish_counters();
+        }
+    }
+
+    /// The no-present watchdog's DISPATCH half, from the vsync tick (`adapter/kobj.rs`
+    /// `service_vsync_tick`): the lapse above is the HPD worker's job and the worker's
+    /// timed wait expires AT the deadline, so on a healthy driver this never acts. It
+    /// acts when the deadline plus `WATCHDOG_GRACE_100NS` has passed with the source
+    /// still live, i.e. the worker is not looping (parked in a long host round trip, or
+    /// on a mutex): it ends the source itself, counts it (`FsLapse` and `FsDpcLps`) and
+    /// requests the restore. That stops the source suppressing and being counted live;
+    /// the desktop's own flush still needs the worker, which the event wakes.
+    ///
+    /// DISPATCH_LEVEL: one relaxed load when no user source is live (the default). The
+    /// state lock is a DISPATCH-safe spinlock, and everything after it is atomics and
+    /// `KeSetEvent(Wait = FALSE)`, which is what `foreign_scanout_restore_desktop` is
+    /// documented to be.
+    pub(crate) fn foreign_scanout_tick(&self) {
+        let at = FS_WATCH_AT.load(Ordering::Relaxed);
+        if at == 0 {
+            return;
+        }
+        let now = now_100ns();
+        if now < at {
+            return;
+        }
+        let polled = {
+            let mut g = STATE.lock();
+            let polled = g.poll_overdue(now, WATCHDOG_GRACE_100NS);
+            // Whatever it found, the hint is now the truth (0 once nothing is live).
+            FS_WATCH_AT.store(g.watch_at(WATCHDOG_GRACE_100NS), Ordering::Relaxed);
+            polled
+        };
+        if let Poll::Lapsed { .. } = polled {
+            FS_LAPSES.fetch_add(1, Ordering::Relaxed);
+            FS_DPC_LAPSES.fetch_add(1, Ordering::Relaxed);
+            note_end(EndCause::LapseWatchdog);
+            self.foreign_scanout_restore_desktop();
         }
     }
 

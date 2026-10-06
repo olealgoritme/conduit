@@ -185,7 +185,12 @@ pub(crate) const RING_SPIN_BURST: u32 = 50_000;
 /// TDR'd long before this budget expires and the constant bounds post-TDR
 /// thread residency rather than preventing a hang.
 ///
-/// It is left at 30 s and NOT shortened here: a bounded wait on a real ring-head
+/// It is 30 s of REAL time as well as 30 000 slices: `sleep_ms(1)` rounds up to the timer
+/// quantum (~15.6 ms), so the slice count alone was up to ~468 s under the Venus mutex
+/// (`helios_kmd_logic::slice_budget`, `ring_wait_until`; `VnRingRt` = 1 when the clock, not
+/// the count, ended it).
+///
+/// The value itself is left at 30 s and NOT shortened here: a bounded wait on a real ring-head
 /// watermark is a safety contract, and shortening it without measuring how long
 /// a legitimately slow host actually takes would trade a rare stall for a
 /// frequent false fatal latch. `VnRingWd` now records the milliseconds actually
@@ -213,7 +218,11 @@ pub(crate) enum FatalReason {
     /// The ring head never advanced past our seqno within
     /// [`RING_WAIT_TIMEOUT_MS`]. Records `VnRingWd` = milliseconds waited, so
     /// the dump distinguishes "gave up at the budget" from a short stall.
-    HeadWaitTimeout { elapsed_ms: u64 },
+    ///
+    /// `real_first`: the REAL elapsed time reached the budget while the nominal slice
+    /// count had not (sleeps of "1 ms" really take ~15.6 ms; see
+    /// `helios_kmd_logic::slice_budget`). Records `VnRingRt` = 1.
+    HeadWaitTimeout { elapsed_ms: u64, real_first: bool },
 }
 
 /// Written into reply word 0 before every reply-generating ring command, so an

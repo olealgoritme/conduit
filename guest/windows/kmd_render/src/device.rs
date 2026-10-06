@@ -405,6 +405,15 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // because the diag dumps between also require it; still ONE mint for
         // this DDI.
         let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        // FIRST, before anything below that can wait on the host: the process behind this
+        // device is gone (dxgkrnl destroys the devices of a killed process), so a foreign
+        // scanout source it held ends now and the desktop is restored. The sweeps below
+        // are host round trips of up to 30 s each under the scanout / Venus mutexes, and
+        // `close_all_for_owner`, which used to be the only place the source ended, comes
+        // after all of them. Idempotent: `close_all_for_owner` finds nothing left to end.
+        if let Some(device_owner) = crate::virtio::gpu::DeviceOwner::new(owner) {
+            adapter.foreign_scanout_owner_exit(device_owner);
+        }
         // Drain THIS device's mappings in batches, unmapping outside the table
         // lock (MmUnmapLockedPages needs PASSIVE; the table lock raises to
         // DISPATCH). One acquisition per entry was O(n) acquisitions and O(n^2)
