@@ -787,7 +787,60 @@ pub(crate) unsafe fn finish_wddm_tex2d_nvk(
     );
 }
 
+/// `D3D10_DDI_RESOURCE_MISC_SHARED_KEYEDMUTEX`.
+const DDI_MISC_SHARED_KEYEDMUTEX: u32 = 0x0000_0100;
+
+/// NVK: remember a live keyed-mutex shared resource of this device, so flushes
+/// and presents complete NVK's work on the CPU while it exists
+/// (`nvk_keyed_flush_wait`).
+unsafe fn note_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE, misc: u32) {
+    if misc & DDI_MISC_SHARED_KEYEDMUTEX == 0 || load_resource(h_resource).is_none() {
+        return;
+    }
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    if !dev.dxvk.is_nvk() {
+        return;
+    }
+    let mut list = lock_ignore_poison(&dev.nvk_keyed_resources);
+    let key = h_resource.pDrvPrivate as usize;
+    if !list.contains(&key) {
+        list.push(key);
+        log_error!(
+            "DDI NVK keyed-mutex resource hDrv=0x{key:x}: flushes now wait for the GPU ({} live)",
+            list.len()
+        );
+    }
+}
+
+/// Forget a resource `note_nvk_keyed_resource` remembered (any resource may be
+/// passed).
+pub(crate) unsafe fn forget_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE) {
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    let mut list = lock_ignore_poison(&dev.nvk_keyed_resources);
+    if list.is_empty() {
+        return;
+    }
+    let key = h_resource.pDrvPrivate as usize;
+    list.retain(|&k| k != key);
+}
+
 pub(crate) unsafe extern "system" fn create_resource(
+    h: Hdevice,
+    arg: *const ddi::D3D11DDIARG_CREATERESOURCE,
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    h_rt: ddi::D3D10DDI_HRTRESOURCE,
+) {
+    create_resource_inner(h, arg, h_resource, h_rt);
+    if !arg.is_null() {
+        note_nvk_keyed_resource(h, h_resource, (*arg).MiscFlags);
+    }
+}
+
+unsafe fn create_resource_inner(
     h: Hdevice,
     arg: *const ddi::D3D11DDIARG_CREATERESOURCE,
     h_resource: ddi::D3D10DDI_HRESOURCE,
@@ -1437,12 +1490,24 @@ pub(crate) unsafe extern "system" fn open_resource(
     h_resource: ddi::D3D10DDI_HRESOURCE,
     h_rt: ddi::D3D10DDI_HRTRESOURCE,
 ) {
+    // The creator's DDI misc flags travel in the meta trailer.
+    let misc = open_resource_inner(h, arg, h_resource, h_rt);
+    note_nvk_keyed_resource(h, h_resource, misc);
+}
+
+/// Returns the creator's misc flags (0 when the open failed early).
+unsafe fn open_resource_inner(
+    h: Hdevice,
+    arg: *const ddi::D3D10DDIARG_OPENRESOURCE,
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    h_rt: ddi::D3D10DDI_HRTRESOURCE,
+) -> u32 {
     clear_handle(h_resource);
 
     if arg.is_null() {
         log_error!("DDI open_resource: null args");
         set_runtime_error(h, E_INVALIDARG);
-        return;
+        return 0;
     }
 
     let a = &*arg;
@@ -1468,7 +1533,7 @@ pub(crate) unsafe extern "system" fn open_resource(
     if a.NumAllocations != 0 && info2.is_null() {
         log_error!("DDI open_resource FAILED: allocation array is null");
         set_runtime_error(h, E_INVALIDARG);
-        return;
+        return 0;
     }
     for index in 0..a.NumAllocations as usize {
         let info = &*info2.add(index);
@@ -1577,7 +1642,7 @@ pub(crate) unsafe extern "system" fn open_resource(
             );
         }
         set_runtime_error(h, E_FAIL);
-        return;
+        return 0;
     };
     let ident = opened.ident;
     let meta = opened.meta;
@@ -1588,13 +1653,13 @@ pub(crate) unsafe extern "system" fn open_resource(
             ident.resource_id
         );
         set_runtime_error(h, E_FAIL);
-        return;
+        return 0;
     }
 
     let Some(dev) = helios_device(h) else {
         log_error!("DDI open_resource FAILED: no Helios device -> E_FAIL");
         set_runtime_error(h, E_FAIL);
-        return;
+        return 0;
     };
 
     let open_bind = api_bind_flags(meta.bind_flags);
@@ -1660,11 +1725,11 @@ pub(crate) unsafe extern "system" fn open_resource(
             meta.width, meta.height, meta.format, allocation, a.hKMResource, ident.resource_id
         );
         set_runtime_error(h, E_FAIL);
-        return;
+        return 0;
     }
 
     let Some(res) = opened else {
-        return;
+        return 0;
     };
     let raw = res.as_raw() as usize;
     stamp_dxvk_resource_kmt_handles(h, &res, allocation, a.hKMResource.handle);
@@ -1677,7 +1742,7 @@ pub(crate) unsafe extern "system" fn open_resource(
                 hr as u32
             );
             set_runtime_error(h, hr);
-            return;
+            return 0;
         }
     };
     log_error!(
@@ -1712,6 +1777,7 @@ pub(crate) unsafe extern "system" fn open_resource(
         empty_present_private(),
         snapshot_source,
     );
+    meta.misc_flags
 }
 
 pub(crate) unsafe extern "system" fn calc_size_opened_resource(

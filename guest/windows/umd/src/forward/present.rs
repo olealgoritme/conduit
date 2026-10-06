@@ -1390,6 +1390,9 @@ unsafe fn nvk_present_impl(
             );
             shown = dst_h;
         }
+        // A keyed-mutex surface may be released right after this present.
+        context.Flush();
+        nvk_keyed_flush_wait(h, &context);
     }
     if let Err(hr) = nvk_present_frame(h, shown) {
         return hr;

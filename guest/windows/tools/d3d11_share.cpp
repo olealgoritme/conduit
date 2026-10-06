@@ -3,6 +3,9 @@
 // through D3DKMTOpenResource / DxgkDdiOpenAllocation like any app.
 //
 //   d3d11_share.exe [nt|nt-keyed|kmt] [width=1920 height=1080]
+//   d3d11_share.exe keyed-load [width height [rounds=20 [copies=400]]]
+//
+// keyed-load checks keyed-mutex ordering under load (see keyed_load below).
 //
 //   A (this process): a shared B8G8R8A8 render-target texture, filled with a
 //     coordinate pattern (UpdateSubresource, then a clear of a 64x64 corner
@@ -173,10 +176,171 @@ static int opener(const char *mode, UINT w, UINT h, const char *kmt) {
   return failed;
 }
 
+// ---- keyed-load: ordering under load -------------------------------------
+//
+// B opens the texture first and blocks in AcquireSync(1). Each round, A holds
+// the key, queues `load` full-texture copies (junk and pattern alternately,
+// the pattern last), and releases key 1 at once; B, already waiting, reads
+// right away and must see round r's pattern, then writes its own pattern into
+// the lower half and releases key 2, which A acquires and checks. A driver
+// whose GPU work is not complete when the key is released (NVK without the
+// UMD's keyed-mutex flush wait) shows up as wrong texels in B.
+
+static UINT32 round_seed(UINT r, bool b) { return 0x1000193u * (r + 1) ^ (b ? 0x5bd1e995u : 0x2545f491u); }
+
+static ID3D11Texture2D *make_plain(ID3D11Device1 *dev, UINT w, UINT h) {
+  D3D11_TEXTURE2D_DESC d{};
+  d.Width = w;
+  d.Height = h;
+  d.MipLevels = 1;
+  d.ArraySize = 1;
+  d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  d.SampleDesc.Count = 1;
+  d.Usage = D3D11_USAGE_DEFAULT;
+  d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  ID3D11Texture2D *t = nullptr;
+  dev->CreateTexture2D(&d, nullptr, &t);
+  return t;
+}
+
+static int keyed_load_opener(UINT w, UINT h, UINT rounds) {
+  role = "B";
+  ID3D11Device1 *dev = nullptr;
+  ID3D11DeviceContext *ctx = nullptr;
+  if (!make_device(&dev, &ctx)) {
+    check("a D3D11 device", false);
+    return 1;
+  }
+  ID3D11Texture2D *tex = nullptr;
+  HRESULT hr = dev->OpenSharedResourceByName(kName, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                                             __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex));
+  check("open A's shared texture", SUCCEEDED(hr) && tex);
+  if (FAILED(hr) || !tex) return 1;
+  IDXGIKeyedMutex *km = nullptr;
+  tex->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(&km));
+  long worst = 0;
+  UINT bad_rounds = 0;
+  for (UINT r = 0; r < rounds; r++) {
+    if (km->AcquireSync(1, 30000) != S_OK) {
+      check("AcquireSync(1)", false);
+      return 1;
+    }
+    long bad = count_bad(dev, ctx, tex, w, 0, h, round_seed(r, false), false);
+    if (bad) {
+      bad_rounds++;
+      if (bad > worst) worst = bad;
+      std::printf("       B: round %u: %ld texels are not A's round-%u pattern\n", r, bad, r);
+    }
+    write_rows(ctx, tex, w, h / 2, h, round_seed(r, true));
+    ctx->Flush();
+    km->ReleaseSync(2);
+  }
+  std::printf("       B: %u of %u rounds wrong (worst %ld texels)\n", bad_rounds, rounds, worst);
+  check("every round, B saw all of A's work at its AcquireSync", bad_rounds == 0);
+  km->Release();
+  tex->Release();
+  ctx->Release();
+  dev->Release();
+  std::printf("%s\n", failed ? "B FAILED" : "B PASSED");
+  return failed;
+}
+
+static int keyed_load(UINT w, UINT h, UINT rounds, UINT load) {
+  ID3D11Device1 *dev = nullptr;
+  ID3D11DeviceContext *ctx = nullptr;
+  if (!make_device(&dev, &ctx)) {
+    check("a D3D11 device", false);
+    return 1;
+  }
+  D3D11_TEXTURE2D_DESC d{};
+  d.Width = w;
+  d.Height = h;
+  d.MipLevels = 1;
+  d.ArraySize = 1;
+  d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  d.SampleDesc.Count = 1;
+  d.Usage = D3D11_USAGE_DEFAULT;
+  d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+  d.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+  ID3D11Texture2D *tex = nullptr;
+  check("a keyed-mutex shared texture", SUCCEEDED(dev->CreateTexture2D(&d, nullptr, &tex)));
+  ID3D11Texture2D *junk = make_plain(dev, w, h), *pat = make_plain(dev, w, h);
+  if (!tex || !junk || !pat) return 1;
+  write_rows(ctx, junk, w, 0, h, 0xdeadbeefu);
+  IDXGIKeyedMutex *km = nullptr;
+  tex->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(&km));
+  check("AcquireSync(0)", km->AcquireSync(0, 10000) == S_OK);
+  IDXGIResource1 *res = nullptr;
+  HANDLE nt = nullptr;
+  tex->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&res));
+  check("CreateSharedHandle by name",
+        res && SUCCEEDED(res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                                                 kName, &nt)));
+  if (res) res->Release();
+
+  char self[MAX_PATH], cmd[1024];
+  GetModuleFileNameA(nullptr, self, sizeof(self));
+  std::snprintf(cmd, sizeof(cmd), "\"%s\" open keyed-load %u %u %u", self, w, h, rounds);
+  STARTUPINFOA si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  if (!CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    check("start B", false);
+    return 1;
+  }
+  Sleep(1500); // B opens and blocks in AcquireSync(1)
+
+  UINT bad_rounds = 0;
+  LARGE_INTEGER f, t0, t1;
+  QueryPerformanceFrequency(&f);
+  double release_ms = 0;
+  for (UINT r = 0; r < rounds; r++) {
+    write_rows(ctx, pat, w, 0, h, round_seed(r, false));
+    for (UINT i = 0; i < load; i++) ctx->CopyResource(tex, (i & 1) ? pat : junk);
+    ctx->CopyResource(tex, pat);
+    ctx->Flush();
+    QueryPerformanceCounter(&t0);
+    km->ReleaseSync(1);
+    QueryPerformanceCounter(&t1);
+    release_ms += 1000.0 * double(t1.QuadPart - t0.QuadPart) / double(f.QuadPart);
+    if (km->AcquireSync(2, 30000) != S_OK) {
+      check("AcquireSync(2)", false);
+      break;
+    }
+    if (count_bad(dev, ctx, tex, w, h / 2, h, round_seed(r, true), false)) bad_rounds++;
+  }
+  std::printf("       A: %u rounds of %u copies, ReleaseSync took %.2f ms on average\n", rounds, load,
+              release_ms / rounds);
+  check("every round, A saw B's writes at its AcquireSync", bad_rounds == 0);
+  WaitForSingleObject(pi.hProcess, 120000);
+  DWORD code = 1;
+  GetExitCodeProcess(pi.hProcess, &code);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+  check("B passed", code == 0);
+  km->ReleaseSync(0);
+  CloseHandle(nt);
+  km->Release();
+  junk->Release();
+  pat->Release();
+  tex->Release();
+  ctx->Release();
+  dev->Release();
+  std::printf("%s\n", failed ? "SHARE FAILED" : "SHARE PASSED");
+  return failed;
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc >= 6 && !std::strcmp(argv[1], "open") && !std::strcmp(argv[2], "keyed-load"))
+    return keyed_load_opener(UINT(std::atoi(argv[3])), UINT(std::atoi(argv[4])), UINT(std::atoi(argv[5])));
   if (argc >= 5 && !std::strcmp(argv[1], "open"))
     return opener(argv[2], UINT(std::atoi(argv[3])), UINT(std::atoi(argv[4])), argc > 5 ? argv[5] : "0");
+  if (argc > 1 && !std::strcmp(argv[1], "keyed-load")) {
+    std::printf("       A: mode keyed-load, HELIOS_ICD=%s\n", std::getenv("HELIOS_ICD") ? std::getenv("HELIOS_ICD") : "(unset)");
+    return keyed_load(argc > 3 ? UINT(std::atoi(argv[2])) : 1920, argc > 3 ? UINT(std::atoi(argv[3])) : 1080,
+                      argc > 4 ? UINT(std::atoi(argv[4])) : 20, argc > 5 ? UINT(std::atoi(argv[5])) : 400);
+  }
 
   const char *mode = argc > 1 ? argv[1] : "nt";
   const UINT w = argc > 3 ? UINT(std::atoi(argv[2])) : 1920;

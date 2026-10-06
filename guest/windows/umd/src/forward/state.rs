@@ -1100,6 +1100,7 @@ pub(crate) unsafe fn release_rtv(h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW) {
 }
 
 pub(crate) unsafe fn release_resource(h: Hdevice, h_res: ddi::D3D10DDI_HRESOURCE) {
+    crate::forward::resource::forget_nvk_keyed_resource(h, h_res);
     let Some(slot) = boxed_slot(h_res) else {
         return;
     };
