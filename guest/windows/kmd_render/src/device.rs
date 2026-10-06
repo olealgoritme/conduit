@@ -196,12 +196,16 @@ impl<'a> ContextHandleRef<'a> {
         })
     }
 
-    /// Stash one complete nonzero stream marker for the immediately following
+    /// Stash one complete stream marker for the immediately following
     /// Present on this context.  The KMD validates registry/process ownership
     /// while consuming it; this handoff only preserves the exact UMD boundary
     /// until the WDDM private-data buffer exists.
+    ///
+    /// "Complete" includes `value == 0` ("already complete", a CPU-complete
+    /// present): dropping it here would silently turn that present into a
+    /// legacy current-wire wait. Only an absent or partial tail is not stashed.
     pub fn stash_present_stream_marker(&self, ctx_id: u32, value: u32, cookie: u64) {
-        if ctx_id == 0 || value == 0 || cookie == 0 {
+        if !helios_kmd_logic::present_stream::tail_selects_boundary(ctx_id, value, cookie) {
             return;
         }
         *self.context.present_stream_marker.lock() = Some((ctx_id, value, cookie));
@@ -396,6 +400,11 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         let blobs = crate::virtio::ctrl::release_blobs_for_owner(passive, adapter, device_owner);
         let contexts =
             crate::virtio::ctrl::destroy_contexts_for_owner(passive, adapter, device_owner);
+        // RM handles the process left open (HELIOS_ESCAPE_NVRM): the host keeps
+        // each opened RM file, and what it allocated, until it is closed.
+        if let Some(owner) = device_owner {
+            let _ = crate::virtio::nvrm::close_all_for_owner(passive, adapter, owner);
+        }
         // Opportunistic PASSIVE reap of completed transport entries.
         crate::virtio::ctrl::reap_parked(passive, adapter);
         // 0x0E02_BBBB = blob-table size BEFORE reclaim (saturated to 16 bits).

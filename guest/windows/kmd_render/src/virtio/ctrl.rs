@@ -53,6 +53,7 @@
 
 use core::cell::Cell;
 use core::mem::size_of;
+use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicU32;
 
@@ -61,15 +62,18 @@ use wdk_sys::ntddk::{KeDelayExecutionThread, KeQueryInterruptTimePrecise, KeWait
 use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::gpu::{
-    BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner, FenceWaitPrep,
+    BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner, FenceWaitPrep, InFlight,
     OwnerFilter, SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, CTRL_TEARDOWN_ABANDONS,
-    CTRL_TIMEOUT_COUNT, ESCAPE_SUBMIT_COUNT, ESCAPE_SUBMIT_RING_COUNT, FENCE_WAIT_TABLE_FULL,
+    CTRL_TIMEOUT_COUNT, ESCAPE_SUBMIT_CALLS, ESCAPE_SUBMIT_COUNT, ESCAPE_SUBMIT_RING_COUNT,
+    FENCE_WAIT_TABLE_FULL,
     FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
 use crate::adapter::AdapterContext;
+use crate::error::NotStarted;
 use crate::irql::PassiveLevel;
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
@@ -248,8 +252,21 @@ fn wait_block(
 /// Reap completed entries at PASSIVE and retain their DMA buffers for reuse.
 /// `MmAllocateContiguousMemory` per tiny Venus submission dominated DWM's
 /// command rate; recycling page-backed buffers removes that steady-state cost.
-pub fn reap_parked(_passive: PassiveLevel, adapter: &AdapterContext) {
+pub fn reap_parked(passive: PassiveLevel, adapter: &AdapterContext) {
     let work = adapter.with_virtio(|v| v.begin_parked_reap());
+    reap_parked_work(passive, adapter, work);
+}
+
+/// The rest of [`reap_parked`] for a caller that took the `begin_parked_reap`
+/// result inside a `with_virtio` hold it needed anyway (`raw_roundtrip` does it
+/// in the same hold as its pool take, one lock instead of two). Whatever `work`
+/// holds MUST be passed here, or `reap_in_progress` stays set and reaping is
+/// disabled for good (see `abort_parked_reap`).
+fn reap_parked_work(
+    _passive: PassiveLevel,
+    adapter: &AdapterContext,
+    work: Result<Option<(Vec<InFlight>, Vec<DmaBuffer>)>, NotStarted>,
+) {
     let Ok(Some((mut dead, mut buffers))) = work else {
         return;
     };
@@ -453,6 +470,234 @@ fn ctrl_roundtrip(
         block.copy_resp(resp_out);
         Ok(())
     })
+}
+
+/// Replies up to this many bytes (the capacity the device is told it may write)
+/// land in a buffer on the caller's stack instead of the heap. 1 KiB covers the
+/// reply of almost every RM call (header, `IoctlResp`, a few hundred bytes of
+/// parameters) and is small next to a 24 KiB kernel stack.
+const RAW_REPLY_STACK: usize = 1024;
+
+/// `NvSpinUs` as read from the service key (clamped), or `u32::MAX` while unread.
+/// Read once, at the first forward (PASSIVE); a change needs a driver reload.
+static NVRM_SPIN_US: AtomicU32 = AtomicU32::new(u32::MAX);
+/// The spin governor's packed state (`helios_kmd_logic::nvrm_fastpath::spin`).
+/// Plain load / store, never a read-modify-write: it is a heuristic, a lost
+/// update costs nothing, and a locked instruction on a line every forwarding
+/// thread shares is exactly what this path is trying to stop paying.
+static NVRM_SPIN_STATE: AtomicU32 =
+    AtomicU32::new(helios_kmd_logic::nvrm_fastpath::spin::initial());
+/// Forwards whose pre-wait spin saw the reply (`NvSpinHit`) and whose spin gave up
+/// (`NvSpinMis`). `hit / (hit + miss)` is the governor's input; both flat at 0
+/// with forwards running means the spin is off (`NvSpinUs = 0`).
+pub static NVRM_SPIN_HITS: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_SPIN_MISSES: AtomicU32 = AtomicU32::new(0);
+
+/// The pre-wait spin budget in 100 ns units; 0 = disabled by the knob.
+fn nvrm_spin_budget_100ns(_passive: PassiveLevel) -> u64 {
+    use helios_kmd_logic::nvrm_fastpath::spin;
+    let mut us = NVRM_SPIN_US.load(Ordering::Relaxed);
+    if us == u32::MAX {
+        us =
+            crate::diag::read_config_dword(crate::diag::knobs::NV_SPIN_US, spin::BUDGET_US_DEFAULT)
+                .min(spin::BUDGET_US_MAX);
+        NVRM_SPIN_US.store(us, Ordering::Relaxed);
+    }
+    spin::budget_100ns(us)
+}
+
+/// Poll `block` for up to `budget_100ns`, at PASSIVE with no lock held, and
+/// return whether the drain was seen starting to complete it.
+///
+/// This is a HINT and nothing leaves on it: whatever it returns, the caller goes
+/// on to [`wait_block`], whose `KeWaitForSingleObject` is still the only
+/// completion-side exit (see its doc for why a lock-free `done` read must not be
+/// one). What the spin buys is that a reply landing within a few microseconds
+/// finds the waiter running: the wait then returns at once, without arming a
+/// timer, switching context, or waking a halted vCPU. The drain is driven by the
+/// device interrupt as always; this never touches the transport or its lock, so
+/// it cannot hold up the DPC that completes the call.
+/// Most clock-read rounds one pre-wait spin may take (each round is
+/// `POLLS_PER_CLOCK_READ` polls and one clock read): far above what a 50 us budget
+/// needs even on a slow emulated timer, far below an unbounded spin.
+const SPIN_MAX_ROUNDS: u32 = 20_000;
+
+fn spin_for_completion(block: &WaitBlockRef<'_>, budget_100ns: u64) -> bool {
+    /// Polls between two clock reads: the clock read costs more than a poll.
+    const POLLS_PER_CLOCK_READ: u32 = 8;
+    let mut qpc = 0u64;
+    // SAFETY: a scalar time read, callable at any IRQL; it waits on nothing and
+    // fills the valid out-pointer.
+    let start = unsafe { KeQueryInterruptTimePrecise(&mut qpc) };
+    // A hard cap on top of the clock: should the interrupt clock ever fail to
+    // advance, this must not become an unbounded spin on the path of every forward.
+    let mut rounds = 0u32;
+    loop {
+        rounds += 1;
+        if rounds > SPIN_MAX_ROUNDS {
+            return block.spin_hint_done();
+        }
+        for _ in 0..POLLS_PER_CLOCK_READ {
+            if block.spin_hint_done() {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        // SAFETY: as above.
+        let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc) };
+        if now.wrapping_sub(start) >= budget_100ns {
+            return block.spin_hint_done();
+        }
+    }
+}
+
+/// Forward one RM message VERBATIM and wait for the reply (HELIOS_ESCAPE_NVRM).
+///
+/// `req` is `MsgHeader | payload` exactly as the caller built it — nothing is
+/// stamped or interpreted here — and the device's reply (`MsgHeader | payload`,
+/// or the header-less stream of `GetSysFiles`) is written into `resp_out`, whose
+/// length is the capacity the device is given. Returns how many reply bytes the
+/// device wrote, which is never 0 on success.
+///
+/// The drain runs at DISPATCH under the device lock, so it cannot be trusted to
+/// write `resp_out` (the runtime's copy of the escape's private data, whose
+/// paging is not ours to assume): it copies the reply into a driver-owned
+/// non-paged buffer instead (see `InFlightKind::Raw`), and the copy into
+/// `resp_out` happens here, at PASSIVE, after the wake. That buffer is on this
+/// frame for a reply up to [`RAW_REPLY_STACK`] bytes (the same standing the
+/// `SyncWaitBlock`'s own response bytes have: the drain writes it only under the
+/// lock and only while `waiter` is still set, and `abandon_sync` clears `waiter`
+/// under that lock before this frame can pop), and otherwise on the heap. It is
+/// never zero-filled: the drain writes exactly the bytes it reports in `used`,
+/// and only those are read back.
+///
+/// A timeout abandons the entry; its eventual completion neither copies nor
+/// signals. An RM call that outlives `timeout_ms` may still have taken effect on
+/// the host, so the caller must treat the handle as indeterminate.
+pub fn raw_roundtrip(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    resp_out: &mut [u8],
+    timeout_ms: u64,
+) -> Result<usize, VirtioError> {
+    const MH: usize = super::hal::MSG_HDR_LEN;
+    let req_len = req.len();
+    let want = resp_out.len();
+    if req_len < MH || want < MH {
+        return Err(VirtioError::DeviceError);
+    }
+    // What the device is told it may write: one byte more than a bare header, so
+    // the reply is two non-empty descriptors (see `Chain::Raw`).
+    let resp_len = want.max(MH + 1);
+    // The reply's landing buffer, declared before the wait block so it outlives
+    // the abandon path. Heap storage is reserved fallibly — the size is
+    // caller-controlled — and only for a reply that does not fit the stack.
+    let mut stack_reply = MaybeUninit::<[u8; RAW_REPLY_STACK]>::uninit();
+    let mut heap_reply = Vec::<u8>::new();
+    let dest = if resp_len <= RAW_REPLY_STACK {
+        stack_reply.as_mut_ptr() as *mut u8
+    } else {
+        if heap_reply.try_reserve_exact(resp_len).is_err() {
+            return Err(VirtioError::OutOfMemory);
+        }
+        heap_reply.as_mut_ptr()
+    };
+    let Some(dest) = NonNull::new(dest) else {
+        return Err(VirtioError::DeviceError);
+    };
+
+    // One lock hold for what used to be two: whether completed entries wait to be
+    // reaped (almost never now, see `drain_used`'s Raw arm) and a pooled buffer.
+    let total = req_len + resp_len;
+    let (work, pooled) =
+        match adapter.with_virtio(|v| (v.begin_parked_reap(), v.take_dma_buffer(total))) {
+            Ok((work, pooled)) => (Ok(work), pooled),
+            Err(e) => (Err(e), None),
+        };
+    // Finish the reap BEFORE anything below can return, or `reap_in_progress`
+    // stays set (see `reap_parked_work`).
+    reap_parked_work(passive, adapter, work);
+    let mut meta = pooled
+        .or_else(|| DmaBuffer::new(passive, total))
+        .ok_or(VirtioError::OutOfMemory)?;
+    meta.as_mut_slice()[..req_len].copy_from_slice(req);
+
+    let used = SyncWaitBlock::with(|block| {
+        // As in `ctrl_roundtrip`: the buffer is a loop value, handed back by every
+        // refusal arm, so a retry that forgets it does not compile.
+        let mut budget = Budget::new(ENQUEUE_RETRY_MAX_MS);
+        let ticket = loop {
+            let res = adapter.with_virtio(move |v| {
+                v.drain_used();
+                v.enqueue_raw(meta, req_len, resp_len, block.as_ptr(), dest)
+            });
+            match res {
+                Err(_) => return Err(VirtioError::DeviceError), // transport gone
+                Ok(Ok(ticket)) => break ticket,
+                Ok(Err((m_back, VirtioError::QueueFull))) => {
+                    meta = m_back;
+                    if budget.charge_slice() {
+                        return Err(VirtioError::QueueFull);
+                    }
+                    reap_parked(passive, adapter);
+                    sleep_ms(passive, RETRY_SLICE_MS);
+                }
+                Ok(Err((_m, e))) => return Err(e), // buffer dropped at PASSIVE
+            }
+        };
+
+        // A short bounded poll before the real wait (see `spin_for_completion`).
+        {
+            use helios_kmd_logic::nvrm_fastpath::spin;
+            let state = NVRM_SPIN_STATE.load(Ordering::Relaxed);
+            if spin::should_spin(state) {
+                let spin_budget = nvrm_spin_budget_100ns(passive);
+                if spin_budget != 0 {
+                    let hit = spin_for_completion(block, spin_budget);
+                    let fresh = NVRM_SPIN_STATE.load(Ordering::Relaxed);
+                    NVRM_SPIN_STATE.store(spin::next(fresh, true, hit), Ordering::Relaxed);
+                    let counter = if hit {
+                        &NVRM_SPIN_HITS
+                    } else {
+                        &NVRM_SPIN_MISSES
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                NVRM_SPIN_STATE.store(spin::next(state, false, false), Ordering::Relaxed);
+            }
+        }
+
+        if !wait_block(passive, adapter, block, timeout_ms) {
+            match adapter.with_virtio(|v| {
+                v.drain_used();
+                v.abandon_sync(ticket, block.as_ptr())
+            }) {
+                // The drain already completed it; the reply is in `dest`.
+                Ok(SyncOutcome::AlreadyCompleted) => {}
+                Ok(SyncOutcome::Abandoned) => {
+                    CTRL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    return Err(VirtioError::Timeout);
+                }
+                Ok(SyncOutcome::NotOurs) => return Err(VirtioError::DeviceError),
+                Err(_) => return Err(VirtioError::DeviceError),
+            }
+        }
+        match block.used() as usize {
+            0 => Err(VirtioError::DeviceError),
+            n => Ok(n),
+        }
+    })?;
+    // PASSIVE: now the reply may go to the caller's buffer. `used` is what the
+    // drain copied into `dest` and is at most `resp_len`, the size of `dest`.
+    let n = used.min(want);
+    // SAFETY: the drain initialised the first `used >= n` bytes of `dest` (and
+    // no other writer exists once the wait was satisfied or the abandon found the
+    // entry completed); `dest` and `resp_out` are distinct allocations; `n` is at
+    // most both lengths.
+    unsafe { core::ptr::copy_nonoverlapping(dest.as_ptr(), resp_out.as_mut_ptr(), n) };
+    Ok(n)
 }
 
 /// Round-trip expecting a bare `VirtioGpuCtrlHdr` response; checks RESP_OK.
@@ -1424,30 +1669,31 @@ fn submit_venus_async_inner(
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }
-    // Ownership is resolved under the device lock, the same lock the enqueue
-    // below takes, so a foreign command stream cannot reach another process's
-    // Venus ring. This costs no extra acquisition on the ~89 us submit path.
-    let owned = adapter
-        .with_virtio(|v| v.resolve_owned_ctx(owner, ctx_id))
-        .map_err(|_| VirtioError::DeviceError)?;
-    let Some(owned) = owned else {
-        return Err(VirtioError::NotOwned);
-    };
-    let ctx_id = owned.id();
     if !stream_fits(stream) {
         return Err(VirtioError::DeviceError);
     }
     reap_parked(passive, adapter);
-    let mut meta = adapter
-        .with_virtio(|v| v.take_dma_buffer(SUBMIT_META_BYTES))
-        .ok()
-        .flatten()
+    // Ownership is resolved under the device lock, the same lock the enqueue
+    // below takes, so a foreign command stream cannot reach another process's
+    // Venus ring. The two staging buffers come out of the pool in the SAME hold
+    // (one acquisition instead of three per submit, ~2000 submits/s); a buffer
+    // the pool cannot supply is allocated below at PASSIVE, never under the lock.
+    let staged = adapter
+        .with_virtio(|v| {
+            let owned = v.resolve_owned_ctx(owner, ctx_id)?;
+            let meta = v.take_dma_buffer(SUBMIT_META_BYTES);
+            let venus = v.take_dma_buffer(stream.len());
+            Some((owned, meta, venus))
+        })
+        .map_err(|_| VirtioError::DeviceError)?;
+    let Some((owned, pooled_meta, pooled_venus)) = staged else {
+        return Err(VirtioError::NotOwned);
+    };
+    let ctx_id = owned.id();
+    let mut meta = pooled_meta
         .or_else(|| DmaBuffer::new(passive, SUBMIT_META_BYTES))
         .ok_or(VirtioError::OutOfMemory)?;
-    let mut venus = adapter
-        .with_virtio(|v| v.take_dma_buffer(stream.len()))
-        .ok()
-        .flatten()
+    let mut venus = pooled_venus
         .or_else(|| DmaBuffer::new(passive, stream.len()))
         .ok_or(VirtioError::OutOfMemory)?;
     venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
@@ -1558,6 +1804,12 @@ fn submit_venus_async_inner(
             Ok(Err((_m, _v, e))) => return Err(e), // buffers dropped at PASSIVE
         }
     }
+}
+
+/// Count one received submission escape (`EscCalls`); see
+/// `ESCAPE_SUBMIT_CALLS`. Counted on receipt, accepted or not.
+pub fn count_submit_escape() {
+    ESCAPE_SUBMIT_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The prologue both per-frame display submitters share: refuse an empty

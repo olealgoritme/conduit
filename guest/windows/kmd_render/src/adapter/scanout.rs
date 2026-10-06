@@ -642,6 +642,16 @@ impl AdapterContext {
         if matches!(outcome, ScanoutRefreshQueue::Queued) {
             self.pacing_snapshot();
         }
+        // A desktop flush that was queued, or that found nothing bound, pays off
+        // the restore a foreign scanout source's end owes the desktop. (`Dropped`,
+        // `Busy` and `Failed` leave it owed; the worker retries or the next dirty
+        // edge arrives.)
+        if matches!(
+            outcome,
+            ScanoutRefreshQueue::Queued | ScanoutRefreshQueue::Unavailable
+        ) {
+            self.foreign_scanout_desktop_flushed();
+        }
         outcome
     }
 
@@ -872,6 +882,27 @@ impl AdapterContext {
                 crate::ddi::scanout_timeline::refresh_outcome::ACTIVE_CHANGED,
             );
             return ScanoutRefreshQueue::Busy;
+        }
+
+        // FOREIGN SCANOUT SOURCE (`adapter/foreign_scanout.rs`): an app holds
+        // scanout 0 through HELIOS_NVRM_OP_SCANOUT_*, and a host flush of the
+        // desktop's resource would replace its picture. Withhold exactly that
+        // flush. Everything else of the desktop's present path (binds, WDDM
+        // fences, vsync, the ledger) already ran and is untouched; what is
+        // cancelled here is cancelled the way the ownership-gate drops below
+        // cancel it, so no publication transaction or lease waits for a read
+        // that will never be issued. Self-healing like those drops: the armed id
+        // is cleared, and the source's end requests a fresh refresh.
+        if self.foreign_scanout_suppresses() {
+            let armed_resource = self.pending_refresh_resource.swap(0, Ordering::AcqRel);
+            self.release_all_scanout_leases(LeaseEnd::Cancelled);
+            let _ = self.with_virtio(|v| v.cancel_publication_exact(resource_id, bound_epoch));
+            note_dropped(
+                resource_id,
+                armed_resource,
+                crate::ddi::scanout_timeline::refresh_outcome::FOREIGN_SOURCE,
+            );
+            return ScanoutRefreshQueue::Dropped;
         }
 
         // THE CENSUS the ownership gate below acts on. It was count-only until

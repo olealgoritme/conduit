@@ -132,6 +132,153 @@ pub static D3D12_SUBMIT_MERGED: AtomicU32 = AtomicU32::new(0);
 /// Retired prefix-clearing diagnostic. HE12 v2 keeps a separate immutable execution tail; always zero.
 pub static D3D12_STALE_RECORD_CLEARED: AtomicU32 = AtomicU32::new(0);
 
+/// Mirror the HELIOS_ESCAPE_NVRM counters into the registry. PASSIVE_LEVEL only.
+/// Called on the present edge with the rest, and by the NVRM escape itself (which
+/// can run for a whole session without a single present).
+pub(crate) fn publish_nvrm_counters() {
+    // HELIOS_ESCAPE_NVRM: forwarded RM messages by kind, and refusals.
+    crate::diag::record_named_bytes(
+        b"NvOpen",
+        crate::virtio::nvrm::NVRM_OPENS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvClose",
+        crate::virtio::nvrm::NVRM_CLOSES.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvIoctl",
+        crate::virtio::nvrm::NVRM_IOCTLS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvOther",
+        crate::virtio::nvrm::NVRM_OTHER.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvRef",
+        crate::virtio::nvrm::NVRM_REFUSED.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvMap",
+        crate::virtio::nvrm::NVRM_MAPS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvMapErr",
+        crate::virtio::nvrm::NVRM_MAP_ERRORS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvFlip",
+        crate::virtio::nvrm::NVRM_FLIPS.load(Ordering::Relaxed),
+    );
+    // The pre-wait spin (`NvSpinUs`): replies it saw in time / gave up on.
+    crate::diag::record_named_bytes(
+        b"NvSpinHit",
+        crate::virtio::ctrl::NVRM_SPIN_HITS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvSpinMis",
+        crate::virtio::ctrl::NVRM_SPIN_MISSES.load(Ordering::Relaxed),
+    );
+    // Pins made / released / failed: `NvPin - NvUnpin` is what is locked now.
+    crate::diag::record_named_bytes(
+        b"NvPin",
+        crate::virtio::nvrm::NVRM_PINS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvUnpin",
+        crate::virtio::nvrm::NVRM_UNPINS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvPinErr",
+        crate::virtio::nvrm::NVRM_PIN_ERRORS.load(Ordering::Relaxed),
+    );
+    // RM events (HELIOS_NVRM_OP_EVENT_*). `NvEvQ` (written once at transport init)
+    // says whether the event queue is up (1) or events are unsupported (0). `NvEvReg` / `NvEvUnreg` / `NvEvRef` are registrations made / removed
+    // by UNREGISTER / refused; `NvEvSig` is KeSetEvents for an EventReady and
+    // `NvEvLatch` / `NvEvDrop` the EventReadys that found nothing registered
+    // (latched on an open handle / for a handle nobody has open); `NvEvLost` is
+    // registrations woken by a lost transport. `NvEvOther` (a message other than
+    // EventReady on the queue) and `NvEvErr` (queue faults) should read 0.
+    crate::diag::record_named_bytes(
+        b"NvEvReg",
+        crate::virtio::nvrm::NVRM_EV_REGS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvUnreg",
+        crate::virtio::nvrm::NVRM_EV_UNREGS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvRef",
+        crate::virtio::nvrm::NVRM_EV_REFUSED.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvSig",
+        crate::virtio::nvrm::NVRM_EV_SIGNALS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvLatch",
+        crate::virtio::nvrm::NVRM_EV_LATCHED.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvDrop",
+        crate::virtio::nvrm::NVRM_EV_DROPS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvLost",
+        crate::virtio::nvrm::NVRM_EV_LOST.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvOther",
+        crate::virtio::nvrm::NVRM_EV_OTHER.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvEvErr",
+        crate::virtio::nvrm::NVRM_EV_ERRORS.load(Ordering::Relaxed),
+    );
+    // Foreign scanout source (HELIOS_NVRM_OP_SCANOUT_*): `FsSet`, `FsPres`, `FsRel`,
+    // `FsLapse`, `FsEnd`, `FsTake`, `FsSupp`, `FsRest`, `FsRef`, `FsErr`.
+    crate::adapter::foreign_scanout::publish_counters();
+    // RM fence handles (a forwarded SEMSURF_FENCE_CREATE): `NvFence` made and
+    // recorded, `NvFenceCl` released (Close or teardown; the difference is what is
+    // live), `NvFenceSig` EventReadys seen for fences, `NvFenceEarly` of those that
+    // beat the recording of their handle, `NvFenceErr` unusable replies and lost
+    // notifications (should read 0).
+    crate::diag::record_named_bytes(
+        b"NvFence",
+        crate::virtio::nvrm::NVRM_FENCES.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvFenceCl",
+        crate::virtio::nvrm::NVRM_FENCES_CLOSED.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvFenceSig",
+        crate::virtio::nvrm::NVRM_FENCE_FIRED.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvFenceEarly",
+        crate::virtio::nvrm::NVRM_FENCE_EARLY.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvFenceErr",
+        crate::virtio::nvrm::NVRM_FENCE_ERRORS.load(Ordering::Relaxed),
+    );
+    // Teardown of a dropped transport: entries it still tracked (`NvSwept`, 0 when
+    // every device was destroyed first), user views it left behind (`NvStale`) and
+    // how many of those their owners have unmapped since (`NvStaleUn`).
+    crate::diag::record_named_bytes(
+        b"NvSwept",
+        crate::virtio::nvrm::NVRM_SWEPT.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvStale",
+        crate::virtio::nvrm::NVRM_STALE_VIEWS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvStaleUn",
+        crate::virtio::nvrm::NVRM_STALE_UNMAPPED.load(Ordering::Relaxed),
+    );
+}
+
 /// Mirror the scheduler private-data handoff evidence at PASSIVE_LEVEL.
 pub(crate) fn record_present_handoff_telemetry() {
     use crate::ddi::present_packet::{
@@ -215,6 +362,13 @@ pub(crate) fn record_present_handoff_telemetry() {
     crate::diag::record_named_bytes(
         b"PsMkAhdHi",
         crate::virtio::gpu::PRESENT_STREAM_MARKER_AHEAD_HIGH_WATER.load(Ordering::Relaxed),
+    );
+    // S3: markers that named a stream with value 0 ("already complete", a
+    // CPU-complete present). Movement here with no PsMkAhd movement is the NVK
+    // path; see `virtio/counters.rs`.
+    crate::diag::record_named_bytes(
+        b"PsMkCpl",
+        crate::virtio::gpu::PRESENT_STREAM_MARKER_COMPLETE.load(Ordering::Relaxed),
     );
     // HE12 v2: accepted exact records and validation failures. D12Zero is a
     // retired diagnostic; a zero boundary is refused before submission.
@@ -364,6 +518,28 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"EscSubRing",
         crate::virtio::gpu::ESCAPE_SUBMIT_RING_COUNT.load(Ordering::Relaxed),
     );
+    // Submission escapes received vs submits accepted: `EscSub / EscCalls` is the
+    // average submits per user->kernel transition, `EscBat*` describe the batch
+    // verb (virtio/counters.rs).
+    crate::diag::record_named_bytes(
+        b"EscCalls",
+        crate::virtio::gpu::ESCAPE_SUBMIT_CALLS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"EscBat",
+        crate::virtio::gpu::ESCAPE_BATCH_COUNT.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"EscBatEnt",
+        crate::virtio::gpu::ESCAPE_BATCH_ENTRIES.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"EscBatMax",
+        crate::virtio::gpu::ESCAPE_BATCH_MAX.load(Ordering::Relaxed),
+    );
+    // The same counts per Venus context (= per ICD instance = per process).
+    crate::virtio::gpu::publish_escape_ctx_counters();
+    publish_nvrm_counters();
     // S-1's instrument (`docs/dx12/PENDING.md` §2). `DxgkDdiCalibrateGpuClock` is
     // the ONLY channel for the GPU timestamp frequency an application divides its
     // timestamp deltas by, and it used to zero-fill and return SUCCESS silently.
@@ -453,6 +629,12 @@ pub fn diag_dump_engine_atomics() {
     );
     crate::diag::record(
         0x0F0E_0000 | (super::interrupt::CONTROL_INT_COUNT.load(Ordering::Relaxed) & 0xFFFF),
+    );
+    // Interrupts taken in message mode (0 on the INTx path): the one number that
+    // says whether MSI is actually delivering.
+    crate::diag::record_named_bytes(
+        b"MsiInts",
+        super::interrupt::MSI_INT_COUNT.load(Ordering::Relaxed),
     );
     crate::diag::record(0x0F0F_0000 | (DMA_NOTIFY_COUNT.load(Ordering::Relaxed) & 0xFFFF));
     crate::diag::record(0x0F10_0000 | (DMA_QUEUE_DPC_COUNT.load(Ordering::Relaxed) & 0xFFFF));
@@ -1366,6 +1548,9 @@ pub unsafe extern "C" fn dxgkddi_render(
             if !command.is_valid() {
                 return None;
             }
+            // `command.is_valid()` above refuses `value == 0` (an ECL record's
+            // value is the exact worker point DMA completion waits for), so the
+            // marker boundary's admission of value 0 does not reach this arm.
             let context = execution_context.as_ref()?;
             let adapter = context.adapter()?;
             let process = context.creator_process()?;
@@ -1453,10 +1638,11 @@ pub unsafe extern "C" fn dxgkddi_render(
             let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
             if let Some(adapter) = context.as_ref().and_then(|c| c.adapter()) {
                 let stream_marker = if take >= size_of::<helios_protocol::HeliosPresentRefreshCmd>()
-                    && command.present_ctx_id != 0
-                    && command.present_value != 0
-                    && command.present_cookie != 0
-                {
+                    && helios_kmd_logic::present_stream::tail_selects_boundary(
+                        command.present_ctx_id,
+                        command.present_value,
+                        command.present_cookie,
+                    ) {
                     context
                         .as_ref()
                         .and_then(|c| c.creator_process())
@@ -1604,10 +1790,11 @@ pub unsafe extern "C" fn dxgkddi_render(
                                     snapshot_memory_type_index
                                 );
                         let stream_marker = if take >= PRESENT_RENDER_STREAM_BYTES
-                            && private.present_ctx_id != 0
-                            && private.present_value != 0
-                            && private.present_cookie != 0
-                        {
+                            && helios_kmd_logic::present_stream::tail_selects_boundary(
+                                private.present_ctx_id,
+                                private.present_value,
+                                private.present_cookie,
+                            ) {
                             context.as_ref().and_then(|c| c.creator_process()).map(
                                 |creator_process| crate::adapter::PresentStreamMarker {
                                     ctx_id: private.present_ctx_id,

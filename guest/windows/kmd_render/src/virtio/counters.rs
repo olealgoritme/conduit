@@ -269,6 +269,130 @@ pub static ESCAPE_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// this subset is exactly the set of submits that carried
 /// `VIRTIO_GPU_FLAG_INFO_RING_IDX` onto the wire.
 pub static ESCAPE_SUBMIT_RING_COUNT: AtomicU32 = AtomicU32::new(0);
+/// `HELIOS_ESCAPE_SUBMIT_VENUS` and `HELIOS_ESCAPE_SUBMIT_VENUS_BATCH` escapes
+/// RECEIVED (accepted or refused), i.e. user→kernel transitions spent on
+/// submission. `EscSub / EscCalls` over a window is submits per escape; its rate
+/// is escapes/s. Published as `EscCalls`.
+pub static ESCAPE_SUBMIT_CALLS: AtomicU32 = AtomicU32::new(0);
+/// `HELIOS_ESCAPE_SUBMIT_VENUS_BATCH` escapes that carried at least one entry
+/// (`EscBat`), the entries they carried that the transport accepted
+/// (`EscBatEnt`, a subset of `EscSub`), and the largest entry count seen
+/// (`EscBatMax`).
+pub static ESCAPE_BATCH_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static ESCAPE_BATCH_ENTRIES: AtomicU32 = AtomicU32::new(0);
+pub static ESCAPE_BATCH_MAX: AtomicU32 = AtomicU32::new(0);
+
+/// Submission escapes attributed to the Venus context that sent them.
+///
+/// `EscSub`/`EscSubRing`/`EscCalls` are ADAPTER-GLOBAL: DWM's own ICD instance
+/// submits through the same escape and moves all of them, so a before/after of
+/// one application's environment switch cannot be read from them. Every ICD
+/// instance creates its own context and logs `CTX_CREATE OK ctx_id=N` in its
+/// diag log, so a per-context row is attributable to a process without any
+/// process-identity API. Published (occupied slots only) as `EscC<i>Id`,
+/// `EscC<i>Calls` (escapes), `EscC<i>Sub` (submits) and `EscC<i>R0` (the
+/// ring_idx 0 subset of those submits: ring wake-ups and roundtrips, which
+/// retire at host decode). `EscCOvf` counts escapes that found the table full.
+pub const ESC_CTX_SLOTS: usize = 32;
+
+pub struct EscCtxSlot {
+    ctx: AtomicU32,
+    calls: AtomicU32,
+    submits: AtomicU32,
+    ring0: AtomicU32,
+}
+
+impl EscCtxSlot {
+    const NEW: Self = Self {
+        ctx: AtomicU32::new(0),
+        calls: AtomicU32::new(0),
+        submits: AtomicU32::new(0),
+        ring0: AtomicU32::new(0),
+    };
+}
+
+pub static ESCAPE_CTX: [EscCtxSlot; ESC_CTX_SLOTS] = [EscCtxSlot::NEW; ESC_CTX_SLOTS];
+pub static ESCAPE_CTX_OVERFLOW: AtomicU32 = AtomicU32::new(0);
+
+/// Attribute `calls` escapes, `submits` accepted-or-attempted submits and
+/// `ring0` of them on ring 0 to `ctx_id`. DISPATCH-safe (atomics only).
+pub fn note_escape_ctx(ctx_id: u32, calls: u32, submits: u32, ring0: u32) {
+    if ctx_id == 0 {
+        return;
+    }
+    for slot in ESCAPE_CTX.iter() {
+        let mut cur = slot.ctx.load(Ordering::Relaxed);
+        if cur == 0 {
+            // Claim a free slot; a racing claimant of the same id is fine.
+            cur = match slot
+                .ctx
+                .compare_exchange(0, ctx_id, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => ctx_id,
+                Err(other) => other,
+            };
+        }
+        if cur == ctx_id {
+            slot.calls.fetch_add(calls, Ordering::Relaxed);
+            slot.submits.fetch_add(submits, Ordering::Relaxed);
+            slot.ring0.fetch_add(ring0, Ordering::Relaxed);
+            return;
+        }
+    }
+    ESCAPE_CTX_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `EscC<idx><suffix>` into `buf` (<= 14 bytes, the registry value-name limit of
+/// `record_named_bytes`). Writes through `get_mut`, so a name that did not fit
+/// would be cut short rather than fault.
+fn esc_row_name<'a>(buf: &'a mut [u8; 14], idx: usize, suffix: &[u8]) -> &'a [u8] {
+    let mut n = 0usize;
+    let mut put = |b: u8| {
+        if let Some(slot) = buf.get_mut(n) {
+            *slot = b;
+            n += 1;
+        }
+    };
+    for b in b"EscC" {
+        put(*b);
+    }
+    if idx >= 10 {
+        put(b'0' + ((idx / 10) % 10) as u8);
+    }
+    put(b'0' + (idx % 10) as u8);
+    for b in suffix {
+        put(*b);
+    }
+    buf.get(..n).unwrap_or(&[])
+}
+
+/// Mirror the per-context rows to the registry. PASSIVE only.
+pub fn publish_escape_ctx_counters() {
+    for (i, slot) in ESCAPE_CTX.iter().enumerate() {
+        let id = slot.ctx.load(Ordering::Relaxed);
+        if id == 0 {
+            continue;
+        }
+        let mut name = [0u8; 14];
+        crate::diag::record_named_bytes(esc_row_name(&mut name, i, b"Id"), id);
+        let mut name = [0u8; 14];
+        crate::diag::record_named_bytes(
+            esc_row_name(&mut name, i, b"Calls"),
+            slot.calls.load(Ordering::Relaxed),
+        );
+        let mut name = [0u8; 14];
+        crate::diag::record_named_bytes(
+            esc_row_name(&mut name, i, b"Sub"),
+            slot.submits.load(Ordering::Relaxed),
+        );
+        let mut name = [0u8; 14];
+        crate::diag::record_named_bytes(
+            esc_row_name(&mut name, i, b"R0"),
+            slot.ring0.load(Ordering::Relaxed),
+        );
+    }
+    crate::diag::record_named_bytes(b"EscCOvf", ESCAPE_CTX_OVERFLOW.load(Ordering::Relaxed));
+}
 /// Guest-supplied completion boundaries REPLACED by `next_wire_fence` because
 /// they were zero-or-beyond the fences this driver has actually assigned.
 ///
@@ -486,6 +610,14 @@ pub static PRESENT_BUFFER_SYNC_REJECTS: AtomicU32 = AtomicU32::new(0);
 /// submitted (`value > slot.submitted_value`), counted at
 /// `present_stream_marker_boundary` with no change to what it returns.
 pub static PRESENT_STREAM_MARKER_AHEAD: AtomicU32 = AtomicU32::new(0);
+/// Present markers that named a registered stream with `value == 0`: "already
+/// complete", a CPU-complete present (S3 of the DXVK-on-NVK plan). Counted at
+/// `present_stream_marker_boundary`, mirrored as `PsMkCpl`. Not a refusal and
+/// not a lookahead: the boundary it returns is ready as soon as its stream is
+/// live, so a count that moves with no `PsMkAhd` movement is the NVK path
+/// working, and a count that is zero on an NVK run means the UMD is not sending
+/// it (the present then falls back to the legacy current-wire watermark).
+pub static PRESENT_STREAM_MARKER_COMPLETE: AtomicU32 = AtomicU32::new(0);
 /// High-water of `value - submitted_value` (saturating —
 /// `helios_kmd_logic::present_stream::marker_lookahead`).
 ///

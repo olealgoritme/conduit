@@ -380,7 +380,10 @@ impl PresentSubmissionPrivate {
         // This private record carries only the opaque tagged stream namespace;
         // a legacy wire fence must stay in `gpu_fence_id` rather than being
         // reinterpreted as a stream handle.
-        if boundary >> 63 != 1 || ((boundary >> 32) & 0x7fff_ffff) == 0 || boundary as u32 == 0 {
+        // A value of 0 is valid: a CPU-complete present (the producer's point is
+        // already reached). The tag bit keeps the encoded boundary nonzero, so a
+        // zero `old` still means "none".
+        if boundary >> 63 != 1 || ((boundary >> 32) & 0x7fff_ffff) == 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let old =
@@ -432,7 +435,6 @@ impl PresentSubmissionPrivate {
         if token == 0
             || boundary >> 63 != 1
             || ((boundary >> 32) & 0x7fff_ffff) == 0
-            || boundary as u32 == 0
         {
             return Err(STATUS_INVALID_PARAMETER);
         }

@@ -17,6 +17,8 @@ pub(crate) mod cpu_host_aperture;
 pub(crate) mod create_allocation;
 pub(crate) mod display;
 mod escape;
+mod escape_foreign;
+mod escape_foreign_scanout;
 mod gpummu;
 pub(crate) mod hpd;
 pub(crate) mod interrupt;
@@ -82,7 +84,7 @@ pub use scheduler::{
     dxgkddi_submit_command_to_hw_queue, dxgkddi_switch_to_hw_context_list,
 };
 pub(crate) use submit_command::{
-    abandon_pending_submissions, record_present_handoff_telemetry, AbandonOutcome,
+    abandon_pending_submissions, publish_nvrm_counters, record_present_handoff_telemetry, AbandonOutcome,
     ABANDONED_FENCES, DMA_STALE_SKIP_COUNT,
 };
 pub use submit_command::{

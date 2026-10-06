@@ -58,6 +58,14 @@ What changed in `kmd_render/src/virtio`:
   `RESP_ERR_UNSPEC` in `drain_used`. Fences are unchanged: the same
   `VIRTIO_GPU_FLAG_FENCE` / `INFO_RING_IDX` commands complete out of order on
   the used ring.
+- **Event queue.** Virtqueue 1 carries buffers the KMD posts empty and the host
+  fills: `EventReady{handle}` (a bare 16-byte `MsgHeader`) for an RM backend
+  handle that became readable. The DPC drains it and `KeSetEvent`s the event a
+  process registered for that handle (`HELIOS_NVRM_OP_EVENT_REGISTER`,
+  `kmd_render/src/virtio/gpu/nvrm_events.rs`). Nothing else is read from the queue
+  (`InputEvent`, `DisplayMode` and clipboard messages are counted and dropped), and
+  no feature bit is acked for it: in particular never `NVGPU_CFG_TAKES_INPUT` (bit
+  12), which would move keyboard and mouse off the emulated devices.
 - **Region 3.** The host-visible blob window is shared memory region 3
   (`SHM_ID_VENUS`), found by `pci_caps::scan_host_visible_window`.
 - **Limit.** Submit streams larger than a 4 MiB `GpuCmd` are refused.

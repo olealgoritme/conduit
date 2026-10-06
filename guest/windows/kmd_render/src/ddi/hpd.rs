@@ -35,6 +35,10 @@ const START_COMPLETE_FALLBACK_100NS: i64 = -5_000_000; // 500 ms, relative
 /// wake source and this only covers a delayed device interrupt.
 const CTRL_INFLIGHT_POLL_100NS: i64 = -40_000; // 4 ms, relative
 
+/// How long the worker sleeps while an `Nv*` counter mirror is wanted but not yet
+/// due: the mirror's own minimum interval (`publish_gate::MIN_INTERVAL_100NS`).
+const NVRM_PUBLISH_RECHECK_100NS: i64 = -2_500_000; // 250 ms, relative
+
 /// Retry delay after a loud scanout-refresh enqueue failure. Also a real bound,
 /// not a stand-in: the failure has no wake source of its own.
 const REFRESH_RETRY_100NS: i64 = -160_000; // 16 ms, relative
@@ -182,7 +186,25 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             timeout.QuadPart = REFRESH_RETRY_100NS;
             &mut timeout
         } else {
-            core::ptr::null_mut()
+            // Two optional timed wakes can be wanted at once, and only ONE timeout
+            // is passed: take the earlier. A foreign scanout source wants a wake
+            // when it would lapse (a silent owner gives the desktop back with no
+            // other edge to do it); a not-yet-due `Nv*` registry mirror wants one
+            // in time to publish. Both are RELATIVE (negative) 100 ns units, so
+            // the earlier is the one closer to zero, i.e. the larger.
+            let foreign = adapter.foreign_scanout_wait_100ns();
+            let mirror = super::escape::nvrm_publish_pending().then_some(NVRM_PUBLISH_RECHECK_100NS);
+            let due = match (foreign, mirror) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            match due {
+                Some(d) => {
+                    timeout.QuadPart = d;
+                    &mut timeout
+                }
+                None => core::ptr::null_mut(),
+            }
         };
         // SAFETY: wait on the initialized event; NULL timeout means sleep until
         // config change, scanout dirty, completion, or StopDevice.
@@ -225,6 +247,10 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             indicate_child_status(adapter, true);
         }
 
+        // Expire a foreign scanout source whose owner stopped presenting (and ask
+        // for the desktop's restore flush, consumed by the refresh arm below).
+        adapter.foreign_scanout_service();
+
         // Consume only the allocation identity supplied by Windows through
         // SetVidPnSourceAddress. The DDI can be called at DIRQL, where neither
         // Venus waits nor registry diagnostics are legal; this worker is the
@@ -236,6 +262,11 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // and have its exact producer stream retire. This call merely consumes
         // those already-signalled edges; it never polls a producer.
         crate::ddi::display::service_windowed_blt(passive, adapter);
+
+        // The `Nv*` registry mirror the NVRM escapes asked for. It used to run
+        // inside the escape (about a millisecond added to every Open / Close /
+        // Map / Pin and to every 256th forward); here it costs nobody's latency.
+        super::escape::nvrm_publish_service();
 
         // Publish the unsampled scanout-bind trace. This is the ONE PASSIVE
         // site that mirrors it; accumulation happens at DIRQL/DISPATCH with

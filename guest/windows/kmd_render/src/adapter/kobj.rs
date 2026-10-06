@@ -126,6 +126,12 @@ impl AdapterContext {
         }
     }
 
+    /// Whether the HPD worker thread exists. It is absent in the render-only
+    /// configuration (`DisplayHalf=0`) and when its creation failed.
+    pub fn hpd_running(&self) -> bool {
+        self.hpd_thread.load(core::sync::atomic::Ordering::Acquire) != 0
+    }
+
     /// Wake the HPD worker to re-indicate connection (from the interrupt DPC at
     /// DISPATCH_LEVEL — KeSetEvent with Wait=FALSE is legal there).
     pub fn signal_hpd(&self) {

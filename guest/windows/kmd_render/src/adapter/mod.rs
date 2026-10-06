@@ -22,6 +22,7 @@ use crate::virtio::VirtioGpu;
 use helios_kmd_logic::DisplayMode;
 
 mod backing;
+pub(crate) mod foreign_scanout;
 pub(crate) mod kobj;
 mod locks;
 pub(crate) use locks::ControlSpaceWaiter;
@@ -515,12 +516,21 @@ pub struct AdapterContext {
     wddm_notify_lock: UnsafeCell<KSPIN_LOCK>,
     /// Mapped kernel VA of the virtio ISR-status register (read-to-clear), or 0
     /// until StartDevice wires it. `DxgkDdiInterruptRoutine` reads this at DIRQL to
-    /// acknowledge the level-triggered INTx line (the device is `MSISupported=0`);
+    /// acknowledge the level-triggered INTx line when PnP gave the device INTx (see `msi_state`);
     /// without it the line stays asserted → interrupt storm → Windows disables the
     /// adapter (Code 43). Set once in StartDevice, read lock-free in the ISR — an
     /// atomic (not behind `virtio_lock`) because the ISR runs at DIRQL and cannot
     /// take the spinlock.
     pub isr_status: AtomicUsize,
+    /// Message-mode state for the DIRQL ISR (`helios_kmd_logic::msi::isr_state`):
+    /// 0 = the device is on the INTx line and `isr_status` is the ISR's ack
+    /// register; nonzero = the device's MSI-X vectors were programmed, so the ISR
+    /// routes by message number and never reads the ISR-status register (there is
+    /// no shared line to acknowledge). Published by StartDevice with `Release`
+    /// BEFORE the transport goes live, cleared first thing in StopDevice, read
+    /// lock-free with `Acquire` in the ISR. An atomic for the same reason as
+    /// `isr_status`: DIRQL cannot take `virtio_lock`.
+    pub msi_state: AtomicU32,
     /// Serializes ALL access to `virtio` (the control virtqueue + the shared
     /// scratch page). Held by escape submissions at PASSIVE_LEVEL and, from M3.4,
     /// by the used-ring DPC at DISPATCH_LEVEL — a spinlock (not a mutex) is
@@ -1130,6 +1140,7 @@ impl AdapterContext {
             last_completed_fence: AtomicU32::new(0),
             wddm_notify_lock: UnsafeCell::new(0),
             isr_status: AtomicUsize::new(0),
+            msi_state: AtomicU32::new(0),
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
             // SAFETY: inert placeholder, initialized in place before publication.
@@ -1281,6 +1292,9 @@ impl AdapterContext {
         let was_programming = gate_active(self.vidpn_programming.load(Ordering::Acquire)) as u32;
         let was_resource = self.active_scanout_resource.load(Ordering::Acquire);
 
+        // A foreign scanout source names RM handles of the generation being
+        // abandoned; the display state below is rebuilt, so no restore is owed.
+        self.foreign_scanout_reset();
         self.vidpn_programming.store(0, Ordering::Release);
         self.pending_vidpn_allocation.store(0, Ordering::Release);
         for slot in &self.frame_watermark_resource {
@@ -1709,7 +1723,14 @@ impl Drop for AdapterContext {
         self.delete_vsync_ex_timer();
         self.stop_hpd();
         // The transport owns callbacks into producer status. Drop it before
-        // that page, including the RemoveDevice-without-StopDevice path.
+        // that page, including the RemoveDevice-without-StopDevice path. A
+        // transport still alive here is asked to close every RM handle first (the
+        // device reset in its Drop does not make the host drop them; a pinned page
+        // must not be unlocked while the host holds it). No views to mark: the
+        // table dies with this context.
+        // SAFETY: RemoveDevice, which drops the boxed context, is PASSIVE_LEVEL.
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        crate::virtio::nvrm::close_all_on_host(passive, self);
         self.set_virtio(None);
         // Free the contiguous paging-RAM segment. RemoveDevice (which drops the
         // boxed AdapterContext) runs at PASSIVE_LEVEL, where MmFreeContiguousMemory

@@ -32,13 +32,15 @@ use helios_protocol::{
     HeliosEscapeQueryScanout, HeliosEscapeQueryScanoutTimeline, HeliosEscapeQueryStats,
     HeliosEscapeQueryStatsV2, HeliosEscapeQueryStatsV3, HeliosEscapeQueryStatsV4,
     HeliosEscapeReleaseBlob, HeliosEscapeScanoutEvent, HeliosEscapeSubmitVenus,
-    HeliosEscapeWaitFence, HeliosEscapeWaitFenceLegacy, HELIOS_ESCAPE_ALLOC_BLOB,
+    HeliosEscapeSubmitVenusBatch, HeliosEscapeWaitFence, HeliosEscapeWaitFenceLegacy, HELIOS_ESCAPE_ALLOC_BLOB,
     HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY,
     HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_MAP_READ_LEDGER, HELIOS_ESCAPE_PRESENT_BUFFER_READ,
     HELIOS_ESCAPE_PRESENT_STREAM, HELIOS_ESCAPE_QUERY_SCANOUT,
     HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE, HELIOS_ESCAPE_QUERY_STATS,
     HELIOS_ESCAPE_REGISTER_FENCE_EVENT, HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SCANOUT_EVENT,
-    HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT, HELIOS_ESCAPE_WAIT_FENCE,
+    HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_SUBMIT_VENUS_BATCH,
+    HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT, HELIOS_ESCAPE_WAIT_FENCE,
+    HELIOS_SUBMIT_BATCH_MAX_ENTRIES, HeliosSubmitBatchEntry,
     HELIOS_FENCE_EVENT_ALREADY_COMPLETE, HELIOS_FENCE_EVENT_CANCELLED,
     HELIOS_FENCE_EVENT_NOT_FOUND, HELIOS_FENCE_EVENT_PROBE_ACK, HELIOS_FENCE_EVENT_REGISTERED,
     HELIOS_PRESENT_BUFFER_READ_ACCEPTED, HELIOS_PRESENT_BUFFER_READ_BUSY,
@@ -53,9 +55,27 @@ use helios_protocol::{
     HELIOS_SCANOUT_TIMELINE_OP_READ, HELIOS_SCANOUT_TIMELINE_TIME_100NS,
 };
 
+use helios_protocol::{
+    HeliosNvrmEvent, HeliosNvrmForward, HeliosNvrmHeader, HeliosNvrmMmap, HeliosNvrmMunmap,
+    HeliosNvrmPin, HeliosNvrmQueryCaps, HeliosNvrmUnpin, HELIOS_NVRM_EVENT_STATE_LATCHED_SIGNALED,
+    HELIOS_NVRM_EVENT_STATE_NOT_FOUND, HELIOS_NVRM_EVENT_STATE_REGISTERED,
+    HELIOS_NVRM_EVENT_STATE_REPLACED, HELIOS_NVRM_EVENT_STATE_UNREGISTERED,
+    HELIOS_NVRM_ST_TRANSPORT_RESET, HELIOS_NVRM_PIN_DEEP_BIT_DIRECT,
+    HELIOS_NVRM_PIN_DEEP_BIT_INDIRECT, HELIOS_NVRM_ST_PIN_IN_USE, HELIOS_NVRM_ST_TOO_SCATTERED,
+    HELIOS_ESCAPE_NVRM, HELIOS_NVRM_CACHE_DEFAULT, HELIOS_NVRM_CACHE_UC, HELIOS_NVRM_CACHE_WB,
+    HELIOS_NVRM_CACHE_WC, HELIOS_NVRM_PROT_READ, HELIOS_NVRM_PROT_WRITE,
+    HELIOS_NVRM_ABI_VERSION, HELIOS_NVRM_FORWARD_BYTES, HELIOS_NVRM_MAX_BUFFER,
+    HELIOS_NVRM_OP_EVENT_REGISTER, HELIOS_NVRM_OP_EVENT_UNREGISTER, HELIOS_NVRM_OP_FORWARD,
+    HELIOS_NVRM_OP_MMAP, HELIOS_NVRM_OP_MUNMAP, HELIOS_NVRM_OP_PIN, HELIOS_NVRM_OP_QUERY_CAPS,
+    HELIOS_NVRM_OP_UNPIN, HELIOS_NVRM_ST_BAD_RANGE, HELIOS_NVRM_ST_DEVICE_ERROR,
+    HELIOS_NVRM_ST_FORBIDDEN, HELIOS_NVRM_ST_MSG_TYPE_REFUSED, HELIOS_NVRM_ST_NOT_OWNED,
+    HELIOS_NVRM_ST_NO_RESOURCES, HELIOS_NVRM_ST_OK, HELIOS_NVRM_ST_TIMEOUT,
+    HELIOS_NVRM_ST_UNSUPPORTED,
+};
+
 use super::blob_map::{
-    effective_map_cache, map_cache_to_mm, map_io_pages_to_user, map_nonpaged_page_to_user_readonly,
-    unmap_io_pages_from_user,
+    effective_map_cache, map_cache_to_mm, map_io_pages_to_user, map_io_pages_to_user_prot,
+    map_nonpaged_page_to_user_readonly, unmap_io_pages_from_user,
 };
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
@@ -369,6 +389,14 @@ pub unsafe extern "C" fn dxgkddi_escape(
             Some(owner) => escape_submit_venus(passive, adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
+        HELIOS_ESCAPE_NVRM => match owner {
+            Some(owner) => escape_nvrm(passive, adapter, buf, &hdr, owner),
+            None => refuse_no_device(),
+        },
+        HELIOS_ESCAPE_SUBMIT_VENUS_BATCH => match owner {
+            Some(owner) => escape_submit_venus_batch(passive, adapter, buf, &hdr, owner),
+            None => refuse_no_device(),
+        },
         HELIOS_ESCAPE_PRESENT_STREAM => match owner {
             Some(owner) => {
                 // `hDevice` is the live DeviceContext whose documented
@@ -417,6 +445,12 @@ pub unsafe extern "C" fn dxgkddi_escape(
         },
         HELIOS_ESCAPE_SCANOUT_EVENT => match owner {
             Some(owner) => escape_scanout_event(adapter, buf, &hdr, owner),
+            None => refuse_no_device(),
+        },
+        helios_protocol::HELIOS_ESCAPE_FOREIGN_RESOURCE => match owner {
+            Some(owner) => {
+                super::escape_foreign::escape_foreign_resource(passive, adapter, buf, &hdr, owner)
+            }
             None => refuse_no_device(),
         },
         // Unknown verbs are rejected — and counted, because an unhandled verb is
@@ -1489,6 +1523,8 @@ fn escape_submit_venus(
         Err(st) => return st,
     };
     let req = wire.read();
+    ctrl::count_submit_escape();
+    crate::virtio::gpu::note_escape_ctx(req.ctx_id, 1, 1, u32::from(req.ring_idx == 0));
 
     // TRUST BOUNDARY, and THE ONE PLACE `hdr.size` MUST NOT BE THE BOUND.
     // SUBMIT_VENUS sets hdr.size = sizeof(HeliosEscapeSubmitVenus) = 40 while
@@ -1502,31 +1538,16 @@ fn escape_submit_venus(
         return STATUS_INVALID_PARAMETER;
     }
 
-    // `present_value32 == 0` is byte-for-byte legacy behavior: the incoming
-    // fence id remains ignored and the KMD assigns a normal wire fence.  A
-    // tagged submit reinterprets only the INPUT fence id as the registered
-    // stream capability; writeback below still returns that same normal fence.
-    let queued = if req.present_value32 == 0 {
-        ctrl::submit_venus_async(
-            passive,
-            adapter,
-            Some(owner),
-            req.ctx_id,
-            req.ring_idx,
-            &stream[..payload],
-        )
-    } else {
-        ctrl::submit_venus_async_present_stream(
-            passive,
-            adapter,
-            owner,
-            req.ctx_id,
-            req.ring_idx,
-            req.fence_id,
-            req.present_value32,
-            &stream[..payload],
-        )
-    };
+    let queued = submit_one(
+        passive,
+        adapter,
+        owner,
+        req.ctx_id,
+        req.ring_idx,
+        req.fence_id,
+        req.present_value32,
+        &stream[..payload],
+    );
     match queued {
         Ok(wire_fence) => {
             // Report the assigned wire fence id back (in/out escape buffer).
@@ -1537,6 +1558,899 @@ fn escape_submit_venus(
         }
         Err(crate::virtio::VirtioError::NotOwned) => refuse_foreign_context(),
         Err(ve) => ve.into(),
+    }
+}
+
+/// `STATUS_CANCELLED` (0xC0000120): a batch entry that was not submitted because an
+/// earlier entry of the same batch was refused.
+const STATUS_CANCELLED: NTSTATUS = 0xC000_0120_u32 as i32;
+
+/// One submission, shared by `HELIOS_ESCAPE_SUBMIT_VENUS` and every entry of
+/// `HELIOS_ESCAPE_SUBMIT_VENUS_BATCH`, so a batched submit takes exactly the path
+/// a single one does.
+///
+/// `present_value32 == 0` is byte-for-byte legacy behavior: the incoming fence id
+/// remains ignored and the KMD assigns a normal wire fence.  A tagged submit
+/// reinterprets only the INPUT fence id as the registered stream capability; the
+/// returned fence is still the normal wire fence.
+#[allow(clippy::too_many_arguments)]
+fn submit_one(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    ctx_id: u32,
+    ring_idx: u32,
+    fence_id: u64,
+    present_value32: u32,
+    stream: &[u8],
+) -> Result<u64, crate::virtio::VirtioError> {
+    if present_value32 == 0 {
+        ctrl::submit_venus_async(passive, adapter, Some(owner), ctx_id, ring_idx, stream)
+    } else {
+        ctrl::submit_venus_async_present_stream(
+            passive,
+            adapter,
+            owner,
+            ctx_id,
+            ring_idx,
+            fence_id,
+            present_value32,
+            stream,
+        )
+    }
+}
+
+/// `HELIOS_ESCAPE_SUBMIT_VENUS_BATCH` — N submissions, one escape. Each entry runs
+/// through [`submit_one`] in order, so fences and ordering are those of N single
+/// escapes; see the verb's docs in `helios_protocol::escape` for the layout and
+/// the failure rule.
+fn escape_submit_venus_batch(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+) -> NTSTATUS {
+    use crate::virtio::gpu::{ESCAPE_BATCH_COUNT, ESCAPE_BATCH_ENTRIES, ESCAPE_BATCH_MAX};
+    let mut wire = match EscapeBuf::<HeliosEscapeSubmitVenusBatch>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let head = wire.read();
+    if head.flags != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Capability probe: an up-to-date KMD acknowledges and does nothing. It is
+    // not a submission, so it is not counted in `EscCalls`.
+    if head.count == 0 {
+        return STATUS_SUCCESS;
+    }
+    if head.count > HELIOS_SUBMIT_BATCH_MAX_ENTRIES {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ctrl::count_submit_escape();
+    let count = head.count as usize;
+    let entry_size = size_of::<HeliosSubmitBatchEntry>();
+    let tail = wire.trailing_mut();
+    // `count` is at most 64, so this cannot overflow.
+    let table_len = count * entry_size;
+    if tail.len() < table_len {
+        return refuse_short_buffer();
+    }
+    let (table, streams) = tail.split_at_mut(table_len);
+
+    // Validate EVERYTHING before submitting anything: a malformed batch must not
+    // leave a prefix of it queued.
+    let mut total = 0usize;
+    for i in 0..count {
+        let e: HeliosSubmitBatchEntry =
+            pod_read_unaligned(&table[i * entry_size..(i + 1) * entry_size]);
+        if e.buffer_size == 0 || e.reserved != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        total = match total.checked_add(e.buffer_size as usize) {
+            Some(t) if t <= streams.len() => t,
+            _ => return STATUS_INVALID_PARAMETER,
+        };
+    }
+
+    let mut offset = 0usize;
+    let mut accepted = 0u32;
+    let mut failed = false;
+    // One escape, attributed to the first entry's context; each entry's submit
+    // (and its ring) to its own.
+    let first: HeliosSubmitBatchEntry = pod_read_unaligned(&table[..entry_size]);
+    crate::virtio::gpu::note_escape_ctx(first.ctx_id, 1, 0, 0);
+    for i in 0..count {
+        let slot = i * entry_size..(i + 1) * entry_size;
+        let mut e: HeliosSubmitBatchEntry = pod_read_unaligned(&table[slot.clone()]);
+        let len = e.buffer_size as usize;
+        if failed {
+            // Nothing of this entry was submitted.
+            e.out_status = STATUS_CANCELLED;
+            table[slot].copy_from_slice(bytes_of(&e));
+            offset += len;
+            continue;
+        }
+        // In range by the validation pass above; checked again because this pass
+        // re-reads the entry from the caller's buffer.
+        let Some(stream) = offset
+            .checked_add(len)
+            .and_then(|end| streams.get(offset..end))
+        else {
+            e.out_status = STATUS_INVALID_PARAMETER;
+            failed = true;
+            table[slot].copy_from_slice(bytes_of(&e));
+            continue;
+        };
+        crate::virtio::gpu::note_escape_ctx(e.ctx_id, 0, 1, u32::from(e.ring_idx == 0));
+        let queued = submit_one(
+            passive,
+            adapter,
+            owner,
+            e.ctx_id,
+            e.ring_idx,
+            e.fence_id,
+            e.present_value32,
+            stream,
+        );
+        offset += len;
+        match queued {
+            Ok(wire_fence) => {
+                e.fence_id = wire_fence;
+                e.out_status = 0;
+                accepted += 1;
+            }
+            Err(crate::virtio::VirtioError::NotOwned) => {
+                e.out_status = refuse_foreign_context();
+                failed = true;
+            }
+            Err(ve) => {
+                let st: NTSTATUS = ve.into();
+                e.out_status = st;
+                failed = true;
+            }
+        }
+        table[slot].copy_from_slice(bytes_of(&e));
+    }
+    ESCAPE_BATCH_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    ESCAPE_BATCH_ENTRIES.fetch_add(accepted, core::sync::atomic::Ordering::Relaxed);
+    ESCAPE_BATCH_MAX.fetch_max(head.count, core::sync::atomic::Ordering::Relaxed);
+    STATUS_SUCCESS
+}
+
+/// Default `FORWARD` wait when `timeout_ms == 0`. RM calls can legitimately run
+/// for seconds (first-time init, large allocations).
+const NVRM_DEFAULT_TIMEOUT_MS: u32 = 30_000;
+/// The operations this build implements, as a bitmask over the op value.
+const NVRM_OPS_IMPLEMENTED: u64 = (1 << HELIOS_NVRM_OP_QUERY_CAPS)
+    | (1 << HELIOS_NVRM_OP_FORWARD)
+    | (1 << HELIOS_NVRM_OP_MMAP)
+    | (1 << HELIOS_NVRM_OP_MUNMAP)
+    | (1 << HELIOS_NVRM_OP_PIN)
+    | (1 << HELIOS_NVRM_OP_UNPIN);
+/// The event ops, reported (`QUERY_CAPS.supported_ops`) only while events are
+/// usable on this device; see `virtio::gpu::nvrm_events`.
+const NVRM_EVENT_OPS: u64 =
+    (1 << HELIOS_NVRM_OP_EVENT_REGISTER) | (1 << HELIOS_NVRM_OP_EVENT_UNREGISTER);
+/// Cache types `MMAP` provides, as a bitmask over `HELIOS_NVRM_CACHE_*`.
+const NVRM_CACHE_TYPES: u32 = (1 << HELIOS_NVRM_CACHE_DEFAULT)
+    | (1 << HELIOS_NVRM_CACHE_UC)
+    | (1 << HELIOS_NVRM_CACHE_WC)
+    | (1 << HELIOS_NVRM_CACHE_WB);
+
+/// Write the common header back (status + epoch) over a buffer whose first 40
+/// bytes are a `HeliosNvrmHeader`.
+fn nvrm_finish(buf: &mut [u8], mut head: HeliosNvrmHeader, status: i32, epoch: u64) -> NTSTATUS {
+    head.status = status;
+    head.epoch = epoch;
+    match buf.get_mut(..size_of::<HeliosNvrmHeader>()) {
+        Some(dst) => {
+            dst.copy_from_slice(bytes_of(&head));
+            STATUS_SUCCESS
+        }
+        None => refuse_short_buffer(),
+    }
+}
+
+/// `HELIOS_ESCAPE_NVRM` — the RM forwarding escape (`helios_protocol::nvrm`).
+///
+/// NTSTATUS is the transport verdict: a malformed request fails with a status
+/// and the buffer is not written. A well-formed request returns SUCCESS and the
+/// KMD's own verdict in `HeliosNvrmHeader.status`; the RM's answer travels in the
+/// forwarded reply bytes and is never interpreted here.
+fn escape_nvrm(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+) -> NTSTATUS {
+    // First, in the owner's own process: unmap the views it still holds of a
+    // transport that was stopped (the one thing `StopDevice` could not do for it).
+    // One atomic load when there are none.
+    crate::virtio::nvrm::reclaim_stale_views(passive, adapter, owner);
+    let st = escape_nvrm_op(passive, adapter, buf, hdr, owner);
+    nvrm_publish_counters_if_due(adapter);
+    // No HPD worker (render-only `DisplayHalf=0`, or its creation failed): nobody
+    // else would ever run the mirror, so do it here. Still rate limited by the
+    // same gate, and one load when nothing is wanted.
+    if !adapter.hpd_running() {
+        nvrm_publish_service();
+    }
+    st
+}
+
+/// Set while the `Nv*` registry mirror is wanted and not yet done. The escape
+/// path only ever sets it (and wakes the HPD worker); the worker clears it.
+static NVRM_PUBLISH_WANTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// What the last mirror covered: the session shape, the 256-call bucket, and
+/// when (interrupt time, 100 ns; 0 = never).
+static NVRM_LAST_SHAPE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static NVRM_LAST_BUCKET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static NVRM_LAST_PUBLISH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(shape, calls)`: a hash of the session-shaping counts (open / close / map /
+/// pin / event registration) and the forwards seen. Plain loads.
+fn nvrm_shape_and_calls() -> (u32, u32) {
+    use crate::virtio::nvrm as n;
+    use core::sync::atomic::Ordering;
+    let shape = [
+        &n::NVRM_OPENS,
+        &n::NVRM_CLOSES,
+        &n::NVRM_MAPS,
+        &n::NVRM_PINS,
+        &n::NVRM_UNPINS,
+        &n::NVRM_EV_REGS,
+        &n::NVRM_EV_UNREGS,
+        &n::NVRM_FENCES,
+        &n::NVRM_FENCES_CLOSED,
+    ]
+    .iter()
+        .fold(0u32, |a, c| a.wrapping_mul(31).wrapping_add(c.load(Ordering::Relaxed)));
+    let calls = n::NVRM_IOCTLS
+        .load(Ordering::Relaxed)
+        .wrapping_add(n::NVRM_OTHER.load(Ordering::Relaxed));
+    (shape, calls)
+}
+
+/// Ask for the `Nv*` registry mirror when a session-shaping count moved (open /
+/// close / map / pin / event registration) or the forward count crossed a 256
+/// bucket. The escape path does NOTHING slower than atomic loads, plus one
+/// atomic swap and one `KeSetEvent` per request: the mirror itself (~40
+/// synchronous registry writes, about a millisecond) used to run right here, in
+/// the latency of every Open / Close / Map / Pin and of every 256th forward. It
+/// now runs on the HPD worker ([`nvrm_publish_service`]), which is a PASSIVE
+/// system thread that lives for the whole device lifetime, and is also driven by
+/// the present edge and by StopDevice. A request is dropped while one is
+/// outstanding, so a storm of pin / unpin raises one wake, not one per call.
+fn nvrm_publish_counters_if_due(adapter: &AdapterContext) {
+    use core::sync::atomic::Ordering;
+    use helios_kmd_logic::nvrm_fastpath::publish_gate as gate;
+    let (shape, calls) = nvrm_shape_and_calls();
+    if !gate::candidate(
+        shape,
+        NVRM_LAST_SHAPE.load(Ordering::Relaxed),
+        calls,
+        NVRM_LAST_BUCKET.load(Ordering::Relaxed),
+    ) {
+        return;
+    }
+    if NVRM_PUBLISH_WANTED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    if NVRM_PUBLISH_WANTED.swap(1, Ordering::AcqRel) == 0 {
+        // A SynchronizationEvent the worker already treats as "something to look
+        // at"; a wake it has nothing to do for costs it one pass of its loop.
+        adapter.signal_hpd();
+    }
+}
+
+/// Whether a mirror was asked for and has not happened yet. The HPD worker
+/// bounds its sleep while this holds, so the trailing state of a burst is
+/// published even if no further escape arrives.
+pub(super) fn nvrm_publish_pending() -> bool {
+    NVRM_PUBLISH_WANTED.load(core::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// The HPD worker's half: do the mirror if one was asked for and at least 250 ms
+/// passed since the last (`helios_kmd_logic::nvrm_fastpath::publish_gate`). PASSIVE.
+/// Cheap (one load) when nothing was asked.
+pub(super) fn nvrm_publish_service() {
+    use core::sync::atomic::Ordering;
+    use helios_kmd_logic::nvrm_fastpath::publish_gate as gate;
+    if NVRM_PUBLISH_WANTED.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut qpc = 0u64;
+    // SAFETY: a scalar time read, callable at any IRQL; it waits on nothing and
+    // fills the valid out-pointer.
+    let now = unsafe { wdk_sys::ntddk::KeQueryInterruptTimePrecise(&mut qpc) };
+    if !gate::interval_elapsed(now, NVRM_LAST_PUBLISH.load(Ordering::Relaxed)) {
+        // Still wanted: the worker sleeps at most one interval while it is.
+        return;
+    }
+    // Memo first, flag second, mirror last: a count that moves from here on
+    // makes the next escape a candidate again, and its request is not lost.
+    let (shape, calls) = nvrm_shape_and_calls();
+    NVRM_LAST_SHAPE.store(shape, Ordering::Relaxed);
+    NVRM_LAST_BUCKET.store(gate::bucket(calls), Ordering::Relaxed);
+    NVRM_LAST_PUBLISH.store(now, Ordering::Relaxed);
+    NVRM_PUBLISH_WANTED.store(0, Ordering::Release);
+    crate::ddi::publish_nvrm_counters();
+}
+
+fn escape_nvrm_op(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+) -> NTSTATUS {
+    let head_size = size_of::<HeliosNvrmHeader>();
+    if buf.len() < head_size || (hdr.size as usize) < head_size {
+        return refuse_short_buffer();
+    }
+    if buf.len() > HELIOS_NVRM_MAX_BUFFER as usize {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let head: HeliosNvrmHeader = pod_read_unaligned(&buf[..head_size]);
+    if head.abi_version != HELIOS_NVRM_ABI_VERSION || head.reserved != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // 0 when the transport is down: QUERY_CAPS still answers (it touches no
+    // device state), and every other op then fails as the transport does.
+    // FORWARD samples it itself, inside a lock hold it needs anyway (the hot
+    // path takes one lock fewer); the value here is unused for it.
+    let epoch = if head.op == HELIOS_NVRM_OP_FORWARD {
+        0
+    } else {
+        adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0)
+    };
+
+    match head.op {
+        HELIOS_NVRM_OP_QUERY_CAPS => {
+            let mut wire = match EscapeBuf::<HeliosNvrmQueryCaps>::new(buf, hdr) {
+                Ok(w) => w,
+                Err(st) => return st,
+            };
+            let mut caps = wire.read();
+            caps.max_buffer_bytes = HELIOS_NVRM_MAX_BUFFER;
+            caps.default_timeout_ms = NVRM_DEFAULT_TIMEOUT_MS;
+            // Events exist only while the KMD's event queue is up and the transport is
+            // up; the transport being down is not an error for QUERY_CAPS.
+            let (event_kinds, device_features) = adapter
+                .with_virtio(|v| (v.nvrm_event_kinds(), v.nvrm_device_features()))
+                .unwrap_or((0, 0));
+            caps.supported_ops = NVRM_OPS_IMPLEMENTED
+                | helios_protocol::HELIOS_NVRM_SCANOUT_OPS
+                | if event_kinds != 0 { NVRM_EVENT_OPS } else { 0 };
+            caps.supported_event_kinds = event_kinds;
+            caps.supported_cache_types = NVRM_CACHE_TYPES;
+            caps.device_features = device_features;
+            caps.max_handles = crate::virtio::gpu::MAX_NVRM_HANDLES_PER_OWNER as u32;
+            caps.max_mappings = crate::virtio::gpu::MAX_NVRM_MAPS_PER_OWNER as u32;
+            caps.max_pins = crate::virtio::gpu::MAX_NVRM_PINS_PER_OWNER as u32;
+            caps.max_pin_pages = crate::virtio::gpu::MAX_NVRM_PIN_PAGES as u32;
+            caps.pin_deep_kinds = HELIOS_NVRM_PIN_DEEP_BIT_DIRECT | HELIOS_NVRM_PIN_DEEP_BIT_INDIRECT;
+            caps.head.status = HELIOS_NVRM_ST_OK;
+            caps.head.epoch = epoch;
+            wire.write_back(&caps);
+            STATUS_SUCCESS
+        }
+        HELIOS_NVRM_OP_FORWARD => nvrm_forward(passive, adapter, buf, hdr, owner, head),
+        // Valid in the ABI, not implemented by this KMD build: QUERY_CAPS says so.
+        HELIOS_NVRM_OP_MMAP => nvrm_mmap(passive, adapter, buf, hdr, owner, epoch),
+        HELIOS_NVRM_OP_MUNMAP => nvrm_munmap(passive, adapter, buf, hdr, owner, epoch),
+        HELIOS_NVRM_OP_PIN => nvrm_pin(passive, adapter, buf, hdr, owner, epoch),
+        HELIOS_NVRM_OP_UNPIN => nvrm_unpin(adapter, buf, hdr, owner, epoch),
+        HELIOS_NVRM_OP_EVENT_REGISTER => nvrm_event_register(adapter, buf, hdr, owner, epoch),
+        HELIOS_NVRM_OP_EVENT_UNREGISTER => nvrm_event_unregister(adapter, buf, hdr, owner, epoch),
+        // Foreign scanout source (own scanout 0, present GEM objects to it).
+        helios_protocol::HELIOS_NVRM_OP_SCANOUT_SET
+        | helios_protocol::HELIOS_NVRM_OP_SCANOUT_PRESENT
+        | helios_protocol::HELIOS_NVRM_OP_SCANOUT_RELEASE => {
+            super::escape_foreign_scanout::escape_scanout_op(
+                passive, adapter, buf, hdr, owner, head.op, epoch,
+            )
+        }
+        _ => STATUS_INVALID_PARAMETER,
+    }
+}
+
+/// `HELIOS_NVRM_OP_EVENT_REGISTER`: tie the caller's event to `(handle, kind)`, so
+/// the host's `EventReady` for the handle (or the loss of the transport) signals
+/// it. PASSIVE, in the caller's process: the event handle is resolved in ITS
+/// handle table. The contract is `helios_protocol::nvrm::HeliosNvrmEvent`.
+fn nvrm_event_register(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    epoch: u64,
+) -> NTSTATUS {
+    use crate::virtio::gpu::NvrmEventsState;
+    use crate::virtio::nvrm::{self, EventRefusal, EventState};
+    use core::sync::atomic::Ordering;
+    let mut wire = match EscapeBuf::<HeliosNvrmEvent>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut e = wire.read();
+    e.head.epoch = epoch;
+    e.out_state = 0;
+    if e.flags != 0 || e.kind == 0 || e.event_handle == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Availability is checked before the handle is touched, so an unsupported
+    // device costs no object reference. No transport at all is the escape-level verdict.
+    let state = match adapter.with_virtio(|v| v.nvrm_events_state()) {
+        Ok(s) => s,
+        Err(_) => return STATUS_DEVICE_NOT_READY,
+    };
+    // These refusals are counted here; `register_event` counts its own.
+    match state {
+        NvrmEventsState::Unavailable | NvrmEventsState::Lost => {
+            crate::virtio::nvrm::NVRM_EV_REFUSED.fetch_add(1, Ordering::Relaxed);
+            let st = if state == NvrmEventsState::Lost {
+                HELIOS_NVRM_ST_TRANSPORT_RESET
+            } else {
+                HELIOS_NVRM_ST_UNSUPPORTED
+            };
+            return nvrm_event_answer(&mut wire, &mut e, st);
+        }
+        NvrmEventsState::Ready => {}
+    }
+    // A kind this build does not know is valid in the ABI but not provided.
+    if !helios_kmd_logic::nvrm_events::kind_known(e.kind) {
+        crate::virtio::nvrm::NVRM_EV_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_UNSUPPORTED);
+    }
+    let Some(event) = reference_user_event(e.event_handle) else {
+        crate::virtio::nvrm::NVRM_EV_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    };
+    // `register_event` takes over `event`'s reference whatever the outcome.
+    match nvrm::register_event(adapter, owner, e.handle, e.kind, event) {
+        Ok(st) => {
+            e.out_state = match st {
+                EventState::Registered => HELIOS_NVRM_EVENT_STATE_REGISTERED,
+                EventState::Replaced => HELIOS_NVRM_EVENT_STATE_REPLACED,
+                EventState::LatchedSignaled => HELIOS_NVRM_EVENT_STATE_LATCHED_SIGNALED,
+            };
+            nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_OK)
+        }
+        Err(EventRefusal::NoTransport) => STATUS_DEVICE_NOT_READY,
+        Err(EventRefusal::Unsupported) => {
+            nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_UNSUPPORTED)
+        }
+        Err(EventRefusal::TransportLost) => {
+            nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_TRANSPORT_RESET)
+        }
+        Err(EventRefusal::NotOwned) => {
+            nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_NOT_OWNED)
+        }
+        Err(EventRefusal::NoResources) => {
+            nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_NO_RESOURCES)
+        }
+    }
+}
+
+/// Write an event op's reply with the KMD verdict `status`.
+fn nvrm_event_answer(
+    wire: &mut EscapeBuf<'_, HeliosNvrmEvent>,
+    e: &mut HeliosNvrmEvent,
+    status: i32,
+) -> NTSTATUS {
+    e.head.status = status;
+    wire.write_back(e);
+    STATUS_SUCCESS
+}
+
+/// `HELIOS_NVRM_OP_EVENT_UNREGISTER`: remove the registration `(handle, kind)` of
+/// the calling process. Not gated: without events there is nothing to find.
+fn nvrm_event_unregister(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    epoch: u64,
+) -> NTSTATUS {
+    use crate::virtio::nvrm;
+    let mut wire = match EscapeBuf::<HeliosNvrmEvent>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut e = wire.read();
+    e.head.epoch = epoch;
+    e.out_state = 0;
+    if e.flags != 0 || e.kind == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let removed = if helios_kmd_logic::nvrm_events::kind_known(e.kind) {
+        match nvrm::unregister_event(adapter, owner, e.handle, e.kind) {
+            Some(removed) => removed,
+            None => return STATUS_DEVICE_NOT_READY,
+        }
+    } else {
+        false
+    };
+    e.out_state = if removed {
+        HELIOS_NVRM_EVENT_STATE_UNREGISTERED
+    } else {
+        HELIOS_NVRM_EVENT_STATE_NOT_FOUND
+    };
+    nvrm_event_answer(&mut wire, &mut e, HELIOS_NVRM_ST_OK)
+}
+
+/// `HELIOS_NVRM_OP_MMAP`: ask the host to `Mmap`, then map the returned range of
+/// the RM window (or the UVM aperture) into the calling process. The mapping
+/// lives in `AdapterContext::mappings` under `nvrm::map_key(kmd_id)`, where
+/// `kmd_id` is OURS (the host's mapping ids are not unique: the RM path answers 0
+/// for every one), so the device teardown that already unmaps blob views unmaps
+/// these too; the host's side is released by `Close`, `MUNMAP` or
+/// `nvrm::close_all_for_owner`.
+fn nvrm_mmap(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    epoch: u64,
+) -> NTSTATUS {
+    use crate::virtio::nvrm::{self, MapRefusal};
+    let mut wire = match EscapeBuf::<HeliosNvrmMmap>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut m = wire.read();
+    // Reports a verdict: STATUS_SUCCESS with the KMD's status in the header.
+    // `flags` carries the host's errno (positive) when the host refused.
+    let mut finish = |m: &mut HeliosNvrmMmap, status: i32, host_errno: i32| {
+        m.head.status = status;
+        m.head.epoch = epoch;
+        m.flags = if host_errno > 0 { host_errno as u32 } else { 0 };
+        wire.write_back(m);
+        STATUS_SUCCESS
+    };
+
+    if m.flags != 0
+        || m.prot == 0
+        || m.prot & !(HELIOS_NVRM_PROT_READ | HELIOS_NVRM_PROT_WRITE) != 0
+        || m.cache_request > HELIOS_NVRM_CACHE_WB
+    {
+        return finish(&mut m, HELIOS_NVRM_ST_UNSUPPORTED, 0);
+    }
+    let write = m.prot & HELIOS_NVRM_PROT_WRITE != 0;
+    let host = match nvrm::host_mmap(passive, adapter, owner, m.handle, write, m.offset, m.size) {
+        Ok(h) => h,
+        Err(r) => {
+            crate::virtio::nvrm::NVRM_MAP_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return match r {
+                MapRefusal::NotOwned => finish(&mut m, HELIOS_NVRM_ST_NOT_OWNED, 0),
+                MapRefusal::BadRange => finish(&mut m, HELIOS_NVRM_ST_BAD_RANGE, 0),
+                MapRefusal::NoResources => finish(&mut m, HELIOS_NVRM_ST_NO_RESOURCES, 0),
+                MapRefusal::Host(errno) => finish(&mut m, HELIOS_NVRM_ST_DEVICE_ERROR, errno),
+                MapRefusal::Transport(crate::virtio::VirtioError::Timeout) => {
+                    finish(&mut m, HELIOS_NVRM_ST_TIMEOUT, 0)
+                }
+                MapRefusal::Transport(_) => finish(&mut m, HELIOS_NVRM_ST_DEVICE_ERROR, 0),
+            };
+        }
+    };
+
+    // From here the host holds a mapping: every failure releases it (unless a
+    // live mapping still carries the same nonzero host id, or the id is 0 and RM
+    // releases it itself — `release_host_map` knows both).
+    let handle = m.handle;
+    let undo = |status: i32| {
+        let _ = nvrm::release_host_map(passive, adapter, handle, host.host_id);
+        status
+    };
+    let region = nvrm::region_for(adapter, host.device_type);
+    let in_range = |r: &crate::virtio::pci_caps::HostVisibleWindow| {
+        host.offset % 4096 == 0
+            && host.size >= m.size
+            && host
+                .offset
+                .checked_add(m.size)
+                .is_some_and(|end| end <= r.len)
+    };
+    let Some(region) = region.filter(|r| in_range(r)) else {
+        let status = undo(if region.is_none() {
+            HELIOS_NVRM_ST_UNSUPPORTED
+        } else {
+            HELIOS_NVRM_ST_BAD_RANGE
+        });
+        crate::virtio::nvrm::NVRM_MAP_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return finish(&mut m, status, 0);
+    };
+
+    // UVM memory is the host kernel's ordinary RAM, coherent with the GPU:
+    // write-back. Everything else (UVM tools included) defaults to write-combined,
+    // as the Linux module maps it. An explicit request is honoured for non-UVM.
+    let uvm = host.device_type == 256;
+    let effective = if uvm {
+        HELIOS_NVRM_CACHE_WB
+    } else if m.cache_request == HELIOS_NVRM_CACHE_DEFAULT {
+        HELIOS_NVRM_CACHE_WC
+    } else {
+        m.cache_request
+    };
+    let cache = match effective {
+        HELIOS_NVRM_CACHE_UC => wdk_sys::_MEMORY_CACHING_TYPE::MmNonCached,
+        HELIOS_NVRM_CACHE_WB => wdk_sys::_MEMORY_CACHING_TYPE::MmCached,
+        _ => wdk_sys::_MEMORY_CACHING_TYPE::MmWriteCombined,
+    };
+    // SAFETY: PASSIVE_LEVEL escape in the caller's process, no lock held;
+    // `region.base + host.offset .. + m.size` was just checked to lie inside the
+    // region's BAR range, and is page aligned.
+    let mapped =
+        unsafe { map_io_pages_to_user_prot(region.base + host.offset, m.size, cache, !write) };
+    let Some((user_va, mdl)) = mapped else {
+        crate::virtio::gpu::MAP_PAGES_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::virtio::nvrm::NVRM_MAP_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let status = undo(HELIOS_NVRM_ST_NO_RESOURCES);
+        return finish(&mut m, status, 0);
+    };
+
+    // Track it and mint its id under one lock hold, which also re-checks that the
+    // handle is still ours (a concurrent Close may have forgotten it).
+    let kmd_id = adapter
+        .with_virtio(|v| v.push_nvrm_map(owner, m.handle, host.host_id))
+        .ok()
+        .flatten();
+    let inserted = kmd_id.is_some_and(|id| {
+        matches!(
+            adapter
+                .mappings
+                .insert_unique(owner.raw(), nvrm::map_key(id), user_va, mdl as usize),
+            crate::mapping::InsertResult::Inserted
+        )
+    });
+    let Some(kmd_id) = kmd_id.filter(|_| inserted) else {
+        if let Some(id) = kmd_id {
+            // The slot was made but the view could not be recorded: take both back.
+            let _ = adapter.with_virtio(|v| v.take_nvrm_map(owner, id));
+        }
+        // SAFETY: still in the owning process at PASSIVE; the pair is the one
+        // `map_io_pages_to_user_prot` returned and is not in any table now.
+        unsafe { unmap_io_pages_from_user(user_va, mdl) };
+        crate::virtio::nvrm::NVRM_MAP_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let status = undo(HELIOS_NVRM_ST_NO_RESOURCES);
+        return finish(&mut m, status, 0);
+    };
+
+    crate::virtio::nvrm::NVRM_MAPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    m.out_user_va = user_va;
+    m.out_mapping_id = kmd_id;
+    m.cache_effective = effective;
+    finish(&mut m, HELIOS_NVRM_ST_OK, 0)
+}
+
+/// `HELIOS_NVRM_OP_MUNMAP`: drop one of the caller's mappings, then tell the host.
+fn nvrm_munmap(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    epoch: u64,
+) -> NTSTATUS {
+    use crate::virtio::nvrm;
+    let mut wire = match EscapeBuf::<HeliosNvrmMunmap>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut u = wire.read();
+    u.head.epoch = epoch;
+    if u.flags != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let slot = adapter
+        .with_virtio(|v| v.take_nvrm_map(owner, u.mapping_id))
+        .ok()
+        .flatten();
+    let Some((handle, host_id)) = slot else {
+        u.head.status = HELIOS_NVRM_ST_NOT_OWNED;
+        wire.write_back(&u);
+        return STATUS_SUCCESS;
+    };
+    if let Some((va, mdl)) = adapter
+        .mappings
+        .take_for_resource(owner.raw(), nvrm::map_key(u.mapping_id))
+    {
+        // SAFETY: PASSIVE, in the process that mapped it (an escape from the
+        // same device handle); the pair came from `map_io_pages_to_user_prot` and
+        // was removed from the table just now.
+        unsafe { unmap_io_pages_from_user(va, mdl as *mut wdk_sys::MDL) };
+    }
+    u.head.status = match nvrm::release_host_map(passive, adapter, handle, host_id) {
+        Ok(()) => HELIOS_NVRM_ST_OK,
+        Err(crate::virtio::VirtioError::Timeout) => HELIOS_NVRM_ST_TIMEOUT,
+        Err(_) => HELIOS_NVRM_ST_DEVICE_ERROR,
+    };
+    wire.write_back(&u);
+    STATUS_SUCCESS
+}
+
+/// `HELIOS_NVRM_OP_PIN`: lock a range of the caller's memory for an OS-descriptor
+/// registration and return the id the registration `FORWARD` names. The page-run
+/// table stays in the KMD (user mode never supplies or sees a physical address).
+fn nvrm_pin(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    epoch: u64,
+) -> NTSTATUS {
+    use crate::virtio::nvrm::{self, PinRefusal};
+    let mut wire = match EscapeBuf::<HeliosNvrmPin>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut p = wire.read();
+    p.head.epoch = epoch;
+    if p.flags != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    p.out_pin_id = 0;
+    p.out_npages = 0;
+    p.head.status = match nvrm::pin_pages(
+        passive,
+        adapter,
+        owner,
+        p.handle,
+        p.user_va,
+        p.length,
+        p.h_root,
+        p.h_object,
+    ) {
+        Ok(out) => {
+            p.out_pin_id = out.id;
+            p.out_npages = out.npages;
+            HELIOS_NVRM_ST_OK
+        }
+        Err(PinRefusal::NotOwned) => HELIOS_NVRM_ST_NOT_OWNED,
+        Err(PinRefusal::BadRange) => HELIOS_NVRM_ST_BAD_RANGE,
+        Err(PinRefusal::NoResources) => HELIOS_NVRM_ST_NO_RESOURCES,
+        Err(PinRefusal::TooScattered) => HELIOS_NVRM_ST_TOO_SCATTERED,
+    };
+    wire.write_back(&p);
+    STATUS_SUCCESS
+}
+
+/// `HELIOS_NVRM_OP_UNPIN`: release a pin no registration has used (a failure path
+/// in the caller). A used pin is the KMD's to release.
+fn nvrm_unpin(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    epoch: u64,
+) -> NTSTATUS {
+    use crate::virtio::gpu::PinTake;
+    let mut wire = match EscapeBuf::<HeliosNvrmUnpin>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut u = wire.read();
+    u.head.epoch = epoch;
+    if u.flags != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    u.head.status = match adapter.with_virtio(|v| v.take_nvrm_unused_pin(owner, u.pin_id)) {
+        Ok(PinTake::Taken(pin)) => {
+            crate::virtio::nvrm::release_pin(pin);
+            HELIOS_NVRM_ST_OK
+        }
+        Ok(PinTake::InUse) => HELIOS_NVRM_ST_PIN_IN_USE,
+        Ok(PinTake::NotFound) => HELIOS_NVRM_ST_NOT_OWNED,
+        Err(_) => HELIOS_NVRM_ST_DEVICE_ERROR,
+    };
+    wire.write_back(&u);
+    STATUS_SUCCESS
+}
+
+/// `HELIOS_NVRM_OP_FORWARD`: validate the layout, forward, report.
+fn nvrm_forward(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    head: HeliosNvrmHeader,
+) -> NTSTATUS {
+    use crate::virtio::nvrm::{self, Refusal};
+    // The device generation, for every answer that does not come back through
+    // `nvrm::forward` (which samples it in its own first lock hold).
+    let epoch_now = || adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
+    let mut fwd = match EscapeBuf::<HeliosNvrmForward>::new(buf, hdr) {
+        Ok(w) => w.read(),
+        Err(st) => return st,
+    };
+    let req_len = fwd.req_len as usize;
+    let resp_cap = fwd.resp_cap as usize;
+    // Layout: struct | request | (pad to 8) | response area. Checked arithmetic
+    // throughout — every one of these is caller-controlled.
+    let layout = req_len
+        .checked_add(7)
+        .map(|n| n & !7usize)
+        .and_then(|padded| HELIOS_NVRM_FORWARD_BYTES.checked_add(padded))
+        .and_then(|resp_off| resp_off.checked_add(resp_cap).map(|total| (resp_off, total)));
+    let Some((resp_off, total)) = layout else {
+        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch_now());
+    };
+    // A message is `MsgHeader | payload` both ways, so each side must be longer
+    // than the 16-byte header.
+    if fwd.pin_id == 0 && fwd.rm_status_off != 0 {
+        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch_now());
+    }
+    if req_len < 16
+        || resp_cap < 16
+        || total > buf.len()
+        || total > HELIOS_NVRM_MAX_BUFFER as usize
+        || total != hdr.size as usize
+    {
+        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch_now());
+    }
+    let timeout_ms = match fwd.timeout_ms {
+        0 => NVRM_DEFAULT_TIMEOUT_MS,
+        t => t,
+    };
+
+    // `total <= buf.len()` and `HELIOS_NVRM_FORWARD_BYTES <= resp_off <= total`
+    // were checked above, so these splits are in range. `get` for the two
+    // views, so a change to the checks above cannot turn into a fault.
+    let (_, rest) = buf.split_at_mut(HELIOS_NVRM_FORWARD_BYTES);
+    let (req_area, resp_area) = rest.split_at_mut(resp_off - HELIOS_NVRM_FORWARD_BYTES);
+    let (Some(req), Some(resp)) = (req_area.get(..req_len), resp_area.get_mut(..resp_cap)) else {
+        return refuse_short_buffer();
+    };
+
+    let mut sampled_epoch = None;
+    let outcome = nvrm::forward(
+        passive,
+        adapter,
+        owner,
+        req,
+        resp,
+        u64::from(timeout_ms),
+        fwd.pin_id,
+        fwd.rm_status_off,
+        &mut sampled_epoch,
+    );
+    let epoch = match sampled_epoch {
+        Some(e) => e,
+        // Refused before any lock was taken: nothing moved, now is as good as then.
+        None => epoch_now(),
+    };
+    let (status, resp_len) = match outcome {
+        Ok(n) => (HELIOS_NVRM_ST_OK, n as u32),
+        Err(Refusal::MsgType) => (HELIOS_NVRM_ST_MSG_TYPE_REFUSED, 0),
+        Err(Refusal::NotOwned) => (HELIOS_NVRM_ST_NOT_OWNED, 0),
+        Err(Refusal::NoResources) => (HELIOS_NVRM_ST_NO_RESOURCES, 0),
+        Err(Refusal::Forbidden) => (HELIOS_NVRM_ST_FORBIDDEN, 0),
+        Err(Refusal::BadRange) => (HELIOS_NVRM_ST_BAD_RANGE, 0),
+        Err(Refusal::Transport(crate::virtio::VirtioError::Timeout)) => {
+            (HELIOS_NVRM_ST_TIMEOUT, 0)
+        }
+        Err(Refusal::Transport(crate::virtio::VirtioError::QueueFull))
+        | Err(Refusal::Transport(crate::virtio::VirtioError::OutOfMemory)) => {
+            (HELIOS_NVRM_ST_NO_RESOURCES, 0)
+        }
+        Err(Refusal::Transport(_)) => (HELIOS_NVRM_ST_DEVICE_ERROR, 0),
+    };
+    fwd.resp_len = resp_len;
+    fwd.head.status = status;
+    fwd.head.epoch = epoch;
+    match buf.get_mut(..HELIOS_NVRM_FORWARD_BYTES) {
+        Some(dst) => {
+            dst.copy_from_slice(bytes_of(&fwd));
+            STATUS_SUCCESS
+        }
+        None => refuse_short_buffer(),
     }
 }
 
@@ -1622,6 +2536,12 @@ fn escape_alloc_blob(
         Err(st) => return st,
     };
     let req = wire.read();
+    // The vendor RM-export blob type is minted only by HELIOS_ESCAPE_FOREIGN_RESOURCE
+    // `IMPORT_RM`, which checks the caller's DRM file, the context and the quota. A
+    // plain ALLOC_BLOB must not forge one with any `(rm_handle << 32 | gem)` id.
+    if req.blob_mem == helios_protocol::HELIOS_BLOB_MEM_RM_EXPORT {
+        return STATUS_INVALID_PARAMETER;
+    }
     // DIAG: 0x0E04_HHHH = ALLOC_BLOB's owning handle (low 16 bits), to confirm it
     // matches the handle DxgkDdiDestroyDevice reclaims under (0x0E01_HHHH).
     crate::diag::record(0x0E04_0000 | ((owner.raw() as u32) & 0xFFFF));

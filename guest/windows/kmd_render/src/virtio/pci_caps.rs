@@ -6,7 +6,7 @@
 //! the split makes a compile-time fact.
 
 use helios_protocol::{
-    VIRTIO_PCI_CAP_ISR_CFG, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
+    VIRTIO_PCI_CAP_COMMON_CFG, VIRTIO_PCI_CAP_ISR_CFG, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
 };
 use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction};
 
@@ -98,8 +98,11 @@ fn bar_base(access: &DxgkConfigAccess, bar: u16) -> Option<u64> {
     }
 }
 
-/// Conduit device shared memory region 3, host-visible Venus blobs
-/// (`SHM_ID_VENUS`, docs/VENUS.md).
+/// Conduit device shared memory regions (host/backend/device/src/shm_regions.rs):
+/// 1 = the RM window (GPU memory mapped for HELIOS_ESCAPE_NVRM MMAP), 2 = the
+/// UVM aperture, 3 = host-visible Venus blobs (docs/VENUS.md).
+pub(super) const SHM_ID_WINDOW: u32 = 1;
+pub(super) const SHM_ID_APERTURE: u32 = 2;
 const SHM_ID_VENUS: u32 = 3;
 
 /// Walk the PCI capability list for the virtio `SHARED_MEMORY_CFG` capability
@@ -108,6 +111,11 @@ const SHM_ID_VENUS: u32 = 3;
 /// Returns `None` if absent (a device built without blob/hostmem), which makes
 /// the blob map path unavailable rather than crashing.
 pub(super) fn scan_host_visible_window(access: &DxgkConfigAccess) -> Option<HostVisibleWindow> {
+    scan_shm_region(access, SHM_ID_VENUS)
+}
+
+/// The same walk for any shared-memory region id.
+pub(super) fn scan_shm_region(access: &DxgkConfigAccess, want: u32) -> Option<HostVisibleWindow> {
     if (cfg_read32(access, PCI_CFG_STATUS) >> 16) & PCI_STATUS_CAP_LIST == 0 {
         return None;
     }
@@ -130,7 +138,7 @@ pub(super) fn scan_host_visible_window(access: &DxgkConfigAccess) -> Option<Host
             let d1 = cfg_read32(access, cap + 4);
             let bar = (d1 & 0xFF) as u16;
             let shmid = (d1 >> 8) & 0xFF;
-            if shmid == SHM_ID_VENUS {
+            if shmid == want {
                 // `virtio_pci_cap64`: offset lo/hi at +8/+16, length lo/hi at +12/+20.
                 let off = cfg_read32(access, cap + 8) as u64
                     | ((cfg_read32(access, cap + 16) as u64) << 32);
@@ -154,9 +162,9 @@ pub(super) fn scan_host_visible_window(access: &DxgkConfigAccess) -> Option<Host
 /// This register is **read-to-clear**: reading it returns the pending-interrupt
 /// bits (bit0 = used-ring/queue interrupt, bit1 = config change) and DEASSERTS
 /// the device's level-triggered INTx line. `DxgkDdiInterruptRoutine` reads it at
-/// DIRQL to acknowledge the line (the device is line-based INTx — `MSISupported=0`
-/// — so without this read the line stays high and Windows' interrupt-storm
-/// detector disables the adapter → Code 43). virtio-drivers' `PciTransport`
+/// DIRQL to acknowledge the line when the OS gave the driver INTx instead of MSI
+/// messages (without this read the line stays high and Windows' interrupt-storm
+/// detector disables the adapter → Code 43). In message mode it is not read. virtio-drivers' `PciTransport`
 /// owns this register internally and never exposes its VA, and its `ack_interrupt`
 /// needs `&mut self` (the queue lock) which the ISR cannot take at DIRQL — so we
 /// locate and map the register ourselves and read it lock-free.
@@ -209,4 +217,86 @@ pub(super) fn map_isr_status_register(access: &DxgkConfigAccess) -> usize {
         cap = cap_next;
     }
     0
+}
+
+/// Bytes of `virtio_pci_common_cfg` the MSI-X programming touches: through
+/// `queue_msix_vector` (offset 0x1A, 2 bytes).
+const COMMON_CFG_MSIX_BYTES: u32 = 0x1C;
+
+/// Map the virtio common-configuration structure and return its kernel VA
+/// (0 if the capability is absent, too short, or the mapping fails).
+///
+/// virtio-drivers' `PciTransport` owns this structure privately and exposes no
+/// accessor for `msix_config` / `queue_msix_vector`, so the MSI-X programming
+/// maps it a second time. The region is mapped with the capability's own length,
+/// exactly as the transport does, so the shared MMIO cache returns the SAME
+/// mapping and there is no aliasing to reason about. PASSIVE_LEVEL.
+pub(super) fn map_common_cfg(access: &DxgkConfigAccess) -> usize {
+    if (cfg_read32(access, PCI_CFG_STATUS) >> 16) & PCI_STATUS_CAP_LIST == 0 {
+        return 0;
+    }
+    let mut cap = (cfg_read32(access, PCI_CFG_CAP_PTR) & 0xFF) as u8 & 0xFC;
+    for _ in 0..48 {
+        if cap == 0 {
+            break;
+        }
+        let d0 = cfg_read32(access, cap);
+        let cap_id = d0 & 0xFF;
+        let cap_next = ((d0 >> 8) & 0xFF) as u8 & 0xFC;
+        let cfg_type = (d0 >> 24) & 0xFF;
+        if cap_id == PCI_CAP_ID_VNDR && cfg_type == VIRTIO_PCI_CAP_COMMON_CFG as u32 {
+            if !cap_fits(cap) {
+                break;
+            }
+            // `virtio_pci_cap`: bar at +4 byte0; offset at +8; length at +12.
+            let bar = (cfg_read32(access, cap + 4) & 0xFF) as u16;
+            let offset = cfg_read32(access, cap + 8) as u64;
+            let length = cfg_read32(access, cap + 12);
+            if length < COMMON_CFG_MSIX_BYTES {
+                return 0;
+            }
+            let Some(base) = bar_base(access, bar) else {
+                return 0;
+            };
+            let phys = base + offset;
+            // SAFETY: maps the real common-cfg sub-region of a device BAR at
+            // PASSIVE_LEVEL through the shared MMIO cache (non-cached MMIO).
+            // The fallible form: a failure is 0, never a dangling VA.
+            return match unsafe {
+                crate::virtio::hal::try_mmio_map(phys as virtio_drivers::PhysAddr, length as usize)
+            } {
+                Some(p) => p.as_ptr() as usize,
+                None => 0,
+            };
+        }
+        cap = cap_next;
+    }
+    0
+}
+
+/// The MSI-X capability's Message Control word (`None` if the device has no
+/// MSI-X capability).
+///
+/// The OS sets its Enable bit when it connected messages instead of the INTx
+/// line, and its table-size field bounds the vectors the device can name.
+/// Read-only config-space access. PASSIVE_LEVEL.
+pub(super) fn read_msix_message_control(access: &DxgkConfigAccess) -> Option<u16> {
+    if (cfg_read32(access, PCI_CFG_STATUS) >> 16) & PCI_STATUS_CAP_LIST == 0 {
+        return None;
+    }
+    let mut cap = (cfg_read32(access, PCI_CFG_CAP_PTR) & 0xFF) as u8 & 0xFC;
+    for _ in 0..48 {
+        if cap == 0 {
+            break;
+        }
+        let d0 = cfg_read32(access, cap);
+        let cap_id = (d0 & 0xFF) as u8;
+        let cap_next = ((d0 >> 8) & 0xFF) as u8 & 0xFC;
+        if cap_id == helios_kmd_logic::msi::PCI_CAP_ID_MSIX {
+            // Message Control is the upper half of the capability's first dword.
+            return Some((d0 >> 16) as u16);
+        }
+        cap = cap_next;
+    }
+    None
 }

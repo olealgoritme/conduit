@@ -265,11 +265,22 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // the transport probe fails, record the exact status, and leave `virtio=None`.
     // Later gates must tighten this once allocations/submission advertise usable
     // render capability.
-    // Drop any prior transport before re-init (e.g. on a stop/start cycle): its
-    // Drop resets the device and frees its rings/scratch. Doing it *before*
+    // SAFETY: `DxgkDdiStartDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
+    // DXGKDDI_START_DEVICE). It is also the deepest stack in the driver — this
+    // token threads down through `bring_up_venus` -> `allocate_host_visible_blob`
+    // -> `VenusRing::bring_up`, which is why it is a by-value ZST and not a
+    // reference: see `crate::irql` and tools/kmd-frame-sizes.ps1.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    // Drop any prior transport before re-init (a start with no stop before it):
+    // its Drop resets the device and frees its rings/scratch. Doing it *before*
     // init keeps the ordering safe — otherwise assigning the new transport would
     // drop the old one (resetting the device) right after init configured it.
-    adapter.set_virtio(None);
+    // Through `retire_transport`, not a bare `set_virtio(None)`: the host is told
+    // to close every RM handle of the old transport while it still answers (the
+    // reset does not make it drop them, and unlocking a pinned page the host
+    // still holds is unsafe), and the old transport's user views are marked stale
+    // (a stop that ran first has already done both, and this finds no transport).
+    crate::virtio::nvrm::retire_transport(passive, adapter);
     // Non-zero only if init below fails, so the display-half demotion can report
     // the status that actually killed the transport rather than a bare flag.
     let mut transport_fail_status: u32 = 0;
@@ -278,13 +289,12 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     let mut venus_ctx_id = 0u32;
     // SAFETY: dxgkrnl_interface is valid per the DDI contract (also copied into
     // the `dxgkrnl` local above); init only borrows it for the call.
-    // SAFETY: `DxgkDdiStartDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
-    // DXGKDDI_START_DEVICE). It is also the deepest stack in the driver — this
-    // token threads down through `bring_up_venus` -> `allocate_host_visible_blob`
-    // -> `VenusRing::bring_up`, which is why it is a by-value ZST and not a
-    // reference: see `crate::irql` and tools/kmd-frame-sizes.ps1.
-    let passive = unsafe { crate::irql::PassiveLevel::assume() };
-    match crate::virtio::VirtioGpu::init(passive, unsafe { &*dxgkrnl_interface }) {
+    // Did the OS connect MSI/MSI-X messages instead of the INTx line? Probed in
+    // its own noinline frame BEFORE `init` (never nested in it: the boot stack
+    // budget) and passed in as a bare u32. 0 = INTx = the driver's historical
+    // behaviour, byte for byte. See `virtio::msi`.
+    let msi_granted = crate::virtio::msi::probe_granted(unsafe { &*dxgkrnl_interface });
+    match crate::virtio::VirtioGpu::init(passive, unsafe { &*dxgkrnl_interface }, msi_granted) {
         Ok(mut gpu) => {
             let Some(generation) = adapter.producer.start_transport() else {
                 crate::diag::record_named_bytes(b"PrGenF", 1);
@@ -294,12 +304,20 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             crate::kmsg(c"Helios: virtio-gpu transport up\n");
             crate::diag::record(0x0B00_0003);
             let host_visible_bytes = gpu.host_visible().map(|window| window.len);
-            // Publish the ISR-status register VA for the DIRQL ISR before the
-            // transport goes live (capture before `gpu` is moved into set_virtio).
+            // Publish the interrupt mode, then the ISR-status register VA, for
+            // the DIRQL ISR before the transport goes live (capture before `gpu`
+            // is moved into set_virtio). The message-mode word goes FIRST so an
+            // ISR that sees a nonzero `isr_status` can never still believe it is
+            // on a line the device is no longer using.
+            adapter
+                .msi_state
+                .store(gpu.msi_isr_state(), core::sync::atomic::Ordering::Release);
             adapter
                 .isr_status
                 .store(gpu.isr_status_addr(), core::sync::atomic::Ordering::Release);
             adapter.set_virtio(Some(gpu));
+            // Now the interrupt can be claimed: hand the host its event buffers.
+            let _ = adapter.with_virtio(|v| v.post_nvrm_event_buffers());
 
             // An explicit VidMmVramMB registry value remains authoritative.
             // When it is absent, use the exact virtio shared-memory capability
@@ -333,6 +351,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             transport_fail_status = status as u32;
             adapter
                 .isr_status
+                .store(0, core::sync::atomic::Ordering::Release);
+            adapter
+                .msi_state
                 .store(0, core::sync::atomic::Ordering::Release);
             adapter.set_virtio(None);
             super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None);
@@ -492,12 +513,18 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         adapter
             .isr_status
             .store(0, core::sync::atomic::Ordering::Release);
+        adapter
+            .msi_state
+            .store(0, core::sync::atomic::Ordering::Release);
         // Cancel the display-half VSync heartbeat + join the HPD worker before
         // teardown (both idempotent; no-ops when the render-only surface never
         // started them). stop_hpd blocks until the worker exits so it can't touch
         // the (about-to-be-torn-down) context.
         adapter.stop_vsync();
         adapter.stop_hpd();
+        // The HPD worker did the `Nv*` registry mirror and is gone: leave the
+        // registry with the final counts (PASSIVE, StopDevice).
+        crate::ddi::publish_nvrm_counters();
         // AFTER stop_hpd, so the worker can no longer re-publish into the state
         // we are about to clear. Every scanout identity below belongs to the
         // transport generation being torn down; carrying it into the next
@@ -527,10 +554,37 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // (and the buffers still in flight inside it) is dropped.
         crate::virtio::ctrl::reap_parked(passive_stop, adapter);
 
-        // Tear down the virtio transport: VirtioGpu::drop resets the device and
-        // frees its rings (plus any in-flight/parked entry buffers). A later
-        // StartDevice re-initializes.
-        adapter.set_virtio(None);
+        // Tear down the virtio transport. `retire_transport` first tells the host
+        // to close every RM handle of every owner (the transport is still alive,
+        // and the host does NOT drop them when the device is reset), then drops
+        // the transport: `VirtioGpu::drop` resets the device and frees its rings
+        // (plus any in-flight/parked entry buffers), wakes and releases the event
+        // registrations, and sweeps whatever the first step could not (a failed
+        // transport), unlocking the pins. A later StartDevice re-initializes.
+        //
+        // The user VIEWS of the host mappings are not the transport's to release:
+        // they live in `adapter.mappings`, which outlives it on purpose (as for
+        // blob views, they are unmapped only inside the process that made them,
+        // and this is not that process). They now point at BAR memory the host no
+        // longer backs for them, and the next generation may give the same window
+        // offsets to someone else, so `retire_transport` marks them stale, AFTER
+        // the transport is gone (nothing can mint an older id any more): the
+        // owner's next call into the NVRM escape unmaps them in its own process,
+        // and DestroyDevice's drain takes whatever is left.
+        crate::virtio::nvrm::retire_transport(passive_stop, adapter);
+        let stale_total =
+            crate::virtio::nvrm::NVRM_STALE_VIEWS.load(core::sync::atomic::Ordering::Relaxed);
+        // Written now, not left to the next escape: this is the one place that
+        // knows a stop happened, and the counters may not be published for a while.
+        crate::diag::record_named_bytes(b"NvStale", stale_total);
+        crate::diag::record_named_bytes(
+            b"NvSwept",
+            crate::virtio::nvrm::NVRM_SWEPT.load(core::sync::atomic::Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"NvUnpin",
+            crate::virtio::nvrm::NVRM_UNPINS.load(core::sync::atomic::Ordering::Relaxed),
+        );
 
         // Drop the whole transport generation in one store — `bar_segment` and
         // `venus_ctx_id` together, since both are meaningless in the next

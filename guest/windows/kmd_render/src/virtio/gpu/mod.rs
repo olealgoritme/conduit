@@ -61,11 +61,28 @@ use wdk_sys::ntddk::{
 };
 use wdk_sys::{KEVENT, PVOID};
 
+mod nvrm_events;
+mod nvrm_tables;
 mod resource_tables;
+mod foreign_tables;
+pub use foreign_tables::{AllocAdopt, ForeignBegin, ForeignCommit};
+
+pub use nvrm_events::{
+    release_nvrm_event, NvrmEventRefusal, NvrmEventRegistered, NvrmEventsState, MAX_NVRM_EVENTS,
+    MAX_NVRM_EVENTS_PER_OWNER,
+};
+
+pub use nvrm_tables::{
+    FenceCommit, NvrmPin, PinTake, MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER, MAX_NVRM_MAPS,
+    MAX_NVRM_MAPS_PER_OWNER, MAX_NVRM_PINS, MAX_NVRM_PINS_PER_OWNER, MAX_NVRM_PIN_PAGES,
+};
 
 use super::config::DxgkConfigAccess;
 use super::hal::{DmaBuffer, DmaSpan, WdkHal};
-use super::pci_caps::{map_isr_status_register, scan_host_visible_window, HostVisibleWindow};
+use super::pci_caps::{
+    map_isr_status_register, scan_host_visible_window, scan_shm_region, HostVisibleWindow,
+    SHM_ID_APERTURE, SHM_ID_WINDOW,
+};
 
 // R1103: the telemetry atomics moved to `super::counters`. Re-exported here so
 // all 53+ external `gpu::<COUNTER>` paths keep compiling unchanged; narrowing
@@ -79,7 +96,18 @@ use crate::virtio::venus::{
 
 /// Control queue index (virtio-gpu controlq = 0; cursorq = 1 is unused).
 const CTRL_QUEUE: u16 = 0;
-/// Control-queue ring size — power of two, conservatively ≤ the device's max.
+/// Control-queue ring size — power of two, ≤ the device's max (256).
+///
+/// 64 allows ~12 Venus submits in flight (5 descriptors each), which a Heaven run
+/// saturates (IfHi 13, QfRet/QSpTout nonzero). 22.22.298.0 tried 128 and the
+/// adapter came up with NO transport: the host saw no command at all, not even
+/// GET_DISPLAY_INFO. Root cause unconfirmed -- measured frames rule out the stack
+/// (start_device 2904 B with init inlined, venus chain ~6.5 KB, ceiling 17936 B),
+/// the backend allows 256 and QEMU is `vq_size=256`. Do not raise this again
+/// without reading the `InitStg` / `VqMax` / `StVio` breadcrumbs of that boot;
+/// `InitStg` names the last stage init reached and `VqMax` is the max queue size
+/// the device reported for queue 0. Ring pressure is instead cut by sending fewer
+/// descriptors per submit (see the batched SUBMIT_VENUS escape).
 const CTRL_QUEUE_SIZE: usize = 64;
 
 /// Conduit's device needs only `VIRTIO_F_VERSION_1`; what it can serve travels in
@@ -299,11 +327,11 @@ pub const MAX_PARKED: usize = 4 * MAX_INFLIGHT;
 /// Completed command buffers retained for reuse. Count, individual capacity,
 /// and total bytes are all bounded: a rare large Venus CS must never pin a
 /// correspondingly large physically-contiguous allocation for device lifetime.
-const MAX_DMA_POOL: usize = 128;
-/// 64 KiB of payload plus the page `DmaBuffer`'s 32-byte wire tail can add to
-/// the page-rounded capacity, so a 60-64 KiB command buffer stays poolable.
-const MAX_DMA_POOL_BUFFER_BYTES: usize = 64 * 1024 + 4096;
-const MAX_DMA_POOL_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DMA_POOL: usize = 256;
+/// 256 KiB of payload plus the page `DmaBuffer`'s 32-byte wire tail can add to
+/// the page-rounded capacity, so a 252-256 KiB command buffer stays poolable.
+const MAX_DMA_POOL_BUFFER_BYTES: usize = 256 * 1024 + 4096;
+const MAX_DMA_POOL_BYTES: usize = 8 * 1024 * 1024;
 /// Enqueue refusal threshold for the parked table (forces the PASSIVE caller
 /// to reap before submitting more).
 const PARKED_ENQUEUE_GATE: usize = MAX_PARKED - MAX_INFLIGHT;
@@ -469,6 +497,12 @@ const BIND_CMD_POOL: usize = 4;
 const NOTIFICATION_EVENT: i32 = 0;
 /// `IO_NO_INCREMENT` priority boost for `KeSetEvent`.
 const IO_NO_INCREMENT: i32 = 0;
+/// Priority boost for the thread a raw RM forward's completion wakes
+/// (`IO_VIDEO_INCREMENT`): that thread is a user-mode caller blocked in a
+/// synchronous call, and without a boost it can sit behind a busy guest CPU for
+/// a whole quantum after its reply is already in. Only a thread at a variable
+/// priority is boosted, and only until its next quantum ends.
+const RAW_WAKE_INCREMENT: i32 = 1;
 
 /// A PASSIVE waiter's completion block. Lives on the waiter's stack; the
 /// registered pointer stays valid because the waiter ALWAYS deregisters (or
@@ -482,6 +516,11 @@ pub struct SyncWaitBlock {
     /// The device-written response bytes, copied out of the entry's DMA buffer
     /// by `drain_used` before the event is signaled.
     resp: UnsafeCell<[u8; SYNC_RESP_MAX]>,
+    /// A raw forward only (`InFlightKind::Raw`): how many reply bytes the drain
+    /// copied to the waiter's destination. Stays 0 on every failure path, and a
+    /// real reply is never empty (it starts with a 16-byte `MsgHeader`), so 0
+    /// means "no reply". Stored (Release) before `done`.
+    used: AtomicU32,
 }
 
 /// Stable adapter-owned notification target for a scanout copy submitted on a
@@ -770,6 +809,7 @@ impl SyncWaitBlock {
         // SAFETY: valid, stable KEVENT storage per the fn contract.
         unsafe { KeInitializeEvent(&mut self.event, NOTIFICATION_EVENT, 0) };
         self.done.store(false, Ordering::Relaxed);
+        self.used.store(0, Ordering::Relaxed);
     }
 
     /// Copy the response bytes out.
@@ -817,6 +857,30 @@ impl WaitBlockRef<'_> {
         // SAFETY: as above; `copy_resp`'s own contract covers the ordering.
         unsafe { self.ptr.as_ref() }.copy_resp(out);
     }
+
+    /// A lock-free HINT that the drain has started completing this block: the
+    /// only use is `ctrl::spin_for_completion`, a bounded PASSIVE poll that runs
+    /// BEFORE the real wait, so a reply that lands within a few microseconds is
+    /// seen without a sleep and a wake.
+    ///
+    /// ⚠ IT AUTHORIZES NOTHING. `done` is stored one instruction before the
+    /// drain's `KeSetEvent`, so a waiter that LEFT on it could pop the frame this
+    /// block lives in while the drain still touches it (the 22.22.218.0 `0xA`;
+    /// see `ctrl::wait_block`). The caller must still leave through
+    /// `KeWaitForSingleObject` (or the abandon path) and never read `resp`,
+    /// `used` or the reply buffer on the strength of this alone.
+    pub fn spin_hint_done(&self) -> bool {
+        // SAFETY: the block outlives this borrow; an atomic load.
+        unsafe { self.ptr.as_ref() }.done.load(Ordering::Acquire)
+    }
+
+    /// Reply bytes a raw forward received (see `SyncWaitBlock::used`). Valid
+    /// after the wait was satisfied, like `copy_resp`.
+    pub fn used(&self) -> u32 {
+        // SAFETY: the block outlives this borrow; the drain stored the value
+        // (Release) before signalling the event this waiter's wait observed.
+        unsafe { self.ptr.as_ref() }.used.load(Ordering::Acquire)
+    }
 }
 
 /// What an in-flight entry is.
@@ -830,6 +894,26 @@ enum InFlightKind {
         /// changes the host's scanout selection and must remain visible to
         /// DestroyAllocation's lifetime barrier.
         scanout_bind: Option<SyncScanoutBind>,
+    },
+    /// A RAW forwarded message (HELIOS_ESCAPE_NVRM FORWARD): the caller's
+    /// `MsgHeader | payload` goes out verbatim and the device's reply is copied
+    /// to `dest`, a driver-owned non-paged buffer the waiter holds, at
+    /// completion.
+    ///
+    /// The reply cannot ride `SyncWaitBlock::resp` (64 bytes, the size of a
+    /// virtio-gpu response), and it cannot stay in `meta` for the waiter to read
+    /// after the wake: the entry is parked at completion and a PASSIVE reap may
+    /// recycle that buffer the moment the waiter is running. So the drain copies
+    /// it, under the lock, before signalling.
+    ///
+    /// `dest` has exactly `InFlight::resp_len` writable bytes and outlives the
+    /// waiter's wait; `waiter` is cleared by `abandon_sync` under this same lock
+    /// when the wait times out, after which the drain neither copies nor signals,
+    /// so a late completion never writes a buffer its owner has left. That is the
+    /// argument `InFlightKind::Sync` already rests on, for a larger payload.
+    Raw {
+        waiter: Option<NonNull<SyncWaitBlock>>,
+        dest: NonNull<u8>,
     },
     /// An async fenced SUBMIT_3D carrying `fence_id` (KMD-assigned wire id).
     /// `ring_idx` 0 = host CPU ring (retires at decode); >= 1 = a per-queue
@@ -1452,6 +1536,12 @@ enum Chain {
     Meta2 { in0_len: usize, in1_len: usize },
     /// `[hdr, venus stream] -> [resp]`, the stream in its own buffer.
     MetaPlusVenus { hdr_len: usize, venus_len: usize },
+    /// `[req[..16], req[16..]] -> [resp[..16], resp[16..]]`: a forwarded RM
+    /// message verbatim, with NO `GpuCmd` header stamped — the caller's own
+    /// 16-byte `MsgHeader` is the first device-read span, and the reply's is the
+    /// first device-written one. The two halves of each side are adjacent in
+    /// `meta`, so the device's bytes land contiguously at `req_len`.
+    Raw { req_len: usize },
 }
 
 impl Chain {
@@ -1466,6 +1556,7 @@ impl Chain {
             Self::Meta1 { in0_len } => in0_len,
             Self::Meta2 { in0_len, in1_len } => in0_len + in1_len,
             Self::MetaPlusVenus { hdr_len, .. } => hdr_len,
+            Self::Raw { req_len } => req_len,
         }
     }
 
@@ -1501,6 +1592,26 @@ impl Chain {
                 3,
                 [resp_hdr, resp],
             ),
+            Self::Raw { req_len } => {
+                const MH: usize = super::hal::MSG_HDR_LEN;
+                // Never a zero-length descriptor: virtio-drivers asserts on one.
+                // A header-only request (Close, GetSysFiles) is one read span;
+                // the reply side is always two because `resp_len > MH` is
+                // enforced at enqueue.
+                let (reads, n_reads) = if req_len > MH {
+                    ([meta.span(0, MH)?, meta.span(MH, req_len - MH)?, none], 2)
+                } else {
+                    ([meta.span(0, req_len)?, none, none], 1)
+                };
+                (
+                    reads,
+                    n_reads,
+                    [
+                        meta.span(req_len, MH)?,
+                        meta.span(req_len.checked_add(MH)?, resp_len.checked_sub(MH)?)?,
+                    ],
+                )
+            }
         })
     }
 }
@@ -2155,9 +2266,14 @@ pub struct VirtioGpu {
     host_visible: Option<HostVisibleWindow>,
     /// Mapped kernel VA of the virtio ISR-status register (read-to-clear), or 0 if
     /// the device exposes no ISR cap. `DxgkDdiInterruptRoutine` reads this at DIRQL
-    /// to acknowledge the line-based INTx (the device is `MSISupported=0`). See
+    /// to acknowledge the line-based INTx when PnP gave the device INTx (see `msi_isr_state`). See
     /// [`map_isr_status_register`].
     isr_status_va: usize,
+    /// The ISR's message-mode state word (`helios_kmd_logic::msi::isr_state`):
+    /// 0 = the device is on the INTx line and `isr_status_va` is the ISR's ack
+    /// register; nonzero = vectors were programmed and the ISR routes by message
+    /// number without touching the ISR-status register.
+    msi_isr_state: u32,
     /// Tracked blobs (resource_id → size/mapping state). Heap-reserved to MAX_BLOBS
     /// at init so `push` under the spinlock never reallocates (the 0x7F lesson).
     blobs: Vec<BlobSlot>,
@@ -2165,6 +2281,10 @@ pub struct VirtioGpu {
     /// against MAX_BLOBS so a burst of concurrent creates cannot overshoot the
     /// reserved capacity (push under the spinlock must never reallocate).
     blobs_reserved: usize,
+    /// Side record of the blobs that are foreign (RM-exported) resources: quotas,
+    /// provenance, the host-verified size. Their `blobs` and `resources` entries
+    /// are ordinary; see `foreign_tables`. Reserved to its cap at init.
+    foreign: helios_kmd_logic::foreign_resource::ForeignTable,
     /// Every host-live virtio resource id created through this transport.
     /// Removal is one-shot and gates CTX_DETACH_RESOURCE/RESOURCE_UNREF, avoiding
     /// qemu `RESOURCE_UNREF: resource does not exist` errors from duplicate DDI
@@ -2176,6 +2296,49 @@ pub struct VirtioGpu {
     /// MANDATORY (see `reserve_context_slot`), so a context is reserved before
     /// the wire round-trip and committed after it.
     contexts_reserved: usize,
+    /// The event virtqueue (index 1) and its posted buffers, where the host's
+    /// `EventReady` arrives. `None` if the queue could not be brought up: then
+    /// events are unsupported. See `nvrm_events`.
+    nvrm_event_ring: Option<Box<nvrm_events::EventRing>>,
+    /// Usermode events registered against RM handles (and `TRANSPORT_LOST`),
+    /// reserved at init so no registration allocates under the spinlock. Each
+    /// holds an object reference that only a PASSIVE caller may drop: every
+    /// removal hands the event back by value.
+    nvrm_events: helios_kmd_logic::nvrm_events::Registry<NonNull<KEVENT>>,
+    /// The device's config `features` word (`NVGPU_CFG_*`), read at init, for
+    /// `HELIOS_NVRM_OP_QUERY_CAPS`.
+    cfg_features: u32,
+    /// Backend RM handles opened through HELIOS_ESCAPE_NVRM, tagged with the
+    /// owning device so a process cannot name another's, and closed at device
+    /// teardown. Reserved to MAX_NVRM_HANDLES at init. See `nvrm_tables`.
+    nvrm_handles: Vec<nvrm_tables::NvrmHandleSlot>,
+    /// Slots reserved by in-flight forwarded `Open`s.
+    nvrm_reserved: usize,
+    /// `SEMSURF_FENCE_CREATE`s in flight and the `EventReady`s that beat their
+    /// handle's recording (see `kmd_logic::nvrm_fence`). Also reserved slots: a
+    /// create reserves one in `nvrm_reserved` like an `Open`.
+    /// Boxed, and built by [`nvrm_tables::new_fence_book`]: the book is 80 bytes and
+    /// a by-value field here lands in `VirtioGpu::init`'s boot-stack frame, where
+    /// the history of this struct shows growth costs far more than its size.
+    nvrm_fences: Box<helios_kmd_logic::nvrm_fence::FenceBook>,
+    /// Live HELIOS_NVRM_OP_MMAP mappings (the host's mapping id, the handle it
+    /// belongs to, the owner), so `Close` and device teardown can send the host
+    /// `Munmap`. Reserved to MAX_NVRM_MAPS at init. The user view itself is in
+    /// `AdapterContext::mappings`, under the key `nvrm::map_key(mapping_id)`.
+    nvrm_maps: Vec<nvrm_tables::NvrmMapSlot>,
+    // (Mapping ids are minted by `virtio::nvrm::mint_map_id`, one counter for the
+    // life of the driver: the host's own ids are not unique, the RM path answers
+    // 0 for all of them, and the views outlive this transport.)
+    /// User pages locked for OS-descriptor registrations, with the page-run table
+    /// each carries. Reserved to MAX_NVRM_PINS at init. Pins hold PASSIVE-only
+    /// resources: they are only ever removed by value and released outside the lock.
+    nvrm_pins: Vec<NvrmPin>,
+    /// The next pin id (starts at 1, never reused; 0 once exhausted).
+    nvrm_next_pin: u32,
+    /// Shared-memory regions 1 and 2, where an RM `Mmap` reply points (an
+    /// offset into one of them). `None` when the device lacks the region.
+    nvrm_window: Option<HostVisibleWindow>,
+    nvrm_aperture: Option<HostVisibleWindow>,
     /// Live virtio-gpu contexts, tagged with the owning device handle, so
     /// `DxgkDdiDestroyDevice` can `CTX_DESTROY` any context an ICD created but did
     /// not tear down (crash / skipped CTX_DESTROY) — otherwise leaked contexts
@@ -2428,9 +2591,11 @@ impl VirtioGpu {
     /// GET_DISPLAY_INFO scratch page; the rest of bring-up is MMIO and PCI
     /// config access. It is a by-value ZST, so it costs neither a register nor a
     /// stack slot in this measured 3.0 KB frame — see `crate::irql`.
+    #[inline(never)]
     pub fn init(
         passive: crate::irql::PassiveLevel,
         dxgkrnl: &DXGKRNL_INTERFACE,
+        msi_granted: u32,
     ) -> Result<Box<Self>, VirtioError> {
         // ── M1: discover the device + map BARs through Dxgkrnl ──────────────
         // A miniport doesn't own the bus, so config space is reached via the
@@ -2445,6 +2610,10 @@ impl VirtioGpu {
         };
         let mut transport = PciTransport::new::<WdkHal, _>(&mut root, device_function)
             .map_err(|_| VirtioError::DeviceError)?;
+        // Init-stage breadcrumb: the last value written names the stage init
+        // reached, so a transport that never comes up says where. 1 = PCI
+        // transport discovered.
+        crate::diag::record_named_bytes(b"InitStg", 1);
 
         // ── M2: feature negotiation (VirtIO 1.2 spec §3.1.1) ────────────────
         transport.set_status(DeviceStatus::empty()); // reset
@@ -2478,6 +2647,7 @@ impl VirtioGpu {
             return Err(VirtioError::FeatureRejected);
         }
 
+        crate::diag::record_named_bytes(b"InitStg", 2); // features negotiated
         // The device only takes `GpuCmd` when the backend runs with `--venus`.
         let cfg_features: u32 = transport
             .read_config_space::<u32>(CONDUIT_CFG_FEATURES_OFFSET)
@@ -2487,6 +2657,13 @@ impl VirtioGpu {
             crate::kmsg(c"Conduit: backend not started with --venus\n");
             return Err(VirtioError::FeatureRejected);
         }
+
+        crate::diag::record_named_bytes(b"InitStg", 3); // config features ok
+        // The largest ring the device accepts for queue 0, next to the size asked
+        // for: `VirtQueue::new` refuses (InvalidParam) when the device's max is
+        // below CTRL_QUEUE_SIZE, and nothing else says so.
+        crate::diag::record_named_bytes(b"VqMax", transport.max_queue_size(CTRL_QUEUE));
+        crate::diag::record_named_bytes(b"VqWant", CTRL_QUEUE_SIZE as u32);
 
         // ── M3: control virtqueue (queue 0), then DRIVER_OK ─────────────────
         // Spell out the error arm instead of `map_err(...)?`. In the measured
@@ -2501,12 +2678,56 @@ impl VirtioGpu {
             /* event_idx */ false,
         ) {
             Ok(control) => control,
-            Err(_) => return Err(VirtioError::DeviceError),
+            Err(_) => {
+                crate::diag::record_named_bytes(b"InitStg", 0xE4); // queue setup refused
+                return Err(VirtioError::DeviceError);
+            }
         };
+        crate::diag::record_named_bytes(b"InitStg", 4); // control queue created
         // Runtime ctrl completion is interrupt-driven. Be explicit instead of
         // relying on the freshly-zeroed avail.flags value: bit 0 clear asks the
         // device to interrupt after it adds a used element.
         control.set_dev_notify(true);
+        // The event queue (index 1), where the host's `EventReady` arrives (see
+        // `nvrm_events`). Created before DRIVER_OK like the control queue; its
+        // buffers are posted once the device object exists. No feature is acked
+        // for it, and the input bit (12) is never acked: `accepted` above is the
+        // only thing written back.
+        let nvrm_event_ring = nvrm_events::new_event_ring(passive, &mut transport);
+        // 1 when the event queue is up, 0 when RM events are unsupported.
+        crate::diag::record_named_bytes(b"NvEvQ", u32::from(nvrm_event_ring.is_some()));
+        // Message-signalled interrupts: when the OS connected messages instead of
+        // the INTx line (`msi_granted != 0`), the device's vectors must be
+        // programmed BEFORE DRIVER_OK, for exactly the queues that exist. A device
+        // on messages with no vector raises nothing, so a refusal fails the
+        // transport here rather than leaving a driver that never wakes. With
+        // `msi_granted == 0` this is a no-op and the INTx path is untouched.
+        let msi_isr_state = if msi_granted != 0 {
+            let queues = [CTRL_QUEUE, nvrm_events::EVENT_QUEUE];
+            let live = if nvrm_event_ring.is_some() { 2 } else { 1 };
+            match super::msi::program_vectors(
+                &DxgkConfigAccess::new(dxgkrnl),
+                msi_granted,
+                &queues[..live],
+            ) {
+                Ok(state) => state,
+                Err(()) => {
+                    // RESET, not just FAILED: the queues above are already
+                    // enabled on the device and drop (freeing their rings)
+                    // before `transport` does, so the device must stop
+                    // referencing them first. Bounded like the reset at the top.
+                    transport.set_status(DeviceStatus::empty());
+                    let mut spins = 0u32;
+                    while !transport.get_status().is_empty() && spins < 100_000 {
+                        spins += 1;
+                        core::hint::spin_loop();
+                    }
+                    return Err(VirtioError::DeviceError);
+                }
+            }
+        } else {
+            0
+        };
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
                 | DeviceStatus::DRIVER
@@ -2590,6 +2811,7 @@ impl VirtioGpu {
             return Err(VirtioError::DeviceError);
         }
         crate::kmsg(c"Helios: virtio-gpu GET_DISPLAY_INFO OK\n");
+        crate::diag::record_named_bytes(b"InitStg", 5); // GET_DISPLAY_INFO answered
         // Remember scanout 0's host-preferred size for the display half's VidPn
         // mode + generated EDID. QEMU reports it in `pmodes[0].r` even before a
         // scanout is bound; take it only when both dimensions look sane (a
@@ -2618,6 +2840,7 @@ impl VirtioGpu {
             None
         };
         crate::diag::record_named_bytes(b"HostEdid", host_edid_len.map_or(0, |n| n as u32));
+        crate::diag::record_named_bytes(b"InitStg", 6); // EDID handshake done
 
         // Discover the host-visible blob window (a fresh config accessor — the
         // original `access` was moved into `PciRoot` above; `DxgkConfigAccess` is
@@ -2628,6 +2851,14 @@ impl VirtioGpu {
         } else {
             0x0B00_00E5
         });
+
+        // The RM window and UVM aperture (shared memory regions 1 and 2): where
+        // an RM `Mmap` reply points. Absent on a device built without them, in
+        // which case HELIOS_NVRM_OP_MMAP answers UNSUPPORTED.
+        let nvrm_window = scan_shm_region(&DxgkConfigAccess::new(dxgkrnl), SHM_ID_WINDOW);
+        let nvrm_aperture = scan_shm_region(&DxgkConfigAccess::new(dxgkrnl), SHM_ID_APERTURE);
+        crate::diag::record_named_bytes(b"NvWinMb", nvrm_window.map_or(0, |w| (w.len >> 20) as u32));
+        crate::diag::record_named_bytes(b"NvAptMb", nvrm_aperture.map_or(0, |w| (w.len >> 20) as u32));
 
         // Locate + map the ISR-status register so the (real) ISR can read-to-clear
         // the level-triggered INTx line and stop the unhandled-interrupt storm.
@@ -2659,7 +2890,18 @@ impl VirtioGpu {
         let present_streams = allocate_present_streams()?;
         let present_buffer_syncs = allocate_present_buffer_syncs()?;
         let present_buffer_opens = allocate_present_buffer_opens()?;
+        // Nothing to register against without the event queue: reserve nothing.
+        let nvrm_events = helios_kmd_logic::nvrm_events::Registry::try_new(
+            if nvrm_event_ring.is_some() {
+                MAX_NVRM_EVENTS
+            } else {
+                0
+            },
+            MAX_NVRM_EVENTS_PER_OWNER,
+        )
+        .ok_or(VirtioError::OutOfMemory)?;
 
+        crate::diag::record_named_bytes(b"InitStg", 7); // building the device object
         // `VirtioGpu` contains the control virtqueue and many ownership tables.
         // Return it heap-owned so StartDevice never reserves a second by-value
         // copy of this large state while `init`'s own frame is live.
@@ -2670,12 +2912,25 @@ impl VirtioGpu {
             next_resource_id: 1,
             host_visible,
             isr_status_va,
+            msi_isr_state,
             blobs: Vec::with_capacity(MAX_BLOBS),
             blobs_reserved: 0,
+            foreign: helios_kmd_logic::foreign_resource::ForeignTable::new(),
             resources: Vec::with_capacity(MAX_RESOURCES),
             resources_reserved: 0,
             contexts_reserved: 0,
             contexts: Vec::with_capacity(MAX_CONTEXTS),
+            nvrm_event_ring,
+            nvrm_events,
+            cfg_features,
+            nvrm_handles: Vec::with_capacity(MAX_NVRM_HANDLES),
+            nvrm_reserved: 0,
+            nvrm_fences: nvrm_tables::new_fence_book(),
+            nvrm_maps: Vec::with_capacity(MAX_NVRM_MAPS),
+            nvrm_pins: Vec::with_capacity(MAX_NVRM_PINS),
+            nvrm_next_pin: 1,
+            nvrm_window,
+            nvrm_aperture,
             window: WindowAllocator::new(host_visible.map_or(0, |w| w.len)),
             inflight: Vec::with_capacity(MAX_INFLIGHT),
             parked: Vec::with_capacity(MAX_PARKED),
@@ -2745,6 +3000,10 @@ impl VirtioGpu {
                 gpu.host_edid_len = n;
             }
         }
+        // The event buffers are posted by `StartDevice` once the ISR address is
+        // published (`post_nvrm_event_buffers`): a host push (display mode,
+        // clipboard) landing in a posted buffer raises the interrupt, and the ISR
+        // must already know where the status register is.
         // `WddmHoldMs` (UV1's instrument). Snapshotted here with every other knob
         // so `reg add` + `pnputil /restart-device` applies it with no reboot, and
         // CLAMPED here rather than trusted: see `WDDM_HOLD_MS_MAX`.
@@ -2777,7 +3036,9 @@ impl VirtioGpu {
         // this register, so the device may still be asserting INTx from that
         // completion. Clear it now (PASSIVE) so the line starts deasserted
         // before the interrupt-driven runtime paths take over.
-        if gpu.isr_status_va != 0 {
+        if gpu.isr_status_va != 0 && gpu.msi_isr_state == 0 {
+            // (Not in message mode: the virtio spec says not to touch the ISR
+            // status register once MSI-X is in use.)
             // SAFETY: `isr_status_va` is the mapped MMIO VA of the 1-byte
             // read-to-clear ISR-status register; a volatile read clears it.
             let _ = unsafe { core::ptr::read_volatile(gpu.isr_status_va as *const u8) };
@@ -2978,6 +3239,42 @@ impl VirtioGpu {
             venus: None,
         });
         Ok((SyncTicket { token }, scanout_bind_seq))
+    }
+
+    /// Enqueue a RAW forwarded message (`InFlightKind::Raw`). `meta` holds the
+    /// request at `[0, req_len)` and has room for the reply at
+    /// `[req_len, req_len + resp_len)`; both are `MsgHeader | payload`, so each
+    /// must be longer than a header. `dest` receives the reply at completion
+    /// (see the variant's contract). On refusal the buffer is handed back.
+    pub fn enqueue_raw(
+        &mut self,
+        meta: DmaBuffer,
+        req_len: usize,
+        resp_len: usize,
+        waiter: NonNull<SyncWaitBlock>,
+        dest: NonNull<u8>,
+    ) -> Result<SyncTicket, (DmaBuffer, VirtioError)> {
+        const MH: usize = super::hal::MSG_HDR_LEN;
+        if req_len < MH || resp_len <= MH {
+            return Err((meta, VirtioError::DeviceError));
+        }
+        let chain = Chain::Raw { req_len };
+        let token = match self.enqueue_core(chain, &meta, None, resp_len) {
+            Ok(token) => token,
+            Err(e) => return Err((meta, e)),
+        };
+        self.publish_then_notify(InFlight {
+            token,
+            kind: InFlightKind::Raw {
+                waiter: Some(waiter),
+                dest,
+            },
+            meta,
+            chain,
+            resp_len,
+            venus: None,
+        });
+        Ok(SyncTicket { token })
     }
 
     /// Enqueue a control command without a blocking waiter.  Completion still
@@ -4168,6 +4465,19 @@ impl VirtioGpu {
             // host read that never happened.
             let scanout_flush = take_scanout_flush_token(&mut entry.kind);
             match entry.kind {
+                InFlightKind::Raw { waiter, .. } => {
+                    if let Some(block) = waiter {
+                        // No reply: `used` stays 0, which the waiter reads as
+                        // failure. Same exits and same argument as the Sync arm.
+                        //
+                        // SAFETY: as the Sync arm below.
+                        unsafe {
+                            let b = block.as_ptr();
+                            (*b).done.store(true, Ordering::Release);
+                            KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                        }
+                    }
+                }
                 InFlightKind::Sync { waiter, .. } => {
                     if let Some(block) = waiter {
                         // No response is copied on purpose: `SyncWaitBlock::new_zeroed`
@@ -4314,6 +4624,10 @@ impl VirtioGpu {
             }
             FENCE_EVENT_SIGNALS.fetch_add(1, Ordering::Relaxed);
         }
+        // RM event waiters have nothing left to wait for either: wake them so they
+        // see the loss. Signal only; the references are dropped by their owners'
+        // `Close` / exit or by this transport's `Drop`, at PASSIVE.
+        self.signal_nvrm_events_lost();
     }
 
     /// Drain every completed entry off the used ring: pop the descriptor chain
@@ -4362,16 +4676,77 @@ impl VirtioGpu {
                     &mut [resp[0].as_mut_slice(), resp[1].as_mut_slice()],
                 )
             };
-            if popped.is_err() {
+            let Ok(written) = popped else {
                 self.latch_failed_and_fail_inflight();
                 return;
-            }
+            };
             self.control_space_epoch = self.control_space_epoch.wrapping_add(1);
             let mut entry = self.inflight.swap_remove(idx);
             // As in `latch_failed_and_fail_inflight`: take the ownership token
             // out before the `match entry.kind` moves the other fields, so the
             // entry stays whole for the park below.
             let scanout_flush = take_scanout_flush_token(&mut entry.kind);
+            // A raw forward carries no virtio-gpu response and no wire-tail
+            // status, so it must not reach the interpretation below: that would
+            // overwrite four bytes of the reply with RESP_ERR_UNSPEC whenever the
+            // pooled buffer's stale tail status was nonzero.
+            if let InFlightKind::Raw { waiter, dest } = &entry.kind {
+                let (waiter, dest) = (*waiter, *dest);
+                if let Some(block) = waiter {
+                    // What the device wrote, bounded by what we gave it and by
+                    // the destination (which is exactly `resp_len` bytes).
+                    let wrote = (written as usize).min(resp_len);
+                    // The two device-written descriptors are adjacent in `meta`
+                    // starting at the response offset, so the reply is one
+                    // contiguous range there.
+                    let src = entry.meta.span(entry.chain.resp_offset(), wrote);
+                    // SAFETY: `block` and `dest` outlive every access here for
+                    // the reason on `InFlightKind::Raw` (the waiter has two exits
+                    // and `abandon_sync`, under this lock, clears `waiter` before
+                    // either could free them); `src` is a span of the entry-owned
+                    // buffer the device has finished writing. `used` and `done`
+                    // are stored (Release) before the signal, inside the critical
+                    // section, exactly as the Sync arm orders them.
+                    unsafe {
+                        let b = block.as_ptr();
+                        let n = match src {
+                            Some(span) => {
+                                core::ptr::copy_nonoverlapping(
+                                    span.as_slice().as_ptr(),
+                                    dest.as_ptr(),
+                                    wrote,
+                                );
+                                wrote
+                            }
+                            None => 0,
+                        };
+                        (*b).used.store(n as u32, Ordering::Release);
+                        (*b).done.store(true, Ordering::Release);
+                        KeSetEvent(&mut (*b).event, RAW_WAKE_INCREMENT, 0);
+                    }
+                }
+                // The reply is already in the waiter's `dest`, so nothing reads
+                // `meta` again: hand it straight back to the pool, as the fast
+                // bind does with its command buffer. Without this every forward
+                // parked its buffer and the NEXT forward paid three lock holds
+                // (begin / recycle / finish) to put it where this puts it in a
+                // push. A push into the reserved pool neither allocates nor
+                // frees, so it is legal here; a buffer the pool would refuse
+                // (too big, pool full) parks as before and is freed at PASSIVE.
+                if entry.venus.is_none() && self.dma_pool_accepts(entry.meta.capacity()) {
+                    let (meta, _none) = entry.into_dma_buffers();
+                    self.dma_pool_push(meta);
+                    continue;
+                }
+                if self.parked.len() < MAX_PARKED {
+                    self.parked.push(entry);
+                    bump_high_water(&PARKED_HIGH_WATER, self.parked.len());
+                } else {
+                    PARKED_LEAKS.fetch_add(1, Ordering::Relaxed);
+                    core::mem::forget(entry);
+                }
+                continue;
+            }
             let resp_base = {
                 // SAFETY: the resp span is within the entry-owned meta buffer,
                 // which the device wrote and nothing else aliases now. A mutable
@@ -4391,6 +4766,8 @@ impl VirtioGpu {
             // SAFETY: as above; unaligned because the offset is command-shaped.
             let resp_type = unsafe { core::ptr::read_unaligned(resp_base as *const u32) };
             match entry.kind {
+                // Completed and parked above; never reaches here.
+                InFlightKind::Raw { .. } => {}
                 InFlightKind::Sync {
                     waiter,
                     scanout_bind,
@@ -4886,13 +5263,25 @@ impl VirtioGpu {
             DMA_POOL_MISSES.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let Some((idx, _)) = self
-            .dma_pool
-            .iter()
-            .enumerate()
-            .filter(|(_, buf)| buf.can_hold(len))
-            .min_by_key(|(_, buf)| buf.capacity())
-        else {
+        // Smallest buffer that fits, as before, but stop at the first one that is
+        // already the smallest a buffer can be (one page): with a pool of up to
+        // MAX_DMA_POOL entries this runs under the device spinlock on every
+        // forward, and the whole scan bought nothing once a page-sized buffer
+        // was in hand.
+        let mut best: Option<(usize, usize)> = None;
+        for (i, buf) in self.dma_pool.iter().enumerate() {
+            if !buf.can_hold(len) {
+                continue;
+            }
+            let cap = buf.capacity();
+            if best.is_none_or(|(_, c)| cap < c) {
+                best = Some((i, cap));
+                if cap <= DmaBuffer::MIN_CAPACITY {
+                    break;
+                }
+            }
+        }
+        let Some((idx, _)) = best else {
             DMA_POOL_MISSES.fetch_add(1, Ordering::Relaxed);
             return None;
         };
@@ -4908,16 +5297,31 @@ impl VirtioGpu {
         Some(buf)
     }
 
+    /// Whether the pool would take one more buffer of `capacity` bytes: the
+    /// single eligibility rule, shared by the PASSIVE reap and the drain.
+    fn dma_pool_accepts(&self, capacity: usize) -> bool {
+        capacity <= MAX_DMA_POOL_BUFFER_BYTES
+            && self.dma_pool.len() < MAX_DMA_POOL
+            && self.dma_pool_bytes.saturating_add(capacity) <= MAX_DMA_POOL_BYTES
+    }
+
+    /// Push a buffer [`Self::dma_pool_accepts`] approved. Inside the capacity
+    /// reserved at construction, so it never reallocates under the spinlock, and
+    /// it never frees: legal at DISPATCH.
+    fn dma_pool_push(&mut self, buf: DmaBuffer) {
+        debug_assert!(self.dma_pool_accepts(buf.capacity()));
+        self.dma_pool_bytes += buf.capacity();
+        self.dma_pool.push(buf);
+        DMA_POOL_CACHED_BYTES.store(self.dma_pool_bytes as u32, Ordering::Relaxed);
+    }
+
     /// Move eligible completed buffers into the bounded pool without allocation.
     /// Any excess remains in `buffers` and is returned for PASSIVE-level drop.
     pub fn recycle_dma_buffers(&mut self, mut buffers: Vec<DmaBuffer>) -> Vec<DmaBuffer> {
         let mut i = 0;
         while i < buffers.len() {
             let capacity = buffers[i].capacity();
-            let eligible = capacity <= MAX_DMA_POOL_BUFFER_BYTES
-                && self.dma_pool.len() < MAX_DMA_POOL
-                && self.dma_pool_bytes.saturating_add(capacity) <= MAX_DMA_POOL_BYTES;
-            if !eligible {
+            if !self.dma_pool_accepts(capacity) {
                 DMA_POOL_DROPS.fetch_add(1, Ordering::Relaxed);
                 i += 1;
                 continue;
@@ -4942,6 +5346,13 @@ impl VirtioGpu {
         for e in self.inflight.iter_mut() {
             if e.token != ticket.token {
                 continue;
+            }
+            if let InFlightKind::Raw { waiter, .. } = &mut e.kind {
+                if *waiter == Some(block) {
+                    *waiter = None;
+                    return SyncOutcome::Abandoned;
+                }
+                return SyncOutcome::NotOurs;
             }
             if let InFlightKind::Sync { waiter, .. } = &mut e.kind {
                 if *waiter == Some(block) {
@@ -5123,7 +5534,10 @@ impl VirtioGpu {
         value: u32,
     ) -> Result<u64, helios_kmd_logic::producer_completion::Error> {
         use helios_kmd_logic::producer_completion::Error;
-        if self.failed || value == 0 {
+        // `value == 0` publishes an already-complete epoch on the allocation
+        // (`producer_completion::Table::publish`); the stream still has to be
+        // this device's live registration.
+        if self.failed {
             return Err(Error::Invalid);
         }
         let (i, s) = self
@@ -5519,7 +5933,16 @@ impl VirtioGpu {
         cookie: u64,
         creator_process: usize,
     ) -> Option<u64> {
-        if ctx_id == 0 || value == 0 || cookie == 0 || creator_process == 0 {
+        // `value == 0` is admitted: "already complete" (see
+        // `present_stream::MarkerTail`). It still has to name a live registered
+        // stream of this process, exactly like a nonzero point; for every
+        // nonzero `value` this gate is the one it always was.
+        if !helios_kmd_logic::present_stream::marker_admissible(
+            ctx_id,
+            value,
+            cookie,
+            creator_process,
+        ) {
             PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -5566,6 +5989,13 @@ impl VirtioGpu {
             bump_high_water(&PRESENT_STREAM_MARKER_AHEAD_HIGH_WATER, lookahead as usize);
         }
         PRESENT_STREAM_MARKERS.fetch_add(1, Ordering::Relaxed);
+        if value == 0 {
+            // A boundary at point 0 of a live stream: `slot_ready` holds for any
+            // retirement, so the bind it gates does not wait on a Venus
+            // timeline, yet it stays in the tagged namespace and dies with its
+            // stream like every other marker (a dead stream is never success).
+            PRESENT_STREAM_MARKER_COMPLETE.fetch_add(1, Ordering::Relaxed);
+        }
         Some(encode_present_stream_boundary(slot.handle(index), value))
     }
 
@@ -7560,6 +7990,13 @@ impl VirtioGpu {
     pub fn isr_status_addr(&self) -> usize {
         self.isr_status_va
     }
+
+    /// The ISR's message-mode state word, 0 when the device is on the INTx line.
+    /// `DxgkDdiStartDevice` publishes it to the `AdapterContext` beside
+    /// [`Self::isr_status_addr`] so the DIRQL ISR can route a message lock-free.
+    pub fn msi_isr_state(&self) -> u32 {
+        self.msi_isr_state
+    }
 }
 
 // The `#[cfg(test)] mod present_stream_tests` that used to sit HERE was moved to
@@ -7593,6 +8030,20 @@ impl Drop for VirtioGpu {
             // SAFETY: the entry owns an object reference taken at registration.
             unsafe { ObDereferenceObjectDeferDelete(e.event.as_ptr() as PVOID) };
         }
+        // RM event registrations: unlike the fence events above, these WAKE their
+        // waiters (a process blocked on one must give up and see the loss), then
+        // drop the references. PASSIVE, outside the device lock.
+        self.teardown_nvrm_events();
+        // FALLBACK sweep of the pins, handle and mapping records still tracked
+        // (the normal path, `nvrm::retire_transport`, already closed every handle
+        // on the host and emptied these while the transport was alive; what is
+        // left here is a transport that had failed, was never asked, or that
+        // something re-populated since). Nothing is sent to the host: the reset
+        // above does not make it drop its RM files (its backend resets only at
+        // the next feature negotiation), so this CANNOT promise the host let go of
+        // a pinned page; it unlocks them anyway because user pages left locked
+        // bugcheck their process at exit.
+        self.teardown_nvrm_state();
 
         // The reset above quiesced the device before the in-flight/parked entry
         // buffers free with this struct.

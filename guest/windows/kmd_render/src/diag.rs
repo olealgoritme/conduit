@@ -530,6 +530,13 @@ pub mod knobs {
 
     /// Breadcrumb ring level. 0 (default) = the `S<idx>` ring is off.
     pub const DIAG_LEVEL: KnobName = KnobName::new(b"DiagLevel");
+    /// `NvSpinUs` (default 50): how long, in microseconds, a forwarded RM message
+    /// polls for its reply before it blocks (`virtio::ctrl::raw_roundtrip`). 0
+    /// turns the spin off; above 200 it is clamped. Adaptive on top of this: the
+    /// spin backs off by itself while the host answers slower than the budget
+    /// (`helios_kmd_logic::nvrm_fastpath::spin`). Read once, at the first forward;
+    /// the outcome is mirrored in `NvSpinHit` / `NvSpinMis`.
+    pub const NV_SPIN_US: KnobName = KnobName::new(b"NvSpinUs");
     /// Segment topology. Legal values 0 and 10 only — see `BarSegTopology`.
     pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
     /// CpuVisible cached-allocation kill switch (default 1 = cached).
@@ -618,6 +625,17 @@ pub mod knobs {
     /// exactly. Snapshotted at transport init, so `pnputil /restart-device`
     /// flips it without a reboot.
     pub const PRESENT_EXACT_WATERMARK: KnobName = KnobName::new(b"PresentWmk");
+
+    /// `MsiVectors` (default 0 = per-source vectors when the OS granted enough
+    /// messages). 1 forces ONE shared message 0 for every queue even when more
+    /// were granted: the same-boot A/B between per-queue and shared vectors.
+    ///
+    /// This is NOT a switch back to INTx. Whether the OS hands the driver
+    /// messages or the INTx line is decided by PnP before `StartDevice` from the
+    /// device key's `MSISupported`; see `docs/msi-interrupts.md` for the one
+    /// `reg add` that forces INTx. Snapshotted at transport init, so
+    /// `pnputil /restart-device` applies it without a reboot.
+    pub const MSI_VECTORS: KnobName = KnobName::new(b"MsiVectors");
 
     /// Default-enabled capacity notification for retry of a full Venus transport
     /// queue. 0 preserves historical 1 ms polling; no capacity change.

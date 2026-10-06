@@ -68,6 +68,9 @@ const fn wire_tail_off(len: usize) -> usize {
 }
 
 impl DmaBuffer {
+    /// The smallest capacity a buffer can have: one page.
+    pub const MIN_CAPACITY: usize = PAGE_SIZE;
+
     /// Allocate a zeroed contiguous buffer of at least `len` bytes. Returns
     /// `None` on allocation failure or `len == 0`.
     pub fn new(_passive: PassiveLevel, len: usize) -> Option<Self> {
