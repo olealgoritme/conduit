@@ -1388,3 +1388,176 @@ legitimately exceeds a budget (why it defaults to off).
 
 Risks: the kept address (14.3); `DeferBudget` abandons a programming whose host SET may still land; the watchdog and the
 direct exits only exist while the knob is set, and a run with it set is no longer a baseline.
+
+## 15. Already-on-scanout present tag
+
+Status: KMD half implemented (`kmd_logic::onscanout`, `kmd_render/src/ddi/onscanout.rs`, hooks in `display.rs`,
+`submit_command.rs`, `device.rs`, `virtio/foreign_scanout.rs`); the UMD half does not exist yet. Wire layout:
+`protocol/src/onscanout.rs`, C mirror `protocol/include/helios_onscanout.h`. The pure logic is host-tested; the glue is
+type-checked against the stub harness only, never compiled for the WDK and never run on Windows.
+
+### 15.1 The problem, and which arm it is
+
+A producer that shows its frames through the user foreign-scanout source (`SCANOUT_SET` / `SCANOUT_PRESENT`) has
+already put the frame on scanout, but a D3D11 `PresentImpl` waits on the frame-latency semaphore that only a per-frame
+`pfnPresentCb` releases, so the UMD presents anyway. The arm `DxgkDdiPresent` runs is decided by `DXGK_PRESENTFLAGS`
+alone (`display.rs`: bit 2 `Flip` clear is the Blt arm; bit 2 set with no DMA buffer is the MMIO flip, with one the DMA
+flip). What dxgkrnl sends for which swap chain is its choice and is not provable from this tree; what the tree
+establishes:
+
+* **Legacy blit model, windowed (and a flip-model chain the runtime degrades to a blit): the Blt arm** (`Flags.Blt`,
+  `PBflag` bit 0). Source = the app's DXGI surface, destination = the window's redirection surface (DWM's: a
+  `PitchedStandardBuffer` or an OPTIMAL image). This is the per-frame cost.
+* **Flip-model swap chain composed by DWM: the app's frame is not a Blt.** dxgkrnl redirects a composed flip-model
+  present to DWM (the app's buffers are DWM's inputs); the KMD sees DWM's own flips (Flip arm), not a per-frame app Blt.
+  A Blt per frame therefore means the chain is on the blit path. **Independent / direct flip** (borderless fullscreen
+  promoted by dxgkrnl) reaches the Flip arm, MMIO or DMA (`flip_route`: `Arm` for a direct-scanout or a
+  `ForeignFlip`-registered allocation, `Skip` = the counted keep of sections 12 and 13, `Fail` for an ordinary
+  unregistered one). A flip copies nothing; its cost is the programming (`arm_dma_flip` / `SetVidPnSourceAddress`) and
+  its completion invariant (section 13), which must keep running.
+
+Which one FFXIV hits is read, not assumed: `PBflag` (bit 0 / bit 2), `PrFgBlt` / `PrFgFlip`, and `OsRejWhy` 6 below (a
+tag arrived on a flip).
+
+**The full-frame Blt, concretely** (non-snapshot Blt arm with an adopted foreign source and `ForeignCopy` = 1; with it
+0 the foreign source is a counted skip, `FcOff`, with no copy but still a failed import attempt per frame): import of
+the NVK image into the KMD's own Venus device as an explicit-modifier dma-buf image, `vkCmdCopyImage` (or the BGRA
+scratch blit for XBGR) of the WHOLE source into the destination (`SrcRect`, `DstRect` and sub-rects are ignored, the
+extents must be equal), then for a standard-buffer destination a CPU wait on the GPU fence (`wait_fence`, up to 5 s),
+`mirror_present_system_backing` (a CPU copy of the whole surface into the paged-out MDL pages when the destination has
+system backing) and the ownership hand-back, and the copy's wire fence merged into the DMA fence. 5120x1440x4 is 29.5
+MB read and 29.5 MB written per frame plus a host round trip. While a user source is live none of it is visible: the
+source withholds the desktop's host flush (`foreign_scanout_suppresses`).
+
+### 15.2 The tag, and where it travels
+
+It does NOT travel in `pfnPresentCb`'s `pPrivateDriverData`: dxgkrnl does not forward that to `DxgkDdiPresent` (`PBIdOk`
+= "no payload" across three driver generations; the D4b snapshot and the stream marker had to move to the Render command
+for the same reason). The carrier is the **`HERF` command the UMD already submits with `pfnRenderCb` immediately before
+`pfnPresentCb`, on the same `hContext`** (`MarkerPresent`, `umd/src/forward/present.rs`), extended by a tail.
+`DxgkDdiRender` parses it and stashes it on the context; the Present that follows on that context takes it (read and
+clear, on every Present, whatever its arm: the same pairing and orphan bound as the stream marker). Every `HERF` Render
+replaces the stash, so a tag never reaches a later Present than its own.
+
+All little-endian. `CommandLength` of the Render must be **72** (not 32 or 48):
+
+```text
+offset  size  field
+  0      32   HeliosPresentRefreshCmd  'HERF' v1, the stream tail as ever (ctx_id, value, cookie)
+ 32      16   HeliosRmFenceTail        all zero unless an RM fence is attached (rm-fence-marker.md)
+ 48      24   HeliosOnScanoutTag
+   48    u32  magic        0x43534F48 ('HOSC': bytes 48 4F 53 43)
+   52    u16  version      1
+   54    u16  flags        0 (nonzero is rejected)
+   56    u64  sequence     the out_seq SCANOUT_PRESENT returned for THIS frame, nonzero
+   64    u32  generation   the out_generation SCANOUT_SET returned for the live source, nonzero
+   68    u32  resource_id  the Blt source's Helios resource id, or 0 = not stated
+```
+
+```c
+struct HeliosOnScanoutTag { uint32_t magic; uint16_t version, flags; uint64_t sequence;
+                            uint32_t generation, resource_id; };           /* 24 */
+struct HeliosPresentRefreshCmdOnScanout { struct HeliosPresentRefreshCmdFence base; /* 48 */
+                                          struct HeliosOnScanoutTag tag; };         /* 72 */
+```
+
+The KMD reads the bytes from offset 48 up to `CommandLength`: nothing there, or zero bytes, is "no claim" and costs
+nothing; anything nonzero is a claim and is counted. The stream tail and the fence slot compose with the tag unchanged
+(a CPU-complete `value == 0` marker, or an RM fence, still decides the present's boundary). An older KMD copies the 72
+bytes into the DMA buffer, reads the 32-byte `HERF`, ignores the rest and does the ordinary Blt, so the UMD may always
+send it; there is no capability bit (a delta in `OsSkip` is the proof). The DMA buffer must hold the 72 bytes
+(`STATUS_BUFFER_TOO_SMALL` from Render is dxgkrnl's retry, as for any command).
+
+UMD rules: take `generation` from the `SCANOUT_SET` reply and `sequence` from the `SCANOUT_PRESENT` reply of the frame
+being presented; the presenting context must belong to a device of the SAME PROCESS as the device that issued them
+(NVK's librmclient D3DKMT device and the UMD's runtime device are two devices of one process, which is what the check
+compares: `hKmdProcess`); send the Render immediately before the Present, on the presenting context, with the usual
+allocation list; tag only a whole-surface Blt (no `ColorFill`, no dirty rects) and never together with a windowed-Blt
+snapshot.
+
+### 15.3 Verification (a tag is a claim, never a fact)
+
+The skip happens only when the KMD's own state backs every part of it (`kmd_logic::onscanout::verify`, checked in this
+order; the first failure is the reason, `OsRejWhy`):
+
+| code | reason | what the KMD checked |
+|---|---|---|
+| 1 | `BadMagic` | the bytes at 48 are nonzero and not `HOSC` |
+| 2 | `Short` | `HOSC` but fewer than 24 bytes before `CommandLength` |
+| 3, 4, 5 | `Version`, `Flags`, `Fields` | version 1, flags 0, `sequence` and `generation` nonzero |
+| 6 | `NotBlt` | the Present is a flip, or has no allocation list or no Blt flag: nothing to copy, the flip machinery runs as ever |
+| 7, 8, 9 | `ColorFill`, `SubRects`, `Snapshot` | a whole-frame Blt only: no fill, no destination sub-rects, no snapshot stash |
+| 10 | `NoSource` | a live, unlapsed USER source exists (not the KMD's resident one) and has minted a frame |
+| 11 | `Generation` | `generation` is that source's |
+| 12 | `Owner` | the presenting context's `hKmdProcess` equals the process of the device that minted the source's frames; an unknown process on either side never matches |
+| 13, 14 | `Ahead`, `Stale` | `sequence` is at most the newest `SCANOUT_PRESENT` minted for that generation (`Ahead` = a frame never minted) and at most 256 behind it (`Stale`) |
+| 15 | `Resource` | `resource_id`, if nonzero, is the Present's source resource id |
+| 16 | `Orphan` | a tag whose Present never came was replaced by the next Render |
+| 17 | `Retry` | verified, but the Present's own preconditions refused it (DMA or private buffer, patch capacity); dxgkrnl retries without the tag and the retry is the ordinary Blt |
+
+A rejected tag is the ordinary Blt, byte for byte: nothing of the default path changed (one relaxed load per Render and
+per Present on a context that carries no tag). What a lying UMD can do: nothing without the live source, and with it,
+the process that owns scanout 0 can already show anything on it; the loss is the update of its own window's
+redirection surface for the frames it falsely tagged. Another process, a stale or forged generation, a sequence the
+source never minted, an expired source or a flip: all rejected and counted.
+
+### 15.4 What the skipped Present does
+
+`present_blt_onscanout` (`display.rs`) is the legacy Blt arm minus the copy and nothing else: the arm's own
+preconditions in its order and at its sites (DMA buffer holds the marker, private record holds the merge, patch
+capacity: all before anything is done, so dxgkrnl's retry protocol is unchanged), then `present_blt_skipped`, the
+completion a skipped foreign Blt already takes: fence-0 marker merged, patch references written, the KMD's DMA marker,
+the stream boundary merged. So the Present completes at the point a Blt would for dxgkrnl (the DMA fence retires with
+the packet, behind the producer's own boundary if the marker carries one), the frame-latency semaphore releases, and
+the source is no longer read, which is why it can be reused at once. Nothing is begun that needs a release: no
+destination `KmdWriter` / CPU-mirror ownership (`begin_present_buffer_write_legacy` is not called), no WindowedBlt token
+(a snapshot never reaches this path, so the dead-ready-token class fixed in v323 has no way in), no read-ledger ticket,
+no Venus import, no host call. The level 5 RM-primary Blt is skipped too (its copy is what is being avoided).
+
+### 15.5 Counters (`Os`, at most 14 characters, unique across `kmd_render` and `kmd_logic`)
+
+`OsTag` claims seen (a tag, well-formed or not; `OsTag = OsSkip + OsRej` when nothing is in flight), `OsSkip` presents
+completed with no copy, `OsRej` claims not honoured, `OsRejWhy` the last reason (the table above), `OsWhyMask` every
+reason seen this generation (bit `code - 1`), `OsBytes` MiB of copy avoided (the source's `pitch * height`), `OsLast`
+the last honoured sequence (low 32 bits). Registry: the first skip, then every 256th; the first rejection, every new
+reason and every 64th; the rest through `publish_nvrm_counters`; zeroed at StartDevice.
+
+### 15.6 Hardware checklist (FFXIV on NVK with the tag; lowest mode first: 1920x1080 at 60 Hz, then bigger)
+
+1. Before the tag (UMD without it): read `PBflag` (bit 0 Blt, bit 2 Flip), `PrFgBlt` / `PrFgFlip`, `FcImp`, and the
+   Present's return time (`scanout_timeline` PRESENT_RETURN): the cost this removes.
+2. With the tag: `OsTag` and `OsSkip` rise at about the frame rate; `OsRej` stays 0 in steady state; `OsBytes` per
+   second is the frame bytes times the rate (5120x1440: about 28 MiB per frame). `OsLast` follows the sequence
+   `SCANOUT_PRESENT` returned.
+3. `OsRej` rising: read `OsRejWhy` and `OsWhyMask`. 6 = the present is a flip (the Blt hypothesis was wrong: report
+   `PBflag`); 10 / 11 = the source is not live or the UMD's generation is stale (`FsLive`, `FsGen`); 12 = the UMD's
+   presenting context is in another process than the one that issued the escapes; 13 / 14 = sequence bookkeeping; 15 =
+   a wrong `resource_id`; 7 to 9 = the shape (dirty rects, snapshot).
+4. No Blt cost: the Present's return time drops to the marker path; `FcImp` / `FcRefuse` stop moving; `PBSyWt` and
+   `PBSyCp` do not appear; in WPR / PresentMon the Venus device's copy submissions drop to the desktop's own and
+   `msBetweenPresents` follows the producer (about 247 fps in the reference run), not the Blt.
+5. Release the source (`SCANOUT_RELEASE`, or kill the app): the tag is rejected with 10 from the next frame, the
+   ordinary Blt resumes, and the desktop is restored by the usual flush (`FsRest`).
+
+### 15.7 Verified, and not
+
+Verified (host tests): the parse over every short length, a forged magic, version, flags, zero fields, a zero tail (not
+a claim) and random bytes; the verdict for the exact claim, lag at and past the limit, a sequence ahead, a wrong
+generation, a wrong or unknown process, no source or no minted frame, flips, ColorFill, sub-rects, a snapshot, a named
+resource, and the order of the reasons; the per-source record's generation and monotonic rules; reason codes dense and
+stable; counter names (at most 14, unique, nothing else in either crate writes an `Os` literal); the protocol layout
+(sizes 24 and 72, offsets, magic bytes) and the C header's constants. Type-checked against the stub harness: the error
+set equals the base's (a new error kind would have shown; an injected error in the new file is reported).
+
+NOT verified: anything on hardware or the WDK build; the arm FFXIV really hits (15.1); that `hKmdProcess` is the same
+token for the producer's escape device and the presenting device (the premise of the owner check, as for stream
+markers); that dxgkrnl treats the skipped Present's frame-latency semantics exactly as a copied one's (the completion
+shape is a skipped foreign Blt's, which has run); that the runtime's command buffer accepts a 72-byte Render command.
+
+Risks: (1) a window whose redirection surface is not updated while the source is live shows stale content when the
+source ends, until its next honest Present (the desktop's restore flush covers the primary, not the window); (2) an
+owner mismatch makes the optimization silently inert (counted, `OsRejWhy` 12), not wrong; (3) the sequence check is
+about frames minted, not frames shown (a fenced flip may still be queued when its Present completes), which is
+invisible by construction; (4) a tag on a flip is refused on purpose (a flip copies nothing and its completion
+invariant must run), so a flip-path workload needs a different lever; (5) `ForeignFlip`'s resident source (DWM-on-NVK)
+is not covered: its presents are flips.

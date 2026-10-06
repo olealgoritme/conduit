@@ -176,6 +176,8 @@ fn mint(
         // The source was registered in an earlier transport generation.
         return Err(PresentRefusal::NoSource);
     }
+    // The frame the already-on-scanout tag (`ddi/onscanout.rs`) can later name.
+    crate::ddi::onscanout::note_minted(owner, flip.generation, flip.seq);
     Ok(flip)
 }
 

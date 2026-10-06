@@ -197,6 +197,17 @@ pub(crate) fn now_100ns() -> u64 {
     unsafe { wdk_sys::ntddk::KeQueryInterruptTimePrecise(&mut qpc_timestamp) }
 }
 
+/// The generation of the live USER source: `Some` only while one is live and has not lapsed, never
+/// for the KMD's own resident source. One short leaf-lock hold (the already-on-scanout tag's check,
+/// `ddi/onscanout.rs`).
+pub(crate) fn live_user_generation() -> Option<u32> {
+    STATE
+        .lock()
+        .suppress_desktop(now_100ns())
+        .filter(|a| !a.resident)
+        .map(|a| a.generation)
+}
+
 /// Mirror the counters to the registry. PASSIVE only.
 pub(crate) fn publish_counters() {
     use crate::diag::record_named_bytes as rec;

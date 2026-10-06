@@ -304,6 +304,10 @@ pub(crate) fn publish_nvrm_counters() {
     // A Present refusal caused by a foreign allocation, answered with success: `PrFgSkip`
     // (last reason `PrFgWhy`, per arm `PrFgBlt` / `PrFgFlip`), written once one happened.
     crate::ddi::present_foreign::publish_counters();
+    // A Blt Present completed with no copy because its producer already put the frame on scanout
+    // (`HOSC`): `OsTag`, `OsSkip`, `OsRej` / `OsRejWhy` / `OsWhyMask`, `OsBytes`, `OsLast`, written
+    // once a tag was seen.
+    crate::ddi::onscanout::publish_counters();
     // A flip of a foreign primary completed without a bind (`kept_picture`): `FkKeep`, the lane
     // split `FkWorker` / `FkDma` / `FkAsync`, the last reason `FkWhy`, written once one happened.
     crate::ddi::flip_keep::publish_counters();
@@ -2216,6 +2220,13 @@ pub unsafe extern "C" fn dxgkddi_render(
             // hand-written `!is_null()` pair; `ContextHandleRef` is the same
             // traversal, checked once, in the module that owns the fields.
             let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
+            if let Some(context) = context.as_ref() {
+                // The already-on-scanout tag (`HOSC`, `ddi/onscanout.rs`) at the tail of the
+                // command: parsed and stashed for the Present that follows on this context, or
+                // (no tag) the stash cleared. Never fails the Render.
+                // SAFETY: `cmd_len` bytes are readable at `pCommand` (checked at the top).
+                unsafe { crate::ddi::onscanout::note_render(context, args.pCommand as *const u8, cmd_len) };
+            }
             if let Some(adapter) = context.as_ref().and_then(|c| c.adapter()) {
                 // The RM fence tail (carrier (b)): only a command that covers all 48
                 // bytes has one, and a fence is exclusive with the stream marker.
