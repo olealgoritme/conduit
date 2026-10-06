@@ -120,8 +120,11 @@ Everything else is a header status. `HELIOS_NVRM_ST_*` as this build produces th
 `VirtioGpu::nvrm_epoch()`, i.e. the transport instance's `wire_fence_base`: it changes at
 every StartDevice, and reads **0 when there is no transport**. A client that sees its
 remembered epoch change must reopen: every handle, mapping, pin and event of the earlier
-transport is gone. librmclient reads the epoch at init and does not re-check it
-(section 10.2).
+transport is gone. A status of `TRANSPORT_RESET` (or `STATUS_DEVICE_NOT_READY` from the event
+ops, which is what "no transport" looks like to them) says the same. librmclient on branch
+`rmc/transport-loss` (commit `2995935`) reads the epoch of every reply, and `0` means no
+transport (section 9); on `feat/nvk-rm-windows-transport` alone it still reads the epoch only
+at init.
 
 ## 4. The operations
 
@@ -557,7 +560,23 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
 - Maps CPU memory with Linux's channel-per-mapping protocol, the final map being `MMAP`;
   the channel is kept until `NV_ESC_RM_UNMAP_MEMORY`.
 - `event_wait` creates a manual-reset event per channel, `EVENT_REGISTER(READY)`, waits,
-  `ResetEvent`s, and the caller drains. It never registers `TRANSPORT_LOST`.
+  `ResetEvent`s, and the caller drains. On `feat/nvk-rm-windows-transport` it never
+  registers `TRANSPORT_LOST`; on `rmc/transport-loss` (`2995935`) it does, see the next item.
+- Transport loss (`rmc/transport-loss`): init refuses a KMD that reports `epoch == 0` (no
+  transport; retried by the next `crm_open`) and registers ONE process-wide `TRANSPORT_LOST`
+  event (handle 0, when `QUERY_CAPS` offers the op and the kind). `event_wait` waits on the
+  channel event and that event with `WaitForMultipleObjects`; a loss ends it with `-ENODEV`,
+  even an infinite wait. The KMD wakes every registration on a loss, so the loss is
+  re-checked after a channel wake. Every escape reply is judged too: `TRANSPORT_RESET`, an
+  `epoch` other than the init one (including 0), or `STATUS_DEVICE_NOT_READY` /
+  `STATUS_DEVICE_REMOVED` latches the loss for the life of the process, and every call then
+  answers `-ENODEV` without a round trip, except `MUNMAP`, `UNPIN` and `EVENT_UNREGISTER`,
+  which still go to the KMD (an escape from the owner is how the KMD reclaims the CPU views
+  a stopped transport left, section 6). The rules are pure inline helpers in
+  `helios_nvrm_escape.h`, tested by `tests/test_win_wire.c`; the wait itself has only been
+  cross-compiled. A failed-but-not-replaced transport keeps its epoch and answers
+  `DEVICE_ERROR` (-> `EIO`) to forwards: only the `TRANSPORT_LOST` event (or a `TRANSPORT_RESET`
+  from `EVENT_REGISTER`) reveals it, so a KMD without events gives no loss detection there.
 - KMD statuses become errno: NOT_OWNED -> `EBADF`, MSG_TYPE_REFUSED/FORBIDDEN -> `EPERM`,
   TRANSPORT_RESET -> `ENODEV`, NO_RESOURCES -> `EMFILE`, UNSUPPORTED -> `ENOSYS`,
   TIMEOUT -> `ETIMEDOUT`, BAD_RANGE -> `EINVAL`, anything else -> `EIO`; escape NTSTATUS
@@ -581,9 +600,10 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
   registration reply itself.
 - **A committed pin cannot be released by the user** (`PIN_IN_USE`); a process that registers
   and never frees keeps the pages locked until Close/exit.
-- **`TRANSPORT_LOST` is implemented in the KMD but not delivered to transports**: librmclient's
-  Windows transport registers only `READY`, so a thread blocked in `event_wait` with an
-  infinite timeout is not woken by a transport failure, and the epoch is never re-read.
+- **`TRANSPORT_LOST` reaches librmclient only on `rmc/transport-loss`** (`2995935`, not merged
+  into `feat/nvk-rm-windows-transport` here): the earlier Windows transport registers only
+  `READY`, so a thread blocked in `event_wait` with an infinite timeout is not woken by a
+  transport failure and the epoch is never re-read (section 9 describes the fix).
 - **`IMPORT_RM`** (`HELIOS_ESCAPE_FOREIGN_RESOURCE`, verb 0x0018, a different verb) is gated
   off: `RM_IMPORT_SERVED = false` in `virtio/foreign.rs`, `CAP_RM_IMPORT` not advertised,
   answers `ST_UNSUPPORTED` before touching state. The host half and the NVK/UMD half do not
@@ -636,7 +656,7 @@ touched.
   fence base and changes at StartDevice only (0 with no transport).
 - Commit `0185243` says only the UVM aperture is mappable; the code also maps the RM window.
 - `transport_windows.c` header comment and the transport-branch README say events and PIN
-  answer `-ENOSYS`; both are implemented in that file.
+  answer `-ENOSYS`; both are implemented in that file (corrected on `rmc/transport-loss`).
 
 ## 11. How to add an op: checklist
 
