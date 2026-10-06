@@ -96,6 +96,7 @@ is the next step. Nine more Mesa patches on top of the 13 above, in `patches-win
 | 20 | `nvk: Win32 WSI` | `VK_KHR_win32_surface` + swapchain through Mesa's win32 WSI, as a software device (CPU copy per present) |
 | 21 | `nvk/rm, wsi: Win32 zero-copy present by Helios scanout` | swapchain images in VRAM, imported once on a host render node as GEM objects and shown with ScanoutFlip (see "Zero-copy present on Windows" below); GDI stays the fallback |
 | 22 | `nvk/rm: host-visible VRAM (a BAR heap)` | a DEVICE_LOCAL \| HOST_VISIBLE \| HOST_COHERENT type on a heap of its own, backed by vidmem mapped once through BAR1 (see "Host-visible VRAM" below). Generic RM code, Linux too |
+| 24 | `nvk/rm, wsi: block-linear Win32 scanout swapchains with NVIDIA's modifier` | the zero-copy swapchain images keep NVK's tiling (block-linear, `0x0300000000606015` on GB20x) and are presented with that DRM modifier, so NVK no longer renders through a tiled shadow plus a copy into a linear image every frame; `NVK_HELIOS_WSI_LINEAR=1` or a refused modifier: linear as before (see "Block-linear scanout" below). 23 is S3's, 25+ follow |
 
 Linux behaviour is unchanged: the full series (20 patches) builds the Linux
 NVK (nouveau + RM) as before, with the same `.so` exports; the patches apply

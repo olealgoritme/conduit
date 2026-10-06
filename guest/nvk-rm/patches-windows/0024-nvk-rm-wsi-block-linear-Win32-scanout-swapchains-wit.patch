@@ -1,0 +1,535 @@
+From 746a1e737f7a32447a8ba8e124ccdbe723e5ab7c Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 03:30:33 +0200
+Subject: [PATCH] nvk/rm, wsi: block-linear Win32 scanout swapchains with
+ NVIDIA's modifier
+
+Patch 0021 presents swapchain images by host scanout with no copy to a
+window, but the images are linear, and NVK cannot render into linear
+color images: every render pass draws into a hidden tiled shadow and
+copies it into the linear image (nvk_cmd_draw.c, linear_tiled_shadows),
+so each frame still has a full-screen GPU copy plus the shadow's VRAM.
+
+Now the images keep NVK's own tiling, named by NVIDIA's DRM format
+modifier, which the host's display path reads as such (verified on the
+host with NVIDIA's driver importing NVK-on-RM block-linear memory,
+spike/host-nvk-import):
+
+vulkan/wsi (Win32):
+- The scanout image type asks the driver for its uncompressed NVIDIA
+  block-linear 2D modifiers for the format (GetPhysicalDeviceFormat-
+  Properties2 + DRM modifier list), keeps those that suit the swapchain's
+  usage, flags and extent (GetPhysicalDeviceImageFormatProperties2, as
+  wsi_common_drm.c does), and creates the images with
+  VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT and that list.  The driver
+  picks (NVK: the tallest block, h = 5, 0x0300000000606015 for
+  B8G8R8A8 on GB20x).  None left: LINEAR, as before.
+- scanout_export now takes the image and returns the modifier the image
+  got (vkGetImageDrmFormatModifierPropertiesEXT is Linux-only in the
+  runtime); the present names it in the flip instead of LINEAR.
+- wsi_device::win32.scanout_linear: LINEAR images only.  The driver sets
+  it at init (NVK_HELIOS_WSI_LINEAR=1); the WSI sets it itself when a
+  flip comes back VK_ERROR_FORMAT_NOT_SUPPORTED (the display path refused
+  the modifier) and returns VK_ERROR_OUT_OF_DATE_KHR, so the application
+  recreates the swapchain, linear.
+
+nvk/rm (Windows):
+- The dedicated allocation of a DRM-modifier image already takes the
+  image's PTE kind and tile mode (nvk_AllocateMemory), and the export
+  already passes them to NVKMS as block-linear surface params on
+  DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY (log2GobsPerBlock.y from the tile
+  mode, genericMemory), as nvkmd_rm_drm.c does on Linux.  The export
+  now checks that the memory's layout is the modifier's (generic kind =
+  the modifier's kind, block height = h, no depth blocks; LINEAR: no
+  kind) and refuses otherwise, so the swapchain falls back.
+- A SCANOUT_SET refused with -EINVAL (layout the KMD does not forward)
+  for a non-linear modifier is VK_ERROR_FORMAT_NOT_SUPPORTED, the WSI's
+  signal to go linear.  KMD 22.22.308..310 validates size, fourcc and
+  stride only, so block-linear modifiers pass.
+---
+ src/nouveau/vulkan/nvk_wsi.c               |  21 ++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |   7 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c |  49 +++++-
+ src/vulkan/wsi/wsi_common.c                |   4 +-
+ src/vulkan/wsi/wsi_common.h                |  22 ++-
+ src/vulkan/wsi/wsi_common_win32.cpp        | 185 ++++++++++++++++++++-
+ 6 files changed, 266 insertions(+), 22 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
+index bec2dff..c13ab12 100644
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -10,18 +10,29 @@
+ #ifdef _WIN32
+ #include "nvk_device.h"
+ #include "nvk_device_memory.h"
++#include "nvk_image.h"
+ #include "nvkmd/rm/nvkmd_rm.h"
++#include "drm-uapi/drm_fourcc.h"
++#include "util/u_debug.h"
+ 
+ /* Conduit's Helios adapter: swapchain images are shown by a host scanout
+  * flip of the VRAM they live in (nvkmd_rm_win.c), no copy to a window.
+  */
+ static VkResult
+-nvk_wsi_scanout_export(VkDevice _device, VkDeviceMemory _mem)
++nvk_wsi_scanout_export(VkDevice _device, VkImage _image, VkDeviceMemory _mem,
++                       uint64_t *modifier)
+ {
+    VK_FROM_HANDLE(nvk_device, dev, _device);
++   VK_FROM_HANDLE(nvk_image, image, _image);
+    VK_FROM_HANDLE(nvk_device_memory, mem, _mem);
+ 
+-   return nvkmd_rm_mem_export_scanout(mem->mem, &dev->vk.base);
++   /* Block-linear: the dedicated allocation took the image's PTE kind and
++    * tile mode (nvk_AllocateMemory), which the export hands to NVKMS.
++    */
++   *modifier = image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ?
++               image->vk.drm_format_mod : DRM_FORMAT_MOD_LINEAR;
++
++   return nvkmd_rm_mem_export_scanout(mem->mem, &dev->vk.base, *modifier);
+ }
+ 
+ static VkResult
+@@ -91,6 +102,12 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
+       pdev->wsi_device.win32.scanout_export = nvk_wsi_scanout_export;
+       pdev->wsi_device.win32.scanout_flip = nvk_wsi_scanout_flip;
+       pdev->wsi_device.win32.scanout_release = nvk_wsi_scanout_release;
++      /* Block-linear swapchain images with NVIDIA's DRM modifier unless
++       * NVK_HELIOS_WSI_LINEAR=1 (linear: NVK renders through a tiled
++       * shadow and copies into the image every frame).
++       */
++      pdev->wsi_device.win32.scanout_linear =
++         debug_get_bool_option("NVK_HELIOS_WSI_LINEAR", false);
+    }
+ #endif
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 5751e9a..181bfec 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -370,8 +370,13 @@ nvkmd_rm_mem_export_dma_buf(struct nvkmd_mem *mem,
+  * Windows extras (nvkmd_rm_scanout_supported).
+  */
+ bool nvkmd_rm_scanout_supported(struct nvkmd_pdev *pdev);
++/* modifier: what the memory will be presented as (DRM_FORMAT_MOD_LINEAR or
++ * an NVIDIA block-linear modifier), checked against the layout the memory
++ * was allocated with, which is what NVKMS gets.
++ */
+ VkResult nvkmd_rm_mem_export_scanout(struct nvkmd_mem *mem,
+-                                     struct vk_object_base *log_obj);
++                                     struct vk_object_base *log_obj,
++                                     uint64_t modifier);
+ VkResult nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *mem,
+                                    struct vk_object_base *log_obj,
+                                    uint32_t width, uint32_t height,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+index e37dd56..8152599 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+@@ -29,6 +29,7 @@
+ 
+ #include "nvkmd_rm.h"
+ 
++#include "drm-uapi/drm_fourcc.h"
+ #include "util/log.h"
+ #include "util/u_atomic.h"
+ #include "util/u_debug.h"
+@@ -209,9 +210,30 @@ out:
+    return result;
+ }
+ 
++/* Does the layout the memory was allocated with (what NVKMS is told on
++ * import) match the modifier it is presented as?  Block-linear 2D: a
++ * generic kind and the same block height (log2 GOBs, tile_mode bits 4..7).
++ */
++static bool
++layout_matches_modifier(const struct nvkmd_rm_mem *mem, uint64_t modifier)
++{
++   if (modifier == DRM_FORMAT_MOD_LINEAR)
++      return mem->pte_kind == 0;
++
++   if (!fourcc_mod_is_vendor(modifier, NVIDIA) || !(modifier & 0x10))
++      return false;
++
++   const uint32_t h = modifier & 0xf;
++   const uint32_t kind = (modifier >> 12) & 0xff;
++   return mem->pte_kind != 0 && kind == mem->pte_kind &&
++          ((mem->tile_mode >> 4) & 0xf) == h &&
++          ((mem->tile_mode >> 8) & 0xf) == 0;
++}
++
+ VkResult
+ nvkmd_rm_mem_export_scanout(struct nvkmd_mem *_mem,
+-                            struct vk_object_base *log_obj)
++                            struct vk_object_base *log_obj,
++                            uint64_t modifier)
+ {
+    struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
+    struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
+@@ -220,6 +242,13 @@ nvkmd_rm_mem_export_scanout(struct nvkmd_mem *_mem,
+    if (!nvkmd_rm_scanout_supported(dev->base.pdev))
+       return vk_error(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
+ 
++   if (!layout_matches_modifier(mem, modifier)) {
++      return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
++                       "RM: memory 0x%x (kind 0x%x, tile 0x%x) cannot be "
++                       "shown as modifier 0x%016" PRIx64, mem->h_memory,
++                       mem->pte_kind, mem->tile_mode, modifier);
++   }
++
+    bool exported = false;
+    simple_mtx_lock(&mem->export_mutex);
+    if (mem->gem_handle == 0) {
+@@ -274,7 +303,8 @@ kmd_source_set_locked(struct nvkmd_rm_dev *dev,
+  */
+ static int
+ kmd_source_present(struct nvkmd_rm_dev *dev,
+-                   const struct nvrm_crm_scanout_flip *flip)
++                   const struct nvrm_crm_scanout_flip *flip,
++                   bool *layout_rejected)
+ {
+    const struct nvkmd_rm_lib *lib = dev->lib;
+    int ret;
+@@ -299,6 +329,8 @@ kmd_source_present(struct nvkmd_rm_dev *dev,
+       dev->source.modifier == flip->modifier;
+    if (!same_layout) {
+       ret = kmd_source_set_locked(dev, flip);
++      /* -EINVAL: a layout the KMD does not forward */
++      *layout_rejected = ret == -EINVAL;
+       if (ret == -ENOSYS) {
+          dev->no_kmd_source = true;
+          if (dev->base.pdev->debug_flags & NVK_DEBUG_VM)
+@@ -350,7 +382,7 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
+    struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
+    struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
+ 
+-   VkResult result = nvkmd_rm_mem_export_scanout(_mem, log_obj);
++   VkResult result = nvkmd_rm_mem_export_scanout(_mem, log_obj, modifier);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -366,11 +398,20 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
+       .modifier = modifier,
+       .seq = p_atomic_inc_return(&dev->flip_seq),
+    };
+-   int ret = kmd_source_present(dev, &flip);
++   bool layout_rejected = false;
++   int ret = kmd_source_present(dev, &flip, &layout_rejected);
+    if (ret == -ENOSYS)
+       ret = dev->lib->win_scanout_flip(&flip);
+    if (ret == 0) {
+       p_atomic_inc(&dev->flips_ok);
++   } else if (layout_rejected && modifier != DRM_FORMAT_MOD_LINEAR) {
++      /* The KMD refused the layout, and LINEAR is the one it surely takes:
++       * the WSI goes linear (wsi_device::win32.scanout_flip).
++       */
++      p_atomic_inc(&dev->flips_failed);
++      result = vk_errorf(log_obj, VK_ERROR_FORMAT_NOT_SUPPORTED,
++                         "SCANOUT_SET of modifier 0x%016" PRIx64 ": %d (%s)",
++                         modifier, ret, strerror(-ret));
+    } else {
+       p_atomic_inc(&dev->flips_failed);
+       result = vk_errorf(log_obj, VK_ERROR_SURFACE_LOST_KHR,
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index b836da3..807a655 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -423,7 +423,9 @@ get_blit_type(const struct wsi_device *wsi,
+       return wsi_dxgi_image_needs_blit(wsi, dxgi_params, device);
+    }
+    case WSI_IMAGE_TYPE_WIN32_SCANOUT:
+-      /* Rendered where it is shown: a linear image in device memory */
++      /* Rendered where it is shown: device memory, linear or the driver's
++       * tiling with a DRM format modifier
++       */
+       return WSI_SWAPCHAIN_NO_BLIT;
+ #endif
+ #if defined(VK_USE_PLATFORM_METAL_EXT)
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index 3d6a0c4..6120072 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -163,16 +163,26 @@ struct wsi_device {
+        *
+        * scanout_export is called once per swapchain image, right after its
+        * (dedicated, device-local) memory is allocated; a failure makes the
+-       * swapchain fall back to the software path.  The memory stays
+-       * presentable until it is freed.  scanout_flip shows it; the image's
+-       * rendering has finished when it is called.  scanout_release (may be
+-       * NULL) gives the display back when a swapchain that presented is
+-       * destroyed.
++       * swapchain fall back to the software path.  It returns the image's
++       * DRM format modifier (the image is LINEAR, or has a modifier from the
++       * list the WSI gave with VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT; the
++       * WSI cannot ask itself, vkGetImageDrmFormatModifierPropertiesEXT is
++       * Linux-only).  The memory stays presentable until it is freed.
++       * scanout_flip shows it; the image's rendering has finished when it is
++       * called.  VK_ERROR_FORMAT_NOT_SUPPORTED from it: the display path
++       * rejected the modifier, so the WSI sets scanout_linear and makes the
++       * swapchain out of date.  scanout_release (may be NULL) gives the
++       * display back when a swapchain that presented is destroyed.
++       *
++       * scanout_linear: LINEAR swapchain images only (the driver may set it
++       * at init; the WSI sets it when a modifier is rejected).
+        */
+-      VkResult (*scanout_export)(VkDevice device, VkDeviceMemory memory);
++      VkResult (*scanout_export)(VkDevice device, VkImage image,
++                                 VkDeviceMemory memory, uint64_t *modifier);
+       VkResult (*scanout_flip)(VkDevice device, VkDeviceMemory memory,
+                                const struct wsi_win32_scanout_flip *flip);
+       void (*scanout_release)(VkDevice device);
++      bool scanout_linear;
+    } win32;
+ 
+    struct {
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index 55f416c..be3e082 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include <assert.h>
++#include <inttypes.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -82,6 +83,8 @@ struct wsi_win32_image {
+       int bmp_row_pitch;
+       void *ppvBits;
+    } sw;
++   /* DRM format modifier the scanout image is presented with (0: linear) */
++   uint64_t scanout_modifier;
+ };
+ 
+ struct wsi_win32_surface {
+@@ -589,9 +592,11 @@ wsi_dxgi_configure_image(const struct wsi_swapchain *chain,
+  *
+  * The driver shows device memory on the display itself (under Conduit, a
+  * host scanout flip of the GPU memory the image lives in), so the swapchain
+- * images are linear images in dedicated device memory that the driver makes
+- * presentable once (scanout_export) and names in every present
+- * (scanout_flip).  Nothing is copied to a window.
++ * images live in dedicated device memory that the driver makes presentable
++ * once (scanout_export) and names in every present (scanout_flip).  Nothing
++ * is copied to a window.  They have the driver's own tiling where a DRM
++ * format modifier names it (NVIDIA block-linear; the display reads it as
++ * such), else they are linear.
+  */
+ 
+ #define WSI_DRM_FORMAT_XRGB8888 0x34325258u /* 'XR24' */
+@@ -624,7 +629,10 @@ wsi_win32_create_scanout_image_mem(const struct wsi_swapchain *chain,
+    wsi->GetImageMemoryRequirements(chain->device, image->image, &reqs);
+ 
+    VkImageSubresource subresource = {};
+-   subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++   subresource.aspectMask = info->create.tiling ==
++                            VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ?
++                            VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT :
++                            VK_IMAGE_ASPECT_COLOR_BIT;
+    VkSubresourceLayout layout;
+    wsi->GetImageSubresourceLayout(chain->device, image->image,
+                                   &subresource, &layout);
+@@ -649,8 +657,130 @@ wsi_win32_create_scanout_image_mem(const struct wsi_swapchain *chain,
+    image->sizes[0] = reqs.size;
+    image->row_pitches[0] = layout.rowPitch;
+    image->offsets[0] = layout.offset;
++   /* The driver names the modifier the image ended up with
++    * (wsi_image::drm_modifier is not there on Windows)
++    */
++   struct wsi_win32_image *win32_image =
++      container_of(image, struct wsi_win32_image, base);
++   win32_image->scanout_modifier = 0; /* DRM_FORMAT_MOD_LINEAR */
++   return wsi->win32.scanout_export(chain->device, image->image,
++                                    image->memory,
++                                    &win32_image->scanout_modifier);
++}
++
++/* fourcc_mod_code(NVIDIA, ...) with the block-linear 2D bit (drm_fourcc.h's
++ * DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D) and its compression field.
++ */
++#define WSI_MOD_VENDOR_NVIDIA     0x03ull
++#define WSI_MOD_NVIDIA_BL_2D      0x10ull
++#define WSI_MOD_NVIDIA_COMPRESSION(m) (((m) >> 23) & 0x7)
++
++static bool
++wsi_win32_scanout_modifier_ok(uint64_t mod)
++{
++   return (mod >> 56) == WSI_MOD_VENDOR_NVIDIA &&
++          (mod & WSI_MOD_NVIDIA_BL_2D) &&
++          WSI_MOD_NVIDIA_COMPRESSION(mod) == 0;
++}
++
++/* The driver's uncompressed block-linear modifiers for the swapchain's
++ * format and usage (filtered as wsi_common_drm.c does), for the driver to
++ * pick from.  None: *count_out = 0.
++ */
++static void
++wsi_win32_scanout_modifiers(const struct wsi_swapchain *chain,
++                            const VkSwapchainCreateInfoKHR *pCreateInfo,
++                            const struct wsi_image_info *info,
++                            uint32_t *count_out, uint64_t **mods_out)
++{
++   const struct wsi_device *wsi = chain->wsi;
++
++   *count_out = 0;
++   *mods_out = NULL;
++   if (wsi->GetPhysicalDeviceFormatProperties2 == NULL ||
++       wsi->GetPhysicalDeviceImageFormatProperties2 == NULL)
++      return;
++
++   VkDrmFormatModifierPropertiesListEXT list = {};
++   list.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
++   VkFormatProperties2 props = {};
++   props.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
++   props.pNext = &list;
++   wsi->GetPhysicalDeviceFormatProperties2(wsi->pdevice,
++                                           pCreateInfo->imageFormat, &props);
++   if (list.drmFormatModifierCount == 0)
++      return;
++
++   VkDrmFormatModifierPropertiesEXT *mod_props =
++      (VkDrmFormatModifierPropertiesEXT *)
++      vk_alloc(&chain->alloc, sizeof(*mod_props) * list.drmFormatModifierCount,
++               8, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
++   uint64_t *mods = (uint64_t *)
++      vk_alloc(&chain->alloc, sizeof(*mods) * list.drmFormatModifierCount,
++               8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   if (mod_props == NULL || mods == NULL) {
++      vk_free(&chain->alloc, mod_props);
++      vk_free(&chain->alloc, mods);
++      return;
++   }
++   list.pDrmFormatModifierProperties = mod_props;
++   wsi->GetPhysicalDeviceFormatProperties2(wsi->pdevice,
++                                           pCreateInfo->imageFormat, &props);
++
++   const VkImageUsageFlags2KHR usage = vk_swapchain_usage_flags(pCreateInfo);
++   uint32_t n = 0;
++   for (uint32_t i = 0; i < list.drmFormatModifierCount; i++) {
++      const uint64_t mod = mod_props[i].drmFormatModifier;
++      if (!wsi_win32_scanout_modifier_ok(mod) ||
++          mod_props[i].drmFormatModifierPlaneCount != 1)
++         continue;
++
++      VkPhysicalDeviceImageDrmFormatModifierInfoEXT mod_info = {};
++      mod_info.sType =
++         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT;
++      mod_info.drmFormatModifier = mod;
++      mod_info.sharingMode = pCreateInfo->imageSharingMode;
++      mod_info.queueFamilyIndexCount = pCreateInfo->queueFamilyIndexCount;
++      mod_info.pQueueFamilyIndices = pCreateInfo->pQueueFamilyIndices;
++
++      VkImageUsageFlags2CreateInfoKHR usage2 = {};
++      usage2.sType = VK_STRUCTURE_TYPE_IMAGE_USAGE_FLAGS_2_CREATE_INFO_KHR;
++      usage2.usage = usage;
++
++      VkPhysicalDeviceImageFormatInfo2 format_info = {};
++      format_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
++      format_info.format = pCreateInfo->imageFormat;
++      format_info.type = VK_IMAGE_TYPE_2D;
++      format_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++      format_info.usage = (VkImageUsageFlags)usage;
++      format_info.flags = info->create.flags;
++      __vk_append_struct(&format_info, &usage2);
++      __vk_append_struct(&format_info, &mod_info);
++
++      VkImageFormatListCreateInfo format_list;
++      if (info->create.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
++         format_list = info->format_list;
++         format_list.pNext = NULL;
++         __vk_append_struct(&format_info, &format_list);
++      }
+ 
+-   return wsi->win32.scanout_export(chain->device, image->memory);
++      VkImageFormatProperties2 format_props = {};
++      format_props.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
++      VkResult result =
++         wsi->GetPhysicalDeviceImageFormatProperties2(wsi->pdevice,
++                                                      &format_info,
++                                                      &format_props);
++      if (result == VK_SUCCESS &&
++          pCreateInfo->imageExtent.width <=
++             format_props.imageFormatProperties.maxExtent.width &&
++          pCreateInfo->imageExtent.height <=
++             format_props.imageFormatProperties.maxExtent.height)
++         mods[n++] = mod;
++   }
++   vk_free(&chain->alloc, mod_props);
++
++   *count_out = n;
++   *mods_out = mods;
+ }
+ 
+ VkResult
+@@ -662,11 +792,33 @@ wsi_win32_scanout_configure_image(const struct wsi_swapchain *chain,
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-   /* What the display takes without knowing the driver's tilings */
+-   info->create.tiling = VK_IMAGE_TILING_LINEAR;
+    info->select_image_memory_type = wsi_select_device_memory_type;
+    info->create_mem = wsi_win32_create_scanout_image_mem;
+ 
++   /* The driver's own tiling, named by a DRM format modifier the display
++    * understands (NVIDIA block-linear): the image is rendered where it is
++    * shown, with no linear copy.  LINEAR when the driver asks for it
++    * (win32.scanout_linear) or has no such modifier for the format.
++    */
++   uint32_t mod_count = 0;
++   uint64_t *mods = NULL;
++   if (!chain->wsi->win32.scanout_linear)
++      wsi_win32_scanout_modifiers(chain, pCreateInfo, info, &mod_count, &mods);
++
++   if (mod_count > 0) {
++      info->create.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++      info->drm_mod_list = {};
++      info->drm_mod_list.sType =
++         VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
++      info->drm_mod_list.drmFormatModifierCount = mod_count;
++      info->drm_mod_list.pDrmFormatModifiers = mods; /* wsi_destroy_image_info */
++      __vk_append_struct(&info->create, &info->drm_mod_list);
++   } else {
++      vk_free(&chain->alloc, mods);
++      /* What the display takes without knowing the driver's tilings */
++      info->create.tiling = VK_IMAGE_TILING_LINEAR;
++   }
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -705,12 +857,29 @@ wsi_win32_queue_present_scanout(struct wsi_win32_swapchain *chain,
+    flip.stride = image->base.row_pitches[0];
+    flip.offset = image->base.offsets[0];
+    flip.fourcc = chain->scanout.fourcc;
+-   flip.modifier = 0; /* DRM_FORMAT_MOD_LINEAR: the images are linear */
++   flip.modifier = image->scanout_modifier;
+ 
+    VkResult result = wsi->win32.scanout_flip(chain->base.device,
+                                              image->base.memory, &flip);
+    chain->scanout.presented = true;
+ 
++   /* The display path does not take the driver's tiling: linear swapchains
++    * from now on, and this one is out of date (the application recreates
++    * it).
++    */
++   if (result == VK_ERROR_FORMAT_NOT_SUPPORTED && flip.modifier != 0) {
++      if (!chain->wsi->wsi->win32.scanout_linear) {
++         fprintf(stderr, "MESA-WSI: scanout modifier 0x%016" PRIx64
++                 " rejected, linear swapchains from now on\n", flip.modifier);
++      }
++      chain->wsi->wsi->win32.scanout_linear = true;
++      mtx_lock(&chain->acquire_mutex);
++      image->state = WSI_IMAGE_IDLE;
++      u_cnd_monotonic_broadcast(&chain->acquire_cond);
++      mtx_unlock(&chain->acquire_mutex);
++      return VK_ERROR_OUT_OF_DATE_KHR;
++   }
++
+    /* A lost frame is not a lost surface: report it once and go on */
+    if (result != VK_SUCCESS && !chain->scanout.flip_failed) {
+       chain->scanout.flip_failed = true;
+-- 
+2.43.0
+
