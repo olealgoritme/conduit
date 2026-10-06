@@ -1008,13 +1008,20 @@ unsafe fn create_resource_inner(
                     !a.pPrimaryDesc.is_null()
                 );
             }
-            let desc = D3D11_BUFFER_DESC {
-                ByteWidth: mip0.TexelWidth,
-                Usage: D3D11_USAGE(a.Usage as i32),
-                BindFlags: bind,
-                CPUAccessFlags: cpu,
-                MiscFlags: misc,
-                StructureByteStride: a.ByteStride,
+            // A video decoder buffer (D3D11.1 video DDI) is read back by the
+            // UMD at SubmitBuffers, whatever usage the runtime asked for.
+            let decoder_buffer = a.DecoderBufferType != 0;
+            let desc = if decoder_buffer {
+                decoder_buffer_desc(mip0.TexelWidth)
+            } else {
+                D3D11_BUFFER_DESC {
+                    ByteWidth: mip0.TexelWidth,
+                    Usage: D3D11_USAGE(a.Usage as i32),
+                    BindFlags: bind,
+                    CPUAccessFlags: cpu,
+                    MiscFlags: misc,
+                    StructureByteStride: a.ByteStride,
+                }
             };
             let (allocation, km_resource) =
                 match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None, None) {
@@ -1076,6 +1083,9 @@ unsafe fn create_resource_inner(
                     empty_present_private(),
                     None,
                 );
+                if decoder_buffer {
+                    mark_decoder_buffer(h_resource);
+                }
             });
             if !stored && allocation_handle != 0 {
                 // The buffer arm allocates first and creates second, so a failed

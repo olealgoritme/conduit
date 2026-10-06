@@ -64,6 +64,13 @@ bool reg_sz(const char* name, char* out, DWORD cap) {
                       &size) == ERROR_SUCCESS && out[0];
 }
 
+bool reg_dword(const char* name, DWORD* out) {
+  DWORD size = sizeof(*out);
+  return RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", name,
+                      RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, nullptr, out,
+                      &size) == ERROR_SUCCESS;
+}
+
 bool reg_wsz(const wchar_t* name, wchar_t* out, DWORD cap_chars) {
   out[0] = 0;
   DWORD size = cap_chars * sizeof(wchar_t);
@@ -274,6 +281,22 @@ void load_nvk() {
   // for nouveau); this process asked for it.
   if (!GetEnvironmentVariableA("NVK_RM", nullptr, 0))
     _putenv_s("NVK_RM", "1");
+  // Vulkan Video decode is experimental in NVK: without NVK_EXPERIMENTAL=video
+  // it shows no video queue, and DXVK's D3D11 video decoder (the UMD's video
+  // DDI, `VideoDdi` knob, default on for NVK) has nothing to run on. Added to
+  // whatever the environment already asks for.
+  DWORD video_ddi = 1;
+  reg_dword("VideoDdi", &video_ddi);
+  if (video_ddi != 0) {
+    char experimental[256] = {};
+    const DWORD n = GetEnvironmentVariableA("NVK_EXPERIMENTAL", experimental, sizeof(experimental));
+    if (n == 0) {
+      _putenv_s("NVK_EXPERIMENTAL", "video");
+    } else if (n < sizeof(experimental) - 8 && !std::strstr(experimental, "video")) {
+      std::strcat(experimental, ",video");
+      _putenv_s("NVK_EXPERIMENTAL", experimental);
+    }
+  }
   // LOAD_WITH_ALTERED_SEARCH_PATH: librmclient.dll next to the ICD resolves
   // first (the ICD also loads it by its own path).
   HMODULE m = LoadLibraryExW(c.nvk_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
