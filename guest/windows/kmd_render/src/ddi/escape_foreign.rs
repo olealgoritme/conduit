@@ -19,10 +19,11 @@ use helios_kmd_logic::foreign_resource::{
 use helios_protocol::{
     HeliosEscapeHeader, HeliosForeignHeader, HeliosForeignImportRm, HeliosForeignImportRmLayout,
     HeliosForeignLayout, HeliosForeignQueryCaps, HELIOS_FOREIGN_ABI_VERSION,
-    HELIOS_FOREIGN_CAP_RM_IMPORT, HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT, HELIOS_FOREIGN_OP_IMPORT_RM,
-    HELIOS_FOREIGN_OP_QUERY_CAPS, HELIOS_FOREIGN_ST_BAD_CONTEXT, HELIOS_FOREIGN_ST_BAD_RANGE,
-    HELIOS_FOREIGN_ST_DEVICE_ERROR, HELIOS_FOREIGN_ST_NOT_OWNED, HELIOS_FOREIGN_ST_NO_RESOURCES,
-    HELIOS_FOREIGN_ST_OK, HELIOS_FOREIGN_ST_UNSUPPORTED,
+    HELIOS_FOREIGN_CAP_RM_IMPORT, HELIOS_FOREIGN_CAP_SHARED_OPEN,
+    HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT, HELIOS_FOREIGN_OP_IMPORT_RM, HELIOS_FOREIGN_OP_QUERY_CAPS,
+    HELIOS_FOREIGN_ST_BAD_CONTEXT, HELIOS_FOREIGN_ST_BAD_RANGE, HELIOS_FOREIGN_ST_DEVICE_ERROR,
+    HELIOS_FOREIGN_ST_NOT_OWNED, HELIOS_FOREIGN_ST_NO_RESOURCES, HELIOS_FOREIGN_ST_OK,
+    HELIOS_FOREIGN_ST_UNSUPPORTED,
 };
 
 use crate::adapter::AdapterContext;
@@ -108,11 +109,14 @@ fn query_caps(
     };
     caps.supported_ops =
         (1u64 << HELIOS_FOREIGN_OP_QUERY_CAPS) | (1u64 << HELIOS_FOREIGN_OP_IMPORT_RM);
-    caps.caps_flags = if foreign::rm_import_served(adapter) {
-        HELIOS_FOREIGN_CAP_RM_IMPORT
-    } else {
-        0
-    };
+    // `SHARED_OPEN` is KMD-only (no host involvement), so it is set whenever this
+    // KMD answers the verb at all.
+    caps.caps_flags = HELIOS_FOREIGN_CAP_SHARED_OPEN
+        | if foreign::rm_import_served(adapter) {
+            HELIOS_FOREIGN_CAP_RM_IMPORT
+        } else {
+            0
+        };
     // The limits are constants; the occupancy is a table read. With no
     // transport the occupancy reads zero, as the NVRM caps do.
     caps.max_per_owner = MAX_FOREIGN_PER_OWNER as u32;
