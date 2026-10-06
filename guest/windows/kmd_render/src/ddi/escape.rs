@@ -352,6 +352,9 @@ pub unsafe extern "C" fn dxgkddi_escape(
     // mirror an escape asks for included), so a stuck worker leaves them stale. A healthy worker
     // costs one clock read and a few loads, and no registry write.
     crate::ddi::stall_diag::publish_from_escape(adapter);
+    // The vsync heartbeat's watchdog, here too: this thread does not depend on the HPD worker
+    // (a few loads and a clock read while the heartbeat is alive; PASSIVE: it may re-arm).
+    adapter.vsync_watch(true);
 
     match hdr.cmd_type {
         HELIOS_ESCAPE_SNAPSHOT_STATUS => {

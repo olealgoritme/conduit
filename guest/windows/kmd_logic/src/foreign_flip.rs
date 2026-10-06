@@ -357,6 +357,52 @@ impl Default for Book {
     }
 }
 
+/// The least time between two host flips that only REPEAT the picture the previous one showed
+/// (a desktop refresh edge: a present marker of any application, a bind edge, a withheld Venus
+/// flush), in 100 ns: 100 ms, so at most 10 a second. A programming (`SetVidPnSourceAddress` /
+/// DMA flip: a picture dxgkrnl issued) is never held by it. The T5 run re-flipped the same
+/// kept picture 155 times a second for as long as an unrelated application kept presenting,
+/// each a host round trip carrying no new pixels; the gate bounds that at the repeat rate and
+/// still refreshes a picture that something wrote in place within 100 ms.
+pub const REPEAT_DEFAULT_MS: u32 = 100;
+/// The largest repeat gate the knob (`FfRepeatMs`) may ask for, ms.
+pub const REPEAT_MAX_MS: u32 = 10_000;
+
+/// The gate in 100 ns for a knob value in ms: 0 is OFF (every edge flips, the old behaviour),
+/// anything above [`REPEAT_MAX_MS`] is that.
+pub const fn repeat_gate_100ns(knob_ms: u32) -> u64 {
+    let ms = if knob_ms > REPEAT_MAX_MS {
+        REPEAT_MAX_MS
+    } else {
+        knob_ms
+    };
+    ms as u64 * 10_000
+}
+
+/// What the repeat gate says about a refresh edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Repeat {
+    /// Flip now.
+    Now,
+    /// Hold the edge; flip once, at this time (100 ns, the clock `now` is on), however many more
+    /// edges arrive meanwhile.
+    At(u64),
+}
+
+/// The gate for a refresh edge at `now`: `last_flip` is when the host last took a flip (0 =
+/// never), `gate` the interval ([`repeat_gate_100ns`], 0 = off).
+pub const fn repeat_decide(now: u64, last_flip: u64, gate: u64) -> Repeat {
+    if gate == 0 || last_flip == 0 {
+        return Repeat::Now;
+    }
+    let due = last_flip.saturating_add(gate);
+    if now >= due {
+        Repeat::Now
+    } else {
+        Repeat::At(due)
+    }
+}
+
 /// Whether the shown target is usable in transport generation `epoch`.
 pub fn target_ready(t: Option<&Target>, epoch: u64) -> bool {
     t.is_some_and(|t| t.epoch == epoch && epoch != 0)
@@ -366,7 +412,7 @@ pub fn target_ready(t: Option<&Target>, epoch: u64) -> bool {
 /// [`ref_name`]). At most 13 characters each, all with the `Ff` prefix no other counter uses.
 /// `FfKnob` (when the knob is read) and `FfGaveUp` (at the event) are also written at their
 /// event; everything else only by the throttled mirror.
-pub const COUNTERS: [&str; 41] = [
+pub const COUNTERS: [&str; 48] = [
     "FfKnob",
     "FfProg",
     "FfSame",
@@ -409,6 +455,18 @@ pub const COUNTERS: [&str; 41] = [
     "FfAsRecyc",
     "FfStrikeSkip",
     "FfDrainHeld",
+    // The re-presentation of an unchanged picture (T5 anomaly 1, docs 15.18.14): refresh edges of
+    // the resident source (`FfEdgeSup`), those held back by the repeat gate (`FfEdgeHeld`) and
+    // the repeats it let through (`FfRepeats`), host flips of the GEM the previous one showed
+    // (`FfReGem`) and of another (`FfNewGem`), passes that ended waiting for the pacing
+    // (`FfWaitN`), and the gate in force in ms (`FfRepMsEff`).
+    "FfEdgeSup",
+    "FfEdgeHeld",
+    "FfRepeats",
+    "FfReGem",
+    "FfNewGem",
+    "FfWaitN",
+    "FfRepMsEff",
 ];
 
 /// Name of the per-reason refusal counter: `FfRef01` .. `FfRef15`.
@@ -1240,7 +1298,12 @@ mod tests {
                 if p.is_dir() {
                     stack.push(p);
                 } else if p.extension().is_some_and(|x| x == "rs") {
-                    if p.file_name().is_some_and(|n| n == "foreign_flip.rs") {
+                    // `diag.rs` spells the KNOB names (`b"FfAsyncWin"`, `b"FfRepeatMs"`), which are
+                    // values the driver reads, not counters it writes; the knobs are checked
+                    // for collision with the counters just below.
+                    if p.file_name()
+                        .is_some_and(|n| n == "foreign_flip.rs" || n == "diag.rs")
+                    {
                         continue;
                     }
                     checked += 1;
@@ -1254,6 +1317,61 @@ mod tests {
             }
         }
         assert!(checked > 20);
+    }
+
+    #[test]
+    fn the_knob_names_are_not_counter_names() {
+        for knob in ["FfAsyncWin", "FfRepeatMs"] {
+            assert!(knob.len() <= 14);
+            assert!(!COUNTERS.contains(&knob), "{knob} is also a counter");
+        }
+    }
+
+    #[test]
+    fn the_repeat_gate_bounds_unchanged_re_presents() {
+        let g = repeat_gate_100ns(REPEAT_DEFAULT_MS);
+        assert_eq!(g, 1_000_000);
+        // Never flipped: the first edge goes.
+        assert_eq!(repeat_decide(5_000_000, 0, g), Repeat::Now);
+        // Within the gate: held to exactly the end of it, whatever the edge rate.
+        let last = 10_000_000;
+        for now in [last, last + 1, last + 500_000, last + 999_999] {
+            assert_eq!(repeat_decide(now, last, g), Repeat::At(last + g));
+        }
+        assert_eq!(repeat_decide(last + g, last, g), Repeat::Now);
+        assert_eq!(repeat_decide(last + 10 * g, last, g), Repeat::Now);
+        // 8000 edges a second for 10 s let through at most 10 a second.
+        let mut last_flip = 0u64;
+        let mut flips = 0;
+        let mut held_until = 0u64;
+        for i in 0..80_000u64 {
+            let now = 1_000_000 + i * 1_250; // 8000 per second in 100 ns units
+            let go = if held_until != 0 && now < held_until {
+                false
+            } else {
+                match repeat_decide(now, last_flip, g) {
+                    Repeat::Now => true,
+                    Repeat::At(at) => {
+                        held_until = at;
+                        false
+                    }
+                }
+            };
+            if go {
+                last_flip = now;
+                held_until = 0;
+                flips += 1;
+            }
+        }
+        assert!(flips <= 101, "{flips} repeats in 10 s");
+        assert!(flips >= 90, "{flips} repeats in 10 s: the gate starves the picture");
+    }
+
+    #[test]
+    fn the_repeat_gate_off_and_clamped() {
+        assert_eq!(repeat_gate_100ns(0), 0);
+        assert_eq!(repeat_decide(5, 4, 0), Repeat::Now, "0 = every edge, as before");
+        assert_eq!(repeat_gate_100ns(u32::MAX), 100_000_000);
     }
 
     #[test]

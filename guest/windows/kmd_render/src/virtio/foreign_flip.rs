@@ -167,6 +167,27 @@ static ASYNC_WAKE: AtomicU64 = AtomicU64::new(0);
 // `FfStrikeSkip` failures in the same pass as another that cost no strike, `FfDrainHeld` worker
 // loops that left the pending programming undrained because the window was full of flips in
 // flight (the backpressure).
+// The re-presentation of an unchanged picture (T5 anomaly 1, `docs/kmd-rm-client.md` 15.18.14):
+// `FfEdgeSup` refresh edges of the resident source (a withheld desktop flush: any application's
+// present marker, a bind edge, a completion), `FfEdgeHeld` of those the repeat gate held back,
+// `FfRepeats` repeats it let through, `FfReGem` / `FfNewGem` host flips of the GEM the previous
+// flip showed / of another (their sum is `FfFrames + FfReflips`), `FfWaitN` passes that ended
+// waiting for the presenter's pacing, `FfRepMsEff` the gate in force (ms, 0 = off).
+static EDGE_SUP: AtomicU32 = AtomicU32::new(0);
+static EDGE_HELD_N: AtomicU32 = AtomicU32::new(0);
+static REPEATS: AtomicU32 = AtomicU32::new(0);
+static RE_GEM: AtomicU32 = AtomicU32::new(0);
+static NEW_GEM: AtomicU32 = AtomicU32::new(0);
+static WAIT_N: AtomicU32 = AtomicU32::new(0);
+/// The repeat gate (100 ns, 0 = off), read once per generation beside the knob.
+static REPEAT_GATE: AtomicU64 = AtomicU64::new(0);
+/// A refresh edge is held by the gate (taken from the shared edge flag, not yet flipped).
+static EDGE_HELD: AtomicU32 = AtomicU32::new(0);
+/// When the held edge is due (100 ns), re-asked of the shared wake word at the end of the pass.
+static HELD_AT: AtomicU64 = AtomicU64::new(0);
+/// When the host last took a flip (100 ns; 0 = none) and the GEM it showed.
+static LAST_FLIP_AT: AtomicU64 = AtomicU64::new(0);
+static LAST_GEM: AtomicU32 = AtomicU32::new(0);
 static AS_ORPH: AtomicU32 = AtomicU32::new(0);
 static STRIKE_SKIP: AtomicU32 = AtomicU32::new(0);
 static DRAIN_HELD: AtomicU32 = AtomicU32::new(0);
@@ -295,6 +316,16 @@ pub(crate) fn publish_counters() {
     rec(b"FfStrikeSkip", STRIKE_SKIP.load(Ordering::Relaxed));
     rec(b"FfDrainHeld", DRAIN_HELD.load(Ordering::Relaxed));
     rec(b"FfAsRecyc", recycled);
+    rec(b"FfEdgeSup", EDGE_SUP.load(Ordering::Relaxed));
+    rec(b"FfEdgeHeld", EDGE_HELD_N.load(Ordering::Relaxed));
+    rec(b"FfRepeats", REPEATS.load(Ordering::Relaxed));
+    rec(b"FfReGem", RE_GEM.load(Ordering::Relaxed));
+    rec(b"FfNewGem", NEW_GEM.load(Ordering::Relaxed));
+    rec(b"FfWaitN", WAIT_N.load(Ordering::Relaxed));
+    rec(
+        b"FfRepMsEff",
+        (REPEAT_GATE.load(Ordering::Relaxed) / 10_000) as u32,
+    );
 }
 
 fn now() -> u64 {
@@ -327,6 +358,16 @@ fn read_knob() -> u32 {
     };
     PIPE.lock().set_window(win);
     WINDOW.store(u32::from(win), Ordering::Release);
+    // The repeat gate of refresh edges (`FfRepeatMs`, default 100 ms, 0 = every edge flips).
+    let gate = if v != 0 {
+        ff::repeat_gate_100ns(crate::diag::read_config_dword(
+            crate::diag::knobs::FOREIGN_FLIP_REPEAT,
+            ff::REPEAT_DEFAULT_MS,
+        ))
+    } else {
+        0
+    };
+    REPEAT_GATE.store(gate, Ordering::Release);
     KNOB.store(v, Ordering::Relaxed);
     // Mirrored on EVERY read, 0 included: "nothing is written for the default" left FfKnob = 1 in
     // the registry after the knob was set back to 0 and the device restarted (tester evidence),
@@ -366,6 +407,11 @@ pub(crate) fn forget() {
     OCCUPIED.store(0, Ordering::Release);
     FLYING.store(0, Ordering::Release);
     ASYNC_WAKE.store(0, Ordering::Release);
+    EDGE_HELD.store(0, Ordering::Release);
+    HELD_AT.store(0, Ordering::Release);
+    LAST_FLIP_AT.store(0, Ordering::Release);
+    LAST_GEM.store(0, Ordering::Release);
+    REPEAT_GATE.store(0, Ordering::Release);
     WINDOW.store(0, Ordering::Release);
     KNOB.store(KNOB_UNREAD, Ordering::Relaxed);
     // The counters are this generation's: zero them, and owe the service key the zero block.
@@ -374,7 +420,8 @@ pub(crate) fn forget() {
         &GAVE_UP, &FRAMES, &REFLIPS, &YIELDED, &FLIP_FAIL, &STALE, &GONE, &POISONED, &EDGES,
         &PRES_WORD, &YIELDS, &AS_SUB, &AS_ACK, &AS_FAIL, &AS_TMO, &AS_LATE, &WIN_FULL,
         &AS_QFULL, &RTT_N, &RTT_SUM_US, &RTT_MAX_US, &EARLY_Q, &EARLY_WAKE, &GATE_WAKE,
-        &AS_ORPH, &STRIKE_SKIP, &DRAIN_HELD,
+        &AS_ORPH, &STRIKE_SKIP, &DRAIN_HELD, &EDGE_SUP, &EDGE_HELD_N, &REPEATS, &RE_GEM,
+        &NEW_GEM, &WAIT_N,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -395,6 +442,43 @@ pub(crate) fn holds_screen() -> bool {
 /// ([`note_early_queued`], [`note_early_woke`], [`note_gate_wake`]).
 pub(crate) fn early_wake() -> bool {
     WINDOW.load(Ordering::Acquire) != 0
+}
+
+/// A refresh edge reached THIS arm's resident source (`foreign_scanout_suppresses`: the desktop
+/// wanted a host flush and the arbiter withheld it), from the HPD worker's own refresh step.
+/// It only asks to REPEAT the picture the previous flip showed, so it is gated (`FfRepeatMs`):
+/// inside the gate the edge is held for the end of it and neither flags nor WAKES the worker
+/// (the raise used to signal the very worker that raised it, one extra wake per refresh
+/// request, and a pass whose only outcome was to find the frame not yet due). Past the gate, or
+/// with the gate off (0), it is the shared frame edge as it always was. Atomics only; the held
+/// wake is the worker's own timed wait (the one writer of the shared wake word).
+pub(crate) fn refresh_edge(adapter: &AdapterContext) {
+    EDGE_SUP.fetch_add(1, Ordering::Relaxed);
+    let gate = REPEAT_GATE.load(Ordering::Acquire);
+    if gate != 0 && SHOWN_RESID.load(Ordering::Acquire) != 0 && OWED.load(Ordering::Acquire) == 0 {
+        if let ff::Repeat::At(at) =
+            ff::repeat_decide(now(), LAST_FLIP_AT.load(Ordering::Acquire), gate)
+        {
+            if EDGE_HELD.swap(1, Ordering::AcqRel) == 0 {
+                EDGE_HELD_N.fetch_add(1, Ordering::Relaxed);
+            }
+            HELD_AT.store(at, Ordering::Release);
+            rm_present::set_wake_at_min(at);
+            return;
+        }
+    }
+    rm_present::note_frame_edge(adapter);
+}
+
+/// The host took a flip of `gem` at `at` (100 ns): the repeat gate's clock, and whether the
+/// picture changed (`FfReGem` / `FfNewGem`).
+fn note_host_flip(gem: u32, at: u64) {
+    LAST_FLIP_AT.store(at, Ordering::Release);
+    if LAST_GEM.swap(gem, Ordering::AcqRel) == gem {
+        RE_GEM.fetch_add(1, Ordering::Relaxed);
+    } else {
+        NEW_GEM.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// `SetVidPnSourceAddress` (DIRQL) asked for the DPC that wakes the worker. Atomics only.
@@ -577,7 +661,7 @@ pub(crate) fn other_source(adapter: &AdapterContext) {
     }
     TARGET.lock().clear();
     SHOWN_RESID.store(0, Ordering::Release);
-    adapter.signal_hpd();
+    adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::FLIP);
 }
 
 /// The allocation `resource_id` is being destroyed (`retire_scanout_allocation`): if it is the
@@ -589,7 +673,7 @@ pub(crate) fn target_gone(adapter: &AdapterContext, resource_id: u32) {
     if TARGET.lock().gone(resource_id) {
         SHOWN_RESID.store(0, Ordering::Release);
         GONE.fetch_add(1, Ordering::Relaxed);
-        adapter.signal_hpd();
+        adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::FLIP);
     }
 }
 
@@ -607,7 +691,7 @@ pub(crate) fn file_closed(adapter: &AdapterContext, owner: DeviceOwner, drm: u32
     {
         SHOWN_RESID.store(0, Ordering::Release);
         GONE.fetch_add(1, Ordering::Relaxed);
-        adapter.signal_hpd();
+        adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::FLIP);
     }
 }
 
@@ -622,7 +706,7 @@ pub(crate) fn owner_closed(adapter: &AdapterContext, owner: DeviceOwner) {
     if SHOWN_RESID.load(Ordering::Acquire) != 0 && TARGET.lock().owner_closed(owner.raw() as u64) {
         SHOWN_RESID.store(0, Ordering::Release);
         GONE.fetch_add(1, Ordering::Relaxed);
-        adapter.signal_hpd();
+        adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::FLIP);
     }
 }
 
@@ -645,6 +729,12 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         return;
     }
     service_pass(passive, adapter);
+    let held_at = HELD_AT.load(Ordering::Acquire);
+    if EDGE_HELD.load(Ordering::Acquire) != 0 && held_at > now() {
+        // Whatever else asked for a wake in the pass, the held repeat is due at its time. Never
+        // a time already past: that would be a 1 ms timer for ever (the wait clamps there).
+        rm_present::set_wake_at_min(held_at);
+    }
     if OCCUPIED.load(Ordering::Acquire) != 0 {
         arm_async_wake();
     }
@@ -821,6 +911,10 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
     // The shared edges are this arm's only while it holds the screen (the level 5 service
     // leaves them alone then); otherwise it is only standing down and takes none.
     let holds = holds_screen();
+    if !holds {
+        // Nothing of this arm is shown: a held repeat has nothing to repeat.
+        EDGE_HELD.store(0, Ordering::Release);
+    }
     let (mut frame_edge, mut resume_edge) = if holds {
         rm_present::clear_wake_at();
         rm_present::take_edges()
@@ -829,7 +923,36 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
     };
     if holds {
         let _ = rm_present::take_edge_count();
-        frame_edge |= OWED.swap(0, Ordering::AcqRel) != 0;
+        // A programming owes a NEW picture: never held. A bare refresh edge owes the SAME
+        // picture again, which the repeat gate bounds (`FfRepeatMs`): held edges coalesce into
+        // one repeat at the end of the gate, and the worker is woken for it by its timed wait.
+        let owed_new = OWED.swap(0, Ordering::AcqRel) != 0;
+        if frame_edge && !owed_new {
+            EDGE_HELD.store(1, Ordering::Release);
+        }
+        frame_edge = false;
+        if owed_new {
+            // The flip that serves the programming serves a held edge too.
+            EDGE_HELD.store(0, Ordering::Release);
+            frame_edge = true;
+        } else if EDGE_HELD.load(Ordering::Acquire) != 0 {
+            match ff::repeat_decide(
+                now(),
+                LAST_FLIP_AT.load(Ordering::Acquire),
+                REPEAT_GATE.load(Ordering::Acquire),
+            ) {
+                ff::Repeat::Now => {
+                    EDGE_HELD.store(0, Ordering::Release);
+                    REPEATS.fetch_add(1, Ordering::Relaxed);
+                    frame_edge = true;
+                }
+                ff::Repeat::At(at) => {
+                    EDGE_HELD_N.fetch_add(1, Ordering::Relaxed);
+                    HELD_AT.store(at, Ordering::Release);
+                    rm_present::set_wake_at_min(at);
+                }
+            }
+        }
     }
     let interval = rr::flip_interval_100ns(adapter.effective_refresh_mhz());
     {
@@ -882,6 +1005,7 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
         match act {
             Act::Idle => return,
             Act::WaitUntil(at) => {
+                WAIT_N.fetch_add(1, Ordering::Relaxed);
                 rm_present::set_wake_at(at);
                 return;
             }
@@ -929,6 +1053,9 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
                 let result = flip(passive, adapter, target);
                 if result == FlipResult::Shown {
                     note_rtt(fp::elapsed_us(t0, now()));
+                    if let Some(t) = target {
+                        note_host_flip(t.gem, now());
+                    }
                 }
                 finish(epoch, slot, copied, result);
                 if result != FlipResult::Shown {
@@ -1093,6 +1220,7 @@ fn flip_async(
                 }
             }
             AS_SUB.fetch_add(1, Ordering::Relaxed);
+            note_host_flip(t.gem, at);
             Submit::Sent
         }
         Err(PresentRefusal::Device(VirtioError::QueueFull)) => {
