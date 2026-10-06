@@ -214,6 +214,21 @@ namespace helios_bridge {
       _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                   "C:\\ProgramData\\Helios\\umd-%lu.log",
                   (unsigned long)GetCurrentProcessId());
+      // A same-named file left by an earlier process with this pid under
+      // another account may refuse our append (docs/dwm-on-nvk.md, T3): then
+      // the name also carries the process creation time, as umd_common's
+      // log.rs computes it.
+      if (FILE* probe = _fsopen(buf, "a", _SH_DENYNO)) {
+        fclose(probe);
+      } else if (GetFileAttributesA(buf) != INVALID_FILE_ATTRIBUTES) {
+        FILETIME c = {}, e = {}, k = {}, u = {};
+        unsigned long long created = 0;
+        if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u))
+          created = (static_cast<unsigned long long>(c.dwHighDateTime) << 32) | c.dwLowDateTime;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "C:\\ProgramData\\Helios\\umd-%lu-%llx.log",
+                    (unsigned long)GetCurrentProcessId(), created);
+      }
       return std::string(buf);
     }();
     return path.c_str();
