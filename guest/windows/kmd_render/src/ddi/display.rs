@@ -330,8 +330,8 @@ unsafe fn dxgkddi_present_inner(
         .destination()
         .map(|allocation| allocation.handle())
         .unwrap_or(core::ptr::null_mut());
-    let src_info = unsafe { present_alloc_info(src_handle) };
-    let dst_info = unsafe { present_alloc_info(dst_handle) };
+    let src_info = unsafe { present_alloc_info(adapter, src_handle) };
+    let dst_info = unsafe { present_alloc_info(adapter, dst_handle) };
     if payload_has_list {
         PRESENT_LAST_SRC_OPEN_LOW.store(src_handle as usize as u32, Ordering::Relaxed);
         PRESENT_LAST_DST_OPEN_LOW.store(dst_handle as usize as u32, Ordering::Relaxed);
@@ -1440,11 +1440,22 @@ pub(crate) unsafe fn arm_dma_flip_programming(
     // so a substituted flip takes by the descriptor's resid, and everything
     // downstream (`arm_bind_refresh`, the D2 identity arm, `RfUnb`, epochs,
     // leases, the D4a ledger) self-aligns because armed = bound = snapshot.
-    let source_resource = unsafe { crate::ddi::create_allocation::allocation_resource_id(h_alloc) };
+    //
+    // A handle that is null, foreign, or from an older transport generation is
+    // refused HERE, before any mark is taken: its resource id (or, with a
+    // snapshot, the descriptor that rode with it) could name a different live
+    // resource's frame watermark, and `take_flip_frame_watermark` consumes it.
+    let Some(source_resource) =
+        (unsafe { crate::ddi::create_allocation::allocation_resource_id(adapter, h_alloc) })
+    else {
+        crate::ddi::scanout_trace::note_ddi_pair_failed();
+        return false;
+    };
     let target_resource = snapshot.map_or(source_resource, |snap| snap.resource_id);
     let frame_watermark = adapter.take_flip_frame_watermark(target_resource);
     if !unsafe {
         crate::ddi::create_allocation::set_vidpn_primary_address(
+            adapter,
             h_alloc,
             0,
             primary_address,
@@ -1567,13 +1578,14 @@ unsafe fn fast_bind_from_flip(
     }
     // SAFETY: per this function's contract — the handle dxgkrnl placed in the
     // present allocation list, which the caller has already resolved once.
-    let source = match unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) } {
-        Some(source) if source.direct_scanout => source,
-        _ => {
-            crate::ddi::scanout_trace::note_fast_bind_skip(skip::NOT_DIRECT);
-            return;
-        }
-    };
+    let source =
+        match unsafe { crate::ddi::create_allocation::scanout_alloc_info(adapter, h_alloc) } {
+            Some(source) if source.direct_scanout => source,
+            _ => {
+                crate::ddi::scanout_trace::note_fast_bind_skip(skip::NOT_DIRECT);
+                return;
+            }
+        };
     // D4b: a carried snapshot descriptor substitutes the BIND TARGET, by value
     // (`from_snapshot_descriptor` re-runs the same layout validation the
     // Present arm already passed). Structurally-unreachable failure falls back
@@ -1701,6 +1713,7 @@ unsafe fn set_vidpn_source_address_dirql(
     // the PASSIVE worker has actually programmed this primary.
     if !unsafe {
         crate::ddi::create_allocation::set_vidpn_primary_address(
+            adapter,
             h_alloc,
             primary_segment,
             primary_address,
@@ -2341,10 +2354,11 @@ unsafe fn program_vidpn_source_inner(
         crate::diag::record_named_bytes(b"VpSA", source_address_n);
     }
 
-    let source = match unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) } {
-        Some(source) => source,
-        None => return Err(ScanoutReject::BadAlloc),
-    };
+    let source =
+        match unsafe { crate::ddi::create_allocation::scanout_alloc_info(adapter, h_alloc) } {
+            Some(source) => source,
+            None => return Err(ScanoutReject::BadAlloc),
+        };
     trace.source_resource = source.resource_id;
     if source.direct_scanout {
         trace.flags |= flags::DIRECT;

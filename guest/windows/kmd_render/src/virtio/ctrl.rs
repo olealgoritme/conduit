@@ -1638,8 +1638,23 @@ pub fn release_blobs_for_owner_within(
                 let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
                 client.release_present_blits_for_resource(adapter, res)
             });
-            if !matches!(cache_release, Ok(Ok(()))) {
-                return false;
+            match cache_release {
+                Ok(Ok(())) => {}
+                // The release itself failed: ambiguous drain, retain (below).
+                Ok(Err(_)) => return false,
+                // `NotStarted`: there is no venus client, so there are no Present
+                // blits cached for this resource to release. StopDevice drops the
+                // client BEFORE this sweep on purpose (its ring/reply mappings are
+                // unmapped first, and the ring blob is itself a KMD blob this sweep
+                // frees), so for that caller this arm is the normal one. Returning
+                // false here instead abandoned the sweep after the first blob had
+                // already been taken out of the table: the rest were never released
+                // (`StopBlobs` always read 0). Only the windowed-blt cancel the
+                // closure would have done remains to do.
+                Err(_) => {
+                    let _ =
+                        adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
+                }
             }
 
             // As in the single-resource path, the worker cannot pass this

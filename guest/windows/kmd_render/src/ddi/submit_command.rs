@@ -187,6 +187,11 @@ pub(crate) fn publish_nvrm_counters() {
         b"NvUnpin",
         crate::virtio::nvrm::NVRM_UNPINS.load(Ordering::Relaxed),
     );
+    // Pins left locked on purpose because a teardown outran the host's closes.
+    crate::diag::record_named_bytes(
+        b"NvPinLeak",
+        crate::virtio::nvrm::NVRM_PIN_LEAKS.load(Ordering::Relaxed),
+    );
     crate::diag::record_named_bytes(
         b"NvPinErr",
         crate::virtio::nvrm::NVRM_PIN_ERRORS.load(Ordering::Relaxed),

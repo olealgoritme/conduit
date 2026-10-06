@@ -23,6 +23,7 @@
 use super::*;
 use alloc::boxed::Box;
 use helios_kmd_logic::nvrm_fence::{is_fence as is_fence_type, Noted, DEVICE_TYPE_FENCE};
+use helios_kmd_logic::sweep_budget::{PinAction, PinFate};
 
 /// Most backend handles tracked across every process.
 pub const MAX_NVRM_HANDLES: usize = 1024;
@@ -42,6 +43,12 @@ extern "C" {
     /// `MmUnlockPages` + `IoFreeMdl` (`src/seh_shim.c`); callable from any process
     /// context for a user MDL that was never mapped (the pins never are).
     fn helios_unlock_system_buffer(mdl: wdk_sys::PMDL);
+    /// Take one reference on the CALLING process's EPROCESS and return it
+    /// (`src/seh_shim.c`); balanced by exactly one `helios_dereference_process`.
+    fn helios_reference_current_process() -> *mut core::ffi::c_void;
+    /// Drop a reference `helios_reference_current_process` returned. PASSIVE, any
+    /// process context.
+    fn helios_dereference_process(process: *mut core::ffi::c_void);
 }
 
 /// One tracked handle.
@@ -82,10 +89,36 @@ pub(super) struct NvrmMapSlot {
 /// Dropping a pin UNLOCKS its pages, at PASSIVE: the lock is released exactly
 /// once, by whatever path ends up owning the value last. That is what makes a
 /// transport torn down with pins still in its table (`StopDevice` before the
-/// owners' `DestroyDevice`) release them instead of leaving user pages locked,
-/// which would bugcheck the owning process at exit (0x76
-/// `PROCESS_HAS_LOCKED_PAGES`). Nothing here may drop one under the virtio lock:
-/// the `take_*` methods hand it back by value.
+/// owners' `DestroyDevice`) release them instead of leaving user pages locked.
+/// Nothing here may drop one under the virtio lock: the `take_*` methods hand it
+/// back by value.
+///
+/// # A pin that is deliberately NOT dropped ([`NvrmPin::leak`])
+///
+/// When the host may still alias the pages (a `FORWARD` claimed the table and the
+/// host never confirmed closing the RM files that hold the GPU mapping), unlocking
+/// them would let the guest reuse that RAM underneath the GPU. Such a pin is
+/// leaked: the pages stay locked. Locked user pages make the kernel bugcheck when
+/// the owning process's address space is torn down (0x76
+/// `PROCESS_HAS_LOCKED_PAGES`), so a leak alone trades DMA into reused memory for
+/// a bugcheck at the owner's exit.
+///
+/// To soften that, every pin holds one reference on its owning process's EPROCESS,
+/// taken in [`NvrmPin::new`] (the pinning thread, in the owning process) and
+/// released by `Drop` AFTER the unlock. A leaked pin never drops, so it keeps the
+/// process object alive: the process can end (threads gone, handles closed) but
+/// its EPROCESS stays referenced, a zombie. The intent is that the locked-pages
+/// check, which this code believes runs when the process OBJECT is deleted
+/// (`PspProcessDelete` -> `MmDeleteProcessAddressSpace`), never runs.
+///
+/// NOT VERIFIED: that belief is from memory of the NT sources, not from a test or
+/// a reading of this kernel's symbols. If the check instead runs when the last
+/// thread exits (`PspExitProcess` -> `MmCleanProcessAddressSpace`), the extra
+/// reference changes nothing and a leaked pin still bugchecks 0x76 at the owner's
+/// exit (argument 2 the process, argument 3 the locked-page count). That outcome
+/// is what happened before the reference existed, so the reference cannot make
+/// it worse; a pin that unlocks normally drops its reference at once, so the
+/// normal path gains no zombie.
 pub struct NvrmPin {
     owner: DeviceOwner,
     handle: u32,
@@ -106,6 +139,10 @@ pub struct NvrmPin {
     /// A `FORWARD` has claimed the table: the GPU may hold the pages.
     used: bool,
     pub(crate) npages: u32,
+    /// The owning process's EPROCESS (an address; one reference is held, see the
+    /// type docs), or 0 if there was none. Released only by `Drop`, after the
+    /// unlock, and never for a leaked pin.
+    process: usize,
 }
 
 impl NvrmPin {
@@ -121,6 +158,10 @@ impl NvrmPin {
         big: Option<DmaBuffer>,
         npages: u32,
     ) -> Self {
+        // SAFETY: PASSIVE (the pin escape's contract), in the process that just
+        // locked `mdl`, so the reference is on THAT process. The matching
+        // dereference is in `Drop`, which runs once.
+        let process = unsafe { helios_reference_current_process() } as usize;
         Self {
             owner,
             handle,
@@ -133,7 +174,25 @@ impl NvrmPin {
             big,
             used: false,
             npages,
+            process,
         }
+    }
+
+    /// Leave this pin's pages locked for good, and its process referenced: the
+    /// host may still alias them. Counted (`NvPinLeak`). The value is consumed
+    /// without running `Drop`, so neither the unlock nor the process dereference
+    /// happens, and the MDL, table buffer and EPROCESS stay allocated until the
+    /// next boot.
+    pub fn leak(self) {
+        crate::virtio::nvrm::NVRM_PIN_LEAKS.fetch_add(1, Ordering::Relaxed);
+        core::mem::forget(self);
+    }
+
+    /// A `FORWARD` has claimed this pin's table, so the host (and through it the
+    /// GPU) may hold an alias of its pages until it closes the RM files involved.
+    /// A pin nothing claimed was never described to the host.
+    pub fn host_may_alias(&self) -> bool {
+        self.used
     }
 }
 
@@ -156,6 +215,15 @@ impl Drop for NvrmPin {
         // table buffer (`big`) is freed by the field drop that follows.
         unsafe { helios_unlock_system_buffer(self.mdl as wdk_sys::PMDL) };
         crate::virtio::nvrm::NVRM_UNPINS.fetch_add(1, Ordering::Relaxed);
+        // After the unlock: `MmUnlockPages` of a user MDL reaches the process it
+        // was locked in, which this reference keeps valid. Released here and
+        // nowhere else (`leak` forgets the value instead), exactly once, at
+        // PASSIVE, in whichever process context this runs.
+        if self.process != 0 {
+            // SAFETY: the reference `new` took, not yet released.
+            unsafe { helios_dereference_process(self.process as *mut core::ffi::c_void) };
+            self.process = 0;
+        }
     }
 }
 
@@ -378,6 +446,7 @@ impl VirtioGpu {
         // Re-checked here under the same hold as the push (the pre-check in
         // `nvrm_map_bytes_room` ran before the host round trip).
         if !self.nvrm_map_bytes_room(owner, uvm, size) {
+            crate::virtio::nvrm::NVRM_MAP_QUOTA_REFUSED.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         let mine = self.nvrm_maps.iter().filter(|s| s.owner == owner).count();
@@ -616,9 +685,14 @@ impl VirtioGpu {
     /// only at its next feature negotiation, i.e. the next `StartDevice`): a pin
     /// unlocked here may still be held by the host. The path that is safe for the
     /// pages is `nvrm::retire_transport`, which closes every handle on the host
-    /// while the transport is alive and only then lets this run. Unlocking is still
-    /// the right thing here: user pages left locked bugcheck their process at exit
-    /// (0x76), and a failed transport has no better answer.
+    /// while the transport is alive and only then lets this run. What this does
+    /// with a pin depends on whether the host may alias it (a `FORWARD` claimed
+    /// its table): an unclaimed pin is unlocked; a claimed one stays locked
+    /// (`NvPinLeak`) with its owner's EPROCESS reference held, because unlocking it
+    /// would let the guest reuse RAM the GPU may still write. The cost of that
+    /// choice is the locked pages themselves: they are meant not to bugcheck the
+    /// owner at exit (0x76) only because the held process reference keeps its
+    /// process object alive, which is UNVERIFIED (see `NvrmPin`).
     ///
     /// Idempotent against the live sweep and the per-device `close_all_for_owner`:
     /// all take entries out of these same tables, so whichever runs first releases
@@ -632,9 +706,23 @@ impl VirtioGpu {
     pub(super) fn teardown_nvrm_state(&mut self) -> u32 {
         let mut swept = 0u32;
         // Pins: popped one at a time and dropped (= unlocked) here, not under any lock.
+        //
+        // Anything still tracked here was NOT confirmed closed by the host: the live
+        // sweep (`close_all_on_host`) takes every pin out of the table itself, so a
+        // pin found now belongs to a transport that already failed (nothing was
+        // sent) or was re-populated concurrently. The host keeps its RM files across
+        // a device reset, so a pin a `FORWARD` claimed may still be aliased by the
+        // GPU; unlocking it would let the guest reuse that RAM underneath the host.
+        // Those stay locked (`NvPinLeak`), holding their owner process's EPROCESS
+        // reference (see `NvrmPin`: whether that keeps the owner from bugchecking
+        // 0x76 at exit is unverified); unclaimed ones are unlocked as before.
+        // Nothing was confirmed closed on this path, so the fate is `Leak`.
         while let Some(pin) = self.nvrm_pins.pop() {
             swept = swept.saturating_add(1);
-            drop(pin);
+            match PinFate::Leak.action(pin.host_may_alias()) {
+                PinAction::Leak => pin.leak(),
+                PinAction::Unlock => drop(pin),
+            }
         }
         swept = swept
             .saturating_add(self.nvrm_maps.len() as u32)

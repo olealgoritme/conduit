@@ -145,8 +145,10 @@ pub(super) fn scan_shm_region(access: &DxgkConfigAccess, want: u32) -> Option<Ho
                 let len = cfg_read32(access, cap + 12) as u64
                     | ((cfg_read32(access, cap + 20) as u64) << 32);
                 let base = bar_base(access, bar)?;
+                // 64-bit throughout: a 4 GiB region 1 and a BAR above 4 GiB are the
+                // normal case, so nothing here may truncate or wrap.
                 return Some(HostVisibleWindow {
-                    base: base + off,
+                    base: base.checked_add(off)?,
                     len,
                 });
             }

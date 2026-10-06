@@ -471,6 +471,20 @@ pub(crate) struct TransportGeneration {
     /// The persistent venus 3D context id (`VIRTIO_GPU_CAPSET_VENUS`) the venus
     /// client rides, created in StartDevice and destroyed in StopDevice. `0` = none.
     pub venus_ctx_id: u32,
+    /// Identity of this generation: minted by [`mint_transport_serial`] for each
+    /// StartDevice, never 0, never reused. Every `AllocationContext` is stamped
+    /// with it at creation, because resource ids RESTART AT 1 in each generation
+    /// and an id from an older one can name a different live blob in this one.
+    pub serial: u64,
+}
+
+/// The last transport-generation serial handed out (0 = none yet).
+static TRANSPORT_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh transport-generation serial: nonzero and unique for the life of the
+/// driver. Call once per StartDevice, for the [`TransportGeneration`] it builds.
+pub(crate) fn mint_transport_serial() -> u64 {
+    TRANSPORT_SERIAL.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 pub struct AdapterContext {
@@ -1653,6 +1667,30 @@ impl AdapterContext {
         };
         // SAFETY: per the fn contract.
         unsafe { *state.transport.get() = generation };
+    }
+
+    /// The serial of the transport generation that is up now, or `None` between
+    /// StopDevice and the next StartDevice. DISPATCH-safe (reads published state).
+    pub(crate) fn current_transport_serial(&self) -> Option<u64> {
+        self.transport_generation().map(|t| t.serial)
+    }
+
+    /// Whether an object stamped with `serial` at creation belongs to the
+    /// transport generation that is up now (see [`TransportGeneration::serial`]).
+    pub(crate) fn is_current_generation(&self, serial: u64) -> bool {
+        helios_kmd_logic::paging::alloc_is_current(serial, self.current_transport_serial())
+    }
+
+    /// Forget every system-backing range and "system copy invalid" mark: both are
+    /// keyed by resource ids of a transport generation that is ending (StopDevice)
+    /// or already ended (a start with no stop before it), and ids restart at 1.
+    /// PASSIVE (the leases unlock pages as they drop).
+    #[inline(never)]
+    pub(crate) fn reset_system_backings(&self, passive: crate::irql::PassiveLevel) {
+        match self.system_backings.serialize(passive) {
+            Some(guard) => guard.reset_generation(),
+            None => crate::diag::record_named_bytes(b"PgRstF", 1),
+        }
     }
 
     /// The venus 3D context id for this transport generation, or 0.

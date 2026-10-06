@@ -58,6 +58,7 @@ use crate::adapter::{AdapterContext, SystemBackingGuard, MAX_SYSTEM_BACKING_RANG
 use crate::ddi::create_allocation::SystemBackingPolicy;
 use crate::ddi::create_allocation::{paging_alloc_info, set_bar_placement};
 use crate::dxgk::*;
+use helios_kmd_logic::paging::{self as pg, Clamp};
 
 /// DISPATCH-safe paging tracers (ntoseye reads these by symbol — no IRQL
 /// violation, unlike the `diag::record` ring).
@@ -112,6 +113,10 @@ pub fn diag_dump_gpummu_atomics(_passive: PassiveLevel) {
 use crate::ddi::PASSIVE_LEVEL_IRQL;
 use crate::irql::PassiveLevel;
 
+/// `DISPATCH_LEVEL` (KIRQL 2): the highest IRQL at which a spinlock may be taken
+/// with `KeAcquireSpinLockRaiseToDpc`.
+const DISPATCH_LEVEL_IRQL: u8 = 2;
+
 /// What one content-op executor did, as a value the dispatch must consume.
 ///
 /// The executors used to return `()`: every failure inside them — an
@@ -150,6 +155,18 @@ enum PagingOpOutcome {
 /// skipped SYSTEM_TO_LOCAL leaves the blob at its last content, so only writes
 /// made while the allocation was system-resident are lost. That is the price of
 /// never taking the machine down, and `PgSkipV` makes it visible.
+///
+/// The blob is only left intact UNTIL THE NEXT PAGE-IN: VidMm believes a skipped
+/// eviction copied the content to system memory, so it will later page those
+/// (garbage) pages back over the good blob. A skipped eviction therefore records
+/// its allocation as "system copy invalid" (`SystemBackingTable`), and a page-in
+/// of such an allocation is itself skipped (`PgInvSk`) until the successful
+/// eviction chunks since the mark cover the whole allocation (`PgInvClr`; one
+/// whole-allocation eviction or several chunks, see
+/// `helios_kmd_logic::paging::InvalidSet::evict_chunk_done`), the content is
+/// discarded, or the allocation is destroyed.
+/// Transient causes (a mapping returning NULL, an allocation failing) are retried
+/// first: [`helios_kmd_logic::paging::retry_after_failure`].
 const fn paging_failure() -> NTSTATUS {
     STATUS_SUCCESS
 }
@@ -218,6 +235,29 @@ static BAR_DEVICE_OP_SKIPS: AtomicU32 = AtomicU32::new(0);
 static BAR_SYSTEM_BACKING_CAPTURES: AtomicU32 = AtomicU32::new(0);
 static BAR_SYSTEM_BACKING_MIRRORS: AtomicU32 = AtomicU32::new(0);
 static BAR_SYSTEM_BACKING_ERRORS: AtomicU32 = AtomicU32::new(0);
+/// Transient failures retried at PASSIVE (`PgRetry`): an MDL or blob mapping that
+/// returned NULL, a reservation that failed. One per extra attempt.
+static BAR_RETRIES: AtomicU32 = AtomicU32::new(0);
+/// Allocations marked "system copy invalid" because their LOCAL_TO_SYSTEM
+/// eviction was skipped (`PgInv`). Each is content VidMm believes it saved and
+/// did not; the blob stays authoritative and the matching page-in is skipped.
+static BAR_INVALID_MARKED: AtomicU32 = AtomicU32::new(0);
+/// The invalid-copy set was full and went to overflow (`PgInvOvf`): until the
+/// next transport generation EVERY page-in is skipped. Must stay 0.
+static BAR_INVALID_OVERFLOW: AtomicU32 = AtomicU32::new(0);
+/// "System copy invalid" marks cleared by successful evictions that, together,
+/// covered the whole allocation (`PgInvClr`). `PgInv - PgInvClr` that keeps
+/// growing is allocations that stay marked (their page-ins keep being skipped).
+static BAR_INVALID_CLEARED: AtomicU32 = AtomicU32::new(0);
+/// SYSTEM_TO_LOCAL page-ins skipped because the allocation's system copy is
+/// invalid (`PgInvSk`).
+static BAR_INVALID_SKIPS: AtomicU32 = AtomicU32::new(0);
+/// VIRTUAL_TRANSFERs carrying nonzero `Flags` (`PgV64`): the 64-KiB-page forms.
+/// The driver never declares 64-KiB pages (`gpummu::fill_gpummu_caps` leaves the
+/// caps bits off and reports only the 4-KiB leaf size), so VidMm should never set
+/// them; the PTE shadow models 4-KiB leaves only, so such a transfer is skipped.
+/// Must stay 0 — a nonzero value means the driver's page-size contract changed.
+static BAR_VIRTUAL_FLAGS: AtomicU32 = AtomicU32::new(0);
 
 /// The BAR paging counter block, mirrored into the registry through the shared
 /// throttled emitter (R317). Named values and encodings are unchanged; only the
@@ -249,7 +289,21 @@ static PAGING_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         f(b"PgEv", &BAR_ERR_VIRTUAL),
         f(b"PgEx", &BAR_ERR_MDL),
         f(b"PgEf", &BAR_ERR_SHADOW_FULL),
-        f(b"PgSkipV", &BAR_SKIPPED),
+        // A VALUE entry, not a failure: every skip site already bumps its own failure
+        // counter (PgEm/PgEb/PgEv/PgSe/...) which forces the flush, and this one used
+        // to force the whole ~35-value registry write on EVERY skipped op — in a
+        // storm, inside BuildPagingBuffer.
+        e(b"PgSkipV", &BAR_SKIPPED),
+        e(b"PgRetry", &BAR_RETRIES),
+        f(b"PgInv", &BAR_INVALID_MARKED),
+        f(b"PgInvOvf", &BAR_INVALID_OVERFLOW),
+        e(b"PgInvSk", &BAR_INVALID_SKIPS),
+        e(b"PgInvClr", &BAR_INVALID_CLEARED),
+        f(b"PgV64", &BAR_VIRTUAL_FLAGS),
+        e(
+            b"PgStale",
+            &crate::ddi::create_allocation::STALE_ALLOC_REFUSED,
+        ),
         e(b"PgClamp", &BAR_CLAMPED),
         e(b"PgVp", &BAR_VIRTUAL_PTES),
         e64(b"PgVs", &BAR_LAST_VIRTUAL_SRC),
@@ -457,7 +511,7 @@ impl PagingPteShadow {
 
     /// Resolve a paging-process GPU-VA byte range to the exact ordered physical
     /// pages currently supplied by VidMm.
-    fn resolve(&self, virtual_address: u64, size: u64) -> Option<Vec<u64>> {
+    fn resolve(&self, passive: PassiveLevel, virtual_address: u64, size: u64) -> Option<Vec<u64>> {
         if size == 0 {
             return Some(Vec::new());
         }
@@ -467,7 +521,9 @@ impl PagingPteShadow {
         let page_count_usize = usize::try_from(page_count).ok()?;
 
         let mut pages = Vec::new();
-        if pages.try_reserve_exact(page_count_usize).is_err() {
+        // A failed reservation is a transient pool shortage, not an unresolvable
+        // range: retried at PASSIVE before the transfer is given up.
+        if !reserve_retry(passive, &mut pages, page_count_usize) {
             return None;
         }
 
@@ -487,6 +543,78 @@ impl PagingPteShadow {
             }
         }
         resolved.then_some(pages)
+    }
+}
+
+/// `try_reserve_exact` that retries a transient shortage at PASSIVE, the same
+/// bounded policy the mappings get ([`pg::retry_after_failure`]). The sleep is
+/// legal because every caller runs inside the PASSIVE-gated content path and holds
+/// only the sleeping content mutex.
+fn reserve_retry<T>(passive: PassiveLevel, v: &mut Vec<T>, additional: usize) -> bool {
+    let mut failed = 0u32;
+    loop {
+        if v.try_reserve_exact(additional).is_ok() {
+            return true;
+        }
+        failed += 1;
+        if backoff(passive, failed, false).is_none() {
+            return false;
+        }
+    }
+}
+
+/// Sleep before the next attempt after `failed` consecutive failures, or `None`
+/// when the attempts are spent. PASSIVE (the token), no spinlock held.
+fn backoff(passive: PassiveLevel, failed: u32, timed_out: bool) -> Option<()> {
+    let ms = pg::retry_after_failure(failed, timed_out)?;
+    BAR_RETRIES.fetch_add(1, Ordering::Relaxed);
+    crate::virtio::ctrl::sleep_ms(passive, ms);
+    Some(())
+}
+
+/// A LOCAL_TO_SYSTEM eviction of the live, reachable allocation `resource_id` did
+/// not (fully) happen although the DDI will answer STATUS_SUCCESS: VidMm now
+/// believes the system pages hold the content, and they do not. Remember it, so
+/// the matching page-in is skipped instead of overwriting the good blob with them.
+///
+/// Needs no content guard (own spinlock): the content mutex failing is itself a
+/// reason to call it.
+fn note_skipped_eviction(adapter: &AdapterContext, resource_id: u32) {
+    match adapter
+        .system_backings
+        .mark_system_copy_invalid(resource_id)
+    {
+        pg::Mark::Newly => {
+            BAR_INVALID_MARKED.fetch_add(1, Ordering::Relaxed);
+        }
+        pg::Mark::Overflow => {
+            BAR_INVALID_MARKED.fetch_add(1, Ordering::Relaxed);
+            BAR_INVALID_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        }
+        pg::Mark::Already | pg::Mark::Ignored => {}
+    }
+}
+
+/// The outcome of a classic eviction that was skipped for a live allocation.
+fn eviction_skipped(adapter: &AdapterContext, resource_id: u32) -> PagingOpOutcome {
+    note_skipped_eviction(adapter, resource_id);
+    PagingOpOutcome::Failed(paging_failure())
+}
+
+/// A LOCAL_TO_SYSTEM eviction chunk just succeeded; `moved` is the count ACTUALLY
+/// copied (not the requested size). Once the chunks that succeeded since the mark
+/// cover the whole allocation, the system copy is real again and the mark goes.
+fn note_eviction_done(
+    content_guard: &SystemBackingGuard<'_>,
+    alloc_size: u64,
+    offset: u64,
+    moved: u64,
+    resource_id: u32,
+) {
+    if content_guard.evict_chunk_done(resource_id, alloc_size, offset, moved)
+        == pg::Chunk::Revalidated
+    {
+        BAR_INVALID_CLEARED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -550,7 +678,7 @@ impl MdlWindow {
 ///
 /// # Safety
 /// `mdl` must be a valid, locked MDL for the duration of the paging op.
-unsafe fn mdl_system_va(_passive: PassiveLevel, mdl: PMDL) -> Option<MdlWindow> {
+unsafe fn mdl_system_va(passive: PassiveLevel, mdl: PMDL) -> Option<MdlWindow> {
     if mdl.is_null() {
         return None;
     }
@@ -565,24 +693,28 @@ unsafe fn mdl_system_va(_passive: PassiveLevel, mdl: PMDL) -> Option<MdlWindow> 
                 byte_offset,
             });
         }
-        let va = MmMapLockedPagesSpecifyCache(
-            mdl,
-            KERNEL_MODE,
-            _MEMORY_CACHING_TYPE::MmCached,
-            core::ptr::null_mut(),
-            0, // BugCheckOnFailure = FALSE → NULL return for KernelMode failure
-            MDL_MAP_PRIORITY,
-        );
-        match core::ptr::NonNull::new(va as *mut u8) {
-            Some(va) => Some(MdlWindow {
-                va,
-                len,
-                byte_offset,
-            }),
-            None => {
-                BAR_ERR_MDL.fetch_add(1, Ordering::Relaxed);
-                None
+        // A NULL return is low system PTEs, which clears by itself: a few attempts
+        // at PASSIVE before the op is given up on (and answered success + counted).
+        let mut failed = 0u32;
+        loop {
+            let va = MmMapLockedPagesSpecifyCache(
+                mdl,
+                KERNEL_MODE,
+                _MEMORY_CACHING_TYPE::MmCached,
+                core::ptr::null_mut(),
+                0, // BugCheckOnFailure = FALSE → NULL return for KernelMode failure
+                MDL_MAP_PRIORITY,
+            );
+            if let Some(va) = core::ptr::NonNull::new(va as *mut u8) {
+                return Some(MdlWindow {
+                    va,
+                    len,
+                    byte_offset,
+                });
             }
+            BAR_ERR_MDL.fetch_add(1, Ordering::Relaxed);
+            failed += 1;
+            backoff(passive, failed, false)?;
         }
     }
 }
@@ -598,33 +730,45 @@ unsafe fn with_blob_bytes(
     f: impl FnOnce(*mut u8, u64),
 ) -> bool {
     BAR_LAST_RESID.store(resource_id, Ordering::Relaxed);
-    let prep = match crate::virtio::ctrl::map_blob_prepare(
-        passive,
-        adapter,
-        crate::virtio::gpu::OwnerFilter::Any,
-        resource_id,
-    ) {
-        Ok(p) => p,
-        Err(_) => {
-            BAR_ERR_MAP.fetch_add(1, Ordering::Relaxed);
+    // Both halves are retried together at PASSIVE (the mapping of the blob into
+    // the window, then the kernel map of that range): either can fail for a
+    // reason that clears in milliseconds. A host TIMEOUT gets one retry only —
+    // each attempt can wait for seconds, and that stall happens under the content
+    // mutex. The map is idempotent, so repeating it is safe.
+    let mut failed = 0u32;
+    let (prep, va) = loop {
+        let timed_out = match crate::virtio::ctrl::map_blob_prepare(
+            passive,
+            adapter,
+            crate::virtio::gpu::OwnerFilter::Any,
+            resource_id,
+        ) {
+            Ok(prep) => {
+                BAR_LAST_MAP_CACHE.store(prep.map_cache, Ordering::Relaxed);
+                let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
+                pa.QuadPart = prep.gpa as i64;
+                // SAFETY: PASSIVE_LEVEL; the range was RESOURCE_MAP_BLOB'd into the
+                // host-visible window, so the pages are backed. The cache attribute
+                // MUST match the host's MAP_INFO response: choosing MmCached
+                // unconditionally creates a conflicting WB alias when virglrenderer
+                // reports WC/UC. Such an alias is architecturally invalid and can
+                // expose stale cache lines after the host GPU writes the blob.
+                // Unmapped below.
+                let cache = super::blob_map::map_cache_to_mm(prep.map_cache);
+                let va = unsafe { MmMapIoSpace(pa, prep.size, cache) } as *mut u8;
+                if !va.is_null() {
+                    break (prep, va);
+                }
+                false
+            }
+            Err(error) => matches!(error, crate::virtio::VirtioError::Timeout),
+        };
+        BAR_ERR_MAP.fetch_add(1, Ordering::Relaxed);
+        failed += 1;
+        if backoff(passive, failed, timed_out).is_none() {
             return false;
         }
     };
-    BAR_LAST_MAP_CACHE.store(prep.map_cache, Ordering::Relaxed);
-    let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
-    pa.QuadPart = prep.gpa as i64;
-    // SAFETY: PASSIVE_LEVEL; the range was RESOURCE_MAP_BLOB'd into the
-    // host-visible window, so the pages are backed. The cache attribute MUST
-    // match the host's MAP_INFO response: choosing MmCached unconditionally
-    // creates a conflicting WB alias when virglrenderer reports WC/UC. Such an
-    // alias is architecturally invalid and can expose stale cache lines after
-    // the host GPU writes the blob. Unmapped below.
-    let cache = super::blob_map::map_cache_to_mm(prep.map_cache);
-    let va = unsafe { MmMapIoSpace(pa, prep.size, cache) } as *mut u8;
-    if va.is_null() {
-        BAR_ERR_MAP.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
     f(va, prep.size);
     // SAFETY: `va` maps `prep.size` bytes, mapped just above.
     unsafe { MmUnmapIoSpace(va as *mut c_void, prep.size) };
@@ -640,7 +784,7 @@ unsafe fn with_blob_bytes(
 /// never retained. A range needed by a later Present acquires its own
 /// `MmProbeAndLockPages` lease from the transient VA before it is unmapped.
 unsafe fn for_each_paging_system_run(
-    _passive: PassiveLevel,
+    passive: PassiveLevel,
     pages: &[u64],
     system_virtual_address: u64,
     size: u64,
@@ -658,10 +802,13 @@ unsafe fn for_each_paging_system_run(
         BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
         return false;
     };
-    if pages.len() != page_count {
+    // `pages` was resolved for the requested size; a transfer cut to a shorter
+    // mapped blob needs only the first `page_count` of them.
+    if pages.len() < page_count {
         BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
         return false;
     }
+    let pages = &pages[..page_count];
 
     let mut page_index = 0usize;
     let mut page_offset = byte_offset;
@@ -683,17 +830,26 @@ unsafe fn for_each_paging_system_run(
             BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
             return false;
         };
-        let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
-        pa.QuadPart = first_physical as i64;
         // SAFETY: VidMm keeps every supplied system PTE locked for this paging
         // operation. MmCached matches ordinary system RAM's established cache
         // attribute, and the view is released before BuildPagingBuffer returns.
-        let mapping =
-            unsafe { MmMapIoSpace(pa, map_size, _MEMORY_CACHING_TYPE::MmCached) } as *mut u8;
-        if mapping.is_null() {
+        let mut failed = 0u32;
+        let mapping = loop {
+            // Rebuilt per attempt: the address is passed by value.
+            let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
+            pa.QuadPart = first_physical as i64;
+            let mapping =
+                unsafe { MmMapIoSpace(pa, map_size, _MEMORY_CACHING_TYPE::MmCached) } as *mut u8;
+            if !mapping.is_null() {
+                break mapping;
+            }
             BAR_ERR_MAP.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
+            failed += 1;
+            // PASSIVE (the token); nothing is mapped or held across the sleep.
+            if backoff(passive, failed, false).is_none() {
+                return false;
+            }
+        };
         let available = map_size - page_offset;
         let chunk = (size - copied).min(available);
         let start = unsafe { mapping.add(page_offset as usize) };
@@ -780,13 +936,41 @@ pub(crate) unsafe fn mirror_present_system_backing(
 /// system-memory side are all supplied by VidMm. The allocation offset applies
 /// only to the blob and is deliberately not added to either virtual address, as
 /// required by `DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL`.
+///
+/// Returns `false` for an op that was skipped (the caller answers STATUS_SUCCESS
+/// and counts it). A skipped LOCAL_TO_SYSTEM eviction of a live allocation marks
+/// its system copy invalid, so the page-in VidMm will issue for it is skipped
+/// rather than copying garbage over the blob (see [`note_skipped_eviction`]).
 unsafe fn bar_virtual_transfer(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     content_guard: &SystemBackingGuard<'_>,
     transfer: &DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL,
 ) -> bool {
-    let Some(alloc) = (unsafe { paging_alloc_info(transfer.hAllocation) }) else {
+    // Set by the inner function once it knows this is an eviction of a live,
+    // reachable allocation: from there on a `false` return is a lost snapshot.
+    let mut evicting: Option<u32> = None;
+    let ok = unsafe {
+        bar_virtual_transfer_inner(passive, adapter, content_guard, transfer, &mut evicting)
+    };
+    if !ok {
+        if let Some(resource_id) = evicting {
+            note_skipped_eviction(adapter, resource_id);
+        }
+    }
+    ok
+}
+
+unsafe fn bar_virtual_transfer_inner(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    content_guard: &SystemBackingGuard<'_>,
+    transfer: &DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL,
+    evicting: &mut Option<u32>,
+) -> bool {
+    let Some(alloc) = (unsafe { paging_alloc_info(adapter, transfer.hAllocation) }) else {
+        // Unknown handle, or an allocation of an older transport generation: there
+        // is no blob this driver can name, so nothing to preserve or to skip.
         BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
         return false;
     };
@@ -804,17 +988,13 @@ unsafe fn bar_virtual_transfer(
     // transfer itself (measured 0x1E10000 against a recorded 0x1C20000), and the
     // only status that could refuse it is one VidMm bugchecks on. The part past
     // the allocation is padding and moves nothing.
-    let size = match helios_kmd_logic::paging::clamp_range(
-        alloc.size,
-        offset,
-        transfer.TransferSizeInBytes,
-    ) {
-        helios_kmd_logic::paging::Clamp::Full(n) => n,
-        helios_kmd_logic::paging::Clamp::Clamped(n) => {
+    let size = match pg::clamp_range(alloc.size, offset, transfer.TransferSizeInBytes) {
+        Clamp::Full(n) => n,
+        Clamp::Clamped(n) => {
             BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
             n
         }
-        helios_kmd_logic::paging::Clamp::Nothing => {
+        Clamp::Nothing => {
             BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -823,21 +1003,8 @@ unsafe fn bar_virtual_transfer(
         return true;
     }
     BAR_LAST_XFER_OFF.store(offset as u32, Ordering::Relaxed);
-    BAR_LAST_XFER_FLAGS.store(
-        unsafe { transfer.Flags.__bindgen_anon_1.Flags },
-        Ordering::Relaxed,
-    );
-    // The retained PTE shadow models 4-KiB leaves. Interpreting a 64-KiB page
-    // table through it would address the wrong physical pages, so refuse the
-    // operation instead of silently corrupting either copy. This is a
-    // capability boundary, not a best-effort fallback: add 64-KiB shadow
-    // support before accepting either documented flag.
     let virtual_flags = unsafe { transfer.Flags.__bindgen_anon_1.Flags };
-    if virtual_flags != 0 {
-        BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
-        crate::diag::record_named_bytes(b"Pg64Ref", virtual_flags);
-        return false;
-    }
+    BAR_LAST_XFER_FLAGS.store(virtual_flags, Ordering::Relaxed);
     BAR_LAST_VIRTUAL_SRC.store(transfer.SourceVirtualAddress, Ordering::Relaxed);
     BAR_LAST_VIRTUAL_DST.store(transfer.DestinationVirtualAddress, Ordering::Relaxed);
 
@@ -858,8 +1025,31 @@ unsafe fn bar_virtual_transfer(
             return false;
         }
     };
+    // From here on this is a content op on a live allocation of this generation.
+    if blob_to_system {
+        *evicting = Some(alloc.resource_id);
+    } else if pg::page_in_decision(content_guard.page_in_blocked(alloc.resource_id))
+        == pg::PageIn::SkipBlobAuthoritative
+    {
+        // The matching eviction was skipped: the system pages are not this
+        // allocation's content, the blob is. Copying them in would destroy it.
+        BAR_INVALID_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    // The retained PTE shadow models 4-KiB leaves. Interpreting a 64-KiB page
+    // table through it would address the wrong physical pages, so skip the
+    // operation instead of silently corrupting either copy. This is a capability
+    // boundary, not a best-effort fallback: add 64-KiB shadow support before
+    // accepting either documented flag. The driver never declares 64-KiB pages
+    // (`PgV64` must stay 0; see `BAR_VIRTUAL_FLAGS`).
+    if virtual_flags != 0 {
+        BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
+        BAR_VIRTUAL_FLAGS.fetch_add(1, Ordering::Relaxed);
+        crate::diag::record_named_bytes(b"Pg64Ref", virtual_flags);
+        return false;
+    }
 
-    let Some(system_pages) = adapter.paging_pte_shadow.resolve(system_va, size) else {
+    let Some(system_pages) = adapter.paging_pte_shadow.resolve(passive, system_va, size) else {
         BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
         return false;
     };
@@ -870,27 +1060,41 @@ unsafe fn bar_virtual_transfer(
         alloc.system_backing_policy == SystemBackingPolicy::PresentLinearBuffer;
     if blob_to_system
         && retain_system_backing
-        && replacements
-            .try_reserve_exact(replacement_capacity)
-            .is_err()
+        && !reserve_retry(passive, &mut replacements, replacement_capacity)
     {
         BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
+    // The bytes actually moved: `size` cut again to the MAPPED blob (a blob
+    // shorter than the recorded allocation moves its prefix, not nothing).
+    let mut moved = 0u64;
+    // Set when the lease bookkeeping for a run could not be kept. NEVER a reason
+    // to stop copying: the data copy and the lease record are independent, and an
+    // eviction that stops after some runs leaves the system image half garbage
+    // while VidMm is told it is whole.
+    let mut lease_failed = false;
     let mut copied = false;
     let mapped = unsafe {
         with_blob_bytes(passive, adapter, alloc.resource_id, |blob, blob_size| {
-            if offset.checked_add(size).is_none_or(|end| end > blob_size) {
-                BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            // SAFETY: the blob range was checked above; the PTE shadow resolves
-            // exactly the other side of this live VidMm paging operation.
+            let n = match pg::clamp_to_mapped(offset, size, blob_size) {
+                Clamp::Full(n) => n,
+                Clamp::Clamped(n) => {
+                    BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
+                    n
+                }
+                Clamp::Nothing => {
+                    BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+            // SAFETY: the blob range `[offset, offset + n)` lies inside the mapping
+            // (`clamp_to_mapped`); the PTE shadow resolves exactly the other side
+            // of this live VidMm paging operation.
             copied = for_each_paging_system_run(
                 passive,
                 &system_pages,
                 system_va,
-                size,
+                n,
                 |system_start, range_offset, range_size| {
                     let Some(blob_range_offset) = offset.checked_add(range_offset) else {
                         return false;
@@ -904,25 +1108,32 @@ unsafe fn bar_virtual_transfer(
                     let blob_start = blob.add(blob_range_offset_usize);
                     if blob_to_system {
                         core::ptr::copy_nonoverlapping(blob_start, system_start, range_size_usize);
-                        if retain_system_backing {
+                        if retain_system_backing && !lease_failed {
                             // Acquire the independent lock while this run's
-                            // operation-owned system mapping is still live.
-                            let Some(range) = content_guard.acquire_range(
-                                passive,
-                                blob_range_offset,
-                                range_size,
-                                system_start,
-                            ) else {
-                                BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
-                                return false;
-                            };
+                            // operation-owned system mapping is still live. A
+                            // refusal (pinned-byte ceiling, MDL lock failure, the
+                            // range table or the record table full) only costs
+                            // later Present mirroring into this surface's CPU view:
+                            // the run is copied, and so are all that follow.
                             if replacements.len() >= MAX_SYSTEM_BACKING_RANGES
                                 || replacements.len() >= replacements.capacity()
                             {
+                                lease_failed = true;
                                 BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
-                                return false;
+                            } else {
+                                match content_guard.acquire_range(
+                                    passive,
+                                    blob_range_offset,
+                                    range_size,
+                                    system_start,
+                                ) {
+                                    Some(range) => replacements.push(range),
+                                    None => {
+                                        lease_failed = true;
+                                        BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
                             }
-                            replacements.push(range);
                         }
                     } else {
                         core::ptr::copy_nonoverlapping(system_start, blob_start, range_size_usize);
@@ -930,34 +1141,54 @@ unsafe fn bar_virtual_transfer(
                     true
                 },
             );
+            moved = n;
         })
     };
-    if mapped && copied {
-        if blob_to_system {
-            if !retain_system_backing {
-                BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
-                return true;
-            }
-            if content_guard.replace_range(passive, alloc.resource_id, offset, size, replacements) {
-                BAR_SYSTEM_BACKING_CAPTURES.fetch_add(1, Ordering::Relaxed);
-            } else {
-                BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
-                return false;
-            }
-            BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
-        } else {
-            if retain_system_backing
-                && !content_guard.remove_range(passive, alloc.resource_id, offset, size)
-            {
-                BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
-                return false;
-            }
-            BAR_XFER_IN.fetch_add(1, Ordering::Relaxed);
-        }
-        true
-    } else {
-        false
+    if !(mapped && copied) {
+        // Skipped (counted at the failing site). A page-in that stopped partway
+        // leaves the blob partly updated from valid system pages; an eviction is
+        // marked by the caller.
+        return false;
     }
+    if blob_to_system {
+        if retain_system_backing {
+            let recorded = !lease_failed
+                && content_guard.replace_range(
+                    passive,
+                    alloc.resource_id,
+                    offset,
+                    moved,
+                    core::mem::take(&mut replacements),
+                );
+            if !recorded {
+                // The snapshot is complete; only the record that lets Present keep
+                // mirroring into the system copy is not. Drop what was gathered
+                // (unlocking those runs) and any older record of this range, which
+                // no longer describes the system image, and say so (`PgSe`).
+                replacements.clear();
+                BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
+                if !content_guard.remove_range(passive, alloc.resource_id, offset, moved) {
+                    BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                BAR_SYSTEM_BACKING_CAPTURES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // The system copy now holds the content: whole-allocation evictions clear
+        // an earlier "invalid" mark.
+        note_eviction_done(content_guard, alloc.size, offset, moved, alloc.resource_id);
+        BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        // The page-in copied; the blob is authoritative again. A record that
+        // cannot be dropped only leaves a stale lease behind (counted).
+        if retain_system_backing
+            && !content_guard.remove_range(passive, alloc.resource_id, offset, moved)
+        {
+            BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+        BAR_XFER_IN.fetch_add(1, Ordering::Relaxed);
+    }
+    true
 }
 
 /// Classic TRANSFER touching the BAR segment: content copy between the
@@ -982,15 +1213,15 @@ unsafe fn bar_transfer(
     // operation anyway hands VidMm a status it cannot tolerate (0x10E
     // VIDEO_MEMORY_MANAGEMENT_INTERNAL, 0xC000009A, measured on a restart under
     // DWM load), so count it and report that nothing needed doing. With the
-    // transport UP a failed copy still fails the operation, as before.
+    // transport UP a failed copy is skipped and counted instead.
     if adapter.with_virtio(|_| ()).is_err() {
         BAR_ERR_TX_GONE.fetch_add(1, Ordering::Relaxed);
         return PagingOpOutcome::NotOurs;
     }
-    let Some(alloc) = (unsafe { paging_alloc_info(t.hAllocation) }) else {
-        // The transfer names the BAR segment but no live Helios allocation:
-        // there is nothing this driver can copy, and the caller must not read
-        // that as "content moved".
+    let Some(alloc) = (unsafe { paging_alloc_info(adapter, t.hAllocation) }) else {
+        // The transfer names the BAR segment but no live Helios allocation of this
+        // transport generation: there is nothing this driver can copy, and the
+        // caller must not read that as "content moved".
         BAR_ERR_XFER_HANDLE.fetch_add(1, Ordering::Relaxed);
         return PagingOpOutcome::Failed(paging_failure());
     };
@@ -1007,17 +1238,13 @@ unsafe fn bar_transfer(
     BAR_LAST_MDL_OFF.store(t.MdlOffset, Ordering::Relaxed);
     // Cut to the recorded allocation, as in `bar_virtual_transfer`; nothing known
     // to move is a counted no-op, not an error.
-    let bytes = match helios_kmd_logic::paging::clamp_range(
-        alloc.size,
-        t.TransferOffset as u64,
-        t.TransferSize as u64,
-    ) {
-        helios_kmd_logic::paging::Clamp::Full(n) => n,
-        helios_kmd_logic::paging::Clamp::Clamped(n) => {
+    let bytes = match pg::clamp_range(alloc.size, t.TransferOffset as u64, t.TransferSize as u64) {
+        Clamp::Full(n) => n,
+        Clamp::Clamped(n) => {
             BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
             n
         }
-        helios_kmd_logic::paging::Clamp::Nothing => {
+        Clamp::Nothing => {
             BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
             return PagingOpOutcome::NotOurs;
         }
@@ -1032,6 +1259,14 @@ unsafe fn bar_transfer(
     match (src_seg, dst_seg) {
         // Page-in: system backing → blob (evicted or initial content).
         (0, s) if s == bar_id => {
+            // A skipped eviction left the SYSTEM pages holding garbage while VidMm
+            // believes they hold the content. The blob is the only good copy.
+            if pg::page_in_decision(content_guard.page_in_blocked(alloc.resource_id))
+                == pg::PageIn::SkipBlobAuthoritative
+            {
+                BAR_INVALID_SKIPS.fetch_add(1, Ordering::Relaxed);
+                return PagingOpOutcome::Failed(paging_failure());
+            }
             // SAFETY: `t.Source` is the transfer's source descriptor; its
             // SegmentId selects the union arm, and it is 0 on this arm.
             let TransferEnd::SystemMdl(mdl) = (unsafe { TransferEnd::source(&t.Source) }) else {
@@ -1039,8 +1274,8 @@ unsafe fn bar_transfer(
                 return PagingOpOutcome::Failed(paging_failure());
             };
             let Some(window) = (unsafe { mdl_system_va(passive, mdl) }) else {
-                // PgEx counted inside mdl_system_va. The page-in did not happen,
-                // so the blob still holds stale bytes — never report success.
+                // PgEx counted inside mdl_system_va, after its retries. The
+                // page-in did not happen: the blob keeps its last content.
                 return PagingOpOutcome::Failed(paging_failure());
             };
             // The MDL side is range-checked exactly like the blob side.
@@ -1051,70 +1286,99 @@ unsafe fn bar_transfer(
             let mut copied = false;
             let ok = unsafe {
                 with_blob_bytes(passive, adapter, alloc.resource_id, |dst, len| {
-                    if blob_off.saturating_add(bytes) > len {
-                        BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
+                    // The mapped blob may be shorter than the recorded allocation:
+                    // move what is there.
+                    let n = match pg::clamp_to_mapped(blob_off, bytes, len) {
+                        Clamp::Full(n) => n,
+                        Clamp::Clamped(n) => {
+                            BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
+                            n
+                        }
+                        Clamp::Nothing => {
+                            BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    };
                     // SAFETY: dst covers `len` blob bytes and src covers `bytes`
-                    // mapped MDL bytes, both checked above.
-                    core::ptr::copy_nonoverlapping(src, dst.add(blob_off as usize), bytes as usize);
+                    // mapped MDL bytes, both checked above, and n <= both.
+                    core::ptr::copy_nonoverlapping(src, dst.add(blob_off as usize), n as usize);
                     copied = true;
                 })
             };
             if !(ok && copied) {
-                // PgEm (blob map) or PgEb (out-of-blob range) already counted.
+                // PgEm (blob map, after retries) or PgEb already counted.
                 return PagingOpOutcome::Failed(paging_failure());
             }
-            // The inverse transfer makes the BAR blob authoritative again.
+            // The inverse transfer makes the BAR blob authoritative again. The
+            // copy has already happened, so a record that cannot be dropped is
+            // counted (it leaves a stale lease behind), not reported as a skipped
+            // page-in.
             if alloc.system_backing_policy == SystemBackingPolicy::PresentLinearBuffer
                 && !content_guard.remove_range(passive, alloc.resource_id, blob_off, bytes)
             {
                 BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
-                return PagingOpOutcome::Failed(paging_failure());
             }
             BAR_XFER_IN.fetch_add(1, Ordering::Relaxed);
             PagingOpOutcome::Executed
         }
-        // Eviction: blob → system backing.
+        // Eviction: blob → system backing. From here every way of not completing
+        // the copy goes through `eviction_skipped`: VidMm is told the system pages
+        // are current, so the allocation must be remembered as invalid.
         (s, 0) if s == bar_id => {
             // SAFETY: as the page-in arm — SegmentId 0 selects pMdl.
             let TransferEnd::SystemMdl(mdl) = (unsafe { TransferEnd::destination(&t.Destination) })
             else {
                 BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
-                return PagingOpOutcome::Failed(paging_failure());
+                return eviction_skipped(adapter, alloc.resource_id);
             };
             let Some(window) = (unsafe { mdl_system_va(passive, mdl.cast()) }) else {
-                // PgEx counted inside mdl_system_va. The eviction did not happen;
-                // reporting success here would lose the allocation's only copy.
-                return PagingOpOutcome::Failed(paging_failure());
+                // PgEx counted inside mdl_system_va, after its retries.
+                return eviction_skipped(adapter, alloc.resource_id);
             };
             // THE WRITE SIDE: an unchecked `mdl_off + bytes` here is a kernel
             // memory write past the mapped buffer.
             let Some(dst_start) = window.slice_at_page(mdl_page, bytes) else {
                 BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
-                return PagingOpOutcome::Failed(paging_failure());
+                return eviction_skipped(adapter, alloc.resource_id);
             };
             let mut copied = false;
+            // The bytes actually moved: `bytes` cut again to the MAPPED blob. A
+            // blob shorter than the recorded allocation moves its prefix, and the
+            // lease and the "invalid" bookkeeping below must describe that prefix,
+            // not the request (a lease running past the blob makes every later
+            // Present mirror and fill of this allocation fail).
+            let mut moved = 0u64;
             let ok = unsafe {
                 with_blob_bytes(passive, adapter, alloc.resource_id, |src, len| {
-                    if blob_off.saturating_add(bytes) > len {
-                        BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
+                    let n = match pg::clamp_to_mapped(blob_off, bytes, len) {
+                        Clamp::Full(n) => n,
+                        Clamp::Clamped(n) => {
+                            BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
+                            n
+                        }
+                        Clamp::Nothing => {
+                            BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    };
                     // SAFETY: src covers `len` blob bytes and dst_start covers
-                    // `bytes` mapped MDL bytes, both checked above.
+                    // `bytes` mapped MDL bytes, both checked above, and n <= both.
                     core::ptr::copy_nonoverlapping(
                         src.add(blob_off as usize),
                         dst_start,
-                        bytes as usize,
+                        n as usize,
                     );
+                    moved = n;
                     copied = true;
                 })
             };
             if !(ok && copied) {
                 // PgEm / PgEb already counted.
-                return PagingOpOutcome::Failed(paging_failure());
+                return eviction_skipped(adapter, alloc.resource_id);
             }
+            // The copy is complete. Whether Present can keep mirroring into it is
+            // a separate matter: without an independent lease it cannot, but the
+            // snapshot is whole, so this is counted (`PgSe`) and still success.
             if alloc.system_backing_policy == SystemBackingPolicy::PresentLinearBuffer
                 && !unsafe {
                     remember_system_backing(
@@ -1122,17 +1386,24 @@ unsafe fn bar_transfer(
                         content_guard,
                         alloc.resource_id,
                         blob_off,
-                        bytes,
+                        moved,
                         dst_start,
                     )
                 }
             {
-                // The eviction bytes were copied, but without an independent
-                // lease a later system-resident Present could not update them
-                // safely.  Refuse the paging op so VidMm can retry instead of
-                // retiring a backing association this driver cannot honor.
-                return PagingOpOutcome::Failed(paging_failure());
+                // Any older record of this range no longer describes the system
+                // image. Best effort; both failures are already in PgSe.
+                if !content_guard.remove_range(passive, alloc.resource_id, blob_off, moved) {
+                    BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
+                }
             }
+            note_eviction_done(
+                content_guard,
+                alloc.size,
+                blob_off,
+                moved,
+                alloc.resource_id,
+            );
             BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
             PagingOpOutcome::Executed
         }
@@ -1162,7 +1433,7 @@ unsafe fn bar_fill(
     if f.Destination.SegmentId != bar_id {
         return PagingOpOutcome::NotOurs;
     }
-    let Some(alloc) = (unsafe { paging_alloc_info(f.hAllocation) }) else {
+    let Some(alloc) = (unsafe { paging_alloc_info(adapter, f.hAllocation) }) else {
         // Same class as PgEh on the transfer side: a BAR-segment fill naming no
         // live allocation is a refusal, not a no-op.
         BAR_ERR_FILL_HANDLE.fetch_add(1, Ordering::Relaxed);
@@ -1172,13 +1443,13 @@ unsafe fn bar_fill(
         BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
         return PagingOpOutcome::NotOurs;
     }
-    let fill_len = match helios_kmd_logic::paging::clamp_range(alloc.size, 0, f.FillSize as u64) {
-        helios_kmd_logic::paging::Clamp::Full(n) => n,
-        helios_kmd_logic::paging::Clamp::Clamped(n) => {
+    let fill_len = match pg::clamp_range(alloc.size, 0, f.FillSize as u64) {
+        Clamp::Full(n) => n,
+        Clamp::Clamped(n) => {
             BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
             n
         }
-        helios_kmd_logic::paging::Clamp::Nothing => {
+        Clamp::Nothing => {
             BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
             return PagingOpOutcome::NotOurs;
         }
@@ -1188,22 +1459,27 @@ unsafe fn bar_fill(
     let mut filled = false;
     let ok = unsafe {
         with_blob_bytes(passive, adapter, alloc.resource_id, |dst, len| {
-            // A fill longer than the MAPPED blob (a blob smaller than the recorded
-            // allocation) is refused whole — counted PgEb, and answered success
-            // with PgSkipV like every skipped op. The recorded-size overrun was
-            // already cut above; this is the second, mapped-length bound.
-            if fill_len > len {
-                BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            fill_pattern(dst, fill_len as usize, pattern);
+            // A blob shorter than the recorded allocation is filled up to its mapped
+            // length (the second bound, after the recorded-size cut above).
+            let n = match pg::clamp_to_mapped(0, fill_len, len) {
+                Clamp::Full(n) => n,
+                Clamp::Clamped(n) => {
+                    BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
+                    n
+                }
+                Clamp::Nothing => {
+                    BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+            fill_pattern(dst, n as usize, pattern);
             filled = system_backing
                 .as_ref()
-                .is_none_or(|backing| backing.copy_blob_range(dst, len, 0, fill_len));
+                .is_none_or(|backing| backing.copy_blob_range(dst, len, 0, n));
         })
     };
     if !(ok && filled) {
-        // PgEm (blob map) or PgEb (oversized fill) already counted.
+        // PgEm (blob map) or PgEb (nothing mapped) already counted.
         return PagingOpOutcome::Failed(paging_failure());
     }
     BAR_FILLS.fetch_add(1, Ordering::Relaxed);
@@ -1228,6 +1504,7 @@ fn fill_pattern(dst: *mut u8, len: usize, pattern: u32) {
 /// physical placement VidMm assigned (pure atomic store — DISPATCH-safe, no
 /// side effects; content ops do not depend on it in the aperture model).
 unsafe fn bar_harvest_page_table(
+    adapter: &AdapterContext,
     bar_id: u32,
     bar_size: u64,
     u: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE,
@@ -1235,7 +1512,7 @@ unsafe fn bar_harvest_page_table(
     if u.PageTableLevel != 0 || u.pPageTableEntries.is_null() || u.NumPageTableEntries == 0 {
         return;
     }
-    let Some(alloc) = (unsafe { paging_alloc_info(u.hAllocation) }) else {
+    let Some(alloc) = (unsafe { paging_alloc_info(adapter, u.hAllocation) }) else {
         return;
     };
     if !alloc.bar_eligible {
@@ -1416,6 +1693,40 @@ impl TransferEnd {
     }
 }
 
+/// The content mutex could not be taken, so `operation` is skipped whole. If it
+/// was an eviction of a live allocation of this generation, remember that: the
+/// page-in that follows must not copy the (unwritten) system pages over the blob.
+/// Reads no content state — only the allocation handle — so it needs no guard.
+fn note_unserialized_eviction(
+    adapter: &AdapterContext,
+    bar_id: u32,
+    operation: &PagingOperation<'_>,
+) {
+    use crate::dxgk::_DXGK_MEMORY_TRANSFER_DIRECTION as Direction;
+    let h_allocation = match operation {
+        PagingOperation::Transfer(t)
+            if t.Destination.SegmentId == 0 && t.Source.SegmentId == bar_id =>
+        {
+            t.hAllocation
+        }
+        PagingOperation::VirtualTransfer(tv)
+            if matches!(
+                tv.TransferDirection,
+                Direction::DXGK_MEMORY_TRANSFER_LOCAL_TO_SYSTEM
+            ) =>
+        {
+            tv.hAllocation
+        }
+        _ => return,
+    };
+    // SAFETY: an in-flight paging op's hAllocation, as everywhere in this file.
+    if let Some(alloc) = unsafe { paging_alloc_info(adapter, h_allocation) } {
+        if alloc.bar_eligible {
+            note_skipped_eviction(adapter, alloc.resource_id);
+        }
+    }
+}
+
 /// `DxgkDdiBuildPagingBuffer` — translate a memory-management operation into GPU
 /// DMA. Null engine for the aperture / page-table segments; REAL content engine
 /// for BAR-segment allocations. See the module doc.
@@ -1451,7 +1762,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
 
     // Placement harvest is DISPATCH-safe (atomic store only) — no IRQL gate.
     if let PagingOperation::UpdatePageTable(update) = operation {
-        let track_system_pages = unsafe { paging_alloc_info(update.hAllocation) }
+        let track_system_pages = unsafe { paging_alloc_info(adapter, update.hAllocation) }
             .is_some_and(|alloc| alloc.bar_eligible);
         // Preserve the exact leaf mapping before retiring the page-table update.
         // Every update clears its Windows-supplied VA range first, including
@@ -1479,7 +1790,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
             BAR_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return paging_failure();
         }
-        unsafe { bar_harvest_page_table(bar.seg_id, bar.size, update) };
+        unsafe { bar_harvest_page_table(adapter, bar.seg_id, bar.size, update) };
         return STATUS_SUCCESS;
     }
 
@@ -1501,8 +1812,21 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // and a same-boot nonzero value is a design-gap escalation, not something
     // to absorb.
     // SAFETY: KeGetCurrentIrql is callable at any IRQL.
-    if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
+    let irql = unsafe { KeGetCurrentIrql() };
+    if irql != PASSIVE_LEVEL_IRQL {
         BAR_ERR_IRQL.fetch_add(1, Ordering::Relaxed);
+        // The skipped op may be the eviction of one of OUR live allocations: VidMm
+        // will believe the system pages hold its content, and they do not, so the
+        // matching page-in must not copy them over the blob. Remembering that
+        // reads only the allocation handle (atomics, the generation check) and
+        // takes the invalid set's own spinlock (raise-to-DPC, legal up to
+        // DISPATCH_LEVEL) — no guard, no mutex, no Mm call — so it is safe at any
+        // IRQL this DDI could be called at. Above DISPATCH the spinlock is not
+        // legal and nothing can be recorded; that is not a state this DDI is
+        // documented to run in, and PgEi already makes it loud.
+        if irql <= DISPATCH_LEVEL_IRQL {
+            note_unserialized_eviction(adapter, bar.seg_id, &operation);
+        }
         return STATUS_SUCCESS;
     }
     // SAFETY: the strongest mint in the driver — `DxgkDdiBuildPagingBuffer` is
@@ -1520,6 +1844,9 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     let Some(content_guard) = adapter.system_backings.serialize(passive) else {
         BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
         BAR_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        // Both directions are skipped. A skipped EVICTION still has to be
+        // remembered (the invalid mark has its own lock and needs no guard).
+        note_unserialized_eviction(adapter, bar.seg_id, &operation);
         return paging_failure();
     };
 
@@ -1534,10 +1861,13 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
             bar_fill(passive, adapter, &content_guard, bar.seg_id, f)
         },
         PagingOperation::DiscardContent(d) => {
-            if let Some(alloc) = unsafe { paging_alloc_info(d.hAllocation) } {
-                content_guard.remove(alloc.resource_id);
+            let discarded = unsafe { paging_alloc_info(adapter, d.hAllocation) };
+            if let Some(alloc) = discarded {
+                // The content is gone, so no system copy of it can be "invalid":
+                // drop the backing ranges AND the mark.
+                content_guard.remove_all(alloc.resource_id);
             }
-            if d.SegmentId == bar.seg_id && unsafe { paging_alloc_info(d.hAllocation) }.is_some() {
+            if d.SegmentId == bar.seg_id && discarded.is_some() {
                 // Content lives in the blob; nothing to release here (aperture
                 // unmaps handle CPU visibility). Counted for the op census.
                 BAR_DISCARDS.fetch_add(1, Ordering::Relaxed);
@@ -1546,7 +1876,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
             PagingOpOutcome::Executed
         }
         PagingOperation::VirtualFill(fv) => {
-            match unsafe { paging_alloc_info(fv.hAllocation) } {
+            match unsafe { paging_alloc_info(adapter, fv.hAllocation) } {
                 None => {
                     BAR_ERR_FILL_HANDLE.fetch_add(1, Ordering::Relaxed);
                     PagingOpOutcome::Failed(paging_failure())
@@ -1557,17 +1887,13 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                 }
                 Some(alloc) => {
                     let off = fv.AllocationOffsetInBytes;
-                    let fill_len = match helios_kmd_logic::paging::clamp_range(
-                        alloc.size,
-                        off,
-                        fv.FillSizeInBytes,
-                    ) {
-                        helios_kmd_logic::paging::Clamp::Full(n) => n,
-                        helios_kmd_logic::paging::Clamp::Clamped(n) => {
+                    let fill_len = match pg::clamp_range(alloc.size, off, fv.FillSizeInBytes) {
+                        Clamp::Full(n) => n,
+                        Clamp::Clamped(n) => {
                             BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
                             n
                         }
-                        helios_kmd_logic::paging::Clamp::Nothing => {
+                        Clamp::Nothing => {
                             BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
                             0
                         }
@@ -1580,18 +1906,27 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                     let mut filled = false;
                     let ok = unsafe {
                         with_blob_bytes(passive, adapter, alloc.resource_id, |dst, len| {
-                            if off.saturating_add(fill_len) > len {
-                                BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
-                                return;
-                            }
+                            // Cut to the MAPPED blob (a blob shorter than the
+                            // recorded allocation fills its prefix, not nothing).
+                            let n = match pg::clamp_to_mapped(off, fill_len, len) {
+                                Clamp::Full(n) => n,
+                                Clamp::Clamped(n) => {
+                                    BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
+                                    n
+                                }
+                                Clamp::Nothing => {
+                                    BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
+                                    return;
+                                }
+                            };
                             // SAFETY: bounds-checked against the blob mapping.
-                            fill_pattern(dst.add(off as usize), fill_len as usize, pattern);
+                            fill_pattern(dst.add(off as usize), n as usize, pattern);
                             // When this allocation is system-resident, keep the
                             // intersecting owned backing ranges authoritative as
                             // part of the same serialized content transaction.
-                            filled = system_backing.as_ref().is_none_or(|backing| {
-                                backing.copy_blob_range(dst, len, off, fill_len)
-                            });
+                            filled = system_backing
+                                .as_ref()
+                                .is_none_or(|backing| backing.copy_blob_range(dst, len, off, n));
                         })
                     };
                     if ok && filled {
