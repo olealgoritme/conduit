@@ -18,6 +18,12 @@
 //!   lock exactly as long as the GPU may use the pages (see `helios_protocol::nvrm`
 //!   `HeliosNvrmPin`). Of RM it recognises one call, `NV_ESC_RM_FREE`.
 //!
+//! * RM fence handles: a successful forwarded `SEMSURF_FENCE_CREATE` on an owned DRM
+//!   node returns a backend handle that is not `Open`ed; `forward_fence_create`
+//!   records it as the caller's under `DEVICE_TYPE_FENCE`, so `EVENT_REGISTER`,
+//!   `Close` and device teardown treat it like any owned handle (and nothing else
+//!   may name it). The rules are in `helios_kmd_logic::nvrm_fence`.
+//!
 //! * usermode events: `register_event` / `unregister_event` tie a process's
 //!   `KEVENT` to a backend handle (or to the loss of the transport); `Close` and
 //!   `close_all_for_owner` drop what a handle or a process registered, at PASSIVE
@@ -27,8 +33,8 @@
 
 use super::ctrl;
 use super::gpu::{
-    release_nvrm_event, DeviceOwner, NvrmEventRefusal, NvrmPin, MAX_NVRM_PINS_PER_OWNER,
-    MAX_NVRM_PIN_PAGES,
+    release_nvrm_event, DeviceOwner, FenceCommit, NvrmEventRefusal, NvrmPin,
+    MAX_NVRM_PINS_PER_OWNER, MAX_NVRM_PIN_PAGES,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
@@ -39,6 +45,7 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
+use helios_kmd_logic::nvrm_fence;
 use helios_kmd_logic::page_runs;
 use helios_protocol::{
     HELIOS_NVRM_DEEP_PAGE_RUNS, HELIOS_NVRM_DEEP_PAGE_RUNS_INDIRECT, HELIOS_NVRM_FORWARD_MSG_TYPES,
@@ -61,8 +68,6 @@ const MSG_IOCTL: u32 = 3;
 const MSG_MMAP: u32 = 4;
 const MSG_MUNMAP: u32 = 5;
 const MSG_SCANOUT_FLIP: u32 = 20;
-/// `device_type` from which an `Open` names a DRM node (`512 + minor`).
-const DEVICE_TYPE_DRI_FIRST: u32 = 512;
 
 /// `NV_ESC_RM_FREE` as the low 16 bits of the Linux ioctl number the guest sends:
 /// `('F' << 8) | 0x29`.
@@ -86,6 +91,8 @@ const MSG_HDR: usize = super::hal::MSG_HDR_LEN;
 const IOCTL_HDR: usize = MSG_HDR + 24;
 /// `MsgHeader` plus the 12-byte `IoctlResp`: where an Ioctl reply's data begins.
 const REPLY_DATA: usize = MSG_HDR + 12;
+// The pure fence rules read the same reply.
+const _: () = assert!(nvrm_fence::REPLY_DATA == REPLY_DATA);
 
 /// Forwarded messages by kind, and refusals. Published as `NvOpen`, `NvClose`,
 /// `NvIoctl`, `NvOther` and `NvRef`.
@@ -126,6 +133,18 @@ pub static NVRM_EV_DROPS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_EV_LOST: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_EV_OTHER: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_EV_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// RM fence handles (`SEMSURF_FENCE_CREATE`): recorded as owned (`NvFence`),
+/// released by a `Close` or by device teardown (`NvFenceCl`; `NvFence -
+/// NvFenceCl` is what is live now, 0 when no client runs), `EventReady`s seen for
+/// one (`NvFenceSig`, one per fire), fires that beat the recording of their
+/// handle (`NvFenceEarly`, also counted in `NvFenceSig`), and creates whose reply
+/// was unusable or lost a notification (`NvFenceErr`, should read 0).
+pub static NVRM_FENCES: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_FENCES_CLOSED: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_FENCE_FIRED: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_FENCE_EARLY: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_FENCE_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// Why a forward did not reach (or come back from) the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +243,9 @@ pub fn forward(
             match ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms) {
                 Ok(n) => {
                     if n >= MSG_HDR && rd_i32(resp, 8) == Some(0) {
+                        if nvrm_fence::is_fence(device_type) {
+                            NVRM_FENCES_CLOSED.fetch_add(1, Ordering::Relaxed);
+                        }
                         // The handle is closed: its event registrations go (a
                         // wake for a handle nobody holds is dropped by the router
                         // already, so the gap is harmless). A failed Close keeps
@@ -239,6 +261,9 @@ pub fn forward(
                 }
                 // A timeout is indeterminate (it may have closed): stay forgotten.
                 Err(VirtioError::Timeout) => {
+                    if nvrm_fence::is_fence(device_type) {
+                        NVRM_FENCES_CLOSED.fetch_add(1, Ordering::Relaxed);
+                    }
                     release_events_for_handle(adapter, owner, handle);
                     Err(Refusal::Transport(VirtioError::Timeout))
                 }
@@ -250,11 +275,33 @@ pub fn forward(
             }
         }
         MSG_IOCTL => {
-            if !owned(adapter, owner, handle) {
+            let Some(device_type) = adapter
+                .with_virtio(|v| v.nvrm_handle_device_type(owner, handle))
+                .ok()
+                .flatten()
+            else {
                 return Err(refused(Refusal::NotOwned));
+            };
+            // A fence handle takes no message but `Close` (the host answers
+            // BadHandle to anything else); say so here and spare the round trip.
+            if nvrm_fence::is_fence(device_type) {
+                return Err(refused(Refusal::Forbidden));
             }
             if let Err(r) = check_ioctl(req, pin_id != 0) {
                 return Err(refused(r));
+            }
+            if let (Some(cmd), Some(data_len)) = (rd_u32(req, 16), rd_u32(req, 20)) {
+                let features = adapter
+                    .with_virtio(|v| v.nvrm_device_features())
+                    .unwrap_or(0);
+                if nvrm_fence::is_fence_create(cmd, data_len, device_type, features) {
+                    // A fence create has no pin to carry: the handle in its reply
+                    // would go untracked.
+                    if pin_id != 0 {
+                        return Err(refused(Refusal::Forbidden));
+                    }
+                    return forward_fence_create(passive, adapter, owner, req, resp, timeout_ms);
+                }
             }
             if pin_id != 0 {
                 return forward_pinned(
@@ -298,7 +345,7 @@ pub fn forward(
                 .flatten();
             match device_type {
                 None => return Err(refused(Refusal::NotOwned)),
-                Some(t) if t < DEVICE_TYPE_DRI_FIRST => return Err(refused(Refusal::Forbidden)),
+                Some(t) if !nvrm_fence::is_dri_node(t) => return Err(refused(Refusal::Forbidden)),
                 Some(_) => {}
             }
             NVRM_FLIPS.fetch_add(1, Ordering::Relaxed);
@@ -350,6 +397,77 @@ fn open(
             // A timeout may still have opened it on the host; that handle is then
             // untracked until the next device reset. Rare, and bounded by quota.
             let _ = adapter.with_virtio(|v| v.cancel_nvrm_reservation());
+            Err(Refusal::Transport(e))
+        }
+    }
+}
+
+/// A forwarded `SEMSURF_FENCE_CREATE` on an owned DRM node: reserve a slot first
+/// (a full table or quota refuses before the host makes a fence), forward it
+/// verbatim, and on a clean success record the handle in the reply's `fd` field as
+/// the caller's. The reply is returned to the caller either way, as the device
+/// wrote it.
+///
+/// The record and the take of an `EventReady` that beat it are one lock hold
+/// (`commit_nvrm_fence`), and the notification keeper is armed before the host
+/// sees the request (`begin_nvrm_fence_create`), so a fence that fires at once is
+/// not lost: its first `EVENT_REGISTER` answers `LATCHED_SIGNALED`.
+///
+/// A timed-out create may still have made a fence on the host that this table
+/// does not know; it is bounded by the host's own limit and its 5 s timeout, as a
+/// timed-out `Open` is bounded by quota.
+fn forward_fence_create(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    req: &[u8],
+    resp: &mut [u8],
+    timeout_ms: u64,
+) -> Result<usize, Refusal> {
+    let begun = adapter
+        .with_virtio(|v| v.begin_nvrm_fence_create(owner))
+        .map_err(|_| Refusal::Transport(VirtioError::DeviceError))?;
+    if !begun {
+        NVRM_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return Err(Refusal::NoResources);
+    }
+    NVRM_IOCTLS.fetch_add(1, Ordering::Relaxed);
+    match ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms) {
+        Ok(n) => {
+            let handle = nvrm_fence::fence_handle_from_reply(resp, n);
+            // A host status of 0 with no handle to own is a fence we cannot see.
+            let host_ok = n >= MSG_HDR && rd_i32(resp, 8) == Some(0);
+            let committed = adapter.with_virtio(|v| match handle {
+                Some(h) => Some(v.commit_nvrm_fence(owner, h)),
+                None => {
+                    v.cancel_nvrm_fence_create();
+                    None
+                }
+            });
+            match committed {
+                Ok(Some(FenceCommit::Recorded { fired })) => {
+                    NVRM_FENCES.fetch_add(1, Ordering::Relaxed);
+                    if fired {
+                        // Its notification was taken before it had an owner (and
+                        // so was not counted as a fire of a known fence).
+                        NVRM_FENCE_FIRED.fetch_add(1, Ordering::Relaxed);
+                        NVRM_FENCE_EARLY.fetch_add(1, Ordering::Relaxed);
+                        NVRM_EV_LATCHED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok(Some(FenceCommit::Duplicate)) => {
+                    NVRM_FENCE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(None) if host_ok => {
+                    NVRM_FENCE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                }
+                // A host refusal (no fence was made), or the transport is gone.
+                _ => {}
+            }
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = adapter.with_virtio(|v| v.cancel_nvrm_fence_create());
             Err(Refusal::Transport(e))
         }
     }
@@ -753,6 +871,10 @@ pub fn host_mmap(
     else {
         return Err(MapRefusal::NotOwned);
     };
+    // A fence is a host sync_file, not a mappable file (the host would refuse).
+    if nvrm_fence::is_fence(device_type) {
+        return Err(MapRefusal::NotOwned);
+    }
     if size == 0 || size % PAGE != 0 || size > MAX_MAP_BYTES || offset % PAGE != 0 {
         return Err(MapRefusal::BadRange);
     }
@@ -1032,9 +1154,12 @@ pub fn close_all_for_owner(
             .with_virtio(|v| v.take_nvrm_handle_for_owner(owner))
             .ok()
             .flatten();
-        let Some(handle) = taken else {
+        let Some((handle, device_type)) = taken else {
             break;
         };
+        if nvrm_fence::is_fence(device_type) {
+            NVRM_FENCES_CLOSED.fetch_add(1, Ordering::Relaxed);
+        }
         if sending {
             let mut req = [0u8; MSG_HDR];
             req[..4].copy_from_slice(&MSG_CLOSE.to_le_bytes());

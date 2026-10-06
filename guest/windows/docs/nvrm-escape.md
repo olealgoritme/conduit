@@ -173,7 +173,7 @@ Per message type:
 |---|---|
 | Open (1) | A tracking slot is reserved **before** the host is asked: a full table or per-process quota gives `NO_RESOURCES` and the host opens nothing. The reply's `handle` (nonzero) with `MsgHeader.status == 0` is committed as owned by the caller, together with the request's `device_type` (`OpenReq` at offset 16). A failed/zero reply cancels the reservation. A transport timeout leaves a possibly-opened handle on the host that the KMD does not track (until the host side is reset; bounded by quota). |
 | Close (2) | See section 6 for the full order. Requires the handle to be the caller's, else `NOT_OWNED`. |
-| Ioctl (3) | Handle must be the caller's (`NOT_OWNED`). `check_ioctl`: request >= 40 bytes; `IoctlReq` at offset 16: `data_len` @20, `nested_len` @28, `deep_ptr_offset` @32, `deep_len` @36; `deep_ptr_offset` equal to `0xFFFFFFFE` or `0xFFFFFFFD` is `FORBIDDEN`; `40 + data_len + nested_len + deep_len > req_len` is `BAD_RANGE`. (Extra trailing bytes are accepted; only an overrun is refused.) |
+| Ioctl (3) | Handle must be the caller's (`NOT_OWNED`). `check_ioctl`: request >= 40 bytes; `IoctlReq` at offset 16: `data_len` @20, `nested_len` @28, `deep_ptr_offset` @32, `deep_len` @36; `deep_ptr_offset` equal to `0xFFFFFFFE` or `0xFFFFFFFD` is `FORBIDDEN`; `40 + data_len + nested_len + deep_len > req_len` is `BAD_RANGE`. (Extra trailing bytes are accepted; only an overrun is refused.) A handle that is a fence (section 4.6) is `FORBIDDEN`. A `SEMSURF_FENCE_CREATE` on a DRM node is recognised and its reply handle is recorded (section 4.6). |
 | GetProcFiles (6) / GetSysFiles (7) | `handle = 0`; no ownership; counted as `NvOther`. |
 | ScanoutFlip (20) | Request must be exactly `16 + 64` bytes (`BAD_RANGE`). `scanout` (offset 16) must be 0 (`BAD_RANGE`). `owner_handle` (offset 20) must be a handle the caller opened (`NOT_OWNED`) with `device_type >= 512`, i.e. a DRM node (`FORBIDDEN`). The 64-byte payload is otherwise forwarded as is (it names a host GEM object; zero-copy present, see `zero-copy-present.md`). The `MsgHeader.handle` of a flip is not checked. Counter `NvFlip`. |
 
@@ -325,7 +325,8 @@ old reference is released), `LATCHED_SIGNALED` (3: see below).
 - **No lost wakeups.** An `EventReady` for a handle that has no `READY` registration is
   *latched* on the handle (`ready_latched`: one flag, not a count). The next `REGISTER` for
   that handle consumes the latch and signals at once (`LATCHED_SIGNALED`). An
-  `EventReady` for a handle nobody has open is dropped (`NvEvDrop`). Note `UNREGISTER`
+  `EventReady` for a handle nobody has open is dropped (`NvEvDrop`), except while a
+  `SEMSURF_FENCE_CREATE` is in flight (section 4.6). Note `UNREGISTER`
   followed by `REGISTER` can yield an immediate wake if a notification arrived in between.
 - `TRANSPORT_LOST` does not latch. On a failed transport every registration of every kind
   is signalled (`NvEvLost` counts them) so blocked waiters give up and see the failure; the
@@ -340,6 +341,62 @@ old reference is released), `LATCHED_SIGNALED` (3: see below).
   otherwise ping-pong with the DPC).
 - Object references are only ever dropped at PASSIVE outside every lock; removal paths hand
   the event back by value.
+
+### 4.6 Fence handles (`SEMSURF_FENCE_CREATE`)
+
+nvidia-drm's semaphore-surface fences (`docs/SYNC.md`, host `nvidia/fence.rs`) turn an RM
+semaphore value into a one-shot backend handle. The guest never `Open`s it: the handle
+arrives inside the reply of a forwarded `Ioctl`, in the same handle namespace as `Open`
+handles. The KMD records it as owned, so `EVENT_REGISTER` works on it and `Close` is allowed.
+
+**Recognition** (all must hold, `kmd_logic/nvrm_fence.rs::is_fence_create`): the message is an
+`Ioctl` on a handle the caller owns with `device_type >= 512` (a DRM node); the low 16 bits of
+`IoctlReq.cmd` are `0x6455` (`('d' << 8) | (0x40 + 0x15)`, i.e. `DRM_IOCTL_NVIDIA_SEMSURF_FENCE_CREATE`
+whatever its direction/size bits, which is all the host looks at too); `data_len == 24`;
+and the device reports `NVGPU_CFG_DRM_FENCES` (config `features` bit 11, in
+`QUERY_CAPS.device_features`). Without the bit a host passes the ioctl to the host driver
+and the `fd` field would be a descriptor number of the backend process, which must never be
+adopted. `0x54` (`FENCE_CTX_CREATE`, returns a GEM handle of the DRM file, not a backend handle)
+and `0x56` (`FENCE_WAIT`, names a fence handle but creates none) are not tracked.
+
+**Wire format** (read from the host, `dispatch_fence_create`): request data is
+`struct drm_nvidia_semsurf_fence_create_params` (24 bytes: `u32 ctx`, `u32 timeout_ms`,
+`u64 wait_value`, `s32 fd` @16, `u32 pad`). The host replies `MsgHeader` (16) | `IoctlResp`
+(12, `data_len = 24`) | the same 24 bytes with the new backend handle in `fd`. The handle is
+therefore the `u32` at **reply offset 28 + 16 = 44** (offset 16 of the data block). It is
+taken only for `MsgHeader.status == 0`, `IoctlResp.data_len == 24`, a reply long enough to
+hold all 24 data bytes, and a handle that is neither 0 nor `0xFFFFFFFF`. Anything else is
+not recorded. The reply is returned to the caller as the device wrote it.
+
+**Lifetime.** One slot is reserved before the host is asked, exactly as for `Open`: a full
+table or the per-process quota (`MAX_NVRM_HANDLES_PER_OWNER`, 128, shared with every other
+handle; the host's own cap is 4096 unsignalled fences) gives `NO_RESOURCES` and the host makes
+no fence. The handle is recorded under `device_type = 511` (`DEVICE_TYPE_FENCE`): not a value
+the host accepts in `Open`, and below 512 so it is never taken for a DRM node
+(`ScanoutFlip.owner_handle`, `IMPORT_RM`). The host reports it **once**: one
+`EventReady(handle)` when the semaphore reaches the value, or when the host driver gives up
+(`hdr.status` is the fence's error, e.g. `-ETIMEDOUT`; the KMD does not read it, so a timed-out
+fence wakes the waiter like a signalled one; check the semaphore). The handle then **stays
+open on the host until `Close`**, so a client must `Close` every fence, fired or not. A
+fired fence is closable. `Close`, device destroy and process exit release it like any handle
+(event registrations released, host `Close` sent best effort and idempotently: the table
+entry is removed first). A fence takes no message but `Close`: `Ioctl` on it is `FORBIDDEN`,
+`MMAP` is `NOT_OWNED`, and the host answers `BadHandle` to anything else.
+
+**No lost fire.** A fence made for an already-reached value fires at once, and the event
+(event queue) can be consumed before the thread that waits for the create's reply (control
+queue) has recorded the handle, when the ordinary latch has no slot to sit on. While at
+least one `SEMSURF_FENCE_CREATE` is in flight (from before it is forwarded until its handle is
+recorded or the create fails) the KMD keeps `EventReady`s for unowned handles in a 16-entry
+table (`FenceBook`) and, when it records the new handle, takes the matching one in the same
+lock hold and latches it. The first `EVENT_REGISTER` then answers `LATCHED_SIGNALED`. A fire
+after recording takes the ordinary path (signal if registered, else latch). With no create in
+flight nothing is kept, so a stale notification of a closed file cannot be taken for a later
+fence that reuses its number. Overflow of the 16-entry table (more than 16 distinct fires
+inside one create's round trip) loses a wake and is counted in `NvFenceErr`; a client should
+wait with a timeout shorter than the 5 s host timeout and re-check the semaphore anyway.
+
+Counters: `NvFence`, `NvFenceCl`, `NvFenceSig`, `NvFenceEarly`, `NvFenceErr` (section 7).
 
 ## 5. Ownership, quotas and limits
 
@@ -372,7 +429,8 @@ All `MAX_*` values are read from the code. "Per process" really means per device
 
 What is owned, and what is checked:
 
-- **Handles**: `nvrm_handles` (owner, handle, device_type, latch). `Ioctl`, `Close`, `MMAP`,
+- **Handles**: `nvrm_handles` (owner, handle, device_type, latch); `Open` handles and, as
+  `device_type` 511, fence handles (section 4.6). `Ioctl`, `Close`, `MMAP`,
   `PIN`, `EVENT_REGISTER(READY)` and `ScanoutFlip.owner_handle` check it. The check and the
   record are done under one lock hold wherever a concurrent `Close` could otherwise let a
   stale number name another process's file (`push_nvrm_map`, `push_nvrm_pin`,
@@ -427,7 +485,7 @@ the win11 SSH session:
 `reg query HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render` and look at `Nv*`.
 
 **Publication lag.** `publish_nvrm_counters` runs from the NVRM escape when the "shape"
-(a hash of `NvOpen NvClose NvMap NvPin NvUnpin NvEvReg NvEvUnreg`) changed since the last
+(a hash of `NvOpen NvClose NvMap NvPin NvUnpin NvEvReg NvEvUnreg NvFence NvFenceCl`) changed since the last
 escape, or on every 256th NVRM escape call, and also on the present edge. The other
 counters can therefore be up to 255 calls stale: do a few extra calls (or a present, or
 change a shape counter) before reading, or compare after the process has exited.
@@ -455,6 +513,11 @@ change a shape counter) before reading, or compare after the process has exited.
 | `NvEvLost` | registrations woken by a failed or dropped transport | **0** until a transport failure |
 | `NvEvOther` | queue messages other than `EventReady` | **0** (nonzero means the host sent e.g. `InputEvent`) |
 | `NvEvErr` | event-queue faults: a buffer that would not repost, a bad token, **or a `REGISTER` whose `event_handle` did not resolve** | **0** |
+| `NvFence` | fence handles recorded as owned (section 4.6) | moves with `SEMSURF_FENCE_CREATE`s |
+| `NvFenceCl` | fence handles released: a successful or timed-out `Close`, plus device-destroy closes (unlike `NvClose`) | `NvFence - NvFenceCl` is the fences open now; **equal** when no client runs |
+| `NvFenceSig` | `EventReady`s for fence handles (one per fire), including the early ones | at most `NvFence` |
+| `NvFenceEarly` | fires that arrived before their handle was recorded and were latched at record time (also counted in `NvFenceSig` and `NvEvLatch`) | small; nonzero only when the semaphore was already reached |
+| `NvFenceErr` | a create the host answered with status 0 whose reply could not be recorded (short or bad reply, duplicate handle), or a notification lost to a full early table | **0** |
 | `NvWinMb`, `NvAptMb` | size in MiB of shared-memory region 1 (RM window) and 2 (UVM aperture), written at init | nonzero, or `MMAP` answers `UNSUPPORTED` |
 
 `Fg*` counters belong to the foreign-resource verb (`zero-copy-present.md`), not this
@@ -464,7 +527,8 @@ escape.
 
 Host-side, no GPU needed:
 
-- `kmd_logic` tests: the event registry (`kmd_logic/src/nvrm_events.rs`) and run-table
+- `kmd_logic` tests: the event registry (`kmd_logic/src/nvrm_events.rs`), the fence rules
+  (`nvrm_fence.rs`: recognition, reply parsing, the early-fire table) and run-table
   builder (`page_runs.rs`): `cargo test` in `guest/windows/kmd_logic`. The KMD crate itself
   cannot host a test harness (`panic = "abort"` cdylib), so logic worth testing lives in
   `kmd_logic`.
@@ -551,8 +615,11 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
 - `HELIOS_NVRM_ST_RESP_TRUNCATED` is never produced; an undersized `resp_cap` is not detected.
 - `ScanoutFlip` forwarding is the only path that accepts a non-RM message; `scanout != 0` is
   refused (single scanout).
-- Host-side indeterminate cases: a timed-out `Open` can leave an untracked host handle; a
-  timed-out `Close` is treated as closed.
+- Host-side indeterminate cases: a timed-out `Open` or `SEMSURF_FENCE_CREATE` can leave an
+  untracked host handle (a fence ends by itself within the host driver's 5 s timeout but its
+  handle stays until the host side is reset); a timed-out `Close` is treated as closed.
+- Fence handles count against the per-process handle quota (128) with every file. A client
+  that keeps hundreds of fences in flight must close fired ones promptly (section 4.6).
 
 ### 10.2 UNVERIFIED (could not be checked from source alone)
 
@@ -570,6 +637,14 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
   serve `NV_ESC_RM_GET_EVENT_DATA` (0x52), which the README says the backend profile
   refused at the time.
 - The registry counter publication rate was derived from the code, not measured.
+- Fence handles (section 4.6) were written from the host code and `docs/SYNC.md` and
+  checked with host unit tests of the pure logic only: that the reply offset, the one-shot
+  `EventReady` and the early-fire path behave this way on a live win11 + backend with
+  `NVGPU_CFG_DRM_FENCES` set, that the Windows transport actually sends cmd `0x6455` with
+  `data_len 24` on a DRM node handle, and the measured semaphore-release-to-`KeSetEvent`
+  latency (the design doc's X3) are all unrun.
+- Whether the frame-size gate (`tools/kmd-frame-sizes.ps1`) still passes: `VirtioGpu`
+  gained about 80 bytes (`FenceBook`) on the `VirtioGpu::init` frame.
 
 ### 10.3 Comments and docs that disagree with the code
 

@@ -1772,7 +1772,7 @@ fn escape_nvrm(
 }
 
 /// Write the `Nv*` registry counters when a session-shaping count moved
-/// (open / close / map / pin / event registration) or every 256th call. The registry write is far too
+/// (open / close / map / pin / event registration / fence made or closed) or every 256th call. The registry write is far too
 /// slow for every forward, but these escapes can run for a whole session with no
 /// present, which is the other place the counters are published.
 fn nvrm_publish_counters_if_due() {
@@ -1788,6 +1788,8 @@ fn nvrm_publish_counters_if_due() {
         &n::NVRM_UNPINS,
         &n::NVRM_EV_REGS,
         &n::NVRM_EV_UNREGS,
+        &n::NVRM_FENCES,
+        &n::NVRM_FENCES_CLOSED,
     ]
     .iter()
         .fold(0u32, |a, c| a.wrapping_mul(31).wrapping_add(c.load(Ordering::Relaxed)));

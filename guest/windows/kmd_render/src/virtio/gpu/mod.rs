@@ -73,7 +73,7 @@ pub use nvrm_events::{
 };
 
 pub use nvrm_tables::{
-    NvrmPin, PinTake, MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER, MAX_NVRM_MAPS,
+    FenceCommit, NvrmPin, PinTake, MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER, MAX_NVRM_MAPS,
     MAX_NVRM_MAPS_PER_OWNER, MAX_NVRM_PINS, MAX_NVRM_PINS_PER_OWNER, MAX_NVRM_PIN_PAGES,
 };
 
@@ -2285,6 +2285,10 @@ pub struct VirtioGpu {
     nvrm_handles: Vec<nvrm_tables::NvrmHandleSlot>,
     /// Slots reserved by in-flight forwarded `Open`s.
     nvrm_reserved: usize,
+    /// `SEMSURF_FENCE_CREATE`s in flight and the `EventReady`s that beat their
+    /// handle's recording (see `kmd_logic::nvrm_fence`). Also reserved slots: a
+    /// create reserves one in `nvrm_reserved` like an `Open`.
+    nvrm_fences: helios_kmd_logic::nvrm_fence::FenceBook,
     /// Live HELIOS_NVRM_OP_MMAP mappings (the host's mapping id, the handle it
     /// belongs to, the owner), so `Close` and device teardown can send the host
     /// `Munmap`. Reserved to MAX_NVRM_MAPS at init. The user view itself is in
@@ -2855,6 +2859,7 @@ impl VirtioGpu {
             cfg_features,
             nvrm_handles: Vec::with_capacity(MAX_NVRM_HANDLES),
             nvrm_reserved: 0,
+            nvrm_fences: helios_kmd_logic::nvrm_fence::FenceBook::new(),
             nvrm_maps: Vec::with_capacity(MAX_NVRM_MAPS),
             nvrm_next_map: 1,
             nvrm_pins: Vec::with_capacity(MAX_NVRM_PINS),
