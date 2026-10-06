@@ -1,4 +1,4 @@
-From 06b43f82f04d373626b8b1eac5eb386197adcf98 Mon Sep 17 00:00:00 2001
+From 81487e3fc06ffcf7e66cd49fd7a1414d1362a1a6 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Tue, 6 Oct 2026 04:48:20 +0200
 Subject: [PATCH] nvk/rm: open another NVK process's shared surface by its
@@ -38,29 +38,29 @@ NVK_HELIOS_SHARED_IMPORT=0 turns it off.
  src/nouveau/vulkan/nvk_device_memory.c     |  46 ++++-
  src/nouveau/vulkan/nvk_device_memory.h     |  10 +
  src/nouveau/vulkan/nvk_helios.c            |  36 ++++
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |  24 +++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |  25 +++
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c |   1 +
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c | 202 +++++++++++++++++++++
- 7 files changed, 350 insertions(+), 1 deletion(-)
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c | 203 +++++++++++++++++++++
+ 7 files changed, 352 insertions(+), 1 deletion(-)
 
 diff --git a/src/nouveau/vulkan/helios_icd_interface.h b/src/nouveau/vulkan/helios_icd_interface.h
-index a1093a1..afd0d2b 100644
+index bed5bb4..14df724 100644
 --- a/src/nouveau/vulkan/helios_icd_interface.h
 +++ b/src/nouveau/vulkan/helios_icd_interface.h
-@@ -57,6 +57,12 @@ enum helios_icd_backend {
- /* The producer interface (escape 0x13 streams keyed on a Venus timeline)
-  * exists. NVK: no; presents are CPU-complete (value 0 markers). */
- #define HELIOS_ICD_CAP_PRODUCER (1u << 3)
+@@ -69,6 +69,12 @@ enum helios_icd_backend {
+ /* The KMD takes RM fences in WDDM present markers (HERF/HEPR tail, HE12 v4;
+  * QueryCaps HELIOS_NVRM_CAP_PRESENT_FENCE, protocol/include/helios_rm_fence.h). */
+ #define HELIOS_ICD_CAP_PRESENT_FENCE_KMD (1u << 6)
 +/* Surfaces another process of this backend made can be opened
 + * (guest/windows/docs/shared-surfaces.md): HELIOS_STRUCTURE_TYPE_IMPORT_
 + * MEMORY_RESOURCE_INFO is accepted. NVK: librmclient has
 + * crm_win_rm_resource_import; whether the KMD and host serve it shows only
 + * when it is tried. */
-+#define HELIOS_ICD_CAP_SHARED_IMPORT (1u << 4)
++#define HELIOS_ICD_CAP_SHARED_IMPORT (1u << 7)
  
  /* DRM fourcc / modifier values used below (drm_fourcc.h). */
  #define HELIOS_DRM_FORMAT_XRGB8888 0x34325258u
-@@ -96,6 +102,32 @@ struct helios_export_memory_resource_info {
+@@ -108,6 +114,32 @@ struct helios_export_memory_resource_info {
     uint32_t reserved;     /* 0 */
  };
  
@@ -194,10 +194,10 @@ index cfceeae..3e58f3a 100644
 +
  #endif
 diff --git a/src/nouveau/vulkan/nvk_helios.c b/src/nouveau/vulkan/nvk_helios.c
-index d49d13b..e1c0e20 100644
+index e847b56..218c4de 100644
 --- a/src/nouveau/vulkan/nvk_helios.c
 +++ b/src/nouveau/vulkan/nvk_helios.c
-@@ -21,6 +21,7 @@
+@@ -24,6 +24,7 @@
  #include "helios_icd_interface.h"
  #include "drm-uapi/drm_fourcc.h"
  
@@ -205,7 +205,7 @@ index d49d13b..e1c0e20 100644
  #include <string.h>
  
  static uint32_t
-@@ -87,6 +88,39 @@ helios_image_layout(const struct nvk_image *image,
+@@ -90,6 +91,39 @@ helios_image_layout(const struct nvk_image *image,
     return VK_SUCCESS;
  }
  
@@ -245,9 +245,9 @@ index d49d13b..e1c0e20 100644
  static uint32_t
  helios_ctx_id(VkInstance instance)
  {
-@@ -221,6 +255,8 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
-       if (nvkmd_rm_win_rm_import_served())
-          caps |= HELIOS_ICD_CAP_RES_ID;
+@@ -304,6 +338,8 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
+       if (ops & (1ull << 33))
+          caps |= HELIOS_ICD_CAP_PRESENT_FENCE_KMD;
     }
 +   if (nvkmd_rm_win_shared_import_supported())
 +      caps |= HELIOS_ICD_CAP_SHARED_IMPORT;
@@ -255,23 +255,24 @@ index d49d13b..e1c0e20 100644
     struct helios_icd_api api = {
        .version = HELIOS_ICD_INTERFACE_VERSION,
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
-index 702cded..c12a7ca 100644
+index 934ca4b..1a890a3 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
-@@ -100,6 +100,12 @@ struct nvkmd_rm_lib {
-    int (*win_foreign_caps)(uint32_t *caps_flags);
-    int (*win_import_rm)(const struct nvrm_crm_foreign_import *in,
-                         uint32_t *resource_id, uint32_t *host_errno);
+@@ -114,6 +114,13 @@ struct nvkmd_rm_lib {
+    int (*win_fence_wait)(int fence, uint32_t timeout_ms);
+    int (*win_scanout_present_fenced)(uint32_t handle, uint32_t gem,
+                                      int fence, uint64_t *seq);
 +   /* Another process's RM-export resource as a GEM handle of our render
 +    * node (backend RmResourceImport); NULL with an older library
 +    */
 +   int (*win_rm_resource_import)(uint32_t rm_handle, uint32_t resource_id,
 +                                 uint32_t *gem_handle, uint64_t *size,
-+                                 uint64_t *modifier, uint32_t *flags);
++                                 uint64_t *modifier, uint32_t *flags,
++                                 uint32_t *host_errno);
  };
  
  /* Returns NULL if librmclient cannot be loaded */
-@@ -440,6 +446,24 @@ void nvkmd_rm_mem_helios_res_release(struct nvkmd_rm_mem *mem);
+@@ -526,6 +533,24 @@ void nvkmd_rm_mem_helios_res_release(struct nvkmd_rm_mem *mem);
  /* Export with an explicit layout (pte_kind != 0: block-linear tile_mode) */
  void nvkmd_rm_mem_set_export_layout(struct nvkmd_mem *mem, uint8_t pte_kind,
                                      uint16_t tile_mode);
@@ -297,22 +298,22 @@ index 702cded..c12a7ca 100644
  
  /*
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
-index e17e7a8..c7c6f2d 100644
+index ef9691f..b1a3bf0 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
-@@ -237,6 +237,7 @@ nvkmd_rm_lib_load(void)
-    LOAD(win_release_blob,      "crm_win_release_blob",      false);
-    LOAD(win_foreign_caps,      "crm_win_foreign_caps",      false);
-    LOAD(win_import_rm,         "crm_win_import_rm",         false);
+@@ -242,6 +242,7 @@ nvkmd_rm_lib_load(void)
+    LOAD(win_semsurf_fence_create,   "crm_win_semsurf_fence_create",   false);
+    LOAD(win_fence_wait,             "crm_win_fence_wait",             false);
+    LOAD(win_scanout_present_fenced, "crm_win_scanout_present_fenced", false);
 +   LOAD(win_rm_resource_import, "crm_win_rm_resource_import", false);
  
     LOAD(event_wait,   "crm_event_wait",   false);
     LOAD(alloc_pages,  "crm_alloc_pages",  false);
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
-index d822535..eaf5ad8 100644
+index e7930fa..f0592ab 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
-@@ -608,3 +608,205 @@ nvkmd_rm_mem_helios_res_release(struct nvkmd_rm_mem *mem)
+@@ -652,3 +652,206 @@ nvkmd_rm_mem_helios_res_release(struct nvkmd_rm_mem *mem)
        lib->win_release_blob(mem->helios_res_ctx, mem->helios_res_id);
     mem->helios_res_id = 0;
  }
@@ -376,10 +377,11 @@ index d822535..eaf5ad8 100644
 +      return result;
 +
 +   /* The host: the resource's memory as a GEM object of our render node */
-+   uint32_t gem = 0, flags = 0;
++   uint32_t gem = 0, flags = 0, host_errno = 0;
 +   uint64_t host_size = 0, host_modifier = 0;
 +   ret = lib->win_rm_resource_import((uint32_t)drm_fd, res_id, &gem,
-+                                     &host_size, &host_modifier, &flags);
++                                     &host_size, &host_modifier, &flags,
++                                     &host_errno);
 +   if (ret != 0 || gem == 0) {
 +      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
 +                       "Helios shared surface %u: RmResourceImport: %d (%s)",
