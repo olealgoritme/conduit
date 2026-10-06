@@ -24,6 +24,7 @@ use helios_kmd_logic::device_lost::ddi;
 /// `$hint` is an expression over the argument names.
 macro_rules! traced {
     ($name:ident, $id:expr, $target:path, ($($arg:ident : $ty:ty),*), $hint:expr) => {
+        #[inline(never)]
         pub unsafe extern "C" fn $name($($arg: $ty),*) -> NTSTATUS {
             let started = dlost::enter($id);
             // SAFETY: the same contract the target DDI documents; the arguments are forwarded
@@ -35,6 +36,7 @@ macro_rules! traced {
     };
     // PASSIVE-only teardown DDIs: mirror the block when a ring moved.
     ($name:ident, $id:expr, $target:path, ($($arg:ident : $ty:ty),*), $hint:expr, publish) => {
+        #[inline(never)]
         pub unsafe extern "C" fn $name($($arg: $ty),*) -> NTSTATUS {
             let started = dlost::enter($id);
             // SAFETY: as above.
@@ -69,20 +71,7 @@ fn handle_hint(h: *const c_void) -> u32 {
     (h as usize as u32) & 0x00FF_FFFF
 }
 
-// ── PnP / power ────────────────────────────────────────────────────────────────────────────
-traced!(
-    start_device,
-    ddi::START_DEVICE,
-    crate::ddi::dxgkddi_start_device,
-    (
-        miniport_device_context: *mut c_void,
-        dxgk_start_info: *mut DXGK_START_INFO,
-        dxgkrnl_interface: *mut DXGKRNL_INTERFACE,
-        number_of_video_present_sources: *mut u32,
-        number_of_children: *mut u32
-    ),
-    0
-);
+// ── PnP / power (StartDevice is deliberately not wrapped: see `lifecycle.rs`) ────────────────────────────────────────────────────────────────────────────
 traced!(
     stop_device,
     ddi::STOP_DEVICE,

@@ -1740,6 +1740,7 @@ fn note_unserialized_eviction(
 /// `DxgkDdiBuildPagingBuffer` — translate a memory-management operation into GPU
 /// DMA. Null engine for the aperture / page-table segments; REAL content engine
 /// for BAR-segment allocations. See the module doc.
+#[inline(never)]
 pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     h_adapter: *mut c_void,
     build_paging_buffer: *mut DXGKARG_BUILDPAGINGBUFFER,
@@ -1823,6 +1824,7 @@ impl PagingNote {
 }
 
 /// The body of [`dxgkddi_build_paging_buffer`]; every return records its outcome in `note`.
+#[inline(never)]
 unsafe fn build_paging_buffer_inner(
     h_adapter: *mut c_void,
     build_paging_buffer: *mut DXGKARG_BUILDPAGINGBUFFER,

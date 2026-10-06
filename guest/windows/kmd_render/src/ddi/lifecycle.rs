@@ -244,6 +244,12 @@ fn stop_flush(
 }
 
 /// `DxgkDdiStartDevice` — bring the adapter online.
+///
+/// NOT wrapped by `ddi::traced` and `#[inline(never)]`: this frame plus `VirtioGpu::init` is the
+/// nested pair the 24 KB kernel stack budget is measured on (17936 B known good, 18800 B did
+/// not boot, `tools/kmd-frame-sizes.ps1`). A wrapper in front of it would add a frame to the
+/// pair, and it runs once per start: its failures are visible through `StVio` / `InitStg`.
+#[inline(never)]
 pub unsafe extern "C" fn dxgkddi_start_device(
     miniport_device_context: *mut c_void,
     _dxgk_start_info: *mut DXGK_START_INFO,
@@ -612,6 +618,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 }
 
 /// `DxgkDdiStopDevice` — quiesce the adapter (inverse of StartDevice).
+#[inline(never)]
 pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_void) -> NTSTATUS {
     crate::kmsg(c"Helios: StopDevice\n");
     if !miniport_device_context.is_null() {

@@ -104,7 +104,7 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
 
     // ── PnP / power lifecycle (Phase 1, real) ──────────────────────────────
     data.DxgkDdiAddDevice = Some(ddi::dxgkddi_add_device);
-    data.DxgkDdiStartDevice = Some(ddi::traced::start_device);
+    data.DxgkDdiStartDevice = Some(ddi::dxgkddi_start_device);
     data.DxgkDdiStopDevice = Some(ddi::traced::stop_device);
     data.DxgkDdiRemoveDevice = Some(ddi::traced::remove_device);
     data.DxgkDdiDispatchIoRequest = Some(ddi::dxgkddi_dispatch_io_request);
