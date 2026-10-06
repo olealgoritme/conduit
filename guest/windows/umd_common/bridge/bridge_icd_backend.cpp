@@ -116,25 +116,52 @@ bool file_exists(const wchar_t* path) {
   return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+// The driver package installs NVK next to the UMDs in the driver store
+// (helios_kmd_render.inx): vulkan_nouveau.dll + librmclient.dll for AMD64,
+// vulkan_nouveau32.dll + librmclient32.dll for WoW64.
+bool nvk_next_to_umd(wchar_t* out, std::size_t cap) {
+  HMODULE self = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(&nvk_next_to_umd), &self))
+    return false;
+  wchar_t dir[MAX_PATH];
+  const DWORD len = GetModuleFileNameW(self, dir, MAX_PATH);
+  if (len == 0 || len >= MAX_PATH)
+    return false;
+  wchar_t* slash = std::wcsrchr(dir, L'\\');
+  if (!slash)
+    return false;
+  slash[1] = 0;
+#if defined(_WIN64)
+  std::swprintf(out, cap, L"%lsvulkan_nouveau.dll", dir);
+#else
+  std::swprintf(out, cap, L"%lsvulkan_nouveau32.dll", dir);
+#endif
+  return file_exists(out);
+}
+
 bool find_nvk_icd(wchar_t* out, std::size_t cap) {
   out[0] = 0;
   const DWORD n = GetEnvironmentVariableW(L"HELIOS_NVK_ICD", out, DWORD(cap));
   if (n > 0 && n < cap)
     return file_exists(out);
 #if defined(_WIN64)
-  if (reg_wsz(L"NvkIcdPath", out, DWORD(cap)))
-    return file_exists(out);
+  if (reg_wsz(L"NvkIcdPath", out, DWORD(cap)) && file_exists(out))
+    return true;
+#else
+  if (reg_wsz(L"NvkIcdPath32", out, DWORD(cap)) && file_exists(out))
+    return true;
+#endif
+  if (nvk_next_to_umd(out, cap))
+    return true;
+  // %ProgramFiles% is "Program Files (x86)" in a WoW64 process.
   wchar_t pf[MAX_PATH];
   const DWORD m = GetEnvironmentVariableW(L"ProgramFiles", pf, MAX_PATH);
   if (m == 0 || m >= MAX_PATH)
     return false;
   std::swprintf(out, cap, L"%ls\\Helios\\nvk\\vulkan_nouveau.dll", pf);
   return file_exists(out);
-#else
-  if (reg_wsz(L"NvkIcdPath32", out, DWORD(cap)))
-    return file_exists(out);
-  return false;
-#endif
 }
 
 IcdBackendChoice decide() {
@@ -177,7 +204,7 @@ IcdBackendChoice decide() {
   }
 
   if (!find_nvk_icd(c.nvk_path, sizeof(c.nvk_path) / sizeof(c.nvk_path[0]))) {
-    c.reason = "no NVK ICD (HELIOS_NVK_ICD, NvkIcdPath, %ProgramFiles%\\Helios\\nvk)";
+    c.reason = "no NVK ICD (HELIOS_NVK_ICD, NvkIcdPath, driver store, %ProgramFiles%\\Helios\\nvk)";
     return c;
   }
   c.backend = IcdBackend::NvkRm;

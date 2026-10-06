@@ -20,9 +20,13 @@
 //     open surfaces Venus processes made, which an NVK process cannot import.
 //  4. The NVK ICD must exist: `HELIOS_NVK_ICD` (environment), else
 //     `NvkIcdPath` / `NvkIcdPath32` (REG_SZ, the full path of
-//     `vulkan_nouveau.dll`, with `librmclient.dll` next to it), else
-//     `%ProgramFiles%\Helios\nvk\vulkan_nouveau.dll` (64-bit only: there is no
-//     default 32-bit NVK). Missing file = Venus.
+//     `vulkan_nouveau.dll`, with `librmclient.dll` next to it) when that file
+//     exists, else the driver package's copy next to this UMD in the driver
+//     store (`vulkan_nouveau.dll` + `librmclient.dll`; WoW64:
+//     `vulkan_nouveau32.dll` + `librmclient32.dll`), else
+//     `%ProgramFiles%\Helios\nvk\vulkan_nouveau.dll` (the x86 Program Files in
+//     a WoW64 process). Missing file = Venus. NVK itself applies the same
+//     policy to Vulkan apps (Mesa patch 0032) and Zink to OpenGL apps (0034).
 //
 // After that the device create can still fall back: the DLL does not load, it
 // lacks `helios_icd_interface_v2`, NVK enumerates no GPU, or the DXVK device

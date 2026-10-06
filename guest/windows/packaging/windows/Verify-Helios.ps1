@@ -136,15 +136,41 @@ if ($null -eq $vulkanX86Value -or [int]$vulkanX86Value -ne 0) {
     $failures.Add("The x86 Vulkan ICD manifest is not enabled in the WoW64 registry.")
 } else { Write-Host "Vulkan x86: registered $($state.vulkanManifestX86)" }
 
-$openGlDriver = if ($classKey -and (Test-Path -LiteralPath $classKey)) { (Get-Item -LiteralPath $classKey).GetValue("OpenGLDriverName", $null) } else { $null }
-if (-not $openGlDriver -or ([string]$openGlDriver -ine (Join-Path ([string]$state.installRoot) "runtime\mesa\libgallium_wgl.dll"))) {
-    $failures.Add("The Helios OpenGL ICD is not registered on the display adapter.")
-} else { Write-Host "OpenGL: registered $openGlDriver" }
-
-$openGlDriverX86 = if ($classKey -and (Test-Path -LiteralPath $classKey)) { (Get-Item -LiteralPath $classKey).GetValue("OpenGLDriverNameWow", $null) } else { $null }
-if (-not $openGlDriverX86 -or ([string]$openGlDriverX86 -ine (Join-Path ([string]$state.installRoot) "runtime\mesa\x86\libgallium_wgl.dll"))) {
-    $failures.Add("The Helios x86 OpenGL ICD is not registered on the display adapter.")
-} else { Write-Host "OpenGL x86: registered $openGlDriverX86" }
+# The driver package's INF registers NVK (Vulkan) and Zink on NVK (OpenGL) on
+# the adapter, from the driver store (REG_MULTI_SZ values); the installer
+# registers the Venus Zink only when the INF did not.
+function Get-HeliosClassValue([string]$Name) {
+    if (-not $classKey -or -not (Test-Path -LiteralPath $classKey)) { return "" }
+    $value = (Get-Item -LiteralPath $classKey).GetValue($Name, $null)
+    if ($null -eq $value) { return "" }
+    return (@($value) -join ";")
+}
+foreach ($check in @(
+    @{ name = "OpenGLDriverName"; label = "OpenGL"; nvk = "\\helios_gl64\.dll$"; venus = (Join-Path ([string]$state.installRoot) "runtime\mesa\libgallium_wgl.dll") },
+    @{ name = "OpenGLDriverNameWow"; label = "OpenGL x86"; nvk = "\\helios_gl32\.dll$"; venus = (Join-Path ([string]$state.installRoot) "runtime\mesa\x86\libgallium_wgl.dll") }
+)) {
+    $value = Get-HeliosClassValue $check.name
+    if ($value -match $check.nvk) {
+        Write-Host "$($check.label): Zink on NVK, registered $value"
+    } elseif ($value -and $value -ieq $check.venus) {
+        Write-Host "$($check.label): Zink on Venus, registered $value"
+    } else {
+        $failures.Add("The Helios $($check.label) ICD is not registered on the display adapter ($($check.name)='$value').")
+    }
+}
+foreach ($check in @(
+    @{ name = "VulkanDriverName"; label = "Vulkan (NVK)"; nvk = "\\helios_nvk64\.json$" },
+    @{ name = "VulkanDriverNameWow"; label = "Vulkan x86 (NVK)"; nvk = "\\helios_nvk32\.json$" }
+)) {
+    $value = Get-HeliosClassValue $check.name
+    if ($value -match $check.nvk) {
+        $json = $value -replace '^.*;', ''
+        if (Test-Path -LiteralPath $json -PathType Leaf) { Write-Host "$($check.label): registered $json" }
+        else { $failures.Add("$($check.label) is registered as $json, which does not exist.") }
+    } else {
+        $failures.Add("NVK is not registered as the adapter's Vulkan driver ($($check.name)='$value').")
+    }
+}
 
 $openClRegistry = "HKLM:\SOFTWARE\Khronos\OpenCL\Vendors"
 $openClValue = if (Test-Path -LiteralPath $openClRegistry) { (Get-Item -LiteralPath $openClRegistry).GetValue([string]$state.openClVendor, $null) } else { $null }

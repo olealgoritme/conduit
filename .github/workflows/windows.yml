@@ -33,9 +33,45 @@ env:
   OPENCL_HEADERS_COMMIT: 6fe718c31a45fe25151362a72ef041c3a1047cbd
 
 jobs:
+  # NVK on RM (Vulkan) and Zink (OpenGL) for the Helios adapter, cross-built
+  # with MinGW-w64 (guest/nvk-rm/README.md, "Windows build"); the driver
+  # package's INF installs them into the driver store.
+  nvk:
+    name: NVK on RM and Zink (x64 + x86, MinGW cross build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          fetch-depth: 1
+      - name: Install the cross toolchain and Mesa's build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
+            bison flex glslang-tools python3-mako python3-yaml python3-packaging \
+            llvm-20-dev libclang-20-dev libclang-cpp20-dev libpolly-20-dev \
+            libllvmspirvlib-20-dev llvm-spirv-20 libclc-20-dev
+          python3 -m pip install --break-system-packages "meson>=1.7" ninja
+          rustup target add x86_64-pc-windows-gnu i686-pc-windows-gnu
+          cargo install --locked bindgen-cli cbindgen
+      - name: Build and stage NVK and Zink
+        env:
+          MESA_DIR: ${{ runner.temp }}/mesa
+          JOBS: '4'
+          MEMORY_MAX: ''
+        run: sh ./guest/nvk-rm/windows/stage-helios-package.sh "$RUNNER_TEMP/helios-nvk"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helios-nvk
+          path: ${{ runner.temp }}/helios-nvk
+          if-no-files-found: error
+          retention-days: 14
+
   driver:
     name: WDDM driver and x64/x86 Direct3D 11/12 UMDs (${{ matrix.configuration }})
     runs-on: windows-2022
+    needs: [nvk]
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -102,9 +138,13 @@ jobs:
       - name: Ensure Windows Driver Kit is installed
         shell: pwsh
         run: ./guest/windows/ci/windows/Install-WindowsDriverKit.ps1
+      - uses: actions/download-artifact@v8
+        with:
+          name: helios-nvk
+          path: ${{ runner.temp }}/helios-nvk
       - name: Build driver package
         shell: pwsh
-        run: ./guest/windows/ci/windows/Build-Driver.ps1 -RepoRoot "$env:GITHUB_WORKSPACE/guest/windows" -OutputDir "$env:RUNNER_TEMP/helios-driver" -Configuration ${{ matrix.configuration }}
+        run: ./guest/windows/ci/windows/Build-Driver.ps1 -RepoRoot "$env:GITHUB_WORKSPACE/guest/windows" -OutputDir "$env:RUNNER_TEMP/helios-driver" -Configuration ${{ matrix.configuration }} -NvkArtifact "$env:RUNNER_TEMP/helios-nvk"
       - uses: actions/upload-artifact@v7
         with:
           name: helios-driver-${{ matrix.configuration }}

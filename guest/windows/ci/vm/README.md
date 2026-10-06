@@ -69,6 +69,22 @@ echo "WIN_SSH='user@127.0.0.1'" >> ~/.config/conduit/win-build.env
 | `OUT` | `dist/windows-driver/<Configuration>` | where the package lands on the host |
 | `WIN_SRC` | this checkout | another checkout or worktree whose `guest/windows` to build; the `ci/vm` scripts still come from this one |
 | `CLEAN` | `0` | `1`: copy everything and rebuild from scratch |
+| `NVK_ARTIFACT` | `dist/nvk-windows` | NVK on RM and Zink, staged by `guest/nvk-rm/windows/stage-helios-package.sh` (required; copied to `W:\nvk`) |
+
+The package carries NVK on RM (the adapter's Vulkan driver) and Zink on NVK
+(its OpenGL ICD), cross-built on the Linux host first:
+
+```sh
+guest/nvk-rm/windows/stage-helios-package.sh      # -> dist/nvk-windows
+```
+
+It builds both architectures with `guest/nvk-rm/build-windows.sh GL=1` (the
+S3 NVK series plus patches 0032-0034; `MESA_DIR`, default
+`~/code/mesa-nvk-rm-helios`) and stages `vulkan_nouveau.dll`,
+`librmclient.dll`, `helios_nvk64.json`, `vulkan_nouveau32.dll`,
+`librmclient32.dll`, `helios_nvk32.json`, `helios_gl64.dll` and
+`helios_gl32.dll`. `Build-Driver.ps1 -NvkArtifact` (`HELIOS_NVK_ARTIFACT`)
+checks them and the cargo-make package step copies them next to the UMDs.
 
 Builds are incremental. `win-build.sh` keeps a sha256 manifest per source
 checkout (`dist/windows-driver/.sync-*`) and sends only files whose content
@@ -95,12 +111,24 @@ certificate.
 
 ## Installing the package
 
-The package is the driver only: `helios_kmd_render.inf/.sys/.cat`,
+The package is the driver: `helios_kmd_render.inf/.sys/.cat`,
 `helios_umd.dll`, `helios_umd12.dll`, `helios_umd32.dll`,
-`helios_umd12_32.dll`, `helios-dev-test.cer`, and licenses. The Mesa Venus
-ICD, Zink, the loaders and the installer come from the full package
-(`windows.yml`, `HeliosSetup.exe`; see `packaging/windows/README.md`), which
-a Windows guest needs once; this package then replaces the driver.
+`helios_umd12_32.dll`, NVK and Zink (above), `helios-dev-test.cer`, and
+licenses. The INF installs NVK and Zink into the driver store with the UMDs
+and registers them on the adapter's software key: `VulkanDriverName(Wow)`
+(the Vulkan loader finds NVK for the Helios adapter; nothing under
+`HKLM\SOFTWARE\Khronos`) and `OpenGLDriverName(Wow)` (opengl32.dll loads
+Zink, which loads NVK directly). The UMDs find NVK there too, unless
+`HKLM\SOFTWARE\Helios!NvkIcdPath(32)` names another build. One policy, read
+by the UMDs, NVK and Zink, decides per process: `HKLM\SOFTWARE\Helios!Icd`
+= `venus` puts D3D, Vulkan and OpenGL back on Venus; `NvkDenyList` /
+`NvkAllowList` (executable names, `;`-separated) adjust the built-in
+deny-list (DWM, the shell, browsers stay on Venus). The Mesa Venus ICD
+(still registered under `HKLM\SOFTWARE\Khronos\Vulkan\Drivers`: the UMDs'
+DXVK on Venus reaches it through the loader, and Vulkan apps see it as a
+second device after NVK), the loaders and the installer come from the full
+package (`windows.yml`, `HeliosSetup.exe`; see `packaging/windows/README.md`),
+which a Windows guest needs once; this package then replaces the driver.
 
 `win-build.sh` ends by pointing here. In the Windows guest (Secure Boot
 off), from an administrator prompt, with the package copied in:
