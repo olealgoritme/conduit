@@ -44,6 +44,8 @@ const ACTS_PER_PASS: usize = 3;
 /// How long the host gets to take one flip (the worker flips every frame and StopDevice
 /// joins it for a bounded time, as `rm_present`).
 const FLIP_TIMEOUT_MS: u64 = 1_000;
+/// How long after the presenter gave up (three failed attempts in a row) it starts over: 5 s.
+const RESTART_AFTER_GIVING_UP_100NS: u64 = 50_000_000;
 /// Consecutive flips that found the source yielded before it counts as a failure.
 const MAX_YIELDS: u32 = 8;
 
@@ -58,7 +60,6 @@ static PRES: SpinLock<PState> = SpinLock::new(PState {
 });
 static TARGET: SpinLock<TargetBook> = SpinLock::new(TargetBook::new());
 static YIELDS: AtomicU32 = AtomicU32::new(0);
-static GAVE_UP_COUNTED: AtomicU32 = AtomicU32::new(0);
 /// The `seq` of the last flip the host took and the GEM it named (the RELEASE SEAM).
 pub static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
 pub static LAST_GEM: AtomicU32 = AtomicU32::new(0);
@@ -66,7 +67,7 @@ pub static LAST_GEM: AtomicU32 = AtomicU32::new(0);
 // Counters (names at most 14 characters): `RmSysProg` primaries programmed (each is a
 // `SetVidPnSourceAddress` of an RM primary), `RmSysProgBad` refused (a layout that is not
 // the mode's), `RmSysRegs` registrations the arbiter took, `RmSysWithdrawn` withdrawals,
-// `RmSysGaveUp` times the presenter gave up (Venus has the screen), `RmSysFrames` flips
+// `RmSysGaveUp` times the presenter gave up and started over five seconds later, `RmSysFrames` flips
 // shown for an edge, `RmSysReflips` flips shown for a resume, `RmSysYielded` flips that
 // found the source yielded, `RmSysFlipFail` flips the host or transport refused,
 // `RmSysPres` the presenter's word (bit 0 registered, bit 1 gave up, bits 8.. failures),
@@ -113,7 +114,6 @@ pub(super) fn reset() {
         g.p.reset();
     }
     YIELDS.store(0, Ordering::Relaxed);
-    GAVE_UP_COUNTED.store(0, Ordering::Relaxed);
     LAST_SEQ.store(0, Ordering::Relaxed);
     LAST_GEM.store(0, Ordering::Relaxed);
     rm_present::clear_wake_at();
@@ -273,9 +273,20 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
             (act, word(&g.p), g.p.gave_up())
         };
         SYS_PRES.store(word, Ordering::Relaxed);
-        if gave_up && GAVE_UP_COUNTED.swap(1, Ordering::Relaxed) == 0 {
+        if gave_up {
+            // Three failures in a row. At level 3 this hands the screen back to Venus; here
+            // Venus has nothing to show (the primary has no Venus image), so withdrawing for
+            // good would leave the screen frozen on its last flip. The source is withdrawn
+            // (the arbiter owes the desktop its flush), counted, and the presenter starts over
+            // five seconds later: a host that comes back is used again.
+            if matches!(act, Act::Withdraw) {
+                withdraw(adapter);
+            }
+            PRES.lock().p.reset();
             SYS_GAVE_UP.fetch_add(1, Ordering::Relaxed);
             crate::diag::record_named_bytes(b"RmSysGaveUp", SYS_GAVE_UP.load(Ordering::Relaxed));
+            rm_present::set_wake_at(now().saturating_add(RESTART_AFTER_GIVING_UP_100NS));
+            return;
         }
         match act {
             Act::Idle => return,

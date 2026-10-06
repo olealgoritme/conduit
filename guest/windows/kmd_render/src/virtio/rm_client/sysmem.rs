@@ -882,6 +882,7 @@ pub(crate) fn released(passive: PassiveLevel, adapter: &AdapterContext, resource
     // The screen stops using it first (no flip names a GEM about to be closed).
     super::sysmem_flip::target_gone(adapter, resource_id);
     let epoch_now = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
+    let mut freed = true;
     if epoch_now == t.epoch && epoch_now != 0 {
         let io = Io {
             passive,
@@ -898,12 +899,18 @@ pub(crate) fn released(passive: PassiveLevel, adapter: &AdapterContext, resource
         if free_sys(&io, &h, Svc::handle(t.slot)).is_err() {
             SYS_SOFT.fetch_add(1, Ordering::Relaxed);
             leaked = true;
+            freed = false;
         }
         if leaked {
             SYS_LEAK.fetch_add(1, Ordering::Relaxed);
         }
     }
-    STATE.lock().svc.freed(t.slot);
+    // A slot whose RM object could not be freed stays taken (Closing): its handle is still
+    // RM's, and reusing the number would make the next `RM_ALLOC` fail as a duplicate. The
+    // sweep of the transport closes the client and the generation reset frees the slot.
+    if freed {
+        STATE.lock().svc.freed(t.slot);
+    }
     mirror_live();
     SYS_FREED.fetch_add(1, Ordering::Relaxed);
     publish_counters();

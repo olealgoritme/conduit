@@ -28,6 +28,10 @@
 //! holds a LEASE (`lease_slot`, `end_lease`): `retire_begin` and `cleanup` wait for it
 //! before they unmap, so a view never goes away under a write.
 //!
+//! LEVEL 5 (`sysmem`, `sysmem_flip`, children of this module). No ring and no client steps on the
+//! worker: the VidPn primary is allocated from RM SYSTEM memory on the creator's thread (its own RM
+//! client, see `sysmem.rs`) and flipped as it is (`sysmem_flip.rs`); the worker only flips.
+//!
 //! LOCKING. `CLIENT` is a LEAF spinlock holding plain data (`rm_client::Client`):
 //! never held across a host round trip, a wait, an allocation or another lock; every
 //! step copies what it needs out under the lock, does its I/O with no lock held, and
@@ -87,7 +91,7 @@ static CLIENT: SpinLock<Client> = SpinLock::new(Client::new());
 
 /// `KNOB_LEVEL` before the knob has been read for this transport generation.
 const KNOB_UNREAD: u32 = u32::MAX;
-/// The `KmdRmClient` knob (0 to 4), or [`KNOB_UNREAD`]: read once per transport
+/// The `KmdRmClient` knob (0 to 5), or [`KNOB_UNREAD`]: read once per transport
 /// generation (so `reg add` + `pnputil /restart-device` applies it), by resetting it to
 /// unread in [`forget`], which `retire_transport` runs for every transport it drops.
 /// With the knob at 0 (the default) [`service`] is this one atomic load and nothing
