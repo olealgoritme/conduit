@@ -919,8 +919,7 @@ pub(crate) unsafe extern "system" fn cs_set_uavs(
             None => None,
         });
     }
-    let n = UAV_BIND_LOG_COUNT.next();
-    if n < 1024 || missing != 0 || slice.is_none() {
+    if crate::trace_enabled() && (UAV_BIND_LOG_COUNT.next() < 1024 || missing != 0 || slice.is_none()) {
         trace_line!(
             "DDI CSSetUnorderedAccessViews start={} num={} nonnull={} missing={} uavs_null={} counts_ptr={}",
             start,

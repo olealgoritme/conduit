@@ -56,8 +56,7 @@ pub(crate) unsafe extern "system" fn set_render_targets(
         bindings.current_rt0_height.store(rt0.2, Ordering::Relaxed);
         bindings.current_rt0_format.store(rt0.3, Ordering::Relaxed);
     }
-    let n = OM_LOG_COUNT.next();
-    if n < 1024 || rt_missing != 0 || rt0.0 != 0 {
+    if crate::trace_enabled() && (OM_LOG_COUNT.next() < 1024 || rt_missing != 0 || rt0.0 != 0) {
         trace_line!(
             "DDI OMSetRenderTargets num={} rt_nonnull={} rt_missing={} rt0_alloc=0x{:x} rt0={}x{} fmt={} dsv_raw=0x{:x} uav_start={} num_uavs={} uav_range={}:{}",
             num_views,
@@ -145,8 +144,7 @@ pub(crate) unsafe extern "system" fn set_viewports(
             MaxDepth: v.MaxDepth,
         });
     }
-    let n = VIEWPORT_LOG_COUNT.next();
-    if n < 64 || num == 0 {
+    if crate::trace_enabled() && (VIEWPORT_LOG_COUNT.next() < 64 || num == 0) {
         if let Some(v) = out.first() {
             trace_line!(
                 "DDI RSSetViewports num={} clear={} first=({},{} {}x{} depth={:.3}..{:.3})",
@@ -187,8 +185,7 @@ pub(crate) unsafe extern "system" fn set_scissor_rects(
             });
         }
     }
-    let n = SCISSOR_LOG_COUNT.next();
-    if n < 64 || num == 0 {
+    if crate::trace_enabled() && (SCISSOR_LOG_COUNT.next() < 64 || num == 0) {
         if let Some(r) = out.first() {
             trace_line!(
                 "DDI RSSetScissorRects num={} clear={} first=({},{}-{}, {})",

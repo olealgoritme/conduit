@@ -689,8 +689,7 @@ pub(crate) unsafe extern "system" fn ia_set_vertex_buffers(
             );
         }
     }
-    let n = IA_BIND_LOG_COUNT.next();
-    if n < 128 || num == 0 {
+    if crate::trace_enabled() && (IA_BIND_LOG_COUNT.next() < 128 || num == 0) {
         let first_stride = if num != 0 && !strides.is_null() {
             *strides
         } else {
