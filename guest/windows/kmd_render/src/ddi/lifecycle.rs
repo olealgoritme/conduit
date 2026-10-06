@@ -232,6 +232,8 @@ fn start_generation_mirrors() {
     // `BltAsync` / `BltNoMirror` (default 0): the knobs read again and mirrored, counters zeroed.
     crate::ddi::blt_async::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
+    // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
+    crate::ddi::std_census::reset_for_start();
     // `foreign_flip::forget` zeroed its counters and owes the block; this writes it (reading and
     // mirroring `FfKnob` first), as does the `Fk*` block.
     crate::virtio::foreign_flip::publish_counters();
