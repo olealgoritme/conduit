@@ -337,13 +337,18 @@ KMD (`kmd_render/src/ddi/flush_trace.rs`, wired from `submit_command.rs`, `inter
 | Point | Where | Records |
 |---|---|---|
 | RENDER | end of `flush_gate_record` (PASSIVE) | event with the gate kind (STREAM / FENCE / WIRE flags, plus DEGRADED, STAMPED, ZERO_POINT, BATCHED), `aux` = the stream point asked, `boundary` = the merged boundary or the stamped wire floor; leaves a `PendingFlush` on the context |
-| SUBMIT | both SubmitCommand DDIs, inside `note_and_maybe_signal` under the notify lock | takes the context's pending record; compares the decoded boundary with the merged one (`submit_matches`); event with the gate bits, MATCH, EMPTY (no private-data record found), IMMEDIATE (fence satisfiable now); a queued fence is added to `Outstanding` |
+| SUBMIT | both SubmitCommand DDIs, inside `note_and_maybe_signal` under the notify lock | takes the context's pending record; compares the decoded boundary with the merged one (`submit_matches`); event with the gate bits, MATCH, EMPTY (no private-data record found), EXEMPT (batched, see below); recorded AFTER the signal decision, with the fence's disposition: queued (added to `Outstanding`), IMMEDIATE (delivered inside SubmitCommand, and its RETIRE event), or SIGNAL_FAILED (satisfiable but the notification failed or dxgkrnl's callback table was missing: not delivered, not tracked) |
 | RETIRE | completion DPC after a successful `DMA_COMPLETED` (`WddmReady::rebased` read-only accessor), or SubmitCommand itself for an immediate fence | event with the gate bits, `aux` = microseconds since the SUBMIT (exact, from `Outstanding`), REBASED, NO_SUBMIT, AT_SUBMIT |
 | (abandon) | `abandon_pending_submissions` | `Outstanding` cleared (`FlGAbn` counts the dropped fences) |
 | (overlap) | `enqueue_submit_inner`, one relaxed load | `FlGUnord` while a queued HEFL fence is outstanding |
 
 Pairing a Render with its SubmitCommand is per context and one deep (dxgkrnl issues them in order). Two
-Renders before one SubmitCommand count `FlGBat`. A HEFL Render whose DMA buffer dxgkrnl never submits would
+Renders before one SubmitCommand count `FlGBat`, and the record that replaced an earlier pending one is EXEMPT:
+the buffer then carries a merge of several Renders' boundaries, so its comparison is counted in neither
+`FlGMat` nor `FlGMis` (`FlGExempt` counts them; `FlGSub` still includes them), and `verdict()` cannot report
+BoundaryLost because of batching alone. The pending slot and its "is there one" flag change together under
+the context's spinlock; SubmitCommand reads the flag with one relaxed load and takes the lock only when set.
+The Outstanding table is reset at transport init (`init_from_registry`), as at an abandon. A HEFL Render whose DMA buffer dxgkrnl never submits would
 hand its record to the NEXT submit of that context (a present's): bounded to one record, and visible as
 `FlGSub` < `FlGRec` plus a mismatch.
 
@@ -357,6 +362,9 @@ New values (the older `FlGRec FlGStrm FlGFnc FlGWire FlGDeg FlGFlr FlGVer` are u
 * `FlGMat` / `FlGMis` the decoded boundary was / was not the one the Render merged. `FlGEmpty` of the
   mismatches, those where SubmitCommand found no record at all: the private data it reads is not the range
   Render wrote (the section 8 assumption).
+* `FlGExempt` batched records (see the pairing note above); `FlGSub` = `FlGMat` + `FlGMis` + `FlGExempt`.
+  `FlGSigFail` fences satisfiable at SubmitCommand whose `DMA_COMPLETED` could not be delivered there (not
+  tracked; expected 0, it moves with `DMA_NOTIFY_FAILS`).
 * `FlGImm` fences completed inside SubmitCommand, never queued: the gate held nothing. `FlGImm` close
   to `FlGSub` means the gate cannot order anything.
 * `FlGRet` tracked fences delivered (immediate ones included); `FlGReb` of them released by the `WddmHeadMs`
@@ -375,7 +383,7 @@ New values (the older `FlGRec FlGStrm FlGFnc FlGWire FlGDeg FlGFlr FlGVer` are u
   by `pack_event`: bits 30..31 kind (1 RENDER, 2 SUBMIT, 3 RETIRE, 0 empty), bits 22..29 flags, bits 0..21
   `aux` (microseconds for SUBMIT / RETIRE since the Render / SUBMIT, the stream point for RENDER; clipped to
   4 194 303). Flags of RENDER: 1 STREAM, 2 FENCE, 4 WIRE, 8 DEGRADED, 16 STAMPED, 32 ZERO_POINT, 64 BATCHED.
-  Flags of SUBMIT: 1 MATCH, 2 IMMEDIATE, 4 EMPTY, and the gate kind 16 STREAM / 32 FENCE / 64 WIRE. Flags
+  Flags of SUBMIT: 1 MATCH, 2 IMMEDIATE, 4 EMPTY, 8 EXEMPT, 128 SIGNAL_FAILED, and the gate kind 16 STREAM / 32 FENCE / 64 WIRE. Flags
   of RETIRE: 1 REBASED, 2 NO_SUBMIT, 4 AT_SUBMIT, and the gate kind as for SUBMIT. The full 64-event ring
   (with fence ids, boundaries, stamps) is the static `RING` in `ddi/flush_trace.rs`, readable from a debugger.
 * `FlGSyncEff` the `FlGSyncMs` value in force after clamping (0 = off). Shows whether the knob took.
@@ -386,11 +394,15 @@ Service-key REG_DWORD `FlGSyncMs`, snapshotted at transport init (`pnputil /rest
 clamped in code to 2000 ms. When nonzero a HEFL Render that carries a boundary (stream point / RM fence) or
 a wire floor waits, at the end of `flush_gate_record`, until that wait has retired
 (`VirtioGpu::flush_gate_ready`), then returns, so the runtime's key release follows the GPU completion on
-the CPU. Rules it was built to: PASSIVE only (`DxgkDdiRender`); no lock across the wait (each poll takes
+the CPU. Rules it was built to: PASSIVE only, and CHECKED (`DxgkDdiRender` is documented PASSIVE, but
+`PassiveLevel::assume` only counts a wrong claim, so the wait reads the live IRQL with
+`PassiveLevel::try_assume` just before its first sleep and, above PASSIVE, returns without sleeping and counts
+`FlGSyncSkip`); no lock across the wait (each poll takes
 `virtio_lock` for one read-only readiness test and drops it before sleeping, the same way `ctrl::wait_block`
 does, including draining the used ring so a lost interrupt cannot pass for a timeout); bounded (the
 deadline, plus one timer tick of overshoot: a 1 ms `KeDelayExecutionThread` sleeps up to ~15.6 ms); a dead
-stream or a down transport ends the wait at once. With 0 nothing runs, not even the IRQL check.
+stream, a failed transport or a down transport ends the wait at once. With 0 nothing runs, not even the
+IRQL check. `FlGSyncSkip` > 0 means some waits were skipped for IRQL and the experiment is incomplete.
 
 Reading it: `FlGSyncWt` waits that actually blocked (0 means the boundary was always already ready, or the
 knob did not take: check `FlGSyncEff`), `FlGSyncTmo` those that hit the bound, `FlGSyncMaxUs` the longest.
