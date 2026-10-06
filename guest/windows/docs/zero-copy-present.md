@@ -1207,7 +1207,7 @@ arithmetic), the clock of `VpDmpT`, `VpVsT` and `VsCntT`.
 | `StallT` | the time this block was last written: the "now" of every age below. A `StallT` that does not move between two reads means NOBODY is writing the block (see below) |
 | `HpdLoopN`, `HpdLoopT` | HPD worker loops (wakes) and the time of the last wake |
 | `HpdSite`, `HpdSiteT` | the step the worker is in or last entered (ids below) and the time it entered it. Age in the step = `StallT - HpdSiteT`. The pair is two stores: a reader may see the id of one step with the time of the next |
-| `ScLkN`, `ScLkAcqT`, `ScLkRelT` | acquisitions of the scanout mutex, the time of the last acquisition and of the last release. HELD NOW when `ScLkAcqT` is later than `ScLkRelT`; its age is `StallT - ScLkAcqT`. Every holder is counted (the worker, the DDI threads, `DestroyAllocation`), which is what lets a worker that waits on the mutex be told from one that holds it |
+| `ScLkN`, `ScLkRelN`, `ScLkAcqT`, `ScLkRelT` | acquisitions and releases of the scanout mutex, and the time of the last acquisition and of the last release. HELD NOW when `ScLkN` and `ScLkRelN` differ (counts, not the millisecond stamps: an acquire and a release in one millisecond cannot be ordered by time); its age is `StallT - ScLkAcqT`. Every holder is counted (the worker, the DDI threads, `DestroyAllocation`), which is what lets a worker that waits on the mutex be told from one that holds it |
 | `FlipIss` | flips dxgkrnl issued: each `SetVidPnSourceAddress` with an argument, each DMA flip record the submit took (a flip record or a keep record) |
 | `FlipPub`, `FlipPubT` | publications of a displayed address (`publish_displayed_primary`: bound or kept, any class, plus the ring-1 completion DPC's two direct stores) and the time of the last. A flip can publish more than once, so `FlipPub` can exceed `FlipIss` by a little; coalescing (`VpCoal`: dxgkrnl flipping faster than the worker drains, handles dropped) makes `FlipIss` exceed it. Healthy at quiescence: `FlipIss - FlipPub - VpCoal` about 0 |
 | `VsPendN`, `VsPendMax` | consecutive vsync ticks with a pending programming (`pending_vidpn_allocation != 0` or the programming gate raised; the vsync DPC maintains it with atomics only) and the longest run this generation. 0 and a small max is a quiet pipeline |
@@ -1314,7 +1314,7 @@ frozen `StallT`). A stalled system is read by what MOVES between the two reads; 
 * Clocks and freshness: `StallT`, `VpDmpT`, `VpVsT` (and `VsCntT`), `StartN`, `StartT`.
 * Pending state: `VpGate`, `VpPend`, `VpDSt` (the worker's last status, 0 = success), `VpVsEn`, `VpLpa` (and `SaLo` /
   `SaHi`: the address the vsync reports), `SaCnt`, `VpPrgN`, `VpCoal`.
-* New: `HpdLoopN`, `HpdLoopT`, `HpdSite`, `HpdSiteT`, `ScLkN`, `ScLkAcqT`, `ScLkRelT`, `FlipIss`, `FlipPub`, `FlipPubT`,
+* New: `HpdLoopN`, `HpdLoopT`, `HpdSite`, `HpdSiteT`, `ScLkN`, `ScLkRelN`, `ScLkAcqT`, `ScLkRelT`, `FlipIss`, `FlipPub`, `FlipPubT`,
   `VsPendN`, `VsPendMax`, `FlipWd`, `FlipWdT`, `FkDefBud`, `FkVenus`, `FlWdMsEff`, `DefBudEff`.
 * Programming outcomes: `ScUnav`, `ScRetry`, `ScGaveUp`, `FkKeep`, `FkWhy`, `PrUnres`.
 * Refresh pipeline: `RfCnt`, `RfDone`, `RfFail`, `RfUnb`, `RfWait`.
@@ -1332,7 +1332,7 @@ together. If `StallT` does not move, see 14.2 (nothing is writing the block).
 
 | # | pattern | means | next |
 |---|---|---|---|
-| 1a | `HpdSite` 7 or 14 (waiting on the mutex), age growing; `ScLkAcqT` later than `ScLkRelT`, age growing, `ScLkN` flat; `VsPendN` growing; `VpVsN` moves | hypothesis 1: ANOTHER thread holds the scanout mutex across a host round trip (`retire_scanout_allocation_locked`: `ctrl_fifo_barrier`, `set_scanout_blob`, up to 30 s each), the worker queues on it | the age is the answer: near 30 s or 60 s is the barrier / SET timeout; `NvEvErr`, `RelRTimeouts`, `RngSub - RngCmp` say whether the host is answering |
+| 1a | `HpdSite` 7 or 14 (waiting on the mutex), age growing; `ScLkN` ahead of `ScLkRelN`, `ScLkAcqT` age growing, `ScLkN` flat; `VsPendN` growing; `VpVsN` moves | hypothesis 1: ANOTHER thread holds the scanout mutex across a host round trip (`retire_scanout_allocation_locked`: `ctrl_fifo_barrier`, `set_scanout_blob`, up to 30 s each), the worker queues on it | the age is the answer: near 30 s or 60 s is the barrier / SET timeout; `NvEvErr`, `RelRTimeouts`, `RngSub - RngCmp` say whether the host is answering |
 | 1b | `HpdSite` 16 or 17 (mutex held by the worker), age growing; `ScLkN` flat; `FlipPub` flat | hypothesis 1: the worker is INSIDE the programming (a Venus copy, `SET_SCANOUT_BLOB`) waiting on the host | `IrqN` / `DpcN` flat = the host is not interrupting; moving = it answers, the wait is on a fence or producer |
 | 1c | `HpdLoopN` moves fast (about the vsync rate), `HpdSite` flickers between 1 and 16, `ScLkN` moves, `VpPrgN` moves, `VpPend` nonzero or `VsPendN` growing, `FlipPub` flat, `VpDSt` 0, `ScRetry` / `ScGaveUp` flat | hypothesis 1: a DEFERRED programming retrying forever (no budget; it has no counter of its own) | set `DeferBudget` 240: `FkDefBud` moves and the stall clears = confirmed |
 | 1d | `HpdSite` is another step (4, 5, 6, 9, 10, 11, 12, 13), age growing | the worker is stuck in that service, not in the programming | 4: `virtio_lock` / the used ring; 5, 6: `Fs*`, `FnCloseErr`; 9: `Rm*`; 10: `Ff*`; 12: the registry |

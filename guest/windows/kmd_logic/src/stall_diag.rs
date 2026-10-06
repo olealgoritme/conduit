@@ -101,20 +101,22 @@ pub mod site {
 ///   `FlipPub`: publications of a displayed address (bound or kept, any class). `FlipPubT`: when.
 /// * `VsPendN`, `VsPendMax`: consecutive vsync ticks with a pending programming (handle in the
 ///   slot, or the programming gate raised), and the longest run this generation.
-/// * `ScLkN`, `ScLkAcqT`, `ScLkRelT`: acquisitions of the scanout mutex and the interrupt time of
-///   the last acquisition and release; held now when `ScLkAcqT` is later than `ScLkRelT`.
+/// * `ScLkN`, `ScLkRelN`, `ScLkAcqT`, `ScLkRelT`: acquisitions and releases of the scanout mutex
+///   (held now when they differ, [`lock_held`]) and the interrupt time of the last acquisition
+///   and release.
 /// * `StartN`, `StartT`: StartDevice generation count (since the image loaded) and its time.
 /// * `FlipWd`, `FlipWdT`, `FlipWdBig`: watchdog publications, the time of the last, and flips it
 ///   could not record (an address above 2^40).
 /// * `StallT`: interrupt time (ms) of the publication of this block: the "now" of every age.
 /// * `FlWdMsEff`, `DefBudEff`: the `FlipWdogMs` and `DeferBudget` knobs in force (clamped, 0
 ///   included), written at every StartDevice.
-pub const COUNTERS: [&str; 20] = [
+pub const COUNTERS: [&str; 21] = [
     "HpdLoopN",
     "HpdLoopT",
     "HpdSite",
     "HpdSiteT",
     "ScLkN",
+    "ScLkRelN",
     "ScLkAcqT",
     "ScLkRelT",
     "FlipIss",
@@ -131,6 +133,17 @@ pub const COUNTERS: [&str; 20] = [
     "FlWdMsEff",
     "DefBudEff",
 ];
+
+// ---- the scanout mutex -----------------------------------------------------------------------
+
+/// Whether the scanout mutex is held, from the acquisition and release COUNTS (`ScLkN`,
+/// `ScLkRelN`). The mutex serializes its holders, so the counts alternate: they are equal when it
+/// is free and differ by one while held. Counts, not the millisecond stamps: an acquisition and a
+/// release in the same millisecond are indistinguishable by time, and the wrapping 32-bit counts
+/// compare exactly.
+pub const fn lock_held(acquired: u32, released: u32) -> bool {
+    acquired != released
+}
 
 // ---- knobs ---------------------------------------------------------------------------------
 
@@ -761,6 +774,18 @@ mod tests {
     }
 
     // ---- sites and counter names ---------------------------------------------------------
+
+    #[test]
+    fn the_lock_is_held_when_the_counts_differ_whatever_the_clock_says() {
+        assert!(!lock_held(0, 0));
+        assert!(lock_held(1, 0));
+        assert!(!lock_held(1, 1));
+        assert!(lock_held(1_000_001, 1_000_000));
+        // The counts wrap: free again after the 2^32th pair, held with the acquire already wrapped.
+        assert!(!lock_held(0, 0));
+        assert!(lock_held(0, u32::MAX));
+        assert!(!lock_held(u32::MAX, u32::MAX));
+    }
 
     #[test]
     fn site_ids_are_dense_unique_and_named() {

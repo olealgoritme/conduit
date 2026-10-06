@@ -55,24 +55,29 @@ pub(crate) fn hpd_loop() {
 
 // ---- the scanout mutex ---------------------------------------------------------------------
 
-/// Acquisitions of the scanout mutex (`with_scanout_lifecycle`), and the interrupt time (ms) of
-/// the last acquisition and of the last release. The mutex is HELD NOW when the acquisition time
-/// is later than the release time; its age is `StallT - ScLkAcqT`. The one lock the worker, the
-/// DDI threads and `DestroyAllocation` queue on, and a holder can sit in a host round trip for
-/// up to 30 s (`retire_scanout_allocation_locked`).
+/// Acquisitions (`ScLkN`) and releases (`ScLkRelN`) of the scanout mutex
+/// (`with_scanout_lifecycle`), and the interrupt time (ms) of the last acquisition and of the
+/// last release. The mutex is HELD NOW when the counts differ (`stall_diag::lock_held`: counts,
+/// not the stamps, which cannot order two events in the same millisecond); its age is
+/// `StallT - ScLkAcqT`. The one lock the worker, the DDI threads and `DestroyAllocation` queue
+/// on, and a holder can sit in a host round trip for up to 30 s
+/// (`retire_scanout_allocation_locked`).
 static LOCK_N: AtomicU32 = AtomicU32::new(0);
+static LOCK_REL_N: AtomicU32 = AtomicU32::new(0);
 static LOCK_ACQ_T: AtomicU32 = AtomicU32::new(0);
 static LOCK_REL_T: AtomicU32 = AtomicU32::new(0);
 
-/// The scanout mutex was just acquired. PASSIVE.
+/// The scanout mutex was just acquired. PASSIVE. The stamp first, the count second (Release): a
+/// reader that sees the count also sees this acquisition's time, never the previous one's.
 pub(crate) fn note_lock_acquired() {
-    LOCK_N.fetch_add(1, Ordering::Relaxed);
     LOCK_ACQ_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
+    LOCK_N.fetch_add(1, Ordering::Release);
 }
 
-/// The scanout mutex is about to be released. PASSIVE.
+/// The scanout mutex is about to be released. PASSIVE. Stamp, then count.
 pub(crate) fn note_lock_released() {
     LOCK_REL_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
+    LOCK_REL_N.fetch_add(1, Ordering::Release);
 }
 
 // ---- flips issued and published ------------------------------------------------------------
@@ -262,6 +267,7 @@ pub(crate) fn start_generation() {
         &HPD_SITE,
         &HPD_SITE_T,
         &LOCK_N,
+        &LOCK_REL_N,
         &LOCK_ACQ_T,
         &LOCK_REL_T,
         &FLIP_ISS,
@@ -298,6 +304,7 @@ pub(crate) fn publish_counters() {
     rec(b"HpdSite", HPD_SITE.load(Ordering::Relaxed));
     rec(b"HpdSiteT", HPD_SITE_T.load(Ordering::Relaxed));
     rec(b"ScLkN", LOCK_N.load(Ordering::Relaxed));
+    rec(b"ScLkRelN", LOCK_REL_N.load(Ordering::Relaxed));
     rec(b"ScLkAcqT", LOCK_ACQ_T.load(Ordering::Relaxed));
     rec(b"ScLkRelT", LOCK_REL_T.load(Ordering::Relaxed));
     rec(b"FlipIss", FLIP_ISS.load(Ordering::Relaxed));
