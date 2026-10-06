@@ -2729,23 +2729,26 @@ namespace {
 constexpr SIZE_T kNvkCreateStack = SIZE_T(8) << 20;
 
 template <typename F>
+struct StackJob {
+  F* fn;
+  std::unique_ptr<HeliosDxvkDevice> out;
+  static DWORD WINAPI run(LPVOID p) {
+    auto* j = static_cast<StackJob*>(p);
+    j->out = (*j->fn)();
+    return 0;
+  }
+};
+
+template <typename F>
 std::unique_ptr<HeliosDxvkDevice> run_with_stack(F&& fn) {
   ULONG_PTR low = 0, high = 0;
   GetCurrentThreadStackLimits(&low, &high);
   if (high - low >= kNvkCreateStack)
     return fn();
-  struct Job {
-    F* fn;
-    std::unique_ptr<HeliosDxvkDevice> out;
-  } job{&fn, nullptr};
-  HANDLE t = CreateThread(
-      nullptr, kNvkCreateStack,
-      [](LPVOID p) -> DWORD {
-        auto* j = static_cast<Job*>(p);
-        j->out = (*j->fn)();
-        return 0;
-      },
-      &job, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+  using Fn = std::remove_reference_t<F>;
+  StackJob<Fn> job{&fn, nullptr};
+  HANDLE t = CreateThread(nullptr, kNvkCreateStack, &StackJob<Fn>::run, &job,
+                          STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
   if (!t) {
     umd_log("NVK device creation: no helper thread, creating on the caller's stack");
     return fn();
