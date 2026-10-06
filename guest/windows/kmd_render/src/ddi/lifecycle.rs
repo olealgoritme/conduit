@@ -229,6 +229,8 @@ fn start_generation_mirrors() {
     crate::ddi::flip_keep::reset_for_start();
     crate::ddi::present_foreign::reset_for_start();
     crate::ddi::onscanout::reset_for_start();
+    // `BltAsync` / `BltNoMirror` (default 0): the knobs read again and mirrored, counters zeroed.
+    crate::ddi::blt_async::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // `foreign_flip::forget` zeroed its counters and owes the block; this writes it (reading and
     // mirroring `FfKnob` first), as does the `Fk*` block.

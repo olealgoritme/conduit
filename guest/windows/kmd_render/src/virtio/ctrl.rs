@@ -2414,6 +2414,44 @@ pub fn submit_venus_async_present(
     }))
 }
 
+/// The outcome of [`submit_venus_async_blt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BltSubmit {
+    /// The copy was enqueued on ring 1; its wire fence. The destination's writer ownership is
+    /// held by the in-flight table and handed back by the completion DPC.
+    Fence(u64),
+    /// The destination is owned by a reader, or by a writer that is not one of the direct
+    /// submissions: nothing was enqueued.
+    DstBusy,
+}
+
+/// Nonblocking KMD Present-BLT submission of a DIRECT asynchronous Blt (`BltAsync`,
+/// `docs/zero-copy-present.md`, "Asynchronous composed present"). Like
+/// [`submit_venus_async_present`] on ring 1 without a notify, but the destination's writer
+/// ownership is taken (or joined) in the SAME transport critical section as the enqueue, the
+/// copy is recorded in the in-flight table, and the completion DPC (not the caller) hands the
+/// buffer back: nothing here, and nothing the caller does afterwards, waits for the host.
+pub fn submit_venus_async_blt(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    stream: &[u8],
+    resource_id: u32,
+) -> Result<BltSubmit, VirtioError> {
+    let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
+    let queued = adapter.with_virtio(move |v| {
+        v.drain_used();
+        v.enqueue_async_submit_blt(ctx_id, meta, venus, venus_len, resource_id)
+    });
+    match queued {
+        Ok(Ok(crate::virtio::gpu::BltEnq::Fence(fence_id))) => Ok(BltSubmit::Fence(fence_id)),
+        // The staged buffers are dropped here, at PASSIVE.
+        Ok(Ok(crate::virtio::gpu::BltEnq::Busy(_meta, _venus))) => Ok(BltSubmit::DstBusy),
+        Ok(Err((_meta, _venus, e))) => Err(e),
+        Err(_) => Err(VirtioError::DeviceError),
+    }
+}
+
 /// Legacy inline Present cannot leave the callback and retry asynchronously.
 /// Wait outside both the Venus mutex and virtio_lock until the external reader
 /// retires, then atomically transition the buffer to KmdWriter. The modern
