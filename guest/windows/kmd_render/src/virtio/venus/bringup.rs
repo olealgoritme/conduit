@@ -434,6 +434,8 @@ impl VenusInstance {
             present_buffers_high_water: 0,
             present_blits_high_water: 0,
             owned_memory_blobs: Vec::with_capacity(MAX_OWNED_MEMORY_BLOBS),
+            rm_blt_stage: None,
+            rm_blt_stage_allocs: 0,
         })
     }
 
