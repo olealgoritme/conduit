@@ -181,6 +181,11 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         } else if retry_pending {
             timeout.QuadPart = REFRESH_RETRY_100NS;
             &mut timeout
+        } else if let Some(due) = adapter.foreign_scanout_wait_100ns() {
+            // A foreign scanout source is live: wake when it would lapse, so a
+            // silent owner gives the desktop back with no other edge to do it.
+            timeout.QuadPart = due;
+            &mut timeout
         } else {
             core::ptr::null_mut()
         };
@@ -224,6 +229,10 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         if adapter.config_change_pending.swap(0, Ordering::AcqRel) != 0 {
             indicate_child_status(adapter, true);
         }
+
+        // Expire a foreign scanout source whose owner stopped presenting (and ask
+        // for the desktop's restore flush, consumed by the refresh arm below).
+        adapter.foreign_scanout_service();
 
         // Consume only the allocation identity supplied by Windows through
         // SetVidPnSourceAddress. The DDI can be called at DIRQL, where neither

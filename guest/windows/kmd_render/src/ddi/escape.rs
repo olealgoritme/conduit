@@ -1833,8 +1833,9 @@ fn escape_nvrm_op(
             let (event_kinds, device_features) = adapter
                 .with_virtio(|v| (v.nvrm_event_kinds(), v.nvrm_device_features()))
                 .unwrap_or((0, 0));
-            caps.supported_ops =
-                NVRM_OPS_IMPLEMENTED | if event_kinds != 0 { NVRM_EVENT_OPS } else { 0 };
+            caps.supported_ops = NVRM_OPS_IMPLEMENTED
+                | helios_protocol::HELIOS_NVRM_SCANOUT_OPS
+                | if event_kinds != 0 { NVRM_EVENT_OPS } else { 0 };
             caps.supported_event_kinds = event_kinds;
             caps.supported_cache_types = NVRM_CACHE_TYPES;
             caps.device_features = device_features;
@@ -1856,6 +1857,14 @@ fn escape_nvrm_op(
         HELIOS_NVRM_OP_UNPIN => nvrm_unpin(adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_EVENT_REGISTER => nvrm_event_register(adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_EVENT_UNREGISTER => nvrm_event_unregister(adapter, buf, hdr, owner, epoch),
+        // Foreign scanout source (own scanout 0, present GEM objects to it).
+        helios_protocol::HELIOS_NVRM_OP_SCANOUT_SET
+        | helios_protocol::HELIOS_NVRM_OP_SCANOUT_PRESENT
+        | helios_protocol::HELIOS_NVRM_OP_SCANOUT_RELEASE => {
+            super::escape_foreign_scanout::escape_scanout_op(
+                passive, adapter, buf, hdr, owner, head.op, epoch,
+            )
+        }
         _ => STATUS_INVALID_PARAMETER,
     }
 }

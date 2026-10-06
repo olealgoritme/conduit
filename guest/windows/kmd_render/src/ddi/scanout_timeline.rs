@@ -87,6 +87,8 @@ pub mod refresh_outcome {
     pub const HOST_UNBOUND: u32 = 7;
     pub const OWNERSHIP_IDENTITY: u32 = 8;
     pub const OWNERSHIP_EPOCH: u32 = 9;
+    /// Withheld because a foreign scanout source owns scanout 0.
+    pub const FOREIGN_SOURCE: u32 = 10;
 }
 
 /// `aux` values for [`kind::VBLANK_TICK`]. This is deliberately an always-on
