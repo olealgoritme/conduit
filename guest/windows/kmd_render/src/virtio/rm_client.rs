@@ -57,6 +57,11 @@ use helios_kmd_logic::rm_client::{
 use wdk_sys::ntddk::{MmMapIoSpace, MmUnmapIoSpace};
 use wdk_sys::{PHYSICAL_ADDRESS, _MEMORY_CACHING_TYPE};
 
+// Level 5 (`KmdRmClient` = 5): the KMD's own allocations from RM system memory. Children of
+// this module because they drive the same `Io` and bring-up steps, which stay private.
+pub(crate) mod sysmem;
+pub(crate) mod sysmem_flip;
+
 /// The one owner of every handle this client opens.
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;
 
@@ -89,10 +94,17 @@ const KNOB_UNREAD: u32 = u32::MAX;
 /// else: no virtio lock, no registry read.
 static KNOB_LEVEL: AtomicU32 = AtomicU32::new(KNOB_UNREAD);
 
-/// Whether the ring level (3) is in force this generation: one relaxed load.
+/// Whether the ring level (3 or 4) is in force this generation: one relaxed load. Level 5
+/// does not run the ring (its allocations are flipped as they are).
 pub(super) fn ring_level_on() -> bool {
     let level = KNOB_LEVEL.load(Ordering::Relaxed);
-    level != KNOB_UNREAD && level >= 3
+    level != KNOB_UNREAD && (3..=4).contains(&level)
+}
+
+/// Whether the RM system-memory level (5) is in force this generation: one relaxed load.
+fn sysmem_level_on() -> bool {
+    let level = KNOB_LEVEL.load(Ordering::Relaxed);
+    level != KNOB_UNREAD && level >= helios_kmd_logic::rm_sysmem::LEVEL
 }
 
 /// Counters, mirrored by [`publish_counters`] (names at most 14 characters).
@@ -141,6 +153,11 @@ pub(crate) fn publish_counters() {
     // registry keeps what it has.
     if level != KNOB_UNREAD {
         rec(b"RmKnob", level);
+    }
+    // Level 5 runs no ring client: its own counters only.
+    if level == helios_kmd_logic::rm_sysmem::LEVEL {
+        sysmem::publish_counters();
+        return;
     }
     rec(b"RmStatus", RM_STATUS.load(Ordering::Relaxed));
     rec(b"RmStep", RM_LAST_STEP.load(Ordering::Relaxed));
@@ -194,7 +211,8 @@ fn knob_level() -> u32 {
 /// per transport generation that needs it.
 #[inline(never)]
 fn read_knob() -> u32 {
-    let v = crate::diag::read_config_dword(crate::diag::knobs::KMD_RM_CLIENT, 0).min(4);
+    let v = crate::diag::read_config_dword(crate::diag::knobs::KMD_RM_CLIENT, 0)
+        .min(helios_kmd_logic::rm_sysmem::LEVEL);
     KNOB_LEVEL.store(v, Ordering::Relaxed);
     // Nothing is written for the default (off): the registry stays as it was.
     if v != 0 {
@@ -211,6 +229,12 @@ fn read_knob() -> u32 {
 pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     let level = knob_level();
     if level == 0 {
+        return;
+    }
+    // Level 5 has no ring and no client steps on the worker (its service runs on the
+    // creator's thread); the worker only flips what the screen shows.
+    if level >= helios_kmd_logic::rm_sysmem::LEVEL {
+        sysmem_flip::service(passive, adapter);
         return;
     }
     // No transport: nothing to do, and `retire_transport` already forgot the client.
@@ -447,6 +471,7 @@ pub(crate) fn forget() {
     VIEW_LEASED.store(0, Ordering::Release);
     unmap_views(&views);
     rm_present::reset();
+    sysmem::forget();
     // The next transport generation reads the knob again (once).
     KNOB_LEVEL.store(KNOB_UNREAD, Ordering::Relaxed);
 }

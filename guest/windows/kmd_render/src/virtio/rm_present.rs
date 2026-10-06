@@ -224,6 +224,26 @@ pub(crate) fn wake_at() -> u64 {
     WAKE_AT.load(Ordering::Acquire)
 }
 
+/// Level 5 (`rm_client::sysmem_flip`) shares the edges and the worker's timed wake with the
+/// presenter above (the two never run in the same generation): take the frame and resume
+/// edges raised since the last look, `(frame, resume)`.
+pub(crate) fn take_edges() -> (bool, bool) {
+    (
+        FRAME_EDGE.swap(0, Ordering::AcqRel) != 0,
+        RESUME_EDGE.swap(0, Ordering::AcqRel) != 0,
+    )
+}
+
+/// Ask the worker to wake at `at` (100 ns, absolute) for a paced flip.
+pub(crate) fn set_wake_at(at: u64) {
+    WAKE_AT.store(at, Ordering::Release);
+}
+
+/// Forget a wake nobody is owed any more.
+pub(crate) fn clear_wake_at() {
+    WAKE_AT.store(0, Ordering::Release);
+}
+
 /// Forget the presenter (the transport generation ended, or is being retired). The
 /// kernel views are the client's to unmap; this holds none.
 pub(crate) fn reset() {
