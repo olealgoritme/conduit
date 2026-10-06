@@ -24,6 +24,15 @@
 //! [`super::rm_client::service`], and only at level 3 with a complete ring. At any
 //! other level, and with the knob at 0, nothing here runs.
 //!
+//! REUSE OF A SURFACE. The surface written is the one not flipped last. With the host's
+//! buffer-release event acked (`virtio/scanout_release.rs`, `docs/foreign-scanout.md`
+//! "Buffer release") it is also written only after the host RELEASED its last flip: the
+//! flip's `seq` is noted per surface ([`LAST_FLIP_SEQ`] -> `Presenter::note_seq`), the
+//! book answers whether it is done before every frame, a frame that has to wait is held
+//! (`Act::WaitUntil`; the DPC wakes this worker when the release arrives) for at most
+//! 500 ms, and the wait and its timeouts are counted (`RelRWaits`, `RelRTimeouts`).
+//! Without the event this is the old rotation, unchanged.
+//!
 //! LOCKING. `PRESENTER` is a leaf spinlock over plain data, never held across I/O or
 //! another lock. The surface views belong to `rm_client::CLIENT`; the copy takes a
 //! LEASE on a slot (under that lock) and holds no lock while it copies: the retire
@@ -37,6 +46,7 @@
 use super::foreign_scanout::{present_within, PresentRefusal};
 use super::gpu::{DeviceOwner, OwnerFilter};
 use super::rm_client::{self, end_lease, lease_slot};
+use super::scanout_release::{self, REL_RING_TIMEOUTS, REL_RING_WAITS};
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
@@ -96,6 +106,10 @@ static RESUME_EDGE: AtomicU32 = AtomicU32::new(0);
 static WAKE_AT: AtomicU64 = AtomicU64::new(0);
 /// Consecutive yielded flips.
 static YIELDS: AtomicU32 = AtomicU32::new(0);
+/// The `seq` of the last flip the host took (`judge`), 0 when the last act sent none: the
+/// presenter runs on one thread (the HPD worker), so a cell is all it needs to hand the
+/// number from the flip to `finish_flip`.
+static LAST_FLIP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // Counters, mirrored by `publish_counters` (names at most 14 characters). `RmPStage` is
 // the stage the presenter started last, written BEFORE it runs (readable by symbol
@@ -156,6 +170,9 @@ pub(crate) fn publish_counters() {
     rec(b"RmCopyMaxMs", RM_COPY_MAX_MS.load(Ordering::Relaxed));
     rec(b"RmCopyMB", RM_COPY_MB.load(Ordering::Relaxed));
     rec(b"RmSrcWhy", RM_SRC_WHY.load(Ordering::Relaxed));
+    // The ring's waits for the host's buffer releases (`RelRWaits`, `RelRTimeouts`) and
+    // the rest of the release counters, on the same cadence as the presenter's.
+    scanout_release::publish_counters();
 }
 
 /// Whether this generation's giving up has been counted (`RmGaveUp`).
@@ -317,6 +334,15 @@ pub(crate) fn service(
             crate::diag::record_named_bytes(b"RmSrcWhy", why);
         }
         let (has_resident, foreground) = adapter.foreign_scanout_resident_state();
+        // With the host's release events: has the host released the surface the next frame
+        // would be written into? (Not asked when nothing would wait: the lock is not taken.)
+        let release_tracked = scanout_release::tracking();
+        let back_released = !release_tracked
+            || PRESENTER
+                .lock()
+                .p
+                .back_wait_seq()
+                .map_or(true, |seq| scanout_release::is_done(seq, now));
         let inputs = Inputs {
             now,
             ring_ready,
@@ -325,6 +351,8 @@ pub(crate) fn service(
             foreground,
             frame_edge,
             resume_edge,
+            release_tracked,
+            back_released,
         };
         // Folded into the presenter now; a second act of this pass sees none.
         frame_edge = false;
@@ -338,7 +366,17 @@ pub(crate) fn service(
             let act = g.p.decide(inputs);
             let g_word = word(&g.p);
             let gave_up = g.p.gave_up();
+            // A frame held back for a release (once per episode) / let go ahead after
+            // its limit, counted.
+            let wait_began = g.p.take_wait_started();
+            let wait_overruled = g.p.take_wait_timeout();
             drop(g);
+            if wait_began {
+                REL_RING_WAITS.fetch_add(1, Ordering::Relaxed);
+            }
+            if wait_overruled {
+                REL_RING_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            }
             if gave_up && !GAVE_UP_COUNTED.swap(true, Ordering::Relaxed) {
                 RM_GAVE_UP.fetch_add(1, Ordering::Relaxed);
                 crate::diag::record_named_bytes(b"RmGaveUp", RM_GAVE_UP.load(Ordering::Relaxed));
@@ -368,6 +406,7 @@ pub(crate) fn service(
                 return;
             }
             Act::CopyFlip { slot } => {
+                LAST_FLIP_SEQ.store(0, Ordering::Relaxed);
                 let result = match source {
                     Ok((src, resid)) => copy_flip(passive, adapter, epoch, want, slot, &src, resid),
                     // The source went away between the verdict above and now.
@@ -385,6 +424,7 @@ pub(crate) fn service(
                 }
             }
             Act::Reflip { slot } => {
+                LAST_FLIP_SEQ.store(0, Ordering::Relaxed);
                 let result = reflip(passive, adapter, epoch, want, slot);
                 finish_flip(epoch, slot, false, result);
                 if result != FlipResult::Shown {
@@ -450,6 +490,11 @@ fn finish_flip(epoch: u64, slot: u8, copied: bool, result: FlipResult) {
         let first = g.p.front().is_none();
         if g.epoch == epoch {
             g.p.flipped(slot, copied, result, now);
+            // The host took the flip: the surface's release has to cover this seq before it
+            // is written again. (0 for a flip that was not shown.)
+            if result == FlipResult::Shown {
+                g.p.note_seq(slot, LAST_FLIP_SEQ.load(Ordering::Relaxed));
+            }
         }
         let w = word(&g.p);
         (first, w)
@@ -495,7 +540,10 @@ fn finish_flip(epoch: u64, slot: u8, copied: bool, result: FlipResult) {
 /// How a `present` ended, for the presenter.
 fn judge(r: Result<u64, PresentRefusal>) -> FlipResult {
     match r {
-        Ok(_) => FlipResult::Shown,
+        Ok(seq) => {
+            LAST_FLIP_SEQ.store(seq, Ordering::Relaxed);
+            FlipResult::Shown
+        }
         // Another source holds scanout 0, or ours lapsed with the generation: not ours
         // to show now.
         Err(PresentRefusal::NoSource) => FlipResult::Yielded,

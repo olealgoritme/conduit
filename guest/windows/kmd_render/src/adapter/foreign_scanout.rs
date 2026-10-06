@@ -175,6 +175,8 @@ pub(crate) fn publish_counters() {
         crate::virtio::nvrm::FENCE_CLOSE_ERRORS.load(Ordering::Relaxed),
     );
     crate::virtio::gpu::publish_rm_gate_counters();
+    // The host's buffer releases (`Rel*`), written only on a boot that had them on.
+    crate::virtio::scanout_release::publish_counters();
 }
 
 impl AdapterContext {
@@ -321,6 +323,9 @@ impl AdapterContext {
 
     /// Device teardown (`DestroyDevice`, `StopDevice`): the owner is gone.
     pub(crate) fn foreign_scanout_release_owner(&self, owner: DeviceOwner) {
+        // The device is gone: nothing of its flips is waited for, and the host sends no
+        // release for the buffers of the files it closed.
+        crate::virtio::scanout_release::forget_owner(owner.raw());
         let (ended, was_resident) = {
             let mut g = STATE.lock();
             let was = g.resident_foreground();
@@ -334,6 +339,8 @@ impl AdapterContext {
 
     /// The owner closed `handle` (a successful forwarded `Close`).
     pub(crate) fn foreign_scanout_release_handle(&self, owner: DeviceOwner, handle: u32) {
+        // The file is closed: the host forgets its buffers with no release event.
+        crate::virtio::scanout_release::forget_handle(handle);
         let (ended, was_resident) = {
             let mut g = STATE.lock();
             let was = g.resident_foreground();
@@ -372,6 +379,10 @@ impl AdapterContext {
         // closed by the transport sweep.
         let dropped = FENCES.lock().clear();
         FS_FENCE_DROPPED.fetch_add(dropped, Ordering::Relaxed);
+        // The flips the host's release events would have retired: gone with the
+        // generation, and so is the tracking (`StartDevice` turns it on again if the new
+        // transport acked the feature).
+        crate::virtio::scanout_release::reset();
     }
 
     /// Whether a FORWARDed `ScanoutFlip` from `owner` must be refused because
@@ -408,6 +419,8 @@ impl AdapterContext {
             .unwrap_or(false)
         });
         if !valid {
+            // Its file is no longer the owner's (closed, or another generation).
+            crate::virtio::scanout_release::forget_handle(src.handle);
             if STATE.lock().invalidate(src.generation) {
                 self.count_end(src.resident);
                 self.foreign_scanout_restore_desktop();
@@ -629,6 +642,13 @@ impl AdapterContext {
                 };
                 FS_FENCE_SKIPPED.fetch_add(drained.skipped, Ordering::Relaxed);
                 FS_FENCE_DROPPED.fetch_add(drained.dropped, Ordering::Relaxed);
+                // Those flips never reach the host: its release event will never name
+                // them, so they are done now (a client waiting for one is woken).
+                for &seq in drained.gone_seqs() {
+                    if let Some(owner) = crate::virtio::scanout_release::gone(seq) {
+                        crate::virtio::scanout_release::wake(self, owner);
+                    }
+                }
                 let Some(entry) = drained.send else {
                     break;
                 };
