@@ -14,6 +14,7 @@
 #   MESA_BASE     Mesa commit the series applies to (default below)
 #   MESON         meson binary (>= 1.7 for Mesa's Rust; default: meson in PATH)
 #   MESON_ARGS    extra `meson setup` arguments for Mesa
+#   VIDEO_CODECS  Mesa -Dvideo-codecs (default h264dec; empty for none)
 #   MESA_CLC_DIR  directory holding native mesa_clc and vtn_bindgen2 (NVK's
 #                 OpenCL kernels are compiled on the build machine). Default:
 #                 built from MESA_DIR into BUILD_DIR-host (needs the LLVM/clang
@@ -132,16 +133,19 @@ cd "$MESA_DIR"
 # debugoptimized for debugging.
 BUILDTYPE=${BUILDTYPE:-release}
 if [ "$BUILDTYPE" = release ]; then NDEBUG=true; else NDEBUG=false; fi
+# H.264 decode for patch 35 (NVDEC; off at runtime unless NVK_EXPERIMENTAL=video)
+VIDEO_CODECS=${VIDEO_CODECS-h264dec}
 if [ -f "$BUILD_DIR/build.ninja" ]; then
   # Build directories from older versions of this script were debugoptimized
-  "$MESON" configure "$BUILD_DIR" -Dbuildtype="$BUILDTYPE" -Db_ndebug="$NDEBUG"
+  "$MESON" configure "$BUILD_DIR" -Dbuildtype="$BUILDTYPE" -Db_ndebug="$NDEBUG" \
+    -Dvideo-codecs="$VIDEO_CODECS"
 else
   # shellcheck disable=SC2086
   "$MESON" setup "$BUILD_DIR" --cross-file "$cross" \
     -Dvulkan-drivers=nouveau -Dnvk-rm=enabled -Dgallium-drivers= \
     -Dplatforms=windows -Dllvm=disabled \
     -Dmesa-clc=system -Dprecomp-compiler=system \
-    -Dvideo-codecs= -Dvulkan-layers= \
+    -Dvideo-codecs="$VIDEO_CODECS" -Dvulkan-layers= \
     -Degl=disabled -Dgbm=disabled -Dglx=disabled -Dopengl=false \
     -Dgles1=disabled -Dgles2=disabled \
     -Dshader-cache=enabled -Dzlib=disabled -Dzstd=disabled -Dexpat=disabled \
