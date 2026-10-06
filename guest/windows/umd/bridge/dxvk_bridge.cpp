@@ -462,7 +462,7 @@ namespace {
 
 // ---- Cross-process hand-off ledger (docs/shared-surfaces.md section 4) -----
 //
-// One shared table per Windows session ("Local\\HeliosHandoffLedger4"), used by
+// One shared table per Windows session ("Local\\HeliosHandoffLedger5"), used by
 // every process with the Helios UMD. At a hand-off (a flush of a device that
 // holds cross-process shared resources) the releaser writes, for each of those
 // resources keyed by its KMD resource id, "device record d (generation g),
@@ -482,7 +482,7 @@ namespace {
 // gone. Slots and records whose processes died are swept when the table runs
 // low. Counters in the header: slots and records in use, fallbacks, sweeps.
 namespace helios_handoff {
-  constexpr std::uint32_t kMagic   = 0x344C4448u; // 'HDL4'
+  constexpr std::uint32_t kMagic   = 0x354C4448u; // 'HDL5'
   constexpr std::uint32_t kDevices = 4096u;
   constexpr std::uint32_t kSlots   = 32768u;
   constexpr std::uint32_t kProbe   = 64u;
@@ -493,10 +493,18 @@ namespace helios_handoff {
   constexpr std::uint64_t kPointMask = (1ull << 40) - 1ull;
   constexpr std::uint32_t kGenMask = 0xFFFu;
 
+  constexpr std::uint32_t kRecent = 12u; // published points kept per device
   struct Device {
     std::atomic<std::uint32_t> pid;
     std::atomic<std::uint32_t> gen;
     std::atomic<std::uint64_t> completed;
+    // The device's last kRecent published points (ring, written by its one
+    // publisher): a reader whose bound is below the device's latest point
+    // needs the latest one before its bound (sample_before), which the slot
+    // (latest point only) no longer has.
+    std::atomic<std::uint64_t> recent[kRecent];
+    std::atomic<std::uint32_t> recent_head;
+    std::uint32_t reserved;
   };
   struct Slot {
     std::atomic<std::uint32_t> key;
@@ -520,7 +528,7 @@ namespace helios_handoff {
     Device devices[kDevices];
     Slot slots[kSlots];
   };
-  static_assert(sizeof(Device) == 16 && sizeof(Slot) == 64, "ledger layout");
+  static_assert(sizeof(Device) == 16 + 8 * kRecent + 8 && sizeof(Slot) == 64, "ledger layout");
   static_assert(sizeof(Table) == 40 + sizeof(Device) * kDevices + sizeof(Slot) * kSlots, "ledger header");
 
   inline std::uint64_t pack(std::uint32_t dev, std::uint32_t gen, std::uint64_t point) {
@@ -537,7 +545,7 @@ namespace helios_handoff {
         sa.lpSecurityDescriptor = sd;
       SetLastError(0);
       HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, sa.lpSecurityDescriptor ? &sa : nullptr,
-        PAGE_READWRITE, 0, DWORD(sizeof(Table)), L"Local\\HeliosHandoffLedger4");
+        PAGE_READWRITE, 0, DWORD(sizeof(Table)), L"Local\\HeliosHandoffLedger5");
       const DWORD create_error = GetLastError();
       if (sd)
         LocalFree(sd);
@@ -656,6 +664,9 @@ namespace helios_handoff {
       Device& dev = t->devices[d];
       const std::uint32_t gen = dev.gen.fetch_add(1, std::memory_order_acq_rel) + 1;
       dev.completed.store(0, std::memory_order_release);
+      for (auto& r : dev.recent)
+        r.store(0, std::memory_order_relaxed);
+      dev.recent_head.store(0, std::memory_order_release);
       *gen_out = gen;
       t->records_in_use.fetch_add(1);
       return d;
@@ -945,9 +956,43 @@ namespace helios_handoff {
     }
     std::uint64_t all[kEntries];
     const std::uint32_t n = sample_all(key, all, kEntries);
+    Table* t = table();
     std::uint32_t kept = 0;
     for (std::uint32_t i = 0; i < n; i++) {
-      if ((all[i] & kPointMask) < bound) {
+      bool from_history = false;
+      if ((all[i] & kPointMask) >= bound && t) {
+        // The device's latest point is too new for this work; its latest
+        // point before our bound, from its history, is the dependency.
+        const std::uint32_t d = std::uint32_t(all[i] >> 52);
+        const Device& dev = t->devices[d];
+        std::uint64_t best = 0, oldest = kPointMask;
+        std::uint32_t filled = 0;
+        for (const auto& r : dev.recent) {
+          const std::uint64_t v = r.load(std::memory_order_acquire);
+          if (!v)
+            continue;
+          filled++;
+          if (v < oldest)
+            oldest = v;
+          if (v < bound && v > best)
+            best = v;
+        }
+        if (!best && filled == kRecent) {
+          // History too short (more than kRecent points of that device since
+          // our bound): wait for its oldest known one, conservative.
+          best = oldest;
+          trace_line("handoff trace: key %u: record %u history too short for bound %llu, waits for %llu", key, d,
+                     static_cast<unsigned long long>(bound), static_cast<unsigned long long>(best));
+        }
+        if (!best || dev.completed.load(std::memory_order_acquire) >= best) {
+          trace_line("handoff trace: key %u: record %u has nothing pending before our next point %llu", key, d,
+                     static_cast<unsigned long long>(bound));
+          continue;
+        }
+        all[i] = (all[i] & ~kPointMask) | best;
+        from_history = true;
+      }
+      if (from_history || (all[i] & kPointMask) < bound) {
         trace_line("handoff trace: device %p key %u waits for point %llu of record %u (bound %llu)", device, key,
                    static_cast<unsigned long long>(all[i] & kPointMask), unsigned(all[i] >> 52),
                    static_cast<unsigned long long>(bound));
@@ -1116,6 +1161,11 @@ std::int32_t HeliosDxvkDevice::handoff_publish(const std::size_t* resources,
     // Pending from before anyone can see it until the CS thread reaches its
     // signal (sample_before).
     helios_handoff::pending_push(impl->device.ptr(), point);
+    {
+      auto& rec = table->devices[impl->handoff_device];
+      const std::uint32_t h = rec.recent_head.fetch_add(1, std::memory_order_relaxed);
+      rec.recent[h % helios_handoff::kRecent].store(point, std::memory_order_release);
+    }
     const std::uint64_t packed = helios_handoff::pack(impl->handoff_device, impl->handoff_gen, point);
     std::uint32_t published = 0;
     bool overflow = false;

@@ -9,17 +9,22 @@ points that were published after this device's own next hand-off point, i.e.
 after the work being recorded was issued, so that work cannot depend on
 them. Waiting for such a point closes a cycle: the other process's
 submission that signals it waits for our point, which rides a later
-submission of ours that our worker never reaches. Only the two-second wait
-cap broke it (keyed-load perf mode: two seconds per round, which looked like a
-hang).
+submission of ours that our worker never reaches.
 
 - HeliosHandoffHooks::sampleBefore (appended): as sampleAll, given the
-  DxvkDevice, so the UMD returns only points published before the device's
-  next own point its CS thread has not reached. Points are a ledger-wide
-  sequence, so they compare across devices.
+  DxvkDevice, so the UMD returns, per publishing device, its latest point
+  published before the device's next own point its CS thread has not
+  reached. Points are a ledger-wide sequence, so they compare across devices.
 - HeliosHandoffHooks::csReached (appended) and
   D3D11ImmediateContext::HeliosSignalHandoffPoint: the CS thread reports
   reaching the signal of an own hand-off point.
+- DxvkFence's event queue is smallest value first. run() fires "all enqueued
+  events whose value is not greater than the current value" from the top of
+  the queue; largest first, every event waited for the largest enqueued
+  value, so with several hand-off points in flight a point was reported
+  complete only when the newest one completed (a traced keyed-load run:
+  points 3..21 all reported at the end, in reverse order), and the reader in
+  the other process waited for it in two-second steps.
 
 diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
 index 22556a5c..3a090686 100644
@@ -100,8 +105,27 @@ index 3d7bfe14..ad4b7ff4 100644
        uint64_t points[4];
        const uint32_t n = hooks->sampleAll(key, points, 4u);
        for (uint32_t i = 0; i < n && i < 4u; i++)
+diff --git a/src/dxvk/dxvk_fence.h b/src/dxvk/dxvk_fence.h
+index 885012db..b4b07329 100644
+--- a/src/dxvk/dxvk_fence.h
++++ b/src/dxvk/dxvk_fence.h
+@@ -165,7 +165,13 @@ namespace dxvk {
+     D3DKMT_HANDLE                   m_kmtLocal = 0;
+     D3DKMT_HANDLE                   m_kmtGlobal = 0;
+ 
+-    std::priority_queue<QueueItem>  m_queue;
++    // Helios: smallest value first. run() signals "all enqueued events whose
++    // value is not greater than the current semaphore value" from the top;
++    // with the default (largest first) an event waited until the largest
++    // enqueued value was reached, so with several values in flight every
++    // earlier event fired late (the hand-off ledger's completed points
++    // trailed by whole frames).
++    std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> m_queue;
+     bool                            m_running    = false;
+ 
+     dxvk::mutex                     m_mutex;
 diff --git a/src/dxvk/dxvk_helios_backend.h b/src/dxvk/dxvk_helios_backend.h
-index dc685cda..58a75714 100644
+index cda39909..a574ac6b 100644
 --- a/src/dxvk/dxvk_helios_backend.h
 +++ b/src/dxvk/dxvk_helios_backend.h
 @@ -72,6 +72,17 @@ namespace dxvk {

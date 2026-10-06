@@ -173,7 +173,7 @@ never drained) with user-mode state only; its cost is the reader's submission-wo
 the read needs anyway. A GPU-side wait can replace the CPU wait in the reader's submission worker
 later without changing the ledger.
 
-Per-device entries (ledger v3, now v4 `Local\\HeliosHandoffLedger4`): a slot keeps one point per
+Per-device entries (ledger v3, now v5 `Local\\HeliosHandoffLedger5`): a slot keeps one point per
 publishing device (four entries; an entry is reused once its point completed or its record moved
 on). With a single "last publisher" point (442d2c2) the reader's own publication could replace the
 releaser's before the reader sampled it, so it waited for nothing: keyed-load stale on 319.2 in
@@ -200,6 +200,15 @@ point was published, so a later foreign point is no dependency; waiting for it c
 when the CS thread lagged (each process's submission waiting for the other's later point, broken
 only by the two-second cap: keyed-load perf mode on 323.1 took two seconds per round). Waits that
 reach the cap are logged ("still pending after").
+
+Ledger v5 (traced keyed-load run on 326.1): (1) a reader whose bound is below the other device's
+latest point skipped it and then waited for nothing, although that device's previous point was
+the dependency; each device record now keeps its last 12 published points, and the reader waits
+for the latest one before its bound (if more than 12 were published since, for the oldest known,
+conservatively). (2) DxvkFence fired its completion events largest value first, so a point was
+reported complete only when the device's newest point completed (points 3..21 all at the end, in
+reverse order) and the other process waited in two-second steps; its queue is smallest first now
+(DXVK 0011).
 
 Any access waits (DXVK patch 0008): the ledger is sampled where DXVK tracks every resource
 access, at the first tracking of a shared image in a submission, so render targets, clears, UAV
