@@ -96,6 +96,7 @@ is the next step. Nine more Mesa patches on top of the 13 above, in `patches-win
 | 20 | `nvk: Win32 WSI` | `VK_KHR_win32_surface` + swapchain through Mesa's win32 WSI, as a software device (CPU copy per present) |
 | 21 | `nvk/rm, wsi: Win32 zero-copy present by Helios scanout` | swapchain images in VRAM, imported once on a host render node as GEM objects and shown with ScanoutFlip (see "Zero-copy present on Windows" below); GDI stays the fallback |
 | 22 | `nvk/rm: host-visible VRAM (a BAR heap)` | a DEVICE_LOCAL \| HOST_VISIBLE \| HOST_COHERENT type on a heap of its own, backed by vidmem mapped once through BAR1 (see "Host-visible VRAM" below). Generic RM code, Linux too |
+| 26 | `util/disk_cache: multi-file shader cache on Windows` | Mesa's disk cache had no Windows code (`-Dshader-cache` was refused): the multi-file cache through Win32 calls, in `%LOCALAPPDATA%\mesa_shader_cache` (see "Shader cache on Windows" below). 23-25 are other branches' |
 
 Linux behaviour is unchanged: the full series (20 patches) builds the Linux
 NVK (nouveau + RM) as before, with the same `.so` exports; the patches apply
@@ -119,7 +120,7 @@ meson setup build-win --cross-file guest/nvk-rm/windows/mingw-x86_64.ini \
     -Dvulkan-drivers=nouveau -Dnvk-rm=enabled -Dgallium-drivers= \
     -Dplatforms=windows -Dllvm=disabled -Dmesa-clc=system -Dprecomp-compiler=system \
     -Dvideo-codecs= -Dvulkan-layers= -Degl=disabled -Dgbm=disabled -Dglx=disabled \
-    -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dshader-cache=disabled \
+    -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dshader-cache=enabled \
     -Dzlib=disabled -Dzstd=disabled -Dexpat=disabled -Dxmlconfig=disabled \
     -Dperfetto=false -Dbuild-tests=false -Dbuildtype=debugoptimized
 ```
@@ -470,6 +471,89 @@ The GPU was busy all the time either way, but at higher power: it was
 stalled on PCIe reads of DXVK's dynamic buffers in system memory, not
 computing. (The "off" rows are faster than the 62 fps in the table above
 because KMD 22.22.309/310 and the backend got faster in between.)
+
+### Shader cache on Windows (patch 26, 2026-10-06, `win11`, KMD 22.22.311.0)
+
+What was off, and why:
+
+- **NVK's disk shader cache.** Mesa has no Windows disk cache:
+  `disk_cache_os.c` is a `TODO` there, and meson refuses
+  `-Dshader-cache` on Windows. `build-windows.sh` also passed
+  `-Dshader-cache=disabled`. So `pdev->vk.disk_cache` was never created
+  and NVK compiled every shader again in every process. NVK itself was
+  ready: `vk_pipeline_cache` falls back to the physical device's disk cache,
+  and patch 17's build id (Mesa version + DLL timestamp) keys it.
+- **DXVK's state cache** does not exist any more. DXVK 3.0.2 (the fork)
+  has no `dxvk.state` / `DXVK_STATE_CACHE_PATH` and no `VkPipelineCache` of
+  its own. Persistence is the driver's job, which is NVK's disk cache.
+- **Graphics pipeline libraries were already on.** NVK exposes
+  `VK_EXT_graphics_pipeline_library` with
+  `graphicsPipelineLibraryIndependentInterpolationDecoration`, so
+  `dxvk.enableGraphicsPipelineLibrary = Auto` turns them on.
+  `Heaven_d3d11.log` says "Graphics pipeline libraries supported" and
+  lists the extension as enabled.
+
+Patch 26 implements Mesa's multi-file cache (the default type) for Windows
+and enables it in `build-windows.sh`:
+
+- Location: `MESA_SHADER_CACHE_DIR`, else `%LOCALAPPDATA%`, else `%TEMP%`,
+  plus `\mesa_shader_cache`. That is per user and writable without setup.
+  `MESA_SHADER_CACHE_DISABLE=1` turns it off.
+- The index is a file mapping shared by all processes, like the
+  `MAP_SHARED` mmap on Linux.
+- A new entry is written to a `.tmp` file opened with no sharing. That
+  plays the part of the `flock`. The file is renamed to its final name while
+  still open (`FileRenameInfo`, never replacing), so no reader sees half an
+  entry.
+- Eviction deletes the least recently used tenth of a random subdirectory
+  (the 1 GiB default size limit).
+- Entries are stored uncompressed: the MinGW build has neither zlib nor
+  zstd. Heaven needs 5.3 MB for 635 entries.
+
+The single-file and database caches stay unimplemented on Windows. Other
+Windows builds (MSVC, dozen) are unchanged: the option is auto-disabled
+there, not refused.
+
+Measured with `windows/heaven-cache-run.ps1` (next to `run-heaven-nvk.bat`). It
+launches Heaven, records 45 s from launch with the shim frame log, then
+kills Heaven by PID. The setup is the same as above (1600x900 Medium,
+tessellation normal, GDI present, BAR heap) on a **release** build
+(`-Dbuildtype=release -Db_ndebug=true`, NAK at opt-level 3). "Cold" deletes
+the cache first; "warm" is the next launch. "Scene" is counted from the end
+of Heaven's ~3.6 s loading screen, which every run has.
+
+| run | launch -> first present | first 30 s from launch: fps / p99 | first 10 s of the scene: p99 / worst frame | time lost in frames > 40 ms, first 10 s | new cache entries |
+|---|---|---|---|---|---|
+| cold 1 | 0.73 s | 241 / 6.6 ms | 23.6 / 837 ms | 1037 ms | 635 |
+| cold 2 | 0.62 s | 232 / 6.5 ms | 16.8 / 715 ms | 941 ms | 635 |
+| warm 1 | 0.61 s | 248 / 5.2 ms | 16.0 / 576 ms | 817 ms | 0 |
+| warm 2 | 0.61 s | 234 / 7.3 ms | 22.1 / 603 ms | 1588 ms* | 0 |
+| cold, GPL off | 0.62 s | 237 / 6.5 ms | 17.3 / 1105 ms | 1335 ms | 403 |
+| warm, GPL off | 0.62 s | 241 / 5.2 ms | 19.5 / 638 ms | 942 ms | 0 |
+
+\* includes two 350 ms hitches at 6.8 s and 7.5 s. Hitches like these
+show up at random in cold and warm runs alike (also at 14-21 s in other
+runs), so they are not compiles.
+
+- The cache works: a warm run writes nothing new, so every NVK compile is a
+  hit.
+- With GPL on, Heaven's start-up stutter is one long frame ~0.4 s into the
+  scene, plus a few 40-120 ms frames in the first 1.5 s. The cache shortens
+  the long frame from 715-837 ms to 576-603 ms. Without GPL it is 1105 ms
+  cold and 638 ms warm. So NVK compiles cost ~150-250 ms of it with GPL
+  and ~470 ms without. The remaining ~600 ms is not NVK compiling, since it
+  happens on full cache hits. DXVK's own DXBC translation, which is not
+  cached anywhere, or resource creation are the next suspects.
+- Time to steady fps is the same cold and warm, about 1.5 s into the scene
+  (~5.7 s after launch). From the first 5 s bucket on, both follow the same
+  camera-path fps within 5% (cold 158 208 275 365 381, warm 171 215 282 374
+  383). The last 10 s of each 45 s run reach 284-311 fps.
+- An earlier set on KMD 310, with other agents' tests running, had 1-4.6 s
+  to the first present cold and 0.6-1.1 s warm. On 311 with an idle GPU, it
+  is 0.6-0.7 s either way. On a release build, the missing cache was not
+  what made launches "slow for many seconds". The debugoptimized build
+  (asserts on, NAK debug assertions) compiles more slowly; it was not
+  measured here.
 
 ## Running (in a guest)
 
