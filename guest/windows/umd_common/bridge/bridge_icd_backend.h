@@ -38,6 +38,11 @@
 // wins over HELIOS_ICD), `Nvk12` (REG_DWORD, 0 = D3D12 on Venus everywhere)
 // and `NvkDenyList12` (REG_SZ, executables whose D3D12 stays on Venus -- titles
 // that need ray tracing above all: NVK has no DXR and reports none).
+// D3D12 ignores `Icd` (2026-10-06): `Icd=venus` is the D3D11 transition default
+// that keeps DWM on Venus, but vkd3d on Venus lacks
+// VK_EXT_device_generated_commands and stops at FL11_0, so D3D12 runs on NVK
+// (FL12_0, SM 6.8, no DXR) unless HELIOS_ICD12 / HELIOS_ICD say venus, Nvk12=0,
+// NvkDenyList12 or the deny-list (step 3) names the process, or NVK fails.
 //
 // After that the device create can still fall back: the DLL does not load, it
 // lacks `helios_icd_interface_v2`, NVK enumerates no GPU, or the DXVK device

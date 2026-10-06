@@ -309,6 +309,13 @@ IcdBackendChoice decide() {
   }
 
   if (!force_nvk) {
+#if !defined(HELIOS_ICD_BACKEND_D3D12)
+    // D3D11 only. `Icd=venus` is the transition default that keeps DWM and the
+    // D3D11 desktop on Venus; it does not reach D3D12: vkd3d on Venus has no
+    // VK_EXT_device_generated_commands, so it stops at FL11_0 and every title
+    // that needs FL12 fails there, while NVK serves FL12_0 / SM 6.8. D3D12 goes
+    // to NVK unless HELIOS_ICD(12)=venus, Nvk12=0, NvkDenyList12 or the
+    // deny-list below says otherwise, or NVK fails (2026-10-06).
     char mode[16];
     if (reg_sz("Icd", mode, sizeof(mode))) {
       lower_ascii(mode);
@@ -317,6 +324,7 @@ IcdBackendChoice decide() {
         return c;
       }
     }
+#endif
     const char* why = nullptr;
     if (denied(c.exe, &why)) {
       c.reason = why;
@@ -329,8 +337,13 @@ IcdBackendChoice decide() {
     return c;
   }
   c.backend = IcdBackend::NvkRm;
-  if (!c.reason)
+  if (!c.reason) {
+#if defined(HELIOS_ICD_BACKEND_D3D12)
+    c.reason = force_nvk ? "HELIOS_ICD=nvk" : "D3D12 default NVK (Icd does not apply), not denied";
+#else
     c.reason = force_nvk ? "HELIOS_ICD=nvk" : "global NVK, not denied";
+#endif
+  }
   return c;
 }
 
