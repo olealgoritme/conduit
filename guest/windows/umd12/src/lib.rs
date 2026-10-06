@@ -89,6 +89,7 @@ mod bridge12;
 mod caps12;
 mod ddi12;
 mod device12;
+mod device_loss12;
 mod forward12;
 mod knobs12;
 mod probe12;

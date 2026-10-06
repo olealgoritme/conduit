@@ -307,6 +307,10 @@ fn build_vkd3d_bridge() {
         // plus the D3D12-only levers under HELIOS_ICD_BACKEND_D3D12) and the NVK
         // ICD loader. The same source `umd/build.rs` compiles.
         .file("../umd_common/bridge/bridge_icd_backend.cpp")
+        // The KMD-view loss table shared with the Venus ICD, librmclient and
+        // the D3D11 UMD (helios_kmdmap.h): device removal after the KMD goes
+        // away under the process (src/device_loss12.rs).
+        .file("../umd_common/bridge/bridge_kmdmap.cpp")
         .define("HELIOS_ICD_BACKEND_D3D12", None)
         .compiler(&clang_cl)
         .archiver(&archiver)

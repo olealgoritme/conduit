@@ -201,6 +201,14 @@ unsafe extern "system" fn present(
         }
     }
 
+    // A lost device presents nothing: report the removal (pfnSetErrorCb), so
+    // the app's Present fails with DXGI_ERROR_DEVICE_REMOVED and it recovers,
+    // instead of every frame "succeeding" into a dead device.
+    // SAFETY: the runtime supplies a live queue handle for this call.
+    if unsafe { queue::report_queue_device_removed(h_queue, "Present") } {
+        return;
+    }
+
     // SAFETY: `_In_ CONST` and live for the call when non-null, per the caller.
     let Some(arg) = (unsafe { p_present.as_ref() }) else {
         note_refusal(&L8_REFUSALS.present_bad_arg);
