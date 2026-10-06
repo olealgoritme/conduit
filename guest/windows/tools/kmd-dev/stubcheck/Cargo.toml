@@ -1,0 +1,3 @@
+[workspace]
+members = ["kmd_render","kmd_logic","protocol","stubs/wdk_sys","stubs/wdk_alloc","stubs/wdk_panic","stubs/wdk"]
+resolver = "2"
