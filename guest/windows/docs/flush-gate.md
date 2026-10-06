@@ -78,16 +78,57 @@ stream_boundary`), with none of their side effects.
    dependency, no over-wait on other processes' work), `scanout_boundary_ready` evaluates it, the
    used-ring retirement of the stream's tag or the `nvrm_events` DPC of the RM fence re-evaluates
    the FIFO head.
-3. **Bounded.** A flush gate is rebase-able like a present's boundary: after `WddmHeadMs` (250 ms
-   default) at the head it is rebased onto the conservative wire prefix (`rebase_blocked_head`,
-   counted `WfBReb*`), a dead stream or an RM gate purge discharges it. A bounded early release
-   beats an adapter-wide TDR; a flush whose GPU backlog exceeds 250 ms is released after it, which
-   for a keyed mutex is one stale read, counted. (`WddmHeadMs=0` makes it unbounded.)
+3. **Bounded for the stream and RM-fence flavours only.** HEFL is rebasable (HE12 is not:
+   `rebase_blocked_head` returns false only when the head has an `execution` wait, which HEFL
+   never writes, it does not use the +88 record). A stream or RM-fence gate whose point has not
+   retired after `WddmHeadMs` (250 ms default) at the head is rebased (`rebase_blocked_head`,
+   counted `WfBReb*`): its stream/gate dependency is swapped for the wire prefix AT REBASE TIME
+   (`next_wire_fence` then, `mod.rs` rebase), a dead stream or an RM gate purge discharges it.
+   What the swap means: if the flush's tagged work is already enqueued the prefix covers it and
+   the fence retires when everything enqueued so far has (which can be LONGER than the point
+   itself, across all processes: a deep backlog of another process, DWM's, lengthens it); if
+   the work is not yet enqueued the prefix does not cover it and the fence is released early,
+   one stale read for a keyed mutex, counted. (`WddmHeadMs=0` makes it unbounded.)
+
+   The **wire rung** (`flags = 0`) and **every degraded record** are NOT bounded by the rebase:
+   their dependency is a wire fence, and the wire arm of `take_one_ready_wddm` returns before
+   any rebase (nothing to rebase a wire dependency onto). They wait for real GPU completion of
+   every transport entry enqueued before the Render, across ALL processes, however long it
+   takes; a host that retires nothing is a TDR, as for every submission. The head-of-line cost
+   is therefore the largest on exactly the rung that is the fallback.
 4. **Advisory.** `Render` never fails for the boundary: unknown flags, an incomplete stream tail,
-   a stream that is not this process's or not live, a refused fence, or no private-data room
-   leave the packet on the legacy rule (every transport entry enqueued before `SubmitCommand`,
-   GPU completion included, `dma_gpu_fence` default on) and bump `FlGDeg`. A fence handle in the
-   tail is the KMD's afterwards, attached or not (`take_fence_tail`).
+   a stream that is not this process's or not live, a refused fence, a boundary the buffer
+   replaced with an older record's wait, or no private-data room leave the packet on the wire
+   rung (GPU completion included, `dma_gpu_fence` default on) and bump `FlGDeg`. A fence handle in
+   the tail is the KMD's afterwards, attached or not (`take_fence_tail`), for every record of
+   magic `HEFL` and 48 bytes: a version this KMD does not know is not resolved, but its handle is
+   taken (`FlGVer`; a future layout must keep the tail at +32, or its handle leaks as it would on
+   an older KMD). The one exception is a Render with no live context (no adapter or process to
+   claim the handle for; unreachable from dxgkrnl): nothing is taken there.
+   Ownership is claimed only for a fence of the Render's own process, so a guess about a
+   foreign layout cannot close anything else.
+4a. **The wire rung is stamped, not inherited.** Nothing consumes the Present prefix of the DMA
+   buffer's private data (`PresentSubmissionPrivate::decode` only peeks) and dxgkrnl recycles
+   those buffers. A packet that ends with no boundary of its own (wire rung, degrade, merge
+   error, a boundary the merge did not keep) therefore gets an explicit wire fence written into
+   the record at Render: the last fence of this transport generation, `next_wire_fence - 1`
+   (`flush_gate::wire_floor`; skipped when the generation has issued nothing). Without it a stale
+   `gpu_fence_id` would become the watermark (wait only up to that old id) and a stale live
+   same-stream boundary would select the exact-present-watermark arm (watermark 0: no wire wait).
+   `note_wddm_submission` evaluates the `gpu_completion_fence` arm first and the merge keeps the
+   larger id, so the stamp wins over both. Its watermark is "every transport entry enqueued
+   before the Render" (not before `SubmitCommand`): the UMD's flush has reached the transport by
+   then (section 4), later work is not this flush's. A merged boundary that the record kept is
+   not touched (a stream/RM-fence gate keeps watermark 0 and no over-wait). A recycled record of
+   a different handle with a real wait keeps its wait and the new boundary is dropped by the
+   merge: that is detected (`flush_gate::boundary_kept`), the packet is stamped and counted
+   `FlGDeg`.
+4b. **The gate does not move the present-marker calibration.** Its stream resolution
+   (`flush_stream_marker_boundary`) and merges (`merge_flush_boundary`, `merge_flush_fence`) bump
+   none of `PRESENT_STREAM_MARKERS`, `PsMkAhd` / `PsMkAhdHi` / `PsMkCpl` (read against the present
+   path's pipeline depth), `PRESENT_STREAM_REJECTS`, `PrBndDrop`, `PRESENT_MARKER_WRITES` /
+   `PRESENT_MARKER_LAST_*` (also the gate of the private-data diagnostic scan). A flush point is a
+   different producer pattern; the gate has its own counters (section 6).
 5. **No sticky state.** No `bind_execution_stream`, no stash, no scanout refresh.
 6. **Non-blocking.** Nothing waits in `pfnFlush` or in the KMD: the WDDM fence is withheld in the
    FIFO and retired from the completion DPC. dxgkrnl waits only if someone waits on the fence,
@@ -109,11 +150,12 @@ the UMD only marks the flush.
   carries no keyed-mutex bit). `DeviceContext` keeps no per-device allocation state
   (`device.rs:20`). So the **UMD must submit a packet at the flush**; there is nothing for the
   KMD to defer otherwise. That packet is the minimum "marker": a `HEFL` with `flags = 0`.
-* **What the KMD computes for that packet with no further input is the WIRE rung**: at
-  `SubmitCommand` the legacy rule gates the fence on every transport entry enqueued before it
-  (`virtio/gpu/mod.rs:7528`, `next_wire_fence`, GPU completion included). That is exact for
+* **What the KMD computes for that packet with no further input is the WIRE rung**: the fence
+  is gated on every transport entry enqueued before the Render (`next_wire_fence - 1`, stamped
+  into the packet's private record, decision 4a; GPU completion included). That is exact for
   work that already reached the transport, and an over-wait on other processes' work (head of
-  line), so it is a fallback and a first-bring-up rung, not the target.
+  line, and not bounded by the rebase, decision 3), so it is a fallback and a first-bring-up
+  rung, not the target.
 * **What the KMD cannot compute is the not-yet-submitted work.** Flush returns before DXVK's
   submission thread has submitted. Whatever counter the KMD keeps (per-context last fence of
   `enqueue_submit_inner`, the stream's `submitted_value`) is behind it. Two ways to close the gap:
@@ -183,21 +225,29 @@ HeliosFlushGateCmd, 48 bytes (little endian)
 
 | situation | outcome | counted |
 |---|---|---|
-| ring never retires the point (host hang, lost tag) | head blocks; after `WddmHeadMs` rebased onto the wire prefix (itself non-rebasable: a host that retires nothing is a TDR, as for every submission) | `WfBReb`, `WfBRebS` |
+| ring never retires the point (host hang, lost tag), stream / RM-fence flavour | head blocks; after `WddmHeadMs` rebased onto the wire prefix at that moment (itself non-rebasable: a host that retires nothing is a TDR, as for every submission) | `WfBReb`, `WfBRebS` |
+| wire rung or degraded record, GPU backlog long (any process's) | head blocks until every transport entry enqueued before the Render retired; NO rebase (the wire arm returns before it), only the TDR bounds it | `WfBWire` (existing, adapter-wide) |
 | stream unregistered / process exits before the point retires | `discharge_dead_present_stream_waits` clears the wait (watermark 0 with `PresentWmk`), the fence completes: a cancellation, not success | none of its own (the discharge is silent for a Venus stream; `RmGCan` for a gate) |
 | RM fence never fires | host times it out at 5 s (`-ETIMEDOUT`), fire with error retires the point; the 250 ms rebase applies first | `RmGErr`, `WfBReb` |
 | RM gate process exit | gate purge discharges waits that named it | `RmGCan` |
 | device reset / TDR / `StopDevice` | pending FIFO dropped by `preempt_flush`/`abandon_pending_submissions`; dxgkrnl resubmits; the private record is not consumed so the replay re-decodes it: a live point is waited for again, a dead one degrades | existing `ABANDONED_FENCES` |
-| record unusable (unknown flags, incomplete stream, not this process's, dead, no room) | legacy wire rule, fence handle taken and closed | `FlGDeg`, `RmGRef` |
+| record unusable (unknown flags, incomplete stream, not this process's, dead, no room, boundary replaced by a recycled record's wait) | wire rung stamped into the record, fence handle taken and closed | `FlGDeg`, `FlGFlr`, `RmGRef` |
+| `HEFL` of a version this KMD does not know | not resolved; fence handle of the process taken and closed; wire rung stamped | `FlGVer`, `FlGFlr` |
+| recycled private-data prefix of an earlier Present on the context | overwritten for the wire rung (stamp); a kept boundary is unaffected; a stale `blt_token` is not scrubbed (pre-existing, only exact live transactions attach, `can_attach_dependency`) | none |
 | older KMD | silent: nothing gated, handle not taken. Gate on the capability | none |
-| head-of-line cost | every fence of every process waits behind a gated flush's point | `WfBStrm`, `WfBReb` (existing, adapter-wide) |
+| head-of-line cost | every fence of every process waits behind a gated flush: for a stream / RM-fence flavour until its point retires or the 250 ms rebase (which then waits for the wire prefix of that moment, and can be longer than the point when other processes have a deep backlog: DWM); for the wire rung and degraded records until the GPU work of everything enqueued before it retired, unbounded | `WfBStrm`, `WfBReb`, `WfBWire` (existing, adapter-wide) |
 
 ## 6. Counters (published beside the `D12*` set in `record_present_handoff_telemetry`, PASSIVE, on the present edge: a session with no present publishes nothing until one runs)
 
 `FlGRec` valid records, `FlGStrm` stream boundaries carried, `FlGFnc` RM fence boundaries carried,
-`FlGWire` records that retire by the legacy rule, `FlGDeg` records that asked for a boundary or
+`FlGWire` records that retire by the wire rung, `FlGDeg` records that asked for a boundary or
 were malformed and did not get it. `FlGRec = FlGStrm + FlGFnc + FlGWire`; `FlGDeg` overlays.
 Healthy: `FlGDeg = 0` and, on Venus with the producer in place, `FlGWire = 0`.
+`FlGFlr` records stamped with an explicit wire fence (every `FlGWire` record, when the transport
+generation had issued a fence; a gap means a Render with no private-data room or a fresh
+transport). `FlGVer` records of magic `HEFL` and 48 bytes with a version other than 1 (expected
+zero until a newer UMD ships). None of these is a present-marker counter, and the gate moves none
+of those (decision 4b).
 
 ## 7. Locks and IRQL
 
@@ -215,8 +265,13 @@ present.
   is ordered after a packet submitted from `pfnFlush` on the device's `hContext`, and which
   contexts it considers. Check with GPUView/ETW (`DmaPacket` vs `ReleaseKeyedMutex`).
 * The D3D11 UMD half, the resource-less flush point in the DXVK bridge, and NVK's fence creation.
-* That a stale `PresentSubmissionPrivate` prefix in a recycled DMA private buffer cannot gate a
-  flush packet on an old point (pre-existing for every Render-only submission; harmless for a
-  retired point, discharged for a dead stream).
+* That the offset the stamp (and the boundary merge) writes at, the start of the Render's private
+  data, is the offset `SubmitCommand` decodes for the same DMA buffer (the assumption every
+  Present marker already makes, `decode_present_fence`), and that a recycled buffer really
+  presents an earlier Present's prefix there; the stamp makes the wire rung independent of what
+  it holds, the merged-boundary flavours are not scrubbed of a stale `gpu_fence_id` (it only adds
+  a wait up to that old id: it replaces the exact-present-watermark relaxation's watermark 0).
+* The rebase of a stream / RM-fence flush gate behind a deep backlog of another process (DWM):
+  whether the swap to the wire prefix lengthens the wait in practice.
 * Head-of-line cost with DWM among the gated devices (it holds shared surfaces).
 * The `d3d11_share` keyed-load test (400 copies, 20 rounds) on v313 + this change, Venus and NVK.
