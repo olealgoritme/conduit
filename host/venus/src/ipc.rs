@@ -61,6 +61,16 @@ mod op {
     pub const UNREF: u32 = 9;
     pub const CREATE_FENCE: u32 = 10;
     pub const EXPORT_SCANOUT: u32 = 11;
+    /// `{res_id u32, size u64}` and the dma-buf as the request's fd. Sent
+    /// only to a server whose features (below) say it knows the op: a server
+    /// that does not ends the connection on an unknown op.
+    pub const IMPORT_DMABUF: u32 = 12;
+
+    /// `CAPSET_INFO` with this index asks for [`Renderer::features`]: the
+    /// reply's first word is the bits. A server from before features passes
+    /// the index to its renderer, which refuses it (there is one capset), so
+    /// the client reads that as "no features" instead of a protocol error.
+    pub const FEATURES_PROBE: u32 = 0xffff_ffff;
 
     pub const OK: u32 = 0x100;
     pub const ERR: u32 = 0x101;
@@ -427,6 +437,8 @@ pub struct IpcClient {
     replies: Receiver<Reply>,
     shared: Arc<Shared>,
     reader: Option<JoinHandle<()>>,
+    /// The server's [`Renderer::features`], asked once.
+    features: Option<u32>,
 }
 
 impl IpcClient {
@@ -450,7 +462,7 @@ impl IpcClient {
             let (sock, shared) = (sock.clone(), shared.clone());
             std::thread::Builder::new().name("venus-ipc".into()).spawn(move || read_loop(&sock, &shared, tx))?
         };
-        Ok(Self { sock, replies, shared, reader: Some(reader) })
+        Ok(Self { sock, replies, shared, reader: Some(reader), features: None })
     }
 
     /// The renderer went away (closed, crashed, or broke protocol). Outside a
@@ -461,14 +473,22 @@ impl IpcClient {
     }
 
     fn send(&self, kind: u32, body: &[u8]) -> Result<()> {
+        self.send_fd(kind, body, None)
+    }
+
+    fn send_fd(&self, kind: u32, body: &[u8], fd: Option<BorrowedFd<'_>>) -> Result<()> {
         if self.is_disconnected() {
             return Err(Error::Disconnected);
         }
-        send_msg(self.sock.as_fd(), kind, body, None).map_err(|_| Error::Disconnected)
+        send_msg(self.sock.as_fd(), kind, body, fd).map_err(|_| Error::Disconnected)
     }
 
     fn call(&mut self, kind: u32, body: &[u8]) -> Result<Msg> {
-        self.send(kind, body)?;
+        self.call_fd(kind, body, None)
+    }
+
+    fn call_fd(&mut self, kind: u32, body: &[u8], fd: Option<BorrowedFd<'_>>) -> Result<Msg> {
+        self.send_fd(kind, body, fd)?;
         let m = self.replies.recv().map_err(|_| Error::Disconnected)?.map_err(|_| Error::Disconnected)?;
         match m.kind {
             op::OK => Ok(m),
@@ -614,6 +634,29 @@ impl Renderer for IpcClient {
             modifier: r.u64()?,
         })
     }
+
+    /// Asked of the server once ([`op::FEATURES_PROBE`]). A refusal is "no
+    /// features"; a dead server is too, and the next call says it is dead.
+    fn features(&mut self) -> u32 {
+        if let Some(f) = self.features {
+            return f;
+        }
+        let f = match self.call(op::CAPSET_INFO, &W::default().u32(op::FEATURES_PROBE).0) {
+            Ok(m) => R(&m.body).u32().unwrap_or(0),
+            Err(Error::Disconnected) => return 0,
+            Err(_) => 0,
+        };
+        self.features = Some(f);
+        f
+    }
+
+    fn import_dmabuf(&mut self, res_id: u32, fd: BorrowedFd<'_>, size: u64) -> Result<()> {
+        if self.features() & crate::FEATURE_IMPORT_DMABUF == 0 {
+            return Err(Error::Refused("the renderer cannot import a dma-buf".into()));
+        }
+        self.call_fd(op::IMPORT_DMABUF, &W::default().u32(res_id).u64(size).0, Some(fd))?;
+        Ok(())
+    }
 }
 
 // -------------------------------------------------------------------- server
@@ -690,6 +733,10 @@ impl IpcServer {
         match m.kind {
             op::CAPSET_INFO => {
                 let index = r.u32().map_err(|_| bad())?;
+                if index == op::FEATURES_PROBE {
+                    let f = rd.features();
+                    return self.reply(Ok(W::default().u32(f).0), None);
+                }
                 let res = rd.capset_info(index).map(|c| W::default().u32(c.id).u32(c.max_version).u32(c.max_size).0);
                 self.reply(res, None)
             }
@@ -733,6 +780,16 @@ impl IpcServer {
             op::UNREF => {
                 rd.unref(r.u32().map_err(|_| bad())?);
                 Ok(())
+            }
+            op::IMPORT_DMABUF => {
+                let mut f = || -> Result<_> { Ok((r.u32()?, r.u64()?)) };
+                let (res, size) = f().map_err(|_| bad())?;
+                // Exactly the one descriptor: anything else is not this op.
+                if m.fds.len() != 1 {
+                    return Err(bad());
+                }
+                let res = rd.import_dmabuf(res, m.fds[0].as_fd(), size).map(|()| Vec::new());
+                self.reply(res, None)
             }
             op::CREATE_FENCE => {
                 let mut f = || -> Result<_> { Ok((r.u32()?, r.u32()?, r.u64()?)) };
@@ -1118,5 +1175,138 @@ mod tests {
         assert!(matches!(recv_frag(x.as_fd(), &mut one, &mut fds), Ok(None)));
         drop(a);
         server.join().unwrap().unwrap();
+    }
+
+    /// A Mock with or without the import feature, recording what imports
+    /// reached it (resource, size, inode of the descriptor it got).
+    struct Importer {
+        inner: Mock,
+        can_import: bool,
+        log: Arc<Mutex<Vec<(u32, u64, u64)>>>,
+    }
+
+    fn inode(fd: BorrowedFd<'_>) -> u64 {
+        // SAFETY: fstat into a zeroed local.
+        unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            assert_eq!(libc::fstat(fd.as_raw_fd(), &mut st), 0);
+            st.st_ino
+        }
+    }
+
+    impl Renderer for Importer {
+        fn capset_info(&mut self, i: u32) -> Result<CapsetInfo> {
+            self.inner.capset_info(i)
+        }
+        fn capset(&mut self, i: u32, v: u32) -> Result<Vec<u8>> {
+            self.inner.capset(i, v)
+        }
+        fn ctx_create(&mut self, c: u32, s: u32, n: &[u8]) -> Result<()> {
+            self.inner.ctx_create(c, s, n)
+        }
+        fn ctx_destroy(&mut self, c: u32) {
+            self.inner.ctx_destroy(c)
+        }
+        fn ctx_attach(&mut self, c: u32, r: u32) -> Result<()> {
+            self.inner.ctx_attach(c, r)
+        }
+        fn ctx_detach(&mut self, c: u32, r: u32) {
+            self.inner.ctx_detach(c, r)
+        }
+        fn submit(&mut self, c: u32, cmd: &[u8]) -> Result<()> {
+            self.inner.submit(c, cmd)
+        }
+        fn create_blob(&mut self, c: u32, r: u32, b: u64, s: u64, f: u32) -> Result<Blob> {
+            self.inner.create_blob(c, r, b, s, f)
+        }
+        fn unref(&mut self, r: u32) {
+            self.inner.unref(r)
+        }
+        fn create_fence(&mut self, c: u32, r: u32, f: u64) -> Result<()> {
+            self.inner.create_fence(c, r, f)
+        }
+        fn fence_fd(&self) -> BorrowedFd<'_> {
+            self.inner.fence_fd()
+        }
+        fn signalled(&mut self) -> Result<Vec<Signalled>> {
+            self.inner.signalled()
+        }
+        fn export_scanout(&mut self, r: u32, l: ScanoutLayout) -> Result<Dmabuf> {
+            self.inner.export_scanout(r, l)
+        }
+        fn features(&mut self) -> u32 {
+            if self.can_import { crate::FEATURE_IMPORT_DMABUF } else { 0 }
+        }
+        fn import_dmabuf(&mut self, r: u32, fd: BorrowedFd<'_>, size: u64) -> Result<()> {
+            assert!(self.can_import, "an import reached a renderer without the feature");
+            self.log.lock().unwrap().push((r, size, inode(fd)));
+            self.inner.import_dmabuf(r, fd, size)
+        }
+    }
+
+    type ImportLog = Arc<Mutex<Vec<(u32, u64, u64)>>>;
+
+    fn importer_pair(can_import: bool) -> (IpcClient, ImportLog, JoinHandle<()>) {
+        let (a, b) = socketpair().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let r = Importer { inner: Mock::new(), can_import, log: log.clone() };
+        let server = std::thread::spawn(move || {
+            IpcServer::new(b, Box::new(r)).serve().expect("serve");
+        });
+        (IpcClient::new(a).unwrap(), log, server)
+    }
+
+    #[test]
+    fn dmabuf_import_carries_the_descriptor() {
+        let (mut c, log, server) = importer_pair(true);
+        assert_eq!(c.features(), crate::FEATURE_IMPORT_DMABUF);
+        let buf = crate::mock::memfd(1 << 16).unwrap();
+        c.import_dmabuf(7, buf.as_fd(), 1 << 16).unwrap();
+        // The renderer got the very file, not a copy of its bytes.
+        assert_eq!(*log.lock().unwrap(), vec![(7, 1 << 16, inode(buf.as_fd()))]);
+        // A second import of the same id is the renderer's to refuse, and the
+        // connection survives it.
+        assert!(matches!(c.import_dmabuf(7, buf.as_fd(), 1 << 16), Err(Error::Refused(_))));
+        c.ctx_create(1, CAPSET_VENUS, b"").unwrap();
+        c.ctx_attach(1, 7).unwrap();
+        drop(c);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_renderer_without_the_feature_is_never_sent_the_op() {
+        let (mut c, log, server) = importer_pair(false);
+        assert_eq!(c.features(), 0);
+        let buf = crate::mock::memfd(4096).unwrap();
+        assert!(matches!(c.import_dmabuf(1, buf.as_fd(), 4096), Err(Error::Refused(_))));
+        assert!(log.lock().unwrap().is_empty());
+        // Still connected: the probe and the refusal were ordinary calls.
+        assert_eq!(c.capset_info(0).unwrap().id, CAPSET_VENUS);
+        drop(c);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn the_features_probe_reads_as_none_on_a_server_that_predates_it() {
+        // What a server from before the probe does with it: hand the index
+        // to its renderer's capset_info, which refuses any index but 0, and
+        // reply ERR. The client must read that as "no features" and carry on.
+        let (a, b) = socketpair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let m = recv_msg(b.as_fd(), &mut buf).unwrap().unwrap();
+            assert_eq!(m.kind, op::CAPSET_INFO);
+            assert_eq!(R(&m.body).u32().unwrap(), op::FEATURES_PROBE);
+            let refused = Mock::new().capset_info(op::FEATURES_PROBE).unwrap_err();
+            send_msg(b.as_fd(), op::ERR, &encode_err(&refused), None).unwrap();
+            let m = recv_msg(b.as_fd(), &mut buf).unwrap().unwrap();
+            assert_eq!(m.kind, op::CAPSET_INFO);
+            send_msg(b.as_fd(), op::OK, &W::default().u32(CAPSET_VENUS).u32(0).u32(160).0, None).unwrap();
+        });
+        let mut c = IpcClient::new(a).unwrap();
+        assert_eq!(c.features(), 0);
+        assert_eq!(c.features(), 0, "asked once, remembered");
+        assert_eq!(c.capset_info(0).unwrap().id, CAPSET_VENUS);
+        server.join().unwrap();
     }
 }

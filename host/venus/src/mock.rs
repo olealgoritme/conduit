@@ -10,6 +10,9 @@ pub struct Mock {
     pub contexts: HashSet<u32>,
     pub resources: HashMap<u32, u64>,
     pub submitted: Vec<(u32, Vec<u8>)>,
+    /// Resources made by `import_dmabuf`: the renderer's own duplicate of
+    /// the dma-buf, as virglrenderer keeps one.
+    pub imported: HashMap<u32, OwnedFd>,
     pending: Vec<Signalled>,
     event: Option<OwnedFd>,
 }
@@ -24,7 +27,9 @@ impl Mock {
     }
 }
 
-fn memfd(size: u64) -> Result<OwnedFd> {
+/// A memfd of `size` bytes: a stand-in for any descriptor a renderer is
+/// handed or hands back (blobs, scanouts, imported dma-bufs).
+pub fn memfd(size: u64) -> Result<OwnedFd> {
     // SAFETY: plain syscalls on a fresh descriptor.
     unsafe {
         let fd = libc::memfd_create(c"conduit-venus-mock".as_ptr(), libc::MFD_CLOEXEC);
@@ -90,6 +95,7 @@ impl Renderer for Mock {
     }
     fn unref(&mut self, res_id: u32) {
         self.resources.remove(&res_id);
+        self.imported.remove(&res_id);
     }
     fn create_fence(&mut self, ctx_id: u32, ring_idx: u32, fence_id: u64) -> Result<()> {
         self.pending.push(Signalled { ctx_id, ring_idx, fence_id });
@@ -100,6 +106,17 @@ impl Renderer for Mock {
     }
     fn signalled(&mut self) -> Result<Vec<Signalled>> {
         Ok(std::mem::take(&mut self.pending))
+    }
+    fn features(&mut self) -> u32 {
+        FEATURE_IMPORT_DMABUF
+    }
+    fn import_dmabuf(&mut self, res_id: u32, fd: BorrowedFd<'_>, size: u64) -> Result<()> {
+        if res_id == 0 || size == 0 || self.resources.contains_key(&res_id) {
+            return Err(Error::Refused("import_dmabuf".into()));
+        }
+        self.imported.insert(res_id, fd.try_clone_to_owned()?);
+        self.resources.insert(res_id, size);
+        Ok(())
     }
     /// The image as `layout` says, in a memfd just big enough for it.
     fn export_scanout(&mut self, res_id: u32, layout: ScanoutLayout) -> Result<Dmabuf> {
