@@ -7,8 +7,10 @@
 # vk_offscreen_test.exe, vk_scanout_present.exe, vk_bar_test.exe,
 # vk_coherence_test.exe, vk_bl_readback.exe, vk_video_probe.exe,
 # helios_icd_test.exe, vk_rmfence_test.exe and helios_share_test.exe plus their
-# SPIR-V
-# (glslangValidator). MinGW ships no Vulkan import library: one for
+# SPIR-V (glslangValidator), and vk_loader_list.exe (what the system Vulkan
+# loader enumerates) and wgl_test.exe (OpenGL through WGL: Zink with app-local
+# opengl32.dll + libgallium_wgl.dll, or the adapter's ICD). MinGW ships no
+# Vulkan import library: one for
 # vulkan-1.dll is generated from the Vulkan headers' prototypes (only the
 # functions a test calls end up imported, all of them loader exports).
 #
@@ -21,6 +23,9 @@
 #   set VK_DIRECT_DRIVER=C:\path\to\vulkan_nouveau.dll
 #   vk_summary.exe & vk_compute_test.exe compute.spv copy & vk_offscreen_test.exe 100
 #   vk_scanout_present.exe 120     (spinning triangle on the scanout, 120 s)
+# From the desktop session (guest/windows/tools/run-in-session.ps1):
+#   vk_loader_list.exe             (no VK_DIRECT_DRIVER: the registered ICDs)
+#   wgl_test.exe 10 1280 720       (readback, GL 4.3 compute, gears fps)
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -54,6 +59,8 @@ done
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/helios_icd_test.c" -o "$OUT_DIR/helios_icd_test.exe"
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/vk_rmfence_test.c" -o "$OUT_DIR/vk_rmfence_test.exe"
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/helios_share_test.c" -o "$OUT_DIR/helios_share_test.exe"
+"$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/vk_loader_list.c" -static-libgcc -o "$OUT_DIR/vk_loader_list.exe"
+"$CC" -O1 -Wall "$here/wgl_test.c" -lopengl32 -lgdi32 -luser32 -lm -static-libgcc -o "$OUT_DIR/wgl_test.exe"
 
 rm -rf "$OUT_DIR/include" "$OUT_DIR/vulkan-1.def" "$OUT_DIR/libvulkan-1.a"
 ls -l "$OUT_DIR"

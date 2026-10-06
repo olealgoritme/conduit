@@ -113,6 +113,43 @@ for (crate_name, native_name, x86_name, _) in umds {
 
 '''
 
+# NVK on RM (Vulkan) and Zink (OpenGL) are cross-built on Linux with
+# guest/nvk-rm/windows/stage-helios-package.sh; HELIOS_NVK_ARTIFACT names the
+# directory it staged (ci/windows/Build-Driver.ps1 -NvkArtifact sets it). The
+# INF lists these files, so the package cannot be catalogued without them.
+[tasks.copy-nvk-to-package]
+private = true
+dependencies = ["copy-driver-binary-to-package", "copy-inf-to-package"]
+script_runner = "@rust"
+script = '''
+use std::path::PathBuf;
+
+let kmd_dir = PathBuf::from(std::env::var("CARGO_MAKE_WORKING_DIRECTORY").unwrap());
+let cargo_profile =
+    std::env::var("CARGO_MAKE_CARGO_PROFILE").unwrap_or_else(|_| "dev".to_string());
+let profile_dir = if cargo_profile == "dev" { "debug" } else { cargo_profile.as_str() };
+let package = kmd_dir.join("target").join(profile_dir).join("helios_kmd_render_package");
+std::fs::create_dir_all(&package).unwrap();
+
+let artifact = std::env::var("HELIOS_NVK_ARTIFACT").unwrap_or_else(|_| {
+    panic!("HELIOS_NVK_ARTIFACT must name the NVK/Zink files staged by \
+            guest/nvk-rm/windows/stage-helios-package.sh (Build-Driver.ps1 -NvkArtifact)")
+});
+let artifact = PathBuf::from(artifact);
+for name in [
+    "vulkan_nouveau.dll", "librmclient.dll", "helios_nvk64.json",
+    "vulkan_nouveau32.dll", "librmclient32.dll", "helios_nvk32.json",
+    "helios_gl64.dll", "helios_gl32.dll",
+] {
+    let source = artifact.join(name);
+    assert!(source.is_file(), "NVK artifact is missing {}", source.display());
+    std::fs::copy(&source, package.join(name)).unwrap_or_else(|e| {
+        panic!("copy {} -> {}: {e}", source.display(), package.display())
+    });
+}
+println!("cargo-make: copied NVK and Zink from {}", artifact.display());
+'''
+
 # Rust/link.exe toolchain revisions have emitted the /MAP output in both
 # target/<profile>/deps and the crate's hashed build/.../out directory. Search
 # those two compiler-owned locations explicitly (never the package directory)
@@ -242,6 +279,7 @@ dependencies = [
   "copy-driver-binary-to-package",
   "copy-inf-to-package",
   "copy-umd-to-package",
+  "copy-nvk-to-package",
 ]
 env = { "WDK_BUILD_INF2CAT_OS" = { source = "${CARGO_MAKE_CRATE_TARGET_TRIPLE}", default_value = "UNKNOWN", mapping = { "x86_64-pc-windows-msvc" = "10_x64", "aarch64-pc-windows-msvc" = "Server10_arm64" } } }
 command = "inf2cat"

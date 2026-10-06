@@ -23,12 +23,16 @@
 #   JOBS          ninja -j (default 2)
 #   MEMORY_MAX    memory cap for the compile, via systemd-run --user --scope
 #                 when available (default 2500M; set empty to run uncapped)
+#   GL            1: also build Zink (OpenGL on Vulkan) as Mesa's gallium WGL
+#                 ICD, libgallium_wgl.dll, plus Mesa's opengl32.dll for
+#                 app-local use; Zink loads the NVK next to it (patch 0033)
 #
 # Needs: gcc-mingw-w64-x86-64, rustup target x86_64-pc-windows-gnu, bindgen,
 # cbindgen, and Mesa's usual Python build modules (mako, yaml).
 #
 # Result in OUT_DIR: vulkan_nouveau.dll, librmclient.dll, nouveau_icd.json
-# (library_path relative to the manifest), imports.txt, exports.txt.
+# (library_path relative to the manifest), imports.txt, exports.txt; with
+# GL=1 also libgallium_wgl.dll and opengl32.dll.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -50,6 +54,7 @@ MESON_ARGS=${MESON_ARGS:-}
 JOBS=${JOBS:-2}
 MEMORY_MAX=${MEMORY_MAX-2500M}
 OUT_DIR=${OUT_DIR:-$MESA_DIR/$BUILD_DIR/dist}
+GL=${GL:-0}
 
 capped() {
   if [ -n "$MEMORY_MAX" ] && command -v systemd-run >/dev/null 2>&1; then
@@ -73,12 +78,13 @@ fi
 # patches-common/: generic NVK patches (per-draw cost) shared with the Linux
 # series, applied after everything else.
 series="$here/patches/*.patch $here/patches-windows/*.patch $here/patches-windows-dxvk/*.patch $here/patches-common/*.patch"
+# The whole series, in order (the start of each subject: a folded Subject:
+# line only holds its beginning), must be what is on top of the base; a tree
+# with an older or different series (another branch's patches) is rebuilt.
 # shellcheck disable=SC2086
-last_patch=$(printf "%s\n" $series | tail -1)
-# (a Subject header may continue on indented lines)
-last_subject=$(awk '/^Subject: /{s = $0; while ((getline l) > 0 && l ~ /^ /) s = s l;
-                    sub(/^Subject: \[PATCH[^]]*\] /, "", s); print s; exit}' "$last_patch")
-if git -C "$MESA_DIR" log --format=%s "$MESA_BASE..HEAD" 2>/dev/null | grep -qxF "$last_subject"; then
+want=$(for p in $series; do sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$p" | head -1 | cut -c1-30; done)
+have=$(git -C "$MESA_DIR" log --reverse --format=%s "$MESA_BASE..HEAD" 2>/dev/null | cut -c1-30)
+if [ -n "$have" ] && [ "$want" = "$have" ]; then
   echo "nvk-rm: Windows series already applied in $MESA_DIR"
 else
   if [ -n "$(git -C "$MESA_DIR" status --porcelain --untracked-files=no)" ]; then
@@ -135,18 +141,26 @@ BUILDTYPE=${BUILDTYPE:-release}
 if [ "$BUILDTYPE" = release ]; then NDEBUG=true; else NDEBUG=false; fi
 # H.264 decode for patch 35 (NVDEC; off at runtime unless NVK_EXPERIMENTAL=video)
 VIDEO_CODECS=${VIDEO_CODECS-h264dec}
+if [ "$GL" = 1 ]; then
+  gl_opts="-Dgallium-drivers=zink -Dopengl=true"
+  gl_targets="src/gallium/targets/wgl/libgallium_wgl.dll src/gallium/targets/libgl-gdi/opengl32.dll"
+else
+  gl_opts="-Dgallium-drivers= -Dopengl=false"
+  gl_targets=
+fi
 if [ -f "$BUILD_DIR/build.ninja" ]; then
   # Build directories from older versions of this script were debugoptimized
+  # shellcheck disable=SC2086
   "$MESON" configure "$BUILD_DIR" -Dbuildtype="$BUILDTYPE" -Db_ndebug="$NDEBUG" \
-    -Dvideo-codecs="$VIDEO_CODECS"
+    -Dvideo-codecs="$VIDEO_CODECS" $gl_opts
 else
   # shellcheck disable=SC2086
   "$MESON" setup "$BUILD_DIR" --cross-file "$cross" \
-    -Dvulkan-drivers=nouveau -Dnvk-rm=enabled -Dgallium-drivers= \
+    -Dvulkan-drivers=nouveau -Dnvk-rm=enabled $gl_opts \
     -Dplatforms=windows -Dllvm=disabled \
     -Dmesa-clc=system -Dprecomp-compiler=system \
     -Dvideo-codecs="$VIDEO_CODECS" -Dvulkan-layers= \
-    -Degl=disabled -Dgbm=disabled -Dglx=disabled -Dopengl=false \
+    -Degl=disabled -Dgbm=disabled -Dglx=disabled \
     -Dgles1=disabled -Dgles2=disabled \
     -Dshader-cache=enabled -Dzlib=disabled -Dzstd=disabled -Dexpat=disabled \
     -Dxmlconfig=disabled -Dperfetto=false -Dbuild-tests=false \
@@ -157,9 +171,10 @@ fi
 if ! grep -q 'ENABLE_SHADER_CACHE' "$BUILD_DIR/build.ninja"; then
   "$MESON" configure "$BUILD_DIR" -Dshader-cache=enabled
 fi
+# shellcheck disable=SC2086
 capped ninja -C "$BUILD_DIR" -j"$JOBS" \
   src/nouveau/vulkan/vulkan_nouveau.dll \
-  src/nouveau/vulkan/nouveau_icd.$ARCH.json
+  src/nouveau/vulkan/nouveau_icd.$ARCH.json $gl_targets
 
 # 5. Stage: the DLLs, an ICD manifest pointing next to itself, imports/exports
 mkdir -p "$OUT_DIR"
@@ -167,6 +182,10 @@ mkdir -p "$OUT_DIR"
 # ~18 MB without); the unstripped DLLs stay in the build directories.
 "$tool-strip" -o "$OUT_DIR/vulkan_nouveau.dll" "$BUILD_DIR/src/nouveau/vulkan/vulkan_nouveau.dll"
 "$tool-strip" -o "$OUT_DIR/librmclient.dll" "$rmc/librmclient.dll"
+if [ "$GL" = 1 ]; then
+  "$tool-strip" -o "$OUT_DIR/libgallium_wgl.dll" "$BUILD_DIR/src/gallium/targets/wgl/libgallium_wgl.dll"
+  "$tool-strip" -o "$OUT_DIR/opengl32.dll" "$BUILD_DIR/src/gallium/targets/libgl-gdi/opengl32.dll"
+fi
 python3 - "$BUILD_DIR/src/nouveau/vulkan/nouveau_icd.$ARCH.json" "$OUT_DIR/nouveau_icd.json" <<'EOF'
 import json, sys
 icd = json.load(open(sys.argv[1]))

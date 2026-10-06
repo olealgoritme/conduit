@@ -90,6 +90,17 @@ $driverOut = Join-Path $payload "driver"
 foreach ($name in @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll", "helios_umd32.dll", "helios_umd12_32.dll", "toolchain.json")) {
     Copy-Required (Join-Path $DriverArtifact $name) (Join-Path $driverOut $name)
 }
+# NVK on RM (Vulkan) and Zink (OpenGL), installed by the INF into the driver
+# store and registered on the adapter (VulkanDriverName, OpenGLDriverName).
+foreach ($name in @("vulkan_nouveau.dll", "librmclient.dll", "helios_nvk64.json", "vulkan_nouveau32.dll", "librmclient32.dll", "helios_nvk32.json", "helios_gl64.dll", "helios_gl32.dll")) {
+    Copy-Required (Join-Path $DriverArtifact $name) (Join-Path $driverOut $name)
+}
+foreach ($name in @("vulkan_nouveau.dll", "librmclient.dll", "helios_gl64.dll")) {
+    Assert-HeliosPeArchitecture (Join-Path $driverOut $name) x64
+}
+foreach ($name in @("vulkan_nouveau32.dll", "librmclient32.dll", "helios_gl32.dll")) {
+    Assert-HeliosPeArchitecture (Join-Path $driverOut $name) x86
+}
 foreach ($name in @("helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll", "helios_umd32.dll", "helios_umd12_32.dll")) {
     $info = (Get-Item -LiteralPath (Join-Path $driverOut $name)).VersionInfo
     if ($info.FileVersion -ne $Version -or $info.ProductVersion -ne $Version -or
@@ -273,6 +284,7 @@ $manifest = [ordered]@{
             architectures = @("x64", "x86")
         }
         mesa = [ordered]@{ vulkan = "Venus"; openGL = "Zink WGL ICD"; architectures = @("x64", "x86"); vulkanApiVersion = "1.4.352" }
+        nvk = [ordered]@{ vulkan = "NVK on RM, the adapter's Vulkan driver (driver store)"; openGL = "Zink on NVK, the adapter's OpenGL ICD (driver store)"; architectures = @("x64", "x86"); policy = "HKLM\SOFTWARE\Helios Icd / NvkDenyList / NvkAllowList" }
         openCl = [ordered]@{ implementation = "CLVK"; onlineCompiler = $true; architectures = @("x64") }
         compatibility = [ordered]@{ davinciResolve = "App-local AMD ADL detection shim" }
     }

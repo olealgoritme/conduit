@@ -2,7 +2,11 @@ param(
     [Parameter(Mandatory)][string]$RepoRoot,
     [Parameter(Mandatory)][string]$OutputDir,
     [ValidateSet("Debug", "Release")][string]$Configuration = "Release",
-    [string]$BuildRoot = "C:\helios-build"
+    [string]$BuildRoot = "C:\helios-build",
+    # NVK on RM + Zink, cross-built on Linux by
+    # guest/nvk-rm/windows/stage-helios-package.sh; the INF installs them into
+    # the driver store next to the UMDs and registers them on the adapter.
+    [string]$NvkArtifact = $env:HELIOS_NVK_ARTIFACT
 )
 
 Set-StrictMode -Version Latest
@@ -16,6 +20,22 @@ $profileDir = if ($Configuration -eq "Debug") { "debug" } else { "release" }
 $mesonBuildType = if ($Configuration -eq "Debug") { "debug" } else { "release" }
 
 $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
+# The NVK/Zink files the INF lists; checked before the long engine builds.
+$nvkFiles = @(
+    "vulkan_nouveau.dll", "librmclient.dll", "helios_nvk64.json",
+    "vulkan_nouveau32.dll", "librmclient32.dll", "helios_nvk32.json",
+    "helios_gl64.dll", "helios_gl32.dll"
+)
+if (-not $NvkArtifact) {
+    throw "No NVK artifact: pass -NvkArtifact (or HELIOS_NVK_ARTIFACT) with the files guest/nvk-rm/windows/stage-helios-package.sh stages."
+}
+$NvkArtifact = (Resolve-Path -LiteralPath $NvkArtifact).Path
+foreach ($name in $nvkFiles) {
+    if (-not (Test-Path -LiteralPath (Join-Path $NvkArtifact $name) -PathType Leaf)) {
+        throw "The NVK artifact $NvkArtifact is missing $name."
+    }
+}
+$env:HELIOS_NVK_ARTIFACT = $NvkArtifact
 # Reject stale checked-in INF/Cargo descriptions before starting engine builds.
 & python (Join-Path $RepoRoot "tools\sync-metadata.py") --check
 if ($LASTEXITCODE -ne 0) { throw "Metadata is stale; run tools/sync-metadata.py." }
@@ -173,10 +193,35 @@ try {
 }
 
 $package = Join-Path $kmdRoot "target\$profileDir\helios_kmd_render_package"
-$required = @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll", "helios_umd32.dll", "helios_umd12_32.dll")
+$required = @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll", "helios_umd32.dll", "helios_umd12_32.dll") + $nvkFiles
 foreach ($name in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $package $name) -PathType Leaf)) {
         throw "Driver package output is missing $name in $package."
+    }
+}
+# NVK and Zink land in one driver-store directory for both architectures, so
+# a DLL in the wrong slot would load nowhere. NVK must carry the Helios
+# interface the UMDs use (S3) and the policy export Zink uses.
+foreach ($entry in @(
+    @{ name = "vulkan_nouveau.dll"; machine = "IMAGE_FILE_MACHINE_AMD64" },
+    @{ name = "librmclient.dll"; machine = "IMAGE_FILE_MACHINE_AMD64" },
+    @{ name = "helios_gl64.dll"; machine = "IMAGE_FILE_MACHINE_AMD64" },
+    @{ name = "vulkan_nouveau32.dll"; machine = "IMAGE_FILE_MACHINE_I386" },
+    @{ name = "librmclient32.dll"; machine = "IMAGE_FILE_MACHINE_I386" },
+    @{ name = "helios_gl32.dll"; machine = "IMAGE_FILE_MACHINE_I386" }
+)) {
+    $path = Join-Path $package $entry.name
+    $headers = @(& $llvmReadObj --file-headers $path 2>&1)
+    if ($LASTEXITCODE -ne 0 -or -not ($headers -match "Machine: $($entry.machine)\b")) {
+        throw "$($entry.name) is not a $($entry.machine) image."
+    }
+}
+foreach ($name in @("vulkan_nouveau.dll", "vulkan_nouveau32.dll")) {
+    $exports = @(& $llvmReadObj --coff-exports (Join-Path $package $name) 2>&1)
+    foreach ($entrypoint in @("vk_icdGetInstanceProcAddr", "helios_icd_interface_v2", "nvk_helios_process_allowed")) {
+        if (-not ($exports -match "^\s*Name: $entrypoint\s*$")) {
+            throw "$name does not export $entrypoint (build it from the S3 NVK series with patches 0032-0034)."
+        }
     }
 }
 
