@@ -140,6 +140,11 @@ struct HeliosDxvkDevice {
   // 1 = no RM fences here (wait and nvk_scanout_present as before),
   // negative = the frame was not shown.
   std::int32_t nvk_scanout_present_fenced(std::size_t d3d11_resource_ptr) const noexcept;
+  // The KMD's names for the texture's latest scanout frame (SCANOUT_PRESENT
+  // out_seq, SCANOUT_SET out_generation), for the already-on-scanout present
+  // tag. False (both 0) without them (older NVK, no live KMD source).
+  bool nvk_scanout_frame(std::size_t d3d11_resource_ptr, std::uint64_t* sequence,
+                         std::uint32_t* generation) const noexcept;
   // An RM fence for everything submitted so far, for a WDDM present marker
   // (helios_rm_fence.h). 0 = *fence_handle is the caller's, 1 = none here.
   std::int32_t nvk_present_fence(std::uint32_t* fence_handle,

@@ -778,6 +778,12 @@ impl RuntimeSubmission {
                 core::mem::size_of::<HeliosPresentRenderCmd>() as u32,
                 "Present",
             ),
+            // The already-on-scanout tag rides after the (possibly zero) fence
+            // slot: 72 bytes (`helios_onscanout.h`).
+            Self::MarkerPresent { correlation, .. } if correlation.on_scanout.is_some() => (
+                helios_protocol::HELIOS_ONSCANOUT_HERF_BYTES as u32,
+                "Present",
+            ),
             Self::MarkerPresent { correlation, .. } if rm_fence_tail(*correlation).is_some() => (
                 core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmdFence>() as u32,
                 "Present",
@@ -811,6 +817,34 @@ pub(crate) fn present_refresh_cmd(
         present_ctx_id: correlation.ctx_id,
         present_value: correlation.value32,
         present_cookie: correlation.cookie,
+    }
+}
+
+/// The 72-byte `HERF` carrying the already-on-scanout tag: the marker, the RM
+/// fence slot (zero unless the correlation carries a fence) and `HOSC` at 48
+/// (`helios_onscanout.h`, docs/zero-copy-present.md section 15).
+fn onscanout_marker(
+    correlation: PresentStreamCorrelation,
+    claim: crate::bridge::OnScanoutClaim,
+) -> helios_protocol::HeliosPresentRefreshCmdOnScanout {
+    use helios_protocol::{HeliosOnScanoutTag, HeliosPresentRefreshCmdFence, HeliosRmFenceTail};
+    helios_protocol::HeliosPresentRefreshCmdOnScanout {
+        base: HeliosPresentRefreshCmdFence {
+            base: present_refresh_cmd(correlation),
+            fence: rm_fence_tail(correlation).unwrap_or(HeliosRmFenceTail {
+                rm_fence_handle: 0,
+                flags: 0,
+                rm_fence_value: 0,
+            }),
+        },
+        tag: HeliosOnScanoutTag {
+            magic: helios_protocol::HELIOS_ONSCANOUT_MAGIC,
+            version: helios_protocol::HELIOS_ONSCANOUT_VERSION,
+            flags: 0,
+            sequence: claim.sequence,
+            generation: claim.generation,
+            resource_id: claim.resource_id,
+        },
     }
 }
 
@@ -918,7 +952,11 @@ pub(crate) unsafe fn submit_runtime_submission(
                     return hr;
                 }
             };
-            if let Some(tail) = rm_fence_tail(correlation) {
+            if let Some(claim) = correlation.on_scanout {
+                (command as *mut helios_protocol::HeliosPresentRefreshCmdOnScanout)
+                    .write_unaligned(onscanout_marker(correlation, claim));
+                NVK_ONSCANOUT_TAGGED.fetch_add(1, Ordering::Relaxed);
+            } else if let Some(tail) = rm_fence_tail(correlation) {
                 (command as *mut helios_protocol::HeliosPresentRefreshCmdFence).write_unaligned(
                     helios_protocol::HeliosPresentRefreshCmdFence {
                         base: present_refresh_cmd(correlation),
@@ -1479,7 +1517,7 @@ unsafe fn nvk_present_frame(
                             NVK_FENCED_FAILURES.load(Ordering::Relaxed)
                         );
                     }
-                    return Ok(NvkFrame::on_scanout());
+                    return Ok(NvkFrame::on_scanout(dev, &src));
                 }
                 Some(false) => {
                     NVK_FENCED_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -1527,7 +1565,7 @@ unsafe fn nvk_present_frame(
                     log_error!("NVK present: {n} frames on scanout 0 (failures {})",
                         NVK_SCANOUT_FAILURES.load(Ordering::Relaxed));
                 }
-                return Ok(NvkFrame::on_scanout());
+                return Ok(NvkFrame::on_scanout(dev, &src));
             } else {
                 NVK_SCANOUT_FAILURES.fetch_add(1, Ordering::Relaxed);
             }
@@ -1550,13 +1588,40 @@ struct NvkFrame {
 }
 
 impl NvkFrame {
-    fn on_scanout() -> Self {
+    /// NVK put `src` on scanout 0. The WDDM present that may follow
+    /// (`nvk_scanout_compose`) carries the KMD's names for that frame as the
+    /// already-on-scanout claim (`helios_onscanout.h`), so a KMD that can
+    /// verify it completes the Blt without copying; an older NVK (no
+    /// `scanout_frame`) or KMD gives no claim / ignores it: the ordinary Blt.
+    fn on_scanout(dev: &HeliosDevice, src: &ID3D11Resource) -> Self {
+        let claim = dev.dxvk.nvk_scanout_frame(src).map(|(sequence, generation)| {
+            crate::bridge::OnScanoutClaim {
+                sequence,
+                generation,
+                // Not stated: the KMD's own resource-id check is optional,
+                // and the WDDM allocation of a back buffer may carry a
+                // placeholder id the scanout frame does not.
+                resource_id: 0,
+            }
+        });
+        if claim.is_none() {
+            NVK_ONSCANOUT_NO_CLAIM.fetch_add(1, Ordering::Relaxed);
+        }
         Self {
-            correlation: PresentStreamCorrelation::default(),
+            correlation: PresentStreamCorrelation {
+                on_scanout: claim,
+                ..PresentStreamCorrelation::default()
+            },
             on_scanout: true,
         }
     }
 }
+
+/// Scanout frames whose WDDM present could carry no already-on-scanout claim
+/// (NVK without `scanout_frame`, or no live KMD source / minted seq yet).
+static NVK_ONSCANOUT_NO_CLAIM: AtomicUsize = AtomicUsize::new(0);
+/// WDDM presents that carried the `HOSC` tag.
+static NVK_ONSCANOUT_TAGGED: AtomicUsize = AtomicUsize::new(0);
 
 static NVK_SCANOUT_FRAMES: AtomicUsize = AtomicUsize::new(0);
 static NVK_SCANOUT_COMPOSED: AtomicUsize = AtomicUsize::new(0);
@@ -1576,6 +1641,12 @@ fn nvk_scanout_compose(frame: NvkFrame) -> bool {
     if compose {
         NVK_SCANOUT_COMPOSED.fetch_add(1, Ordering::Relaxed);
     }
+    if n == 0 {
+        log_error!(
+            "NVK scanout: NvkScanoutComposeEvery={every} (effective; D3D11 DDI {:?})",
+            crate::ddi_level::ddi_level()
+        );
+    }
     if (n + 1) % 1024 == 0 {
         static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
         let now = std::time::Instant::now();
@@ -1584,9 +1655,11 @@ fn nvk_scanout_compose(frame: NvkFrame) -> bool {
             let fps = 1024.0 / now.duration_since(last).as_secs_f64().max(1e-9);
             log_error!(
                 "NVK scanout: {} frames, {} also sent to DWM (NvkScanoutComposeEvery={every}), \
-                 {fps:.1} fps over the last 1024",
+                 {fps:.1} fps over the last 1024; HOSC tagged {} untagged {}",
                 n + 1,
-                NVK_SCANOUT_COMPOSED.load(Ordering::Relaxed)
+                NVK_SCANOUT_COMPOSED.load(Ordering::Relaxed),
+                NVK_ONSCANOUT_TAGGED.load(Ordering::Relaxed),
+                NVK_ONSCANOUT_NO_CLAIM.load(Ordering::Relaxed)
             );
         }
     }
@@ -3004,7 +3077,13 @@ pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_P
     if helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk()) {
         match nvk_present_frame(h, src_h) {
             Ok(frame) if !nvk_scanout_compose(frame) => return 0,
-            Ok(frame) => nvk_correlation = frame.correlation,
+            Ok(frame) => {
+                nvk_correlation = frame.correlation;
+                // The KMD skips only a whole-surface Blt: no claim with dirty rects.
+                if a.DirtyRects != 0 {
+                    nvk_correlation.on_scanout = None;
+                }
+            }
             Err(hr) => return hr,
         }
     } else {
