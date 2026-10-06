@@ -223,3 +223,16 @@ Run each step only in a quiet window agreed with the install agent. Always end w
   * `VsR4` 536.
 * Revert: `Icd=venus` restored, `NvkAllowList` removed, DWM killed once. The Venus DWM (pid 10916)
   kept the same pid for 30 s. No TDR, no reboot.
+
+### T2 (2026-10-06 10:23, 22.22.319.3 with 4cc35bb; `DwmIcd=nvk`, `Icd=venus` left as is, 45 s)
+
+* No crash, no hang. NVK device creation ran on the 8 MiB helper thread ("caller's stack 128 KiB"),
+  so the stack overflow is gone.
+* NVK then failed with "DxvkError: Failed to initialize DXVK". NVK's own policy (Mesa 0032) hides
+  its GPU from a process that `Icd=venus` sends to Venus. The D3D12 bridge wraps its creation in
+  `NvkPolicyScope`; the D3D11 bridge did not. Fixed in 1d513d1.
+* **Failure safety confirmed live.** `note_nvk_failed` moved the process to Venus, and that DWM (pid
+  2036) composed normally until the revert. The guard file recorded one NVK start.
+* KMD: `PBRet` 0xC000000D and `PBCpy` 2 -> 225 although DWM never presented on NVK, so this
+  `PBRet` comes with a Venus DWM restart (T1 had restarts too).
+* Revert: `DwmIcd` removed, DWM killed once; Venus DWM pid 5128 stable for 30 s.
