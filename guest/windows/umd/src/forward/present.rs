@@ -1792,6 +1792,14 @@ unsafe fn nvk_present_impl(
     if !nvk_scanout_compose(frame) {
         return 0;
     }
+    // The KMD's Blt copy of this source may still be queued when Present
+    // returns (BltAsync), and nothing else orders the next frame's NVK writes
+    // into it after that copy: tag it so DXVK's next command lists that touch
+    // it wait for the KMD's read-ledger claim (zero-copy-present.md 24.10.3).
+    // Once per resource; later calls are an atomic load in the bridge.
+    if let (Some(dev), Some(src)) = (helios_device(h), load_resource(src_h)) {
+        let _ = dev.dxvk.mark_blt_source(src.as_raw() as usize);
+    }
     let correlation = frame.correlation;
     let result = finish_present(
         h,

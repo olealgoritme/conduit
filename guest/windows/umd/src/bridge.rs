@@ -186,6 +186,11 @@ mod ffi {
         /// Hand-off ledger: give a shared resource its key now.
         /// # Safety: a live `ID3D11Resource*`.
         unsafe fn handoff_register(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize);
+        /// NVK: the resource is a composed Present's Blt source; DXVK's
+        /// next lists that touch it wait for the KMD's read-ledger claim.
+        /// Returns the ledger id (0: none).
+        /// # Safety: a live `ID3D11Resource*`.
+        unsafe fn mark_blt_source(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize) -> u32;
         /// Hand-off ledger: the resource goes; this process lets go of its key.
         /// # Safety: a live `ID3D11Resource*`.
         unsafe fn handoff_unregister(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize);
@@ -877,6 +882,16 @@ impl BridgeDevice {
         if let Some(d) = self.get() {
             // SAFETY: the caller passes a live resource pointer.
             unsafe { d.handoff_register(res) };
+        }
+    }
+
+    /// NVK: `res` is the source of a composed Present (see the bridge
+    /// declaration). Returns the ledger id, 0 when it has none.
+    pub(crate) fn mark_blt_source(&self, res: usize) -> u32 {
+        match self.get() {
+            // SAFETY: the caller passes a live resource pointer.
+            Some(d) => unsafe { d.mark_blt_source(res) },
+            None => 0,
         }
     }
 

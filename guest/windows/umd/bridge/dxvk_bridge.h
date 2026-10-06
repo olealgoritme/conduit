@@ -173,6 +173,12 @@ struct HeliosDxvkDevice {
   // without anyone waiting. 0 = nothing new, 1 = published, -1 = ledger
   // unavailable or full (fall back), -2 = failed.
   void handoff_register(std::size_t d3d11_resource_ptr) const noexcept;
+  // NVK: the resource is the source of a composed (windowed Blt) Present. The
+  // KMD may still be copying from it after Present returns and claims its
+  // IMPORT_RM id in the read ledger meanwhile, so DXVK's next command lists
+  // that touch it wait for the claim to retire (zero-copy-present.md
+  // 24.10.3). Returns the ledger id, 0 when it has none.
+  std::uint32_t mark_blt_source(std::size_t d3d11_resource_ptr) const noexcept;
   // The resource goes (DestroyResource): this process stops holding its key;
   // the slot is freed when no process holds it.
   void handoff_unregister(std::size_t d3d11_resource_ptr) const noexcept;
