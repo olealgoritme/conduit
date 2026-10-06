@@ -139,7 +139,7 @@ Touches no device state, so it works with the transport down (then `device_featu
 event ops/kinds absent, `epoch = 0`). Fills: `max_buffer_bytes` (1 MiB),
 `default_timeout_ms` (30000), `supported_ops`, `supported_event_kinds` (`0b110` while events
 are usable, `0b1110` with the host's buffer-release event acked, else 0), `supported_cache_types` (`0b1111`), `device_features` (the virtio config
-`features` word read at init), `max_handles` 128, `max_mappings` 256, `max_pins` 256,
+`features` word read at init), `max_handles` 4096, `max_mappings` 4096 (128 and 256 under `NvWinPolicy` = 0), `max_pins` 256,
 `max_pin_pages` 262143, `pin_deep_kinds` (direct | indirect = 3). The `max_*` values are the
 per-process limits of section 5.
 
@@ -209,8 +209,9 @@ Order and results:
 
 1. `flags != 0`, `prot == 0`, unknown `prot` bits, `cache_request > WB` -> `UNSUPPORTED`.
 2. Handle not the caller's -> `NOT_OWNED`. `size == 0`, not a page multiple, `> 256 MiB`
-   (`MAX_MAP_BYTES`), or `offset` not page-aligned -> `BAD_RANGE`. Per-process mapping
-   quota -> `NO_RESOURCES`.
+   (`MAX_MAP_BYTES`), or `offset` not page-aligned -> `BAD_RANGE`. A mapping-table bound or
+   the window policy (section 13: window full, the reserve, a map that could never fit; the
+   legacy per-device quota under `NvWinPolicy` = 0) -> `NO_RESOURCES`, counted by reason.
 3. Host `Mmap{size, offset, prot}` is sent (prot 3 if writable, else 1; 30 s). A host errno
    -> `DEVICE_ERROR` + `flags = errno`; a timeout -> `TIMEOUT`.
 4. The reply is an offset into a shared-memory region, not an address. The region is chosen
@@ -378,9 +379,9 @@ hold all 24 data bytes, and a handle that is neither 0 nor `0xFFFFFFFF`. Anythin
 not recorded. The reply is returned to the caller as the device wrote it.
 
 **Lifetime.** One slot is reserved before the host is asked, exactly as for `Open`: a full
-table or the per-process quota (`MAX_NVRM_HANDLES_PER_OWNER`, 128, shared with every other
-handle; the host's own cap is 4096 unsignalled fences) gives `NO_RESOURCES` and the host makes
-no fence. The handle is recorded under `device_type = 511` (`DEVICE_TYPE_FENCE`): not a value
+table or the per-process sanity bound (`MAX_NVRM_HANDLES_PER_OWNER`, 4096 since the tables
+grow, 128 under `NvWinPolicy` = 0; shared with every other handle; the host's own cap is 4096
+unsignalled fences) gives `NO_RESOURCES` and the host makes no fence. The handle is recorded under `device_type = 511` (`DEVICE_TYPE_FENCE`): not a value
 the host accepts in `Open`, and below 512 so it is never taken for a DRM node
 (`ScanoutFlip.owner_handle`, `IMPORT_RM`). The host reports it **once**: one
 `EventReady(handle)` when the semaphore reaches the value, or when the host driver gives up
@@ -407,6 +408,46 @@ wait with a timeout shorter than the 5 s host timeout and re-check the semaphore
 
 Counters: `NvFence`, `NvFenceCl`, `NvFenceSig`, `NvFenceEarly`, `NvFenceErr` (section 7).
 
+### 4.7 WINDOW_INFO (op 13, 88 bytes)
+
+A read-only report of the RM window for NVK's live `VK_EXT_memory_budget` (policy and
+accounting: section 13). Advertised by `QUERY_CAPS.supported_ops` bit 13 (the op) and bit 36
+(`HELIOS_NVRM_CAP_WINDOW_INFO`; bits 32..35 are `SCANOUT_FENCE`, `PRESENT_FENCE`, `FLUSH_GATE`,
+`SCANOUT_RELEASE`). `HeliosNvrmWindowInfo` (`protocol/src/nvrm.rs`, `guest/rmclient/src/
+helios_nvrm_escape.h`), little endian:
+
+| offset | field | |
+|---|---|---|
+| 0..39 | `head` | `op` = 13 |
+| 40 | `u64 window_bytes` | the RM window's size as the device reports it (0: no window, or the transport is down) |
+| 48 | `u64 window_used_bytes` | mapped now by every process (the UVM aperture is another region and not counted) |
+| 56 | `u64 owner_limit_bytes` | the ceiling that applies to the caller. Dynamic policy: a ceiling on `window_used_bytes` (flag bit 2): `window_bytes` for the privileged device (the shell's), `window_bytes - reserve` (default reserve 256 MiB) for everyone else; `NvWinMaxMb` lowers the window first. `NvWinPolicy` = 0: a quarter of the window, a ceiling on `owner_used_bytes` |
+| 64 | `u64 owner_used_bytes` | this process's (device's) bytes of the window, all its window `MMAP`s (UVM aperture maps excluded); 0 for a process with none |
+| 72 | `u64 generation` | bumps when the window size or the policy may have changed (once per transport start today; 0 before the first) |
+| 80 | `u32 flags` | bit 0: `owner_limit_bytes < window_bytes` (this process cannot use the whole window); bit 1: the window can grow (always 0 today); bit 2: the limit is a ceiling on the all-owners total |
+| 84 | `u32 reserved` | 0 |
+
+Room left for the caller: `owner_limit_bytes - window_used_bytes` with bit 2 set,
+`owner_limit_bytes - owner_used_bytes` with it clear; the host may still refuse a map it cannot place
+(`DEVICE_ERROR`, errno in `flags` of `MMAP`; `NvWinRHost`). The status is always `OK`; no side
+effect, no host round trip, no registry write (the counters are mirrored by the worker); a few
+atomic reads, one read of the scanout state's leaf lock (is the caller the shell's device) and one
+short virtio-lock hold over the window account (`O(owners)`), so it is cheap enough for every new
+memory chunk; a UMD caches the answer for 10 ms. A buffer shorter than 88 bytes answers `BAD_RANGE`
+in the header (when the 40-byte header fits; otherwise `STATUS_BUFFER_TOO_SMALL` like every op) and
+is counted in the short-buffer counter (QUERY_STATS `out_escape_short_buffer`). Counter: `NvWinInfo`
+(calls). Tests: `protocol` (`window_info_*`: offsets, little-endian bytes, 64-bit fields, op and
+capability bits free) and `kmd_logic::rm_window` (`info_*`).
+
+**Phase 2 (design only, not implemented).** A per-process read-only page, mapped like the read
+ledger (`HELIOS_ESCAPE_MAP_READ_LEDGER`) and refreshed under a seqlock by the KMD whenever the
+window account changes (the table doors already call `mirror`), would let the UMD read the budget
+with no escape at all: `{seq, window_bytes, used, owner_limit, owner_used, generation, flags}`
+with the usual odd-while-writing sequence word. It is per process because `owner_limit` and
+`owner_used` are; one page per device, written for every device on every change would cost
+`O(devices)` per map, so the writes would be lazy (marked dirty at the change, refreshed by the
+next escape of that device or by the worker). Not needed while the escape costs about a microsecond.
+
 ## 5. Ownership, quotas and limits
 
 All `MAX_*` values are read from the code. "Per process" really means per device handle
@@ -418,18 +459,17 @@ All `MAX_*` values are read from the code. "Per process" really means per device
 | `NVRM_DEFAULT_TIMEOUT_MS` | 30000 | `escape.rs` | FORWARD wait when `timeout_ms == 0` |
 | host Mmap wait / host Munmap wait / teardown `Close` wait | 30000 / 5000 / 5000 ms | `virtio/nvrm.rs` | hard-coded |
 | `ENQUEUE_RETRY_MAX_MS` | 5000 | `virtio/ctrl.rs` | ring-full retry budget before `NO_RESOURCES` |
-| `MAX_NVRM_HANDLES` | 1024 | `nvrm_tables.rs` | backend handles, all owners (in-flight Opens count) |
-| `MAX_NVRM_HANDLES_PER_OWNER` | 128 | same | per process; `QUERY_CAPS.max_handles` |
-| `MAX_NVRM_MAPS` | 1024 | same | live MMAPs, all owners |
-| `MAX_NVRM_MAPS_PER_OWNER` | 256 | same | `QUERY_CAPS.max_mappings` |
+| `MAX_NVRM_HANDLES` | 16384 (was 1024), grows from 1024 | `nvrm_tables.rs` | SANITY bound on backend handles, all owners (in-flight Opens count); `NvWinPolicy` = 0 puts 1024 back |
+| `MAX_NVRM_HANDLES_PER_OWNER` | 4096 (was 128) | same | SANITY bound per process; `QUERY_CAPS.max_handles` reports the one in force |
+| `MAX_NVRM_MAPS` | 8192 (was 1024), grows from 1024 | same | SANITY bound on live MMAPs, all owners (equals the adapter-wide view table, `mapping.rs`); legacy 1024 |
+| `MAX_NVRM_MAPS_PER_OWNER` | 4096 (was 256) | same | `QUERY_CAPS.max_mappings`; legacy 256 |
 | `MAX_MAP_BYTES` | 256 MiB | `virtio/nvrm.rs` | one MMAP (bounds the MDL's non-paged cost) |
 | `MAX_NVRM_PINS` | 1024 | `nvrm_tables.rs` | live pins, all owners |
 | `MAX_NVRM_PINS_PER_OWNER` | 256 | same | `QUERY_CAPS.max_pins` |
 | `MAX_NVRM_PIN_PAGES` | 262143 pages (just under 1 GiB) | same | one PIN; equals the indirect table's run capacity, so a fully scattered range still fits |
 | `HELIOS_NVRM_PAGE_RUNS_MAX` / `page_runs::DIRECT_MAX_RUNS` | 1024 | protocol / `kmd_logic/page_runs.rs` | runs in a direct table (8 + 1024 x 16 bytes) |
 | `page_runs::INDIRECT_MAX_RUNS` | 262143 | `page_runs.rs` | runs an indirect table can hold |
-| `MAX_NVRM_EVENTS` | 1024 | `gpu/nvrm_events.rs` | registrations, all owners; storage reserved at init (0 if no event queue) |
-| `MAX_NVRM_EVENTS_PER_OWNER` | 130 | same (`MAX_NVRM_HANDLES_PER_OWNER + 2`) | one `READY` per handle plus one `TRANSPORT_LOST` and one `SCANOUT_RELEASED` |
+| `rm_limits::EVENTS` (was `MAX_NVRM_EVENTS` 1024 / `MAX_NVRM_EVENTS_PER_OWNER` 130) | 17408 in all, 4098 per process, grows from 1024 | `kmd_logic/rm_limits.rs`, `kmd_logic/nvrm_events.rs`, `gpu/nvrm_events.rs` | registrations, all owners (0 if no event queue). DERIVED from the handle bounds: one `READY` per handle a process can have open (the registration requires the handle to be the caller's) plus its `TRANSPORT_LOST` and `SCANOUT_RELEASED`; in all the handle bound plus 1024. Grown like the handle table (13.8). 1024 / 130 fixed under `NvWinPolicy` = 0 |
 | `EVENT_QUEUE_SIZE` / `EVENT_BUF_BYTES` | 16 / 256 | same | event virtqueue (kept small on purpose: the by-value queue slot sits on the boot stack under `VirtioGpu::init`, gated by `tools/kmd-frame-sizes.ps1`) |
 | `OTHER_KICK_LIMIT` | 1024 | same | non-`EventReady` messages after which reposts stop kicking |
 | mapping id range | `1 .. 0x7FFFFFF0` | `virtio/nvrm.rs::mint_map_id`, `kmd_logic/nvrm_views.rs` | KMD-minted from ONE counter for the life of the driver (never restarted by a new transport, never reused); the table key is `id | 0x80000000` in `AdapterContext::mappings` |
@@ -470,7 +510,10 @@ What is owned, and what is checked:
   `AdapterContext::mappings`.
 - **Pins**: `nvrm_pins`; ids never reused.
 - **Events**: `nvrm_events` registry in `kmd_logic/nvrm_events.rs` (pure, host-tested).
-- Capacity of every table is reserved at init, so nothing allocates under the spinlock.
+- Capacity of the pin, event and client tables is reserved at init, so nothing allocates under the
+  spinlock. The handle and mapping tables start at 1024 slots and GROW (section 13.8): the new
+  storage is allocated at PASSIVE outside every lock before the reservation that needs it, and
+  only swapped in under the lock.
   Anything whose drop must run at PASSIVE (locked MDL, contiguous buffer, event
   reference) is handed back by value from `take_*` and released after the lock.
 - **The KMD itself is a client of this pipe** behind the `KmdRmClient` knob (default off): its
@@ -632,6 +675,9 @@ change a shape counter) before reading, or compare after the process has exited.
 | `NvDupDoubt` | requests with a slot the rules could not judge with confidence (a block of an unverified size, a field cut short, an fd control the host does not translate); forwarded in every mode | small; a rise names a workload to look at (section 12.5) |
 | `NvDupMode` | the `NvDupHarden` value in force (0, 1 or 2), written once the first forward read it | 2 until the default is flipped, then 1 |
 | `NvWinMb`, `NvAptMb` | size in MiB of shared-memory region 1 (RM window) and 2 (UVM aperture), written at init | nonzero, or `MMAP` answers `UNSUPPORTED` |
+| `NvMapMb` | bytes mapped through `MMAP` now, all owners, UVM aperture included, in MiB | follows the clients |
+| `NvMapQRef` | `MMAP`s refused or failed for want of window: the policy's refusals, a view not made after the host mapped, a host refusal (until the window policy it counted only the per-device quota; under `NvWinPolicy` = 0 it still does, byte for byte). The split is `NvWinR*` (section 13.6). A mapping-table bound is NOT in it: `NvMapTRef` | **0**; nonzero says the window is under pressure |
+| `NvWin*`, `NvHdl*`, `NvMapT*`, `NvTblOom`, `NvPinQRef`, `NvSanityRef` | the RM window policy, the handle and mapping tables behind the per-process bounds, pin quota refusals | section 13.6 |
 
 `Fg*` counters belong to the foreign-resource verb (`zero-copy-present.md`), not this
 escape.
@@ -761,8 +807,10 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
 - Host-side indeterminate cases: a timed-out `Open` or `SEMSURF_FENCE_CREATE` can leave an
   untracked host handle (a fence ends by itself within the host driver's 5 s timeout but its
   handle stays until the host side is reset); a timed-out `Close` is treated as closed.
-- Fence handles count against the per-process handle quota (128) with every file. A client
-  that keeps hundreds of fences in flight must close fired ones promptly (section 4.6).
+- Fence handles count against the per-process handle bound (4096 now, 128 before the tables grew,
+  and again under `NvWinPolicy` = 0) with every file. A client that keeps hundreds of fences in
+  flight must close fired ones promptly (section 4.6); the host's own cap is 4096 unsignalled
+  fences.
 
 ### 10.2 UNVERIFIED (could not be checked from source alone)
 
@@ -1098,3 +1146,322 @@ rules are not sure they count instead of refusing:
    prefix field.
 3. Add a test with an own, a foreign, a zero and a wrong-size value; run it first as a Doubt in
    `NvDupHarden` = 2 on a real workload if the layout was not read from a header.
+
+## 13. The RM window policy and the table limits
+
+Pure rules: `kmd_logic/src/rm_window.rs` (who may map how many bytes of region 1),
+`rm_limits.rs` (when a table grows, where it refuses), `window_units.rs` (64-bit placement and
+MiB conversion). Driver side: `virtio/nvrm_window.rs` (counters, privilege, publishing),
+the doors in `virtio/gpu/nvrm_tables.rs`, `virtio/nvrm.rs::host_mmap`, `ddi/escape.rs::nvrm_mmap`.
+Host tests: `cargo test` in `guest/windows/kmd_logic`.
+
+### 13.1 What is accounted
+
+NVK maps RM memory with `MMAP` into the host's RM window (shared-memory region 1, sized by the
+backend's `--window-mib`, read by the KMD as `NvWinMb`: the GPU's BAR1, 32 GiB with ReBAR, 128 GiB
+on a 96 GB card). The HOST places each mapping there (its own extent allocator, split into caching
+zones: `host/backend/device/src/shm.rs`) and the reply names where; the KMD never chooses an
+address in region 1 and holds no free list or bitmap of it. So what the KMD can count is BYTES: the
+sum of the sizes of the live non-UVM mappings (the UVM aperture, region 2, is exempt as before). That
+is an approximation of the real occupancy: the host also holds extents for mappings armed by
+`RM_MAP_MEMORY` and not yet `MMAP`ed, and its zones can run out (write-combined is most of it) while
+the byte total still has room. A host refusal is therefore its own counted reason (`NvWinRHost`,
+last errno `NvWinHErrno`: 12 is ENOMEM, the host's zone is full). The KMD cannot report a "largest
+free extent": `NvWinFreeMb` is `cap - in use`, an upper bound.
+
+### 13.2 The policy (`NvWinPolicy` = 1, the default)
+
+* No fixed per-process share. Any device may map until the window is full.
+* A reserve (`NvWinReserveMb`, default 256 MiB) is kept for the privileged device: a map by anybody
+  else is refused once it would take the in-use total past `cap - reserve`; the privileged device
+  may use everything up to `cap`. The reserve is clamped to a quarter of the cap, so a small
+  window (a 256 MiB BAR1 without ReBAR keeps 64 MiB) or an `NvWinMaxMb` at or below the reserve
+  still gives an ordinary device at least three quarters: never less than the legacy window/4
+  (`small_windows_table`).
+* `cap` is the window size, or `NvWinMaxMb` when that is set and smaller: an operator bound on the
+  non-paged pool (each mapping costs an MDL of 2 KiB per MiB: 64 MiB of pool for a full 32 GiB, 256
+  MiB for 128 GiB; `NvWinMaxMb` = 16384 would hold it to 32 MiB).
+* One map is never larger than `MAX_MAP_BYTES` (256 MiB, the MDL's contiguous non-paged allocation
+  and the `ULONG` length of `IoAllocateMdl`); a map larger than the window could ever give (an empty
+  window would refuse it too) is `NvWinRBig`.
+* Refusal: `NO_RESOURCES`, what the quota answered, so NVK's patch falls back to system memory
+  with no UMD change. Counted by reason (13.6) and in `NvMapQRef`.
+* `NvWinPolicy` = 0 is the old rule byte for byte: a quarter of the window per device (8 GiB of 32),
+  nothing else, no reserve, and the tables back at their old fixed sizes (1024 handles, 128 per
+  process, 1024 maps, 256 per process). The pure function equals the old one over a grid of
+  windows and sizes (`legacy_equals_the_old_function`).
+
+All of it is `u64` bytes; the knob products are `u64` (any `u32` MiB is valid, 4 PiB at most).
+
+### 13.3 The privileged device (the reserve is its)
+
+Nothing in the KMD identified DWM before (no image name, no pid). The choice, least fragile first:
+
+1. **The holder of the foreign scanout source** (`SCANOUT_SET`): DWM-on-NVK is the process that sets
+   scanout 0 from an NVK-allocated image. Decided at map time by `foreign_scanout_owner_is` (the
+   leaf `STATE` lock, read BEFORE the virtio lock is taken) and made sticky: a successful
+   `SCANOUT_SET` marks the device privileged in the account until the device is destroyed
+   (`close_all_for_owner`), so DWM keeps the reserve between sources (a resolution change, a
+   lapse), exactly when it re-creates its swap chain.
+2. **The KMD's own RM client** (`DeviceOwner::KMD_RM`), always.
+
+**A restarted DWM** is a new device, ordinary until its first `SCANOUT_SET`, and its first maps
+(swap chain, glyph caches) come before that. While others hold the window up to `cap - reserve` it
+would be refused: the shell would fall back to system memory for its first buffers. Mitigation, kept
+simple (`rm_window::PRIVILEGE_GRACE_100NS`, test `a_restarted_dwm_gets_the_reserve_for_its_first_maps`):
+when a device marked privileged is destroyed, the account opens a 30 s grace. A device that appears
+during it (no row yet) may use the reserve, and the row it makes keeps that right until the grace
+ends (`NvWinGrace` counts them); devices that already held maps stay ordinary, and the right ends
+with the 30 s or with the device's own `SCANOUT_SET` (the sticky mark). Cost: any new process
+that starts in those 30 s can use the reserve too, which only matters if the window is nearly full,
+and the reserve is only 256 MiB. Not chosen: keying on a MISC_PRIMARY/foreign primary allocation
+(the KMD sees it at `CreateAllocation`, in another lock domain and before any NVRM device exists)
+or on the last privileged process image (no image name is recorded anywhere). If DWM restarts
+slower than 30 s after the old one died, its first maps are ordinary until its `SCANOUT_SET`;
+`NvWinPriv` 0 with a running desktop says it.
+
+Not used, on purpose: an image-name list (`PsGetProcessImageFileName` for `dwm.exe`) needs an
+export the Rust bindings do not carry and a C shim that cannot be built here, and is a name a
+renamed binary spoofs; no image name or pid is recorded anywhere in the KMD today. Cost: a device that never sets a scanout
+source (a DWM that has not yet drawn) maps as an ordinary device, which only matters while the
+window is nearly full. Risk: any process can call `SCANOUT_SET` and claim the reserve (a hostile
+process already can take the whole window below the reserve; the reserve only keeps the shell
+alive, it is not a security boundary, see the trust notes in section 10.1). The
+reserve in use is `NvWinRsvUse`; `NvWinPriv` is the number of privileged devices.
+
+### 13.4 Reclaim (designed, not implemented)
+
+Reclaiming an idle mapping is not safe from the KMD alone: the process holds a live user address
+into it, `MmUnmapLockedPages` is only legal in the owner's context, and an access after it faults
+the process instead of failing a call. No mapping is provably idle. The safe design is cooperative:
+the read-only `WINDOW_INFO` report (section 4.7) tells NVK how much room is left, and a future
+"release hint" event (kind 3 or a new one) asks the UMD to `MUNMAP` its least recently used
+persistent maps (NVK knows which are idle; its patch falls back to system memory for the next one).
+The KMD would count hints sent and honoured. Nothing evicts today; the refusal is the pressure
+valve.
+
+### 13.5 Scale: 32 to 128 GiB
+
+| item | state |
+|---|---|
+| byte counts, offsets, region lengths | `u64` everywhere (13.1, section 5 "Nothing assumes a 4 GiB window") |
+| `NvWinMb` parse and publish | `virtio_pci_cap64` length, `mib_u32` (exact to 4 PiB, saturating) |
+| mapping the window | never as one range. Per map: an MDL of PFNs (`IoAllocateMdl`, 8 bytes per page) mapped into the caller. `MmMapIoSpace` is only the KMD's own client, one surface at a time |
+| non-paged pool | MDLs: 2 KiB per MiB mapped (bound with `NvWinMaxMb`); tables: handle slot ~48 bytes, map slot ~40, so 16384 handles is under 1 MiB |
+| per-map work | `O(table)` scans under the lock (the old gauge refold per change is gone; the policy is `O(owners)`): at the 8192/16384 bounds about 10 to 30 microseconds worst case. An index by owner is the next step if the bounds are ever raised |
+| DPC per `EventReady` | ONE scan of the handle table under the virtio lock (`nvrm_handle_index`, shared by the fence-fired mark and the latch); it used to be two per event, up to 16 events per drain. The events registry scan (`signal_handle`) is over at most 1024 registrations. Still `O(table)` and not indexed: at the 16384 bound a scan is tens of microseconds, so an index by handle is the next step if tables are ever near their bound. Also `O(table)` at PASSIVE: `fence_claim_index` counts the attached fences (a counter kept at the attach/close sites would make it `O(1)`), and `nvrm_judge` / `nvrm_handle_device_type` per forwarded ioctl |
+| BAR | the guest must give the device a BAR for all three regions (above-4G decoding); the KMD reads the base from config space |
+| host zones | the host splits the window by caching type; a WC-only workload fills its zone before the byte total (13.1) |
+| `VIDMM_VRAM_MAX_MB` (64 GiB) | region 3 (Venus), not region 1; a Venus window above 64 GiB reads `VidVBad` and disables the VidMm override |
+
+### 13.6 Counters and knobs
+
+Knobs (service key, REG_DWORD, read once per transport): `NvWinPolicy` (default 1; 0 = legacy),
+`NvWinReserveMb` (default 256), `NvWinMaxMb` (default 0 = the window). Names are at most 14
+characters, unique across `kmd_render` and `kmd_logic` (`rm_window::counter_names_fit_...` scans
+both trees).
+
+| counter | meaning |
+|---|---|
+| `NvWinMb` | the window, MiB (existing) |
+| `NvWinPol` / `NvWinCapMb` / `NvWinResMb` | policy in force; effective cap; reserve (MiB) |
+| `NvWinUseMb` / `NvWinPeakMb` / `NvWinFreeMb` | window bytes mapped now (non-UVM); high-water mark since driver load; `cap - use` |
+| `NvWinRsvUse` | MiB in use inside the reserve (only the privileged device gets there) |
+| `NvWinMaps` / `NvWinOwn` / `NvWinPriv` | live window mappings; devices with a row; devices marked privileged |
+| `NvWinGrace` | devices let use the reserve by the privilege grace (13.3, a restarted DWM or any new device within 30 s of the shell's loss) since the transport started |
+| `NvWinRFull` | refused: the window (up to `cap`) has no room |
+| `NvWinRRes` | refused: a non-privileged map would eat into the reserve |
+| `NvWinRBig` | refused: one map larger than the window could ever give |
+| `NvWinRTab` | refused: bookkeeping full (no owner row, or the adapter-wide view table) |
+| `NvWinRAddr` | the view could not be made after the host mapped (MDL, user address space) |
+| `NvWinRHost` / `NvWinHErrno` | the host refused the `Mmap`; the last errno (12 = its zone is full) |
+| `NvWinT1Pid`, `NvWinT1Mb` ... `NvWinT4Pid`, `NvWinT4Mb` | the four owners mapping most (process id of the first map, MiB); 0 = unused rank. Recomputed under the lock at every change in `O(owners)`, published at PASSIVE only |
+| `NvMapMb` | all `MMAP` bytes now, UVM included (existing) |
+| `NvMapQRef` | the window refusals and failures above (`NvWinRFull`, `NvWinRRes`, `NvWinRBig`, `NvWinRTab`, `NvWinRAddr`, `NvWinRHost`), NOT the mapping-table bounds (`NvMapTRef`). Under `NvWinPolicy` = 0 only the per-device quota refusals, as before: the new reasons are then visible in `NvWinR*` alone |
+| `NvHdlLive` / `NvHdlPeak` / `NvHdlCap` / `NvHdlGrow` | live handles (reservations included), high-water mark, table slots, growths |
+| `NvHdlORef` / `NvHdlGRef` / `NvHdlFRef` | handle reservations refused: per-process bound, whole-table bound, fairness while scarce |
+| `NvMapTCap` / `NvMapTGrow` / `NvMapTRef` | mapping table slots, growths, refusals by its bounds |
+| `NvRestLost` | a handle still open on the host that could not be put back after a failed `Close` (nothing was left in the storage kept for restores): untracked until the sweep. Should read 0 |
+| `NvTblOom` | a table wanted to grow and the allocator refused, or a reservation found no storage because growth lagged (only a hostile burst gets there) |
+| `NvPinQRef` | `PIN`s refused by the per-process pin quota (before this counter nothing in the registry showed it) |
+| `NvWinInfo` | `WINDOW_INFO` calls answered (section 4.7) |
+| `NvSanityRef` | every refusal by a sanity bound: `NvHdl*Ref` plus `NvMapTRef` |
+
+### 13.7 Reading a submission failure: which counters show KMD-side exhaustion
+
+The FFXIV run: an NVK queue submit failed after about 56,700 frames (`present_frame_gate: command
+stream/submission failed`, hr 0x80004005, no host Xid). A refusal anywhere below reaches the UMD as
+`NO_RESOURCES` / `STATUS_INSUFFICIENT_RESOURCES` and from there as a generic failure. Every path:
+
+| path | limit | counter TODAY (before this change) | counter now |
+|---|---|---|---|
+| window byte quota | window/4 per device | `NvMapQRef` (and `NvMapErr`, +1 per refused `MMAP`) | `NvMapQRef`, split `NvWinRFull`/`NvWinRRes`/`NvWinRBig` |
+| per-process mapping count | 256 | `NvMapErr` only (no counter of its own) | `NvMapTRef`, `NvSanityRef` (bound 4096) |
+| host refused the map (its window or zone full) | host | `NvMapErr` | `NvWinRHost`, `NvWinHErrno` |
+| view not made (MDL, address space) | OS | `NvMapErr`; QUERY_STATS `MAP_PAGES_FAILS` | `NvWinRAddr` |
+| adapter-wide view table | 8192 | QUERY_STATS `MAPPING_FULL_REJECTS` | `NvWinRTab` as well |
+| per-process handle quota (`Open`, fence create) | 128 | `NvRef` only (shared with every policy refusal) | `NvHdlORef` / `NvHdlGRef` / `NvHdlFRef`; `NvHdlLive` shows the level |
+| client table (`NvDupHarden`) | 32 per process, 256 | `NvCliFull` | unchanged (not yet dynamic) |
+| pin quota | 256 per process, 1024 | nothing (`NvPinErr` counts what failed after the lock) | `NvPinQRef`; `NvPinErr` as before |
+| pin leaks | n/a | `NvPinLeak`, `NvPin - NvUnpin` | unchanged |
+| event registrations | 130 per process, 1024 | `NvEvRef` | `NvEvRef` (bound now 4098 per process, derived from the handle bound) |
+| fence early table | 16 | `NvFenceErr` | unchanged |
+| KMD-held (attached) fences | 512 | `RmGRef` (marker refused), `FsFRef` | unchanged |
+| RM gates / points | 8 gates, 128 points | `RmGRef` | unchanged |
+| scanout fenced queue | 8 | `FsFFull` | unchanged |
+| producer completion | 8192 pending, 16384 writers, 64 marks | `PrdFull`, `PrdWrFull`, `PrdMarkFull` (`PrdPend`, `PrdHi` level) | unchanged |
+| flush gate table | see `flush-gate.md` | `FlGTblFull` | unchanged |
+| control ring full past 5 s | virtqueue | `QfRet` (retries) | unchanged |
+| windowed-blt tokens | 64 | loud Present refusal (`PrBndDrop` is a different thing) | unchanged |
+| scanout allocation slots | 32 | `ScAlcFul` | unchanged |
+
+**Can a per-frame resource leak and hit a fixed limit in about 56,700 frames?** The leak rate each
+table implies, if one entry is lost every N frames: 128 handles (fence handles count against it)
+N = 443; 512 attached fences N = 111; 1024 pins, events or handles in the old global table N = 55;
+8192 producer entries N = 6.9; 64 windowed-blt tokens N = 886. Where the KMD can lose one:
+
+* **A fence handle** is created per present (one `SEMSURF_FENCE_CREATE`). The KMD closes it when
+  the carrier is accepted and the fence fires (`NvFenceCl` counts it). It stays the CALLER's when a
+  carrier whose status the UMD sees is refused (the scanout `PRESENT` with a fence, `HE12`): the
+  UMD must then `Close` it. A single error path in NVK that forgets that is a leak of one handle
+  per occurrence, and at 128 every later create is refused with `NvRef` rising. Read
+  `NvFence - NvFenceCl` (live fences; with no leak it stays near the frames in flight), `NvOpen -
+  NvClose`, and `NvHdlLive` / `NvHdlPeak`: a value climbing steadily with the frame count and
+  stopping at 128 (legacy) or 4096 is this leak; from this change the 128 wall is gone, and a leak
+  would show as `NvHdlLive` rising instead of a failed submit.
+* **A KMD-held fence** that never fires (the host's `EventReady` lost, the event queue has 16
+  buffers): `RmGAtt - RmGFire - RmGCan` grows and `NvFence - NvFenceCl` with it; at 512 the carrier is
+  refused (`RmGRef`) and presents fall back to the legacy wait. `NvEvErr`, `NvEvDrop`, `NvFenceErr`
+  say whether notifications are being lost.
+* **A producer entry** stranded behind an older one that never completes (`PrdPend` rising with
+  frames, `PrdHi` at 8192, `PrdFull` > 0, the UMD log "producer: allocation epoch publication
+  failed"). The completion rule fix (`producer-completion.md`) closes the known cases; 56,700 / 8192
+  is 6.9 frames per entry, so this is the one that needs MOST of the frames to leak and the first to
+  check if `PrdPend` is high.
+* **Event registrations** (`EVENT_REGISTER` per fence wait): `NvEvReg - NvEvUnreg` is only an order
+  of magnitude (Close removes without counting); `NvEvRef` > 0 is the refusal at the per-process
+  bound (130 before the registry followed the handle bound; 4098 now).
+* **Mappings** do not accumulate per frame in the present path (persistent maps); `NvWinMaps` and
+  `NvMap` show it if they do. **Pins** are not in the present path (`NvPin - NvUnpin`, `NvPinQRef`).
+* No fixed table in the release book (`scanout_release.rs`, 32 slots) can fail a call: it
+  overwrites its oldest entry (counted as evicted), so it cannot be the cause.
+
+So: after a failed submit read, in this order, `NvRef`, `NvHdlLive`/`NvHdlPeak`, `NvFence`/`NvFenceCl`,
+`RmGRef`/`RmGAtt`/`RmGFire`, `PrdPend`/`PrdHi`/`PrdFull`, `NvEvRef`, `NvMapQRef`/`NvWinR*`,
+`NvPinQRef`, `QfRet`. The registry values are published at most 255 NVRM calls late (section 7).
+
+### 13.8 Table growth and the sanity bounds
+
+The handle and mapping tables used to be fixed arrays reserved at init (so nothing allocates under
+the spinlock): 1024 handles with 128 per process, 1024 maps with 256 per process. Those numbers
+were guesses; the limits that matter are the host's (it opens real files: 4096 unsignalled fences)
+and RM's own. The tables now start at 1024 slots and grow by doubling to a SANITY bound that no
+real client reaches (handles 16384 / 4096 per process; maps 8192 / 4096 per process, the size of the
+adapter-wide view table they feed), counted when hit (`NvHdl*Ref`, `NvMapTRef`, `NvSanityRef`).
+
+* Growth never allocates under the lock. `grow_nvrm_tables` runs at PASSIVE before the reservation
+  that needs room (`Open`, a fence create, `MMAP`): under a short lock hold it asks the pure
+  `want_capacity` whether fewer than 16 slots are free, allocates the new storage with no lock, takes
+  the lock again and swaps it in (`append`: a copy, no allocation), and frees the old, empty storage
+  after the lock. A push still only ever happens into a free slot (the reservation checks
+  `live < capacity`), so a lost race refuses (`NvTblOom`) instead of allocating.
+* Fairness: while a table is 3/4 full, a process already holding its fair share is refused
+  (`NvHdlFRef`), so the last quarter of the table is only for processes below it. The fair share
+  is 1/8 of the handle table (2048: it must be BELOW the per-process bound of 4096, or the
+  per-process refusal fires first and the rule is dead; the first shape had exactly that bug) and
+  1/4 of the mapping table (2048 of 8192). Four hostile processes can take 12288 handles between
+  them and no more; a fresh process (DWM) still gets slots (`hostile_owners_cannot_starve_a_fresh_one`,
+  and `production_shapes_can_actually_be_fair` holds both shapes to it). Below the scarce point
+  only the per-process bound applies.
+* **Init frame budget.** `VirtioGpu::init` builds the transport by value on the boot stack, and
+  the `StartDevice` + `init` pair was at its ceiling (17936 bytes was the last good nested pair, 18800
+  did not boot, `tools/kmd-frame-sizes.ps1`). The window account and both tables' bounds therefore
+  live in ONE `Box<NvrmLimits>` built by `new_window_account` (`#[inline(never)]`, one pointer
+  returned, its registry reads in its own frame), so `init` gains 8 bytes of struct and no return
+  slot. **The script must be run on the build** (`new_window_account` is in its default symbols and
+  chains); the numbers were not measured here.
+* **Restores cannot grow, so they have their own slots.** A forwarded `Close` takes the entry out
+  of the table first (the host may reuse the number at once) and puts it back if the host did not
+  take the close; the KMD's own fence close does the same. Both run where nothing may allocate, and
+  used to reserve a slot like an `Open`, so a table that filled up in between silently untracked a
+  handle still open on the host. The handle table now keeps `restore_slack` = 8 slots of storage
+  that no reservation may take (`rm_limits::admit` stops reservations 8 short of the capacity, and
+  the PASSIVE pre-grow keeps 16 free, so growth stays ahead); `restore_nvrm_handle` /
+  `restore_fence_after_failed_close` use them with no bound and no growth. If even those are gone
+  `NvRestLost` counts it (read 0). `NvWinPolicy` = 0 has no slack (the old shape, 0 slots).
+* The window account's owner rows (512) are reserved at init; a 513th device mapping at once is
+  `NvWinRTab`.
+* The event registry grows the same way (`Registry::want_capacity` / `spare` / `install`, run by
+  `grow_nvrm_tables` before `EVENT_REGISTER`), to a bound derived from the handle bounds
+  (`rm_limits::EVENTS`): a process may register an event on every handle it can hold, and no
+  more. Registrations hold an object reference each, bounded by the handle bound.
+* Behaviour in the working range is unchanged: refusals only appear past the old numbers.
+* `NvWinPolicy` = 0 restores the fixed tables.
+
+### 13.9 Audit of the other fixed limits
+
+"Host/protocol" = a number the host or the ABI defines (keep, derive from it). "Arbitrary" = a guess
+(make dynamic). Nothing below was changed except the first two rows; the order is the recommended
+order of work. Safety rule for every one: a global sanity bound plus a per-owner share while the
+global is scarce, counted, grown at PASSIVE outside the lock (13.8).
+
+| # | limit | value | where | kind | recommendation |
+|---|---|---|---|---|---|
+| 1 | handle table | 1024 / 128 | `nvrm_tables.rs` | arbitrary | DONE (13.8) |
+| 2 | mapping table | 1024 / 256 | same | arbitrary | DONE (13.8) |
+| 3 | pins | 1024 / 256 | same | arbitrary (the lock cost is the process's own locked-page quota) | next: same growth (`Vec<NvrmPin>`), the `NvPinQRef` counter exists |
+| 4 | event registrations | 1024 / 130 | `nvrm_events.rs`, `kmd_logic::nvrm_events::Registry` | arbitrary | DONE: derived from the handle bound (4098 per process) and grown (13.8); a process past ~128 live fences no longer fails at `EVENT_REGISTER` |
+| 5 | RM client table (`NvDupHarden`) | 256 / 32 | `kmd_logic/nvrm_clients.rs` | arbitrary, `[Slot; 256]` in a box | make a growable `Vec`; per process 32 is far above one NVK process (it makes a few roots) |
+| 6 | attached (KMD-held) fences | 512 | `nvrm_tables.rs` | KMD budget, below gates x points (8 x 128 = 1024) | derive from gates x points or raise with them |
+| 7 | RM gates / points per gate | 8 / 128 | `rm_gates.rs`, `rm_fence_present.rs` | arbitrary (the UMD falls back to a CPU wait) | gates per process count (`MAX_STREAMS` 64 is the adapter-wide stream table, `lib.rs`) |
+| 8 | fence early table | 16 | `nvrm_fence.rs` | arbitrary, loses a wake counted `NvFenceErr` | keep (bounded by creates in flight) or make it a `Vec` |
+| 9 | scanout fenced queue | 8 | `rm_fence_present.rs`, `HELIOS_NVRM_SCANOUT_FENCE_DEPTH` | protocol (the UMD knows 8) | keep; `QUEUE_FULL` is the contract |
+| 10 | scanout release book | 32 | `scanout_release.rs` | arbitrary, SELF-EVICTING (cannot fail a call) | keep |
+| 11 | producer completion | 8192 allocations (ABI), 8192 pending, 16384 writers, 64 marks, 1024 waiters, 16384 bindings | `producer_completion.rs`, `adapter/producer.rs` | slots: protocol (`HELIOS_PRODUCER_SLOTS`, the status page); the rest arbitrary, allocated at `StartDevice` | keep the slot count; make pending/writers grow only if `PrdHi` ever nears them (`PrdPend`, `PrdHi`, `PrdFull` exist; 100 000-entry soak test) |
+| 12 | windowed-blt tokens | 64 | `gpu/mod.rs` `MAX_WINDOWED_BLT_PENDING` | tied to `HELIOS_READ_LEDGER_SLOTS` = 65 (ABI, the ledger page) | keep with the ABI; derive both from the flip queue depth in a version bump |
+| 13 | scanout allocation slots | 32 | `create_allocation.rs` | arbitrary (`ScAlcFul`) | grow (also 512 foreign records, 64 per owner, `foreign_resource.rs`, `rm-backed-standard.md` item 5) |
+| 14 | foreign resources | 512 / 64 per owner, 4 GiB per owner, 2048 open rows | `foreign_resource.rs` | arbitrary | grow with 13 |
+| 15 | adapter-wide view table | 8192 | `mapping.rs` | arbitrary (Doom lesson: raised once) | growable behind the same PASSIVE pre-grow; it is the real bound of 2 |
+| 16 | blobs / resources / contexts | 8192 / 16384 / 1024 | `gpu/mod.rs` | arbitrary | counters exist (`BLOB_FULL_REJECTS`, `RESOURCE_FULL_REJECTS`, `CONTEXT_FULL_DROPS` in QUERY_STATS); grow |
+| 17 | in-flight control entries | `CTRL_QUEUE_SIZE` (virtqueue), parked 4x | `gpu/mod.rs` | host-derived (queue size) | already derived |
+| 18 | Venus window ranges (region 3) | 1024 free ranges | `WindowAllocator` | arbitrary: past it a freed range is DROPPED (fragmentation leak, `WINDOW_RANGE_DROPS`) | grow the free list or coalesce harder |
+| 19 | fence waiters / events | 64 / 256 | `gpu/mod.rs` | arbitrary (`WtTbl`) | grow |
+| 20 | event virtqueue | 16 buffers | `nvrm_events.rs` | boot-stack frame budget | keep (events are rare); `NvEvDrop`/`NvEvErr` say if it matters |
+| 21 | flip queue depth, S4 FIFO | 1..16, 8 | `query_adapter_info.rs`, `rm_fence_present.rs` | protocol / WDDM caps | keep |
+| 22 | pin pages per pin | 262143 | `nvrm_tables.rs` | protocol (the indirect run table) | keep |
+| 23 | one map | 256 MiB | `nvrm.rs` | KMD (MDL allocation, `ULONG` length) | keep; the window total is the budget |
+
+### 13.10 Checklist
+
+1. Install; `reg query HKLM\\SYSTEM\\CurrentControlSet\\Services\\helios_kmd_render`: `NvWinMb` is the
+   BAR1 size in MiB (32768 for 32 GiB), `NvWinPol` 1, `NvWinCapMb` = `NvWinMb`, `NvWinResMb` 256.
+2. Run `crm_smoke` and `crm_pin_smoke`: `NvWinUseMb` rises while mappings are held and returns to 0
+   (`NvMapMb` too); `NvWinPeakMb` keeps the peak; `NvWinMaps` follows `NvMap`.
+3. Run NVK / the desktop with DWM-on-NVK: `NvWinPriv` is 1 (the device that set the scanout source);
+   `NvWinT1Pid` is the process with the most mapped; `NvWinRFull`, `NvWinRRes`, `NvWinRBig` 0.
+4. Pressure test (several processes mapping to the cap): refusals count in `NvWinRRes` first (the
+   ordinary limit), `NvWinRFull` only when the privileged device itself fills the window;
+   `NvWinRsvUse` > 0 only while DWM is in the reserve.
+5. Long run: `NvHdlLive` and `NvFence - NvFenceCl` stay flat; `NvHdlGrow` 0 for a normal game (one
+   growth appears past about 1000 handles); `NvSanityRef`, `NvTblOom` 0.
+6. Fallback: `reg add ... /v NvWinPolicy /t REG_DWORD /d 0`, restart the device: the old quota
+   and fixed tables are back (`NvWinPol` 0).
+7. `NvWinHErrno` 12 with `NvWinRHost` rising and `NvWinUseMb` well below `NvWinCapMb` means the
+   host's caching zone is full, not the KMD's accounting: raise the host window or look at the
+   host's write-combine zone.
+
+### 13.11 Verification status
+
+* `cargo test` in `guest/windows/kmd_logic`: `rm_window` (hostile sizes, u64 overflow, 64 GiB windows,
+  reserve boundary exact to the page, per-owner accounting, free-all-by-owner, sticky privilege,
+  top-N, fragmentation, a 20 000-step interleaving checked against a full recomputation, legacy
+  equals the old function), `rm_limits` (growth, bounds, fairness, the grow-then-reserve protocol),
+  `window_units`, and the counter-name uniqueness scan of both trees.
+* `kmd_render` cannot be built here: it was type-checked as a whole crate against the `wdk-sys` stub
+  harness, comparing the errors before and after (no new ones apart from the stubbed
+  `PsGetCurrentProcessId`); nothing was run in a Windows guest. NOT VERIFIED: the real build, that
+  `wdk_sys::ntddk::PsGetCurrentProcessId` is bound, the grow-and-swap under load, the 32 GiB BAR
+  assignment by the guest, DWM's actual `SCANOUT_SET` ordering relative to its first maps.
+* Risks: a process can claim the reserve with a `SCANOUT_SET`; the byte total cannot see the host's
+  zones (13.1); table scans are `O(n)` under the lock (13.5); the privilege grace (13.3) lets
+  any device that appears within 30 s of the shell's loss use the reserve.

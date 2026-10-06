@@ -68,6 +68,9 @@ param(
         # the present-stream allocator.
         '17allocate_rm_gates',
         '30allocate_scanout_refresh_state',
+        # The RM window account (virtio/gpu/nvrm_tables.rs): built in its own frame, returns
+        # one Box pointer (the window account and both table bounds in one allocation).
+        '18new_window_account',
         '14bring_up_venus',
         '26allocate_host_visible_blob',
         '9VenusRing8bring_up',
@@ -88,6 +91,7 @@ param(
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,24allocate_present_streams',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,17allocate_rm_gates',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,30allocate_scanout_refresh_state',
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,18new_window_account',
         '9lifecycle20dxgkddi_start_device,14bring_up_venus,26allocate_host_visible_blob,13VenusInstance11into_device,13VenusInstance29create_device_with_ext_ladder'
     ),
     [int]      $Window  = 24

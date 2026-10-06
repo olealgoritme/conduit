@@ -25,12 +25,23 @@ use alloc::boxed::Box;
 use helios_kmd_logic::nvrm_clients::{ClientTable, Commit, Verdict};
 use helios_kmd_logic::nvrm_fence::{is_fence as is_fence_type, Noted, DEVICE_TYPE_FENCE};
 use helios_kmd_logic::rm_fence_present::{same_process, Attach, FenceMeta};
+use helios_kmd_logic::rm_limits::{self, Admit, Bounds};
+use helios_kmd_logic::rm_window::{self, Account, Policy};
 use helios_kmd_logic::sweep_budget::{PinAction, PinFate};
 
-/// Most backend handles tracked across every process.
-pub const MAX_NVRM_HANDLES: usize = 1024;
-/// Most one process may hold open at once (`QUERY_CAPS` reports it).
-pub const MAX_NVRM_HANDLES_PER_OWNER: usize = 128;
+/// The sanity bounds of the handle and mapping tables, and where they start: the shapes are
+/// `helios_kmd_logic::rm_limits::{HANDLES, MAPS}` (host-tested there). The tables GROW from
+/// 1024 slots (what they always held) up to the global bound, at PASSIVE and outside the lock
+/// (`grow_nvrm_tables`); the bounds are far above anything a real client reaches and are there
+/// so a hostile process cannot take the non-paged pool. A bound that is hit is counted
+/// (`NvHdlORef`, `NvHdlGRef`, `NvHdlFRef`, `NvMapTRef`, `NvSanityRef`). `NvWinPolicy` = 0 puts
+/// the old fixed numbers back (`rm_limits::*_LEGACY`), nothing grows. The table:
+/// `docs/nvrm-escape.md` section 5.
+///
+/// Backend handles tracked across every process (fence handles included), at most.
+pub const MAX_NVRM_HANDLES: usize = rm_limits::HANDLES.global_max;
+/// Most one process may hold open at once (`QUERY_CAPS` reports the bound in force).
+pub const MAX_NVRM_HANDLES_PER_OWNER: usize = rm_limits::HANDLES.per_owner_max;
 /// Most fence handles the KMD holds at once as its own (attached to a present, or
 /// discarded and owed a `Close`), across every process. A fence moves out of its
 /// creator's per-process quota when the KMD takes it, and into this one: gates hold
@@ -38,9 +49,15 @@ pub const MAX_NVRM_HANDLES_PER_OWNER: usize = 128;
 /// them (and the KMD's RM client, which shares the `KMD_RM` owner, would be refused
 /// its `Open`s).
 pub const MAX_NVRM_ATTACHED_FENCES: usize = 512;
-/// Most live `MMAP` mappings across every process, and per process.
-pub const MAX_NVRM_MAPS: usize = 1024;
-pub const MAX_NVRM_MAPS_PER_OWNER: usize = 256;
+/// Live `MMAP` mappings across every process, and per process (sanity bounds). The user
+/// views live in `AdapterContext::mappings`, one adapter-wide table of 8192 entries shared
+/// with every blob view (`mapping.rs`, `MAX_MAPPINGS`): a bound above it could never be
+/// reached, so this is it (a view refused there is counted as `NvWinRTab`).
+pub const MAX_NVRM_MAPS: usize = rm_limits::MAPS.global_max;
+pub const MAX_NVRM_MAPS_PER_OWNER: usize = rm_limits::MAPS.per_owner_max;
+/// Owners the window account can hold at once (rows), see `rm_window::Account`.
+const NVRM_WINDOW_OWNER_ROWS: usize = 512;
+
 /// Most live pins across every process, and per process.
 pub const MAX_NVRM_PINS: usize = 1024;
 pub const MAX_NVRM_PINS_PER_OWNER: usize = 256;
@@ -302,6 +319,129 @@ pub(super) fn new_client_table() -> Box<ClientTable> {
     }
 }
 
+/// The handle and mapping tables' bounds for `policy` (the shapes live in
+/// `helios_kmd_logic::rm_limits`, where the host tests hold them to their promises).
+pub(super) fn table_bounds(policy: Policy) -> (Bounds, Bounds, Bounds) {
+    match policy {
+        Policy::Dynamic => (rm_limits::HANDLES, rm_limits::MAPS, rm_limits::EVENTS),
+        Policy::Legacy => (
+            rm_limits::HANDLES_LEGACY,
+            rm_limits::MAPS_LEGACY,
+            rm_limits::EVENTS_LEGACY,
+        ),
+    }
+}
+
+/// The window account and both tables' bounds, in ONE box. `VirtioGpu::init` builds the
+/// transport by value on a boot-stack frame that was already at its budget (17936 bytes was the
+/// last good nested pair, 18800 did not boot: `tools/kmd-frame-sizes.ps1`): holding the two
+/// `Bounds` (64 bytes each) inline, or returning them next to a `Box`, would grow it.
+pub(super) struct NvrmLimits {
+    /// Who holds how many bytes of the RM window, the reserve, the refusals.
+    pub(super) acct: Account,
+    /// Sanity bounds and growth rules of the handle and mapping tables (the legacy fixed numbers
+    /// under `NvWinPolicy` = 0).
+    pub(super) handle_bounds: Bounds,
+    pub(super) map_bounds: Bounds,
+    /// The event registry's shape (derived from the handle table's).
+    pub(super) event_bounds: Bounds,
+}
+
+/// The window account, the policy it runs and both tables' bounds, from the knobs
+/// (`NvWinPolicy`, `NvWinReserveMb`, `NvWinMaxMb`) and the window the device reported.
+/// PASSIVE (transport init). `None` when the owner rows cannot be allocated.
+///
+/// `#[inline(never)]`, and it returns one pointer: its locals (the registry reads, the config)
+/// live and die in its own frame, not in `VirtioGpu::init`'s.
+#[inline(never)]
+pub(super) fn new_window_account(window: Option<HostVisibleWindow>) -> Option<Box<NvrmLimits>> {
+    use crate::diag::{knobs, read_config_dword};
+    let policy = Policy::from_knob(read_config_dword(knobs::NV_WIN_POLICY, 1));
+    let cfg = rm_window::Config::new(
+        window.map_or(0, |w| w.len),
+        read_config_dword(knobs::NV_WIN_RESERVE_MB, rm_window::DEFAULT_RESERVE_MIB),
+        read_config_dword(knobs::NV_WIN_MAX_MB, 0),
+        policy,
+    );
+    let acct = Account::new(cfg, NVRM_WINDOW_OWNER_ROWS)?;
+    let (handle_bounds, map_bounds, event_bounds) = table_bounds(policy);
+    crate::virtio::nvrm_window::configure(
+        &cfg,
+        handle_bounds.per_owner_max,
+        map_bounds.per_owner_max,
+    );
+    crate::virtio::nvrm_window::HDL_CAP.store(handle_bounds.initial as u32, Ordering::Relaxed);
+    crate::virtio::nvrm_window::MAP_CAP.store(map_bounds.initial as u32, Ordering::Relaxed);
+    Some(Box::new(NvrmLimits {
+        acct,
+        handle_bounds,
+        map_bounds,
+        event_bounds,
+    }))
+}
+
+/// Give the handle table and the mapping table the room their next reservation wants.
+///
+/// PASSIVE, outside every lock, BEFORE the reservation (`reserve_nvrm_handle_slot`,
+/// `begin_nvrm_fence_create`, a `MMAP`): the new storage is allocated here and only SWAPPED
+/// in under the lock, so nothing allocates (or frees) with the spinlock held. A table
+/// that wants to grow and cannot (the allocator refuses, or it is at its bound) is left
+/// alone: the reservation then refuses by the bound (counted) or, for the allocator, as
+/// `NvTblOom`. Cheap when nothing is wanted: one lock hold, two comparisons.
+pub fn grow_nvrm_tables(adapter: &crate::adapter::AdapterContext) {
+    /// New storage for `n` entries, counted `NvTblOom` when the allocator refuses.
+    fn fresh<T>(n: Option<usize>) -> Option<Vec<T>> {
+        let n = n?;
+        let mut v = Vec::new();
+        match v.try_reserve_exact(n) {
+            Ok(()) => Some(v),
+            Err(_) => {
+                crate::virtio::nvrm_window::TBL_OOM.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+    // Each step at least doubles a table, so a few suffice for the 16x between initial and
+    // bound; the loop is bounded in any case.
+    for _ in 0..6 {
+        let wants = adapter.with_virtio(|v| {
+            (
+                v.nvrm_handles_want(),
+                v.nvrm_maps_want(),
+                v.nvrm_events_want(),
+            )
+        });
+        let Ok((h, m, e)) = wants else {
+            return;
+        };
+        if h.is_none() && m.is_none() && e.is_none() {
+            return;
+        }
+        let fresh_h = fresh::<NvrmHandleSlot>(h);
+        let fresh_m = fresh::<NvrmMapSlot>(m);
+        let fresh_e = e.and_then(|n| {
+            let s = helios_kmd_logic::nvrm_events::Registry::<core::ptr::NonNull<wdk_sys::KEVENT>>::spare(n);
+            if s.is_none() {
+                crate::virtio::nvrm_window::TBL_OOM.fetch_add(1, Ordering::Relaxed);
+            }
+            s
+        });
+        if fresh_h.is_none() && fresh_m.is_none() && fresh_e.is_none() {
+            return;
+        }
+        // The swap is under the lock; the old (now empty) storage comes back and is freed
+        // here, outside it.
+        let old = adapter.with_virtio(|v| {
+            (
+                v.nvrm_handles_install(fresh_h),
+                v.nvrm_maps_install(fresh_m),
+                v.nvrm_events_install(fresh_e),
+            )
+        });
+        drop(old);
+    }
+}
+
 impl VirtioGpu {
     // ---- RM clients (cross-client hardening) -----------------------------------------
     //
@@ -381,12 +521,90 @@ impl VirtioGpu {
             .iter()
             .filter(|s| s.owner == owner && s.fence.attached() == Attach::None)
             .count();
-        if self.nvrm_handles.len() + self.nvrm_reserved >= MAX_NVRM_HANDLES
-            || mine >= MAX_NVRM_HANDLES_PER_OWNER
-        {
+        let live = self.nvrm_handles.len() + self.nvrm_reserved;
+        let verdict = rm_limits::admit(
+            &self.nvrm_limits.handle_bounds,
+            self.nvrm_handles.capacity(),
+            live,
+            mine,
+        );
+        if verdict != Admit::Ok {
+            // `NeedGrow` here means the PASSIVE pre-grow (`grow_nvrm_tables`) did not
+            // cover this reservation (the allocator refused, or more concurrent
+            // reservers than the headroom): refused and counted as `NvTblOom`.
+            crate::virtio::nvrm_window::count_handle_refusal(verdict);
             return false;
         }
         self.nvrm_reserved += 1;
+        let now = (live + 1).min(u32::MAX as usize) as u32;
+        crate::virtio::nvrm_window::HDL_LIVE.store(now, Ordering::Relaxed);
+        crate::virtio::nvrm_window::HDL_PEAK.fetch_max(now, Ordering::Relaxed);
+        true
+    }
+
+    /// The capacity the handle table wants before the next reservation, if it wants more.
+    /// Called outside the lock's critical work (a short hold), then the allocation happens
+    /// with no lock held ([`grow_nvrm_tables`]).
+    pub(super) fn nvrm_handles_want(&self) -> Option<usize> {
+        rm_limits::want_capacity(
+            &self.nvrm_limits.handle_bounds,
+            self.nvrm_handles.capacity(),
+            self.nvrm_handles.len() + self.nvrm_reserved,
+        )
+    }
+
+    /// Swap in the larger storage allocated outside the lock. Moves the entries (a copy, no
+    /// allocation: the new storage holds them all) and hands back the old storage, empty,
+    /// for the caller to free with no lock held. A `fresh` that is not larger than what is
+    /// here (another caller grew it first) or cannot hold what is here comes back untouched.
+    pub(super) fn nvrm_handles_install(
+        &mut self,
+        fresh: Option<Vec<NvrmHandleSlot>>,
+    ) -> Option<Vec<NvrmHandleSlot>> {
+        let mut fresh = fresh?;
+        if fresh.capacity() <= self.nvrm_handles.capacity()
+            || fresh.capacity() < self.nvrm_handles.len()
+        {
+            return Some(fresh);
+        }
+        fresh.append(&mut self.nvrm_handles);
+        core::mem::swap(&mut self.nvrm_handles, &mut fresh);
+        crate::virtio::nvrm_window::HDL_CAP.store(
+            self.nvrm_handles.capacity().min(u32::MAX as usize) as u32,
+            Ordering::Relaxed,
+        );
+        crate::virtio::nvrm_window::HDL_GROWS.fetch_add(1, Ordering::Relaxed);
+        Some(fresh)
+    }
+
+    /// The live-handles gauge after an entry left the table.
+    fn note_handles_live(&self) {
+        let live = (self.nvrm_handles.len() + self.nvrm_reserved).min(u32::MAX as usize) as u32;
+        crate::virtio::nvrm_window::HDL_LIVE.store(live, Ordering::Relaxed);
+    }
+
+    /// Put `handle` back after a forwarded `Close` the host did not take (it is still open
+    /// there, and still `owner`'s). Takes a slot of the storage the reservations leave free
+    /// (`Bounds::restore_slack`): no bound, no fairness (the entry was admitted when it was
+    /// made) and no growth (this runs where nothing may allocate). `false`, and `NvRestLost`
+    /// counted, when even that is gone: the handle is then open on the host and untracked
+    /// here until the transport's sweep.
+    pub fn restore_nvrm_handle(&mut self, owner: DeviceOwner, handle: u32, device_type: u32) -> bool {
+        if !rm_limits::restore_room(
+            self.nvrm_handles.capacity(),
+            self.nvrm_handles.len() + self.nvrm_reserved,
+        ) {
+            crate::virtio::nvrm_window::REST_LOST.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.nvrm_handles.push(NvrmHandleSlot {
+            owner,
+            handle,
+            device_type,
+            ready_latched: false,
+            fence: FenceMeta::new(0),
+        });
+        self.note_handles_live();
         true
     }
 
@@ -433,6 +651,7 @@ impl VirtioGpu {
             return false;
         };
         self.nvrm_handles.swap_remove(idx);
+        self.note_handles_live();
         true
     }
 
@@ -441,6 +660,7 @@ impl VirtioGpu {
     pub fn take_nvrm_handle_for_owner(&mut self, owner: DeviceOwner) -> Option<(u32, u32)> {
         let idx = self.nvrm_handles.iter().position(|s| s.owner == owner)?;
         let s = self.nvrm_handles.swap_remove(idx);
+        self.note_handles_live();
         Some((s.handle, s.device_type))
     }
 
@@ -449,13 +669,23 @@ impl VirtioGpu {
     /// lock): the owner, the handle and its `device_type`.
     pub fn take_nvrm_handle_any(&mut self) -> Option<(DeviceOwner, u32, u32)> {
         let s = self.nvrm_handles.pop()?;
+        self.note_handles_live();
         Some((s.owner, s.handle, s.device_type))
     }
 
-    /// Latch an `EventReady` for `handle` (see `NvrmHandleSlot::ready_latched`).
-    /// `false` if no process has it open.
-    pub(super) fn latch_nvrm_ready(&mut self, handle: u32) -> bool {
-        match self.nvrm_handles.iter_mut().find(|s| s.handle == handle) {
+    /// The table index of `handle` (any owner), for the DPC that serves one `EventReady`: ONE
+    /// scan under the virtio lock, shared by [`Self::fence_note_fired_at`] and
+    /// [`Self::latch_nvrm_ready_at`] (it used to be two per event, up to a ring's worth of
+    /// events per drain, over a table that can now hold 16384 entries). Valid until the table
+    /// changes: the caller holds the lock and changes nothing in between.
+    pub(super) fn nvrm_handle_index(&self, handle: u32) -> Option<usize> {
+        self.nvrm_handles.iter().position(|s| s.handle == handle)
+    }
+
+    /// Latch an `EventReady` for the handle at `idx` (see `NvrmHandleSlot::ready_latched`).
+    /// `false` if no process has it open (`idx` is `None`).
+    pub(super) fn latch_nvrm_ready_at(&mut self, idx: Option<usize>) -> bool {
+        match idx.and_then(|i| self.nvrm_handles.get_mut(i)) {
             Some(s) => {
                 s.ready_latched = true;
                 true
@@ -542,11 +772,10 @@ impl VirtioGpu {
     /// An `EventReady{handle, status}` for a fence: record that it fired (the first
     /// one only; see `FenceMeta::set_fired`). The caller routes by what it was
     /// attached to.
-    pub(super) fn fence_note_fired(&mut self, handle: u32, status: i32) -> FenceFire {
-        match self
-            .nvrm_handles
-            .iter_mut()
-            .find(|s| s.handle == handle && is_fence_type(s.device_type))
+    pub(super) fn fence_note_fired_at(&mut self, idx: Option<usize>, status: i32) -> FenceFire {
+        match idx
+            .and_then(|i| self.nvrm_handles.get_mut(i))
+            .filter(|s| is_fence_type(s.device_type))
         {
             None => FenceFire::NotFence,
             Some(s) => {
@@ -721,7 +950,9 @@ impl VirtioGpu {
             .nvrm_handles
             .iter()
             .position(|s| is_fence_type(s.device_type) && s.fence.close_wanted())?;
-        Some(self.nvrm_handles.swap_remove(idx).handle)
+        let handle = self.nvrm_handles.swap_remove(idx).handle;
+        self.note_handles_live();
+        Some(handle)
     }
 
     /// The host did not take the `Close` of `handle` that [`Self::take_fence_to_close`]
@@ -731,7 +962,13 @@ impl VirtioGpu {
     /// the worker would retry it forever): it is the KMD's, counted against the KMD's
     /// own fence quota and not the RM client's, and only the sweep closes it.
     pub fn restore_fence_after_failed_close(&mut self, handle: u32) {
-        if self.nvrm_handles.len() + self.nvrm_reserved >= MAX_NVRM_HANDLES {
+        if !rm_limits::restore_room(
+            self.nvrm_handles.capacity(),
+            self.nvrm_handles.len() + self.nvrm_reserved,
+        ) {
+            // No slot (the slack kept for this was used up): the fence stays open on the
+            // host and untracked here. Counted, never silent (`NvRestLost`).
+            crate::virtio::nvrm_window::REST_LOST.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let mut fence = FenceMeta::new(0);
@@ -774,16 +1011,124 @@ impl VirtioGpu {
         }
     }
 
-    /// How many mappings `owner` holds (for the quota check before asking the host).
-    pub fn nvrm_map_count(&self, owner: DeviceOwner) -> usize {
-        self.nvrm_maps.iter().filter(|s| s.owner == owner).count()
+    /// May `owner` hold one more mapping, by the table's sanity bounds (per process, whole
+    /// table, fairness when scarce)? The pre-check before the host is asked. `NeedGrow` means
+    /// the table is full but may grow: the caller runs [`grow_nvrm_tables`] and asks again.
+    pub fn nvrm_map_admit(&self, owner: DeviceOwner) -> Admit {
+        let mine = self.nvrm_maps.iter().filter(|s| s.owner == owner).count();
+        rm_limits::admit(
+            &self.nvrm_limits.map_bounds,
+            self.nvrm_maps.capacity(),
+            self.nvrm_maps.len(),
+            mine,
+        )
+    }
+
+    /// The capacity the mapping table wants before the next push, if it wants more.
+    pub(super) fn nvrm_maps_want(&self) -> Option<usize> {
+        rm_limits::want_capacity(
+            &self.nvrm_limits.map_bounds,
+            self.nvrm_maps.capacity(),
+            self.nvrm_maps.len(),
+        )
+    }
+
+    /// Swap in the larger mapping storage allocated outside the lock (see
+    /// [`Self::nvrm_handles_install`]).
+    pub(super) fn nvrm_maps_install(
+        &mut self,
+        fresh: Option<Vec<NvrmMapSlot>>,
+    ) -> Option<Vec<NvrmMapSlot>> {
+        let mut fresh = fresh?;
+        if fresh.capacity() <= self.nvrm_maps.capacity() || fresh.capacity() < self.nvrm_maps.len()
+        {
+            return Some(fresh);
+        }
+        fresh.append(&mut self.nvrm_maps);
+        core::mem::swap(&mut self.nvrm_maps, &mut fresh);
+        crate::virtio::nvrm_window::MAP_CAP.store(
+            self.nvrm_maps.capacity().min(u32::MAX as usize) as u32,
+            Ordering::Relaxed,
+        );
+        crate::virtio::nvrm_window::MAP_GROWS.fetch_add(1, Ordering::Relaxed);
+        Some(fresh)
+    }
+
+    /// May `owner` map `size` more bytes of the window? The pre-check before the host is
+    /// asked, counting a refusal by reason. Always for the UVM aperture (its own region,
+    /// sized by the host). `live_privileged`: the caller's evidence that `owner` is the
+    /// privileged device (see `virtio::nvrm_window::live_privileged`; it is read before the
+    /// lock is taken).
+    pub fn nvrm_window_admit(
+        &mut self,
+        owner: DeviceOwner,
+        uvm: bool,
+        size: u64,
+        live_privileged: bool,
+    ) -> Result<(), rm_window::Refusal> {
+        if uvm {
+            return Ok(());
+        }
+        self.win_tick();
+        let r = self
+            .nvrm_limits
+            .acct
+            .admit(owner.raw() as u64, live_privileged, size);
+        if let Err(why) = r {
+            crate::virtio::nvrm_window::count_refusal(why);
+        }
+        r
+    }
+
+    /// Give the window account the clock (a scalar read, legal at any IRQL), for the privilege
+    /// grace (`rm_window::PRIVILEGE_GRACE_100NS`).
+    fn win_tick(&mut self) {
+        self.nvrm_limits
+            .acct
+            .tick(crate::adapter::foreign_scanout::now_100ns());
+    }
+
+    /// What `WINDOW_INFO` tells `owner` (`helios_kmd_logic::rm_window::Account::info`). Read
+    /// only: no counter moves.
+    pub fn nvrm_window_info(
+        &self,
+        owner: DeviceOwner,
+        live_privileged: bool,
+    ) -> rm_window::Info {
+        self.nvrm_limits.acct.info_at(
+            crate::adapter::foreign_scanout::now_100ns(),
+            owner.raw() as u64,
+            live_privileged,
+        )
+    }
+
+    /// `owner` set the foreign scanout source: it is the privileged device from now until
+    /// its device is destroyed (the reserve is its to use).
+    pub fn nvrm_window_mark_privileged(&mut self, owner: DeviceOwner) {
+        let _ = self
+            .nvrm_limits
+            .acct
+            .mark_privileged(owner.raw() as u64, 0);
+        crate::virtio::nvrm_window::mirror(&self.nvrm_limits.acct.snapshot());
+    }
+
+    /// `owner`'s device is destroyed: forget what the window account holds for it (the
+    /// per-map releases already ran for each mapping taken; this drops the sticky
+    /// privileged mark and any row left by a map whose slot was already gone).
+    pub fn nvrm_window_forget_owner(&mut self, owner: DeviceOwner) {
+        self.win_tick();
+        let _ = self.nvrm_limits.acct.forget_owner(owner.raw() as u64);
+        crate::virtio::nvrm_window::mirror(&self.nvrm_limits.acct.snapshot());
     }
 
     /// Track a new mapping and mint its id. `None` when the handle is no longer
     /// `owner`'s (a concurrent `Close` got there first — the host may already have
-    /// reused the number), or the table or `owner`'s quota is full, or ids ran out.
+    /// reused the number), or a table bound or the window policy refuses, or ids ran out.
     /// Checked and pushed under one lock hold, so a mapping can never be recorded
-    /// against a handle that is gone.
+    /// against a handle that is gone. A non-UVM mapping is charged to the window account
+    /// here (the pre-check ran before the host round trip; other maps may have landed
+    /// since), and a refusal is counted by reason.
+    #[allow(clippy::too_many_arguments)]
     pub fn push_nvrm_map(
         &mut self,
         owner: DeviceOwner,
@@ -791,24 +1136,39 @@ impl VirtioGpu {
         host_id: u32,
         size: u64,
         uvm: bool,
+        pid: u32,
+        live_privileged: bool,
     ) -> Option<u32> {
         if !self.nvrm_handle_owned(owner, handle) {
             return None;
         }
-        // Re-checked here under the same hold as the push (the pre-check in
-        // `nvrm_map_bytes_room` ran before the host round trip).
-        if !self.nvrm_map_bytes_room(owner, uvm, size) {
-            crate::virtio::nvrm::NVRM_MAP_QUOTA_REFUSED.fetch_add(1, Ordering::Relaxed);
+        // Storage first: this push must not allocate, so a slot has to be free (the
+        // PASSIVE pre-grow made one unless the allocator refused or a bound was hit).
+        if self.nvrm_map_admit(owner) != Admit::Ok {
+            crate::virtio::nvrm_window::count_map_table_refusal();
             return None;
         }
-        let mine = self.nvrm_maps.iter().filter(|s| s.owner == owner).count();
-        if self.nvrm_maps.len() >= MAX_NVRM_MAPS || mine >= MAX_NVRM_MAPS_PER_OWNER {
+        // Re-checked here under the same hold as the push.
+        self.win_tick();
+        if !uvm
+            && self
+                .nvrm_limits
+            .acct
+                .charge(owner.raw() as u64, pid, live_privileged, size)
+                .map_err(crate::virtio::nvrm_window::count_refusal)
+                .is_err()
+        {
             return None;
         }
         // Driver-wide counter, not per transport: the view this id names outlives
         // the transport (see `helios_kmd_logic::nvrm_views`). Minted last, after
         // every refusal above, so a refusal costs no id.
-        let kmd_id = crate::virtio::nvrm::mint_map_id()?;
+        let Some(kmd_id) = crate::virtio::nvrm::mint_map_id() else {
+            if !uvm {
+                self.nvrm_limits.acct.release(owner.raw() as u64, size);
+            }
+            return None;
+        };
         self.nvrm_maps.push(NvrmMapSlot {
             owner,
             handle,
@@ -817,38 +1177,28 @@ impl VirtioGpu {
             size,
             uvm,
         });
-        self.refresh_map_gauge();
+        self.map_added(size);
         Some(kmd_id)
     }
 
-    /// The per-device byte quota for views of the RM window: a quarter of the window
-    /// (read from the device at init, not assumed), so one process cannot starve the
-    /// others of window space. 0 with no window.
-    pub fn nvrm_map_byte_quota(&self) -> u64 {
-        self.nvrm_window.map_or(0, |w| w.len / 4)
+    /// A mapping of `size` bytes was recorded: the all-owners gauge (`NvMapMb`, the UVM
+    /// aperture included) and the window gauges follow, with no scan of the table.
+    fn map_added(&self, size: u64) {
+        crate::virtio::nvrm::NVRM_MAP_BYTES.fetch_add(size, core::sync::atomic::Ordering::Relaxed);
+        crate::virtio::nvrm_window::mirror(&self.nvrm_limits.acct.snapshot());
     }
 
-    /// Whether `owner` may map `size` more bytes: always for the UVM aperture (it has
-    /// its own region and the host sizes it), else within [`Self::nvrm_map_byte_quota`].
-    pub fn nvrm_map_bytes_room(&self, owner: DeviceOwner, uvm: bool, size: u64) -> bool {
-        if uvm {
-            return true;
+    /// A mapping slot was taken out of the table: give its bytes back.
+    fn map_removed(&mut self, s: &NvrmMapSlot) {
+        let _ = crate::virtio::nvrm::NVRM_MAP_BYTES.fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |b| Some(b.saturating_sub(s.size)),
+        );
+        if !s.uvm {
+            self.nvrm_limits.acct.release(s.owner.raw() as u64, s.size);
         }
-        let mine: u64 = self
-            .nvrm_maps
-            .iter()
-            .filter(|s| s.owner == owner && !s.uvm)
-            .fold(0u64, |a, s| a.saturating_add(s.size));
-        mine.saturating_add(size) <= self.nvrm_map_byte_quota()
-    }
-
-    /// Publish the bytes currently mapped, all owners (`NvMapMb`).
-    fn refresh_map_gauge(&self) {
-        let total = self
-            .nvrm_maps
-            .iter()
-            .fold(0u64, |a, s| a.saturating_add(s.size));
-        crate::virtio::nvrm::NVRM_MAP_BYTES.store(total, core::sync::atomic::Ordering::Relaxed);
+        crate::virtio::nvrm_window::mirror(&self.nvrm_limits.acct.snapshot());
     }
 
     /// Whether a live mapping already carries this nonzero host id on `handle`.
@@ -870,7 +1220,7 @@ impl VirtioGpu {
             .iter()
             .position(|s| s.owner == owner && s.kmd_id == kmd_id)?;
         let s = self.nvrm_maps.swap_remove(idx);
-        self.refresh_map_gauge();
+        self.map_removed(&s);
         Some((s.handle, s.host_id))
     }
 
@@ -886,7 +1236,7 @@ impl VirtioGpu {
             .iter()
             .position(|s| s.owner == owner && s.handle == handle)?;
         let s = self.nvrm_maps.swap_remove(idx);
-        self.refresh_map_gauge();
+        self.map_removed(&s);
         Some((s.kmd_id, s.host_id))
     }
 
@@ -895,7 +1245,7 @@ impl VirtioGpu {
     pub fn take_nvrm_map_for_owner(&mut self, owner: DeviceOwner) -> Option<(u32, u32, u32)> {
         let idx = self.nvrm_maps.iter().position(|s| s.owner == owner)?;
         let s = self.nvrm_maps.swap_remove(idx);
-        self.refresh_map_gauge();
+        self.map_removed(&s);
         Some((s.handle, s.kmd_id, s.host_id))
     }
 
@@ -903,7 +1253,7 @@ impl VirtioGpu {
     /// handle and host id.
     pub fn take_nvrm_map_any(&mut self) -> Option<(u32, u32)> {
         let s = self.nvrm_maps.pop()?;
-        self.refresh_map_gauge();
+        self.map_removed(&s);
         Some((s.handle, s.host_id))
     }
 
@@ -1092,6 +1442,10 @@ impl VirtioGpu {
         self.nvrm_maps.clear();
         self.nvrm_handles.clear();
         self.nvrm_reserved = 0;
+        // Nothing is mapped or privileged in a transport that is gone; the high-water mark
+        // and the refusal counts stay.
+        self.nvrm_limits.acct.clear();
+        crate::virtio::nvrm_window::reset_gauges();
         crate::virtio::nvrm::NVRM_SWEPT.fetch_add(swept, Ordering::Relaxed);
         swept
     }

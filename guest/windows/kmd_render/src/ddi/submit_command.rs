@@ -276,8 +276,11 @@ pub(crate) fn publish_nvrm_counters() {
     crate::adapter::foreign_scanout::publish_counters();
     // Producer completion table occupancy (`Prd*`): see `adapter::producer`.
     crate::adapter::producer::publish_counters();
-    // Bytes mapped through MMAP now (all owners, MiB), and MMAPs refused by the
-    // per-device quota of a quarter of the RM window.
+    // The RM window policy (`NvWin*`), the handle and mapping tables behind the
+    // per-process bounds (`NvHdl*`, `NvMapT*`, `NvSanityRef`): `virtio::nvrm_window`.
+    crate::virtio::nvrm_window::publish_counters();
+    // Bytes mapped through MMAP now (all owners, MiB), and every MMAP refusal or failure of
+    // the window policy, all reasons (`NvMapQRef`; by reason: `NvWinR*`).
     crate::diag::record_named_bytes(
         b"NvMapMb",
         helios_kmd_logic::window_units::mib_u32(

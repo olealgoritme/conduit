@@ -24,6 +24,7 @@ pub mod hal;
 pub mod msi;
 pub mod nvrm;
 pub mod nvrm_harden;
+pub mod nvrm_window;
 pub mod pci_caps;
 pub mod rm_client;
 pub mod rm_foreign;

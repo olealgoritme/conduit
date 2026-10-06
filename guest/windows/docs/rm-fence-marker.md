@@ -314,6 +314,7 @@ free for capabilities:
 | 33 | `HELIOS_NVRM_CAP_PRESENT_FENCE` | the same, and the WDDM carriers are compiled in |
 | 34 | `HELIOS_NVRM_CAP_FLUSH_GATE` | the flush gate (`HEFL`) honours its RM fence variant, under the same preconditions as bit 33 (`flush-gate.md`) |
 | 35 | `HELIOS_NVRM_CAP_SCANOUT_RELEASE` | the host's `NVGPU_F_SCANOUT_RELEASE` was acked (display half on, event queue up): `SCANOUT_STATUS` (op bit 12) and the `SCANOUT_RELEASED` event kind exist (`foreign-scanout.md`) |
+| 36 | `HELIOS_NVRM_CAP_WINDOW_INFO` | always set by a KMD that has the RM window policy: `WINDOW_INFO` (op bit 13) exists (`nvrm-escape.md` section 4.7) |
 
 ## Statuses
 
