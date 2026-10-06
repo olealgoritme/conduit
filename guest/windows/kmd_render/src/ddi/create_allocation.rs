@@ -2940,6 +2940,7 @@ unsafe fn create_one(
     }
     if priv_ptr.is_null() || priv_len < size_of::<HeliosWddmAllocPrivate>() {
         crate::diag::record(0x0C01_0002);
+        crate::ddi::shared_placeholder::note_early_refusal(true, priv_len as u32);
         return Err(STATUS_INVALID_PARAMETER);
     }
     // SAFETY: bounds-checked above; the runtime guarantees `priv_len` bytes at
@@ -2953,6 +2954,7 @@ unsafe fn create_one(
     crate::diag::record(0x0C32_0000 | (ap.ctx_id & 0xFFFF));
     if !ap.is_valid() {
         crate::diag::record(0x0C01_0003);
+        crate::ddi::shared_placeholder::note_early_refusal(false, ap.magic);
         return Err(STATUS_INVALID_PARAMETER);
     }
     if ap.kind == HELIOS_WDDM_ALLOC_KIND_TRACKING
@@ -3330,6 +3332,11 @@ unsafe fn create_one(
         is_direct_scanout || (ctx.foreign.is_some() && crate::virtio::foreign_flip::enabled());
     let ctx_resource_id = ctx.resource_id;
     let ctx_serial = ctx.serial;
+    if placeholder {
+        // Counted BEFORE the producer registration below can fail and destroy the context, so
+        // `ShPhFree` never runs ahead of `ShPhMade`.
+        crate::ddi::shared_placeholder::note_created(ap.size);
+    }
     if adapter
         .producer
         .register_allocation((&*ctx as *const AllocationContext) as usize)
@@ -3452,9 +3459,6 @@ unsafe fn create_one(
     crate::diag::record(0x0C16_0000 | (meta.width.min(0xFFFF) as u32));
     crate::diag::record(0x0C17_0000 | (meta.height.min(0xFFFF) as u32));
     crate::diag::record(0x0C18_0000 | (meta.format & 0xFFFF));
-    if placeholder {
-        crate::ddi::shared_placeholder::note_created(ap.size);
-    }
     Ok(())
 }
 

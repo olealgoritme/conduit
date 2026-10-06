@@ -10,10 +10,19 @@
 //! * `ShPhMade`: placeholders created (host-less shared STANDARD allocations).
 //! * `ShPhBytes`: the size of the last one.
 //! * `ShPhRefuse`: placeholders refused with `STATUS_NO_MEMORY` (a soft per-resource failure);
-//!   `ShPhWhy` holds the last reason code (`Refusal::code`, 0x10 = too large).
+//!   `ShPhRefWhy` holds the last reason code (`Refusal::code`, 0x10 = too large).
 //! * `ShPhNear`: shared STANDARD allocations with adopt id 0 and context 0 that were NOT
 //!   placeholders and took the ordinary path (an unexpected private-data size or an identity
-//!   bit); `ShPhWhy` holds the last `Existing::code`.
+//!   bit); `ShPhNearWhy` holds the last `Existing::code`.
+//! * Making a wrong shared-bit assumption visible: `ShPhShape` counts identity-less STANDARD
+//!   allocations (adopt 0, ctx 0, no identity bit) whatever their flags and size, and
+//!   `ShPhFl1`..`ShPhFl8` hold the creation-flags word of the first eight of them (a shared
+//!   texture should read 3). `ShPhNotSh` counts those whose shared bit was CLEAR (so they took
+//!   the ordinary path), with `ShPhFlg` / `ShPhPriv` the flags word and private size of the
+//!   last one. If bit 1 is not `CreateShared`, the dump shows the shape arriving here.
+//! * `CrPrivSmall` / `CrApInvalid`: the two early refusals of `create_one` before any decision
+//!   (private data shorter than 48 bytes, value = its length; a record whose magic or version
+//!   is wrong, value = the magic word).
 //! * `ShPhOpen`: opens of an identity-less allocation of the placeholder shape (any process,
 //!   including the creator's own device open). Such an open succeeds with no identity: the
 //!   opener's Present rules see an unresolved allocation (`present_foreign`).
@@ -24,7 +33,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use bytemuck::pod_read_unaligned;
-use helios_kmd_logic::shared_placeholder::{self as sp, identity};
+use helios_kmd_logic::shared_placeholder::{self as sp, words};
 use helios_protocol::{
     HeliosWddmAllocMeta, HeliosWddmAllocPrivate, HELIOS_BLOB_MEM_RM_EXPORT,
     HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT, HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK,
@@ -40,48 +49,29 @@ const _: () = assert!(
             == size_of::<HeliosWddmAllocPrivate>() + size_of::<HeliosWddmAllocMeta>()
 );
 
+// The protocol words `helios_kmd_logic::shared_placeholder::identity_bits` spells as literals.
+const _: () = assert!(
+    words::BLOB_MEM_RM_EXPORT == HELIOS_BLOB_MEM_RM_EXPORT
+        && words::BLOB_FLAG_GLOBAL_VIDMM_TRACKER == HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER
+        && words::MISC_PRIMARY == HELIOS_WDDM_ALLOC_MISC_PRIMARY
+        && words::MISC_DIRECT_SCANOUT == HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT
+        && words::MISC_OPTIMAL_GDI_TEXTURE == HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE
+        && words::MISC_STANDARD_TYPE_MASK == HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK
+        && words::MISC_GDI_TYPE_MASK == HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK
+);
+
 static MADE: AtomicU32 = AtomicU32::new(0);
 static REFUSED: AtomicU32 = AtomicU32::new(0);
 static NEAR: AtomicU32 = AtomicU32::new(0);
 static OPENED: AtomicU32 = AtomicU32::new(0);
 static FREED: AtomicU32 = AtomicU32::new(0);
+static SHAPE: AtomicU32 = AtomicU32::new(0);
+static NOT_SHARED: AtomicU32 = AtomicU32::new(0);
+static EARLY_SMALL: AtomicU32 = AtomicU32::new(0);
+static EARLY_INVALID: AtomicU32 = AtomicU32::new(0);
 
-/// The [`identity`] bits of one allocation's private data. `misc_flags` is the meta's (zero
-/// when the meta is absent); `layout_trailer` is whether a valid layout trailer is present.
-pub(crate) fn identity_bits(
-    ap: &HeliosWddmAllocPrivate,
-    misc_flags: u32,
-    layout_trailer: bool,
-) -> u32 {
-    let mut bits = 0;
-    if ap.blob_id != 0 {
-        bits |= identity::BLOB_ID;
-    }
-    if ap.blob_mem == HELIOS_BLOB_MEM_RM_EXPORT {
-        bits |= identity::RM_EXPORT;
-    }
-    if ap.blob_flags & HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER != 0 {
-        bits |= identity::TRACKER;
-    }
-    if layout_trailer {
-        bits |= identity::LAYOUT_TRAILER;
-    }
-    if misc_flags & HELIOS_WDDM_ALLOC_MISC_PRIMARY != 0 {
-        bits |= identity::PRIMARY;
-    }
-    if misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0 {
-        bits |= identity::GDI_TEXTURE;
-    }
-    if misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT != 0 {
-        bits |= identity::DIRECT_SCANOUT;
-    }
-    if misc_flags & (HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK | HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK)
-        != 0
-    {
-        bits |= identity::STANDARD_TYPE;
-    }
-    bits
-}
+/// How many identity-less STANDARD allocations have their creation flags recorded one by one.
+const FLAG_SAMPLES: u32 = 8;
 
 /// The decision's input for one create-time allocation.
 pub(crate) fn create_input(
@@ -98,19 +88,45 @@ pub(crate) fn create_input(
         ctx_id: ap.ctx_id,
         private_size: private_size.min(u32::MAX as usize) as u32,
         size: ap.size,
-        identity: identity_bits(ap, misc_flags, layout_trailer),
+        identity: sp::identity_bits(&sp::PrivateFacts {
+            blob_id: ap.blob_id,
+            blob_mem: ap.blob_mem,
+            blob_flags: ap.blob_flags,
+            misc_flags,
+            layout_trailer,
+        }),
     }
 }
 
 /// Count a decision that was not ordinary and unremarkable: a refusal (the caller then fails
-/// soft) or a near miss. A `Placeholder` verdict is counted by [`note_created`] once the
+/// soft), a near miss, and every identity-less STANDARD allocation with its flags (so a wrong
+/// shared-bit assumption shows). A `Placeholder` verdict is counted by [`note_created`] once the
 /// allocation exists.
 pub(crate) fn note_verdict(input: &sp::Input, verdict: sp::Verdict) {
+    if sp::is_identityless_standard(input) {
+        let n = SHAPE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= FLAG_SAMPLES {
+            // `ShPhFl1`..`ShPhFl8`.
+            let name = [b'S', b'h', b'P', b'h', b'F', b'l', b'0' + n as u8];
+            crate::diag::record_named_bytes(&name, input.create_flags);
+        }
+        if n == 1 || n % 64 == 0 {
+            crate::diag::record_named_bytes(b"ShPhShape", n);
+        }
+        if !sp::is_shared(input.create_flags) {
+            let m = NOT_SHARED.fetch_add(1, Ordering::Relaxed) + 1;
+            if m <= FLAG_SAMPLES || m % 64 == 0 {
+                crate::diag::record_named_bytes(b"ShPhFlg", input.create_flags);
+                crate::diag::record_named_bytes(b"ShPhPriv", input.private_size);
+                crate::diag::record_named_bytes(b"ShPhNotSh", m);
+            }
+        }
+    }
     match verdict {
         sp::Verdict::Refuse(r) => {
             let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
             if n == 1 || n % 64 == 0 {
-                crate::diag::record_named_bytes(b"ShPhWhy", r.code());
+                crate::diag::record_named_bytes(b"ShPhRefWhy", r.code());
                 crate::diag::record_named_bytes(b"ShPhRefuse", n);
             }
         }
@@ -122,11 +138,28 @@ pub(crate) fn note_verdict(input: &sp::Input, verdict: sp::Verdict) {
         {
             let n = NEAR.fetch_add(1, Ordering::Relaxed) + 1;
             if n == 1 || n % 64 == 0 {
-                crate::diag::record_named_bytes(b"ShPhWhy", why.code());
+                crate::diag::record_named_bytes(b"ShPhNearWhy", why.code());
                 crate::diag::record_named_bytes(b"ShPhNear", n);
             }
         }
         _ => {}
+    }
+}
+
+/// `create_one` refused the private data before any decision: shorter than the 48-byte record
+/// (`value` = its length) or not a valid record (`value` = its magic word). First and every
+/// 64th each.
+pub(crate) fn note_early_refusal(too_small: bool, value: u32) {
+    if too_small {
+        let n = EARLY_SMALL.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 64 == 0 {
+            crate::diag::record_named_bytes(b"CrPrivSmall", value);
+        }
+    } else {
+        let n = EARLY_INVALID.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 64 == 0 {
+            crate::diag::record_named_bytes(b"CrApInvalid", value);
+        }
     }
 }
 
