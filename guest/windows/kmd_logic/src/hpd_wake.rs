@@ -293,10 +293,155 @@ pub const fn power_vsync(device_uid: u32, d0: bool, display_half: bool) -> Power
     }
 }
 
+// ---- v327: the v326 behaviour changes behind knobs, defaults = the v325 behaviour ------------
+
+/// `VsPowerMode` (default 0): 0 = KMD 325 (any non-D0 call of any `DeviceUid` quiesces the
+/// heartbeat), 1 = KMD 326 (only the ADAPTER leaving D0 does). Anything above 1 reads as 1.
+pub const fn clamp_power_mode(v: u32) -> u32 {
+    if v > 1 {
+        1
+    } else {
+        v
+    }
+}
+
+/// `VsWatchdog` (default 0): 0 = off (KMD 325), 1 = revive a heartbeat that is armed but silent,
+/// 2 = also re-arm one that was quiesced although the adapter is in D0 (KMD 326). Above 2 reads
+/// as 2.
+pub const fn clamp_watchdog(v: u32) -> u32 {
+    if v > 2 {
+        2
+    } else {
+        v
+    }
+}
+
+/// `VsIdleWake` (default 0): 1 = the HPD worker wakes 4 times a second while the heartbeat is
+/// armed, to run the watchdog (KMD 326); 0 = it waits as in KMD 325. Anything non-zero is 1.
+pub const fn clamp_idle_wake(v: u32) -> u32 {
+    if v != 0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// [`power_vsync`] under `VsPowerMode`: 0 quiesces on ANY non-D0 state of ANY uid (KMD 325), 1 is
+/// [`power_vsync`].
+pub const fn power_vsync_mode(mode: u32, device_uid: u32, d0: bool, display_half: bool) -> PowerVsync {
+    if mode == 0 && !d0 {
+        return PowerVsync::Quiesce;
+    }
+    power_vsync(device_uid, d0, display_half)
+}
+
+/// [`vsync_watch`] under `VsWatchdog` `level`: 0 never acts, 1 only revives, 2 revives and resumes.
+#[allow(clippy::too_many_arguments)]
+pub const fn vsync_watch_level(
+    level: u32,
+    armed: bool,
+    display_half: bool,
+    adapter_d0: bool,
+    gate_open: bool,
+    now: u64,
+    reference: u64,
+    period: u64,
+) -> VsyncWatch {
+    if level == 0 {
+        return VsyncWatch::Ok;
+    }
+    match vsync_watch(armed, display_half, adapter_d0, gate_open, now, reference, period) {
+        VsyncWatch::Resume if level < 2 => VsyncWatch::Ok,
+        other => other,
+    }
+}
+
+/// The optional 4 Hz watchdog tick of the worker's wait: only with `VsIdleWake` on, a watchdog
+/// that can act (`VsWatchdog` above 0), and a heartbeat that is meant to run.
+pub const fn idle_watch(
+    idle_wake: u32,
+    watchdog: u32,
+    optional: bool,
+    display_half: bool,
+    armed: bool,
+) -> Option<i64> {
+    if idle_wake != 0 && watchdog != 0 && optional && display_half && armed {
+        Some(VSYNC_WATCH_100NS)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
     use super::*;
+
+    // ---- v327: knobs default to the KMD 325 behaviour --------------------------------------
+
+    #[test]
+    fn power_mode_zero_quiesces_on_any_non_d0() {
+        for uid in [0, 1, DISPLAY_ADAPTER_HW_ID] {
+            assert_eq!(power_vsync_mode(0, uid, false, true), PowerVsync::Quiesce);
+            assert_eq!(power_vsync_mode(0, uid, false, false), PowerVsync::Quiesce);
+            assert_eq!(power_vsync_mode(0, uid, true, true), PowerVsync::Resume);
+            assert_eq!(power_vsync_mode(0, uid, true, false), PowerVsync::Leave);
+        }
+    }
+
+    #[test]
+    fn power_mode_one_is_adapter_only() {
+        assert_eq!(power_vsync_mode(1, 0, false, true), PowerVsync::Leave);
+        assert_eq!(
+            power_vsync_mode(1, DISPLAY_ADAPTER_HW_ID, false, true),
+            PowerVsync::Quiesce
+        );
+        assert_eq!(power_vsync_mode(1, 0, true, true), PowerVsync::Resume);
+    }
+
+    #[test]
+    fn knob_clamps() {
+        assert_eq!(clamp_power_mode(0), 0);
+        assert_eq!(clamp_power_mode(1), 1);
+        assert_eq!(clamp_power_mode(7), 1);
+        assert_eq!(clamp_watchdog(0), 0);
+        assert_eq!(clamp_watchdog(2), 2);
+        assert_eq!(clamp_watchdog(9), 2);
+        assert_eq!(clamp_idle_wake(0), 0);
+        assert_eq!(clamp_idle_wake(5), 1);
+    }
+
+    #[test]
+    fn watchdog_levels() {
+        let dead_armed =
+            |l| vsync_watch_level(l, true, true, true, true, 100 * 10_000_000, 1, 166_666);
+        let quiesced = |l| vsync_watch_level(l, false, true, true, true, 100, 0, 166_666);
+        assert_eq!(dead_armed(0), VsyncWatch::Ok);
+        assert_eq!(quiesced(0), VsyncWatch::Ok);
+        assert_eq!(dead_armed(1), VsyncWatch::Revive);
+        assert_eq!(quiesced(1), VsyncWatch::Ok);
+        assert_eq!(dead_armed(2), VsyncWatch::Revive);
+        assert_eq!(quiesced(2), VsyncWatch::Resume);
+    }
+
+    #[test]
+    fn idle_watch_is_off_unless_asked_for() {
+        assert_eq!(idle_watch(0, 2, true, true, true), None);
+        assert_eq!(idle_watch(1, 0, true, true, true), None);
+        assert_eq!(idle_watch(1, 2, false, true, true), None);
+        assert_eq!(idle_watch(1, 2, true, false, true), None);
+        assert_eq!(idle_watch(1, 2, true, true, false), None);
+        assert_eq!(idle_watch(1, 1, true, true, true), Some(VSYNC_WATCH_100NS));
+        // With the default knobs the wait is exactly KMD 325's.
+        let (due, class) = wait_plan(WaitInputs {
+            ctrl_inflight: false,
+            retry_pending: false,
+            foreign: None,
+            mirror: None,
+            watch: idle_watch(0, 0, true, true, true),
+        });
+        assert_eq!((due, class), (None, WaitClass::Infinite));
+    }
 
     const MS: u64 = 10_000;
 

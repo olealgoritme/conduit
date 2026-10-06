@@ -232,6 +232,12 @@ impl AdapterContext {
         let _ = unsafe { wdk_sys::ntddk::ZwClose(h as wdk_sys::HANDLE) };
     }
 
+    /// A worker thread handle is registered (`init_hpd` ran and `stop_hpd` has not taken it):
+    /// the StartDevice-entry breadcrumb `EntHpdTh`.
+    pub(crate) fn hpd_worker_registered(&self) -> bool {
+        self.hpd_thread.load(core::sync::atomic::Ordering::Relaxed) != 0
+    }
+
     /// True if [`Self::stop_hpd`] could not prove the worker exited, so this
     /// context must never be freed. Consulted by `dxgkddi_remove_device`.
     pub fn hpd_worker_may_be_running(&self) -> bool {
@@ -430,9 +436,12 @@ impl AdapterContext {
     /// `may_arm` is false (`ExSetTimer` is).
     pub(crate) fn vsync_watch(&self, may_arm: bool) {
         use core::sync::atomic::Ordering;
-        use helios_kmd_logic::hpd_wake::{vsync_watch, VsyncWatch};
+        use helios_kmd_logic::hpd_wake::VsyncWatch;
         use wdk_sys::ntddk::KeQueryInterruptTimePrecise;
-        if !self.display_half() {
+        // v327: `VsWatchdog` 0 (the default) is KMD 325: no watchdog, nothing re-arms a heartbeat
+        // but StartDevice and a D0 power call.
+        let level = crate::ddi::stall_diag::vs_watchdog();
+        if level == 0 || !self.display_half() {
             return;
         }
         let armed = self.vsync_armed.load(Ordering::Acquire) != 0;
@@ -441,7 +450,8 @@ impl AdapterContext {
         // SAFETY: a scalar clock read; `qpc_timestamp` is a live local.
         let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
         let period = helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(self));
-        match vsync_watch(
+        match helios_kmd_logic::hpd_wake::vsync_watch_level(
+            level,
             armed,
             true,
             crate::ddi::stall_diag::adapter_d0(),

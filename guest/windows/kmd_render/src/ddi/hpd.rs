@@ -65,8 +65,20 @@ fn indicate_child_status(adapter: &AdapterContext, connected: bool) {
     crate::diag::record_named_bytes(b"HpdStTo", HPD_START_EDGE_TIMEOUTS.load(Ordering::Relaxed));
 }
 
-/// Count of child-status indications this boot (diag `HpdN`).
+/// Count of child-status indications of this generation (diag `HpdN`; zeroed at every
+/// StartDevice since v327, so it is the worker of THIS start that wrote it).
 static HPD_INDICATE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The previous generation's `HpdN`, for the StartDevice-entry breadcrumb (`EntHpdN`).
+pub(crate) fn indicate_count() -> u32 {
+    HPD_INDICATE_COUNT.load(Ordering::Relaxed)
+}
+
+/// StartDevice: the indication count and the start-edge timeouts are this generation's.
+pub(crate) fn reset_for_start() {
+    HPD_INDICATE_COUNT.store(0, Ordering::Relaxed);
+    HPD_START_EDGE_TIMEOUTS.store(0, Ordering::Relaxed);
+}
 
 /// Times the prologue's bounded fallback fired instead of the real start edge
 /// (diag `HpdStTo`). Must read 0 on a healthy boot: a nonzero value means
@@ -115,6 +127,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
     // Stall breadcrumbs (`HpdSite`, `ddi::stall_diag`): every service and step below stores its
     // id and the clock when it is entered, so a worker that stops answering names the step it
     // stopped in. Atomics only; nothing here changes what the worker does.
+    stall_diag::hpd_phase(1);
     stall_diag::hpd_enter(site::START_WAIT);
     while adapter.start_complete.load(Ordering::Acquire) == 0 {
         if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
@@ -162,9 +175,11 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
     // Swapping first means a bit set DURING the indication survives to the next
     // iteration and is acted on there. The steady-state loop already had this
     // right; only this one-shot prologue did not.
+    stall_diag::hpd_phase(2);
     adapter.config_change_pending.swap(0, Ordering::AcqRel);
     stall_diag::hpd_enter(site::INDICATE);
     indicate_child_status(adapter, true);
+    stall_diag::hpd_phase(3);
 
     // Steady state is event/dirty driven. A real virtio display-change wakes us
     // to re-indicate the child; a completed primary GPU copy wakes us to queue
@@ -198,10 +213,15 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // While the heartbeat is meant to run the worker wakes 4 times a second even when idle,
         // to check it (`AdapterContext::vsync_watch`): an MMIO flip is woken by the heartbeat
         // alone, so a dead heartbeat and a sleeping worker would hold the flip for ever.
-        let watch = (optional
-            && adapter.display_half()
-            && adapter.vsync_armed.load(Ordering::Acquire) != 0)
-            .then_some(hpd_wake::VSYNC_WATCH_100NS);
+        // v327: off unless `VsIdleWake` (and a watchdog level) ask for it: the default wait is KMD
+        // 325's, infinite when nothing is due.
+        let watch = hpd_wake::idle_watch(
+            stall_diag::vs_idle_wake(),
+            stall_diag::vs_watchdog(),
+            optional,
+            adapter.display_half(),
+            adapter.vsync_armed.load(Ordering::Acquire) != 0,
+        );
         let (due, class) = hpd_wake::wait_plan(hpd_wake::WaitInputs {
             ctrl_inflight,
             retry_pending,
@@ -239,6 +259,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             return;
         }
         stall_diag::hpd_loop(wait_status == STATUS_TIMEOUT);
+        stall_diag::hpd_phase(4);
         // The retire flag is consumed on EVERY pass, whatever else woke the worker: submits
         // signal only its 0 -> 1 edge (`note_and_maybe_signal`), so a flag left set by a pass
         // that drained for another reason would silence every later wake.
