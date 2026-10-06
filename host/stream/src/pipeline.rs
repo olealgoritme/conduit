@@ -165,6 +165,7 @@ fn main_loop(g: &Gpu, host: &Arc<Host>, sock: &Arc<UdpSocket>) {
     let mut held_back = false;
     loop {
         // Wait for something to do, at most until the next due time.
+        let mut superseded: Option<Frame> = None;
         let cursor = {
             let mut ib = sh.inbox.lock().unwrap();
             let timeout = if enc.is_none() {
@@ -184,11 +185,15 @@ fn main_loop(g: &Gpu, host: &Arc<Host>, sock: &Arc<UdpSocket>) {
                 ib = sh.cv.wait_timeout(ib, timeout).unwrap().0;
             }
             if let Some(f) = ib.frame.take() {
-                pending = Some(f);
+                superseded = pending.replace(f);
             }
             seen_kick = ib.kick;
             ib.cursor.take()
         };
+        // A frame held back for the budget and replaced: never read.
+        if let Some(o) = superseded {
+            sh.dropped(o.desc.id, o.seq);
+        }
         if let Some(c) = cursor {
             let r = match &c {
                 Some(img) => {
@@ -210,8 +215,12 @@ fn main_loop(g: &Gpu, host: &Arc<Host>, sock: &Arc<UdpSocket>) {
             sender = None;
             // Keep the newest picture current for the next session.
             if let Some(f) = pending.take() {
-                if let Err(e) = g.set_frame(f.fd.as_raw_fd(), &f.desc) {
-                    log::warn!("frame: {e:#}");
+                match g.set_frame(f.fd.as_raw_fd(), &f.desc) {
+                    Ok(()) => sh.showing(f.desc.id, f.seq),
+                    Err(e) => {
+                        log::warn!("frame: {e:#}");
+                        sh.dropped(f.desc.id, f.seq);
+                    }
                 }
             }
             continue;
@@ -316,14 +325,20 @@ fn main_loop(g: &Gpu, host: &Arc<Host>, sock: &Arc<UdpSocket>) {
         let mut received = now;
         if let Some(f) = pending.take() {
             received = f.received;
-            if let Err(err) = g.set_frame(f.fd.as_raw_fd(), &f.desc) {
-                log::warn!(
-                    "frame {}x{} {} {:#x}: {err:#}",
-                    f.desc.width,
-                    f.desc.height,
-                    broker::fourcc_str(f.desc.fourcc),
-                    f.desc.modifier
-                );
+            // The encode that read the previous buffer has finished (encodes
+            // are synchronous), so it is released as this one takes over.
+            match g.set_frame(f.fd.as_raw_fd(), &f.desc) {
+                Ok(()) => sh.showing(f.desc.id, f.seq),
+                Err(err) => {
+                    log::warn!(
+                        "frame {}x{} {} {:#x}: {err:#}",
+                        f.desc.width,
+                        f.desc.height,
+                        broker::fourcc_str(f.desc.fourcc),
+                        f.desc.modifier
+                    );
+                    sh.dropped(f.desc.id, f.seq);
+                }
             }
         }
         let mut force_idr = want_idr;

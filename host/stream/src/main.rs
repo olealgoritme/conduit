@@ -371,7 +371,9 @@ fn serve(o: ServeOpts) -> Result<()> {
         | broker::CAP_MODE_HINTS
         | broker::CAP_CURSOR
         | broker::CAP_GAMEPAD
-        | broker::CAP_IDLE;
+        | broker::CAP_IDLE
+        | broker::CAP_RELEASE
+        | broker::CAP_RELEASE_SEQ;
     let sh = broker::Shared::new(caps);
     *sh.formats.lock().unwrap() = Some(pipeline::format_check(info.modifiers));
 

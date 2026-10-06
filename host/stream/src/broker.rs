@@ -32,6 +32,9 @@ pub const CMD_CURSOR: u16 = 7;
 
 pub const EV_HELLO: u16 = 1;
 pub const EV_SURFACE: u16 = 2;
+/// w0,w1 = the buffer's dma-buf inode; x = the seq of the newest ATTACH of
+/// it this release covers (with CAP_RELEASE_SEQ).
+pub const EV_RELEASE: u16 = 4;
 pub const EV_KEY: u16 = 5;
 pub const EV_BTN: u16 = 6;
 pub const EV_ABS: u16 = 7;
@@ -55,12 +58,17 @@ pub const CAP_REL_POINTER: u32 = 1 << 2;
 pub const CAP_FOCUS_EVENTS: u32 = 1 << 5;
 pub const CAP_DMABUF: u32 = 1 << 7;
 pub const CAP_MODIFIERS: u32 = 1 << 8;
+pub const CAP_RELEASE: u32 = 1 << 9;
 pub const CAP_MODE_HINTS: u32 = 1 << 10;
 pub const CAP_CURSOR: u32 = 1 << 11;
 pub const CAP_GAMEPAD: u32 = 1 << 13;
 /// We start idle and say EV_ACTIVE while a client watches: with no session
 /// the backend sends us nothing (and exports nothing for us).
 pub const CAP_IDLE: u32 = 1 << 14;
+/// EV_RELEASE is exact (Conduit addition): one per buffer we were sent, once
+/// we no longer read it, naming the newest ATTACH of it in x. The backend
+/// then hands the buffer back to the guest on it.
+pub const CAP_RELEASE_SEQ: u32 = 1 << 15;
 
 pub const HINT_RESTORE: u32 = 0;
 pub const HINT_FULLSCREEN: u32 = 1;
@@ -183,6 +191,8 @@ pub struct Frame {
     /// When the guest flipped (the backend's stamp, CLOCK_MONOTONIC like
     /// Instant), or when it arrived here if the backend sends no stamp.
     pub received: Instant,
+    /// The ATTACH's seq, which our EV_RELEASE of the buffer names.
+    pub seq: u32,
 }
 
 pub struct CursorImg {
@@ -215,6 +225,9 @@ pub struct Shared {
     pub formats: Mutex<Option<FormatCheck>>,
     pub caps: u32,
     pub client_caps: Mutex<u32>,
+    /// The buffer the GPU side reads now (its image is the one an encode
+    /// renders from): dma-buf inode and the seq of its newest ATTACH.
+    shown: Mutex<Option<(u64, u32)>>,
 }
 
 pub type FormatCheck = Box<dyn Fn(u32, u64) -> bool + Send>;
@@ -229,7 +242,47 @@ impl Shared {
             formats: Mutex::new(None),
             caps,
             client_caps: Mutex::new(0),
+            shown: Mutex::new(None),
         })
+    }
+
+    /// Tell the backend we no longer read buffer `id` (its ATTACHes up to
+    /// `seq`). Only with CAP_RELEASE_SEQ: without it the backend takes a
+    /// buffer as done once it has sent us the next one.
+    fn release(&self, id: u64, seq: u32) {
+        if self.caps & CAP_RELEASE_SEQ != 0 && id != 0 {
+            self.send(Pkt::new(
+                EV_RELEASE,
+                seq as i32,
+                0,
+                id as u32,
+                (id >> 32) as u32,
+            ));
+        }
+    }
+
+    /// A frame we will never read (superseded before the pipeline took it, or
+    /// refused): released now, unless it is the buffer the GPU side reads
+    /// anyway, whose release then covers this ATTACH too.
+    pub fn dropped(&self, id: u64, seq: u32) {
+        {
+            let mut shown = self.shown.lock().unwrap();
+            if let Some(s) = shown.as_mut().filter(|s| s.0 == id) {
+                s.1 = seq;
+                return;
+            }
+        }
+        self.release(id, seq);
+    }
+
+    /// The pipeline now reads frame (`id`, `seq`) and nothing else: the
+    /// buffer it read before is released (the encode that read it last has
+    /// finished: frames are taken between encodes).
+    pub fn showing(&self, id: u64, seq: u32) {
+        let prev = self.shown.lock().unwrap().replace((id, seq));
+        if let Some((pid, pseq)) = prev.filter(|p| p.0 != id) {
+            self.release(pid, pseq);
+        }
     }
 
     /// Send one event to the backend (no-op when none is connected).
@@ -421,6 +474,8 @@ fn session(s: UnixStream, sh: &Arc<Shared>, on_connect: &dyn Fn()) -> Result<()>
     *sh.out.lock().unwrap() = Some(s.try_clone()?);
     *sh.seq.lock().unwrap() = 0;
     *sh.client_caps.lock().unwrap() = 0;
+    // Stamps and buffers are per connection.
+    *sh.shown.lock().unwrap() = None;
     sh.send(Pkt::new(EV_HELLO, 0, 0, PROTO_VERSION, sh.caps));
     sh.send(Pkt::new(EV_FOCUS, 1, 0, 0, 0));
     {
@@ -456,10 +511,16 @@ fn session(s: UnixStream, sh: &Arc<Shared>, on_connect: &dyn Fn()) -> Result<()>
                             c.height,
                             c.stride
                         );
-                        attach = None;
+                        sh.dropped(fd_inode(f.as_raw_fd()), c.seq);
+                        if let Some((old, oc)) = attach.take() {
+                            sh.dropped(fd_inode(old.as_raw_fd()), oc.seq);
+                        }
                         continue;
                     }
-                    attach = Some((f, c));
+                    // An ATTACH never committed is dropped by the next one.
+                    if let Some((old, oc)) = attach.replace((f, c)) {
+                        sh.dropped(fd_inode(old.as_raw_fd()), oc.seq);
+                    }
                 }
                 CMD_COMMIT => {
                     let Some((f, c)) = attach.take() else {
@@ -490,14 +551,20 @@ fn session(s: UnixStream, sh: &Arc<Shared>, on_connect: &dyn Fn()) -> Result<()>
                         fd: f,
                         desc,
                         received,
+                        seq: c.seq,
                     };
                     let mut ib = sh.inbox.lock().unwrap();
-                    if ib.frame.replace(frame).is_some() {
+                    let old = ib.frame.replace(frame);
+                    if old.is_some() {
                         ib.superseded += 1;
                     }
                     ib.frames_in += 1;
                     drop(ib);
                     sh.cv.notify_all();
+                    // Superseded before the pipeline took it: never read.
+                    if let Some(o) = old {
+                        sh.dropped(o.desc.id, o.seq);
+                    }
                 }
                 CMD_CURSOR => {
                     let img = if c.width == 0 {
@@ -704,6 +771,79 @@ mod tests {
             drop(b);
             t.join().unwrap().unwrap();
             *sh.out.lock().unwrap() = None;
+        }
+    }
+
+    /// CAP_RELEASE_SEQ: a frame superseded before the pipeline took it is
+    /// released at once; the one the pipeline reads, when it moves on; and a
+    /// superseded ATTACH of the buffer being read leaves it held.
+    #[test]
+    fn releases_name_the_attach_they_cover() {
+        use std::io::Read;
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let sh = Shared::new(CAP_RELEASE_SEQ);
+        let sh2 = sh.clone();
+        let t = std::thread::spawn(move || session(a, &sh2, &|| {}));
+        let mut p = [0u8; 24];
+        b.read_exact(&mut p).unwrap(); // hello
+        b.read_exact(&mut p).unwrap(); // focus
+        let bufs: Vec<RawFd> = (0..3)
+            .map(|_| unsafe { libc::memfd_create(c"x".as_ptr(), 0) })
+            .collect();
+        let frame = |fd: RawFd, seq: u32| {
+            let attach = Cmd {
+                ty: CMD_ATTACH,
+                width: 64,
+                height: 32,
+                stride: 256,
+                fourcc: 0x34325258,
+                seq,
+                ..Default::default()
+            };
+            let mut rec = attach.encode().to_vec();
+            rec.extend_from_slice(
+                &Cmd {
+                    ty: CMD_COMMIT,
+                    seq,
+                    ..Default::default()
+                }
+                .encode(),
+            );
+            send_fd(&b, &rec, fd);
+        };
+        let mut rd = b.try_clone().unwrap();
+        let mut next_release = || {
+            rd.read_exact(&mut p).unwrap();
+            let r = Pkt::decode(&p);
+            assert_eq!(r.ty, EV_RELEASE);
+            (r.w0 as u64 | (r.w1 as u64) << 32, r.x as u32)
+        };
+        // Two frames before the pipeline looks: the first is never read.
+        frame(bufs[0], 10);
+        frame(bufs[1], 11);
+        assert_eq!(next_release(), (fd_inode(bufs[0]), 10));
+        let f = sh.inbox.lock().unwrap().frame.take().expect("frame");
+        assert_eq!((f.desc.id, f.seq), (fd_inode(bufs[1]), 11));
+        sh.showing(f.desc.id, f.seq);
+        // The buffer being read comes again and is superseded unread: its
+        // release waits for the pipeline to move on, and covers the newer
+        // ATTACH.
+        frame(bufs[1], 12);
+        frame(bufs[2], 13);
+        for _ in 0..200 {
+            if sh.inbox.lock().unwrap().superseded >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let f = sh.inbox.lock().unwrap().frame.take().expect("frame");
+        sh.showing(f.desc.id, f.seq);
+        assert_eq!(next_release(), (fd_inode(bufs[1]), 12));
+        drop(rd);
+        drop(b);
+        t.join().unwrap().unwrap();
+        for fd in bufs {
+            unsafe { libc::close(fd) };
         }
     }
 
