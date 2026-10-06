@@ -91,6 +91,18 @@ enable Venus automatically for a Windows guest so nobody types `--venus`.
 | Venus fences / ring used by KMD paths (paging, present ready-poll) | built on Venus first | RM fences (S4 done for presents); move the remaining KMD waits to RM semaphores |
 | Host: conduit-venus, virglrenderer patches 0001/0002, `--venus-guest-blobs` | the above | removed with the last row |
 
+Open (not done yet): the KMD-side audit that checks this table. Brief: list
+every KMD path that touches Venus (ring/instance bring-up, fences and waits,
+host-visible blobs and the BAR/aperture CPU view, paging copies, present
+buffers, the present ready-poll/worker, scanout image and
+SET_SCANOUT_BLOB/flush, ForeignCopy, snapshot/WindowedBlt, read ledger), and
+judge the RM copy-engine route against the KMD RM client as it stands. Today
+that client has the client/device/subdevice/memory classes and
+export/GEM/ScanoutFlip, but no GPFIFO channels, CE objects or push-buffer
+submission, and the OS-descriptor mapping of guest pages is UNVERIFIED
+([kmd-rm-client.md](../guest/windows/docs/kmd-rm-client.md) 5.3). So the route
+is a new subsystem, not a small step; the audit should size it.
+
 Order: (1) windowed copy on the KMD RM client with a GPU semaphore wait (this
 is also the windowed-performance fix, so it goes first), (2) KMD waits on RM
 fences, (3) deny-list down to DXR, (4) Venus scanout path removed, (5) host
