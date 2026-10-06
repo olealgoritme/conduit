@@ -1,0 +1,111 @@
+From b4e425431591b8ed62f4fba0c966b5134c381b6f Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 20:59:53 +0200
+Subject: [PATCH] nvk/rm: the Helios process policy from Conduit's
+ helios_icd_policy.h
+
+NVK kept its own copy of the Helios ICD policy (patch 0032), and it had
+drifted from the D3D UMD's: no "desktop follows DWM" rule, no NvkDefaults,
+and Icd=venus beat NvkAllowList. Under a DWM on NVK (DwmIcd=nvk plus the
+Local\HeliosDwmOnNvk marker) every Zink process asked
+nvk_helios_process_allowed(), was told Venus, and kept the Vulkan loader:
+OpenGL apps ran on Venus, whose surfaces an NVK DWM shows blank (Heaven's
+OpenGL window was white).
+
+When Conduit's guest/windows/protocol/include is on the include path
+(build-windows.sh adds it to rmclient.pc), NVK now uses
+helios_policy_decide() from helios_icd_policy.h, the implementation the UMDs
+use too: the desktop follows an NVK DWM unless NvkDenyList names the
+executable (DesktopFollowsDwm=0 turns it off), then Icd=venus unless
+NvkAllowList/NvkDefaults names it, then the deny-lists. HELIOS_ICD still
+comes first. The decision and its reason are logged once (mesa_logi).
+Without the header the old rules build as before.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c | 35 +++++++++++++++-------
+ 1 file changed, 25 insertions(+), 10 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index 71699ba..b349cd4 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -37,6 +37,15 @@ static bool rm_lib_ok;
+ static util_once_flag rm_lib_once = UTIL_ONCE_FLAG_INIT;
+ 
+ #ifdef _WIN32
++#if __has_include("helios_icd_policy.h")
++/* Conduit's guest/windows/protocol/include (rmclient.pc adds it): the one
++ * Helios ICD policy the D3D UMDs use too, "desktop follows DWM" included.
++ */
++#include "helios_icd_policy.h"
++#define NVK_HELIOS_SHARED_POLICY 1
++#endif
++
++#ifndef NVK_HELIOS_SHARED_POLICY
+ static bool
+ helios_reg_sz(const char *name, char *out, DWORD cap)
+ {
+@@ -67,11 +76,6 @@ helios_list_has(const char *list, const char *exe)
+    return false;
+ }
+ 
+-/* Executables that stay on Venus unless NvkDenyList replaces this list or
+- * NvkAllowList takes a name out of it: the Helios D3D UMD's built-in list
+- * (bridge_icd_backend.cpp).  Vulkan instances in these processes (DXVK on
+- * Venus inside DWM, for one) then never open an RM client.
+- */
+ static const char *const helios_builtin_deny[] = {
+    "dwm.exe", "explorer.exe", "csrss.exe", "winlogon.exe", "logonui.exe",
+    "consent.exe", "fontdrvhost.exe", "sihost.exe", "dllhost.exe",
+@@ -86,11 +90,14 @@ static const char *const helios_builtin_deny[] = {
+    "obs64.exe", "obs32.exe", "vlc.exe", "mpc-hc64.exe", "mpc-be64.exe",
+    "video.ui.exe", "microsoft.photos.exe", "photos.exe",
+    "steamwebhelper.exe", "epicwebhelper.exe",
+-   "cefsharp.browsersubprocess.exe", "nvidia share.exe",
++   "cefsharp.browsersubprocess.exe",
+ };
++#endif
+ 
+ /* The same decision as the Helios D3D UMD: a process the policy sends to
+  * Venus does not see the RM device, so the Vulkan loader hands it Venus.
++ * HELIOS_ICD first (the UMD sets it around the device creations it decided
++ * itself, DWM's included), then the shared rules.
+  */
+ static bool
+ helios_decide(void)
+@@ -101,14 +108,21 @@ helios_decide(void)
+    if (forced != NULL && _stricmp(forced, "nvk") == 0)
+       return true;
+ 
+-   char value[4096];
+-   if (helios_reg_sz("Icd", value, sizeof(value)) && _stricmp(value, "venus") == 0)
+-      return false;
+-
+    char path[MAX_PATH] = {0};
+    GetModuleFileNameA(NULL, path, MAX_PATH);
+    const char *exe = strrchr(path, '\\');
+    exe = exe ? exe + 1 : path;
++
++#ifdef NVK_HELIOS_SHARED_POLICY
++   const char *why = NULL;
++   const bool nvk = helios_policy_decide(exe, 1, &why) != 0;
++   if (why != NULL)
++      mesa_logi("NVK: Helios policy for %s: %s (%s)", exe, nvk ? "NVK" : "Venus", why);
++   return nvk;
++#else
++   char value[4096];
++   if (helios_reg_sz("Icd", value, sizeof(value)) && _stricmp(value, "venus") == 0)
++      return false;
+    if (helios_reg_sz("NvkAllowList", value, sizeof(value)) &&
+        helios_list_has(value, exe))
+       return true;
+@@ -119,6 +133,7 @@ helios_decide(void)
+          return false;
+    }
+    return true;
++#endif
+ }
+ 
+ static bool helios_allowed;
+-- 
+2.43.0
+

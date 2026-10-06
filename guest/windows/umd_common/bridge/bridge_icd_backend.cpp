@@ -24,6 +24,7 @@
 #include "bridge_common.h"  // umd_log
 #include "bridge_icd_backend.h"
 #include "helios_icd_interface.h"
+#include "helios_icd_policy.h"  // protocol/include: shared with NVK
 
 extern "C" int32_t helios_kmdmap_c_epoch(void);
 
@@ -36,22 +37,7 @@ namespace {
 // else (S6 moves them); the rest open or produce surfaces shared with Venus
 // processes (video, browsers, overlays, capture), which an NVK process cannot
 // import (dxvk-on-nvk.md 3.7).
-constexpr const char* kBuiltinDeny[] = {
-  "dwm.exe", "explorer.exe", "csrss.exe", "winlogon.exe", "logonui.exe",
-  "consent.exe", "fontdrvhost.exe", "sihost.exe", "dllhost.exe",
-  "searchhost.exe", "searchapp.exe", "startmenuexperiencehost.exe",
-  "shellexperiencehost.exe", "shellhost.exe", "textinputhost.exe",
-  "lockapp.exe", "applicationframehost.exe", "systemsettings.exe",
-  "runtimebroker.exe", "widgets.exe", "widgetservice.exe",
-  "phoneexperiencehost.exe", "crossdeviceresume.exe", "taskmgr.exe",
-  "mmc.exe", "rdpclip.exe", "msedge.exe", "msedgewebview2.exe",
-  "chrome.exe", "firefox.exe", "brave.exe", "opera.exe", "teams.exe",
-  "ms-teams.exe", "discord.exe", "slack.exe", "spotify.exe", "code.exe",
-  "obs64.exe", "obs32.exe", "vlc.exe", "mpc-hc64.exe", "mpc-be64.exe",
-  "video.ui.exe", "microsoft.photos.exe", "photos.exe",
-  "steamwebhelper.exe", "epicwebhelper.exe",
-  "cefsharp.browsersubprocess.exe",
-};
+// The built-in deny-list: helios_policy_builtin_deny (helios_icd_policy.h).
 
 // Deny-list entries measured to work on NVK under a Venus DWM
 // (docs/dwm-on-nvk.md 4.2.1, 22.22.326.1, 2026-10-06): they make an NVK
@@ -71,11 +57,7 @@ constexpr const char* kBuiltinDeny[] = {
 // crashed at its NVK start; SearchHost crash-loops on Venus too), msedge and
 // the Chromium family (video frames stall on NVK), video players (VLC's
 // D3D11VA output is green on NVK), logonui/consent/lockapp (after the shell).
-constexpr const char* kBuiltinNvkDefault[] = {
-  "csrss.exe", "winlogon.exe", "fontdrvhost.exe", "rdpclip.exe",
-  "taskmgr.exe", "mmc.exe", "startmenuexperiencehost.exe",
-  "systemsettings.exe", "applicationframehost.exe",
-};
+// The NvkDefaults names: helios_policy_nvk_default_names (helios_icd_policy.h).
 
 void lower_ascii(char* s) {
   for (; *s; s++) {
@@ -114,56 +96,21 @@ bool env_sz(const char* name, char* out, std::size_t cap) {
 
 // `list` holds names separated by ';' (spaces around names ignored).
 bool list_has(const char* list, const char* exe) {
-  const std::size_t len = std::strlen(exe);
-  const char* p = list;
-  while (*p) {
-    while (*p == ';' || *p == ' ' || *p == '\t') p++;
-    const char* start = p;
-    while (*p && *p != ';') p++;
-    const char* end = p;
-    while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
-    if (std::size_t(end - start) == len && _strnicmp(start, exe, len) == 0)
-      return true;
-  }
-  return false;
+  return helios_policy_list_has(list, exe) != 0;
 }
 
 // NvkDefaults=1 and `exe` is one of kBuiltinNvkDefault.
 bool nvk_default(const char* exe) {
-  DWORD on = 0;
-  if (!reg_dword("NvkDefaults", &on) || on == 0)
-    return false;
-  for (const char* name : kBuiltinNvkDefault) {
-    if (std::strcmp(name, exe) == 0)
-      return true;
-  }
-  return false;
+  return helios_policy_nvk_default(exe) != 0;
 }
 
 // NvkDenyList (REG_SZ) names `exe`.
 bool explicitly_denied(const char* exe) {
-  char deny[4096];
-  return reg_sz("NvkDenyList", deny, sizeof(deny)) && list_has(deny, exe);
+  return helios_policy_explicitly_denied(exe) != 0;
 }
 
 bool denied(const char* exe, const char** why) {
-  char allow[4096];
-  if (reg_sz("NvkAllowList", allow, sizeof(allow)) && list_has(allow, exe))
-    return false;
-  if (nvk_default(exe) && !explicitly_denied(exe))
-    return false;
-  char deny[4096];
-  if (reg_sz("NvkDenyList", deny, sizeof(deny))) {
-    *why = "NvkDenyList names this executable";
-    return list_has(deny, exe);
-  }
-  for (const char* name : kBuiltinDeny) {
-    if (std::strcmp(name, exe) == 0) {
-      *why = "built-in deny-list (compositor, shell or interop-heavy app)";
-      return true;
-    }
-  }
-  return false;
+  return helios_policy_denied(exe, why) != 0;
 }
 
 // DwmIcd=nvk crash-loop guard (docs/dwm-on-nvk.md, "Failure safety"). Windows
@@ -243,7 +190,7 @@ bool dwm_nvk_guard_allows(const char** why) {
 // processes may not open it (its DACL admits everyone for SYNCHRONIZE, but a
 // restricted token can still be refused): ERROR_ACCESS_DENIED also means it
 // exists.
-constexpr const char kDwmOnNvkEvent[] = "Local\\HeliosDwmOnNvk";
+constexpr const char kDwmOnNvkEvent[] = HELIOS_POLICY_DWM_MARKER;
 HANDLE g_dwm_marker = nullptr;
 
 void dwm_marker_create() {
@@ -273,22 +220,7 @@ void dwm_marker_drop() {
 // A non-DWM process: does the running DWM compose on NVK (and should this
 // process follow it)?
 [[maybe_unused]] bool desktop_follows_dwm_on_nvk() {
-  DWORD follow = 1;
-  reg_dword("DesktopFollowsDwm", &follow);
-  if (follow == 0)
-    return false;
-  char dwm[16];
-  if (!reg_sz("DwmIcd", dwm, sizeof(dwm)))
-    return false;
-  lower_ascii(dwm);
-  if (std::strcmp(dwm, "nvk") != 0)
-    return false;
-  HANDLE h = OpenEventA(SYNCHRONIZE, FALSE, kDwmOnNvkEvent);
-  if (h) {
-    CloseHandle(h);
-    return true;
-  }
-  return GetLastError() == ERROR_ACCESS_DENIED;
+  return helios_policy_desktop_follows_dwm() != 0;
 }
 
 bool file_exists(const wchar_t* path) {
