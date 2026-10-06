@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 05:11:15 +0200
+Subject: [PATCH 18/18] nvk: advertise external semaphore/fence fds only if a sync
+ type exports
+
+VK_KHR_external_semaphore_fd and VK_KHR_external_fence_fd were advertised
+whenever the kernel driver has dma-bufs. On the RM backend that is true
+(nvidia-drm), but its syncs are memory semaphores with neither an opaque
+fd nor a sync_file export, so no handle type can be exported. Applications
+that chain VkExportSemaphoreCreateInfo without asking
+vkGetPhysicalDeviceExternalSemaphoreProperties first (FFmpeg's Vulkan
+hwcontext up to at least 6.1, browsers) then fail vkCreateSemaphore with
+VK_ERROR_INVALID_EXTERNAL_HANDLE, so they cannot use the device at all.
+
+Advertise both extensions only if one of the device's sync types can
+export an opaque fd or a sync_file. The nouveau backend's DRM syncobjs
+can, so nothing changes there.
+
+Exporting RM syncs for real needs NV_SEMAPHORE_SURFACE-backed syncs and
+nvidia-drm's semaphore-surface fences; until then hiding the extensions
+is the correct answer.
+---
+ src/nouveau/vulkan/nvk_physical_device.c | 25 ++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index 7f3f9fc..2dacf76 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -108,11 +108,31 @@ nvk_has_astc(const struct nv_device_info *info)
+    return info->type == NV_DEVICE_TYPE_SOC && info->cls_eng3d >= KEPLER_C;
+ }
+ 
++/* VK_KHR_external_semaphore_fd and VK_KHR_external_fence_fd only make sense
++ * if some sync type can hand out an fd: an opaque fd (DRM syncobj) or a
++ * sync_file.  The RM backend's syncs are memory semaphores that cannot be
++ * exported yet.  Advertising the extensions anyway makes applications that
++ * create exportable semaphores without asking first (FFmpeg's Vulkan
++ * hwcontext, browsers) fail vkCreateSemaphore with
++ * VK_ERROR_INVALID_EXTERNAL_HANDLE.
++ */
++static bool
++nvk_sync_types_can_export_fd(const struct vk_sync_type *const *types)
++{
++   for (const struct vk_sync_type *const *t = types; t != NULL && *t != NULL; t++) {
++      if ((*t)->export_opaque_fd != NULL || (*t)->export_sync_file != NULL)
++         return true;
++   }
++
++   return false;
++}
++
+ static void
+ nvk_get_device_extensions(const struct nvk_instance *instance,
+                           const struct nv_device_info *info,
+                           bool has_tiled_bos,
+                           bool has_dma_buf,
++                          bool has_sync_fd,
+                           struct vk_device_extension_table *ext)
+ {
+    const bool h264dec = nvk_video_enabled(instance, info);
+@@ -143,11 +163,11 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
+       .KHR_dynamic_rendering = true,
+       .KHR_dynamic_rendering_local_read = true,
+       .KHR_external_fence = true,
+-      .KHR_external_fence_fd = has_dma_buf,
++      .KHR_external_fence_fd = has_dma_buf && has_sync_fd,
+       .KHR_external_memory = true,
+       .KHR_external_memory_fd = has_dma_buf,
+       .KHR_external_semaphore = true,
+-      .KHR_external_semaphore_fd = has_dma_buf,
++      .KHR_external_semaphore_fd = has_dma_buf && has_sync_fd,
+       .KHR_format_feature_flags2 = true,
+       .KHR_fragment_shader_barycentric = info->cls_eng3d >= TURING_A,
+       .KHR_fragment_shading_rate = info->cls_eng3d >= TURING_A,
+@@ -1567,6 +1587,7 @@ nvk_create_physical_device_for_nvkmd(struct nvk_instance *instance,
+    nvk_get_device_extensions(instance, &nvkmd->dev_info,
+                              nvkmd->kmd_info.has_alloc_tiled,
+                              nvkmd->kmd_info.has_dma_buf,
++                             nvk_sync_types_can_export_fd(nvkmd->sync_types),
+                              &supported_extensions);
+ 
+    struct vk_features supported_features;

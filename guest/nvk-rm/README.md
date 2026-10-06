@@ -45,6 +45,7 @@ Mesa `main` at **`70c4c018cbe5b78a1db7e9413bc7e511b366fd95`**
 | 15 | `nvk/rm: let the GPU cache coherent host-visible system memory in L2` | host-visible system memory mapped `GPU_CACHEABLE_YES`, L2 sysmem invalidate at the start of every submit (`NVK_RM_SYSMEM_CACHED=0` turns it off); UBOs and vertex buffers in system memory 20-60x faster, on par with NVIDIA |
 | 16 | `nvk/rm: compressible VRAM for images on GB20x` | `has_compression`: dedicated image memory allocated COMPR_ANY (as NVKMS does) and mapped with the compressible GMK kind (`NVK_RM_COMPRESSION=0` off); clears 15x faster, blending on par with NVIDIA |
 | 17 | `nvk/rm: ZCULL from NV2080_CTRL_CMD_GR_GET_ZCULL_INFO` | `has_zcull_info` (`NVK_RM_ZCULL=0` off); depth-tested overdraw 3.4x faster, on par with NVIDIA |
+| 18 | `nvk: advertise external semaphore/fence fds only if a sync type exports` | `VK_KHR_external_semaphore_fd`/`_fence_fd` only when a sync type has an opaque-fd or sync_file export. The RM syncs have neither, so RM stops advertising them; before, FFmpeg's Vulkan hwcontext (and anything else that creates exportable semaphores without asking) failed `vkCreateSemaphore` with `VK_ERROR_INVALID_EXTERNAL_HANDLE`. nouveau unchanged |
 
 Each patch builds on its own.
 
