@@ -1,0 +1,173 @@
+<!--
+  Example Windows 11 domain for Conduit (a reference, not a file to copy blindly).
+
+  This is a plain Windows 11 VM: define it, install Windows from the ISO, shut
+  it off, then run `conduit attach win11`. attach adds the Conduit parts itself
+  (Conduit's QEMU as <emulator>, memfd shared memory, host-passthrough CPU with
+  the host's address width, Hyper-V enlightenments, the NVIDIA virtiofs share,
+  the VNC boot console on a socket and the vhost-user GPU in
+  <qemu:commandline>). Those parts are shown below in comments, as attach
+  writes them; don't uncomment them by hand, the sockets only exist once
+  attach has installed Conduit's units.
+
+  Edit before `virsh define docs/examples/win11.xml`:
+    - the disk and ISO paths (placeholders under /var/lib/libvirt/images);
+      for qemu:///session use e.g. ~/.local/share/libvirt/images instead;
+    - memory and vCPUs, scaled to the host.
+  libvirt fills in the uuid, MAC address, nvram path and PCI addresses.
+-->
+<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <name>win11</name>
+  <!-- conduit attach adds:
+  <metadata>
+    <conduit:vm xmlns:conduit="https://github.com/olealgoritme/conduit/libvirt/1" name="win11" kind="attached"/>
+  </metadata>
+  -->
+
+  <!-- Memory and vCPUs: scale to the host (here 16 GiB and 16 vCPUs of a
+       32-thread host). The topology must multiply out to the vCPU count. -->
+  <memory unit='GiB'>16</memory>
+  <currentMemory unit='GiB'>16</currentMemory>
+  <!-- conduit attach adds (the GPU shares guest memory with the backend):
+  <memoryBacking>
+    <source type='memfd'/>
+    <access mode='shared'/>
+  </memoryBacking>
+  -->
+  <vcpu placement='static'>16</vcpu>
+  <iothreads>1</iothreads>
+
+  <!-- UEFI (OVMF) with Secure Boot off: the Conduit driver is test-signed.
+       libvirt picks the OVMF build; smm is needed by OVMF. -->
+  <os firmware='efi'>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <firmware>
+      <feature enabled='no' name='enrolled-keys'/>
+      <feature enabled='no' name='secure-boot'/>
+    </firmware>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <!-- Hyper-V enlightenments; conduit attach adds any that are missing. -->
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='8191'/>
+      <vpindex state='on'/>
+      <runtime state='on'/>
+      <synic state='on'/>
+      <stimer state='on'>
+        <direct state='on'/>
+      </stimer>
+      <reset state='on'/>
+      <frequencies state='on'/>
+      <tlbflush state='on'/>
+      <ipi state='on'/>
+    </hyperv>
+    <smm state='on'/>
+  </features>
+  <!-- conduit attach sets this CPU (and adds <maxphysaddr mode='passthrough'/>,
+       which OVMF needs to place the 64 GiB shared-memory BAR); the topology
+       is kept. -->
+  <cpu mode='host-passthrough' check='none' migratable='off'>
+    <topology sockets='1' dies='1' cores='8' threads='2'/>
+  </cpu>
+  <clock offset='localtime'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+    <timer name='hypervclock' present='yes'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+  <devices>
+    <!-- conduit attach replaces this with Conduit's QEMU:
+    <emulator>/opt/conduit/bin/qemu-system-x86_64</emulator>
+    -->
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+
+    <!-- System disk, virtio: Windows Setup needs the viostor driver from the
+         virtio-win ISO below ("Load driver", E:\viostor\w11\amd64). -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap' iothread='1'/>
+      <source file='/var/lib/libvirt/images/win11.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+      <boot order='1'/>
+    </disk>
+    <!-- Windows 11 installation ISO. -->
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='/var/lib/libvirt/images/Win11_English_x64.iso'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+      <boot order='2'/>
+    </disk>
+    <!-- virtio-win drivers ISO (disk, network). -->
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='/var/lib/libvirt/images/virtio-win.iso'/>
+      <target dev='sdb' bus='sata'/>
+      <readonly/>
+    </disk>
+
+    <controller type='sata' index='0'/>
+    <controller type='usb' index='0' model='qemu-xhci'/>
+
+    <!-- virtio network (driver: NetKVM on the virtio-win ISO). User-mode
+         networking works for qemu:///session; on qemu:///system use
+         <interface type='network'><source network='default'/>. -->
+    <interface type='user'>
+      <model type='virtio'/>
+    </interface>
+
+    <input type='tablet' bus='usb'/>
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+
+    <!-- TPM 2.0 (Windows 11 requires it), emulated by swtpm. -->
+    <tpm model='tpm-crb'>
+      <backend type='emulator' version='2.0'/>
+    </tpm>
+
+    <!-- Display for the installation. conduit attach replaces it with one VNC
+         server on a Unix socket, the boot console Conduit shows:
+    <graphics type='vnc' socket='/run/user/UID/conduit/win11/console.sock'>
+      <listen type='socket' socket='/run/user/UID/conduit/win11/console.sock'/>
+    </graphics>
+    -->
+    <graphics type='vnc' autoport='yes'>
+      <listen type='address' address='127.0.0.1'/>
+    </graphics>
+    <video>
+      <model type='vga' vram='16384' heads='1' primary='yes'/>
+    </video>
+    <sound model='ich9'/>
+    <audio id='1' type='none'/>
+    <watchdog model='itco' action='reset'/>
+    <memballoon model='none'/>
+
+    <!-- conduit attach adds the NVIDIA share (virtiofs, tag "nvidia"):
+    <filesystem type='mount'>
+      <driver type='virtiofs' queue='1024'/>
+      <source socket='/run/user/UID/conduit/win11/vfs-libvirt.sock'/>
+      <target dir='nvidia'/>
+    </filesystem>
+    -->
+  </devices>
+
+  <!-- conduit attach adds the GPU (libvirt has no element for a generic
+       vhost-user device; the slot is picked free):
+  <qemu:commandline>
+    <qemu:arg value='-chardev'/>
+    <qemu:arg value='socket,id=conduit-gpu,path=/run/user/UID/conduit/win11/gpu-libvirt.sock'/>
+    <qemu:arg value='-device'/>
+    <qemu:arg value='vhost-user-test-device-pci,chardev=conduit-gpu,virtio-id=45,class=0x0380,num_vqs=2,vq_size=256,config_size=4036,bus=pcie.0,addr=0x1e'/>
+  </qemu:commandline>
+  -->
+</domain>

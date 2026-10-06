@@ -33,6 +33,11 @@ conduit attach win11                  # recognizes Windows: no Linux guest setup
 conduit view win11 --venus            # or: conduit up win11 --venus
 ```
 
+[examples/win11.xml](examples/win11.xml) is an example domain (q35, OVMF with
+Secure Boot off, TPM 2.0, virtio disk and network), with the parts `attach`
+adds shown in comments; [SECOND-MACHINE.md](SECOND-MACHINE.md) section 3 says
+where to get the Windows and virtio-win ISOs.
+
 `attach` tells a Windows VM from a Linux one by the OS virt-manager recorded
 (libosinfo `http://microsoft.com/win/...` in `<metadata>`), Hyper-V features
 in the definition, or, for a running VM, the guest agent's

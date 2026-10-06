@@ -35,8 +35,25 @@ and the bundled QEMU ([PACKAGING.md](PACKAGING.md)).
 
 ## 3. The VM
 
-1. In virt-manager, create a Windows 11 VM: UEFI (OVMF), **Secure Boot
-   off** (the driver is test-signed). Install Windows as usual.
+**Getting Windows 11.** The ISO is on Microsoft's
+[download page](https://www.microsoft.com/software-download/windows11)
+("Download Windows 11 Disk Image (ISO) for x64 devices"). With a virtio disk
+or network, also get the
+[virtio-win drivers ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso):
+Setup finds the disk only after "Load driver" from it (`viostor\w11\amd64`).
+Windows 11 needs UEFI and TPM 2.0; libvirt emulates the TPM with `swtpm`
+(`sudo apt install swtpm swtpm-tools ovmf`).
+
+1. Create the VM, either way:
+   - in virt-manager: a Windows 11 VM with UEFI (OVMF), **Secure Boot off**
+     (the driver is test-signed) and a TPM 2.0 (emulated, CRB);
+   - or from [examples/win11.xml](examples/win11.xml): edit the disk and ISO
+     paths, memory and vCPUs, then
+     `qemu-img create -f qcow2 /var/lib/libvirt/images/win11.qcow2 128G` and
+     `virsh define docs/examples/win11.xml`; the Windows and virtio-win ISOs
+     are its two CD-ROMs (or attach them in virt-manager).
+
+   Install Windows as usual.
 2. Shut it off, then give it Conduit's GPU:
 
    ```bash
