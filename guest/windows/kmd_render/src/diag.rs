@@ -668,6 +668,16 @@ pub mod knobs {
     /// write-back / write-combined ALIAS of the same pages (an opt-in, counted `RmSysAlias`).
     /// Any other value is the default: an unknown value never picks an alias.
     pub const KMD_RM_SYS_CACHE: KnobName = KnobName::new(b"KmdRmSysCache");
+    /// `KmdRmSysPollMs` (default 0 = off). With `KmdRmClient` = 5: a heartbeat for a primary
+    /// that is written with no event the KMD can see (a GDI-only session, no DWM: GDI draws
+    /// through the CPU aperture mapping and nobody tells the driver). While an RM primary is
+    /// shown, it is flipped again at this period (milliseconds, 50 to 5000), also with
+    /// nothing reported. Costs a flip (a dup, one message, one compositor commit) per period for
+    /// as long as the desktop exists, so it is off by default: with DWM every change comes with
+    /// a present, a paging write or a marker, and the short tail after the last of them
+    /// (`rm_refresh::TAIL_100NS`, always on) covers what trails it. Read once per transport
+    /// generation (`docs/kmd-rm-client.md` 15.16).
+    pub const KMD_RM_SYS_POLL_MS: KnobName = KnobName::new(b"KmdRmSysPollMs");
     /// `BindFlushMode` (default 0). Selects when the bind edge tells the host
     /// to READ the freshly bound primary (ROADMAP defect 0ab-B):
     ///   0 = completion-ordered against the boundary this buffer's own present

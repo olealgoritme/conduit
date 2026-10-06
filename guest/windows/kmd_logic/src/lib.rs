@@ -32,6 +32,7 @@ pub mod rm_resource_import;
 pub mod page_runs;
 pub mod rm_client;
 pub mod rm_present;
+pub mod rm_refresh;
 pub mod scanout_release;
 pub mod rm_sysmem;
 pub mod producer_completion;

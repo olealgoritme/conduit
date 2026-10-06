@@ -1257,7 +1257,7 @@ Hook points (14.3's table, as built):
 | where | what |
 |---|---|
 | `program_vidpn_source_inner`, after the extent check | `sysmem_flip::program(resid, address, w, h)`. An allocation whose record is an adopted RM sysmem record (and the level is 5): no `ScanoutTarget`, no `SET_SCANOUT_BLOB`, no GPU copy, no dedicated image. It records the target (resid, DRM file, GEM, layout), stores `active_scanout_*`, publishes the displayed primary (`publish_bound_primary`, as a bind does), ends the leases (`Cancelled`: nothing reads this memory through a lease; the flip is not one), updates a registered resident source's layout in place, raises the frame edge and returns `Programmed`. `host_bound_scanout_resource` is NOT set: a Venus flush of it would be refused loudly (`RfUnb`) instead of being sent for a resource with no scanout. Any other allocation: `NotOurs` and the Venus path below runs unchanged, after `other_source` forgets a previous RM target (the worker then withdraws the resident source, and the desktop flush returns) |
-| `rm_client::service` (HPD worker), level 5 | `sysmem_flip::service`: the level 3 presenter's state machine with a ring of ONE (`Presenter::new(1)`; "copy" is nothing, the memory is the primary): register the resident source (`foreign_scanout_resident_set`, owner `KMD_RM`, the service's DRM file), flip the GEM on a frame edge (`present_within`, 1 s, direct) paced to 60 Hz, re-flip on a resume edge, withdraw when no target. The presenter's inputs come from `rm_sysmem::flip_inputs`: a ring of one never asks the release book (below) |
+| `rm_client::service` (HPD worker), level 5 | `sysmem_flip::service`: the level 3 presenter's state machine with a ring of ONE (`Presenter::new(1)`; "copy" is nothing, the memory is the primary): register the resident source (`foreign_scanout_resident_set`, owner `KMD_RM`, the service's DRM file), flip the GEM on a frame edge (`present_within`, 1 s, direct) paced to the MODE's refresh period (15.16), re-flip on a resume edge, withdraw when no target. The presenter's inputs come from `rm_sysmem::flip_inputs`: a ring of one never asks the release book (below) |
 | the suppression gate (unchanged) | the desktop flush the arbiter withholds is a frame edge (`note_frame_edge`), exactly as at level 3; the refresh machinery reaches the gate because `active_scanout_resource` names the RM primary |
 | `release_allocation_resource` (via `sysmem::released`) | the target is forgotten first (`target_gone`), so no flip names a GEM about to be closed; then GEM close, `RM_FREE` |
 
@@ -1313,11 +1313,12 @@ that waited. Tests: `a_reflipped_buffer_is_never_something_a_close_waits_for`,
 
 ### 15.8 What reaches the screen, and what does not (read this before the first run)
 
-* GDI writes into the primary reach the viewer through flips on frame edges. Frame edges come from the same
-  refresh requests the Venus path uses (present markers, completions); a pure CPU write with no kernel
-  notification at all is not seen by the KMD on either path. If the viewer re-samples the attached buffer
-  without being told, nothing more is needed; if it does not, the edge-driven flip is the damage signal
-  (checklist step 7).
+* GDI writes into the primary reach the viewer through flips on frame edges. The host viewer commits only when
+  it is sent a `ScanoutFlip` (no re-sampling, no damage message), so every change of the primary has to end in a
+  flip of the same GEM: 15.16 lists every edge kind, the mode-rate pacing and what covers a CPU write that no
+  event reports (a short decaying tail, and the opt-in `KmdRmSysPollMs` heartbeat). Before 15.16 only the
+  programming and the refresh gate's edges existed at level 5; the present blit, the windowed blit and the
+  paging writes raised none.
 * **DWM's composition into this primary** (the UMD's windowed present blits into the primary by identity)
   rides the host's Venus import of an RM-export resource. The identity record of a STANDARD allocation cannot
   carry the FOREIGN flag today (only DEVICE_MEMORY does), so a UMD opening it sees plain Venus memory with
@@ -1397,13 +1398,19 @@ that waited. Tests: `a_reflipped_buffer_is_never_something_a_close_waits_for`,
 | `RmSysRegs` / `RmSysWithdrawn` / `RmSysGaveUp` | registrations / withdrawals / giving-ups | 1 / 0 / 0 |
 | `RmSysFrames` / `RmSysReflips` / `RmSysYielded` / `RmSysFlipFail` | flips for an edge / for a resume / that found the source yielded / refused | grows / small / small / 0 |
 | `RmSysPres` / `RmSysSeq` | the presenter word (bit 0 registered, bit 1 gave up, bits 8.. failures) / the last flip's `seq` | 1 / grows |
+| `RmSysEdges` | frame edges raised (all kinds) | grows with desktop activity |
+| `RmSysEdProg` / `RmSysEdBlt` / `RmSysEdWBlt` / `RmSysEdPag` / `RmSysEdRef` | by kind (15.16): programmed / present blit / windowed blit done / paging write / the refresh gate (markers, restore: the rest of the total) | each grows with its source |
+| `RmSysEdOther` | events that named another allocation than the shown primary | grows (most paging and blits) |
+| `RmSysCoal` | edges that got no flip of their own (folded into one flip per refresh) | grows under load |
+| `RmSysTail` / `RmSysPoll` | flips of the tail after the last reported change / of the `KmdRmSysPollMs` heartbeat | up to 5 per burst / 0 unless the knob is set |
+| `RmSysIvl` / `RmSysPollMs` | the flip interval in 100 ns (the mode's refresh period: 41667 at 240 Hz, 166667 at 60 Hz) / the heartbeat knob | the mode's / 0 |
 
 `FgMapRf` must stay 0 for the primary (the map is no longer refused for it); `FsSupp` grows with the withheld
 flushes; `RfUnb` is expected to count only if a Venus flush of the RM primary is ever attempted.
 
 ### 15.12 Verified here, and not
 
-Verified on the host (`cargo test` in `guest/windows/kmd_logic`, 707 tests; in `guest/windows/protocol`, 29):
+Verified on the host (`cargo test` in `guest/windows/kmd_logic`, 729 tests; in `guest/windows/protocol`, 30):
 which kinds go to RM; sizes and the page-granular rule against the aperture count and the paging clamp; the RM
 parameter block byte for byte (`attr` words against `nvos.h` 610.57.04's bit positions, `0x3a000000` /
 `0x5a000000`, and the written-back `0x2a800000` / `0x4a800000` the host decides from); RM's rounded answer; the
@@ -1504,8 +1511,9 @@ here sets `KmdRmSysCache` before step 7: steps 1 to 6 run on the default, write-
 1. **The alias** (15.5): the default avoids it. Whether dxgkrnl's write-combined view of cached memory is
    harmless on this stack, and whether the CPU read speed it buys is worth the risk, is what step 7 of 15.13
    measures; until then the cached variants stay opt-in.
-2. **Whether the viewer needs a flip per change** or samples the attached buffer continuously: decides if the
-   edge-driven flips are the damage signal or merely harmless.
+2. **Whether the viewer needs a flip per change** or samples the attached buffer continuously: the host session's
+   answer is that it commits only on a `ScanoutFlip` (15.16), so the edge-driven flips ARE the damage signal; what
+   is open is only the cost of a refresh flip on the real viewer (checklist step 11).
 3. **An existing RM primary has no Venus fallback** (15.8). The seam is `program`'s `Retry` / the presenter's
    restart; the candidates are a CPU copy sysmem -> the dedicated LINEAR image (the default sysmem is write-combined: reads
    are slow, about 75 MB/s; this wants a cached opt-in, 15.5) through the existing bind and flush, or asking dxgkrnl to recreate the primary.
@@ -1517,7 +1525,8 @@ here sets `KmdRmSysCache` before step 7: steps 1 to 6 run on the default, write-
    the host really sends `ScanoutReleased` for a level 5 flip's replaced buffer on this viewer (checklist step 9),
    and whether a user source that replaced our buffer should enter the flip log (today the close then does not wait).
 7. **Host size rounding**: RM may report a larger `size` than asked (the spike asked 64 KiB multiples); the KMD
-   adopts it, and the host's "size <= object" check is then against the adopted value.
+   adopts it, and the host's "size <= object" check is then against the adopted value. Checked in 15.16 (the GEM
+   import and the resource import use the one adopted size).
 
 ### 15.15 The merged state machine: level 5 on the v315 line
 
@@ -1583,7 +1592,7 @@ level 5 adds the target (which RM primary is shown), the presenter of one surfac
 | event | arbiter | release book / flip log | screen |
 |---|---|---|---|
 | first RM primary programmed | resident registered by the worker | flip entered and marked sent; log: current = (gem, seq) | the primary, by flip |
-| desktop refresh withheld by the gate (frame edge) | unchanged | a re-flip of the SAME buffer: the older flips of it are superseded (done; the book wakes the HPD worker for it, and the pass finds nothing owed), the newest stays live for as long as it is shown; log: current's seq moves. **No wait** | re-flip, paced to 60 Hz |
+| desktop refresh withheld by the gate (frame edge) | unchanged | a re-flip of the SAME buffer: the older flips of it are superseded (done; the book wakes the HPD worker for it, and the pass finds nothing owed), the newest stays live for as long as it is shown; log: current's seq moves. **No wait** | re-flip, paced to the mode's refresh (15.16) |
 | new primary programmed (mode change) | resident layout updated in place (generation kept) | flip of ANOTHER buffer: the old buffer's newest flip starts ageing and awaits `ScanoutReleased`; log: previous = (old gem, its seq, now), current = new. **No wait** | the new primary |
 | the replaced primary destroyed | unchanged | `close_wait(old)` = Replaced: `wait_released` holds the GEM close until the book says done or 500 ms after the replacing flip (`RmSysRelWait` / `RmSysRelTmo`), then GEM close, RM free; log forgets it | unchanged |
 | the shown primary destroyed | worker withdraws (target gone first); the arbiter owes one Venus desktop flush | `close_wait` = Free: no wait (the shown buffer is never released); the book's entry for the closed GEM is left to age | the Venus desktop (when a Venus primary exists) |
@@ -1623,3 +1632,200 @@ adds, read as a diff against the v315 tip (`50d0698`), and what it does with the
 touch `host_bound_scanout_resource`: a Venus flush of the RM primary is refused loudly (`RfUnb`) rather than sent
 for a resource with no scanout, which is also why the suppression gate (checked before that refusal) is what keeps
 the desktop flush away while the resident source is on screen.
+
+
+### 15.16 Re-flipping on change: the edges, the pacing, the dirty-unknown window, the size rule, the opener (decided)
+
+Written on `kmd/level5-refresh` against v317. The pure decisions are `kmd_logic::rm_refresh` (20 tests) and the
+presenter's `set_min_interval`; the I/O is `sysmem_flip::primary_changed` / `service`. Not built into a driver, never
+run; 15.12's rules about what is verified apply.
+
+**The host fact this answers.** The host viewer commits (attach, full damage, `wl_surface_commit`) only when it
+receives a `ScanoutFlip`: it does not re-sample every vsync and there is no damage message. A flip that names the
+SAME resource again is the cheap refresh (the PRIME export is cached by `(owner, handle)`, the viewer reuses its
+`wl_buffer` when inode and geometry match: a dup, one `sendmsg`, an `lseek`, one compositor commit; Venus does the
+same for every `RESOURCE_FLUSH` of its scanout resource). So CPU writes into the sysmem primary show only if a flip
+follows them.
+
+**What the Venus path relies on (read, v317).** Nothing watches the bytes. A dirty edge exists only where the driver
+is told: (1) `SetVidPnSourceAddress` (the MMIO flip contract; the DMA-flip contract arms the same programming at
+submit): the dedicated-LINEAR fallback queues a GPU copy primary -> image whose completion DPC sets
+`scanout_refresh_pending` (`ScanoutNotify`), the direct bind arms `arm_bind_refresh`; (2) the UMD's present marker
+(`HeliosPresentRefreshCmd` / `HeliosPresentRenderCmd` in `DxgkDdiRender`, `arm_present_marker_refresh`): identity-free
+or naming the active resource it is queued at once (`QueueImmediate`) and is promoted by the used-ring DPC when its
+Venus boundary retires (`take_ready_scanout_refresh`), else it waits for the buffer's bind; both set
+`scanout_refresh_pending` and wake the HPD worker, which runs `queue_active_scanout_refresh` (gate, ownership gate,
+`RESOURCE_FLUSH`); (3) the restore after a user source ended. There is NO dirty-rect mechanism: nothing reads
+`DXGKARG_PRESENT` move or dirty rects (grep: none); the D4b "snapshot" is a UMD image substituted as the bind
+target, not a damage record; the read ledger counts host reads per resource to protect buffer reuse, it does not say
+what changed; `WddmDirtyRects` does not exist. The `HeliosPresentRefreshCmd` that `dxgkddi_present` itself writes
+into its DMA buffer has no consumer (`SubmitCommand` reads only the private data): it is a record, not an edge.
+When GDI (or dxgkrnl's software cursor) writes the primary through the CPU aperture mapping and no present follows,
+the Venus path does nothing at all.
+
+**The edges, every kind** (`rm_refresh::Edge`; "level 5 today" is v317 before this change):
+
+| edge | source | context | level 5 today | now |
+|---|---|---|---|---|
+| `SetVidPnSourceAddress` of the RM primary (each MMIO / DMA flip, a mode change, the same allocation again) | `program_vidpn_source_inner` -> `sysmem_flip::program` (the DIRQL half only defers to the worker) | worker, PASSIVE | **yes** (`note_frame_edge`) | yes, `Edge::Programmed`; `SHOWN_RESID` is published here |
+| UMD present marker naming the primary or nothing; the bind of a completed present; a refresh retried after `Busy` | `arm_present_marker_refresh` / `take_ready_scanout_refresh` -> `scanout_refresh_pending` -> worker `queue_active_scanout_refresh` -> the suppression gate | marker DISPATCH/PASSIVE, ready edge DPC, gate PASSIVE | **yes**, through the gate (`foreign_scanout_suppresses` raises the frame edge) while the resident source is registered; an edge that arrives unregistered is dropped (`RfUnb`) and covered by the registration's first frame | unchanged (counted as `RmSysEdRef`, the rest of the total) |
+| bind edges (`arm_bind_refresh*`, the DPC fast bind) | display.rs, interrupt.rs | DPC / worker | n/a: an RM primary is never bound (`program` returns first) | n/a |
+| the restore after a user source ended | `foreign_scanout_restore_desktop` | any | **yes**: `RESUME_EDGE` -> `Reflip` (resident owed), else the gate edge | unchanged |
+| `DxgkDdiPresent` Blt into the primary | `dxgkddi_present_inner`, legacy arm | PASSIVE | **no** (nothing arms a refresh from the Present itself) | yes, `Edge::PresentBlt`, after the fence wait. **Fires only once the blit can target the RM primary (below): today the arm refuses it first** |
+| two-phase windowed blit into the primary completes | `service_windowed_blt`, after the mirror | HPD worker, PASSIVE | **no** (Render skips the marker for a snapshot blit; the completion arms nothing) | yes, `Edge::WindowedBlt` (same caveat) |
+| `DxgkDdiPresent` Flip | `dxgkddi_present_inner` flip arm | PASSIVE | via `SetVidPnSourceAddress`, the first row | unchanged |
+| `DxgkDdiPresentDisplayOnly` | not registered (render + display driver) | n/a | n/a | n/a |
+| ColorFill, MoveRects, rotation in `DxgkDdiPresent` | accepted as no-ops (the driver writes no content for them) | PASSIVE | no content changes | none to flip for |
+| a `BuildPagingBuffer` page-in, fill or virtual transfer INTO the primary | `bar_transfer`, `bar_fill`, `bar_virtual_transfer_inner` | PASSIVE | **no** | yes, `Edge::Paging` (the `alloc.resource_id` is compared with the shown one) |
+| a paging eviction (primary -> system) | same | PASSIVE | no change of content | none |
+| a registration's first frame, a resume | `Act::Register`, `RESUME_EDGE` | worker | yes | unchanged |
+| **a CPU write through the aperture mapping with no DDI call** (GDI, dxgkrnl's software cursor, a `Lock`) | none: dxgkrnl maps the aperture once and writes it | none | **no, and none can be seen** | the tail and the opt-in heartbeat, below |
+
+`primary_changed(adapter, edge, resid)` is the one door for the three new kinds and for `Programmed`: it compares
+`resid` with `SHOWN_RESID` (one atomic load; an event that names another allocation, the common case, costs
+`RmSysEdOther` and nothing else) and raises the same frame edge the gate raises. The decision is
+`rm_refresh::judge`, tested for every kind against shown / other / none / level off.
+
+**The CPU write nobody reports: what is possible, and what was chosen.** Detecting it is not possible: the bytes can
+only be read back through the write-combined mapping (about 75 MB/s: one 5120x1440 frame is 390 ms, and a sparse
+sample misses a caret), the PTE dirty bits belong to dxgkrnl's mapping, and no DDI is called. Two things are
+possible, and both are bounded:
+
+1. **The tail (always on).** After a flip that was owed to a reported change, the primary is "dirty-unknown" for a
+   moment: GDI drawing that trails the present that started the frame, a write that raced the flip's own read. The
+   refresher re-flips at +50, +100, +200, +400 and +800 ms (`TAIL_100NS`, 1.55 s, five flips) after the last
+   such flip and then STOPS; a new reported change restarts it, so a desktop that is being presented to never
+   reaches it, and an idle desktop has no wake at all after the fifth (`Refresher::next_due` is `None`; tested for
+   an hour of passes).
+2. **The heartbeat (opt-in, `KmdRmSysPollMs`, default 0 = off).** For a session whose writes never come with an
+   event (a GDI-only desktop: safe mode, no DWM), a fixed period (50 to 5000 ms) re-flip while an RM primary is shown.
+   It costs a flip per period for as long as the desktop exists, which is why it is not the default: with DWM every
+   change comes with a present, a paging write or a marker. Hook for a better answer if the hardware run shows one:
+   a periodic poll gated by an "active" proxy would need an input-activity signal the KMD does not have.
+
+Chosen over "poll while the desktop is active": the KMD has no activity signal that is not itself one of the
+edges above, so an "active" gate would be the tail again. Chosen over "hook dxgkrnl's present that follows": there is
+none for GDI CPU writes (that is the problem), and for DWM the present is already an edge.
+
+**Pacing: at most one flip per vblank at the current mode rate.** `adapter.effective_refresh_mhz()` (the committed
+VidPn target mode's rate, else the host EDID's preferred, 60 Hz when only a size was given; the value the vsync
+heartbeat runs on, without its `VsyncRateMhz` debug override) gives the period through `vsync_deadline::period_100ns`; `flip_interval_100ns` clamps it to
+2 ms .. 100 ms and the worker passes it to the presenter (`Presenter::set_min_interval`) before each decision. The
+ring levels never call it and keep the 16 ms constant.
+
+| mode | interval (100 ns) | at most per second |
+|---|---|---|
+| 5120x1440 @ 240 Hz | 41 667 (4.17 ms) | 240 |
+| 360 Hz | 27 778 | 360 |
+| 144 Hz | 69 444 | 144 |
+| 60 Hz, unknown rate | 166 667 | 60 |
+| 59.94 Hz | 166 834 | 59 |
+| above 500 Hz / below 10 Hz | 20 000 / 1 000 000 (clamped) | 500 / 10 |
+
+Edges closer than the interval coalesce into the one flip that is owed (the presenter holds the frame until
+`last_flip + interval` and answers `WaitUntil`), and the LAST edge is always shown by that trailing flip (tested:
+an edge every 250 us for 100 ms at 240 Hz gives at most `100 ms / 4.17 ms + 2` flips, never closer than the
+interval, and the final edge is flipped). `RmSysCoal` counts the edges that got no flip of their own (edges minus
+flips owed to edges), `RmSysIvl` records the interval in use. The worker stays non-spinning: one timed wait, and
+the earliest of the presenter's pacing deadline and the refresher's next moment wins (`set_wake_at_min`);
+`next_due` never returns a moment that is already due, so a wake that the pass could not serve cannot repeat. The
+flip itself is a synchronous round trip on the worker (up to `FLIP_TIMEOUT_MS`), measured from its end, so a slow
+host lowers the rate by itself. The timed wait is `foreign_scanout_wait_100ns`'s: at least 1 ms and at most 1 s
+(a longer moment, the 5 s heartbeat, is reached in 1 s steps), and the kernel rounds a timeout to its timer
+resolution, so with a lone edge the trailing flip of a 240 Hz burst can be late by up to a timer tick (15.6 ms at the
+default resolution); under a stream of edges every edge wakes the worker and the flip lands within one edge
+spacing of its due time.
+
+**The release book under repeated flips of one buffer** (read, and tested against the REAL `ReleaseBook`:
+`hammering_one_buffer_with_re_flips_leaks_nothing_and_never_moves_the_floor_wrongly`, 20 000 flips at 240 Hz).
+Each flip is entered (`minted`) and marked (`sent`); `sent` finishes the older flips of the same `(handle, gem)`
+(`superseded`), so at most two entries of the source are live (the shown flip, and the one in flight). The book is
+a fixed array of 32 recycled in place (the oldest `Done` entry is overwritten): it never grows and never evicts a
+live entry (`RelEvict` stays 0). The floor of the source is `first_live - 1`, rises by exactly one per flip and is
+never above the live flip (the shown buffer is never released, so a wait for it would last its limit: the flip never
+waits, `release_tracked = false`). A mode change flips another GEM; the host's one `ScanoutReleased` for the old
+buffer retires its newest seq, a late duplicate matches with 0 newly done, and a flip the host refused is `gone`
+(done) without holding the floor. `FlipLog` (the GEM close's rule) keeps the shown buffer's `Free` through any number
+of re-flips. Nothing to fix.
+
+**The size rule (checked against the host's answer).** `lseek(SEEK_END)` of the dma-buf is the bound (larger: ERANGE;
+equal or smaller passes), MAPPABLE needs `page_align(size) <= hostmem_len`, `SET_SCANOUT_BLOB` needs
+`offset + stride * height <= size`, and a size rounded up to 64 KiB passes only if the GEM import used the same
+rounded size. `sysmem.rs` takes ONE number after the `RM_ALLOC` reply, `size = rm_sysmem::adopt_size(lay.size,
+reported)` (RM's own rounding, page-granular, never below the request), and hands that same variable to
+`gem_import` (the NVKMS import's `mem_size`), to `foreign_layout` (the layout is proven to fit it), to
+`validate_request` / `foreign_begin_kmd_import` and to the resource creation (`alloc_blob_errno_within`); the
+record, `adopted_size` and every later user (VidMm, the aperture count, the blob mapping) read the record's copy of
+it. The RM request itself carries `lay.size` (the picture, page-rounded), which RM may only round UP; the dma-buf is
+what RM made, so the adopted size is never larger than it. No code change was needed;
+`one_rounded_size_serves_the_gem_import_the_import_and_the_flip` pins what the number is for 1920x1080,
+1896x1030, 5120x1440, 1366x768 and 3840x2160 with RM answering 0, the request, the request rounded to 64 KiB and
+one page more.
+
+**The STANDARD open identity and the Venus-side opener.** What an opener must do with the RM primary: it is a
+dma-buf of system memory, not Venus memory, and the Vulkan import must be an image with
+`VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and an explicit layout (the same path the KMD's own foreign copy takes,
+`virtio/venus/foreign_copy.rs`):
+
+| field | value for the level 5 primary | where it is |
+|---|---|---|
+| modifier | `DRM_FORMAT_MOD_LINEAR` (0): the primary is pitch-linear | implied (the KMD creates nothing else); the trailer's `modifier` when present |
+| plane 0 offset | 0 | meta `plane_offset` |
+| row pitch | `width * 4` rounded up to 256 | meta `pitch` |
+| extent, format | the mode's, BGRA / BGRX / RGBA | meta `width` / `height` / `dxgi_format` (fourcc: 28 `AB24`, 87 `AR24`, 88 `XR24`) |
+| memory size | the host-verified adopted size | identity `venus_alloc_size` (= `blob_size`) |
+| memory type index | not consulted (0 in the identity): the importing device picks it | |
+| attach | by resource id to the opener's Venus context (the host confirms any context may attach an RM-export resource) | identity `resource_id` |
+
+Done here (small, additive, safe): the KMD now tells a STANDARD opener that the allocation is that dma-buf. The
+STANDARD identity's `reserved[0]` gets bit 1, `HELIOS_WDDM_STANDARD_CONTRACT_FOREIGN_SYSMEM`
+(`HeliosWddmOpenIdentity::foreign_sysmem_primary()`), written by `write_open_identity` from the KMD's own record
+(`ident.foreign`: set at creation and at an open that hit the foreign table, never from creator data), beside the
+dedicated-buffer bit 0 which a primary never has. The DEVICE_MEMORY FOREIGN flag could not be reused (same bit
+value, other kind), the identity version stays 2 and a reader that knows only bit 0 sees what it saw before.
+`protocol` tests pin the bit, the kind discrimination and that the other readers are unmoved.
+
+**Not done, and exactly what is missing:**
+
+1. **The layout trailer for a STANDARD allocation.** The trailer is at private-data offset 96 and needs 128 bytes;
+   `GetStandardAllocationDriverData` reports 96 for every standard type (`PRIV_SIZE`), so `write_foreign_layout_trailer`
+   finds no room (`FgOpNoRm` counts it, the adoption is told room exists because the KMD is the creator). Reporting
+   128 for `SHAREDPRIMARYSURFACE` alone is a one-line change but alters the private-data size of the boot primary
+   for every configuration; not needed, because the table above is derivable from the meta, and not done blind.
+2. **The UMD.** `umd/src/forward/resource.rs` `open_resource` imports every STANDARD identity as an ordinary OPTIMAL
+   opaque-fd image (`open_texture2d`, "the .38 regression" comment forbids DRM-modifier rebuilds for DWM imports).
+   It must branch on `foreign_sysmem_primary()` to the modifier import with the table above. Out of this branch's
+   scope (`umd/` is not touched); until it does, a DWM process that opens the primary imports the wrong shape.
+3. **The KMD's own blit into the primary.** The Present Blt arm treats a `PitchedStandardBuffer` destination as a
+   registered Present buffer: `begin_present_buffer_write_legacy` answers `NotFound` for the RM primary (it has
+   `SystemBackingPolicy::None`, no `present_buffer_syncs` slot), so `PBOwn 0xE1` and `STATUS_DEVICE_NOT_READY` come
+   first; the two-phase path would strand a request whose `complete_present_buffer_gpu_write` is false. The fix is a
+   `PresentDestinationDesc` arm for a foreign destination (a modifier image with `TRANSFER_DST`, imported like
+   `new_foreign_dma_buf`) selected by `PresentAllocInfo::foreign`, which the open path sets from the trailer (point 1)
+   or would set from the identity bit. That is Venus-client work I cannot compile or test here. Until it exists the
+   `PresentBlt` and `WindowedBlt` edges have nothing to fire for, and DWM composes into Venus buffers, which
+   programs a Venus allocation and withdraws the RM source (the first row of the 15.15 table).
+
+**IRQL and locks of the new code.** `primary_changed` takes no lock and does no I/O: atomics, `KeSetEvent(Wait =
+FALSE)` through `signal_hpd`; legal at any IRQL up to DISPATCH, and used at PASSIVE only today (the present DDI,
+`BuildPagingBuffer`, the HPD worker). The edge that already came from a DPC path (the marker's ready edge,
+`request_scanout_refresh_for`) is unchanged: it sets `scanout_refresh_pending` and the event, and the gate (PASSIVE,
+under `scanout_mutex`) raises the frame edge. `PRES` (now with the refresher) is still a leaf spinlock never held across
+I/O; `read_poll_ms` is a registry read on the worker (PASSIVE), once per generation. `publish_counters` takes `PRES`
+for one read (PASSIVE). No hook runs under `virtio_lock`.
+
+**Hardware checklist additions** (after 15.13 step 10): 11. with a GDI-only session (safe mode) at
+`KmdRmSysPollMs` 0, type into a GDI window: expect the screen to show it only within the tail after an event, and
+`RmSysEdges` flat otherwise; set the knob to 100 and expect `RmSysPoll` to grow at 10 per second and the typing to
+show. 12. at 5120x1440 / 240 Hz, drag a GDI window: `RmSysIvl` 41667, `RmSysFrames` at most 240 per second,
+`RmSysCoal` large, the picture current at the end of the drag (the trailing flip). 13. idle for a minute: `RmSysFrames`,
+`RmSysTail` and `RmSysPoll` do not move after the tail (the worker sleeps). 14. a DWM session: which of
+`RmSysEdProg` / `RmSysEdRef` / `RmSysEdPag` / `RmSysEdBlt` grow, and that `RmSysEdOther` dominates (the counters are
+the answer to "which edges does a real desktop produce"). 15. the cost of a refresh flip on the real viewer (CPU of
+the compositor at 240 flips per second of an unchanged picture).
+
+**Untested here, all of it**: that any edge fires on a real dxgkrnl; that the viewer shows a re-flip of an
+unchanged GEM (the host's account is code, not a run); the timing of the tail against real GDI traffic; the
+heartbeat's cost; the compile of the three hooks in `display.rs`, `build_paging_buffer.rs` and `create_allocation.rs`
+(read against the real definitions; the files `sysmem_flip.rs`, `rm_present.rs` and the rest of 15.12's list were
+type-checked in the generated harness); that the STANDARD identity's new bit is ignored by the shipped UMD.

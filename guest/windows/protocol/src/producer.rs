@@ -8,6 +8,9 @@ pub const HELIOS_PRODUCER_VERSION: u32 = 1;
 pub const HELIOS_PRODUCER_SLOTS: usize = 8192;
 pub const HELIOS_PRODUCER_MAP: u32 = 1;
 pub const HELIOS_PRODUCER_BIND: u32 = 2;
+/// Announce the next epoch of the bound allocation, completing when the named stream's
+/// completed value reaches `value` (`<=`: a later value completes every earlier one).
+/// `value == 0` announces an already-complete epoch. Table full: STATUS_INSUFFICIENT_RESOURCES.
 pub const HELIOS_PRODUCER_PUBLISH: u32 = 3;
 pub const HELIOS_PRODUCER_WAIT: u32 = 4;
 pub const HELIOS_PRODUCER_CANCEL: u32 = 5;

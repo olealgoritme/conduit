@@ -274,6 +274,8 @@ pub(crate) fn publish_nvrm_counters() {
     // Foreign scanout source (HELIOS_NVRM_OP_SCANOUT_*): `FsSet`, `FsPres`, `FsRel`,
     // `FsLapse`, `FsEnd`, `FsTake`, `FsSupp`, `FsRest`, `FsRef`, `FsErr`.
     crate::adapter::foreign_scanout::publish_counters();
+    // Producer completion table occupancy (`Prd*`): see `adapter::producer`.
+    crate::adapter::producer::publish_counters();
     // Bytes mapped through MMAP now (all owners, MiB), and MMAPs refused by the
     // per-device quota of a quarter of the RM window.
     crate::diag::record_named_bytes(

@@ -17,6 +17,16 @@
 //! alone for every other allocation, and withdraws the resident source when the screen's
 //! source stops being an RM primary ([`other_source`]).
 //!
+//! WHEN IT FLIPS AGAIN (`docs/kmd-rm-client.md` 15.16, decided). The viewer commits only when it
+//! is sent a `ScanoutFlip`, so every change of the primary (GDI and DWM write it through the CPU
+//! aperture mapping) has to end in a flip of the same GEM. [`primary_changed`] is the one door
+//! for the events that report a change (`rm_refresh::Edge`: the present blit, the windowed blit's
+//! completion, a paging write; the programming and the refresh gate raise the same frame edge);
+//! `rm_refresh::Refresher` covers the change nobody reports (a short decaying tail after the last
+//! reported one, and the opt-in `KmdRmSysPollMs` heartbeat); the presenter's minimum interval is
+//! the mode's refresh period (`rm_refresh::flip_interval_100ns`), so a flood of edges costs at
+//! most one flip per refresh and the last of them is always shown (a trailing flip).
+//!
 //! THE RELEASE SEAM (`docs/kmd-rm-client.md` 15.7, decided). The KMD's flips are entered in the
 //! host-release book by `present_within` like every other flip (`virtio/scanout_release.rs`).
 //! A flip here NEVER waits for a release: the buffer it shows is the one already on the
@@ -48,6 +58,7 @@ use crate::virtio::gpu::DeviceOwner;
 use crate::virtio::rm_present;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use helios_kmd_logic::rm_present::{Act, FlipResult, Presenter};
+use helios_kmd_logic::rm_refresh::{self as rr, Edge, Refresher, Synthetic, Verdict};
 use helios_kmd_logic::rm_sysmem::{self as rs, Change, CloseWait, FlipLog, Target, TargetBook};
 
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;
@@ -63,12 +74,35 @@ const MAX_YIELDS: u32 = 8;
 struct PState {
     epoch: u64,
     p: Presenter,
+    /// The dirty-unknown window (tail and heartbeat) and the edge census.
+    r: Refresher,
 }
 
 static PRES: SpinLock<PState> = SpinLock::new(PState {
     epoch: 0,
     p: Presenter::new(1),
+    r: Refresher::new(),
 });
+/// The resource the screen shows when it is an RM primary, 0 when not: what the edge sources
+/// that name an allocation (the present blit, a paging write) compare against with one atomic
+/// load, at any IRQL. Written by [`program`], [`other_source`], [`target_gone`] and [`reset`].
+static SHOWN_RESID: AtomicU32 = AtomicU32::new(0);
+/// Reported edges that were a change of the shown primary, by `rm_refresh::Edge::index`
+/// (the refresh gate's are the rest of the total: `RmSysEdRef`).
+static EDGE_KIND: [AtomicU32; rr::EDGE_KINDS] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+/// Events that named another allocation than the shown primary (not a change of the screen).
+static EDGE_OTHER: AtomicU32 = AtomicU32::new(0);
+/// The flip interval the last pass used (100 ns): the mode's refresh period.
+static INTERVAL: AtomicU64 = AtomicU64::new(0);
+/// `KmdRmSysPollMs` of this transport generation, or [`POLL_UNREAD`].
+static POLL_MS: AtomicU32 = AtomicU32::new(POLL_UNREAD);
+const POLL_UNREAD: u32 = u32::MAX;
 static TARGET: SpinLock<TargetBook> = SpinLock::new(TargetBook::new());
 static YIELDS: AtomicU32 = AtomicU32::new(0);
 /// When the presenter that gave up starts over (interrupt time, 100 ns; 0 = it is not
@@ -89,7 +123,13 @@ pub static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
 // shown for an edge, `RmSysReflips` flips shown for a resume, `RmSysYielded` flips that
 // found the source yielded, `RmSysFlipFail` flips the host or transport refused,
 // `RmSysPres` the presenter's word (bit 0 registered, bit 1 gave up, bits 8.. failures),
-// `RmSysSeq` the last flip's `seq`.
+// `RmSysSeq` the last flip's `seq`. The refresh census (15.16): `RmSysEdges` frame edges raised
+// (all kinds), then by kind `RmSysEdProg` (programmed), `RmSysEdBlt` (present blit),
+// `RmSysEdWBlt` (windowed blit done), `RmSysEdPag` (paging write), `RmSysEdRef` (the refresh
+// gate: markers, restore), `RmSysEdOther` events that named another allocation;
+// `RmSysCoal` edges that got no flip of their own (folded into one flip per refresh),
+// `RmSysTail` / `RmSysPoll` flips of the tail and of the heartbeat, `RmSysIvl` the flip
+// interval in 100 ns (the mode's refresh period), `RmSysPollMs` the heartbeat knob.
 pub static SYS_PROG: AtomicU32 = AtomicU32::new(0);
 pub static SYS_PROG_BAD: AtomicU32 = AtomicU32::new(0);
 pub static SYS_REGS: AtomicU32 = AtomicU32::new(0);
@@ -117,6 +157,25 @@ pub(super) fn publish_counters() {
     rec(b"RmSysFlipFail", SYS_FLIP_FAIL.load(Ordering::Relaxed));
     rec(b"RmSysPres", SYS_PRES.load(Ordering::Relaxed));
     rec(b"RmSysSeq", LAST_SEQ.load(Ordering::Relaxed) as u32);
+    let st = PRES.lock().r.stats();
+    let kind = |e: Edge| EDGE_KIND[e.index()].load(Ordering::Relaxed);
+    let reported = kind(Edge::Programmed)
+        .saturating_add(kind(Edge::PresentBlt))
+        .saturating_add(kind(Edge::WindowedBlt))
+        .saturating_add(kind(Edge::Paging));
+    rec(b"RmSysEdges", st.edges);
+    rec(b"RmSysEdProg", kind(Edge::Programmed));
+    rec(b"RmSysEdBlt", kind(Edge::PresentBlt));
+    rec(b"RmSysEdWBlt", kind(Edge::WindowedBlt));
+    rec(b"RmSysEdPag", kind(Edge::Paging));
+    rec(b"RmSysEdRef", st.edges.saturating_sub(reported));
+    rec(b"RmSysEdOther", EDGE_OTHER.load(Ordering::Relaxed));
+    rec(b"RmSysCoal", st.coalesced());
+    rec(b"RmSysTail", st.tail_flips);
+    rec(b"RmSysPoll", st.poll_flips);
+    rec(b"RmSysIvl", INTERVAL.load(Ordering::Relaxed) as u32);
+    let poll = POLL_MS.load(Ordering::Relaxed);
+    rec(b"RmSysPollMs", if poll == POLL_UNREAD { 0 } else { poll });
 }
 
 fn now() -> u64 {
@@ -130,7 +189,10 @@ pub(super) fn reset() {
         let mut g = PRES.lock();
         g.epoch = 0;
         g.p.reset();
+        g.r.reset();
     }
+    SHOWN_RESID.store(0, Ordering::Release);
+    POLL_MS.store(POLL_UNREAD, Ordering::Relaxed);
     YIELDS.store(0, Ordering::Relaxed);
     RESTART_AT.store(0, Ordering::Release);
     LAST_SEQ.store(0, Ordering::Relaxed);
@@ -195,6 +257,8 @@ pub(crate) fn program(
         layout: flip,
     };
     let change = TARGET.lock().set(target);
+    // The edge sources that name an allocation compare against this one word.
+    SHOWN_RESID.store(resource_id, Ordering::Release);
     // Which allocation is the active scanout, and the address the vsync reports: what a bind
     // publishes. The host is NOT bound to it (`host_bound_scanout_resource` stays), so a
     // Venus flush of it, if the resident source were ever withdrawn, is refused loudly
@@ -215,8 +279,9 @@ pub(crate) fn program(
         let _ = adapter.foreign_scanout_resident_set(KMD, drm, epoch, flip);
     }
     SYS_PROG.fetch_add(1, Ordering::Relaxed);
-    // The first flip of a (new) primary is owed.
-    rm_present::note_frame_edge(adapter);
+    // The first flip of a (new) primary is owed; so is one for every programming of it, also
+    // of the same allocation again (every flip of the DMA / MMIO present contract ends here).
+    primary_changed(adapter, Edge::Programmed, resource_id);
     Programmed::Ok
 }
 
@@ -234,6 +299,7 @@ pub(crate) fn other_source(adapter: &AdapterContext) {
         had
     };
     if had {
+        SHOWN_RESID.store(0, Ordering::Release);
         adapter.signal_hpd();
     }
 }
@@ -243,16 +309,76 @@ pub(crate) fn other_source(adapter: &AdapterContext) {
 /// names the GEM that is about to be closed (the target is gone first).
 pub(super) fn target_gone(adapter: &AdapterContext, resource_id: u32) {
     if TARGET.lock().gone(resource_id) {
+        SHOWN_RESID.store(0, Ordering::Release);
         adapter.signal_hpd();
     }
+}
+
+// ---- the edges ------------------------------------------------------------------------------
+
+/// A change of the primary was reported: `edge` named allocation `resid` (0 when the edge names
+/// none). If it is the shown RM primary a frame is owed and the worker is woken; the flip comes
+/// at the mode's rate (`rm_refresh::flip_interval_100ns`), after the presenter's pacing.
+///
+/// Atomics and `KeSetEvent(Wait = FALSE)` only, so it is legal wherever an edge can come from:
+/// PASSIVE (the present DDI, `BuildPagingBuffer`, the HPD worker's own windowed-blit service)
+/// and up to DISPATCH (a completion DPC). It takes no lock and does no I/O. With the knob below
+/// 5 it is one relaxed load.
+pub(crate) fn primary_changed(adapter: &AdapterContext, edge: Edge, resid: u32) {
+    let shown = SHOWN_RESID.load(Ordering::Acquire);
+    match rr::judge(super::sysmem_level_on(), shown, edge, resid) {
+        Verdict::Flip => {
+            EDGE_KIND[edge.index()].fetch_add(1, Ordering::Relaxed);
+            rm_present::note_frame_edge(adapter);
+        }
+        Verdict::NotShown => {
+            EDGE_OTHER.fetch_add(1, Ordering::Relaxed);
+        }
+        Verdict::Off => {}
+    }
+}
+
+/// `KmdRmSysPollMs` (the opt-in heartbeat, 0 = off), read once per transport generation.
+fn poll_ms() -> u32 {
+    let v = POLL_MS.load(Ordering::Relaxed);
+    if v != POLL_UNREAD {
+        return v;
+    }
+    read_poll_ms()
+}
+
+#[inline(never)]
+fn read_poll_ms() -> u32 {
+    let raw = crate::diag::read_config_dword(crate::diag::knobs::KMD_RM_SYS_POLL_MS, 0);
+    let v = if raw == 0 {
+        0
+    } else {
+        raw.clamp(rr::MIN_POLL_MS, rr::MAX_POLL_MS)
+    };
+    POLL_MS.store(v, Ordering::Relaxed);
+    if v != 0 {
+        crate::diag::record_named_bytes(b"RmSysPollMs", v);
+    }
+    v
 }
 
 // ---- the worker -----------------------------------------------------------------------
 
 /// One pass of the flip service, from `rm_client::service` at level 5 (PASSIVE, the HPD
-/// worker). With nothing shown and nothing registered it is two lock holds.
+/// worker). With nothing shown and nothing registered it is two lock holds. After the pass the
+/// refresher's next moment (the tail, the heartbeat) is added to the worker's timed wake: the
+/// earliest deadline wins, and an idle desktop has none.
 #[inline(never)]
 pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
+    service_pass(passive, adapter);
+    let due = PRES.lock().r.next_due(now());
+    if let Some(at) = due {
+        rm_present::set_wake_at_min(at);
+    }
+}
+
+#[inline(never)]
+fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
     // A presenter that gave up waits out its pause whatever wakes the worker (frame edges
     // come at the display's rate): nothing is registered or flipped, the edges stay
     // owed, and the next wake is the end of the pause.
@@ -269,6 +395,21 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     }
     rm_present::clear_wake_at();
     let (mut frame_edge, mut resume_edge) = rm_present::take_edges();
+    // The cap on flips is the mode's: one per refresh period, whatever rate the edges come at.
+    let interval = rr::flip_interval_100ns(adapter.effective_refresh_mhz());
+    INTERVAL.store(interval, Ordering::Relaxed);
+    let poll = poll_ms();
+    {
+        let mut g = PRES.lock();
+        if g.epoch != epoch {
+            g.p.reset();
+            g.r.reset();
+            g.epoch = epoch;
+        }
+        g.p.set_min_interval(interval);
+        g.r.set_poll_ms(poll);
+        g.r.edges(rm_present::take_edge_count(), frame_edge);
+    }
     for _ in 0..ACTS_PER_PASS {
         // StopDevice is joining the worker: start nothing. The transport reset that
         // follows ends the resident source.
@@ -280,14 +421,22 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         let ready = rs::target_ready(target.as_ref(), epoch);
         let (has_resident, foreground) = adapter.foreign_scanout_resident_state();
         // A ring of one: no release is ever waited for (`rm_sysmem::flip_inputs`).
-        let inputs = rs::flip_inputs(t, ready, has_resident, foreground, frame_edge, resume_edge);
+        let mut inputs =
+            rs::flip_inputs(t, ready, has_resident, foreground, frame_edge, resume_edge);
         frame_edge = false;
         resume_edge = false;
         let (act, word, gave_up) = {
             let mut g = PRES.lock();
             if g.epoch != epoch {
                 g.p.reset();
+                g.r.reset();
                 g.epoch = epoch;
+                g.p.set_min_interval(interval);
+            }
+            // A frame nobody reported: the next step of the tail after the last reported
+            // change, or the opt-in heartbeat. Never while a reported change is owed a flip.
+            if g.r.synthetic(t, ready) != Synthetic::None {
+                inputs.frame_edge = true;
             }
             let act = g.p.decide(inputs);
             (act, word(&g.p), g.p.gave_up())
@@ -302,7 +451,11 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
             if matches!(act, Act::Withdraw) {
                 withdraw(adapter);
             }
-            PRES.lock().p.reset();
+            {
+                let mut g = PRES.lock();
+                g.p.reset();
+                g.r.reset();
+            }
             SYS_GAVE_UP.fetch_add(1, Ordering::Relaxed);
             crate::diag::record_named_bytes(b"RmSysGaveUp", SYS_GAVE_UP.load(Ordering::Relaxed));
             let at = now().saturating_add(rs::RESTART_AFTER_GIVING_UP_100NS);
@@ -428,6 +581,12 @@ fn finish(epoch: u64, slot: u8, copied: bool, result: FlipResult) {
     match result {
         FlipResult::Shown => {
             YIELDS.store(0, Ordering::Relaxed);
+            {
+                let mut g = PRES.lock();
+                if g.epoch == epoch {
+                    g.r.shown(t, copied);
+                }
+            }
             if copied {
                 SYS_FRAMES.fetch_add(1, Ordering::Relaxed);
             } else {

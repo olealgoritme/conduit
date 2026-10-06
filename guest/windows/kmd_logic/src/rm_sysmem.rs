@@ -1152,6 +1152,55 @@ mod tests {
         assert_eq!(clamp_range(recorded, 0, recorded), Clamp::Full(recorded));
     }
 
+    /// The host's size rule: the declared size is checked against the dma-buf's
+    /// `lseek(SEEK_END)` (larger: ERANGE; equal or smaller passes), a MAPPABLE resource
+    /// needs `page_align(size) <= hostmem_len`, `SET_SCANOUT_BLOB` needs
+    /// `offset + stride * height <= size`, and a size rounded up to 64 KiB passes only if
+    /// the GEM import (the `mem_size` of the NVKMS import) used that same rounded size.
+    /// `build_steps` takes ONE `size` from `adopt_size` and hands it to the GEM import, to
+    /// the foreign request validation, to the reservation and to the resource creation; this
+    /// pins what that one number is for every answer RM can give.
+    #[test]
+    fn one_rounded_size_serves_the_gem_import_the_import_and_the_flip() {
+        use crate::foreign_resource::{validate_request, FLAG_LAYOUT};
+        const K64: u64 = 64 * 1024;
+        let round64 = |n: u64| n.div_ceil(K64) * K64;
+        for (w, h) in [
+            (1920u32, 1080u32),
+            (1896, 1030),
+            (5120, 1440),
+            (1366, 768),
+            (3840, 2160),
+        ] {
+            let l = layout(w, h, 88).unwrap();
+            for reported in [0, l.size, round64(l.size), round64(l.size) + PAGE] {
+                let size = adopt_size(l.size, reported).unwrap();
+                assert!(size >= l.size, "{w}x{h} {reported}");
+                assert_eq!(
+                    size % PAGE,
+                    0,
+                    "page-granular: MAPPABLE rounds it again, to itself"
+                );
+                assert_eq!(crate::round_up_page(size), size);
+                let fl = foreign_layout(&l, size).expect("the picture fits");
+                // The flip's `offset + stride * height <= size`.
+                assert!(u64::from(fl.offset) + u64::from(fl.stride) * u64::from(fl.height) <= size);
+                // The request the import is validated and reserved with is that same size.
+                assert!(validate_request(1, 2, 3, FLAG_LAYOUT, size, Some(fl)).is_ok());
+                // RM's own rounding to 64 KiB is adopted as it is, not shrunk to the ask.
+                if reported == round64(l.size) {
+                    assert_eq!(size, reported, "{w}x{h}");
+                }
+            }
+            // RM answering less than the picture needs is refused, never papered over.
+            assert_eq!(adopt_size(l.size, l.size - PAGE), Err(Why::Size));
+        }
+        // A size that is not a page multiple would be refused by the import request.
+        let l = layout(1920, 1080, 88).unwrap();
+        let fl = foreign_layout(&l, l.size).unwrap();
+        assert!(validate_request(1, 2, 3, FLAG_LAYOUT, l.size + 1, Some(fl)).is_err());
+    }
+
     // ---- the RM block ------------------------------------------------------------
 
     fn rd32(b: &[u8], at: usize) -> u32 {
@@ -2056,5 +2105,94 @@ mod tests {
         // The new current buffer is still never done.
         assert!(!b.is_done(s3, 1_002));
         assert_eq!(log.closing(11), CloseWait::Free);
+    }
+
+    /// The re-flip refresh sends the SAME buffer's GEM again and again (up to the mode's
+    /// rate). The book must not leak entries, must not evict a live one, must keep the
+    /// floor of the source monotone and never above the live flip, and a replaced primary
+    /// must still be released by the host's one event.
+    #[test]
+    fn hammering_one_buffer_with_re_flips_leaks_nothing_and_never_moves_the_floor_wrongly() {
+        use crate::scanout_release::BOOK_SLOTS;
+        const DRM: u32 = 5;
+        const KMD: usize = usize::MAX;
+        let mut b = ReleaseBook::new();
+        let mut log = FlipLog::new();
+        let mut t = 1_000u64;
+        let mut seq = 0u64;
+        let mut floors = std::vec::Vec::new();
+        for k in 0..20_000u64 {
+            seq += 1;
+            t += 41_667; // 240 Hz
+            let m = b.minted(seq, KMD, DRM, 10);
+            assert!(!m.evicted_live, "re-flip {k}: a live entry was overwritten");
+            // Between mint and the host's reply the previous flip is still the live one.
+            let (f_mid, last_mid) = b.floor(DRM, t);
+            assert!(f_mid < last_mid, "the latest flip is live: floor < last");
+            let sent = b.sent(seq, t).expect("known");
+            if k > 0 {
+                assert_eq!(
+                    sent.superseded, 1,
+                    "the older flip of the same buffer is done"
+                );
+            }
+            log.flipped(10, seq, t);
+            let (floor, last) = b.floor(DRM, t);
+            assert_eq!(last, seq);
+            assert_eq!(
+                floor,
+                seq - 1,
+                "everything older is done, the shown one never is"
+            );
+            floors.push(floor);
+            assert!(b.len() <= BOOK_SLOTS);
+            assert!(
+                !b.is_done(seq, t + 100 * MS),
+                "the buffer on the scanout is never released"
+            );
+            if k > 0 {
+                assert!(b.is_done(seq - 1, t), "a superseded flip is done");
+            }
+            assert_eq!(log.closing(10), CloseWait::Free);
+        }
+        assert!(
+            floors.windows(2).all(|w| w[0] < w[1]),
+            "the floor only rises"
+        );
+        assert_eq!(b.len(), BOOK_SLOTS, "a full book, recycled, not grown");
+        // A mode change: another primary replaces it; the host releases the old one once.
+        seq += 1;
+        t += 41_667;
+        b.minted(seq, KMD, DRM, 11);
+        b.sent(seq, t).unwrap();
+        log.flipped(11, seq, t);
+        let CloseWait::Replaced { seq: waits_for, .. } = log.closing(10) else {
+            panic!("replaced")
+        };
+        assert_eq!(waits_for, seq - 1);
+        assert!(!b.is_done(waits_for, t + 1));
+        assert!(matches!(
+            b.released(DRM, 10, waits_for),
+            crate::scanout_release::Release::Matched { .. }
+        ));
+        assert!(b.is_done(waits_for, t + 2));
+        // A second release for the same buffer (a late duplicate) changes nothing.
+        assert!(matches!(
+            b.released(DRM, 10, waits_for),
+            crate::scanout_release::Release::Matched { newly: 0, .. }
+        ));
+        // The new primary is the live one now.
+        let (floor, last) = b.floor(DRM, t + 3);
+        assert_eq!((floor, last), (waits_for, seq));
+        // A flip the host refused is retired, not left live.
+        seq += 1;
+        b.minted(seq, KMD, DRM, 11);
+        assert_eq!(b.gone(seq), Some(KMD));
+        let (floor, _) = b.floor(DRM, t + 4);
+        assert_eq!(
+            floor,
+            seq - 2,
+            "the shown flip (still live) holds the floor below itself"
+        );
     }
 }

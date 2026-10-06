@@ -435,6 +435,19 @@ pub const HELIOS_WDDM_IDENTITY_VERSION: u32 = 2;
 /// is kind-discriminated: DEVICE_MEMORY identities use the same words for the
 /// global VidMm tracker, while STANDARD identities never carry that tracker.
 pub const HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER: u32 = 0x0000_0001;
+/// [`HeliosWddmOpenIdentity::reserved`] word 0, bit 1, STANDARD identities only: the allocation
+/// is the KMD's own RM SYSTEM-memory primary (`KmdRmClient` = 5, `docs/kmd-rm-client.md`
+/// section 15): the resource id names a FOREIGN (RM-exported, host `blob_mem` RM_EXPORT)
+/// resource, not Venus memory, so an opener must not import it as a Venus buffer or OPTIMAL
+/// image. Import it as the dma-buf it is: `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`, modifier
+/// `DRM_FORMAT_MOD_LINEAR` (the primary is pitch-linear), plane 0 offset 0, row pitch
+/// `meta.pitch`, extent `meta.width` x `meta.height`, format of `meta.dxgi_format`, memory size
+/// `venus_alloc_size` (the host-verified size: equal to `blob_size`). The layout trailer
+/// ([`HeliosWddmAllocLayout`]) repeats those words when the private data holds 128 bytes; a
+/// standard allocation has 96, so an opener derives them from the meta as above. Only the KMD
+/// sets it, from its own record; bit 0 is untouched, so a reader that knows only the dedicated
+/// bit sees what it saw before. The version stays 2.
+pub const HELIOS_WDDM_STANDARD_CONTRACT_FOREIGN_SYSMEM: u32 = 0x0000_0002;
 /// [`HeliosWddmOpenIdentity::reserved`] word 0 bit for a DEVICE_MEMORY allocation
 /// that adopted a FOREIGN resource (`HELIOS_ESCAPE_FOREIGN_RESOURCE` `IMPORT_RM`,
 /// `blob_mem = HELIOS_BLOB_MEM_RM_EXPORT`): RM memory exported by an NVK-on-RM
@@ -499,6 +512,17 @@ impl HeliosWddmOpenIdentity {
             && self.version >= HELIOS_WDDM_IDENTITY_VERSION
             && self.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
             && self.reserved[0] & HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER != 0
+    }
+
+    /// Whether this STANDARD allocation is the KMD's own RM system-memory primary
+    /// ([`HELIOS_WDDM_STANDARD_CONTRACT_FOREIGN_SYSMEM`]): a LINEAR dma-buf, not Venus memory.
+    #[inline]
+    pub fn foreign_sysmem_primary(&self) -> bool {
+        self.is_valid()
+            && self.version >= HELIOS_WDDM_IDENTITY_VERSION
+            && self.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
+            && self.resource_id != 0
+            && self.reserved[0] & HELIOS_WDDM_STANDARD_CONTRACT_FOREIGN_SYSMEM != 0
     }
 
     /// Whether this allocation adopted a FOREIGN (RM-exported) resource, so the
@@ -1261,6 +1285,59 @@ mod classify_tests {
             ..meta
         };
         assert!(!layout.agrees_with(&skewed));
+    }
+
+    #[test]
+    fn the_standard_foreign_sysmem_bit_is_its_own_bit_and_only_a_standard_v2_identity_has_it() {
+        // Two distinct bits of the same word: neither implies the other.
+        assert_ne!(
+            HELIOS_WDDM_STANDARD_CONTRACT_FOREIGN_SYSMEM,
+            HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER
+        );
+        assert_eq!(
+            HELIOS_WDDM_STANDARD_CONTRACT_FOREIGN_SYSMEM
+                & HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER,
+            0
+        );
+        let mut ident = HeliosWddmOpenIdentity {
+            venus_alloc_size: 29_491_200,
+            blob_size: 29_491_200,
+            magic: HELIOS_WDDM_IDENTITY_MAGIC,
+            version: HELIOS_WDDM_IDENTITY_VERSION,
+            resource_id: 42,
+            memory_type_index: 0,
+            ctx_id: 7,
+            kind: HELIOS_WDDM_ALLOC_KIND_STANDARD,
+            reserved: [HELIOS_WDDM_STANDARD_CONTRACT_FOREIGN_SYSMEM, 0],
+        };
+        assert!(ident.foreign_sysmem_primary());
+        // A reader that knows only the dedicated bit still sees "not a present buffer", and a
+        // STANDARD identity is never a DEVICE_MEMORY foreign adoption or a tracker.
+        assert!(!ident.dedicated_present_buffer());
+        assert!(!ident.foreign());
+        assert_eq!(ident.global_vidmm_tracker(), None);
+        // Both bits can be told apart.
+        ident.reserved[0] |= HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER;
+        assert!(ident.foreign_sysmem_primary() && ident.dedicated_present_buffer());
+        ident.reserved[0] = HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER;
+        assert!(!ident.foreign_sysmem_primary());
+        ident.reserved[0] = HELIOS_WDDM_STANDARD_CONTRACT_FOREIGN_SYSMEM;
+        // Not for DEVICE_MEMORY (whose word 0 is a tracker share or the FOREIGN flag).
+        let mut dm = ident;
+        dm.kind = HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY;
+        assert!(!dm.foreign_sysmem_primary());
+        // Not for a legacy identity (padding), an invalid record or no resource.
+        let mut v1 = ident;
+        v1.version = HELIOS_WDDM_IDENTITY_VERSION_LEGACY;
+        assert!(!v1.foreign_sysmem_primary());
+        let mut bad = ident;
+        bad.magic = 0;
+        assert!(!bad.foreign_sysmem_primary());
+        let mut none = ident;
+        none.resource_id = 0;
+        assert!(!none.foreign_sysmem_primary());
+        // The layout an opener derives for the primary: pitch-linear, 4 bytes a pixel.
+        assert_eq!(core::mem::size_of::<HeliosWddmOpenIdentity>(), 48);
     }
 
     #[test]
