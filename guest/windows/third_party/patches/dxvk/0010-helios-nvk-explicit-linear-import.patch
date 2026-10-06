@@ -11,7 +11,7 @@ record's modifier LINEAR, one plane and a pitch, the image is now created
 with VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT and an explicit plane layout
 (offset, rowPitch from the trailer), as 0001 does for Venus foreign
 imports; NVK's import check then matches by construction. An NVK device
-enables VK_EXT_image_drm_format_modifier for this (NVK patch 0041 exposes
+enables VK_EXT_image_drm_format_modifier for this (NVK patch 0042 exposes
 it on Windows). Block-linear records, i.e. every ordinary OPTIMAL share,
 and two-plane records take the old path unchanged.
 
