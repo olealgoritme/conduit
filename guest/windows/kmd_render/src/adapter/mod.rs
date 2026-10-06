@@ -1072,6 +1072,29 @@ impl ProgrammedPrimary {
     pub(crate) fn after_scanout_bind(address: u64) -> Self {
         Self { address }
     }
+
+    /// Complete a flip of a FOREIGN or HOLLOW primary the KMD could not show: publish its address
+    /// WITHOUT claiming the screen shows its content. The screen keeps the previous picture.
+    ///
+    /// WHY THIS IS LEGAL. `last_primary_address` is not a claim about pixels, it is the word
+    /// `DXGK_INTERRUPT_CRTC_VSYNC` carries so dxgkrnl can retire the queued flip whose new
+    /// `PhysicalAddress` it matches (the driver's model, `viogpu3d`'s `m_sourceAddress`; whether
+    /// dxgkrnl is strictly address-driven has never been observed, see
+    /// `docs/zero-copy-present.md`, "Flip completion invariant for foreign primaries"). The KMD
+    /// OWNS flip completion toward dxgkrnl; whether the picture was displayed is a separate
+    /// question with its own counters (`ScCpyErr`, `FkKeep`, `FfRef*`). Leaving the address on the
+    /// previous primary instead does not keep the screen honest, it holds the flip until dxgkrnl
+    /// stops issuing source addresses and the compositor blocks after a couple of presents.
+    ///
+    /// ONLY for a foreign or hollow allocation (`flip_completion::classify`): a Venus allocation
+    /// that fails to program keeps the old address exactly as before
+    /// (`helios_kmd_logic::flip_completion::decide` never answers `Kept` for one), and every call
+    /// site goes through that decision. Named differently from
+    /// [`Self::after_scanout_bind`] on purpose, so the two cannot be confused and a grep for
+    /// `kept_picture` finds every place a flip is completed without a bind.
+    pub(crate) fn kept_picture(address: u64) -> Self {
+        Self { address }
+    }
 }
 
 impl Drop for ProgrammingInterval<'_> {
@@ -1525,8 +1548,9 @@ impl AdapterContext {
         &self,
         primary_address: u64,
         ticket: ProgrammingTicket,
+        keep_on_failure: bool,
     ) -> crate::virtio::ScanoutNotify {
-        crate::virtio::ScanoutNotify::for_adapter(self, primary_address, ticket)
+        crate::virtio::ScanoutNotify::for_adapter(self, primary_address, ticket, keep_on_failure)
     }
 
     /// Publish the address the CRTC_VSYNC packet reports as the display

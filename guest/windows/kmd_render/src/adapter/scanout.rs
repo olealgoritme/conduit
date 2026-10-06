@@ -195,6 +195,17 @@ impl AdapterContext {
         crate::ddi::scanout_trace::note_lease_primary_published();
     }
 
+    /// Complete a flip of a foreign primary that could not be shown: publish its address as a
+    /// kept picture (`ProgrammedPrimary::kept_picture`). One atomic store and nothing else: legal
+    /// at any IRQL, including the DMA flip lane's DISPATCH submit and the ring-1 completion DPC.
+    ///
+    /// Deliberately NOT `publish_bound_primary`: that one also feeds the lease census
+    /// (`LsPub`), and nothing was bound here. The caller decides through
+    /// `helios_kmd_logic::flip_completion::decide` and counts through `ddi::flip_keep`.
+    pub(crate) fn publish_kept_primary(&self, address: u64) {
+        self.publish_displayed_primary(super::ProgrammedPrimary::kept_picture(address));
+    }
+
     /// Mark already-completed scanout contents dirty. The normal copied path
     /// does this from the ring-1 GPU-completion DPC; the direct-primary
     /// zero-copy case has no KMD GPU submission, so SetVidPn uses this after

@@ -894,6 +894,11 @@ pub(crate) struct WindowsPrimary {
     /// from this primary's own layout; everything else here (address, epoch,
     /// retirement) still describes the flipped allocation.
     pub snapshot: Option<SnapshotDescriptor>,
+    /// Which flip-completion rule this allocation follows (`helios_kmd_logic::flip_completion`),
+    /// from the KMD's own create-time record, never the creator's words: a foreign adoption, or
+    /// a hollow allocation the Venus path can never show, still completes its flip as a kept
+    /// picture when the programming cannot show it. A Venus allocation keeps every path it had.
+    pub flip_source: helios_kmd_logic::flip_completion::Source,
 }
 
 /// A scan-out surface that has been validated as legal for `SET_SCANOUT_BLOB`.
@@ -1231,7 +1236,39 @@ pub(crate) unsafe fn scanout_alloc_info(
         present_epoch: ctx.vidpn_present_epoch.load(Ordering::Relaxed),
         frame_watermark: ctx.vidpn_frame_watermark.load(Ordering::Relaxed),
         snapshot,
+        flip_source: flip_source_of(ctx),
     })
+}
+
+/// [`helios_kmd_logic::flip_completion::classify`] of an allocation context (lock-free).
+fn flip_source_of(ctx: &AllocationContext) -> helios_kmd_logic::flip_completion::Source {
+    helios_kmd_logic::flip_completion::classify(&helios_kmd_logic::flip_completion::SourceFacts {
+        resource_id: ctx.resource_id,
+        foreign: ctx.foreign.is_some(),
+        direct_scanout: ctx.direct_scanout,
+        width: ctx.width,
+        height: ctx.height,
+        venus_identity: ctx.venus_image_id != 0 || ctx.venus_alloc_size != 0,
+    })
+}
+
+/// What flip completion needs from a `SetVidPnSourceAddress` handle that
+/// [`scanout_alloc_info`] may refuse: the rule it follows and the address Windows paired with it.
+/// Unlike [`scanout_alloc_info`] it also answers for an allocation with NO resource id (the shared
+/// placeholder), which is exactly the one whose flip must still complete. `None` for a null,
+/// foreign or older-generation handle (no address is known).
+///
+/// # Safety
+/// Same contract as [`scanout_alloc_info`].
+pub(crate) unsafe fn flip_completion_info(
+    adapter: &AdapterContext,
+    h: HANDLE,
+) -> Option<(helios_kmd_logic::flip_completion::Source, u64)> {
+    let ctx = unsafe { resolve_current_alloc(adapter, h) }?;
+    Some((
+        flip_source_of(ctx),
+        ctx.vidpn_primary_address.load(Ordering::Acquire),
+    ))
 }
 
 /// Rebuild the published [`PreparedImageCopy`] snapshot from its atomic mirror.
@@ -1447,7 +1484,17 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
                 copy
             }
         };
-        let fence = client.submit_prepared_image_copy(adapter, &copy, primary_address, ticket)?;
+        // A foreign or hollow source whose copy fails on the host still completes its flip
+        // (`flip_completion`); a Venus source publishes nothing on failure, as before.
+        let keep_on_failure =
+            primary.flip_source != helios_kmd_logic::flip_completion::Source::Venus;
+        let fence = client.submit_prepared_image_copy(
+            adapter,
+            &copy,
+            primary_address,
+            ticket,
+            keep_on_failure,
+        )?;
         ctx.scanout_copy_last_fence.store(fence, Ordering::Release);
         Ok::<u64, crate::virtio::VirtioError>(fence)
     });

@@ -462,6 +462,7 @@ impl VenusClient {
         copy: &PreparedImageCopy,
         primary_address: u64,
         ticket: crate::adapter::ProgrammingTicket,
+        keep_on_failure: bool,
     ) -> Result<u64, VirtioError> {
         // The two null checks are gone: both handles are NonZeroU64 now.
         if Some(copy.target_image_id) != self.copy_target_image_id {
@@ -496,6 +497,7 @@ impl VenusClient {
             submit.as_slice()?,
             primary_address,
             ticket,
+            keep_on_failure,
         )?;
         // Remember it here, under the venus mutex the caller already holds, so
         // the drain in destroy_prepared_image_copy cannot read a stale value

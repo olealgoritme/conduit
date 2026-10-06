@@ -593,6 +593,10 @@ pub struct ScanoutNotify {
     /// `ScStale` instead of clearing a gate that is not its own.
     ticket: crate::adapter::ProgrammingTicket,
     primary_address: u64,
+    /// The copy's source is a foreign or hollow allocation (`flip_completion::Source`): a copy
+    /// whose GPU completion FAILS still completes the flip, by publishing `primary_address` as a
+    /// kept picture. False for a Venus allocation, whose failure publishes nothing as before.
+    keep_on_failure: bool,
     event: NonNull<KEVENT>,
 }
 
@@ -769,6 +773,7 @@ impl ScanoutNotify {
         adapter: &crate::adapter::AdapterContext,
         primary_address: u64,
         ticket: crate::adapter::ProgrammingTicket,
+        keep_on_failure: bool,
     ) -> Self {
         Self {
             pending: NonNull::from(&adapter.scanout_refresh_pending),
@@ -776,6 +781,7 @@ impl ScanoutNotify {
             programming: NonNull::from(&adapter.vidpn_programming),
             ticket,
             primary_address,
+            keep_on_failure,
             // SAFETY: hpd_event is embedded in the stable adapter and
             // initialized by init_kernel_events before StartDevice creates any
             // Venus submissions.
@@ -5196,6 +5202,23 @@ impl VirtioGpu {
                                         .as_ref()
                                         .store(notify.primary_address, Ordering::Release);
                                     notify.pending.as_ref().store(1, Ordering::Release);
+                                } else if notify.keep_on_failure
+                                    && notify.primary_address != 0
+                                {
+                                    // FLIP COMPLETION (`helios_kmd_logic::flip_completion`): the
+                                    // copy of a foreign or hollow primary failed on the host, so
+                                    // nothing will ever publish this address and dxgkrnl would
+                                    // hold the flip. Publish it as a kept picture (the screen
+                                    // keeps what it showed; no refresh is requested): the same
+                                    // atomic store as above, legal at this DISPATCH_LEVEL.
+                                    notify
+                                        .displayed_primary
+                                        .as_ref()
+                                        .store(notify.primary_address, Ordering::Release);
+                                    crate::ddi::flip_keep::count(
+                                        helios_kmd_logic::flip_completion::KeepWhy::AsyncCopyFailed,
+                                        crate::ddi::flip_keep::Lane::Async,
+                                    );
                                 }
                                 // Ticketed clear, unconditional on response_ok
                                 // exactly as before: a failed copy must still
