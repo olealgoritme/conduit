@@ -56,7 +56,7 @@ possible with the current stack).
 | NVIDIA open kernel modules | expected | expected | expected | works | Open modules support Turing and later only (README of [open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules)); Blackwell requires them. `conduit doctor` refuses the closed modules: `cli/src/doctor.rs:77` |
 | Driver release with RM ABI tables (580.178.04, 595.71.05, 595.104.02, 610.57.04, 615.71.09) | expected | expected | expected | works | Tables are **per driver release, not per GPU**: RM's ioctl/control layouts do not depend on the chip. `host/backend/gen/src/osdesc/mod.rs:185` picks the nearest older release; doctor checks the version against the supported list (`cli/src/doctor.rs:86`). A newer driver needs new tables (`host/backend/gen`, `.github/workflows/abi.yml`) |
 | Turing still supported by the driver branch | expected | | | | 580 is the last branch for Maxwell/Pascal/Volta; 590+ supports Turing (GTX 16 / RTX 20) and later, no Linux EOL for Turing announced ([Arch news on 590](https://archlinux.org/news/nvidia-590-driver-drops-pascal-support-main-packages-switch-to-open-kernel-modules/)). 615 ships open modules only |
-| BAR1 / RM window sizing | needs check: 256 MiB BAR1 | expected (ReBAR on) / needs check (off) | expected | works | `gpu.window_mib` defaults to the host GPU's BAR1 (`cli/src/config.rs:7`, `cli/src/lvrun.rs:639`); the KMD handles small windows (`guest/windows/kmd_logic/src/rm_window.rs:158`, test row "BAR1 256 MiB" at :814). Functionally fine. NVK-on-RM's host-visible VRAM heap is `min(NVK_RM_BAR_MB, BAR1/2)` (`nvkmd_rm_pdev.c:240-256`), so a 256 MiB BAR1 gives a 128 MiB heap; past it allocations fall back to system memory (0025). A real 595.71.05 bug hit a 5070 with ReBAR off ([open-gpu-kernel-modules#1132](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1132)) **(guess: noticeable DXVK perf drop without ReBAR)** |
+| BAR1 / RM window sizing | needs check: 256 MiB BAR1 | expected (ReBAR on) / needs check (off) | expected | works | `gpu.window_mib` defaults to the host GPU's BAR1 (`cli/src/config.rs:7`, `cli/src/lvrun.rs:639`); the KMD handles small windows (`guest/windows/kmd_logic/src/rm_window.rs:158`, test row "BAR1 256 MiB" at :814). Functionally fine. NVK-on-RM's host-visible VRAM heap is `MIN2(bar1, vram - 64K)` (Mesa 0045:158-163; 0022 had a 256 MiB cap), so a 256 MiB BAR1 gives a 256 MiB heap; past it allocations fall back to system memory (0025, 0045). A real 595.71.05 bug hit a 5070 with ReBAR off ([open-gpu-kernel-modules#1132](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1132)) **(guess: noticeable DXVK perf drop without ReBAR)** |
 | Guest shared-memory BAR (64 GiB, QEMU) | expected | expected | expected | works | Not GPU-dependent: `cli/src/qemu.rs:147`, `docs/examples/win11.xml:71` |
 | Venus host renderer (NVIDIA Vulkan) | expected | expected | expected | works | Conduit's virglrenderer patches use `VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier`, `VK_EXT_external_memory_host`, exposed by NVIDIA's Linux driver on every Turing+ GPU (dma-buf and modifiers since 515.43.04, external_memory_host since 440.66.17); they are hidden without `nvidia-drm modeset=1` and render-node access. No per-generation differences documented **(check `vulkaninfo` on the 4070)** |
 
@@ -76,8 +76,9 @@ possible with the current stack).
 | Upstream NVK hardware support | expected (conformant) | expected (conformant) | expected (conformant) | works | `docs/drivers/nvk.rst:9-17` at our base: Kepler through Ada plus consumer Blackwell, conformant Vulkan 1.4; `nvk_is_conformant` (`nvk_physical_device.c:100-116`) covers KEPLER_A..ADA_A and BLACKWELL_B; Turing+ get API 1.4 ([NVK docs](https://docs.mesa3d.org/drivers/nvk.html)) |
 | NAK shader compiler | expected | expected | expected | works | One backend (`sm70.rs`, `sm70_encode.rs`) for all four; SM120 adds encodings and uniform ALU forms gated on SM>=100/120, SM89 vs SM86 differs only in f16 conversions. SM75/86/89 are older and better trodden than SM120. `sm` and shared-memory limits come from `chipset` (`nouveau_device_limits.c`) |
 | NVK on RM: class and device info from RM | expected | expected | expected | works | Classes from the RM class list, chipset from `MC_GET_ARCH_INFO` (above); the only Blackwell gates are compression (0028) and a GB202 GP_GET comment (`nvkmd_rm_ctx.c:95`) |
-| NVK on RM: GPC/TPC counts | **to verify** | **to verify** | **to verify** | works | `gpc_count` from `GR_INFO_INDEX_LITTER_NUM_GPCS`, `tpc_count` from `SHADER_PIPE_SUB_COUNT` (`nvkmd_rm_pdev.c:264-276`): "litter" values are per-design constants, not necessarily the enabled (floorswept) counts. Check the gpc/tpc log line (`nvkmd_rm_pdev.c:435`) against `nvidia-smi`/spec **(unverified)** |
+| NVK on RM: GPC/TPC counts | **to verify** | **to verify** | **to verify** | works | `gpc_count` from `GR_INFO_INDEX_LITTER_NUM_GPCS`, `tpc_count` from `SHADER_PIPE_SUB_COUNT` (`nvkmd_rm_pdev.c:264-276`): "litter" values are per-design constants, not necessarily the enabled (floorswept) counts. Check the gpc/tpc log line (`nvkmd_rm_pdev.c:435`) against `nvidia-smi`/spec. If they are design maxima they over-size per-SM buffers, which wastes memory but is safe **(unverified)** |
 | Per-draw patches (patches-common 0001-0007) | expected | expected | expected | works | Gated on `cls_eng3d >= TURING_A` (e.g. 0001 l.103); use Turing-era methods (NVC597) |
+| Depth/stencil PTE kinds | **to verify** | **to verify** | **to verify** | works | GB20x uses only generic kinds (0x06/0x08, `nil/image.rs:745-765`); Turing-Ada use dedicated depth kinds (Z16, Z24S8, S8Z24, ZF32_X24S8, S8; `tu102_choose_pte_kind`, `image.rs:767-826`). NVK-on-RM allocates generic, `_COMPR_NONE` memory (`nvkmd_rm_mem.c:200-219`) and forces the kind per mapping with `OS46 _PAGE_KIND_OVERRIDE` (`nvkmd_rm_va.c:370-380`). RM under GSP was never asked for a depth kind that way; if it refuses, binds fail; the fallback without `crm_map_dma2` maps with the generic kind, harmless on Blackwell but likely corrupt depth on older GPUs **(unverified)** |
 | Compression (0028) | off, works uncompressed | off | off | works | `has_compression = cls_eng3d >= BLACKWELL_A` (0028 l.55, l.175; `nvkmd_rm_pdev.c:403-405`): pre-Blackwell images stay uncompressed (kind 0x06). Correct but slower. Pre-Blackwell compression keeps its state in comptaglines RM writes into the PTEs, allocated when `NVOS32_ATTR_COMPR` is not NONE (open modules `mem_mgr_tu102.c:249-260, 457-483`), so it needs a COMPR_ANY allocation, mapping through RM and the Turing-Ada depth kinds (0x01-0x05 and their compressible forms) that 0028 does not know: **needs work** (perf only) |
 | ZCULL (0029) | expected **(to verify)** | expected **(to verify)** | expected **(to verify)** | works | Sizes come from `NV2080_CTRL_CMD_GR_GET_ZCULL_INFO`, not constants |
 | Video decode (0035) | expected | expected | expected | works | NVDEC class taken from the class list, Turing 0xc4b0 .. Blackwell 0xcfb0 (0035 l.141) |
@@ -116,7 +117,11 @@ possible with the current stack).
 | KMD: learn the GOB scheme (registry knob, or the host reports the GPU architecture through a capability bit) and pass it to validation | 20/30/40 | M; needs a WDK build | `guest/windows/kmd_render` (escape_foreign.rs, knob reading), host protocol | needs work |
 | Pre-Blackwell compression: allocate comptags through RM, use compressible kinds | 20/30/40 | L; Mesa rebuild + measurement | Mesa patch 0028 | needs work (perf only) |
 | RM ABI tables for any new driver release | all | M per release (generated) | `host/backend/gen`, `abi.yml` | as needed |
-| `conduit doctor`: report GPU name, architecture, BAR1 size / ReBAR, warn on 256 MiB BAR1 | all | S | `cli/src/doctor.rs` | needs work (next) |
+| `conduit doctor`: report GPU name and BAR1, warn on a BAR1 of 256 MiB or less | all | S | `cli/src/doctor.rs`, `cli/src/host.rs` | done on branch `feat/multi-gpu` (cli tests + clippy pass; on the 5090 it adds `GPU: NVIDIA GeForce RTX 5090 at 0000:01:00.0, BAR1 32.0 GB`) |
+| Backend caps tests pin the Turing/Ampere/Ada/Blackwell classes; comment fixes (0xfe/gen 0 is Fermi-Volta; 6/2/1 is right on every Turing+ GPU) | all | XS | `host/backend/device/src/caps.rs`, `nvidia/rm_import.rs`, `nvidia/files.rs` | done on branch `feat/multi-gpu` |
+| KMD wiring: pass a `GobScheme` at the three `validate_request` call sites (`kmd_render/src/virtio/foreign.rs:171`, `virtio/rm_client/sysmem.rs:824`, `virtio/rm_foreign.rs:133`), from `NV2080_CTRL_CMD_MC_GET_ARCH_INFO` through the KMD's RM client or the PCI id from CardInfo | 20/30/40 | M; WDK build | `guest/windows/kmd_render` | needs work |
+| `conduit doctor`: 535.129.03 is in the supported list but `major < 580` fails it | all | XS | `cli/src/doctor.rs:80`, `cli/src/host.rs` | needs a decision (drop 535 tables or the 580 floor) |
+| Venus scanout modifier hardcoded `0x0300000000606010 \| h` (`host/backend/device/src/venus/scanout.rs:34-42`) and the NVIDIA Vulkan driver's block-height heuristic (:56-73), measured on the 5090 only | all | S | backend | right on every Turing+ desktop GPU; heuristic **to verify** (override: `CONDUIT_VENUS_SCANOUT_MODIFIER`) |
 | crm_smoke: architecture names per family (TU10x/GA10x/AD10x/GB20x) | all | XS | `guest/rmclient/tests/crm_smoke.c:32` | cosmetic |
 
 ## Testing a new GPU
@@ -161,7 +166,8 @@ Then Windows: `Verify-Helios.ps1 -RunSmokeTests`, a D3D11 app with
    in `guest/rmclient` (expect `Ada (AD100)` = arch 0x190 and usermode class
    0xc561); the other crm_* smokes; then `vk_summary`, `vk_compute_test`,
    `vk_offscreen_test`, `vk_bar_test`, `vk_bl_readback`,
-   `vk_scanout_present` from `guest/nvk-rm/tests`. Save `vk_summary` output
+   `vk_scanout_present` from `guest/nvk-rm/tests`, then a depth/stencil test
+   with `NVK_DEBUG=vm` (risk 3). Save `vk_summary` output
    next to a 5090 run: any class or heap difference is the first lead.
 3. **Venus (5 min)**: `vkcube` over Venus in the Linux guest.
 4. **Windows (25 min)**: the same `HeliosSetup.exe`/driver as on the 5090;
@@ -182,12 +188,17 @@ Top risks for the 4070, most likely first:
    counts mis-size per-SM buffers (shader local memory, etc.). Check NVK's
    gpc/tpc log line first. Classes and chipset come from RM and should be
    right (expected 3D 0xc997, chipset 0x194). **(unverified)**
-3. **ReBAR off / smaller BAR1**: works but the host-visible heap shrinks;
+3. **Depth/stencil PTE kinds through RM** (matrix above): Ada uses depth
+   kinds the 5090 never needed. First check: a Vulkan app with D16, D24S8,
+   D32S8 and S8 attachments under `NVK_DEBUG=vm` in the Linux guest (any
+   game's depth buffer shows it too: corrupt depth or failed binds).
+   **(unverified)**
+4. **ReBAR off / smaller BAR1**: works but the host-visible heap shrinks;
    check BAR1 before measuring anything.
-4. **Driver release mismatch**: a newer driver than the five with tables
+5. **Driver release mismatch**: a newer driver than the five with tables
    fails `conduit doctor`; install a listed release instead of generating
    tables on the spot.
-5. **Lower numbers than the 5090 for non-GPU reasons**: compression is off
+6. **Lower numbers than the 5090 for non-GPU reasons**: compression is off
    pre-Blackwell (0028), so compare against bare metal on the same 4070, not
    against the 5090 table in HANDOFF.md.
 
