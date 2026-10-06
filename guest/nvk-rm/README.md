@@ -859,6 +859,35 @@ adapter's LUID (librmclient with `crm_win_adapter_luid`), Venus second;
 the first discrete GPU, NVK, creates a device and completes a submit. With
 `HELIOS_ICD=venus` NVK enumerates nothing and the app gets Venus.
 
+### Scanout images back on host release (patch 36, KMD 22.22.315)
+
+With KMD 22.22.315 on a backend with `NVGPU_F_SCANOUT_RELEASE` (feature bit
+15) the KMD reports when the host is done with a flipped image
+(`guest/windows/docs/foreign-scanout.md` on `worktree-kmd-start-debug`,
+"Buffer release"; `QueryCaps.supported_ops` bit 35). Patch 36 replaces the
+swapchain's "an image comes back two presents later" with it:
+
+- every flip through the KMD's source (plain or fenced) records the
+  `out_seq` it returned on the memory; a flip still queued in the flip
+  thread has no seq yet, so a wait on that memory first waits for the thread;
+- `vkAcquireNextImageKHR` gets an image as soon as a later one is shown,
+  takes the idle image shown longest ago and blocks (outside the swapchain
+  lock) until `SCANOUT_STATUS`'s released floor reaches that image's seq,
+  woken by the `SCANOUT_RELEASED` event (kind 3, handle 0) with the
+  reset/ask/wait order that loses no wake (librmclient
+  `crm_win_scanout_wait_released`). The wait honours the app's timeout
+  (`VK_TIMEOUT`/`VK_NOT_READY`, the image stays idle) and is capped at 1 s:
+  past the host's 500 ms forced release the image is written anyway and
+  counted. A lost transport counts as released;
+- without bit 35 (any KMD before 315, or a host without bit 15) the old rule,
+  unchanged. `NVK_SCANOUT_RELEASE=0` forces the old rule.
+
+`win11`, KMD 22.22.312 (no bit 35): "not tracked", `vk_scanout_present` with
+two and three images as before, 0 release waits. The tracked path is untested
+(needs KMD 315 and the backend with bit 15).
+
+Order: after 0030, before `patches-windows-dxvk/`.
+
 ## Running (in a guest)
 
 ```sh
