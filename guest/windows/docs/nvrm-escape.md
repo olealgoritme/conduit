@@ -46,11 +46,12 @@ mode stay: the RM structures, the data/nested/deep pointer fix-ups, the device t
 Everything else the KMD adds is bookkeeping that one process must not be able to get wrong
 about another: handle ownership, mapping / pin / event lifetime, and teardown.
 
-**Security stance (two rules are enforced).** User mode never supplies or sees a
+**Security stance (two rules; the second is counted, not yet refused).** User mode never supplies or sees a
 guest-physical address. Page-run tables are built only by the KMD from pages it locked
 (`PIN`); a `FORWARD` that carries a page-run `deep_ptr_offset` is refused. The second rule
 is that a request may only name RM clients and backend handles of the process that sends it:
-section 12 (`NvDupHarden`, on by default). Everything else is deferred (section 10).
+section 12 (`NvDupHarden`: log-only by default in the first shipped package, refusing with
+`NvDupHarden` = 1). Everything else is deferred (section 10).
 
 **Owner = the D3DKMT device handle**, not the process. Every ownership table is keyed on
 the `hDevice` of the escape (`DeviceOwner::new(args.hDevice)`). An escape with no `hDevice`
@@ -607,7 +608,7 @@ change a shape counter) before reading, or compare after the process has exited.
 | `NvDupDeny` | of those, refused (mode 1; each is also in `NvRef`) | **0** outside a deliberate negative test |
 | `NvDupWould` | of those, only counted because `NvDupHarden` = 2 | **0**; the field of a log-only run, read it before switching to 1 |
 | `NvDupDoubt` | requests with a slot the rules could not judge with confidence (a block of an unverified size, a field cut short, an fd control the host does not translate); forwarded in every mode | small; a rise names a workload to look at (section 12.5) |
-| `NvDupMode` | the `NvDupHarden` value in force (0, 1 or 2), written once the first forward read it | 1 |
+| `NvDupMode` | the `NvDupHarden` value in force (0, 1 or 2), written once the first forward read it | 2 until the default is flipped, then 1 |
 | `NvWinMb`, `NvAptMb` | size in MiB of shared-memory region 1 (RM window) and 2 (UVM aperture), written at init | nonzero, or `MMAP` answers `UNSUPPORTED` |
 
 `Fg*` counters belong to the foreign-resource verb (`zero-copy-present.md`), not this
@@ -700,13 +701,14 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
 ### 10.1 Known gaps (deliberate)
 
 - **Security hardening is deferred.** Only the physical-address rule, handle/pin/map
-  ownership and (section 12) cross-client references are enforced. Not done: per-process resource accounting beyond the counts above,
+  ownership are enforced, and (section 12) cross-client references are counted, or refused
+  with `NvDupHarden` = 1. Not done: per-process resource accounting beyond the counts above,
   in-flight reference counts on handles (a handle closed by one thread while another is
   inside a `FORWARD` on it can still name a recycled number: the commit-time rechecks narrow
   but do not close this), validation of RM structures, rate limiting, auditing which RM
   classes a process may allocate.
 - **Payload slots that name another client's object** are checked since `NvDupHarden`
-  (section 12): `RM_DUP_OBJECT`'s `hClientSrc`, every RM escape's own client, the cross-client
+  (section 12; counted by default, refused with `NvDupHarden` = 1): `RM_DUP_OBJECT`'s `hClientSrc`, every RM escape's own client, the cross-client
   slots of the allocations and controls the host lets an unprivileged caller reach, and the
   backend-handle slots (`0x3d05` / `0x3d06`, the NVKMS `memFd`, the `NV0005` event `data`,
   `REGISTER_FD`, the `fd` of `ALLOC_MEMORY` / `MAP_MEMORY`, the OS-event `fd`; the fence wait
@@ -879,7 +881,8 @@ in a Windows guest (section 12.7).
   28 or 40) and a `hObjectNew` (word 8) that is neither 0 nor `0xFFFFFFFF`, records that client
   for the owner, with the backend file the request went through as `via`.
 * **Reservation.** As an `Open` does for handles, a client allocation reserves its table slot
-  BEFORE it is forwarded: a full table or quota refuses (`NO_RESOURCES`, `NvCliFull`) before the
+  BEFORE it is forwarded (the reservation is a slot of the table that counts against the table
+  AND the owner's quota, so two concurrent allocations one below the quota cannot both reserve): a full table or quota refuses (`NO_RESOURCES`, `NvCliFull`) before the
   host makes a client nobody tracks. A failed or refused allocation gives the slot back.
 * **Forgetting.** A successful `NV_ESC_RM_FREE` of the client itself (16-byte NVOS00,
   `hObjectOld == hRoot`, host and RM status 0), or one that TIMED OUT (indeterminate: the entry
@@ -907,14 +910,29 @@ in a Windows guest (section 12.7).
 
 ### 12.3 The knob and the counters
 
-`NvDupHarden` (REG_DWORD under the service key, read once per boot, so `reg add` + restart the
-device): **1** (default) enforce; **0** off (nothing is recorded or judged: the behaviour before
-this change); **2** log-only (everything is recorded and judged, what mode 1 would refuse is
-counted in `NvDupWould` and forwarded). Any other value enforces. The counters are in section 7
-(`NvCli*`, `NvDup*`; all at most 10 characters). `NvDupMode` shows what was read.
+`NvDupHarden` (REG_DWORD under the service key, read once per boot): **2** (the default of the
+first shipped package) log-only: everything is recorded and judged, what mode 1 would refuse is
+counted in `NvDupWould` and forwarded; **1** enforce (a refusal is `NOT_OWNED`, counted in
+`NvDupDeny` and `NvRef`); **0** off (nothing is recorded or judged: the behaviour before this
+change). A value that is present and is not 0 or 2 enforces, so a typo never turns the checks
+off. The counters are in section 7 (`NvCli*`, `NvDup*`; all at most 10 characters). `NvDupMode`
+shows what was read.
 
-Recommended roll-out on a new workload: run it once with `NvDupHarden` = 2 and read `NvDupWould`
-and `NvDupDoubt`; both should be 0 / small, and then leave the default.
+To set it, in an elevated prompt on the guest, then restart the adapter (or reboot):
+
+```
+reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v NvDupHarden /t REG_DWORD /d 1 /f
+pnputil /restart-device "<the Helios display adapter's instance id>"
+reg query HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v NvDupMode
+```
+
+(`NvDupMode` appears once the first forward after the restart read the knob.)
+
+**Flip the default to 1** (change `MODE_LOG` to `MODE_ENFORCE` in `virtio/nvrm_harden.rs`
+`read_mode`, and the knob comment in `diag.rs`) after a real NVK run, with the default as
+shipped, shows: `NvCliRec` close to `NvOpen` (one client per `crm_open`; a gap means replies the
+table could not read), `NvDupWould` 0 (nothing the rules would refuse was sent), and `NvDupDoubt`
+small and explained. Read the counters after a few extra escapes (section 7, publication lag).
 
 ### 12.4 What is covered
 
@@ -927,7 +945,8 @@ host allow-list's, equal in all six releases it carries unless noted), else Doub
 | every RM escape in `CLIENT_AT_0` (`0x27 0x28 0x29 0x2A 0x2B 0x32 0x33 0x34 0x35 0x37 0x38 0x39 0x41 0x4A 0x4D 0x4E 0x4F 0x56 0x57 0x58 0x59 0x5E`) | `data` @0 (`hRoot` / `hClient`) | the caller's client | Deny; client 0 passes |
 | `NV_ESC_RM_ALLOC` of a root class | none (RM picks the number) | | the request is recognised and its reply recorded |
 | `NV_ESC_RM_DUP_OBJECT` (NVOS55, 28 bytes) | `data` @12 `hClientSrc` (`hObjectSrc` @16 follows from it) | a client | Deny at 28 bytes |
-| `RM_ALLOC` class `0x05` / `0x79` (`NV0005`, 24 bytes) | `nested` @0 `hParentClient`; @16 `data` (low word, the event file) | a client; a backend handle | Deny at 24 |
+| `RM_ALLOC` class `0x79` (`NV0005`, 24 bytes) | `nested` @0 `hParentClient`; @16 `data` (low word, the event file) | a client; a backend handle | Deny at 24; Deny at 24 |
+| `RM_ALLOC` class `0x05` (`NV0005`, 24 bytes) | `nested` @0 `hParentClient`; @16 `data` | a client; a number that may be a cookie | Deny at 24; Doubt always (12.5) |
 | `RM_ALLOC` class `0x80` (`NV0080`, 56) | `nested` @4 `hClientShare`, @8 `hTargetClient` | clients | Deny at 56 |
 | `RM_ALLOC` class `0x83DE` (debugger, 12) | `nested` @4 `hAppClient` | a client | Deny at 12 |
 | `RM_ALLOC` class `0xB2CC` (profiler, 8) | `nested` @0 `hClientTarget` | a client | Deny at 8 |
@@ -972,9 +991,10 @@ rules are not sure they count instead of refusing:
 * **Size drift.** Every Deny needs the verified block size. A release whose struct grew gets a
   `NvDupDoubt` and is forwarded as before until the table is updated (the preemption bind, 104 /
   112, is the one entry whose size differs between the six releases, and asserts none).
-* **`NV0005` class `0x05` versus `0x79`.** The host treats `data` the same way for both and so
-  does the table; a class-`0x05` event whose `data` is not a backend handle would be refused. No
-  such use is known.
+* **`NV0005` class `0x05` versus `0x79`.** The host turns `data`'s low word into a descriptor for
+  both, but only `NV01_EVENT_OS_EVENT` (`0x79`) is known to take a descriptor there. For class
+  `0x05` a `data` that is not a handle of the caller's may be a cookie, so it is counted, not
+  refused; the parent client is checked for both.
 * **`SEMSURF_FENCE_WAIT`'s `fd`.** Counted, never refused: a process may wait on a fence it did not
   create (one the KMD took over for a present moves to the `KMD_RM` owner, and a fence another
   process shares is a plausible design), and nothing read for this change says that cannot be
@@ -984,9 +1004,11 @@ rules are not sure they count instead of refusing:
   number reaches RM as a descriptor of the backend process, which is not a handle of this table,
   so they are counted, not judged. This is a HOST finding (the values name whichever backend file
   sits at that number); the fix belongs in `host/backend/device/src/nvidia/nested.rs`.
-* **Two layout assumptions** read from headers, not from a running RM: the NVOS64 / NVOS21 status
-  offsets (40 / 28, from the host's `note_clients`) and `IoctlResp` carrying the data block at
-  reply offset 28. A reply that does not fit them records nothing (the client is then untracked,
+* **Two layout assumptions** read from the host and the current headers, not from a running RM:
+  the NVOS64 / NVOS21 sizes and status offsets (48 / 40 and 32 / 28: the host's
+  `nvidia/ioctl.rs` `note_clients` and the current `nvos.h` agree; the older SDK snapshot under
+  an older SDK copy has shorter structs and was not used for them) and `IoctlResp` carrying the data
+  block at reply offset 28. A reply that does not fit them records nothing (the client is then untracked,
   and in mode 1 its later calls are refused: watch `NvCliRec` against `NvOpen` in a first run).
 
 ### 12.6 What is NOT covered
@@ -1028,7 +1050,7 @@ rules are not sure they count instead of refusing:
 
 ### 12.7 Verification
 
-* `cargo test` in `guest/windows/kmd_logic` (`nvrm_clients::tests`, 44 tests): the table (two
+* `cargo test` in `guest/windows/kmd_logic` (`nvrm_clients::tests`, 47 tests): the table (two
   owners with the same number, reuse after a free, quotas, reservations, retire, `Close` of a
   file, `clear`), parsing and replies with every truncation and `u32::MAX` lengths, one test per
   covered slot (own / foreign / zero / negative / wrong size / too short), UVM and other
@@ -1040,7 +1062,8 @@ rules are not sure they count instead of refusing:
 * **UNVERIFIED:** that NVK on a live backend behaves as the headers say for the slots above
   (`NvDupWould` / `NvDupDoubt` in a log-only run are the check); that the reply layout of
   `RM_ALLOC` is as read from the host (`NvCliRec` must follow `NvOpen`); that `crm_share_smoke`'s
-  cross-client dup is now refused (`NvDupSrc` and `NvDupDeny` rise by one per attempt).
+  cross-client dup is now seen (`NvDupSrc` and `NvDupWould` rise by one per attempt in the default
+  mode; `NvDupDeny` in mode 1).
 
 ### 12.8 Adding or changing a slot
 
