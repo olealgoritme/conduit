@@ -1,7 +1,7 @@
-From 394aafbc55cbd138637f9e1ffb210e681fb26e67 Mon Sep 17 00:00:00 2001
+From 96cd563cbe57106cf74505335ab644f7c0fcf84d Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Tue, 6 Oct 2026 02:41:03 +0200
-Subject: [PATCH 3/3] wsi/win32: swizzle R8G8B8A8 swapchains into the BGRA DIB
+Subject: [PATCH 3/4] wsi/win32: swizzle R8G8B8A8 swapchains into the BGRA DIB
 
 The GDI (non-DXGI) present path memcpy()s each row into a BI_RGB DIB,
 which is B,G,R,X in memory, so an R8G8B8A8 swapchain (DXVK picks it for
@@ -12,10 +12,10 @@ Swap the two channels while copying for R8G8B8A8_UNORM/SRGB.
  1 file changed, 15 insertions(+), 1 deletion(-)
 
 diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
-index 0622857..cf1b905 100644
+index 55f416c..2e447ca 100644
 --- a/src/vulkan/wsi/wsi_common_win32.cpp
 +++ b/src/vulkan/wsi/wsi_common_win32.cpp
-@@ -107,6 +107,9 @@ struct wsi_win32_swapchain {
+@@ -109,6 +109,9 @@ struct wsi_win32_swapchain {
     uint64_t                     flip_sequence;
     VkResult                     status;
     VkExtent2D                 extent;
@@ -24,8 +24,8 @@ index 0622857..cf1b905 100644
 +   bool                       swap_rb;
     HWND wnd;
     HDC chain_dc;
-    struct wsi_win32_image     images[0];
-@@ -842,7 +845,16 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
+ 
+@@ -1027,7 +1030,16 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
     char *dptr = (char *)image->sw.ppvBits;
  
     for (unsigned h = 0; h < chain->extent.height; h++) {
@@ -43,7 +43,7 @@ index 0622857..cf1b905 100644
        dptr += image->sw.bmp_row_pitch;
        ptr += image->base.row_pitches[0];
     }
-@@ -1000,6 +1012,8 @@ wsi_win32_surface_create_swapchain(
+@@ -1203,6 +1215,8 @@ retry:
     chain->base.queue_present = wsi_win32_queue_present;
     chain->base.present_mode = wsi_swapchain_get_present_mode(wsi_device, create_info);
     chain->extent = create_info->imageExtent;

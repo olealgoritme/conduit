@@ -1,7 +1,7 @@
-From c83e8e3dbd58dce5c46354673adc7567b4fbd05a Mon Sep 17 00:00:00 2001
+From ba15b6fddba405acc4ee50e450685c3d1cfcd8ab Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Tue, 6 Oct 2026 02:37:23 +0200
-Subject: [PATCH 2/3] nvk: no VK_KHR_present_id/present_wait(2) on Windows
+Subject: [PATCH 2/4] nvk: no VK_KHR_present_id/present_wait(2) on Windows
 
 Mesa's Win32 WSI implements no wait_for_present, so wsi_WaitForPresentKHR
 asserts (swapchain->wait_for_present) and would then call NULL. DXVK

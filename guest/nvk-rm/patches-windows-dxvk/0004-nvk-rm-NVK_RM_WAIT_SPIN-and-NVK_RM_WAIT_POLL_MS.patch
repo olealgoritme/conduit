@@ -1,0 +1,59 @@
+From 929e3b03f8e41d2b7915dc9b926bdabb0bffbb44 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 02:58:06 +0200
+Subject: [PATCH 4/4] nvk/rm: NVK_RM_WAIT_SPIN and NVK_RM_WAIT_POLL_MS
+
+Tuning knobs for the CPU wait loop (yield iterations before blocking on
+the non-stall event, longest single block), for measuring how much the
+event wakeup path costs. Defaults unchanged (64, 10 ms).
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index ea123cf..ad0f8c1 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "nvkmd_rm.h"
++#include "util/u_debug.h"
+ 
+ #include "c11/threads.h"
+ #include <inttypes.h>
+@@ -305,8 +306,22 @@ nvkmd_rm_dev_get_gpu_timestamp(struct nvkmd_dev *_dev)
+  * is only a wakeup, so a missed or spurious one costs at most one poll
+  * timeout.
+  */
+-#define NVKMD_RM_WAIT_SPIN_ITERS 64
+-#define NVKMD_RM_WAIT_POLL_MS    10
++#define NVKMD_RM_WAIT_SPIN_ITERS_DEFAULT 64
++#define NVKMD_RM_WAIT_POLL_MS_DEFAULT    10
++
++/* Tuning/experiments: NVK_RM_WAIT_SPIN (yield iterations before blocking) and
++ * NVK_RM_WAIT_POLL_MS (longest single block on the event). */
++static uint32_t nvkmd_rm_wait_spin_iters, nvkmd_rm_wait_poll_ms;
++static void
++nvkmd_rm_wait_params_init(void)
++{
++   nvkmd_rm_wait_spin_iters =
++      debug_get_num_option("NVK_RM_WAIT_SPIN", NVKMD_RM_WAIT_SPIN_ITERS_DEFAULT);
++   nvkmd_rm_wait_poll_ms =
++      MAX2(1, debug_get_num_option("NVK_RM_WAIT_POLL_MS", NVKMD_RM_WAIT_POLL_MS_DEFAULT));
++}
++#define NVKMD_RM_WAIT_SPIN_ITERS nvkmd_rm_wait_spin_iters
++#define NVKMD_RM_WAIT_POLL_MS    nvkmd_rm_wait_poll_ms
+ 
+ VkResult
+ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+@@ -318,6 +333,9 @@ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+ 
+    const uint64_t remaining_ns = abs_timeout_ns - now;
+ 
++   static once_flag params_once = ONCE_FLAG_INIT;
++   call_once(&params_once, nvkmd_rm_wait_params_init);
++
+    if (*iter < NVKMD_RM_WAIT_SPIN_ITERS) {
+       thrd_yield();
+    } else if (dev != NULL && dev->nonstall_fd >= 0 &&

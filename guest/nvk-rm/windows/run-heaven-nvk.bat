@@ -23,5 +23,6 @@ if not exist "%HEAVEN%\logs" mkdir "%HEAVEN%\logs"
 rem Extra per-experiment settings (e.g. set NVK_RM_WAIT_POLL_MS=1), if any
 if exist "%HEAVEN%\env.cmd" call "%HEAVEN%\env.cmd"
 
+if "%HEAVEN_TESS%"=="" set HEAVEN_TESS=TESSELLATION_NORMAL
 cd /d "%HEAVEN%\bin"
-start Heaven.exe -video_app direct3d11 -sound_app null -data_path ../ -engine_config ../data/heaven_4.0.cfg -system_script heaven/unigine.cpp -video_mode -1 -video_width %W% -video_height %H% -video_fullscreen 0 -video_multisample 0 -extern_define RELEASE,LANGUAGE_EN,QUALITY_MEDIUM,TESSELLATION_NORMAL
+start Heaven.exe -video_app direct3d11 -sound_app null -data_path ../ -engine_config ../data/heaven_4.0.cfg -system_script heaven/unigine.cpp -video_mode -1 -video_width %W% -video_height %H% -video_fullscreen 0 -video_multisample 0 -extern_define RELEASE,LANGUAGE_EN,QUALITY_MEDIUM,%HEAVEN_TESS%
