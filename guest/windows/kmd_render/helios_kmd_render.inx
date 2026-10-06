@@ -96,11 +96,24 @@ HKR,,TypesSupported,%REG_DWORD%,7
 [Helios_Install.HW]
 AddReg = Helios_PCI_MSIX
 
+; Message-signalled interrupts. The device is vhost-user-test-device-pci with two
+; queues and 3 MSI-X vectors (config, control queue, event queue); a third (RM)
+; queue would bring a fourth. MessageNumberLimit caps what PnP may grant, and the
+; driver follows whatever it is actually given (it reads the MSI-X Enable bit and
+; the resource list at StartDevice, falls back to INTx handling when no message
+; was granted, and never programs a vector above the granted count), so a device
+; that offers fewer messages (conduit-vmm) or none still works.
+;
+; To force the legacy INTx line for a bisect, on the installed device key:
+;   reg add "HKLM\SYSTEM\CurrentControlSet\Enum\<instance path>\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" /v MSISupported /t REG_DWORD /d 0 /f
+;   pnputil /restart-device "<instance id>"
+; (a driver update re-applies this section and sets it back to 1). See
+; docs/msi-interrupts.md.
 [Helios_PCI_MSIX]
 HKR, "Interrupt Management",, 0x00000010
 HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
-HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, %REG_DWORD%, 0
-HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, %REG_DWORD%, 1
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, %REG_DWORD%, 1
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, %REG_DWORD%, 3
 
 ; ──── Software key / UMD registration ──────────────────────────────────────
 ; TWO user-mode APIs, each built for AMD64 and x86, since stage S5 (docs/dx12/ARCHITECTURE.md 9.1

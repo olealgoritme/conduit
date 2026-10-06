@@ -284,7 +284,12 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // -> `VenusRing::bring_up`, which is why it is a by-value ZST and not a
     // reference: see `crate::irql` and tools/kmd-frame-sizes.ps1.
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
-    match crate::virtio::VirtioGpu::init(passive, unsafe { &*dxgkrnl_interface }) {
+    // Did the OS connect MSI/MSI-X messages instead of the INTx line? Probed in
+    // its own noinline frame BEFORE `init` (never nested in it: the boot stack
+    // budget) and passed in as a bare u32. 0 = INTx = the driver's historical
+    // behaviour, byte for byte. See `virtio::msi`.
+    let msi_granted = crate::virtio::msi::probe_granted(unsafe { &*dxgkrnl_interface });
+    match crate::virtio::VirtioGpu::init(passive, unsafe { &*dxgkrnl_interface }, msi_granted) {
         Ok(mut gpu) => {
             let Some(generation) = adapter.producer.start_transport() else {
                 crate::diag::record_named_bytes(b"PrGenF", 1);
@@ -294,8 +299,14 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             crate::kmsg(c"Helios: virtio-gpu transport up\n");
             crate::diag::record(0x0B00_0003);
             let host_visible_bytes = gpu.host_visible().map(|window| window.len);
-            // Publish the ISR-status register VA for the DIRQL ISR before the
-            // transport goes live (capture before `gpu` is moved into set_virtio).
+            // Publish the interrupt mode, then the ISR-status register VA, for
+            // the DIRQL ISR before the transport goes live (capture before `gpu`
+            // is moved into set_virtio). The message-mode word goes FIRST so an
+            // ISR that sees a nonzero `isr_status` can never still believe it is
+            // on a line the device is no longer using.
+            adapter
+                .msi_state
+                .store(gpu.msi_isr_state(), core::sync::atomic::Ordering::Release);
             adapter
                 .isr_status
                 .store(gpu.isr_status_addr(), core::sync::atomic::Ordering::Release);
@@ -335,6 +346,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             transport_fail_status = status as u32;
             adapter
                 .isr_status
+                .store(0, core::sync::atomic::Ordering::Release);
+            adapter
+                .msi_state
                 .store(0, core::sync::atomic::Ordering::Release);
             adapter.set_virtio(None);
             super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None);
@@ -493,6 +507,9 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // T4a minor item.
         adapter
             .isr_status
+            .store(0, core::sync::atomic::Ordering::Release);
+        adapter
+            .msi_state
             .store(0, core::sync::atomic::Ordering::Release);
         // Cancel the display-half VSync heartbeat + join the HPD worker before
         // teardown (both idempotent; no-ops when the render-only surface never

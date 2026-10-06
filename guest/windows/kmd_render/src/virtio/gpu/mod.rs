@@ -2264,9 +2264,14 @@ pub struct VirtioGpu {
     host_visible: Option<HostVisibleWindow>,
     /// Mapped kernel VA of the virtio ISR-status register (read-to-clear), or 0 if
     /// the device exposes no ISR cap. `DxgkDdiInterruptRoutine` reads this at DIRQL
-    /// to acknowledge the line-based INTx (the device is `MSISupported=0`). See
+    /// to acknowledge the line-based INTx when PnP gave the device INTx (see `msi_isr_state`). See
     /// [`map_isr_status_register`].
     isr_status_va: usize,
+    /// The ISR's message-mode state word (`helios_kmd_logic::msi::isr_state`):
+    /// 0 = the device is on the INTx line and `isr_status_va` is the ISR's ack
+    /// register; nonzero = vectors were programmed and the ISR routes by message
+    /// number without touching the ISR-status register.
+    msi_isr_state: u32,
     /// Tracked blobs (resource_id → size/mapping state). Heap-reserved to MAX_BLOBS
     /// at init so `push` under the spinlock never reallocates (the 0x7F lesson).
     blobs: Vec<BlobSlot>,
@@ -2588,6 +2593,7 @@ impl VirtioGpu {
     pub fn init(
         passive: crate::irql::PassiveLevel,
         dxgkrnl: &DXGKRNL_INTERFACE,
+        msi_granted: u32,
     ) -> Result<Box<Self>, VirtioError> {
         // ── M1: discover the device + map BARs through Dxgkrnl ──────────────
         // A miniport doesn't own the bus, so config space is reached via the
@@ -2688,6 +2694,38 @@ impl VirtioGpu {
         let nvrm_event_ring = nvrm_events::new_event_ring(passive, &mut transport);
         // 1 when the event queue is up, 0 when RM events are unsupported.
         crate::diag::record_named_bytes(b"NvEvQ", u32::from(nvrm_event_ring.is_some()));
+        // Message-signalled interrupts: when the OS connected messages instead of
+        // the INTx line (`msi_granted != 0`), the device's vectors must be
+        // programmed BEFORE DRIVER_OK, for exactly the queues that exist. A device
+        // on messages with no vector raises nothing, so a refusal fails the
+        // transport here rather than leaving a driver that never wakes. With
+        // `msi_granted == 0` this is a no-op and the INTx path is untouched.
+        let msi_isr_state = if msi_granted != 0 {
+            let queues = [CTRL_QUEUE, nvrm_events::EVENT_QUEUE];
+            let live = if nvrm_event_ring.is_some() { 2 } else { 1 };
+            match super::msi::program_vectors(
+                &DxgkConfigAccess::new(dxgkrnl),
+                msi_granted,
+                &queues[..live],
+            ) {
+                Ok(state) => state,
+                Err(()) => {
+                    // RESET, not just FAILED: the queues above are already
+                    // enabled on the device and drop (freeing their rings)
+                    // before `transport` does, so the device must stop
+                    // referencing them first. Bounded like the reset at the top.
+                    transport.set_status(DeviceStatus::empty());
+                    let mut spins = 0u32;
+                    while !transport.get_status().is_empty() && spins < 100_000 {
+                        spins += 1;
+                        core::hint::spin_loop();
+                    }
+                    return Err(VirtioError::DeviceError);
+                }
+            }
+        } else {
+            0
+        };
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
                 | DeviceStatus::DRIVER
@@ -2872,6 +2910,7 @@ impl VirtioGpu {
             next_resource_id: 1,
             host_visible,
             isr_status_va,
+            msi_isr_state,
             blobs: Vec::with_capacity(MAX_BLOBS),
             blobs_reserved: 0,
             foreign: helios_kmd_logic::foreign_resource::ForeignTable::new(),
@@ -7927,6 +7966,13 @@ impl VirtioGpu {
     /// `AdapterContext` so the DIRQL ISR can acknowledge the INTx line lock-free.
     pub fn isr_status_addr(&self) -> usize {
         self.isr_status_va
+    }
+
+    /// The ISR's message-mode state word, 0 when the device is on the INTx line.
+    /// `DxgkDdiStartDevice` publishes it to the `AdapterContext` beside
+    /// [`Self::isr_status_addr`] so the DIRQL ISR can route a message lock-free.
+    pub fn msi_isr_state(&self) -> u32 {
+        self.msi_isr_state
     }
 }
 

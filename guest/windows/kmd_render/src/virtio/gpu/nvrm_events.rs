@@ -55,7 +55,7 @@ pub const MAX_NVRM_EVENTS_PER_OWNER: usize = MAX_NVRM_HANDLES_PER_OWNER + 1;
 const NEVER_ACKED_TAKES_INPUT: u64 = 1 << 12;
 
 /// The event queue's index and size (16 buffers; see `EVENT_QUEUE_SIZE`).
-const EVENT_QUEUE: u16 = 1;
+pub(super) const EVENT_QUEUE: u16 = 1;
 /// Small on purpose: `VirtQueue<_, N>::new` returns a by-value slot that grows
 /// with N and sits on the boot stack under `VirtioGpu::init` (see
 /// tools/kmd-frame-sizes.ps1). Events are rare and level-triggered on the host,

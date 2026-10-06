@@ -623,6 +623,12 @@ pub fn diag_dump_engine_atomics() {
     crate::diag::record(
         0x0F0E_0000 | (super::interrupt::CONTROL_INT_COUNT.load(Ordering::Relaxed) & 0xFFFF),
     );
+    // Interrupts taken in message mode (0 on the INTx path): the one number that
+    // says whether MSI is actually delivering.
+    crate::diag::record_named_bytes(
+        b"MsiInts",
+        super::interrupt::MSI_INT_COUNT.load(Ordering::Relaxed),
+    );
     crate::diag::record(0x0F0F_0000 | (DMA_NOTIFY_COUNT.load(Ordering::Relaxed) & 0xFFFF));
     crate::diag::record(0x0F10_0000 | (DMA_QUEUE_DPC_COUNT.load(Ordering::Relaxed) & 0xFFFF));
     crate::diag::record(0x0F11_0000 | (DMA_SYNC_STATUS_LOW.load(Ordering::Relaxed) & 0xFFFF));

@@ -51,6 +51,12 @@ param(
         # The event queue is built from init (before DRIVER_OK), beside the
         # control queue's constructor.
         '14new_event_ring',
+        # MSI-X bring-up (virtio/msi.rs). `probe_granted` -> `listed_messages`
+        # runs BEFORE init (sequential, never nested in it) and carries the
+        # ~150-byte DXGK_DEVICE_INFO; `program_vectors` is a leaf under init.
+        '13probe_granted',
+        '15listed_messages',
+        '15program_vectors',
         # VirtQueue::new's concrete PciTransport argument. Deliberately WITHOUT
         # the const queue size before it (`Kj40_` for 64): that prefix made this
         # symbol vanish from the gate when the ring size changed, silently
@@ -73,6 +79,8 @@ param(
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,E3newNtNtNtB5_9transport3pci12PciTransport',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,14new_event_ring,E3newNtNtNtB5_9transport3pci12PciTransport',
+        '9lifecycle20dxgkddi_start_device,13probe_granted,15listed_messages',
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,15program_vectors',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,24allocate_present_streams',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,30allocate_scanout_refresh_state',
         '9lifecycle20dxgkddi_start_device,14bring_up_venus,26allocate_host_visible_blob,13VenusInstance11into_device,13VenusInstance29create_device_with_ext_ladder'

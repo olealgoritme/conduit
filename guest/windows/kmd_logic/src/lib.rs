@@ -29,6 +29,7 @@ pub mod foreign_scanout;
 pub mod page_runs;
 pub mod producer_completion;
 pub mod execution_completion;
+pub mod msi;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///
