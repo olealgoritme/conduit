@@ -469,8 +469,7 @@ All `MAX_*` values are read from the code. "Per process" really means per device
 | `MAX_NVRM_PIN_PAGES` | 262143 pages (just under 1 GiB) | same | one PIN; equals the indirect table's run capacity, so a fully scattered range still fits |
 | `HELIOS_NVRM_PAGE_RUNS_MAX` / `page_runs::DIRECT_MAX_RUNS` | 1024 | protocol / `kmd_logic/page_runs.rs` | runs in a direct table (8 + 1024 x 16 bytes) |
 | `page_runs::INDIRECT_MAX_RUNS` | 262143 | `page_runs.rs` | runs an indirect table can hold |
-| `MAX_NVRM_EVENTS` | 1024 | `gpu/nvrm_events.rs` | registrations, all owners; storage reserved at init (0 if no event queue) |
-| `MAX_NVRM_EVENTS_PER_OWNER` | 130 | same (a literal now: it was `MAX_NVRM_HANDLES_PER_OWNER + 2`, and the handle bound moved) | one `READY` per handle plus one `TRANSPORT_LOST` and one `SCANOUT_RELEASED`. Not yet dynamic (section 13.9): a process past 128 registered handles gets `NvEvRef` |
+| `rm_limits::EVENTS` (was `MAX_NVRM_EVENTS` 1024 / `MAX_NVRM_EVENTS_PER_OWNER` 130) | 17408 in all, 4098 per process, grows from 1024 | `kmd_logic/rm_limits.rs`, `kmd_logic/nvrm_events.rs`, `gpu/nvrm_events.rs` | registrations, all owners (0 if no event queue). DERIVED from the handle bounds: one `READY` per handle a process can have open (the registration requires the handle to be the caller's) plus its `TRANSPORT_LOST` and `SCANOUT_RELEASED`; in all the handle bound plus 1024. Grown like the handle table (13.8). 1024 / 130 fixed under `NvWinPolicy` = 0 |
 | `EVENT_QUEUE_SIZE` / `EVENT_BUF_BYTES` | 16 / 256 | same | event virtqueue (kept small on purpose: the by-value queue slot sits on the boot stack under `VirtioGpu::init`, gated by `tools/kmd-frame-sizes.ps1`) |
 | `OTHER_KICK_LIMIT` | 1024 | same | non-`EventReady` messages after which reposts stop kicking |
 | mapping id range | `1 .. 0x7FFFFFF0` | `virtio/nvrm.rs::mint_map_id`, `kmd_logic/nvrm_views.rs` | KMD-minted from ONE counter for the life of the driver (never restarted by a new transport, never reused); the table key is `id | 0x80000000` in `AdapterContext::mappings` |
@@ -1289,7 +1288,7 @@ stream/submission failed`, hr 0x80004005, no host Xid). A refusal anywhere below
 | client table (`NvDupHarden`) | 32 per process, 256 | `NvCliFull` | unchanged (not yet dynamic) |
 | pin quota | 256 per process, 1024 | nothing (`NvPinErr` counts what failed after the lock) | `NvPinQRef`; `NvPinErr` as before |
 | pin leaks | n/a | `NvPinLeak`, `NvPin - NvUnpin` | unchanged |
-| event registrations | 130 per process, 1024 | `NvEvRef` | unchanged |
+| event registrations | 130 per process, 1024 | `NvEvRef` | `NvEvRef` (bound now 4098 per process, derived from the handle bound) |
 | fence early table | 16 | `NvFenceErr` | unchanged |
 | KMD-held (attached) fences | 512 | `RmGRef` (marker refused), `FsFRef` | unchanged |
 | RM gates / points | 8 gates, 128 points | `RmGRef` | unchanged |
@@ -1324,7 +1323,8 @@ N = 443; 512 attached fences N = 111; 1024 pins, events or handles in the old gl
   is 6.9 frames per entry, so this is the one that needs MOST of the frames to leak and the first to
   check if `PrdPend` is high.
 * **Event registrations** (`EVENT_REGISTER` per fence wait): `NvEvReg - NvEvUnreg` is only an order
-  of magnitude (Close removes without counting); `NvEvRef` > 0 is the refusal at 130.
+  of magnitude (Close removes without counting); `NvEvRef` > 0 is the refusal at the per-process
+  bound (130 before the registry followed the handle bound; 4098 now).
 * **Mappings** do not accumulate per frame in the present path (persistent maps); `NvWinMaps` and
   `NvMap` show it if they do. **Pins** are not in the present path (`NvPin - NvUnpin`, `NvPinQRef`).
 * No fixed table in the release book (`scanout_release.rs`, 32 slots) can fail a call: it
@@ -1375,6 +1375,10 @@ adapter-wide view table they feed), counted when hit (`NvHdl*Ref`, `NvMapTRef`, 
   `NvRestLost` counts it (read 0). `NvWinPolicy` = 0 has no slack (the old shape, 0 slots).
 * The window account's owner rows (512) are reserved at init; a 513th device mapping at once is
   `NvWinRTab`.
+* The event registry grows the same way (`Registry::want_capacity` / `spare` / `install`, run by
+  `grow_nvrm_tables` before `EVENT_REGISTER`), to a bound derived from the handle bounds
+  (`rm_limits::EVENTS`): a process may register an event on every handle it can hold, and no
+  more. Registrations hold an object reference each, bounded by the handle bound.
 * Behaviour in the working range is unchanged: refusals only appear past the old numbers.
 * `NvWinPolicy` = 0 restores the fixed tables.
 
@@ -1390,7 +1394,7 @@ global is scarce, counted, grown at PASSIVE outside the lock (13.8).
 | 1 | handle table | 1024 / 128 | `nvrm_tables.rs` | arbitrary | DONE (13.8) |
 | 2 | mapping table | 1024 / 256 | same | arbitrary | DONE (13.8) |
 | 3 | pins | 1024 / 256 | same | arbitrary (the lock cost is the process's own locked-page quota) | next: same growth (`Vec<NvrmPin>`), the `NvPinQRef` counter exists |
-| 4 | event registrations | 1024 / 130 | `nvrm_events.rs`, `kmd_logic::nvrm_events::Registry` | arbitrary; per-process now coupled to nothing | next: growth in `Registry` (its storage is already a `Vec` with a total and a per-owner bound) |
+| 4 | event registrations | 1024 / 130 | `nvrm_events.rs`, `kmd_logic::nvrm_events::Registry` | arbitrary | DONE: derived from the handle bound (4098 per process) and grown (13.8); a process past ~128 live fences no longer fails at `EVENT_REGISTER` |
 | 5 | RM client table (`NvDupHarden`) | 256 / 32 | `kmd_logic/nvrm_clients.rs` | arbitrary, `[Slot; 256]` in a box | make a growable `Vec`; per process 32 is far above one NVK process (it makes a few roots) |
 | 6 | attached (KMD-held) fences | 512 | `nvrm_tables.rs` | KMD budget, below gates x points (8 x 128 = 1024) | derive from gates x points or raise with them |
 | 7 | RM gates / points per gate | 8 / 128 | `rm_gates.rs`, `rm_fence_present.rs` | arbitrary (the UMD falls back to a CPU wait) | gates per process count (`MAX_STREAMS` 64 is the adapter-wide stream table, `lib.rs`) |
@@ -1443,5 +1447,4 @@ global is scarce, counted, grown at PASSIVE outside the lock (13.8).
   `wdk_sys::ntddk::PsGetCurrentProcessId` is bound, the grow-and-swap under load, the 32 GiB BAR
   assignment by the guest, DWM's actual `SCANOUT_SET` ordering relative to its first maps.
 * Risks: a process can claim the reserve with a `SCANOUT_SET`; the byte total cannot see the host's
-  zones (13.1); table scans are `O(n)` under the lock (13.5); events are still capped at 130 per
-  process (13.9 row 4).
+  zones (13.1); table scans are `O(n)` under the lock (13.5).

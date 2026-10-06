@@ -124,6 +124,18 @@ pub const HANDLES: Bounds = Bounds::growing_fair(1024, 16, 16_384, 4_096, 8).wit
 /// The mapping table's shape: starts at 1024, grows to 8192 (the adapter-wide view table),
 /// at most 4096 per process, fair share 1/4 (2048).
 pub const MAPS: Bounds = Bounds::growing(1024, 16, 8_192, 4_096);
+/// The event registry's shape, DERIVED from the handle table's: one `READY` registration per
+/// handle a process can have open (the registration checks the handle is the caller's), plus
+/// its `TRANSPORT_LOST` and `SCANOUT_RELEASED` ones, so per process the handle bound + 2 and in
+/// all the handle bound plus two per device (1024 devices of headroom). Starts at 1024, grows.
+pub const EVENTS: Bounds = Bounds::growing(
+    1024,
+    16,
+    HANDLES.global_max + 1024,
+    HANDLES.per_owner_max + 2,
+);
+/// `NvWinPolicy` = 0: 1024 registrations, 130 per process, never grown.
+pub const EVENTS_LEGACY: Bounds = Bounds::fixed(1024, 1024, 130);
 /// `NvWinPolicy` = 0: the old fixed tables (1024 handles, 128 per process; 1024 maps, 256).
 pub const HANDLES_LEGACY: Bounds = Bounds::fixed(1024, 1024, 128);
 pub const MAPS_LEGACY: Bounds = Bounds::fixed(1024, 1024, 256);
@@ -298,6 +310,17 @@ mod tests {
     /// The production shapes: fairness must be reachable, or it is dead code (the first handle
     /// shape had fair share 1/4 of 16384 = the per-process bound 4096, so the per-process
     /// refusal always fired first and `NvHdlFRef` could never move).
+    /// A process that can hold N handles can register N events: the event bound is the
+    /// handle bound (plus the handle-less kinds), never below it (the old fixed 130 against
+    /// 4096 handles failed `EVENT_REGISTER` past ~128 live fences).
+    #[test]
+    fn events_follow_handles() {
+        assert!(EVENTS.per_owner_max >= HANDLES.per_owner_max + 2);
+        assert!(EVENTS.global_max >= HANDLES.global_max + 1024);
+        assert_eq!(EVENTS_LEGACY.per_owner_max, HANDLES_LEGACY.per_owner_max + 2);
+        assert_eq!(EVENTS.restore_slack, 0);
+    }
+
     #[test]
     fn production_shapes_can_actually_be_fair() {
         // Growth keeps ahead of the restore slack.

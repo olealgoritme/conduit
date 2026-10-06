@@ -70,8 +70,7 @@ mod rm_resource_import_tables;
 pub use foreign_tables::{AllocAdopt, ForeignBegin, ForeignClose, ForeignCommit, ForeignSnapshot};
 
 pub use nvrm_events::{
-    release_nvrm_event, NvrmEventRefusal, NvrmEventRegistered, NvrmEventsState, MAX_NVRM_EVENTS,
-    MAX_NVRM_EVENTS_PER_OWNER,
+    release_nvrm_event, NvrmEventRefusal, NvrmEventRegistered, NvrmEventsState,
 };
 
 pub use rm_gates::{
@@ -3041,15 +3040,16 @@ impl VirtioGpu {
         let nvrm_limits =
             nvrm_tables::new_window_account(nvrm_window).ok_or(VirtioError::OutOfMemory)?;
         // Nothing to register against without the event queue: reserve nothing.
-        let nvrm_events = helios_kmd_logic::nvrm_events::Registry::try_new(
-            if nvrm_event_ring.is_some() {
-                MAX_NVRM_EVENTS
+        let nvrm_events = {
+            let b = &nvrm_limits.event_bounds;
+            let (initial, total) = if nvrm_event_ring.is_some() {
+                (b.initial, b.global_max)
             } else {
-                0
-            },
-            MAX_NVRM_EVENTS_PER_OWNER,
-        )
-        .ok_or(VirtioError::OutOfMemory)?;
+                (0, 0)
+            };
+            helios_kmd_logic::nvrm_events::Registry::try_new_growing(initial, total, b.per_owner_max)
+                .ok_or(VirtioError::OutOfMemory)?
+        };
         // The release event is delivered on the event queue: without it (a device with no
         // second queue, no memory for its buffers) the ack buys nothing, so the consumers
         // stay off. `RelNoQ` = 1 names that case (the host then keeps bookkeeping it can

@@ -321,10 +321,14 @@ pub(super) fn new_client_table() -> Box<ClientTable> {
 
 /// The handle and mapping tables' bounds for `policy` (the shapes live in
 /// `helios_kmd_logic::rm_limits`, where the host tests hold them to their promises).
-pub(super) fn table_bounds(policy: Policy) -> (Bounds, Bounds) {
+pub(super) fn table_bounds(policy: Policy) -> (Bounds, Bounds, Bounds) {
     match policy {
-        Policy::Dynamic => (rm_limits::HANDLES, rm_limits::MAPS),
-        Policy::Legacy => (rm_limits::HANDLES_LEGACY, rm_limits::MAPS_LEGACY),
+        Policy::Dynamic => (rm_limits::HANDLES, rm_limits::MAPS, rm_limits::EVENTS),
+        Policy::Legacy => (
+            rm_limits::HANDLES_LEGACY,
+            rm_limits::MAPS_LEGACY,
+            rm_limits::EVENTS_LEGACY,
+        ),
     }
 }
 
@@ -339,6 +343,8 @@ pub(super) struct NvrmLimits {
     /// under `NvWinPolicy` = 0).
     pub(super) handle_bounds: Bounds,
     pub(super) map_bounds: Bounds,
+    /// The event registry's shape (derived from the handle table's).
+    pub(super) event_bounds: Bounds,
 }
 
 /// The window account, the policy it runs and both tables' bounds, from the knobs
@@ -358,7 +364,7 @@ pub(super) fn new_window_account(window: Option<HostVisibleWindow>) -> Option<Bo
         policy,
     );
     let acct = Account::new(cfg, NVRM_WINDOW_OWNER_ROWS)?;
-    let (handle_bounds, map_bounds) = table_bounds(policy);
+    let (handle_bounds, map_bounds, event_bounds) = table_bounds(policy);
     crate::virtio::nvrm_window::configure(
         &cfg,
         handle_bounds.per_owner_max,
@@ -370,6 +376,7 @@ pub(super) fn new_window_account(window: Option<HostVisibleWindow>) -> Option<Bo
         acct,
         handle_bounds,
         map_bounds,
+        event_bounds,
     }))
 }
 
@@ -382,37 +389,44 @@ pub(super) fn new_window_account(window: Option<HostVisibleWindow>) -> Option<Bo
 /// alone: the reservation then refuses by the bound (counted) or, for the allocator, as
 /// `NvTblOom`. Cheap when nothing is wanted: one lock hold, two comparisons.
 pub fn grow_nvrm_tables(adapter: &crate::adapter::AdapterContext) {
+    /// New storage for `n` entries, counted `NvTblOom` when the allocator refuses.
+    fn fresh<T>(n: Option<usize>) -> Option<Vec<T>> {
+        let n = n?;
+        let mut v = Vec::new();
+        match v.try_reserve_exact(n) {
+            Ok(()) => Some(v),
+            Err(_) => {
+                crate::virtio::nvrm_window::TBL_OOM.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
     // Each step at least doubles a table, so a few suffice for the 16x between initial and
     // bound; the loop is bounded in any case.
     for _ in 0..6 {
-        let wants = adapter.with_virtio(|v| (v.nvrm_handles_want(), v.nvrm_maps_want()));
-        let Ok((h, m)) = wants else {
+        let wants = adapter.with_virtio(|v| {
+            (
+                v.nvrm_handles_want(),
+                v.nvrm_maps_want(),
+                v.nvrm_events_want(),
+            )
+        });
+        let Ok((h, m, e)) = wants else {
             return;
         };
-        if h.is_none() && m.is_none() {
+        if h.is_none() && m.is_none() && e.is_none() {
             return;
         }
-        let fresh_h = h.and_then(|n| {
-            let mut v = Vec::new();
-            match v.try_reserve_exact(n) {
-                Ok(()) => Some(v),
-                Err(_) => {
-                    crate::virtio::nvrm_window::TBL_OOM.fetch_add(1, Ordering::Relaxed);
-                    None
-                }
+        let fresh_h = fresh::<NvrmHandleSlot>(h);
+        let fresh_m = fresh::<NvrmMapSlot>(m);
+        let fresh_e = e.and_then(|n| {
+            let s = helios_kmd_logic::nvrm_events::Registry::<core::ptr::NonNull<wdk_sys::KEVENT>>::spare(n);
+            if s.is_none() {
+                crate::virtio::nvrm_window::TBL_OOM.fetch_add(1, Ordering::Relaxed);
             }
+            s
         });
-        let fresh_m = m.and_then(|n| {
-            let mut v = Vec::new();
-            match v.try_reserve_exact(n) {
-                Ok(()) => Some(v),
-                Err(_) => {
-                    crate::virtio::nvrm_window::TBL_OOM.fetch_add(1, Ordering::Relaxed);
-                    None
-                }
-            }
-        });
-        if fresh_h.is_none() && fresh_m.is_none() {
+        if fresh_h.is_none() && fresh_m.is_none() && fresh_e.is_none() {
             return;
         }
         // The swap is under the lock; the old (now empty) storage comes back and is freed
@@ -421,6 +435,7 @@ pub fn grow_nvrm_tables(adapter: &crate::adapter::AdapterContext) {
             (
                 v.nvrm_handles_install(fresh_h),
                 v.nvrm_maps_install(fresh_m),
+                v.nvrm_events_install(fresh_e),
             )
         });
         drop(old);

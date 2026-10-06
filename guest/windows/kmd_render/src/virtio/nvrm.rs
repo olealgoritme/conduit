@@ -1246,6 +1246,8 @@ pub fn register_event(
 ) -> Result<EventState, EventRefusal> {
     // `event` is Copy, so the closure takes a copy and the original is still ours
     // to release if the closure never runs (the transport is gone).
+    // The registry grows here (PASSIVE, no lock) when it is running out of slots.
+    super::gpu::grow_nvrm_tables(adapter);
     let result = adapter.with_virtio(|v| v.register_nvrm_event(owner, handle, kind, event));
     let refused = |r: EventRefusal| {
         NVRM_EV_REFUSED.fetch_add(1, Ordering::Relaxed);
