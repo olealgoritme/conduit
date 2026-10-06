@@ -2437,11 +2437,12 @@ pub fn submit_venus_async_blt(
     ctx_id: u32,
     stream: &[u8],
     resource_id: u32,
+    source_id: u32,
 ) -> Result<BltSubmit, VirtioError> {
     let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
     let queued = adapter.with_virtio(move |v| {
         v.drain_used();
-        v.enqueue_async_submit_blt(ctx_id, meta, venus, venus_len, resource_id)
+        v.enqueue_async_submit_blt(adapter, ctx_id, meta, venus, venus_len, resource_id, source_id)
     });
     match queued {
         Ok(Ok(crate::virtio::gpu::BltEnq::Fence(fence_id))) => Ok(BltSubmit::Fence(fence_id)),

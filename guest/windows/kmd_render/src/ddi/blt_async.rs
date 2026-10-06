@@ -42,6 +42,10 @@
 //! * `BltMirrorN` / `BltMirrorSk` / `BltMirrorUs`: CPU mirrors done, skipped by `BltNoMirror`,
 //!   and the microseconds spent in them. `BltNoMirInv`: destination system copies newly marked
 //!   invalid.
+//! * `BltSrcBusy`: Presents of a source an earlier asynchronous copy was still reading (the
+//!   swap-chain buffer rotation is shallower than the copy's latency, or a buffer is presented
+//!   twice). `BltLookKnob` / `BltLookN`: the worker's lookahead depth (`BltLookahead`) and the
+//!   copies it dispatched ahead of a front entry that could not go.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -81,6 +85,9 @@ static MIRROR_N: AtomicU32 = AtomicU32::new(0);
 static MIRROR_SKIPPED: AtomicU32 = AtomicU32::new(0);
 static MIRROR_US: AtomicU32 = AtomicU32::new(0);
 static NOMIR_INVALID: AtomicU32 = AtomicU32::new(0);
+static SRC_BUSY: AtomicU32 = AtomicU32::new(0);
+static LOOKAHEAD: AtomicU32 = AtomicU32::new(ba::LOOKAHEAD_DEFAULT);
+static LOOK_N: AtomicU32 = AtomicU32::new(0);
 
 /// Interrupt time in 100 ns units; legal at any IRQL, no lock.
 pub(crate) fn now_100ns() -> u64 {
@@ -143,10 +150,47 @@ pub(crate) fn reset_for_start() {
     for cell in LAT.iter().chain(WAIT.iter()) {
         cell.store(0, Ordering::Relaxed);
     }
+    SRC_BUSY.store(0, Ordering::Relaxed);
+    LOOK_N.store(0, Ordering::Relaxed);
     let a = read_knob(&ASYNC_KNOB, crate::diag::knobs::BLT_ASYNC);
     let m = read_knob(&NO_MIRROR_KNOB, crate::diag::knobs::BLT_NO_MIRROR);
+    let depth = ba::clamp_lookahead(crate::diag::read_config_dword(
+        crate::diag::knobs::BLT_LOOKAHEAD,
+        ba::LOOKAHEAD_DEFAULT,
+    )) as u32;
+    LOOKAHEAD.store(depth, Ordering::Relaxed);
     crate::diag::record_named_bytes(b"BltAsyncKnob", a as u32);
     crate::diag::record_named_bytes(b"BltNoMirKnob", m as u32);
+    crate::diag::record_named_bytes(b"BltLookKnob", depth);
+}
+
+/// How many entries of the WindowedBlt ready queue the worker looks at (`BltLookahead`). One
+/// relaxed load; the registry is read at StartDevice only (the worker holds a spinlock).
+pub(crate) fn lookahead() -> usize {
+    LOOKAHEAD.load(Ordering::Relaxed) as usize
+}
+
+/// The worker dispatched a copy ahead of a front entry that could not go.
+pub(crate) fn note_lookahead() {
+    LOOK_N.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The source of a Present is still being read by an earlier asynchronous copy.
+pub(crate) fn note_source_busy() {
+    SRC_BUSY.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The Level 5 frame edge a finished asynchronous copy owes (`blt_async::edge_owed`): atomics
+/// only, legal at DISPATCH (the completion DPC) and at PASSIVE.
+pub(crate) fn raise_edge(
+    adapter: &AdapterContext,
+    finish: ba::Finish,
+    copy_ok: bool,
+    destination: u32,
+) {
+    if let Some(edge) = ba::edge_owed(finish, copy_ok) {
+        crate::virtio::rm_client::sysmem_flip::primary_changed(adapter, edge, destination);
+    }
 }
 
 const LAT_NAMES: [&[u8]; ba::BUCKETS] = [
@@ -179,7 +223,9 @@ pub(crate) fn publish_counters() {
         | WAIT_N.load(Ordering::Relaxed)
         | MIRROR_N.load(Ordering::Relaxed)
         | MIRROR_SKIPPED.load(Ordering::Relaxed)
-        | FAILED.load(Ordering::Relaxed);
+        | FAILED.load(Ordering::Relaxed)
+        | SRC_BUSY.load(Ordering::Relaxed)
+        | LOOK_N.load(Ordering::Relaxed);
     if events == 0 {
         return;
     }
@@ -208,6 +254,8 @@ pub(crate) fn publish_counters() {
     rec(b"BltMirrorSk", MIRROR_SKIPPED.load(Ordering::Relaxed));
     rec(b"BltMirrorUs", MIRROR_US.load(Ordering::Relaxed));
     rec(b"BltNoMirInv", NOMIR_INVALID.load(Ordering::Relaxed));
+    rec(b"BltSrcBusy", SRC_BUSY.load(Ordering::Relaxed));
+    rec(b"BltLookN", LOOK_N.load(Ordering::Relaxed));
 }
 
 // ---- counters, callable at any IRQL (atomics only) -----------------------------------------
@@ -320,10 +368,17 @@ pub(crate) unsafe fn try_async(
     boundary: Option<u64>,
 ) -> Result<Taken, NTSTATUS> {
     let destination_resource = destination.resource_id();
-    let facts = adapter.with_virtio(|v| v.blt_async_facts(boundary, destination_resource));
-    let Ok((boundary_state, deferred_pending, room)) = facts else {
+    let source_resource = source.resource_id();
+    let facts =
+        adapter.with_virtio(|v| v.blt_async_facts(boundary, destination_resource, source_resource));
+    let Ok(facts) = facts else {
         return Ok(fall(Why::SubmitRefused));
     };
+    if facts.source_busy {
+        note_source_busy();
+    }
+    let (boundary_state, deferred_pending, room) =
+        (facts.boundary, facts.deferred_pending, facts.room);
     let route = ba::decide(ba::Facts {
         async_on: true,
         no_mirror_on: no_mirror_on(),
@@ -334,24 +389,25 @@ pub(crate) unsafe fn try_async(
         dst_deferred_pending: deferred_pending,
         table_has_room: room,
     });
-    match route {
-        Route::Legacy { why } => Ok(fall(why)),
-        Route::LegacyAfterDrain { why } => {
-            drain(passive, adapter, destination_resource);
-            Ok(fall(why))
-        }
+    let taken = match route {
+        Route::Legacy { why } | Route::LegacyAfterDrain { why } => Ok(fall(why)),
         Route::Direct => unsafe { direct(passive, adapter, args, source, destination) },
         Route::Deferred => unsafe {
             deferred(passive, adapter, args, source, destination, boundary)
         },
+    };
+    // Every way out to the legacy arm (a refused queue, token or submission included): the arm
+    // that follows must not reach the host before an older copy queued for the destination.
+    if let Ok(Taken::Legacy) = taken {
+        drain(passive, adapter, destination_resource);
     }
+    taken
 }
 
 /// Wait (PASSIVE, bounded) until no queued copy names `resource_id` as its destination. The
 /// legacy arm that follows must not reach the host before an older frame queued for the same
 /// buffer, or the older frame would land last.
 fn drain(passive: PassiveLevel, adapter: &AdapterContext, resource_id: u32) {
-    DRAINS.fetch_add(1, Ordering::Relaxed);
     // Nominal 320 ms, about 5 s at Windows' common timer quantum: the budget of
     // `begin_present_buffer_write_legacy`, which this wait precedes.
     let mut slices = 0u32;
@@ -361,6 +417,9 @@ fn drain(passive: PassiveLevel, adapter: &AdapterContext, resource_id: u32) {
             .unwrap_or(false);
         if !pending {
             return;
+        }
+        if slices == 0 {
+            DRAINS.fetch_add(1, Ordering::Relaxed);
         }
         crate::virtio::ctrl::sleep_ms(passive, 1);
         slices += 1;
@@ -383,6 +442,8 @@ unsafe fn direct(
     let copy = adapter.with_venus_client(passive, |client| {
         client.submit_present_blt_direct(adapter, source, destination)
     });
+    // (`submit_present_blt_direct` passes the source's id down: the in-flight table holds a
+    // read-ledger ticket on it until the copy retires.)
     let fence = match copy {
         Ok(Ok(BltSubmit::Fence(fence))) => fence,
         Ok(Ok(BltSubmit::DstBusy)) => return Ok(fall(Why::DstBusy)),

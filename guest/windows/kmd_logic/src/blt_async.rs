@@ -26,6 +26,9 @@
 //!
 //! Nothing here reads a clock, a lock or a handle: every rule is a function of its arguments.
 
+use crate::scanout_read_ledger::LedgerTicket;
+use crate::rm_refresh::Edge;
+
 /// Number of latency / wait histogram buckets (`BltAsyncLat0..7`, `BltWait0..7`).
 pub const BUCKETS: usize = 8;
 
@@ -167,8 +170,8 @@ pub const fn no_mirror_applies(
 /// | `BltAsync` 0 | legacy |
 /// | not a foreign source, or a snapshot | legacy |
 /// | destination is not a standard buffer | legacy |
+/// | no boundary (or a dead one), a deferred request for the destination is queued | legacy after drain |
 /// | no boundary, mirror on | legacy (the mirror needs the worker, the worker needs a boundary) |
-/// | no boundary, mirror off, a deferred request for the destination is queued | legacy after drain |
 /// | no boundary, mirror off | direct |
 /// | dead boundary | legacy |
 /// | live boundary, producer finished, mirror off, nothing queued for the destination, room | direct |
@@ -192,13 +195,15 @@ pub const fn decide(f: Facts) -> Route {
     }
     match f.boundary {
         Boundary::None => {
-            if !f.no_mirror_on {
-                Route::Legacy {
-                    why: Why::NoBoundaryMirror,
-                }
-            } else if f.dst_deferred_pending {
+            // Whatever the mirror says: a copy queued for this destination is older than this
+            // Present, and the legacy arm that follows must not reach the host before it.
+            if f.dst_deferred_pending {
                 Route::LegacyAfterDrain {
                     why: Why::PendingNoBoundary,
+                }
+            } else if !f.no_mirror_on {
+                Route::Legacy {
+                    why: Why::NoBoundaryMirror,
                 }
             } else if !f.table_has_room {
                 Route::Legacy {
@@ -208,6 +213,9 @@ pub const fn decide(f: Facts) -> Route {
                 Route::Direct
             }
         }
+        Boundary::Dead if f.dst_deferred_pending => Route::LegacyAfterDrain {
+            why: Why::BoundaryDead,
+        },
         Boundary::Dead => Route::Legacy {
             why: Why::BoundaryDead,
         },
@@ -273,6 +281,28 @@ pub struct Entry {
     pub resource_id: u32,
     /// Interrupt time of the submission, 100 ns units.
     pub t0: u64,
+    /// The source resource the copy reads (0 = not recorded).
+    pub source_id: u32,
+    /// The read-ledger ticket on the source, retired when the copy retires (`NONE` = unledgered).
+    pub ticket: LedgerTicket,
+}
+
+impl Entry {
+    pub const fn new(fence_id: u64, resource_id: u32, t0: u64) -> Self {
+        Self {
+            fence_id,
+            resource_id,
+            t0,
+            source_id: 0,
+            ticket: LedgerTicket::NONE,
+        }
+    }
+
+    pub const fn reading(mut self, source_id: u32, ticket: LedgerTicket) -> Self {
+        self.source_id = source_id;
+        self.ticket = ticket;
+        self
+    }
 }
 
 /// What a retired entry hands back.
@@ -280,6 +310,8 @@ pub struct Entry {
 pub struct Done {
     pub resource_id: u32,
     pub t0: u64,
+    pub source_id: u32,
+    pub ticket: LedgerTicket,
     /// No other submission of the table still writes this destination: ownership goes back now.
     pub last_for_resource: bool,
 }
@@ -293,11 +325,7 @@ pub struct Table<const N: usize> {
     peak: usize,
 }
 
-const EMPTY: Entry = Entry {
-    fence_id: 0,
-    resource_id: 0,
-    t0: 0,
-};
+const EMPTY: Entry = Entry::new(0, 0, 0);
 
 impl<const N: usize> Default for Table<N> {
     fn default() -> Self {
@@ -339,6 +367,34 @@ impl<const N: usize> Table<N> {
             .count()
     }
 
+    /// Entries reading `source_id` now (0 matches nothing).
+    pub fn readers(&self, source_id: u32) -> usize {
+        if source_id == 0 {
+            return 0;
+        }
+        self.entries[..self.len]
+            .iter()
+            .filter(|e| e.source_id == source_id)
+            .count()
+    }
+
+    /// Remove and return the oldest entry (a transport generation ending: the caller retires
+    /// what each holds).
+    pub fn pop_oldest(&mut self) -> Option<Entry> {
+        if self.len == 0 {
+            return None;
+        }
+        let entry = self.entries[0];
+        let mut i = 0;
+        while i + 1 < self.len {
+            self.entries[i] = self.entries[i + 1];
+            i += 1;
+        }
+        self.len -= 1;
+        self.entries[self.len] = EMPTY;
+        Some(entry)
+    }
+
     /// Record one submission. `false` (and nothing recorded) when the table is full or the fence
     /// id is 0 or not above every fence already in the table (a ring-1 fence id is monotonic; an
     /// out-of-order add would break the "last to retire hands it back" argument).
@@ -375,6 +431,8 @@ impl<const N: usize> Table<N> {
         Some(Done {
             resource_id: entry.resource_id,
             t0: entry.t0,
+            source_id: entry.source_id,
+            ticket: entry.ticket,
             last_for_resource: self.writers(entry.resource_id) == 0,
         })
     }
@@ -384,6 +442,83 @@ impl<const N: usize> Table<N> {
         self.entries = [EMPTY; N];
         self.len = 0;
     }
+}
+
+/// How an asynchronous copy ended its life, for the Level 5 frame edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Finish {
+    /// A DIRECT copy retired (the completion DPC).
+    Direct,
+    /// A DEFERRED copy with `BltNoMirror` retired: its ring completion is its terminal.
+    DeferredNoMirror,
+    /// A DEFERRED copy with the mirror on retired: the worker's mirror stage ends it, and raises
+    /// the edge itself.
+    DeferredMirrored,
+}
+
+/// The Level 5 (`KmdRmClient` 5) frame edge a finished asynchronous copy owes, if any. The
+/// legacy arm raises `Edge::PresentBlt` after a copy that completed (a failed wait or a failed
+/// mirror returns before it) and the worker's mirror stage raises `Edge::WindowedBlt`; an
+/// asynchronous copy that never reaches either must raise the same edge at its own end, or a
+/// destination that is the shown RM primary is never flipped. Whether the destination IS the
+/// shown primary is `rm_refresh::judge`'s question, asked by the caller with this edge.
+pub const fn edge_owed(finish: Finish, copy_ok: bool) -> Option<Edge> {
+    if !copy_ok {
+        return None;
+    }
+    match finish {
+        Finish::Direct => Some(Edge::PresentBlt),
+        Finish::DeferredNoMirror => Some(Edge::WindowedBlt),
+        Finish::DeferredMirrored => None,
+    }
+}
+
+/// Most ready-queue entries the worker looks at (`BltLookahead`).
+pub const LOOKAHEAD_MAX: usize = 8;
+/// `BltLookahead` default: the first four ready entries.
+pub const LOOKAHEAD_DEFAULT: u32 = 4;
+
+/// `BltLookahead` as the driver uses it: 1 is the old behaviour (the front only), 0 is read as 1,
+/// anything above the maximum is cut to it.
+pub const fn clamp_lookahead(raw: u32) -> usize {
+    if raw <= 1 {
+        1
+    } else if raw as usize > LOOKAHEAD_MAX {
+        LOOKAHEAD_MAX
+    } else {
+        raw as usize
+    }
+}
+
+/// One entry of the ready queue's window, as the worker sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cand {
+    /// The token names a live, undispatched request (a stale one neither dispatches nor blocks).
+    pub live: bool,
+    /// The destination resource.
+    pub dst: u32,
+    /// Admitted, producer boundary ready and destination writable: could be dispatched now.
+    pub dispatchable: bool,
+}
+
+/// Which entry of the window the worker dispatches: the first one that can go, unless an EARLIER
+/// live entry names the same destination (that one is older and has not gone, whatever its
+/// reason: the later frame must not land first). With a window of one this is the old rule.
+/// An entry that cannot go (its producer is slow, its destination is being read) no longer holds
+/// the entries of unrelated destinations behind it.
+pub fn pick(window: &[Cand]) -> Option<usize> {
+    let mut i = 0;
+    while i < window.len() {
+        let c = window[i];
+        if c.live && c.dispatchable {
+            let blocked = window[..i].iter().any(|e| e.live && e.dst == c.dst);
+            if !blocked {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The counters this feature writes, all in `kmd_render/src/ddi/blt_async.rs`. At most 14
@@ -406,6 +541,11 @@ pub const COUNTERS: &[&str] = &[
     "BltAsyncBusy",
     "BltDeferUs",
     "BltDrainN",
+    // A source still being read by an earlier copy when its next Present arrived.
+    "BltSrcBusy",
+    // Worker lookahead: knob in force, dispatches made ahead of a blocked front entry.
+    "BltLookKnob",
+    "BltLookN",
     // Submission to copy completion, histogram.
     "BltAsyncLat0",
     "BltAsyncLat1",
@@ -673,6 +813,201 @@ mod tests {
     }
 
     #[test]
+    fn an_older_queued_copy_is_drained_whatever_the_mirror_says() {
+        for no_mirror_on in [false, true] {
+            for boundary in [Boundary::None, Boundary::Dead] {
+                let f = Facts {
+                    no_mirror_on,
+                    boundary,
+                    dst_deferred_pending: true,
+                    ..facts()
+                };
+                assert!(
+                    matches!(decide(f), Route::LegacyAfterDrain { .. }),
+                    "{f:?} -> {:?}",
+                    decide(f)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_plain_legacy_route_never_leaves_an_older_queued_copy_behind() {
+        let bools = [false, true];
+        let boundaries = [
+            Boundary::None,
+            Boundary::Dead,
+            Boundary::Live { ready: false },
+            Boundary::Live { ready: true },
+        ];
+        for &async_on in &bools {
+            for &no_mirror_on in &bools {
+                for &foreign_source in &bools {
+                    for &snapshot in &bools {
+                        for &dst_standard_buffer in &bools {
+                            for &boundary in &boundaries {
+                                for &room in &bools {
+                                    let f = Facts {
+                                        async_on,
+                                        no_mirror_on,
+                                        foreign_source,
+                                        snapshot,
+                                        dst_standard_buffer,
+                                        boundary,
+                                        dst_deferred_pending: true,
+                                        table_has_room: room,
+                                    };
+                                    if let Route::Legacy { why } = decide(f) {
+                                        // Only the Presents this feature never touches.
+                                        assert!(
+                                            matches!(
+                                                why,
+                                                Why::Off | Why::NotForeign | Why::NotBuffer
+                                            ),
+                                            "{f:?} -> Legacy({why:?})"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_level_5_edge_is_owed_exactly_where_no_other_stage_raises_it() {
+        assert_eq!(edge_owed(Finish::Direct, true), Some(Edge::PresentBlt));
+        assert_eq!(
+            edge_owed(Finish::DeferredNoMirror, true),
+            Some(Edge::WindowedBlt)
+        );
+        // The worker's mirror stage raises it for a mirrored copy.
+        assert_eq!(edge_owed(Finish::DeferredMirrored, true), None);
+        // A failed copy changed nothing on the screen.
+        for f in [
+            Finish::Direct,
+            Finish::DeferredNoMirror,
+            Finish::DeferredMirrored,
+        ] {
+            assert_eq!(edge_owed(f, false), None);
+        }
+    }
+
+    #[test]
+    fn lookahead_is_clamped() {
+        assert_eq!(clamp_lookahead(0), 1);
+        assert_eq!(clamp_lookahead(1), 1);
+        assert_eq!(clamp_lookahead(LOOKAHEAD_DEFAULT), 4);
+        assert_eq!(clamp_lookahead(8), 8);
+        assert_eq!(clamp_lookahead(9), LOOKAHEAD_MAX);
+        assert_eq!(clamp_lookahead(u32::MAX), LOOKAHEAD_MAX);
+    }
+
+    fn cand(dst: u32, dispatchable: bool) -> Cand {
+        Cand {
+            live: true,
+            dst,
+            dispatchable,
+        }
+    }
+
+    #[test]
+    fn a_blocked_front_does_not_hold_an_unrelated_destination() {
+        // The front's producer is slow; the second entry is another window's frame.
+        let w = [cand(1, false), cand(2, true)];
+        assert_eq!(pick(&w), Some(1));
+        // With a window of one it is the old behaviour: nothing.
+        assert_eq!(pick(&w[..1]), None);
+    }
+
+    #[test]
+    fn a_later_frame_never_overtakes_an_older_one_for_its_destination() {
+        // Same destination: the older one cannot go, so the newer one waits behind it.
+        let w = [cand(1, false), cand(1, true), cand(2, true)];
+        assert_eq!(pick(&w), Some(2));
+        let w = [cand(1, false), cand(1, true)];
+        assert_eq!(pick(&w), None);
+        // The older one can go: it goes first.
+        let w = [cand(1, true), cand(1, true)];
+        assert_eq!(pick(&w), Some(0));
+    }
+
+    #[test]
+    fn a_stale_entry_neither_dispatches_nor_blocks() {
+        let stale = Cand {
+            live: false,
+            dst: 1,
+            dispatchable: true,
+        };
+        let w = [stale, cand(1, true)];
+        assert_eq!(pick(&w), Some(1));
+        assert_eq!(pick(&[stale]), None);
+        assert_eq!(pick(&[]), None);
+    }
+
+    #[test]
+    fn pick_keeps_per_destination_order_for_every_window() {
+        // Exhaustive over 4 entries, 3 destinations, every dispatchable pattern: the pick is never
+        // preceded by a live entry of its own destination, it is the first entry that could go,
+        // and nothing is picked only when nothing could.
+        let mut checked = 0u32;
+        for code in 0..(3u32.pow(4) * 16) {
+            let mut c = code;
+            let mut w = [cand(0, false); 4];
+            for slot in w.iter_mut() {
+                slot.dst = 1 + c % 3;
+                c /= 3;
+            }
+            for (i, slot) in w.iter_mut().enumerate() {
+                slot.dispatchable = (c >> i) & 1 == 1;
+            }
+            let could_go = |j: usize| {
+                let blocked = w[..j].iter().any(|e| e.dst == w[j].dst);
+                w[j].dispatchable && !blocked
+            };
+            match pick(&w) {
+                Some(k) => {
+                    assert!(could_go(k), "{w:?} -> {k}");
+                    for j in 0..k {
+                        assert!(!could_go(j), "{w:?} skipped {j}");
+                    }
+                }
+                None => {
+                    for j in 0..4 {
+                        assert!(!could_go(j), "{w:?} found nothing");
+                    }
+                }
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 81 * 16);
+    }
+
+    #[test]
+    fn the_table_counts_readers_of_a_source_and_hands_tickets_back() {
+        let mut t = Table::<4>::new();
+        let ticket = LedgerTicket {
+            slot: 3,
+            resid: 77,
+            generation: 5,
+        };
+        assert!(t.add(Entry::new(2, 9, 0).reading(77, ticket)));
+        assert!(t.add(Entry::new(4, 9, 0).reading(77, LedgerTicket::NONE)));
+        assert_eq!(t.readers(77), 2);
+        assert_eq!(t.readers(78), 0);
+        assert_eq!(t.readers(0), 0);
+        let done = t.complete(2).unwrap();
+        assert_eq!(done.source_id, 77);
+        assert_eq!(done.ticket, ticket);
+        assert_eq!(t.readers(77), 1);
+        let oldest = t.pop_oldest().unwrap();
+        assert_eq!(oldest.fence_id, 4);
+        assert!(t.pop_oldest().is_none());
+    }
+
+    #[test]
     fn no_mirror_applies_only_to_a_foreign_source_into_a_buffer() {
         assert!(no_mirror_applies(true, true, false, true));
         assert!(!no_mirror_applies(false, true, false, true));
@@ -735,21 +1070,9 @@ mod tests {
     #[test]
     fn the_last_retiring_writer_hands_the_buffer_back() {
         let mut t = Table::<4>::new();
-        assert!(t.add(Entry {
-            fence_id: 10,
-            resource_id: 7,
-            t0: 1
-        }));
-        assert!(t.add(Entry {
-            fence_id: 12,
-            resource_id: 7,
-            t0: 2
-        }));
-        assert!(t.add(Entry {
-            fence_id: 14,
-            resource_id: 9,
-            t0: 3
-        }));
+        assert!(t.add(Entry::new(10, 7, 1)));
+        assert!(t.add(Entry::new(12, 7, 2)));
+        assert!(t.add(Entry::new(14, 9, 3)));
         assert_eq!(t.writers(7), 2);
         assert_eq!(t.writers(9), 1);
         assert_eq!(t.peak(), 3);
@@ -768,11 +1091,7 @@ mod tests {
     fn completion_may_come_in_any_order() {
         let mut t = Table::<4>::new();
         for (i, f) in [4u64, 6, 8].iter().enumerate() {
-            assert!(t.add(Entry {
-                fence_id: *f,
-                resource_id: 1,
-                t0: i as u64
-            }));
+            assert!(t.add(Entry::new(*f, 1, i as u64)));
         }
         assert!(!t.complete(8).unwrap().last_for_resource);
         assert!(!t.complete(4).unwrap().last_for_resource);
@@ -783,11 +1102,7 @@ mod tests {
     fn an_unknown_or_repeated_completion_is_nothing() {
         let mut t = Table::<2>::new();
         assert!(t.complete(5).is_none());
-        assert!(t.add(Entry {
-            fence_id: 5,
-            resource_id: 3,
-            t0: 0
-        }));
+        assert!(t.add(Entry::new(5, 3, 0)));
         assert!(t.complete(6).is_none());
         assert!(t.complete(5).is_some());
         assert!(t.complete(5).is_none(), "a second completion finds nothing");
@@ -796,54 +1111,22 @@ mod tests {
     #[test]
     fn the_table_is_bounded_and_ordered() {
         let mut t = Table::<2>::new();
-        assert!(t.add(Entry {
-            fence_id: 3,
-            resource_id: 1,
-            t0: 0
-        }));
+        assert!(t.add(Entry::new(3, 1, 0)));
         // Not above the newest fence.
-        assert!(!t.add(Entry {
-            fence_id: 3,
-            resource_id: 1,
-            t0: 0
-        }));
-        assert!(!t.add(Entry {
-            fence_id: 2,
-            resource_id: 1,
-            t0: 0
-        }));
+        assert!(!t.add(Entry::new(3, 1, 0)));
+        assert!(!t.add(Entry::new(2, 1, 0)));
         // Zero ids name nothing.
-        assert!(!t.add(Entry {
-            fence_id: 9,
-            resource_id: 0,
-            t0: 0
-        }));
-        assert!(!t.add(Entry {
-            fence_id: 0,
-            resource_id: 1,
-            t0: 0
-        }));
-        assert!(t.add(Entry {
-            fence_id: 4,
-            resource_id: 1,
-            t0: 0
-        }));
+        assert!(!t.add(Entry::new(9, 0, 0)));
+        assert!(!t.add(Entry::new(0, 1, 0)));
+        assert!(t.add(Entry::new(4, 1, 0)));
         assert!(!t.has_room());
-        assert!(!t.add(Entry {
-            fence_id: 5,
-            resource_id: 1,
-            t0: 0
-        }));
+        assert!(!t.add(Entry::new(5, 1, 0)));
         assert_eq!(t.len(), 2);
         t.clear();
         assert!(t.is_empty() && t.has_room());
         assert_eq!(t.peak(), 2);
         // After a clear the fence order starts over (a new transport generation).
-        assert!(t.add(Entry {
-            fence_id: 1,
-            resource_id: 1,
-            t0: 0
-        }));
+        assert!(t.add(Entry::new(1, 1, 0)));
     }
 
     #[test]
@@ -936,7 +1219,7 @@ mod tests {
         }
         for l in &written {
             // The knob names (read, not written) are the only other literals of the file.
-            if l == "BltAsync" || l == "BltNoMirror" {
+            if l == "BltAsync" || l == "BltNoMirror" || l == "BltLookahead" {
                 continue;
             }
             assert!(
@@ -988,6 +1271,7 @@ mod tests {
         let text = std::fs::read_to_string(render.join("diag.rs")).unwrap();
         assert!(text.contains("KnobName::new(b\"BltAsync\")"));
         assert!(text.contains("KnobName::new(b\"BltNoMirror\")"));
+        assert!(text.contains("KnobName::new(b\"BltLookahead\")"));
         for n in COUNTERS {
             assert_ne!(*n, "BltAsync");
             assert_ne!(*n, "BltNoMirror");
