@@ -151,11 +151,21 @@ pub(crate) fn worker_idle(adapter: &AdapterContext) -> bool {
 #[inline]
 pub(crate) fn on_ddi_entry(adapter: &AdapterContext) -> bool {
     if mode().announces() {
-        ANN_ADDR.store(0, Ordering::Release);
-        ANN_HANDLE.store(0, Ordering::Release);
+        forget_unconfirmed();
         return worker_idle(adapter);
     }
     false
+}
+
+/// Forget an announcement nobody confirmed. Called at every flip dxgkrnl issues (the MMIO DDI
+/// above, and the DMA lane's submit and keep record, which do not announce but publish through
+/// the funnel too) and when the display publication state is reset. Atomics only.
+#[inline]
+pub(crate) fn forget_unconfirmed() {
+    if ANN_ADDR.load(Ordering::Relaxed) != 0 {
+        ANN_ADDR.store(0, Ordering::Release);
+        ANN_HANDLE.store(0, Ordering::Release);
+    }
 }
 
 /// The paired flip `h_alloc` naming `address` reached the DDI (DIRQL; `idle` is
@@ -230,6 +240,16 @@ pub(crate) fn funnel(address: u64) -> bool {
             false
         }
     }
+}
+
+/// A ring-1 copy completion DPC is about to store `address` as the displayed one (it stores
+/// through a pointer, not through `publish_displayed_primary`): the same funnel. Returns whether
+/// to store. The announced flip's own copy completion confirms the announcement (the store is
+/// skipped: already published), and a completion of an OLDER copy after a newer announce is
+/// dropped instead of regressing the heartbeat's address.
+#[inline]
+pub(crate) fn funnel_dpc(address: u64) -> bool {
+    funnel(address)
 }
 
 /// The worker's programming of `h_alloc` ended in a refusal. If that flip was announced the

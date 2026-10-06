@@ -1216,6 +1216,9 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
         {
             // A flip dxgkrnl issued (`FlipIss`), completed here by the keep record.
             crate::ddi::stall_diag::note_flip_issued(address);
+            // `FlipAnnounce`: an earlier announcement nobody confirmed must not drop this
+            // flip's own publication as a regression.
+            crate::ddi::flip_announce::forget_unconfirmed();
             let _ = crate::ddi::flip_keep::keep(
                 adapter,
                 address,
@@ -1227,6 +1230,7 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
     };
     // A flip dxgkrnl issued (`FlipIss`): the DMA lane's counterpart of `SetVidPnSourceAddress`.
     crate::ddi::stall_diag::note_flip_issued(primary_address);
+    crate::ddi::flip_announce::forget_unconfirmed();
     // NOTE (0ab-B, 22.22.210.0): capturing the completion boundary HERE was
     // tried and MEASURED NOT TO WORK. dxgkrnl submits a flip about a frame
     // after the app presented, so `next_wire_fence` at this point already
