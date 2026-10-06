@@ -118,7 +118,7 @@ impl AdapterContext {
             // The registry mirror's own thread (`ddi::mirror_thread`): the worker only requests
             // a publish pass, it does not spend tens of milliseconds between two flips on one.
             // SAFETY: PASSIVE_LEVEL (StartDevice).
-            unsafe { crate::ddi::mirror_thread::start() };
+            unsafe { crate::ddi::mirror_thread::start(self) };
         } else {
             // 0x0B00_00EA = HPD-worker-create-failed. It was 0x0B00_00E7, which
             // ddi/lifecycle.rs also records for venus-bring-up-failed — and BOTH
@@ -157,6 +157,11 @@ impl AdapterContext {
         use core::sync::atomic::Ordering;
         // The mirror thread first (idempotent): from here the callers publish inline again.
         crate::ddi::mirror_thread::stop();
+        // The mirror thread reads this context (the dump, the pacing snapshot): one that could not
+        // be joined keeps it allocated, like a worker that could not be joined.
+        if crate::ddi::mirror_thread::leaked() {
+            self.hpd_worker_leaked.store(1, Ordering::Release);
+        }
         let h = self.hpd_thread.swap(0, Ordering::AcqRel);
         if h == 0 {
             return;
@@ -784,6 +789,8 @@ impl AdapterContext {
             self.vsync_ex_timer
                 .store(ex_timer as usize, core::sync::atomic::Ordering::Release);
         }
+        // `VsExTm`: which timer drives the heartbeat (1 = the high-resolution Ex timer).
+        crate::ddi::stall_diag::note_vsync_source(!ex_timer.is_null());
         // The independent watchdog's timer (v329): default resolution (it ticks every 250 ms), its
         // own callback, the same immutable context. NULL = no watchdog this adapter lifetime
         // (`VsWdNoTm`); the heartbeat itself is unaffected.
@@ -878,7 +885,15 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
                 adapter.vsync_fast.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let Some(deadline) = helios_kmd_logic::vsync_deadline::next(anchor, now, period) else {
+        // `advance` is `next` plus the accounting of the period slots this step moved over
+        // (`VsSlotN`, `VsSkipN`) and, with `VsCatchUp`, one missed slot served by an immediate
+        // extra tick instead of dropped (`VsCatchN`).
+        let Some(step) = helios_kmd_logic::vsync_deadline::advance(
+            anchor,
+            now,
+            period,
+            crate::ddi::stall_diag::vs_catch_up(),
+        ) else {
             // Interrupt-time representation exhausted. The current one-shot
             // has fired; leave it disarmed rather than schedule an immediate
             // 100 ns retry loop.
@@ -887,6 +902,7 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
             crate::ddi::stall_diag::note_vsync_exhausted();
             return;
         };
+        let deadline = step.deadline;
         adapter
             .vsync_deadline_100ns
             .store(deadline, Ordering::Release);
@@ -900,8 +916,9 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
             adapter.cancel_vsync_one_shot();
             return;
         }
-        now
+        (now, step)
     };
+    let (tick_time_100ns, step) = tick_time_100ns;
     // Stall diagnosis (`ddi::stall_diag`): the consecutive-pending-tick count `VsPendN` and its
     // maximum, and, only with `FlipWdogMs` set, the flip watchdog. Atomics only (DISPATCH),
     // before the delivery gate below so a disabled delivery does not blind the count; the
@@ -909,6 +926,8 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     crate::ddi::stall_diag::on_vsync_tick(
         adapter,
         helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(adapter)),
+        tick_time_100ns,
+        &step,
     );
     // ControlInterrupt may close only the delivery gate at DIRQL. Keep the
     // one-shot heartbeat free-running while disabled so a later enable needs no
@@ -1022,7 +1041,13 @@ unsafe extern "system" fn vsync_ex_timer_callback(_timer: ExTimer, context: PVOI
     let adapter = unsafe { &*(context as *const AdapterContext) };
     // `VsCbIn` / `VsCbOut`: entered and returned; a blocked callback is `VsCbIn` above `VsCbOut`.
     crate::ddi::stall_diag::cb_enter();
+    let entered = crate::adapter::foreign_scanout::now_100ns();
     unsafe { service_vsync_tick(adapter) };
+    // `VsCbMaxUs` / `VsCbOvN`: the callback's own time (a callback of a period or more delays the
+    // next tick of this same timer).
+    crate::ddi::stall_diag::note_cb_dwell(
+        crate::adapter::foreign_scanout::now_100ns().saturating_sub(entered),
+    );
     crate::ddi::stall_diag::cb_leave();
 }
 
@@ -1056,6 +1081,10 @@ pub unsafe extern "C" fn vsync_dpc_routine(
     let adapter = unsafe { &*(context as *const AdapterContext) };
     // `VsCbIn` / `VsCbOut`: entered and returned; a blocked callback is `VsCbIn` above `VsCbOut`.
     crate::ddi::stall_diag::cb_enter();
+    let entered = crate::adapter::foreign_scanout::now_100ns();
     unsafe { service_vsync_tick(adapter) };
+    crate::ddi::stall_diag::note_cb_dwell(
+        crate::adapter::foreign_scanout::now_100ns().saturating_sub(entered),
+    );
     crate::ddi::stall_diag::cb_leave();
 }

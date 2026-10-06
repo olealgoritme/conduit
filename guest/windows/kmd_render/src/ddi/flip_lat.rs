@@ -25,7 +25,9 @@
 //! * `VbTicks`, `VbUsed`, `VbUsedPm`: delivered ticks with a source shown, of which those that
 //!   retired a flip, and the share in permille: the "every vblank used" ratio.
 //! * `VsLate0..7`, `VsLateMaxUs`: how late the heartbeat's tick ran against its scheduled
-//!   deadline (the one-shot high-resolution timer's own jitter).
+//!   deadline (the one-shot high-resolution timer's own jitter); a tick a whole period late
+//!   (bucket 5, 4.2 ms and more, at 240 Hz) is a dropped slot. `VsAheadN`, `VsAheadMaxUs`: ticks
+//!   that ran BEFORE their deadline, and the most by which (`VsLate*` reads 0 for those).
 //! * `FlipPh0..3`, `FlipInDpc`: where in the period the DDI ran (quarters after the last tick)
 //!   and how many DDIs ran while this driver's own device DPC was inside
 //!   `DxgkCbNotifyDpc` (dxgkrnl issuing the next flip as part of retiring the previous one).
@@ -79,6 +81,11 @@ static VB_TICKS: AtomicU32 = AtomicU32::new(0);
 static VB_USED: AtomicU32 = AtomicU32::new(0);
 static LATE: [AtomicU32; BUCKETS] = [Z32; BUCKETS];
 static LATE_MAX_US: AtomicU32 = AtomicU32::new(0);
+/// Ticks that ran BEFORE their scheduled deadline (`VsAheadN`) and by how much at most
+/// (`VsAheadMaxUs`): a high-resolution timer whose relative due time is taken against a coarse
+/// clock fires early by up to a system tick. `VsLate*` saturates at 0 for these.
+static AHEAD_N: AtomicU32 = AtomicU32::new(0);
+static AHEAD_MAX_US: AtomicU32 = AtomicU32::new(0);
 static PHASE: [AtomicU32; 4] = [Z32; 4];
 static IN_DPC_N: AtomicU32 = AtomicU32::new(0);
 /// Non-zero while this driver's device DPC is inside `DxgkCbNotifyDpc`: the processor number + 1
@@ -139,6 +146,8 @@ pub(crate) fn start_generation() {
         &VB_TICKS,
         &VB_USED,
         &LATE_MAX_US,
+        &AHEAD_N,
+        &AHEAD_MAX_US,
         &IN_DPC_N,
         &IN_DPC,
         &FA_TICK,
@@ -244,6 +253,10 @@ fn load_ring() -> ([u64; RING], [u64; RING], u32) {
 pub(crate) fn note_tick_late(now: u64, deadline: u64) {
     if !on() {
         return;
+    }
+    if now < deadline {
+        AHEAD_N.fetch_add(1, Ordering::Relaxed);
+        AHEAD_MAX_US.fetch_max(((deadline - now) / 10).min(u32::MAX as u64) as u32, Ordering::Relaxed);
     }
     let d = now.saturating_sub(deadline);
     LATE[fr::late_bucket_100ns(d)].fetch_add(1, Ordering::Relaxed);
@@ -512,4 +525,6 @@ pub(crate) fn publish_counters() {
     m.rec(b"VbUsedPm", fr::used_permille(used, ticks));
     rec_hist(&mut m, b"VsLate", &load_hist(&LATE));
     m.rec(b"VsLateMaxUs", LATE_MAX_US.load(Ordering::Relaxed));
+    m.rec(b"VsAheadN", AHEAD_N.load(Ordering::Relaxed));
+    m.rec(b"VsAheadMaxUs", AHEAD_MAX_US.load(Ordering::Relaxed));
 }

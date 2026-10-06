@@ -55,6 +55,12 @@ pub(crate) fn hpd_enter(step: u32) {
         if us >= 100_000 {
             HPD_STEP_100_N.fetch_add(1, Ordering::Relaxed);
         }
+        // A step over the 4 ms budget (one 240 Hz period): which STEPS still take one, by id
+        // (`HpdOv4Mask`, bit = `site` id) and how many did (`HpdOv4N`); `HpdMx*` says by how much.
+        if sd::step_over_budget(us) {
+            HPD_OV4_N.fetch_add(1, Ordering::Relaxed);
+            HPD_OV4_MASK.fetch_or(sd::step_mask_bit(left), Ordering::Relaxed);
+        }
         if let Some(c) = STEP_MAX_US.get(left as usize) {
             c.fetch_max(us, Ordering::Relaxed);
         }
@@ -79,6 +85,12 @@ static HPD_SITE_AT: AtomicU64 = AtomicU64::new(0);
 static HPD_LONG: helios_kmd_logic::device_lost::Longest = helios_kmd_logic::device_lost::Longest::new();
 static HPD_LONG_INFL: AtomicU32 = AtomicU32::new(0);
 static HPD_STEP_100_N: AtomicU32 = AtomicU32::new(0);
+/// Steps of the worker over the 4 ms budget (`HpdOv4N`) and the set of step ids that had one
+/// (`HpdOv4Mask`), and the periodic dumps held back by a flip in hand (`HpdDumpDef`, the inline
+/// fallback only: with the mirror thread the worker never writes the dump).
+static HPD_OV4_N: AtomicU32 = AtomicU32::new(0);
+static HPD_OV4_MASK: AtomicU32 = AtomicU32::new(0);
+static DUMP_DEFERRED: AtomicU32 = AtomicU32::new(0);
 /// The longest dwell (microseconds) in each worker step, by `site` id (`HpdMx00`..`HpdMx31`).
 #[allow(clippy::declare_interior_mutable_const)]
 const Z32: AtomicU32 = AtomicU32::new(0);
@@ -203,6 +215,11 @@ pub(crate) fn note_dump_skipped() {
     DUMP_SKIP.fetch_add(1, Ordering::Relaxed);
 }
 
+/// A due inline dump was held back because a flip was in the worker's hands (`HpdDumpDef`).
+pub(crate) fn note_dump_deferred() {
+    DUMP_DEFERRED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Mirror the worker's wake block. PASSIVE.
 pub(crate) fn publish_hpd_wake() {
     use crate::diag::record_named_bytes as rec;
@@ -222,6 +239,7 @@ pub(crate) fn publish_hpd_wake() {
     rec(b"HpdDumpN", DUMP_N.load(Ordering::Relaxed));
     rec(b"HpdDumpUs", DUMP_US.load(Ordering::Relaxed));
     rec(b"HpdDumpSkip", DUMP_SKIP.load(Ordering::Relaxed));
+    rec(b"HpdDumpDef", DUMP_DEFERRED.load(Ordering::Relaxed));
     rec(b"HpdSgBlt", SIGNALS[cause::BLT as usize].load(Ordering::Relaxed));
     rec(b"HpdSgRfr", SIGNALS[cause::REFRESH as usize].load(Ordering::Relaxed));
     rec(b"HpdSgEdg", SIGNALS[cause::EDGE as usize].load(Ordering::Relaxed));
@@ -351,6 +369,26 @@ static VS_PEND_MAX: AtomicU32 = AtomicU32::new(0);
 /// that dxgkrnl keeps closed.
 static VS_TICKS: AtomicU32 = AtomicU32::new(0);
 static VS_OFF: AtomicU32 = AtomicU32::new(0);
+/// The heartbeat's exact (count, time) sample (`kmd_logic::vsync_snap`, 15.18.16): the tick stores
+/// its running totals and its own time in one seqlock cell, the mirror reads the cell once per pass
+/// and writes `VsTickN`, `VsTickT`, `VsSlotN`, `VsSkipN`, `VsCatchN` and the two packed 64-bit
+/// pairs `VsSnapA` / `VsSnapB` from that one read. `VS_SAMPLE_LAST` is the last read that
+/// succeeded (a read that met a write in flight is counted in `VsSnapMiss` and publishes it).
+static VS_SNAP: helios_kmd_logic::vsync_snap::Snap = helios_kmd_logic::vsync_snap::Snap::new();
+#[allow(clippy::declare_interior_mutable_const)]
+const Z64: AtomicU64 = AtomicU64::new(0);
+static VS_SAMPLE_LAST: [AtomicU64; helios_kmd_logic::vsync_snap::FIELDS] =
+    [Z64; helios_kmd_logic::vsync_snap::FIELDS];
+static VS_SNAP_MISS: AtomicU32 = AtomicU32::new(0);
+/// The callback's own time (`VsCbMaxUs`: the longest, `VsCbOvN`: callbacks that took a whole
+/// period or more, which delay the NEXT tick of the same timer), the period they are judged by,
+/// whether the high-resolution Ex timer is the source (`VsExTm`; 0 = the KTIMER fallback, whose
+/// resolution is the system's), and the `VsCatchUp` knob in force.
+static VS_CB_MAX_US: AtomicU32 = AtomicU32::new(0);
+static VS_CB_OVER_N: AtomicU32 = AtomicU32::new(0);
+static VS_PERIOD: AtomicU64 = AtomicU64::new(0);
+static VS_EX_TIMER: AtomicU32 = AtomicU32::new(0);
+static VS_CATCH_UP: AtomicU32 = AtomicU32::new(0);
 static VS_STALL: AtomicU32 = AtomicU32::new(0);
 static VS_SEEN_PUB: AtomicU32 = AtomicU32::new(0);
 /// Watchdog publications (`FlipWd`), the time of the last (`FlipWdT`), and flips it could not
@@ -367,6 +405,29 @@ static DEFER_BUDGET: AtomicU32 = AtomicU32::new(0);
 static VS_POWER_MODE: AtomicU32 = AtomicU32::new(0);
 static VS_WATCHDOG: AtomicU32 = AtomicU32::new(0);
 static VS_IDLE_WAKE: AtomicU32 = AtomicU32::new(0);
+
+/// The tick callback ran for `dwell_100ns` (entry to return, whatever the callback did, the time it
+/// was preempted included). A callback that takes a whole period or more holds up the NEXT tick of
+/// the same timer, which then runs late and drops a slot: `VsCbOvN` counts them, `VsCbMaxUs` is
+/// the longest. Atomics only (DISPATCH).
+pub(crate) fn note_cb_dwell(dwell_100ns: u64) {
+    VS_CB_MAX_US.fetch_max((dwell_100ns / 10).min(u32::MAX as u64) as u32, Ordering::Relaxed);
+    let period = VS_PERIOD.load(Ordering::Relaxed);
+    if period != 0 && dwell_100ns >= period {
+        VS_CB_OVER_N.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Which timer drives the heartbeat: the high-resolution Ex timer (`VsExTm` 1) or the KTIMER
+/// fallback (0), decided once at AddDevice. Any IRQL.
+pub(crate) fn note_vsync_source(ex_timer: bool) {
+    VS_EX_TIMER.store(ex_timer as u32, Ordering::Relaxed);
+}
+
+/// `VsCatchUp` in force (1 = serve one missed slot with an immediate extra tick; default 0).
+pub(crate) fn vs_catch_up() -> bool {
+    VS_CATCH_UP.load(Ordering::Relaxed) != 0
+}
 
 /// `VsPowerMode` in force (0 = any non-D0 call quiesces, 1 = adapter only).
 pub(crate) fn vs_power_mode() -> u32 {
@@ -397,8 +458,29 @@ pub(crate) fn vs_idle_wake() -> u32 {
 /// picture that is not on the screen: this is recovery, not completion, and only the opt-in knob
 /// allows it. It does not lower the programming gate or touch the pending slot: the worker
 /// still owns the programming and will bind or reject it as before.
-pub(crate) fn on_vsync_tick(adapter: &AdapterContext, period_100ns: u64) {
+pub(crate) fn on_vsync_tick(
+    adapter: &AdapterContext,
+    period_100ns: u64,
+    tick_time_100ns: u64,
+    advance: &helios_kmd_logic::vsync_deadline::Advance,
+) {
     VS_TICKS.fetch_add(1, Ordering::Relaxed);
+    VS_PERIOD.store(period_100ns, Ordering::Relaxed);
+    // The exact sample: this tick's own time with the totals it made (one writer, the tick).
+    {
+        use helios_kmd_logic::vsync_snap as snap;
+        let previous = VS_SNAP.read_tries(2).unwrap_or([0; snap::FIELDS]);
+        let sample = snap::after_tick(
+            &previous,
+            tick_time_100ns,
+            advance.slots,
+            advance.skipped,
+            advance.caught_up,
+        );
+        if !VS_SNAP.write(&sample) {
+            VS_SNAP_MISS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     // The tick's own time (`VsTickT`, the watchdog's reference) and the longest silence between
     // two ticks (`VsGapMaxMs`; the arm clears the previous tick, so a quiesce is not a gap).
     let now = crate::adapter::foreign_scanout::now_100ns();
@@ -479,11 +561,20 @@ pub(crate) fn on_vsync_tick(adapter: &AdapterContext, period_100ns: u64) {
 /// mirror, which does not). PASSIVE.
 pub(crate) fn publish_vsync_ticks() {
     use crate::diag::record_named_bytes as rec;
-    rec_live(1, b"VsTickN", VS_TICKS.load(Ordering::Relaxed));
+    // ONE read of the tick's own cell (15.18.16): the count, its time, the slots and the drops
+    // below are the same instant, and the two packed pairs carry (count, time) in one registry
+    // value, so a reader's rate is the count delta over the delta of the ticks' own times.
+    let s = vs_sample();
+    publish_vs_sample(&s);
     rec(b"VsOffN", VS_OFF.load(Ordering::Relaxed));
-    // The time of the last tick, written in the same call as the count: a count that stays put
-    // while `StallT` (or `VpDmpT`) moves is a heartbeat that stopped, whatever the mirror's age.
-    rec_live(2, b"VsTickT", VS_TICK_T.load(Ordering::Relaxed));
+    rec(b"VsSlotN", s[helios_kmd_logic::vsync_snap::SLOTS] as u32);
+    rec(b"VsSkipN", s[helios_kmd_logic::vsync_snap::SKIPPED] as u32);
+    rec(b"VsCatchN", s[helios_kmd_logic::vsync_snap::CAUGHT] as u32);
+    rec(b"VsSnapMiss", VS_SNAP_MISS.load(Ordering::Relaxed));
+    // The callback's own time, the timer source and the knob in force.
+    rec(b"VsCbMaxUs", VS_CB_MAX_US.load(Ordering::Relaxed));
+    rec(b"VsCbOvN", VS_CB_OVER_N.load(Ordering::Relaxed));
+    rec(b"VsExTm", VS_EX_TIMER.load(Ordering::Relaxed));
     rec(b"VsGapMaxMs", VS_GAP_MAX_MS.load(Ordering::Relaxed));
     rec(b"VsArmN", VS_ARM_N.load(Ordering::Relaxed));
     rec(b"VsDisN", VS_DIS_N.load(Ordering::Relaxed));
@@ -716,8 +807,10 @@ static VS_WD_LAST_FULL: AtomicU32 = AtomicU32::new(0);
 /// The last value written for each of the ten live values (`u64::MAX` = unknown: written next
 /// time). Every writer of those names goes through [`rec_live`], so the cache is the registry's
 /// content; [`start_generation`] makes it unknown again before it writes the block's zeros.
-const LIVE_N: usize = 10;
+const LIVE_N: usize = 12;
 static LIVE_CACHE: [AtomicU64; LIVE_N] = [
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
     AtomicU64::new(u64::MAX),
     AtomicU64::new(u64::MAX),
     AtomicU64::new(u64::MAX),
@@ -730,12 +823,61 @@ static LIVE_CACHE: [AtomicU64; LIVE_N] = [
     AtomicU64::new(u64::MAX),
 ];
 
-/// Write one of the ten live values unless it is what the registry already holds. PASSIVE.
+/// Write one of the live values unless it is what the registry already holds. PASSIVE.
 fn rec_live(slot: usize, name: &[u8], value: u32) {
     if LIVE_CACHE[slot].swap(value as u64, Ordering::Relaxed) == value as u64 {
         return;
     }
     crate::diag::record_named_bytes(name, value);
+}
+
+/// [`rec_live`] for a 64-bit value (a REG_QWORD: one registry transaction, so a reader sees all of
+/// it or none of it). PASSIVE.
+fn rec_live_q(slot: usize, name: &[u8], value: u64) {
+    if LIVE_CACHE[slot].swap(value, Ordering::Relaxed) == value {
+        return;
+    }
+    crate::diag::record_named_qword(name, value);
+}
+
+/// The heartbeat's exact sample (15.18.16): one seqlock read of the tick's own cell. A read that
+/// meets a write in flight more often than its bound (never, with one writer that is not
+/// preempted inside four stores) is counted in `VsSnapMiss` and answered with the last good
+/// sample, so a publication is never made of a torn one.
+fn vs_sample() -> helios_kmd_logic::vsync_snap::Sample {
+    use helios_kmd_logic::vsync_snap::FIELDS;
+    match VS_SNAP.read() {
+        Some(s) => {
+            for i in 0..FIELDS {
+                VS_SAMPLE_LAST[i].store(s[i], Ordering::Relaxed);
+            }
+            s
+        }
+        None => {
+            VS_SNAP_MISS.fetch_add(1, Ordering::Relaxed);
+            let mut s = [0u64; FIELDS];
+            for i in 0..FIELDS {
+                s[i] = VS_SAMPLE_LAST[i].load(Ordering::Relaxed);
+            }
+            s
+        }
+    }
+}
+
+/// `VsTickN` and `VsTickT` (the count and the time of the tick that made it) and the two packed
+/// pairs, all four from one sample, unchanged values skipped.
+fn publish_vs_sample(s: &helios_kmd_logic::vsync_snap::Sample) {
+    use helios_kmd_logic::vsync_snap as snap;
+    rec_live(1, b"VsTickN", s[snap::TICKS] as u32);
+    // The time of the tick that made the count, written beside it: a count that stays put while
+    // `StallT` (or `VpDmpT`) moves is a heartbeat that stopped, whatever the mirror's age.
+    rec_live(
+        2,
+        b"VsTickT",
+        helios_kmd_logic::vsync_rate::ms_from_100ns(s[snap::TIME]),
+    );
+    rec_live_q(10, b"VsSnapA", snap::pack_pair(s[snap::TICKS], s[snap::TIME]));
+    rec_live_q(11, b"VsSnapB", snap::pack_pair(s[snap::SLOTS], s[snap::TIME]));
 }
 
 /// A tick callback was entered / returned (any IRQL <= DISPATCH, atomics only).
@@ -844,6 +986,9 @@ pub(crate) fn request_live_publish(tick_n: u32, acted: bool) -> bool {
 pub(crate) fn publish_live_if_wanted() {
     match LIVE_WANTED.swap(0, Ordering::AcqRel) {
         0 => {}
+        // With the mirror thread the worker does not write: the pass the thread takes publishes the
+        // whole heartbeat block, ten live values included (15.18.16).
+        _ if crate::ddi::mirror_thread::running() => crate::ddi::mirror_thread::request(),
         1 => publish_live_small(),
         _ => publish_vsync_ticks(),
     }
@@ -853,8 +998,7 @@ pub(crate) fn publish_live_if_wanted() {
 /// write), unchanged ones skipped.
 pub(crate) fn publish_live_small() {
     rec_live(0, b"VsLiveT", AdapterContext::interrupt_time_ms());
-    rec_live(1, b"VsTickN", VS_TICKS.load(Ordering::Relaxed));
-    rec_live(2, b"VsTickT", VS_TICK_T.load(Ordering::Relaxed));
+    publish_vs_sample(&vs_sample());
     rec_live(3, b"VsCbIn", VS_CB_IN.load(Ordering::Relaxed));
     rec_live(4, b"VsCbOut", VS_CB_OUT.load(Ordering::Relaxed));
     rec_live(5, b"VsWdTkN", VS_WD_TK_N.load(Ordering::Relaxed));
@@ -978,6 +1122,12 @@ pub(crate) fn reread_knobs() {
     ));
     VS_WD_TIMER.store(wd_timer, Ordering::Relaxed);
     crate::diag::record_named_bytes(b"VsWdTmEff", wd_timer);
+    let catch_up = helios_kmd_logic::vsync_snap::clamp_catch_up(crate::diag::read_config_dword(
+        crate::diag::knobs::VS_CATCH_UP,
+        0,
+    ));
+    VS_CATCH_UP.store(catch_up, Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"VsCatchEff", catch_up);
 }
 
 // ---- v327 breadcrumbs: what the previous generation left, where the worker and the mode set are
@@ -1265,6 +1415,8 @@ fn publish_long_events() {
     rec(b"HpdLongT", HPD_LONG.t.load(Ordering::Relaxed));
     rec(b"HpdLongInfl", HPD_LONG_INFL.load(Ordering::Relaxed));
     rec(b"HpdStep100N", HPD_STEP_100_N.load(Ordering::Relaxed));
+    rec(b"HpdOv4N", HPD_OV4_N.load(Ordering::Relaxed));
+    rec(b"HpdOv4Mask", HPD_OV4_MASK.load(Ordering::Relaxed));
     rec(b"HpdPass100N", HPD_PASS_100_N.load(Ordering::Relaxed));
     rec(b"HpdPass500N", HPD_PASS_500_N.load(Ordering::Relaxed));
     rec(b"VsGap100N", VS_GAP_100_N.load(Ordering::Relaxed));
@@ -1316,6 +1468,12 @@ pub(crate) fn start_generation() {
         &VS_PEND_MAX,
         &VS_TICKS,
         &VS_OFF,
+        &VS_SNAP_MISS,
+        &VS_CB_MAX_US,
+        &VS_CB_OVER_N,
+        &HPD_OV4_N,
+        &HPD_OV4_MASK,
+        &DUMP_DEFERRED,
         &VS_STALL,
         &VS_SEEN_PUB,
         &WD_COUNT,
@@ -1385,6 +1543,11 @@ pub(crate) fn start_generation() {
         &LIVE_WANTED,
         &VS_WD_LAST_FULL,
     ] {
+        c.store(0, Ordering::Relaxed);
+    }
+    // The heartbeat's exact sample starts the generation at zero (the tick writes it again).
+    VS_SNAP.reset();
+    for c in &VS_SAMPLE_LAST {
         c.store(0, Ordering::Relaxed);
     }
     // The registry is about to be rewritten with this generation's zeros: forget what was cached.

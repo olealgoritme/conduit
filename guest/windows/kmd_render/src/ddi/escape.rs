@@ -1816,7 +1816,7 @@ fn escape_nvrm(
     // else would ever run the mirror, so do it here. Still rate limited by the
     // same gate, and one load when nothing is wanted.
     if !adapter.hpd_running() {
-        nvrm_publish_service();
+        nvrm_publish_service(false);
         // The same for the fences the KMD owes the host a `Close` (the HE12 v4
         // fence path works without a worker: `rm_fence_served` does not need one):
         // a render-only config would otherwise leave every fired fence as a table
@@ -1908,7 +1908,11 @@ pub(super) fn nvrm_publish_pending() -> bool {
 /// The HPD worker's half: do the mirror if one was asked for and at least 250 ms
 /// passed since the last (`helios_kmd_logic::nvrm_fastpath::publish_gate`). PASSIVE.
 /// Cheap (one load) when nothing was asked.
-pub(super) fn nvrm_publish_service() {
+///
+/// With the mirror thread the worker only hands it over (`mirror_thread::NV`: ~100 registry
+/// writes that ran between two flips, `HpdSite` 11). Without it, `flip_busy` (a flip in the
+/// worker's hands) holds the mirror back for 10 s at most (`hpd_wake::dump_gate`; `HpdDumpDef`).
+pub(super) fn nvrm_publish_service(flip_busy: bool) {
     use core::sync::atomic::Ordering;
     use helios_kmd_logic::nvrm_fastpath::publish_gate as gate;
     if NVRM_PUBLISH_WANTED.load(Ordering::Acquire) == 0 {
@@ -1922,6 +1926,21 @@ pub(super) fn nvrm_publish_service() {
         // Still wanted: the worker sleeps at most one interval while it is.
         return;
     }
+    let inline = !crate::ddi::mirror_thread::running();
+    if inline {
+        let now_ms = helios_kmd_logic::vsync_rate::ms_from_100ns(now);
+        let since = NVRM_DEFER_SINCE.load(Ordering::Relaxed);
+        match helios_kmd_logic::hpd_wake::dump_gate(true, flip_busy, since, now_ms) {
+            helios_kmd_logic::hpd_wake::DumpGate::Defer => {
+                if since == 0 {
+                    NVRM_DEFER_SINCE.store(now_ms.max(1), Ordering::Relaxed);
+                }
+                crate::ddi::stall_diag::note_dump_deferred();
+                return;
+            }
+            _ => NVRM_DEFER_SINCE.store(0, Ordering::Relaxed),
+        }
+    }
     // Memo first, flag second, mirror last: a count that moves from here on
     // makes the next escape a candidate again, and its request is not lost.
     let (shape, calls) = nvrm_shape_and_calls();
@@ -1929,8 +1948,15 @@ pub(super) fn nvrm_publish_service() {
     NVRM_LAST_BUCKET.store(gate::bucket(calls), Ordering::Relaxed);
     NVRM_LAST_PUBLISH.store(now, Ordering::Relaxed);
     NVRM_PUBLISH_WANTED.store(0, Ordering::Release);
+    if !inline {
+        crate::ddi::mirror_thread::request_bits(crate::ddi::mirror_thread::NV);
+        return;
+    }
     crate::ddi::publish_nvrm_counters();
 }
+
+/// The interrupt time (ms, never 0) the inline `Nv*` mirror was first held back by a flip in hand.
+static NVRM_DEFER_SINCE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn escape_nvrm_op(
     passive: PassiveLevel,

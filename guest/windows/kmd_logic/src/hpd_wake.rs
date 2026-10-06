@@ -187,6 +187,91 @@ pub const fn dump_due(first: bool, loops_since: u32, now_ms: u32, last_ms: u32) 
     first || (loops_since >= DUMP_EVERY_LOOPS && age_ms(now_ms, last_ms) >= DUMP_MIN_INTERVAL_MS)
 }
 
+/// The longest an INLINE periodic dump (no mirror thread) may be held back by a flip in hand.
+pub const DUMP_MAX_DEFER_MS: u32 = 10_000;
+
+/// What the worker does with a dump that is due.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DumpGate {
+    /// Not due: nothing to decide.
+    NotDue,
+    /// Write now.
+    Run,
+    /// Due but a flip is in hand (a pending slot, the programming gate up, a host flip owed or in
+    /// flight): about 120 registry writes between two flips cost one or more whole periods
+    /// (`FlipMaxUs` 16 to 31 ms at `HpdSite` 12, 15.18.16). Held back, and asked again at the next
+    /// wake.
+    Defer,
+}
+
+/// The inline dump's gate (the mirror thread takes the dump when it exists; this is the fallback
+/// of `MirrorThread` 0 and of a failed thread start). `due` is [`dump_due`], `flip_busy` that a
+/// flip is in the worker's hands (`flip_announce::worker_idle` false), `deferred_since_ms` the
+/// interrupt time (ms, never 0) the dump was first held back (0 = not held back), `now_ms` now.
+/// A busy worker holds the dump back, but never for longer than [`DUMP_MAX_DEFER_MS`]: a desktop
+/// that flips 240 times a second is never idle, and the dump is the diagnostic that says so.
+pub const fn dump_gate(due: bool, flip_busy: bool, deferred_since_ms: u32, now_ms: u32) -> DumpGate {
+    if !due {
+        return DumpGate::NotDue;
+    }
+    if !flip_busy {
+        return DumpGate::Run;
+    }
+    if deferred_since_ms != 0 && age_ms(now_ms, deferred_since_ms) >= DUMP_MAX_DEFER_MS {
+        return DumpGate::Run;
+    }
+    DumpGate::Defer
+}
+
+// ---- the registry mirror thread (15.18.16) --------------------------------------------------
+
+/// Least time between two mirror passes with changed-only writes (`MirChanged` 1: a pass is a few
+/// dozen writes), milliseconds.
+pub const MIRROR_REST_CHANGED_MS: u32 = 500;
+/// Least time between two passes that write every value (`MirChanged` 0, or a full refresh).
+pub const MIRROR_REST_FULL_MS: u32 = 1_000;
+/// Every value is written again at least this often even when unchanged, so a value deleted or
+/// edited by hand comes back.
+pub const MIRROR_FULL_REFRESH_MS: u32 = 30_000;
+/// `MirPrio` default: below the HPD worker's priority 8.
+pub const MIRROR_PRIO_DEFAULT: u32 = 6;
+/// `MirYield` default: rest after this many writes of one pass.
+pub const MIRROR_YIELD_DEFAULT: u32 = 32;
+
+/// The rest after a pass, milliseconds.
+pub const fn mirror_rest_ms(changed_only: bool) -> u32 {
+    if changed_only {
+        MIRROR_REST_CHANGED_MS
+    } else {
+        MIRROR_REST_FULL_MS
+    }
+}
+
+/// Whether the next pass must write every value: none has yet (`last_full_ms` 0), or the last was
+/// [`MIRROR_FULL_REFRESH_MS`] ago.
+pub const fn mirror_full_due(now_ms: u32, last_full_ms: u32) -> bool {
+    last_full_ms == 0 || age_ms(now_ms, last_full_ms) >= MIRROR_FULL_REFRESH_MS
+}
+
+/// `MirPrio`: 0 leaves the thread's priority alone, 1 to 15 are used as given (the dynamic range:
+/// a real-time priority is never taken from a registry value), anything else is the default.
+pub const fn clamp_mirror_prio(v: u32) -> u32 {
+    match v {
+        0 => 0,
+        1..=15 => v,
+        _ => MIRROR_PRIO_DEFAULT,
+    }
+}
+
+/// `MirYield`: 0 never rests, otherwise rest after this many writes, at most 1024.
+pub const fn clamp_mirror_yield(v: u32) -> u32 {
+    if v > 1024 {
+        1024
+    } else {
+        v
+    }
+}
+
 // ---- the vsync heartbeat -------------------------------------------------------------------
 
 /// A heartbeat that has not ticked for this many periods (and at least [`REVIVE_MIN_100NS`])
@@ -376,6 +461,59 @@ pub const fn idle_watch(
 mod tests {
     extern crate std;
     use super::*;
+
+    // ---- 15.18.16: the inline dump never runs between two flips -------------------------------
+
+    #[test]
+    fn the_inline_dump_waits_for_an_idle_worker() {
+        // not due: nothing to do, whatever else
+        assert_eq!(dump_gate(false, false, 0, 5), DumpGate::NotDue);
+        assert_eq!(dump_gate(false, true, 7, 5), DumpGate::NotDue);
+        // due and idle: write
+        assert_eq!(dump_gate(true, false, 0, 5), DumpGate::Run);
+        assert_eq!(dump_gate(true, false, 3, 5), DumpGate::Run);
+        // due and a flip in hand: held back
+        assert_eq!(dump_gate(true, true, 0, 5), DumpGate::Defer);
+        assert_eq!(dump_gate(true, true, 1_000, 1_000 + 9_999), DumpGate::Defer);
+        // ... but not for ever: a desktop that never idles still gets its dump
+        assert_eq!(dump_gate(true, true, 1_000, 1_000 + DUMP_MAX_DEFER_MS), DumpGate::Run);
+        assert_eq!(dump_gate(true, true, 1_000, 1_000 + 60_000), DumpGate::Run);
+        // the millisecond clock wraps
+        assert_eq!(dump_gate(true, true, u32::MAX - 5, 4), DumpGate::Defer);
+        assert_eq!(
+            dump_gate(true, true, u32::MAX - 5, DUMP_MAX_DEFER_MS),
+            DumpGate::Run
+        );
+    }
+
+    #[test]
+    fn the_mirror_rests_by_how_much_it_writes() {
+        assert_eq!(mirror_rest_ms(true), 500);
+        assert_eq!(mirror_rest_ms(false), 1000);
+        // a full refresh is due before the first pass and every 30 s
+        assert!(mirror_full_due(5, 0));
+        assert!(!mirror_full_due(1_000 + 29_999, 1_000));
+        assert!(mirror_full_due(1_000 + 30_000, 1_000));
+        assert!(mirror_full_due(3, u32::MAX - 29_996)); // wrapped clock: exactly 30 s later
+        assert!(!mirror_full_due(3, u32::MAX - 29_990));
+    }
+
+    #[test]
+    fn the_mirror_knobs_are_clamped() {
+        assert_eq!(clamp_mirror_prio(0), 0);
+        assert_eq!(clamp_mirror_prio(1), 1);
+        assert_eq!(clamp_mirror_prio(6), 6);
+        assert_eq!(clamp_mirror_prio(15), 15);
+        // never a real-time priority from a registry value
+        assert_eq!(clamp_mirror_prio(16), MIRROR_PRIO_DEFAULT);
+        assert_eq!(clamp_mirror_prio(31), MIRROR_PRIO_DEFAULT);
+        assert_eq!(clamp_mirror_prio(u32::MAX), MIRROR_PRIO_DEFAULT);
+        assert!(MIRROR_PRIO_DEFAULT < 8, "below the worker");
+        assert_eq!(clamp_mirror_yield(0), 0);
+        assert_eq!(clamp_mirror_yield(1), 1);
+        assert_eq!(clamp_mirror_yield(32), 32);
+        assert_eq!(clamp_mirror_yield(5000), 1024);
+    }
 
     // ---- v327: knobs default to the KMD 325 behaviour --------------------------------------
 
