@@ -14,6 +14,12 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+/// One cache line per counter. These counters are bumped on per-draw DDI
+/// paths (DrawIndexed, IASetVertexBuffers, ...); packed next to counters that
+/// other threads bump, every `fetch_add` was a cross-core cache-line transfer
+/// (~1 us per UpdateSubresource in a Heaven profile on 339.4, the single
+/// hottest instruction of the UMD).
+#[repr(align(64))]
 pub struct LogThrottle {
     count: AtomicUsize,
 }
