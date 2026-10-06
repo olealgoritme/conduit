@@ -152,12 +152,17 @@ check   "RELEASE names the buffer that was attached, not some other one" \
         "RELEASE .*w0=$REL_LO w1=$REL_HI" "$CASE_OUT"
 nocheck "RELEASE never names buffer 0 (which would translate to nothing)" \
         'RELEASE .*w0=0 w1=0' "$CASE_OUT"
+# CAP_RELEASE_SEQ: x is the seq of the newest ATTACH the release covers.
+check   "RELEASE carries the seq of the ATTACH it covers" \
+        "RELEASE .*x=1 y=0 w0=$REL_LO w1=$REL_HI" "$CASE_OUT"
 
 
 # A-18: geometry that does not fit the buffer.  REJECT, never clamp.
 run_case '' --present 320x240 --bad-size 4000
 check   "a buffer smaller than its claimed geometry is REJECTED" \
         'REJECTED \(the compositor would read out of bounds\)' "$CASE_LOG"
+check   "and released at once (CAP_RELEASE_SEQ: a release per ATTACH)" \
+        'RELEASE .*x=1 y=0' "$CASE_OUT"
 nocheck "and is not clamped into an attach"    'TEST attach' "$CASE_LOG"
 nocheck "a rejected frame does not kill the client" 'protocol violation' "$CASE_LOG"
 

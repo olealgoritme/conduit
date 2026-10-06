@@ -797,10 +797,42 @@ void nb_sink_frame(struct nb_sink *s)
     nb_emit(s, NVKVM_BROKER_EV_FRAME, 0, 0, 0, 0);
 }
 
-void nb_sink_release(struct nb_sink *s, uint64_t buf_id)
+void nb_sink_release(struct nb_sink *s, uint64_t buf_id, uint32_t seq)
 {
-    nb_emit(s, NVKVM_BROKER_EV_RELEASE, 0, 0,
+    nb_emit(s, NVKVM_BROKER_EV_RELEASE, (int32_t)seq, 0,
             (uint32_t)buf_id, (uint32_t)(buf_id >> 32));
+}
+
+/*
+ * NVKVM_BROKER_CAP_RELEASE_SEQ: an ATTACH that will never be shown (refused
+ * by validation or by the display) is released at once -- the client waits
+ * for a release per buffer, and none would ever come -- unless the display
+ * still reads an earlier commit of the same buffer, whose release then covers
+ * this one too.  `fd` names the buffer when validation never got as far as
+ * its inode.
+ */
+static void nb_release_dropped(struct nb_sink *s, int fd, uint64_t id,
+                               uint32_t seq)
+{
+    struct nb_session *ss = s->sess;
+
+    if (!(ss->caps & NVKVM_BROKER_CAP_RELEASE_SEQ)) {
+        return;
+    }
+    if (!id && fd >= 0) {
+        struct stat st;
+
+        if (fstat(fd, &st) == 0) {
+            id = (uint64_t)st.st_ino;
+        }
+    }
+    if (!id) {
+        return;
+    }
+    if (ss->ops->hold_release && ss->ops->hold_release(ss, id, seq)) {
+        return;
+    }
+    nb_sink_release(s, id, seq);
 }
 
 /* ── clipboard ───────────────────────────────────────────────────────────── */
@@ -1870,6 +1902,7 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             return;
         }
         if (nb_validate_desc(s, c, fd, &d, false) != 0) {
+            nb_release_dropped(s, fd, 0, c->seq);
             close(fd);
             s->n_reject++;
             /*
@@ -1886,6 +1919,7 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
                              * way our copy is done — HARDENING 5, fd intake
                              * is bounded at one in flight by construction */
         if (r != 0) {
+            nb_release_dropped(s, -1, d.id, d.seq);
             s->n_reject++;
             if (nb_reject_log(s)) {
                 nb_err("ATTACH: the display refused the buffer: %s",

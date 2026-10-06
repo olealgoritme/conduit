@@ -766,10 +766,14 @@ static void buf_release(void *data, struct wl_buffer *b)
      * what lets it recycle without guessing; it is advisory (nvkvm's guest
      * cycles its own bos regardless), which is why a missed release only costs
      * the client an optimisation.
+     *
+     * With NVKVM_BROKER_CAP_RELEASE_SEQ it is exact: `seq` is the newest
+     * ATTACH of this buffer, which this release covers (attach and commit
+     * happen back to back, so the newest ATTACH is the newest commit).
      */
     slot->held = false;
     if (slot->owner->sink) {
-        nb_sink_release(slot->owner->sink, slot->id);
+        nb_sink_release(slot->owner->sink, slot->id, slot->seq);
     }
 }
 static const struct wl_buffer_listener buf_listener = { .release = buf_release };
@@ -783,6 +787,49 @@ static void wl_buf_destroy(struct nb_wl *w, int i)
         wl_buffer_destroy(w->bufs[i].buf);
     }
     memset(&w->bufs[i], 0, sizeof(w->bufs[i]));
+}
+
+/*
+ * Evict a cache slot for a new import.  Destroyed while the compositor still
+ * held it, no wl_buffer.release will come for it any more.  A victim is never
+ * the buffer on the surface and prefers buffers already released, so the
+ * compositor is done with it at its next repaint: say so now rather than
+ * never (NVKVM_BROKER_CAP_RELEASE_SEQ promises a release per buffer).
+ */
+static void wl_buf_evict(struct nb_wl *w, int i)
+{
+    if (w->bufs[i].valid && w->bufs[i].held && w->sink) {
+        nb_sink_release(w->sink, w->bufs[i].id, w->bufs[i].seq);
+    }
+    wl_buf_destroy(w, i);
+}
+
+/* ops->hold_release: the compositor still reads an earlier commit of `id`,
+ * so its coming release covers the dropped ATTACH `seq` too. */
+static bool wl_hold_release(struct nb_session *s, uint64_t id, uint32_t seq)
+{
+    struct nb_wl *w = s->priv;
+    int i;
+
+    for (i = 0; i < NB_MAX_BUFS; i++) {
+        if (w->bufs[i].valid && w->bufs[i].held && w->bufs[i].id == id) {
+            w->bufs[i].seq = seq;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* An ATTACH this backend accepted but will not show (a probe): released at
+ * once unless an earlier commit of the buffer is still held. */
+static void wl_drop_attach(struct nb_session *s, const struct nb_buf_desc *d)
+{
+    if (!(s->caps & NVKVM_BROKER_CAP_RELEASE_SEQ) || !s->sink) {
+        return;
+    }
+    if (!wl_hold_release(s, d->id, d->seq)) {
+        nb_sink_release(s->sink, d->id, d->seq);
+    }
 }
 
 /* ── ops: format policy ──────────────────────────────────────────────────── */
@@ -894,6 +941,19 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
 
     w->tick++;
 
+    /* A staged buffer that was never committed is dropped by this ATTACH: it
+     * will not be shown, so it is released now unless the compositor still
+     * holds an earlier commit of it (then that release covers it). */
+    if (w->pending >= 0) {
+        struct nb_wl_buf *old = &w->bufs[w->pending];
+
+        w->pending = -1;
+        if (old->valid && !old->held && w->sink &&
+            (s->caps & NVKVM_BROKER_CAP_RELEASE_SEQ)) {
+            nb_sink_release(w->sink, old->id, old->seq);
+        }
+    }
+
     /* Already imported?  Same reasoning as the import cache in
      * nvkvm_present_egl.c: the guest cycles a handful of scanout bos, and the
      * dma-buf inode is their stable identity across dup(2) and SCM_RIGHTS. */
@@ -922,8 +982,10 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
             victim = i;
             break;
         }
-        if (w->bufs[i].used < oldest) {
-            oldest = w->bufs[i].used;
+        /* A buffer the compositor has released goes before one it still
+         * holds (whose release would be lost with its wl_buffer). */
+        if ((w->bufs[i].used | (w->bufs[i].held ? 1ull << 63 : 0)) < oldest) {
+            oldest = w->bufs[i].used | (w->bufs[i].held ? 1ull << 63 : 0);
             victim = i;
         }
     }
@@ -978,7 +1040,7 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
                        "compositor one upload per frame.");
             }
         }
-        wl_buf_destroy(w, victim);
+        wl_buf_evict(w, victim);
         w->bufs[victim] = (struct nb_wl_buf){
             .valid = true, .id = d->id, .buf = sb,
             .w = d->width, .h = d->height, .stride = d->stride,
@@ -1015,7 +1077,8 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
             return -EINVAL;         /* known-refused: reject, do not retry */
         }
         if (w->proven[ps].probing) {
-            return 0;               /* a probe is in flight; nothing to show */
+            wl_drop_attach(s, d);   /* a probe is in flight; nothing to show */
+            return 0;
         }
         /*
          * ONE PROBE AT A TIME.  probe_fourcc/probe_mod are a single slot --
@@ -1027,6 +1090,7 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
          * which is how a client reaches the ps < 0 case above.
          */
         if (w->probe_inflight) {
+            wl_drop_attach(s, d);
             return 0;
         }
         if (w->proven[ps].state == 0) {
@@ -1054,6 +1118,7 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
                    (const char *)&d->fourcc,
                    (unsigned long long)d->modifier);
             w->pending = -1;
+            wl_drop_attach(s, d);   /* the probe buffer is never shown */
             return 0;
         }
     }
@@ -1081,7 +1146,7 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
         return -EIO;
     }
 
-    wl_buf_destroy(w, victim);
+    wl_buf_evict(w, victim);
     w->bufs[victim] = (struct nb_wl_buf){
         .valid = true, .id = d->id, .buf = b,
         .w = d->width, .h = d->height, .stride = d->stride,
@@ -5758,7 +5823,7 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     s->width = (uint32_t)w->surf_w;
     s->height = (uint32_t)w->surf_h;
     s->caps = NVKVM_BROKER_CAP_FULLSCREEN | NVKVM_BROKER_CAP_DMABUF |
-              NVKVM_BROKER_CAP_RELEASE;
+              NVKVM_BROKER_CAP_RELEASE | NVKVM_BROKER_CAP_RELEASE_SEQ;
     if (w->seat) {
         s->caps |= NVKVM_BROKER_CAP_KEYBOARD | NVKVM_BROKER_CAP_ABS_POINTER |
                    NVKVM_BROKER_CAP_FOCUS_EVENTS;
@@ -5870,6 +5935,7 @@ static const struct nb_session_ops wl_ops = {
     .fetch_clipboard = wl_fetch_clipboard,
     .cursor = wl_cursor,
     .hotkey = wl_hotkey,
+    .hold_release = wl_hold_release,
 };
 
 struct nb_session *nb_session_wayland(const struct nb_config *cfg)
