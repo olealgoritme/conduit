@@ -324,6 +324,11 @@ int crm_win_scanout_wait_released(uint32_t handle, uint64_t seq, uint32_t timeou
  * records it when it starts and is lost once it differs. 0 off Windows. */
 int32_t crm_win_loss_epoch(void);
 
+/* One HELIOS_NVRM_OP_QUERY_CAPS escape on the open adapter: answered inside the
+ * KMD without touching virtio, so its cost is the bare D3DKMTEscape round trip
+ * (benchmarks). 0, -ENODEV before the first crm_open, -ENOSYS off Windows. */
+int crm_win_query_caps(void);
+
 /* The platform default transport (what crm_open(.., NULL) uses). */
 const struct crm_transport *crm_default_transport(void);
 

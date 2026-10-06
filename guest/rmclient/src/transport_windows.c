@@ -2221,6 +2221,18 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     return TRUE;
 }
 
+int crm_win_query_caps(void)
+{
+    struct win_ctx *c = &g_ctx;
+    if (!c->ready)
+        return -ENODEV;
+    HeliosNvrmQueryCaps caps;
+    memset(&caps, 0, sizeof(caps));
+    helios_nvrm_init(&caps.head, HELIOS_NVRM_OP_QUERY_CAPS, sizeof(caps));
+    const int r = nvrm_escape(c, &caps, sizeof(caps));
+    return r ? r : kmd_status_to_errno(caps.head.status);
+}
+
 const struct crm_transport *crm_windows_transport(void)
 {
     return &windows_transport;
@@ -2385,6 +2397,8 @@ int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id
         *host_errno = 0;
     return -ENOSYS;
 }
+
+int crm_win_query_caps(void) { return -ENOSYS; }
 
 #endif
 

@@ -13,7 +13,7 @@ O       ?= build-make
 SRCS := src/rmclient.c src/status.c src/transport_linux.c src/transport_windows.c
 OBJS := $(SRCS:src/%.c=$(O)/%.o)
 
-all: $(O)/librmclient.a $(O)/librmclient.so $(O)/test_unit $(O)/test_win_wire $(O)/crm_smoke $(O)/crm_event_smoke $(O)/crm_pin_smoke $(O)/crm_scanout_smoke $(O)/crm_share_smoke
+all: $(O)/librmclient.a $(O)/librmclient.so $(O)/test_unit $(O)/test_win_wire $(O)/crm_smoke $(O)/crm_event_smoke $(O)/crm_pin_smoke $(O)/crm_scanout_smoke $(O)/crm_share_smoke $(O)/crm_bench
 
 $(O):
 	mkdir -p $(O)
@@ -46,6 +46,9 @@ $(O)/crm_scanout_smoke: tests/crm_scanout_smoke.c $(O)/librmclient.a
 	$(CC) $(XCFLAGS) $< $(O)/librmclient.a $(XLDFLAGS) -o $@
 
 $(O)/crm_share_smoke: tests/crm_share_smoke.c $(O)/librmclient.a
+	$(CC) $(XCFLAGS) $< $(O)/librmclient.a $(XLDFLAGS) -o $@
+
+$(O)/crm_bench: tests/crm_bench.c $(O)/librmclient.a
 	$(CC) $(XCFLAGS) $< $(O)/librmclient.a $(XLDFLAGS) -o $@
 
 check: $(O)/test_unit $(O)/test_win_wire

@@ -79,3 +79,7 @@ executable('crm_semsurf_smoke', 'tests/crm_semsurf_smoke.c',
 executable('crm_share_smoke', 'tests/crm_share_smoke.c',
   include_directories : [inc, include_directories('src')],
   dependencies : rmclient_dep)
+# RM call latency (native /dev/nvidiactl vs. Conduit forwarding); needs a GPU.
+executable('crm_bench', 'tests/crm_bench.c',
+  include_directories : [inc, include_directories('src')],
+  dependencies : rmclient_dep)
