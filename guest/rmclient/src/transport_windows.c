@@ -40,6 +40,7 @@
 
 #if defined(_WIN32)
 
+#include <stddef.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1691,8 +1692,9 @@ int crm_win_foreign_caps(uint32_t *caps_flags)
     return 0;
 }
 
-int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id,
-                      uint32_t *host_errno)
+int crm_win_import_rm_planes(const struct crm_foreign_import *in,
+                             const struct crm_foreign_plane *plane1,
+                             uint32_t *resource_id, uint32_t *host_errno)
 {
     struct win_ctx *c = &g_ctx;
     *resource_id = 0;
@@ -1700,6 +1702,9 @@ int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id
         *host_errno = 0;
     if (!c->ready)
         return -ENODEV;
+    /* helios_foreign_import_rm_planes (protocol/include/helios_foreign.h); the
+     * first 104 bytes are helios_foreign_import_rm_layout, all a request without
+     * plane 1 sends. */
     struct {
         struct crm_foreign_head head;
         uint32_t ctx_id, rm_handle, gem_handle, flags;
@@ -1707,10 +1712,14 @@ int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id
         uint32_t out_resource_id, out_host_errno;
         uint32_t width, height, stride, offset, fourcc, reserved;
         uint64_t modifier;
+        uint64_t p1_modifier;
+        uint32_t p1_stride, p1_offset;
     } q;
-    _Static_assert(sizeof(q) == 104, "import rm + layout");
+    _Static_assert(sizeof(q) == 120, "import rm + layout + plane 1");
+    _Static_assert(offsetof(__typeof__(q), p1_modifier) == 104, "plane 1 tail");
+    const uint32_t bytes = plane1 != NULL ? 120u : 104u;
     memset(&q, 0, sizeof(q));
-    helios_hdr(&q.head.hdr, CRM_HELIOS_ESC_FOREIGN, sizeof(q));
+    helios_hdr(&q.head.hdr, CRM_HELIOS_ESC_FOREIGN, bytes);
     q.head.abi_version = 1;
     q.head.op = 2; /* IMPORT_RM */
     q.ctx_id = in->ctx_id;
@@ -1724,7 +1733,13 @@ int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id
     q.offset = in->offset;
     q.fourcc = in->fourcc;
     q.modifier = in->modifier;
-    int r = nvrm_escape(c, &q, sizeof(q));
+    if (plane1 != NULL) {
+        q.flags |= 2; /* PLANE1 */
+        q.p1_modifier = plane1->modifier;
+        q.p1_stride = plane1->stride;
+        q.p1_offset = plane1->offset;
+    }
+    int r = nvrm_escape(c, &q, bytes);
     if (r)
         return r;
     if (host_errno)
@@ -1736,6 +1751,12 @@ int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id
         return -EIO;
     *resource_id = q.out_resource_id;
     return 0;
+}
+
+int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id,
+                      uint32_t *host_errno)
+{
+    return crm_win_import_rm_planes(in, NULL, resource_id, host_errno);
 }
 
 /* FOREIGN_RESOURCE RM_RESOURCE_IMPORT (op 3, KMD 22.22.313+ with a host that
@@ -1946,6 +1967,17 @@ int crm_win_release_blob(uint32_t ctx_id, uint32_t resource_id)
 int crm_win_foreign_caps(uint32_t *caps_flags)
 {
     *caps_flags = 0;
+    return -ENOSYS;
+}
+
+int crm_win_import_rm_planes(const struct crm_foreign_import *in,
+                             const struct crm_foreign_plane *plane1,
+                             uint32_t *resource_id, uint32_t *host_errno)
+{
+    (void)in; (void)plane1;
+    *resource_id = 0;
+    if (host_errno)
+        *host_errno = 0;
     return -ENOSYS;
 }
 
