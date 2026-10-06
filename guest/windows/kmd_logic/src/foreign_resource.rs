@@ -289,6 +289,28 @@ pub const MOD_LINEAR: u64 = 0;
 /// `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c=0, s=1, g=2, k=0x06, h=0)`: the
 /// family NVK advertises, `base | h` with `h` the log2 block height in GOBs.
 pub const MOD_NVIDIA_BLOCK_LINEAR_BASE: u64 = 0x0300_0000_0060_6010;
+/// The GB20x family for 1-byte elements: `BASE` with the sector-layout field (bit 22 and
+/// bits 26..27) naming the Blackwell 8-bit GOB. Copy of `helios_protocol::MOD_NVIDIA_BL_GB20X_8BPP`,
+/// pinned by `kmd_render`.
+pub const MOD_NVIDIA_BLOCK_LINEAR_BASE_8BPP: u64 = 0x0300_0000_0420_6010;
+/// The same for 2-byte elements (the Blackwell 16-bit GOB). Copy of
+/// `helios_protocol::MOD_NVIDIA_BL_GB20X_16BPP`, pinned by `kmd_render`.
+pub const MOD_NVIDIA_BLOCK_LINEAR_BASE_16BPP: u64 = 0x0300_0000_0460_6010;
+
+/// The block-linear family a plane whose elements are `element_bytes` wide must use:
+/// 1 byte [`MOD_NVIDIA_BLOCK_LINEAR_BASE_8BPP`], 2 bytes
+/// [`MOD_NVIDIA_BLOCK_LINEAR_BASE_16BPP`], anything else (4 and 8 bytes, YUYV's 4)
+/// [`MOD_NVIDIA_BLOCK_LINEAR_BASE`]. Copy of `helios_protocol::gb20x_family`, pinned by
+/// `kmd_render`. `element_bytes` is [`ShareFormat::bpp0`] for plane 0 and
+/// [`ShareFormat::bpp1`] for plane 1.
+pub const fn gb20x_family(element_bytes: u32) -> u64 {
+    match element_bytes {
+        1 => MOD_NVIDIA_BLOCK_LINEAR_BASE_8BPP,
+        2 => MOD_NVIDIA_BLOCK_LINEAR_BASE_16BPP,
+        _ => MOD_NVIDIA_BLOCK_LINEAR_BASE,
+    }
+}
+
 /// Largest accepted `h` (32 GOBs = 256 rows per block).
 pub const MAX_BLOCK_HEIGHT_LOG2: u32 = 5;
 /// Rows in one GOB.
@@ -308,8 +330,8 @@ pub struct Plane {
     /// Plane 1 offset in bytes from the start of the object; at or past the end
     /// of plane 0 ([`Layout::validate`]).
     pub offset: u32,
-    /// `DRM_FORMAT_MOD_*` of plane 1: LINEAR iff plane 0 is, else the same
-    /// block-linear family (its `h` may differ).
+    /// `DRM_FORMAT_MOD_*` of plane 1: LINEAR iff plane 0 is, else
+    /// `gb20x_family(bpp1) | h` (its `h`, and its family, may differ from plane 0's).
     pub modifier: u64,
 }
 
@@ -325,7 +347,8 @@ pub struct Layout {
     /// Plane 0 offset in bytes from the start of the object.
     pub offset: u32,
     pub fourcc: u32,
-    /// `DRM_FORMAT_MOD_*`: [`MOD_LINEAR`] or `MOD_NVIDIA_BLOCK_LINEAR_BASE | h`.
+    /// `DRM_FORMAT_MOD_*`: [`MOD_LINEAR`] or `gb20x_family(bpp0) | h`, `h <= 5` (for the four
+    /// 32 bpp formats that is `MOD_NVIDIA_BLOCK_LINEAR_BASE | h`).
     pub modifier: u64,
     /// Plane 1 of a two-plane format; `Some` iff the format has two planes.
     pub plane1: Option<Plane>,
@@ -341,7 +364,8 @@ pub enum LayoutError {
     /// A plane's stride under its row bytes, off its alignment, or over
     /// [`MAX_STRIDE`].
     Stride,
-    /// Not LINEAR and not `MOD_NVIDIA_BLOCK_LINEAR_BASE | h`, `h <= 5`; or plane 1
+    /// A plane's modifier is not LINEAR and not `gb20x_family(element bytes of that plane) | h`
+    /// with `h <= 5` (another family's modifier is refused, whatever its `h`); or plane 1
     /// LINEAR with plane 0 block-linear (or the other way round).
     Modifier,
     /// The layout needs more bytes than the resource has, or plane 1 starts
@@ -351,25 +375,45 @@ pub enum LayoutError {
     Planes,
 }
 
-/// `h` of an NVIDIA block-linear modifier, or `None` for LINEAR and for a
-/// modifier outside the accepted family.
-const fn block_log2(modifier: u64) -> Option<u32> {
-    if modifier >= MOD_NVIDIA_BLOCK_LINEAR_BASE
-        && modifier <= MOD_NVIDIA_BLOCK_LINEAR_BASE + MAX_BLOCK_HEIGHT_LOG2 as u64
-    {
-        Some((modifier - MOD_NVIDIA_BLOCK_LINEAR_BASE) as u32)
+/// `h` of `modifier` if it is `family | h` with `h <= MAX_BLOCK_HEIGHT_LOG2`, else `None`.
+const fn family_log2(modifier: u64, family: u64) -> Option<u32> {
+    if modifier >= family && modifier <= family + MAX_BLOCK_HEIGHT_LOG2 as u64 {
+        Some((modifier - family) as u32)
     } else {
         None
     }
 }
 
-/// A modifier a plane may carry: LINEAR or the block-linear family.
-const fn modifier_ok(modifier: u64) -> bool {
-    modifier == MOD_LINEAR || block_log2(modifier).is_some()
+/// `h` of a block-linear modifier of ANY of the three GB20x families
+/// ([`MOD_NVIDIA_BLOCK_LINEAR_BASE`] and its 8BPP and 16BPP variants), or `None` for LINEAR
+/// and for anything else. Which family a plane may carry is [`plane_modifier_ok`]'s rule; the
+/// block height is the same function of `h` in all three (see [`plane_min_bytes`]).
+const fn block_log2(modifier: u64) -> Option<u32> {
+    if let Some(h) = family_log2(modifier, MOD_NVIDIA_BLOCK_LINEAR_BASE) {
+        return Some(h);
+    }
+    if let Some(h) = family_log2(modifier, MOD_NVIDIA_BLOCK_LINEAR_BASE_8BPP) {
+        return Some(h);
+    }
+    family_log2(modifier, MOD_NVIDIA_BLOCK_LINEAR_BASE_16BPP)
+}
+
+/// A modifier a plane whose elements are `element_bytes` wide may carry: LINEAR, or the one
+/// block-linear family [`gb20x_family`] names for that element size, with `h <= 5`. Every
+/// other value, another family's included, is refused.
+const fn plane_modifier_ok(modifier: u64, element_bytes: u32) -> bool {
+    modifier == MOD_LINEAR || family_log2(modifier, gb20x_family(element_bytes)).is_some()
 }
 
 /// `offset + stride * rows`, `rows` rounded up to the plane's block when it is
-/// block-linear. Saturating, so even an unvalidated layout (a `u32::MAX` stride
+/// block-linear. The block is `GOB_ROWS << h` whatever the family: the GB20x 8-bit and 16-bit
+/// GOBs differ from the desktop GOB in the sector layout (the order of the sectors inside the
+/// GOB), which the modifier names in bits 22 and 26..27; they are the same 64 byte x 8 row
+/// GOB, so the row count a block spans, and with it this lower bound, does not depend on the
+/// family. That is an assumption (no hardware measurement here); a family whose GOB were
+/// taller would only make this bound too LOW, never too high, and the host's check of the
+/// image against the object (`image size <= resource size`) stays the backstop.
+/// Saturating, so even an unvalidated layout (a `u32::MAX` stride
 /// and height) yields a large bound and never wraps.
 const fn plane_min_bytes(offset: u32, stride: u32, rows: u64, modifier: u64) -> u64 {
     let rows = match block_log2(modifier) {
@@ -406,7 +450,7 @@ impl Layout {
         {
             return Err(LayoutError::Stride);
         }
-        if !modifier_ok(self.modifier) {
+        if !plane_modifier_ok(self.modifier, f.bpp0) {
             return Err(LayoutError::Modifier);
         }
         if let Some(p) = self.plane1 {
@@ -416,8 +460,9 @@ impl Layout {
             {
                 return Err(LayoutError::Stride);
             }
-            // LINEAR planes stay LINEAR together; block-linear ones may differ in `h`.
-            if !modifier_ok(p.modifier)
+            // LINEAR planes stay LINEAR together; block-linear ones may differ in `h` and in
+            // family (each plane's family follows its own element size: NV12 is 8BPP + 16BPP).
+            if !plane_modifier_ok(p.modifier, f.bpp1)
                 || (p.modifier == MOD_LINEAR) != (self.modifier == MOD_LINEAR)
             {
                 return Err(LayoutError::Modifier);
@@ -742,6 +787,12 @@ pub struct Counters {
     /// geometry, stride, modifier or size (`FgRefNewG`). Included in
     /// [`Counters::refused_request`].
     pub refused_new_geometry: u32,
+    /// Requests refused for a modifier that is neither LINEAR nor `gb20x_family(plane
+    /// element bytes) | h`, `h <= 5`, or for mixing a LINEAR plane with a block-linear one
+    /// (`FgRefMod`, [`LayoutError::Modifier`]). Any format, the 32-bit four included.
+    /// Included in [`Counters::refused_request`]; for a format beyond the 32-bit four also
+    /// included in [`Counters::refused_new_geometry`].
+    pub refused_modifier: u32,
     /// Adoptions of a two-plane record refused for want of the 144-byte private data
     /// (`FgAdoNoPln`, [`AdoptRefusal::NoPlaneRoom`]). Included in
     /// [`Counters::refused_adopt`].
@@ -1493,7 +1544,13 @@ impl ForeignTable {
             RequestError::Flags if layout.is_some_and(|l| l.plane1.is_some()) => {
                 c.refused_planes = c.refused_planes.saturating_add(1);
             }
-            RequestError::Layout(_) => {
+            RequestError::Layout(why) => {
+                // A modifier that is not LINEAR or the plane's own GB20x family (any format,
+                // the four 32-bit ones included). Also counted below when the format is one
+                // of the shared ones: `FgRefMod` is a subset of `FgRefNewG` there.
+                if why == LayoutError::Modifier {
+                    c.refused_modifier = c.refused_modifier.saturating_add(1);
+                }
                 // A known shared format beyond the 32-bit four whose geometry was refused.
                 if layout.is_some_and(|l| share_format(l.fourcc).is_some() && !l.is_rgb32()) {
                     c.refused_new_geometry = c.refused_new_geometry.saturating_add(1);
@@ -2821,10 +2878,11 @@ mod shared_format_tests {
     /// `l` with plane 1 given block-linear moduli `h0`/`h1`, offset kept past plane 0.
     fn two_bl(fourcc: u32, w: u32, h: u32, h0: u64, h1: u64) -> Layout {
         let mut l = two(fourcc, w, h);
-        l.modifier = BL | h0;
+        let (_, _, bpp) = *TWO_PLANE.iter().find(|t| t.0 == fourcc).unwrap();
+        l.modifier = gb20x_family(bpp) | h0;
         let off = l.plane0_min_bytes();
         let p = l.plane1.as_mut().unwrap();
-        p.modifier = BL | h1;
+        p.modifier = gb20x_family(bpp * 2) | h1;
         p.offset = off as u32;
         l
     }
@@ -3169,9 +3227,10 @@ mod shared_format_tests {
             for &(w, h) in &[(64u32, 1080u32), (128, 1), (130, 257), (128, 8), (128, 256)] {
                 let w = if hdiv == 2 { w & !1 } else { w };
                 let row = row0(bpp, hdiv, w);
+                let fam = gb20x_family(bpp);
                 for hh in 0..=5u64 {
                     let l = Layout {
-                        modifier: BL | hh,
+                        modifier: fam | hh,
                         ..one(f, w, h, row)
                     };
                     assert_eq!(l.validate(), Ok(()), "{name} h{hh}");
@@ -3183,7 +3242,14 @@ mod shared_format_tests {
                     assert_eq!(l.validate_for(want - 1), Err(LayoutError::TooLarge));
                 }
                 // h = 6 and the neighbours of the family are refused.
-                for m in [BL | 6, BL - 1, BL + 6, 1, 0x0100_0000_0000_0001, u64::MAX] {
+                for m in [
+                    fam | 6,
+                    fam - 1,
+                    fam + 6,
+                    1,
+                    0x0100_0000_0000_0001,
+                    u64::MAX,
+                ] {
                     assert_eq!(
                         Layout {
                             modifier: m,
@@ -3222,7 +3288,7 @@ mod shared_format_tests {
         }
         for hh in 0..=5u64 {
             let bl = Layout {
-                modifier: BL | hh,
+                modifier: MOD_NVIDIA_BLOCK_LINEAR_BASE_8BPP | hh,
                 ..lin
             };
             let rows = rup(1080, 8 << hh);
@@ -3435,7 +3501,7 @@ mod shared_format_tests {
 
     #[test]
     fn plane_modifiers_linear_together_and_h_may_differ() {
-        for (f, name, _) in TWO_PLANE {
+        for (f, name, bpp) in TWO_PLANE {
             // Every h0 / h1 pair of the family is valid, plane 1 placed past plane 0.
             for h0 in 0..=5u64 {
                 for h1 in 0..=5u64 {
@@ -3455,7 +3521,7 @@ mod shared_format_tests {
             }
             // Mixed LINEAR / block-linear, both ways, is refused.
             let mut lin0 = two(f, 1920, 1080);
-            lin0.plane1.as_mut().unwrap().modifier = BL | 2;
+            lin0.plane1.as_mut().unwrap().modifier = gb20x_family(bpp * 2) | 2;
             assert_eq!(
                 lin0.validate(),
                 Err(LayoutError::Modifier),
@@ -3469,10 +3535,13 @@ mod shared_format_tests {
                 "{name} bl0/lin1"
             );
             // Plane 1's modifier is held to the family like plane 0's.
-            for m in [BL | 6, BL - 1, 1, 0x0100_0000_0000_0001, u64::MAX] {
+            let (fam0, fam1) = (gb20x_family(bpp), gb20x_family(bpp * 2));
+            for m in [fam1 | 6, fam1 - 1, 1, 0x0100_0000_0000_0001, u64::MAX] {
                 let mut l = two_bl(f, 1920, 1080, 2, 2);
                 l.plane1.as_mut().unwrap().modifier = m;
                 assert_eq!(l.validate(), Err(LayoutError::Modifier), "{name} p1 {m:#x}");
+            }
+            for m in [fam0 | 6, fam0 - 1, 1, 0x0100_0000_0000_0001, u64::MAX] {
                 let mut l = two(f, 1920, 1080);
                 l.modifier = m;
                 l.plane1.as_mut().unwrap().modifier = m;
@@ -3665,7 +3734,7 @@ mod shared_format_tests {
             .map(|t| t.0)
             .chain(TWO_PLANE.iter().map(|t| t.0))
         {
-            for modifier in [MOD_LINEAR, BL, BL | 5, u64::MAX] {
+            for modifier in [MOD_LINEAR, BL, BL | 5, B8 | 5, B16 | 5, u64::MAX] {
                 for stride in [0, 1, 3, MAX_STRIDE, MAX_STRIDE + 1, u32::MAX] {
                     for offset in [0, 1, u32::MAX] {
                         for plane1 in [
@@ -3767,6 +3836,403 @@ mod shared_format_tests {
         );
     }
 
+    // ---- the GB20x block-linear families (docs/shared-formats.md section 5) -----------
+
+    const B8: u64 = MOD_NVIDIA_BLOCK_LINEAR_BASE_8BPP;
+    const B16: u64 = MOD_NVIDIA_BLOCK_LINEAR_BASE_16BPP;
+    const FAMILIES: [u64; 3] = [BL, B8, B16];
+
+    /// The family each plane of each format must carry, written out by hand (not derived
+    /// from `gb20x_family` or from the table): (fourcc, plane 0 family, plane 1 family or 0).
+    const FAMILY_OF: [(u32, u64, u64); 18] = [
+        (FOURCC_XRGB8888, BL, 0),
+        (FOURCC_ARGB8888, BL, 0),
+        (FOURCC_XBGR8888, BL, 0),
+        (FOURCC_ABGR8888, BL, 0),
+        (FOURCC_R8, B8, 0),
+        (FOURCC_GR88, B16, 0),
+        (FOURCC_R16, B16, 0),
+        (FOURCC_GR1616, BL, 0),
+        (FOURCC_RGB565, B16, 0),
+        (FOURCC_ARGB1555, B16, 0),
+        (FOURCC_ARGB4444, B16, 0),
+        (FOURCC_ABGR2101010, BL, 0),
+        (FOURCC_ABGR16161616F, BL, 0),
+        (FOURCC_ABGR16161616, BL, 0),
+        (FOURCC_YUYV, BL, 0),
+        (FOURCC_NV12, B8, B16),
+        (FOURCC_P010, B16, BL),
+        (FOURCC_P016, B16, BL),
+    ];
+
+    /// Every modifier worth offering a plane: LINEAR, each family with every `h` in 0..=7,
+    /// and the values around and far from them.
+    fn modifier_candidates() -> Vec<u64> {
+        let mut v = std::vec![MOD_LINEAR, 1, 0x10, 0x0100_0000_0000_0001, u64::MAX];
+        for f in FAMILIES {
+            for h in 0..=7u64 {
+                v.push(f | h);
+            }
+            v.extend([
+                f - 1,
+                f + 0x10,
+                f | 0xf,
+                f ^ 1 << 63,
+                f ^ 1 << 22,
+                f ^ 3 << 26,
+            ]);
+        }
+        // The sector-layout bits of the three families, mixed the two other ways.
+        v.push(BL | 1 << 22);
+        v.push(BL | 3 << 26);
+        v.push(B8 | 3 << 26);
+        v.push(B16 & !(1 << 22));
+        v
+    }
+
+    /// Whether `m` is acceptable for a plane whose family is `fam`: LINEAR, or `fam | h`,
+    /// `h <= 5`. Spelled out without any of the production helpers.
+    fn plane_accepts(m: u64, fam: u64) -> bool {
+        m == 0 || (0..=5u64).any(|h| m == (fam | h))
+    }
+
+    #[test]
+    fn the_three_families_and_the_element_size_rule() {
+        assert_eq!(BL, 0x0300_0000_0060_6010);
+        assert_eq!(B8, 0x0300_0000_0420_6010);
+        assert_eq!(B16, 0x0300_0000_0460_6010);
+        // They differ only in the sector-layout field: bit 22 and bits 26..27.
+        let sector = |m: u64| ((m >> 22) & 1) | (((m >> 26) & 3) << 1);
+        assert_eq!((sector(BL), sector(B8), sector(B16)), (1, 2, 3));
+        let rest = !((1u64 << 22) | (3u64 << 26));
+        assert_eq!(BL & rest, B8 & rest);
+        assert_eq!(BL & rest, B16 & rest);
+        // `h` lives in the low nibble, clear of every family bit.
+        for f in FAMILIES {
+            assert_eq!(f & 0xf, 0);
+        }
+        assert_eq!(gb20x_family(1), B8);
+        assert_eq!(gb20x_family(2), B16);
+        for bytes in [0, 3, 4, 5, 8, 16, u32::MAX] {
+            assert_eq!(gb20x_family(bytes), BL, "{bytes}");
+        }
+        // The table's element sizes give the hand-written families.
+        for (fourcc, f0, f1) in FAMILY_OF {
+            let f = share_format(fourcc).unwrap();
+            assert_eq!(gb20x_family(f.bpp0), f0, "{fourcc:#x} plane 0");
+            if f.planes == 2 {
+                assert_eq!(gb20x_family(f.bpp1), f1, "{fourcc:#x} plane 1");
+            } else {
+                assert_eq!(f1, 0, "{fourcc:#x} has no plane 1");
+            }
+        }
+        assert_eq!(
+            FAMILY_OF.len(),
+            ONE_PLANE.len() + TWO_PLANE.len(),
+            "every format of the table is listed"
+        );
+        // Every `h` of every family reads back.
+        for f in FAMILIES {
+            for h in 0..=5u64 {
+                let l = Layout {
+                    modifier: f | h,
+                    ..one(FOURCC_R8, 64, 64, 64)
+                };
+                assert_eq!(l.block_height_log2(), Some(h as u32));
+            }
+            for h in 6..=7u64 {
+                let l = Layout {
+                    modifier: f | h,
+                    ..one(FOURCC_R8, 64, 64, 64)
+                };
+                assert_eq!(l.block_height_log2(), None);
+            }
+        }
+        assert_eq!(one(FOURCC_R8, 64, 64, 64).block_height_log2(), None);
+    }
+
+    /// Every format x every modifier candidate on plane 0 (x every candidate on plane 1 for
+    /// the two-plane formats): accepted exactly when each plane's modifier is LINEAR or its
+    /// own family with `h <= 5`, and LINEAR together; refused as `Modifier` otherwise, and
+    /// never anything else (the layouts are otherwise valid).
+    #[test]
+    fn only_the_matching_family_is_accepted_per_plane() {
+        let cands = modifier_candidates();
+        let mut accepted = 0u32;
+        let mut checked = 0u32;
+        for (fourcc, f0, f1) in FAMILY_OF {
+            let fmt = share_format(fourcc).unwrap();
+            let (w, h) = (64u32, 64u32);
+            let base = if fmt.planes == 2 {
+                two(fourcc, w, h)
+            } else {
+                let (_, _, bpp, hdiv) = *ONE_PLANE.iter().find(|t| t.0 == fourcc).unwrap();
+                one(fourcc, w, h, row0(bpp, hdiv, w))
+            };
+            for &m0 in &cands {
+                let ok0 = plane_accepts(m0, f0);
+                if fmt.planes == 1 {
+                    let l = Layout {
+                        modifier: m0,
+                        ..base
+                    };
+                    let want = if ok0 {
+                        Ok(())
+                    } else {
+                        Err(LayoutError::Modifier)
+                    };
+                    assert_eq!(l.validate(), want, "{fourcc:#x} {m0:#x}");
+                    assert_eq!(l.validate_for(u64::MAX), want, "{fourcc:#x} {m0:#x}");
+                    if ok0 {
+                        let size = rup(l.min_bytes(), PAGE);
+                        assert_eq!(validate_request(1, 2, 3, FLAG_LAYOUT, size, Some(l)), Ok(l));
+                        accepted += 1;
+                    } else {
+                        assert_eq!(
+                            validate_request(1, 2, 3, FLAG_LAYOUT, 1 << 30, Some(l)),
+                            Err(RequestError::Layout(LayoutError::Modifier)),
+                            "{fourcc:#x} {m0:#x}"
+                        );
+                    }
+                    checked += 1;
+                    continue;
+                }
+                for &m1 in &cands {
+                    let mut l = Layout {
+                        modifier: m0,
+                        ..base
+                    };
+                    let off = l.plane0_min_bytes();
+                    let p = l.plane1.as_mut().unwrap();
+                    p.modifier = m1;
+                    p.offset = off as u32;
+                    let ok1 = plane_accepts(m1, f1);
+                    let together = (m0 == 0) == (m1 == 0);
+                    let good = ok0 && ok1 && together;
+                    let want = if good {
+                        Ok(())
+                    } else {
+                        Err(LayoutError::Modifier)
+                    };
+                    assert_eq!(l.validate(), want, "{fourcc:#x} {m0:#x} / {m1:#x}");
+                    if good {
+                        let size = rup(l.min_bytes(), PAGE);
+                        assert_eq!(
+                            validate_request(1, 2, 3, FLAG_LAYOUT | FLAG_PLANE1, size, Some(l)),
+                            Ok(l)
+                        );
+                        accepted += 1;
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        // 32 candidates... the exact count is not the point; the sweep ran and accepted some.
+        assert!(checked > 5_000, "{checked}");
+        assert!(accepted > 100, "{accepted}");
+    }
+
+    /// The explicit cases the NVK owner listed.
+    #[test]
+    fn the_named_formats_take_the_named_families() {
+        let ok = |l: Layout| assert_eq!(l.validate(), Ok(()), "{l:?}");
+        let bad = |l: Layout| assert_eq!(l.validate(), Err(LayoutError::Modifier), "{l:?}");
+        // NV12: plane 0 8BPP, plane 1 16BPP, h free per plane.
+        let mk = |fourcc, m0, m1| {
+            let mut l = two(fourcc, 1920, 1080);
+            l.modifier = m0;
+            let off = l.plane0_min_bytes();
+            let p = l.plane1.as_mut().unwrap();
+            p.modifier = m1;
+            p.offset = off as u32;
+            l
+        };
+        ok(mk(FOURCC_NV12, B8 | 4, B16 | 3));
+        ok(mk(FOURCC_NV12, B8, B16 | 5));
+        bad(mk(FOURCC_NV12, BL | 4, B16 | 3));
+        bad(mk(FOURCC_NV12, B8 | 4, BL | 3));
+        bad(mk(FOURCC_NV12, B16 | 4, B8 | 3));
+        bad(mk(FOURCC_NV12, B8 | 4, B8 | 3));
+        bad(mk(FOURCC_NV12, B16 | 4, B16 | 3));
+        bad(mk(FOURCC_NV12, B8 | 6, B16 | 3));
+        bad(mk(FOURCC_NV12, B8 | 4, B16 | 6));
+        // P010 / P016: plane 0 16BPP, plane 1 BASE.
+        for f in [FOURCC_P010, FOURCC_P016] {
+            ok(mk(f, B16 | 4, BL | 3));
+            bad(mk(f, BL | 4, BL | 3));
+            bad(mk(f, B16 | 4, B16 | 3));
+            bad(mk(f, B8 | 4, BL | 3));
+            bad(mk(f, B16 | 4, B8 | 3));
+        }
+        // LINEAR with LINEAR stays fine, and LINEAR never mixes with a family.
+        ok(mk(FOURCC_NV12, 0, 0));
+        bad(mk(FOURCC_NV12, 0, B16 | 1));
+        bad(mk(FOURCC_NV12, B8 | 1, 0));
+        // One-plane formats.
+        let r8 = |m| Layout {
+            modifier: m,
+            ..one(FOURCC_R8, 1920, 1080, 1920)
+        };
+        ok(r8(B8 | 5));
+        bad(r8(BL | 5));
+        bad(r8(B16 | 5));
+        for f in [
+            FOURCC_GR88,
+            FOURCC_R16,
+            FOURCC_RGB565,
+            FOURCC_ARGB1555,
+            FOURCC_ARGB4444,
+        ] {
+            let l = |m| Layout {
+                modifier: m,
+                ..one(f, 1920, 1080, 3840)
+            };
+            ok(l(B16 | 2));
+            bad(l(BL | 2));
+            bad(l(B8 | 2));
+        }
+        // 4 and 8 byte elements, YUYV included, keep BASE only.
+        for (f, stride) in [
+            (FOURCC_GR1616, 7680),
+            (FOURCC_ABGR2101010, 7680),
+            (FOURCC_ABGR16161616F, 15360),
+            (FOURCC_ABGR16161616, 15360),
+            (FOURCC_YUYV, 3840),
+            (FOURCC_XRGB8888, 7680),
+            (FOURCC_ABGR8888, 7680),
+        ] {
+            let l = |m| Layout {
+                modifier: m,
+                ..one(f, 1920, 1080, stride)
+            };
+            ok(l(BL | 2));
+            bad(l(B8 | 2));
+            bad(l(B16 | 2));
+        }
+    }
+
+    /// The block height of the size bound is `8 << h` in every family: the same layout
+    /// geometry gives the same bound whichever family carries the `h` (the assumption in
+    /// `plane_min_bytes`: the sector layout reorders bytes inside a GOB, it does not change
+    /// the rows a block spans).
+    #[test]
+    fn the_size_bound_uses_h_whatever_the_family() {
+        for hh in 0..=5u64 {
+            let want = 1920 * rup(1080, 8 << hh);
+            for f in FAMILIES {
+                let l = Layout {
+                    modifier: f | hh,
+                    ..one(FOURCC_R8, 1920, 1080, 1920)
+                };
+                assert_eq!(l.plane0_min_bytes(), want, "{f:#x} h{hh}");
+                assert_eq!(l.min_bytes(), want);
+            }
+        }
+        // And per plane of NV12 with the families it really has.
+        for h0 in 0..=5u64 {
+            for h1 in 0..=5u64 {
+                let l = two_bl(FOURCC_NV12, 1920, 1080, h0, h1);
+                assert_eq!(l.modifier, B8 | h0);
+                assert_eq!(l.plane1.unwrap().modifier, B16 | h1);
+                assert_eq!(l.validate(), Ok(()));
+                let p0 = 1920 * rup(1080, 8 << h0);
+                assert_eq!(l.plane0_min_bytes(), p0);
+                assert_eq!(
+                    l.plane1_min_bytes(),
+                    Some(p0 + 1920 * rup(540, 8 << h1)),
+                    "{h0}/{h1}"
+                );
+            }
+        }
+    }
+
+    /// The 32 bpp consumers (scanout, flip, copy, blit, level 5) only ever see records the
+    /// table validated, so a 32 bpp record carries `BASE | h` or LINEAR: a layout naming the
+    /// 8BPP / 16BPP family on a 32 bpp format never becomes a record.
+    #[test]
+    fn a_32_bpp_layout_with_another_family_is_refused_at_the_request() {
+        for (f, name, _, _) in &ONE_PLANE[..4] {
+            for fam in [B8, B16] {
+                for h in 0..=7u64 {
+                    let l = Layout {
+                        modifier: fam | h,
+                        ..one(*f, 1920, 1080, 7680)
+                    };
+                    assert_eq!(
+                        validate_request(1, 2, 3, FLAG_LAYOUT, 16 * MIB, Some(l)),
+                        Err(RequestError::Layout(LayoutError::Modifier)),
+                        "{name} {fam:#x} h{h}"
+                    );
+                }
+            }
+            for h in 0..=5u64 {
+                let l = Layout {
+                    modifier: BL | h,
+                    ..one(*f, 1920, 1080, 7680)
+                };
+                assert_eq!(
+                    validate_request(1, 2, 3, FLAG_LAYOUT, 16 * MIB, Some(l)),
+                    Ok(l),
+                    "{name} h{h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn modifier_refusals_are_counted_as_fgrefmod() {
+        let mut t = table();
+        let refuse = |t: &mut ForeignTable, l: Layout, flags: u32| {
+            let e = validate_request(1, 2, 3, flags, 64 * MIB, Some(l)).unwrap_err();
+            t.note_request_refusal(e, Some(&l));
+            e
+        };
+        // A 32 bpp record with the 16BPP family: a modifier refusal, not "new geometry".
+        refuse(
+            &mut t,
+            Layout {
+                modifier: B16 | 1,
+                ..lay1()
+            },
+            FLAG_LAYOUT,
+        );
+        let c = t.counters();
+        assert_eq!((c.refused_modifier, c.refused_new_geometry), (1, 0));
+        assert_eq!(c.refused_request, 1);
+        // R8 with the BASE family: both a modifier refusal and a new-format geometry one.
+        refuse(
+            &mut t,
+            Layout {
+                modifier: BL,
+                ..one(FOURCC_R8, 64, 64, 64)
+            },
+            FLAG_LAYOUT,
+        );
+        // NV12 plane 1 in the wrong family.
+        let mut nv = two(FOURCC_NV12, 64, 64);
+        nv.modifier = B8;
+        nv.plane1.as_mut().unwrap().modifier = B8;
+        refuse(&mut t, nv, FLAG_LAYOUT | FLAG_PLANE1);
+        let c = t.counters();
+        assert_eq!((c.refused_modifier, c.refused_new_geometry), (3, 2));
+        assert_eq!(c.refused_request, 3);
+        // Other refusals do not move it: a bad stride, an odd extent, an unknown fourcc.
+        refuse(
+            &mut t,
+            Layout {
+                stride: 3,
+                modifier: BL,
+                ..lay1()
+            },
+            FLAG_LAYOUT,
+        );
+        refuse(&mut t, one(0, 64, 64, 64), FLAG_LAYOUT);
+        let c = t.counters();
+        assert_eq!(c.refused_modifier, 3);
+        assert_eq!(c.refused_request, 5);
+        assert_eq!(c.refused(), 5, "a subset counter does not add to the total");
+    }
+
     // ---- the 32 bpp behaviour is unchanged -------------------------------------------
 
     /// The validation of `foreign_resource` before the shared formats, verbatim (only the
@@ -3861,6 +4327,14 @@ mod shared_format_tests {
             1,
             0x0100_0000_0000_0001,
             u64::MAX,
+            // The GB20x 8BPP / 16BPP families: the old rules never knew them, so a 32 bpp
+            // layout carrying one is refused exactly as any other unknown modifier was.
+            MOD_NVIDIA_BLOCK_LINEAR_BASE_8BPP,
+            MOD_NVIDIA_BLOCK_LINEAR_BASE_8BPP | 1,
+            MOD_NVIDIA_BLOCK_LINEAR_BASE_8BPP | 5,
+            MOD_NVIDIA_BLOCK_LINEAR_BASE_16BPP,
+            MOD_NVIDIA_BLOCK_LINEAR_BASE_16BPP | 2,
+            MOD_NVIDIA_BLOCK_LINEAR_BASE_16BPP | 5,
         ];
         let fourccs = [
             FOURCC_XRGB8888,
@@ -4141,7 +4615,7 @@ mod shared_format_tests {
             FLAG_LAYOUT,
             8 * MIB,
             Some(Layout {
-                modifier: BL | 6,
+                modifier: MOD_NVIDIA_BLOCK_LINEAR_BASE_16BPP | 6,
                 ..one(FOURCC_R16, 64, 64, 128)
             }),
         );
@@ -4164,6 +4638,8 @@ mod shared_format_tests {
         assert_eq!(c.refused_format, 1);
         assert_eq!(c.refused_planes, 2);
         assert_eq!(c.refused_new_geometry, 4);
+        // The R16 request with h = 6 is the one modifier refusal.
+        assert_eq!(c.refused_modifier, 1);
         // All of them are requests refused, and `refused` still sums once.
         assert_eq!(c.refused(), 11);
     }
@@ -4267,24 +4743,32 @@ pub(crate) mod test_formats {
     ];
 
     /// A valid record of `fourcc` (tightly packed; plane 1 right after plane 0 for the
-    /// two-plane formats) with plane 0 carrying `modifier` (plane 1 the same `h`).
+    /// two-plane formats). `modifier` is [`MOD_LINEAR`] (both planes) or
+    /// `MOD_NVIDIA_BLOCK_LINEAR_BASE | h`, which names the block height `h` only: each plane
+    /// gets the family its element size requires ([`gb20x_family`]) with that `h`.
     pub(crate) fn valid_layout(fourcc: u32, w: u32, h: u32, modifier: u64) -> Layout {
         let f = share_format(fourcc).unwrap();
         let stride = f.row_bytes(0, w) as u32;
+        let (m0, m1) = if modifier == MOD_LINEAR {
+            (MOD_LINEAR, MOD_LINEAR)
+        } else {
+            let bh = modifier - MOD_NVIDIA_BLOCK_LINEAR_BASE;
+            (gb20x_family(f.bpp0) | bh, gb20x_family(f.bpp1) | bh)
+        };
         let mut l = Layout {
             width: w,
             height: h,
             stride,
             offset: 0,
             fourcc,
-            modifier,
+            modifier: m0,
             plane1: None,
         };
         if f.planes == 2 {
             l.plane1 = Some(Plane {
                 stride: f.row_bytes(1, w) as u32,
                 offset: l.plane0_min_bytes() as u32,
-                modifier,
+                modifier: m1,
             });
         }
         assert_eq!(l.validate(), Ok(()), "fixture {fourcc:#x} {w}x{h}");

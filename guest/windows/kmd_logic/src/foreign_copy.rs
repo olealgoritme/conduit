@@ -321,7 +321,10 @@ pub const fn ladder_start_tier(want_scanout_exts: bool, want_modifier: bool) -> 
 mod tests {
     extern crate std;
     use super::*;
-    use crate::foreign_resource::{MOD_LINEAR, MOD_NVIDIA_BLOCK_LINEAR_BASE};
+    use crate::foreign_resource::{
+        MOD_LINEAR, MOD_NVIDIA_BLOCK_LINEAR_BASE, MOD_NVIDIA_BLOCK_LINEAR_BASE_16BPP,
+        MOD_NVIDIA_BLOCK_LINEAR_BASE_8BPP,
+    };
     use crate::{encode_image_create, encode_memory_allocate, Writer, MAX_CMD_BYTES};
     use std::vec::Vec;
 
@@ -422,6 +425,12 @@ mod tests {
             1u64,
             MOD_NVIDIA_BLOCK_LINEAR_BASE - 1,
             MOD_NVIDIA_BLOCK_LINEAR_BASE + 6,
+            // The GB20x 8BPP / 16BPP families belong to 1 and 2 byte elements: a 32 bpp
+            // image never carries them.
+            MOD_NVIDIA_BLOCK_LINEAR_BASE_8BPP,
+            MOD_NVIDIA_BLOCK_LINEAR_BASE_8BPP | 5,
+            MOD_NVIDIA_BLOCK_LINEAR_BASE_16BPP,
+            MOD_NVIDIA_BLOCK_LINEAR_BASE_16BPP | 5,
             // Intel X-tiling, and "invalid".
             0x0100_0000_0000_0001,
             0x00ff_ffff_ffff_ffff,
@@ -878,7 +887,7 @@ mod shared_format_refusals {
                     plane_offset: 0,
                 };
                 let tr = OpenTrailer {
-                    modifier: m,
+                    modifier: l.modifier,
                     fourcc: f,
                     stride: l.stride,
                     plane_offset: 0,
