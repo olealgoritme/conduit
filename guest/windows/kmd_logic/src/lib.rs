@@ -34,6 +34,7 @@ pub mod rm_client;
 pub mod rm_present;
 pub mod producer_completion;
 pub mod execution_completion;
+pub mod flush_gate;
 pub mod rm_fence_present;
 pub mod msi;
 pub mod paging;
