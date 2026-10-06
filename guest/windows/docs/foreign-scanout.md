@@ -350,6 +350,9 @@ Suppression cannot outlive the lapse by construction: `suppress_desktop(now)` is
 it with the current time. A source nobody polled therefore stops suppressing at its deadline
 whatever the worker is doing. What a stuck worker cannot do is run the restore (a worker task),
 and the state stays `Active` until something polls it, so the counters keep counting it live.
+The watchdog's counters (`FsLapse`, `FsDpcLps`, `FsEndBy`, `FsEndT`) cannot be written to the registry at DISPATCH, so
+the tick sets a publish-due flag and the next PASSIVE caller mirrors the block: the HPD worker's service pass,
+or the escape thread's stuck-only publish (`stall_diag::publish_from_escape`) while the worker looks stuck.
 The DISPATCH watchdog closes that second half: the vsync tick (free running, independent of the
 worker and of every mutex the worker waits on) checks one atomic (`FS_WATCH_AT`, the live user
 source's deadline plus 250 ms; 0 with no source, so a load per tick by default), and past it ends

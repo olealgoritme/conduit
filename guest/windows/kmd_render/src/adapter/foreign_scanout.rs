@@ -150,6 +150,21 @@ static FS_END_BY: AtomicU32 = AtomicU32::new(0);
 static FS_END_GEN: AtomicU32 = AtomicU32::new(0);
 static FS_END_AT_100NS: AtomicU64 = AtomicU64::new(0);
 
+/// Set (atomics only, DISPATCH) by the watchdog tick when it ended a source: the counters it
+/// moved (`FsLapse`, `FsDpcLps`, `FsEndBy`, `FsEndT`, ...) are mirrored to the registry by the
+/// next PASSIVE caller of [`publish_if_due`] (the HPD worker's service pass, or the escape
+/// thread's stuck-only publish), because the tick itself may not write the registry.
+static FS_PUBLISH_DUE: AtomicU32 = AtomicU32::new(0);
+
+/// Publish the foreign scanout block if the DISPATCH watchdog asked for it. One atomic load
+/// when it did not. PASSIVE.
+pub(crate) fn publish_if_due() {
+    if FS_PUBLISH_DUE.load(Ordering::Relaxed) != 0 && FS_PUBLISH_DUE.swap(0, Ordering::AcqRel) != 0
+    {
+        publish_counters();
+    }
+}
+
 /// Remember how the last user source ended. Atomics only: legal at any IRQL.
 fn note_end(cause: EndCause) {
     FS_END_GEN.store(FS_CUR_GEN.swap(0, Ordering::Relaxed), Ordering::Relaxed);
@@ -587,6 +602,8 @@ impl AdapterContext {
 
     /// HPD worker, once per wake: expire a source whose owner went silent. PASSIVE.
     pub(crate) fn foreign_scanout_service(&self) {
+        // The watchdog's counters, if the vsync tick ended a source since the last pass.
+        publish_if_due();
         let now = now_100ns();
         let polled = STATE.lock().poll(now);
         if let Poll::Lapsed { .. } = polled {
@@ -630,6 +647,9 @@ impl AdapterContext {
             FS_LAPSES.fetch_add(1, Ordering::Relaxed);
             FS_DPC_LAPSES.fetch_add(1, Ordering::Relaxed);
             note_end(EndCause::LapseWatchdog);
+            // The registry mirror is a PASSIVE job; ask for it. The restore request below
+            // signals the worker, whose service pass publishes.
+            FS_PUBLISH_DUE.store(1, Ordering::Release);
             self.foreign_scanout_restore_desktop();
         }
     }
