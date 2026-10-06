@@ -66,6 +66,12 @@
 #define HELIOS_DRM_FORMAT_NV12 0x3231564Eu
 #define HELIOS_DRM_FORMAT_P010 0x30313050u
 #define HELIOS_DRM_FORMAT_P016 0x36313050u
+/* GB20x block-linear families (| h): the GOB follows the element size, named in
+ * the modifier's sector-layout field. 4/8-byte elements 0x0300000000606010,
+ * 1-byte elements (R8, NV12 plane 0) and 2-byte elements (GR88, R16, 16 bpp
+ * RGB, NV12 plane 1, P010/P016 plane 0) these two: */
+#define HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X_8BPP 0x0300000004206010u
+#define HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X_16BPP 0x0300000004606010u
 
 /* RM_RESOURCE_IMPORT.out_flags: out_modifier is known. */
 #define HELIOS_FOREIGN_RM_RESOURCE_IMPORT_MODIFIER (1u << 0)
