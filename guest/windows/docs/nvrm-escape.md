@@ -120,8 +120,11 @@ Everything else is a header status. `HELIOS_NVRM_ST_*` as this build produces th
 `VirtioGpu::nvrm_epoch()`, i.e. the transport instance's `wire_fence_base`: it changes at
 every StartDevice, and reads **0 when there is no transport**. A client that sees its
 remembered epoch change must reopen: every handle, mapping, pin and event of the earlier
-transport is gone. librmclient reads the epoch at init and does not re-check it
-(section 10.2).
+transport is gone. A status of `TRANSPORT_RESET` (or `STATUS_DEVICE_NOT_READY` from the event
+ops, which is what "no transport" looks like to them) says the same. librmclient on branch
+`rmc/transport-loss` (commit `2995935`) reads the epoch of every reply, and `0` means no
+transport (section 9); on `feat/nvk-rm-windows-transport` alone it still reads the epoch only
+at init.
 
 ## 4. The operations
 
@@ -232,7 +235,9 @@ first and always; then the host `Munmap` is sent (5 s) and its failure is report
 `TIMEOUT` / `DEVICE_ERROR` after the view is already gone. For host id 0 nothing is sent
 (RM releases the mapping through `NV_ESC_RM_UNMAP_MEMORY`).
 
-A mapping lives until `MUNMAP`, `Close` of its handle, device destroy, or transport loss.
+A mapping lives until `MUNMAP`, `Close` of its handle, device destroy, or transport loss
+(for the view, "transport loss" means the owner's next NVRM escape after a `StopDevice`:
+section 6).
 
 ### 4.4 PIN / UNPIN (ops 7, 8)
 
@@ -266,6 +271,7 @@ makes it *used* ("committed": the GPU may now hold the pages). Then:
 | a *successful* plain-Ioctl `NV_ESC_RM_FREE` (low 16 bits of `cmd == 0x4629`, `data_len == 16`, flat `NVOS00`) whose `hRoot`/`hObjectOld` match | every used pin of the caller with that `h_root` and `h_object == hObjectOld` is released; if `hObjectOld == hRoot` (client free) every used pin with that `h_root` is released. "Successful" = host status 0 **and** the `NVOS00.status` word (reply data + 12) 0 |
 | successful `Close` of the pin's `handle` | released (after the host has torn the objects down) |
 | process exit / device destroy | released (last step of teardown) |
+| transport dropped (`StopDevice`) | released after the device reset, whether or not the owner's device was destroyed first |
 
 `h_root` / `h_object` are the caller's word: the KMD does not verify them against the
 registration. They only decide *when* the KMD unlocks. A caller that mis-tags can have its
@@ -423,7 +429,7 @@ All `MAX_*` values are read from the code. "Per process" really means per device
 | `MAX_NVRM_EVENTS_PER_OWNER` | 129 | same (`MAX_NVRM_HANDLES_PER_OWNER + 1`) | one `READY` per handle plus one `TRANSPORT_LOST` |
 | `EVENT_QUEUE_SIZE` / `EVENT_BUF_BYTES` | 16 / 256 | same | event virtqueue (kept small on purpose: the by-value queue slot sits on the boot stack under `VirtioGpu::init`, gated by `tools/kmd-frame-sizes.ps1`) |
 | `OTHER_KICK_LIMIT` | 1024 | same | non-`EventReady` messages after which reposts stop kicking |
-| mapping id range | `1 .. 0x7FFFFFF0` | `nvrm_tables.rs` | KMD-minted; the table key is `id | 0x80000000` in `AdapterContext::mappings` |
+| mapping id range | `1 .. 0x7FFFFFF0` | `virtio/nvrm.rs::mint_map_id`, `kmd_logic/nvrm_views.rs` | KMD-minted from ONE counter for the life of the driver (never restarted by a new transport, never reused); the table key is `id | 0x80000000` in `AdapterContext::mappings` |
 | `HELIOS_NVRM_SCANOUT_FLIP_BYTES` / `MSG_HEADER_BYTES` | 64 / 16 | protocol | |
 | `DEVICE_TYPE_DRI_FIRST` | 512 | `virtio/nvrm.rs` | first DRM-node `device_type` (`512 + minor`); 255 control, GPU minors, 256 UVM, 257 UVM tools |
 
@@ -471,11 +477,45 @@ after the device's user mappings were drained in the owning process:
 
 **Transport loss / reset.** When the transport fails, every event registration is signalled
 (section 4.5); handles, mappings and pins stay in the tables until their owners close or
-exit. When the transport object is dropped (StopDevice), registrations are signalled once
-more and released at PASSIVE, and the device is reset first. A new transport starts with
-empty tables and a new `epoch`. `StopDevice` itself does **not** call `close_all_for_owner`
-and `VirtioGpu::drop` does not unlock pins: pin/handle/mapping release relies on dxgkrnl
-having destroyed every device first (**UNVERIFIED**, section 10.2).
+exit (`close_all_for_owner` then sends nothing to a transport that has already failed, but
+still clears the tables and unlocks the pins).
+
+When the transport object is dropped (`StopDevice`, `set_virtio(None)`) the device is reset
+first, and then `VirtioGpu::drop` releases what the owners did not, without sending anything
+(there is no host to send to):
+
+1. event registrations are signalled once more and dereferenced (PASSIVE);
+2. every pin is unlocked (`NvrmPin`'s `Drop` is the unlock, so a pin cannot leave the tables
+   any other way than unlocked): the MDLs are user MDLs that are never mapped, and
+   `MmUnlockPages` on such an MDL does not need the owning process (the same helper,
+   `helios_unlock_system_buffer`, already runs from `close_all_for_owner` in whatever
+   context the destroy arrives in). User pages left locked would bugcheck the owning process
+   at exit (0x76);
+3. the handle and host-mapping records are dropped; `NvSwept` counts the entries 1-3 found
+   (0 when dxgkrnl destroyed every device first).
+
+That is idempotent against `DestroyDevice` -> `close_all_for_owner`: both take entries out of
+the same tables under the virtio lock, so whichever runs first releases them and the other
+finds nothing (after the drop `with_virtio` fails and the per-device path does nothing).
+
+**User views of a stopped transport.** The views made by `MMAP` live in
+`AdapterContext::mappings`, which deliberately outlives the transport (as blob views do): a
+user view can only be unmapped inside the process that made it, and `StopDevice` is not that
+process. After the drop they point at BAR memory the host no longer backs for them, and the
+next transport may hand the same window offsets to another process. So `StopDevice` marks
+them stale (`MappingTable::mark_nvrm_views_stale`, `NvStale`, taken AFTER the drop so no older
+id can still be minted), and the owner's NEXT `HELIOS_ESCAPE_NVRM` call of any op unmaps its
+own stale views first, in its own process (`nvrm::reclaim_stale_views`, `NvStaleUn`): a process
+that touches one afterwards takes an access violation instead of reading someone else's
+memory. A process that never calls again keeps them until its `DestroyDevice` drain, which
+takes every view regardless of the transport, as it always did. A `MUNMAP` of such an id
+answers `NOT_OWNED` (the escape-entry sweep already removed the view). Because the views
+outlive the transport, mapping ids come from one driver-wide counter, so a new transport can
+never mint an id an old view still holds. Residual: an `MMAP` that is between its own table
+push and its view insert while `StopDevice` runs can leave one view unmarked until
+`DestroyDevice`.
+
+A new transport starts with empty tables and a new `epoch`.
 
 ## 7. Counters (registry)
 
@@ -518,6 +558,9 @@ change a shape counter) before reading, or compare after the process has exited.
 | `NvFenceSig` | `EventReady`s for fence handles (one per fire), including the early ones | at most `NvFence` |
 | `NvFenceEarly` | fires that arrived before their handle was recorded and were latched at record time (also counted in `NvFenceSig` and `NvEvLatch`) | small; nonzero only when the semaphore was already reached |
 | `NvFenceErr` | a create the host answered with status 0 whose reply could not be recorded (short or bad reply, duplicate handle), or a notification lost to a full early table | **0** |
+| `NvSwept` | handles, mappings and pins still tracked when a transport was dropped (`StopDevice`), cumulative | **0** when dxgkrnl destroys every device first; nonzero means the sweep did the owners' work |
+| `NvStale` | user views of a dropped transport that `StopDevice` marked stale, cumulative | usually 0 |
+| `NvStaleUn` | of those, how many owners' next NVRM escape unmapped | follows `NvStale`; the rest is reclaimed by `DestroyDevice` |
 | `NvWinMb`, `NvAptMb` | size in MiB of shared-memory region 1 (RM window) and 2 (UVM aperture), written at init | nonzero, or `MMAP` answers `UNSUPPORTED` |
 
 `Fg*` counters belong to the foreign-resource verb (`zero-copy-present.md`), not this
@@ -581,7 +624,23 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
 - Maps CPU memory with Linux's channel-per-mapping protocol, the final map being `MMAP`;
   the channel is kept until `NV_ESC_RM_UNMAP_MEMORY`.
 - `event_wait` creates a manual-reset event per channel, `EVENT_REGISTER(READY)`, waits,
-  `ResetEvent`s, and the caller drains. It never registers `TRANSPORT_LOST`.
+  `ResetEvent`s, and the caller drains. On `feat/nvk-rm-windows-transport` it never
+  registers `TRANSPORT_LOST`; on `rmc/transport-loss` (`2995935`) it does, see the next item.
+- Transport loss (`rmc/transport-loss`): init refuses a KMD that reports `epoch == 0` (no
+  transport; retried by the next `crm_open`) and registers ONE process-wide `TRANSPORT_LOST`
+  event (handle 0, when `QUERY_CAPS` offers the op and the kind). `event_wait` waits on the
+  channel event and that event with `WaitForMultipleObjects`; a loss ends it with `-ENODEV`,
+  even an infinite wait. The KMD wakes every registration on a loss, so the loss is
+  re-checked after a channel wake. Every escape reply is judged too: `TRANSPORT_RESET`, an
+  `epoch` other than the init one (including 0), or `STATUS_DEVICE_NOT_READY` /
+  `STATUS_DEVICE_REMOVED` latches the loss for the life of the process, and every call then
+  answers `-ENODEV` without a round trip, except `MUNMAP`, `UNPIN` and `EVENT_UNREGISTER`,
+  which still go to the KMD (an escape from the owner is how the KMD reclaims the CPU views
+  a stopped transport left, section 6). The rules are pure inline helpers in
+  `helios_nvrm_escape.h`, tested by `tests/test_win_wire.c`; the wait itself has only been
+  cross-compiled. A failed-but-not-replaced transport keeps its epoch and answers
+  `DEVICE_ERROR` (-> `EIO`) to forwards: only the `TRANSPORT_LOST` event (or a `TRANSPORT_RESET`
+  from `EVENT_REGISTER`) reveals it, so a KMD without events gives no loss detection there.
 - KMD statuses become errno: NOT_OWNED -> `EBADF`, MSG_TYPE_REFUSED/FORBIDDEN -> `EPERM`,
   TRANSPORT_RESET -> `ENODEV`, NO_RESOURCES -> `EMFILE`, UNSUPPORTED -> `ENOSYS`,
   TIMEOUT -> `ETIMEDOUT`, BAD_RANGE -> `EINVAL`, anything else -> `EIO`; escape NTSTATUS
@@ -605,9 +664,10 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
   registration reply itself.
 - **A committed pin cannot be released by the user** (`PIN_IN_USE`); a process that registers
   and never frees keeps the pages locked until Close/exit.
-- **`TRANSPORT_LOST` is implemented in the KMD but not delivered to transports**: librmclient's
-  Windows transport registers only `READY`, so a thread blocked in `event_wait` with an
-  infinite timeout is not woken by a transport failure, and the epoch is never re-read.
+- **`TRANSPORT_LOST` reaches librmclient only on `rmc/transport-loss`** (`2995935`, not merged
+  into `feat/nvk-rm-windows-transport` here): the earlier Windows transport registers only
+  `READY`, so a thread blocked in `event_wait` with an infinite timeout is not woken by a
+  transport failure and the epoch is never re-read (section 9 describes the fix).
 - **`IMPORT_RM`** (`HELIOS_ESCAPE_FOREIGN_RESOURCE`, verb 0x0018, a different verb) is gated
   off: `RM_IMPORT_SERVED = false` in `virtio/foreign.rs`, `CAP_RM_IMPORT` not advertised,
   answers `ST_UNSUPPORTED` before touching state. The host half and the NVK/UMD half do not
@@ -626,9 +686,14 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
 - That any of this runs as described on the current KMD in a Windows guest: it was read,
   not executed. The transport README's pass reports predate the event/flip work and the
   v307 event queue fixes.
-- That `StopDevice` is always preceded by `DestroyDevice` for every device, which the
-  release of handles, mappings and pins depends on (section 6): `dxgkddi_stop_device` does
-  not sweep NVRM state and `VirtioGpu::drop` does not unlock pins.
+- Whether `StopDevice` is always preceded by `DestroyDevice` for every device. It no longer
+  matters for correctness: the transport's drop unlocks pins and clears the tables, and the
+  views are reclaimed by their owners (section 6). `NvSwept` / `NvStale` on a real stop will
+  say which order dxgkrnl uses.
+- That `MmUnlockPages` of a never-mapped user MDL from a foreign process context (the
+  `StopDevice` thread) is accepted by the memory manager. It is the documented behaviour of
+  that routine (the MDL records the locking process) and the same helper is already relied on
+  from `DestroyDevice`, but it was not run.
 - That, when a process crashes, `DestroyDevice` runs in a context where unmapping the user
   views is valid; the code comments assume the creating process.
 - That `D3DKMTEscape` from a non-console SSH session works for the smoke programs.
@@ -666,7 +731,7 @@ touched.
   fence base and changes at StartDevice only (0 with no transport).
 - Commit `0185243` says only the UVM aperture is mappable; the code also maps the RM window.
 - `transport_windows.c` header comment and the transport-branch README say events and PIN
-  answer `-ENOSYS`; both are implemented in that file.
+  answer `-ENOSYS`; both are implemented in that file (corrected on `rmc/transport-loss`).
 
 ## 11. How to add an op: checklist
 

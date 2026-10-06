@@ -2319,9 +2319,9 @@ pub struct VirtioGpu {
     /// `Munmap`. Reserved to MAX_NVRM_MAPS at init. The user view itself is in
     /// `AdapterContext::mappings`, under the key `nvrm::map_key(mapping_id)`.
     nvrm_maps: Vec<nvrm_tables::NvrmMapSlot>,
-    /// The next KMD-assigned mapping id (starts at 1; the host's own ids are not
-    /// unique, the RM path answers 0 for all of them).
-    nvrm_next_map: u32,
+    // (Mapping ids are minted by `virtio::nvrm::mint_map_id`, one counter for the
+    // life of the driver: the host's own ids are not unique, the RM path answers
+    // 0 for all of them, and the views outlive this transport.)
     /// User pages locked for OS-descriptor registrations, with the page-run table
     /// each carries. Reserved to MAX_NVRM_PINS at init. Pins hold PASSIVE-only
     /// resources: they are only ever removed by value and released outside the lock.
@@ -2886,7 +2886,6 @@ impl VirtioGpu {
             nvrm_reserved: 0,
             nvrm_fences: nvrm_tables::new_fence_book(),
             nvrm_maps: Vec::with_capacity(MAX_NVRM_MAPS),
-            nvrm_next_map: 1,
             nvrm_pins: Vec::with_capacity(MAX_NVRM_PINS),
             nvrm_next_pin: 1,
             nvrm_window,
@@ -7966,6 +7965,12 @@ impl Drop for VirtioGpu {
         // waiters (a process blocked on one must give up and see the loss), then
         // drop the references. PASSIVE, outside the device lock.
         self.teardown_nvrm_events();
+        // Pins, handle and mapping records the owners did not release before the
+        // transport went (StopDevice ahead of their DestroyDevice): the device was
+        // reset above, so the host holds no alias of a pinned page and the pages
+        // may be unlocked (user pages left locked bugcheck their process at exit).
+        // Nothing is sent to the host: there is no host to send to.
+        self.teardown_nvrm_state();
 
         // The reset above quiesced the device before the in-flight/parked entry
         // buffers free with this struct.

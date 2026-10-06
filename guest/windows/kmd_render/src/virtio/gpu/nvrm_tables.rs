@@ -38,9 +38,11 @@ pub const MAX_NVRM_PINS_PER_OWNER: usize = 256;
 /// within `page_runs::INDIRECT_MAX_RUNS`, whatever the scatter.
 pub const MAX_NVRM_PIN_PAGES: usize = 262_143;
 
-/// KMD-assigned mapping ids stay below this: above it live the fixed ids other
-/// mapping kinds use in the shared user-mapping table (`mapping.rs`).
-const NVRM_MAP_ID_LIMIT: u32 = 0x7FFF_FFF0;
+extern "C" {
+    /// `MmUnlockPages` + `IoFreeMdl` (`src/seh_shim.c`); callable from any process
+    /// context for a user MDL that was never mapped (the pins never are).
+    fn helios_unlock_system_buffer(mdl: wdk_sys::PMDL);
+}
 
 /// One tracked handle.
 pub(super) struct NvrmHandleSlot {
@@ -71,6 +73,14 @@ pub(super) struct NvrmMapSlot {
 
 /// One pin: user pages locked for an OS-descriptor registration, and the
 /// page-run table that names them to the host.
+///
+/// Dropping a pin UNLOCKS its pages, at PASSIVE: the lock is released exactly
+/// once, by whatever path ends up owning the value last. That is what makes a
+/// transport torn down with pins still in its table (`StopDevice` before the
+/// owners' `DestroyDevice`) release them instead of leaving user pages locked,
+/// which would bugcheck the owning process at exit (0x76
+/// `PROCESS_HAS_LOCKED_PAGES`). Nothing here may drop one under the virtio lock:
+/// the `take_*` methods hand it back by value.
 pub struct NvrmPin {
     owner: DeviceOwner,
     handle: u32,
@@ -130,6 +140,18 @@ pub enum FenceCommit {
     Recorded { fired: bool },
     /// The number is already a live handle: nothing was recorded.
     Duplicate,
+}
+
+impl Drop for NvrmPin {
+    fn drop(&mut self) {
+        // SAFETY: `mdl` is the locked MDL `helios_lock_user_pages_seh` returned,
+        // owned by this pin alone (no other table or copy holds it) and released
+        // exactly once, here. PASSIVE by this type's contract; the user MDL has
+        // no system mapping, so no process context is required. The contiguous
+        // table buffer (`big`) is freed by the field drop that follows.
+        unsafe { helios_unlock_system_buffer(self.mdl as wdk_sys::PMDL) };
+        crate::virtio::nvrm::NVRM_UNPINS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// What `take_nvrm_unused_pin` found.
@@ -337,11 +359,10 @@ impl VirtioGpu {
         if self.nvrm_maps.len() >= MAX_NVRM_MAPS || mine >= MAX_NVRM_MAPS_PER_OWNER {
             return None;
         }
-        let kmd_id = self.nvrm_next_map;
-        if kmd_id == 0 || kmd_id >= NVRM_MAP_ID_LIMIT {
-            return None;
-        }
-        self.nvrm_next_map = kmd_id + 1;
+        // Driver-wide counter, not per transport: the view this id names outlives
+        // the transport (see `helios_kmd_logic::nvrm_views`). Minted last, after
+        // every refusal above, so a refusal costs no id.
+        let kmd_id = crate::virtio::nvrm::mint_map_id()?;
         self.nvrm_maps.push(NvrmMapSlot {
             owner,
             handle,
@@ -505,5 +526,41 @@ impl VirtioGpu {
     pub fn take_nvrm_pin_for_owner(&mut self, owner: DeviceOwner) -> Option<NvrmPin> {
         let idx = self.nvrm_pins.iter().position(|p| p.owner == owner)?;
         Some(self.nvrm_pins.swap_remove(idx))
+    }
+
+    // ---- transport teardown -------------------------------------------------------
+
+    /// The transport is being dropped (`StopDevice`, or a failed start): whatever
+    /// its owners left tracked dies with it. Called from `Drop`, PASSIVE, outside
+    /// the virtio lock, AFTER the device was reset: the host holds no alias of a
+    /// pinned page any more, so the pages are unlocked, and the host's handles and
+    /// mappings are gone with it, so their records are dropped WITHOUT any message
+    /// to the (dead) transport.
+    ///
+    /// Idempotent against the per-device `close_all_for_owner`: both take entries
+    /// out of these same tables, so whichever runs first releases them and the
+    /// other finds nothing (once the transport is gone `with_virtio` fails and the
+    /// per-device path is a no-op).
+    ///
+    /// The user VIEWS of the mappings are not here: they live in
+    /// `AdapterContext::mappings` and can only be unmapped in their owning process
+    /// (see `MappingTable::mark_nvrm_views_stale`). Event registrations are
+    /// released by `teardown_nvrm_events`. Returns how many entries were still tracked.
+    pub(super) fn teardown_nvrm_state(&mut self) -> u32 {
+        let mut swept = 0u32;
+        // Pins: popped one at a time and dropped (= unlocked) here, not under any lock.
+        while let Some(pin) = self.nvrm_pins.pop() {
+            swept = swept.saturating_add(1);
+            drop(pin);
+        }
+        swept = swept
+            .saturating_add(self.nvrm_maps.len() as u32)
+            .saturating_add(self.nvrm_handles.len() as u32);
+        // Plain data: nothing in them needs PASSIVE.
+        self.nvrm_maps.clear();
+        self.nvrm_handles.clear();
+        self.nvrm_reserved = 0;
+        crate::virtio::nvrm::NVRM_SWEPT.fetch_add(swept, Ordering::Relaxed);
+        swept
     }
 }

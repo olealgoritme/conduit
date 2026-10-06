@@ -262,6 +262,21 @@ pub(crate) fn publish_nvrm_counters() {
         b"NvFenceErr",
         crate::virtio::nvrm::NVRM_FENCE_ERRORS.load(Ordering::Relaxed),
     );
+    // Teardown of a dropped transport: entries it still tracked (`NvSwept`, 0 when
+    // every device was destroyed first), user views it left behind (`NvStale`) and
+    // how many of those their owners have unmapped since (`NvStaleUn`).
+    crate::diag::record_named_bytes(
+        b"NvSwept",
+        crate::virtio::nvrm::NVRM_SWEPT.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvStale",
+        crate::virtio::nvrm::NVRM_STALE_VIEWS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvStaleUn",
+        crate::virtio::nvrm::NVRM_STALE_UNMAPPED.load(Ordering::Relaxed),
+    );
 }
 
 /// Mirror the scheduler private-data handoff evidence at PASSIVE_LEVEL.

@@ -96,6 +96,13 @@ pub struct MappingTable {
     /// `FixedVec` has no growth path, so nothing here can allocate under the
     /// spinlock.
     entries: crate::sync::SpinLock<crate::sync::FixedVec<Mapping>>,
+    /// NVRM views with an id below this were made by a transport that is gone
+    /// (see [`Self::mark_nvrm_views_stale`]). 0 = none was ever marked. Only
+    /// written under the `entries` lock.
+    stale_below: AtomicU32,
+    /// How many stale NVRM views the table held at the last mark or sweep: the
+    /// lock-free "is there anything to reclaim" answer for the escape hot path.
+    stale_count: AtomicU32,
 }
 
 impl MappingTable {
@@ -104,6 +111,8 @@ impl MappingTable {
     pub fn new() -> Self {
         Self {
             entries: crate::sync::SpinLock::new(crate::sync::FixedVec::with_max(MAX_MAPPINGS)),
+            stale_below: AtomicU32::new(0),
+            stale_count: AtomicU32::new(0),
         }
     }
 
@@ -222,6 +231,62 @@ impl MappingTable {
                 i += 1;
             }
         }
+        n
+    }
+
+    /// The transport that made every NVRM view with an id below `below` is gone
+    /// (`StopDevice`, after the transport was dropped). Marks them stale and
+    /// returns how many the table holds. They cannot be unmapped here: a user
+    /// view is unmapped inside the process that made it, and `StopDevice` is not
+    /// that process. Each owner's next NVRM call reclaims its own
+    /// ([`Self::drain_stale_nvrm_for`]); `DestroyDevice`'s drain takes whatever
+    /// is left, as it takes every other view.
+    pub fn mark_nvrm_views_stale(&self, below: u32) -> u32 {
+        let entries = self.entries.lock();
+        // Monotonic: a second mark can only widen the stale range.
+        let below = below.max(self.stale_below.load(Ordering::Relaxed));
+        self.stale_below.store(below, Ordering::Relaxed);
+        let n = Self::count_stale(entries.as_slice(), below);
+        self.stale_count.store(n, Ordering::Release);
+        n
+    }
+
+    fn count_stale(entries: &[Mapping], below: u32) -> u32 {
+        entries
+            .iter()
+            .filter(|m| helios_kmd_logic::nvrm_views::is_stale(m.resource_id, below))
+            .count() as u32
+    }
+
+    /// Pop up to `out.len()` of `owner`'s stale NVRM views (see
+    /// [`Self::mark_nvrm_views_stale`]), returning how many were written. The
+    /// caller unmaps them OUTSIDE the lock, in the owning process, and calls
+    /// again while the answer fills `out`. One atomic load when nothing is stale.
+    pub fn drain_stale_nvrm_for(&self, owner: usize, out: &mut [(u64, usize)]) -> usize {
+        if out.is_empty() || self.stale_count.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        let mut entries = self.entries.lock();
+        let below = self.stale_below.load(Ordering::Relaxed);
+        let mut n = 0;
+        let mut i = 0;
+        let mut remaining = 0u32;
+        while i < entries.len() {
+            let m = entries.as_slice()[i];
+            if !helios_kmd_logic::nvrm_views::is_stale(m.resource_id, below) {
+                i += 1;
+            } else if m.owner == owner && n < out.len() {
+                // swap_remove moves the last element into slot i: do not advance.
+                entries.swap_remove(i);
+                out[n] = (m.user_va, m.mdl);
+                n += 1;
+            } else {
+                // Someone else's (or past this batch): still stale, still here.
+                remaining += 1;
+                i += 1;
+            }
+        }
+        self.stale_count.store(remaining, Ordering::Release);
         n
     }
 
