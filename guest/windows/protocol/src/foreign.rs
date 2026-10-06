@@ -66,6 +66,10 @@ pub const HELIOS_FOREIGN_OP_QUERY_CAPS: u32 = 1;
 /// Import an RM-exported GEM object as a Venus resource.
 /// See [`HeliosForeignImportRm`].
 pub const HELIOS_FOREIGN_OP_IMPORT_RM: u32 = 2;
+/// Make a GEM handle, in the caller's own host DRM file, for an RM-export
+/// resource the caller created or opened (a second process's way to the memory
+/// another NVK process rendered into). See [`HeliosForeignRmResourceImport`].
+pub const HELIOS_FOREIGN_OP_RM_RESOURCE_IMPORT: u32 = 3;
 
 /// `QueryCaps.caps_flags`: `IMPORT_RM` is served end to end (KMD gate open and
 /// the host has the matching blob type).
@@ -81,6 +85,12 @@ pub const HELIOS_FOREIGN_CAP_RM_IMPORT: u32 = 1 << 0;
 /// share a foreign allocation should require it: an older KMD would open it
 /// without the flag. See `guest/windows/docs/shared-foreign-surfaces.md`.
 pub const HELIOS_FOREIGN_CAP_SHARED_OPEN: u32 = 1 << 1;
+/// `QueryCaps.caps_flags`: `RM_RESOURCE_IMPORT` is served end to end: this KMD
+/// knows the op and the host serves `RmResourceImport` (config features bit 14,
+/// with bits 13 and 10). Needs the host, unlike
+/// [`HELIOS_FOREIGN_CAP_SHARED_OPEN`]. Without it the op answers
+/// [`HELIOS_FOREIGN_ST_UNSUPPORTED`] and touches nothing.
+pub const HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT: u32 = 1 << 2;
 
 pub const HELIOS_FOREIGN_ST_OK: i32 = 0;
 /// The op is valid in this ABI but not served: `CAP_RM_IMPORT` is not set.
@@ -257,6 +267,56 @@ pub struct HeliosForeignImportRmLayout {
 
 pub const HELIOS_FOREIGN_IMPORT_RM_LAYOUT_BYTES: usize = 104;
 
+/// `RM_RESOURCE_IMPORT`. 80 bytes, no trailing data.
+///
+/// The caller is a process that OPENED an adopted foreign allocation (or the
+/// device that imported the resource, before adoption) and holds `resource_id`
+/// from the open identity. `rm_handle` is a DRM node (`device_type >= 512`) its
+/// own device opened through `HELIOS_ESCAPE_NVRM`. On success the host has made
+/// GEM object `out_gem_handle` in that file from the resource's dma-buf; NVK then
+/// runs `DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY` on it, `OS_UNIX_IMPORT_OBJECT_FROM_FD`
+/// (`NV0000` `0x3d06`) into its RM client, and `DRM_IOCTL_GEM_CLOSE`, all through
+/// `FORWARD`. The same resource on the same file answers the same handle, so one
+/// close undoes any number of imports; the KMD records nothing (the host closes
+/// the file's GEM handles when the file closes, which `DestroyDevice` does).
+///
+/// The KMD refuses, answering `NOT_OWNED` for all of them (one code, so a
+/// process learns nothing about another's handles or resources): `rm_handle`
+/// not this device's DRM node; no such foreign resource; its adopting allocation
+/// destroyed; the caller neither its importer nor a process holding an open of
+/// it. A zero `rm_handle` or `resource_id`, or nonzero `flags`, is `BAD_RANGE`.
+/// Host errnos map as for `IMPORT_RM`: `EBADF`/`ENOENT` `NOT_OWNED`,
+/// `EINVAL`/`ERANGE` `BAD_RANGE`, `EOPNOTSUPP` and `EPROTO` (a backend that
+/// predates the message) `UNSUPPORTED`, `ENOMEM` `NO_RESOURCES`, anything else
+/// `DEVICE_ERROR`; `out_host_errno` has the host's errno when it gave one.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosForeignRmResourceImport {
+    pub head: HeliosForeignHeader,
+    /// in: backend handle of a DRM file the calling device opened.
+    pub rm_handle: u32,
+    /// in: the resource id (from the open identity, or the `IMPORT_RM` reply).
+    pub resource_id: u32,
+    /// in: zero. Reserved for the host's request `flags`.
+    pub flags: u32,
+    /// out: GEM handle in `rm_handle`'s file. Zero unless `status == ST_OK`.
+    pub out_gem_handle: u32,
+    /// out: the object's size in bytes (the dma-buf's).
+    pub out_size: u64,
+    /// out: the modifier the resource was created with; zero unless
+    /// [`HELIOS_FOREIGN_RM_RESOURCE_IMPORT_MODIFIER`] is set in `out_flags`.
+    pub out_modifier: u64,
+    /// out: `HELIOS_FOREIGN_RM_RESOURCE_IMPORT_*`.
+    pub out_flags: u32,
+    /// out: the host's errno when it refused and said so, otherwise zero.
+    pub out_host_errno: u32,
+}
+
+pub const HELIOS_FOREIGN_RM_RESOURCE_IMPORT_BYTES: usize = 80;
+
+/// `RM_RESOURCE_IMPORT.out_flags` bit 0: `out_modifier` is known.
+pub const HELIOS_FOREIGN_RM_RESOURCE_IMPORT_MODIFIER: u32 = 1 << 0;
+
 const _: () = {
     use core::mem::{offset_of, size_of};
     assert!(size_of::<HeliosForeignHeader>() == HELIOS_FOREIGN_HEADER_BYTES);
@@ -300,6 +360,29 @@ const _: () = {
     assert!(size_of::<HeliosForeignImportRmLayout>() == HELIOS_FOREIGN_IMPORT_RM_LAYOUT_BYTES);
     assert!(offset_of!(HeliosForeignImportRmLayout, base) == 0);
     assert!(offset_of!(HeliosForeignImportRmLayout, layout) == HELIOS_FOREIGN_IMPORT_RM_BYTES);
+
+    assert!(size_of::<HeliosForeignRmResourceImport>() == HELIOS_FOREIGN_RM_RESOURCE_IMPORT_BYTES);
+    assert!(offset_of!(HeliosForeignRmResourceImport, rm_handle) == 40);
+    assert!(offset_of!(HeliosForeignRmResourceImport, resource_id) == 44);
+    assert!(offset_of!(HeliosForeignRmResourceImport, flags) == 48);
+    assert!(offset_of!(HeliosForeignRmResourceImport, out_gem_handle) == 52);
+    assert!(offset_of!(HeliosForeignRmResourceImport, out_size) == 56);
+    assert!(offset_of!(HeliosForeignRmResourceImport, out_modifier) == 64);
+    assert!(offset_of!(HeliosForeignRmResourceImport, out_flags) == 72);
+    assert!(offset_of!(HeliosForeignRmResourceImport, out_host_errno) == 76);
+
+    // The ops are distinct and the cap bits do not overlap.
+    assert!(HELIOS_FOREIGN_OP_RM_RESOURCE_IMPORT != HELIOS_FOREIGN_OP_IMPORT_RM);
+    assert!(HELIOS_FOREIGN_OP_RM_RESOURCE_IMPORT != HELIOS_FOREIGN_OP_QUERY_CAPS);
+    assert!(
+        HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT
+            & (HELIOS_FOREIGN_CAP_RM_IMPORT | HELIOS_FOREIGN_CAP_SHARED_OPEN)
+            == 0
+    );
+    // `RmResourceImport` (host MsgType 31) is sent by the KMD after its own checks
+    // (`helios_kmd_logic::rm_resource_import`); it must never become forwardable,
+    // or any process could name any resource.
+    assert!(crate::HELIOS_NVRM_FORWARD_MSG_TYPES & (1u32 << 31) == 0);
 
     // Distinct from every other verb in the protocol crate.
     assert!(HELIOS_ESCAPE_FOREIGN_RESOURCE != crate::HELIOS_ESCAPE_NVRM);
@@ -376,6 +459,18 @@ mod tests {
             HELIOS_FOREIGN_CAP_SHARED_OPEN as u64
         );
         assert_eq!(
+            c_define("HELIOS_FOREIGN_OP_RM_RESOURCE_IMPORT"),
+            HELIOS_FOREIGN_OP_RM_RESOURCE_IMPORT as u64
+        );
+        assert_eq!(
+            c_define("HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT"),
+            HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT as u64
+        );
+        assert_eq!(
+            c_define("HELIOS_FOREIGN_RM_RESOURCE_IMPORT_MODIFIER"),
+            HELIOS_FOREIGN_RM_RESOURCE_IMPORT_MODIFIER as u64
+        );
+        assert_eq!(
             c_define("HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT"),
             HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT as u64
         );
@@ -438,6 +533,32 @@ mod tests {
             bytemuck::pod_read_unaligned(&bytes[HELIOS_FOREIGN_IMPORT_RM_BYTES..]);
         assert_eq!(tail.modifier, 0x0300_0000_0060_6015);
         assert_eq!(tail.stride, 7680);
+    }
+
+    #[test]
+    fn rm_resource_import_round_trips_through_bytes() {
+        let mut r = HeliosForeignRmResourceImport::zeroed();
+        r.head.hdr = HeliosEscapeHeader::new(
+            HELIOS_ESCAPE_FOREIGN_RESOURCE,
+            HELIOS_FOREIGN_RM_RESOURCE_IMPORT_BYTES as u32,
+        );
+        r.head.abi_version = HELIOS_FOREIGN_ABI_VERSION;
+        r.head.op = HELIOS_FOREIGN_OP_RM_RESOURCE_IMPORT;
+        r.rm_handle = 6;
+        r.resource_id = 100;
+        r.out_gem_handle = 9;
+        r.out_size = 0x80_0000;
+        r.out_modifier = 0x0300_0000_0060_6015;
+        r.out_flags = HELIOS_FOREIGN_RM_RESOURCE_IMPORT_MODIFIER;
+        r.out_host_errno = 71;
+        let b = bytemuck::bytes_of(&r);
+        assert_eq!(b.len(), 80);
+        assert_eq!(&b[16..24], &[1, 0, 0, 0, 3, 0, 0, 0]); // abi_version, op
+        assert_eq!(&b[40..48], &[6, 0, 0, 0, 100, 0, 0, 0]);
+        let back: HeliosForeignRmResourceImport = bytemuck::pod_read_unaligned(b);
+        assert_eq!(back.out_size, 0x80_0000);
+        assert_eq!(back.out_modifier, 0x0300_0000_0060_6015);
+        assert_eq!(back.out_host_errno, 71);
     }
 
     #[test]

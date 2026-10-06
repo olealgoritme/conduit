@@ -28,6 +28,7 @@ pub mod foreign_copy;
 pub mod foreign_errno;
 pub mod foreign_resource;
 pub mod foreign_scanout;
+pub mod rm_resource_import;
 pub mod page_runs;
 pub mod rm_client;
 pub mod producer_completion;

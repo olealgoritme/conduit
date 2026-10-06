@@ -24,6 +24,7 @@ pub mod msi;
 pub mod nvrm;
 pub mod pci_caps;
 pub mod rm_client;
+pub mod rm_resource_import;
 pub mod venus;
 
 // `gpu::CompletedBind` is deliberately NOT re-exported: its only consumer names

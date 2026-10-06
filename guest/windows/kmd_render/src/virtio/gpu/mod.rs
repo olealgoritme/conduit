@@ -65,6 +65,7 @@ mod nvrm_events;
 mod nvrm_tables;
 mod resource_tables;
 mod foreign_tables;
+mod rm_resource_import_tables;
 pub use foreign_tables::{AllocAdopt, ForeignBegin, ForeignClose, ForeignCommit, ForeignSnapshot};
 
 pub use nvrm_events::{

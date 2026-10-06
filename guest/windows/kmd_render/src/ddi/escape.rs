@@ -456,7 +456,16 @@ pub unsafe extern "C" fn dxgkddi_escape(
         },
         helios_protocol::HELIOS_ESCAPE_FOREIGN_RESOURCE => match owner {
             Some(owner) => {
-                super::escape_foreign::escape_foreign_resource(passive, adapter, buf, &hdr, owner)
+                // `hKmdProcess` of the escaping device: RM_RESOURCE_IMPORT matches
+                // it against the opens of a shared allocation, as ATTACH does.
+                // SAFETY: the runtime supplies our live DeviceContext (non-null:
+                // `owner` is Some) for this Escape.
+                let process = unsafe { crate::device::DeviceHandleRef::from_raw(args.hDevice) }
+                    .map(|d| d.creator_process())
+                    .unwrap_or(0);
+                super::escape_foreign::escape_foreign_resource(
+                    passive, adapter, buf, &hdr, owner, process,
+                )
             }
             None => refuse_no_device(),
         },
