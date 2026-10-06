@@ -197,6 +197,7 @@ pub(crate) fn prepare(
         advertised,
         dst_standard_buffer: true,
         foreign_consumer,
+        system_copy_invalid: adapter.system_backings.system_copy_invalid(resource_id),
         record: adapter.system_backings.guest_record(resource_id),
     });
     match decision {
@@ -255,6 +256,12 @@ fn create(
         note_refused(Why::Busy);
         return;
     };
+    // A marked system copy (a skipped eviction, `BltNoMirror`): its page-in will be skipped in
+    // favour of the Venus blob, so the pages must not become the newest copy. Checked again
+    // under the transaction (the decision in `prepare` read it without one).
+    if guard.system_copy_invalid(resource_id) {
+        return note_refused(Why::SystemStale);
+    }
     let cover = match gb::cover_len(pitch, height, allocation_size) {
         Ok(cover) => cover,
         Err(why) => return note_refused(why),
@@ -341,6 +348,13 @@ fn create(
                 return;
             }
             MADE.fetch_add(1, Ordering::Relaxed);
+            // A mark can be set without the content transaction (a skipped eviction whose
+            // mutex failed, a `BltNoMirror` copy): one that arrived during the create retires
+            // the new blob before any copy targets it.
+            if guard.system_copy_invalid(resource_id) {
+                note_refused(Why::SystemStale);
+                retire(passive, adapter, &guard, resource_id);
+            }
         }
         Some((why, clean)) => {
             // Everything the import made was released (and fenced): the blob can go, and only

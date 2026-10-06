@@ -495,6 +495,13 @@ impl SystemBackingTable {
         self.invalid.lock().page_in_blocked(resource_id)
     }
 
+    /// Whether `resource_id`'s system copy is marked invalid, WITHOUT the side effect of
+    /// [`Self::page_in_blocked`] (no eviction coverage is voided). `GuestBlob` only: a marked
+    /// destination gets no guest blob (`helios_kmd_logic::guest_blob::eligible`). Spinlock only.
+    pub(crate) fn system_copy_invalid(&self, resource_id: u32) -> bool {
+        self.invalid.lock().contains(resource_id)
+    }
+
     /// A LOCAL_TO_SYSTEM eviction chunk `[offset, offset + moved)` of the
     /// `alloc_size`-byte `resource_id` succeeded. Own spinlock, no allocation.
     pub fn evict_chunk_done(
@@ -712,6 +719,11 @@ impl SystemBackingGuard<'_> {
     /// [`SystemBackingTable::page_in_blocked`].
     pub(crate) fn page_in_blocked(&self, resource_id: u32) -> bool {
         self.table.page_in_blocked(resource_id)
+    }
+
+    /// See [`SystemBackingTable::system_copy_invalid`].
+    pub(crate) fn system_copy_invalid(&self, resource_id: u32) -> bool {
+        self.table.system_copy_invalid(resource_id)
     }
 
     /// A LOCAL_TO_SYSTEM eviction chunk of `resource_id` succeeded; clears the

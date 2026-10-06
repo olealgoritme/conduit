@@ -195,8 +195,9 @@ pub mod contract {
 use contract::{MAX_BLOB_BYTES, MAX_ENTRIES, MAX_LIVE_BLOBS, MAX_LIVE_RUNS, MAX_RUN_BYTES, PAGE};
 
 /// Why a destination does not (or no longer) use a guest blob. `code` is what `GbWhy` holds,
-/// `bit` what `GbMask` collects. Codes 1 to 11 are decisions (no strike); 12 and above are
-/// failures, each a strike ([`Why::strikes`]). New codes are appended, never renumbered.
+/// `bit` what `GbMask` collects. Codes 1 to 11 are decisions (no strike); 12 to 28 are
+/// failures, each a strike; later codes are each one or the other ([`Why::strikes`]). New
+/// codes are appended, never renumbered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Why {
     /// `GuestBlob` is 0.
@@ -259,10 +260,14 @@ pub enum Why {
     /// `RESP_ERR_INVALID_PARAMETER` + `EXDEV`: the entries span more than one guest RAM
     /// backing file.
     HostCrossFile,
+    /// The destination's system copy is marked invalid (a skipped eviction, `BltNoMirror`): a
+    /// page-in will be skipped and the Venus blob kept, so the pages must not become the copy
+    /// target (and a live guest blob is retired). A decision, no strike.
+    SystemStale,
 }
 
 impl Why {
-    pub const ALL: [Why; 28] = [
+    pub const ALL: [Why; 29] = [
         Why::KnobOff,
         Why::NotAdvertised,
         Why::NotBuffer,
@@ -291,6 +296,7 @@ impl Why {
         Why::DrainTimeout,
         Why::ReleaseFailed,
         Why::HostCrossFile,
+        Why::SystemStale,
     ];
 
     /// 1-based, stable: the value of `GbWhy`.
@@ -324,6 +330,7 @@ impl Why {
             Why::DrainTimeout => 26,
             Why::ReleaseFailed => 27,
             Why::HostCrossFile => 28,
+            Why::SystemStale => 29,
         }
     }
 
@@ -332,9 +339,10 @@ impl Why {
         1u32 << (self.code() - 1)
     }
 
-    /// Whether this is a failure (a strike) rather than a decision.
+    /// Whether this is a failure (a strike) rather than a decision. Decisions are codes 1 to 11
+    /// and the ones appended later ([`Why::SystemStale`]).
     pub const fn strikes(self) -> bool {
-        self.code() >= 12
+        !matches!(self.code(), 1..=11 | 29)
     }
 
     /// Whether the failure leaves host objects that may still write the pages, so the
@@ -713,12 +721,25 @@ pub struct Facts {
     pub advertised: bool,
     pub dst_standard_buffer: bool,
     pub foreign_consumer: bool,
+    /// The destination's system copy is marked invalid (`paging::InvalidSet::contains`): a
+    /// skipped eviction or a `BltNoMirror` copy into the Venus blob. A page-in of the
+    /// destination will be skipped and its Venus blob kept.
+    pub system_copy_invalid: bool,
     /// The destination's record, `None` when it has none.
     pub record: Option<Record>,
 }
 
-/// The per-Present decision. Order: knob, host, destination shape, strikes, foreign
-/// consumer, state.
+/// The per-Present decision. Order: knob, host, destination shape, foreign consumer, system
+/// copy marked invalid, state and strikes.
+///
+/// The invalid mark: a guest blob makes the leased pages the destination's newest copy, and a
+/// marked destination's page-in is skipped in favour of the Venus blob. The two must never
+/// meet, so the invariant is "a guest blob is the copy target only while the destination's
+/// system copy is not marked invalid": no guest blob is created while the mark is up (here, and
+/// re-checked by the create under the content transaction), and the first Blt that finds a
+/// mark on a destination whose guest blob is live retires it ([`Eligible::Retire`]) before its
+/// own copy, which then goes into the Venus blob (full surface): the blob the skipped page-in
+/// keeps is then the newest copy again.
 pub fn eligible(f: Facts) -> Eligible {
     if !f.knob_on {
         return Eligible::No(Why::KnobOff);
@@ -735,6 +756,13 @@ pub fn eligible(f: Facts) -> Eligible {
             Eligible::Retire(Why::ForeignConsumer)
         } else {
             Eligible::No(Why::ForeignConsumer)
+        };
+    }
+    if f.system_copy_invalid {
+        return if record.copy_target() {
+            Eligible::Retire(Why::SystemStale)
+        } else {
+            Eligible::No(Why::SystemStale)
         };
     }
     if record.copy_target() {
@@ -1168,8 +1196,48 @@ mod tests {
             advertised: true,
             dst_standard_buffer: true,
             foreign_consumer: false,
+            system_copy_invalid: false,
             record,
         }
+    }
+
+    #[test]
+    fn a_marked_system_copy_refuses_a_create_and_retires_a_live_blob() {
+        // No record (or None/Gone): no create while marked, a decision, not a strike.
+        let mut f = facts(None);
+        f.system_copy_invalid = true;
+        assert_eq!(eligible(f), Eligible::No(Why::SystemStale));
+        assert!(!Why::SystemStale.strikes() && !Why::SystemStale.poisons());
+        let mut gone = Record::new(5);
+        gone.begin_create().unwrap();
+        gone.sent(8, 1);
+        gone.created();
+        gone.begin_drain();
+        gone.drained();
+        let mut f = facts(Some(gone));
+        f.system_copy_invalid = true;
+        assert_eq!(eligible(f), Eligible::No(Why::SystemStale));
+        // A live guest blob on a marked destination is retired before the copy.
+        let mut live = Record::new(5);
+        live.begin_create().unwrap();
+        live.sent(8, 1);
+        live.created();
+        let mut f = facts(Some(live));
+        f.system_copy_invalid = true;
+        assert_eq!(eligible(f), Eligible::Retire(Why::SystemStale));
+        // Unmarked, the same record is used.
+        f.system_copy_invalid = false;
+        assert_eq!(eligible(f), Eligible::Use);
+        // A foreign consumer is decided first (same retire, its own reason).
+        f.system_copy_invalid = true;
+        f.foreign_consumer = true;
+        assert_eq!(eligible(f), Eligible::Retire(Why::ForeignConsumer));
+        // Busy and disabled destinations stay refused while marked.
+        let mut creating = Record::new(5);
+        creating.begin_create().unwrap();
+        let mut f = facts(Some(creating));
+        f.system_copy_invalid = true;
+        assert!(matches!(eligible(f), Eligible::No(_)));
     }
 
     #[test]
@@ -1263,7 +1331,10 @@ mod tests {
         assert_eq!(codes.len(), Why::ALL.len());
         assert!(codes.iter().all(|&c| (1..=32).contains(&c)));
         for w in Why::ALL {
-            assert_eq!(w.strikes(), w.code() >= 12);
+            let decision = w.code() <= 11 || w == Why::SystemStale;
+            assert_eq!(w.strikes(), !decision, "{w:?}");
+            // Only a strike can poison.
+            assert!(!w.poisons() || w.strikes(), "{w:?}");
         }
         assert!(Why::DrainTimeout.poisons() && Why::ReleaseFailed.poisons());
         assert!(!Why::HostShape.poisons());
