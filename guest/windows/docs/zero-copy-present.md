@@ -2727,6 +2727,9 @@ built or run in the authoring environment. The pure logic (`kmd_logic/src/blt_as
 render crate was rustfmt-parsed and type-checked against the stub harness (the error set equals the base's, apart from
 stub-only unknown-field and arity errors in the new files).
 
+Hardware finding (v337.2): the arm was never entered because `ForeignCopy` was 0; see 24.11 (entry conditions, `BltEntry*` /
+`BltNoEntry*` counters, `BltAsyncVenus`).
+
 ### 24.1 The measurement
 
 Heaven 1600x900 windowed, composed under DWM, KMD 334.1: the host renders 576 fps, the VM shows 148 fps. PresentMon:
@@ -3064,6 +3067,94 @@ rotation), `RdIss == RdRet` after a quiescent run, and, with `KmdRmClient` 5 and
 frame edge `RmSysEdBlt` / `RmSysEdWBlt` (the per-edge counters of `sysmem_flip`) move with `BltAsync` 1 as they do with 0. Two
 Heaven windows at once, one of them slowed by a heavy producer, with `BltLookahead` 1 and 4: the other window's frame rate
 should stop following the slow one's at 4 (`BltLookN` > 0).
+
+### 24.11 The arm was never entered on hardware: entry conditions, the finding, the counters (v339)
+
+#### 24.11.1 The finding
+
+KMD 337.2, Heaven windowed D3D11 composed under the NVK DWM, `BltAsync=1 BltNoMirror=1 BltLookahead=4` (knobs confirmed in
+`BltAsyncKnob` / `BltNoMirKnob` / `BltLookKnob`): `BltAsyncN` 0, `BltAsyncFall` 0 (not even counted as a fallback),
+`BltMirrorSk` 0, while `BltWaitN` == `BltMirrorN` rose with every present. The same service-key dump holds `FcKnob=0` and
+`FcOff=5354` == `BltWaitN` (5354). `FcOff` counts "a foreign source seen while `ForeignCopy` is 0"
+(`foreign_source_if_enabled`, `virtio/venus/foreign_copy.rs`), so every Blt of the run was a foreign (NVK-on-RM) source
+with `ForeignCopy` off.
+
+Which condition failed. In `ddi/display.rs` (Blt arm, before this change) the async arm and the mirror skip were gated on
+`source_foreign`, which the arm sets only in the `foreign_source_if_enabled(...)` branch of the source-descriptor chain
+(the Some branch needs `adapter.knobs().foreign_copy`). With `ForeignCopy=0` that function returns `None`, the chain falls
+to the `source.storage` match, the source is imported as an ordinary OPTIMAL image (the plain import the host refuses for a
+foreign resource, section 11), `source_foreign` stays false, and
+`no_mirror_applies(.., source_foreign, ..)` and the async test were both false: the Blt ran the legacy path
+(`begin_present_buffer_write_legacy`, `submit_present_blt`, `wait_fence` = `BltWaitN`, `mirror_present_system_backing` =
+`BltMirrorN`) with neither new feature consulted, and nothing counted because the counters sat behind the same gate.
+The fix for the tester is `ForeignCopy=1` (a restart-device is enough). Two caveats worth reading from the counters of that
+run: the legacy copy of a foreign source with `ForeignCopy` 0 is the import the host refuses, so `BltWaitUs` of those rows
+(about 0.98 ms per Blt) measured a refused copy plus a mirror of whatever the destination held, not a real composed
+frame; and `FcImp`, `FcBlt`, `FcRefuse`, `FcHostErr` were all 0 (no foreign copy ever ran). Compare the rows again with
+`ForeignCopy=1`.
+
+Hypotheses considered, ranked, with what the counters said:
+
+1. `ForeignCopy=0` (confirmed: `FcKnob=0`, `FcOff` == `BltWaitN`; `display.rs`, the `foreign_source_if_enabled` branch).
+2. A Venus-native source (UMD-made image, `foreign` None) would also have run the legacy arm and counted `BltWaitN`, but
+   `FcOff` would then be 0: refuted by `FcOff`.
+3. A destination that is not a standard buffer: refuted, `BltWaitN` and `BltMirrorN` are only counted for one
+   (`destination_buffer.is_some()`).
+4. A snapshot (WindowedBlt) Blt: refuted, that path never counts `BltWaitN` (`BltMirrorN` there comes from the worker, and
+   `SnSub` / `SnFbk` / `BeSmp` are 0).
+5. A precondition returning before the decision (patch capacity, format, kind, descriptors, extent): refuted, those return
+   an error or a counted skip and never reach `wait_fence`.
+
+#### 24.11.2 Entry conditions, in order (`ddi/display.rs` Blt arm; the pure decision is `blt_async::entry`)
+
+| # | condition | where | on failure |
+|---|---|---|---|
+| 1 | `present_flags` Blt bit, not the level 5 RM primary, not an on-scanout skip | `dxgkddi_present_inner` | other arms (not counted) |
+| 2 | DMA buffer and private data large enough; patch capacity (`validate_patch_capacity`) | top of the arm | error / `BLT_PATCH`, counted `BltNoEntryO` |
+| 3 | adapter, source and destination resolve | `let (Some(adapter), ..)` | counted skip or error, `BltNoEntryO` |
+| 4 | both DXGI formats resolve; source kind is DEVICE_MEMORY | `BltFormat`, `BltSourceKind` | `BltNoEntryO` |
+| 5 | a snapshot, if present, validates | `validate_windowed_blt` | `BltNoEntryO` |
+| 6 | source and destination descriptors exist; extents equal | `BltDescriptor`, `BltExtent` | `BltNoEntryO` |
+| 7 | the entry decision (`entry`), counted `BltEntryDec`: 7a both knobs 0 (`KnobOff`, `BltNoEntryK`); 7b a snapshot (`Snapshot`, `BltNoEntryM`: its two-phase path is separate); 7c source class: `ForeignCopyOff` (`BltNoEntryFc`), or Venus-native with `BltAsyncVenus` 0 (`NotForeign`, `BltNoEntryF`); 7d destination not a standard buffer (`NotBuffer`, `BltNoEntryS`) | after row 6, before the snapshot / legacy split | the Blt takes the arm it always took |
+| 8 | `BltEntryOk`: `async_enter` (`BltAsync` on) goes to `try_async`; `no_mirror` (`BltNoMirror` on) skips the mirror whichever arm copies | the non-snapshot branch | |
+| 9 | `try_async`: `decide` (boundary, queue, table room, destination ownership) | `ddi/blt_async.rs` | `BltAsyncFall`, `BltAsyncWhy` (24.6) |
+
+`BltEntrySeen` counts row 1 arrivals; `BltNoEntryO` is derived as `BltEntrySeen - BltEntryDec`, so it cannot drift from the
+other counters. The identity at a quiescent point: `BltEntrySeen = BltNoEntryK + M + F + Fc + S + O + BltEntryOk`, and
+`BltEntryOk >= BltAsyncN + BltAsyncFall` (the rest are no-mirror-only Blts). `BltEntryWhy` is the last reason code and
+`BltEntryMask` has bit `code - 1` for every reason seen (1 knobs, 2 snapshot, 3 source not eligible, 4 foreign with
+`ForeignCopy` off, 5 destination, 6 before the decision). Reasons are tried in the order of the table (a snapshot is reported
+as the snapshot even though its source is not foreign).
+
+#### 24.11.3 Venus-native sources: `BltAsyncVenus` (default 0)
+
+Decision: a Venus-native source into a standard buffer is eligible for both knobs when `BltAsyncVenus=1`, and not by
+default.
+
+Why it can be eligible. Ordering after the producer: the copy is a Venus command on the same ring as the UMD's own commands,
+and the producer boundary that travels with the Present (if any) is handled by `decide` exactly as for a foreign source; with
+no boundary the route is DIRECT (mirror off) or the legacy arm (mirror on, `NoBoundaryMirror`). The DMA fence retires on the
+copy's wire fence (24.4 item 1), the destination ownership, in-flight table and drain rules are keyed by resource id and do not
+look at the source's origin, the source's read-ledger claim is taken by resource id (24.10.3), and `BltNoMirror`'s premise (DWM
+reads the GPU copy) is a property of the destination. The wait and the mirror cost the same.
+
+Why it is off by default. Nothing here has run for a Venus source: whether the host executes the UMD's last write to the
+image before the KMD's copy on ring 1 with no KMD-visible boundary is an assumption the legacy arm hid behind its CPU wait
+(the app thread blocked until the copy had retired, so a swap-chain buffer was never rewritten while the KMD read it); with
+`BltAsync` the source-reuse hazard of 24.5 applies to Venus images too, and the Venus UMD's own present gate is the only thing
+that bounds it. A tester can A/B it: `BltAsyncVenus=1` with `BltAsync` / `BltNoMirror`, read `BltEntryOk`, `BltNoEntryF`
+(0 when it is on), `BltSrcBusy`, `BltAsyncFail`, and look for one-frame-early content.
+
+#### 24.11.4 Counters (24.6 plus these; all in `kmd_logic::blt_async::COUNTERS`)
+
+`BltVenusKnob` (knob in force), `BltEntrySeen`, `BltEntryDec`, `BltEntryOk`, `BltEntryWhy`, `BltEntryMask`, `BltNoEntryK`,
+`BltNoEntryM`, `BltNoEntryF`, `BltNoEntryFc`, `BltNoEntryS`, `BltNoEntryO`. Read them first on any run where `BltAsyncN` is 0:
+`BltNoEntryFc` rising means `ForeignCopy` is 0; `BltNoEntryF` means a Venus-native source; `BltNoEntryK` that the knobs did not
+reach the transport (compare `BltAsyncKnob`); `BltNoEntryS` that the destination is not DWM's redirection surface.
+
+Tests (`kmd_logic`): `entry` over its whole input space (2 knobs x venus knob x snapshot x destination x three source classes,
+against an independent statement of the rule), the reason order, the foreign-copy-off refusal that this section is about, the
+Venus knob, and the reason codes' bits.
 
 ## 25. Wrong buffer on scanout after a device restart (v337 incident; identity fix, StopDevice unbind)
 
