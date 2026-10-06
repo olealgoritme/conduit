@@ -23,12 +23,20 @@
 use super::*;
 use alloc::boxed::Box;
 use helios_kmd_logic::nvrm_fence::{is_fence as is_fence_type, Noted, DEVICE_TYPE_FENCE};
+use helios_kmd_logic::rm_fence_present::{same_process, Attach, FenceMeta};
 use helios_kmd_logic::sweep_budget::{PinAction, PinFate};
 
 /// Most backend handles tracked across every process.
 pub const MAX_NVRM_HANDLES: usize = 1024;
 /// Most one process may hold open at once (`QUERY_CAPS` reports it).
 pub const MAX_NVRM_HANDLES_PER_OWNER: usize = 128;
+/// Most fence handles the KMD holds at once as its own (attached to a present, or
+/// discarded and owed a `Close`), across every process. A fence moves out of its
+/// creator's per-process quota when the KMD takes it, and into this one: gates hold
+/// up to 8 x 128 points, so without a bound of its own the table could fill with
+/// them (and the KMD's RM client, which shares the `KMD_RM` owner, would be refused
+/// its `Open`s).
+pub const MAX_NVRM_ATTACHED_FENCES: usize = 512;
 /// Most live `MMAP` mappings across every process, and per process.
 pub const MAX_NVRM_MAPS: usize = 1024;
 pub const MAX_NVRM_MAPS_PER_OWNER: usize = 256;
@@ -63,6 +71,9 @@ pub(super) struct NvrmHandleSlot {
     /// registered for it; the next `EVENT_REGISTER` consumes it and signals at
     /// once. A flag, not a count: the consumer drains until empty.
     ready_latched: bool,
+    /// Fence handles only: who created it, how it fired, what it was attached to
+    /// (`rm-fence-marker.md`). Inert (`FenceMeta::new(0)`) for every other kind.
+    fence: FenceMeta,
 }
 
 /// One live mapping, for the host `Munmap` at `Close` / teardown.
@@ -196,6 +207,36 @@ impl NvrmPin {
     }
 }
 
+/// What a fence's `EventReady` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FenceFire {
+    /// Not a fence the KMD tracks.
+    NotFence,
+    /// It had fired already: ignored.
+    Repeat,
+    /// The first fire, with what the fence was attached to.
+    Fired(Attach),
+}
+
+/// Who claims a fence for a carrier.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FenceClaim {
+    /// An NVRM owner (carrier (a): the source's owner).
+    Owner(DeviceOwner),
+    /// A process, by its `hKmdProcess` (carrier (b)): the fence was created in it.
+    Process(usize),
+}
+
+/// Why a fence could not be taken over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceRefusal {
+    NotOwned,
+    NotFence,
+    AlreadyAttached,
+    /// [`MAX_NVRM_ATTACHED_FENCES`] fences are the KMD's already.
+    Quota,
+}
+
 /// What `commit_nvrm_fence` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FenceCommit {
@@ -247,7 +288,13 @@ impl VirtioGpu {
     /// Reserve a tracking slot for an in-flight `Open`. Refuses when the table
     /// or this owner's quota is full, BEFORE the host is asked to open anything.
     pub fn reserve_nvrm_handle_slot(&mut self, owner: DeviceOwner) -> bool {
-        let mine = self.nvrm_handles.iter().filter(|s| s.owner == owner).count();
+        // A fence the KMD took over for a present is not the owner's: it counts against
+        // `MAX_NVRM_ATTACHED_FENCES`, not against the `KMD_RM` owner's Opens.
+        let mine = self
+            .nvrm_handles
+            .iter()
+            .filter(|s| s.owner == owner && s.fence.attached() == Attach::None)
+            .count();
         if self.nvrm_handles.len() + self.nvrm_reserved >= MAX_NVRM_HANDLES
             || mine >= MAX_NVRM_HANDLES_PER_OWNER
         {
@@ -265,6 +312,7 @@ impl VirtioGpu {
             handle,
             device_type,
             ready_latched: false,
+            fence: FenceMeta::new(0),
         });
     }
 
@@ -370,35 +418,253 @@ impl VirtioGpu {
     /// The host made fence `handle`: record it as `owner`'s, in one lock hold with
     /// taking whatever `EventReady` already arrived for it, which is latched so the
     /// first `EVENT_REGISTER` signals at once.
-    pub fn commit_nvrm_fence(&mut self, owner: DeviceOwner, handle: u32) -> FenceCommit {
+    pub fn commit_nvrm_fence(
+        &mut self,
+        owner: DeviceOwner,
+        handle: u32,
+        process: usize,
+    ) -> FenceCommit {
         // The host never hands out a number that is live. If one is, recording it
         // would make two owners of one handle; refuse and leave the other alone.
         if self.nvrm_handles.iter().any(|s| s.handle == handle) {
             self.cancel_nvrm_fence_create();
             return FenceCommit::Duplicate;
         }
-        let fired = self.nvrm_fences.finish(Some(handle));
+        let early = self.nvrm_fences.finish_status(Some(handle));
         self.commit_nvrm_handle(owner, handle, DEVICE_TYPE_FENCE);
-        if fired {
-            if let Some(s) = self.nvrm_handles.last_mut() {
+        if let Some(s) = self.nvrm_handles.last_mut() {
+            s.fence = FenceMeta::new(process);
+            if let Some(status) = early {
                 s.ready_latched = true;
+                s.fence.set_fired(status);
             }
         }
-        FenceCommit::Recorded { fired }
-    }
-
-    /// Whether `handle` is a fence some process holds (any owner: an `EventReady`
-    /// names no owner).
-    pub(super) fn nvrm_handle_is_fence(&self, handle: u32) -> bool {
-        self.nvrm_handles
-            .iter()
-            .any(|s| s.handle == handle && is_fence_type(s.device_type))
+        FenceCommit::Recorded {
+            fired: early.is_some(),
+        }
     }
 
     /// An `EventReady` for a handle nobody has open: keep it if a create is in
     /// flight that may own it.
-    pub(super) fn note_nvrm_fence_ready(&mut self, handle: u32) -> Noted {
-        self.nvrm_fences.note_ready(handle)
+    ///
+    /// The status is kept with it (0 or the fence's error), so a fence that fired
+    /// with an error before its create's reply was recorded still counts as one.
+    pub(super) fn note_nvrm_fence_ready(&mut self, handle: u32, status: i32) -> Noted {
+        self.nvrm_fences.note_ready_status(handle, status)
+    }
+
+    /// An `EventReady{handle, status}` for a fence: record that it fired (the first
+    /// one only; see `FenceMeta::set_fired`). The caller routes by what it was
+    /// attached to.
+    pub(super) fn fence_note_fired(&mut self, handle: u32, status: i32) -> FenceFire {
+        match self
+            .nvrm_handles
+            .iter_mut()
+            .find(|s| s.handle == handle && is_fence_type(s.device_type))
+        {
+            None => FenceFire::NotFence,
+            Some(s) => {
+                if s.fence.set_fired(status) {
+                    FenceFire::Fired(s.fence.attached())
+                } else {
+                    FenceFire::Repeat
+                }
+            }
+        }
+    }
+
+    /// Whether fence `handle` fired. A handle that is not there (closed behind our
+    /// back) reads as fired: nothing will ever fire it, and a queued present must
+    /// not wedge on it.
+    pub fn fence_fired(&self, handle: u32) -> bool {
+        self.nvrm_handles
+            .iter()
+            .find(|s| s.handle == handle && is_fence_type(s.device_type))
+            .map_or(true, |s| s.fence.fired().is_some())
+    }
+
+    /// The status `handle` fired with.
+    pub fn fence_status(&self, handle: u32) -> Option<i32> {
+        self.nvrm_handles
+            .iter()
+            .find(|s| s.handle == handle && is_fence_type(s.device_type))
+            .and_then(|s| s.fence.fired())
+    }
+
+    /// Take a fence over for a carrier: check the caller's claim, re-tag it to the
+    /// KMD (every later user call on it is `NOT_OWNED`) and record what it waits
+    /// for. Returns the status it had already fired with, if it had. One lock hold:
+    /// the checks and the re-tag cannot be split by a concurrent `Close`.
+    pub fn fence_attach(
+        &mut self,
+        by: FenceClaim,
+        handle: u32,
+        to: Attach,
+    ) -> Result<Option<i32>, FenceRefusal> {
+        let idx = self.fence_claim_index(by, handle, true)?;
+        let s = &mut self.nvrm_handles[idx];
+        match s.fence.attach(to) {
+            Ok(early) => {
+                s.owner = DeviceOwner::KMD_RM;
+                Ok(early)
+            }
+            Err(_) => Err(FenceRefusal::AlreadyAttached),
+        }
+    }
+
+    /// Whether [`Self::fence_attach`] would take `handle` for `by` right now, with
+    /// nothing changed. A carrier that must reserve something of its own first (a
+    /// gate and a stream slot) asks this first, so a refusal costs it nothing. The
+    /// answer holds for as long as the caller keeps the lock it asked under.
+    pub fn fence_claimable(&self, by: FenceClaim, handle: u32) -> Result<(), FenceRefusal> {
+        self.fence_claim_index(by, handle, true).map(|_| ())
+    }
+
+    /// The checks of a claim, in order (the first failure wins): the handle exists,
+    /// is `by`'s, is a fence, is not already taken, and (`quota`) the KMD has room
+    /// for one more of its own. Read-only; returns the table index.
+    fn fence_claim_index(
+        &self,
+        by: FenceClaim,
+        handle: u32,
+        quota: bool,
+    ) -> Result<usize, FenceRefusal> {
+        let Some(idx) = self.nvrm_handles.iter().position(|s| s.handle == handle) else {
+            return Err(FenceRefusal::NotOwned);
+        };
+        let s = &self.nvrm_handles[idx];
+        match by {
+            FenceClaim::Owner(owner) => {
+                if s.owner != owner {
+                    return Err(FenceRefusal::NotOwned);
+                }
+            }
+            FenceClaim::Process(process) => {
+                // A fence of this process, not already the KMD's. Nothing else
+                // about the creating device matters: the presenting device is not it.
+                if s.owner == DeviceOwner::KMD_RM
+                    || !is_fence_type(s.device_type)
+                    || !same_process(s.fence.process(), process)
+                {
+                    return Err(FenceRefusal::NotOwned);
+                }
+            }
+        }
+        if !is_fence_type(s.device_type) {
+            return Err(FenceRefusal::NotFence);
+        }
+        if s.fence.attached() != Attach::None || s.fence.close_wanted() {
+            return Err(FenceRefusal::AlreadyAttached);
+        }
+        if quota && self.attached_fences() >= MAX_NVRM_ATTACHED_FENCES {
+            return Err(FenceRefusal::Quota);
+        }
+        Ok(idx)
+    }
+
+    /// Fences the KMD holds as its own (attached, discarded or restored), until it
+    /// has closed them.
+    fn attached_fences(&self) -> usize {
+        self.nvrm_handles
+            .iter()
+            .filter(|s| s.fence.attached() != Attach::None)
+            .count()
+    }
+
+    /// Take a fence of `by` only to close it: a `HERF` / `HEPR` tail whose marker
+    /// could not be attached still names a handle the UMD gave up (the call returned
+    /// success, so the UMD cannot know), and a handle nobody closes counts against
+    /// its 128-per-process quota for good. Re-tags it to the KMD and owes the host
+    /// its `Close` at once. Returns whether this call made the debt (the caller wakes
+    /// the worker). No quota check: this is what frees an entry.
+    pub fn fence_discard(&mut self, by: FenceClaim, handle: u32) -> Result<bool, FenceRefusal> {
+        let idx = self.fence_claim_index(by, handle, false)?;
+        let s = &mut self.nvrm_handles[idx];
+        if s.fence.attach(Attach::Discard).is_err() {
+            return Err(FenceRefusal::AlreadyAttached);
+        }
+        s.owner = DeviceOwner::KMD_RM;
+        let made = s.fence.want_close();
+        if made {
+            crate::virtio::nvrm::FENCE_CLOSE_OWED.store(1, Ordering::Release);
+        }
+        Ok(made)
+    }
+
+    /// Undo [`Self::fence_attach`] for a carrier that then failed (the entry was
+    /// never queued): hand the handle back to `owner`.
+    pub fn fence_unattach(&mut self, owner: DeviceOwner, handle: u32) {
+        if let Some(s) = self
+            .nvrm_handles
+            .iter_mut()
+            .find(|s| s.handle == handle && s.owner == DeviceOwner::KMD_RM)
+        {
+            s.fence.unattach();
+            s.owner = owner;
+        }
+    }
+
+    /// The KMD owes the host a `Close` of fence `handle`. Returns whether this call
+    /// made the debt (the caller then wakes the worker).
+    ///
+    /// Only for a fence the KMD took over (owned by `KMD_RM` and attached to
+    /// something): a stale queue entry, or a purged gate's point, can name a number
+    /// the host has since reused for somebody else's live fence, and that one must
+    /// never be closed from here.
+    pub fn fence_want_close(&mut self, handle: u32) -> bool {
+        let made = self
+            .nvrm_handles
+            .iter_mut()
+            .find(|s| {
+                s.handle == handle
+                    && is_fence_type(s.device_type)
+                    && s.owner == DeviceOwner::KMD_RM
+                    && s.fence.attached() != Attach::None
+            })
+            .is_some_and(|s| s.fence.want_close());
+        if made {
+            crate::virtio::nvrm::FENCE_CLOSE_OWED.store(1, Ordering::Release);
+        }
+        made
+    }
+
+    /// Pop one fence the KMD owes a `Close`, out of the table (take-then-send, as
+    /// `Close` does: the host may reuse the number the moment it closes it).
+    pub fn take_fence_to_close(&mut self) -> Option<u32> {
+        let idx = self
+            .nvrm_handles
+            .iter()
+            .position(|s| is_fence_type(s.device_type) && s.fence.close_wanted())?;
+        Some(self.nvrm_handles.swap_remove(idx).handle)
+    }
+
+    /// The host did not take the `Close` of `handle` that [`Self::take_fence_to_close`]
+    /// popped: put it back as the KMD's, so the transport sweep closes it.
+    ///
+    /// It goes back attached to nothing (`Attach::Discard`, no `Close` owed again, or
+    /// the worker would retry it forever): it is the KMD's, counted against the KMD's
+    /// own fence quota and not the RM client's, and only the sweep closes it.
+    pub fn restore_fence_after_failed_close(&mut self, handle: u32) {
+        if self.nvrm_handles.len() + self.nvrm_reserved >= MAX_NVRM_HANDLES {
+            return;
+        }
+        let mut fence = FenceMeta::new(0);
+        let _ = fence.attach(Attach::Discard);
+        self.nvrm_handles.push(NvrmHandleSlot {
+            owner: DeviceOwner::KMD_RM,
+            handle,
+            device_type: DEVICE_TYPE_FENCE,
+            ready_latched: false,
+            fence,
+        });
+    }
+
+    /// Fences the KMD still owes a `Close`.
+    pub fn fences_owing_close(&self) -> usize {
+        self.nvrm_handles
+            .iter()
+            .filter(|s| is_fence_type(s.device_type) && s.fence.close_wanted())
+            .count()
     }
 
     /// The transport generation, for `HeliosNvrmHeader.epoch`: it changes when

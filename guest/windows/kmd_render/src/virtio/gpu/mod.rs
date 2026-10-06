@@ -64,16 +64,22 @@ use wdk_sys::{KEVENT, PVOID};
 mod nvrm_events;
 mod nvrm_tables;
 mod resource_tables;
+mod rm_gates;
 mod foreign_tables;
-pub use foreign_tables::{AllocAdopt, ForeignBegin, ForeignCommit};
+mod rm_resource_import_tables;
+pub use foreign_tables::{AllocAdopt, ForeignBegin, ForeignClose, ForeignCommit, ForeignSnapshot};
 
 pub use nvrm_events::{
     release_nvrm_event, NvrmEventRefusal, NvrmEventRegistered, NvrmEventsState, MAX_NVRM_EVENTS,
     MAX_NVRM_EVENTS_PER_OWNER,
 };
 
+pub use rm_gates::{
+    publish_rm_gate_counters, rm_gates_open, GateAttached, GateRefusal, RMG_REFUSED,
+};
+
 pub use nvrm_tables::{
-    FenceCommit, NvrmPin, PinTake, MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER, MAX_NVRM_MAPS,
+    FenceClaim, FenceCommit, FenceRefusal, NvrmPin, PinTake, MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER, MAX_NVRM_MAPS,
     MAX_NVRM_MAPS_PER_OWNER, MAX_NVRM_PINS, MAX_NVRM_PINS_PER_OWNER, MAX_NVRM_PIN_PAGES,
 };
 
@@ -2423,6 +2429,9 @@ pub struct VirtioGpu {
     /// allocation-free on registration, tagging, completion, and DISPATCH
     /// marker-readiness paths.
     present_streams: Vec<PresentStreamSlot>,
+    /// One RM gate per process that attaches RM fences to WDDM presents; each is
+    /// carried by a slot of `present_streams` (`rm_gates.rs`).
+    rm_gates: Vec<rm_gates::RmGateSlot>,
     producer_adapter: usize,
     producer_generation: u32,
     /// Dedicated standard-buffer ownership table. Fixed-length heap storage keeps all
@@ -2905,6 +2914,7 @@ impl VirtioGpu {
         // roughly 1 MiB; allocation failure must propagate through StartDevice
         // instead of entering the kernel allocator's infallible OOM path.
         let present_streams = allocate_present_streams()?;
+        let rm_gates = rm_gates::allocate_rm_gates()?;
         let present_buffer_syncs = allocate_present_buffer_syncs()?;
         let present_buffer_opens = allocate_present_buffer_opens()?;
         // Nothing to register against without the event queue: reserve nothing.
@@ -2961,6 +2971,7 @@ impl VirtioGpu {
             fence_waiters: Vec::with_capacity(MAX_FENCE_WAITERS),
             fence_events: Vec::with_capacity(MAX_FENCE_EVENTS),
             present_streams,
+            rm_gates,
             producer_adapter: 0,
             producer_generation: 0,
             present_buffer_syncs,
@@ -5705,6 +5716,7 @@ impl VirtioGpu {
 
     /// Purge all registrations for this transport generation (failure/reset).
     pub fn purge_all_present_streams(&mut self) {
+        self.rm_gates_purge_all();
         if let Some(producer) = self.producer_completion() {
             producer.reset();
         }

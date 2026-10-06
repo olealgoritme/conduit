@@ -15,7 +15,8 @@ use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
 use crate::virtio::gpu::DeviceOwner;
-use helios_kmd_logic::foreign_scanout::PresentError;
+use helios_kmd_logic::foreign_scanout::{Flip, PresentError};
+use helios_kmd_logic::nvrm_fence::is_fence;
 use helios_protocol::HELIOS_NVRM_SCANOUT_FLIP_BYTES;
 
 /// Host `MsgType::ScanoutFlip`.
@@ -25,6 +26,10 @@ const DEVICE_TYPE_DRI_FIRST: u32 = 512;
 /// How long the host gets to take one flip. A flip is a header-only reply; the
 /// backend acks it without waiting for the viewer.
 const FLIP_TIMEOUT_MS: u64 = 5_000;
+/// The same for a flip sent from the queue (`send_queued`), which runs on the HPD
+/// worker as often as on an escape: at most half of what `stop_hpd` gives the worker
+/// to exit (5 s, twice), like the RM client's steps and the fence `Close`.
+const QUEUED_FLIP_TIMEOUT_MS: u64 = 2_500;
 
 /// Why a present did not reach the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +46,14 @@ pub enum PresentRefusal {
     NoSource,
     /// The host or the transport did not take the flip.
     Device(VirtioError),
+    /// A fenced present, and this KMD / host does not serve fences.
+    Unsupported,
+    /// The fence handle is the caller's but not a fence.
+    NotFence,
+    /// The fence handle is already attached to a present.
+    AlreadyAttached,
+    /// `HELIOS_NVRM_SCANOUT_FENCE_DEPTH` presents already wait.
+    QueueFull,
 }
 
 fn wr32(b: &mut [u8], at: usize, v: u32) {
@@ -51,33 +64,15 @@ fn wr64(b: &mut [u8], at: usize, v: u64) {
     b[at..at + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-/// Show GEM object `gem` of the caller's DRM file `handle` on scanout 0. Returns
-/// the `seq` the flip carried.
-pub fn present(
+/// Build and send one `ScanoutFlip` and wait for the host's header-only answer.
+/// PASSIVE: a control-queue round trip.
+fn send(
     passive: PassiveLevel,
     adapter: &AdapterContext,
-    owner: DeviceOwner,
-    handle: u32,
+    flip: &Flip,
     gem: u32,
-) -> Result<u64, PresentRefusal> {
-    // Ownership first, in this transport generation: a lapsed or foreign handle
-    // must not mint a sequence number.
-    let (epoch, device_type) = adapter
-        .with_virtio(|v| (v.nvrm_epoch(), v.nvrm_handle_device_type(owner, handle)))
-        .map_err(|_| PresentRefusal::NoTransport)?;
-    match device_type {
-        None => return Err(PresentRefusal::NotOwned),
-        Some(t) if t < DEVICE_TYPE_DRI_FIRST => return Err(PresentRefusal::Forbidden),
-        Some(_) => {}
-    }
-    let flip = adapter
-        .foreign_scanout_mint_flip(owner, handle)
-        .map_err(|_: PresentError| PresentRefusal::NoSource)?;
-    if flip.epoch != epoch {
-        // The source was registered in an earlier transport generation.
-        return Err(PresentRefusal::NoSource);
-    }
-
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
     // MsgHeader { msg_type, handle = 0, status = 0, padding = 0 } | ScanoutFlip.
     let mut req = [0u8; MSG_HDR_LEN + HELIOS_NVRM_SCANOUT_FLIP_BYTES];
     wr32(&mut req, 0, MSG_SCANOUT_FLIP);
@@ -95,7 +90,7 @@ pub fn present(
     // reserved[4] at p + 48 stays zero.
 
     let mut resp = [0u8; 2 * MSG_HDR_LEN];
-    let sent = match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, FLIP_TIMEOUT_MS) {
+    match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, timeout_ms) {
         // MsgHeader.status (offset 8) is a signed errno; 0 is success.
         Ok(n) if n >= MSG_HDR_LEN => {
             let status = i32::from_le_bytes([resp[8], resp[9], resp[10], resp[11]]);
@@ -107,10 +102,125 @@ pub fn present(
         }
         Ok(_) => Err(VirtioError::DeviceError),
         Err(e) => Err(e),
-    };
+    }
+}
+
+/// Send a flip that was queued behind a fence (the pump's), and do the same
+/// bookkeeping a direct present does. A failure is counted (`FsErr`); the caller of
+/// the original `PRESENT` is long gone and the frame is lost.
+///
+/// Returns `false` when the host did not answer in time: the caller stops sending
+/// for this pass (every further flip would cost another full wait, on a worker that
+/// `stop_hpd` joins).
+pub fn send_queued(passive: PassiveLevel, adapter: &AdapterContext, flip: Flip, gem: u32) -> bool {
+    let sent = send(passive, adapter, &flip, gem, QUEUED_FLIP_TIMEOUT_MS);
+    adapter.foreign_scanout_flip_done(flip.generation, sent.is_ok());
+    !matches!(sent, Err(VirtioError::Timeout))
+}
+
+/// Ownership of the source handle and the minted flip, in a transport generation:
+/// the first half of every `PRESENT`.
+fn mint(
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    handle: u32,
+    served_needed: bool,
+) -> Result<Flip, PresentRefusal> {
+    // Ownership first, in this transport generation: a lapsed or foreign handle
+    // must not mint a sequence number.
+    let (epoch, device_type, served) = adapter
+        .with_virtio(|v| {
+            (
+                v.nvrm_epoch(),
+                v.nvrm_handle_device_type(owner, handle),
+                v.rm_fence_served(),
+            )
+        })
+        .map_err(|_| PresentRefusal::NoTransport)?;
+    if served_needed && !served {
+        return Err(PresentRefusal::Unsupported);
+    }
+    match device_type {
+        None => return Err(PresentRefusal::NotOwned),
+        Some(t) if t < DEVICE_TYPE_DRI_FIRST => return Err(PresentRefusal::Forbidden),
+        Some(_) => {}
+    }
+    let flip = adapter
+        .foreign_scanout_mint_flip(owner, handle)
+        .map_err(|_: PresentError| PresentRefusal::NoSource)?;
+    if flip.epoch != epoch {
+        // The source was registered in an earlier transport generation.
+        return Err(PresentRefusal::NoSource);
+    }
+    Ok(flip)
+}
+
+/// Show GEM object `gem` of the caller's DRM file `handle` on scanout 0. Returns
+/// the `seq` the flip carried.
+///
+/// Normally the flip is sent before this returns. If fenced presents are waiting
+/// (or being sent), this one queues behind them as an already-ready entry instead,
+/// so flips never go out of order, and the call returns at once.
+pub fn present(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    handle: u32,
+    gem: u32,
+) -> Result<u64, PresentRefusal> {
+    let flip = mint(adapter, owner, handle, false)?;
+    if adapter.foreign_fence_queue_busy() {
+        adapter
+            .foreign_fence_enqueue(owner, flip, gem, 0)
+            .map_err(queue_refusal)?;
+        adapter.foreign_fence_pump(passive);
+        return Ok(flip.seq);
+    }
+    let sent = send(passive, adapter, &flip, gem, FLIP_TIMEOUT_MS);
     adapter.foreign_scanout_flip_done(flip.generation, sent.is_ok());
     match sent {
         Ok(()) => Ok(flip.seq),
         Err(e) => Err(PresentRefusal::Device(e)),
+    }
+}
+
+/// `SCANOUT_PRESENT` with `RM_FENCE`: queue the flip behind `fence`, a fence of the
+/// caller's that the KMD takes over, and return at once with the `seq`. The flip is
+/// sent when the fence fires (or now, if it already had and nothing waits ahead).
+pub fn present_fenced(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    handle: u32,
+    gem: u32,
+    fence: u32,
+) -> Result<u64, PresentRefusal> {
+    // Cheap refusals first, before a sequence number is minted and the lapse is
+    // pushed out: the capability, the source, and the fence's kind and owner.
+    let fence_type = adapter
+        .with_virtio(|v| v.nvrm_handle_device_type(owner, fence))
+        .map_err(|_| PresentRefusal::NoTransport)?;
+    match fence_type {
+        None => return Err(PresentRefusal::NotOwned),
+        Some(t) if !is_fence(t) => return Err(PresentRefusal::NotFence),
+        Some(_) => {}
+    }
+    let flip = mint(adapter, owner, handle, true)?;
+    adapter
+        .foreign_fence_enqueue(owner, flip, gem, fence)
+        .map_err(queue_refusal)?;
+    // Already fired and nothing ahead: this sends it before returning.
+    adapter.foreign_fence_pump(passive);
+    Ok(flip.seq)
+}
+
+fn queue_refusal(e: crate::adapter::foreign_scanout::EnqueueRefusal) -> PresentRefusal {
+    use crate::adapter::foreign_scanout::EnqueueRefusal as E;
+    match e {
+        E::NoTransport => PresentRefusal::NoTransport,
+        E::Full => PresentRefusal::QueueFull,
+        E::NotOwned => PresentRefusal::NotOwned,
+        E::NotFence => PresentRefusal::NotFence,
+        E::AlreadyAttached => PresentRefusal::AlreadyAttached,
     }
 }

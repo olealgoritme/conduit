@@ -75,10 +75,17 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
     // a `KeSetEvent` on the process's registered event (HELIOS_NVRM_OP_EVENT_*).
     // The device raises the same INTx for either queue, so this is the one place
     // that sees it. Allocation-free and wait-free; a no-op without the queue.
-    let _ = adapter.with_virtio(|v| {
-        v.drain_used();
-        v.drain_nvrm_events();
-    });
+    let fence_work = adapter
+        .with_virtio(|v| {
+            v.drain_used();
+            v.drain_nvrm_events()
+        })
+        .unwrap_or(false);
+    if fence_work {
+        // A fence a present waits on fired: the PASSIVE worker sends the flip and
+        // closes the handle (the host round trips are not DPC work).
+        adapter.signal_hpd();
+    }
 
     // A producer completion may have made the one deferred fast bind safe.
     // Promotion and sequence minting share this virtio-lock hold, so the host

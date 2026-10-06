@@ -17,13 +17,27 @@
 
 #define HELIOS_FOREIGN_OP_QUERY_CAPS 1u
 #define HELIOS_FOREIGN_OP_IMPORT_RM 2u
+/* A GEM handle in the caller's own DRM file for an RM-export resource the caller
+ * created or opened (the second-process route: see
+ * helios_foreign_rm_resource_import). */
+#define HELIOS_FOREIGN_OP_RM_RESOURCE_IMPORT 3u
 
 #define HELIOS_FOREIGN_CAP_RM_IMPORT (1u << 0)
+/* The KMD lets other processes open an adopted foreign allocation (open
+ * identity flag, layout trailer rewritten at every open, host resource kept
+ * until the last open closes). KMD-only: independent of the host. */
+#define HELIOS_FOREIGN_CAP_SHARED_OPEN (1u << 1)
+/* RM_RESOURCE_IMPORT is served end to end (this KMD and a host that serves
+ * RmResourceImport). Without it the op answers HELIOS_FOREIGN_ST_UNSUPPORTED. */
+#define HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT (1u << 2)
 
 /* IMPORT_RM.flags: a helios_foreign_layout follows the 72-byte request
  * (helios_foreign_import_rm_layout, 104 bytes). Not optional: a request without
  * it is refused HELIOS_FOREIGN_ST_BAD_RANGE. */
 #define HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT (1u << 0)
+
+/* RM_RESOURCE_IMPORT.out_flags: out_modifier is known. */
+#define HELIOS_FOREIGN_RM_RESOURCE_IMPORT_MODIFIER (1u << 0)
 
 #define HELIOS_FOREIGN_ST_OK 0
 #define HELIOS_FOREIGN_ST_UNSUPPORTED 1
@@ -73,6 +87,27 @@ struct helios_foreign_import_rm {
    uint64_t size;       /* in: bytes of the exported object, page multiple */
    uint32_t out_resource_id;
    uint32_t out_host_errno;
+};
+
+/* RM_RESOURCE_IMPORT: the caller (a process that opened the adopted allocation,
+ * or the device that imported the resource) names a DRM file its own device
+ * opened and a resource id; the host makes a GEM object in that file from the
+ * resource's dma-buf. NVK then runs DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY on it,
+ * NV0000 OS_UNIX_IMPORT_OBJECT_FROM_FD (0x3d06) into its RM client and
+ * DRM_IOCTL_GEM_CLOSE, through FORWARD. The same resource on the same file gives
+ * the same handle. The KMD refuses with NOT_OWNED (one code) a file that is not
+ * the caller's DRM node, an unknown or destroyed resource, and a caller that
+ * neither imported nor opened it; zero ids or nonzero flags are BAD_RANGE. */
+struct helios_foreign_rm_resource_import {
+   struct helios_foreign_header head;
+   uint32_t rm_handle;      /* in: backend handle of a DRM file this device opened */
+   uint32_t resource_id;    /* in: from the open identity / the IMPORT_RM reply */
+   uint32_t flags;          /* in: 0 */
+   uint32_t out_gem_handle; /* out: GEM handle in rm_handle's file */
+   uint64_t out_size;       /* out: bytes */
+   uint64_t out_modifier;   /* out: valid iff out_flags & ..._MODIFIER, else 0 */
+   uint32_t out_flags;      /* out: HELIOS_FOREIGN_RM_RESOURCE_IMPORT_* */
+   uint32_t out_host_errno; /* out: the host's errno when it refused and said so */
 };
 
 /* What is inside the exported object (plane 0). Accepted: fourcc one of
@@ -137,5 +172,15 @@ _Static_assert(offsetof(struct helios_foreign_layout, modifier) == 24, "layout")
 _Static_assert(sizeof(struct helios_foreign_import_rm_layout) == 104, "import+layout size");
 _Static_assert(offsetof(struct helios_foreign_import_rm_layout, base) == 0, "import+layout");
 _Static_assert(offsetof(struct helios_foreign_import_rm_layout, layout) == 72, "import+layout");
+
+_Static_assert(sizeof(struct helios_foreign_rm_resource_import) == 80, "rri size");
+_Static_assert(offsetof(struct helios_foreign_rm_resource_import, rm_handle) == 40, "rri");
+_Static_assert(offsetof(struct helios_foreign_rm_resource_import, resource_id) == 44, "rri");
+_Static_assert(offsetof(struct helios_foreign_rm_resource_import, flags) == 48, "rri");
+_Static_assert(offsetof(struct helios_foreign_rm_resource_import, out_gem_handle) == 52, "rri");
+_Static_assert(offsetof(struct helios_foreign_rm_resource_import, out_size) == 56, "rri");
+_Static_assert(offsetof(struct helios_foreign_rm_resource_import, out_modifier) == 64, "rri");
+_Static_assert(offsetof(struct helios_foreign_rm_resource_import, out_flags) == 72, "rri");
+_Static_assert(offsetof(struct helios_foreign_rm_resource_import, out_host_errno) == 76, "rri");
 
 #endif

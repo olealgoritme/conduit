@@ -30,14 +30,58 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use helios_kmd_logic::foreign_scanout::{
     Flip, ForeignScanout, Layout, Poll, PresentError, ReleaseOutcome, SetError, SetKind, SetOutcome,
 };
+use helios_kmd_logic::rm_fence_present::{Attach, QEntry, ScanoutQueue};
 
 use super::AdapterContext;
 use crate::ddi::scanout_trace::LeaseEnd;
 use crate::sync::SpinLock;
-use crate::virtio::gpu::DeviceOwner;
+use crate::irql::PassiveLevel;
+use crate::virtio::gpu::{DeviceOwner, FenceClaim, FenceRefusal};
 use wdk_sys::ntddk::KeSetEvent;
 
 static STATE: SpinLock<ForeignScanout> = SpinLock::new(ForeignScanout::new());
+
+/// The `SCANOUT_PRESENT`s waiting for their fences (`docs/rm-fence-marker.md`,
+/// carrier (a)). LOCK ORDER: `virtio_lock` -> `FENCES`; `FENCES` is a leaf (its
+/// holders call only the pure queue and `VirtioGpu` methods already under
+/// `virtio_lock`). `STATE` is never taken under `FENCES`.
+static FENCES: SpinLock<ScanoutQueue> = SpinLock::new(ScanoutQueue::new());
+/// The pump (queue -> host flips) is one at a time, so flips leave in order. A
+/// caller that finds it busy leaves `PUMP_AGAIN` for the holder to see.
+static PUMP_BUSY: AtomicU32 = AtomicU32::new(0);
+static PUMP_AGAIN: AtomicU32 = AtomicU32::new(0);
+
+/// Become the pump, or leave a note for whoever is. `true`: this caller pumps.
+///
+/// The holder's exit is `PUMP_BUSY = 0` then `swap(PUMP_AGAIN, 0)`. A caller that
+/// failed the compare-exchange before that store and stores its note after that swap
+/// would leave the note set with nobody pumping (a lost wakeup), so after the note it
+/// tries once more: either the holder has released (we take over and pump, which
+/// covers what the note was for), or it has not yet, and then its swap comes after
+/// our note and sees it. All four operations are `SeqCst`: this is a store-then-load
+/// pattern on two locations, which release/acquire does not order. No `signal_hpd`
+/// here: when the failing caller IS the worker, a wake per failed attempt would spin
+/// it for as long as an escape thread holds the pump in a host round trip; the
+/// worker's own service pass already looks at `PUMP_AGAIN`.
+fn pump_acquire() -> bool {
+    if PUMP_BUSY
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        // Everything queued so far is seen by the pass that starts now.
+        PUMP_AGAIN.store(0, Ordering::SeqCst);
+        return true;
+    }
+    PUMP_AGAIN.store(1, Ordering::SeqCst);
+    if PUMP_BUSY
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        PUMP_AGAIN.store(0, Ordering::SeqCst);
+        return true;
+    }
+    false
+}
 
 /// Sources started (`FsSet`), flips sent (`FsPres`), sources ended by an explicit
 /// `RELEASE` (`FsRel`), by the lapse (`FsLapse`), by teardown or an invalid handle
@@ -56,6 +100,39 @@ pub static FS_SUPPRESSED: AtomicU32 = AtomicU32::new(0);
 pub static FS_RESTORES: AtomicU32 = AtomicU32::new(0);
 pub static FS_REFUSED: AtomicU32 = AtomicU32::new(0);
 pub static FS_SEND_ERRORS: AtomicU32 = AtomicU32::new(0);
+/// Fenced presents (`rm-fence-marker.md`): entries queued (`FsFQue`), flips sent from
+/// the queue (`FsFSent`), fences fired (`FsFFire`), of those with an error status
+/// (`FsFErr`), queued already fired (`FsFEarly`), ready entries superseded by a newer
+/// one (`FsFSkip`), entries dropped unsent because their source ended (`FsFDrop`),
+/// requests refused (`FsFRef`) and refused for a full queue (`FsFFull`).
+/// Waiting now = `FsFQue - FsFSent - FsFSkip - FsFDrop`; it returns to 0 when idle.
+pub static FS_FENCE_QUEUED: AtomicU32 = AtomicU32::new(0);
+pub static FS_FENCE_SENT: AtomicU32 = AtomicU32::new(0);
+pub static FS_FENCE_FIRED: AtomicU32 = AtomicU32::new(0);
+pub static FS_FENCE_ERRORS: AtomicU32 = AtomicU32::new(0);
+pub static FS_FENCE_EARLY: AtomicU32 = AtomicU32::new(0);
+pub static FS_FENCE_SKIPPED: AtomicU32 = AtomicU32::new(0);
+pub static FS_FENCE_DROPPED: AtomicU32 = AtomicU32::new(0);
+pub static FS_FENCE_REFUSED: AtomicU32 = AtomicU32::new(0);
+pub static FS_FENCE_FULL: AtomicU32 = AtomicU32::new(0);
+
+/// A fence a queued present waits on fired (from the DPC: atomics only).
+pub(crate) fn note_fence_fired(status: i32) {
+    FS_FENCE_FIRED.fetch_add(1, Ordering::Relaxed);
+    if status != 0 {
+        FS_FENCE_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Why a fenced `SCANOUT_PRESENT` could not be queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnqueueRefusal {
+    NoTransport,
+    Full,
+    NotOwned,
+    NotFence,
+    AlreadyAttached,
+}
 
 /// Monotonic time in 100 ns units. A scalar read, legal through DISPATCH.
 pub(crate) fn now_100ns() -> u64 {
@@ -78,6 +155,20 @@ pub(crate) fn publish_counters() {
     rec(b"FsRest", FS_RESTORES.load(Ordering::Relaxed));
     rec(b"FsRef", FS_REFUSED.load(Ordering::Relaxed));
     rec(b"FsErr", FS_SEND_ERRORS.load(Ordering::Relaxed));
+    rec(b"FsFQue", FS_FENCE_QUEUED.load(Ordering::Relaxed));
+    rec(b"FsFSent", FS_FENCE_SENT.load(Ordering::Relaxed));
+    rec(b"FsFFire", FS_FENCE_FIRED.load(Ordering::Relaxed));
+    rec(b"FsFErr", FS_FENCE_ERRORS.load(Ordering::Relaxed));
+    rec(b"FsFEarly", FS_FENCE_EARLY.load(Ordering::Relaxed));
+    rec(b"FsFSkip", FS_FENCE_SKIPPED.load(Ordering::Relaxed));
+    rec(b"FsFDrop", FS_FENCE_DROPPED.load(Ordering::Relaxed));
+    rec(b"FsFRef", FS_FENCE_REFUSED.load(Ordering::Relaxed));
+    rec(b"FsFFull", FS_FENCE_FULL.load(Ordering::Relaxed));
+    rec(
+        b"FnCloseErr",
+        crate::virtio::nvrm::FENCE_CLOSE_ERRORS.load(Ordering::Relaxed),
+    );
+    crate::virtio::gpu::publish_rm_gate_counters();
 }
 
 impl AdapterContext {
@@ -92,6 +183,9 @@ impl AdapterContext {
     fn foreign_scanout_restore_desktop(&self) {
         self.release_all_scanout_leases(LeaseEnd::Cancelled);
         self.request_scanout_refresh();
+        // The source ended: its queued fenced flips are dropped (and their fences
+        // closed) by the worker's next pass.
+        self.signal_hpd();
     }
 
     /// `SCANOUT_SET`.
@@ -221,6 +315,10 @@ impl AdapterContext {
         if STATE.lock().reset() {
             FS_ENDED.fetch_add(1, Ordering::Relaxed);
         }
+        // Queued fenced flips die with the transport; their fence handles are
+        // closed by the transport sweep.
+        let dropped = FENCES.lock().clear();
+        FS_FENCE_DROPPED.fetch_add(dropped, Ordering::Relaxed);
     }
 
     /// Whether a FORWARDed `ScanoutFlip` from `owner` must be refused because
@@ -294,5 +392,164 @@ impl AdapterContext {
         // At least 1 ms (a due deadline must not spin the worker), at most an hour.
         let remaining = remaining.clamp(10_000, 36_000_000_000);
         Some(-(remaining as i64))
+    }
+
+    // ---- fenced presents (`docs/rm-fence-marker.md`, carrier (a)) -----------------
+
+    /// Whether any flip waits in the fenced queue (an unfenced present then queues
+    /// behind it, to keep the order).
+    pub(crate) fn foreign_fence_queue_busy(&self) -> bool {
+        !FENCES.lock().is_empty() || PUMP_BUSY.load(Ordering::Acquire) != 0
+    }
+
+    /// Queue one flip. With `fence != 0` the fence is taken over for the KMD in the
+    /// same lock hold (`FenceClaim::Owner`: it must be the source owner's own fence).
+    /// Returns whether the fence had already fired. Nothing changes on a refusal.
+    pub(crate) fn foreign_fence_enqueue(
+        &self,
+        owner: DeviceOwner,
+        flip: Flip,
+        gem: u32,
+        fence: u32,
+    ) -> Result<bool, EnqueueRefusal> {
+        let outcome = self
+            .with_virtio(|v| {
+                let mut queue = FENCES.lock();
+                if queue.is_full() {
+                    return Err(EnqueueRefusal::Full);
+                }
+                let early = if fence != 0 {
+                    match v.fence_attach(FenceClaim::Owner(owner), fence, Attach::Scanout) {
+                        Ok(early) => early,
+                        Err(FenceRefusal::NotOwned) => return Err(EnqueueRefusal::NotOwned),
+                        Err(FenceRefusal::NotFence) => return Err(EnqueueRefusal::NotFence),
+                        Err(FenceRefusal::AlreadyAttached) => {
+                            return Err(EnqueueRefusal::AlreadyAttached)
+                        }
+                        // The KMD holds as many fences as it may: the same answer
+                        // as a full queue (present without a fence, or retry).
+                        Err(FenceRefusal::Quota) => return Err(EnqueueRefusal::Full),
+                    }
+                } else {
+                    None
+                };
+                // Room was checked under this same hold, so this cannot fail; if it
+                // somehow does, hand the fence back rather than strand it.
+                if queue.push(QEntry { flip, gem, fence }).is_err() {
+                    if fence != 0 {
+                        v.fence_unattach(owner, fence);
+                    }
+                    return Err(EnqueueRefusal::Full);
+                }
+                Ok(early)
+            })
+            .map_err(|_| EnqueueRefusal::NoTransport)?;
+        match outcome {
+            Ok(early) => {
+                FS_FENCE_QUEUED.fetch_add(1, Ordering::Relaxed);
+                if fence != 0 {
+                    // PASSIVE (the escape), outside every lock: what the creator
+                    // registered on a handle that is now the KMD's goes with it.
+                    crate::virtio::nvrm::release_events_of_taken_fence(self, fence);
+                }
+                if let Some(status) = early {
+                    FS_FENCE_EARLY.fetch_add(1, Ordering::Relaxed);
+                    note_fence_fired(status);
+                }
+                Ok(early.is_some())
+            }
+            Err(e) => {
+                FS_FENCE_REFUSED.fetch_add(1, Ordering::Relaxed);
+                if e == EnqueueRefusal::Full {
+                    FS_FENCE_FULL.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Send every flip that is ready, in order, and close the fences that are done
+    /// (sent, superseded or dropped). One pump at a time: a caller that finds it
+    /// busy leaves a note and the holder goes round again, so a flip queued while
+    /// another was being sent is never left waiting for the next wake. PASSIVE: it
+    /// does the host round trips.
+    ///
+    /// Bounded for the HPD worker (which `stop_hpd` joins for 5 s, twice): a flip waits
+    /// at most 2.5 s for the host and the pass ends at the first timeout (the host is
+    /// not answering) and as soon as `hpd_stop` is set; the flips not reached stay
+    /// queued for the next pass or for the teardown that drops them.
+    pub(crate) fn foreign_fence_pump(&self, passive: PassiveLevel) {
+        if !pump_acquire() {
+            return;
+        }
+        loop {
+            let mut host_slow = false;
+            loop {
+                if self.hpd_stop.load(Ordering::Acquire) != 0 {
+                    // StopDevice is joining the worker: stop sending; the sweep of
+                    // the transport closes the fences and drops the queue.
+                    host_slow = true;
+                    break;
+                }
+                let now = now_100ns();
+                let live = STATE
+                    .lock()
+                    .suppress_desktop(now)
+                    .map(|a| (a.generation, a.epoch));
+                let drained = self.with_virtio(|v| {
+                    // A source of an earlier transport generation names handles that
+                    // no longer exist.
+                    let live = live.filter(|&(_, epoch)| epoch == v.nvrm_epoch());
+                    let drained = FENCES.lock().drain(live, |fence| v.fence_fired(fence));
+                    for &fence in drained.closes() {
+                        v.fence_want_close(fence);
+                    }
+                    drained
+                });
+                let Ok(drained) = drained else {
+                    // No transport: nothing can be sent, and nothing will fire.
+                    let dropped = FENCES.lock().clear();
+                    FS_FENCE_DROPPED.fetch_add(dropped, Ordering::Relaxed);
+                    break;
+                };
+                FS_FENCE_SKIPPED.fetch_add(drained.skipped, Ordering::Relaxed);
+                FS_FENCE_DROPPED.fetch_add(drained.dropped, Ordering::Relaxed);
+                let Some(entry) = drained.send else {
+                    break;
+                };
+                FS_FENCE_SENT.fetch_add(1, Ordering::Relaxed);
+                if !crate::virtio::foreign_scanout::send_queued(
+                    passive, self, entry.flip, entry.gem,
+                ) {
+                    host_slow = true;
+                    break;
+                }
+            }
+            if !host_slow {
+                // (A slow host would cost the next wait as well; `close_owed_fences`
+                // has its own bound and stop rules, and the debt flag survives.)
+                crate::virtio::nvrm::close_owed_fences(passive, self);
+            }
+            // SeqCst on the release / note pair (see `pump_acquire`).
+            PUMP_BUSY.store(0, Ordering::SeqCst);
+            if host_slow || PUMP_AGAIN.swap(0, Ordering::SeqCst) == 0 {
+                break;
+            }
+            if !pump_acquire() {
+                break;
+            }
+        }
+    }
+
+    /// HPD worker, once per wake: send what fired, close what is owed. Cheap (two
+    /// loads and one short lock) when there is nothing.
+    pub(crate) fn foreign_fence_service(&self, passive: PassiveLevel) {
+        if FENCES.lock().is_empty()
+            && crate::virtio::nvrm::FENCE_CLOSE_OWED.load(Ordering::Acquire) == 0
+            && PUMP_AGAIN.load(Ordering::Acquire) == 0
+        {
+            return;
+        }
+        self.foreign_fence_pump(passive);
     }
 }

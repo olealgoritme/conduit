@@ -259,6 +259,11 @@ pub(crate) fn publish_nvrm_counters() {
     );
     // The KMD's own RM client (`KmdRmClient`): `Rm*`, written only once it has run.
     crate::virtio::rm_client::publish_counters();
+    // The KMD copy of a foreign resource into the scan-out image (`Fc*`): imports
+    // made (`FcImp`, split `FcScan` / `FcBlt`), refusals (`FcRefuse`, last reason
+    // `FcRefCode`), host refusals (`FcHostErr`), device without the extension
+    // (`FcNoExt`), stale or unknown records (`FcStale`), knob off (`FcOff`).
+    crate::virtio::venus::publish_foreign_copy_counters();
     // RM fence handles (a forwarded SEMSURF_FENCE_CREATE): `NvFence` made and
     // recorded, `NvFenceCl` released (Close or teardown; the difference is what is
     // live), `NvFenceSig` EventReadys seen for fences, `NvFenceEarly` of those that
@@ -333,6 +338,12 @@ pub(crate) fn record_present_handoff_telemetry() {
     crate::diag::record_named_bytes(b"PmWr", PRESENT_MARKER_WRITES.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmWFn", PRESENT_MARKER_LAST_FENCE.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmWSz", PRESENT_MARKER_LAST_SIZE.load(Ordering::Relaxed));
+    // Boundaries of two handles (stream / RM gate) that collided in one DMA buffer
+    // and cost the later present its wait. Zero unless a client mixes marker kinds.
+    crate::diag::record_named_bytes(
+        b"PrBndDrop",
+        crate::ddi::present_packet::PRESENT_BOUNDARY_DROPPED.load(Ordering::Relaxed),
+    );
     crate::diag::record_named_bytes(b"PmHit", PRESENT_MARKER_HITS.load(Ordering::Relaxed));
     // How many WDDM submissions took the exact-boundary watermark (`PresentWmk`).
     // Zero with the knob off is the correct reading; a knob that reads as its
@@ -1489,6 +1500,114 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
 
 // ── Render-path DDIs. ───────────────────────────────────────────────────────
 
+/// Carrier (b) of `docs/rm-fence-marker.md`: take the RM fence a present record names
+/// over for the KMD and turn it into the marker the Render stashes. Ownership is
+/// "a fence created in the presenting context's process"; a refusal attaches nothing
+/// and leaves the handle where it was (counted in `RmGRef`): the caller decides what
+/// the carrier's rule says then (`HE12`: the call fails and the handle stays the
+/// caller's; `HERF` / `HEPR`: [`take_fence_tail`]).
+/// The table work runs at DISPATCH under `virtio_lock`: scans and fixed-array writes
+/// only. The rest is PASSIVE (`DxgkDdiRender`).
+fn attach_rm_fence_marker(
+    adapter: &AdapterContext,
+    process: usize,
+    tail: &helios_protocol::HeliosRmFenceTail,
+) -> Result<crate::adapter::PresentStreamMarker, crate::virtio::gpu::GateRefusal> {
+    use crate::virtio::gpu::GateRefusal;
+    if !tail.is_fence() {
+        crate::virtio::gpu::RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return Err(GateRefusal::NotFence);
+    }
+    let attached = match adapter.with_virtio(|v| v.rm_gate_attach(tail.rm_fence_handle, process)) {
+        Ok(Ok(attached)) => attached,
+        Ok(Err(why)) => return Err(why),
+        Err(_) => return Err(GateRefusal::Unsupported),
+    };
+    // What the creator registered on the handle goes with its ownership.
+    crate::virtio::nvrm::release_events_of_taken_fence(adapter, tail.rm_fence_handle);
+    if attached.wake_worker {
+        // It fired already: the worker owes the host a `Close`.
+        adapter.signal_hpd();
+    }
+    fence_taken(adapter);
+    Ok(crate::adapter::PresentStreamMarker {
+        ctx_id: 0,
+        value: 0,
+        cookie: 0,
+        creator_process: process,
+        rm_boundary: attached.boundary,
+    })
+}
+
+/// The KMD has taken a fence (attached or discarded). With no HPD worker
+/// (render-only `DisplayHalf=0`) nobody else would ever close the handles that fired
+/// or send queued flips, so this thread does the worker's pass (a no-op with a
+/// worker, one load when nothing is owed).
+fn fence_taken(adapter: &AdapterContext) {
+    // SAFETY: only called from `DxgkDdiRender`, documented "IRQL: PASSIVE_LEVEL"
+    // (`DXGKDDI_RENDER`), with no lock held: the table work above has returned.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    crate::virtio::nvrm::service_fences_without_worker(passive, adapter);
+}
+
+/// A `HERF` / `HEPR` tail names a fence the KMD did not attach a marker for (both
+/// markers, a partial stream tail, no room, ...). The UMD gets no status from that
+/// `Render` (it returns success), so it cannot know the tail was dropped and would
+/// leak the handle against its 128-per-process quota. So for ANY parsed tail whose
+/// handle is a fence of the presenting process (the claim of an attach), the KMD
+/// takes the handle and closes it, marker or not (counted `RmGTake`). A handle that
+/// is not such a fence is left alone. `process` is the context's `hKmdProcess`.
+fn take_fence_tail(
+    adapter: &AdapterContext,
+    process: Option<usize>,
+    tail: &helios_protocol::HeliosRmFenceTail,
+) {
+    let (Some(process), handle) = (process, tail.rm_fence_handle) else {
+        return;
+    };
+    if handle == 0 {
+        return;
+    }
+    let taken = adapter
+        .with_virtio(|v| v.rm_fence_take(handle, process))
+        .unwrap_or(false);
+    if taken {
+        crate::virtio::nvrm::release_events_of_taken_fence(adapter, handle);
+        // A `Close` is owed now.
+        adapter.signal_hpd();
+        fence_taken(adapter);
+    }
+}
+
+/// `HERF` / `HEPR`, no stream marker beside the tail: attach the fence as the
+/// present's marker, or (any refusal) take it anyway and close it (`take_fence_tail`).
+fn attach_or_take_fence_tail(
+    adapter: &AdapterContext,
+    process: usize,
+    tail: &helios_protocol::HeliosRmFenceTail,
+) -> Option<crate::adapter::PresentStreamMarker> {
+    match attach_rm_fence_marker(adapter, process, tail) {
+        Ok(marker) => Some(marker),
+        Err(_) => {
+            take_fence_tail(adapter, Some(process), tail);
+            None
+        }
+    }
+}
+
+/// Hand a resolved marker to the Present that follows this Render on the context:
+/// a stream point is resolved by the Present, an attached RM fence already is.
+fn stash_marker(
+    context: &crate::device::ContextHandleRef<'_>,
+    marker: &crate::adapter::PresentStreamMarker,
+) {
+    if marker.rm_boundary != 0 {
+        context.stash_resolved_marker(marker.rm_boundary);
+    } else {
+        context.stash_present_stream_marker(marker.ctx_id, marker.value, marker.cookie);
+    }
+}
+
 /// `DxgkDdiRender` — record a DMA buffer from a UMD command buffer.
 ///
 /// Our UMD command buffer already begins with a `HeliosWddmCmdBuf` followed by the
@@ -1522,6 +1641,17 @@ pub unsafe extern "C" fn dxgkddi_render(
         // Buffer too small for the recorded command: ask the runtime to grow it.
         return STATUS_BUFFER_TOO_SMALL;
     }
+    // Every argument check that can still refuse this Render comes BEFORE anything
+    // below takes something irreversible (an RM fence handle): the runtime retries a
+    // refused Render, and the retry must find the handle where the caller left it.
+    if args.PatchLocationListInSize > args.PatchLocationListOutSize {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if args.PatchLocationListInSize != 0
+        && (args.pPatchLocationListIn.is_null() || args.pPatchLocationListOut.is_null())
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     // The ECL completion record has its own tail, independent of Present's
     // private prefix. Non-ECL Render records preserve same-context predecessors
@@ -1541,55 +1671,99 @@ pub unsafe extern "C" fn dxgkddi_render(
         unsafe { args.pCommand.cast::<u32>().read_unaligned() } == helios_protocol::HELIOS_D3D12_SUBMIT_MAGIC;
     if is_ecl {
         let result = (|| {
-            // BOTH lengths are accepted. A long-lived process (dwm) can still hold
-            // the previous package's `helios_umd12.dll` across an upgrade, and
-            // reading a 32-byte struct out of a 24-byte command would run past its
-            // end. The v2 shape widens with `gpu_wire_fence = 0`, i.e. exactly v2
-            // behaviour.
-            let command = if cmd_len == size_of::<helios_protocol::HeliosD3D12SubmitCmd>() {
-                // SAFETY: the exact full command size is validated before this read.
-                unsafe {
-                    args.pCommand
-                        .cast::<helios_protocol::HeliosD3D12SubmitCmd>()
-                        .read_unaligned()
-                }
-            } else if cmd_len == size_of::<helios_protocol::HeliosD3D12SubmitCmdV2>() {
-                // SAFETY: as above, for the 24-byte v2 shape.
-                let v2 = unsafe {
-                    args.pCommand
-                        .cast::<helios_protocol::HeliosD3D12SubmitCmdV2>()
-                        .read_unaligned()
-                };
-                if !v2.is_valid() {
-                    return None;
-                }
-                v2.widen()
-            } else {
-                return None;
-            };
-            if !command.is_valid() {
-                return None;
-            }
-            // `command.is_valid()` above refuses `value == 0` (an ECL record's
-            // value is the exact worker point DMA completion waits for), so the
-            // marker boundary's admission of value 0 does not reach this arm.
+            // THREE shapes are accepted. v3 (32 B) and v2 (24 B) name a registered
+            // Venus stream point. BOTH of those lengths stay: a long-lived process
+            // (dwm) can still hold the previous package's `helios_umd12.dll` across
+            // an upgrade, and reading a 32-byte struct out of a 24-byte command
+            // would run past its end. The v2 shape widens with `gpu_wire_fence = 0`,
+            // i.e. exactly v2 behaviour. v4 (48 B) is the RM-fence record
+            // (`docs/rm-fence-marker.md`): a fence of this process, or "nothing to
+            // wait for"; an older KMD refuses it, which is why the UMD gates it on the
+            // `PRESENT_FENCE` capability.
             let context = execution_context.as_ref()?;
             let adapter = context.adapter()?;
             let process = context.creator_process()?;
             let record = execution_record?;
-            let boundary = adapter
-                .with_wddm_notify_lock(|guard| {
-                    guard.with_virtio(|_, v| {
-                        v.present_stream_marker_boundary(
-                            command.ctx_id,
-                            command.value,
-                            command.cookie,
-                            process,
+            let (boundary, gpu_wire_fence) = if cmd_len
+                == size_of::<helios_protocol::HeliosD3D12SubmitCmdV4>()
+            {
+                // SAFETY: the exact full command size is validated before this read.
+                let v4 = unsafe {
+                    args.pCommand
+                        .cast::<helios_protocol::HeliosD3D12SubmitCmdV4>()
+                        .read_unaligned()
+                };
+                if v4.is_complete_record() {
+                    // The producer waited on the CPU: no boundary, the packet retires
+                    // by the ordinary wire rule. Nothing to merge.
+                    return Some(());
+                }
+                if !v4.is_fence_record() {
+                    return None;
+                }
+                // Attaching is irreversible, and this call's status is what the UMD
+                // sees (a refusal leaves the handle the caller's), so everything
+                // below that can still refuse is checked BEFORE the fence is taken:
+                // the context's last bound stream must be this process's gate (or
+                // none yet), which is all `bind_execution_stream` and the record
+                // merge look at (point numbers of a gate only grow).
+                let bindable = adapter
+                    .with_virtio(|v| {
+                        helios_kmd_logic::execution_completion::may_bind_stream(
+                            context.execution_stream(),
+                            v.rm_gate_stream_handle(process),
                         )
                     })
-                })
-                .ok()
-                .flatten()?;
+                    .unwrap_or(false);
+                if !bindable {
+                    crate::virtio::gpu::RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                let marker = attach_rm_fence_marker(adapter, process, &v4.fence).ok()?;
+                (marker.rm_boundary, 0)
+            } else {
+                let command = if cmd_len == size_of::<helios_protocol::HeliosD3D12SubmitCmd>() {
+                    // SAFETY: the exact full command size is validated before this read.
+                    unsafe {
+                        args.pCommand
+                            .cast::<helios_protocol::HeliosD3D12SubmitCmd>()
+                            .read_unaligned()
+                    }
+                } else if cmd_len == size_of::<helios_protocol::HeliosD3D12SubmitCmdV2>() {
+                    // SAFETY: as above, for the 24-byte v2 shape.
+                    let v2 = unsafe {
+                        args.pCommand
+                            .cast::<helios_protocol::HeliosD3D12SubmitCmdV2>()
+                            .read_unaligned()
+                    };
+                    if !v2.is_valid() {
+                        return None;
+                    }
+                    v2.widen()
+                } else {
+                    return None;
+                };
+                if !command.is_valid() {
+                    return None;
+                }
+                // `command.is_valid()` above refuses `value == 0` (an ECL record's
+                // value is the exact worker point DMA completion waits for), so the
+                // marker boundary's admission of value 0 does not reach this arm.
+                let boundary = adapter
+                    .with_wddm_notify_lock(|guard| {
+                        guard.with_virtio(|_, v| {
+                            v.present_stream_marker_boundary(
+                                command.ctx_id,
+                                command.value,
+                                command.cookie,
+                                process,
+                            )
+                        })
+                    })
+                    .ok()
+                    .flatten()?;
+                (boundary, command.gpu_wire_fence)
+            };
             if !context.bind_execution_stream(boundary) {
                 return None;
             }
@@ -1599,8 +1773,8 @@ pub unsafe extern "C" fn dxgkddi_render(
             // preempted replay must carry the same proof, and `merge` preserves it.
             let next = old
                 .merge(boundary)?
-                .with_gpu_wire_fence(command.gpu_wire_fence);
-            if command.gpu_wire_fence != 0 {
+                .with_gpu_wire_fence(gpu_wire_fence);
+            if gpu_wire_fence != 0 {
                 D3D12_FENCE_CARRIED.fetch_add(1, Ordering::Relaxed);
             } else {
                 D3D12_FENCE_ABSENT.fetch_add(1, Ordering::Relaxed);
@@ -1659,26 +1833,62 @@ pub unsafe extern "C" fn dxgkddi_render(
             // traversal, checked once, in the module that owns the fields.
             let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
             if let Some(adapter) = context.as_ref().and_then(|c| c.adapter()) {
-                let stream_marker = if take >= size_of::<helios_protocol::HeliosPresentRefreshCmd>()
+                // The RM fence tail (carrier (b)): only a command that covers all 48
+                // bytes has one, and a fence is exclusive with the stream marker.
+                let fence_tail = (cmd_len >= size_of::<helios_protocol::HeliosPresentRefreshCmdFence>())
+                    .then(|| {
+                        // SAFETY: `cmd_len` bytes are readable at `pCommand` and the
+                        // check above covers the whole tail.
+                        unsafe {
+                            core::ptr::read_unaligned(
+                                (args.pCommand as *const u8).add(core::mem::offset_of!(
+                                    helios_protocol::HeliosPresentRefreshCmdFence,
+                                    fence
+                                )) as *const helios_protocol::HeliosRmFenceTail,
+                            )
+                        }
+                    })
+                    .filter(|tail| tail.flags != 0 || tail.rm_fence_handle != 0);
+                let stream_selected = take >= size_of::<helios_protocol::HeliosPresentRefreshCmd>()
                     && helios_kmd_logic::present_stream::tail_selects_boundary(
                         command.present_ctx_id,
                         command.present_value,
                         command.present_cookie,
-                    ) {
-                    context
-                        .as_ref()
-                        .and_then(|c| c.creator_process())
-                        .map(|creator_process| crate::adapter::PresentStreamMarker {
-                            ctx_id: command.present_ctx_id,
-                            value: command.present_value,
-                            cookie: command.present_cookie,
-                            creator_process,
-                        })
+                    );
+                let stream_tail_zero = command.present_ctx_id == 0
+                    && command.present_value == 0
+                    && command.present_cookie == 0;
+                let creator = context.as_ref().and_then(|c| c.creator_process());
+                let stream_marker = if stream_selected {
+                    if let Some(tail) = fence_tail {
+                        // Both markers: exclusive, the fence is not attached. The
+                        // handle is still the KMD's (the UMD cannot know): closed.
+                        crate::virtio::gpu::RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
+                        take_fence_tail(adapter, creator, &tail);
+                    }
+                    creator.map(|creator_process| crate::adapter::PresentStreamMarker {
+                        ctx_id: command.present_ctx_id,
+                        value: command.present_value,
+                        cookie: command.present_cookie,
+                        creator_process,
+                        rm_boundary: 0,
+                    })
+                } else if let Some(tail) = fence_tail {
+                    if stream_tail_zero {
+                        creator
+                            .and_then(|process| attach_or_take_fence_tail(adapter, process, &tail))
+                    } else {
+                        // A partial stream tail beside a fence: not a marker, but
+                        // the handle is still the KMD's.
+                        crate::virtio::gpu::RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
+                        take_fence_tail(adapter, creator, &tail);
+                        None
+                    }
                 } else {
                     None
                 };
                 if let (Some(context), Some(marker)) = (context.as_ref(), stream_marker) {
-                    context.stash_present_stream_marker(marker.ctx_id, marker.value, marker.cookie);
+                    stash_marker(context, &marker);
                 }
                 // HERF carries no resource identity: it is the generic
                 // "the bound target is dirty" edge, so it arms with 0 and the
@@ -1811,20 +2021,60 @@ pub unsafe extern "C" fn dxgkddi_render(
                                     helios_protocol::HeliosPresentPrivateData,
                                     snapshot_memory_type_index
                                 );
-                        let stream_marker = if take >= PRESENT_RENDER_STREAM_BYTES
+                        let stream_selected = take >= PRESENT_RENDER_STREAM_BYTES
                             && helios_kmd_logic::present_stream::tail_selects_boundary(
                                 private.present_ctx_id,
                                 private.present_value,
                                 private.present_cookie,
-                            ) {
-                            context.as_ref().and_then(|c| c.creator_process()).map(
-                                |creator_process| crate::adapter::PresentStreamMarker {
-                                    ctx_id: private.present_ctx_id,
-                                    value: private.present_value,
-                                    cookie: private.present_cookie,
-                                    creator_process,
-                                },
-                            )
+                            );
+                        // The RM fence tail (carrier (b)): flagged AND covered, and
+                        // exclusive with the stream marker.
+                        let fence_tail = (private.reserved
+                            & helios_protocol::HELIOS_PRESENT_PRIVATE_FLAG_RM_FENCE
+                            != 0
+                            && cmd_len
+                                >= size_of::<helios_protocol::HeliosPresentRenderCmdFence>())
+                        .then(|| {
+                            // SAFETY: `cmd_len` bytes are readable at `pCommand` and
+                            // the check above covers the whole tail.
+                            unsafe {
+                                core::ptr::read_unaligned(
+                                    (args.pCommand as *const u8).add(core::mem::offset_of!(
+                                        helios_protocol::HeliosPresentRenderCmdFence,
+                                        fence
+                                    ))
+                                        as *const helios_protocol::HeliosRmFenceTail,
+                                )
+                            }
+                        });
+                        let creator = context.as_ref().and_then(|c| c.creator_process());
+                        let stream_marker = if stream_selected {
+                            if let Some(tail) = fence_tail {
+                                // Both markers: the fence is not attached, but the
+                                // handle is still the KMD's (closed).
+                                crate::virtio::gpu::RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
+                                take_fence_tail(adapter, creator, &tail);
+                            }
+                            creator.map(|creator_process| crate::adapter::PresentStreamMarker {
+                                ctx_id: private.present_ctx_id,
+                                value: private.present_value,
+                                cookie: private.present_cookie,
+                                creator_process,
+                                rm_boundary: 0,
+                            })
+                        } else if let Some(tail) = fence_tail {
+                            let stream_tail_zero = private.present_ctx_id == 0
+                                && private.present_value == 0
+                                && private.present_cookie == 0;
+                            if stream_tail_zero {
+                                creator.and_then(|process| {
+                                    attach_or_take_fence_tail(adapter, process, &tail)
+                                })
+                            } else {
+                                crate::virtio::gpu::RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
+                                take_fence_tail(adapter, creator, &tail);
+                                None
+                            }
                         } else {
                             None
                         };
@@ -1832,11 +2082,7 @@ pub unsafe extern "C" fn dxgkddi_render(
                         // must carry this exact boundary too, or it can retire
                         // before a tagged batch has reached the transport.
                         if let (Some(context), Some(marker)) = (context.as_ref(), stream_marker) {
-                            context.stash_present_stream_marker(
-                                marker.ctx_id,
-                                marker.value,
-                                marker.cookie,
-                            );
+                            stash_marker(context, &marker);
                         }
                         if windowed_blt_snapshot {
                             // Keep Render's causal handoff observable without
@@ -1877,15 +2123,8 @@ pub unsafe extern "C" fn dxgkddi_render(
         }
     }
 
-    if args.PatchLocationListInSize > args.PatchLocationListOutSize {
-        return STATUS_BUFFER_TOO_SMALL;
-    }
-    if args.PatchLocationListInSize != 0
-        && (args.pPatchLocationListIn.is_null() || args.pPatchLocationListOut.is_null())
-    {
-        return STATUS_INVALID_PARAMETER;
-    }
-
+    // (The patch-list argument checks are at the top of this function: a refused
+    // Render must have taken nothing, in particular no RM fence above.)
     for i in 0..args.PatchLocationListInSize {
         let input = unsafe { &*args.pPatchLocationListIn.add(i as usize) };
         let output = unsafe { &mut *args.pPatchLocationListOut.add(i as usize) };

@@ -65,6 +65,9 @@ extern "C" {
 /// Host `MsgType` values that need KMD attention (see `helios_protocol::nvrm`).
 const MSG_OPEN: u32 = 1;
 const MSG_CLOSE: u32 = 2;
+/// How long the KMD's own fence `Close` waits for the host. At most half of what
+/// `stop_hpd` gives the worker to exit (5 s), like the RM client's steps.
+const FENCE_CLOSE_TIMEOUT_MS: u64 = 2_500;
 const MSG_IOCTL: u32 = 3;
 const MSG_MMAP: u32 = 4;
 const MSG_MUNMAP: u32 = 5;
@@ -186,6 +189,11 @@ pub static NVRM_FENCES_CLOSED: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_FENCE_FIRED: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_FENCE_EARLY: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_FENCE_ERRORS: AtomicU32 = AtomicU32::new(0);
+/// Set whenever the KMD owes the host a `Close` of a fence handle it took over
+/// (`docs/rm-fence-marker.md`); the HPD worker swaps it to 0 and closes them.
+pub static FENCE_CLOSE_OWED: AtomicU32 = AtomicU32::new(0);
+/// Closes of KMD-owned fence handles the host did not take (`FnCloseErr`).
+pub static FENCE_CLOSE_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// Why a forward did not reach (or come back from) the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,13 +508,30 @@ fn forward_fence_create(
         return Err(Refusal::NoResources);
     }
     NVRM_IOCTLS.fetch_add(1, Ordering::Relaxed);
+    // The process the creating device belongs to, recorded with the fence: a WDDM
+    // carrier (`docs/rm-fence-marker.md`) checks it against the presenting
+    // context's process, because the presenting device is not this one. Read now,
+    // while this escape keeps `owner`'s device alive; 0 (never matches) if the
+    // handle cannot be resolved.
+    // `KMD_RM` is the KMD's own RM client, a token that is not a device handle
+    // (`usize::MAX`): never resolve it. Unreachable today (no escape names it, and
+    // the RM client does not forward a fence create), and guarded so a future caller
+    // cannot make it a wild dereference.
+    // SAFETY: `owner` is the `hDevice` of the escape being served, which dxgkrnl
+    // keeps alive until the escape returns.
+    let process = if owner == DeviceOwner::KMD_RM {
+        0
+    } else {
+        unsafe { crate::device::DeviceHandleRef::from_raw(owner.raw() as *mut core::ffi::c_void) }
+            .map_or(0, |d| d.creator_process())
+    };
     match ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms) {
         Ok(n) => {
             let handle = nvrm_fence::fence_handle_from_reply(resp, n);
             // A host status of 0 with no handle to own is a fence we cannot see.
             let host_ok = n >= MSG_HDR && rd_i32(resp, 8) == Some(0);
             let committed = adapter.with_virtio(|v| match handle {
-                Some(h) => Some(v.commit_nvrm_fence(owner, h)),
+                Some(h) => Some(v.commit_nvrm_fence(owner, h, process)),
                 None => {
                     v.cancel_nvrm_fence_create();
                     None
@@ -1239,6 +1264,109 @@ pub fn reclaim_stale_views(_passive: PassiveLevel, adapter: &AdapterContext, own
         if n < BATCH {
             break;
         }
+    }
+}
+
+/// Close, on the host, the fence handles the KMD took over and now owes a `Close`
+/// (they fired, or their present was dropped). Take-then-send, one at a time, as a
+/// user `Close` does: the host may hand the number to someone else the moment it
+/// closes it. PASSIVE. A transport that has failed is not asked: the sweep that
+/// retires it closes every handle.
+///
+/// Bounded, because the HPD worker runs it and `stop_hpd` joins the worker for 5 s
+/// (twice): each call waits at most [`FENCE_CLOSE_TIMEOUT_MS`] (the KMD's own RM
+/// client caps its steps at the same 2.5 s for this reason), and the loop ends at
+/// the first timeout (the host is not answering; each further handle would cost
+/// another full wait) and as soon as `hpd_stop` is set (the sweep of the transport
+/// retires what is left). What is left stays owed, and the next call goes on.
+pub fn close_owed_fences(passive: PassiveLevel, adapter: &AdapterContext) {
+    if FENCE_CLOSE_OWED.swap(0, Ordering::AcqRel) == 0 {
+        return;
+    }
+    let alive = adapter
+        .with_virtio(|v| !v.transport_failed())
+        .unwrap_or(false);
+    if !alive {
+        return;
+    }
+    loop {
+        if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
+            rearm_fence_close_debt(adapter);
+            break;
+        }
+        let taken = adapter
+            .with_virtio(|v| v.take_fence_to_close())
+            .ok()
+            .flatten();
+        let Some(handle) = taken else {
+            break;
+        };
+        NVRM_FENCES_CLOSED.fetch_add(1, Ordering::Relaxed);
+        let mut req = [0u8; MSG_HDR];
+        req[..4].copy_from_slice(&MSG_CLOSE.to_le_bytes());
+        req[4..8].copy_from_slice(&handle.to_le_bytes());
+        let mut resp = [0u8; MSG_HDR];
+        match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, FENCE_CLOSE_TIMEOUT_MS) {
+            Ok(n) if n >= MSG_HDR && rd_i32(&resp, 8) == Some(0) => {}
+            // The host answered no (it no longer knows the number): nothing to keep.
+            Ok(_) => {
+                FENCE_CLOSE_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            // Indeterminate (it may have closed): stay forgotten, as `Close` does.
+            // The host is not answering in time, so stop here.
+            Err(VirtioError::Timeout) => {
+                FENCE_CLOSE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                rearm_fence_close_debt(adapter);
+                break;
+            }
+            // Never reached the host: still the KMD's, for the transport sweep.
+            Err(_) => {
+                FENCE_CLOSE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                let _ = adapter.with_virtio(|v| v.restore_fence_after_failed_close(handle));
+            }
+        }
+    }
+}
+
+/// A `close_owed_fences` that stopped early leaves what it did not reach owed:
+/// raise the flag again so the next call (the worker's next pass, or an escape's)
+/// goes on. The flag was taken by that call's `swap(0)`.
+fn rearm_fence_close_debt(adapter: &AdapterContext) {
+    if adapter
+        .with_virtio(|v| v.fences_owing_close() != 0)
+        .unwrap_or(false)
+    {
+        FENCE_CLOSE_OWED.store(1, Ordering::Release);
+    }
+}
+
+/// The KMD took fence `handle` over for a present: drop what its creator had
+/// registered on it (`EVENT_REGISTER`, any owner). A user `Close` does this for
+/// the handle it closes (`release_events_for_handle`); the KMD's own close does
+/// not, so without this the registrations, and the event references they hold,
+/// would outlive the handle until the creator's device is destroyed. After the
+/// attach no one can register again (the handle is no longer theirs). PASSIVE.
+pub fn release_events_of_taken_fence(adapter: &AdapterContext, handle: u32) {
+    loop {
+        let event = adapter
+            .with_virtio(|v| v.take_nvrm_event_for_handle_any(handle))
+            .ok()
+            .flatten();
+        let Some(event) = event else {
+            break;
+        };
+        release_nvrm_event(event);
+    }
+}
+
+/// With no HPD worker (render-only `DisplayHalf=0`, or its creation failed) nothing
+/// else would send the fenced flips that fired or close the fence handles the KMD
+/// owes the host, so the callers that are PASSIVE anyway do it on their own thread:
+/// every NVRM escape, and the `Render` that takes a fence. One atomic load (and a
+/// short lock when there is a queue) when nothing is owed. A no-op with a worker.
+pub fn service_fences_without_worker(passive: PassiveLevel, adapter: &AdapterContext) {
+    if !adapter.hpd_running() {
+        adapter.foreign_fence_service(passive);
     }
 }
 

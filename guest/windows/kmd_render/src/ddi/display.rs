@@ -310,7 +310,16 @@ unsafe fn dxgkddi_present_inner(
     let stashed_stream_marker = present_context
         .as_ref()
         .and_then(ContextHandleRef::take_present_stream_marker_stash);
-    let present_stream_boundary = stashed_stream_marker.and_then(|(ctx_id, value, cookie)| {
+    let present_stream_boundary = stashed_stream_marker.and_then(|marker| {
+        let (ctx_id, value, cookie) = match marker {
+            // An RM fence attached at Render: only its boundary travels.
+            crate::device::StashedMarker::Resolved(boundary) => return Some(boundary),
+            crate::device::StashedMarker::Stream {
+                ctx_id,
+                value,
+                cookie,
+            } => (ctx_id, value, cookie),
+        };
         let creator_process = present_context
             .as_ref()
             .and_then(ContextHandleRef::creator_process)?;
@@ -516,6 +525,22 @@ unsafe fn dxgkddi_present_inner(
                     snapshot.height,
                     SNAPSHOT_BIND_FLAGS,
                     snapshot.dxgi_format,
+                )
+            } else if let Some(foreign) = crate::virtio::venus::foreign_source_if_enabled(
+                adapter,
+                source.foreign,
+                source.venus_alloc_size,
+            ) {
+                // An adopted foreign (NVK-on-RM) resource: imported as an
+                // explicit-modifier dma-buf image from its layout record. The
+                // pixel format is the record's fourcc. Every other source takes
+                // the match below, unchanged.
+                OptimalPresentImageDesc::new_foreign_dma_buf(
+                    source.resource_id,
+                    source.width,
+                    source.height,
+                    source_dxgi_format,
+                    foreign,
                 )
             } else {
                 match source.storage {

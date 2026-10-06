@@ -23,10 +23,18 @@
 //! # Ownership (all carriers)
 //!
 //! The KMD takes the handle over when the carrier is ACCEPTED (status OK for (a);
-//! the Present DDI resolving the marker for (b)). From then on the caller must
+//! `DxgkDdiRender` parsing the record for (b)). From then on the caller must
 //! never `Close`, `EVENT_REGISTER` on, `FORWARD` on or reuse it: all of those answer
 //! `NOT_OWNED`. The KMD closes it on the host when it fires or on any teardown.
-//! A refused carrier leaves the handle the caller's, who may CPU-wait and `Close`.
+//! A refused carrier whose call status the caller sees ((a) `SCANOUT_PRESENT`, and
+//! `HE12` version 4) leaves the handle the caller's, who may CPU-wait and `Close`.
+//!
+//! The exception is a `HERF` / `HEPR` tail (carrier (b)): its `Render` returns success
+//! whatever became of the tail, so the caller cannot learn a refusal. For ANY parsed
+//! tail whose handle is a fence of the presenting process the KMD therefore takes
+//! the handle and closes it, attached as the present's marker or not (both markers
+//! in one record, a partial stream tail, no room, ...). Never `Close` a handle you
+//! put in such a tail.
 
 use crate::wddm::{HeliosD3D12SubmitCmd, HeliosPresentRefreshCmd, HeliosPresentRenderCmd};
 use bytemuck::{Pod, Zeroable};
@@ -52,7 +60,8 @@ pub const HELIOS_NVRM_CAP_PRESENT_FENCE: u64 = 1 << 33;
 // Statuses (`HeliosNvrmHeader.status`). 13 and 14 are `SCANOUT_BUSY` / `NO_SOURCE`.
 // ---------------------------------------------------------------------------
 
-/// The fence handle is already attached to a present (and so is the KMD's now).
+/// Reserved: an already attached handle is the KMD's, so today it answers
+/// `NOT_OWNED` like any handle that is not the caller's.
 pub const HELIOS_NVRM_ST_FENCE_ATTACHED: i32 = 15;
 /// `SCANOUT_PRESENT` with a fence: the source already has
 /// [`HELIOS_NVRM_SCANOUT_FENCE_DEPTH`] presents waiting. Retry after the oldest
@@ -111,8 +120,9 @@ pub struct HeliosRmFenceTail {
 /// older KMD, losing the scanout-refresh arm, where a longer one merely loses the
 /// tail). The tail is read only when `CommandLength >= 48`, and the stream tail
 /// (`present_ctx_id`, `present_value`, `present_cookie`) must then be all zero:
-/// the two markers are exclusive, a record carrying both is refused (the fence is
-/// not attached; the present follows the legacy rule).
+/// the two markers are exclusive, a record carrying both has its stream marker
+/// honoured and its fence NOT attached (the present follows the stream marker); the
+/// fence handle is still the KMD's and is closed (`Render` cannot tell the caller).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosPresentRefreshCmdFence {

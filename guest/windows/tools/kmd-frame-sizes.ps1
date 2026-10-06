@@ -63,6 +63,10 @@ param(
         # dropping its by-value return slot from the budget.
         'E3newNtNtNtB5_9transport3pci12PciTransport',
         '24allocate_present_streams',
+        # The RM gate table (virtio/gpu/rm_gates.rs): a RmGateSlot is ~1.1 KiB (128
+        # points) built by value in this `inline(never)` frame, called from init like
+        # the present-stream allocator.
+        '17allocate_rm_gates',
         '30allocate_scanout_refresh_state',
         '14bring_up_venus',
         '26allocate_host_visible_blob',
@@ -82,6 +86,7 @@ param(
         '9lifecycle20dxgkddi_start_device,13probe_granted,15listed_messages',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,15program_vectors',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,24allocate_present_streams',
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,17allocate_rm_gates',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,30allocate_scanout_refresh_state',
         '9lifecycle20dxgkddi_start_device,14bring_up_venus,26allocate_host_visible_blob,13VenusInstance11into_device,13VenusInstance29create_device_with_ext_ladder'
     ),

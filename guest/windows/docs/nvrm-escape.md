@@ -693,6 +693,26 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
   inside a `FORWARD` on it can still name a recycled number: the commit-time rechecks narrow
   but do not close this), validation of RM structures, rate limiting, auditing which RM
   classes a process may allocate.
+- **Payload slots that name another client's object are not checked** (hardening list, security
+  last; nothing may rely on their absence). `FORWARD` checks the backend handle of the message
+  header and nothing inside the payload. `RM_DUP_OBJECT` across guest clients already works
+  through `FORWARD` with no check (shown on v311 with `crm_share_smoke`: a second client dups
+  the first client's memory object). The slots a hardening pass must check, against the
+  caller's own tables:
+
+  | where | slot (little endian, in the ioctl's nested/outer block) | namespace | check against |
+  |---|---|---|---|
+  | `NV_ESC_RM_DUP_OBJECT` (0x34, low 16 bits of the request `0x4634`), `NVOS55_PARAMETERS` (offsets as the host reads them, `vidmem.rs`) | `hClientSrc` at offset 12, and `hObjectSrc` at 16 | an RM client handle the guest minted with `NV01_ROOT` (not a backend handle) | the set of RM clients this device allocated: the KMD does not track them today (it tracks backend file handles), so this needs `RM_ALLOC` of class `NV01_ROOT` recorded per owner and dropped on `RM_FREE` / `Close`; not a few lines |
+  | `NV_ESC_RM_CONTROL` (0x2a) cmd `0x3d06` `OS_UNIX_IMPORT_OBJECT_FROM_FD` | `fd` at nested offset 0 | a backend handle (the host's per-connection table) | `nvrm_handle_owned(owner, fd)` |
+  | `NV_ESC_RM_CONTROL` cmd `0x3d05` `OS_UNIX_EXPORT_OBJECT_TO_FD` | `fd` at nested offset 16 | a backend handle | `nvrm_handle_owned(owner, fd)` |
+  | NVKMS `GEM_IMPORT_NVKMS_MEMORY` / `GEM_EXPORT_NVKMS_MEMORY` ioctls | `memFd` at the ioctl's `nested_fd_offset` (host: `nested.rs`) | a backend handle | `nvrm_handle_owned(owner, memFd)` |
+  | `NV0005` event class alloc | `data` at offset 16 | a backend handle | `nvrm_handle_owned(owner, data)` |
+
+  The `0x3d06` / `0x3d05` / `memFd` slots are what `RM_RESOURCE_IMPORT` replaces for the
+  cross-process case: its GEM handle lives in the importer's own DRM file, so the importer
+  exports it to a control descriptor of its OWN and never needs another process's handle.
+  Once the slots above are checked, a process can reach another process's memory only through
+  the resource id the KMD gates (`shared-foreign-surfaces.md` section 6).
 - **Pin tags are trusted.** `h_root`/`h_object` on `PIN` are the caller's word; the KMD only
   uses them to decide when `RM_FREE` unlocks a pin. A mis-tagging process can unlock its own
   pages while the host still maps them. Hardening TODO: take the object handle from the

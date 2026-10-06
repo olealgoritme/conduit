@@ -157,6 +157,16 @@ pub(crate) struct AdapterKnobs {
     /// steady-state path never waits or maps a frame, and the per-pair
     /// `probe_done` state statically prevents repeated readbacks.
     pub present_probe: bool,
+    /// `ForeignCopy` (default 0 = OFF; set 1 to test). The KMD copy of a foreign (NVK-on-RM)
+    /// resource into the LINEAR scan-out image: the explicit-modifier dma-buf
+    /// import (`virtio::venus::foreign_copy`) and, with it, the
+    /// `VK_EXT_image_drm_format_modifier` device-extension tier of the
+    /// `CreateDevice` ladder (only on a host that serves `IMPORT_RM`, and only
+    /// at device creation, i.e. the next StartDevice). 0 is the bisect lever: the
+    /// device is the export-only one it was before the feature, and a foreign
+    /// source takes the ordinary OPTIMAL import (which the host refuses for these
+    /// resources). `FcOff` counts foreign sources seen while it is 0.
+    pub foreign_copy: bool,
     /// `DisplayHalf` (default 1 = ON — the render+display miniport IS the
     /// product; the hardware-accelerated desktop shipped on it). When nonzero,
     /// StartDevice advertises ONE video-present source + ONE child
@@ -231,6 +241,7 @@ impl AdapterKnobs {
         bind_flush_immediate: false,
         dispatch_bind: true,
         present_probe: false,
+        foreign_copy: false,
         display_half: true,
         direct_flip: false,
         cross_adapter: false,
@@ -261,6 +272,7 @@ impl AdapterKnobs {
             bind_flush_immediate: read_config_dword(knobs::BIND_FLUSH_MODE, 0) == 1,
             dispatch_bind: read_config_dword(knobs::DISPATCH_BIND, 1) != 0,
             present_probe: read_config_dword(knobs::PRESENT_PROBE, 0) != 0,
+            foreign_copy: read_config_dword(knobs::FOREIGN_COPY, 0) != 0,
             display_half: read_config_dword(knobs::DISPLAY_HALF, 1) != 0,
             direct_flip: read_config_dword(knobs::DIRECT_FLIP_CAPS, 0) != 0,
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
@@ -282,6 +294,7 @@ impl AdapterKnobs {
         crate::diag::record_named_bytes(b"BndFM", knobs.bind_flush_immediate as u32);
         crate::diag::record_named_bytes(b"DspBnd", knobs.dispatch_bind as u32);
         crate::diag::record_named_bytes(b"PBPrEn", knobs.present_probe as u32);
+        crate::diag::record_named_bytes(b"FcKnob", knobs.foreign_copy as u32);
         crate::diag::record_named_bytes(b"DspH", knobs.display_half as u32);
         crate::diag::record_named_bytes(b"BarF", knobs.bar_seg_flags);
         crate::diag::record_named_bytes(b"BarB", knobs.bar_seg_base_mb);
