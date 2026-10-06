@@ -49,6 +49,78 @@ pub fn major(v: &str) -> u32 {
     DriverVersion::parse(v).map_or(0, |v| v.major)
 }
 
+/// An NVIDIA display GPU bound to the `nvidia` driver, as `conduit doctor` shows it.
+#[derive(Debug, PartialEq)]
+pub struct Gpu {
+    /// PCI address, e.g. `0000:01:00.0`.
+    pub addr: String,
+    /// PCI device id (0x2b85 for an RTX 5090, 0x2786 / 0x2709 for an RTX 4070).
+    pub device: u32,
+    /// `Model:` from /proc/driver/nvidia/gpus/<addr>/information.
+    pub model: Option<String>,
+    /// BAR1 length in bytes (the second line of sysfs `resource`).
+    pub bar1: Option<u64>,
+}
+
+/// The `Model:` line of /proc/driver/nvidia/gpus/<addr>/information.
+pub fn parse_gpu_model(info: &str) -> Option<String> {
+    let line = info
+        .lines()
+        .find(|l| l.trim_start().starts_with("Model:"))?;
+    let m = line.trim_start().trim_start_matches("Model:").trim();
+    (!m.is_empty()).then(|| m.to_string())
+}
+
+/// BAR1's length from a sysfs `resource` file (one `start end flags` line per BAR).
+pub fn parse_bar1(resource: &str) -> Option<u64> {
+    let hex = |s: &str| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok();
+    let mut f = resource.lines().nth(1)?.split_whitespace();
+    let (start, end) = (hex(f.next()?)?, hex(f.next()?)?);
+    (end > start).then(|| end - start + 1)
+}
+
+/// NVIDIA display GPUs under `pci_devices` (/sys/bus/pci/devices) bound to `nvidia`, with
+/// their model from `proc_gpus` (/proc/driver/nvidia/gpus). Sorted by address.
+pub fn gpus_in(pci_devices: &Path, proc_gpus: &Path) -> Vec<Gpu> {
+    let read = |p: std::path::PathBuf| std::fs::read_to_string(p).ok();
+    let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    let Ok(dir) = std::fs::read_dir(pci_devices) else {
+        return Vec::new();
+    };
+    let mut v: Vec<Gpu> = dir
+        .flatten()
+        .filter_map(|e| {
+            let d = e.path();
+            if hex(&read(d.join("vendor"))?)? != 0x10de
+                || hex(&read(d.join("class"))?)? >> 16 != 0x03
+            {
+                return None;
+            }
+            let driver = std::fs::read_link(d.join("driver")).ok()?;
+            if driver.file_name()? != "nvidia" {
+                return None;
+            }
+            let addr = e.file_name().to_string_lossy().into_owned();
+            Some(Gpu {
+                device: hex(&read(d.join("device"))?)? as u32,
+                model: read(proc_gpus.join(&addr).join("information"))
+                    .and_then(|t| parse_gpu_model(&t)),
+                bar1: read(d.join("resource")).and_then(|t| parse_bar1(&t)),
+                addr,
+            })
+        })
+        .collect();
+    v.sort_by(|a, b| a.addr.cmp(&b.addr));
+    v
+}
+
+pub fn gpus() -> Vec<Gpu> {
+    gpus_in(
+        Path::new("/sys/bus/pci/devices"),
+        Path::new("/proc/driver/nvidia/gpus"),
+    )
+}
+
 /// Driver releases the backend accepts: those with exact ABI tables.
 /// Installed: share/conduit/supported-drivers.txt (one per line, written by
 /// packaging/build.sh via packaging/supported-drivers.sh). Source checkout:
@@ -228,6 +300,87 @@ mod tests {
         assert!(same_release("580.178.04", "580.178.4"));
         assert!(!same_release("565.77", "565.77.01"));
         assert!(!same_release("565.77", "565.57.01"));
+    }
+
+    #[test]
+    fn gpu_model_and_bar1() {
+        let info = "Model: \t\t NVIDIA GeForce RTX 5090\nIRQ:   \t\t 180\nGPU UUID: \t GPU-x\n";
+        assert_eq!(
+            parse_gpu_model(info).as_deref(),
+            Some("NVIDIA GeForce RTX 5090")
+        );
+        assert_eq!(parse_gpu_model("IRQ: 1\n"), None);
+        // An RTX 5090: BAR0 64 MiB, BAR1 32 GiB.
+        let res = "0x00000000f8000000 0x00000000fbffffff 0x0000000000040200\n\
+                   0x0000004000000000 0x00000047ffffffff 0x000000000014220c\n";
+        assert_eq!(parse_bar1(res), Some(32 << 30));
+        // ReBAR off: 256 MiB.
+        let off = "0x00000000f8000000 0x00000000fbffffff 0x0000000000040200\n\
+                   0x00000000e0000000 0x00000000efffffff 0x000000000014220c\n";
+        assert_eq!(parse_bar1(off), Some(256 << 20));
+        assert_eq!(parse_bar1("0x0 0x0 0x0\n0x0 0x0 0x0\n"), None);
+        assert_eq!(parse_bar1(""), None);
+    }
+
+    #[test]
+    fn gpus_from_sysfs() {
+        let t = std::env::temp_dir().join(format!("conduit-gpus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let (pci, procg) = (t.join("pci"), t.join("proc"));
+        let dev = |addr: &str, vendor: &str, class: &str, device: &str, driver: &str| {
+            let d = pci.join(addr);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("vendor"), vendor).unwrap();
+            std::fs::write(d.join("class"), class).unwrap();
+            std::fs::write(d.join("device"), device).unwrap();
+            std::fs::write(
+                d.join("resource"),
+                "0x00000000f8000000 0x00000000fbffffff 0x0\n0x0000004000000000 0x00000043ffffffff 0x0\n",
+            )
+            .unwrap();
+            let drv = t.join("drivers").join(driver);
+            std::fs::create_dir_all(&drv).unwrap();
+            std::os::unix::fs::symlink(&drv, d.join("driver")).unwrap();
+        };
+        dev(
+            "0000:01:00.0",
+            "0x10de\n",
+            "0x030000\n",
+            "0x2786\n",
+            "nvidia",
+        );
+        dev(
+            "0000:01:00.1",
+            "0x10de\n",
+            "0x040300\n",
+            "0x22bc\n",
+            "snd_hda_intel",
+        ); // its audio
+        dev(
+            "0000:02:00.0",
+            "0x10de\n",
+            "0x030000\n",
+            "0x2b85\n",
+            "vfio-pci",
+        ); // not ours
+        dev("0000:03:00.0", "0x8086\n", "0x030000\n", "0xa780\n", "i915");
+        std::fs::create_dir_all(procg.join("0000:01:00.0")).unwrap();
+        std::fs::write(
+            procg.join("0000:01:00.0/information"),
+            "Model: \t\t NVIDIA GeForce RTX 4070\n",
+        )
+        .unwrap();
+        let g = gpus_in(&pci, &procg);
+        let _ = std::fs::remove_dir_all(&t);
+        assert_eq!(
+            g,
+            vec![Gpu {
+                addr: "0000:01:00.0".into(),
+                device: 0x2786,
+                model: Some("NVIDIA GeForce RTX 4070".into()),
+                bar1: Some(16 << 30),
+            }]
+        );
     }
 
     #[test]
