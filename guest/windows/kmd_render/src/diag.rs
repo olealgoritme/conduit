@@ -700,6 +700,17 @@ pub mod knobs {
     /// the worker to refresh the heartbeat block every 2 s. 0 never arms it. Read at every
     /// StartDevice; mirrored as `VsWdTmEff`.
     pub const VS_WD_TIMER: KnobName = KnobName::new(b"VsWdTimer");
+    /// `RestSeed` (default 1 = on): persist the newest flip address dxgkrnl issued in the
+    /// service key (`RestIssLo` / `RestIssHi` / `RestUpS` / `RestChk`) and seed the restarted
+    /// heartbeat from it after a `pnputil /restart-device` that RELOADED the image (every static
+    /// zero). 0 = the v329 behaviour, statics only, nothing written or read. Read at every
+    /// StartDevice; mirrored as `RestSeedEff` (docs/zero-copy-present.md section 20).
+    pub const REST_SEED: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_KNOB);
+    /// The persisted words, read at StartDevice (`restart_flip::Persisted`).
+    pub const REST_ISS_LO: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_ISS_LO);
+    pub const REST_ISS_HI: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_ISS_HI);
+    pub const REST_UPTIME: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_UPTIME);
+    pub const REST_CHECK: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_CHECK);
     /// Segment topology. Legal values 0 and 10 only — see `BarSegTopology`.
     pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
     /// CpuVisible cached-allocation kill switch (default 1 = cached).
