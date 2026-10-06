@@ -742,6 +742,30 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
             match rx.try_recv() {
                 Ok(Watch::Add(handle, fd, fence)) => {
                     if ctl(libc::EPOLL_CTL_ADD, fd.as_raw_fd(), handle) == 0 {
+                        // Edge-triggered misses a descriptor that is already
+                        // readable when it is added: a fence made for a value
+                        // the GPU has passed signals before it gets here.
+                        // Ask it once now rather than leave it to the sweep,
+                        // which costs up to a millisecond per such fence.
+                        let mut pfd = libc::pollfd {
+                            fd: fd.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let ready = unsafe { libc::poll(&mut pfd, 1, 0) } > 0
+                            && pfd.revents & libc::POLLIN != 0;
+                        if ready && fence {
+                            // Reported once and never watched, as the sweep
+                            // would do for a signalled fence.
+                            let status = sync_file_status(fd.as_raw_fd());
+                            if push_event(&vring, &mem, handle, status) {
+                                ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle);
+                                continue;
+                            }
+                        }
+                        if ready && push_event(&vring, &mem, handle, 0) {
+                            last_report.insert(handle as u64, Instant::now());
+                        }
                         watched.insert(handle as u64, fd);
                         if fence {
                             once.insert(handle as u64);
