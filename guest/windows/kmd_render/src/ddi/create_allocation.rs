@@ -201,6 +201,13 @@ struct AllocationContext {
     dedicated_present_buffer: bool,
     /// Nonzero only for a registered VidMm tracker allocation.
     vidmm_tracker_cookie: u32,
+    /// The layout of the foreign (NVK-on-RM) resource this allocation adopted,
+    /// recorded at create time; `None` for every other allocation. Immutable.
+    /// The KMD's scan-out copy imports such a source as an explicit-modifier
+    /// dma-buf image from this layout and `venus_alloc_size` (the recorded
+    /// size), after checking both against the foreign table once
+    /// (`VenusClient::foreign_preflight`).
+    foreign: Option<fr::Layout>,
 }
 
 /// Resolutions refused because the allocation context was created by an older
@@ -304,6 +311,16 @@ pub struct PresentAllocInfo {
     /// The allocation was created from the runtime's documented
     /// `pPrimaryDesc` contract and explicitly exported for direct scanout.
     pub direct_scanout: bool,
+    /// The layout of an adopted foreign (NVK-on-RM) resource, read at open time
+    /// from the KMD-written layout trailer of the allocation's private data
+    /// (`HeliosWddmAllocLayout`), or `None`. A HINT: the KMD overwrites the
+    /// trailer of a foreign adoption, so a foreign resource always carries its
+    /// true layout, but an ordinary allocation's creator controls those bytes and
+    /// could forge one; the import therefore checks it against the foreign table
+    /// (which holds the record) before using it, and refuses a mismatch. Lock-free
+    /// to read, which is why the Present path takes it from here and not from the
+    /// table.
+    pub foreign: Option<fr::Layout>,
 }
 
 /// TRACE-ONLY companion to [`PresentAllocInfo`], resolved by
@@ -1349,6 +1366,13 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
                         target_image_id,
                     )?
                 } else {
+                    // `Some` only for an adopted foreign resource, and only with
+                    // the `ForeignCopy` knob on; everything else is unchanged.
+                    let foreign = crate::virtio::venus::foreign_source_if_enabled(
+                        adapter,
+                        ctx.foreign,
+                        ctx.venus_alloc_size,
+                    );
                     client.prepare_optimal_scanout_copy(
                         adapter,
                         ctx.resource_id,
@@ -1359,6 +1383,7 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
                         ctx.dxgi_format,
                         ctx.bind_flags,
                         target_image_id,
+                        foreign,
                     )?
                 };
                 publish_prepared_copy(ctx, &copy);
@@ -1671,6 +1696,34 @@ unsafe fn read_layout_trailer(
     };
     let layout: HeliosWddmAllocLayout = pod_read_unaligned(bytes);
     layout.is_valid().then_some(layout)
+}
+
+/// The foreign layout an opener may hand to the KMD's copy import, from the
+/// trailer and the meta of the same private data (the rules are
+/// `helios_kmd_logic::foreign_copy::layout_from_open`, host-tested). A forged
+/// trailer on an ordinary allocation can pass them and is caught by the table
+/// check in the import.
+fn foreign_layout_from_open(
+    kind: u32,
+    meta: Option<HeliosWddmAllocMeta>,
+    trailer: Option<HeliosWddmAllocLayout>,
+) -> Option<fr::Layout> {
+    use helios_kmd_logic::foreign_copy::{layout_from_open, OpenMeta, OpenTrailer};
+    layout_from_open(
+        kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+        meta.map(|m| OpenMeta {
+            width: m.width,
+            height: m.height,
+            pitch: m.pitch,
+            plane_offset: m.plane_offset,
+        }),
+        trailer.map(|t| OpenTrailer {
+            modifier: t.modifier,
+            fourcc: t.fourcc,
+            stride: t.stride,
+            plane_offset: t.plane_offset,
+        }),
+    )
 }
 
 /// Identity summary parsed from an allocation's private driver data at
@@ -2970,6 +3023,10 @@ unsafe fn create_one(
         system_backing_policy,
         dedicated_present_buffer,
         vidmm_tracker_cookie: 0,
+        foreign: match foreign_backing {
+            ForeignBacking::Adopted(layout) => Some(layout),
+            ForeignBacking::No => None,
+        },
     });
 
     let mut ctx = ctx;
@@ -3419,6 +3476,13 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         }
 
         let open_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+        // The foreign layout trailer, if the KMD wrote one (see
+        // `PresentAllocInfo::foreign`). Read like the meta above: this entry's
+        // private data first, the call's second.
+        let foreign_trailer = unsafe {
+            read_layout_trailer(info.pPrivateDriverData, info.PrivateDriverDataSize)
+                .or_else(|| read_layout_trailer(args.pPrivateDriverData, args.PrivateDriverSize))
+        };
         let present = ident.map(|identity| {
             let misc_flags = meta.map(|m| m.misc_flags).unwrap_or(0);
             let storage = if identity.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
@@ -3446,6 +3510,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 venus_alloc_size: identity.venus_alloc_size,
                 memory_type_index: identity.memory_type_index,
                 direct_scanout: misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT != 0,
+                foreign: foreign_layout_from_open(identity.kind, meta, foreign_trailer),
             }
         });
         // Trace-only companion (R316): these seven values have no consumer

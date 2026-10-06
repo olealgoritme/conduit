@@ -492,7 +492,7 @@ What the UMD must change (not done here): `PresentStreamCorrelation::is_complete
    `VkImageDrmFormatModifierExplicitCreateInfoEXT { drmFormatModifier = layout.modifier,
    drmFormatModifierPlaneCount = 1, pPlaneLayouts = { offset = layout.offset, rowPitch = layout.stride } }`,
    reading `VirtioGpu::foreign_layout`. It currently creates a plain OPTIMAL image and infers layout from
-   the size. Not rewritten here.
+   the size. Not rewritten here. **Done: section 11.**
 2. **Layout on the host wire.** The 56-byte `RESOURCE_CREATE_BLOB` has no room for the layout; the host
    learns it from the GEM object or from a new message. Needed before the gate opens.
 3. **KMD-driven `ScanoutFlip`** in `program_vidpn_source_inner` (plan 3.6 Option B): read
@@ -549,6 +549,116 @@ Wire contract (host: docs/VENUS.md "RM-export blobs"):
 * An importing context (the UMD bridge, DWM) must create the image with
   `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` (explicit modifier, one plane, offset 0,
   `rowPitch`), `VkExternalMemoryImageCreateInfo{DMA_BUF}`, `VkImportMemoryResourceInfoMESA`
-  and a dedicated allocation. The KMD's own `prepare_optimal_scanout_copy` still makes a
-  plain OPTIMAL opaque-fd image and fails for these; the direct flip (a foreign source
-  scanned out with `ScanoutFlip`) does not use it.
+  and a dedicated allocation. The KMD's own `prepare_optimal_scanout_copy` used to make a
+  plain OPTIMAL opaque-fd image and fail for these; it now builds exactly this import for a
+  foreign source (section 11). The direct flip (a foreign source scanned out with
+  `ScanoutFlip`) does not use it.
+
+## 11. The KMD copy of a foreign resource (Blt model / KMD copy)
+
+A foreign resource that is not scanned out directly still has to reach the screen: the legacy
+windowed present (the Blt / GDI / DWM-composed path) copies the source allocation into DWM's
+destination, and the primary copy (`SetVidPnSourceAddress` of a non-direct primary) copies it into
+the adapter's LINEAR scan-out image. Both import the source into the KMD's own Venus device. For
+an ordinary UMD resource that is a plain OPTIMAL opaque-fd image and nothing below changes it. For a
+foreign resource the host's NVIDIA driver accepts only the explicit-modifier import (10.5), so the
+KMD now builds that.
+
+### 11.1 What is built
+
+For a source that adopted a foreign resource (a layout record exists, 10.1):
+
+| step | Vulkan | from |
+|---|---|---|
+| image | `vkCreateImage`: `VkExternalMemoryImageCreateInfo{DMA_BUF}` -> `VkImageDrmFormatModifierExplicitCreateInfoEXT{modifier, 1 plane, {offset, rowPitch}}`, `tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`, 2D, 1 mip, 1 layer, `TRANSFER_SRC`, UNDEFINED | record: fourcc (-> format), modifier, stride (-> rowPitch), offset; extent from the layout, which must be the copied extent |
+| requirements | `vkGetImageMemoryRequirements` | refused if `required > recorded size` (the undersize guard of the OPTIMAL path) |
+| memory type | the first allowed DEVICE_LOCAL type (VRAM first), by the KMD device's own choice | the creator has no `vkAllocateMemory`, so there is no creator type to reuse |
+| memory | `vkAllocateMemory`: `VkImportMemoryResourceInfoMESA{resource}` -> `VkMemoryDedicatedAllocateInfo{image}`, `allocationSize = required` | the resource must be attached to the KMD context first (as for any import) |
+| bind | `vkBindImageMemory` offset 0 | |
+
+Then the existing recorders run unchanged: acquire from the external family GENERAL -> GENERAL,
+`vkCmdCopyImage` (or `vkCmdBlitImage` through the BGRA scratch image when the source is
+`DRM_FORMAT_XBGR/ABGR8888`, whose bytes are R8G8B8A8), release. The conversion decision uses the
+record's fourcc, never the allocation's DXGI format. `SIMULTANEOUS_USE`, the ring-1 submit, the
+wire fence and the teardown drain are the ones the OPTIMAL path has.
+
+Mapping (`helios_kmd_logic::foreign_copy`): `XRGB8888`/`ARGB8888` -> `B8G8R8A8_UNORM` (44),
+`XBGR8888`/`ABGR8888` -> `R8G8B8A8_UNORM` (37). The modifier set is the record's: LINEAR and
+`0x0300000000606010 | h`, `h <= 5`. The VkSubresourceLayout carries `size = arrayPitch = depthPitch
+= 0` as the spec requires for a single-layer 2D image.
+
+One deviation from the host spike (c6fab91) worth knowing: the spike passed the object size in
+`VkSubresourceLayout.size` and allocated `mr.size`; the KMD follows the spec for the layout (size 0)
+and allocates the image's own requirement, as the spike did. `allocationSize` is therefore not the
+recorded size but at most it (a dedicated allocation must equal the image's requirement, and the host
+relaxes its check to `image size <= resource size`, 10.5).
+
+### 11.2 Where it plugs in
+
+* `virtio/venus/foreign_copy.rs` (new): `ForeignSource{layout, record_size}`,
+  `foreign_preflight` (no host contact), `import_foreign_source`, the counters.
+* `virtio/venus/scanout.rs::prepare_optimal_scanout_copy` takes `foreign: Option<ForeignSource>`;
+  `None` runs the code it always ran (the OPTIMAL steps moved into an `else` block, statement for
+  statement).
+* `virtio/venus/present.rs`: `OptimalPresentImageDesc::new_foreign_dma_buf`; its `foreign` field is
+  part of the descriptor's identity; `import_optimal_present_image` branches first on it. The
+  imported image is an ordinary `ImportedOptimalImage`, so the cache and
+  `release_present_blits_for_resource` need nothing new.
+* `ddi/create_allocation.rs`: `AllocationContext::foreign` (the adopted layout, for the primary
+  copy) and `PresentAllocInfo::foreign` (read at OpenAllocation from the KMD-written layout trailer,
+  for the Blt); `ddi/display.rs` chooses the foreign descriptor for the Present source.
+* `virtio/gpu/foreign_tables.rs::foreign_record` (layout + size in one lookup).
+* pure logic and tests: `kmd_logic/src/foreign_copy.rs`, the two new encoder variants
+  (`ImagePNext::ExternalMemoryDrmExplicit`, `MemoryPNext::ImportResourceDedicated`) in `kmd_logic/src/lib.rs`
+  (golden bytes written out field by field from `vn_encode_VkImageCreateInfo`).
+
+Trust: the layout travels with the allocation (no lock on the present path), but the import checks it
+once against the foreign table (`foreign_record`: same layout, same size) and refuses a mismatch or a
+missing record (`FcStale`). A forged trailer on an ordinary allocation therefore cannot turn it into
+a foreign import, and a stale one cannot import a recycled resource id.
+
+### 11.3 The device extension, and why it is gated
+
+The image needs `VK_EXT_image_drm_format_modifier` enabled on the KMD's `VkDevice`. The KMD's device
+had only the export trio on purpose: a global enable of this extension (with `VK_KHR_image_format_list`)
+in the 38th session inflated the memory requirements of ordinary shared OPTIMAL imports (undersized-import
+refusals, DWM failures, Xid 31). So the `CreateDevice` ladder gained a tier 0 (export trio + the one extension,
+no format list) that is tried first **only** when all three hold:
+
+* the `ForeignCopy` knob is not 0 (default 1);
+* the adapter is the display half;
+* the host serves `IMPORT_RM` (config features `NVGPU_CFG_RM_IMPORT` and `NVGPU_CFG_VENUS`): otherwise no
+  foreign resource can exist and the extension would only add the risk.
+
+Everywhere else the ladder starts where it did (tier 1 = export trio, tier 2 = none) and the device is
+byte-for-byte the previous one. A host that refuses the extension steps down to tier 1: bring-up
+succeeds, `FcDevX` reads 0, `SdgDevR` holds the refusing VkResult, and a foreign source is refused at
+use (`FcNoExt`). `SdgDevX` = 0 now means tier 0.
+
+### 11.4 Knob and counters
+
+`ForeignCopy` (REG_DWORD in the service key, default 1, read like every knob at AddAdapter/StartDevice;
+the device tier is chosen at device creation, so a change needs a device restart): 0 restores the
+previous device and makes a foreign source take the ordinary OPTIMAL import (which the host refuses), for a
+same-boot bisect. `FcKnob` mirrors it.
+
+| counter | meaning |
+|---|---|
+| `FcDevWant` / `FcDevX` | tier 0 attempted / obtained (written at device creation) |
+| `FcImp`, `FcScan`, `FcBlt` | complete imports; of which for the primary copy and for the Blt (`FcImp = FcScan + FcBlt`) |
+| `FcRefuse`, `FcRefCode` | refusals the KMD decided, and the last code: 1 dimensions, 2 fourcc, 3 stride, 4 modifier, 5 layout larger than the resource, 6 no format, 7 extent differs, 8 size 0, 9 image needs more than the resource, 10 no memory type |
+| `FcHostErr` | the host refused a step (image, requirements, memory, bind) |
+| `FcNoExt` | foreign source on a device without the extension |
+| `FcStale` | the allocation's layout disagreed with the table, or no record |
+| `FcOff` | foreign source seen with the knob at 0 |
+| `FcImpSt` (stage), `FcImgVr` / `FcMemVr` (raw VkResult), `FcReq`, `FcBit`, `FcMt` | breadcrumbs: last stage, host results, requirement size / memory-type bits / chosen type |
+
+### 11.5 Not tested
+
+Nothing here has run. The KMD cannot be built or run here; the Venus tree was type-checked against a stub
+of the surrounding crate (the new KMD files, the touched Venus files, bring-up), the `ddi/` and `adapter/`
+edits were reviewed and rustfmt-parsed only, and the pure logic has host tests (`cargo test` in `kmd_logic`).
+In particular unverified: that the host accepts `VkImportMemoryResourceInfoMESA` + dedicated
+for a dma-buf resource as this image; that NVIDIA accepts the layout with `size = 0`; that the
+extension enable does not move ordinary OPTIMAL import sizes on the production device (the reason for the
+gate and the knob); that `vkCmdBlitImage` from the modifier image is supported for the R8G8B8A8 source.
