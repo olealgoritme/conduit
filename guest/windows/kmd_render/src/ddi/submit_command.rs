@@ -225,6 +225,9 @@ pub(crate) fn publish_nvrm_counters() {
         b"NvEvErr",
         crate::virtio::nvrm::NVRM_EV_ERRORS.load(Ordering::Relaxed),
     );
+    // Foreign scanout source (HELIOS_NVRM_OP_SCANOUT_*): `FsSet`, `FsPres`, `FsRel`,
+    // `FsLapse`, `FsEnd`, `FsTake`, `FsSupp`, `FsRest`, `FsRef`, `FsErr`.
+    crate::adapter::foreign_scanout::publish_counters();
 }
 
 /// Mirror the scheduler private-data handoff evidence at PASSIVE_LEVEL.

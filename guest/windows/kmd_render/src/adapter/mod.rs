@@ -22,6 +22,7 @@ use crate::virtio::VirtioGpu;
 use helios_kmd_logic::DisplayMode;
 
 mod backing;
+pub(crate) mod foreign_scanout;
 pub(crate) mod kobj;
 mod locks;
 pub(crate) use locks::ControlSpaceWaiter;
@@ -1281,6 +1282,9 @@ impl AdapterContext {
         let was_programming = gate_active(self.vidpn_programming.load(Ordering::Acquire)) as u32;
         let was_resource = self.active_scanout_resource.load(Ordering::Acquire);
 
+        // A foreign scanout source names RM handles of the generation being
+        // abandoned; the display state below is rebuilt, so no restore is owed.
+        self.foreign_scanout_reset();
         self.vidpn_programming.store(0, Ordering::Release);
         self.pending_vidpn_allocation.store(0, Ordering::Release);
         for slot in &self.frame_watermark_resource {

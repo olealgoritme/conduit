@@ -232,6 +232,8 @@ pub fn forward(
                         // The host's objects, and its alias of the pinned pages,
                         // are gone: the pins hang off this handle and unlock now.
                         release_pins_for_handle(adapter, owner, handle);
+                        // A foreign scanout source on this file ends with it.
+                        adapter.foreign_scanout_release_handle(owner, handle);
                     } else {
                         restore();
                     }
@@ -240,6 +242,7 @@ pub fn forward(
                 // A timeout is indeterminate (it may have closed): stay forgotten.
                 Err(VirtioError::Timeout) => {
                     release_events_for_handle(adapter, owner, handle);
+                    adapter.foreign_scanout_release_handle(owner, handle);
                     Err(Refusal::Transport(VirtioError::Timeout))
                 }
                 // Anything else never reached the host.
@@ -300,6 +303,11 @@ pub fn forward(
                 None => return Err(refused(Refusal::NotOwned)),
                 Some(t) if t < DEVICE_TYPE_DRI_FIRST => return Err(refused(Refusal::Forbidden)),
                 Some(_) => {}
+            }
+            // Another device holds scanout 0 as a foreign scanout source: its
+            // frames must not alternate with this one's.
+            if adapter.foreign_scanout_blocks_flip(owner) {
+                return Err(refused(Refusal::Forbidden));
             }
             NVRM_FLIPS.fetch_add(1, Ordering::Relaxed);
             ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms).map_err(Refusal::Transport)
@@ -1004,6 +1012,9 @@ pub fn close_all_for_owner(
     // Events first: nothing of this owner's may be signalled from here on, and the
     // references are PASSIVE-only to drop.
     release_events_for_owner(adapter, owner);
+    // A foreign scanout source of this owner ends first: the desktop gets scanout
+    // 0 back whatever the host does with the rest of the teardown.
+    adapter.foreign_scanout_release_owner(owner);
     // After the first transport failure the host is not answering: stop sending
     // (a wedged host would cost seconds per handle) but keep clearing the tables,
     // so no entry outlives the device handle it names.
