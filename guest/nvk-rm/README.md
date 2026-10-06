@@ -107,6 +107,7 @@ is the next step. Nine more Mesa patches on top of the 13 above, in `patches-win
 | 38 | `nvk/rm: a Helios shared-surface import goes on the device's memory list` | patch 31's `nvkmd_rm_mem_import_resource` made the memory outside the `nvkmd_dev_*` wrappers, so it never went on `dev->mems`, and `nvkmd_mem_unref` took it off: an access violation in `nvkmd_mem_unref` when the opener freed an imported shared surface (`d3d11_share` on NVK, every mode, KMD 22.22.318.1). `nvkmd_dev_track_imported_mem` puts it on the list like every other import |
 | 39 | `wsi/win32: scanout swapchains get two images; a one-image one does not hang` | Zink's kopper creates its swapchain with the surface's `minImageCount`, which the Win32 surface reported as 1. After patch 36 a one-image scanout chain kept its only image QUEUED after the present, so the next acquire waited forever (wgl_test on NVK hung in its first `SwapBuffers`, also with `NVK_RM_FENCE=0` and `NVK_SCANOUT_RELEASE=0`; `NVK_HELIOS_WSI=0` passed). The surface now reports 2 when the driver flips, and a one-image chain gets its image back at once, as before patch 36 |
 | 43 | `nvkmd: keep the device's memory list consistent; log misuse with a stack` | `nvkmd_dev_alloc_mapped_mem`'s map-failure path freed a listed memory without unlinking it; add/remove on `dev->mems` are idempotent and `nvkmd_rm_mem_free` unlinks a still-listed memory, each misuse logged (`mesa_loge`, module+offset stack, 16 per process). Turns the ledger-on exit crash (`nvkmd_mem_unref` `list_del` on a freed neighbour) into a log line that names the culprit |
+| 45 | `nvk/rm: host-visible VRAM has no fixed budget; a full heap falls back to system memory` | Replaces patch 22's 256 MiB budget: the BAR heap is sized from BAR1 (one big page below VRAM so it never reads as a full ReBAR) and is no longer a hard limit. An allocation past the reported size goes to system memory, as one whose CPU map the host refused (patch 25) already did, and neither is charged to the heap. The host's window is the real limit. A full heap used to return `VK_ERROR_OUT_OF_DEVICE_MEMORY`, which DXVK latched in the command buffer it was recording and `vkEndCommandBuffer` then failed. `NVK_RM_BAR_MB` still overrides the reported size (0 = off) |
 | 44 | `nvk/rm: a device whose KMD went away touches none of its mappings` | Windows device loss (a live driver update or device restart under a running NVK process): librmclient registers every KMD view of RM memory in the loss table it shares with the Venus ICD and the Helios UMD (`guest/windows/umd_common/bridge/helios_kmdmap.h`), so a vanished view reads as zero pages, and the loss epoch moves (`crm_win_loss_epoch`, optional). A device records the epoch at creation; once it moves, exec-context flush/exec/wait/signal/sync, every CPU wait step and sync signal/get_value return `VK_ERROR_DEVICE_LOST` before touching a mapping, and new syncs are CPU-only. Fixes the crash in `nvkmd_rm_exec_ctx_flush` writing GP_PUT into a USERD view the KMD had unmapped (323.1, `vulkan_nouveau.dll+0x5dbf61`). After a loss librmclient sends no escape: the process needs restarting to use RM again |
 
 | 32 | `nvk/rm: Windows: RM device on by default under the Helios ICD policy; librmclient32.dll` | Windows only: `NVK_RM` defaults to on (`NVK_RM=0` off). The Helios ICD policy of the D3D UMD (`HELIOS_ICD`, `HKLM\SOFTWARE\Helios` `Icd` / `NvkDenyList` / `NvkAllowList`, the UMD's built-in deny-list) hides the device from processes sent to Venus, so the loader hands them Venus; exported as `nvk_helios_process_allowed()`. A 32-bit build loads `librmclient32.dll` first (one driver-store directory for both architectures) |
@@ -514,14 +515,17 @@ driver have. On the RTX 5090 in `win11`:
   VRAM go through BAR1 and, under Conduit, through the host-visible window
   every CPU mapping in the guest shares (1 GiB, `NvWinMb`), and each map
   cost a host round trip (5.7 ms before KMD 309, 0.4 ms now).
-- What it uses now: `bar_size_B = min(NVK_RM_BAR_MB (default 256, 0 = off),
-  BAR1 / 2)`, BAR1 from `NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE`. NVK's other
-  mappable memory is its own system pages (OS descriptors) and takes no
-  window space, so 256 MiB per device fits. Each allocation from the type
+- What it uses now (patch 45): `bar_size_B` = BAR1 from
+  `NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE`, kept one big page below VRAM
+  (`NVK_RM_BAR_MB` overrides, 0 = off; patch 22 had a 256 MiB default and
+  BAR1 / 2). NVK's other mappable memory is its own system pages (OS
+  descriptors) and takes no window space. Each allocation from the type
   is mapped once (`crm_map_memory`, write-combined in the KMD) when it is
   allocated and stays mapped until freed; internal and client maps alias
-  that mapping, so mapping per frame costs nothing. An allocation that
-  does not fit the heap fails with `VK_ERROR_OUT_OF_DEVICE_MEMORY`.
+  that mapping, so mapping per frame costs nothing. The heap size is not a
+  hard limit: an allocation past it goes to system memory, like one whose
+  map the host refused (below). Until patch 45 it failed with
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY`.
 - When the CPU map fails (patch 0025: the shared window is full, or the
   KMD's per-process share of it is used up), the allocation still succeeds.
   The VRAM is freed and the allocation gets system pages (OS descriptors,
@@ -1133,7 +1137,7 @@ unsubmitted values instead of leaving GPU acquires spinning).
 | dma-buf / opaque-fd memory export and import | done (see "Zero-copy presentation") | cross-driver import (a dma-buf nvidia-drm cannot name) is refused |
 | external semaphore/fence fds, explicit sync | not supported (no handle types) | `NV_SEMAPHORE_SURFACE` + nvidia-drm's `SEMSURF_FENCE_*` (Conduit forwards them) for sync_files and syncobjs; then drop `wait_before_present` and use Wayland explicit sync / DRI3 syncobj |
 | presentation | zero-copy (dma-buf + modifiers), CPU wait before each present | explicit sync, above |
-| host-visible VRAM, BAR heap | 256 MiB (patch 22, `NVK_RM_BAR_MB`) | the window size from the KMD/backend, to size the heap from it |
+| host-visible VRAM, BAR heap | BAR1, not a hard limit: past it, or when the host refuses a map, system memory (patches 22, 25, 45; `NVK_RM_BAR_MB` overrides) | a heap size that tracks the host window's free space |
 | compression | off | comptags (`NVOS32_ATTR_COMPR_REQUIRED`) and compressed modifiers |
 | transfer queue (async CE channel), video decode | off | a second TSG with `NV2080_ENGINE_TYPE_COPY(n)` |
 | zcull info | not queried | `NV2080_CTRL_CMD_GR_GET_ZCULL_INFO` |

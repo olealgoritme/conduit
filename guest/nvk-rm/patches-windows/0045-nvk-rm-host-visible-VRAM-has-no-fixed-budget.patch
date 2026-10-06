@@ -1,0 +1,169 @@
+From d504f10a3efa60fbcdfcd1e4f4c1a5394e81ad02 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 15:06:43 +0200
+Subject: [PATCH] nvk/rm: host-visible VRAM has no fixed budget; a full heap
+ falls back to system memory
+
+The BAR heap was a 256 MiB budget (NVK_RM_BAR_MB, clamped to half of
+BAR1), enforced by failing the allocation with
+VK_ERROR_OUT_OF_DEVICE_MEMORY. A full heap therefore failed whatever
+allocated next, including upload and push buffers DXVK allocates while
+recording, which latch the error until vkEndCommandBuffer fails.
+
+The heap is now sized from BAR1 (kept one big page below VRAM so it never
+reads as a full ReBAR), and it is not a hard limit: an allocation past the
+reported size goes to system memory, exactly like one whose CPU map the
+host refused, and neither is charged to the heap. The host window (sized
+to BAR1 by the host) is the real limit. NVK_RM_BAR_MB still overrides the
+reported size for testing; 0 turns host-visible VRAM off.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c  | 66 +++++++++++++--------
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c | 26 ++++----
+ 2 files changed, 58 insertions(+), 34 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 1deac07..c2bd0f4 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -36,19 +36,18 @@
+  *    stays mapped until it is freed: under Conduit a mapping is a trip to
+  *    the host and a slot in the shared window, so apps that map and unmap
+  *    per frame must not pay for it each time.  The heap's size,
+- *    dev_info.bar_size_B, is enforced here.
+- *  - If that CPU map fails (under Conduit: the shared window is full, or
+- *    the guest driver's per-process share of it is used up, and the map
+- *    comes back as an error), the allocation does not fail: the VRAM is
+- *    freed and the memory is our own system pages instead, as for any
+- *    other host-visible type.  It is still DEVICE_LOCAL | HOST_VISIBLE |
+- *    HOST_COHERENT as far as the app knows, only slower for the GPU to
+- *    read, and it still counts against the heap, so the heap keeps the
+- *    size it reports and a full heap still fails the allocation with
+- *    VK_ERROR_OUT_OF_DEVICE_MEMORY (which DXVK and others answer by trying
+- *    the next type).  Failing the allocation on a map error instead would
+- *    take down apps that do not retry, and the window can fill at any time
+- *    from other processes.
++ *    dev_info.bar_size_B, is BAR1 (nvkmd_rm_pdev.c) and is not a hard
++ *    limit: the host is.
++ *  - If that CPU map fails (under Conduit: the KMD's window, sized by the
++ *    host, is full and the map comes back as an error), or the allocation
++ *    would take the heap past its reported size, the allocation does not
++ *    fail: the memory is our own system pages instead, as for any other
++ *    host-visible type, and it is not charged to the heap.  It is still
++ *    DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT as far as the app knows,
++ *    only slower for the GPU to read.  Failing the allocation instead
++ *    (VK_ERROR_OUT_OF_DEVICE_MEMORY) took down DXVK's recording: an
++ *    upload or push buffer allocated mid-command-buffer latches the error
++ *    and vkEndCommandBuffer fails (FFXIV after ~56k frames, 2026-10-06).
+  *
+  * GPU caching of system memory
+  *
+@@ -111,6 +110,21 @@ bar_map_failed(struct nvkmd_rm_dev *dev, uint64_t size_B, int ret)
+    }
+ }
+ 
++/* An allocation found the reported heap size used up: say so once per
++ * device (and every time with NVK_DEBUG=vm).  It goes on in system memory.
++ */
++static void
++bar_heap_full(struct nvkmd_rm_dev *dev, uint64_t size_B)
++{
++   const uint32_t n = p_atomic_inc_return(&dev->bar_fallbacks);
++   if (n == 1 || (dev->base.pdev->debug_flags & NVK_DEBUG_VM)) {
++      mesa_logw("NVK: host-visible VRAM: %" PRIu64 " MiB in use of a %" PRIu64
++                " MiB heap, %" PRIu64 " MiB more go to system memory (%u so far)",
++                p_atomic_read(&dev->bar_used_B) >> 20,
++                dev->base.pdev->dev_info.bar_size_B >> 20, size_B >> 20, n);
++   }
++}
++
+ static VkResult
+ alloc_os_pages(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+                uint64_t size_B, uint32_t *h_memory_out, void **pages_out)
+@@ -321,15 +335,16 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+    /* The BAR heap: VRAM the CPU maps (see the placement policy) */
+-   const bool bar = vram && (flags & NVKMD_MEM_VRAM) &&
+-                    (flags & NVKMD_MEM_CAN_MAP);
++   bool bar = vram && (flags & NVKMD_MEM_VRAM) &&
++              (flags & NVKMD_MEM_CAN_MAP);
+    if (bar && !bar_reserve(dev, size_B)) {
+-      FREE(mem);
+-      return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                       "host-visible VRAM heap full (%" PRIu64 " of %" PRIu64
+-                       " MiB used, NVK_RM_BAR_MB)",
+-                       p_atomic_read(&dev->bar_used_B) >> 20,
+-                       dev_info->bar_size_B >> 20);
++      /* Past the reported heap size: system memory stands in, exactly as for
++       * a refused CPU map.  Never VK_ERROR_OUT_OF_DEVICE_MEMORY: the host
++       * window, not this number, is the real limit.
++       */
++      bar_heap_full(dev, size_B);
++      bar = false;
++      vram = false;
+    }
+ 
+    /* NVK only asks for a compressible kind for a dedicated allocation of
+@@ -357,14 +372,17 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+                                  NVRM_DEF(OS33, _FLAGS, _ACCESS, _READ_WRITE),
+                                  &mem->bar_map);
+          if (ret != 0) {
+-            /* No CPU mapping to be had (the window is full): system memory
+-             * stands in, still charged to the heap (the placement policy).
+-             * size_B and align_B are whole big pages, which suits it too.
++            /* No CPU mapping to be had (the host window is full): system
++             * memory stands in and the heap charge is returned, so the heap
++             * only ever counts VRAM that is really mapped.  size_B and
++             * align_B are whole big pages, which suits system memory too.
+              */
+             mem->bar_map = NULL;
+             nvkmd_rm_free_memory(dev, mem->h_memory);
+             mem->h_memory = 0;
+             bar_map_failed(dev, size_B, ret);
++            bar_release(dev, size_B);
++            bar = false;
+             vram = false;
+             page_size_B = NVKMD_RM_SYSMEM_PAGE_SIZE;
+          }
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index 2903b92..de1f951 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -250,18 +250,24 @@ fill_device_info(struct nvkmd_rm_pdev *pdev,
+     * reads over PCIe.  Each allocation is CPU-mapped once, through BAR1, for
+     * its whole life (nvkmd_rm_mem.c).
+     *
+-    * Most of BAR1 is not ours to hand out: RM keeps part of it, and under
+-    * Conduit every CPU mapping of GPU memory, from every process in the
+-    * guest, lands in one shared host-visible window (1 GiB by default).
+-    * NVK's other mappable memory is our own system pages and does not use
+-    * it.  So the heap is a budget, NVK_RM_BAR_MB (default 256, 0 turns it
+-    * off), clamped to half of BAR1.
++    * The heap is sized from the hardware, not from a guess: BAR1, kept one
++    * big page below the VRAM size (a heap as large as VRAM would read as a
++    * full ReBAR, which changes how NVK maps shaders and host-copy images).
++    * It is not a hard limit either.  What bounds host-visible VRAM is the
++    * host: under Conduit every CPU mapping lands in the KMD's window, which
++    * the host sizes to BAR1 and refuses maps from when it is full.  A
++    * refused map, and an allocation past the reported heap size, both put
++    * that allocation in system memory (nvkmd_rm_mem.c), so the heap never
++    * fails an allocation.  NVK_RM_BAR_MB overrides the reported size for
++    * testing (0 turns host-visible VRAM off).
+     */
+-   const int64_t bar_cap_MB = debug_get_num_option("NVK_RM_BAR_MB", 256);
+-   const uint64_t bar_cap_B = bar_cap_MB > 0 ? (uint64_t)bar_cap_MB << 20 : 0;
+    const uint64_t bar1_B = bar1_KiB * 1024;
+-   info->bar_size_B = MIN2(bar_cap_B, bar1_B / 2);
+-   info->bar_size_B &= ~((uint64_t)NVKMD_RM_BIG_PAGE_SIZE - 1);
++   const int64_t bar_cap_MB = debug_get_num_option("NVK_RM_BAR_MB", -1);
++   uint64_t bar_size_B = bar_cap_MB < 0 ? bar1_B :
++                         MIN2((uint64_t)bar_cap_MB << 20, bar1_B);
++   if (info->vram_size_B > NVKMD_RM_BIG_PAGE_SIZE)
++      bar_size_B = MIN2(bar_size_B, info->vram_size_B - NVKMD_RM_BIG_PAGE_SIZE);
++   info->bar_size_B = bar_size_B & ~((uint64_t)NVKMD_RM_BIG_PAGE_SIZE - 1);
+    if (info->bar_size_B >= info->vram_size_B)
+       info->bar_size_B = 0; /* would read as a full BAR; not what this is */
+ 
+-- 
+2.43.0
+
