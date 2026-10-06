@@ -60,6 +60,21 @@ pub fn present(
     handle: u32,
     gem: u32,
 ) -> Result<u64, PresentRefusal> {
+    present_within(passive, adapter, owner, handle, gem, FLIP_TIMEOUT_MS)
+}
+
+/// [`present`] with the caller's bound on how long the host gets to take the flip.
+/// The KMD's own presenter (`rm_present.rs`) flips every frame from the HPD worker,
+/// which StopDevice joins for a bounded time: it uses a short bound, so a host that
+/// stops answering costs a frame, not the worker.
+pub fn present_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    handle: u32,
+    gem: u32,
+    timeout_ms: u64,
+) -> Result<u64, PresentRefusal> {
     // Ownership first, in this transport generation: a lapsed or foreign handle
     // must not mint a sequence number.
     let (epoch, device_type) = adapter
@@ -95,7 +110,7 @@ pub fn present(
     // reserved[4] at p + 48 stays zero.
 
     let mut resp = [0u8; 2 * MSG_HDR_LEN];
-    let sent = match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, FLIP_TIMEOUT_MS) {
+    let sent = match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, timeout_ms) {
         // MsgHeader.status (offset 8) is a signed errno; 0 is success.
         Ok(n) if n >= MSG_HDR_LEN => {
             let status = i32::from_le_bytes([resp[8], resp[9], resp[10], resp[11]]);
