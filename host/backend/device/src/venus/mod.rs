@@ -33,6 +33,7 @@ mod scanout;
 mod tests;
 
 pub use fence::Completion;
+pub use rm::RmResource;
 
 /// Contexts one VM may hold at once.
 pub const MAX_CONTEXTS: usize = 1024;
@@ -148,6 +149,9 @@ pub struct Venus {
     /// The errno the command being served was refused with, echoed in the
     /// error response's header (`errno_padding`). Set by RM-export blobs.
     refusal_errno: Option<i32>,
+    /// Whether a renderer descriptor is a dma-buf (`rm::is_dmabuf`); a
+    /// stand-in in tests, whose mock renderer hands out memfds.
+    is_dmabuf: fn(BorrowedFd<'_>) -> bool,
 }
 
 impl Venus {
@@ -174,6 +178,7 @@ impl Venus {
         Self {
             rm_import,
             refusal_errno: None,
+            is_dmabuf: rm::is_dmabuf,
             renderer,
             hostmem_len,
             display,
@@ -196,6 +201,13 @@ impl Venus {
     /// RM-export blobs are served: the renderer imports dma-bufs.
     pub fn rm_import(&self) -> bool {
         self.rm_import
+    }
+
+    /// Take every renderer descriptor for a dma-buf, or none (tests: the
+    /// mock renderer's memory is a memfd).
+    #[cfg(test)]
+    pub fn assume_dmabufs(&mut self, yes: bool) {
+        self.is_dmabuf = if yes { |_| true } else { |_| false };
     }
 
     /// Readable when a fence may have signalled: the transport polls it and

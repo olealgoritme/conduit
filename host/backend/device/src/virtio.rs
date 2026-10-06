@@ -290,8 +290,11 @@ impl VirtioGpuNvConfig {
     /// Serve RM-export blobs (docs/VENUS.md "RM-export blobs"): sets
     /// [`protocol::messages::NVGPU_CFG_RM_IMPORT`]. Only with Venus, and only
     /// when its renderer imports dma-bufs.
+    /// `RmResourceImport` comes with it ([`protocol::messages::NVGPU_CFG_RM_RESOURCE_IMPORT`]):
+    /// it serves exactly the resources RM import makes.
     pub fn set_rm_import(&mut self) {
-        self.features |= protocol::messages::NVGPU_CFG_RM_IMPORT;
+        self.features |= protocol::messages::NVGPU_CFG_RM_IMPORT
+            | protocol::messages::NVGPU_CFG_RM_RESOURCE_IMPORT;
     }
 
     /// Turn host fences into guest fences (docs/SYNC.md): sets
@@ -508,14 +511,19 @@ mod tests {
 
     #[test]
     fn rm_import_is_announced_only_when_set() {
-        use protocol::messages::{NVGPU_CFG_RM_IMPORT, NVGPU_CFG_VENUS};
+        use protocol::messages::{
+            NVGPU_CFG_RM_IMPORT, NVGPU_CFG_RM_RESOURCE_IMPORT, NVGPU_CFG_VENUS,
+        };
         let mut cfg = VirtioGpuNvConfig::new("615.71.09", &[], crate::caps::Caps::DEFAULT, 0);
         assert_eq!({ cfg.features } & NVGPU_CFG_RM_IMPORT, 0);
         cfg.set_venus();
         cfg.set_rm_import();
         assert_eq!(
             { cfg.features },
-            FEATURE_RMCTRL_SEGMENTS | NVGPU_CFG_VENUS | NVGPU_CFG_RM_IMPORT
+            FEATURE_RMCTRL_SEGMENTS
+                | NVGPU_CFG_VENUS
+                | NVGPU_CFG_RM_IMPORT
+                | NVGPU_CFG_RM_RESOURCE_IMPORT
         );
         assert_eq!(NVGPU_CFG_RM_IMPORT, 1 << 13);
     }

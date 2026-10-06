@@ -722,7 +722,7 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
         x->idle_shown = false;
         x11_cursor_policy(x);
         /* PutImage copies, so the buffer is the guest's again immediately. */
-        nb_sink_release(sink, sl->id);
+        nb_sink_release(sink, sl->id, 0);
         /*
          * AND PACE THE NEXT FRAME.  On the dma-buf path this comes from
          * Present's CompleteNotify, which the shm tier deliberately never
@@ -765,7 +765,7 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
             x11_cursor_policy(x);
             /* Composite copies, so the buffer is free the moment the server
              * has read it -- there is no PresentIdleNotify coming for it. */
-            nb_sink_release(sink, sl->id);
+            nb_sink_release(sink, sl->id, 0);
             return 0;
         }
 #endif
@@ -876,7 +876,7 @@ static void x11_present_event(struct nb_x11 *x, struct nb_sink *sink,
 
         for (i = 0; i < NB_MAX_BUFS; i++) {
             if (x->bufs[i].valid && x->bufs[i].pixmap == ie->pixmap) {
-                nb_sink_release(sink, x->bufs[i].id);
+                nb_sink_release(sink, x->bufs[i].id, 0);
                 break;
             }
         }

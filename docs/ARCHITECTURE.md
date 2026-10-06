@@ -145,7 +145,8 @@ supported: the GPU state lives in the host driver. Details:
 - NVIDIA only. Linux guests; Windows guests (Venus) are experimental
   ([WINDOWS.md](WINDOWS.md), [ROADMAP.md](ROADMAP.md)).
 - Not hardware isolation; the host NVIDIA driver is trusted.
-- The shared-memory window (1 GiB) is sized when the VM starts and cannot grow.
+- The shared-memory window (`--window-mib`, 4 GiB by default) is sized when the
+  VM starts and cannot grow.
 - No HMM / pageable memory access, MIG or SR-IOV.
 - `--vram-limit-mib` does not count memory RM allocates internally.
 

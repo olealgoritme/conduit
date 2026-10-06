@@ -31,6 +31,27 @@ pub(super) fn dmabuf_size(fd: BorrowedFd<'_>) -> Option<u64> {
     (end > 0).then_some(end as u64)
 }
 
+/// Whether `fd` is a dma-buf: its file system is dma-buf's
+/// (`DMA_BUF_MAGIC`). A renderer export of a Venus blob is either that or an
+/// `OPAQUE_FD`, which on NVIDIA is a driver handle, not shareable memory.
+pub(super) fn is_dmabuf(fd: BorrowedFd<'_>) -> bool {
+    const DMA_BUF_MAGIC: libc::c_long = 0x444d_4142;
+    // SAFETY: fstatfs into a zeroed struct on a descriptor we hold.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstatfs(fd.as_raw_fd(), &mut st) } == 0)
+        && st.f_type as libc::c_long == DMA_BUF_MAGIC
+}
+
+/// A resource's memory as `RmResourceImport` sees it.
+pub struct RmResource<'a> {
+    /// The backend's own dma-buf of the object, borrowed.
+    pub dmabuf: BorrowedFd<'a>,
+    /// The object's size (the dma-buf's).
+    pub size: u64,
+    /// The modifier its GEM import had, when the backend saw it.
+    pub modifier: Option<u64>,
+}
+
 impl Venus {
     /// Refuse with a `RESP_ERR_*` and the errno the guest is told
     /// (`errno_padding`).
@@ -158,10 +179,54 @@ impl Venus {
         Ok(Reply::NoData)
     }
 
+    /// A resource's memory as a dma-buf, for `RmResourceImport`: the
+    /// backend's own reference, the object's size and the modifier the
+    /// resource was created with, when known.
+    ///
+    /// - An RM-export blob: the dma-buf the backend holds for it, with the
+    ///   modifier NVK imported it with.
+    /// - A Venus blob (`HOST3D`, host Vulkan memory) whose renderer export is
+    ///   a dma-buf: that export. nvidia-drm imports memory NVIDIA's Vulkan
+    ///   driver exported as `DMA_BUF` into an RM client exactly (spike X4,
+    ///   `guest/nvk-rm/tests/vk_dmabuf_to_rm.c`). Its modifier is unknown:
+    ///   the image layout is the creating Venus context's, which the memory
+    ///   does not carry (the importer takes it from the surface's metadata).
+    ///
+    /// `Err` is an errno: `ENOENT` for no such resource, `EINVAL` for a
+    /// Venus blob exported as an `OPAQUE_FD` (a driver handle nvidia-drm
+    /// cannot take), `EIO` when the object's size cannot be read.
+    pub fn rm_resource(&self, res_id: u32) -> std::result::Result<RmResource<'_>, i32> {
+        let r = self.resources.get(&res_id).ok_or(libc::ENOENT)?;
+        let modifier = match r.rm {
+            Some(rm) => rm.modifier,
+            None if (self.is_dmabuf)(r.fd.as_fd()) => None,
+            None => return Err(libc::EINVAL),
+        };
+        let size = dmabuf_size(r.fd.as_fd()).ok_or(libc::EIO)?;
+        Ok(RmResource {
+            dmabuf: r.fd.as_fd(),
+            size,
+            modifier,
+        })
+    }
+
     /// The modifier an RM-export blob was imported with, for tests:
     /// `None` for no such resource, `Some(None)` for an unknown layout.
     #[cfg(test)]
     pub(super) fn rm_modifier(&self, res_id: u32) -> Option<Option<u64>> {
         self.resources.get(&res_id)?.rm.map(|r| r.modifier)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_dma_buf_is_taken_for_one() {
+        let m = conduit_venus::mock::memfd(4096).unwrap();
+        assert!(!is_dmabuf(m.as_fd()), "a memfd");
+        let null = std::fs::File::open("/dev/null").unwrap();
+        assert!(!is_dmabuf(null.as_fd()), "a device node");
     }
 }

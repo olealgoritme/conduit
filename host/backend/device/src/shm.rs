@@ -176,6 +176,28 @@ impl ZoneConfig {
         }
     }
 
+    /// The same split for a window of `len` bytes (`--window-mib`): uncached
+    /// 1/32, write-combine 24/32, write-back 7/32, which is
+    /// [`Self::default_1gib`] at 1 GiB. Write-combine stays the largest
+    /// because it is where every CPU map of VRAM lands, NVK's host-visible
+    /// VRAM heap included (3 GiB of a 4 GiB window).
+    ///
+    /// `len` must be a multiple of 128 KiB so each zone is whole pages;
+    /// `shm_regions::window_len` only hands out powers of two from 32 MiB.
+    pub fn for_window(len: u64) -> Self {
+        assert_eq!(
+            len % (32 * 4096),
+            0,
+            "window {len:#x} does not split into pages"
+        );
+        let unit = len / 32;
+        Self {
+            uc_size: unit,
+            wc_size: unit * 24,
+            wb_size: unit * 7,
+        }
+    }
+
     /// The original 256 MiB split. Too small for a single encode with any
     /// margin; kept only for tests that want a zone they can exhaust.
     pub fn default_256mib() -> Self {
@@ -560,6 +582,39 @@ pub trait WindowPlacer: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `for_window` at 1 GiB is the measured split, and scales it.
+    #[test]
+    fn for_window_scales_the_measured_split() {
+        let one = ZoneConfig::for_window(1 << 30);
+        let d = ZoneConfig::default_1gib();
+        assert_eq!(
+            (one.uc_size, one.wc_size, one.wb_size),
+            (d.uc_size, d.wc_size, d.wb_size)
+        );
+        let four = ZoneConfig::for_window(4 << 30);
+        assert_eq!(four.uc_size, 128 << 20);
+        assert_eq!(four.wc_size, 3 << 30);
+        assert_eq!(four.wb_size, 896 << 20);
+        assert_eq!(four.total(), 4 << 30);
+    }
+
+    /// A 4 GiB window is address space: the allocator over it commits no
+    /// memory until a mapping is written, and a write-combine zone that size
+    /// holds twelve 256 MiB NVK heaps at once.
+    #[test]
+    fn a_4gib_window_holds_twelve_nvk_heaps() {
+        let mut a = ShmAllocator::new(ZoneConfig::for_window(4 << 30));
+        assert_eq!(a.total_size(), 4 << 30);
+        let heaps: Vec<_> = (0..12)
+            .map(|_| a.alloc(256 << 20, PgprotKind::WriteCombine).unwrap())
+            .collect();
+        assert!(a.alloc(256 << 20, PgprotKind::WriteCombine).is_err());
+        for h in &heaps {
+            a.free(h).unwrap();
+        }
+        assert_eq!(a.free_bytes().1, 3 << 30);
+    }
 
     fn small_cfg() -> ZoneConfig {
         ZoneConfig {

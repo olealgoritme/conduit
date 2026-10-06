@@ -99,6 +99,7 @@ Capability bits in `HELLO.w1`: `KEYBOARD`, `ABS_POINTER`, `REL_POINTER`,
 | `CAP_GAMEPAD` (bit 13) + `CMD_CAPS` width bit 3 `CLIENT_GAMEPAD` | the broker may send `EV_PAD` = 18 (x = evdev code, y = value, w0 = pad << 16 \| evdev type); conduit-stream does, the viewer does not. |
 | `CAP_IDLE` (bit 14) | the broker starts idle and sends `EV_ACTIVE` = 19 (x = 1 frames please, 0 stop) when it wants frames. A client with several brokers treats it as a session broker: while active, its mode hints take precedence. The viewer does not set it; conduit-stream does. |
 | `CMD_CAPS` width bit 4 `CLIENT_IDLE` | the client honours `EV_ACTIVE` and arbitrates the guest mode between brokers (docs/SCANOUT.md, "Several display clients"). |
+| `CAP_RELEASE_SEQ` (bit 15) | `EV_RELEASE` is exact: x = the `seq` of the newest ATTACH of that buffer the release covers, and every ATTACH is released eventually, one that is never shown (refused, dropped by a probe, evicted) at once unless an earlier commit of the same buffer is still held. A client may then hand buffers back to the guest on it (docs/SCANOUT.md, "Buffer release"). The Wayland backend and conduit-stream set it; the X11 backend does not. |
 
 ### Backpressure, and the rule it enforces
 

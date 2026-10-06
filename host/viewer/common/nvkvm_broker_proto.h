@@ -56,7 +56,10 @@ enum {
                                      * request, and ignoring it only costs fps */
     NVKVM_BROKER_EV_RELEASE   = 4,  /* w0,w1 = low,high 32 bits of the buffer
                                      * id (its dma-buf inode).  The display is
-                                     * no longer reading that buffer.          */
+                                     * no longer reading that buffer.
+                                     * x = the `seq` of the newest ATTACH of
+                                     * it this release covers (meaningful only
+                                     * with NVKVM_BROKER_CAP_RELEASE_SEQ)      */
     NVKVM_BROKER_EV_KEY       = 5,  /* x=Linux evdev keycode (KEY_*), y=down   */
     NVKVM_BROKER_EV_BTN       = 6,  /* x=Linux evdev button (BTN_*),  y=down   */
     NVKVM_BROKER_EV_ABS       = 7,  /* x,y = position; w0,w1 = the range.
@@ -289,6 +292,25 @@ enum {
  * while active, its mode hints take precedence over the others'.
  */
 #define NVKVM_BROKER_CAP_IDLE         (1u << 14)
+/*
+ * CAP_RELEASE_SEQ (Conduit): EV_RELEASE is EXACT, so a client may hand the
+ * buffer back to whoever draws into it (the guest) on it alone:
+ *
+ *   - x carries the `seq` of the newest ATTACH of that buffer the release
+ *     covers.  A release crossing a newer ATTACH of the same buffer on the
+ *     socket names the older seq, and the client ignores it for the newer.
+ *   - Every ATTACH is released eventually, exactly once per hold: one that
+ *     never reaches the screen (refused, dropped by a probe, replaced before
+ *     its COMMIT) is released at once, unless the display still reads an
+ *     earlier commit of the same buffer, in which case that hold's release
+ *     covers it.
+ *   - The buffer on screen is released when the display is done with it,
+ *     normally after a later commit replaced it.
+ *
+ * Without the bit (an older broker, or the X11 backend) EV_RELEASE is
+ * advisory and a client must not rely on getting one per buffer.
+ */
+#define NVKVM_BROKER_CAP_RELEASE_SEQ  (1u << 15)
 
 /* BYE reason codes. */
 enum {

@@ -196,6 +196,10 @@ impl Venus {
                 link.disable();
             }
         }
+        // A release still owed for it names an id the guest may reuse.
+        if let Some(link) = env.display {
+            link.forget_resource(id);
+        }
         for &ctx in &r.attached {
             self.renderer.ctx_detach(ctx, id);
         }

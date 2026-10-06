@@ -60,6 +60,7 @@ struct nb_test {
     /* the "pending" buffer, as a real backend would hold it */
     bool     have_pending;
     uint64_t pending_id;
+    uint32_t pending_seq;
     uint32_t pending_w, pending_h;
     unsigned resize_w, resize_h;    /* announced on the next dispatch */
     bool     fetch_pending;
@@ -188,6 +189,7 @@ static int test_attach(struct nb_session *s, const struct nb_buf_desc *d)
 
     t->have_pending = true;
     t->pending_id = d->id;
+    t->pending_seq = d->seq;
     t->pending_w = d->width;
     t->pending_h = d->height;
     nb_log("TEST attach: id=%llu %ux%u stride=%u offset=%u %s mod=0x%016llx "
@@ -209,7 +211,7 @@ static int test_commit(struct nb_session *s, struct nb_sink *sink)
     nb_sink_surface(sink, t->pending_w, t->pending_h, t->refresh_mhz);
     /* A real backend answers with these; produce them so a client's pacing
      * and recycling paths are exercised end to end. */
-    nb_sink_release(sink, t->pending_id);
+    nb_sink_release(sink, t->pending_id, t->pending_seq);
     nb_sink_frame(sink);
     t->have_pending = false;
     return 0;
@@ -324,6 +326,7 @@ static int test_open(struct nb_session *s, const struct nb_config *cfg)
               NVKVM_BROKER_CAP_TOTAL_GRAB | NVKVM_BROKER_CAP_FOCUS_EVENTS |
               NVKVM_BROKER_CAP_FULLSCREEN | NVKVM_BROKER_CAP_DMABUF |
               NVKVM_BROKER_CAP_MODIFIERS | NVKVM_BROKER_CAP_RELEASE |
+              NVKVM_BROKER_CAP_RELEASE_SEQ |
               NVKVM_BROKER_CAP_CURSOR;
     snprintf(s->grab_caveat, sizeof(s->grab_caveat),
              "THIS IS THE TEST BACKEND: nothing is displayed and no real input "

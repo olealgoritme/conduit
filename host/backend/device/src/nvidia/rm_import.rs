@@ -121,7 +121,7 @@ pub fn modifier_for(layout: SurfaceLayout, tiling: Tiling) -> Option<u64> {
 pub(super) struct RmLayouts(HashMap<(u32, u32), Option<u64>>);
 
 impl RmLayouts {
-    fn insert(&mut self, owner: u32, gem: u32, modifier: Option<u64>) {
+    pub(super) fn insert(&mut self, owner: u32, gem: u32, modifier: Option<u64>) {
         if self.0.len() >= MAX_LAYOUTS && !self.0.contains_key(&(owner, gem)) {
             log::warn!(
                 "rm import: {MAX_LAYOUTS} layouts kept already; handle {gem} on file {owner} \
@@ -392,6 +392,8 @@ mod tests {
     }
 
     pub(crate) const GEM_HANDLE: u32 = 77;
+    /// What PRIME_FD_TO_HANDLE answers on any file (RmResourceImport).
+    pub(crate) const IMPORTED_HANDLE: u32 = 88;
 
     impl HostDriver for DrmHost {
         fn ioctl(&self, _fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
@@ -405,6 +407,14 @@ mod tests {
                 for (i, w) in [0x100u32, 0, 0, 1, 6, 2, 1, 1, 1].iter().enumerate() {
                     arg[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
                 }
+                return Ok(());
+            }
+            if request == super::super::rm_resource::DRM_IOCTL_PRIME_FD_TO_HANDLE {
+                let fd = i32::from_le_bytes(arg[8..12].try_into().unwrap());
+                if fd < 0 {
+                    return Err(libc::EBADF);
+                }
+                arg[0..4].copy_from_slice(&IMPORTED_HANDLE.to_le_bytes());
                 return Ok(());
             }
             if request == crate::display::DRM_IOCTL_PRIME_HANDLE_TO_FD {
@@ -497,10 +507,7 @@ mod tests {
             Some(Some(0x0300_0000_0060_6015))
         );
         assert!(
-            calls
-                .lock()
-                .unwrap()
-                .contains(&GET_DEV_INFO),
+            calls.lock().unwrap().contains(&GET_DEV_INFO),
             "the node's own tiling was asked"
         );
         let o = be.rm_view().export(dri as u32, GEM_HANDLE).unwrap();
@@ -680,6 +687,150 @@ mod tests {
             RESP_OK_NODATA
         );
         assert_eq!(be.venus().unwrap().resources(), 0);
+    }
+
+    /// RmResourceImport: a second render node of the guest gets a GEM handle
+    /// for an RM-export resource, with its layout; what is not a render node,
+    /// not a resource, or not an RM-export one is refused.
+    #[cfg(feature = "venus")]
+    #[test]
+    fn an_rm_resource_becomes_a_gem_handle_on_another_render_node() {
+        use protocol::messages::{
+            RM_RESOURCE_IMPORT_MODIFIER, RmResourceImport, RmResourceImportReply,
+        };
+        use protocol::venus::*;
+        let (mut be, dri, ctl, calls) = drm_backend(8 << 20);
+        let ask = |be: &mut NvidiaBackend, owner: u64, res: u32, flags: u32| {
+            let mut v = vec![0u8; size_of::<MsgHeader>()];
+            write_struct(&mut v, &MsgHeader::ok(MsgType::RmResourceImport, 0));
+            v.extend_from_slice(
+                &RmResourceImport {
+                    owner_handle: owner as u32,
+                    resource_id: res,
+                    flags,
+                    reserved: 0,
+                }
+                .to_bytes(),
+            );
+            let mut resp = vec![0u8; 256];
+            let n = be.dispatch(&v, &mut resp);
+            let h = read_struct::<MsgHeader>(&resp, 0);
+            assert_eq!(h.msg_type, MsgType::RmResourceImport as u32);
+            (h.status, RmResourceImportReply::from_bytes(&resp[16..n]))
+        };
+        // No Venus, no RM-export resources.
+        assert_eq!(ask(&mut be, dri, 5, 0).0, -libc::EOPNOTSUPP);
+
+        be.set_venus(crate::venus::Venus::new(
+            Box::new(conduit_venus::mock::Mock::new()),
+            1 << 20,
+            None,
+        ));
+        import_layout(&mut be, dri, ctl, NVKMS_LAYOUT_BLOCK_LINEAR, 5);
+        let gpu_cmd = |body: &[u8]| {
+            let mut v = vec![0u8; size_of::<MsgHeader>()];
+            write_struct(&mut v, &MsgHeader::ok(MsgType::GpuCmd, 0));
+            v.extend_from_slice(body);
+            v
+        };
+        let send = |be: &mut NvidiaBackend, body: &[u8]| {
+            let mut resp = [0u8; 1024];
+            be.dispatch(&gpu_cmd(body), &mut resp);
+            CtrlHdr::from_bytes(&resp[16..]).unwrap().ty
+        };
+        let ctx = CtxCreate {
+            hdr: CtrlHdr {
+                ty: CMD_CTX_CREATE,
+                ctx_id: 1,
+                ..Default::default()
+            },
+            context_init: CAPSET_VENUS,
+            ..Default::default()
+        };
+        assert_eq!(send(&mut be, &ctx.to_bytes()), RESP_OK_NODATA);
+        let blob = ResourceCreateBlob {
+            hdr: CtrlHdr {
+                ty: CMD_RESOURCE_CREATE_BLOB,
+                ctx_id: 1,
+                ..Default::default()
+            },
+            resource_id: 5,
+            blob_mem: BLOB_MEM_RM_EXPORT,
+            blob_flags: 0,
+            nr_entries: 0,
+            blob_id: (dri << 32) | u64::from(GEM_HANDLE),
+            size: 8 << 20,
+        };
+        assert_eq!(send(&mut be, &blob.to_bytes()), RESP_OK_NODATA);
+        // An ordinary (host Vulkan) blob beside it.
+        let host = ResourceCreateBlob {
+            resource_id: 6,
+            blob_mem: BLOB_MEM_HOST3D,
+            blob_id: 1,
+            size: 4096,
+            ..blob
+        };
+        assert_eq!(send(&mut be, &host.to_bytes()), RESP_OK_NODATA);
+
+        // The second process's render node.
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let dri2 = be.handles.insert(OwnedFd::from(null));
+        be.handle_kinds.insert(dri2, DeviceKind::Dri(0));
+
+        let (status, reply) = ask(&mut be, dri2, 5, 0);
+        assert_eq!(status, 0);
+        let reply = reply.expect("a reply body");
+        assert_eq!(reply.gem_handle, IMPORTED_HANDLE);
+        assert_eq!(reply.size, 8 << 20);
+        assert_eq!(reply.flags, RM_RESOURCE_IMPORT_MODIFIER);
+        assert_eq!(reply.modifier, 0x0300_0000_0060_6015);
+        assert_eq!(
+            be.rm_layouts.get(dri2 as u32, IMPORTED_HANDLE),
+            Some(Some(0x0300_0000_0060_6015)),
+            "the new handle carries the layout, for a later flip or export"
+        );
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .contains(&super::super::rm_resource::DRM_IOCTL_PRIME_FD_TO_HANDLE)
+        );
+        assert_eq!(be.rm_resource_imports(), 1);
+
+        // Refusals: not a render node, no such resource, not an RM-export
+        // resource, flags.
+        assert_eq!(ask(&mut be, ctl, 5, 0).0, -libc::EBADF);
+        assert_eq!(ask(&mut be, 999, 5, 0).0, -libc::EBADF);
+        assert_eq!(ask(&mut be, dri2, 7, 0).0, -libc::ENOENT);
+        assert_eq!(ask(&mut be, dri2, 6, 0).0, -libc::EINVAL);
+        assert_eq!(ask(&mut be, dri2, 5, 1).0, -libc::EINVAL);
+        assert_eq!(be.rm_resource_imports(), 1);
+
+        // A Venus blob whose renderer export is a dma-buf (the mock's memfd
+        // taken for one) is imported the same way, with no modifier.
+        be.venus.as_mut().unwrap().assume_dmabufs(true);
+        let (status, reply) = ask(&mut be, dri2, 6, 0);
+        assert_eq!(status, 0);
+        let reply = reply.expect("a reply body");
+        assert_eq!(reply.gem_handle, IMPORTED_HANDLE);
+        assert_eq!((reply.flags, reply.modifier), (0, 0), "layout unknown");
+        assert_eq!(be.rm_resource_imports(), 2);
+        be.venus.as_mut().unwrap().assume_dmabufs(false);
+
+        // The creator's file closes: the resource, and the import, live on.
+        let mut v = vec![0u8; size_of::<MsgHeader>()];
+        write_struct(
+            &mut v,
+            &MsgHeader {
+                msg_type: MsgType::Close as u32,
+                handle: dri as u32,
+                status: 0,
+                padding: 0,
+            },
+        );
+        let mut r = vec![0u8; 256];
+        be.dispatch(&v, &mut r);
+        assert_eq!(ask(&mut be, dri2, 5, 0).0, 0);
     }
 
     #[test]

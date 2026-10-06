@@ -633,6 +633,9 @@ pub fn backend_exec(name: &str) -> Result<()> {
     if let Some(s) = &venus_sock {
         cmd.arg("--venus").arg("--venus-renderer").arg(s);
     }
+    if let Some(mib) = config::window_mib() {
+        cmd.arg("--window-mib").arg(mib.to_string());
+    }
     // The boot console (attached VMs): QEMU's VNC server, which the backend
     // shows until the guest driver displays. QEMU opens it only after the
     // GPU's vhost-user handshake, i.e. after this backend started.

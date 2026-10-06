@@ -177,7 +177,23 @@ pub fn now() -> String {
 
 /// The built-in VM runner's (conduit-vmm) JSON config.
 pub fn vmm_config(c: &VmConfig, kernel: &Path, gpu_sock: &Path, share: &Path) -> serde_json::Value {
+    vmm_config_with(c, kernel, gpu_sock, share, crate::config::window_mib())
+}
+
+/// [`vmm_config`] with the window's size, which must be the backend's
+/// `--window-mib` (run.rs passes both); `None` leaves both at their default.
+fn vmm_config_with(
+    c: &VmConfig,
+    kernel: &Path,
+    gpu_sock: &Path,
+    share: &Path,
+    window_mib: Option<u64>,
+) -> serde_json::Value {
     let n = c.net();
+    let mut gpu_forward = json!({ "socket": gpu_sock });
+    if let Some(mib) = window_mib {
+        gpu_forward["window-mib"] = json!(mib);
+    }
     let mut args = String::from("console=hvc0 root=/dev/vda rw");
     if !c.kernel_args.trim().is_empty() {
         args.push(' ');
@@ -201,7 +217,7 @@ pub fn vmm_config(c: &VmConfig, kernel: &Path, gpu_sock: &Path, share: &Path) ->
             // guest touches them (several prefaulted VMs ran a host out of RAM).
             "prefault": false,
         },
-        "gpu-forward": { "socket": gpu_sock },
+        "gpu-forward": gpu_forward,
         "shared-directories": [{
             "tag": "nvidia",
             "path-on-host": share,
@@ -259,11 +275,12 @@ mod tests {
         let mut c = VmConfig::new("t", 8192, 6, 3, "me", "gnome");
         c.disk = PathBuf::from("/vms/t/disk.img");
         c.kernel_args = "quiet".into();
-        let v = vmm_config(
+        let v = vmm_config_with(
             &c,
             Path::new("/k/vmlinux"),
             Path::new("/run/gpu.sock"),
             Path::new("/share"),
+            None,
         );
         assert_eq!(v["boot-source"]["kernel_image_path"], "/k/vmlinux");
         assert_eq!(
@@ -281,6 +298,19 @@ mod tests {
         assert_eq!(v["network"]["tap-name"], "conduit3");
         assert_eq!(v["network"]["host-ip"], "172.30.3.1");
         assert_eq!(v["network"]["netmask"], "255.255.255.0");
+    }
+
+    /// The window's size reaches conduit-vmm only when it is set, and then as
+    /// the number the backend is given.
+    #[test]
+    fn vmm_config_carries_the_window_size_when_set() {
+        let c = VmConfig::new("t", 8192, 6, 3, "me", "gnome");
+        let (k, g, s) = (Path::new("/k"), Path::new("/g"), Path::new("/s"));
+        let v = vmm_config_with(&c, k, g, s, None);
+        assert!(v["gpu-forward"].get("window-mib").is_none());
+        let v = vmm_config_with(&c, k, g, s, Some(8192));
+        assert_eq!(v["gpu-forward"]["window-mib"], 8192);
+        assert_eq!(v["gpu-forward"]["socket"], "/g");
     }
 
     #[test]

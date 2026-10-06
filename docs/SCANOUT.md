@@ -33,6 +33,7 @@ All little-endian, `#[repr(C)]`, after the common message header. Display
 | 25 | `ClipboardFromHost` | host → guest | event (see docs/CLIPBOARD.md) |
 | 26 | `ClipboardToHost` | guest → host | control (reply: header only, status) |
 | 27 | `ClipboardRequest` | guest → host | control, no payload: resend the host clipboard (reply: header only, status) |
+| 28 | `ScanoutReleased` | host → guest | event, only to a guest that acked `NVGPU_F_SCANOUT_RELEASE` (see [Buffer release](#buffer-release)) |
 
 ```c
 struct scanout_flip {          /* 64 bytes */
@@ -181,6 +182,7 @@ types, no version bump; record sizes unchanged:
 | `CAP_IDLE` (HELLO w1 bit 14) | broker → backend | the broker starts idle: no frames, no cursor until it sends `EV_ACTIVE`; it is a session client for the mode policy |
 | `EV_ACTIVE` = 19 | broker → backend | x = 1 send frames from now on, 0 stop (only from a `CAP_IDLE` broker) |
 | `CMD_CAPS` width bit `CLIENT_IDLE` (1<<4) | backend → broker | the backend honours `EV_ACTIVE` and arbitrates the mode between clients, so a session that ends goes idle instead of asking for a restore |
+| `CAP_RELEASE_SEQ` (HELLO w1 bit 15) | broker → backend | `EV_RELEASE` (4) is exact: x = the `seq` of the newest ATTACH of that buffer (w0,w1 = its dma-buf inode) the release covers, and every ATTACH is released eventually, a refused or dropped one at once (see [Buffer release](#buffer-release)) |
 
 ## Several display clients
 
@@ -218,9 +220,75 @@ guest flip ─► backend ─ export ─┤
   input; see [Boot console](#boot-console)). Keys and buttons held through
   a client are released when that client disconnects or loses focus, without
   touching what the other holds.
-- **Buffer release.** The backend does not forward `EV_RELEASE` (see
-  docs/STREAMING.md, Limitations); when it does, a buffer becomes reusable
-  only once every client that was sent it has released it.
+- **Buffer release.** A buffer becomes reusable only once every client that
+  was sent it has released it ([Buffer release](#buffer-release)).
+
+### Buffer release
+
+A guest that wants to know when it may draw into a buffer it flipped again
+(the Windows KMD's read ledger for KMD-driven flips, NVK's WSI) acks the
+**virtio device feature** `NVGPU_F_SCANOUT_RELEASE = 1 << 15` (offered by
+the backend whenever it has a display; like `NVGPU_CFG_TAKES_INPUT`, a
+device feature the guest acks, not a config `features` bit, and config bit 15
+stays unused). Only then does it get `ScanoutReleased` events on the event
+queue; a guest that does not ack it (the Linux module, every driver written
+before it) gets none, and the backend does no release bookkeeping at all.
+
+```c
+struct scanout_released {      /* 32 bytes, event queue, after the header
+                                * (msg_type 28, handle 0, status 0) */
+    u32 scanout;               /* 0 */
+    u32 flags;                 /* SCANOUT_RELEASED_* below */
+    u32 owner_handle;          /* ScanoutFlip.owner_handle; 0 for Venus */
+    u32 host_handle;           /* ScanoutFlip.host_handle, or the Venus resource id */
+    u64 seq;                   /* ScanoutFlip.seq of the buffer's latest flip; 0 for Venus */
+    u64 reserved;              /* 0 */
+};
+#define SCANOUT_RELEASED_RESOURCE  (1u << 0)  /* a Venus SET_SCANOUT_BLOB resource */
+#define SCANOUT_RELEASED_NOT_SHOWN (1u << 1)  /* no client was sent its latest flip */
+#define SCANOUT_RELEASED_FORCED    (1u << 2)  /* a client did not answer within 500 ms */
+```
+
+Meaning: the buffer's latest flip (`seq`) was **replaced** by a flip of a
+different buffer (or by `ScanoutDisable`), and every display client that was
+sent it has finished reading it. The buffer on the scanout is never
+released; it is read until it is replaced. One event per release: a buffer
+flipped again is released again later. A `ScanoutFlip` buffer is named as
+the flip named it, `(owner_handle, host_handle)`; a Venus scanout
+(`SET_SCANOUT_BLOB` + `RESOURCE_FLUSH`) by its resource id with
+`SCANOUT_RELEASED_RESOURCE`. A buffer whose GEM handle, file or resource the
+guest closes before its release is forgotten (no event).
+
+When a buffer counts as done, per display client:
+
+- **no client wants frames** (none connected, or a stream with no session):
+  at once when the next flip replaces it (`SCANOUT_RELEASED_NOT_SHOWN`; the
+  same if every socket was full and the frame went to nobody);
+- **a client with `CAP_RELEASE_SEQ`** (conduit-viewer's Wayland backend,
+  conduit-stream): when it says so with `EV_RELEASE`. The viewer sends it on
+  `wl_buffer.release` (the compositor is done), and at once for an ATTACH it
+  will never show (refused, dropped by a probe, evicted from its import
+  cache); conduit-stream when its pipeline moves on to another buffer (its
+  encode, which reads the buffer, has finished with `glFinish`) or when a
+  frame is superseded before the pipeline took it. `x` names the newest
+  ATTACH covered, so a release crossing a newer send of the same buffer on
+  the socket does not count for the newer one;
+- **an older client** (no `CAP_RELEASE_SEQ`: an older viewer or stream, the
+  viewer's X11 backend): once the backend has sent it a different buffer, the
+  "release on next flip" rule everything followed before;
+- a client that disconnects or goes idle holds nothing;
+- a client that never answers is overruled 500 ms after the buffer was
+  replaced (`SCANOUT_RELEASED_FORCED`, counted).
+
+Latency: a release with no client to wait for is put on the event queue by
+the thread serving the guest's flip, before the flip's reply; a client's
+`EV_RELEASE` is turned into the event by the link thread as soon as it is
+read. With no event buffer posted the event waits (a 2 ms retry). With release
+on, a `ScanoutDisable` also drops the kept copy of the last frame, so a client
+that attaches later is not shown a buffer the guest may be drawing into.
+
+The Linux module would only warn about an unknown event type, but it never
+acks the bit, so it never sees one.
 
 ### Mode policy with several clients
 

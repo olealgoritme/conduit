@@ -3,6 +3,7 @@
 //! | key | values | default |
 //! |---|---|---|
 //! | `view.close_stops_vm` | true, false | true: closing the window of a VM that `conduit view` started shuts it down. A VM started any other way (`conduit up`, virt-manager, virsh) always keeps running. |
+//! | `gpu.window_mib` | 1024, 2048, 4096, 8192, 16384 | the backend's own (4096): the shared window every guest CPU mapping of GPU memory goes through, in MiB. Address space, not memory. Applies when a VM's backend next starts. |
 
 use crate::paths;
 use crate::ui::oops;
@@ -11,11 +12,18 @@ use serde_json::{Map, Value};
 use std::path::PathBuf;
 
 /// Known keys, their allowed values and what they do.
-const KEYS: &[(&str, &[&str], &str)] = &[(
-    "view.close_stops_vm",
-    &["true", "false"],
-    "closing the window of a VM that `conduit view` started shuts it down (default true)",
-)];
+const KEYS: &[(&str, &[&str], &str)] = &[
+    (
+        "view.close_stops_vm",
+        &["true", "false"],
+        "closing the window of a VM that `conduit view` started shuts it down (default true)",
+    ),
+    (
+        "gpu.window_mib",
+        &["1024", "2048", "4096", "8192", "16384"],
+        "MiB of shared window for guest CPU mappings of GPU memory, from the next backend start (default 4096)",
+    ),
+];
 
 fn file() -> PathBuf {
     paths::config_dir().join("config.json")
@@ -105,6 +113,19 @@ pub fn close_stops_vm() -> bool {
         .unwrap_or(true)
 }
 
+/// `gpu.window_mib`, when set: given to the backend as `--window-mib` and to
+/// conduit-vmm as `gpu-forward.window-mib`, which must agree. Unset, neither
+/// is told and both use their own default (4096).
+pub fn window_mib() -> Option<u64> {
+    window_mib_of(&load())
+}
+
+fn window_mib_of(m: &Map<String, Value>) -> Option<u64> {
+    let v = m.get("gpu.window_mib")?.as_str()?;
+    let (_, values, _) = key("gpu.window_mib").ok()?;
+    values.contains(&v).then(|| v.parse().ok()).flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +134,19 @@ mod tests {
     fn unknown_keys_and_values_are_refused() {
         assert!(key("view.close_stops_vm").is_ok());
         assert!(key("view.nope").is_err());
+        assert!(key("gpu.window_mib").is_ok());
+    }
+
+    #[test]
+    fn window_mib_is_read_only_when_valid() {
+        let mut m = Map::new();
+        assert_eq!(window_mib_of(&m), None);
+        m.insert("gpu.window_mib".into(), Value::String("8192".into()));
+        assert_eq!(window_mib_of(&m), Some(8192));
+        // Hand-edited to something the backend would refuse: not passed.
+        m.insert("gpu.window_mib".into(), Value::String("3000".into()));
+        assert_eq!(window_mib_of(&m), None);
+        m.insert("gpu.window_mib".into(), Value::from(4096));
+        assert_eq!(window_mib_of(&m), None);
     }
 }

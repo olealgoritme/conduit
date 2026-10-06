@@ -104,12 +104,29 @@ const SHM_BAR: usize = 2;
 /// "undefined" id, which a guest discards without a word.
 const NV_SHM_ID: u8 = 1;
 
-/// Size of the window, which must cover every offset the backend's allocator
-/// can hand out -- its three zones total exactly this.
+/// Default size of the window, in MiB: the backend's `--window-mib` default
+/// (`shm_regions::WINDOW_MIB_DEFAULT`). The window must cover every offset the
+/// backend's allocator can hand out -- its three zones total exactly this --
+/// so a config that sets `gpu-forward.window-mib` must give the backend the
+/// same number.
 ///
 /// Nothing is committed for it here. The reservation is PROT_NONE and the
 /// pages arrive only as the backend asks for them, one mapping at a time.
-const SHM_SIZE: u64 = 1 << 30; // 1 GiB
+pub const WINDOW_MIB_DEFAULT: u64 = 4096;
+const WINDOW_MIB_MIN: u64 = 32;
+const WINDOW_MIB_MAX: u64 = 65536;
+
+/// The window's size in bytes for `gpu-forward.window-mib` (`None`: the
+/// default): a power of two, as a BAR is, within the backend's own bounds.
+pub fn window_len(mib: Option<u64>) -> Result<u64> {
+    let mib = mib.unwrap_or(WINDOW_MIB_DEFAULT);
+    anyhow::ensure!(
+        mib.is_power_of_two() && (WINDOW_MIB_MIN..=WINDOW_MIB_MAX).contains(&mib),
+        "window-mib {mib}: must be a power of two from {WINDOW_MIB_MIN} to {WINDOW_MIB_MAX}, \
+         and the backend's --window-mib"
+    );
+    Ok(mib << 20)
+}
 
 /// BAR 4 is the UVM aperture: one memory slot per mapping of a UVM file, which
 /// is a CUDA semaphore pool or a managed allocation (`cuMemAllocManaged`).
@@ -731,6 +748,8 @@ fn check_device_config(cfg: &[u8], host_version: &str, vram_limit_mib: Option<u6
 
 pub struct NvGpuDevice {
     inner: Mutex<Inner>,
+    /// BAR 2's size, from [`window_len`].
+    shm_size: u64,
 }
 
 impl NvGpuDevice {
@@ -739,8 +758,10 @@ impl NvGpuDevice {
         socket_path: &Path,
         proc_root: &Path,
         vram_limit_mib: Option<u64>,
+        window_mib: Option<u64>,
         mem: Arc<GuestMemoryMmap>,
     ) -> Result<Self> {
+        let shm_size = window_len(window_mib)?;
         // Checked before connecting: a host with no driver loaded cannot have a
         // backend worth talking to, and the reason is clearer here.
         let host_version = driver_version(proc_root).with_context(|| {
@@ -764,12 +785,14 @@ impl NvGpuDevice {
             .map(|_| EventFd::new(0).context("failed to create conduit-gpu kick eventfd"))
             .collect::<Result<Vec<_>>>()?;
 
-        let (cfg, msix_cap) = Self::build_pci_config();
+        let (cfg, msix_cap) = Self::build_pci_config(shm_size);
         log::info!(
-            "conduit-gpu: backend {} ({CONFIG_LEN}-byte config)",
-            socket_path.display()
+            "conduit-gpu: backend {} ({CONFIG_LEN}-byte config), window {} MiB",
+            socket_path.display(),
+            shm_size >> 20
         );
         Ok(Self {
+            shm_size,
             inner: Mutex::new(Inner {
                 window: None,
                 com: ComCfg::default(),
@@ -880,8 +903,8 @@ impl NvGpuDevice {
     }
 
     /// The window's size, for the caller that has to reserve it.
-    pub fn shm_bar_size() -> u64 {
-        SHM_SIZE
+    pub fn shm_bar_size(&self) -> u64 {
+        self.shm_size
     }
 
     /// Which BAR the window is, for the caller that has to ask the bus for its
@@ -899,7 +922,7 @@ impl NvGpuDevice {
         self.inner.lock().unwrap().msix.bind(vectors, router, intx);
     }
 
-    fn build_pci_config() -> ([u8; 256], u16) {
+    fn build_pci_config(shm_size: u64) -> ([u8; 256], u16) {
         // Class 0x038000: display controller, other.
         let mut cfg = PciConfig::new(
             0x1AF4,
@@ -915,8 +938,8 @@ impl NvGpuDevice {
         cfg.add_virtio_notify_cap(0, NV_OFF_NOTIFY as u32, 0x100, NOTIFY_MULT);
         cfg.add_virtio_cap(3, 0, NV_OFF_ISR as u32, 1);
         cfg.add_virtio_cap(4, 0, NV_OFF_DEVICE as u32, CONFIG_LEN as u32);
-        cfg.set_bar_mem64(SHM_BAR, SHM_SIZE);
-        cfg.add_virtio_shm_cap(NV_SHM_ID, SHM_BAR as u8, 0, SHM_SIZE);
+        cfg.set_bar_mem64(SHM_BAR, shm_size);
+        cfg.add_virtio_shm_cap(NV_SHM_ID, SHM_BAR as u8, 0, shm_size);
         cfg.set_bar_mem64(APERTURE_BAR, APERTURE_SIZE);
         cfg.add_virtio_shm_cap(NV_SHM_ID_APERTURE, APERTURE_BAR as u8, 0, APERTURE_SIZE);
         let msix_cap = cfg.add_msix_cap(
@@ -1081,7 +1104,7 @@ impl PciDevice for NvGpuDevice {
     fn bar_size(&self, bi: usize) -> u64 {
         match bi {
             0 => NV_BAR0_SIZE,
-            SHM_BAR => SHM_SIZE,
+            SHM_BAR => self.shm_size,
             APERTURE_BAR => APERTURE_SIZE,
             _ => 0,
         }
@@ -1097,6 +1120,19 @@ impl PciDevice for NvGpuDevice {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_len_matches_the_backend() {
+        use super::window_len;
+        // host/backend/device/src/shm_regions.rs: WINDOW_MIB_DEFAULT 4096.
+        assert_eq!(window_len(None).unwrap(), 4 << 30);
+        assert_eq!(window_len(Some(1024)).unwrap(), 1 << 30);
+        assert_eq!(window_len(Some(32)).unwrap(), 32 << 20);
+        assert_eq!(window_len(Some(65536)).unwrap(), 64 << 30);
+        for bad in [0, 16, 3000, 131072] {
+            assert!(window_len(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
     use super::*;
 
     fn config(version: &str, gpus: u32, fds: u32) -> Vec<u8> {
