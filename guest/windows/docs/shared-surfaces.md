@@ -9,11 +9,11 @@ itself on NVK. Read `dxvk-on-nvk.md` (sections 3.6, 3.7, S6 on `research/dxvk-on
 | piece | where | state |
 |---|---|---|
 | host verb `RmResourceImport` (MsgType 31) | `feat/s6-backend` (`host/backend/device/src/nvidia/rm_resource.rs`, docs/VENUS.md) | done, unit-tested; route verified on the host driver |
-| librmclient `crm_win_rm_resource_import`, `crm_dup_object` | `guest/rmclient` (this branch) | done; wire unit-tested; DUP tested in win11 |
+| librmclient `crm_win_rm_resource_import`, `crm_dup_object` | `guest/rmclient` (this branch) | done (KMD op 3 of `FOREIGN_RESOURCE`); DUP tested in win11 |
 | NVK patch 0031 | `guest/nvk-rm/patches-windows/0031-*.patch` | done, builds; tested in win11 up to the host verb |
 | DXVK patch 0002 | `third_party/patches/dxvk/0002-helios-nvk-shared-import.patch` | written, applies on 0001; not compiled |
 | UMD bridge | `umd/bridge/dxvk_bridge.cpp` `open_ddi_texture2d` | written; not compiled (no driver build was run) |
-| KMD | section 7 | `kmd/s6-shared-foreign` has the open half; FORWARD of msg 31 missing |
+| KMD | section 7 | open half on `kmd/s6-shared-foreign`; `FOREIGN_RESOURCE` op 3 `RM_RESOURCE_IMPORT` on `kmd/rm-resource-import` (v313) |
 
 ## 1. The problem
 
@@ -60,8 +60,8 @@ CreateAllocation adopts R
                                          identity{R, foreign}, layout trailer ─────────────►  UMD open_resource
                                                                                               DXVK: OPTIMAL image, same desc
                                                                                               vkAllocateMemory(+IMPORT_MEMORY_RESOURCE_INFO R)
-                                         FORWARD msg 31 ◄──────────────────────────────────── crm_win_rm_resource_import(B's DRI, R)
-                                         check: B opened R ───────► PRIME_FD_TO_HANDLE(dma-buf(R)) on B's DRI file
+                                         FOREIGN op 3 ◄────────────────────────────────────── crm_win_rm_resource_import(B's DRI, R)
+                                         check: B opened R, msg 31 ► PRIME_FD_TO_HANDLE(dma-buf(R)) on B's DRI file
                                                                     reply {gem, size, modifier} ─► 
                                                                                               GEM_EXPORT_NVKMS_MEMORY(gem, memFd = B's ctl)
                                                                                               0x3d06 into B's client → hMemory_B
@@ -117,9 +117,10 @@ work is not in those DMA buffers, so dxgkrnl cannot order it.
 ## 5. Implementation on this branch
 
 - **librmclient**: `crm_win_rm_resource_import(rm_handle, resource_id, &gem, &size, &modifier,
-  &flags)` sends msg 31 through `HELIOS_NVRM_OP_FORWARD` (`win_wire.h`
-  `crm_wire_rm_resource_import` / `crm_wire_parse_rm_resource_import`, checked by
-  `test_win_wire`). `crm_dup_object` (NVOS55) with unit tests and `crm_share_smoke`: kept as
+  &flags, &host_errno)`: `HELIOS_ESCAPE_FOREIGN_RESOURCE` op 3 (`RM_RESOURCE_IMPORT`, 80-byte
+  `helios_foreign_rm_resource_import`; the KMD checks that this process opened the resource or
+  this device imported it, then sends the backend's msg 31). `-ENOSYS` while the KMD lacks the
+  op (QUERY_CAPS `supported_ops` bit 3, learnt lazily) or the gate is closed (cap bit 2). `crm_dup_object` (NVOS55) with unit tests and `crm_share_smoke`: kept as
   RM API coverage and as the proof of the KMD hole; NVK does not use it.
 - **NVK patch 0031** (applies on 0023 alone or on nvk-rm/integration after 0029, before
   `patches-windows-dxvk/`; ordered as `5c7e2b8 → 0031 → dxvk 0001..0004`):
@@ -145,25 +146,20 @@ work is not in those DMA buffers, so dxgkrnl cannot order it.
 | `rm_export_exec` + `rm_reimport_check` (the route of section 3 without a guest) | host, RTX 5090, 610.57.04 | LINEAR and block-linear h=5 1920×1080: 0 of 2073600 pixels differ through a second RM client |
 | `vk_dmabuf_to_rm dmabuf` (host Vulkan memory → RM client, spike X4) | host | exact; `opaque`: `PRIME_FD_TO_HANDLE` EBADF |
 | backend unit test `an_rm_resource_becomes_a_gem_handle_on_another_render_node` | `cargo test -p device --features venus` | pass (342 lib tests) |
-| `helios_share_test` (two NVK processes, no UMD) | win11, `C:\Users\Public\s6\nvk`, NVK s6 build | creator: caps 0x17, export image, IMPORT_RM resid with layout; opener: wrong-layout import refused; real import stops at RmResourceImport: KMD 311 refuses FORWARD of msg 31 (-EPERM, probe), and the running backend predates the verb |
+| `helios_share_test` (two NVK processes, no UMD) | win11, `C:\Users\Public\s6\nvk`, NVK s6 build | creator: caps 0x17, export image, IMPORT_RM resid with layout; opener: wrong-layout import refused; real import stops at RM_RESOURCE_IMPORT: KMD 311 has no op 3 (`-ENOSYS`), raw FORWARD of msg 31 is refused (`-EPERM`) |
 | `test_unit`, `test_win_wire` | host | pass |
 
-What is left to prove on the guest: after the KMD forwards msg 31 and a backend with
-`feat/s6-backend` runs, `helios_share_test` end to end (both GPU directions), then a D3D11
-two-process sample (`OpenSharedResource` + keyed mutex) on NVK.
+What is left to prove on the guest, with KMD v313 and a backend carrying `feat/s6-backend`:
+a D3D11 two-process sample (`OpenSharedResource` / NT handle + keyed mutex) on NVK through the
+UMD, which is the only process pair the KMD lets through (the opener must have opened the
+allocation; `helios_share_test` without a WDDM open is refused `NOT_OWNED` by design and stays
+useful for the creator half and the layout check).
 
 ## 7. KMD change list (for the KMD session)
 
-1. **FORWARD msg 31** (`virtio/nvrm.rs` `forward`): accept `MSG_RM_RESOURCE_IMPORT = 31`, exact
-   length `MSG_HDR + 16`, reply buffer at least `MSG_HDR + 24`. Checks before sending:
-   `owner_handle` (payload +0) owned by the caller's device and a DRI node (as the ScanoutFlip
-   arm); `resource_id` (payload +4) a foreign resid this device created (IMPORT_RM owner) or
-   currently holds open through `DxgkDdiOpenAllocation` (the `ForeignTable` open record), not
-   destroyed or destroy-pending; `flags`/`reserved` 0. Refuse with `NotOwned` / `Forbidden`.
-   Count it (`FgRmImp`, `FgRmImpRf`). Alternatively a `FOREIGN_RESOURCE` op
-   `RM_RESOURCE_IMPORT {in rm_handle, resource_id; out gem_handle, flags, size, modifier,
-   host_errno}` with cap bit `HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT`; librmclient switches to it
-   when the cap is set.
+1. **RM_RESOURCE_IMPORT** — done on `kmd/rm-resource-import` (v313): `FOREIGN_RESOURCE` op 3,
+   cap bit 2 (gated by config bit 14), checks the caller's DRI file and that the caller created
+   or opened the resource, sends msg 31; raw FORWARD of msg 31 stays refused.
 2. **Close sweep**: the returned GEM handle belongs to B's DRI file; nothing to track for
    correctness (the backend forgets on GEM_CLOSE / file Close), but recording `(device, file,
    gem)` lets the per-device sweep close leaked ones.

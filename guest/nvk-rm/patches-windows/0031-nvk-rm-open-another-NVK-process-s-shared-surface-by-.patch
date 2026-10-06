@@ -1,4 +1,4 @@
-From 5ccf1404b8e8e700da43b403343abafb03aa0dfb Mon Sep 17 00:00:00 2001
+From 06b43f82f04d373626b8b1eac5eb386197adcf98 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Tue, 6 Oct 2026 04:48:20 +0200
 Subject: [PATCH] nvk/rm: open another NVK process's shared surface by its
@@ -17,8 +17,10 @@ open and never hands out the creator's RM handles. So:
   RESOURCE_INFO (1000384004): resource id, object size, and the layout the
   image must have (modifier, row pitch, offset).
 - vkAllocateMemory with it and a dedicated image: librmclient's
-  crm_win_rm_resource_import asks the host (backend RmResourceImport) to make
-  the resource's memory a GEM object of our render node; we turn that into
+  crm_win_rm_resource_import (the KMD's FOREIGN_RESOURCE RM_RESOURCE_IMPORT,
+  KMD 22.22.313+, for a resource this process opened or this device
+  imported) asks the host (backend RmResourceImport) to make the resource's
+  memory a GEM object of our render node; we turn that into
   RM memory of our own client as Linux NVK imports any nvidia-drm dma-buf
   (DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY to a fresh control channel,
   OS_UNIX_IMPORT_OBJECT_FROM_FD), close the GEM handle and map it like an

@@ -234,18 +234,19 @@ struct crm_foreign_import {
 int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id,
                       uint32_t *host_errno);
 
-/* RmResourceImport (backend MsgType 31, docs/VENUS.md "RM-export resources in
- * a second process"): the memory behind RM-export resource `resource_id`
- * (another process's shared surface) becomes a GEM handle of the render node
- * `rm_handle` (from crm_win_open_device), which the caller then imports into
- * its own RM client (DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY,
- * OS_UNIX_IMPORT_OBJECT_FROM_FD) and closes. *modifier_valid says whether the
- * host knows the resource's layout. -EPROTO from a backend without the
- * message, the KMD's refusal (-EPERM/-EBADF) for a resource this device did
- * not create or open, else the host's -errno. */
+/* HELIOS_ESCAPE_FOREIGN_RESOURCE RM_RESOURCE_IMPORT (op 3; KMD 22.22.313+ and a
+ * backend that serves RmResourceImport, guest/windows/docs/shared-surfaces.md):
+ * the memory behind resource `resource_id` (another process's shared surface
+ * this process opened, or one this device imported) becomes a GEM handle of
+ * the DRM file `rm_handle` (from crm_win_open_device). The caller imports it
+ * into its own RM client (DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY,
+ * OS_UNIX_IMPORT_OBJECT_FROM_FD) and closes it. *flags bit 0: *modifier is the
+ * host's. -ENOSYS without the op or with the gate closed, -EBADF for a file or resource the
+ * caller may not name, -EINVAL for zero ids, -EIO otherwise (*host_errno). */
 #define CRM_RM_IMPORT_MODIFIER_VALID 1u
 int crm_win_rm_resource_import(uint32_t rm_handle, uint32_t resource_id, uint32_t *gem_handle,
-                               uint64_t *size, uint64_t *modifier, uint32_t *flags);
+                               uint64_t *size, uint64_t *modifier, uint32_t *flags,
+                               uint32_t *host_errno);
 
 /* The platform default transport (what crm_open(.., NULL) uses). */
 const struct crm_transport *crm_default_transport(void);

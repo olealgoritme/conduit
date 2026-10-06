@@ -276,36 +276,8 @@ static void test_scanout_path(void)
     CHECK(b[80] == 0xEE);                    /* nothing past the message */
 }
 
-static void test_rm_resource_import(void)
-{
-    uint8_t b[64];
-    CHECK(crm_wire_rm_resource_import(b, 9, 50) == 32);
-    CHECK(crm_get32(b + 0) == 31); /* msg_type RmResourceImport */
-    CHECK(crm_get32(b + 4) == 0);  /* handle */
-    CHECK(crm_get32(b + 16) == 9); /* owner_handle */
-    CHECK(crm_get32(b + 20) == 50);
-    CHECK(crm_get32(b + 24) == 0 && crm_get32(b + 28) == 0);
-
-    uint8_t r[CRM_WIRE_HDR + 24];
-    memset(r, 0, sizeof(r));
-    crm_put32(r + 0, 31);
-    crm_put32(r + 16, 88);
-    crm_put32(r + 20, 1);
-    crm_put32(r + 24, 1u << 20);
-    crm_put32(r + 32, 0x00606015u);
-    crm_put32(r + 36, 0x03000000u);
-    struct crm_wire_rm_import_reply a;
-    CHECK(crm_wire_parse_rm_resource_import(r, sizeof(r), &a) == 0);
-    CHECK(a.gem_handle == 88 && a.flags == 1 && a.size == (1u << 20));
-    CHECK(a.modifier == 0x0300000000606015ull);
-    CHECK(crm_wire_parse_rm_resource_import(r, CRM_WIRE_HDR + 8, &a) == -EIO);
-    crm_put32(r + 8, (uint32_t)-ENOENT);
-    CHECK(crm_wire_parse_rm_resource_import(r, CRM_WIRE_HDR, &a) == -ENOENT);
-}
-
 int main(void)
 {
-    test_rm_resource_import();
     test_cmd_encoding();
     test_open_close();
     test_ioctl_layout();
