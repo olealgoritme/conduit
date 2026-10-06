@@ -276,8 +276,17 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // SetVidPnSourceAddress. The DDI can be called at DIRQL, where neither
         // Venus waits nor registry diagnostics are legal; this worker is the
         // PASSIVE continuation for that exact callback.
+        //
+        // `FfAsyncWin`: first settle the pipelined host flips whose answer is in (an answer frees
+        // the window), then leave the slot alone while the window is still full of flips in
+        // flight: that is the backpressure that keeps DWM from cycling ahead of the host. With
+        // the knob off both are one load and nothing is held back.
+        stall_diag::hpd_enter(site::FOREIGN_FLIP);
+        crate::virtio::foreign_flip::settle(adapter);
         stall_diag::hpd_enter(site::DEFERRED_VIDPN);
-        crate::ddi::display::process_deferred_vidpn_source_address(passive, adapter);
+        if !crate::virtio::foreign_flip::drain_blocked() {
+            crate::ddi::display::process_deferred_vidpn_source_address(passive, adapter);
+        }
 
         // WindowedBlt has an event-driven PASSIVE continuation distinct from
         // scanout refresh: the request must first be admitted by SubmitCommand

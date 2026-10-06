@@ -584,6 +584,24 @@ impl Presenter {
         }
     }
 
+    /// PIPELINED flip (`flip_pipeline`): the flip of surface `slot` was SUBMITTED to the host at
+    /// `now` and its answer is not known yet. The surface and the pacing clock move as for a
+    /// shown flip (the host is assumed to take it, as a timed-out round trip always was);
+    /// the strike count and the retry pause are NOT touched: they belong to the answers
+    /// ([`Self::acked`] on a taken flip, [`Self::flipped`] with `Failed` on a refused or
+    /// timed-out one).
+    pub fn submitted(&mut self, slot: u8, now: u64) {
+        self.ring.commit(slot);
+        self.last_flip = now.max(1);
+    }
+
+    /// PIPELINED flip: the host took a submitted flip. Clears the strikes and the retry pause,
+    /// as a shown flip does; leaves the pacing clock at the submission.
+    pub fn acked(&mut self) {
+        self.fails = 0;
+        self.retry_at = 0;
+    }
+
     /// The transport generation changed or the client was forgotten: everything of
     /// the old generation is gone. A new generation gets a fresh chance.
     pub fn reset(&mut self) {
@@ -1125,6 +1143,56 @@ mod tests {
         assert_eq!(p.fails(), 1);
         // At the pause's end the frame is attempted again.
         assert!(matches!(p.decide(inp(back)), Act::CopyFlip { .. }));
+    }
+
+    #[test]
+    fn a_submitted_flip_paces_and_commits_but_the_answer_owns_the_strikes() {
+        let mut p = shown(10 * MS);
+        let t = 100 * MS;
+        let mut i = inp(t);
+        i.frame_edge = true;
+        let Act::CopyFlip { slot } = p.decide(i) else {
+            panic!("a frame was due")
+        };
+        p.submitted(slot, t);
+        // Paced from the submission, nothing owed, no strike.
+        assert_eq!(p.fails(), 0);
+        assert!(!p.frame_owed());
+        assert_eq!(p.front(), Some(slot));
+        let mut i = inp(t + 1);
+        i.frame_edge = true;
+        assert_eq!(p.decide(i), Act::WaitUntil(t + p.min_interval()));
+        // A refused answer is the usual failure: a strike, the frame owed, the pause.
+        p.flipped(slot, true, FlipResult::Failed, t + 3 * MS);
+        assert_eq!(p.fails(), 1);
+        assert!(p.frame_owed());
+        // A taken answer clears the strikes and the pause (the pacing clock stays).
+        p.acked();
+        assert_eq!(p.fails(), 0);
+        assert!(matches!(
+            p.decide(inp(t + RETRY_AFTER_FAIL_100NS)),
+            Act::CopyFlip { .. }
+        ));
+    }
+
+    #[test]
+    fn answers_of_submitted_flips_still_give_up_after_three_in_a_row() {
+        let mut p = shown(10 * MS);
+        let mut now = 100 * MS;
+        for n in 1..=MAX_CONSECUTIVE_FAILS {
+            let mut i = inp(now);
+            i.frame_edge = true;
+            let Act::CopyFlip { slot } = p.decide(i) else {
+                panic!("a frame was due at failure {n}")
+            };
+            p.submitted(slot, now);
+            // The submission alone never resets the count the failures build.
+            assert_eq!(p.fails(), n - 1);
+            p.flipped(slot, true, FlipResult::Failed, now);
+            assert_eq!(p.fails(), n);
+            now += 100 * MS;
+        }
+        assert!(p.gave_up());
     }
 
     #[test]
