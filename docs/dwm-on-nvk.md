@@ -236,3 +236,16 @@ Run each step only in a quiet window agreed with the install agent. Always end w
 * KMD: `PBRet` 0xC000000D and `PBCpy` 2 -> 225 although DWM never presented on NVK, so this
   `PBRet` comes with a Venus DWM restart (T1 had restarts too).
 * Revert: `DwmIcd` removed, DWM killed once; Venus DWM pid 5128 stable for 30 s.
+
+### T2c (2026-10-06 10:38, 22.22.319.4 with 1d513d1; `DwmIcd=nvk`, `ForeignFlip=0`, 50 s)
+
+* **DWM ran on NVK**: DXVK devices on NVK, created on the helper thread (DWM's calling threads had
+  128 KiB and 512 KiB of stack), with `NvkPolicyScope`.
+* Six 5120x1440 swap-chain buffers and one 1024x1024 surface got foreign ids (res 143 to 149).
+* Six Venus window surfaces became blank placeholders. No crash, no TDR.
+* **Stops after two flips.** DWM made two `Present1` calls through the WDDM flip
+  (`pfnPresentCb` hr 0, flags 0x1, then 0x2 onto an NVK primary). Its log is silent from then until
+  the revert, about 45 s; a Venus DWM logs ~150 presents in that time. So DWM waits for the first
+  flip of a foreign primary, which the Venus `SET_SCANOUT_BLOB` path never completes. This is K1/K3
+  (`ForeignFlip`, KMD v320): next is T3 with `ForeignFlip=1`.
+* Revert: `DwmIcd` removed; Venus DWM pid 7092 stable for 30 s.
