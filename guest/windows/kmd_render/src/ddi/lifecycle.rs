@@ -644,6 +644,11 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // (`ddi::device_lost`): written BEFORE the flush below, so a stop that follows an
         // adapter-wide device loss leaves them on disk. PASSIVE.
         crate::ddi::device_lost::publish_block(crate::ddi::device_lost::Trigger::Stop);
+        // The newest issued flip address (`RestSeed`: the next image reads it at StartDevice,
+        // `pnputil /restart-device` reloads the image and zeroes every static), written before
+        // the first flush so that one covers it; `note_stop_entry` writes it again if a flip
+        // arrived while the worker and the heartbeat were being stopped.
+        crate::ddi::stall_diag::persist_rest_seed(true);
         // The first stage reaches the disk before anything that could bugcheck.
         let flush = crate::diag::read_config_dword(crate::diag::knobs::STOP_FLUSH, 1) != 0;
         if flush {

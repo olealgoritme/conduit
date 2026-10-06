@@ -1001,7 +1001,127 @@ pub(crate) fn note_start_entry(adapter: &AdapterContext, hpd_indicates: u32) {
     // The programming state this StartDevice inherited (the stop's reset already cleared it, so
     // anything here is a start with no stop before it) and the address the heartbeat carries.
     REST_PEND_START.store(adapter.restart_programming_flags(), Ordering::Relaxed);
+    // After a driver image reload every static is zero: take the newest issued address of the
+    // previous image from the service key BEFORE `ScRestIss` is read and before the first
+    // `reset_display_publication_state` seeds the heartbeat from `LAST_ISSUED`.
+    load_rest_seed();
     REST_ISS.store(last_issued_address(), Ordering::Relaxed);
+}
+
+// ---- the restart seed that survives an image reload ----------------------------------------
+
+/// `RestSeed` in force (0 = off: statics only, the v329 behaviour), the persisted address as read
+/// at the last StartDevice (low and high dword; 0 when the knob is off), and `RestSeedUse`
+/// (`restart_flip::USE_*`). Written at every StartDevice, zero included; mirrored by
+/// [`publish_restart`].
+static SEED_EFF: AtomicU32 = AtomicU32::new(0);
+static SEED_LO: AtomicU32 = AtomicU32::new(0);
+static SEED_HI: AtomicU32 = AtomicU32::new(0);
+static SEED_USE: AtomicU32 = AtomicU32::new(0);
+/// The address the service key holds now (as written, or as read back and used), and the
+/// interrupt time (100 ns) of the last write: the worker's change-and-rate test is two loads.
+static SEED_PERSISTED: AtomicU64 = AtomicU64::new(0);
+static SEED_WRITE_T: AtomicU64 = AtomicU64::new(0);
+/// One writer at a time: the worker's periodic write and StopDevice's can overlap.
+static SEED_WRITING: AtomicU32 = AtomicU32::new(0);
+
+/// StartDevice entry, PASSIVE: read the knob and the persisted words, choose the seed
+/// (`restart_flip::choose_seed`) and, when the persisted address wins, store it as `LAST_ISSUED`
+/// so every later seed site (`reset_display_publication_state`, the worker's dead-source exit)
+/// sees it. A rejected value is erased, so that a later and longer boot cannot accept it by its
+/// uptime. Nothing is read or written with the knob off.
+fn load_rest_seed() {
+    use helios_kmd_logic::restart_flip as rf;
+    let on = rf::clamp_knob(crate::diag::read_config_dword(
+        crate::diag::knobs::REST_SEED,
+        1,
+    ));
+    let persisted = if on != 0 {
+        rf::Persisted::from_words(
+            crate::diag::read_config_dword(crate::diag::knobs::REST_ISS_LO, 0),
+            crate::diag::read_config_dword(crate::diag::knobs::REST_ISS_HI, 0),
+            crate::diag::read_config_dword(crate::diag::knobs::REST_UPTIME, 0),
+            crate::diag::read_config_dword(crate::diag::knobs::REST_CHECK, 0),
+        )
+    } else {
+        rf::Persisted::NONE
+    };
+    SEED_EFF.store(on, Ordering::Relaxed);
+    SEED_LO.store(persisted.address as u32, Ordering::Relaxed);
+    SEED_HI.store((persisted.address >> 32) as u32, Ordering::Relaxed);
+    let now = crate::adapter::foreign_scanout::now_100ns();
+    let choice = rf::choose_seed(
+        on != 0,
+        LAST_ISSUED.load(Ordering::Acquire),
+        persisted,
+        rf::uptime_seconds(now),
+    );
+    SEED_USE.store(choice.reason, Ordering::Relaxed);
+    match choice.reason {
+        rf::USE_PERSISTED => {
+            // Only into an empty slot: a flip issued since the check wins.
+            let _ = LAST_ISSUED.compare_exchange(
+                0,
+                choice.address,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            SEED_PERSISTED.store(choice.address, Ordering::Relaxed);
+            SEED_WRITE_T.store(now, Ordering::Relaxed);
+        }
+        rf::USE_STALE | rf::USE_INSANE => {
+            write_rest_words(0, 0);
+            SEED_PERSISTED.store(0, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+/// The four persisted words, check LAST (`restart_flip::persist_words`). PASSIVE.
+fn write_rest_words(address: u64, uptime_s: u32) {
+    use helios_kmd_logic::restart_flip as rf;
+    let w = if address == 0 {
+        [0; 4]
+    } else {
+        rf::persist_words(address, uptime_s)
+    };
+    crate::diag::record_named_bytes(rf::NAME_ISS_LO, w[0]);
+    crate::diag::record_named_bytes(rf::NAME_ISS_HI, w[1]);
+    crate::diag::record_named_bytes(rf::NAME_UPTIME, w[2]);
+    crate::diag::record_named_bytes(rf::NAME_CHECK, w[3]);
+}
+
+/// Write the newest issued address to the service key when it changed (`restart_flip::persist_due`):
+/// `force` (StopDevice) writes at once, otherwise at most once per 2 s. The common call, from the
+/// HPD worker's every pass, is two atomic loads and a compare. PASSIVE only (registry); never on
+/// the flip path. A no-op with the knob off.
+pub(crate) fn persist_rest_seed(force: bool) {
+    use helios_kmd_logic::restart_flip as rf;
+    let current = LAST_ISSUED.load(Ordering::Acquire);
+    let persisted = SEED_PERSISTED.load(Ordering::Relaxed);
+    if current == persisted || SEED_EFF.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let now = crate::adapter::foreign_scanout::now_100ns();
+    if !rf::persist_due(
+        current,
+        persisted,
+        now,
+        SEED_WRITE_T.load(Ordering::Relaxed),
+        force,
+    ) {
+        return;
+    }
+    if SEED_WRITING
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    write_rest_words(current, rf::uptime_seconds(now));
+    SEED_PERSISTED.store(current, Ordering::Relaxed);
+    SEED_WRITE_T.store(now, Ordering::Relaxed);
+    SEED_WRITING.store(0, Ordering::Release);
 }
 
 /// Flip retirement across a restart (`restart_flip`): the programming state at StopDevice and at
@@ -1018,6 +1138,9 @@ static REST_SIG: AtomicU32 = AtomicU32::new(0);
 /// StopDevice, after the worker and the heartbeat were stopped and BEFORE the display state is
 /// reset: what was pending, and the address the heartbeat was carrying. PASSIVE.
 pub(crate) fn note_stop_entry(adapter: &AdapterContext) {
+    // The newest issued address goes to the service key before anything below can fail: the
+    // StopDevice flushes that follow cover it (the next image reads it at StartDevice).
+    persist_rest_seed(true);
     REST_PEND_STOP.store(adapter.restart_programming_flags(), Ordering::Relaxed);
     REST_ADDR_STOP.store(
         adapter.last_primary_address.load(Ordering::Acquire),
@@ -1062,6 +1185,11 @@ pub(crate) fn publish_restart() {
         helios_kmd_logic::restart_flip::high_bytes(stop, iss, exit),
     );
     rec(b"ScRestSig", REST_SIG.load(Ordering::Relaxed));
+    // The persisted seed (`restart_flip::choose_seed`), as this StartDevice read it.
+    rec(b"RestSeedEff", SEED_EFF.load(Ordering::Relaxed));
+    rec(b"RestSeedLo", SEED_LO.load(Ordering::Relaxed));
+    rec(b"RestSeedHi", SEED_HI.load(Ordering::Relaxed));
+    rec(b"RestSeedUse", SEED_USE.load(Ordering::Relaxed));
 }
 
 /// The HPD worker's phase this generation (1 thread entered, 2 StartDevice's return seen, 3 first
