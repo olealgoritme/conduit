@@ -3156,6 +3156,21 @@ Tests (`kmd_logic`): `entry` over its whole input space (2 knobs x venus knob x 
 against an independent statement of the rule), the reason order, the foreign-copy-off refusal that this section is about, the
 Venus knob, and the reason codes' bits.
 
+#### 24.11.5 First hardware rows (339.1 / 339.4): what they say
+
+With `ForeignCopy=1` the arm is entered (`BltEntryOk` = `BltAsyncN`, `BltAsyncFall` / `BltAsyncFail` 0). Nearly every copy is
+DEFERRED (9304 of 9374 in one run): `decide` goes direct only when the producer's boundary is already ready at the Present DDI,
+and the app calls Present right after it submits the frame. The deferred wait is dominated by the producer itself, not the worker
+(`BltDeferUs` / `BltAsyncDefer` was 656 us against a producer GPU time of about 0.7 ms), and the ring copy is 0.5 to 1 ms
+(`BltAsyncLat2`). The Venus submission takes the Venus client mutex, which is PASSIVE only, so a copy cannot be dispatched from the
+boundary-retire DPC; the DPC can only wake the worker. `msInPresentAPI` barely moved (1.93 to 1.86 ms) because it contains the
+runtime's queued-present throttle: the wait moves from the DDI to the throttle once the DDI stops blocking.
+
+`BltNoMirror` is NOT safe with an NVK DWM. A run with `BltAsync=1`, `BltNoMirror=1` showed Heaven's window frozen on its loading
+screen in the composed desktop while PresentMon counted 223 presents/s and `BltMirrorSk` rose; the same scene with the mirror on
+was live. Read the knob as valid only when every reader of the redirection buffer reads the host blob (a Venus DWM). It stays 0 by
+default. With the mirror on, the worker mirrors after the ring copy and the Present's fence retires after the mirror.
+
 ## 25. Wrong buffer on scanout after a device restart (v337 incident; identity fix, StopDevice unbind)
 
 ### 25.1 The incident
