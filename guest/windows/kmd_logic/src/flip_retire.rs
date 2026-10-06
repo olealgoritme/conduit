@@ -441,6 +441,9 @@ pub enum NoAnnounce {
     /// The foreign arm is failing (the presenter gave up or a flip failed within the retry
     /// pause): the Venus or kept-picture path completes the flip.
     Failing,
+    /// Mode 2 and the flip names a foreign or hollow allocation while `FlipAnnForeign` is 0:
+    /// the Venus path is announced, the foreign one waits until it was validated.
+    ForeignOff,
 }
 
 impl NoAnnounce {
@@ -453,6 +456,7 @@ impl NoAnnounce {
             NoAnnounce::Busy => 4,
             NoAnnounce::Unknown => 5,
             NoAnnounce::Failing => 6,
+            NoAnnounce::ForeignOff => 7,
         }
     }
 }
@@ -471,6 +475,11 @@ pub struct AnnounceFacts {
     pub address: u64,
     /// The allocation's resource id, `None` when the handle did not pair.
     pub resource: Option<u32>,
+    /// The flip names a foreign or hollow allocation (`flip_completion::Source` not `Venus`),
+    /// from the KMD's own lock-free record of the allocation.
+    pub foreign_class: bool,
+    /// `FlipAnnForeign` is on: mode 2 may announce foreign classes too.
+    pub foreign_ok: bool,
     /// The worker is idle: nothing pending and the programming gate lowered, read BEFORE this
     /// flip raises it (the previous flip's bind, copy and completion are all finished).
     pub idle: bool,
@@ -488,6 +497,7 @@ pub struct AnnounceFacts {
 /// | 0 | | | | | | `No(Off)` |
 /// | | 0 | | | | | `No(NoAddress)` |
 /// | | | none or 0 | | | | `No(NoResource)` |
+/// | 2 | | | foreign class, `FlipAnnForeign` 0 | | | `No(ForeignOff)` |
 /// | | | | no | | | `No(Busy)` |
 /// | 1 | | | | no | | `No(Unknown)` |
 /// | | | | | yes | yes | `No(Failing)` |
@@ -502,6 +512,9 @@ pub const fn announce_decide(f: &AnnounceFacts) -> Announce {
     match f.resource {
         None | Some(0) => return Announce::No(NoAnnounce::NoResource),
         Some(_) => {}
+    }
+    if matches!(f.mode, AnnounceMode::All) && f.foreign_class && !f.foreign_ok {
+        return Announce::No(NoAnnounce::ForeignOff);
     }
     if !f.idle {
         return Announce::No(NoAnnounce::Busy);
@@ -566,7 +579,7 @@ pub const COUNTERS: &[&str] = &[
     "VsLateMaxUs",
     // announce
     "FaKnob", "FaEarly", "FaDdi", "FaWorker", "FaRefuse", "FaLate", "FaTick", "FaNo", "FaNoWhy",
-    "FaNoBusy", "FaNoUnk", "FaNoFail", "FaNoOther",
+    "FaNoBusy", "FaNoUnk", "FaNoFail", "FaNoOther", "FaNoFgn",
 ];
 
 #[cfg(test)]
@@ -946,6 +959,8 @@ mod tests {
             mode: AnnounceMode::Foreign,
             address: 0x1_0000,
             resource: Some(7),
+            foreign_class: true,
+            foreign_ok: true,
             idle: true,
             accepted: true,
             failing: false,
@@ -985,6 +1000,19 @@ mod tests {
         }
         let f = AnnounceFacts { idle: false, ..facts() };
         assert_eq!(announce_decide(&f), Announce::No(NoAnnounce::Busy));
+        // mode 2 announces the Venus class always and the foreign class only with FlipAnnForeign
+        let f = AnnounceFacts {
+            mode: AnnounceMode::All,
+            foreign_class: true,
+            foreign_ok: false,
+            ..facts()
+        };
+        assert_eq!(announce_decide(&f), Announce::No(NoAnnounce::ForeignOff));
+        let f = AnnounceFacts { foreign_class: false, foreign_ok: false, ..f };
+        assert_eq!(announce_decide(&f), Announce::Yes);
+        // mode 1 is the explicit foreign mode: the extra knob does not gate it
+        let f = AnnounceFacts { foreign_ok: false, ..facts() };
+        assert_eq!(announce_decide(&f), Announce::Yes);
         // mode 1 needs a foreign allocation the arm accepted; mode 2 does not
         let f = AnnounceFacts { accepted: false, ..facts() };
         assert_eq!(announce_decide(&f), Announce::No(NoAnnounce::Unknown));
@@ -1008,6 +1036,8 @@ mod tests {
             mode: AnnounceMode::Off,
             address: 0,
             resource: None,
+            foreign_class: true,
+            foreign_ok: false,
             idle: false,
             accepted: false,
             failing: true,
@@ -1078,6 +1108,7 @@ mod tests {
             NoAnnounce::Busy,
             NoAnnounce::Unknown,
             NoAnnounce::Failing,
+            NoAnnounce::ForeignOff,
         ];
         let mut codes: std::vec::Vec<u32> = all.iter().map(|w| w.code()).collect();
         assert!(codes.iter().all(|&c| c != 0));
@@ -1123,7 +1154,7 @@ mod tests {
     }
 
     const INDEXED: [&str; 6] = ["FlipLat", "FlipPrgLat", "FlipHostLat", "IfGap", "VsLate", "FlipPh"];
-    const KNOBS: [&str; 3] = ["FlipAnnounce", "FlipEarlyWake", "FlipLat"];
+    const KNOBS: [&str; 4] = ["FlipAnnounce", "FlipEarlyWake", "FlipLat", "FlipAnnForeign"];
 
     #[test]
     fn the_counters_the_driver_writes_are_exactly_the_ones_listed() {

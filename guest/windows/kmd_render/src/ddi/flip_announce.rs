@@ -38,6 +38,8 @@ use crate::adapter::{gate_active, AdapterContext};
 /// `FlipAnnounce` in force (`AnnounceMode::code`), `FlipEarlyWake` in force.
 static MODE: AtomicU32 = AtomicU32::new(0);
 static EARLY: AtomicU32 = AtomicU32::new(0);
+/// `FlipAnnForeign` in force.
+static FOREIGN_OK: AtomicU32 = AtomicU32::new(0);
 
 /// The address (and handle) the newest announce waits for the worker to confirm; 0 = none.
 static ANN_ADDR: AtomicU64 = AtomicU64::new(0);
@@ -61,6 +63,7 @@ static NO_WHY: AtomicU32 = AtomicU32::new(0);
 static NO_BUSY: AtomicU32 = AtomicU32::new(0);
 static NO_UNK: AtomicU32 = AtomicU32::new(0);
 static NO_FAIL: AtomicU32 = AtomicU32::new(0);
+static NO_FGN: AtomicU32 = AtomicU32::new(0);
 static NO_OTHER: AtomicU32 = AtomicU32::new(0);
 static EARLY_N: AtomicU32 = AtomicU32::new(0);
 static MIRROR_PENDING: AtomicU32 = AtomicU32::new(1);
@@ -72,13 +75,17 @@ pub(crate) fn start_generation() {
         0,
     ));
     let early = crate::diag::read_config_dword(crate::diag::knobs::FLIP_EARLY_WAKE, 0);
+    FOREIGN_OK.store(
+        u32::from(crate::diag::read_config_dword(crate::diag::knobs::FLIP_ANN_FOREIGN, 0) != 0),
+        Ordering::Relaxed,
+    );
     MODE.store(mode.code(), Ordering::Relaxed);
     EARLY.store(u32::from(early != 0), Ordering::Relaxed);
     ANN_ADDR.store(0, Ordering::Release);
     ANN_HANDLE.store(0, Ordering::Release);
     invalidate_all();
     for c in [
-        &DDI, &WORKER, &REFUSE, &LATE, &NO, &NO_WHY, &NO_BUSY, &NO_UNK, &NO_FAIL, &NO_OTHER,
+        &DDI, &WORKER, &REFUSE, &LATE, &NO, &NO_WHY, &NO_BUSY, &NO_UNK, &NO_FAIL, &NO_OTHER, &NO_FGN,
         &EARLY_N,
     ] {
         c.store(0, Ordering::Relaxed);
@@ -182,10 +189,16 @@ pub(crate) unsafe fn at_ddi(adapter: &AdapterContext, h_alloc: HANDLE, address: 
     // SAFETY: the same lock-free resolution `set_vidpn_primary_address` just made.
     let resource = unsafe { crate::ddi::create_allocation::allocation_resource_id(adapter, h_alloc) };
     let accepted = resource.is_some_and(accepted);
+    // The KMD's own lock-free record of the allocation: a foreign or hollow one is not Venus.
+    // SAFETY: as above.
+    let foreign_class = unsafe { crate::ddi::create_allocation::flip_completion_info(adapter, h_alloc) }
+        .is_some_and(|(source, _)| source != helios_kmd_logic::flip_completion::Source::Venus);
     let facts = AnnounceFacts {
         mode,
         address,
         resource,
+        foreign_class,
+        foreign_ok: FOREIGN_OK.load(Ordering::Relaxed) != 0,
         idle,
         accepted,
         failing: crate::virtio::foreign_flip::failing_atomics(),
@@ -205,6 +218,7 @@ pub(crate) unsafe fn at_ddi(adapter: &AdapterContext, h_alloc: HANDLE, address: 
                 NoAnnounce::Busy => NO_BUSY.fetch_add(1, Ordering::Relaxed),
                 NoAnnounce::Unknown => NO_UNK.fetch_add(1, Ordering::Relaxed),
                 NoAnnounce::Failing => NO_FAIL.fetch_add(1, Ordering::Relaxed),
+                NoAnnounce::ForeignOff => NO_FGN.fetch_add(1, Ordering::Relaxed),
                 _ => NO_OTHER.fetch_add(1, Ordering::Relaxed),
             };
         }
@@ -270,7 +284,10 @@ pub(crate) fn publish_counters() {
     if !owed && m == 0 && e == 0 {
         return;
     }
-    mr.rec(b"FaKnob", m | (e << 8));
+    mr.rec(
+        b"FaKnob",
+        m | (e << 8) | (FOREIGN_OK.load(Ordering::Relaxed) << 16),
+    );
     mr.rec(b"FaEarly", EARLY_N.load(Ordering::Relaxed));
     mr.rec(b"FaDdi", DDI.load(Ordering::Relaxed));
     mr.rec(b"FaWorker", WORKER.load(Ordering::Relaxed));
@@ -283,4 +300,5 @@ pub(crate) fn publish_counters() {
     mr.rec(b"FaNoUnk", NO_UNK.load(Ordering::Relaxed));
     mr.rec(b"FaNoFail", NO_FAIL.load(Ordering::Relaxed));
     mr.rec(b"FaNoOther", NO_OTHER.load(Ordering::Relaxed));
+    mr.rec(b"FaNoFgn", NO_FGN.load(Ordering::Relaxed));
 }
