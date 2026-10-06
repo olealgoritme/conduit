@@ -766,9 +766,17 @@ impl NvidiaBackend {
     // ------------------------------------------------------------------
 
     pub fn teardown(&mut self) {
-        self.teardown_scanout();
+        self.teardown_with("backend teardown");
+    }
+
+    /// [`NvidiaBackend::teardown`], with why the guest's generation ended for
+    /// the display's log.
+    fn teardown_with(&mut self, why: &str) {
+        // Venus first: its scanout goes off before the display drops every
+        // buffer of the generation.
         #[cfg(feature = "venus")]
         self.teardown_venus();
+        self.teardown_scanout(why);
         log::info!(
             "NvidiaBackend::teardown: video memory {} MiB in use, peak {} MiB, {} allocation(s) refused, limit {}",
             self.vram.in_use() >> 20,
@@ -958,7 +966,7 @@ impl NvidiaBackend {
         // rest. What it held is kept across the reset, emptied.
         #[cfg(feature = "venus")]
         let venus = self.reset_venus();
-        self.teardown();
+        self.teardown_with("device reset");
 
         // Everything else back to how `new` left it.
         let tiny = ShmAllocator::new(ZoneConfig {
@@ -971,13 +979,11 @@ impl NvidiaBackend {
         std::mem::swap(&mut self.host, &mut old.host);
         self.window = window;
         self.guest_ram = old.guest_ram.take();
+        // The guest's picture went with it (`teardown_scanout`): the viewer
+        // was blanked, and the boot console (if any) shows the reboot --
+        // firmware, boot menu, disk password -- until the guest's driver
+        // flips again.
         self.display = old.display.take();
-        // The guest's picture went with it: the boot console (if any) shows
-        // the reboot -- firmware, boot menu, disk password -- until the
-        // guest's driver flips again.
-        if let Some(link) = self.display.as_ref() {
-            link.console_reset("device reset");
-        }
         self.caps = old.caps;
         self.driver = old.driver;
         self.abi = old.abi;

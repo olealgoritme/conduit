@@ -326,6 +326,16 @@ to it and input goes to the guest driver as usual. The console takes over
 again after a device reset, when the event queue stops, or when a
 `ScanoutDisable` is not followed by a flip within 250 ms.
 
+A device reset (a guest reboot, or a driver reload such as Windows'
+`pnputil /restart-device`) ends the guest's generation
+(`DisplayLink::guest_gone`): the backend drops every dma-buf it exported or
+kept for it, everything parked by GEM identity, and every buffer awaiting a
+release, and sends the viewer a black shared-memory frame at once, so it
+never presents the old buffer again (its memory was owned by the guest's RM
+clients and is reissued to the next generation). A flip that arrives late
+names a file or resource of the old generation and is refused. The log says
+`display: device reset: guest scanout generation ended; ...`.
+
 Input follows the picture only for a guest that takes Conduit input. The
 rule (`device::display::guest_takes_input`) has two parts, both required:
 

@@ -186,9 +186,22 @@ impl NvidiaBackend {
         }
     }
 
-    pub(super) fn teardown_scanout(&mut self) {
+    /// The guest's transport generation ended (`why`): every dma-buf exported
+    /// for it goes, and the display drops everything it kept of it and blanks
+    /// the viewer ([`DisplayLink::guest_gone`]). A flip that comes later
+    /// names a file of the old generation, which is no longer open, and is
+    /// refused (`handle_scanout_flip`).
+    pub(super) fn teardown_scanout(&mut self, why: &str) {
+        let exported = self.dmabufs.len();
         self.dmabufs.clear();
+        self.rm_layouts.clear();
         if let Some(link) = self.display.as_ref() {
+            if exported > 0 {
+                log::info!(
+                    "scanout: {why}: {exported} exported buffer(s) of the old generation dropped"
+                );
+            }
+            link.guest_gone(why);
             use std::sync::atomic::Ordering::Relaxed;
             let s = &link.stats;
             log::info!(
@@ -503,5 +516,83 @@ mod tests {
             crate::display::wire::CMD_ATTACH
         );
         let _ = broker.into_raw_fd();
+    }
+
+    /// Read one 40-byte broker record (any fd it carries is dropped).
+    fn broker_cmd(fd: RawFd) -> crate::display::wire::Cmd {
+        let mut buf = [0u8; crate::display::wire::CMD_SIZE];
+        let mut got = 0;
+        while got < buf.len() {
+            let n = unsafe { libc::recv(fd, buf[got..].as_mut_ptr().cast(), buf.len() - got, 0) };
+            assert!(n > 0);
+            got += n as usize;
+        }
+        crate::display::wire::Cmd::decode(&buf)
+    }
+
+    /// A device reset (a guest reboot, or `pnputil /restart-device` reloading
+    /// the KMD) ends the guest's generation: every export goes, the viewer is
+    /// sent black instead of keeping the old buffer, and a late flip naming
+    /// the old generation's file is refused without reaching the host or
+    /// the viewer.
+    #[test]
+    fn a_reset_drops_the_generation_and_refuses_its_late_flips() {
+        use crate::display::wire;
+        use std::sync::atomic::Ordering::Relaxed;
+        let (mut be, host, owner) = setup_without_viewer();
+        let mut sv = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) },
+            0
+        );
+        let broker = unsafe { OwnedFd::from_raw_fd(sv[1]) };
+        let link = DisplayLink::new(None);
+        link.adopt(unsafe { OwnedFd::from_raw_fd(sv[0]) });
+        be.set_display(link.clone());
+        let mut resp = [0u8; 64];
+        be.dispatch(&flip(owner, 7, 1), &mut resp);
+        assert_eq!(status(&resp), 0);
+        assert_eq!(be.scanout_buffers(), 1);
+        assert_eq!(link.stats.sent.load(Relaxed), 1);
+        // WINDOW, QUERY_FORMAT, ATTACH, COMMIT.
+        let cmds: Vec<_> = (0..4).map(|_| broker_cmd(broker.as_raw_fd()).ty).collect();
+        assert_eq!(
+            cmds,
+            [
+                wire::CMD_WINDOW,
+                wire::CMD_QUERY_FORMAT,
+                wire::CMD_ATTACH,
+                wire::CMD_COMMIT
+            ]
+        );
+
+        be.reset();
+        assert_eq!(be.scanout_buffers(), 0);
+        assert_eq!(link.generation(), 1);
+        assert!(!link.has_parked());
+        // Black, from shared memory, at the size the viewer showed.
+        let c = broker_cmd(broker.as_raw_fd());
+        assert_eq!((c.ty, c.width, c.height), (wire::CMD_ATTACH, 64, 64));
+        assert_ne!(c.flags & wire::CMD_F_SHM, 0);
+        assert_eq!(broker_cmd(broker.as_raw_fd()).ty, wire::CMD_COMMIT);
+        let sent = link.stats.sent.load(Relaxed);
+
+        // A late flip of the old generation: its file is gone.
+        let exports = host.0.lock().unwrap().len();
+        be.dispatch(&flip(owner, 7, 2), &mut resp);
+        assert_eq!(status(&resp), -libc::EBADF);
+        assert_eq!(host.0.lock().unwrap().len(), exports, "nothing exported");
+        assert_eq!(link.stats.sent.load(Relaxed), sent, "nothing shown");
+        let mut n: libc::c_int = 0;
+        assert_eq!(
+            unsafe { libc::ioctl(broker.as_raw_fd(), libc::FIONREAD, &mut n) },
+            0
+        );
+        assert_eq!(n, 0, "nothing more reached the viewer");
+
+        // The new generation's file numbers do not reuse the old ones.
+        let null: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let h = be.handles.insert(null);
+        assert_ne!(h as u32, owner);
     }
 }
