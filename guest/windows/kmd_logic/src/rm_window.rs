@@ -593,6 +593,7 @@ pub const COUNTERS: &[&str] = &[
     "NvMapTGrow",
     "NvMapTRef",
     "NvTblOom",
+    "NvRestLost",
     "NvPinQRef",
     "NvWinInfo",
     "NvSanityRef",
@@ -759,8 +760,10 @@ mod tests {
             let c = Config::new(win * MIB, knob, max, Policy::Dynamic);
             assert_eq!((c.cap, c.reserve), (cap * MIB, reserve * MIB), "{win} {max} {knob}");
             assert!(c.ordinary_limit() >= c.cap - c.cap / 4 || c.cap == 0, "{win} {max} {knob}");
+            // Never below the legacy window/4 (or, when the operator bound lowers the cap
+            // under it, below three quarters of the cap).
             assert!(
-                c.ordinary_limit() >= c.legacy_quota().min(c.cap),
+                c.ordinary_limit() >= c.legacy_quota().min(c.cap - c.cap / 4),
                 "never below the legacy quota: {win} {max} {knob}"
             );
             if cap > 0 {
