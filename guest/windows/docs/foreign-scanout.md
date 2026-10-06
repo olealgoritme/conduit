@@ -431,7 +431,10 @@ Venus present cannot touch it. The ~104 ms per frame is not the S4 queue.
    leaving the owner's remaining blobs in the table with a dead owner token and their pending
    windowed blts (each holding a read-ledger ticket and one of 64 token slots) un-cancelled.
    Killed apps fill the blob table, the token slots and the ledger a few at a time. Now the rest
-   are drained without host commands, their undispatched windowed blts cancelled (`BlbAbandoned`,
+   are drained without host commands, their undispatched windowed blts cancelled and their
+   read-ledger claims ended (the 8-slot ledger would otherwise run out and every windowed
+   present would get `STATUS_NO_MEMORY`; a claim with a reader still active is pinned until that
+   reader's ticket retires, then reclaimed) (`BlbAbandoned`,
    must read 0).
 4. **Closing present-stream slots keep undispatched requests alive (fixed).** A purge that finds a
    mid-frame stream only marks it closing; the sweep that cancels the requests of dead streams

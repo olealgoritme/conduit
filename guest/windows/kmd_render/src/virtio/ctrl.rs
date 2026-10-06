@@ -1807,6 +1807,11 @@ pub fn release_blobs_for_owner_within(
             // Nothing else: the host objects stay until the Venus teardown, as for the
             // blob that was ambiguous.
             let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
+            // And the resid's claim on the 8-slot read ledger: skipping it leaked one slot
+            // per abandoned blob, until `queue_windowed_blt` could issue no ticket at all.
+            // `note_alloc_retired` pins the claim while a reader is still active and
+            // reclaims it when the last ticket retires, so it is safe for any state.
+            retire_ledger_claim(passive, adapter, res);
             BLOB_SWEEP_ABANDONED.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -1852,6 +1857,9 @@ pub fn release_blobs_for_owner_within(
             // and the 64 WindowedBlt token slots across a few killed processes. The rest
             // are drained without host commands (`abandoned`, above).
             abandoned = true;
+            // The ambiguous blob's own ledger claim as well (pinned while its reader is
+            // active, reclaimed when that reader's ticket retires).
+            retire_ledger_claim(passive, adapter, res);
             BLOB_SWEEP_ABANDONED.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -1876,11 +1884,19 @@ pub fn release_blobs_for_owner_within(
         // how a crashed/exited process's snapshot resids reach the ledger at
         // all (`RdOvf` must stay 0 across app restarts). Per-resid acquisition
         // keeps the display worker's lock hold times unchanged during a sweep.
-        adapter.with_scanout_lifecycle(passive, |_lock| {
-            adapter.read_ledger.note_alloc_retired(res);
-        });
+        retire_ledger_claim(passive, adapter, res);
         reclaimed += 1;
     }
+}
+
+/// End `res`'s claim on the D4a read ledger (`ReadLedger::note_alloc_retired`) under the
+/// scanout lifecycle mutex, which serialises the ledger's claim discipline. Every blob
+/// teardown path of `release_blobs_for_owner_within` ends here, the ones that send nothing
+/// to the host included.
+fn retire_ledger_claim(passive: PassiveLevel, adapter: &AdapterContext, res: u32) {
+    adapter.with_scanout_lifecycle(passive, |_lock| {
+        adapter.read_ledger.note_alloc_retired(res);
+    });
 }
 
 /// Drop the KMD-internal (owner-0) blob slot for an allocation at
