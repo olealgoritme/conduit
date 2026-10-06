@@ -234,6 +234,37 @@ struct crm_foreign_import {
 int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id,
                       uint32_t *host_errno);
 
+/*
+ * RM fences (KMD 22.22.311+, guest/windows/docs/rm-fence-marker.md, docs/SYNC.md).
+ * A semaphore-surface fence context on render node drm_fd imports RM
+ * NV_SEMAPHORE_SURFACE h_semsurf (of RM client h_client, `size` bytes of
+ * semaphore memory) at slot `index`; a fence is a backend handle that fires
+ * once when that slot reaches wait_value, or after timeout_ms (at most 5000,
+ * nvidia-drm's cap) with an error the caller cannot see: re-check the value.
+ * Close a fence with crm_win_close_device unless SCANOUT_PRESENT took it.
+ */
+/* QUERY_CAPS: supported_ops (bits 32..63: HELIOS_NVRM_CAP_*, bit 32 = scanout
+ * fences) and the host's device_features (bit 11 = NVGPU_CFG_DRM_FENCES). */
+#define CRM_WIN_CAP_SCANOUT_FENCE (1ull << 32)
+#define CRM_WIN_CAP_PRESENT_FENCE (1ull << 33)
+int crm_win_caps(uint64_t *supported_ops, uint32_t *device_features);
+/* SEMSURF_FENCE_CTX_CREATE: *ctx is a GEM handle of drm_fd. -ENOSYS when the
+ * host has no DRM fences (feature bit 11). */
+int crm_win_semsurf_ctx_create(int drm_fd, uint32_t h_client, uint32_t h_semsurf,
+                               uint64_t size, uint64_t index, uint32_t *ctx);
+/* SEMSURF_FENCE_CREATE: *fence > 0 is a backend handle this device owns. */
+int crm_win_semsurf_fence_create(int drm_fd, uint32_t ctx, uint64_t wait_value,
+                                 uint32_t timeout_ms, int *fence);
+/* Block until the fence fired: 1, 0 on timeout, or a negative errno. */
+int crm_win_fence_wait(int fence, uint32_t timeout_ms);
+/* SCANOUT_PRESENT with HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE: the KMD sends
+ * the flip when the fence fires and returns at once. On 0 the KMD OWNS the
+ * fence (never close, wait on or reuse it). Any error leaves it the caller's:
+ * -ENOSYS without CRM_WIN_CAP_SCANOUT_FENCE, -EAGAIN when 8 presents already
+ * wait (QUEUE_FULL), -EALREADY when it is attached, -ENOENT when the source is
+ * gone, otherwise the KMD status as an errno. */
+int crm_win_scanout_present_fenced(uint32_t handle, uint32_t gem, int fence, uint64_t *seq);
+
 /* The platform default transport (what crm_open(.., NULL) uses). */
 const struct crm_transport *crm_default_transport(void);
 

@@ -67,3 +67,8 @@ executable('crm_pin_smoke', 'tests/crm_pin_smoke.c',
 executable('crm_scanout_smoke', 'tests/crm_scanout_smoke.c',
   include_directories : [inc, include_directories('src')],
   dependencies : rmclient_dep)
+# RM semaphore-surface fences through the KMD (dxvk-on-nvk S4): fence create,
+# EVENT_REGISTER on the fence handle, signal latency; exits 77 elsewhere.
+executable('crm_semsurf_smoke', 'tests/crm_semsurf_smoke.c',
+  include_directories : [inc, include_directories('src')],
+  dependencies : rmclient_dep)
