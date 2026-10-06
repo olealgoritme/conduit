@@ -2569,3 +2569,153 @@ about frames minted, not frames shown (a fenced flip may still be queued when it
 invisible by construction; (4) a tag on a flip is refused on purpose (a flip copies nothing and its completion
 invariant must run), so a flip-path workload needs a different lever; (5) `ForeignFlip`'s resident source (DWM-on-NVK)
 is not covered: its presents are flips.
+
+## 23. RM fence carrier wedge (v333 incident; fix v335)
+
+Built, host-tested for its pure half (`kmd_logic/src/wait_bound.rs`, `flip_pend_wd.rs`, `rm_fence_present.rs` `Gate`),
+type-checked against the stub harness, compiled by nothing that links the WDK, run by nothing. Branch
+`kmd/fence-carrier-wedge`.
+
+### 23.1 The incident
+
+Heaven DX11 fullscreen exclusive 5120x1440, NVK DWM with `ForeignFlip=1`, `HELIOS_NVK_RM_FENCE_PRESENT=1` for Heaven only
+(carrier (b) of `docs/rm-fence-marker.md`). About 50 s of fast presents (present gate 105 us, 7680 presents), then the
+screen froze. Heaven's `dxvk-queue` thread sat in `NtGdiDdDDIEscape`. After `Stop-Process -Force` Heaven stayed alive, the
+screen stayed frozen, explorer logged an app hang, and `pnputil /restart-device` never returned. Only a VM reboot cleared it.
+
+### 23.2 What the dumps actually say (read before the hypotheses)
+
+Files: `kmd-1.txt`, `kmd-2.txt` (uptime 4 760 s and 4 765 s), `kmd-3-stuck-1913.txt` (uptime 4 987 s), `heaven-stacks.txt`,
+`dwm-stacks-stuck.txt`, `umd-heaven.log`. `kstacks-stuck.txt` holds only the LiveKd banner: NO kernel stack of any
+thread exists, and the user-mode stacks end at `wow64win!NtGdiDdDDIEscape`, so "blocked in the KMD" is an inference, not
+a reading.
+
+1. The stall block of `kmd-1` / `kmd-2` is a stale snapshot. `StallT` 4 700 746 against uptime 4 760 375 / 4 765 859:
+   every value of the block (`FlipIss`, `FlipPub`, `HpdSite`, `ScLkN` ...) is 60 s old and identical in both reads
+   because nothing wrote the block, not because nothing moved. Only the heartbeat block (`VsTick*`, `VsWd*`) moved. The
+   block is written on request (worker, dump, escapes while the worker looks stuck); an idle worker and no escapes mean
+   nobody requests (14.2). "Frozen in both reads 5 s apart" is therefore no evidence about the flip queue.
+2. `FlipIss` 16267 against `FlipPub` 16261 is NOT six parked flips: `VpCoal` is 12 (handles dropped by coalescing; the
+   healthy quiescent figure is `FlipIss - FlipPub - VpCoal` near 0, here -6, i.e. more publications than issues, as foreign
+   flips publish more than once). `VsPendN` 0, `VpPend` 0, `VpGate` 0, `PrdPend` 0, `FfAsSub` = `FfAsAck` = 12281,
+   `FsFQue` 0, `RmGAtt` = `RmGFire` = 7763, `RmGCan` 0, `RmGRef` 0, `NvEvLost` 0, `NvEvDrop` 0: the KMD held nothing.
+3. `kmd-3` (block refreshed at 4 955 523, 256 s after the last flip): `FlipIss` 16267, `FlipPub` 16261, `FlipPubT`
+   4 699 380 (unchanged: dxgkrnl issued no flip for 256 s), still `VsPendN` 0 and `VpGate` 0, `VpVsN` moving at
+   240 Hz (the heartbeat reports the last address every tick). `DdiInflL` 0: NO DDI of ours in flight, so no escape was
+   inside `DxgkDdiEscape`. `NStopDev` 0: the `pnputil` stop never reached `DxgkDdiStopDevice`.
+   `NPreempt` 2 and `TPreempt` 4 699 382: `DxgkDdiPreemptCommand` was called twice, the last 2 ms after the last
+   publication. (`kmd-1` / `kmd-2` carry `DdiInflL` = bit 30 = one Escape in flight at 4 700.7 s: that one, or the one the
+   tester's tool made; it was gone by 4 955.)
+4. `EscHwA` 0 and `EscNoSy` 0: no escape sets `HardwareAccess`, and NO escape sets `NoAdapterSynchronization`, so
+   dxgkrnl serializes every escape against the adapter-level DDI synchronization before our DDI is entered.
+
+### 23.3 Ranked hypotheses
+
+| # | hypothesis | for | against | what would show it |
+|---|---|---|---|---|
+| H1 | dxgkrnl / VidSch wedge after the preemption at 4 699.382: the scheduler never resumed (no `SubmitCommand`, no flip, no `CreateDevice` for 290 s) and the escape (adapter-synchronized, `EscNoSy` 0) and the device stop queue behind a dxgkrnl lock, not behind ours | `NPreempt` 2 / `TPreempt` 2 ms after `FlipPubT`; `DdiInflL` 0 at 4 955; `NStopDev` 0; nothing pending in the KMD; `NResetTmo` 0 (TDR off or not reached) | the ack looks delivered (`DmaNtfF` 0, `WdSigF` 0, `DdiFailN` 0); the preempt request itself is unexplained | kernel stacks: `!process <Heaven> 7`, the thread `27fc.3194`, `!stacks 2 dxgkrnl`, `!stacks 2 dxgmms2`, `!stacks 2 helios_kmd_render`, `!locks`; the new `Pre*` breadcrumbs (23.6) |
+| H2 | the preempt ack semantics: `preempt_flush` drops the whole pending WDDM FIFO (`virtio/gpu/mod.rs` `preempt_flush`), `DMA_PREEMPTED` carries `LastCompletedFenceId = last_completed_fence`; dxgkrnl resubmits the dropped buffers only when it schedules again, and nothing after the preempt was ever submitted | same as H1 | no counter of what was dropped (`AbnDrop` 0 in both reads: written by the PASSIVE flush, may be stale) | `Pre*` breadcrumbs: preemption fence, last completed, dropped count |
+| H3 | an escape blocked INSIDE the KMD on a host round trip (`wait_block` 30 s `SYNC_ROUNDTRIP_TIMEOUT_MS`, a loop of them, the Venus ring wait up to minutes under the Venus mutex, the scanout mutex acquire without end) | `kmd-2` shows an Escape in flight at 4 700.7 | `DdiInflL` 0 at 4 955 (a 30 s round trip ended by then; a mutex wait would still be counted in flight) | `DdiInflL` bit 30 and `DdiOldMs` in the next stuck dump; `LkWaitN`, `VnLkHeldMs` |
+| H4 | a lost RM fence fire holds a gate point (and the WDDM FIFO head behind it) for ever | the incident's path | `RmGAtt` = `RmGFire`, `RmGCan` 0, nothing pending; the 250 ms head rebase (`WdHeadEff` 250) already bounds a stream head | `RmGAtt - RmGFire` > 0 for more than 6 s |
+| H5 | the early-fire note table (16 entries, `nvrm_fence::EARLY_CAP`) dropped a fire that raced a create | possible under many threads | `NvEvLost` 0, `NvFenceEarly` 29, `RmGEarly` 32 | `NvEvLost`, `NvFenceErr` |
+| H6 | the flip queue itself parked behind a Deferred programming on a boundary that never completes | the task's premise | `VpPend` 0, `VpGate` 0, `VsPendN` 0 (at 4 700.7 and at 4 955) | `VsPendN` growing with `FlipPub` flat |
+
+Whatever the cause, three facts make the damage worse than it has to be, and v335 fixes those without waiting for the
+cause: a thread in a kernel wait cannot be killed, so one blocked escape makes the process unkillable; the device stop
+then waits for what that thread holds; and a flip that stops being published is never retired by anything.
+
+### 23.4 What changed
+
+All of it acts only when something is already wrong (a thread being terminated, the device stopping, a flip stuck), and
+every knob can restore v334 (0).
+
+1. **The escape scope** (`ddi/escape_wait.rs`, `kmd_logic::wait_bound`). `dxgkddi_escape` registers the calling thread
+   (table of 64, keyed by thread id) with a deadline of `EscWaitMs` (default 10000, 250..600000, 0 = no deadline) and
+   refuses with `STATUS_DEVICE_NOT_READY` when the device is already stopping. Every wait the escape makes gives up when
+   the thread is terminating (`PsIsThreadTerminating`), when the stopping flag is up, or when the deadline is spent. A
+   thread that is NOT inside an escape (the HPD worker, a DPC, paging, a DDI that dxgkrnl runs on a terminating thread to
+   clean up) is never aborted: `verdict` answers `None` for it.
+2. **The waits**, each with its bound before and after:
+
+   | wait | before | after (inside an escape) |
+   |---|---|---|
+   | `ctrl::wait_block` (every control-queue and NVRM round trip, `wait_fence`) | 1 ms .. 1 s slices to the call's total (30 s; `WAIT_FENCE_MAX_MS` 120 s) | slices <= 100 ms, each ends with the abort check; ends at the escape deadline; abort = the existing timeout path (`VirtioError::Timeout`, abandon, the escape's own `TIMEOUT` status) |
+   | every retry loop charging a `Budget` (queue full, map busy, present-buffer write/teardown) | nominal ms, up to ~16x real | `charge_slice` reports spent on an abort |
+   | the Venus ring wait (`ring_wait_until`, under the Venus mutex) | 30 000 sleeps of 1 ms, bounded by the real clock | the same, plus the abort check each round, WITHOUT latching the ring fatal (`Timeout`) |
+   | Venus mutex acquire (`acquire_venus_mutex`) | infinite (5 s counted slices) | 100 ms slices, abort returns `NotStarted` through `with_venus_client`, the client is not touched |
+   | scanout mutex acquire | infinite | `try_with_scanout_lifecycle` (RELEASE_BLOB path, snapshot status) gives up with `None`; `with_scanout_lifecycle` (callers that cannot fail) is unchanged |
+   | content mutex (`PassiveMutex::lock`) | infinite | abortable, returns `None` |
+   | RM client lease/sysmem waits, worker service | worker only | unchanged (never in an escape) |
+
+   Not covered: waits inside DDIs other than Escape (`DxgkDdiPresent`'s scanout-lifecycle acquire, `Render`'s fence service).
+   A thread blocked inside dxgkrnl itself (H1) is not reachable from the KMD at all.
+3. **The stopping flag.** Set first thing in `DxgkDdiStopDevice` and `DxgkDdiRemoveDevice`, cleared at StartDevice
+   (`escape_wait::reread_knobs`). Every scoped wait polls it at least every 100 ms, so an escape holding the Venus or
+   scanout mutex releases it and the teardown that waits for it proceeds.
+4. **The generic pending-flip watchdog** (`kmd_logic::flip_pend_wd`, knob `FlipPendWdMs`, default 500, 100..60000,
+   0 = off). Every vsync tick: the newest flip dxgkrnl issued is not done, was issued at least that long ago, and no
+   address was published for as long, then its address is published kept (`publish_kept_primary`, one atomic store,
+   DISPATCH) and the flip marked done: `FlipPendWd`, `FlipPendWdT`, `FpWdMsEff`. Why `FlipWdogMs` would not have caught
+   the incident: it counts only while a programming is pending (`VsPendN`), and `VsPendN` was 0; this one needs no
+   pending state, only an unretired newest flip. The two share the record of the newest flip, so a flip is never
+   published twice.
+5. **Lost RM gate fires** (`kmd_logic::rm_fence_present::Gate::take_expired`, knob `RmGateMs`, default 6000, 1000..120000,
+   0 = never). The worker (`foreign_fence_service`, every 250 ms at most) declares fired any point whose fence has not
+   fired 6 s after it was attached (the host's own fence timeout is 5 s and fires with an error status), queues its handle
+   for closing and prompts the completion DPC: a boundary that can never become ready is ready after a bounded time.
+   `RmGExp`, `RmGateMsEff`.
+6. **Owner death.** A killed owner can now leave its escape, so `DestroyDevice` / `DestroyProcess` run: the RM gate is
+   purged (`rm_gate_purge_process_ordered`), the stream slot retires, `discharge_dead_present_stream_waits` ends the
+   waits that named it, and a Deferred programming gated on it exits through `WorkerBindDispatch::Abandoned` ->
+   `ScanoutReject::ProducerAbandoned` -> `complete_dead_source`, which publishes the flip's address kept (read, not run:
+   `stage_worker_scanout_bind`, `display.rs` `complete_dead_source`). A flip nobody completes is retired by item 4 after
+   `FlipPendWdMs` whoever owned it.
+7. **A stale dump refreshes itself.** The vsync tick asks the mirror thread for the stall block when it is older than 5 s
+   (`StallReqN`): the 333 stuck dumps were read 60 s and 290 s after the block they showed.
+
+### 23.5 Counters (at most 14 characters, unique across `kmd_render` and `kmd_logic`)
+
+`EscWaitN` (escapes scoped), `EscWaitMax` (longest, ms), `EscAbortKill`, `EscAbortStop`, `EscTimeout` (waits that gave up:
+thread terminating, device stopping, `EscWaitMs` spent), `LkWaitAbort` (mutex acquires that gave up), `EscNoSlot` (table
+full), `EscRefStop` (escapes refused while stopping), `EscWaitMsEff`, `PreFence`, `PreLastCmp`, `PreDropped`, `PreStatus`,
+`PreT` (the last `DxgkDdiPreemptCommand`), `FlipPendWd`, `FlipPendWdT`, `FpWdMsEff`, `StallReqN`, `RmGExp`, `RmGateMsEff`.
+Knobs: `EscWaitMs`, `FlipPendWdMs`, `RmGateMs` (read at every StartDevice).
+
+### 23.6 What to read after the next wedge
+
+`DdiInflL` / `DdiInflH` / `DdiOldId` / `DdiOldMs` (is anything of ours in flight), `NPreempt`, `TPreempt`, `Pre*`, `NStopDev`,
+`StallT` against the uptime (is the block fresh), `FlipIss`, `FlipPub`, `FlipPubT`, `VsPendN`, `FlipPendWd`, `RmGAtt`,
+`RmGFire`, `RmGExp`, `EscAbort*`, `EscTimeout`, `LkWaitAbort`. And the kernel stacks, which this incident lacked: with
+LiveKd, `!process 0 7` for the stuck process and for `dwm.exe`, `!thread` for the escape thread, `!stacks 2 dxgkrnl`,
+`!stacks 2 dxgmms2`, `!stacks 2 helios_kmd_render`, `!locks`, `!vm`. The UMD could also set `NoAdapterSynchronization`
+on its escapes (none does): that takes dxgkrnl's adapter-level serialization out of the picture for them (not a KMD change).
+
+### 23.7 Verified, and not
+
+Verified (host tests): the wait state machine (unscoped waits unchanged to their own total, the 1 ms -> 1 s ladder,
+scoped slices <= 100 ms, kill beats stop beats deadline, a kill noticed within one slice, the deadline exact across the
+32-bit clock wrap, never 0, a nested scope keeps the outer deadline and does not release it, a full table registers
+nothing); the pending-flip watchdog decision (to the millisecond, once per flip, a newer stuck flip fires again,
+the wrap, the incident's own numbers); gate point expiry (in order, out-of-order fires, wrap, unstamped never); knob
+clamps; counter names (listed = written, written nowhere else). Type-checked against the stub harness (the error set
+equals the base's, apart from one stub-only unknown-field error counted twice).
+
+NOT verified: anything on hardware or the WDK build; that a killed thread's abort status is what the UMD expects from each
+escape (an abort is the escape's own timeout/not-ready status); that `PsIsThreadTerminating` is true for a thread under
+`Stop-Process -Force` while it waits in KernelMode (it is the documented test; the 100 ms slices make the wait itself
+independent of any APC); the cause of H1.
+
+Risks: (1) `EscWaitMs` 10 s cuts a legitimate escape that waits longer in total (a first-time RM init with a user
+timeout above it): the UMD sees its `TIMEOUT` status; the knob is 0 or larger on a machine that needs it; (2)
+`FlipPendWdMs` 500 publishes a kept address for a producer slower than half a second (the screen shows the previous
+picture a moment longer; 14.3); (3) an aborted `release_blob` leaves the host blob to the transport reset; (4) the
+preempt breadcrumbs are diagnosis only.
+
+### 23.8 Checklist
+
+1. Heaven 1600x900 windowed 10-minute soak with `HELIOS_NVK_RM_FENCE_PRESENT=1`: `FlipPendWd` 0, `RmGExp` 0, `EscTimeout` 0,
+   `EscAbortKill` 0, `LkWaitAbort` 0.
+2. Kill the app while it presents: it ends within a second; `EscAbortKill` may count; the desktop continues.
+3. `pnputil /restart-device` with an app running: returns; `EscAbortStop` may count.
+4. A wedge with `FlipPendWdMs=0`, then 500: `FlipPendWd` moves and the flip queue resumes.
+5. `EscWaitMs=0`, `FlipPendWdMs=0`, `RmGateMs=0` restore v334 behaviour (kill and stop exits stay).
