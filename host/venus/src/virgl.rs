@@ -75,6 +75,15 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct ImportBlobArgs {
+        pub res_handle: u32,
+        pub blob_mem: u32,
+        pub fd_type: u32,
+        pub fd: c_int,
+        pub size: u64,
+    }
+
+    #[repr(C)]
     pub struct Hdr {
         pub stype: u32,
         pub stype_version: u32,
@@ -112,6 +121,7 @@ mod ffi {
         pub fn virgl_renderer_submit_cmd(buffer: *mut c_void, ctx_id: c_int, ndw: c_int) -> c_int;
         pub fn virgl_renderer_resource_create_blob(args: *const CreateBlobArgs) -> c_int;
         pub fn virgl_renderer_resource_export_blob(res_id: u32, fd_type: *mut u32, fd: *mut c_int) -> c_int;
+        pub fn virgl_renderer_resource_import_blob(args: *const ImportBlobArgs) -> c_int;
         pub fn virgl_renderer_resource_get_map_info(res_handle: u32, map_info: *mut u32) -> c_int;
         pub fn virgl_renderer_resource_unref(res_handle: u32);
         pub fn virgl_renderer_context_create_fence(ctx_id: u32, flags: u32, ring_idx: u32, fence_id: u64) -> c_int;
@@ -439,6 +449,42 @@ impl Renderer for Virgl {
 
     fn tick(&mut self) -> Option<std::time::Duration> {
         flush_latency()
+    }
+
+    fn features(&mut self) -> u32 {
+        crate::FEATURE_IMPORT_DMABUF
+    }
+
+    /// `virgl_renderer_resource_import_blob` with a dma-buf. The resource is
+    /// `VIRGL_RESOURCE_FD_DMABUF`, which is what the render server's attach
+    /// (`proxy_context_attach_resource`) passes on and what vkr turns into
+    /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT` for
+    /// `VkImportMemoryResourceInfoMESA` (`vkr_get_fd_info_from_resource_info`).
+    /// `blob_mem` is HOST3D only because import_blob takes nothing else; the
+    /// memory is the dma-buf's.
+    fn import_dmabuf(&mut self, res_id: u32, fd: BorrowedFd<'_>, size: u64) -> Result<()> {
+        if res_id == 0 || size == 0 {
+            return Err(Error::Refused("import_dmabuf: resource 0 or size 0".into()));
+        }
+        let dup = fd.try_clone_to_owned()?;
+        let args = ffi::ImportBlobArgs {
+            res_handle: res_id,
+            blob_mem: ffi::VIRGL_RENDERER_BLOB_MEM_HOST3D,
+            fd_type: ffi::VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF,
+            fd: dup.as_raw_fd(),
+            size,
+        };
+        // SAFETY: args is a valid struct for the call.
+        let ret = unsafe { ffi::virgl_renderer_resource_import_blob(&args) };
+        // Ownership of the descriptor: import_blob refuses its arguments
+        // (-EINVAL) before it takes the fd, and from then on owns it, closing
+        // it itself if it fails (virgl_resource_create_from_fd).
+        if ret == -libc::EINVAL {
+            drop(dup);
+            return check(ret);
+        }
+        std::mem::forget(dup);
+        check(ret)
     }
 
     /// The image is described by the guest's layout (see [`ScanoutLayout`]):

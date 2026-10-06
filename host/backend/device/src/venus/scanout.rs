@@ -9,7 +9,8 @@
 //! from the blob's size: a blob exactly as big as the image is linear, and one
 //! with room for the rows NVIDIA pads an optimal-tiling image to is
 //! block-linear ([`modifier_for`]). `CONDUIT_VENUS_SCANOUT_MODIFIER` overrides
-//! the guess, for experiments.
+//! the guess, for experiments. An RM-export blob (`rm.rs`) is shown with the
+//! modifier NVK imported it with, from the dma-buf the backend holds for it.
 
 use super::*;
 use crate::display::FrameGeometry;
@@ -146,8 +147,13 @@ impl Venus {
             offset: s.offsets[0],
             fourcc,
         };
+        // An RM-export blob's layout is known: the one NVK imported it with.
+        // Only a Venus blob (or an RM one whose import the backend did not
+        // see) has its layout guessed from its size.
+        let known = r.rm.and_then(|m| m.modifier);
         let modifier = self
             .forced_modifier
+            .or(known)
             .unwrap_or_else(|| modifier_for(&layout, r.size));
         log::debug!(
             "venus: scanout is resource {} ({} bytes): {}x{} format {} stride {} offset {} modifier {modifier:#018x}",
@@ -185,7 +191,21 @@ impl Venus {
             return Ok(Reply::NoData);
         };
         let (id, layout, format, modifier) = (s.resource_id, s.layout, s.format, s.modifier);
+        let g = FrameGeometry {
+            width: layout.width,
+            height: layout.height,
+            stride: layout.stride,
+            offset: layout.offset,
+            fourcc: layout.fourcc,
+            modifier,
+        };
         let r = self.resources.get_mut(&id).expect("checked above");
+        // An RM-export blob already is a dma-buf, the backend's own: shown
+        // as it is, with no renderer export.
+        if r.rm.is_some() {
+            link.flip_dmabuf(r.fd.as_raw_fd(), &g);
+            return Ok(Reply::NoData);
+        }
         if r.export.as_ref().is_none_or(|e| e.layout != layout) {
             r.export = None;
             match self.renderer.export_scanout(id, layout) {
@@ -213,14 +233,6 @@ impl Venus {
         // The guest's layout, which the renderer echoes into the dma-buf,
         // and the modifier SET_SCANOUT_BLOB inferred: the renderer's is
         // always linear, as it cannot know better.
-        let g = FrameGeometry {
-            width: layout.width,
-            height: layout.height,
-            stride: layout.stride,
-            offset: layout.offset,
-            fourcc: layout.fourcc,
-            modifier,
-        };
         link.flip_dmabuf(e.fd.as_raw_fd(), &g);
         Ok(Reply::NoData)
     }

@@ -83,6 +83,16 @@ absent → no KMS). This is the
 the head a cursor plane; without it there is none and the guest compositor
 draws the cursor into its frames.
 
+Windows guests scan out through Venus (`SET_SCANOUT_BLOB` + `RESOURCE_FLUSH`,
+[VENUS.md](VENUS.md)) and reach the same broker path with a dma-buf. Its
+modifier is inferred from the blob's size, except for an RM-export blob
+(`NVGPU_CFG_RM_IMPORT = 1<<13`, memory NVK on RM rendered into): that one is
+shown with the modifier NVK gave nvidia-drm when it imported the memory
+(`DRM_FORMAT_MOD_LINEAR` for a pitch layout, NVIDIA block-linear 2D with the
+render node's page kind, kind generation and sector layout and NVK's block
+height otherwise; VENUS.md "RM-export blobs"), from the dma-buf the backend
+holds for it, with no renderer export.
+
 ## Dynamic resolution
 
 ```

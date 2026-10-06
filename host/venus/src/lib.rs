@@ -87,6 +87,10 @@ pub struct Dmabuf {
     pub modifier: u64,
 }
 
+/// [`Renderer::features`]: the renderer can make a resource from a dma-buf
+/// the backend hands it ([`Renderer::import_dmabuf`]).
+pub const FEATURE_IMPORT_DMABUF: u32 = 1 << 0;
+
 /// A fence the renderer has signalled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Signalled {
@@ -134,4 +138,21 @@ pub trait Renderer: Send {
     /// image with `layout`'s size, stride, offset and format and
     /// [`DRM_FORMAT_MOD_LINEAR`] (see [`ScanoutLayout`]).
     fn export_scanout(&mut self, res_id: u32, layout: ScanoutLayout) -> Result<Dmabuf>;
+
+    /// What this renderer can do beyond the calls every renderer serves:
+    /// `FEATURE_*` bits. None by default.
+    fn features(&mut self) -> u32 {
+        0
+    }
+
+    /// Make `res_id` a resource whose memory is the dma-buf `fd`, `size`
+    /// bytes of it (docs/VENUS.md "RM-export blobs"). The resource is
+    /// attached to no context; the backend attaches it. Contexts import it
+    /// as `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT` memory through
+    /// `VkImportMemoryResourceInfoMESA`. The renderer keeps its own
+    /// duplicate of `fd`. Only with [`FEATURE_IMPORT_DMABUF`].
+    fn import_dmabuf(&mut self, res_id: u32, fd: BorrowedFd<'_>, size: u64) -> Result<()> {
+        let _ = (res_id, fd, size);
+        Err(Error::Refused("this renderer cannot import a dma-buf".into()))
+    }
 }

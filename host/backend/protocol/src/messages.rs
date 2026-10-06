@@ -412,6 +412,17 @@ pub const NVGPU_CFG_DRM_FENCES: u32 = 1 << 11;
 /// stays unused, so the number means the same thing in both words.
 pub const NVGPU_CFG_TAKES_INPUT: u32 = 1 << 12;
 
+/// Device config `features` bit, only together with [`NVGPU_CFG_VENUS`]: the
+/// backend serves RM-export blobs (docs/VENUS.md "RM-export blobs"):
+/// `RESOURCE_CREATE_BLOB` with `blob_mem =`
+/// [`crate::venus::BLOB_MEM_RM_EXPORT`] imports a host GEM object NVK
+/// exported through nvidia-drm as a dma-buf Venus resource, which Venus
+/// contexts import with `VkImportMemoryResourceInfoMESA` as dma-buf memory
+/// and the scanout shows with the modifier NVK imported it with. Set only
+/// when the backend runs with `--venus` and its renderer can import a
+/// dma-buf. Bit 12 is skipped (see [`NVGPU_CFG_TAKES_INPUT`]).
+pub const NVGPU_CFG_RM_IMPORT: u32 = 1 << 13;
+
 /// Request payload for `MsgType::ScanoutFlip`, following a `MsgHeader`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -988,6 +999,10 @@ mod tests {
         // Below the transport bits (24..), and what guest/linux/conduit_gpu.c
         // lists in its feature table as NVGPU_F_TAKES_INPUT (12).
         assert_eq!(NVGPU_CFG_TAKES_INPUT, 1 << 12);
+        assert_eq!(NVGPU_CFG_RM_IMPORT, 1 << 13);
+        assert_eq!(crate::venus::BLOB_MEM_RM_EXPORT, 0x8000_0001);
+        assert_eq!(crate::venus::rm_export_ids(0x0000_0007_0000_004d), (7, 77));
+        assert_eq!(crate::venus::errno_padding(-34), [34, 0, 0]);
     }
 
     /// The event the guest's event-queue handler decodes: header, then

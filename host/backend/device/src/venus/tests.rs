@@ -5,6 +5,7 @@ use super::*;
 use crate::display::wire;
 use conduit_venus::mock::Mock;
 use conduit_venus::{Blob, CapsetInfo, Dmabuf, ScanoutLayout, Signalled};
+use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
@@ -147,6 +148,49 @@ impl Renderer for Shared {
         self.exports.lock().unwrap().push((res_id, layout));
         self.mock.lock().unwrap().export_scanout(res_id, layout)
     }
+    fn features(&mut self) -> u32 {
+        self.mock.lock().unwrap().features()
+    }
+    fn import_dmabuf(
+        &mut self,
+        res_id: u32,
+        fd: BorrowedFd<'_>,
+        size: u64,
+    ) -> conduit_venus::Result<()> {
+        self.check()?;
+        self.mock.lock().unwrap().import_dmabuf(res_id, fd, size)
+    }
+}
+
+/// The RM side of the backend: objects by (file, GEM handle), each a memfd
+/// of its size exported fresh per ask, with the modifier its import had.
+#[derive(Default)]
+struct FakeRm {
+    objects: HashMap<(u32, u32), (u64, Option<u64>)>,
+    /// The file descriptors handed out, by inode, so a test can tell the
+    /// renderer got the same object.
+    exported: Mutex<Vec<u64>>,
+}
+
+impl RmExports for FakeRm {
+    fn export(&self, rm: u32, gem: u32) -> std::result::Result<crate::nvidia::RmObject, i32> {
+        let &(size, modifier) =
+            self.objects
+                .get(&(rm, gem))
+                .ok_or(if rm == 7 { libc::ENOENT } else { libc::EBADF })?;
+        let dmabuf = conduit_venus::mock::memfd(size).map_err(|_| libc::EIO)?;
+        self.exported.lock().unwrap().push(inode(dmabuf.as_fd()));
+        Ok(crate::nvidia::RmObject { dmabuf, modifier })
+    }
+}
+
+fn inode(fd: BorrowedFd<'_>) -> u64 {
+    // SAFETY: fstat into a zeroed local.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        assert_eq!(libc::fstat(fd.as_raw_fd(), &mut st), 0);
+        st.st_ino
+    }
 }
 
 /// Region 3 as a plain mapping in this process, so a placed blob can be
@@ -256,6 +300,7 @@ struct Rig {
     r: Shared,
     region: Arc<Region>,
     resp: Vec<u8>,
+    rm: FakeRm,
 }
 
 impl Rig {
@@ -274,6 +319,7 @@ impl Rig {
             r,
             region: Region::new(HOSTMEM),
             resp: vec![0u8; 64 * 1024],
+            rm: FakeRm::default(),
         }
     }
 
@@ -281,6 +327,7 @@ impl Rig {
         let env = Env {
             window: Some(&*self.region),
             display,
+            rm: Some(&self.rm),
         };
         self.venus.dispatch(cmd, &mut self.resp, env)
     }
@@ -309,6 +356,7 @@ impl Rig {
         let env = Env {
             window: Some(&*self.region),
             display: None,
+            rm: None,
         };
         self.venus.completions(env)
     }
@@ -1420,3 +1468,5 @@ fn scanout_modifier_reaches_the_viewer() {
     assert_eq!(t.ty(&scanout_cmd(11, 1920, 1080)), RESP_OK_NODATA);
     assert_eq!(t.venus.scanout_modifier(), Some(0x0300_0000_0060_6010));
 }
+
+mod rm;

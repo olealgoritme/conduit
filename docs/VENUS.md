@@ -38,6 +38,7 @@ Setting up a Windows VM, installing the guest driver and tuning it:
 | | |
 |---|---|
 | Config `features` bit | `NVGPU_CFG_VENUS = 1 << 10`. Set only with `--venus`. A guest sends `GpuCmd` only when set. |
+| Config `features` bit | `NVGPU_CFG_RM_IMPORT = 1 << 13`, only with `NVGPU_CFG_VENUS`: RM-export blobs are served (below). Set when the renderer imports dma-bufs (`conduit-venus` from this release on). Bit 12 is not used in the config word. |
 | Shared memory region 3 | `SHM_ID_VENUS`, host-visible Venus blobs, `--venus-hostmem-mib` (default 8192, power of two). Advertised only with `--venus`. Offsets inside it are chosen by the guest, as with virtio-gpu's host-visible region. QEMU only (conduit-vmm has fixed BARs). |
 | Queues | unchanged: 0 control, 1 event. No cursor queue. |
 
@@ -119,12 +120,12 @@ spell opens a new window. An idle guest logs nothing
 | `CTX_DESTROY` | destroys the context and detaches its resources |
 | `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` | renderer attach/detach |
 | `SUBMIT_3D` | Venus command stream to the context |
-| `RESOURCE_CREATE_BLOB` | `blob_mem = HOST3D` only (guest-memory blobs refused for now); renderer allocates, returns an fd and map info |
+| `RESOURCE_CREATE_BLOB` | `blob_mem = HOST3D`: renderer allocates, returns an fd and map info. `blob_mem = BLOB_MEM_RM_EXPORT` (`0x80000001`): an RM-export blob (below). Guest-memory blobs refused for now |
 | `RESOURCE_MAP_BLOB` | the blob's fd placed in region 3 at the guest's offset; reply `RESP_OK_MAP_INFO` with the cache type |
 | `RESOURCE_UNMAP_BLOB` | withdrawn from region 3 |
 | `RESOURCE_UNREF` | unmapped if mapped, then freed |
-| `SET_SCANOUT_BLOB` | records scanout 0's resource, size, format, stride, offset, and the modifier its blob's size implies (below); resource 0 turns the scanout off (`ScanoutDisable` to the viewer); a format with no DRM fourcc is `RESP_ERR_INVALID_PARAMETER`, a scanout other than 0 `RESP_ERR_INVALID_SCANOUT_ID` |
-| `RESOURCE_FLUSH` | renderer exports the scanout resource as a dma-buf with the guest's layout (cached per resource and layout), sent to the viewer as a frame |
+| `SET_SCANOUT_BLOB` | records scanout 0's resource, size, format, stride, offset, and its modifier: an RM-export blob's own, else the one its blob's size implies (below); resource 0 turns the scanout off (`ScanoutDisable` to the viewer); a format with no DRM fourcc is `RESP_ERR_INVALID_PARAMETER`, a scanout other than 0 `RESP_ERR_INVALID_SCANOUT_ID` |
+| `RESOURCE_FLUSH` | renderer exports the scanout resource as a dma-buf with the guest's layout (cached per resource and layout), sent to the viewer as a frame; an RM-export blob is sent as the dma-buf the backend already holds |
 
 **EDID.** `GET_EDID` (`0x010a`: header, `scanout_id`, padding) is answered
 with `RESP_OK_EDID` (`0x1104`): header, `size` = 256, padding, then
@@ -217,6 +218,106 @@ conduit-backend@NAME.service` (add `[Service]` and
 `Environment=CONDUIT_VENUS_SCANOUT_MODIFIER=0x...`; without `--user` for a
 `qemu:///system` VM), then restart the VM.
 
+### RM-export blobs
+
+Memory NVK on RM rendered into, made a Venus resource so Venus contexts (DWM,
+the D3D bridge, the KMD's own copies) read it with no CPU copy: the windowed
+path of NVK in a Windows guest (`guest/windows/docs/zero-copy-present.md`
+H1 to H7). Served only with `NVGPU_CFG_RM_IMPORT`.
+
+How the object comes to exist: NVK exports the image's RM memory to a
+control-file descriptor (`NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD`) and
+imports that on a render node it opened through the backend
+(`DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY`, forwarded as any nvidia-drm ioctl).
+That makes a host GEM object; its handle comes back to NVK unchanged.
+
+**Wire contract.** `RESOURCE_CREATE_BLOB` with
+
+| Field | Value |
+|---|---|
+| `hdr.ctx_id` | the guest context the resource is attached to |
+| `resource_id` | chosen by the guest, not yet in use |
+| `blob_mem` | `BLOB_MEM_RM_EXPORT = 0x80000001` |
+| `blob_flags` | 0 (the resource cannot be mapped: no CPU view of RM memory) |
+| `blob_id` | `rm_handle << 32 \| gem_handle`: `rm_handle` is the backend handle of the render node (the `Open` reply's handle for a `device_type >= 512` node), `gem_handle` what the GEM import returned on that file |
+| `size` | nonzero, at most the object's size (the dma-buf's; RM rounds allocations up to 64 KiB, so the image's own size is fine) |
+| `nr_entries` | 0 |
+
+The backend checks the context and resource id as for any blob, that
+`rm_handle` is a render node this guest has open (`EBADF` otherwise), exports
+the GEM handle with `PRIME_HANDLE_TO_FD` on that file (`ENOENT` for a handle
+the file does not have), compares `size` with the dma-buf's (`ERANGE` when
+larger), and hands the dma-buf to the renderer
+(`virgl_renderer_resource_import_blob`, fd type dma-buf), which attaches it
+to `ctx_id`. The guest's own `CTX_ATTACH_RESOURCE` after the create is then a
+no-op, and other contexts attach it as any resource.
+
+**Errors.** The response is the usual `RESP_ERR_*`, and for this blob type
+the header's three `padding` bytes carry the errno (24-bit little-endian,
+zero when there is none; every other response leaves them zero):
+
+| Response | errno | Why |
+|---|---|---|
+| `RESP_ERR_UNSPEC` | `EOPNOTSUPP` | not served (no `NVGPU_CFG_RM_IMPORT`) |
+| `RESP_ERR_INVALID_PARAMETER` | `EINVAL` | `blob_flags`, `nr_entries` or `size` 0 |
+| `RESP_ERR_INVALID_PARAMETER` | `EBADF` | `rm_handle` is not a render node this guest has open |
+| `RESP_ERR_INVALID_PARAMETER` | `ENOENT` | no such GEM handle on that file |
+| `RESP_ERR_INVALID_PARAMETER` | `ERANGE` | `size` larger than the object |
+| `RESP_ERR_UNSPEC` | other | the export failed otherwise, or the renderer refused (`EIO`) |
+| `RESP_ERR_INVALID_CONTEXT_ID` / `RESP_ERR_INVALID_RESOURCE_ID` / `RESP_ERR_OUT_OF_MEMORY` | 0 / 0 / `ENOMEM` | as for any blob |
+
+**Lifetime.** The backend keeps its own dma-buf descriptor for the resource
+and the renderer its own; either keeps the memory alive, so the resource
+outlives the render node, the GEM handle and NVK's RM objects. Both go at
+`RESOURCE_UNREF`, and every one goes at device reset, backend exit or
+renderer death.
+
+**Layout (modifier).** A dma-buf carries no layout. The backend takes it from
+the GEM import: when a forwarded `DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY`
+succeeds on a render node it reads the `NvKmsKapiPrivImportMemoryParams` the
+guest passed (`layout`, `log2GobsPerBlock`) and keeps, per (file, GEM
+handle), until `GEM_CLOSE` or the file's `Close`:
+
+- `layout = PITCH` (1): `DRM_FORMAT_MOD_LINEAR`;
+- `layout = BLOCK_LINEAR` (0) with `log2GobsPerBlock = {0, h, 0}`, `h` ≤ 5:
+  `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c=0, s, g, k, h)` with `k`, `g`, `s`
+  the node's own `generic_page_kind`, `page_kind_generation`,
+  `sector_layout` (`DRM_NVIDIA_GET_DEV_INFO`), i.e.
+  `0x0300000000606010 | h` on GB20x; NVK's 1920×1080 swapchain image is
+  `h = 5`, `0x0300000000606015`;
+- anything else (3D blocks): none.
+
+The blob takes the modifier its object had when it was created.
+`SET_SCANOUT_BLOB` uses it instead of the size rule above (which is wrong for
+heights that are a whole number of blocks); a blob whose import the backend
+did not see falls back to the size rule. `CONDUIT_VENUS_SCANOUT_MODIFIER`
+still overrides both.
+
+**What the guest must do to read it.** The host cannot tell a Venus context
+the modifier (virtio-gpu has no resource query), so the guest supplies it:
+NVK knows the layout it chose (`vkGetImageDrmFormatModifierPropertiesEXT` on
+its own image, or NIL's choice) and must hand modifier and row pitch over with
+the resource id. The importing context then creates the image with
+`VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`,
+`VkImageDrmFormatModifierExplicitCreateInfoEXT` (that modifier, one plane,
+offset 0, `rowPitch` = the pitch: `width × 4` for linear, the GOB-aligned row
+size for block-linear) and `VkExternalMemoryImageCreateInfo{DMA_BUF}`, enables
+`VK_EXT_image_drm_format_modifier`, and allocates with
+`VkImportMemoryResourceInfoMESA{resource_id}` (plus
+`VkMemoryDedicatedAllocateInfo`; no `VkExportMemoryAllocateInfo`, or one
+naming `DMA_BUF` only). vkr turns the import into a
+`VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT` import of the resource's fd.
+NVIDIA's driver refuses the same memory as an `OPTIMAL` image or as
+`OPAQUE_FD`, so `prepare_optimal_scanout_copy`'s `OptimalImageTransport::OpaqueFd`
+path cannot be used for these resources.
+
+Checked on the host, without a guest: `guest/nvk-rm/tests/rm_export_exec.c`
+allocates and exports RM memory as nvk-rm does and runs
+`host/venus/examples/venus-rm-import.rs` against a sandboxed `conduit-venus`,
+which imports it as above and copies it to a linear image; LINEAR and
+block-linear `h` = 5, 4 and 0 at 1920×1080 are pixel-exact (RTX 5090,
+610.57.04).
+
 **Checks** (backend, before the renderer sees anything): command length
 matches the type; `ctx_id` and `resource_id` exist and belong together;
 resource ids unique; blob size nonzero and ≤ region 3 once rounded up to a page (any size, as QEMU takes it; a mapping covers whole pages); map offset
@@ -246,7 +347,13 @@ than the backend's sandbox allows (its libraries, shader cache, more ioctls).
 The backend talks to it over a Unix `SOCK_SEQPACKET` socket
 (`host/venus/src/ipc.rs`): one request per call, replies in order, messages
 sent in 64 KiB fragments (a submit can be 4 MiB), blob and dma-buf fds passed
-by `SCM_RIGHTS`, and fence signals pushed by the renderer on their own. Both
+by `SCM_RIGHTS` (from the renderer, and to it for `IMPORT_DMABUF`, the
+RM-export blob's dma-buf), and fence signals pushed by the renderer on their
+own. What a renderer can do beyond the base calls (`Renderer::features`,
+today only `FEATURE_IMPORT_DMABUF`) is asked once as `CAPSET_INFO` with index
+`0xffffffff`: a `conduit-venus` from before it refuses that index like any
+other, so the backend reads "no features" and never sends it an op it does
+not know (an unknown op ends the connection). Both
 sides use the `conduit_venus::Renderer` trait (`host/venus/src/lib.rs`): the
 backend through the IPC client, tests through `conduit_venus::mock::Mock`.
 
