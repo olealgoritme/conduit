@@ -677,7 +677,7 @@ change a shape counter) before reading, or compare after the process has exited.
 | `NvDupMode` | the `NvDupHarden` value in force (0, 1 or 2), written once the first forward read it | 2 until the default is flipped, then 1 |
 | `NvWinMb`, `NvAptMb` | size in MiB of shared-memory region 1 (RM window) and 2 (UVM aperture), written at init | nonzero, or `MMAP` answers `UNSUPPORTED` |
 | `NvMapMb` | bytes mapped through `MMAP` now, all owners, UVM aperture included, in MiB | follows the clients |
-| `NvMapQRef` | `MMAP`s refused or failed for want of window, address space or host room, ALL reasons (until the window policy it counted only the per-device quota). The split is `NvWinR*` (section 13.6) | **0**; nonzero says the window is under pressure |
+| `NvMapQRef` | `MMAP`s refused or failed for want of window: the policy's refusals, a view not made after the host mapped, a host refusal (until the window policy it counted only the per-device quota; under `NvWinPolicy` = 0 it still does, byte for byte). The split is `NvWinR*` (section 13.6). A mapping-table bound is NOT in it: `NvMapTRef` | **0**; nonzero says the window is under pressure |
 | `NvWin*`, `NvHdl*`, `NvMapT*`, `NvTblOom`, `NvPinQRef`, `NvSanityRef` | the RM window policy, the handle and mapping tables behind the per-process bounds, pin quota refusals | section 13.6 |
 
 `Fg*` counters belong to the foreign-resource verb (`zero-copy-present.md`), not this
@@ -1261,7 +1261,7 @@ both trees).
 | `NvWinRHost` / `NvWinHErrno` | the host refused the `Mmap`; the last errno (12 = its zone is full) |
 | `NvWinT1Pid`, `NvWinT1Mb` ... `NvWinT4Pid`, `NvWinT4Mb` | the four owners mapping most (process id of the first map, MiB); 0 = unused rank. Recomputed under the lock at every change in `O(owners)`, published at PASSIVE only |
 | `NvMapMb` | all `MMAP` bytes now, UVM included (existing) |
-| `NvMapQRef` | refusals and failures, ALL reasons above (legacy: the per-device quota, as before) |
+| `NvMapQRef` | the window refusals and failures above (`NvWinRFull`, `NvWinRRes`, `NvWinRBig`, `NvWinRTab`, `NvWinRAddr`, `NvWinRHost`), NOT the mapping-table bounds (`NvMapTRef`). Under `NvWinPolicy` = 0 only the per-device quota refusals, as before: the new reasons are then visible in `NvWinR*` alone |
 | `NvHdlLive` / `NvHdlPeak` / `NvHdlCap` / `NvHdlGrow` | live handles (reservations included), high-water mark, table slots, growths |
 | `NvHdlORef` / `NvHdlGRef` / `NvHdlFRef` | handle reservations refused: per-process bound, whole-table bound, fairness while scarce |
 | `NvMapTCap` / `NvMapTGrow` / `NvMapTRef` | mapping table slots, growths, refusals by its bounds |
@@ -1347,9 +1347,14 @@ adapter-wide view table they feed), counted when hit (`NvHdl*Ref`, `NvMapTRef`, 
   the lock again and swaps it in (`append`: a copy, no allocation), and frees the old, empty storage
   after the lock. A push still only ever happens into a free slot (the reservation checks
   `live < capacity`), so a lost race refuses (`NvTblOom`) instead of allocating.
-* Fairness: while a table is 3/4 full, a process already holding 1/4 of its bound is refused
-  (`NvHdlFRef`), so one process cannot take the last of the table from the others. Below that, only
-  the per-process bound applies.
+* Fairness: while a table is 3/4 full, a process already holding its fair share is refused
+  (`NvHdlFRef`), so the last quarter of the table is only for processes below it. The fair share
+  is 1/8 of the handle table (2048: it must be BELOW the per-process bound of 4096, or the
+  per-process refusal fires first and the rule is dead; the first shape had exactly that bug) and
+  1/4 of the mapping table (2048 of 8192). Four hostile processes can take 12288 handles between
+  them and no more; a fresh process (DWM) still gets slots (`hostile_owners_cannot_starve_a_fresh_one`,
+  and `production_shapes_can_actually_be_fair` holds both shapes to it). Below the scarce point
+  only the per-process bound applies.
 * The window account's owner rows (512) are reserved at init; a 513th device mapping at once is
   `NvWinRTab`.
 * Behaviour in the working range is unchanged: refusals only appear past the old numbers.

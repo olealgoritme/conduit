@@ -77,7 +77,16 @@ static MAP_REF: AtomicU32 = AtomicU32::new(0);
 /// the headroom: only a hostile process gets there).
 pub(super) static TBL_OOM: AtomicU32 = AtomicU32::new(0);
 
-/// What a window map is refused with, counted in `NvMapQRef` as well.
+/// Count one more in `NvMapQRef`, the all-reasons window refusal total. Under `NvWinPolicy`
+/// = 0 it counts only what it always counted (the per-device quota, `Refusal::Quota`), so a
+/// legacy run reads byte-identical counters; the new reasons then appear in `NvWinR*` only.
+fn count_qref(always: bool) {
+    if always || WIN_POLICY.load(Ordering::Relaxed) != 0 {
+        super::nvrm::NVRM_MAP_QUOTA_REFUSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// What a window map is refused with: the reason's counter, and `NvMapQRef`.
 pub fn count_refusal(why: Refusal) {
     let c = match why {
         Refusal::WindowFull => &R_FULL,
@@ -86,25 +95,25 @@ pub fn count_refusal(why: Refusal) {
         Refusal::TableFull => &R_TABLE,
         // The legacy quota has no counter of its own: it is in `NvMapQRef`, as before.
         Refusal::Quota => {
-            super::nvrm::NVRM_MAP_QUOTA_REFUSED.fetch_add(1, Ordering::Relaxed);
+            count_qref(true);
             return;
         }
     };
     c.fetch_add(1, Ordering::Relaxed);
-    super::nvrm::NVRM_MAP_QUOTA_REFUSED.fetch_add(1, Ordering::Relaxed);
+    count_qref(false);
 }
 
 /// The user view could not be made after the host mapped (no MDL, no address space).
 pub fn count_addr_space() {
     R_ADDR.fetch_add(1, Ordering::Relaxed);
-    super::nvrm::NVRM_MAP_QUOTA_REFUSED.fetch_add(1, Ordering::Relaxed);
+    count_qref(false);
 }
 
 /// The host refused the `Mmap` with `errno` (12, ENOMEM, is its window zone being full).
 pub fn count_host_refused(errno: u32) {
     R_HOST.fetch_add(1, Ordering::Relaxed);
     HOST_ERRNO.store(errno, Ordering::Relaxed);
-    super::nvrm::NVRM_MAP_QUOTA_REFUSED.fetch_add(1, Ordering::Relaxed);
+    count_qref(false);
 }
 
 /// `PIN`s refused by the per-process pin quota before any page was locked. Until this

@@ -144,10 +144,12 @@ pub static NVRM_MAP_ERRORS: AtomicU32 = AtomicU32::new(0);
 /// Bytes currently mapped through MMAP, all owners (`NvMapMb`, in MiB). Refreshed
 /// under the table lock at every change.
 pub static NVRM_MAP_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// MMAPs the RM window policy refused or that failed for want of window, address space or
-/// host room, ALL reasons (`NvMapQRef`; the split by reason is `NvWinRFull`, `NvWinRRes`,
-/// `NvWinRBig`, `NvWinRTab`, `NvWinRAddr`, `NvWinRHost`, see `virtio::nvrm_window`). Under
-/// `NvWinPolicy` = 0 it counts the legacy per-device quota refusals, as it always did.
+/// MMAPs refused or failed for want of WINDOW: the policy's refusals (window full, reserve,
+/// too big, owner rows full), a view that could not be made after the host mapped, and a host
+/// refusal (`NvMapQRef`; the split is `NvWinRFull`, `NvWinRRes`, `NvWinRBig`, `NvWinRTab`,
+/// `NvWinRAddr`, `NvWinRHost`, see `virtio::nvrm_window`). A mapping-TABLE bound is not in it:
+/// that is `NvMapTRef` (and `NvSanityRef`). Under `NvWinPolicy` = 0 it counts only the
+/// per-device quota refusals, byte for byte as it always did.
 pub static NVRM_MAP_QUOTA_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// Pins made, pins released, pin failures. `NvPin - NvUnpin` is what is locked
 /// now; a count that only grows is a leak. Published as `NvPin`, `NvUnpin`,
