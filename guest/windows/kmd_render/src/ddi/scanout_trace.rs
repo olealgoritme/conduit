@@ -645,6 +645,61 @@ pub(crate) fn note_worker_epoch_conflict() {
     WORKER_EPOCH_CONFLICT.fetch_add(1, Ordering::Relaxed);
 }
 
+// ---- S-0a: the flip flags the driver observes but does not act on -------------------------
+//
+// Read-only. The independent-flip probe (docs/zero-copy-present.md, "FlipCapsX and flip flag
+// counters (S-0a)") needs to know whether dxgkrnl ever sets `SharedPrimaryTransition`,
+// `IndependentFlipExclusive` or `MoveFlip` in `SetVidPnSourceAddress` (which can run at DIRQL, so
+// atomics only) or `RedirectedFlip` in `DxgkDdiPresent`. Nothing here gates or changes either
+// DDI; the decode is `helios_kmd_logic::flip_flags`. Counted per call, zeroed by [`reset`] at
+// every StartDevice, published by [`publish_idf_flags`] from [`dump`] (the one PASSIVE site).
+
+/// `SetVidPnSourceAddress` calls with `SharedPrimaryTransition` set (`IdfSpaTrans`).
+static IDF_SPA_TRANS: AtomicU32 = AtomicU32::new(0);
+/// ... with `IndependentFlipExclusive` set (`IdfSpaExcl`).
+static IDF_SPA_EXCL: AtomicU32 = AtomicU32::new(0);
+/// ... with `MoveFlip` set (`IdfSpaMove`).
+static IDF_SPA_MOVE: AtomicU32 = AtomicU32::new(0);
+/// The last full `DXGK_SETVIDPNSOURCEADDRESS_FLAGS.Value` seen (`IdfSpaFlg`).
+static IDF_SPA_FLG: AtomicU32 = AtomicU32::new(0);
+/// `DxgkDdiPresent` calls with `RedirectedFlip` set (`IdfPrRedir`).
+static IDF_PR_REDIR: AtomicU32 = AtomicU32::new(0);
+/// The last full `DXGK_PRESENTFLAGS.Value` seen (`IdfPrFlg`).
+static IDF_PR_FLG: AtomicU32 = AtomicU32::new(0);
+
+/// Note the flags of one `SetVidPnSourceAddress` call. Any IRQL, atomics only.
+pub(crate) fn note_set_vidpn_flags(value: u32) {
+    let d = helios_kmd_logic::flip_flags::decode_spa_flags(value);
+    if d.shared_primary_transition {
+        IDF_SPA_TRANS.fetch_add(1, Ordering::Relaxed);
+    }
+    if d.independent_flip_exclusive {
+        IDF_SPA_EXCL.fetch_add(1, Ordering::Relaxed);
+    }
+    if d.move_flip {
+        IDF_SPA_MOVE.fetch_add(1, Ordering::Relaxed);
+    }
+    IDF_SPA_FLG.store(value, Ordering::Relaxed);
+}
+
+/// Note the flags of one `DxgkDdiPresent` call. Any IRQL, atomics only.
+fn note_present_idf_flags(value: u32) {
+    if helios_kmd_logic::flip_flags::present_is_redirected(value) {
+        IDF_PR_REDIR.fetch_add(1, Ordering::Relaxed);
+    }
+    IDF_PR_FLG.store(value, Ordering::Relaxed);
+}
+
+/// Mirror the S-0a counters into the service key. PASSIVE_LEVEL only; called from [`dump`] alone.
+fn publish_idf_flags() {
+    crate::diag::record_named_bytes(b"IdfSpaTrans", IDF_SPA_TRANS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"IdfSpaExcl", IDF_SPA_EXCL.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"IdfSpaMove", IDF_SPA_MOVE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"IdfSpaFlg", IDF_SPA_FLG.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"IdfPrRedir", IDF_PR_REDIR.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"IdfPrFlg", IDF_PR_FLG.load(Ordering::Relaxed));
+}
+
 /// Ticks [`dump_periodic`].
 static DUMP_TICKS: AtomicU32 = AtomicU32::new(0);
 
@@ -666,6 +721,7 @@ static DUMP_LAST_MS: AtomicU32 = AtomicU32::new(0);
 pub(crate) fn note_present(flags: u32, flip_interval: u32, has_dma: bool, blt: bool, flip: bool) {
     PRESENT_CALLS.fetch_add(1, Ordering::Relaxed);
     PRESENT_FLAGS_HISTOGRAM.note(flags);
+    note_present_idf_flags(flags);
     PRESENT_INTERVAL_HISTOGRAM.note((flip_interval << 8) | u32::from(has_dma));
     if blt {
         PRESENT_BLTS.fetch_add(1, Ordering::Relaxed);
@@ -979,6 +1035,7 @@ pub(crate) fn dump(adapter: &crate::adapter::AdapterContext) {
     PRESENT_FLIP_HISTOGRAM.dump([b'P', b'b']);
     PRESENT_FLAGS_HISTOGRAM.dump([b'F', b'l']);
     PRESENT_INTERVAL_HISTOGRAM.dump([b'F', b'i']);
+    publish_idf_flags();
 
     // The D4a read-ledger census (`Rd*`/`Aq*` — FIX-DESIGN-d4a.md §3.4).
     // Identity for every run: `RdIss == RdRet` at quiescence, `RdIss <= FfTot`
@@ -1068,6 +1125,12 @@ pub(crate) fn reset(adapter: &crate::adapter::AdapterContext) {
         &FAST_BIND_SKIPS,
         &WORKER_EPOCH_SUPERSEDED,
         &WORKER_EPOCH_CONFLICT,
+        &IDF_SPA_TRANS,
+        &IDF_SPA_EXCL,
+        &IDF_SPA_MOVE,
+        &IDF_SPA_FLG,
+        &IDF_PR_REDIR,
+        &IDF_PR_FLG,
         &DUMP_TICKS,
         &DUMP_LAST_N,
         &DUMP_LAST_MS,
