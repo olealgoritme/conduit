@@ -367,6 +367,28 @@ pub fn sample_tick(ticks: &AtomicU32) -> bool {
     level() >= 1 || n == 1 || n % SAMPLE_EVERY == 0
 }
 
+/// The last value a [`record_named_on_change`] site wrote; starts as "never".
+pub struct NamedLast(core::sync::atomic::AtomicU64);
+
+impl NamedLast {
+    pub const fn new() -> Self {
+        Self(core::sync::atomic::AtomicU64::new(u64::MAX))
+    }
+}
+
+/// A fixed-name outcome value ("what the last operation did") written only
+/// when it differs from the value this name last got, so the registry still
+/// always holds the latest outcome but a steady success costs no synchronous
+/// `RtlWriteRegistryValue` per call. EVERY write of `name` (success and
+/// failure arms alike) must go through the same `last`, or a skipped write
+/// could leave a stale failure code in place. `DiagLevel >= 1` writes always.
+pub fn record_named_on_change(name: &[u8], value: u32, last: &NamedLast) {
+    let prev = last.0.swap(u64::from(value), Ordering::Relaxed);
+    if prev != u64::from(value) || level() >= 1 {
+        record_named_bytes(name, value);
+    }
+}
+
 /// One-shot throttled identity value, for a site with no surrounding block.
 /// Same policy as [`sample_tick`].
 pub fn sample_named(name: &[u8], value: u32, ticks: &AtomicU32) {
