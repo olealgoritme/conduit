@@ -1,4 +1,4 @@
-From 64d672b2a93240f89121b0964635f319fa1309d2 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Tue, 6 Oct 2026 06:20:02 +0200
 Subject: [PATCH] nvk/rm, wsi: scanout images come back when the host releases
@@ -54,10 +54,10 @@ Order: after 0030 (presents on RM fences), before patches-windows-dxvk/.
  8 files changed, 284 insertions(+), 16 deletions(-)
 
 diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
-index 1de0f26..769ff85 100644
+index f6e02dd..62bd5a7 100644
 --- a/src/nouveau/vulkan/nvk_wsi.c
 +++ b/src/nouveau/vulkan/nvk_wsi.c
-@@ -91,6 +91,23 @@ nvk_wsi_scanout_flip_fenced(VkDevice _device, VkQueue _queue,
+@@ -101,6 +101,23 @@ nvk_wsi_scanout_flip_fenced(VkDevice _device, VkQueue _queue,
                                             fence);
  }
  
@@ -81,7 +81,7 @@ index 1de0f26..769ff85 100644
  static void
  nvk_wsi_scanout_release(VkDevice _device)
  {
-@@ -144,6 +161,8 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
+@@ -154,6 +171,8 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
     if (nvkmd_rm_scanout_supported(pdev->nvkmd)) {
        pdev->wsi_device.win32.scanout_export = nvk_wsi_scanout_export;
        pdev->wsi_device.win32.scanout_flip = nvk_wsi_scanout_flip;
@@ -91,13 +91,13 @@ index 1de0f26..769ff85 100644
           debug_get_bool_option("NVK_RM_FENCE", true) ?
           nvk_wsi_scanout_flip_fenced : NULL;
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
-index caf22eb..5087aa1 100644
+index 2f9432b..5310890 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
-@@ -114,6 +114,14 @@ struct nvkmd_rm_lib {
-    int (*win_fence_wait)(int fence, uint32_t timeout_ms);
-    int (*win_scanout_present_fenced)(uint32_t handle, uint32_t gem,
-                                      int fence, uint64_t *seq);
+@@ -121,6 +121,14 @@ struct nvkmd_rm_lib {
+                                  uint32_t *gem_handle, uint64_t *size,
+                                  uint64_t *modifier, uint32_t *flags,
+                                  uint32_t *host_errno);
 +   /* Buffer release (KMD 22.22.315+, QueryCaps bit 35): when the host is done
 +    * with a flipped image (guest/windows/docs/foreign-scanout.md).
 +    */
@@ -109,7 +109,7 @@ index caf22eb..5087aa1 100644
  };
  
  /* Returns NULL if librmclient cannot be loaded */
-@@ -236,6 +244,13 @@ struct nvkmd_rm_dev {
+@@ -250,6 +258,13 @@ struct nvkmd_rm_dev {
     struct nvkmd_rm_rmfence *rmfence;
     simple_mtx_t rmfence_mutex;
     bool rmfence_failed;
@@ -123,7 +123,7 @@ index caf22eb..5087aa1 100644
  #endif
  
     /* Map coherent host-visible system memory GPU-cacheable */
-@@ -321,6 +336,13 @@ struct nvkmd_rm_mem {
+@@ -335,6 +350,13 @@ struct nvkmd_rm_mem {
     uint32_t helios_res_id;
     uint32_t helios_res_ctx;
     bool helios_res_adopted;
@@ -137,7 +137,7 @@ index caf22eb..5087aa1 100644
  };
  
  NVKMD_DECL_SUBCLASS(mem, rm);
-@@ -488,6 +510,21 @@ void nvkmd_rm_rmfence_finish(struct nvkmd_rm_dev *dev);
+@@ -507,6 +529,21 @@ void nvkmd_rm_rmfence_finish(struct nvkmd_rm_dev *dev);
  /* Waits until the flip thread has sent every flip queued so far */
  void nvkmd_rm_rmfence_drain(struct nvkmd_rm_dev *dev);
  
@@ -177,20 +177,20 @@ index 2df5eb6..beb5e75 100644
     simple_mtx_destroy(&dev->drm_mutex);
     simple_mtx_destroy(&dev->rmfence_mutex);
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
-index ef9691f..377c3a3 100644
+index 8b5c346..353623e 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
-@@ -242,6 +242,8 @@ nvkmd_rm_lib_load(void)
-    LOAD(win_semsurf_fence_create,   "crm_win_semsurf_fence_create",   false);
+@@ -359,6 +359,8 @@ nvkmd_rm_lib_load(void)
     LOAD(win_fence_wait,             "crm_win_fence_wait",             false);
     LOAD(win_scanout_present_fenced, "crm_win_scanout_present_fenced", false);
+    LOAD(win_rm_resource_import, "crm_win_rm_resource_import", false);
 +   LOAD(win_scanout_status,         "crm_win_scanout_status",         false);
 +   LOAD(win_scanout_wait_released,  "crm_win_scanout_wait_released",  false);
  
     LOAD(event_wait,   "crm_event_wait",   false);
     LOAD(alloc_pages,  "crm_alloc_pages",  false);
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
-index 2e28402..1932447 100644
+index ed4c9cf..58e8150 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
 @@ -36,6 +36,7 @@
@@ -387,19 +387,19 @@ index 2e28402..1932447 100644
 +   return VK_SUCCESS;
 +}
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
-index 0df4960..203a113 100644
+index 5236866..d6c7581 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
-@@ -274,7 +274,7 @@ nvkmd_rm_win_source_set_locked(struct nvkmd_rm_dev *dev,
-  */
+@@ -304,7 +304,7 @@ nvkmd_rm_win_source_set_locked(struct nvkmd_rm_dev *dev,
  static int
  kmd_source_present(struct nvkmd_rm_dev *dev,
--                   const struct nvrm_crm_scanout_flip *flip)
-+                   const struct nvrm_crm_scanout_flip *flip, uint64_t *seq)
+                    const struct nvrm_crm_scanout_flip *flip,
+-                   bool *layout_rejected)
++                   bool *layout_rejected, uint64_t *seq)
  {
     const struct nvkmd_rm_lib *lib = dev->lib;
     int ret;
-@@ -309,14 +309,14 @@ kmd_source_present(struct nvkmd_rm_dev *dev,
+@@ -341,14 +341,14 @@ kmd_source_present(struct nvkmd_rm_dev *dev,
     }
  
     ret = lib->win_scanout_present(flip->owner_handle, flip->host_handle,
@@ -416,25 +416,25 @@ index 0df4960..203a113 100644
     }
  
  out:
-@@ -369,9 +369,12 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
-       .modifier = modifier,
+@@ -402,9 +402,12 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
        .seq = p_atomic_inc_return(&dev->flip_seq),
     };
--   int ret = kmd_source_present(dev, &flip);
+    bool layout_rejected = false;
+-   int ret = kmd_source_present(dev, &flip, &layout_rejected);
 +   uint64_t seq = 0;
-+   int ret = kmd_source_present(dev, &flip, &seq);
++   int ret = kmd_source_present(dev, &flip, &layout_rejected, &seq);
     if (ret == -ENOSYS)
        ret = dev->lib->win_scanout_flip(&flip);
 +   else if (ret == 0 && seq != 0)
 +      p_atomic_set(&mem->scanout_seq, seq);
     if (ret == 0) {
        p_atomic_inc(&dev->flips_ok);
-    } else {
+    } else if (layout_rejected && modifier != DRM_FORMAT_MOD_LINEAR) {
 diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
-index cf99648..32c041c 100644
+index 6c44722..3e19741 100644
 --- a/src/vulkan/wsi/wsi_common.h
 +++ b/src/vulkan/wsi/wsi_common.h
-@@ -181,6 +181,15 @@ struct wsi_device {
+@@ -190,6 +190,15 @@ struct wsi_device {
        VkResult (*scanout_flip_fenced)(VkDevice device, VkQueue queue,
                                        VkDeviceMemory memory,
                                        const struct wsi_win32_scanout_flip *flip);
@@ -448,13 +448,13 @@ index cf99648..32c041c 100644
 +      VkResult (*scanout_wait_released)(VkDevice device, VkDeviceMemory memory,
 +                                        uint64_t timeout_ns);
        void (*scanout_release)(VkDevice device);
+       bool scanout_linear;
     } win32;
- 
 diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
-index 352d55f..09e9260 100644
+index 0821c49..aad54b9 100644
 --- a/src/vulkan/wsi/wsi_common_win32.cpp
 +++ b/src/vulkan/wsi/wsi_common_win32.cpp
-@@ -72,6 +72,10 @@ enum wsi_win32_image_state {
+@@ -73,6 +73,10 @@ enum wsi_win32_image_state {
  struct wsi_win32_image {
     struct wsi_image base;
     enum wsi_win32_image_state state;
@@ -465,7 +465,7 @@ index 352d55f..09e9260 100644
     struct wsi_win32_swapchain *chain;
     struct {
        ID3D12Resource *swapchain_res;
-@@ -133,6 +137,11 @@ struct wsi_win32_swapchain {
+@@ -136,6 +140,11 @@ struct wsi_win32_swapchain {
        HANDLE timer;
        bool flip_failed;
        bool presented;
@@ -477,7 +477,7 @@ index 352d55f..09e9260 100644
     } scanout;
  
     struct wsi_win32_image     images[0];
-@@ -735,12 +744,19 @@ wsi_win32_queue_present_scanout(struct wsi_win32_swapchain *chain,
+@@ -904,12 +913,19 @@ wsi_win32_queue_present_scanout(struct wsi_win32_swapchain *chain,
  
     mtx_lock(&chain->acquire_mutex);
     image->state = WSI_IMAGE_QUEUED;
@@ -491,16 +491,16 @@ index 352d55f..09e9260 100644
 +         continue;
 +      if (chain->scanout.release) {
 +         /* Replaced on the display: acquire waits for its release */
-          other->state = WSI_IMAGE_IDLE;
++         other->state = WSI_IMAGE_IDLE;
 +         other->release_pending = true;
 +      } else if (other->base.present_serial + chain->scanout.hold <=
 +                 chain->base.present_serial) {
-+         other->state = WSI_IMAGE_IDLE;
+          other->state = WSI_IMAGE_IDLE;
 +      }
     }
     u_cnd_monotonic_broadcast(&chain->acquire_cond);
     mtx_unlock(&chain->acquire_mutex);
-@@ -891,6 +907,21 @@ static bool
+@@ -1060,6 +1076,21 @@ static bool
  wsi_win32_find_idle_image(struct wsi_win32_swapchain *chain,
                            uint32_t *out_image_index)
  {
@@ -522,7 +522,7 @@ index 352d55f..09e9260 100644
     for (uint32_t i = 0; i < chain->base.image_count; i++) {
        if (chain->images[i].state == WSI_IMAGE_IDLE) {
           *out_image_index = i;
-@@ -939,6 +970,49 @@ wsi_win32_acquire_idle_cpu_image(struct wsi_win32_swapchain *chain,
+@@ -1108,6 +1139,49 @@ wsi_win32_acquire_idle_cpu_image(struct wsi_win32_swapchain *chain,
     return result;
  }
  
@@ -572,7 +572,7 @@ index 352d55f..09e9260 100644
  static VkResult
  wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
                               const VkAcquireNextImageInfoKHR *info,
-@@ -952,6 +1026,8 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
+@@ -1121,6 +1195,8 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
        return chain->status;
  
     /* acquire timeout has to be explicitly handled for sw wsi */
@@ -581,7 +581,7 @@ index 352d55f..09e9260 100644
     if (!chain->dxgi)
        return wsi_win32_acquire_idle_cpu_image(chain, info, image_index);
  
-@@ -1230,6 +1306,10 @@ retry:
+@@ -1399,6 +1475,10 @@ retry:
        chain->scanout.hold = MIN2(2u, num_images - 1);
        chain->base.gpu_ordered_present =
           wsi_device->win32.scanout_flip_fenced != NULL;
@@ -592,6 +592,3 @@ index 352d55f..09e9260 100644
        const uint64_t hz = debug_get_num_option("MESA_WSI_SCANOUT_HZ", 0);
        chain->scanout.period_ns =
           chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR && hz > 0 ?
--- 
-2.43.0
-
