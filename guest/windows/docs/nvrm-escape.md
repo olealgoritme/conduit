@@ -46,10 +46,11 @@ mode stay: the RM structures, the data/nested/deep pointer fix-ups, the device t
 Everything else the KMD adds is bookkeeping that one process must not be able to get wrong
 about another: handle ownership, mapping / pin / event lifetime, and teardown.
 
-**Security stance (the one rule that is enforced now).** User mode never supplies or sees a
+**Security stance (two rules are enforced).** User mode never supplies or sees a
 guest-physical address. Page-run tables are built only by the KMD from pages it locked
-(`PIN`); a `FORWARD` that carries a page-run `deep_ptr_offset` is refused. Broader hardening
-is deferred (section 10).
+(`PIN`); a `FORWARD` that carries a page-run `deep_ptr_offset` is refused. The second rule
+is that a request may only name RM clients and backend handles of the process that sends it:
+section 12 (`NvDupHarden`, on by default). Everything else is deferred (section 10).
 
 **Owner = the D3DKMT device handle**, not the process. Every ownership table is keyed on
 the `hDevice` of the escape (`DeviceOwner::new(args.hDevice)`). An escape with no `hDevice`
@@ -176,7 +177,7 @@ Per message type:
 |---|---|
 | Open (1) | A tracking slot is reserved **before** the host is asked: a full table or per-process quota gives `NO_RESOURCES` and the host opens nothing. The reply's `handle` (nonzero) with `MsgHeader.status == 0` is committed as owned by the caller, together with the request's `device_type` (`OpenReq` at offset 16). A failed/zero reply cancels the reservation. A transport timeout leaves a possibly-opened handle on the host that the KMD does not track (until the host side is reset; bounded by quota). |
 | Close (2) | See section 6 for the full order. Requires the handle to be the caller's, else `NOT_OWNED`. |
-| Ioctl (3) | Handle must be the caller's (`NOT_OWNED`). `check_ioctl`: request >= 40 bytes; `IoctlReq` at offset 16: `data_len` @20, `nested_len` @28, `deep_ptr_offset` @32, `deep_len` @36; `deep_ptr_offset` equal to `0xFFFFFFFE` or `0xFFFFFFFD` is `FORBIDDEN`; `40 + data_len + nested_len + deep_len > req_len` is `BAD_RANGE`. (Extra trailing bytes are accepted; only an overrun is refused.) A handle that is a fence (section 4.6) is `FORBIDDEN`. A `SEMSURF_FENCE_CREATE` on a DRM node is recognised and its reply handle is recorded (section 4.6). |
+| Ioctl (3) | Handle must be the caller's (`NOT_OWNED`). `check_ioctl`: request >= 40 bytes; `IoctlReq` at offset 16: `data_len` @20, `nested_len` @28, `deep_ptr_offset` @32, `deep_len` @36; `deep_ptr_offset` equal to `0xFFFFFFFE` or `0xFFFFFFFD` is `FORBIDDEN`; `40 + data_len + nested_len + deep_len > req_len` is `BAD_RANGE`. (Extra trailing bytes are accepted; only an overrun is refused.) A handle that is a fence (section 4.6) is `FORBIDDEN`. A request whose payload names an RM client or a backend handle that is not the caller's is `NOT_OWNED` (section 12, after the length check). A successful `NV_ESC_RM_ALLOC` of a root class records the client it made as the caller's, a successful free of it forgets it (section 12). A `SEMSURF_FENCE_CREATE` on a DRM node is recognised and its reply handle is recorded (section 4.6). |
 | GetProcFiles (6) / GetSysFiles (7) | `handle = 0`; no ownership; counted as `NvOther`. |
 | ScanoutFlip (20) | Request must be exactly `16 + 64` bytes (`BAD_RANGE`). `scanout` (offset 16) must be 0 (`BAD_RANGE`). `owner_handle` (offset 20) must be a handle the caller opened (`NOT_OWNED`) with `device_type >= 512`, i.e. a DRM node (`FORBIDDEN`). The 64-byte payload is otherwise forwarded as is (it names a host GEM object; zero-copy present, see `zero-copy-present.md`). The `MsgHeader.handle` of a flip is not checked. Counter `NvFlip`. |
 
@@ -466,8 +467,8 @@ What is owned, and what is checked:
    `Munmap` sent (stops sending after the first timeout/device error; still unmaps every
    view). The ABI's order is unmap, then close.
 3. The `Close` is forwarded.
-4. On `MsgHeader.status == 0`: the handle's event registrations are released and its pins
-   unlocked. On a nonzero status or a transport error that never reached the host: the
+4. On `MsgHeader.status == 0`: the handle's event registrations are released, the RM clients
+   made through it are forgotten (section 12) and its pins unlocked. On a nonzero status or a transport error that never reached the host: the
    handle is restored to the table (note: its mappings are already gone) and events/pins are
    kept. On a **timeout**: the handle stays forgotten, its events are released, its pins stay
    until device destroy (the handle is no longer the caller's, so nothing else can release them).
@@ -597,6 +598,16 @@ change a shape counter) before reading, or compare after the process has exited.
 | `NvSwept` | handles, mappings and pins still tracked when the transport was dropped, AFTER the live host-close sweep (so only what a failed transport, a wedged host or a racing call left), cumulative | **0** when dxgkrnl destroys every device first; nonzero means the sweep did the owners' work |
 | `NvStale` | user views of a dropped transport that `StopDevice` marked stale, cumulative | usually 0 |
 | `NvStaleUn` | of those, how many owners' next NVRM escape unmapped | follows `NvStale`; the rest is reclaimed by `DestroyDevice` |
+| `NvCliRec` | RM clients recorded as a process's own (a successful forwarded `NV_ESC_RM_ALLOC` of a root class; section 12) | moves with `crm_open` |
+| `NvCliDrop` | clients forgotten: a successful (or timed-out) free of the client, `Close` of the file it was made through, device destroy, the transport sweep | `NvCliRec - NvCliDrop` is the clients live now; **equal** when no client runs |
+| `NvCliFull` | client allocations the table could not take (per-process 32, total 256): refused before the host in mode 1, forwarded untracked in mode 2 | **0** |
+| `NvDupCli` | requests whose own client (`hRoot` / `hClient`) is not the caller's, counted in modes 1 and 2 | **0** |
+| `NvDupSrc` | requests with another cross-client slot (`hClientSrc`, `hParentClient`, ...) that names a client that is not the caller's | **0** |
+| `NvDupFd` | requests with a backend-handle slot (`fd`, `memFd`, `ctl_fd`, event `data`) that names a handle the caller did not open | **0** |
+| `NvDupDeny` | of those, refused (mode 1; each is also in `NvRef`) | **0** outside a deliberate negative test |
+| `NvDupWould` | of those, only counted because `NvDupHarden` = 2 | **0**; the field of a log-only run, read it before switching to 1 |
+| `NvDupDoubt` | requests with a slot the rules could not judge with confidence (a block of an unverified size, a field cut short, an fd control the host does not translate); forwarded in every mode | small; a rise names a workload to look at (section 12.5) |
+| `NvDupMode` | the `NvDupHarden` value in force (0, 1 or 2), written once the first forward read it | 1 |
 | `NvWinMb`, `NvAptMb` | size in MiB of shared-memory region 1 (RM window) and 2 (UVM aperture), written at init | nonzero, or `MMAP` answers `UNSUPPORTED` |
 
 `Fg*` counters belong to the foreign-resource verb (`zero-copy-present.md`), not this
@@ -688,32 +699,21 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
 
 ### 10.1 Known gaps (deliberate)
 
-- **Security hardening is deferred.** Only the physical-address rule and handle/pin/map
-  ownership are enforced. Not done: per-process resource accounting beyond the counts above,
+- **Security hardening is deferred.** Only the physical-address rule, handle/pin/map
+  ownership and (section 12) cross-client references are enforced. Not done: per-process resource accounting beyond the counts above,
   in-flight reference counts on handles (a handle closed by one thread while another is
   inside a `FORWARD` on it can still name a recycled number: the commit-time rechecks narrow
   but do not close this), validation of RM structures, rate limiting, auditing which RM
   classes a process may allocate.
-- **Payload slots that name another client's object are not checked** (hardening list, security
-  last; nothing may rely on their absence). `FORWARD` checks the backend handle of the message
-  header and nothing inside the payload. `RM_DUP_OBJECT` across guest clients already works
-  through `FORWARD` with no check (shown on v311 with `crm_share_smoke`: a second client dups
-  the first client's memory object). The slots a hardening pass must check, against the
-  caller's own tables:
-
-  | where | slot (little endian, in the ioctl's nested/outer block) | namespace | check against |
-  |---|---|---|---|
-  | `NV_ESC_RM_DUP_OBJECT` (0x34, low 16 bits of the request `0x4634`), `NVOS55_PARAMETERS` (offsets as the host reads them, `vidmem.rs`) | `hClientSrc` at offset 12, and `hObjectSrc` at 16 | an RM client handle the guest minted with `NV01_ROOT` (not a backend handle) | the set of RM clients this device allocated: the KMD does not track them today (it tracks backend file handles), so this needs `RM_ALLOC` of class `NV01_ROOT` recorded per owner and dropped on `RM_FREE` / `Close`; not a few lines |
-  | `NV_ESC_RM_CONTROL` (0x2a) cmd `0x3d06` `OS_UNIX_IMPORT_OBJECT_FROM_FD` | `fd` at nested offset 0 | a backend handle (the host's per-connection table) | `nvrm_handle_owned(owner, fd)` |
-  | `NV_ESC_RM_CONTROL` cmd `0x3d05` `OS_UNIX_EXPORT_OBJECT_TO_FD` | `fd` at nested offset 16 | a backend handle | `nvrm_handle_owned(owner, fd)` |
-  | NVKMS `GEM_IMPORT_NVKMS_MEMORY` / `GEM_EXPORT_NVKMS_MEMORY` ioctls | `memFd` at the ioctl's `nested_fd_offset` (host: `nested.rs`) | a backend handle | `nvrm_handle_owned(owner, memFd)` |
-  | `NV0005` event class alloc | `data` at offset 16 | a backend handle | `nvrm_handle_owned(owner, data)` |
-
-  The `0x3d06` / `0x3d05` / `memFd` slots are what `RM_RESOURCE_IMPORT` replaces for the
-  cross-process case: its GEM handle lives in the importer's own DRM file, so the importer
-  exports it to a control descriptor of its OWN and never needs another process's handle.
-  Once the slots above are checked, a process can reach another process's memory only through
-  the resource id the KMD gates (`shared-foreign-surfaces.md` section 6).
+- **Payload slots that name another client's object** are checked since `NvDupHarden`
+  (section 12): `RM_DUP_OBJECT`'s `hClientSrc`, every RM escape's own client, the cross-client
+  slots of the allocations and controls the host lets an unprivileged caller reach, and the
+  backend-handle slots (`0x3d05` / `0x3d06`, the NVKMS `memFd`, the `NV0005` event `data`,
+  `REGISTER_FD`, the `fd` of `ALLOC_MEMORY` / `MAP_MEMORY`, the OS-event `fd`; the fence wait
+  `fd` is only counted). What section 12 does NOT cover (UVM, NVKMS on the modeset file, controls
+  outside its table, the grant side of `RM_SHARE`) is listed in section 12.6. The cross-process
+  route the KMD does offer is `RM_RESOURCE_IMPORT` (`shared-foreign-surfaces.md` section 6),
+  which never needs another process's handle.
 - **Adoption of a KMD-created resource has no same-device check** (`ctx_id != 0` in place of the
   creating device's context; `shared-foreign-surfaces.md` R5). Level 4 of the KMD's own RM client
   (`kmd-rm-client.md` section 14) is the only creator of such a resource.
@@ -836,3 +836,220 @@ touched.
 10. **Docs and version.** Update this file (sections 4, 5, 7), keep `QUERY_CAPS` truthful, bump
     the KMD driver version (`guest/windows/kmd_render/driver-version.env` is the single source;
     the `tools/win-mcp` helper that `build.rs` mentions for bumping is not in this tree).
+
+
+## 12. Cross-client hardening (`NvDupHarden`)
+
+Written against the code of this branch (`kmd_logic/src/nvrm_clients.rs`,
+`kmd_render/src/virtio/nvrm_harden.rs`, the call sites in `virtio/nvrm.rs`). It was verified
+with host tests of the pure rules and a type-check of the KMD sources; it has **not** been run
+in a Windows guest (section 12.7).
+
+### 12.1 Threat model
+
+* **Actors.** Two guest processes A and B, each an owner (a D3DKMT device), both using
+  `FORWARD`. The host backend serves the whole VM from ONE process, so every RM client and every
+  backend file handle in it is "the guest's": RM does not tell A's client from B's, and the
+  backend's handle table is one table. `RM_DUP_OBJECT` across guest clients worked through
+  `FORWARD` with no check (shown on v311 with `crm_share_smoke`).
+* **What A controls.** Every byte of its escape buffer, lengths included. It can guess numbers:
+  backend handles are small integers, RM client handles are RM-chosen but sequential and
+  unpublished.
+* **What A wants.** To act in, read, dup, map or be signalled by something of B: run RM controls
+  in B's client; `RM_DUP_OBJECT` B's memory into its own client (`hClientSrc` / `hObjectSrc`);
+  allocate an event on B's objects (`NV0005.hParentClient`); import an object from a backend
+  file of B's (`0x3d06`, the NVKMS `memFd`); use B's file as its own event or mapping channel
+  (`REGISTER_FD`, `ALLOC_MEMORY` / `MAP_MEMORY` `fd`).
+* **Out of scope.** A compromised KMD or host; GPU-level isolation between channels; resource
+  exhaustion beyond the existing quotas; UVM (section 12.6).
+* **The rule.** A forwarded `Ioctl` may only name RM clients and backend handles its own owner
+  was given. The one sanctioned cross-process route is the KMD-mediated foreign resource
+  (`RM_RESOURCE_IMPORT`), which is another verb and needs no foreign handle: the importer
+  exports the GEM handle of ITS OWN DRM file to a control descriptor of its own client. The KMD's
+  own RM client (`DeviceOwner::KMD_RM`, `KmdRmClient`) goes through `forward` too and is
+  exempt: no escape can present that owner, and its traffic is the KMD's.
+
+### 12.2 Mechanism
+
+* **Who owns which client.** `kmd_logic::nvrm_clients::ClientTable`, a field of the transport
+  (so a new transport starts empty): `(owner, hClient, via)`, at most 32 per owner and 256
+  total, boxed. It is learned from replies, not from requests: a forwarded `NV_ESC_RM_ALLOC` of
+  class `NV01_ROOT` / `NV01_ROOT_NON_PRIV` / `NV01_ROOT_CLIENT` (the host's `ROOT_CLASSES`) in an
+  NVOS21 (32-byte) or NVOS64 (48-byte) block, whose reply has host status 0, RM status 0 (word
+  28 or 40) and a `hObjectNew` (word 8) that is neither 0 nor `0xFFFFFFFF`, records that client
+  for the owner, with the backend file the request went through as `via`.
+* **Reservation.** As an `Open` does for handles, a client allocation reserves its table slot
+  BEFORE it is forwarded: a full table or quota refuses (`NO_RESOURCES`, `NvCliFull`) before the
+  host makes a client nobody tracks. A failed or refused allocation gives the slot back.
+* **Forgetting.** A successful `NV_ESC_RM_FREE` of the client itself (16-byte NVOS00,
+  `hObjectOld == hRoot`, host and RM status 0), or one that TIMED OUT (indeterminate: the entry
+  goes, the safe direction); `Close` of the `via` file (success or timeout, not a failed
+  `Close`, which restores the handle); `close_all_for_owner`; the transport sweep
+  (`close_all_on_host`); and the table dies with the transport. A client number RM mints again
+  evicts a stale entry of ANOTHER owner, so one number never has two owners.
+* **Judging a request.** `judge` runs in the SAME lock hold that already resolves the handle's
+  `device_type`, so the hot path pays no extra lock. It parses `MsgHeader | IoctlReq | data |
+  nested` with checked arithmetic (a request that does not parse is `Allow` here, because
+  `check_ioctl` refuses it right after), then looks at every slot that names something (12.4).
+  UVM files (`device_type` 256 / 257) are not interpreted.
+* **Order in `forward`.** handle ownership (`NOT_OWNED`) -> fence handle (`FORBIDDEN`) ->
+  `check_ioctl` (`BAD_RANGE`, `FORBIDDEN`) -> the hardening verdict -> client reservation ->
+  the round trip -> record / forget from the reply.
+* **Verdicts.** `Allow` (every reference is the caller's, or there is none), `Deny(cause)`,
+  `Doubt(cause)`. A slot is `Deny`-grade only when the field is known AND the parameter block has
+  exactly the size the layout was verified against (or, for a prefix field, any size that holds
+  it). A block of another size, a block too short for the slot, and a descriptor control the host
+  does not translate are `Doubt`: counted (`NvDupDoubt`), never refused, in every mode. A refusal
+  answers `NOT_OWNED` (one code for "not yours" and "does not exist", checklist item 4 of section
+  11), counted in `NvRef` as every refusal.
+* **Zero and negative.** Client 0 is "none" (RM refuses it itself) and is never checked; a
+  backend-handle slot is read as the `i32` the host reads, and a value `<= 0` names no file.
+
+### 12.3 The knob and the counters
+
+`NvDupHarden` (REG_DWORD under the service key, read once per boot, so `reg add` + restart the
+device): **1** (default) enforce; **0** off (nothing is recorded or judged: the behaviour before
+this change); **2** log-only (everything is recorded and judged, what mode 1 would refuse is
+counted in `NvDupWould` and forwarded). Any other value enforces. The counters are in section 7
+(`NvCli*`, `NvDup*`; all at most 10 characters). `NvDupMode` shows what was read.
+
+Recommended roll-out on a new workload: run it once with `NvDupHarden` = 2 and read `NvDupWould`
+and `NvDupDoubt`; both should be 0 / small, and then leave the default.
+
+### 12.4 What is covered
+
+Offsets are bytes into the named block (`data` = the `NVOSxx` struct, `nested` = the block its
+pointer names). "Grade" is Deny when the slot's block has the stated size (the sizes are the
+host allow-list's, equal in all six releases it carries unless noted), else Doubt.
+
+| request | slot | names | grade |
+|---|---|---|---|
+| every RM escape in `CLIENT_AT_0` (`0x27 0x28 0x29 0x2A 0x2B 0x32 0x33 0x34 0x35 0x37 0x38 0x39 0x41 0x4A 0x4D 0x4E 0x4F 0x56 0x57 0x58 0x59 0x5E`) | `data` @0 (`hRoot` / `hClient`) | the caller's client | Deny; client 0 passes |
+| `NV_ESC_RM_ALLOC` of a root class | none (RM picks the number) | | the request is recognised and its reply recorded |
+| `NV_ESC_RM_DUP_OBJECT` (NVOS55, 28 bytes) | `data` @12 `hClientSrc` (`hObjectSrc` @16 follows from it) | a client | Deny at 28 bytes |
+| `RM_ALLOC` class `0x05` / `0x79` (`NV0005`, 24 bytes) | `nested` @0 `hParentClient`; @16 `data` (low word, the event file) | a client; a backend handle | Deny at 24 |
+| `RM_ALLOC` class `0x80` (`NV0080`, 56) | `nested` @4 `hClientShare`, @8 `hTargetClient` | clients | Deny at 56 |
+| `RM_ALLOC` class `0x83DE` (debugger, 12) | `nested` @4 `hAppClient` | a client | Deny at 12 |
+| `RM_ALLOC` class `0xB2CC` (profiler, 8) | `nested` @0 `hClientTarget` | a client | Deny at 8 |
+| `RM_CONTROL` `0x3D05` `EXPORT_OBJECT_TO_FD` (24) | `nested` @16 `fd` | a backend handle | Deny at 24 |
+| `RM_CONTROL` `0x3D06` `IMPORT_OBJECT_FROM_FD` (20) | `nested` @0 `fd` | a backend handle | Deny at 20 |
+| `RM_CONTROL` `0x3D08 0x3D0A 0x3D0B 0x3D0C` | `nested` @0 / 72 / 0 / 0 `fd` | a descriptor the host does not translate | Doubt always |
+| `RM_CONTROL` `0x00000D03` `CLIENT_GET_ACCESS_RIGHTS` (12) | `nested` @4 `hClient` | a client | Deny at 12 |
+| `RM_CONTROL` `0x20802502` `DMA_INVALIDATE_TLB` (16) | @0 `hClient` | a client | Deny at 16 |
+| `RM_CONTROL` `0x2080110B` `FIFO_DISABLE_CHANNELS` (536) | @4 `numChannels` (capped at 64), @24 `hClientList[]` | clients | Deny at 536 |
+| `RM_CONTROL` `0x208F0403` `FIFO_GET_CHANNEL_STATE` (16) | @4 `hClient` | a client | Deny at 16 |
+| `RM_CONTROL` `0x503C0106` `REGISTER_PID` (4) | @0 `hClient` | a client | Deny at 4 |
+| `RM_CONTROL` `0xA0840105` `BIND_FECS_EVTBUF` (16) | @0 `hEventBufferClient` | a client | Deny at 16 |
+| `RM_CONTROL` `0x20800122` `GPU_EXEC_REG_OPS` (48) | @0 `hClientTarget` (0 = all) | a client | Deny at 48 |
+| `RM_CONTROL` `0x20801209` `GR_CTXSW_PM_BIND` (40), `0x20801208` `ZCULL_BIND` (24) | @0 `hClient` | a client | Deny at the size |
+| `RM_CONTROL` `0x20801211` `GR_CTXSW_PREEMPTION_BIND` (104 or 112 by release) | @4 `hClient` | a client | Deny at any size that holds it |
+| `RM_CONTROL` `0x20801205` `GR_CTXSW_ZCULL_MODE` (16) | @4 `hShareClient` | a client | Deny at 16 |
+| `NV_ESC_RM_ALLOC_MEMORY` `0x27`, `NV_ESC_RM_MAP_MEMORY` `0x4E` (56 with the trailing fd) | `data` @48 `fd` | a backend handle | Deny at 56 |
+| `NV_ESC_REGISTER_FD` `0xC9` (4) | `data` @0 `ctl_fd` | a backend handle | Deny at 4 |
+| `NV_ESC_ALLOC_OS_EVENT` `0xCE` / `NV_ESC_FREE_OS_EVENT` `0xCF` (16) | `data` @0 `hClient`; @8 `fd` | the caller's client; a backend handle | Deny; Deny at 16 |
+| nvidia-drm `GEM_IMPORT_NVKMS_MEMORY` `0x41`, `GEM_EXPORT_NVKMS_MEMORY` `0x49`, `GEM_EXPORT_DMABUF_MEMORY` `0x4D` | `nested` @0 `memFd` | a backend handle | Deny; a missing block is a Doubt |
+| nvidia-drm `SEMSURF_FENCE_CTX_CREATE` `0x54` | `nested` @0 `hClient` | a client | Deny |
+| nvidia-drm `SEMSURF_FENCE_WAIT` `0x56` (24) | `data` @4 `fd` (a fence handle; 0 = already signalled) | a backend handle | Doubt always (12.5) |
+
+The ioctl type byte decides what the number means: `'F'` (0x46) for the RM escapes, `'d'` (0x64)
+for the nvidia-drm ones. Sources of the layouts: the NVIDIA headers (`nvos.h`, `class/cl0005.h`,
+`cl0080.h`, `cl83de.h`, `clb2cc.h`, `ctrl/...`) compiled with `offsetof` against the host's
+per-release allow-lists (`host/backend/gen/src/rmallow`), and the host's own parsers
+(`nested.rs`, `rm_fd.rs`, `fence.rs`) for the descriptor slots.
+
+### 12.5 Single-client traffic and the doubts
+
+A caller that only names its own clients and files is `Allow` by construction. The librmclient
+flows were read for this change (`crm_open`: the root allocation on the control file and
+`REGISTER_FD` of that file on each GPU channel; `crm_alloc`; `crm_map_memory`: `MAP_MEMORY` with
+the per-mapping channel as `fd`; `crm_event_open`: `ALLOC_OS_EVENT` on the event file and the
+`NV0005` event with that file as `data`), and `a_single_client_session_is_untouched` walks a
+session of that shape through `judge`. The `0x3D05` / `0x3D06` export / import, the NVKMS import
+and the fence wait are read from the host's parsers and `shared-foreign-surfaces.md` section 6,
+not from a running NVK. Mode 0 restores the old behaviour exactly. Where the
+rules are not sure they count instead of refusing:
+
+* **Size drift.** Every Deny needs the verified block size. A release whose struct grew gets a
+  `NvDupDoubt` and is forwarded as before until the table is updated (the preemption bind, 104 /
+  112, is the one entry whose size differs between the six releases, and asserts none).
+* **`NV0005` class `0x05` versus `0x79`.** The host treats `data` the same way for both and so
+  does the table; a class-`0x05` event whose `data` is not a backend handle would be refused. No
+  such use is known.
+* **`SEMSURF_FENCE_WAIT`'s `fd`.** Counted, never refused: a process may wait on a fence it did not
+  create (one the KMD took over for a present moves to the `KMD_RM` owner, and a fence another
+  process shares is a plausible design), and nothing read for this change says that cannot be
+  legitimate. Its creator's own waits are `Allow`. If waits on foreign fences turn out never to
+  occur (`NvDupDoubt` stays 0 under a real workload), make it a Deny.
+* **Descriptor controls the host does not translate** (`0x3D08 0x3D0A 0x3D0B 0x3D0C`): the
+  number reaches RM as a descriptor of the backend process, which is not a handle of this table,
+  so they are counted, not judged. This is a HOST finding (the values name whichever backend file
+  sits at that number); the fix belongs in `host/backend/device/src/nvidia/nested.rs`.
+* **Two layout assumptions** read from headers, not from a running RM: the NVOS64 / NVOS21 status
+  offsets (40 / 28, from the host's `note_clients`) and `IoctlResp` carrying the data block at
+  reply offset 28. A reply that does not fit them records nothing (the client is then untracked,
+  and in mode 1 its later calls are refused: watch `NvCliRec` against `NvOpen` in a first run).
+
+### 12.6 What is NOT covered
+
+* **UVM** (`device_type` 256 / 257). Its calls carry `rmCtrlFd` (a backend handle) and `hClient`
+  side by side (`UVM_REGISTER_GPU`, `UVM_MAP_EXTERNAL_ALLOCATION`, `UVM_REGISTER_CHANNEL`, ...). The
+  host checks that the client was made on that control file, but accepts any of the VM's files,
+  so a UVM caller could name another process's control file and client. The per-release call
+  tables are the host's (`abi::uvm`); the KMD has none. NVK does not use UVM.
+* **NVKMS on the modeset file** (type `'m'`) and the other `'d'` ioctls not in 12.4: not parsed.
+* **`RM_CONTROL` commands outside the table.** The table is the set of allow-listed controls
+  (`v615_71_09`: 756) whose parameter structs, in the NVIDIA headers, hold a client handle; the
+  controls with a client handle that the host does not allow an unprivileged caller are refused
+  there (`GPU_EVICT_CTX`, `GPU_INITIALIZE_CTX`, `GPU_PROMOTE_CTX`, `GR_SET_ZCULL_BIT_WAR`,
+  `FIFO_UPDATE_CHANNEL_INFO`, ...). Still open: controls that embed another struct with a client
+  handle, notably `NV5080_CTRL_CMD_DEFERRED_API` / `_V2` (the `api_bundle` union holds the GR
+  context-switch binds above), and any control a later release adds. Re-run the extraction
+  (12.8) when the host's allow-list changes.
+* **`NV_ESC_RM_SHARE`** (grant side): its `sharePolicy.target` is not checked. The consuming
+  side (dup, event, control in the granted client) is covered, so a grant to a client the
+  grantee cannot use is harmless.
+* **Objects.** Object handles are never checked on their own; they live inside a client and RM
+  resolves them there, so checking the client is the check. A client of the caller's own with
+  an object handle the caller did not create is the caller's business.
+* **A timed-out client allocation** leaves a client on the host that this table does not know (as
+  a timed-out `Open` leaves a file): in mode 1 the process cannot use it, and the host frees it
+  with its file. Bounded by the file quota.
+* **A free that fails after the host acted** without a timeout (a malformed reply) leaves the
+  entry; the next client RM mints under that number evicts it.
+* **Races.** A request judged just before a concurrent free of its client, or a `Close` of its
+  file, is forwarded (the host then answers for it). The tables are not reference counted, as the
+  handle tables are not (section 10.1).
+* **Pinned registrations.** A client allocation sent with a `pin_id` is forwarded by
+  `forward_pinned`, which does not record its reply (only `ALLOC_MEMORY` registrations are
+  meant to carry pins): in mode 1 such a client cannot be used by its creator, which only
+  harms the creator.
+* **The owner is the D3DKMT device**, as everywhere in this file: two devices of one process are
+  strangers to each other; one device shared by two processes is not possible.
+
+### 12.7 Verification
+
+* `cargo test` in `guest/windows/kmd_logic` (`nvrm_clients::tests`, 44 tests): the table (two
+  owners with the same number, reuse after a free, quotas, reservations, retire, `Close` of a
+  file, `clear`), parsing and replies with every truncation and `u32::MAX` lengths, one test per
+  covered slot (own / foreign / zero / negative / wrong size / too short), UVM and other
+  namespaces left alone, a seeded 20 000-request random run for panics, a whole two-process
+  session, and a single-client session that must stay `Allow`.
+* The KMD sources were type-checked as a whole crate against a `wdk-sys` stub (the real target
+  does not build here), comparing the errors of the touched files before and after: no new ones.
+  `kmd_render` itself was **not** compiled for Windows and nothing was run in a guest.
+* **UNVERIFIED:** that NVK on a live backend behaves as the headers say for the slots above
+  (`NvDupWould` / `NvDupDoubt` in a log-only run are the check); that the reply layout of
+  `RM_ALLOC` is as read from the host (`NvCliRec` must follow `NvOpen`); that `crm_share_smoke`'s
+  cross-client dup is now refused (`NvDupSrc` and `NvDupDeny` rise by one per attempt).
+
+### 12.8 Adding or changing a slot
+
+1. Find the struct in the NVIDIA headers and the command in the host allow-list
+   (`host/backend/gen/src/rmallow/<release>.rs`); compile an `offsetof` probe against
+   `sdk/nvidia/inc` for the offset and the size.
+2. Add a `Layout` to `CLASS_LAYOUTS` (alloc classes) or `CONTROL_LAYOUTS` (controls) in
+   `kmd_logic/src/nvrm_clients.rs`, or a match arm in `rm_escape` / `drm_ioctl` for an escape. Use
+   `untranslated` when the host does not turn the number into a descriptor, a size of 0 only for a
+   prefix field.
+3. Add a test with an own, a foreign, a zero and a wrong-size value; run it first as a Doubt in
+   `NvDupHarden` = 2 on a real workload if the layout was not read from a header.

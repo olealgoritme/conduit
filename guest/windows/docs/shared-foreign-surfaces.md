@@ -163,16 +163,18 @@ transferable, and **they must not become shareable**. The rules, as implemented:
   it again, query RM state of it, dup its RM object or learn its handles.
 * R3. Closing A's RM handle neither releases nor invalidates the resource for B (independent
   lifetimes, by design).
-* R4. Known gap, not fixed here (security last): `FORWARD` does not check handles *inside*
-  payloads. From `host/backend/device/src/nvidia/nested.rs`, the guest-visible "handle" in these
-  slots is an entry of the host's per-connection handle table, i.e. the same numbering as the
-  backend handles the KMD tracks per owner, so another process's number is guessable and the
-  host honours it: `NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD` (0x3d05, nested offset 16),
+* R4. `FORWARD` used not to check handles *inside* payloads. From
+  `host/backend/device/src/nvidia/nested.rs`, the guest-visible "handle" in these slots is an
+  entry of the host's per-connection handle table, i.e. the same numbering as the backend handles
+  the KMD tracks per owner, so another process's number is guessable and the host honours it:
+  `NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD` (0x3d05, nested offset 16),
   `IMPORT_OBJECT_FROM_FD` (0x3d06, nested offset 0), the NV0005 event class `data` (offset 16),
-  the NVKMS `memFd` at the ioctl's `nested_fd_offset`, plus RM `DUP_OBJECT`'s `hClientSrc`. A
-  hardening pass must check each against `nvrm_handle_owned(owner, ...)` before forwarding.
-  Until then cross-process sharing "works by accident" through those slots; nothing in this
-  design relies on it, and nothing may.
+  the NVKMS `memFd` at the ioctl's `nested_fd_offset`, plus RM `DUP_OBJECT`'s `hClientSrc`. They
+  are checked now (`NvDupHarden`, `nvrm-escape.md` section 12): each must be a backend handle
+  the caller opened, and each RM client must be one RM made for the caller, learned from its own
+  `NV01_ROOT` allocation. Nothing in this design relied on the old cross-process "works by
+  accident" behaviour (`RM_RESOURCE_IMPORT` below never needs another process's handle), so
+  nothing changes for it. What stays open (UVM, controls outside the table) is in section 12.6.
 * R5. Known gap, not fixed here (security last): **adoption of a KMD-created resource is weaker than
   the same-device rule.** A resource the KMD's own RM client made (`KmdRmClient` = 4,
   `kmd-rm-client.md` section 14; creator token `KMD_RM`) has no creating device, so
@@ -292,8 +294,9 @@ compares it with the escaping device's (the same rule as `ATTACH_RESOURCE`). Ano
 that learns a resource id still cannot get a handle (it has no open row), but a process that holds
 an open may name ANY of its own DRM nodes, which is what it is for. The host's reply `size` and
 `modifier` are not cross-checked against the KMD's own record (the dma-buf may be rounded up).
-The cross-client slots of `FORWARD` (`RM_DUP_OBJECT` and the fd slots) remain unchecked; the list
-is in `nvrm-escape.md` section 10.1.
+The cross-client slots of `FORWARD` (`RM_DUP_OBJECT` and the fd slots) are checked by
+`NvDupHarden` (`nvrm-escape.md` section 12); the importer's own client and DRM file are all this
+route names.
 
 ## 7. Counters (registry, throttled: first and every 16th open/close, every 64th escape)
 
