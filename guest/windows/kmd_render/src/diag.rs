@@ -171,8 +171,8 @@ mod mirror {
     pub(super) static SKIPPED: AtomicU32 = AtomicU32::new(0);
 
     extern "system" {
-        /// `KeGetCurrentThread()`: any IRQL.
-        fn KeGetCurrentThread() -> usize;
+        /// `PsGetCurrentThread()` (exported; `KeGetCurrentThread` is an inline in wdm.h and is not): any IRQL.
+        fn PsGetCurrentThread() -> usize;
     }
 
     /// FNV-1a over the UTF-16 units of the value name.
@@ -199,7 +199,7 @@ mod mirror {
     pub(super) fn in_pass() -> bool {
         let t = PASS_THREAD.load(Ordering::Relaxed);
         // SAFETY: a scalar read of the current thread pointer, any IRQL.
-        t != 0 && t == unsafe { KeGetCurrentThread() }
+        t != 0 && t == unsafe { PsGetCurrentThread() }
     }
 
     /// The pass's write is redundant: the registry already holds `value` under this name.
@@ -232,7 +232,7 @@ mod mirror {
         YIELD_EVERY.store(yield_every, Ordering::Relaxed);
         SINCE_REST.store(0, Ordering::Relaxed);
         // SAFETY: as in `in_pass`.
-        PASS_THREAD.store(unsafe { KeGetCurrentThread() }, Ordering::Release);
+        PASS_THREAD.store(unsafe { PsGetCurrentThread() }, Ordering::Release);
     }
 
     /// The pass is over.
