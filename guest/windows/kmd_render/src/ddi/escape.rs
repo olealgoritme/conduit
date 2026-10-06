@@ -2223,13 +2223,12 @@ fn nvrm_mmap(
         status
     };
     let region = nvrm::region_for(adapter, host.device_type);
+    // 64-bit throughout: the window is the GPU's BAR1 (32 GiB, 128 GiB on a big card), so an
+    // offset or a sum past 4 GiB is the normal case, and a host that names a span that
+    // wraps (or whose physical address would not fit `PHYSICAL_ADDRESS`) is refused.
     let in_range = |r: &crate::virtio::pci_caps::HostVisibleWindow| {
-        host.offset % 4096 == 0
-            && host.size >= m.size
-            && host
-                .offset
-                .checked_add(m.size)
-                .is_some_and(|end| end <= r.len)
+        host.size >= m.size
+            && helios_kmd_logic::window_units::place(r.base, r.len, host.offset, m.size).is_some()
     };
     let Some(region) = region.filter(|r| in_range(r)) else {
         let status = undo(if region.is_none() {

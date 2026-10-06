@@ -2985,8 +2985,17 @@ impl VirtioGpu {
         // which case HELIOS_NVRM_OP_MMAP answers UNSUPPORTED.
         let nvrm_window = scan_shm_region(&DxgkConfigAccess::new(dxgkrnl), SHM_ID_WINDOW);
         let nvrm_aperture = scan_shm_region(&DxgkConfigAccess::new(dxgkrnl), SHM_ID_APERTURE);
-        crate::diag::record_named_bytes(b"NvWinMb", nvrm_window.map_or(0, |w| (w.len >> 20) as u32));
-        crate::diag::record_named_bytes(b"NvAptMb", nvrm_aperture.map_or(0, |w| (w.len >> 20) as u32));
+        // MiB through the saturating helper: a 32 or 128 GiB window is 32768 / 131072, and a
+        // region past what a u32 of MiB holds (4 PiB) reads as the maximum, never as a small
+        // number (`helios_kmd_logic::window_units`).
+        crate::diag::record_named_bytes(
+            b"NvWinMb",
+            nvrm_window.map_or(0, |w| helios_kmd_logic::window_units::mib_u32(w.len)),
+        );
+        crate::diag::record_named_bytes(
+            b"NvAptMb",
+            nvrm_aperture.map_or(0, |w| helios_kmd_logic::window_units::mib_u32(w.len)),
+        );
 
         // Locate + map the ISR-status register so the (real) ISR can read-to-clear
         // the level-triggered INTx line and stop the unhandled-interrupt storm.

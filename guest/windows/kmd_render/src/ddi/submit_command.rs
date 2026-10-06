@@ -280,7 +280,9 @@ pub(crate) fn publish_nvrm_counters() {
     // per-device quota of a quarter of the RM window.
     crate::diag::record_named_bytes(
         b"NvMapMb",
-        (crate::virtio::nvrm::NVRM_MAP_BYTES.load(Ordering::Relaxed) >> 20) as u32,
+        helios_kmd_logic::window_units::mib_u32(
+            crate::virtio::nvrm::NVRM_MAP_BYTES.load(Ordering::Relaxed),
+        ),
     );
     crate::diag::record_named_bytes(
         b"NvMapQRef",
