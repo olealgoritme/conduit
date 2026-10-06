@@ -477,6 +477,10 @@ entry behind older pending epochs (the per-allocation prefix rule: a consumer ne
 before N); it never reads or advances the stream's strictly-increasing writer value. The stream must
 still be the calling device's live registration.
 
+Completion of a pending entry is `value <= completed` on the stream, not `==`, and the table keeps a
+per-stream watermark so a publish after its retirement completes on arrival; writer slots are freed
+with their pair's last entry. See `producer-completion.md`.
+
 What the UMD must change (not done here): `PresentStreamCorrelation::is_complete` requires
 `value32 != 0` and the vehicle's `set_present_source` refuses `fence_value == 0`; both need a
 "CPU-complete" mode that sends `ctx_id`, `cookie` of the NVK device's registered stream with
@@ -523,6 +527,7 @@ adoption and the layout record are already written.
 | layout rules, size lower bound, request validation, adoption state machine (all 11 refusals, once-only, quota freed, record kept, claim, trailer room), refusal codes | `kmd_logic/src/foreign_resource.rs` | host `cargo test` |
 | marker tail readings, the "old gate for nonzero values is unchanged" table, boundary readiness for value 0 and dead streams | `kmd_logic/src/lib.rs` (`present_marker_tail_tests`) | host `cargo test` |
 | producer publish with value 0 (no pending slot, ordering behind older epochs, no writer slot, atomic failure, terminal) | `kmd_logic/src/producer_completion.rs` | host `cargo test` |
+| producer completion rule (skipped values, early completion, writer reuse, 100k soak, wrap, dead stream, occupancy counters) | `kmd_logic/src/producer_completion.rs` | host `cargo test` (`producer-completion.md`) |
 | ABI: `HeliosForeignLayout` 32, `HeliosForeignImportRmLayout` 104, `HeliosWddmAllocLayout` 32 at offset 96; C mirror | `protocol/src/foreign.rs`, `protocol/src/wddm.rs`, `protocol/include/helios_foreign.h` | Rust `const` asserts + `cargo test`; `gcc -m32/-m64 -Wall -Wextra -Werror` on the header |
 | escape parse of the layout tail, import with layout, `foreign_layout`, `adopt_for_allocation` glue (re-ownership, quota, wrong context, dropped context, declared/record agreement, legacy path) | the real `escape_foreign.rs`, `virtio/foreign.rs`, `gpu/foreign_tables.rs` | compiled and run against a stub of the surrounding crate (not in the tree), gate flipped in the copy only |
 | `create_allocation.rs`, `submit_command.rs`, `gpu/mod.rs`, `device.rs` edits | - | rustfmt parse and review only; **never compiled**. Nothing here has run on a Windows guest. |

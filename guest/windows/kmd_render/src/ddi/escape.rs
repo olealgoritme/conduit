@@ -372,6 +372,9 @@ pub unsafe extern "C" fn dxgkddi_escape(
                         + 1;
                     if n == 1 || n % 64 == 0 {
                         crate::diag::record_named_bytes(b"PrRef", n);
+                        // A refusal is when the table occupancy matters: mirror it now
+                        // instead of waiting for the next counter publication.
+                        crate::adapter::producer::publish_counters();
                     }
                 }
                 status
