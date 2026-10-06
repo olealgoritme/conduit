@@ -335,12 +335,24 @@ impl AdapterContext {
     /// the same adapter and resume the same timer source. `wait=TRUE` is the
     /// no-UAF proof for the callback's immutable adapter context.
     pub(crate) fn delete_vsync_ex_timer(&mut self) {
-        let wd_timer = self
-            .vsync_wd_timer
-            .swap(0, core::sync::atomic::Ordering::AcqRel);
+        use core::sync::atomic::Ordering;
+        // The pointers stay PUBLISHED until `ExDeleteTimer(wait)` has returned: a callback that
+        // passed its checks before `stop_vsync` and is still running loaded a nonzero pointer
+        // and must find the timer valid (the delete waits for it); one that starts later cannot,
+        // the delete cancelled the timer first. Storing 0 BEFORE the delete let such a callback
+        // read 0 and call `ExSetTimer(NULL)` (the watchdog), or fall to the KTIMER fallback and
+        // arm a DPC inside a context about to be freed (the heartbeat).
+        let wd_timer = self.vsync_wd_timer.load(Ordering::Acquire);
+        let ex_timer = self.vsync_ex_timer.load(Ordering::Acquire);
+        if wd_timer == 0 && ex_timer == 0 {
+            return;
+        }
+        // A callback blocked in `DxgkCbSynchronizeExecution` hangs the waits below: `StopSub`
+        // names this step (`VsCbIn` above `VsCbOut` says why).
+        crate::ddi::stall_diag::stop_sub(helios_kmd_logic::stall_diag::stop_sub::REMOVE_TIMER);
         if wd_timer != 0 {
-            // SAFETY: as below; `stop_vsync` already cleared `vsync_wd_on`, so the callback
-            // does not re-arm, and cancel+wait drains one in flight.
+            // SAFETY: as below; `stop_vsync` already cleared `vsync_wd_on`, so a callback does
+            // not re-arm, and cancel+wait drains one in flight.
             unsafe {
                 ExDeleteTimer(
                     wd_timer as ExTimer,
@@ -349,24 +361,22 @@ impl AdapterContext {
                     core::ptr::null_mut(),
                 );
             }
+            self.vsync_wd_timer.store(0, Ordering::Release);
         }
-        let ex_timer = self
-            .vsync_ex_timer
-            .swap(0, core::sync::atomic::Ordering::AcqRel);
-        if ex_timer == 0 {
-            return;
-        }
-        // SAFETY: Drop runs only from RemoveDevice at PASSIVE_LEVEL, after
-        // stop_vsync closed the delivery gate and cancelled the timer.
-        // ExDeleteTimer with cancel+wait drains any in-flight callback before
-        // the adapter storage containing its context pointer is released.
-        unsafe {
-            ExDeleteTimer(
-                ex_timer as ExTimer,
-                BOOLEAN_TRUE,
-                BOOLEAN_TRUE,
-                core::ptr::null_mut(),
-            );
+        if ex_timer != 0 {
+            // SAFETY: Drop runs only from RemoveDevice at PASSIVE_LEVEL, after
+            // stop_vsync closed the delivery gate and cancelled the timer.
+            // ExDeleteTimer with cancel+wait drains any in-flight callback before
+            // the adapter storage containing its context pointer is released.
+            unsafe {
+                ExDeleteTimer(
+                    ex_timer as ExTimer,
+                    BOOLEAN_TRUE,
+                    BOOLEAN_TRUE,
+                    core::ptr::null_mut(),
+                );
+            }
+            self.vsync_ex_timer.store(0, Ordering::Release);
         }
     }
 
@@ -571,11 +581,14 @@ impl AdapterContext {
         use core::sync::atomic::Ordering;
         use helios_kmd_logic::vsync_wd::{self, WdAction};
         use wdk_sys::ntddk::KeQueryInterruptTimePrecise;
-        if self.vsync_wd_on.load(Ordering::Acquire) == 0 {
+        // Loaded ONCE, before anything else: `delete_vsync_ex_timer` publishes 0 only after
+        // `ExDeleteTimer(wait)` has returned, which cannot happen while this callback runs, so a
+        // nonzero value stays valid for the whole call and 0 means there is nothing to do.
+        let timer = self.vsync_wd_timer.load(Ordering::Acquire);
+        if timer == 0 || self.vsync_wd_on.load(Ordering::Acquire) == 0 {
             return;
         }
-        let timer = self.vsync_wd_timer.load(Ordering::Acquire);
-        // SAFETY: nonzero while `vsync_wd_on` is, one-shot, relative due time.
+        // SAFETY: `timer` is the live watchdog timer (see above), one-shot, relative due time.
         unsafe {
             ExSetTimer(
                 timer as ExTimer,
