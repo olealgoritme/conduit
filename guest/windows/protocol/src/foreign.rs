@@ -70,6 +70,17 @@ pub const HELIOS_FOREIGN_OP_IMPORT_RM: u32 = 2;
 /// `QueryCaps.caps_flags`: `IMPORT_RM` is served end to end (KMD gate open and
 /// the host has the matching blob type).
 pub const HELIOS_FOREIGN_CAP_RM_IMPORT: u32 = 1 << 0;
+/// `QueryCaps.caps_flags`: this KMD lets OTHER processes open an adopted foreign
+/// allocation (`D3DKMTOpenResource` / `OpenResourceFromNtHandle` of a shared
+/// allocation whose `blob_mem` is `HELIOS_BLOB_MEM_RM_EXPORT`). It sets
+/// [`crate::HELIOS_WDDM_OPEN_FLAG_FOREIGN`] in the open identity, rewrites the
+/// [`crate::HeliosWddmAllocLayout`] trailer at every open from its own record,
+/// and keeps the host resource alive until the last of the adopting allocation's
+/// destroy and every open's close. Independent of [`HELIOS_FOREIGN_CAP_RM_IMPORT`]
+/// (that one needs the host; this one is KMD-only). A producer that is about to
+/// share a foreign allocation should require it: an older KMD would open it
+/// without the flag. See `guest/windows/docs/shared-foreign-surfaces.md`.
+pub const HELIOS_FOREIGN_CAP_SHARED_OPEN: u32 = 1 << 1;
 
 pub const HELIOS_FOREIGN_ST_OK: i32 = 0;
 /// The op is valid in this ABI but not served: `CAP_RM_IMPORT` is not set.
@@ -359,6 +370,10 @@ mod tests {
         assert_eq!(
             c_define("HELIOS_FOREIGN_CAP_RM_IMPORT"),
             HELIOS_FOREIGN_CAP_RM_IMPORT as u64
+        );
+        assert_eq!(
+            c_define("HELIOS_FOREIGN_CAP_SHARED_OPEN"),
+            HELIOS_FOREIGN_CAP_SHARED_OPEN as u64
         );
         assert_eq!(
             c_define("HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT"),

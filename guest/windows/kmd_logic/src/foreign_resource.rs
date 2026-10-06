@@ -48,6 +48,31 @@
 //!   first gets an entry back.
 //! * A reservation is a promise of one slot and `size` bytes to one owner; it
 //!   is consumed exactly once, by `commit` or `cancel`.
+//!
+//! # Cross-process lifetime (S6, `docs/shared-foreign-surfaces.md`)
+//!
+//! Once a WDDM allocation has adopted the resource, other processes may open that
+//! allocation (`DxgkDdiOpenAllocation`). The host resource must live until the LAST
+//! of {the adopting allocation destroyed, every open closed}, whichever order
+//! dxgkrnl delivers them in. This table counts opens per `(resource, process)`
+//! ([`ForeignTable::open`] / [`ForeignTable::close`]) and decides who releases:
+//!
+//! ```text
+//!   adopted (creator None, destroyed = false)
+//!      │ open(p) / close(p): rows change, nothing is released
+//!      │ allocation_destroyed
+//!      ├─ no opens ──────────────► Release   (the destroyer tears the resource down)
+//!      └─ opens > 0 ─► destroyed = true, Deferred
+//!                         │ open(p) refused (the allocation is gone)
+//!                         │ close(p): ... the close that drops the last open ► Release
+//! ```
+//!
+//! `Release` is returned exactly once per resource: by `allocation_destroyed`
+//! when nothing is open, else by the `close` that drains the last open of a
+//! destroyed allocation. Both transitions test and set `destroyed` in the same
+//! call, so two racing destroys or a destroy racing the last close cannot both
+//! win. The caller then removes the record (`remove`) and unrefs the host
+//! resource under the existing one-shot guard.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -60,6 +85,11 @@ pub const MAX_FOREIGN_PER_OWNER: usize = 64;
 pub const MAX_FOREIGN_RESOURCE_BYTES: u64 = 1 << 30;
 /// Most bytes one device may hold that it created and no allocation adopted.
 pub const MAX_FOREIGN_BYTES_PER_OWNER: u64 = 4 << 30;
+
+/// Most `(resource, process)` open rows across every foreign resource. A row is
+/// one process holding one or more opens of one allocation, so this bounds the
+/// number of distinct (resource, process) pairs, not the number of opens.
+pub const MAX_FOREIGN_OPEN_ROWS: usize = 2048;
 
 const PAGE: u64 = 4096;
 
@@ -337,6 +367,9 @@ pub struct Entry {
     pub size: u64,
     /// What is in it, validated against `size` at import.
     pub layout: Layout,
+    /// The adopting allocation was destroyed: the release is the last close's job
+    /// (or already done). Never set before adoption.
+    pub destroyed: bool,
 }
 
 /// Why a request that never became a resource was turned away, for
@@ -369,6 +402,27 @@ pub struct Counters {
     /// ([`AdoptRefusal`]).
     pub refused_adopt: u32,
     pub live_high_water: u32,
+    /// Opens of an adopted foreign allocation that were counted
+    /// ([`ForeignTable::open`] returned `Opened`).
+    pub opened: u32,
+    /// Closes that matched an open row.
+    pub closed: u32,
+    /// Opens turned away ([`OpenRefusal`]). Included in [`Counters::refused`].
+    pub refused_open: u32,
+    /// Closes that found no record or no row of that process: a lifecycle bug
+    /// upstream, or a record the transport teardown already swept.
+    pub close_missed: u32,
+    /// Allocation destroys that found opens still live and deferred the release.
+    /// Expected 0 under dxgkrnl's contract (every open is closed before the
+    /// allocation is destroyed); nonzero means the guard earned its keep.
+    pub deferred: u32,
+    /// Of those, how many were later completed by the last close.
+    pub deferred_released: u32,
+    /// `ATTACH_RESOURCE` attempts naming a foreign resource.
+    pub attached: u32,
+    /// Of those, attempts by a caller that is neither the creating device nor
+    /// a process holding an open of the resource ([`AttachOutcome`]).
+    pub attached_unsanctioned: u32,
 }
 
 impl Counters {
@@ -380,6 +434,7 @@ impl Counters {
             .saturating_add(self.refused_request)
             .saturating_add(self.refused_host)
             .saturating_add(self.refused_adopt)
+            .saturating_add(self.refused_open)
     }
 }
 
@@ -480,10 +535,93 @@ pub enum AdoptRefusal {
     ClaimTooLarge,
 }
 
+/// One process's opens of one adopted allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenRow {
+    resource_id: u32,
+    /// dxgkrnl's opaque `hKmdProcess`, compared only for equality.
+    process: u64,
+    refs: u32,
+}
+
+/// Why [`ForeignTable::open`] turned an open away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenRefusal {
+    /// The record exists but no WDDM allocation adopted it: an allocation
+    /// opened a foreign resid it does not own. Cannot happen through dxgkrnl
+    /// (the identity is the KMD's own write); refused rather than counted.
+    NotAdopted,
+    /// The adopting allocation was already destroyed.
+    Destroyed,
+    /// The open table is full, or the process's count would overflow.
+    Rows,
+}
+
+impl OpenRefusal {
+    /// A stable nonzero code for the registry trace.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::NotAdopted => 1,
+            Self::Destroyed => 2,
+            Self::Rows => 3,
+        }
+    }
+}
+
+/// The outcome of [`ForeignTable::open`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenOutcome {
+    /// No record: an ordinary Venus resource, the legacy open applies.
+    NotForeign,
+    /// Counted. The opener's identity is built from this (the recorded size and
+    /// layout, never anything the creator wrote).
+    Opened(Adopted),
+    Refused(OpenRefusal),
+}
+
+/// The outcome of [`ForeignTable::close`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// No record: the resource was swept (transport teardown) or never foreign.
+    Gone,
+    /// The process holds no open of it (counted, `close_missed`).
+    NoRow,
+    /// Closed; the resource lives on.
+    Kept,
+    /// Closed the last open of a destroyed allocation: the caller must release
+    /// the host resource now (once; see the module docs).
+    Release,
+}
+
+/// The outcome of [`ForeignTable::allocation_destroyed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DestroyOutcome {
+    /// Not an adopted foreign resource: the ordinary teardown applies unchanged.
+    Proceed,
+    /// Nothing is open: release the host resource now.
+    Release,
+    /// `opens` are still live: do NOT release; the last close will.
+    Deferred { opens: u32 },
+    /// A second destroy of the same allocation: release nothing.
+    Repeat,
+}
+
+/// The outcome of [`ForeignTable::note_attach`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachOutcome {
+    NotForeign,
+    /// The caller created the resource, or its process holds an open of it.
+    Sanctioned,
+    /// Neither. Counted; the policy decides whether it is refused.
+    Unsanctioned,
+}
+
 pub struct ForeignTable {
     limits: Limits,
     entries: Vec<Entry>,
     reserved: Vec<Reservation>,
+    opens: Vec<OpenRow>,
+    open_row_cap: usize,
     counters: Counters,
 }
 
@@ -494,10 +632,17 @@ impl ForeignTable {
     }
 
     pub fn with_limits(limits: Limits) -> Self {
+        Self::with_limits_and_rows(limits, MAX_FOREIGN_OPEN_ROWS)
+    }
+
+    /// As [`Self::with_limits`], with an explicit open-row capacity (tests).
+    pub fn with_limits_and_rows(limits: Limits, open_rows: usize) -> Self {
         Self {
             limits,
             entries: Vec::with_capacity(limits.total),
             reserved: Vec::with_capacity(limits.total),
+            opens: Vec::with_capacity(open_rows),
+            open_row_cap: open_rows,
             counters: Counters::default(),
         }
     }
@@ -610,6 +755,7 @@ impl ForeignTable {
             gem_handle,
             size: r.size,
             layout,
+            destroyed: false,
         });
         self.counters.imported = self.counters.imported.saturating_add(1);
         let live = self.entries.len() as u32;
@@ -739,7 +885,169 @@ impl ForeignTable {
             .iter()
             .position(|e| e.resource_id == resource_id)?;
         self.counters.released = self.counters.released.saturating_add(1);
+        // The rows die with the record (`retain` never allocates). A later close
+        // of one of them finds no record: `CloseOutcome::Gone`.
+        self.opens.retain(|r| r.resource_id != resource_id);
         Some(self.entries.swap_remove(idx))
+    }
+
+    // ---- cross-process opens and the release decision -----------------------
+
+    /// Live opens of `resource_id`, summed over processes.
+    pub fn opens(&self, resource_id: u32) -> u32 {
+        self.opens
+            .iter()
+            .filter(|r| r.resource_id == resource_id)
+            .fold(0u32, |a, r| a.saturating_add(r.refs))
+    }
+
+    /// Live opens across every resource.
+    pub fn open_refs_total(&self) -> u32 {
+        self.opens
+            .iter()
+            .fold(0u32, |a, r| a.saturating_add(r.refs))
+    }
+
+    /// Destroyed allocations whose release still waits for opens to drain.
+    pub fn orphans(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.destroyed && self.opens(e.resource_id) != 0)
+            .count()
+    }
+
+    /// Whether `process` holds at least one open of `resource_id`.
+    pub fn process_has_open(&self, resource_id: u32, process: u64) -> bool {
+        self.opens
+            .iter()
+            .any(|r| r.resource_id == resource_id && r.process == process && r.refs != 0)
+    }
+
+    /// `DxgkDdiOpenAllocation` of an allocation that names `resource_id`, by
+    /// `process`. Counts the open iff the resource is an adopted foreign one whose
+    /// allocation still lives; the caller must pair every `Opened` with exactly
+    /// one [`Self::close`] (the open handle remembers it).
+    pub fn open(&mut self, resource_id: u32, process: u64) -> OpenOutcome {
+        let Some(e) = self.get(resource_id).copied() else {
+            return OpenOutcome::NotForeign;
+        };
+        let refusal = if e.creator.is_some() {
+            Some(OpenRefusal::NotAdopted)
+        } else if e.destroyed {
+            Some(OpenRefusal::Destroyed)
+        } else {
+            self.add_open_ref(resource_id, process).err()
+        };
+        match refusal {
+            Some(r) => {
+                self.counters.refused_open = self.counters.refused_open.saturating_add(1);
+                OpenOutcome::Refused(r)
+            }
+            None => {
+                self.counters.opened = self.counters.opened.saturating_add(1);
+                OpenOutcome::Opened(Adopted {
+                    size: e.size,
+                    layout: e.layout,
+                })
+            }
+        }
+    }
+
+    fn add_open_ref(&mut self, resource_id: u32, process: u64) -> Result<(), OpenRefusal> {
+        if let Some(row) = self
+            .opens
+            .iter_mut()
+            .find(|r| r.resource_id == resource_id && r.process == process)
+        {
+            row.refs = row.refs.checked_add(1).ok_or(OpenRefusal::Rows)?;
+            return Ok(());
+        }
+        if self.opens.len() >= self.open_row_cap {
+            return Err(OpenRefusal::Rows);
+        }
+        // `len < cap` and the vector was reserved at `cap`: no growth.
+        self.opens.push(OpenRow {
+            resource_id,
+            process,
+            refs: 1,
+        });
+        Ok(())
+    }
+
+    /// `DxgkDdiCloseAllocation` (or the unwind of a failed open) of an open this
+    /// table counted. See [`CloseOutcome`].
+    pub fn close(&mut self, resource_id: u32, process: u64) -> CloseOutcome {
+        let Some(destroyed) = self.get(resource_id).map(|e| e.destroyed) else {
+            self.counters.close_missed = self.counters.close_missed.saturating_add(1);
+            return CloseOutcome::Gone;
+        };
+        let Some(idx) = self
+            .opens
+            .iter()
+            .position(|r| r.resource_id == resource_id && r.process == process)
+        else {
+            self.counters.close_missed = self.counters.close_missed.saturating_add(1);
+            return CloseOutcome::NoRow;
+        };
+        if self.opens[idx].refs > 1 {
+            self.opens[idx].refs -= 1;
+        } else {
+            self.opens.swap_remove(idx);
+        }
+        self.counters.closed = self.counters.closed.saturating_add(1);
+        if destroyed && self.opens(resource_id) == 0 {
+            self.counters.deferred_released = self.counters.deferred_released.saturating_add(1);
+            CloseOutcome::Release
+        } else {
+            CloseOutcome::Kept
+        }
+    }
+
+    /// `DxgkDdiDestroyAllocation` of the allocation that adopted `resource_id`:
+    /// decide whether this call releases the host resource. Test-and-set of
+    /// `destroyed`, so only one caller ever gets `Release` from this side.
+    pub fn allocation_destroyed(&mut self, resource_id: u32) -> DestroyOutcome {
+        let opens = self.opens(resource_id);
+        let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.resource_id == resource_id)
+        else {
+            return DestroyOutcome::Proceed;
+        };
+        if e.creator.is_some() {
+            return DestroyOutcome::Proceed;
+        }
+        if e.destroyed {
+            return DestroyOutcome::Repeat;
+        }
+        e.destroyed = true;
+        if opens == 0 {
+            DestroyOutcome::Release
+        } else {
+            self.counters.deferred = self.counters.deferred.saturating_add(1);
+            DestroyOutcome::Deferred { opens }
+        }
+    }
+
+    /// An `ATTACH_RESOURCE` of `resource_id` by `owner` (the escaping device's
+    /// token, 0 if none) of `process`. Only counts and classifies; refusing is the
+    /// caller's policy. The sanctioned routes are: the device that imported the
+    /// resource (before or after adoption), and any process that opened the
+    /// allocation that adopted it.
+    pub fn note_attach(&mut self, resource_id: u32, owner: u64, process: u64) -> AttachOutcome {
+        let Some(creator) = self.get(resource_id).map(|e| e.creator) else {
+            return AttachOutcome::NotForeign;
+        };
+        self.counters.attached = self.counters.attached.saturating_add(1);
+        let by_creator = owner != 0 && creator == Some(owner);
+        if by_creator || self.process_has_open(resource_id, process) {
+            AttachOutcome::Sanctioned
+        } else {
+            self.counters.attached_unsanctioned =
+                self.counters.attached_unsanctioned.saturating_add(1);
+            AttachOutcome::Unsanctioned
+        }
     }
 
     /// Count a request that never produced a reservation or a resource.
@@ -1523,5 +1831,364 @@ mod tests {
         let mut t = with_import();
         let _ = t.adopt_for_allocation(99, &req(), true, true);
         assert_eq!(t.counters().refused(), 1);
+    }
+
+    // ---- cross-process opens: the lifetime state machine ---------------------
+
+    const PROC_A: u64 = 0x1000;
+    const PROC_B: u64 = 0x2000;
+    const PROC_C: u64 = 0x3000;
+
+    /// Resource 50, imported by device 1 and adopted by an allocation.
+    fn adopted() -> ForeignTable {
+        let mut t = with_import();
+        assert!(matches!(adopt(&mut t, &req()), Ok(AdoptPlan::Foreign(_))));
+        t
+    }
+
+    #[test]
+    fn an_open_of_an_ordinary_resource_is_not_counted() {
+        let mut t = adopted();
+        assert_eq!(t.open(999, PROC_A), OpenOutcome::NotForeign);
+        assert_eq!(t.counters().opened, 0);
+        assert_eq!(t.counters().refused_open, 0);
+    }
+
+    #[test]
+    fn an_open_returns_the_recorded_size_and_layout() {
+        let mut t = adopted();
+        assert_eq!(
+            t.open(50, PROC_B),
+            OpenOutcome::Opened(Adopted {
+                size: 8 * MIB,
+                layout: lay(),
+            })
+        );
+        assert_eq!(t.opens(50), 1);
+        assert!(t.process_has_open(50, PROC_B));
+        assert!(!t.process_has_open(50, PROC_C));
+    }
+
+    #[test]
+    fn a_resource_nobody_adopted_cannot_be_opened() {
+        let mut t = with_import();
+        assert_eq!(
+            t.open(50, PROC_A),
+            OpenOutcome::Refused(OpenRefusal::NotAdopted)
+        );
+        assert_eq!(t.opens(50), 0);
+        assert_eq!(t.counters().refused_open, 1);
+        assert_eq!(t.counters().opened, 0);
+    }
+
+    #[test]
+    fn opens_are_counted_per_process_and_merge_into_one_row() {
+        let mut t = adopted();
+        for _ in 0..3 {
+            assert!(matches!(t.open(50, PROC_A), OpenOutcome::Opened(_)));
+        }
+        assert!(matches!(t.open(50, PROC_B), OpenOutcome::Opened(_)));
+        assert_eq!(t.opens(50), 4);
+        assert_eq!(t.open_refs_total(), 4);
+        assert_eq!(t.opens.len(), 2, "one row per (resource, process)");
+        // Closing is per process too: B cannot close A's opens.
+        assert_eq!(t.close(50, PROC_B), CloseOutcome::Kept);
+        assert_eq!(t.close(50, PROC_B), CloseOutcome::NoRow);
+        assert_eq!(t.opens(50), 3);
+        assert_eq!(t.counters().close_missed, 1);
+    }
+
+    #[test]
+    fn the_usual_order_closes_every_open_then_destroys_and_releases_once() {
+        let mut t = adopted();
+        let _ = t.open(50, PROC_A); // the creating device's own open
+        let _ = t.open(50, PROC_B); // DWM
+        assert_eq!(t.close(50, PROC_B), CloseOutcome::Kept);
+        assert_eq!(t.close(50, PROC_A), CloseOutcome::Kept);
+        assert_eq!(t.allocation_destroyed(50), DestroyOutcome::Release);
+        // A second destroy of the same allocation releases nothing.
+        assert_eq!(t.allocation_destroyed(50), DestroyOutcome::Repeat);
+        assert_eq!(t.counters().deferred, 0);
+        assert!(t.remove(50).is_some());
+    }
+
+    #[test]
+    fn a_destroy_with_an_opener_alive_defers_and_the_last_close_releases() {
+        let mut t = adopted();
+        let _ = t.open(50, PROC_A);
+        let _ = t.open(50, PROC_B);
+        // The creator's allocation is destroyed while DWM still has it open.
+        assert_eq!(
+            t.allocation_destroyed(50),
+            DestroyOutcome::Deferred { opens: 2 }
+        );
+        assert_eq!(t.orphans(), 1);
+        assert_eq!(t.counters().deferred, 1);
+        // A new open of a destroyed allocation is refused: nothing may take a
+        // new reference on a resource whose release is pending.
+        assert_eq!(
+            t.open(50, PROC_C),
+            OpenOutcome::Refused(OpenRefusal::Destroyed)
+        );
+        assert_eq!(t.close(50, PROC_A), CloseOutcome::Kept);
+        assert_eq!(t.orphans(), 1);
+        assert_eq!(t.close(50, PROC_B), CloseOutcome::Release);
+        assert_eq!(t.orphans(), 0);
+        assert_eq!(t.counters().deferred_released, 1);
+        // The caller removes the record; nothing releases it twice.
+        assert!(t.remove(50).is_some());
+        assert_eq!(t.close(50, PROC_B), CloseOutcome::Gone);
+        assert_eq!(t.allocation_destroyed(50), DestroyOutcome::Proceed);
+    }
+
+    #[test]
+    fn a_second_destroy_while_deferred_does_not_release() {
+        let mut t = adopted();
+        let _ = t.open(50, PROC_B);
+        assert!(matches!(
+            t.allocation_destroyed(50),
+            DestroyOutcome::Deferred { .. }
+        ));
+        assert_eq!(t.allocation_destroyed(50), DestroyOutcome::Repeat);
+        assert_eq!(t.counters().deferred, 1);
+        assert_eq!(t.close(50, PROC_B), CloseOutcome::Release);
+    }
+
+    #[test]
+    fn a_close_that_finds_no_row_never_releases() {
+        let mut t = adopted();
+        let _ = t.open(50, PROC_A);
+        assert!(matches!(
+            t.allocation_destroyed(50),
+            DestroyOutcome::Deferred { .. }
+        ));
+        // A stray close by a process that never opened it: counted, ignored, and
+        // above all not the "last close".
+        assert_eq!(t.close(50, PROC_C), CloseOutcome::NoRow);
+        assert_eq!(t.opens(50), 1);
+        assert_eq!(t.close(50, PROC_A), CloseOutcome::Release);
+        // After the last close the row is gone: a repeated close is not a release.
+        assert_eq!(t.close(50, PROC_A), CloseOutcome::NoRow);
+    }
+
+    #[test]
+    fn a_destroy_of_an_unadopted_or_unknown_resource_is_the_legacy_teardown() {
+        let mut t = with_import();
+        assert_eq!(t.allocation_destroyed(50), DestroyOutcome::Proceed);
+        assert!(!t.get(50).unwrap().destroyed);
+        assert_eq!(t.allocation_destroyed(77), DestroyOutcome::Proceed);
+    }
+
+    #[test]
+    fn removal_drops_the_open_rows_with_the_record() {
+        let mut t = adopted();
+        let _ = t.open(50, PROC_A);
+        let _ = t.open(50, PROC_B);
+        assert!(t.remove(50).is_some());
+        assert_eq!(t.opens(50), 0);
+        assert_eq!(t.opens.len(), 0);
+        // The sweep got there first: the opener's later close is "gone".
+        assert_eq!(t.close(50, PROC_A), CloseOutcome::Gone);
+        assert_eq!(t.open(50, PROC_A), OpenOutcome::NotForeign);
+    }
+
+    #[test]
+    fn the_open_table_is_bounded_and_never_grows() {
+        let mut t = ForeignTable::with_limits_and_rows(
+            Limits {
+                total: 4,
+                per_owner: 2,
+                bytes_per_owner: 64 * MIB,
+            },
+            3,
+        );
+        let r = t.reserve(1, 8 * MIB).unwrap();
+        t.commit(r, 50, 7, 3, 9, lay()).unwrap();
+        assert!(t.adopt(50));
+        let cap = t.opens.capacity();
+        assert!(cap >= 3);
+        for p in [PROC_A, PROC_B, PROC_C] {
+            assert!(matches!(t.open(50, p), OpenOutcome::Opened(_)));
+        }
+        assert_eq!(t.open(50, 0x4000), OpenOutcome::Refused(OpenRefusal::Rows));
+        // An existing process still can: it adds a count, not a row.
+        assert!(matches!(t.open(50, PROC_A), OpenOutcome::Opened(_)));
+        assert_eq!(t.opens.capacity(), cap);
+        assert_eq!(t.counters().refused_open, 1);
+        // Closing the last open of a row frees it for another process.
+        assert_eq!(t.close(50, PROC_B), CloseOutcome::Kept);
+        assert!(matches!(t.open(50, 0x4000), OpenOutcome::Opened(_)));
+    }
+
+    #[test]
+    fn open_refusals_are_in_the_total_and_have_distinct_codes() {
+        let mut t = with_import();
+        let _ = t.open(50, PROC_A);
+        assert_eq!(t.counters().refused(), 1);
+        let codes = [
+            OpenRefusal::NotAdopted.code(),
+            OpenRefusal::Destroyed.code(),
+            OpenRefusal::Rows.code(),
+        ];
+        assert!(codes.iter().all(|&c| c != 0));
+        assert!(codes[0] != codes[1] && codes[1] != codes[2] && codes[0] != codes[2]);
+    }
+
+    #[test]
+    fn an_attach_is_sanctioned_for_the_creator_and_for_openers_only() {
+        let mut t = with_import();
+        // Before adoption the importing device attaches (its own other contexts).
+        assert_eq!(t.note_attach(50, 1, PROC_A), AttachOutcome::Sanctioned);
+        assert_eq!(t.note_attach(50, 2, PROC_B), AttachOutcome::Unsanctioned);
+        assert!(t.adopt(50));
+        // After adoption the creator is gone from the record, so the creating
+        // device's own process needs its own open (dxgkrnl makes one).
+        assert_eq!(t.note_attach(50, 1, PROC_A), AttachOutcome::Unsanctioned);
+        let _ = t.open(50, PROC_A);
+        let _ = t.open(50, PROC_B);
+        assert_eq!(t.note_attach(50, 1, PROC_A), AttachOutcome::Sanctioned);
+        assert_eq!(t.note_attach(50, 9, PROC_B), AttachOutcome::Sanctioned);
+        assert_eq!(t.note_attach(50, 9, PROC_C), AttachOutcome::Unsanctioned);
+        // A caller with no device token and no process is never sanctioned.
+        assert_eq!(t.note_attach(50, 0, 0), AttachOutcome::Unsanctioned);
+        // Not a foreign resource: untouched, uncounted.
+        assert_eq!(t.note_attach(999, 1, PROC_A), AttachOutcome::NotForeign);
+        let c = t.counters();
+        assert_eq!((c.attached, c.attached_unsanctioned), (7, 4));
+        // A closed open stops sanctioning.
+        assert_eq!(t.close(50, PROC_B), CloseOutcome::Kept);
+        assert_eq!(t.note_attach(50, 9, PROC_B), AttachOutcome::Unsanctioned);
+    }
+
+    /// The state machine against a reference model, over a long pseudo-random
+    /// interleaving of opens, closes and destroys of a few resources by a few
+    /// processes. The invariants the KMD relies on:
+    ///   * a `Release` never happens while the model has an open;
+    ///   * a `Release` never happens before the destroy;
+    ///   * every resource is released exactly once, as soon as it has been
+    ///     destroyed and its opens have drained (never later, never twice).
+    #[test]
+    fn release_happens_exactly_once_after_the_last_of_destroy_and_close() {
+        const RES: usize = 4;
+        const PROCS: u64 = 3;
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _round in 0..200 {
+            let mut t = ForeignTable::with_limits(Limits {
+                total: 8,
+                per_owner: 8,
+                bytes_per_owner: 64 * MIB,
+            });
+            for i in 0..RES as u32 {
+                let r = t.reserve(1, MIB).unwrap();
+                t.commit(r, 100 + i, 7, 3, 9 + i, lay_for(MIB)).unwrap();
+                assert!(t.adopt(100 + i));
+            }
+            // Model: open counts per (resource, process), destroyed, releases.
+            let mut model_opens = [[0u32; PROCS as usize]; RES];
+            let mut destroyed = [false; RES];
+            let mut releases = [0u32; RES];
+            for _step in 0..60 {
+                let r = (next() % RES as u64) as usize;
+                let p = (next() % PROCS) as usize;
+                let id = 100 + r as u32;
+                let proc_id = 0x1000 * (p as u64 + 1);
+                let total: u32 = model_opens[r].iter().sum();
+                match next() % 4 {
+                    0 | 1 => {
+                        let out = t.open(id, proc_id);
+                        if destroyed[r] {
+                            assert_eq!(out, OpenOutcome::Refused(OpenRefusal::Destroyed));
+                        } else {
+                            assert!(matches!(out, OpenOutcome::Opened(_)));
+                            model_opens[r][p] += 1;
+                        }
+                    }
+                    2 => {
+                        let out = t.close(id, proc_id);
+                        if model_opens[r][p] == 0 {
+                            assert!(matches!(out, CloseOutcome::NoRow | CloseOutcome::Gone));
+                        } else {
+                            model_opens[r][p] -= 1;
+                            let left: u32 = model_opens[r].iter().sum();
+                            if destroyed[r] && left == 0 {
+                                assert_eq!(out, CloseOutcome::Release);
+                                releases[r] += 1;
+                            } else {
+                                assert_eq!(out, CloseOutcome::Kept);
+                            }
+                        }
+                    }
+                    _ => {
+                        let out = t.allocation_destroyed(id);
+                        if destroyed[r] {
+                            assert!(matches!(
+                                out,
+                                DestroyOutcome::Repeat | DestroyOutcome::Proceed
+                            ));
+                        } else {
+                            destroyed[r] = true;
+                            if total == 0 {
+                                assert_eq!(out, DestroyOutcome::Release);
+                                releases[r] += 1;
+                            } else {
+                                assert_eq!(out, DestroyOutcome::Deferred { opens: total });
+                            }
+                        }
+                    }
+                }
+                for k in 0..RES {
+                    assert!(releases[k] <= 1, "released twice");
+                    assert_eq!(t.opens(100 + k as u32), model_opens[k].iter().sum::<u32>());
+                    if releases[k] == 1 {
+                        // Released implies destroyed and drained.
+                        assert!(destroyed[k]);
+                        assert_eq!(model_opens[k].iter().sum::<u32>(), 0);
+                    }
+                }
+            }
+            // Drain: close everything, destroy what is left. Every resource ends
+            // with exactly one release.
+            for r in 0..RES {
+                let id = 100 + r as u32;
+                for p in 0..PROCS as usize {
+                    while model_opens[r][p] > 0 {
+                        let out = t.close(id, 0x1000 * (p as u64 + 1));
+                        model_opens[r][p] -= 1;
+                        let left: u32 = model_opens[r].iter().sum();
+                        if destroyed[r] && left == 0 {
+                            assert_eq!(out, CloseOutcome::Release);
+                            releases[r] += 1;
+                        } else {
+                            assert_eq!(out, CloseOutcome::Kept);
+                        }
+                    }
+                }
+                if !destroyed[r] {
+                    assert_eq!(t.allocation_destroyed(id), DestroyOutcome::Release);
+                    releases[r] += 1;
+                }
+                assert_eq!(releases[r], 1, "resource {r}");
+            }
+            assert_eq!(t.orphans(), 0);
+            assert_eq!(t.open_refs_total(), 0);
+        }
+    }
+
+    /// A layout that fits `size` bytes (1080p linear needs 0x7e9000).
+    fn lay_for(size: u64) -> Layout {
+        let l = Layout {
+            width: 64,
+            height: 64,
+            stride: 256,
+            ..lay()
+        };
+        assert!(l.min_bytes() <= size);
+        l
     }
 }
