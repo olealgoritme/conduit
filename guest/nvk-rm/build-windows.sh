@@ -122,7 +122,15 @@ PKG_CONFIG_LIBDIR=$pcdir
 export PKG_CONFIG_LIBDIR
 
 cd "$MESA_DIR"
-if [ ! -f "$BUILD_DIR/build.ninja" ]; then
+# Release: -O3, no C asserts (an assert is a dialog box on Windows), NAK
+# (Rust) without debug assertions and overflow checks.  BUILDTYPE=
+# debugoptimized for debugging.
+BUILDTYPE=${BUILDTYPE:-release}
+if [ "$BUILDTYPE" = release ]; then NDEBUG=true; else NDEBUG=false; fi
+if [ -f "$BUILD_DIR/build.ninja" ]; then
+  # Build directories from older versions of this script were debugoptimized
+  "$MESON" configure "$BUILD_DIR" -Dbuildtype="$BUILDTYPE" -Db_ndebug="$NDEBUG"
+else
   # shellcheck disable=SC2086
   "$MESON" setup "$BUILD_DIR" --cross-file "$cross" \
     -Dvulkan-drivers=nouveau -Dnvk-rm=enabled -Dgallium-drivers= \
@@ -133,7 +141,7 @@ if [ ! -f "$BUILD_DIR/build.ninja" ]; then
     -Dgles1=disabled -Dgles2=disabled \
     -Dshader-cache=disabled -Dzlib=disabled -Dzstd=disabled -Dexpat=disabled \
     -Dxmlconfig=disabled -Dperfetto=false -Dbuild-tests=false \
-    -Dbuildtype=debugoptimized \
+    -Dbuildtype="$BUILDTYPE" -Db_ndebug="$NDEBUG" \
     $MESON_ARGS
 fi
 capped ninja -C "$BUILD_DIR" -j"$JOBS" \
@@ -142,7 +150,7 @@ capped ninja -C "$BUILD_DIR" -j"$JOBS" \
 
 # 5. Stage: the DLLs, an ICD manifest pointing next to itself, imports/exports
 mkdir -p "$OUT_DIR"
-# Stripped copies (debugoptimized vulkan_nouveau.dll is ~140 MB with DWARF,
+# Stripped copies (a debugoptimized vulkan_nouveau.dll is ~140 MB with DWARF,
 # ~18 MB without); the unstripped DLLs stay in the build directories.
 "$tool-strip" -o "$OUT_DIR/vulkan_nouveau.dll" "$BUILD_DIR/src/nouveau/vulkan/vulkan_nouveau.dll"
 "$tool-strip" -o "$OUT_DIR/librmclient.dll" "$rmc/librmclient.dll"

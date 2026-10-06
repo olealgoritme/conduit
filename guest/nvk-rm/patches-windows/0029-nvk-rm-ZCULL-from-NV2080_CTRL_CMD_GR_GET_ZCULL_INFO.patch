@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 03:37:53 +0200
+Subject: [PATCH 29/29] nvk/rm: ZCULL from NV2080_CTRL_CMD_GR_GET_ZCULL_INFO
+
+has_zcull_info was false, so NVK never enabled ZCULL and depth-tested
+overdraw paid for every hidden fragment in the ZROP.  Fill
+nv_zcull_device_info from the control nouveau's GET_ZCULL_INFO wraps;
+NVK places and manages each depth image's ZCULL storage itself.
+NVK_RM_ZCULL=0 turns it off; NVK_DEBUG=vm prints it.
+
+RTX 5090, 2560x1440, 32 depth-tested fullscreen layers front to back:
+0.243 ms -> 0.072 ms (NVIDIA: 0.071 ms).  Rendered images are identical,
+also with other processes rendering depth on the GPU at the same time.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c | 31 +++++++++++++++++++--
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h | 16 +++++++++++
+ 2 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index 41ff10e..80c7485 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -280,7 +280,32 @@ fill_device_info(struct nvkmd_rm_pdev *pdev,
+    /* Not exposed in the first cut */
+    info->has_transfer_queue = false;
+    info->has_video = false;
++
++   /* ZCULL: the same numbers nouveau's DRM_NOUVEAU_GET_ZCULL_INFO passes on
++    * from this control.  NVK keeps each depth image's ZCULL storage next to
++    * it and manages regions itself; ctxsw_size/align are not used by NVK.
++    */
+    info->has_zcull_info = false;
++   NV2080_CTRL_GR_GET_ZCULL_INFO_PARAMS zcull = { 0 };
++   if (debug_get_bool_option("NVK_RM_ZCULL", true) &&
++       lib->control(client, pdev->h_subdevice,
++                    NV2080_CTRL_CMD_GR_GET_ZCULL_INFO,
++                    &zcull, sizeof(zcull)) == 0 &&
++       zcull.aliquotTotal != 0) {
++      info->zcull_info = (struct nv_zcull_device_info) {
++         .width_align_pixels = zcull.widthAlignPixels,
++         .height_align_pixels = zcull.heightAlignPixels,
++         .pixel_squares_by_aliquots = zcull.pixelSquaresByAliquots,
++         .aliquot_total = zcull.aliquotTotal,
++         .zcull_region_byte_multiplier = zcull.zcullRegionByteMultiplier,
++         .zcull_region_header_size = zcull.zcullRegionHeaderSize,
++         .zcull_subregion_header_size = zcull.zcullSubregionHeaderSize,
++         .subregion_count = zcull.subregionCount,
++         .subregion_width_align_pixels = zcull.subregionWidthAlignPixels,
++         .subregion_height_align_pixels = zcull.subregionHeightAlignPixels,
++      };
++      info->has_zcull_info = true;
++   }
+ 
+    nouveau_ws_device_info_init_limits(info);
+ 
+@@ -399,7 +424,7 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+       fprintf(stderr, "NVK: RM GPU %u: %s (%s, chipset 0x%x) 3d %04x "
+               "compute %04x copy %04x gpfifo %04x usermode %04x "
+               "vram %" PRIu64 " MiB, bar heap %" PRIu64 " MiB, "
+-              "%u GPCs, %u TPCs\n",
++              "%u GPCs, %u TPCs, zcull %s (%u aliquots)\n",
+               pdev->gpu_id, pdev->base.dev_info.device_name,
+               pdev->base.dev_info.chipset_name,
+               pdev->base.dev_info.chipset, pdev->base.dev_info.cls_eng3d,
+@@ -407,7 +432,9 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+               pdev->base.dev_info.cls_gpfifo, pdev->cls_usermode,
+               pdev->base.dev_info.vram_size_B >> 20,
+               pdev->base.dev_info.bar_size_B >> 20,
+-              pdev->base.dev_info.gpc_count, pdev->base.dev_info.tpc_count);
++              pdev->base.dev_info.gpc_count, pdev->base.dev_info.tpc_count,
++              pdev->base.dev_info.has_zcull_info ? "yes" : "no",
++              pdev->base.dev_info.zcull_info.aliquot_total);
+    }
+ 
+    *pdev_out = &pdev->base;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+index 66f4b2f..51a66b9 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -482,6 +482,22 @@ typedef struct NV0080_CTRL_GR_GET_INFO_V2_PARAMS {
+ typedef NV0080_CTRL_GR_GET_INFO_V2_PARAMS NV2080_CTRL_GR_GET_INFO_V2_PARAMS;
+ 
+ #define NV2080_CTRL_CMD_GR_GET_INFO_V2                    (0x20801228U)
++
++#define NV2080_CTRL_CMD_GR_GET_ZCULL_INFO                 (0x20801206U)
++typedef struct NV2080_CTRL_GR_GET_ZCULL_INFO_PARAMS {
++   NvU32 widthAlignPixels;
++   NvU32 heightAlignPixels;
++   NvU32 pixelSquaresByAliquots;
++   NvU32 aliquotTotal;
++   NvU32 zcullRegionByteMultiplier;
++   NvU32 zcullRegionHeaderSize;
++   NvU32 zcullSubregionHeaderSize;
++   NvU32 subregionCount;
++   NvU32 subregionWidthAlignPixels;
++   NvU32 subregionHeightAlignPixels;
++} NV2080_CTRL_GR_GET_ZCULL_INFO_PARAMS;
++static_assert(sizeof(NV2080_CTRL_GR_GET_ZCULL_INFO_PARAMS) == 40,
++              "NV2080_CTRL_GR_GET_ZCULL_INFO_PARAMS");
+ #define NV2080_CTRL_GR_INFO_INDEX_SHADER_PIPE_SUB_COUNT   (0x00000009)
+ #define NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_GPCS         (0x00000014)
+ 

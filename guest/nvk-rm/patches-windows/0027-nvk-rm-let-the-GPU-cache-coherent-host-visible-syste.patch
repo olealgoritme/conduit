@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 03:37:52 +0200
+Subject: [PATCH 27/29] nvk/rm: let the GPU cache coherent host-visible system
+ memory in L2
+
+RM maps system memory GPU-uncached unless asked otherwise, so every GPU
+read of host-visible memory crossed PCIe.  NVIDIA's driver lets L2 cache
+it; DXVK keeps dynamic vertex, index and constant buffers there.
+
+Map GART|COHERENT memory (Vulkan host-visible memory types) with
+NVOS46_FLAGS_GPU_CACHEABLE_YES and start every submit with an L2 sysmem
+invalidate after its semaphore waits.  Rings, semaphores, query reports,
+pushbuffers and shared memory stay uncached.  NVK_RM_SYSMEM_CACHED=0
+restores the old mapping.
+
+RTX 5090, 2000 draws of a 2k-triangle mesh with a dynamic UBO each:
+  UBO in system memory:          5.04 ms -> 0.22 ms (NVIDIA: 0.23 ms)
+  vertices + UBO in system mem: 47.5 ms  -> 0.85 ms (NVIDIA: 0.86 ms)
+  2M-triangle mesh in sysmem:   16.3 ms  -> 10.0 ms (NVIDIA: 9.8 ms)
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  6 ++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c  | 32 +++++++++++++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  |  2 ++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c  | 19 ++++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c   |  2 ++
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h |  8 ++++++
+ 6 files changed, 69 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 5751e9a..a2c477b 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -209,6 +209,9 @@ struct nvkmd_rm_dev {
+    struct nvrm_crm_scanout_source source;
+ #endif
+ 
++   /* Map coherent host-visible system memory GPU-cacheable */
++   bool sysmem_cached;
++
+    simple_mtx_t heap_mutex;
+    struct util_vma_heap heap;
+    struct util_vma_heap replay_heap;
+@@ -241,6 +244,9 @@ struct nvkmd_rm_mem {
+    /* Placement actually used */
+    bool vram;
+ 
++   /* System memory the GPU may keep in L2 (see nvkmd_rm_alloc_tiled_mem) */
++   bool gpu_cached;
++
+    /* For memory backed by our own pages (NV01_MEMORY_SYSTEM_OS_DESCRIPTOR),
+     * the CPU mapping is the allocation itself.
+     */
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index 4c1dc38..16ed858 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -360,6 +360,31 @@ nvkmd_rm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+    return check_channel_error(ctx, log_obj);
+ }
+ 
++/* Drops clean system-memory lines from L2, so the GPU sees what the CPU
++ * wrote to GPU-cacheable system memory before this submit.
++ */
++static VkResult
++emit_l2_sysmem_invalidate(struct nvkmd_rm_exec_ctx *ctx,
++                          struct vk_object_base *log_obj)
++{
++   VkResult result = wait_ring_space(ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const uint32_t slot = ctx->put;
++   uint32_t *p = ctx->push_slots + slot * NVKMD_RM_PUSH_SLOT_DW;
++   uint32_t dw = 0;
++   p[dw++] = host_mthd_incr(NVRM_GPFIFO_MEM_OP_A, 4);
++   p[dw++] = 0;
++   p[dw++] = 0;
++   p[dw++] = 0;
++   p[dw++] = NVRM_DEF(RM_GPFIFO, _MEM_OP_D, _OPERATION, _L2_SYSMEM_INVALIDATE);
++
++   return push_gpfifo_entry(ctx, log_obj,
++                            ctx->push_slots_va + slot * NVKMD_RM_PUSH_SLOT_B,
++                            dw * 4, false);
++}
++
+ static VkResult
+ nvkmd_rm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+                        struct vk_object_base *log_obj,
+@@ -372,6 +397,13 @@ nvkmd_rm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   /* After the waits: what the CPU wrote before signaling them counts too */
++   if (nvkmd_rm_dev(_ctx->dev)->sysmem_cached) {
++      result = emit_l2_sysmem_invalidate(ctx, log_obj);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
+    /* All entries of a submit are written before GP_PUT moves, so an
+     * "incomplete" push is simply followed by the next entry.
+     */
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index ea123cf..dd10c4a 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -9,6 +9,7 @@
+ #include <inttypes.h>
+ #include "util/log.h"
+ #include "util/os_time.h"
++#include "util/u_debug.h"
+ #include "util/u_math.h"
+ #include "vk_log.h"
+ 
+@@ -124,6 +125,7 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+ #ifdef _WIN32
+    simple_mtx_init(&dev->drm_mutex, mtx_plain);
+ #endif
++   dev->sysmem_cached = debug_get_bool_option("NVK_RM_SYSMEM_CACHED", true);
+ 
+    list_inithead(&dev->base.mems);
+    simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 4fbad77..1f050e4 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -34,6 +34,21 @@
+  *    the host and a slot in the shared window, so apps that map and unmap
+  *    per frame must not pay for it each time.  The heap's size,
+  *    dev_info.bar_size_B, is enforced here.
++ *
++ * GPU caching of system memory
++ *
++ * RM maps system memory GPU-uncached (volatile) by default, so every GPU
++ * read of it crosses PCIe, even the sixth read of the same vertex.  NVIDIA's
++ * own driver lets L2 cache the host-visible memory applications get; DXVK
++ * keeps dynamic vertex, index and constant buffers there, and uncached they
++ * are 20-60x slower to draw from.  Coherent host-visible memory types
++ * (GART | COHERENT, i.e. VkDeviceMemory) are therefore mapped GPU-cacheable,
++ * and every submit starts with an L2 sysmem invalidate (nvkmd_rm_ctx.c) so
++ * CPU writes made before it are seen.  Within a command buffer NVK already
++ * invalidates for host-to-device barriers.  Memory the GPU polls or fetches
++ * commands from (rings, semaphores, query reports, pushbuffers: all
++ * allocated without NVKMD_MEM_COHERENT) and shared memory stay uncached.
++ * NVK_RM_SYSMEM_CACHED=0 turns this off.
+  */
+ 
+ static bool
+@@ -202,6 +217,9 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+     */
+    const bool force_rm_sysmem = (flags & NVKMD_RM_MEM_RM_SYSMEM) ||
+                                 (flags & NVKMD_MEM_SHARED);
++   const bool gpu_cacheable = (flags & NVKMD_MEM_GART) &&
++                              (flags & NVKMD_MEM_COHERENT) &&
++                              !force_rm_sysmem && dev->sysmem_cached;
+    flags &= ~NVKMD_RM_MEM_RM_SYSMEM;
+ 
+    /* Kinds are applied per mapping (the image's own VA).  The layout is only
+@@ -278,6 +296,7 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+       goto fail_bar;
+ 
+    mem->vram = vram;
++   mem->gpu_cached = !vram && gpu_cacheable;
+    mem->pte_kind = pte_kind;
+    mem->tile_mode = tile_mode;
+    simple_mtx_init(&mem->export_mutex, mtx_plain);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+index 49ef5ac..e43b3dc 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_va.c
+@@ -363,6 +363,8 @@ nvkmd_rm_va_bind_mem(struct nvkmd_va *_va,
+    } else {
+       flags |= NVRM_DEF(OS46, _FLAGS, _PAGE_SIZE, _4KB) |
+                NVRM_DEF(OS46, _FLAGS, _CACHE_SNOOP, _ENABLE);
++      if (mem->gpu_cached)
++         flags |= NVRM_DEF(OS46, _FLAGS, _GPU_CACHEABLE, _YES);
+    }
+ 
+    uint32_t kind = 0;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+index 0ca3e34..7e009b0 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -178,6 +178,8 @@ typedef NvU32 NvHandle;
+ #define NVOS46_FLAGS_DMA_OFFSET_FIXED_TRUE        (0x00000001)
+ #define NVOS46_FLAGS_GPU_CACHEABLE                18:17
+ #define NVOS46_FLAGS_GPU_CACHEABLE_DEFAULT        (0x00000000)
++#define NVOS46_FLAGS_GPU_CACHEABLE_YES            (0x00000001)
++#define NVOS46_FLAGS_GPU_CACHEABLE_NO             (0x00000002)
+ #define NVOS46_FLAGS_PAGE_KIND_OVERRIDE           19:19
+ #define NVOS46_FLAGS_PAGE_KIND_OVERRIDE_NO        (0x00000000)
+ #define NVOS46_FLAGS_PAGE_KIND_OVERRIDE_YES       (0x00000001)
+@@ -543,6 +545,12 @@ typedef struct NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS {
+ #define NVRM_GPFIFO_GP_ENTRY1_SYNC_WAIT           0x00000001
+ 
+ #define NVRM_GPFIFO_NON_STALL_INTERRUPT           (0x00000020)
++#define NVRM_GPFIFO_MEM_OP_A                      (0x00000028)
++#define NVRM_GPFIFO_MEM_OP_B                      (0x0000002c)
++#define NVRM_GPFIFO_MEM_OP_C                      (0x00000030)
++#define NVRM_GPFIFO_MEM_OP_D                      (0x00000034)
++#define NVRM_GPFIFO_MEM_OP_D_OPERATION                    31:27
++#define NVRM_GPFIFO_MEM_OP_D_OPERATION_L2_SYSMEM_INVALIDATE 0x0000000e
+ #define NVRM_GPFIFO_SEM_ADDR_LO                   (0x0000005c)
+ #define NVRM_GPFIFO_SEM_ADDR_HI                   (0x00000060)
+ #define NVRM_GPFIFO_SEM_PAYLOAD_LO                (0x00000064)
