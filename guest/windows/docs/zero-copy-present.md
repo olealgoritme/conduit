@@ -3064,3 +3064,139 @@ rotation), `RdIss == RdRet` after a quiescent run, and, with `KmdRmClient` 5 and
 frame edge `RmSysEdBlt` / `RmSysEdWBlt` (the per-edge counters of `sysmem_flip`) move with `BltAsync` 1 as they do with 0. Two
 Heaven windows at once, one of them slowed by a heavy producer, with `BltLookahead` 1 and 4: the other window's frame rate
 should stop following the slow one's at 4 (`BltLookN` > 0).
+
+## 25. Wrong buffer on scanout after a device restart (v337 incident; identity fix, StopDevice unbind)
+
+### 25.1 The incident
+
+Win11 tester, KMD v337 (`ForeignFlip` 1, `FlipAnnForeign` 1, NVK DWM), after `pnputil /restart-device` with `BltNoMirror` 1 and a plain
+windowed Heaven: the viewer showed a wrong buffer, a 512x512-ish block of noise on the left, then a texture atlas of desktop icons
+(Outlook, Store, Settings, Xbox) on black. KMD read at the time: `FfProg` 0, `FfNoRec` 0, `FlipIss` 0, `SaLo` 0xC4180000, `VpLpa`
+0xC0590000. Earlier in the same session (same restart, no Blt knobs, `HELIOS_NVK_RM_FENCE_PRESENT` 1 on Heaven) Heaven failed to load
+(D3D11 out of memory on a 2048x2048 DXT1/ATI2 texture); a later plain Heaven ran. Host backend log, per transport generation: DWM was
+the SAME process (pid 13220) across all three restarts. Before the first restart `gpu_cmd` 352613 and `scanout_flip` 260689; in the
+generations after it `gpu_cmd` 11 and `scanout_flip` 7 to 9 over minutes, with `ioctl` 9682 then 194739 and `open` 9620 / `close`
+9681: the long-lived NVK clients reconnected in a loop and never got a working RM client again. The viewer therefore kept whatever it
+had last been given while the guest's new generation reused small ids.
+
+Not read from a dump (none was taken at the moment); everything below is from the code, with the counters that decide it.
+
+### 25.2 What the numbers already say
+
+* `FlipIss` 0 and `FfProg` 0 together: no flip of this generation had been issued or taken by the foreign arm. `SaLo` is also written
+  by `pacing_publish` from `last_primary_address` (`adapter/scanout.rs:756`), which after a restart is the RestSeed (section 20.3a):
+  the address of the PREVIOUS image's newest flip. So `SaLo` 0xC4180000 is most likely that seed and not a flip of this generation.
+  `VpLpa` (`ddi/scanout_trace.rs:915`) is a service-key value and survives an image reload until it is rewritten, so a `VpLpa` that
+  differs from `SaLo` is expected and is not by itself evidence of two programmed sources. Read both with `StartN` and `StartT`.
+* `gpu_cmd` 11 means the NVK processes were not rendering at all: nothing new was presented, so the viewer's last picture was the
+  only content. A wrong picture then needs an old binding or a flip naming a stale object.
+
+### 25.3 Ranked hypotheses
+
+**R1 (certain defect, fixed): the NVRM epoch repeats across an image reload, so surviving NVK clients never learn the device was
+lost.** `HeliosNvrmHeader.epoch` is `VirtioGpu::nvrm_epoch()` (`virtio/gpu/nvrm_tables.rs`), which was the bare `wire_fence_base`,
+taken from `NEXT_WIRE_FENCE_BASE` (`virtio/gpu/mod.rs:1765`), a STATIC that starts at 1. `pnputil /restart-device` reloads the image
+(`StartN` 1), so every image's first transport had epoch 1. The client contract (`helios_nvrm_reply_is_lost`,
+`guest/rmclient/src/helios_nvrm_escape.h:488`) is: a reply whose epoch differs from the one QUERY_CAPS gave at init means the device
+is lost, latch it, answer `-ENODEV` from then on, and the process reopens once. With equal epochs nothing latched. The processes kept
+their device (DWM's librmclient device is a private `D3DKMTCreateDevice` that lives until the process exits), their RM client, file
+and GEM numbers of the old generation, and used them against the new generation's empty tables:
+
+* `Ioctl` / `Close` / `ScanoutFlip` of an old handle: header status `NOT_OWNED` (1), librmclient errno `EBADF` (`owned()`,
+  `virtio/nvrm.rs:239`; the handle tables are per transport and empty). There is no other status for "an owner of an older
+  generation": owners are not registered at CreateDevice, they appear at their first `Open` (`reserve_nvrm_handle_slot`).
+* `Open`: succeeds (a fresh slot) and returns a handle number the new generation hands out from the start. Handle numbers, RM
+  client ids and GEM numbers therefore RESTART and collide with the stale ones a client still believes it holds. That is the
+  `open` 9620 / `close` 9681 / `ioctl` 194739 storm, and it is also how a stale `ScanoutFlip { owner_handle, host_handle }` can name a
+  live DRM file of the new generation and a GEM number that is now another object of the same process (DWM's own icon atlas):
+  the `MSG_SCANOUT_FLIP` arm (`virtio/nvrm.rs:444`) checks only that `owner_handle` is the caller's and a DRM node.
+* There IS a clean "device lost" signal and it is the epoch itself: `TRANSPORT_RESET` (4) is produced only by `EVENT_REGISTER`;
+  `STATUS_DEVICE_NOT_READY` only by the event ops with no transport; `STATUS_DEVICE_REMOVED` only when the adapter is removed.
+  `helios_nvrm_reply_is_lost` and `helios_nvrm_ntstatus_is_lost` treat a different epoch, `TRANSPORT_RESET`, 0xC00000A3 and 0xC00002B6
+  as fatal for the process. The in-tree header carries the rules; the transport that applies them (`transport_windows.c`) is on the
+  librmclient branch `rmc/transport-loss` (`nvrm-escape.md` section 9). A librmclient without it still loops.
+
+Fix (next build, `kmd_logic::generation_id`): the epoch is `(image_salt << 24) | generation index`, the salt being the interrupt time in
+~0.1 s units read once per image (`adapter::image_salt`), never 0. The first reply of a surviving client now differs from its init
+epoch and it takes the loss path once. Predicts: `GenEpoch` (low 32 bits, written at every StartDevice) differs between restarts;
+`NvRef` (NOT_OWNED refusals) no longer climbs by thousands after a restart; host `open` / `ioctl` per generation stays small.
+
+**R2 (certain defect, fixed; reachable only if dxgkrnl kept allocation handles across the reload): the allocation serial repeats the
+same way.** `TRANSPORT_SERIAL` (`adapter/mod.rs:511`) is a static starting at 0, so each image's first generation had serial 1.
+`resolve_current_alloc` (`ddi/create_allocation.rs:768`, `paging::alloc_is_current`) refuses an allocation whose `serial` differs from
+the current generation's: after a reload an older image's allocation compared EQUAL. `scanout_alloc_info`
+(`ddi/create_allocation.rs:1230`) then returned its `resource_id` as the primary's, and the direct arm
+(`ScanoutTarget::from_direct_primary`, `ddi/display.rs:3551`) bound and flushed that id: a resource id of the old generation that names
+a different live resource of the new one (ids restart at 1). The host accepts it when its size covers the layout
+(`SET_SCANOUT_BLOB` checks in `host/backend/device/src/venus/scanout.rs:138-146`: an icon atlas of 4096x4096 RGBA covers a 5120x1440
+stride, and the noise block is the same bytes read with the wrong stride). Fixed by the same salt (`transport_serial`). Predicts: a
+stale handle in use after a restart with `FkGen` 0 and `PgStale` 0 (both stay 0 while the serials collide; with the fix they count).
+Not provable without a dump of `ScRid` and the allocation's `resource_id`; the defect is certain, its role in this incident is not.
+
+**R3 (certain gap, fixed for the Venus bind): StopDevice never turned the host's scanout binding off.** `dxgkddi_stop_device`
+(`ddi/lifecycle.rs`) calls `reset_display_publication_state` (`adapter/mod.rs:1378`), which only zeroes the guest's views
+(`host_bound_scanout_resource`, `active_scanout_*`), then drops the transport. The host's device reset (`Venus::reset`,
+`host/backend/device/src/venus/mod.rs:469`) calls `release(window, None, tell)`: with `display` None the scanout is forgotten but
+`link.disable()` (`venus/mod.rs:443`) is not run, and `teardown_scanout` (`nvidia/scanout.rs:183`) only clears the dma-buf cache; the
+viewer window "keeps the last frame" (`display.rs:2015-2019`). So after a restart the viewer shows the old generation's last image
+until a flip of the new one arrives, and in the incident none did. New: `stop_unbind_scanout` (`ddi/lifecycle.rs`, before the reset,
+inside the StopDevice budget) sends `SET_SCANOUT_BLOB` with resource 0 (`ctrl::disable_scanout_within`) when the guest's host-bound id
+or the host's last accepted bind names a resource. Predicts: `StopUnbSt` 1 after every restart that had a Venus-bound desktop.
+Limits: a desktop shown by a `ScanoutFlip` (`ForeignFlip`, the KMD RM client) has no Venus binding, so SET_SCANOUT 0 finds nothing to
+disable on the host (`venus/scanout.rs:111-117` disables only a scanout that was set). The host does have a `ScanoutDisable`
+message (`nvidia/scanout.rs`, `handle_scanout_disable`) that nothing in the guest sends yet: that is the follow-up for ForeignFlip,
+and the host side (`Venus::reset` / `teardown_scanout` calling `disable` on a reset) is the other half. Both are outside this tree.
+
+**R4 (open, low): a fresh adapter-owned LINEAR scanout target shown before its first copy.** `production_linear_scanout`
+(`ddi/display.rs:69-149`) allocates a new blob in the new generation and nothing clears it; uninitialised device memory showing
+earlier contents (noise and an icon atlas are what freed texture memory looks like) would look like the incident. The flush is
+supposed to follow the copy's completion (`queue_active_scanout_refresh` docs), and `gpu_cmd` 11 says no copy ran, so it is possible
+only if something flushed without the copy. Decided by: `ScRid` equal to `CpRid` (the dedicated target), `CpErr`, and the flush
+histogram (`FfR<n>` / `FfC<n>` / `FfTot`, `FLUSH_HISTOGRAM`, `ddi/scanout_trace.rs:310`) naming a resource id that is not the one
+`ScRid` bound.
+
+**R5 (refuted by construction): `BltAsync` / `BltNoMirror`.** The deferred queue (`virtio/gpu/blt_async.rs:241`) dies with the
+transport and the knobs are read again at every start (`ddi/blt_async.rs:127`); the system-copy invalid marks and system-backing
+leases are cleared at stop (`reset_system_backings`, `adapter/mod.rs:1843`, called from StopDevice); the Blt arm only writes the
+destination's backing and its RM sysmem image and never issues a SET_SCANOUT or a flush. It cannot make the host show another
+resource. `BltNoMirror` 1 was merely a knob set in the run.
+
+**The RestSeed arm (the issue's H1 tail)**: confirmed harmless. `RestSeed` seeds `last_primary_address` only (`adapter/mod.rs:1442`,
+`:1510`, `restart_flip::seed_address`); it is read by the heartbeat and by `same_active_identity` (`ddi/display.rs:3575`, which also
+requires `already_bound`, false after the reset). No bind or flush takes an id from it: `queue_active_scanout_refresh_locked` flushes
+only `active_scanout_resource`, which `reset_display_publication_state` zeroes and only a bind of THIS generation sets.
+
+### 25.4 The Heaven out-of-memory (row A), briefly
+
+Nothing in the KMD returns a D3D "out of memory" for the texture create by itself; the candidates are (a) the 32-bit process's own
+address space (x86 Heaven at 1.6 GB private bytes) and (b) a KMD refusal that surfaces as `STATUS_NO_MEMORY` from a CreateAllocation or
+as `NO_RESOURCES` / `EMFILE` from an NVRM `MMAP`. Read, in this order, after a repro: `NvWinRFull` (window full), `NvWinRRes` (the
+256 MiB reserve), `NvWinRBig` (one map larger than the window), `NvWinRAddr` (user address space: the x86 process limit), `NvWinRTab`
+(mapping table), `NvWinRHost` with `NvWinHErrno` (the host refused); `NvMapTRef` (mapping-table bound), `NvHdlLive` / `NvHdlPeak` /
+`NvHdlCap` / `NvHdlORef` / `NvHdlFRef` / `NvHdlGRef` (handle table), `CrPrivSmall` (CreateAllocation private data too small: a
+UMD/KMD mismatch, not memory), `ShPhFail` (shared physical backing). Row A was also the first load after a restart, so R1 (a surviving
+client or shell process looping on stale handles and consuming handle and window quota) is a better explanation than a limit:
+`NvWinUseMb` / `NvHdlLive` high with `gpu_cmd` near 0 would say so.
+
+### 25.5 Breadcrumbs for the next occurrence
+
+New: `GenSalt`, `GenSerial`, `GenEpoch` (StartDevice: the image salt, the allocation serial and the NVRM epoch, low 32 bits);
+`StopUnbGst` (the guest's host-bound resource at the stop), `StopUnbAct` (its active resource), `StopUnbHst` (the host's last accepted
+bind), `StopUnbSt` (0 nothing bound, 1 disabled, 2 refused or failed, 3 no budget left). Existing, to read with them: `StartN` /
+`StartT`, `SaLo` / `SaHi` / `SaCnt`, `VpLpa`, `ScRid` / `ScPub` / `ScSrc` / `ScDir`, `CpRid`, `RfRid` / `RfCnt` / `RfUnb`, the flush
+histogram (`FfR<n>`), `FlipIss` / `FlipPub`, `FfProg` / `FfNoRec` / `FfMoved` / `FfReowned`, `FkGen`, `PgStale`, `NvOpen` / `NvClose` /
+`NvIoctl` / `NvRef` / `NvStale` / `NvStaleUn` / `NvSwept`, `RestSeed*` / `ScRest*`, `PBFlip` / `PBRetSite`. Reading order: `StartN` (1 =
+image reloaded), `GenEpoch` against the previous run's (equal = R1 not fixed or not running), `StopUnbSt` / `StopUnbHst` (what the host
+was bound to at the stop), `ScRid` / `ScPub` / the histogram (what this generation bound and flushed), `NvRef` / `NvOpen` (the
+reconnect loop).
+
+### 25.6 Verified, and not
+
+The pure logic (`generation_id`) is host-tested (the salt, the serial and the epoch differ between two images loaded minutes apart and
+increase strictly within one; a stale serial is refused by `paging::alloc_is_current`; the whole kmd_logic and protocol suites pass).
+`kmd_render` cannot be built here: the stub type-check harness reports the same distinct error lines before and after. NOT verified:
+that a surviving client reacts to the new epoch as the header says (needs the librmclient branch and the Windows transport); that the
+StopDevice disable does not lengthen a restart (it is bounded by the StopDevice budget and sent only when something is bound);
+anything on hardware. Two statements elsewhere are wrong across an image reload: the doc comment of
+`reset_display_publication_state` and the row "TRANSPORT_SERIAL, NEXT_WIRE_FENCE_BASE: monotonic, KEPT" of section 20.4. Both restart at
+zero with the image, which the salt now covers.

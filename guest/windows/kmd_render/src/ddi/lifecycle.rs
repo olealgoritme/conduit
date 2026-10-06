@@ -260,6 +260,47 @@ fn stop_flush(
     stop_credit(budget, from)
 }
 
+/// Turn the host's scanout 0 off before the transport that bound it is dropped, and leave the ids
+/// at the stop in the service key (`StopUnb*`, docs/zero-copy-present.md section 25).
+///
+/// The host keeps its scanout binding when the guest resets the device unless somebody disables it,
+/// and the next generation numbers its resources from 1 again: a binding that outlives the stop can
+/// show whatever the new generation creates under that id. Sent only when the guest or the host's
+/// last accepted bind names a resource, within the StopDevice budget; a failure is counted and
+/// StopDevice goes on (the transport reset reclaims the host side anyway). Must run BEFORE
+/// `reset_display_publication_state` (it zeroes the identities read here) and while the transport
+/// is up. `StopUnbSt`: 0 nothing bound, 1 disabled, 2 refused or failed, 3 no budget left.
+#[inline(never)]
+fn stop_unbind_scanout(
+    passive: crate::irql::PassiveLevel,
+    adapter: &AdapterContext,
+    budget: &helios_kmd_logic::sweep_budget::SweepBudget,
+) {
+    use core::sync::atomic::Ordering;
+    let guest_bound = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
+    let active = adapter.active_scanout_resource.load(Ordering::Acquire);
+    let host_accepted = adapter
+        .with_virtio(|v| v.host_accepted_scanout_bind().1)
+        .unwrap_or(0);
+    crate::diag::record_named_bytes(b"StopUnbGst", guest_bound);
+    crate::diag::record_named_bytes(b"StopUnbAct", active);
+    crate::diag::record_named_bytes(b"StopUnbHst", host_accepted);
+    if guest_bound == 0 && host_accepted == 0 {
+        crate::diag::record_named_bytes(b"StopUnbSt", 0);
+        return;
+    }
+    let now = crate::adapter::foreign_scanout::now_100ns();
+    let Some(timeout_ms) = budget.call_timeout_ms(now) else {
+        crate::diag::record_named_bytes(b"StopUnbSt", 3);
+        return;
+    };
+    let status = match crate::virtio::ctrl::disable_scanout_within(passive, adapter, timeout_ms) {
+        Ok(()) => 1,
+        Err(_) => 2,
+    };
+    crate::diag::record_named_bytes(b"StopUnbSt", status);
+}
+
 /// `DxgkDdiStartDevice` — bring the adapter online.
 ///
 /// NOT wrapped by `ddi::traced` and `#[inline(never)]`: this frame plus `VirtioGpu::init` is the
@@ -602,6 +643,21 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 
     start_stage(3);
 
+    // This generation's identities (section 25): the image salt, the allocation serial and the
+    // NVRM epoch (low 32 bits each). After a `pnputil /restart-device` all three must differ from
+    // the previous image's, or a client / allocation that survived it is not seen as stale.
+    crate::diag::record_named_bytes(b"GenSalt", crate::adapter::image_salt() as u32);
+    crate::diag::record_named_bytes(
+        b"GenSerial",
+        adapter.current_transport_serial().unwrap_or(0) as u32,
+    );
+    crate::diag::record_named_bytes(
+        b"GenEpoch",
+        adapter
+            .with_virtio(|v| v.nvrm_epoch())
+            .unwrap_or(0) as u32,
+    );
+
     if knobs.display_half {
         crate::diag::record_named_bytes(b"DspMd", adapter.display_mode_packed());
 
@@ -742,6 +798,9 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // transport generation being torn down; carrying it into the next
         // StartDevice is how a latched gate kills CRTC_VSYNC and how a recycled
         // resource id gets bound as the cached scan-out target.
+        // The host's scanout binding is turned off first, while the identities it names are still
+        // readable and the transport is up (section 25: the host keeps it across a device reset).
+        stop_unbind_scanout(passive_stop, adapter, &budget);
         adapter.reset_display_publication_state();
 
         // Tear down the venus client + page-table blob + context BEFORE dropping
