@@ -102,6 +102,10 @@ pub(crate) struct HeliosD3D12Device {
     /// ⚠ Dropping this drops all of that, which is why `destroy_device` is
     /// `drop_in_place` and not a bare "null the handle".
     pub(crate) engine: BridgeDevice12,
+
+    /// Device removal when the KMD goes away under this process
+    /// (`device_loss12.rs`): the shared loss epoch at creation. Appended last.
+    pub(crate) loss: crate::device_loss12::LossWatch,
 }
 
 /// The size of the private block the runtime must allocate for one device.
@@ -324,6 +328,7 @@ pub(crate) unsafe fn create_device(arg: *const ddi12::D3D12DDIARG_CREATEDEVICE_0
                 um_callbacks: um_callbacks_raw,
                 kt_callbacks: a.pKTCallbacks,
                 engine,
+                loss: crate::device_loss12::LossWatch::new(),
             },
         );
     }
@@ -509,6 +514,42 @@ pub(crate) fn set_error(dev: &HeliosD3D12Device, hr: Hresult) -> bool {
     // `h_rt_device` is the handle it supplied alongside it and owns until
     // `pfnDestroyDevice`. The call transfers no ownership.
     unsafe { set_error_cb(dev.h_rt_device, hr) };
+    true
+}
+
+/// Whether the device is removed: the KMD went away under this process since
+/// it was created (the shared loss epoch), or vkd3d saw `VK_ERROR_DEVICE_LOST`
+/// (`GetDeviceRemovedReason` is not S_OK).
+pub(crate) fn device_removed(dev: &HeliosD3D12Device) -> bool {
+    if dev.loss.kmd_lost() {
+        return true;
+    }
+    // SAFETY: a borrowed interface of the live engine device; the call takes
+    // and transfers nothing.
+    dev.engine
+        .d3d12_device()
+        .is_some_and(|device| unsafe { device.GetDeviceRemovedReason() }.is_err())
+}
+
+/// If the device is removed, report `D3DDDIERR_DEVICEREMOVED` through
+/// `pfnSetErrorCb` (the runtime then answers `DXGI_ERROR_DEVICE_REMOVED` and
+/// `GetDeviceRemovedReason` to the app) and return `true`: the caller does no
+/// further work. Without this a D3D12 app kept submitting into a lost device
+/// and waited on fences that never signal, or presented nothing, while every
+/// call succeeded.
+pub(crate) fn report_if_removed(dev: &HeliosD3D12Device, site: &str) -> bool {
+    if !device_removed(dev) {
+        return false;
+    }
+    if dev.loss.first_report() {
+        log_error!(
+            "device removed (KMD gone: {}) at {site}: reporting D3DDDIERR_DEVICEREMOVED to the runtime",
+            dev.loss.kmd_lost()
+        );
+    }
+    if !set_error(dev, D3DDDIERR_DEVICEREMOVED) {
+        log_error!("device removed at {site}: no pfnSetErrorCb to report it through");
+    }
     true
 }
 

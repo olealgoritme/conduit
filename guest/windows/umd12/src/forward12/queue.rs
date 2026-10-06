@@ -836,6 +836,21 @@ pub struct RecorderState {
 /// `h` must be a handle [`create_command_queue`] returned `S_OK` for and
 /// [`destroy_command_queue`] has not been called on, and the returned reference
 /// must not outlive the DDI call that obtained it.
+/// For `present12.rs`: report the device removed if it is (see
+/// `device12::report_if_removed`), resolving the queue's device.
+///
+/// # Safety
+/// `h` must be a live queue handle from `create_command_queue`.
+pub(crate) unsafe fn report_queue_device_removed(
+    h: ddi12::D3D12DDI_HCOMMANDQUEUE,
+    site: &str,
+) -> bool {
+    // SAFETY: the caller's guarantee; the device outlives its queues.
+    unsafe { queue_state(h) }
+        .and_then(|queue| unsafe { crate::device12::device(queue.h_device) })
+        .is_some_and(|dev| crate::device12::report_if_removed(dev, site))
+}
+
 unsafe fn queue_state<'a>(h: ddi12::D3D12DDI_HCOMMANDQUEUE) -> Option<&'a QueueState> {
     // SAFETY: the caller guarantees a live handle, so its slot lies inside the
     // private block `calc_private_command_queue_size` sized.
@@ -3004,6 +3019,12 @@ unsafe extern "system" fn execute_command_lists(
         note_refusal(&L2_REFUSALS.execute_command_lists_bad_arg);
         return;
     };
+    // SAFETY: the queue's device outlives it (runtime destroy order).
+    if unsafe { crate::device12::device(queue.h_device) }
+        .is_some_and(|dev| crate::device12::report_if_removed(dev, "ExecuteCommandLists"))
+    {
+        return;
+    }
     let n = count as usize;
     if n == 0 {
         // Legal and degenerate: nothing to submit, nothing to report.
@@ -3288,6 +3309,20 @@ unsafe fn fence_operation(
         note_refusal(&L2_REFUSALS.fence_op_bad_arg);
         return;
     };
+    // A lost device's fences never advance: report the removal instead of
+    // queueing a signal or wait that would leave the app waiting forever.
+    // SAFETY: the queue's device outlives it (runtime destroy order).
+    if unsafe { crate::device12::device(queue.h_device) }.is_some_and(|dev| {
+        crate::device12::report_if_removed(
+            dev,
+            match which {
+                FenceOp::Signal => "SignalFence",
+                FenceOp::Wait => "WaitForFence",
+            },
+        )
+    }) {
+        return;
+    }
     // SAFETY: runtime supplies a live fence private block for this operation.
     let valid =
         unsafe { fence::fence_state(op.Fence) }.is_some_and(|f| f.belongs_to(queue.h_device));
