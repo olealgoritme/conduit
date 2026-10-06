@@ -121,12 +121,51 @@ pub fn umd_log_path() -> &'static std::path::Path {
         let dir = std::path::Path::new(r"C:\ProgramData\Helios");
         // Best effort: ignore AlreadyExists / permission errors.
         let _ = std::fs::create_dir_all(dir);
-        dir.join(format!(
-            "{}-{}.log",
-            BASENAME.get().copied().unwrap_or("umd"),
-            std::process::id()
-        ))
+        let base = BASENAME.get().copied().unwrap_or("umd");
+        let path = dir.join(format!("{base}-{}.log", std::process::id()));
+        // A file of the same name left by an earlier process with this pid,
+        // created under another account (dwm.exe runs as a fresh DWM-<n> each
+        // restart), may refuse our append: every line of this process would
+        // vanish (docs/dwm-on-nvk.md, T3). Then the name also carries the
+        // process creation time, which the C++ bridges compute the same way.
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => dir.join(format!(
+                "{base}-{}-{:x}.log",
+                std::process::id(),
+                process_creation_time()
+            )),
+            _ => path,
+        }
     })
+}
+
+/// This process's creation time (FILETIME, 100 ns since 1601), 0 if unknown.
+fn process_creation_time() -> u64 {
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetProcessTimes(
+            process: isize,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+    let (mut c, mut e, mut k, mut u) =
+        (FileTime::default(), FileTime::default(), FileTime::default(), FileTime::default());
+    // SAFETY: the pseudo handle needs no closing; all four pointers are live locals.
+    let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
+    if ok == 0 {
+        return 0;
+    }
+    (u64::from(c.high) << 32) | u64::from(c.low)
 }
 
 /// The unconditional log writer.

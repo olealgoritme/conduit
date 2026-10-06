@@ -249,3 +249,19 @@ Run each step only in a quiet window agreed with the install agent. Always end w
   flip of a foreign primary, which the Venus `SET_SCANOUT_BLOB` path never completes. This is K1/K3
   (`ForeignFlip`, KMD v320): next is T3 with `ForeignFlip=1`.
 * Revert: `DwmIcd` removed; Venus DWM pid 7092 stable for 30 s.
+
+### T3 (2026-10-06 10:52, 22.22.320.1 with 1d513d1; `ForeignFlip=1`, `DwmIcd=nvk`, 45 s)
+
+* **ForeignFlip put the NVK DWM's frames on screen**: `FfProg`/`FfFrames`/`FfSeq` 4, `FfRegs` 1,
+  `FfPres` 1, `FfMoved` 2, `FfSame` 1, `FfNoRec` 1. No refusals (`FfRef01..14` all 0); `FfFlipFail`,
+  `FfStale` and `FfGaveUp` 0.
+* After 4 frames nothing more was flipped, which matches the missing kept-picture completion
+  (KMD v321).
+* The Present arm skipped 7 Blt presents with a foreign source (`PrFgSkip`/`PrFgBlt` 7).
+* No new `PBRet`. No crash, no TDR. Venus DWM pid 5792 stable for 30 s after the revert.
+* **No UMD log.** `umd-6340.log` already existed, from a 01:23 process with the same pid under
+  another DWM account, so the new DWM's appends were refused and nothing was logged. The UMD did run:
+  the guard file was written at 10:52:21. Fixed: when the per-pid name refuses the append, the UMD
+  logs to `umd-<pid>-<creation time>.log` (Rust `umd_common::log` and the D3D11 bridge agree on the
+  name).
+* The backend logs no `ScanoutFlip` lines at its current level (lines 3194843 to 3197753).
