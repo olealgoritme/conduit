@@ -543,6 +543,9 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     {
         crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
     }
+    // The foreign scanout source's no-present watchdog: ends a source whose lapse the HPD
+    // worker has not polled in time. One relaxed load while no user source is live.
+    adapter.foreign_scanout_tick();
     if !adapter.display_half() || adapter.vsync_armed.load(Ordering::Acquire) == 0 {
         return;
     }

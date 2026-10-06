@@ -46,12 +46,14 @@ flush or finds nothing bound), on:
 
 * `RELEASE`;
 * a successful forwarded `Close` of the source's DRM file (`nvrm::forward`);
-* device teardown (`close_all_for_owner`, called from DestroyDevice);
+* device teardown: the entry of DestroyDevice (before its sweeps) and `close_all_for_owner` (see
+  "Owner death and killed processes");
 * the suppression gate finding the handle no longer the owner's, or the NVRM epoch
   changed (re-checked on every suppressed refresh, so a missed hook cannot wedge it);
 * the lapse: no `PRESENT` for `lapse_ms` (default 2 s, 100 ms..30 s). The HPD worker
   waits with a timeout equal to the remaining lapse while a source is live, so a
-  silent owner gives the desktop back with no other edge.
+  silent owner gives the desktop back with no other edge A DISPATCH-level watchdog on the vsync tick ends a source the worker has not
+  polled 250 ms after its deadline.
 * transport reset / StopDevice (`reset_display_publication_state`): `Inactive`, no
   restore (the display state is rebuilt).
 
@@ -252,6 +254,12 @@ is visible.
 `FsSet - FsRel - FsLapse - FsEnd - FsTake` (0 or 1). `FsSupp` rising with no source
 live is a bug. `FsRest` should track `FsRel + FsLapse + FsEnd`.
 
+These are registry MIRRORS, written only at edges (SET, RELEASE, a worker lapse, an owner
+exit, the `Nv*` mirror the worker runs after a session-shaping NVRM call, StopDevice). A value
+that "did not change over 10 s" says only that no such edge happened, not that the live
+counter stood still: read `FsPubT` (below) against the uptime before drawing conclusions. The
+owner-death counters and breadcrumbs are in "Owner death and killed processes".
+
 ### Reading vsync rates
 
 The heartbeat has exactly one source: `service_vsync_tick` (`adapter/kobj.rs`), run by a
@@ -298,6 +306,165 @@ Recipe, using only values written by one dump (or one `enum_cofunc_modality` cal
 A count and its time are two registry values read at slightly different instants, so a
 pair can be one tick (4 ms at 240 Hz) apart; this matters for intervals of a few ticks, not
 for seconds.
+
+## Owner death and killed processes
+
+Status: implemented on `kmd/scanout-kill-lapse`, never built or run (the KMD cannot be compiled
+where it was written); the pure rules are host-tested (`kmd_logic::foreign_scanout`,
+`windowed_ready`, `slice_budget`). Origin: a 320.1 desktop stall after a scanout app and then a
+Venus app were killed by `TerminateProcess` (ranked findings below).
+
+### What a killed process leaves, and what ends the source
+
+`TerminateProcess` runs no code of the app. Everything the KMD sees of it is what dxgkrnl does
+on its behalf afterwards: it destroys the process's contexts and devices (`DxgkDdiDestroyContext`,
+`DxgkDdiDestroyDevice`; the order and the delay are dxgkrnl's, and a context with queued GPU work
+can delay them), and at the very end `DxgkDdiDestroyProcess`. There is no process-exit callback
+into the KMD and none is registered. The foreign source is keyed by the owner token (the
+`DeviceContext` pointer, `DeviceOwner::raw()`), so the device is the hook.
+
+| path | who ends the source | counters | when |
+|---|---|---|---|
+| `SCANOUT_RELEASE` | the owner | `FsRel`, `FsEndBy`=1 | the client's own exit path |
+| `DestroyDevice` entry (`foreign_scanout_owner_exit`, `device.rs`) | the KMD | `FsEnd`, `FsXitEnd`, `FsEndBy`=5 | FIRST thing in the DDI, before the mapping drain, the blob and context sweeps |
+| `close_all_for_owner` (`foreign_scanout_release_owner`) | the KMD | `FsEnd`, `FsEndBy`=6 | later in the same DDI; finds nothing if the entry hook ran (idempotent) |
+| forwarded `Close` of the source's DRM file, transport sweep | the KMD | `FsEnd`, `FsEndBy`=7 | |
+| suppression gate: handle no longer the owner's, or another epoch | the KMD | `FsEnd`, `FsEndBy`=8 | every suppressed refresh, so a missed hook cannot wedge it |
+| lapse, HPD worker (`foreign_scanout_service`) | the worker's timed wait | `FsLapse`, `FsEndBy`=2 | `lapse_ms` after the last accepted flip (default 2 s) |
+| lapse, DISPATCH watchdog (`foreign_scanout_tick`, the vsync tick) | the tick | `FsLapse`, `FsDpcLps`, `FsEndBy`=3 | 250 ms after the deadline, only if the worker did not poll it |
+| the owner's next `SCANOUT_PRESENT` found it lapsed | the KMD | `FsLapse`, `FsEndBy`=4 | |
+| another owner's `SCANOUT_SET` after the lapse | the KMD | `FsTake`, `FsEndBy`=10 | |
+| transport reset / `StopDevice` | the KMD | `FsEnd`, `FsEndBy`=9 | |
+
+Why the entry hook: `close_all_for_owner` used to be the only place a dead owner's source ended
+by teardown, and it runs after the mapping drain, the diag dumps, `purge_present_streams`,
+`release_blobs_for_owner` and `destroy_contexts_for_owner`. Those are host round trips of up to
+30 s each (`SYNC_ROUNDTRIP_TIMEOUT_MS`), per blob and per context, under the scanout and Venus
+mutexes. The 2 s lapse still covered the desktop (suppression is a pure function of time, see
+below), but the restore flush, the drop of the fenced queue (and the `Close` of its fence
+handles), the book release and the next `SET` all waited behind the sweeps. A device without
+blobs or contexts (an NVK-on-RM process) loses nothing by the order; a Venus device does.
+
+Suppression cannot outlive the lapse by construction: `suppress_desktop(now)` is
+`now < deadline`, a pure read, and the refresh gate and `foreign_scanout_blocks_flip` both ask
+it with the current time. A source nobody polled therefore stops suppressing at its deadline
+whatever the worker is doing. What a stuck worker cannot do is run the restore (a worker task),
+and the state stays `Active` until something polls it, so the counters keep counting it live.
+The DISPATCH watchdog closes that second half: the vsync tick (free running, independent of the
+worker and of every mutex the worker waits on) checks one atomic (`FS_WATCH_AT`, the live user
+source's deadline plus 250 ms; 0 with no source, so a load per tick by default), and past it ends
+the source exactly as the worker's lapse does, with the restore request (atomics and `KeSetEvent`,
+legal at DISPATCH). The 250 ms grace is the whole reason a healthy driver never sees it act: the
+worker's own timed wait expires AT the deadline. `FsDpcLps` > 0 therefore means "the worker was
+not looping on time", by itself a finding.
+
+The state machine, read from the counters: `FsSet - FsRel - FsLapse - FsEnd - FsTake` = live user
+sources (0 or 1); `FsRest` = `FsRel + FsLapse + FsEnd` once every restore ran; `FsDpcLps <=
+FsLapse` and `FsXitEnd <= FsEnd`. `RelTrack = FsFQue + FsFFull` (a minted flip is queued or
+refused as full) and `RelGone = FsFFull + FsFSkip (+ whatever left the book first)`.
+
+### Breadcrumbs (`publish_counters`, PASSIVE; times are interrupt-time ms mod 2^32, the clock of
+`VpDmpT` and `uptime_ms`)
+
+| value | meaning |
+|---|---|
+| `FsLive` | 1 a user source holds scanout 0, 2 the KMD's resident one, 0 none |
+| `FsOwner`, `FsGen` | low 32 bits of the owner token (the `DeviceContext` pointer), generation of the live source |
+| `FsDeadl` | its lapse deadline; older than `FsPubT` on a live source means a lapse nobody polled |
+| `FsLastP` | last flip the host took for any user source |
+| `FsEndBy`, `FsEndGen`, `FsEndT` | `EndCause` code (table above), generation and time of the LAST end |
+| `FsPubT` | time of this publication: every `Fs*`/`Rel*`/`Nv*` value is a mirror written at an edge, so compare it with the uptime before reading anything as "unchanged" |
+| `FsDpcLps`, `FsXitEnd` | the two new end paths |
+| `WbStaleRdy`, `BlbAbandoned`, `VnRingWd`, `VnRingRt` | the Venus-side findings below |
+
+Publication edges: SET, RELEASE, the worker's lapse, every end by device teardown (new: it
+used to leave `FsEnd` unpublished until some later edge; an end by a closed file or the suppression
+gate still waits for the next edge), the worker's `Nv*`
+mirror, StopDevice. A tester dump taken minutes after the last edge shows the picture at the
+edge. `FsPubT` against `uptime_ms` is how old it is.
+
+### Findings of the 320.1 stall, ranked (hardware: not proven)
+
+Evidence: stall after a killed scanout app and then a killed 32-bit Venus app (windowed present
+through the UMD's scanout-snapshot, 5152x1440, about 104 ms per frame, 'unsupported source format
+65', device creation failed 3 times before). Plain kills (an NVK `d3d11_spin` with RM fences and
+KMD flips, a Venus `d3d11_spin`) do NOT reproduce it: the owner-death cleanup of the foreign
+source works for those (`FsEnd` +1 and `FsRest` +1 within 2 s).
+
+What the first dump pair cannot show: every `Fs*`, `Rel*`, `Vp*`, `Nv*` value in it is a mirror
+last written at about 11:26:34 (`VpDmpT`), 7.4 minutes before the dump, so "unchanged over 10 s"
+is meaningless, and the arithmetic at that publish (`FsSet 5 - FsRel 2 - FsLapse 2 - FsEnd 1 = 0`,
+`FsRest 5 = 2+2+1`) says no source was live and nothing was owed then. `FsFFull 685` is the
+NVK run's: only `SCANOUT_PRESENT` escapes enqueue in the S4 queue (depth 8, no KMD-side wait: a
+full queue answers `QUEUE_FULL` at once and the client retries; 685 of 108 739 flips), and a
+Venus present cannot touch it. The ~104 ms per frame is not the S4 queue.
+
+1. **The WindowedBlt ready queue holds a dead token (a real defect, fixed here).** An admitted,
+   undispatched windowed blt is retired by `terminal_windowed_blt` when the teardown of its
+   snapshot resource calls `cancel_windowed_blt_for_resource` (killed process, ring slots
+   destroyed). That removed the request from `pending` but left its token at the front of
+   `windowed_blt.ready`; `take_ready_windowed_blt` then answered "nothing to dispatch" without
+   popping, for every later request of every process, for the rest of the boot. Each such
+   present's WDDM fence waits for a blt terminal that is never produced; only the `WddmHeadMs`
+   (250 ms) rebase moved the adapter-global FIFO, by cancelling the copy. A large-frame windowed
+   app that is slow (one dispatch per worker wake, a 29.7 MB mirror per frame) builds exactly the
+   backlog of admitted-undispatched requests this needs; a 64-bit app at 8000 fps does not.
+   Fix: the terminal drops the token, the dispatcher pops dead and dispatched front tokens
+   (`WbStaleRdy`, must read 0; nonzero = the healing fired).
+2. **A "30 s" ring wait that is up to 468 s, under the mutexes the HPD worker waits on without a
+   timeout (a real defect, bounded here).** `VenusRing::ring_wait_until` counted one millisecond
+   per `sleep_ms(1)`, which sleeps a timer quantum (about 15.6 ms): `RING_WAIT_TIMEOUT_MS` 30 000
+   slices is up to about 7.8 minutes of real time. It is reached from `DxgkDdiPresent`
+   (`prepare_present_blt`) and from the blob teardown (`release_present_blits_for_resource`)
+   holding the scanout and Venus mutexes; the worker takes both (`service_windowed_blt`, the
+   refresh, the deferred `SetVidPnSourceAddress`) so its dump counter stops and DWM's flips stop
+   for as long as the host does not advance the ring head. 7.4 minutes of stale mirror at the
+   dump, still stalled, against a 7.8 minute ceiling, and the device restart that followed, fit.
+   What makes the host stop consuming the ring is NOT determined (a dead process's Venus context
+   teardown on the host is the suspect). Fix: the real clock bounds the wait as well
+   (`slice_budget`): 30 s of real time, then the existing fatal latch, with `VnRingWd` now the real
+   elapsed time and `VnRingRt` = 1 when the clock, not the count, ended it. Cost: a host that
+   stalls the ring for 30 s to 7 minutes and then recovers used to come back and now latches the
+   ring fatal (a device restart brings it back); healthy waits (milliseconds) are unchanged.
+3. **A blob sweep that stops at the first ambiguity (fixed).** `release_blobs_for_owner_within`
+   returned at the first blob whose blit release failed or whose windowed blt was still in flight,
+   leaving the owner's remaining blobs in the table with a dead owner token and their pending
+   windowed blts (each holding a read-ledger ticket and one of 64 token slots) un-cancelled.
+   Killed apps fill the blob table, the token slots and the ledger a few at a time. Now the rest
+   are drained without host commands, their undispatched windowed blts cancelled (`BlbAbandoned`,
+   must read 0).
+4. **Closing present-stream slots keep undispatched requests alive (fixed).** A purge that finds a
+   mid-frame stream only marks it closing; the sweep that cancels the requests of dead streams
+   ran at that moment, when the slot still counted as live, and was not repeated when the
+   context's `CTX_DESTROY` finalized the slot. It is now repeated there.
+5. Not changed, named for the next look: a windowed blt destination buffer left in `KmdWriter` /
+   `KmdCpuMirror` after a rejected blt or an early return in the legacy Present arm
+   (`present_buffer` ownership never returns, `try_begin_present_buffer_write` stays Busy and the
+   allocation cannot be destroyed); an unfulfilled wire fence at the head of the adapter-global
+   FIFO (the wire arm cannot be rebased); the FIFO overflow latch (`failed`, never cleared).
+
+The 104 ms per frame constant is not a timer: no 100 ms or 104 ms wait exists in the KMD. At
+5152x1440x4 (29.7 MB) the windowed blt costs a ring copy plus a CPU mirror of the whole
+destination on the single HPD worker, one request per wake, under the scanout mutex; 25 vsync
+periods at 240 Hz happens to be 104.17 ms but nothing counts them.
+
+### Hardware checklist
+
+1. Read `FsPubT` against `uptime_ms` first. If the stall is live and `FsPubT` is minutes old,
+   nothing below can be concluded from the other mirrors.
+2. After a deliberate kill of a scanout app: `FsEnd` +1, `FsXitEnd` +1, `FsEndBy` 5, `FsEndT`
+   within about the DDI's delay of the kill, `FsRest` +1, `FsLive` 0. `FsEndBy` 6 means the entry
+   hook did not run first (check `DestroyDevice`); 2 or 3 means DestroyDevice never ran for that
+   device, and `FsDpcLps` > 0 means the HPD worker was late (read the worker breadcrumbs of the
+   `kmd/stall-watchdog` lane).
+3. After a kill of a Venus windowed app that was slow and queued (Heaven at 5152x1440): `WbStaleRdy`
+   (a healed wedge: expected 0 or small once, never growing), `BlbAbandoned` (0 unless a blit
+   was in flight), `VnRingWd` / `VnRingRt` (present only if a ring wait expired; `VnRingRt` 1
+   proves the quantum mismatch).
+4. DWM present counts before and after a deliberate kill and a notepad window, as in
+   `killrepro.sh`; a stall with `VnRingWd` absent for under 30 s of real time points at the ring wait
+   (the latch fires at 30 s), a stall with `WfBBlt` rising points at item 1.
+5. Not to be inferred from a dump: that a source is live. `FsLive` and `FsDeadl` say so.
 
 ## What is not done
 
