@@ -1,4 +1,4 @@
-From 0c57da30b52775dded13d58be17dc0ebbb917d1a Mon Sep 17 00:00:00 2001
+From ffb0cfbfe276eda264e9d132a510c45ef7af7ca4 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Tue, 6 Oct 2026 15:20:57 +0200
 Subject: [PATCH] nvk/rm: helios_icd_interface version 5, scanout_frame (the
@@ -13,9 +13,9 @@ VK_NOT_READY when no live KMD source minted a frame of it.
 ---
  src/nouveau/vulkan/helios_icd_interface.h  | 13 ++++++++++-
  src/nouveau/vulkan/nvk_helios.c            | 26 ++++++++++++++++++++++
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |  6 +++++
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c | 23 +++++++++++++++++++
- 4 files changed, 67 insertions(+), 1 deletion(-)
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     | 10 +++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c | 26 ++++++++++++++++++++++
+ 4 files changed, 74 insertions(+), 1 deletion(-)
 
 diff --git a/src/nouveau/vulkan/helios_icd_interface.h b/src/nouveau/vulkan/helios_icd_interface.h
 index 6b4b338..06fb02f 100644
@@ -93,10 +93,21 @@ index 11b0469..6c4ce03 100644
     memcpy(out, &api, cap);
     return VK_SUCCESS;
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
-index 5a96fb5..fb0b2dd 100644
+index 5a96fb5..5af9d15 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
-@@ -506,6 +506,12 @@ VkResult nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *mem,
+@@ -264,6 +264,10 @@ struct nvkmd_rm_dev {
+    bool no_kmd_source;
+    bool source_live;
+    struct nvrm_crm_scanout_source source;
++   /* source.generation while source_live (the KMD source), else 0; written
++    * under drm_mutex, read lock-free (nvkmd_rm_mem_scanout_frame).
++    */
++   uint32_t source_gen_live;
+ 
+    /* RM fences for presents (nvkmd_rm_rmfence.c, dxvk-on-nvk S4), made on
+     * first use under rmfence_mutex.
+@@ -506,6 +510,12 @@ VkResult nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *mem,
                                     uint32_t fourcc, uint64_t modifier);
  /* Gives scanout 0 back to the desktop (no-op without a live source) */
  void nvkmd_rm_dev_scanout_release(struct nvkmd_dev *dev);
@@ -110,10 +121,30 @@ index 5a96fb5..fb0b2dd 100644
  /*
   * RM fences for presents (nvkmd_rm_rmfence.c; guest/windows/docs/
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
-index d3c8dd1..5baf254 100644
+index d3c8dd1..99af8f0 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
-@@ -375,6 +375,29 @@ nvkmd_rm_dev_scanout_release(struct nvkmd_dev *_dev)
+@@ -287,6 +287,7 @@ nvkmd_rm_win_source_set_locked(struct nvkmd_rm_dev *dev,
+    if (ret == 0) {
+       dev->source = src;
+       dev->source_live = true;
++      p_atomic_set(&dev->source_gen_live, src.generation);
+       if (dev->base.pdev->debug_flags & NVK_DEBUG_VM) {
+          fprintf(stderr, "NVK: scanout source %u: %ux%u stride %u fourcc "
+                  "0x%08x modifier 0x%" PRIx64 ", lapse %u ms\n",
+@@ -345,6 +346,7 @@ kmd_source_present(struct nvkmd_rm_dev *dev,
+    if (ret == -ENOENT) {
+       /* The source lapsed (or the KMD reset): register it again */
+       dev->source_live = false;
++      p_atomic_set(&dev->source_gen_live, 0);
+       ret = nvkmd_rm_win_source_set_locked(dev, flip);
+       if (ret == 0)
+          ret = lib->win_scanout_present(flip->owner_handle,
+@@ -372,9 +374,33 @@ nvkmd_rm_dev_scanout_release(struct nvkmd_dev *_dev)
+                  dev->source.generation, ret);
+    }
+    dev->source_live = false;
++   p_atomic_set(&dev->source_gen_live, 0);
     simple_mtx_unlock(&dev->drm_mutex);
  }
  
@@ -126,11 +157,11 @@ index d3c8dd1..5baf254 100644
 +
 +   *seq = 0;
 +   *generation = 0;
-+   simple_mtx_lock(&dev->drm_mutex);
-+   const bool live = dev->source_live && !dev->no_kmd_source;
-+   const uint32_t gen = dev->source.generation;
-+   simple_mtx_unlock(&dev->drm_mutex);
-+   if (!live || gen == 0)
++   /* Lock-free: drm_mutex is held across the flip escapes, and this runs
++    * on the presenting thread for every composed frame.
++    */
++   const uint32_t gen = p_atomic_read(&dev->source_gen_live);
++   if (gen == 0)
 +      return false;
 +   const uint64_t s = p_atomic_read(&mem->scanout_seq);
 +   if (s == 0)
