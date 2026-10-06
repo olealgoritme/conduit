@@ -194,6 +194,14 @@ struct Args {
     #[cfg(feature = "venus")]
     #[arg(long, value_name = "PATH")]
     venus_renderer: Option<PathBuf>,
+
+    /// Serve guest-memory blobs (docs/VENUS.md "Guest-memory blobs"): Venus
+    /// resources over the guest's own pages, which the host GPU copies
+    /// into directly. Sets config bit NVGPU_CFG_GUEST_BLOB when the renderer
+    /// can import host memory. Opt-in while new.
+    #[cfg(feature = "venus")]
+    #[arg(long, requires = "venus")]
+    venus_guest_blobs: bool,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -1220,7 +1228,12 @@ impl NvGpuBackend {
     /// Serve Venus (`--venus`): the config bit, `GpuCmd`, and region 3 of
     /// `hostmem_len` bytes.
     #[cfg(feature = "venus")]
-    fn enable_venus(&mut self, renderer: Box<dyn conduit_venus::Renderer>, hostmem_len: u64) {
+    fn enable_venus(
+        &mut self,
+        renderer: Box<dyn conduit_venus::Renderer>,
+        hostmem_len: u64,
+        guest_blobs: bool,
+    ) {
         let display = ({ self.config.features } & protocol::messages::NVGPU_CFG_DISPLAY != 0)
             .then_some(device::display::DisplayMode {
                 width: self.config.display_width,
@@ -1228,9 +1241,12 @@ impl NvGpuBackend {
                 refresh_hz: self.config.display_refresh_hz,
             });
         self.config.set_venus();
-        let venus = device::venus::Venus::new(renderer, hostmem_len, display);
+        let mut venus = device::venus::Venus::new(renderer, hostmem_len, display);
         if venus.rm_import() {
             self.config.set_rm_import();
+        }
+        if guest_blobs && venus.enable_guest_blobs() {
+            self.config.set_guest_blob();
         }
         self.nvidia.lock().expect("backend mutex").set_venus(venus);
         self.venus.hostmem_len = hostmem_len;
@@ -1980,7 +1996,7 @@ fn main() -> anyhow::Result<()> {
     if args.venus {
         let len = device::shm_regions::venus_hostmem_len(args.venus_hostmem_mib)
             .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
-        nvgpu.enable_venus(venus_renderer(&args)?, len);
+        nvgpu.enable_venus(venus_renderer(&args)?, len, args.venus_guest_blobs);
         log::info!(
             "venus: serving GpuCmd, region 3 {} MiB",
             args.venus_hostmem_mib

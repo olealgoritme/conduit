@@ -6,6 +6,7 @@
 
 use std::os::fd::{BorrowedFd, OwnedFd};
 
+pub mod guest_pages;
 pub mod ipc;
 pub mod latency;
 pub mod mock;
@@ -91,6 +92,19 @@ pub struct Dmabuf {
 /// the backend hands it ([`Renderer::import_dmabuf`]).
 pub const FEATURE_IMPORT_DMABUF: u32 = 1 << 0;
 
+/// [`Renderer::features`]: the renderer can make a resource of guest pages
+/// ([`Renderer::import_guest_pages`]) that Venus contexts import with
+/// `VK_EXT_external_memory_host` (docs/VENUS.md "Guest-memory blobs").
+pub const FEATURE_IMPORT_GUEST_PAGES: u32 = 1 << 1;
+
+/// One run of guest pages for [`Renderer::import_guest_pages`]: `len` bytes
+/// at `offset` of the guest RAM file, both whole pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageRun {
+    pub offset: u64,
+    pub len: u64,
+}
+
 /// A fence the renderer has signalled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Signalled {
@@ -154,5 +168,18 @@ pub trait Renderer: Send {
     fn import_dmabuf(&mut self, res_id: u32, fd: BorrowedFd<'_>, size: u64) -> Result<()> {
         let _ = (res_id, fd, size);
         Err(Error::Refused("this renderer cannot import a dma-buf".into()))
+    }
+
+    /// Make `res_id` a resource whose memory is `runs` of the guest RAM file
+    /// `ram`, in order (docs/VENUS.md "Guest-memory blobs"). The renderer maps
+    /// them as one span of its own and keeps that mapping until
+    /// [`Renderer::unref`]. The resource is attached to no context; the
+    /// backend attaches it. Contexts import it through
+    /// `VkImportMemoryResourceInfoMESA`, which vkr turns into a
+    /// `VK_EXT_external_memory_host` import of the span. Only with
+    /// [`FEATURE_IMPORT_GUEST_PAGES`].
+    fn import_guest_pages(&mut self, res_id: u32, ram: BorrowedFd<'_>, runs: &[PageRun]) -> Result<()> {
+        let _ = (res_id, ram, runs);
+        Err(Error::Refused("this renderer cannot import guest pages".into()))
     }
 }

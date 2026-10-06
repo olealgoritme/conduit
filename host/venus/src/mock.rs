@@ -13,6 +13,8 @@ pub struct Mock {
     /// Resources made by `import_dmabuf`: the renderer's own duplicate of
     /// the dma-buf, as virglrenderer keeps one.
     pub imported: HashMap<u32, OwnedFd>,
+    /// Resources made by `import_guest_pages`: the runs, as sent.
+    pub guest: HashMap<u32, Vec<PageRun>>,
     pending: Vec<Signalled>,
     event: Option<OwnedFd>,
 }
@@ -96,6 +98,7 @@ impl Renderer for Mock {
     fn unref(&mut self, res_id: u32) {
         self.resources.remove(&res_id);
         self.imported.remove(&res_id);
+        self.guest.remove(&res_id);
     }
     fn create_fence(&mut self, ctx_id: u32, ring_idx: u32, fence_id: u64) -> Result<()> {
         self.pending.push(Signalled { ctx_id, ring_idx, fence_id });
@@ -108,7 +111,24 @@ impl Renderer for Mock {
         Ok(std::mem::take(&mut self.pending))
     }
     fn features(&mut self) -> u32 {
-        FEATURE_IMPORT_DMABUF
+        FEATURE_IMPORT_DMABUF | FEATURE_IMPORT_GUEST_PAGES
+    }
+    /// Checks the runs as the real renderer does, against the file's size,
+    /// and maps nothing.
+    fn import_guest_pages(&mut self, res_id: u32, ram: BorrowedFd<'_>, runs: &[PageRun]) -> Result<()> {
+        if res_id == 0 || self.resources.contains_key(&res_id) {
+            return Err(Error::Refused("import_guest_pages".into()));
+        }
+        // SAFETY: fstat into a zeroed struct on a descriptor we hold.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::fstat(ram.as_raw_fd(), &mut st) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let size = crate::guest_pages::check_runs(runs, st.st_size as u64, crate::guest_pages::ARENA_BYTES as u64)?;
+        self.guest.insert(res_id, runs.to_vec());
+        self.resources.insert(res_id, size);
+        Ok(())
     }
     fn import_dmabuf(&mut self, res_id: u32, fd: BorrowedFd<'_>, size: u64) -> Result<()> {
         if res_id == 0 || size == 0 || self.resources.contains_key(&res_id) {

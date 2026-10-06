@@ -1,0 +1,571 @@
+diff --git a/server/render_context.c b/server/render_context.c
+index b44b5b5..bd4abcd 100644
+--- a/server/render_context.c
++++ b/server/render_context.c
+@@ -85,14 +85,26 @@ render_context_dispatch_import_resource(struct render_context *ctx,
+                                         const int *fds,
+                                         int fd_count)
+ {
++   const struct render_context_op_import_resource_request *req =
++      &request->import_resource;
++
++#ifdef ENABLE_RENDER_SERVER_WORKER_THREAD
++   if (req->fd_type == VIRGL_RESOURCE_HOST_PTR) {
++      if (fd_count != 0 || !req->host_ptr) {
++         render_log("failed to attach host-pointer resource");
++         return false;
++      }
++      return render_state_import_resource_host_ptr(
++         ctx->ctx_id, req->res_id, (void *)(uintptr_t)req->host_ptr, req->size);
++   }
++#endif
++
+    if (fd_count != 1) {
+       render_log("failed to attach resource with fd_count %d", fd_count);
+       return false;
+    }
+ 
+    /* classic 3d resource with valid size reuses the blob import path here */
+-   const struct render_context_op_import_resource_request *req =
+-      &request->import_resource;
+    return render_state_import_resource(ctx->ctx_id, req->res_id, req->fd_type, fds[0],
+                                        req->size);
+ }
+diff --git a/server/render_protocol.h b/server/render_protocol.h
+index cae94a0..580016f 100644
+--- a/server/render_protocol.h
++++ b/server/render_protocol.h
+@@ -164,6 +164,8 @@ struct render_context_op_import_resource_request {
+    uint32_t res_id;
+    enum virgl_resource_fd_type fd_type;
+    uint64_t size;
++   /* Conduit: fd_type VIRGL_RESOURCE_HOST_PTR only, and then no fd follows */
++   uint64_t host_ptr;
+    /* followed by 1 fd */
+ };
+ 
+diff --git a/server/render_state.c b/server/render_state.c
+index bc7f8e1..5a816a1 100644
+--- a/server/render_state.c
++++ b/server/render_state.c
+@@ -245,6 +245,16 @@ render_state_import_resource(uint32_t ctx_id,
+    return vkr_renderer_import_resource(ctx_id, res_id, fd_type, fd, size);
+ }
+ 
++bool
++render_state_import_resource_host_ptr(uint32_t ctx_id,
++                                      uint32_t res_id,
++                                      void *ptr,
++                                      uint64_t size)
++{
++   SCOPE_LOCK_RENDERER();
++   return vkr_renderer_import_resource_host_ptr(ctx_id, res_id, ptr, size);
++}
++
+ void
+ render_state_destroy_resource(uint32_t ctx_id, uint32_t res_id)
+ {
+diff --git a/server/render_state.h b/server/render_state.h
+index 98de272..146ace1 100644
+--- a/server/render_state.h
++++ b/server/render_state.h
+@@ -50,6 +50,12 @@ render_state_import_resource(uint32_t ctx_id,
+                              int fd,
+                              uint64_t size);
+ 
++bool
++render_state_import_resource_host_ptr(uint32_t ctx_id,
++                                      uint32_t res_id,
++                                      void *ptr,
++                                      uint64_t size);
++
+ void
+ render_state_destroy_resource(uint32_t ctx_id, uint32_t res_id);
+ 
+diff --git a/src/proxy/proxy_context.c b/src/proxy/proxy_context.c
+index 2780a54..181e807 100644
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -459,6 +459,21 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource
+     * that can be exported to dma-buf. A protocol change is needed when there exists use
+     * case for importing external Vulkan opaque resource.
+     */
++   if (res->fd_type == VIRGL_RESOURCE_HOST_PTR) {
++      /* Conduit: the render worker is a thread of this process */
++      const struct render_context_op_import_resource_request req = {
++         .header.op = RENDER_CONTEXT_OP_IMPORT_RESOURCE,
++         .res_id = res_id,
++         .fd_type = VIRGL_RESOURCE_HOST_PTR,
++         .size = res->map_size,
++         .host_ptr = (uint64_t)(uintptr_t)res->host_ptr,
++      };
++      if (!proxy_socket_send_request(&ctx->socket, &req, sizeof(req)))
++         proxy_log("failed to attach res %d", res_id);
++      proxy_context_resource_add(ctx, res_id);
++      return;
++   }
++
+    if (res->fd_type != VIRGL_RESOURCE_FD_INVALID &&
+        res->fd_type != VIRGL_RESOURCE_FD_DMABUF &&
+        res->fd_type != VIRGL_RESOURCE_FD_SHM) {
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index b97e5ea..d9a57c6 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -191,6 +191,8 @@ vkr_context_free_resource(struct hash_entry *entry)
+    struct vkr_resource *res = entry->data;
+    if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
+       munmap(res->u.data, res->size);
++   else if (res->fd_type == VIRGL_RESOURCE_HOST_PTR)
++      ; /* the embedder's mapping */
+    else if (res->u.fd >= 0)
+       close(res->u.fd);
+    free(res);
+@@ -376,6 +378,18 @@ vkr_context_create_resource(struct vkr_context *ctx,
+                                                          blob_flags, out_blob);
+ }
+ 
++bool
++vkr_context_import_resource_host_ptr(struct vkr_context *ctx,
++                                     uint32_t res_id,
++                                     void *ptr,
++                                     uint64_t size)
++{
++   if (vkr_context_get_resource(ctx, res_id))
++      return false;
++   return vkr_context_import_resource_internal(ctx, res_id, size, VIRGL_RESOURCE_HOST_PTR,
++                                               -1, ptr);
++}
++
+ bool
+ vkr_context_import_resource(struct vkr_context *ctx,
+                             uint32_t res_id,
+diff --git a/src/venus/vkr_context.h b/src/venus/vkr_context.h
+index 3867f13..cb1c6f1 100644
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -27,7 +27,7 @@ struct vkr_resource {
+    union {
+       /* valid when fd_type is dma_buf or opaque */
+       int fd;
+-      /* valid when fd_type is shm */
++      /* valid when fd_type is shm or host_ptr (Conduit; not owned) */
+       uint8_t *data;
+    } u;
+ 
+@@ -134,6 +134,12 @@ vkr_context_create_resource(struct vkr_context *ctx,
+                             uint32_t blob_flags,
+                             struct virgl_context_blob *out_blob);
+ 
++bool
++vkr_context_import_resource_host_ptr(struct vkr_context *ctx,
++                                     uint32_t res_id,
++                                     void *ptr,
++                                     uint64_t size);
++
+ bool
+ vkr_context_import_resource(struct vkr_context *ctx,
+                             uint32_t res_id,
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 603f45b..d147b5e 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -137,6 +137,7 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    ext_count += physical_dev->KHR_external_memory_fd;
+    ext_count += physical_dev->EXT_external_memory_dma_buf;
+    ext_count += physical_dev->KHR_external_fence_fd;
++   ext_count += physical_dev->EXT_external_memory_host;
+    if (ext_count > args->pCreateInfo->enabledExtensionCount) {
+       exts = malloc(sizeof(*exts) * ext_count);
+       if (!exts) {
+@@ -160,6 +161,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          exts[ext_count++] = "VK_EXT_external_memory_dma_buf";
+       if (physical_dev->KHR_external_fence_fd)
+          exts[ext_count++] = "VK_KHR_external_fence_fd";
++      if (physical_dev->EXT_external_memory_host)
++         exts[ext_count++] = "VK_EXT_external_memory_host";
+ 
+       ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames = exts;
+       ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount = ext_count;
+@@ -188,6 +191,11 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+                               args->pCreateInfo->ppEnabledExtensionNames,
+                               args->pCreateInfo->enabledExtensionCount);
+ 
++   if (physical_dev->EXT_external_memory_host)
++      dev->GetMemoryHostPointerPropertiesEXT =
++         (PFN_vkGetMemoryHostPointerPropertiesEXT)vk->GetDeviceProcAddr(
++            dev->base.handle.device, "vkGetMemoryHostPointerPropertiesEXT");
++
+    if (physical_dev->EXT_external_memory_metal)
+       dev->mtl_device =
+          vkr_metal_get_device(dev->base.handle.device, vk->GetDeviceProcAddr);
+diff --git a/src/venus/vkr_device.h b/src/venus/vkr_device.h
+index c71f085..154b1c4 100644
+--- a/src/venus/vkr_device.h
++++ b/src/venus/vkr_device.h
+@@ -28,6 +28,9 @@ struct vkr_device {
+    struct list_head objects;
+ 
+    void *mtl_device;
++
++   /* Conduit: set when VK_EXT_external_memory_host is enabled */
++   PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT;
+ };
+ VKR_DEFINE_OBJECT_CAST(device, VK_OBJECT_TYPE_DEVICE, VkDevice)
+ 
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index 1abc23a..4a4590d 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -262,22 +262,53 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+ 
+    /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR in place */
+    VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
++   VkImportMemoryHostPointerInfoEXT local_host_import_info;
++   bool host_ptr_import = false;
+    VkImportMemoryResourceInfoMESA *res_info = NULL;
+    void *prev_of_res_info = vkr_find_prev_struct(
+       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+    if (prev_of_res_info) {
+       res_info = (VkImportMemoryResourceInfoMESA *)vkr_pnext_get_next(prev_of_res_info);
+-      if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
+-         args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+-         return;
+-      }
++      struct vkr_resource *host_res = vkr_context_get_resource(ctx, res_info->resourceId);
++      if (host_res && host_res->fd_type == VIRGL_RESOURCE_HOST_PTR) {
++         /* Conduit: guest pages the backend mapped, imported by pointer. The
++          * size is rounded up to the import alignment; the mapping is whole
++          * pages and never smaller than that. */
++         const VkDeviceSize align =
++            MAX2(physical_dev->min_imported_host_pointer_alignment, 1);
++         const VkDeviceSize size =
++            (alloc_info->allocationSize + align - 1) / align * align;
++         if (!dev->GetMemoryHostPointerPropertiesEXT || !size || size > host_res->size ||
++             ((uintptr_t)host_res->u.data % align)) {
++            args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++            return;
++         }
++         alloc_info->allocationSize = size;
++         local_host_import_info = (VkImportMemoryHostPointerInfoEXT){
++            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
++            .pNext = res_info->pNext,
++            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++            .pHostPointer = host_res->u.data,
++         };
++         vkr_pnext_set_next(prev_of_res_info, &local_host_import_info);
++         host_ptr_import = true;
++      } else {
++         if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
++            args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++            return;
++         }
+ 
+-      vkr_pnext_set_next(prev_of_res_info, &local_import_info);
++         vkr_pnext_set_next(prev_of_res_info, &local_import_info);
++      }
+    }
+ 
+    VkExportMemoryAllocateInfo *export_info =
+       vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+ 
++   /* Conduit: host memory cannot be exported again */
++   if (host_ptr_import && export_info)
++      export_info->handleTypes = 0;
++
+    /* track if driver has requested export allocation */
+    const bool might_export = export_info && export_info->handleTypes;
+ 
+@@ -478,6 +509,30 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
+       return;
+    }
+ 
++   if (res->fd_type == VIRGL_RESOURCE_HOST_PTR) {
++      /* Conduit: guest pages imported by pointer */
++      if (!dev->GetMemoryHostPointerPropertiesEXT) {
++         args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++         return;
++      }
++      VkMemoryHostPointerPropertiesEXT host_props = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
++      };
++      vn_replace_vkGetMemoryResourcePropertiesMESA_args_handle(args);
++      args->ret = dev->GetMemoryHostPointerPropertiesEXT(
++         args->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, res->u.data,
++         &host_props);
++      if (args->ret != VK_SUCCESS)
++         return;
++      args->pMemoryResourceProperties->memoryTypeBits = host_props.memoryTypeBits;
++      VkMemoryResourceAllocationSizePropertiesMESA *size_props =
++         vkr_find_struct(args->pMemoryResourceProperties->pNext,
++                         VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA);
++      if (size_props)
++         size_props->allocationSize = res->size;
++      return;
++   }
++
+    if (res->fd_type != VIRGL_RESOURCE_FD_DMABUF) {
+       args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+       return;
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index bc38754..52e6592 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -158,11 +158,19 @@ vkr_physical_device_init_id_properties(struct vkr_physical_device *physical_dev)
+ 
+    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
+    physical_dev->id_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
++   VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
++   };
++   if (physical_dev->EXT_external_memory_host)
++      physical_dev->id_properties.pNext = &host_props;
+    VkPhysicalDeviceProperties2 props2 = {
+       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+       .pNext = &physical_dev->id_properties
+    };
+    vk->GetPhysicalDeviceProperties2(handle, &props2);
++   physical_dev->id_properties.pNext = NULL;
++   physical_dev->min_imported_host_pointer_alignment =
++      host_props.minImportedHostPointerAlignment;
+ }
+ 
+ static void
+@@ -280,6 +288,8 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+          physical_dev->KHR_external_memory_fd = true;
+       else if (!strcmp(props->extensionName, "VK_EXT_external_memory_dma_buf"))
+          physical_dev->EXT_external_memory_dma_buf = true;
++      else if (!strcmp(props->extensionName, "VK_EXT_external_memory_host"))
++         physical_dev->EXT_external_memory_host = true;
+       else if (!strcmp(props->extensionName, "VK_KHR_external_fence_fd"))
+          physical_dev->KHR_external_fence_fd = true;
+       else if (!strcmp(props->extensionName, "VK_EXT_external_memory_metal"))
+diff --git a/src/venus/vkr_physical_device.h b/src/venus/vkr_physical_device.h
+index 371899b..90eeacb 100644
+--- a/src/venus/vkr_physical_device.h
++++ b/src/venus/vkr_physical_device.h
+@@ -23,6 +23,9 @@ struct vkr_physical_device {
+ 
+    bool KHR_external_memory_fd;
+    bool EXT_external_memory_dma_buf;
++   /* Conduit: host-pointer imports of guest memory */
++   bool EXT_external_memory_host;
++   VkDeviceSize min_imported_host_pointer_alignment;
+    bool KHR_portability_subset;
+ 
+    bool KHR_external_fence_fd;
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index 8aae924..a619906 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -231,6 +231,25 @@ vkr_renderer_import_resource(uint32_t ctx_id,
+    return vkr_context_import_resource(ctx, res_id, fd_type, fd, size);
+ }
+ 
++bool
++vkr_renderer_import_resource_host_ptr(uint32_t ctx_id,
++                                      uint32_t res_id,
++                                      void *ptr,
++                                      uint64_t size)
++{
++   TRACE_FUNC();
++
++   assert(res_id);
++   assert(ptr);
++   assert(size);
++
++   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
++   if (!ctx)
++      return false;
++
++   return vkr_context_import_resource_host_ptr(ctx, res_id, ptr, size);
++}
++
+ void
+ vkr_renderer_destroy_resource(uint32_t ctx_id, uint32_t res_id)
+ {
+diff --git a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
+index be3ae04..0983954 100644
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -71,6 +71,12 @@ vkr_renderer_import_resource(uint32_t ctx_id,
+                              int fd,
+                              uint64_t size);
+ 
++bool
++vkr_renderer_import_resource_host_ptr(uint32_t ctx_id,
++                                      uint32_t res_id,
++                                      void *ptr,
++                                      uint64_t size);
++
+ void
+ vkr_renderer_destroy_resource(uint32_t ctx_id, uint32_t res_id);
+ 
+diff --git a/src/virgl_resource.c b/src/virgl_resource.c
+index 0ee5468..0923b15 100644
+--- a/src/virgl_resource.c
++++ b/src/virgl_resource.c
+@@ -47,7 +47,8 @@ virgl_resource_destroy_func(void *val)
+    if (res->pipe_resource)
+       pipe_callbacks.unref(res->pipe_resource, pipe_callbacks.data);
+    if ((res->fd_type != VIRGL_RESOURCE_FD_INVALID) &&
+-       (res->fd_type != VIRGL_RESOURCE_OPAQUE_HANDLE))
++       (res->fd_type != VIRGL_RESOURCE_OPAQUE_HANDLE) &&
++       (res->fd_type != VIRGL_RESOURCE_HOST_PTR))
+       close(res->fd);
+ 
+    free(res);
+@@ -161,6 +162,21 @@ virgl_resource_create_from_fd(uint32_t res_id,
+    return res;
+ }
+ 
++struct virgl_resource *
++virgl_resource_create_from_host_ptr(uint32_t res_id, void *ptr, uint64_t size)
++{
++   struct virgl_resource *res = virgl_resource_create(res_id);
++   if (!res)
++      return NULL;
++
++   res->fd_type = VIRGL_RESOURCE_HOST_PTR;
++   res->host_ptr = ptr;
++   res->map_size = size;
++   res->map_info = 0;
++
++   return res;
++}
++
+ struct virgl_resource *
+ virgl_resource_create_from_opaque_handle(struct virgl_context *ctx,
+                                          uint32_t res_id,
+@@ -263,6 +279,8 @@ virgl_resource_export_fd(struct virgl_resource *res, int *fd)
+          return VIRGL_RESOURCE_FD_INVALID;
+ 
+       return ctx->export_opaque_handle(ctx, res, fd);
++   } else if (res->fd_type == VIRGL_RESOURCE_HOST_PTR) {
++      return VIRGL_RESOURCE_FD_INVALID;
+    } else if (res->fd_type != VIRGL_RESOURCE_FD_INVALID) {
+       *fd = os_dupfd_cloexec(res->fd);
+       return *fd >= 0 ? res->fd_type : VIRGL_RESOURCE_FD_INVALID;
+diff --git a/src/virgl_resource.h b/src/virgl_resource.h
+index 8eb770e..148a865 100644
+--- a/src/virgl_resource.h
++++ b/src/virgl_resource.h
+@@ -50,6 +50,10 @@ enum virgl_resource_fd_type {
+     */
+    VIRGL_RESOURCE_OPAQUE_HANDLE,
+ 
++   /* Conduit: no fd; host memory at virgl_resource::host_ptr, owned by the
++    * embedder (virgl_renderer_resource_import_host_ptr). */
++   VIRGL_RESOURCE_HOST_PTR,
++
+    VIRGL_RESOURCE_FD_INVALID = -1,
+ };
+ 
+@@ -106,6 +110,9 @@ struct virgl_resource {
+    struct virgl_resource_vulkan_info vulkan_info;
+ 
+    void *private_data;
++
++   /* fd_type == VIRGL_RESOURCE_HOST_PTR: the memory, map_size bytes */
++   void *host_ptr;
+ };
+ 
+ struct virgl_resource_pipe_callbacks {
+@@ -174,4 +181,7 @@ virgl_resource_detach_iov(struct virgl_resource *res);
+ enum virgl_resource_fd_type
+ virgl_resource_export_fd(struct virgl_resource *res, int *fd);
+ 
++struct virgl_resource *
++virgl_resource_create_from_host_ptr(uint32_t res_id, void *ptr, uint64_t size);
++
+ #endif /* VIRGL_RESOURCE_H */
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index ce2b03d..7fbf48c 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -1382,6 +1382,7 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
+          map = ctx->resource_map(ctx, res, NULL, PROT_WRITE | PROT_READ, MAP_SHARED);
+          map_size = res->map_size;
+          break;
++      case VIRGL_RESOURCE_HOST_PTR:
+       case VIRGL_RESOURCE_FD_INVALID:
+          /* Avoid a default case so that -Wswitch will tell us at compile time
+           * if a new virgl resource type is added without being handled here.
+@@ -1437,6 +1438,7 @@ int virgl_renderer_resource_map_fixed(uint32_t res_handle, void *addr)
+                                  MAP_FIXED | MAP_SHARED);
+          break;
+       case VIRGL_RESOURCE_FD_OPAQUE:
++      case VIRGL_RESOURCE_HOST_PTR:
+       case VIRGL_RESOURCE_FD_INVALID:
+          /* Avoid a default case so that -Wswitch will tell us at compile time
+           * if a new virgl resource type is added without being handled here.
+@@ -1481,6 +1483,7 @@ int virgl_renderer_resource_unmap(uint32_t res_handle)
+       case VIRGL_RESOURCE_FD_OPAQUE:
+          ret = vkr_allocator_resource_unmap(res);
+          break;
++      case VIRGL_RESOURCE_HOST_PTR:
+       case VIRGL_RESOURCE_FD_INVALID:
+          /* Avoid a default case so that -Wswitch will tell us at compile time
+           * if a new virgl resource type is added without being handled here.
+@@ -1529,6 +1532,7 @@ virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
+       *fd_type = VIRGL_RENDERER_BLOB_FD_TYPE_SHM;
+       break;
+    case VIRGL_RESOURCE_OPAQUE_HANDLE:
++   case VIRGL_RESOURCE_HOST_PTR:
+    case VIRGL_RESOURCE_FD_INVALID:
+       /* Avoid a default case so that -Wswitch will tell us at compile time if a
+        * new virgl resource type is added without being handled here.
+@@ -1596,6 +1600,31 @@ virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_
+    return 0;
+ }
+ 
++int
++virgl_renderer_resource_import_host_ptr(uint32_t res_handle, void *ptr, uint64_t size)
++{
++   TRACE_FUNC();
++
++#ifndef ENABLE_RENDER_SERVER_WORKER_THREAD
++   (void)res_handle;
++   (void)ptr;
++   (void)size;
++   return -EOPNOTSUPP;
++#else
++   const uint64_t page = (uint64_t)getpagesize();
++   if (!res_handle || !ptr || !size || ((uintptr_t)ptr % page) || (size % page))
++      return -EINVAL;
++   if (virgl_resource_lookup(res_handle))
++      return -EINVAL;
++
++   struct virgl_resource *res = virgl_resource_create_from_host_ptr(res_handle, ptr, size);
++   if (!res)
++      return -ENOMEM;
++
++   return 0;
++#endif
++}
++
+ int
+ virgl_renderer_export_fence(uint64_t client_fence_id, int *fd)
+ {
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+index 0bcafef..2929b61 100644
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -451,6 +451,17 @@ struct virgl_renderer_resource_import_blob_args
+ VIRGL_EXPORT int
+ virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_blob_args *args);
+ 
++/* Conduit: a resource whose memory is [ptr, ptr + size) of this process, for
++ * example guest pages the embedder mapped. Venus contexts import it through
++ * VkImportMemoryResourceInfoMESA, which vkr turns into a
++ * VK_EXT_external_memory_host import of the pointer. ptr and size must be
++ * page-aligned, and the mapping must outlive the resource. Only with the
++ * render server's thread worker, where the pointer means the same thing on
++ * both sides. Returns 0 or a negative errno.
++ */
++VIRGL_EXPORT int
++virgl_renderer_resource_import_host_ptr(uint32_t res_handle, void *ptr, uint64_t size);
++
+ #define VIRGL_RENDERER_FENCE_FLAG_MERGEABLE      (1 << 0)
+ VIRGL_EXPORT int virgl_renderer_context_create_fence(uint32_t ctx_id,
+                                                      uint32_t flags,

@@ -160,6 +160,18 @@ impl Renderer for Shared {
         self.check()?;
         self.mock.lock().unwrap().import_dmabuf(res_id, fd, size)
     }
+    fn import_guest_pages(
+        &mut self,
+        res_id: u32,
+        ram: BorrowedFd<'_>,
+        runs: &[conduit_venus::PageRun],
+    ) -> conduit_venus::Result<()> {
+        self.check()?;
+        self.mock
+            .lock()
+            .unwrap()
+            .import_guest_pages(res_id, ram, runs)
+    }
 }
 
 /// The RM side of the backend: objects by (file, GEM handle), each a memfd
@@ -310,6 +322,8 @@ struct Rig {
     region: Arc<Region>,
     resp: Vec<u8>,
     rm: FakeRm,
+    /// Guest RAM, for guest-memory blobs; none unless a test gives it.
+    ram: Option<crate::guestmem::fake::FakeRam>,
 }
 
 impl Rig {
@@ -329,6 +343,7 @@ impl Rig {
             region: Region::new(HOSTMEM),
             resp: vec![0u8; 64 * 1024],
             rm: FakeRm::default(),
+            ram: None,
         }
     }
 
@@ -337,6 +352,10 @@ impl Rig {
             window: Some(&*self.region),
             display,
             rm: Some(&self.rm),
+            ram: self
+                .ram
+                .as_ref()
+                .map(|r| r as &dyn crate::guestmem::GuestRam),
         };
         self.venus.dispatch(cmd, &mut self.resp, env)
     }
@@ -366,6 +385,7 @@ impl Rig {
             window: Some(&*self.region),
             display: None,
             rm: None,
+            ram: None,
         };
         self.venus.completions(env)
     }
@@ -1478,4 +1498,5 @@ fn scanout_modifier_reaches_the_viewer() {
     assert_eq!(t.venus.scanout_modifier(), Some(0x0300_0000_0060_6010));
 }
 
+mod guest;
 mod rm;

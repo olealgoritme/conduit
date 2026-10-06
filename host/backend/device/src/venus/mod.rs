@@ -10,7 +10,7 @@
 //! this side has not seen created.
 //!
 //! `mod.rs` holds the state and the dispatch; display info, the EDID,
-//! contexts and capsets are in `cmd.rs` (the EDID's bytes in `edid.rs`), blobs and region 3 in `blob.rs`, RM-export blobs in `rm.rs`, fences in `fence.rs` and the
+//! contexts and capsets are in `cmd.rs` (the EDID's bytes in `edid.rs`), blobs and region 3 in `blob.rs`, RM-export blobs in `rm.rs`, guest-memory blobs in `guest.rs`, fences in `fence.rs` and the
 //! scanout in `scanout.rs`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -27,6 +27,7 @@ mod blob;
 mod cmd;
 pub mod edid;
 mod fence;
+mod guest;
 mod rm;
 mod scanout;
 #[cfg(test)]
@@ -64,6 +65,8 @@ pub struct Env<'a> {
     pub window: Option<&'a dyn WindowPlacer>,
     pub display: Option<&'a DisplayLink>,
     pub rm: Option<&'a dyn RmExports>,
+    /// Guest RAM, for guest-memory blobs (`guest.rs`).
+    pub ram: Option<&'a dyn crate::guestmem::GuestRam>,
 }
 
 /// The RM side of the backend, as an RM-export blob needs it
@@ -101,6 +104,9 @@ struct Resource {
     /// to the host object, held until the resource goes, whatever the guest
     /// does with the render node it came from.
     rm: Option<RmImport>,
+    /// A guest-memory blob: `fd` is then the guest RAM file its pages are
+    /// in, and this is what it counts against the live limits.
+    guest: Option<guest::GuestPages>,
 }
 
 /// What an RM-export blob carries besides its dma-buf.
@@ -149,6 +155,12 @@ pub struct Venus {
     /// The errno the command being served was refused with, echoed in the
     /// error response's header (`errno_padding`). Set by RM-export blobs.
     refusal_errno: Option<i32>,
+    /// Guest-memory blobs are served (`--venus-guest-blobs` and a renderer
+    /// that imports host memory).
+    guest_blobs: bool,
+    /// What live guest-memory blobs hold, against the `GUEST_BLOB_MAX_LIVE*`
+    /// limits.
+    guest_live: guest::Live,
     /// Whether a renderer descriptor is a dma-buf (`rm::is_dmabuf`); a
     /// stand-in in tests, whose mock renderer hands out memfds.
     is_dmabuf: fn(BorrowedFd<'_>) -> bool,
@@ -177,6 +189,8 @@ impl Venus {
         }
         Self {
             rm_import,
+            guest_blobs: false,
+            guest_live: Default::default(),
             refusal_errno: None,
             is_dmabuf: rm::is_dmabuf,
             renderer,
@@ -414,7 +428,7 @@ impl Venus {
                     .ok_or(RESP_ERR_UNSPEC)?;
                 exact(ResourceCreateBlob::LEN.saturating_add(entries))?;
                 self.count("resource_create_blob");
-                self.create_blob(&c, env)
+                self.create_blob(&c, &b[ResourceCreateBlob::LEN..], env)
             }
             CMD_RESOURCE_MAP_BLOB => {
                 exact(ResourceMapBlob::LEN)?;
@@ -522,6 +536,7 @@ impl Venus {
         }
         self.resources.clear();
         self.contexts.clear();
+        self.guest_live = Default::default();
     }
 
     /// Device reset or backend exit (docs/VENUS.md "Reset and close"):

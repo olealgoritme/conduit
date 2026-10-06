@@ -77,6 +77,20 @@ pub const BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
 /// be mapped.
 pub const BLOB_MEM_RM_EXPORT: u32 = 0x8000_0001;
 
+/// Guest-memory blobs ([`BLOB_MEM_GUEST`], docs/VENUS.md "Guest-memory
+/// blobs", only with [`crate::messages::NVGPU_CFG_GUEST_BLOB`]): the most
+/// `virtio_gpu_mem_entry`s one create may carry.
+pub const GUEST_BLOB_MAX_ENTRIES: u32 = 4096;
+/// The largest guest-memory blob.
+pub const GUEST_BLOB_MAX_BYTES: u64 = 256 << 20;
+/// Guest-memory blobs one VM may hold at once.
+pub const GUEST_BLOB_MAX_LIVE: usize = 1024;
+/// Page runs (after merging runs adjacent in guest RAM) all live
+/// guest-memory blobs may hold together: each is one host mapping.
+pub const GUEST_BLOB_MAX_LIVE_RUNS: usize = 32768;
+/// Bytes all live guest-memory blobs may cover together.
+pub const GUEST_BLOB_MAX_LIVE_BYTES: u64 = 32 << 30;
+
 /// `blob_id` of a [`BLOB_MEM_RM_EXPORT`] blob: (rm_handle, gem_handle).
 pub const fn rm_export_ids(blob_id: u64) -> (u32, u32) {
     ((blob_id >> 32) as u32, blob_id as u32)

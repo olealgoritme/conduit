@@ -255,7 +255,7 @@ pub(crate) mod fake {
     /// Guest RAM made of memfds, one per region, so the stitcher can be run
     /// against something whose contents are known.
     pub(crate) struct FakeRam {
-        regions: Vec<(u64, u64, OwnedFd)>, // base, len, fd
+        regions: Vec<(u64, u64, OwnedFd, u64)>, // base, len, fd, offset in fd
     }
 
     impl FakeRam {
@@ -267,7 +267,27 @@ pub(crate) mod fake {
                         unsafe { libc::memfd_create(c"guest-ram".as_ptr(), libc::MFD_CLOEXEC) };
                     assert!(raw >= 0);
                     assert_eq!(unsafe { libc::ftruncate(raw, len as libc::off_t) }, 0);
-                    (base, len, unsafe { OwnedFd::from_raw_fd(raw) })
+                    (base, len, unsafe { OwnedFd::from_raw_fd(raw) }, 0)
+                })
+                .collect();
+            Self { regions }
+        }
+
+        /// Every region in one memfd, one after another, as QEMU backs a
+        /// VM's RAM with one memfd and its regions are ranges of it.
+        pub(crate) fn one_file(spans: &[(u64, u64)]) -> Self {
+            let total: u64 = spans.iter().map(|&(_, len)| len).sum();
+            let raw = unsafe { libc::memfd_create(c"guest-ram".as_ptr(), libc::MFD_CLOEXEC) };
+            assert!(raw >= 0);
+            assert_eq!(unsafe { libc::ftruncate(raw, total as libc::off_t) }, 0);
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            let mut at = 0;
+            let regions = spans
+                .iter()
+                .map(|&(base, len)| {
+                    let r = (base, len, fd.try_clone().expect("dup"), at);
+                    at += len;
+                    r
                 })
                 .collect();
             Self { regions }
@@ -276,7 +296,7 @@ pub(crate) mod fake {
         /// Fill every page with a byte derived from its guest address, so a
         /// stitched span can be checked page by page.
         pub(crate) fn fill(&self) {
-            for &(base, len, ref fd) in &self.regions {
+            for &(base, len, ref fd, start) in &self.regions {
                 for page in 0..len / PAGE {
                     let b = [mark(base + page * PAGE); PAGE as usize];
                     let n = unsafe {
@@ -284,7 +304,7 @@ pub(crate) mod fake {
                             fd.as_raw_fd(),
                             b.as_ptr() as *const libc::c_void,
                             PAGE as usize,
-                            (page * PAGE) as libc::off_t,
+                            (start + page * PAGE) as libc::off_t,
                         )
                     };
                     assert_eq!(n, PAGE as isize);
@@ -318,10 +338,10 @@ pub(crate) mod fake {
         fn backing(&self, gpa: u64) -> Option<Backing> {
             self.regions
                 .iter()
-                .find(|&&(base, len, _)| gpa >= base && gpa < base + len)
-                .map(|&(base, len, ref fd)| Backing {
+                .find(|&&(base, len, _, _)| gpa >= base && gpa < base + len)
+                .map(|&(base, len, ref fd, start)| Backing {
                     fd: fd.try_clone().expect("duplicating a memfd"),
-                    offset: gpa - base,
+                    offset: start + gpa - base,
                     len: base + len - gpa,
                 })
         }

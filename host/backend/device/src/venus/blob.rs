@@ -51,11 +51,20 @@ impl Maps {
 }
 
 impl Venus {
-    /// `blob_mem = HOST3D`, or Conduit's `BLOB_MEM_RM_EXPORT` (`rm.rs`);
-    /// guest-memory blobs are refused for now.
-    pub(super) fn create_blob(&mut self, c: &ResourceCreateBlob, env: Env<'_>) -> Answer {
+    /// `blob_mem = HOST3D`, Conduit's `BLOB_MEM_RM_EXPORT` (`rm.rs`), or
+    /// `GUEST` (`guest.rs`, only with `--venus-guest-blobs`). `entries` are
+    /// the `virtio_gpu_mem_entry`s after the struct, `nr_entries` of them.
+    pub(super) fn create_blob(
+        &mut self,
+        c: &ResourceCreateBlob,
+        entries: &[u8],
+        env: Env<'_>,
+    ) -> Answer {
         if c.blob_mem == BLOB_MEM_RM_EXPORT {
             return self.create_rm_blob(c, env);
+        }
+        if c.blob_mem == BLOB_MEM_GUEST && self.guest_blobs {
+            return self.create_guest_blob(c, entries, env);
         }
         let ctx = c.hdr.ctx_id;
         log::debug!(
@@ -119,6 +128,7 @@ impl Venus {
                 attached: HashSet::from([ctx]),
                 export: None,
                 rm: None,
+                guest: None,
             },
         );
         Ok(Reply::NoData)
@@ -187,6 +197,9 @@ impl Venus {
         let Some(r) = self.resources.remove(&id) else {
             return Err(RESP_ERR_INVALID_RESOURCE_ID);
         };
+        if let Some(g) = &r.guest {
+            self.guest_live.remove(g);
+        }
         if let Some(offset) = r.mapped {
             self.withdraw(offset, id, env);
         }
