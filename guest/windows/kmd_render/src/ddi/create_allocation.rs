@@ -337,6 +337,12 @@ pub struct PresentAllocInfo {
     /// to read, which is why the Present path takes it from here and not from the
     /// table.
     pub foreign: Option<fr::Layout>,
+    /// The open identity's FOREIGN flag: the KMD's own record (a foreign-table hit at
+    /// open, never creator data) that this allocation adopted a foreign resource. Unlike
+    /// [`Self::foreign`] it is not a layout hint and needs no lock to read; Present uses it
+    /// to answer a refusal for a foreign allocation with a counted success instead of a
+    /// failure (`helios_kmd_logic::present_foreign`).
+    pub foreign_identity: bool,
 }
 
 /// TRACE-ONLY companion to [`PresentAllocInfo`], resolved by
@@ -3740,6 +3746,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 memory_type_index: identity.memory_type_index,
                 direct_scanout: misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT != 0,
                 foreign: foreign_layout_from_open(identity.kind, meta, foreign_trailer),
+                foreign_identity: identity.foreign,
             }
         });
         // Trace-only companion (R316): these seven values have no consumer

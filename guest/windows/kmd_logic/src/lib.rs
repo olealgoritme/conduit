@@ -42,6 +42,7 @@ pub mod execution_completion;
 pub mod flush_gate;
 pub mod flush_trace;
 pub mod rm_fence_present;
+pub mod present_foreign;
 pub mod msi;
 pub mod paging;
 pub mod sweep_budget;
