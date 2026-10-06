@@ -844,7 +844,14 @@ pub(crate) unsafe fn forget_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D1
         return;
     }
     let key = h_resource.pDrvPrivate as usize;
+    let before = list.len();
     list.retain(|&(k, _)| k != key);
+    if list.len() != before {
+        // The ledger slot is freed when no process holds the resource.
+        if let Some(res) = load_resource(h_resource) {
+            dev.dxvk.handoff_unregister(res.as_raw() as usize);
+        }
+    }
 }
 
 pub(crate) unsafe extern "system" fn create_resource(

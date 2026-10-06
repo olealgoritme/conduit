@@ -162,6 +162,9 @@ struct HeliosDxvkDevice {
   // without anyone waiting. 0 = nothing new, 1 = published, -1 = ledger
   // unavailable or full (fall back), -2 = failed.
   void handoff_register(std::size_t d3d11_resource_ptr) const noexcept;
+  // The resource goes (DestroyResource): this process stops holding its key;
+  // the slot is freed when no process holds it.
+  void handoff_unregister(std::size_t d3d11_resource_ptr) const noexcept;
   std::int32_t handoff_publish(const std::size_t* resources,
                                std::uint32_t resource_count) const noexcept;
 

@@ -47,6 +47,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 #include "dxvk_instance.h"
 #include "dxvk_adapter.h"
@@ -357,14 +358,21 @@ struct HeliosDxvkDeviceImpl {
   std::mutex flush_gate_mutex;
   std::uint64_t flush_gate_seq = UINT64_MAX;
 
-  // Hand-off ledger (helios_handoff): this device's record, its local
-  // timeline and last point. Guarded by flush_gate_mutex.
+  // Hand-off ledger (helios_handoff): this device's record and its
+  // generation, the local timeline and last point. Guarded by
+  // flush_gate_mutex; the record is freed in the destructor.
   std::uint32_t handoff_device = UINT32_MAX;
-  bool handoff_failed = false;
+  std::uint32_t handoff_gen = 0;
+  void* handoff_table = nullptr;
   dxvk::Rc<dxvk::DxvkFence> handoff_fence;
   std::uint64_t handoff_value = 0;
 
+  // Defined after helios_handoff: free this device's ledger record once its
+  // last point is done (so no late completion lands in a reused record).
+  void release_handoff_record();
+
   ~HeliosDxvkDeviceImpl() {
+    release_handoff_record();
     if (vehicle_semaphore_handle) CloseHandle(vehicle_semaphore_handle);
     if (context) context->Release();
     if (d3d11) d3d11->Release();
@@ -453,42 +461,62 @@ namespace {
 
 // ---- Cross-process hand-off ledger (docs/shared-surfaces.md section 4) -----
 //
-// One page set per Windows session ("Local\\HeliosHandoffLedger"), shared by
+// One shared table per Windows session ("Local\\HeliosHandoffLedger2"), used by
 // every process with the Helios UMD. At a hand-off (a flush of a device that
 // holds cross-process shared resources) the releaser writes, for each of those
-// resources keyed by its KMD resource id, "device record d, point p"; a fence
-// worker of the releaser's DXVK device stores `completed = p` into record d
-// when the GPU finished everything recorded before the hand-off. A reader of a
-// shared image samples the slot when it records the read and its submission
-// worker waits until record d's `completed` reaches p (DXVK patch 0007). So the
-// releaser never waits, the acquirer waits only for that producer, and nothing
-// heads the adapter's queue, on Venus and NVK alike.
+// resources keyed by its KMD resource id, "device record d (generation g),
+// point p"; a fence worker of the releaser's DXVK device stores
+// `completed = p` into record d when the GPU finished everything recorded
+// before the hand-off. Any first access of a shared image in a reader's
+// command list samples the slot and its submission worker waits until record
+// d (still generation g) completes p (DXVK patch 0007). So the releaser never
+// waits, the acquirer waits only for that producer, and nothing heads the
+// adapter's queue, on Venus and NVK alike.
+//
+// Reclamation: a slot lists the processes that hold its resource (up to four
+// pids, more are counted) and is freed when the last one lets go; a device
+// record is freed when its device goes and taken over when its process is
+// gone. Slots and records whose processes died are swept when the table runs
+// low. Counters in the header: slots and records in use, fallbacks, sweeps.
 namespace helios_handoff {
-  constexpr std::uint32_t kMagic   = 0x4C474448u; // 'HDGL'
-  constexpr std::uint32_t kDevices = 65536u;      // never reused within a session
-  constexpr std::uint32_t kSlots   = 32768u;      // keys, never freed
+  constexpr std::uint32_t kMagic   = 0x324C4448u; // 'HDL2'
+  constexpr std::uint32_t kDevices = 4096u;
+  constexpr std::uint32_t kSlots   = 32768u;
   constexpr std::uint32_t kProbe   = 64u;
-  constexpr std::uint64_t kPointMask = (1ull << 48) - 1ull;
+  constexpr std::uint32_t kPids    = 4u;
+  constexpr std::uint32_t kTombstone = 0xFFFFFFFFu;
+  // packed = device (12 bits) << 52 | generation (12 bits) << 40 | point (40 bits)
+  constexpr std::uint64_t kPointMask = (1ull << 40) - 1ull;
+  constexpr std::uint32_t kGenMask = 0xFFFu;
 
   struct Device {
     std::atomic<std::uint32_t> pid;
-    std::uint32_t reserved;
+    std::atomic<std::uint32_t> gen;
     std::atomic<std::uint64_t> completed;
   };
   struct Slot {
     std::atomic<std::uint32_t> key;
-    std::uint32_t reserved;
-    std::atomic<std::uint64_t> packed; // device << 48 | point
+    std::atomic<std::uint32_t> extra_holders; // holders beyond `pids`
+    std::atomic<std::uint64_t> packed;
+    std::atomic<std::uint32_t> pids[kPids];
   };
   struct Table {
     std::atomic<std::uint32_t> magic;
     std::uint32_t version;
     std::atomic<std::uint32_t> next_device;
-    std::uint32_t reserved;
+    std::atomic<std::uint32_t> records_in_use;
+    std::atomic<std::uint32_t> slots_in_use;
+    std::atomic<std::uint32_t> fallbacks;
+    std::atomic<std::uint32_t> sweeps;
+    std::atomic<std::uint32_t> handoffs;
     Device devices[kDevices];
     Slot slots[kSlots];
   };
-  static_assert(sizeof(Device) == 16 && sizeof(Slot) == 16, "ledger layout");
+  static_assert(sizeof(Device) == 16 && sizeof(Slot) == 32, "ledger layout");
+
+  inline std::uint64_t pack(std::uint32_t dev, std::uint32_t gen, std::uint64_t point) {
+    return (std::uint64_t(dev) << 52) | (std::uint64_t(gen & kGenMask) << 40) | (point & kPointMask);
+  }
 
   Table* table() {
     static Table* s_table = []() -> Table* {
@@ -499,7 +527,7 @@ namespace helios_handoff {
             L"D:(A;;GA;;;WD)(A;;GA;;;SY)(A;;GA;;;AC)S:(ML;;NW;;;LW)", SDDL_REVISION_1, &sd, nullptr))
         sa.lpSecurityDescriptor = sd;
       HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, sa.lpSecurityDescriptor ? &sa : nullptr,
-        PAGE_READWRITE, 0, DWORD(sizeof(Table)), L"Local\\HeliosHandoffLedger");
+        PAGE_READWRITE, 0, DWORD(sizeof(Table)), L"Local\\HeliosHandoffLedger2");
       if (sd)
         LocalFree(sd);
       if (!mapping)
@@ -526,49 +554,223 @@ namespace helios_handoff {
     return on;
   }
 
-  std::uint32_t claim_device() {
-    Table* t = table();
-    if (!t)
-      return UINT32_MAX;
-    const std::uint32_t d = t->next_device.fetch_add(1);
-    if (d >= kDevices)
-      return UINT32_MAX;
-    t->devices[d].completed.store(0);
-    t->devices[d].pid.store(GetCurrentProcessId());
-    return d;
+  bool process_alive(std::uint32_t pid) {
+    if (!pid)
+      return false;
+    if (pid == GetCurrentProcessId())
+      return true;
+    HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!p)
+      return GetLastError() == ERROR_ACCESS_DENIED; // exists, not ours to open
+    const bool alive = WaitForSingleObject(p, 0) == WAIT_TIMEOUT;
+    CloseHandle(p);
+    return alive;
   }
 
-  Slot* find(Table* t, std::uint32_t key, bool claim) {
+  // ---- device records
+
+  void free_device(Table* t, std::uint32_t d) {
+    Device& dev = t->devices[d];
+    dev.completed.store(UINT64_MAX, std::memory_order_release);
+    dev.gen.fetch_add(1, std::memory_order_acq_rel);
+    dev.pid.store(0, std::memory_order_release);
+    t->records_in_use.fetch_sub(1);
+  }
+
+  // A fresh record, else a freed one, else one whose process is gone.
+  std::uint32_t claim_device(Table* t, std::uint32_t* gen_out) {
+    const std::uint32_t me = GetCurrentProcessId();
+    auto take = [&](std::uint32_t d) {
+      Device& dev = t->devices[d];
+      const std::uint32_t gen = dev.gen.fetch_add(1, std::memory_order_acq_rel) + 1;
+      dev.completed.store(0, std::memory_order_release);
+      *gen_out = gen;
+      t->records_in_use.fetch_add(1);
+      return d;
+    };
+    std::uint32_t d = t->next_device.load();
+    while (d < kDevices) {
+      if (t->next_device.compare_exchange_weak(d, d + 1)) {
+        t->devices[d].pid.store(me);
+        return take(d);
+      }
+    }
+    for (std::uint32_t i = 0; i < kDevices; i++) {
+      std::uint32_t zero = 0;
+      if (t->devices[i].pid.compare_exchange_strong(zero, me))
+        return take(i);
+    }
+    t->sweeps.fetch_add(1);
+    for (std::uint32_t i = 0; i < kDevices; i++) {
+      std::uint32_t pid = t->devices[i].pid.load();
+      if (pid && !process_alive(pid) && t->devices[i].pid.compare_exchange_strong(pid, me)) {
+        t->records_in_use.fetch_sub(1);
+        return take(i);
+      }
+    }
+    return UINT32_MAX;
+  }
+
+  // ---- slots
+
+  Slot* find(Table* t, std::uint32_t key) {
     std::uint32_t h = (key * 2654435761u) % kSlots;
     for (std::uint32_t i = 0; i < kProbe; i++, h = (h + 1) % kSlots) {
-      Slot& s = t->slots[h];
-      std::uint32_t k = s.key.load(std::memory_order_acquire);
+      const std::uint32_t k = t->slots[h].key.load(std::memory_order_acquire);
       if (k == key)
-        return &s;
-      if (k == 0) {
-        if (!claim)
-          return nullptr;
-        if (s.key.compare_exchange_strong(k, key) || k == key)
-          return &s;
-      }
+        return &t->slots[h];
+      if (k == 0)
+        return nullptr;
     }
     return nullptr;
   }
 
-  // dxvk_helios_backend.h hooks.
+  void sweep_slots(Table* t);
+
+  Slot* find_or_claim(Table* t, std::uint32_t key) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+      if (Slot* s = find(t, key))
+        return s;
+      std::uint32_t h = (key * 2654435761u) % kSlots;
+      for (std::uint32_t i = 0; i < kProbe; i++, h = (h + 1) % kSlots) {
+        Slot& s = t->slots[h];
+        std::uint32_t k = s.key.load(std::memory_order_acquire);
+        if (k == key)
+          return &s;
+        if (k == 0 || k == kTombstone) {
+          if (s.key.compare_exchange_strong(k, key)) {
+            s.packed.store(0, std::memory_order_release);
+            s.extra_holders.store(0);
+            for (auto& p : s.pids)
+              p.store(0);
+            t->slots_in_use.fetch_add(1);
+            return &s;
+          }
+          if (k == key)
+            return &s;
+        }
+      }
+      sweep_slots(t); // full window: reclaim what dead processes left
+    }
+    return nullptr;
+  }
+
+  bool slot_empty(const Slot& s) {
+    if (s.extra_holders.load())
+      return false;
+    for (const auto& p : s.pids)
+      if (p.load())
+        return false;
+    return true;
+  }
+
+  void maybe_free_slot(Table* t, Slot& s, std::uint32_t key) {
+    if (!slot_empty(s))
+      return;
+    std::uint32_t k = key;
+    if (s.key.compare_exchange_strong(k, kTombstone)) {
+      s.packed.store(0, std::memory_order_release);
+      t->slots_in_use.fetch_sub(1);
+    }
+  }
+
+  void add_holder(Slot& s, std::uint32_t pid) {
+    for (auto& p : s.pids)
+      if (p.load() == pid)
+        return;
+    for (auto& p : s.pids) {
+      std::uint32_t zero = 0;
+      if (p.compare_exchange_strong(zero, pid))
+        return;
+    }
+    s.extra_holders.fetch_add(1);
+  }
+
+  void remove_holder(Slot& s, std::uint32_t pid) {
+    for (auto& p : s.pids) {
+      std::uint32_t mine = pid;
+      if (p.compare_exchange_strong(mine, 0))
+        return;
+    }
+    std::uint32_t extra = s.extra_holders.load();
+    while (extra && !s.extra_holders.compare_exchange_weak(extra, extra - 1)) { }
+  }
+
+  void sweep_slots(Table* t) {
+    static std::mutex s_sweep;
+    std::unique_lock lock(s_sweep, std::try_to_lock);
+    if (!lock.owns_lock())
+      return;
+    t->sweeps.fetch_add(1);
+    for (std::uint32_t i = 0; i < kSlots; i++) {
+      Slot& s = t->slots[i];
+      const std::uint32_t key = s.key.load();
+      if (key == 0 || key == kTombstone)
+        continue;
+      for (auto& p : s.pids) {
+        std::uint32_t pid = p.load();
+        if (pid && !process_alive(pid))
+          p.compare_exchange_strong(pid, 0);
+      }
+      // Holders beyond the pid list cannot be checked: such a slot stays.
+      maybe_free_slot(t, s, key);
+    }
+  }
+
+  // Process-local count of registrations per key (several devices or
+  // resources of one process may hold the same resource id).
+  std::mutex s_local_mutex;
+  std::unordered_map<std::uint32_t, std::uint32_t>& local_holds() {
+    static std::unordered_map<std::uint32_t, std::uint32_t> holds;
+    return holds;
+  }
+
+  void hold(std::uint32_t key) {
+    Table* t = table();
+    if (!t || !key)
+      return;
+    std::lock_guard lock(s_local_mutex);
+    if (local_holds()[key]++ == 0) {
+      if (Slot* s = find_or_claim(t, key))
+        add_holder(*s, GetCurrentProcessId());
+      else
+        t->fallbacks.fetch_add(1);
+    }
+  }
+
+  void release(std::uint32_t key) {
+    Table* t = table();
+    if (!t || !key)
+      return;
+    std::lock_guard lock(s_local_mutex);
+    auto it = local_holds().find(key);
+    if (it == local_holds().end() || --it->second != 0)
+      return;
+    local_holds().erase(it);
+    if (Slot* s = find(t, key)) {
+      remove_holder(*s, GetCurrentProcessId());
+      maybe_free_slot(t, *s, key);
+    }
+  }
+
+  // ---- dxvk_helios_backend.h hooks
+
   std::uint64_t sample(std::uint32_t key) {
     Table* t = table();
     if (!t || !key)
       return 0;
-    Slot* s = find(t, key, false);
+    Slot* s = find(t, key);
     if (!s)
       return 0;
     const std::uint64_t packed = s->packed.load(std::memory_order_acquire);
-    const std::uint32_t d = std::uint32_t(packed >> 48);
+    const std::uint32_t d = std::uint32_t(packed >> 52);
+    const std::uint32_t gen = std::uint32_t(packed >> 40) & kGenMask;
     const std::uint64_t point = packed & kPointMask;
     if (!point || d >= kDevices)
       return 0;
     const Device& dev = t->devices[d];
+    if ((dev.gen.load(std::memory_order_acquire) & kGenMask) != gen)
+      return 0; // the publishing device is gone (it went idle first)
     if (dev.pid.load(std::memory_order_relaxed) == GetCurrentProcessId())
       return 0; // our own hand-off: same-process order is DXVK's
     if (dev.completed.load(std::memory_order_acquire) >= point)
@@ -580,7 +782,8 @@ namespace helios_handoff {
     Table* t = table();
     if (!t)
       return true;
-    const std::uint32_t d = std::uint32_t(packed >> 48);
+    const std::uint32_t d = std::uint32_t(packed >> 52);
+    const std::uint32_t gen = std::uint32_t(packed >> 40) & kGenMask;
     const std::uint64_t point = packed & kPointMask;
     if (d >= kDevices)
       return true;
@@ -589,19 +792,13 @@ namespace helios_handoff {
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
     for (std::uint32_t spin = 0;; spin++) {
-      if (dev.completed.load(std::memory_order_acquire) >= point)
+      if ((dev.gen.load(std::memory_order_acquire) & kGenMask) != gen
+       || dev.completed.load(std::memory_order_acquire) >= point)
         return true;
       QueryPerformanceCounter(&now);
       const double ns = double(now.QuadPart - t0.QuadPart) * 1e9 / double(f.QuadPart);
-      if (ns >= double(timeout_ns)) {
-        // A publisher that is gone completes nothing: do not wait for it.
-        const DWORD pid = dev.pid.load(std::memory_order_relaxed);
-        HANDLE p = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : nullptr;
-        const bool alive = p && WaitForSingleObject(p, 0) == WAIT_TIMEOUT;
-        if (p)
-          CloseHandle(p);
-        return !alive;
-      }
+      if (ns >= double(timeout_ns))
+        return !process_alive(dev.pid.load(std::memory_order_relaxed)); // gone: done
       if (spin < 64)
         YieldProcessor();
       else if (spin < 256)
@@ -621,6 +818,15 @@ namespace helios_handoff {
     }();
     (void)done;
   }
+}
+
+void HeliosDxvkDeviceImpl::release_handoff_record() {
+  if (handoff_device == UINT32_MAX || !handoff_table)
+    return;
+  if (handoff_fence != nullptr && handoff_value)
+    (void)handoff_fence->waitBounded(handoff_value, 2000000000ull);
+  helios_handoff::free_device(static_cast<helios_handoff::Table*>(handoff_table), handoff_device);
+  handoff_device = UINT32_MAX;
 }
 
 namespace {
@@ -653,7 +859,21 @@ void HeliosDxvkDevice::handoff_register(std::size_t d3d11_resource_ptr) const no
     if (!impl || !helios_handoff::enabled())
       return false;
     helios_handoff::install_hooks_once();
-    return handoff_key(*impl, d3d11_resource_ptr) != 0;
+    const std::uint32_t key = handoff_key(*impl, d3d11_resource_ptr);
+    helios_handoff::hold(key);
+    return key != 0;
+  });
+}
+
+void HeliosDxvkDevice::handoff_unregister(std::size_t d3d11_resource_ptr) const noexcept {
+  bridge_guard("handoff_unregister", false, [&]() -> bool {
+    if (!impl || !helios_handoff::enabled())
+      return false;
+    auto* texture = dxvk::GetCommonTexture(reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr));
+    if (!texture || !texture->GetImage())
+      return false;
+    helios_handoff::release(texture->GetImage()->heliosHandoffKey());
+    return true;
   });
 }
 
@@ -671,29 +891,37 @@ std::int32_t HeliosDxvkDevice::handoff_publish(const std::size_t* resources,
     const std::uint64_t seq = immediate->HeliosFlushSequence();
     if (seq == impl->flush_gate_seq)
       return 0;
-    if (impl->handoff_failed)
-      return -1; // ledger full: the caller falls back
-    if (impl->handoff_fence == nullptr) {
-      impl->handoff_device = helios_handoff::claim_device();
+    if (impl->handoff_device == UINT32_MAX) {
+      impl->handoff_device = helios_handoff::claim_device(table, &impl->handoff_gen);
       if (impl->handoff_device == UINT32_MAX) {
-        impl->handoff_failed = true;
-        return -1;
+        table->fallbacks.fetch_add(1);
+        return -1; // no record free: the caller falls back, counted
       }
-      dxvk::DxvkFenceCreateInfo info = { };
-      info.initialValue = 0;
-      impl->handoff_fence = impl->device->createFence(info);
+      if (impl->handoff_fence == nullptr) {
+        dxvk::DxvkFenceCreateInfo info = { };
+        info.initialValue = 0;
+        impl->handoff_fence = impl->device->createFence(info);
+      }
+      impl->handoff_table = table;
     }
     const std::uint64_t point = ++impl->handoff_value;
-    if (point > helios_handoff::kPointMask)
+    if (point > helios_handoff::kPointMask) {
+      table->fallbacks.fetch_add(1);
       return -1;
-    const std::uint64_t packed = (std::uint64_t(impl->handoff_device) << 48) | point;
+    }
+    const std::uint64_t packed = helios_handoff::pack(impl->handoff_device, impl->handoff_gen, point);
     std::uint32_t published = 0;
     bool overflow = false;
     for (std::uint32_t i = 0; resources && i < resource_count; i++) {
       const std::uint32_t key = handoff_key(*impl, resources[i]);
       if (!key)
         continue;
-      auto* slot = helios_handoff::find(table, key, true);
+      auto* slot = helios_handoff::find(table, key);
+      if (!slot) {
+        // Registered but no slot (it was full then): try again now.
+        helios_handoff::hold(key);
+        slot = helios_handoff::find(table, key);
+      }
       if (!slot) {
         overflow = true;
         continue;
@@ -702,20 +930,27 @@ std::int32_t HeliosDxvkDevice::handoff_publish(const std::size_t* resources,
       published++;
     }
     impl->flush_gate_seq = immediate->HeliosSignalFlushPoint(impl->handoff_fence, point);
-    auto* device_record = &table->devices[impl->handoff_device];
-    impl->handoff_fence->enqueueWait(point, [device_record, point]() {
-      std::uint64_t cur = device_record->completed.load(std::memory_order_relaxed);
-      while (cur < point && !device_record->completed.compare_exchange_weak(
+    auto* record = &table->devices[impl->handoff_device];
+    const std::uint32_t gen = impl->handoff_gen;
+    impl->handoff_fence->enqueueWait(point, [record, gen, point]() {
+      if (record->gen.load(std::memory_order_acquire) != gen)
+        return; // the record went with its device
+      std::uint64_t cur = record->completed.load(std::memory_order_relaxed);
+      while (cur < point && !record->completed.compare_exchange_weak(
                cur, point, std::memory_order_release, std::memory_order_relaxed)) { }
     });
-    static std::atomic<std::uint64_t> s_handoffs{0};
-    const auto n = s_handoffs.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n <= 4 || (n % 4096u) == 0) {
-      char msg[192];
+    const auto n = table->handoffs.fetch_add(1) + 1;
+    if (overflow)
+      table->fallbacks.fetch_add(1);
+    static std::atomic<std::uint32_t> s_logs{0};
+    if (overflow || s_logs.fetch_add(1) < 4 || (n % 4096u) == 0) {
+      char msg[256];
       std::snprintf(msg, sizeof(msg),
-        "handoff: point %llu of device record %u on %u shared resource(s)%s (#%llu)",
+        "handoff: point %llu of record %u on %u resource(s)%s; ledger: %u slots, %u records "
+        "in use, %u fallbacks, %u sweeps, %u hand-offs",
         static_cast<unsigned long long>(point), impl->handoff_device, published,
-        overflow ? ", LEDGER FULL for some" : "", static_cast<unsigned long long>(n));
+        overflow ? ", LEDGER FULL for some" : "", table->slots_in_use.load(),
+        table->records_in_use.load(), table->fallbacks.load(), table->sweeps.load(), n);
       umd_log(msg);
     }
     return overflow ? -1 : 1;

@@ -1,0 +1,98 @@
+Helios DXVK fork: any first access of a shared image waits for hand-offs
+
+Conduit guest/windows/docs/shared-surfaces.md section 4. Applied after 0007
+by ci/windows/Build-Driver.ps1.
+
+0007 sampled the hand-off ledger only for copy sources and sampled views. A
+reader that renders into, clears, UAV-writes or blends onto a shared image
+after acquiring it races the producer's pending writes as well. The ledger
+is now sampled where every resource access is tracked: the first tracking of
+a shared image in a submission (DxvkCommandList::track, once per image and
+access kind thanks to trackId) records the hand-off wait, whatever the
+usage, and the submission worker waits once per image per submission.
+
+diff --git a/src/dxvk/dxvk_cmdlist.cpp b/src/dxvk/dxvk_cmdlist.cpp
+index 3f6961cd..27a9dbca 100644
+--- a/src/dxvk/dxvk_cmdlist.cpp
++++ b/src/dxvk/dxvk_cmdlist.cpp
+@@ -2,6 +2,7 @@
+ #include <chrono>
+ 
+ #include "dxvk_cmdlist.h"
++#include "dxvk_image.h"
+ #include "dxvk_helios_backend.h"
+ #include "dxvk_device.h"
+ #include "dxvk_helios_feed_trace.h"
+@@ -482,6 +483,19 @@ namespace dxvk {
+   }
+ 
+   
++  void DxvkCommandList::heliosHandoffSampleImage(DxvkImage* image) {
++    if (!image->info().shared)
++      return;
++    const auto* hooks = heliosHandoffHooks();
++    if (!hooks)
++      return;
++    if (const uint32_t key = image->heliosHandoffKey()) {
++      if (const uint64_t point = hooks->sample(key))
++        waitHandoff(key, point);
++    }
++  }
++
++
+   VkResult DxvkCommandList::waitProducers(const std::atomic<bool>& stopped) {
+     for (const auto& dependency : m_producerWaits) {
+       while (!stopped.load(std::memory_order_acquire)) {
+diff --git a/src/dxvk/dxvk_cmdlist.h b/src/dxvk/dxvk_cmdlist.h
+index 8051208e..85a4c5f2 100644
+--- a/src/dxvk/dxvk_cmdlist.h
++++ b/src/dxvk/dxvk_cmdlist.h
+@@ -352,22 +352,45 @@ namespace dxvk {
+      */
+     template<typename T>
+     void track(Rc<T>&& object, DxvkAccess access) {
+-      if (object->trackId(m_trackingId, access))
++      if (object->trackId(m_trackingId, access)) {
++        heliosHandoffTrack(object.ptr());
+         m_objectTracker.track<DxvkResourceRef>(std::move(object), access);
++      }
+     }
+ 
+     template<typename T>
+     void track(const Rc<T>& object, DxvkAccess access) {
+-      if (object->trackId(m_trackingId, access))
++      if (object->trackId(m_trackingId, access)) {
++        heliosHandoffTrack(object.ptr());
+         m_objectTracker.track<DxvkResourceRef>(object.ptr(), access);
++      }
+     }
+ 
+     template<typename T>
+     void track(T* object, DxvkAccess access) {
+-      if (object->trackId(m_trackingId, access))
++      if (object->trackId(m_trackingId, access)) {
++        heliosHandoffTrack(object);
+         m_objectTracker.track<DxvkResourceRef>(object, access);
++      }
++    }
++
++    /**
++     * \brief Helios: the first access of a shared image in this submission
++     *
++     * Whatever the access (read, render target, clear, UAV write, blend), a
++     * shared image's first tracking in a submission samples the hand-off
++     * ledger, so the submission worker waits for another process's pending
++     * hand-off point before this list runs (write-after-write included).
++     * trackId makes this once per image and access kind per submission.
++     */
++    template<typename T>
++    void heliosHandoffTrack(T* object) {
++      if constexpr (std::is_same_v<T, DxvkImage>)
++        heliosHandoffSampleImage(object);
+     }
+ 
++    void heliosHandoffSampleImage(DxvkImage* image);
++
+     /**
+      * \brief Tracks a graphics pipeline
+      * \param [in] pipeline Pipeline
