@@ -1,6 +1,6 @@
 # Zero-copy presentation of NVK-on-RM images (Windows guest, KMD side)
 
-Status: KMD half implemented behind a closed gate (`RM_IMPORT_SERVED = false`);
+Status: KMD half implemented; the gate opens at runtime when the host advertises the import (v310, see "Gate opened");
 host half and the NVK/UMD half do not exist yet. Written against the code at
 commit `0185243` on `kmd/zero-copy-present`. **Section 10 (S3) supersedes this
 document where it differs**: the layout is mandatory in `IMPORT_RM`, adoption of
@@ -518,3 +518,37 @@ adoption and the layout record are already written.
 | ABI: `HeliosForeignLayout` 32, `HeliosForeignImportRmLayout` 104, `HeliosWddmAllocLayout` 32 at offset 96; C mirror | `protocol/src/foreign.rs`, `protocol/src/wddm.rs`, `protocol/include/helios_foreign.h` | Rust `const` asserts + `cargo test`; `gcc -m32/-m64 -Wall -Wextra -Werror` on the header |
 | escape parse of the layout tail, import with layout, `foreign_layout`, `adopt_for_allocation` glue (re-ownership, quota, wrong context, dropped context, declared/record agreement, legacy path) | the real `escape_foreign.rs`, `virtio/foreign.rs`, `gpu/foreign_tables.rs` | compiled and run against a stub of the surrounding crate (not in the tree), gate flipped in the copy only |
 | `create_allocation.rs`, `submit_command.rs`, `gpu/mod.rs`, `device.rs` edits | - | rustfmt parse and review only; **never compiled**. Nothing here has run on a Windows guest. |
+
+
+## Gate opened (v310)
+
+`IMPORT_RM` is served when the device's config `features` word has
+`NVGPU_CFG_RM_IMPORT` (bit 13) AND `NVGPU_CFG_VENUS` (bit 10): the host sets bit 13
+only when its renderer imports dma-bufs, so an older host is never sent the new blob
+type. `virtio/foreign.rs::rm_import_served` reads it per call; `RM_IMPORT_ENABLED` is
+the compile-time kill switch. `QUERY_CAPS` reports `CAP_RM_IMPORT` accordingly.
+
+Wire contract (host: docs/VENUS.md "RM-export blobs"):
+
+* `RESOURCE_CREATE_BLOB`: `blob_mem = 0x80000001`, `blob_id = rm_handle << 32 | gem`,
+  `blob_flags = 0`, `nr_entries = 0`, `size` nonzero and at most the dma-buf size, the
+  KMD-minted resource id, attached to `hdr.ctx_id`. The KMD's own `CTX_ATTACH_RESOURCE`
+  is a no-op there. `MAP_BLOB` is always refused for this type (the KMD refuses it too).
+* Errors: the usual `RESP_ERR_*`, and for this blob type only the 3 padding bytes of the
+  response header carry a Linux errno (24-bit LE, 0 if none). The KMD returns it in
+  `out_host_errno` and maps it (`kmd_logic::foreign_errno::classify`):
+  `EBADF`/`ENOENT` -> `ST_NOT_OWNED`, `ERANGE`/`EINVAL` -> `ST_BAD_RANGE`,
+  `EOPNOTSUPP` -> `ST_UNSUPPORTED`, `ENOMEM` -> `ST_NO_RESOURCES`, anything else
+  (`EIO`, none) -> `ST_DEVICE_ERROR`.
+* Lifetime: the host and the renderer each hold their own dma-buf, so the resource
+  outlives closing the DRM node or the GEM; it is released at `RESOURCE_UNREF` or reset.
+* Layout: the host records the modifier from the forwarded `GEM_IMPORT_NVKMS_MEMORY`
+  (pitch -> LINEAR, block-linear -> `0x0300000000606010 | h`) and uses it for
+  `SET_SCANOUT_BLOB`. The KMD's record still carries the layout NVK passes (mandatory in
+  `IMPORT_RM`) for its own use.
+* An importing context (the UMD bridge, DWM) must create the image with
+  `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` (explicit modifier, one plane, offset 0,
+  `rowPitch`), `VkExternalMemoryImageCreateInfo{DMA_BUF}`, `VkImportMemoryResourceInfoMESA`
+  and a dedicated allocation. The KMD's own `prepare_optimal_scanout_copy` still makes a
+  plain OPTIMAL opaque-fd image and fails for these; the direct flip (a foreign source
+  scanned out with `ScanoutFlip`) does not use it.

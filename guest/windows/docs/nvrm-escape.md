@@ -698,9 +698,9 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
   `READY`, so a thread blocked in `event_wait` with an infinite timeout is not woken by a
   transport failure and the epoch is never re-read (section 9 describes the fix).
 - **`IMPORT_RM`** (`HELIOS_ESCAPE_FOREIGN_RESOURCE`, verb 0x0018, a different verb) is gated
-  off: `RM_IMPORT_SERVED = false` in `virtio/foreign.rs`, `CAP_RM_IMPORT` not advertised,
-  answers `ST_UNSUPPORTED` before touching state. The host half and the NVK/UMD half do not
-  exist. See `zero-copy-present.md`.
+  at runtime by `rm_import_served` in `virtio/foreign.rs` (host config feature bits 13 + 10;
+  `CAP_RM_IMPORT` follows it) and answers `ST_UNSUPPORTED` before touching state when the
+  host does not serve it. The NVK/UMD half is still to do. See `zero-copy-present.md`.
 - `HELIOS_NVRM_ST_RESP_TRUNCATED` is never produced; an undersized `resp_cap` is not detected.
 - `ScanoutFlip` forwarding is the only path that accepts a non-RM message; `scanout != 0` is
   refused (single scanout).
