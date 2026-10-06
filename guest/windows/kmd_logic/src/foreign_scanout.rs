@@ -33,6 +33,31 @@
 //!   this boot (never reset by release or reset), so the host never sees `seq`
 //!   go back.
 //!
+//! # The resident source (the KMD's own, `docs/kmd-rm-client.md` section 13)
+//!
+//! A user-mode source holds scanout 0 for a lapse and is replaced by the desktop
+//! when it ends. The KMD's own RM surface (level 3 of `KmdRmClient`) is different:
+//! it is the desktop itself, shown through RM instead of Venus, so it has no
+//! lapse and must come back by itself when a user source ends. It is a RESIDENT
+//! source, registered with [`ForeignScanout::resident_set`]:
+//!
+//! ```text
+//!  priority:   user source   >   resident (KMD) source   >   Venus desktop flush
+//! ```
+//!
+//! * the resident source is the foreground source when no user source holds scanout
+//!   0 (`Active` with `resident = true`: suppresses the desktop, never lapses, and
+//!   only its owner's `present` yields a flip);
+//! * a user [`ForeignScanout::set`] PREEMPTS it ([`SetKind::Preempted`]), at once and
+//!   without waiting for a lapse; the resident registration is kept, parked;
+//! * when the user source ends, by any of the ways a source ends, the resident one
+//!   takes the screen back and `resume_owed` is raised. The driver answers it with
+//!   a re-flip of the resident surface (no Venus flush: the desktop stays
+//!   suppressed), where ending the last source asks for a desktop flush instead;
+//! * when the resident source itself ends (its file closed, its generation
+//!   invalid, withdrawn by the KMD) it is forgotten and the desktop is owed one
+//!   flush, exactly as for any source.
+//!
 //! Pure functions of their arguments: no wdk, no atomics, no clock. Time is `now`
 //! in 100 ns units from any monotonic source.
 
@@ -108,8 +133,61 @@ pub struct Active {
     /// Identifies this source among all of this boot's, nonzero.
     pub generation: u32,
     pub layout: Layout,
+    /// The KMD's resident source: no lapse, yields to a user source.
+    pub resident: bool,
     lapse: u64,
     deadline: u64,
+}
+
+/// The KMD's standing source: what is shown again when a user source lets go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resident {
+    pub owner: u64,
+    pub handle: u32,
+    pub epoch: u64,
+    pub generation: u32,
+    pub layout: Layout,
+}
+
+impl Resident {
+    fn foreground(&self) -> Active {
+        Active {
+            owner: self.owner,
+            handle: self.handle,
+            epoch: self.epoch,
+            generation: self.generation,
+            layout: self.layout,
+            resident: true,
+            lapse: 0,
+            deadline: u64::MAX,
+        }
+    }
+}
+
+/// Where a registered resident source stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidentKind {
+    /// It holds scanout 0: the driver flips its frames.
+    Foreground,
+    /// A user source holds scanout 0: it waits, and comes back when that one ends.
+    Parked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentOutcome {
+    pub kind: ResidentKind,
+    pub generation: u32,
+}
+
+/// What [`ForeignScanout::resident_drop`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidentDrop {
+    /// No resident source was registered.
+    None,
+    /// It was parked behind a user source: nothing changes on screen.
+    Parked,
+    /// It held scanout 0: the desktop is owed one flush.
+    Ended,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +206,9 @@ pub enum SetKind {
     Updated,
     /// A source whose lapse had run out was replaced by another owner's.
     TookOver,
+    /// The KMD's resident source was foreground and a user source took scanout 0 from
+    /// it, at once. The resident one is parked, not ended.
+    Preempted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +268,10 @@ pub enum Poll {
 #[derive(Debug, Clone, Copy)]
 pub struct ForeignScanout {
     state: State,
+    resident: Option<Resident>,
+    /// A user source just ended and the resident one took the screen back: the driver
+    /// owes a re-flip of its surface.
+    resume_owed: bool,
     next_seq: u64,
     next_generation: u32,
 }
@@ -210,6 +295,8 @@ impl ForeignScanout {
     pub const fn new() -> Self {
         Self {
             state: State::Inactive,
+            resident: None,
+            resume_owed: false,
             next_seq: 1,
             next_generation: 1,
         }
@@ -233,6 +320,8 @@ impl ForeignScanout {
         let kind = match &self.state {
             State::Inactive | State::ReleasePending => SetKind::Activated,
             State::Active(a) if a.owner == owner => SetKind::Updated,
+            // The KMD's resident source yields to any user source, at once.
+            State::Active(a) if a.resident => SetKind::Preempted,
             State::Active(a) if now >= a.deadline => SetKind::TookOver,
             State::Active(_) => return Err(SetError::Busy),
         };
@@ -253,9 +342,13 @@ impl ForeignScanout {
             epoch,
             generation,
             layout,
+            resident: false,
             lapse,
             deadline: now.saturating_add(lapse),
         });
+        // A source that was just set is the one on screen: nothing is owed to the
+        // resident one until this one ends.
+        self.resume_owed = false;
         Ok(SetOutcome {
             kind,
             generation,
@@ -275,7 +368,8 @@ impl ForeignScanout {
             return Err(PresentError::NoSource);
         }
         if now >= a.deadline {
-            self.state = State::ReleasePending;
+            let was_resident = a.resident;
+            self.foreground_ended(was_resident);
             return Err(PresentError::Lapsed);
         }
         let seq = self.next_seq;
@@ -310,15 +404,23 @@ impl ForeignScanout {
             return ReleaseOutcome::NotOwner;
         }
         let generation = a.generation;
-        self.state = State::ReleasePending;
+        let was_resident = a.resident;
+        self.foreground_ended(was_resident);
         ReleaseOutcome::Released { generation }
     }
 
     /// Device teardown: `owner` is gone. True if it held the source.
     pub fn release_owner(&mut self, owner: u64) -> bool {
+        // A parked resident source of a gone owner goes with it.
+        if self.resident.is_some_and(|r| r.owner == owner)
+            && !matches!(&self.state, State::Active(a) if a.resident)
+        {
+            self.resident = None;
+        }
         match &self.state {
             State::Active(a) if a.owner == owner => {
-                self.state = State::ReleasePending;
+                let was_resident = a.resident;
+                self.foreground_ended(was_resident);
                 true
             }
             _ => false,
@@ -327,9 +429,18 @@ impl ForeignScanout {
 
     /// `owner` closed `handle`. True if that was the source's file.
     pub fn release_handle(&mut self, owner: u64, handle: u32) -> bool {
+        // A parked resident source whose file was closed is gone for good.
+        if self
+            .resident
+            .is_some_and(|r| r.owner == owner && r.handle == handle)
+            && !matches!(&self.state, State::Active(a) if a.resident)
+        {
+            self.resident = None;
+        }
         match &self.state {
             State::Active(a) if a.owner == owner && a.handle == handle => {
-                self.state = State::ReleasePending;
+                let was_resident = a.resident;
+                self.foreground_ended(was_resident);
                 true
             }
             _ => false,
@@ -341,7 +452,8 @@ impl ForeignScanout {
     pub fn invalidate(&mut self, generation: u32) -> bool {
         match &self.state {
             State::Active(a) if a.generation == generation => {
-                self.state = State::ReleasePending;
+                let was_resident = a.resident;
+                self.foreground_ended(was_resident);
                 true
             }
             _ => false,
@@ -353,6 +465,8 @@ impl ForeignScanout {
     pub fn reset(&mut self) -> bool {
         let was = matches!(self.state, State::Active(_));
         self.state = State::Inactive;
+        self.resident = None;
+        self.resume_owed = false;
         was
     }
 
@@ -361,7 +475,8 @@ impl ForeignScanout {
         match &self.state {
             State::Active(a) if now >= a.deadline => {
                 let generation = a.generation;
-                self.state = State::ReleasePending;
+                let was_resident = a.resident;
+                self.foreground_ended(was_resident);
                 Poll::Lapsed { generation }
             }
             _ => Poll::Nothing,
@@ -394,10 +509,109 @@ impl ForeignScanout {
         }
     }
 
+    /// The foreground source ended. If it was a user source and the KMD has a resident
+    /// one registered, that takes scanout 0 back and a re-flip is owed; otherwise the
+    /// desktop is owed one flush. A resident source that ends is forgotten.
+    fn foreground_ended(&mut self, was_resident: bool) {
+        if was_resident {
+            self.resident = None;
+        }
+        match self.resident {
+            Some(r) if !was_resident => {
+                self.state = State::Active(r.foreground());
+                self.resume_owed = true;
+            }
+            _ => {
+                self.state = State::ReleasePending;
+                self.resume_owed = false;
+            }
+        }
+    }
+
+    /// Register (or update) the KMD's resident source. With no user source live it
+    /// becomes the foreground source at once ([`ResidentKind::Foreground`]: the driver
+    /// copies a first frame and flips it); behind a live user source it waits parked.
+    /// A resident source of the same owner is updated in place, keeping its
+    /// generation (a flip in flight stays valid).
+    pub fn resident_set(
+        &mut self,
+        owner: u64,
+        handle: u32,
+        epoch: u64,
+        layout: Layout,
+        now: u64,
+    ) -> Result<ResidentOutcome, SetError> {
+        layout.validate().map_err(SetError::Layout)?;
+        let generation = match self.resident {
+            Some(r) if r.owner == owner => r.generation,
+            _ => {
+                let g = self.next_generation;
+                self.next_generation = self.next_generation.checked_add(1).unwrap_or(1);
+                g
+            }
+        };
+        let r = Resident {
+            owner,
+            handle,
+            epoch,
+            generation,
+            layout,
+        };
+        self.resident = Some(r);
+        // A user source that is live (and not lapsed) keeps the screen; anything else
+        // is replaced by the resident one.
+        let user_live = matches!(&self.state, State::Active(a) if !a.resident && now < a.deadline);
+        if user_live {
+            return Ok(ResidentOutcome {
+                kind: ResidentKind::Parked,
+                generation,
+            });
+        }
+        self.state = State::Active(r.foreground());
+        // This is not a resume: the driver flips because it registered, not because a
+        // user source ended.
+        self.resume_owed = false;
+        Ok(ResidentOutcome {
+            kind: ResidentKind::Foreground,
+            generation,
+        })
+    }
+
+    /// The KMD withdraws its resident source (it is no longer what the screen shows).
+    pub fn resident_drop(&mut self) -> ResidentDrop {
+        if self.resident.is_none() {
+            return ResidentDrop::None;
+        }
+        if matches!(&self.state, State::Active(a) if a.resident) {
+            self.foreground_ended(true);
+            return ResidentDrop::Ended;
+        }
+        self.resident = None;
+        self.resume_owed = false;
+        ResidentDrop::Parked
+    }
+
+    /// The registered resident source, if any.
+    pub fn resident(&self) -> Option<Resident> {
+        self.resident
+    }
+
+    /// Whether the resident source is the foreground source right now.
+    pub fn resident_foreground(&self) -> bool {
+        matches!(&self.state, State::Active(a) if a.resident)
+    }
+
+    /// A user source ended and the resident one took scanout 0 back: true once, then
+    /// false until the next time. The driver answers it with a re-flip.
+    pub fn take_resume_owed(&mut self) -> bool {
+        core::mem::take(&mut self.resume_owed)
+    }
+
     /// When the worker must next look at an `Active` source, for its wait timeout.
     pub fn next_deadline(&self) -> Option<u64> {
         match &self.state {
-            State::Active(a) => Some(a.deadline),
+            // A resident source never lapses: the worker needs no timed wake for it.
+            State::Active(a) if !a.resident => Some(a.deadline),
             _ => None,
         }
     }
@@ -698,5 +912,284 @@ mod tests {
         // The deadline saturates at MAX instead of wrapping to a past time.
         assert!(s.present(A, 7, u64::MAX - 5).is_ok());
         assert_eq!(s.next_deadline(), Some(u64::MAX));
+    }
+
+    // ---- the resident (KMD) source ----------------------------------------------------
+
+    /// The KMD's own owner token and its DRM file.
+    const K: u64 = u64::MAX;
+    const KH: u32 = 3;
+
+    fn resident(s: &mut ForeignScanout, now: u64) -> ResidentOutcome {
+        s.resident_set(K, KH, 3, layout(), now).unwrap()
+    }
+
+    #[test]
+    fn a_resident_source_is_foreground_when_nobody_else_holds_scanout() {
+        let mut s = ForeignScanout::new();
+        let r = resident(&mut s, 0);
+        assert_eq!(r.kind, ResidentKind::Foreground);
+        let a = s
+            .suppress_desktop(1)
+            .expect("the desktop flush is withheld");
+        assert!(a.resident);
+        assert_eq!((a.owner, a.handle, a.generation), (K, KH, r.generation));
+        assert!(s.resident_foreground());
+        // No lapse, no timed wake, however long it runs.
+        assert_eq!(s.next_deadline(), None);
+        assert_eq!(s.poll(u64::MAX - 1), Poll::Nothing);
+        assert!(s.suppress_desktop(1_000_000 * 3_600 * MS).is_some());
+        // Only the KMD presents; each flip is a new, increasing seq.
+        assert_eq!(s.present(A, KH, 10), Err(PresentError::NoSource));
+        let f1 = s.present(K, KH, 10).unwrap();
+        let f2 = s.present(K, KH, 20 * 3_600 * 1_000 * MS).unwrap();
+        assert!(f2.seq > f1.seq);
+        assert_eq!(f1.generation, r.generation);
+        assert_eq!(f1.layout, layout());
+        // A host-accepted flip does not move a deadline that does not exist.
+        assert!(s.extend(f1.generation, 5));
+        assert_eq!(s.next_deadline(), None);
+        // Nothing is owed: it started, it did not resume.
+        assert!(!s.take_resume_owed());
+        assert!(!s.restore_pending());
+    }
+
+    #[test]
+    fn a_user_source_preempts_the_resident_one_at_once() {
+        let mut s = ForeignScanout::new();
+        resident(&mut s, 0);
+        // `Busy` would be the answer to another USER source holding scanout 0; the
+        // resident one has no lapse and yields anyway.
+        let o = s.set(A, 7, 3, layout(), 0, 100 * MS).unwrap();
+        assert_eq!(o.kind, SetKind::Preempted);
+        let a = s.suppress_desktop(101 * MS).unwrap();
+        assert_eq!((a.owner, a.resident), (A, false));
+        assert!(!s.resident_foreground());
+        // The KMD's flips are refused while it is parked, and mint nothing.
+        assert_eq!(s.present(K, KH, 101 * MS), Err(PresentError::NoSource));
+        assert_eq!(s.present(A, 7, 101 * MS).unwrap().seq, 1);
+        // The registration is kept.
+        assert_eq!(s.resident().map(|r| r.handle), Some(KH));
+        // A second user source is Busy as always, resident or not.
+        assert_eq!(s.set(B, 9, 3, layout(), 0, 102 * MS), Err(SetError::Busy));
+        // The user source has a lapse; its deadline is what the worker waits for.
+        assert_eq!(s.next_deadline(), Some(100 * MS + 2_000 * MS));
+    }
+
+    #[test]
+    fn when_the_user_source_ends_the_resident_one_resumes_and_the_desktop_stays_off() {
+        let mut s = ForeignScanout::new();
+        let r = resident(&mut s, 0);
+        s.set(A, 7, 3, layout(), 0, 100 * MS).unwrap();
+        assert_eq!(s.present(A, 7, 101 * MS).unwrap().seq, 1);
+        assert!(
+            !s.take_resume_owed(),
+            "nothing owed while the user holds scanout"
+        );
+        assert!(matches!(
+            s.release(A, Some(7)),
+            ReleaseOutcome::Released { .. }
+        ));
+        // Not a desktop restore: the resident source is back on screen.
+        assert!(!s.restore_pending());
+        assert!(!s.desktop_restored());
+        assert!(s.resident_foreground());
+        assert!(s.suppress_desktop(200 * MS).is_some());
+        assert!(s.take_resume_owed());
+        assert!(!s.take_resume_owed(), "once");
+        // Its flips work again, in the same generation, with a seq above the user's.
+        let f = s.present(K, KH, 201 * MS).unwrap();
+        assert_eq!(f.generation, r.generation);
+        assert_eq!(
+            f.seq, 2,
+            "above the user's flip: the host never sees seq go back"
+        );
+    }
+
+    #[test]
+    fn every_way_a_user_source_ends_resumes_the_resident_one() {
+        type End = fn(&mut ForeignScanout, u32);
+        let ends: [(&str, End); 6] = [
+            ("release", |s, _| {
+                s.release(A, Some(7));
+            }),
+            ("release_owner", |s, _| {
+                s.release_owner(A);
+            }),
+            ("release_handle", |s, _| {
+                s.release_handle(A, 7);
+            }),
+            ("invalidate", |s, g| {
+                s.invalidate(g);
+            }),
+            ("poll lapse", |s, _| {
+                s.poll(10_000 * MS);
+            }),
+            ("present after lapse", |s, _| {
+                let _ = s.present(A, 7, 10_000 * MS);
+            }),
+        ];
+        for (name, end) in ends {
+            let mut s = ForeignScanout::new();
+            resident(&mut s, 0);
+            let o = s.set(A, 7, 3, layout(), 0, 10 * MS).unwrap();
+            end(&mut s, o.generation);
+            assert!(s.resident_foreground(), "{name}");
+            assert!(!s.restore_pending(), "{name}");
+            assert!(s.take_resume_owed(), "{name}");
+            assert!(s.present(K, KH, 10_001 * MS).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_stale_generation_cannot_end_the_resident_source_through_invalidate() {
+        let mut s = ForeignScanout::new();
+        let r = resident(&mut s, 0);
+        assert!(!s.invalidate(r.generation + 1));
+        assert!(s.resident_foreground());
+        // Its own generation can: the driver found the file or the epoch dead.
+        assert!(s.invalidate(r.generation));
+        assert!(s.restore_pending(), "the desktop is owed a flush");
+        assert_eq!(s.resident(), None, "an invalid source is forgotten");
+        assert!(!s.take_resume_owed());
+    }
+
+    #[test]
+    fn the_resident_source_ends_for_good_when_its_own_file_closes() {
+        let mut s = ForeignScanout::new();
+        resident(&mut s, 0);
+        assert!(!s.release_handle(K, KH + 1));
+        assert!(s.release_handle(K, KH));
+        assert!(s.restore_pending());
+        assert_eq!(s.resident(), None);
+        assert!(s.suppress_desktop(1).is_none());
+        assert!(!s.take_resume_owed());
+        // ... and a parked one is forgotten without touching what is on screen.
+        let mut s = ForeignScanout::new();
+        resident(&mut s, 0);
+        s.set(A, 7, 3, layout(), 0, 1).unwrap();
+        assert!(
+            !s.release_handle(K, KH),
+            "the foreground source is not its file"
+        );
+        assert_eq!(s.resident(), None);
+        assert!(s.suppress_desktop(2).is_some());
+        // So the user's end now owes the DESKTOP, not a resume.
+        s.release(A, None);
+        assert!(s.restore_pending());
+        assert!(!s.take_resume_owed());
+    }
+
+    #[test]
+    fn the_kmd_can_withdraw_its_resident_source() {
+        let mut s = ForeignScanout::new();
+        assert_eq!(s.resident_drop(), ResidentDrop::None);
+        resident(&mut s, 0);
+        assert_eq!(s.resident_drop(), ResidentDrop::Ended);
+        assert!(s.restore_pending());
+        assert_eq!(s.resident(), None);
+        assert!(s.desktop_restored());
+        // Parked: the screen belongs to the user and stays so; nothing is owed after.
+        resident(&mut s, 1);
+        s.set(A, 7, 3, layout(), 0, 2).unwrap();
+        assert_eq!(s.resident_drop(), ResidentDrop::Parked);
+        assert!(s.suppress_desktop(3).is_some());
+        s.release(A, None);
+        assert!(s.restore_pending());
+        assert!(!s.take_resume_owed());
+    }
+
+    #[test]
+    fn registering_behind_a_live_user_source_parks_and_a_lapsed_one_does_not_hold() {
+        let mut s = ForeignScanout::new();
+        s.set(A, 7, 3, layout(), 0, 0).unwrap();
+        let r = resident(&mut s, 100 * MS);
+        assert_eq!(r.kind, ResidentKind::Parked);
+        assert_eq!(s.suppress_desktop(101 * MS).map(|a| a.owner), Some(A));
+        assert!(!s.take_resume_owed());
+        s.release(A, None);
+        assert!(s.take_resume_owed());
+        assert!(s.resident_foreground());
+        // A user source that has lapsed (the worker has not polled yet) does not hold.
+        let mut s = ForeignScanout::new();
+        s.set(A, 7, 3, layout(), 0, 0).unwrap();
+        let r = resident(&mut s, 3_000 * MS);
+        assert_eq!(r.kind, ResidentKind::Foreground);
+        assert!(s.resident_foreground());
+        assert_eq!(s.present(A, 7, 3_001 * MS), Err(PresentError::NoSource));
+    }
+
+    #[test]
+    fn re_registering_updates_in_place_and_keeps_the_generation() {
+        let mut s = ForeignScanout::new();
+        let a = resident(&mut s, 0);
+        let mut l = layout();
+        l.width = 1280;
+        l.height = 720;
+        l.stride = 1280 * 4;
+        let b = s.resident_set(K, KH + 1, 4, l, 1).unwrap();
+        assert_eq!(b.generation, a.generation);
+        let f = s.present(K, KH + 1, 2).unwrap();
+        assert_eq!((f.layout.width, f.epoch, f.handle), (1280, 4, KH + 1));
+        assert_eq!(s.present(K, KH, 2), Err(PresentError::NoSource));
+        // A bad layout changes nothing.
+        let mut bad = layout();
+        bad.fourcc = 0;
+        assert_eq!(
+            s.resident_set(K, KH, 3, bad, 3),
+            Err(SetError::Layout(LayoutError::Format))
+        );
+        assert_eq!(s.resident().map(|r| r.handle), Some(KH + 1));
+    }
+
+    #[test]
+    fn a_new_user_source_cancels_a_resume_nobody_answered_yet() {
+        let mut s = ForeignScanout::new();
+        resident(&mut s, 0);
+        s.set(A, 7, 3, layout(), 0, 1).unwrap();
+        s.release(A, None);
+        // The driver has not looked yet when another user source takes over.
+        let o = s.set(B, 9, 3, layout(), 0, 2).unwrap();
+        assert_eq!(o.kind, SetKind::Preempted);
+        assert!(
+            !s.take_resume_owed(),
+            "the user is on screen: nothing to resume"
+        );
+        s.release(B, None);
+        assert!(s.take_resume_owed());
+    }
+
+    #[test]
+    fn reset_forgets_the_resident_source_and_seq_survives() {
+        let mut s = ForeignScanout::new();
+        resident(&mut s, 0);
+        let first = s.present(K, KH, 1).unwrap().seq;
+        assert!(s.reset());
+        assert_eq!(s.resident(), None);
+        assert!(!s.resident_foreground());
+        assert!(!s.restore_pending());
+        assert!(!s.take_resume_owed());
+        resident(&mut s, 2);
+        assert!(s.present(K, KH, 3).unwrap().seq > first);
+    }
+
+    #[test]
+    fn the_probe_style_source_of_the_same_owner_still_works_beside_the_ring() {
+        // Level 2 sets a lapse-limited source with the KMD's token; level 3 never does,
+        // but nothing about the old source changes.
+        let mut s = ForeignScanout::new();
+        let o = s.set(K, KH, 3, layout(), 4_000, 0).unwrap();
+        assert_eq!(o.kind, SetKind::Activated);
+        assert_eq!(s.next_deadline(), Some(4_000 * MS));
+        assert_eq!(
+            s.poll(4_000 * MS),
+            Poll::Lapsed {
+                generation: o.generation
+            }
+        );
+        assert!(
+            s.restore_pending(),
+            "no resident source: the desktop is owed"
+        );
     }
 }

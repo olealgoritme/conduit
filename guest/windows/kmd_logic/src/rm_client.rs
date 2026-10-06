@@ -832,6 +832,11 @@ pub enum Step {
     FillPattern = 48,
     ScanoutSet = 49,
     ScanoutPresent = 50,
+    // Pure state moves between the slots of a ring (level 3); no I/O.
+    /// Put the finished working slot aside; the next surface is built in a fresh one.
+    Park = 56,
+    /// Take the last parked slot back as the working slot, to tear it down.
+    Unpark = 57,
 }
 
 /// The bring-up sequence, in order.
@@ -994,10 +999,40 @@ pub const PROBE_MAX_BUSY: u8 = 3;
 /// What the caller wants of the client right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Want {
-    /// 0 off, 1 client and surface, 2 also the CPU view and the probe flip.
+    /// 0 off, 1 client and surface, 2 also the CPU view and the probe flip, 3 a ring
+    /// of [`RING_SLOTS`] surfaces, each with its CPU view, and no probe (the
+    /// presenter, `rm_present`, drives scanout).
     pub level: u8,
     /// The extent of the VidPn primary, once one is bound.
     pub surface: Option<(u32, u32)>,
+}
+
+/// Surfaces in the level 3 ring. The host flip has no completion, so a surface
+/// that was flipped may still be read by the viewer for a frame or two: content is
+/// always written to the one that was NOT shown last.
+pub const RING_SLOTS: usize = 2;
+/// Slots that can be parked beside the working one.
+pub const MAX_PARKED: usize = RING_SLOTS - 1;
+
+impl Want {
+    /// The surfaces wanted: one, or the whole ring at level 3.
+    pub fn slots(&self) -> usize {
+        if self.level >= 3 {
+            RING_SLOTS
+        } else {
+            1
+        }
+    }
+
+    /// Whether the CPU view of a surface is wanted.
+    fn views(&self) -> bool {
+        self.level >= 2
+    }
+
+    /// Whether the one-picture probe flip runs (levels 2 only: level 3 flips real frames).
+    fn probes(&self) -> bool {
+        self.level == 2
+    }
 }
 
 /// The next thing to do.
@@ -1015,13 +1050,104 @@ pub enum Action {
 /// file drops its GEM handles, so closing these is the whole teardown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Cleanup {
-    pub handles: [u32; 5],
+    pub handles: [u32; 3 + 2 * (1 + MAX_PARKED)],
     pub count: usize,
 }
 
 impl Cleanup {
     pub fn as_slice(&self) -> &[u32] {
         self.handles.get(..self.count).unwrap_or(&[])
+    }
+}
+
+/// One surface of the ring and everything that belongs to it: its export file, its
+/// CPU view and its probe. The client works on one slot at a time (`Client::cur`);
+/// finished ones are parked.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    export_ch: u32,
+    map_ch: u32,
+    surface: Option<Surface>,
+    view: ViewStage,
+    view_cookie: u64,
+    view_host_id: u32,
+    view_off: u64,
+    view_va: u64,
+    view_len: u64,
+    view_failed: bool,
+    probe: Probe,
+    probe_busy: u8,
+}
+
+impl Slot {
+    const EMPTY: Slot = Slot {
+        export_ch: 0,
+        map_ch: 0,
+        surface: None,
+        view: ViewStage::None,
+        view_cookie: 0,
+        view_host_id: 0,
+        view_off: 0,
+        view_va: 0,
+        view_len: 0,
+        view_failed: false,
+        probe: Probe::Idle,
+        probe_busy: 0,
+    };
+
+    /// Nothing of it is allocated or mapped.
+    fn is_empty(&self) -> bool {
+        self.surface.is_none() && self.view == ViewStage::None && self.export_ch == 0
+    }
+
+    /// The kernel view, if mapped.
+    fn view_now(&self) -> Option<(u64, u64)> {
+        (self.view == ViewStage::KernelMapped).then_some((self.view_va, self.view_len))
+    }
+
+    /// Take the kernel view away, for unmapping (see [`Client::take_view`]).
+    fn take_view(&mut self) -> Option<(u64, u64)> {
+        let v = self.view_now();
+        if v.is_some() {
+            self.view = ViewStage::HostMapped;
+            self.view_va = 0;
+            self.view_len = 0;
+        }
+        v
+    }
+
+    /// The surface is finished and, when `views`, its CPU view is up.
+    fn is_complete(&self, views: bool) -> bool {
+        match self.surface {
+            Some(s) if s.stage == SurfStage::Ready => {
+                !views || (self.view == ViewStage::KernelMapped && !self.view_failed)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What the presenter needs to know about one slot of the ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotInfo {
+    pub layout: SurfaceLayout,
+    /// The GEM handle on the DRM file.
+    pub gem: u32,
+    /// The kernel view: address and length.
+    pub view: (u64, u64),
+}
+
+/// Every kernel view the client holds, for unmapping all of them at once (a retire,
+/// a new transport generation, a death).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Views {
+    pub items: [(u64, u64); 1 + MAX_PARKED],
+    pub count: usize,
+}
+
+impl Views {
+    pub fn as_slice(&self) -> &[(u64, u64)] {
+        self.items.get(..self.count).unwrap_or(&[])
     }
 }
 
@@ -1040,21 +1166,14 @@ pub struct Client {
     gpu_id: u32,
     minor: u32,
     dri_index: u32,
-    export_ch: u32,
-    map_ch: u32,
     version: [u8; VERSION_STR_BYTES],
-    surface: Option<Surface>,
+    /// The slot every step works on.
+    cur: Slot,
+    /// Finished slots set aside by [`Step::Park`], oldest first.
+    parked: [Slot; MAX_PARKED],
+    parked_n: u8,
     /// Surfaces made so far (handle uniqueness).
     surfaces_made: u32,
-    view: ViewStage,
-    view_cookie: u64,
-    view_host_id: u32,
-    view_off: u64,
-    view_va: u64,
-    view_len: u64,
-    view_failed: bool,
-    probe: Probe,
-    probe_busy: u8,
     /// Dead and not yet cleaned up.
     cleanup_owed: bool,
     /// Unwinding steps that failed (counted, never retried).
@@ -1080,20 +1199,11 @@ impl Client {
             gpu_id: 0,
             minor: 0,
             dri_index: 0,
-            export_ch: 0,
-            map_ch: 0,
             version: [0u8; VERSION_STR_BYTES],
-            surface: None,
+            cur: Slot::EMPTY,
+            parked: [Slot::EMPTY; MAX_PARKED],
+            parked_n: 0,
             surfaces_made: 0,
-            view: ViewStage::None,
-            view_cookie: 0,
-            view_host_id: 0,
-            view_off: 0,
-            view_va: 0,
-            view_len: 0,
-            view_failed: false,
-            probe: Probe::Idle,
-            probe_busy: 0,
             cleanup_owed: false,
             soft_errors: 0,
         }
@@ -1151,26 +1261,26 @@ impl Client {
         self.dri_index
     }
     pub fn export_ch(&self) -> u32 {
-        self.export_ch
+        self.cur.export_ch
     }
     pub fn map_ch(&self) -> u32 {
-        self.map_ch
+        self.cur.map_ch
     }
     pub fn soft_errors(&self) -> u32 {
         self.soft_errors
     }
     pub fn probe(&self) -> Probe {
-        self.probe
+        self.cur.probe
     }
 
     /// The surface being built or ready: its layout and RM memory handle.
     pub fn surface(&self) -> Option<(SurfaceLayout, u32)> {
-        self.surface.map(|s| (s.layout, s.memory))
+        self.cur.surface.map(|s| (s.layout, s.memory))
     }
 
     /// The finished surface: layout, memory handle and GEM handle.
     pub fn ready_surface(&self) -> Option<(SurfaceLayout, u32, u32)> {
-        match self.surface {
+        match self.cur.surface {
             Some(s) if s.stage == SurfStage::Ready => Some((s.layout, s.memory, s.gem)),
             _ => None,
         }
@@ -1179,17 +1289,17 @@ impl Client {
     /// The GEM handle of the surface as soon as it exists (before the export file
     /// is closed): for diagnostics.
     pub fn gem(&self) -> u32 {
-        self.surface.map_or(0, |s| s.gem)
+        self.cur.surface.map_or(0, |s| s.gem)
     }
 
     /// The cookie of the CPU mapping RM holds, for its unmap.
     pub fn view_cookie(&self) -> u64 {
-        self.view_cookie
+        self.cur.view_cookie
     }
 
     /// The host's mapping id and the mapping's offset in the shared-memory region.
     pub fn view_host(&self) -> (u32, u64) {
-        (self.view_host_id, self.view_off)
+        (self.cur.view_host_id, self.cur.view_off)
     }
 
     /// The version string `QUERY` returned (all zero when RM gave none).
@@ -1202,9 +1312,58 @@ impl Client {
         memory_handle(self.surfaces_made.wrapping_add(1))
     }
 
-    /// The kernel view of the surface, if mapped.
+    /// The kernel view of the working slot's surface, if mapped.
     pub fn view(&self) -> Option<(u64, u64)> {
-        (self.view == ViewStage::KernelMapped).then_some((self.view_va, self.view_len))
+        self.cur.view_now()
+    }
+
+    /// Slots that hold a surface: the parked ones and the working one.
+    pub fn slot_count(&self) -> usize {
+        usize::from(self.parked_n) + usize::from(self.cur.surface.is_some())
+    }
+
+    /// Slots set aside by [`Step::Park`].
+    pub fn parked(&self) -> usize {
+        usize::from(self.parked_n)
+    }
+
+    /// Slot `i` of the ring (parked ones first, the working one last), when it is
+    /// finished and its CPU view is up.
+    pub fn slot(&self, i: usize) -> Option<SlotInfo> {
+        let n = usize::from(self.parked_n);
+        let slot = match i.cmp(&n) {
+            core::cmp::Ordering::Less => self.parked.get(i)?,
+            core::cmp::Ordering::Equal => &self.cur,
+            core::cmp::Ordering::Greater => return None,
+        };
+        let s = slot.surface.filter(|s| s.stage == SurfStage::Ready)?;
+        let view = slot.view_now()?;
+        Some(SlotInfo {
+            layout: s.layout,
+            gem: s.gem,
+            view,
+        })
+    }
+
+    /// The ring is complete for `want` and the client is healthy: every wanted slot
+    /// is finished and mapped. This is what the presenter waits for.
+    pub fn presentable(&self, want: Want) -> bool {
+        if self.is_dead() || !self.bring_up_done() || !want.views() {
+            return false;
+        }
+        let Some((w, h)) = want.surface else {
+            return false;
+        };
+        let n = want.slots();
+        if self.slot_count() != n {
+            return false;
+        }
+        // Every slot has the primary's extent (a mode change tears them all down
+        // before this is true again).
+        (0..n).all(|i| {
+            self.slot(i)
+                .is_some_and(|s| s.layout.width == w && s.layout.height == h)
+        })
     }
 
     /// One word for the registry: phase, bring-up progress, surface and view stage,
@@ -1215,12 +1374,13 @@ impl Client {
             Phase::Up => 1,
             Phase::Dead(_) => 2,
         };
-        let surf = self.surface.map_or(0u32, |s| 1 + s.stage as u32);
-        let probe = self.probe as u32;
+        let surf = self.cur.surface.map_or(0u32, |s| 1 + s.stage as u32);
+        let probe = self.cur.probe as u32;
         (phase << 28)
+            | (u32::from(self.parked_n) << 24)
             | (u32::from(self.up) << 20)
             | (surf << 12)
-            | ((self.view as u32) << 8)
+            | ((self.cur.view as u32) << 8)
             | probe
     }
 
@@ -1248,16 +1408,28 @@ impl Client {
         self.surfaces_made = keep_made;
     }
 
-    /// Take the kernel view away from the machine, for unmapping. After this the
-    /// machine no longer believes in a view.
+    /// Take the working slot's kernel view away from the machine, for unmapping.
+    /// After this the machine no longer believes in a view.
     pub fn take_view(&mut self) -> Option<(u64, u64)> {
-        let v = self.view();
-        if v.is_some() {
-            self.view = ViewStage::HostMapped;
-            self.view_va = 0;
-            self.view_len = 0;
+        self.cur.take_view()
+    }
+
+    /// [`Self::take_view`] for every slot, parked ones included.
+    pub fn take_views(&mut self) -> Views {
+        let mut out = Views::default();
+        let mut put = |v: Option<(u64, u64)>| {
+            if let Some(v) = v {
+                if let Some(slot) = out.items.get_mut(out.count) {
+                    *slot = v;
+                    out.count += 1;
+                }
+            }
+        };
+        put(self.cur.take_view());
+        for p in self.parked.iter_mut() {
+            put(p.take_view());
         }
-        v
+        out
     }
 
     /// Record that bring-up begins in generation `epoch` (the first step of a cold
@@ -1291,14 +1463,14 @@ impl Client {
         if let Some(step) = self.view_unwind_step(want) {
             return Action::Step(step);
         }
-        if let Some(s) = self.surface {
+        if let Some(s) = self.cur.surface {
             let wanted = want.surface;
             if wanted.is_some() && wanted != Some((s.layout.width, s.layout.height)) {
                 // A different extent: tear the surface down; the next call makes
                 // the new one. An export file still open (stages `ExportChOpen` ..
                 // `Imported`) goes first: nothing else would close it, and the next
                 // `OpenExportCh` would overwrite its handle.
-                if self.export_ch != 0 {
+                if self.cur.export_ch != 0 {
                     return Action::Step(Step::CloseExportChUndo);
                 }
                 return Action::Step(if s.gem != 0 && s.stage >= SurfStage::Imported {
@@ -1312,29 +1484,60 @@ impl Client {
                 SurfStage::ExportChOpen => Action::Step(Step::ExportToFd),
                 SurfStage::Exported => Action::Step(Step::GemImport),
                 SurfStage::Imported => Action::Step(Step::CloseExportCh),
-                SurfStage::Ready => self.view_and_probe_step(want),
+                SurfStage::Ready => match self.view_and_probe_step(want) {
+                    // Finished, and the ring wants more: set it aside and build the
+                    // next one. Only a slot that is complete (surface AND, when the
+                    // view is wanted, its view) is kept: a given-up view ends the
+                    // ring here, and the presenter never starts.
+                    Action::Idle
+                        if self.cur.is_complete(want.views())
+                            && usize::from(self.parked_n) + 1 < want.slots() =>
+                    {
+                        Action::Step(Step::Park)
+                    }
+                    other => other,
+                },
             };
         }
-        match want.surface {
-            Some(_) => Action::Step(Step::AllocMemory),
-            None => Action::Idle,
+        // The working slot is empty. A parked slot of another extent must go before
+        // anything new is made: bring it back to tear it down with the same steps.
+        if self.parked_n > 0 && self.parked_is_stale(want) {
+            return Action::Step(Step::Unpark);
         }
+        match want.surface {
+            Some(_) if usize::from(self.parked_n) < want.slots() => Action::Step(Step::AllocMemory),
+            _ => Action::Idle,
+        }
+    }
+
+    /// Whether a parked slot has an extent other than the one now wanted.
+    fn parked_is_stale(&self, want: Want) -> bool {
+        let Some(w) = want.surface else {
+            return false;
+        };
+        self.parked
+            .iter()
+            .take(usize::from(self.parked_n))
+            .any(|p| {
+                p.surface
+                    .is_some_and(|s| (s.layout.width, s.layout.height) != w)
+            })
     }
 
     /// The step that undoes the next stage of the view, when it must go.
     fn view_unwind_step(&self, want: Want) -> Option<Step> {
-        if self.view == ViewStage::None {
+        if self.cur.view == ViewStage::None {
             return None;
         }
-        let surface_changing = match (self.surface, want.surface) {
+        let surface_changing = match (self.cur.surface, want.surface) {
             (Some(s), Some(w)) => w != (s.layout.width, s.layout.height),
             (None, _) => true,
             _ => false,
         };
-        if !(self.view_failed || surface_changing || want.level < 2) {
+        if !(self.cur.view_failed || surface_changing || !want.views()) {
             return None;
         }
-        Some(match self.view {
+        Some(match self.cur.view {
             ViewStage::KernelMapped => Step::KernelUnmap,
             ViewStage::HostMapped => Step::HostMunmap,
             ViewStage::RmMapped => Step::RmUnmapMemory,
@@ -1345,10 +1548,10 @@ impl Client {
 
     /// With the surface ready: the CPU view (level 2) and the probe that needs it.
     fn view_and_probe_step(&self, want: Want) -> Action {
-        if want.level < 2 || self.view_failed {
+        if !want.views() || self.cur.view_failed {
             return Action::Idle;
         }
-        match self.view {
+        match self.cur.view {
             ViewStage::None => return Action::Step(Step::OpenMapCh),
             ViewStage::ChanOpen => return Action::Step(Step::RegisterMapFd),
             ViewStage::FdRegistered => return Action::Step(Step::RmMapMemory),
@@ -1356,7 +1559,10 @@ impl Client {
             ViewStage::HostMapped => return Action::Step(Step::KernelMap),
             ViewStage::KernelMapped => {}
         }
-        match self.probe {
+        if !want.probes() {
+            return Action::Idle;
+        }
+        match self.cur.probe {
             Probe::Idle => Action::Step(Step::FillPattern),
             Probe::Filled => Action::Step(Step::ScanoutSet),
             Probe::Set => Action::Step(Step::ScanoutPresent),
@@ -1374,6 +1580,30 @@ impl Client {
     pub fn finish(&mut self, step: Step, result: Result<Out, Fail>) {
         use Step::*;
         match step {
+            // Pure state moves: no I/O behind them, so no result to judge.
+            Park => {
+                let n = usize::from(self.parked_n);
+                if self.cur.is_empty() || n >= MAX_PARKED {
+                    // Not a thing the machine asks for; refuse it loudly.
+                    return self.die(step, Fail::new(FailKind::Parse, 0xfe));
+                }
+                if let Some(slot) = self.parked.get_mut(n) {
+                    *slot = self.cur;
+                    self.cur = Slot::EMPTY;
+                    self.parked_n += 1;
+                }
+            }
+            Unpark => {
+                let n = usize::from(self.parked_n);
+                if !self.cur.is_empty() || n == 0 {
+                    return self.die(step, Fail::new(FailKind::Parse, 0xfd));
+                }
+                if let Some(slot) = self.parked.get_mut(n - 1) {
+                    self.cur = *slot;
+                    *slot = Slot::EMPTY;
+                    self.parked_n -= 1;
+                }
+            }
             KernelUnmap | HostMunmap | RmUnmapMemory | CloseMapCh | CloseExportChUndo => {
                 // An undo always advances: a failed one is counted, never retried.
                 if result.is_err() {
@@ -1381,30 +1611,30 @@ impl Client {
                 }
                 match step {
                     KernelUnmap => {
-                        self.view = ViewStage::HostMapped;
-                        self.view_va = 0;
-                        self.view_len = 0;
+                        self.cur.view = ViewStage::HostMapped;
+                        self.cur.view_va = 0;
+                        self.cur.view_len = 0;
                     }
                     HostMunmap => {
-                        self.view = ViewStage::RmMapped;
-                        self.view_host_id = 0;
-                        self.view_off = 0;
+                        self.cur.view = ViewStage::RmMapped;
+                        self.cur.view_host_id = 0;
+                        self.cur.view_off = 0;
                     }
                     RmUnmapMemory => {
-                        self.view = ViewStage::FdRegistered;
-                        self.view_cookie = 0;
+                        self.cur.view = ViewStage::FdRegistered;
+                        self.cur.view_cookie = 0;
                     }
                     // The surface keeps its stage: the GEM and the memory are next.
-                    CloseExportChUndo => self.export_ch = 0,
+                    CloseExportChUndo => self.cur.export_ch = 0,
                     _ => {
-                        self.view = ViewStage::None;
-                        self.map_ch = 0;
-                        self.view_cookie = 0;
+                        self.cur.view = ViewStage::None;
+                        self.cur.map_ch = 0;
+                        self.cur.view_cookie = 0;
                         // The view is gone: either it failed (and stays given up) or
                         // the surface changes (and the next one starts clean).
-                        if !self.view_failed {
-                            self.probe = Probe::Idle;
-                            self.probe_busy = 0;
+                        if !self.cur.view_failed {
+                            self.cur.probe = Probe::Idle;
+                            self.cur.probe_busy = 0;
                         }
                     }
                 }
@@ -1419,43 +1649,43 @@ impl Client {
         use Step::*;
         match (step, result) {
             (ScanoutSet, Err(f)) if f.kind == FailKind::Busy => {
-                self.probe_busy = self.probe_busy.saturating_add(1);
-                if self.probe_busy >= PROBE_MAX_BUSY {
-                    self.probe = Probe::Skipped;
+                self.cur.probe_busy = self.cur.probe_busy.saturating_add(1);
+                if self.cur.probe_busy >= PROBE_MAX_BUSY {
+                    self.cur.probe = Probe::Skipped;
                 }
             }
             (FillPattern | ScanoutSet | ScanoutPresent, Err(_)) => {
-                self.probe = Probe::Skipped;
+                self.cur.probe = Probe::Skipped;
             }
             (_, Err(_)) => {
                 // The view is given up; what is half made is undone by the unwind.
-                self.view_failed = true;
+                self.cur.view_failed = true;
             }
             (OpenMapCh, Ok(Out::Handle(h))) => {
-                self.map_ch = h;
-                self.view = ViewStage::ChanOpen;
+                self.cur.map_ch = h;
+                self.cur.view = ViewStage::ChanOpen;
             }
-            (RegisterMapFd, Ok(_)) => self.view = ViewStage::FdRegistered,
+            (RegisterMapFd, Ok(_)) => self.cur.view = ViewStage::FdRegistered,
             (RmMapMemory, Ok(Out::Cookie(c))) => {
-                self.view_cookie = c;
-                self.view = ViewStage::RmMapped;
+                self.cur.view_cookie = c;
+                self.cur.view = ViewStage::RmMapped;
             }
             (HostMmap, Ok(Out::HostMapped(id, off))) => {
-                self.view_host_id = id;
-                self.view_off = off;
-                self.view = ViewStage::HostMapped;
+                self.cur.view_host_id = id;
+                self.cur.view_off = off;
+                self.cur.view = ViewStage::HostMapped;
             }
             (KernelMap, Ok(Out::Mapped(va, len))) => {
-                self.view_va = va;
-                self.view_len = len;
-                self.view = ViewStage::KernelMapped;
+                self.cur.view_va = va;
+                self.cur.view_len = len;
+                self.cur.view = ViewStage::KernelMapped;
             }
-            (FillPattern, Ok(_)) => self.probe = Probe::Filled,
-            (ScanoutSet, Ok(_)) => self.probe = Probe::Set,
-            (ScanoutPresent, Ok(_)) => self.probe = Probe::Shown,
+            (FillPattern, Ok(_)) => self.cur.probe = Probe::Filled,
+            (ScanoutSet, Ok(_)) => self.cur.probe = Probe::Set,
+            (ScanoutPresent, Ok(_)) => self.cur.probe = Probe::Shown,
             // A success that did not carry what the step must produce is a
             // malformed result of the driver's own: give the view up.
-            (_, Ok(_)) => self.view_failed = true,
+            (_, Ok(_)) => self.cur.view_failed = true,
         }
     }
 
@@ -1505,45 +1735,45 @@ impl Client {
             }
             (AllocMemory, Out::Mem(layout)) => {
                 self.surfaces_made = self.surfaces_made.wrapping_add(1);
-                self.surface = Some(Surface {
+                self.cur.surface = Some(Surface {
                     layout,
                     memory: memory_handle(self.surfaces_made),
                     stage: SurfStage::Allocated,
                     gem: 0,
                 });
                 // A fresh surface shows its own picture once.
-                self.probe = Probe::Idle;
-                self.probe_busy = 0;
+                self.cur.probe = Probe::Idle;
+                self.cur.probe_busy = 0;
             }
             (OpenExportCh, Out::Handle(h)) => {
-                self.export_ch = h;
+                self.cur.export_ch = h;
                 self.set_stage(SurfStage::ExportChOpen);
             }
             (ExportToFd, _) => self.set_stage(SurfStage::Exported),
             (GemImport, Out::Gem(g)) => {
-                if let Some(s) = self.surface.as_mut() {
+                if let Some(s) = self.cur.surface.as_mut() {
                     s.gem = g;
                 }
                 self.set_stage(SurfStage::Imported);
             }
             (CloseExportCh, _) => {
-                self.export_ch = 0;
+                self.cur.export_ch = 0;
                 self.set_stage(SurfStage::Ready);
             }
             (GemClose, _) => {
-                if let Some(s) = self.surface.as_mut() {
+                if let Some(s) = self.cur.surface.as_mut() {
                     s.gem = 0;
                     // The memory is next; `Imported` is the last stage that owns a GEM.
                     s.stage = SurfStage::Allocated;
                 }
             }
-            (FreeMemory, _) => self.surface = None,
+            (FreeMemory, _) => self.cur.surface = None,
             _ => bad(self),
         }
     }
 
     fn set_stage(&mut self, stage: SurfStage) {
-        if let Some(s) = self.surface.as_mut() {
+        if let Some(s) = self.cur.surface.as_mut() {
             s.stage = stage;
         }
     }
@@ -1565,23 +1795,31 @@ impl Client {
         self.cleanup_owed = false;
         // Most dependent first: the files that hold mappings and exports, then the
         // GPU channel, last the control file.
-        for h in [self.map_ch, self.export_ch, self.drm, self.gpu, self.ctl] {
+        let mut put = |h: u32| {
             if h != 0 {
                 if let Some(slot) = c.handles.get_mut(c.count) {
                     *slot = h;
                     c.count += 1;
                 }
             }
+        };
+        for p in self.parked.iter().take(usize::from(self.parked_n)) {
+            put(p.map_ch);
+            put(p.export_ch);
         }
-        self.map_ch = 0;
-        self.export_ch = 0;
+        put(self.cur.map_ch);
+        put(self.cur.export_ch);
+        put(self.drm);
+        put(self.gpu);
+        put(self.ctl);
         self.drm = 0;
         self.gpu = 0;
         self.ctl = 0;
-        self.surface = None;
-        self.view = ViewStage::None;
-        self.view_va = 0;
-        self.view_len = 0;
+        // The caller took the views first (`take_views`); nothing of any slot is
+        // believed in after a death.
+        self.cur = Slot::EMPTY;
+        self.parked = [Slot::EMPTY; MAX_PARKED];
+        self.parked_n = 0;
         c
     }
 }
@@ -2678,5 +2916,304 @@ mod tests {
             assert!(h & 0xff00_0000 != 0x5c00_0000, "librmclient's range");
         }
         assert_eq!(H_DEVICE & 0xff00_0000, 0x4b00_0000);
+    }
+
+    // ---- level 3: the ring ----------------------------------------------------------
+
+    const WANT3: Want = Want {
+        level: 3,
+        surface: Some((1920, 1080)),
+    };
+
+    /// `ok_out` with a distinct file per surface (the real host never repeats one).
+    fn ok_out3(step: Step, c: &Client, files: &mut u32) -> Out {
+        match step {
+            Step::OpenExportCh | Step::OpenMapCh => {
+                *files += 1;
+                Out::Handle(100 + *files)
+            }
+            Step::GemImport => {
+                *files += 1;
+                Out::Gem(200 + *files)
+            }
+            Step::KernelMap => {
+                *files += 1;
+                Out::Mapped(
+                    0xffff_8000_0000_0000 + u64::from(*files) * 0x1000_0000,
+                    c.surface().unwrap().0.size,
+                )
+            }
+            _ => ok_out(step, c),
+        }
+    }
+
+    /// Run `want` to quiescence against a healthy host, with unique files.
+    fn run3(c: &mut Client, want: Want, files: &mut u32) -> Vec<Step> {
+        let mut log = Vec::new();
+        loop {
+            c.begin(if c.epoch() == 0 { 1 } else { c.epoch() });
+            match c.next(want) {
+                Action::Step(s) => {
+                    assert!(log.len() < 80, "runaway: {log:?}");
+                    log.push(s);
+                    let out = match s {
+                        Step::AllocMemory => {
+                            let (w, h) = want.surface.unwrap();
+                            Out::Mem(surface_layout(w, h).unwrap())
+                        }
+                        _ => ok_out3(s, c, files),
+                    };
+                    c.finish(s, Ok(out));
+                }
+                Action::Idle | Action::Dead => return log,
+            }
+        }
+    }
+
+    #[test]
+    fn want_slots_follow_the_level() {
+        assert_eq!(WANT1.slots(), 1);
+        assert_eq!(WANT2.slots(), 1);
+        assert_eq!(WANT3.slots(), RING_SLOTS);
+        assert_eq!(RING_SLOTS, MAX_PARKED + 1);
+        assert!(!WANT1.probes() && WANT2.probes() && !WANT3.probes());
+        assert!(!WANT1.views() && WANT2.views() && WANT3.views());
+    }
+
+    #[test]
+    fn level_three_builds_a_ring_of_mapped_surfaces_and_never_probes() {
+        use Step::*;
+        let mut c = Client::new();
+        let mut files = 0;
+        let log = run3(&mut c, WANT3, &mut files);
+        // 11 bring-up + (5 surface + 5 view) per slot + 1 park.
+        assert_eq!(log.len(), 11 + 2 * 10 + 1, "{log:?}");
+        assert_eq!(log.iter().filter(|s| **s == Park).count(), 1);
+        assert_eq!(
+            log.iter().filter(|s| **s == AllocMemory).count(),
+            RING_SLOTS
+        );
+        assert!(!log
+            .iter()
+            .any(|s| matches!(s, FillPattern | ScanoutSet | ScanoutPresent)));
+        // The park comes after the first slot's view and before the second surface.
+        let park = log.iter().position(|s| *s == Park).unwrap();
+        assert_eq!(log[park - 1], KernelMap);
+        assert_eq!(log[park + 1], AllocMemory);
+        assert_eq!(c.slot_count(), 2);
+        assert_eq!(c.parked(), 1);
+        assert!(c.presentable(WANT3));
+        let (a, b) = (c.slot(0).unwrap(), c.slot(1).unwrap());
+        assert_ne!(a.gem, b.gem);
+        assert_ne!(a.view.0, b.view.0, "two views");
+        assert_eq!(a.layout, b.layout);
+        assert!(c.slot(2).is_none());
+        // The same machine is quiescent once complete.
+        assert_eq!(c.next(WANT3), Action::Idle);
+        // A level that wants one surface and no views is not "presentable".
+        assert!(!c.presentable(WANT1));
+    }
+
+    #[test]
+    fn the_ring_is_not_presentable_before_it_is_complete_or_at_another_extent() {
+        let mut c = Client::new();
+        let mut files = 0;
+        // One slot short: stop after the first surface's view.
+        let mut n = 0;
+        while n < 11 + 10 {
+            c.begin(1);
+            let Action::Step(s) = c.next(WANT3) else {
+                panic!("stopped early")
+            };
+            let out = match s {
+                Step::AllocMemory => Out::Mem(surface_layout(1920, 1080).unwrap()),
+                _ => ok_out3(s, &c, &mut files),
+            };
+            c.finish(s, Ok(out));
+            n += 1;
+        }
+        assert_eq!(c.slot_count(), 1);
+        assert!(!c.presentable(WANT3), "half a ring");
+        assert_eq!(c.next(WANT3), Action::Step(Step::Park));
+        // A complete ring is for one extent only.
+        let mut c = Client::new();
+        run3(&mut c, WANT3, &mut files);
+        assert!(c.presentable(WANT3));
+        assert!(!c.presentable(Want {
+            level: 3,
+            surface: Some((1280, 720))
+        }));
+        assert!(!c.presentable(Want {
+            level: 3,
+            surface: None
+        }));
+        // A dead client is never presentable.
+        c.finish(Step::AllocMemory, Err(Fail::new(FailKind::Rm, 0x51)));
+        assert!(!c.presentable(WANT3));
+    }
+
+    #[test]
+    fn a_new_extent_tears_the_whole_ring_down_then_builds_it_again() {
+        use Step::*;
+        let mut c = Client::new();
+        let mut files = 0;
+        run3(&mut c, WANT3, &mut files);
+        let other = Want {
+            level: 3,
+            surface: Some((1280, 720)),
+        };
+        let log = run3(&mut c, other, &mut files);
+        // Old slot (the working one): view down, GEM, memory; then the parked one comes
+        // back and goes the same way; only then is anything new made.
+        let first_alloc = log.iter().position(|s| *s == AllocMemory).unwrap();
+        let before = &log[..first_alloc];
+        let count = |s: Step| before.iter().filter(|x| **x == s).count();
+        assert_eq!(count(Unpark), 1, "{log:?}");
+        assert_eq!(count(GemClose), 2, "{log:?}");
+        assert_eq!(count(FreeMemory), 2, "{log:?}");
+        assert_eq!(count(KernelUnmap), 2, "{log:?}");
+        assert_eq!(count(CloseMapCh), 2, "{log:?}");
+        // The new ring is whole at the new extent.
+        assert!(c.presentable(other));
+        assert_eq!(c.slot(0).unwrap().layout.width, 1280);
+        assert_eq!(c.slot(1).unwrap().layout.height, 720);
+        assert_eq!(log.iter().filter(|s| **s == AllocMemory).count(), 2);
+        assert_eq!(c.soft_errors(), 0);
+    }
+
+    #[test]
+    fn a_failure_in_the_second_slot_closes_the_first_slots_files_too() {
+        use Step::*;
+        let mut c = Client::new();
+        let mut files = 0;
+        // Run until the second slot has opened its export file, and fail its export.
+        let mut opened = 0;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard < 80);
+            c.begin(1);
+            let Action::Step(s) = c.next(WANT3) else {
+                panic!("stopped early")
+            };
+            if s == OpenExportCh {
+                opened += 1;
+            }
+            if s == ExportToFd && opened == 2 {
+                c.finish(s, Err(Fail::new(FailKind::Rm, 0x1f)));
+                break;
+            }
+            let out = match s {
+                AllocMemory => Out::Mem(surface_layout(1920, 1080).unwrap()),
+                _ => ok_out3(s, &c, &mut files),
+            };
+            c.finish(s, Ok(out));
+        }
+        assert!(c.is_dead());
+        // The first slot's view is the caller's to unmap, and it takes it first.
+        let views = c.take_views();
+        assert_eq!(views.as_slice().len(), 1, "the parked slot's view");
+        let cl = c.take_cleanup();
+        let hs = cl.as_slice();
+        // Bring-up files (ctl 10, gpu 11, drm 12), the parked slot's map channel, the
+        // working slot's export file: each exactly once.
+        assert!(
+            hs.contains(&10) && hs.contains(&11) && hs.contains(&12),
+            "{hs:?}"
+        );
+        let mut sorted: Vec<u32> = hs.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), hs.len(), "each handle once: {hs:?}");
+        assert_eq!(hs.len(), 3 + 2, "{hs:?}");
+        // Closing is once: a second call is empty.
+        assert_eq!(c.take_cleanup().as_slice().len(), 0);
+        assert_eq!(c.slot_count(), 0);
+    }
+
+    #[test]
+    fn a_given_up_view_stops_the_ring_without_killing_the_client() {
+        use Step::*;
+        let mut c = Client::new();
+        let mut files = 0;
+        // First slot complete and parked; the second slot's host mapping is refused.
+        let mut parked = false;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard < 80);
+            c.begin(1);
+            let Action::Step(s) = c.next(WANT3) else {
+                break;
+            };
+            if s == Park {
+                parked = true;
+            }
+            if parked && s == HostMmap {
+                c.finish(s, Err(Fail::new(FailKind::Host, 22)));
+                continue;
+            }
+            let out = match s {
+                AllocMemory => Out::Mem(surface_layout(1920, 1080).unwrap()),
+                _ => ok_out3(s, &c, &mut files),
+            };
+            c.finish(s, Ok(out));
+        }
+        assert!(!c.is_dead());
+        assert!(parked);
+        assert!(!c.presentable(WANT3));
+        assert_eq!(c.parked(), 1);
+        assert_eq!(c.next(WANT3), Action::Idle, "no retry, no third slot");
+        // The failed slot has a surface but no view: it is not a usable slot.
+        assert!(c.slot(1).is_none());
+    }
+
+    #[test]
+    fn take_views_gives_every_slots_view_once() {
+        let mut c = Client::new();
+        let mut files = 0;
+        run3(&mut c, WANT3, &mut files);
+        let want_views = [c.slot(0).unwrap().view, c.slot(1).unwrap().view];
+        let v = c.take_views();
+        assert_eq!(v.as_slice().len(), 2);
+        for w in want_views {
+            assert!(v.as_slice().contains(&w));
+        }
+        assert_eq!(c.take_views().as_slice().len(), 0);
+        // The machine no longer believes in either view.
+        assert!(!c.presentable(WANT3));
+    }
+
+    #[test]
+    fn the_level_three_status_word_counts_the_parked_slot() {
+        let mut c = Client::new();
+        let mut files = 0;
+        run3(&mut c, WANT3, &mut files);
+        let w = c.status_word();
+        // `docs/kmd-rm-client.md` section 13 quotes this as the healthy level 3 reading.
+        assert_eq!(w, 0x11b0_5500);
+        assert_eq!((w >> 24) & 0xf, 1, "one parked");
+        assert_eq!((w >> 20) & 0xf, 11);
+        assert_eq!(w >> 28, 1);
+        // Levels 1 and 2 never park, so their words keep the documented values.
+        let mut c = Client::new();
+        let mut buf = [None; 64];
+        run(&mut c, WANT1, &mut buf);
+        assert_eq!((c.status_word() >> 24) & 0xf, 0);
+    }
+
+    #[test]
+    fn park_and_unpark_refuse_what_the_machine_never_asks() {
+        let mut c = Client::new();
+        c.begin(1);
+        // An empty working slot cannot be parked.
+        c.finish(Step::Park, Ok(Out::Unit));
+        assert!(c.is_dead());
+        let mut c = Client::new();
+        let mut buf = [None; 64];
+        run(&mut c, WANT1, &mut buf);
+        // A working slot that holds a surface cannot take another.
+        c.finish(Step::Unpark, Ok(Out::Unit));
+        assert!(c.is_dead());
     }
 }
