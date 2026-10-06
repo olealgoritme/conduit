@@ -1468,6 +1468,19 @@ pub fn resource_unmap_blob(
     resource_unmap_blob_within(passive, adapter, resource_id, SYNC_ROUNDTRIP_TIMEOUT_MS)
 }
 
+/// [`resource_unmap_blob`] under a [`SweepBudget`]: with it spent nothing is sent (`Timeout`).
+pub fn resource_unmap_blob_budgeted(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    budget: &SweepBudget,
+) -> Result<(), VirtioError> {
+    match sweep_timeout_ms(Some(budget)) {
+        Some(timeout_ms) => resource_unmap_blob_within(passive, adapter, resource_id, timeout_ms),
+        None => Err(VirtioError::Timeout),
+    }
+}
+
 fn resource_unmap_blob_within(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -1885,6 +1898,9 @@ pub fn release_allocation_resource(
         let _ = ctx_detach_resource(passive, adapter, ctx_id, resource_id);
         let _ = resource_unref(passive, adapter, resource_id);
     }
+    // `KmdRmClient` = 5: a resource that was the KMD's own RM system memory also owes its
+    // GEM and its RM memory (one atomic load when the service holds nothing).
+    super::rm_client::sysmem::released(passive, adapter, resource_id);
 }
 
 // ── Venus submission ─────────────────────────────────────────────────────────
