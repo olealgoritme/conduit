@@ -500,3 +500,22 @@ pub(crate) fn nvk_rm_fence_present() -> bool {
         env_bool("HELIOS_NVK_RM_FENCE_PRESENT").unwrap_or_else(|| NVK_RM_FENCE_PRESENT.get())
     })
 }
+
+/// `DirectFlipSupport` (REG_DWORD), or `HELIOS_DIRECT_FLIP_SUPPORT` from the
+/// process environment: what the D3D11.1 `CheckDirectFlipSupport` DDI answers.
+/// 0 (default) = never (the behaviour before this knob); 1 = yes when dxgkrnl
+/// reports DirectFlip support for the Helios adapter (KMTQAITYPE_DIRECTFLIP_SUPPORT,
+/// i.e. the KMD's SupportDirectFlip cap) and the two resources have the same
+/// size and format; 2 = yes whenever size and format match (test lever).
+/// Windows decides independent flip and the blt-to-flip swap-effect upgrade
+/// partly from this answer.
+pub(crate) fn direct_flip_support() -> u32 {
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("HELIOS_DIRECT_FLIP_SUPPORT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .or_else(|| helios_umd_common::knobs::reg_dword(c"DirectFlipSupport"))
+            .unwrap_or(0)
+    })
+}

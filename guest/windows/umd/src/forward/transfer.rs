@@ -760,17 +760,130 @@ pub(crate) unsafe extern "system" fn discard_11_1(
 
 pub(crate) unsafe extern "system" fn check_direct_flip_support_11_1(
     _h: Hdevice,
-    _resource1: ddi::D3D10DDI_HRESOURCE,
-    _resource2: ddi::D3D10DDI_HRESOURCE,
+    resource1: ddi::D3D10DDI_HRESOURCE,
+    resource2: ddi::D3D10DDI_HRESOURCE,
     flags: u32,
     supported: *mut ddi::BOOL,
 ) {
+    let mode = crate::knobs::direct_flip_support();
+    let (answer, why) = match mode {
+        0 => (false, "DirectFlipSupport=0"),
+        _ if mode == 1 && !kmd_reports_direct_flip() => (false, "dxgkrnl reports no DirectFlip"),
+        _ => {
+            // resource1 (the app's) must be able to replace resource2 (DWM's
+            // primary) on scanout as is: same size, same format.
+            let (_, k1, w1, h1, _, f1) = resource_summary(resource1);
+            let (_, k2, w2, h2, _, f2) = resource_summary(resource2);
+            if k1 == "tex2d" && k2 == "tex2d" && w1 == w2 && h1 == h2 && f1 == f2 && w1 != 0 {
+                (true, "same size and format")
+            } else {
+                (false, "size or format differ")
+            }
+        }
+    };
     if !supported.is_null() {
-        *supported = 0;
+        *supported = answer as ddi::BOOL;
     }
     if D3D11_1_LOG_COUNT.first_n(64).is_some() {
-        log_error!("DDI D3D11.1 CheckDirectFlipSupport: flags=0x{flags:x} -> no");
+        log_error!(
+            "DDI D3D11.1 CheckDirectFlipSupport: flags=0x{flags:x} mode={mode} -> {} ({why})",
+            if answer { "yes" } else { "no" }
+        );
     }
+}
+
+/// Does dxgkrnl report DirectFlip support (KMTQAITYPE_DIRECTFLIP_SUPPORT, from
+/// the KMD's SupportDirectFlip cap) for a hardware render adapter? Asked once
+/// per process through gdi32's D3DKMT entry points.
+fn kmd_reports_direct_flip() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        // SAFETY: gdi32's documented D3DKMT ABI; every buffer is local and
+        // sized as the call expects; adapters opened by EnumAdapters2 are closed.
+        let r = unsafe { query_direct_flip() };
+        log_error!("DDI CheckDirectFlipSupport: dxgkrnl DirectFlip support = {r}");
+        r
+    })
+}
+
+unsafe fn query_direct_flip() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryA(name: *const u8) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct AdapterInfo {
+        h_adapter: u32,
+        luid_low: u32,
+        luid_high: i32,
+        num_sources: u32,
+        precise_present_regions: i32,
+    }
+    #[repr(C)]
+    struct EnumAdapters2 {
+        num_adapters: u32,
+        adapters: *mut AdapterInfo,
+    }
+    #[repr(C)]
+    struct QueryAdapterInfo {
+        h_adapter: u32,
+        kind: u32,
+        data: *mut c_void,
+        size: u32,
+    }
+    const KMTQAITYPE_ADAPTERTYPE: u32 = 15;
+    const KMTQAITYPE_DIRECTFLIP_SUPPORT: u32 = 19;
+    type Enum2 = unsafe extern "system" fn(*mut EnumAdapters2) -> i32;
+    type Query = unsafe extern "system" fn(*const QueryAdapterInfo) -> i32;
+    type Close = unsafe extern "system" fn(*const u32) -> i32;
+
+    let gdi = LoadLibraryA(c"gdi32.dll".as_ptr().cast());
+    if gdi.is_null() {
+        return false;
+    }
+    let (e, q, c) = (
+        GetProcAddress(gdi, c"D3DKMTEnumAdapters2".as_ptr().cast()),
+        GetProcAddress(gdi, c"D3DKMTQueryAdapterInfo".as_ptr().cast()),
+        GetProcAddress(gdi, c"D3DKMTCloseAdapter".as_ptr().cast()),
+    );
+    if e.is_null() || q.is_null() || c.is_null() {
+        return false;
+    }
+    let (enum2, query, close): (Enum2, Query, Close) =
+        (core::mem::transmute(e), core::mem::transmute(q), core::mem::transmute(c));
+    let mut adapters = [AdapterInfo::default(); 16];
+    let mut arg = EnumAdapters2 { num_adapters: adapters.len() as u32, adapters: adapters.as_mut_ptr() };
+    if enum2(&mut arg) < 0 {
+        return false;
+    }
+    let mut supported = false;
+    for a in &adapters[..(arg.num_adapters as usize).min(adapters.len())] {
+        // D3DKMT_ADAPTERTYPE: bit 0 RenderSupported, bit 2 SoftwareDevice.
+        let mut kind: u32 = 0;
+        let qa = QueryAdapterInfo {
+            h_adapter: a.h_adapter,
+            kind: KMTQAITYPE_ADAPTERTYPE,
+            data: (&mut kind as *mut u32).cast(),
+            size: 4,
+        };
+        let hardware_render = query(&qa) >= 0 && kind & 1 != 0 && kind & 4 == 0;
+        if hardware_render {
+            let mut df: i32 = 0;
+            let qd = QueryAdapterInfo {
+                h_adapter: a.h_adapter,
+                kind: KMTQAITYPE_DIRECTFLIP_SUPPORT,
+                data: (&mut df as *mut i32).cast(),
+                size: 4,
+            };
+            if query(&qd) >= 0 && df & 1 != 0 {
+                supported = true;
+            }
+        }
+        close(&a.h_adapter);
+    }
+    supported
 }
 
 pub(crate) unsafe extern "system" fn clear_view_11_1(
