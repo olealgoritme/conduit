@@ -2215,6 +2215,10 @@ shown.
 
 #### 15.18.7 Failure and fallback matrix
 
+> Since `kmd/flip-completion`: where this matrix says "Venus path" for a FOREIGN or hollow allocation, the Venus copy only
+> runs when it can bind (`ForeignCopy` on, or direct scan-out). Otherwise the flip is completed as a kept picture (its
+> address is published, the screen keeps its picture) and the copy is skipped; `zero-copy-present.md` section 13.
+
 | where | failure | effect | fallback |
 |---|---|---|---|
 | knob 0 / absent | none | the v319 behaviour (15.18.8 states the cost) | Venus (as before) |
