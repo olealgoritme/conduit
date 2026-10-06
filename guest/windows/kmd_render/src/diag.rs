@@ -841,6 +841,17 @@ pub mod knobs {
     /// ⛔ Clamped in code to `[WDDM_HEAD_MS_MIN, WDDM_HEAD_MS_MAX]` when nonzero:
     /// too large reinstates the TDR, too small re-opens the 0ab-B stale-frame class.
     pub const WDDM_HEAD_MS: KnobName = KnobName::new(b"WddmHeadMs");
+    /// `FlGSyncMs` (default 0 = OFF; DIAGNOSTIC, `docs/flush-gate.md` section 9).
+    ///
+    /// A `HEFL` flush-gate Render waits up to N ms (PASSIVE, no lock held, clamped in
+    /// code to `flush_trace::SYNC_MS_MAX`) until the boundary its packet carries has
+    /// retired, then returns, so the runtime's key release follows the GPU completion on
+    /// the CPU. If the keyed-mutex ordering failure goes away with it, the failure is a
+    /// CPU-vs-GPU race (the release outruns the work); if it does not, the gate is not
+    /// what orders the acquirer. Snapshotted at transport init: `pnputil /restart-device`
+    /// applies it. Read `FlGSyncWt` (waits that ran) first: 0 means the experiment did
+    /// not run.
+    pub const FLG_SYNC_MS: KnobName = KnobName::new(b"FlGSyncMs");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.
