@@ -500,6 +500,46 @@ system memory, which the GPU reads over PCIe on every draw. This is the
 first suspect (`feat/nvk-rm-bar-heap`). After that come NVK/NAK on
 Blackwell itself and tessellation.
 
+#### Config tuning: DXVK options do not move it (2026-10-06, KMD 22.22.310.0)
+
+A private copy (`C:\Users\Public\tune\heaven`), 1600x900 Medium,
+tessellation normal, one `dxvk.conf` change per pass on top of
+`d3d11.disableDirectImageMapping = False`. Each pass: 25 s warm-up, then the
+last 30 s of shim frame times, with host `nvidia-smi dmon -s pu -c 15`
+during the window (avg SM % / min-max, avg power). Run-to-run noise is about
++-5 fps here: the 30 s window starts at a slightly different point of the
+camera path depending on load and shader-compile time (no shader cache),
+so the two baselines differ by 14 fps.
+
+| setting | fps | p50 / p99 ms | SM % avg (min-max) | power |
+|---|---|---|---|---|
+| baseline (KMD .309, before the guest restart) | 83.2 | 10.50 / 43.3 | 92 (49-99) | 163 W |
+| baseline 2 | 97.3 | 8.79 / 18.8 | 98 (98-99) | 165 W |
+| `d3d11.cachedDynamicResources = a` | 87.8 | 9.83 / 20.9 | 98 (93-99) | 165 W |
+| `d3d11.cachedDynamicResources = cr` | 91.7 | 9.66 / 20.5 | 99 (98-99) | 168 W |
+| `d3d11.cachedDynamicResources = vi` | 92.6 | 9.39 / 20.3 | 99 (97-99) | 170 W |
+| `d3d11.relaxedBarriers = True` | 91.8 | 9.63 / 19.8 | 99 (99-99) | 171 W |
+| `d3d11.relaxedGraphicsBarriers = True` | 95.2 | 8.97 / 20.4 | 99 (98-99) | 167 W |
+
+Not measured (runs stopped to free Heaven time for the BAR-heap and
+block-linear work): `dxvk.enableGraphicsPipelineLibrary`, `dxvk.useRawSsbo`,
+descriptor buffer off (`dxvk.enableDescriptorBuffer = False`; DXVK uses
+`VK_EXT_descriptor_buffer` on NVK, no descriptor heap), `dxgi.hideNvidiaGpu`
+(DXVK reports the GPU to Heaven as AMD 0x1002:0x73df), `d3d11.maxTessFactor`,
+`NVK_DEBUG=no_cbuf`, `NAK_DEBUG=nougpr`. `d3d11.constantBufferRangeCheck`
+and `d3d11.ignoreGraphicsBarriers` no longer exist in this DXVK, and
+`NVK_DEBUG=coherent`/`gart` are parsed but used nowhere.
+
+Every setting lands inside the baseline noise, with the GPU at 98-99% SM in
+every pass, so DXVK's resource placement and barrier options are not the
+limit. Recommended `dxvk.conf`: unchanged (`windows/dxvk-nvk.conf`).
+
+At the time this was read as a sign that per-draw GPU reads of DXVK's dynamic
+buffers over PCIe were not the main cost, and that a BAR heap would help less
+than hoped. That reading was wrong: `cachedDynamicResources` keeps those
+buffers in (cached) system memory, which the GPU still reads over PCIe, and
+the BAR heap gave 3.1x (next section).
+
 It was the cause: see the next section.
 
 ### Host-visible VRAM (patch 22, 2026-10-06, `win11`, KMD 22.22.310.0)
