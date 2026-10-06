@@ -1727,6 +1727,35 @@ pub fn forget_allocation_blob(
     false
 }
 
+/// Release the host resource an allocation owns, exactly once: drop its blob slot
+/// (and a foreign record), then, only for the first claimant of the live-resource
+/// entry, detach it from `ctx_id` and `RESOURCE_UNREF` it.
+///
+/// The one place both release triggers meet: `DxgkDdiDestroyAllocation` (nothing
+/// open) and the last `DxgkDdiCloseAllocation` of an allocation destroyed while
+/// still open (`ForeignTable::allocation_destroyed` / `close`). The old adopted
+/// arm unref'd unconditionally, which double-freed resources another path had
+/// already reclaimed (QEMU "virgl_cmd_resource_unref: resource does not exist");
+/// `take_live_resource` is the guard. Best-effort on the virtio operations:
+/// teardown must not get stuck, and a context that is already gone just makes the
+/// detach fail. PASSIVE only.
+pub fn release_allocation_resource(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    resource_id: u32,
+) {
+    // `forget_allocation_blob` already OWNS the unmap decision (T6/R915).
+    let _ = forget_allocation_blob(passive, adapter, resource_id);
+    let first_teardown = adapter
+        .with_virtio(|v| v.take_live_resource(resource_id))
+        .unwrap_or(false);
+    if first_teardown {
+        let _ = ctx_detach_resource(passive, adapter, ctx_id, resource_id);
+        let _ = resource_unref(passive, adapter, resource_id);
+    }
+}
+
 // ── Venus submission ─────────────────────────────────────────────────────────
 
 /// SYNCHRONOUS venus SUBMIT_3D (in-kernel venus client's direct commands —

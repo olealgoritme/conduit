@@ -67,12 +67,26 @@ pub enum AllocAdopt {
     Refused(AdoptRefusal),
 }
 
-/// A point-in-time read for `QUERY_CAPS`.
+/// What [`VirtioGpu::foreign_close`] decided, and what the final release needs.
+#[derive(Clone, Copy)]
+pub struct ForeignClose {
+    pub outcome: fr::CloseOutcome,
+    /// The Venus context the resource was imported on (the holder context), read
+    /// in the same lock hold: the caller of a deferred `Release` no longer has an
+    /// `AllocationContext` to take it from.
+    pub holder_ctx: u32,
+}
+
+/// A point-in-time read for `QUERY_CAPS` and the counters.
 #[derive(Clone, Copy)]
 pub struct ForeignSnapshot {
     pub limits: fr::Limits,
     pub live_total: u32,
     pub live_owner: u32,
+    /// Opens of adopted foreign allocations alive now, across processes.
+    pub opens_live: u32,
+    /// Destroyed allocations whose release waits for opens to drain.
+    pub orphans: u32,
     pub counters: fr::Counters,
 }
 
@@ -228,11 +242,70 @@ impl VirtioGpu {
     /// Limits, occupancy and counters; `owner` is the caller, whose own count
     /// is reported separately.
     pub fn foreign_snapshot(&self, owner: DeviceOwner) -> ForeignSnapshot {
+        self.foreign_snapshot_for(owner.raw() as u64)
+    }
+
+    /// As [`Self::foreign_snapshot`] for a caller with no device token (the
+    /// open / close / attach paths publish counters too): `live_owner` is 0.
+    pub fn foreign_snapshot_any(&self) -> ForeignSnapshot {
+        self.foreign_snapshot_for(0)
+    }
+
+    fn foreign_snapshot_for(&self, owner: u64) -> ForeignSnapshot {
         ForeignSnapshot {
             limits: self.foreign.limits(),
             live_total: self.foreign.live() as u32,
-            live_owner: self.foreign.owner_live(owner.raw() as u64) as u32,
+            live_owner: self.foreign.owner_live(owner) as u32,
+            opens_live: self.foreign.open_refs_total(),
+            orphans: self.foreign.orphans() as u32,
             counters: self.foreign.counters(),
         }
+    }
+
+    // ---- cross-process sharing (S6) ------------------------------------------
+    //
+    // All four run under the device spinlock like everything in this file: table
+    // work only, no allocation, nothing that waits. The release they may call for
+    // runs at PASSIVE in the caller (`ctrl::release_allocation_resource`).
+
+    /// `DxgkDdiOpenAllocation` of an allocation naming `resource_id`, by
+    /// `process` (the opening device's `hKmdProcess`). Counts the open iff the
+    /// resource is an adopted foreign one whose allocation still lives; the open
+    /// handle must remember it and call [`Self::foreign_close`] exactly once.
+    pub fn foreign_open(&mut self, resource_id: u32, process: usize) -> fr::OpenOutcome {
+        self.foreign.open(resource_id, process as u64)
+    }
+
+    /// `DxgkDdiCloseAllocation` (or the unwind of a failed open) of an open
+    /// [`Self::foreign_open`] counted. `Release` tells the caller it closed the
+    /// last open of a destroyed allocation and must release the host resource.
+    pub fn foreign_close(&mut self, resource_id: u32, process: usize) -> ForeignClose {
+        let holder_ctx = self.foreign.get(resource_id).map_or(0, |e| e.ctx_id);
+        ForeignClose {
+            outcome: self.foreign.close(resource_id, process as u64),
+            holder_ctx,
+        }
+    }
+
+    /// `DxgkDdiDestroyAllocation` of an allocation that owns `resource_id`:
+    /// whether this destroy releases the host resource now, defers it to the
+    /// last close, or is the legacy teardown of a non-foreign resource.
+    pub fn foreign_allocation_destroyed(&mut self, resource_id: u32) -> fr::DestroyOutcome {
+        self.foreign.allocation_destroyed(resource_id)
+    }
+
+    /// An `ATTACH_RESOURCE` escape of `resource_id` by `owner` / `process`:
+    /// classify and count (see `ForeignTable::note_attach`).
+    pub fn foreign_note_attach(
+        &mut self,
+        resource_id: u32,
+        owner: Option<DeviceOwner>,
+        process: usize,
+    ) -> fr::AttachOutcome {
+        self.foreign.note_attach(
+            resource_id,
+            owner.map_or(0, |o| o.raw() as u64),
+            process as u64,
+        )
     }
 }

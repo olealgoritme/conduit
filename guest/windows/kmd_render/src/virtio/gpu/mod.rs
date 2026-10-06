@@ -65,7 +65,7 @@ mod nvrm_events;
 mod nvrm_tables;
 mod resource_tables;
 mod foreign_tables;
-pub use foreign_tables::{AllocAdopt, ForeignBegin, ForeignCommit};
+pub use foreign_tables::{AllocAdopt, ForeignBegin, ForeignClose, ForeignCommit, ForeignSnapshot};
 
 pub use nvrm_events::{
     release_nvrm_event, NvrmEventRefusal, NvrmEventRegistered, NvrmEventsState, MAX_NVRM_EVENTS,

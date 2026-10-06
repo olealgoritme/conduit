@@ -239,6 +239,9 @@ hardening items below.
   current process today) or an adoption cookie returned by `IMPORT_RM`.
 - Cross-process lifetime of an imported foreign resource that two devices of one process use:
   the importing device's DestroyDevice frees it even if the bridge's device still imports it.
+  **S6 (`shared-foreign-surfaces.md`): after adoption the lifetime is refcounted over the opens
+  of the adopting allocation (the host resource lives until the last of the allocation's
+  destroy and every open's close); before adoption this item still stands.**
 
 ## 9. Open questions
 
@@ -426,7 +429,9 @@ allocation (`owns_resource`) pops the blob slot and the record (`forget_allocati
 `take_live_resource` lets exactly one caller issue `CTX_DETACH_RESOURCE` + `RESOURCE_UNREF`. A second
 allocation cannot adopt the same resid (`AlreadyAdopted`), so there is never a second owner.
 `OpenAllocation` creates only an `OpenAllocationContext` and never owns the resource, and the C1 gate
-(`resource_is_live`) still fails an open of a dead resid. The creator's `RELEASE_BLOB` after adoption
+(`resource_is_live`) still fails an open of a dead resid. **S6 supersedes the single release: the
+open is counted and the unref moves to the last of destroy and closes, see
+`shared-foreign-surfaces.md` section 3.** The creator's `RELEASE_BLOB` after adoption
 no longer finds the slot (it is KMD-owned) and fails harmlessly.
 
 ### 10.3 The vendor blob type cannot be minted from allocation private data (live, gate or not)

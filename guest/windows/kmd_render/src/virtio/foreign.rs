@@ -86,6 +86,16 @@ pub fn rm_import_served(adapter: &AdapterContext) -> bool {
             .unwrap_or(false)
 }
 
+/// Whether an `ATTACH_RESOURCE` of a foreign resource by a caller that neither
+/// created it nor holds an open of its allocation is refused (`STATUS_ACCESS_DENIED`).
+///
+/// `false`: counted (`FgAttUns`) and allowed, as every live resid has always been.
+/// The sanctioned route to a foreign resid is `OpenAllocation` (it identifies the
+/// resource and records the opener's process); flip this once a run shows
+/// `FgAttUns` is 0 for every legitimate consumer (DWM, the bridge, NVK's holder
+/// context). See `docs/shared-foreign-surfaces.md` section 4.
+pub const ATTACH_ENFORCE: bool = false;
+
 /// `IMPORT_RM` requests turned away because the gate is closed (`FgUns`).
 pub static IMPORT_UNSUPPORTED: AtomicU32 = AtomicU32::new(0);
 /// `RELEASE_BLOB`s that found nothing to release (`FgRelDup`): an unknown resource,
@@ -220,8 +230,32 @@ pub fn import_rm(
 /// throttles the calls. `owner` is the caller (the snapshot needs one for its
 /// per-owner count, which is not published).
 pub fn publish_counters(adapter: &AdapterContext, owner: DeviceOwner) {
-    if let Ok(snap) = adapter.with_virtio(|v| v.foreign_snapshot(owner)) {
+    publish_snapshot(adapter.with_virtio(|v| v.foreign_snapshot(owner)).ok());
+}
+
+/// As [`publish_counters`] for the paths that have no device token (open, close,
+/// attach, destroy). PASSIVE only; the callers throttle.
+pub fn publish_counters_any(adapter: &AdapterContext) {
+    publish_snapshot(adapter.with_virtio(|v| v.foreign_snapshot_any()).ok());
+}
+
+fn publish_snapshot(snap: Option<super::gpu::ForeignSnapshot>) {
+    if let Some(snap) = snap {
         let c = snap.counters;
+        // Cross-process sharing (S6). `FgOpen - FgClose` is `FgOpLive` (a count
+        // that only grows is an open leaked by dxgkrnl or by us); `FgDefer` is 0
+        // under dxgkrnl's contract and `FgOrphan` is 0 at rest (an allocation
+        // destroyed with an opener still alive, whose release waits for it).
+        crate::diag::record_named_bytes(b"FgOpen", c.opened);
+        crate::diag::record_named_bytes(b"FgClose", c.closed);
+        crate::diag::record_named_bytes(b"FgOpRf", c.refused_open);
+        crate::diag::record_named_bytes(b"FgClsMis", c.close_missed);
+        crate::diag::record_named_bytes(b"FgDefer", c.deferred);
+        crate::diag::record_named_bytes(b"FgDeferRl", c.deferred_released);
+        crate::diag::record_named_bytes(b"FgOpLive", snap.opens_live);
+        crate::diag::record_named_bytes(b"FgOrphan", snap.orphans);
+        crate::diag::record_named_bytes(b"FgAtt", c.attached);
+        crate::diag::record_named_bytes(b"FgAttUns", c.attached_unsanctioned);
         crate::diag::record_named_bytes(b"FgImp", c.imported);
         crate::diag::record_named_bytes(b"FgRel", c.released);
         crate::diag::record_named_bytes(b"FgAdo", c.adopted);

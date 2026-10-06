@@ -428,7 +428,14 @@ pub unsafe extern "C" fn dxgkddi_escape(
             Some(owner) => escape_release_blob(passive, adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
-        HELIOS_ESCAPE_ATTACH_RESOURCE => escape_attach_resource(passive, adapter, buf, &hdr),
+        HELIOS_ESCAPE_ATTACH_RESOURCE => {
+            // SAFETY: the runtime supplies our live DeviceContext (or null, which
+            // reads as "no process") for this Escape.
+            let process = unsafe { crate::device::DeviceHandleRef::from_raw(args.hDevice) }
+                .map(|d| d.creator_process())
+                .unwrap_or(0);
+            escape_attach_resource(passive, adapter, buf, &hdr, owner, process)
+        }
         HELIOS_ESCAPE_QUERY_STATS => escape_query_stats(adapter, buf, &hdr),
         HELIOS_ESCAPE_QUERY_SCANOUT => escape_query_scanout(adapter, buf, &hdr),
         HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE => escape_query_scanout_timeline(buf, &hdr),
@@ -2713,6 +2720,8 @@ fn escape_attach_resource(
     adapter: &AdapterContext,
     buf: &mut [u8],
     hdr: &HeliosEscapeHeader,
+    owner: Option<crate::virtio::gpu::DeviceOwner>,
+    process: usize,
 ) -> NTSTATUS {
     let wire = match EscapeBuf::<HeliosEscapeAttachResource>::new(buf, hdr) {
         Ok(w) => w,
@@ -2729,6 +2738,21 @@ fn escape_attach_resource(
     // attach of a dead resid "succeeds" and the importer's next
     // `vkAllocateMemory` poisons its whole venus ring (host `invalid res_id`
     // → CS error → fatal decoder state — the boot-#3 dwm kill).
+    //
+    // S6: a FOREIGN resource (RM memory another process rendered into) is the most
+    // valuable resid to name, so an attach of one is counted (`FgAtt`) and
+    // classified: sanctioned when the caller's device imported it or the caller's
+    // process holds an open of the allocation that adopted it (the route
+    // `DxgkDdiOpenAllocation` gives an opener), else `FgAttUns`. Refused only when
+    // `foreign::ATTACH_ENFORCE` says so; today every live resid is still accepted.
+    let verdict = adapter
+        .with_virtio(|v| v.foreign_note_attach(req.resource_id, owner, process))
+        .unwrap_or(helios_kmd_logic::foreign_resource::AttachOutcome::NotForeign);
+    if verdict == helios_kmd_logic::foreign_resource::AttachOutcome::Unsanctioned
+        && crate::virtio::foreign::ATTACH_ENFORCE
+    {
+        return STATUS_ACCESS_DENIED;
+    }
     match ctrl::attach_resource_checked(passive, adapter, req.ctx_id, req.resource_id) {
         Ok(()) => STATUS_SUCCESS,
         Err(ve) => ve.into(),

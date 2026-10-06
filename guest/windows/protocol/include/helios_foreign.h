@@ -19,6 +19,10 @@
 #define HELIOS_FOREIGN_OP_IMPORT_RM 2u
 
 #define HELIOS_FOREIGN_CAP_RM_IMPORT (1u << 0)
+/* The KMD lets other processes open an adopted foreign allocation (open
+ * identity flag, layout trailer rewritten at every open, host resource kept
+ * until the last open closes). KMD-only: independent of the host. */
+#define HELIOS_FOREIGN_CAP_SHARED_OPEN (1u << 1)
 
 /* IMPORT_RM.flags: a helios_foreign_layout follows the 72-byte request
  * (helios_foreign_import_rm_layout, 104 bytes). Not optional: a request without
