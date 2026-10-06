@@ -1,4 +1,4 @@
-From eb1feeba9e49646d9607fe64207b623a81723d95 Mon Sep 17 00:00:00 2001
+From 0c6b337d10a26ba6f536c66a0060f850a20b52b5 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Tue, 6 Oct 2026 03:17:09 +0200
 Subject: [PATCH] nvk/rm: Helios ICD interface, resource ids by IMPORT_RM,
@@ -37,9 +37,9 @@ VK_ERROR_FEATURE_NOT_PRESENT. NVK_HELIOS_RESID=0 turns resource ids off.
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  44 ++++
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c  |   6 +
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c  |   3 +
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c  | 203 +++++++++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c  | 209 ++++++++++++++++-
  src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h |  17 ++
- 10 files changed, 703 insertions(+), 3 deletions(-)
+ 10 files changed, 708 insertions(+), 4 deletions(-)
  create mode 100644 src/nouveau/vulkan/helios_icd_interface.h
  create mode 100644 src/nouveau/vulkan/nvk_helios.c
 
@@ -270,7 +270,7 @@ index 46efbb9..83339c9 100644
        align64(pAllocateInfo->allocationSize, alignment);
 diff --git a/src/nouveau/vulkan/nvk_helios.c b/src/nouveau/vulkan/nvk_helios.c
 new file mode 100644
-index 0000000..c64d596
+index 0000000..d49d13b
 --- /dev/null
 +++ b/src/nouveau/vulkan/nvk_helios.c
 @@ -0,0 +1,240 @@
@@ -338,7 +338,7 @@ index 0000000..c64d596
 +   uint64_t modifier;
 +   if (level->tiling.gob_type == NIL_GOB_TYPE_LINEAR) {
 +      modifier = DRM_FORMAT_MOD_LINEAR;
-+   } else if (level->tiling.gob_type == NIL_GOB_TYPE_FERMI_COLOR &&
++   } else if (level->tiling.gob_type == NIL_GOB_TYPE_TURING_COLOR2_D &&
 +              level->tiling.x_log2 == 0 && level->tiling.z_log2 == 0 &&
 +              level->tiling.y_log2 <= 5) {
 +      modifier = HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X | level->tiling.y_log2;
@@ -647,10 +647,23 @@ index 8d40c66..78b6451 100644
        nvkmd_rm_close_gem(dev, mem->gem_handle);
     simple_mtx_destroy(&mem->export_mutex);
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
-index e37dd56..f0f6834 100644
+index e37dd56..59cb881 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
-@@ -391,3 +391,206 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
+@@ -372,7 +372,11 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
+    if (ret == 0) {
+       p_atomic_inc(&dev->flips_ok);
+    } else {
+-      p_atomic_inc(&dev->flips_failed);
++      const uint64_t nfail = p_atomic_inc_return(&dev->flips_failed);
++      if (nfail <= 4 || nfail % 600 == 0)
++         mesa_logw("NVK: scanout flip of GEM %u failed: %d (%s), %" PRIu64
++                   " failed so far", mem->gem_handle, ret,
++                   ret < 0 ? strerror(-ret) : "?", nfail);
+       result = vk_errorf(log_obj, VK_ERROR_SURFACE_LOST_KHR,
+                          "ScanoutFlip of GEM %u: %d (%s)", mem->gem_handle,
+                          ret, ret < 0 ? strerror(-ret) : "?");
+@@ -391,3 +395,206 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
  
     return result;
  }
