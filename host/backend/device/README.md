@@ -49,7 +49,7 @@ against a fake host driver; the skipped ones open the real `/dev/nvidiactl`.
 conduit-backend --socket /run/user/1000/conduit/vm.sock \
     --caps graphics,video,utility,compute [--vram-limit-mib 8192] \
     [--display-socket PATH]... [--console-vnc PATH] \
-    [--venus --venus-renderer PATH [--venus-hostmem-mib N]]
+    [--window-mib N] [--venus --venus-renderer PATH [--venus-hostmem-mib N]]
 ```
 
 `--display-socket` may be given several times (the CLI passes the viewer's

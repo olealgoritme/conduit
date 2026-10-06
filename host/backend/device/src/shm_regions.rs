@@ -7,11 +7,12 @@
 //!
 //! | shmid | what | size |
 //! | --- | --- | --- |
-//! | 1 | the window: device memory the backend places (`shm.rs`) | the allocator's total, 1 GiB |
+//! | 1 | the window: device memory the backend places (`shm.rs`) | `--window-mib`, 4 GiB |
 //! | 2 | the UVM aperture: CUDA semaphore pools and managed memory (`nvidia/aperture.rs`) | 32 GiB |
 //! | 3 | Venus host-visible blobs, at offsets the guest picks (docs/VENUS.md) | `--venus-hostmem-mib`, 8 GiB |
 //!
-//! conduit-vmm hard-codes both (BAR 2 and BAR 4). QEMU >= 11.1 asks instead, with
+//! conduit-vmm takes the window's size from its config (`gpu-forward.window-mib`,
+//! the same 4 GiB default) and hard-codes the aperture (BAR 2 and BAR 4). QEMU >= 11.1 asks instead, with
 //! `VHOST_USER_GET_SHMEM_CONFIG`, and lays the regions out itself -- one BAR
 //! (BAR 4) holding them back to back in shmid order. The answer is built here,
 //! where it can be tested without the vhost crates.
@@ -24,6 +25,41 @@
 pub const SHM_ID_WINDOW: u8 = 1;
 /// The UVM aperture. Must match `NVGPU_SHM_ID_APERTURE`.
 pub const SHM_ID_APERTURE: u8 = 2;
+
+/// `--window-mib` when not given: the window every guest CPU mapping of RM
+/// memory goes through (VRAM through BAR1, host-allocated system memory).
+///
+/// 4 GiB because several NVK-on-RM processes each keep up to 256 MiB of
+/// host-visible VRAM mapped for as long as it is allocated (guest/nvk-rm,
+/// `NVK_RM_BAR_MB`), and 1 GiB ran out at four. It costs nothing until used:
+/// the backend's memfd is sparse, QEMU reserves the range `MAP_NORESERVE`
+/// (patch 0008) and conduit-vmm `PROT_NONE`, and the allocator keeps a free
+/// list, not a page table. Nor does it move the BAR: QEMU rounds window +
+/// aperture (+ Venus) up to a power of two, and 4 + 32 + 8 GiB is 64 GiB,
+/// as 1 + 32 + 8 was. conduit-vmm's default (`gpu-forward.window-mib`) is the
+/// same number and must stay so.
+pub const WINDOW_MIB_DEFAULT: u64 = 4096;
+
+/// The smallest window `--window-mib` takes: each of the allocator's three
+/// zones must still be whole pages, and the smallest (uncached, 1/32) at
+/// least 1 MiB.
+pub const WINDOW_MIB_MIN: u64 = 32;
+/// The largest. 64 GiB is QEMU's whole default shared-memory BAR; above it the
+/// BAR doubles to 128 GiB or more, which firmware without the host's physical
+/// address width will not place (docs/VENUS.md "Windows/OVMF guests").
+pub const WINDOW_MIB_MAX: u64 = 65536;
+
+/// The size of region 1 for `--window-mib`: a power of two (conduit-vmm makes
+/// it a BAR of its own, and the allocator's zones are fractions of it) from
+/// [`WINDOW_MIB_MIN`] to [`WINDOW_MIB_MAX`].
+pub fn window_len(mib: u64) -> Result<u64, String> {
+    if !mib.is_power_of_two() || !(WINDOW_MIB_MIN..=WINDOW_MIB_MAX).contains(&mib) {
+        return Err(format!(
+            "--window-mib {mib}: must be a power of two from {WINDOW_MIB_MIN} to {WINDOW_MIB_MAX}"
+        ));
+    }
+    Ok(mib << 20)
+}
 
 /// Venus host-visible blobs (docs/VENUS.md). Advertised only with `--venus`,
 /// and only to a frontend that asks (QEMU): conduit-vmm's BARs are fixed.
@@ -165,6 +201,51 @@ mod tests {
         assert_eq!(sizes[1], 1 << 30);
         assert_eq!(sizes[2], 32 << 30);
         assert!(sizes[4..].iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn window_size_is_checked() {
+        assert_eq!(window_len(WINDOW_MIB_DEFAULT), Ok(4 << 30));
+        assert_eq!(window_len(1024), Ok(1 << 30));
+        assert_eq!(window_len(WINDOW_MIB_MIN), Ok(32 << 20));
+        assert_eq!(window_len(WINDOW_MIB_MAX), Ok(64 << 30));
+        for bad in [0, 16, 3000, 4095, 131072, 1 << 62] {
+            assert!(window_len(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The default window does not change QEMU's BAR (patch 0006 rounds the
+    /// regions' total up to a power of two): 64 GiB with Venus or without,
+    /// as with the old 1 GiB window.
+    #[test]
+    fn the_default_window_keeps_the_bar_at_64_gib() {
+        let bar = |window: u64, venus: u64| {
+            let (_, sizes) = region_sizes_with_venus(window, APERTURE_LEN, venus);
+            sizes.iter().sum::<u64>().next_power_of_two()
+        };
+        let venus = venus_hostmem_len(VENUS_HOSTMEM_MIB_DEFAULT).unwrap();
+        let window = window_len(WINDOW_MIB_DEFAULT).unwrap();
+        assert_eq!(bar(1 << 30, venus), 64 << 30);
+        assert_eq!(bar(window, venus), 64 << 30);
+        assert_eq!(bar(window, 0), 64 << 30);
+        // 16 GiB still fits; the 64 GiB maximum doubles it.
+        assert_eq!(bar(16 << 30, venus), 64 << 30);
+        assert_eq!(bar(64 << 30, venus), 128 << 30);
+    }
+
+    /// The allocator's zones cover exactly the window, for every size taken.
+    #[test]
+    fn every_window_size_splits_into_whole_page_zones() {
+        let mut mib = WINDOW_MIB_MIN;
+        while mib <= WINDOW_MIB_MAX {
+            let len = window_len(mib).unwrap();
+            let z = ZoneConfig::for_window(len);
+            assert_eq!(z.total(), len, "{mib} MiB");
+            for zone in [z.uc_size, z.wc_size, z.wb_size] {
+                assert!(zone >= 1 << 20 && zone % 4096 == 0, "{mib} MiB");
+            }
+            mib *= 2;
+        }
     }
 
     #[test]

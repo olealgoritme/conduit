@@ -401,6 +401,7 @@ fn main() -> Result<()> {
                 &forward.socket,
                 &forward.proc_nvidia,
                 forward.vram_limit_mib,
+                forward.window_mib,
                 vm.mem.clone(),
             )
             .with_context(|| format!("GPU forwarding backend at {}", forward.socket.display()))?,
@@ -428,7 +429,7 @@ fn main() -> Result<()> {
         // backend is simply never offered a request channel, and every mapping
         // stays where the guest cannot reach it -- which is where this device
         // was before the window existed.
-        if let Err(err) = memory_slots.open_window(shm_addr, NvGpuDevice::shm_bar_size()) {
+        if let Err(err) = memory_slots.open_window(shm_addr, device.shm_bar_size()) {
             log::warn!(
                 "conduit-gpu window not reserved ({err:#}); device memory will not be \
                  mappable by the guest"
