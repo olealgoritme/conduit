@@ -787,14 +787,31 @@ pub(crate) unsafe fn finish_wddm_tex2d_nvk(
     );
 }
 
-/// `D3D10_DDI_RESOURCE_MISC_SHARED_KEYEDMUTEX`.
-const DDI_MISC_SHARED_KEYEDMUTEX: u32 = 0x0000_0100;
+/// `D3D10_DDI_RESOURCE_MISC_SHARED`.
+const DDI_MISC_SHARED_FLAG: u32 = 0x0000_0002;
+/// `D3D10_DDI_BIND_PRESENT`.
+const DDI_BIND_PRESENT_FLAG: u32 = 0x0000_0080;
 
-/// NVK: remember a live keyed-mutex shared resource of this device, so flushes
-/// and presents complete NVK's work on the CPU while it exists
+/// NVK: remember a live cross-process shared resource of this device, so
+/// flushes and presents complete NVK's work on the CPU while it exists
 /// (`nvk_keyed_flush_wait`).
-unsafe fn note_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE, misc: u32) {
-    if misc & DDI_MISC_SHARED_KEYEDMUTEX == 0 || load_resource(h_resource).is_none() {
+///
+/// The keyed mutex is invisible at the DDI: `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`
+/// (0x100) is "reserved" in `D3D10_DDI_RESOURCE_MISC_FLAG` (d3d10umddi.h), the
+/// runtime passes such a texture down as plain `MISC_SHARED` (seen: API misc
+/// 0x900 arrives as DDI 0x2) and drives `D3DKMT*KeyedMutex2` itself after
+/// `pfnFlush`. So every shared resource counts, except DXGI present buffers
+/// (`BIND_PRESENT`), whose hand-off to DWM is the present path's business.
+unsafe fn note_nvk_keyed_resource(
+    h: Hdevice,
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    misc: u32,
+    bind: u32,
+) {
+    if misc & DDI_MISC_SHARED_FLAG == 0
+        || bind & DDI_BIND_PRESENT_FLAG != 0
+        || load_resource(h_resource).is_none()
+    {
         return;
     }
     let Some(dev) = helios_device(h) else {
@@ -808,7 +825,7 @@ unsafe fn note_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURC
     if !list.contains(&key) {
         list.push(key);
         log_error!(
-            "DDI NVK keyed-mutex resource hDrv=0x{key:x}: flushes now wait for the GPU ({} live)",
+            "DDI NVK shared resource hDrv=0x{key:x}: flushes now wait for the GPU ({} live)",
             list.len()
         );
     }
@@ -836,7 +853,7 @@ pub(crate) unsafe extern "system" fn create_resource(
 ) {
     create_resource_inner(h, arg, h_resource, h_rt);
     if !arg.is_null() {
-        note_nvk_keyed_resource(h, h_resource, (*arg).MiscFlags);
+        note_nvk_keyed_resource(h, h_resource, (*arg).MiscFlags, (*arg).BindFlags);
     }
 }
 
@@ -1490,12 +1507,13 @@ pub(crate) unsafe extern "system" fn open_resource(
     h_resource: ddi::D3D10DDI_HRESOURCE,
     h_rt: ddi::D3D10DDI_HRTRESOURCE,
 ) {
-    // The creator's DDI misc flags travel in the meta trailer.
-    let misc = open_resource_inner(h, arg, h_resource, h_rt);
-    note_nvk_keyed_resource(h, h_resource, misc);
+    // An opened resource is shared by definition; the creator's bind flags
+    // travel in the meta trailer.
+    let bind = open_resource_inner(h, arg, h_resource, h_rt);
+    note_nvk_keyed_resource(h, h_resource, DDI_MISC_SHARED_FLAG, bind);
 }
 
-/// Returns the creator's misc flags (0 when the open failed early).
+/// Returns the creator's DDI bind flags (0 when the open failed early).
 unsafe fn open_resource_inner(
     h: Hdevice,
     arg: *const ddi::D3D10DDIARG_OPENRESOURCE,
@@ -1777,7 +1795,7 @@ unsafe fn open_resource_inner(
         empty_present_private(),
         snapshot_source,
     );
-    meta.misc_flags
+    meta.bind_flags
 }
 
 pub(crate) unsafe extern "system" fn calc_size_opened_resource(

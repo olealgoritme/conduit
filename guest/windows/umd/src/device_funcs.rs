@@ -379,11 +379,12 @@ pub struct HeliosDevice {
     /// Mutex, not RefCell: written by CreateResource/DestroyResource (any
     /// thread under FREETHREADED caps), read by the present path. Lock with
     /// `crate::forward::lock_ignore_poison`.
-    /// NVK: live shared resources this device created or opened with a keyed
-    /// mutex (`pDrvPrivate` of each). While any exists, `pfnFlush` and present
-    /// wait on the CPU for NVK's submitted work (docs/shared-surfaces.md §4):
-    /// the runtime's keyed-mutex release is ordered against our DMA buffers
-    /// only, and NVK's GPU work is not in them.
+    /// NVK: live cross-process shared resources (not present buffers) this
+    /// device created or opened (`pDrvPrivate` of each). While any exists,
+    /// `pfnFlush` and present wait on the CPU for NVK's submitted work
+    /// (docs/shared-surfaces.md §4): the runtime's keyed-mutex release is
+    /// ordered against our DMA buffers only, NVK's GPU work is not in them, and
+    /// the keyed mutex itself is invisible at the DDI.
     pub nvk_keyed_resources: std::sync::Mutex<Vec<usize>>,
     pub direct_scanout_allocations:
         std::sync::Mutex<Vec<(u32, helios_protocol::HeliosPresentPrivateData)>>,
