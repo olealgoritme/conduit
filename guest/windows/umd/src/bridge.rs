@@ -118,6 +118,9 @@ mod ffi {
             foreign_modifier: u64,
             foreign_stride: u32,
             foreign_offset: u32,
+            foreign_plane1_modifier: u64,
+            foreign_plane1_stride: u32,
+            foreign_plane1_offset: u32,
         ) -> usize;
 
         /// The ICD backend of this device: 1 = Venus, 2 = NVK on RM
@@ -139,6 +142,9 @@ mod ffi {
             stride: *mut u32,
             offset: *mut u32,
             fourcc: *mut u32,
+            plane1_modifier: *mut u64,
+            plane1_stride: *mut u32,
+            plane1_offset: *mut u32,
         ) -> bool;
         /// NVK: show the texture on scanout 0 (KMD foreign scanout source).
         /// 0 = shown. # Safety: a live `ID3D11Resource*`.
@@ -463,6 +469,9 @@ impl ffi::HeliosDxvkDevice {
                 foreign.map_or(0, |f| f.modifier),
                 foreign.map_or(0, |f| f.stride),
                 foreign.map_or(0, |f| f.offset),
+                foreign.map_or(0, |f| f.plane1_modifier),
+                foreign.map_or(0, |f| f.plane1_stride),
+                foreign.map_or(0, |f| f.plane1_offset),
             ))
         }
     }
@@ -491,6 +500,9 @@ impl ffi::HeliosDxvkDevice {
                 &mut id.layout.stride,
                 &mut id.layout.offset,
                 &mut id.layout.fourcc,
+                &mut id.layout.plane1_modifier,
+                &mut id.layout.plane1_stride,
+                &mut id.layout.plane1_offset,
             )
         };
         (ok && id.resource_id != 0 && id.ctx_id != 0).then_some(id)
@@ -536,14 +548,19 @@ pub(crate) enum IcdBackend {
     NvkRm,
 }
 
-/// What lies in an NVK-made (foreign) resource: plane 0, as the KMD records it
-/// (`HeliosWddmAllocLayout`).
+/// What lies in an NVK-made (foreign) resource: plane 0, and plane 1 of a
+/// two-plane format (NV12/P010/P016), as the KMD records it
+/// (`HeliosWddmAllocLayout`, `HeliosWddmAllocPlane`; docs/shared-formats.md).
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct ForeignLayout {
     pub(crate) modifier: u64,
     pub(crate) stride: u32,
     pub(crate) offset: u32,
     pub(crate) fourcc: u32,
+    /// Plane 1; `plane1_stride` 0 for a single-plane resource.
+    pub(crate) plane1_modifier: u64,
+    pub(crate) plane1_stride: u32,
+    pub(crate) plane1_offset: u32,
 }
 
 /// `mode` of [`BridgeDevice::flush_gate_point`] (dxvk_bridge.h kFlushGate*).

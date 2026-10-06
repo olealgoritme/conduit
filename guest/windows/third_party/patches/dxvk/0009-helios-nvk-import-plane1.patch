@@ -1,0 +1,96 @@
+Helios DXVK fork: an NVK import of a two-plane surface passes plane 1
+
+Conduit guest/windows/docs/shared-formats.md. Applied after 0008 by
+ci/windows/Build-Driver.ps1.
+
+A foreign resource of a two-plane format (NV12/P010/P016) records plane 1's
+modifier, pitch and offset in the KMD's version-2 layout trailer. The UMD
+reads them at the open and hands them over in D3D11_HELIOS_IMPORT_INFO
+(ForeignPlane1*); DxvkImage passes them to NVK in
+HeliosImportMemoryResourceInfo with HELIOS_IMPORT_MEMORY_RESOURCE_FLAG_PLANE1,
+and NVK checks plane 1 of the opener's image against them as it checks
+plane 0. A single-plane open (stride 0) sends what it sent before.
+
+diff --git a/src/d3d11/d3d11_texture.cpp b/src/d3d11/d3d11_texture.cpp
+index 4413c32a..412acb8e 100644
+--- a/src/d3d11/d3d11_texture.cpp
++++ b/src/d3d11/d3d11_texture.cpp
+@@ -95,6 +95,9 @@ namespace dxvk {
+         imageInfo.sharing.heliosForeignModifier = pHeliosImport->ForeignModifier;
+         imageInfo.sharing.heliosForeignStride   = pHeliosImport->ForeignStride;
+         imageInfo.sharing.heliosForeignOffset   = pHeliosImport->ForeignOffset;
++        imageInfo.sharing.heliosForeignPlane1Modifier = pHeliosImport->ForeignPlane1Modifier;
++        imageInfo.sharing.heliosForeignPlane1Stride   = pHeliosImport->ForeignPlane1Stride;
++        imageInfo.sharing.heliosForeignPlane1Offset   = pHeliosImport->ForeignPlane1Offset;
+ 
+         // Symmetric scan-out-primary import: reconstruct the creator's exact
+         // plain LINEAR + DMA_BUF image. Import mode is preserved, and ordinary
+diff --git a/src/d3d11/d3d11_texture.h b/src/d3d11/d3d11_texture.h
+index 93dad517..08f26c91 100644
+--- a/src/d3d11/d3d11_texture.h
++++ b/src/d3d11/d3d11_texture.h
+@@ -105,6 +105,11 @@ namespace dxvk {
+     uint64_t ForeignModifier  = 0u;
+     uint32_t ForeignStride    = 0u;
+     uint32_t ForeignOffset    = 0u;
++    // Plane 1 of a two-plane foreign resource (the KMD's version-2 trailer,
++    // Conduit shared-formats.md); stride 0 for one plane.
++    uint64_t ForeignPlane1Modifier = 0u;
++    uint32_t ForeignPlane1Stride   = 0u;
++    uint32_t ForeignPlane1Offset   = 0u;
+   };
+ 
+ 
+diff --git a/src/dxvk/dxvk_helios_backend.h b/src/dxvk/dxvk_helios_backend.h
+index dc685cda..cda39909 100644
+--- a/src/dxvk/dxvk_helios_backend.h
++++ b/src/dxvk/dxvk_helios_backend.h
+@@ -104,8 +104,15 @@ namespace dxvk {
+     uint64_t        modifier;
+     uint32_t        stride;
+     uint32_t        offset;
++    // With HELIOS_IMPORT_MEMORY_RESOURCE_FLAG_PLANE1 only: plane 1 of a
++    // two-plane surface (NV12/P010/P016, Conduit shared-formats.md)
++    uint64_t        plane1Modifier;
++    uint32_t        plane1Stride;
++    uint32_t        plane1Offset;
+   };
+ 
++  constexpr uint32_t HELIOS_IMPORT_MEMORY_RESOURCE_FLAG_PLANE1 = 1u << 0;
++
+   constexpr VkStructureType VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_HELIOS =
+     VkStructureType(1000384004);
+ 
+diff --git a/src/dxvk/dxvk_image.cpp b/src/dxvk/dxvk_image.cpp
+index 0a6f0f2e..1da4ac0f 100644
+--- a/src/dxvk/dxvk_image.cpp
++++ b/src/dxvk/dxvk_image.cpp
+@@ -739,6 +739,12 @@ namespace dxvk {
+       heliosNvkImportInfo.modifier   = m_info.sharing.heliosForeignModifier;
+       heliosNvkImportInfo.stride     = m_info.sharing.heliosForeignStride;
+       heliosNvkImportInfo.offset     = m_info.sharing.heliosForeignOffset;
++      if (m_info.sharing.heliosForeignPlane1Stride) {
++        heliosNvkImportInfo.flags         |= HELIOS_IMPORT_MEMORY_RESOURCE_FLAG_PLANE1;
++        heliosNvkImportInfo.plane1Modifier = m_info.sharing.heliosForeignPlane1Modifier;
++        heliosNvkImportInfo.plane1Stride   = m_info.sharing.heliosForeignPlane1Stride;
++        heliosNvkImportInfo.plane1Offset   = m_info.sharing.heliosForeignPlane1Offset;
++      }
+       heliosNvkImportInfo.pNext = std::exchange(sharedMemoryInfo, &heliosNvkImportInfo);
+       Logger::info(str::format("DxvkImage: NVK import of resource ", m_info.sharing.heliosResourceId,
+         " ", m_info.extent.width, "x", m_info.extent.height, " modifier 0x", std::hex,
+diff --git a/src/dxvk/dxvk_memory.h b/src/dxvk/dxvk_memory.h
+index 2e3bf9eb..d456cc3d 100644
+--- a/src/dxvk/dxvk_memory.h
++++ b/src/dxvk/dxvk_memory.h
+@@ -70,6 +70,11 @@ namespace dxvk {
+     uint64_t     heliosForeignModifier  = 0u;
+     uint32_t     heliosForeignStride    = 0u;
+     uint32_t     heliosForeignOffset    = 0u;
++    /// Plane 1 of a two-plane foreign resource (NV12/P010/P016); stride 0:
++    /// the resource has one plane, or the opener did not learn plane 1.
++    uint64_t     heliosForeignPlane1Modifier = 0u;
++    uint32_t     heliosForeignPlane1Stride   = 0u;
++    uint32_t     heliosForeignPlane1Offset   = 0u;
+   };
+ 
+ 

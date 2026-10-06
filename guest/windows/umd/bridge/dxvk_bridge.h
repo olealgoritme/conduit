@@ -93,7 +93,10 @@ struct HeliosDxvkDevice {
       bool foreign,
       std::uint64_t foreign_modifier,
       std::uint32_t foreign_stride,
-      std::uint32_t foreign_offset) const;
+      std::uint32_t foreign_offset,
+      std::uint64_t foreign_plane1_modifier,
+      std::uint32_t foreign_plane1_stride,
+      std::uint32_t foreign_plane1_offset) const;
 
   // The ICD backend this device runs on (helios_icd_interface.h's
   // HELIOS_ICD_BACKEND_*): 1 = Venus, 2 = NVK on RM.
@@ -113,7 +116,10 @@ struct HeliosDxvkDevice {
       std::uint64_t* modifier,
       std::uint32_t* stride,
       std::uint32_t* offset,
-      std::uint32_t* fourcc) const noexcept;
+      std::uint32_t* fourcc,
+      std::uint64_t* plane1_modifier,
+      std::uint32_t* plane1_stride,
+      std::uint32_t* plane1_offset) const noexcept;
 
   // NVK: show the texture's image on scanout 0 through the KMD's foreign
   // scanout source (zero copy). The caller has waited for the frame's GPU
