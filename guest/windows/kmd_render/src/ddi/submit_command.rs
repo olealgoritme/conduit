@@ -237,6 +237,11 @@ pub(crate) fn publish_nvrm_counters() {
     // Foreign scanout source (HELIOS_NVRM_OP_SCANOUT_*): `FsSet`, `FsPres`, `FsRel`,
     // `FsLapse`, `FsEnd`, `FsTake`, `FsSupp`, `FsRest`, `FsRef`, `FsErr`.
     crate::adapter::foreign_scanout::publish_counters();
+    // RELEASE_BLOBs that found nothing (a double free, or a race with a sweep).
+    crate::diag::record_named_bytes(
+        b"FgRelDup",
+        crate::virtio::foreign::RELEASE_DUP.load(Ordering::Relaxed),
+    );
     // RM fence handles (a forwarded SEMSURF_FENCE_CREATE): `NvFence` made and
     // recorded, `NvFenceCl` released (Close or teardown; the difference is what is
     // live), `NvFenceSig` EventReadys seen for fences, `NvFenceEarly` of those that

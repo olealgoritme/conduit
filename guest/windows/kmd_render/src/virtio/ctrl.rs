@@ -1475,6 +1475,7 @@ pub fn release_blob_for_owner(
         .with_virtio(|v| v.take_blob_matching(owner, ctx_id, resource_id))
         .map_err(|_| VirtioError::DeviceError)?;
     let Some((res, mapped, map_offset, map_len)) = taken else {
+        crate::virtio::foreign::RELEASE_DUP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return Ok(());
     };
     // A snapshot/DWM resource cannot detach while a deferred WindowedBlt

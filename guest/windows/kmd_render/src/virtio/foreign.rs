@@ -88,6 +88,11 @@ pub fn rm_import_served(adapter: &AdapterContext) -> bool {
 
 /// `IMPORT_RM` requests turned away because the gate is closed (`FgUns`).
 pub static IMPORT_UNSUPPORTED: AtomicU32 = AtomicU32::new(0);
+/// `RELEASE_BLOB`s that found nothing to release (`FgRelDup`): an unknown resource,
+/// or one already released. The verb stays an idempotent success (it can race the
+/// device-destroy sweeps and the Venus ICD releases defensively); this makes a
+/// double free in NVK or the UMD visible without turning it into an error.
+pub static RELEASE_DUP: AtomicU32 = AtomicU32::new(0);
 /// `MAP_BLOB` / remap attempts on a foreign resource (`FgMapRf`). Bumped under
 /// the device spinlock, hence an atomic.
 pub static MAP_REFUSED: AtomicU32 = AtomicU32::new(0);
