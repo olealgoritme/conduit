@@ -31,6 +31,10 @@
       in `conduit-vmm`, backend thread placement, a short spin in the event pump
 - [ ] Display pacing: forward buffer release, drive the guest vblank from the
       host's presentation feedback ([KNOWN-ISSUES.md](KNOWN-ISSUES.md))
+- [ ] Windows guests on NVK-on-RM: the desktop and every app and game through
+      Mesa NVK on the host's RM, zero-copy, Venus removed in the end. Heaven
+      already runs at ~350 fps there against 139 on Venus. Goal, stages and
+      state: [NVK-ROADMAP.md](NVK-ROADMAP.md)
 - [ ] Windows guests through Venus (in progress, experimental `--venus`):
       Helios's guest drivers over Conduit's device ([WINDOWS.md](WINDOWS.md),
       [VENUS.md](VENUS.md)); runs in a Windows 11 guest.
