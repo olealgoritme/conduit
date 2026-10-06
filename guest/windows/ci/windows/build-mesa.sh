@@ -17,6 +17,23 @@ compat_header="${repo_root}/icd/win-build/helios_win_compat.h"
 
 python "${repo_root}/tools/sync-metadata.py" --check
 
+# The Helios patches the shipped ICD carries (icd/patches/series, one file
+# name per line, in order; see icd/patches/README.md). Idempotent: a patch the
+# tree already carries is skipped.
+series="${repo_root}/icd/patches/series"
+if [[ -f "${series}" ]]; then
+  while read -r patch; do
+    [[ -z "${patch}" || "${patch}" == \#* ]] && continue
+    patch_file="${repo_root}/icd/patches/${patch}"
+    if git -C "${mesa_src}" apply --reverse --check "${patch_file}" 2>/dev/null; then
+      printf 'mesa: %s already applied\n' "${patch}"
+    else
+      git -C "${mesa_src}" apply "${patch_file}"
+      printf 'mesa: applied %s\n' "${patch}"
+    fi
+  done < "${series}"
+fi
+
 setup_mode=()
 case "${build_mode}" in
   --clean)

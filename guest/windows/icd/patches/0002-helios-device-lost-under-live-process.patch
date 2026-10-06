@@ -1,0 +1,903 @@
+diff --git a/src/virtio/vulkan/test_helios_lost.c b/src/virtio/vulkan/test_helios_lost.c
+new file mode 100644
+index 00000000000..5d6378eb98a
+--- /dev/null
++++ b/src/virtio/vulkan/test_helios_lost.c
+@@ -0,0 +1,199 @@
++/* Unit test for vn_renderer_helios_lost.h (Windows, user mode only).
++ *
++ * A pagefile-backed section view stands in for a KMD MAP_BLOB view: it is
++ * unmapped under the process the way DxgkDdiDestroyDevice unmaps the KMD's
++ * views when the driver stops, while threads keep using it the way the ring
++ * writer does.
++ *
++ * Build: x86_64-w64-mingw32-gcc -O2 -o test_helios_lost.exe test_helios_lost.c
++ *        (or i686-w64-mingw32-gcc for the WoW64 ICD)
++ */
++#include <stdio.h>
++#include <string.h>
++#include <windows.h>
++
++static volatile LONG log_lines;
++#define HELIOS_LOST_LOG(...)                                                  \
++   do {                                                                       \
++      InterlockedIncrement(&log_lines);                                       \
++      fprintf(stderr, "  log: ");                                             \
++      fprintf(stderr, __VA_ARGS__);                                           \
++      fputc('\n', stderr);                                                    \
++   } while (0)
++#include "vn_renderer_helios_lost.h"
++
++static int failures;
++#define CHECK(cond)                                                           \
++   do {                                                                       \
++      if (!(cond)) {                                                          \
++         fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);      \
++         failures++;                                                          \
++      }                                                                       \
++   } while (0)
++
++struct view {
++   HANDLE section;
++   volatile uint32_t *va;
++   size_t size;
++};
++
++static struct view
++view_map(size_t size)
++{
++   struct view v = { 0 };
++   v.size = size;
++   v.section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
++                                  0, (DWORD)size, NULL);
++   v.va = MapViewOfFile(v.section, FILE_MAP_ALL_ACCESS, 0, 0, size);
++   return v;
++}
++
++static void
++view_unmap(struct view *v)
++{
++   UnmapViewOfFile((void *)v->va);
++   CloseHandle(v->section);
++}
++
++static DWORD
++state_of(const volatile void *p)
++{
++   MEMORY_BASIC_INFORMATION mbi;
++   if (!VirtualQuery((const void *)p, &mbi, sizeof(mbi)))
++      return 0;
++   return mbi.State == MEM_COMMIT ? (mbi.Type << 1 | 1) : mbi.State;
++}
++
++/* A ring writer: reads head, copies a packet into the buffer, stores tail,
++ * until the owner is lost. */
++struct writer {
++   volatile uint32_t *shared;
++   size_t size;
++   volatile LONG *owner;
++   volatile LONG running;
++   LONG iterations_after_loss;
++};
++
++static DWORD WINAPI
++writer_main(void *arg)
++{
++   struct writer *w = arg;
++   uint8_t packet[256];
++   memset(packet, 0xab, sizeof(packet));
++   uint32_t cur = 0;
++   InterlockedExchange(&w->running, 1);
++   for (;;) {
++      if (helios_lost_is_set(w->owner)) {
++         /* What the ICD does after the latch: no more real touches, but a
++          * straggler touch must still be safe. */
++         (void)w->shared[0];
++         w->iterations_after_loss++;
++         break;
++      }
++      const uint32_t head = w->shared[0];
++      const uint32_t off = 64 + (cur % (uint32_t)(w->size - 64 - sizeof(packet)));
++      memcpy((uint8_t *)w->shared + off, packet, sizeof(packet));
++      cur += sizeof(packet) + (head & 1);
++      w->shared[1] = cur;
++   }
++   return 0;
++}
++
++int
++main(void)
++{
++   CHECK(helios_lost_init());
++   volatile LONG lost_a = 0, lost_b = 0;
++
++   /* 1. A view unmapped under a thread that keeps writing to it. */
++   {
++      struct view ring = view_map(1 << 20);
++      struct view other = view_map(256 << 10); /* same owner, never touched */
++      struct view kept = view_map(64 << 10);   /* same owner, still mapped */
++      CHECK(ring.va && other.va && kept.va);
++      kept.va[0] = 0x1234;
++      helios_lost_register(&lost_a, (void *)ring.va, ring.size);
++      helios_lost_register(&lost_a, (void *)other.va, other.size);
++      helios_lost_register(&lost_a, (void *)kept.va, kept.size);
++
++      struct writer w = { ring.va, ring.size, &lost_a, 0, 0 };
++      HANDLE threads[4];
++      struct writer ws[4];
++      for (int i = 0; i < 4; i++) {
++         ws[i] = w;
++         threads[i] = CreateThread(NULL, 0, writer_main, &ws[i], 0, NULL);
++      }
++      for (int i = 0; i < 4; i++)
++         while (!ws[i].running)
++            Sleep(1);
++      Sleep(50);
++      view_unmap(&ring);  /* the KMD stop */
++      view_unmap(&other);
++      CHECK(WaitForMultipleObjects(4, threads, TRUE, 5000) == WAIT_OBJECT_0);
++      for (int i = 0; i < 4; i++) {
++         CHECK(ws[i].iterations_after_loss == 1);
++         CloseHandle(threads[i]);
++      }
++      CHECK(helios_lost_is_set(&lost_a));
++      CHECK(!helios_lost_is_set(&lost_b));
++      /* both freed ranges are ours now, the mapped one is untouched */
++      CHECK(state_of(ring.va) == (MEM_PRIVATE << 1 | 1));
++      CHECK(state_of(other.va) == (MEM_PRIVATE << 1 | 1));
++      CHECK(state_of(kept.va) == (MEM_MAPPED << 1 | 1));
++      CHECK(kept.va[0] == 0x1234);
++      CHECK(helios_lost.repairs == 2);
++
++      /* unregistering frees our backing */
++      helios_lost_unregister((void *)ring.va);
++      CHECK(state_of(ring.va) == MEM_FREE);
++      helios_lost_unregister_owner(&lost_a);
++      CHECK(state_of(other.va) == MEM_FREE);
++      CHECK(state_of(kept.va) == (MEM_MAPPED << 1 | 1));
++      CHECK(helios_lost.count == 0);
++      view_unmap(&kept);
++   }
++
++   /* 2. Faults outside registered ranges are left alone. */
++   {
++      CHECK(IsBadReadPtr((void *)(uintptr_t)0x10, 4));
++      CHECK(!helios_lost_is_set(&lost_b));
++   }
++
++   /* 3. A freed range something else took is not claimed. */
++   {
++      struct view v = view_map(64 << 10);
++      helios_lost_register(&lost_b, (void *)v.va, v.size);
++      void *base = (void *)v.va;
++      view_unmap(&v);
++      void *squat = VirtualAlloc(base, 64 << 10, MEM_RESERVE, PAGE_NOACCESS);
++      CHECK(squat == base);
++      CHECK(IsBadReadPtr(base, 4)); /* still faults, handler declined */
++      CHECK(!helios_lost_is_set(&lost_b));
++      VirtualFree(squat, 0, MEM_RELEASE);
++      helios_lost_unregister(base);
++   }
++
++   /* 4. A D3DKMT "device gone" latch backs freed ranges before any touch. */
++   {
++      struct view v = view_map(128 << 10);
++      helios_lost_register(&lost_b, (void *)v.va, v.size);
++      volatile uint32_t *p = v.va;
++      view_unmap(&v);
++      CHECK(helios_lost_status_is_device_gone((LONG)0xC00002B6));
++      CHECK(!helios_lost_status_is_device_gone((LONG)0xC0000002));
++      helios_lost_mark(&lost_b);
++      CHECK(helios_lost_is_set(&lost_b));
++      CHECK(state_of(p) == (MEM_PRIVATE << 1 | 1));
++      CHECK(p[7] == 0);
++      helios_lost_unregister_owner(&lost_b);
++      CHECK(state_of(p) == MEM_FREE);
++   }
++
++   helios_lost_fini();
++   CHECK(helios_lost.veh == NULL);
++
++   printf("%s (%d failures, %ld log lines, %ld repairs)\n",
++          failures ? "FAILED" : "PASSED", failures, log_lines,
++          helios_lost.repairs);
++   return failures ? 1 : 0;
++}
+diff --git a/src/virtio/vulkan/vn_queue.c b/src/virtio/vulkan/vn_queue.c
+index 3abfc4ea0da..f4849bc0e7e 100644
+--- a/src/virtio/vulkan/vn_queue.c
++++ b/src/virtio/vulkan/vn_queue.c
+@@ -38,6 +38,16 @@
+ 
+ /* queue commands */
+ 
++/* The device is gone: a forward-progress deadline concluded the renderer
++ * context is dead (dev->helios_lost), or the renderer itself lost its device
++ * (Helios: the KMD stopped under this process and its mappings went away). */
++static inline bool
++vn_device_is_lost(struct vn_device *dev)
++{
++   return p_atomic_read(&dev->helios_lost) ||
++          vn_renderer_is_lost(dev->renderer);
++}
++
+ #if DETECT_OS_WINDOWS
+ void vn_renderer_helios_diag_log(const char *fmt, ...);
+ #endif
+@@ -1879,6 +1889,9 @@ vn_queue_submit(struct vn_queue_submission *submit)
+    uint64_t phase_win32_ns = 0;
+    uint64_t phase_t0;
+ 
++   if (unlikely(vn_device_is_lost(dev)))
++      return vn_error(instance, VK_ERROR_DEVICE_LOST);
++
+    /* To ensure external components waiting on the correct fence payload,
+     * below sync primitives must be installed after the submission:
+     * - explicit fencing: sync file export
+@@ -2980,6 +2993,8 @@ VKAPI_ATTR VkResult VKAPI_CALL
+ vn_GetFenceStatus(VkDevice device, VkFence fence)
+ {
+    struct vn_device *dev = vn_device_from_handle(device);
++   if (unlikely(vn_device_is_lost(dev)))
++      return vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
+    VkResult result = vn_get_fence_status(device, fence, NULL);
+    if (result == VK_SUCCESS)
+       vn_device_memory_invalidate_coherent_cached_mappings(dev);
+@@ -3028,8 +3043,12 @@ vn_update_sync_result(struct vn_device *dev,
+ {
+    switch (result) {
+    case VK_NOT_READY:
+-      if (abs_timeout != OS_TIMEOUT_INFINITE &&
+-          os_time_get_nano() >= abs_timeout)
++      /* Nothing will ever signal on a lost device; spinning on would end in
++       * vn_relax()'s abort. */
++      if (unlikely(vn_device_is_lost(dev)))
++         result = VK_ERROR_DEVICE_LOST;
++      else if (abs_timeout != OS_TIMEOUT_INFINITE &&
++               os_time_get_nano() >= abs_timeout)
+          result = VK_TIMEOUT;
+       else
+          vn_relax(relax_state);
+@@ -3679,7 +3698,7 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
+    bool check_device_lost = false;
+    bool deadline_hit = false;
+ 
+-   if (p_atomic_read(&dev->helios_lost))
++   if (vn_device_is_lost(dev))
+       return vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
+ 
+ #if DETECT_OS_WINDOWS
+diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+index 96090e74858..791c9fb2e1c 100644
+--- a/src/virtio/vulkan/vn_renderer.h
++++ b/src/virtio/vulkan/vn_renderer.h
+@@ -303,8 +303,22 @@ struct vn_renderer {
+    struct vn_renderer_shmem_ops shmem_ops;
+    struct vn_renderer_bo_ops bo_ops;
+    struct vn_renderer_sync_ops sync_ops;
++
++   /* Latched (never cleared) when the device behind the renderer is gone and
++    * its mapped memory may be too (Helios: the KMD stopped under this
++    * process). From then on nothing may touch renderer-mapped memory for
++    * real work and every submit or wait reports VK_ERROR_DEVICE_LOST.
++    * p_atomic_*; 32 bits so the Helios backend can latch it with Interlocked
++    * operations. */
++   uint32_t lost;
+ };
+ 
++static inline bool
++vn_renderer_is_lost(const struct vn_renderer *renderer)
++{
++   return p_atomic_read(&renderer->lost) != 0;
++}
++
+ #ifdef HAVE_LIBDRM
+ VkResult
+ vn_renderer_create_virtgpu(struct vn_instance *instance,
+diff --git a/src/virtio/vulkan/vn_renderer_helios.c b/src/virtio/vulkan/vn_renderer_helios.c
+index 18533cc8742..f7aadc0876e 100644
+--- a/src/virtio/vulkan/vn_renderer_helios.c
++++ b/src/virtio/vulkan/vn_renderer_helios.c
+@@ -711,6 +711,22 @@ vn_renderer_helios_diag_log(const char *fmt, ...)
+    fclose(f);
+ }
+ 
++/* Device loss under a live process: KMD mappings that vanish (see the header). */
++#define HELIOS_LOST_LOG(...) helios_diag(__VA_ARGS__)
++#include "vn_renderer_helios_lost.h"
++
++static inline volatile LONG *
++helios_lost_latch(struct helios *helios)
++{
++   return (volatile LONG *)&helios->base.lost;
++}
++
++static inline bool
++helios_is_lost(struct helios *helios)
++{
++   return vn_renderer_is_lost(&helios->base);
++}
++
+ __declspec(dllexport) uint32_t helios_venus_current_ctx_id(void);
+ __declspec(dllexport) uint32_t helios_venus_instance_ctx_id(VkInstance instance);
+ __declspec(dllexport) uint64_t helios_venus_memory_id(VkDeviceMemory memory);
+@@ -1432,6 +1448,10 @@ helios_escape_ex(struct helios *helios, void *buf, uint32_t size, bool hardware_
+       helios_diag("escape skipped: no adapter size=%u", size);
+       return false;
+    }
++   /* The device is gone; its handles are dead and every escape would fail
++    * (and log three lines). */
++   if (helios_is_lost(helios))
++      return false;
+ 
+    D3DKMT_ESCAPE esc;
+    memset(&esc, 0, sizeof(esc));
+@@ -1457,6 +1477,12 @@ helios_escape_ex(struct helios *helios, void *buf, uint32_t size, bool hardware_
+                   (unsigned)helios->device, size);
+       fprintf(stderr, "HELIOS[gate5a]: D3DKMTEscape status=0x%08x (adapter=0x%x device=0x%x size=%u)\n",
+               (unsigned)st, (unsigned)helios->adapter, (unsigned)helios->device, size);
++      if (helios_lost_status_is_device_gone(st) && !helios_is_lost(helios)) {
++         helios_diag("device-lost: D3DKMTEscape status=0x%08x — renderer lost, "
++                     "KMD mappings no longer touched",
++                     (unsigned)st);
++         helios_lost_mark(helios_lost_latch(helios));
++      }
+       return false;
+    }
+    return true;
+@@ -2792,7 +2818,8 @@ helios_sync_retire_thread(void *arg)
+          }
+          if (!handled) {
+             uint32_t slices = 0;
+-            while (!p_atomic_read(&helios->retire_stop) && slices < HELIOS_RETIRE_MAX_SLICES) {
++            while (!p_atomic_read(&helios->retire_stop) && !helios_is_lost(helios) &&
++                   slices < HELIOS_RETIRE_MAX_SLICES) {
+                if (helios_wait_fence_blocking(helios, entry->fence_id,
+                                               HELIOS_RETIRE_SLICE_NS)) {
+                   complete = true;
+@@ -3939,6 +3966,8 @@ static VkResult
+ helios_submit(struct vn_renderer *renderer, const struct vn_renderer_submit *submit)
+ {
+    struct helios *helios = (struct helios *)renderer;
++   if (unlikely(helios_is_lost(helios)))
++      return VK_ERROR_DEVICE_LOST;
+    VkResult result = VK_SUCCESS;
+    const bool perf = helios->perf.enabled;
+    LARGE_INTEGER t0 = { 0 }, t1 = { 0 }, t2 = { 0 };
+@@ -4052,6 +4081,8 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
+          helios->perf.wait_fast++;
+       return VK_SUCCESS;
+    }
++   if (unlikely(helios_is_lost(helios)))
++      return VK_ERROR_DEVICE_LOST;
+    if (wait->timeout == 0) {
+       if (helios->perf.enabled)
+          helios->perf.wait_timeout++;
+@@ -4138,7 +4169,7 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
+ 
+    for (uint32_t i = 0; i < wait_fence_count; i++) {
+       if (!helios_ioctl_wait_fence(helios, wait_fences[i], wait->timeout)) {
+-         result = VK_TIMEOUT;
++         result = helios_is_lost(helios) ? VK_ERROR_DEVICE_LOST : VK_TIMEOUT;
+          break;
+       }
+    }
+@@ -4170,6 +4201,8 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
+ static void
+ helios_shmem_destroy_now(struct vn_renderer *renderer, struct vn_renderer_shmem *shmem)
+ {
++   /* before RELEASE_BLOB unmaps it */
++   helios_lost_unregister(shmem->mmap_ptr);
+    struct helios *helios = (struct helios *)renderer;
+    struct helios_shmem *hshmem = (struct helios_shmem *)shmem;
+ 
+@@ -4250,6 +4283,7 @@ helios_shmem_create(struct vn_renderer *renderer, size_t size)
+    shmem->base.mmap_size = size;
+    shmem->base.mmap_ptr = (void *)(uintptr_t)user_va;
+    shmem->ctx_id = helios->ctx_id;
++   helios_lost_register(helios_lost_latch(helios), shmem->base.mmap_ptr, size);
+ 
+    return &shmem->base;
+ }
+@@ -4424,6 +4458,8 @@ helios_bo_map(struct vn_renderer *renderer, struct vn_renderer_bo *_bo, void *pl
+       if (va) {
+          bo->base.mmap_ptr = (void *)(uintptr_t)va;
+          bo->map_cache = map_cache;
++         helios_lost_register(helios_lost_latch(helios), bo->base.mmap_ptr,
++                              bo->base.mmap_size);
+          if (helios->perf.enabled) {
+             switch (map_cache) {
+             case HELIOS_MAP_CACHE_CACHED:
+@@ -4454,6 +4490,7 @@ helios_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *bo)
+ 
+    if (!hbo->resource_released)
+       vn_renderer_bo_release_resource(renderer, bo);
++   helios_lost_unregister(bo->mmap_ptr);
+ 
+    free(hbo);
+    return true;
+@@ -4465,6 +4502,7 @@ helios_bo_release_resource(struct vn_renderer *renderer, struct vn_renderer_bo *
+    struct helios *helios = (struct helios *)renderer;
+    struct helios_bo *hbo = (struct helios_bo *)bo;
+ 
++   helios_lost_unregister(bo->mmap_ptr); /* before RELEASE_BLOB unmaps it */
+    if (hbo->resource_released)
+       return;
+ 
+@@ -5013,6 +5051,10 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
+ 
+    vn_renderer_shmem_cache_fini(&helios->shmem_cache);
+ 
++   /* Anything still registered (the producer status page, a bo the client
++    * leaked) goes before DestroyDevice unmaps the KMD views. */
++   helios_lost_unregister_owner(helios_lost_latch(helios));
++
+    if (helios->ctx_id)
+       helios_ioctl_ctx_destroy(helios, helios->ctx_id); /* CTX_DESTROY via escape */
+    if (helios_current_ctx_id == helios->ctx_id)
+@@ -5059,6 +5101,7 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
+    mtx_destroy(&helios->dev_mutex);
+    free(helios->submit_buf);
+ 
++   helios_lost_fini();
+    vk_free(alloc, helios);
+ }
+ 
+@@ -5210,6 +5253,12 @@ vn_renderer_create_helios(struct vn_instance *instance,
+    helios->instance = instance;
+    helios->dev = INVALID_HANDLE_VALUE;
+ 
++   /* Paired with helios_lost_fini() in helios_destroy(), which init failure
++    * also runs. */
++   if (!helios_lost_init())
++      helios_diag("device-lost: AddVectoredExceptionHandler failed (err=%lu)",
++                  GetLastError());
++
+    VkResult result = helios_init(helios);
+    if (result != VK_SUCCESS) {
+       helios_destroy(&helios->base, alloc);
+diff --git a/src/virtio/vulkan/vn_renderer_helios_lost.h b/src/virtio/vulkan/vn_renderer_helios_lost.h
+new file mode 100644
+index 00000000000..790febcd6f6
+--- /dev/null
++++ b/src/virtio/vulkan/vn_renderer_helios_lost.h
+@@ -0,0 +1,304 @@
++/* Helios device loss: KMD-mapped memory that vanishes under a live process.
++ *
++ * The ring, the cs/reply shmems, mapped bos and the producer status page are
++ * user mappings the KMD makes itself (MAP_BLOB -> MmMapLockedPagesSpecifyCache
++ * into this process). When the KMD stops under live processes (a live driver
++ * update, a device reset), dxgkrnl destroys every device and the KMD's
++ * DxgkDdiDestroyDevice unmaps those views in the owning process. The ICD does
++ * not hear about it until its next escape fails, and the ring hot path makes no
++ * escape at all: the next ring write reads ring->shared.head from a freed VA and
++ * the process takes an access violation (dwm.exe, explorer.exe and
++ * ApplicationFrameHost.exe at vulkan_virtio.dll+0x3858c4, vn_ring_submit_locked,
++ * at every live driver swap).
++ *
++ * dxgkrnl itself keeps D3D CPU mappings valid across a device removal by
++ * pointing them at a dummy page. This file does the same for the KMD's own
++ * mappings, from user mode:
++ *
++ *  - every KMD-made mapping is registered here (base, size, owning renderer);
++ *  - a vectored exception handler catches an access violation inside a
++ *    registered range whose VA is now free, commits zeroed private memory at
++ *    exactly that range, latches the owning renderer lost and resumes the
++ *    faulting instruction, which now reads zeros;
++ *  - the same latch also reserves every other registered range of that
++ *    renderer that is already free, so nothing else in the process can be
++ *    handed those addresses while the ICD still holds pointers into them;
++ *  - a D3DKMT failure that says the device is gone latches the renderer lost
++ *    the same way, before any mapped memory is touched again.
++ *
++ * Once lost, the ring reports FATAL without reading shared memory, waits and
++ * submits return VK_ERROR_DEVICE_LOST, and the client takes its normal
++ * device-lost path. Nothing here can make a mapping that is still present go
++ * away, and nothing claims a range that is not free: an access violation in a
++ * range that is still mapped (or that something else took) is left to the
++ * next handler exactly as before.
++ *
++ * Self-contained (Win32 only) so the unit test can include it on its own.
++ * Included by vn_renderer_helios.c.
++ */
++#ifndef VN_RENDERER_HELIOS_LOST_H
++#define VN_RENDERER_HELIOS_LOST_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <windows.h>
++
++#ifndef HELIOS_LOST_LOG
++#define HELIOS_LOST_LOG(...) ((void)0)
++#endif
++
++struct helios_lost_map {
++   uintptr_t base;       /* address the ICD uses */
++   size_t size;
++   volatile LONG *owner; /* the owning renderer's lost latch */
++   uintptr_t repl_base;  /* != 0: our replacement allocation (VirtualFree) */
++};
++
++static struct {
++   SRWLOCK lock;
++   volatile DWORD lock_owner; /* thread holding `lock` exclusive, else 0 */
++   struct helios_lost_map *maps;
++   size_t count, capacity;
++   PVOID veh;
++   LONG users;
++   volatile LONG repairs; /* ranges replaced, for tests and diagnostics */
++} helios_lost = { SRWLOCK_INIT, 0, NULL, 0, 0, NULL, 0, 0 };
++
++static void
++helios_lost_lock(void)
++{
++   AcquireSRWLockExclusive(&helios_lost.lock);
++   helios_lost.lock_owner = GetCurrentThreadId();
++}
++
++static void
++helios_lost_unlock(void)
++{
++   helios_lost.lock_owner = 0;
++   ReleaseSRWLockExclusive(&helios_lost.lock);
++}
++
++static inline bool
++helios_lost_is_set(const volatile LONG *latch)
++{
++   return InterlockedCompareExchange((volatile LONG *)latch, 0, 0) != 0;
++}
++
++/* Replace one registered range whose VA is free with zeroed private memory.
++ * Caller holds the lock. Returns whether the range is backed by our memory. */
++static bool
++helios_lost_replace_locked(struct helios_lost_map *m)
++{
++   if (m->repl_base)
++      return true;
++
++   MEMORY_BASIC_INFORMATION mbi;
++   if (!VirtualQuery((void *)m->base, &mbi, sizeof(mbi)) ||
++       mbi.State != MEM_FREE)
++      return false;
++
++   /* A reservation starts on the allocation granularity; the KMD's view did
++    * too, so the rounded range is the freed view itself. */
++   SYSTEM_INFO si;
++   GetSystemInfo(&si);
++   const uintptr_t gran = si.dwAllocationGranularity;
++   const uintptr_t start = m->base & ~(gran - 1);
++   const uintptr_t end = m->base + m->size;
++   void *p = VirtualAlloc((void *)start, end - start, MEM_RESERVE | MEM_COMMIT,
++                          PAGE_READWRITE);
++   if (p != (void *)start) {
++      if (p)
++         VirtualFree(p, 0, MEM_RELEASE);
++      HELIOS_LOST_LOG("device-lost: cannot back freed range %p+0x%llx (err=%lu)",
++                      (void *)m->base, (unsigned long long)m->size,
++                      GetLastError());
++      return false;
++   }
++   m->repl_base = start;
++   InterlockedIncrement(&helios_lost.repairs);
++   return true;
++}
++
++/* Latch `owner` lost and back every one of its ranges that is already free.
++ * Caller holds the lock. */
++static void
++helios_lost_latch_locked(volatile LONG *owner)
++{
++   InterlockedExchange(owner, 1);
++   for (size_t i = 0; i < helios_lost.count; i++) {
++      if (helios_lost.maps[i].owner == owner)
++         helios_lost_replace_locked(&helios_lost.maps[i]);
++   }
++}
++
++static LONG CALLBACK
++helios_lost_veh(PEXCEPTION_POINTERS info)
++{
++   const EXCEPTION_RECORD *rec = info->ExceptionRecord;
++   if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
++       rec->NumberParameters < 2)
++      return EXCEPTION_CONTINUE_SEARCH;
++   /* A fault while this thread holds the lock is not ours to handle. */
++   if (helios_lost.lock_owner == GetCurrentThreadId())
++      return EXCEPTION_CONTINUE_SEARCH;
++
++   const uintptr_t addr = (uintptr_t)rec->ExceptionInformation[1];
++   LONG verdict = EXCEPTION_CONTINUE_SEARCH;
++   bool first = false;
++   uintptr_t base = 0;
++   size_t size = 0;
++
++   helios_lost_lock();
++   for (size_t i = 0; i < helios_lost.count; i++) {
++      struct helios_lost_map *m = &helios_lost.maps[i];
++      if (addr - m->base >= m->size)
++         continue;
++      first = !helios_lost_is_set(m->owner);
++      if (m->repl_base) {
++         /* Another thread backed it first; resume unless it is not ours. */
++         MEMORY_BASIC_INFORMATION mbi;
++         if (VirtualQuery((void *)addr, &mbi, sizeof(mbi)) &&
++             mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE)
++            verdict = EXCEPTION_CONTINUE_EXECUTION;
++      } else if (helios_lost_replace_locked(m)) {
++         verdict = EXCEPTION_CONTINUE_EXECUTION;
++      }
++      if (verdict == EXCEPTION_CONTINUE_EXECUTION)
++         helios_lost_latch_locked(m->owner);
++      base = m->base;
++      size = m->size;
++      break;
++   }
++   helios_lost_unlock();
++
++   if (base && (first || verdict != EXCEPTION_CONTINUE_EXECUTION)) {
++      HELIOS_LOST_LOG("device-lost: access violation at %p in KMD mapping "
++                      "%p+0x%llx (%s) -> %s",
++                      (void *)addr, (void *)base, (unsigned long long)size,
++                      rec->ExceptionInformation[0] ? "write" : "read",
++                      verdict == EXCEPTION_CONTINUE_EXECUTION
++                         ? "backed with zero pages, renderer lost"
++                         : "range not free, left to the next handler");
++   }
++   return verdict;
++}
++
++/* One per renderer; installs the handler for the first. */
++static bool
++helios_lost_init(void)
++{
++   bool ok = true;
++   helios_lost_lock();
++   if (helios_lost.users++ == 0) {
++      helios_lost.veh = AddVectoredExceptionHandler(1, helios_lost_veh);
++      ok = helios_lost.veh != NULL;
++   }
++   helios_lost_unlock();
++   return ok;
++}
++
++static void
++helios_lost_fini(void)
++{
++   helios_lost_lock();
++   if (helios_lost.users > 0 && --helios_lost.users == 0) {
++      if (helios_lost.veh)
++         RemoveVectoredExceptionHandler(helios_lost.veh);
++      helios_lost.veh = NULL;
++      free(helios_lost.maps);
++      helios_lost.maps = NULL;
++      helios_lost.count = helios_lost.capacity = 0;
++   }
++   helios_lost_unlock();
++}
++
++static void
++helios_lost_register(volatile LONG *owner, void *va, size_t size)
++{
++   if (!va || !size)
++      return;
++   helios_lost_lock();
++   if (helios_lost.count == helios_lost.capacity) {
++      const size_t cap = helios_lost.capacity ? helios_lost.capacity * 2 : 64;
++      struct helios_lost_map *maps =
++         realloc(helios_lost.maps, cap * sizeof(*maps));
++      if (!maps) {
++         helios_lost_unlock();
++         return;
++      }
++      helios_lost.maps = maps;
++      helios_lost.capacity = cap;
++   }
++   helios_lost.maps[helios_lost.count++] = (struct helios_lost_map){
++      .base = (uintptr_t)va,
++      .size = size,
++      .owner = owner,
++   };
++   helios_lost_unlock();
++}
++
++static void
++helios_lost_remove_locked(size_t i)
++{
++   struct helios_lost_map *m = &helios_lost.maps[i];
++   if (m->repl_base)
++      VirtualFree((void *)m->repl_base, 0, MEM_RELEASE);
++   helios_lost.maps[i] = helios_lost.maps[--helios_lost.count];
++}
++
++/* Before the mapping is released (the KMD unmaps it then). */
++static void
++helios_lost_unregister(void *va)
++{
++   if (!va)
++      return;
++   helios_lost_lock();
++   for (size_t i = 0; i < helios_lost.count; i++) {
++      if (helios_lost.maps[i].base == (uintptr_t)va) {
++         helios_lost_remove_locked(i);
++         break;
++      }
++   }
++   helios_lost_unlock();
++}
++
++static void
++helios_lost_unregister_owner(volatile LONG *owner)
++{
++   helios_lost_lock();
++   for (size_t i = helios_lost.count; i-- > 0;) {
++      if (helios_lost.maps[i].owner == owner)
++         helios_lost_remove_locked(i);
++   }
++   helios_lost_unlock();
++}
++
++/* The device is gone (a D3DKMT call said so): latch before the next touch. */
++static void
++helios_lost_mark(volatile LONG *owner)
++{
++   helios_lost_lock();
++   helios_lost_latch_locked(owner);
++   helios_lost_unlock();
++}
++
++/* NTSTATUS values with which D3DKMT reports that the device or adapter is no
++ * longer there. */
++static inline bool
++helios_lost_status_is_device_gone(LONG st)
++{
++   switch ((ULONG)st) {
++   case 0xC00002B6: /* STATUS_DEVICE_REMOVED */
++   case 0xC000009D: /* STATUS_DEVICE_NOT_CONNECTED */
++   case 0xC00000C0: /* STATUS_DEVICE_DOES_NOT_EXIST */
++   case 0xC01E0003: /* STATUS_GRAPHICS_ADAPTER_WAS_RESET */
++   case 0xC01E0200: /* STATUS_GRAPHICS_GPU_EXCEPTION_ON_DEVICE */
++      return true;
++   default:
++      return false;
++   }
++}
++
++#endif /* VN_RENDERER_HELIOS_LOST_H */
+diff --git a/src/virtio/vulkan/vn_renderer_helios_producer.h b/src/virtio/vulkan/vn_renderer_helios_producer.h
+index e54000c3505..7e497a81768 100644
+--- a/src/virtio/vulkan/vn_renderer_helios_producer.h
++++ b/src/virtio/vulkan/vn_renderer_helios_producer.h
+@@ -76,7 +76,10 @@ helios_producer_bind(uintptr_t device, uint32_t allocation, void **out)
+    bool ok = true;
+    if (!h->producer_status) {
+       ok = helios_escape(h, &r, sizeof(r)) && r.user_va && r.size == 8192 * 64;
+-      if (ok) h->producer_status = (void *)(uintptr_t)r.user_va;
++      if (ok) {
++         h->producer_status = (void *)(uintptr_t)r.user_va;
++         helios_lost_register(helios_lost_latch(h), h->producer_status, r.size);
++      }
+    }
+    r = helios_producer_request(HP_BIND, 0);
+    r.allocation = allocation;
+diff --git a/src/virtio/vulkan/vn_ring.c b/src/virtio/vulkan/vn_ring.c
+index ca9b5f14aab..103f0b629c5 100644
+--- a/src/virtio/vulkan/vn_ring.c
++++ b/src/virtio/vulkan/vn_ring.c
+@@ -108,6 +108,15 @@ struct vn_ring {
+    int64_t next_notify;
+ };
+ 
++/* The renderer lost its device: the ring's shared memory may be unmapped (the
++ * Helios KMD unmaps it when it stops under this process), so it must not be
++ * read or written for real work any more. */
++static inline bool
++vn_ring_renderer_lost(const struct vn_ring *ring)
++{
++   return vn_renderer_is_lost(ring->instance->renderer);
++}
++
+ #if DETECT_OS_WINDOWS
+ /* ProgramData diag sink (vn_renderer_helios.c) — C:\Windows\Temp is not
+  * writable from the restricted IddCx host process, so ring diags written
+@@ -130,7 +139,7 @@ helios_ring_diag(const struct vn_ring *ring, const char *msg)
+    uint32_t head_value = 0;
+    uint32_t tail_value = 0;
+    uint32_t status_value = 0;
+-   if (ring) {
++   if (ring && !vn_ring_renderer_lost(ring)) {
+       if (ring->shared.head)
+          head_value =
+             atomic_load_explicit(ring->shared.head, memory_order_seq_cst);
+@@ -155,6 +164,8 @@ helios_ring_diag(const struct vn_ring *ring, const char *msg)
+ static bool
+ helios_ring_shared_valid(const struct vn_ring *ring)
+ {
++   if (ring && vn_ring_renderer_lost(ring))
++      return false;
+    if (!ring || !ring->shared.head || !ring->shared.tail ||
+        !ring->shared.status || !ring->shared.buffer) {
+       helios_ring_diag(ring, "invalid null shared pointers");
+@@ -167,7 +178,8 @@ helios_ring_shared_valid(const struct vn_ring *ring)
+ static bool
+ helios_ring_shared_valid(const struct vn_ring *ring)
+ {
+-   return ring && ring->shared.head && ring->shared.tail &&
++   return ring && !vn_ring_renderer_lost(ring) &&
++          ring->shared.head && ring->shared.tail &&
+           ring->shared.status && ring->shared.buffer;
+ }
+ 
+@@ -228,12 +240,16 @@ uint32_t
+ vn_ring_load_status(const struct vn_ring *ring)
+ {
+    /* must be called and ordered after vn_ring_store_tail for idle status */
++   if (unlikely(vn_ring_renderer_lost(ring)))
++      return VK_RING_STATUS_FATAL_BIT_MESA;
+    return atomic_load_explicit(ring->shared.status, memory_order_seq_cst);
+ }
+ 
+ void
+ vn_ring_unset_status_bits(struct vn_ring *ring, uint32_t mask)
+ {
++   if (unlikely(vn_ring_renderer_lost(ring)))
++      return;
+    atomic_fetch_and_explicit(ring->shared.status, ~mask,
+                              memory_order_seq_cst);
+ }
+@@ -396,14 +412,15 @@ vn_ring_has_space(const struct vn_ring *ring,
+    return false;
+ }
+ 
+-static uint32_t
+-vn_ring_wait_space(struct vn_ring *ring, uint32_t size)
++/* Returns false, without waiting further, once the ring can never make room:
++ * the renderer lost its device or the ring went fatal. */
++static bool
++vn_ring_wait_space(struct vn_ring *ring, uint32_t size, uint32_t *out_head)
+ {
+    assert(size <= ring->buffer_size);
+ 
+-   uint32_t head;
+-   if (likely(vn_ring_has_space(ring, size, &head)))
+-      return head;
++   if (likely(vn_ring_has_space(ring, size, out_head)))
++      return true;
+ 
+    {
+       VN_TRACE_FUNC();
+@@ -412,10 +429,19 @@ vn_ring_wait_space(struct vn_ring *ring, uint32_t size)
+       struct vn_relax_state relax_state =
+          vn_relax_init(ring->instance, VN_RELAX_REASON_RING_SPACE);
+       do {
++         /* A fatal ring never drains and a lost device has no ring left to
++          * drain; vn_relax() would abort the process on either. */
++         if (unlikely(vn_ring_load_status(ring) &
++                      VK_RING_STATUS_FATAL_BIT_MESA)) {
++            helios_ring_diag(ring, "fatal/lost while waiting for space");
++            vn_relax_fini(&relax_state);
++            return false;
++         }
+          vn_relax(&relax_state);
+-         if (vn_ring_has_space(ring, size, &head)) {
++         if (!vn_ring_renderer_lost(ring) &&
++             vn_ring_has_space(ring, size, out_head)) {
+             vn_relax_fini(&relax_state);
+-            return head;
++            return true;
+          }
+       } while (true);
+    }
+@@ -629,7 +655,9 @@ vn_ring_submit_internal(struct vn_ring *ring,
+ 
+    for (uint32_t i = 0; i < cs->buffer_count; i++) {
+       const struct vn_cs_encoder_buffer *buf = &cs->buffers[i];
+-      cur_seqno = vn_ring_wait_space(ring, buf->committed_size);
++      if (unlikely(!vn_ring_wait_space(ring, buf->committed_size,
++                                       &cur_seqno)))
++         return false;
+       vn_ring_write_buffer(ring, buf->base, buf->committed_size);
+    }
+ 

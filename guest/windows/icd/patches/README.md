@@ -72,3 +72,53 @@ submits sent directly while batching is on, `max`).
 
 Compare Heaven with and without `HELIOS_SUBMIT_BATCH=1` in the Heaven process's
 environment only.
+
+## 0002 — survive the KMD stopping under a live process
+
+Base: `winboat-org/mesa-helios` @ `89bd0676a4e69740d9900fb13561b14acc4997d6`;
+also applies on top of 0001. Listed in `series`, so `ci/windows/build-mesa.sh`
+applies it to the shipped ICD (0001 stays manual).
+
+**The crash.** At every live driver update (pnputil) dwm.exe, explorer.exe and
+ApplicationFrameHost.exe died with 0xC0000005 at `vulkan_virtio.dll+0x3858c4`.
+That is `vn_ring_submit_locked` (`vn_ring_write_buffer`/`vn_ring_has_space`
+inlined), the load `mov (%rax),%r14d` of `*ring->shared.head`. The ring shmem
+is a MAP_BLOB view the KMD maps into the process itself
+(`MmMapLockedPagesSpecifyCache(UserMode)`); when the KMD stops, dxgkrnl
+destroys every device and `DxgkDdiDestroyDevice` unmaps those views. The ring
+writer makes no escape, so the first thing that notices is the next ring
+access, on a free VA.
+
+**What.**
+- `vn_renderer_helios_lost.h`: every KMD-made mapping (ring and cs/reply
+  shmems, mapped bos, the producer status page) is registered with its owning
+  renderer. A vectored exception handler catches an access violation inside a
+  registered range whose VA is now free, commits zeroed memory at exactly that
+  range, latches the renderer lost (`vn_renderer::lost`), reserves that
+  renderer's other freed ranges too, and resumes the faulting instruction. A
+  range that is still mapped, or that something else took, is left alone and
+  the fault goes to the next handler as before.
+- A D3DKMTEscape failure with a device-gone status (`STATUS_DEVICE_REMOVED`
+  and friends) latches the same way, before the next touch. Once lost, escapes
+  are not issued any more.
+- Once lost: the ring reports `FATAL` without reading shared memory, ring
+  submits and space waits fail instead of spinning into `vn_relax()`'s abort,
+  `vkQueueSubmit*`, `vkGetFenceStatus`, fence/semaphore waits and the Helios
+  submit/wait ops return `VK_ERROR_DEVICE_LOST`, the retire thread stops
+  slicing. The client (the UMD under DWM) takes its device-removed path.
+
+**Test.** `src/virtio/vulkan/test_helios_lost.c` (not built by meson):
+pagefile-section views stand in for KMD views and are unmapped under four
+threads that keep writing to them like the ring writer.
+
+```
+x86_64-w64-mingw32-gcc -O2 -static -o test_helios_lost64.exe test_helios_lost.c
+i686-w64-mingw32-gcc   -O2 -static -o test_helios_lost32.exe test_helios_lost.c
+```
+
+Both print `PASSED` in the win11 guest. The real check is a live driver swap
+with the patched ICD installed: dwm/explorer must not fault in
+`vulkan_virtio.dll`, and `C:\ProgramData\Helios\helios_icd_diag.log` should show
+`device-lost: access violation at ... backed with zero pages, renderer lost`
+or `device-lost: D3DKMTEscape status=0xc00002b6 ...` for each process that had
+the ICD loaded.
