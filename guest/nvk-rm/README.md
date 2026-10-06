@@ -80,10 +80,10 @@ with `-Dnvk-rm=enabled` and without it (plain nouveau NVK).
 
 NVK with the RM backend builds for **Windows x86_64** with MinGW-w64 on a
 Linux host: `vulkan_nouveau.dll`, its ICD manifest and `librmclient.dll`.
-It loads and runs up to GPU enumeration (tested under wine 9.0); it cannot
-reach a GPU yet because librmclient's Windows transport is a stub until the
-Conduit KMD's escape ABI is fixed. Seven more Mesa patches on top of the 13
-above, in `patches-windows/` (Mesa branch `nvk-rm-windows`):
+With librmclient's real Windows transport (RM escapes through the Helios
+KMD) it **runs on the RTX 5090 in the `win11` guest**: enumeration, compute
+and offscreen rendering pass (see "First run on Windows" below); presenting
+is the next step. Seven more Mesa patches on top of the 13 above, in `patches-windows/` (Mesa branch `nvk-rm-windows`):
 
 | # | patch | what |
 |---|---|---|
@@ -158,6 +158,38 @@ MESA: warning: NVK_RM: crm_open failed: -40          # -ENOSYS: stub transport
 vkEnumeratePhysicalDevices: 0, 0 physical devices
 ```
 
+### First run on Windows (2026-10-06, `win11`, KMD 22.22.307.0, RTX 5090)
+
+The series above, unchanged, with librmclient's real Windows transport
+(`guest/rmclient`, `src/transport_windows.c`: RM escapes over
+`HELIOS_ESCAPE_NVRM`, CPU mappings, OS-descriptor pinning and event waits
+through the KMD). Files in one directory: `vulkan_nouveau.dll`,
+`librmclient.dll`, `nouveau_icd.json`; the tests from
+`windows/build-tests.sh`. Run with `NVK_RM=1`.
+
+The Vulkan loader ignores `VK_DRIVER_FILES` / `VK_ICD_FILENAMES` (and
+`VK_ADD_DRIVER_FILES`) in an elevated process, which an administrator's ssh
+session is ("Loader is running with elevated permissions. Environment
+variable VK_DRIVER_FILES will be ignored"): `vulkaninfo` there only shows
+the registered Venus ICD. The tests therefore take
+`VK_DIRECT_DRIVER=C:\...\vulkan_nouveau.dll` and hand the ICD to the loader
+through `VK_LUNARG_direct_driver_loading` (exclusive mode,
+`tests/vk_direct_driver.h`). From a normal (non-elevated) desktop session
+`VK_DRIVER_FILES` works as on Linux.
+
+| test | result |
+|---|---|
+| `icd_smoke.exe vulkan_nouveau.dll` (no loader) | 1 physical device: `NVIDIA GeForce RTX 5090 (NVK GB202) (0x10de:0x2b85)` |
+| `vk_summary.exe` (loader 1.4.309) | NVK, API 1.4.363, driver `Mesa 26.3.0-devel`, conformance 1.4.3.0, heap 0 32146 MiB VRAM, heap 1 15356 MiB system (host-visible), queue family flags 0xf, 183 device extensions |
+| `vk_compute_test.exe compute.spv` | `PASS: 4096/4096 values correct (host-visible)` |
+| `vk_compute_test.exe compute.spv copy 1048576` | `PASS: 1048576/1048576 values correct (device-local + copy)` |
+| `vk_offscreen_test.exe 5000` | `PASS: offscreen triangle 256x256, 5000 frame(s)`, 1.4 s in all (~0.2 ms per submit + fence wait); the readback is the expected RGB triangle |
+
+No RM refusal in the host backend log for any of these (no
+"not in the ABI profile", no failed `RM_ALLOC`/`RM_CONTROL`). The first run
+after copying new binaries takes a few seconds longer (Defender scanning the
+new files), later runs do not.
+
 (and "librmclient could not be loaded" without the DLL next to the driver).
 librmclient's unit tests (`test_unit.exe`, 300 checks) pass under wine.
 
@@ -217,8 +249,9 @@ librmclient's `src/transport_windows.c` documents it per callback; in short:
    counterpart). That is the next design item after the transport.
 
 Not tried yet: building on Windows itself (MSVC/clang-cl would need the
-same NAK bitfield question answered with the MSVC layout), the Vulkan
-loader on real Windows, and anything on a GPU.
+same NAK bitfield question answered with the MSVC layout), presenting
+through the win32 WSI, `vkcube` (it cannot be pointed at NVK from an
+elevated session, see above) and dEQP.
 
 ## Running (in a guest)
 

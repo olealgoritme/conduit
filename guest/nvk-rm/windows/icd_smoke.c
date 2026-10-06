@@ -6,9 +6,8 @@
  *   icd_smoke.exe [path\to\vulkan_nouveau.dll]
  *
  * With librmclient.dll next to the driver and NVK_RM=1, NVK asks RM for
- * GPUs. With the stub Windows transport crm_open fails with -ENOSYS, so the
- * expected result there is "0 physical devices" (set MESA_DEBUG / NVK_DEBUG
- * for logs); a real transport should list the GPU.
+ * GPUs through librmclient's Windows transport (the Helios KMD's RM
+ * escapes) and should list the GPU; set MESA_DEBUG / NVK_DEBUG for logs.
  */
 #include <stdio.h>
 #include <stdlib.h>

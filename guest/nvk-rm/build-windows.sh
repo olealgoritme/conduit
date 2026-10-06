@@ -88,7 +88,7 @@ fi
 PATH="$MESA_CLC_DIR:$PATH"
 export PATH
 
-# 3. librmclient.dll (Conduit's guest/rmclient, Windows stub transport)
+# 3. librmclient.dll (Conduit's guest/rmclient, Windows transport over the KMD)
 rmc="$MESA_DIR/$BUILD_DIR-rmclient"
 if [ ! -f "$rmc/build.ninja" ]; then
   "$MESON" setup "$rmc" "$conduit/guest/rmclient" --cross-file "$cross" -Dbuildtype=release
