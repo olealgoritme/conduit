@@ -400,6 +400,28 @@ impl ShareFormat {
     }
 }
 
+/// GB20x block-linear modifier families, `| h` (h = log2 GOBs per block, 0..=5).
+/// The GPU picks the GOB by element size, and the modifier names it in its
+/// sector-layout field (bits 22 and 26..27): 4- and 8-byte elements use the
+/// desktop GOB ([`MOD_NVIDIA_BL_GB20X`], what every 32 bpp record has),
+/// 1-byte elements [`MOD_NVIDIA_BL_GB20X_8BPP`], 2-byte elements
+/// [`MOD_NVIDIA_BL_GB20X_16BPP`]. Kind (generic memory, 0x06) and GOB-kind
+/// version are the same for all three.
+pub const MOD_NVIDIA_BL_GB20X: u64 = 0x0300_0000_0060_6010;
+pub const MOD_NVIDIA_BL_GB20X_8BPP: u64 = 0x0300_0000_0420_6010;
+pub const MOD_NVIDIA_BL_GB20X_16BPP: u64 = 0x0300_0000_0460_6010;
+
+/// The block-linear family a plane whose elements are `element_bytes` wide
+/// must use ([`ShareFormat::bpp0`] for plane 0, [`ShareFormat::bpp1`] for
+/// plane 1).
+pub const fn gb20x_family(element_bytes: u32) -> u64 {
+    match element_bytes {
+        1 => MOD_NVIDIA_BL_GB20X_8BPP,
+        2 => MOD_NVIDIA_BL_GB20X_16BPP,
+        _ => MOD_NVIDIA_BL_GB20X,
+    }
+}
+
 /// The layout facts of `fourcc`, or `None` for a format a foreign resource may
 /// not hold. The four 32-bit RGB formats are always in; the rest need
 /// [`HELIOS_FOREIGN_CAP_LAYOUT_FORMATS`].
@@ -642,6 +664,25 @@ mod tests {
         assert_eq!((f16.row_bytes(0, 100), f16.stride_align(0)), (800, 4));
         assert_eq!(share_format(DRM_FORMAT_R8).unwrap().stride_align(0), 1);
         assert!(share_format(0).is_none());
+        // The families differ only in the sector-layout field (bit 22, bits 26..27).
+        let sector = |m: u64| ((m >> 22) & 1) | (((m >> 26) & 3) << 1);
+        assert_eq!(sector(MOD_NVIDIA_BL_GB20X), 1);
+        assert_eq!(sector(MOD_NVIDIA_BL_GB20X_8BPP), 2);
+        assert_eq!(sector(MOD_NVIDIA_BL_GB20X_16BPP), 3);
+        let rest = !((1u64 << 22) | (3u64 << 26));
+        assert_eq!(MOD_NVIDIA_BL_GB20X & rest, MOD_NVIDIA_BL_GB20X_8BPP & rest);
+        assert_eq!(MOD_NVIDIA_BL_GB20X & rest, MOD_NVIDIA_BL_GB20X_16BPP & rest);
+        assert_eq!(gb20x_family(nv12.bpp0), MOD_NVIDIA_BL_GB20X_8BPP);
+        assert_eq!(gb20x_family(nv12.bpp1), MOD_NVIDIA_BL_GB20X_16BPP);
+        assert_eq!(gb20x_family(p010.bpp0), MOD_NVIDIA_BL_GB20X_16BPP);
+        assert_eq!(gb20x_family(p010.bpp1), MOD_NVIDIA_BL_GB20X);
+        assert_eq!(gb20x_family(f16.bpp0), MOD_NVIDIA_BL_GB20X);
+        for (name, v) in [
+            ("HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X_8BPP", MOD_NVIDIA_BL_GB20X_8BPP),
+            ("HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X_16BPP", MOD_NVIDIA_BL_GB20X_16BPP),
+        ] {
+            assert_eq!(c_define(name), v, "{name}");
+        }
         assert!(ShareFormat::is_rgb32(DRM_FORMAT_ARGB8888) && !ShareFormat::is_rgb32(DRM_FORMAT_R8));
     }
 

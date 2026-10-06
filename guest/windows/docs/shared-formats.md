@@ -131,9 +131,14 @@ Files and rules, exactly:
      `stride_p >= ShareFormat::row_bytes(p, width)`,
      `stride_p % ShareFormat::stride_align(p) == 0` (1, 2 or 4),
      `stride_p <= MAX_STRIDE`, else `LayoutError::Stride`.
-   * `modifier_p` is `MOD_LINEAR` or `MOD_NVIDIA_BLOCK_LINEAR_BASE | h`,
-     `h <= 5`; plane 1 is LINEAR iff plane 0 is; else `LayoutError::Modifier`.
-     `h` may differ between the planes.
+   * `modifier_p` is `MOD_LINEAR` or `gb20x_family(element_bytes_p) | h`,
+     `h <= 5` (`helios_protocol::gb20x_family`: 1-byte elements
+     `0x0300000004206010`, 2-byte `0x0300000004606010`, 4/8-byte
+     `0x0300000000606010`; element bytes = `bpp0` / `bpp1`, YUYV 4). GB20x
+     picks the GOB by element size and the modifier names it in its
+     sector-layout field (bits 22, 26..27). Plane 1 is LINEAR iff plane 0 is;
+     else `LayoutError::Modifier`. `h` and the family may differ between the
+     planes (NV12: plane 0 8BPP, plane 1 16BPP).
    * `min_bytes_p = offset_p + stride_p * rows_p`, rows rounded up to the plane's
      own block (`8 << h_p`) when block-linear.
    * `plane1.is_some() == (planes == 2)`, else a new `LayoutError::Planes`.
@@ -244,5 +249,17 @@ installed UMD otherwise:
 | NVK `a8`, `r8g8`, `r10g10b10a2`, `rgba16f`, `nv12` | refused as designed on this KMD (`memory_res_id` -11, no escape); the UMD's KMD placeholder is then refused by `pfnAllocateCb` (E_INVALIDARG) and the runtime reported DEVICE_REMOVED. Pre-existing: the same happens to `bgra8` with `NVK_HELIOS_RESID=0`. The UMD now answers E_OUTOFMEMORY for that one creation (commit e38d158); relayed to the KMD session |
 | health | no dumps, no TDR, no app crash, DWM pid unchanged |
 
-Pending: the non-32 bpp formats end to end need the KMD change (section 5);
+22.22.323.1 (KMD v321+ with `CAP_LAYOUT_FORMATS`, run by the install agent):
+NVK to NVK r16g16, r10g10b10a2, rgba16f, yuy2 byte-exact (`FgImpFmt` 7); a8,
+r8, r8g8, r16, b5g6r5, nv12, p010 refused by NVK before any escape. Cause: on
+GB20x nil uses the Blackwell8Bit / Blackwell16Bit GOBs for 1- and 2-byte
+elements, which the first 0041 did not map to a modifier. Fixed in 0041 (the
+sector-layout field, see section 5); the KMD's modifier rule must take the two
+extra families. With the fixed NVK on v323 the KMD refuses those imports
+(`vr=-2`, BAD_RANGE) and the texture fails with E_OUTOFMEMORY, cleanly; r16g16
+still passes byte-exact. The host's RmResourceImport reports the modifier from
+the NVKMS parameters, which carry no sector layout: NVK's opener ignores those
+bits when it compares (the KMD record is authoritative).
+
+Pending: the 8/16-bit-element formats end to end need the KMD modifier rule;
 then `d3d11_share.exe fmt all kmt|nt` on NVK.
