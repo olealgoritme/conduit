@@ -213,6 +213,9 @@ fn main() {
         // S3: ICD backend selection (global NVK with a deny-list) and the NVK
         // ICD loader. `umd12` compiles it too (S5, with HELIOS_ICD_BACKEND_D3D12).
         .file("../umd_common/bridge/bridge_icd_backend.cpp")
+        // The KMD-view loss table shared with the Venus ICD (helios_kmdmap.h):
+        // the scanout read ledger survives the KMD stopping under dwm.
+        .file("../umd_common/bridge/bridge_kmdmap.cpp")
         .compiler(&clang_cl)
         .archiver(&archiver)
         .static_crt(true)

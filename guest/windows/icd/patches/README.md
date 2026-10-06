@@ -122,3 +122,47 @@ with the patched ICD installed: dwm/explorer must not fault in
 `device-lost: access violation at ... backed with zero pages, renderer lost`
 or `device-lost: D3DKMTEscape status=0xc00002b6 ...` for each process that had
 the ICD loaded.
+
+## 0003 — one KMD-view loss table for the ICD and the UMD
+
+On top of 0002 (in `series`). Replaces 0002's per-module
+`vn_renderer_helios_lost.h` with `helios_kmdmap.h`, a byte-identical copy of
+`guest/windows/umd_common/bridge/helios_kmdmap.h`, which `helios_umd.dll`
+compiles too (`umd_common/bridge/bridge_kmdmap.cpp`).
+
+**Why.** At the 319.1 -> 319.2 live swap with 0002 installed, Explorer,
+ApplicationFrameHost and StartMenu survived, but dwm.exe died in
+`helios_umd!helios_scanout_ledger_snapshot_v2+0xca` (`mov eax,[r8+8]`, the
+ledger's `slot_count`): the scanout read ledger is a KMD view of the UMD's own
+that the KMD unmapped at DestroyDevice. The ICD log also showed
+`cannot back freed range ... (err=487)`. The dump explains it: a 4 KiB
+allocation had already landed at the second 64 KiB granule of a freed 132 KiB
+ring view of ANOTHER renderer, which 0002 neither latched nor swept (a loss
+only latched the renderer whose range faulted).
+
+**What.**
+- One process-wide table (named section `Local\HeliosKmdMap-<pid>`, created
+  atomically by whichever module comes first) holds every KMD view of every
+  module. Each module installs its own vectored handler, and every handler runs
+  the same code on that table under the table's lock, so it does not matter
+  which one runs first and they cannot fight.
+- Loss is a process-wide **epoch**: every user (ICD renderer, UMD device)
+  records it at creation; one loss loses every user alive then (one KMD serves
+  the process), and users created after the KMD restarts start clean. A
+  straggler fault in an old generation's range does not move it again.
+- The first fault, or a device-gone escape status, backs every registered range
+  that is already free, in all modules, before anything else can take it.
+- When part of a freed range was taken anyway, backing goes granule by granule
+  (the err=487 case) and the taken granule is left alone.
+- UMD: the ledger view is registered at map, unregistered before UNMAP, and the
+  readers (`helios_scanout_ledger_lookup_v2` / `_snapshot_v2`) skip a view
+  whose device is lost (they report "no ledger", which callers already handle).
+
+**Test.** `guest/windows/icd/win-build/helios_kmdmap_test.c`, with
+`helios_kmdmap_mod.c` as a second module (DLL) in the same process: ring views
+unmapped under four writer threads, a ledger page owned by the other module, a
+freed ring with a squatter in its middle granule, a still-mapped view, a range
+wholly taken, the escape-status path, and a user attached after the loss. Build
+commands are in the file; x64 and x86 both PASS in win11. The Mesa copy must
+stay identical: `cmp guest/windows/umd_common/bridge/helios_kmdmap.h
+<mesa>/src/virtio/vulkan/helios_kmdmap.h`.
