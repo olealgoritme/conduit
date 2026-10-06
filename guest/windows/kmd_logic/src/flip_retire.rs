@@ -40,6 +40,31 @@ pub const STALL_100NS: u64 = 80_000;
 /// 100 ns units per microsecond.
 const UNITS_PER_US: u64 = 10;
 
+/// Upper edges of the ForeignFlip host round trip histogram, microseconds (`FfRttB0..7`): the
+/// time the worker saw from submitting (or sending) a `ScanoutFlip` to its answer.
+pub const RTT_EDGES_US: [u32; BUCKETS - 1] = [250, 500, 1_000, 2_000, 4_200, 8_400, 17_000];
+
+/// The bucket of a host round trip in microseconds (`FfRttB0..7`).
+pub const fn rtt_bucket(us: u64) -> usize {
+    bucket_of(us, &RTT_EDGES_US)
+}
+
+/// The least time between two host flips the foreign presenter enforces. With the pipelined flip
+/// the clock starts at the SUBMIT, so the worker's own latency jitter (a wake that was 0.1 ms
+/// late for one flip and on time for the next) shifts the next flip's due time by that jitter
+/// and, with the due time exactly one period, parks every flip that arrives a little early
+/// behind a timed wait of at least a millisecond: the frame behind it is then overwritten
+/// (single owed slot) and one in several is never shown, a beat. A flip is allowed 3/4 of a
+/// period after the previous one instead (still at most one per vblank on average: flips arrive
+/// once per tick). The synchronous round trip keeps the full period.
+pub const fn paced_interval(period_100ns: u64, pipelined: bool) -> u64 {
+    if pipelined {
+        period_100ns - period_100ns / 4
+    } else {
+        period_100ns
+    }
+}
+
 /// The bucket of a latency in microseconds against `edges`.
 pub const fn bucket_of(us: u64, edges: &[u32; BUCKETS - 1]) -> usize {
     let mut i = 0;
@@ -616,6 +641,64 @@ mod tests {
         // 100 ns units: 4.17 ms is the 240 Hz period and sits under the 4.2 ms edge.
         assert_eq!(lat_bucket_100ns(P240), 3);
         assert_eq!(lat_bucket_100ns(2 * P240), 4);
+    }
+
+    #[test]
+    fn rtt_buckets_and_pacing() {
+        assert_eq!(rtt_bucket(0), 0);
+        assert_eq!(rtt_bucket(249), 0);
+        assert_eq!(rtt_bucket(250), 1);
+        assert_eq!(rtt_bucket(999), 2);
+        assert_eq!(rtt_bucket(1_000), 3);
+        assert_eq!(rtt_bucket(4_199), 4);
+        assert_eq!(rtt_bucket(4_200), 5);
+        assert_eq!(rtt_bucket(8_400), 6);
+        assert_eq!(rtt_bucket(17_000), 7);
+        // the 240 Hz period: pipelined 3/4 (3.1 ms), synchronous the whole period
+        assert_eq!(paced_interval(P240, false), P240);
+        assert_eq!(paced_interval(P240, true), P240 - P240 / 4);
+        assert!(paced_interval(P240, true) > P240 / 2);
+        assert_eq!(paced_interval(0, true), 0);
+    }
+
+    #[test]
+    fn a_pacing_slack_keeps_every_flip_of_a_tick_aligned_chain() {
+        // Flips arrive once per period; the worker submits each `lat` after its arrival and the
+        // presenter lets the next one go `interval` after the previous SUBMIT, or when it
+        // arrives, whichever is later (a timed wait of at least 1 ms for a flip that is early).
+        // Count the arrivals that are overwritten (a newer one arrived before it flew).
+        fn dropped(interval: u64, lats: &[u64]) -> u32 {
+            let mut last_submit = 0u64;
+            let mut dropped = 0u32;
+            let mut t_free = 0u64; // the worker's next flip time for the owed frame
+            let mut owed: Option<u64> = None;
+            for n in 0..400u64 {
+                let arrive = n * P240;
+                // before this arrival, fly the owed frame if it is due
+                if let Some(a) = owed {
+                    let due = (last_submit + interval).max(a);
+                    if due < arrive {
+                        last_submit = due;
+                        owed = None;
+                        t_free = due;
+                    }
+                }
+                if owed.is_some() {
+                    dropped += 1; // overwritten by the newer one
+                }
+                let lat = lats[(n as usize) % lats.len()];
+                owed = Some(arrive + lat);
+                let _ = t_free;
+            }
+            dropped
+        }
+        // worker latency alternating 0.1 ms and 2 ms: the full-period pacing drops frames,
+        // the 3/4 period does not
+        let lats = [1_000u64, 20_000, 1_000, 1_000, 20_000, 3_000];
+        let full = dropped(paced_interval(P240, false), &lats);
+        let slack = dropped(paced_interval(P240, true), &lats);
+        assert!(full > slack, "full {full} slack {slack}");
+        assert_eq!(slack, 0);
     }
 
     #[test]
