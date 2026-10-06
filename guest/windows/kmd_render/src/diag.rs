@@ -667,6 +667,18 @@ pub mod knobs {
     /// four seconds at 60 Hz. Nonzero values are clamped to 16..4000000. Read at every
     /// StartDevice; mirrored as `DefBudEff`.
     pub const DEFER_BUDGET: KnobName = KnobName::new(b"DeferBudget");
+    /// `VsPowerMode` (default 0 = KMD 325): which `DxgkDdiSetPowerState` calls quiesce the vsync
+    /// heartbeat. 0: any non-D0 state of any `DeviceUid` (the monitor child's included), 1: only
+    /// the adapter leaving D0 (KMD 326). Read at every StartDevice; mirrored as `VsPwrEff`.
+    pub const VS_POWER_MODE: KnobName = KnobName::new(b"VsPowerMode");
+    /// `VsWatchdog` (default 0 = off, KMD 325): the heartbeat watchdog. 1 revives an armed but
+    /// silent heartbeat, 2 also re-arms a quiesced one while the adapter is in D0 (KMD 326). Read
+    /// at every StartDevice; mirrored as `VsWdgEff`.
+    pub const VS_WATCHDOG: KnobName = KnobName::new(b"VsWatchdog");
+    /// `VsIdleWake` (default 0 = off, KMD 325): 1 makes the HPD worker wake 4 times a second
+    /// while the heartbeat is armed, to run the watchdog (needs `VsWatchdog` above 0). Read at
+    /// every StartDevice; mirrored as `VsIdlEff`.
+    pub const VS_IDLE_WAKE: KnobName = KnobName::new(b"VsIdleWake");
     /// Segment topology. Legal values 0 and 10 only — see `BarSegTopology`.
     pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
     /// CpuVisible cached-allocation kill switch (default 1 = cached).
