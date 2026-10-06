@@ -2536,6 +2536,12 @@ fn escape_alloc_blob(
         Err(st) => return st,
     };
     let req = wire.read();
+    // The vendor RM-export blob type is minted only by HELIOS_ESCAPE_FOREIGN_RESOURCE
+    // `IMPORT_RM`, which checks the caller's DRM file, the context and the quota. A
+    // plain ALLOC_BLOB must not forge one with any `(rm_handle << 32 | gem)` id.
+    if req.blob_mem == helios_protocol::HELIOS_BLOB_MEM_RM_EXPORT {
+        return STATUS_INVALID_PARAMETER;
+    }
     // DIAG: 0x0E04_HHHH = ALLOC_BLOB's owning handle (low 16 bits), to confirm it
     // matches the handle DxgkDdiDestroyDevice reclaims under (0x0E01_HHHH).
     crate::diag::record(0x0E04_0000 | ((owner.raw() as u32) & 0xFFFF));
