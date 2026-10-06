@@ -26,14 +26,22 @@ sanctioned route to attach the resid to its own Venus context.
 ## 2. What the opener gets (the ABI)
 
 `DXGK_OPENALLOCATIONINFO.pPrivateDriverData` of a foreign allocation is 128 bytes
-(`HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES`; the adoption refuses a smaller buffer). The KMD
+(`HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES`; the adoption refuses a smaller buffer), or 144 bytes
+(`HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES`) for a two-plane record (NV12 / P010 / P016, see
+`shared-formats.md`: the adoption refuses 128 for those, `AdoptRefusal::NoPlaneRoom`). The KMD
 rewrites two of its three parts at every open:
 
 | bytes | record | written by | notes |
 |---|---|---|---|
 | 0..48 | `HeliosWddmOpenIdentity` (`'HIDN'`, version 2) | KMD, every open | `resource_id`; `kind = DEVICE_MEMORY`; `blob_size = venus_alloc_size =` the recorded, host-verified object size; `reserved[0] = HELIOS_WDDM_OPEN_FLAG_FOREIGN`, `reserved[1] = 0`; `ctx_id` is the holder context of A's device (diagnostic: B must not use it); `memory_type_index` is A's and means nothing for a dma-buf import |
 | 48..96 | `HeliosWddmAllocMeta` | A, at create | `width`, `height`, `pitch`, `plane_offset` were proven equal to the KMD's record at adoption; `format`, `dxgi_format`, `bind_flags`, `misc_flags` are A's word, not validated (as for any adopted allocation) |
-| 96..128 | `HeliosWddmAllocLayout` (`'HFLY'`, version 1) | KMD, create and every open | `modifier`, `fourcc`, `stride`, `plane_offset` from the foreign record |
+| 96..128 | `HeliosWddmAllocLayout` (`'HFLY'`, version 1; version 2 with `reserved = 2` for a two-plane record) | KMD, create and every open | `modifier`, `fourcc`, `stride`, `plane_offset` from the foreign record (plane 0) |
+| 128..144 | `HeliosWddmAllocPlane` (two-plane records only) | KMD, create and every open | plane 1's `modifier`, `stride`, `plane_offset`; read with `HeliosWddmAllocLayout::read_open_planes` |
+
+A one-plane record, whatever its format (`R8`, fp16, `YUYV`, ...), is the version-1 trailer in 128
+bytes exactly as above; a version-1 reader refuses version 2, so an older opener falls back instead
+of misreading a two-plane record. The KMD writes nothing when the buffer is short for the record it
+holds (it never writes a version-2 header without the plane behind it).
 
 The resource-level buffer (`args.pPrivateDriverData`) carries the identity (with the flag) but no
 layout: **read the layout from the per-allocation buffer of the same `pOpenAllocationInfo2[i]`

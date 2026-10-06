@@ -122,6 +122,9 @@ placeholder is created host-less by the KMD (no Venus buffer, no identity;
 
 ## 5. KMD change request (owner: the KMD session)
 
+Implemented on `kmd/shared-formats`; section 9 says what was built, where it differs from this
+list (nothing in the wire, a few choices the list left open) and how to check it on hardware.
+
 Files and rules, exactly:
 
 1. `kmd_logic/src/foreign_resource.rs`
@@ -210,8 +213,133 @@ A creates a shared texture of the format, fills it with a byte pattern
 through a staging copy, writes a second pattern, waits for its GPU work; A reads
 B's pattern back. Pixel-exact both ways. `HELIOS_ICD=nvk` for both processes.
 
-Results: section 9.
+Results: section 10.
 
-## 9. Results
+## 9. KMD implementation
+
+What was built, as three layers; everything is in `guest/windows`, nothing in the host.
+
+**Pure logic (`kmd_logic`, host tests).**
+
+* `foreign_resource.rs`: `Layout::plane1: Option<Plane{stride, offset, modifier}>`, the format table
+  (`share_format`, a copy of `helios_protocol::share_format`: `kmd_logic` has no dependency edge to
+  the protocol crate, so `kmd_render` pins the two with a const assertion over every fourcc of the
+  table and its neighbours, `escape_foreign.rs`), `LayoutError::Format` / `Planes` (appended),
+  per-plane stride / modifier / extent rules exactly as section 5, `FLAG_PLANE1`.
+  `min_bytes` is the larger of the two planes' bounds and **saturates**: an unvalidated layout with
+  `u32::MAX` stride and height can no longer wrap `stride * rows`.
+* The choices section 5 left open: plane 1 starting inside plane 0 is `LayoutError::TooLarge` (as
+  the list says) and is checked in `validate()`, so it does not depend on the object size;
+  `FLAG_PLANE1` against the decoded tail (flag without tail, tail without flag) is
+  `RequestError::Flags`, while a two-plane fourcc without the flag, or a one-plane fourcc with it, is
+  `Layout(Planes)`; `FLAG_PLANE1` without `FLAG_LAYOUT` is `LayoutRequired`; a 120-byte request in a
+  shorter buffer is `BAD_RANGE` (counted), not an escape failure. The 32-bit RGB check is unchanged:
+  the new code is pinned against a verbatim copy of the old rules over a 215 000 point grid.
+* Adoption: `AdoptRequest::plane_room` (private data of 144 bytes or more) and
+  `AdoptRefusal::NoPlaneRoom` (code 12, appended; `FgAdRf` shows it). `trailer_bytes(layout)` is
+  128 or 144.
+* Every status the import answers for a layout fault is `BAD_RANGE`
+  (`ImportError::BadRequest`); `foreign_errno.rs` classifies *host* errnos only and needed no
+  change.
+
+**Driver (`kmd_render`, type-checked against the stub harness only: see "Not verified").**
+
+* `escape_foreign.rs`: `QUERY_CAPS` sets `HELIOS_FOREIGN_CAP_LAYOUT_FORMATS` on the same gate as
+  `CAP_RM_IMPORT` (`rm_import_served`); `IMPORT_RM` binds the 120-byte
+  `HeliosForeignImportRmPlanes` when `FLAG_PLANE1` is set; only the 72-byte base is written back.
+* `create_allocation.rs`: a two-plane record needs 144 bytes of private data or the adoption is
+  refused (counted). `write_foreign_layout_trailer` writes version 2 with `reserved = 2` and plane 1
+  at 128 for a two-plane record, at create and at every open, and writes nothing if the room is
+  short; one-plane records keep writing version 1. `read_layout_trailer` reads plane 1 of a version-2
+  trailer (`read_open_planes`) and the creator's hint is compared with it too. The meta's `pitch` /
+  `plane_offset` stay plane 0's. The allocation size is the recorded, host-verified size, which
+  `validate_for` has already proven at least `min_bytes()`.
+* The 32-bit consumers refuse the new records and count it, none of them reads one as BGRA:
+
+| consumer | decision | refusal | counter |
+|---|---|---|---|
+| ForeignFlip (`foreign_flip::decide`) | before `flip_layout`, which has no plane 1 | `Why::SharedFormat` (15, appended) | `FfRef15` |
+| foreign copy (`foreign_copy`) | `vk_format_for_fourcc` is `None`; a record with a plane 1 never builds an image; `layout_from_open` is `None` | `Refusal::Format` (6), `Layout(Planes)` (11, appended) | `FcRefuse`, `FcRefCode`, `FcNotRgb32` |
+| SCANOUT_SET / resident set (`foreign_scanout`) | its own 32-bit validator | `SetError::Layout(Format)` | `FsRef`, `FsFmtRef` |
+| level 5 Blt (`rm_blt::order_for_fourcc`) | `None` for every fourcc but the four | `Skip::Layout` | the blt skip counters |
+| level 5 primary (`rm_sysmem::layout`) | only DXGI 28, 87, 88 | `LayoutError::Format` | (creation falls back to Venus) |
+
+**No overlay planes, which is why NV12 is never scanned out.** dxgkrnl hands a YUV surface to the
+display hardware only through a multi-plane-overlay present. The KMD never advertises one: the
+adapter reports WDDM 2.1 + GpuMmu (`wddm_surface.rs`), `DXGK_DRIVERCAPS.SupportMultiPlaneOverlay`
+is never written (it lies past the last field `query_adapter_info.rs` writes, `SupportDirectFlip`,
+and the field-by-field writer would refuse and count a write there), and the MPO3 KMD interface is
+not registered (registering it needs the 3.2 level, where DWM fails with `E_NOTIMPL`:
+`wddm_surface.rs` module docs). A present flagged `FlipWithMultiPlaneOverlay` would be refused
+(`PresentPayload::MultiPlaneOverlay`, `present_packet.rs`). So an NV12 / P010 / P016 (or any other shared-format)
+allocation is only ever opened and sampled, never programmed as a scanout source; if one were, the
+flip arm and the copy path would refuse it by the table above. The test
+`foreign_resource::shared_format_tests::the_kmd_never_advertises_overlay_planes` scans every
+non-comment line of `kmd_render/src` and fails if any names `SupportMultiPlaneOverlay`,
+`CheckMultiPlaneOverlay`, `SetVidPnSourceAddressWithMultiPlaneOverlay`, `MaxOverlay` or `MPO3`, or
+names a multi-plane overlay anywhere but `present_packet.rs` (where it is the refused arm).
+
+**Counters** (service key values, written by the throttled foreign-resource publish; all at most 13
+characters and checked against every other `b"..."` name in `kmd_render` and `kmd_logic`). None is
+bumped by a 32-bit RGB record, and each is also included in the older total named in the last
+column.
+
+| counter | counts | total it is part of |
+|---|---|---|
+| `FgImpFmt` | imports of a one-plane record beyond the four 32-bit formats | `FgImp` |
+| `FgImp2P` | imports of a two-plane record | `FgImp` |
+| `FgAdo2P` | adoptions of a two-plane record | `FgAdo` |
+| `FgRefFmt` | requests refused for a fourcc outside the table | `FgRefR` |
+| `FgRefPln` | requests refused because the plane tail and the format disagree (also a 120-byte request in a short buffer) | `FgRefR` |
+| `FgRefNewG` | requests for a known shared format refused for geometry: odd extent, stride, modifier, overlap, size | `FgRefR` |
+| `FgAdoNoPln` | two-plane adoptions refused for private data under 144 bytes | `FgRefA` (and `FgAdRf` = 12) |
+| `FgTrl2W` | version-2 trailers written, at create and at every open | |
+| `FgTrl2NoRm` | version-2 writes that found the buffer short (wrote nothing) | |
+| `FgTrl2Rd` | version-2 trailers read (the creator's hint, the KMD's own record at an open) | |
+| `FfRef15` | ForeignFlip refusals: a shared format | `FfRef` |
+| `FcNotRgb32` | foreign copy refusals: not a format it can carry | `FcRefuse` |
+| `FsFmtRef` | `SCANOUT_SET` refused for a fourcc outside the four | `FsRef` |
+
+**Tests** (`cargo test` in `kmd_logic`, 928, of which 40 are new; `protocol` unchanged, 31):
+`foreign_resource::shared_format_tests` has one test per rule of section 5 and the cases around
+it: the table row by row, every one-plane format valid at its limits and refused one byte under,
+over the cap and off its alignment, extents per format (odd width YUYV, odd NV12 on both axes), plane
+1 strides per format, R8 1920x1080 linear and block-linear, fp16 stride `8 * w`, NV12 / P010 / P016
+1080p with plane 1 at `min_bytes_0`, every `h0`/`h1` pair, mixed LINEAR / block-linear refused,
+overlap refused (and the boundary accepted), `Planes` in both directions, the request flags,
+hostile values (u32 / u64 extremes in every format, `stride * rows` overflow, 16384 x 16384 fp16
+over the 1 GiB cap, the largest accepted layout), the four 32-bit formats against the old rules,
+the counters, the 144-byte room rule, the supplied trailer repeating plane 1. Each consumer has a
+table of non-32-bit layouts refused by its pure decision (`foreign_flip`, `foreign_copy`,
+`rm_blt`, `foreign_scanout`, `rm_sysmem`). Two assertions of the older tests changed because the
+values they used as "unknown" are real now: bit 1 of the import flags is `FLAG_PLANE1`, and RGB565
+and the fp16 fourcc are accepted (unknown fourccs in those tests are `BG24` and `XR30`), and one
+ForeignFlip table row (NV12) now expects `SharedFormat` instead of `BadLayout`.
+
+**Hardware checklist** (set nothing: there is no knob; the KMD cap follows the host's `IMPORT_RM`):
+
+1. `QUERY_CAPS` shows bit 3 (`CAP_LAYOUT_FORMATS`) together with bit 0 (`CAP_RM_IMPORT`). Without the
+   host's import neither is set, and a client mints ids for nothing.
+2. Run `d3d11_share.exe fmt a8` (both processes `HELIOS_ICD=nvk`), then read the counters:
+   `FgImp`, `FgImpFmt`, `FgAdo` and `FgOpen` each grew by one per shared texture; `FgImp2P`,
+   `FgAdo2P` and `FgTrl2W` did not move (A8 is a one-plane record, version-1 trailer);
+   `FgRefFmt`, `FgRefPln`, `FgRefNewG`, `FgAdoNoPln` and `FgAdRf` stayed 0.
+3. Run `d3d11_share.exe fmt nv12`: `FgImp2P` and `FgAdo2P` grew by one, `FgImpFmt` did not,
+   `FgTrl2W` grew by at least two (create and B's open), `FgTrl2Rd` by at least one, `FgTrl2NoRm`
+   and `FgAdoNoPln` stayed 0.
+4. In both runs `FfRef15`, `FcNotRgb32` and `FsFmtRef` stayed 0 (nothing tried to show the shared
+   surface), and `FgOpLive` is back to 0 once both processes exit.
+5. A refused request is `BAD_RANGE` and counted: a build with a bad plane (odd height NV12, plane 1
+   inside plane 0) moves `FgRefNewG`, a fourcc outside the table `FgRefFmt`.
+
+**Not verified.** `kmd_render` cannot be compiled for the WDK here: the driver edits were
+type-checked in a stub harness that copies the real module tree and replaces only the `wdk` crates,
+and the set of errors it reports (the missing bindgen types) is identical before and after the
+change; the const assertions that pin `kmd_logic` to the protocol are evaluated there too (a
+deliberate drift in the table was seen to fail the build). Nothing has run on the guest: the
+section 8 runs and the checklist above are still to do. The three commits do not build `kmd_render`
+one by one: the `kmd_logic` commit adds struct fields the driver commit fills in.
+
+## 10. Results
 
 (filled in as runs complete)

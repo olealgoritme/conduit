@@ -33,7 +33,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use helios_kmd_logic::foreign_scanout::{
-    Flip, ForeignScanout, Layout, Poll, PresentError, ReleaseOutcome, ResidentDrop,
+    Flip, ForeignScanout, Layout, LayoutError, Poll, PresentError, ReleaseOutcome, ResidentDrop,
     ResidentOutcome, SetError, SetKind, SetOutcome,
 };
 use helios_kmd_logic::rm_fence_present::{Attach, QEntry, ScanoutQueue};
@@ -105,6 +105,10 @@ pub static FS_TAKEOVERS: AtomicU32 = AtomicU32::new(0);
 pub static FS_SUPPRESSED: AtomicU32 = AtomicU32::new(0);
 pub static FS_RESTORES: AtomicU32 = AtomicU32::new(0);
 pub static FS_REFUSED: AtomicU32 = AtomicU32::new(0);
+/// `SCANOUT_SET`s refused for a fourcc outside the four 32 bpp RGB ones: every shared format
+/// of `docs/shared-formats.md` (`R8`, `YUYV`, `NV12`, fp16, ...) lands here, because a
+/// `ScanoutFlip` names one 32 bpp plane (`FsFmtRef`). Included in `FsRef`.
+pub static FS_FORMAT_REFUSED: AtomicU32 = AtomicU32::new(0);
 pub static FS_SEND_ERRORS: AtomicU32 = AtomicU32::new(0);
 /// Fenced presents (`rm-fence-marker.md`): entries queued (`FsFQue`), flips sent from
 /// the queue (`FsFSent`), fences fired (`FsFFire`), of those with an error status
@@ -160,6 +164,7 @@ pub(crate) fn publish_counters() {
     rec(b"FsSupp", FS_SUPPRESSED.load(Ordering::Relaxed));
     rec(b"FsRest", FS_RESTORES.load(Ordering::Relaxed));
     rec(b"FsRef", FS_REFUSED.load(Ordering::Relaxed));
+    rec(b"FsFmtRef", FS_FORMAT_REFUSED.load(Ordering::Relaxed));
     rec(b"FsErr", FS_SEND_ERRORS.load(Ordering::Relaxed));
     rec(b"FsFQue", FS_FENCE_QUEUED.load(Ordering::Relaxed));
     rec(b"FsFSent", FS_FENCE_SENT.load(Ordering::Relaxed));
@@ -232,8 +237,11 @@ impl AdapterContext {
                     crate::virtio::rm_present::note_preempted();
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 FS_REFUSED.fetch_add(1, Ordering::Relaxed);
+                if *e == SetError::Layout(LayoutError::Format) {
+                    FS_FORMAT_REFUSED.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         result
