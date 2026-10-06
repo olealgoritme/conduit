@@ -7,10 +7,11 @@
 #include "rmclient_transport.h"
 
 #include <errno.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <threads.h>
+#include "crm_mutex.h"
 
 #include "nv_ioctl_defs.h"
 
@@ -62,7 +63,7 @@ struct crm_gpu {
 
 struct crm_client {
     struct crm_transport t;
-    mtx_t    lock;
+    crm_mutex lock;
     int      ctl_fd;
     uint32_t root;
     uint32_t next_handle;
@@ -437,8 +438,8 @@ int crm_open(crm_client **out, const struct crm_transport *transport)
         transport = crm_default_transport();
     if (!transport)
         return -ENOSYS;
-    if (transport->abi != CRM_TRANSPORT_ABI || !transport->open || !transport->close ||
-        !transport->ioctl)
+    if ((transport->abi != 1 && transport->abi != CRM_TRANSPORT_ABI) ||
+        !transport->open || !transport->close || !transport->ioctl)
         return -EINVAL;
     if (!transport->map_memory && (!transport->mmap || !transport->munmap))
         return -EINVAL;
@@ -446,12 +447,16 @@ int crm_open(crm_client **out, const struct crm_transport *transport)
     crm_client *c = calloc(1, sizeof(*c));
     if (!c)
         return -ENOMEM;
-    c->t = *transport;
+    /* An ABI 1 transport ends at destroy: the ABI 2 callbacks stay NULL */
+    if (transport->abi == 1)
+        memcpy(&c->t, transport, offsetof(struct crm_transport, event_wait));
+    else
+        c->t = *transport;
     if (c->t.page_size == 0 || (c->t.page_size & (c->t.page_size - 1)))
         c->t.page_size = 4096;
     c->ctl_fd = -1;
     c->next_handle = 1;
-    if (mtx_init(&c->lock, mtx_plain) != thrd_success) {
+    if (crm_mutex_init(&c->lock) != 0) {
         free(c);
         return -ENOMEM;
     }
@@ -478,7 +483,7 @@ fail:
         c->t.close(c->t.ctx, c->ctl_fd);
     if (c->t.destroy)
         c->t.destroy(c->t.ctx);
-    mtx_destroy(&c->lock);
+    crm_mutex_destroy(&c->lock);
     free(c);
     return r; /* -errno, or a positive NV_STATUS if RM refused the root client */
 }
@@ -501,7 +506,7 @@ void crm_close(crm_client *c)
         c->t.close(c->t.ctx, c->ctl_fd);
     if (c->t.destroy)
         c->t.destroy(c->t.ctx);
-    mtx_destroy(&c->lock);
+    crm_mutex_destroy(&c->lock);
     free(c->maps);
     free(c->binds);
     free(c->objs);
@@ -527,9 +532,9 @@ uint32_t crm_new_handle(crm_client *c)
 {
     if (!c)
         return 0;
-    mtx_lock(&c->lock);
+    crm_mutex_lock(&c->lock);
     uint32_t h = handle_reserve(c);
-    mtx_unlock(&c->lock);
+    crm_mutex_unlock(&c->lock);
     return h;
 }
 
@@ -537,9 +542,9 @@ void crm_release_handle(crm_client *c, uint32_t handle)
 {
     if (!c)
         return;
-    mtx_lock(&c->lock);
+    crm_mutex_lock(&c->lock);
     handle_unreserve(c, handle);
-    mtx_unlock(&c->lock);
+    crm_mutex_unlock(&c->lock);
 }
 
 int crm_alloc(crm_client *c, uint32_t parent, uint32_t *object, uint32_t hclass,
@@ -553,9 +558,9 @@ int crm_alloc(crm_client *c, uint32_t parent, uint32_t *object, uint32_t hclass,
     uint32_t h = *object;
     int picked = 0;
     if (h == 0) {
-        mtx_lock(&c->lock);
+        crm_mutex_lock(&c->lock);
         h = handle_reserve(c);
-        mtx_unlock(&c->lock);
+        crm_mutex_unlock(&c->lock);
         if (!h)
             return -ENOMEM;
         picked = 1;
@@ -564,11 +569,11 @@ int crm_alloc(crm_client *c, uint32_t parent, uint32_t *object, uint32_t hclass,
     int r = rm_alloc_raw(c, c->root, parent ? parent : c->root, h, hclass,
                          params, params_size, NULL);
 
-    mtx_lock(&c->lock);
+    crm_mutex_lock(&c->lock);
     if (r != 0) {
         if (picked)
             handle_unreserve(c, h);
-        mtx_unlock(&c->lock);
+        crm_mutex_unlock(&c->lock);
         return r;
     }
     struct crm_obj *o = obj_put(c, h, SLOT_USED);
@@ -587,7 +592,7 @@ int crm_alloc(crm_client *c, uint32_t parent, uint32_t *object, uint32_t hclass,
     }
     /* Out of memory for bookkeeping: the object exists in RM regardless and
      * goes away with the client; only crm_object_count undercounts. */
-    mtx_unlock(&c->lock);
+    crm_mutex_unlock(&c->lock);
     *object = h;
     return 0;
 }
@@ -599,17 +604,17 @@ int crm_free(crm_client *c, uint32_t parent, uint32_t object)
     if (object == c->root)
         return -EINVAL; /* use crm_close */
     if (parent == 0) {
-        mtx_lock(&c->lock);
+        crm_mutex_lock(&c->lock);
         struct crm_obj *o = obj_find(c, object);
         parent = (o && o->state == SLOT_USED) ? o->parent : c->root;
-        mtx_unlock(&c->lock);
+        crm_mutex_unlock(&c->lock);
     }
     int r = rm_free_raw(c, parent, object);
     if (r != 0)
         return r;
-    mtx_lock(&c->lock);
+    crm_mutex_lock(&c->lock);
     forget_subtree(c, object);
-    mtx_unlock(&c->lock);
+    crm_mutex_unlock(&c->lock);
     return 0;
 }
 
@@ -617,9 +622,9 @@ int crm_free_quiet(crm_client *c, uint32_t parent, uint32_t object)
 {
     int r = crm_free(c, parent, object);
     if (r == (int)NV_ERR_OBJECT_NOT_FOUND || r == (int)NV_ERR_INVALID_OBJECT_HANDLE) {
-        mtx_lock(&c->lock);
+        crm_mutex_lock(&c->lock);
         forget_subtree(c, object);
-        mtx_unlock(&c->lock);
+        crm_mutex_unlock(&c->lock);
         r = 0;
     }
     return r;
@@ -652,7 +657,7 @@ static int32_t map_node_hint(crm_client *c, uint32_t device, uint32_t memory)
     uint32_t mclass = 0, devinst = 0;
     int have_dev = 0;
 
-    mtx_lock(&c->lock);
+    crm_mutex_lock(&c->lock);
     struct crm_obj *m = obj_find(c, memory);
     if (m && m->state == SLOT_USED)
         mclass = m->hclass;
@@ -668,7 +673,7 @@ static int32_t map_node_hint(crm_client *c, uint32_t device, uint32_t memory)
         }
         h = o->parent;
     }
-    mtx_unlock(&c->lock);
+    crm_mutex_unlock(&c->lock);
 
     if (mclass == NV01_MEMORY_SYSTEM || mclass == NV01_MEMORY_SYSTEM_OS_DESCRIPTOR)
         return CRM_NODE_CTL;
@@ -805,9 +810,9 @@ int crm_map_memory(crm_client *c, uint32_t device, uint32_t memory, uint64_t off
         }
     }
 
-    mtx_lock(&c->lock);
+    crm_mutex_lock(&c->lock);
     int r = map_add(c, &m);
-    mtx_unlock(&c->lock);
+    crm_mutex_unlock(&c->lock);
     if (r < 0) {
         map_release_cpu(c, &m);
         rm_unmap_cookie(c, device, memory, m.cookie, flags, NULL);
@@ -824,7 +829,7 @@ int crm_unmap_memory(crm_client *c, uint32_t device, uint32_t memory, void *cpu_
         return -EINVAL;
     struct crm_cpu_map m;
     int found = 0;
-    mtx_lock(&c->lock);
+    crm_mutex_lock(&c->lock);
     for (size_t i = 0; i < c->map_count; i++) {
         if (c->maps[i].ptr == cpu_ptr && c->maps[i].memory == memory &&
             (device == 0 || c->maps[i].device == device)) {
@@ -834,7 +839,7 @@ int crm_unmap_memory(crm_client *c, uint32_t device, uint32_t memory, void *cpu_
             break;
         }
     }
-    mtx_unlock(&c->lock);
+    crm_mutex_unlock(&c->lock);
     if (!found)
         return -ENOENT;
     (void)length; /* the recorded length is authoritative */
@@ -898,11 +903,11 @@ static int rm_unmap_dma(crm_client *c, uint32_t device, uint32_t dma, uint32_t m
 static uint32_t vaspace_device(crm_client *c, uint32_t dma)
 {
     uint32_t dev = 0;
-    mtx_lock(&c->lock);
+    crm_mutex_lock(&c->lock);
     struct crm_obj *o = obj_find(c, dma);
     if (o && o->state == SLOT_USED && o->hclass == FERMI_VASPACE_A)
         dev = o->parent;
-    mtx_unlock(&c->lock);
+    crm_mutex_unlock(&c->lock);
     return dev;
 }
 
@@ -942,12 +947,12 @@ int crm_map_dma2(crm_client *c, uint32_t device, uint32_t dma, uint32_t memory,
         crm_free(c, vas_dev, virt);
         return r;
     }
-    mtx_lock(&c->lock);
+    crm_mutex_lock(&c->lock);
     if (c->bind_count == c->bind_cap) {
         size_t ncap = c->bind_cap ? c->bind_cap * 2 : 16;
         struct crm_va_bind *n = realloc(c->binds, ncap * sizeof(*n));
         if (!n) {
-            mtx_unlock(&c->lock);
+            crm_mutex_unlock(&c->lock);
             rm_unmap_dma(c, device, virt, memory, 0, va);
             crm_free(c, vas_dev, virt);
             return -ENOMEM;
@@ -956,7 +961,7 @@ int crm_map_dma2(crm_client *c, uint32_t device, uint32_t dma, uint32_t memory,
         c->bind_cap = ncap;
     }
     c->binds[c->bind_count++] = (struct crm_va_bind){ dma, virt, memory, va };
-    mtx_unlock(&c->lock);
+    crm_mutex_unlock(&c->lock);
     *gpu_va = va;
     return 0;
 }
@@ -977,7 +982,7 @@ int crm_unmap_dma(crm_client *c, uint32_t device, uint32_t dma, uint32_t memory,
         return rm_unmap_dma(c, device, dma, memory, flags, gpu_va);
 
     uint32_t virt = 0;
-    mtx_lock(&c->lock);
+    crm_mutex_lock(&c->lock);
     for (size_t i = 0; i < c->bind_count; i++) {
         struct crm_va_bind *b = &c->binds[i];
         if (b->vaspace == dma && b->memory == memory && b->gpu_va == gpu_va) {
@@ -986,7 +991,7 @@ int crm_unmap_dma(crm_client *c, uint32_t device, uint32_t dma, uint32_t memory,
             break;
         }
     }
-    mtx_unlock(&c->lock);
+    crm_mutex_unlock(&c->lock);
     if (!virt)
         return -ENOENT;
     int r = rm_unmap_dma(c, device, virt, memory, flags, gpu_va);
@@ -1004,7 +1009,7 @@ static int device_gpu_fd(crm_client *c, uint32_t device)
     uint32_t devinst = 0;
     int have_dev = 0;
 
-    mtx_lock(&c->lock);
+    crm_mutex_lock(&c->lock);
     uint32_t h = device;
     for (int depth = 0; depth < 8 && h && h != c->root; depth++) {
         struct crm_obj *o = obj_find(c, h);
@@ -1017,7 +1022,7 @@ static int device_gpu_fd(crm_client *c, uint32_t device)
         }
         h = o->parent;
     }
-    mtx_unlock(&c->lock);
+    crm_mutex_unlock(&c->lock);
 
     if (c->gpu_count == 0)
         return -ENODEV;
@@ -1059,9 +1064,9 @@ int crm_alloc_os_descriptor(crm_client *c, uint32_t device, uint32_t *object,
     uint32_t h = *object;
     int picked = 0;
     if (h == 0) {
-        mtx_lock(&c->lock);
+        crm_mutex_lock(&c->lock);
         h = handle_reserve(c);
-        mtx_unlock(&c->lock);
+        crm_mutex_unlock(&c->lock);
         if (!h)
             return -ENOMEM;
         picked = 1;
@@ -1081,11 +1086,11 @@ int crm_alloc_os_descriptor(crm_client *c, uint32_t device, uint32_t *object,
     if (r == 0 && p.params.status != NV_OK)
         r = (int)p.params.status;
 
-    mtx_lock(&c->lock);
+    crm_mutex_lock(&c->lock);
     if (r != 0) {
         if (picked)
             handle_unreserve(c, h);
-        mtx_unlock(&c->lock);
+        crm_mutex_unlock(&c->lock);
         return r;
     }
     struct crm_obj *o = obj_put(c, h, SLOT_USED);
@@ -1097,7 +1102,7 @@ int crm_alloc_os_descriptor(crm_client *c, uint32_t device, uint32_t *object,
         if (po && po->state == SLOT_USED)
             po->children++;
     }
-    mtx_unlock(&c->lock);
+    crm_mutex_unlock(&c->lock);
     *object = h;
     return 0;
 }
@@ -1177,11 +1182,11 @@ int crm_event_close(crm_client *c, uint32_t event_handle, int event_fd)
     uint32_t parent = 0;
     int r = 0;
     if (event_handle) {
-        mtx_lock(&c->lock);
+        crm_mutex_lock(&c->lock);
         struct crm_obj *o = obj_find(c, event_handle);
         if (o && o->state == SLOT_USED)
             parent = o->parent;
-        mtx_unlock(&c->lock);
+        crm_mutex_unlock(&c->lock);
         r = crm_free_quiet(c, parent, event_handle);
     }
     nv_ioctl_free_os_event_t e = { .hClient = c->root, .hDevice = parent, .fd = (uint32_t)event_fd };
@@ -1221,6 +1226,35 @@ int crm_event_drain(crm_client *c, int event_fd, struct crm_event_data *out, int
     return n;
 }
 
+int crm_event_wait(crm_client *c, int event_fd, uint32_t timeout_ms)
+{
+    if (!c || event_fd < 0)
+        return -EINVAL;
+    if (!c->t.event_wait)
+        return -ENOSYS;
+    return c->t.event_wait(c->t.ctx, event_fd, timeout_ms);
+}
+
+int crm_alloc_pages(crm_client *c, uint64_t size, void **addr)
+{
+    if (!c || !addr || size == 0 || (size & (c->t.page_size - 1)))
+        return -EINVAL;
+    *addr = NULL;
+    if (!c->t.alloc_pages || !c->t.free_pages)
+        return -ENOSYS;
+    return c->t.alloc_pages(c->t.ctx, size, addr);
+}
+
+int crm_free_pages(crm_client *c, void *addr, uint64_t size)
+{
+    if (!c || !addr)
+        return -EINVAL;
+    if (!c->t.free_pages)
+        return -ENOSYS;
+    c->t.free_pages(c->t.ctx, addr, size);
+    return 0;
+}
+
 int crm_escape(crm_client *c, int fd, uint32_t nr, void *arg, uint32_t size)
 {
     if (!c || (size && !arg))
@@ -1232,10 +1266,10 @@ size_t crm_object_count(const crm_client *c)
 {
     if (!c)
         return 0;
-    mtx_t *l = (mtx_t *)&c->lock;
-    mtx_lock(l);
+    crm_mutex *l = (crm_mutex *)&c->lock;
+    crm_mutex_lock(l);
     size_t n = c->obj_used;
-    mtx_unlock(l);
+    crm_mutex_unlock(l);
     return n;
 }
 
@@ -1243,9 +1277,9 @@ size_t crm_mapping_count(const crm_client *c)
 {
     if (!c)
         return 0;
-    mtx_t *l = (mtx_t *)&c->lock;
-    mtx_lock(l);
+    crm_mutex *l = (crm_mutex *)&c->lock;
+    crm_mutex_lock(l);
     size_t n = c->map_count;
-    mtx_unlock(l);
+    crm_mutex_unlock(l);
     return n;
 }

@@ -1,0 +1,446 @@
+From 34b0b9c159007bd02fa69cfba6235ec91ae4f390 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 00:19:26 +0200
+Subject: [PATCH 14/20] nvk/rm: event waits and host pages through librmclient,
+ LoadLibrary on Windows
+
+The RM backend no longer calls mmap() or poll() itself. librmclient's
+transport ABI 2 provides both:
+
+ - crm_event_wait(): block on the non-stall event channel (Linux: poll()
+   for POLLIN). A wait the transport cannot do (-ENOSYS) makes CPU waits
+   sleep with backoff, like a host that refuses GET_EVENT_DATA.
+ - crm_alloc_pages() / crm_free_pages(): the host pages behind
+   NV01_MEMORY_SYSTEM_OS_DESCRIPTOR memory (Linux: anonymous MAP_POPULATE
+   with MADV_DONTFORK; Windows: VirtualAlloc).
+
+With a librmclient from before these calls, Linux falls back to the same
+code in nvkmd_rm_lib.c, so behaviour does not change. sched_yield() becomes
+thrd_yield().
+
+The loader uses LoadLibrary() on Windows and looks for librmclient.dll (or
+rmclient.dll) next to vulkan_nouveau.dll first: an ICD is loaded from its
+manifest's directory, not the application's. NVK_RMCLIENT_LIB still
+overrides the path.
+
+The fallback rmclient.h is refreshed from librmclient.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h        |  10 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c    |  32 +--
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c    | 185 ++++++++++++++++--
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c    |  21 +-
+ .../nvkmd/rm/rmclient-fallback/rmclient.h     |  14 ++
+ 5 files changed, 226 insertions(+), 36 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index bd51149..5119643 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -68,6 +68,16 @@ struct nvkmd_rm_lib {
+                               uint32_t nvos02_flags);
+    uint32_t (*new_handle)(crm_client *c);
+    void (*release_handle)(crm_client *c, uint32_t handle);
++
++   /* OS services (transport ABI 2).  The backend never calls mmap(),
++    * poll() or their Windows counterparts itself: host pages for OS
++    * descriptors and event waits come from here.  On Linux,
++    * nvkmd_rm_lib.c fills these in with equivalents of librmclient's own
++    * implementation when an older librmclient does not export them.
++    */
++   int (*event_wait)(crm_client *c, int event_fd, uint32_t timeout_ms);
++   int (*alloc_pages)(crm_client *c, uint64_t size, void **addr);
++   int (*free_pages)(crm_client *c, void *addr, uint64_t size);
+ };
+ 
+ /* Returns NULL if librmclient cannot be loaded */
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index f6f864c..9926cc5 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -5,14 +5,13 @@
+ 
+ #include "nvkmd_rm.h"
+ 
++#include "c11/threads.h"
+ #include "util/log.h"
+ #include "util/os_time.h"
+ #include "util/u_math.h"
+ #include "vk_log.h"
+ 
+ #include <fcntl.h>
+-#include <poll.h>
+-#include <sched.h>
+ #include <unistd.h>
+ 
+ static VkResult
+@@ -288,11 +287,12 @@ nvkmd_rm_dev_get_gpu_timestamp(struct nvkmd_dev *_dev)
+ /*
+  * CPU waits
+  *
+- * Spin briefly, then block in poll() on the non-stall interrupt event (the
+- * pushbuffer raises one after each semaphore release), or sleep with
+- * backoff if there is no event.  The value in memory is always what
+- * decides; the event is only a wakeup, so a missed or spurious one costs at
+- * most one poll timeout.
++ * Spin briefly, then block on the non-stall interrupt event (the pushbuffer
++ * raises one after each semaphore release) through librmclient's
++ * crm_event_wait (Linux: poll() on the event fd), or sleep with backoff if
++ * there is no event.  The value in memory is always what decides; the event
++ * is only a wakeup, so a missed or spurious one costs at most one poll
++ * timeout.
+  */
+ #define NVKMD_RM_WAIT_SPIN_ITERS 64
+ #define NVKMD_RM_WAIT_POLL_MS    10
+@@ -308,15 +308,19 @@ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+    const uint64_t remaining_ns = abs_timeout_ns - now;
+ 
+    if (*iter < NVKMD_RM_WAIT_SPIN_ITERS) {
+-      sched_yield();
++      thrd_yield();
+    } else if (dev != NULL && dev->nonstall_fd >= 0 &&
++              dev->lib->event_wait != NULL &&
+               !p_atomic_read(&dev->nonstall_undrainable)) {
+-      const int ms = MIN2(remaining_ns / 1000000 + 1, NVKMD_RM_WAIT_POLL_MS);
+-      struct pollfd pfd = {
+-         .fd = dev->nonstall_fd,
+-         .events = POLLIN,
+-      };
+-      if (poll(&pfd, 1, ms) > 0 && dev->lib->event_drain != NULL) {
++      const uint32_t ms = MIN2(remaining_ns / 1000000 + 1,
++                               NVKMD_RM_WAIT_POLL_MS);
++      const int waited = dev->lib->event_wait(dev->client, dev->nonstall_fd,
++                                              ms);
++      if (waited < 0) {
++         /* The transport cannot wait (e.g. -ENOSYS): sleep from now on */
++         mesa_logd("NVK: RM event wait failed (%d); CPU waits sleep", waited);
++         p_atomic_set(&dev->nonstall_undrainable, true);
++      } else if (waited > 0 && dev->lib->event_drain != NULL) {
+          struct crm_event_data data[8];
+          int n = dev->lib->event_drain(dev->client, dev->nonstall_fd,
+                                        data, ARRAY_SIZE(data));
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index a6bb6d6..12a9623 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -10,11 +10,24 @@
+ #include "util/u_call_once.h"
+ #include "vk_log.h"
+ 
+-#include <dlfcn.h>
+ #include <errno.h>
+ #include <stdio.h>
+ #include <string.h>
+ 
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#else
++#include <dlfcn.h>
++#endif
++
++#ifdef __linux__
++#include <poll.h>
++#include <sys/mman.h>
++#endif
++
+ /* NVK does not link against librmclient.  It is loaded the first time an RM
+  * device is enumerated so that a Mesa built with -Dnvk-rm=enabled still
+  * works (with nouveau only) on systems without it.
+@@ -23,9 +36,144 @@ static struct nvkmd_rm_lib rm_lib;
+ static bool rm_lib_ok;
+ static util_once_flag rm_lib_once = UTIL_ONCE_FLAG_INIT;
+ 
++/*
++ * Shared library loading: dlopen() on Unix, LoadLibrary() on Windows.
++ */
++#ifdef _WIN32
++
++static const char *const default_lib_names[] = {
++   "librmclient.dll",   /* what MinGW/meson name it */
++   "rmclient.dll",
++};
++
++/* An ICD is loaded from wherever its manifest points (the driver store),
++ * not from the application's directory: look next to our own DLL first.
++ */
++static void *
++rm_lib_open_next_to_us(const char *name)
++{
++   HMODULE self = NULL;
++   if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                           (LPCSTR)(void *)&rm_lib, &self))
++      return NULL;
++
++   char path[MAX_PATH];
++   DWORD len = GetModuleFileNameA(self, path, sizeof(path));
++   if (len == 0 || len >= sizeof(path))
++      return NULL;
++
++   char *slash = strrchr(path, '\\');
++   if (slash == NULL)
++      return NULL;
++   slash[1] = '\0';
++   if (strlen(path) + strlen(name) >= sizeof(path))
++      return NULL;
++   strcat(path, name);
++
++   return (void *)LoadLibraryExA(path, NULL,
++                                 LOAD_WITH_ALTERED_SEARCH_PATH);
++}
++
++static void *
++rm_lib_open(const char *name, bool search_own_dir)
++{
++   void *h = search_own_dir ? rm_lib_open_next_to_us(name) : NULL;
++   if (h == NULL)
++      h = (void *)LoadLibraryA(name);
++   return h;
++}
++
++static void *
++rm_lib_sym(void *handle, const char *name)
++{
++   return (void *)GetProcAddress((HMODULE)handle, name);
++}
++
++static void
++rm_lib_close(void *handle)
++{
++   FreeLibrary((HMODULE)handle);
++}
++
++static const char *
++rm_lib_error(void)
++{
++   static char msg[32];
++   snprintf(msg, sizeof(msg), "error %lu", (unsigned long)GetLastError());
++   return msg;
++}
++
++#else
++
++static const char *const default_lib_names[] = {
++   "librmclient.so.0",
++   "librmclient.so",
++};
++
++static void *
++rm_lib_open(const char *name, bool search_own_dir)
++{
++   return dlopen(name, RTLD_NOW | RTLD_LOCAL);
++}
++
++static void *
++rm_lib_sym(void *handle, const char *name)
++{
++   return dlsym(handle, name);
++}
++
++static void
++rm_lib_close(void *handle)
++{
++   dlclose(handle);
++}
++
++static const char *
++rm_lib_error(void)
++{
++   return dlerror();
++}
++
++#endif
++
++#ifdef __linux__
++/* For a librmclient from before transport ABI 2: what its Linux transport
++ * does now, so the backend keeps one code path.
++ */
++static int
++compat_event_wait(crm_client *c, int event_fd, uint32_t timeout_ms)
++{
++   struct pollfd pfd = { .fd = event_fd, .events = POLLIN };
++   int r = poll(&pfd, 1, (int)MIN2(timeout_ms, INT32_MAX));
++   if (r < 0)
++      return errno == EINTR ? 0 : -errno;
++   return r > 0;
++}
++
++static int
++compat_alloc_pages(crm_client *c, uint64_t size, void **addr)
++{
++   void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
++                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
++   if (p == MAP_FAILED)
++      return -errno;
++   /* RM pins these pages; a child process must not get COW copies */
++   madvise(p, size, MADV_DONTFORK);
++   *addr = p;
++   return 0;
++}
++
++static int
++compat_free_pages(crm_client *c, void *addr, uint64_t size)
++{
++   return munmap(addr, size) < 0 ? -errno : 0;
++}
++#endif
++
+ #define LOAD(field, name, required)                                  \
+    do {                                                              \
+-      *(void **)&rm_lib.field = dlsym(rm_lib.handle, name);          \
++      *(void **)&rm_lib.field = rm_lib_sym(rm_lib.handle, name);     \
+       if ((required) && rm_lib.field == NULL) {                      \
+          mesa_logw("NVK: %s does not export %s", path, name);        \
+          goto fail;                                                  \
+@@ -35,25 +183,21 @@ static util_once_flag rm_lib_once = UTIL_ONCE_FLAG_INIT;
+ static void
+ nvkmd_rm_lib_load(void)
+ {
+-   static const char *const default_paths[] = {
+-      "librmclient.so.0",
+-      "librmclient.so",
+-   };
+    const char *path = os_get_option("NVK_RMCLIENT_LIB");
+ 
+    if (path != NULL) {
+-      rm_lib.handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
++      rm_lib.handle = rm_lib_open(path, false);
+    } else {
+-      for (unsigned i = 0; i < ARRAY_SIZE(default_paths); i++) {
+-         path = default_paths[i];
+-         rm_lib.handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
++      for (unsigned i = 0; i < ARRAY_SIZE(default_lib_names); i++) {
++         path = default_lib_names[i];
++         rm_lib.handle = rm_lib_open(path, true);
+          if (rm_lib.handle != NULL)
+             break;
+       }
+    }
+ 
+    if (rm_lib.handle == NULL) {
+-      mesa_logd("NVK: failed to load librmclient: %s", dlerror());
++      mesa_logd("NVK: failed to load librmclient: %s", rm_lib_error());
+       return;
+    }
+ 
+@@ -80,11 +224,28 @@ nvkmd_rm_lib_load(void)
+    LOAD(new_handle,   "crm_new_handle",   false);
+    LOAD(release_handle, "crm_release_handle", false);
+ 
++   LOAD(event_wait,   "crm_event_wait",   false);
++   LOAD(alloc_pages,  "crm_alloc_pages",  false);
++   LOAD(free_pages,   "crm_free_pages",   false);
++   if (rm_lib.alloc_pages == NULL || rm_lib.free_pages == NULL) {
++      rm_lib.alloc_pages = NULL;
++      rm_lib.free_pages = NULL;
++   }
++
++#ifdef __linux__
++   if (rm_lib.event_wait == NULL)
++      rm_lib.event_wait = compat_event_wait;
++   if (rm_lib.alloc_pages == NULL) {
++      rm_lib.alloc_pages = compat_alloc_pages;
++      rm_lib.free_pages = compat_free_pages;
++   }
++#endif
++
+    rm_lib_ok = true;
+    return;
+ 
+ fail:
+-   dlclose(rm_lib.handle);
++   rm_lib_close(rm_lib.handle);
+    memset(&rm_lib, 0, sizeof(rm_lib));
+ }
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 24aab04..061d48a 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -13,7 +13,6 @@
+ #include <fcntl.h>
+ #include <inttypes.h>
+ #include <stdio.h>
+-#include <sys/mman.h>
+ #include <unistd.h>
+ #include <xf86drm.h>
+ 
+@@ -42,13 +41,15 @@ alloc_os_pages(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+ {
+    const struct nvkmd_rm_lib *lib = dev->lib;
+ 
+-   void *pages = mmap(NULL, size_B, PROT_READ | PROT_WRITE,
+-                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+-   if (pages == MAP_FAILED)
+-      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++   /* Zeroed, resident pages RM can pin, from librmclient's transport (Linux:
++    * anonymous MAP_POPULATE + MADV_DONTFORK; Windows: VirtualAlloc).
++    */
++   if (lib->alloc_pages == NULL)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY; /* caller falls back to RM sysmem */
+ 
+-   /* RM pins these pages; a child process must not get COW copies */
+-   madvise(pages, size_B, MADV_DONTFORK);
++   void *pages = NULL;
++   if (lib->alloc_pages(dev->client, size_B, &pages) != 0)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+    NV_OS_DESC_MEMORY_ALLOCATION_PARAMS params = {
+       .type = NVOS32_TYPE_IMAGE,
+@@ -79,7 +80,7 @@ alloc_os_pages(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+                        &params, sizeof(params));
+    }
+    if (ret != 0) {
+-      munmap(pages, size_B);
++      lib->free_pages(dev->client, pages, size_B);
+       return NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             ret, "alloc NV01_MEMORY_SYSTEM_OS_DESCRIPTOR");
+    }
+@@ -263,7 +264,7 @@ fail_rm:
+    simple_mtx_destroy(&mem->export_mutex);
+    free_rm_memory(dev, mem->h_memory);
+    if (mem->os_pages != NULL)
+-      munmap(mem->os_pages, size_B);
++      dev->lib->free_pages(dev->client, mem->os_pages, size_B);
+ fail_mem:
+    FREE(mem);
+ 
+@@ -561,7 +562,7 @@ nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
+    if (mem->imported && dev->lib->release_handle != NULL)
+       dev->lib->release_handle(dev->client, mem->h_memory);
+    if (mem->os_pages != NULL)
+-      munmap(mem->os_pages, mem->base.size_B);
++      dev->lib->free_pages(dev->client, mem->os_pages, mem->base.size_B);
+ 
+    FREE(mem);
+ }
+diff --git a/src/nouveau/vulkan/nvkmd/rm/rmclient-fallback/rmclient.h b/src/nouveau/vulkan/nvkmd/rm/rmclient-fallback/rmclient.h
+index 92ed427..a7b51b4 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/rmclient-fallback/rmclient.h
++++ b/src/nouveau/vulkan/nvkmd/rm/rmclient-fallback/rmclient.h
+@@ -135,6 +135,20 @@ int crm_event_drain(crm_client *c, int event_fd, struct crm_event_data *out, int
+ int crm_alloc_os_descriptor(crm_client *c, uint32_t device, uint32_t *object,
+                             void *addr, uint64_t size, uint32_t nvos02_flags);
+ 
++/* Wait for an event channel from crm_event_open to be signalled (Linux:
++ * poll() for POLLIN). Returns 1 if it is (drain it with crm_event_drain to
++ * re-arm), 0 after timeout_ms, or -errno; -ENOSYS when the transport cannot
++ * wait, and callers then sleep-poll instead. */
++int crm_event_wait(crm_client *c, int event_fd, uint32_t timeout_ms);
++
++/* Host memory for crm_alloc_os_descriptor: `size` bytes (a multiple of the
++ * page size), page aligned, zero filled and resident, from the transport
++ * (Linux: private anonymous mmap with MAP_POPULATE and MADV_DONTFORK, since
++ * RM pins the pages; Windows: VirtualAlloc). Free it with crm_free_pages and
++ * the same size, after the OS-descriptor object is gone. */
++int crm_alloc_pages(crm_client *c, uint64_t size, void **addr);
++int crm_free_pages(crm_client *c, void *addr, uint64_t size);
++
+ /* Raw escape on the control channel (fd = -1) or a transport fd, for escapes
+  * this API does not wrap. Returns 0 or -errno; RM status stays in *arg. */
+ int crm_escape(crm_client *c, int fd, uint32_t nr, void *arg, uint32_t size);
+-- 
+2.43.0
+

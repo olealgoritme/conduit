@@ -1,0 +1,35 @@
+From 4e9d9ef5229d2421c8713d30142a646867f0fcd7 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 00:19:52 +0200
+Subject: [PATCH 18/20] nak: leave nouveau's winsys and DRM out of the bindings
+ on Windows
+
+Only the hardware tests (Linux, cfg(test)) use them, and Windows has no
+libdrm.
+---
+ src/nouveau/compiler/nak_bindings.h | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/nouveau/compiler/nak_bindings.h b/src/nouveau/compiler/nak_bindings.h
+index e766da1..f82db1d 100644
+--- a/src/nouveau/compiler/nak_bindings.h
++++ b/src/nouveau/compiler/nak_bindings.h
+@@ -5,6 +5,10 @@
+ 
+ #include "nak_private.h"
+ 
++/* nouveau's winsys and DRM are only used by the hardware tests (Linux);
++ * Windows has neither.
++ */
++#ifndef _WIN32
+ #include "nouveau_bo.h"
+ #include "nouveau_context.h"
+ #include "nouveau_device.h"
+@@ -18,3 +22,4 @@
+ enum ENUM_PACKED drm_rs_ioctls {
+    DRM_RS_IOCTL(NOUVEAU_EXEC),
+ };
++#endif
+-- 
+2.43.0
+

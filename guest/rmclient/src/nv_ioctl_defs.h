@@ -360,6 +360,25 @@ typedef struct {
     int32_t  numaId;
 } NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS;
 
+/* Export an RM object to a fresh control channel `fd`, which nvidia-drm then
+ * imports (DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY). hParent is the device. */
+#define NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD 0x3d05u
+#define NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM   1u
+typedef struct {
+    struct {
+        uint32_t type;
+        union {
+            struct {
+                uint32_t hDevice;
+                uint32_t hParent;
+                uint32_t hObject;
+            } rmObject;
+        } data;
+    } object;
+    int32_t  fd;
+    uint32_t flags;
+} NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS;
+
 #define NV2080_CTRL_CMD_GPU_GET_NAME_STRING              0x20800110u
 #define NV2080_GPU_MAX_NAME_STRING_LENGTH                0x40
 #define NV2080_CTRL_GPU_GET_NAME_STRING_FLAGS_TYPE_ASCII 0
@@ -412,5 +431,6 @@ _Static_assert(sizeof(NV_VASPACE_ALLOCATION_PARAMETERS) == 56, "NV_VASPACE_ALLOC
 _Static_assert(sizeof(NV2080_CTRL_GPU_GET_NAME_STRING_PARAMS) == 68, "GET_NAME_STRING");
 _Static_assert(sizeof(NV2080_CTRL_MC_GET_ARCH_INFO_PARAMS) == 16, "GET_ARCH_INFO");
 _Static_assert(sizeof(NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS) == 32, "GET_ID_INFO_V2");
+_Static_assert(sizeof(NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS) == 24, "EXPORT_OBJECT_TO_FD");
 
 #endif /* CRM_NV_IOCTL_DEFS_H */

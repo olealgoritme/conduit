@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 03:58:33 +0200
+Subject: [PATCH 2/7] nvk: don't reselect cb0 after binding constant buffers on
+ Turing+
+
+nvk_cmd_flush_gfx_cbufs() calls NVK_MME_SELECT_CB0 after binding any
+constant buffer so that root table updates through LOAD_CONSTANT_BUFFER
+land in cb0.  With the hardware root table (Turing+), the root table is
+written with SET_ROOT_TABLE_SELECTOR / LOAD_ROOT_TABLE and nothing loads
+a constant buffer through the selector after queue init, so the macro
+call only costs time: one MME call per draw that changes a UBO binding.
+
+vk_perf_bench, 20000 draws on an RTX 5090: a new dynamic UBO offset per
+draw 0.224 -> 0.189 ms GPU (NVIDIA 0.121 ms).
+---
+ src/nouveau/vulkan/nvk_cmd_draw.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 79f0c41..6ac3dc8 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -4388,9 +4388,11 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+    /* We bind all root descriptors last so that CONSTANT_BUFFER_SELECTOR is
+     * always left pointing at the root descriptor table.  This way draw
+     * parameters and similar MME root table updates always hit the root
+-    * descriptor table and not some random UBO.
++    * descriptor table and not some random UBO.  With a hardware root table
++    * (Turing+), root updates go through SET_ROOT_TABLE_SELECTOR instead and
++    * nothing loads constant buffers through the selector after init.
+     */
+-   if (bound_any_cbuf) {
++   if (bound_any_cbuf && !nvk_use_hw_root_table(&pdev->info, true)) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+       P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SELECT_CB0));
+       P_INLINE_DATA(p, 0);

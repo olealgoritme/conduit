@@ -11,7 +11,6 @@
  */
 #include <errno.h>
 #include <inttypes.h>
-#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -57,11 +56,9 @@ static int expect(const char *what, int ok)
     return ok;
 }
 
-static int readable(int fd, int ms)
+static int readable(crm_client *c, int fd, int ms)
 {
-    struct pollfd p = { .fd = fd, .events = POLLIN };
-    int r = poll(&p, 1, ms);
-    return r > 0 && (p.revents & POLLIN);
+    return crm_event_wait(c, fd, (uint32_t)ms) == 1;
 }
 
 int main(void)
@@ -119,7 +116,7 @@ int main(void)
     /* One trigger, read through poll + drain. */
     step("NV2080_CTRL_CMD_EVENT_SET_TRIGGER x1",
          crm_control(c, sub, NV2080_CTRL_CMD_EVENT_SET_TRIGGER, NULL, 0));
-    expect("event fd readable (poll POLLIN) after the trigger", readable(efd, 2000));
+    expect("event fd readable (crm_event_wait) after the trigger", readable(c, efd, 2000));
     memset(d, 0, sizeof(d));
     nd = crm_event_drain(c, efd, d, 8);
     printf("       drain -> %d\n", nd);
@@ -134,7 +131,7 @@ int main(void)
     for (int i = 0; i < 3; i++)
         step("NV2080_CTRL_CMD_EVENT_SET_TRIGGER",
              crm_control(c, sub, NV2080_CTRL_CMD_EVENT_SET_TRIGGER, NULL, 0));
-    expect("event fd readable after three triggers", readable(efd, 2000));
+    expect("event fd readable after three triggers", readable(c, efd, 2000));
     memset(d, 0, sizeof(d));
     nd = crm_event_drain(c, efd, d, 8);
     printf("       drain -> %d\n", nd);

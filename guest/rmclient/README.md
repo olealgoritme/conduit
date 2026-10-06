@@ -29,6 +29,8 @@ positive `NV_STATUS` when RM refused the call. `crm_status_name()` and
 | `crm_gpu_count`, `crm_gpu_info`, `crm_gpu_pci` | the `NV_ESC_CARD_INFO` read at open |
 | `crm_alloc_os_descriptor(c, device, &h, addr, size, flags)` | `NV_ESC_RM_ALLOC_MEMORY` (NVOS02 + fd) on the GPU channel: `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` over the caller's own pages. RM accepts a user address only on this route; `NV_ESC_RM_ALLOC` of the class answers `NV_ERR_NOT_SUPPORTED`. |
 | `crm_event_open` / `crm_event_drain` / `crm_event_close` | a new control fd, `NV_ESC_ALLOC_OS_EVENT`, `NV01_EVENT_OS_EVENT` with `data = fd` / `NV_ESC_RM_GET_EVENT_DATA` / `NV_ESC_FREE_OS_EVENT` |
+| `crm_event_wait(c, fd, timeout_ms)` | none: waits for the event channel (Linux: `poll` POLLIN). 1 signalled, 0 timeout, `-ENOSYS` if the transport cannot wait |
+| `crm_alloc_pages` / `crm_free_pages` | none: host pages for `crm_alloc_os_descriptor` (Linux: anonymous `mmap` with `MAP_POPULATE`, `MADV_DONTFORK`; Windows: `VirtualAlloc`) |
 | `crm_escape(c, fd, nr, arg, size)` | any escape, unwrapped |
 | `crm_new_handle`, `crm_release_handle`, `crm_free_quiet`, `crm_object_count`, `crm_mapping_count`, `crm_rm_version`, `crm_ctl_fd` | helpers |
 
@@ -64,8 +66,11 @@ What the library does for the caller:
   passed through unchanged, so a driver that manages its own VA (NVK) can
   allocate one large VirtualMemory and map with `NVOS46_FLAGS_DMA_OFFSET_FIXED`
   itself.
-- **Threads.** The client's bookkeeping is protected by a C11 `mtx_t`. RM calls
-  run concurrently.
+- **Threads.** The client's bookkeeping is protected by a C11 `mtx_t` (an SRW
+  lock on Windows, `src/crm_mutex.h`). RM calls run concurrently.
+- **OS services.** Everything else OS-specific that a driver on RM needs (event
+  waits, pinnable host pages) also goes through the library, so NVK's RM
+  backend calls neither `mmap` nor `poll` and builds for Windows unchanged.
 
 ## Transports (`include/rmclient_transport.h`)
 
@@ -84,8 +89,32 @@ way, such as a Windows KMD that maps into the process and returns the address,
 sets the optional `map_memory` / `unmap_memory` hooks instead, and the library
 skips its own protocol.
 
-`crm_linux_transport()` is the Linux one. `crm_open(&c, NULL)` uses
-`crm_default_transport()`. `$CRM_DEV_DIR` overrides `/dev` for tests.
+Transport ABI 2 (`CRM_TRANSPORT_ABI`) adds three optional callbacks at the end
+of the struct: `event_wait(fd, timeout_ms)`, `alloc_pages(size)` and
+`free_pages`. `crm_open` still accepts ABI 1 transports; their ABI 2 callbacks
+count as missing, and the wrappers answer `-ENOSYS`.
+
+`crm_linux_transport()` is the Linux one. `crm_windows_transport()` is the
+Windows one (`src/transport_windows.c`): RM escapes through the Conduit KMD as
+`HELIOS_ESCAPE_NVRM` calls on `D3DKMTEscape` (the ABI is
+`guest/windows/protocol/src/nvrm.rs`, mirrored in `src/helios_nvrm_escape.h`).
+It finds the Helios adapter by probing the verb, then does what the Linux guest
+module does in its kernel: builds the host's wire messages (`src/win_wire.h`,
+unit-tested on any host by `tests/test_win_wire.c`) from each NVIDIA escape and
+the blocks its pointers address. The KMD only forwards them and owns handles.
+A transport "fd" is the backend handle the host returned from Open, so fds
+written into payloads already mean what the host expects.
+
+Implemented: `open`, `close`, `ioctl` (including the parameter block of
+`NV_ESC_RM_CONTROL` and `NV_ESC_RM_ALLOC`), `map_memory`/`unmap_memory` (CPU
+mapping: Linux's channel-per-mapping protocol, with the KMD doing the final map)
+and `alloc_pages`. Still `-ENOSYS`, each waiting for its KMD verb: `event_wait`
+(OS events) and registering user memory as an OS descriptor.
+Controls whose parameters hold a pointer of their own are sent without it. The
+Windows build needs the vendored WDK headers
+(`guest/windows/icd/win-build/wdk-include`), which `meson.build` adds.
+`crm_open(&c, NULL)` uses `crm_default_transport()` (Linux or Windows).
+`$CRM_DEV_DIR` overrides `/dev` for tests.
 
 ## Build and test
 
@@ -94,6 +123,18 @@ meson setup build && meson test -C build        # unit tests (fake transport, no
 make check                                      # same without meson (build-make/)
 make smoke                                      # tests/crm_smoke.c against a real RM
 ```
+
+Windows (cross-compiled on Linux with MinGW-w64; `guest/nvk-rm/build-windows.sh`
+does this as part of the NVK build):
+
+```sh
+meson setup build-win --cross-file ../nvk-rm/windows/mingw-x86_64.ini
+ninja -C build-win                 # librmclient.dll, librmclient.dll.a, test_unit.exe, ...
+wine build-win/test_unit.exe       # unit tests pass under wine (wine64 9.0)
+```
+
+`librmclient.dll` depends on system DLLs only (KERNEL32, msvcrt). MinGW
+exports every non-static function (there is no `.def` file yet).
 
 `tests/test_unit.c` runs the library against a fake transport that acts as a
 small RM. It covers handle allocation and reuse, table growth, NVOS
@@ -112,6 +153,12 @@ subdevice, and open/drain/close an OS event. Each step is printed.
 `crm_event_smoke` arms the subdevice's software notifier, triggers it and
 reads the events back with `crm_event_drain`.
 
+`tests/crm_pin_smoke.c` registers the caller's own memory with RM: it takes
+pages from `crm_alloc_pages`, makes an `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR`
+over them, GPU-maps and unmaps it, checks the CPU's pattern survived, and
+frees it, at 2 MiB and at 512 MiB (past what a direct page-run table holds on
+Windows, where the KMD pins the range).
+
 ## Status
 
 Tested in the `lab` guest (RTX 5090, GB20x, host driver 610.57.04):
@@ -122,6 +169,12 @@ module carries the 16-byte event buffer, the backend checks it,
 Conduit guests; a backend from before that refuses 0x52 with `-EINVAL`. NVK on
 RM (`guest/nvk-rm`) is the first user.
 
-Not done yet: the Windows transport, `NV_ESC_RM_DUP_OBJECT`, and
-export/import of objects by fd (NVK on RM does that itself with the RM
-controls `OS_UNIX_EXPORT_OBJECT_TO_FD` / `IMPORT_OBJECT_FROM_FD`).
+Windows, in the `win11` guest with the Helios KMD (22.22.307.0 and later,
+same GPU and host driver): `crm_smoke`, `crm_pin_smoke` (OS descriptors through
+the KMD's PIN), `crm_event_smoke` (EVENT_REGISTER over the device event queue)
+and `crm_scanout_smoke` (zero-copy ScanoutFlip) pass; NVK on RM runs on this
+transport (see `guest/nvk-rm/README.md`).
+
+Not done yet: `NV_ESC_RM_DUP_OBJECT` and export/import of objects by fd in the
+library itself (NVK on RM does that with the RM controls
+`OS_UNIX_EXPORT_OBJECT_TO_FD` / `IMPORT_OBJECT_FROM_FD`).

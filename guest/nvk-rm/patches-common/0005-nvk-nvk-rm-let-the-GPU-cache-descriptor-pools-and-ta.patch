@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 04:17:19 +0200
+Subject: [PATCH 5/7] nvk, nvk/rm: let the GPU cache descriptor pools and
+ tables on RM
+
+The RM backend places NVK's own mappable memory (NVKMD_MEM_LOCAL with a
+CPU map) in system memory, and maps it GPU-uncached.  That includes the
+descriptor pools and the image/sampler descriptor tables, so every
+descriptor set a draw binds is a constant buffer that the GPU fetches
+across PCIe, uncached: switching descriptor sets per draw cost about 15 ns
+of GPU time per draw on an RTX 5090, about 2x NVIDIA even after the
+other per-draw fixes.
+
+Add NVKMD_MEM_GPU_READ_ONLY, for memory that only shaders and the texture
+units read and that the CPU writes before the submit that reads it, set
+it on the descriptor pools and the descriptor tables, and have the RM
+backend map such memory GPU-cacheable like coherent host-visible memory.
+Every RM submit already starts with an L2 system-memory invalidate, which
+covers descriptor writes made before the submit (Vulkan requires them to
+be, update-after-bind included).  Command buffer memory, which the GPU
+also fetches commands from, stays uncached.  nouveau ignores the flag.
+
+vk_perf_bench, 20000 draws: a descriptor set switch per draw 0.285 ->
+0.218 ms GPU (NVIDIA 0.143 ms).  A descriptor set rewritten between
+submits renders correctly (vk_perf_bench -t descupd).
+---
+ src/nouveau/vulkan/nvk_descriptor_set.c    |  4 +++-
+ src/nouveau/vulkan/nvk_descriptor_table.c  |  3 ++-
+ src/nouveau/vulkan/nvkmd/nvkmd.h           |  8 ++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c | 17 +++++++++++------
+ 4 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_descriptor_set.c b/src/nouveau/vulkan/nvk_descriptor_set.c
+index 49a1cc5..293d8d1 100644
+--- a/src/nouveau/vulkan/nvk_descriptor_set.c
++++ b/src/nouveau/vulkan/nvk_descriptor_set.c
+@@ -697,7 +697,9 @@ nvk_CreateDescriptorPool(VkDevice _device,
+          }
+       } else {
+          result = nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base,
+-                                             mem_size, 0, NVKMD_MEM_LOCAL,
++                                             mem_size, 0,
++                                             NVKMD_MEM_LOCAL |
++                                             NVKMD_MEM_GPU_READ_ONLY,
+                                              NVKMD_MEM_MAP_WR, &pool->mem);
+          if (result != VK_SUCCESS) {
+             nvk_destroy_descriptor_pool(dev, pAllocator, pool);
+diff --git a/src/nouveau/vulkan/nvk_descriptor_table.c b/src/nouveau/vulkan/nvk_descriptor_table.c
+index 4bb5e1d..161b16d 100644
+--- a/src/nouveau/vulkan/nvk_descriptor_table.c
++++ b/src/nouveau/vulkan/nvk_descriptor_table.c
+@@ -68,7 +68,8 @@ nvk_descriptor_table_init(struct nvk_device *dev,
+    assert(util_is_power_of_two_nonzero(min_descriptor_count));
+    assert(util_is_power_of_two_nonzero(max_descriptor_count));
+ 
+-   result = nvk_mem_arena_init(dev, &table->arena, NVKMD_MEM_LOCAL,
++   result = nvk_mem_arena_init(dev, &table->arena,
++                               NVKMD_MEM_LOCAL | NVKMD_MEM_GPU_READ_ONLY,
+                                NVKMD_MEM_MAP_WR, true /* contiguous */,
+                                max_descriptor_count * descriptor_size);
+    if (result != VK_SUCCESS)
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
+index 3d6229b..ac878d3 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+@@ -56,6 +56,14 @@ enum nvkmd_mem_flags {
+ 
+    /** This memory object has coherent CPU maps */
+    NVKMD_MEM_COHERENT   = 1 << 5,
++
++   /** Only shaders and the texture units read this memory on the GPU: the
++    *  GPU never writes it, polls it or fetches commands from it, and the CPU
++    *  writes it only before submitting the work that reads it (descriptor
++    *  sets and tables).  A backend which places mappable memory in system
++    *  memory may let the GPU cache it.
++    */
++   NVKMD_MEM_GPU_READ_ONLY = 1 << 6,
+ };
+ 
+ #define NVKMD_MEM_PLACEMENT_FLAGS \
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 2efeb5b..be7c585 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -51,10 +51,14 @@
+  * (GART | COHERENT, i.e. VkDeviceMemory) are therefore mapped GPU-cacheable,
+  * and every submit starts with an L2 sysmem invalidate (nvkmd_rm_ctx.c) so
+  * CPU writes made before it are seen.  Within a command buffer NVK already
+- * invalidates for host-to-device barriers.  Memory the GPU polls or fetches
+- * commands from (rings, semaphores, query reports, pushbuffers: all
+- * allocated without NVKMD_MEM_COHERENT) and shared memory stay uncached.
+- * NVK_RM_SYSMEM_CACHED=0 turns this off.
++ * invalidates for host-to-device barriers.  NVK's descriptor pools and
++ * descriptor tables (NVKMD_MEM_GPU_READ_ONLY: written by the CPU before the
++ * submit that reads them) are GPU-cacheable as well; uncached, every new
++ * descriptor set a draw binds is a constant buffer fetched across PCIe.
++ * Memory the GPU polls or fetches commands from (rings, semaphores, query
++ * reports, pushbuffers and NVK's other command buffer memory: all allocated
++ * without NVKMD_MEM_COHERENT or NVKMD_MEM_GPU_READ_ONLY) and shared memory
++ * stay uncached.  NVK_RM_SYSMEM_CACHED=0 turns this off.
+  */
+ 
+ static bool
+@@ -255,8 +259,9 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+     */
+    const bool force_rm_sysmem = (flags & NVKMD_RM_MEM_RM_SYSMEM) ||
+                                 (flags & NVKMD_MEM_SHARED);
+-   const bool gpu_cacheable = (flags & NVKMD_MEM_GART) &&
+-                              (flags & NVKMD_MEM_COHERENT) &&
++   const bool gpu_cacheable = (((flags & NVKMD_MEM_GART) &&
++                                (flags & NVKMD_MEM_COHERENT)) ||
++                               (flags & NVKMD_MEM_GPU_READ_ONLY)) &&
+                               !force_rm_sysmem && dev->sysmem_cached;
+    flags &= ~NVKMD_RM_MEM_RM_SYSMEM;
+ 
