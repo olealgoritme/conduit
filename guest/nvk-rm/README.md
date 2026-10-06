@@ -437,6 +437,16 @@ driver have. On the RTX 5090 in `win11`:
   allocated and stays mapped until freed; internal and client maps alias
   that mapping, so mapping per frame costs nothing. An allocation that
   does not fit the heap fails with `VK_ERROR_OUT_OF_DEVICE_MEMORY`.
+- When the CPU map fails (patch 0025: the shared window is full, or the
+  KMD's per-process share of it is used up), the allocation still succeeds.
+  The VRAM is freed and the allocation gets system pages (OS descriptors,
+  which take no window space). The app still sees the same memory type, the
+  GPU just reads it more slowly, and it still counts against the heap. The
+  first such fallback per device logs `NVK: host-visible VRAM: CPU map of N
+  MiB failed ... using system memory` (`NVK_DEBUG=vm`: every one). Patch
+  order: 0022, 0023 (S3 Helios ICD interface) if present, 0024 (block-linear
+  WSI) if present, then 0025, then `patches-windows-dxvk/`. The patch applies
+  with or without 0023.
 - Only that type lands in the BAR: `nvkmd_info::host_visible_vram_is_pinned`
   makes NVK ask for `NVKMD_MEM_VRAM` there, while NVK's own
   `LOCAL | CAN_MAP` buffers (push, queries, events, upload) stay in system
