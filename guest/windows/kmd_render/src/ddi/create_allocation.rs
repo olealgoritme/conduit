@@ -2978,6 +2978,9 @@ fn build_backing(
 
 /// Create the virtio blob for one allocation and fill its VidMm metadata. On
 /// failure nothing is stored (the caller unwinds prior allocations).
+/// [`create_one_inner`], plus the `ShPhRet` breadcrumb: the status returned for an allocation of
+/// the placeholder shape (identity-less STANDARD), success included.
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_one(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -2986,6 +2989,41 @@ unsafe fn create_one(
     info: &mut DXGK_ALLOCATIONINFO,
     resource_associated: bool,
     create_flags: u32,
+    num_allocations: u32,
+    alloc_index: u32,
+) -> Result<(), NTSTATUS> {
+    let mut shape = false;
+    let result = unsafe {
+        create_one_inner(
+            passive,
+            adapter,
+            resource_private,
+            resource_private_size,
+            info,
+            resource_associated,
+            create_flags,
+            num_allocations,
+            alloc_index,
+            &mut shape,
+        )
+    };
+    if shape {
+        crate::ddi::shared_placeholder::note_shape_return(result);
+    }
+    result
+}
+
+unsafe fn create_one_inner(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_private: *const c_void,
+    resource_private_size: UINT,
+    info: &mut DXGK_ALLOCATIONINFO,
+    resource_associated: bool,
+    create_flags: u32,
+    num_allocations: u32,
+    alloc_index: u32,
+    shape: &mut bool,
 ) -> Result<(), NTSTATUS> {
     // ── Read + validate the ICD's private driver data ───────────────────────
     //
@@ -3055,10 +3093,18 @@ unsafe fn create_one(
     }
     let mut ap = ap;
     let mut supplied_resource_id = 0u32;
-    // A SHARED, identity-less STANDARD allocation is a placeholder (NVK has no resource id for
-    // the texture): host-less backing instead of a Venus present buffer. Anything carrying an
-    // identity, and every unshared allocation, is `false` here and validated as before. The
-    // decision and its table: `helios_kmd_logic::shared_placeholder`.
+    // An identity-less STANDARD allocation is a placeholder (NVK has no resource id for the
+    // texture): host-less backing instead of a Venus present buffer. Whether it is shared is NOT
+    // part of the decision (the KMD flags word carries no shared bit, only `Resource`); anything
+    // carrying an identity is `false` here and validated as before. The decision and its table:
+    // `helios_kmd_logic::shared_placeholder`.
+    let placeholder_at = crate::ddi::shared_placeholder::Where {
+        // The runtime's input value, read before this function writes the field.
+        info_flags: unsafe { info.__bindgen_anon_4.FlagsWddm2.__bindgen_anon_1.Value } as u32,
+        resource: resource_associated,
+        num_allocations,
+        index: alloc_index,
+    };
     let placeholder_input = crate::ddi::shared_placeholder::create_input(
         &ap,
         create_flags,
@@ -3067,7 +3113,8 @@ unsafe fn create_one(
         unsafe { read_layout_trailer(priv_ptr as *const c_void, priv_len as UINT) }.is_some(),
     );
     let placeholder_verdict = helios_kmd_logic::shared_placeholder::decide(&placeholder_input);
-    crate::ddi::shared_placeholder::note_verdict(&placeholder_input, placeholder_verdict);
+    *shape = helios_kmd_logic::shared_placeholder::is_identityless_standard(&placeholder_input);
+    crate::ddi::shared_placeholder::note_verdict(&placeholder_input, placeholder_verdict, placeholder_at);
     let placeholder = match placeholder_verdict {
         helios_kmd_logic::shared_placeholder::Verdict::Placeholder => true,
         helios_kmd_logic::shared_placeholder::Verdict::Existing(_) => false,
@@ -3407,7 +3454,10 @@ unsafe fn create_one(
     if placeholder {
         // Counted BEFORE the producer registration below can fail and destroy the context, so
         // `ShPhFree` never runs ahead of `ShPhMade`.
-        crate::ddi::shared_placeholder::note_created(ap.size);
+        crate::ddi::shared_placeholder::note_created(
+            ap.size,
+            helios_kmd_logic::shared_placeholder::creator_declares_shared(meta.misc_flags),
+        );
     }
     if adapter
         .producer
@@ -3625,6 +3675,8 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
                 info,
                 wants_resource,
                 create_flags,
+                args.NumAllocations as u32,
+                i as u32,
             )
         } {
             // Unwind the allocations already created in this call, then the
