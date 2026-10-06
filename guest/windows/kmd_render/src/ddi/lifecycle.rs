@@ -226,6 +226,10 @@ fn start_generation_mirrors() {
     crate::ddi::flip_keep::publish_counters();
     // The stall-diagnosis block (`HpdLoopN`, `FlipIss`, `VsPendN`, ...): zeroed, `StartN` bumped,
     // written once. After the worker of the previous generation was stopped.
+    // The flip retire measurement and the announce knobs (`FlipLat`, `FlipAnnounce`,
+    // `FlipEarlyWake`), read and zeroed before the block above is first written.
+    crate::ddi::flip_lat::start_generation();
+    crate::ddi::flip_announce::start_generation();
     crate::ddi::stall_diag::start_generation();
 }
 

@@ -282,6 +282,8 @@ static FLIP_PUB_T: AtomicU32 = AtomicU32::new(0);
 /// newer flip replaced. An address the word cannot carry (zero, or 40 bits or more) clears the
 /// word instead, so an OLDER flip's address is never fired for this one (`FlipWdBig`).
 pub(crate) fn note_flip_issued(address: u64) {
+    // `FlipLat*` / `IfGap*` (`ddi::flip_lat`): the issue time of this flip, for its retire latency.
+    crate::ddi::flip_lat::note_issue(address);
     let seq = FLIP_ISS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     // The newest address dxgkrnl issued, for the restart seed (`restart_flip::seed_address`).
     // Never zeroed by a generation, and a zero address (nothing assigned) never replaces it.
@@ -1435,6 +1437,15 @@ pub(crate) fn publish_counters() {
     rec(b"FlipWd", WD_COUNT.load(Ordering::Relaxed));
     rec(b"FlipWdT", WD_T.load(Ordering::Relaxed));
     rec(b"FlipWdBig", WD_BIG.load(Ordering::Relaxed));
+    // The flip retire latency, the inter-flip interval, the vblank utilisation and the
+    // announce counters (`docs/kmd-rm-client.md` 15.18.15).
+    crate::ddi::flip_lat::publish_counters();
+    crate::ddi::flip_announce::publish_counters();
+}
+
+/// The HPD worker's current step (`site::*`), for the longest flip's breadcrumb.
+pub(crate) fn hpd_site() -> u32 {
+    HPD_SITE.load(Ordering::Relaxed)
 }
 
 /// Interrupt time (ms, never 0) of the last publication from an escape.
