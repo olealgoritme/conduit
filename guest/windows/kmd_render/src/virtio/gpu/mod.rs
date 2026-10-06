@@ -2555,6 +2555,7 @@ impl VirtioGpu {
     /// GET_DISPLAY_INFO scratch page; the rest of bring-up is MMIO and PCI
     /// config access. It is a by-value ZST, so it costs neither a register nor a
     /// stack slot in this measured 3.0 KB frame — see `crate::irql`.
+    #[inline(never)]
     pub fn init(
         passive: crate::irql::PassiveLevel,
         dxgkrnl: &DXGKRNL_INTERFACE,
