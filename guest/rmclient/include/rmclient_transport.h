@@ -314,6 +314,14 @@ int crm_win_scanout_status(uint32_t handle, uint64_t *released_seq, uint64_t *la
 int crm_win_scanout_wait_released(uint32_t handle, uint64_t seq, uint32_t timeout_ms,
                                   uint64_t *released_seq);
 
+/* The process's device-loss epoch (Conduit guest/windows/umd_common/bridge/
+ * helios_kmdmap.h, shared with the Venus ICD and the Helios UMD). It moves
+ * once when the KMD goes away under this process (a live driver update, a
+ * device restart): from then on the KMD's views of RM memory may be unmapped
+ * (they read as zeros if touched) and every escape fails with -ENODEV. A user
+ * records it when it starts and is lost once it differs. 0 off Windows. */
+int32_t crm_win_loss_epoch(void);
+
 /* The platform default transport (what crm_open(.., NULL) uses). */
 const struct crm_transport *crm_default_transport(void);
 

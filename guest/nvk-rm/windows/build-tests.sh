@@ -59,6 +59,7 @@ done
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/helios_icd_test.c" -o "$OUT_DIR/helios_icd_test.exe"
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/vk_rmfence_test.c" -o "$OUT_DIR/vk_rmfence_test.exe"
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/helios_share_test.c" -o "$OUT_DIR/helios_share_test.exe"
+"$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/vk_lost_test.c" -L"$OUT_DIR" -lvulkan-1 -o "$OUT_DIR/vk_lost_test.exe"
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/vk_loader_list.c" -static-libgcc -o "$OUT_DIR/vk_loader_list.exe"
 "$CC" -O1 -Wall "$here/wgl_test.c" -lopengl32 -lgdi32 -luser32 -lm -static-libgcc -o "$OUT_DIR/wgl_test.exe"
 
