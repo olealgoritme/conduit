@@ -378,7 +378,7 @@ refused as full) and `RelGone = FsFFull + FsFSkip (+ whatever left the book firs
 | `FsEndBy`, `FsEndGen`, `FsEndT` | `EndCause` code (table above), generation and time of the LAST end |
 | `FsPubT` | time of this publication: every `Fs*`/`Rel*`/`Nv*` value is a mirror written at an edge, so compare it with the uptime before reading anything as "unchanged" |
 | `FsDpcLps`, `FsXitEnd` | the two new end paths |
-| `WbStaleRdy`, `BlbAbandoned`, `VnRingWd`, `VnRingRt` | the Venus-side findings below |
+| `WbStaleRdy`, `BlbAbandoned`, `VnRingWd`, `VnRingSl`, `VnRingRt` | the Venus-side findings below |
 
 Publication edges: SET, RELEASE, the worker's lapse, every end by device teardown (new: it
 used to leave `FsEnd` unpublished until some later edge; an end by a closed file or the suppression
@@ -425,8 +425,10 @@ Venus present cannot touch it. The ~104 ms per frame is not the S4 queue.
    dump, still stalled, against a 7.8 minute ceiling, and the device restart that followed, fit.
    What makes the host stop consuming the ring is NOT determined (a dead process's Venus context
    teardown on the host is the suspect). Fix: the real clock bounds the wait as well
-   (`slice_budget`): 30 s of real time, then the existing fatal latch, with `VnRingWd` now the real
-   elapsed time and `VnRingRt` = 1 when the clock, not the count, ended it. Cost: a host that
+   (`slice_budget`): 30 s of real time, then the existing fatal latch, with `VnRingWd` now the larger of
+   the real elapsed time and the slice count, `VnRingSl` the slice count alone and `VnRingRt` = 1 when
+   the real time reached the budget first (which is nearly always: real time is a little ahead of the
+   count even with an exact 1 ms timer, so `VnRingRt` proves nothing; `VnRingSl` far below 30 000 does). Cost: a host that
    stalls the ring for 30 s to 7 minutes and then recovers used to come back and now latches the
    ring fatal (a device restart brings it back); healthy waits (milliseconds) are unchanged.
 3. **A blob sweep that stops at the first ambiguity (fixed).** `release_blobs_for_owner_within`
@@ -465,8 +467,9 @@ periods at 240 Hz happens to be 104.17 ms but nothing counts them.
    `kmd/stall-watchdog` lane).
 3. After a kill of a Venus windowed app that was slow and queued (Heaven at 5152x1440): `WbStaleRdy`
    (a healed wedge: expected 0 or small once, never growing), `BlbAbandoned` (0 unless a blit
-   was in flight), `VnRingWd` / `VnRingRt` (present only if a ring wait expired; `VnRingRt` 1
-   proves the quantum mismatch).
+   was in flight), `VnRingWd` / `VnRingSl` / `VnRingRt` (present only if a ring wait
+   expired; `VnRingSl` of about 2 000 against a budget of 30 000 with `VnRingWd` about 30 000 proves the
+   timer-quantum mismatch; `VnRingRt` alone does not).
 4. DWM present counts before and after a deliberate kill and a notepad window, as in
    `killrepro.sh`; a stall with `VnRingWd` absent for under 30 s of real time points at the ring wait
    (the latch fires at 30 s), a stall with `WfBBlt` rising points at item 1.
