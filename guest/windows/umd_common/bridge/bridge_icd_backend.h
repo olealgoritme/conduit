@@ -81,4 +81,26 @@ void* nvk_icd_get_instance_proc_addr();
 /// DLL is not loaded or lacks the export. `out` is caller storage.
 const helios_icd_api* nvk_icd_api(helios_icd_api* out);
 
+/// NVK applies the Helios ICD policy itself (Mesa patch 0032: `HELIOS_ICD`,
+/// `Icd`, `NvkDenyList`, `NvkAllowList`) when it first enumerates devices, and
+/// hides its GPU from a process that policy sends to Venus. It does not know
+/// the D3D12 levers, so with `HKLM\SOFTWARE\Helios!Icd=venus` and
+/// `HELIOS_ICD12=nvk` the UMD loads NVK and NVK enumerates no GPU. The UMD has
+/// already decided when it creates a device on the ICD it loaded itself, so for
+/// that scope this sets `HELIOS_ICD=nvk` (NVK reads it with
+/// GetEnvironmentVariableA) and restores the previous value afterwards. NVK
+/// latches its answer once per module, at that first enumeration.
+class NvkPolicyScope {
+ public:
+  NvkPolicyScope();
+  ~NvkPolicyScope();
+  NvkPolicyScope(const NvkPolicyScope&) = delete;
+  NvkPolicyScope& operator=(const NvkPolicyScope&) = delete;
+
+ private:
+  bool active_ = false;
+  bool had_ = false;
+  char saved_[32] = {};
+};
+
 }  // namespace helios_bridge

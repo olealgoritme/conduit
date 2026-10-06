@@ -360,6 +360,28 @@ void* nvk_icd_get_instance_proc_addr() {
   return g_nvk_gipa;
 }
 
+NvkPolicyScope::NvkPolicyScope() {
+  if (icd_backend_choice().backend != IcdBackend::NvkRm)
+    return;
+  const DWORD n = GetEnvironmentVariableA("HELIOS_ICD", saved_, sizeof(saved_));
+  had_ = n > 0 && n < sizeof(saved_);
+  if (had_ && _stricmp(saved_, "nvk") == 0)
+    return;
+  if (_putenv_s("HELIOS_ICD", "nvk") != 0)
+    return;
+  active_ = true;
+  umd_log(had_ ? "icd backend: HELIOS_ICD=nvk for NVK's own policy while the device is created "
+                 "(was set to another value)"
+               : "icd backend: HELIOS_ICD=nvk for NVK's own policy while the device is created");
+}
+
+NvkPolicyScope::~NvkPolicyScope() {
+  if (!active_)
+    return;
+  // An empty value removes the variable (_putenv_s semantics).
+  _putenv_s("HELIOS_ICD", had_ ? saved_ : "");
+}
+
 const helios_icd_api* nvk_icd_api(helios_icd_api* out) {
   std::call_once(g_nvk_load_once, load_nvk);
   if (!g_nvk_iface || !out)

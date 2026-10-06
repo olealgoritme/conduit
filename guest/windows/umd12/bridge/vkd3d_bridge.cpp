@@ -922,8 +922,14 @@ std::unique_ptr<HeliosVkd3dDevice> create_on_nvk(LUID luid, std::uint32_t minimu
     return {};
   }
   ID3D12Device* dev = nullptr;
-  const HRESULT hr = helios_vkd3d_create_device_icd(luid, gipa, __uuidof(ID3D12Device),
-                                                    reinterpret_cast<void**>(&dev));
+  HRESULT hr;
+  {
+    // NVK's own policy (Mesa 0032) would hide the GPU under Icd=venus even
+    // though HELIOS_ICD12=nvk chose NVK here.
+    helios_bridge::NvkPolicyScope policy;
+    hr = helios_vkd3d_create_device_icd(luid, gipa, __uuidof(ID3D12Device),
+                                        reinterpret_cast<void**>(&dev));
+  }
   if (FAILED(hr) || !dev) {
     char msg[160];
     std::snprintf(msg, sizeof(msg), "helios_vkd3d_create_device_icd failed hr=0x%08lx",
