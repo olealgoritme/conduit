@@ -110,6 +110,15 @@ static NO_ENTRY_SNAPSHOT: AtomicU32 = AtomicU32::new(0);
 static NO_ENTRY_SOURCE: AtomicU32 = AtomicU32::new(0);
 static NO_ENTRY_FC_OFF: AtomicU32 = AtomicU32::new(0);
 static NO_ENTRY_DST: AtomicU32 = AtomicU32::new(0);
+// `DxgkDdiPresent`'s own wall time, by arm (`PrDdi*`): where the Present cost sits, in this DDI or
+// in dxgkrnl before it calls us.
+static PRES_BLT_N: AtomicU32 = AtomicU32::new(0);
+static PRES_BLT_US: AtomicU32 = AtomicU32::new(0);
+static PRES_BLT_MAX: AtomicU32 = AtomicU32::new(0);
+static PRES_BLT: [AtomicU32; ba::BUCKETS] = [const { AtomicU32::new(0) }; ba::BUCKETS];
+static PRES_FLIP_N: AtomicU32 = AtomicU32::new(0);
+static PRES_FLIP_US: AtomicU32 = AtomicU32::new(0);
+static PRES_FLIP_MAX: AtomicU32 = AtomicU32::new(0);
 
 /// Interrupt time in 100 ns units; legal at any IRQL, no lock.
 pub(crate) fn now_100ns() -> u64 {
@@ -181,10 +190,16 @@ pub(crate) fn reset_for_start() {
         &NO_ENTRY_SOURCE,
         &NO_ENTRY_FC_OFF,
         &NO_ENTRY_DST,
+        &PRES_BLT_N,
+        &PRES_BLT_US,
+        &PRES_BLT_MAX,
+        &PRES_FLIP_N,
+        &PRES_FLIP_US,
+        &PRES_FLIP_MAX,
     ] {
         cell.store(0, Ordering::Relaxed);
     }
-    for cell in LAT.iter().chain(WAIT.iter()) {
+    for cell in LAT.iter().chain(WAIT.iter()).chain(PRES_BLT.iter()) {
         cell.store(0, Ordering::Relaxed);
     }
     SRC_BUSY.store(0, Ordering::Relaxed);
@@ -270,6 +285,17 @@ const LAT_NAMES: [&[u8]; ba::BUCKETS] = [
     b"BltAsyncLat7",
 ];
 
+const PRES_NAMES: [&[u8]; ba::BUCKETS] = [
+    b"PrDdiBlt0",
+    b"PrDdiBlt1",
+    b"PrDdiBlt2",
+    b"PrDdiBlt3",
+    b"PrDdiBlt4",
+    b"PrDdiBlt5",
+    b"PrDdiBlt6",
+    b"PrDdiBlt7",
+];
+
 const WAIT_NAMES: [&[u8]; ba::BUCKETS] = [
     b"BltWait0",
     b"BltWait1",
@@ -292,7 +318,9 @@ pub(crate) fn publish_counters() {
         | FAILED.load(Ordering::Relaxed)
         | SRC_BUSY.load(Ordering::Relaxed)
         | LOOK_N.load(Ordering::Relaxed)
-        | ENTRY_SEEN.load(Ordering::Relaxed);
+        | ENTRY_SEEN.load(Ordering::Relaxed)
+        | PRES_BLT_N.load(Ordering::Relaxed)
+        | PRES_FLIP_N.load(Ordering::Relaxed);
     if events == 0 {
         return;
     }
@@ -348,6 +376,31 @@ pub(crate) fn publish_counters() {
     rec(b"BltNoEntryFc", NO_ENTRY_FC_OFF.load(Ordering::Relaxed));
     rec(b"BltNoEntryS", NO_ENTRY_DST.load(Ordering::Relaxed));
     rec(b"BltNoEntryO", other);
+    rec(b"PrDdiBltN", PRES_BLT_N.load(Ordering::Relaxed));
+    rec(b"PrDdiBltUs", PRES_BLT_US.load(Ordering::Relaxed));
+    rec(b"PrDdiBltMax", PRES_BLT_MAX.load(Ordering::Relaxed));
+    for (name, cell) in PRES_NAMES.iter().zip(PRES_BLT.iter()) {
+        rec(name, cell.load(Ordering::Relaxed));
+    }
+    rec(b"PrDdiFlipN", PRES_FLIP_N.load(Ordering::Relaxed));
+    rec(b"PrDdiFlipUs", PRES_FLIP_US.load(Ordering::Relaxed));
+    rec(b"PrDdiFlipMax", PRES_FLIP_MAX.load(Ordering::Relaxed));
+}
+
+/// `DxgkDdiPresent` returned after `dt` (100 ns units, the whole exported DDI): a Blt arm (`blt`)
+/// or a flip arm. Atomics only, any IRQL; the Blt arm also keeps the histogram.
+pub(crate) fn note_present_wall(blt: bool, dt: u64) {
+    let us = ba::us32(dt);
+    if blt {
+        PRES_BLT_N.fetch_add(1, Ordering::Relaxed);
+        PRES_BLT_US.fetch_add(us, Ordering::Relaxed);
+        PRES_BLT_MAX.fetch_max(us, Ordering::Relaxed);
+        PRES_BLT[ba::lat_bucket(dt)].fetch_add(1, Ordering::Relaxed);
+    } else {
+        PRES_FLIP_N.fetch_add(1, Ordering::Relaxed);
+        PRES_FLIP_US.fetch_add(us, Ordering::Relaxed);
+        PRES_FLIP_MAX.fetch_max(us, Ordering::Relaxed);
+    }
 }
 
 // ---- counters, callable at any IRQL (atomics only) -----------------------------------------
