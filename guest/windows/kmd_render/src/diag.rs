@@ -645,8 +645,15 @@ pub mod knobs {
     /// The KMD's own RM client (`virtio::rm_client`, `docs/kmd-rm-client.md`): 1 =
     /// open an RM client over the forwarding path and allocate, export and import a
     /// video-memory surface of the VidPn primary's size (invisible); 2 = also map it,
-    /// paint a test picture and show it once through the KMD's own `ScanoutFlip`.
-    /// Read once per transport generation. Values above 2 count as 2.
+    /// paint a test picture and show it once through the KMD's own `ScanoutFlip`;
+    /// 3 = a ring of two such surfaces, and the composited desktop (the LINEAR
+    /// primary the display worker keeps current) is copied into the one not shown and
+    /// flipped, in place of Venus' `RESOURCE_FLUSH`, with Venus as the fallback
+    /// (`virtio::rm_present`, `docs/kmd-rm-client.md` section 13).
+    /// 4 = 3 plus each ring surface imported as a foreign resource under the KMD's own
+    /// owner (the resource id a WDDM allocation adopts, `docs/kmd-rm-client.md` section
+    /// 14). Read once per transport generation. Values above 4 count as 4 (before level 3
+    /// existed, 3 and more counted as 2: a service key left at 3 turns the ring on).
     pub const KMD_RM_CLIENT: KnobName = KnobName::new(b"KmdRmClient");
     /// `BindFlushMode` (default 0). Selects when the bind edge tells the host
     /// to READ the freshly bound primary (ROADMAP defect 0ab-B):

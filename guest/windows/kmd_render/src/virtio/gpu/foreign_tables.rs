@@ -119,6 +119,36 @@ impl VirtioGpu {
         }
     }
 
+    /// [`Self::foreign_begin_import`] for the KMD's OWN import of a surface its RM
+    /// client made (`DeviceOwner::KMD_RM`, `virtio/rm_foreign.rs`): the DRM file is the
+    /// client's, and the holder context must be the KMD's own Venus context
+    /// (`kmd_ctx`, the transport generation's), which is not a device-owned context
+    /// and so cannot be resolved the way a user context is.
+    pub fn foreign_begin_kmd_import(
+        &mut self,
+        rm_handle: u32,
+        ctx_id: u32,
+        kmd_ctx: u32,
+        size: u64,
+    ) -> ForeignBegin {
+        let owner = DeviceOwner::KMD_RM;
+        match self.nvrm_handle_device_type(owner, rm_handle) {
+            Some(t) if t >= NVRM_DEVICE_TYPE_DRM_MIN => {}
+            _ => {
+                self.foreign.note_refusal(RefusalKind::NotOwned);
+                return ForeignBegin::NotOwned;
+            }
+        }
+        if ctx_id == 0 || ctx_id != kmd_ctx {
+            self.foreign.note_refusal(RefusalKind::BadContext);
+            return ForeignBegin::BadContext;
+        }
+        match self.foreign.reserve(owner.raw() as u64, size) {
+            Ok(r) => ForeignBegin::Reserved(r),
+            Err(q) => ForeignBegin::Quota(q),
+        }
+    }
+
     /// The host created the resource: record it against the reservation, if the
     /// state it was made under still holds. Consumes the reservation on every
     /// path.
@@ -189,6 +219,15 @@ impl VirtioGpu {
             .get(resource_id)
             .and_then(|e| e.creator.map(|c| (c, e.ctx_id)))
         {
+            // The KMD's own import (`foreign_begin_kmd_import`): its holder context was
+            // proven to be the KMD's own Venus context at the import and lives as long
+            // as the transport generation the record does; the slot is KMD_RM's.
+            Some((creator, ctx_id)) if creator == DeviceOwner::KMD_RM.raw() as u64 => (
+                ctx_id != 0,
+                self.blobs
+                    .iter()
+                    .any(|s| s.resource_id == resource_id && s.owner == Some(DeviceOwner::KMD_RM)),
+            ),
             Some((creator, ctx_id)) => {
                 let owner = DeviceOwner::new(creator as usize);
                 (

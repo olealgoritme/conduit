@@ -15,7 +15,12 @@
 //!   ([`AdapterContext::request_scanout_refresh`]); the worker reports it queued
 //!   through [`AdapterContext::foreign_scanout_desktop_flushed`];
 //! * teardown hooks (`Close` of the DRM file, `close_all_for_owner`, transport
-//!   reset) and the lapse timer the HPD worker polls.
+//!   reset) and the lapse timer the HPD worker polls;
+//! * the KMD's RESIDENT source (`KmdRmClient` = 3, `virtio/rm_present.rs`): it
+//!   suppresses the desktop exactly as a user source does, every flush it withholds
+//!   is a frame for the presenter to copy and flip, a user source preempts it, and
+//!   when that one ends the restore is a re-flip of the resident surface
+//!   ([`AdapterContext::foreign_scanout_restore_desktop`]) instead of a Venus flush.
 //!
 //! LOCKING. `STATE` is a LEAF spinlock: its holders call nothing but the pure
 //! state machine (no allocation, no other lock, no wait). It is taken at PASSIVE
@@ -28,7 +33,8 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use helios_kmd_logic::foreign_scanout::{
-    Flip, ForeignScanout, Layout, Poll, PresentError, ReleaseOutcome, SetError, SetKind, SetOutcome,
+    Flip, ForeignScanout, Layout, Poll, PresentError, ReleaseOutcome, ResidentDrop,
+    ResidentOutcome, SetError, SetKind, SetOutcome,
 };
 use helios_kmd_logic::rm_fence_present::{Attach, QEntry, ScanoutQueue};
 
@@ -182,6 +188,13 @@ impl AdapterContext {
     /// reuse protection is the read ledger, which retires per token, not this).
     fn foreign_scanout_restore_desktop(&self) {
         self.release_all_scanout_leases(LeaseEnd::Cancelled);
+        // A user source ended and the KMD's own resident source has scanout 0 again:
+        // the screen is owed a re-flip of ITS surface, not a Venus flush (which the
+        // gate would withhold anyway). Atomics and an event: legal where this is.
+        if STATE.lock().take_resume_owed() {
+            crate::virtio::rm_present::note_resume_edge(self);
+            return;
+        }
         self.request_scanout_refresh();
         // The source ended: its queued fenced flips are dropped (and their fences
         // closed) by the worker's next pass.
@@ -212,6 +225,9 @@ impl AdapterContext {
                 FS_SETS.fetch_add(1, Ordering::Relaxed);
                 if o.kind == SetKind::TookOver {
                     FS_TAKEOVERS.fetch_add(1, Ordering::Relaxed);
+                }
+                if o.kind == SetKind::Preempted {
+                    crate::virtio::rm_present::note_preempted();
                 }
             }
             Err(_) => {
@@ -294,17 +310,38 @@ impl AdapterContext {
 
     /// Device teardown (`DestroyDevice`, `StopDevice`): the owner is gone.
     pub(crate) fn foreign_scanout_release_owner(&self, owner: DeviceOwner) {
-        if STATE.lock().release_owner(owner.raw() as u64) {
-            FS_ENDED.fetch_add(1, Ordering::Relaxed);
+        let (ended, was_resident) = {
+            let mut g = STATE.lock();
+            let was = g.resident_foreground();
+            (g.release_owner(owner.raw() as u64), was)
+        };
+        if ended {
+            self.count_end(was_resident);
             self.foreign_scanout_restore_desktop();
         }
     }
 
     /// The owner closed `handle` (a successful forwarded `Close`).
     pub(crate) fn foreign_scanout_release_handle(&self, owner: DeviceOwner, handle: u32) {
-        if STATE.lock().release_handle(owner.raw() as u64, handle) {
-            FS_ENDED.fetch_add(1, Ordering::Relaxed);
+        let (ended, was_resident) = {
+            let mut g = STATE.lock();
+            let was = g.resident_foreground();
+            (g.release_handle(owner.raw() as u64, handle), was)
+        };
+        if ended {
+            self.count_end(was_resident);
             self.foreign_scanout_restore_desktop();
+        }
+    }
+
+    /// A source ended by teardown or an invalid handle: the resident source has its own
+    /// counter (`RmResEnd`), so `FsSet - FsRel - FsLapse - FsEnd - FsTake` stays the
+    /// number of USER sources live.
+    fn count_end(&self, was_resident: bool) {
+        if was_resident {
+            crate::virtio::rm_present::RM_RES_ENDED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            FS_ENDED.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -312,8 +349,13 @@ impl AdapterContext {
     /// with them, are gone. Called from `reset_display_publication_state`, which
     /// rebuilds the display state from scratch, so no restore is owed.
     pub(crate) fn foreign_scanout_reset(&self) {
-        if STATE.lock().reset() {
-            FS_ENDED.fetch_add(1, Ordering::Relaxed);
+        let (ended, was_resident) = {
+            let mut g = STATE.lock();
+            let was = g.resident_foreground();
+            (g.reset(), was)
+        };
+        if ended {
+            self.count_end(was_resident);
         }
         // Queued fenced flips die with the transport; their fence handles are
         // closed by the transport sweep.
@@ -356,12 +398,21 @@ impl AdapterContext {
         });
         if !valid {
             if STATE.lock().invalidate(src.generation) {
-                FS_ENDED.fetch_add(1, Ordering::Relaxed);
+                self.count_end(src.resident);
                 self.foreign_scanout_restore_desktop();
             }
             return false;
         }
         FS_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        if src.resident {
+            // The desktop wanted a flush and the KMD's own source is what is on screen:
+            // that flush is a frame to copy and flip, which the worker does next.
+            crate::virtio::rm_present::note_frame_edge(self);
+        } else {
+            // A user source is on screen: a parked resident source is out of date, and
+            // owes a fresh frame when the user source ends.
+            crate::virtio::rm_present::note_desktop_changed();
+        }
         true
     }
 
@@ -385,13 +436,66 @@ impl AdapterContext {
     }
 
     /// For the HPD worker's wait: how long, as a negative relative `KeWait` timeout
-    /// in 100 ns units, until the live source lapses; `None` with no live source.
+    /// in 100 ns units, until the live source lapses or the presenter's next paced
+    /// frame is due; `None` when neither waits.
     pub(crate) fn foreign_scanout_wait_100ns(&self) -> Option<i64> {
-        let deadline = STATE.lock().next_deadline()?;
-        let remaining = deadline.saturating_sub(now_100ns());
-        // At least 1 ms (a due deadline must not spin the worker), at most an hour.
-        let remaining = remaining.clamp(10_000, 36_000_000_000);
-        Some(-(remaining as i64))
+        let deadline = STATE.lock().next_deadline();
+        let frame_at = crate::virtio::rm_present::wake_at();
+        if deadline.is_none() && frame_at == 0 {
+            // The common case (no source, no paced frame): no clock read.
+            return None;
+        }
+        let now = now_100ns();
+        let lapse = deadline.map(|deadline| {
+            // At least 1 ms (a due deadline must not spin the worker), at most an hour.
+            let remaining = deadline.saturating_sub(now).clamp(10_000, 36_000_000_000);
+            -(remaining as i64)
+        });
+        let frame = (frame_at != 0).then(|| {
+            // At least 1 ms, at most a second.
+            let remaining = frame_at.saturating_sub(now).clamp(10_000, 10_000_000);
+            -(remaining as i64)
+        });
+        // Both are relative (negative) 100 ns units: the earlier is the larger.
+        match (lapse, frame) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Register the KMD's resident source (`KmdRmClient` = 3): see
+    /// `helios_kmd_logic::foreign_scanout::ForeignScanout::resident_set`. PASSIVE.
+    pub(crate) fn foreign_scanout_resident_set(
+        &self,
+        owner: DeviceOwner,
+        handle: u32,
+        epoch: u64,
+        layout: Layout,
+    ) -> Result<ResidentOutcome, SetError> {
+        let now = now_100ns();
+        let result = STATE
+            .lock()
+            .resident_set(owner.raw() as u64, handle, epoch, layout, now);
+        if result.is_err() {
+            FS_REFUSED.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// The KMD withdraws its resident source: when it was on screen, the desktop is
+    /// owed one flush. PASSIVE.
+    pub(crate) fn foreign_scanout_resident_drop(&self) -> ResidentDrop {
+        let result = STATE.lock().resident_drop();
+        if result == ResidentDrop::Ended {
+            self.foreign_scanout_restore_desktop();
+        }
+        result
+    }
+
+    /// `(a resident source is registered, it is the foreground source)`.
+    pub(crate) fn foreign_scanout_resident_state(&self) -> (bool, bool) {
+        let g = STATE.lock();
+        (g.resident().is_some(), g.resident_foreground())
     }
 
     // ---- fenced presents (`docs/rm-fence-marker.md`, carrier (a)) -----------------
