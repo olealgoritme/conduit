@@ -347,6 +347,11 @@ pub unsafe extern "C" fn dxgkddi_escape(
     // deadlock rather than a new one. Counted by `IrqlBad` if that ever changes.
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
 
+    // The stall-diagnosis block (`ddi::stall_diag`), at most twice a second, on THIS thread: every
+    // other mirror runs on the HPD worker (the `Nv*` mirror an escape asks for included), so a
+    // stuck worker leaves them stale. One clock read and one load when nothing is due.
+    crate::ddi::stall_diag::publish_from_escape();
+
     match hdr.cmd_type {
         HELIOS_ESCAPE_SNAPSHOT_STATUS => {
             let status = escape_snapshot_status(passive, adapter, buf, &hdr, args.hDevice, args.hContext);

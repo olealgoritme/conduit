@@ -34,6 +34,7 @@ pub(crate) mod scanout_trace;
 mod scheduler;
 pub(crate) mod segment_table;
 pub(crate) mod shared_placeholder;
+pub(crate) mod stall_diag;
 pub(crate) mod submit_command;
 pub(crate) mod vidpn;
 pub(crate) mod wddm_surface;

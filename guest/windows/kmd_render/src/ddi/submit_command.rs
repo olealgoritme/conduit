@@ -307,6 +307,10 @@ pub(crate) fn publish_nvrm_counters() {
     // A flip of a foreign primary completed without a bind (`kept_picture`): `FkKeep`, the lane
     // split `FkWorker` / `FkDma` / `FkAsync`, the last reason `FkWhy`, written once one happened.
     crate::ddi::flip_keep::publish_counters();
+    // The stall-diagnosis block: HPD worker breadcrumbs, flips issued / published, the vsync
+    // pending run, `StartN` (`ddi::stall_diag`). The escape thread also writes it directly
+    // (`publish_from_escape`), so it refreshes when this worker-run mirror cannot.
+    crate::ddi::stall_diag::publish_counters();
     // Cross-client hardening of forwarded RM ioctls (`NvDupHarden`): clients recorded /
     // dropped / refused for room (`NvCli*`), and requests that named a client or file
     // that is not the caller's (`NvDup*`). Nonzero `NvDupDeny` / `NvDupWould` outside a
@@ -1176,6 +1180,8 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
         if let Some(address) =
             unsafe { crate::ddi::present_packet::PresentFlipPrivate::take_keep(base, total) }
         {
+            // A flip dxgkrnl issued (`FlipIss`), completed here by the keep record.
+            crate::ddi::stall_diag::note_flip_issued();
             let _ = crate::ddi::flip_keep::keep(
                 adapter,
                 address,
@@ -1185,6 +1191,8 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
         }
         return;
     };
+    // A flip dxgkrnl issued (`FlipIss`): the DMA lane's counterpart of `SetVidPnSourceAddress`.
+    crate::ddi::stall_diag::note_flip_issued();
     // NOTE (0ab-B, 22.22.210.0): capturing the completion boundary HERE was
     // tried and MEASURED NOT TO WORK. dxgkrnl submits a flip about a frame
     // after the app presented, so `next_wire_fence` at this point already

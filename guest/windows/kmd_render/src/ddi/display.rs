@@ -1922,6 +1922,8 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     let primary_segment = unsafe { (*address).PrimarySegment };
     let primary_address = unsafe { (*address).PrimaryAddress.QuadPart as u64 };
     let primary_flags = unsafe { (*address).Flags.__bindgen_anon_1.Value };
+    // `FlipIss` (`ddi::stall_diag`): a flip dxgkrnl issued. Atomics only, legal at DIRQL.
+    crate::ddi::stall_diag::note_flip_issued();
 
     // Dxgkrnl's MMIO-flip path invokes this DDI under DxgkCbSynchronizeExecution
     // at DIRQL. At that IRQL it is illegal to write registry diagnostics, wait on
@@ -2063,6 +2065,8 @@ pub(crate) unsafe fn arm_dma_flip_programming(
         crate::ddi::scanout_trace::note_ddi_pair_failed();
         return false;
     }
+    // The watchdog's record of this flip, before the raise (see `set_vidpn_source_address_dirql`).
+    crate::ddi::stall_diag::note_flip_pending(primary_address);
     let _ticket = adapter.raise_programming_gate();
     let previous = adapter
         .pending_vidpn_allocation
@@ -2337,6 +2341,10 @@ unsafe fn set_vidpn_source_address_dirql(
     // address until this primary has actually been published; that is the
     // scanout pipeline's truthful current address.
     //
+    // The watchdog's record of this flip (`ddi::stall_diag::note_flip_pending`: the address as
+    // one packed word; atomics only, legal at DIRQL), BEFORE the raise so a tick that sees the
+    // gate never pairs it with an older flip's word.
+    crate::ddi::stall_diag::note_flip_pending(primary_address);
     // Raising bumps the generation and sets the active flag in ONE publication,
     // so a completion can tell which interval it belongs to.
     let _ticket = adapter.raise_programming_gate();
@@ -2352,6 +2360,9 @@ pub(crate) fn process_deferred_vidpn_source_address(
     adapter: &AdapterContext,
 ) {
     let status = adapter.with_scanout_lifecycle(passive, |lock| {
+        // Stall breadcrumb (HPD worker only): the scanout mutex is held now, so a worker stuck
+        // here is inside the programming, and one stuck one id earlier is waiting for the mutex.
+        crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::DEFERRED_LOCKED);
         let raw = adapter.pending_vidpn_allocation.swap(0, Ordering::AcqRel);
         if raw == 0 {
             return None;
@@ -2421,6 +2432,24 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
             STATUS_SUCCESS
         }
         Ok(ScanoutOutcome::Deferred) => {
+            // `DeferBudget` (`ddi::stall_diag`, default 0 = unlimited: this arm is then exactly
+            // what it was, `defer_note` touches nothing). With a budget, the attempt that spends
+            // it publishes the flip's address KEPT (any class, `FkDefBud`) and lowers the gate
+            // instead of re-arming, the way the refusal retry gives up below. The risk is the
+            // documented one: the producer boundary or the busy publication this attempt waits
+            // for may retire a moment later, and the kept address then names a picture that was
+            // never shown; the screen keeps what it had.
+            if matches!(
+                crate::ddi::stall_diag::defer_note(h_alloc as usize),
+                helios_kmd_logic::stall_diag::DeferDecision::Exhausted
+            ) {
+                release_leases_for_reject(adapter);
+                unsafe { keep_after_defer_budget(adapter, h_alloc) };
+                if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+                    interval.retain_for_retry();
+                }
+                return STATUS_SUCCESS;
+            }
             // A newer DIRQL flip may have filled the one pending slot after this
             // worker took `h_alloc`. Never overwrite that exact newer handle,
             // but keep the programming gate raised for whichever handle now owns
@@ -2472,13 +2501,15 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
                         // A foreign primary's flip still completes (kept picture): before this
                         // exit it was held forever and the compositor blocked behind it. A
                         // Venus allocation keeps the old address, as it always did.
-                        unsafe {
+                        let completed = unsafe {
                             complete_foreign_flip_of(
                                 adapter,
                                 h_alloc,
                                 reject.flip_outcome(false),
                             )
                         };
+                        // `FlipWdogMs` only: a Venus flip leaves here too (`FkVenus`).
+                        unsafe { keep_venus_exit_under_watchdog(adapter, h_alloc, completed) };
                         if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
                             interval.retain_for_retry();
                         }
@@ -2491,7 +2522,11 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
                 release_leases_for_reject(adapter);
                 // Same completion for a foreign primary (an extent that is not the mode's, a
                 // layout or format the host cannot take): kept picture, nothing for Venus.
-                unsafe { complete_foreign_flip_of(adapter, h_alloc, reject.flip_outcome(false)) };
+                let completed = unsafe {
+                    complete_foreign_flip_of(adapter, h_alloc, reject.flip_outcome(false))
+                };
+                // `FlipWdogMs` only: a Venus flip leaves here too (`FkVenus`).
+                unsafe { keep_venus_exit_under_watchdog(adapter, h_alloc, completed) };
                 if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
                     interval.retain_for_retry();
                 }
@@ -2734,6 +2769,44 @@ unsafe fn complete_foreign_flip_of(
     )
 }
 
+/// A Deferred programming spent its `DeferBudget`: publish the flip's address kept, for any class
+/// of allocation (`FkDefBud`). A handle that no longer resolves publishes nothing.
+///
+/// # Safety
+/// `h_alloc` is the exact allocation handle Windows published, as for [`program_vidpn_source`].
+unsafe fn keep_after_defer_budget(adapter: &AdapterContext, h_alloc: HANDLE) {
+    if let Some((_, address)) =
+        unsafe { crate::ddi::create_allocation::flip_completion_info(adapter, h_alloc) }
+    {
+        crate::ddi::flip_keep::keep_defer_budget(adapter, address);
+    }
+}
+
+/// `FlipWdogMs` only: the direct exits of the programming (a spent refusal-retry budget, a
+/// permanent reject) complete no flip of a VENUS allocation by default
+/// (`flip_completion::decide` answers `None`, byte-identical to before). With the watchdog knob
+/// on they publish the address kept for it too (`FkVenus`), so a Venus flip that can never be
+/// shown does not hold dxgkrnl for the watchdog's interval. `completed`: the foreign / hollow
+/// completion already published (nothing more to do). The kept address names a picture that is
+/// not on the screen. PASSIVE, under the scanout lifecycle lock.
+///
+/// # Safety
+/// `h_alloc` is the exact allocation handle Windows published, as for [`program_vidpn_source`].
+unsafe fn keep_venus_exit_under_watchdog(
+    adapter: &AdapterContext,
+    h_alloc: HANDLE,
+    completed: bool,
+) {
+    if completed || !crate::ddi::stall_diag::watchdog_on() {
+        return;
+    }
+    if let Some((FlipSource::Venus, address)) =
+        unsafe { crate::ddi::create_allocation::flip_completion_info(adapter, h_alloc) }
+    {
+        crate::ddi::flip_keep::keep_venus_exit(adapter, address);
+    }
+}
+
 /// Retry attempts allowed for one primary before its programming interval is
 /// dropped while VSync continues reporting the truthful old address.
 ///
@@ -2788,6 +2861,9 @@ fn clear_retry_state() {
     use core::sync::atomic::Ordering::Relaxed;
     RETRY_HANDLE.store(0, Relaxed);
     RETRY_ATTEMPTS.store(0, Relaxed);
+    // The same for the Deferred budget (`DeferBudget`): a primary that programmed or failed for
+    // good starts the next one from a full budget. Two relaxed stores; no knob involved.
+    crate::ddi::stall_diag::clear_defer_state();
 }
 
 /// What a successful deferred programming did, and therefore who owns the gate.

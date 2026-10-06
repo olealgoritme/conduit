@@ -652,6 +652,21 @@ pub mod knobs {
     /// Read once per boot. Flip the default to 1 after a real NVK run shows `NvCliRec` close
     /// to `NvOpen`, `NvDupWould` 0 and `NvDupDoubt` small.
     pub const NV_DUP_HARDEN: KnobName = KnobName::new(b"NvDupHarden");
+    /// `FlipWdogMs` (default 0 = off). The opt-in flip watchdog (`ddi::stall_diag`,
+    /// `docs/zero-copy-present.md` "Stall diagnosis"): when a pending flip has gone this many
+    /// milliseconds (in vsync ticks) with no address published, the vsync DPC publishes the
+    /// flip's address as a KEPT picture (for any class of allocation, Venus included), and the
+    /// Venus direct exits (a spent retry budget, a permanent reject) publish kept too. The kept
+    /// address names a picture that is not on the screen: a diagnostic and recovery valve, not a
+    /// completion. Nonzero values are clamped to 50..60000. Read at every StartDevice; mirrored
+    /// as `FlWdMsEff`.
+    pub const FLIP_WDOG_MS: KnobName = KnobName::new(b"FlipWdogMs");
+    /// `DeferBudget` (default 0 = unlimited, today's behaviour). The most Deferred programming
+    /// attempts of one primary (about one per vsync tick) before the worker publishes the flip's
+    /// address kept and lowers the gate instead of retrying again (`FkDefBud`). 240 is about
+    /// four seconds at 60 Hz. Nonzero values are clamped to 16..4000000. Read at every
+    /// StartDevice; mirrored as `DefBudEff`.
+    pub const DEFER_BUDGET: KnobName = KnobName::new(b"DeferBudget");
     /// Segment topology. Legal values 0 and 10 only — see `BarSegTopology`.
     pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
     /// CpuVisible cached-allocation kill switch (default 1 = cached).

@@ -25,6 +25,13 @@
 //! (`SetVidPnSourceAddress` for an unpaired handle); `FkWhy` the last reason (`KeepWhy::code`);
 //! `FkKeep01`..`FkKeep08` per reason; `FkDmaRec` the DMA
 //! Presents that wrote a keep record (the Present side of `FkDma`).
+//!
+//! Two more `Fk` counters are NOT flip completions and are in neither `FkKeep` nor `FkWhy`: they
+//! count the opt-in exits of the stall diagnosis lane (`ddi/stall_diag.rs`,
+//! `docs/zero-copy-present.md` "Stall diagnosis"). `FkDefBud`: a Deferred programming that spent
+//! its `DeferBudget` and had its flip's address published kept, any class. `FkVenus`: a Venus
+//! flip's GaveUp or permanent reject that published kept, only with `FlipWdogMs` on. Both are
+//! written at PASSIVE on the event (they are rare) and mirrored with the block.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -123,13 +130,55 @@ pub(crate) fn note_placeholder_flip() {
     }
 }
 
+/// Deferred programmings past their `DeferBudget` that published the address kept (`FkDefBud`),
+/// and Venus GaveUp / permanent-reject exits that did so under `FlipWdogMs` (`FkVenus`).
+static DEFER_BUDGET_EXITS: AtomicU32 = AtomicU32::new(0);
+static VENUS_EXITS: AtomicU32 = AtomicU32::new(0);
+
+/// Publish `address` kept because a Deferred programming spent its `DeferBudget`, for ANY class
+/// of allocation, and count it (`FkDefBud`). PASSIVE (the HPD worker). A zero address publishes
+/// nothing and counts nothing. The screen keeps whatever it showed: see the risk in
+/// `docs/zero-copy-present.md`, "Stall diagnosis".
+pub(crate) fn keep_defer_budget(adapter: &AdapterContext, address: u64) -> bool {
+    let Some(address) = fc::keep_address(address) else {
+        return false;
+    };
+    adapter.publish_kept_primary(address);
+    let n = DEFER_BUDGET_EXITS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    crate::diag::record_named_bytes(b"FkDefBud", n);
+    true
+}
+
+/// Publish `address` kept for a VENUS flip that left the programming by GaveUp or a permanent
+/// reject, under `FlipWdogMs` only (the caller checks), and count it (`FkVenus`). PASSIVE.
+pub(crate) fn keep_venus_exit(adapter: &AdapterContext, address: u64) -> bool {
+    let Some(address) = fc::keep_address(address) else {
+        return false;
+    };
+    adapter.publish_kept_primary(address);
+    let n = VENUS_EXITS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    crate::diag::record_named_bytes(b"FkVenus", n);
+    true
+}
+
 /// The `Fk*` block owes the service key one full write (zeros included) for this StartDevice.
 static MIRROR_PENDING: AtomicU32 = AtomicU32::new(1);
 
 /// A new generation (StartDevice): zero the counters and owe the zero block, so values from an
 /// earlier run in the service key are never read as this one's. PASSIVE.
 pub(crate) fn reset_for_start() {
-    for c in [&KEPT, &LAST_WHY, &WORKER, &DMA, &ASYNC, &DDI, &DMA_RECORDS, &PH_FLIPS] {
+    for c in [
+        &KEPT,
+        &LAST_WHY,
+        &WORKER,
+        &DMA,
+        &ASYNC,
+        &DDI,
+        &DMA_RECORDS,
+        &PH_FLIPS,
+        &DEFER_BUDGET_EXITS,
+        &VENUS_EXITS,
+    ] {
         c.store(0, Ordering::Relaxed);
     }
     for c in &BY_WHY {
@@ -146,10 +195,20 @@ pub(crate) fn publish_counters() {
     let kept = KEPT.load(Ordering::Relaxed);
     let records = DMA_RECORDS.load(Ordering::Relaxed);
     let placeholders = PH_FLIPS.load(Ordering::Relaxed);
+    let defer_exits = DEFER_BUDGET_EXITS.load(Ordering::Relaxed);
+    let venus_exits = VENUS_EXITS.load(Ordering::Relaxed);
     let owed = MIRROR_PENDING.swap(0, Ordering::AcqRel) != 0;
-    if kept == 0 && records == 0 && placeholders == 0 && !owed {
+    if kept == 0
+        && records == 0
+        && placeholders == 0
+        && defer_exits == 0
+        && venus_exits == 0
+        && !owed
+    {
         return;
     }
+    rec(b"FkDefBud", defer_exits);
+    rec(b"FkVenus", venus_exits);
     rec(b"FkPhFlip", placeholders);
     rec(b"FkKeep", kept);
     rec(b"FkWhy", LAST_WHY.load(Ordering::Relaxed));

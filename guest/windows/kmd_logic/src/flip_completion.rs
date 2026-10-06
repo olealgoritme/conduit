@@ -308,11 +308,15 @@ pub const WORKER_FLIP_TIMEOUT_MS: u64 = 250;
 /// `FkDdi` by `SetVidPnSourceAddress` itself (an unpaired handle), `FkDmaRec` the DMA Presents
 /// that wrote a keep record, `FkPhFlip` flips of a host-less placeholder the Present completed;
 /// `FkWhy` the last reason ([`KeepWhy::code`]); `FkKeep01`..`FkKeep08`
-/// per reason.
-pub const COUNTERS: [&str; 16] = [
+/// per reason. `FkDefBud` and `FkVenus` are NOT flip completions: they count the two opt-in
+/// diagnostic exits of `stall_diag` (a Deferred programming past its `DeferBudget` published
+/// kept, and a Venus GaveUp / permanent reject published kept under `FlipWdogMs`); neither is in
+/// `FkKeep` or `FkWhy`.
+pub const COUNTERS: [&str; 18] = [
     "FkKeep", "FkWhy", "FkWorker", "FkDma", "FkAsync", "FkDdi", "FkDmaRec", "FkPhFlip", "FkKeep01",
     "FkKeep02",
     "FkKeep03", "FkKeep04", "FkKeep05", "FkKeep06", "FkKeep07", "FkKeep08",
+    "FkDefBud", "FkVenus",
 ];
 
 /// Name of the per-reason counter: `FkKeep01` .. `FkKeep08`.
