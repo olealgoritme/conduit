@@ -25,6 +25,8 @@
 #include "bridge_icd_backend.h"
 #include "helios_icd_interface.h"
 
+extern "C" int32_t helios_kmdmap_c_epoch(void);
+
 namespace helios_bridge {
 
 namespace {
@@ -486,6 +488,13 @@ IcdBackendChoice decide() {
 std::once_flag g_choice_once;
 IcdBackendChoice g_choice;
 std::atomic<bool> g_nvk_failed{false};
+// The process's loss epoch (helios_kmdmap.h) when NVK failed. A failure is a
+// latch for the process, except across a driver update or device restart:
+// once the epoch moved, the next device creation tries NVK again
+// (librmclient reopens the KMD in a new generation), so a long-lived process
+// (explorer, the shell hosts, DWM) comes back to NVK instead of staying on
+// Venus, whose surfaces an NVK DWM cannot compose.
+std::atomic<int32_t> g_nvk_failed_epoch{0};
 
 std::once_flag g_nvk_load_once;
 HMODULE g_nvk_module = nullptr;
@@ -576,12 +585,26 @@ bool is_dwm_process() {
 
 IcdBackend effective_icd_backend() {
   const IcdBackendChoice& c = icd_backend_choice();
+  if (c.backend == IcdBackend::NvkRm && g_nvk_failed.load(std::memory_order_acquire)) {
+    const int32_t now = helios_kmdmap_c_epoch();
+    const int32_t then = g_nvk_failed_epoch.load(std::memory_order_acquire);
+    if (now != then && g_nvk_failed.exchange(false, std::memory_order_acq_rel)) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+                    "icd backend: the KMD restarted since NVK failed (loss epoch %d -> %d); "
+                    "NVK again for this process", int(then), int(now));
+      umd_log(msg);
+      if (is_dwm_process() && c.reason && std::strstr(c.reason, "DwmIcd"))
+        dwm_marker_create();
+    }
+  }
   if (c.backend == IcdBackend::NvkRm && !g_nvk_failed.load(std::memory_order_acquire))
     return IcdBackend::NvkRm;
   return IcdBackend::Venus;
 }
 
 void note_nvk_failed(const char* why) {
+  g_nvk_failed_epoch.store(helios_kmdmap_c_epoch(), std::memory_order_release);
   if (!g_nvk_failed.exchange(true, std::memory_order_acq_rel)) {
     dwm_marker_drop();
     char msg[256];
