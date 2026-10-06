@@ -1620,14 +1620,23 @@ pub unsafe extern "C" fn dxgkddi_preempt_command(
     // The one-critical-section rationale now lives on
     // `abandon_pending_submissions`, where DxgkDdiResetEngine's reader can see
     // it too.
-    abandon_pending_submissions(
+    let (dropped, status) = abandon_pending_submissions(
         adapter,
         AbandonOutcome::Preempted {
             dxgkrnl,
             fence: preempt.PreemptionFenceId,
         },
-    )
-    .1
+    );
+    // Breadcrumbs (`PreFence`, `PreLastCmp`, `PreDropped`, `PreStatus`, `PreT`; atomics only,
+    // DISPATCH): the 333 wedge began with two preemptions and a scheduler that never submitted
+    // again; what the last one was told and what it dropped is the first thing to read.
+    crate::ddi::escape_wait::note_preempt(
+        preempt.PreemptionFenceId,
+        adapter.completed_fence(),
+        dropped,
+        status as u32,
+    );
+    status
 }
 
 /// `DxgkDdiResetFromTimeout` — TDR recovery. There is no hardware engine state

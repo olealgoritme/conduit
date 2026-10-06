@@ -207,6 +207,16 @@ fn reread_cached_knobs() {
     let _ = crate::virtio::ctrl::reread_spin_knob();
     // `FlipWdogMs` and `DeferBudget` (`FlWdMsEff`, `DefBudEff`): 0 = off, today's behaviour.
     crate::ddi::stall_diag::reread_knobs();
+    // `EscWaitMs`, and the stopping flag back down: a new generation begins (v334).
+    crate::ddi::escape_wait::reread_knobs();
+    // `RmGateMs` (default 6000, 0 = never): the RM gates' lost-fire valve, mirrored `RmGateMsEff`.
+    crate::virtio::gpu::RMG_EXPIRE_MS.store(
+        helios_kmd_logic::rm_fence_present::clamp_gate_expire_ms(crate::diag::read_config_dword(
+            crate::diag::knobs::RM_GATE_MS,
+            helios_kmd_logic::rm_fence_present::GATE_EXPIRE_DEFAULT_MS,
+        )),
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// After the previous transport's state was forgotten (`retire_transport`): the new generation's
@@ -629,6 +639,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 #[inline(never)]
 pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_void) -> NTSTATUS {
     crate::kmsg(c"Helios: StopDevice\n");
+    // FIRST, before anything below can wait on something an escape holds: every escape in flight
+    // gives up at its next wait slice (at most 100 ms) and releases its locks, and none starts
+    // (v334, `ddi::escape_wait`). Atomic store, any IRQL.
+    crate::ddi::escape_wait::set_stopping(true);
     if !miniport_device_context.is_null() {
         // SHARED borrow, for the same reason StartDevice takes one: the ISR and
         // the DPCs can still build `&AdapterContext` from this pointer while this
@@ -846,6 +860,8 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
 /// `DxgkDdiRemoveDevice` — free the adapter context allocated in AddDevice.
 pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_void) -> NTSTATUS {
     crate::kmsg(c"Helios: RemoveDevice\n");
+    // As StopDevice: no escape may hold anything the teardown waits for (v334).
+    crate::ddi::escape_wait::set_stopping(true);
     crate::diag::record(0x0C00_0001);
     crate::ddi::stall_diag::stop_sub(helios_kmd_logic::stall_diag::stop_sub::REMOVE_ENTER);
     if !miniport_device_context.is_null() {

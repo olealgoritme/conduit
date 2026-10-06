@@ -109,6 +109,10 @@ pub mod site {
 /// `kmd_render` or `kmd_logic` (host-tested by scanning both trees). The two `Fk` names,
 /// `FkDefBud` and `FkVenus`, are in `flip_completion::COUNTERS` and written by `ddi/flip_keep.rs`.
 ///
+/// * `FlipPendWd`, `FlipPendWdT`, `FpWdMsEff` (v334): publications of the generic pending-flip
+///   watchdog (`flip_pend_wd`, knob `FlipPendWdMs`, default 500), the time of the last, and the
+///   knob in force. `StallReqN`: refreshes of a stale stall block the vsync tick asked the
+///   mirror thread for (the block is at least `STALE_PUBLISH_MS` old and nobody else wrote it).
 /// * `HpdLoopN`, `HpdLoopT`: HPD worker loops, interrupt time (ms) of the last one's wake.
 /// * `HpdSite`, `HpdSiteT`: [`site`] the worker is in or last entered, and when it entered it.
 /// * `FlipIss`: flips dxgkrnl issued (each `SetVidPnSourceAddress`, each DMA flip taken).
@@ -193,7 +197,7 @@ pub mod site {
 ///   `VsWdSCbI`, `VsWdSCbO`, `VsWdSSyT`: what it saw the last time it acted (when, armed, the
 ///   reference and deadline in ms, the silence, the callback counts, when the last synchronized
 ///   call began).
-pub const COUNTERS: [&str; 146] = [
+pub const COUNTERS: [&str; 150] = [
     "HpdLoopN",
     "HpdLoopT",
     "HpdSite",
@@ -214,6 +218,10 @@ pub const COUNTERS: [&str; 146] = [
     "FlipWd",
     "FlipWdT",
     "FlipWdBig",
+    "FlipPendWd",
+    "FlipPendWdT",
+    "FpWdMsEff",
+    "StallReqN",
     "StallT",
     "FlWdMsEff",
     "DefBudEff",

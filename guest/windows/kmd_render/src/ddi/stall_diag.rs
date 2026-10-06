@@ -310,6 +310,10 @@ pub(crate) fn note_flip_issued(address: u64) {
     // `FlipLat*` / `IfGap*` (`ddi::flip_lat`): the issue time of this flip, for its retire latency.
     crate::ddi::flip_lat::note_issue(address);
     let seq = FLIP_ISS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    // When the newest flip was issued, for `FlipPendWdMs` (stored before the word below, so a
+    // tick that reads the new word reads a stamp at least as new; a tick that reads the stamp of
+    // flip n+1 with the word of flip n only ever waits a little longer).
+    FLIP_ISS_T.store(AdapterContext::interrupt_time_ms().max(1), Ordering::Relaxed);
     // The newest address dxgkrnl issued, for the restart seed (`restart_flip::seed_address`).
     // Never zeroed by a generation, and a zero address (nothing assigned) never replaces it.
     if address != 0 {
@@ -396,6 +400,16 @@ static VS_SEEN_PUB: AtomicU32 = AtomicU32::new(0);
 static WD_COUNT: AtomicU32 = AtomicU32::new(0);
 static WD_T: AtomicU32 = AtomicU32::new(0);
 static WD_BIG: AtomicU32 = AtomicU32::new(0);
+/// The generic pending-flip watchdog (`FlipPendWdMs`, `kmd_logic::flip_pend_wd`): publications
+/// (`FlipPendWd`), the time of the last (`FlipPendWdT`), the knob in force (`FpWdMsEff`), the
+/// issue time of the newest recorded flip, and the refreshes of a stale stall block the vsync tick
+/// asked the mirror thread for (`StallReqN`, `STALL_REQ_T` its last).
+static PEND_WD_COUNT: AtomicU32 = AtomicU32::new(0);
+static PEND_WD_T: AtomicU32 = AtomicU32::new(0);
+static PEND_WD_MS: AtomicU32 = AtomicU32::new(0);
+static FLIP_ISS_T: AtomicU32 = AtomicU32::new(0);
+static STALL_REQ_N: AtomicU32 = AtomicU32::new(0);
+static STALL_REQ_T: AtomicU32 = AtomicU32::new(0);
 
 /// `FlipWdogMs` in force (clamped; 0 = off) and `DeferBudget` in force (clamped; 0 = unlimited).
 static WDOG_MS: AtomicU32 = AtomicU32::new(0);
@@ -553,6 +567,42 @@ pub(crate) fn on_vsync_tick(
         adapter.publish_kept_primary(address);
         WD_COUNT.fetch_add(1, Ordering::Relaxed);
         WD_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
+    }
+    // The generic pending-flip watchdog (`FlipPendWdMs`, default 500): the newest flip dxgkrnl
+    // issued is not done, is old, and nothing was published for as long. Independent of whether a
+    // programming is pending (the one above only counts while one is). Atomics only (DISPATCH),
+    // the same one-store publication.
+    let now_ms = AdapterContext::interrupt_time_ms();
+    let pend_wd_flip_word = FLIP_WORD.load(Ordering::Acquire);
+    if let helios_kmd_logic::flip_pend_wd::PendWdAction::Publish(address) =
+        helios_kmd_logic::flip_pend_wd::pend_wd_step(helios_kmd_logic::flip_pend_wd::PendWdInput {
+            now_ms,
+            limit_ms: PEND_WD_MS.load(Ordering::Relaxed),
+            flip_word: pend_wd_flip_word,
+            done_seq: DONE_SEQ.load(Ordering::Relaxed),
+            issue_t_ms: FLIP_ISS_T.load(Ordering::Relaxed),
+            pub_t_ms: FLIP_PUB_T.load(Ordering::Relaxed),
+        })
+    {
+        DONE_SEQ.store(sd::flip_seq(pend_wd_flip_word), Ordering::Relaxed);
+        adapter.publish_kept_primary(address);
+        PEND_WD_COUNT.fetch_add(1, Ordering::Relaxed);
+        PEND_WD_T.store(now_ms, Ordering::Relaxed);
+    }
+    // A stall block nobody has written for `STALE_PUBLISH_MS` is asked for again, by the heartbeat
+    // (which runs when the worker, the escapes and the flips all stopped: the 333 stuck dump was
+    // read 60 s and then 290 s after the block it showed). Rate limited to the same interval; the
+    // request is two atomics and a `KeSetEvent` (legal at DISPATCH); changed-only writes make the
+    // pass cheap.
+    let published = STALL_PUB_T.load(Ordering::Relaxed);
+    if published != 0
+        && sd::age_ms(now_ms, published) >= sd::STALE_PUBLISH_MS
+        && sd::age_ms(now_ms, STALL_REQ_T.load(Ordering::Relaxed)) >= sd::STALE_PUBLISH_MS
+        && crate::ddi::mirror_thread::running()
+    {
+        STALL_REQ_T.store(now_ms.max(1), Ordering::Relaxed);
+        STALL_REQ_N.fetch_add(1, Ordering::Relaxed);
+        crate::ddi::mirror_thread::request();
     }
 }
 
@@ -1096,6 +1146,13 @@ pub(crate) fn reread_knobs() {
     ));
     WDOG_MS.store(wdog, Ordering::Relaxed);
     DEFER_BUDGET.store(budget, Ordering::Relaxed);
+    // `FlipPendWdMs` (default 500, 0 = off): the generic pending-flip watchdog.
+    let pend_wd = helios_kmd_logic::flip_pend_wd::clamp_pend_wd_ms(crate::diag::read_config_dword(
+        crate::diag::knobs::FLIP_PEND_WD_MS,
+        helios_kmd_logic::flip_pend_wd::PEND_WD_DEFAULT_MS,
+    ));
+    PEND_WD_MS.store(pend_wd, Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"FpWdMsEff", pend_wd);
     crate::diag::record_named_bytes(b"FlWdMsEff", wdog);
     crate::diag::record_named_bytes(b"DefBudEff", budget);
     let pm = hpd_wake::clamp_power_mode(crate::diag::read_config_dword(
@@ -1479,6 +1536,11 @@ pub(crate) fn start_generation() {
         &WD_COUNT,
         &WD_T,
         &WD_BIG,
+        &PEND_WD_COUNT,
+        &PEND_WD_T,
+        &FLIP_ISS_T,
+        &STALL_REQ_N,
+        &STALL_REQ_T,
         &DEFER_ATTEMPTS,
         &WK_EVT,
         &WK_TMO,
@@ -1629,10 +1691,15 @@ pub(crate) fn publish_counters() {
     rec(b"FlipWd", WD_COUNT.load(Ordering::Relaxed));
     rec(b"FlipWdT", WD_T.load(Ordering::Relaxed));
     rec(b"FlipWdBig", WD_BIG.load(Ordering::Relaxed));
+    rec(b"FlipPendWd", PEND_WD_COUNT.load(Ordering::Relaxed));
+    rec(b"FlipPendWdT", PEND_WD_T.load(Ordering::Relaxed));
+    rec(b"StallReqN", STALL_REQ_N.load(Ordering::Relaxed));
     // The flip retire latency, the inter-flip interval, the vblank utilisation and the
     // announce counters (`docs/kmd-rm-client.md` 15.18.15).
     crate::ddi::flip_lat::publish_counters();
     crate::ddi::flip_announce::publish_counters();
+    // The escape scope's counters (v334): waits that gave up, the longest escape.
+    crate::ddi::escape_wait::publish_counters();
 }
 
 /// The HPD worker's current step (`site::*`), for the longest flip's breadcrumb.
