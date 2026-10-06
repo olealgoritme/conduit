@@ -1212,3 +1212,47 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod shared_format_refusals {
+    use super::*;
+    use crate::foreign_resource::test_formats::BEYOND_RGB32;
+
+    fn layout(fourcc: u32) -> Layout {
+        Layout {
+            width: 1920,
+            height: 1080,
+            stride: 1920 * 8,
+            offset: 0,
+            fourcc,
+            modifier: 0,
+        }
+    }
+
+    #[test]
+    fn a_scanout_set_or_resident_set_of_a_shared_format_is_refused_and_changes_nothing() {
+        for f in BEYOND_RGB32 {
+            let mut s = ForeignScanout::new();
+            assert_eq!(
+                s.set(0xA, 7, 3, layout(f), 0, 0),
+                Err(SetError::Layout(LayoutError::Format)),
+                "{f:#x}"
+            );
+            assert_eq!(*s.state(), State::Inactive);
+            assert_eq!(
+                s.resident_set(0xB, 8, 3, layout(f), 1),
+                Err(SetError::Layout(LayoutError::Format)),
+                "{f:#x}"
+            );
+            assert!(s.resident().is_none());
+            assert_eq!(layout(f).validate(), Err(LayoutError::Format));
+        }
+        // With a live source, a refused set leaves it alone.
+        let mut s = ForeignScanout::new();
+        s.set(0xA, 7, 3, layout(FOURCC_XRGB8888), 0, 0).unwrap();
+        for f in BEYOND_RGB32 {
+            assert!(s.set(0xA, 7, 3, layout(f), 0, 1).is_err());
+        }
+        assert!(s.suppress_desktop(2).is_some());
+    }
+}
