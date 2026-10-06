@@ -1865,7 +1865,8 @@ unsafe fn adopt_committed_allocation(
             // from a D3D12 resource-flags word would be a translation no reader asked
             // for."* Both halves are false — see [`meta_bind_flags`] for the reader and
             // for what the verbatim word decodes as.
-            bind_flags: meta_bind_flags(res_arg.Flags),
+            bind_flags: meta_bind_flags(res_arg.Flags)
+                | present_buffer_bind(heap_arg, res_arg),
             // ⛔ NOT `HELIOS_WDDM_ALLOC_MISC_PRIMARY`, and NOT
             // `HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT` -- see this function's doc for
             // both arguments. A windowed DWM-composited back buffer is not the VidPn
@@ -2196,6 +2197,33 @@ fn nvk_present_candidate(
             != ddi12::D3D12DDI_CPU_PAGE_PROPERTY_D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK
 }
 
+/// `D3D10_DDI_BIND_PRESENT` in the D3D11 DDI bind word of the meta, for a
+/// resource a flip-model swap chain can be made of ([`nvk_present_candidate`]).
+///
+/// The reader is DWM's D3D11 `pfnOpenResource`: a shared resource WITHOUT this
+/// bit is a cross-process keyed-mutex surface to it (`note_nvk_keyed_resource`
+/// in `umd/src/forward/resource.rs`), and since the flush gate (HEFL, 22.22.316)
+/// every DWM `pfnFlush` with work then sends a STREAM gate packet. That packet
+/// heads the adapter-wide WDDM FIFO until DWM's point retires or the
+/// `WddmHeadMs` rebase (250 ms) fires, and every D3D12 frame waited behind it:
+/// d3d12_tri on Venus fell from ~970 to 4 fps. A D3D11 swap chain's buffers
+/// carry the bit (`meta_bind=0xa8` in DWM's log), so their hand-off stays the
+/// present path's business; a D3D12 back buffer now says the same. The runtime
+/// never names the back buffers on this DDI (see `create_fused_heap_and_resource`),
+/// so the swap-chain shape is the test, as for NVK's export request.
+/// `api_bind_flags` drops the bit, so the imported alias's usage is unchanged.
+fn present_buffer_bind(
+    heap_arg: &ddi12::D3D12DDIARG_CREATEHEAP_0001,
+    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+) -> u32 {
+    const DDI_BIND_PRESENT: u32 = 0x0000_0080;
+    if nvk_present_candidate(heap_arg, res_arg) {
+        DDI_BIND_PRESENT
+    } else {
+        0
+    }
+}
+
 /// The private data of an NVK-made (foreign) primary: the 96-byte prefix plus the
 /// layout trailer the KMD checks against what it recorded at IMPORT_RM.
 #[repr(C)]
@@ -2291,7 +2319,7 @@ unsafe fn adopt_committed_allocation_nvk(
         height: res_arg.Height,
         format: 0,
         pitch,
-        bind_flags: meta_bind_flags(res_arg.Flags),
+        bind_flags: meta_bind_flags(res_arg.Flags) | present_buffer_bind(heap_arg, res_arg),
         misc_flags: 0,
         venus_alloc_size: 0,
         memory_type_index: 0,
