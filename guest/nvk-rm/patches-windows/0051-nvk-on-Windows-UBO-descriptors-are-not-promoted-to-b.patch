@@ -1,0 +1,127 @@
+From 8f4c8ddbd2e699fca15832f60ce15e48856ffb18 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 21:59:44 +0200
+Subject: [PATCH] nvk: on Windows, UBO descriptors are not promoted to bound
+ cbufs
+
+NVK promotes UBOs from descriptor sets and descriptor buffers to bound
+hardware cbufs. The CPU does not know their addresses, so every draw
+re-binds each of them with NVK_MME_BIND_CBUF_DESC, which reads the
+descriptor from memory in the front end and stalls it. D3D11 through
+DXVK (descriptor buffers) binds every cbuffer that way: Unigine Heaven
+averages ~8 such binds per draw. Under Conduit (Windows guest, RM
+backend) that kept the GPU busy ~2.7 us per draw. With the UBOs left to
+bindless cbuf loads (NVK_DEBUG=no_cbuf) it took ~0.7 us: 2.2x more draws
+in the same time, GPU busy 98% -> 42%, and Heaven ran 300-520 fps instead
+of 180-400.
+
+pdev->ubo_desc_cbufs (NVK_UBO_DESC_CBUF, default off on Windows, on
+elsewhere) now decides whether NVK_CBUF_TYPE_UBO_DESC cbufs are built.
+Root descriptors, shader constant data, dynamic UBOs and inline uniform
+blocks stay bound cbufs. Large constants keep their cbuf too, unlike with
+no_cbuf. The choice is part of the compiler flags, so the shader cache
+keys follow it.
+---
+ src/nouveau/vulkan/nvk_nir_lower_descriptors.c |  6 ++++++
+ src/nouveau/vulkan/nvk_physical_device.c       | 15 +++++++++++++++
+ src/nouveau/vulkan/nvk_physical_device.h       |  7 +++++++
+ src/nouveau/vulkan/nvk_shader.c                |  1 +
+ 4 files changed, 29 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvk_nir_lower_descriptors.c b/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
+index 8f2c09b..137d405 100644
+--- a/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
++++ b/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
+@@ -61,6 +61,7 @@ struct lower_descriptors_ctx {
+    bool clamp_desc_array_bounds;
+    bool indirect_bind;
+    bool has_task_shader;
++   bool ubo_desc_cbufs;
+    nir_address_format ubo_addr_format;
+    nir_address_format ssbo_addr_format;
+ 
+@@ -459,6 +460,10 @@ build_cbuf_map(nir_shader *nir, struct lower_descriptors_ctx *ctx)
+           cbufs[i].key.type == NVK_CBUF_TYPE_UBO_DESC)
+          continue;
+ 
++      /* See nvk_physical_device::ubo_desc_cbufs */
++      if (!ctx->ubo_desc_cbufs && cbufs[i].key.type == NVK_CBUF_TYPE_UBO_DESC)
++         continue;
++
+       /* Prior to Turing, indirect cbufs require splitting the pushbuf and
+        * pushing bits of the descriptor set.  Doing this every draw call is
+        * probably more overhead than it's worth.
+@@ -1570,6 +1575,7 @@ nvk_nir_lower_descriptors(nir_shader *nir,
+       .indirect_bind =
+          shader_flags & VK_SHADER_CREATE_INDIRECT_BINDABLE_BIT_EXT,
+       .has_task_shader = (shader_flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT) == 0,
++      .ubo_desc_cbufs = pdev->ubo_desc_cbufs,
+       .ssbo_addr_format = nvk_ssbo_addr_format(pdev, rs),
+       .ubo_addr_format = nvk_ubo_addr_format(pdev, rs),
+    };
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index 66d1ea9..45d5d82 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -3,6 +3,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ #include "nvk_physical_device.h"
++#include "util/u_debug.h"
+ 
+ /* Mesa's Win32 WSI implements no wait_for_present (wsi_WaitForPresentKHR
+  * asserts on it), so VK_KHR_present_id/_wait(2) are not advertised there:
+@@ -1625,6 +1626,20 @@ nvk_create_physical_device_for_nvkmd(struct nvk_instance *instance,
+    pdev->nvkmd = nvkmd;
+    pdev->info = nvkmd->dev_info;
+    pdev->debug_flags = instance->debug_flags;
++   /* Under Conduit (Windows, RM backend) every BIND_CBUF_DESC front-end read
++    * of a descriptor is expensive, and D3D11 through DXVK binds every
++    * cbuffer that way: ~8 per draw in Unigine Heaven, which kept the GPU
++    * busy 2.7 us per draw against 0.7 us with UBO descriptors left to
++    * bindless cbuf loads (NVK_DEBUG=no_cbuf: 2.2x more draws in the same GPU
++    * time). Root descriptors, shader constants, dynamic UBOs and inline
++    * uniform blocks stay bound cbufs. NVK_UBO_DESC_CBUF=1 restores upstream
++    * behaviour; it is the default elsewhere.
++    */
++#ifdef _WIN32
++   pdev->ubo_desc_cbufs = debug_get_bool_option("NVK_UBO_DESC_CBUF", false);
++#else
++   pdev->ubo_desc_cbufs = debug_get_bool_option("NVK_UBO_DESC_CBUF", true);
++#endif
+ 
+    pdev->nak = nak_compiler_create(&pdev->info);
+    if (pdev->nak == NULL) {
+diff --git a/src/nouveau/vulkan/nvk_physical_device.h b/src/nouveau/vulkan/nvk_physical_device.h
+index 65594b6..68e4ab0 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.h
++++ b/src/nouveau/vulkan/nvk_physical_device.h
+@@ -40,6 +40,13 @@ struct nvk_physical_device {
+    struct vk_physical_device vk;
+    struct nv_device_info info;
+    enum nvk_debug debug_flags;
++
++   /* Promote UBO descriptors (descriptor sets/buffers) to bound cbufs. Each
++    * such cbuf is re-bound per draw by NVK_MME_BIND_CBUF_DESC, which reads
++    * the descriptor from memory in the front end and stalls it. See
++    * nvk_physical_device.c.
++    */
++   bool ubo_desc_cbufs;
+    bool ssbo_align_4b;
+ 
+    struct nvkmd_pdev *nvkmd;
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index f0680fb..5221722 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -82,6 +82,7 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
+    assert(nak_flags <= UINT16_MAX);
+ 
+    return (no_cbufs ? 1 << 12 : 0)
++      | (pdev->ubo_desc_cbufs ? 0 : 1 << 15)
+       | (use_edb_buffer_views ? 1 << 13 : 0)
+       | (instance->drirc.misc.ssbo_align_4b ? 1 << 14 : 0)
+       | (nak_flags << 48);
+-- 
+2.43.0
+
