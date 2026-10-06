@@ -259,6 +259,11 @@ pub(crate) fn publish_nvrm_counters() {
     );
     // The KMD's own RM client (`KmdRmClient`): `Rm*`, written only once it has run.
     crate::virtio::rm_client::publish_counters();
+    // The KMD copy of a foreign resource into the scan-out image (`Fc*`): imports
+    // made (`FcImp`, split `FcScan` / `FcBlt`), refusals (`FcRefuse`, last reason
+    // `FcRefCode`), host refusals (`FcHostErr`), device without the extension
+    // (`FcNoExt`), stale or unknown records (`FcStale`), knob off (`FcOff`).
+    crate::virtio::venus::publish_foreign_copy_counters();
     // RM fence handles (a forwarded SEMSURF_FENCE_CREATE): `NvFence` made and
     // recorded, `NvFenceCl` released (Close or teardown; the difference is what is
     // live), `NvFenceSig` EventReadys seen for fences, `NvFenceEarly` of those that

@@ -234,6 +234,17 @@ impl VirtioGpu {
         self.foreign.layout(resource_id)
     }
 
+    /// The whole record the KMD's own Venus import of a foreign resource is built
+    /// from: the layout and the host-verified size (`Entry::size`, never larger
+    /// than the host object). `None` for a resource that is not foreign (dead, or
+    /// an ordinary blob). One lookup, so the two cannot come from different
+    /// instants; the KMD's copy import takes it once per import under the table
+    /// lock and compares it with what the allocation carried
+    /// (`helios_kmd_logic::foreign_copy::record_agrees`).
+    pub fn foreign_record(&self, resource_id: u32) -> Option<(fr::Layout, u64)> {
+        self.foreign.get(resource_id).map(|e| (e.layout, e.size))
+    }
+
     /// Count a request refused before it reached any table.
     pub fn foreign_note_refusal(&mut self, kind: RefusalKind) {
         self.foreign.note_refusal(kind);

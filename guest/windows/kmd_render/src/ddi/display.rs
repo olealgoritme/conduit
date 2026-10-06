@@ -517,6 +517,22 @@ unsafe fn dxgkddi_present_inner(
                     SNAPSHOT_BIND_FLAGS,
                     snapshot.dxgi_format,
                 )
+            } else if let Some(foreign) = crate::virtio::venus::foreign_source_if_enabled(
+                adapter,
+                source.foreign,
+                source.venus_alloc_size,
+            ) {
+                // An adopted foreign (NVK-on-RM) resource: imported as an
+                // explicit-modifier dma-buf image from its layout record. The
+                // pixel format is the record's fourcc. Every other source takes
+                // the match below, unchanged.
+                OptimalPresentImageDesc::new_foreign_dma_buf(
+                    source.resource_id,
+                    source.width,
+                    source.height,
+                    source_dxgi_format,
+                    foreign,
+                )
             } else {
                 match source.storage {
                     PresentAllocationStorage::OptimalCrossContextImage => {

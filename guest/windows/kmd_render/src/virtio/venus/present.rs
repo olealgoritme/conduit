@@ -29,6 +29,13 @@ pub struct OptimalPresentImageDesc {
     /// only *outside* `venus.rs`).
     pub(super) pixel_format: PresentPixelFormat,
     pub(super) transport: OptimalImageTransport,
+    /// `Some` for a foreign (NVK-on-RM) source: the import is then an
+    /// explicit-modifier dma-buf image built from this record, and
+    /// `memory_type_index`, `ddi_bind_flags` and `transport` are not consulted.
+    /// Part of the descriptor's identity, so a cache hit can never reuse an
+    /// ordinary alias for a foreign resource or the other way round. `None` for
+    /// every ordinary resource, which keeps its code path unchanged.
+    pub(super) foreign: Option<ForeignSource>,
 }
 
 impl OptimalPresentImageDesc {
@@ -53,6 +60,7 @@ impl OptimalPresentImageDesc {
             dxgi_format,
             pixel_format,
             transport,
+            foreign: None,
         })
     }
 
@@ -87,6 +95,35 @@ impl OptimalPresentImageDesc {
             dxgi_format,
             OptimalImageTransport::OpaqueFd,
         )
+    }
+
+    /// A foreign (NVK-on-RM) resource as a Present source: imported as an
+    /// explicit-modifier dma-buf image from `source`'s record (see
+    /// [`foreign_copy`](super::foreign_copy)). The pixel format is the record's
+    /// fourcc, not the allocation's DXGI format (`dxgi_format` is kept for the
+    /// descriptor's identity and traces only). `None` when the record's fourcc has
+    /// no Present format or an extent is zero.
+    pub fn new_foreign_dma_buf(
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        dxgi_format: u32,
+        source: ForeignSource,
+    ) -> Option<Self> {
+        let pixel_format = source.pixel_format()?;
+        (resource_id != 0 && source.record_size != 0 && width != 0 && height != 0).then_some(Self {
+            resource_id,
+            allocation_size: source.record_size,
+            // Not consulted: the KMD device picks the memory type itself.
+            memory_type_index: 0,
+            width,
+            height,
+            ddi_bind_flags: 0,
+            dxgi_format,
+            pixel_format,
+            transport: OptimalImageTransport::CrossContextDmaBuf,
+            foreign: Some(source),
+        })
     }
 
     /// KMD GDI textures and direct-optimal scanout images are exported through
@@ -512,6 +549,12 @@ impl VenusClient {
         adapter: &AdapterContext,
         desc: OptimalPresentImageDesc,
     ) -> Result<ImportedOptimalImage, VirtioError> {
+        // A foreign source is a different import (explicit-modifier dma-buf
+        // image, own memory type); everything below is the ordinary OPTIMAL one,
+        // untouched.
+        if let Some(source) = desc.foreign {
+            return self.import_foreign_present_image(adapter, desc, &source);
+        }
         if desc.memory_type_index >= self.memory_type_count {
             return Err(VirtioError::DeviceError);
         }
@@ -577,6 +620,30 @@ impl VenusClient {
             return Err(e);
         }
 
+        Ok(ImportedOptimalImage {
+            desc,
+            image_id,
+            memory_id,
+        })
+    }
+
+    /// The foreign half of [`Self::import_optimal_present_image`]: preflight
+    /// (no host contact), attach, then the explicit-modifier import. The returned
+    /// record is the ordinary [`ImportedOptimalImage`], so the cache, its
+    /// identity check and `release_present_blits_for_resource` treat it like any
+    /// other import.
+    fn import_foreign_present_image(
+        &mut self,
+        adapter: &AdapterContext,
+        desc: OptimalPresentImageDesc,
+        source: &ForeignSource,
+    ) -> Result<ImportedOptimalImage, VirtioError> {
+        let image =
+            self.foreign_preflight(adapter, desc.resource_id, source, desc.width, desc.height)?;
+        ctrl::attach_resource_checked(self.passive(), adapter, self.ctx_id(), desc.resource_id)?;
+        let (image_id, memory_id) =
+            self.import_foreign_source(adapter, desc.resource_id, &image)?;
+        FC_BLT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(ImportedOptimalImage {
             desc,
             image_id,
