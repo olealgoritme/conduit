@@ -339,6 +339,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             crate::adapter::foreign_scanout::now_100ns(),
         ),
     );
+    // Whatever the previous generation recorded against its resource ids (system
+    // backing leases, "system copy invalid" marks) is meaningless now: ids restart
+    // at 1 and would name different resources.
+    adapter.reset_system_backings(passive);
     // Non-zero only if init below fails, so the display-half demotion can report
     // the status that actually killed the transport rather than a bare flag.
     let mut transport_fail_status: u32 = 0;
@@ -511,6 +515,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         adapter.set_transport_generation(Some(crate::adapter::TransportGeneration {
             bar_segment,
             venus_ctx_id,
+            serial: crate::adapter::mint_transport_serial(),
         }));
     }
 
@@ -723,6 +728,9 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // SAFETY: StopDevice, PASSIVE_LEVEL, serialized by dxgkrnl against
         // StartDevice and against every DDI that reads the generation.
         unsafe { adapter.set_transport_generation(None) };
+        // Every system-backing lease and "system copy invalid" mark is keyed by a
+        // resource id of the generation that just ended.
+        adapter.reset_system_backings(passive_stop);
         stop_stage(entry, 9);
         if flush {
             crate::diag::flush_service_key(passive_stop);
