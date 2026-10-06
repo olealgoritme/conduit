@@ -429,12 +429,13 @@ pub(crate) unsafe fn flush_gate(h: Hdevice, context: &ID3D11DeviceContext) {
 
 static LEDGER_HANDOFFS: AtomicUsize = AtomicUsize::new(0);
 
-/// `HELIOS_HANDOFF_LEDGER=0` (process environment): the previous hand-off
-/// handling (Venus producer publication, NVK releaser CPU wait, optional HEFL)
-/// instead of the ledger.
+/// `HELIOS_HANDOFF_LEDGER=1` (process environment, in every process sharing
+/// the surface): the hand-off ledger. Off by default until it is verified
+/// across processes; the default is the previous hand-off handling (Venus
+/// producer publication, NVK releaser CPU wait, optional HEFL).
 fn ledger_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("HELIOS_HANDOFF_LEDGER").is_ok_and(|v| v == "0"))
+    *ON.get_or_init(|| std::env::var("HELIOS_HANDOFF_LEDGER").is_ok_and(|v| v == "1"))
 }
 
 /// The registered shared resources of `dev` as `ID3D11Resource*`; opened ones

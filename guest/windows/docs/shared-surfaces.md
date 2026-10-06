@@ -195,7 +195,10 @@ in use come back.
 Any access waits (DXVK patch 0008): the ledger is sampled where DXVK tracks every resource
 access, at the first tracking of a shared image in a submission, so render targets, clears, UAV
 writes and blending wait for a pending hand-off too (write-after-write); one wait per image per
-submission. Knobs: `HELIOS_HANDOFF_LEDGER=0` (the previous behaviour),
+submission. Knobs: `HELIOS_HANDOFF_LEDGER=1` (opt-in, in every sharing process; off by default
+until verified across processes, so the default is the previous behaviour: Venus producer
+publication, NVK releaser CPU wait; on 320.1 each process created its own table because the
+section handle was closed after mapping, which drops the name),
 `HELIOS_FLUSH_GATE_CPU_WAIT=1` (also the releaser CPU wait). `d3d11_share keyed-load W H ROUNDS
 COPIES perf` reports the producer's flush+release time and hand-offs/s without readbacks.
 
