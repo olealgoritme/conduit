@@ -244,9 +244,81 @@ triangle on a hidden window, `vk_scanout_present [seconds] [width height]
 | KMD 22.22.307, `MESA_WSI_SCANOUT_HZ=60`, 30 s | 60.0 fps, 1801 flips, 0 failed; `NvFlip` +1801 |
 | `NVK_HELIOS_DRI=99` | "cannot open host render node 99", falls back to GDI |
 
-Next: block-linear images with NVIDIA's DRM modifier (a linear image is
-rendered through NVK's tiled shadow plus a copy), a host release event
-instead of the fixed hold, vblank pacing.
+Next: a host release event instead of the fixed hold, vblank pacing.
+
+### Block-linear scanout (patch 24)
+
+NVK cannot render into a linear color image. With linear swapchain images
+(patch 21) every render pass drew into a hidden tiled shadow
+(`linear_tiled_shadows`, `nvk_cmd_draw.c`) and copied it into the linear
+image. Patch 24 keeps NVK's own tiling instead, named by NVIDIA's DRM format
+modifier, which the host's display path reads as such. NVIDIA's driver
+imports NVK-on-RM block-linear memory pixel-exact (`spike/host-nvk-import`,
+`host_import_spike.c`).
+
+- The Win32 WSI asks the driver for its uncompressed NVIDIA block-linear 2D
+  modifiers for the format, filters them by usage and extent (as
+  `wsi_common_drm.c` does) and creates the images with
+  `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and that list. This works even
+  though NVK on Windows does not advertise `VK_EXT_image_drm_format_modifier`.
+  NVK picks the tallest block, `0x0300000000606015` (kind 0x06, GOB kind
+  generation 2, sector layout 1, h = 5) for B8G8R8A8 and R8G8B8A8 on GB20x.
+- `scanout_export` returns the modifier the image got.
+  `vkGetImageDrmFormatModifierPropertiesEXT` is Linux-only in the runtime,
+  so the WSI cannot ask for it itself. The dedicated allocation already
+  carries the image's PTE kind and tile mode, and the export passes them to
+  NVKMS on `DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY` as block-linear surface
+  params (`log2GobsPerBlock.y`, `genericMemory`), as `nvkmd_rm_drm.c` does
+  on Linux. The export refuses memory whose layout is not the modifier's.
+- `SCANOUT_SET` carries the modifier. KMD 22.22.308 to 311
+  (`kmd_logic/src/foreign_scanout.rs`, `Layout::validate`) checks only the
+  size, the fourcc and `stride >= width * 4`, so block-linear passes. Its
+  unit test has `modifier = 0x0300_0000_0000_0010; // block linear is
+  allowed`. No KMD change is needed. The stride is the GOB-aligned row
+  pitch, which is 7680 at 1920.
+- Fallback to linear: `NVK_HELIOS_WSI_LINEAR=1`, or a `SCANOUT_SET` refused
+  with `-EINVAL` for a non-linear modifier. In that case the flip returns
+  `VK_ERROR_FORMAT_NOT_SUPPORTED` to the WSI, which goes linear for later
+  swapchains and returns `VK_ERROR_OUT_OF_DATE_KHR`.
+
+Correctness: `tests/vk_bl_readback.c` builds the WSI's image: B8G8R8A8,
+the modifier list, dedicated device-local memory. It writes a `(y << 16) | x`
+pattern with the copy engine and clears an odd rectangle across GOB and
+block edges with `vkCmdClearAttachments`, which uses the 3D engine with the
+image as a color target. It then reads the memory's raw bytes back through
+a buffer bound to the same memory and checks every pixel at the address the
+modifier gives it, using NIL's TuringColor2D GOB as in `host_import_spike.c`.
+These raw bytes are what NVKMS exports. In `win11` with KMD 22.22.311, a
+release build:
+
+| run | result |
+|---|---|
+| 1920x1080, `...6015` (what the WSI picks) | PASS: 2073600 pixels, 524835 of them cleared by the 3D engine, 0 wrong through the image, 0 wrong raw |
+| 1920x1080 `...6014`, 1280x720 `...6015` | PASS |
+| LINEAR (control) | PASS |
+| `...6015` read as `...6014` (negative control) | FAIL as expected, 1799059 wrong |
+| `...6015` read as linear (negative control) | FAIL as expected, 1833118 wrong |
+
+`NVK_DEBUG=vm` in the demo and in Heaven shows the swapchain memory as
+`kind 0x6, tile 0x50` and the scanout source as `modifier
+0x300000000606015` (Heaven: 1600x900, stride 6400, XB24, two images). There
+were 0 failed flips.
+
+Performance, the same release build (`buildtype=release`, on top of patch
+22), KMD 22.22.311, linear through `NVK_HELIOS_WSI_LINEAR=1`. Host
+`nvidia-smi dmon -s pu` was sampled during each run:
+
+| run | linear (patch 21) | block-linear (patch 24) |
+|---|---|---|
+| `vk_scanout_present 15 1920 1080 3`, unpaced | 6573 fps, SM 11-13 % (one sample 21), ~102-129 W | **11748 fps**, SM 6-8 % (two samples 19, 24), ~108-116 W |
+| Heaven 32-bit, 1600x900 Medium, zero-copy WSI unpaced, `heaven-nvk-fps.ps1` 30 s after 25 s | 355.7 fps, median 2.38 / p99 5.18 ms, SM 90-95 %, 162-226 W | 344.1 fps, median 2.43 / p99 5.19 ms, SM 86-97 %, 164-252 W |
+
+The demo nearly doubles. It is a triangle per frame, so the shadow copy was
+most of its GPU work, and SM time per frame drops by about 3x. Heaven does
+not change: the two runs follow the same 5 s buckets within noise (e.g.
+45 s: 514 vs 515 fps). It is bound by NVK's own rendering at 90-95 % SM. A
+1600x900 copy is small against a ~2.8 ms frame. Heaven with GDI present and
+the BAR heap was 297 fps (patch 22's measurement).
 
 ### Linux-only code and how the Windows build handles it
 
