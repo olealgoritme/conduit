@@ -1041,6 +1041,13 @@ pub mod knobs {
     /// invalid" instead. Independent of `BltAsync`. Read at every StartDevice; mirrored as
     /// `BltNoMirKnob`.
     pub const BLT_NO_MIRROR: KnobName = KnobName::new(b"BltNoMirror");
+    /// `BltLookahead` (default 4, 1 = the front of the ready queue only, the behaviour before
+    /// v337). How many entries of the WindowedBlt ready queue the HPD worker looks at when it
+    /// picks the next copy to submit: a request whose producer has not finished, or whose
+    /// destination is still being read, no longer holds the requests of unrelated destinations
+    /// behind it (per-destination order is kept). Clamped to 1..8. Read at every StartDevice;
+    /// mirrored as `BltLookKnob`. `docs/zero-copy-present.md` section 24.10.
+    pub const BLT_LOOKAHEAD: KnobName = KnobName::new(b"BltLookahead");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");

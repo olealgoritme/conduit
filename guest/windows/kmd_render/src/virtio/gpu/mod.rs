@@ -7223,7 +7223,7 @@ impl VirtioGpu {
         // (the request was retired through a terminal, or already went out): pop it, or
         // it holds every later request of every process behind it for the rest of the
         // boot (`helios_kmd_logic::windowed_ready`). Counted in `WbStaleRdy`.
-        let index = loop {
+        let front_healed = loop {
             let front = self.windowed_blt.ready.front().copied();
             let index = front.and_then(|token| {
                 self.windowed_blt
@@ -7244,13 +7244,14 @@ impl VirtioGpu {
                 }
             }
         };
-        let boundary = self.windowed_blt.pending[index].stream_boundary;
-        if !self.windowed_blt.pending[index].admitted
-            || self.windowed_blt.pending[index].dispatched
-            || !self.scanout_boundary_ready(boundary)
-        {
+        // The front is live. It goes if it can; if it cannot (its producer has not finished, its
+        // destination is being read) an unrelated destination behind it may, within the
+        // lookahead window and never past an older entry of its own destination
+        // (`BltLookahead`, `helios_kmd_logic::blt_async::pick`; a window of 1 is the front only).
+        let _ = front_healed;
+        let Some((index, position)) = self.blt_pick_ready() else {
             return None;
-        }
+        };
         if let PresentDestinationDesc::StandardBuffer(destination) =
             self.windowed_blt.pending[index].destination
         {
@@ -7264,7 +7265,10 @@ impl VirtioGpu {
         }
         self.windowed_blt.pending[index].dispatched = true;
         self.blt_async_dispatched(index);
-        self.windowed_blt.ready.pop_front();
+        self.windowed_blt.ready.remove(position);
+        if position > 0 {
+            crate::ddi::blt_async::note_lookahead();
+        }
         Some(self.windowed_blt.pending[index])
     }
 
@@ -7384,6 +7388,14 @@ impl VirtioGpu {
                     // Quiet: the worker's own failed-submit path released the buffer already,
                     // in this same critical section.
                     self.blt_async_release_writer(resource_id);
+                    // Level 5: this terminal is where the frame lands (the mirrored kind
+                    // raises the edge in the worker's mirror stage). Atomics only.
+                    crate::ddi::blt_async::raise_edge(
+                        adapter,
+                        helios_kmd_logic::blt_async::Finish::DeferredNoMirror,
+                        ok,
+                        resource_id,
+                    );
                 }
                 self.terminal_windowed_blt(adapter, token, stream_boundary, ok);
                 return;

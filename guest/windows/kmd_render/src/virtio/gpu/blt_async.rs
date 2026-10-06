@@ -31,14 +31,32 @@ pub(super) const MAX_BLT_ASYNC: usize = 8;
 /// The in-flight table of the direct submissions (`helios_kmd_logic::blt_async::Table`).
 pub(super) struct BltAsyncState {
     table: ba::Table<MAX_BLT_ASYNC>,
+    /// The adapter that owns this transport, set by the first direct submission: the completion
+    /// DPC needs it for the source's ledger ticket and the Level 5 frame edge. It names the same
+    /// adapter for the life of the transport and every entry is retired or forgotten before the
+    /// transport (`StopDevice` drains, the latch forgets), like `WindowedBltPending::adapter`.
+    adapter: Option<NonNull<crate::adapter::AdapterContext>>,
 }
 
 impl BltAsyncState {
     pub(super) const fn new() -> Self {
         Self {
             table: ba::Table::new(),
+            adapter: None,
         }
     }
+}
+
+/// What the route decision needs from the transport, in one critical section.
+pub(crate) struct BltFacts {
+    /// The producer boundary's state.
+    pub boundary: ba::Boundary,
+    /// A queued (WindowedBlt) copy already names the destination.
+    pub deferred_pending: bool,
+    /// The direct table has room.
+    pub room: bool,
+    /// An earlier asynchronous copy is still reading the source.
+    pub source_busy: bool,
 }
 
 /// What [`VirtioGpu::enqueue_async_submit_blt`] did with the staged buffers.
@@ -51,14 +69,10 @@ pub(crate) enum BltEnq {
 }
 
 impl VirtioGpu {
-    /// What the route decision needs from the transport, in one critical section: the producer
-    /// boundary's state, whether a queued (WindowedBlt) copy already names `dst`, and whether the
-    /// direct table has room.
-    pub(crate) fn blt_async_facts(
-        &self,
-        boundary: Option<u64>,
-        dst: u32,
-    ) -> (ba::Boundary, bool, bool) {
+    /// The facts of one Present: the producer boundary's state, whether a queued (WindowedBlt)
+    /// copy already names `dst`, whether the direct table has room, and whether an earlier
+    /// asynchronous copy still reads `src`.
+    pub(crate) fn blt_async_facts(&self, boundary: Option<u64>, dst: u32, src: u32) -> BltFacts {
         let boundary = match boundary {
             None => ba::Boundary::None,
             Some(b) if self.present_stream_boundary_live(b) => ba::Boundary::Live {
@@ -66,11 +80,17 @@ impl VirtioGpu {
             },
             Some(_) => ba::Boundary::Dead,
         };
-        (
+        BltFacts {
             boundary,
-            self.blt_dst_deferred_pending(dst),
-            self.blt_async.table.has_room(),
-        )
+            deferred_pending: self.blt_dst_deferred_pending(dst),
+            room: self.blt_async.table.has_room(),
+            source_busy: self.blt_async.table.readers(src) > 0
+                || self
+                    .windowed_blt
+                    .pending
+                    .iter()
+                    .any(|request| request.async_blt && request.source_resource_id == src),
+        }
     }
 
     /// A WindowedBlt request (a snapshot's, or a deferred NVK copy) that has not reached its
@@ -108,11 +128,13 @@ impl VirtioGpu {
     /// has no entry, and no other submission can see a half-acquired buffer.
     pub(crate) fn enqueue_async_submit_blt(
         &mut self,
+        adapter: &crate::adapter::AdapterContext,
         ctx_id: u32,
         meta: DmaBuffer,
         venus: DmaBuffer,
         venus_len: usize,
         resource_id: u32,
+        source_id: u32,
     ) -> Result<BltEnq, (DmaBuffer, DmaBuffer, VirtioError)> {
         if !self.blt_async.table.has_room() {
             return Err((meta, venus, VirtioError::QueueFull));
@@ -135,6 +157,10 @@ impl VirtioGpu {
                 true
             }
         };
+        // A read of the source until the copy retires, published in the read ledger like a
+        // WindowedBlt snapshot's: a consumer of the ledger (the UMD) sees the source busy. A
+        // full ledger leaves the copy unledgered (loud in `RdOvf`, never a refusal).
+        let ticket = adapter.read_ledger.issue(source_id);
         match self.enqueue_submit_inner(
             ctx_id,
             SCANOUT_RING_IDX,
@@ -147,13 +173,15 @@ impl VirtioGpu {
             None,
         ) {
             Ok(fence_id) => {
-                let added = self.blt_async.table.add(ba::Entry {
-                    fence_id,
-                    resource_id,
-                    t0: crate::ddi::blt_async::now_100ns(),
-                });
+                self.blt_async.adapter = Some(NonNull::from(adapter));
+                let added = self.blt_async.table.add(
+                    ba::Entry::new(fence_id, resource_id, crate::ddi::blt_async::now_100ns())
+                        .reading(source_id, ticket),
+                );
                 if added {
                     crate::ddi::blt_async::note_infl_add();
+                } else {
+                    adapter.read_ledger.retire(ticket, true);
                 }
                 // `has_room` held under this same lock and wire fence ids only grow, so `added`
                 // is true. If it ever were not, the buffer stays KMD-owned (fail closed, the
@@ -165,6 +193,7 @@ impl VirtioGpu {
             Err(error) => {
                 // Descriptor enqueue failed: no host command exists. A buffer this call
                 // acquired goes back; a joined one belongs to the earlier submissions.
+                adapter.read_ledger.retire(ticket, true);
                 if acquired {
                     self.complete_present_buffer_write(resource_id);
                 }
@@ -192,20 +221,37 @@ impl VirtioGpu {
             // waiting for this buffer are woken.
             self.complete_present_buffer_write(done.resource_id);
         }
+        if let Some(adapter) = self.blt_async.adapter {
+            // SAFETY: set by an enqueue of this transport; see `BltAsyncState::adapter`.
+            let adapter = unsafe { adapter.as_ref() };
+            // The copy has stopped reading the source (a failed one too).
+            adapter.read_ledger.retire(done.ticket, !response_ok);
+            // Level 5: the frame is in the destination; if it is the shown RM primary a flip is
+            // owed (atomics only, DISPATCH-legal).
+            crate::ddi::blt_async::raise_edge(
+                adapter,
+                ba::Finish::Direct,
+                response_ok,
+                done.resource_id,
+            );
+        }
     }
 
     /// A transport failure latched: nothing in the table can complete any more. Forget the
     /// entries (the buffers die with the transport generation).
     pub(super) fn blt_async_forget(&mut self) {
-        for _ in 0..self.blt_async.table.len() {
+        while let Some(entry) = self.blt_async.table.pop_oldest() {
             crate::ddi::blt_async::note_infl_sub();
+            if let Some(adapter) = self.blt_async.adapter {
+                // SAFETY: as `blt_async_retire`.
+                unsafe { adapter.as_ref() }.read_ledger.retire(entry.ticket, true);
+            }
         }
-        self.blt_async.table.clear();
     }
 
     /// `queue_windowed_blt` for a DEFERRED asynchronous Blt: the same FIFO, token and boundary
-    /// rules, with no snapshot reader ledgered (the NVK source is not a DXVK snapshot and nobody
-    /// reads the ledger for it) and the two flags `WindowedBltPending` carries for it.
+    /// rules, with the two flags `WindowedBltPending` carries for it. The source is ledgered
+    /// like a snapshot's, but an overflowing ledger does not refuse the request.
     pub(crate) fn queue_async_blt(
         &mut self,
         adapter: &crate::adapter::AdapterContext,
@@ -226,6 +272,10 @@ impl VirtioGpu {
         let Some(token) = self.windowed_blt.issue_token() else {
             return Err(VirtioError::OutOfMemory);
         };
+        // A read of the source until the copy retires (the ring completion or the terminal
+        // retires it), as for a snapshot; a full ledger leaves the request unledgered, not
+        // refused.
+        let ledger_ticket = adapter.read_ledger.issue(source.resource_id());
         self.windowed_blt.pending.push_back(WindowedBltPending {
             adapter: NonNull::from(adapter),
             token,
@@ -235,13 +285,12 @@ impl VirtioGpu {
             source,
             destination,
             prepared,
-            ledger_ticket: LedgerTicket::NONE,
+            ledger_ticket,
             admitted: false,
             dispatched: false,
             ring_complete: false,
             mirror_ready: false,
-            // Nothing was ledgered, so there is nothing to retire.
-            ledger_retired: true,
+            ledger_retired: false,
             wddm_completion_required: true,
             mirror_claimed: false,
             async_blt: true,
@@ -271,6 +320,51 @@ impl VirtioGpu {
         }
         request.t_submit = crate::ddi::blt_async::now_100ns();
         crate::ddi::blt_async::note_defer_wait(request.t_queue, request.t_submit);
+    }
+
+    /// Which ready request the worker dispatches next: `(index in pending, position in ready)`.
+    /// The first of the first `BltLookahead` ready entries that can go now (admitted, its
+    /// producer's boundary reached, its destination writable), unless an earlier live entry names
+    /// the same destination (`helios_kmd_logic::blt_async::pick`). `front` is the healed front's
+    /// index in `pending`. With a depth of 1 this is the rule before v337.
+    pub(super) fn blt_pick_ready(&self) -> Option<(usize, usize)> {
+        let depth = crate::ddi::blt_async::lookahead().min(ba::LOOKAHEAD_MAX);
+        let mut window = [ba::Cand {
+            live: false,
+            dst: 0,
+            dispatchable: false,
+        }; ba::LOOKAHEAD_MAX];
+        let mut index = [usize::MAX; ba::LOOKAHEAD_MAX];
+        let mut n = 0;
+        for token in self.windowed_blt.ready.iter().take(depth) {
+            let at = self
+                .windowed_blt
+                .pending
+                .iter()
+                .position(|request| request.token == *token);
+            if let Some(i) = at {
+                let request = &self.windowed_blt.pending[i];
+                let live = !request.dispatched;
+                let writable = match request.destination {
+                    PresentDestinationDesc::StandardBuffer(d) => {
+                        self.blt_async_own(d.resource_id()) == Some(ba::Own::Free)
+                    }
+                    PresentDestinationDesc::OptimalImage(_) => true,
+                };
+                window[n] = ba::Cand {
+                    live,
+                    dst: request.destination_resource_id,
+                    dispatchable: live
+                        && request.admitted
+                        && writable
+                        && self.scanout_boundary_ready(request.stream_boundary),
+                };
+                index[n] = i;
+            }
+            n += 1;
+        }
+        let pos = ba::pick(&window[..n])?;
+        Some((index[pos], pos))
     }
 
     /// Hand `resource_id` back to its readers if the KMD owns it as a writer, and do nothing (no
