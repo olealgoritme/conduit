@@ -334,6 +334,32 @@ pub struct Gate {
     next: u32,
     retired: u32,
     pts: [Point; GATE_POINTS],
+    /// When each point was attached (interrupt time, ms; 0 = unknown, never expires), for
+    /// [`Gate::take_expired`]: a point whose fire was lost must not hold the gate for ever.
+    stamps: [u32; GATE_POINTS],
+}
+
+/// A point that has not fired this long after it was attached is declared fired by the worker
+/// (`RmGateMs`, default; 0 = never): the host's own fence timeout is 5 s (`-ETIMEDOUT`, and the
+/// fire with an error status retires the present like a success), so 6 s means the `EventReady`
+/// itself was lost, which no real fence outlives.
+pub const GATE_EXPIRE_DEFAULT_MS: u32 = 6_000;
+/// Smallest nonzero `RmGateMs`.
+pub const GATE_EXPIRE_MIN_MS: u32 = 1_000;
+/// Largest `RmGateMs`.
+pub const GATE_EXPIRE_MAX_MS: u32 = 120_000;
+
+/// `RmGateMs` as the driver uses it: 0 stays 0 (never), anything else is clamped.
+pub const fn clamp_gate_expire_ms(raw: u32) -> u32 {
+    if raw == 0 {
+        0
+    } else if raw < GATE_EXPIRE_MIN_MS {
+        GATE_EXPIRE_MIN_MS
+    } else if raw > GATE_EXPIRE_MAX_MS {
+        GATE_EXPIRE_MAX_MS
+    } else {
+        raw
+    }
 }
 
 impl Default for Gate {
@@ -351,6 +377,7 @@ impl Gate {
                 fence: 0,
                 fired: false,
             }; GATE_POINTS],
+            stamps: [0; GATE_POINTS],
         }
     }
 
@@ -375,6 +402,11 @@ impl Gate {
 
     /// Attach `fence` (nonzero) as the next point; `fired` when it had already fired.
     pub fn attach(&mut self, fence: u32, fired: bool) -> Result<u32, GateError> {
+        self.attach_at(fence, fired, 0)
+    }
+
+    /// [`Self::attach`], stamping the point with `now_ms` (0 = no stamp: it never expires).
+    pub fn attach_at(&mut self, fence: u32, fired: bool, now_ms: u32) -> Result<u32, GateError> {
         if self.next > GATE_POINT_MAX {
             return Err(GateError::Exhausted);
         }
@@ -383,9 +415,37 @@ impl Gate {
         }
         let p = self.next;
         self.pts[p as usize % GATE_POINTS] = Point { fence, fired };
+        self.stamps[p as usize % GATE_POINTS] = now_ms;
         self.next += 1;
         self.advance();
         Ok(p)
+    }
+
+    /// The oldest unfired point attached at least `limit_ms` ago (stamped, `limit_ms` nonzero),
+    /// marked fired and its fence returned for the caller to close; `None` when none is that old.
+    /// Points fire in attach order only for retirement (`advance`), so scanning from the oldest
+    /// and stopping at the first that is not old enough is exact: stamps never decrease with the
+    /// point number.
+    pub fn take_expired(&mut self, now_ms: u32, limit_ms: u32) -> Option<u32> {
+        if limit_ms == 0 {
+            return None;
+        }
+        let mut p = self.retired + 1;
+        while p < self.next {
+            let i = p as usize % GATE_POINTS;
+            let pt = self.pts[i];
+            let stamp = self.stamps[i];
+            if !pt.fired && pt.fence != 0 {
+                if stamp == 0 || crate::stall_diag::age_ms(now_ms, stamp) < limit_ms {
+                    return None;
+                }
+                self.pts[i].fired = true;
+                self.advance();
+                return Some(pt.fence);
+            }
+            p += 1;
+        }
+        None
     }
 
     /// `fence` fired. `Some(retired)` if it names a pending point (whether or not
@@ -1153,5 +1213,65 @@ mod tests {
         assert_eq!(m.attached(), Attach::Discard);
         assert_eq!(m.attach(Attach::Scanout), Err(AttachError::AlreadyAttached));
         assert!(m.want_close());
+    }
+}
+
+#[cfg(test)]
+mod gate_expiry_tests {
+    extern crate std;
+    use super::*;
+
+    #[test]
+    fn a_point_that_never_fired_is_released_after_the_limit_and_retires_in_order() {
+        let mut g = Gate::new();
+        assert_eq!(g.attach_at(11, false, 1_000), Ok(1));
+        assert_eq!(g.attach_at(12, false, 1_500), Ok(2));
+        assert_eq!(g.take_expired(6_999, 6_000), None);
+        assert_eq!(g.take_expired(7_000, 6_000), Some(11));
+        assert_eq!(g.retired(), 1);
+        // point 2 is 5.5 s old at 7 000: not yet
+        assert_eq!(g.take_expired(7_000, 6_000), None);
+        assert_eq!(g.take_expired(7_500, 6_000), Some(12));
+        assert_eq!(g.retired(), 2);
+        assert!(g.is_idle());
+    }
+
+    #[test]
+    fn an_expired_point_behind_a_fired_one_still_retires_the_prefix() {
+        let mut g = Gate::new();
+        g.attach_at(1, false, 100).unwrap();
+        g.attach_at(2, false, 200).unwrap();
+        assert_eq!(g.fire(2), Some(0)); // out of order: point 2 fired, 1 holds retirement
+        assert_eq!(g.retired(), 0);
+        assert_eq!(g.take_expired(10_000, 6_000), Some(1));
+        assert_eq!(g.retired(), 2);
+    }
+
+    #[test]
+    fn off_unstamped_and_fired_points_never_expire() {
+        let mut g = Gate::new();
+        g.attach(5, false).unwrap(); // no stamp
+        assert_eq!(g.take_expired(u32::MAX, 6_000), None);
+        let mut g = Gate::new();
+        g.attach_at(5, false, 10).unwrap();
+        assert_eq!(g.take_expired(u32::MAX / 2, 0), None);
+        g.fire(5);
+        assert_eq!(g.take_expired(u32::MAX / 2, 6_000), None);
+    }
+
+    #[test]
+    fn the_clock_wrap_is_handled() {
+        let mut g = Gate::new();
+        g.attach_at(9, false, u32::MAX - 999).unwrap();
+        assert_eq!(g.take_expired(4_000, 6_000), None);
+        assert_eq!(g.take_expired(5_001, 6_000), Some(9));
+    }
+
+    #[test]
+    fn the_knob_clamps() {
+        assert_eq!(clamp_gate_expire_ms(0), 0);
+        assert_eq!(clamp_gate_expire_ms(5), GATE_EXPIRE_MIN_MS);
+        assert_eq!(clamp_gate_expire_ms(6_000), 6_000);
+        assert_eq!(clamp_gate_expire_ms(u32::MAX), GATE_EXPIRE_MAX_MS);
     }
 }

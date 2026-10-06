@@ -91,6 +91,7 @@ pub const fn pend_wd_step(i: PendWdInput) -> PendWdAction {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use crate::stall_diag::pack_flip;
 

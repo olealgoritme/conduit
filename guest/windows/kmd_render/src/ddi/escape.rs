@@ -904,12 +904,17 @@ fn escape_snapshot_status(
     {
         return STATUS_INVALID_PARAMETER;
     }
-    let idle = adapter.with_scanout_lifecycle(passive, |_| {
+    // The abortable acquire (v334): an escape queued behind a scanout-mutex holder that never lets
+    // go ends with a clean failure when its thread is killed, the device stops or `EscWaitMs`
+    // is spent, instead of waiting for ever.
+    let Some(idle) = adapter.try_with_scanout_lifecycle(passive, |_| {
         adapter.with_virtio(|v| {
             !context.has_snapshot_stash(out.resource_id)
                 && v.windowed_snapshot_idle(out.resource_id)
         })
-    });
+    }) else {
+        return STATUS_DEVICE_NOT_READY;
+    };
     out.out_state = match idle {
         Ok(true) => HELIOS_SNAPSHOT_IDLE,
         Ok(false) => HELIOS_SNAPSHOT_BUSY,

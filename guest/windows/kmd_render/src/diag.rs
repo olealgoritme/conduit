@@ -891,6 +891,13 @@ pub mod knobs {
     /// every wait the escape is in gives up with a clean failure status. Nonzero values are
     /// clamped to 250..600000. Read at every StartDevice; mirrored as `EscWaitMsEff`.
     pub const ESC_WAIT_MS: KnobName = KnobName::new(b"EscWaitMs");
+    /// `RmGateMs` (default 6000, 0 = never). An RM fence gate point (`docs/rm-fence-marker.md`
+    /// carrier (b)) whose `EventReady` has not come this many milliseconds after the fence was
+    /// attached is declared fired by the HPD worker (`RmGExp`): the host's own fence timeout is
+    /// 5 s, so a fire later than 6 s was lost, and the present it gates must not wait for it for
+    /// ever. Nonzero values are clamped to 1000..120000. Read at every StartDevice; mirrored as
+    /// `RmGateMsEff`.
+    pub const RM_GATE_MS: KnobName = KnobName::new(b"RmGateMs");
     /// `DeferBudget` (default 0 = unlimited, today's behaviour). The most Deferred programming
     /// attempts of one primary (about one per vsync tick) before the worker publishes the flip's
     /// address kept and lowers the gate instead of retrying again (`FkDefBud`). 240 is about

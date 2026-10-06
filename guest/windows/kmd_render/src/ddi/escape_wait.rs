@@ -48,6 +48,23 @@ static TIMEOUTS: AtomicU32 = AtomicU32::new(0);
 static LOCK_ABORTS: AtomicU32 = AtomicU32::new(0);
 static NO_SLOT: AtomicU32 = AtomicU32::new(0);
 static REFUSED_STOPPING: AtomicU32 = AtomicU32::new(0);
+/// The last `DxgkDdiPreemptCommand` (`PreFence`: the preemption fence id it carried, `PreLastCmp`:
+/// the last completed fence it reported, `PreDropped`: pending submissions it dropped,
+/// `PreStatus`: what it returned, `PreT`: when, interrupt ms).
+static PRE_FENCE: AtomicU32 = AtomicU32::new(0);
+static PRE_LAST: AtomicU32 = AtomicU32::new(0);
+static PRE_DROPPED: AtomicU32 = AtomicU32::new(0);
+static PRE_STATUS: AtomicU32 = AtomicU32::new(0);
+static PRE_T: AtomicU32 = AtomicU32::new(0);
+
+/// `DxgkDdiPreemptCommand` finished: remember what it did. Atomics only, any IRQL.
+pub(crate) fn note_preempt(fence: u32, last_completed: u32, dropped: u32, status: u32) {
+    PRE_FENCE.store(fence, Ordering::Relaxed);
+    PRE_LAST.store(last_completed, Ordering::Relaxed);
+    PRE_DROPPED.store(dropped, Ordering::Relaxed);
+    PRE_STATUS.store(status, Ordering::Relaxed);
+    PRE_T.store(now_ms().max(1), Ordering::Relaxed);
+}
 
 fn thread_id() -> u32 {
     // SAFETY: a scalar read of the current thread's cid; callable at any IRQL.
@@ -194,4 +211,9 @@ pub(crate) fn publish_counters() {
     rec(b"LkWaitAbort", LOCK_ABORTS.load(Ordering::Relaxed));
     rec(b"EscNoSlot", NO_SLOT.load(Ordering::Relaxed));
     rec(b"EscRefStop", REFUSED_STOPPING.load(Ordering::Relaxed));
+    rec(b"PreFence", PRE_FENCE.load(Ordering::Relaxed));
+    rec(b"PreLastCmp", PRE_LAST.load(Ordering::Relaxed));
+    rec(b"PreDropped", PRE_DROPPED.load(Ordering::Relaxed));
+    rec(b"PreStatus", PRE_STATUS.load(Ordering::Relaxed));
+    rec(b"PreT", PRE_T.load(Ordering::Relaxed));
 }

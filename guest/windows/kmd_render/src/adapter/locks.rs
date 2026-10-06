@@ -235,21 +235,29 @@ impl ScanoutGuard<'_> {
 }
 
 impl AdapterContext {
-    /// Acquire the PASSIVE venus mutex (blocks; PASSIVE_LEVEL only).
-    pub(super) fn acquire_venus_mutex(&self) {
+    /// Acquire the PASSIVE venus mutex (blocks; PASSIVE_LEVEL only). `false`: the wait gave up
+    /// (v334: the calling thread is inside an escape and is terminating, the device is stopping or
+    /// the escape's `EscWaitMs` is spent) and the mutex is NOT held: the caller must not touch the
+    /// client. A thread that is not inside an escape always gets `true`.
+    pub(super) fn acquire_venus_mutex(&self) -> bool {
         // `VnLkWaitMs` / `VnLkHoldMs` / `VnLkHeldMs` (`ddi::device_lost`): the longest wait for
         // this mutex, the longest hold, and the age of the current hold. Two clock reads.
         let wait_started = crate::adapter::foreign_scanout::now_100ns();
         // SAFETY: the event was initialized in place by `init_kernel_events`;
-        // an infinite Executive/KernelMode wait at PASSIVE_LEVEL. The
+        // an Executive/KernelMode wait at PASSIVE_LEVEL in 100 ms slices. The
         // SynchronizationEvent auto-clears on a satisfied wait (mutex acquire).
-        let _ = unsafe {
-            crate::sync::wait_logged(
+        let status = unsafe {
+            crate::sync::wait_logged_abortable(
                 self.venus_mutex.get() as PVOID,
                 helios_kmd_logic::stall_diag::lock::VENUS,
+                true,
             )
         };
+        if status < 0 {
+            return false;
+        }
         crate::ddi::device_lost::venus_acquired(wait_started);
+        true
     }
 
     /// Release the PASSIVE venus mutex.
@@ -270,14 +278,43 @@ impl AdapterContext {
         passive: PassiveLevel,
         f: impl FnOnce(&ScanoutGuard<'_>) -> R,
     ) -> R {
+        // The original, never-giving-up acquire: a caller that cannot fail uses this one, even
+        // from inside an escape (`try_with_scanout_lifecycle` is the one that can).
+        self.scanout_lifecycle_inner(passive, false, f)
+            .unwrap_or_else(|| unreachable_unabortable())
+    }
+
+    /// As [`Self::with_scanout_lifecycle`], but the acquire gives up (`None`, the closure NOT run,
+    /// the mutex NOT held) when the calling thread is inside an escape and is terminating, the
+    /// device is stopping or the escape's `EscWaitMs` is spent (v334, `ddi::escape_wait`). The
+    /// escape-reachable callers use it, so an escape queued behind a holder that never lets go
+    /// ends instead of waiting for ever.
+    pub(crate) fn try_with_scanout_lifecycle<R>(
+        &self,
+        passive: PassiveLevel,
+        f: impl FnOnce(&ScanoutGuard<'_>) -> R,
+    ) -> Option<R> {
+        self.scanout_lifecycle_inner(passive, true, f)
+    }
+
+    fn scanout_lifecycle_inner<R>(
+        &self,
+        passive: PassiveLevel,
+        abortable: bool,
+        f: impl FnOnce(&ScanoutGuard<'_>) -> R,
+    ) -> Option<R> {
         // SAFETY: initialized in place by `init_kernel_events`; all callers are
         // PASSIVE-level display worker or allocation-lifecycle paths.
-        let _ = unsafe {
-            crate::sync::wait_logged(
+        let status = unsafe {
+            crate::sync::wait_logged_abortable(
                 self.scanout_mutex.get() as PVOID,
                 helios_kmd_logic::stall_diag::lock::SCANOUT,
+                abortable,
             )
         };
+        if status < 0 {
+            return None;
+        }
         // `ScLkN` / `ScLkAcqT` / `ScLkRelT` (`ddi::stall_diag`): when the mutex was last taken
         // and last given back, so a stall dump can tell "the worker waits on a mutex somebody
         // holds for seconds" from "the worker holds it". Atomics and a clock read.
@@ -291,7 +328,7 @@ impl AdapterContext {
         crate::ddi::stall_diag::note_lock_released();
         // SAFETY: release the synchronization-event mutex acquired above.
         unsafe { KeSetEvent(self.scanout_mutex.get(), 0, 0) };
-        result
+        Some(result)
     }
 
     /// Run `f` against the persistent venus client under the PASSIVE venus
@@ -315,7 +352,11 @@ impl AdapterContext {
         _passive: PassiveLevel,
         f: impl FnOnce(&mut crate::virtio::venus::VenusClient) -> R,
     ) -> Result<R, NotStarted> {
-        self.acquire_venus_mutex();
+        if !self.acquire_venus_mutex() {
+            // Gave up inside an escape (v334): the same answer as "no client", which every
+            // caller already handles, and the mutex is not held.
+            return Err(NotStarted);
+        }
         // SAFETY: the venus mutex gives exclusive access to the cell.
         let result = match unsafe { &mut *self.venus_client.get() } {
             Some(client) => Ok(f(client)),
@@ -417,4 +458,12 @@ impl AdapterContext {
             unsafe { KeSetEvent(self.control_space_event.get(), 0, 0) };
         }
     }
+}
+
+/// `with_scanout_lifecycle` runs the inner acquire with `abortable = false`, which returns `Some`
+/// by construction (the wait never gives up); this names the impossible arm.
+#[cold]
+fn unreachable_unabortable() -> ! {
+    // A wait that cannot abort did: the lock may not be held, and nothing can be done safely.
+    panic!("unabortable scanout acquire failed")
 }

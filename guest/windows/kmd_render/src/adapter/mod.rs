@@ -1870,7 +1870,12 @@ impl AdapterContext {
     /// StopDevice teardown). Device-lifecycle callers only; the previous client
     /// (if any) drops OUTSIDE the mutex, at PASSIVE_LEVEL.
     pub fn set_venus_client(&self, client: Option<crate::virtio::venus::VenusClient>) {
-        self.acquire_venus_mutex();
+        if !self.acquire_venus_mutex() {
+            // Not reachable (only the device lifecycle calls this, never inside an escape), but
+            // never touch the cell without the mutex.
+            drop(client);
+            return;
+        }
         // SAFETY: the venus mutex gives exclusive access to the cell.
         let old = core::mem::replace(unsafe { &mut *self.venus_client.get() }, client);
         self.release_venus_mutex();

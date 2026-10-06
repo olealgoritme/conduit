@@ -294,6 +294,9 @@ impl<const N: usize> Default for Slots<N> {
 /// * `EscNoSlot`: escapes that found the table full (they run with the old unbounded waits).
 /// * `EscWaitMsEff`: `EscWaitMs` in force (clamped, 0 = no deadline).
 /// * `EscRefStop`: escapes refused at entry because the device was already stopping.
+/// * `PreFence`, `PreLastCmp`, `PreDropped`, `PreStatus`, `PreT`: the last `DxgkDdiPreemptCommand`:
+///   the preemption fence id, the last completed fence it reported, the pending submissions it
+///   dropped, its status and when (interrupt ms).
 pub const COUNTERS: [&str; 8] = [
     "EscWaitN",
     "EscWaitMax",
@@ -307,10 +310,12 @@ pub const COUNTERS: [&str; 8] = [
 
 /// `EscRefStop` is separate only so the list above stays the ones written by the escape scope; it
 /// is written by the same file.
-pub const COUNTERS_EXTRA: [&str; 1] = ["EscRefStop"];
+pub const COUNTERS_EXTRA: [&str; 6] =
+    ["EscRefStop", "PreFence", "PreLastCmp", "PreDropped", "PreStatus", "PreT"];
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
 
     fn probe() -> Probe {

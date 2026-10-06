@@ -1786,7 +1786,11 @@ pub fn release_blob_for_owner_within(
     // A snapshot/DWM resource cannot detach while a deferred WindowedBlt
     // still owns its reader lease or reusable Venus command. Cancellation is
     // exact by resource id; cache release runs before detach/unref.
-    let terminal = adapter.with_scanout_lifecycle(passive, |lock| -> Result<(), VirtioError> {
+    // The abortable acquire (v334, `ddi::escape_wait`): this is the RELEASE_BLOB escape's path. A
+    // thread that gave up leaves the blob out of the table and on the host (the transport reset
+    // reclaims it), the same outcome as a host that never answers, and returns an error.
+    let terminal = adapter
+        .try_with_scanout_lifecycle(passive, |lock| -> Result<(), VirtioError> {
         lock.with_venus_client(|client| {
             let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
             client.release_present_blits_for_resource(adapter, res)
@@ -1804,7 +1808,8 @@ pub fn release_blob_for_owner_within(
         } else {
             Err(VirtioError::DeviceError)
         }
-    });
+    })
+        .unwrap_or(Err(VirtioError::Timeout));
     terminal?;
     if mapped {
         if let Some(timeout_ms) = sweep_timeout_ms(budget) {
@@ -1834,7 +1839,7 @@ pub fn release_blob_for_owner_within(
     // serialized by it (see `note_alloc_retired`'s contract); PASSIVE here, no
     // other lock held, so the acquisition is legal and unordered against
     // nothing. A resid with no ledger slot no-ops.
-    adapter.with_scanout_lifecycle(passive, |_lock| {
+    let _ = adapter.try_with_scanout_lifecycle(passive, |_lock| {
         adapter.read_ledger.note_alloc_retired(res);
     });
     result

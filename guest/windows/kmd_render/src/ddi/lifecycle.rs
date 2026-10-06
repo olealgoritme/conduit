@@ -209,6 +209,14 @@ fn reread_cached_knobs() {
     crate::ddi::stall_diag::reread_knobs();
     // `EscWaitMs`, and the stopping flag back down: a new generation begins (v334).
     crate::ddi::escape_wait::reread_knobs();
+    // `RmGateMs` (default 6000, 0 = never): the RM gates' lost-fire valve, mirrored `RmGateMsEff`.
+    crate::virtio::gpu::RMG_EXPIRE_MS.store(
+        helios_kmd_logic::rm_fence_present::clamp_gate_expire_ms(crate::diag::read_config_dword(
+            crate::diag::knobs::RM_GATE_MS,
+            helios_kmd_logic::rm_fence_present::GATE_EXPIRE_DEFAULT_MS,
+        )),
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// After the previous transport's state was forgotten (`retire_transport`): the new generation's
