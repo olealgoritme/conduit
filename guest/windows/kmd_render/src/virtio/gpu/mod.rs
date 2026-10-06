@@ -209,8 +209,25 @@ pub struct BlobMapPrep {
 pub struct DeviceOwner(core::num::NonZeroUsize);
 
 impl DeviceOwner {
+    /// The owner of the KMD's OWN RM client (`virtio::rm_client`): a token no
+    /// escape can present. `hDevice` is a pointer to a boxed `DeviceContext`, which
+    /// is never all ones, and [`Self::new`] refuses that value anyway, so a user-mode
+    /// sweep (`close_all_for_owner`) can never name the KMD's handles; only the
+    /// transport-wide sweep (`close_all_on_host`) closes them.
+    pub const KMD_RM: DeviceOwner = DeviceOwner(core::num::NonZeroUsize::MAX);
+
     /// `None` for a null handle — the caller must refuse rather than substitute.
+    /// Also `None` for [`Self::KMD_RM`]'s value.
     pub fn new(raw: usize) -> Option<Self> {
+        core::num::NonZeroUsize::new(raw)
+            .filter(|v| *v != core::num::NonZeroUsize::MAX)
+            .map(Self)
+    }
+
+    /// Rebuild an owner from the raw token the KMD itself stored (the foreign
+    /// scanout state keeps `raw()` as a `u64`), including [`Self::KMD_RM`]. Never
+    /// for a value that came from an escape: those go through [`Self::new`].
+    pub(crate) fn from_token(raw: usize) -> Option<Self> {
         core::num::NonZeroUsize::new(raw).map(Self)
     }
 

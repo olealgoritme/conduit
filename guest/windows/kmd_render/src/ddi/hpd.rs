@@ -263,6 +263,10 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // those already-signalled edges; it never polls a producer.
         crate::ddi::display::service_windowed_blt(passive, adapter);
 
+        // The KMD's own RM client (`KmdRmClient`, off by default: a no-op then). After
+        // the deferred programming above, so a primary bound in this very pass is seen.
+        crate::virtio::rm_client::service(passive, adapter);
+
         // The `Nv*` registry mirror the NVRM escapes asked for. It used to run
         // inside the escape (about a millisecond added to every Open / Close /
         // Map / Pin and to every 256th forward); here it costs nobody's latency.

@@ -1,0 +1,1052 @@
+//! The KMD's own RM client: the I/O half. Design, stages, failure matrix and the
+//! hardware checklist: `docs/kmd-rm-client.md`. The decisions (which step is next,
+//! what a failure does, the payloads) are `helios_kmd_logic::rm_client`; this file
+//! only performs them.
+//!
+//! WHAT IT IS. The KMD speaks the NVIDIA RM protocol itself, over the same
+//! forwarding path a user-mode RM client uses (`nvrm::forward`, i.e. the allow-list,
+//! the ownership tables and the quotas), under one reserved owner,
+//! [`DeviceOwner::KMD_RM`]. That owner is not any `hDevice`, so a process's sweep
+//! (`close_all_for_owner`) can never touch these handles; the transport-wide sweep
+//! (`close_all_on_host`, run by `retire_transport`) closes them while the host still
+//! answers, exactly as it closes everybody's. Its quotas are its own (the per-owner
+//! limits apply to this owner alone), and its objects are the first thing the KMD
+//! owns that is NOT a Venus resource.
+//!
+//! WHEN IT RUNS. Never unless the `KmdRmClient` service-key DWORD is nonzero, and
+//! then only on the HPD worker thread (PASSIVE, the one thread that already does the
+//! display's host round trips), after the display half has bound a VidPn primary:
+//! [`service`] is one line in the worker loop. It is the ONLY mutator of the client
+//! while a worker runs (StopDevice joins the worker before `retire_transport`; see
+//! [`retire_begin`]). Each pass performs at most [`STEPS_PER_PASS`] steps and wakes
+//! the worker again for the rest, so a bring-up never holds the display's refresh
+//! for more than a few round trips at a time.
+//!
+//! LOCKING. `CLIENT` is a LEAF spinlock holding plain data (`rm_client::Client`):
+//! never held across a host round trip, a wait, an allocation or another lock; every
+//! step copies what it needs out under the lock, does its I/O with no lock held, and
+//! reports back under the lock (discarding the report if the transport generation
+//! changed meanwhile). It is never taken with `virtio_lock` held, nor the other way
+//! round (`with_virtio` is called only with `CLIENT` released).
+//!
+//! FAILING CLOSED. A failure in bring-up or in the surface path kills the client for
+//! the transport generation ([`cleanup`] closes what it opened); nothing falls over,
+//! because nothing consumes the client yet but the probe, and every other allocation
+//! is still Venus. A failure of the CPU view or the probe only gives those up.
+
+use super::gpu::DeviceOwner;
+use super::nvrm::{self, MapRefusal, Refusal};
+use super::VirtioError;
+use crate::adapter::AdapterContext;
+use crate::irql::PassiveLevel;
+use crate::sync::SpinLock;
+use alloc::vec::Vec;
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use helios_kmd_logic::foreign_scanout::SetError;
+use helios_kmd_logic::rm_client::{
+    self as rc, Action, Client, Fail, FailKind, Out, Step, Want, MAX_DRI,
+};
+use wdk_sys::ntddk::{MmMapIoSpace, MmUnmapIoSpace};
+use wdk_sys::{PHYSICAL_ADDRESS, _MEMORY_CACHING_TYPE};
+
+/// The one owner of every handle this client opens.
+const KMD: DeviceOwner = DeviceOwner::KMD_RM;
+
+/// Steps performed per worker pass before the worker is woken again.
+const STEPS_PER_PASS: usize = 6;
+/// How long any one host message may take.
+const TIMEOUT_MS: u64 = 10_000;
+/// How long the probe picture stays on screen: the foreign scanout source's lapse,
+/// after which the HPD worker gives scanout 0 back by itself (`FsLapse`).
+const PROBE_LAPSE_MS: u32 = 4_000;
+/// The largest `Ioctl` reply any RM step expects (`NV_ESC_RM_ALLOC` of a memory
+/// object: 16 + 12 + 48 + 128), with room.
+const REPLY_MAX: usize = 384;
+/// The largest request a step builds on the stack (the same alloc plus headers).
+const REQUEST_MAX: usize = 256;
+const PAGE: u64 = 4096;
+
+/// The one client. See the module docs for what may touch it and when.
+static CLIENT: SpinLock<Client> = SpinLock::new(Client::new());
+
+/// The `KmdRmClient` knob, read once per transport generation (so `reg add` +
+/// `pnputil /restart-device` applies it). `KNOB_EPOCH` is the generation it was read
+/// for; 0 is no generation.
+static KNOB_EPOCH: AtomicU64 = AtomicU64::new(0);
+static KNOB_LEVEL: AtomicU32 = AtomicU32::new(0);
+
+/// Counters, mirrored by [`publish_counters`] (names at most 14 characters).
+///
+/// `RmStatus` is [`Client::status_word`] after the last pass, `RmStep` the step
+/// started last (written BEFORE the step runs, so a hang names itself), `RmFail` the
+/// packed failure of the last death (`step << 24 | kind << 16 | code`), `RmDead` how
+/// many times the client died, `RmSteps` steps performed, `RmBringUp` bring-ups
+/// finished, `RmSurf` / `RmSurfFree` surfaces made / freed, `RmGem` GEM handles
+/// imported, `RmView` / `RmViewFree` kernel views made / unmapped, `RmFillMs` how long
+/// the last probe fill took, `RmRdBad` probe read-back samples that did not match,
+/// `RmProbe` probe flips shown, `RmBusy` probe sets that found scanout 0 held,
+/// `RmClosed` handles closed by cleanup, `RmSoft` undo steps that failed, `RmRegFd`
+/// `REGISTER_FD`s the host refused (harmless, as in librmclient).
+pub static RM_STATUS: AtomicU32 = AtomicU32::new(0);
+pub static RM_LAST_STEP: AtomicU32 = AtomicU32::new(0);
+pub static RM_FAIL: AtomicU32 = AtomicU32::new(0);
+pub static RM_DEAD: AtomicU32 = AtomicU32::new(0);
+pub static RM_STEPS: AtomicU32 = AtomicU32::new(0);
+pub static RM_BRING_UPS: AtomicU32 = AtomicU32::new(0);
+pub static RM_SURFACES: AtomicU32 = AtomicU32::new(0);
+pub static RM_SURFACES_FREED: AtomicU32 = AtomicU32::new(0);
+pub static RM_GEMS: AtomicU32 = AtomicU32::new(0);
+pub static RM_VIEWS: AtomicU32 = AtomicU32::new(0);
+pub static RM_VIEWS_FREED: AtomicU32 = AtomicU32::new(0);
+pub static RM_FILL_MS: AtomicU32 = AtomicU32::new(0);
+pub static RM_READBACK_BAD: AtomicU32 = AtomicU32::new(0);
+pub static RM_PROBES: AtomicU32 = AtomicU32::new(0);
+pub static RM_BUSY: AtomicU32 = AtomicU32::new(0);
+pub static RM_CLOSED: AtomicU32 = AtomicU32::new(0);
+pub static RM_SOFT: AtomicU32 = AtomicU32::new(0);
+pub static RM_REGFD_REFUSED: AtomicU32 = AtomicU32::new(0);
+
+/// Mirror the counters to the registry. PASSIVE only. Cheap to call when the knob
+/// is off: nothing is written until the client has done something.
+pub(crate) fn publish_counters() {
+    use crate::diag::record_named_bytes as rec;
+    if KNOB_LEVEL.load(Ordering::Relaxed) == 0 && RM_STEPS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    rec(b"RmKnob", KNOB_LEVEL.load(Ordering::Relaxed));
+    rec(b"RmStatus", RM_STATUS.load(Ordering::Relaxed));
+    rec(b"RmStep", RM_LAST_STEP.load(Ordering::Relaxed));
+    rec(b"RmFail", RM_FAIL.load(Ordering::Relaxed));
+    rec(b"RmDead", RM_DEAD.load(Ordering::Relaxed));
+    rec(b"RmSteps", RM_STEPS.load(Ordering::Relaxed));
+    rec(b"RmBringUp", RM_BRING_UPS.load(Ordering::Relaxed));
+    rec(b"RmSurf", RM_SURFACES.load(Ordering::Relaxed));
+    rec(b"RmSurfFree", RM_SURFACES_FREED.load(Ordering::Relaxed));
+    rec(b"RmGem", RM_GEMS.load(Ordering::Relaxed));
+    rec(b"RmView", RM_VIEWS.load(Ordering::Relaxed));
+    rec(b"RmViewFree", RM_VIEWS_FREED.load(Ordering::Relaxed));
+    rec(b"RmFillMs", RM_FILL_MS.load(Ordering::Relaxed));
+    rec(b"RmRdBad", RM_READBACK_BAD.load(Ordering::Relaxed));
+    rec(b"RmProbe", RM_PROBES.load(Ordering::Relaxed));
+    rec(b"RmBusy", RM_BUSY.load(Ordering::Relaxed));
+    rec(b"RmClosed", RM_CLOSED.load(Ordering::Relaxed));
+    rec(b"RmSoft", RM_SOFT.load(Ordering::Relaxed));
+    rec(b"RmRegFd", RM_REGFD_REFUSED.load(Ordering::Relaxed));
+}
+
+// ---- the worker's entry ------------------------------------------------------------
+
+/// The extent of the VidPn primary the display half has bound, if one is: the size the
+/// scanout surface must have.
+fn wanted_surface(adapter: &AdapterContext) -> Option<(u32, u32)> {
+    if !adapter.display_half() {
+        return None;
+    }
+    let wh = adapter.active_scanout_wh.load(Ordering::Acquire);
+    if adapter.active_scanout_resource.load(Ordering::Acquire) == 0 || wh == 0 {
+        return None;
+    }
+    Some(((wh >> 32) as u32, wh as u32))
+}
+
+/// The knob for this transport generation, read once.
+fn level_for(epoch: u64) -> u8 {
+    if KNOB_EPOCH.load(Ordering::Acquire) != epoch {
+        let v = crate::diag::read_config_dword(crate::diag::knobs::KMD_RM_CLIENT, 0);
+        KNOB_LEVEL.store(v.min(2), Ordering::Release);
+        KNOB_EPOCH.store(epoch, Ordering::Release);
+        // Nothing is written for the default (off): the registry stays as it was.
+        if v != 0 {
+            crate::diag::record_named_bytes(b"RmKnob", v.min(2));
+        }
+    }
+    KNOB_LEVEL.load(Ordering::Acquire) as u8
+}
+
+/// One pass of the client, from the HPD worker's loop (PASSIVE). Does nothing at all
+/// unless `KmdRmClient` is nonzero and a VidPn primary is bound.
+pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
+    // No transport: nothing to do, and `retire_transport` already forgot the client.
+    let Ok(epoch) = adapter.with_virtio(|v| v.nvrm_epoch()) else {
+        return;
+    };
+    if epoch == 0 {
+        return;
+    }
+    let level = level_for(epoch);
+    if level == 0 {
+        return;
+    }
+    let want = Want {
+        level,
+        surface: wanted_surface(adapter),
+    };
+
+    // A new transport generation: every handle of the old one is gone. The kernel view
+    // is unmapped first (retire normally did it already; this is the belt).
+    {
+        let mut view = None;
+        let mut g = CLIENT.lock();
+        if g.epoch() != epoch {
+            view = g.take_view();
+            g.sync_epoch(epoch);
+        }
+        drop(g);
+        unmap_view(view);
+    }
+
+    let io = Io {
+        passive,
+        adapter,
+        epoch,
+    };
+    let mut did = 0usize;
+    let mut more = false;
+    for i in 0..STEPS_PER_PASS {
+        let (action, snapshot) = {
+            let g = CLIENT.lock();
+            (g.next(want), *g)
+        };
+        match action {
+            Action::Idle => break,
+            Action::Dead => {
+                // `take_cleanup` is empty once it has run: this is safe every pass.
+                cleanup(&io);
+                break;
+            }
+            Action::Step(step) => {
+                RM_LAST_STEP.store(step as u32, Ordering::Relaxed);
+                // Before the step, so a step that wedges the thread names itself.
+                crate::diag::record_named_bytes(b"RmStep", step as u32);
+                RM_STEPS.fetch_add(1, Ordering::Relaxed);
+                let result = io.perform(step, &snapshot, want);
+                did += 1;
+                if !apply(epoch, step, result, &snapshot) {
+                    // The generation changed under the step: it is moot.
+                    break;
+                }
+                if CLIENT.lock().is_dead() {
+                    cleanup(&io);
+                    break;
+                }
+                more = i + 1 == STEPS_PER_PASS;
+            }
+        }
+    }
+    if did != 0 {
+        let word = CLIENT.lock().status_word();
+        RM_STATUS.store(word, Ordering::Relaxed);
+        publish_counters();
+    }
+    if more {
+        // The rest of the bring-up goes on after the worker has done its other duties.
+        adapter.signal_hpd();
+    }
+}
+
+/// Report a finished step. `false` if the client no longer belongs to `epoch` (the
+/// result is dropped, and a kernel view it made is unmapped).
+fn apply(epoch: u64, step: Step, result: Result<Out, Fail>, before: &Client) -> bool {
+    let mut g = CLIENT.lock();
+    if g.epoch() != epoch {
+        drop(g);
+        if let Ok(Out::Mapped(va, len)) = result {
+            unmap_view(Some((va, len)));
+        }
+        return false;
+    }
+    let was_up = g.bring_up_done();
+    let had_surface = g.ready_surface().is_some();
+    if let Err(f) = &result {
+        if f.kind == FailKind::Busy {
+            RM_BUSY.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let soft_before = before.soft_errors();
+    g.finish(step, result);
+    let soft_after = g.soft_errors();
+    if soft_after > soft_before {
+        RM_SOFT.fetch_add(soft_after - soft_before, Ordering::Relaxed);
+    }
+    if !was_up && g.bring_up_done() {
+        RM_BRING_UPS.fetch_add(1, Ordering::Relaxed);
+    }
+    match step {
+        Step::GemImport if g.gem() != 0 => {
+            RM_GEMS.fetch_add(1, Ordering::Relaxed);
+        }
+        Step::CloseExportCh if !had_surface && g.ready_surface().is_some() => {
+            RM_SURFACES.fetch_add(1, Ordering::Relaxed);
+        }
+        Step::FreeMemory if g.surface().is_none() => {
+            RM_SURFACES_FREED.fetch_add(1, Ordering::Relaxed);
+        }
+        Step::KernelMap if g.view().is_some() => {
+            RM_VIEWS.fetch_add(1, Ordering::Relaxed);
+        }
+        Step::ScanoutPresent if g.probe() == rc::Probe::Shown => {
+            RM_PROBES.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    let died = g.failure().map(|f| f.pack());
+    // The registry write is a PASSIVE-only call: never under the spinlock.
+    drop(g);
+    if let Some(pack) = died {
+        RM_FAIL.store(pack, Ordering::Relaxed);
+        RM_DEAD.fetch_add(1, Ordering::Relaxed);
+        crate::diag::record_named_bytes(b"RmFail", pack);
+    }
+    true
+}
+
+/// A dead client: unmap its view, then close what it opened (closing the control file
+/// frees every RM client made on it; closing the DRM file drops its GEM handles).
+/// Nothing is retried; the client stays dead until the next transport generation.
+fn cleanup(io: &Io<'_>) {
+    let (view, handles) = {
+        let mut g = CLIENT.lock();
+        (g.take_view(), g.take_cleanup())
+    };
+    unmap_view(view);
+    for &h in handles.as_slice() {
+        if io.close_file(h) {
+            RM_CLOSED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if handles.as_slice().is_empty() {
+        return;
+    }
+    publish_counters();
+}
+
+// ---- retirement --------------------------------------------------------------------
+
+/// The transport is about to be retired (`nvrm::close_all_on_host`, first thing, before
+/// it even asks whether the host is alive): unmap the kernel view of the RM mapping, so
+/// no virtual address outlives the window range the host is about to release. The
+/// client's handles are in the NVRM tables under [`DeviceOwner::KMD_RM`] and are
+/// closed by that same sweep.
+pub(crate) fn retire_begin(_passive: PassiveLevel) {
+    let view = CLIENT.lock().take_view();
+    unmap_view(view);
+}
+
+/// The transport is gone: forget everything (the sweep closed the host side). A view
+/// the worker recorded after [`retire_begin`] looked (a start without a stop, the one
+/// path on which a worker can still be running) is unmapped here, so none outlives it.
+pub(crate) fn forget() {
+    let view = {
+        let mut g = CLIENT.lock();
+        let view = g.take_view();
+        g.forget();
+        view
+    };
+    unmap_view(view);
+}
+
+fn unmap_view(view: Option<(u64, u64)>) {
+    if let Some((va, len)) = view {
+        // SAFETY: `va`/`len` came from `MmMapIoSpace` in `kernel_map` and were taken
+        // out of the client (or never recorded) exactly once, so this unmaps it
+        // exactly once; PASSIVE (the worker, StopDevice or StartDevice).
+        unsafe { MmUnmapIoSpace(va as *mut c_void, len) };
+        RM_VIEWS_FREED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// ---- the I/O -----------------------------------------------------------------------
+
+fn page_up(v: u64) -> u64 {
+    (v + PAGE - 1) & !(PAGE - 1)
+}
+
+/// How a refused or failed forward looks to the machine.
+fn fail_of(r: Refusal) -> Fail {
+    match r {
+        Refusal::MsgType => Fail::new(FailKind::Refused, 1),
+        Refusal::NotOwned => Fail::new(FailKind::Refused, 2),
+        Refusal::NoResources => Fail::new(FailKind::Refused, 3),
+        Refusal::Forbidden => Fail::new(FailKind::Refused, 4),
+        Refusal::BadRange => Fail::new(FailKind::Refused, 5),
+        Refusal::Transport(VirtioError::Timeout) => Fail::new(FailKind::Transport, 1),
+        Refusal::Transport(VirtioError::QueueFull | VirtioError::OutOfMemory) => {
+            Fail::new(FailKind::Transport, 2)
+        }
+        Refusal::Transport(_) => Fail::new(FailKind::Transport, 3),
+    }
+}
+
+/// One step's context: the token, the adapter, and the generation the client belongs to.
+struct Io<'a> {
+    passive: PassiveLevel,
+    adapter: &'a AdapterContext,
+    epoch: u64,
+}
+
+impl Io<'_> {
+    /// Forward one host message as the KMD's owner and return the reply length. A reply
+    /// from a different transport generation than the client's is a failure: the
+    /// handles it names are not this client's any more.
+    fn send(&self, req: &[u8], resp: &mut [u8]) -> Result<usize, Fail> {
+        let mut seen = None;
+        let n = nvrm::forward(
+            self.passive,
+            self.adapter,
+            KMD,
+            req,
+            resp,
+            TIMEOUT_MS,
+            0,
+            0,
+            &mut seen,
+        )
+        .map_err(fail_of)?;
+        if seen.is_some_and(|g| g != self.epoch) {
+            return Err(Fail::new(FailKind::Transport, 0xE0));
+        }
+        Ok(n)
+    }
+
+    /// Build and send an `Ioctl` of `cmd` on backend handle `handle`, with `data` and
+    /// `nested`. The request is built on the stack when it fits [`REQUEST_MAX`], else on
+    /// the heap (only `CARD_INFO` needs that).
+    fn exchange(
+        &self,
+        handle: u32,
+        cmd: u32,
+        data: &[u8],
+        nested: &[u8],
+        resp: &mut [u8],
+    ) -> Result<usize, Fail> {
+        let total = rc::MSG_HDR + rc::IOCTL_REQ + data.len() + nested.len();
+        if total <= REQUEST_MAX {
+            let mut req = [0u8; REQUEST_MAX];
+            let n = rc::build_ioctl(&mut req, handle, cmd, data, nested)
+                .ok_or(Fail::new(FailKind::Parse, 1))?;
+            return self.send(req.get(..n).ok_or(Fail::new(FailKind::Parse, 1))?, resp);
+        }
+        let mut req = Vec::<u8>::new();
+        if req.try_reserve_exact(total).is_err() {
+            return Err(Fail::new(FailKind::Os, 1));
+        }
+        req.resize(total, 0);
+        let n = rc::build_ioctl(&mut req, handle, cmd, data, nested)
+            .ok_or(Fail::new(FailKind::Parse, 1))?;
+        self.send(req.get(..n).ok_or(Fail::new(FailKind::Parse, 1))?, resp)
+    }
+
+    /// `Open` of `device_type`; the backend handle.
+    fn open_file(&self, device_type: u32) -> Result<u32, Fail> {
+        let mut req = [0u8; 32];
+        let n = rc::build_open(&mut req, device_type).ok_or(Fail::new(FailKind::Parse, 2))?;
+        let mut resp = [0u8; 64];
+        let len = self.send(
+            req.get(..n).ok_or(Fail::new(FailKind::Parse, 2))?,
+            &mut resp,
+        )?;
+        let reply = resp.get(..len).ok_or(Fail::new(FailKind::Parse, 2))?;
+        if let Some(h) = rc::parse_open_reply(reply) {
+            return Ok(h);
+        }
+        match rc::reply_status(reply) {
+            Some(s) if s != 0 => Err(Fail::new(FailKind::Host, s.unsigned_abs())),
+            _ => {
+                // The host opened something the reply cannot name usably: the
+                // transport table recorded it (any nonzero handle), so close it.
+                if let Some(h) = rc::get32(reply, 4).filter(|h| *h != 0) {
+                    self.close_file(h);
+                }
+                Err(Fail::new(FailKind::Parse, 2))
+            }
+        }
+    }
+
+    /// `Close` of `handle`; whether the host closed it.
+    fn close_file(&self, handle: u32) -> bool {
+        let mut req = [0u8; 32];
+        let Some(n) = rc::build_close(&mut req, handle) else {
+            return false;
+        };
+        let mut resp = [0u8; 64];
+        let Some(req) = req.get(..n) else {
+            return false;
+        };
+        match self.send(req, &mut resp) {
+            Ok(len) => resp
+                .get(..len)
+                .and_then(rc::reply_status)
+                .is_some_and(|s| s == 0),
+            Err(_) => false,
+        }
+    }
+
+    /// `NV_ESC_RM_ALLOC` of `class` as `h_new` under `parent`, with `params`: the reply.
+    #[allow(clippy::too_many_arguments)]
+    fn rm_alloc(
+        &self,
+        ctl: u32,
+        root: u32,
+        parent: u32,
+        h_new: u32,
+        class: u32,
+        params: &[u8],
+        resp: &mut [u8],
+    ) -> Result<usize, Fail> {
+        let block = rc::nvos64(root, parent, h_new, class, params.len() as u32);
+        let n = self.exchange(ctl, rc::nv_cmd(rc::ESC_RM_ALLOC, 48), &block, params, resp)?;
+        // The status word has to be checked here for every caller: RM said no, or yes.
+        rc::rm_reply(
+            resp.get(..n).ok_or(Fail::new(FailKind::Parse, 3))?,
+            rc::NVOS64_STATUS_AT,
+        )
+        .map_err(Fail::from)?;
+        Ok(n)
+    }
+
+    /// Perform one step. Each arm is its own function, so the stack buffers of one
+    /// step never add to another's frame (this runs on a worker thread, under a deep
+    /// transport call).
+    fn perform(&self, step: Step, c: &Client, want: Want) -> Result<Out, Fail> {
+        match step {
+            Step::OpenCtl => self.open_file(rc::DEV_CTL).map(Out::Handle),
+            Step::VersionQuery => self.version_query(c),
+            Step::VersionStrict => self.version_strict(c),
+            Step::CardInfo => self.card_info(c),
+            Step::AllocRoot => self.alloc_root(c),
+            Step::OpenGpu => self.open_file(c.minor()).map(Out::Handle),
+            Step::RegisterGpuFd => self.register_fd(c.gpu(), c.ctl()),
+            Step::AllocDevice => self.alloc_device(c),
+            Step::AllocSubdevice => self.alloc_subdevice(c),
+            Step::SysFiles => self.sys_files(c),
+            Step::OpenDrm => self
+                .open_file(rc::DEV_DRI_BASE.saturating_add(c.dri_index()))
+                .map(Out::Handle),
+
+            Step::AllocMemory => self.alloc_memory(c, want),
+            Step::OpenExportCh => self.open_file(rc::DEV_CTL).map(Out::Handle),
+            Step::ExportToFd => self.export_to_fd(c),
+            Step::GemImport => self.gem_import(c),
+            Step::CloseExportCh => self.close_checked(c.export_ch()),
+            Step::GemClose => self.gem_close(c),
+            Step::FreeMemory => self.free_memory(c),
+
+            Step::OpenMapCh => self.open_file(c.minor()).map(Out::Handle),
+            Step::RegisterMapFd => self.register_fd(c.map_ch(), c.ctl()),
+            Step::RmMapMemory => self.rm_map_memory(c),
+            Step::HostMmap => self.host_mmap(c),
+            Step::KernelMap => self.kernel_map(c),
+            Step::KernelUnmap => {
+                // The machine still holds the view: take it back for the unmap.
+                let view = CLIENT.lock().take_view();
+                unmap_view(view);
+                Ok(Out::Unit)
+            }
+            Step::HostMunmap => {
+                let (id, _) = c.view_host();
+                nvrm::release_host_map(self.passive, self.adapter, c.map_ch(), id)
+                    .map(|()| Out::Unit)
+                    .map_err(|e| fail_of(Refusal::Transport(e)))
+            }
+            Step::RmUnmapMemory => self.rm_unmap_memory(c),
+            Step::CloseMapCh => self.close_checked(c.map_ch()),
+
+            Step::FillPattern => self.fill_pattern(c),
+            Step::ScanoutSet => self.scanout_set(c),
+            Step::ScanoutPresent => self.scanout_present(c),
+        }
+    }
+
+    // ---- bring-up ------------------------------------------------------------------
+
+    #[inline(never)]
+    fn version_query(&self, c: &Client) -> Result<Out, Fail> {
+        let blank = [0u8; rc::VERSION_STR_BYTES];
+        let data = rc::version_params(rc::VERSION_CMD_QUERY, &blank);
+        let mut resp = [0u8; REPLY_MAX];
+        let n = self.exchange(
+            c.ctl(),
+            rc::nv_cmd(rc::ESC_CHECK_VERSION_STR, rc::VERSION_BYTES as u32),
+            &data,
+            &[],
+            &mut resp,
+        )?;
+        let reply = rc::parse_ioctl_reply(resp.get(..n).ok_or(Fail::new(FailKind::Parse, 4))?)
+            .map_err(|e| match e {
+                rc::ReplyError::Host(s) => Fail::new(FailKind::Host, s.unsigned_abs()),
+                rc::ReplyError::Short => Fail::new(FailKind::Parse, 4),
+            })?;
+        // No string is not a failure: the strict check below is then skipped, as a RM
+        // that never enforced it would not notice either.
+        Ok(Out::Version(
+            rc::parse_version_reply(reply.data).unwrap_or([0u8; rc::VERSION_STR_BYTES]),
+        ))
+    }
+
+    #[inline(never)]
+    fn version_strict(&self, c: &Client) -> Result<Out, Fail> {
+        let v = c.version();
+        if v[0] == 0 {
+            return Ok(Out::Unit);
+        }
+        let data = rc::version_params(rc::VERSION_CMD_STRICT, &v);
+        let mut resp = [0u8; REPLY_MAX];
+        let n = self.exchange(
+            c.ctl(),
+            rc::nv_cmd(rc::ESC_CHECK_VERSION_STR, rc::VERSION_BYTES as u32),
+            &data,
+            &[],
+            &mut resp,
+        )?;
+        // RM answers a mismatch with -EINVAL, which the host reports in the header.
+        rc::parse_ioctl_reply(resp.get(..n).ok_or(Fail::new(FailKind::Parse, 5))?)
+            .map(|_| Out::Unit)
+            .map_err(|e| match e {
+                rc::ReplyError::Host(s) => Fail::new(FailKind::Host, s.unsigned_abs()),
+                rc::ReplyError::Short => Fail::new(FailKind::Parse, 5),
+            })
+    }
+
+    #[inline(never)]
+    fn card_info(&self, c: &Client) -> Result<Out, Fail> {
+        let data = [0u8; rc::CARD_INFO_BYTES];
+        let mut resp = Vec::<u8>::new();
+        let cap = rc::REPLY_DATA + rc::CARD_INFO_BYTES + 64;
+        if resp.try_reserve_exact(cap).is_err() {
+            return Err(Fail::new(FailKind::Os, 2));
+        }
+        resp.resize(cap, 0);
+        let n = self.exchange(
+            c.ctl(),
+            rc::nv_cmd(rc::ESC_CARD_INFO, rc::CARD_INFO_BYTES as u32),
+            &data,
+            &[],
+            &mut resp,
+        )?;
+        let reply = rc::parse_ioctl_reply(resp.get(..n).ok_or(Fail::new(FailKind::Parse, 6))?)
+            .map_err(|e| match e {
+                rc::ReplyError::Host(s) => Fail::new(FailKind::Host, s.unsigned_abs()),
+                rc::ReplyError::Short => Fail::new(FailKind::Parse, 6),
+            })?;
+        rc::parse_card_info(reply.data)
+            .map(Out::Card)
+            .ok_or(Fail::new(FailKind::Parse, 7))
+    }
+
+    #[inline(never)]
+    fn alloc_root(&self, c: &Client) -> Result<Out, Fail> {
+        // RM chooses the client handle (`hObjectNew = 0`) and answers it.
+        let block = rc::alloc_root();
+        let mut resp = [0u8; REPLY_MAX];
+        let n = self.exchange(
+            c.ctl(),
+            rc::nv_cmd(rc::ESC_RM_ALLOC, 48),
+            &block,
+            &[],
+            &mut resp,
+        )?;
+        let reply = rc::rm_reply(
+            resp.get(..n).ok_or(Fail::new(FailKind::Parse, 8))?,
+            rc::NVOS64_STATUS_AT,
+        )
+        .map_err(Fail::from)?;
+        rc::alloc_new_handle(&reply)
+            .map(Out::Handle)
+            .ok_or(Fail::new(FailKind::Parse, 9))
+    }
+
+    /// `NV_ESC_REGISTER_FD`: tie `channel` to the control file. librmclient ignores its
+    /// failure ("harmless: the channel still keeps the GPU open"), and so does this.
+    #[inline(never)]
+    fn register_fd(&self, channel: u32, ctl: u32) -> Result<Out, Fail> {
+        let data = rc::register_fd_params(ctl);
+        let mut resp = [0u8; REPLY_MAX];
+        let cmd = rc::nv_cmd(rc::ESC_REGISTER_FD, 4);
+        match self.exchange(channel, cmd, &data, &[], &mut resp) {
+            Ok(n) => {
+                let ok = resp
+                    .get(..n)
+                    .is_some_and(|r| rc::parse_ioctl_reply(r).is_ok());
+                if !ok {
+                    RM_REGFD_REFUSED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            // A transport that is gone fails the next step anyway; a host that
+            // refuses is counted and ignored.
+            Err(f) if f.kind == FailKind::Transport => return Err(f),
+            Err(_) => {
+                RM_REGFD_REFUSED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(Out::Unit)
+    }
+
+    #[inline(never)]
+    fn alloc_device(&self, c: &Client) -> Result<Out, Fail> {
+        let params = rc::device_params();
+        let mut resp = [0u8; REPLY_MAX];
+        self.rm_alloc(
+            c.ctl(),
+            c.root(),
+            c.root(),
+            rc::H_DEVICE,
+            rc::NV01_DEVICE_0,
+            &params,
+            &mut resp,
+        )
+        .map(|_| Out::Unit)
+    }
+
+    #[inline(never)]
+    fn alloc_subdevice(&self, c: &Client) -> Result<Out, Fail> {
+        let params = rc::subdevice_params();
+        let mut resp = [0u8; REPLY_MAX];
+        self.rm_alloc(
+            c.ctl(),
+            c.root(),
+            rc::H_DEVICE,
+            rc::H_SUBDEVICE,
+            rc::NV20_SUBDEVICE_0,
+            &params,
+            &mut resp,
+        )
+        .map(|_| Out::Unit)
+    }
+
+    /// `GetSysFiles`: which DRI node belongs to the card. The reply is a bare stream
+    /// (no `MsgHeader`) sized as librmclient and the Linux module size it.
+    #[inline(never)]
+    fn sys_files(&self, c: &Client) -> Result<Out, Fail> {
+        let mut req = [0u8; 32];
+        let n = rc::build_get_sys_files(&mut req).ok_or(Fail::new(FailKind::Parse, 10))?;
+        let mut resp = Vec::<u8>::new();
+        if resp.try_reserve_exact(rc::SYS_FILES_CAP).is_err() {
+            return Err(Fail::new(FailKind::Os, 3));
+        }
+        resp.resize(rc::SYS_FILES_CAP, 0);
+        let len = self.send(
+            req.get(..n).ok_or(Fail::new(FailKind::Parse, 10))?,
+            &mut resp,
+        )?;
+        let stream = resp.get(..len).ok_or(Fail::new(FailKind::Parse, 10))?;
+        let mut nodes = [rc::DriNode::default(); MAX_DRI];
+        let k = rc::parse_dri_section(stream, &mut nodes);
+        rc::pick_dri(nodes.get(..k).unwrap_or(&[]), c.gpu_id())
+            .map(Out::Dri)
+            .ok_or(Fail::new(FailKind::Parse, 11))
+    }
+
+    // ---- the surface ---------------------------------------------------------------
+
+    #[inline(never)]
+    fn alloc_memory(&self, c: &Client, want: Want) -> Result<Out, Fail> {
+        let (w, h) = want.surface.ok_or(Fail::new(FailKind::Layout, 1))?;
+        let layout = rc::surface_layout(w, h).ok_or(Fail::new(FailKind::Layout, 2))?;
+        let params = rc::mem_alloc_params(c.root(), &layout);
+        let mut resp = [0u8; REPLY_MAX];
+        let n = self.rm_alloc(
+            c.ctl(),
+            c.root(),
+            rc::H_DEVICE,
+            c.next_memory_handle(),
+            rc::NV01_MEMORY_LOCAL_USER,
+            &params,
+            &mut resp,
+        )?;
+        // RM writes what it made back into the parameter block.
+        let reply = rc::parse_ioctl_reply(resp.get(..n).ok_or(Fail::new(FailKind::Parse, 12))?)
+            .map_err(|_| Fail::new(FailKind::Parse, 12))?;
+        rc::adopt_alloc_reply(&layout, reply.nested)
+            .map(Out::Mem)
+            .map_err(|e| Fail::new(FailKind::Layout, 0x10 + e as u32))
+    }
+
+    #[inline(never)]
+    fn export_to_fd(&self, c: &Client) -> Result<Out, Fail> {
+        let (_, mem) = c.surface().ok_or(Fail::new(FailKind::Parse, 13))?;
+        let params = rc::export_params(rc::H_DEVICE, mem, c.export_ch());
+        let block = rc::nvos54(
+            c.root(),
+            c.root(),
+            rc::NV0000_CTRL_CMD_EXPORT_OBJECT_TO_FD,
+            params.len() as u32,
+        );
+        let mut resp = [0u8; REPLY_MAX];
+        let n = self.exchange(
+            c.ctl(),
+            rc::nv_cmd(rc::ESC_RM_CONTROL, 32),
+            &block,
+            &params,
+            &mut resp,
+        )?;
+        rc::rm_reply(
+            resp.get(..n).ok_or(Fail::new(FailKind::Parse, 14))?,
+            rc::NVOS54_STATUS_AT,
+        )
+        .map(|_| Out::Unit)
+        .map_err(Fail::from)
+    }
+
+    #[inline(never)]
+    fn gem_import(&self, c: &Client) -> Result<Out, Fail> {
+        let (layout, _) = c.surface().ok_or(Fail::new(FailKind::Parse, 15))?;
+        let data = rc::gem_import_params(layout.size);
+        let nested = rc::nvkms_import_params(c.export_ch());
+        let mut resp = [0u8; REPLY_MAX];
+        let n = self.exchange(
+            c.drm(),
+            rc::DRM_IOCTL_GEM_IMPORT_NVKMS,
+            &data,
+            &nested,
+            &mut resp,
+        )?;
+        let reply = rc::parse_ioctl_reply(resp.get(..n).ok_or(Fail::new(FailKind::Parse, 16))?)
+            .map_err(|e| match e {
+                rc::ReplyError::Host(s) => Fail::new(FailKind::Host, s.unsigned_abs()),
+                rc::ReplyError::Short => Fail::new(FailKind::Parse, 16),
+            })?;
+        rc::gem_handle(&reply)
+            .map(Out::Gem)
+            .ok_or(Fail::new(FailKind::Parse, 17))
+    }
+
+    /// `Close` of a file the machine asked to have closed, as a step: a refusal is a
+    /// failure (it leaves a handle open).
+    fn close_checked(&self, handle: u32) -> Result<Out, Fail> {
+        if handle == 0 {
+            return Ok(Out::Unit);
+        }
+        if self.close_file(handle) {
+            Ok(Out::Unit)
+        } else {
+            Err(Fail::new(FailKind::Host, 0xC1))
+        }
+    }
+
+    #[inline(never)]
+    fn gem_close(&self, c: &Client) -> Result<Out, Fail> {
+        // The KMD's own flip source names this GEM: end it first (the desktop is
+        // restored), so no flip can name a closed object. A no-op when it is not live.
+        let _ = self.adapter.foreign_scanout_release(KMD, Some(c.drm()));
+        let data = rc::gem_close_params(c.gem());
+        let mut resp = [0u8; REPLY_MAX];
+        let n = self.exchange(c.drm(), rc::DRM_IOCTL_GEM_CLOSE, &data, &[], &mut resp)?;
+        rc::parse_ioctl_reply(resp.get(..n).ok_or(Fail::new(FailKind::Parse, 18))?)
+            .map(|_| Out::Unit)
+            .map_err(|e| match e {
+                rc::ReplyError::Host(s) => Fail::new(FailKind::Host, s.unsigned_abs()),
+                rc::ReplyError::Short => Fail::new(FailKind::Parse, 18),
+            })
+    }
+
+    #[inline(never)]
+    fn free_memory(&self, c: &Client) -> Result<Out, Fail> {
+        let (_, mem) = c.surface().ok_or(Fail::new(FailKind::Parse, 19))?;
+        let block = rc::nvos00(c.root(), rc::H_DEVICE, mem);
+        let mut resp = [0u8; REPLY_MAX];
+        let n = self.exchange(
+            c.ctl(),
+            rc::nv_cmd(rc::ESC_RM_FREE, 16),
+            &block,
+            &[],
+            &mut resp,
+        )?;
+        rc::rm_reply(
+            resp.get(..n).ok_or(Fail::new(FailKind::Parse, 20))?,
+            rc::NVOS00_STATUS_AT,
+        )
+        .map(|_| Out::Unit)
+        .map_err(Fail::from)
+    }
+
+    // ---- the CPU view --------------------------------------------------------------
+    //
+    // The channel-per-mapping protocol of librmclient's Windows transport
+    // (`win_map_memory`): a fresh GPU channel, tied to the control file, is armed by
+    // `NV_ESC_RM_MAP_MEMORY` (issued on the control file, naming the channel), and the
+    // host's `Mmap` of the channel answers where in the RM window the pages are.
+
+    #[inline(never)]
+    fn rm_map_memory(&self, c: &Client) -> Result<Out, Fail> {
+        let (layout, mem) = c.surface().ok_or(Fail::new(FailKind::Parse, 21))?;
+        let block = rc::nvos33_with_fd(
+            c.root(),
+            rc::H_DEVICE,
+            mem,
+            0,
+            page_up(layout.size),
+            c.map_ch(),
+        );
+        let mut resp = [0u8; REPLY_MAX];
+        let n = self.exchange(
+            c.ctl(),
+            rc::nv_cmd(rc::ESC_RM_MAP_MEMORY, rc::NVOS33_FD_BYTES as u32),
+            &block,
+            &[],
+            &mut resp,
+        )?;
+        let reply = rc::rm_reply(
+            resp.get(..n).ok_or(Fail::new(FailKind::Parse, 22))?,
+            rc::NVOS33_STATUS_AT,
+        )
+        .map_err(Fail::from)?;
+        rc::map_cookie(&reply)
+            .map(Out::Cookie)
+            .ok_or(Fail::new(FailKind::Parse, 23))
+    }
+
+    #[inline(never)]
+    fn rm_unmap_memory(&self, c: &Client) -> Result<Out, Fail> {
+        let (_, mem) = c.surface().ok_or(Fail::new(FailKind::Parse, 24))?;
+        let block = rc::nvos34(c.root(), rc::H_DEVICE, mem, c.view_cookie());
+        let mut resp = [0u8; REPLY_MAX];
+        let n = self.exchange(
+            c.ctl(),
+            rc::nv_cmd(rc::ESC_RM_UNMAP_MEMORY, 32),
+            &block,
+            &[],
+            &mut resp,
+        )?;
+        rc::rm_reply(
+            resp.get(..n).ok_or(Fail::new(FailKind::Parse, 25))?,
+            rc::NVOS34_STATUS_AT,
+        )
+        .map(|_| Out::Unit)
+        .map_err(Fail::from)
+    }
+
+    #[inline(never)]
+    fn host_mmap(&self, c: &Client) -> Result<Out, Fail> {
+        let (layout, _) = c.surface().ok_or(Fail::new(FailKind::Parse, 26))?;
+        let size = page_up(layout.size);
+        // Offset 0 on the freshly armed channel, as librmclient does: the mapping is
+        // the channel's own.
+        match nvrm::host_mmap(self.passive, self.adapter, KMD, c.map_ch(), true, 0, size) {
+            Ok(m) if m.size >= size => Ok(Out::HostMapped(m.host_id, m.offset)),
+            Ok(m) => {
+                // Too small: give the mapping back before failing.
+                let _ = nvrm::release_host_map(self.passive, self.adapter, c.map_ch(), m.host_id);
+                Err(Fail::new(FailKind::Layout, 0x20))
+            }
+            Err(MapRefusal::Host(errno)) => Err(Fail::new(FailKind::Host, errno.unsigned_abs())),
+            Err(MapRefusal::Transport(e)) => Err(fail_of(Refusal::Transport(e))),
+            Err(MapRefusal::NotOwned) => Err(Fail::new(FailKind::Refused, 2)),
+            Err(MapRefusal::BadRange) => Err(Fail::new(FailKind::Refused, 5)),
+            Err(MapRefusal::NoResources) => Err(Fail::new(FailKind::Refused, 3)),
+        }
+    }
+
+    #[inline(never)]
+    fn kernel_map(&self, c: &Client) -> Result<Out, Fail> {
+        let (layout, _) = c.surface().ok_or(Fail::new(FailKind::Parse, 27))?;
+        let size = page_up(layout.size);
+        let (_, off) = c.view_host();
+        // `minor` (<= 254) is never UVM's 256, so this is the RM window.
+        let region = nvrm::region_for(self.adapter, c.minor()).ok_or(Fail::new(FailKind::Os, 4))?;
+        let end = off
+            .checked_add(size)
+            .ok_or(Fail::new(FailKind::Layout, 0x21))?;
+        if off % PAGE != 0 || end > region.len {
+            return Err(Fail::new(FailKind::Layout, 0x22));
+        }
+        let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
+        pa.QuadPart = (region.base + off) as i64;
+        // SAFETY: PASSIVE (the HPD worker); `region.base + off .. + size` lies inside the
+        // window the host just placed this mapping in (checked above), page aligned.
+        // Write-combined as the user-mode map of the same memory is (the Linux module's
+        // default for BAR memory); a read of it is slow by nature, see the doc.
+        let va = unsafe { MmMapIoSpace(pa, size, _MEMORY_CACHING_TYPE::MmWriteCombined) };
+        if va.is_null() {
+            return Err(Fail::new(FailKind::Os, 5));
+        }
+        Ok(Out::Mapped(va as u64, size))
+    }
+
+    // ---- the probe -----------------------------------------------------------------
+
+    /// Paint the probe picture through the kernel view, and read a sample back (like
+    /// `crm_scanout_smoke`): a view that does not hold what was written is counted
+    /// (`RmRdBad`), not fatal, because what is on screen is the evidence that matters.
+    #[inline(never)]
+    fn fill_pattern(&self, c: &Client) -> Result<Out, Fail> {
+        let (layout, _, _) = c.ready_surface().ok_or(Fail::new(FailKind::Parse, 28))?;
+        let (va, len) = c.view().ok_or(Fail::new(FailKind::Parse, 29))?;
+        let (w, h, pitch) = (layout.width, layout.height, layout.pitch);
+        if u64::from(pitch) * u64::from(h) > len || va == 0 {
+            return Err(Fail::new(FailKind::Layout, 0x23));
+        }
+        let started = crate::adapter::foreign_scanout::now_100ns();
+        let base = va as *mut u8;
+        for y in 0..h {
+            // SAFETY: row `y` is `pitch` bytes at `y * pitch`, inside the mapped
+            // `len` (checked above); `x < w` and `w * 4 <= pitch`; volatile because
+            // the memory is device memory (a write-combined BAR mapping).
+            let row = unsafe { base.add(y as usize * pitch as usize) } as *mut u32;
+            for x in 0..w {
+                unsafe {
+                    row.add(x as usize)
+                        .write_volatile(rc::pattern_pixel(x, y, w, h))
+                };
+            }
+        }
+        // Drain the write-combining buffers before anything reads or the host flips.
+        // SAFETY: SSE2 is baseline on x86_64.
+        unsafe { core::arch::x86_64::_mm_sfence() };
+        let mut bad = 0u32;
+        let mut y = 0u32;
+        while y < h {
+            let mut x = 0u32;
+            while x < w {
+                // SAFETY: as above.
+                let got = unsafe {
+                    ((base.add(y as usize * pitch as usize)) as *const u32)
+                        .add(x as usize)
+                        .read_volatile()
+                };
+                if got != rc::pattern_pixel(x, y, w, h) {
+                    bad += 1;
+                }
+                x += 101;
+            }
+            y += 37;
+        }
+        let ms = crate::adapter::foreign_scanout::now_100ns().wrapping_sub(started) / 10_000;
+        RM_FILL_MS.store(ms.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+        RM_READBACK_BAD.fetch_add(bad, Ordering::Relaxed);
+        Ok(Out::Unit)
+    }
+
+    /// Take scanout 0 for the KMD's own source (the foreign scanout state machine, with
+    /// the KMD's owner token): from here the desktop's host flush is withheld until the
+    /// source ends.
+    #[inline(never)]
+    fn scanout_set(&self, c: &Client) -> Result<Out, Fail> {
+        let (layout, _, _) = c.ready_surface().ok_or(Fail::new(FailKind::Parse, 30))?;
+        match self.adapter.foreign_scanout_set(
+            KMD,
+            c.drm(),
+            self.epoch,
+            rc::flip_layout(&layout),
+            PROBE_LAPSE_MS,
+        ) {
+            Ok(_) => Ok(Out::Unit),
+            Err(SetError::Busy) => Err(Fail::new(FailKind::Busy, 0)),
+            Err(SetError::Layout(_)) => Err(Fail::new(FailKind::Layout, 0x24)),
+        }
+    }
+
+    /// Send the one `ScanoutFlip`, through the same path `SCANOUT_PRESENT` uses.
+    #[inline(never)]
+    fn scanout_present(&self, c: &Client) -> Result<Out, Fail> {
+        use crate::virtio::foreign_scanout::{present, PresentRefusal};
+        match present(self.passive, self.adapter, KMD, c.drm(), c.gem()) {
+            Ok(_seq) => Ok(Out::Unit),
+            Err(PresentRefusal::NoTransport) => Err(Fail::new(FailKind::Transport, 4)),
+            Err(PresentRefusal::NotOwned) => Err(Fail::new(FailKind::Refused, 2)),
+            Err(PresentRefusal::Forbidden) => Err(Fail::new(FailKind::Refused, 4)),
+            Err(PresentRefusal::NoSource) => Err(Fail::new(FailKind::Refused, 6)),
+            Err(PresentRefusal::Device(e)) => Err(fail_of(Refusal::Transport(e))),
+        }
+    }
+}

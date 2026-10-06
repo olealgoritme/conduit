@@ -1357,6 +1357,12 @@ pub fn close_all_on_host(
     adapter: &AdapterContext,
     budget: &SweepBudget,
 ) -> u32 {
+    // The KMD's own RM client keeps a kernel view of an RM mapping: it must be
+    // unmapped BEFORE the host closes the file that holds the mapping (and whether
+    // or not the host is still being asked). Its handles are in the tables below
+    // under `DeviceOwner::KMD_RM`, so the sweep closes them like any other owner's.
+    // Idempotent: StopDevice sweeps explicitly and again through `retire_transport`.
+    super::rm_client::retire_begin(passive);
     let alive = adapter
         .with_virtio(|v| !v.transport_failed())
         .unwrap_or(false);
@@ -1450,6 +1456,8 @@ pub fn retire_transport(
         close_all_on_host(passive, adapter, budget);
     }
     adapter.set_virtio(None);
+    // Its handles were closed by the sweep (or died with the transport): forget them.
+    super::rm_client::forget();
     if had {
         mark_views_stale(adapter);
     }
