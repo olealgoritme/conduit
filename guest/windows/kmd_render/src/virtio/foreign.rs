@@ -270,4 +270,5 @@ fn publish_snapshot(snap: Option<super::gpu::ForeignSnapshot>) {
     }
     crate::diag::record_named_bytes(b"FgUns", IMPORT_UNSUPPORTED.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"FgMapRf", MAP_REFUSED.load(Ordering::Relaxed));
+    super::rm_resource_import::publish_counters();
 }

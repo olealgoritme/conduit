@@ -19,8 +19,9 @@ use helios_kmd_logic::foreign_resource::{
 use helios_protocol::{
     HeliosEscapeHeader, HeliosForeignHeader, HeliosForeignImportRm, HeliosForeignImportRmLayout,
     HeliosForeignLayout, HeliosForeignQueryCaps, HELIOS_FOREIGN_ABI_VERSION,
-    HELIOS_FOREIGN_CAP_RM_IMPORT, HELIOS_FOREIGN_CAP_SHARED_OPEN,
-    HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT, HELIOS_FOREIGN_OP_IMPORT_RM, HELIOS_FOREIGN_OP_QUERY_CAPS,
+    HELIOS_FOREIGN_CAP_RM_IMPORT, HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT,
+    HELIOS_FOREIGN_CAP_SHARED_OPEN, HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT, HELIOS_FOREIGN_OP_IMPORT_RM,
+    HELIOS_FOREIGN_OP_QUERY_CAPS, HELIOS_FOREIGN_OP_RM_RESOURCE_IMPORT,
     HELIOS_FOREIGN_ST_BAD_CONTEXT, HELIOS_FOREIGN_ST_BAD_RANGE, HELIOS_FOREIGN_ST_DEVICE_ERROR,
     HELIOS_FOREIGN_ST_NOT_OWNED, HELIOS_FOREIGN_ST_NO_RESOURCES, HELIOS_FOREIGN_ST_OK,
     HELIOS_FOREIGN_ST_UNSUPPORTED,
@@ -64,13 +65,16 @@ fn write_back<T: Pod>(buf: &mut [u8], value: &T) -> NTSTATUS {
 }
 
 /// The dispatch target. `owner` is the escaping device (proven non-null by the
-/// dispatcher); every resource this creates is tagged with it.
+/// dispatcher); every resource this creates is tagged with it. `process` is the
+/// escaping device's `hKmdProcess` (0 if unknown), which `RM_RESOURCE_IMPORT`
+/// matches against the opens of a shared allocation.
 pub(super) fn escape_foreign_resource(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
     hdr: &HeliosEscapeHeader,
     owner: DeviceOwner,
+    process: usize,
 ) -> NTSTATUS {
     let head: HeliosForeignHeader = match bind(buf, hdr) {
         Ok(h) => h,
@@ -86,6 +90,11 @@ pub(super) fn escape_foreign_resource(
     let st = match head.op {
         HELIOS_FOREIGN_OP_QUERY_CAPS => query_caps(adapter, buf, hdr, owner, epoch),
         HELIOS_FOREIGN_OP_IMPORT_RM => import_rm(passive, adapter, buf, hdr, owner, epoch),
+        HELIOS_FOREIGN_OP_RM_RESOURCE_IMPORT => {
+            super::escape_foreign_rm_resource::rm_resource_import(
+                passive, adapter, buf, hdr, owner, process, epoch,
+            )
+        }
         _ => STATUS_INVALID_PARAMETER,
     };
     // Registry writes are slow and an escape is not the place to storm them:
@@ -107,13 +116,19 @@ fn query_caps(
         Ok(c) => c,
         Err(st) => return st,
     };
-    caps.supported_ops =
-        (1u64 << HELIOS_FOREIGN_OP_QUERY_CAPS) | (1u64 << HELIOS_FOREIGN_OP_IMPORT_RM);
+    caps.supported_ops = (1u64 << HELIOS_FOREIGN_OP_QUERY_CAPS)
+        | (1u64 << HELIOS_FOREIGN_OP_IMPORT_RM)
+        | (1u64 << HELIOS_FOREIGN_OP_RM_RESOURCE_IMPORT);
     // `SHARED_OPEN` is KMD-only (no host involvement), so it is set whenever this
     // KMD answers the verb at all.
     caps.caps_flags = HELIOS_FOREIGN_CAP_SHARED_OPEN
         | if foreign::rm_import_served(adapter) {
             HELIOS_FOREIGN_CAP_RM_IMPORT
+        } else {
+            0
+        }
+        | if crate::virtio::rm_resource_import::rm_resource_import_served(adapter) {
+            HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT
         } else {
             0
         };

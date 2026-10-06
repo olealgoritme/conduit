@@ -18,6 +18,7 @@ pub(crate) mod create_allocation;
 pub(crate) mod display;
 mod escape;
 mod escape_foreign;
+mod escape_foreign_rm_resource;
 mod escape_foreign_scanout;
 mod gpummu;
 pub(crate) mod hpd;
