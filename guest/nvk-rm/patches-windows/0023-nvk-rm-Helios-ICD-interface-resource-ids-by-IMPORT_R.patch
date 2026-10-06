@@ -1,0 +1,897 @@
+From eb1feeba9e49646d9607fe64207b623a81723d95 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 03:17:09 +0200
+Subject: [PATCH] nvk/rm: Helios ICD interface, resource ids by IMPORT_RM,
+ deviceLUID
+
+What Conduit's Helios D3D11 UMD needs to run DXVK on NVK in a Windows
+guest (Conduit guest/windows/docs/dxvk-on-nvk.md, stage S3):
+
+- helios_icd_interface_v2, exported from vulkan_nouveau.dll: the
+  backend-neutral table of helios_icd_interface.h (a verbatim copy of
+  Conduit's guest/windows/protocol/include/helios_icd_interface.h).
+  memory_res_id exports the dedicated memory of a 32 bpp image to a GEM
+  object of the host render node (the export the scanout path already
+  makes), creates one Venus holder context per process and asks the KMD
+  for a resource id with HELIOS_ESCAPE_FOREIGN_RESOURCE IMPORT_RM,
+  passing the image's layout (pitch or GB20x block-linear modifier, row
+  pitch, offset). The id is released with the memory unless a WDDM
+  allocation adopted it (transfer_ownership). scanout_present shows such
+  an image through the KMD's foreign scanout source.
+- HELIOS_STRUCTURE_TYPE_EXPORT_MEMORY_RESOURCE_INFO in
+  vkAllocateMemory: shared, uncompressed, and the dedicated image's
+  block-linear kind and tile mode recorded for the export.
+- VkPhysicalDeviceIDProperties.deviceLUID = the Helios adapter's LUID
+  (librmclient's crm_win_adapter_luid), deviceNodeMask 1.
+
+Needs librmclient's crm_win_adapter_luid, crm_win_venus_ctx_create,
+crm_win_foreign_caps, crm_win_import_rm and crm_win_release_blob; without
+them (or with the KMD's IMPORT_RM gate closed) memory_res_id answers
+VK_ERROR_FEATURE_NOT_PRESENT. NVK_HELIOS_RESID=0 turns resource ids off.
+---
+ src/nouveau/vulkan/helios_icd_interface.h   | 145 ++++++++++++
+ src/nouveau/vulkan/meson.build              |   3 +-
+ src/nouveau/vulkan/nvk_device_memory.c      |  31 ++-
+ src/nouveau/vulkan/nvk_helios.c             | 240 ++++++++++++++++++++
+ src/nouveau/vulkan/nvk_physical_device.c    |  14 ++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  44 ++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c  |   6 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c  |   3 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c  | 203 +++++++++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h |  17 ++
+ 10 files changed, 703 insertions(+), 3 deletions(-)
+ create mode 100644 src/nouveau/vulkan/helios_icd_interface.h
+ create mode 100644 src/nouveau/vulkan/nvk_helios.c
+
+diff --git a/src/nouveau/vulkan/helios_icd_interface.h b/src/nouveau/vulkan/helios_icd_interface.h
+new file mode 100644
+index 0000000..a1093a1
+--- /dev/null
++++ b/src/nouveau/vulkan/helios_icd_interface.h
+@@ -0,0 +1,145 @@
++/* The backend-neutral interface between the Helios D3D UMDs and the Vulkan ICD
++ * they run on (guest/windows/docs/dxvk-on-nvk.md, section 3.2, decision D2).
++ *
++ * One export per ICD:
++ *
++ *    VkResult helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out);
++ *
++ * NVK on RM (vulkan_nouveau.dll, guest/nvk-rm/patches-windows) implements it
++ * natively. The Venus ICD (vulkan_virtio.dll) does not need to: the UMD builds
++ * the same table from the older helios_venus_* exports, so a new UMD keeps
++ * working with an older Venus ICD (umd_common/bridge/bridge_icd_backend.cpp).
++ *
++ * The KMD resource id stays the one buffer name across components (D1): every
++ * entry that names a buffer to WDDM, DWM or the scanout does it with a resource
++ * id. Venus makes one per exportable VkDeviceMemory; NVK mints one through the
++ * KMD's HELIOS_ESCAPE_FOREIGN_RESOURCE IMPORT_RM (protocol/src/foreign.rs) and
++ * reports the layout that goes with it, because a Venus importer (DWM) and the
++ * scanout cannot learn it anywhere else.
++ *
++ * Rules:
++ *  - `version` in = the version the caller was built against; the ICD fills
++ *    at most `out->size` bytes it knows, sets `version`/`size` to what it
++ *    filled, and returns VK_ERROR_INCOMPATIBLE_DRIVER for a version it cannot
++ *    serve. Entries are only ever appended; a NULL entry is "not supported".
++ *  - Every entry takes handles of the ICD that returned the table, created by
++ *    the instance/device the caller made through that ICD's
++ *    vk_icdGetInstanceProcAddr (no loader trampolines), and is thread-safe.
++ *  - Calling convention: the platform's default C convention (cdecl on x86).
++ *
++ * C header, included by Mesa (a verbatim copy) and by the UMD bridges. */
++#ifndef HELIOS_ICD_INTERFACE_H
++#define HELIOS_ICD_INTERFACE_H
++
++#include <stdint.h>
++#include <vulkan/vulkan_core.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define HELIOS_ICD_INTERFACE_EXPORT "helios_icd_interface_v2"
++#define HELIOS_ICD_INTERFACE_VERSION 2u
++
++enum helios_icd_backend {
++   HELIOS_ICD_BACKEND_VENUS = 1,
++   HELIOS_ICD_BACKEND_NVK_RM = 2,
++};
++
++/* helios_icd_api.caps, as of the call that returned the table. */
++/* memory_res_id can mint resource ids now (Venus: always; NVK: the KMD serves
++ * IMPORT_RM, i.e. FOREIGN_RESOURCE caps bit CAP_RM_IMPORT). */
++#define HELIOS_ICD_CAP_RES_ID (1u << 0)
++/* The resource ids carry a layout the importer must use (NVK: always). */
++#define HELIOS_ICD_CAP_LAYOUT (1u << 1)
++/* scanout_present works (NVK: the KMD's foreign scanout source, ops 9..11). */
++#define HELIOS_ICD_CAP_SCANOUT (1u << 2)
++/* The producer interface (escape 0x13 streams keyed on a Venus timeline)
++ * exists. NVK: no; presents are CPU-complete (value 0 markers). */
++#define HELIOS_ICD_CAP_PRODUCER (1u << 3)
++
++/* DRM fourcc / modifier values used below (drm_fourcc.h). */
++#define HELIOS_DRM_FORMAT_XRGB8888 0x34325258u
++#define HELIOS_DRM_FORMAT_ARGB8888 0x34325241u
++#define HELIOS_DRM_FORMAT_XBGR8888 0x34324258u
++#define HELIOS_DRM_FORMAT_ABGR8888 0x34324241u
++#define HELIOS_DRM_FORMAT_MOD_LINEAR 0ull
++/* DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, h) on GB20x: | h, h 0..5 */
++#define HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X 0x0300000000606010ull
++
++/* What the memory behind a resource id holds: plane 0 of a 2D image. The same
++ * fields as helios_foreign_layout (protocol/include/helios_foreign.h) plus the
++ * object size; zero `modifier`/`stride` with HELIOS_ICD_CAP_LAYOUT clear means
++ * "the importer infers it" (Venus). */
++struct helios_icd_layout {
++   uint64_t size;     /* bytes of the exported object (>= the image) */
++   uint64_t modifier; /* DRM_FORMAT_MOD_* */
++   uint32_t width;
++   uint32_t height;
++   uint32_t stride;   /* row pitch, bytes */
++   uint32_t offset;   /* plane 0 offset, bytes */
++   uint32_t fourcc;   /* DRM_FORMAT_*, 0 for formats without one */
++   uint32_t memory_type_index;
++};
++
++/* Chained into VkMemoryAllocateInfo by the UMD's DXVK for memory that will
++ * need a resource id (a dedicated allocation of a WDDM-backed image). NVK then
++ * allocates it standalone in VRAM, uncompressed, and records the image's
++ * layout for the export. Venus ignores it (its own OPAQUE_FD/DMA_BUF export
++ * request does the same job there). The value sits next to Venus' private
++ * VkImportMemoryResourceInfoMESA (1000384002). */
++#define HELIOS_STRUCTURE_TYPE_EXPORT_MEMORY_RESOURCE_INFO ((VkStructureType)1000384003)
++struct helios_export_memory_resource_info {
++   VkStructureType sType; /* HELIOS_STRUCTURE_TYPE_EXPORT_MEMORY_RESOURCE_INFO */
++   const void *pNext;
++   uint32_t flags;        /* 0 */
++   uint32_t reserved;     /* 0 */
++};
++
++struct helios_icd_api {
++   uint32_t version; /* HELIOS_ICD_INTERFACE_VERSION */
++   uint32_t size;    /* sizeof(struct helios_icd_api) the ICD filled */
++   uint32_t backend; /* enum helios_icd_backend */
++   uint32_t caps;    /* HELIOS_ICD_CAP_* */
++
++   /* The Venus context that resource ids made for `instance` are attached to
++    * (stamped into WDDM allocation private data as ctx_id). NVK: the holder
++    * context it created for IMPORT_RM, 0 before the first import. */
++   uint32_t (*ctx_id)(VkInstance instance);
++
++   /* The resource id behind `memory`, made on first use and cached on the
++    * memory object for its lifetime. `image` is the image bound to it at
++    * offset 0 (NVK needs it for the layout; Venus ignores it). Fills `layout`
++    * (may be NULL). VK_ERROR_FEATURE_NOT_PRESENT when ids cannot be made now
++    * (NVK: IMPORT_RM not served), VK_ERROR_FORMAT_NOT_SUPPORTED for an image
++    * the importers cannot take (NVK: not 32 bpp, 3D tiling, suballocated). */
++   VkResult (*memory_res_id)(VkDevice device, VkDeviceMemory memory, VkImage image,
++                             uint32_t *res_id, struct helios_icd_layout *layout);
++
++   /* Exact allocation size and memory type of `memory` (Venus: what an
++    * importer must repeat; NVK: the RM object size). */
++   VkBool32 (*memory_alloc_info)(VkDeviceMemory memory, uint64_t *alloc_size,
++                                 uint32_t *memory_type_index);
++
++   /* A WDDM allocation adopted the resource id: the ICD stops releasing it when
++    * the memory is freed. Returns the id, 0 if there was none. */
++   uint32_t (*transfer_ownership)(VkDeviceMemory memory);
++
++   /* Present `image` (bound to `memory`) on scanout 0 through the KMD's foreign
++    * scanout source, after the GPU finished rendering it (the caller waited).
++    * NULL or VK_ERROR_FEATURE_NOT_PRESENT without HELIOS_ICD_CAP_SCANOUT. */
++   VkResult (*scanout_present)(VkDevice device, VkDeviceMemory memory, VkImage image);
++   /* Give scanout 0 back to the desktop. */
++   void (*scanout_release)(VkDevice device);
++
++   /* The producer interface (helios_producer_abi.h), or NULL. */
++   const void *(*producer)(void);
++};
++
++typedef VkResult (*PFN_helios_icd_interface_v2)(uint32_t version, struct helios_icd_api *out);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* HELIOS_ICD_INTERFACE_H */
+diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
+index 122d2f3..9d85aa3 100644
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -317,7 +317,8 @@ if not get_option('nvk-rm').disabled()
+     nvk_files += files('nvkmd/rm/nvkmd_rm_drm.c')
+   elif host_machine.system() == 'windows'
+     # Scanout presentation through Conduit's Helios KMD
+-    nvk_files += files('nvkmd/rm/nvkmd_rm_win.c')
++    nvk_files += files('nvkmd/rm/nvkmd_rm_win.c', 'nvk_helios.c',
++                       'helios_icd_interface.h')
+   endif
+ endif
+ 
+diff --git a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
+index 46efbb9..83339c9 100644
+--- a/src/nouveau/vulkan/nvk_device_memory.c
++++ b/src/nouveau/vulkan/nvk_device_memory.c
+@@ -4,6 +4,10 @@
+  */
+ #include "nvk_device_memory.h"
+ 
++#ifdef _WIN32
++#include "helios_icd_interface.h"
++#endif
++
+ #include "nvk_device.h"
+ #include "nvk_entrypoints.h"
+ #include "nvk_image.h"
+@@ -157,7 +161,22 @@ nvk_AllocateMemory(VkDevice device,
+    if (fd_info != NULL)
+       handle_types |= fd_info->handleType;
+ 
+-   const bool not_shared = handle_types == 0;
++#ifdef _WIN32
++   /* The Helios UMD will make a KMD resource id of this memory
++    * (helios_icd_interface.h): standalone, shared, uncompressed, with the
++    * image's layout recorded for the export.
++    */
++   bool helios_export = false;
++   vk_foreach_struct_const(stype, ext, pAllocateInfo->pNext) {
++      (void)ext;
++      if (stype == HELIOS_STRUCTURE_TYPE_EXPORT_MEMORY_RESOURCE_INFO)
++         helios_export = true;
++   }
++#else
++   const bool helios_export = false;
++#endif
++
++   const bool not_shared = handle_types == 0 && !helios_export;
+    bool pinned_to_vram = false;
+ 
+    /* Align to os page size (typically 4K) as a start as this works for
+@@ -200,11 +219,19 @@ nvk_AllocateMemory(VkDevice device,
+             alignment = (1ULL << 21);
+          else
+             alignment = (1ULL << 16);
++      } else if (helios_export && image->plane_count == 1 &&
++                 image->planes[0].nil.pte_kind != 0) {
++         /* Uncompressed block-linear: the layout an importer can read */
++         alignment = MAX2(alignment, image->planes[0].nil.align_B);
++         pte_kind = image->planes[0].nil.pte_kind;
++         tile_mode = image->planes[0].nil.tile_mode;
+       }
+    }
+ 
+-   const enum nvkmd_mem_flags flags =
++   enum nvkmd_mem_flags flags =
+       nvk_memory_type_flags(type, handle_types, pinned_to_vram);
++   if (helios_export)
++      flags |= NVKMD_MEM_SHARED;
+ 
+    const uint64_t aligned_size =
+       align64(pAllocateInfo->allocationSize, alignment);
+diff --git a/src/nouveau/vulkan/nvk_helios.c b/src/nouveau/vulkan/nvk_helios.c
+new file mode 100644
+index 0000000..c64d596
+--- /dev/null
++++ b/src/nouveau/vulkan/nvk_helios.c
+@@ -0,0 +1,240 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * helios_icd_interface_v2: what Conduit's Helios D3D UMDs need from the
++ * Vulkan ICD they run DXVK / vkd3d-proton on, beyond Vulkan
++ * (helios_icd_interface.h; guest/windows/docs/dxvk-on-nvk.md, section 3.2).
++ *
++ * The UMD loads vulkan_nouveau.dll itself (no loader) and calls these with
++ * handles of the instance and device it created through
++ * vk_icdGetInstanceProcAddr.  Resource ids come from the Helios KMD's
++ * IMPORT_RM (nvkmd_rm_win.c); the layout reported with them is what DWM's
++ * Venus import and the scanout use, since the host cannot be asked.
++ */
++#include "nvk_device.h"
++#include "nvk_device_memory.h"
++#include "nvk_image.h"
++#include "nvk_physical_device.h"
++#include "nvkmd/rm/nvkmd_rm.h"
++
++#include "helios_icd_interface.h"
++#include "drm-uapi/drm_fourcc.h"
++
++#include <string.h>
++
++static uint32_t
++helios_fourcc(VkFormat format)
++{
++   switch (format) {
++   case VK_FORMAT_B8G8R8A8_UNORM:
++   case VK_FORMAT_B8G8R8A8_SRGB:
++      return DRM_FORMAT_ARGB8888;
++   case VK_FORMAT_R8G8B8A8_UNORM:
++   case VK_FORMAT_R8G8B8A8_SRGB:
++      return DRM_FORMAT_ABGR8888;
++   default:
++      return 0;
++   }
++}
++
++/* The layout of `image` at offset 0 of its dedicated memory, in the terms of
++ * HELIOS_ESCAPE_FOREIGN_RESOURCE (protocol/src/foreign.rs): plane 0, 32 bpp,
++ * pitch-linear or 2D block-linear with NVIDIA's GB20x DRM modifier.
++ */
++static VkResult
++helios_image_layout(const struct nvk_image *image,
++                    struct nvkmd_rm_foreign_layout *out,
++                    uint8_t *pte_kind, uint16_t *tile_mode)
++{
++   if (image->plane_count != 1 || image->vk.image_type != VK_IMAGE_TYPE_2D ||
++       image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
++       image->vk.array_layers != 1)
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++
++   const uint32_t fourcc = helios_fourcc(image->vk.format);
++   if (fourcc == 0)
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++
++   const struct nvk_image_plane *plane = &image->planes[0];
++   const struct nil_image_level *level = &plane->nil.levels[0];
++
++   uint64_t modifier;
++   if (level->tiling.gob_type == NIL_GOB_TYPE_LINEAR) {
++      modifier = DRM_FORMAT_MOD_LINEAR;
++   } else if (level->tiling.gob_type == NIL_GOB_TYPE_FERMI_COLOR &&
++              level->tiling.x_log2 == 0 && level->tiling.z_log2 == 0 &&
++              level->tiling.y_log2 <= 5) {
++      modifier = HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X | level->tiling.y_log2;
++   } else {
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++   }
++
++   const uint64_t offset = plane->plane_offset_B + level->offset_B;
++   if (offset > UINT32_MAX)
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++
++   *out = (struct nvkmd_rm_foreign_layout) {
++      .width = image->vk.extent.width,
++      .height = image->vk.extent.height,
++      .stride = level->row_stride_B,
++      .offset = (uint32_t)offset,
++      .fourcc = fourcc,
++      .modifier = modifier,
++   };
++   *pte_kind = plane->nil.pte_kind;
++   *tile_mode = plane->nil.tile_mode;
++   return VK_SUCCESS;
++}
++
++static uint32_t
++helios_ctx_id(VkInstance instance)
++{
++   (void)instance;
++   return nvkmd_rm_win_holder_ctx();
++}
++
++static VkResult
++helios_memory_res_id(VkDevice _device, VkDeviceMemory _mem, VkImage _image,
++                     uint32_t *res_id, struct helios_icd_layout *layout)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++   VK_FROM_HANDLE(nvk_device_memory, mem, _mem);
++   VK_FROM_HANDLE(nvk_image, image, _image);
++
++   *res_id = 0;
++   if (layout != NULL)
++      memset(layout, 0, sizeof(*layout));
++   if (mem == NULL || image == NULL)
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++
++   struct nvkmd_rm_foreign_layout fl;
++   uint8_t pte_kind;
++   uint16_t tile_mode;
++   VkResult result = helios_image_layout(image, &fl, &pte_kind, &tile_mode);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* The image must own the whole memory object: the KMD names objects */
++   if (mem->dedicated_image != image)
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++
++   /* A memory allocated without the Helios export request has no recorded
++    * layout and may be compressed; only uncompressed kinds export.
++    */
++   if (image->is_compressed)
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++   nvkmd_rm_mem_set_export_layout(mem->mem, pte_kind, tile_mode);
++
++   result = nvkmd_rm_mem_helios_res_id(mem->mem, &dev->vk.base, &fl, res_id);
++   if (result != VK_SUCCESS)
++      return result;
++
++   if (layout != NULL) {
++      *layout = (struct helios_icd_layout) {
++         .size = mem->mem->size_B,
++         .modifier = fl.modifier,
++         .width = fl.width,
++         .height = fl.height,
++         .stride = fl.stride,
++         .offset = fl.offset,
++         .fourcc = fl.fourcc,
++         .memory_type_index = mem->vk.memory_type_index,
++      };
++   }
++   return VK_SUCCESS;
++}
++
++static VkBool32
++helios_memory_alloc_info(VkDeviceMemory _mem, uint64_t *alloc_size,
++                         uint32_t *memory_type_index)
++{
++   VK_FROM_HANDLE(nvk_device_memory, mem, _mem);
++
++   if (mem == NULL)
++      return VK_FALSE;
++   if (alloc_size != NULL)
++      *alloc_size = mem->mem->size_B;
++   if (memory_type_index != NULL)
++      *memory_type_index = mem->vk.memory_type_index;
++   return VK_TRUE;
++}
++
++static uint32_t
++helios_transfer_ownership(VkDeviceMemory _mem)
++{
++   VK_FROM_HANDLE(nvk_device_memory, mem, _mem);
++
++   return mem != NULL ? nvkmd_rm_mem_helios_res_adopt(mem->mem) : 0;
++}
++
++static VkResult
++helios_scanout_present(VkDevice _device, VkDeviceMemory _mem, VkImage _image)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++   VK_FROM_HANDLE(nvk_device_memory, mem, _mem);
++   VK_FROM_HANDLE(nvk_image, image, _image);
++
++   if (mem == NULL || image == NULL || mem->dedicated_image != image ||
++       image->is_compressed)
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++
++   struct nvkmd_rm_foreign_layout fl;
++   uint8_t pte_kind;
++   uint16_t tile_mode;
++   VkResult result = helios_image_layout(image, &fl, &pte_kind, &tile_mode);
++   if (result != VK_SUCCESS)
++      return result;
++   nvkmd_rm_mem_set_export_layout(mem->mem, pte_kind, tile_mode);
++
++   return nvkmd_rm_mem_scanout_flip(mem->mem, &dev->vk.base, fl.width,
++                                    fl.height, fl.stride, fl.offset,
++                                    fl.fourcc, fl.modifier);
++}
++
++static void
++helios_scanout_release(VkDevice _device)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++
++   if (dev != NULL)
++      nvkmd_rm_dev_scanout_release(dev->nvkmd);
++}
++
++__declspec(dllexport) VkResult
++helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out);
++
++__declspec(dllexport) VkResult
++helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
++{
++   if (out == NULL || version < 2)
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++
++   const uint32_t cap = out->size != 0 && out->size < sizeof(*out) ?
++                        out->size : (uint32_t)sizeof(*out);
++
++   const struct nvkmd_rm_lib *lib = nvkmd_rm_lib_get();
++   uint32_t caps = HELIOS_ICD_CAP_LAYOUT;
++   if (lib != NULL && lib->win_open_device != NULL &&
++       lib->win_scanout_set != NULL) {
++      caps |= HELIOS_ICD_CAP_SCANOUT;
++      if (nvkmd_rm_win_rm_import_served())
++         caps |= HELIOS_ICD_CAP_RES_ID;
++   }
++
++   struct helios_icd_api api = {
++      .version = HELIOS_ICD_INTERFACE_VERSION,
++      .size = cap,
++      .backend = HELIOS_ICD_BACKEND_NVK_RM,
++      .caps = caps,
++      .ctx_id = helios_ctx_id,
++      .memory_res_id = helios_memory_res_id,
++      .memory_alloc_info = helios_memory_alloc_info,
++      .transfer_ownership = helios_transfer_ownership,
++      .scanout_present = helios_scanout_present,
++      .scanout_release = helios_scanout_release,
++      .producer = NULL,
++   };
++   memcpy(out, &api, cap);
++   return VK_SUCCESS;
++}
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index d1c05f6..66d1ea9 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -25,6 +25,9 @@
+ #include "nvk_shader.h"
+ #include "nvk_wsi.h"
+ #include "nvkmd/nvkmd.h"
++#if defined(_WIN32) && defined(NVK_WITH_RM)
++#include "nvkmd/rm/nvkmd_rm.h"
++#endif
+ #include "git_sha1.h"
+ #include "util/detect_os.h"
+ #include "util/disk_cache.h"
+@@ -1431,6 +1434,17 @@ nvk_get_device_properties(const struct nvk_instance *instance,
+             sizeof(properties->shaderModuleIdentifierAlgorithmUUID));
+ 
+    nv_device_uuid(info, properties->deviceUUID, VK_UUID_SIZE, true);
++#if defined(_WIN32) && defined(NVK_WITH_RM)
++   /* The WDDM adapter NVK reaches RM through (Conduit's Helios adapter):
++    * D3D on Vulkan (DXVK, vkd3d-proton) and the Vulkan loader match adapters
++    * by LUID.
++    */
++   STATIC_ASSERT(VK_LUID_SIZE == 8);
++   if (nvkmd_rm_win_adapter_luid(properties->deviceLUID)) {
++      properties->deviceLUIDValid = true;
++      properties->deviceNodeMask = 1;
++   }
++#endif
+    STATIC_ASSERT(sizeof(instance->driver_build_sha) >= VK_UUID_SIZE);
+    memcpy(properties->driverUUID, instance->driver_build_sha, VK_UUID_SIZE);
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index c2d0625..440f6dc 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -92,6 +92,14 @@ struct nvkmd_rm_lib {
+    int (*win_scanout_set)(struct nvrm_crm_scanout_source *src);
+    int (*win_scanout_present)(uint32_t handle, uint32_t gem, uint64_t *seq);
+    int (*win_scanout_release)(uint32_t handle);
++   /* Helios resource ids for RM memory (KMD 22.22.309+, foreign resources) */
++   int (*win_adapter_luid)(uint32_t *low, int32_t *high);
++   int (*win_venus_ctx_create)(uint32_t *ctx_id);
++   void (*win_venus_ctx_destroy)(uint32_t ctx_id);
++   int (*win_release_blob)(uint32_t ctx_id, uint32_t resource_id);
++   int (*win_foreign_caps)(uint32_t *caps_flags);
++   int (*win_import_rm)(const struct nvrm_crm_foreign_import *in,
++                        uint32_t *resource_id, uint32_t *host_errno);
+ };
+ 
+ /* Returns NULL if librmclient cannot be loaded */
+@@ -254,6 +262,14 @@ struct nvkmd_rm_mem {
+    /* GEM handle on dev->drm_fd once the memory has been exported, 0 before */
+    simple_mtx_t export_mutex;
+    uint32_t gem_handle;
++
++   /* Helios KMD resource id minted for this memory (IMPORT_RM), under
++    * export_mutex; 0 before.  Released with the memory unless a WDDM
++    * allocation adopted it (helios_res_adopted).
++    */
++   uint32_t helios_res_id;
++   uint32_t helios_res_ctx;
++   bool helios_res_adopted;
+ };
+ 
+ NVKMD_DECL_SUBCLASS(mem, rm);
+@@ -366,6 +382,34 @@ VkResult nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *mem,
+                                    uint32_t fourcc, uint64_t modifier);
+ /* Gives scanout 0 back to the desktop (no-op without a live source) */
+ void nvkmd_rm_dev_scanout_release(struct nvkmd_dev *dev);
++
++/*
++ * Helios resource ids (nvkmd_rm_win.c, guest/windows/docs/dxvk-on-nvk.md S3):
++ * RM memory exported to a GEM object and imported by the KMD
++ * (HELIOS_ESCAPE_FOREIGN_RESOURCE IMPORT_RM) so that a WDDM allocation can
++ * adopt it and Venus contexts (DWM) can read it.
++ */
++struct nvkmd_rm_foreign_layout {
++   uint32_t width, height, stride, offset, fourcc;
++   uint64_t modifier;
++};
++/* The Helios adapter's LUID, false if unknown */
++bool nvkmd_rm_win_adapter_luid(uint8_t luid[8]);
++/* FOREIGN_RESOURCE caps bit 0: IMPORT_RM is served end to end */
++bool nvkmd_rm_win_rm_import_served(void);
++/* The process's holder Venus context for imports, 0 before the first one */
++uint32_t nvkmd_rm_win_holder_ctx(void);
++VkResult nvkmd_rm_mem_helios_res_id(struct nvkmd_mem *mem,
++                                    struct vk_object_base *log_obj,
++                                    const struct nvkmd_rm_foreign_layout *layout,
++                                    uint32_t *res_id);
++/* A WDDM allocation adopted the id: do not release it with the memory */
++uint32_t nvkmd_rm_mem_helios_res_adopt(struct nvkmd_mem *mem);
++/* Called by nvkmd_rm_mem_free */
++void nvkmd_rm_mem_helios_res_release(struct nvkmd_rm_mem *mem);
++/* Export with an explicit layout (pte_kind != 0: block-linear tile_mode) */
++void nvkmd_rm_mem_set_export_layout(struct nvkmd_mem *mem, uint8_t pte_kind,
++                                    uint16_t tile_mode);
+ #endif
+ 
+ /*
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index 9a745b0..e17e7a8 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -231,6 +231,12 @@ nvkmd_rm_lib_load(void)
+    LOAD(win_scanout_set,     "crm_win_scanout_set",     false);
+    LOAD(win_scanout_present, "crm_win_scanout_present", false);
+    LOAD(win_scanout_release, "crm_win_scanout_release", false);
++   LOAD(win_adapter_luid,      "crm_win_adapter_luid",      false);
++   LOAD(win_venus_ctx_create,  "crm_win_venus_ctx_create",  false);
++   LOAD(win_venus_ctx_destroy, "crm_win_venus_ctx_destroy", false);
++   LOAD(win_release_blob,      "crm_win_release_blob",      false);
++   LOAD(win_foreign_caps,      "crm_win_foreign_caps",      false);
++   LOAD(win_import_rm,         "crm_win_import_rm",         false);
+ 
+    LOAD(event_wait,   "crm_event_wait",   false);
+    LOAD(alloc_pages,  "crm_alloc_pages",  false);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 8d40c66..78b6451 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -278,6 +278,9 @@ nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
+    /* nvidia-drm holds its own reference to the memory for as long as a
+     * dma-buf of it is alive; this only drops our GEM name for it.
+     */
++#ifdef _WIN32
++   nvkmd_rm_mem_helios_res_release(mem);
++#endif
+    if (mem->gem_handle != 0)
+       nvkmd_rm_close_gem(dev, mem->gem_handle);
+    simple_mtx_destroy(&mem->export_mutex);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+index e37dd56..f0f6834 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+@@ -391,3 +391,206 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
+ 
+    return result;
+ }
++
++/*
++ * Helios resource ids for RM memory (guest/windows/docs/dxvk-on-nvk.md, S3).
++ *
++ * The Helios D3D11 UMD running DXVK on NVK needs a KMD resource id for every
++ * image that becomes a WDDM allocation (swapchain buffers, shared surfaces),
++ * so that the allocation can adopt it and DWM, on Venus, can compose it.  The
++ * KMD mints one with HELIOS_ESCAPE_FOREIGN_RESOURCE IMPORT_RM from a GEM object
++ * of a host render node this process opened (the same export the scanout path
++ * makes) and attaches it to a Venus "holder" context of this process.  The
++ * host imports the object as a dma-buf; the layout travels with the request
++ * because nothing downstream can query it.
++ *
++ * One holder context per process: librmclient's transport is one D3DKMT
++ * device per process, and IMPORT_RM requires the context and the DRM file to
++ * belong to the same device.
++ */
++
++static simple_mtx_t helios_ctx_mutex = SIMPLE_MTX_INITIALIZER;
++static uint32_t helios_holder_ctx;
++static bool helios_holder_failed;
++
++bool
++nvkmd_rm_win_adapter_luid(uint8_t luid[8])
++{
++   const struct nvkmd_rm_lib *lib = nvkmd_rm_lib_get();
++   uint32_t low = 0;
++   int32_t high = 0;
++
++   if (lib == NULL || lib->win_adapter_luid == NULL ||
++       lib->win_adapter_luid(&low, &high) != 0)
++      return false;
++   if (low == 0 && high == 0)
++      return false;
++
++   memcpy(luid, &low, 4);
++   memcpy(luid + 4, &high, 4);
++   return true;
++}
++
++bool
++nvkmd_rm_win_rm_import_served(void)
++{
++   const struct nvkmd_rm_lib *lib = nvkmd_rm_lib_get();
++   uint32_t caps = 0;
++
++   if (!debug_get_bool_option("NVK_HELIOS_RESID", true))
++      return false;
++   if (lib == NULL || lib->win_foreign_caps == NULL ||
++       lib->win_import_rm == NULL || lib->win_venus_ctx_create == NULL)
++      return false;
++   /* Asked every time: the KMD opens the gate when the host feature bit is
++    * there, which can change across a device reset.  One escape, called once
++    * per resource id at most.
++    */
++   if (lib->win_foreign_caps(&caps) != 0)
++      return false;
++   return (caps & 1u) != 0;
++}
++
++uint32_t
++nvkmd_rm_win_holder_ctx(void)
++{
++   simple_mtx_lock(&helios_ctx_mutex);
++   const uint32_t ctx = helios_holder_ctx;
++   simple_mtx_unlock(&helios_ctx_mutex);
++   return ctx;
++}
++
++static uint32_t
++get_holder_ctx(const struct nvkmd_rm_lib *lib)
++{
++   simple_mtx_lock(&helios_ctx_mutex);
++   if (helios_holder_ctx == 0 && !helios_holder_failed) {
++      uint32_t ctx = 0;
++      int ret = lib->win_venus_ctx_create(&ctx);
++      if (ret != 0 || ctx == 0) {
++         helios_holder_failed = true;
++         mesa_logw("NVK: no Helios holder context (%d), no resource ids", ret);
++      } else {
++         helios_holder_ctx = ctx;
++      }
++   }
++   const uint32_t ctx = helios_holder_ctx;
++   simple_mtx_unlock(&helios_ctx_mutex);
++   return ctx;
++}
++
++void
++nvkmd_rm_mem_set_export_layout(struct nvkmd_mem *_mem, uint8_t pte_kind,
++                               uint16_t tile_mode)
++{
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++
++   simple_mtx_lock(&mem->export_mutex);
++   /* Only before the first export: the GEM object keeps the layout it was
++    * imported with.
++    */
++   if (mem->gem_handle == 0) {
++      mem->pte_kind = pte_kind;
++      mem->tile_mode = tile_mode;
++   }
++   simple_mtx_unlock(&mem->export_mutex);
++}
++
++VkResult
++nvkmd_rm_mem_helios_res_id(struct nvkmd_mem *_mem,
++                           struct vk_object_base *log_obj,
++                           const struct nvkmd_rm_foreign_layout *layout,
++                           uint32_t *res_id_out)
++{
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
++   const struct nvkmd_rm_lib *lib = dev->lib;
++   VkResult result = VK_SUCCESS;
++
++   *res_id_out = 0;
++   if (!nvkmd_rm_scanout_supported(dev->base.pdev) ||
++       !nvkmd_rm_win_rm_import_served())
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   const uint32_t ctx = get_holder_ctx(lib);
++   if (ctx == 0)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   simple_mtx_lock(&mem->export_mutex);
++   if (mem->helios_res_id != 0) {
++      *res_id_out = mem->helios_res_id;
++      simple_mtx_unlock(&mem->export_mutex);
++      return VK_SUCCESS;
++   }
++   if (mem->gem_handle == 0)
++      result = export_to_gem(dev, mem, log_obj, &mem->gem_handle);
++   if (result == VK_SUCCESS) {
++      const struct nvrm_crm_foreign_import imp = {
++         .ctx_id = ctx,
++         .rm_handle = (uint32_t)dev->drm_fd,
++         .gem_handle = mem->gem_handle,
++         .fourcc = layout->fourcc,
++         .size = mem->base.size_B,
++         .modifier = layout->modifier,
++         .width = layout->width,
++         .height = layout->height,
++         .stride = layout->stride,
++         .offset = layout->offset,
++      };
++      uint32_t res_id = 0, host_errno = 0;
++      int ret = lib->win_import_rm(&imp, &res_id, &host_errno);
++      if (ret == 0 && res_id != 0) {
++         mem->helios_res_id = res_id;
++         mem->helios_res_ctx = ctx;
++         *res_id_out = res_id;
++      } else {
++         result = vk_errorf(log_obj, ret == -ENOSYS ?
++                            VK_ERROR_FEATURE_NOT_PRESENT :
++                            VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                            "Helios IMPORT_RM of GEM %u (%ux%u stride %u "
++                            "fourcc 0x%08x modifier 0x%" PRIx64 ", %" PRIu64
++                            " B): %d, host errno %u", mem->gem_handle,
++                            layout->width, layout->height, layout->stride,
++                            layout->fourcc, layout->modifier,
++                            mem->base.size_B, ret, host_errno);
++      }
++   }
++   simple_mtx_unlock(&mem->export_mutex);
++
++   if (result == VK_SUCCESS && (dev->base.pdev->debug_flags & NVK_DEBUG_VM)) {
++      fprintf(stderr, "NVK: RM memory 0x%x is Helios resource %u (ctx %u, "
++              "GEM %u, %ux%u stride %u modifier 0x%" PRIx64 ")\n",
++              mem->h_memory, *res_id_out, ctx, mem->gem_handle,
++              layout->width, layout->height, layout->stride,
++              layout->modifier);
++   }
++   return result;
++}
++
++uint32_t
++nvkmd_rm_mem_helios_res_adopt(struct nvkmd_mem *_mem)
++{
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++
++   simple_mtx_lock(&mem->export_mutex);
++   const uint32_t res_id = mem->helios_res_id;
++   if (res_id != 0)
++      mem->helios_res_adopted = true;
++   simple_mtx_unlock(&mem->export_mutex);
++   return res_id;
++}
++
++void
++nvkmd_rm_mem_helios_res_release(struct nvkmd_rm_mem *mem)
++{
++   const struct nvkmd_rm_lib *lib = nvkmd_rm_lib_get();
++
++   if (mem->helios_res_id == 0 || mem->helios_res_adopted)
++      return;
++   /* No allocation took it: the KMD would hold it (and the host its
++    * dma-buf) until the device goes away.
++    */
++   if (lib != NULL && lib->win_release_blob != NULL)
++      lib->win_release_blob(mem->helios_res_ctx, mem->helios_res_id);
++   mem->helios_res_id = 0;
++}
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+index 0ca3e34..068e6de 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -652,6 +652,22 @@ struct nvrm_crm_scanout_source {
+    uint32_t generation;
+ };
+ 
++/* librmclient's struct crm_foreign_import (rmclient_transport.h): IMPORT_RM
++ * of a GEM object of a host DRM file as a Helios KMD resource id, with the
++ * layout the KMD records (guest/windows/protocol/src/foreign.rs).
++ */
++struct nvrm_crm_foreign_import {
++   uint32_t ctx_id;
++   uint32_t rm_handle;
++   uint32_t gem_handle;
++   uint32_t fourcc;
++   uint64_t size;
++   uint64_t modifier;
++   uint32_t width, height;
++   uint32_t stride;
++   uint32_t offset;
++};
++
+ /* USERD layout (Nvc36fControl .. Nvca6fControl) */
+ #define NVRM_USERD_GP_GET                         0x88
+ #define NVRM_USERD_GP_PUT                         0x8c
+@@ -686,6 +702,7 @@ static_assert(sizeof(NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS
+ static_assert(sizeof(NvNotification) == 16, "NvNotification");
+ static_assert(sizeof(struct nvrm_crm_scanout_flip) == 48, "crm_scanout_flip");
+ static_assert(sizeof(struct nvrm_crm_scanout_source) == 40, "crm_scanout_source");
++static_assert(sizeof(struct nvrm_crm_foreign_import) == 48, "crm_foreign_import");
+ static_assert(sizeof(NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS) == 24, "OS_UNIX_EXPORT_OBJECT_TO_FD");
+ static_assert(sizeof(NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS) == 20, "OS_UNIX_IMPORT_OBJECT_FROM_FD");
+ static_assert(sizeof(NV0041_CTRL_GET_SURFACE_INFO_PARAMS) == 16, "GET_SURFACE_INFO");
+-- 
+2.43.0
+
