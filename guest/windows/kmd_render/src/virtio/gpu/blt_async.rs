@@ -311,6 +311,34 @@ impl VirtioGpu {
         Ok(token)
     }
 
+    /// `GuestBlob`: the worker re-prepared the dispatched request `(token, stream_boundary)`
+    /// because the guest buffer it was prepared for is no longer its destination's copy target
+    /// (`VenusClient::retarget_prepared_present_blt`). Its preparation and its mirror flag are
+    /// replaced BEFORE it is submitted, so the ring completion owes the worker a CPU mirror
+    /// exactly when the copy no longer writes the leased pages itself. `false`: no such
+    /// request (the caller then submits nothing). Spinlock-only, no allocation.
+    pub(crate) fn retarget_windowed_blt(
+        &mut self,
+        token: u64,
+        stream_boundary: u64,
+        prepared: PreparedPresentBltSubmission,
+        no_mirror: bool,
+    ) -> bool {
+        match self
+            .windowed_blt
+            .pending
+            .iter_mut()
+            .find(|request| request.token == token && request.stream_boundary == stream_boundary)
+        {
+            Some(request) => {
+                request.prepared = prepared;
+                request.no_mirror = no_mirror;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The worker dispatched `pending[index]` (it is about to be enqueued on the ring): stamp the
     /// submission time of an asynchronous request and count what it waited in the FIFO.
     pub(super) fn blt_async_dispatched(&mut self, index: usize) {

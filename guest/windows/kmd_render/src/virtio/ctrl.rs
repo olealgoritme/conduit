@@ -1465,8 +1465,11 @@ fn resource_create_blob_errno_within(
 pub(crate) enum GuestBlobCreateError {
     /// The host answered `resp_type` with `errno` in the response header.
     Host { resp_type: u32, errno: u32 },
-    /// The command never got an answer (transport, timeout, no memory for the request).
+    /// The command was not sent (no transport, no memory for the request, a full queue).
     Transport,
+    /// The command may have reached the host and got no answer in time (a timeout, an
+    /// abandoned wait): the host may still create the blob over the pages.
+    Unanswered,
     /// The live-resource table is full.
     NoSlot,
 }
@@ -1476,7 +1479,9 @@ pub(crate) enum GuestBlobCreateError {
 /// `size` bytes (their sum), in Venus context `ctx_id`. Every field the host defines comes from
 /// `helios_kmd_logic::guest_blob::contract`. No `CTX_ATTACH_RESOURCE` follows: the host
 /// attaches a guest blob to `hdr.ctx_id` itself. The resource is committed to the live-resource
-/// table, so [`release_guest_blob`] can claim it exactly once. PASSIVE only.
+/// table, so [`release_guest_blob_within`] can claim it exactly once. Waits at most
+/// `timeout_ms` for the answer (`helios_kmd_logic::guest_blob::deadline::CREATE_MS`). PASSIVE
+/// only.
 pub(crate) fn create_guest_blob(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -1484,6 +1489,7 @@ pub(crate) fn create_guest_blob(
     entries: &[u8],
     nr_entries: u32,
     size: u64,
+    timeout_ms: u64,
 ) -> Result<u32, GuestBlobCreateError> {
     use helios_kmd_logic::guest_blob::contract as gb;
     if entries.is_empty() || size == 0 || ctx_id == 0 {
@@ -1522,7 +1528,7 @@ pub(crate) fn create_guest_blob(
         bytes_of(&cmd),
         Some(entries),
         &mut resp,
-        SYNC_ROUNDTRIP_TIMEOUT_MS,
+        timeout_ms,
         None,
     );
     let outcome = match sent {
@@ -1537,11 +1543,17 @@ pub(crate) fn create_guest_blob(
                 })
             }
         }
-        Err(_) => Err(GuestBlobCreateError::Transport),
+        // Never enqueued: nothing reached the host.
+        Err(VirtioError::QueueFull | VirtioError::OutOfMemory) => {
+            Err(GuestBlobCreateError::Transport)
+        }
+        // A timeout (the wait was abandoned, the command stays queued) or an abandon at
+        // teardown: the host may still run it. The caller keeps the pages pinned.
+        Err(_) => Err(GuestBlobCreateError::Unanswered),
     };
     if let Err(e) = outcome {
         // A refused create made nothing on the host; an unanswered one is reclaimed by the
-        // transport reset that follows a transport failure.
+        // transport reset that ends the generation (its pages stay pinned until then).
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
@@ -1550,12 +1562,16 @@ pub(crate) fn create_guest_blob(
 }
 
 /// `RESOURCE_UNREF` of a guest blob made by [`create_guest_blob`], once (the live-resource
-/// entry is the guard). After a successful return the host holds no mapping or pin of its
-/// pages. `Ok` also when another path already claimed it. PASSIVE only.
-pub(crate) fn release_guest_blob(
+/// entry is the guard), waiting at most `timeout_ms` for the answer
+/// (`helios_kmd_logic::guest_blob::deadline::UNREF_MS`). After a successful return the host
+/// holds no mapping or pin of its pages. `Ok` also when another path already claimed it; an
+/// unanswered UNREF is NOT retried (the claim is spent): its pages stay pinned until the
+/// generation ends. PASSIVE only.
+pub(crate) fn release_guest_blob_within(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_id: u32,
+    timeout_ms: u64,
 ) -> Result<(), VirtioError> {
     let first = adapter
         .with_virtio(|v| v.take_live_resource(resource_id))
@@ -1563,7 +1579,7 @@ pub(crate) fn release_guest_blob(
     if !first {
         return Ok(());
     }
-    resource_unref(passive, adapter, resource_id)
+    resource_unref_within(passive, adapter, resource_id, timeout_ms)
 }
 
 /// `HELIOS_ESCAPE_ALLOC_BLOB` — create a HOST3D blob (create + attach) and
@@ -2709,7 +2725,10 @@ pub fn wait_fence(
                 Ok(FenceWaitPrep::Invalid) => return WaitFenceOutcome::Invalid,
                 Ok(FenceWaitPrep::TableFull) => {
                     full_retries += 1;
-                    if full_retries > 1_000 {
+                    // A `GuestBlob` bounded section (the drain of a retire) gives up at its
+                    // deadline instead of after up to ~16 s; nothing else changes (escapes and
+                    // unscoped threads never see `bounded_spent`).
+                    if full_retries > 1_000 || crate::ddi::escape_wait::bounded_spent() {
                         // NOT FENCE_WAIT_TIMEOUTS: the host may be perfectly
                         // healthy and all MAX_FENCE_WAITERS slots simply occupied.
                         // The outcome stays TimedOut so the ICD is untouched; only

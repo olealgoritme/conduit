@@ -195,8 +195,9 @@ pub mod contract {
 use contract::{MAX_BLOB_BYTES, MAX_ENTRIES, MAX_LIVE_BLOBS, MAX_LIVE_RUNS, MAX_RUN_BYTES, PAGE};
 
 /// Why a destination does not (or no longer) use a guest blob. `code` is what `GbWhy` holds,
-/// `bit` what `GbMask` collects. Codes 1 to 11 are decisions (no strike); 12 and above are
-/// failures, each a strike ([`Why::strikes`]). New codes are appended, never renumbered.
+/// `bit` what `GbMask` collects. Codes 1 to 11 are decisions (no strike); 12 to 28 are
+/// failures, each a strike; later codes are each one or the other ([`Why::strikes`]). New
+/// codes are appended, never renumbered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Why {
     /// `GuestBlob` is 0.
@@ -259,10 +260,17 @@ pub enum Why {
     /// `RESP_ERR_INVALID_PARAMETER` + `EXDEV`: the entries span more than one guest RAM
     /// backing file.
     HostCrossFile,
+    /// The destination's system copy is marked invalid (a skipped eviction, `BltNoMirror`): a
+    /// page-in will be skipped and the Venus blob kept, so the pages must not become the copy
+    /// target (and a live guest blob is retired). A decision, no strike.
+    SystemStale,
+    /// The create was sent and not answered within [`deadline::CREATE_MS`]: the host may still
+    /// create the blob over the pages, so they stay pinned (poisons).
+    CreateTimeout,
 }
 
 impl Why {
-    pub const ALL: [Why; 28] = [
+    pub const ALL: [Why; 30] = [
         Why::KnobOff,
         Why::NotAdvertised,
         Why::NotBuffer,
@@ -291,6 +299,8 @@ impl Why {
         Why::DrainTimeout,
         Why::ReleaseFailed,
         Why::HostCrossFile,
+        Why::SystemStale,
+        Why::CreateTimeout,
     ];
 
     /// 1-based, stable: the value of `GbWhy`.
@@ -324,6 +334,8 @@ impl Why {
             Why::DrainTimeout => 26,
             Why::ReleaseFailed => 27,
             Why::HostCrossFile => 28,
+            Why::SystemStale => 29,
+            Why::CreateTimeout => 30,
         }
     }
 
@@ -332,15 +344,108 @@ impl Why {
         1u32 << (self.code() - 1)
     }
 
-    /// Whether this is a failure (a strike) rather than a decision.
+    /// Whether this is a failure (a strike) rather than a decision. Decisions are codes 1 to 11
+    /// and the ones appended later ([`Why::SystemStale`]).
     pub const fn strikes(self) -> bool {
-        self.code() >= 12
+        !matches!(self.code(), 1..=11 | 29)
     }
 
     /// Whether the failure leaves host objects that may still write the pages, so the
     /// destination must keep them pinned and never retry.
     pub const fn poisons(self) -> bool {
-        matches!(self, Why::DrainTimeout | Why::ReleaseFailed)
+        matches!(
+            self,
+            Why::DrainTimeout | Why::ReleaseFailed | Why::CreateTimeout
+        )
+    }
+}
+
+/// The KMD's own bounds on every wait of a create and of a retire (policy, not host contract).
+///
+/// A create runs on a Present thread under the content transaction, a retire on the paging
+/// thread (`BuildPagingBuffer`), a Present thread or StopDevice, under the content transaction
+/// and the Venus mutex: a sick host must cost them at most a few seconds, never the 30 s of a
+/// default control round trip or ring wait per step. The I/O half runs each phase inside a
+/// bounded section (`ddi::escape_wait::begin_bounded`) whose deadline every wait primitive it
+/// reaches already obeys (the control round trip, the Venus ring wait, the mutex acquires, the
+/// enqueue retry budget: `wait_bound`), and passes the per-step limits below where a call takes
+/// a timeout of its own. A phase that runs out is a strike that POISONS the destination (the
+/// host may still act on what was sent: the pages stay pinned until the generation ends);
+/// `BuildPagingBuffer` answers success either way.
+pub mod deadline {
+    /// One wire fence of a copy into a guest buffer, or one queue marker (its
+    /// `vkWaitForFences` carries this as its host-side timeout, so a marker never blocks the
+    /// host's ring for longer either).
+    pub const FENCE_MS: u32 = 250;
+    /// The Venus half of a retire, all of it: the Venus mutex, the drain (every fence and the
+    /// marker), the release of the cached commands, the destroy, the free and the fence after it.
+    pub const DRAIN_MS: u32 = 1_000;
+    /// The `RESOURCE_UNREF` of a guest blob.
+    pub const UNREF_MS: u32 = 1_000;
+    /// The `RESOURCE_CREATE_BLOB` round trip.
+    pub const CREATE_MS: u32 = 1_000;
+    /// The import: the Venus mutex and every ring command of it, its unwind included.
+    pub const IMPORT_MS: u32 = 1_000;
+    /// The longest a create can block its thread: the create, the import, the UNREF of a
+    /// refused import.
+    pub const CREATE_TOTAL_MS: u32 = CREATE_MS + IMPORT_MS + UNREF_MS;
+
+    /// The limits of one retire.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Limits {
+        pub drain_ms: u32,
+        pub unref_ms: u32,
+    }
+
+    impl Limits {
+        /// A retire from the paging path, a Present or a destroy.
+        pub const NORMAL: Limits = Limits {
+            drain_ms: DRAIN_MS,
+            unref_ms: UNREF_MS,
+        };
+
+        /// A retire under a caller's per-call allowance (StopDevice's sweep budget,
+        /// `SweepBudget::call_timeout_ms`): each limit cut to `cap_ms`, never 0 (a 0 deadline
+        /// would mean "none").
+        pub const fn capped(cap_ms: u64) -> Limits {
+            Limits {
+                drain_ms: cut(DRAIN_MS, cap_ms),
+                unref_ms: cut(UNREF_MS, cap_ms),
+            }
+        }
+
+        /// The longest the retire can block its thread.
+        pub const fn total_ms(&self) -> u32 {
+            self.drain_ms.saturating_add(self.unref_ms)
+        }
+    }
+
+    const fn cut(limit_ms: u32, cap_ms: u64) -> u32 {
+        let v = if (limit_ms as u64) < cap_ms {
+            limit_ms
+        } else {
+            cap_ms as u32
+        };
+        if v == 0 {
+            1
+        } else {
+            v
+        }
+    }
+
+    /// The timeout of one fence wait inside a section with `left_ms` remaining (`None`: not in
+    /// a bounded section): [`FENCE_MS`], cut to what is left, at least 1 ms.
+    pub const fn fence_wait_ms(left_ms: Option<u32>) -> u32 {
+        match left_ms {
+            Some(left) if left < FENCE_MS => {
+                if left == 0 {
+                    1
+                } else {
+                    left
+                }
+            }
+            _ => FENCE_MS,
+        }
     }
 }
 
@@ -713,12 +818,25 @@ pub struct Facts {
     pub advertised: bool,
     pub dst_standard_buffer: bool,
     pub foreign_consumer: bool,
+    /// The destination's system copy is marked invalid (`paging::InvalidSet::contains`): a
+    /// skipped eviction or a `BltNoMirror` copy into the Venus blob. A page-in of the
+    /// destination will be skipped and its Venus blob kept.
+    pub system_copy_invalid: bool,
     /// The destination's record, `None` when it has none.
     pub record: Option<Record>,
 }
 
-/// The per-Present decision. Order: knob, host, destination shape, strikes, foreign
-/// consumer, state.
+/// The per-Present decision. Order: knob, host, destination shape, foreign consumer, system
+/// copy marked invalid, state and strikes.
+///
+/// The invalid mark: a guest blob makes the leased pages the destination's newest copy, and a
+/// marked destination's page-in is skipped in favour of the Venus blob. The two must never
+/// meet, so the invariant is "a guest blob is the copy target only while the destination's
+/// system copy is not marked invalid": no guest blob is created while the mark is up (here, and
+/// re-checked by the create under the content transaction), and the first Blt that finds a
+/// mark on a destination whose guest blob is live retires it ([`Eligible::Retire`]) before its
+/// own copy, which then goes into the Venus blob (full surface): the blob the skipped page-in
+/// keeps is then the newest copy again.
 pub fn eligible(f: Facts) -> Eligible {
     if !f.knob_on {
         return Eligible::No(Why::KnobOff);
@@ -735,6 +853,13 @@ pub fn eligible(f: Facts) -> Eligible {
             Eligible::Retire(Why::ForeignConsumer)
         } else {
             Eligible::No(Why::ForeignConsumer)
+        };
+    }
+    if f.system_copy_invalid {
+        return if record.copy_target() {
+            Eligible::Retire(Why::SystemStale)
+        } else {
+            Eligible::No(Why::SystemStale)
         };
     }
     if record.copy_target() {
@@ -781,6 +906,44 @@ pub const fn present_effect(guest_hit: bool, no_mirror_on: bool) -> Effect {
     }
 }
 
+/// Whether a deferred copy must be prepared again at submission: it was prepared for the guest
+/// blob `prepared_for` (`None`: not for a guest blob, never), and the destination's copy
+/// target is now `current` (the guest blob `VenusClient::guest_target_for` finds, `None`: the
+/// Venus blob). A copy whose guest blob was retired since the Present is re-prepared into the
+/// current target and submitted (its mirror then decided by [`present_effect`] from the new
+/// target), never dropped: the frame lands.
+pub const fn retarget_needed(prepared_for: Option<u32>, current: Option<u32>) -> bool {
+    match (prepared_for, current) {
+        (None, _) => false,
+        (Some(was), Some(now)) => was != now,
+        (Some(_), None) => true,
+    }
+}
+
+/// What the DIRECT asynchronous route does with a copy it has prepared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectCopy {
+    /// The route was open only because of a guest blob (`BltNoMirror` 0) and the copy does not
+    /// go into one: submit nothing, the legacy arm (which mirrors) runs.
+    Refuse,
+    /// Submit it; `mark_stale`: mark the system copy invalid first.
+    Submit { mark_stale: bool },
+}
+
+/// The DIRECT route's decision from the ONE predicate: `guest` is the target the prepare chose
+/// (`VenusClient::guest_target_for`, in the same hold of the Venus mutex as the submission),
+/// never a second look at the guest buffers. `need_guest`: the route was open only because of
+/// the destination's guest blob (`BltNoMirror` is 0). The route is otherwise open only with
+/// `BltNoMirror` on, so the stale mark is [`present_effect`]'s with it on.
+pub const fn direct_copy(need_guest: bool, guest: bool) -> DirectCopy {
+    if need_guest && !guest {
+        return DirectCopy::Refuse;
+    }
+    DirectCopy::Submit {
+        mark_stale: present_effect(guest, true).mark_stale,
+    }
+}
+
 /// Whether an open of `resource_id` belongs to a process other than `presenter` (rows are
 /// `(resource_id, process, refs)` of the Present-buffer open table). The presenter is the
 /// process whose app device presents into the destination: the census (`rm-backed-standard.md`
@@ -824,7 +987,8 @@ pub const COUNTERS: &[&str] = &[
     "GbBytes",
     "GbLive",
     "GbLiveRuns",
-    // Deferred copies prepared for a guest blob that was retired before they were submitted.
+    // Deferred copies prepared for a guest blob that was retired before they were submitted
+    // (each re-prepared into the destination's current target, so the frame still lands).
     "GbLost",
 ];
 
@@ -1151,6 +1315,30 @@ mod tests {
     }
 
     #[test]
+    fn a_retire_always_leaves_ready() {
+        // The StopDevice sweep (`retire_all_for_stop`) retires "the first Ready record" until
+        // there is none: every outcome of a retire must leave Ready, or the sweep would spin.
+        for outcome in 0..3 {
+            let mut r = Record::new(1);
+            r.begin_create().unwrap();
+            r.sent(3, 1);
+            assert!(r.created());
+            assert!(r.copy_target());
+            assert_eq!(r.begin_drain(), Drain::Release { guest: 3 });
+            match outcome {
+                0 => {
+                    r.drained();
+                }
+                1 => r.drain_failed(Why::DrainTimeout),
+                _ => r.drain_failed(Why::ReleaseFailed),
+            }
+            assert!(!r.copy_target(), "outcome {outcome}");
+            // A poisoned record keeps its pages until the generation reset.
+            assert_eq!(r.may_unlock(), outcome == 0, "outcome {outcome}");
+        }
+    }
+
+    #[test]
     fn a_failed_release_of_a_draining_record_retries_as_poisoned() {
         let mut r = Record::new(1);
         r.begin_create().unwrap();
@@ -1168,8 +1356,48 @@ mod tests {
             advertised: true,
             dst_standard_buffer: true,
             foreign_consumer: false,
+            system_copy_invalid: false,
             record,
         }
+    }
+
+    #[test]
+    fn a_marked_system_copy_refuses_a_create_and_retires_a_live_blob() {
+        // No record (or None/Gone): no create while marked, a decision, not a strike.
+        let mut f = facts(None);
+        f.system_copy_invalid = true;
+        assert_eq!(eligible(f), Eligible::No(Why::SystemStale));
+        assert!(!Why::SystemStale.strikes() && !Why::SystemStale.poisons());
+        let mut gone = Record::new(5);
+        gone.begin_create().unwrap();
+        gone.sent(8, 1);
+        gone.created();
+        gone.begin_drain();
+        gone.drained();
+        let mut f = facts(Some(gone));
+        f.system_copy_invalid = true;
+        assert_eq!(eligible(f), Eligible::No(Why::SystemStale));
+        // A live guest blob on a marked destination is retired before the copy.
+        let mut live = Record::new(5);
+        live.begin_create().unwrap();
+        live.sent(8, 1);
+        live.created();
+        let mut f = facts(Some(live));
+        f.system_copy_invalid = true;
+        assert_eq!(eligible(f), Eligible::Retire(Why::SystemStale));
+        // Unmarked, the same record is used.
+        f.system_copy_invalid = false;
+        assert_eq!(eligible(f), Eligible::Use);
+        // A foreign consumer is decided first (same retire, its own reason).
+        f.system_copy_invalid = true;
+        f.foreign_consumer = true;
+        assert_eq!(eligible(f), Eligible::Retire(Why::ForeignConsumer));
+        // Busy and disabled destinations stay refused while marked.
+        let mut creating = Record::new(5);
+        creating.begin_create().unwrap();
+        let mut f = facts(Some(creating));
+        f.system_copy_invalid = true;
+        assert!(matches!(eligible(f), Eligible::No(_)));
     }
 
     #[test]
@@ -1243,6 +1471,53 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_copy_whose_guest_blob_went_is_prepared_again() {
+        // Not prepared for a guest blob: never touched (the default path).
+        assert!(!retarget_needed(None, None));
+        assert!(!retarget_needed(None, Some(7)));
+        // Still the target: submitted as prepared.
+        assert!(!retarget_needed(Some(7), Some(7)));
+        // Retired (the Venus blob is the target now), or replaced by a newer guest blob.
+        assert!(retarget_needed(Some(7), None));
+        assert!(retarget_needed(Some(7), Some(9)));
+        // The re-prepared copy's mirror follows its new target: into the Venus blob it is
+        // mirrored (or marked stale with `BltNoMirror`), into a guest blob neither.
+        assert!(present_effect(false, false).mirror);
+        assert!(present_effect(false, true).mark_stale);
+        let into_guest = present_effect(true, false);
+        assert!(!into_guest.mirror && !into_guest.mark_stale);
+    }
+
+    #[test]
+    fn the_direct_route_marks_exactly_when_its_copy_misses_the_guest_buffer() {
+        // Opened by the guest blob alone: a copy that still goes into it needs no mark; one
+        // that does not is refused (the legacy arm mirrors), never submitted unmarked.
+        assert_eq!(
+            direct_copy(true, true),
+            DirectCopy::Submit { mark_stale: false }
+        );
+        assert_eq!(direct_copy(true, false), DirectCopy::Refuse);
+        // Opened by `BltNoMirror`: the copy goes out either way, marked unless it went into
+        // the guest buffer (the pages themselves).
+        assert_eq!(
+            direct_copy(false, true),
+            DirectCopy::Submit { mark_stale: false }
+        );
+        assert_eq!(
+            direct_copy(false, false),
+            DirectCopy::Submit { mark_stale: true }
+        );
+        // Never a submission that leaves the pages older than the blob without a mark.
+        for need in [false, true] {
+            for guest in [false, true] {
+                if let DirectCopy::Submit { mark_stale } = direct_copy(need, guest) {
+                    assert_eq!(mark_stale, !guest);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn foreign_consumer_rule() {
         let rows = [(5u32, 100usize, 1u32), (6, 200, 1), (5, 300, 0)];
         // Only the presenter has 5 open (300's row has no refs).
@@ -1263,10 +1538,64 @@ mod tests {
         assert_eq!(codes.len(), Why::ALL.len());
         assert!(codes.iter().all(|&c| (1..=32).contains(&c)));
         for w in Why::ALL {
-            assert_eq!(w.strikes(), w.code() >= 12);
+            let decision = w.code() <= 11 || w == Why::SystemStale;
+            assert_eq!(w.strikes(), !decision, "{w:?}");
+            // Only a strike can poison.
+            assert!(!w.poisons() || w.strikes(), "{w:?}");
         }
         assert!(Why::DrainTimeout.poisons() && Why::ReleaseFailed.poisons());
         assert!(!Why::HostShape.poisons());
+    }
+
+    #[test]
+    fn deadlines_bound_every_wait_to_seconds() {
+        use super::deadline::*;
+        // Each step is far below the 30 s of a default round trip or ring wait, and a whole
+        // retire or create blocks for a few seconds at most.
+        for ms in [FENCE_MS, DRAIN_MS, UNREF_MS, CREATE_MS, IMPORT_MS] {
+            assert!(ms > 0 && ms <= 1_000, "{ms}");
+        }
+        assert!(FENCE_MS < DRAIN_MS);
+        assert_eq!(CREATE_TOTAL_MS, CREATE_MS + IMPORT_MS + UNREF_MS);
+        assert!(CREATE_TOTAL_MS <= 3_000);
+        assert!(Limits::NORMAL.total_ms() <= 2_000);
+        // A cap cuts both limits, never to 0, and never raises them.
+        assert_eq!(Limits::capped(u64::MAX), Limits::NORMAL);
+        assert_eq!(
+            Limits::capped(300),
+            Limits {
+                drain_ms: 300,
+                unref_ms: 300
+            }
+        );
+        assert_eq!(
+            Limits::capped(0),
+            Limits {
+                drain_ms: 1,
+                unref_ms: 1
+            }
+        );
+        for cap in [0u64, 1, 250, 999, 1_000, 1_001, 5_000] {
+            let l = Limits::capped(cap);
+            assert!(l.drain_ms >= 1 && l.drain_ms <= DRAIN_MS);
+            assert!(l.unref_ms >= 1 && l.unref_ms <= UNREF_MS);
+        }
+        // One fence wait: the per-fence limit, cut to what the section has left, never 0.
+        assert_eq!(fence_wait_ms(None), FENCE_MS);
+        assert_eq!(fence_wait_ms(Some(10_000)), FENCE_MS);
+        assert_eq!(fence_wait_ms(Some(100)), 100);
+        assert_eq!(fence_wait_ms(Some(0)), 1);
+    }
+
+    #[test]
+    fn an_unanswered_create_poisons() {
+        let mut r = Record::new(1);
+        r.begin_create().unwrap();
+        r.create_failed(Why::CreateTimeout);
+        assert!(r.poisoned && r.disabled());
+        assert!(!r.may_unlock());
+        assert_eq!(r.begin_drain(), Drain::Poisoned);
+        assert!(Why::CreateTimeout.strikes() && Why::CreateTimeout.poisons());
     }
 
     #[test]

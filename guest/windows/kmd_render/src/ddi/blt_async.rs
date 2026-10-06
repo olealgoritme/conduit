@@ -599,20 +599,33 @@ unsafe fn direct(
 ) -> Result<Taken, NTSTATUS> {
     let destination_resource = destination.resource_id();
     let copy = adapter.with_venus_client(passive, |client| {
-        // Decided under the Venus mutex, with the predicate the copy applies: a copy into the
-        // guest buffer writes the system pages themselves; any other copy makes them older
-        // than the blob from here on (marked before the copy, spinlocks only).
-        let guest = client.guest_target_live(destination_resource);
-        if need_guest && !guest {
-            return Err(VirtioError::DeviceError);
-        }
-        if !guest {
+        // ONE decision, under the Venus mutex: the copy target the prepare chose
+        // (`guest_target_for`) is the target the submission below writes, and the stale mark
+        // and the route's need for a guest blob are decided from it. A copy into the guest
+        // buffer writes the system pages themselves; any other copy makes them older than the
+        // blob from here on (marked before the copy, spinlocks only). With `GuestBlob` 0 no
+        // guest target exists (the decision is always "submit, mark"): the mark goes before the
+        // prepare, exactly where it always went.
+        let guest_knob = crate::ddi::guest_blob::knob_on();
+        if !guest_knob {
             mark_stale(adapter, destination_resource);
         }
-        client.submit_present_blt_direct(adapter, source, destination)
+        let prepared = client.prepare_present_blt_guest(adapter, source, destination)?;
+        match helios_kmd_logic::guest_blob::direct_copy(need_guest, prepared.guest_target()) {
+            helios_kmd_logic::guest_blob::DirectCopy::Refuse => {
+                return Err(VirtioError::DeviceError);
+            }
+            helios_kmd_logic::guest_blob::DirectCopy::Submit { mark_stale: true } => {
+                if guest_knob {
+                    mark_stale(adapter, destination_resource);
+                }
+            }
+            helios_kmd_logic::guest_blob::DirectCopy::Submit { mark_stale: false } => {}
+        }
+        client.submit_prepared_present_blt_direct(adapter, source, prepared)
     });
-    // (`submit_present_blt_direct` passes the source's id down: the in-flight table holds a
-    // read-ledger ticket on it until the copy retires.)
+    // (`submit_prepared_present_blt_direct` passes the source's id down: the in-flight table
+    // holds a read-ledger ticket on it until the copy retires.)
     let fence = match copy {
         Ok(Ok(BltSubmit::Fence(fence))) => fence,
         Ok(Ok(BltSubmit::DstBusy)) => return Ok(fall(Why::DstBusy)),

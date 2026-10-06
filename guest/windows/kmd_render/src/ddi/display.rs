@@ -1868,34 +1868,79 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 .with_virtio(|v| v.take_ready_windowed_blt())
                 .ok()
                 .flatten();
-            request.map(|request| {
+            request.map(|mut request| {
+                // `GuestBlob`: a copy prepared into a guest buffer that is no longer its
+                // destination's copy target (retired by a paging operation since the Present)
+                // is prepared again into the destination's current target, and the request's
+                // mirror flag follows the new target, so the frame still lands (in the Venus
+                // blob, mirrored into the pages unless `BltNoMirror`). `None` (one bool test)
+                // for every copy not prepared for a guest buffer.
+                let mut retarget_failed = None;
+                if let Some(again) =
+                    client.retarget_prepared_present_blt(adapter, request.source, request.prepared)
+                {
+                    crate::ddi::guest_blob::note_lost();
+                    match again {
+                        Ok(prepared) => {
+                            // Mirrored unless it went into a guest buffer or `BltNoMirror` is on.
+                            let no_mirror = !helios_kmd_logic::guest_blob::present_effect(
+                                prepared.guest_target(),
+                                crate::ddi::blt_async::no_mirror_on(),
+                            )
+                            .mirror;
+                            let updated = adapter
+                                .with_virtio(|v| {
+                                    v.retarget_windowed_blt(
+                                        request.token,
+                                        request.stream_boundary,
+                                        prepared,
+                                        no_mirror,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if updated {
+                                request.prepared = prepared;
+                                request.no_mirror = no_mirror;
+                            } else {
+                                retarget_failed = Some(VirtioError::DeviceError);
+                            }
+                        }
+                        Err(error) => retarget_failed = Some(error),
+                    }
+                }
                 // `BltNoMirror`: from this submission the system pages VidMm may hold for the
                 // destination are older than its blob and nothing will mirror them. Not for a
                 // copy into a guest buffer (`GuestBlob`): it writes those pages themselves.
-                if request.async_blt && request.no_mirror && !request.prepared.guest_target() {
+                if retarget_failed.is_none()
+                    && request.async_blt
+                    && request.no_mirror
+                    && !request.prepared.guest_target()
+                {
                     crate::ddi::blt_async::mark_stale(adapter, request.destination_resource_id);
                     crate::ddi::blt_async::note_mirror_skipped();
                 }
                 (
                     request.token,
                     request.stream_boundary,
-                    request.prepared.guest_target(),
                     match request.destination {
                         PresentDestinationDesc::StandardBuffer(destination) => {
                             Some(destination.resource_id())
                         }
                         PresentDestinationDesc::OptimalImage(_) => None,
                     },
-                    client.submit_prepared_present_blt(
-                        adapter,
-                        request.prepared,
-                        request.token,
-                        request.stream_boundary,
-                    ),
+                    match retarget_failed {
+                        Some(error) => Err(error),
+                        None => client.submit_prepared_present_blt(
+                            adapter,
+                            request.prepared,
+                            request.token,
+                            request.stream_boundary,
+                        ),
+                    },
                 )
             })
         });
-        if let Ok(Some((token, boundary, guest, destination_buffer, result))) = submit {
+        if let Ok(Some((token, boundary, destination_buffer, result))) = submit {
             match result {
                 Ok(fence) => crate::ddi::scanout_timeline::note(
                     crate::ddi::scanout_timeline::kind::WINDOWED_BLT_SUBMIT,
@@ -1907,11 +1952,6 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                     0,
                 ),
                 Err(_) => {
-                    if guest {
-                        // Its guest buffer was retired (a paging operation) after the Present
-                        // prepared it: the copy is dropped, the destination keeps its pages.
-                        crate::ddi::guest_blob::note_lost();
-                    }
                     let _ = adapter.with_virtio(|v| {
                         if let Some(resource_id) = destination_buffer {
                             v.abort_present_buffer_write_before_submit(resource_id);

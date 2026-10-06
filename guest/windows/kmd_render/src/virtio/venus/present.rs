@@ -1242,7 +1242,7 @@ impl VenusClient {
         // the cache key (one predicate, under this mutex: `guest_target_for`).
         let guest = match destination {
             PresentDestinationDesc::StandardBuffer(desc) if allow_guest => {
-                self.guest_target_for(&desc)
+                self.guest_target_for(adapter, &desc)
             }
             _ => None,
         };
@@ -1484,15 +1484,17 @@ impl VenusClient {
     /// destination, submitted through `ctrl::submit_venus_async_blt`, which takes (or joins) the
     /// destination's writer ownership in the same transport critical section as the enqueue and
     /// leaves its hand-back to the completion DPC. The caller never waits for the host.
-    pub fn submit_present_blt_direct(
+    ///
+    /// `prepared` comes from [`Self::prepare_present_blt_guest`] in the SAME hold of this
+    /// client's mutex: the caller decides the stale mark (and whether the route still stands)
+    /// from `prepared.guest_target()`, the target this copy then writes, so the two cannot
+    /// disagree (`helios_kmd_logic::guest_blob::direct_copy`).
+    pub fn submit_prepared_present_blt_direct(
         &mut self,
         adapter: &AdapterContext,
         source: OptimalPresentImageDesc,
-        destination: PresentDestinationDesc,
+        prepared: PreparedPresentBltSubmission,
     ) -> Result<ctrl::BltSubmit, VirtioError> {
-        // May copy into a guest buffer: the caller decided the stale mark under this same
-        // mutex with `guest_target_live`, the predicate `prepare_present_blt_to` applies.
-        let prepared = self.prepare_present_blt_to(adapter, source, destination, true)?;
         let blt_index = self.validate_prepared_present_blt(prepared)?;
         let PresentDestinationDesc::StandardBuffer(buffer) = prepared.destination else {
             return Err(VirtioError::DeviceError);
@@ -1562,6 +1564,34 @@ impl VenusClient {
                     .store(1, core::sync::atomic::Ordering::Release);
             }
         }
+    }
+
+    /// `GuestBlob`: a deferred copy was prepared (at Present) into the guest buffer of its
+    /// destination; at submission that buffer may no longer be the destination's copy target
+    /// (a paging operation retired it, a mark or a foreign consumer did, a retire was poisoned).
+    /// Then the copy is prepared AGAIN, into whatever the destination's target is now (its
+    /// Venus blob, or a newer guest buffer), so the Present's content still lands somewhere a
+    /// reader sees: `Some(new preparation)`, which the caller submits instead, with the mirror
+    /// decided from the new target. `None`: `prepared` stands as it is, always for a copy that
+    /// was not prepared for a guest buffer (one bool test: the default path).
+    pub fn retarget_prepared_present_blt(
+        &mut self,
+        adapter: &AdapterContext,
+        source: OptimalPresentImageDesc,
+        prepared: PreparedPresentBltSubmission,
+    ) -> Option<Result<PreparedPresentBltSubmission, VirtioError>> {
+        if !prepared.guest {
+            return None;
+        }
+        let PresentDestinationDesc::StandardBuffer(desc) = prepared.destination else {
+            return None;
+        };
+        let current = self.guest_target_for(adapter, &desc).map(|g| g.guest);
+        if !helios_kmd_logic::guest_blob::retarget_needed(Some(prepared.cache_destination), current)
+        {
+            return None;
+        }
+        Some(self.prepare_present_blt_to(adapter, source, prepared.destination, true))
     }
 
     /// Submit a cache-prepared BLT only after the exact Present token was
