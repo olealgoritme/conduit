@@ -28,7 +28,7 @@ use helios_protocol::{
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 use crate::irql::PassiveLevel;
-use crate::virtio::foreign::{self, ImportError, RM_IMPORT_SERVED};
+use crate::virtio::foreign::{self, ImportError};
 use crate::virtio::gpu::DeviceOwner;
 
 // kmd_logic has no dependency edge to helios_protocol; this pins its copy of the
@@ -108,7 +108,7 @@ fn query_caps(
     };
     caps.supported_ops =
         (1u64 << HELIOS_FOREIGN_OP_QUERY_CAPS) | (1u64 << HELIOS_FOREIGN_OP_IMPORT_RM);
-    caps.caps_flags = if RM_IMPORT_SERVED {
+    caps.caps_flags = if foreign::rm_import_served(adapter) {
         HELIOS_FOREIGN_CAP_RM_IMPORT
     } else {
         0
@@ -193,7 +193,23 @@ fn import_rm(
         // No transport is the transport verdict, not the KMD's: fail the escape
         // as the other transport-bound verbs do.
         Err(ImportError::NoTransport) => return STATUS_DEVICE_NOT_READY,
-        Err(ImportError::Device(_)) => HELIOS_FOREIGN_ST_DEVICE_ERROR,
+        Err(ImportError::Device(_, errno)) => {
+            req.out_host_errno = errno;
+            HELIOS_FOREIGN_ST_DEVICE_ERROR
+        }
+        // The host's own verdicts, with its errno kept for the caller.
+        Err(ImportError::HostNotOwned(errno)) => {
+            req.out_host_errno = errno;
+            HELIOS_FOREIGN_ST_NOT_OWNED
+        }
+        Err(ImportError::HostBadRange(errno)) => {
+            req.out_host_errno = errno;
+            HELIOS_FOREIGN_ST_BAD_RANGE
+        }
+        Err(ImportError::HostUnsupported(errno)) => {
+            req.out_host_errno = errno;
+            HELIOS_FOREIGN_ST_UNSUPPORTED
+        }
     };
     write_back(buf, &req)
 }

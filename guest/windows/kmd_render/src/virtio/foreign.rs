@@ -5,8 +5,9 @@
 //!
 //! The sequence, and why each step is where it is:
 //!
-//! 1. **Gate.** Until the host serves the import (`RM_IMPORT_SERVED`), nothing
-//!    is touched: no reservation, no wire traffic.
+//! 1. **Gate.** Unless the host advertises the import (`rm_import_served`: config
+//!    features bit 13 with bit 10), nothing is touched: no reservation, no wire
+//!    traffic.
 //! 2. **Structure.** `validate_request`: ids nonzero, flags known, a whole number
 //!    of pages within the per-resource cap, and a layout (mandatory) that is valid
 //!    and fits the size. Pure.
@@ -61,7 +62,29 @@ use helios_protocol::HELIOS_BLOB_MEM_RM_EXPORT;
 ///    or a layout-carrying message must be added: see "Open questions" in the
 ///    design note.
 /// 4. The deferred review findings in the design note are fixed or accepted.
-pub const RM_IMPORT_SERVED: bool = false;
+///
+/// **OPENED (v310): this is no longer a constant.** [`rm_import_served`] reads the
+/// device's config `features` word: the import is served only when the host
+/// advertises `NVGPU_CFG_RM_IMPORT` (bit 13) together with `NVGPU_CFG_VENUS` (bit
+/// 10). The host sets bit 13 only when its renderer imports dma-bufs, so an older
+/// host is never sent the new blob type. The constant below is kept as the
+/// compile-time kill switch.
+pub const RM_IMPORT_ENABLED: bool = true;
+
+/// Config `features` bits: `NVGPU_CFG_RM_IMPORT` and `NVGPU_CFG_VENUS`.
+const CFG_RM_IMPORT: u32 = 1 << 13;
+const CFG_VENUS: u32 = 1 << 10;
+
+/// Whether this device serves `IMPORT_RM`.
+pub fn rm_import_served(adapter: &AdapterContext) -> bool {
+    RM_IMPORT_ENABLED
+        && adapter
+            .with_virtio(|v| {
+                let f = v.nvrm_device_features();
+                f & CFG_RM_IMPORT != 0 && f & CFG_VENUS != 0
+            })
+            .unwrap_or(false)
+}
 
 /// `IMPORT_RM` requests turned away because the gate is closed (`FgUns`).
 pub static IMPORT_UNSUPPORTED: AtomicU32 = AtomicU32::new(0);
@@ -84,8 +107,16 @@ pub enum ImportError {
     NoResources,
     /// There is no transport.
     NoTransport,
-    /// The host or the transport refused the create.
-    Device(VirtioError),
+    /// The host or the transport refused the create. The `u32` is the host's errno
+    /// (0 if none was reported), already classified for the cases below.
+    Device(VirtioError, u32),
+    /// The host said the RM handle or the GEM handle is not usable (`EBADF` or
+    /// `ENOENT`).
+    HostNotOwned(u32),
+    /// The host said the size or the request is out of range (`ERANGE`, `EINVAL`).
+    HostBadRange(u32),
+    /// The host does not serve the import (`EOPNOTSUPP`).
+    HostUnsupported(u32),
 }
 
 /// Import GEM object `gem_handle` of DRM file `rm_handle` as a Venus resource of
@@ -104,7 +135,7 @@ pub fn import_rm(
     size: u64,
     layout: Option<Layout>,
 ) -> Result<u32, ImportError> {
-    if !RM_IMPORT_SERVED {
+    if !rm_import_served(adapter) {
         IMPORT_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
         return Err(ImportError::Unsupported);
     }
@@ -122,7 +153,8 @@ pub fn import_rm(
         ForeignBegin::Quota(_) => return Err(ImportError::NoResources),
     };
 
-    let created = ctrl::alloc_blob(
+    let mut host_errno = 0u32;
+    let created = ctrl::alloc_blob_errno(
         passive,
         adapter,
         ctx_id,
@@ -131,14 +163,21 @@ pub fn import_rm(
         foreign_blob_id(rm_handle, gem_handle),
         size,
         Some(owner),
+        Some(&mut host_errno),
     );
     let resource_id = match created {
         Ok(id) => id,
         Err(e) => {
             let _ = adapter.with_virtio(|v| v.foreign_abandon_import(reservation));
-            return Err(match e {
-                VirtioError::OutOfMemory => ImportError::NoResources,
-                other => ImportError::Device(other),
+            use helios_kmd_logic::foreign_errno::{classify, Verdict};
+            return Err(match (e, classify(host_errno)) {
+                (VirtioError::OutOfMemory, _) | (_, Verdict::NoResources) => {
+                    ImportError::NoResources
+                }
+                (_, Verdict::NotOwned) => ImportError::HostNotOwned(host_errno),
+                (_, Verdict::BadRange) => ImportError::HostBadRange(host_errno),
+                (_, Verdict::Unsupported) => ImportError::HostUnsupported(host_errno),
+                (other, Verdict::Device) => ImportError::Device(other, host_errno),
             });
         }
     };
@@ -157,7 +196,7 @@ pub fn import_rm(
     match committed {
         Ok(ForeignCommit::Recorded) => Ok(resource_id),
         // Device teardown already released the resource.
-        Ok(ForeignCommit::BlobGone) => Err(ImportError::Device(VirtioError::DeviceError)),
+        Ok(ForeignCommit::BlobGone) => Err(ImportError::Device(VirtioError::DeviceError, 0)),
         // The resource exists host-side with no record: release it through the
         // ordinary path (blob slot, live entry, detach, unref), best effort.
         Ok(verdict) => {
@@ -165,7 +204,7 @@ pub fn import_rm(
             Err(if verdict == ForeignCommit::HandleClosed {
                 ImportError::NotOwned
             } else {
-                ImportError::Device(VirtioError::DeviceError)
+                ImportError::Device(VirtioError::DeviceError, 0)
             })
         }
         Err(_) => Err(ImportError::NoTransport),

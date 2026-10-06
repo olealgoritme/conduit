@@ -1153,6 +1153,26 @@ pub fn resource_create_blob(
     blob_id: u64,
     size: u64,
 ) -> Result<u32, VirtioError> {
+    resource_create_blob_errno(
+        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size, None,
+    )
+}
+
+/// [`resource_create_blob`], plus the host's errno when it refuses the create:
+/// the host reports one only for the RM-export blob type
+/// (`foreign_errno::from_resp_hdr`). With `errno_out == None` this is exactly the
+/// plain call.
+#[allow(clippy::too_many_arguments)]
+fn resource_create_blob_errno(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    errno_out: Option<&mut u32>,
+) -> Result<u32, VirtioError> {
     let reserved = adapter
         .with_virtio(|v| v.reserve_resource_slot())
         .map_err(|_| VirtioError::DeviceError)?;
@@ -1175,7 +1195,31 @@ pub fn resource_create_blob(
     cmd.nr_entries = 0;
     cmd.blob_id = blob_id;
     cmd.size = size;
-    if let Err(e) = ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None) {
+    let mut resp = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+    let sent = ctrl_roundtrip(
+        passive,
+        adapter,
+        bytes_of(&cmd),
+        None,
+        &mut resp,
+        SYNC_ROUNDTRIP_TIMEOUT_MS,
+        None,
+    );
+    let created = match sent {
+        Ok(_) => {
+            let t = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+            if resp_is_ok(t) {
+                Ok(())
+            } else {
+                if let Some(e) = errno_out {
+                    *e = helios_kmd_logic::foreign_errno::from_resp_hdr(&resp);
+                }
+                Err(VirtioError::DeviceError)
+            }
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = created {
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
@@ -1202,6 +1246,25 @@ pub fn alloc_blob(
     size: u64,
     owner: Option<DeviceOwner>,
 ) -> Result<u32, VirtioError> {
+    alloc_blob_errno(
+        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size, owner, None,
+    )
+}
+
+/// [`alloc_blob`] that also reports the host's errno for a refused create (see
+/// [`resource_create_blob_errno`]).
+#[allow(clippy::too_many_arguments)]
+pub fn alloc_blob_errno(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    owner: Option<DeviceOwner>,
+    errno_out: Option<&mut u32>,
+) -> Result<u32, VirtioError> {
     if size == 0 {
         return Err(VirtioError::DeviceError);
     }
@@ -1211,8 +1274,8 @@ pub fn alloc_blob(
     if !reserved {
         return Err(VirtioError::OutOfMemory);
     }
-    match resource_create_blob(
-        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size,
+    match resource_create_blob_errno(
+        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size, errno_out,
     ) {
         Ok(resource_id) => {
             let _ = adapter.with_virtio(|v| v.commit_blob(owner, ctx_id, resource_id, size));
