@@ -346,3 +346,29 @@ pub(crate) fn umd_command_lists() -> bool {
 pub(crate) fn umd_deferred_diagnostics() -> bool {
     UMD_DEFERRED_DIAGNOSTICS.get()
 }
+
+// --- NVK on RM (dxvk-on-nvk S3) ----------------------------------------------
+//
+// Which ICD a process runs on is decided in the bridge
+// (`umd_common/bridge/bridge_icd_backend.h`: `Icd`, `NvkDenyList`,
+// `NvkAllowList`, `NvkIcdPath`, and `ForeignImport` for Venus processes that
+// compose NVK surfaces). These two only shape how an NVK device presents.
+
+/// `NvkPresent`: 0 = automatic (compose through DWM when the KMD gave the back
+/// buffer a resource id, else show it on scanout 0), 1 = always scanout 0
+/// (zero-copy flip of the back buffer; the desktop is hidden while the app
+/// presents), 2 = always the WDDM present (DWM composes).
+pub(crate) static NVK_PRESENT: DwordKnob = DwordKnob::new(c"NvkPresent", 0);
+
+/// `NvkPlaceholderAllocations`: 1 = never ask NVK for resource ids; every
+/// WDDM-backed texture gets a KMD placeholder (A/B and fallback lever).
+pub(crate) static NVK_PLACEHOLDER_ALLOCATIONS: BoolKnob =
+    BoolKnob::new(c"NvkPlaceholderAllocations", false);
+
+pub(crate) fn nvk_present_mode() -> u32 {
+    NVK_PRESENT.get()
+}
+
+pub(crate) fn nvk_placeholder_allocations() -> bool {
+    NVK_PLACEHOLDER_ALLOCATIONS.get()
+}

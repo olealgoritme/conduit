@@ -33,6 +33,7 @@
 #include "bridge_common.h"
 #include "bridge_icd_anchor.h"
 #include "bridge_icd_exports.h"
+#include "helios_icd_interface.h"
 
 namespace helios_bridge {
 
@@ -533,6 +534,51 @@ namespace helios_bridge {
 
     log_export_unavailable(HeliosIcdExport::MemoryOpenVidMmTracker);
     return false;
+  }
+
+  namespace {
+    uint32_t venus_api_ctx_id(VkInstance instance) {
+      return read_instance_venus_context_id(instance);
+    }
+
+    VkResult venus_api_memory_res_id(VkDevice, VkDeviceMemory memory, VkImage,
+                                     uint32_t* res_id, helios_icd_layout* layout) {
+      if (layout)
+        std::memset(layout, 0, sizeof(*layout));
+      *res_id = venus_memory_resource_id_from_handle(memory);
+      if (layout && *res_id) {
+        venus_memory_alloc_info_from_handle(memory, &layout->size,
+                                            &layout->memory_type_index);
+      }
+      return *res_id ? VK_SUCCESS : VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+
+    VkBool32 venus_api_memory_alloc_info(VkDeviceMemory memory, uint64_t* alloc_size,
+                                         uint32_t* memory_type_index) {
+      return venus_memory_alloc_info_from_handle(memory, alloc_size, memory_type_index)
+        ? VK_TRUE : VK_FALSE;
+    }
+
+    uint32_t venus_api_transfer_ownership(VkDeviceMemory memory) {
+      return venus_memory_transfer_resource_ownership(memory);
+    }
+  }
+
+  const helios_icd_api* venus_icd_api() {
+    static const helios_icd_api api = {
+      HELIOS_ICD_INTERFACE_VERSION,
+      sizeof(helios_icd_api),
+      HELIOS_ICD_BACKEND_VENUS,
+      HELIOS_ICD_CAP_RES_ID | HELIOS_ICD_CAP_PRODUCER,
+      venus_api_ctx_id,
+      venus_api_memory_res_id,
+      venus_api_memory_alloc_info,
+      venus_api_transfer_ownership,
+      nullptr,  // scanout_present: the KMD's own scanout path serves Venus
+      nullptr,  // scanout_release
+      nullptr,  // producer: DXVK resolves helios_venus_producer_interface itself
+    };
+    return &api;
   }
 
 }  // namespace helios_bridge

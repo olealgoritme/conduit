@@ -195,6 +195,45 @@ pub struct RtvState {
 pub(crate) struct RuntimeAllocPrivate {
     pub(crate) alloc: HeliosWddmAllocPrivate,
     pub(crate) meta: HeliosWddmAllocMeta,
+    /// The foreign-layout trailer at byte 96. Sent (128 bytes) only for an
+    /// NVK-made allocation; every other allocation still sends the 96-byte
+    /// prefix, exactly as before.
+    pub(crate) layout: helios_protocol::HeliosWddmAllocLayout,
+}
+
+const _: () = {
+    assert!(
+        core::mem::offset_of!(RuntimeAllocPrivate, layout)
+            == helios_protocol::HELIOS_WDDM_LAYOUT_OFFSET
+    );
+    assert!(
+        core::mem::size_of::<RuntimeAllocPrivate>()
+            == helios_protocol::HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES
+    );
+};
+
+/// The KMD's foreign-layout trailer of an OPENED allocation (written by the KMD
+/// at create time for an NVK-made resource), or `None` for every other one.
+pub(crate) unsafe fn read_open_layout(
+    ptr: *const c_void,
+    size: u32,
+) -> Option<crate::bridge::ForeignLayout> {
+    use helios_protocol::{HeliosWddmAllocLayout, HELIOS_WDDM_LAYOUT_OFFSET};
+    if ptr.is_null()
+        || (size as usize)
+            < HELIOS_WDDM_LAYOUT_OFFSET + core::mem::size_of::<HeliosWddmAllocLayout>()
+    {
+        return None;
+    }
+    let layout = core::ptr::read_unaligned(
+        (ptr as *const u8).add(HELIOS_WDDM_LAYOUT_OFFSET) as *const HeliosWddmAllocLayout,
+    );
+    layout.is_valid().then_some(crate::bridge::ForeignLayout {
+        modifier: layout.modifier,
+        stride: layout.stride,
+        offset: layout.plane_offset,
+        fourcc: layout.fourcc,
+    })
 }
 
 #[inline]

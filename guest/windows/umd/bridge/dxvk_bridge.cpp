@@ -64,10 +64,13 @@
 #include "d3d11_context_imm.h"
 #include "dxvk_helios_feed_trace.h"
 #include "dxvk_helios_producer.h"
+#include "dxvk_helios_backend.h"
 
 // After the DXVK headers: see the include-order note in this header.
 #include "bridge_icd_anchor.h"
+#include "bridge_icd_backend.h"
 #include "bridge_icd_exports.h"
+#include "helios_icd_interface.h"
 
 // ── the shared bridge_guard, with this bridge's one engine-specific arm ──────
 //
@@ -323,6 +326,11 @@ struct HeliosDxvkDeviceImpl {
   ID3D11Device*        d3d11   = nullptr; // QI'd from D3D11DXGIDevice; holds it alive
   ID3D11DeviceContext* context = nullptr; // immediate context
   std::uint32_t venus_ctx_id = 0;
+  // The ICD under DXVK and its backend-neutral table (helios_icd_interface.h):
+  // the Venus ICD's helios_venus_* exports wrapped (venus_icd_api), or NVK's
+  // helios_icd_interface_v2.
+  helios_bridge::IcdBackend backend = helios_bridge::IcdBackend::Venus;
+  helios_icd_api icd = {};
   // WSI borrows its handle only until Present returns. Keep a duplicate for
   // exact object comparison and an imported semaphore for the helper device.
   std::mutex vehicle_semaphore_mutex;
@@ -408,6 +416,115 @@ std::uint32_t HeliosDxvkDevice::venus_context_id() const {
   return impl ? impl->venus_ctx_id : 0;
 }
 
+std::uint32_t HeliosDxvkDevice::icd_backend() const {
+  return impl ? static_cast<std::uint32_t>(impl->backend) : 0;
+}
+
+namespace {
+  // The texture's image and the memory it is bound to, or false.
+  bool texture_image_memory(std::size_t d3d11_resource_ptr, VkImage* image,
+                            VkDeviceMemory* memory, VkDeviceSize* offset) {
+    if (!d3d11_resource_ptr)
+      return false;
+    auto* texture = dxvk::GetCommonTexture(
+      reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr));
+    if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
+      return false;
+    auto img = texture->GetImage();
+    auto info = img->storage()->getMemoryInfo();
+    *image = img->handle();
+    *memory = info.memory;
+    *offset = info.offset;
+    return *image != VK_NULL_HANDLE && *memory != VK_NULL_HANDLE;
+  }
+}
+
+bool HeliosDxvkDevice::get_resource_foreign_identity(
+    std::size_t d3d11_resource_ptr,
+    std::uint32_t* resource_id,
+    std::uint32_t* ctx_id,
+    std::uint64_t* size,
+    std::uint64_t* modifier,
+    std::uint32_t* stride,
+    std::uint32_t* offset,
+    std::uint32_t* fourcc) const noexcept {
+  return bridge_guard("get_resource_foreign_identity", false, [&]() -> bool {
+    *resource_id = 0; *ctx_id = 0; *size = 0; *modifier = 0;
+    *stride = 0; *offset = 0; *fourcc = 0;
+    if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm
+     || !impl->icd.memory_res_id)
+      return false;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memory_offset = 0;
+    if (!texture_image_memory(d3d11_resource_ptr, &image, &memory, &memory_offset)
+     || memory_offset != 0)
+      return false;
+    helios_icd_layout layout = {};
+    std::uint32_t res = 0;
+    const VkResult vr = impl->icd.memory_res_id(
+      impl->device->vkd()->device(), memory, image, &res, &layout);
+    static std::atomic<std::uint32_t> s_logs{0};
+    if (bridge_log_budget(s_logs, 64, 512)) {
+      char msg[288];
+      std::snprintf(msg, sizeof(msg),
+        "nvk resource id: vr=%d res_id=%u %ux%u stride=%u offset=%u fourcc=0x%08x "
+        "modifier=0x%016llx size=%llu",
+        int(vr), res, layout.width, layout.height, layout.stride, layout.offset,
+        layout.fourcc, static_cast<unsigned long long>(layout.modifier),
+        static_cast<unsigned long long>(layout.size));
+      umd_log(msg);
+    }
+    if (vr != VK_SUCCESS || !res)
+      return false;
+    *resource_id = res;
+    *ctx_id = impl->icd.ctx_id ? impl->icd.ctx_id(impl->instance->handle()) : 0;
+    *size = layout.size;
+    *modifier = layout.modifier;
+    *stride = layout.stride;
+    *offset = layout.offset;
+    *fourcc = layout.fourcc;
+    return *ctx_id != 0;
+  });
+}
+
+std::int32_t HeliosDxvkDevice::nvk_scanout_present(
+    std::size_t d3d11_resource_ptr) const noexcept {
+  return bridge_guard("nvk_scanout_present", std::int32_t(-1), [&]() -> std::int32_t {
+    if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm
+     || !impl->icd.scanout_present)
+      return -1;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memory_offset = 0;
+    if (!texture_image_memory(d3d11_resource_ptr, &image, &memory, &memory_offset)
+     || memory_offset != 0)
+      return -2;
+    const VkResult vr = impl->icd.scanout_present(
+      impl->device->vkd()->device(), memory, image);
+    if (vr != VK_SUCCESS) {
+      static std::atomic<std::uint32_t> s_fail{0};
+      const std::uint32_t n = s_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n % 512u) == 0) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "nvk scanout present failed vr=%d (x%u)", int(vr), n);
+        umd_log(msg);
+      }
+      return -3;
+    }
+    return 0;
+  });
+}
+
+void HeliosDxvkDevice::nvk_scanout_release() const noexcept {
+  bridge_guard("nvk_scanout_release", false, [&]() -> bool {
+    if (impl && impl->backend == helios_bridge::IcdBackend::NvkRm
+     && impl->icd.scanout_release && impl->device != nullptr)
+      impl->icd.scanout_release(impl->device->vkd()->device());
+    return true;
+  });
+}
+
 std::uint64_t HeliosDxvkDevice::feed_trace_timestamp_ns() const noexcept {
   return dxvk::helios_feed::timestampNs();
 }
@@ -471,13 +588,17 @@ bool HeliosDxvkDevice::set_resource_kmt_handles(
       return false;
 
     auto image = texture->GetImage();
-    dxvk::Rc<dxvk::HeliosProducerBinding> producer = new dxvk::HeliosProducerBinding(
-      impl->device->vkd()->device(), impl->device->vkd()->vkGetSemaphoreCounterValue, local);
-    if (!image->storage()->setHeliosProducer(producer))
-      return false;
-    if (image->heliosStagingImage() != nullptr
-     && !image->heliosStagingImage()->storage()->setHeliosProducer(producer))
-      return false;
+    // The producer binding (escape 0x13, keyed on a Venus timeline) exists
+    // only on Venus; NVK presents are CPU-complete (value-0 markers).
+    if (impl->backend == helios_bridge::IcdBackend::Venus) {
+      dxvk::Rc<dxvk::HeliosProducerBinding> producer = new dxvk::HeliosProducerBinding(
+        impl->device->vkd()->device(), impl->device->vkd()->vkGetSemaphoreCounterValue, local);
+      if (!image->storage()->setHeliosProducer(producer))
+        return false;
+      if (image->heliosStagingImage() != nullptr
+       && !image->heliosStagingImage()->storage()->setHeliosProducer(producer))
+        return false;
+    }
     image->storage()->setKmtHandles(local, global);
 
     static std::atomic<std::uint32_t> s_setKmtLogs{0};
@@ -510,6 +631,10 @@ bool HeliosDxvkDevice::get_resource_memory_info(
 
     if (!d3d11_resource_ptr)
       return false;
+    // The Venus blob id and its exact-size identity have no NVK counterpart:
+    // an NVK texture is named by get_resource_foreign_identity instead.
+    if (!impl || impl->backend != helios_bridge::IcdBackend::Venus)
+      return false;
 
     auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr);
     auto* texture = dxvk::GetCommonTexture(resource);
@@ -519,7 +644,10 @@ bool HeliosDxvkDevice::get_resource_memory_info(
     auto info = texture->GetImage()->storage()->getMemoryInfo();
     const auto rawMemory = memory_handle_bits(info.memory);
     const auto venusId = venus_memory_id_from_handle(info.memory);
-    const auto resourceId = venus_memory_resource_id_from_handle(info.memory);
+    std::uint32_t resourceId = 0;
+    if (impl->icd.memory_res_id)
+      impl->icd.memory_res_id(impl->device->vkd()->device(), info.memory,
+                              texture->GetImage()->handle(), &resourceId, nullptr);
     if (memory)
       *memory = venusId;
     if (size)
@@ -567,9 +695,12 @@ bool HeliosDxvkDevice::get_resource_alloc_identity(
     if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
       return false;
 
+    if (!impl || impl->backend != helios_bridge::IcdBackend::Venus
+     || !impl->icd.memory_alloc_info)
+      return false;
     auto info = texture->GetImage()->storage()->getMemoryInfo();
-    const bool valid = venus_memory_alloc_info_from_handle(
-      info.memory, venus_alloc_size, memory_type_index);
+    const bool valid = impl->icd.memory_alloc_info(
+      info.memory, venus_alloc_size, memory_type_index) == VK_TRUE;
     if (valid && global_vidmm_tracker) {
       *global_vidmm_tracker =
         venus_memory_vidmm_global_identity_from_handle(info.memory);
@@ -590,7 +721,8 @@ bool HeliosDxvkDevice::transfer_resource_ownership(
       return false;
 
     auto info = texture->GetImage()->storage()->getMemoryInfo();
-    const auto resourceId = venus_memory_transfer_resource_ownership(info.memory);
+    const auto resourceId = impl && impl->icd.transfer_ownership
+      ? impl->icd.transfer_ownership(info.memory) : 0u;
 
     static std::atomic<std::uint32_t> s_xferOwnLogs{0};
     if (bridge_log_budget(s_xferOwnLogs, 64, 512)) {
@@ -622,9 +754,28 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     bool cross_context_optimal,
     bool dedicated_present_buffer,
     std::size_t source_image_create_info,
-    bool source_external_ownership) const {
+    bool source_external_ownership,
+    bool foreign,
+    std::uint64_t foreign_modifier,
+    std::uint32_t foreign_stride,
+    std::uint32_t foreign_offset) const {
   if (!impl || !impl->d3d11 || !global || !renderer_resource_id || !width || !height)
     return 0;
+  if (impl->backend != helios_bridge::IcdBackend::Venus) {
+    // An NVK process cannot import a surface another device made (no
+    // Venus/host-Vulkan -> RM direction, dxvk-on-nvk.md 3.7). Such apps belong
+    // on the deny-list.
+    static std::atomic<std::uint32_t> s_nvkOpen{0};
+    const std::uint32_t n = s_nvkOpen.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n % 512u) == 0) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+        "OpenDdiTexture2D REFUSED on NVK: res_id=%u is another device's surface (x%u)",
+        renderer_resource_id, n);
+      umd_log(msg);
+    }
+    return 0;
+  }
 
   return bridge_guard("open_ddi_texture2d", std::size_t(0), [&]() -> std::size_t {
       {
@@ -676,6 +827,12 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       importInfo.SourceCreateInfo =
         reinterpret_cast<const VkImageCreateInfo*>(source_image_create_info);
       importInfo.SourceExternalOwnership = source_external_ownership;
+      // An NVK-made resource (the KMD's foreign layout trailer): import it as
+      // an explicit DRM-modifier image (DXVK patch, ForeignImport knob).
+      importInfo.Foreign         = foreign;
+      importInfo.ForeignModifier = foreign_modifier;
+      importInfo.ForeignStride   = foreign_stride;
+      importInfo.ForeignOffset   = foreign_offset;
 
       // static_cast, matching the sibling context downcast in this file. Zero
       // runtime change today (the base sits at offset 0), but if an upstream DXVK
@@ -1323,6 +1480,9 @@ bool HeliosDxvkDevice::publish_present_order(std::size_t d3d11_resource_ptr,
   if (out_cookie) *out_cookie = 0;
   if (!impl || !impl->context)
     return false;
+  // Producer streams are Venus timelines; NVK presents are CPU-complete.
+  if (impl->backend != helios_bridge::IcdBackend::Venus)
+    return false;
 
   return bridge_guard("publish_present_order", false, [&]() -> bool {
     if (!d3d11_resource_ptr)
@@ -1726,25 +1886,40 @@ std::size_t HeliosDxvkDevice::create_compute_shader(const std::uint8_t* code, st
       });
 }
 
-std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
-    std::uint32_t luid_low,
-    std::int32_t  luid_high,
-    bool timer_resolution) {
-  // R824: configuration delivered as a process-global side effect, whose
-  // correctness used to be statement position -- these writes happened on EVERY
-  // CreateDevice DDI, and one process (dwm) creates several D3D11 devices, so
-  // the block was rewritten while earlier DxvkInstances were live and
-  // _putenv_s is not safe against a concurrent getenv. The values are identical
-  // on every call, so doing it once is behaviour-preserving; what goes away is
-  // the repeat writes and the concurrent-write window.
-  //
-  // Static guarantee: none. std::call_once is a runtime construct and an
-  // `EnvConfigured` token would be ceremony around one call site. _putenv_s
-  // stays the mechanism because DXVK reads env; changing that is out of scope.
-  static std::once_flag s_envOnce;
-  std::call_once(s_envOnce, [] {
-    // Force selection of the Helios venus device if other ICDs are present.
-    _putenv_s("DXVK_FILTER_DEVICE_NAME", "Virtio-GPU Venus");
+namespace {
+
+  // HKLM\SOFTWARE\Helios REG_DWORD, `fallback` when absent.
+  DWORD helios_reg_dword(const char* name, DWORD fallback) {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", name,
+                     RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, nullptr, &value,
+                     &size) == ERROR_SUCCESS)
+      return value;
+    return fallback;
+  }
+
+  // The per-backend DXVK environment. _putenv_s is not safe against a
+  // concurrent getenv, so this runs before any instance of the backend exists:
+  // once per process for the backend chosen, and once more only if NVK fails
+  // and the process falls back to Venus.
+  void configure_dxvk_env(helios_bridge::IcdBackend backend) {
+    if (backend == helios_bridge::IcdBackend::NvkRm) {
+      // DXVK only sees NVK (the instance is NVK's own, no loader), but keep
+      // the filter explicit; the backend switch turns the Venus-only export
+      // paths off (third_party/patches/dxvk).
+      _putenv_s("DXVK_FILTER_DEVICE_NAME", "NVK");
+      _putenv_s("HELIOS_DXVK_BACKEND", "nvk");
+    } else {
+      // Force selection of the Helios venus device if other ICDs are present.
+      _putenv_s("DXVK_FILTER_DEVICE_NAME", "Virtio-GPU Venus");
+      _putenv_s("HELIOS_DXVK_BACKEND", "");
+      // ForeignImport=1: this Venus process (DWM above all) composes surfaces
+      // NVK processes made, through explicit DRM-modifier imports. Off by
+      // default: it enables VK_EXT_image_drm_format_modifier on the device.
+      _putenv_s("HELIOS_DXVK_FOREIGN_IMPORT",
+                helios_reg_dword("ForeignImport", 0) ? "1" : "");
+    }
     // HELIOS_DXVK_KMT_SHARED is no longer forced here: the engine defaults it
     // ON (2026-08-05). Forcing it made a knob that could not be off in any
     // configuration this process ever produced, which hid the fact that the
@@ -1763,45 +1938,89 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     if (haveDump)
       _putenv_s("DXVK_SHADER_DUMP_PATH", dumpPath);
 
-    char msg[MAX_PATH + 128];
+    char msg[MAX_PATH + 160];
     std::snprintf(msg, sizeof(msg),
-      "dxvk env configured once: DXVK_FILTER_DEVICE_NAME=Virtio-GPU Venus "
-      "kmt-shared=default-on DXVK_SHADER_DUMP_PATH=%s",
+      "dxvk env configured: backend=%s DXVK_FILTER_DEVICE_NAME=%s "
+      "kmt-shared=default-on foreign-import=%s DXVK_SHADER_DUMP_PATH=%s",
+      backend == helios_bridge::IcdBackend::NvkRm ? "nvk" : "venus",
+      backend == helios_bridge::IcdBackend::NvkRm ? "NVK" : "Virtio-GPU Venus",
+      std::getenv("HELIOS_DXVK_FOREIGN_IMPORT") && std::getenv("HELIOS_DXVK_FOREIGN_IMPORT")[0] == '1'
+        ? "on" : "off",
       haveDump ? dumpPath : "(unset)");
     umd_log(msg);
-  });
+  }
 
-  return bridge_guard<std::unique_ptr<HeliosDxvkDevice>>(
-      "helios_dxvk_create_device", nullptr,
-      [&]() -> std::unique_ptr<HeliosDxvkDevice> {
-      auto out = std::make_unique<HeliosDxvkDevice>();
-      out->impl = std::make_unique<HeliosDxvkDeviceImpl>(timer_resolution);
-      auto& d = *out->impl;
+  std::mutex g_envMutex;
+  bool g_envConfigured[3] = {};
 
+  void configure_dxvk_env_once(helios_bridge::IcdBackend backend) {
+    std::lock_guard lock(g_envMutex);
+    const auto i = static_cast<std::size_t>(backend);
+    if (i < 3 && !g_envConfigured[i]) {
+      configure_dxvk_env(backend);
+      g_envConfigured[i] = true;
+    }
+  }
+
+  // Build the DXVK instance/adapter/device and the D3D11 COM device on
+  // `backend`. Returns false (with `d` partly filled) on any failure; the
+  // caller drops `d`.
+  bool create_on_backend(HeliosDxvkDeviceImpl& d, helios_bridge::IcdBackend backend,
+                         std::uint32_t luid_low, std::int32_t luid_high) {
+    d.backend = backend;
+    if (backend == helios_bridge::IcdBackend::NvkRm) {
+      auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+        helios_bridge::nvk_icd_get_instance_proc_addr());
+      if (!gipa || !helios_bridge::nvk_icd_api(&d.icd)) {
+        helios_bridge::note_nvk_failed("the NVK ICD did not load or has no helios_icd_interface_v2");
+        return false;
+      }
+      // NVK's own vk_icdGetInstanceProcAddr: no Vulkan loader, no registry,
+      // and no Venus ICD in this instance.
+      dxvk::DxvkInstanceImportInfo import = { };
+      import.loaderProc = gipa;
+      d.instance = new dxvk::DxvkInstance(import, dxvk::DxvkInstanceFlags());
+    } else {
+      d.icd = *helios_bridge::venus_icd_api();
       d.instance = new dxvk::DxvkInstance(dxvk::DxvkInstanceFlags());
+    }
 
-      if (luid_low != 0 || luid_high != 0) {
-        LUID luid;
-        luid.LowPart  = luid_low;
-        luid.HighPart = luid_high;
-        d.adapter = d.instance->findAdapterByLuid(&luid);
-        if (d.adapter == nullptr)
-          umd_log("findAdapterByLuid found nothing; falling back to adapter 0");
-      }
-
+    if (luid_low != 0 || luid_high != 0) {
+      LUID luid;
+      luid.LowPart  = luid_low;
+      luid.HighPart = luid_high;
+      d.adapter = d.instance->findAdapterByLuid(&luid);
       if (d.adapter == nullptr)
-        d.adapter = d.instance->enumAdapters(0);
+        umd_log("findAdapterByLuid found nothing; falling back to adapter 0");
+    }
 
-      if (d.adapter == nullptr) {
-        umd_log("no Vulkan adapter enumerated (venus ICD not present?)");
-        return nullptr;
-      }
+    if (d.adapter == nullptr)
+      d.adapter = d.instance->enumAdapters(0);
 
-      d.device = d.adapter->createDevice();
-      if (d.device == nullptr) {
-        umd_log("DxvkAdapter::createDevice returned null");
-        return nullptr;
-      }
+    if (d.adapter == nullptr) {
+      umd_log(backend == helios_bridge::IcdBackend::NvkRm
+        ? "no Vulkan adapter enumerated (NVK found no RM GPU?)"
+        : "no Vulkan adapter enumerated (venus ICD not present?)");
+      return false;
+    }
+
+    d.device = d.adapter->createDevice();
+    if (d.device == nullptr) {
+      umd_log("DxvkAdapter::createDevice returned null");
+      return false;
+    }
+
+    if (backend == helios_bridge::IcdBackend::NvkRm) {
+      // The holder context is NVK's (created at the first IMPORT_RM); the
+      // Venus ICD anchor does not concern this device.
+      d.venus_ctx_id = 0;
+      char msg[192];
+      std::snprintf(msg, sizeof(msg),
+        "DxvkDevice created on NVK OK (icd caps 0x%x: res_id=%u scanout=%u)",
+        d.icd.caps, (d.icd.caps & HELIOS_ICD_CAP_RES_ID) ? 1u : 0u,
+        (d.icd.caps & HELIOS_ICD_CAP_SCANOUT) ? 1u : 0u);
+      umd_log(msg);
+    } else {
       d.venus_ctx_id = read_instance_venus_context_id(d.instance->handle());
       // ⛔ S4b (`ARCHITECTURE.md` §6.4). The read above is the first thing that
       // forces `resolve_helios_icd_module`, which now reconciles against the
@@ -1820,37 +2039,80 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
       if (helios_bridge::icd_anchor_poisoned()) {
         umd_log("REFUSING DXVK device: venus ICD anchor mismatch "
                 "(two ICD modules live in this process)");
-        return nullptr;
+        return false;
       }
       if (!d.venus_ctx_id)
         umd_log("DXVK device created but Venus context export returned 0");
       umd_log("DxvkDevice created on venus adapter OK");
+    }
 
-      // Instantiate DXVK's full D3D11 COM device from the DxvkDevice. The DDI
-      // device-funcs forward to this ID3D11Device / its immediate context.
-      // `new HeliosStubAdapter()` starts at refcount 1 and is only released AFTER
-      // the D3D11DXGIDevice constructor returns — but that constructor builds the
-      // D3D11 device and its immediate context and can throw dxvk::DxvkError, in
-      // which case the catch below returns nullptr and the Release() never runs.
-      // The guard makes the zero-refcount window exit through exactly one path.
-      ComRelease<HeliosStubAdapter> stubAdapter(new HeliosStubAdapter());
-      auto* dxgiDevice = new dxvk::D3D11DXGIDevice(
-          stubAdapter.get(), nullptr, nullptr,
-          d.instance, d.adapter, d.device,
-          D3D_FEATURE_LEVEL_11_0, 0);
-      stubAdapter.reset(); // dxgiDevice holds its own ref now
+    // Instantiate DXVK's full D3D11 COM device from the DxvkDevice. The DDI
+    // device-funcs forward to this ID3D11Device / its immediate context.
+    // `new HeliosStubAdapter()` starts at refcount 1 and is only released AFTER
+    // the D3D11DXGIDevice constructor returns — but that constructor builds the
+    // D3D11 device and its immediate context and can throw dxvk::DxvkError, in
+    // which case the catch below returns nullptr and the Release() never runs.
+    // The guard makes the zero-refcount window exit through exactly one path.
+    ComRelease<HeliosStubAdapter> stubAdapter(new HeliosStubAdapter());
+    auto* dxgiDevice = new dxvk::D3D11DXGIDevice(
+        stubAdapter.get(), nullptr, nullptr,
+        d.instance, d.adapter, d.device,
+        D3D_FEATURE_LEVEL_11_0, 0);
+    stubAdapter.reset(); // dxgiDevice holds its own ref now
 
-      HRESULT hr = dxgiDevice->QueryInterface(__uuidof(ID3D11Device),
-                                              reinterpret_cast<void**>(&d.d3d11));
-      if (FAILED(hr) || d.d3d11 == nullptr) {
-        umd_log("QueryInterface(ID3D11Device) on D3D11DXGIDevice failed");
-        // dxgiDevice has refcount 0 here (QI failed) — drop it.
-        delete dxgiDevice;
+    HRESULT hr = dxgiDevice->QueryInterface(__uuidof(ID3D11Device),
+                                            reinterpret_cast<void**>(&d.d3d11));
+    if (FAILED(hr) || d.d3d11 == nullptr) {
+      umd_log("QueryInterface(ID3D11Device) on D3D11DXGIDevice failed");
+      // dxgiDevice has refcount 0 here (QI failed) — drop it.
+      delete dxgiDevice;
+      return false;
+    }
+    // d.d3d11 now holds the one ref that keeps dxgiDevice alive.
+    d.d3d11->GetImmediateContext(&d.context);
+    umd_log("D3D11 COM device + immediate context created OK");
+    return true;
+  }
+
+}  // namespace
+
+std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
+    std::uint32_t luid_low,
+    std::int32_t  luid_high,
+    bool timer_resolution) {
+  // R824: configuration delivered as a process-global side effect. One process
+  // (dwm) creates several D3D11 devices, so the environment is written once per
+  // backend, before that backend's first instance (configure_dxvk_env_once).
+  //
+  // ICD selection (S3, bridge_icd_backend.h): global NVK with a deny-list,
+  // Venus whenever NVK is denied, missing or failed in this process.
+  helios_bridge::IcdBackend backend = helios_bridge::effective_icd_backend();
+
+  if (backend == helios_bridge::IcdBackend::NvkRm) {
+    configure_dxvk_env_once(backend);
+    auto nvk = bridge_guard<std::unique_ptr<HeliosDxvkDevice>>(
+        "helios_dxvk_create_device(nvk)", nullptr,
+        [&]() -> std::unique_ptr<HeliosDxvkDevice> {
+        auto out = std::make_unique<HeliosDxvkDevice>();
+        out->impl = std::make_unique<HeliosDxvkDeviceImpl>(timer_resolution);
+        if (!create_on_backend(*out->impl, backend, luid_low, luid_high))
+          return nullptr;
+        return out;
+    });
+    if (nvk)
+      return nvk;
+    helios_bridge::note_nvk_failed("DXVK device creation on NVK failed");
+    backend = helios_bridge::IcdBackend::Venus;
+  }
+
+  configure_dxvk_env_once(backend);
+  return bridge_guard<std::unique_ptr<HeliosDxvkDevice>>(
+      "helios_dxvk_create_device", nullptr,
+      [&]() -> std::unique_ptr<HeliosDxvkDevice> {
+      auto out = std::make_unique<HeliosDxvkDevice>();
+      out->impl = std::make_unique<HeliosDxvkDeviceImpl>(timer_resolution);
+      if (!create_on_backend(*out->impl, backend, luid_low, luid_high))
         return nullptr;
-      }
-      // d.d3d11 now holds the one ref that keeps dxgiDevice alive.
-      d.d3d11->GetImmediateContext(&d.context);
-      umd_log("D3D11 COM device + immediate context created OK");
       return out;
   });
 }

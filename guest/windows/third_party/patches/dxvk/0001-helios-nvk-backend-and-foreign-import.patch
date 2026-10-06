@@ -1,0 +1,258 @@
+Helios DXVK fork: NVK backend and foreign (NVK-made) resource import
+
+Conduit guest/windows/docs/dxvk-on-nvk.md, stage S3. Applied to third_party/dxvk
+by ci/windows/Build-Driver.ps1 (the fork is not ours to push to).
+
+- HELIOS_DXVK_BACKEND=nvk (set by the UMD for an NVK device): shared images
+  are not exported as OPAQUE_FD/DMA_BUF but allocated dedicated with the
+  Helios export request (sType 1000384003), from which NVK mints a KMD
+  resource id; importing a shared resource on NVK fails cleanly.
+- HELIOS_DXVK_FOREIGN_IMPORT=1 (UMD knob ForeignImport): a Venus device
+  enables VK_EXT_image_drm_format_modifier, and a texture opened with the
+  KMD's foreign layout trailer (D3D11_HELIOS_IMPORT_INFO::Foreign) is imported
+  as an explicit DRM-modifier image with that modifier, pitch and offset,
+  bypassing the GDI staging and alias paths.
+
+diff --git a/src/d3d11/d3d11_texture.cpp b/src/d3d11/d3d11_texture.cpp
+index e22a1c7a..ef156fad 100644
+--- a/src/d3d11/d3d11_texture.cpp
++++ b/src/d3d11/d3d11_texture.cpp
+@@ -91,6 +91,10 @@ namespace dxvk {
+         imageInfo.sharing.heliosAllocSize       = pHeliosImport->AllocSize;
+         imageInfo.sharing.heliosMemoryTypeIndex = pHeliosImport->MemoryTypeIndex;
+         imageInfo.sharing.heliosDedicatedPresentBuffer = pHeliosImport->DedicatedPresentBuffer;
++        imageInfo.sharing.heliosForeign         = pHeliosImport->Foreign;
++        imageInfo.sharing.heliosForeignModifier = pHeliosImport->ForeignModifier;
++        imageInfo.sharing.heliosForeignStride   = pHeliosImport->ForeignStride;
++        imageInfo.sharing.heliosForeignOffset   = pHeliosImport->ForeignOffset;
+ 
+         // Symmetric scan-out-primary import: reconstruct the creator's exact
+         // plain LINEAR + DMA_BUF image. Import mode is preserved, and ordinary
+diff --git a/src/d3d11/d3d11_texture.h b/src/d3d11/d3d11_texture.h
+index d42527f3..93dad517 100644
+--- a/src/d3d11/d3d11_texture.h
++++ b/src/d3d11/d3d11_texture.h
+@@ -99,6 +99,12 @@ namespace dxvk {
+     // Vehicle v3: exact producer template, borrowed through texture creation.
+     const VkImageCreateInfo* SourceCreateInfo = nullptr;
+     bool SourceExternalOwnership = false;
++    // The resource is NVK-made (KMD foreign resource, Conduit dxvk-on-nvk S3):
++    // the KMD's layout trailer, to import it as a DRM-modifier image.
++    bool     Foreign          = false;
++    uint64_t ForeignModifier  = 0u;
++    uint32_t ForeignStride    = 0u;
++    uint32_t ForeignOffset    = 0u;
+   };
+ 
+ 
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index 2fc56066..f4495eb3 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -1,4 +1,5 @@
+ #include <algorithm>
++#include "dxvk_helios_backend.h"
+ #include <iomanip>
+ #include <set>
+ #include <sstream>
+@@ -675,6 +676,17 @@ namespace dxvk {
+       }
+     }
+ 
++    // Helios: a Venus device that composes NVK-made surfaces imports them as
++    // explicit DRM-modifier images. Only then, because the Venus paths are
++    // tuned for devices without this extension (see extExternalMemoryDmaBuf).
++    if (heliosForeignImport() && m_extensionsSupported.extImageDrmFormatModifier.specVersion
++     && !m_extensionsEnabled.extImageDrmFormatModifier.specVersion) {
++      m_extensionsEnabled.extImageDrmFormatModifier.specVersion =
++        m_extensionsSupported.extImageDrmFormatModifier.specVersion;
++      m_featuresEnabled.extImageDrmFormatModifier = VK_TRUE;
++      m_extensionList.push_back(&m_extensionsEnabled.extImageDrmFormatModifier);
++    }
++
+     // Make sure we have a full pNext chain to pass to the device
+     chainFeatures(m_extensionsEnabled, m_featuresEnabled);
+   }
+diff --git a/src/dxvk/dxvk_helios_backend.h b/src/dxvk/dxvk_helios_backend.h
+new file mode 100644
+index 00000000..653f208a
+--- /dev/null
++++ b/src/dxvk/dxvk_helios_backend.h
+@@ -0,0 +1,57 @@
++#pragma once
++
++#include <cstdlib>
++#include <cstring>
++
++#include "../vulkan/vulkan_loader.h"
++
++namespace dxvk {
++
++  /**
++   * \brief Helios: the Vulkan ICD under this engine is NVK on RM
++   *
++   * Set by the Helios UMD (HELIOS_DXVK_BACKEND=nvk) before it creates an
++   * instance on NVK (Conduit guest/windows/docs/dxvk-on-nvk.md, stage S3).
++   * The Venus-only paths then stay off: shared images are not exported as
++   * OPAQUE_FD/DMA_BUF (NVK has no external memory on Windows) but allocated
++   * dedicated with the Helios export request, from which NVK makes a KMD
++   * resource id; nothing is imported by Venus resource id.
++   *
++   * Read on every call, not cached: a process whose NVK device failed falls
++   * back to Venus and clears the variable.
++   */
++  inline bool heliosBackendNvk() {
++    const char* value = std::getenv("HELIOS_DXVK_BACKEND");
++    return value && !std::strcmp(value, "nvk");
++  }
++
++  /**
++   * \brief Helios: Venus devices may import NVK-made (foreign) resources
++   *
++   * Importing an RM-exported resource id needs an explicit DRM-modifier image
++   * (VK_EXT_image_drm_format_modifier), which the Venus paths otherwise never
++   * enable on DXVK devices. HELIOS_DXVK_FOREIGN_IMPORT=1, set by the UMD from
++   * its ForeignImport knob before the device is created.
++   */
++  inline bool heliosForeignImport() {
++    const char* value = std::getenv("HELIOS_DXVK_FOREIGN_IMPORT");
++    return value && value[0] == '1';
++  }
++
++  /**
++   * \brief VkMemoryAllocateInfo pNext: this memory will need a resource id
++   *
++   * Mirrors helios_export_memory_resource_info in Conduit's
++   * guest/windows/protocol/include/helios_icd_interface.h.
++   */
++  struct HeliosExportMemoryResourceInfo {
++    VkStructureType sType;
++    const void*     pNext;
++    uint32_t        flags;
++    uint32_t        reserved;
++  };
++
++  constexpr VkStructureType VK_STRUCTURE_TYPE_EXPORT_MEMORY_RESOURCE_INFO_HELIOS =
++    VkStructureType(1000384003);
++
++}
+diff --git a/src/dxvk/dxvk_image.cpp b/src/dxvk/dxvk_image.cpp
+index f656626c..7ce24a2e 100644
+--- a/src/dxvk/dxvk_image.cpp
++++ b/src/dxvk/dxvk_image.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "dxvk_buffer.h"
+ #include "dxvk_device.h"
++#include "dxvk_helios_backend.h"
+ 
+ #include <cstdlib>
+ 
+@@ -450,6 +451,41 @@ namespace dxvk {
+     const bool heliosKmtShared = heliosKmtOnlySharedResources();
+     bool useVulkanExternalMemory = m_shared && !heliosKmtShared;
+     bool useHeliosRendererExternalMemory = m_shared && heliosKmtShared;
++
++    // Helios on NVK: no Venus external memory. An exported image gets dedicated
++    // memory with the Helios export request (NVK mints the KMD resource id from
++    // it); an NVK device cannot import a resource made by another device.
++    const bool heliosNvk = m_shared && heliosBackendNvk();
++    if (heliosNvk) {
++      if (m_info.sharing.mode == DxvkSharedHandleMode::Import)
++        throw DxvkError("DxvkImage: NVK cannot import a shared resource");
++      useVulkanExternalMemory = false;
++      useHeliosRendererExternalMemory = false;
++    }
++
++    // Helios on Venus, importing a resource NVK made (an RM-exported dma-buf):
++    // only an explicit DRM-modifier image with the creator's layout reads it.
++    const bool heliosForeign = useHeliosRendererExternalMemory
++      && m_info.sharing.mode == DxvkSharedHandleMode::Import
++      && m_info.sharing.heliosForeign;
++    VkImageDrmFormatModifierExplicitCreateInfoEXT heliosForeignModifier = {
++      VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT };
++    VkSubresourceLayout heliosForeignPlane = { };
++    if (heliosForeign) {
++      if (!heliosForeignImport())
++        throw DxvkError("DxvkImage: foreign (NVK) resource import is disabled (ForeignImport knob)");
++      heliosForeignPlane.offset   = m_info.sharing.heliosForeignOffset;
++      heliosForeignPlane.rowPitch = m_info.sharing.heliosForeignStride;
++      heliosForeignModifier.drmFormatModifier = m_info.sharing.heliosForeignModifier;
++      heliosForeignModifier.drmFormatModifierPlaneCount = 1u;
++      heliosForeignModifier.pPlaneLayouts = &heliosForeignPlane;
++      heliosForeignModifier.pNext = std::exchange(imageInfo.pNext, &heliosForeignModifier);
++      imageInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++      Logger::info(str::format("DxvkImage: foreign import resid ", m_info.sharing.heliosResourceId,
++        " ", m_info.extent.width, "x", m_info.extent.height, " modifier 0x", std::hex,
++        m_info.sharing.heliosForeignModifier, std::dec, " pitch ",
++        m_info.sharing.heliosForeignStride, " offset ", m_info.sharing.heliosForeignOffset));
++    }
+     // Scan-out surfaces and exact WSI aliases use DMA_BUF, matching their
+     // resource-id imports; ordinary shared surfaces retain the
+     // renderer opaque-fd handle. Both externalInfo.handleTypes and
+@@ -457,7 +493,7 @@ namespace dxvk {
+     VkExternalMemoryHandleTypeFlagBits heliosRendererHandleType =
+       (m_info.heliosScanoutPrimary || m_info.heliosLinearScanoutTarget
+        || m_info.heliosDirectOptimalScanout || m_info.heliosCrossContextOptimal
+-       || m_heliosImportTemplate)
++       || m_heliosImportTemplate || heliosForeign)
+         ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+         : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+ 
+@@ -474,6 +510,7 @@ namespace dxvk {
+     // imports, because the executor always writes 4 bytes/texel at a
+     // round_up(width*4,256) byte stride.
+     const bool heliosImportCandidate = useHeliosRendererExternalMemory
++     && !heliosForeign
+      && !m_info.heliosDirectImportAlias
+      && !m_info.heliosLinearScanoutTarget
+      && !m_info.heliosCrossContextOptimal
+@@ -625,6 +662,7 @@ namespace dxvk {
+     // pixels). If still black, dwm samples a different surface. Device-local imports only
+     // (host-visible ones already took the working staging path above).
+     if (useHeliosRendererExternalMemory
++     && !heliosForeign
+      && m_info.sharing.mode == DxvkSharedHandleMode::Import
+      && m_info.sharing.heliosResourceId
+      && !m_heliosGdiStaged
+@@ -681,13 +719,21 @@ namespace dxvk {
+       }
+     }
+ 
++    HeliosExportMemoryResourceInfo heliosNvkExport = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_RESOURCE_INFO_HELIOS };
++    if (heliosNvk && m_info.sharing.mode == DxvkSharedHandleMode::Export)
++      heliosNvkExport.pNext = std::exchange(sharedMemoryInfo, &heliosNvkExport);
++
+     DxvkAllocationInfo allocationInfo = { };
+     allocationInfo.resourceCookie = cookie();
+     allocationInfo.properties = m_properties;
+     allocationInfo.mode = mode;
+-    allocationInfo.forceDedicated = m_shared && heliosKmtShared;
++    allocationInfo.forceDedicated = m_shared && (heliosKmtShared || heliosNvk);
+ 
+-    if (useHeliosRendererExternalMemory && m_info.sharing.mode == DxvkSharedHandleMode::Import) {
++    if (heliosForeign) {
++      // The foreign object is at least as large as the image (the KMD checked
++      // the layout against it): allocate what this image needs, of a type it
++      // accepts, and let the renderer import the dma-buf behind the resid.
++    } else if (useHeliosRendererExternalMemory && m_info.sharing.mode == DxvkSharedHandleMode::Import) {
+       // Import with the creator's exact venus allocation size and memory type
+       // (see DxvkSharedHandleInfo::heliosAllocSize).
+       allocationInfo.importSizeOverride = m_info.sharing.heliosAllocSize;
+diff --git a/src/dxvk/dxvk_memory.h b/src/dxvk/dxvk_memory.h
+index 47dadaf9..2e3bf9eb 100644
+--- a/src/dxvk/dxvk_memory.h
++++ b/src/dxvk/dxvk_memory.h
+@@ -64,6 +64,12 @@ namespace dxvk {
+     VkDeviceSize heliosAllocSize        = 0u;
+     uint32_t     heliosMemoryTypeIndex  = ~0u;
+     bool         heliosDedicatedPresentBuffer = false;
++    /// The resource was made by NVK on RM (KMD foreign resource): import it
++    /// as an explicit DRM-modifier image with this plane-0 layout.
++    bool         heliosForeign          = false;
++    uint64_t     heliosForeignModifier  = 0u;
++    uint32_t     heliosForeignStride    = 0u;
++    uint32_t     heliosForeignOffset    = 0u;
+   };
+ 
+ 

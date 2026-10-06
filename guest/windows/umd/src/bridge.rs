@@ -114,7 +114,37 @@ mod ffi {
             dedicated_present_buffer: bool,
             source_image_create_info: usize,
             source_external_ownership: bool,
+            foreign: bool,
+            foreign_modifier: u64,
+            foreign_stride: u32,
+            foreign_offset: u32,
         ) -> usize;
+
+        /// The ICD backend of this device: 1 = Venus, 2 = NVK on RM
+        /// (`helios_icd_interface.h`).
+        fn icd_backend(self: &HeliosDxvkDevice) -> u32;
+        /// NVK: the KMD resource id (IMPORT_RM) of a WDDM-backed texture's
+        /// dedicated memory, its holder context and recorded layout. False when
+        /// none can be made now.
+        /// # Safety
+        /// `d3d11_resource_ptr` is a live `ID3D11Resource*`; the outputs are
+        /// live writable storage.
+        unsafe fn get_resource_foreign_identity(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+            resource_id: *mut u32,
+            ctx_id: *mut u32,
+            size: *mut u64,
+            modifier: *mut u64,
+            stride: *mut u32,
+            offset: *mut u32,
+            fourcc: *mut u32,
+        ) -> bool;
+        /// NVK: show the texture on scanout 0 (KMD foreign scanout source).
+        /// 0 = shown. # Safety: a live `ID3D11Resource*`.
+        unsafe fn nvk_scanout_present(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize) -> i32;
+        /// NVK: give scanout 0 back to the desktop.
+        fn nvk_scanout_release(self: &HeliosDxvkDevice);
 
         /// Create a dedicated OPTIMAL, DMA_BUF-exportable image and report
         /// logical scanout metadata. `kmd_transfer_source` selects the
@@ -359,6 +389,7 @@ impl ffi::HeliosDxvkDevice {
         dedicated_present_buffer: bool,
         source_image_create_info: usize,
         source_external_ownership: bool,
+        foreign: Option<ForeignLayout>,
     ) -> Option<ID3D11Resource> {
         // SAFETY: the caller upholds the resource-id/handle preconditions
         // above, and the bridge transfers one reference on success.
@@ -380,8 +411,41 @@ impl ffi::HeliosDxvkDevice {
                 dedicated_present_buffer,
                 source_image_create_info,
                 source_external_ownership,
+                foreign.is_some(),
+                foreign.map_or(0, |f| f.modifier),
+                foreign.map_or(0, |f| f.stride),
+                foreign.map_or(0, |f| f.offset),
             ))
         }
+    }
+
+    /// The ICD under this device.
+    pub(crate) fn backend(&self) -> IcdBackend {
+        if self.icd_backend() == 2 {
+            IcdBackend::NvkRm
+        } else {
+            IcdBackend::Venus
+        }
+    }
+
+    /// NVK: the KMD resource id and layout of a WDDM-backed texture.
+    pub(crate) fn foreign_identity(&self, res: &ID3D11Resource) -> Option<ForeignIdentity> {
+        let mut id = ForeignIdentity::default();
+        // SAFETY: `res` is a live resource borrowed for the call; every output
+        // points at a field of the local `id`.
+        let ok = unsafe {
+            self.get_resource_foreign_identity(
+                res.as_raw() as usize,
+                &mut id.resource_id,
+                &mut id.ctx_id,
+                &mut id.size,
+                &mut id.layout.modifier,
+                &mut id.layout.stride,
+                &mut id.layout.offset,
+                &mut id.layout.fourcc,
+            )
+        };
+        (ok && id.resource_id != 0 && id.ctx_id != 0).then_some(id)
     }
 
     /// A dedicated OPTIMAL, DMA_BUF-exportable image, plus its logical
@@ -415,6 +479,32 @@ impl ffi::HeliosDxvkDevice {
         // SAFETY: the bridge transfers one reference on success.
         unsafe { adopt_resource(raw) }.map(|r| (r, row_pitch, offset))
     }
+}
+
+/// The Vulkan ICD a device runs on (`helios_icd_interface.h`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IcdBackend {
+    Venus,
+    NvkRm,
+}
+
+/// What lies in an NVK-made (foreign) resource: plane 0, as the KMD records it
+/// (`HeliosWddmAllocLayout`).
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct ForeignLayout {
+    pub(crate) modifier: u64,
+    pub(crate) stride: u32,
+    pub(crate) offset: u32,
+    pub(crate) fourcc: u32,
+}
+
+/// A foreign resource id minted for one texture.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct ForeignIdentity {
+    pub(crate) resource_id: u32,
+    pub(crate) ctx_id: u32,
+    pub(crate) size: u64,
+    pub(crate) layout: ForeignLayout,
 }
 
 // NOT wrapped, deliberately: the eight shader creates.
@@ -566,6 +656,7 @@ impl BridgeDevice {
         dedicated_present_buffer: bool,
         source_image_create_info: usize,
         source_external_ownership: bool,
+        foreign: Option<ForeignLayout>,
     ) -> Option<ID3D11Resource> {
         // SAFETY: the caller retains the resource and any source template
         // through the synchronous native import, which copies nested metadata.
@@ -587,7 +678,35 @@ impl BridgeDevice {
                 dedicated_present_buffer,
                 source_image_create_info,
                 source_external_ownership,
+                foreign,
             )
+        }
+    }
+
+    /// The ICD under this device (Venus when there is no bridge device).
+    pub(crate) fn backend(&self) -> IcdBackend {
+        self.get().map_or(IcdBackend::Venus, |d| d.backend())
+    }
+
+    pub(crate) fn is_nvk(&self) -> bool {
+        self.backend() == IcdBackend::NvkRm
+    }
+
+    /// NVK: the KMD resource id and layout of a WDDM-backed texture.
+    pub(crate) fn foreign_identity(&self, res: &ID3D11Resource) -> Option<ForeignIdentity> {
+        self.get()?.foreign_identity(res)
+    }
+
+    /// NVK: show `res` on scanout 0. True if shown.
+    pub(crate) fn nvk_scanout_present(&self, res: &ID3D11Resource) -> bool {
+        // SAFETY: `res` is a live resource borrowed for the call.
+        self.get()
+            .is_some_and(|d| unsafe { d.nvk_scanout_present(res.as_raw() as usize) } == 0)
+    }
+
+    pub(crate) fn nvk_scanout_release(&self) {
+        if let Some(d) = self.get() {
+            d.nvk_scanout_release();
         }
     }
 

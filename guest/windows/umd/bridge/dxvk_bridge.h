@@ -84,7 +84,38 @@ struct HeliosDxvkDevice {
       bool cross_context_optimal,
       bool dedicated_present_buffer,
       std::size_t source_image_create_info,
-      bool source_external_ownership) const;
+      bool source_external_ownership,
+      bool foreign,
+      std::uint64_t foreign_modifier,
+      std::uint32_t foreign_stride,
+      std::uint32_t foreign_offset) const;
+
+  // The ICD backend this device runs on (helios_icd_interface.h's
+  // HELIOS_ICD_BACKEND_*): 1 = Venus, 2 = NVK on RM.
+  std::uint32_t icd_backend() const;
+
+  // NVK: the KMD resource id of a WDDM-backed texture's dedicated memory
+  // (IMPORT_RM through the ICD's helios_icd_interface_v2), the holder context
+  // it is attached to, and the layout the KMD recorded with it. False when the
+  // ICD cannot make one now (the KMD's IMPORT_RM gate is closed, or the image
+  // is not a 32 bpp single-plane 2D image with its own memory); the caller then
+  // gives the allocation a KMD-backed placeholder.
+  bool get_resource_foreign_identity(
+      std::size_t d3d11_resource_ptr,
+      std::uint32_t* resource_id,
+      std::uint32_t* ctx_id,
+      std::uint64_t* size,
+      std::uint64_t* modifier,
+      std::uint32_t* stride,
+      std::uint32_t* offset,
+      std::uint32_t* fourcc) const noexcept;
+
+  // NVK: show the texture's image on scanout 0 through the KMD's foreign
+  // scanout source (zero copy). The caller has waited for the frame's GPU
+  // work. 0 = shown, negative = not (no scanout source, wrong image kind).
+  std::int32_t nvk_scanout_present(std::size_t d3d11_resource_ptr) const noexcept;
+  // NVK: give scanout 0 back to the desktop.
+  void nvk_scanout_release() const noexcept;
 
   // Create a dedicated OPTIMAL, DMA_BUF-exportable image (via the
   // D3D11_HELIOS_CREATE_INFO marker) and report logical scanout metadata for

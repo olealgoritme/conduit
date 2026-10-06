@@ -210,6 +210,9 @@ fn main() {
         // whichever module the loader enumerated first becomes the single
         // publisher for the process. `umd12/build.rs` lists the identical line.
         .file("../umd_common/bridge/bridge_icd_anchor.cpp")
+        // S3: ICD backend selection (global NVK with a deny-list) and the NVK
+        // ICD loader. `umd12` joins at S5.
+        .file("../umd_common/bridge/bridge_icd_backend.cpp")
         .compiler(&clang_cl)
         .archiver(&archiver)
         .static_crt(true)
@@ -224,6 +227,8 @@ fn main() {
         // same-named header in this crate must win, so a future D3D11-only
         // override is possible without editing `umd_common`.
         .include("../umd_common/bridge")
+        // helios_icd_interface.h: the backend-neutral ICD table.
+        .include("../protocol/include")
         .include(format!(r"{dxvk_src}\src"))
         .include(format!(r"{dxvk_src}\src\dxvk"))
         .include(format!(r"{dxvk_src}\src\d3d11"))
@@ -289,6 +294,9 @@ fn main() {
         "../umd_common/bridge/bridge_guard.h",
         "../umd_common/bridge/bridge_icd_anchor.cpp",
         "../umd_common/bridge/bridge_icd_anchor.h",
+        "../umd_common/bridge/bridge_icd_backend.cpp",
+        "../umd_common/bridge/bridge_icd_backend.h",
+        "../protocol/include/helios_icd_interface.h",
         "../umd_common/bridge/bridge_util.h",
         "bridge/bridge_dxbc.cpp",
         "bridge/bridge_dxbc.h",

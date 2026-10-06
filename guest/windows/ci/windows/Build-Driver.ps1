@@ -43,6 +43,31 @@ if ($env:RUST_TOOLCHAIN) { $env:RUSTUP_TOOLCHAIN = $env:RUST_TOOLCHAIN }
 $dxvkSource = Join-Path $RepoRoot "third_party\dxvk"
 $vkd3dSource = Join-Path $RepoRoot "third_party\vkd3d-proton"
 $compatHeader = Join-Path $RepoRoot "umd\build-support\dxvk_c_compat.h"
+
+# Conduit's changes to the engine forks live as patches in third_party\patches
+# (the fork repositories are not ours to push to). Each is applied once to the
+# source tree: `git apply --reverse --check` succeeding means it is already in
+# (a previous build, or a checkout that carries the change), so this is
+# idempotent for the incremental build VM as well as for a clean CI checkout.
+foreach ($engine in @(@{ name = "dxvk"; dir = $dxvkSource }, @{ name = "vkd3d-proton"; dir = $vkd3dSource })) {
+    $patchDir = Join-Path $RepoRoot "third_party\patches\$($engine.name)"
+    if (-not (Test-Path -LiteralPath $patchDir)) { continue }
+    foreach ($patch in (Get-ChildItem -LiteralPath $patchDir -Filter "*.patch" | Sort-Object Name)) {
+        Push-Location -LiteralPath $engine.dir
+        try {
+            & git apply --reverse --check $patch.FullName 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "$($engine.name): $($patch.Name) already applied"
+                continue
+            }
+            & git apply $patch.FullName
+            if ($LASTEXITCODE -ne 0) { throw "$($engine.name): $($patch.Name) does not apply" }
+            Write-Host "$($engine.name): applied $($patch.Name)"
+        } finally {
+            Pop-Location
+        }
+    }
+}
 New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
 $engineBuilds = @{}
 foreach ($architecture in @("x64", "x86")) {

@@ -199,6 +199,9 @@ pub(crate) unsafe fn allocate_wddm_resource(
     // direct OPTIMAL uses a logical scanout stride while QEMU validates the
     // opaque allocation with its exact Vulkan allocation size.
     scanout: Option<ScanoutGeometry>,
+    // An NVK-made backing (KMD foreign resource, dxvk-on-nvk S3): the KMD
+    // adopts `resource_id` with this layout. Exclusive with `backing`.
+    foreign: Option<crate::bridge::ForeignIdentity>,
 ) -> Result<(Option<ResidentAllocation>, ddi::D3DKMT_HANDLE), i32> {
     const DDI_BIND_PRESENT: u32 = 0x0000_0080;
 
@@ -219,8 +222,13 @@ pub(crate) unsafe fn allocate_wddm_resource(
         return Err(E_FAIL);
     };
 
-    let venus_ctx_id = dev.dxvk.venus_context_id();
-    if venus_ctx_id == 0 {
+    // NVK: the holder context the foreign resource was imported on (the KMD
+    // checks the allocation names it). Venus: this device's context.
+    let venus_ctx_id = match foreign {
+        Some(f) => f.ctx_id,
+        None => dev.dxvk.venus_context_id(),
+    };
+    if venus_ctx_id == 0 && !dev.dxvk.is_nvk() {
         log_error!("DDI allocate_wddm_resource: no Venus context id");
     }
 
@@ -233,17 +241,20 @@ pub(crate) unsafe fn allocate_wddm_resource(
     // A LINEAR scan-out primary reports its exact COLOR row pitch; use it verbatim so
     // `SET_SCANOUT_BLOB` reads rows at the true host stride instead of the
     // cross-adapter guess (a wrong stride shears the scanned-out image).
-    let pitch = match scanout {
-        Some(g) => g.pitch.get(),
-        None => pitch,
+    let pitch = match (foreign, scanout) {
+        // The KMD requires the meta to repeat the recorded layout.
+        (Some(f), _) => f.layout.stride,
+        (None, Some(g)) => g.pitch.get(),
+        (None, None) => pitch,
     };
     let linear_size = (pitch as u64)
         .saturating_mul(mip0.TexelHeight.max(1) as u64)
         .max(4096);
     // A live backing with a zero blob_size still falls back to the linear size:
     // blob_id is the only field that gates a mode.
-    let size = match backing {
-        Some(b) if b.blob_size != 0 => b.blob_size,
+    let size = match (foreign, backing) {
+        (Some(f), _) => f.size,
+        (None, Some(b)) if b.blob_size != 0 => b.blob_size,
         _ => linear_size,
     };
 
@@ -261,6 +272,7 @@ pub(crate) unsafe fn allocate_wddm_resource(
     };
 
     let mut private = RuntimeAllocPrivate {
+        layout: helios_protocol::HeliosWddmAllocLayout::zeroed(),
         alloc: HeliosWddmAllocPrivate::new(
             if backing.is_some() {
                 HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
@@ -322,6 +334,34 @@ pub(crate) unsafe fn allocate_wddm_resource(
             plane_offset: scanout.map_or(0, |g| g.plane_offset),
         },
     };
+    if let Some(f) = foreign {
+        // zero-copy-present.md 10.2: DEVICE_MEMORY adopting the foreign resid,
+        // blob_mem declaring the vendor RM-export type, no blob id, no cache
+        // policy, the meta repeating the recorded geometry, the creator's
+        // layout trailer (the KMD checks it and writes the record back).
+        private.alloc = HeliosWddmAllocPrivate::new(
+            HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+            f.ctx_id,
+            0,
+            f.size,
+            helios_protocol::HELIOS_BLOB_MEM_RM_EXPORT,
+            0,
+            0,
+            f.resource_id,
+        );
+        private.meta.venus_alloc_size = 0;
+        private.meta.memory_type_index = 0;
+        private.meta.plane_offset = u64::from(f.layout.offset);
+        private.layout = helios_protocol::HeliosWddmAllocLayout {
+            modifier: f.layout.modifier,
+            magic: helios_protocol::HELIOS_WDDM_LAYOUT_MAGIC,
+            version: helios_protocol::HELIOS_WDDM_LAYOUT_VERSION,
+            fourcc: f.layout.fourcc,
+            stride: f.layout.stride,
+            plane_offset: f.layout.offset,
+            reserved: 0,
+        };
+    }
     let pre_private_alloc = private.alloc;
     let pre_private_meta = private.meta;
 
@@ -347,7 +387,12 @@ pub(crate) unsafe fn allocate_wddm_resource(
 
     let mut allocation_info = ddi::D3DDDI_ALLOCATIONINFO2::default();
     let private_ptr = (&mut private as *mut RuntimeAllocPrivate).cast();
-    let private_size = core::mem::size_of::<RuntimeAllocPrivate>() as u32;
+    // 128 bytes (with the layout trailer) only for a foreign adoption.
+    let private_size = if foreign.is_some() {
+        helios_protocol::HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES as u32
+    } else {
+        core::mem::offset_of!(RuntimeAllocPrivate, layout) as u32
+    };
     allocation_info.pPrivateDriverData = private_ptr;
     allocation_info.PrivateDriverDataSize = private_size;
     let is_present = (a.BindFlags & DDI_BIND_PRESENT) != 0;
@@ -484,6 +529,10 @@ pub(crate) unsafe fn finish_wddm_tex2d(
     direct_scanout_primary: bool,
     scanout: Option<ScanoutGeometry>,
 ) {
+    if helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk()) {
+        unsafe { finish_wddm_tex2d_nvk(h, a, mip0, h_rt, h_resource, res) };
+        return;
+    }
     let (memory, memory_size, memory_offset, resource_id) = dxvk_resource_memory_info(h, &res);
     let needs_importable = needs_wddm_texture_allocation(a);
     let (backing_blob_id, backing_blob_size, backing_resource_id) = if memory != 0
@@ -558,7 +607,7 @@ pub(crate) unsafe fn finish_wddm_tex2d(
         return;
     }
     let (allocation, km_resource) =
-        match allocate_wddm_resource(h, a, mip0, h_rt, backing, direct_scanout_primary, scanout) {
+        match allocate_wddm_resource(h, a, mip0, h_rt, backing, direct_scanout_primary, scanout, None) {
             Ok(allocation) => allocation,
             Err(hr) => {
                 log_error!(
@@ -655,6 +704,79 @@ pub(crate) unsafe fn finish_wddm_tex2d(
     if present_private.is_valid() {
         unsafe { remember_direct_scanout_allocation(h, allocation_handle, present_private) };
     }
+}
+
+/// `finish_wddm_tex2d` on NVK (dxvk-on-nvk S3). A WDDM-backed texture's
+/// allocation adopts the KMD resource id NVK minted for its dedicated memory
+/// (IMPORT_RM), so DWM can open and compose it; when the KMD cannot mint one
+/// (gate closed, an image kind the importers cannot take) the allocation is a
+/// KMD-backed placeholder and the texture can only reach the screen through
+/// the NVK scanout present. No producer binding, no snapshot identity, no
+/// direct-scanout private data: those name Venus timelines and resources.
+pub(crate) unsafe fn finish_wddm_tex2d_nvk(
+    h: Hdevice,
+    a: &ddi::D3D11DDIARG_CREATERESOURCE,
+    mip0: &ddi::D3D10DDI_MIPINFO,
+    h_rt: ddi::D3D10DDI_HRTRESOURCE,
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    res: ID3D11Resource,
+) {
+    let Some(dev) = helios_device(h) else {
+        set_runtime_error(h, E_FAIL);
+        return;
+    };
+    let foreign = if needs_wddm_texture_allocation(a) && !crate::knobs::nvk_placeholder_allocations() {
+        dev.dxvk.foreign_identity(&res)
+    } else {
+        None
+    };
+    const DDI_BIND_PRESENT: u32 = 0x0000_0080;
+    if (a.BindFlags & DDI_BIND_PRESENT) != 0 || !a.pPrimaryDesc.is_null() {
+        super::present::note_nvk_present_buffer(foreign.is_some());
+    }
+    if needs_wddm_texture_allocation(a) && foreign.is_none() {
+        trace_line!(
+            "DDI create_resource(tex2d) NVK: no resource id, KMD placeholder {}x{} fmt={} bind=0x{:x} misc=0x{:x}",
+            mip0.TexelWidth, mip0.TexelHeight, a.Format, a.BindFlags, a.MiscFlags
+        );
+    }
+    let (allocation, km_resource) =
+        match allocate_wddm_resource(h, a, mip0, h_rt, None, false, None, foreign) {
+            Ok(allocation) => allocation,
+            Err(hr) => {
+                log_error!(
+                    "DDI create_resource(tex2d) NVK: WDDM allocation/residency failed hr=0x{:08x} foreign_res_id={}",
+                    hr as u32,
+                    foreign.map_or(0, |f| f.resource_id)
+                );
+                set_runtime_error(h, hr);
+                return;
+            }
+        };
+    let allocation_handle = allocation
+        .as_ref()
+        .map(ResidentAllocation::handle)
+        .unwrap_or(0);
+    if allocation_handle != 0 && foreign.is_some() {
+        // SAFETY: `res` is the live resource this DDI just created.
+        if !unsafe { dev.dxvk.transfer_resource_ownership(res.as_raw() as usize) } {
+            log_error!(
+                "DDI create_resource(tex2d) NVK: ownership transfer failed res_id={}",
+                foreign.map_or(0, |f| f.resource_id)
+            );
+        }
+    }
+    stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
+    store_resource(
+        h_resource,
+        res,
+        allocation,
+        km_resource,
+        h_rt.handle,
+        AllocationOwnership::CreatedByUmd,
+        empty_present_private(),
+        None,
+    );
 }
 
 pub(crate) unsafe extern "system" fn create_resource(
@@ -820,7 +942,7 @@ pub(crate) unsafe extern "system" fn create_resource(
                 StructureByteStride: a.ByteStride,
             };
             let (allocation, km_resource) =
-                match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
+                match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None, None) {
                     Ok(allocation) => allocation,
                     Err(hr) => {
                         log_error!(
@@ -952,7 +1074,11 @@ pub(crate) unsafe extern "system" fn create_resource(
             // Windows' pPrimaryDesc is the authoritative, non-heuristic marker
             // for a scan-out primary. The supported 32-bit Windows primary
             // formats become dedicated OPTIMAL DMA_BUF exports.
-            let is_scanout = !a.pPrimaryDesc.is_null() && matches!(a.Format as u32, 28 | 87 | 88);
+            // NVK has no direct-scanout primary path: a primary is an ordinary
+            // WDDM-backed texture there (finish_wddm_tex2d_nvk).
+            let is_scanout = !a.pPrimaryDesc.is_null()
+                && matches!(a.Format as u32, 28 | 87 | 88)
+                && !helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk());
             let mut handled = false;
             if is_scanout {
                 // The QEMU fork reconstructs this exact same-driver OPTIMAL
@@ -1160,7 +1286,7 @@ pub(crate) unsafe extern "system" fn create_resource(
             };
             finish_create(h, created, res, |res| {
                 let (allocation, km_resource) = match allocate_wddm_resource(
-                    h, a, &mip0, h_rt, None, false, None,
+                    h, a, &mip0, h_rt, None, false, None, None,
                 ) {
                     Ok(allocation) => allocation,
                     Err(hr) => {
@@ -1252,7 +1378,7 @@ pub(crate) unsafe extern "system" fn create_resource(
                 // the last statement of create_resource, so that is the same
                 // exit it was before.
                 let (allocation, km_resource) = match allocate_wddm_resource(
-                    h, a, &mip0, h_rt, None, false, None,
+                    h, a, &mip0, h_rt, None, false, None, None,
                 ) {
                     Ok(allocation) => allocation,
                     Err(hr) => {
@@ -1327,6 +1453,10 @@ pub(crate) unsafe extern "system" fn open_resource(
         unsafe { read_open_identity(a.pPrivateDriverData, a.PrivateDriverDataSize) },
         Some((_, None))
     );
+    // An NVK-made (foreign) resource carries the KMD's layout trailer: the
+    // opener must import it as an explicit DRM-modifier image (dxvk-on-nvk S3).
+    let mut foreign_layout =
+        unsafe { read_open_layout(a.pPrivateDriverData, a.PrivateDriverDataSize) };
     if a.NumAllocations != 0 && info2.is_null() {
         log_error!("DDI open_resource FAILED: allocation array is null");
         set_runtime_error(h, E_INVALIDARG);
@@ -1339,6 +1469,10 @@ pub(crate) unsafe extern "system" fn open_resource(
         }
         let allocation_identity =
             unsafe { read_open_identity(info.pPrivateDriverData, info.PrivateDriverDataSize) };
+        if foreign_layout.is_none() {
+            foreign_layout =
+                unsafe { read_open_layout(info.pPrivateDriverData, info.PrivateDriverDataSize) };
+        }
         // Only a candidate that carries the meta TRAILER can be selected — the
         // type says so now. The KMD stamps the identity into both the
         // per-allocation and the resource-level private buffer
@@ -1508,6 +1642,7 @@ pub(crate) unsafe extern "system" fn open_resource(
         dedicated_present_buffer,
         0, // Ordinary WDDM open, not a vehicle v3 source-template borrow.
         false,
+        foreign_layout,
     );
     if opened.is_none() {
         // Import of a KMD-validated-live resource failed: a real bug, not a

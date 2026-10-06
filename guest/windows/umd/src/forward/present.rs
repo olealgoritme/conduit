@@ -1270,6 +1270,150 @@ pub(crate) unsafe fn finish_present(
 
 /// DXGI `pfnPresent`: copy the source resource to the destination resource when
 /// DXGI provides both handles, then flush submitted GPU work.
+// --- NVK on RM (dxvk-on-nvk S3) ----------------------------------------------
+
+/// Whether this process's present buffers got KMD resource ids (so DWM can
+/// compose them): 0 = no present buffer yet, 1 = every one did, 2 = at least
+/// one is a KMD placeholder. Written by `finish_wddm_tex2d_nvk`.
+pub(crate) static NVK_PRESENT_BUFFERS: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn note_nvk_present_buffer(has_resource_id: bool) {
+    use core::sync::atomic::Ordering as O;
+    if has_resource_id {
+        let _ = NVK_PRESENT_BUFFERS.compare_exchange(0, 1, O::Relaxed, O::Relaxed);
+    } else {
+        NVK_PRESENT_BUFFERS.store(2, O::Relaxed);
+    }
+}
+
+/// Upper bound of the CPU wait for a frame's NVK work before it is presented.
+const NVK_PRESENT_WAIT_US: u32 = 2_000_000;
+
+static NVK_SCANOUT_PRESENTS: AtomicUsize = AtomicUsize::new(0);
+static NVK_SCANOUT_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static NVK_COMPOSE_PRESENTS: AtomicUsize = AtomicUsize::new(0);
+static NVK_WAIT_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Does DWM import NVK-made surfaces? The same `ForeignImport` knob the Venus
+/// side of this driver reads (DWM's DXVK enables explicit DRM-modifier imports).
+fn nvk_dwm_composes() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        helios_umd_common::knobs::reg_dword(c"ForeignImport").is_some_and(|v| v != 0)
+    })
+}
+
+/// The NVK half of a present, after the frame (and any Blt copy) is recorded.
+///
+/// v1 sync (dxvk-on-nvk.md 3.5 level 1, decision D5): the KMD knows no NVK
+/// timeline, so the UMD waits on the CPU for the frame's GPU work and the
+/// present carries no stream marker (the KMD then has nothing to wait for).
+/// This is the NVK-only replacement for the Venus producer streams, not the
+/// retired `PresentOrder` gate: there is no Venus point an NVK frame could be
+/// ordered against. The RM-fence boundary (S4) removes it.
+///
+/// Then either the frame goes to scanout 0 through the KMD's foreign scanout
+/// source (zero copy; the desktop is hidden while it presents), or it is left
+/// to the WDDM present that follows, which DWM composes from the resource id.
+unsafe fn nvk_present_frame(h: Hdevice, shown: ddi::D3D10DDI_HRESOURCE) -> Result<(), i32> {
+    let Some(dev) = helios_device(h) else {
+        return Err(E_FAIL);
+    };
+    if let Some(context) = d3d11_context(h) {
+        context.Flush();
+    }
+    match dev.dxvk.present_frame_gate(NVK_PRESENT_WAIT_US, PRESENT_ORDER_COMPLETE) {
+        0 => {}
+        1 => {
+            let n = NVK_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 16 || n % 512 == 0 {
+                log_error!("NVK present: frame wait timed out (x{n}), presenting anyway");
+            }
+        }
+        hr => {
+            log_error!("NVK present refused: frame wait failed hr=0x{:08x}", hr as u32);
+            return Err(E_FAIL);
+        }
+    }
+    let scanout = match crate::knobs::nvk_present_mode() {
+        1 => true,
+        2 => false,
+        _ => !(nvk_dwm_composes() && NVK_PRESENT_BUFFERS.load(Ordering::Relaxed) == 1),
+    };
+    if scanout {
+        if let Some(src) = load_resource(shown) {
+            if dev.dxvk.nvk_scanout_present(&src) {
+                let n = NVK_SCANOUT_PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n % 1024 == 0 {
+                    log_error!("NVK present: {n} frames on scanout 0 (failures {})",
+                        NVK_SCANOUT_FAILURES.load(Ordering::Relaxed));
+                }
+            } else {
+                NVK_SCANOUT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    } else {
+        let n = NVK_COMPOSE_PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 1024 == 0 {
+            log_error!("NVK present: {n} frames composed by DWM from foreign resource ids");
+        }
+    }
+    Ok(())
+}
+
+/// `dxgi_present_impl` on NVK: no vehicle, no direct-primary or snapshot path,
+/// no producer publication (all Venus); Blt copy if DXGI asked for one, the
+/// NVK frame (`nvk_present_frame`), then the ordinary WDDM present callbacks so
+/// DXGI's flip queue, statistics and DWM work as before.
+unsafe fn nvk_present_impl(
+    a: &ddi::DXGI_DDI_ARG_PRESENT,
+    boundary: PresentBoundaryEntry,
+    h: Hdevice,
+    src_h: ddi::D3D10DDI_HRESOURCE,
+    dst_h: ddi::D3D10DDI_HRESOURCE,
+    src_alloc: u32,
+    dst_alloc: u32,
+) -> i32 {
+    let mut shown = src_h;
+    if let Some(context) = d3d11_context(h) {
+        if let (Some(dst), Some(src)) = (load_resource(dst_h), load_resource(src_h)) {
+            context.CopySubresourceRegion(
+                &*dst,
+                a.DstSubResourceIndex,
+                0,
+                0,
+                0,
+                &*src,
+                a.SrcSubResourceIndex,
+                None,
+            );
+            shown = dst_h;
+        }
+    }
+    if let Err(hr) = nvk_present_frame(h, shown) {
+        return hr;
+    }
+    match finish_present(
+        h,
+        src_h,
+        dst_h,
+        src_alloc,
+        dst_alloc,
+        PresentRequest {
+            kind: PresentKind::Present,
+            boundary,
+            dxgi_context: a.pDXGIContext,
+            flags: *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
+        },
+        None,
+        PresentStreamCorrelation::default(),
+    ) {
+        Ok(hr) => hr,
+        Err(hr) => hr,
+    }
+}
+
 pub(crate) unsafe extern "system" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     probe_entry_attempt(PresentBoundaryEntry::Present);
     dxgi_present_impl(arg, PresentBoundaryEntry::Present)
@@ -1299,6 +1443,10 @@ unsafe fn dxgi_present_impl(
     let dst_h = dxgi_resource_handle(a.hDstResource);
     let src_alloc = resource_allocation(src_h);
     let dst_alloc = resource_allocation(dst_h);
+    if helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk()) {
+        probe_present_entry(boundary, a, src_alloc, dst_alloc);
+        return nvk_present_impl(a, boundary, h, src_h, dst_h, src_alloc, dst_alloc);
+    }
     // SAFETY: src_h is the runtime's live source for this Present.
     let snapshot_required = unsafe { requires_present_snapshot(src_h) };
     if snapshot_required && a.SrcSubResourceIndex != 0 {
@@ -2599,13 +2747,19 @@ pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_P
         return E_INVALIDARG;
     }
 
-    if let Some(context) = d3d11_context(h) {
-        context.Flush();
-    }
-
-    if let Some(dev) = helios_device(h) {
-        if let Err(hr) = run_present_frame_gate(dev, 0, false) {
+    if helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk()) {
+        if let Err(hr) = nvk_present_frame(h, src_h) {
             return hr;
+        }
+    } else {
+        if let Some(context) = d3d11_context(h) {
+            context.Flush();
+        }
+
+        if let Some(dev) = helios_device(h) {
+            if let Err(hr) = run_present_frame_gate(dev, 0, false) {
+                return hr;
+            }
         }
     }
 

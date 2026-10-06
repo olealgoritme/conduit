@@ -293,6 +293,7 @@ pub(crate) unsafe fn vehicle_present_prepare(
             false,
             info.source_image_create_info,
             info.source_external_ownership,
+            None,
         );
         let Some(imported) = opened else {
             let n = EXT_IMPORT_FAILS.fetch_add(1, Ordering::Relaxed);
