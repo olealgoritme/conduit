@@ -2535,7 +2535,9 @@ pub(crate) fn process_deferred_vidpn_source_address(
     // says it is held.
     crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::DEFERRED_POST);
     if let Some(status) = status {
-        crate::diag::record_named_bytes(b"VpDSt", status as u32);
+        // Changed-only: this is one registry transaction per programmed flip on the worker, between
+        // two flips (`HpdMx18`); the status is almost always the same.
+        crate::diag::record_named_changed(b"VpDSt", status as u32);
     }
 }
 

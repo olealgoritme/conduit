@@ -698,6 +698,21 @@ impl AdapterContext {
     /// those stay loud and in place at their own sites. (`RbFail` was here
     /// until T6/R902 deleted the async bind arm that produced it.)
     fn pacing_snapshot(&self) {
+        if !crate::diag::sample_tick(&SCANOUT_PACING_TICKS) {
+            return;
+        }
+        // About forty registry writes: never on the worker between two flips (15.18.16). The
+        // mirror thread takes them (`pacing_publish`); inline only without the thread.
+        if crate::ddi::mirror_thread::running() {
+            crate::ddi::mirror_thread::request_bits(crate::ddi::mirror_thread::PACING);
+            return;
+        }
+        self.pacing_publish();
+    }
+
+    /// The pacing snapshot's registry writes (PASSIVE): the mirror thread's, or the worker's when
+    /// there is no thread.
+    pub(crate) fn pacing_publish(&self) {
         use core::sync::atomic::Ordering;
 
         let n = self.scanout_refresh_count.load(Ordering::Relaxed);
@@ -705,9 +720,6 @@ impl AdapterContext {
         let wh = self.active_scanout_wh.load(Ordering::Relaxed);
         let width = (wh >> 32) as u32;
         let height = wh as u32;
-        if !crate::diag::sample_tick(&SCANOUT_PACING_TICKS) {
-            return;
-        }
 
         // The stall-diagnosis block rides the same periodic mirror (`ddi::stall_diag`).
         crate::ddi::stall_diag::request_publish();
