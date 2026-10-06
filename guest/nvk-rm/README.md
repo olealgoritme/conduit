@@ -503,7 +503,8 @@ driver have. On the RTX 5090 in `win11`:
 
 - Why it was 0: the first cut set `bar_size_B = 0` on purpose. CPU maps of
   VRAM go through BAR1 and, under Conduit, through the host-visible window
-  every CPU mapping in the guest shares (1 GiB, `NvWinMb`), and each map
+  every CPU mapping in the guest shares (then 1 GiB, now the host GPU's
+  BAR1; `NvWinMb`), and each map
   cost a host round trip (5.7 ms before KMD 309, 0.4 ms now).
 - What it uses now: `bar_size_B = min(NVK_RM_BAR_MB (default 256, 0 = off),
   BAR1 / 2)`, BAR1 from `NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE`. NVK's other

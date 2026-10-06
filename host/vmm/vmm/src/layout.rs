@@ -27,8 +27,13 @@ pub const MMIO_HOLE_END: u64 = 0x1_0000_0000;
 pub const PCI_MMIO_START: u64 = 0xC000_0000;
 pub const PCI_MMIO_END: u64 = 0xE000_0000;
 
-/// Largest 64-bit MMIO window we will hand out, if the address space allows.
-const PCI_MMIO64_MAX_SIZE: u64 = 0x10_0000_0000; // 64 GiB
+/// Largest 64-bit MMIO window we will hand out, if the address space allows:
+/// 8 TiB, what OVMF gives a QEMU guest at 46 bits and up. It holds the GPU
+/// window's BAR (`gpu-forward.window-mib`, the host GPU's BAR1 by default:
+/// 32 GiB on an RTX 5090, 128 GiB on an RTX PRO 6000, up to 2 TiB) next to
+/// the 32 GiB UVM aperture; the old 64 GiB left a 32 GiB window no room.
+/// Address space only: nothing is reserved for it.
+const PCI_MMIO64_MAX_SIZE: u64 = 8 << 40;
 
 /// Where 64-bit prefetchable BARs live: at the very top of what the CPU can
 /// address. A GPU's host-visible memory does not fit in the 512 MiB below
@@ -169,6 +174,25 @@ mod tests {
             assert!(w.end() <= 1u64 << bits, "{bits}-bit window overflows");
             assert!(w.start >= MMIO_HOLE_END, "{bits}-bit window is below 4 GiB");
         }
+    }
+
+    /// The GPU's window BAR (the backend's largest `auto` for the address
+    /// space) and the 32 GiB aperture fit, each aligned to its size.
+    #[test]
+    fn the_gpu_window_and_aperture_fit() {
+        for (bits, window) in [
+            (39u8, 4u64 << 30),
+            (41, 64 << 30),
+            (43, 256 << 30),
+            (48, 2 << 40),
+        ] {
+            let w = mmio64_window(bits);
+            let window_at = w.start.next_multiple_of(window);
+            let aperture_at = (window_at + window).next_multiple_of(32 << 30);
+            assert!(aperture_at + (32 << 30) <= w.end(), "{bits} bits");
+        }
+        assert_eq!(mmio64_window(48).size, 8 << 40);
+        assert_eq!(mmio64_window(39).size, 128 << 30);
     }
 
     #[test]

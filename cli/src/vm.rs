@@ -175,25 +175,18 @@ pub fn now() -> String {
         .unwrap_or_default()
 }
 
-/// The built-in VM runner's (conduit-vmm) JSON config.
-pub fn vmm_config(c: &VmConfig, kernel: &Path, gpu_sock: &Path, share: &Path) -> serde_json::Value {
-    vmm_config_with(c, kernel, gpu_sock, share, crate::config::window_mib())
-}
-
-/// [`vmm_config`] with the window's size, which must be the backend's
-/// `--window-mib` (run.rs passes both); `None` leaves both at their default.
-fn vmm_config_with(
+/// The built-in VM runner's (conduit-vmm) JSON config. `window_mib` must be
+/// the backend's `--window-mib`: run.rs decides it once (`run::window_mib`)
+/// and passes both.
+pub fn vmm_config(
     c: &VmConfig,
     kernel: &Path,
     gpu_sock: &Path,
     share: &Path,
-    window_mib: Option<u64>,
+    window_mib: u64,
 ) -> serde_json::Value {
     let n = c.net();
-    let mut gpu_forward = json!({ "socket": gpu_sock });
-    if let Some(mib) = window_mib {
-        gpu_forward["window-mib"] = json!(mib);
-    }
+    let gpu_forward = json!({ "socket": gpu_sock, "window-mib": window_mib });
     let mut args = String::from("console=hvc0 root=/dev/vda rw");
     if !c.kernel_args.trim().is_empty() {
         args.push(' ');
@@ -275,12 +268,12 @@ mod tests {
         let mut c = VmConfig::new("t", 8192, 6, 3, "me", "gnome");
         c.disk = PathBuf::from("/vms/t/disk.img");
         c.kernel_args = "quiet".into();
-        let v = vmm_config_with(
+        let v = vmm_config(
             &c,
             Path::new("/k/vmlinux"),
             Path::new("/run/gpu.sock"),
             Path::new("/share"),
-            None,
+            4096,
         );
         assert_eq!(v["boot-source"]["kernel_image_path"], "/k/vmlinux");
         assert_eq!(
@@ -300,16 +293,14 @@ mod tests {
         assert_eq!(v["network"]["netmask"], "255.255.255.0");
     }
 
-    /// The window's size reaches conduit-vmm only when it is set, and then as
-    /// the number the backend is given.
+    /// conduit-vmm always gets the number the backend is given, so its own
+    /// `auto` never has to agree with the backend's by itself.
     #[test]
-    fn vmm_config_carries_the_window_size_when_set() {
+    fn vmm_config_carries_the_window_size() {
         let c = VmConfig::new("t", 8192, 6, 3, "me", "gnome");
         let (k, g, s) = (Path::new("/k"), Path::new("/g"), Path::new("/s"));
-        let v = vmm_config_with(&c, k, g, s, None);
-        assert!(v["gpu-forward"].get("window-mib").is_none());
-        let v = vmm_config_with(&c, k, g, s, Some(8192));
-        assert_eq!(v["gpu-forward"]["window-mib"], 8192);
+        let v = vmm_config(&c, k, g, s, 32768);
+        assert_eq!(v["gpu-forward"]["window-mib"], 32768);
         assert_eq!(v["gpu-forward"]["socket"], "/g");
     }
 

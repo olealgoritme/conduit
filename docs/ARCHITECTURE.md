@@ -145,8 +145,32 @@ supported: the GPU state lives in the host driver. Details:
 - NVIDIA only. Linux guests; Windows guests (Venus) are experimental
   ([WINDOWS.md](WINDOWS.md), [ROADMAP.md](ROADMAP.md)).
 - Not hardware isolation; the host NVIDIA driver is trusted.
-- The shared-memory window (`--window-mib`, 4 GiB by default) is sized when the
-  VM starts and cannot grow.
+- The shared-memory window (`--window-mib`) is sized when the VM starts and
+  cannot grow. By default (`auto`) it is the host GPU's BAR1, as Resizable
+  BAR gives a bare-metal driver: 32 GiB on an RTX 5090, 128 GiB on an RTX PRO
+  6000; 4 GiB when the backend finds no NVIDIA GPU in sysfs. What bounds it:
+  - **The guest's 64-bit MMIO window.** Under QEMU the window, the 32 GiB UVM
+    aperture and the Venus region share one BAR rounded up to a power of two
+    (a 32 GiB window makes it 128 GiB with Venus, a 128 GiB window 256 GiB).
+    OVMF takes the top eighth of `min(physical address bits, 46)` for 64-bit
+    BARs (8 TiB at 46 bits and up; `win11` on a 48-bit host:
+    0x3800_0000_0000..0x4000_0000_0000), and `auto` lets the BAR take at most
+    half of it, leaving the rest for other BARs and the root ports'
+    prefetchable reserves. So the window is at most 2 TiB at 46 bits and up,
+    256 GiB at 43, 64 GiB at 41, and stays at 4 GiB at 39 (whose 64 GiB BAR
+    already needs the guest to see the host's address width:
+    [VENUS.md](VENUS.md) "Windows/OVMF guests"). conduit-vmm's 64-bit window
+    is at least as large (`layout::mmio64_window`, up to 8 TiB).
+  - **A KVM memory slot.** QEMU makes the window one slot (patch 0008), and
+    KVM refuses a slot of 2^31 pages or more, so no window is above 4 TiB
+    (`--window-mib` refuses it).
+  - **Cost.** Address space only: the backend's memfd is sparse, QEMU
+    reserves the range `MAP_NORESERVE` and conduit-vmm `PROT_NONE`, and the
+    allocator is a free list. The one cost that grows with it: when KVM needs
+    its shadow MMU (a guest running Hyper-V: Windows VBS/HVCI, WSL2) it gives
+    each slot a reverse map of 2 MiB of host kernel memory per GiB (64 MiB for
+    a 32 GiB window, 256 MiB for 128 GiB). With the TDP MMU alone there is
+    none.
 - No HMM / pageable memory access, MIG or SR-IOV.
 - `--vram-limit-mib` does not count memory RM allocates internally.
 
