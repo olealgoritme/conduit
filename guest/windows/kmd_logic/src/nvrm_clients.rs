@@ -149,37 +149,45 @@ pub enum Commit {
 
 /// Per-owner RM clients. Fixed capacity; a few words per entry, scanned linearly (a
 /// session holds one or two entries per process).
+///
+/// A slot with `client == 0` and a nonzero owner is a RESERVATION: a promise to a client
+/// allocation in flight. It counts against the table AND the owner's quota (so two
+/// concurrent allocations of an owner at one below its quota cannot both reserve), is
+/// never owned by anyone, and is turned into the client by [`commit`](Self::commit) or
+/// given back by [`cancel`](Self::cancel).
+///
+/// The all-zero byte pattern is a valid empty table (the kernel builds it with
+/// `alloc_zeroed`, without a 4 KiB temporary; a test pins it).
 pub struct ClientTable {
     slots: [Slot; MAX_CLIENTS],
-    len: usize,
-    /// Slots promised to in-flight client allocations.
-    reserved: usize,
+    /// Slots in use, reservations included: `slots[..used]` is live.
+    used: usize,
 }
 
 impl ClientTable {
     pub const fn new() -> Self {
         Self {
             slots: [EMPTY; MAX_CLIENTS],
-            len: 0,
-            reserved: 0,
+            used: 0,
         }
     }
 
-    /// Entries recorded.
+    fn live(&self) -> &[Slot] {
+        &self.slots[..self.used]
+    }
+
+    /// Clients recorded (reservations are not clients).
     pub fn len(&self) -> usize {
-        self.len
+        self.live().iter().filter(|s| s.client != 0).count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
-    /// Entries `owner` holds.
+    /// Slots `owner` holds: clients and reservations.
     pub fn count_for(&self, owner: usize) -> usize {
-        self.slots[..self.len]
-            .iter()
-            .filter(|s| s.owner == owner)
-            .count()
+        self.live().iter().filter(|s| s.owner == owner).count()
     }
 
     /// Whether `owner` was given `client` by RM and has not lost it. `owner == 0` and
@@ -187,43 +195,63 @@ impl ClientTable {
     pub fn is_client_owned_by(&self, owner: usize, client: u32) -> bool {
         owner != 0
             && client != 0
-            && self.slots[..self.len]
+            && self
+                .live()
                 .iter()
                 .any(|s| s.owner == owner && s.client == client)
     }
 
     /// Promise a slot to a client allocation about to be forwarded, so a full table
-    /// refuses BEFORE the host makes a client nobody tracks. `false`: no room.
+    /// refuses BEFORE the host makes a client nobody tracks. `false`: no room (table or
+    /// the owner's quota, reservations in flight counted).
     pub fn reserve(&mut self, owner: usize) -> bool {
-        if owner == 0
-            || self.len + self.reserved >= MAX_CLIENTS
-            || self.count_for(owner) >= MAX_CLIENTS_PER_OWNER
+        if owner == 0 || self.used >= MAX_CLIENTS || self.count_for(owner) >= MAX_CLIENTS_PER_OWNER
         {
             return false;
         }
-        self.reserved += 1;
+        self.slots[self.used] = Slot {
+            owner,
+            client: 0,
+            via: 0,
+        };
+        self.used += 1;
         true
     }
 
-    /// Give a promised slot back (the allocation failed or never left).
-    pub fn cancel(&mut self) {
-        self.reserved = self.reserved.saturating_sub(1);
+    /// Remove one reservation of `owner`. `false` if it had none.
+    fn take_reservation(&mut self, owner: usize) -> bool {
+        match self
+            .live()
+            .iter()
+            .position(|s| s.owner == owner && s.client == 0)
+        {
+            Some(i) => {
+                self.remove_at(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Give `owner`'s promised slot back (the allocation failed or never left).
+    pub fn cancel(&mut self, owner: usize) {
+        self.take_reservation(owner);
     }
 
     /// Record `client` for `owner` after RM made it (`via` = the file it was made
-    /// through). `reserved`: the caller holds a [`reserve`](Self::reserve) promise,
-    /// which this consumes (success or not); without one (log-only mode records
+    /// through). `reserved`: the caller holds a [`reserve`](Self::reserve) promise of this
+    /// owner, which this consumes (success or not); without one (log-only mode records
     /// opportunistically) another request's promise is left alone.
     pub fn commit(&mut self, owner: usize, via: u32, client: u32, reserved: bool) -> Commit {
         if reserved {
-            self.reserved = self.reserved.saturating_sub(1);
+            self.take_reservation(owner);
         }
         if owner == 0 || client == 0 || client == u32::MAX {
             return Commit::Refused;
         }
         let mut evicted = false;
         let mut i = 0;
-        while i < self.len {
+        while i < self.used {
             let s = self.slots[i];
             if s.client == client {
                 if s.owner == owner {
@@ -233,19 +261,17 @@ impl ClientTable {
                 // RM never has two live clients of one number: the other owner's
                 // entry is stale (a free whose reply was lost, a file closed behind
                 // our back). Dropping it is the safe direction.
-                self.slots[i] = self.slots[self.len - 1];
-                self.slots[self.len - 1] = EMPTY;
-                self.len -= 1;
+                self.remove_at(i);
                 evicted = true;
                 continue;
             }
             i += 1;
         }
-        if self.len >= MAX_CLIENTS || self.count_for(owner) >= MAX_CLIENTS_PER_OWNER {
+        if self.used >= MAX_CLIENTS || self.count_for(owner) >= MAX_CLIENTS_PER_OWNER {
             return Commit::Refused;
         }
-        self.slots[self.len] = Slot { owner, client, via };
-        self.len += 1;
+        self.slots[self.used] = Slot { owner, client, via };
+        self.used += 1;
         if evicted {
             Commit::Evicted
         } else {
@@ -254,15 +280,19 @@ impl ClientTable {
     }
 
     fn remove_at(&mut self, i: usize) {
-        self.slots[i] = self.slots[self.len - 1];
-        self.slots[self.len - 1] = EMPTY;
-        self.len -= 1;
+        self.slots[i] = self.slots[self.used - 1];
+        self.slots[self.used - 1] = EMPTY;
+        self.used -= 1;
     }
 
     /// Forget one client of `owner` (its free succeeded, or timed out). `false` if the
     /// owner did not hold it.
     pub fn forget_client(&mut self, owner: usize, client: u32) -> bool {
-        match self.slots[..self.len]
+        if client == 0 {
+            return false;
+        }
+        match self
+            .live()
             .iter()
             .position(|s| s.owner == owner && s.client == client)
         {
@@ -274,43 +304,43 @@ impl ClientTable {
         }
     }
 
+    /// Drop every slot matching `f`, returning how many CLIENTS (not reservations) went.
+    fn drop_where(&mut self, f: impl Fn(&Slot) -> bool) -> u32 {
+        let mut n = 0;
+        let mut i = 0;
+        while i < self.used {
+            if f(&self.slots[i]) {
+                if self.slots[i].client != 0 {
+                    n += 1;
+                }
+                self.remove_at(i);
+            } else {
+                i += 1;
+            }
+        }
+        n
+    }
+
     /// Forget every client of `owner` made through backend file `via` (the file
     /// closed). Returns how many.
     pub fn forget_via(&mut self, owner: usize, via: u32) -> u32 {
-        let mut n = 0;
-        let mut i = 0;
-        while i < self.len {
-            if self.slots[i].owner == owner && self.slots[i].via == via {
-                self.remove_at(i);
-                n += 1;
-            } else {
-                i += 1;
-            }
-        }
-        n
+        self.drop_where(|s| s.owner == owner && s.client != 0 && s.via == via)
     }
 
-    /// Forget every client of `owner` (device destroy). Returns how many.
+    /// Forget every client and reservation of `owner` (device destroy). Returns how many
+    /// clients.
     pub fn forget_owner(&mut self, owner: usize) -> u32 {
-        let mut n = 0;
-        let mut i = 0;
-        while i < self.len {
-            if self.slots[i].owner == owner {
-                self.remove_at(i);
-                n += 1;
-            } else {
-                i += 1;
-            }
-        }
-        n
+        self.drop_where(|s| s.owner == owner)
     }
 
-    /// Forget everything (the transport is retired). Returns how many entries.
+    /// Forget everything (the transport is retired). Returns how many clients. No
+    /// 4 KiB temporary: this runs under the virtio spinlock.
     pub fn clear(&mut self) -> u32 {
-        let n = self.len as u32;
-        self.slots = [EMPTY; MAX_CLIENTS];
-        self.len = 0;
-        self.reserved = 0;
+        let n = self.len() as u32;
+        for s in self.slots[..self.used].iter_mut() {
+            *s = EMPTY;
+        }
+        self.used = 0;
         n
     }
 }
@@ -423,10 +453,12 @@ const fn handle(off: usize) -> Field {
     }
 }
 
-/// A backend-handle slot that MAY legitimately name a handle of another owner (a fence a
-/// process waits on that the KMD took over or another process shares): counted, not
+/// A backend-handle slot where a number that is not the caller's handle is not known to
+/// be an attack: a fence the caller waits on that the KMD took over or another process
+/// shares (`SEMSURF_FENCE_WAIT`), or the `data` of an `NV01_EVENT` (class 0x05, not
+/// 0x79), which RM may read as a callback cookie rather than a descriptor. Counted, never
 /// refused, whoever it names.
-const fn shared_handle(off: usize) -> Field {
+const fn soft_handle(off: usize) -> Field {
     Field {
         off,
         kind: Kind::Handle,
@@ -471,7 +503,7 @@ const CLASS_LAYOUTS: [(u32, Layout); 5] = [
         0x05,
         Layout {
             size: 24,
-            fields: &[client(0), handle(16)],
+            fields: &[client(0), soft_handle(16)],
             array: None,
         },
     ),
@@ -958,7 +990,7 @@ fn drm_ioctl<F: Fn(u32) -> bool>(cx: &Ctx<'_, F>, acc: &mut Acc, io: &IoctlView<
             cx.field(
                 acc,
                 io.data,
-                shared_handle(4),
+                soft_handle(4),
                 io.data.len() == 24,
                 Cause::HandleRef,
             );
@@ -1167,20 +1199,40 @@ mod tests {
         let mut t = ClientTable::new();
         for _ in 0..MAX_CLIENTS_PER_OWNER {
             assert!(t.reserve(A));
-            t.cancel();
+            t.cancel(A);
         }
         assert!(t.reserve(A));
-        t.clear();
+        assert_eq!(t.clear(), 0, "a reservation is not a client");
         // Back to a clean quota.
         for i in 0..MAX_CLIENTS_PER_OWNER {
             assert!(t.reserve(A), "slot {i}");
             assert_eq!(t.commit(A, 1, 100 + i as u32, true), Commit::Recorded);
         }
         assert!(!t.reserve(A));
+        assert_eq!(t.clear(), MAX_CLIENTS_PER_OWNER as u32);
+        assert!(t.is_empty());
+        assert!(t.reserve(A));
     }
 
     #[test]
-    fn quotas_hold_per_owner_and_in_total_and_reservations_count() {
+    fn an_all_zero_table_is_an_empty_table() {
+        // `new_client_table` builds the kernel's table with `alloc_zeroed` (no 4 KiB
+        // temporary): the zero pattern must be the empty table.
+        let fresh = ClientTable::new();
+        let n = core::mem::size_of::<ClientTable>();
+        // SAFETY: a plain-old-data struct without padding (usize / u32 fields only), read as
+        // bytes while it is alive and unchanged.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(&fresh as *const ClientTable as *const u8, n) };
+        assert!(bytes.iter().all(|b| *b == 0));
+        assert_eq!(
+            n,
+            MAX_CLIENTS * core::mem::size_of::<Slot>() + core::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn quotas_hold_per_owner_and_in_total() {
         let mut t = ClientTable::new();
         for i in 0..MAX_CLIENTS_PER_OWNER {
             assert!(t.reserve(A));
@@ -1188,7 +1240,7 @@ mod tests {
         }
         assert!(!t.reserve(A), "per-owner quota");
         assert!(t.reserve(B), "another owner is not held up");
-        t.cancel();
+        t.cancel(B);
         // Fill the rest of the table with other owners.
         let mut o = 100usize;
         let mut h = 1000u32;
@@ -1201,15 +1253,60 @@ mod tests {
             assert_eq!(t.commit(o, 1, h, true), Commit::Recorded);
         }
         assert!(!t.reserve(B), "total quota");
-        // An in-flight reservation holds a slot.
+    }
+
+    #[test]
+    fn reservations_in_flight_count_against_the_table_and_the_owners_quota() {
+        // The table: 255 reservations of other owners and one client fill it.
         let mut t = ClientTable::new();
         t.commit(A, 1, 1, false);
         for i in 0..MAX_CLIENTS - 1 {
             assert!(t.reserve(1000 + i), "reservation {i}");
         }
         assert!(!t.reserve(B), "reservations count against the total");
-        t.cancel();
+        t.cancel(1000);
         assert!(t.reserve(B));
+
+        // The owner's quota: one below it, two concurrent root allocations cannot both reserve.
+        let mut t = ClientTable::new();
+        for i in 0..MAX_CLIENTS_PER_OWNER - 1 {
+            assert_eq!(t.commit(A, 1, 10 + i as u32, false), Commit::Recorded);
+        }
+        assert!(t.reserve(A), "the first takes the last slot");
+        assert!(
+            !t.reserve(A),
+            "the second must be refused, not both admitted"
+        );
+        assert!(t.reserve(B), "another owner is not held up");
+        t.cancel(B);
+        // The first one finishes: its reservation becomes the client and the quota is full.
+        assert_eq!(t.commit(A, 1, 99, true), Commit::Recorded);
+        assert_eq!(t.count_for(A), MAX_CLIENTS_PER_OWNER);
+        assert!(!t.reserve(A));
+        // A failed allocation gives its slot back; a stranger's cancel takes nothing of A's.
+        assert!(t.forget_client(A, 99));
+        assert!(t.reserve(A));
+        t.cancel(B);
+        assert!(!t.reserve(A), "B's cancel did not release A's reservation");
+        t.cancel(A);
+        assert!(t.reserve(A));
+    }
+
+    #[test]
+    fn a_reservation_is_nobodys_client_and_is_dropped_with_its_owner() {
+        let mut t = ClientTable::new();
+        assert!(t.reserve(A));
+        assert!(!t.is_client_owned_by(A, 0));
+        assert_eq!(t.len(), 0);
+        assert!(
+            !t.forget_client(A, 0),
+            "client 0 is not a reservation handle"
+        );
+        assert_eq!(t.forget_via(A, 0), 0);
+        assert_eq!(t.forget_owner(A), 0, "no client went");
+        assert_eq!(t.count_for(A), 0, "but the reservation did");
+        // A commit that lost its reservation (owner torn down in flight) still records.
+        assert_eq!(t.commit(A, 1, 5, true), Commit::Recorded);
     }
 
     #[test]
@@ -1701,11 +1798,6 @@ mod tests {
                 "events of another process's objects"
             );
             assert_eq!(
-                judge_a(&t, CTL, &event_alloc(class, CA, 2, 24)),
-                Verdict::Deny(Cause::HandleRef),
-                "another process's file"
-            );
-            assert_eq!(
                 judge_a(&t, CTL, &event_alloc(class, CA, u64::MAX, 24)),
                 Verdict::Allow,
                 "a negative descriptor names no file"
@@ -1716,6 +1808,30 @@ mod tests {
                 Verdict::Doubt(Cause::ClientRef)
             );
         }
+        // Class 0x79 (`NV01_EVENT_OS_EVENT`): `data` is a descriptor, another process's file
+        // is refused.
+        assert_eq!(
+            judge_a(&t, CTL, &event_alloc(0x79, CA, 2, 24)),
+            Verdict::Deny(Cause::HandleRef),
+            "another process's file"
+        );
+        // Class 0x05 (`NV01_EVENT`): `data` may be a cookie RM does not read as a descriptor, so
+        // a number that is not the caller's handle is a doubt, not a refusal; the parent client
+        // is still checked.
+        assert_eq!(
+            judge_a(&t, CTL, &event_alloc(0x05, CA, 2, 24)),
+            Verdict::Doubt(Cause::HandleRef)
+        );
+        assert_eq!(
+            judge_a(&t, CTL, &event_alloc(0x05, CA, 0x7FFF_0000_1234, 24)),
+            Verdict::Doubt(Cause::HandleRef),
+            "a cookie whose low word is no handle of the caller's"
+        );
+        assert_eq!(
+            judge_a(&t, CTL, &event_alloc(0x05, CB, 0x7FFF_0000_1234, 24)),
+            Verdict::Deny(Cause::ClientRef),
+            "a refusal outranks a doubt"
+        );
         // No parameter block at all: nothing named.
         assert_eq!(
             judge_a(&t, CTL, &alloc64(CA, CA, 9, 0x79, &[])),
@@ -2062,7 +2178,7 @@ mod tests {
                 Some(c) => {
                     t.commit(owner, via, c, true);
                 }
-                None => t.cancel(),
+                None => t.cancel(owner),
             }
         } else if let Some(c) = client_free(req) {
             if free_reply_ok(host_reply, host_reply.len()) {
