@@ -958,9 +958,13 @@ own counters. A flip whose programming cannot bind a non-Venus allocation comple
 a KEPT picture (`ProgrammedPrimary::kept_picture`, `AdapterContext::publish_kept_primary`): the address moves, the
 screen keeps whatever it showed, no refresh or bind is requested. One atomic store, legal at any IRQL.
 
-Which allocations (`flip_completion::classify`, from the KMD's own create-time record, never the creator's words):
+Which allocations (`flip_completion::classify`, from the allocation context the KMD built at create time). Honest
+about provenance: whether an allocation is FOREIGN is the KMD's own adoption record; the other inputs (`width`,
+`height`, `direct_scanout`, `venus_alloc_size`, the Venus image id) come from the creator's private-data trailer. A
+creator can therefore make ITS OWN allocation look hollow; the only effect is that ITS flips complete as kept pictures
+instead of failing, which is self-harm and reaches no other allocation:
 
-* `Foreign`: adopted NVK-on-RM resource (`AllocationContext::foreign`).
+* `Foreign`: adopted NVK-on-RM resource (`AllocationContext::foreign`, the KMD's record).
 * `Hollow`: not foreign and the Venus path can never show it: no resource id (the host-less shared placeholder), or a
   non-direct allocation with no geometry (`submit_primary_scanout_copy` refuses `ctx.width != width`, and an allocation
   with no geometry is programmed at the mode's extent) or no Venus identity to import. A direct-scanout allocation with
@@ -1008,7 +1012,18 @@ fail `PBFlip` 0xE6) is `PresentSkip`.
 * DMA lane: `display.rs` writes a keep record (`PresentFlipPrivate::write_keep`, its own magic `HPKP`, so `take` still
   refuses a zero allocation) for a skipped foreign flip and for the `Fail` route of a hollow allocation;
   `submit_command::arm_dma_flip` takes it (`take_keep`, one-shot) and publishes `kept_picture(physical_address)`. Atomics
-  only, legal at DISPATCH. A zero physical address publishes nothing.
+  only, legal at DISPATCH. A zero physical address publishes nothing. STALE REPLAY: dxgkrnl recycles DMA private
+  buffers; if `present_complete` FAILS after the record was written (patch capacity, stream boundary), the slot is
+  zeroed (`PresentFlipPrivate::clear_keep`, in `display::present_flip_kept`) so a recycled buffer cannot publish an old
+  address as kept for another flip. Not host-testable (raw DMA private memory); it is read, not run. The ordinary flip
+  record (`HPFL`) has the same exposure and is not changed here.
+* Placeholder flips (`FkPhFlip`). A host-less shared placeholder has no identity, so `present_alloc_info` is `None` and the
+  flip arm failed `PBFlip` 0xE1 before any of the above. The open now records `host_less_placeholder` (no identity and
+  the placeholder's shape, `shared_placeholder::identityless_open_is_placeholder`, the KMD's own test) and the flip arm
+  completes such a flip: MMIO returns success (`SetVidPnSourceAddress` follows with the global handle, resource id 0,
+  which the worker rejects and completes as a kept picture) and DMA writes a keep record for the allocation list's
+  address. An identity-less allocation that does not have the placeholder's shape still fails 0xE1, as does every
+  Venus allocation.
 * `virtio/gpu/mod.rs` and the three call layers above it (`submit_prepared_image_copy`, `submit_venus_async_scanout`,
   `scanout_notify`): `ScanoutNotify::keep_on_failure`, set for a non-Venus source. The ring-1 completion DPC then stores
   the address when the copy's GPU completion FAILS (`response_ok` false), where it stored it only on success. The
@@ -1017,8 +1032,10 @@ fail `PBFlip` 0xE6) is `PresentSkip`.
   publishes at programming; the flip is sent later by the worker). What was coupled was the worker: it drains
   `pending_vidpn_allocation` (`hpd.rs`, before `foreign_flip::service`), so a flip waiting on a slow or silent host sat in
   front of every later publication for up to `FLIP_TIMEOUT_MS` = 1 s. The timeout is now
-  `flip_completion::WORKER_FLIP_TIMEOUT_MS` = 100 ms (host-tested bounds: at least two 60 Hz frames, well under a second),
-  with the retry and failure accounting untouched (a timeout is `Failed`, three in a row give up for five seconds). Chosen
+  `flip_completion::WORKER_FLIP_TIMEOUT_MS` = 250 ms (host-tested bounds: at least two 60 Hz frames, at most 250 ms, well
+  under a second), with the retry and failure accounting untouched (a timeout is `Failed`, three in a row give up for
+  five seconds, `FAIL_UNTIL`). It was first 100 ms; a tester's run showed three 100 ms host stalls withdrawing the
+  `ForeignFlip` source in about 0.6 s (three strikes plus the retry pauses), so it is 250 ms. Chosen
   over a second thread (new lifetime and lock-order surface, unverifiable without hardware) and over draining between acts
   (starves the flips under a steady stream of programmings). With every refusal now completing as a kept picture, a
   spurious timeout costs a stale picture for the pause, not a held flip. The level 5 presenter's 1 s is untouched.
@@ -1067,7 +1084,8 @@ by the periodic mirror):
 Verified (host tests, `kmd_logic`): the full decision table (2 contracts x 3 sources x ForeignFlip on/off x 10 outcomes,
 unreachable rows asserted unreachable); Venus rows publish nothing new for every knob; Kept never for Venus or for a
 programming that bound; every terminal foreign dead end completes; the T3 rows; `classify` for each shape; the 100 ms
-bound; counter names (length, uniqueness, no `Fk` literal elsewhere in `kmd_render`, exact list); first-and-every-64th.
+bound (at most 250 ms); counter names (length, uniqueness, no `Fk` literal elsewhere in `kmd_render`, exact list);
+first-and-every-64th.
 Type-checked: the whole `kmd_render` against the stub harness (a build script supplies the base NT types), with the
 error set of the touched tree IDENTICAL to the base, and a probe confirming the harness reports an injected arity error in
 `create_allocation.rs` and an unknown variant in `submit_command.rs`.
@@ -1103,7 +1121,48 @@ was never written is zero.
 7. If `FkKeep` moves and DWM still blocks, unknown 1 is the answer: dxgkrnl is not retiring on the VSync address. Then
    compare `SaLo` / `SaHi` with the flip's address and look at the `DMA_COMPLETED` fence path (`WfDone`, `WtOut`) before
    suspecting this rule.
-8. A Venus-only session must read `FkKeep` 0 and no `Fk*` value at all (nothing is written until the first completion).
-   A nonzero `FkKeep` there names an allocation `classify` called hollow: read `SaSeg`, `ScSrc`, `ScWH`, `ScDir` for it.
-9. `ForeignFlip` 1: `FfFlipFail` and `FfGaveUp` are the timeout's cost; with the 100 ms bound a loaded host may fail more
+8. A Venus-only session should read `FkKeep` 0 (the `Fk*` block is written once per StartDevice as zeros, then only on
+   events). A nonzero `FkKeep` there is either an allocation `classify` called hollow (read `SaSeg`, `ScSrc`, `ScWH`,
+   `ScDir` for it), or the DIRQL unpaired-handle publication (`FkDdi`, `FkKeep08`): a stale-generation or foreign handle
+   of an otherwise ordinary Venus session can bump it. Confirm `VpPrF` (handles that paired with nothing) is 0 on a Venus
+   baseline before reading a nonzero `FkDdi` as a defect; `FkDdi` should equal the growth of `VpPrF`.
+9. `ForeignFlip` 1: `FfFlipFail` and `FfGaveUp` are the timeout's cost; with the 250 ms bound a loaded host may fail more
    than with 1 s. A rise with `FkKeep02` (refused while failing) is the stale-picture window, expected for five seconds.
+10. Every knob mirror in the table of 13.8 is the value in force at this StartDevice, 0 included: read `FfKnob`, `FcKnob`,
+    `RmKnob`, `NvDupMode`, `DiagLvl` before trusting any block that depends on them.
+
+### 13.8 Knob read times and their mirrors (the table), and the stale-block rule
+
+Found on hardware: `FfKnob` = 1 stayed in the service key after the registry knob was set to 0 and the device restarted,
+and the whole `Ff*` block (written only once an allocation was seen) stayed frozen at a previous run's values. Two
+causes: the lazy knob readers wrote their mirror only for a NONZERO value, and event-gated counter blocks write nothing
+until their first event. Rules now: (1) a knob mirror is written on EVERY read, 0 included; (2) every cached knob is
+read again at StartDevice, so `reg add` + `pnputil /restart-device` applies a change; (3) a block that is written only
+on events is zeroed in the service key (and its statics) once per StartDevice, and the `Ff*` and `Fk*` blocks publish a
+full zero block once per generation even if nothing is ever seen.
+
+| knob | read at | cached in | mirror (value in force) |
+|---|---|---|---|
+| `DiagLevel` | StartDevice (`diag::reread_level`), lazily before | static | `DiagLvl` (new) |
+| `StopFlush` | each StopDevice | not cached | none (behaviour only) |
+| `NvSpinUs` | StartDevice (`ctrl::reread_spin_knob`), lazily before | static (was: once per driver load) | `NvSpinUs` (new) |
+| `NvDupHarden` | StartDevice (`nvrm_harden::reread_mode`), lazily before | static (was: once per driver load) | `NvDupMode` (now on every read) |
+| `AllocCached`, `BindFlushMode`, `DispatchBind`, `PresentProbe`, `ForeignCopy`, `DisplayHalf`, `DirectFlipCaps`, `CrossAdaptCaps`, `BarSegFlags`, `BarSegBaseMB`, `BarSegMode`, `VidMmVramMB`, `SubSpaceWake` | AddDevice and StartDevice (`AdapterKnobs::read`, `read_at_start`) | `AdapterContext::knobs` | `AlcC`, `BndFM`, `DspBnd`, `PBPrEn`, `FcKnob`, `DspH`, `BarF`, `BarB`, `BarM` (written at every start); the others none |
+| `DmaGpuFence`, `PresentWmk`, `WddmHoldMs`, `WddmHeadMs` | transport init (`VirtioGpu::init`, every StartDevice) | `VirtioGpu` fields / statics | `DmaGfEff`, `PrWmkEff`, `WdHoldEff`, `WdHeadEff` (new) |
+| `FlGSyncMs` | transport init (`flush_trace::init_from_registry`) | static | `FlGSyncEff` (now written at every init; before, only once a flush-gate Render was seen) |
+| `MsiVectors` | transport init (MSI plan) | local | `MsiVec` |
+| `VsyncRateMhz` | StartDevice | static | `VsRate` |
+| `OutputTech` | each child-capabilities query | not cached | `OutTech` |
+| `FlipCapsX`, `FlipQueueN` | each QueryAdapterInfo caps query | not cached | `FlipCapV`, `FlipQueV` |
+| `KmdRmClient` | StartDevice, after `retire_transport` (`rm_client::reread_knob_at_start`); `forget` resets it per transport | static | `RmKnob` (now on every read, 0 included) |
+| `KmdRmSysCache` | each level 5 primary bring-up | state | `RmSysCache` (level 5 counter block) |
+| `KmdRmSysPollMs` | lazily at level 5, per transport generation (`forget` resets it) | static | `RmSysPollMs` (now on every read, 0 included) |
+| `ForeignFlip` | StartDevice, after `retire_transport` (via `foreign_flip::publish_counters`), lazily otherwise; `forget` resets it | static | `FfKnob` (now on every read, 0 included) |
+
+Event-gated counter blocks, and what resets them: `Ff*` (`foreign_flip::forget` zeroes the counters at every
+`retire_transport`, the block is published once as zeros, then on events), `Fk*` (`flip_keep::reset_for_start`, same),
+`PrFg*` / `PrUnres*` / `PrColFill` (`present_foreign::reset_for_start`), `ShPh*` and `CrPrivSmall` / `CrApInvalid`
+(`shared_placeholder::reset_for_start`). Not changed, and still event-gated, so a value in the service key may predate
+this boot until its first event: the `Rm*` presenter and level 5 blocks (`RmKnob` itself is now fresh), `Fc*`
+(`FcKnob` is fresh), `FlG*`. The `Nv*`, `Vs*` and `Sa*` counters are written by the periodic mirror without a gate.
+`reset_fault_counters` already zeroes the fault set at StartDevice.

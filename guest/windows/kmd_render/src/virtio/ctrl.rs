@@ -480,7 +480,8 @@ fn ctrl_roundtrip(
 const RAW_REPLY_STACK: usize = 1024;
 
 /// `NvSpinUs` as read from the service key (clamped), or `u32::MAX` while unread.
-/// Read once, at the first forward (PASSIVE); a change needs a driver reload.
+/// Read at StartDevice ([`reread_spin_knob`]) and, if unread, at the first forward (PASSIVE);
+/// mirrored as `NvSpinUs` on every read.
 static NVRM_SPIN_US: AtomicU32 = AtomicU32::new(u32::MAX);
 /// The spin governor's packed state (`helios_kmd_logic::nvrm_fastpath::spin`).
 /// Plain load / store, never a read-modify-write: it is a heuristic, a lost
@@ -494,15 +495,28 @@ static NVRM_SPIN_STATE: AtomicU32 =
 pub static NVRM_SPIN_HITS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_SPIN_MISSES: AtomicU32 = AtomicU32::new(0);
 
+/// Read `NvSpinUs` (clamped), cache it and mirror it. PASSIVE.
+fn read_spin_knob() -> u32 {
+    use helios_kmd_logic::nvrm_fastpath::spin;
+    let us = crate::diag::read_config_dword(crate::diag::knobs::NV_SPIN_US, spin::BUDGET_US_DEFAULT)
+        .min(spin::BUDGET_US_MAX);
+    NVRM_SPIN_US.store(us, Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"NvSpinUs", us);
+    us
+}
+
+/// Forget the cached `NvSpinUs` and read it again (StartDevice, PASSIVE): the static outlives a
+/// `pnputil /restart-device`, and this knob used to need a driver reload.
+pub(crate) fn reread_spin_knob() -> u32 {
+    read_spin_knob()
+}
+
 /// The pre-wait spin budget in 100 ns units; 0 = disabled by the knob.
 fn nvrm_spin_budget_100ns(_passive: PassiveLevel) -> u64 {
     use helios_kmd_logic::nvrm_fastpath::spin;
     let mut us = NVRM_SPIN_US.load(Ordering::Relaxed);
     if us == u32::MAX {
-        us =
-            crate::diag::read_config_dword(crate::diag::knobs::NV_SPIN_US, spin::BUDGET_US_DEFAULT)
-                .min(spin::BUDGET_US_MAX);
-        NVRM_SPIN_US.store(us, Ordering::Relaxed);
+        us = read_spin_knob();
     }
     spin::budget_100ns(us)
 }

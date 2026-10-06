@@ -143,6 +143,10 @@ static GONE: AtomicU32 = AtomicU32::new(0);
 static POISONED: AtomicU32 = AtomicU32::new(0);
 static EDGES: AtomicU32 = AtomicU32::new(0);
 static PRES_WORD: AtomicU32 = AtomicU32::new(0);
+/// The `Ff*` block owes the service key one full write (zeros included) for this transport
+/// generation: set by [`forget`], taken by [`publish_counters`]. A value left in the registry by
+/// a previous run is then never read as live, whether or not this generation sees a flip.
+static MIRROR_PENDING: AtomicU32 = AtomicU32::new(1);
 
 /// Mirror the counters to the service key. PASSIVE only. Nothing is written until the knob
 /// was on and an allocation was seen, so a box with the knob off gets no new value.
@@ -152,8 +156,15 @@ pub(crate) fn publish_counters() {
         | NO_REC.load(Ordering::Relaxed)
         | REFUSED.load(Ordering::Relaxed)
         | POISONED.load(Ordering::Relaxed);
-    if seen == 0 {
+    // Once per generation the whole block is written even when nothing was seen (zeros), so a
+    // block from an earlier run cannot be read as this one's. The knob is read (and mirrored)
+    // first if this generation has not yet.
+    let owed = MIRROR_PENDING.swap(0, Ordering::AcqRel) != 0;
+    if seen == 0 && !owed {
         return;
+    }
+    if owed {
+        let _ = knob_on();
     }
     rec(b"FfKnob", KNOB.load(Ordering::Relaxed).min(0xFF));
     rec(b"FfProg", PROG.load(Ordering::Relaxed));
@@ -205,10 +216,10 @@ fn knob_on() -> bool {
 fn read_knob() -> u32 {
     let v = crate::diag::read_config_dword(crate::diag::knobs::FOREIGN_FLIP, 0);
     KNOB.store(v, Ordering::Relaxed);
-    // Nothing is written for the default (off): the service key stays as it was.
-    if v != 0 {
-        crate::diag::record_named_bytes(b"FfKnob", v.min(0xFF));
-    }
+    // Mirrored on EVERY read, 0 included: "nothing is written for the default" left FfKnob = 1 in
+    // the registry after the knob was set back to 0 and the device restarted (tester evidence),
+    // and the whole `Ff*` block with it.
+    crate::diag::record_named_bytes(b"FfKnob", v.min(0xFF));
     v
 }
 
@@ -234,6 +245,18 @@ pub(crate) fn forget() {
     FAIL_UNTIL.store(0, Ordering::Release);
     LAST_SEQ.store(0, Ordering::Relaxed);
     KNOB.store(KNOB_UNREAD, Ordering::Relaxed);
+    // The counters are this generation's: zero them, and owe the service key the zero block.
+    for c in [
+        &PROG, &SAME, &MOVED, &REOWNED, &NO_REC, &REFUSED, &WHY, &REGS, &REG_FAIL, &WITHDRAWN,
+        &GAVE_UP, &FRAMES, &REFLIPS, &YIELDED, &FLIP_FAIL, &STALE, &GONE, &POISONED, &EDGES,
+        &PRES_WORD, &YIELDS,
+    ] {
+        c.store(0, Ordering::Relaxed);
+    }
+    for c in &REFUSED_BY {
+        c.store(0, Ordering::Relaxed);
+    }
+    MIRROR_PENDING.store(1, Ordering::Release);
 }
 
 /// Whether this arm's allocation is what the screen shows: the level 5 service leaves the

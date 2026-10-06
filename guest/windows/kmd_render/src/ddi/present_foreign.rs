@@ -200,6 +200,41 @@ fn note_handoff() {
     }
 }
 
+/// A new generation (StartDevice): zero the counters and write zeros over their service-key
+/// values (`PrFg*`, `PrUnres*`, `PrColFill`). They are mirrored only once an event happened, so
+/// without this a block from an earlier run stays readable as this one's. PASSIVE.
+pub(crate) fn reset_for_start() {
+    for c in [
+        &SKIPS,
+        &LAST_WHY,
+        &BLT_SKIPS,
+        &FLIP_SKIPS,
+        &HANDED,
+        &UNRESOLVED,
+        &LAST_CAUSES,
+        &COLOR_FILLS,
+    ] {
+        c.store(0, Ordering::Relaxed);
+    }
+    publish_zero_block();
+}
+
+fn publish_zero_block() {
+    use crate::diag::record_named_bytes as rec;
+    for name in [
+        &b"PrUnres"[..],
+        b"PrUnrWhy",
+        b"PrColFill",
+        b"PrFgWhy",
+        b"PrFgHand",
+        b"PrFgSkip",
+        b"PrFgBlt",
+        b"PrFgFlip",
+    ] {
+        rec(name, 0);
+    }
+}
+
 /// Mirror the counters to the service key. PASSIVE_LEVEL only; with the NVRM counters.
 pub(crate) fn publish_counters() {
     let n = SKIPS.load(Ordering::Relaxed);

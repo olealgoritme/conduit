@@ -356,9 +356,8 @@ fn read_poll_ms() -> u32 {
         raw.clamp(rr::MIN_POLL_MS, rr::MAX_POLL_MS)
     };
     POLL_MS.store(v, Ordering::Relaxed);
-    if v != 0 {
-        crate::diag::record_named_bytes(b"RmSysPollMs", v);
-    }
+    // Mirrored on every read, 0 included (see `rm_client::read_knob`).
+    crate::diag::record_named_bytes(b"RmSysPollMs", v);
     v
 }
 

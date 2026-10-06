@@ -1032,6 +1032,40 @@ unsafe fn dxgkddi_present_inner(
         // private-data snapshot captured by OpenAllocation. In particular, do
         // not let the UMD command payload independently select a resource.
         let Some(source) = src_info else {
+            // A HOST-LESS SHARED PLACEHOLDER (the KMD's own record from its open: no identity, the
+            // placeholder's shape) has no identity to resolve and no host resource, but DWM can
+            // flip it and the flip must COMPLETE (`helios_kmd_logic::flip_completion`, Hollow):
+            // failing it here left the chain held. The MMIO contract only needs the Present to
+            // succeed (`SetVidPnSourceAddress` follows with the global handle, resource id 0, which
+            // the worker completes as a kept picture); the DMA contract writes a keep record for
+            // the address the allocation list assigned.
+            if unsafe {
+                crate::ddi::create_allocation::present_alloc_is_placeholder(adapter, src_handle)
+            } {
+                if args.pDmaBuffer.is_null() {
+                    crate::ddi::flip_keep::note_placeholder_flip();
+                    crate::diag::record_named_bytes(b"PBMmio", 1);
+                    crate::ddi::scanout_trace::note_present_mmio_flip();
+                    args.MultipassOffset = 0;
+                    PRESENT_LAST_STATUS.store(STATUS_SUCCESS as u32, Ordering::Relaxed);
+                    return STATUS_SUCCESS;
+                }
+                if let Some(flip_source) = present_allocations.source() {
+                    crate::ddi::flip_keep::note_placeholder_flip();
+                    return unsafe {
+                        present_flip_kept(
+                            args,
+                            present_allocations,
+                            flip_source.physical_address(),
+                            present_stream_boundary,
+                            present_arm,
+                            adapter,
+                            src_info,
+                            dst_info,
+                        )
+                    };
+                }
+            }
             crate::diag::record_named_bytes(b"PBFlip", 0xE1);
             PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
             return crate::ddi::present_foreign::invalid(site::FLIP_NO_SOURCE);
@@ -1157,26 +1191,11 @@ unsafe fn dxgkddi_present_inner(
         let flip_allocation = match (route, registered) {
             (FlipRoute::Arm { .. }, Some(handle)) => handle,
             _ if keep_flip => {
-                if unsafe {
-                    crate::ddi::present_packet::PresentFlipPrivate::write_keep(
-                        args.pDmaBufferPrivateData,
-                        args.DmaBufferPrivateDataSize,
-                        flip_source.physical_address(),
-                    )
-                }
-                .is_ok()
-                {
-                    crate::ddi::flip_keep::note_dma_record();
-                } else {
-                    // The private buffer is smaller than the record (never with the size
-                    // requested at CreateContext): the flip then completes as it did before.
-                    crate::diag::record_named_bytes(b"PBFlip", 0xE5);
-                }
                 return unsafe {
-                    present_complete(
+                    present_flip_kept(
                         args,
                         present_allocations,
-                        None,
+                        flip_source.physical_address(),
                         present_stream_boundary,
                         present_arm,
                         adapter,
@@ -1251,6 +1270,67 @@ unsafe fn dxgkddi_present_inner(
             dst_info,
         )
     }
+}
+
+/// A DMA flip this Present completes without arming any programming: write the KEEP record for
+/// `physical_address` (`arm_dma_flip` publishes it as a kept picture at submit), then the shared
+/// completion.
+///
+/// STALE REPLAY. dxgkrnl recycles DMA private-data buffers. If the completion FAILS after the
+/// record was written (patch capacity, stream boundary), dxgkrnl retries or abandons this Present
+/// and the buffer may be handed to a later submission with the record still in it, which would
+/// publish an old flip's address as kept for a flip it does not belong to. So every failing return
+/// zeroes the slot (`clear_keep`); a success leaves it for `take_keep`, which consumes it.
+///
+/// # Safety
+/// As [`present_complete`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn present_flip_kept(
+    args: &mut DXGKARG_PRESENT,
+    present_allocations: PresentAllocations,
+    physical_address: u64,
+    present_stream_boundary: Option<u64>,
+    arm: PresentArm,
+    adapter: Option<&AdapterContext>,
+    src_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+    dst_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+) -> NTSTATUS {
+    let written = unsafe {
+        crate::ddi::present_packet::PresentFlipPrivate::write_keep(
+            args.pDmaBufferPrivateData,
+            args.DmaBufferPrivateDataSize,
+            physical_address,
+        )
+    }
+    .is_ok();
+    if written {
+        crate::ddi::flip_keep::note_dma_record();
+    } else {
+        // The private buffer is smaller than the record (never with the size requested at
+        // CreateContext): the flip then completes as it did before.
+        crate::diag::record_named_bytes(b"PBFlip", 0xE5);
+    }
+    let status = unsafe {
+        present_complete(
+            args,
+            present_allocations,
+            None,
+            present_stream_boundary,
+            arm,
+            adapter,
+            src_info,
+            dst_info,
+        )
+    };
+    if written && status != STATUS_SUCCESS {
+        unsafe {
+            crate::ddi::present_packet::PresentFlipPrivate::clear_keep(
+                args.pDmaBufferPrivateData,
+                args.DmaBufferPrivateDataSize,
+            )
+        };
+    }
+    status
 }
 
 /// The shared completion of a Present: the patch-location references, the DMA marker and the

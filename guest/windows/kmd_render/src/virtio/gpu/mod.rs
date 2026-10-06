@@ -3107,6 +3107,8 @@ impl VirtioGpu {
             host_edid_len: 0,
         });
         let mut gpu = gpu;
+        crate::diag::record_named_bytes(b"DmaGfEff", u32::from(gpu.dma_gpu_fence));
+        crate::diag::record_named_bytes(b"PrWmkEff", u32::from(gpu.present_exact_watermark));
         if let Some(n) = host_edid_len {
             if let (Some(src), Some(dst)) = (
                 resp_buf.get(EDID_RESP_OFFSET..EDID_RESP_OFFSET + n),
@@ -3128,6 +3130,9 @@ impl VirtioGpu {
                 .min(WDDM_HOLD_MS_MAX),
             Ordering::Relaxed,
         );
+        // The knobs this init snapshots, mirrored with the value IN FORCE (every init, 0
+        // included): a registry value set back to its default must not leave a stale one showing.
+        crate::diag::record_named_bytes(b"WdHoldEff", WDDM_HOLD_MS.load(Ordering::Relaxed));
         // `WddmHeadMs` (K-F2 / A5's consumer-side head bound). Snapshotted with
         // every other knob, and CLAMPED IN BOTH DIRECTIONS rather than trusted: too
         // large reinstates the unbounded head and hence the TDR, too small turns a
@@ -3143,6 +3148,7 @@ impl VirtioGpu {
             ),
             Ordering::Relaxed,
         );
+        crate::diag::record_named_bytes(b"WdHeadEff", WDDM_HEAD_MS.load(Ordering::Relaxed));
         // `FlGSyncMs` (flush-gate diagnostic, default 0 = off): snapshotted here with the
         // other knobs; clamped in `flush_trace::init_from_registry`.
         crate::ddi::flush_trace::init_from_registry();

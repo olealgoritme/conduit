@@ -63,6 +63,9 @@ static ASYNC: AtomicU32 = AtomicU32::new(0);
 static DDI: AtomicU32 = AtomicU32::new(0);
 /// DMA Presents that wrote a keep record (the Present side of the DMA lane).
 static DMA_RECORDS: AtomicU32 = AtomicU32::new(0);
+/// Flips of a host-less shared placeholder the Present completed instead of failing (both
+/// contracts; `FkPhFlip`).
+static PH_FLIPS: AtomicU32 = AtomicU32::new(0);
 
 /// Publish `address` as a kept picture and count it: atomics only, any IRQL. Returns the running
 /// count when this was the first or a 64th (a registry write is due; a PASSIVE caller makes it),
@@ -111,6 +114,30 @@ pub(crate) fn note_dma_record() {
     }
 }
 
+/// A Present (PASSIVE) completed a flip of a host-less shared placeholder (`FkPhFlip`): the first
+/// and every 64th written at once.
+pub(crate) fn note_placeholder_flip() {
+    let n = PH_FLIPS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if fc::mirror_due(n) {
+        crate::diag::record_named_bytes(b"FkPhFlip", n);
+    }
+}
+
+/// The `Fk*` block owes the service key one full write (zeros included) for this StartDevice.
+static MIRROR_PENDING: AtomicU32 = AtomicU32::new(1);
+
+/// A new generation (StartDevice): zero the counters and owe the zero block, so values from an
+/// earlier run in the service key are never read as this one's. PASSIVE.
+pub(crate) fn reset_for_start() {
+    for c in [&KEPT, &LAST_WHY, &WORKER, &DMA, &ASYNC, &DDI, &DMA_RECORDS, &PH_FLIPS] {
+        c.store(0, Ordering::Relaxed);
+    }
+    for c in &BY_WHY {
+        c.store(0, Ordering::Relaxed);
+    }
+    MIRROR_PENDING.store(1, Ordering::Release);
+}
+
 /// Mirror the counters to the service key. PASSIVE_LEVEL only; nothing is written until a flip was
 /// completed this way (or a keep record was written), so a box that never meets a foreign primary
 /// gets no new value.
@@ -118,9 +145,12 @@ pub(crate) fn publish_counters() {
     use crate::diag::record_named_bytes as rec;
     let kept = KEPT.load(Ordering::Relaxed);
     let records = DMA_RECORDS.load(Ordering::Relaxed);
-    if kept == 0 && records == 0 {
+    let placeholders = PH_FLIPS.load(Ordering::Relaxed);
+    let owed = MIRROR_PENDING.swap(0, Ordering::AcqRel) != 0;
+    if kept == 0 && records == 0 && placeholders == 0 && !owed {
         return;
     }
+    rec(b"FkPhFlip", placeholders);
     rec(b"FkKeep", kept);
     rec(b"FkWhy", LAST_WHY.load(Ordering::Relaxed));
     rec(b"FkWorker", WORKER.load(Ordering::Relaxed));

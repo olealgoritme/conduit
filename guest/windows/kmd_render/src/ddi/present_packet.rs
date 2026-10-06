@@ -221,6 +221,16 @@ impl PresentFlipPrivate {
         Ok(())
     }
 
+    /// Zero a keep record this Present wrote, when the Present then FAILED: a recycled DMA
+    /// private buffer must not replay an old address as kept (see `display::present_flip_kept`).
+    /// Only a keep record is cleared; whatever else the slot holds is left alone.
+    ///
+    /// # Safety
+    /// As [`Self::take_keep`].
+    pub(crate) unsafe fn clear_keep(private_data: *mut c_void, private_size: u32) {
+        let _ = unsafe { Self::take_keep(private_data, private_size) };
+    }
+
     /// Take a keep record at submit time (see [`Self::write_keep`]): the flip's physical address,
     /// or `None` when this DMA buffer carries none. One-shot like [`Self::take`]: the magic is
     /// zeroed, so a recycled buffer cannot replay it.
