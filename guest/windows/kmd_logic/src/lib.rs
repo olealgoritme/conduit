@@ -37,6 +37,7 @@ pub mod rm_sysmem;
 pub mod producer_completion;
 pub mod execution_completion;
 pub mod flush_gate;
+pub mod flush_trace;
 pub mod rm_fence_present;
 pub mod msi;
 pub mod paging;
