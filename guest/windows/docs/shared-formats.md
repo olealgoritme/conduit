@@ -69,8 +69,13 @@ plane 1 (offset, pitch, its own modifier).
 **Plane 1 has its own modifier.** NVK picks the block height per plane from the
 plane's extent, so plane 1 of a 1080p NV12 may use a smaller `h` than plane 0.
 The PTE kind is the same generic colour kind (`0x06`) for every colour format
-on GB20x, so the modifier family stays `0x0300000000606010 | h`. LINEAR planes
-stay LINEAR together.
+on GB20x, but the GOB follows the element size: 1-byte elements use the
+Blackwell 8-bit GOB and 2-byte elements the 16-bit one, named in the
+modifier's sector-layout field (bits 22 and 26..27). So the modifier is
+`0x0300000000606010 | h` for 4- and 8-byte elements,
+`0x0300000004206010 | h` for 1-byte and `0x0300000004606010 | h` for 2-byte
+ones, chosen per plane (NV12: plane 0 has 1-byte elements, plane 1 2-byte
+ones). LINEAR planes stay LINEAR together.
 
 **Single-plane formats need no new bytes.** They fit today's 32-byte layout
 and the 128-byte private data unchanged; only the KMD's fourcc check and stride
@@ -138,9 +143,14 @@ Files and rules, exactly:
      `stride_p >= ShareFormat::row_bytes(p, width)`,
      `stride_p % ShareFormat::stride_align(p) == 0` (1, 2 or 4),
      `stride_p <= MAX_STRIDE`, else `LayoutError::Stride`.
-   * `modifier_p` is `MOD_LINEAR` or `MOD_NVIDIA_BLOCK_LINEAR_BASE | h`,
-     `h <= 5`; plane 1 is LINEAR iff plane 0 is; else `LayoutError::Modifier`.
-     `h` may differ between the planes.
+   * `modifier_p` is `MOD_LINEAR` or `gb20x_family(element_bytes_p) | h`,
+     `h <= 5` (`helios_protocol::gb20x_family`: 1-byte elements
+     `0x0300000004206010`, 2-byte `0x0300000004606010`, 4/8-byte
+     `0x0300000000606010`; element bytes = `bpp0` / `bpp1`, YUYV 4). GB20x
+     picks the GOB by element size and the modifier names it in its
+     sector-layout field (bits 22, 26..27). Plane 1 is LINEAR iff plane 0 is;
+     else `LayoutError::Modifier`. `h` and the family may differ between the
+     planes (NV12: plane 0 8BPP, plane 1 16BPP).
    * `min_bytes_p = offset_p + stride_p * rows_p`, rows rounded up to the plane's
      own block (`8 << h_p`) when block-linear.
    * `plane1.is_some() == (planes == 2)`, else a new `LayoutError::Planes`.
@@ -226,6 +236,25 @@ What was built, as three layers; everything is in `guest/windows`, nothing in th
   the protocol crate, so `kmd_render` pins the two with a const assertion over every fourcc of the
   table and its neighbours, `escape_foreign.rs`), `LayoutError::Format` / `Planes` (appended),
   per-plane stride / modifier / extent rules exactly as section 5, `FLAG_PLANE1`.
+* The modifier rule, per plane (`plane_modifier_ok`): LINEAR, or `gb20x_family(element bytes of
+  that plane) | h` with `h` in 0..=5, and nothing else. `kmd_logic` keeps its own copies of
+  `MOD_NVIDIA_BLOCK_LINEAR_BASE` (4 and 8 byte elements), `_BASE_8BPP` (`0x0300000004206010`) and
+  `_BASE_16BPP` (`0x0300000004606010`) and of `gb20x_family`; `kmd_render` pins all of them (and
+  `gb20x_family` for every element size 0..=64 and `u32::MAX`) to the protocol's
+  `MOD_NVIDIA_BL_GB20X*` / `gb20x_family` with a const assertion next to the table one
+  (`gb20x_families_agree`, `escape_foreign.rs`). Per format: the four 32-bit RGB formats, GR1616,
+  ABGR2101010, both fp16 formats and YUYV take BASE; R8 the 8BPP family; GR88, R16, RGB565,
+  ARGB1555 and ARGB4444 the 16BPP family; NV12 plane 0 8BPP and plane 1 16BPP; P010 / P016 plane 0
+  16BPP and plane 1 BASE. A modifier of any other family is `LayoutError::Modifier`, whatever its `h`
+  (a 32 bpp record with the 8BPP or 16BPP family never becomes a record, so ForeignFlip, foreign copy,
+  `rm_blt`, `foreign_scanout` and level 5 keep seeing only `BASE | h` or LINEAR on 32 bpp). Which
+  plane failed is not reported: one error, one counter (`FgRefMod`).
+* The size lower bound rounds rows to `8 << h` in every family. This assumes that the Blackwell
+  8-bit and 16-bit GOBs differ from the desktop GOB only in the sector layout (the order of the
+  sectors inside the GOB, which is what bits 22 and 26..27 name), so a block still spans `8 << h`
+  rows. Nothing here measured it. If a family's GOB were taller the bound would be too low, not too
+  high, so no valid layout is refused because of it; the host's image-versus-object size check
+  remains the real guard (`min_bytes() <= size` is a lower bound already, section 5).
   `min_bytes` is the larger of the two planes' bounds and **saturates**: an unvalidated layout with
   `u32::MAX` stride and height can no longer wrap `stride * rows`.
 * The choices section 5 left open: plane 1 starting inside plane 0 is `LayoutError::TooLarge` (as
@@ -234,7 +263,14 @@ What was built, as three layers; everything is in `guest/windows`, nothing in th
   `RequestError::Flags`, while a two-plane fourcc without the flag, or a one-plane fourcc with it, is
   `Layout(Planes)`; `FLAG_PLANE1` without `FLAG_LAYOUT` is `LayoutRequired`; a 120-byte request in a
   shorter buffer is `BAD_RANGE` (counted), not an escape failure. The 32-bit RGB check is unchanged:
-  the new code is pinned against a verbatim copy of the old rules over a 215 000 point grid.
+  the new code is pinned against a verbatim copy of the old rules over a grid of 344 064 points
+  (it was 215 000 before the 8BPP / 16BPP family values joined the modifier axis: the old rules
+  refuse them, and so does the new code for a 32 bpp format). The family rule has its own tests
+  (`shared_format_tests`): the constants and their sector-layout bits, a hand-written family per
+  format, every format x every modifier candidate (LINEAR, each family x `h` 0..=7, the values
+  around them, mixed sector bits) on plane 0 and, for NV12 / P010 / P016, on plane 1 as well
+  (accepted exactly when each plane matches its own family and LINEAR goes with LINEAR), the named
+  NV12 / P010 / R8 / GR88 / 4-and-8-byte cases, and the `FgRefMod` counts.
 * Adoption: `AdoptRequest::plane_room` (private data of 144 bytes or more) and
   `AdoptRefusal::NoPlaneRoom` (code 12, appended; `FgAdRf` shows it). `trailer_bytes(layout)` is
   128 or 144.
@@ -292,6 +328,7 @@ column.
 | `FgRefFmt` | requests refused for a fourcc outside the table | `FgRefR` |
 | `FgRefPln` | requests refused because the plane tail and the format disagree (also a 120-byte request in a short buffer) | `FgRefR` |
 | `FgRefNewG` | requests for a known shared format refused for geometry: odd extent, stride, modifier, overlap, size | `FgRefR` |
+| `FgRefMod` | requests refused for a modifier: not LINEAR and not the plane's own family `\| h` (`h <= 5`), or a LINEAR plane with a block-linear one. Any format, the four 32-bit ones included, so for a shared format it is also in `FgRefNewG` | `FgRefR` |
 | `FgAdoNoPln` | two-plane adoptions refused for private data under 144 bytes | `FgRefA` (and `FgAdRf` = 12) |
 | `FgTrl2W` | version-2 trailers written, at create and at every open | |
 | `FgTrl2NoRm` | version-2 writes that found the buffer short (wrote nothing) | |
