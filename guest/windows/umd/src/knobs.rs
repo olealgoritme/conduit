@@ -399,7 +399,22 @@ pub(crate) fn nvk_scanout_compose_every() -> u32 {
         std::env::var("HELIOS_NVK_SCANOUT_COMPOSE_EVERY")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or_else(|| NVK_SCANOUT_COMPOSE_EVERY.get())
+            .or_else(|| helios_umd_common::knobs::reg_dword(c"NvkScanoutComposeEvery"))
+            .unwrap_or_else(|| {
+                // A WDDM 2.x D3D11 device must hand every frame to the runtime:
+                // d3d11!NDXGI::CDevice::PresentImpl throttles flip-model presents
+                // on its frame-latency semaphore (2 s timeout per Present), which
+                // is only released through the per-frame WDDM present. Skipping
+                // it after the NVK scanout flip (the 470a978 default) made FFXIV
+                // run at ~0.3 fps under HELIOS_UMD_DDI=2.3. Until the KMD can
+                // retire a "shown on scanout, nothing to copy" present cheaply,
+                // 2.3 processes pay the per-frame present (WDDM 1.3 keeps 0).
+                if crate::ddi_level::ddi_level() == crate::ddi_level::DdiLevel::Wddm2_3 {
+                    1
+                } else {
+                    NVK_SCANOUT_COMPOSE_EVERY.get()
+                }
+            })
     })
 }
 
