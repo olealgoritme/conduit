@@ -305,6 +305,21 @@ pub const fn verdict(ddi: u32, status: i32) -> Verdict {
                 Verdict::Fatal
             }
         }
+        // A callback's refusal is not the KMD answering dxgkrnl, so it can never be the
+        // "driver answered a status it must not" record. A removed-class status is still fatal.
+        // `STATUS_DEVICE_NOT_READY` from the DMA notify is the ordinary shutdown / refused-sync
+        // outcome (no `DxgkCbSynchronizeExecution`, or it returned FALSE) and is expected; anything
+        // else a callback says, `STATUS_GRAPHICS_*` from the hot-plug indication included, is
+        // suspect at most.
+        Family::Callback => {
+            if is_removed_class(status) {
+                Verdict::Fatal
+            } else if ddi == self::ddi::CB_NOTIFY_DMA && status == STATUS_DEVICE_NOT_READY {
+                Verdict::Expected
+            } else {
+                Verdict::Suspect
+            }
+        }
         fam => {
             if is_expected(ddi, status) && !is_removed_class(status) {
                 return Verdict::Expected;
@@ -323,6 +338,14 @@ pub const fn verdict(ddi: u32, status: i32) -> Verdict {
             }
         }
     }
+}
+
+/// Whether a non-success return belongs in the failure ring (`Dd*`). The refusal family of the
+/// query DDIs (`QueryAdapterInfo` asked for a type this driver does not know, `ControlInterrupt`
+/// for one it does not implement) is routine and would push the entries that matter out of a
+/// 16-slot ring; it is dropped unless it is not in the DDI's expected set.
+pub const fn ring_worthy(ddi: u32, status: i32) -> bool {
+    status != STATUS_SUCCESS && !(matches!(family(ddi), Family::Query) && is_expected(ddi, status))
 }
 
 /// `ddi` in the top byte, a 24-bit hint below it.
@@ -896,7 +919,6 @@ mod tests {
             ddi::CREATE_DEVICE,
             ddi::DESTROY_DEVICE,
             ddi::SET_POWER_STATE,
-            ddi::CB_INDICATE_CHILD,
             ddi::RENDER,
             ddi::OPEN_ALLOCATION,
         ] {
@@ -939,6 +961,55 @@ mod tests {
             verdict(ddi::QUERY_ADAPTER_INFO, STATUS_NOT_SUPPORTED),
             Verdict::Expected
         );
+    }
+
+    #[test]
+    fn callback_outcomes_never_set_the_first_fatal_record() {
+        let graphics = 0xC01E_0300u32 as i32;
+        // The shutdown / refused-sync outcome of the DMA notify: expected, not even suspect.
+        assert_eq!(
+            verdict(ddi::CB_NOTIFY_DMA, STATUS_DEVICE_NOT_READY),
+            Verdict::Expected
+        );
+        // Anything else a callback says is suspect at most...
+        for st in [graphics, STATUS_INVALID_PARAMETER, STATUS_UNSUCCESSFUL, STATUS_NO_MEMORY] {
+            assert_eq!(verdict(ddi::CB_NOTIFY_DMA, st), Verdict::Suspect, "{st:#x}");
+            assert_eq!(verdict(ddi::CB_INDICATE_CHILD, st), Verdict::Suspect, "{st:#x}");
+        }
+        assert_eq!(
+            verdict(ddi::CB_INDICATE_CHILD, STATUS_DEVICE_NOT_READY),
+            Verdict::Suspect
+        );
+        // ...except a removed-class status, which is the one thing worth the sticky record.
+        assert_eq!(
+            verdict(ddi::CB_INDICATE_CHILD, STATUS_DEVICE_REMOVED),
+            Verdict::Fatal
+        );
+        assert_eq!(
+            verdict(ddi::CB_NOTIFY_DMA, STATUS_DEVICE_NOT_CONNECTED),
+            Verdict::Fatal
+        );
+        // None of the harmless ones can be Fatal, whatever the status.
+        for st in [graphics, STATUS_DEVICE_NOT_READY, STATUS_INVALID_PARAMETER] {
+            assert!(verdict(ddi::CB_NOTIFY_DMA, st) < Verdict::Fatal);
+            assert!(verdict(ddi::CB_INDICATE_CHILD, st) < Verdict::Fatal);
+        }
+    }
+
+    #[test]
+    fn expected_query_refusals_stay_out_of_the_failure_ring() {
+        assert!(!ring_worthy(ddi::QUERY_ADAPTER_INFO, STATUS_NOT_SUPPORTED));
+        assert!(!ring_worthy(ddi::CONTROL_INTERRUPT, STATUS_NOT_IMPLEMENTED));
+        assert!(!ring_worthy(ddi::QUERY_ADAPTER_INFO, STATUS_INVALID_PARAMETER));
+        assert!(!ring_worthy(ddi::QUERY_ADAPTER_INFO, STATUS_BUFFER_TOO_SMALL));
+        // A query DDI answering something outside its expected set is still recorded.
+        assert!(ring_worthy(ddi::QUERY_ADAPTER_INFO, STATUS_DEVICE_NOT_READY));
+        assert!(ring_worthy(ddi::CONTROL_INTERRUPT, STATUS_DEVICE_REMOVED));
+        // Success is never a ring entry; every other DDI's failures are.
+        assert!(!ring_worthy(ddi::RENDER, STATUS_SUCCESS));
+        assert!(ring_worthy(ddi::BUILD_PAGING_BUFFER, STATUS_INVALID_PARAMETER));
+        assert!(ring_worthy(ddi::ESCAPE, STATUS_INVALID_PARAMETER));
+        assert!(ring_worthy(ddi::CB_NOTIFY_DMA, STATUS_DEVICE_NOT_READY));
     }
 
     #[test]

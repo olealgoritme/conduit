@@ -114,7 +114,13 @@ pub(crate) fn note_cb(id: u32, status: NTSTATUS, hint: u32) {
 
 fn note_failure(id: u32, status: NTSTATUS, hint: u32, now_ms: u32) {
     let packed = dl::pack_ddi_hint(id, hint);
-    let seq = FAILS.push(status as u32, packed, now_ms);
+    // The routine refusals of the query DDIs stay out of the ring (they would push out the
+    // entries that matter); everything else, expected or not, goes in.
+    let seq = if dl::ring_worthy(id, status) {
+        FAILS.push(status as u32, packed, now_ms)
+    } else {
+        FAILS.count()
+    };
     match dl::verdict(id, status) {
         Verdict::Ok | Verdict::Expected => {}
         Verdict::Suspect => {
@@ -142,7 +148,7 @@ fn note_failure(id: u32, status: NTSTATUS, hint: u32, now_ms: u32) {
 
 // ---- the paging operations ------------------------------------------------------------------
 
-static PG_LAST_OP: AtomicU32 = AtomicU32::new(0);
+static PG_LAST_OP: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
 static PG_LAST_RES: AtomicU32 = AtomicU32::new(0);
 static PG_LAST_AL: AtomicU32 = AtomicU32::new(0);
 static PG_LAST_SZ: AtomicU32 = AtomicU32::new(0);
@@ -401,15 +407,28 @@ fn publish() {
 
     // 1. The sticky first-fatal record.
     rec(b"LostN", FIRST.count());
-    rec(b"LostDdi", FIRST.ddi.load(Ordering::Relaxed));
-    rec(b"LostSt", FIRST.status.load(Ordering::Relaxed));
-    rec(b"LostT", FIRST.t.load(Ordering::Relaxed));
-    rec(b"LostThr", FIRST.thread.load(Ordering::Relaxed));
-    rec(b"LostHint", FIRST.hint.load(Ordering::Relaxed));
-    rec(b"LostIrql", FIRST.irql.load(Ordering::Relaxed));
-    rec(b"LostSeq", FIRST.seq.load(Ordering::Relaxed));
-    rec(b"LostInfL", FIRST.inflight_lo.load(Ordering::Relaxed));
-    rec(b"LostInfH", FIRST.inflight_hi.load(Ordering::Relaxed));
+    // The fields only once the winner finished writing them: a record read mid-write would
+    // mix two events' values. A publish that catches it skips the fields; the next one has them
+    // (`LostN` nonzero with `LostDdi` 0 on that run means "caught mid-write").
+    if FIRST.is_ready() {
+        rec(b"LostDdi", FIRST.ddi.load(Ordering::Relaxed));
+        rec(b"LostSt", FIRST.status.load(Ordering::Relaxed));
+        rec(b"LostT", FIRST.t.load(Ordering::Relaxed));
+        rec(b"LostThr", FIRST.thread.load(Ordering::Relaxed));
+        rec(b"LostHint", FIRST.hint.load(Ordering::Relaxed));
+        rec(b"LostIrql", FIRST.irql.load(Ordering::Relaxed));
+        rec(b"LostSeq", FIRST.seq.load(Ordering::Relaxed));
+        rec(b"LostInfL", FIRST.inflight_lo.load(Ordering::Relaxed));
+        rec(b"LostInfH", FIRST.inflight_hi.load(Ordering::Relaxed));
+    } else if FIRST.count() == 0 {
+        // Nothing fatal yet: zero the fields so a previous boot's record is not read as this one's.
+        for name in [
+            &b"LostDdi"[..], b"LostSt", b"LostT", b"LostThr", b"LostHint", b"LostIrql",
+            b"LostSeq", b"LostInfL", b"LostInfH",
+        ] {
+            rec(name, 0);
+        }
+    }
 
     // 2. The totals, the rings, who is inside a DDI right now, the longest calls.
     rec(b"DdiFailN", FAILS.count());

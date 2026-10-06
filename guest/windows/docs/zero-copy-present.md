@@ -1665,19 +1665,27 @@ and `PgLongUs` small; H2 shows `PgMtxMaxUs` or `PgLongUs` in the seconds only if
 H4 shows nothing in `Pg*` (the paging DDI returns only success) and the answer in `Lost*`.
 
 New (this change; writer `ddi/device_lost.rs`, the pure half `helios_kmd_logic::device_lost`, wrappers `ddi/traced.rs` which
-`lib.rs` wires into the DDI table; the real DDIs are untouched). Atomics at any IRQL; the registry is written at PASSIVE only,
-by `device_lost::publish` from `stall_diag::publish_counters` (the worker's periodic mirror, the escape thread's stuck-only
-publisher, which now also fires when a suspect/fatal status or a slow call appeared, and the StartDevice zero write), from
-`StopDevice` (before its first hive flush), and from `DestroyDevice` / `StopDevice` through `publish_if_dirty`.
+`lib.rs` wires into the DDI table; the real DDIs are untouched; `DxgkDdiStartDevice` is NOT wrapped, it is the frame-size-gated
+nested pair, see `tools/kmd-frame-sizes.ps1`, and its failures are in `StVio` / `InitStg`). Atomics at any IRQL; the registry is
+written at PASSIVE only, through ONE function, `device_lost::publish_block(Trigger)`, which is the only caller of the writer
+(redirect it and the whole block moves to another thread). Three triggers: `Periodic` (`stall_diag::publish_counters`: the worker's
+mirror, the escape thread's stuck-only publisher, which also fires when a suspect/fatal status or a slow call appeared, and the
+StartDevice zero write; the block is written only when a ring moved or 30 s passed since the last write, so it does not ride every
+`REFRESH_POST`), `Stop` (`StopDevice`, before its first hive flush, always) and `Teardown` (the `DestroyDevice` wrapper: only for a
+suspect, fatal or slow event, never because an expected refusal moved a ring, and after the call's duration is taken so the stall is
+already in `Dz*`).
 
 * The sticky first-fatal record, `Lost*` (image lifetime, first wins, never overwritten; `LostN` counts all fatal events):
   `LostN`, `LostDdi` (DDI id, 16.7), `LostSt` (status), `LostT` (interrupt ms), `LostThr` (thread id), `LostHint`, `LostIrql`,
   `LostSeq` (the failure sequence number), `LostInfL` / `LostInfH` (DDIs in flight then, bitmask by id, ids 0 to 31 / 32 to 63). A fatal
   verdict is: a non-success from `BuildPagingBuffer` other than `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER` (so `STATUS_INVALID_PARAMETER`
-  from paging is fatal), any non-success from the scheduler DDIs, a removed-class status from any DDI, a `STATUS_GRAPHICS_*` or
-  `STATUS_DEVICE_NOT_READY` outside the DDI's expected set (`device_lost::verdict`, host-tested; the table is `is_expected`).
+  from paging is fatal), any non-success from the scheduler DDIs, a removed-class status from any DDI or callback, a `STATUS_GRAPHICS_*`
+  or `STATUS_DEVICE_NOT_READY` from a DDI outside its expected set (`device_lost::verdict`, host-tested; the table is `is_expected`).
+  The two callbacks (ids 42, 43) are never fatal for anything but a removed-class status: `STATUS_DEVICE_NOT_READY` from the DMA
+  notify (no `DxgkCbSynchronizeExecution` at shutdown, or a refused sync) is expected, anything else they say is suspect.
 * The DDI failure rings, dynamic names `<stem><kind><two hex digits>`, index 0 newest: stems `Dd` (last 16 non-success returns of any
-  wrapped DDI or the two callbacks), `Dx` (last 8 whose verdict was suspect or fatal), `Dz` (last 8 calls that took 250 ms or more,
+  wrapped DDI or the two callbacks, except the routine refusals of `QueryAdapterInfo` / `ControlInterrupt`, which would push the
+  entries that matter out), `Dx` (last 8 whose verdict was suspect or fatal), `Dz` (last 8 calls that took 250 ms or more,
   5 s for Escape); kinds `S` (status; milliseconds in `Dz`), `D` (DDI id in the top byte, a 24-bit hint below: the handle's low
   bits, the escape code, `uid << 16 | state << 8 | action` for SetPowerState, the interrupt type for ControlInterrupt), `T`
   (interrupt time ms). Totals `DdiFailN`, `DdiSuspN`, `DdiSlowN`; the longest call `DdiLongMs`, `DdiLongId`, `DdiLongT`; who is

@@ -26,11 +26,14 @@ macro_rules! traced {
     ($name:ident, $id:expr, $target:path, ($($arg:ident : $ty:ty),*), $hint:expr) => {
         #[inline(never)]
         pub unsafe extern "C" fn $name($($arg: $ty),*) -> NTSTATUS {
+            // The hint is taken BEFORE the call: the handler owns the buffer afterwards (an escape
+            // writes its reply into it), and the hint must name the request, not the answer.
+            let hint: u32 = $hint;
             let started = dlost::enter($id);
             // SAFETY: the same contract the target DDI documents; the arguments are forwarded
             // unchanged.
             let status = unsafe { $target($($arg),*) };
-            dlost::leave($id, started, status, $hint);
+            dlost::leave($id, started, status, hint);
             status
         }
     };
@@ -40,10 +43,11 @@ macro_rules! traced {
     ($name:ident, $id:expr, $target:path, ($($arg:ident : $ty:ty),*), $hint:expr, publish) => {
         #[inline(never)]
         pub unsafe extern "C" fn $name($($arg: $ty),*) -> NTSTATUS {
+            let hint: u32 = $hint;
             let started = dlost::enter($id);
             // SAFETY: as above.
             let status = unsafe { $target($($arg),*) };
-            dlost::leave($id, started, status, $hint);
+            dlost::leave($id, started, status, hint);
             // Documented PASSIVE_LEVEL.
             dlost::publish_block(dlost::Trigger::Teardown);
             status
