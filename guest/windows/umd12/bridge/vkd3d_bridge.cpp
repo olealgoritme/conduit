@@ -511,6 +511,19 @@ bool HeliosVkd3dDevice::native_optional_caps(std::uint32_t& maximum_feature_leve
       return false;
     maximum_feature_level = SUCCEEDED(extended) ? D3D_FEATURE_LEVEL_12_0 : impl->minimum_feature_level;
     if (FAILED(extended)) {
+      // Venus: vkd3d has no VK_EXT_device_generated_commands there, so FL12 is
+      // not admitted (the engine's "Native FL12 admission requires ..." errors
+      // are these two probes). The device stays usable at the baseline; apps
+      // that ask for FL12 get the runtime's ordinary feature-level refusal.
+      static std::atomic<bool> s_logged{false};
+      if (!s_logged.exchange(true)) {
+        char msg[192];
+        std::snprintf(msg, sizeof(msg),
+                      "native FL12_x not admitted on %s; reporting FL 0x%x (baseline)",
+                      impl->backend == helios_bridge::IcdBackend::NvkRm ? "NVK" : "Venus",
+                      impl->minimum_feature_level);
+        umd_log(msg);
+      }
       // Re-run the baseline so the outputs describe the level reported.
       if (FAILED(helios_vkd3d_validate_native_feature_level(impl->d3d12,
           impl->minimum_feature_level, &shader_model, &raytracing_tier, device_uuid.data())))
