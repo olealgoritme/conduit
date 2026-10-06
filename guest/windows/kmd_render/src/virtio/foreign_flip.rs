@@ -92,7 +92,7 @@ static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
 // allocation: `publish_counters`). `FfProg` allocations taken, of which `FfSame` the same
 // one again, `FfMoved` another of the same device, `FfReowned` of another device; `FfNoRec`
 // programmed with no foreign record (a plain Venus allocation or a placeholder); `FfRef` refused to
-// Venus, `FfWhy` the last reason (`Why::code`), `FfRef01`..`FfRef14` per reason; `FfRegs`
+// Venus, `FfWhy` the last reason (`Why::code`), `FfRef01`..`FfRef15` per reason; `FfRegs`
 // registrations, `FfRegFail` refused registrations, `FfWithdrawn` withdrawals, `FfGaveUp` giving-ups, `FfFrames` flips for an edge,
 // `FfReflips` flips for a resume, `FfYielded` flips that found the source yielded,
 // `FfFlipFail` flips refused, `FfStale` flips refused because the importer's file is no longer
@@ -107,6 +107,7 @@ static NO_REC: AtomicU32 = AtomicU32::new(0);
 static REFUSED: AtomicU32 = AtomicU32::new(0);
 static WHY: AtomicU32 = AtomicU32::new(0);
 static REFUSED_BY: [AtomicU32; Why::COUNT] = [
+    AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),

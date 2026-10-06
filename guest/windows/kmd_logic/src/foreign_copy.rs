@@ -76,7 +76,9 @@ pub const CODE_NO_MEMORY_TYPE: u32 = 10;
 pub enum Refusal {
     /// The record's layout is invalid, or needs more bytes than the resource has.
     Layout(LayoutError),
-    /// A fourcc with no `VkFormat` here.
+    /// A fourcc with no `VkFormat` here: every shared format beyond the four 32-bit
+    /// RGB ones (`docs/shared-formats.md`: the copy is a 32 bpp, one-plane path), and
+    /// any record carrying a plane 1.
     Format,
     /// The layout's extent is not the extent being copied.
     Extent,
@@ -85,7 +87,7 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    /// A small stable code for the registry trace (`FcRefCode`). 1 to 8 are
+    /// A small stable code for the registry trace (`FcRefCode`). 1 to 8 and 11 are
     /// these; [`CODE_UNDERSIZE`] and [`CODE_NO_MEMORY_TYPE`] are the two the Venus
     /// half adds once the host has reported the image's requirements.
     pub const fn code(self) -> u32 {
@@ -98,6 +100,9 @@ impl Refusal {
             Refusal::Format => 6,
             Refusal::Extent => 7,
             Refusal::Size => 8,
+            // Appended: 9 and 10 are the Venus half's ([`CODE_UNDERSIZE`],
+            // [`CODE_NO_MEMORY_TYPE`]).
+            Refusal::Layout(LayoutError::Planes) => 11,
         }
     }
 }
@@ -136,6 +141,11 @@ impl ForeignImage {
             return Err(Refusal::Size);
         }
         layout.validate_for(record_size).map_err(Refusal::Layout)?;
+        // One plane only: `image_spec` describes a single memory plane, so a record
+        // with a plane 1 can never be this path's, whatever its fourcc maps to.
+        if layout.plane1.is_some() {
+            return Err(Refusal::Format);
+        }
         let Some(vk_format) = vk_format_for_fourcc(layout.fourcc) else {
             return Err(Refusal::Format);
         };
@@ -238,6 +248,12 @@ pub struct OpenTrailer {
 /// The foreign layout an opener may carry, from the meta and the trailer of one
 /// allocation's private data; `None` unless every part is consistent.
 ///
+/// `None` as well for every fourcc outside the four this path copies
+/// ([`vk_format_for_fourcc`]), the shared formats beyond them included: the copy
+/// would refuse them anyway, and a hint that names a format it cannot import is no
+/// hint. The trailer here is the version-1 one, so a two-plane record has no
+/// layout from it (its plane 1 is not read).
+///
 /// The trailer's `stride` and `plane_offset` must equal the meta's (that is the
 /// trailer's contract), the allocation must be a device-memory one (the only kind
 /// that adopts a foreign resource), and the layout must pass the same rules a
@@ -265,8 +281,10 @@ pub fn layout_from_open(
         offset: trailer.plane_offset,
         fourcc: trailer.fourcc,
         modifier: trailer.modifier,
+        plane1: None,
     };
     layout.validate().ok()?;
+    vk_format_for_fourcc(layout.fourcc)?;
     Some(layout)
 }
 
@@ -315,10 +333,13 @@ mod tests {
             offset: 0,
             fourcc,
             modifier,
+            plane1: None,
         }
     }
 
     const SIZE_1080P: u64 = 0x7f_0000;
+    /// `DRM_FORMAT_BGR888`: a real fourcc outside the shared table.
+    const UNSHARED_FOURCC: u32 = 0x3432_4742;
 
     /// What RM would allocate for `l`: its lower bound rounded up to 64 KiB.
     fn rm_size(l: &Layout) -> u64 {
@@ -465,7 +486,8 @@ mod tests {
             ForeignImage::from_record(&l, SIZE_1080P, 1920, 1080),
             Err(Refusal::Layout(LayoutError::Stride))
         );
-        let l = layout_1080p(0x3631_4752, MOD_LINEAR);
+        // 'BG24': a real DRM format that is not shared, so no row in the table.
+        let l = layout_1080p(UNSHARED_FOURCC, MOD_LINEAR);
         assert_eq!(
             ForeignImage::from_record(&l, SIZE_1080P, 1920, 1080),
             Err(Refusal::Layout(LayoutError::Format))
@@ -480,6 +502,7 @@ mod tests {
             Refusal::Layout(LayoutError::Stride),
             Refusal::Layout(LayoutError::Modifier),
             Refusal::Layout(LayoutError::TooLarge),
+            Refusal::Layout(LayoutError::Planes),
             Refusal::Format,
             Refusal::Extent,
             Refusal::Size,
@@ -554,6 +577,7 @@ mod tests {
                 offset: 0,
                 fourcc: FOURCC_ARGB8888,
                 modifier: 0x0300_0000_0060_6015,
+                plane1: None,
             })
         );
     }
@@ -581,7 +605,7 @@ mod tests {
         t4.modifier = 0x0100_0000_0000_0001;
         assert_eq!(layout_from_open(true, Some(m), Some(t4)), None);
         let mut t5 = t;
-        t5.fourcc = 0x3631_4752;
+        t5.fourcc = UNSHARED_FOURCC;
         assert_eq!(layout_from_open(true, Some(m), Some(t5)), None);
         let mut m3 = m;
         m3.width = 0;
@@ -788,5 +812,79 @@ mod tests {
             EXT_IMAGE_DRM_FORMAT_MODIFIER,
             b"VK_EXT_image_drm_format_modifier\0"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_format_refusals {
+    use super::*;
+    use crate::foreign_resource::test_formats::{valid_layout, BEYOND_RGB32};
+    use crate::foreign_resource::{Plane, MOD_LINEAR, MOD_NVIDIA_BLOCK_LINEAR_BASE};
+
+    fn size_for(l: &Layout) -> u64 {
+        (l.min_bytes() + 0xfff) & !0xfff
+    }
+
+    #[test]
+    fn no_shared_format_beyond_rgb32_has_a_vk_format() {
+        for f in BEYOND_RGB32 {
+            assert_eq!(vk_format_for_fourcc(f), None, "{f:#x}");
+        }
+        assert_eq!(vk_format_for_fourcc(0), None);
+    }
+
+    #[test]
+    fn the_import_refuses_every_valid_shared_record_and_counts_why() {
+        for f in BEYOND_RGB32 {
+            for m in [MOD_LINEAR, MOD_NVIDIA_BLOCK_LINEAR_BASE | 4] {
+                let l = valid_layout(f, 1920, 1080, m);
+                let size = size_for(&l);
+                assert_eq!(
+                    ForeignImage::from_record(&l, size, 1920, 1080),
+                    Err(Refusal::Format),
+                    "{f:#x} {m:#x}"
+                );
+            }
+        }
+        assert_eq!(Refusal::Format.code(), 6);
+    }
+
+    #[test]
+    fn a_record_with_a_second_plane_is_never_a_copy_source() {
+        // A 32 bpp fourcc with a plane 1 is invalid in the table (`Planes`), and the
+        // copy says so rather than building a single-plane image over two planes.
+        let mut l = valid_layout(FOURCC_ARGB8888, 1920, 1080, MOD_LINEAR);
+        l.plane1 = Some(Plane {
+            stride: 1920,
+            offset: 0x80_0000,
+            modifier: MOD_LINEAR,
+        });
+        assert_eq!(
+            ForeignImage::from_record(&l, 0x100_0000, 1920, 1080),
+            Err(Refusal::Layout(LayoutError::Planes))
+        );
+        assert_eq!(Refusal::Layout(LayoutError::Planes).code(), 11);
+    }
+
+    #[test]
+    fn the_open_time_hint_is_none_for_every_shared_format() {
+        for f in BEYOND_RGB32 {
+            for m in [MOD_LINEAR, MOD_NVIDIA_BLOCK_LINEAR_BASE | 4] {
+                let l = valid_layout(f, 1920, 1080, m);
+                let meta = OpenMeta {
+                    width: 1920,
+                    height: 1080,
+                    pitch: l.stride,
+                    plane_offset: 0,
+                };
+                let tr = OpenTrailer {
+                    modifier: m,
+                    fourcc: f,
+                    stride: l.stride,
+                    plane_offset: 0,
+                };
+                assert_eq!(layout_from_open(true, Some(meta), Some(tr)), None, "{f:#x}");
+            }
+        }
     }
 }

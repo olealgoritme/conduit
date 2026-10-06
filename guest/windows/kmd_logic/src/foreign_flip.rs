@@ -18,7 +18,7 @@
 //!
 //! Everything is a function of its arguments: no wdk, no clock, no atomics.
 
-use crate::foreign_resource::FlipRecord;
+use crate::foreign_resource::{share_format, FlipRecord};
 use crate::foreign_scanout::Layout as FlipLayout;
 use crate::rm_sysmem::flip_layout;
 
@@ -62,10 +62,15 @@ pub enum Why {
     /// The allocation carries `MISC_DIRECT_SCANOUT`: the fast bind of a flip
     /// (`fast_bind_from_flip`) would race the resident source for the same screen.
     DirectScanout,
+    /// The record is a shared format beyond the four 32 bpp RGB ones (`R8`, `YUYV`,
+    /// `NV12`, fp16, ...: `docs/shared-formats.md`) or carries a plane 1. `ScanoutFlip`
+    /// names one 32 bpp plane, so a flip would read the bytes wrong; the Venus path runs.
+    /// Appended as code 15 (the codes before it never move).
+    SharedFormat,
 }
 
 impl Why {
-    pub const COUNT: usize = 14;
+    pub const COUNT: usize = 15;
 
     pub const ALL: [Why; Self::COUNT] = [
         Why::RingLevel,
@@ -82,6 +87,7 @@ impl Why {
         Why::OwnerGone,
         Why::Failing,
         Why::DirectScanout,
+        Why::SharedFormat,
     ];
 
     /// Stable nonzero code, 1 to [`Self::COUNT`].
@@ -101,6 +107,7 @@ impl Why {
             Why::OwnerGone => 12,
             Why::Failing => 13,
             Why::DirectScanout => 14,
+            Why::SharedFormat => 15,
         }
     }
 
@@ -221,6 +228,12 @@ pub fn decide(f: &Facts) -> Verdict {
     }
     if f.direct_scanout {
         return Verdict::Refuse(Why::DirectScanout);
+    }
+    // A shared format beyond 32 bpp RGB, or a record with a second plane, is a real record
+    // this arm cannot show: refused by its own reason before `flip_layout` (which has no
+    // plane 1 and would drop it) is asked anything.
+    if !rec.layout.is_rgb32() && share_format(rec.layout.fourcc).is_some() {
+        return Verdict::Refuse(Why::SharedFormat);
     }
     let layout = flip_layout(&rec.layout);
     if layout.validate().is_err() {
@@ -378,7 +391,7 @@ pub const COUNTERS: [&str; 22] = [
     "FfRegFail",
 ];
 
-/// Name of the per-reason refusal counter: `FfRef01` .. `FfRef14`.
+/// Name of the per-reason refusal counter: `FfRef01` .. `FfRef15`.
 pub const fn ref_name(why: Why) -> [u8; 7] {
     let c = why.code();
     [
@@ -418,6 +431,7 @@ mod tests {
             offset: 0,
             fourcc: FOURCC_XRGB8888,
             modifier: 0x0300_0000_0060_6015,
+            plane1: None,
         }
     }
 
@@ -557,10 +571,19 @@ mod tests {
                 Verdict::Refuse(Why::BadLayout),
             ),
             (
-                "layout missing: a format the host flip does not carry",
+                "a shared format the host flip does not carry (NV12)",
                 |f| {
                     let mut r = rec();
                     r.layout.fourcc = 0x3231_564e;
+                    f.record = Some(r);
+                },
+                Verdict::Refuse(Why::SharedFormat),
+            ),
+            (
+                "layout missing: a fourcc nobody shares ('BG24')",
+                |f| {
+                    let mut r = rec();
+                    r.layout.fourcc = 0x3432_4742;
                     f.record = Some(r);
                 },
                 Verdict::Refuse(Why::BadLayout),
@@ -1138,6 +1161,7 @@ mod tests {
             claimed_alloc_size: 0,
             supplied_layout: Some(lay()),
             trailer_room: true,
+            plane_room: true,
         };
         assert!(t.adopt_for_allocation(50, &req, true, true).is_ok());
         let r = t.flip_record(50).unwrap();
@@ -1234,5 +1258,100 @@ mod tests {
         let mut listed: Vec<std::string::String> = COUNTERS.iter().map(|s| (*s).into()).collect();
         listed.sort();
         assert_eq!(written, listed);
+    }
+
+    // ---- shared formats (docs/shared-formats.md) --------------------------------------
+
+    #[test]
+    fn every_shared_format_beyond_rgb32_is_refused_with_its_own_reason() {
+        use crate::foreign_resource::test_formats::{valid_layout, BEYOND_RGB32};
+        for fourcc in BEYOND_RGB32 {
+            for modifier in [0, 0x0300_0000_0060_6015] {
+                let mut f = facts();
+                let mut r = rec();
+                r.layout = valid_layout(fourcc, 1920, 1080, modifier);
+                f.record = Some(r);
+                assert_eq!(
+                    decide(&f),
+                    Verdict::Refuse(Why::SharedFormat),
+                    "{fourcc:#x} modifier {modifier:#x}"
+                );
+                // The record's life, the environment and the flags come first; the
+                // extent comes after (a format the arm cannot show is that, whatever
+                // the mode).
+                let mut g = f;
+                g.mode = (1, 1);
+                assert_eq!(decide(&g), Verdict::Refuse(Why::SharedFormat));
+                let mut g = f;
+                g.failing = true;
+                assert_eq!(decide(&g), Verdict::Refuse(Why::Failing));
+                let mut g = f;
+                g.direct_scanout = true;
+                assert_eq!(decide(&g), Verdict::Refuse(Why::DirectScanout));
+                let mut g = f;
+                g.record.as_mut().unwrap().destroyed = true;
+                assert_eq!(decide(&g), Verdict::Refuse(Why::Destroyed));
+            }
+        }
+    }
+
+    #[test]
+    fn a_second_plane_is_never_dropped_by_the_flip_layout() {
+        // A 32 bpp fourcc with a plane 1 cannot be recorded (the table refuses it), but if
+        // one ever were, the flip must not silently reduce it to its plane 0.
+        let mut f = facts();
+        let mut r = rec();
+        r.layout.plane1 = crate::foreign_resource::Plane {
+            stride: 1920,
+            offset: 0x80_0000,
+            modifier: 0,
+        }
+        .into();
+        f.record = Some(r);
+        assert_eq!(decide(&f), Verdict::Refuse(Why::SharedFormat));
+    }
+
+    #[test]
+    fn the_four_32_bpp_formats_are_still_taken() {
+        use crate::foreign_resource::{FOURCC_ABGR8888, FOURCC_ARGB8888, FOURCC_XBGR8888};
+        for fourcc in [
+            FOURCC_XRGB8888,
+            FOURCC_ARGB8888,
+            FOURCC_XBGR8888,
+            FOURCC_ABGR8888,
+        ] {
+            let mut f = facts();
+            let mut r = rec();
+            r.layout.fourcc = fourcc;
+            f.record = Some(r);
+            assert!(matches!(decide(&f), Verdict::Take(_)), "{fourcc:#x}");
+        }
+    }
+
+    #[test]
+    fn the_shared_format_reason_is_appended_not_renumbered() {
+        assert_eq!(Why::SharedFormat.code(), 15);
+        assert_eq!(Why::COUNT, 15);
+        assert_eq!(&ref_name(Why::SharedFormat), b"FfRef15");
+        // Every code before it is where it was.
+        let before: [(Why, u32); 14] = [
+            (Why::RingLevel, 1),
+            (Why::LevelUnread, 2),
+            (Why::NoTransport, 3),
+            (Why::NoDisplay, 4),
+            (Why::HostCap, 5),
+            (Why::NotAdopted, 6),
+            (Why::Destroyed, 7),
+            (Why::FileClosed, 8),
+            (Why::KmdOwned, 9),
+            (Why::BadLayout, 10),
+            (Why::Extent, 11),
+            (Why::OwnerGone, 12),
+            (Why::Failing, 13),
+            (Why::DirectScanout, 14),
+        ];
+        for (w, c) in before {
+            assert_eq!(w.code(), c);
+        }
     }
 }

@@ -17,14 +17,18 @@ use helios_kmd_logic::foreign_resource::{
     MAX_FOREIGN_TOTAL,
 };
 use helios_protocol::{
-    HeliosEscapeHeader, HeliosForeignHeader, HeliosForeignImportRm, HeliosForeignImportRmLayout,
-    HeliosForeignLayout, HeliosForeignQueryCaps, HELIOS_FOREIGN_ABI_VERSION,
-    HELIOS_FOREIGN_CAP_RM_IMPORT, HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT,
-    HELIOS_FOREIGN_CAP_SHARED_OPEN, HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT, HELIOS_FOREIGN_OP_IMPORT_RM,
-    HELIOS_FOREIGN_OP_QUERY_CAPS, HELIOS_FOREIGN_OP_RM_RESOURCE_IMPORT,
+    share_format, HeliosEscapeHeader, HeliosForeignHeader, HeliosForeignImportRm,
+    HeliosForeignImportRmLayout, HeliosForeignImportRmPlanes, HeliosForeignLayout,
+    HeliosForeignPlane, HeliosForeignQueryCaps, HELIOS_FOREIGN_ABI_VERSION,
+    HELIOS_FOREIGN_CAP_LAYOUT_FORMATS, HELIOS_FOREIGN_CAP_RM_IMPORT,
+    HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT, HELIOS_FOREIGN_CAP_SHARED_OPEN,
+    HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT, HELIOS_FOREIGN_IMPORT_FLAG_PLANE1,
+    HELIOS_FOREIGN_IMPORT_RM_PLANES_BYTES, HELIOS_FOREIGN_OP_IMPORT_RM,
+    HELIOS_FOREIGN_OP_QUERY_CAPS, HELIOS_FOREIGN_OP_RM_RESOURCE_IMPORT, HELIOS_FOREIGN_PLANE_BYTES,
     HELIOS_FOREIGN_ST_BAD_CONTEXT, HELIOS_FOREIGN_ST_BAD_RANGE, HELIOS_FOREIGN_ST_DEVICE_ERROR,
     HELIOS_FOREIGN_ST_NOT_OWNED, HELIOS_FOREIGN_ST_NO_RESOURCES, HELIOS_FOREIGN_ST_OK,
-    HELIOS_FOREIGN_ST_UNSUPPORTED,
+    HELIOS_FOREIGN_ST_UNSUPPORTED, HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES,
+    HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES,
 };
 
 use crate::adapter::AdapterContext;
@@ -36,6 +40,81 @@ use crate::virtio::gpu::DeviceOwner;
 // kmd_logic has no dependency edge to helios_protocol; this pins its copy of the
 // layout flag to the wire's.
 const _: () = assert!(fr::FLAG_LAYOUT == HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT);
+const _: () = assert!(fr::FLAG_PLANE1 == HELIOS_FOREIGN_IMPORT_FLAG_PLANE1);
+// The plane tail is the 16 bytes after the 104-byte layout request, and the request that
+// carries it is the 120-byte form (`HeliosForeignImportRmPlanes`).
+const _: () = assert!(size_of::<HeliosForeignPlane>() == HELIOS_FOREIGN_PLANE_BYTES);
+const _: () =
+    assert!(size_of::<HeliosForeignImportRmPlanes>() == HELIOS_FOREIGN_IMPORT_RM_PLANES_BYTES);
+const _: () = assert!(
+    size_of::<HeliosForeignImportRmPlanes>()
+        == size_of::<HeliosForeignImportRmLayout>() + size_of::<HeliosForeignPlane>()
+);
+// The private-data sizes `kmd_logic` states as plain numbers are the protocol's.
+const _: () = assert!(fr::PRIVATE_WITH_LAYOUT_BYTES == HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES);
+const _: () = assert!(fr::PRIVATE_WITH_PLANES_BYTES == HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES);
+
+/// `kmd_logic` carries its own copy of the shared-format table (it has no dependency edge to
+/// the protocol crate): every fourcc of the protocol's table, and the neighbours that must
+/// stay out, give the same row in both. A drift in either fails the driver build here.
+const fn share_tables_agree() -> bool {
+    use helios_protocol::{
+        DRM_FORMAT_ABGR16161616, DRM_FORMAT_ABGR16161616F, DRM_FORMAT_ABGR2101010,
+        DRM_FORMAT_ABGR8888, DRM_FORMAT_ARGB1555, DRM_FORMAT_ARGB4444, DRM_FORMAT_ARGB8888,
+        DRM_FORMAT_GR1616, DRM_FORMAT_GR88, DRM_FORMAT_NV12, DRM_FORMAT_P010, DRM_FORMAT_P016,
+        DRM_FORMAT_R16, DRM_FORMAT_R8, DRM_FORMAT_RGB565, DRM_FORMAT_XBGR8888, DRM_FORMAT_XRGB8888,
+        DRM_FORMAT_YUYV,
+    };
+    const FOURCCS: [u32; 24] = [
+        DRM_FORMAT_XRGB8888,
+        DRM_FORMAT_ARGB8888,
+        DRM_FORMAT_XBGR8888,
+        DRM_FORMAT_ABGR8888,
+        DRM_FORMAT_R8,
+        DRM_FORMAT_GR88,
+        DRM_FORMAT_R16,
+        DRM_FORMAT_GR1616,
+        DRM_FORMAT_RGB565,
+        DRM_FORMAT_ARGB1555,
+        DRM_FORMAT_ARGB4444,
+        DRM_FORMAT_ABGR2101010,
+        DRM_FORMAT_ABGR16161616F,
+        DRM_FORMAT_ABGR16161616,
+        DRM_FORMAT_YUYV,
+        DRM_FORMAT_NV12,
+        DRM_FORMAT_P010,
+        DRM_FORMAT_P016,
+        // Not shared: zero, 'BG24', 'XR30', 'YV12', and the neighbours of NV12 / P010.
+        0,
+        0x3432_4742,
+        0x3033_5258,
+        0x3231_5659,
+        DRM_FORMAT_NV12 + 1,
+        DRM_FORMAT_P010 - 1,
+    ];
+    let mut i = 0;
+    while i < FOURCCS.len() {
+        let c = FOURCCS[i];
+        let same = match (share_format(c), fr::share_format(c)) {
+            (None, None) => true,
+            (Some(p), Some(k)) => {
+                p.planes == k.planes
+                    && p.bpp0 == k.bpp0
+                    && p.bpp1 == k.bpp1
+                    && p.hdiv0 == k.hdiv0
+                    && p.even_width == k.even_width
+                    && p.even_height == k.even_height
+            }
+            _ => false,
+        };
+        if !same {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+const _: () = assert!(share_tables_agree());
 
 /// Escapes of this verb, for the registry-write throttle.
 static CALLS: AtomicU32 = AtomicU32::new(0);
@@ -131,6 +210,13 @@ fn query_caps(
             HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT
         } else {
             0
+        }
+        // The shared formats ride on the same gate as `IMPORT_RM` itself: the table, the plane
+        // tail and the version-2 trailer are KMD-only, and a client can only use them to mint ids.
+        | if foreign::rm_import_served(adapter) {
+            HELIOS_FOREIGN_CAP_LAYOUT_FORMATS
+        } else {
+            0
         };
     // The limits are constants; the occupancy is a table read. With no
     // transport the occupancy reads zero, as the NVRM caps do.
@@ -179,12 +265,37 @@ fn import_rm(
     // fails as any short buffer does. A request without the flag has no layout
     // and is refused `BAD_RANGE` by `validate_request` (the layout is mandatory;
     // the refusal is counted there). Only the 72-byte base is ever written back.
-    let layout = if req.flags & HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT != 0 {
+    //
+    // With `FLAG_PLANE1` (and the layout flag) the request is the 120-byte
+    // `HeliosForeignImportRmPlanes`: plane 1 of a two-plane format follows the layout. A
+    // buffer shorter than that, declared or supplied, is refused `BAD_RANGE` (the 72-byte
+    // base is there to carry the verdict) and counted as a plane fault, not an escape
+    // failure. `PLANE1` alone has no layout to hang the plane on: it falls through to
+    // `validate_request`, which answers `LayoutRequired`.
+    let wants_planes = req.flags & HELIOS_FOREIGN_IMPORT_FLAG_PLANE1 != 0
+        && req.flags & HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT != 0;
+    if wants_planes
+        && (buf.len() < HELIOS_FOREIGN_IMPORT_RM_PLANES_BYTES
+            || (hdr.size as usize) < HELIOS_FOREIGN_IMPORT_RM_PLANES_BYTES)
+    {
+        let _ = adapter.with_virtio(|v| {
+            v.foreign_note_request_refusal(fr::RequestError::Layout(fr::LayoutError::Planes), None)
+        });
+        req.head.status = HELIOS_FOREIGN_ST_BAD_RANGE;
+        return write_back(buf, &req);
+    }
+    let layout = if wants_planes {
+        let ext: HeliosForeignImportRmPlanes = match bind(buf, hdr) {
+            Ok(e) => e,
+            Err(st) => return st,
+        };
+        layout_from_wire(&ext.base.layout, Some(&ext.plane1))
+    } else if req.flags & HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT != 0 {
         let ext: HeliosForeignImportRmLayout = match bind(buf, hdr) {
             Ok(e) => e,
             Err(st) => return st,
         };
-        layout_from_wire(&ext.layout)
+        layout_from_wire(&ext.layout, None)
     } else {
         None
     };
@@ -236,7 +347,10 @@ fn import_rm(
 /// The wire layout as the pure type. `None` when `reserved` is not zero (a field
 /// this KMD does not know): the request then reads as having no layout and is
 /// refused `BAD_RANGE`, like any unknown bit.
-fn layout_from_wire(w: &HeliosForeignLayout) -> Option<fr::Layout> {
+fn layout_from_wire(
+    w: &HeliosForeignLayout,
+    plane1: Option<&HeliosForeignPlane>,
+) -> Option<fr::Layout> {
     if w.reserved != 0 {
         return None;
     }
@@ -247,5 +361,12 @@ fn layout_from_wire(w: &HeliosForeignLayout) -> Option<fr::Layout> {
         offset: w.offset,
         fourcc: w.fourcc,
         modifier: w.modifier,
+        // Present exactly when the request carried the plane tail; whether the fourcc has a
+        // plane 1 is `Layout::validate`'s to say (`Planes`).
+        plane1: plane1.map(|p| fr::Plane {
+            stride: p.stride,
+            offset: p.offset,
+            modifier: p.modifier,
+        }),
     })
 }

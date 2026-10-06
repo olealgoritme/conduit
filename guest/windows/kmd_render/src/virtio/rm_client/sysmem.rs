@@ -615,6 +615,7 @@ fn build_steps(
         // trailer is written where the buffer has room (the open path says so when it
         // has none: `FgOpNoRm`).
         trailer_room: true,
+        plane_room: true,
     };
     let adopted = io
         .adapter

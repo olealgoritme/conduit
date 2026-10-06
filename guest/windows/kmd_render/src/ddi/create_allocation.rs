@@ -18,16 +18,17 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bytemuck::{bytes_of, pod_read_unaligned, Zeroable};
 use helios_protocol::{
-    HeliosWddmAllocLayout, HeliosWddmAllocMeta, HeliosWddmAllocPrivate, HeliosWddmOpenIdentity,
-    HELIOS_BLOB_MEM_RM_EXPORT, HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+    HeliosWddmAllocLayout, HeliosWddmAllocMeta, HeliosWddmAllocPlane, HeliosWddmAllocPrivate,
+    HeliosWddmOpenIdentity, HELIOS_BLOB_MEM_RM_EXPORT, HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
     HELIOS_WDDM_ALLOC_KIND_STANDARD, HELIOS_WDDM_ALLOC_KIND_TRACKING,
     HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT, HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK,
     HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT, HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE,
     HELIOS_WDDM_ALLOC_MISC_PRIMARY, HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED,
     HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK, HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT,
     HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER, HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING,
-    HELIOS_WDDM_LAYOUT_OFFSET, HELIOS_WDDM_OPEN_FLAG_FOREIGN,
-    HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+    HELIOS_WDDM_LAYOUT_OFFSET, HELIOS_WDDM_LAYOUT_PLANE1_OFFSET, HELIOS_WDDM_LAYOUT_VERSION_PLANES,
+    HELIOS_WDDM_OPEN_FLAG_FOREIGN, HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES,
+    HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
     VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_WC,
 };
 
@@ -1732,51 +1733,94 @@ unsafe fn read_standard_meta(
     Some(pod_read_unaligned(&raw))
 }
 
+/// A layout trailer read from a private-data buffer: the 32-byte [`HeliosWddmAllocLayout`] and,
+/// for a version-2 (two-plane) record, [`HeliosWddmAllocPlane`] after it.
+#[derive(Clone, Copy)]
+struct ReadTrailer {
+    layout: HeliosWddmAllocLayout,
+    plane1: Option<HeliosWddmAllocPlane>,
+}
+
 /// The creator's optional [`HeliosWddmAllocLayout`] trailer (foreign adoption
 /// only). `None` when the buffer cannot hold it or the record is not a valid
 /// one: absent and malformed read alike, and the adoption then simply has no
 /// supplied layout to compare (the recorded one is what counts).
-unsafe fn read_layout_trailer(
-    private: *const c_void,
-    private_size: UINT,
-) -> Option<HeliosWddmAllocLayout> {
+///
+/// A version-1 record is the 32 bytes at [`HELIOS_WDDM_LAYOUT_OFFSET`], as always. A version-2
+/// record (`HELIOS_WDDM_LAYOUT_VERSION_PLANES`, plane count 2) also needs plane 1 after it
+/// ([`HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES`] in all); in a buffer too short for that it reads
+/// as no trailer, like any other malformed one (the adoption of a two-plane record then fails on
+/// its own room check, not on a half-read plane).
+unsafe fn read_layout_trailer(private: *const c_void, private_size: UINT) -> Option<ReadTrailer> {
     if private.is_null() || (private_size as usize) < HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES {
         return None;
     }
-    // SAFETY: the length check above proves HELIOS_WDDM_LAYOUT_OFFSET + 32 bytes
-    // exist at `private`; read unaligned like every other private-data read.
+    // SAFETY: the length check above proves at least HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES
+    // bytes exist at `private`, and the slice is no longer than `private_size`; read unaligned
+    // like every other private-data read.
     let bytes = unsafe {
         core::slice::from_raw_parts(
-            (private as *const u8).add(HELIOS_WDDM_LAYOUT_OFFSET),
-            size_of::<HeliosWddmAllocLayout>(),
+            private as *const u8,
+            (private_size as usize).min(HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES),
         )
     };
-    let layout: HeliosWddmAllocLayout = pod_read_unaligned(bytes);
-    layout.is_valid().then_some(layout)
+    if let Some(layout) = HeliosWddmAllocLayout::read_open(bytes) {
+        return Some(ReadTrailer {
+            layout,
+            plane1: None,
+        });
+    }
+    let (layout, plane1) = HeliosWddmAllocLayout::read_open_planes(bytes)?;
+    crate::virtio::foreign::TRAILER_V2_READ.fetch_add(1, Ordering::Relaxed);
+    Some(ReadTrailer {
+        layout,
+        plane1: Some(plane1),
+    })
 }
 
+/// The plane count a version-2 trailer carries in `HeliosWddmAllocLayout::reserved`.
+const TRAILER_V2_PLANE_COUNT: u32 = 2;
+
 /// Write the KMD's recorded layout over the [`HeliosWddmAllocLayout`] trailer of a
-/// per-allocation private-data buffer. Returns whether the buffer had room (at
-/// least [`HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES`]); nothing is written if not.
+/// per-allocation private-data buffer. Returns whether the buffer had room
+/// ([`fr::trailer_bytes`]: [`HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES`] for a one-plane record,
+/// [`HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES`] for a two-plane one); NOTHING is written if not
+/// (a version-2 header with no plane 1 behind it would read as a record with a plane that is
+/// not there).
 /// Called at create time (so the creator and later openers read the KMD-validated
 /// record, not what the creator wrote) and again at every open of a foreign
 /// allocation (so an opener never reads anything but the KMD's table).
+///
+/// A one-plane record, whatever its format, is written as version 1 with `reserved` 0, exactly
+/// as before the shared formats. A two-plane record is version 2 (`reserved` = the plane
+/// count) with plane 1 at [`HELIOS_WDDM_LAYOUT_PLANE1_OFFSET`]; a version-1 reader refuses it.
 unsafe fn write_foreign_layout_trailer(
     private: *mut c_void,
     private_size: UINT,
     layout: &fr::Layout,
 ) -> bool {
-    if private.is_null() || (private_size as usize) < HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES {
+    if private.is_null() || (private_size as usize) < fr::trailer_bytes(layout) {
+        if layout.plane1.is_some() {
+            crate::virtio::foreign::TRAILER_V2_NO_ROOM.fetch_add(1, Ordering::Relaxed);
+        }
         return false;
     }
     let trailer = HeliosWddmAllocLayout {
         modifier: layout.modifier,
         magic: helios_protocol::HELIOS_WDDM_LAYOUT_MAGIC,
-        version: helios_protocol::HELIOS_WDDM_LAYOUT_VERSION,
+        version: if layout.plane1.is_some() {
+            HELIOS_WDDM_LAYOUT_VERSION_PLANES
+        } else {
+            helios_protocol::HELIOS_WDDM_LAYOUT_VERSION
+        },
         fourcc: layout.fourcc,
         stride: layout.stride,
         plane_offset: layout.offset,
-        reserved: 0,
+        reserved: if layout.plane1.is_some() {
+            TRAILER_V2_PLANE_COUNT
+        } else {
+            0
+        },
     };
     // SAFETY: the length check above proves HELIOS_WDDM_LAYOUT_OFFSET + 32 bytes
     // exist at `private`; the buffer is the per-allocation runtime-owned one,
@@ -1789,6 +1833,24 @@ unsafe fn write_foreign_layout_trailer(
         )
     };
     dst.copy_from_slice(bytes_of(&trailer));
+    if let Some(p) = layout.plane1 {
+        let plane = HeliosWddmAllocPlane {
+            modifier: p.modifier,
+            stride: p.stride,
+            plane_offset: p.offset,
+        };
+        // SAFETY: `trailer_bytes` for a two-plane record is
+        // HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES, checked above, so the 16 bytes at
+        // HELIOS_WDDM_LAYOUT_PLANE1_OFFSET exist in the same buffer.
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(
+                (private as *mut u8).add(HELIOS_WDDM_LAYOUT_PLANE1_OFFSET),
+                size_of::<HeliosWddmAllocPlane>(),
+            )
+        };
+        dst.copy_from_slice(bytes_of(&plane));
+        crate::virtio::foreign::TRAILER_V2_WRITTEN.fetch_add(1, Ordering::Relaxed);
+    }
     true
 }
 
@@ -2405,6 +2467,8 @@ struct ForeignAdoptInput {
     supplied_layout: Option<fr::Layout>,
     /// The per-allocation buffer is large enough for the trailer the KMD writes.
     trailer_room: bool,
+    /// ... and for plane 1 after it (a two-plane record's version-2 trailer).
+    plane_room: bool,
 }
 
 /// Foreign-adoption refusals, for the registry trace (`FgAdRf`): first and every
@@ -2553,6 +2617,7 @@ fn build_backing(
                 claimed_alloc_size: meta.venus_alloc_size,
                 supplied_layout: foreign.supplied_layout,
                 trailer_room: foreign.trailer_room,
+                plane_room: foreign.plane_room,
             };
             let (adopted_blob_size, foreign_backing) =
                 match adapter.with_virtio(|v| v.adopt_for_allocation(resource_id, &request)) {
@@ -2942,13 +3007,22 @@ unsafe fn create_one(
         .map(|t| fr::Layout {
             width: meta.width,
             height: meta.height,
-            stride: t.stride,
-            offset: t.plane_offset,
-            fourcc: t.fourcc,
-            modifier: t.modifier,
+            stride: t.layout.stride,
+            offset: t.layout.plane_offset,
+            fourcc: t.layout.fourcc,
+            modifier: t.layout.modifier,
+            plane1: t.plane1.map(|p| fr::Plane {
+                stride: p.stride,
+                offset: p.plane_offset,
+                modifier: p.modifier,
+            }),
         }),
         trailer_room: !write_target.is_null()
             && write_target_len >= HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES,
+        // A two-plane record is refused without this (`AdoptRefusal::NoPlaneRoom`): the
+        // version-2 trailer the KMD writes back needs plane 1 after the layout.
+        plane_room: !write_target.is_null()
+            && write_target_len >= HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES,
     };
     let is_primary = (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_PRIMARY) != 0;
     // Deliberately the FLAG, not the backing arm. This is a VidMm policy input
@@ -3762,10 +3836,14 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         // The foreign layout trailer, if the KMD wrote one (see
         // `PresentAllocInfo::foreign`). Read like the meta above: this entry's
         // private data first, the call's second.
+        // Only the version-1 form feeds the copy import's hint (`foreign_layout_from_open`): it
+        // copies 32 bpp one-plane images, so a two-plane record has no hint to give.
         let foreign_trailer = unsafe {
             read_layout_trailer(info.pPrivateDriverData, info.PrivateDriverDataSize)
                 .or_else(|| read_layout_trailer(args.pPrivateDriverData, args.PrivateDriverSize))
-        };
+        }
+        .filter(|t| t.plane1.is_none())
+        .map(|t| t.layout);
         let present = ident.map(|identity| {
             let misc_flags = meta.map(|m| m.misc_flags).unwrap_or(0);
             let storage = if identity.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
