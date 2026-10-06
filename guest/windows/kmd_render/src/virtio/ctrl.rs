@@ -154,6 +154,15 @@ impl Budget {
     /// the old `attempts > MAX` test exactly (charge first, then test).
     fn charge_slice(&mut self) -> bool {
         self.spent_ms = self.spent_ms.saturating_add(RETRY_SLICE_MS);
+        // Inside an escape (v334, `ddi::escape_wait`): a terminating thread, a stopping device or
+        // a spent `EscWaitMs` ends EVERY retry loop that charges a Budget, through the exit the
+        // loop already has for a spent budget (`QueueFull` and friends). The nominal budget is
+        // up to ~16x its real time (see `sleep_ms`), which is exactly the unbounded kind of wait
+        // the escape deadline exists for. Never aborts a thread that is not inside an escape.
+        if let Some(why) = crate::ddi::escape_wait::abort_now() {
+            crate::ddi::escape_wait::note_abort(why);
+            self.spent_ms = self.total_ms.saturating_add(1);
+        }
         self.expired()
     }
 
@@ -220,13 +229,23 @@ fn wait_block(
     block: &WaitBlockRef<'_>,
     total_ms: u64,
 ) -> bool {
-    let mut waited: u64 = 0;
-    let mut slice: u64 = 1;
+    // The slice ladder, the total and the abort rules are `helios_kmd_logic::wait_bound::Bounded`
+    // (host-tested). Outside an escape it is the old 1 ms -> 1 s doubling to `total_ms`, byte for
+    // byte; inside one (v334, `ddi::escape_wait`) the slices stop at 100 ms and each ends with a
+    // check for a terminating thread, a stopping device and the escape's `EscWaitMs`, so a
+    // wait that the host never answers is ended by a kill, a stop or the deadline instead of by
+    // `total_ms` (30 s per call, minutes for a loop of calls). An abort is a timeout to the
+    // caller: it takes the abandon path and fails with `VirtioError::Timeout`.
+    let mut bounded = helios_kmd_logic::wait_bound::Bounded::new(total_ms);
     loop {
-        if waited >= total_ms {
-            return false;
-        }
-        let this_slice = slice.min(total_ms - waited);
+        let this_slice = match bounded.step(crate::ddi::escape_wait::probe()) {
+            helios_kmd_logic::wait_bound::Step::Wait(ms) => ms,
+            helios_kmd_logic::wait_bound::Step::Spent => return false,
+            helios_kmd_logic::wait_bound::Step::Abort(why) => {
+                crate::ddi::escape_wait::note_abort(why);
+                return false;
+            }
+        };
         let mut timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
         timeout.QuadPart = -((this_slice.max(1) as i64) * 10_000);
         // SAFETY: the KEVENT was initialized by SyncWaitBlock::init at this
@@ -243,8 +262,7 @@ fn wait_block(
         if status == STATUS_SUCCESS {
             return true;
         }
-        waited += this_slice;
-        slice = (slice * 2).min(1_000);
+        bounded.expired(this_slice);
         // Interrupt-loss tolerance: drain whatever completed.
         let _ = adapter.with_virtio(|v| v.drain_used());
     }

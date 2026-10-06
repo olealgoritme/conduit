@@ -879,6 +879,18 @@ pub mod knobs {
     /// completion. Nonzero values are clamped to 50..60000. Read at every StartDevice; mirrored
     /// as `FlWdMsEff`.
     pub const FLIP_WDOG_MS: KnobName = KnobName::new(b"FlipWdogMs");
+    /// `FlipPendWdMs` (default 500, 0 = off). The generic pending-flip watchdog (v334,
+    /// `kmd_logic::flip_pend_wd`, `docs/zero-copy-present.md` section 23): the newest flip
+    /// dxgkrnl issued that is not done, is this old and was followed by no publication of any
+    /// address for as long, is published as a KEPT picture by the vsync tick, whether or not a
+    /// programming is pending (`FlipWdogMs` only counts while one is). Nonzero values are clamped
+    /// to 100..60000. Read at every StartDevice; mirrored as `FpWdMsEff`; counted `FlipPendWd`.
+    pub const FLIP_PEND_WD_MS: KnobName = KnobName::new(b"FlipPendWdMs");
+    /// `EscWaitMs` (default 10000, 0 = no deadline; the kill and stop exits stay on). The most one
+    /// escape may spend waiting in total (v334, `kmd_logic::wait_bound`, section 23): after it
+    /// every wait the escape is in gives up with a clean failure status. Nonzero values are
+    /// clamped to 250..600000. Read at every StartDevice; mirrored as `EscWaitMsEff`.
+    pub const ESC_WAIT_MS: KnobName = KnobName::new(b"EscWaitMs");
     /// `DeferBudget` (default 0 = unlimited, today's behaviour). The most Deferred programming
     /// attempts of one primary (about one per vsync tick) before the worker publishes the flip's
     /// address kept and lowers the gate instead of retrying again (`FkDefBud`). 240 is about

@@ -287,6 +287,26 @@ pub unsafe extern "C" fn dxgkddi_escape(
     if h_adapter.is_null() || escape.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    // The escape scope (v334, `ddi::escape_wait`): from here to the return every wait this thread
+    // makes is bounded by `EscWaitMs` and gives up when the thread is terminating or the device
+    // is stopping, so a user process can never hold the device (or itself) in a kernel wait that
+    // a kill or a `pnputil /restart-device` cannot end. An escape that arrives while the device
+    // is already stopping is refused at once.
+    let Ok(_scope) = crate::ddi::escape_wait::begin() else {
+        return STATUS_DEVICE_NOT_READY;
+    };
+    // SAFETY: same contract as this function; the scope only registers the thread.
+    unsafe { dxgkddi_escape_inner(h_adapter, escape) }
+}
+
+/// The body of [`dxgkddi_escape`], run inside the escape scope.
+///
+/// # Safety
+/// As `dxgkddi_escape`.
+unsafe fn dxgkddi_escape_inner(
+    h_adapter: *mut c_void,
+    escape: *const DXGKARG_ESCAPE,
+) -> NTSTATUS {
     // SAFETY: Dxgkrnl passes our adapter context and a valid (const) args struct.
     // We only read fields of `args`; we write only through the buffer it points to.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };

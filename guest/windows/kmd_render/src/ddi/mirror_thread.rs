@@ -110,6 +110,14 @@ extern "system" {
     fn KeSetPriorityThread(thread: usize, priority: i32) -> i32;
 }
 
+/// The calling thread's `PKTHREAD` (`KeGetCurrentThread`, the one declaration this crate has of it,
+/// proven to link by the mirror thread itself): any IRQL. For `escape_wait`'s termination check.
+#[inline]
+pub(crate) fn current_thread() -> usize {
+    // SAFETY: a scalar read of the current thread pointer, legal at any IRQL.
+    unsafe { KeGetCurrentThread() }
+}
+
 /// Whether the thread exists: the callers then request instead of publishing inline.
 #[inline]
 pub(crate) fn running() -> bool {
