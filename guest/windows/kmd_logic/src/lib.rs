@@ -47,6 +47,7 @@ pub mod rm_fence_present;
 pub mod present_foreign;
 pub mod msi;
 pub mod paging;
+pub mod shared_placeholder;
 pub mod sweep_budget;
 pub mod vsync_rate;
 
