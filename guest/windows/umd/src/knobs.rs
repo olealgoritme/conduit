@@ -380,3 +380,40 @@ pub(crate) fn nvk_present_mode() -> u32 {
 pub(crate) fn nvk_placeholder_allocations() -> bool {
     NVK_PLACEHOLDER_ALLOCATIONS.get()
 }
+
+// --- NVK on RM: RM fences (dxvk-on-nvk S4, docs/rm-fence-marker.md) ---------
+
+/// `NvkRmFence`: 1 (default) = an NVK present hands its flip an RM fence and
+/// does not wait on the CPU for the frame (needs NVK with
+/// `helios_icd_interface` version 3 and a host with DRM fences; the KMD flips
+/// on the fence with capability bit 32, else NVK's flip thread does). 0 = the
+/// S3 CPU wait before every NVK present.
+pub(crate) static NVK_RM_FENCE: BoolKnob = BoolKnob::new(c"NvkRmFence", true);
+
+/// `NvkRmFencePresent`: 1 = when DWM composes an NVK app's frames, the WDDM
+/// present carries the RM fence in its `HEPR`/`HERF` tail and the KMD retires
+/// the present on it (needs capability bit 33, the KMD's (b) carrier).
+/// 0 (default until that KMD is tested) = the S3 CPU wait for composed frames.
+pub(crate) static NVK_RM_FENCE_PRESENT: BoolKnob = BoolKnob::new(c"NvkRmFencePresent", false);
+
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name).ok().and_then(|v| match v.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    })
+}
+
+/// `NvkRmFence`, or `HELIOS_NVK_RM_FENCE` from the process environment.
+pub(crate) fn nvk_rm_fence() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| env_bool("HELIOS_NVK_RM_FENCE").unwrap_or_else(|| NVK_RM_FENCE.get()))
+}
+
+/// `NvkRmFencePresent`, or `HELIOS_NVK_RM_FENCE_PRESENT` from the environment.
+pub(crate) fn nvk_rm_fence_present() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        env_bool("HELIOS_NVK_RM_FENCE_PRESENT").unwrap_or_else(|| NVK_RM_FENCE_PRESENT.get())
+    })
+}

@@ -117,6 +117,25 @@ struct HeliosDxvkDevice {
   // NVK: give scanout 0 back to the desktop.
   void nvk_scanout_release() const noexcept;
 
+  // NVK RM fences (dxvk-on-nvk S4, helios_icd_interface.h version 3). The
+  // caller has made sure the frame is SUBMITTED (present_frame_gate with
+  // kPresentOrderSubmitted), not complete.
+  //
+  // HELIOS_ICD_CAP_* of the ICD (0 on Venus).
+  std::uint32_t nvk_icd_caps() const noexcept;
+  // Show the texture on scanout 0 once the GPU has finished everything
+  // submitted so far, without waiting here: an RM fence goes with the flip
+  // (the KMD flips when it fires, or NVK's flip thread does). 0 = queued,
+  // 1 = no RM fences here (wait and nvk_scanout_present as before),
+  // negative = the frame was not shown.
+  std::int32_t nvk_scanout_present_fenced(std::size_t d3d11_resource_ptr) const noexcept;
+  // An RM fence for everything submitted so far, for a WDDM present marker
+  // (helios_rm_fence.h). 0 = *fence_handle is the caller's, 1 = none here.
+  std::int32_t nvk_present_fence(std::uint32_t* fence_handle,
+                                 std::uint64_t* value) const noexcept;
+  // Close a fence the caller still owns.
+  void nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept;
+
   // Create a dedicated OPTIMAL, DMA_BUF-exportable image (via the
   // D3D11_HELIOS_CREATE_INFO marker) and report logical scanout metadata for
   // exact reconstruction. kmd_transfer_source selects GENERAL as the image's

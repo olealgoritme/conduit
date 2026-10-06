@@ -767,9 +767,19 @@ impl RuntimeSubmission {
     /// EXACTLY as they were -- TypedPresent and MarkerPresent both log
     /// "Present" -- so validation stays byte-identical.
     pub(crate) fn command_length_and_label(&self) -> (u32, &'static str) {
+        // An RM fence (NVK on RM, S4) appends the 16-byte tail of
+        // `helios_rm_fence.h`; the KMD reads it only from the longer command.
         match self {
+            Self::TypedPresent { correlation, .. } if rm_fence_tail(*correlation).is_some() => (
+                core::mem::size_of::<helios_protocol::HeliosPresentRenderCmdFence>() as u32,
+                "Present",
+            ),
             Self::TypedPresent { .. } => (
                 core::mem::size_of::<HeliosPresentRenderCmd>() as u32,
+                "Present",
+            ),
+            Self::MarkerPresent { correlation, .. } if rm_fence_tail(*correlation).is_some() => (
+                core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmdFence>() as u32,
                 "Present",
             ),
             Self::MarkerPresent { .. } => (
@@ -802,6 +812,21 @@ pub(crate) fn present_refresh_cmd(
         present_value: correlation.value32,
         present_cookie: correlation.cookie,
     }
+}
+
+/// The RM fence tail of a present marker (`helios_rm_fence.h`), when the
+/// correlation carries a fence and no stream point (the two are exclusive: the
+/// KMD refuses a record with both).
+fn rm_fence_tail(correlation: PresentStreamCorrelation) -> Option<helios_protocol::HeliosRmFenceTail> {
+    (correlation.rm_fence_handle != 0
+        && correlation.ctx_id == 0
+        && correlation.value32 == 0
+        && correlation.cookie == 0)
+        .then_some(helios_protocol::HeliosRmFenceTail {
+            rm_fence_handle: correlation.rm_fence_handle,
+            flags: helios_protocol::HELIOS_RM_FENCE_TAIL_FLAG_FENCE,
+            rm_fence_value: correlation.rm_fence_value,
+        })
 }
 
 /// Submit a runtime-owned WDDM command buffer.
@@ -861,11 +886,25 @@ pub(crate) unsafe fn submit_runtime_submission(
             private.present_ctx_id = correlation.ctx_id;
             private.present_value = correlation.value32;
             private.present_cookie = correlation.cookie;
-            (command as *mut HeliosPresentRenderCmd).write_unaligned(HeliosPresentRenderCmd {
-                magic: HELIOS_PRESENT_RENDER_MAGIC,
-                version: HELIOS_PRESENT_RENDER_VERSION,
-                present: private,
-            });
+            if let Some(tail) = rm_fence_tail(correlation) {
+                private.reserved |= helios_protocol::HELIOS_PRESENT_PRIVATE_FLAG_RM_FENCE;
+                (command as *mut helios_protocol::HeliosPresentRenderCmdFence).write_unaligned(
+                    helios_protocol::HeliosPresentRenderCmdFence {
+                        base: HeliosPresentRenderCmd {
+                            magic: HELIOS_PRESENT_RENDER_MAGIC,
+                            version: HELIOS_PRESENT_RENDER_VERSION,
+                            present: private,
+                        },
+                        fence: tail,
+                    },
+                );
+            } else {
+                (command as *mut HeliosPresentRenderCmd).write_unaligned(HeliosPresentRenderCmd {
+                    magic: HELIOS_PRESENT_RENDER_MAGIC,
+                    version: HELIOS_PRESENT_RENDER_VERSION,
+                    present: private,
+                });
+            }
             count
         }
         RuntimeSubmission::MarkerPresent {
@@ -879,8 +918,17 @@ pub(crate) unsafe fn submit_runtime_submission(
                     return hr;
                 }
             };
-            (command as *mut HeliosPresentRefreshCmd)
-                .write_unaligned(present_refresh_cmd(correlation));
+            if let Some(tail) = rm_fence_tail(correlation) {
+                (command as *mut helios_protocol::HeliosPresentRefreshCmdFence).write_unaligned(
+                    helios_protocol::HeliosPresentRefreshCmdFence {
+                        base: present_refresh_cmd(correlation),
+                        fence: tail,
+                    },
+                );
+            } else {
+                (command as *mut HeliosPresentRefreshCmd)
+                    .write_unaligned(present_refresh_cmd(correlation));
+            }
             count
         }
     };
@@ -1304,25 +1352,99 @@ fn nvk_dwm_composes() -> bool {
     })
 }
 
+static NVK_FENCED_PRESENTS: AtomicUsize = AtomicUsize::new(0);
+static NVK_FENCED_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static NVK_MARKER_FENCES: AtomicUsize = AtomicUsize::new(0);
+
+/// `HELIOS_ICD_CAP_*` bits this file reads (`helios_icd_interface.h`).
+const HELIOS_ICD_CAP_RM_FENCE: u32 = 1 << 4;
+const HELIOS_ICD_CAP_PRESENT_FENCE_KMD: u32 = 1 << 6;
+
 /// The NVK half of a present, after the frame (and any Blt copy) is recorded.
 ///
-/// v1 sync (dxvk-on-nvk.md 3.5 level 1, decision D5): the KMD knows no NVK
-/// timeline, so the UMD waits on the CPU for the frame's GPU work and the
-/// present carries no stream marker (the KMD then has nothing to wait for).
-/// This is the NVK-only replacement for the Venus producer streams, not the
-/// retired `PresentOrder` gate: there is no Venus point an NVK frame could be
-/// ordered against. The RM-fence boundary (S4) removes it.
+/// S4 (dxvk-on-nvk.md 3.5 level 2, `docs/rm-fence-marker.md`): the frame is
+/// only made SUBMITTED here (DXVK's CS thread and submission queue drained,
+/// no GPU wait), then NVK signals its present timeline after it on DXVK's
+/// queue and turns the value into an RM fence:
+/// - scanout 0: the fence goes with the flip (`scanout_present_fenced`): the
+///   KMD sends the flip when it fires (capability bit 32), or NVK's flip
+///   thread does with an older KMD. The presenting thread never waits.
+/// - DWM composition: with `NvkRmFencePresent` and a KMD that takes fences in
+///   WDDM markers (capability bit 33) the fence rides the WDDM present's
+///   `HEPR`/`HERF` tail (returned here for `finish_present`). Otherwise the
+///   v1 CPU wait (S3) and an unmarked present.
 ///
-/// Then either the frame goes to scanout 0 through the KMD's foreign scanout
-/// source (zero copy; the desktop is hidden while it presents), or it is left
-/// to the WDDM present that follows, which DWM composes from the resource id.
-unsafe fn nvk_present_frame(h: Hdevice, shown: ddi::D3D10DDI_HRESOURCE) -> Result<(), i32> {
+/// Without RM fences (no DRM fences on the host, an older NVK or librmclient,
+/// `NvkRmFence=0`): the S3 behaviour, a CPU wait for the frame's GPU work
+/// before the flip or the WDDM present.
+unsafe fn nvk_present_frame(
+    h: Hdevice,
+    shown: ddi::D3D10DDI_HRESOURCE,
+) -> Result<PresentStreamCorrelation, i32> {
     let Some(dev) = helios_device(h) else {
         return Err(E_FAIL);
     };
     if let Some(context) = d3d11_context(h) {
         context.Flush();
     }
+    let scanout = match crate::knobs::nvk_present_mode() {
+        1 => true,
+        2 => false,
+        _ => !(nvk_dwm_composes() && NVK_PRESENT_BUFFERS.load(Ordering::Relaxed) == 1),
+    };
+    let caps = dev.dxvk.nvk_icd_caps();
+    let fences = crate::knobs::nvk_rm_fence() && caps & HELIOS_ICD_CAP_RM_FENCE != 0;
+    let marker_fences = fences
+        && crate::knobs::nvk_rm_fence_present()
+        && caps & HELIOS_ICD_CAP_PRESENT_FENCE_KMD != 0;
+
+    if (scanout && fences) || (!scanout && marker_fences) {
+        // Submitted, not complete: the fence is signalled after this on the GPU.
+        match dev.dxvk.present_frame_gate(NVK_PRESENT_WAIT_US, PRESENT_ORDER_SUBMITTED) {
+            0 | 1 => {}
+            hr => {
+                log_error!("NVK present refused: frame submission failed hr=0x{:08x}", hr as u32);
+                return Err(E_FAIL);
+            }
+        }
+        if scanout {
+            let Some(src) = load_resource(shown) else {
+                return Ok(PresentStreamCorrelation::default());
+            };
+            match dev.dxvk.nvk_scanout_present_fenced(&src) {
+                Some(true) => {
+                    let n = NVK_FENCED_PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n % 4096 == 0 {
+                        log_error!(
+                            "NVK present: {n} frames on scanout 0 on RM fences, no CPU wait \
+                             (failures {})",
+                            NVK_FENCED_FAILURES.load(Ordering::Relaxed)
+                        );
+                    }
+                    return Ok(PresentStreamCorrelation::default());
+                }
+                Some(false) => {
+                    NVK_FENCED_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    return Ok(PresentStreamCorrelation::default());
+                }
+                // No RM fences after all: the CPU wait below.
+                None => {}
+            }
+        } else if let Some((fence, value)) = dev.dxvk.nvk_present_fence() {
+            let n = NVK_MARKER_FENCES.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n % 4096 == 0 {
+                log_error!("NVK present: {n} WDDM presents carry an RM fence (value {value})");
+            }
+            return Ok(PresentStreamCorrelation {
+                rm_fence_handle: fence,
+                rm_fence_value: value,
+                ..PresentStreamCorrelation::default()
+            });
+        }
+    }
+
+    // v1 sync (S3, decision D5): wait on the CPU for the frame's GPU work; the
+    // present then carries no stream marker (the KMD has nothing to wait for).
     match dev.dxvk.present_frame_gate(NVK_PRESENT_WAIT_US, PRESENT_ORDER_COMPLETE) {
         0 => {}
         1 => {
@@ -1336,11 +1458,6 @@ unsafe fn nvk_present_frame(h: Hdevice, shown: ddi::D3D10DDI_HRESOURCE) -> Resul
             return Err(E_FAIL);
         }
     }
-    let scanout = match crate::knobs::nvk_present_mode() {
-        1 => true,
-        2 => false,
-        _ => !(nvk_dwm_composes() && NVK_PRESENT_BUFFERS.load(Ordering::Relaxed) == 1),
-    };
     if scanout {
         if let Some(src) = load_resource(shown) {
             if dev.dxvk.nvk_scanout_present(&src) {
@@ -1359,7 +1476,19 @@ unsafe fn nvk_present_frame(h: Hdevice, shown: ddi::D3D10DDI_HRESOURCE) -> Resul
             log_error!("NVK present: {n} frames composed by DWM from foreign resource ids");
         }
     }
-    Ok(())
+    Ok(PresentStreamCorrelation::default())
+}
+
+/// An RM fence a WDDM present was to carry is still ours when
+/// `finish_present` refused before the runtime submission (`Err`): give it
+/// back. Once the submission ran, the KMD owns it (rm-fence-marker.md: it
+/// closes a fence it attached when the fence fires).
+unsafe fn nvk_release_unsent_fence(h: Hdevice, fence: u32, result: &Result<i32, i32>) {
+    if fence != 0 && result.is_err() {
+        if let Some(dev) = helios_device(h) {
+            dev.dxvk.nvk_rm_fence_close(fence);
+        }
+    }
 }
 
 /// `dxgi_present_impl` on NVK: no vehicle, no direct-primary or snapshot path,
@@ -1391,10 +1520,11 @@ unsafe fn nvk_present_impl(
             shown = dst_h;
         }
     }
-    if let Err(hr) = nvk_present_frame(h, shown) {
-        return hr;
-    }
-    match finish_present(
+    let correlation = match nvk_present_frame(h, shown) {
+        Ok(c) => c,
+        Err(hr) => return hr,
+    };
+    let result = finish_present(
         h,
         src_h,
         dst_h,
@@ -1407,8 +1537,10 @@ unsafe fn nvk_present_impl(
             flags: *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
         },
         None,
-        PresentStreamCorrelation::default(),
-    ) {
+        correlation,
+    );
+    nvk_release_unsent_fence(h, correlation.rm_fence_handle, &result);
+    match result {
         Ok(hr) => hr,
         Err(hr) => hr,
     }
@@ -2747,9 +2879,11 @@ pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_P
         return E_INVALIDARG;
     }
 
+    let mut nvk_correlation = PresentStreamCorrelation::default();
     if helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk()) {
-        if let Err(hr) = nvk_present_frame(h, src_h) {
-            return hr;
+        match nvk_present_frame(h, src_h) {
+            Ok(c) => nvk_correlation = c,
+            Err(hr) => return hr,
         }
     } else {
         if let Some(context) = d3d11_context(h) {
@@ -2763,7 +2897,7 @@ pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_P
         }
     }
 
-    let present_hr = match finish_present(
+    let present_hr = finish_present(
         h,
         src_h,
         dst_h,
@@ -2778,8 +2912,10 @@ pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_P
         // Present1-multi performs no scanout publish and records no blit —
         // no substitution here, ever.
         None,
-        PresentStreamCorrelation::default(),
-    ) {
+        nvk_correlation,
+    );
+    nvk_release_unsent_fence(h, nvk_correlation.rm_fence_handle, &present_hr);
+    let present_hr = match present_hr {
         Ok(hr) => hr,
         // Skips the trailing PRESENT1_LOG_COUNT line, exactly as the bare
         // `return DXGI_ERROR_UNSUPPORTED` / `return E_FAIL` did.

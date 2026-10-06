@@ -93,7 +93,9 @@ struct win_ctx {
     D3DKMT_HANDLE context;
 
     uint32_t max_buffer; /* QUERY_CAPS.max_buffer_bytes */
-    uint64_t supported_ops; /* QUERY_CAPS.supported_ops: bit n = HELIOS_NVRM_OP n */
+    uint64_t supported_ops; /* QUERY_CAPS.supported_ops: bit n = HELIOS_NVRM_OP n;
+                               bits 32..63 HELIOS_NVRM_CAP_* */
+    uint32_t device_features; /* QUERY_CAPS.device_features (NVGPU_CFG_*) */
     uint64_t epoch;      /* the KMD's device generation at init */
     LUID luid;           /* the chosen adapter's LUID (D3DKMTEnumAdapters2) */
 
@@ -412,6 +414,7 @@ static int probe_adapter(struct win_ctx *c, D3DKMT_HANDLE adapter, D3DKMT_HANDLE
             goto reject;
         c->max_buffer = caps.max_buffer_bytes;
         c->supported_ops = caps.supported_ops;
+        c->device_features = caps.device_features;
         c->epoch = caps.head.epoch;
         *out_device = cd.hDevice;
         *out_context = context;
@@ -1307,6 +1310,133 @@ int crm_win_scanout_release(uint32_t handle)
     return kmd_status_to_errno(rel.head.status);
 }
 
+/* ---- RM fences (guest/windows/docs/rm-fence-marker.md, docs/SYNC.md) ------
+ * nvidia-drm's semaphore-surface fences on a host render node: a fence context
+ * imports an RM NV_SEMAPHORE_SURFACE of one of this guest's RM clients, a fence
+ * is a backend handle that fires one EventReady when the surface's slot reaches
+ * a value (or after nvidia-drm's timeout). The KMD records the handle a
+ * forwarded SEMSURF_FENCE_CREATE returns as this device's (KMD 22.22.311+), so
+ * EVENT_REGISTER and Close work on it, and SCANOUT_PRESENT can take it over. */
+
+#define CRM_DRM_IOWR(nr, size) ((3u << 30) | ((uint32_t)(size) << 16) | ('d' << 8) | (nr))
+#define CRM_SEMSURF_FENCE_CTX_CREATE CRM_DRM_IOWR(0x54, 32)
+#define CRM_SEMSURF_FENCE_CREATE CRM_DRM_IOWR(0x55, 24)
+#define CRM_NVGPU_CFG_DRM_FENCES (1u << 11)
+
+int crm_win_caps(uint64_t *supported_ops, uint32_t *device_features)
+{
+    struct win_ctx *c = &g_ctx;
+    int r = win_init(c);
+    if (r)
+        return r;
+    if (supported_ops)
+        *supported_ops = c->supported_ops;
+    if (device_features)
+        *device_features = c->device_features;
+    return 0;
+}
+
+int crm_win_semsurf_ctx_create(int drm_fd, uint32_t h_client, uint32_t h_semsurf,
+                               uint64_t size, uint64_t index, uint32_t *ctx)
+{
+    struct win_ctx *c = &g_ctx;
+    *ctx = 0;
+    if (!c->ready)
+        return -ENODEV;
+    if (!(c->device_features & CRM_NVGPU_CFG_DRM_FENCES))
+        return -ENOSYS;
+    struct {
+        uint64_t index;
+        uint64_t nvkms_params_ptr;
+        uint64_t nvkms_params_size;
+        uint32_t handle;
+        uint32_t pad;
+    } p;
+    /* NvKmsKapiPrivImportSemaphoreSurfaceParams */
+    struct {
+        uint32_t h_client;
+        uint32_t h_semaphore_surface;
+        uint64_t size;
+    } nvkms = { h_client, h_semsurf, size };
+    memset(&p, 0, sizeof(p));
+    p.index = index;
+    p.nvkms_params_ptr = (uint64_t)(uintptr_t)&nvkms;
+    p.nvkms_params_size = sizeof(nvkms);
+    int r = ioctl_wire_cmd(c, drm_fd, CRM_SEMSURF_FENCE_CTX_CREATE, &p, sizeof(p), &nvkms,
+                           sizeof(nvkms), 0, 0);
+    if (r)
+        return r;
+    if (p.handle == 0)
+        return -EIO;
+    *ctx = p.handle;
+    return 0;
+}
+
+int crm_win_semsurf_fence_create(int drm_fd, uint32_t ctx, uint64_t wait_value,
+                                 uint32_t timeout_ms, int *fence)
+{
+    struct win_ctx *c = &g_ctx;
+    *fence = -1;
+    if (!c->ready)
+        return -ENODEV;
+    struct {
+        uint32_t ctx;
+        uint32_t timeout_ms;
+        uint64_t wait_value;
+        int32_t fd;
+        uint32_t pad;
+    } p = { ctx, timeout_ms, wait_value, -1, 0 };
+    int r = ioctl_wire_cmd(c, drm_fd, CRM_SEMSURF_FENCE_CREATE, &p, sizeof(p), NULL, 0, 0, 0);
+    if (r)
+        return r;
+    if (p.fd <= 0)
+        return -EIO;
+    *fence = p.fd;
+    return 0;
+}
+
+int crm_win_fence_wait(int fence, uint32_t timeout_ms)
+{
+    if (!g_ctx.ready)
+        return -ENODEV;
+    return win_event_wait(&g_ctx, fence, timeout_ms);
+}
+
+int crm_win_scanout_present_fenced(uint32_t handle, uint32_t gem, int fence, uint64_t *seq)
+{
+    struct win_ctx *c = &g_ctx;
+    int r = scanout_op_ready(c, HELIOS_NVRM_OP_SCANOUT_PRESENT);
+    if (r)
+        return r;
+    if (!(c->supported_ops & HELIOS_NVRM_CAP_SCANOUT_FENCE))
+        return -ENOSYS;
+    if (fence <= 0)
+        return -EINVAL;
+    HeliosNvrmScanoutPresent p;
+    memset(&p, 0, sizeof(p));
+    helios_nvrm_init(&p.head, HELIOS_NVRM_OP_SCANOUT_PRESENT, sizeof(p));
+    p.handle = handle;
+    p.gem = gem;
+    p.flags = HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE;
+    p.rm_fence_handle = (uint32_t)fence;
+    r = nvrm_escape(c, &p, sizeof(p));
+    if (r)
+        return r;
+    switch (p.head.status) {
+    case HELIOS_NVRM_ST_OK:
+        break;
+    case HELIOS_NVRM_ST_QUEUE_FULL:
+        return -EAGAIN;
+    case HELIOS_NVRM_ST_FENCE_ATTACHED:
+        return -EALREADY;
+    default:
+        return kmd_status_to_errno(p.head.status);
+    }
+    if (seq)
+        *seq = p.out_seq;
+    return 0;
+}
+
 /* ---- Helios extras beyond NVRM: adapter identity, Venus holder contexts,
  * foreign resources (guest/windows/protocol/src/foreign.rs). All go through the
  * same D3DKMT device as the RM escapes, so the KMD sees one owner for the DRM
@@ -1566,6 +1696,43 @@ int crm_win_scanout_present(uint32_t handle, uint32_t gem, uint64_t *seq)
 int crm_win_scanout_release(uint32_t handle)
 {
     (void)handle;
+    return -ENOSYS;
+}
+
+int crm_win_caps(uint64_t *supported_ops, uint32_t *device_features)
+{
+    if (supported_ops)
+        *supported_ops = 0;
+    if (device_features)
+        *device_features = 0;
+    return -ENOSYS;
+}
+
+int crm_win_semsurf_ctx_create(int drm_fd, uint32_t h_client, uint32_t h_semsurf,
+                               uint64_t size, uint64_t index, uint32_t *ctx)
+{
+    (void)drm_fd; (void)h_client; (void)h_semsurf; (void)size; (void)index;
+    *ctx = 0;
+    return -ENOSYS;
+}
+
+int crm_win_semsurf_fence_create(int drm_fd, uint32_t ctx, uint64_t wait_value,
+                                 uint32_t timeout_ms, int *fence)
+{
+    (void)drm_fd; (void)ctx; (void)wait_value; (void)timeout_ms;
+    *fence = -1;
+    return -ENOSYS;
+}
+
+int crm_win_fence_wait(int fence, uint32_t timeout_ms)
+{
+    (void)fence; (void)timeout_ms;
+    return -ENOSYS;
+}
+
+int crm_win_scanout_present_fenced(uint32_t handle, uint32_t gem, int fence, uint64_t *seq)
+{
+    (void)handle; (void)gem; (void)fence; (void)seq;
     return -ENOSYS;
 }
 

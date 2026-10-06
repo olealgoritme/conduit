@@ -516,6 +516,107 @@ std::int32_t HeliosDxvkDevice::nvk_scanout_present(
   });
 }
 
+std::uint32_t HeliosDxvkDevice::nvk_icd_caps() const noexcept {
+  return impl && impl->backend == helios_bridge::IcdBackend::NvkRm ? impl->icd.caps : 0u;
+}
+
+namespace {
+  // An RM fence for everything submitted to DXVK's graphics queue so far
+  // (helios_icd_interface.h queue_rm_fence). The queue is DXVK's: take it the
+  // way external submitters must (lockSubmission also drains DXVK's own
+  // submission queue first, so the frame's command buffers are in it).
+  VkResult queue_rm_fence(const HeliosDxvkDeviceImpl& d, std::uint32_t* fence,
+                          std::uint64_t* value) {
+    if (d.backend != helios_bridge::IcdBackend::NvkRm || !d.icd.queue_rm_fence
+     || !(d.icd.caps & HELIOS_ICD_CAP_RM_FENCE) || d.device == nullptr)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+    const VkQueue queue = d.device->queues().graphics.queueHandle;
+    d.device->lockSubmission();
+    const VkResult vr = d.icd.queue_rm_fence(d.device->vkd()->device(), queue, fence, value);
+    d.device->unlockSubmission();
+    return vr;
+  }
+}
+
+std::int32_t HeliosDxvkDevice::nvk_scanout_present_fenced(
+    std::size_t d3d11_resource_ptr) const noexcept {
+  return bridge_guard("nvk_scanout_present_fenced", std::int32_t(-1), [&]() -> std::int32_t {
+    if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm
+     || !impl->icd.scanout_present_fenced || !impl->icd.queue_rm_fence)
+      return 1;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memory_offset = 0;
+    if (!texture_image_memory(d3d11_resource_ptr, &image, &memory, &memory_offset)
+     || memory_offset != 0)
+      return -2;
+    std::uint32_t fence = 0;
+    std::uint64_t value = 0;
+    VkResult vr = queue_rm_fence(*impl, &fence, &value);
+    if (vr == VK_ERROR_FEATURE_NOT_PRESENT)
+      return 1;
+    if (vr != VK_SUCCESS || fence == 0) {
+      static std::atomic<std::uint32_t> s_fail{0};
+      const std::uint32_t n = s_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n % 512u) == 0) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "nvk queue_rm_fence failed vr=%d (x%u)", int(vr), n);
+        umd_log(msg);
+      }
+      return 1;
+    }
+    // Takes the fence whatever it answers.
+    vr = impl->icd.scanout_present_fenced(impl->device->vkd()->device(), memory, image, fence);
+    if (vr != VK_SUCCESS) {
+      static std::atomic<std::uint32_t> s_fail{0};
+      const std::uint32_t n = s_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n % 512u) == 0) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "nvk scanout_present_fenced failed vr=%d (x%u)",
+                      int(vr), n);
+        umd_log(msg);
+      }
+      return -3;
+    }
+    static std::atomic<std::uint32_t> s_ok{0};
+    const std::uint32_t n = s_ok.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || (n % 4096u) == 0) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+        "nvk fenced scanout present #%u (timeline value %llu, %s)", n,
+        static_cast<unsigned long long>(value),
+        (impl->icd.caps & HELIOS_ICD_CAP_SCANOUT_FENCE_KMD) ? "the KMD flips on the fence"
+                                                            : "NVK's flip thread waits");
+      umd_log(msg);
+    }
+    return 0;
+  });
+}
+
+std::int32_t HeliosDxvkDevice::nvk_present_fence(std::uint32_t* fence_handle,
+                                                 std::uint64_t* value) const noexcept {
+  return bridge_guard("nvk_present_fence", std::int32_t(1), [&]() -> std::int32_t {
+    *fence_handle = 0;
+    *value = 0;
+    if (!impl)
+      return 1;
+    const VkResult vr = queue_rm_fence(*impl, fence_handle, value);
+    if (vr != VK_SUCCESS || *fence_handle == 0) {
+      *fence_handle = 0;
+      return 1;
+    }
+    return 0;
+  });
+}
+
+void HeliosDxvkDevice::nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept {
+  bridge_guard("nvk_rm_fence_close", false, [&]() -> bool {
+    if (impl && fence_handle && impl->icd.rm_fence_close && impl->device != nullptr)
+      impl->icd.rm_fence_close(impl->device->vkd()->device(), fence_handle);
+    return true;
+  });
+}
+
 void HeliosDxvkDevice::nvk_scanout_release() const noexcept {
   bridge_guard("nvk_scanout_release", false, [&]() -> bool {
     if (impl && impl->backend == helios_bridge::IcdBackend::NvkRm

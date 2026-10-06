@@ -4,8 +4,8 @@
 #   guest/nvk-rm/windows/build-tests.sh [OUT_DIR]     (default: ./nvk-tests-win)
 #
 # Builds icd_smoke.exe, vk_summary.exe, vk_compute_test.exe,
-# vk_offscreen_test.exe, vk_scanout_present.exe, vk_bar_test.exe and
-# vk_coherence_test.exe, helios_icd_test.exe plus their SPIR-V
+# vk_offscreen_test.exe, vk_scanout_present.exe, vk_bar_test.exe,
+# vk_coherence_test.exe, helios_icd_test.exe and vk_rmfence_test.exe plus their SPIR-V
 # (glslangValidator). MinGW ships no Vulkan import library: one for
 # vulkan-1.dll is generated from the Vulkan headers' prototypes (only the
 # functions a test calls end up imported, all of them loader exports).
@@ -50,6 +50,7 @@ for t in vk_summary vk_compute_test vk_offscreen_test vk_scanout_present vk_bar_
 done
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/icd_smoke.c" -o "$OUT_DIR/icd_smoke.exe"
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/helios_icd_test.c" -o "$OUT_DIR/helios_icd_test.exe"
+"$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/vk_rmfence_test.c" -o "$OUT_DIR/vk_rmfence_test.exe"
 
 rm -rf "$OUT_DIR/include" "$OUT_DIR/vulkan-1.def" "$OUT_DIR/libvulkan-1.a"
 ls -l "$OUT_DIR"

@@ -144,7 +144,7 @@ fn scanout_present(
         Err(st) => return st,
     };
     req.out_seq = 0;
-    let status = if req.flags != 0 || req.reserved != 0 || req.gem == 0 {
+    let status = if req.flags != 0 || req.rm_fence_handle != 0 || req.gem == 0 {
         HELIOS_NVRM_ST_BAD_RANGE
     } else {
         match flip::present(passive, adapter, owner, req.handle, req.gem) {

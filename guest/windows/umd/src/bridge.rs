@@ -145,6 +145,26 @@ mod ffi {
         unsafe fn nvk_scanout_present(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize) -> i32;
         /// NVK: give scanout 0 back to the desktop.
         fn nvk_scanout_release(self: &HeliosDxvkDevice);
+        /// NVK: `HELIOS_ICD_CAP_*` of the ICD (0 on Venus).
+        fn nvk_icd_caps(self: &HeliosDxvkDevice) -> u32;
+        /// NVK RM fences (S4): show the texture on scanout 0 once the GPU has
+        /// finished everything submitted so far, without a CPU wait. 0 =
+        /// queued, 1 = no RM fences here (CPU wait + `nvk_scanout_present`),
+        /// negative = not shown. # Safety: a live `ID3D11Resource*`.
+        unsafe fn nvk_scanout_present_fenced(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+        ) -> i32;
+        /// NVK RM fences (S4): a fence for everything submitted so far, for a
+        /// WDDM present marker. 0 = `*fence_handle` is the caller's.
+        /// # Safety: both pointers are live writable storage.
+        unsafe fn nvk_present_fence(
+            self: &HeliosDxvkDevice,
+            fence_handle: *mut u32,
+            value: *mut u64,
+        ) -> i32;
+        /// NVK: close a fence the caller still owns.
+        fn nvk_rm_fence_close(self: &HeliosDxvkDevice, fence_handle: u32);
 
         /// Create a dedicated OPTIMAL, DMA_BUF-exportable image and report
         /// logical scanout metadata. `kmd_transfer_source` selects the
@@ -564,6 +584,13 @@ pub(crate) struct PresentStreamCorrelation {
     pub(crate) ctx_id: u32,
     pub(crate) value32: u32,
     pub(crate) cookie: u64,
+    /// NVK on RM (S4): an RM fence handle the present retires on instead of a
+    /// stream point (`helios_rm_fence.h` tail; exclusive with the three fields
+    /// above, which are then zero). 0 = none. The KMD takes the handle when
+    /// it attaches the marker.
+    pub(crate) rm_fence_handle: u32,
+    /// Diagnostic only: the timeline value behind `rm_fence_handle`.
+    pub(crate) rm_fence_value: u64,
 }
 
 impl PresentStreamCorrelation {
@@ -707,6 +734,41 @@ impl BridgeDevice {
     pub(crate) fn nvk_scanout_release(&self) {
         if let Some(d) = self.get() {
             d.nvk_scanout_release();
+        }
+    }
+
+    /// NVK: `HELIOS_ICD_CAP_*` (`helios_icd_interface.h`), 0 on Venus.
+    pub(crate) fn nvk_icd_caps(&self) -> u32 {
+        self.get().map_or(0, |d| d.nvk_icd_caps())
+    }
+
+    /// NVK RM fences (S4): flip `res` once the GPU has finished everything
+    /// submitted so far, no CPU wait. `None` when RM fences cannot be had
+    /// here (the caller waits and calls [`Self::nvk_scanout_present`]);
+    /// `Some(shown)` otherwise.
+    pub(crate) fn nvk_scanout_present_fenced(&self, res: &ID3D11Resource) -> Option<bool> {
+        let d = self.get()?;
+        // SAFETY: `res` is a live resource borrowed for the call.
+        match unsafe { d.nvk_scanout_present_fenced(res.as_raw() as usize) } {
+            0 => Some(true),
+            1 => None,
+            _ => Some(false),
+        }
+    }
+
+    /// NVK RM fences (S4): a fence (handle, diagnostic timeline value) for
+    /// everything submitted so far; the caller owns the handle.
+    pub(crate) fn nvk_present_fence(&self) -> Option<(u32, u64)> {
+        let d = self.get()?;
+        let (mut fence, mut value) = (0u32, 0u64);
+        // SAFETY: both out-pointers borrow live locals for this synchronous call.
+        let r = unsafe { d.nvk_present_fence(&mut fence, &mut value) };
+        (r == 0 && fence != 0).then_some((fence, value))
+    }
+
+    pub(crate) fn nvk_rm_fence_close(&self, fence: u32) {
+        if let Some(d) = self.get() {
+            d.nvk_rm_fence_close(fence);
         }
     }
 
