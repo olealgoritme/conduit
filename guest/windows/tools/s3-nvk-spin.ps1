@@ -6,7 +6,7 @@
 #                   [-Present 0|1|2] [-Dir C:\Users\Public\s3]
 #
 # Expects, under -Dir: app\d3d11_spin.exe, app\run-in-session.ps1 and
-# nvk\vulkan_nouveau.dll + nvk\librmclient.dll (64-bit). No registry write:
+# nvk64\vulkan_nouveau.dll + nvk64\librmclient.dll (64-bit). No registry write:
 # HELIOS_ICD / HELIOS_NVK_ICD / HELIOS_NVK_PRESENT are per-process overrides.
 # -Present: 0 auto (scanout unless DWM composes foreign resids, ForeignImport=1),
 # 1 scanout 0 (zero-copy flip of the back buffer), 2 WDDM present (DWM composes).
@@ -22,7 +22,7 @@ $ErrorActionPreference = "Stop"
 $app = Join-Path $Dir "app"
 $since = Get-Date
 $vars = @{ HELIOS_ICD = $Icd; HELIOS_NVK_PRESENT = "$Present" }
-if ($Icd -eq "nvk") { $vars.HELIOS_NVK_ICD = Join-Path $Dir "nvk\vulkan_nouveau.dll" }
+if ($Icd -eq "nvk") { $vars.HELIOS_NVK_ICD = Join-Path $Dir "nvk64\vulkan_nouveau.dll" }
 & (Join-Path $app "run-in-session.ps1") -Dir $app -Env $vars `
     -Command "d3d11_spin.exe $Seconds $Width $Height 0 0" -TimeoutSec ($Seconds + 60)
 "--- UMD log (C:\ProgramData\Helios\umd-*.log written since the start) ---"
