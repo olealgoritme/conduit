@@ -115,6 +115,10 @@ impl AdapterContext {
         };
         if st == STATUS_SUCCESS && !handle.is_null() {
             self.hpd_thread.store(handle as usize, Ordering::Release);
+            // The registry mirror's own thread (`ddi::mirror_thread`): the worker only requests
+            // a publish pass, it does not spend tens of milliseconds between two flips on one.
+            // SAFETY: PASSIVE_LEVEL (StartDevice).
+            unsafe { crate::ddi::mirror_thread::start(self) };
         } else {
             // 0x0B00_00EA = HPD-worker-create-failed. It was 0x0B00_00E7, which
             // ddi/lifecycle.rs also records for venus-bring-up-failed — and BOTH
@@ -151,6 +155,13 @@ impl AdapterContext {
     /// PASSIVE_LEVEL — it blocks on the worker's exit.
     pub fn stop_hpd(&self) {
         use core::sync::atomic::Ordering;
+        // The mirror thread first (idempotent): from here the callers publish inline again.
+        crate::ddi::mirror_thread::stop();
+        // The mirror thread reads this context (the dump, the pacing snapshot): one that could not
+        // be joined keeps it allocated, like a worker that could not be joined.
+        if crate::ddi::mirror_thread::leaked() {
+            self.hpd_worker_leaked.store(1, Ordering::Release);
+        }
         let h = self.hpd_thread.swap(0, Ordering::AcqRel);
         if h == 0 {
             return;
@@ -778,6 +789,8 @@ impl AdapterContext {
             self.vsync_ex_timer
                 .store(ex_timer as usize, core::sync::atomic::Ordering::Release);
         }
+        // `VsExTm`: which timer drives the heartbeat (1 = the high-resolution Ex timer).
+        crate::ddi::stall_diag::note_vsync_source(!ex_timer.is_null());
         // The independent watchdog's timer (v329): default resolution (it ticks every 250 ms), its
         // own callback, the same immutable context. NULL = no watchdog this adapter lifetime
         // (`VsWdNoTm`); the heartbeat itself is unaffected.
@@ -855,6 +868,8 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         // `now` whenever the DPC is late would turn normal dispatch latency
         // into cumulative phase drift, defeating the one-shot scheme.
         let anchor = if previous == 0 { now } else { previous };
+        // `VsLate*`: how late this tick ran against the deadline it was scheduled for.
+        crate::ddi::flip_lat::note_tick_late(now, anchor);
         let period = helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(adapter));
         // Gap statistics (diag `VsMinGap` / `VsFast`): the evidence that the
         // heartbeat does not burst. A few relaxed accesses, no lock and no
@@ -870,7 +885,15 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
                 adapter.vsync_fast.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let Some(deadline) = helios_kmd_logic::vsync_deadline::next(anchor, now, period) else {
+        // `advance` is `next` plus the accounting of the period slots this step moved over
+        // (`VsSlotN`, `VsSkipN`) and, with `VsCatchUp`, one missed slot served by an immediate
+        // extra tick instead of dropped (`VsCatchN`).
+        let Some(step) = helios_kmd_logic::vsync_deadline::advance(
+            anchor,
+            now,
+            period,
+            crate::ddi::stall_diag::vs_catch_up(),
+        ) else {
             // Interrupt-time representation exhausted. The current one-shot
             // has fired; leave it disarmed rather than schedule an immediate
             // 100 ns retry loop.
@@ -879,6 +902,7 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
             crate::ddi::stall_diag::note_vsync_exhausted();
             return;
         };
+        let deadline = step.deadline;
         adapter
             .vsync_deadline_100ns
             .store(deadline, Ordering::Release);
@@ -892,8 +916,9 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
             adapter.cancel_vsync_one_shot();
             return;
         }
-        now
+        (now, step)
     };
+    let (tick_time_100ns, step) = tick_time_100ns;
     // Stall diagnosis (`ddi::stall_diag`): the consecutive-pending-tick count `VsPendN` and its
     // maximum, and, only with `FlipWdogMs` set, the flip watchdog. Atomics only (DISPATCH),
     // before the delivery gate below so a disabled delivery does not blind the count; the
@@ -901,6 +926,8 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     crate::ddi::stall_diag::on_vsync_tick(
         adapter,
         helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(adapter)),
+        tick_time_100ns,
+        &step,
     );
     // ControlInterrupt may close only the delivery gate at DIRQL. Keep the
     // one-shot heartbeat free-running while disabled so a later enable needs no
@@ -910,7 +937,7 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         crate::ddi::stall_diag::note_gate_closed_tick();
         // `FfAsyncWin`: a programming pending behind a closed gate is not waited on for a tick
         // that will deliver; the heartbeat runs regardless, so it wakes the worker here.
-        if crate::virtio::foreign_flip::early_wake()
+        if (crate::virtio::foreign_flip::early_wake() || crate::ddi::flip_announce::wakes_early())
             && adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0
         {
             crate::virtio::foreign_flip::note_gate_wake();
@@ -929,6 +956,8 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     // is therefore the truthful address to report.
     //
     let phys = adapter.last_primary_address.load(Ordering::Acquire) as i64;
+    // `FlipLat`: the instant just after the address was read (a flip issued later is not in it).
+    let phys_t = crate::adapter::foreign_scanout::now_100ns();
     // SAFETY: live callback interface; signal_crtc_vsync raises to DIRQL internally
     // via DxgkCbSynchronizeExecution and delivers the CRTC_VSYNC packet.
     // `VsCbSyncB` / `VsCbSyncOk` / `VsCbSyncT`: a sync that begins and never returns is visible.
@@ -941,6 +970,15 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     crate::ddi::stall_diag::cb_sync_end(status);
     let epoch = adapter.scanout_bound_epoch.load(Ordering::Acquire);
     if status == STATUS_SUCCESS {
+        // `FlipLat*` / `IfGap*` / `VbUsed`: a CRTC_VSYNC carrying `phys` was delivered; the flip
+        // with that address (if any) retires here.
+        crate::ddi::flip_lat::on_delivered_tick(
+            adapter,
+            phys as u64,
+            tick_time_100ns,
+            phys_t,
+            helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(adapter)),
+        );
         // Record every callback that actually reached dxgkrnl. At ~60 Hz the
         // fixed 32768-entry ring retains several minutes, and this is the
         // causal heartbeat a trace needs rather than a stale sampled mirror.
@@ -1003,7 +1041,13 @@ unsafe extern "system" fn vsync_ex_timer_callback(_timer: ExTimer, context: PVOI
     let adapter = unsafe { &*(context as *const AdapterContext) };
     // `VsCbIn` / `VsCbOut`: entered and returned; a blocked callback is `VsCbIn` above `VsCbOut`.
     crate::ddi::stall_diag::cb_enter();
+    let entered = crate::adapter::foreign_scanout::now_100ns();
     unsafe { service_vsync_tick(adapter) };
+    // `VsCbMaxUs` / `VsCbOvN`: the callback's own time (a callback of a period or more delays the
+    // next tick of this same timer).
+    crate::ddi::stall_diag::note_cb_dwell(
+        crate::adapter::foreign_scanout::now_100ns().saturating_sub(entered),
+    );
     crate::ddi::stall_diag::cb_leave();
 }
 
@@ -1037,6 +1081,10 @@ pub unsafe extern "C" fn vsync_dpc_routine(
     let adapter = unsafe { &*(context as *const AdapterContext) };
     // `VsCbIn` / `VsCbOut`: entered and returned; a blocked callback is `VsCbIn` above `VsCbOut`.
     crate::ddi::stall_diag::cb_enter();
+    let entered = crate::adapter::foreign_scanout::now_100ns();
     unsafe { service_vsync_tick(adapter) };
+    crate::ddi::stall_diag::note_cb_dwell(
+        crate::adapter::foreign_scanout::now_100ns().saturating_sub(entered),
+    );
     crate::ddi::stall_diag::cb_leave();
 }

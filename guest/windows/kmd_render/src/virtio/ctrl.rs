@@ -154,6 +154,15 @@ impl Budget {
     /// the old `attempts > MAX` test exactly (charge first, then test).
     fn charge_slice(&mut self) -> bool {
         self.spent_ms = self.spent_ms.saturating_add(RETRY_SLICE_MS);
+        // Inside an escape (v334, `ddi::escape_wait`): a terminating thread, a stopping device or
+        // a spent `EscWaitMs` ends EVERY retry loop that charges a Budget, through the exit the
+        // loop already has for a spent budget (`QueueFull` and friends). The nominal budget is
+        // up to ~16x its real time (see `sleep_ms`), which is exactly the unbounded kind of wait
+        // the escape deadline exists for. Never aborts a thread that is not inside an escape.
+        if let Some(why) = crate::ddi::escape_wait::abort_now() {
+            crate::ddi::escape_wait::note_abort(why);
+            self.spent_ms = self.total_ms.saturating_add(1);
+        }
         self.expired()
     }
 
@@ -220,13 +229,23 @@ fn wait_block(
     block: &WaitBlockRef<'_>,
     total_ms: u64,
 ) -> bool {
-    let mut waited: u64 = 0;
-    let mut slice: u64 = 1;
+    // The slice ladder, the total and the abort rules are `helios_kmd_logic::wait_bound::Bounded`
+    // (host-tested). Outside an escape it is the old 1 ms -> 1 s doubling to `total_ms`, byte for
+    // byte; inside one (v334, `ddi::escape_wait`) the slices stop at 100 ms and each ends with a
+    // check for a terminating thread, a stopping device and the escape's `EscWaitMs`, so a
+    // wait that the host never answers is ended by a kill, a stop or the deadline instead of by
+    // `total_ms` (30 s per call, minutes for a loop of calls). An abort is a timeout to the
+    // caller: it takes the abandon path and fails with `VirtioError::Timeout`.
+    let mut bounded = helios_kmd_logic::wait_bound::Bounded::new(total_ms);
     loop {
-        if waited >= total_ms {
-            return false;
-        }
-        let this_slice = slice.min(total_ms - waited);
+        let this_slice = match bounded.step(crate::ddi::escape_wait::probe()) {
+            helios_kmd_logic::wait_bound::Step::Wait(ms) => ms,
+            helios_kmd_logic::wait_bound::Step::Spent => return false,
+            helios_kmd_logic::wait_bound::Step::Abort(why) => {
+                crate::ddi::escape_wait::note_abort(why);
+                return false;
+            }
+        };
         let mut timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
         timeout.QuadPart = -((this_slice.max(1) as i64) * 10_000);
         // SAFETY: the KEVENT was initialized by SyncWaitBlock::init at this
@@ -243,8 +262,7 @@ fn wait_block(
         if status == STATUS_SUCCESS {
             return true;
         }
-        waited += this_slice;
-        slice = (slice * 2).min(1_000);
+        bounded.expired(this_slice);
         // Interrupt-loss tolerance: drain whatever completed.
         let _ = adapter.with_virtio(|v| v.drain_used());
     }
@@ -1152,6 +1170,22 @@ pub fn set_scanout_blob(
     Ok(seq.get())
 }
 
+/// `SET_SCANOUT_BLOB` with resource 0 (scanout 0 off), for StopDevice: the host keeps the scanout
+/// binding of a transport it is about to lose only if nobody turns it off, and ids restart at 1 in
+/// the next generation (docs/zero-copy-present.md section 25). Waits at most `timeout_ms` (the
+/// StopDevice budget's share); it takes no wire-order mint, because the display state it would
+/// update is zeroed by `reset_display_publication_state` right after and the transport is dropped.
+/// PASSIVE_LEVEL only.
+pub fn disable_scanout_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
+    let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
+    fill_set_scanout_blob(&mut cmd, 0, 0, 0, 0, 0, 0);
+    ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
+}
+
 /// Encode one `SET_SCANOUT_BLOB` into `cmd`, whoever owns the storage.
 ///
 /// THE ONE ENCODER. Its two callers are the synchronous round-trip above, which
@@ -1768,7 +1802,11 @@ pub fn release_blob_for_owner_within(
     // A snapshot/DWM resource cannot detach while a deferred WindowedBlt
     // still owns its reader lease or reusable Venus command. Cancellation is
     // exact by resource id; cache release runs before detach/unref.
-    let terminal = adapter.with_scanout_lifecycle(passive, |lock| -> Result<(), VirtioError> {
+    // The abortable acquire (v334, `ddi::escape_wait`): this is the RELEASE_BLOB escape's path. A
+    // thread that gave up leaves the blob out of the table and on the host (the transport reset
+    // reclaims it), the same outcome as a host that never answers, and returns an error.
+    let terminal = adapter
+        .try_with_scanout_lifecycle(passive, |lock| -> Result<(), VirtioError> {
         lock.with_venus_client(|client| {
             let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
             client.release_present_blits_for_resource(adapter, res)
@@ -1786,7 +1824,8 @@ pub fn release_blob_for_owner_within(
         } else {
             Err(VirtioError::DeviceError)
         }
-    });
+    })
+        .unwrap_or(Err(VirtioError::Timeout));
     terminal?;
     if mapped {
         if let Some(timeout_ms) = sweep_timeout_ms(budget) {
@@ -1816,7 +1855,7 @@ pub fn release_blob_for_owner_within(
     // serialized by it (see `note_alloc_retired`'s contract); PASSIVE here, no
     // other lock held, so the acquisition is legal and unordered against
     // nothing. A resid with no ledger slot no-ops.
-    adapter.with_scanout_lifecycle(passive, |_lock| {
+    let _ = adapter.try_with_scanout_lifecycle(passive, |_lock| {
         adapter.read_ledger.note_alloc_retired(res);
     });
     result
@@ -2389,6 +2428,45 @@ pub fn submit_venus_async_present(
             ),
         }
     }))
+}
+
+/// The outcome of [`submit_venus_async_blt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BltSubmit {
+    /// The copy was enqueued on ring 1; its wire fence. The destination's writer ownership is
+    /// held by the in-flight table and handed back by the completion DPC.
+    Fence(u64),
+    /// The destination is owned by a reader, or by a writer that is not one of the direct
+    /// submissions: nothing was enqueued.
+    DstBusy,
+}
+
+/// Nonblocking KMD Present-BLT submission of a DIRECT asynchronous Blt (`BltAsync`,
+/// `docs/zero-copy-present.md`, "Asynchronous composed present"). Like
+/// [`submit_venus_async_present`] on ring 1 without a notify, but the destination's writer
+/// ownership is taken (or joined) in the SAME transport critical section as the enqueue, the
+/// copy is recorded in the in-flight table, and the completion DPC (not the caller) hands the
+/// buffer back: nothing here, and nothing the caller does afterwards, waits for the host.
+pub fn submit_venus_async_blt(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    stream: &[u8],
+    resource_id: u32,
+    source_id: u32,
+) -> Result<BltSubmit, VirtioError> {
+    let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
+    let queued = adapter.with_virtio(move |v| {
+        v.drain_used();
+        v.enqueue_async_submit_blt(adapter, ctx_id, meta, venus, venus_len, resource_id, source_id)
+    });
+    match queued {
+        Ok(Ok(crate::virtio::gpu::BltEnq::Fence(fence_id))) => Ok(BltSubmit::Fence(fence_id)),
+        // The staged buffers are dropped here, at PASSIVE.
+        Ok(Ok(crate::virtio::gpu::BltEnq::Busy(_meta, _venus))) => Ok(BltSubmit::DstBusy),
+        Ok(Err((_meta, _venus, e))) => Err(e),
+        Err(_) => Err(VirtioError::DeviceError),
+    }
 }
 
 /// Legacy inline Present cannot leave the callback and retry asynchronously.

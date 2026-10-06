@@ -1133,6 +1133,26 @@ void HeliosDxvkDevice::handoff_register(std::size_t d3d11_resource_ptr) const no
   });
 }
 
+std::uint32_t HeliosDxvkDevice::mark_blt_source(std::size_t d3d11_resource_ptr) const noexcept {
+  return bridge_guard("mark_blt_source", std::uint32_t(0), [&]() -> std::uint32_t {
+    if (!impl || impl->device == nullptr)
+      return 0;
+    auto* texture = dxvk::GetCommonTexture(reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr));
+    if (!texture || !texture->GetImage())
+      return 0;
+    auto image = texture->GetImage();
+    if (const std::uint32_t resid = image->heliosBltSourceResid())
+      return resid;
+    // The same id the hand-off ledger keys on: NVK's IMPORT_RM id, which is
+    // also the KMD's resource id for the adopted allocation and the read
+    // ledger's key for a Blt from it.
+    const std::uint32_t resid = handoff_key(*impl, d3d11_resource_ptr);
+    if (resid)
+      image->setHeliosBltSourceResid(resid);
+    return resid;
+  });
+}
+
 void HeliosDxvkDevice::handoff_unregister(std::size_t d3d11_resource_ptr) const noexcept {
   bridge_guard("handoff_unregister", false, [&]() -> bool {
     if (!impl || !helios_handoff::enabled())

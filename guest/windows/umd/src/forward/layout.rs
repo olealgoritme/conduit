@@ -229,6 +229,7 @@ pub(crate) unsafe extern "system" fn destroy_element_layout(
                         true
                     }
                 });
+            dev.owned.ia_gen.fetch_add(1, Ordering::Release);
             let _ = dev.owned.bindings.current_layout.compare_exchange(
                 p,
                 0,
@@ -287,6 +288,23 @@ pub(crate) unsafe fn bind_input_layout(h: Hdevice) {
                 vp
             );
         }
+        return;
+    }
+    // Per-draw fast path: the same (layout, VS) pair as the last draw on this
+    // context resolves to the same input layout and VS variant until a cache
+    // eviction bumps `ia_gen`. This skips the caches lock, two SipHash map
+    // lookups and the variant key's heap Vec on nearly every draw.
+    let gen = dev.owned.ia_gen.load(Ordering::Acquire);
+    let memo = *bindings
+        .ia_memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((il_raw, vs_to_bind)) = memo.get(gen, lp, vp) {
+        if let Some(context) = d3d11_context(h) {
+            let il = ManuallyDrop::new(ID3D11InputLayout::from_raw(il_raw as *mut c_void));
+            context.IASetInputLayout(&*il);
+        }
+        bind_vs_to(h, bindings, vp, vs_to_bind);
         return;
     }
     let cached = dev.owned.caches_lock().layout_cache.get(&(lp, vp)).copied();
@@ -428,7 +446,19 @@ pub(crate) unsafe fn bind_input_layout(h: Hdevice) {
     // any (layout, VS) pair the runtime allows to bind matched the app's
     // original input signature — so bind a variant recompiled with the
     // layout's classes whenever any attribute is non-float.
-    resolve_vs_input_variant(h, lp, vp);
+    let vs_to_bind = resolve_vs_input_variant(h, lp, vp);
+    if vs_to_bind != 0 {
+        *bindings
+            .ia_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = crate::device_funcs::IaMemo {
+            gen,
+            layout: lp,
+            vs: vp,
+            input_layout: il_raw,
+            vs_to_bind,
+        };
+    }
 }
 
 /// Numeric class of a DXGI vertex format for Vulkan's vertex-input contract,
@@ -458,14 +488,16 @@ pub(crate) fn dxgi_vertex_mask(format: i32) -> u32 {
 /// Pick (and lazily compile) the vertex-shader variant whose declared input
 /// component types match the bound layout's format classes, then bind it.
 /// All-float layouts (the overwhelmingly common case) bind the original.
-pub(crate) unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) {
+///
+/// Returns the VS it bound (or found already bound), 0 when it could not run.
+pub(crate) unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) -> usize {
     // Caches are device-global; the bound-VS shadow belongs to the RECORDING
     // context (a DC's own under command lists).
     let Some(dev) = helios_device(h) else {
-        return;
+        return 0;
     };
     let Some(bindings) = ctx_bindings(h) else {
-        return;
+        return 0;
     };
     let layout = &*(lp as *const LayoutData);
     // (register, class, mask) per input register, merging multi-element
@@ -524,6 +556,18 @@ pub(crate) unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) 
         }
     };
 
+    bind_vs_to(h, bindings, vp, desired);
+    desired
+}
+
+/// Hand `desired` (the runtime's VS `vp` or its input-class variant) to
+/// DXVK's VSSetShader unless it is the one already bound on this context.
+unsafe fn bind_vs_to(
+    h: Hdevice,
+    bindings: &crate::device_funcs::CtxBindings,
+    vp: usize,
+    desired: usize,
+) {
     if bindings.bound_vs_com.load(Ordering::Relaxed) == desired {
         return;
     }
@@ -623,20 +667,18 @@ pub(crate) unsafe extern "system" fn ia_set_vertex_buffers(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let mut bufs: Vec<Option<ID3D11Buffer>> = Vec::with_capacity(num as usize);
-    for i in 0..num as usize {
-        let h_buf = *buffers.add(i);
-        bufs.push(load_resource(h_buf).and_then(|r| (*r).cast::<ID3D11Buffer>().ok()));
-    }
+    // Pre-cast buffer words from the resource slots: no Vec, no per-buffer
+    // QueryInterface + AddRef/Release (profiled at ~4 % of Heaven's render
+    // thread on 334.1).
+    let bufs = super::bindings::collect_vertex_buffers(num, buffers);
+    let first_raw = if num != 0 && !buffers.is_null() {
+        super::bindings::buffer_raw_of(*buffers)
+    } else {
+        0
+    };
     if let Some(bindings) = ctx_bindings(h) {
         if start == 0 && num != 0 {
-            bindings.current_vb0.store(
-                bufs.first()
-                    .and_then(|b| b.as_ref())
-                    .map(|b| b.as_raw() as usize)
-                    .unwrap_or(0),
-                Ordering::Relaxed,
-            );
+            bindings.current_vb0.store(first_raw, Ordering::Relaxed);
             bindings.current_vb0_stride.store(
                 if strides.is_null() { 0 } else { *strides },
                 Ordering::Relaxed,
@@ -647,8 +689,7 @@ pub(crate) unsafe extern "system" fn ia_set_vertex_buffers(
             );
         }
     }
-    let n = IA_BIND_LOG_COUNT.next();
-    if n < 128 || num == 0 {
+    if crate::trace_enabled() && (IA_BIND_LOG_COUNT.next() < 128 || num == 0) {
         let first_stride = if num != 0 && !strides.is_null() {
             *strides
         } else {
@@ -659,11 +700,6 @@ pub(crate) unsafe extern "system" fn ia_set_vertex_buffers(
         } else {
             0
         };
-        let first_raw = bufs
-            .first()
-            .and_then(|b| b.as_ref())
-            .map(|b| b.as_raw() as usize)
-            .unwrap_or(0);
         trace_line!(
             "DDI IASetVertexBuffers start={} num={} first=0x{:x} stride={} offset={}",
             start,
@@ -675,8 +711,8 @@ pub(crate) unsafe extern "system" fn ia_set_vertex_buffers(
     }
     context.IASetVertexBuffers(
         start,
-        num,
-        Some(bufs.as_ptr()),
+        bufs.len(),
+        Some(bufs.as_com_ptr::<ID3D11Buffer>()),
         Some(strides),
         Some(offsets),
     );
@@ -691,12 +727,13 @@ pub(crate) unsafe extern "system" fn ia_set_index_buffer(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let buf = load_resource(h_buf).and_then(|r| (*r).cast::<ID3D11Buffer>().ok());
+    // The pre-cast buffer word (see `ia_set_vertex_buffers`); borrowed, not
+    // owned, so it is never released here.
+    let buf_raw = super::bindings::buffer_raw_of(h_buf);
+    let buf = (buf_raw != 0)
+        .then(|| ManuallyDrop::new(ID3D11Buffer::from_raw(buf_raw as *mut c_void)));
     if let Some(bindings) = ctx_bindings(h) {
-        bindings.current_ib.store(
-            buf.as_ref().map(|b| b.as_raw() as usize).unwrap_or(0),
-            Ordering::Relaxed,
-        );
+        bindings.current_ib.store(buf_raw, Ordering::Relaxed);
         bindings
             .current_ib_format
             .store(format as u32, Ordering::Relaxed);
@@ -705,10 +742,10 @@ pub(crate) unsafe extern "system" fn ia_set_index_buffer(
     if IA_BIND_LOG_COUNT.first_n(128).is_some() {
         trace_line!(
             "DDI IASetIndexBuffer raw=0x{:x} fmt={} offset={}",
-            buf.as_ref().map(|b| b.as_raw() as usize).unwrap_or(0),
+            buf_raw,
             format as u32,
             offset
         );
     }
-    context.IASetIndexBuffer(buf.as_ref(), DXGI_FORMAT(format as i32), offset);
+    context.IASetIndexBuffer(buf.as_deref(), DXGI_FORMAT(format as i32), offset);
 }

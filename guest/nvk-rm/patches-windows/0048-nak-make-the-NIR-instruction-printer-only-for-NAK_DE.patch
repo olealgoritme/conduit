@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 18:41:14 +0200
+Subject: [PATCH] nak: make the NIR instruction printer only for
+ NAK_DEBUG=annotate
+
+Every shader compile created a NirInstrPrinter, whose memstream is a
+temporary file on Windows (GetTempFileName in %TEMP% + fopen). A
+sandboxed process may not create it (Edge's GPU process: low integrity,
+restricted token), so NirInstrPrinter::new().unwrap() panicked with
+"Access is denied" in from_nir.rs, nak_compile_shader returned NULL,
+every pipeline failed with VK_ERROR_UNKNOWN and DXVK lost the device:
+Edge's GPU process restarted three times and fell back to software.
+Outside a sandbox it cost a temp file create per compiled shader.
+
+The printer is now made on first use, which only NAK_DEBUG=annotate
+reaches.
+---
+ src/nouveau/compiler/nak/from_nir.rs | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
+index fa9b66a..99c4e1c 100644
+--- a/src/nouveau/compiler/nak/from_nir.rs
++++ b/src/nouveau/compiler/nak/from_nir.rs
+@@ -383,7 +383,9 @@ struct ShaderFromNir<'a> {
+     end_block_id: u32,
+     ssa_map: FxHashMap<u32, Vec<SSAValue>>,
+     saturated: FxHashSet<*const nir_def>,
+-    nir_instr_printer: NirInstrPrinter,
++    /// Only made for NAK_DEBUG=annotate: on Windows a memstream is a file
++    /// in %TEMP%, which a sandboxed process may not create.
++    nir_instr_printer: Option<NirInstrPrinter>,
+ }
+ 
+ impl<'a> ShaderFromNir<'a> {
+@@ -408,10 +410,15 @@ impl<'a> ShaderFromNir<'a> {
+             end_block_id: 0,
+             ssa_map: Default::default(),
+             saturated: Default::default(),
+-            nir_instr_printer: NirInstrPrinter::new().unwrap(),
++            nir_instr_printer: None,
+         }
+     }
+ 
++    fn nir_instr_printer(&mut self) -> &mut NirInstrPrinter {
++        self.nir_instr_printer
++            .get_or_insert_with(|| NirInstrPrinter::new().unwrap())
++    }
++
+     fn get_block_label(&mut self, block: &nir_block) -> Label {
+         *self
+             .block_label
+@@ -4326,7 +4333,7 @@ impl<'a> ShaderFromNir<'a> {
+ 
+             if DEBUG.annotate() {
+                 let annotation = self
+-                    .nir_instr_printer
++                    .nir_instr_printer()
+                     .instr_to_string(ni)
+                     .unwrap()
+                     .split_whitespace()
+@@ -4376,7 +4383,7 @@ impl<'a> ShaderFromNir<'a> {
+         for ni in nb.iter_instr_list() {
+             if DEBUG.annotate() && ni.type_ != nir_instr_type_phi {
+                 let annotation = self
+-                    .nir_instr_printer
++                    .nir_instr_printer()
+                     .instr_to_string(ni)
+                     .unwrap()
+                     .split_whitespace()
+@@ -4454,7 +4461,7 @@ impl<'a> ShaderFromNir<'a> {
+ 
+                 if DEBUG.annotate() {
+                     let annotation = self
+-                        .nir_instr_printer
++                        .nir_instr_printer()
+                         .instr_to_string(ni)
+                         .unwrap()
+                         .split_whitespace()
+-- 
+2.43.0
+

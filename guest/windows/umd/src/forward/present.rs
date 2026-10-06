@@ -1400,6 +1400,16 @@ static NVK_PRESENT_NO_ID: AtomicUsize = AtomicUsize::new(0);
 /// Log the allocation an NVK present shows and whether it carries a foreign
 /// resource id: the first 64 presents, then every one without an id (first
 /// 64 of those) and every 512th.
+/// Was `shown` made by `finish_wddm_tex2d_nvk` as a primary (fullscreen
+/// exclusive flip chain) with a resource id?
+unsafe fn nvk_source_is_primary(shown: ddi::D3D10DDI_HRESOURCE) -> bool {
+    let alloc = resource_allocation(shown);
+    lock_ignore_poison(&NVK_ALLOC_BOOK)
+        .iter()
+        .find(|e| e.0 == alloc)
+        .is_some_and(|e| e.1 != 0 && e.4)
+}
+
 unsafe fn nvk_log_present_source(shown: ddi::D3D10DDI_HRESOURCE) {
     let alloc = resource_allocation(shown);
     let entry = lock_ignore_poison(&NVK_ALLOC_BOOK).iter().find(|e| e.0 == alloc).copied();
@@ -1436,11 +1446,44 @@ static NVK_WAIT_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Does DWM import NVK-made surfaces? The same `ForeignImport` knob the Venus
 /// side of this driver reads (DWM's DXVK enables explicit DRM-modifier imports).
+///
+/// A DWM on NVK (`DwmIcd=nvk`, docs/dwm-on-nvk.md) imports NVK surfaces by
+/// resource id natively, so it composes them too: then an NVK app's frames go
+/// to DWM like any app's instead of taking scanout 0 for the whole screen
+/// (which interleaved with DWM's own flips about once a second).
 fn nvk_dwm_composes() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| {
         helios_umd_common::knobs::reg_dword(c"ForeignImport").is_some_and(|v| v != 0)
+            || dwm_on_nvk_marker()
     })
+}
+
+/// The marker the DWM on NVK holds (`Local\HeliosDwmOnNvk`,
+/// `umd_common/bridge/bridge_icd_backend.cpp` "the desktop follows DWM"),
+/// with `DwmIcd=nvk` in the registry. ERROR_ACCESS_DENIED (a sandboxed
+/// opener) also means it exists.
+fn dwm_on_nvk_marker() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenEventA(access: u32, inherit: i32, name: *const u8) -> *mut c_void;
+        fn CloseHandle(h: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    if !helios_umd_common::knobs::reg_sz(c"DwmIcd").is_some_and(|v| v.trim().eq_ignore_ascii_case("nvk")) {
+        return false;
+    }
+    // SAFETY: a NUL-terminated name; the handle is closed at once.
+    unsafe {
+        let h = OpenEventA(SYNCHRONIZE, 0, c"Local\\HeliosDwmOnNvk".as_ptr().cast());
+        if !h.is_null() {
+            CloseHandle(h);
+            return true;
+        }
+        GetLastError() == ERROR_ACCESS_DENIED
+    }
 }
 
 static NVK_FENCED_PRESENTS: AtomicUsize = AtomicUsize::new(0);
@@ -1482,11 +1525,19 @@ unsafe fn nvk_present_frame(
     // DWM itself never takes scanout 0 through NVK's own source (a level-2
     // user source would hide its flips from dxgkrnl's flip queue and present
     // statistics): every DWM frame is a WDDM flip (docs/dwm-on-nvk.md).
+    // A fullscreen-exclusive source (a primary: DXGI flips it, DWM composes
+    // nothing) goes to scanout 0 with its RM fence even when DWM composes NVK
+    // apps: that path neither waits on the CPU nor waits for DWM, while the
+    // composed path costs a CPU wait per frame (Heaven 5120x1440 fullscreen
+    // under an NVK DWM: 134 fps composed, the S3 wait; scanout 0 is GPU bound).
     let scanout = match crate::knobs::nvk_present_mode() {
         _ if crate::knobs::is_dwm_process() => false,
         1 => true,
         2 => false,
-        _ => !(nvk_dwm_composes() && NVK_PRESENT_BUFFERS.load(Ordering::Relaxed) == 1),
+        _ => {
+            nvk_source_is_primary(shown)
+                || !(nvk_dwm_composes() && NVK_PRESENT_BUFFERS.load(Ordering::Relaxed) == 1)
+        }
     };
     let caps = dev.dxvk.nvk_icd_caps();
     let fences = crate::knobs::nvk_rm_fence() && caps & HELIOS_ICD_CAP_RM_FENCE != 0;
@@ -1538,6 +1589,7 @@ unsafe fn nvk_present_frame(
                     ..PresentStreamCorrelation::default()
                 },
                 on_scanout: false,
+                compose: true,
             });
         }
     }
@@ -1585,6 +1637,10 @@ unsafe fn nvk_present_frame(
 struct NvkFrame {
     correlation: PresentStreamCorrelation,
     on_scanout: bool,
+    /// For a frame on scanout: does it also go through the WDDM present
+    /// (`NvkScanoutComposeEvery`)? Decided in `on_scanout`, so the
+    /// already-on-scanout claim is only fetched for frames that carry it.
+    compose: bool,
 }
 
 impl NvkFrame {
@@ -1593,7 +1649,21 @@ impl NvkFrame {
     /// already-on-scanout claim (`helios_onscanout.h`), so a KMD that can
     /// verify it completes the Blt without copying; an older NVK (no
     /// `scanout_frame`) or KMD gives no claim / ignores it: the ordinary Blt.
+    ///
+    /// The claim is fetched only when this frame is composed: a skipped WDDM
+    /// present (the default at DDI 1.3) has no use for it, and `scanout_frame`
+    /// takes NVK's device mutex, which the flip path holds across its KMD
+    /// escape, so asking every frame serialised the app behind the last flip
+    /// (S3 B 4400-5450 -> 2383 fps on 328.1).
     fn on_scanout(dev: &HeliosDevice, src: &ID3D11Resource) -> Self {
+        let compose = nvk_scanout_compose_decide();
+        if !compose {
+            return Self {
+                correlation: PresentStreamCorrelation::default(),
+                on_scanout: true,
+                compose: false,
+            };
+        }
         let claim = dev.dxvk.nvk_scanout_frame(src).map(|(sequence, generation)| {
             crate::bridge::OnScanoutClaim {
                 sequence,
@@ -1613,6 +1683,7 @@ impl NvkFrame {
                 ..PresentStreamCorrelation::default()
             },
             on_scanout: true,
+            compose: true,
         }
     }
 }
@@ -1632,9 +1703,13 @@ static NVK_SCANOUT_COMPOSED: AtomicUsize = AtomicUsize::new(0);
 /// 1024 scanout frames: with the WDDM present skipped, ETW-based tools
 /// (PresentMon) no longer see the frames, so this line is the frame clock.
 fn nvk_scanout_compose(frame: NvkFrame) -> bool {
-    if !frame.on_scanout {
-        return true;
-    }
+    !frame.on_scanout || frame.compose
+}
+
+/// The per-frame half of `nvk_scanout_compose`, called once per scanout
+/// frame from `NvkFrame::on_scanout`: counts the frame, decides whether it
+/// is composed, and logs the frame rate every 1024 frames.
+fn nvk_scanout_compose_decide() -> bool {
     let n = NVK_SCANOUT_FRAMES.fetch_add(1, Ordering::Relaxed);
     let every = crate::knobs::nvk_scanout_compose_every() as usize;
     let compose = n == 0 || (every != 0 && n % every == 0);
@@ -1716,6 +1791,14 @@ unsafe fn nvk_present_impl(
     };
     if !nvk_scanout_compose(frame) {
         return 0;
+    }
+    // The KMD's Blt copy of this source may still be queued when Present
+    // returns (BltAsync), and nothing else orders the next frame's NVK writes
+    // into it after that copy: tag it so DXVK's next command lists that touch
+    // it wait for the KMD's read-ledger claim (zero-copy-present.md 24.10.3).
+    // Once per resource; later calls are an atomic load in the bridge.
+    if let (Some(dev), Some(src)) = (helios_device(h), load_resource(src_h)) {
+        let _ = dev.dxvk.mark_blt_source(src.as_raw() as usize);
     }
     let correlation = frame.correlation;
     let result = finish_present(

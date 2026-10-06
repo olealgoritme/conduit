@@ -1,0 +1,86 @@
+From 1258a1825489043aa196a1ca0729538559baceeb Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 21:36:00 +0200
+Subject: [PATCH] nvk/rm, wsi: no scanout swap chains while a DWM on NVK
+ composes the desktop
+
+NVK's Win32 WSI made every swap chain a Helios scanout swap chain when
+the KMD supports scanout: its images go straight to scanout 0. Under a
+DWM on NVK (DwmIcd=nvk plus the Local\HeliosDwmOnNvk marker) that takes
+the whole display from DWM's flips, and the app's window, which DWM
+composes, stays black: OpenGL Heaven on Zink under an NVK DWM.
+
+The D3D11 UMD already composes through DWM in that case
+(nvk_dwm_composes). Do the same here: while the shared Helios policy
+(helios_policy_desktop_follows_dwm) says DWM is on NVK, window swap
+chains take the WSI's GDI path and DWM composes them.
+NVK_HELIOS_WSI_SCANOUT=1 forces scanout swap chains anyway. A zero-copy
+composed path replaces the GDI copy later.
+---
+ src/nouveau/vulkan/nvk_wsi.c               | 12 +++++++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |  4 ++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c | 10 ++++++++++
+ 3 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
+index 62bd5a7..d26e880 100644
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -168,7 +168,17 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
+       pdev->nvkmd->sync_types[0]->export_sync_file == NULL;
+ 
+ #ifdef _WIN32
+-   if (nvkmd_rm_scanout_supported(pdev->nvkmd)) {
++   /* Helios scanout swap chains show their images on scanout 0 in place of
++    * the desktop. Under a DWM on NVK that hides DWM's own flips and leaves
++    * the app's window black, so window swap chains then present through
++    * the WSI's GDI path and DWM composes them, like the D3D11 UMD's frames
++    * (NVK_HELIOS_WSI_SCANOUT=1 forces scanout anyway).
++    */
++   const bool dwm_composes = nvkmd_rm_helios_dwm_composes() &&
++      !debug_get_bool_option("NVK_HELIOS_WSI_SCANOUT", false);
++   if (dwm_composes)
++      mesa_logi("NVK: DWM on NVK composes this desktop: no scanout swap chains");
++   if (!dwm_composes && nvkmd_rm_scanout_supported(pdev->nvkmd)) {
+       pdev->wsi_device.win32.scanout_export = nvk_wsi_scanout_export;
+       pdev->wsi_device.win32.scanout_flip = nvk_wsi_scanout_flip;
+       pdev->wsi_device.win32.scanout_wait_released =
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index a8a0f97..d11084d 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -152,6 +152,10 @@ const struct nvkmd_rm_lib *nvkmd_rm_lib_get(void);
+  * NvkDenyList, NvkAllowList) gives this process NVK rather than Venus.
+  */
+ bool nvkmd_rm_helios_allows_nvk(void);
++/* A DWM on NVK composes this desktop (DwmIcd=nvk and its marker): window
++ * swap chains must present through DWM, not take scanout 0 for themselves.
++ */
++bool nvkmd_rm_helios_dwm_composes(void);
+ #endif
+ 
+ /* Turns a librmclient return value into a VkResult, logging failures */
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index b349cd4..57c90f0 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -152,6 +152,16 @@ nvkmd_rm_helios_allows_nvk(void)
+    return helios_allowed;
+ }
+ 
++bool
++nvkmd_rm_helios_dwm_composes(void)
++{
++#ifdef NVK_HELIOS_SHARED_POLICY
++   return helios_policy_desktop_follows_dwm() != 0;
++#else
++   return false;
++#endif
++}
++
+ /* For Zink, which loads NVK directly and keeps the Vulkan loader for a
+  * process the policy sends to Venus.
+  */
+-- 
+2.43.0
+

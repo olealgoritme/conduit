@@ -4182,6 +4182,12 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             0,
             true,
         );
+        // S-A0 census (`ddi/std_census.rs`): a registered open of a KMD-made STANDARD
+        // allocation, its slot recovered from the meta's standard and GDI type bits. Counting
+        // only. PASSIVE (this DDI).
+        if ident.is_some_and(|identity| identity.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD) {
+            crate::ddi::std_census::note_open(meta.map_or(0, |m| m.misc_flags));
+        }
         info.hDeviceSpecificAllocation = Box::into_raw(open) as HANDLE;
         crate::diag::record(
             0x0C36_0000 | ((info.hDeviceSpecificAllocation as usize as u32) & 0xFFFF),
@@ -4593,6 +4599,9 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         args.ResourcePrivateDriverDataSize = PRIV_SIZE;
     }
     args.AllocationPrivateDriverDataSize = PRIV_SIZE;
+    // S-A0 census (`ddi/std_census.rs`): counting only, after every refusal arm above, so a
+    // request is counted once (phase 2 only; phase 1 is the size query). PASSIVE DDI.
+    crate::ddi::std_census::note_request(standard_allocation_type, gdi_surface_type, size);
     crate::diag::record(0x0C02_0005);
     STATUS_SUCCESS
 }

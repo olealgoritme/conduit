@@ -123,9 +123,11 @@ struct crm_transport {
 const struct crm_transport *crm_linux_transport(void);
 
 /* The Windows transport: escapes through the Conduit KMD
- * (HELIOS_ESCAPE_NVRM on D3DKMTEscape). open/close/ioctl, CPU mapping and
- * alloc_pages work; event_wait answers -ENOSYS until the KMD provides OS
- * events. NULL on non-Windows builds. */
+ * (HELIOS_ESCAPE_NVRM on D3DKMTEscape). open/close/ioctl, CPU mapping,
+ * alloc_pages and event_wait work. Once the device was reset or its transport
+ * replaced, every call (event_wait included) answers -ENODEV until the next
+ * open, which starts a new generation on the KMD that came back; handles,
+ * mappings and events of the old one stay gone. NULL on non-Windows builds. */
 const struct crm_transport *crm_windows_transport(void);
 
 /*

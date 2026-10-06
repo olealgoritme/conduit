@@ -218,6 +218,12 @@ pub unsafe extern "C" fn dxgkddi_present(
     // fixed timeline write is the only per-call publication: no registry I/O,
     // allocation, lock, wait, or producer polling is introduced here.
     let end_100ns = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
+    // `PrDdi*`: this DDI's own wall time by arm (flip bit 2 of the present flags), so a Present
+    // cost seen by the UMD can be placed inside or outside the KMD. Atomics only.
+    crate::ddi::blt_async::note_present_wall(
+        PRESENT_LAST_FLAGS.load(Ordering::Relaxed) & (1 << 2) == 0,
+        end_100ns.saturating_sub(start_100ns),
+    );
     crate::ddi::scanout_timeline::note(
         crate::ddi::scanout_timeline::kind::PRESENT_RETURN,
         if status == STATUS_SUCCESS {
@@ -339,6 +345,12 @@ unsafe fn dxgkddi_present_inner(
     let stashed_stream_marker = present_context
         .as_ref()
         .and_then(ContextHandleRef::take_present_stream_marker_stash);
+    // The "already on scanout" tag (`HOSC`) the same Render left, taken (read + CLEAR) on every
+    // Present that resolves its context, whatever its arm, like the snapshot and the marker. One
+    // relaxed load for a context that carries none.
+    let onscanout_tag = present_context
+        .as_ref()
+        .and_then(ContextHandleRef::take_onscanout_tag);
     let present_stream_boundary = stashed_stream_marker.and_then(|marker| {
         let (ctx_id, value, cookie) = match marker {
             // An RM fence attached at Render: only its boundary travels.
@@ -370,6 +382,24 @@ unsafe fn dxgkddi_present_inner(
         .unwrap_or(core::ptr::null_mut());
     let src_info = unsafe { present_alloc_info(adapter, src_handle) };
     let dst_info = unsafe { present_alloc_info(adapter, dst_handle) };
+    // Is this Blt's copy owed at all? A producer that already put the frame on scanout through the
+    // user foreign-scanout source says so with a tag, and the KMD takes its word only when its own
+    // state backs every part of it (`helios_kmd_logic::onscanout::verify`); anything else is
+    // counted and the Present is the ordinary Blt. Flips are never skipped (the verdict refuses
+    // them): they copy nothing and their completion machinery must run as ever.
+    let onscanout_skip = onscanout_tag.filter(|tag| {
+        crate::ddi::onscanout::decide(
+            present_context.as_ref(),
+            *tag,
+            present_arm,
+            // No Blt copy in this Present: no allocation list, or the Blt flag is not set.
+            !payload_has_list || present_flags & 1 == 0,
+            present_flags & (1 << 1) != 0,
+            !args.pDstSubRects.is_null() && args.SubRectCnt != 0,
+            stashed_snapshot.is_some(),
+            src_info.as_ref(),
+        )
+    });
     if payload_has_list {
         PRESENT_LAST_SRC_OPEN_LOW.store(src_handle as usize as u32, Ordering::Relaxed);
         PRESENT_LAST_DST_OPEN_LOW.store(dst_handle as usize as u32, Ordering::Relaxed);
@@ -461,6 +491,23 @@ unsafe fn dxgkddi_present_inner(
             }
         }
 
+        // The producer's frame is already on scanout and the KMD verified it: complete this Blt
+        // with no copy. Before every other Blt arm (the level 5 RM primary included): none of them
+        // has done anything yet, and their copies are what is being skipped.
+        if let Some(tag) = onscanout_skip {
+            return unsafe {
+                present_blt_onscanout(
+                    args,
+                    present_allocations,
+                    present_stream_boundary,
+                    tag,
+                    adapter,
+                    src_info,
+                    dst_info,
+                )
+            };
+        }
+
         // Level 5 (`KmdRmClient` = 5): a Blt whose destination is the RM system-memory
         // primary has no Present buffer behind it, so the arm below would fail the Present
         // (`begin_present_buffer_write_legacy` knows no such buffer). It takes the CPU-copy
@@ -500,6 +547,9 @@ unsafe fn dxgkddi_present_inner(
                 Err(status) => return status,
             }
         } else if present_flags & 1 != 0 {
+            // The Blt arm proper: the entry decision below is counted against this
+            // (`BltEntrySeen`), so a Blt that returns before it shows as `BltNoEntryO`.
+            crate::ddi::blt_async::note_entry_seen();
             let bytes = core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmd>() as UINT;
             if args.pDmaBuffer.is_null() || args.DmaSize < bytes {
                 PRESENT_LAST_STATUS.store(
@@ -639,6 +689,11 @@ unsafe fn dxgkddi_present_inner(
                 },
                 None => None,
             };
+            // What the source is, for `BltAsync` and `BltNoMirror` (`ddi/blt_async.rs`): an adopted
+            // foreign (NVK-on-RM) allocation the KMD copies as one, one it does not (`ForeignCopy`
+            // 0: the legacy arm below imports it as an ordinary image, so neither knob may act on
+            // it), or a Venus-native image.
+            let mut source_class = helios_kmd_logic::blt_async::SourceClass::Venus;
             let source_desc = if let Some(snapshot) = snapshot_source {
                 // D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET. The
                 // image was created by the UMD snapshot ring with exactly these
@@ -663,6 +718,7 @@ unsafe fn dxgkddi_present_inner(
                 // explicit-modifier dma-buf image from its layout record. The
                 // pixel format is the record's fourcc. Every other source takes
                 // the match below, unchanged.
+                source_class = helios_kmd_logic::blt_async::SourceClass::Foreign;
                 OptimalPresentImageDesc::new_foreign_dma_buf(
                     source.resource_id,
                     source.width,
@@ -671,6 +727,10 @@ unsafe fn dxgkddi_present_inner(
                     foreign,
                 )
             } else {
+                if source.foreign.is_some() {
+                    // `foreign_source_if_enabled` refused it (counted `FcOff`).
+                    source_class = helios_kmd_logic::blt_async::SourceClass::ForeignCopyOff;
+                }
                 match source.storage {
                     PresentAllocationStorage::OptimalCrossContextImage => {
                         OptimalPresentImageDesc::new_cross_context_dma_buf(
@@ -751,6 +811,21 @@ unsafe fn dxgkddi_present_inner(
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return crate::ddi::present_foreign::invalid(site::BLT_EXTENT);
             }
+            // The entry decision, once, before either path below and after every precondition:
+            // whether `BltAsync` / `BltNoMirror` act on this Blt, and if neither does, why
+            // (`BltEntryWhy`, `BltNoEntry*`). Pure: `helios_kmd_logic::blt_async::entry`.
+            let entry = helios_kmd_logic::blt_async::entry(helios_kmd_logic::blt_async::EntryFacts {
+                async_on: crate::ddi::blt_async::async_on(),
+                no_mirror_on: crate::ddi::blt_async::no_mirror_on(),
+                async_venus_on: crate::ddi::blt_async::async_venus_on(),
+                source: source_class,
+                snapshot: snapshot_source.is_some(),
+                dst_standard_buffer: matches!(
+                    destination_desc,
+                    PresentDestinationDesc::StandardBuffer(_)
+                ),
+            });
+            crate::ddi::blt_async::note_entry(entry);
             // A typed WindowedBlt snapshot is a TWO-PHASE transaction. Prepare
             // its reusable Venus command and reserve the exact reader lease at
             // Present, but do not submit until SubmitCommand admits the same
@@ -843,6 +918,56 @@ unsafe fn dxgkddi_present_inner(
                     PresentDestinationDesc::StandardBuffer(desc) => Some(desc.resource_id()),
                     PresentDestinationDesc::OptimalImage(_) => None,
                 };
+                // `BltNoMirror` applies to a Blt the entry decision admitted, whichever arm below
+                // copies it; `BltAsync` takes such a Blt out of this arm altogether.
+                let skip_mirror = entry.no_mirror;
+                if entry.async_enter {
+                    // SAFETY: `args` is dxgkrnl's present struct for this call (PASSIVE_LEVEL)
+                    // and the capacity of its private data was validated above.
+                    match unsafe {
+                        crate::ddi::blt_async::try_async(
+                            passive,
+                            adapter,
+                            args,
+                            source_desc,
+                            destination_desc,
+                            present_stream_boundary,
+                        )
+                    } {
+                        Ok(crate::ddi::blt_async::Taken::Legacy) => {}
+                        Ok(taken) => {
+                            // Submitted (a wire fence) or queued (a WindowedBlt token): the
+                            // DMA fence retires with the copy, and nothing here waits for it.
+                            let (copy, id) = match taken {
+                                crate::ddi::blt_async::Taken::Direct(fence) => (3, fence),
+                                crate::ddi::blt_async::Taken::Deferred(token) => (4, token),
+                                crate::ddi::blt_async::Taken::Legacy => (0, 0),
+                            };
+                            crate::diag::record_named_bytes(b"PBCpy", copy);
+                            crate::diag::record_named_bytes(b"PBFnc", id as u32);
+                            return unsafe {
+                                present_complete(
+                                    args,
+                                    present_allocations,
+                                    patch_capacity.take(),
+                                    present_stream_boundary,
+                                    present_arm,
+                                    Some(adapter),
+                                    src_info,
+                                    dst_info,
+                                )
+                            };
+                        }
+                        Err(status) => {
+                            crate::diag::record_named_bytes(b"PBCpy", 0xE6);
+                            PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+                            return crate::ddi::present_foreign::site(
+                                site::BLT_FENCE_MERGE,
+                                status,
+                            );
+                        }
+                    }
+                }
                 if let Some(resource_id) = destination_buffer {
                     if crate::virtio::ctrl::begin_present_buffer_write_legacy(
                         passive,
@@ -908,12 +1033,16 @@ unsafe fn dxgkddi_present_inner(
                 // mirror into those pages before Present retires; otherwise later
                 // frames update only the stale BAR blob.
                 if destination_buffer.is_some() {
-                    match crate::virtio::ctrl::wait_fence(
+                    let wait_started = crate::ddi::blt_async::now_100ns();
+                    let waited = crate::virtio::ctrl::wait_fence(
                         passive,
                         adapter,
                         gpu_fence,
                         5_000_000_000,
-                    ) {
+                    );
+                    // What `BltAsync` saves: the app thread's CPU wait for the copy (`BltWait*`).
+                    crate::ddi::blt_async::note_wait(wait_started);
+                    match waited {
                         crate::virtio::ctrl::WaitFenceOutcome::Complete => {
                             crate::diag::record_named_on_change(b"PBSyWt", 1, &PB_SYWT_LAST);
                         }
@@ -954,14 +1083,25 @@ unsafe fn dxgkddi_present_inner(
                         );
                     }
                 }
-                let mirror_ok = if destination_buffer.is_some() {
-                    match unsafe {
+                let mirror_ok = if destination_buffer.is_some() && skip_mirror {
+                    // `BltNoMirror`: DWM reads the GPU copy. The system pages VidMm may hold for
+                    // the destination are now older than the blob: marked invalid, so a page-in
+                    // does not copy them back over it and a later eviction pulls from the blob.
+                    crate::ddi::blt_async::note_mirror_skipped();
+                    crate::ddi::blt_async::mark_stale(adapter, destination.resource_id);
+                    crate::diag::record_named_bytes(b"PBSyCp", 3);
+                    true
+                } else if destination_buffer.is_some() {
+                    let mirror_started = crate::ddi::blt_async::now_100ns();
+                    let mirrored = unsafe {
                         crate::ddi::build_paging_buffer::mirror_present_system_backing(
                             passive,
                             adapter,
                             destination.resource_id,
                         )
-                    } {
+                    };
+                    crate::ddi::blt_async::note_mirror(mirror_started);
+                    match mirrored {
                         Some(true) => {
                             crate::diag::record_named_on_change(b"PBSyCp", 1, &PB_SYCP_LAST);
                             true
@@ -1493,6 +1633,69 @@ unsafe fn present_blt_skipped(
     }
 }
 
+/// A Blt whose producer already put the frame on scanout, verified by `ddi::onscanout::decide`
+/// (`helios_kmd_logic::onscanout`): complete it with no copy and no host call.
+///
+/// It is the legacy Blt arm minus the copy, and nothing else: the arm's own preconditions in its
+/// order and at its sites (a DMA buffer that holds the marker and a private record that holds the
+/// fence merge, then the patch capacity, all before anything is done, so dxgkrnl's retry protocol
+/// is unchanged and the retry, which carries no tag, is the ordinary Blt); then the same shared
+/// completion a skipped foreign Blt takes (`present_blt_skipped`: a fence-0 marker, the patch
+/// references, the DMA marker, the stream boundary). No destination buffer is begun and no token
+/// is queued, so there is nothing to retire or cancel: a windowed-Blt snapshot never reaches here
+/// (the verdict refuses it), which is where the ready-queue token lives.
+///
+/// # Safety
+/// As [`present_complete`]; `args` names the Blt arm.
+#[allow(clippy::too_many_arguments)]
+unsafe fn present_blt_onscanout(
+    args: &mut DXGKARG_PRESENT,
+    present_allocations: PresentAllocations,
+    present_stream_boundary: Option<u64>,
+    tag: helios_kmd_logic::onscanout::Tag,
+    adapter: Option<&AdapterContext>,
+    src_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+    dst_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+) -> NTSTATUS {
+    let bytes = core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmd>() as UINT;
+    if args.pDmaBuffer.is_null()
+        || args.DmaSize < bytes
+        || args.pDmaBufferPrivateData.is_null()
+        || (args.DmaBufferPrivateDataSize as usize)
+            < core::mem::size_of::<PresentSubmissionPrivate>()
+    {
+        crate::ddi::onscanout::note_retry();
+        PRESENT_LAST_STATUS.store(
+            STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER as u32,
+            Ordering::Relaxed,
+        );
+        return crate::ddi::present_foreign::site(
+            site::BLT_DMA_SMALL,
+            STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
+        );
+    }
+    let capacity = match present_allocations.validate_patch_capacity(args) {
+        Ok(capacity) => capacity,
+        Err(status) => {
+            crate::ddi::onscanout::note_retry();
+            PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+            return crate::ddi::present_foreign::site(site::BLT_PATCH, status);
+        }
+    };
+    crate::ddi::onscanout::note_skip(tag, src_info.as_ref());
+    unsafe {
+        present_blt_skipped(
+            args,
+            present_allocations,
+            Some(capacity),
+            present_stream_boundary,
+            adapter,
+            src_info,
+            dst_info,
+        )
+    }
+}
+
 /// The last `PBCpy` this arm wrote: the value changes rarely and the legacy arm's per-Present
 /// registry write is not repeated here.
 static RM_BLT_LAST_CPY: AtomicU32 = AtomicU32::new(0);
@@ -1650,6 +1853,12 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 .ok()
                 .flatten();
             request.map(|request| {
+                // `BltNoMirror`: from this submission the system pages VidMm may hold for the
+                // destination are older than its blob and nothing will mirror them.
+                if request.async_blt && request.no_mirror {
+                    crate::ddi::blt_async::mark_stale(adapter, request.destination_resource_id);
+                    crate::ddi::blt_async::note_mirror_skipped();
+                }
                 (
                     request.token,
                     request.stream_boundary,
@@ -1695,6 +1904,7 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
             .ok()
             .flatten();
         if let Some(request) = mirror {
+            let mirror_started = crate::ddi::blt_async::now_100ns();
             let ok = match unsafe {
                 crate::ddi::build_paging_buffer::mirror_present_system_backing(
                     passive,
@@ -1705,6 +1915,7 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 Some(true) | None => true,
                 Some(false) => false,
             };
+            crate::ddi::blt_async::note_mirror(mirror_started);
             let _ = adapter.with_virtio(|v| {
                 v.complete_windowed_blt_mirror(adapter, request.token, request.stream_boundary, ok)
             });
@@ -1895,6 +2106,8 @@ pub unsafe extern "C" fn dxgkddi_commit_vidpn(
     // `return SUCCESS` that never checks the pin is exactly viogpu3d's "commit but
     // light nothing" failure). Scanout itself is issued from SetVidPnSourceAddress.
     let adapter = unsafe { &*p };
+    // `FlipAnnounce`: the accepted allocations were checked against the OLD mode's extent.
+    crate::ddi::flip_announce::invalidate_all();
     let status = crate::ddi::vidpn::legalize_vidpn(unsafe {
         crate::ddi::vidpn::commit_vidpn(adapter, commit as *const DXGKARG_COMMITVIDPN)
     });
@@ -1954,6 +2167,10 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     // `FlipIss` (`ddi::stall_diag`): a flip dxgkrnl issued, recorded as the newest for the
     // watchdog. Atomics only, legal at DIRQL. Before anything below can publish or raise the gate.
     crate::ddi::stall_diag::note_flip_issued(primary_address);
+    // `FlipAnnounce`: forget an unconfirmed announcement and read, BEFORE this flip raises the
+    // programming gate, whether the worker is idle (`docs/kmd-rm-client.md` 15.18.15). One
+    // relaxed load with the knob off.
+    let announce_idle = crate::ddi::flip_announce::on_ddi_entry(adapter);
 
     // Dxgkrnl's MMIO-flip path invokes this DDI under DxgkCbSynchronizeExecution
     // at DIRQL. At that IRQL it is illegal to write registry diagnostics, wait on
@@ -2013,12 +2230,26 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         if previous != 0 && previous != h_alloc as usize {
             crate::ddi::scanout_trace::note_ddi_coalesced(previous);
         }
-        // `FfAsyncWin`: wake the worker NOW, through the DPC (`DxgkCbQueueDpc` is legal at
-        // DIRQL; `KeSetEvent` on the worker's event is not), instead of leaving the pending
-        // slot to the next vsync tick: at 240 Hz that tick is up to 4.17 ms away, a whole frame
-        // of publication latency. Atomics and the one DPC request only.
-        if crate::virtio::foreign_flip::early_wake() {
-            crate::virtio::foreign_flip::note_early_queued();
+        // `FlipAnnounce`: publish this flip's address toward dxgkrnl NOW (atomics only), so the
+        // next tick retires it; the worker programs it afterwards. Decided by
+        // `helios_kmd_logic::flip_retire::announce_decide`.
+        unsafe {
+            crate::ddi::flip_announce::at_ddi(adapter, h_alloc, primary_address, announce_idle)
+        };
+        // `FfAsyncWin` / `FlipEarlyWake` / `FlipAnnounce`: wake the worker NOW, through the DPC
+        // (`DxgkCbQueueDpc` is legal at DIRQL; `KeSetEvent` on the worker's event is not),
+        // instead of leaving the pending slot to the next vsync tick: at 240 Hz that tick is up
+        // to 4.17 ms away, a whole frame of publication latency. Atomics and the one DPC
+        // request only.
+        let ffl_wake = crate::virtio::foreign_flip::early_wake();
+        let ann_wake = crate::ddi::flip_announce::wakes_early();
+        if ffl_wake || ann_wake {
+            if ffl_wake {
+                crate::virtio::foreign_flip::note_early_queued();
+            }
+            if ann_wake {
+                crate::ddi::flip_announce::note_early();
+            }
             crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
         }
         return STATUS_SUCCESS;
@@ -2411,7 +2642,9 @@ pub(crate) fn process_deferred_vidpn_source_address(
     // says it is held.
     crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::DEFERRED_POST);
     if let Some(status) = status {
-        crate::diag::record_named_bytes(b"VpDSt", status as u32);
+        // Changed-only: this is one registry transaction per programmed flip on the worker, between
+        // two flips (`HpdMx18`); the status is almost always the same.
+        crate::diag::record_named_changed(b"VpDSt", status as u32);
     }
 }
 
@@ -2518,6 +2751,9 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
         }
         Err(reject) => {
             reject.report();
+            // `FlipAnnounce`: an announced flip the worker refuses already retired (the screen
+            // keeps its previous picture): `FaRefuse`.
+            crate::ddi::flip_announce::note_worker_refused(h_alloc);
             if reject.retryable() {
                 // A refusal is not a Deferred outcome: the `DeferBudget` count is of consecutive
                 // Deferred outcomes, so the one in progress (if any) ends here, whether the

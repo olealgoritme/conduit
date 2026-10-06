@@ -128,7 +128,7 @@ cat > "$pcdir/rmclient.pc" <<EOF
 Name: rmclient
 Description: librmclient headers (Conduit); NVK loads librmclient.dll at runtime
 Version: 0.1.0
-Cflags: -I$conduit/guest/rmclient/include
+Cflags: -I$conduit/guest/rmclient/include -I$conduit/guest/windows/protocol/include
 EOF
 PKG_CONFIG_LIBDIR=$pcdir
 export PKG_CONFIG_LIBDIR

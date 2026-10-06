@@ -207,6 +207,16 @@ fn reread_cached_knobs() {
     let _ = crate::virtio::ctrl::reread_spin_knob();
     // `FlipWdogMs` and `DeferBudget` (`FlWdMsEff`, `DefBudEff`): 0 = off, today's behaviour.
     crate::ddi::stall_diag::reread_knobs();
+    // `EscWaitMs`, and the stopping flag back down: a new generation begins (v334).
+    crate::ddi::escape_wait::reread_knobs();
+    // `RmGateMs` (default 6000, 0 = never): the RM gates' lost-fire valve, mirrored `RmGateMsEff`.
+    crate::virtio::gpu::RMG_EXPIRE_MS.store(
+        helios_kmd_logic::rm_fence_present::clamp_gate_expire_ms(crate::diag::read_config_dword(
+            crate::diag::knobs::RM_GATE_MS,
+            helios_kmd_logic::rm_fence_present::GATE_EXPIRE_DEFAULT_MS,
+        )),
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// After the previous transport's state was forgotten (`retire_transport`): the new generation's
@@ -218,13 +228,22 @@ fn start_generation_mirrors() {
     let _ = crate::virtio::rm_client::reread_knob_at_start();
     crate::ddi::flip_keep::reset_for_start();
     crate::ddi::present_foreign::reset_for_start();
+    crate::ddi::onscanout::reset_for_start();
+    // `BltAsync` / `BltNoMirror` (default 0): the knobs read again and mirrored, counters zeroed.
+    crate::ddi::blt_async::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
+    // The S-A0 census of the KMD's STANDARD allocations (`StdN*`, `StdO*`, `StdOpenN`, ...).
+    crate::ddi::std_census::reset_for_start();
     // `foreign_flip::forget` zeroed its counters and owes the block; this writes it (reading and
     // mirroring `FfKnob` first), as does the `Fk*` block.
     crate::virtio::foreign_flip::publish_counters();
     crate::ddi::flip_keep::publish_counters();
     // The stall-diagnosis block (`HpdLoopN`, `FlipIss`, `VsPendN`, ...): zeroed, `StartN` bumped,
     // written once. After the worker of the previous generation was stopped.
+    // The flip retire measurement and the announce knobs (`FlipLat`, `FlipAnnounce`,
+    // `FlipEarlyWake`), read and zeroed before the block above is first written.
+    crate::ddi::flip_lat::start_generation();
+    crate::ddi::flip_announce::start_generation();
     crate::ddi::stall_diag::start_generation();
 }
 
@@ -241,6 +260,47 @@ fn stop_flush(
     let from = crate::adapter::foreign_scanout::now_100ns();
     crate::diag::flush_service_key(passive);
     stop_credit(budget, from)
+}
+
+/// Turn the host's scanout 0 off before the transport that bound it is dropped, and leave the ids
+/// at the stop in the service key (`StopUnb*`, docs/zero-copy-present.md section 25).
+///
+/// The host keeps its scanout binding when the guest resets the device unless somebody disables it,
+/// and the next generation numbers its resources from 1 again: a binding that outlives the stop can
+/// show whatever the new generation creates under that id. Sent only when the guest or the host's
+/// last accepted bind names a resource, within the StopDevice budget; a failure is counted and
+/// StopDevice goes on (the transport reset reclaims the host side anyway). Must run BEFORE
+/// `reset_display_publication_state` (it zeroes the identities read here) and while the transport
+/// is up. `StopUnbSt`: 0 nothing bound, 1 disabled, 2 refused or failed, 3 no budget left.
+#[inline(never)]
+fn stop_unbind_scanout(
+    passive: crate::irql::PassiveLevel,
+    adapter: &AdapterContext,
+    budget: &helios_kmd_logic::sweep_budget::SweepBudget,
+) {
+    use core::sync::atomic::Ordering;
+    let guest_bound = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
+    let active = adapter.active_scanout_resource.load(Ordering::Acquire);
+    let host_accepted = adapter
+        .with_virtio(|v| v.host_accepted_scanout_bind().1)
+        .unwrap_or(0);
+    crate::diag::record_named_bytes(b"StopUnbGst", guest_bound);
+    crate::diag::record_named_bytes(b"StopUnbAct", active);
+    crate::diag::record_named_bytes(b"StopUnbHst", host_accepted);
+    if guest_bound == 0 && host_accepted == 0 {
+        crate::diag::record_named_bytes(b"StopUnbSt", 0);
+        return;
+    }
+    let now = crate::adapter::foreign_scanout::now_100ns();
+    let Some(timeout_ms) = budget.call_timeout_ms(now) else {
+        crate::diag::record_named_bytes(b"StopUnbSt", 3);
+        return;
+    };
+    let status = match crate::virtio::ctrl::disable_scanout_within(passive, adapter, timeout_ms) {
+        Ok(()) => 1,
+        Err(_) => 2,
+    };
+    crate::diag::record_named_bytes(b"StopUnbSt", status);
 }
 
 /// `DxgkDdiStartDevice` — bring the adapter online.
@@ -585,6 +645,21 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 
     start_stage(3);
 
+    // This generation's identities (section 25): the image salt, the allocation serial and the
+    // NVRM epoch (low 32 bits each). After a `pnputil /restart-device` all three must differ from
+    // the previous image's, or a client / allocation that survived it is not seen as stale.
+    crate::diag::record_named_bytes(b"GenSalt", crate::adapter::image_salt() as u32);
+    crate::diag::record_named_bytes(
+        b"GenSerial",
+        adapter.current_transport_serial().unwrap_or(0) as u32,
+    );
+    crate::diag::record_named_bytes(
+        b"GenEpoch",
+        adapter
+            .with_virtio(|v| v.nvrm_epoch())
+            .unwrap_or(0) as u32,
+    );
+
     if knobs.display_half {
         crate::diag::record_named_bytes(b"DspMd", adapter.display_mode_packed());
 
@@ -624,6 +699,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 #[inline(never)]
 pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_void) -> NTSTATUS {
     crate::kmsg(c"Helios: StopDevice\n");
+    // FIRST, before anything below can wait on something an escape holds: every escape in flight
+    // gives up at its next wait slice (at most 100 ms) and releases its locks, and none starts
+    // (v334, `ddi::escape_wait`). Atomic store, any IRQL.
+    crate::ddi::escape_wait::set_stopping(true);
     if !miniport_device_context.is_null() {
         // SHARED borrow, for the same reason StartDevice takes one: the ISR and
         // the DPCs can still build `&AdapterContext` from this pointer while this
@@ -644,6 +723,11 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // (`ddi::device_lost`): written BEFORE the flush below, so a stop that follows an
         // adapter-wide device loss leaves them on disk. PASSIVE.
         crate::ddi::device_lost::publish_block(crate::ddi::device_lost::Trigger::Stop);
+        // The newest issued flip address (`RestSeed`: the next image reads it at StartDevice,
+        // `pnputil /restart-device` reloads the image and zeroes every static), written before
+        // the first flush so that one covers it; `note_stop_entry` writes it again if a flip
+        // arrived while the worker and the heartbeat were being stopped.
+        crate::ddi::stall_diag::persist_rest_seed(true);
         // The first stage reaches the disk before anything that could bugcheck.
         let flush = crate::diag::read_config_dword(crate::diag::knobs::STOP_FLUSH, 1) != 0;
         if flush {
@@ -716,6 +800,9 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // transport generation being torn down; carrying it into the next
         // StartDevice is how a latched gate kills CRTC_VSYNC and how a recycled
         // resource id gets bound as the cached scan-out target.
+        // The host's scanout binding is turned off first, while the identities it names are still
+        // readable and the transport is up (section 25: the host keeps it across a device reset).
+        stop_unbind_scanout(passive_stop, adapter, &budget);
         adapter.reset_display_publication_state();
 
         // Tear down the venus client + page-table blob + context BEFORE dropping
@@ -836,6 +923,8 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
 /// `DxgkDdiRemoveDevice` — free the adapter context allocated in AddDevice.
 pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_void) -> NTSTATUS {
     crate::kmsg(c"Helios: RemoveDevice\n");
+    // As StopDevice: no escape may hold anything the teardown waits for (v334).
+    crate::ddi::escape_wait::set_stopping(true);
     crate::diag::record(0x0C00_0001);
     crate::ddi::stall_diag::stop_sub(helios_kmd_logic::stall_diag::stop_sub::REMOVE_ENTER);
     if !miniport_device_context.is_null() {

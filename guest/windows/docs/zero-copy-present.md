@@ -1160,6 +1160,7 @@ full zero block once per generation even if nothing is ever seen.
 | `KmdRmSysCache` | each level 5 primary bring-up | state | `RmSysCache` (level 5 counter block) |
 | `KmdRmSysPollMs` | lazily at level 5, per transport generation (`forget` resets it) | static | `RmSysPollMs` (now on every read, 0 included) |
 | `ForeignFlip` | StartDevice, after `retire_transport` (via `foreign_flip::publish_counters`), lazily otherwise; `forget` resets it | static | `FfKnob` (now on every read, 0 included) |
+| `RestSeed` (section 20.3a) | each StartDevice (`stall_diag::load_rest_seed`, from `note_start_entry`) | statics | `RestSeedEff` (every start, 0 included), `RestSeedLo`, `RestSeedHi`, `RestSeedUse` (published with `ScRest*`) |
 | `FlipWdogMs`, `DeferBudget` | each StartDevice (`stall_diag::reread_knobs`, from `reread_cached_knobs`) | statics | `FlWdMsEff`, `DefBudEff` (clamped value in force, 0 included; section 14) |
 
 Event-gated counter blocks, and what resets them: `Ff*` (`foreign_flip::forget` zeroes the counters at every
@@ -2221,9 +2222,14 @@ flip it issued LAST is not seen retired and everything queues behind it.
 
 ### 20.3 What changed
 
-* **The heartbeat's address survives the restart.** `ddi::stall_diag::LAST_ISSUED` records the newest address dxgkrnl ever
+* **The heartbeat's address survives the restart (v329: statics only; image reload found on hardware, then persisted).**
+  `ddi::stall_diag::LAST_ISSUED` records the newest address dxgkrnl ever
   issued in a flip (`note_flip_issued`: every `SetVidPnSourceAddress` and every DMA flip record; process-lifetime,
-  `start_generation` leaves it alone). `reset_display_publication_state` stores `restart_flip::seed_address(LAST_ISSUED)` in
+  `start_generation` leaves it alone). The v329 design assumed a process-lifetime static survives
+  `pnputil /restart-device`. That was WRONG: the restart RELOADS the driver image (hardware: `StartN` is 1 after each
+  restart, `EntHpdN`, `EntHpdTh` and `EntVsTk` are 0 at the start), so every static is zero at the new start, the seed was
+  inert and `ScRestAdr0` / `ScRestIss` read 0. The restart passed 5/5 on 328.1 and 330.1 without the seed; the persisted
+  seed (20.3a) is robustness work, not a fix of an observed failure. `reset_display_publication_state` stores `restart_flip::seed_address(LAST_ISSUED)` in
   `last_primary_address` instead of 0, at its start and again at its end (the lease teardown can publish a withheld
   old-generation address over it). Only the ADDRESS word is kept: the displayed identity, the binding, the gate, the
   pending slot and every resource-id keyed table are still cleared. A new flip's programming still publishes its own
@@ -2241,10 +2247,58 @@ flip it issued LAST is not seen retired and everything queues behind it.
   exit 0..7), `ScRestSig` (worker wakes StartDevice owed). The wake is one `signal_hpd` at the end of StartDevice when
   `restart_flip::needs_worker_signal` (the reset clears both, so it fires only for a programming raised while the start
   ran). The `ScRest*` values are never zeroed by `start_generation`: they describe the restart itself.
-* Pure logic and tests: `kmd_logic/src/restart_flip.rs`; the counter lists are `stall_diag::COUNTERS` (`ScRest*`) and
-  `flip_completion::COUNTERS` (`FkGen`, `FkStale`).
+* **The seed survives an image reload (20.3a).**
+* Pure logic and tests: `kmd_logic/src/restart_flip.rs`; the counter lists are `stall_diag::COUNTERS` (`ScRest*`,
+  `RestSeed*`; the persisted words are spelled once in `restart_flip`) and `flip_completion::COUNTERS` (`FkGen`, `FkStale`).
+
+### 20.3a The persisted seed (`RestSeed`, default 1)
+
+The newest issued flip address is kept in the SERVICE KEY (the key of the other knobs and counters; a hive value outlives
+an image reload, a static does not). `RtlWriteRegistryValue` writes DWORDs here, so the 64-bit address is two DWORDs:
+
+| value | content |
+|---|---|
+| `RestIssLo`, `RestIssHi` | the address, low and high dword |
+| `RestUpS` | interrupt time in whole seconds when it was written (`KeQueryInterruptTimePrecise`; zero at every boot) |
+| `RestChk` | check word over the three (`restart_flip::persist_check`), written LAST, so a write torn by a crash reads as damaged |
+
+*Written* (PASSIVE only, never on the flip path; `ddi::stall_diag::persist_rest_seed`): (1) at the top of StopDevice,
+before the first hive flush (`StopFlush`), (2) again in `note_stop_entry` (after the worker and heartbeat stopped, before
+`reset_display_publication_state`; the later `stop_flush` stages cover it), and (3) from the HPD worker's every pass
+(right after `publish_live_if_wanted`), when `LAST_ISSUED` changed and at least 2 s passed since the last write
+(`restart_flip::persist_due`; two loads and a compare otherwise). A crash, bugcheck or unclean stop therefore leaves a value at
+most about 2 s old (the lazy hive writer decides when it reaches the disk; the stop flushes force it). Only a sane address
+is written: nonzero, page aligned, below 2^52 (`sane_address`).
+
+*Read* (`load_rest_seed`, from `note_start_entry`, the first thing StartDevice does with it: before `ScRestIss` is
+captured, before the first `reset_display_publication_state` and before the heartbeat starts) with max-of semantics
+(`restart_flip::choose_seed`):
+
+| `RestSeedUse` | meaning | seed |
+|---|---|---|
+| 0 | knob off, or nothing persisted and no static | the static (0 with the knob off after a reload) |
+| 1 | the persisted address was used and stored into `LAST_ISSUED` | persisted |
+| 2 | rejected: stale. `RestUpS` is later than this boot's uptime, so the value is from an earlier boot (dxgkrnl's flip queue is empty at boot; a stale address is harmless but pointless) | none |
+| 3 | rejected: insane (unaligned, bit 52 or above, or `RestChk` does not match: torn or hand-edited) | none |
+| 4 | the image was NOT reloaded, `LAST_ISSUED` is nonzero: the static is used, the persisted value was not consulted for the seed | static |
+
+A rejected value (2, 3) is erased (all four words zeroed) so a later, longer boot cannot accept it by its uptime. The boot
+test is the monotonic interrupt time, as there is no boot id: a value written in an earlier boot whose uptime was SHORTER
+than the new driver start's reads as fresh. That is the harmless case (a stale address names no flip; the heartbeat reports a
+picture's address that dxgkrnl is not waiting for), not a stall. Hibernate keeps interrupt time running and a restart is not
+a boot, so a restart after hibernation is accepted as it should be.
+
+*Mirrors*, written at EVERY StartDevice, zero included, in the `ScRest*` block (`publish_restart`): `RestSeedEff` (the knob
+in force), `RestSeedLo` / `RestSeedHi` (the persisted address as read, 0 with the knob off), `RestSeedUse` (above).
+`RestSeed` 0 is exactly the v329 behaviour: nothing is read, written or fed to `LAST_ISSUED`.
 
 ### 20.4 State that survives StopDevice / StartDevice: the audit and the decisions
+
+CORRECTION (hardware): the table below was written assuming that process-lifetime statics survive
+`pnputil /restart-device`. They do not: the restart reloads the image and every static is zero at the new start
+(`StartN` 1, `EntHpdN` / `EntHpdTh` / `EntVsTk` 0). Rows that say KEPT or LEFT for a static therefore mean "kept across a
+StopDevice / StartDevice pair of the SAME image" (a stop and start without an unload); after an image reload they are zero,
+and the only state that crosses it is the service key (the persisted seed above, the knobs and the counters).
 
 Every process-lifetime static and `AdapterContext` field that holds scanout, flip, present, fence, vsync, retry, epoch,
 lease, bind-sequence, producer-stream or generation state was read for what StopDevice / StartDevice does to it
@@ -2276,7 +2330,9 @@ worker wake. Decision column: RESET (already), CHANGED (this section), KEPT (on 
 The doc comment on `reset_display_publication_state` says `pnputil /restart-device` re-runs AddDevice and allocates a fresh context;
 section 19 says the context is kept (the Ex timers and the adapter survive). The two cannot both hold. `StartN` rising while
 `EntArm`, `EntHpdTh` and `EntVsTk` show the old generation's heartbeat and worker in the statics, together with a matching `HpdN`, says
-the context is reused; the fix is correct either way (`LAST_ISSUED` is a static).
+the context is reused; the fix is correct either way (`LAST_ISSUED` is a static). Hardware then showed `StartN` 1 and the
+`Ent*` counters 0 at the start of every restart: the image IS reloaded, and the audit's conclusions about statics hold
+only for a stop and start without an unload (20.3a closes the one that matters, the newest issued address).
 
 ### 20.5 Hardware checklist
 
@@ -2288,6 +2344,14 @@ After `pnputil /restart-device` with a Venus `d3d11_spin` window and DWM running
    `ScRestAdr0` and `ScRestIss` are nonzero and `ScRestAddr` equals `ScRestIss` (low 32 bits). On a pre-fix image
    `ScRestAddr` read 0 and that is the H1 signature.
 3. `SaLo` / `SaHi` and `VpLpa` just after the restart equal `ScRestIss` until the first new flip is programmed.
+   With the persisted seed (`RestSeed` 1, the default), after `pnputil /restart-device` of an image that issued flips
+   (the image is reloaded: `StartN` 1): `RestSeedEff` 1, `RestSeedLo` / `RestSeedHi` the persisted address (the same as
+   `RestIssLo` / `RestIssHi` in the key), `RestSeedUse` 1, `ScRestIss` NONZERO (it was 0 on 328.1 / 330.1: the seed was
+   inert), `ScRestAddr` equal to `ScRestIss` (low 32 bits) and `SaLo` / `SaHi` / `VpLpa` equal to the seed until the first
+   new flip. `RestSeedUse` 0 with nonzero `RestIssLo` means the address was not read (knob off); 2 is a boot in between
+   (expected after a reboot, erased); 3 an address that is not page aligned or damaged (check `RestIssLo`, `RestChk`);
+   4 an image that was not reloaded. A reboot, then a first start: `RestSeedUse` 0 or 2 and `ScRestIss` 0. With
+   `RestSeed` 0 the run is the v329 behaviour (`RestSeedUse` 0, `ScRestIss` 0 after a reload).
 4. `FkKeep`, `FkStale`, `FkGen`, `FkKeep05`, `FkKeep08`, `PBRetSite`, `VpPend`, `VpGate`, `VpPrF`, `PgStale`: small or 0.
    A nonzero `FkStale` after a restart means H2 was also live.
 5. If DWM still stalls: `VsPendN`, `HpdLoopN`, `HpdSite`, `FlipIss - FlipPub - VpCoal` (14.5 rows 1c, 2, 2b), `DeferBudget` 240
@@ -2306,6 +2370,14 @@ address that matches no flip, exactly as 0 did) and the stall has another cause:
 host tests of `restart_flip`, the whole `kmd_render` through the stub harness with the error set identical to the base.
 NOT verified: anything on hardware, the WDK build, that dxgkrnl keeps its flip queue across the restart.
 
+The persisted seed (20.3a) is verified by host tests of its pure decisions (`restart_flip`: the choice table, the sanity and
+torn-write checks, the persist rule) and by the stub type-check of the whole `kmd_render`; NOT on hardware or the WDK. Open
+points: the flip addresses must be page aligned for the persisted value to be written (an address that is not never reaches
+the key and `RestSeedUse` stays 0: read `RestIssLo` and `ScRestIss`); the registry writes add about half a millisecond each on the
+worker's pass (four, at most once per 2 s while flips change the address) and at StopDevice; `RtlWriteRegistryValue` on the
+service key may reach the disk late, so a bugcheck within the lazy writer's interval loses the newest value (the stop
+flushes cover a clean stop).
+
 ## 21. Default flip: `VsPowerMode=1`, `VsWatchdog=1` (v330)
 
 Hardware acceptance on 328.1 (5/5 device restarts, `ForeignFlip` 0,1,0,1,0, `VsPowerMode=1`,
@@ -2317,3 +2389,920 @@ and `VsWatchdog=1` (revive an armed but silent heartbeat). `VsIdleWake` stays 0;
 Both old behaviours remain selectable (`VsPowerMode=0`, `VsWatchdog=0`), re-read at every StartDevice
 (prefer a VM reboot when changing them). The knob tables in 13.8 and 15.4 list the old defaults and
 are superseded by this section.
+## 22. Already-on-scanout present tag
+
+Status: KMD half implemented (`kmd_logic::onscanout`, `kmd_render/src/ddi/onscanout.rs`, hooks in `display.rs`,
+`submit_command.rs`, `device.rs`, `virtio/foreign_scanout.rs`); the UMD half is written (branch
+`fix/ffxiv-basemark-nvk`, d812a49; NVK patch 0046 adds `scanout_frame()` returning `out_seq` / `out_generation`) and is
+not yet run against this KMD on hardware. Written on v326, merged onto v331 (v331 tip: the doc sections 15 to 21 are
+other incidents, hence section 22). Wire layout:
+`protocol/src/onscanout.rs`, C mirror `protocol/include/helios_onscanout.h`. The pure logic is host-tested; the glue is
+type-checked against the stub harness only, never compiled for the WDK and never run on Windows.
+
+### 22.1 The problem, and which arm it is
+
+A producer that shows its frames through the user foreign-scanout source (`SCANOUT_SET` / `SCANOUT_PRESENT`) has
+already put the frame on scanout, but a D3D11 `PresentImpl` waits on the frame-latency semaphore that only a per-frame
+`pfnPresentCb` releases, so the UMD presents anyway. The arm `DxgkDdiPresent` runs is decided by `DXGK_PRESENTFLAGS`
+alone (`display.rs`: bit 2 `Flip` clear is the Blt arm; bit 2 set with no DMA buffer is the MMIO flip, with one the DMA
+flip). What dxgkrnl sends for which swap chain is its choice and is not provable from this tree; what the tree
+establishes:
+
+* **Legacy blit model, windowed (and a flip-model chain the runtime degrades to a blit): the Blt arm** (`Flags.Blt`,
+  `PBflag` bit 0). Source = the app's DXGI surface, destination = the window's redirection surface (DWM's: a
+  `PitchedStandardBuffer` or an OPTIMAL image). This is the per-frame cost.
+* **Flip-model swap chain composed by DWM: the app's frame is not a Blt.** dxgkrnl redirects a composed flip-model
+  present to DWM (the app's buffers are DWM's inputs); the KMD sees DWM's own flips (Flip arm), not a per-frame app Blt.
+  A Blt per frame therefore means the chain is on the blit path. **Independent / direct flip** (borderless fullscreen
+  promoted by dxgkrnl) reaches the Flip arm, MMIO or DMA (`flip_route`: `Arm` for a direct-scanout or a
+  `ForeignFlip`-registered allocation, `Skip` = the counted keep of sections 12 and 13, `Fail` for an ordinary
+  unregistered one). A flip copies nothing; its cost is the programming (`arm_dma_flip` / `SetVidPnSourceAddress`) and
+  its completion invariant (section 13), which must keep running.
+
+Which one FFXIV hits is read, not assumed: `PBflag` (bit 0 / bit 2), `PrFgBlt` / `PrFgFlip`, and `OsRejWhy` 6 below (a
+tag arrived on a flip).
+
+**The full-frame Blt, concretely** (non-snapshot Blt arm with an adopted foreign source and `ForeignCopy` = 1; with it
+0 the foreign source is a counted skip, `FcOff`, with no copy but still a failed import attempt per frame): import of
+the NVK image into the KMD's own Venus device as an explicit-modifier dma-buf image, `vkCmdCopyImage` (or the BGRA
+scratch blit for XBGR) of the WHOLE source into the destination (`SrcRect`, `DstRect` and sub-rects are ignored, the
+extents must be equal), then for a standard-buffer destination a CPU wait on the GPU fence (`wait_fence`, up to 5 s),
+`mirror_present_system_backing` (a CPU copy of the whole surface into the paged-out MDL pages when the destination has
+system backing) and the ownership hand-back, and the copy's wire fence merged into the DMA fence. 5120x1440x4 is 29.5
+MB read and 29.5 MB written per frame plus a host round trip. While a user source is live none of it is visible: the
+source withholds the desktop's host flush (`foreign_scanout_suppresses`).
+
+### 22.2 The tag, and where it travels
+
+It does NOT travel in `pfnPresentCb`'s `pPrivateDriverData`: dxgkrnl does not forward that to `DxgkDdiPresent` (`PBIdOk`
+= "no payload" across three driver generations; the D4b snapshot and the stream marker had to move to the Render command
+for the same reason). The carrier is the **`HERF` command the UMD already submits with `pfnRenderCb` immediately before
+`pfnPresentCb`, on the same `hContext`** (`MarkerPresent`, `umd/src/forward/present.rs`), extended by a tail.
+`DxgkDdiRender` parses it and stashes it on the context; the Present that follows on that context takes it (read and
+clear, on every Present, whatever its arm: the same pairing and orphan bound as the stream marker). Every `HERF` Render
+replaces the stash, so a tag never reaches a later Present than its own.
+
+All little-endian. `CommandLength` of the Render must be **72** (not 32 or 48):
+
+```text
+offset  size  field
+  0      32   HeliosPresentRefreshCmd  'HERF' v1, the stream tail as ever (ctx_id, value, cookie)
+ 32      16   HeliosRmFenceTail        all zero unless an RM fence is attached (rm-fence-marker.md)
+ 48      24   HeliosOnScanoutTag
+   48    u32  magic        0x43534F48 ('HOSC': bytes 48 4F 53 43)
+   52    u16  version      1
+   54    u16  flags        0 (nonzero is rejected)
+   56    u64  sequence     the out_seq SCANOUT_PRESENT returned for THIS frame, nonzero
+   64    u32  generation   the out_generation SCANOUT_SET returned for the live source, nonzero
+   68    u32  resource_id  the Blt source's Helios resource id, or 0 = not stated
+```
+
+```c
+struct HeliosOnScanoutTag { uint32_t magic; uint16_t version, flags; uint64_t sequence;
+                            uint32_t generation, resource_id; };           /* 24 */
+struct HeliosPresentRefreshCmdOnScanout { struct HeliosPresentRefreshCmdFence base; /* 48 */
+                                          struct HeliosOnScanoutTag tag; };         /* 72 */
+```
+
+The KMD reads the bytes from offset 48 up to `CommandLength`: nothing there, or zero bytes, is "no claim" and costs
+nothing; anything nonzero is a claim and is counted. The stream tail and the fence slot compose with the tag unchanged
+(a CPU-complete `value == 0` marker, or an RM fence, still decides the present's boundary). An older KMD copies the 72
+bytes into the DMA buffer, reads the 32-byte `HERF`, ignores the rest and does the ordinary Blt, so the UMD may always
+send it; there is no capability bit (a delta in `OsSkip` is the proof). The DMA buffer must hold the 72 bytes
+(`STATUS_BUFFER_TOO_SMALL` from Render is dxgkrnl's retry, as for any command).
+
+UMD rules: take `generation` from the `SCANOUT_SET` reply and `sequence` from the `SCANOUT_PRESENT` reply of the frame
+being presented; the presenting context must belong to a device of the SAME PROCESS as the device that issued them
+(NVK's librmclient D3DKMT device and the UMD's runtime device are two devices of one process, which is what the check
+compares: `hKmdProcess`); send the Render immediately before the Present, on the presenting context, with the usual
+allocation list; tag only a whole-surface Blt (no `ColorFill`, no dirty rects) and never together with a windowed-Blt
+snapshot.
+
+### 22.3 Verification (a tag is a claim, never a fact)
+
+The skip happens only when the KMD's own state backs every part of it (`kmd_logic::onscanout::verify`, checked in this
+order; the first failure is the reason, `OsRejWhy`):
+
+| code | reason | what the KMD checked |
+|---|---|---|
+| 1 | `BadMagic` | the bytes at 48 are nonzero and not `HOSC` |
+| 2 | `Short` | `HOSC` but fewer than 24 bytes before `CommandLength` |
+| 3, 4, 5 | `Version`, `Flags`, `Fields` | version 1, flags 0, `sequence` and `generation` nonzero |
+| 6 | `NotBlt` | the Present is a flip, or has no allocation list or no Blt flag: nothing to copy, the flip machinery runs as ever |
+| 7, 8, 9 | `ColorFill`, `SubRects`, `Snapshot` | a whole-frame Blt only: no fill, no destination sub-rects, no snapshot stash |
+| 10 | `NoSource` | a live, unlapsed USER source exists (not the KMD's resident one) and has minted a frame |
+| 11 | `Generation` | `generation` is that source's |
+| 12 | `Owner` | the presenting context's `hKmdProcess` equals the process of the device that minted the source's frames; an unknown process on either side never matches |
+| 13, 14 | `Ahead`, `Stale` | `sequence` is at most the newest `SCANOUT_PRESENT` minted for that generation (`Ahead` = a frame never minted) and at most 256 behind it (`Stale`) |
+| 15 | `Resource` | `resource_id`, if nonzero, is the Present's source resource id |
+| 16 | `Orphan` | a tag whose Present never came was replaced by the next Render |
+| 17 | `Retry` | verified, but the Present's own preconditions refused it (DMA or private buffer, patch capacity); dxgkrnl retries without the tag and the retry is the ordinary Blt |
+
+A rejected tag is the ordinary Blt, byte for byte: nothing of the default path changed (one relaxed load per Render and
+per Present on a context that carries no tag). What a lying UMD can do: nothing without the live source, and with it,
+the process that owns scanout 0 can already show anything on it; the loss is the update of its own window's
+redirection surface for the frames it falsely tagged. Another process, a stale or forged generation, a sequence the
+source never minted, an expired source or a flip: all rejected and counted.
+
+### 22.4 What the skipped Present does
+
+`present_blt_onscanout` (`display.rs`) is the legacy Blt arm minus the copy and nothing else: the arm's own
+preconditions in its order and at its sites (DMA buffer holds the marker, private record holds the merge, patch
+capacity: all before anything is done, so dxgkrnl's retry protocol is unchanged), then `present_blt_skipped`, the
+completion a skipped foreign Blt already takes: fence-0 marker merged, patch references written, the KMD's DMA marker,
+the stream boundary merged. So the Present completes at the point a Blt would for dxgkrnl (the DMA fence retires with
+the packet, behind the producer's own boundary if the marker carries one), the frame-latency semaphore releases, and
+the source is no longer read, which is why it can be reused at once. Nothing is begun that needs a release: no
+destination `KmdWriter` / CPU-mirror ownership (`begin_present_buffer_write_legacy` is not called), no WindowedBlt token
+(a snapshot never reaches this path, so the dead-ready-token class fixed in v323 has no way in), no read-ledger ticket,
+no Venus import, no host call. The level 5 RM-primary Blt is skipped too (its copy is what is being avoided).
+
+### 22.5 Counters (`Os`, at most 14 characters, unique across `kmd_render` and `kmd_logic`)
+
+`OsTag` claims seen (a tag, well-formed or not; `OsTag = OsSkip + OsRej` when nothing is in flight), `OsSkip` presents
+completed with no copy, `OsRej` claims not honoured, `OsRejWhy` the last reason (the table above), `OsWhyMask` every
+reason seen this generation (bit `code - 1`), `OsBytes` MiB of copy avoided (the source's `pitch * height`), `OsLast`
+the last honoured sequence (low 32 bits). Registry: the first skip, then every 256th; the first rejection, every new
+reason and every 64th; the rest through `publish_nvrm_counters`; zeroed at StartDevice.
+
+### 22.6 Hardware checklist (FFXIV on NVK with the tag; lowest mode first: 1920x1080 at 60 Hz, then bigger)
+
+1. Before the tag (UMD without it): read `PBflag` (bit 0 Blt, bit 2 Flip), `PrFgBlt` / `PrFgFlip`, `FcImp`, and the
+   Present's return time (`scanout_timeline` PRESENT_RETURN): the cost this removes.
+2. With the tag: `OsTag` and `OsSkip` rise at about the frame rate; `OsRej` stays 0 in steady state; `OsBytes` per
+   second is the frame bytes times the rate (5120x1440: about 28 MiB per frame). `OsLast` follows the sequence
+   `SCANOUT_PRESENT` returned.
+3. `OsRej` rising: read `OsRejWhy` and `OsWhyMask`. 6 = the present is a flip (the Blt hypothesis was wrong: report
+   `PBflag`); 10 / 11 = the source is not live or the UMD's generation is stale (`FsLive`, `FsGen`); 12 = the UMD's
+   presenting context is in another process than the one that issued the escapes; 13 / 14 = sequence bookkeeping; 15 =
+   a wrong `resource_id`; 7 to 9 = the shape (dirty rects, snapshot).
+4. No Blt cost: the Present's return time drops to the marker path; `FcImp` / `FcRefuse` stop moving; `PBSyWt` and
+   `PBSyCp` do not appear; in WPR / PresentMon the Venus device's copy submissions drop to the desktop's own and
+   `msBetweenPresents` follows the producer (about 247 fps in the reference run), not the Blt.
+5. Release the source (`SCANOUT_RELEASE`, or kill the app): the tag is rejected with 10 from the next frame, the
+   ordinary Blt resumes, and the desktop is restored by the usual flush (`FsRest`).
+
+### 22.7 Verified, and not
+
+Verified (host tests): the parse over every short length, a forged magic, version, flags, zero fields, a zero tail (not
+a claim) and random bytes; the verdict for the exact claim, lag at and past the limit, a sequence ahead, a wrong
+generation, a wrong or unknown process, no source or no minted frame, flips, ColorFill, sub-rects, a snapshot, a named
+resource, and the order of the reasons; the per-source record's generation and monotonic rules; reason codes dense and
+stable; counter names (at most 14, unique, nothing else in either crate writes an `Os` literal); the protocol layout
+(sizes 24 and 72, offsets, magic bytes) and the C header's constants. Type-checked against the stub harness: the error
+set equals the base's (a new error kind would have shown; an injected error in the new file is reported).
+
+Review of the v331 merge: the record of what `SCANOUT_PRESENT` minted (`ddi::onscanout::note_minted`) is written by the
+two escape-side callers only (`present`, `present_fenced`). It reads the minting device's object for its
+`hKmdProcess`; the first version sat in `mint`, which the `ForeignFlip` worker and the KMD's presenter also reach with a
+stored owner token whose device may already be destroyed (a read of freed memory). Those two never mint a user source.
+
+NOT verified: anything on hardware or the WDK build; the arm FFXIV really hits (22.1); that `hKmdProcess` is the same
+token for the producer's escape device and the presenting device (the premise of the owner check, as for stream
+markers); that dxgkrnl treats the skipped Present's frame-latency semantics exactly as a copied one's (the completion
+shape is a skipped foreign Blt's, which has run); that the runtime's command buffer accepts a 72-byte Render command.
+
+Risks: (1) a window whose redirection surface is not updated while the source is live shows stale content when the
+source ends, until its next honest Present (the desktop's restore flush covers the primary, not the window); (2) an
+owner mismatch makes the optimization silently inert (counted, `OsRejWhy` 12), not wrong; (3) the sequence check is
+about frames minted, not frames shown (a fenced flip may still be queued when its Present completes), which is
+invisible by construction; (4) a tag on a flip is refused on purpose (a flip copies nothing and its completion
+invariant must run), so a flip-path workload needs a different lever; (5) `ForeignFlip`'s resident source (DWM-on-NVK)
+is not covered: its presents are flips.
+
+## 23. RM fence carrier wedge (v333 incident; fix v335)
+
+Built, host-tested for its pure half (`kmd_logic/src/wait_bound.rs`, `flip_pend_wd.rs`, `rm_fence_present.rs` `Gate`),
+type-checked against the stub harness, compiled by nothing that links the WDK, run by nothing. Branch
+`kmd/fence-carrier-wedge`.
+
+### 23.1 The incident
+
+Heaven DX11 fullscreen exclusive 5120x1440, NVK DWM with `ForeignFlip=1`, `HELIOS_NVK_RM_FENCE_PRESENT=1` for Heaven only
+(carrier (b) of `docs/rm-fence-marker.md`). About 50 s of fast presents (present gate 105 us, 7680 presents), then the
+screen froze. Heaven's `dxvk-queue` thread sat in `NtGdiDdDDIEscape`. After `Stop-Process -Force` Heaven stayed alive, the
+screen stayed frozen, explorer logged an app hang, and `pnputil /restart-device` never returned. Only a VM reboot cleared it.
+
+### 23.2 What the dumps actually say (read before the hypotheses)
+
+Files: `kmd-1.txt`, `kmd-2.txt` (uptime 4 760 s and 4 765 s), `kmd-3-stuck-1913.txt` (uptime 4 987 s), `heaven-stacks.txt`,
+`dwm-stacks-stuck.txt`, `umd-heaven.log`. `kstacks-stuck.txt` holds only the LiveKd banner: NO kernel stack of any
+thread exists, and the user-mode stacks end at `wow64win!NtGdiDdDDIEscape`, so "blocked in the KMD" is an inference, not
+a reading.
+
+1. The stall block of `kmd-1` / `kmd-2` is a stale snapshot. `StallT` 4 700 746 against uptime 4 760 375 / 4 765 859:
+   every value of the block (`FlipIss`, `FlipPub`, `HpdSite`, `ScLkN` ...) is 60 s old and identical in both reads
+   because nothing wrote the block, not because nothing moved. Only the heartbeat block (`VsTick*`, `VsWd*`) moved. The
+   block is written on request (worker, dump, escapes while the worker looks stuck); an idle worker and no escapes mean
+   nobody requests (14.2). "Frozen in both reads 5 s apart" is therefore no evidence about the flip queue.
+2. `FlipIss` 16267 against `FlipPub` 16261 is NOT six parked flips: `VpCoal` is 12 (handles dropped by coalescing; the
+   healthy quiescent figure is `FlipIss - FlipPub - VpCoal` near 0, here -6, i.e. more publications than issues, as foreign
+   flips publish more than once). `VsPendN` 0, `VpPend` 0, `VpGate` 0, `PrdPend` 0, `FfAsSub` = `FfAsAck` = 12281,
+   `FsFQue` 0, `RmGAtt` = `RmGFire` = 7763, `RmGCan` 0, `RmGRef` 0, `NvEvLost` 0, `NvEvDrop` 0: the KMD held nothing.
+3. `kmd-3` (block refreshed at 4 955 523, 256 s after the last flip): `FlipIss` 16267, `FlipPub` 16261, `FlipPubT`
+   4 699 380 (unchanged: dxgkrnl issued no flip for 256 s), still `VsPendN` 0 and `VpGate` 0, `VpVsN` moving at
+   240 Hz (the heartbeat reports the last address every tick). `DdiInflL` 0: NO DDI of ours in flight, so no escape was
+   inside `DxgkDdiEscape`. `NStopDev` 0: the `pnputil` stop never reached `DxgkDdiStopDevice`.
+   `NPreempt` 2 and `TPreempt` 4 699 382: `DxgkDdiPreemptCommand` was called twice, the last 2 ms after the last
+   publication. (`kmd-1` / `kmd-2` carry `DdiInflL` = bit 30 = one Escape in flight at 4 700.7 s: that one, or the one the
+   tester's tool made; it was gone by 4 955.)
+4. `EscHwA` 0 and `EscNoSy` 0: no escape sets `HardwareAccess`, and NO escape sets `NoAdapterSynchronization`, so
+   dxgkrnl serializes every escape against the adapter-level DDI synchronization before our DDI is entered.
+
+### 23.3 Ranked hypotheses
+
+| # | hypothesis | for | against | what would show it |
+|---|---|---|---|---|
+| H1 | dxgkrnl / VidSch wedge after the preemption at 4 699.382: the scheduler never resumed (no `SubmitCommand`, no flip, no `CreateDevice` for 290 s) and the escape (adapter-synchronized, `EscNoSy` 0) and the device stop queue behind a dxgkrnl lock, not behind ours | `NPreempt` 2 / `TPreempt` 2 ms after `FlipPubT`; `DdiInflL` 0 at 4 955; `NStopDev` 0; nothing pending in the KMD; `NResetTmo` 0 (TDR off or not reached) | the ack looks delivered (`DmaNtfF` 0, `WdSigF` 0, `DdiFailN` 0); the preempt request itself is unexplained | kernel stacks: `!process <Heaven> 7`, the thread `27fc.3194`, `!stacks 2 dxgkrnl`, `!stacks 2 dxgmms2`, `!stacks 2 helios_kmd_render`, `!locks`; the new `Pre*` breadcrumbs (23.6) |
+| H2 | the preempt ack semantics: `preempt_flush` drops the whole pending WDDM FIFO (`virtio/gpu/mod.rs` `preempt_flush`), `DMA_PREEMPTED` carries `LastCompletedFenceId = last_completed_fence`; dxgkrnl resubmits the dropped buffers only when it schedules again, and nothing after the preempt was ever submitted | same as H1 | no counter of what was dropped (`AbnDrop` 0 in both reads: written by the PASSIVE flush, may be stale) | `Pre*` breadcrumbs: preemption fence, last completed, dropped count |
+| H3 | an escape blocked INSIDE the KMD on a host round trip (`wait_block` 30 s `SYNC_ROUNDTRIP_TIMEOUT_MS`, a loop of them, the Venus ring wait up to minutes under the Venus mutex, the scanout mutex acquire without end) | `kmd-2` shows an Escape in flight at 4 700.7 | `DdiInflL` 0 at 4 955 (a 30 s round trip ended by then; a mutex wait would still be counted in flight) | `DdiInflL` bit 30 and `DdiOldMs` in the next stuck dump; `LkWaitN`, `VnLkHeldMs` |
+| H4 | a lost RM fence fire holds a gate point (and the WDDM FIFO head behind it) for ever | the incident's path | `RmGAtt` = `RmGFire`, `RmGCan` 0, nothing pending; the 250 ms head rebase (`WdHeadEff` 250) already bounds a stream head | `RmGAtt - RmGFire` > 0 for more than 6 s |
+| H5 | the early-fire note table (16 entries, `nvrm_fence::EARLY_CAP`) dropped a fire that raced a create | possible under many threads | `NvEvLost` 0, `NvFenceEarly` 29, `RmGEarly` 32 | `NvEvLost`, `NvFenceErr` |
+| H6 | the flip queue itself parked behind a Deferred programming on a boundary that never completes | the task's premise | `VpPend` 0, `VpGate` 0, `VsPendN` 0 (at 4 700.7 and at 4 955) | `VsPendN` growing with `FlipPub` flat |
+
+Whatever the cause, three facts make the damage worse than it has to be, and v335 fixes those without waiting for the
+cause: a thread in a kernel wait cannot be killed, so one blocked escape makes the process unkillable; the device stop
+then waits for what that thread holds; and a flip that stops being published is never retired by anything.
+
+### 23.4 What changed
+
+All of it acts only when something is already wrong (a thread being terminated, the device stopping, a flip stuck), and
+every knob can restore v334 (0).
+
+1. **The escape scope** (`ddi/escape_wait.rs`, `kmd_logic::wait_bound`). `dxgkddi_escape` registers the calling thread
+   (table of 64, keyed by thread id) with a deadline of `EscWaitMs` (default 10000, 250..600000, 0 = no deadline) and
+   refuses with `STATUS_DEVICE_NOT_READY` when the device is already stopping. Every wait the escape makes gives up when
+   the thread is terminating (`PsIsThreadTerminating`), when the stopping flag is up, or when the deadline is spent. A
+   thread that is NOT inside an escape (the HPD worker, a DPC, paging, a DDI that dxgkrnl runs on a terminating thread to
+   clean up) is never aborted: `verdict` answers `None` for it.
+2. **The waits**, each with its bound before and after:
+
+   | wait | before | after (inside an escape) |
+   |---|---|---|
+   | `ctrl::wait_block` (every control-queue and NVRM round trip, `wait_fence`) | 1 ms .. 1 s slices to the call's total (30 s; `WAIT_FENCE_MAX_MS` 120 s) | slices <= 100 ms, each ends with the abort check; ends at the escape deadline; abort = the existing timeout path (`VirtioError::Timeout`, abandon, the escape's own `TIMEOUT` status) |
+   | every retry loop charging a `Budget` (queue full, map busy, present-buffer write/teardown) | nominal ms, up to ~16x real | `charge_slice` reports spent on an abort |
+   | the Venus ring wait (`ring_wait_until`, under the Venus mutex) | 30 000 sleeps of 1 ms, bounded by the real clock | the same, plus the abort check each round, WITHOUT latching the ring fatal (`Timeout`) |
+   | Venus mutex acquire (`acquire_venus_mutex`) | infinite (5 s counted slices) | 100 ms slices, abort returns `NotStarted` through `with_venus_client`, the client is not touched |
+   | scanout mutex acquire | infinite | `try_with_scanout_lifecycle` (RELEASE_BLOB path, snapshot status) gives up with `None`; `with_scanout_lifecycle` (callers that cannot fail) is unchanged |
+   | content mutex (`PassiveMutex::lock`) | infinite | abortable, returns `None` |
+   | RM client lease/sysmem waits, worker service | worker only | unchanged (never in an escape) |
+
+   Not covered: waits inside DDIs other than Escape (`DxgkDdiPresent`'s scanout-lifecycle acquire, `Render`'s fence service).
+   A thread blocked inside dxgkrnl itself (H1) is not reachable from the KMD at all.
+3. **The stopping flag.** Set first thing in `DxgkDdiStopDevice` and `DxgkDdiRemoveDevice`, cleared at StartDevice
+   (`escape_wait::reread_knobs`). Every scoped wait polls it at least every 100 ms, so an escape holding the Venus or
+   scanout mutex releases it and the teardown that waits for it proceeds.
+4. **The generic pending-flip watchdog** (`kmd_logic::flip_pend_wd`, knob `FlipPendWdMs`, default 500, 100..60000,
+   0 = off). Every vsync tick: the newest flip dxgkrnl issued is not done, was issued at least that long ago, and no
+   address was published for as long, then its address is published kept (`publish_kept_primary`, one atomic store,
+   DISPATCH) and the flip marked done: `FlipPendWd`, `FlipPendWdT`, `FpWdMsEff`. Why `FlipWdogMs` would not have caught
+   the incident: it counts only while a programming is pending (`VsPendN`), and `VsPendN` was 0; this one needs no
+   pending state, only an unretired newest flip. The two share the record of the newest flip, so a flip is never
+   published twice.
+5. **Lost RM gate fires** (`kmd_logic::rm_fence_present::Gate::take_expired`, knob `RmGateMs`, default 6000, 1000..120000,
+   0 = never). The worker (`foreign_fence_service`, every 250 ms at most) declares fired any point whose fence has not
+   fired 6 s after it was attached (the host's own fence timeout is 5 s and fires with an error status), queues its handle
+   for closing and prompts the completion DPC: a boundary that can never become ready is ready after a bounded time.
+   `RmGExp`, `RmGateMsEff`.
+6. **Owner death.** A killed owner can now leave its escape, so `DestroyDevice` / `DestroyProcess` run: the RM gate is
+   purged (`rm_gate_purge_process_ordered`), the stream slot retires, `discharge_dead_present_stream_waits` ends the
+   waits that named it, and a Deferred programming gated on it exits through `WorkerBindDispatch::Abandoned` ->
+   `ScanoutReject::ProducerAbandoned` -> `complete_dead_source`, which publishes the flip's address kept (read, not run:
+   `stage_worker_scanout_bind`, `display.rs` `complete_dead_source`). A flip nobody completes is retired by item 4 after
+   `FlipPendWdMs` whoever owned it.
+7. **A stale dump refreshes itself.** The vsync tick asks the mirror thread for the stall block when it is older than 5 s
+   (`StallReqN`): the 333 stuck dumps were read 60 s and 290 s after the block they showed.
+
+### 23.5 Counters (at most 14 characters, unique across `kmd_render` and `kmd_logic`)
+
+`EscWaitN` (escapes scoped), `EscWaitMax` (longest, ms), `EscAbortKill`, `EscAbortStop`, `EscTimeout` (waits that gave up:
+thread terminating, device stopping, `EscWaitMs` spent), `LkWaitAbort` (mutex acquires that gave up), `EscNoSlot` (table
+full), `EscRefStop` (escapes refused while stopping), `EscWaitMsEff`, `PreFence`, `PreLastCmp`, `PreDropped`, `PreStatus`,
+`PreT` (the last `DxgkDdiPreemptCommand`), `FlipPendWd`, `FlipPendWdT`, `FpWdMsEff`, `StallReqN`, `RmGExp`, `RmGateMsEff`.
+Knobs: `EscWaitMs`, `FlipPendWdMs`, `RmGateMs` (read at every StartDevice).
+
+### 23.6 What to read after the next wedge
+
+`DdiInflL` / `DdiInflH` / `DdiOldId` / `DdiOldMs` (is anything of ours in flight), `NPreempt`, `TPreempt`, `Pre*`, `NStopDev`,
+`StallT` against the uptime (is the block fresh), `FlipIss`, `FlipPub`, `FlipPubT`, `VsPendN`, `FlipPendWd`, `RmGAtt`,
+`RmGFire`, `RmGExp`, `EscAbort*`, `EscTimeout`, `LkWaitAbort`. And the kernel stacks, which this incident lacked: with
+LiveKd, `!process 0 7` for the stuck process and for `dwm.exe`, `!thread` for the escape thread, `!stacks 2 dxgkrnl`,
+`!stacks 2 dxgmms2`, `!stacks 2 helios_kmd_render`, `!locks`, `!vm`. The UMD could also set `NoAdapterSynchronization`
+on its escapes (none does): that takes dxgkrnl's adapter-level serialization out of the picture for them (not a KMD change).
+
+### 23.7 Verified, and not
+
+Verified (host tests): the wait state machine (unscoped waits unchanged to their own total, the 1 ms -> 1 s ladder,
+scoped slices <= 100 ms, kill beats stop beats deadline, a kill noticed within one slice, the deadline exact across the
+32-bit clock wrap, never 0, a nested scope keeps the outer deadline and does not release it, a full table registers
+nothing); the pending-flip watchdog decision (to the millisecond, once per flip, a newer stuck flip fires again,
+the wrap, the incident's own numbers); gate point expiry (in order, out-of-order fires, wrap, unstamped never); knob
+clamps; counter names (listed = written, written nowhere else). Type-checked against the stub harness (the error set
+equals the base's, apart from one stub-only unknown-field error counted twice).
+
+NOT verified: anything on hardware or the WDK build; that a killed thread's abort status is what the UMD expects from each
+escape (an abort is the escape's own timeout/not-ready status); that `PsIsThreadTerminating` is true for a thread under
+`Stop-Process -Force` while it waits in KernelMode (it is the documented test; the 100 ms slices make the wait itself
+independent of any APC); the cause of H1.
+
+Risks: (1) `EscWaitMs` 10 s cuts a legitimate escape that waits longer in total (a first-time RM init with a user
+timeout above it): the UMD sees its `TIMEOUT` status; the knob is 0 or larger on a machine that needs it; (2)
+`FlipPendWdMs` 500 publishes a kept address for a producer slower than half a second (the screen shows the previous
+picture a moment longer; 14.3); (3) an aborted `release_blob` leaves the host blob to the transport reset; (4) the
+preempt breadcrumbs are diagnosis only.
+
+### 23.8 Checklist
+
+1. Heaven 1600x900 windowed 10-minute soak with `HELIOS_NVK_RM_FENCE_PRESENT=1`: `FlipPendWd` 0, `RmGExp` 0, `EscTimeout` 0,
+   `EscAbortKill` 0, `LkWaitAbort` 0.
+2. Kill the app while it presents: it ends within a second; `EscAbortKill` may count; the desktop continues.
+3. `pnputil /restart-device` with an app running: returns; `EscAbortStop` may count.
+4. A wedge with `FlipPendWdMs=0`, then 500: `FlipPendWd` moves and the flip queue resumes.
+5. `EscWaitMs=0`, `FlipPendWdMs=0`, `RmGateMs=0` restore v334 behaviour (kill and stop exits stay).
+
+## 24. Asynchronous composed present (BltAsync, BltNoMirror)
+
+Status: implemented behind two knobs that default to 0 (the previous behaviour). Nothing here has run: the KMD cannot be
+built or run in the authoring environment. The pure logic (`kmd_logic/src/blt_async.rs`, 23 tests) is host-tested; the
+render crate was rustfmt-parsed and type-checked against the stub harness (the error set equals the base's, apart from
+stub-only unknown-field and arity errors in the new files).
+
+Hardware finding (v337.2): the arm was never entered because `ForeignCopy` was 0; see 24.11 (entry conditions, `BltEntry*` /
+`BltNoEntry*` counters, `BltAsyncVenus`).
+
+### 24.1 The measurement
+
+Heaven 1600x900 windowed, composed under DWM, KMD 334.1: the host renders 576 fps, the VM shows 148 fps. PresentMon:
+`msBetweenPresents` p50 6.61 ms, `msInPresentAPI` p50 3.55 ms ("Composed: Copy with GPU GDI"); the UMD present gate
+averages 2.56 ms in mode 0 (a CPU wait); about 1.1 ms of the rest is the KMD. Host GPU utilization on this path is
+55-70 %: each frame runs CPU, then GPU, then CPU, serially.
+
+### 24.2 What the DDI waits for today, and why (read, `ddi/display.rs`, Blt arm, non-snapshot branch)
+
+A Blt whose source is an adopted foreign (NVK-on-RM) allocation (`foreign_source_if_enabled`, `ForeignCopy=1`) and whose
+destination is a KMD standard buffer (`PitchedStandardBuffer`, `PresentDestinationDesc::StandardBuffer`: DWM's redirection
+surface) runs, on the app thread, in this order:
+
+1. `begin_present_buffer_write_legacy` (`virtio/ctrl.rs`): take the buffer's writer ownership (`PresentBufferAccess`
+   `KmdWriter`). It sleeps in 1 ms slices (rounded to the timer quantum, 5 s budget) while a consumer (DWM) has not
+   finished reading the previous frame or a writer is on it.
+2. `submit_present_blt`: import the NVK image into the KMD's Venus device (cached after the first frame), enqueue the
+   reusable copy command on ring 1 (`submit_venus_async_present`). Per frame this also allocates two contiguous DMA
+   buffers (`stage_display_submit`), unchanged here.
+3. `wait_fence(gpu_fence, 5 s)`: sleep until the copy's ring-1 wire fence completes. THIS IS THE CPU WAIT.
+4. `present_buffer_cpu_mirror_ready` (ownership is now `KmdCpuMirror`: the ring completion moved it there) and
+   `mirror_present_system_backing`: take the system-backing content mutex, map the destination blob
+   (`RESOURCE_MAP_BLOB` + `MmMapIoSpace`) and memcpy the whole frame (5.76 MB at 1600x900) into the system pages VidMm
+   gave the allocation, if it keeps a lease on any (`SystemBackingPolicy::PresentLinearBuffer`; none: the call is a
+   mutex and a lookup).
+5. `complete_present_buffer_cpu_mirror` (ownership back to `ExternalReady`), `merge_fence(gpu_fence)` into the DMA
+   private data, return.
+
+Why step 3 exists. It is NOT what makes the Present's DMA fence mean "the copy is done". That is already tied to the copy's
+wire fence by the private record (`PresentSubmissionPrivate::gpu_fence_id`, written by step 5's merge): SubmitCommand
+(`note_and_maybe_signal` -> `note_wddm_submission`) gates the packet on that exact fence in the GPU-completion domain
+(`RetireDomain::IncludingGpu`, `wddm_boundary::select`), and the completion DPC signals `DMA_COMPLETED` when the wire fence
+has retired. The wait exists because (a) the mirror (4) reads the blob and must run after the copy, and (b) the hand-back of
+the buffer ownership (5) was done by the DDI after the mirror. Remove the mirror, or move it off the app thread, and the
+wait has no job.
+
+What orders the copy after the producer today. Nothing in this arm. The Present's stream boundary (the RM fence the UMD
+attaches with carrier (b), `NvkRmFencePresent`) is merged into the private record in `present_complete`, so the DMA FENCE
+waits for the producer, but the Venus copy is submitted at once, in the DDI, whether the producer has finished or not. Today
+that is harmless only because the UMD's present gate (the 2.56 ms CPU wait) makes the producer finish before the Present is
+issued. With the UMD wait removed, the copy of the legacy arm would read a frame the NVK queue may still be writing. The host
+cannot order a Venus ring-1 command after an RM fence (they are different drivers). The ordering has to be the KMD's:
+submit the copy only after the boundary is ready.
+
+Who reads what (allocation classes). The Venus consumer of a dedicated present buffer (identity bit 0
+`DEDICATED_PRESENT_BUFFER`, `rm-backed-standard.md` 1.2) imports the buffer's own memory as a linear image: a GPU read of
+the blob, after the Present's DMA fence, through the ownership table (`claim_present_buffer_read`, which refuses while the
+KMD is a writer). The system backing is read only by CPU views of the allocation (GDI `LockCb` readers; a CPU mapping of a
+staging or shadow surface) and is the source of a page-in. The census in `rm-backed-standard.md` found DWM opening no KMD
+STANDARD allocation at all in its own runs and reading the UMD-made images instead; for the redirection surfaces this
+section is about, the requester states DWM reads the GPU copy. That is the premise of `BltNoMirror` and it is
+unverified here (24.8).
+
+### 24.3 Design
+
+`BltAsync` (default 0): for a foreign source into a standard buffer, `DxgkDdiPresent` never waits for the copy. The route is
+`helios_kmd_logic::blt_async::decide`:
+
+| situation | route |
+|---|---|
+| knob 0, source not foreign, snapshot present, destination not a standard buffer | legacy arm, unchanged |
+| producer boundary live and NOT ready; or live and the mirror is on; or an older copy for the destination is still queued | DEFERRED |
+| producer boundary live and ready, mirror off, nothing queued for the destination, table room | DIRECT |
+| no boundary (the UMD waited on the CPU), mirror off, nothing queued | DIRECT |
+| no boundary and the mirror is on; dead boundary; full table, with nothing queued for the destination | legacy arm (counted `BltAsyncFall`, reason `BltAsyncWhy`) |
+| no boundary or a dead one, an older copy for the destination is queued (whatever the mirror knob says: v337) | wait (bounded) for the queue to drain, then the legacy arm (`BltDrainN`) |
+| any of the above where the queue, the token or the submission was refused after the decision | the same drain, then the legacy arm (v337) |
+
+DIRECT (`ddi/blt_async.rs::direct`, `virtio/gpu/blt_async.rs::enqueue_async_submit_blt`). The destination ownership is taken, or
+joined, in the same critical section of the transport lock as the ring-1 enqueue, and the copy is recorded in a small fixed
+table (`kmd_logic::blt_async::Table`, 8 entries). The DDI then merges the copy's wire fence into the private record exactly as
+before and returns. The completion DPC (`blt_async_retire`, next to the other per-fence retirements of `drain_used`) hands the
+buffer back when the LAST direct copy of it retires. Several frames for one destination may be in flight at once (an app that
+presents faster than the copy completes): ring-1 submissions of one context retire in order, so "the last to retire" is
+also the last to write. A writer that is not a direct copy (a deferred copy, a CPU mirror) is never joined (`begin`).
+
+DEFERRED (`queue_async_blt`, then the existing WindowedBlt machinery). The reusable copy is prepared, a request is queued in
+the WindowedBlt FIFO under the producer's boundary and its token is merged into the private record (the same two-phase
+transaction a DXVK snapshot Blt has): SubmitCommand admits it once the destination's residency is effective, the HPD worker
+(`service_windowed_blt`) submits it when BOTH the boundary is ready (`scanout_boundary_ready`: an RM gate fires through the
+EventReady DPC, `rm_gate_fire`, and the worker is woken) and the destination can be written (`try_begin_present_buffer_write`;
+a completion wakes the worker), and the ring completion terminalizes the token the Present's DMA fence waits for. The two
+additions to the request are `async_blt` (timed and counted) and `no_mirror`; the source is ledgered like a snapshot's
+(24.10.3; a full ledger leaves it unledgered, it does not refuse the request). With the mirror on, the worker's existing PASSIVE mirror runs after the ring completion and the token
+terminalizes after it; with `BltNoMirror` the ring completion hands the buffer back and terminalizes at once.
+
+`BltNoMirror` (default 0, independent of `BltAsync`): for the same class of Blt the CPU mirror is not made. Instead the
+destination's system copy is marked invalid (`mark_stale_if_backed`, the "system copy invalid" machinery of
+`build_paging_buffer.rs`: `SystemBackingTable::mark_system_copy_invalid`) when, and only when, VidMm holds system pages with a
+KMD lease for it. A later SYSTEM_TO_LOCAL page-in of the allocation is then skipped (`PgInvSk`) instead of copying the older
+system pages over the blob, and the next whole-allocation eviction (blob to system) revalidates the mark (`PgInvClr`). Not
+marking an allocation that has no backing keeps the bounded invalid set (overflow skips every page-in, `PgInvOvf` must stay 0)
+out of the per-frame path. The mark is placed immediately before the copy is submitted (the DDI for DIRECT and the legacy arm,
+the worker for DEFERRED), so the window in which a page-in can see pages older than the copy in flight is the copy itself.
+
+### 24.4 Invariants
+
+1. The Present's DMA fence retires only after the copy has completed on the host GPU. DIRECT: the private record names the
+   copy's wire fence (unchanged mechanism). DEFERRED: the fence waits for the request's terminal token, which exists only after
+   the ring completion (and after the mirror, if there is one). A gate that fires with an error, or expires (`RmGateMs`),
+   releases the copy; the producer's frame may then be incomplete, the same trade the gate always made.
+2. The copy never starts before the producer has finished. DIRECT is chosen only for "no boundary" (the UMD's CPU wait already
+   ordered it) or a boundary already ready; otherwise the copy waits in the FIFO until `scanout_boundary_ready`.
+3. One destination, one order. A DIRECT copy never overtakes a queued one for the same destination (`dst_deferred_pending`), a
+   queued copy cannot start while direct copies hold the buffer, and a legacy Blt that cannot be queued waits for the queue
+   to drain first. A deferred request's dispatch is FIFO in admission order.
+4. Ownership. The destination is KmdWriter from the enqueue (DIRECT) or the dispatch (DEFERRED) until the copy's completion; no
+   consumer claim is accepted meanwhile (`claim_present_buffer_read` is `Busy`), allocation teardown waits
+   (`begin_present_buffer_teardown`), and the cached copy command is drained by `release_present_blits_for_resource` as before.
+5. A failed copy still completes the Present. The host's error response for a ring-1 command means it touched nothing: the wire
+   fence retires regardless (the DMA fence signals), the destination keeps the previous frame, `BltAsyncFail` counts it, and the
+   buffer is handed back. (The legacy arm pinned the buffer for ever in this case. A transport latch is different: everything
+   is abandoned with the transport generation. Why releasing is safe: 24.10.2.)
+6. Nothing sleeps in the DDI except the legacy fallbacks (`BltAsyncBusy`, `BltDrainN`).
+
+### 24.5 Hazards
+
+* Source reuse (write after read). Before, the DDI returned after the copy had read the NVK source, so the app could draw into
+  it at once. Now the Present returns with the copy still queued behind the producer (milliseconds). dxgkrnl's allocation
+  tracking orders the app's next WDDM submission after the Present's DMA fence, but NVK on RM submits through its own channel,
+  which dxgkrnl does not see. Whatever recycles the swap-chain buffer must wait for the Present's fence; the KMD cannot enforce
+  it. Symptom if not: a frame with the next frame's pixels in it (tearing, one frame early). First thing to look for in the
+  checklist.
+* DWM reading before the copy completes: only if the DMA fence signalled early. The fence is tied to the copy (24.4 item 1);
+  `PBFnc` shows the fence or token each Present carried.
+* `BltNoMirror` and CPU readers. A GDI or CPU reader of the destination (a `LockCb`, a CPU-mapped staging surface) sees the pages
+  VidMm holds, which are no longer updated while the allocation is system-resident and are skipped on page-in. If DWM reads the
+  system pages rather than the GPU copy, composition shows stale content: `BltMirrorSk` rising with a frozen window is the
+  signature. Turn the knob off.
+* The eviction race. A whole-allocation eviction that completes while a copy is in flight copies a partial frame into the
+  system pages and clears the mark; a later page-in then puts that frame over the blob until the next Present rewrites it
+  (one frame). The mark is re-placed on the next Present.
+* A failed copy (`BltAsyncFail`): see 24.4 item 5.
+* A dead boundary (the producing process was killed): DIRECT is not used, the legacy arm copies at once (unordered, as before
+  this change); a queued request whose stream dies is cancelled by the existing teardown paths.
+* A deferred request makes the Present's DMA fence depend on the worker. A wedged worker stalls composed presents; the
+  existing `WddmHeadMs` rebase bounds it as for snapshot Blts.
+* `KmdRmClient` 5: the level 5 frame edge is raised by the asynchronous routes at their own end (24.10.1; the first version
+  of this section argued it was never owed and was wrong).
+
+### 24.6 Counters (at most 14 characters, unique across `kmd_render` and `kmd_logic`; `kmd_logic::blt_async::COUNTERS`)
+
+| counter | meaning |
+|---|---|
+| `BltAsyncKnob`, `BltNoMirKnob` | the knobs in force (written at every StartDevice, 0 included) |
+| `BltAsyncN` | asynchronous Blts made; `BltAsyncDir` direct, `BltAsyncDefer` deferred (producer not ready, mirror on, or an older frame queued) |
+| `BltAsyncInfl`, `BltAsyncPk` | submitted or queued with the copy not yet complete, now and the most at once |
+| `BltAsyncLat0..7` | submission to copy completion: < 250 us, < 500 us, < 1 ms, < 2 ms, < 4 ms, < 8 ms, < 16 ms, more |
+| `BltDeferUs` | microseconds deferred Blts waited in the FIFO from Present to submission |
+| `BltAsyncFail` | copies the host answered with an error |
+| `BltAsyncFall`, `BltAsyncWhy`, `BltAsyncMask` | eligible Blts that took the legacy arm; last reason code and the set of reasons seen (bit `code - 1`: 2 not foreign, 3 not a buffer, 4 no boundary with the mirror on, 5 dead boundary, 6 queue refused, 7 token refused, 8 submit refused, 9 older copy queued and no boundary, 10 table full, 11 destination busy) |
+| `BltAsyncBusy`, `BltDrainN` | of those, destination busy; legacy Blts that drained the queue first |
+| `BltSrcBusy` | Presents of a source an earlier asynchronous copy was still reading (24.10.3) |
+| `BltLookKnob`, `BltLookN` | worker lookahead depth in force; copies dispatched ahead of a front entry that could not go (24.10.4) |
+| `BltWaitN`, `BltWaitUs`, `BltWait0..7` | the legacy arm's CPU wait for the copy (same buckets): what `BltAsync` saves |
+| `BltMirrorN`, `BltMirrorSk`, `BltMirrorUs` | CPU mirrors done (legacy and worker), skipped by `BltNoMirror`, microseconds spent in them |
+| `BltNoMirInv` | destination system copies newly marked invalid (an Already mark is not counted) |
+
+`PBCpy` is 3 for a DIRECT Blt and 4 for a DEFERRED one (`PBFnc`: the wire fence or the token); `PBSyCp` is 3 when the mirror
+was skipped. A new transport generation zeroes the counters (`reset_for_start`).
+
+### 24.7 Where the code is
+
+`kmd_logic/src/blt_async.rs` (route table, ownership rule `begin`, in-flight `Table`, buckets, stale-mark rule, counter list and
+the name scans); `kmd_render/src/ddi/blt_async.rs` (knobs, counters, `try_async`, `direct`, `deferred`, `drain`);
+`kmd_render/src/virtio/gpu/blt_async.rs` (in-flight table in the transport, `enqueue_async_submit_blt`, `blt_async_retire`,
+`queue_async_blt`, ownership release); hooks: `ddi/display.rs` (Blt arm, worker), `virtio/ctrl.rs::submit_venus_async_blt`,
+`virtio/venus/present.rs::submit_present_blt_direct`, `virtio/gpu/mod.rs` (the retire arm, the request fields, the ring
+completion), `adapter/backing.rs::mark_stale_if_backed`, `diag.rs` (knob names), `ddi/lifecycle.rs`, `ddi/submit_command.rs`.
+
+### 24.8 Verified, and not
+
+Verified (host tests): the route table, exhaustively over its inputs (Direct only with its preconditions, never with a producer
+that has not finished, never past a queued older copy; Deferred only behind a live boundary); the ownership rule; the in-flight
+table (last-writer hand-back, any completion order, bounded, fence ordering); histogram buckets at their edges; the stale-mark
+rule; counter names (listed = written by `ddi/blt_async.rs`, written nowhere else, at most 14, unique).
+
+NOT verified: anything on hardware or the WDK build; that the host executes ring-1 copies of the KMD context in submission order
+across the destination (assumed from the Venus per-queue order, which the legacy arm already relied on for its own fence);
+that a deferred request for a source that is not a snapshot passes every WindowedBlt precondition (admission, terminal
+membership, teardown by resource id): the paths are shared but were written for snapshots; that `merge_blt_boundaries` accepts
+the RM gate boundary beside a Venus stream boundary in one private record (a refusal is counted `TokenRefused` and falls
+back); the premise that DWM reads the GPU copy (24.2).
+
+### 24.9 Hardware checklist (Heaven 1600x900 windowed, composed; lowest mode first: 1920x1080 at 60 Hz, then bigger)
+
+Run each row ten minutes, read the counters after, and record PresentMon `msInPresentAPI`, `msBetweenPresents`, host GPU
+utilization (`nvidia-smi dmon -s u` on the host) and fps.
+
+| row | `HELIOS_NVK_RM_FENCE_PRESENT` | `BltAsync` | `BltNoMirror` | expect |
+|---|---|---|---|---|
+| 1 | 0 | 0 | 0 | the baseline; `BltWaitUs / BltWaitN` is the DDI's wait, `BltMirrorUs / BltMirrorN` the mirror |
+| 2 | 0 | 0 | 1 | `BltMirrorSk` = Presents, `BltMirrorN` 0, `BltNoMirInv` > 0 only if VidMm paged the surface; the wait unchanged |
+| 3 | 0 | 1 | 1 | no boundary: all DIRECT (`BltAsyncDir`), `BltWaitN` 0, `BltAsyncPk` small, `BltAsyncLat` mostly < 2 ms |
+| 4 | 1 | 0 | 0 | the ordering gap of 24.2 shows as torn or old frames if the producer is slower than the DDI |
+| 5 | 1 | 1 | 0 | all DEFERRED (mirror on), `BltDeferUs / BltAsyncDefer` is the wait for the producer, `BltMirrorN` from the worker |
+| 6 | 1 | 1 | 1 | the target: DEFERRED while the producer runs, DIRECT when it had finished (`BltAsyncDir`); `BltWaitN` 0, `BltMirrorN` 0 |
+
+Pass: `BltAsyncFail`, `BltAsyncBusy`, `BltDrainN` 0 or tiny; `BltAsyncInfl` returns to 0 at idle; `PgInvOvf` 0; no `RmGExp`, no
+`WddmHeadMs` rebase; `FlipPendWd` 0; no tearing or one-frame-early content in Heaven's moving scene (the source-reuse hazard);
+a GDI app (Notepad, Explorer) beside it stays correct with `BltNoMirror` 1 (the CPU-reader hazard); `pnputil /restart-device`
+with the app running returns and the counters restart from 0. Compare rows 1, 3, 5 and 6 on `msInPresentAPI` (the saved
+wait), `msBetweenPresents`, fps and host GPU utilization. Recommend the defaults only after rows 3 and 6 are clean; turn
+`BltNoMirror` on separately, after the question of who reads the system pages is settled.
+
+### 24.10 Follow-ups after review (v337)
+
+Five findings of the review of v336, and what was done about each. The pure parts are in `kmd_logic/src/blt_async.rs`
+(1355 tests in the crate now, nine of them new); the rest is in the same three files as 24.7.
+
+#### 24.10.1 Level 5 (`KmdRmClient` 5) lost its frame edge (fixed)
+
+The legacy arm calls `primary_changed(Edge::PresentBlt)` after a copy that completed, and the worker's mirror stage calls
+`primary_changed(Edge::WindowedBlt)`. The asynchronous routes reached neither: the DIRECT route returns before the arm's
+tail, and a DEFERRED copy with `BltNoMirror` ends in `complete_windowed_blt_ring`, which has no mirror stage. A destination
+that is the shown RM primary would then never be flipped. Now:
+
+* DIRECT: the completion DPC (`blt_async_retire`) raises `Edge::PresentBlt` for the destination when the copy succeeded.
+* DEFERRED with `BltNoMirror`: `complete_windowed_blt_ring` raises `Edge::WindowedBlt` at the terminal.
+* DEFERRED with the mirror on: unchanged, the worker's mirror stage raises it.
+* A failed copy raises nothing (the screen did not change; the legacy arm returned before its edge as well).
+
+The decision is the pure `blt_async::edge_owed(Finish, copy_ok)` (tested for every finish and both outcomes); whether the
+destination is the shown RM primary stays `rm_refresh::judge`'s question, asked inside `primary_changed`. That function is
+atomics and `KeSetEvent(Wait = FALSE)` only, so it is legal in the DPC; the DPC reaches the adapter through the pointer the
+first direct submission stored in the in-flight state (`BltAsyncState::adapter`, with the same lifetime argument as
+`WindowedBltPending::adapter`: every entry is retired or forgotten before the transport goes). The earlier text of 24.5
+(the edge "is not raised ... never takes this arm") was an argument, not a guarantee, and is superseded by this.
+
+#### 24.10.2 A failed copy releases the destination (decided, documented)
+
+The legacy arm leaves the buffer `KmdWriter`-poisoned after a rejected host response, with this reasoning in the code: "a
+retired wire id is not enough: a rejected host response leaves KmdWriter poisoned and must never authorize a CPU read or
+external reacquire". The asynchronous routes with `BltNoMirror` hand it back. This is a deliberate change of the invariant,
+for these reasons and no wider than these:
+
+* What the poison protected is a CPU read (the mirror) of a destination the copy may have half written. With `BltNoMirror`
+  there is no CPU read. The same invariant holds where it still applies: a DEFERRED copy with the mirror on keeps the
+  legacy behaviour (its ring failure never reaches the mirror stage, the buffer stays pinned), and so does every
+  `BltAsync` 0 Blt.
+* What it costs when it is kept: the buffer is never writable again, so every later Present to that destination waits the
+  full 5 s budget of `begin_present_buffer_write_legacy` and then fails, and no consumer (DWM) can read it either: the window
+  is dead for the session, for a single rejected command.
+* What it costs when it is released: if the host started the copy and then failed, an external reader may take one frame that
+  is partly the new one. The next Present rewrites the buffer. The host's error answer for a ring-1 SUBMIT_3D is a rejection
+  at decode or at fence level, i.e. a command that did not run to completion; this is a belief from the transport code
+  (`resp_is_ok`), not something measured, and is why the case is counted, not hidden.
+* It is counted: every failed asynchronous copy bumps `BltAsyncFail` (DIRECT in `blt_async_retire`, DEFERRED in
+  `complete_windowed_blt_ring`), and the Present's DMA fence retires with the wire fence regardless. A transport latch is a
+  different event: all entries are forgotten with their ledger tickets retired as failures, and nothing is handed back.
+
+`BltAsyncFail` should read 0 on a healthy run. A nonzero value with torn frames in the same window is the evidence that the
+belief is wrong; the knob that restores the old behaviour is `BltAsync` 0.
+
+#### 24.10.3 Source reuse after the Present returns (highest risk: UMD requirements, plus a KMD-side claim)
+
+Check of what orders the next render. The UMD's RM-fence carrier (b) gates the NEXT PRESENT's DMA fence on the producer, it
+does not gate the next RENDER on anything of this Present: NVK on RM submits its work through its own channel, which neither
+dxgkrnl nor this KMD sees. Before v336 the DDI returned after the copy had read the source, so nothing could overwrite it
+afterwards; with `BltAsync` the Present returns while the copy is still queued behind the producer (and, deferred, until the
+worker submits it), so the source's next-frame render is not ordered after this copy by anything in the KMD. The source of
+a Blt is a swap-chain back buffer the application may draw into as soon as Present returns (blt-model swap chains), so
+the hazard is real and cannot be closed from the KMD alone: the KMD has no way to stop an RM channel.
+
+What the UMD must guarantee (requirement list for the UMD session):
+
+1. Do not let any work that WRITES a swap-chain buffer (or a resource that was the source of a Blt) start until the DMA fence of
+   the Present that read it has signalled. The Present's fence is the one `DxgkDdiPresent` returned with: it is the copy's
+   wire fence (DIRECT) or the copy's terminal token (DEFERRED), and it signals only after the host GPU finished reading.
+2. The wait has to be a GPU-side or a CPU-side wait the UMD owns, because the KMD cannot gate an RM channel: a CPU wait on
+   the fence before the next Draw/Clear/Present of that buffer (`D3DKMTWaitForSynchronizationObject`-style on the Present's
+   monitored/DMA fence, or the swap chain's frame-latency semaphore / buffer-ready that is signalled from it), or an RM
+   semaphore acquire inserted ahead of the next render that the UMD releases from that fence.
+3. With composed presents the runtime's present queue and `SetMaximumFrameLatency` bound the number of Presents in flight, and
+   the back-buffer rotation depth decides which buffer the next frame renders into. The UMD must verify that depth: if the
+   number of buffers is not larger than the latency of (producer + deferred queue + copy), which is milliseconds here, the
+   rotation hands the app a buffer an earlier Present is still reading. The safe configuration is a rotation depth of at least
+   the frame latency plus one AND requirement 1 on top (the rotation alone is an assumption about timing).
+4. The same holds for a buffer that is Present'd twice in a row: the second Present's copy reads it again, and the first one may
+   still be in flight (`BltSrcBusy` counts exactly this, below).
+5. The RM-fence carrier must keep attaching the fence of the work that WRITES the frame the Present reads (it does today); the
+   KMD only orders the copy after it.
+
+Not verified: that the NVK UMD does any of this today. It is not in this tree (the Mesa side), and this change cannot know. Treat
+it as the first thing to check on hardware (24.9): tearing or one-frame-early content in Heaven's moving scene with `BltAsync`
+1 and the RM fence present on.
+
+KMD-side safety added: the source is CLAIMED in the read ledger for the life of the copy, the same ledger a DXVK snapshot
+reader is published in (`HELIOS_ESCAPE_MAP_READ_LEDGER`: a slot per resource id, `issued > retired` while a host read is in
+flight). DIRECT takes the ticket in the same critical section as the enqueue and the completion DPC retires it (a failed
+copy and a transport latch included); DEFERRED takes it when the request is queued and the existing ring completion and
+terminal paths retire it. A full ledger (`RdOvf`) leaves the copy unledgered, loudly, and never refuses it; `RdIss` and `RdRet`
+stay balanced. This is a claim a consumer can read, not a wall: nothing in the KMD waits on it, and the NVK UMD does not
+read the ledger today. It lets the UMD (or a probe) see the source busy without a KMD change, and it makes the copy's
+read lifetime visible in the same place as every other.
+
+`BltSrcBusy` counts Presents whose source an earlier asynchronous copy was still reading when the next Present of it arrived
+(the in-flight table and the queued requests are searched in the same critical section as the route decision). Nonzero means
+the buffer rotation is shallower than the copy's latency or a buffer is Present'd again before it was released: with the
+requirements above violated, this is the Present at which the frame can be torn.
+
+#### 24.10.4 Head-of-line blocking of the deferred queue (fixed, `BltLookahead`)
+
+`take_ready_windowed_blt` looked only at the FRONT of the ready queue. A live producer boundary that has not finished (an NVK
+frame in flight) held every later windowed copy of every other window behind it, so one slow producer stalled DWM's other
+windows. Now the worker looks at the first `BltLookahead` ready entries (default 1 = the old behaviour, so a plain build is unchanged; set 4 together with `BltAsync`; clamped 1 to 8, read at every StartDevice,
+mirrored as `BltLookKnob`; 1 is exactly the old behaviour) and dispatches the first that can go: admitted, its producer's
+boundary reached, its destination writable. Per-destination order is kept by construction: an entry never goes ahead of an
+earlier LIVE entry of its own destination, whether or not that earlier one could go (`blt_async::pick`; the test enumerates
+every window of four entries over three destinations and every ready pattern: the pick is the first entry that could go, is
+never preceded by a live entry of its own destination, and nothing is picked only when nothing could go). A stale token in
+the window neither dispatches nor blocks (the front is still healed exactly as before, `WbStaleRdy`). `BltLookN` counts
+dispatches made ahead of a front entry that could not go. This changes the dispatcher the DXVK snapshot Blts share, which is
+why the depth is a knob; with 1 the behaviour is byte for byte the old one.
+
+Order across destinations is not preserved by design: the WDDM fence of each Present waits for its own token's terminal, not for
+an earlier token's. Order across entries beyond the window, and of entries not yet admitted, is as before.
+
+#### 24.10.5 Ordering gap with `BltNoMirror` 0, no boundary and queued older copies (fixed)
+
+`decide` tested the mirror knob before the queued-copy test, so a Blt with no boundary, the mirror on and older deferred copies
+for the same destination took the plain legacy route and its copy could land BEFORE the older frame. A dead boundary had the
+same gap. Now the queued-copy test comes first for both: the route is `LegacyAfterDrain`, whatever the mirror knob says. Beyond
+`decide`, every way out to the legacy arm (a refused queue, a refused token, a refused submission, a busy destination) now
+drains the destination's queue before the arm runs (`try_async` does it once, at the single exit), so no fallback can overtake
+a queued frame either. Tests: an older queued copy is drained for every mirror setting and both boundary states, and an
+exhaustive property over the whole input space: a plain `Legacy` route with a queued copy exists only for the Presents this
+feature never touches (knob off, not foreign, not a buffer).
+
+#### 24.10.6 Counters added, and what to read
+
+`BltSrcBusy`, `BltLookKnob`, `BltLookN` (24.6 plus these). `BltAsyncFall` / `BltAsyncWhy` bit 9 (`PendingNoBoundary`) and bit 5
+(`BoundaryDead`) now also mean "drained first". Checklist additions (24.9): read `BltSrcBusy` (expect 0 with a sound buffer
+rotation), `RdIss == RdRet` after a quiescent run, and, with `KmdRmClient` 5 and Heaven windowed onto the RM primary, that the
+frame edge `RmSysEdBlt` / `RmSysEdWBlt` (the per-edge counters of `sysmem_flip`) move with `BltAsync` 1 as they do with 0. Two
+Heaven windows at once, one of them slowed by a heavy producer, with `BltLookahead` 1 and 4: the other window's frame rate
+should stop following the slow one's at 4 (`BltLookN` > 0).
+
+### 24.11 The arm was never entered on hardware: entry conditions, the finding, the counters (v339)
+
+#### 24.11.1 The finding
+
+KMD 337.2, Heaven windowed D3D11 composed under the NVK DWM, `BltAsync=1 BltNoMirror=1 BltLookahead=4` (knobs confirmed in
+`BltAsyncKnob` / `BltNoMirKnob` / `BltLookKnob`): `BltAsyncN` 0, `BltAsyncFall` 0 (not even counted as a fallback),
+`BltMirrorSk` 0, while `BltWaitN` == `BltMirrorN` rose with every present. The same service-key dump holds `FcKnob=0` and
+`FcOff=5354` == `BltWaitN` (5354). `FcOff` counts "a foreign source seen while `ForeignCopy` is 0"
+(`foreign_source_if_enabled`, `virtio/venus/foreign_copy.rs`), so every Blt of the run was a foreign (NVK-on-RM) source
+with `ForeignCopy` off.
+
+Which condition failed. In `ddi/display.rs` (Blt arm, before this change) the async arm and the mirror skip were gated on
+`source_foreign`, which the arm sets only in the `foreign_source_if_enabled(...)` branch of the source-descriptor chain
+(the Some branch needs `adapter.knobs().foreign_copy`). With `ForeignCopy=0` that function returns `None`, the chain falls
+to the `source.storage` match, the source is imported as an ordinary OPTIMAL image (the plain import the host refuses for a
+foreign resource, section 11), `source_foreign` stays false, and
+`no_mirror_applies(.., source_foreign, ..)` and the async test were both false: the Blt ran the legacy path
+(`begin_present_buffer_write_legacy`, `submit_present_blt`, `wait_fence` = `BltWaitN`, `mirror_present_system_backing` =
+`BltMirrorN`) with neither new feature consulted, and nothing counted because the counters sat behind the same gate.
+The fix for the tester is `ForeignCopy=1` (a restart-device is enough). Two caveats worth reading from the counters of that
+run: the legacy copy of a foreign source with `ForeignCopy` 0 is the import the host refuses, so `BltWaitUs` of those rows
+(about 0.98 ms per Blt) measured a refused copy plus a mirror of whatever the destination held, not a real composed
+frame; and `FcImp`, `FcBlt`, `FcRefuse`, `FcHostErr` were all 0 (no foreign copy ever ran). Compare the rows again with
+`ForeignCopy=1`.
+
+Hypotheses considered, ranked, with what the counters said:
+
+1. `ForeignCopy=0` (confirmed: `FcKnob=0`, `FcOff` == `BltWaitN`; `display.rs`, the `foreign_source_if_enabled` branch).
+2. A Venus-native source (UMD-made image, `foreign` None) would also have run the legacy arm and counted `BltWaitN`, but
+   `FcOff` would then be 0: refuted by `FcOff`.
+3. A destination that is not a standard buffer: refuted, `BltWaitN` and `BltMirrorN` are only counted for one
+   (`destination_buffer.is_some()`).
+4. A snapshot (WindowedBlt) Blt: refuted, that path never counts `BltWaitN` (`BltMirrorN` there comes from the worker, and
+   `SnSub` / `SnFbk` / `BeSmp` are 0).
+5. A precondition returning before the decision (patch capacity, format, kind, descriptors, extent): refuted, those return
+   an error or a counted skip and never reach `wait_fence`.
+
+#### 24.11.2 Entry conditions, in order (`ddi/display.rs` Blt arm; the pure decision is `blt_async::entry`)
+
+| # | condition | where | on failure |
+|---|---|---|---|
+| 1 | `present_flags` Blt bit, not the level 5 RM primary, not an on-scanout skip | `dxgkddi_present_inner` | other arms (not counted) |
+| 2 | DMA buffer and private data large enough; patch capacity (`validate_patch_capacity`) | top of the arm | error / `BLT_PATCH`, counted `BltNoEntryO` |
+| 3 | adapter, source and destination resolve | `let (Some(adapter), ..)` | counted skip or error, `BltNoEntryO` |
+| 4 | both DXGI formats resolve; source kind is DEVICE_MEMORY | `BltFormat`, `BltSourceKind` | `BltNoEntryO` |
+| 5 | a snapshot, if present, validates | `validate_windowed_blt` | `BltNoEntryO` |
+| 6 | source and destination descriptors exist; extents equal | `BltDescriptor`, `BltExtent` | `BltNoEntryO` |
+| 7 | the entry decision (`entry`), counted `BltEntryDec`: 7a both knobs 0 (`KnobOff`, `BltNoEntryK`); 7b a snapshot (`Snapshot`, `BltNoEntryM`: its two-phase path is separate); 7c source class: `ForeignCopyOff` (`BltNoEntryFc`), or Venus-native with `BltAsyncVenus` 0 (`NotForeign`, `BltNoEntryF`); 7d destination not a standard buffer (`NotBuffer`, `BltNoEntryS`) | after row 6, before the snapshot / legacy split | the Blt takes the arm it always took |
+| 8 | `BltEntryOk`: `async_enter` (`BltAsync` on) goes to `try_async`; `no_mirror` (`BltNoMirror` on) skips the mirror whichever arm copies | the non-snapshot branch | |
+| 9 | `try_async`: `decide` (boundary, queue, table room, destination ownership) | `ddi/blt_async.rs` | `BltAsyncFall`, `BltAsyncWhy` (24.6) |
+
+`BltEntrySeen` counts row 1 arrivals; `BltNoEntryO` is derived as `BltEntrySeen - BltEntryDec`, so it cannot drift from the
+other counters. The identity at a quiescent point: `BltEntrySeen = BltNoEntryK + M + F + Fc + S + O + BltEntryOk`, and
+`BltEntryOk >= BltAsyncN + BltAsyncFall` (the rest are no-mirror-only Blts). `BltEntryWhy` is the last reason code and
+`BltEntryMask` has bit `code - 1` for every reason seen (1 knobs, 2 snapshot, 3 source not eligible, 4 foreign with
+`ForeignCopy` off, 5 destination, 6 before the decision). Reasons are tried in the order of the table (a snapshot is reported
+as the snapshot even though its source is not foreign).
+
+#### 24.11.3 Venus-native sources: `BltAsyncVenus` (default 0)
+
+Decision: a Venus-native source into a standard buffer is eligible for both knobs when `BltAsyncVenus=1`, and not by
+default.
+
+Why it can be eligible. Ordering after the producer: the copy is a Venus command on the same ring as the UMD's own commands,
+and the producer boundary that travels with the Present (if any) is handled by `decide` exactly as for a foreign source; with
+no boundary the route is DIRECT (mirror off) or the legacy arm (mirror on, `NoBoundaryMirror`). The DMA fence retires on the
+copy's wire fence (24.4 item 1), the destination ownership, in-flight table and drain rules are keyed by resource id and do not
+look at the source's origin, the source's read-ledger claim is taken by resource id (24.10.3), and `BltNoMirror`'s premise (DWM
+reads the GPU copy) is a property of the destination. The wait and the mirror cost the same.
+
+Why it is off by default. Nothing here has run for a Venus source: whether the host executes the UMD's last write to the
+image before the KMD's copy on ring 1 with no KMD-visible boundary is an assumption the legacy arm hid behind its CPU wait
+(the app thread blocked until the copy had retired, so a swap-chain buffer was never rewritten while the KMD read it); with
+`BltAsync` the source-reuse hazard of 24.5 applies to Venus images too, and the Venus UMD's own present gate is the only thing
+that bounds it. A tester can A/B it: `BltAsyncVenus=1` with `BltAsync` / `BltNoMirror`, read `BltEntryOk`, `BltNoEntryF`
+(0 when it is on), `BltSrcBusy`, `BltAsyncFail`, and look for one-frame-early content.
+
+#### 24.11.4 Counters (24.6 plus these; all in `kmd_logic::blt_async::COUNTERS`)
+
+`BltVenusKnob` (knob in force), `BltEntrySeen`, `BltEntryDec`, `BltEntryOk`, `BltEntryWhy`, `BltEntryMask`, `BltNoEntryK`,
+`BltNoEntryM`, `BltNoEntryF`, `BltNoEntryFc`, `BltNoEntryS`, `BltNoEntryO`. Read them first on any run where `BltAsyncN` is 0:
+`BltNoEntryFc` rising means `ForeignCopy` is 0; `BltNoEntryF` means a Venus-native source; `BltNoEntryK` that the knobs did not
+reach the transport (compare `BltAsyncKnob`); `BltNoEntryS` that the destination is not DWM's redirection surface.
+
+Tests (`kmd_logic`): `entry` over its whole input space (2 knobs x venus knob x snapshot x destination x three source classes,
+against an independent statement of the rule), the reason order, the foreign-copy-off refusal that this section is about, the
+Venus knob, and the reason codes' bits.
+
+#### 24.11.5 First hardware rows (339.1 / 339.4): what they say
+
+With `ForeignCopy=1` the arm is entered (`BltEntryOk` = `BltAsyncN`, `BltAsyncFall` / `BltAsyncFail` 0). Nearly every copy is
+DEFERRED (9304 of 9374 in one run): `decide` goes direct only when the producer's boundary is already ready at the Present DDI,
+and the app calls Present right after it submits the frame. The deferred wait is dominated by the producer itself, not the worker
+(`BltDeferUs` / `BltAsyncDefer` was 656 us against a producer GPU time of about 0.7 ms), and the ring copy is 0.5 to 1 ms
+(`BltAsyncLat2`). The Venus submission takes the Venus client mutex, which is PASSIVE only, so a copy cannot be dispatched from the
+boundary-retire DPC; the DPC can only wake the worker. `msInPresentAPI` barely moved (1.93 to 1.86 ms) because it contains the
+runtime's queued-present throttle: the wait moves from the DDI to the throttle once the DDI stops blocking.
+
+`BltNoMirror` is NOT safe with an NVK DWM. A run with `BltAsync=1`, `BltNoMirror=1` showed Heaven's window frozen on its loading
+screen in the composed desktop while PresentMon counted 223 presents/s and `BltMirrorSk` rose; the same scene with the mirror on
+was live. Read the knob as valid only when every reader of the redirection buffer reads the host blob (a Venus DWM). It stays 0 by
+default. With the mirror on, the worker mirrors after the ring copy and the Present's fence retires after the mirror.
+
+## 25. Wrong buffer on scanout after a device restart (v337 incident; identity fix, StopDevice unbind)
+
+### 25.1 The incident
+
+Win11 tester, KMD v337 (`ForeignFlip` 1, `FlipAnnForeign` 1, NVK DWM), after `pnputil /restart-device` with `BltNoMirror` 1 and a plain
+windowed Heaven: the viewer showed a wrong buffer, a 512x512-ish block of noise on the left, then a texture atlas of desktop icons
+(Outlook, Store, Settings, Xbox) on black. KMD read at the time: `FfProg` 0, `FfNoRec` 0, `FlipIss` 0, `SaLo` 0xC4180000, `VpLpa`
+0xC0590000. Earlier in the same session (same restart, no Blt knobs, `HELIOS_NVK_RM_FENCE_PRESENT` 1 on Heaven) Heaven failed to load
+(D3D11 out of memory on a 2048x2048 DXT1/ATI2 texture); a later plain Heaven ran. Host backend log, per transport generation: DWM was
+the SAME process (pid 13220) across all three restarts. Before the first restart `gpu_cmd` 352613 and `scanout_flip` 260689; in the
+generations after it `gpu_cmd` 11 and `scanout_flip` 7 to 9 over minutes, with `ioctl` 9682 then 194739 and `open` 9620 / `close`
+9681: the long-lived NVK clients reconnected in a loop and never got a working RM client again. The viewer therefore kept whatever it
+had last been given while the guest's new generation reused small ids.
+
+Not read from a dump (none was taken at the moment); everything below is from the code, with the counters that decide it.
+
+### 25.2 What the numbers already say
+
+* `FlipIss` 0 and `FfProg` 0 together: no flip of this generation had been issued or taken by the foreign arm. `SaLo` is also written
+  by `pacing_publish` from `last_primary_address` (`adapter/scanout.rs:756`), which after a restart is the RestSeed (section 20.3a):
+  the address of the PREVIOUS image's newest flip. So `SaLo` 0xC4180000 is most likely that seed and not a flip of this generation.
+  `VpLpa` (`ddi/scanout_trace.rs:915`) is a service-key value and survives an image reload until it is rewritten, so a `VpLpa` that
+  differs from `SaLo` is expected and is not by itself evidence of two programmed sources. Read both with `StartN` and `StartT`.
+* `gpu_cmd` 11 means the NVK processes were not rendering at all: nothing new was presented, so the viewer's last picture was the
+  only content. A wrong picture then needs an old binding or a flip naming a stale object.
+
+### 25.3 Ranked hypotheses
+
+**R1 (certain defect, fixed): the NVRM epoch repeats across an image reload, so surviving NVK clients never learn the device was
+lost.** `HeliosNvrmHeader.epoch` is `VirtioGpu::nvrm_epoch()` (`virtio/gpu/nvrm_tables.rs`), which was the bare `wire_fence_base`,
+taken from `NEXT_WIRE_FENCE_BASE` (`virtio/gpu/mod.rs:1765`), a STATIC that starts at 1. `pnputil /restart-device` reloads the image
+(`StartN` 1), so every image's first transport had epoch 1. The client contract (`helios_nvrm_reply_is_lost`,
+`guest/rmclient/src/helios_nvrm_escape.h:488`) is: a reply whose epoch differs from the one QUERY_CAPS gave at init means the device
+is lost, latch it, answer `-ENODEV` from then on, and the process reopens once. With equal epochs nothing latched. The processes kept
+their device (DWM's librmclient device is a private `D3DKMTCreateDevice` that lives until the process exits), their RM client, file
+and GEM numbers of the old generation, and used them against the new generation's empty tables:
+
+* `Ioctl` / `Close` / `ScanoutFlip` of an old handle: header status `NOT_OWNED` (1), librmclient errno `EBADF` (`owned()`,
+  `virtio/nvrm.rs:239`; the handle tables are per transport and empty). There is no other status for "an owner of an older
+  generation": owners are not registered at CreateDevice, they appear at their first `Open` (`reserve_nvrm_handle_slot`).
+* `Open`: succeeds (a fresh slot) and returns a handle number the new generation hands out from the start. Handle numbers, RM
+  client ids and GEM numbers therefore RESTART and collide with the stale ones a client still believes it holds. That is the
+  `open` 9620 / `close` 9681 / `ioctl` 194739 storm, and it is also how a stale `ScanoutFlip { owner_handle, host_handle }` can name a
+  live DRM file of the new generation and a GEM number that is now another object of the same process (DWM's own icon atlas):
+  the `MSG_SCANOUT_FLIP` arm (`virtio/nvrm.rs:444`) checks only that `owner_handle` is the caller's and a DRM node.
+* There IS a clean "device lost" signal and it is the epoch itself: `TRANSPORT_RESET` (4) is produced only by `EVENT_REGISTER`;
+  `STATUS_DEVICE_NOT_READY` only by the event ops with no transport; `STATUS_DEVICE_REMOVED` only when the adapter is removed.
+  `helios_nvrm_reply_is_lost` and `helios_nvrm_ntstatus_is_lost` treat a different epoch, `TRANSPORT_RESET`, 0xC00000A3 and 0xC00002B6
+  as fatal for the process. The in-tree header carries the rules; the transport that applies them (`transport_windows.c`) is on the
+  librmclient branch `rmc/transport-loss` (`nvrm-escape.md` section 9). A librmclient without it still loops.
+
+Fix (next build, `kmd_logic::generation_id`): the epoch is `(image_salt << 24) | generation index`, the salt being the interrupt time in
+~0.1 s units read once per image (`adapter::image_salt`), never 0. The first reply of a surviving client now differs from its init
+epoch and it takes the loss path once. Predicts: `GenEpoch` (low 32 bits, written at every StartDevice) differs between restarts;
+`NvRef` (NOT_OWNED refusals) no longer climbs by thousands after a restart; host `open` / `ioctl` per generation stays small.
+
+**R2 (certain defect, fixed; reachable only if dxgkrnl kept allocation handles across the reload): the allocation serial repeats the
+same way.** `TRANSPORT_SERIAL` (`adapter/mod.rs:511`) is a static starting at 0, so each image's first generation had serial 1.
+`resolve_current_alloc` (`ddi/create_allocation.rs:768`, `paging::alloc_is_current`) refuses an allocation whose `serial` differs from
+the current generation's: after a reload an older image's allocation compared EQUAL. `scanout_alloc_info`
+(`ddi/create_allocation.rs:1230`) then returned its `resource_id` as the primary's, and the direct arm
+(`ScanoutTarget::from_direct_primary`, `ddi/display.rs:3551`) bound and flushed that id: a resource id of the old generation that names
+a different live resource of the new one (ids restart at 1). The host accepts it when its size covers the layout
+(`SET_SCANOUT_BLOB` checks in `host/backend/device/src/venus/scanout.rs:138-146`: an icon atlas of 4096x4096 RGBA covers a 5120x1440
+stride, and the noise block is the same bytes read with the wrong stride). Fixed by the same salt (`transport_serial`). Predicts: a
+stale handle in use after a restart with `FkGen` 0 and `PgStale` 0 (both stay 0 while the serials collide; with the fix they count).
+Not provable without a dump of `ScRid` and the allocation's `resource_id`; the defect is certain, its role in this incident is not.
+
+**R3 (certain gap, fixed for the Venus bind): StopDevice never turned the host's scanout binding off.** `dxgkddi_stop_device`
+(`ddi/lifecycle.rs`) calls `reset_display_publication_state` (`adapter/mod.rs:1378`), which only zeroes the guest's views
+(`host_bound_scanout_resource`, `active_scanout_*`), then drops the transport. The host's device reset (`Venus::reset`,
+`host/backend/device/src/venus/mod.rs:469`) calls `release(window, None, tell)`: with `display` None the scanout is forgotten but
+`link.disable()` (`venus/mod.rs:443`) is not run, and `teardown_scanout` (`nvidia/scanout.rs:183`) only clears the dma-buf cache; the
+viewer window "keeps the last frame" (`display.rs:2015-2019`). So after a restart the viewer shows the old generation's last image
+until a flip of the new one arrives, and in the incident none did. New: `stop_unbind_scanout` (`ddi/lifecycle.rs`, before the reset,
+inside the StopDevice budget) sends `SET_SCANOUT_BLOB` with resource 0 (`ctrl::disable_scanout_within`) when the guest's host-bound id
+or the host's last accepted bind names a resource. Predicts: `StopUnbSt` 1 after every restart that had a Venus-bound desktop.
+Limits: a desktop shown by a `ScanoutFlip` (`ForeignFlip`, the KMD RM client) has no Venus binding, so SET_SCANOUT 0 finds nothing to
+disable on the host (`venus/scanout.rs:111-117` disables only a scanout that was set). The host does have a `ScanoutDisable`
+message (`nvidia/scanout.rs`, `handle_scanout_disable`) that nothing in the guest sends yet: that is the follow-up for ForeignFlip,
+and the host side (`Venus::reset` / `teardown_scanout` calling `disable` on a reset) is the other half. Both are outside this tree.
+
+**R4 (open, low): a fresh adapter-owned LINEAR scanout target shown before its first copy.** `production_linear_scanout`
+(`ddi/display.rs:69-149`) allocates a new blob in the new generation and nothing clears it; uninitialised device memory showing
+earlier contents (noise and an icon atlas are what freed texture memory looks like) would look like the incident. The flush is
+supposed to follow the copy's completion (`queue_active_scanout_refresh` docs), and `gpu_cmd` 11 says no copy ran, so it is possible
+only if something flushed without the copy. Decided by: `ScRid` equal to `CpRid` (the dedicated target), `CpErr`, and the flush
+histogram (`FfR<n>` / `FfC<n>` / `FfTot`, `FLUSH_HISTOGRAM`, `ddi/scanout_trace.rs:310`) naming a resource id that is not the one
+`ScRid` bound.
+
+**R5 (refuted by construction): `BltAsync` / `BltNoMirror`.** The deferred queue (`virtio/gpu/blt_async.rs:241`) dies with the
+transport and the knobs are read again at every start (`ddi/blt_async.rs:127`); the system-copy invalid marks and system-backing
+leases are cleared at stop (`reset_system_backings`, `adapter/mod.rs:1843`, called from StopDevice); the Blt arm only writes the
+destination's backing and its RM sysmem image and never issues a SET_SCANOUT or a flush. It cannot make the host show another
+resource. `BltNoMirror` 1 was merely a knob set in the run.
+
+**The RestSeed arm (the issue's H1 tail)**: confirmed harmless. `RestSeed` seeds `last_primary_address` only (`adapter/mod.rs:1442`,
+`:1510`, `restart_flip::seed_address`); it is read by the heartbeat and by `same_active_identity` (`ddi/display.rs:3575`, which also
+requires `already_bound`, false after the reset). No bind or flush takes an id from it: `queue_active_scanout_refresh_locked` flushes
+only `active_scanout_resource`, which `reset_display_publication_state` zeroes and only a bind of THIS generation sets.
+
+### 25.4 The Heaven out-of-memory (row A), briefly
+
+Nothing in the KMD returns a D3D "out of memory" for the texture create by itself; the candidates are (a) the 32-bit process's own
+address space (x86 Heaven at 1.6 GB private bytes) and (b) a KMD refusal that surfaces as `STATUS_NO_MEMORY` from a CreateAllocation or
+as `NO_RESOURCES` / `EMFILE` from an NVRM `MMAP`. Read, in this order, after a repro: `NvWinRFull` (window full), `NvWinRRes` (the
+256 MiB reserve), `NvWinRBig` (one map larger than the window), `NvWinRAddr` (user address space: the x86 process limit), `NvWinRTab`
+(mapping table), `NvWinRHost` with `NvWinHErrno` (the host refused); `NvMapTRef` (mapping-table bound), `NvHdlLive` / `NvHdlPeak` /
+`NvHdlCap` / `NvHdlORef` / `NvHdlFRef` / `NvHdlGRef` (handle table), `CrPrivSmall` (CreateAllocation private data too small: a
+UMD/KMD mismatch, not memory), `ShPhFail` (shared physical backing). Row A was also the first load after a restart, so R1 (a surviving
+client or shell process looping on stale handles and consuming handle and window quota) is a better explanation than a limit:
+`NvWinUseMb` / `NvHdlLive` high with `gpu_cmd` near 0 would say so.
+
+### 25.5 Breadcrumbs for the next occurrence
+
+New: `GenSalt`, `GenSerial`, `GenEpoch` (StartDevice: the image salt, the allocation serial and the NVRM epoch, low 32 bits);
+`StopUnbGst` (the guest's host-bound resource at the stop), `StopUnbAct` (its active resource), `StopUnbHst` (the host's last accepted
+bind), `StopUnbSt` (0 nothing bound, 1 disabled, 2 refused or failed, 3 no budget left). Existing, to read with them: `StartN` /
+`StartT`, `SaLo` / `SaHi` / `SaCnt`, `VpLpa`, `ScRid` / `ScPub` / `ScSrc` / `ScDir`, `CpRid`, `RfRid` / `RfCnt` / `RfUnb`, the flush
+histogram (`FfR<n>`), `FlipIss` / `FlipPub`, `FfProg` / `FfNoRec` / `FfMoved` / `FfReowned`, `FkGen`, `PgStale`, `NvOpen` / `NvClose` /
+`NvIoctl` / `NvRef` / `NvStale` / `NvStaleUn` / `NvSwept`, `RestSeed*` / `ScRest*`, `PBFlip` / `PBRetSite`. Reading order: `StartN` (1 =
+image reloaded), `GenEpoch` against the previous run's (equal = R1 not fixed or not running), `StopUnbSt` / `StopUnbHst` (what the host
+was bound to at the stop), `ScRid` / `ScPub` / the histogram (what this generation bound and flushed), `NvRef` / `NvOpen` (the
+reconnect loop).
+
+### 25.6 Verified, and not
+
+The pure logic (`generation_id`) is host-tested (the salt, the serial and the epoch differ between two images loaded minutes apart and
+increase strictly within one; a stale serial is refused by `paging::alloc_is_current`; the whole kmd_logic and protocol suites pass).
+`kmd_render` cannot be built here: the stub type-check harness reports the same distinct error lines before and after. NOT verified:
+that a surviving client reacts to the new epoch as the header says (needs the librmclient branch and the Windows transport); that the
+StopDevice disable does not lengthen a restart (it is bounded by the StopDevice budget and sent only when something is bound);
+anything on hardware. Two statements elsewhere are wrong across an image reload: the doc comment of
+`reset_display_publication_state` and the row "TRANSPORT_SERIAL, NEXT_WIRE_FENCE_BASE: monotonic, KEPT" of section 20.4. Both restart at
+zero with the image, which the salt now covers.

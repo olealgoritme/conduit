@@ -197,6 +197,17 @@ pub(crate) fn now_100ns() -> u64 {
     unsafe { wdk_sys::ntddk::KeQueryInterruptTimePrecise(&mut qpc_timestamp) }
 }
 
+/// The generation of the live USER source: `Some` only while one is live and has not lapsed, never
+/// for the KMD's own resident source. One short leaf-lock hold (the already-on-scanout tag's check,
+/// `ddi/onscanout.rs`).
+pub(crate) fn live_user_generation() -> Option<u32> {
+    STATE
+        .lock()
+        .suppress_desktop(now_100ns())
+        .filter(|a| !a.resident)
+        .map(|a| a.generation)
+}
+
 /// Mirror the counters to the registry. PASSIVE only.
 pub(crate) fn publish_counters() {
     use crate::diag::record_named_bytes as rec;
@@ -916,6 +927,7 @@ impl AdapterContext {
     /// HPD worker, once per wake: send what fired, close what is owed. Cheap (two
     /// loads and one short lock) when there is nothing.
     pub(crate) fn foreign_fence_service(&self, passive: PassiveLevel) {
+        self.rm_gate_expiry_service();
         if FENCES.lock().is_empty()
             && crate::virtio::nvrm::FENCE_CLOSE_OWED.load(Ordering::Acquire) == 0
             && PUMP_AGAIN.load(Ordering::Acquire) == 0
@@ -923,5 +935,31 @@ impl AdapterContext {
             return;
         }
         self.foreign_fence_pump(passive);
+    }
+
+    /// The RM gates' lost-fire valve (v334, `RmGateMs`, default 6000, 0 = never): a point whose
+    /// `EventReady` has not come that long after the fence was attached is declared fired, so a
+    /// present gated on it completes after a bounded time (`RmGExp`). Worker, once per wake, at
+    /// most every 250 ms; one atomic load when no gate is open.
+    fn rm_gate_expiry_service(&self) {
+        static LAST_SCAN_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let limit = crate::virtio::gpu::RMG_EXPIRE_MS.load(Ordering::Relaxed);
+        if limit == 0 || !crate::virtio::gpu::rm_gates_open() {
+            return;
+        }
+        let now = AdapterContext::interrupt_time_ms();
+        if helios_kmd_logic::stall_diag::age_ms(now, LAST_SCAN_MS.load(Ordering::Relaxed)) < 250 {
+            return;
+        }
+        LAST_SCAN_MS.store(now.max(1), Ordering::Relaxed);
+        let expired = self
+            .with_virtio(|v| v.rm_gates_expire(now, limit))
+            .unwrap_or(0);
+        if expired != 0 {
+            // Waits that named a gate re-evaluate on the completion DPC; the handles are owed a
+            // host `Close`, which this very service sends next.
+            crate::ddi::interrupt::request_wddm_completion_dpc(self);
+            self.signal_hpd();
+        }
     }
 }

@@ -186,6 +186,11 @@ mod ffi {
         /// Hand-off ledger: give a shared resource its key now.
         /// # Safety: a live `ID3D11Resource*`.
         unsafe fn handoff_register(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize);
+        /// NVK: the resource is a composed Present's Blt source; DXVK's
+        /// next lists that touch it wait for the KMD's read-ledger claim.
+        /// Returns the ledger id (0: none).
+        /// # Safety: a live `ID3D11Resource*`.
+        unsafe fn mark_blt_source(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize) -> u32;
         /// Hand-off ledger: the resource goes; this process lets go of its key.
         /// # Safety: a live `ID3D11Resource*`.
         unsafe fn handoff_unregister(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize);
@@ -692,6 +697,11 @@ impl PresentStreamCorrelation {
 /// The DXVK bridge device, with the raw cxx surface sealed off.
 pub struct BridgeDevice {
     inner: cxx::UniquePtr<ffi::HeliosDxvkDevice>,
+    /// The immediate context, read once: the bridge sets it at device creation
+    /// (GetImmediateContext) and never changes it, and every DDI asks for it,
+    /// so the per-call cxx round trip (`d3d11_context_ptr`) is not worth
+    /// paying ~10 times per draw.
+    context_ptr: usize,
 }
 
 impl BridgeDevice {
@@ -705,7 +715,11 @@ impl BridgeDevice {
             luid_high,
             crate::knobs::UMD_TIMER_RESOLUTION.get(),
         );
-        (!inner.is_null()).then_some(Self { inner })
+        if inner.is_null() {
+            return None;
+        }
+        let context_ptr = inner.as_ref().map_or(0, |d| d.d3d11_context_ptr());
+        Some(Self { inner, context_ptr })
     }
 
     /// The only path from the newtype to the sealed type, and it is private.
@@ -720,7 +734,11 @@ impl BridgeDevice {
     }
 
     pub(crate) fn d3d11_context(&self) -> Option<ManuallyDrop<ID3D11DeviceContext>> {
-        self.get()?.d3d11_context()
+        let p = self.context_ptr;
+        // SAFETY: the bridge device owns the immediate context's reference for
+        // its whole life (see `context_ptr`); ManuallyDrop borrows it.
+        (p != 0)
+            .then(|| ManuallyDrop::new(unsafe { ID3D11DeviceContext::from_raw(p as *mut c_void) }))
     }
 
     /// # Safety
@@ -877,6 +895,16 @@ impl BridgeDevice {
         if let Some(d) = self.get() {
             // SAFETY: the caller passes a live resource pointer.
             unsafe { d.handoff_register(res) };
+        }
+    }
+
+    /// NVK: `res` is the source of a composed Present (see the bridge
+    /// declaration). Returns the ledger id, 0 when it has none.
+    pub(crate) fn mark_blt_source(&self, res: usize) -> u32 {
+        match self.get() {
+            // SAFETY: the caller passes a live resource pointer.
+            Some(d) => unsafe { d.mark_blt_source(res) },
+            None => 0,
         }
     }
 

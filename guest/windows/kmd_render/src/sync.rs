@@ -51,28 +51,61 @@ use crate::irql::PassiveLevel;
 /// `STATUS_TIMEOUT`.
 const STATUS_TIMEOUT: i32 = 0x0000_0102;
 
-/// An infinite, non-alertable, KernelMode wait on `object` that is made of 5 s slices: each slice
-/// that expires is counted (`LkWaitN`, `LkWaitWh` = `which`, `LkWaitMs`, `ddi::stall_diag`) and
-/// the wait goes on, so the semantics are an infinite wait's exactly (mutual exclusion is never
-/// given up) and a holder that never lets go shows in the next stall dump instead of nowhere.
-/// Returns the status of the satisfying wait.
+/// The status [`wait_logged`] returns when an abortable wait gave up (`STATUS_CANCELLED`): negative,
+/// so every caller that tests `status >= 0` already reads it as a failure.
+pub(crate) const STATUS_WAIT_ABORTED: i32 = 0xC000_0120u32 as i32;
+
+/// An infinite, non-alertable, KernelMode wait on `object` that is made of 100 ms slices (counted
+/// as 5 s slices for `LkWaitN`, `LkWaitWh`, `LkWaitMs`, `ddi::stall_diag`): each 5 s that expire
+/// are counted and the wait goes on, so the semantics are an infinite wait's exactly (mutual
+/// exclusion is never given up) and a holder that never lets go shows in the next stall dump
+/// instead of nowhere. Returns the status of the satisfying wait.
+///
+/// With `abortable` (v334, `ddi::escape_wait`, `kmd_logic::wait_bound`) the wait ALSO gives up,
+/// returning [`STATUS_WAIT_ABORTED`] without the lock, when the calling thread is inside an escape
+/// and is terminating, the device is stopping, or the escape's `EscWaitMs` is spent
+/// (`LkWaitAbort`). The caller must then fail without touching what the lock guards. A thread
+/// that is not inside an escape is never aborted, `abortable` or not, and a caller that cannot
+/// fail (`with_scanout_lifecycle`) passes `false`.
 ///
 /// # Safety
 /// `object` is an initialized dispatcher object that outlives the wait; PASSIVE_LEVEL.
-pub(crate) unsafe fn wait_logged(object: PVOID, which: u32) -> i32 {
+pub(crate) unsafe fn wait_logged_abortable(object: PVOID, which: u32, abortable: bool) -> i32 {
     let mut slices = 0u32;
+    let mut slice_ms = 0u32;
     loop {
         // SAFETY: an all-zero LARGE_INTEGER is a valid plain integer union.
         let mut timeout: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
-        timeout.QuadPart = helios_kmd_logic::stall_diag::LONG_WAIT_SLICE_100NS;
+        // 100 ms: an uncontended acquire returns at once, a contended one is looked at ten times
+        // a second.
+        timeout.QuadPart = -1_000_000;
         // SAFETY: per the fn contract.
         let status = unsafe { KeWaitForSingleObject(object, 0, 0, 0, &mut timeout) };
         if status != STATUS_TIMEOUT {
             return status;
         }
-        slices = slices.saturating_add(1);
-        crate::ddi::stall_diag::note_long_wait(which, slices);
+        if abortable {
+            if let Some(why) = crate::ddi::escape_wait::abort_now() {
+                crate::ddi::escape_wait::note_lock_abort(why);
+                return STATUS_WAIT_ABORTED;
+            }
+        }
+        slice_ms += 100;
+        if slice_ms >= helios_kmd_logic::stall_diag::LONG_WAIT_SLICE_MS {
+            slice_ms = 0;
+            slices = slices.saturating_add(1);
+            crate::ddi::stall_diag::note_long_wait(which, slices);
+        }
     }
+}
+
+/// [`wait_logged_abortable`] that never gives up (the original behaviour).
+///
+/// # Safety
+/// As [`wait_logged_abortable`].
+pub(crate) unsafe fn wait_logged(object: PVOID, which: u32) -> i32 {
+    // SAFETY: per the fn contract.
+    unsafe { wait_logged_abortable(object, which, false) }
 }
 
 /// A stable, fallibly-created atomic shared owner.
@@ -192,9 +225,10 @@ impl PassiveMutex {
         // Executive=0, KernelMode=0, Alertable=FALSE and NULL timeout form a
         // legal indefinite PASSIVE_LEVEL wait.
         let status = unsafe {
-            wait_logged(
+            wait_logged_abortable(
                 self.raw.get().cast::<core::ffi::c_void>() as PVOID,
                 helios_kmd_logic::stall_diag::lock::CONTENT,
+                true,
             )
         };
         (status >= 0).then_some(PassiveMutexGuard {

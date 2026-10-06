@@ -664,6 +664,14 @@ impl VenusRing {
                 });
                 return Err(VirtioError::DeviceError);
             }
+            // Inside an escape (v334, `ddi::escape_wait`): a terminating thread, a stopping device
+            // or a spent `EscWaitMs` ends the wait WITHOUT latching the ring fatal (the ring is
+            // healthy, this thread is leaving): the caller fails with a timeout and releases the
+            // Venus mutex it holds. Never aborts a thread outside an escape.
+            if let Some(why) = crate::ddi::escape_wait::abort_now() {
+                crate::ddi::escape_wait::note_abort(why);
+                return Err(VirtioError::Timeout);
+            }
             ctrl::sleep_ms(self.passive, 1);
             slept_ms += 1;
         }

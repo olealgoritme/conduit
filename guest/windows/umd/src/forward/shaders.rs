@@ -934,6 +934,9 @@ pub(crate) unsafe extern "system" fn destroy_shader(h: Hdevice, h_shader: ddi::D
                 was_vertex_shader
             };
             if was_vertex_shader {
+                dev.owned.ia_gen.fetch_add(1, Ordering::Release);
+            }
+            if was_vertex_shader {
                 // Defensive: the runtime's use-counting means a destroyed VS
                 // cannot still be bound, but clear the shadow if it is. The
                 // stores happen after the caches lock drops — no compound

@@ -470,11 +470,14 @@ pub(crate) fn nvk_placeholder_allocations() -> bool {
 /// S3 CPU wait before every NVK present.
 pub(crate) static NVK_RM_FENCE: BoolKnob = BoolKnob::new(c"NvkRmFence", true);
 
-/// `NvkRmFencePresent`: 1 = when DWM composes an NVK app's frames, the WDDM
-/// present carries the RM fence in its `HEPR`/`HERF` tail and the KMD retires
-/// the present on it (needs capability bit 33, the KMD's (b) carrier).
-/// 0 (default until that KMD is tested) = the S3 CPU wait for composed frames.
-pub(crate) static NVK_RM_FENCE_PRESENT: BoolKnob = BoolKnob::new(c"NvkRmFencePresent", false);
+/// `NvkRmFencePresent`: 1 (default) = when DWM composes an NVK app's frames, the
+/// WDDM present carries the RM fence in its `HEPR`/`HERF` tail and the KMD
+/// retires the present on it (needs capability bit 33, the KMD's (b) carrier).
+/// Default on since 22.22.339.2, after a 10-minute windowed Heaven soak with no
+/// pending-flip, gate or escape timeouts (windowed Heaven 121 -> 213 fps).
+/// 0 (registry, or `HELIOS_NVK_RM_FENCE_PRESENT=0`) = the S3 CPU wait for
+/// composed frames.
+pub(crate) static NVK_RM_FENCE_PRESENT: BoolKnob = BoolKnob::new(c"NvkRmFencePresent", true);
 
 fn env_bool(name: &str) -> Option<bool> {
     std::env::var(name).ok().and_then(|v| match v.trim() {
@@ -495,5 +498,24 @@ pub(crate) fn nvk_rm_fence_present() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| {
         env_bool("HELIOS_NVK_RM_FENCE_PRESENT").unwrap_or_else(|| NVK_RM_FENCE_PRESENT.get())
+    })
+}
+
+/// `DirectFlipSupport` (REG_DWORD), or `HELIOS_DIRECT_FLIP_SUPPORT` from the
+/// process environment: what the D3D11.1 `CheckDirectFlipSupport` DDI answers.
+/// 0 (default) = never (the behaviour before this knob); 1 = yes when dxgkrnl
+/// reports DirectFlip support for the Helios adapter (KMTQAITYPE_DIRECTFLIP_SUPPORT,
+/// i.e. the KMD's SupportDirectFlip cap) and the two resources have the same
+/// size and format; 2 = yes whenever size and format match (test lever).
+/// Windows decides independent flip and the blt-to-flip swap-effect upgrade
+/// partly from this answer.
+pub(crate) fn direct_flip_support() -> u32 {
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("HELIOS_DIRECT_FLIP_SUPPORT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .or_else(|| helios_umd_common::knobs::reg_dword(c"DirectFlipSupport"))
+            .unwrap_or(0)
     })
 }

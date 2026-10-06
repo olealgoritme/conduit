@@ -54,12 +54,12 @@ pub(crate) unsafe extern "system" fn resource_copy_region(
     };
     let dst = load_resource(h_dst);
     let src = load_resource(h_src);
-    let dst_summary = resource_summary(h_dst);
-    let src_summary = resource_summary(h_src);
-    let (dst_rt, dst_km) = resource_parent_handles(h_dst);
-    let (src_rt, src_km) = resource_parent_handles(h_src);
     let n = COPY_REGION_LOG_COUNT.next();
-    if n < 1024 || dst.is_none() || src.is_none() {
+    if crate::trace_enabled() && (n < 1024 || dst.is_none() || src.is_none()) {
+        let dst_summary = resource_summary(h_dst);
+        let src_summary = resource_summary(h_src);
+        let (dst_rt, dst_km) = resource_parent_handles(h_dst);
+        let (src_rt, src_km) = resource_parent_handles(h_src);
         trace_line!(
             "DDI ResourceCopyRegion: #{} dstDrv={:p} dstRT={:p} dstKM=0x{:x} \
              dstAlloc=0x{:x} dst={}x{} fmt={} srcDrv={:p} srcRT={:p} srcKM=0x{:x} \
@@ -760,17 +760,130 @@ pub(crate) unsafe extern "system" fn discard_11_1(
 
 pub(crate) unsafe extern "system" fn check_direct_flip_support_11_1(
     _h: Hdevice,
-    _resource1: ddi::D3D10DDI_HRESOURCE,
-    _resource2: ddi::D3D10DDI_HRESOURCE,
+    resource1: ddi::D3D10DDI_HRESOURCE,
+    resource2: ddi::D3D10DDI_HRESOURCE,
     flags: u32,
     supported: *mut ddi::BOOL,
 ) {
+    let mode = crate::knobs::direct_flip_support();
+    let (answer, why) = match mode {
+        0 => (false, "DirectFlipSupport=0"),
+        _ if mode == 1 && !kmd_reports_direct_flip() => (false, "dxgkrnl reports no DirectFlip"),
+        _ => {
+            // resource1 (the app's) must be able to replace resource2 (DWM's
+            // primary) on scanout as is: same size, same format.
+            let (_, k1, w1, h1, _, f1) = resource_summary(resource1);
+            let (_, k2, w2, h2, _, f2) = resource_summary(resource2);
+            if k1 == "tex2d" && k2 == "tex2d" && w1 == w2 && h1 == h2 && f1 == f2 && w1 != 0 {
+                (true, "same size and format")
+            } else {
+                (false, "size or format differ")
+            }
+        }
+    };
     if !supported.is_null() {
-        *supported = 0;
+        *supported = answer as ddi::BOOL;
     }
     if D3D11_1_LOG_COUNT.first_n(64).is_some() {
-        log_error!("DDI D3D11.1 CheckDirectFlipSupport: flags=0x{flags:x} -> no");
+        log_error!(
+            "DDI D3D11.1 CheckDirectFlipSupport: flags=0x{flags:x} mode={mode} -> {} ({why})",
+            if answer { "yes" } else { "no" }
+        );
     }
+}
+
+/// Does dxgkrnl report DirectFlip support (KMTQAITYPE_DIRECTFLIP_SUPPORT, from
+/// the KMD's SupportDirectFlip cap) for a hardware render adapter? Asked once
+/// per process through gdi32's D3DKMT entry points.
+fn kmd_reports_direct_flip() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        // SAFETY: gdi32's documented D3DKMT ABI; every buffer is local and
+        // sized as the call expects; adapters opened by EnumAdapters2 are closed.
+        let r = unsafe { query_direct_flip() };
+        log_error!("DDI CheckDirectFlipSupport: dxgkrnl DirectFlip support = {r}");
+        r
+    })
+}
+
+unsafe fn query_direct_flip() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryA(name: *const u8) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct AdapterInfo {
+        h_adapter: u32,
+        luid_low: u32,
+        luid_high: i32,
+        num_sources: u32,
+        precise_present_regions: i32,
+    }
+    #[repr(C)]
+    struct EnumAdapters2 {
+        num_adapters: u32,
+        adapters: *mut AdapterInfo,
+    }
+    #[repr(C)]
+    struct QueryAdapterInfo {
+        h_adapter: u32,
+        kind: u32,
+        data: *mut c_void,
+        size: u32,
+    }
+    const KMTQAITYPE_ADAPTERTYPE: u32 = 15;
+    const KMTQAITYPE_DIRECTFLIP_SUPPORT: u32 = 19;
+    type Enum2 = unsafe extern "system" fn(*mut EnumAdapters2) -> i32;
+    type Query = unsafe extern "system" fn(*const QueryAdapterInfo) -> i32;
+    type Close = unsafe extern "system" fn(*const u32) -> i32;
+
+    let gdi = LoadLibraryA(c"gdi32.dll".as_ptr().cast());
+    if gdi.is_null() {
+        return false;
+    }
+    let (e, q, c) = (
+        GetProcAddress(gdi, c"D3DKMTEnumAdapters2".as_ptr().cast()),
+        GetProcAddress(gdi, c"D3DKMTQueryAdapterInfo".as_ptr().cast()),
+        GetProcAddress(gdi, c"D3DKMTCloseAdapter".as_ptr().cast()),
+    );
+    if e.is_null() || q.is_null() || c.is_null() {
+        return false;
+    }
+    let (enum2, query, close): (Enum2, Query, Close) =
+        (core::mem::transmute(e), core::mem::transmute(q), core::mem::transmute(c));
+    let mut adapters = [AdapterInfo::default(); 16];
+    let mut arg = EnumAdapters2 { num_adapters: adapters.len() as u32, adapters: adapters.as_mut_ptr() };
+    if enum2(&mut arg) < 0 {
+        return false;
+    }
+    let mut supported = false;
+    for a in &adapters[..(arg.num_adapters as usize).min(adapters.len())] {
+        // D3DKMT_ADAPTERTYPE: bit 0 RenderSupported, bit 2 SoftwareDevice.
+        let mut kind: u32 = 0;
+        let qa = QueryAdapterInfo {
+            h_adapter: a.h_adapter,
+            kind: KMTQAITYPE_ADAPTERTYPE,
+            data: (&mut kind as *mut u32).cast(),
+            size: 4,
+        };
+        let hardware_render = query(&qa) >= 0 && kind & 1 != 0 && kind & 4 == 0;
+        if hardware_render {
+            let mut df: i32 = 0;
+            let qd = QueryAdapterInfo {
+                h_adapter: a.h_adapter,
+                kind: KMTQAITYPE_DIRECTFLIP_SUPPORT,
+                data: (&mut df as *mut i32).cast(),
+                size: 4,
+            };
+            if query(&qd) >= 0 && df & 1 != 0 {
+                supported = true;
+            }
+        }
+        close(&a.h_adapter);
+    }
+    supported
 }
 
 pub(crate) unsafe extern "system" fn clear_view_11_1(
@@ -848,12 +961,40 @@ pub(crate) unsafe extern "system" fn resource_update_subresource(
         }
         return;
     };
-    // `alloc` selects the gate below, so the summary read stays out here; every
-    // other operand is log-only and now lives inside it. The two
-    // `read_unaligned` probes in particular are two dependent cache misses into
-    // the CALLER's buffer, and they used to be paid on every BGRA/RGBA tex2d
-    // update purely to produce a log field.
-    let (alloc, kind, width, height, depth, fmt) = resource_summary(h_res);
+    // Untraced: nothing below the trace gate is needed, so the allocation
+    // read (a dependent load into the resource slot) and the two counters
+    // are skipped on this per-draw path.
+    if crate::trace_enabled() {
+        trace_update_subresource(h_res, subresource, box_, data, row_pitch, depth_pitch);
+    }
+    let bx;
+    let bx_ptr = if box_.is_null() {
+        None
+    } else {
+        let b = &*box_;
+        bx = D3D11_BOX {
+            left: b.left as u32,
+            top: b.top as u32,
+            front: b.front as u32,
+            right: b.right as u32,
+            bottom: b.bottom as u32,
+            back: b.back as u32,
+        };
+        Some(&bx as *const D3D11_BOX)
+    };
+    context.UpdateSubresource(&*res, subresource, bx_ptr, data, row_pitch, depth_pitch);
+}
+
+/// The UpdateSubresource trace line (UmdTrace only).
+unsafe fn trace_update_subresource(
+    h_res: ddi::D3D10DDI_HRESOURCE,
+    subresource: u32,
+    box_: *const ddi::D3D10_DDI_BOX,
+    data: *const c_void,
+    row_pitch: u32,
+    depth_pitch: u32,
+) {
+    let alloc = resource_allocation(h_res);
     let n = UPDATE_LOG_COUNT.next();
     // DECLARED diagnostic change: the old gate's `|| alloc != 0` disjunct
     // removed the rate cap entirely for exactly the shared/primary/present
@@ -866,6 +1007,10 @@ pub(crate) unsafe extern "system" fn resource_update_subresource(
         UPDATE_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
     }
     if crate::trace_enabled() && rate_ok {
+        // Three QueryInterface casts and a GetDesc: only for the log line,
+        // never on the untraced path (profiled at ~3 % of Heaven's render
+        // thread when it ran per call).
+        let (_, kind, width, height, depth, fmt) = resource_summary(h_res);
         let (rt_resource, km_resource) = resource_parent_handles(h_res);
         let (box_left, box_top, box_right, box_bottom) = if box_.is_null() {
             (
@@ -933,22 +1078,6 @@ pub(crate) unsafe extern "system" fn resource_update_subresource(
             );
         }
     }
-    let bx;
-    let bx_ptr = if box_.is_null() {
-        None
-    } else {
-        let b = &*box_;
-        bx = D3D11_BOX {
-            left: b.left as u32,
-            top: b.top as u32,
-            front: b.front as u32,
-            right: b.right as u32,
-            bottom: b.bottom as u32,
-            back: b.back as u32,
-        };
-        Some(&bx as *const D3D11_BOX)
-    };
-    context.UpdateSubresource(&*res, subresource, bx_ptr, data, row_pitch, depth_pitch);
 }
 
 pub(crate) unsafe extern "system" fn resource_update_subresource_11_1(

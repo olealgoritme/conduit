@@ -109,6 +109,10 @@ pub mod site {
 /// `kmd_render` or `kmd_logic` (host-tested by scanning both trees). The two `Fk` names,
 /// `FkDefBud` and `FkVenus`, are in `flip_completion::COUNTERS` and written by `ddi/flip_keep.rs`.
 ///
+/// * `FlipPendWd`, `FlipPendWdT`, `FpWdMsEff` (v334): publications of the generic pending-flip
+///   watchdog (`flip_pend_wd`, knob `FlipPendWdMs`, default 500), the time of the last, and the
+///   knob in force. `StallReqN`: refreshes of a stale stall block the vsync tick asked the
+///   mirror thread for (the block is at least `STALE_PUBLISH_MS` old and nobody else wrote it).
 /// * `HpdLoopN`, `HpdLoopT`: HPD worker loops, interrupt time (ms) of the last one's wake.
 /// * `HpdSite`, `HpdSiteT`: [`site`] the worker is in or last entered, and when it entered it.
 /// * `FlipIss`: flips dxgkrnl issued (each `SetVidPnSourceAddress`, each DMA flip taken).
@@ -167,6 +171,16 @@ pub mod site {
 ///   `VsGapT`, `VsGapSite`, `VsGapFlg`, `VsGapInfl`: for the longest (`VsGapMaxMs`): when it
 ///   ended, the worker's `HpdSite` then, flags (bit 0 scanout mutex held, 1 Venus mutex held, 2
 ///   worker idle in its wait, 3 programming pending), the DDIs in flight (ids 0..32).
+/// * `VsSnapA`, `VsSnapB` (REG_QWORD, 15.18.16): the heartbeat's tick count, resp. the period slots
+///   it moved over, in the high 32 bits and the interrupt time (ms) of the tick that made them in
+///   the low 32: one registry value each, so a reader gets a count with ITS time, from the one
+///   seqlock'd sample the mirror took (`vsync_snap`). `VsSlotN`, `VsSkipN`, `VsCatchN`: the slots
+///   moved over (nominal rate), those dropped because a callback ran a period or more late, and
+///   those served by a catch-up tick (`VsCatchUp`, `VsCatchEff` in force); `VsSnapMiss`: samples
+///   that met a write in flight. `VsCbMaxUs`, `VsCbOvN`: the longest tick callback and those that
+///   took a whole period; `VsExTm`: 1 = the high-resolution Ex timer drives the heartbeat.
+///   `HpdOv4N`, `HpdOv4Mask`: worker steps over 4 ms and the step ids (bit = `site` id) that had
+///   one; `HpdDumpDef`: inline dumps held back by a flip in the worker's hands.
 /// * `VsLiveT`: interrupt time (ms) the heartbeat block (`VsTickN` ... `VsWd*`) was last written. Every
 ///   value of that block is a snapshot as of `VsLiveT`: compare `VsTickT` with `VsLiveT`, and
 ///   `VsLiveT` with the uptime, before calling a heartbeat dead. The watchdog timer asks the worker
@@ -183,7 +197,7 @@ pub mod site {
 ///   `VsWdSCbI`, `VsWdSCbO`, `VsWdSSyT`: what it saw the last time it acted (when, armed, the
 ///   reference and deadline in ms, the silence, the callback counts, when the last synchronized
 ///   call began).
-pub const COUNTERS: [&str; 129] = [
+pub const COUNTERS: [&str; 150] = [
     "HpdLoopN",
     "HpdLoopT",
     "HpdSite",
@@ -204,6 +218,10 @@ pub const COUNTERS: [&str; 129] = [
     "FlipWd",
     "FlipWdT",
     "FlipWdBig",
+    "FlipPendWd",
+    "FlipPendWdT",
+    "FpWdMsEff",
+    "StallReqN",
     "StallT",
     "FlWdMsEff",
     "DefBudEff",
@@ -329,7 +347,45 @@ pub const COUNTERS: [&str; 129] = [
     "ScRestIss",
     "ScRestHi",
     "ScRestSig",
+    // The restart seed that survives an image reload (`restart_flip::choose_seed`): the knob in
+    // force, the persisted address as read at StartDevice (low and high dword), and why it was or
+    // was not used. The persisted words themselves (`RestIssLo`, ...) are state, not counters:
+    // they are spelled once, in `restart_flip`.
+    "RestSeedEff",
+    "RestSeedLo",
+    "RestSeedHi",
+    "RestSeedUse",
+    // 15.18.16 (docs/kmd-rm-client.md): the heartbeat's exact (count, time) pair and the slots it
+    // moved over, what the tick callback itself costs, which timer drives it, the worker steps over
+    // 4 ms, and the inline dumps held back by a flip.
+    "VsSnapA",
+    "VsSnapB",
+    "VsSnapMiss",
+    "VsSlotN",
+    "VsSkipN",
+    "VsCatchN",
+    "VsCatchEff",
+    "VsCbMaxUs",
+    "VsCbOvN",
+    "VsExTm",
+    "HpdOv4N",
+    "HpdOv4Mask",
+    "HpdDumpDef",
 ];
+
+/// A worker step longer than this (one 240 Hz period, microseconds) is over budget: a flip that
+/// arrives while the worker is inside it waits a whole tick or more.
+pub const STEP_BUDGET_US: u32 = 4_000;
+
+/// Whether a worker step that lasted `us` microseconds is over [`STEP_BUDGET_US`].
+pub const fn step_over_budget(us: u32) -> bool {
+    us >= STEP_BUDGET_US
+}
+
+/// The bit of `HpdOv4Mask` for step id `site` (ids above 31 share bit 31).
+pub const fn step_mask_bit(site: u32) -> u32 {
+    1u32 << if site > 31 { 31 } else { site }
+}
 
 // ---- the scanout mutex -----------------------------------------------------------------------
 
@@ -1566,6 +1622,27 @@ mod tests {
         }
         assert!(REMOVE_ENTER > DONE && REMOVE_DROP > REMOVE_ENTER && REMOVE_DONE > REMOVE_DROP);
         assert!(REMOVE_TIMER > REMOVE_DONE);
+    }
+
+    #[test]
+    fn the_four_millisecond_budget_marks_steps_by_id() {
+        assert!(!step_over_budget(0));
+        assert!(!step_over_budget(STEP_BUDGET_US - 1));
+        assert!(step_over_budget(STEP_BUDGET_US));
+        assert!(step_over_budget(u32::MAX));
+        // every worker step id has its own bit; the mask of two is the union
+        let mut seen = 0u32;
+        for (id, _) in site::ALL {
+            let bit = step_mask_bit(id);
+            assert_eq!(bit.count_ones(), 1);
+            assert_eq!(seen & bit, 0, "site {id} shares a bit");
+            seen |= bit;
+        }
+        assert_eq!(step_mask_bit(site::DUMP), 1 << 12);
+        assert_eq!(step_mask_bit(site::NVRM_PUBLISH) | step_mask_bit(site::DUMP), 0x1800);
+        // an id past the mask shares the last bit instead of overflowing the shift
+        assert_eq!(step_mask_bit(32), 1 << 31);
+        assert_eq!(step_mask_bit(u32::MAX), 1 << 31);
     }
 
     #[test]

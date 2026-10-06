@@ -104,6 +104,46 @@ Expected leftovers on Venus:
   video and HDR content.
 * The secure desktop until the shell has soaked.
 
+#### 4.2.0 The desktop follows DWM (UMD, `feat/s6-fast-handoff`)
+
+An NVK DWM shows a blank placeholder for every surface a Venus process made: with `DwmIcd=nvk`
+and `Icd=venus` the Start menu, search and notification centre came up gray (DWM log: "not
+importable: blank placeholder" for 1312x384, 704x704, 800x704, 832x896, 1024x1024, 32x32). So
+while DWM runs on NVK, every D3D11 process goes to NVK as well:
+
+* The DWM that chose NVK through `DwmIcd=nvk` (crash-loop guard passed) creates the named event
+  `Local\HeliosDwmOnNvk` (DACL: everyone and restricted/AppContainer tokens may wait; low label)
+  and closes it if NVK fails for it; it dies with that DWM.
+* Any other D3D11 process whose registry says `DwmIcd=nvk` and that finds the marker (an
+  `ERROR_ACCESS_DENIED` open counts as found) takes NVK. `Icd=venus` and the built-in deny-list do
+  not apply then (their reason, NVK and Venus processes cannot share surfaces, is what they would
+  cause); an explicit `NvkDenyList` still keeps a process on Venus.
+  `DesktopFollowsDwm=0` (REG_DWORD) turns it off. D3D12 is unchanged (already NVK by default).
+* NVK apps' presents go to DWM (composed by resource id) rather than straight to scanout 0 while
+  the marker is there, as with `ForeignImport=1`; otherwise an NVK app took the whole screen and
+  DWM's own flips showed through about once a second.
+
+The choice is made once per process: processes that started before DWM moved (the shell after a
+`restart-device`) keep Venus until they restart.
+
+#### 4.2.0a Browsers on NVK: the stall was NAK in the sandbox, not the hand-off (2026-10-06)
+
+* Cross-process hand-off cost on NVK (330.2, `tools/handoff_bench`, 1280x720 BGRA ping-pong, 300
+  hand-offs, no stale reads): median round trip 0.42 ms with an NT-handle keyed mutex, 0.44 ms with a
+  KMT keyed mutex, 0.47 ms with a shared `ID3D11Fence`.
+* Edge's GPU process (low integrity, restricted token) lost its NVK device at its first pipeline:
+  every NAK compile created a NIR instruction printer whose memstream is a `%TEMP%` file on
+  Windows, which the sandbox may not create; NAK panicked (`from_nir.rs`, Access is denied),
+  pipelines failed with `VK_ERROR_UNKNOWN`, DXVK lost the device, and Edge fell back to software
+  after three GPU process restarts. The same panic killed AppContainer shell hosts
+  (ShellExperienceHost c000027b in XAML) and blanked explorer's XAML islands. Fixed by NVK patch
+  0048 (the printer only for `NAK_DEBUG=annotate`). `tools/sandbox_run` reproduces the sandbox.
+* NT-handle sharing: B5G6R5, B5G5R5A1 and B4G4R4A4 are refused by the Microsoft runtime for WARP
+  as well (policy, not a driver gap). R16G16 / R16G16_FLOAT are refused only on Helios (both
+  backends, WDDM 1.3 and 2.3 alike): open.
+* A process whose KMD restarted under it now gets NVK back at its next device creation
+  (librmclient generations, a1fe219), so long-lived shell processes do not stay on Venus.
+
 #### 4.2.1a Measured moves (22.22.326.1, 2026-10-06, Venus DWM with ForeignImport=1)
 
 Each category on NVK by `NvkAllowList` only (`Icd=venus` kept), its processes restarted in the

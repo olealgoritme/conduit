@@ -510,10 +510,37 @@ pub(crate) struct TransportGeneration {
 /// The last transport-generation serial handed out (0 = none yet).
 static TRANSPORT_SERIAL: AtomicU64 = AtomicU64::new(0);
 
-/// A fresh transport-generation serial: nonzero and unique for the life of the
-/// driver. Call once per StartDevice, for the [`TransportGeneration`] it builds.
+/// The per-IMAGE salt (`helios_kmd_logic::generation_id`), 0 until first asked for.
+///
+/// `pnputil /restart-device` reloads the driver image, which zeroes every static: without a salt
+/// the first generation of each image was "serial 1, NVRM epoch 1", so an allocation or a
+/// long-lived NVK client from the previous image compared EQUAL to the new generation
+/// (docs/zero-copy-present.md section 25). The clock only moves forward within a boot, so images
+/// loaded later get larger salts. Any IRQL after the first call; the first call reads the interrupt
+/// time (a scalar read, legal through DISPATCH) and races benignly (the first compare-exchange wins,
+/// every caller returns the winner).
+static IMAGE_SALT: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn image_salt() -> u64 {
+    let current = IMAGE_SALT.load(Ordering::Acquire);
+    if current != 0 {
+        return current;
+    }
+    let fresh = helios_kmd_logic::generation_id::image_salt(foreign_scanout::now_100ns());
+    match IMAGE_SALT.compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => fresh,
+        Err(winner) => winner,
+    }
+}
+
+/// A fresh transport-generation serial: nonzero and unique across StartDevice calls AND across
+/// image reloads of one boot (`generation_id::transport_serial`). Call once per StartDevice, for the
+/// [`TransportGeneration`] it builds.
 pub(crate) fn mint_transport_serial() -> u64 {
-    TRANSPORT_SERIAL.fetch_add(1, Ordering::Relaxed) + 1
+    helios_kmd_logic::generation_id::transport_serial(
+        image_salt(),
+        TRANSPORT_SERIAL.fetch_add(1, Ordering::Relaxed) + 1,
+    )
 }
 
 pub struct AdapterContext {
@@ -1478,6 +1505,8 @@ impl AdapterContext {
 
         // The seed again, last: ending the leases above publishes a withheld old-generation
         // address (`publish_displayed_primary`) that must not displace what dxgkrnl waits for.
+        // An unconfirmed announcement of the old generation must not drop the next publication.
+        crate::ddi::flip_announce::forget_unconfirmed();
         self.last_primary_address.store(
             helios_kmd_logic::restart_flip::seed_address(
                 crate::ddi::stall_diag::last_issued_address(),
@@ -1622,6 +1651,14 @@ impl AdapterContext {
     /// addresses, and the desktop froze with two overwritten DWORDs as the only
     /// trace — a failure indistinguishable from a hang.
     pub(crate) fn publish_displayed_primary(&self, primary: ProgrammedPrimary) {
+        // `FlipAnnounce` (`ddi::flip_announce`): with nothing announced this is one acquire load
+        // and the store below, exactly as before. The announced flip's own publication is
+        // already stored (swallowed), and an OLDER address after a newer announce is dropped.
+        // `FlipPrgLat*`: the programming of this flip is done (announced or not).
+        crate::ddi::flip_lat::note_published(primary.address);
+        if !crate::ddi::flip_announce::funnel(primary.address) {
+            return;
+        }
         self.last_primary_address
             .store(primary.address, Ordering::Release);
         // `FlipPub` / `FlipPubT` (`ddi::stall_diag`): every publication, bound or kept, any
@@ -1860,7 +1897,12 @@ impl AdapterContext {
     /// StopDevice teardown). Device-lifecycle callers only; the previous client
     /// (if any) drops OUTSIDE the mutex, at PASSIVE_LEVEL.
     pub fn set_venus_client(&self, client: Option<crate::virtio::venus::VenusClient>) {
-        self.acquire_venus_mutex();
+        if !self.acquire_venus_mutex() {
+            // Not reachable (only the device lifecycle calls this, never inside an escape), but
+            // never touch the cell without the mutex.
+            drop(client);
+            return;
+        }
         // SAFETY: the venus mutex gives exclusive access to the cell.
         let old = core::mem::replace(unsafe { &mut *self.venus_client.get() }, client);
         self.release_venus_mutex();

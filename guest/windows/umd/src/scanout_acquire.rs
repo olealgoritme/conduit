@@ -759,19 +759,35 @@ pub extern "C" fn helios_scanout_ledger_lookup_v2(
             if unsafe { ledger_load(slot, SLOT_RESID_OFF) } != resid {
                 continue;
             }
+            // The reader order of protocol/include/helios_read_ledger.h
+            // (helios_read_ledger_lookup), whose stress test found a torn read
+            // in the older order: resid, generation, RE-CHECK resid, issued,
+            // retired, then generation and resid again; restart on a change.
             // SAFETY: as above.
             let generation = unsafe { ledger_load_u64(slot, SLOT_GENERATION_OFF) };
+            core::sync::atomic::fence(Ordering::Acquire);
+            // SAFETY: as above.
+            if unsafe { ledger_load(slot, SLOT_RESID_OFF) } != resid {
+                changed = true;
+                break;
+            }
             // SAFETY: as above.
             let issued = unsafe { ledger_load_u64(slot, SLOT_ISSUED_OFF) };
             // SAFETY: as above.
             let retired = unsafe { ledger_load_u64(slot, SLOT_RETIRED_OFF) };
+            core::sync::atomic::fence(Ordering::Acquire);
             // SAFETY: both re-reads close recycle and same-resid re-claim races.
             let final_generation = unsafe { ledger_load_u64(slot, SLOT_GENERATION_OFF) };
             // SAFETY: as above.
             let final_resid = unsafe { ledger_load(slot, SLOT_RESID_OFF) };
-            if generation == 0 || final_generation != generation || final_resid != resid {
+            if final_generation != generation || final_resid != resid {
                 changed = true;
                 break;
+            }
+            if generation == 0 {
+                // A claim being published or freed (resid set, generation not
+                // yet): no valid claim in this slot; keep scanning.
+                continue;
             }
             // SAFETY: out pointers were null-checked; the caller owns them.
             unsafe {
@@ -819,12 +835,18 @@ pub extern "C" fn helios_scanout_ledger_snapshot_v2(
         let resid = unsafe { ledger_load(slot, SLOT_RESID_OFF) };
         // SAFETY: as above.
         let generation = unsafe { ledger_load_u64(slot, SLOT_GENERATION_OFF) };
+        core::sync::atomic::fence(Ordering::Acquire);
+        // Re-check the identity before the counters (helios_read_ledger.h order).
+        // SAFETY: as above.
+        let resid_again = unsafe { ledger_load(slot, SLOT_RESID_OFF) };
         // SAFETY: as above.
         let issued = unsafe { ledger_load_u64(slot, SLOT_ISSUED_OFF) };
         // SAFETY: as above.
         let retired = unsafe { ledger_load_u64(slot, SLOT_RETIRED_OFF) };
+        core::sync::atomic::fence(Ordering::Acquire);
         // SAFETY: both fields identify this exact sampled claim.
         let stable = resid != 0
+            && resid_again == resid
             && generation != 0
             && unsafe { ledger_load_u64(slot, SLOT_GENERATION_OFF) } == generation
             // SAFETY: as above.

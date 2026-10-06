@@ -31,7 +31,7 @@
 //!                the device-teardown family, so ExchangePreStartInfo moved to
 //!                0x0E10_0001 (and its success marker 0x0E00_0002 -> 0x0E10_0002).
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use wdk_sys::ntddk::RtlWriteRegistryValue;
 
@@ -72,6 +72,8 @@ pub fn reread_level() -> u32 {
 const RTL_REGISTRY_SERVICES: u32 = 1;
 /// `REG_DWORD`.
 const REG_DWORD: u32 = 4;
+/// `REG_QWORD`.
+const REG_QWORD: u32 = 11;
 /// Cap on breadcrumbs so a chatty steady state can't grow the key unbounded.
 const MAX_STEPS: u32 = 3000;
 
@@ -124,6 +126,150 @@ fn record_named(name: &[u16], mut code: u32) {
             4,
         );
     }
+}
+
+/// [`record_named`] for a 64-bit value (`REG_QWORD`, 8 bytes): one registry transaction, so a
+/// reader sees the whole value or none of it. PASSIVE_LEVEL only.
+fn record_named_q(name: &[u16], mut value: u64) {
+    // SAFETY: PASSIVE_LEVEL (see module note). `name` is a NUL-terminated UTF-16 value name;
+    // ValueData points to an 8-byte QWORD that RtlWriteRegistryValue copies before returning.
+    unsafe {
+        let _ = RtlWriteRegistryValue(
+            RTL_REGISTRY_SERVICES,
+            SERVICE_NAME.as_ptr(),
+            name.as_ptr(),
+            REG_QWORD,
+            (&mut value as *mut u64).cast::<core::ffi::c_void>(),
+            8,
+        );
+    }
+}
+
+/// The registry mirror's pass-local write policy (15.18.16): inside a pass of `ddi::mirror_thread`
+/// (and only there) a write whose value is what the registry already holds is skipped, and a short
+/// rest is taken every few writes so a hundred-write pass does not keep one processor and the
+/// registry lock for tens of milliseconds. Every OTHER writer is untouched, except that each write
+/// from anywhere updates the cache, so the cache is the registry's content (a name written by a
+/// worker one-shot and by the mirror cannot be skipped wrongly).
+mod mirror {
+    use super::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+    const SLOTS: usize = 2048;
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicU64 = AtomicU64::new(0);
+    /// One entry per name hash: a 32-bit tag of the name in the high half (never 0: an empty slot
+    /// matches nothing) and the last value written in the low half.
+    static CACHE: [AtomicU64; SLOTS] = [Z; SLOTS];
+    /// The thread inside a pass (0 = none), `MirChanged` and `MirYield` in force, writes counted
+    /// in a pass since the last rest, writes made / skipped / rests taken (`MirWrN`, `MirSkipN`,
+    /// `MirYlds`; owned by `ddi::mirror_thread`).
+    static PASS_THREAD: AtomicUsize = AtomicUsize::new(0);
+    static CHANGED_ONLY: AtomicU32 = AtomicU32::new(1);
+    static YIELD_EVERY: AtomicU32 = AtomicU32::new(0);
+    static SINCE_REST: AtomicU32 = AtomicU32::new(0);
+    pub(super) static WRITES: AtomicU32 = AtomicU32::new(0);
+    pub(super) static SKIPPED: AtomicU32 = AtomicU32::new(0);
+
+    extern "system" {
+        /// `PsGetCurrentThread()` (exported; `KeGetCurrentThread` is an inline in wdm.h and is not): any IRQL.
+        fn PsGetCurrentThread() -> usize;
+    }
+
+    /// FNV-1a over the UTF-16 units of the value name.
+    fn hash(name: &[u16]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for c in name {
+            h ^= *c as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// `(slot, tag)` of a name.
+    pub(super) fn key(name: &[u16]) -> (usize, u32) {
+        let h = hash(name);
+        (((h ^ (h >> 32)) as usize) & (SLOTS - 1), ((h >> 32) as u32) | 1)
+    }
+
+    fn entry(tag: u32, value: u32) -> u64 {
+        ((tag as u64) << 32) | value as u64
+    }
+
+    /// The calling thread is the one inside a pass.
+    pub(super) fn in_pass() -> bool {
+        let t = PASS_THREAD.load(Ordering::Relaxed);
+        // SAFETY: a scalar read of the current thread pointer, any IRQL.
+        t != 0 && t == unsafe { PsGetCurrentThread() }
+    }
+
+    /// The pass's write is redundant: the registry already holds `value` under this name.
+    pub(super) fn unchanged(k: (usize, u32), value: u32) -> bool {
+        CHANGED_ONLY.load(Ordering::Relaxed) != 0
+            && CACHE[k.0].load(Ordering::Relaxed) == entry(k.1, value)
+    }
+
+    /// The cache holds exactly `value` under this name (regardless of `MirChanged` and of the
+    /// calling thread: the per-flip one-value breadcrumbs always use it).
+    pub(super) fn cached_equal(k: (usize, u32), value: u32) -> bool {
+        CACHE[k.0].load(Ordering::Relaxed) == entry(k.1, value)
+    }
+
+    /// `value` was written under this name, by any thread.
+    pub(super) fn wrote(k: (usize, u32), value: u32) {
+        CACHE[k.0].store(entry(k.1, value), Ordering::Relaxed);
+    }
+
+    /// Forget everything (the registry may have been edited by hand: every value is rewritten).
+    pub(crate) fn forget_all() {
+        for c in &CACHE {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// A pass begins on the calling thread, with the knobs in force.
+    pub(crate) fn begin_pass(changed_only: bool, yield_every: u32) {
+        CHANGED_ONLY.store(changed_only as u32, Ordering::Relaxed);
+        YIELD_EVERY.store(yield_every, Ordering::Relaxed);
+        SINCE_REST.store(0, Ordering::Relaxed);
+        // SAFETY: as in `in_pass`.
+        PASS_THREAD.store(unsafe { PsGetCurrentThread() }, Ordering::Release);
+    }
+
+    /// The pass is over.
+    pub(crate) fn end_pass() {
+        PASS_THREAD.store(0, Ordering::Release);
+    }
+
+    /// One write was made inside a pass: count it, and tell whether a rest is due.
+    pub(super) fn made_write() -> bool {
+        WRITES.fetch_add(1, Ordering::Relaxed);
+        let every = YIELD_EVERY.load(Ordering::Relaxed);
+        if every == 0 {
+            return false;
+        }
+        let n = SINCE_REST.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if n >= every {
+            SINCE_REST.store(0, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+}
+
+pub(crate) use mirror::{begin_pass as mirror_begin_pass, end_pass as mirror_end_pass, forget_all as mirror_forget_all};
+
+/// Registry writes the mirror's passes made and skipped as unchanged (`MirWrN`, `MirSkipN`).
+pub(crate) fn mirror_write_counts() -> (u32, u32) {
+    (
+        mirror::WRITES.load(Ordering::Relaxed),
+        mirror::SKIPPED.load(Ordering::Relaxed),
+    )
+}
+
+/// Zero the two mirror write counters (StartDevice).
+pub(crate) fn mirror_reset_counts() {
+    mirror::WRITES.store(0, Ordering::Relaxed);
+    mirror::SKIPPED.store(0, Ordering::Relaxed);
 }
 
 /// A lifecycle failure that must stay visible on a **default** boot.
@@ -598,7 +744,64 @@ pub fn record_named_bytes(name: &[u8], value: u32) {
         i += 1;
     }
     buf[n] = 0;
+    let key = mirror::key(&buf[..n]);
+    let in_pass = mirror::in_pass();
+    if in_pass && mirror::unchanged(key, value) {
+        mirror::SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     record_named(&buf[..=n], value);
+    mirror::wrote(key, value);
+    if in_pass && mirror::made_write() {
+        crate::ddi::mirror_thread::rest();
+    }
+}
+
+/// [`record_named_bytes`] unless the registry already holds `value` under this name, as far as the
+/// writes of this driver tell (every write from every thread updates the same cache). For the
+/// one-value breadcrumbs of a per-flip path (`VpDSt`: the status of every programming, almost
+/// always the same), which cost the HPD worker a registry transaction of a hundred microseconds or
+/// more per flip, between two flips. The value is rewritten at once when it changes, and by the
+/// mirror's full refresh at the latest 30 s after it was lost (`MirChanged`). PASSIVE_LEVEL only.
+pub fn record_named_changed(name: &[u8], value: u32) {
+    let mut buf = [0u16; 16];
+    let n = name.len().min(14);
+    let mut i = 0;
+    while i < n {
+        buf[i] = name[i] as u16;
+        i += 1;
+    }
+    buf[n] = 0;
+    let key = mirror::key(&buf[..n]);
+    if mirror::cached_equal(key, value) {
+        return;
+    }
+    record_named(&buf[..=n], value);
+    mirror::wrote(key, value);
+}
+
+/// Whether the calling thread is inside a pass of the registry mirror thread.
+pub(crate) fn mirror_in_pass() -> bool {
+    mirror::in_pass()
+}
+
+/// [`record_named_bytes`] for a 64-bit value (REG_QWORD): the value is ONE registry transaction,
+/// so the two 32-bit halves of a (count, time) pair are never from different writes. Not part of
+/// the mirror's changed-only cache (the callers keep their own, `stall_diag::rec_live_q`); inside a
+/// mirror pass it counts towards the rest like any write. PASSIVE_LEVEL only.
+pub fn record_named_qword(name: &[u8], value: u64) {
+    let mut buf = [0u16; 16];
+    let n = name.len().min(14);
+    let mut i = 0;
+    while i < n {
+        buf[i] = name[i] as u16;
+        i += 1;
+    }
+    buf[n] = 0;
+    record_named_q(&buf[..=n], value);
+    if mirror::in_pass() && mirror::made_write() {
+        crate::ddi::mirror_thread::rest();
+    }
 }
 
 /// `RTL_QUERY_REGISTRY_DIRECT` — store the value straight into EntryContext
@@ -698,6 +901,25 @@ pub mod knobs {
     /// completion. Nonzero values are clamped to 50..60000. Read at every StartDevice; mirrored
     /// as `FlWdMsEff`.
     pub const FLIP_WDOG_MS: KnobName = KnobName::new(b"FlipWdogMs");
+    /// `FlipPendWdMs` (default 500, 0 = off). The generic pending-flip watchdog (v334,
+    /// `kmd_logic::flip_pend_wd`, `docs/zero-copy-present.md` section 23): the newest flip
+    /// dxgkrnl issued that is not done, is this old and was followed by no publication of any
+    /// address for as long, is published as a KEPT picture by the vsync tick, whether or not a
+    /// programming is pending (`FlipWdogMs` only counts while one is). Nonzero values are clamped
+    /// to 100..60000. Read at every StartDevice; mirrored as `FpWdMsEff`; counted `FlipPendWd`.
+    pub const FLIP_PEND_WD_MS: KnobName = KnobName::new(b"FlipPendWdMs");
+    /// `EscWaitMs` (default 10000, 0 = no deadline; the kill and stop exits stay on). The most one
+    /// escape may spend waiting in total (v334, `kmd_logic::wait_bound`, section 23): after it
+    /// every wait the escape is in gives up with a clean failure status. Nonzero values are
+    /// clamped to 250..600000. Read at every StartDevice; mirrored as `EscWaitMsEff`.
+    pub const ESC_WAIT_MS: KnobName = KnobName::new(b"EscWaitMs");
+    /// `RmGateMs` (default 6000, 0 = never). An RM fence gate point (`docs/rm-fence-marker.md`
+    /// carrier (b)) whose `EventReady` has not come this many milliseconds after the fence was
+    /// attached is declared fired by the HPD worker (`RmGExp`): the host's own fence timeout is
+    /// 5 s, so a fire later than 6 s was lost, and the present it gates must not wait for it for
+    /// ever. Nonzero values are clamped to 1000..120000. Read at every StartDevice; mirrored as
+    /// `RmGateMsEff`.
+    pub const RM_GATE_MS: KnobName = KnobName::new(b"RmGateMs");
     /// `DeferBudget` (default 0 = unlimited, today's behaviour). The most Deferred programming
     /// attempts of one primary (about one per vsync tick) before the worker publishes the flip's
     /// address kept and lowers the gate instead of retrying again (`FkDefBud`). 240 is about
@@ -722,6 +944,17 @@ pub mod knobs {
     /// the worker to refresh the heartbeat block every 2 s. 0 never arms it. Read at every
     /// StartDevice; mirrored as `VsWdTmEff`.
     pub const VS_WD_TIMER: KnobName = KnobName::new(b"VsWdTimer");
+    /// `RestSeed` (default 1 = on): persist the newest flip address dxgkrnl issued in the
+    /// service key (`RestIssLo` / `RestIssHi` / `RestUpS` / `RestChk`) and seed the restarted
+    /// heartbeat from it after a `pnputil /restart-device` that RELOADED the image (every static
+    /// zero). 0 = the v329 behaviour, statics only, nothing written or read. Read at every
+    /// StartDevice; mirrored as `RestSeedEff` (docs/zero-copy-present.md section 20).
+    pub const REST_SEED: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_KNOB);
+    /// The persisted words, read at StartDevice (`restart_flip::Persisted`).
+    pub const REST_ISS_LO: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_ISS_LO);
+    pub const REST_ISS_HI: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_ISS_HI);
+    pub const REST_UPTIME: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_UPTIME);
+    pub const REST_CHECK: KnobName = KnobName::new(helios_kmd_logic::restart_flip::NAME_CHECK);
     /// Segment topology. Legal values 0 and 10 only — see `BarSegTopology`.
     pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
     /// CpuVisible cached-allocation kill switch (default 1 = cached).
@@ -818,6 +1051,30 @@ pub mod knobs {
     /// extension tier it needs. 0, the default, is the pre-feature device and import;
     /// read at AddAdapter/StartDevice like every knob.
     pub const FOREIGN_COPY: KnobName = KnobName::new(b"ForeignCopy");
+    /// `BltAsync` (default 0 = the previous behaviour). 1: a Blt Present of an adopted foreign
+    /// (NVK-on-RM) source into a KMD standard buffer returns from `DxgkDdiPresent` without a CPU
+    /// wait: the copy is submitted by the DDI, or queued for the HPD worker until the producer's
+    /// boundary has been reached, and the Present's DMA fence retires with the copy. Read at every
+    /// StartDevice; mirrored as `BltAsyncKnob`. `docs/zero-copy-present.md`, "Asynchronous
+    /// composed present (BltAsync, BltNoMirror)".
+    pub const BLT_ASYNC: KnobName = KnobName::new(b"BltAsync");
+    /// `BltNoMirror` (default 0 = the previous behaviour). 1: such a Blt does not CPU-copy the
+    /// frame into the destination's system-memory backing; the backing is marked "system copy
+    /// invalid" instead. Independent of `BltAsync`. Read at every StartDevice; mirrored as
+    /// `BltNoMirKnob`.
+    pub const BLT_NO_MIRROR: KnobName = KnobName::new(b"BltNoMirror");
+    /// `BltAsyncVenus` (default 0 = the knobs act on foreign sources only). 1: `BltAsync` and
+    /// `BltNoMirror` also act on a Venus-native source (an image the UMD created through Venus)
+    /// blitted into a standard buffer. Has no effect with both of those knobs at 0. Read at every
+    /// StartDevice; mirrored as `BltVenusKnob`. `docs/zero-copy-present.md` section 24.11.
+    pub const BLT_ASYNC_VENUS: KnobName = KnobName::new(b"BltAsyncVenus");
+    /// `BltLookahead` (default 1 = the front of the ready queue only, the behaviour before
+    /// v337). How many entries of the WindowedBlt ready queue the HPD worker looks at when it
+    /// picks the next copy to submit: a request whose producer has not finished, or whose
+    /// destination is still being read, no longer holds the requests of unrelated destinations
+    /// behind it (per-destination order is kept). Clamped to 1..8. Read at every StartDevice;
+    /// mirrored as `BltLookKnob`. `docs/zero-copy-present.md` section 24.10.
+    pub const BLT_LOOKAHEAD: KnobName = KnobName::new(b"BltLookahead");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");
@@ -852,6 +1109,66 @@ pub mod knobs {
     /// 0 is coerced to 1 (a zero-depth flip queue is not representable) and the
     /// value actually advertised is mirrored in the `FlipQueV` counter.
     pub const FLIP_QUEUE_DEPTH: KnobName = KnobName::new(b"FlipQueueN");
+    /// `FlipAnnounce` (default 2 since the 332.1 hardware rows; 0 = off, the old behaviour): publish a flip's address toward
+    /// dxgkrnl AT `SetVidPnSourceAddress` (atomics only, DIRQL) so the very next CRTC_VSYNC tick
+    /// retires it (one tick per flip instead of two), while the HPD worker does the real
+    /// programming afterwards. 1 = only flips of foreign allocations `ForeignFlip` already
+    /// accepted; 2 = every flip, Venus direct and copy paths included. Only when the worker is
+    /// idle at the DDI (at most one unprogrammed announced flip); a flip that finds it busy
+    /// retires the normal way. Any non-zero value also wakes the worker early (`FlipEarlyWake`).
+    /// Read at every StartDevice (`pnputil /restart-device` applies it); mirrored as `FaKnob`.
+    /// `docs/kmd-rm-client.md` 15.18.15.
+    pub const FLIP_ANNOUNCE: KnobName = KnobName::new(b"FlipAnnounce");
+    /// `FlipAnnForeign` (default 1 with `ForeignFlip` on, else 0; an explicit value wins, 0
+    /// included): with `FlipAnnounce` 2, also announce flips of foreign or hollow allocations (the
+    /// NVK DWM's swap chain). 0 announces the Venus class only, which is the tear-exposure-free
+    /// setting (the foreign flip retires when the worker publishes it). `FlipAnnounce` 1 (the
+    /// explicit foreign mode) ignores it. Read at every StartDevice; mirrored in `FaKnob` (bit 16).
+    /// The name is 14 characters, the lookup buffer's limit. `docs/kmd-rm-client.md` 15.18.16.
+    pub const FLIP_ANN_FOREIGN: KnobName = KnobName::new(b"FlipAnnForeign");
+    /// `MirrorThread` (default 1, 0 = off): run the registry mirror (`stall_diag::publish_counters`)
+    /// on its own thread, one pass a second (`ddi/mirror_thread.rs`). 0 is the kill switch: every
+    /// caller publishes inline on the HPD worker, as before v332. Read at every StartDevice and
+    /// mirrored as `MirThrEff`; a thread that could not be joined (`MirLeak` 1) turns it off for
+    /// the rest of the driver image's life.
+    pub const MIRROR_THREAD: KnobName = KnobName::new(b"MirrorThread");
+    /// `MirPrio` (default 6, 0 = leave the thread's priority alone): the kernel priority the mirror
+    /// thread runs at, below the HPD worker's (8, the default of a system thread), so a registry
+    /// pass never delays the flip path. 1 to 15 are taken as given; anything else is the default.
+    /// Read at every StartDevice, mirrored as `MirPrioEff`. `docs/kmd-rm-client.md` 15.18.16.
+    pub const MIRROR_PRIO: KnobName = KnobName::new(b"MirPrio");
+    /// `MirYield` (default 32, 0 = never): the mirror thread rests (a one-millisecond relative wait
+    /// that ends at once on a stop; the system timer may round it up) after this many registry
+    /// writes of one pass, so a hundred-write pass does not hold one processor for tens of
+    /// milliseconds. Mirrored as `MirYldEff`. `docs/kmd-rm-client.md` 15.18.16.
+    pub const MIRROR_YIELD: KnobName = KnobName::new(b"MirYield");
+    /// `MirChanged` (default 1, 0 = off): inside a mirror pass skip a write whose value is what the
+    /// registry already holds (every value is written again at least every 30 s, so a hand-edited
+    /// or deleted one comes back). 0 writes every value of every pass, as before. Mirrored as
+    /// `MirChgEff`. `docs/kmd-rm-client.md` 15.18.16.
+    pub const MIRROR_CHANGED: KnobName = KnobName::new(b"MirChanged");
+    /// `VsCatchUp` (default 0): 1 serves ONE missed heartbeat slot with an immediate extra tick
+    /// when a tick callback ran between one and 1.5 periods after its own deadline (the missed
+    /// slot is otherwise dropped, no burst). Read at every StartDevice, mirrored as `VsCatchEff`.
+    /// `docs/kmd-rm-client.md` 15.18.16.
+    pub const VS_CATCH_UP: KnobName = KnobName::new(b"VsCatchUp");
+    /// `FlipBusyFly` (default 0, at most 4): how many pipelined `ForeignFlip` host flips may be in
+    /// flight while the worker still counts as idle for a `FlipAnnounce` (0 = none: strict: the
+    /// previous buffer is certainly no longer read when the next flip is announced; 1 lets the
+    /// announce run with one host flip in flight, trading a tear exposure of up to one more host
+    /// round trip for throughput). Only with `ForeignFlip` and `FfAsyncWin`; read once per
+    /// transport generation. `docs/kmd-rm-client.md` 15.18.15.
+    pub const FLIP_BUSY_FLY: KnobName = KnobName::new(b"FlipBusyFly");
+    /// `FlipEarlyWake` (default 0): the DDI asks for the device DPC that wakes the HPD worker the
+    /// moment a flip is pending, instead of the worker waiting for the next vsync tick; without
+    /// an announce the retire still waits for the worker's publication (one tick earlier on
+    /// average). Read at every StartDevice.
+    pub const FLIP_EARLY_WAKE: KnobName = KnobName::new(b"FlipEarlyWake");
+    /// `FlipLat` (default 1 = on, 0 = off): the flip retire latency / inter-flip interval /
+    /// vblank utilisation measurement (`FlipLat*`, `IfGap*`, `FlipP99Us`, `VbUsed`,
+    /// `VsLate*`): atomics in the DDI and the tick, mirrored once a second. Read at every
+    /// StartDevice.
+    pub const FLIP_LAT: KnobName = KnobName::new(b"FlipLat");
     /// `OutputTech` (default 1): the connector type the virtual monitor's child
     /// device reports to Windows. 1 = DisplayPort (external), 2 = HDMI, 3 = DVI,
     /// 4 = internal, 0 = HD15 (analog VGA, the historical value). Anything else

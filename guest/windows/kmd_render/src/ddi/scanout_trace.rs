@@ -703,6 +703,9 @@ fn publish_idf_flags() {
 /// Ticks [`dump_periodic`].
 static DUMP_TICKS: AtomicU32 = AtomicU32::new(0);
 
+/// The interrupt time (ms, never 0) the inline dump was first held back by a flip in hand (0 = not
+/// held back): `hpd_wake::dump_gate`.
+static DUMP_DEFER_SINCE: AtomicU32 = AtomicU32::new(0);
 /// The wake count and the time (ms) of the last dump ([`dump_periodic`]).
 static DUMP_LAST_N: AtomicU32 = AtomicU32::new(0);
 static DUMP_LAST_MS: AtomicU32 = AtomicU32::new(0);
@@ -900,7 +903,7 @@ pub(crate) fn dump(adapter: &crate::adapter::AdapterContext) {
     // alone): until v328 `HpdSite` / `HpdLoopT` / `StallT` were only ever refreshed by the `Nv*`
     // mirror and a stuck-worker escape, so a dump read after an idle spell showed a worker frozen
     // at the site of the last such write.
-    crate::ddi::stall_diag::publish_counters();
+    crate::ddi::stall_diag::request_publish();
     crate::diag::record_named_bytes(b"VsMinGap", adapter.vsync_min_gap_published());
     crate::diag::record_named_bytes(b"VsFast", adapter.vsync_fast.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"VpVsEn", adapter.vsync_enabled.load(Ordering::Relaxed));
@@ -1059,6 +1062,35 @@ pub(crate) fn dump_periodic(adapter: &crate::adapter::AdapterContext) {
         now_ms,
         DUMP_LAST_MS.load(Ordering::Relaxed),
     ) {
+        // The dump is about 120 registry writes: 16 to 31 ms on the worker (`FlipMaxUs` at
+        // `HpdSite` 12, 333 hardware run), between two flips. With the mirror thread it only asks
+        // (two atomics and a `KeSetEvent`), and the thread writes it (`mirror_thread::DUMP`).
+        if crate::ddi::mirror_thread::running() {
+            DUMP_LAST_N.store(n, Ordering::Relaxed);
+            DUMP_LAST_MS.store(now_ms, Ordering::Relaxed);
+            DUMP_DEFER_SINCE.store(0, Ordering::Relaxed);
+            crate::ddi::mirror_thread::request_bits(crate::ddi::mirror_thread::DUMP);
+            return;
+        }
+        // Inline (`MirrorThread` 0, or no thread): never between two flips. A flip in the worker's
+        // hands (a pending slot, the programming gate up, a host flip owed or in flight) holds the
+        // dump back, for 10 s at most (`hpd_wake::dump_gate`).
+        let since_deferred = DUMP_DEFER_SINCE.load(Ordering::Relaxed);
+        match helios_kmd_logic::hpd_wake::dump_gate(
+            true,
+            !crate::ddi::flip_announce::worker_idle(adapter),
+            since_deferred,
+            now_ms,
+        ) {
+            helios_kmd_logic::hpd_wake::DumpGate::Defer => {
+                if since_deferred == 0 {
+                    DUMP_DEFER_SINCE.store(now_ms.max(1), Ordering::Relaxed);
+                }
+                crate::ddi::stall_diag::note_dump_deferred();
+                return;
+            }
+            _ => DUMP_DEFER_SINCE.store(0, Ordering::Relaxed),
+        }
         DUMP_LAST_N.store(n, Ordering::Relaxed);
         DUMP_LAST_MS.store(now_ms, Ordering::Relaxed);
         let t0 = crate::adapter::foreign_scanout::now_100ns();

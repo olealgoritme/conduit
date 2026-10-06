@@ -1,0 +1,95 @@
+Helios DXVK fork: NVK composed-Present sources wait for the KMD's read claim
+
+Conduit guest/windows/docs/zero-copy-present.md 24.10.3. With KMD BltAsync
+the windowed Blt that copies a composed Present's source may still be
+queued when Present returns, and the KMD claims the source's resource id in
+the read ledger until the copy retires. Nothing else orders the next NVK
+render into that swap-chain buffer after the copy (NVK submits on its own
+RM channel, which dxgkrnl does not schedule).
+
+- DxvkImage::heliosBltSourceResid / setHeliosBltSourceResid: the UMD tags a
+  Present's source with its ledger id (NVK's IMPORT_RM id, which is also the
+  KMD's resource id of the adopted allocation).
+- heliosEmitScanoutReuseWaits qualifies tagged images too and uses the tag
+  as the ledger id (an NVK allocation has no Venus id to ask for), so a
+  command list touching the source waits GPU-side for the claim to retire,
+  exactly as for a scanout buffer.
+
+diff --git a/src/dxvk/dxvk_context.cpp b/src/dxvk/dxvk_context.cpp
+index 49553a9b..3c0150ee 100644
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ -9906,9 +9906,14 @@ namespace dxvk {
+       const auto& info = image->info();
+ 
+       // Only images the host can read back: the direct-OPTIMAL primary, the
+-      // exact-primary LINEAR shape, and the KMD-owned LINEAR fallback target.
+-      // dwm's compositing SRVs and ordinary backbuffers never qualify.
+-      if (!info.heliosDirectOptimalScanout
++      // exact-primary LINEAR shape, the KMD-owned LINEAR fallback target, and
++      // (NVK) the source of a composed Present, which the KMD's Blt copy may
++      // still be reading after Present returned (KMD BltAsync, Conduit
++      // zero-copy-present.md 24.10.3). dwm's compositing SRVs never qualify.
++      const uint32_t bltResid = image->heliosBltSourceResid();
++
++      if (!bltResid
++       && !info.heliosDirectOptimalScanout
+        && !info.heliosScanoutPrimary
+        && !info.heliosLinearScanoutTarget)
+         continue;
+@@ -9917,13 +9922,15 @@ namespace dxvk {
+       // rotate_resource_backings swaps storages between images, so the
+       // create-time id goes stale while the storage's backing memory is
+       // authoritative (the 56th-session lesson, restated by the spec §5.1).
++      // An NVK Blt source has no backing rotation (one dedicated allocation
++      // whose IMPORT_RM id is the ledger key) and no Venus id to ask for.
+       Rc<DxvkResourceAllocation> storage = image->storage();
+ 
+       if (storage == nullptr)
+         continue;
+ 
+-      const uint32_t resid = helios_acquire::residFromMemory(
+-        storage->getMemoryInfo().memory);
++      const uint32_t resid = bltResid ? bltResid
++        : helios_acquire::residFromMemory(storage->getMemoryInfo().memory);
+ 
+       if (!resid) {
+         m_heliosScanoutResidMiss += 1u;
+diff --git a/src/dxvk/dxvk_image.h b/src/dxvk/dxvk_image.h
+index 1d0be4ab..b02d7a5a 100644
+--- a/src/dxvk/dxvk_image.h
++++ b/src/dxvk/dxvk_image.h
+@@ -965,6 +965,25 @@ namespace dxvk {
+       m_heliosHandoffKey.store(key, std::memory_order_relaxed);
+     }
+ 
++    /**
++     * \brief Helios: the KMD reads this image after a Present
++     *
++     * Set by the UMD when it presents the image through a composed
++     * (windowed Blt) Present on NVK: the KMD's copy of it may still be
++     * queued when Present returns (KMD BltAsync), and it claims the image's
++     * resource id in the read ledger for the life of the copy. Command lists
++     * that touch the image then wait for that claim to retire
++     * (DxvkContext::heliosEmitScanoutReuseWaits).
++     * \returns The ledger resource id, 0 when not a Blt source
++     */
++    uint32_t heliosBltSourceResid() const {
++      return m_heliosBltSourceResid.load(std::memory_order_relaxed);
++    }
++
++    void setHeliosBltSourceResid(uint32_t resid) {
++      m_heliosBltSourceResid.store(resid, std::memory_order_relaxed);
++    }
++
+     /**
+      * \brief Whether this is a Helios debug-magenta private image
+      *
+@@ -1077,6 +1096,7 @@ namespace dxvk {
+     // creator's OPTIMAL layout (a linear buffer copy cannot).
+     Rc<DxvkImage>               m_heliosStagingImage = nullptr;
+     std::atomic<uint32_t> m_heliosHandoffKey = { 0u };
++    std::atomic<uint32_t> m_heliosBltSourceResid = { 0u };
+     // Device pointer for constructing the internal alias image during
+     // allocateStorageWithUsage (only Helios uses this).
+     DxvkDevice*                 m_heliosDevice = nullptr;

@@ -12,6 +12,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <sddl.h>
 
 #include <atomic>
 #include <cstdio>
@@ -23,6 +24,9 @@
 #include "bridge_common.h"  // umd_log
 #include "bridge_icd_backend.h"
 #include "helios_icd_interface.h"
+#include "helios_icd_policy.h"  // protocol/include: shared with NVK
+
+extern "C" int32_t helios_kmdmap_c_epoch(void);
 
 namespace helios_bridge {
 
@@ -33,22 +37,7 @@ namespace {
 // else (S6 moves them); the rest open or produce surfaces shared with Venus
 // processes (video, browsers, overlays, capture), which an NVK process cannot
 // import (dxvk-on-nvk.md 3.7).
-constexpr const char* kBuiltinDeny[] = {
-  "dwm.exe", "explorer.exe", "csrss.exe", "winlogon.exe", "logonui.exe",
-  "consent.exe", "fontdrvhost.exe", "sihost.exe", "dllhost.exe",
-  "searchhost.exe", "searchapp.exe", "startmenuexperiencehost.exe",
-  "shellexperiencehost.exe", "shellhost.exe", "textinputhost.exe",
-  "lockapp.exe", "applicationframehost.exe", "systemsettings.exe",
-  "runtimebroker.exe", "widgets.exe", "widgetservice.exe",
-  "phoneexperiencehost.exe", "crossdeviceresume.exe", "taskmgr.exe",
-  "mmc.exe", "rdpclip.exe", "msedge.exe", "msedgewebview2.exe",
-  "chrome.exe", "firefox.exe", "brave.exe", "opera.exe", "teams.exe",
-  "ms-teams.exe", "discord.exe", "slack.exe", "spotify.exe", "code.exe",
-  "obs64.exe", "obs32.exe", "vlc.exe", "mpc-hc64.exe", "mpc-be64.exe",
-  "video.ui.exe", "microsoft.photos.exe", "photos.exe",
-  "steamwebhelper.exe", "epicwebhelper.exe",
-  "cefsharp.browsersubprocess.exe",
-};
+// The built-in deny-list: helios_policy_builtin_deny (helios_icd_policy.h).
 
 // Deny-list entries measured to work on NVK under a Venus DWM
 // (docs/dwm-on-nvk.md 4.2.1, 22.22.326.1, 2026-10-06): they make an NVK
@@ -68,11 +57,7 @@ constexpr const char* kBuiltinDeny[] = {
 // crashed at its NVK start; SearchHost crash-loops on Venus too), msedge and
 // the Chromium family (video frames stall on NVK), video players (VLC's
 // D3D11VA output is green on NVK), logonui/consent/lockapp (after the shell).
-constexpr const char* kBuiltinNvkDefault[] = {
-  "csrss.exe", "winlogon.exe", "fontdrvhost.exe", "rdpclip.exe",
-  "taskmgr.exe", "mmc.exe", "startmenuexperiencehost.exe",
-  "systemsettings.exe", "applicationframehost.exe",
-};
+// The NvkDefaults names: helios_policy_nvk_default_names (helios_icd_policy.h).
 
 void lower_ascii(char* s) {
   for (; *s; s++) {
@@ -111,56 +96,21 @@ bool env_sz(const char* name, char* out, std::size_t cap) {
 
 // `list` holds names separated by ';' (spaces around names ignored).
 bool list_has(const char* list, const char* exe) {
-  const std::size_t len = std::strlen(exe);
-  const char* p = list;
-  while (*p) {
-    while (*p == ';' || *p == ' ' || *p == '\t') p++;
-    const char* start = p;
-    while (*p && *p != ';') p++;
-    const char* end = p;
-    while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
-    if (std::size_t(end - start) == len && _strnicmp(start, exe, len) == 0)
-      return true;
-  }
-  return false;
+  return helios_policy_list_has(list, exe) != 0;
 }
 
 // NvkDefaults=1 and `exe` is one of kBuiltinNvkDefault.
 bool nvk_default(const char* exe) {
-  DWORD on = 0;
-  if (!reg_dword("NvkDefaults", &on) || on == 0)
-    return false;
-  for (const char* name : kBuiltinNvkDefault) {
-    if (std::strcmp(name, exe) == 0)
-      return true;
-  }
-  return false;
+  return helios_policy_nvk_default(exe) != 0;
 }
 
 // NvkDenyList (REG_SZ) names `exe`.
 bool explicitly_denied(const char* exe) {
-  char deny[4096];
-  return reg_sz("NvkDenyList", deny, sizeof(deny)) && list_has(deny, exe);
+  return helios_policy_explicitly_denied(exe) != 0;
 }
 
 bool denied(const char* exe, const char** why) {
-  char allow[4096];
-  if (reg_sz("NvkAllowList", allow, sizeof(allow)) && list_has(allow, exe))
-    return false;
-  if (nvk_default(exe) && !explicitly_denied(exe))
-    return false;
-  char deny[4096];
-  if (reg_sz("NvkDenyList", deny, sizeof(deny))) {
-    *why = "NvkDenyList names this executable";
-    return list_has(deny, exe);
-  }
-  for (const char* name : kBuiltinDeny) {
-    if (std::strcmp(name, exe) == 0) {
-      *why = "built-in deny-list (compositor, shell or interop-heavy app)";
-      return true;
-    }
-  }
-  return false;
+  return helios_policy_denied(exe, why) != 0;
 }
 
 // DwmIcd=nvk crash-loop guard (docs/dwm-on-nvk.md, "Failure safety"). Windows
@@ -222,6 +172,55 @@ bool dwm_nvk_guard_allows(const char** why) {
     umd_log("icd backend: DwmIcd=nvk crash-loop guard cannot write its file; NVK unguarded");
   }
   return true;
+}
+
+// "The desktop follows DWM" (docs/dwm-on-nvk.md 4.2): a DWM on NVK cannot
+// import surfaces Venus processes made (it shows a blank placeholder for them:
+// the gray Start menu, search and notification centre). So while DWM runs on
+// NVK, every D3D11 process goes to NVK too: Icd=venus and the built-in
+// deny-list no longer apply (the deny-list exists because an NVK process and a
+// Venus process cannot share surfaces, which is exactly what it would cause
+// now); only an explicit NvkDenyList keeps a process on Venus.
+// DesktopFollowsDwm (REG_DWORD, default 1) = 0 turns this off.
+//
+// The marker is a named event in the session's namespace that the DWM on NVK
+// creates when it chooses NVK and closes when NVK fails for it; it dies with
+// that DWM. So it names the DWM that runs now (the crash-loop guard sending a
+// DWM to Venus leaves no marker), not just the registry value. Sandboxed
+// processes may not open it (its DACL admits everyone for SYNCHRONIZE, but a
+// restricted token can still be refused): ERROR_ACCESS_DENIED also means it
+// exists.
+constexpr const char kDwmOnNvkEvent[] = HELIOS_POLICY_DWM_MARKER;
+HANDLE g_dwm_marker = nullptr;
+
+void dwm_marker_create() {
+  if (g_dwm_marker)
+    return;
+  // Everyone (and restricted / AppContainer tokens) may wait on it; low label.
+  const char* sddl = "D:(A;;0x100001;;;WD)(A;;0x100001;;;RC)(A;;0x100001;;;AC)(A;;GA;;;SY)S:(ML;;NW;;;LW)";
+  PSECURITY_DESCRIPTOR sd = nullptr;
+  SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, FALSE };
+  if (ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl, SDDL_REVISION_1, &sd, nullptr))
+    sa.lpSecurityDescriptor = sd;
+  g_dwm_marker = CreateEventA(&sa, TRUE, TRUE, kDwmOnNvkEvent);
+  if (sd)
+    LocalFree(sd);
+  umd_log(g_dwm_marker ? "icd backend: DWM on NVK: the desktop follows (marker Local\\HeliosDwmOnNvk set)"
+                       : "icd backend: DWM on NVK, but its marker event could not be created");
+}
+
+void dwm_marker_drop() {
+  if (g_dwm_marker) {
+    CloseHandle(g_dwm_marker);
+    g_dwm_marker = nullptr;
+    umd_log("icd backend: DWM left NVK: marker Local\\HeliosDwmOnNvk dropped");
+  }
+}
+
+// A non-DWM process: does the running DWM compose on NVK (and should this
+// process follow it)?
+[[maybe_unused]] bool desktop_follows_dwm_on_nvk() {
+  return helios_policy_desktop_follows_dwm() != 0;
 }
 
 bool file_exists(const wchar_t* path) {
@@ -352,6 +351,7 @@ IcdBackendChoice decide() {
         }
         force_nvk = true;
         c.reason = "HKLM\\SOFTWARE\\Helios!DwmIcd=nvk";
+        dwm_marker_create();
       }
     }
   }
@@ -367,6 +367,20 @@ IcdBackendChoice decide() {
     // NvkAllowList names executables that go to NVK whatever Icd says: the
     // per-category lever of docs/dwm-on-nvk.md 4.2 (move one category off
     // the Venus defaults at a time, Icd=venus staying for everything else).
+    if (std::strcmp(c.exe, "dwm.exe") != 0 && desktop_follows_dwm_on_nvk()) {
+      if (explicitly_denied(c.exe)) {
+        c.reason = "DWM is on NVK, but NvkDenyList names this executable";
+        return c;
+      }
+      if (!find_nvk_icd(c.nvk_path, sizeof(c.nvk_path) / sizeof(c.nvk_path[0]))) {
+        c.reason = "DWM is on NVK, but no NVK ICD was found";
+        return c;
+      }
+      c.backend = IcdBackend::NvkRm;
+      c.reason = "DWM is on NVK (DwmIcd=nvk, marker set): the desktop follows, "
+                 "Icd and the built-in deny-list do not apply";
+      return c;
+    }
     char allow[4096];
     const bool allowed = (reg_sz("NvkAllowList", allow, sizeof(allow)) && list_has(allow, c.exe))
       || (nvk_default(c.exe) && !explicitly_denied(c.exe));
@@ -406,6 +420,13 @@ IcdBackendChoice decide() {
 std::once_flag g_choice_once;
 IcdBackendChoice g_choice;
 std::atomic<bool> g_nvk_failed{false};
+// The process's loss epoch (helios_kmdmap.h) when NVK failed. A failure is a
+// latch for the process, except across a driver update or device restart:
+// once the epoch moved, the next device creation tries NVK again
+// (librmclient reopens the KMD in a new generation), so a long-lived process
+// (explorer, the shell hosts, DWM) comes back to NVK instead of staying on
+// Venus, whose surfaces an NVK DWM cannot compose.
+std::atomic<int32_t> g_nvk_failed_epoch{0};
 
 std::once_flag g_nvk_load_once;
 HMODULE g_nvk_module = nullptr;
@@ -496,13 +517,28 @@ bool is_dwm_process() {
 
 IcdBackend effective_icd_backend() {
   const IcdBackendChoice& c = icd_backend_choice();
+  if (c.backend == IcdBackend::NvkRm && g_nvk_failed.load(std::memory_order_acquire)) {
+    const int32_t now = helios_kmdmap_c_epoch();
+    const int32_t then = g_nvk_failed_epoch.load(std::memory_order_acquire);
+    if (now != then && g_nvk_failed.exchange(false, std::memory_order_acq_rel)) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+                    "icd backend: the KMD restarted since NVK failed (loss epoch %d -> %d); "
+                    "NVK again for this process", int(then), int(now));
+      umd_log(msg);
+      if (is_dwm_process() && c.reason && std::strstr(c.reason, "DwmIcd"))
+        dwm_marker_create();
+    }
+  }
   if (c.backend == IcdBackend::NvkRm && !g_nvk_failed.load(std::memory_order_acquire))
     return IcdBackend::NvkRm;
   return IcdBackend::Venus;
 }
 
 void note_nvk_failed(const char* why) {
+  g_nvk_failed_epoch.store(helios_kmdmap_c_epoch(), std::memory_order_release);
   if (!g_nvk_failed.exchange(true, std::memory_order_acq_rel)) {
+    dwm_marker_drop();
     char msg[256];
     std::snprintf(msg, sizeof(msg), "icd backend: NVK failed (%s); Venus for this process", why);
     umd_log(msg);

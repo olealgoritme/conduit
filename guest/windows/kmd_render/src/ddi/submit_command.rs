@@ -309,13 +309,20 @@ pub(crate) fn publish_nvrm_counters() {
     // A Present refusal caused by a foreign allocation, answered with success: `PrFgSkip`
     // (last reason `PrFgWhy`, per arm `PrFgBlt` / `PrFgFlip`), written once one happened.
     crate::ddi::present_foreign::publish_counters();
+    // A Blt Present completed with no copy because its producer already put the frame on scanout
+    // (`HOSC`): `OsTag`, `OsSkip`, `OsRej` / `OsRejWhy` / `OsWhyMask`, `OsBytes`, `OsLast`, written
+    // once a tag was seen.
+    crate::ddi::onscanout::publish_counters();
+    // The asynchronous composed present and the dropped CPU mirror (`BltAsync`, `BltNoMirror`):
+    // `BltAsync*`, `BltWait*`, `BltMirror*`, `BltNoMirInv`, written once an event happened.
+    crate::ddi::blt_async::publish_counters();
     // A flip of a foreign primary completed without a bind (`kept_picture`): `FkKeep`, the lane
     // split `FkWorker` / `FkDma` / `FkAsync`, the last reason `FkWhy`, written once one happened.
     crate::ddi::flip_keep::publish_counters();
     // The stall-diagnosis block: HPD worker breadcrumbs, flips issued / published, the vsync
     // pending run, `StartN` (`ddi::stall_diag`). The escape thread also writes it directly
     // (`publish_from_escape`), so it refreshes when this worker-run mirror cannot.
-    crate::ddi::stall_diag::publish_counters();
+    crate::ddi::stall_diag::request_publish();
     // Cross-client hardening of forwarded RM ioctls (`NvDupHarden`): clients recorded /
     // dropped / refused for room (`NvCli*`), and requests that named a client or file
     // that is not the caller's (`NvDup*`). Nonzero `NvDupDeny` / `NvDupWould` outside a
@@ -1212,6 +1219,9 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
         {
             // A flip dxgkrnl issued (`FlipIss`), completed here by the keep record.
             crate::ddi::stall_diag::note_flip_issued(address);
+            // `FlipAnnounce`: an earlier announcement nobody confirmed must not drop this
+            // flip's own publication as a regression.
+            crate::ddi::flip_announce::forget_unconfirmed();
             let _ = crate::ddi::flip_keep::keep(
                 adapter,
                 address,
@@ -1223,6 +1233,7 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
     };
     // A flip dxgkrnl issued (`FlipIss`): the DMA lane's counterpart of `SetVidPnSourceAddress`.
     crate::ddi::stall_diag::note_flip_issued(primary_address);
+    crate::ddi::flip_announce::forget_unconfirmed();
     // NOTE (0ab-B, 22.22.210.0): capturing the completion boundary HERE was
     // tried and MEASURED NOT TO WORK. dxgkrnl submits a flip about a frame
     // after the app presented, so `next_wire_fence` at this point already
@@ -1612,14 +1623,23 @@ pub unsafe extern "C" fn dxgkddi_preempt_command(
     // The one-critical-section rationale now lives on
     // `abandon_pending_submissions`, where DxgkDdiResetEngine's reader can see
     // it too.
-    abandon_pending_submissions(
+    let (dropped, status) = abandon_pending_submissions(
         adapter,
         AbandonOutcome::Preempted {
             dxgkrnl,
             fence: preempt.PreemptionFenceId,
         },
-    )
-    .1
+    );
+    // Breadcrumbs (`PreFence`, `PreLastCmp`, `PreDropped`, `PreStatus`, `PreT`; atomics only,
+    // DISPATCH): the 333 wedge began with two preemptions and a scheduler that never submitted
+    // again; what the last one was told and what it dropped is the first thing to read.
+    crate::ddi::escape_wait::note_preempt(
+        preempt.PreemptionFenceId,
+        adapter.completed_fence(),
+        dropped,
+        status as u32,
+    );
+    status
 }
 
 /// `DxgkDdiResetFromTimeout` — TDR recovery. There is no hardware engine state
@@ -2238,6 +2258,15 @@ pub unsafe extern "C" fn dxgkddi_render(
             // hand-written `!is_null()` pair; `ContextHandleRef` is the same
             // traversal, checked once, in the module that owns the fields.
             let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
+            if let Some(context) = context.as_ref() {
+                // The already-on-scanout tag (`HOSC`, `ddi/onscanout.rs`) at the tail of the
+                // command: parsed and stashed for the Present that follows on this context, or
+                // (no tag) the stash cleared. Never fails the Render.
+                // SAFETY: `cmd_len` bytes are readable at `pCommand` (checked at the top).
+                unsafe {
+                    crate::ddi::onscanout::note_render(context, args.pCommand as *const u8, cmd_len)
+                };
+            }
             if let Some(adapter) = context.as_ref().and_then(|c| c.adapter()) {
                 // The RM fence tail (carrier (b)): only a command that covers all 48
                 // bytes has one, and a fence is exclusive with the stream marker.
