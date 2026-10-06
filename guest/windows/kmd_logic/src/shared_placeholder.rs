@@ -1,10 +1,9 @@
-//! Shared placeholder allocations: the pure decision. An NVK process that cannot mint a KMD
-//! resource id for a SHARED texture (A8, R10G10B10A2, fp16, R8G8, NV12 without the
-//! shared-format cap, BGRA8 with `NVK_HELIOS_RESID=0`) still has to hand the D3D runtime a
-//! WDDM allocation, so it creates a PLACEHOLDER: a `STANDARD` allocation with no identity
-//! (adopt id 0, context 0, the 96-byte private data, the shared creation flag set). The real
-//! content is exchanged by NVK through other means; the placeholder is never flipped, scanned
-//! out or copied.
+//! Placeholder allocations: the pure decision. An NVK process that cannot mint a KMD resource
+//! id for a texture (A8, R10G10B10A2, fp16, R8G8, NV12 without the shared-format cap, BGRA8
+//! with `NVK_HELIOS_RESID=0`) still has to hand the D3D runtime a WDDM allocation, so it
+//! creates a PLACEHOLDER: a `STANDARD` allocation with no identity (adopt id 0, context 0, the
+//! 96-byte private data). The real content is exchanged by NVK through other means; the
+//! placeholder is never flipped, scanned out or copied.
 //!
 //! The ordinary `STANDARD` path backs such an allocation with a real Venus present buffer
 //! (a Vulkan buffer and device memory on the host Venus renderer, a registered
@@ -17,19 +16,36 @@
 //! (`present: None`), exactly the "foreign-unknown" case the Present rules already skip and
 //! count (`present_foreign`), never a Venus resource it could misread.
 //!
+//! SHARED OR NOT IS NOT PART OF THE DECISION. The first design gated on
+//! `DXGKARG_CREATEALLOCATION::Flags` bit 1 (`CreateShared`); the hardware run (v323) showed
+//! the placeholder arriving with flags 1 (`Resource` only): the kernel-mode flags word has no
+//! shared bit (the only header on disk, Win8-era, has `Resource : 1, Reserved : 31`), and
+//! `DXGK_ALLOCATIONINFOFLAGS` has none either. The KMD is not told at create time that an
+//! allocation will be shared (the creator's `misc_flags` in the meta is its own, untrusted,
+//! word). So the shape alone decides, and the flags words are only recorded, to say how the
+//! shared intent is signalled if it is signalled at all.
+//!
 //! This module only DECIDES. The rule is deliberately narrow: an allocation that carries ANY
 //! identity (an adopt id, a context, a blob id, a declared RM-export memory type, a tracker
-//! flag, a layout trailer, a primary / GDI / scan-out / standard-type bit) or is not shared is
-//! never a placeholder and takes the ordinary path with exactly today's validation.
+//! flag, a layout trailer, a primary / GDI / scan-out / standard-type bit) is never a
+//! placeholder and takes the ordinary path with exactly today's validation. The KMD-originated
+//! standard allocations (`GetStandardAllocationDriverData`: shared primary, shadow, staging,
+//! GDI surface) always carry the standard-type bits (enum values 1..4), so they stop at the
+//! identity row even when the KMD has no Venus context to put in them.
 //! Design and the table: `docs/shared-foreign-surfaces.md`, "Shared placeholder allocations".
 
 /// `HELIOS_WDDM_ALLOC_KIND_STANDARD` (`protocol/src/wddm.rs`); pinned by the KMD build.
 pub const KIND_STANDARD: u32 = 2;
 
-/// `DXGK_CREATEALLOCATIONFLAGS` bit 1, `CreateShared` (bit 0 is `Resource`, which
-/// `dxgkddi_create_allocation` already reads). The first `CARFlg` value of a shared texture
-/// reads 3.
+/// `DXGK_CREATEALLOCATIONFLAGS` bit 1, the user-mode `D3DKMT_CREATEALLOCATIONFLAGS::CreateShared`
+/// position. DIAGNOSTIC ONLY (it splits `ShPhShared` from `ShPhUnsh`): v323 hardware shows the
+/// KMD flags word reads 1 for the NVK shared placeholders, so this bit is never the gate.
 pub const CREATE_FLAG_SHARED: u32 = 0x0000_0002;
+
+/// The creator's own declaration of sharing in the meta `misc_flags`: the D3D10 DDI
+/// `RESOURCE_MISC_SHARED` (0x2) and `SHARED_KEYEDMUTEX` (0x100) bits the UMDs copy from the
+/// create call. Untrusted, diagnostic only.
+pub const CREATOR_MISC_SHARED: u32 = 0x0000_0002 | 0x0000_0100;
 
 /// The per-allocation private data of an id-less allocation: `HeliosWddmAllocPrivate` (48) +
 /// `HeliosWddmAllocMeta` (48). 128 / 144 bytes carry a layout trailer, which is an identity.
@@ -137,7 +153,8 @@ pub const fn identity_bits(f: &PrivateFacts) -> u32 {
 pub struct Input {
     /// `HeliosWddmAllocPrivate::kind`.
     pub kind: u32,
-    /// `DXGKARG_CREATEALLOCATION::Flags` as the raw word.
+    /// `DXGKARG_CREATEALLOCATION::Flags` as the raw word. NOT read by [`decide`]; carried so
+    /// the counters can say what arrived.
     pub create_flags: u32,
     /// `HeliosWddmAllocPrivate::adopt_resource_id`.
     pub adopt_resource_id: u32,
@@ -156,7 +173,6 @@ pub struct Input {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Existing {
     NotStandard,
-    NotShared,
     AdoptId,
     Context,
     PrivateSize,
@@ -176,18 +192,17 @@ pub enum Refusal {
 pub enum Verdict {
     /// Not a placeholder: the ordinary path, unchanged.
     Existing(Existing),
-    /// A shared, identity-less STANDARD allocation: host-less backing.
+    /// An identity-less STANDARD allocation: host-less backing.
     Placeholder,
     /// A placeholder the KMD will not create.
     Refuse(Refusal),
 }
 
 impl Existing {
-    /// The counter / trace code (1..).
+    /// The counter / trace code (1..; 2 was the retired shared-flag row and is not reused).
     pub const fn code(self) -> u32 {
         match self {
             Existing::NotStandard => 1,
-            Existing::NotShared => 2,
             Existing::AdoptId => 3,
             Existing::Context => 4,
             Existing::PrivateSize => 5,
@@ -205,18 +220,20 @@ impl Refusal {
     }
 }
 
-/// Whether the creation flags say the resource is shared.
+/// Whether the creation flags word has the user-mode `CreateShared` bit. Diagnostic only.
 pub const fn is_shared(create_flags: u32) -> bool {
     create_flags & CREATE_FLAG_SHARED != 0
+}
+
+/// Whether the creator's meta `misc_flags` declare a shared resource. Diagnostic only.
+pub const fn creator_declares_shared(misc_flags: u32) -> bool {
+    misc_flags & CREATOR_MISC_SHARED != 0
 }
 
 /// Decide. Pure; the checks run in a fixed order so the reason is deterministic.
 pub const fn decide(i: &Input) -> Verdict {
     if i.kind != KIND_STANDARD {
         return Verdict::Existing(Existing::NotStandard);
-    }
-    if !is_shared(i.create_flags) {
-        return Verdict::Existing(Existing::NotShared);
     }
     if i.adopt_resource_id != 0 {
         return Verdict::Existing(Existing::AdoptId);
@@ -236,21 +253,14 @@ pub const fn decide(i: &Input) -> Verdict {
     Verdict::Placeholder
 }
 
-/// Whether an allocation of this shape is a placeholder, for the open-side counter (the open
-/// does not see the creation flags, so the shared test is taken as met).
+/// Whether an allocation of this shape is a placeholder, for the open-side counter.
 pub const fn has_placeholder_shape(i: &Input) -> bool {
-    matches!(
-        decide(&Input {
-            create_flags: i.create_flags | CREATE_FLAG_SHARED,
-            ..*i
-        }),
-        Verdict::Placeholder
-    )
+    matches!(decide(i), Verdict::Placeholder)
 }
 
 /// A STANDARD allocation with no identity at all, whatever its private size and creation
-/// flags: the shape a placeholder has, used to make a wrong shared-bit or size assumption
-/// visible (the allocation is counted and its flags recorded even when the gate says no).
+/// flags: the shape a placeholder has (a superset of the placeholders: a wrong private size
+/// still counts), used to make a wrong size assumption visible.
 pub const fn is_identityless_standard(i: &Input) -> bool {
     i.kind == KIND_STANDARD && i.adopt_resource_id == 0 && i.ctx_id == 0 && i.identity == 0
 }
@@ -295,8 +305,6 @@ mod tests {
                             };
                             let want = if kind != 2 {
                                 Verdict::Existing(Existing::NotStandard)
-                            } else if flags & 2 == 0 {
-                                Verdict::Existing(Existing::NotShared)
                             } else if adopt != 0 {
                                 Verdict::Existing(Existing::AdoptId)
                             } else if ctx != 0 {
@@ -390,12 +398,13 @@ mod tests {
         assert_eq!(decide(&zero), Verdict::Placeholder);
         // The refusal of a size is only reached by a would-be placeholder: an unshared or
         // identity-carrying allocation keeps the ordinary path whatever its size.
+        // The flags word is not part of the decision: the size cap holds for flags 1 as well.
         let unshared_huge = Input {
             create_flags: 1,
             size: u64::MAX,
             ..PLAIN
         };
-        assert_eq!(decide(&unshared_huge), Verdict::Existing(Existing::NotShared));
+        assert_eq!(decide(&unshared_huge), Verdict::Refuse(Refusal::TooLarge));
     }
 
     /// Real `DXGKARG_CREATEALLOCATION::Flags` words. `Resource | CreateShared` reads 3 in the
@@ -530,24 +539,84 @@ mod tests {
     }
 
     #[test]
-    fn open_side_shape_ignores_the_creation_flags() {
-        let unshared = Input {
-            create_flags: 0,
-            ..PLAIN
-        };
-        assert_eq!(decide(&unshared), Verdict::Existing(Existing::NotShared));
-        assert!(has_placeholder_shape(&unshared));
+    fn the_creation_flags_word_is_not_part_of_the_decision() {
+        // v323 hardware: the NVK placeholder arrives with flags 1 (Resource only).
+        for flags in [0u32, 1, 2, 3, 0xFFFF_FFFF, 0xFFFF_FFFC] {
+            let i = Input {
+                create_flags: flags,
+                ..PLAIN
+            };
+            assert_eq!(decide(&i), Verdict::Placeholder, "{flags:#x}");
+            assert!(has_placeholder_shape(&i));
+        }
         assert!(!has_placeholder_shape(&Input {
             ctx_id: 1,
             ..PLAIN
         }));
     }
 
+    /// Every allocation `GetStandardAllocationDriverData` can describe (enum values 1..4:
+    /// shared primary, shadow, staging, GDI surface, GDI types 1..) carries the standard-type
+    /// bits, with the KMD's Venus context or, when Venus is down, without it; neither is a
+    /// placeholder.
+    #[test]
+    fn a_kmd_originated_standard_allocation_is_never_a_placeholder() {
+        for ty in 1u32..=4 {
+            for gdi in [0u32, 1, 2, 3] {
+                for venus_ctx in [0u32, 1, 9] {
+                    for primary in [false, true] {
+                        let misc = (ty << 24)
+                            | (gdi << 20)
+                            | if primary { words::MISC_PRIMARY } else { 0 };
+                        let id = identity_bits(&PrivateFacts {
+                            blob_mem: 2,
+                            blob_flags: 1,
+                            misc_flags: misc,
+                            ..Default::default()
+                        });
+                        assert_ne!(id & identity::STANDARD_TYPE, 0);
+                        let i = Input {
+                            create_flags: 1,
+                            ctx_id: venus_ctx,
+                            identity: id,
+                            ..PLAIN
+                        };
+                        let v = decide(&i);
+                        assert!(
+                            matches!(
+                                v,
+                                Verdict::Existing(Existing::Context)
+                                    | Verdict::Existing(Existing::Identity)
+                            ),
+                            "{i:?} {v:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_creators_shared_declaration_is_diagnostic_only() {
+        assert!(!creator_declares_shared(0));
+        assert!(creator_declares_shared(0x2));
+        assert!(creator_declares_shared(0x100));
+        assert!(creator_declares_shared(0x102));
+        assert!(!creator_declares_shared(0x1000_0000));
+        // The misc bits that mark sharing never reach the identity mapping.
+        let f = PrivateFacts {
+            blob_mem: 2,
+            blob_flags: 1,
+            misc_flags: 0x102,
+            ..Default::default()
+        };
+        assert_eq!(identity_bits(&f), 0);
+    }
+
     #[test]
     fn codes_are_distinct_and_nonzero() {
         let codes = [
             Existing::NotStandard.code(),
-            Existing::NotShared.code(),
             Existing::AdoptId.code(),
             Existing::Context.code(),
             Existing::PrivateSize.code(),
