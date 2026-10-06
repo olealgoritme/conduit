@@ -239,7 +239,7 @@ That makes a host GEM object; its handle comes back to NVK unchanged.
 | `hdr.ctx_id` | the guest context the resource is attached to |
 | `resource_id` | chosen by the guest, not yet in use |
 | `blob_mem` | `BLOB_MEM_RM_EXPORT = 0x80000001` |
-| `blob_flags` | 0 (the resource cannot be mapped: no CPU view of RM memory) |
+| `blob_flags` | 0, or `USE_MAPPABLE` (and/or `USE_SHAREABLE`, which changes nothing): mappable into region 3, for system memory only (see "Mapping an RM-export blob" below) |
 | `blob_id` | `rm_handle << 32 \| gem_handle`: `rm_handle` is the backend handle of the render node (the `Open` reply's handle for a `device_type >= 512` node), `gem_handle` what the GEM import returned on that file |
 | `size` | nonzero, at most the object's size (the dma-buf's; RM rounds allocations up to 64 KiB, so the image's own size is fine) |
 | `nr_entries` | 0 |
@@ -260,7 +260,8 @@ zero when there is none; every other response leaves them zero):
 | Response | errno | Why |
 |---|---|---|
 | `RESP_ERR_UNSPEC` | `EOPNOTSUPP` | not served (no `NVGPU_CFG_RM_IMPORT`) |
-| `RESP_ERR_INVALID_PARAMETER` | `EINVAL` | `blob_flags`, `nr_entries` or `size` 0 |
+| `RESP_ERR_INVALID_PARAMETER` | `EINVAL` | `blob_flags` other than `USE_MAPPABLE`/`USE_SHAREABLE`, `nr_entries`, `size` 0, or a mappable `size` past region 3 |
+| `RESP_ERR_INVALID_PARAMETER` | `EOPNOTSUPP` | `USE_MAPPABLE` of video memory, or of memory whose RM allocation the backend did not see |
 | `RESP_ERR_INVALID_PARAMETER` | `EBADF` | `rm_handle` is not a render node this guest has open |
 | `RESP_ERR_INVALID_PARAMETER` | `ENOENT` | no such GEM handle on that file |
 | `RESP_ERR_INVALID_PARAMETER` | `ERANGE` | `size` larger than the object |
@@ -272,6 +273,48 @@ and the renderer its own; either keeps the memory alive, so the resource
 outlives the render node, the GEM handle and NVK's RM objects. Both go at
 `RESOURCE_UNREF`, and every one goes at device reset, backend exit or
 renderer death.
+
+**Mapping an RM-export blob (system memory).** A blob created with
+`USE_MAPPABLE` of RM **system** memory (`NV01_MEMORY_SYSTEM`) is mapped like
+a HOST3D blob: `RESOURCE_MAP_BLOB` places the backend's dma-buf of the object
+at the guest's offset in region 3 (the frontend `mmap`s it there: the dma-buf's
+own mapping, nvidia-drm's, with the CPU caching the memory has), and answers
+`RESP_OK_MAP_INFO` with `map_info` = `VIRTIO_GPU_MAP_CACHE_CACHED` for cached
+or write-back memory, `MAP_CACHE_WC` for write-combined, `MAP_CACHE_UNCACHED`
+for anything else. `RESOURCE_UNMAP_BLOB` withdraws it; the resource and the
+object live on until `RESOURCE_UNREF`, which withdraws a mapping still there
+first.
+
+- Offsets and sizes as for any blob: the offset page-aligned, the mapping
+  `size` rounded up to whole pages, inside region 3, overlapping no other
+  mapping (`RESP_ERR_INVALID_PARAMETER` otherwise); a blob maps once at a
+  time.
+- Where the memory lives is followed by the backend, since neither nvidia-drm
+  nor any RM control a user client may make on the object says (its
+  `GET_SURFACE_INFO` `PHYS_ATTR` reads 0, `RM_MAP_MEMORY` echoes the caching
+  it was asked for): a forwarded `RM_ALLOC` of `NV01_MEMORY_SYSTEM` or
+  `NV01_MEMORY_LOCAL_USER` records the `attr` RM writes back into
+  `NV_MEMORY_ALLOCATION_PARAMS` (cached PCI sysmem answers `0x2a800000`), a
+  forwarded `OS_UNIX_EXPORT_OBJECT_TO_FD` carries it to the export descriptor,
+  and the `GEM_IMPORT_NVKMS_MEMORY` that names that descriptor to the GEM
+  object. Video memory (behind BAR1) and objects allocated any other way
+  (`NV_ESC_RM_ALLOC_MEMORY`, OS descriptors; those cannot be GEM-imported
+  anyway) are refused `USE_MAPPABLE` with `EOPNOTSUPP` at create.
+- Coherence: the GPU reads cached system memory snooped (RM gives such memory
+  the `SYSTEM_COHERENT` PTE aperture, `kgmmuGetHwPteApertureFromMemdesc`), so
+  a guest writing through a cached mapping needs no cache maintenance before
+  the compositor samples it; only ordering: the writes must be done before the
+  flip that names the buffer is sent. Write-combined memory is read
+  non-snooped; the guest must make its WC writes visible (`sfence`) before the
+  flip. Measured on the host (`guest/nvk-rm/tests/rm_sysmem_flip.c ... dmabuf`):
+  a pattern written through a shared mapping of the dma-buf, cached and WC,
+  linear and block-linear, sampled by EGL right after with no flush: 0 of
+  2,073,600 pixels differ. CPU reads through the cached mapping run at about
+  28 GB/s, through the WC one at about 75 MB/s.
+- Guest unmap: with the frontend's in-place region mappings (QEMU patch 0008)
+  the range is replaced by fresh anonymous memory before the unmap is
+  answered, which drops the dma-buf's pages from the guest's view (the KVM MMU
+  notifier on the replaced mapping); the range then reads zeros.
 
 **Layout (modifier).** A dma-buf carries no layout. The backend takes it from
 the GEM import: when a forwarded `DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY`

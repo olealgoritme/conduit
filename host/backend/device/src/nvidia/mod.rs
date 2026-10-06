@@ -356,6 +356,9 @@ pub struct NvidiaBackend {
     /// The modifier of each GEM object NVK imported through nvidia-drm, for
     /// RM-export blobs (`rm_import.rs`).
     rm_layouts: rm_import::RmLayouts,
+    /// Where RM memory objects live, followed to the GEM objects NVK makes
+    /// of them (`rm_import::RmPlacements`).
+    rm_placements: rm_import::RmPlacements,
     /// `RmResourceImport`s served (rm_resource.rs).
     rm_resource_imports: u64,
     /// The guest's clipboard transfer being reassembled (`ClipboardToHost`).
@@ -475,6 +478,7 @@ impl NvidiaBackend {
             display: None,
             dmabufs: Default::default(),
             rm_layouts: Default::default(),
+            rm_placements: Default::default(),
             rm_resource_imports: 0,
             clip_in: Default::default(),
             #[cfg(feature = "venus")]
@@ -1127,7 +1131,7 @@ mod osdesc;
 mod resp;
 mod rm_fd;
 mod rm_import;
-pub use rm_import::{RmObject, SurfaceLayout, Tiling};
+pub use rm_import::{RmObject, RmPlacement, SurfaceLayout, Tiling};
 mod rm_resource;
 mod rmctrl;
 mod scanout;
