@@ -370,6 +370,25 @@ impl SystemBackingTable {
         self.invalid.lock().mark(resource_id)
     }
 
+    /// `BltNoMirror`: the GPU copy of a Present is about to make the system pages VidMm holds
+    /// for `resource_id` older than its blob, and the KMD does not mirror the frame into them.
+    /// Marks the system copy invalid so a page-in does not copy them over the blob, but only
+    /// when such pages exist (`None` otherwise: nothing could be resurrected, and the invalid
+    /// set is bounded, its overflow skips every page-in). The next whole-allocation eviction
+    /// (blob to system) revalidates the copy. Spinlocks only; no content transaction.
+    pub(crate) fn mark_stale_if_backed(
+        &self,
+        resource_id: u32,
+    ) -> Option<helios_kmd_logic::paging::Mark> {
+        let backed = self
+            .entries
+            .lock()
+            .as_slice()
+            .iter()
+            .any(|entry| entry.resource_id == resource_id);
+        backed.then(|| self.mark_system_copy_invalid(resource_id))
+    }
+
     /// Whether a page-in of `resource_id` must be skipped. When it must, the
     /// blob (which the GPU may now write) is the only current copy, so whatever
     /// eviction chunks were tallied toward clearing the mark are void.

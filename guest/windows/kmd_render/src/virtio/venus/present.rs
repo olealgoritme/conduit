@@ -1367,6 +1367,35 @@ impl VenusClient {
         Ok(fence_id)
     }
 
+    /// The DIRECT asynchronous Blt (`BltAsync`): [`Self::submit_present_blt`] for a standard-buffer
+    /// destination, submitted through `ctrl::submit_venus_async_blt`, which takes (or joins) the
+    /// destination's writer ownership in the same transport critical section as the enqueue and
+    /// leaves its hand-back to the completion DPC. The caller never waits for the host.
+    pub fn submit_present_blt_direct(
+        &mut self,
+        adapter: &AdapterContext,
+        source: OptimalPresentImageDesc,
+        destination: PresentDestinationDesc,
+    ) -> Result<ctrl::BltSubmit, VirtioError> {
+        let prepared = self.prepare_present_blt(adapter, source, destination)?;
+        let blt_index = self.validate_prepared_present_blt(prepared)?;
+        let PresentDestinationDesc::StandardBuffer(buffer) = prepared.destination else {
+            return Err(VirtioError::DeviceError);
+        };
+        let submit = self.encode_command_buffer_submit(prepared.command_buffer_id);
+        let outcome = ctrl::submit_venus_async_blt(
+            self.passive(),
+            adapter,
+            self.ctx_id(),
+            submit.as_slice()?,
+            buffer.resource_id,
+        )?;
+        if let ctrl::BltSubmit::Fence(fence_id) = outcome {
+            self.note_prepared_present_blt_submit(adapter, prepared, blt_index, fence_id);
+        }
+        Ok(outcome)
+    }
+
     fn validate_prepared_present_blt(
         &self,
         prepared: PreparedPresentBltSubmission,

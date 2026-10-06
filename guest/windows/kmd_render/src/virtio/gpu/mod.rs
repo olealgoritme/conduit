@@ -65,6 +65,8 @@ mod nvrm_events;
 mod nvrm_tables;
 mod resource_tables;
 mod rm_gates;
+mod blt_async;
+pub(crate) use blt_async::BltEnq;
 mod foreign_tables;
 mod rm_resource_import_tables;
 pub use foreign_tables::{AllocAdopt, ForeignBegin, ForeignClose, ForeignCommit, ForeignSnapshot};
@@ -2136,6 +2138,14 @@ pub(crate) struct WindowedBltPending {
     /// submission can ever consume.
     pub(crate) wddm_completion_required: bool,
     pub(crate) mirror_claimed: bool,
+    /// An asynchronous Blt of an NVK source (`BltAsync`, `blt_async.rs`): its copy is timed and
+    /// counted, and it has no snapshot reader in the ledger.
+    pub(crate) async_blt: bool,
+    /// `BltNoMirror`: the ring completion hands the destination back at once; no CPU mirror.
+    pub(crate) no_mirror: bool,
+    /// Interrupt time (100 ns) the request was queued, and the worker submitted it (0 before).
+    pub(crate) t_queue: u64,
+    pub(crate) t_submit: u64,
 }
 
 /// Preallocated FIFO plus an exact terminal-membership table. Keeping terminal
@@ -2534,6 +2544,8 @@ pub struct VirtioGpu {
     /// StartDevice, so Present/Submit/DPC mutations never allocate under the
     /// virtio spinlock.
     windowed_blt: WindowedBltState,
+    /// Direct asynchronous Blts in flight (`BltAsync`, `blt_async.rs`).
+    blt_async: blt_async::BltAsyncState,
     /// Bounded completion-ordered DWM/primary dirty state.  Its oldest
     /// outstanding marker is retained for liveness while one later marker is
     /// coalesced with exact resource identity; boxed to keep StartDevice's
@@ -3139,6 +3151,7 @@ impl VirtioGpu {
             wire_fence_base,
             wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
             windowed_blt: WindowedBltState::new(),
+            blt_async: blt_async::BltAsyncState::new(),
             // Snapshotted at transport init like every other knob, so
             // `reg add` + `pnputil /restart-device` flips it with no reboot.
             dma_gpu_fence: crate::diag::read_config_dword(crate::diag::knobs::DMA_GPU_FENCE, 1)
@@ -4845,6 +4858,7 @@ impl VirtioGpu {
         // reads an old handle as live.
         self.purge_all_present_streams();
         self.abort_windowed_blt_for_terminal_transport();
+        self.blt_async_forget();
         while let Some(e) = self.fence_events.pop() {
             // SAFETY: the entry holds an object reference taken by the escape
             // handler. The deref MUST be deferred: dropping the last reference
@@ -5333,6 +5347,11 @@ impl VirtioGpu {
                             let _ = self.complete_present_buffer_gpu_write(resource_id);
                             self.wake_ready_windowed_blt();
                         }
+                    }
+                    // A direct asynchronous Blt (`BltAsync`): the destination goes back to its
+                    // readers here, before the WDDM FIFO below can retire the Present's fence.
+                    if ring_idx != 0 {
+                        self.blt_async_retire(fence_id, response_ok);
                     }
                     if let Some(retire) = windowed_blt {
                         // SAFETY: every token stores the stable adapter that
@@ -7150,6 +7169,10 @@ impl VirtioGpu {
             ledger_retired: false,
             wddm_completion_required: true,
             mirror_claimed: false,
+            async_blt: false,
+            no_mirror: false,
+            t_queue: 0,
+            t_submit: 0,
         });
         crate::ddi::scanout_timeline::note(
             crate::ddi::scanout_timeline::kind::WINDOWED_BLT_ARM,
@@ -7242,6 +7265,7 @@ impl VirtioGpu {
             }
         }
         self.windowed_blt.pending[index].dispatched = true;
+        self.blt_async_dispatched(index);
         self.windowed_blt.ready.pop_front();
         Some(self.windowed_blt.pending[index])
     }
@@ -7274,6 +7298,7 @@ impl VirtioGpu {
         let Some(request) = self.windowed_blt.pending.remove(index) else {
             return;
         };
+        self.blt_async_gone(&request);
         if !request.dispatched {
             // Retired before the worker took it (the teardown of its snapshot resource
             // gives an admitted request a terminal): its token must not stay at the
@@ -7330,6 +7355,8 @@ impl VirtioGpu {
             PresentDestinationDesc::StandardBuffer(destination) => Some(destination.resource_id()),
             PresentDestinationDesc::OptimalImage(_) => None,
         };
+        let (blt_async, blt_no_mirror, blt_t_submit) =
+            (request.async_blt, request.no_mirror, request.t_submit);
         request.ring_complete = true;
         if !request.ledger_retired {
             adapter.read_ledger.retire(request.ledger_ticket, !ok);
@@ -7348,6 +7375,22 @@ impl VirtioGpu {
             request.source_resource_id,
             request.destination_resource_id,
         );
+        if blt_async {
+            // `BltAsync` (docs/zero-copy-present.md, "Asynchronous composed present"): the copy's
+            // latency; and with `BltNoMirror` the destination goes straight back to its readers
+            // (a failed copy included: the host rejected a command that touched nothing and the
+            // destination keeps the previous frame), with no CPU mirror owed to the worker.
+            crate::ddi::blt_async::note_copy_done(blt_t_submit, ok);
+            if blt_no_mirror {
+                if let Some(resource_id) = destination_buffer {
+                    // Quiet: the worker's own failed-submit path released the buffer already,
+                    // in this same critical section.
+                    self.blt_async_release_writer(resource_id);
+                }
+                self.terminal_windowed_blt(adapter, token, stream_boundary, ok);
+                return;
+            }
+        }
         let mirror_ready = ok
             && destination_buffer
                 .is_some_and(|resource_id| self.complete_present_buffer_gpu_write(resource_id));
@@ -7416,6 +7459,7 @@ impl VirtioGpu {
         let Some(request) = self.windowed_blt.pending.remove(index) else {
             return;
         };
+        self.blt_async_gone(&request);
         if !request.ledger_retired {
             adapter.read_ledger.retire(request.ledger_ticket, true);
         }
@@ -7534,6 +7578,7 @@ impl VirtioGpu {
         self.windowed_blt.ready.clear();
         self.windowed_blt.terminal.clear();
         while let Some(request) = self.windowed_blt.pending.pop_front() {
+            self.blt_async_gone(&request);
             if !request.ledger_retired {
                 // SAFETY: every queued request was created with this live
                 // adapter; transport destruction is below its lifecycle.

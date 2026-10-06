@@ -55,6 +55,7 @@ pub mod flush_trace;
 pub mod rm_fence_present;
 pub mod present_foreign;
 pub mod onscanout;
+pub mod blt_async;
 pub mod msi;
 pub mod paging;
 pub mod shared_placeholder;
