@@ -388,6 +388,7 @@ pub(crate) fn enabled() -> bool {
 /// Forget everything (the transport generation ended; `retire_transport`). The next
 /// generation reads the knob again.
 pub(crate) fn forget() {
+    crate::ddi::flip_announce::invalidate_all();
     TARGET.lock().clear();
     {
         let mut g = PRES.lock();
@@ -571,9 +572,24 @@ fn is_failing() -> bool {
     )
 }
 
+/// [`is_failing`] from atomics alone, for the `SetVidPnSourceAddress` DDI at DIRQL
+/// (`FlipAnnounce`): the presenter's `gave_up` needs its lock, but giving up always sets the
+/// restart pause (`RESTART_AT`) in the same step, which this reads. Slightly late (a
+/// failure counts from the worker's own bookkeeping), never wrong the other way: an announce
+/// the worker then refuses is counted (`FaRefuse`) and completes as a kept picture.
+pub(crate) fn failing_atomics() -> bool {
+    ff::failing(
+        now(),
+        RESTART_AT.load(Ordering::Acquire),
+        false,
+        FAIL_UNTIL.load(Ordering::Acquire),
+    )
+}
+
 /// A registration or a flip failed: no new allocation is taken before the presenter's own
 /// retry pause is over (the screen is the Venus path's meanwhile).
 fn note_failure() {
+    crate::ddi::flip_announce::invalidate_all();
     let until = now().saturating_add(helios_kmd_logic::rm_present::RETRY_AFTER_FAIL_100NS);
     FAIL_UNTIL.fetch_max(until, Ordering::AcqRel);
 }
@@ -610,6 +626,8 @@ pub(crate) fn program(
 }
 
 fn note_refusal(why: Why) {
+    // `FlipAnnounce`: a refused allocation is no longer one the DDI may announce.
+    crate::ddi::flip_announce::invalidate_all();
     REFUSED.fetch_add(1, Ordering::Relaxed);
     REFUSED_BY[why.index()].fetch_add(1, Ordering::Relaxed);
     WHY.store(why.code(), Ordering::Relaxed);
@@ -631,6 +649,10 @@ fn take(
     };
     let change = TARGET.lock().set(target);
     SHOWN_RESID.store(target.resid, Ordering::Release);
+    // `FlipAnnounce` mode 1: the next flip of this allocation may be announced at the DDI.
+    // `FlipHostLat*`: when this flip entered, for the host flip's submit time.
+    crate::ddi::flip_announce::learn(target.resid);
+    crate::ddi::flip_lat::note_programmed(primary_address);
     // Which allocation is the active scanout, and the address the vsync reports: what a bind
     // publishes (the same as the level 5 flip). The host is NOT bound to it
     // (`host_bound_scanout_resource` stays), so a Venus flush of it is refused loudly (`RfUnb`)
@@ -672,6 +694,7 @@ pub(crate) fn other_source(adapter: &AdapterContext) {
     if SHOWN_RESID.load(Ordering::Acquire) == 0 {
         return;
     }
+    crate::ddi::flip_announce::invalidate_all();
     TARGET.lock().clear();
     SHOWN_RESID.store(0, Ordering::Release);
     adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::FLIP);
@@ -683,6 +706,7 @@ pub(crate) fn target_gone(adapter: &AdapterContext, resource_id: u32) {
     if SHOWN_RESID.load(Ordering::Acquire) != resource_id || resource_id == 0 {
         return;
     }
+    crate::ddi::flip_announce::invalidate_all();
     if TARGET.lock().gone(resource_id) {
         SHOWN_RESID.store(0, Ordering::Release);
         GONE.fetch_add(1, Ordering::Relaxed);
@@ -696,6 +720,7 @@ pub(crate) fn file_closed(adapter: &AdapterContext, owner: DeviceOwner, drm: u32
     if !knob_on() {
         return;
     }
+    crate::ddi::flip_announce::invalidate_all();
     if let Ok(n) = adapter.with_virtio(|v| v.foreign_file_closed(owner, drm)) {
         POISONED.fetch_add(n as u32, Ordering::Relaxed);
     }
@@ -713,6 +738,7 @@ pub(crate) fn owner_closed(adapter: &AdapterContext, owner: DeviceOwner) {
     if !knob_on() {
         return;
     }
+    crate::ddi::flip_announce::invalidate_all();
     if let Ok(n) = adapter.with_virtio(|v| v.foreign_owner_closed(owner)) {
         POISONED.fetch_add(n as u32, Ordering::Relaxed);
     }
@@ -1010,6 +1036,7 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
                 withdraw(adapter);
             }
             PRES.lock().p.reset();
+            crate::ddi::flip_announce::invalidate_all();
             // The restart pause below is what `program` reads as "failing" from here on.
             GAVE_UP.fetch_add(1, Ordering::Relaxed);
             crate::diag::record_named_bytes(b"FfGaveUp", GAVE_UP.load(Ordering::Relaxed));
@@ -1043,7 +1070,10 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
                     match flip_async(passive, adapter, epoch, slot, copied, target) {
                         // Submitted: the answer is settled by a later pass. Go on (the next
                         // act of this pass is `Idle`, or the next programming's).
-                        Submit::Sent => continue,
+                        Submit::Sent => {
+                            crate::ddi::flip_lat::note_host_submit(now());
+                            continue;
+                        }
                         // Not now: the frame stays owed and the pass ends. The answer that
                         // frees a slot (or the timeout that gives the host up) wakes it.
                         Submit::Full(retry_at) => {
@@ -1066,6 +1096,7 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
                     }
                 }
                 let t0 = now();
+                crate::ddi::flip_lat::note_host_submit(t0);
                 let result = flip(passive, adapter, target);
                 if result == FlipResult::Shown {
                     note_rtt(fp::elapsed_us(t0, now()));

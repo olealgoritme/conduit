@@ -855,6 +855,8 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         // `now` whenever the DPC is late would turn normal dispatch latency
         // into cumulative phase drift, defeating the one-shot scheme.
         let anchor = if previous == 0 { now } else { previous };
+        // `VsLate*`: how late this tick ran against the deadline it was scheduled for.
+        crate::ddi::flip_lat::note_tick_late(now, anchor);
         let period = helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(adapter));
         // Gap statistics (diag `VsMinGap` / `VsFast`): the evidence that the
         // heartbeat does not burst. A few relaxed accesses, no lock and no
@@ -910,7 +912,7 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         crate::ddi::stall_diag::note_gate_closed_tick();
         // `FfAsyncWin`: a programming pending behind a closed gate is not waited on for a tick
         // that will deliver; the heartbeat runs regardless, so it wakes the worker here.
-        if crate::virtio::foreign_flip::early_wake()
+        if (crate::virtio::foreign_flip::early_wake() || crate::ddi::flip_announce::wakes_early())
             && adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0
         {
             crate::virtio::foreign_flip::note_gate_wake();
@@ -941,6 +943,14 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     crate::ddi::stall_diag::cb_sync_end(status);
     let epoch = adapter.scanout_bound_epoch.load(Ordering::Acquire);
     if status == STATUS_SUCCESS {
+        // `FlipLat*` / `IfGap*` / `VbUsed`: a CRTC_VSYNC carrying `phys` was delivered; the flip
+        // with that address (if any) retires here.
+        crate::ddi::flip_lat::on_delivered_tick(
+            adapter,
+            phys as u64,
+            tick_time_100ns,
+            helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(adapter)),
+        );
         // Record every callback that actually reached dxgkrnl. At ~60 Hz the
         // fixed 32768-entry ring retains several minutes, and this is the
         // causal heartbeat a trace needs rather than a stale sampled mirror.

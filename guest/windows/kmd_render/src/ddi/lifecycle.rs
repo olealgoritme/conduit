@@ -218,6 +218,7 @@ fn start_generation_mirrors() {
     let _ = crate::virtio::rm_client::reread_knob_at_start();
     crate::ddi::flip_keep::reset_for_start();
     crate::ddi::present_foreign::reset_for_start();
+    crate::ddi::onscanout::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // `foreign_flip::forget` zeroed its counters and owes the block; this writes it (reading and
     // mirroring `FfKnob` first), as does the `Fk*` block.
@@ -225,6 +226,10 @@ fn start_generation_mirrors() {
     crate::ddi::flip_keep::publish_counters();
     // The stall-diagnosis block (`HpdLoopN`, `FlipIss`, `VsPendN`, ...): zeroed, `StartN` bumped,
     // written once. After the worker of the previous generation was stopped.
+    // The flip retire measurement and the announce knobs (`FlipLat`, `FlipAnnounce`,
+    // `FlipEarlyWake`), read and zeroed before the block above is first written.
+    crate::ddi::flip_lat::start_generation();
+    crate::ddi::flip_announce::start_generation();
     crate::ddi::stall_diag::start_generation();
 }
 

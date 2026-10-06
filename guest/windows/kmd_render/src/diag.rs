@@ -863,6 +863,26 @@ pub mod knobs {
     /// 0 is coerced to 1 (a zero-depth flip queue is not representable) and the
     /// value actually advertised is mirrored in the `FlipQueV` counter.
     pub const FLIP_QUEUE_DEPTH: KnobName = KnobName::new(b"FlipQueueN");
+    /// `FlipAnnounce` (default 0 = off, today's behaviour): publish a flip's address toward
+    /// dxgkrnl AT `SetVidPnSourceAddress` (atomics only, DIRQL) so the very next CRTC_VSYNC tick
+    /// retires it (one tick per flip instead of two), while the HPD worker does the real
+    /// programming afterwards. 1 = only flips of foreign allocations `ForeignFlip` already
+    /// accepted; 2 = every flip, Venus direct and copy paths included. Only when the worker is
+    /// idle at the DDI (at most one unprogrammed announced flip); a flip that finds it busy
+    /// retires the normal way. Any non-zero value also wakes the worker early (`FlipEarlyWake`).
+    /// Read at every StartDevice (`pnputil /restart-device` applies it); mirrored as `FaKnob`.
+    /// `docs/kmd-rm-client.md` 15.18.15.
+    pub const FLIP_ANNOUNCE: KnobName = KnobName::new(b"FlipAnnounce");
+    /// `FlipEarlyWake` (default 0): the DDI asks for the device DPC that wakes the HPD worker the
+    /// moment a flip is pending, instead of the worker waiting for the next vsync tick; without
+    /// an announce the retire still waits for the worker's publication (one tick earlier on
+    /// average). Read at every StartDevice.
+    pub const FLIP_EARLY_WAKE: KnobName = KnobName::new(b"FlipEarlyWake");
+    /// `FlipLat` (default 1 = on, 0 = off): the flip retire latency / inter-flip interval /
+    /// vblank utilisation measurement (`FlipLat*`, `IfGap*`, `FlipP99Us`, `VbUsed`,
+    /// `VsLate*`): atomics in the DDI and the tick, mirrored once a second. Read at every
+    /// StartDevice.
+    pub const FLIP_LAT: KnobName = KnobName::new(b"FlipLat");
     /// `OutputTech` (default 1): the connector type the virtual monitor's child
     /// device reports to Windows. 1 = DisplayPort (external), 2 = HDMI, 3 = DVI,
     /// 4 = internal, 0 = HD15 (analog VGA, the historical value). Anything else
