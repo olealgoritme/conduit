@@ -2,7 +2,11 @@
 
 Status: KMD half implemented behind a closed gate (`RM_IMPORT_SERVED = false`);
 host half and the NVK/UMD half do not exist yet. Written against the code at
-commit `0185243` on `kmd/zero-copy-present`.
+commit `0185243` on `kmd/zero-copy-present`. **Section 10 (S3) supersedes this
+document where it differs**: the layout is mandatory in `IMPORT_RM`, adoption of
+a foreign resid by `D3DKMTCreateAllocation` is complete, and a present marker may
+carry `value == 0`. Sections 3.1, 3.2, 5 (H3) and 9 (O1, O3) are annotated
+accordingly.
 
 Background: `docs/research/nvk-rm-windows.md` on branch `research/nvk-rm-windows`
 (sections 4.1 and 4.3 are the intended design), `guest/nvk-rm/README.md` on
@@ -67,7 +71,8 @@ proves it owns, but it is not RM forwarding: it creates a Venus resource that li
 in the resource tables. A separate verb also avoids op-number and `QUERY_CAPS`
 collisions with the NVRM event work, and needs no change to `helios_nvrm_escape.h`.
 ABI: 40-byte header (same shape as `HeliosNvrmHeader`), `QUERY_CAPS` (96 bytes) and
-`IMPORT_RM` (72 bytes). The canonical C mirror is `protocol/include/helios_foreign.h`;
+`IMPORT_RM` (72 bytes; **S3: the request must be the 104-byte `IMPORT_RM` plus
+layout, section 10.1**). The canonical C mirror is `protocol/include/helios_foreign.h`;
 sizes, offsets and every constant are asserted on both sides (a Rust test parses the
 header). `rm_handle` is the backend handle librmclient got from `Open` of a DRM node
 (`device_type >= 512`); `gem_handle` is what `DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY`
@@ -76,8 +81,9 @@ returned in that file; `size` is the exported object's byte size.
 ### 3.2 Validation (all before any wire traffic, in this order)
 
 1. Gate: `QUERY_CAPS.caps_flags & CAP_RM_IMPORT`, else `ST_UNSUPPORTED` and nothing happens.
-2. Structure (`validate_request`, pure, host-tested): ctx, rm and gem ids nonzero, `flags == 0`,
-   `size` a nonzero page multiple and at most 1 GiB. `ST_BAD_RANGE`.
+2. Structure (`validate_request`, pure, host-tested): ctx, rm and gem ids nonzero, `flags`
+   only the layout bit, `size` a nonzero page multiple and at most 1 GiB, **and a valid
+   layout that fits `size` (S3, section 10.1)**. `ST_BAD_RANGE`.
 3. Ownership, one lock hold with the reservation: the calling device opened `rm_handle`
    through `HELIOS_ESCAPE_NVRM` and it is a DRM file (`ST_NOT_OWNED`, one code, so
    another process's handles are not probeable); the calling device created `ctx_id`
@@ -166,7 +172,9 @@ No new KMD mechanism in v1. The two consumers and what completes them:
   block, from the import parameters nvidia-drm kept) and use it as the modifier at
   `SET_SCANOUT_BLOB` / flush export, instead of the size-based inference in
   `venus/scanout.rs`. The inference is wrong for heights that are a whole number of blocks
-  (768, 1024).
+  (768, 1024). **S3: the KMD now holds the layout (10.1); the 56-byte
+  `RESOURCE_CREATE_BLOB` still carries none of it, so the host either keeps it from the
+  GEM object or a layout-carrying message is added (10.6).**
 - **H4 Lifetime.** Hold its own dma-buf reference, so the resource survives `Close` of the
   DRM file; drop it on `RESOURCE_UNREF`; drop everything on Venus reset.
 - **H5 Importability.** The imported resource must be importable by Venus contexts
@@ -225,12 +233,18 @@ hardening items below.
 - Stale RM handle: a handle closed by one thread while another uses it can name another
   process's file once the host reuses the number. Narrowed here by the recheck at commit, as in
   `push_nvrm_map`; closing it fully needs an in-flight count on the handle, for `FORWARD` too.
+- Adoption by `D3DKMTCreateAllocation` (S3, 10.2) cannot name the creating device (the DDI has no
+  device handle); it is bound to the import's holder context, which a hostile process could guess.
+  Closing it needs the caller's process identity at CreateAllocation (nothing in the KMD reads the
+  current process today) or an adoption cookie returned by `IMPORT_RM`.
 - Cross-process lifetime of an imported foreign resource that two devices of one process use:
   the importing device's DestroyDevice frees it even if the bridge's device still imports it.
 
 ## 9. Open questions
 
-- **O1 (the big one) Venus import of a dma-buf-origin resource.** The bridge and the KMD import
+- **O1 (the big one) Venus import of a dma-buf-origin resource. ANSWERED by the host spike
+  (`host_import_spike.c`, branch `spike/host-nvk-import`, c6fab91): see 10.5. The text below is
+  the question as asked.** The bridge and the KMD import
   a resource as `VkDeviceMemory` + an OPTIMAL `VkImage`. `prepare_optimal_scanout_copy` uses
   `OptimalImageTransport::OpaqueFd` and creates a plain OPTIMAL image; the vehicle's import
   needs "an exact-size match" (vehicle.rs). A dma-buf-backed resource may need dma-buf handle
@@ -240,7 +254,8 @@ hardening items below.
 - **O2 Wire shape.** `RESOURCE_CREATE_BLOB` with a vendor `blob_mem` (D3) versus a dedicated
   message. Only `virtio/foreign.rs::import_rm` (one `ctrl::alloc_blob` call) changes if the host
   prefers another shape.
-- **O3 Who knows the layout.** H3 assumes nvidia-drm keeps the import parameters on the GEM
+- **O3 Who knows the layout. DECIDED (S3): the caller of `IMPORT_RM` sends it, mandatory (10.1).
+  The question as asked:** H3 assumes nvidia-drm keeps the import parameters on the GEM
   object. If not, `IMPORT_RM.flags` / a new field must carry pitch/block height, and the KMD
   must forward it (the 56-byte `RESOURCE_CREATE_BLOB` has no room: it would need a message).
 - **O4 Producer sync.** The RM-semaphore-to-Venus-semaphore path is unspecified; v1 is the CPU wait.
@@ -272,3 +287,234 @@ or behaviour while `RM_IMPORT_SERVED` is false; fix before opening the gate.
    adopt it on the leak path.
 4. `out_host_errno` is documented as the host's errno on `ST_DEVICE_ERROR` but
    is always 0. Reword the field's doc or plumb the errno out.
+
+## 10. S3: adoption of a foreign resid and its layout (implemented, KMD half)
+
+Written against the DXVK-on-NVK plan (`docs/dxvk-on-nvk.md` on `research/dxvk-on-nvk`,
+sections 2.3, 2.4, 3.4, 3.5 level 1, 3.6, 7), stage S3. Everything here is KMD-only and still
+dead code while `RM_IMPORT_SERVED` is `false`, except two things that are live regardless of
+the gate and that are called out in 10.3 and 10.4.
+
+### 10.1 The layout is part of the record (and of the request)
+
+A foreign resource is RM memory the KMD never allocated, so its layout can only come from the
+process that made it. The host spike showed that the layout must reach the importer exactly
+(OPTIMAL tiling with a dma-buf or opaque fd fails; DRM format modifier with explicit plane layout
+imports with 0 wrong pixels, read and write, LINEAR and block-linear h = 5, 4, 0), so the layout is
+**not optional**.
+
+`IMPORT_RM` is the 72-byte `HeliosForeignImportRm` followed by a 32-byte `HeliosForeignLayout`,
+104 bytes in all (`HeliosForeignImportRmLayout`), with `flags = HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT`
+(bit 0). A request without the flag (the old 72-byte form), or with the flag and a short buffer,
+or with any other flag bit, or with a nonzero `reserved`, is refused: `ST_BAD_RANGE` (short buffer:
+the escape fails `STATUS_BUFFER_TOO_SMALL`). The 72-byte struct is unchanged, so a client builds the
+104-byte one by appending. Only the first 72 bytes are written back.
+
+```c
+struct helios_foreign_layout {          /* 32 bytes, plane 0 only */
+   uint32_t width;     /* 1..=16384 */
+   uint32_t height;    /* 1..=16384 */
+   uint32_t stride;    /* rowPitch: multiple of 4, >= width*4, <= 1 MiB */
+   uint32_t offset;    /* plane 0 offset in bytes from the start of the object */
+   uint32_t fourcc;    /* DRM_FORMAT_{XRGB,ARGB,XBGR,ABGR}8888 */
+   uint32_t reserved;  /* 0 */
+   uint64_t modifier;  /* DRM_FORMAT_MOD_LINEAR, or 0x0300000000606010 | h, h = 0..=5 */
+};
+struct helios_foreign_import_rm_layout { struct helios_foreign_import_rm base;   /* 72 */
+                                         struct helios_foreign_layout layout; }; /* +32 = 104 */
+```
+
+Validation, pure and host-tested (`helios_kmd_logic::foreign_resource::Layout`), mirroring the
+foreign-scanout validator (`kmd/foreign-scanout` 66c714f) with two deliberate differences: the extent
+floor is 1 (a foreign resource is any adopted allocation, not only a mode-sized scanout image), and
+the modifier set is closed to the family the host was shown to import exactly (the list NVK builds:
+`0x0300000000606010` to `...6015`, plus LINEAR).
+
+**Size rule.** `min_bytes() <= size`, never equality: `min_bytes = offset + stride * rows`, `rows`
+being `height` (LINEAR) or `height` rounded up to `8 << h` (block-linear). RM rounds allocations to
+64 KiB (a 1080p linear image is `0x7e9000` inside a `0x7f0000` object), so a layout-derived size is a
+lower bound. The recorded `size` itself is still the host-verified object size.
+
+The record keeps the layout (`foreign_resource::Entry::layout`) for the life of the resource, and the
+KMD exposes it:
+
+```rust
+VirtioGpu::foreign_layout(resource_id) -> Option<helios_kmd_logic::foreign_resource::Layout>
+// Layout { width, height, stride, offset, fourcc, modifier }, plus Layout::block_height_log2()
+```
+
+This is the accessor a KMD-driven `ScanoutFlip{stride, fourcc, modifier}` and the scanout-copy
+import will read. It is valid while the resource lives; the allocation's destroy drops the record.
+
+### 10.2 Adopting a foreign resid in `D3DKMTCreateAllocation`
+
+`HeliosWddmAllocPrivate` (48 bytes, unchanged) must be:
+
+| field | value |
+|---|---|
+| `kind` | `HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY` (1). Any other kind is refused: only DEVICE_MEMORY takes the blob's lifetime. |
+| `blob_mem` | `HELIOS_BLOB_MEM_RM_EXPORT` (0x80000001). It is a declaration, checked against the record in both directions. Do NOT set `HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER` (that shape reuses `blob_mem` as a cookie; foreign allocations keep the full conservative VidMm charge). |
+| `adopt_resource_id` | `out_resource_id` of `IMPORT_RM` |
+| `ctx_id` | **the Venus context `IMPORT_RM` was given (the holder context)**; mismatch is refused |
+| `blob_id`, `map_cache` | 0 (not used) |
+| `size` | the object size (informational; the recorded size is authoritative) |
+| `blob_flags` | 0 |
+
+`HeliosWddmAllocMeta` (the 48-byte trailer at byte 48, unchanged) must **repeat the layout**:
+`width`, `height`, `pitch` (= `stride`), `plane_offset` (= `offset`) each equal to the record's; a
+zero is not "don't care". `venus_alloc_size` is 0 or at most the recorded size (the KMD reports the
+recorded size). `dxgi_format` / `format` / `bind_flags` / `misc_flags` as for any adopted texture.
+
+**Per-allocation private-data size must be 128 bytes** (`HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES`):
+the new second trailer `HeliosWddmAllocLayout` lives at byte 96.
+
+```c
+struct helios_wddm_alloc_layout {       /* 32 bytes, at private data offset 96 */
+   uint64_t modifier;      /* == layout.modifier */
+   uint32_t magic;         /* 0x594C4648 'HFLY' */
+   uint32_t version;       /* 1 */
+   uint32_t fourcc;        /* == layout.fourcc */
+   uint32_t stride;        /* == meta.pitch */
+   uint32_t plane_offset;  /* == meta.plane_offset */
+   uint32_t reserved;      /* 0 */
+};
+```
+
+The creator may fill it (the KMD then requires it to equal the record's layout exactly: fourcc,
+modifier, stride, offset) or leave it zero. Either way the KMD **overwrites it at create time** with
+the recorded layout, so the creator (after `pfnAllocateCb` returns) and every opener (DWM, through
+`OpenAllocation`; the KMD leaves bytes 48.. as written, as it does for the meta) read one
+KMD-validated record. A buffer smaller than 128 bytes is refused for a foreign adoption, because an
+opener would otherwise have no way to learn the layout. This is backward compatible: the KMD's meta
+reader already accepts "48 bytes or more" after the prefix and ignores the excess, so a 96-byte
+creator is unaffected for every ordinary allocation, and an older KMD sees a 128-byte buffer as a
+96-byte one.
+
+Adoption (`ForeignTable::adopt_for_allocation`, one device-lock hold with the slot re-ownership,
+`VirtioGpu::adopt_for_allocation`):
+
+```text
+resid has no record, not declared ........ legacy Venus adoption, unchanged
+resid has no record, declared ............ refused NotForeign   (dead, or a plain Venus blob)
+record, not declared ..................... refused Undeclared
+kind does not own the blob ............... refused NotDeviceMemory
+already adopted .......................... refused AlreadyAdopted   (it would be released twice)
+ctx_id != the import's ctx ............... refused ContextMismatch
+that context no longer the creator's ..... refused ContextGone
+blob slot no longer the creator's ........ refused SlotNotCreators
+private data < 128 bytes ................. refused NoTrailerRoom
+width/height/pitch/plane_offset differ ... refused GeometryMismatch
+supplied trailer differs from the record . refused LayoutMismatch
+venus_alloc_size claim > recorded size ... refused ClaimTooLarge
+otherwise: creator quota freed, record KEPT (so MAP refusal and the teardown rules still apply),
+           blob slot re-owned to the KMD (owner None), layout written back.
+```
+
+A refusal is `STATUS_INVALID_PARAMETER`, changes nothing, and is counted (`FgRefA` in the service
+key, mirrored as `refused` in `QUERY_CAPS`; the first and every 64th refusal also records `FgAdRf` =
+the refusal code, 1 to 11, `AdoptRefusal::code`).
+
+**"Same device".** `DXGKARG_CREATEALLOCATION` carries no device handle, so the creating device cannot
+be named by the DDI. The KMD binds the adoption to the import's **holder context**: the allocation must
+name the context the resource was imported on, and that context must still belong to the importing
+device. Contexts are device-owned, so presenting one is presenting something only that device was
+handed. This is a consistency check, not authentication: context ids are small integers a hostile
+process could guess (listed in section 8, hardening).
+
+**Destroy and open release the host resource exactly once.** `DestroyAllocation` of the adopting
+allocation (`owns_resource`) pops the blob slot and the record (`forget_allocation_blob`), then
+`take_live_resource` lets exactly one caller issue `CTX_DETACH_RESOURCE` + `RESOURCE_UNREF`. A second
+allocation cannot adopt the same resid (`AlreadyAdopted`), so there is never a second owner.
+`OpenAllocation` creates only an `OpenAllocationContext` and never owns the resource, and the C1 gate
+(`resource_is_live`) still fails an open of a dead resid. The creator's `RELEASE_BLOB` after adoption
+no longer finds the slot (it is KMD-owned) and fails harmlessly.
+
+### 10.3 The vendor blob type cannot be minted from allocation private data (live, gate or not)
+
+A `D3DKMTCreateAllocation` with `adopt_resource_id == 0` and `blob_mem == HELIOS_BLOB_MEM_RM_EXPORT`
+used to classify as a raw HOST3D blob and forward the vendor `blob_mem` to the host verbatim, which
+would have bypassed `IMPORT_RM`'s ownership proof and quota. It is now refused
+(`STATUS_INVALID_PARAMETER`, counted as `FgAdRf` = 0x100). No shipping UMD sends that value.
+
+### 10.4 Present markers: `value == 0` means "already complete" (live, gate or not)
+
+The marker tail `(ctx_id, value, cookie)` of `HeliosPresentRefreshCmd` / `HeliosPresentPrivateData`
+(and the D3D11/D3D12 `publish` of the producer escape) now has four readings
+(`helios_kmd_logic::present_stream::classify_tail`):
+
+| ctx_id | value | cookie | reading | effect |
+|---|---|---|---|---|
+| 0 | 0 | 0 | absent | legacy: capture the current wire watermark (unchanged; an old UMD leaves the tail zero) |
+| != 0 | != 0 | != 0 | point | wait for that point on the registered stream (byte-identical to before) |
+| != 0 | **0** | != 0 | **complete** | the boundary is `(stream handle, 0)`: ready as soon as the stream is live, waits on no Venus timeline |
+| any other mix | | | partial | not a marker; legacy rule |
+
+A complete marker still authenticates exactly like a point: `ctx_id`, `cookie` and the process
+association must name a live registered stream (`HELIOS_ESCAPE_PRESENT_STREAM` register), else the
+marker is rejected (`PRESENT_STREAM_REJECTS`) and the present falls back to the legacy watermark, which
+is correct but waits. The boundary stays in the tagged namespace: it dies with its stream like every
+other marker (a dead stream is never success), `scanout_boundary_ready` is true for it (`slot_ready`
+with value 0), the bind worker, the fast bind and the WDDM fence all treat it as any other tagged
+boundary, and nothing treats the 64-bit boundary as 0 (the tag bit is set). The two parse sites in
+`DxgkDdiRender` and `ContextHandleRef::stash_present_stream_marker` no longer drop `value == 0`
+(dropping it would silently turn the present into the legacy wait). It is counted: `PsMkCpl`
+(`PRESENT_STREAM_MARKER_COMPLETE`). D3D12 ECL records (`HE12`) still require `value != 0`
+(`HeliosD3D12SubmitCmd::is_valid`); that is a different contract (DMA completion waits on the exact
+worker point) and is unchanged.
+
+The allocation-scoped producer table (escape 0x13, `HELIOS_PRODUCER_PUBLISH`) accepts `value == 0`
+as well (`producer_completion::Table::publish`): the epoch is announced and completes at once when
+nothing older is pending on that allocation (no pending slot consumed), or queues as an already-done
+entry behind older pending epochs (the per-allocation prefix rule: a consumer never sees epoch N+1
+before N); it never reads or advances the stream's strictly-increasing writer value. The stream must
+still be the calling device's live registration.
+
+What the UMD must change (not done here): `PresentStreamCorrelation::is_complete` requires
+`value32 != 0` and the vehicle's `set_present_source` refuses `fence_value == 0`; both need a
+"CPU-complete" mode that sends `ctx_id`, `cookie` of the NVK device's registered stream with
+`value = 0`, after it has waited on the CPU for the frame's NVK timeline point.
+
+### 10.5 What the host spike settled (host_import_spike.c, c6fab91)
+
+- The host's NVIDIA Vulkan driver imports NVK-on-RM memory exported via nvidia-drm with the exact
+  layout, both directions, every pixel checked: LINEAR (rowPitch 7680) and block-linear h = 5, 4, 0.
+  Advertised modifiers for B8G8R8A8 / R8G8B8A8: `0x0300000000606015` down to `...6010`, plus LINEAR
+  (the list NVK builds); an NVK 1080p swapchain image on GB202 is `0x0300000000606015` (h = 5).
+- The opaque route fails (OPTIMAL tiling with a dma-buf or opaque fd: `OUT_OF_DEVICE_MEMORY`), and the
+  layout would be wrong anyway. This answers O1: the import must be an explicit-modifier image.
+- The host will relax the vehicle's exact-size match to `image size <= resource size`; hence the size
+  rule in 10.1.
+
+### 10.6 Follow-ups (not in this change)
+
+1. **Scanout copy import.** `prepare_optimal_scanout_copy` (`venus/scanout.rs`) and the vehicle import
+   must create the image for a foreign resource with `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and
+   `VkImageDrmFormatModifierExplicitCreateInfoEXT { drmFormatModifier = layout.modifier,
+   drmFormatModifierPlaneCount = 1, pPlaneLayouts = { offset = layout.offset, rowPitch = layout.stride } }`,
+   reading `VirtioGpu::foreign_layout`. It currently creates a plain OPTIMAL image and infers layout from
+   the size. Not rewritten here.
+2. **Layout on the host wire.** The 56-byte `RESOURCE_CREATE_BLOB` has no room for the layout; the host
+   learns it from the GEM object or from a new message. Needed before the gate opens.
+3. **KMD-driven `ScanoutFlip`** in `program_vidpn_source_inner` (plan 3.6 Option B): read
+   `foreign_layout` for `stride`, `fourcc`, `modifier`.
+4. **Hardening**: ownership check of the adopting process (the holder-context binding is a consistency
+   check only, 10.2); `ATTACH_RESOURCE` and snapshot descriptors for a foreign resid (section 8).
+
+### 10.7 Opening the gate
+
+`virtio/foreign.rs::RM_IMPORT_SERVED` is the one const. Flip it to `true` (or make it read the host
+feature bit) only when its documented preconditions hold: the host serves `blob_mem 0x80000001`
+(H1 to H4), advertises it with a feature bit, imports with the recorded layout (10.6 item 2), and the
+deferred review findings below are fixed or accepted. Nothing else changes: caps, `IMPORT_RM`,
+adoption and the layout record are already written.
+
+### 10.8 Tests
+
+| what | where | how it was run |
+|---|---|---|
+| layout rules, size lower bound, request validation, adoption state machine (all 11 refusals, once-only, quota freed, record kept, claim, trailer room), refusal codes | `kmd_logic/src/foreign_resource.rs` | host `cargo test` |
+| marker tail readings, the "old gate for nonzero values is unchanged" table, boundary readiness for value 0 and dead streams | `kmd_logic/src/lib.rs` (`present_marker_tail_tests`) | host `cargo test` |
+| producer publish with value 0 (no pending slot, ordering behind older epochs, no writer slot, atomic failure, terminal) | `kmd_logic/src/producer_completion.rs` | host `cargo test` |
+| ABI: `HeliosForeignLayout` 32, `HeliosForeignImportRmLayout` 104, `HeliosWddmAllocLayout` 32 at offset 96; C mirror | `protocol/src/foreign.rs`, `protocol/src/wddm.rs`, `protocol/include/helios_foreign.h` | Rust `const` asserts + `cargo test`; `gcc -m32/-m64 -Wall -Wextra -Werror` on the header |
+| escape parse of the layout tail, import with layout, `foreign_layout`, `adopt_for_allocation` glue (re-ownership, quota, wrong context, dropped context, declared/record agreement, legacy path) | the real `escape_foreign.rs`, `virtio/foreign.rs`, `gpu/foreign_tables.rs` | compiled and run against a stub of the surrounding crate (not in the tree), gate flipped in the copy only |
+| `create_allocation.rs`, `submit_command.rs`, `gpu/mod.rs`, `device.rs` edits | - | rustfmt parse and review only; **never compiled**. Nothing here has run on a Windows guest. |

@@ -5951,6 +5951,67 @@ pub mod present_stream {
     pub const fn marker_runs_ahead(value: u32, submitted_value: u32) -> bool {
         marker_lookahead(value, submitted_value) != 0
     }
+
+    /// How a present-marker tail `(ctx_id, value, cookie)` reads.
+    ///
+    /// `value == 0` is "already complete" (S3 of the DXVK-on-NVK plan): a
+    /// CPU-complete present whose producer waited for its own GPU work before
+    /// sending the marker, so there is no Venus timeline point to wait for. It
+    /// still NAMES a registered stream (`ctx_id` and `cookie` nonzero), which is
+    /// what tells it apart from an ABSENT tail: an old UMD leaves the tail
+    /// all-zero, and that must keep meaning "legacy current-wire watermark", or
+    /// every old-UMD present would bind without waiting.
+    ///
+    /// The UMD's own `PresentStreamCorrelation` never emits a partial tuple
+    /// (it is all-zero or all-nonzero), so `Complete` is a shape no shipping
+    /// writer produced before.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum MarkerTail {
+        /// All three zero: no marker, the legacy rule applies.
+        Absent,
+        /// Stream named, `value != 0`: wait for that point on the stream.
+        Point,
+        /// Stream named, `value == 0`: already complete, wait for nothing.
+        Complete,
+        /// Any other mix (an id without its cookie, a value with no stream):
+        /// not a marker; the legacy rule applies and nothing is trusted.
+        Partial,
+    }
+
+    pub const fn classify_tail(ctx_id: u32, value: u32, cookie: u64) -> MarkerTail {
+        if ctx_id == 0 && value == 0 && cookie == 0 {
+            MarkerTail::Absent
+        } else if ctx_id == 0 || cookie == 0 {
+            MarkerTail::Partial
+        } else if value == 0 {
+            MarkerTail::Complete
+        } else {
+            MarkerTail::Point
+        }
+    }
+
+    /// Whether the tail selects a stream boundary at all (`Point` or
+    /// `Complete`). The two parse sites in `DxgkDdiRender` use this where they
+    /// used `ctx_id != 0 && value != 0 && cookie != 0`; for every nonzero
+    /// `value` the answer is unchanged.
+    pub const fn tail_selects_boundary(ctx_id: u32, value: u32, cookie: u64) -> bool {
+        matches!(
+            classify_tail(ctx_id, value, cookie),
+            MarkerTail::Point | MarkerTail::Complete
+        )
+    }
+
+    /// `present_stream_marker_boundary`'s argument gate: the tail selects a
+    /// boundary and the caller carries a KMD-process association. The stream
+    /// itself is then matched against the live registered slots.
+    pub const fn marker_admissible(
+        ctx_id: u32,
+        value: u32,
+        cookie: u64,
+        creator_process: usize,
+    ) -> bool {
+        creator_process != 0 && tail_selects_boundary(ctx_id, value, cookie)
+    }
 }
 
 #[cfg(test)]
@@ -5996,6 +6057,91 @@ mod present_stream_tests {
         assert_eq!(marker_lookahead(0, u32::MAX), 0);
         assert_eq!(marker_lookahead(1, u32::MAX), 0);
         assert!(!marker_runs_ahead(0, u32::MAX));
+    }
+}
+
+#[cfg(test)]
+mod present_marker_tail_tests {
+    use super::present_stream::{
+        classify_tail, decode_boundary, encode_boundary, marker_admissible, marker_lookahead,
+        slot_handle, slot_ready, tail_selects_boundary, MarkerTail,
+    };
+
+    #[test]
+    fn an_all_zero_tail_is_absent_and_keeps_the_legacy_rule() {
+        assert_eq!(classify_tail(0, 0, 0), MarkerTail::Absent);
+        assert!(!tail_selects_boundary(0, 0, 0));
+        assert!(!marker_admissible(0, 0, 0, 1));
+    }
+
+    #[test]
+    fn a_nonzero_point_is_exactly_what_it_was() {
+        // The old gate: ctx != 0 && value != 0 && cookie != 0 (&& process != 0).
+        for (ctx, value, cookie, process) in [
+            (1u32, 1u32, 1u64, 1usize),
+            (7, 41, 0xDEAD_BEEF_0000_0001, 0x1234),
+            (u32::MAX, u32::MAX, u64::MAX, usize::MAX),
+            (1, 1, 1, 0),
+            (0, 5, 5, 1),
+            (5, 5, 0, 1),
+            (5, 0, 5, 1), // the one input whose answer changes (value == 0)
+            (0, 0, 5, 1),
+            (5, 0, 0, 1),
+            (0, 5, 0, 1),
+        ] {
+            let old = ctx != 0 && value != 0 && cookie != 0 && process != 0;
+            let new = marker_admissible(ctx, value, cookie, process);
+            if value != 0 {
+                assert_eq!(old, new, "{ctx} {value} {cookie:#x} {process:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn value_zero_with_a_stream_is_complete_not_absent() {
+        assert_eq!(classify_tail(5, 0, 9), MarkerTail::Complete);
+        assert!(tail_selects_boundary(5, 0, 9));
+        assert!(marker_admissible(5, 0, 9, 1));
+        // Still needs the process association.
+        assert!(!marker_admissible(5, 0, 9, 0));
+    }
+
+    #[test]
+    fn partial_tails_are_not_markers() {
+        // An id with no cookie, a cookie with no id, a value with neither.
+        assert_eq!(classify_tail(5, 0, 0), MarkerTail::Partial);
+        assert_eq!(classify_tail(0, 0, 9), MarkerTail::Partial);
+        assert_eq!(classify_tail(5, 3, 0), MarkerTail::Partial);
+        assert_eq!(classify_tail(0, 3, 9), MarkerTail::Partial);
+        assert_eq!(classify_tail(0, 3, 0), MarkerTail::Partial);
+        for (c, v, k) in [(5, 0, 0), (0, 0, 9), (5, 3, 0), (0, 3, 9), (0, 3, 0)] {
+            assert!(!tail_selects_boundary(c, v, k));
+        }
+        assert_eq!(classify_tail(5, 3, 9), MarkerTail::Point);
+    }
+
+    #[test]
+    fn a_complete_boundary_is_a_valid_tagged_boundary_and_ready_while_live() {
+        let handle = slot_handle(3, 2);
+        let boundary = encode_boundary(handle, 0);
+        // Nonzero (the tag bit), so no consumer can mistake it for "no
+        // boundary"; and it decodes, so it stays in the stream namespace and is
+        // never fed to the wire-fence `< watermark` scan.
+        assert_ne!(boundary, 0);
+        assert_eq!(decode_boundary(boundary), Some((handle, 0)));
+        // Ready at once on a live stream whatever it has retired...
+        assert!(slot_ready(true, 3, 2, handle, 0, 0));
+        assert!(slot_ready(true, 3, 2, handle, 0, 17));
+        // ...and exactly as unready as any other boundary once the stream dies
+        // or its generation moves: a dead stream is never success.
+        assert!(!slot_ready(false, 3, 2, handle, 0, 17));
+        assert!(!slot_ready(true, 4, 2, handle, 0, 17));
+    }
+
+    #[test]
+    fn a_complete_marker_never_counts_as_running_ahead() {
+        assert_eq!(marker_lookahead(0, 0), 0);
+        assert_eq!(marker_lookahead(0, 41), 0);
     }
 }
 

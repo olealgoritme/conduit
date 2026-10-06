@@ -610,6 +610,14 @@ pub static PRESENT_BUFFER_SYNC_REJECTS: AtomicU32 = AtomicU32::new(0);
 /// submitted (`value > slot.submitted_value`), counted at
 /// `present_stream_marker_boundary` with no change to what it returns.
 pub static PRESENT_STREAM_MARKER_AHEAD: AtomicU32 = AtomicU32::new(0);
+/// Present markers that named a registered stream with `value == 0`: "already
+/// complete", a CPU-complete present (S3 of the DXVK-on-NVK plan). Counted at
+/// `present_stream_marker_boundary`, mirrored as `PsMkCpl`. Not a refusal and
+/// not a lookahead: the boundary it returns is ready as soon as its stream is
+/// live, so a count that moves with no `PsMkAhd` movement is the NVK path
+/// working, and a count that is zero on an NVK run means the UMD is not sending
+/// it (the present then falls back to the legacy current-wire watermark).
+pub static PRESENT_STREAM_MARKER_COMPLETE: AtomicU32 = AtomicU32::new(0);
 /// High-water of `value - submitted_value` (saturating —
 /// `helios_kmd_logic::present_stream::marker_lookahead`).
 ///

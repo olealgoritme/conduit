@@ -13,12 +13,13 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use bytemuck::{bytes_of, pod_read_unaligned, Pod};
 use helios_kmd_logic::foreign_resource::{
-    MAX_FOREIGN_BYTES_PER_OWNER, MAX_FOREIGN_PER_OWNER, MAX_FOREIGN_RESOURCE_BYTES,
+    self as fr, MAX_FOREIGN_BYTES_PER_OWNER, MAX_FOREIGN_PER_OWNER, MAX_FOREIGN_RESOURCE_BYTES,
     MAX_FOREIGN_TOTAL,
 };
 use helios_protocol::{
-    HeliosEscapeHeader, HeliosForeignHeader, HeliosForeignImportRm, HeliosForeignQueryCaps,
-    HELIOS_FOREIGN_ABI_VERSION, HELIOS_FOREIGN_CAP_RM_IMPORT, HELIOS_FOREIGN_OP_IMPORT_RM,
+    HeliosEscapeHeader, HeliosForeignHeader, HeliosForeignImportRm, HeliosForeignImportRmLayout,
+    HeliosForeignLayout, HeliosForeignQueryCaps, HELIOS_FOREIGN_ABI_VERSION,
+    HELIOS_FOREIGN_CAP_RM_IMPORT, HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT, HELIOS_FOREIGN_OP_IMPORT_RM,
     HELIOS_FOREIGN_OP_QUERY_CAPS, HELIOS_FOREIGN_ST_BAD_CONTEXT, HELIOS_FOREIGN_ST_BAD_RANGE,
     HELIOS_FOREIGN_ST_DEVICE_ERROR, HELIOS_FOREIGN_ST_NOT_OWNED, HELIOS_FOREIGN_ST_NO_RESOURCES,
     HELIOS_FOREIGN_ST_OK, HELIOS_FOREIGN_ST_UNSUPPORTED,
@@ -29,6 +30,10 @@ use crate::dxgk::*;
 use crate::irql::PassiveLevel;
 use crate::virtio::foreign::{self, ImportError, RM_IMPORT_SERVED};
 use crate::virtio::gpu::DeviceOwner;
+
+// kmd_logic has no dependency edge to helios_protocol; this pins its copy of the
+// layout flag to the wire's.
+const _: () = assert!(fr::FLAG_LAYOUT == HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT);
 
 /// Escapes of this verb, for the registry-write throttle.
 static CALLS: AtomicU32 = AtomicU32::new(0);
@@ -150,6 +155,20 @@ fn import_rm(
     req.head.epoch = epoch;
     req.out_resource_id = 0;
     req.out_host_errno = 0;
+    // The layout tail is part of the request when the flag says so: both the
+    // declared and the supplied length must cover all 104 bytes, or the escape
+    // fails as any short buffer does. A request without the flag has no layout
+    // and is refused `BAD_RANGE` by `validate_request` (the layout is mandatory;
+    // the refusal is counted there). Only the 72-byte base is ever written back.
+    let layout = if req.flags & HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT != 0 {
+        let ext: HeliosForeignImportRmLayout = match bind(buf, hdr) {
+            Ok(e) => e,
+            Err(st) => return st,
+        };
+        layout_from_wire(&ext.layout)
+    } else {
+        None
+    };
     let result = foreign::import_rm(
         passive,
         adapter,
@@ -159,6 +178,7 @@ fn import_rm(
         req.gem_handle,
         req.flags,
         req.size,
+        layout,
     );
     req.head.status = match result {
         Ok(resource_id) => {
@@ -176,4 +196,21 @@ fn import_rm(
         Err(ImportError::Device(_)) => HELIOS_FOREIGN_ST_DEVICE_ERROR,
     };
     write_back(buf, &req)
+}
+
+/// The wire layout as the pure type. `None` when `reserved` is not zero (a field
+/// this KMD does not know): the request then reads as having no layout and is
+/// refused `BAD_RANGE`, like any unknown bit.
+fn layout_from_wire(w: &HeliosForeignLayout) -> Option<fr::Layout> {
+    if w.reserved != 0 {
+        return None;
+    }
+    Some(fr::Layout {
+        width: w.width,
+        height: w.height,
+        stride: w.stride,
+        offset: w.offset,
+        fourcc: w.fourcc,
+        modifier: w.modifier,
+    })
 }

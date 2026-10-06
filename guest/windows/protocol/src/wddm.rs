@@ -298,6 +298,82 @@ pub struct HeliosWddmAllocMeta {
     pub plane_offset: u64,
 }
 
+/// `'HFLY'` — magic of [`HeliosWddmAllocLayout`].
+pub const HELIOS_WDDM_LAYOUT_MAGIC: u32 = 0x594C_4648;
+/// Current [`HeliosWddmAllocLayout`] version.
+pub const HELIOS_WDDM_LAYOUT_VERSION: u32 = 1;
+/// Byte offset of [`HeliosWddmAllocLayout`] in an allocation's private driver
+/// data: after [`HeliosWddmAllocPrivate`] (48) and [`HeliosWddmAllocMeta`] (48).
+pub const HELIOS_WDDM_LAYOUT_OFFSET: usize = 96;
+/// Private-data size that covers the layout trailer (96 + 32).
+pub const HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES: usize = 128;
+
+/// Surface layout of an adopted FOREIGN resource (`blob_mem =
+/// HELIOS_BLOB_MEM_RM_EXPORT`), the second trailer of an allocation's private
+/// driver data, at [`HELIOS_WDDM_LAYOUT_OFFSET`]. 32 bytes, padding-free.
+///
+/// It carries what [`HeliosWddmAllocMeta`] has no room for (fourcc, DRM modifier)
+/// and repeats the two fields of it that the layout is defined by (`stride` =
+/// `meta.pitch`, `plane_offset` = `meta.plane_offset`), so an opener reads one
+/// self-contained record. `width`/`height` stay in the meta.
+///
+/// Backward compatible by construction: the KMD's trailer reader already accepts
+/// "48 bytes or more" after the 48-byte private prefix and ignores the excess, so
+/// an older reader of a 128-byte buffer sees exactly the 96-byte form. A creator
+/// that predates it sends 96 bytes; for an ordinary (Venus) allocation nothing
+/// changes, and for a foreign adoption the KMD refuses a buffer that cannot hold
+/// the trailer, because openers could not otherwise learn the layout.
+///
+/// Direction: the creator MAY fill it (the KMD then requires it to equal the
+/// layout recorded at `IMPORT_RM`); the KMD ALWAYS overwrites it at create time
+/// with the recorded layout, so creator and openers read the same, KMD-validated
+/// values. Plane 0 only.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+pub struct HeliosWddmAllocLayout {
+    /// `DRM_FORMAT_MOD_*`: LINEAR or `0x0300000000606010 | h`.
+    pub modifier: u64,
+    pub magic: u32,   // == HELIOS_WDDM_LAYOUT_MAGIC
+    pub version: u32, // == HELIOS_WDDM_LAYOUT_VERSION
+    /// `DRM_FORMAT_*`.
+    pub fourcc: u32,
+    /// Plane 0 pitch in bytes; equals `HeliosWddmAllocMeta::pitch`.
+    pub stride: u32,
+    /// Plane 0 offset in bytes; equals `HeliosWddmAllocMeta::plane_offset`.
+    pub plane_offset: u32,
+    /// Zero.
+    pub reserved: u32,
+}
+
+impl HeliosWddmAllocLayout {
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.magic == HELIOS_WDDM_LAYOUT_MAGIC
+            && self.version == HELIOS_WDDM_LAYOUT_VERSION
+            && self.reserved == 0
+    }
+}
+
+const _: () = {
+    use core::mem::{offset_of, size_of};
+    assert!(size_of::<HeliosWddmAllocLayout>() == 32);
+    assert!(offset_of!(HeliosWddmAllocLayout, modifier) == 0);
+    assert!(offset_of!(HeliosWddmAllocLayout, magic) == 8);
+    assert!(offset_of!(HeliosWddmAllocLayout, version) == 12);
+    assert!(offset_of!(HeliosWddmAllocLayout, fourcc) == 16);
+    assert!(offset_of!(HeliosWddmAllocLayout, stride) == 20);
+    assert!(offset_of!(HeliosWddmAllocLayout, plane_offset) == 24);
+    assert!(offset_of!(HeliosWddmAllocLayout, reserved) == 28);
+    assert!(
+        HELIOS_WDDM_LAYOUT_OFFSET
+            == size_of::<HeliosWddmAllocPrivate>() + size_of::<HeliosWddmAllocMeta>()
+    );
+    assert!(
+        HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES
+            == HELIOS_WDDM_LAYOUT_OFFSET + size_of::<HeliosWddmAllocLayout>()
+    );
+};
+
 // ── HeliosWddmAllocMeta::bind_flags — the wire vocabulary ───────────────────
 //
 // ⛔ These are the `D3D10DDI_BIND_*` values, declared HERE because
@@ -494,7 +570,8 @@ pub struct HeliosPresentPrivateData {
     /// Optional registered present-stream marker.  Readers must only inspect
     /// this appended tail when their input covers the complete 64-byte form;
     /// the v1 prefix through `venus_alloc_size` remains the compatibility and
-    /// snapshot-coverage boundary.
+    /// snapshot-coverage boundary.  `present_value == 0` with `ctx_id` and
+    /// `cookie` nonzero means "already complete" (see `HeliosPresentRefreshCmd`).
     pub present_ctx_id: u32,
     pub present_value: u32,
     pub present_cookie: u64,
@@ -559,9 +636,14 @@ pub struct HeliosPresentRefreshCmd {
     pub source_index: u32,
     /// RESERVED-ZERO on the UMD path. See [`Self::source_index`].
     pub destination_index: u32,
-    /// Optional registered present-stream marker.  A complete nonzero tail
-    /// selects a stream boundary; an absent, partial, or invalid tail follows
-    /// the legacy current-wire watermark path.
+    /// Optional registered present-stream marker.  A complete tail selects a
+    /// stream boundary; an absent, partial, or invalid tail follows the legacy
+    /// current-wire watermark path.  Complete means `ctx_id` and `cookie`
+    /// nonzero: with `value != 0` the bind waits for that point on the stream,
+    /// and with **`value == 0` the present is already complete** (a
+    /// CPU-complete producer, e.g. NVK on RM, waited for its own GPU work
+    /// first): the bind waits for nothing but still needs the stream to be live.
+    /// An all-zero tail is "absent", never "complete".
     pub present_ctx_id: u32,
     pub present_value: u32,
     pub present_cookie: u64,

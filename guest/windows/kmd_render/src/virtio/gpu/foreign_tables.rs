@@ -17,7 +17,9 @@
 //! allocation (the record's storage is reserved at init) and nothing that waits.
 
 use super::*;
-use helios_kmd_logic::foreign_resource::{self as fr, Quota, RefusalKind, Reservation};
+use helios_kmd_logic::foreign_resource::{
+    self as fr, AdoptPlan, AdoptRefusal, AdoptRequest, Quota, RefusalKind, Reservation,
+};
 
 /// First `device_type` of a DRM file in the `HELIOS_ESCAPE_NVRM` handle table
 /// (255 is the control file, a GPU minor, 256 UVM, 257 UVM tools).
@@ -49,6 +51,20 @@ pub enum ForeignCommit {
     /// The table refused the record (a duplicate id). The caller must tear the
     /// resource down.
     Refused,
+}
+
+/// What [`VirtioGpu::adopt_for_allocation`] decided for one
+/// `D3DKMTCreateAllocation` that names an existing resource.
+pub enum AllocAdopt {
+    /// Not foreign: the ordinary Venus adoption ran (`Some(size)` of the live
+    /// blob, or `None` if it is dead or untracked), exactly as before.
+    Legacy(Option<u64>),
+    /// A foreign resource, adopted: its blob slot is KMD-owned now and its
+    /// creator's quota is freed. The record (with the layout) is kept until the
+    /// allocation's destroy removes it.
+    Foreign(fr::Adopted),
+    /// Refused; nothing changed.
+    Refused(AdoptRefusal),
 }
 
 /// A point-in-time read for `QUERY_CAPS`.
@@ -100,6 +116,7 @@ impl VirtioGpu {
         ctx_id: u32,
         rm_handle: u32,
         gem_handle: u32,
+        layout: fr::Layout,
     ) -> ForeignCommit {
         // `alloc_blob` committed the slot in an earlier hold; teardown of this
         // device may have popped it since. Recording a resource that is gone
@@ -120,7 +137,7 @@ impl VirtioGpu {
         }
         match self
             .foreign
-            .commit(r, resource_id, ctx_id, rm_handle, gem_handle)
+            .commit(r, resource_id, ctx_id, rm_handle, gem_handle, layout)
         {
             Ok(()) => ForeignCommit::Recorded,
             Err(_) => ForeignCommit::Refused,
@@ -132,6 +149,75 @@ impl VirtioGpu {
     pub fn foreign_abandon_import(&mut self, r: Reservation) {
         self.foreign.cancel(r);
         self.foreign.note_refusal(RefusalKind::Host);
+    }
+
+    /// Adopt `resource_id` for a WDDM allocation (`DxgkDdiCreateAllocation`),
+    /// foreign or not, in ONE lock hold: the decision in
+    /// `ForeignTable::adopt_for_allocation`, the facts it needs read from the
+    /// tables here, and the re-ownership of the blob slot that makes the
+    /// allocation the resource's owner.
+    ///
+    /// DISPATCH-safe like the rest of this file: table work only, no allocation,
+    /// nothing that waits. The caller releases the lock before any host round
+    /// trip, as `build_backing` does for the legacy path.
+    ///
+    /// The "same device" rule. `DxgkDdiCreateAllocation` is handed no device
+    /// handle (`DXGKARG_CREATEALLOCATION` has none), so the creator cannot be
+    /// named by the DDI. What the KMD can check is that the allocation names
+    /// the Venus context the import was made on, and that context is still the
+    /// creating device's; contexts are device-owned, so presenting it is
+    /// presenting something only that device was handed. This is not
+    /// authentication (context ids are small integers a hostile process can
+    /// guess); see the hardening list in the design note.
+    pub fn adopt_for_allocation(&mut self, resource_id: u32, req: &AdoptRequest) -> AllocAdopt {
+        let (ctx_ok, slot_ok) = match self
+            .foreign
+            .get(resource_id)
+            .and_then(|e| e.creator.map(|c| (c, e.ctx_id)))
+        {
+            Some((creator, ctx_id)) => {
+                let owner = DeviceOwner::new(creator as usize);
+                (
+                    owner.is_some() && self.resolve_owned_ctx(owner, ctx_id).is_some(),
+                    owner.is_some()
+                        && self
+                            .blobs
+                            .iter()
+                            .any(|s| s.resource_id == resource_id && s.owner == owner),
+                )
+            }
+            None => (false, false),
+        };
+        match self
+            .foreign
+            .adopt_for_allocation(resource_id, req, ctx_ok, slot_ok)
+        {
+            Ok(AdoptPlan::Legacy) => AllocAdopt::Legacy(if req.take_ownership {
+                self.adopt_blob_for_allocation(resource_id)
+            } else {
+                self.live_blob_size(resource_id)
+            }),
+            Ok(AdoptPlan::Foreign(adopted)) => {
+                // `slot_ok` was true in this hold, so the slot exists and was the
+                // creator's. KMD-owned from here: no escape-owner reclaim path
+                // reaches it, and only the allocation's destroy releases it.
+                if let Some(slot) = self.blobs.iter_mut().find(|s| s.resource_id == resource_id) {
+                    slot.owner = None;
+                }
+                AllocAdopt::Foreign(adopted)
+            }
+            Err(refusal) => AllocAdopt::Refused(refusal),
+        }
+    }
+
+    /// The layout recorded for a foreign resource, for the KMD-driven scanout
+    /// flip (`ScanoutFlip{stride, fourcc, modifier}`), the scanout copy import
+    /// (`VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` with an explicit layout) and
+    /// any importer that must not infer it from the size. `None` for a resource
+    /// that is not foreign. Valid while the resource lives (its removal drops the
+    /// record).
+    pub fn foreign_layout(&self, resource_id: u32) -> Option<fr::Layout> {
+        self.foreign.layout(resource_id)
     }
 
     /// Count a request refused before it reached any table.

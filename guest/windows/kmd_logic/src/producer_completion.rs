@@ -326,8 +326,11 @@ impl Table {
         if s.status != LIVE {
             return Err(Error::Terminal(s.status));
         }
-        if stream == 0 || value == 0 {
+        if stream == 0 {
             return Err(Error::Invalid);
+        }
+        if value == 0 {
+            return self.publish_complete(key, stream, s.announced);
         }
         let known = self
             .writers
@@ -355,6 +358,56 @@ impl Table {
             value,
             next: NONE,
             done: already_complete,
+        });
+        let a = &mut self.allocations[key.slot as usize];
+        if let Some(tail) = self.pending.get_mut(a.tail).and_then(Option::as_mut) {
+            tail.next = pending;
+        } else {
+            a.head = pending;
+        }
+        a.tail = pending;
+        a.snapshot.announced = epoch;
+        self.advance(key);
+        Ok(epoch)
+    }
+
+    /// `publish` with `value == 0`: the present is already complete (S3 of the
+    /// DXVK-on-NVK plan: a CPU-complete producer waited for its own GPU work
+    /// before announcing). There is no stream point to wait for, so:
+    ///
+    /// * the epoch is announced and completes at once when nothing older is
+    ///   pending on this allocation, without consuming a `pending` slot;
+    /// * behind an older pending epoch it queues as an already-done entry, so a
+    ///   consumer still never sees epoch N+1 before epoch N (the per-allocation
+    ///   prefix rule);
+    /// * the stream's monotonic writer value is neither read nor advanced:
+    ///   "complete" is not a position on the stream, so interleaving it with
+    ///   ordinary values cannot trip the strictly-increasing rule or consume a
+    ///   writer slot.
+    ///
+    /// Same all-checks-before-first-mutation rule as `publish`.
+    fn publish_complete(&mut self, key: Key, stream: u64, announced: u64) -> Result<u64, Error> {
+        let epoch = announced.checked_add(1).ok_or(Error::Capacity)?;
+        let a = &self.allocations[key.slot as usize];
+        if a.head == NONE {
+            let a = &mut self.allocations[key.slot as usize];
+            a.snapshot.announced = epoch;
+            a.snapshot.completed = epoch;
+            self.changed(key.slot as usize);
+            return Ok(epoch);
+        }
+        let pending = self
+            .pending
+            .iter()
+            .position(Option::is_none)
+            .ok_or(Error::Capacity)?;
+        self.pending[pending] = Some(Pending {
+            key,
+            epoch,
+            stream,
+            value: 0,
+            next: NONE,
+            done: true,
         });
         let a = &mut self.allocations[key.slot as usize];
         if let Some(tail) = self.pending.get_mut(a.tail).and_then(Option::as_mut) {
@@ -697,7 +750,7 @@ mod tests {
             (101, 900, Error::Invalid),
             (101, 899, Error::Invalid),
             (0, 1, Error::Invalid),
-            (101, 0, Error::Invalid),
+            (0, 0, Error::Invalid), // a complete publish still names a stream
             (202, 1, Error::Capacity),
         ] {
             assert_eq!(t.publish(a, stream, value, false), Err(error));
@@ -705,6 +758,85 @@ mod tests {
         }
         t.complete(101, 900);
         assert_eq!(t.publish(a, 202, 1, false), Ok(2));
+    }
+
+    #[test]
+    fn value_zero_is_already_complete_without_a_pending_slot() {
+        // One pending slot, and it is used: a complete publish must not need it.
+        let mut t = Table::new(2, 1, 2).unwrap();
+        let a = t.register(11).unwrap();
+        t.publish(a, 101, 5, false).unwrap();
+        t.complete(101, 5);
+        assert_eq!(t.snapshot(a).unwrap().completed, 1);
+        // Nothing pending: epoch 2 announces and completes together.
+        assert_eq!(t.publish(a, 101, 0, false), Ok(2));
+        let s = t.snapshot(a).unwrap();
+        assert_eq!((s.announced, s.completed), (2, 2));
+        assert_eq!(t.predicate(a, 2), Ok(Predicate::Ready));
+        // And the stream's own value namespace is untouched: 6 is next, 5 is
+        // still refused as a replay.
+        assert_eq!(t.publish(a, 101, 5, false), Err(Error::Invalid));
+        assert_eq!(t.publish(a, 101, 6, false), Ok(3));
+    }
+
+    #[test]
+    fn value_zero_never_overtakes_an_older_pending_epoch() {
+        let mut t = table();
+        let a = t.register(11).unwrap();
+        t.publish(a, 101, 1, false).unwrap(); // epoch 1, pending
+        assert_eq!(t.publish(a, 202, 0, false), Ok(2)); // epoch 2, complete
+                                                        // The consumer waiting on 2 must not run ahead of epoch 1.
+        assert_eq!(t.predicate(a, 2), Ok(Predicate::Pending));
+        assert_eq!(t.snapshot(a).unwrap().completed, 0);
+        t.complete(101, 1);
+        assert_eq!(t.snapshot(a).unwrap().completed, 2);
+        assert_eq!(t.predicate(a, 2), Ok(Predicate::Ready));
+    }
+
+    #[test]
+    fn value_zero_repeats_freely_and_takes_no_writer_slot() {
+        // Two writer slots, both free; a hundred complete publishes need none.
+        let mut t = Table::new(1, 2, 1).unwrap();
+        let a = t.register(11).unwrap();
+        for epoch in 1..=100u64 {
+            assert_eq!(t.publish(a, 101, 0, false), Ok(epoch));
+        }
+        assert_eq!(t.snapshot(a).unwrap().completed, 100);
+        // The single writer slot is still free for a real stream.
+        assert_eq!(t.publish(a, 303, 1, false), Ok(101));
+    }
+
+    #[test]
+    fn value_zero_behind_pending_needs_a_pending_slot_and_fails_atomically() {
+        let mut t = Table::new(1, 1, 2).unwrap();
+        let a = t.register(11).unwrap();
+        t.publish(a, 101, 1, false).unwrap(); // takes the only pending slot
+        let before = t.snapshot(a).unwrap();
+        assert_eq!(t.publish(a, 101, 0, false), Err(Error::Capacity));
+        assert_eq!(t.snapshot(a).unwrap(), before);
+    }
+
+    #[test]
+    fn value_zero_on_a_terminal_allocation_is_refused() {
+        let mut t = table();
+        let a = t.register(11).unwrap();
+        t.publish(a, 101, 1, false).unwrap();
+        t.fail_stream(101, FAILED);
+        assert_eq!(t.publish(a, 101, 0, false), Err(Error::Terminal(FAILED)));
+        let b = t.register(12).unwrap();
+        t.remove(b);
+        assert_eq!(t.publish(b, 101, 0, false), Err(Error::Terminal(REMOVED)));
+    }
+
+    #[test]
+    fn a_failed_stream_does_not_cancel_a_complete_epoch_that_is_already_done() {
+        let mut t = table();
+        let a = t.register(11).unwrap();
+        assert_eq!(t.publish(a, 101, 0, false), Ok(1));
+        t.fail_stream(101, FAILED);
+        // No pending entry named the stream, so the allocation is not poisoned
+        // and the epoch stays complete.
+        assert_eq!(t.predicate(a, 1), Ok(Predicate::Ready));
     }
 
     #[test]
