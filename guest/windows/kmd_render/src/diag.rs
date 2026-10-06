@@ -856,6 +856,13 @@ pub mod knobs {
     /// `FlipAnnounce` 1 (the explicit foreign mode) ignores it. Read at every StartDevice; mirrored
     /// in `FaKnob` (bit 16). The name is 14 characters, the lookup buffer's limit.
     pub const FLIP_ANN_FOREIGN: KnobName = KnobName::new(b"FlipAnnForeign");
+    /// `FlipBusyFly` (default 0, at most 4): how many pipelined `ForeignFlip` host flips may be in
+    /// flight while the worker still counts as idle for a `FlipAnnounce` (0 = none: strict: the
+    /// previous buffer is certainly no longer read when the next flip is announced; 1 lets the
+    /// announce run with one host flip in flight, trading a tear exposure of up to one more host
+    /// round trip for throughput). Only with `ForeignFlip` and `FfAsyncWin`; read once per
+    /// transport generation. `docs/kmd-rm-client.md` 15.18.15.
+    pub const FLIP_BUSY_FLY: KnobName = KnobName::new(b"FlipBusyFly");
     /// `FlipEarlyWake` (default 0): the DDI asks for the device DPC that wakes the HPD worker the
     /// moment a flip is pending, instead of the worker waiting for the next vsync tick; without
     /// an announce the retire still waits for the worker's publication (one tick earlier on
