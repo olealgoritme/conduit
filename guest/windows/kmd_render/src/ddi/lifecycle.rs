@@ -534,6 +534,38 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // StartDevice re-initializes.
         adapter.set_virtio(None);
 
+        // What the dropped transport tracked for the RM escape is gone with it:
+        // `VirtioGpu::drop` woke and released the event registrations, unlocked the
+        // pins and cleared the handle / mapping records, whether or not the owners'
+        // DestroyDevice ran first (that path then finds nothing).
+        //
+        // What it could NOT release are the user VIEWS of its host mappings: they
+        // live in `adapter.mappings`, which outlives the transport on purpose (as for
+        // blob views, they are unmapped only inside the process that made them, and
+        // this is not that process). They now point at BAR memory the host no longer
+        // backs for them, and the next generation may give the same window offsets
+        // to someone else. Mark them stale, AFTER the transport is gone (so nothing
+        // can mint an older id any more): the owner's next call into the NVRM escape
+        // unmaps them in its own process, and DestroyDevice's drain takes whatever
+        // is left.
+        let stale = adapter
+            .mappings
+            .mark_nvrm_views_stale(crate::virtio::nvrm::next_map_id());
+        let stale_total = crate::virtio::nvrm::NVRM_STALE_VIEWS
+            .fetch_add(stale, core::sync::atomic::Ordering::Relaxed)
+            .saturating_add(stale);
+        // Written now, not left to the next escape: this is the one place that
+        // knows a stop happened, and the counters may not be published for a while.
+        crate::diag::record_named_bytes(b"NvStale", stale_total);
+        crate::diag::record_named_bytes(
+            b"NvSwept",
+            crate::virtio::nvrm::NVRM_SWEPT.load(core::sync::atomic::Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"NvUnpin",
+            crate::virtio::nvrm::NVRM_UNPINS.load(core::sync::atomic::Ordering::Relaxed),
+        );
+
         // Drop the whole transport generation in one store — `bar_segment` and
         // `venus_ctx_id` together, since both are meaningless in the next
         // generation.

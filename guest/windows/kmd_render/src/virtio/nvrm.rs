@@ -73,7 +73,31 @@ const CMD_RM_FREE_LOW16: u32 = 0x4629;
 /// mapping ids stay below `0x7FFF_FFF0`; the high bit keeps the two namespaces
 /// apart.
 pub fn map_key(kmd_id: u32) -> u32 {
-    kmd_id | 0x8000_0000
+    helios_kmd_logic::nvrm_views::key(kmd_id)
+}
+
+/// The next mapping id to mint. ONE counter for the life of the driver, not one
+/// per transport: the user views these ids name live in `AdapterContext::mappings`,
+/// which outlives every transport, so a generation that restarted at 1 would put
+/// its first id on a key an older view of a surviving device handle still holds.
+static NVRM_NEXT_MAP_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Mint a mapping id (unique and nonzero for the life of the driver); `None` once
+/// the id space is used up.
+pub(crate) fn mint_map_id() -> Option<u32> {
+    NVRM_NEXT_MAP_ID
+        .fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            helios_kmd_logic::nvrm_views::successor,
+        )
+        .ok()
+}
+
+/// The id the next mapping will get: every id below it belongs to the transport
+/// generations that are gone once the current one is dropped.
+pub(crate) fn next_map_id() -> u32 {
+    NVRM_NEXT_MAP_ID.load(Ordering::Relaxed)
 }
 
 const PAGE: u64 = 4096;
@@ -126,6 +150,14 @@ pub static NVRM_EV_DROPS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_EV_LOST: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_EV_OTHER: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_EV_ERRORS: AtomicU32 = AtomicU32::new(0);
+/// What a transport found still tracked when it was dropped (handles, mappings and
+/// pins nobody had closed: dxgkrnl normally destroys every device first, so this
+/// is 0), the user views left behind by it (`NvStale`), and how many of those the
+/// owners' next calls unmapped (`NvStaleUn`). Published as `NvSwept`, `NvStale`,
+/// `NvStaleUn`.
+pub static NVRM_SWEPT: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_STALE_VIEWS: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_STALE_UNMAPPED: AtomicU32 = AtomicU32::new(0);
 
 /// Why a forward did not reach (or come back from) the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,13 +472,11 @@ pub struct PinOut {
 }
 
 /// Unlock a pin's pages and free its tables. PASSIVE, outside every lock: the
-/// contiguous table buffer cannot be freed above PASSIVE, and the pin was just
-/// removed from the table, so this is its only owner.
+/// contiguous table buffer cannot be freed above PASSIVE. The unlock itself is
+/// `NvrmPin`'s `Drop`, so a pin that goes away by ANY path (this one, a transport
+/// dropped with pins in its table) is unlocked exactly once; this names the
+/// intent at the call sites that hand a pin back by value.
 pub fn release_pin(pin: NvrmPin) {
-    // SAFETY: `pin.mdl` is the locked MDL `helios_lock_user_pages_seh` returned,
-    // released exactly once here.
-    unsafe { helios_unlock_system_buffer(pin.mdl as PMDL) };
-    NVRM_UNPINS.fetch_add(1, Ordering::Relaxed);
     drop(pin);
 }
 
@@ -991,10 +1021,48 @@ fn release_events_for_owner(adapter: &AdapterContext, owner: DeviceOwner) {
 
 // ---- teardown ----------------------------------------------------------------------
 
+/// Unmap the user views `owner` still holds of transports that no longer exist.
+///
+/// The views live in `AdapterContext::mappings`, which survives `StopDevice`, and a
+/// view can only be unmapped inside the process that made it, which `StopDevice`
+/// is not. So `StopDevice` marks them stale (`MappingTable::mark_nvrm_views_stale`)
+/// and the OWNER's next call into the KMD comes here, in its own process: the
+/// host mapping behind each view died with the old transport, and a later
+/// generation may hand the same BAR window offsets to another process, so the view
+/// must not stay readable. A process that touches one afterwards takes an access
+/// violation, which is the honest outcome of a mapping that no longer exists.
+///
+/// PASSIVE, in the owning process (an escape from its device handle). One atomic
+/// load when nothing is stale.
+pub fn reclaim_stale_views(_passive: PassiveLevel, adapter: &AdapterContext, owner: DeviceOwner) {
+    const BATCH: usize = 16;
+    let mut batch = [(0u64, 0usize); BATCH];
+    loop {
+        let n = adapter
+            .mappings
+            .drain_stale_nvrm_for(owner.raw(), &mut batch);
+        for &(va, mdl) in batch.iter().take(n) {
+            // SAFETY: PASSIVE, in the process that mapped it; the pair came from
+            // `map_io_pages_to_user_prot` and was removed from the table just now.
+            unsafe { crate::ddi::unmap_io_pages_from_user(va, mdl as *mut wdk_sys::MDL) };
+            NVRM_STALE_UNMAPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        if n < BATCH {
+            break;
+        }
+    }
+}
+
 /// Device teardown: release, on the host, everything `owner` left behind — its
 /// mappings, then its handles — and unlock its pins. Returns how many handles
 /// were closed. A close that fails is dropped — the device may be going away, and
 /// the table entry is already gone, so nothing is retried.
+///
+/// Idempotent against the transport's own teardown (`VirtioGpu::drop`, which sweeps
+/// the same tables when `StopDevice` gets there first): both take entries out of
+/// the one set of tables under the virtio lock, so whichever runs first releases
+/// them and the other finds nothing. After the transport is gone `with_virtio`
+/// fails and this does nothing at all.
 pub fn close_all_for_owner(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -1006,8 +1074,11 @@ pub fn close_all_for_owner(
     release_events_for_owner(adapter, owner);
     // After the first transport failure the host is not answering: stop sending
     // (a wedged host would cost seconds per handle) but keep clearing the tables,
-    // so no entry outlives the device handle it names.
-    let mut sending = true;
+    // so no entry outlives the device handle it names. A transport that has
+    // ALREADY failed is not asked at all.
+    let mut sending = adapter
+        .with_virtio(|v| !v.transport_failed())
+        .unwrap_or(false);
     // Mappings first. Their user views were already unmapped by the device
     // teardown's drain of `AdapterContext::mappings`; what is left is telling
     // the host, before the handles they hang off are closed.

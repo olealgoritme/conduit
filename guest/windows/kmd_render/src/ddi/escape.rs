@@ -1766,6 +1766,10 @@ fn escape_nvrm(
     hdr: &HeliosEscapeHeader,
     owner: DeviceOwner,
 ) -> NTSTATUS {
+    // First, in the owner's own process: unmap the views it still holds of a
+    // transport that was stopped (the one thing `StopDevice` could not do for it).
+    // One atomic load when there are none.
+    crate::virtio::nvrm::reclaim_stale_views(passive, adapter, owner);
     let st = escape_nvrm_op(passive, adapter, buf, hdr, owner);
     nvrm_publish_counters_if_due();
     st
