@@ -22,8 +22,12 @@ use crate::sync::FallibleArc;
 /// These leases exist only for KMD standard surfaces that VidMm evicted from
 /// Helios's BAR and that Present must continue updating. Locking without a
 /// ceiling could turn arbitrary eviction traffic into unbounded nonpageable
-/// memory. At the ceiling the paging operation fails and VidMm retains/retries
-/// the allocation instead of the driver losing content or pinning more RAM.
+/// memory. At the ceiling the lease is REFUSED, but the paging operation does
+/// not fail: `BuildPagingBuffer` may only answer STATUS_SUCCESS (VidMm
+/// bugchecks on anything else), and an eviction that stopped partway would leave
+/// the system image half garbage. The eviction copies EVERY byte first; only the
+/// bookkeeping is dropped (`PgSe`), so what is lost is later Present mirroring
+/// into the CPU view of that surface, never the snapshot itself.
 const MAX_PINNED_SYSTEM_BACKING_BYTES: u64 = 512 * 1024 * 1024;
 /// Bound interval fragmentation as well as pinned bytes. A range is one
 /// physically-contiguous run in the virtual-transfer path; ordinary
@@ -327,6 +331,16 @@ pub(crate) struct SystemBackingTable {
     /// multi-megabyte copies never run under a spinlock or raised IRQL.
     content_mutex: Option<crate::sync::PassiveMutex>,
     entries: crate::sync::SpinLock<crate::sync::FixedVec<SystemBackingEntry>>,
+    /// Allocations whose SYSTEM copy is invalid because a LOCAL_TO_SYSTEM
+    /// eviction was skipped (answered STATUS_SUCCESS, so VidMm believes the system
+    /// pages are current). A SYSTEM_TO_LOCAL page-in of such an allocation is
+    /// skipped so the host blob, which is still right, is not overwritten with
+    /// whatever the system pages hold. Own spinlock (a handful of ids, no
+    /// allocation, no blocking), so it can be marked even when the content mutex
+    /// could not be taken. See `helios_kmd_logic::paging::InvalidSet`.
+    invalid: crate::sync::SpinLock<
+        helios_kmd_logic::paging::InvalidSet<{ helios_kmd_logic::paging::INVALID_SET_CAPACITY }>,
+    >,
     /// Shared by every lease so the bound applies before probing, including
     /// temporary relocks during a partial-range transaction.
     budget: Option<FallibleArc<PinnedBackingBudget>>,
@@ -341,11 +355,29 @@ impl SystemBackingTable {
             entries: crate::sync::SpinLock::new(crate::sync::FixedVec::with_max(
                 Self::MAX_ALLOCATIONS,
             )),
+            invalid: crate::sync::SpinLock::new(helios_kmd_logic::paging::InvalidSet::new()),
             budget: FallibleArc::try_new(PinnedBackingBudget {
                 bytes: AtomicU64::new(0),
             })
             .ok(),
         }
+    }
+
+    /// Remember that `resource_id`'s system copy is invalid. Callable without the
+    /// content mutex (the mutex failing is itself a reason to call it). Returns
+    /// what the set did, so the caller can count a newly set mark or an overflow.
+    pub fn mark_system_copy_invalid(&self, resource_id: u32) -> helios_kmd_logic::paging::Mark {
+        self.invalid.lock().mark(resource_id)
+    }
+
+    /// Whether a page-in of `resource_id` must be skipped.
+    pub fn system_copy_invalid(&self, resource_id: u32) -> bool {
+        self.invalid.lock().contains(resource_id)
+    }
+
+    /// Drop the mark. Returns whether it was set.
+    pub fn clear_system_copy_invalid(&self, resource_id: u32) -> bool {
+        self.invalid.lock().clear(resource_id)
     }
 
     /// Serialize a complete backing-content transaction at PASSIVE_LEVEL.
@@ -532,7 +564,60 @@ impl SystemBackingGuard<'_> {
         self.store(resource_id, next)
     }
 
-    /// Remove every system-backing range for one allocation.
+    /// See [`SystemBackingTable::mark_system_copy_invalid`].
+    pub(crate) fn mark_system_copy_invalid(
+        &self,
+        resource_id: u32,
+    ) -> helios_kmd_logic::paging::Mark {
+        self.table.mark_system_copy_invalid(resource_id)
+    }
+
+    /// Whether a page-in of `resource_id` must be skipped (its last eviction was
+    /// skipped, so the system pages are not its content).
+    pub(crate) fn system_copy_invalid(&self, resource_id: u32) -> bool {
+        self.table.system_copy_invalid(resource_id)
+    }
+
+    /// The system copy of `resource_id` is valid again (a whole-allocation
+    /// eviction succeeded).
+    pub(crate) fn clear_system_copy_invalid(&self, resource_id: u32) -> bool {
+        self.table.clear_system_copy_invalid(resource_id)
+    }
+
+    /// The allocation's content is discarded or the allocation is gone: drop its
+    /// backing ranges AND its invalid mark. Use this, not [`Self::remove`], for
+    /// DISCARD_CONTENT and DestroyAllocation.
+    pub(crate) fn remove_all(&self, resource_id: u32) {
+        self.table.clear_system_copy_invalid(resource_id);
+        self.remove(resource_id);
+    }
+
+    /// A new transport generation begins (or the old one ended): every resource
+    /// id recorded here, range or invalid mark, belongs to a namespace that no
+    /// longer exists, and ids restart at 1 — a surviving entry would be applied
+    /// to a different live resource. Leases are released outside the spinlock.
+    pub(crate) fn reset_generation(&self) {
+        self.table.invalid.lock().clear_all();
+        loop {
+            let taken = {
+                let mut entries = self.table.entries.lock();
+                if entries.len() == 0 {
+                    None
+                } else {
+                    Some(entries.swap_remove(0))
+                }
+            };
+            match taken {
+                // PASSIVE (guard holder): the last owner may unlock pages.
+                Some(entry) => drop(entry),
+                None => break,
+            }
+        }
+    }
+
+    /// Remove every system-backing range for one allocation. Does NOT touch the
+    /// invalid mark (a failed partial transfer calls this too); see
+    /// [`Self::remove_all`].
     pub(crate) fn remove(&self, resource_id: u32) {
         let removed = {
             let mut entries = self.table.entries.lock();

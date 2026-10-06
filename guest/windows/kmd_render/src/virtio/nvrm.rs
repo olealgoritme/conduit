@@ -47,7 +47,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 use helios_kmd_logic::nvrm_fence;
 use helios_kmd_logic::page_runs;
-use helios_kmd_logic::sweep_budget::SweepBudget;
+use helios_kmd_logic::sweep_budget::{CloseTally, PinFate, SweepBudget};
 use helios_protocol::{
     HELIOS_NVRM_DEEP_PAGE_RUNS, HELIOS_NVRM_DEEP_PAGE_RUNS_INDIRECT, HELIOS_NVRM_FORWARD_MSG_TYPES,
     HELIOS_NVRM_SCANOUT_FLIP_BYTES,
@@ -141,6 +141,9 @@ pub static NVRM_MAP_QUOTA_REFUSED: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_FLIPS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_PINS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_UNPINS: AtomicU32 = AtomicU32::new(0);
+/// Pins deliberately left locked because the host never confirmed closing what
+/// aliased them (`NvPinLeak`). Nonzero means a teardown outran the host.
+pub static NVRM_PIN_LEAKS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_PIN_ERRORS: AtomicU32 = AtomicU32::new(0);
 /// Event registrations made, removed by `EVENT_UNREGISTER`, and refused. Published
 /// as `NvEvReg`, `NvEvUnreg`, `NvEvRef`. `Close`, process exit and reset remove
@@ -1268,6 +1271,9 @@ pub fn close_all_for_owner(
     let mut sending = adapter
         .with_virtio(|v| !v.transport_failed())
         .unwrap_or(false);
+    // Which of the entries taken below the host actually confirmed closed; the pins
+    // are unlocked only if it was all of them (see `release_or_leak_pin`).
+    let mut tally = CloseTally::new();
     // Mappings first. Their user views were already unmapped by the device
     // teardown's drain of `AdapterContext::mappings`; what is left is telling
     // the host, before the handles they hang off are closed.
@@ -1280,11 +1286,16 @@ pub fn close_all_for_owner(
             break;
         };
         if sending {
-            if let Err(VirtioError::Timeout) | Err(VirtioError::DeviceError) =
-                release_host_map(passive, adapter, handle, host_id)
-            {
-                sending = false;
+            match release_host_map(passive, adapter, handle, host_id) {
+                Ok(()) => tally.confirmed(),
+                Err(VirtioError::Timeout) | Err(VirtioError::DeviceError) => {
+                    sending = false;
+                    tally.failed();
+                }
+                Err(_) => tally.failed(),
             }
+        } else {
+            tally.unsent();
         }
     }
     loop {
@@ -1304,14 +1315,21 @@ pub fn close_all_for_owner(
             req[4..8].copy_from_slice(&handle.to_le_bytes());
             let mut resp = [0u8; MSG_HDR];
             match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, 5_000) {
-                Err(VirtioError::Timeout) | Err(VirtioError::DeviceError) => sending = false,
-                _ => {}
+                Ok(_) => tally.confirmed(),
+                Err(VirtioError::Timeout) | Err(VirtioError::DeviceError) => {
+                    sending = false;
+                    tally.failed();
+                }
+                Err(_) => tally.failed(),
             }
+        } else {
+            tally.unsent();
         }
         closed += 1;
     }
-    // Last: the host no longer holds an alias of the pinned pages (or is not
-    // answering and the VM is going away), so they may be unlocked.
+    // Last: every handle the host held an alias through was closed (or it was not
+    // and the pages stay locked): see `release_or_leak_pin`.
+    let fate = tally.pin_fate();
     loop {
         let pin = adapter
             .with_virtio(|v| v.take_nvrm_pin_for_owner(owner))
@@ -1320,9 +1338,29 @@ pub fn close_all_for_owner(
         let Some(pin) = pin else {
             break;
         };
-        release_pin(pin);
+        release_or_leak_pin(pin, fate);
     }
     closed
+}
+
+/// Hand a pin back according to `fate`: unlock it, or — when the host never
+/// confirmed closing what aliased it — keep it locked for good.
+///
+/// Only a pin a `FORWARD` claimed (`host_may_alias`) can be aliased by the host;
+/// an unclaimed one is unlocked either way. A leaked pin costs its locked pages,
+/// its MDL and its table buffer until the next boot, and is counted (`NvPinLeak`). Unlocking pages the GPU may still
+/// write is not a leak but a corruption: the guest would reuse that RAM underneath
+/// the host. The pin is removed from the transport's table first (the caller took
+/// it), so `VirtioGpu::drop`'s fallback sweep cannot unlock it either.
+fn release_or_leak_pin(pin: NvrmPin, fate: PinFate) {
+    match fate {
+        PinFate::Leak if pin.host_may_alias() => {
+            NVRM_PIN_LEAKS.fetch_add(1, Ordering::Relaxed);
+            core::mem::forget(pin);
+        }
+        // Confirmed closed, or never described to the host (no FORWARD claimed it).
+        PinFate::Unlock | PinFate::Leak => release_pin(pin),
+    }
 }
 
 /// Retire the live transport's NVRM state while it can still be asked: send the
@@ -1370,13 +1408,25 @@ pub fn close_all_on_host(
         return 0;
     }
     let mut sending = true;
+    // What the host confirmed closed. Entries dropped from the tables unsent (the
+    // budget spent, or an earlier command failed) and failed sends both count
+    // against `all_closed`, and then the pins are NOT unlocked: the host still
+    // holds those handles, and the doc below says it does not drop them on reset.
+    let mut tally = CloseTally::new();
     // Asked before each send: how long the next command may wait, or `None` when
-    // a timeout or error already ended sending or the budget is spent.
-    let next_timeout_ms = |sending: &mut bool| -> Option<u64> {
+    // a timeout or error already ended sending or the budget is spent. A `Close`
+    // may wait longer than the other commands (`close_timeout_ms`): freeing a
+    // device handle's VRAM is slow, and an unconfirmed Close costs the pins.
+    let next_timeout_ms = |sending: &mut bool, close: bool| -> Option<u64> {
         if !*sending {
             return None;
         }
-        let timeout = budget.call_timeout_ms(crate::adapter::foreign_scanout::now_100ns());
+        let now = crate::adapter::foreign_scanout::now_100ns();
+        let timeout = if close {
+            budget.close_timeout_ms(now)
+        } else {
+            budget.call_timeout_ms(now)
+        };
         if timeout.is_none() {
             *sending = false;
         }
@@ -1391,10 +1441,15 @@ pub fn close_all_on_host(
         let Some((handle, host_id)) = map else {
             break;
         };
-        if let Some(timeout_ms) = next_timeout_ms(&mut sending) {
+        if let Some(timeout_ms) = next_timeout_ms(&mut sending, false) {
             if release_host_map_within(passive, adapter, handle, host_id, timeout_ms).is_err() {
                 sending = false;
+                tally.failed();
+            } else {
+                tally.confirmed();
             }
+        } else {
+            tally.unsent();
         }
     }
     let mut closed = 0u32;
@@ -1412,19 +1467,27 @@ pub fn close_all_on_host(
         // A foreign scanout source on this file ends with it (a no-op after
         // `StopDevice` already reset the display state).
         adapter.foreign_scanout_release_handle(owner, handle);
-        if let Some(timeout_ms) = next_timeout_ms(&mut sending) {
+        if let Some(timeout_ms) = next_timeout_ms(&mut sending, true) {
             let mut req = [0u8; MSG_HDR];
             req[..4].copy_from_slice(&MSG_CLOSE.to_le_bytes());
             req[4..8].copy_from_slice(&handle.to_le_bytes());
             let mut resp = [0u8; MSG_HDR];
             if ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, timeout_ms).is_err() {
                 sending = false;
+                tally.failed();
+            } else {
+                tally.confirmed();
             }
+        } else {
+            tally.unsent();
         }
         closed += 1;
     }
-    // Last: the host has closed what held the pages (or is not answering and the
-    // transport is about to be reset), so they may be unlocked.
+    // Last: the pins. Unlocked only if the host confirmed every close above; if
+    // sending stopped early they stay locked (leaked, `NvPinLeak`), because the
+    // host keeps its RM files across a device reset and the GPU may still write
+    // pages it registered. Leaked locked pages are safe; DMA into reused RAM is not.
+    let fate = tally.pin_fate();
     loop {
         let pin = adapter
             .with_virtio(|v| v.take_nvrm_pin_any())
@@ -1433,7 +1496,7 @@ pub fn close_all_on_host(
         let Some(pin) = pin else {
             break;
         };
-        release_pin(pin);
+        release_or_leak_pin(pin, fate);
     }
     closed
 }
@@ -1458,6 +1521,9 @@ pub fn retire_transport(
     adapter.set_virtio(None);
     // Its handles were closed by the sweep (or died with the transport): forget them.
     super::rm_client::forget();
+    // The mapping table died with the transport; the gauge is only refreshed by a
+    // table change, so without this it kept the last total until the next push.
+    NVRM_MAP_BYTES.store(0, Ordering::Relaxed);
     if had {
         mark_views_stale(adapter);
     }

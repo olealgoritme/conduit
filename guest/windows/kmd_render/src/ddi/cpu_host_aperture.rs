@@ -341,7 +341,7 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
         // only bump atomics and defer; it must NEVER call dump_bar_ap_counters,
         // because RtlWriteRegistryValue above PASSIVE is the same invariant
         // violation R307 removed from the paging path.
-        let already_mapped = unsafe { paging_alloc_info(args.hAllocation) }
+        let already_mapped = unsafe { paging_alloc_info(adapter, args.hAllocation) }
             .filter(|a| a.bar_eligible)
             .inspect(|a| note_size_provenance(adapter, a))
             .and_then(|a| {
@@ -378,7 +378,7 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
     // even by accident. That refusal is the reason `assume()` counts rather than
     // returning a Result — STATUS_UNSUCCESSFUL here costs the whole VidPn.
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
-    let Some(alloc) = (unsafe { paging_alloc_info(args.hAllocation) }) else {
+    let Some(alloc) = (unsafe { paging_alloc_info(adapter, args.hAllocation) }) else {
         BAR_AP_ERR_ALLOC.fetch_add(1, Ordering::Relaxed);
         dump_bar_ap_counters();
         return STATUS_NO_MEMORY;

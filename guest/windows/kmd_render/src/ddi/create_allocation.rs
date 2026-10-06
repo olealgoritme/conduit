@@ -59,6 +59,12 @@ struct AllocationContext {
     magic: u32,
     ctx_id: u32,
     resource_id: u32,
+    /// The transport generation this allocation (and so `resource_id`) belongs
+    /// to: [`crate::adapter::TransportGeneration::serial`] at creation, 0 if none
+    /// was up. Resource ids restart at 1 in every generation, so an id means
+    /// nothing — or something else — once the serial no longer matches. Every
+    /// resolve that acts on `resource_id` goes through [`resolve_current_alloc`].
+    serial: u64,
     owns_resource: bool,
     /// Nonzero for KMD-backed standard allocations: the kernel venus client's
     /// `VkDeviceMemory` object id behind the blob, freed (`vkFreeMemory`) at
@@ -197,6 +203,12 @@ struct AllocationContext {
     vidmm_tracker_cookie: u32,
 }
 
+/// Resolutions refused because the allocation context was created by an older
+/// transport generation than the one now up (or none is up): `PgStale`. After a
+/// StopDevice/StartDevice an old `hAllocation` can still reach the paging DDIs
+/// and DestroyAllocation; its resource id names a different live blob (or none).
+pub(crate) static STALE_ALLOC_REFUSED: AtomicU32 = AtomicU32::new(0);
+
 /// Per-resource KMD state. Dxgkrnl requires a non-null KMD resource handle for
 /// `Flags.Resource` CreateAllocation calls (not just per-allocation handles);
 /// the handle is opaque to us until DestroyAllocation carries it back.
@@ -239,6 +251,8 @@ struct OpenAllocationContext {
     present: Option<PresentAllocInfo>,
     /// Trace-only companion; never read by a decision path.
     present_diag: Option<PresentAllocDiag>,
+    /// Transport generation this open belongs to (see `AllocationContext::serial`).
+    serial: u64,
     /// Exact process/resource authorization installed in the dedicated
     /// Present-buffer registry for this open. Kept in the open handle so every
     /// failure unwind and CloseAllocation releases precisely what it acquired.
@@ -249,6 +263,9 @@ struct OpenAllocationContext {
 struct PresentBufferOpenCapability {
     resource_id: u32,
     creator_process: usize,
+    /// Generation that authorized it: releasing it in another generation would
+    /// release a DIFFERENT resource's open slot.
+    serial: u64,
 }
 
 /// Surface identity + geometry for a Present allocation-list entry, resolved from
@@ -509,10 +526,22 @@ pub(crate) const fn scanout_dxgi_for_primary() -> DxgiFormat {
 /// SAFETY: `h` must be an `hDeviceSpecificAllocation` value the KMD returned from
 /// `DxgkDdiOpenAllocation` (dxgkrnl round-trips it unmodified in command/present
 /// allocation lists) and still open (not yet `CloseAllocation`-freed).
-pub unsafe fn present_alloc_info(h: HANDLE) -> Option<PresentAllocInfo> {
+///
+/// An open created in another transport generation than the one `adapter` has up
+/// resolves to `None`: its resource id means something else now. (`adapter` is
+/// `None` only when the present context could not name one; no check is possible
+/// then, and nothing can be presented anyway.)
+pub unsafe fn present_alloc_info(
+    adapter: Option<&AdapterContext>,
+    h: HANDLE,
+) -> Option<PresentAllocInfo> {
     // SAFETY: validated by `open_allocation_context`, which reads the magic
     // through an unaligned raw read before forming any reference.
     let open = unsafe { open_allocation_context(h)? };
+    if adapter.is_some_and(|a| !a.is_current_generation(open.serial)) {
+        STALE_ALLOC_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     open.present
 }
 
@@ -625,6 +654,33 @@ unsafe fn resolve_alloc(h: HANDLE) -> Option<&'static AllocationContext> {
     (ctx.magic == ALLOCATION_CTX_MAGIC).then_some(ctx)
 }
 
+/// [`resolve_alloc`] for every caller that ACTS ON `resource_id`: the handle must
+/// also belong to the transport generation that is up now.
+///
+/// Resource ids restart at 1 in each generation, and the magic is a constant, so
+/// an allocation created before StopDevice and used after StartDevice resolved
+/// fine and carried an id that named a DIFFERENT live blob of the new generation —
+/// a page-in then wrote its stale bytes into someone else's resource, and a
+/// destroy freed it. `None` here is the "provably unreachable" case: nothing this
+/// driver holds corresponds to that handle any more.
+///
+/// DISPATCH-safe (atomics and published state only).
+///
+/// # Safety
+/// As [`resolve_alloc`].
+unsafe fn resolve_current_alloc(
+    adapter: &AdapterContext,
+    h: HANDLE,
+) -> Option<&'static AllocationContext> {
+    let ctx = unsafe { resolve_alloc(h) }?;
+    if adapter.is_current_generation(ctx.serial) {
+        Some(ctx)
+    } else {
+        STALE_ALLOC_REFUSED.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
+
 /// Geometry `DxgkDdiDescribeAllocation` reports, from a magic-checked handle.
 pub(crate) struct DescribeInfo {
     pub width: u32,
@@ -690,8 +746,14 @@ unsafe fn describe_alloc_info(h: HANDLE) -> Option<DescribeInfo> {
 ///
 /// SAFETY: `h` must be an in-flight paging op's `hAllocation` (dxgkrnl keeps
 /// the allocation alive across its paging operations).
-pub(crate) unsafe fn paging_alloc_info(h: HANDLE) -> Option<PagingAllocInfo> {
-    let ctx = unsafe { resolve_alloc(h) }?;
+///
+/// `None` also for an allocation of another transport generation (see
+/// [`resolve_current_alloc`]): every paging arm treats that as unknown.
+pub(crate) unsafe fn paging_alloc_info(
+    adapter: &AdapterContext,
+    h: HANDLE,
+) -> Option<PagingAllocInfo> {
+    let ctx = unsafe { resolve_current_alloc(adapter, h) }?;
     Some(PagingAllocInfo {
         resource_id: ctx.resource_id,
         size: ctx.size as u64,
@@ -1051,12 +1113,12 @@ pub(crate) unsafe fn allocation_resource_id(h: HANDLE) -> u32 {
 /// dxgkrnl passes in `SetVidPnSourceAddress`) to its scan-out geometry + layout
 /// for `SET_SCANOUT_BLOB`. Returns `None` for a null/foreign handle or an
 /// unbacked allocation. SAFETY: same contract as [`paging_alloc_info`].
-pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<WindowsPrimary> {
-    if h.is_null() {
-        return None;
-    }
-    let ctx = unsafe { &*(h as *const AllocationContext) };
-    if ctx.magic != ALLOCATION_CTX_MAGIC || ctx.resource_id == 0 {
+pub(crate) unsafe fn scanout_alloc_info(
+    adapter: &AdapterContext,
+    h: HANDLE,
+) -> Option<WindowsPrimary> {
+    let ctx = unsafe { resolve_current_alloc(adapter, h) }?;
+    if ctx.resource_id == 0 {
         return None;
     }
     // Acquire on the address pairs with the Release in
@@ -1368,12 +1430,17 @@ struct ScanoutAllocSlot {
     /// Box is leaked into `info.hAllocation`, and cleared in
     /// `destroy_allocation_ctx` BEFORE the Box is dropped.
     allocation: core::sync::atomic::AtomicUsize,
+    /// Transport generation of the registered allocation
+    /// ([`AllocationContext::serial`]), stored so a newer generation's allocation
+    /// can take over an id an older one still holds without dereferencing it.
+    serial: AtomicU64,
 }
 
 impl ScanoutAllocSlot {
     const NEW: Self = Self {
         resource_id: AtomicU32::new(0),
         allocation: core::sync::atomic::AtomicUsize::new(0),
+        serial: AtomicU64::new(0),
     };
 }
 
@@ -1385,9 +1452,24 @@ static SCANOUT_ALLOCS: [ScanoutAllocSlot; SCANOUT_ALLOC_SLOTS] =
 pub(crate) static SCANOUT_ALLOC_FULL: AtomicU32 = AtomicU32::new(0);
 
 /// Publish `allocation` as the global handle for `resource_id`.
-fn register_scanout_allocation(resource_id: u32, allocation: usize) {
+fn register_scanout_allocation(resource_id: u32, allocation: usize, serial: u64) {
     if resource_id == 0 || allocation == 0 {
         return;
+    }
+    // An entry already carrying this id from an OLDER transport generation (ids
+    // restart at 1 and are unique within one generation): the new allocation takes
+    // it over, instead of sitting behind a stale entry that every lookup by id
+    // would find first. The stale allocation's own destroy withdraws by handle
+    // (`unregister_scanout_allocation_handle`) and so leaves this alone. Same-
+    // generation duplicates (an importer carrying the creator's id) are untouched.
+    for slot in SCANOUT_ALLOCS.iter() {
+        if slot.resource_id.load(Ordering::Acquire) == resource_id
+            && slot.serial.load(Ordering::Acquire) != serial
+        {
+            slot.allocation.store(allocation, Ordering::Release);
+            slot.serial.store(serial, Ordering::Release);
+            return;
+        }
     }
     for slot in SCANOUT_ALLOCS.iter() {
         // Claim by resource id. Venus resource ids are monotonic and never
@@ -1399,6 +1481,7 @@ fn register_scanout_allocation(resource_id: u32, allocation: usize) {
             .is_ok()
         {
             slot.allocation.store(allocation, Ordering::Release);
+            slot.serial.store(serial, Ordering::Release);
             return;
         }
     }
@@ -1418,6 +1501,21 @@ fn unregister_scanout_allocation(resource_id: u32) {
             slot.allocation.store(0, Ordering::Release);
             slot.resource_id.store(0, Ordering::Release);
             return;
+        }
+    }
+}
+
+/// Withdraw every registration that names `allocation` (a handle, not an id): the
+/// stale-generation destroy must not touch a slot that the CURRENT generation's
+/// allocation with the same resource id owns.
+fn unregister_scanout_allocation_handle(allocation: usize) {
+    if allocation == 0 {
+        return;
+    }
+    for slot in SCANOUT_ALLOCS.iter() {
+        if slot.allocation.load(Ordering::Acquire) == allocation {
+            slot.allocation.store(0, Ordering::Release);
+            slot.resource_id.store(0, Ordering::Release);
         }
     }
 }
@@ -1878,6 +1976,26 @@ unsafe fn destroy_allocation_ctx(
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
     adapter.producer.remove_allocation(allocation_handle);
     adapter.vidmm_trackers.remove(ctx.vidmm_tracker_cookie);
+    // An allocation of an OLDER transport generation (created before a StopDevice
+    // and destroyed after the next StartDevice, or while no transport is up).
+    // Everything below is keyed by `ctx.resource_id` / `ctx.venus_memory_id` and
+    // would act on the CURRENT generation's tables: resource ids restart at 1, so
+    // it would unref, detach and `vkFreeMemory` a different live resource, and
+    // withdraw its scan-out registration. The old generation's host objects died
+    // with its transport (device reset, venus context destroyed), so there is
+    // nothing of this allocation's left to tear down; only the guest pointers that
+    // name its Box must go before the Box does.
+    if !adapter.is_current_generation(ctx.serial) {
+        STALE_ALLOC_REFUSED.fetch_add(1, Ordering::Relaxed);
+        crate::diag::record_named_bytes(b"AllocStale", ctx.resource_id);
+        unregister_scanout_allocation_handle(allocation_handle);
+        // Resource id 0: cancels a deferred SetVidPnSourceAddress that still names
+        // this exact handle (so the display worker cannot dereference the freed
+        // Box), and touches no resource-keyed state.
+        let _ = adapter.retire_scanout_allocation(passive, allocation_handle, 0);
+        drop(ctx);
+        return;
+    }
     // Withdraw the DMA-flip lookup FIRST: after this no Present can resolve
     // this resource id to a handle whose Box is about to be dropped.
     unregister_scanout_allocation(ctx.resource_id);
@@ -1894,7 +2012,8 @@ unsafe fn destroy_allocation_ctx(
     // this resource. After the guard is acquired, no stale backing snapshot can
     // write after teardown withdraws the entry.
     if let Some(content_guard) = adapter.system_backings.serialize(passive) {
-        content_guard.remove(ctx.resource_id);
+        // Ranges AND the "system copy invalid" mark: the id is gone for good.
+        content_guard.remove_all(ctx.resource_id);
     } else {
         // An infinite, non-alertable kernel-mutex wait has no normal failure
         // status. If the kernel nevertheless reports one, there is no safe way
@@ -2808,6 +2927,7 @@ unsafe fn create_one(
         magic: ALLOCATION_CTX_MAGIC,
         ctx_id: ap.ctx_id,
         resource_id,
+        serial: adapter.current_transport_serial().unwrap_or(0),
         owns_resource,
         venus_memory_id,
         venus_image_id,
@@ -2864,6 +2984,7 @@ unsafe fn create_one(
     // ── VidMm metadata: segment placement + CPU visibility ──────────────────
     let is_direct_scanout = ctx.direct_scanout;
     let ctx_resource_id = ctx.resource_id;
+    let ctx_serial = ctx.serial;
     if adapter
         .producer
         .register_allocation((&*ctx as *const AllocationContext) as usize)
@@ -2884,7 +3005,7 @@ unsafe fn create_one(
     // Register AFTER the Box is leaked, so the pointer published here is the
     // one dxgkrnl will hand back.
     if is_direct_scanout {
-        register_scanout_allocation(ctx_resource_id, info.hAllocation as usize);
+        register_scanout_allocation(ctx_resource_id, info.hAllocation as usize, ctx_serial);
     }
     info.Size = vidmm_size;
     info.PitchAlignedSize = vidmm_size;
@@ -3178,6 +3299,13 @@ fn release_present_buffer_capability(
     let Some(capability) = capability else {
         return;
     };
+    // The slot belongs to the generation that authorized it. In another one the
+    // same resource id is a different resource's slot, and the table that held
+    // this one is gone with its transport.
+    if !adapter.is_current_generation(capability.serial) {
+        STALE_ALLOC_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let _ = adapter.with_virtio(|v| {
         v.release_present_buffer_open(capability.resource_id, capability.creator_process)
     });
@@ -3348,6 +3476,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                     Ok(true) => Some(PresentBufferOpenCapability {
                         resource_id,
                         creator_process,
+                        serial: adapter.current_transport_serial().unwrap_or(0),
                     }),
                     Ok(false) => {
                         unsafe { unwind_opens(adapter, args, i) };
@@ -3365,6 +3494,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             magic: OPEN_ALLOCATION_CTX_MAGIC,
             present,
             present_diag,
+            serial: adapter.current_transport_serial().unwrap_or(0),
             present_buffer_capability,
         });
         let registered = crate::adapter::producer::with_allocation_reference(

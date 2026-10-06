@@ -330,8 +330,8 @@ unsafe fn dxgkddi_present_inner(
         .destination()
         .map(|allocation| allocation.handle())
         .unwrap_or(core::ptr::null_mut());
-    let src_info = unsafe { present_alloc_info(src_handle) };
-    let dst_info = unsafe { present_alloc_info(dst_handle) };
+    let src_info = unsafe { present_alloc_info(adapter, src_handle) };
+    let dst_info = unsafe { present_alloc_info(adapter, dst_handle) };
     if payload_has_list {
         PRESENT_LAST_SRC_OPEN_LOW.store(src_handle as usize as u32, Ordering::Relaxed);
         PRESENT_LAST_DST_OPEN_LOW.store(dst_handle as usize as u32, Ordering::Relaxed);
@@ -1567,13 +1567,14 @@ unsafe fn fast_bind_from_flip(
     }
     // SAFETY: per this function's contract — the handle dxgkrnl placed in the
     // present allocation list, which the caller has already resolved once.
-    let source = match unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) } {
-        Some(source) if source.direct_scanout => source,
-        _ => {
-            crate::ddi::scanout_trace::note_fast_bind_skip(skip::NOT_DIRECT);
-            return;
-        }
-    };
+    let source =
+        match unsafe { crate::ddi::create_allocation::scanout_alloc_info(adapter, h_alloc) } {
+            Some(source) if source.direct_scanout => source,
+            _ => {
+                crate::ddi::scanout_trace::note_fast_bind_skip(skip::NOT_DIRECT);
+                return;
+            }
+        };
     // D4b: a carried snapshot descriptor substitutes the BIND TARGET, by value
     // (`from_snapshot_descriptor` re-runs the same layout validation the
     // Present arm already passed). Structurally-unreachable failure falls back
@@ -2341,10 +2342,11 @@ unsafe fn program_vidpn_source_inner(
         crate::diag::record_named_bytes(b"VpSA", source_address_n);
     }
 
-    let source = match unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) } {
-        Some(source) => source,
-        None => return Err(ScanoutReject::BadAlloc),
-    };
+    let source =
+        match unsafe { crate::ddi::create_allocation::scanout_alloc_info(adapter, h_alloc) } {
+            Some(source) => source,
+            None => return Err(ScanoutReject::BadAlloc),
+        };
     trace.source_resource = source.resource_id;
     if source.direct_scanout {
         trace.flags |= flags::DIRECT;
