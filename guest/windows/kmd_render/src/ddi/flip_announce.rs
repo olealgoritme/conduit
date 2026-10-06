@@ -138,6 +138,10 @@ fn accepted(resource: u32) -> bool {
 pub(crate) fn worker_idle(adapter: &AdapterContext) -> bool {
     adapter.pending_vidpn_allocation.load(Ordering::Acquire) == 0
         && !gate_active(adapter.vidpn_programming.load(Ordering::Acquire))
+        // The gate drops when the programming (bind, `take`) returns, but the ForeignFlip host
+        // flip of that picture is the worker's LATER step (paced, windowed, asynchronous): the
+        // previous buffer is still read until it is done.
+        && !crate::virtio::foreign_flip::busy()
 }
 
 /// First thing in every `SetVidPnSourceAddress` with a mode on: forget an announcement the

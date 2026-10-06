@@ -106,6 +106,12 @@ static SHOWN_RESID: AtomicU32 = AtomicU32::new(0);
 /// `rm_present` flags carry can be taken by the level 5 service in the one pass that stands
 /// down, this one cannot be.
 static OWED: AtomicU32 = AtomicU32::new(0);
+/// Programmings taken ([`take`]) and programmings the service pass has served ([`served`]: its
+/// host flip was submitted or done, or nothing is owed any more). `TAKEN != SERVED` is a frame
+/// still owed in the presenter (waiting for its pacing, its window slot, a retry): the part of
+/// [`busy`] that `OWED` alone cannot see, because `OWED` is consumed at the start of the pass.
+static TAKEN: AtomicU32 = AtomicU32::new(0);
+static SERVED: AtomicU32 = AtomicU32::new(0);
 static YIELDS: AtomicU32 = AtomicU32::new(0);
 /// Until when (interrupt time, 100 ns) a failed registration or flip keeps [`program`] from
 /// taking another allocation (the presenter's own retry pause; 0 = none).
@@ -397,6 +403,8 @@ pub(crate) fn forget() {
     }
     SHOWN_RESID.store(0, Ordering::Release);
     OWED.store(0, Ordering::Release);
+    TAKEN.store(0, Ordering::Release);
+    SERVED.store(0, Ordering::Release);
     YIELDS.store(0, Ordering::Relaxed);
     RESTART_AT.store(0, Ordering::Release);
     FAIL_UNTIL.store(0, Ordering::Release);
@@ -438,6 +446,25 @@ pub(crate) fn forget() {
 /// shared frame and resume edges alone then (they are this arm's).
 pub(crate) fn holds_screen() -> bool {
     SHOWN_RESID.load(Ordering::Acquire) != 0
+}
+
+/// Whether this arm still has the previous picture in hand: atomics only, any IRQL. `FlipAnnounce`
+/// reads it at the `SetVidPnSourceAddress` DDI: an announce hands the PREVIOUS buffer back to the
+/// compositor one tick early, which is safe only if the host no longer reads it. Busy while
+/// (a) a programming's frame is owed (`OWED`, or taken and not yet served: waiting for the
+/// presenter's pacing, a full window, a retry), (b) a pipelined host flip is in flight within its
+/// timeout (`FLYING`), or (c) a synchronous host flip is inside its round trip (a taken
+/// programming is served only after `flip` returned). A flip abandoned after its timeout does
+/// not count (the timeout already bounds the wait; it would otherwise hold the announce for 3 s).
+pub(crate) fn busy() -> bool {
+    OWED.load(Ordering::Acquire) != 0
+        || TAKEN.load(Ordering::Acquire) != SERVED.load(Ordering::Acquire)
+        || FLYING.load(Ordering::Acquire) != 0
+}
+
+/// The service pass that started when `TAKEN` read `seen` served every programming up to it.
+fn served(seen: u32) {
+    SERVED.store(seen, Ordering::Release);
 }
 
 /// Whether the pipelined flip is on (`FfAsyncWin` != 0): one atomic load, legal at any IRQL.
@@ -681,6 +708,7 @@ fn take(
         Change::New => 0,
     };
     // A frame is owed for every programming, also of the same allocation again.
+    TAKEN.fetch_add(1, Ordering::AcqRel);
     OWED.store(1, Ordering::Release);
     EDGES.fetch_add(1, Ordering::Relaxed);
     rm_present::note_frame_edge(adapter);
@@ -765,6 +793,7 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         // Nothing of this arm is shown or registered: a held repeat has nothing to repeat, and
         // its wake time must not stay in the shared word (a past time is a 1 ms timer for ever).
         drop_held();
+        served(TAKEN.load(Ordering::Acquire));
         if OCCUPIED.load(Ordering::Acquire) != 0 {
             arm_async_wake();
         }
@@ -938,6 +967,8 @@ fn note_rtt(us: u32) {
 
 #[inline(never)]
 fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
+    // Every programming taken before this point is served by the terminal act of this pass.
+    let seen = TAKEN.load(Ordering::Acquire);
     // A presenter that gave up waits out its pause whatever wakes the worker.
     let restart_at = RESTART_AT.load(Ordering::Acquire);
     if let Some(wake) = rs::restart_pause(restart_at, now()) {
@@ -1043,10 +1074,14 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
             let at = now().saturating_add(rs::RESTART_AFTER_GIVING_UP_100NS);
             RESTART_AT.store(at, Ordering::Release);
             rm_present::set_wake_at(at);
+            served(seen);
             return;
         }
         match act {
-            Act::Idle => return,
+            Act::Idle => {
+                served(seen);
+                return;
+            }
             Act::WaitUntil(at) => {
                 WAIT_N.fetch_add(1, Ordering::Relaxed);
                 rm_present::set_wake_at(at);
@@ -1062,6 +1097,7 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
             }
             Act::Withdraw => {
                 withdraw(adapter);
+                served(seen);
                 return;
             }
             Act::CopyFlip { slot } | Act::Reflip { slot } => {
@@ -1072,6 +1108,9 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
                         // act of this pass is `Idle`, or the next programming's).
                         Submit::Sent => {
                             crate::ddi::flip_lat::note_host_submit(now());
+                            // In flight within its timeout (`FLYING`, mirrored before this
+                            // returned): `busy` covers it from here.
+                            served(seen);
                             continue;
                         }
                         // Not now: the frame stays owed and the pass ends. The answer that
@@ -1086,6 +1125,9 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
                         }
                         Submit::Done(result) => {
                             finish(epoch, slot, copied, result);
+                            if result != FlipResult::Yielded {
+                                served(seen);
+                            }
                             rm_present::set_wake_at(
                                 now().saturating_add(
                                     helios_kmd_logic::rm_present::RETRY_AFTER_FAIL_100NS,
@@ -1105,6 +1147,11 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
                     }
                 }
                 finish(epoch, slot, copied, result);
+                // The round trip is over: the host no longer reads the previous picture. A
+                // yielded flip is still owed and stays busy.
+                if result != FlipResult::Yielded {
+                    served(seen);
+                }
                 if result != FlipResult::Shown {
                     rm_present::set_wake_at(
                         now().saturating_add(helios_kmd_logic::rm_present::RETRY_AFTER_FAIL_100NS),
