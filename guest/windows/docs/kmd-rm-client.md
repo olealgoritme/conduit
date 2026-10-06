@@ -2008,8 +2008,8 @@ opt-in (15.5) or the Venus fallback of 15.14 point 3. 13c. **Two apps at once:**
 
 Status: written on `kmd/option-b-foreign` against v319 (`dcc265c`). Gated by the service-key knob `ForeignFlip`
 (REG_DWORD under `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`, **default 0 = off, and then every path is the
-one v319 runs**: one relaxed load in the display hook and in the worker, nothing written to the service key).
-Pure logic: `kmd_logic::foreign_flip` (19 tests, 808 in the crate). I/O: `virtio/foreign_flip.rs`. Small hooks in
+one v319 runs**; the cost of the off state is stated exactly in 15.18.8).
+Pure logic: `kmd_logic::foreign_flip` (21 tests, 810 in the crate). I/O: `virtio/foreign_flip.rs`. Small hooks in
 `display.rs`, `adapter/scanout.rs`, `adapter/foreign_scanout.rs`, `virtio/nvrm.rs`, `ddi/hpd.rs`, `ddi/submit_command.rs`,
 `rm_client/sysmem_flip.rs`.
 
@@ -2046,7 +2046,7 @@ Answer. **Neither as they stood, and both pieces are reused.**
 | hook in `program_vidpn_source_inner` | the level 5 arm (`NotOurs` for anything else, then `other_source`) | a second arm after it: `foreign_flip::program` |
 | arbiter | `resident_set` with any owner token; `present` / `mint` prove the owner's file; ends on `release_handle`, `release_owner`, an invalid handle, a transport reset | the resident accessors could not tell a KMD resident from a user device's: `resident_state_of` / `resident_drop_of` (class-aware), so the level 5 presenter cannot withdraw the other class's source and vice versa |
 | presenter | `rm_present::Presenter` with a ring of one, `rm_sysmem::flip_inputs`, the restart pause | a second instance (`virtio/foreign_flip.rs`) with its own edge flag, so the one pass in which the level 5 service stands down cannot take its edge |
-| file-close hazard | none (the KMD's own file is its own) | `ForeignTable::file_closed` / `owner_closed` poison every record made from a closed file; hooks in `foreign_scanout_release_handle` / `_release_owner`; the arm refuses a poisoned record and drops a shown one |
+| file-close hazard | none (the KMD's own file is its own) | `ForeignTable::file_closed` / `owner_closed` poison every record made from a closed file; hooks in `foreign_scanout_release_handle` / `_release_owner` (both before the arbiter's `STATE` block, so a normal device exit finds no target to flip instead of costing the presenter a refused-flip strike); the arm refuses a poisoned record and drops a shown one |
 | completion / reuse | `ScanoutFlushToken`, the read ledger (Venus flush); the host release book enters every `present_within` flip | decided: the conservative rule (15.18.5); nothing waits |
 | gate | none | the knob `ForeignFlip`, counters `Ff*` |
 
@@ -2074,10 +2074,27 @@ stashes the allocation and `process_deferred_vidpn_source_address` calls the sam
 | 3 | the record is the KMD's own sysmem | `Sysmem`: the level 5 arm's | nothing |
 | 4 | `KmdRmClient` not read yet / 3 or 4 | refuse `LevelUnread` (2) / `RingLevel` (1) | `FfRef`, `FfRef02` / `FfRef01` |
 | 5 | no transport / display half off / host lacks the RM import (config bits 13 and 10) | refuse `NoTransport` (3) / `NoDisplay` (4) / `HostCap` (5) | `FfRef03` to `FfRef05` |
-| 6 | not adopted / destroyed / the importer closed the file (poisoned) / the KMD's own vidmem import | refuse `NotAdopted` (6) / `Destroyed` (7) / `FileClosed` (8) / `KmdOwned` (9) | `FfRef06` to `FfRef09` |
-| 7 | the recorded layout is not a `ScanoutFlip` layout (extent under 64, format) / its extent is not the mode's | refuse `BadLayout` (10) / `Extent` (11) | `FfRef10`, `FfRef11` |
-| 8 | the importer's `rm_handle` is not that device's DRM file in this transport generation | refuse `OwnerGone` (12) | `FfRef12` |
-| 9 | otherwise | `Take(target)`: `{resid, owner = the importer's token, drm = rm_handle, gem, epoch, layout}` | `FfProg` |
+| 6 | **flips are failing**: the presenter gave up (its restart pause is pending), or a registration or a flip failed within the presenter's 100 ms retry pause | refuse `Failing` (13) | `FfRef13` |
+| 7 | not adopted / destroyed / the importer closed the file (poisoned) / the KMD's own vidmem import | refuse `NotAdopted` (6) / `Destroyed` (7) / `FileClosed` (8) / `KmdOwned` (9) | `FfRef06` to `FfRef09` |
+| 8 | the allocation carries `MISC_DIRECT_SCANOUT` (the fast bind of a flip, `fast_bind_from_flip`, would race the resident source for the screen; DWM-on-NVK's allocations never carry it) | refuse `DirectScanout` (14) | `FfRef14` |
+| 9 | the recorded layout is not a `ScanoutFlip` layout (extent under 64, format) / its extent is not the mode's | refuse `BadLayout` (10) / `Extent` (11) | `FfRef10`, `FfRef11` |
+| 10 | the importer's `rm_handle` is not that device's DRM file in this transport generation | refuse `OwnerGone` (12) | `FfRef12` |
+| 11 | otherwise | `Take(target)`: `{resid, owner = the importer's token, drm = rm_handle, gem, epoch, layout}` | `FfProg` |
+
+Rows 4 and 5 refuse before anything about the record is read, and the order of every row is pinned by a test
+(`refusal_precedence_is_the_tables_order`: a record that is unadopted, destroyed, closed, KMD-owned, direct, unusable
+and ownerless is refused for each reason in turn as the earlier ones are removed).
+
+**Falling back when flips stop working.** Without row 6 a host that never answers `ScanoutFlip` (or a presenter that
+gave up and waits five seconds) would leave every new `SetVidPnSourceAddress` taken with no bind and no
+`SET_SCANOUT_BLOB`: a frozen screen. `failing` (`kmd_logic::foreign_flip::failing`, pure) is true while the presenter
+has given up and not been reset, while `RESTART_AT` is in the future (`rm_sysmem::restart_pause`), and while
+`FAIL_UNTIL` is in the future (set to now + 100 ms by every failed registration and every failed flip). Every pause
+ENDS, so the arm is used again by itself; nothing sticks. A refusal runs `other_source`, which forgets a shown target and
+wakes the worker, whose next pass withdraws this class's resident source (the presenter's `ready = false` answer is
+`Withdraw` before any retry pause is looked at), so the Venus desktop flush comes back; a transport that never answers
+therefore alternates, at worst, between a flip attempt per 100 ms strike and the Venus path, and settles on the Venus
+path for five seconds after the third strike.
 
 `FfWhy` is the last reason's code. A refusal always lands on the v319 Venus path (the KMD copy of the foreign resource,
 `ForeignCopy`). The record's layout is mandatory at import and validated against the size, so "layout missing" is the layout
@@ -2198,7 +2215,9 @@ shown.
 
 | where | failure | effect | fallback |
 |---|---|---|---|
-| knob 0 / absent | none | the v319 behaviour (one load per hook, nothing written) | Venus (as before) |
+| knob 0 / absent | none | the v319 behaviour (15.18.8 states the cost) | Venus (as before) |
+| flips failing (a refused registration or flip, the presenter's give-up) | `FfRef13`; `FfRegFail`, `FfFlipFail`, `FfGaveUp` | no new allocation is taken until the pause is over; the shown target is forgotten and the resident source withdrawn | Venus path |
+| an adopted allocation with `MISC_DIRECT_SCANOUT` | `FfRef14` | none | Venus path (its fast bind owns the screen) |
 | `decide` refuses (15.18.3) | counted `FfRef`, `FfWhy`, `FfRef<NN>` | no target; `other_source` | Venus path for this programming |
 | no record | `FfNoRec` | none | Venus (placeholders, plain allocations) |
 | registration refused by the arbiter | `FsRef`; the presenter pauses 100 ms; three strikes | withdraw, restart in 5 s (`FfGaveUp`) | the next programming is looked at afresh |
@@ -2222,7 +2241,16 @@ arbiter's `STATE` is taken only through the adapter methods after both are relea
 scanout lifecycle lock (it calls `with_virtio` for the facts, after `rm_import_served`'s own hold, and the adapter methods;
 it sends nothing), `target_gone` from `retire_scanout_allocation_locked` (one load, then `TARGET`), the close hooks at
 PASSIVE with no lock held (`with_virtio` for the poison, then `TARGET`), the flips from the HPD worker with no lock held.
-The knob is read at PASSIVE (the first `program` or close hook of the generation). The level 5 service leaves the shared
+The knob is read at PASSIVE (the first `program` or close hook of the generation).
+
+**The cost of the knob being off, exactly.** Not "one load, nothing else". With `ForeignFlip` absent or 0: (a) the FIRST
+`program` call of each transport generation, and the first forwarded `Close` / device exit (`foreign_scanout_release_handle`,
+`_release_owner`), read the value from the service key (a read-only registry query at PASSIVE; nothing is written for a 0),
+and cache it; every later call is one relaxed load; (b) until that read has happened the HPD worker's `foreign_flip::service`
+finds `KNOB` unread and takes the presenter's lock once per pass to look at `registered()` (a leaf lock, no I/O); afterwards
+it is one load; (c) the other hooks (`other_source`, `target_gone`, `holds_screen`) are one load of an atomic that stays 0; (d)
+`sysmem_flip` asks the arbiter for the KMD class of resident source (`resident_state_of(true)`) instead of any, which is the
+same answer while only the KMD registers one; (e) nothing is written to the service key and no `Ff*` value appears. The level 5 service leaves the shared
 frame and resume edges alone while `foreign_flip::holds_screen()` and only stands down; its resident accessors are
 class-aware (`resident_state_of(true)`, `resident_drop_of(true)`), which with only KMD sources registered answer exactly
 what they did.
@@ -2234,22 +2262,28 @@ what they did.
 | `FfKnob` | the knob's value (also written when read, if nonzero) | 1 |
 | `FfProg` / `FfSame` / `FfMoved` / `FfReowned` | allocations taken / the same again / another of the same device / of another device | grows / grows / grows / 0 or 1 per device |
 | `FfNoRec` | programmed with no foreign record | the GDI primary before DWM, placeholders |
-| `FfRef`, `FfWhy`, `FfRef01` to `FfRef12` | refused to Venus / last reason / per reason (15.18.3) | 0 |
-| `FfRegs` / `FfWithdrawn` / `FfGaveUp` | registrations / withdrawals / giving-ups | 1 / 0 / 0 |
+| `FfRef`, `FfWhy`, `FfRef01` to `FfRef14` | refused to Venus / last reason / per reason (15.18.3) | 0 |
+| `FfRegs` / `FfRegFail` / `FfWithdrawn` / `FfGaveUp` | registrations / refused registrations / withdrawals / giving-ups | 1 / 0 / 0 / 0 |
 | `FfFrames` / `FfReflips` / `FfYielded` / `FfFlipFail` | flips for an edge / for a resume / that found the source yielded / refused | grows / small / small / 0 |
 | `FfStale` / `FfGone` / `FfPoison` | flips refused because the importer's file is not its own / shown allocations dropped / records poisoned by a close | 0 / 0 / 0 until a device or file closes |
 | `FfPres` / `FfSeq` / `FfEdges` | the presenter word (bit 0 registered, bit 1 gave up, bits 8.. failures) / the last flip's `seq` / frames owed | 1 / grows / grows |
-| `FfReg` | the last registration's answer, written when it happens | 1 |
+
+Which values are written when: `FfKnob` and `FfGaveUp` are ALSO written at their event (once per transport generation, and
+once per give-up: rare and worth seeing at once even if the mirror has not run); everything else, including every
+registration (`FfRegs`, `FfRegFail`, so Windows alternating between Venus and foreign allocations costs no registry write per
+registration), only by the throttled mirror (`submit_command.rs`), which writes nothing until the knob was on and an
+allocation was seen. The mirror's values can therefore lag the live ones by a mirror period.
 
 `FfProg` counts every `SetVidPnSourceAddress` / DMA flip shown through this arm; `FfFrames + FfReflips` is the number of
 host flips, at most one per refresh period (the difference is coalescing).
 
 #### 15.18.10 Verified here, and not
 
-Verified on the host: `cargo test` in `guest/windows/kmd_logic` (808 tests) and `guest/windows/protocol` (30, unchanged).
+Verified on the host: `cargo test` in `guest/windows/kmd_logic` (810 tests) and `guest/windows/protocol` (30, unchanged).
 New and checked there, against the REAL arbiter, presenter and foreign table: the decision table (every row of 15.18.3,
 including knob off beating every other fault, the level rows, KMD-owned vs user-owned, owner gone, a layout the flip cannot
-carry, extent, destroyed / poisoned / not adopted); the target book (same / moved / re-owned, destroyed, file closed, owner
+carry, extent, destroyed / poisoned / not adopted, flips failing, `MISC_DIRECT_SCANOUT`), the order of every row
+(`refusal_precedence_is_the_tables_order`) and the pauses `failing` follows (`failing_lasts_exactly_as_long_as_the_pause`); the target book (same / moved / re-owned, destroyed, file closed, owner
 closed); the generation rule (the same allocation again and a move keep the resident source's generation, a new owner gets
 a new one and the old owner's flip is refused); pacing and "newest allocation wins"; user preemption, release and LAPSE
 both resuming with a re-flip of the newest allocation and no Venus flush; the importer's own `SET` as `Updated`; close and
@@ -2277,14 +2311,16 @@ Prerequisites: the DWM-on-NVK UMD presents through the WDDM flip only (no `SCANO
 import (`FgImp` counts imports); if `KmdRmClient=5` is in use, 15.13 steps 2 to 5 pass.
 
 1. **Baseline, knob absent.** `ForeignFlip` absent, restart the device, run DWM-on-NVK: note what the screen shows and the
-   flip counters (`Pb*`, `Vk*`, `Sn*`, `FsSupp`, `RfUnb`). No `Ff*` value exists. This is the v319 behaviour; if it differs,
-   stop.
+   flip counters (`Pb*`, `Vk*`, `Sn*`, `FsSupp`, `RfUnb`). No `Ff*` value exists (the read-only knob query is the only difference from v319). This is the v319 behaviour; if it
+   differs, stop.
 2. **Check the environment.** `KmdRmClient` absent, 0, 1, 2 or 5 (NOT 3 or 4: the arm refuses, `FfRef01`). The imports work
    without the arm: `FgImp` and `FgAdo` grow, `FgRefA=0`, `FgLive` = the swap chain's buffers.
 3. **Turn it on.** `reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v ForeignFlip /t REG_DWORD /d 1`,
    then restart the display adapter's device (the knob is read once per transport generation). `FfKnob=1`.
 4. **Is the arm seeing the allocations?** With DWM running: `FfProg` grows (one per flip), `FfNoRec` small and not growing
-   (the GDI primary and placeholders only), `FfRef=0`. If `FfRef` grows, `FfWhy` and `FfRef01` to `FfRef12` say why:
+   (the GDI primary and placeholders only), `FfRef=0`. If `FfRef` grows, `FfWhy` and `FfRef01` to `FfRef14` say why (13 `Failing` is the arm having backed off after a failed registration or flip: read
+`FfRegFail`, `FfFlipFail`, `FfGaveUp` and the host log; 14 `DirectScanout` means the UMD set `MISC_DIRECT_SCANOUT`, which
+it must not):
    8 `FileClosed` or 12 `OwnerGone` means the importer's DRM file is not open any more at the flip (the UMD / librmclient
    must keep the file open for the life of the swap chain, or the resid flip of 15.18.6 is needed); 10 or 11 mean the
    record's layout is not the mode's; 2 means the worker has not read `KmdRmClient` yet (retry); 5 is a host without the
@@ -2310,7 +2346,11 @@ import (`FgImp` counts imports); if `KmdRmClient=5` is in use, 15.13 steps 2 to 
 10. **Mode change**: a new swap chain at the new mode: `FfProg` grows; `FfRef11` counts only stale buffers of the old mode.
 11. **Fallback**: `ForeignFlip=0` again after a device restart restores step 1's behaviour exactly (no `Ff*` growth). With
     `KmdRmClient=3`: `FfRef01` grows and the desktop is the Venus / ring desktop.
-12. **Soak**: ten minutes of normal desktop use: `FfFlipFail=0`, `FfGaveUp=0`, `FfStale=0`.
+12. **Soak**: ten minutes of normal desktop use: `FfFlipFail=0`, `FfGaveUp=0`, `FfStale=0`, `FfRegFail=0`, `FfRef13=0`.
+13. **The fallback when flips fail.** With the host refusing `ScanoutFlip` (or the viewer disconnected from the flip
+    path): `FfFlipFail` grows by three, `FfGaveUp`+1, then `FfRef13` grows with every programming for five seconds and the
+    desktop is the Venus path (not frozen); after the pause `FfProg` grows again. A screen that freezes with `FfRef13=0` is a
+    defect of this arm: report `FfPres`, `FfFlipFail`, `FfWhy`.
 
 #### 15.18.12 Risks and open questions
 
