@@ -379,6 +379,30 @@ static inline void helios_nvrm_init(HeliosNvrmHeader *h, uint32_t op, uint32_t t
   h->epoch = 0;
 }
 
+/* ---- client rules (not wire: how a client must read the replies) ----------
+ *
+ * The transport a client initialised against is gone when ANY reply says so:
+ *   - HELIOS_NVRM_ST_TRANSPORT_RESET (EVENT_REGISTER on a failed transport), or
+ *   - `epoch` differs from the one QUERY_CAPS gave at init. The epoch is the
+ *     transport instance's generation: it changes at every StartDevice, and
+ *     reads 0 when there is no transport at all (a live one is never 0). Every
+ *     handle, mapping, pin and event of the earlier generation is gone, so the
+ *     process must reopen; a client that cannot (librmclient) treats the device
+ *     as lost for good.
+ * The header is valid whenever the escape's NTSTATUS was success (the KMD writes
+ * `epoch` on every success return, including a nonzero `status`). */
+static inline int helios_nvrm_reply_is_lost(uint64_t init_epoch, const HeliosNvrmHeader *h) {
+  return h->status == HELIOS_NVRM_ST_TRANSPORT_RESET || h->epoch != init_epoch;
+}
+
+/* NTSTATUS values of a failed escape that mean the device is gone, not that the
+ * request was bad: STATUS_DEVICE_NOT_READY (EVENT_REGISTER / UNREGISTER with no
+ * transport) and STATUS_DEVICE_REMOVED (the adapter was removed). */
+static inline int helios_nvrm_ntstatus_is_lost(int32_t ntstatus) {
+  const uint32_t s = (uint32_t)ntstatus;
+  return s == 0xC00000A3u || s == 0xC00002B6u;
+}
+
 #ifdef __cplusplus
 }
 #endif
