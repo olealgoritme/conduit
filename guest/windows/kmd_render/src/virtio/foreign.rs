@@ -293,6 +293,7 @@ fn publish_snapshot(snap: Option<super::gpu::ForeignSnapshot>) {
         crate::diag::record_named_bytes(b"FgRefFmt", c.refused_format);
         crate::diag::record_named_bytes(b"FgRefPln", c.refused_planes);
         crate::diag::record_named_bytes(b"FgRefNewG", c.refused_new_geometry);
+        crate::diag::record_named_bytes(b"FgRefMod", c.refused_modifier);
         crate::diag::record_named_bytes(b"FgAdoNoPln", c.refused_no_plane_room);
     }
     crate::diag::record_named_bytes(b"FgUns", IMPORT_UNSUPPORTED.load(Ordering::Relaxed));

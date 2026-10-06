@@ -746,6 +746,21 @@ pub mod knobs {
     /// old path runs, when the importer's file is gone, the layout is unusable, the host lacks
     /// the import, or `KmdRmClient` is 3 or 4. Read once per transport generation.
     pub const FOREIGN_FLIP: KnobName = KnobName::new(b"ForeignFlip");
+    /// `FfAsyncWin` (default 0 = off: every `ForeignFlip` host flip is a synchronous round trip
+    /// on the HPD worker, as it always was). 1 to 4 (larger is 4), only with `ForeignFlip` on:
+    /// the host `ScanoutFlip` is SUBMITTED on the control queue without waiting for its reply,
+    /// with at most this many in flight; the worker settles the answers when the used-ring drain
+    /// wakes it, so programming never waits for the host. Also lets the `SetVidPnSourceAddress`
+    /// DDI wake the worker through a DPC at once instead of at the next vsync tick, and the
+    /// tick wake it with the vsync delivery gate closed. Read once per transport generation
+    /// (`docs/kmd-rm-client.md` 15.18.13).
+    pub const FOREIGN_FLIP_WIN: KnobName = KnobName::new(b"FfAsyncWin");
+    /// `FfRepeatMs` (default 100, 0 = off, at most 10000), only with `ForeignFlip` on: the least
+    /// time between two host flips that only REPEAT the picture the previous flip showed (a
+    /// desktop refresh edge, as opposed to a programming dxgkrnl issued). 0 flips on every edge,
+    /// as KMD 325 did (155 flips a second of an unchanged picture in the T5 run). Read once per
+    /// transport generation (`docs/kmd-rm-client.md` 15.18.14).
+    pub const FOREIGN_FLIP_REPEAT: KnobName = KnobName::new(b"FfRepeatMs");
     /// `BindFlushMode` (default 0). Selects when the bind edge tells the host
     /// to READ the freshly bound primary (ROADMAP defect 0ab-B):
     ///   0 = completion-ordered against the boundary this buffer's own present

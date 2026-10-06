@@ -115,6 +115,8 @@ pub mod site {
 ///   `FlipPub`: publications of a displayed address (bound or kept, any class). `FlipPubT`: when.
 /// * `VsPendN`, `VsPendMax`: consecutive vsync ticks with a pending programming (handle in the
 ///   slot, or the programming gate raised), and the longest run this generation.
+/// * `VsTickN`, `VsOffN`: every vsync heartbeat tick, and those that ran with the CRTC_VSYNC
+///   delivery gate closed (`ControlInterrupt` disable); `VsTickN - VsOffN` is `VpVsN`.
 /// * `ScLkN`, `ScLkRelN`, `ScLkAcqT`, `ScLkRelT`: acquisitions and releases of the scanout mutex
 ///   (held now when they differ, [`lock_held`]) and the interrupt time of the last acquisition
 ///   and release.
@@ -124,7 +126,26 @@ pub mod site {
 /// * `StallT`: interrupt time (ms) of the publication of this block: the "now" of every age.
 /// * `FlWdMsEff`, `DefBudEff`: the `FlipWdogMs` and `DeferBudget` knobs in force (clamped, 0
 ///   included), written at every StartDevice.
-pub const COUNTERS: [&str; 21] = [
+/// * `HpdWkEvt`, `HpdWkTmo`: worker loops woken by an event / by a timeout; `HpdWkSrc`: the
+///   `hpd_wake::cause` bits signalled since the previous loop, as of the last loop.
+///   `HpdSgBlt`, `HpdSgRfr`, `HpdSgEdg`, `HpdSgFnc`, `HpdSgFs`, `HpdSgRel`, `HpdSgFlp`,
+///   `HpdSgOth`: signals by cause (`HpdSgOth` is every caller not named); `HpdSgCoal`: windowed-
+///   Blt wakes not signalled because one was already owed.
+/// * `HpdWait`, `HpdWaitMin`: the last timed wait and the shortest one, in microseconds (0 =
+///   infinite / none yet); `HpdTmCtl`, `HpdTmRty`, `HpdTmDue`, `HpdTmNone`: waits by class
+///   (control poll, refresh retry, a due time, none).
+/// * `HpdBusyUs`, `HpdPassMaxUs`: microseconds the worker spent awake (all passes) and the longest
+///   pass. `HpdDumpN`, `HpdDumpUs`, `HpdDumpSkip`: periodic `Vp*` dumps run, their total time in
+///   microseconds, and the wake counts that reached the loop cadence but not the 1 s one.
+/// * `VsTickT`: interrupt time (ms) of the last heartbeat tick, written beside `VsTickN` (a
+///   frozen count with a moving `StallT` and a stale `VsTickT` is a dead chain, not a stale
+///   mirror); `VsGapMaxMs`: the longest silence between two ticks, ms; `VsArmN`, `VsDisN`,
+///   `VsCanN`: effective arms, effective disarms, and cancels of the one-shot; `VsEarlyN`: ticks
+///   that returned before the count (disarmed or no display half); `VsExhN`: the deadline
+///   exhausted; `VsRevN`: heartbeats the watchdog found dead and re-armed.
+/// * `PwrN`, `PwrUid`, `PwrD3N`: `DxgkDdiSetPowerState` calls, the last one's `DeviceUid`
+///   (0xFFFFFFFF = the adapter), and those that were not D0.
+pub const COUNTERS: [&str; 57] = [
     "HpdLoopN",
     "HpdLoopT",
     "HpdSite",
@@ -138,6 +159,8 @@ pub const COUNTERS: [&str; 21] = [
     "FlipPubT",
     "VsPendN",
     "VsPendMax",
+    "VsTickN",
+    "VsOffN",
     "StartN",
     "StartT",
     "FlipWd",
@@ -146,6 +169,42 @@ pub const COUNTERS: [&str; 21] = [
     "StallT",
     "FlWdMsEff",
     "DefBudEff",
+    // T5 anomalies (`hpd_wake`, docs/kmd-rm-client.md 15.18.14): the worker's wakes, its wait,
+    // its periodic dump, the signals by cause, and the vsync heartbeat's life.
+    "HpdWkEvt",
+    "HpdWkTmo",
+    "HpdWkSrc",
+    "HpdWait",
+    "HpdWaitMin",
+    "HpdTmCtl",
+    "HpdTmRty",
+    "HpdTmDue",
+    "HpdTmNone",
+    "HpdBusyUs",
+    "HpdPassMaxUs",
+    "HpdDumpN",
+    "HpdDumpUs",
+    "HpdDumpSkip",
+    "HpdSgBlt",
+    "HpdSgRfr",
+    "HpdSgEdg",
+    "HpdSgFnc",
+    "HpdSgFs",
+    "HpdSgRel",
+    "HpdSgFlp",
+    "HpdSgOth",
+    "HpdSgCoal",
+    "VsTickT",
+    "VsGapMaxMs",
+    "VsArmN",
+    "VsDisN",
+    "VsCanN",
+    "VsEarlyN",
+    "VsExhN",
+    "VsRevN",
+    "PwrN",
+    "PwrUid",
+    "PwrD3N",
 ];
 
 // ---- the scanout mutex -----------------------------------------------------------------------

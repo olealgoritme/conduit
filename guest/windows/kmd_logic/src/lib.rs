@@ -28,9 +28,11 @@ pub mod nvrm_views;
 pub mod foreign_copy;
 pub mod foreign_errno;
 pub mod flip_completion;
+pub mod flip_pipeline;
 pub mod foreign_flip;
 pub mod foreign_resource;
 pub mod foreign_scanout;
+pub mod hpd_wake;
 pub mod rm_resource_import;
 pub mod page_runs;
 pub mod rm_client;
@@ -52,6 +54,8 @@ pub mod shared_placeholder;
 pub mod stall_diag;
 pub mod sweep_budget;
 pub mod vsync_rate;
+pub mod windowed_ready;
+pub mod slice_budget;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///

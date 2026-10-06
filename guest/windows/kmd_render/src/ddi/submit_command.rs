@@ -1054,8 +1054,16 @@ fn note_and_maybe_signal(
         // SubmitCommand is the residency-admission edge. Publish the worker
         // cause before its wake: the exact producer may have terminalized
         // during preemption, so its original wake can already be gone.
-        adapter.scanout_retire_wanted.store(1, Ordering::Release);
-        adapter.signal_hpd();
+        //
+        // COALESCED: the flag is the cause and the worker consumes it at the top of every pass
+        // (`ddi/hpd.rs`, unconditionally), so a submit that finds it already owed need not signal
+        // again: the signal that owed it is either pending or already woke the worker, which will
+        // read the flag on its next pass. Only the 0 -> 1 edge signals (`HpdSgCoal` counts the rest).
+        if adapter.scanout_retire_wanted.swap(1, Ordering::AcqRel) == 0 {
+            adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::BLT);
+        } else {
+            crate::ddi::stall_diag::note_signal_coalesced();
+        }
     }
     SubmitAck::Accepted
 }

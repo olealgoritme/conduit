@@ -494,6 +494,11 @@ static NVRM_SPIN_STATE: AtomicU32 =
 /// with forwards running means the spin is off (`NvSpinUs = 0`).
 pub static NVRM_SPIN_HITS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_SPIN_MISSES: AtomicU32 = AtomicU32::new(0);
+/// `BlbAbandoned`: blob teardowns of a destroyed device that were not sent to the host
+/// because an earlier blob of the same device was ambiguous (a blit still in flight, a
+/// failed release): the ambiguous one itself and every blob taken out of the table after it
+/// (`release_blobs_for_owner_within`). Must read 0 on a healthy session.
+pub static BLOB_SWEEP_ABANDONED: AtomicU32 = AtomicU32::new(0);
 
 /// Read `NvSpinUs` (clamped), cache it and mirror it. PASSIVE.
 fn read_spin_knob() -> u32 {
@@ -715,6 +720,57 @@ pub fn raw_roundtrip(
     Ok(n)
 }
 
+/// Submit one RM message VERBATIM and do NOT wait for the reply (`ForeignFlip`'s pipelined
+/// `ScanoutFlip`, `helios_kmd_logic::flip_pipeline`). `req` is `MsgHeader | payload` as for
+/// [`raw_roundtrip`]; the reply is a bare header whose `status` the used-ring drain turns into
+/// ONE word, `cell` (tagged `tag`: `flip_pipeline::pack_reply` / `pack_no_reply`), before it
+/// signals the HPD worker's event. The caller zeroes `cell` BEFORE the call and settles it
+/// later (`virtio/foreign_flip.rs`).
+///
+/// PASSIVE, one attempt: a full queue is returned as `QueueFull` at once (no sleeping retry
+/// loop as the round trip has; the worker keeps the frame owed and comes back), an allocation
+/// failure as `OutOfMemory`. On every error return nothing reached the ring and `cell` is
+/// untouched. `cell` must be `'static` (it is read by the drain after this returns).
+pub fn raw_submit_async(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    cell: &'static core::sync::atomic::AtomicU64,
+    tag: u32,
+) -> Result<(), VirtioError> {
+    const MH: usize = super::hal::MSG_HDR_LEN;
+    let req_len = req.len();
+    if req_len < MH {
+        return Err(VirtioError::DeviceError);
+    }
+    // A bare header plus one more descriptor's worth, as `raw_roundtrip` gives a header-only
+    // reply (see `Chain::Raw`); the drain reads only the header's `status`.
+    let resp_len = 2 * MH;
+    let total = req_len + resp_len;
+    let (work, pooled) =
+        match adapter.with_virtio(|v| (v.begin_parked_reap(), v.take_dma_buffer(total))) {
+            Ok((work, pooled)) => (Ok(work), pooled),
+            Err(e) => (Err(e), None),
+        };
+    reap_parked_work(passive, adapter, work);
+    let mut meta = pooled
+        .or_else(|| DmaBuffer::new(passive, total))
+        .ok_or(VirtioError::OutOfMemory)?;
+    meta.as_mut_slice()[..req_len].copy_from_slice(req);
+    let wake = NonNull::new(adapter.hpd_event.get()).ok_or(VirtioError::DeviceError)?;
+    let cell = NonNull::from(cell);
+    let queued = adapter.with_virtio(move |v| {
+        v.drain_used();
+        v.enqueue_raw_async(meta, req_len, resp_len, cell, tag, wake)
+    });
+    match queued {
+        Ok(Ok(())) => Ok(()),
+        // The buffer comes back here, at PASSIVE, to be dropped.
+        Ok(Err((_meta, e))) => Err(e),
+        Err(_) => Err(VirtioError::DeviceError),
+    }
+}
+
 /// Round-trip expecting a bare `VirtioGpuCtrlHdr` response; checks RESP_OK.
 fn ctrl_roundtrip_ok(
     passive: PassiveLevel,
@@ -903,7 +959,9 @@ pub fn ctx_destroy_within(
     if result.is_ok() {
         let finalized = adapter.with_wddm_notify_lock(|guard| {
             guard
-                .with_virtio(|_order, v| v.finalize_closed_present_streams_for_context(ctx_id))
+                .with_virtio(|order, v| {
+                    v.finalize_closed_present_streams_for_context(order, ctx_id)
+                })
                 .unwrap_or(0)
         });
         if finalized != 0 {
@@ -954,7 +1012,9 @@ pub fn destroy_contexts_for_owner(
         if ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None).is_ok() {
             let finalized = adapter.with_wddm_notify_lock(|guard| {
                 guard
-                    .with_virtio(|_order, v| v.finalize_closed_present_streams_for_context(ctx_id))
+                    .with_virtio(|order, v| {
+                        v.finalize_closed_present_streams_for_context(order, ctx_id)
+                    })
                     .unwrap_or(0)
             });
             if finalized != 0 {
@@ -1784,6 +1844,11 @@ pub fn release_blobs_for_owner_within(
     budget: Option<&SweepBudget>,
 ) -> u32 {
     let mut reclaimed = 0u32;
+    // Set once one blob's teardown was ambiguous (see below): the rest of the owner's table
+    // entries are still taken out, so a dead owner cannot hold blob slots for ever, but they
+    // are not sent to the host (the first ambiguity already says the host or an in-flight
+    // blit cannot be trusted to answer), and only the host-free part runs for them.
+    let mut abandoned = false;
     loop {
         let taken = adapter
             .with_virtio(|v| v.take_blob_for_owner(owner))
@@ -1791,6 +1856,20 @@ pub fn release_blobs_for_owner_within(
         let Some((ctx_id, res, mapped, map_offset, map_len)) = taken else {
             return reclaimed;
         };
+        if abandoned {
+            // Undispatched windowed blts that name this resource have no host reader: end
+            // them, or each keeps a ledger ticket and one of the 64 token slots for ever.
+            // Nothing else: the host objects stay until the Venus teardown, as for the
+            // blob that was ambiguous.
+            let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
+            // And the resid's claim on the 8-slot read ledger: skipping it leaked one slot
+            // per abandoned blob, until `queue_windowed_blt` could issue no ticket at all.
+            // `note_alloc_retired` pins the claim while a reader is still active and
+            // reclaims it when the last ticket retires, so it is safe for any state.
+            retire_ledger_claim(passive, adapter, res);
+            BLOB_SWEEP_ABANDONED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let terminal = adapter.with_scanout_lifecycle(passive, |lock| {
             let cache_release = lock.with_venus_client(|client| {
                 let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
@@ -1826,7 +1905,18 @@ pub fn release_blobs_for_owner_within(
             // The blob tracking entry was intentionally taken first. Retaining
             // the host objects on an ambiguous drain leaks safely until Venus
             // teardown; continuing would detach a possibly in-flight resource.
-            return reclaimed;
+            //
+            // Returning here used to leave every REMAINING blob of the owner in the table
+            // with a dead owner token (the device is being destroyed: nothing will ever
+            // sweep them again) and their windowed blts pending, which fills the blob table
+            // and the 64 WindowedBlt token slots across a few killed processes. The rest
+            // are drained without host commands (`abandoned`, above).
+            abandoned = true;
+            // The ambiguous blob's own ledger claim as well (pinned while its reader is
+            // active, reclaimed when that reader's ticket retires).
+            retire_ledger_claim(passive, adapter, res);
+            BLOB_SWEEP_ABANDONED.fetch_add(1, Ordering::Relaxed);
+            continue;
         }
         if mapped {
             if let Some(timeout_ms) = sweep_timeout_ms(budget) {
@@ -1849,11 +1939,19 @@ pub fn release_blobs_for_owner_within(
         // how a crashed/exited process's snapshot resids reach the ledger at
         // all (`RdOvf` must stay 0 across app restarts). Per-resid acquisition
         // keeps the display worker's lock hold times unchanged during a sweep.
-        adapter.with_scanout_lifecycle(passive, |_lock| {
-            adapter.read_ledger.note_alloc_retired(res);
-        });
+        retire_ledger_claim(passive, adapter, res);
         reclaimed += 1;
     }
+}
+
+/// End `res`'s claim on the D4a read ledger (`ReadLedger::note_alloc_retired`) under the
+/// scanout lifecycle mutex, which serialises the ledger's claim discipline. Every blob
+/// teardown path of `release_blobs_for_owner_within` ends here, the ones that send nothing
+/// to the host included.
+fn retire_ledger_claim(passive: PassiveLevel, adapter: &AdapterContext, res: u32) {
+    adapter.with_scanout_lifecycle(passive, |_lock| {
+        adapter.read_ledger.note_alloc_retired(res);
+    });
 }
 
 /// Drop the KMD-internal (owner-0) blob slot for an allocation at

@@ -47,7 +47,7 @@ constexpr const char* kBuiltinDeny[] = {
   "obs64.exe", "obs32.exe", "vlc.exe", "mpc-hc64.exe", "mpc-be64.exe",
   "video.ui.exe", "microsoft.photos.exe", "photos.exe",
   "steamwebhelper.exe", "epicwebhelper.exe",
-  "cefsharp.browsersubprocess.exe", "nvidia share.exe",
+  "cefsharp.browsersubprocess.exe",
 };
 
 void lower_ascii(char* s) {
@@ -212,9 +212,13 @@ bool nvk_next_to_umd(wchar_t* out, std::size_t cap) {
 
 bool find_nvk_icd(wchar_t* out, std::size_t cap) {
   out[0] = 0;
+  // An override that names no file (a stale test copy, deleted since) falls
+  // through to the installed NVK instead of putting the process on Venus:
+  // that silently turned "HELIOS_ICD=nvk" runs into Venus runs (2026-10-06,
+  // Heaven with HELIOS_NVK_ICD=...\s315\nvk32 after the copy was removed).
   const DWORD n = GetEnvironmentVariableW(L"HELIOS_NVK_ICD", out, DWORD(cap));
-  if (n > 0 && n < cap)
-    return file_exists(out);
+  if (n > 0 && n < cap && file_exists(out))
+    return true;
 #if defined(_WIN64)
   if (reg_wsz(L"NvkIcdPath", out, DWORD(cap)) && file_exists(out))
     return true;
@@ -316,14 +320,21 @@ IcdBackendChoice decide() {
     // that needs FL12 fails there, while NVK serves FL12_0 / SM 6.8. D3D12 goes
     // to NVK unless HELIOS_ICD(12)=venus, Nvk12=0, NvkDenyList12 or the
     // deny-list below says otherwise, or NVK fails (2026-10-06).
+    // NvkAllowList names executables that go to NVK whatever Icd says: the
+    // per-category lever of docs/dwm-on-nvk.md 4.2 (move one category off
+    // the Venus defaults at a time, Icd=venus staying for everything else).
+    char allow[4096];
+    const bool allowed = reg_sz("NvkAllowList", allow, sizeof(allow)) && list_has(allow, c.exe);
     char mode[16];
-    if (reg_sz("Icd", mode, sizeof(mode))) {
+    if (!allowed && reg_sz("Icd", mode, sizeof(mode))) {
       lower_ascii(mode);
       if (std::strcmp(mode, "venus") == 0) {
         c.reason = "HKLM\\SOFTWARE\\Helios!Icd=venus";
         return c;
       }
     }
+    if (allowed)
+      c.reason = "NvkAllowList names this executable";
 #endif
     const char* why = nullptr;
     if (denied(c.exe, &why)) {

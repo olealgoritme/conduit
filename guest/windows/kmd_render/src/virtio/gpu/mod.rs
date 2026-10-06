@@ -422,6 +422,12 @@ pub static WDDM_HOLD_MS: AtomicU32 = AtomicU32::new(0);
 /// A static, not a `VirtioGpu` field, for the same reason as [`WDDM_HOLD_MS`]: one
 /// read site, and readable without `virtio_lock`.
 pub static WDDM_HEAD_MS: AtomicU32 = AtomicU32::new(WDDM_HEAD_MS_DEFAULT);
+/// `WbStaleRdy`: front tokens of the WindowedBlt ready queue popped because no undispatched
+/// request stood behind them (`helios_kmd_logic::windowed_ready`). Must read 0 on a healthy
+/// boot; a nonzero value is a request that was retired without its token (a killed process
+/// whose snapshot resource was torn down with admitted blts queued) and was healed by the
+/// worker instead of wedging every later windowed present.
+pub static WINDOWED_READY_STALE: AtomicU32 = AtomicU32::new(0);
 /// `WddmHeadMs`'s shipping default, in ms, and it is a DECISION (AGENTS.md rule 8).
 ///
 /// The bound exists because `present_stream_marker_boundary` accepts any nonzero
@@ -948,6 +954,24 @@ enum InFlightKind {
     Raw {
         waiter: Option<NonNull<SyncWaitBlock>>,
         dest: NonNull<u8>,
+    },
+    /// A RAW forwarded message whose caller does NOT wait (`ForeignFlip`'s pipelined
+    /// `ScanoutFlip`, `helios_kmd_logic::flip_pipeline`). At completion the drain writes ONE
+    /// word to `cell` (`flip_pipeline::pack_reply` with the reply header's `status`, or
+    /// `pack_no_reply` when the reply is shorter than a header or the transport died) and
+    /// signals `wake_event`; nothing else is touched, and the reply stays in the entry's own
+    /// buffer, which goes straight back to the pool.
+    ///
+    /// `cell` names a `'static` word and `wake_event` a field of the adapter, whose lifetime
+    /// encloses the transport: neither can dangle, unlike a stack waiter, so there is no
+    /// abandon path and no second exit to argue about. A completion that outlives its flip's
+    /// timeout still writes the word; the owner keeps the slot occupied until it arrives
+    /// (`flip_pipeline::Pipeline`), and `tag` lets it tell this flip's word from an earlier
+    /// flip's of the same slot.
+    RawAsync {
+        cell: NonNull<AtomicU64>,
+        tag: u32,
+        wake_event: NonNull<KEVENT>,
     },
     /// An async fenced SUBMIT_3D carrying `fence_id` (KMD-assigned wire id).
     /// `ring_idx` 0 = host CPU ring (retires at decode); >= 1 = a per-queue
@@ -3404,6 +3428,43 @@ impl VirtioGpu {
         Ok(SyncTicket { token })
     }
 
+    /// Enqueue a RAW forwarded message that nobody waits for (`InFlightKind::RawAsync`).
+    /// `meta` is laid out as for [`Self::enqueue_raw`]; the completion writes the flip
+    /// acknowledgement word `cell` (tagged `tag`) and signals `wake_event`. The caller zeroes
+    /// `cell` BEFORE this call. On refusal the buffer is handed back.
+    pub fn enqueue_raw_async(
+        &mut self,
+        meta: DmaBuffer,
+        req_len: usize,
+        resp_len: usize,
+        cell: NonNull<AtomicU64>,
+        tag: u32,
+        wake_event: NonNull<KEVENT>,
+    ) -> Result<(), (DmaBuffer, VirtioError)> {
+        const MH: usize = super::hal::MSG_HDR_LEN;
+        if req_len < MH || resp_len <= MH {
+            return Err((meta, VirtioError::DeviceError));
+        }
+        let chain = Chain::Raw { req_len };
+        let token = match self.enqueue_core(chain, &meta, None, resp_len) {
+            Ok(token) => token,
+            Err(e) => return Err((meta, e)),
+        };
+        self.publish_then_notify(InFlight {
+            token,
+            kind: InFlightKind::RawAsync {
+                cell,
+                tag,
+                wake_event,
+            },
+            meta,
+            chain,
+            resp_len,
+            venus: None,
+        });
+        Ok(())
+    }
+
     /// Enqueue a control command without a blocking waiter.  Completion still
     /// consumes and validates the device response in [`Self::drain_used`], owns
     /// `meta` until then, clears the adapter-owned `completion` gate, and wakes
@@ -4608,6 +4669,25 @@ impl VirtioGpu {
                         }
                     }
                 }
+                InFlightKind::RawAsync {
+                    cell,
+                    tag,
+                    wake_event,
+                } => {
+                    // The transport is dead: the flip got no reply. The word says so and the
+                    // worker is woken to settle it (a failure of this flip, nothing frozen).
+                    //
+                    // SAFETY: `cell` is a `'static` word and `wake_event` an adapter field
+                    // (see `InFlightKind::RawAsync`); `KeSetEvent` with Wait = FALSE is legal
+                    // at DISPATCH.
+                    unsafe {
+                        cell.as_ref().store(
+                            helios_kmd_logic::flip_pipeline::pack_no_reply(tag),
+                            Ordering::Release,
+                        );
+                        KeSetEvent(wake_event.as_ptr(), IO_NO_INCREMENT, 0);
+                    }
+                }
                 InFlightKind::Sync { waiter, .. } => {
                     if let Some(block) = waiter {
                         // No response is copied on purpose: `SyncWaitBlock::new_zeroed`
@@ -4877,6 +4957,57 @@ impl VirtioGpu {
                 }
                 continue;
             }
+            // A pipelined flip (`InFlightKind::RawAsync`): its reply is a bare `MsgHeader`
+            // whose `status` (offset 8, a signed errno) is the whole answer. One word is
+            // written for the worker and the worker is woken; nothing is copied anywhere.
+            if let InFlightKind::RawAsync {
+                cell,
+                tag,
+                wake_event,
+            } = &entry.kind
+            {
+                const MH: usize = super::hal::MSG_HDR_LEN;
+                let (cell, tag, wake_event) = (*cell, *tag, *wake_event);
+                let wrote = (written as usize).min(resp_len);
+                let src = if wrote >= MH {
+                    entry.meta.span(entry.chain.resp_offset(), MH)
+                } else {
+                    None
+                };
+                // SAFETY: `src` is a span of the entry-owned buffer the device has finished
+                // writing (at least a header, proved by `wrote >= MH`); `cell` and
+                // `wake_event` outlive the transport (see `InFlightKind::RawAsync`). The word
+                // is stored (Release) before the signal, as the Sync and Raw arms order theirs.
+                unsafe {
+                    let word = match src {
+                        Some(span) => {
+                            let b = span.as_slice();
+                            helios_kmd_logic::flip_pipeline::pack_reply(
+                                tag,
+                                i32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+                            )
+                        }
+                        None => helios_kmd_logic::flip_pipeline::pack_no_reply(tag),
+                    };
+                    cell.as_ref().store(word, Ordering::Release);
+                    KeSetEvent(wake_event.as_ptr(), IO_NO_INCREMENT, 0);
+                }
+                // Nothing reads `meta` again: back to the pool, or parked for the PASSIVE
+                // reaper, exactly as a finished raw forward.
+                if entry.venus.is_none() && self.dma_pool_accepts(entry.meta.capacity()) {
+                    let (meta, _none) = entry.into_dma_buffers();
+                    self.dma_pool_push(meta);
+                    continue;
+                }
+                if self.parked.len() < MAX_PARKED {
+                    self.parked.push(entry);
+                    bump_high_water(&PARKED_HIGH_WATER, self.parked.len());
+                } else {
+                    PARKED_LEAKS.fetch_add(1, Ordering::Relaxed);
+                    core::mem::forget(entry);
+                }
+                continue;
+            }
             let resp_base = {
                 // SAFETY: the resp span is within the entry-owned meta buffer,
                 // which the device wrote and nothing else aliases now. A mutable
@@ -4896,8 +5027,8 @@ impl VirtioGpu {
             // SAFETY: as above; unaligned because the offset is command-shaped.
             let resp_type = unsafe { core::ptr::read_unaligned(resp_base as *const u32) };
             match entry.kind {
-                // Completed and parked above; never reaches here.
-                InFlightKind::Raw { .. } => {}
+                // Completed and parked above; never reach here.
+                InFlightKind::Raw { .. } | InFlightKind::RawAsync { .. } => {}
                 InFlightKind::Sync {
                     waiter,
                     scanout_bind,
@@ -5934,7 +6065,16 @@ impl VirtioGpu {
     /// claimed-but-never-submitted and in-flight consumer ownership before
     /// releasing the closing stream slots. This is never called on an
     /// ambiguous or rejected destroy.
-    pub fn finalize_closed_present_streams_for_context(&mut self, ctx_id: u32) -> u32 {
+    ///
+    /// Retiring a closing slot turns every WDDM FIFO entry whose boundary names it into one
+    /// that names a dead stream, which the purges' `discharge_dead_present_stream_waits`
+    /// cancels; that sweep ran at purge time, when the slot still counted as live, so it is
+    /// repeated here (it takes the notification-ordered token the callers already hold).
+    pub fn finalize_closed_present_streams_for_context(
+        &mut self,
+        order: &crate::adapter::NotifyOrdered<'_>,
+        ctx_id: u32,
+    ) -> u32 {
         let mut finalized = 0u32;
         for index in 0..self.present_streams.len() {
             let slot = self.present_streams[index];
@@ -5954,6 +6094,15 @@ impl VirtioGpu {
             }
             self.retire_present_stream_slot(index);
             finalized += 1;
+        }
+        if finalized != 0 {
+            // The purge that closed these slots ran these sweeps while they still counted as
+            // live (a closing slot keeps its handle until now): the FIFO entries and the
+            // undispatched requests of a stream that just died are cancelled here, or they
+            // wait on a boundary that is never satisfied and keep their ledger tickets and
+            // token slots until some unrelated purge comes along. Same order as the purges.
+            let _ = self.discharge_dead_present_stream_waits(order);
+            self.cancel_dead_undispatched_windowed_blt();
         }
         finalized
     }
@@ -7011,12 +7160,31 @@ impl VirtioGpu {
     /// boundary are mandatory; a retired producer without residency admission
     /// remains inert in `pending`.
     pub fn take_ready_windowed_blt(&mut self) -> Option<WindowedBltPending> {
-        let token = *self.windowed_blt.ready.front()?;
-        let index = self
-            .windowed_blt
-            .pending
-            .iter()
-            .position(|request| request.token == token)?;
+        // A front token with no undispatched request behind it can never be dispatched
+        // (the request was retired through a terminal, or already went out): pop it, or
+        // it holds every later request of every process behind it for the rest of the
+        // boot (`helios_kmd_logic::windowed_ready`). Counted in `WbStaleRdy`.
+        let index = loop {
+            let front = self.windowed_blt.ready.front().copied();
+            let index = front.and_then(|token| {
+                self.windowed_blt
+                    .pending
+                    .iter()
+                    .position(|request| request.token == token)
+            });
+            let entry = index.map(|index| self.windowed_blt.pending[index].dispatched);
+            match helios_kmd_logic::windowed_ready::classify(front, entry) {
+                helios_kmd_logic::windowed_ready::Head::Empty => return None,
+                helios_kmd_logic::windowed_ready::Head::Stale => {
+                    self.windowed_blt.ready.pop_front();
+                    WINDOWED_READY_STALE.fetch_add(1, Ordering::Relaxed);
+                }
+                helios_kmd_logic::windowed_ready::Head::Candidate => {
+                    // `Candidate` means a front token with a pending, undispatched request.
+                    break index?;
+                }
+            }
+        };
         let boundary = self.windowed_blt.pending[index].stream_boundary;
         if !self.windowed_blt.pending[index].admitted
             || self.windowed_blt.pending[index].dispatched
@@ -7068,6 +7236,14 @@ impl VirtioGpu {
         let Some(request) = self.windowed_blt.pending.remove(index) else {
             return;
         };
+        if !request.dispatched {
+            // Retired before the worker took it (the teardown of its snapshot resource
+            // gives an admitted request a terminal): its token must not stay at the
+            // front of `ready`, where nothing would ever dispatch it or pop it.
+            self.windowed_blt
+                .ready
+                .retain(|known| *known != request.token);
+        }
         if !request.ledger_retired {
             adapter.read_ledger.retire(request.ledger_ticket, !ok);
         }

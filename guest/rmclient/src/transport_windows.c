@@ -40,6 +40,7 @@
 
 #if defined(_WIN32)
 
+#include <stdarg.h>
 #include <stddef.h>
 #include <errno.h>
 #include <stdint.h>
@@ -65,6 +66,38 @@ typedef LONG NTSTATUS, *PNTSTATUS;
 #include "nv_ioctl_defs.h"
 #include "win_wire.h"
 
+/* ---- device loss: KMD views that vanish under a live process -------------
+ *
+ * The CPU mappings below are views the KMD maps into this process itself
+ * (HELIOS_NVRM_OP_MMAP: USERD, GPFIFO rings, semaphores, BAR memory). When
+ * the KMD stops under live processes (a live driver update, a device
+ * restart), dxgkrnl destroys the devices and the KMD unmaps those views; the
+ * next plain load or store from NVK is an access violation (an NVK process
+ * died writing GP_PUT into USERD at a device restart). helios_kmdmap.h is
+ * the one process-wide table and exception-handler protocol the Venus ICD
+ * and the Helios UMD use for the same problem (see there): every view is
+ * registered, a vanished one is backed with zero pages, and the process's
+ * loss epoch moves, which NVK reads through crm_win_loss_epoch(). After a
+ * loss this library sends no escape any more (the device handles are dead,
+ * and fd numbers of the dead generation could alias a later one's): a
+ * process needs restarting to get the GPU back through RM. */
+static void crm_kmdmap_log(const char *fmt, ...)
+{
+    FILE *f = fopen("C:\\ProgramData\\Helios\\helios_icd_diag.log", "a");
+    if (!f)
+        return;
+    fprintf(f, "%lu pid=%lu rmclient ", (unsigned long)GetTickCount(),
+            (unsigned long)GetCurrentProcessId());
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+#define HELIOS_KMDMAP_LOG(...) crm_kmdmap_log(__VA_ARGS__)
+#include "helios_kmdmap.h"
+
 /* ---- D3DKMT, resolved at run time so the build needs no gdi32 import ------ */
 
 typedef NTSTATUS(APIENTRY *pfn_enum_adapters2)(D3DKMT_ENUMADAPTERS2 *);
@@ -79,6 +112,11 @@ typedef NTSTATUS(APIENTRY *pfn_query_adapter_info)(const D3DKMT_QUERYADAPTERINFO
 struct win_ctx {
     SRWLOCK lock;
     int ready;
+
+    /* Device loss (helios_kmdmap.h): attached to the shared table once, at
+     * the first successful init; the loss epoch then. */
+    int kmdmap_attached;
+    int32_t loss_epoch0;
 
     pfn_enum_adapters2 enum_adapters2;
     pfn_create_device create_device;
@@ -108,6 +146,7 @@ struct win_ctx {
     /* Live CPU mappings made by map_memory, found again by pointer at unmap. */
     struct win_map {
         void *ptr;        /* the address handed to the caller */
+        void *base;       /* the start of the KMD's view (registered for loss) */
         int fd;           /* the channel kept for this mapping */
         uint32_t id;      /* the KMD/host mapping id */
     } *maps;
@@ -288,8 +327,17 @@ static int nvrm_escape(struct win_ctx *c, void *buf, uint32_t size)
     return r;
 }
 
+/* Has the KMD gone away under this process since init? */
+static int win_lost(struct win_ctx *c)
+{
+    return c->kmdmap_attached && helios_kmdmap_lost(c->loss_epoch0);
+}
+
 static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size)
 {
+    if (win_lost(c))
+        return -ENODEV;
+
     D3DKMT_ESCAPE esc;
     memset(&esc, 0, sizeof(esc));
     esc.hAdapter = c->adapter;
@@ -300,6 +348,13 @@ static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size)
     esc.pPrivateDriverData = buf;
     esc.PrivateDriverDataSize = size;
     const NTSTATUS st = c->escape(&esc);
+    if (st != 0 && c->kmdmap_attached && helios_kmdmap_status_is_device_gone(st)) {
+        if (!win_lost(c))
+            crm_kmdmap_log("device-lost: D3DKMTEscape status=0x%08lx, no more RM "
+                           "escapes in this process", (unsigned long)st);
+        helios_kmdmap_mark_lost(c->loss_epoch0);
+        return -ENODEV;
+    }
     return st == 0 ? 0 : nt_to_errno(st);
 }
 
@@ -535,6 +590,10 @@ static int win_init(struct win_ctx *c)
             r = find_adapter(c);
         if (r == 0) {
             c->ready = 1;
+            if (!c->kmdmap_attached) {
+                c->loss_epoch0 = helios_kmdmap_attach();
+                c->kmdmap_attached = 1;
+            }
             read_host_tables(c);
         }
     }
@@ -939,7 +998,7 @@ static int nvrm_munmap_call(struct win_ctx *c, uint32_t id)
     return r ? r : kmd_status_to_errno(u.head.status);
 }
 
-static int map_table_add(struct win_ctx *c, void *ptr, int fd, uint32_t id)
+static int map_table_add(struct win_ctx *c, void *ptr, void *base, int fd, uint32_t id)
 {
     int r = 0;
     AcquireSRWLockExclusive(&c->lock);
@@ -954,7 +1013,7 @@ static int map_table_add(struct win_ctx *c, void *ptr, int fd, uint32_t id)
         }
     }
     if (r == 0)
-        c->maps[c->n_maps++] = (struct win_map){ .ptr = ptr, .fd = fd, .id = id };
+        c->maps[c->n_maps++] = (struct win_map){ .ptr = ptr, .base = base, .fd = fd, .id = id };
     ReleaseSRWLockExclusive(&c->lock);
     return r;
 }
@@ -1044,7 +1103,9 @@ static int win_map_memory(void *vctx, int ctl_fd, const struct crm_map_request *
         uint32_t id = 0;
         r = nvrm_mmap_call(c, (uint32_t)fd, prot, 0, end - start, &base, &id);
         if (r == 0)
-            r = map_table_add(c, (uint8_t *)base + (req->offset - start), fd, id);
+            r = map_table_add(c, (uint8_t *)base + (req->offset - start), base, fd, id);
+        if (r == 0)
+            helios_kmdmap_register(base, end - start, (uint64_t)(uintptr_t)c);
         if (r != 0) {
             if (base && id)
                 (void)nvrm_munmap_call(c, id);
@@ -1076,7 +1137,9 @@ static int win_unmap_memory(void *vctx, int ctl_fd, const struct crm_map_request
         return -ENOENT;
     /* The view goes first, then the host's mapping. The channel RM armed the
      * mapping on stays open until the library's NV_ESC_RM_UNMAP_MEMORY (win_ioctl
-     * closes it then), or until the control channel closes. */
+     * closes it then), or until the control channel closes. Out of the loss
+     * table before the KMD unmaps the view. */
+    helios_kmdmap_unregister(m.base);
     (void)nvrm_munmap_call(c, m.id);
     if (pend_add(c, req->h_memory, cookie, m.fd) != 0)
         win_close(c, m.fd);
@@ -1827,6 +1890,30 @@ static struct crm_transport windows_transport = {
     .free_pages = win_free_pages,
 };
 
+int32_t crm_win_loss_epoch(void)
+{
+    struct helios_kmdmap_table *t = helios_kmdmap_t;
+    if (!t)
+        return 0;
+    /* A "lost" answer also backs views the KMD unmapped since (rate-limited). */
+    if (g_ctx.kmdmap_attached)
+        (void)helios_kmdmap_lost(g_ctx.loss_epoch0);
+    return (int32_t)InterlockedCompareExchange(&t->epoch, 0, 0);
+}
+
+/* The vectored handler lives in this DLL: take it out when the DLL is
+ * unloaded while the process goes on (FreeLibrary; at process exit nothing
+ * runs any more). The table entries stay: the Venus ICD or the UMD may still
+ * hold handlers on the same table, and our views are the KMD's to unmap. */
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved);
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+{
+    (void)inst;
+    if (reason == DLL_PROCESS_DETACH && reserved == NULL && g_ctx.kmdmap_attached)
+        helios_kmdmap_detach();
+    return TRUE;
+}
+
 const struct crm_transport *crm_windows_transport(void)
 {
     return &windows_transport;
@@ -1840,6 +1927,7 @@ const struct crm_transport *crm_default_transport(void)
 #else /* !_WIN32 */
 
 const struct crm_transport *crm_windows_transport(void) { return NULL; }
+int32_t crm_win_loss_epoch(void) { return 0; }
 
 #include <errno.h>
 

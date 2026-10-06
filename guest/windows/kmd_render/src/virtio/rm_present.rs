@@ -213,14 +213,14 @@ fn mirror_due() -> bool {
 pub(crate) fn note_frame_edge(adapter: &AdapterContext) {
     EDGE_COUNT.fetch_add(1, Ordering::Relaxed);
     FRAME_EDGE.store(1, Ordering::Release);
-    adapter.signal_hpd();
+    adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::EDGE);
 }
 
 /// A user source ended and the resident one has scanout 0 again: re-flip it. Same
 /// context rules as [`note_frame_edge`].
 pub(crate) fn note_resume_edge(adapter: &AdapterContext) {
     RESUME_EDGE.store(1, Ordering::Release);
-    adapter.signal_hpd();
+    adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::EDGE);
 }
 
 /// The desktop wanted a flush while a USER source holds scanout 0 (the gate withheld

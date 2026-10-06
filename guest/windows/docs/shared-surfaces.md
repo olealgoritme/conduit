@@ -173,7 +173,7 @@ never drained) with user-mode state only; its cost is the reader's submission-wo
 the read needs anyway. A GPU-side wait can replace the CPU wait in the reader's submission worker
 later without changing the ledger.
 
-Per-device entries (ledger v3, `Local\\HeliosHandoffLedger3`): a slot keeps one point per
+Per-device entries (ledger v3, now v4 `Local\\HeliosHandoffLedger4`): a slot keeps one point per
 publishing device (four entries; an entry is reused once its point completed or its record moved
 on). With a single "last publisher" point (442d2c2) the reader's own publication could replace the
 releaser's before the reader sampled it, so it waited for nothing: keyed-load stale on 319.2 in
@@ -191,6 +191,15 @@ back to the releaser CPU wait, counted. Header counters (records in use, slots i
 sweeps, hand-offs) are in the UMD log every 4096 hand-offs and from `d3d11_share ledger`;
 `d3d11_share churn N` creates, hands off and destroys N shared textures and checks that the slots
 in use come back.
+
+Causal bound (ledger v4, DXVK patch 0011): points are a ledger-wide publication sequence, and a
+device's CS thread only waits for foreign points published before its own next point that the CS
+thread has not reached yet (the UMD keeps the published-but-not-reached points per DxvkDevice;
+`HeliosSignalHandoffPoint` reports reaching one). The work being recorded was issued before that
+point was published, so a later foreign point is no dependency; waiting for it closed a cycle
+when the CS thread lagged (each process's submission waiting for the other's later point, broken
+only by the two-second cap: keyed-load perf mode on 323.1 took two seconds per round). Waits that
+reach the cap are logged ("still pending after").
 
 Any access waits (DXVK patch 0008): the ledger is sampled where DXVK tracks every resource
 access, at the first tracking of a shared image in a submission, so render targets, clears, UAV

@@ -116,6 +116,27 @@ const fn share_tables_agree() -> bool {
 }
 const _: () = assert!(share_tables_agree());
 
+/// `kmd_logic` carries its own copy of the three GB20x block-linear modifier families and of
+/// the element-size-to-family rule (`foreign_resource::gb20x_family`): the constants and the
+/// rule give the protocol's values for every element size up to 64 bytes and for the extremes.
+const fn gb20x_families_agree() -> bool {
+    if fr::MOD_NVIDIA_BLOCK_LINEAR_BASE != helios_protocol::MOD_NVIDIA_BL_GB20X
+        || fr::MOD_NVIDIA_BLOCK_LINEAR_BASE_8BPP != helios_protocol::MOD_NVIDIA_BL_GB20X_8BPP
+        || fr::MOD_NVIDIA_BLOCK_LINEAR_BASE_16BPP != helios_protocol::MOD_NVIDIA_BL_GB20X_16BPP
+    {
+        return false;
+    }
+    let mut bytes = 0u32;
+    while bytes <= 64 {
+        if fr::gb20x_family(bytes) != helios_protocol::gb20x_family(bytes) {
+            return false;
+        }
+        bytes += 1;
+    }
+    fr::gb20x_family(u32::MAX) == helios_protocol::gb20x_family(u32::MAX)
+}
+const _: () = assert!(gb20x_families_agree());
+
 /// Escapes of this verb, for the registry-write throttle.
 static CALLS: AtomicU32 = AtomicU32::new(0);
 

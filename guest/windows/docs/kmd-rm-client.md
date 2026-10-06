@@ -2168,6 +2168,12 @@ desktop chain) is the protection; the residual hazard is a viewer that still sam
 interval later (tearing, never corruption). The host's release book still sees every flip (`present_within` mints and sends
 through it; `RelMatch` grows); it is not read. Whether the KMD should read it is checklist step 8.
 
+With `FfAsyncWin` (15.18.13) the host's flips are no longer waited for, so the publication can run ahead of the host. The
+exposure is then bounded by the WINDOW, not by the 250 ms round-trip timeout: while the window is full of flips still
+within their timeout the worker does not drain the pending programming slot (`FfDrainHeld`), so DWM cannot cycle its swap
+chain further ahead of what the host has been told than the window (1 to 4 flips). The residual hazard is the same tear
+(never corruption), at most the window deep; the checklist's tearing row (15.18.13.6 step 8) measures it.
+
 Ordering against the NVK rendering is NOT something this arm provides: it flips when dxgkrnl names the allocation, as the
 level 5 arm does. For the DMA-buffer flip the flip's fence retires behind the programming; for the MMIO flip dxgkrnl names
 the allocation after its fence. That the NVK work for the frame is complete by then is the UMD's contract (the
@@ -2280,6 +2286,9 @@ registration (`FfRegs`, `FfRegFail`, so Windows alternating between Venus and fo
 registration), only by the throttled mirror (`submit_command.rs`), which writes nothing until the knob was on and an
 allocation was seen. The mirror's values can therefore lag the live ones by a mirror period.
 
+The pipelining and round-trip counters (`FfAsyWin`, `FfAsSub`, `FfAsAck`, `FfAsFail`, `FfAsTmo`, `FfAsLate`, `FfWinFull`,
+`FfAsQFull`, `FfAsHigh`, `FfRttN`, `FfRttUsSum`, `FfRttUsMax`, `FfEarlyQ`, `FfEarlyWake`, `FfGateWake`) are in 15.18.13.5.
+
 `FfProg` counts every `SetVidPnSourceAddress` / DMA flip shown through this arm; `FfFrames + FfReflips` is the number of
 host flips, at most one per refresh period (the difference is coalescing).
 
@@ -2370,6 +2379,384 @@ it must not):
    `program_vidpn_source_inner` runs under the scanout lifecycle lock).
 6. **A withdrawn source owes the Venus desktop a flush** of an unbound foreign resource (`RfUnb`): the screen keeps its last
    flip. A copy-based fallback for an existing foreign primary is not built (the same limit as 15.14 point 3).
+
+#### 15.18.13 `ForeignFlip` rate and pipelining (built; compiled by nothing, run by nothing; `FfAsyncWin`, default off)
+
+**The question.** A tester run of KMD 323.1 with `ForeignFlip=1` and DWM on NVK flipped for 38 s without a stall, zero copy
+(`FfProg` 40 to 116, `FfFrames` 74 to 219, `FfRef`, `FfFlipFail`, `FfStale`, `FfGaveUp` 0). That is 76 programmings
+(2.0 per second) and 145 host flips (3.8 per second). Is that the idle desktop (a Venus DWM idles at about 2.2 flips per
+second), or a limit of the design? The target is a flip programmable every 4.17 ms at 240 Hz with the host's answer off
+the critical path.
+
+**The answer, short.** The design IS serialised, in the way the question guessed, and with a real worst case: while a host
+round trip is in flight the HPD worker cannot drain the next `SetVidPnSourceAddress`, so every later publication waits for
+the host, up to `WORKER_FLIP_TIMEOUT_MS` (250 ms) when the host stalls (a tester run has already seen three 100 ms host
+stalls, `flip_completion.rs`). Whether it was the limit in the 38 s run cannot be told from those counters: they bound the
+host's round trip only above (3.8 per second means a mean under 262 ms, which says nothing). The idle-desktop reading is
+the likelier, and 15.18.13.6 is what settles it on hardware (`FfRttUsSum / FfRttN`, new). `FfFrames` was 1.9 times
+`FfProg`: the extra host flips are the desktop's refresh edges (`rm_present::note_frame_edge` from the withheld Venus
+flushes) and resume edges, so the host flips were NOT coalesced, which says the worker was not saturated at that load.
+
+##### 15.18.13.1 One DWM flip, step by step (file:line at 81c95e4)
+
+| # | step | where | blocks on the host? |
+|---|---|---|---|
+| 1 | MMIO contract: `DxgkDdiSetVidPnSourceAddress` at DIRQL pairs the handle and swaps it into the ONE slot `pending_vidpn_allocation` (a newer flip replaces an older one, counted `VpCoal`) | `ddi/display.rs:1957-1981` | no |
+| 1' | DMA contract: `arm_dma_flip_programming` (submit path) does the same swap and `signal_hpd()` at once | `ddi/display.rs:2012-2121` | no |
+| 2 | the worker is woken: MMIO only by the vsync tick, and only when `vsync_enabled != 0` (the early `return` at `adapter/kobj.rs:621-623` skips the `signal_hpd` at 678-680) | `adapter/kobj.rs:621,678` | no |
+| 3 | the worker loop: wait on `hpd_event` (`ddi/hpd.rs:223`), then in order `foreign_scanout_service` (268), `foreign_fence_service`, `process_deferred_vidpn_source_address` (280), windowed blt, `rm_client::service`, `foreign_flip::service` (298), the `Nv*` mirror, the dumps | `ddi/hpd.rs:223-298` | the order is the point |
+| 4 | `process_deferred_vidpn_source_address` swaps the slot to 0 and runs `program_vidpn_source_inner` under the scanout lifecycle mutex | `ddi/display.rs:2353-2373,3103` | no |
+| 5 | `ffl::program` (`ddi/display.rs:3188`): `gather` facts, `decide_for`, then `take`: `TARGET.set`, `publish_bound_primary(primary_address)` (this is the publication toward dxgkrnl: the address the next `CRTC_VSYNC` carries), `OWED = 1`, `note_frame_edge` | `virtio/foreign_flip.rs:342-422` | no (sends nothing) |
+| 6 | the same worker pass reaches `foreign_flip::service`, `service_pass`: `decide` returns `CopyFlip` (paced to one per refresh period, `rm_refresh::flip_interval_100ns`) | `virtio/foreign_flip.rs:487-604` | no |
+| 7 | `flip` calls `present_within(... FLIP_TIMEOUT_MS = 250)`: `mint`, `scanout_release::minted`, then `send` builds the 64-byte `ScanoutFlip` (msg 20) and calls `ctrl::raw_roundtrip` | `virtio/foreign_flip.rs:647-678`, `virtio/foreign_scanout.rs:70-109,223-239` | YES |
+| 8 | `raw_roundtrip`: enqueue on the control queue, notify, spin up to a short budget (`spin_for_completion`), then `wait_block` on a stack `KEVENT` in slices of 1, 2, 4 ... ms | `virtio/ctrl.rs:597-711` | YES, the worker thread sleeps here |
+| 9 | the host answers in queue order; the interrupt, DPC and `drain_used` signal the stack event; the worker wakes, books the flip in the release book (`note_flip_sent`) and returns `Shown` | `virtio/gpu/mod.rs` drain `Raw` arm | |
+
+**(a)** Yes: the host answer is awaited synchronously (step 8) on the single worker thread that also drains
+`pending_vidpn_allocation` (step 4). The drain precedes the flip service within one pass, so a flip programmed in pass N is
+sent in pass N, and the NEXT flip's programming waits for that round trip to return.
+**(b)** The service sends only the newest frame: the shown target is one slot (`Book::cur`) that every programming
+overwrites and `OWED` is one flag, so any number of programmings during a round trip become one flip of the newest picture.
+Nothing queues. (Counter: `FfProg - FfSame` against `FfFrames`.)
+**(c)** No: one worker thread, one round trip at a time. A programming that arrives during a round trip is published at
+the earliest when the round trip returns, then flipped.
+**(d)** The host handles the control queue on ONE thread, in avail order, under the backend mutex
+(`host/backend/device/bin/conduit-backend.rs:1236-1246`), and `ScanoutFlip` is just one of the messages
+(`nvidia/scanout.rs:26-86`; the dma-buf export is cached, `link.flip` never blocks). The queue is shared with every other
+message of the guest: Venus `SUBMIT_3D`, `RESOURCE_FLUSH`, the forwarded RM ioctls (allocations, maps, which can take
+milliseconds), fences. So the flip's answer is delayed by whatever was queued ahead of it.
+
+**The arithmetic (what the current design sustains).** Per flip, the worker is busy for about `RTT + pass overhead`
+(registry-free, tens of microseconds) and the next flip is paced to `max(refresh period, 2 ms)`. Rate limit
+`~ 1 / max(refresh period, RTT + overhead)`:
+
+| mode | refresh period | RTT that still sustains it | at RTT = 8 ms | at RTT = 100 ms | at the 250 ms timeout |
+|---|---|---|---|---|---|
+| 60 Hz | 16.67 ms | up to about 16 ms | 60 per s | 10 per s | 4 per s (each one a failure) |
+| 144 Hz | 6.94 ms | up to about 6.9 ms | 125 per s | 10 per s | 4 per s |
+| 240 Hz | 4.17 ms | up to about 4.1 ms | 125 per s | 10 per s | 4 per s |
+
+With a healthy, idle host (a header-only reply, a cached dma-buf, one wake each way; the guest side a notify, an interrupt,
+a DPC, a thread wake) an RTT of 0.2 to 1 ms is what to expect, which sustains every row at its refresh rate. The design only
+bites when the host is busy: an RTT above the period halves, thirds, ... the flip rate, and an RTT of 100 ms (seen) is 10
+flips per second AND a 100 ms latency on every publication that arrives behind it. What cannot be known without hardware: the
+host's RTT distribution under DWM load (mean, tail), how often the worker has more than one programming waiting behind a round
+trip, and how much of the 2 to 4 per second in the tester's run is demand. `FfRttN`, `FfRttUsSum`, `FfRttUsMax` measure the RTT.
+
+##### 15.18.13.2 The publication latency that is NOT the host's: the wake
+
+Independently of the round trip, an MMIO flip is published only when the worker runs, and the worker is woken for it by the
+vsync tick alone (step 2). That is up to one refresh period of latency (4.17 ms at 240 Hz, a whole frame), and nothing at
+all while dxgkrnl keeps the CRTC_VSYNC delivery gate closed (`vsync_enabled == 0`: the tick still runs, but returns at
+`kobj.rs:621` before the `signal_hpd` at 678). `FfAsyncWin` also changes both (below).
+
+##### 15.18.13.3 The vsync question: what `VpVsN` counts
+
+`VpVsN` (the `VpVsN`/`VpVsT` pair of `scanout_trace::dump`, and `ScVs`, `VsCnt` mirrors of the same `vsync_count`) is
+incremented at the END of `service_vsync_tick` (`adapter/kobj.rs:687`), after the `vsync_enabled` gate (621) and the
+dxgkrnl callback check, i.e. it counts the ticks that were DELIVERED (a `CRTC_VSYNC` was signalled), not the timer's ticks.
+The gate is dxgkrnl's `DxgkDdiControlInterrupt` (`ddi/interrupt.rs:472`): dxgkrnl enables the interrupt only while something
+waits for a vsync (a queued flip, a vsync wait by DWM) and disables it when it is idle. `VsCnt`/`VsCntT` were frozen because
+they are written by the Venus refresh mirror (`adapter/scanout.rs:724`), which does not run with `ForeignFlip` (no Venus
+refresh), and `ScVs` only by `EnumVidPnCofuncModality`; only `VpVsN` rides the worker's periodic dump (`dump_periodic`, every
+128 loops).
+
+12.7 delivered ticks per second against a 60 Hz timer (or 240 Hz) is therefore CONSISTENT with an idle DWM and a gate that is
+open about one tick in five (or one in nineteen), and equally with a slow timer; the existing counters cannot separate them.
+`VsMinGap` and `VsFast` only say the ticks that DID run were not bunched (`VsFast` near 0, `VsMinGap` near the period; a
+`VsMinGap` far below half the period or `VsFast` near the tick count would be a burst or a second timer). `VsPendN` (ticks
+in a row with a programming pending) says the worker kept up: small is healthy. The new counters settle it:
+
+* `VsTickN`: every tick of the timer, whatever the gate; its rate against the dump's own clock (`VpDmpT`) is the timer's rate
+  (must be 60, 144 or 240 per second to within a percent);
+* `VsOffN`: ticks that ran with the delivery gate closed; `VsTickN - VsOffN = VpVsN`.
+
+`VsTickN` at the refresh rate with `VsOffN` large: dxgkrnl keeps the gate closed while idle (nothing wrong); `VsTickN` at
+a fraction of the refresh rate: the timer itself is slow (a `KeSetCoalescableTimer` / high-resolution timer problem to be
+looked at); both are atomics in the tick (`ddi/stall_diag.rs`), mirrored at PASSIVE beside `VpVsN`.
+
+##### 15.18.13.4 The design (`FfAsyncWin`, 0 = off = exactly the old behaviour)
+
+`FfAsyncWin` = 1 to 4 (larger is 4), read once per transport generation and only with `ForeignFlip` on:
+
+1. **Pipelined host flip.** `service_pass` calls `flip_async` instead of `flip`: the same re-check of the target at submit
+   time (`TARGET.current() == target`: a destroyed allocation or a closed file is never named) and the same ownership
+   proof and mint (`present_submit`, built on `mint`), then ONE `ScanoutFlip` is submitted on the control queue
+   (`ctrl::raw_submit_async`) and the worker goes on. Nothing waits for the host. The wire message is byte for byte the
+   same as the round trip's (`build_flip`).
+2. **The answer.** `InFlightKind::RawAsync` (`virtio/gpu/mod.rs`): the used-ring drain, at DISPATCH, reads the reply
+   header's `status` and writes ONE word to the slot's static cell (`flip_pipeline::pack_reply`), then signals the worker's
+   event. No stack waiter is involved, so there is no abandon race: the cell is `'static`, and a slot that timed out stays
+   keeps its cell until its word arrives (a late answer is only counted), so a reused cell is never written by an old
+   flip. The tag in the word (the low 30 bits of the flip's `seq`) also protects against a word from an earlier transport
+   generation. A dead transport writes "no reply" into every cell (`latch_failed_and_fail_inflight`).
+   **Orphaning.** A flip still unanswered 3 s after its submission (`ORPHAN_AFTER_100NS`) stops counting toward the window
+   (`FfAsOrph`), so a lost reply cannot shrink the window for good: a dead host costs the window three seconds. Its CELL
+   stays reserved: there are 8 cells for a window of at most 4, so a late word cannot land in a cell a newer flip uses.
+   Only when every cell is held does a new flip take over the OLDEST orphan's cell (`FfAsRecyc`); the tag then keeps the
+   orphan's late word from being read as the new flip's answer (what it cannot prevent: an orphan word that lands after
+   the new flip's own answer overwrites it, and that flip then times out, once).
+3. **Settling** (`foreign_flip::settle`, called by the worker loop BEFORE it drains the pending programming, so an answer that
+   frees the window lets the same pass publish the next flip): the accounting the round trip's return did, driven by the
+   answer, **in sequence order** (`Pipeline::settle_all`, not cell order), and with **at most one strike per pass**: of
+   the failures a pass finds only the first costs the presenter a strike, the others owe the frame without one
+   (`FfStrikeSkip`), as the synchronous path spends one strike per attempt and cannot spend three in a pass. In sequence
+   order a later taken flip clears the strikes of an earlier failure (the next success of the synchronous path would); a
+   newer failure is never cleared by an older flip's ack. **Interrupt-loss tolerance:** while a flip waits, the settle
+   first drains the used ring itself (`drain_used_and_complete`, the DPC's routine, which also retires the fences a drain
+   may consume), and the worker arms a 4 ms poll wake while a flip is flying, so a reply that sits in the ring at the
+   250 ms deadline is read, not counted as a timeout. A taken flip: release book `sent`, arbiter `flip_done(true)` (the source's lapse is extended
+   from the ACK), `FfFrames`/`FfReflips`, `Presenter::acked` (strikes and retry pause cleared). A refused flip or no
+   reply: `scanout_release::gone`, `flip_done(false)`, `FfFlipFail`, `FAIL_UNTIL`, `Presenter::flipped(Failed)` (a strike,
+   the frame owed, the 100 ms retry pause), so three in a row still give up (`FfGaveUp`, five seconds on Venus). A flip
+   unanswered after `WORKER_FLIP_TIMEOUT_MS`: ONE failure, assumed taken in the release book, as the round trip's timeout
+   always was (`FfAsTmo`). A window of slots that are ALL abandoned counts a failure per attempt
+   (`Pipeline::stuck`), so a dead host still reaches the three strikes and the Venus fallback.
+4. **Backpressure.** The worker loop does not drain `pending_vidpn_allocation` (it calls `foreign_flip::drain_blocked`
+   before `process_deferred_vidpn_source_address`) while the window is full of flips still within their timeout. So the
+   publication cannot run further ahead of the host than the window: DWM, which is paced by dxgkrnl's completion of
+   what it presented, stalls at most for the host's answer (an answer wakes the worker). The window of flips that timed
+   out (abandoned) does NOT hold the drain: the timeout already bounds the wait, and the three-strike fallback needs
+   the programming to go on. The vsync tick keeps waking the worker while the slot is pending, so the first pass after
+   the answer drains it. `FfDrainHeld` counts the loops that held it.
+5. **Coalescing.** The window bounds what is in flight (`can_submit`). When it is full the frame stays owed
+   (`FfWinFull`; the presenter is told `Yielded`, no strike) and the pass ends; the answer that frees a slot wakes the
+   worker, which then flips the target's CURRENT picture: older pictures were superseded by the single-slot target
+   already, nothing is queued. With window 1 and a healthy host that is "at most one flip in flight, the newest wins".
+6. **Pacing.** `Presenter::submitted` commits the surface and the pacing clock at the submit (one flip per refresh period,
+   as before); the strikes belong to the answers.
+7. **Release and fence rules unchanged.** `scanout_release::minted` at submit, `sent` / `gone` at the answer (the same
+   functions through `note_async_result`); reuse is still the conservative rule of 15.18.5 (the displayed address is
+   published at programming, nothing waits for `ScanoutReleased`); the stale-file proof is `mint`'s, at submit; the
+   epoch of the presenter rides on the slot so an answer of an earlier epoch does not strike a new presenter; the ring
+   presenter's waits (`RelRWaits`) are not involved (a ring of one, no copies).
+8. **Early wake** (the same knob; atomics and one DPC request only): the MMIO DDI at DIRQL asks for the DPC
+   (`DxgkCbQueueDpc`, legal at DIRQL) right after it swaps the pending slot, and the DPC wakes the worker when a
+   programming is pending (`FfEarlyQ`, `FfEarlyWake`); the vsync tick wakes it for a pending programming with the delivery
+   gate closed (`FfGateWake`). The worker then publishes a flip within its own latency (tens of microseconds) instead of at
+   the next tick.
+
+What the window changes: publication (`take`) never depended on the host; what is removed is the worker being busy inside
+a round trip when the next programming is waiting. A host that stalls for 100 ms now costs a stale picture and a counted
+flip; DWM waits at most for the window to drain (backpressure), and for no longer than the round trip's 250 ms timeout.
+
+**Host changes: none required.** The host replies to every `ScanoutFlip` today and the reply is what the guest now reads
+asynchronously, so the design works against the current host at its best pipelining (window 1 to 4 over a single in-order
+queue). What would help further, and only matters if `FfRttUsMax` shows the host's queue delay to be the problem: (i) a flip
+that is not queued behind blocking RM ioctls (a dedicated queue or a worker thread for `ScanoutFlip`, whose handler is
+non-blocking), (ii) the host dropping a queued flip when a newer one for the same scanout is already queued (the guest
+coalesces already; this only helps the window). Neither is built; `host/` is untouched.
+
+##### 15.18.13.5 Counters (all `Ff*` at most 13 characters except where noted; no name is shared with any other counter)
+
+| value | what | expect |
+|---|---|---|
+| `FfAsyWin` | the window in force (0 = off) | the knob |
+| `FfAsSub` / `FfAsAck` / `FfAsFail` / `FfAsTmo` / `FfAsLate` | flips submitted / taken / refused or no reply / unanswered within 250 ms / answers after a timeout | `FfAsSub = FfAsAck` (+ the few in flight); the rest 0 |
+| `FfWinFull` / `FfAsQFull` / `FfAsHigh` | frames kept owed because the window was full / submits that found the control queue full / most flips in flight | small / 0 / at most the window |
+| `FfRttN`, `FfRttUsSum`, `FfRttUsMax` | host round trip in microseconds as the worker saw it, in BOTH modes (sync: the whole `present_within`; async: submit to the pass that read the answer): count, sum (wraps at 2^32 us, 71 minutes), maximum | mean = Sum / N: a healthy host 200 to 1500 us; Max below 20 ms |
+| `FfAsOrph` / `FfAsRecyc` | flips given up on after 3 s (no longer in the window) / orphaned cells a newer flip took over | 0 / 0 |
+| `FfStrikeSkip` | failures in the same pass as another, which cost no strike | 0 |
+| `FfDrainHeld` | worker loops that left the pending programming undrained because the window was full of flips in flight (the backpressure) | small: a loop or two per flip at most; a count near `FfProg` times 10 means the host's RTT is the pacing |
+| `FfEarlyQ` / `FfEarlyWake` / `FfGateWake` | DPCs requested by the DDI at DIRQL / DPCs that woke the worker for a pending programming / ticks that did with the gate closed | `FfEarlyQ` near `FfProg`; `FfGateWake` small |
+| `VsTickN` / `VsOffN` (service key, `VpVsN` dump) | vsync timer ticks / of which with the delivery gate closed | `VsTickN` at the refresh rate |
+
+##### 15.18.13.6 Hardware checklist (T5: continuous motion, then 240 Hz)
+
+Prerequisites: 15.18.11 steps 1 to 5 pass with the knob absent from `FfAsyncWin` (the synchronous flip is the baseline).
+Always use the lowest mode first: 1920x1080 at 60 Hz, then the larger modes and the higher rates.
+
+1. **Baseline, synchronous, with motion.** Drag a window continuously (or run a 60 fps animation) for 60 s at 1920x1080
+   60 Hz. Read, 10 s apart: `FfProg`, `FfFrames`, `FfReflips`, `FfRttN`, `FfRttUsSum`, `FfRttUsMax`, `FfFlipFail`,
+   `VpVsN`, `VsTickN`, `VsOffN`, `FkKeep`. Expect with motion at 60 Hz: `FfProg` and `FfFrames` about 60 per second (DWM on NVK
+   presents once per frame while content moves), `FfFlipFail` 0, `FkKeep` 0 or growing only at the refreshes that are
+   kept pictures, mean RTT (Sum / N) under 1.5 ms, Max under 20 ms, `VsTickN` about 60 per second.
+   **The decision:** if `FfFrames` per second is well below `FfProg` per second AND RTT mean is a large part of the
+   refresh period (above about 4 ms at 60 Hz), the serialisation is the limit: continue. If `FfProg` itself is low
+   (DWM is not presenting faster), the limit is upstream (`VpVsN`, `VsOffN`: a gate dxgkrnl keeps closed, the swap chain
+   depth, DWM's own pacing) and the window will not help.
+2. **Vsync accounting.** `VsTickN` per second against the mode's rate. At the rate and `VsOffN` growing while idle:
+   dxgkrnl closes the gate when idle (expected); `VpVsN` then follows the flips. `VsTickN` below the rate: the timer is slow.
+3. **Turn the window on.** `reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v FfAsyncWin /t REG_DWORD /d 1`,
+   restart the device (once per generation). `FfAsyWin=1`. Repeat step 1: `FfAsSub` grows and equals `FfAsAck` within the
+   in-flight count (`FfAsHigh` 1), `FfAsFail`, `FfAsTmo`, `FfAsLate`, `FfAsQFull` 0, `FfFlipFail` 0, `FfWinFull` 0
+   to small (nonzero means the RTT exceeded a frame period and frames coalesced). `FfFrames + FfReflips` matches `FfAsAck`.
+   `FfEarlyQ` about `FfProg`; `FfEarlyWake` at most `FfEarlyQ`; `FfAsOrph`, `FfAsRecyc`, `FfStrikeSkip` 0. The picture must
+   be as smooth as step 1 or smoother and show no stale frame after the motion stops (the last flip must reach the
+   host: the viewer shows the final position; if it shows the one before, report `FfWinFull`). Tearing is step 8.
+4. **Window 2 to 4.** Only if step 3 shows `FfWinFull` growing: `FfAsyncWin` 2, then 4; `FfAsHigh` reaches the window.
+   More than 1 in flight lets a RTT longer than the period be hidden; it does not shorten the RTT.
+5. **240 Hz** (after 60 and 144 pass): the mode at 240 Hz. Targets: `FfProg` up to 240 per second under motion, `VsTickN` 240
+   per second, `FfRttUsSum / FfRttN` under 4 ms (above it the window must be 2 or more and `FfWinFull` stays small),
+   `FfAsFail`, `FfAsTmo`, `FfGaveUp` 0, `FkKeep` stable, no `FfRef13`.
+6. **Stalled host (the row that proves the fixes).** With the window on (1, then 2), pause the backend for 2 s and resume.
+   Expect: DWM waits for the window, not for the stall (`FfDrainHeld` climbs while the host is paused, `VsPendN` large
+   only during it, `FlipPub` advances again within a tick of the first answer); one `FfAsTmo` per flip in flight at
+   the 250 ms mark (the timeout is read AFTER a drain: a reply already in the used ring is not a timeout, so a host that
+   answers just before 250 ms gives `FfAsAck`, not `FfAsTmo`); `FfFlipFail` and strikes at most 1 per pass
+   (`FfStrikeSkip` explains any difference between `FfAsTmo + FfAsFail` and `FfFlipFail` strikes), `FfGaveUp` at most 1
+   (the Venus fallback for five seconds); `FfAsLate` follows when the host resumes. Then pause it for 5 s: `FfAsOrph`
+   rises about 3 s after the first stuck flip and the window is usable again (`FfAsSub` grows with the fallback
+   restarted); `FfAsRecyc` stays 0 unless more than 8 flips were lost.
+7. **Fallback.** `FfAsyncWin` removed or 0 and a device restart: `FfAsyWin=0`, `FfAsSub=0`, the flips are round trips again
+   (`FfRttN` grows with `FfFrames`).
+8. **Tearing with the window** (the exposure of 15.18.5, now bounded by the window): drag a window over a moving video for
+   a minute at window 1, 2 and 4, and at the synchronous baseline; count visible tears each time and read `RelMatch`,
+   `RelDrop`, `FfDrainHeld`. Expect no more tears than the baseline at window 1 and 2; if tears grow with the window, the
+   window is the exposure and the answer is the smallest window that keeps `FfWinFull` small. Report the counts before the knob
+   is recommended on.
+
+Verified here: the pure window, slot lifecycle, acknowledgement word and the presenter's submit / answer split
+(`kmd_logic`, new tests in `flip_pipeline.rs` and `rm_present.rs`); the counter names (length, uniqueness, one writer file,
+the lists), the orphan age, the cell recycling and its tag check, the sequence order, the one-strike rule and the
+backpressure predicate (`flip_pipeline.rs`); the whole tree parses and type-checks against a stub harness for everything but the WDK's own types. NOT verified:
+anything that runs: that the drain's new arm and the DPC wake behave on a real queue, that `DxgkCbQueueDpc` from inside the
+MMIO flip's `DxgkCbSynchronizeExecution` callback is accepted at DIRQL (it is documented callable from the ISR, which is also
+DIRQL), the host's RTT, the effect on smoothness. Risks: a new `InFlightKind` in the transport's drain (a bug there is a
+transport bug: the arm only stores one word and signals an event, and recycles the buffer exactly as the raw forward does);
+the early DPC adds one `DxgkCbQueueDpc` per flip with the knob on; with the knob at 0 none of this runs (one atomic load in
+three places).
+
+#### 15.18.14 T5 anomalies (KMD 325.1, `ForeignFlip` 1, DWM on NVK, an NVK window presenting at ~8000 fps through WDDM): analysis, fixes, next-run checklist
+
+**What the run showed (pass 1 `FfAsyncWin` 0, pass 2 `FfAsyncWin` 2: identical, so the window is irrelevant).**
+`FfFrames = FfSeq = FsPres = FfRttN` grew about 155 a second while `FfProg = FfEdges = 4`, `FlipIss = FlipPub = 5`,
+`VpFlip = 2`, `SaCnt = 1` and `VsTickN` (275) / `VpVsN` (271) were FLAT; `HpdLoopN` rose about 9600 a second with `HpdSite`
+11; `FsLive` 2, `FsSet` 0, `FsOwner` 333436272 (0x13DFD570). DWM on NVK made 26 presents in 40 s of motion.
+
+**The chain, proved from the code** (all four anomalies are one story):
+
+1. The vsync heartbeat stopped (or was never running after the first ~270 ticks). `signal_crtc_vsync` has ONE caller,
+   `service_vsync_tick` (`adapter/kobj.rs`); a flip is retired by dxgkrnl only when a `CRTC_VSYNC` carries its address, and
+   `last_primary_address` already named the 5th flip (`FlipPub` 5 = every issued flip was published). So with no tick the 5th
+   flip is never retired, dxgkrnl's flip queue stays full, and DWM stops presenting. That is anomaly (d): DWM did not stop
+   issuing flips for its own reasons; it was never told the previous one had flipped.
+2. With DWM silent, nothing changes the shown picture, but the worker still re-flips it. `FfFrames` counts a host flip for
+   a frame OWED, and a frame is owed by (a) a programming (`take`: `OWED`, `FfEdges`: 4) or (b) a refresh edge:
+   `foreign_scanout_suppresses` (`adapter/foreign_scanout.rs`) is asked by every desktop host-flush attempt
+   (`queue_active_scanout_refresh_locked`), finds the arm's own RESIDENT source live, and raises `note_frame_edge`. The
+   flush attempts come from `request_scanout_refresh_for`, which every present MARKER arms: `HERF` carries no resource
+   identity and arms with resource 0, which `present_marker_action` classifies as `QueueImmediate` for ANY application
+   ("the intentionally identity-free HERF edge"). So each of the NVK spin window's ~8000 presents a second is a refresh
+   edge of a picture that did not change; the presenter paces them to one host flip per refresh period (~155 a second
+   here) of the SAME GEM. `FfFrames`/`FsPres` are therefore the ForeignFlip arm's own `present_within` calls on its resident
+   source (not user scanout escapes: `FsSet` 0, `FsFQue` 0), and `FfFrames - FfProg` is almost entirely re-presents
+   (counted now: `FfReGem`, `FfNewGem`, `FfEdgeSup`).
+3. The HPD worker's ~9600 loops a second are the SAME presents. A timer cannot make that rate: every timed wake of the
+   worker is at least 1 ms (the foreign wait clamps there) and `hpd_wake::wait_plan` now guarantees 0.5 ms for any input
+   (tested over zero, positive and tiny timeouts), 2000 a second at the very most. Only events can: each windowed-Blt
+   `SubmitCommand` signals the worker once (`note_and_maybe_signal`, ~8000 a second here), each present marker that asks for
+   a refresh signals it again (`request_scanout_refresh_for`), each fence the used-ring drain finds does (`signal_hpd` in
+   `drain_used_and_complete`). 9600 loops against ~8000 presents is 1.2 wakes per present. The defect in that is the COST
+   of a wake: `scanout_trace::dump_periodic` ran the `Vp*` dump (about 300 registry writes: the ring, eight histograms, the
+   scalars, the read ledger) every 128th WAKE, i.e. about 75 times a second at this rate, keeping the worker out of its flip
+   pacing for a large part of every second. That is the likeliest reason the re-flips ran at 155 a second and not at the
+   240 Hz the presenter allows (`FfWaitN` and `HpdBusyUs` / `HpdDumpUs` settle it).
+
+**(a) `HpdSite` 11** is `site::NVRM_PUBLISH`, and it is where the value is WRITTEN, not where the worker lives: the Nv* mirror
+(`nvrm_publish_service` -> `publish_nvrm_counters` -> `stall_diag::publish_counters`) is the code that writes `HpdSite`, and the
+worker had entered that site a moment earlier. A worker that is asleep reads 1 (`WAIT`). Read `HpdBusyUs` against `StallT`
+instead (below).
+
+**Does the resident source withhold vsync or flip completion? No.** `foreign_scanout_suppresses` has exactly one caller,
+`queue_active_scanout_refresh_locked`, and it withholds exactly one thing, the Venus `RESOURCE_FLUSH` of the desktop. The
+CRTC_VSYNC (`service_vsync_tick`), the address it carries (`last_primary_address`, stored by `publish_displayed_primary`:
+`take` calls `publish_bound_primary` at programming, the kept-picture lanes `publish_kept_primary`) and every flip
+completion are independent of the arbiter's state. The resident source is the ForeignFlip arm's own: it is registered with
+the importing device's token, so it is "resident" (`FsLive` 2), never "user" (`FsLive` 1).
+
+**(b) `FsLive` 2 with `FsSet` 0.** `FsLive` 2 is "the KMD's RESIDENT source": the ForeignFlip arm registers its own
+resident source (`foreign_flip::register` -> `foreign_scanout_resident_set(owner = the importing device's token)`). `FsSet`
+counts only user `SCANOUT_SET` escapes. `FsOwner` 0x13DFD570 is the importing device's token (`DeviceOwner::new(hDevice)` of
+DWM's NVK device, `Target::owner`), not `KMD_RM`. `FsPres` is the arbiter's `present_within` count, shared by user
+presents and this arm's own flips (the arm calls `present_within` too), so `FsPres == FfFrames` is exactly "no user
+present, only this arm's flips". The presenter does not re-flip because an owed flag never clears: `decide` clears
+`owed_frame` when it returns `CopyFlip`; the flag is set again by the next refresh edge, and the edges arrive at the
+present rate of an unrelated application (point 2).
+
+**(c) What disarms the heartbeat.** Every site that can change `vsync_armed`, the one-shot or the delivery gate, by an
+exhaustive search of `kmd_render/src`: `arm_vsync` (StartDevice, D0), `disarm_vsync` (`quiesce_vsync` from
+`DxgkDdiSetPowerState` for any non-D0 state of ANY `DeviceUid`, `stop_vsync` from StopDevice / Drop), the tick's own
+exhaustion arm (`vsync_deadline::next` None: impossible for a 1 Hz to 1 kHz rate) and `ControlInterrupt`, which only
+toggles `vsync_enabled` (`VsOffN`). Nothing in `ForeignFlip`, the resident source, the arbiter, `holds_screen`,
+`publish_bound_primary`, `SetVidPnSourceVisibility`, the programming gate or the restore/resume edges touches the timer.
+The tick's early returns before `VsTickN` are exactly two (display half off, `vsync_armed` 0) plus the exhaustion arm.
+`VsTickN` is not a stale mirror: it is written by the worker's dump (at least every 128 wakes) and by the Nv* mirror in
+the same call as `HpdLoopN`, which moved. So the heartbeat really stopped after about 270 ticks, in BOTH passes, and
+restarted after the Venus revert (491). Two mechanisms fit and the counters could not tell them apart:
+
+* **H1, a quiesce.** `dxgkddi_set_power_state` quiesced on ANY non-D0 call, including a CHILD uid (the monitor): a
+  monitor blanked by dxgkrnl stopped the adapter's heartbeat, and a flip is retired only by the heartbeat. The D0 that
+  resumes it is not guaranteed to come while the output stays blanked. (The existing `PwrSt` value, `state << 16 |
+  action`, last call only, does not carry the uid: read it anyway, D3 is 4.)
+* **H2, a dead chain with `vsync_armed` still 1** (the timer expired and nothing re-armed it, or a quiesce/resume
+  raced the callback's own re-arm): no counter existed for it.
+
+**What changed (on top of 325.1; the version is not bumped here).**
+
+| change | file | default behaviour |
+|---|---|---|
+| Only the ADAPTER leaving D0 quiesces the heartbeat; a child's non-D0 state is counted (`PwrUid`, `PwrD3N`) and ignored (`hpd_wake::power_vsync`) | `ddi/lifecycle.rs`, `kmd_logic/hpd_wake.rs` | adapter transitions unchanged; a monitor's D3 no longer stops the heartbeat |
+| Heartbeat watchdog `AdapterContext::vsync_watch`: armed and silent for 250 ms (16 periods at 60 Hz) is re-armed (`VsRevN`); disarmed with the adapter in D0, the display half up and the delivery gate open is armed (`Resume`, PASSIVE callers). Run on every worker pass and from every escape | `adapter/kobj.rs`, `ddi/hpd.rs`, `ddi/escape.rs` | a healthy heartbeat never meets it (silence 250 ms is 60 periods at 240 Hz) |
+| While the heartbeat is meant to run the worker's wait gets a 250 ms tick (4 idle wakes a second), so a dead heartbeat and a sleeping worker cannot hold a pending MMIO flip for ever | `ddi/hpd.rs` (`hpd_wake::wait_plan`) | idle desktop: 4 wakes a second where there were 0 |
+| The `Vp*` dump cadence is "128 wakes AND 1 s" (`hpd_wake::dump_due`) | `ddi/scanout_trace.rs` | at 155 wakes a second as before (about 1 a second); at 9000 a second 1 instead of 70 |
+| A refresh edge raised by the worker's own refresh step (`foreign_scanout_suppresses` -> `foreign_flip::refresh_edge`) no longer signals the worker that raised it while the repeat gate holds it: it used to cost one extra wake per refresh request and a pass that only found the frame not yet due. Level 5's own resident source (owner `KMD_RM`) still raises `note_frame_edge` as before | `adapter/foreign_scanout.rs`, `virtio/foreign_flip.rs` | `ForeignFlip` 0 and level 5: unchanged |
+| A refresh edge of the resident source only REPEATS the picture the previous flip showed: repeats are gated to one per `FfRepeatMs` (default 100, 0 = every edge as before, at most 10000); a programming (a picture dxgkrnl issued) is never held; held edges coalesce into one repeat, flipped by the worker's timed wake | `virtio/foreign_flip.rs`, `kmd_logic/foreign_flip.rs` (`repeat_decide`), knob in `diag.rs` | `ForeignFlip` is itself off by default; with it on, re-flips of an unchanged picture are at most 10 a second |
+| Windowed-Blt wakes signal only the 0 -> 1 edge of `scanout_retire_wanted`; the worker consumes the flag on every pass (it used to consume it only if no earlier term of the drain condition was true) | `ddi/submit_command.rs`, `ddi/hpd.rs` | same work per pass, fewer redundant signals (`HpdSgCoal`) |
+| The Ff-prefix collision scan skips `diag.rs` (the knob names `FfAsyncWin`, `FfRepeatMs` are values read, not counters written): at 325 `foreign_flip::tests::counter_names_fit_are_unique_and_collide_with_nothing_else` already FAILED because of `FfAsyncWin` | `kmd_logic/foreign_flip.rs` (test) | test only |
+
+**Breadcrumbs (all `kmd_render/src/ddi/stall_diag.rs` unless `Ff`; at most 14 characters; names checked unique across both trees by the existing scans).**
+Worker: `HpdWkEvt` / `HpdWkTmo` (loops woken by event / by timeout), `HpdWkSrc` (the `hpd_wake::cause` bits signalled
+since the previous loop: 1 blt, 2 refresh, 4 edge, 8 fence, 0x10 fs set, 0x20 release, 0x40 flip, 0x80 other),
+`HpdSgBlt` `HpdSgRfr` `HpdSgEdg` `HpdSgFnc` `HpdSgFs` `HpdSgRel` `HpdSgFlp` `HpdSgOth` (signals by cause; `HpdSgOth` is every
+`signal_hpd()` not yet named), `HpdSgCoal` (windowed-Blt wakes not signalled), `HpdWait` / `HpdWaitMin` (last and shortest
+timed wait, microseconds; 0 = infinite), `HpdTmCtl` `HpdTmRty` `HpdTmDue` `HpdTmNone` (waits by class),
+`HpdBusyUs` / `HpdPassMaxUs` (time awake, longest pass), `HpdDumpN` / `HpdDumpUs` / `HpdDumpSkip` (dumps, their time,
+loops that reached the cadence but not the second). Heartbeat: `VsTickT` (time of the last tick, written beside
+`VsTickN`), `VsGapMaxMs` (longest silence), `VsArmN` `VsDisN` `VsCanN` (effective arms, disarms, cancels), `VsEarlyN`
+(ticks that returned before the count), `VsExhN`, `VsRevN` (watchdog re-arms), `PwrN` `PwrUid` `PwrD3N`. `Ff`:
+`FfEdgeSup` (refresh edges of the resident source), `FfEdgeHeld` / `FfRepeats` (held by / let through the gate),
+`FfReGem` / `FfNewGem` (host flips of the GEM the previous flip showed / of another; their sum is `FfFrames +
+FfReflips`), `FfWaitN` (passes that ended waiting for the pacing), `FfRepMsEff` (the gate in force, ms).
+
+**Verified here:** `hpd_wake` (15 tests: the wait for every input including zero / positive / microscopic timeouts, 2000 loops
+a second as the timer ceiling, the dump cadence at 10 / 155 / 9000 wakes a second, the watchdog's decisions, the power
+rule, the cause bits) and the repeat gate (8000 edges a second let through at most 10 repeats a second and not fewer than 9); the full
+`kmd_logic` suite (1085 passed, 0 failed); `protocol`; the whole tree parses; the stub type-check shows no new error kind.
+**Not verified:** anything that runs: that H1 or H2 is the cause (the next run says), `ExSetTimer` from a worker or
+escape thread against a live expiry, the effect of the 250 ms idle tick, whether 8000 wakes a second now cost less, that
+100 ms repeats are enough for a picture something writes in place.
+
+**Risks.** (1) The watchdog re-arms a heartbeat whose callback is merely stuck: harmless (`ExSetTimer` replaces the
+expiry) but if the callback itself hangs inside `DxgkCbSynchronizeExecution` the new expiry hangs the next CPU too;
+`VsRevN` climbing with `VsTickN` flat would say so. (2) Ignoring a child's D3 keeps ticking while the monitor is
+blanked: the delivery gate (`ControlInterrupt`) still closes delivery; a few ticks a second cost nothing. (3) The repeat gate
+assumes the shown GEM is only written when dxgkrnl flips it (flip model); a client that renders into the shown
+primary in place is refreshed at 10 Hz, not at the refresh rate (set `FfRepeatMs` 0 for the old behaviour). (4) Fewer
+edge-driven wakes make the presenter's pacing depend on its timed wait, whose precision is the system timer's: with
+the high-resolution heartbeat alive this is the 1 ms floor; watch `HpdWaitMin` / `FfFrames` per second when DWM does
+flip (the target is 240 a second under motion, which needs the heartbeat, point 1).
+
+**Next-run checklist** (lowest mode first: 1920x1080 at 60 Hz, then bigger; read twice 10 s apart with the spin window and
+a moving window as in T5; always `StallT`, `VpDmpT`, `HpdBusyUs`):
+
+1. Heartbeat: `VsTickN` per second against the mode's rate and `VsTickT` against `StallT`. `VsRevN` > 0: the chain died
+   with `vsync_armed` 1 (H2, now healed: note when). `VsDisN` > `VsArmN - 1` or `PwrD3N` > 0: read `PwrUid` and `PwrSt`
+   (H1: a uid other than 0xFFFFFFFF with D3 is the monitor). `VsEarlyN` > 0 with `VsDisN` 0: a tick returned before the
+   count with the heartbeat armed, which the code does not allow: report. `VsGapMaxMs` over 250 with `VsRevN` 0: a long
+   stall that was not a death.
+2. Flips: `FlipIss` must now grow with DWM's presents and `FlipPub` follow; `FfProg` grows; `VpFlip` grows. DWM presenting at
+   the refresh rate under motion is the T5 target (240 a second at 240 Hz).
+3. Re-presents: `FfReGem` / `FfFrames` (before: ~1), `FfEdgeSup` and `FfEdgeHeld` against `FfRepeats` (at most `1000 /
+   FfRepMsEff` a second), `FfWaitN`. `FfRepMsEff` 100.
+4. Worker: `HpdLoopN` per second against `HpdSgBlt` + `HpdSgRfr` + `HpdSgEdg` + `HpdSgFnc` + `HpdSgOth` (signals) and `HpdSgCoal`:
+   which cause carries the wakes. `HpdWkTmo` should be small, `HpdTmDue` about 4 a second at idle. `HpdDumpN` about 1 a second,
+   `HpdDumpUs` / `HpdBusyUs` the share of time in dumps (before: several tenths of a second a second), `HpdPassMaxUs` the longest pass.
+5. If `HpdSgBlt` and `HpdSgRfr` carry nearly every wake and the busy share is still high, the next step is a timed
+   coalescing of those two causes (they need a timer to be safe: the flag they set must not wait for a wake that never
+   comes), not a cadence change.
+6. `FfRepeatMs` 0 and a device restart: the old behaviour (every edge flips) for comparison.
+
 
 ### 15.19 KMD-made STANDARD allocations for DWM on NVK (design only; `rm-backed-standard.md`)
 

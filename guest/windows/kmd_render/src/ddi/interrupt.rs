@@ -84,7 +84,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
     if fence_work {
         // A fence a present waits on fired: the PASSIVE worker sends the flip and
         // closes the handle (the host round trips are not DPC work).
-        adapter.signal_hpd();
+        adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::FENCE);
     }
 
     // A producer completion may have made the one deferred fast bind safe.
@@ -427,6 +427,15 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
     // A latched config-change (ISR bit 1): wake the HPD worker to re-indicate the
     // child connected. KeSetEvent (Wait=FALSE) is legal at DISPATCH_LEVEL.
     if adapter.config_change_pending.load(Ordering::Acquire) != 0 {
+        adapter.signal_hpd();
+    }
+
+    // `FfAsyncWin`: a `SetVidPnSourceAddress` (DIRQL) left a programming pending and asked for
+    // this DPC; wake the worker that drains it (it used to wait for the next vsync tick).
+    if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0
+        && crate::virtio::foreign_flip::early_wake()
+    {
+        crate::virtio::foreign_flip::note_early_woke();
         adapter.signal_hpd();
     }
 

@@ -65,16 +65,8 @@ fn wr64(b: &mut [u8], at: usize, v: u64) {
     b[at..at + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-/// Build and send one `ScanoutFlip` and wait for the host's header-only answer.
-/// PASSIVE: a control-queue round trip.
-fn send(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    flip: &Flip,
-    gem: u32,
-    timeout_ms: u64,
-) -> Result<(), VirtioError> {
-    // MsgHeader { msg_type, handle = 0, status = 0, padding = 0 } | ScanoutFlip.
+/// `MsgHeader { msg_type, handle = 0, status = 0, padding = 0 } | ScanoutFlip`.
+fn build_flip(flip: &Flip, gem: u32) -> [u8; MSG_HDR_LEN + HELIOS_NVRM_SCANOUT_FLIP_BYTES] {
     let mut req = [0u8; MSG_HDR_LEN + HELIOS_NVRM_SCANOUT_FLIP_BYTES];
     wr32(&mut req, 0, MSG_SCANOUT_FLIP);
     let p = MSG_HDR_LEN;
@@ -89,6 +81,19 @@ fn send(
     wr64(&mut req, p + 32, flip.layout.modifier);
     wr64(&mut req, p + 40, flip.seq);
     // reserved[4] at p + 48 stays zero.
+    req
+}
+
+/// Build and send one `ScanoutFlip` and wait for the host's header-only answer.
+/// PASSIVE: a control-queue round trip.
+fn send(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    flip: &Flip,
+    gem: u32,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
+    let req = build_flip(flip, gem);
 
     let mut resp = [0u8; 2 * MSG_HDR_LEN];
     let sent = match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, timeout_ms) {
@@ -235,6 +240,83 @@ pub fn present_within(
     match sent {
         Ok(()) => Ok(flip.seq),
         Err(e) => Err(PresentRefusal::Device(e)),
+    }
+}
+
+/// What a pipelined flip came to, for [`note_async_result`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncResult {
+    /// The host took it.
+    Taken,
+    /// The host refused it, or no usable reply came.
+    Failed,
+    /// No answer within the timeout. As for a timed-out round trip the host is ASSUMED to have
+    /// taken it (the image stays reserved in the release book), but it is a failed send.
+    TimedOut,
+    /// The answer of a flip already counted as timed out: the book only.
+    LateTaken,
+    LateFailed,
+}
+
+/// A pipelined `ForeignFlip` (`foreign_flip::service`): [`present_within`] without the wait.
+/// The same ownership proof and mint, the same release-book entry, then ONE `ScanoutFlip`
+/// submitted on the control queue; the host's answer is written to `cell` by the used-ring
+/// drain and settled later by [`note_async_result`]. PASSIVE, never waits for the host and
+/// never queues behind fenced presents (as `present_within`).
+///
+/// `Ok((seq, generation))`: submitted. `Err(Device(QueueFull))`: nothing was sent and nothing
+/// is owed (the caller keeps its frame owed and tries again); any other `Err` is as for
+/// `present_within`, with the release book and the source's accounting already told.
+/// `cell` is zeroed here, before the message can reach the ring.
+pub fn present_submit(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    handle: u32,
+    gem: u32,
+    cell: &'static core::sync::atomic::AtomicU64,
+) -> Result<(u64, u32), PresentRefusal> {
+    let flip = mint(adapter, owner, handle, false)?;
+    scanout_release::minted(flip.seq, owner.raw(), flip.handle, gem);
+    let req = build_flip(&flip, gem);
+    cell.store(0, core::sync::atomic::Ordering::Release);
+    let tag = helios_kmd_logic::flip_pipeline::tag_of(flip.seq);
+    match ctrl::raw_submit_async(passive, adapter, &req, cell, tag) {
+        Ok(()) => Ok((flip.seq, flip.generation)),
+        Err(e) => {
+            // It never reached the ring: no flip, nothing for the host to release.
+            if let Some(owner) = scanout_release::gone(flip.seq) {
+                scanout_release::wake(adapter, owner);
+            }
+            if e != VirtioError::QueueFull {
+                adapter.foreign_scanout_flip_done(flip.generation, false);
+            }
+            Err(PresentRefusal::Device(e))
+        }
+    }
+}
+
+/// Settle a pipelined flip: tell the release book and the source what became of it, the same
+/// bookkeeping [`present_within`] does when its round trip returns.
+pub fn note_async_result(adapter: &AdapterContext, seq: u64, generation: u32, r: AsyncResult) {
+    match r {
+        AsyncResult::Taken => {
+            note_flip_sent(adapter, seq, &Ok(()));
+            adapter.foreign_scanout_flip_done(generation, true);
+        }
+        AsyncResult::Failed => {
+            note_flip_sent(adapter, seq, &Err(VirtioError::DeviceError));
+            adapter.foreign_scanout_flip_done(generation, false);
+        }
+        AsyncResult::TimedOut => {
+            note_flip_sent(adapter, seq, &Err(VirtioError::Timeout));
+            adapter.foreign_scanout_flip_done(generation, false);
+        }
+        AsyncResult::LateTaken => {}
+        AsyncResult::LateFailed => {
+            // It was assumed taken at the timeout; the host says it was not.
+            note_flip_sent(adapter, seq, &Err(VirtioError::DeviceError));
+        }
     }
 }
 

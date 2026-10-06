@@ -1,0 +1,124 @@
+Helios DXVK fork: hand-off waits bounded by the device's next own point
+
+Conduit guest/windows/docs/shared-surfaces.md section 4. Applied after 0010
+by ci/windows/Build-Driver.ps1.
+
+The ledger is sampled on the CS thread, which can run well behind the
+application thread. A lagging CS thread then samples another process's
+points that were published after this device's own next hand-off point, i.e.
+after the work being recorded was issued, so that work cannot depend on
+them. Waiting for such a point closes a cycle: the other process's
+submission that signals it waits for our point, which rides a later
+submission of ours that our worker never reaches. Only the two-second wait
+cap broke it (keyed-load perf mode: two seconds per round, which looked like a
+hang).
+
+- HeliosHandoffHooks::sampleBefore (appended): as sampleAll, given the
+  DxvkDevice, so the UMD returns only points published before the device's
+  next own point its CS thread has not reached. Points are a ledger-wide
+  sequence, so they compare across devices.
+- HeliosHandoffHooks::csReached (appended) and
+  D3D11ImmediateContext::HeliosSignalHandoffPoint: the CS thread reports
+  reaching the signal of an own hand-off point.
+
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 22556a5c..3a090686 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -4,6 +4,7 @@
+ #include "d3d11_fence.h"
+ #include "d3d11_texture.h"
+ 
++#include "../dxvk/dxvk_helios_backend.h"
+ #include "../dxvk/dxvk_helios_feed_trace.h"
+ #include "../dxvk/dxvk_helios_present_format.h"
+ #include "../dxvk/dxvk_helios_scanout_acquire.h"
+@@ -1243,6 +1244,29 @@ namespace dxvk {
+   }
+ 
+ 
++  uint64_t D3D11ImmediateContext::HeliosSignalHandoffPoint(
++    const Rc<DxvkFence>&        Fence,
++          uint64_t              Value) {
++    D3D10DeviceLock lock = LockContext();
++
++    EmitCs([
++      cFence  = Fence,
++      cValue  = Value,
++      cDevice = static_cast<const void*>(m_device.ptr())
++    ] (DxvkContext* ctx) {
++      ctx->signalFence(cFence, cValue);
++      // Work the CS thread records from here on was issued after this
++      // point was published (see HeliosHandoffHooks::sampleBefore).
++      if (const auto* hooks = heliosHandoffHooks()) {
++        if (hooks->csReached)
++          hooks->csReached(cDevice, cValue);
++      }
++    });
++    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, false);
++    return GetCurrentSequenceNumber();
++  }
++
++
+   uint64_t D3D11ImmediateContext::HeliosSignalFlushPointTracked(
+     const Rc<DxvkFence>&        Fence,
+           uint64_t              Value,
+diff --git a/src/d3d11/d3d11_context_imm.h b/src/d3d11/d3d11_context_imm.h
+index b8371502..3edc59b5 100644
+--- a/src/d3d11/d3d11_context_imm.h
++++ b/src/d3d11/d3d11_context_imm.h
+@@ -191,6 +191,14 @@ namespace dxvk {
+       const Rc<DxvkFence>&        Fence,
+             uint64_t              Value);
+ 
++    /**
++     * \brief Helios hand-off ledger: as \ref HeliosSignalFlushPoint, and the
++     * CS thread reports reaching the signal (HeliosHandoffHooks::csReached)
++     */
++    uint64_t HeliosSignalHandoffPoint(
++      const Rc<DxvkFence>&        Fence,
++            uint64_t              Value);
++
+     /**
+      * \brief Helios flush gate: a stream point that producers publish
+      *
+diff --git a/src/dxvk/dxvk_cmdlist.cpp b/src/dxvk/dxvk_cmdlist.cpp
+index 3d7bfe14..ad4b7ff4 100644
+--- a/src/dxvk/dxvk_cmdlist.cpp
++++ b/src/dxvk/dxvk_cmdlist.cpp
+@@ -492,7 +492,12 @@ namespace dxvk {
+     const uint32_t key = image->heliosHandoffKey();
+     if (!key)
+       return;
+-    if (hooks->sampleAll) {
++    if (hooks->sampleBefore) {
++      uint64_t points[4];
++      const uint32_t n = hooks->sampleBefore(key, m_device, points, 4u);
++      for (uint32_t i = 0; i < n && i < 4u; i++)
++        waitHandoff(key, points[i]);
++    } else if (hooks->sampleAll) {
+       uint64_t points[4];
+       const uint32_t n = hooks->sampleAll(key, points, 4u);
+       for (uint32_t i = 0; i < n && i < 4u; i++)
+diff --git a/src/dxvk/dxvk_helios_backend.h b/src/dxvk/dxvk_helios_backend.h
+index dc685cda..58a75714 100644
+--- a/src/dxvk/dxvk_helios_backend.h
++++ b/src/dxvk/dxvk_helios_backend.h
+@@ -72,6 +72,17 @@ namespace dxvk {
+     // keeps one per publishing device, so the reader's own publication never
+     // hides the releaser's), up to `max`; returns the count. NULL: use sample.
+     uint32_t (*sampleAll)(uint32_t key, uint64_t* points, uint32_t max);
++    // Appended (0009): as sampleAll, but only points published before
++    // `device`'s next own hand-off point that its CS thread has not reached
++    // yet. The work being recorded was issued before that point was
++    // published, so it cannot depend on anything published later, and
++    // waiting for such a point could close a wait cycle with the other
++    // process (each submission waiting for the other's later point while
++    // its own CS thread lags). NULL: use sampleAll.
++    uint32_t (*sampleBefore)(uint32_t key, const void* device, uint64_t* points, uint32_t max);
++    // Appended (0009): `device`'s CS thread reached the signal of its own
++    // hand-off point `point` (D3D11ImmediateContext::HeliosSignalHandoffPoint).
++    void (*csReached)(const void* device, uint64_t point);
+   };
+ 
+   inline std::atomic<const HeliosHandoffHooks*> g_heliosHandoffHooks = { nullptr };
