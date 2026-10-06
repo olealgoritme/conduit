@@ -218,6 +218,7 @@ fn start_generation_mirrors() {
     let _ = crate::virtio::rm_client::reread_knob_at_start();
     crate::ddi::flip_keep::reset_for_start();
     crate::ddi::present_foreign::reset_for_start();
+    crate::ddi::onscanout::reset_for_start();
     crate::ddi::shared_placeholder::reset_for_start();
     // `foreign_flip::forget` zeroed its counters and owes the block; this writes it (reading and
     // mirroring `FfKnob` first), as does the `Fk*` block.

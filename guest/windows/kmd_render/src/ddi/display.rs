@@ -329,6 +329,12 @@ unsafe fn dxgkddi_present_inner(
     let stashed_stream_marker = present_context
         .as_ref()
         .and_then(ContextHandleRef::take_present_stream_marker_stash);
+    // The "already on scanout" tag (`HOSC`) the same Render left, taken (read + CLEAR) on every
+    // Present that resolves its context, whatever its arm, like the snapshot and the marker. One
+    // relaxed load for a context that carries none.
+    let onscanout_tag = present_context
+        .as_ref()
+        .and_then(ContextHandleRef::take_onscanout_tag);
     let present_stream_boundary = stashed_stream_marker.and_then(|marker| {
         let (ctx_id, value, cookie) = match marker {
             // An RM fence attached at Render: only its boundary travels.
@@ -360,6 +366,24 @@ unsafe fn dxgkddi_present_inner(
         .unwrap_or(core::ptr::null_mut());
     let src_info = unsafe { present_alloc_info(adapter, src_handle) };
     let dst_info = unsafe { present_alloc_info(adapter, dst_handle) };
+    // Is this Blt's copy owed at all? A producer that already put the frame on scanout through the
+    // user foreign-scanout source says so with a tag, and the KMD takes its word only when its own
+    // state backs every part of it (`helios_kmd_logic::onscanout::verify`); anything else is
+    // counted and the Present is the ordinary Blt. Flips are never skipped (the verdict refuses
+    // them): they copy nothing and their completion machinery must run as ever.
+    let onscanout_skip = onscanout_tag.filter(|tag| {
+        crate::ddi::onscanout::decide(
+            present_context.as_ref(),
+            *tag,
+            present_arm,
+            // No Blt copy in this Present: no allocation list, or the Blt flag is not set.
+            !payload_has_list || present_flags & 1 == 0,
+            present_flags & (1 << 1) != 0,
+            !args.pDstSubRects.is_null() && args.SubRectCnt != 0,
+            stashed_snapshot.is_some(),
+            src_info.as_ref(),
+        )
+    });
     if payload_has_list {
         PRESENT_LAST_SRC_OPEN_LOW.store(src_handle as usize as u32, Ordering::Relaxed);
         PRESENT_LAST_DST_OPEN_LOW.store(dst_handle as usize as u32, Ordering::Relaxed);
@@ -449,6 +473,23 @@ unsafe fn dxgkddi_present_inner(
             } else {
                 crate::diag::record_named_bytes(b"PBdst", 0);
             }
+        }
+
+        // The producer's frame is already on scanout and the KMD verified it: complete this Blt
+        // with no copy. Before every other Blt arm (the level 5 RM primary included): none of them
+        // has done anything yet, and their copies are what is being skipped.
+        if let Some(tag) = onscanout_skip {
+            return unsafe {
+                present_blt_onscanout(
+                    args,
+                    present_allocations,
+                    present_stream_boundary,
+                    tag,
+                    adapter,
+                    src_info,
+                    dst_info,
+                )
+            };
         }
 
         // Level 5 (`KmdRmClient` = 5): a Blt whose destination is the RM system-memory
@@ -1470,6 +1511,69 @@ unsafe fn present_blt_skipped(
             patch_capacity,
             present_stream_boundary,
             PresentArm::Blt,
+            adapter,
+            src_info,
+            dst_info,
+        )
+    }
+}
+
+/// A Blt whose producer already put the frame on scanout, verified by `ddi::onscanout::decide`
+/// (`helios_kmd_logic::onscanout`): complete it with no copy and no host call.
+///
+/// It is the legacy Blt arm minus the copy, and nothing else: the arm's own preconditions in its
+/// order and at its sites (a DMA buffer that holds the marker and a private record that holds the
+/// fence merge, then the patch capacity, all before anything is done, so dxgkrnl's retry protocol
+/// is unchanged and the retry, which carries no tag, is the ordinary Blt); then the same shared
+/// completion a skipped foreign Blt takes (`present_blt_skipped`: a fence-0 marker, the patch
+/// references, the DMA marker, the stream boundary). No destination buffer is begun and no token
+/// is queued, so there is nothing to retire or cancel: a windowed-Blt snapshot never reaches here
+/// (the verdict refuses it), which is where the ready-queue token lives.
+///
+/// # Safety
+/// As [`present_complete`]; `args` names the Blt arm.
+#[allow(clippy::too_many_arguments)]
+unsafe fn present_blt_onscanout(
+    args: &mut DXGKARG_PRESENT,
+    present_allocations: PresentAllocations,
+    present_stream_boundary: Option<u64>,
+    tag: helios_kmd_logic::onscanout::Tag,
+    adapter: Option<&AdapterContext>,
+    src_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+    dst_info: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+) -> NTSTATUS {
+    let bytes = core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmd>() as UINT;
+    if args.pDmaBuffer.is_null()
+        || args.DmaSize < bytes
+        || args.pDmaBufferPrivateData.is_null()
+        || (args.DmaBufferPrivateDataSize as usize)
+            < core::mem::size_of::<PresentSubmissionPrivate>()
+    {
+        crate::ddi::onscanout::note_retry();
+        PRESENT_LAST_STATUS.store(
+            STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER as u32,
+            Ordering::Relaxed,
+        );
+        return crate::ddi::present_foreign::site(
+            site::BLT_DMA_SMALL,
+            STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
+        );
+    }
+    let capacity = match present_allocations.validate_patch_capacity(args) {
+        Ok(capacity) => capacity,
+        Err(status) => {
+            crate::ddi::onscanout::note_retry();
+            PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+            return crate::ddi::present_foreign::site(site::BLT_PATCH, status);
+        }
+    };
+    crate::ddi::onscanout::note_skip(tag, src_info.as_ref());
+    unsafe {
+        present_blt_skipped(
+            args,
+            present_allocations,
+            Some(capacity),
+            present_stream_boundary,
             adapter,
             src_info,
             dst_info,
