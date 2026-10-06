@@ -56,11 +56,40 @@ pub mod flag {
     pub const MATCH: u8 = 1;
     /// The fence was satisfiable at SubmitCommand and completed there, never queued.
     pub const IMMEDIATE: u8 = 2;
+    /// SubmitCommand found no private-data record at all (nothing to decode).
+    pub const EMPTY: u8 = 4;
     // RETIRE
     /// The fence retired after the `WddmHeadMs` rebase: its boundary was replaced.
     pub const REBASED: u8 = 1;
     /// No SUBMIT event of this fence is left in the ring: the lag is unknown (0).
     pub const NO_SUBMIT: u8 = 2;
+    /// The fence was delivered inside SubmitCommand itself (pairs with
+    /// [`IMMEDIATE`] on the SUBMIT event).
+    pub const AT_SUBMIT: u8 = 4;
+    // SUBMIT and RETIRE: the gate kind of the Render they follow (RENDER carries it as
+    // STREAM / FENCE / WIRE, whose low bits mean something else on these two kinds).
+    /// The Render's boundary was a Venus stream point.
+    pub const GATE_STREAM: u8 = 16;
+    /// The Render's boundary was an RM fence.
+    pub const GATE_FENCE: u8 = 32;
+    /// The Render had no boundary of its own: the wire rung (or a degrade).
+    pub const GATE_WIRE: u8 = 64;
+}
+
+/// The SUBMIT / RETIRE gate-kind bits for a RENDER event's flags (`STREAM`, `FENCE`,
+/// `WIRE` become `GATE_STREAM`, `GATE_FENCE`, `GATE_WIRE`).
+pub const fn gate_bits(render_flags: u8) -> u8 {
+    let mut out = 0;
+    if render_flags & flag::STREAM != 0 {
+        out |= flag::GATE_STREAM;
+    }
+    if render_flags & flag::FENCE != 0 {
+        out |= flag::GATE_FENCE;
+    }
+    if render_flags & flag::WIRE != 0 {
+        out |= flag::GATE_WIRE;
+    }
+    out
 }
 
 /// One recorded event.
@@ -205,6 +234,155 @@ impl Default for Ring {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What a `HEFL` Render leaves for the SubmitCommand of the same DMA buffer (one per
+/// context: dxgkrnl serialises Render and SubmitCommand of a context in order, and a
+/// second Render before the SubmitCommand is the batched case).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PendingFlush {
+    /// Interrupt time of the Render, 100 ns.
+    pub stamp_100ns: u64,
+    /// The RENDER event's flags (`flag::STREAM` ...); [`gate_bits`] maps them.
+    pub render_flags: u8,
+    /// The tagged boundary the Render merged and kept, else 0.
+    pub expected_boundary: u64,
+    /// The wire floor the Render stamped, else 0.
+    pub expected_floor: u64,
+}
+
+/// What [`Outstanding::insert`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Insert {
+    /// A free slot was taken.
+    New,
+    /// The fence was already tracked (a replayed submission): its stamp was refreshed.
+    Replaced,
+    /// No free slot, or an unusable fence value (0 and `u32::MAX` are reserved).
+    Refused,
+}
+
+/// Slots in [`Outstanding`].
+pub const OUTSTANDING_LEN: usize = 16;
+const KEY_FREE: u32 = 0;
+const KEY_BUSY: u32 = u32::MAX;
+
+struct OutSlot {
+    /// `KEY_FREE`, `KEY_BUSY` while the stamp is being written, else the fence id.
+    key: AtomicU32,
+    stamp: AtomicU64,
+}
+
+/// The queued `HEFL` fences: from their SubmitCommand to their `DMA_COMPLETED`. Atomics
+/// only, so SubmitCommand (DISPATCH) inserts and the completion DPC removes without a
+/// lock. Fences of an abandoned scheduler epoch never retire: [`Outstanding::clear`]
+/// drops them.
+pub struct Outstanding {
+    slots: [OutSlot; OUTSTANDING_LEN],
+    live: AtomicU32,
+}
+
+impl Outstanding {
+    pub const fn new() -> Self {
+        Self {
+            slots: [const {
+                OutSlot {
+                    key: AtomicU32::new(KEY_FREE),
+                    stamp: AtomicU64::new(0),
+                }
+            }; OUTSTANDING_LEN],
+            live: AtomicU32::new(0),
+        }
+    }
+
+    /// Fences currently tracked. One load: cheap enough for a hot path.
+    pub fn live(&self) -> u32 {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    /// Start tracking `fence`, submitted at `stamp_100ns`.
+    pub fn insert(&self, fence: u32, stamp_100ns: u64) -> Insert {
+        if fence == KEY_FREE || fence == KEY_BUSY {
+            return Insert::Refused;
+        }
+        for slot in &self.slots {
+            if slot.key.load(Ordering::Acquire) == fence {
+                slot.stamp.store(stamp_100ns, Ordering::Relaxed);
+                return Insert::Replaced;
+            }
+        }
+        for slot in &self.slots {
+            if slot
+                .key
+                .compare_exchange(KEY_FREE, KEY_BUSY, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                slot.stamp.store(stamp_100ns, Ordering::Relaxed);
+                // The stamp is published with the key.
+                slot.key.store(fence, Ordering::Release);
+                self.live.fetch_add(1, Ordering::Relaxed);
+                return Insert::New;
+            }
+        }
+        Insert::Refused
+    }
+
+    /// Stop tracking `fence`; returns its submit stamp if it was tracked.
+    pub fn take(&self, fence: u32) -> Option<u64> {
+        if fence == KEY_FREE || fence == KEY_BUSY || self.live() == 0 {
+            return None;
+        }
+        for slot in &self.slots {
+            if slot.key.load(Ordering::Acquire) == fence {
+                let stamp = slot.stamp.load(Ordering::Relaxed);
+                if slot
+                    .key
+                    .compare_exchange(fence, KEY_FREE, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    self.live.fetch_sub(1, Ordering::Relaxed);
+                    return Some(stamp);
+                }
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Forget every tracked fence; returns how many were dropped.
+    pub fn clear(&self) -> u32 {
+        let mut dropped = 0u32;
+        for slot in &self.slots {
+            let key = slot.key.load(Ordering::Acquire);
+            if key != KEY_FREE
+                && key != KEY_BUSY
+                && slot
+                    .key
+                    .compare_exchange(key, KEY_FREE, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                dropped += 1;
+            }
+        }
+        if dropped != 0 {
+            self.live.fetch_sub(dropped, Ordering::Relaxed);
+        }
+        dropped
+    }
+}
+
+impl Default for Outstanding {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One event in 32 bits, for a registry value: `kind` in bits 30..32 (1 RENDER, 2 SUBMIT,
+/// 3 RETIRE; 0 = no event), `flags` in bits 22..30, and `aux` (microseconds for SUBMIT /
+/// RETIRE, the stream point for RENDER) clipped to 22 bits.
+pub const fn pack_event(kind: u8, flags: u8, aux: u32) -> u32 {
+    let aux = if aux > 0x3f_ffff { 0x3f_ffff } else { aux };
+    ((kind as u32 & 3) << 30) | ((flags as u32) << 22) | aux
 }
 
 /// Longest the synchronous gate (`FlGSyncMs`) may hold a `DxgkDdiRender`, in
@@ -524,6 +702,92 @@ mod tests {
             verdict(&Summary { rebased: 40, ..healthy() }),
             Verdict::Rebased
         );
+    }
+
+    #[test]
+    fn gate_bits_map_the_render_kind() {
+        assert_eq!(gate_bits(flag::STREAM | flag::STAMPED), flag::GATE_STREAM);
+        assert_eq!(gate_bits(flag::FENCE), flag::GATE_FENCE);
+        assert_eq!(gate_bits(flag::WIRE | flag::DEGRADED), flag::GATE_WIRE);
+        assert_eq!(gate_bits(flag::DEGRADED | flag::BATCHED), 0);
+        // The gate bits never collide with the SUBMIT / RETIRE group bits.
+        assert_eq!(
+            (flag::MATCH | flag::IMMEDIATE | flag::EMPTY | flag::REBASED | flag::NO_SUBMIT | flag::AT_SUBMIT)
+                & (flag::GATE_STREAM | flag::GATE_FENCE | flag::GATE_WIRE),
+            0
+        );
+    }
+
+    #[test]
+    fn outstanding_tracks_submit_to_retire() {
+        let t = Outstanding::new();
+        assert_eq!(t.live(), 0);
+        assert_eq!(t.take(7), None);
+        assert_eq!(t.insert(7, 1000), Insert::New);
+        assert_eq!(t.insert(8, 2000), Insert::New);
+        assert_eq!(t.live(), 2);
+        assert_eq!(t.take(8), Some(2000));
+        assert_eq!(t.take(8), None);
+        assert_eq!(t.live(), 1);
+        assert_eq!(t.take(7), Some(1000));
+        assert_eq!(t.live(), 0);
+        assert_eq!(t.take(7), None);
+    }
+
+    #[test]
+    fn outstanding_replay_refreshes_instead_of_duplicating() {
+        let t = Outstanding::new();
+        assert_eq!(t.insert(5, 10), Insert::New);
+        assert_eq!(t.insert(5, 99), Insert::Replaced);
+        assert_eq!(t.live(), 1);
+        assert_eq!(t.take(5), Some(99));
+        assert_eq!(t.live(), 0);
+    }
+
+    #[test]
+    fn outstanding_refuses_reserved_fences_and_a_full_table() {
+        let t = Outstanding::new();
+        assert_eq!(t.insert(0, 1), Insert::Refused);
+        assert_eq!(t.insert(u32::MAX, 1), Insert::Refused);
+        assert_eq!(t.live(), 0);
+        for i in 1..=OUTSTANDING_LEN as u32 {
+            assert_eq!(t.insert(i, i as u64), Insert::New);
+        }
+        assert_eq!(t.live(), OUTSTANDING_LEN as u32);
+        assert_eq!(t.insert(1000, 5), Insert::Refused);
+        // A tracked fence is still refreshable when the table is full.
+        assert_eq!(t.insert(3, 77), Insert::Replaced);
+        // Room again after a retire.
+        assert_eq!(t.take(3), Some(77));
+        assert_eq!(t.insert(1000, 5), Insert::New);
+        assert_eq!(t.take(1000), Some(5));
+    }
+
+    #[test]
+    fn outstanding_clear_drops_everything_and_frees_the_slots() {
+        let t = Outstanding::new();
+        for i in 1..=5u32 {
+            t.insert(i, 1);
+        }
+        assert_eq!(t.clear(), 5);
+        assert_eq!(t.live(), 0);
+        assert_eq!(t.take(2), None);
+        assert_eq!(t.clear(), 0);
+        for i in 1..=OUTSTANDING_LEN as u32 {
+            assert_eq!(t.insert(i, 1), Insert::New);
+        }
+    }
+
+    #[test]
+    fn packed_events_keep_kind_flags_and_clip_aux() {
+        assert_eq!(pack_event(0, 0, 0), 0);
+        let v = pack_event(kind::RETIRE, flag::REBASED | flag::GATE_STREAM, 1234);
+        assert_eq!(v >> 30, 3);
+        assert_eq!((v >> 22) & 0xff, (flag::REBASED | flag::GATE_STREAM) as u32);
+        assert_eq!(v & 0x3f_ffff, 1234);
+        assert_eq!(pack_event(kind::SUBMIT, 0, u32::MAX) & 0x3f_ffff, 0x3f_ffff);
+        // Flags never bleed into the kind.
+        assert_eq!(pack_event(kind::RENDER, 0xff, 0) >> 30, 1);
     }
 
     #[test]
