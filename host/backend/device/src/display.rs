@@ -1834,6 +1834,11 @@ impl DisplayLink {
                 out = out.merge(self.send_frame_locked(st, i, fd, f, flags));
             }
         }
+        // An older client is done with the previous buffer now that it was
+        // sent this one.
+        if st.release.enabled() {
+            st.release.collect(Instant::now());
+        }
         out
     }
 
@@ -4648,6 +4653,21 @@ mod tests {
         assert!(released(&sink).is_empty());
         link.client_released(0, inode(fx.as_raw_fd()), cx.seq);
         assert_eq!(released(&sink), vec![(10, 1, 0)]);
+    }
+
+    #[test]
+    fn with_only_an_older_client_the_flip_that_replaces_a_buffer_releases_it() {
+        let (ours, broker) = socketpair();
+        let link = DisplayLink::new(None);
+        let sink = releasing(&link);
+        link.adopt(ours);
+        link.hello_for_test(0);
+        let (x, y) = (memfd(), memfd());
+        link.flip(x.as_raw_fd(), &gflip(1, 10));
+        assert!(released(&sink).is_empty());
+        link.flip(y.as_raw_fd(), &gflip(2, 11));
+        assert_eq!(released(&sink), vec![(10, 1, 0)]);
+        drop(broker);
     }
 
     #[test]
