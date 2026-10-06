@@ -44,14 +44,14 @@
 //!   makes the KMD splice its own table into the request (it requires the
 //!   request's `deep_ptr_offset` and `deep_len` to be 0, then sets both).
 //! * A pin that has been used by a `FORWARD` is **committed**: the GPU may now
-//!   hold the pages. It is released only by `Close` of its handle (after the
+//!   hold the pages. It is released only by the KMD: at once when the
+//!   registration failed, when a successful `RM_FREE` names its
+//!   `(h_root, h_object)` (or `h_root`), at `Close` of its handle (after the
 //!   host has torn the objects down), process exit, or device reset — never by
 //!   a user `UNPIN` (`HELIOS_NVRM_ST_PIN_IN_USE`). Otherwise a process could
 //!   unpin, free the pages, and have the GPU write into whoever receives them
 //!   next. `UNPIN` is for a pin that never reached a `FORWARD` (a failure path).
-//!   (A later optimisation may release a committed pin when the KMD sees the
-//!   matching successful `RM_FREE`; that needs hClient/hObject tracking and is
-//!   not part of ABI v1.)
+//!   See [`HeliosNvrmPin`] for the tag-trust caveat.
 //!
 //! # Buffer layout and sizes
 //!
