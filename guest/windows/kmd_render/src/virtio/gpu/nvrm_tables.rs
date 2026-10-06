@@ -283,10 +283,23 @@ pub(super) fn new_fence_book() -> Box<helios_kmd_logic::nvrm_fence::FenceBook> {
     Box::new(helios_kmd_logic::nvrm_fence::FenceBook::new())
 }
 
-/// Build the client table in its own (popped) frame; see the field's comment.
+/// Build the client table directly on the heap, zeroed: `Box::new(ClientTable::new())` would
+/// build the 4 KiB value on `VirtioGpu::init`'s stack first. The all-zero pattern is the empty
+/// table (`an_all_zero_table_is_an_empty_table` in `kmd_logic` pins it).
 #[inline(never)]
 pub(super) fn new_client_table() -> Box<ClientTable> {
-    Box::new(ClientTable::new())
+    let layout = core::alloc::Layout::new::<ClientTable>();
+    // SAFETY: `layout` has a nonzero size. A null result is turned into the allocation error
+    // handler, as `Box::new` does. The pointer is valid for `ClientTable`, whose all-zero bytes are
+    // a valid (empty) table, and it came from the global allocator with this exact layout, which
+    // is what `Box::from_raw` requires.
+    unsafe {
+        let p = alloc::alloc::alloc_zeroed(layout) as *mut ClientTable;
+        if p.is_null() {
+            alloc::alloc::handle_alloc_error(layout);
+        }
+        Box::from_raw(p)
+    }
 }
 
 impl VirtioGpu {
@@ -319,9 +332,9 @@ impl VirtioGpu {
         self.nvrm_clients.reserve(owner.raw())
     }
 
-    /// Give a promised slot back (the allocation failed).
-    pub fn cancel_nvrm_client(&mut self) {
-        self.nvrm_clients.cancel();
+    /// Give `owner`'s promised slot back (the allocation failed).
+    pub fn cancel_nvrm_client(&mut self, owner: DeviceOwner) {
+        self.nvrm_clients.cancel(owner.raw());
     }
 
     /// Record the client RM made for `owner` through file `via`; `reserved` consumes the

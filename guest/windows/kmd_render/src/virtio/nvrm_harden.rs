@@ -21,11 +21,13 @@
 //! The KMD's own RM client (`DeviceOwner::KMD_RM`) is never judged and never recorded: no
 //! escape can present that owner, and its traffic is the KMD's own.
 //!
-//! The knob is `NvDupHarden` (service key): 1 (default) enforce, 0 off (nothing is
-//! recorded or judged: the pre-hardening behaviour exactly), 2 log-only (everything is
-//! recorded and judged, and what mode 1 would refuse is counted in `NvDupWould` and
-//! forwarded). Read once per boot (`reg add` + restart the device to change it). An
-//! unknown value enforces.
+//! The knob is `NvDupHarden` (service key): 2 (default for the first shipped package)
+//! log-only (everything is recorded and judged, and what mode 1 would refuse is counted
+//! in `NvDupWould` and forwarded), 1 enforce, 0 off (nothing is recorded or judged: the
+//! pre-hardening behaviour exactly). Read once per boot (`reg add` + restart the device
+//! to change it). An unknown value enforces. Flip the default to 1 after a real NVK run
+//! shows `NvCliRec` close to `NvOpen`, `NvDupWould` 0 and `NvDupDoubt` small
+//! (`docs/nvrm-escape.md` section 12.3).
 
 use super::gpu::DeviceOwner;
 use super::nvrm::Refusal;
@@ -36,9 +38,10 @@ use helios_kmd_logic::nvrm_clients::{self, Cause, Commit, Verdict};
 
 /// `NvDupHarden` = 0: no tracking, no checks.
 pub const MODE_OFF: u32 = 0;
-/// `NvDupHarden` = 1 (the default): refuse.
+/// `NvDupHarden` = 1: refuse.
 pub const MODE_ENFORCE: u32 = 1;
-/// `NvDupHarden` = 2: count what would be refused, forward everything.
+/// `NvDupHarden` = 2 (the default for now): count what would be refused, forward
+/// everything.
 pub const MODE_LOG: u32 = 2;
 
 const MODE_UNREAD: u32 = u32::MAX;
@@ -85,7 +88,9 @@ fn mode(_passive: PassiveLevel) -> u32 {
 
 #[inline(never)]
 fn read_mode() -> u32 {
-    let v = crate::diag::read_config_dword(crate::diag::knobs::NV_DUP_HARDEN, MODE_ENFORCE);
+    let v = crate::diag::read_config_dword(crate::diag::knobs::NV_DUP_HARDEN, MODE_LOG);
+    // An absent value is the default (log-only); a present one that is not 0 or 2
+    // enforces, so a typo never turns the checks off.
     let m = match v {
         0 => MODE_OFF,
         2 => MODE_LOG,
@@ -183,7 +188,7 @@ pub fn after_reply(
             Some(c) => Some(v.commit_nvrm_client(owner, handle, c, reserved)),
             None => {
                 if reserved {
-                    v.cancel_nvrm_client();
+                    v.cancel_nvrm_client(owner);
                 }
                 None
             }
@@ -217,7 +222,7 @@ pub fn after_failed(
         return;
     }
     if reserved {
-        let _ = adapter.with_virtio(|v| v.cancel_nvrm_client());
+        let _ = adapter.with_virtio(|v| v.cancel_nvrm_client(owner));
     }
     // A free that timed out may have freed the client, and a number the host mints again
     // must not find the old owner still holding it: the entry goes (the owner loses a

@@ -19,7 +19,8 @@
 //!   `HeliosNvrmPin`). Of RM it recognises one call, `NV_ESC_RM_FREE`.
 //!
 //! * cross-client references: an `Ioctl` whose payload names an RM client or a backend
-//!   handle that is not the caller's is refused (`nvrm_harden`, the pure rules in
+//!   handle that is not the caller's is counted (`NvDupHarden` = 2, the default for now)
+//!   or refused (= 1) (`nvrm_harden`, the pure rules in
 //!   `helios_kmd_logic::nvrm_clients`; `docs/nvrm-escape.md` section 12). The KMD learns
 //!   a process's clients from the reply of its `NV_ESC_RM_ALLOC` of a root class and
 //!   forgets them on the free, on `Close` of the file and on teardown.
