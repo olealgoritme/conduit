@@ -576,3 +576,251 @@ was not compiled (no WDK here); its two call sites and `std_census.rs` were chec
 **Not verified by anything:** every statement about the host's behaviour (msg 31 on a host-visible Venus blob, RM
 sysmem create and map), NVK's behaviour (stride, import), dxgkrnl's two-phase standard allocation protocol, the UMD
 changes, the type census, the eviction interplay under VidMm pressure, the cost of a burst of creations.
+
+## 13. Blt destination without the mirror: what is the smallest correct change
+
+Written on `kmd/rm-shadow-design` over `9e61f90`. **Design only**: no `.rs` file changes. Every `file:line` in this section was
+read on `9e61f90` (the line numbers in sections 1 to 12 are from `8aba6f4` and have moved). Host paths are under the
+repository's `host/`. virglrenderer is the `host/venus/third_party/virglrenderer` submodule, which is empty in this worktree, so
+it was read in the main checkout. Nothing here was run.
+
+The hardware facts this section answers (2026-10-06, Heaven 1600x900 windowed, NVK DWM): Present costs about 1.5 to 2.1 ms.
+The KMD's Venus ring-1 copy of the app's NVK image into the KMD standard buffer takes about 0.75 ms, and the CPU mirror into
+VidMm's system pages takes about 0.4 to 0.7 ms. DWM opens no KMD standard allocation (8, "S-A0 result") and reads the window
+through dxgkrnl's CPU view. `BltNoMirror=1` froze the window (`zero-copy-present.md` 24.11.5).
+
+### 13.1 What the Blt destination is, and how its bytes move today (read)
+
+* **Which allocation.** The Blt arm accepts any `STANDARD` allocation whose storage is `PitchedStandardBuffer` as a
+  `PresentDestinationDesc::StandardBuffer` (`ddi/display.rs:750-764`). It does not check the standard type. Shadow (2),
+  staging (3) and every GDI type except `TEXTURE` produce the same object: `GetStandardAllocationDriverData` authors the
+  256-aligned pitch for shadow and staging (`ddi/create_allocation.rs:4439-4447`), `classify` sends them to
+  `KmdStandardBuffer { primary: false }` (`protocol/src/wddm.rs:1000-1004`), and `build_backing` calls
+  `allocate_present_buffer_blob` (`create_allocation.rs:2892-2939`). **No counter records which type Heaven's destination
+  is.** The census (8) saw `StdNShadow` 5 and `StdNStaging` 1, all opened by the app itself, so Shadow is the likely one. That
+  stays a guess until a destination counter names the slot (13.6, Q1). Everything below holds for either type.
+* **Its memory.** A Venus `VkBuffer` with a dedicated `VkDeviceMemory` of a CACHED host-visible type
+  (`venus/commands.rs:300-380`, `choose_cached_host_visible_memory_type` at 516). It is exported as a HOST3D blob and registered
+  in the Present-buffer ownership table (`commands.rs:469`). Its size is `linear_blob_size(6400, 900)` = 6400 x 1024 + 64 KiB
+  = 6,619,136 bytes for 1600x900, of which 5,760,000 are pixels. It has `SystemBackingPolicy::PresentLinearBuffer` and
+  `dedicated_present_buffer` true (`create_allocation.rs:2932-2937`).
+* **VidMm's view of it.** It is BAR-eligible (`create_allocation.rs:3376-3378`) and its preferred segment is the BAR segment.
+  Its supported set is the BAR plus the aperture segment whenever `DisplayHalf` is on (`create_allocation.rs:2238-2247`):
+  WDDM requires the aperture for a CpuVisible allocation in a non-CPU-accessible segment (2218-2230). It is `CpuVisible` and
+  `Cached` (2271, 3564-3570). While it is in the BAR segment, dxgkrnl's CPU view IS the Venus blob, host-mapped at the
+  aperture offset dxgkrnl chose (`ddi/cpu_host_aperture.rs:10-18`). When VidMm moves it out (LOCAL_TO_SYSTEM), the CPU view is
+  the system pages VidMm supplied, and the blob stays alive in the host.
+* **Eviction.** `bar_virtual_transfer` and `bar_transfer` copy the blob to the system pages (`build_paging_buffer.rs:1112-1113`,
+  1374-1378). For `PresentLinearBuffer` only, they also take their own `MmProbeAndLockPages` leases on those pages and record
+  them by resource id in `adapter.system_backings` (`build_paging_buffer.rs:1062-1070, 1114-1140, 1156-1179`;
+  `remember_system_backing` at 873; `adapter/backing.rs:82-110, 329-345`; the ceiling and the 4096-range limit are at
+  `backing.rs:20-36`). A whole-allocation eviction clears an earlier invalid mark (`note_eviction_done`, 610). **Page-in**
+  (SYSTEM_TO_LOCAL) copies the system pages into the blob and drops the leases (`build_paging_buffer.rs:1184-1194, 1265-1331`).
+  If the allocation is marked invalid, the page-in is skipped instead (`PgInvSk`, 1034-1041, 1269-1274). A skipped eviction
+  marks the allocation invalid (`note_skipped_eviction`, 585).
+* **The Present.** The arm runs these steps in order:
+  1. `begin_present_buffer_write_legacy` takes writer ownership (`display.rs:959-976`).
+  2. `submit_present_blt` records an image-to-buffer copy into the Venus buffer (`venus/present.rs:1346-1368`).
+  3. `wait_fence` blocks the DDI thread until the copy is done (`display.rs:1022-1031`).
+  4. `mirror_present_system_backing` runs (`display.rs:1081-1107`). Under the content mutex it takes a `snapshot` of the leases
+     (`backing.rs:452-465`). With no leases this is a lookup only and `PBSyCp` is 2. Otherwise it maps the WHOLE blob with
+     `RESOURCE_MAP_BLOB` + `MmMapIoSpace` using the host's cache attribute, memcpys every leased range, and unmaps
+     (`build_paging_buffer.rs:908-934`, `with_blob_bytes` 729-778).
+
+  Ownership goes `KmdWriter` -> `KmdCpuMirror` (at the ring completion) -> `ExternalReady`
+  (`complete_present_buffer_cpu_mirror`, `virtio/gpu/mod.rs:1175-1191, 6749-6775`).
+* **`BltNoMirror`.** It skips the memcpy and marks the system copy invalid, but only when a lease exists (`display.rs:1073-1080`,
+  `ddi/blt_async.rs:473-481`, `backing.rs:379-390`). The window froze. So the CPU view DWM's path reads was the system pages,
+  which means a system backing existed while frames were presented. The mirror's measured cost agrees: 0.4 to 0.7 ms for 5.76 to
+  6.6 MB is 8 to 16 GB/s, while with no backing the mirror is only a mutex and a lookup.
+
+The fact to design for: **in steady state, the destination's authoritative content (for VidMm and for dxgkrnl's CPU view) is
+guest system pages. The GPU copy writes a host blob that VidMm considers non-resident, and the mirror reconciles the two.** Why
+VidMm keeps the allocation out of the BAR segment is unknown (13.6, Q1).
+
+**What no candidate can remove.** Every design below still copies over PCIe from the app's VRAM into system memory, because
+the reader is a CPU view of system memory. What can be removed is the CPU copy (0.4 to 0.7 ms). The DDI's fence wait goes with
+it: its only remaining jobs are the mirror and the ownership hand-back (`zero-copy-present.md` 24.2).
+
+### 13.2 Candidate A: route R (RM cached system memory behind the destination, KMD/RM copy)
+
+**What changes.** Sections 4 and 5 as written, about 600 to 800 lines:
+
+* `rm_sysmem::route` gets a standard kind; today it routes `LinearPrimary` only (`kmd_logic/src/rm_sysmem.rs:153-158`).
+* `TABLE_CAP` grows from 32 (432).
+* `build_backing`'s `KmdStandardBuffer` arm first asks a generalised `sysmem::try_create_primary`
+  (`virtio/rm_client/sysmem.rs:273`, `build_steps` 509, `import_resource` 811).
+* The Blt goes to `present_blt_to_rm_primary`, because `sysmem_blt::primary` matches any adopted RM sysmem record
+  (`display.rs:507-509`, `virtio/rm_client/sysmem_blt.rs:105`).
+
+**What the copy would be.** `sysmem_blt` does NOT write the RM memory with the GPU. It GPU-copies the source into a private
+LINEAR host-visible Venus staging image (`VenusClient::rm_blt_copy_to_stage`, `venus/present.rs:1683`), waits for that copy,
+then CPU-copies rows from the staging mapping into the RM memory (`sysmem_blt.rs:1-40`). That is today's VRAM-to-host-blob copy
+plus today's CPU copy, in a new place: **A as built removes nothing.** It removes the CPU copy only if the host's Venus can
+import the RM-export blob as a `VkBuffer` copy destination. That import is "unverified and the likeliest first failure"
+(`kmd-rm-client.md` 15.8; 15.14 Q4).
+
+**Hazards.**
+
+1. The decisive one: section 4's paging design makes the RM memory authoritative and SKIPS both eviction and page-in. Today
+   VidMm demonstrably moves this allocation to system pages, and dxgkrnl's CPU view follows them (13.1). With evictions
+   skipped, those pages hold whatever VidMm put there, which is the `BltNoMirror` freeze again. A would work only if VidMm
+   never moved the allocation, which cannot be promised (the WDDM rule puts the aperture in the supported set), or with a
+   mirror from RM memory, which is the cost A set out to remove.
+2. Level 5 has never run on hardware. `kmd-rm-client.md` 15 says "Never built, never run", 15.17 says "compiled by nothing,
+   run by nothing", and no `RmSys*` result is recorded in this tree.
+3. The Venus DWM fallback (2.3), the DUP exposure (2.4) and the table caps (4).
+4. The ownership protocol disappears for these allocations (bit 0 clear, section 4).
+
+**Fallback.** The Venus arm on any refusal.
+
+**Test plan.** Only after 15.13 steps 2 to 5 pass: `RmStdOk` and `RmSysBlt*` grow, `BltMirrorUs` stays 0, and the window is live.
+
+**Verdict.** A does not remove the mirror. It is section 4's design for removing Venus from the KMD, and it inherits the
+eviction problem above.
+
+### 13.3 Candidate B: a guest-memory blob over the allocation's own system pages as the Venus copy destination
+
+**Idea.** While `system_backings` holds leases for the destination, the GPU copy writes THOSE pages instead of the Venus blob,
+so the mirror has nothing left to do. While it holds none (the allocation is in the BAR segment), the CPU view is the Venus
+blob, so the legacy copy is already correct (`PBSyCp` 2). The page-in stays a CPU copy from system pages to the blob, which
+now carries the current frame.
+
+**What the KMD would do** (estimate 400 to 500 lines, plus about 150 lines of `kmd_logic` tests):
+
+1. **Create the guest blob.** When the leases of a destination cover `[0, pitch x height)` (a new pure check over the
+   snapshot's ranges), build the page list from the leases' locked MDLs (`backing.rs:82-110`; the PFNs stay stable while the
+   lease lives). Send `RESOURCE_CREATE_BLOB` with:
+   * `blob_mem` `VIRTIO_GPU_BLOB_MEM_GUEST` (1, `protocol/src/virtio_gpu.rs:94`) and `blob_flags` `USE_SHAREABLE`;
+   * `nr_entries` = the page runs (at most 4096, from `MAX_SYSTEM_BACKING_RANGES`; whether one control message may carry
+     4096 entries is unknown);
+   * `blob_id` 0, on the KMD's Venus context.
+
+   Then send `CTX_ATTACH_RESOURCE` to that context.
+2. **Import it on the KMD's Venus device.** `vkAllocateMemory` with `VkImportMemoryResourceInfoMESA { resourceId }`, then
+   `vkCreateBuffer` of the allocation's size and bind. Add a present-buffer cache entry keyed by the guest blob's resid, so the
+   `(source, destination)` cache of `prepare_present_blt` (`venus/present.rs:1206-1224`) records a second reusable command
+   with `desc.pitch`.
+3. **Present** (the legacy arm and both `BltAsync` arms). `begin_present_buffer_write_legacy` runs on the Venus resid as
+   today, and the copy goes to the guest buffer. Skip the mirror and do NOT mark the copy stale: the system copy is now the
+   current one. The ownership hand-back follows the `BltNoMirror` flow (`virtio/gpu/mod.rs:2142`). With `BltAsync` the DDI no
+   longer waits.
+4. **Teardown before the leases change.** `replace_range`, `remove_range`, `remove_all` and the generation reset
+   (`backing.rs:470, 549, 635, 640`) must, in this order:
+   * drain copies in flight to the guest buffer (a bounded wait on the last wire fence, at PASSIVE inside `BuildPagingBuffer`,
+     which must still answer success);
+   * release the cached command (`release_present_blits_for_resource`, `venus/present.rs:1483`) and free the Venus memory;
+   * unref the guest blob;
+   * only then unlock the pages.
+5. **Refuse B (use the legacy arm) when another Venus process has opened the buffer**, i.e. the Present-buffer open table
+   has a Venus consumer other than the creator (`authorize_present_buffer_open`, `virtio/gpu/mod.rs:6490`). A Venus DWM
+   samples the Venus blob, which B leaves stale.
+
+**What the HOST must provide.** None of it exists today:
+
+* The backend refuses guest blobs (`host/backend/device/src/venus/blob.rs:54, 73`, pinned by `tests.rs:701-705`) and forwards
+  only HOST3D to the renderer (`host/venus/src/virgl.rs:329-338`, with null iovecs).
+* virglrenderer's Venus import of a resource needs an fd of type DMABUF or OPAQUE (`src/venus/vkr_device_memory.c:28-38`). It
+  refuses a guest resource that has only iovecs.
+
+So the host needs three things:
+
+* **(a)** The backend accepts GUEST blobs and validates the runs against guest RAM. `backend/device/src/guestmem.rs` already
+  stitches guest page runs from the vhost-user region fds for RM's OS-descriptor PIN (`nvidia/osdesc.rs:125-195`).
+* **(b)** A dma-buf of those pages (a udmabuf over the region memfd; the region fds exist per `guestmem.rs:10-15`), passed to
+  the renderer process and given to virglrenderer as a DMABUF resource (`virgl_renderer_resource_import_blob`,
+  `virglrenderer.h:442-452`).
+* **(c)** The NVIDIA host Vulkan driver imports that dma-buf as `VkDeviceMemory` that can be a transfer destination, with a
+  coherent (snooped) memory type. **(c) is the big unknown.**
+
+A second host route has the same KMD shape: pin the pages as RM `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` (the PIN path of
+`nvrm-escape.md` 4.4), export it to a dma-buf, create an RM_EXPORT blob, and import that into Venus the way `ForeignCopy`
+already imports NVK images. `kmd-rm-client.md` 5.3 row B marks the OS-descriptor export UNVERIFIED.
+
+**Hazards.**
+
+* **Page-in and eviction:** handled by step 4. The drain is the new risk: a paging operation that waits on the GPU.
+* **Partial evictions:** B applies only with full coverage.
+* **Stale marks:** B never sets one. If `BltNoMirror` is also on, B wins for a covered destination.
+* **Ownership:** the keys and states are unchanged; only the `KmdCpuMirror` state is skipped.
+* **Concurrency with dxgkrnl's CPU view:** the GPU writes the pages before the Present's DMA fence retires, exactly when the
+  mirror writes them today. An unordered CPU reader sees tearing in both cases.
+* **Coherence:** the guest maps the pages write-back. Host GPU writes to host RAM are snooped on x86 only if the imported
+  memory type is a coherent one, which is unknown until (c) is answered.
+* **Lifetime:** the guest blob's lifetime must fit inside the lease's.
+
+**Fallback.** Any failure in steps 1 or 2 keeps the legacy arm and the mirror for that destination (counted), with a strike
+limit.
+
+**Test plan.** New counters: `GbMade`, `GbHit` (copies into a guest buffer), `GbDrop` (teardowns at paging), `GbDrainUs`,
+`GbFail`, `GbWhy`. Pass conditions:
+
+* `GbHit` equals the Blt count while `BltMirrorN` and `PgSm` stay flat, and the window is live in the NVK DWM.
+* A CPU checksum of the first row against a GPU-written pattern, on 1 frame in 64, gives `GbBad` 0.
+* `PrDdiBltUs / PrDdiBltN` drops by at least the old `BltMirrorUs / BltMirrorN`.
+* Under window drags and memory pressure, `PgTo`, `PgTi` and `GbDrop` grow while `PgSe` and `PgInvOvf` stay 0.
+
+### 13.4 Candidate C: keep the host-visible blob, make the mirror cheaper
+
+**What changes.** Four options, each small, all in `build_paging_buffer.rs:908-934` and `display.rs:1081-1107`:
+
+1. **Persistent mapping** (60 lines). Keep the blob's kernel mapping across frames instead of doing `RESOURCE_MAP_BLOB` +
+   `MmMapIoSpace` + `MmUnmapIoSpace` of 6.6 MB every frame. Hazard: the mapping must die with the blob, the window placement
+   and the generation.
+2. **Non-temporal stores** into the leased pages (30 lines). The destination is read only later, by DWM's path, so keeping it
+   out of the cache is right.
+3. **Dirty rects.** The Blt arm reads no rects today (`kmd-rm-client.md` 15.17), and for a 3D app every frame covers the whole
+   window, so the gain for Heaven is 0.
+4. **Off the DDI thread, with the fence tied to it.** Already built: `BltAsync` DEFERRED runs the mirror on the worker, and the
+   Present fence retires after it (`zero-copy-present.md` 24.3, 24.11.5). `msInPresentAPI` moved only from 1.93 to 1.86 ms,
+   because the runtime's throttle absorbs the difference.
+
+**Host.** Nothing. **Hazards.** Nothing new beyond the mapping lifetime. **Fallback.** The knob.
+
+**Realistic best case from the measured numbers.** The copy reads at most about 26.8 GB/s cached (2.2), so 5.76 MB cannot take
+less than about 0.21 ms. With streaming stores and no per-frame map, perhaps 0.25 to 0.35 ms instead of 0.4 to 0.7 ms. That
+saves 0.1 to 0.4 ms of a 1.5 to 2.1 ms Present, and the 0.75 ms copy and the fence wait still run serially in front of it.
+
+**Test plan.** Split `BltMirrorUs` into map time and copy time (`MirMapUs`, `MirCpyUs`) and compare before and after on the
+same scene.
+
+### 13.5 Recommendation
+
+**B**, after the step-0 measurement in 13.6 (Q1). B is the only candidate that removes the CPU copy while keeping dxgkrnl's
+CPU view and VidMm's content model truthful:
+
+* it writes exactly the pages VidMm believes are authoritative;
+* it changes no paging semantics: no new invalid marks, and the page-in copies the current frame;
+* it keeps the Venus blob path for the resident case and for Venus consumers;
+* its fallback is today's arm, per destination.
+
+A does not remove the copy as built, and it breaks under the eviction this allocation demonstrably sees. C caps at a saving of
+0.1 to 0.4 ms.
+
+B's cost is on the host: guest blobs do not exist in the backend or the renderer today, and whether the NVIDIA driver can
+import them is unknown. If question 2 or 3 below fails, C(1)+(2) is the fallback plan. If question 1 shows the system backing
+is avoidable (VidMm keeps the allocation in the BAR segment), the mirror shrinks to the `PBSyCp` 2 lookup with no new
+mechanism at all. That would be the smallest change, which is why question 1 comes first.
+
+### 13.6 Questions to answer first, in order (each settled by one counter or one log line)
+
+1. **Win11 session (counters that exist):** is the destination persistently system-backed? Over 10 s of Heaven:
+   * `PgSm` grows by about the Blt count while `PgTo` and `PgTi` stay flat after the first eviction: yes.
+   * `PgTi` grows every frame: VidMm pages it in for each Present and out again, and the cost of that churn decides B.
+   * `PgSm` stays flat: the mirror is not what costs time, and 13.1 is wrong.
+
+   A new counter `PBDstSlot` (the destination's `rm_standard::hist_slot_from_misc`) would also say whether it is Shadow or Staging.
+2. **Host session:** can the NVIDIA host Vulkan driver import a udmabuf over a memfd range as `VkDeviceMemory` (memory type
+   flags printed) and run `vkCmdCopyImageToBuffer` into it? Settled by one standalone test's log line: `udmabuf import:
+   VkResult 0, type flags 0x...`. If not, ask the same for the RM OS-descriptor route (`EXPORT_OBJECT_TO_FD` of an
+   OS-descriptor object).
+3. **Host session:** with a backend that accepts guest blobs, does one reach a Venus import? The backend's
+   `venus: create blob ... blob_mem 1 ... entries N` line (`blob.rs:57-65`) must be answered `RESP_OK_NODATA`, and the
+   renderer's `failed to import resource` line (`vkr_device_memory.c:23`) must be absent.
+4. **Host session:** are GPU writes into guest pages coherent under a guest write-back view? `GbBad` stays 0 over 10 000 frames.
+5. **Win11 session:** is the GPU copy into guest pages as fast as into the host-visible blob? Compare `BltAsyncLat2` (or
+   `BltWaitUs / BltWaitN`) with and without B, on the same scene.
+6. **UMD session:** does a Venus DWM (`DwmIcd=venus`) open the destination? Read `StdOpenPid` after starting Heaven under a Venus
+   DWM. If it is DWM's pid, B must refuse that buffer (13.3 step 5) and that DWM keeps the mirror.
+7. **Host session, only if A is reconsidered:** does Venus import an RM_EXPORT sysmem blob as a buffer copy destination
+   (`kmd-rm-client.md` 15.14 Q4)? Settled by one host log line showing a successful `vkAllocateMemory` import of a 0x80000001 blob.
