@@ -817,9 +817,6 @@ unsafe fn note_nvk_keyed_resource(
     let Some(dev) = helios_device(h) else {
         return;
     };
-    if !dev.dxvk.is_nvk() && !keyed_flush_wait_forced() {
-        return;
-    }
     let mut list = lock_ignore_poison(&dev.nvk_keyed_resources);
     let key = h_resource.pDrvPrivate as usize;
     if !list.contains(&key) {

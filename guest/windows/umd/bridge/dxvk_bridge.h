@@ -19,6 +19,11 @@ struct HeliosDxvkDeviceImpl;
 inline constexpr std::uint32_t kPresentOrderComplete = 0;
 inline constexpr std::uint32_t kPresentOrderSubmitted = 1;
 
+// `mode` of HeliosDxvkDevice::flush_gate_point.
+inline constexpr std::uint32_t kFlushGateStream = 0;
+inline constexpr std::uint32_t kFlushGateWire = 1;
+inline constexpr std::uint32_t kFlushGateRmFence = 2;
+
 struct HeliosDxvkDevice {
   HeliosDxvkDevice() noexcept;
   ~HeliosDxvkDevice();
@@ -135,6 +140,25 @@ struct HeliosDxvkDevice {
                                  std::uint64_t* value) const noexcept;
   // Close a fence the caller still owns.
   void nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept;
+
+  // Flush gate (Conduit docs/flush-gate.md): what pfnFlush's HEFL packet
+  // carries for everything recorded so far. Flushes first. `mode`:
+  //   kFlushGateStream  Venus: a point of the device's present stream,
+  //                     signalled behind all recorded work (*ctx_id,
+  //                     *value32, *cookie);
+  //   kFlushGateWire    wait until the work reached the transport (the
+  //                     submission thread), no point;
+  //   kFlushGateRmFence NVK: wait for the submission, then an RM fence for
+  //                     everything submitted (*fence becomes the caller's,
+  //                     *fence_value diagnostic).
+  // Returns 0 = nothing recorded since the previous gate (send nothing),
+  // 1 = ready, -1 = this mode is unavailable here (fall back), -2 = failed.
+  std::int32_t flush_gate_point(std::uint32_t mode,
+                                std::uint32_t* ctx_id,
+                                std::uint32_t* value32,
+                                std::uint64_t* cookie,
+                                std::uint32_t* fence,
+                                std::uint64_t* fence_value) const noexcept;
 
   // Create a dedicated OPTIMAL, DMA_BUF-exportable image (via the
   // D3D11_HELIOS_CREATE_INFO marker) and report logical scanout metadata for

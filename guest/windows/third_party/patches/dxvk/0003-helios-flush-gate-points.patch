@@ -1,0 +1,82 @@
+Helios DXVK fork: flush-gate points without a producer allocation
+
+Conduit guest/windows/docs/flush-gate.md (KMD kmd/flush-completion) and
+docs/shared-surfaces.md section 4. Applied after 0002 by
+ci/windows/Build-Driver.ps1.
+
+- D3D11ImmediateContext::HeliosFlushSequence: flush whatever is pending and
+  return the sequence number of the last chunk, so the UMD can tell a flush
+  with new work from an empty one.
+- D3D11ImmediateContext::HeliosSignalFlushPoint: a signal of the present
+  stream's timeline semaphore behind everything recorded so far, then a
+  flush. The UMD's pfnFlush sends the point in its HEFL flush-gate packet;
+  unlike HeliosSignalPresentFence it needs no producer allocation, because
+  a flush names no resource.
+
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index b321e97e..26744591 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -1220,6 +1220,29 @@ namespace dxvk {
+   }
+ 
+ 
++  uint64_t D3D11ImmediateContext::HeliosFlushSequence() {
++    D3D10DeviceLock lock = LockContext();
++    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, false);
++    return GetCurrentSequenceNumber();
++  }
++
++
++  uint64_t D3D11ImmediateContext::HeliosSignalFlushPoint(
++    const Rc<DxvkFence>&        Fence,
++          uint64_t              Value) {
++    D3D10DeviceLock lock = LockContext();
++
++    EmitCs([
++      cFence = Fence,
++      cValue = Value
++    ] (DxvkContext* ctx) {
++      ctx->signalFence(cFence, cValue);
++    });
++    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, false);
++    return GetCurrentSequenceNumber();
++  }
++
++
+   void D3D11ImmediateContext::HeliosSignalPresentFence(
+     const Rc<DxvkFence>&        Fence,
+           uint64_t              Value,
+diff --git a/src/d3d11/d3d11_context_imm.h b/src/d3d11/d3d11_context_imm.h
+index 4dc81e7f..92348b9b 100644
+--- a/src/d3d11/d3d11_context_imm.h
++++ b/src/d3d11/d3d11_context_imm.h
+@@ -168,6 +168,28 @@ namespace dxvk {
+             uint64_t              Value,
+       const Rc<HeliosProducerOperation>& Operation);
+ 
++    /**
++     * \brief Helios flush gate: flush and name what has been recorded
++     *
++     * Dispatches whatever is pending (as a D3D11 Flush does) and returns the
++     * sequence number of the last chunk handed to the CS thread. Two calls
++     * that return the same number had nothing recorded in between.
++     */
++    uint64_t HeliosFlushSequence();
++
++    /**
++     * \brief Helios flush gate: a stream point after everything recorded
++     *
++     * Records a signal of `Fence` to `Value` behind all work recorded so far
++     * and flushes, so the signal rides the next submission (Conduit
++     * docs/flush-gate.md: the KMD gates the flush packet on its retirement).
++     * No producer allocation is involved. Returns the sequence number after
++     * the flush.
++     */
++    uint64_t HeliosSignalFlushPoint(
++      const Rc<DxvkFence>&        Fence,
++            uint64_t              Value);
++
+     /**
+      * \brief Helios: image-level copy for the dcomp present vehicle
+      *

@@ -114,6 +114,18 @@ work is not in those DMA buffers, so dxgkrnl cannot order it.
   acquire before the first use after `AcquireSync`. Until then, keep the v1 CPU rule on the
   acquire side too (wait for nothing: v1 already completes the releaser).
 
+**Implemented (flush gate, `docs/flush-gate.md`, KMD `kmd/flush-completion` 4fc8df4, v315):**
+`umd/src/forward/transfer.rs` `flush_gate`. On every flush (and NVK present) of a device holding
+a created or opened `MISC_SHARED` non-`BIND_PRESENT` resource, when DXVK recorded work since the
+previous gate (CS sequence number), one 48-byte `HEFL` through `pfnRenderCb` on the device's
+context, no allocations: NVK `RM_FENCE` (NVRM caps bit 34, the S4 queue fence after the
+submission thread drained); Venus `STREAM` (scanout probe bit 5; a point of the present stream
+signalled behind the recorded work by DXVK patch 0003 `HeliosSignalFlushPoint`, the stream
+registered without a producer allocation if no present did it first), else the wire rung after
+the submission thread. Without a carrier the CPU wait above remains (NVK by default, Venus with
+`HELIOS_KEYED_FLUSH_WAIT=1`). A failed packet never fails the flush. `d3d11_share keyed-load`
+prints the KMD's `FlGRec FlGStrm FlGFnc FlGWire FlGDeg` deltas.
+
 ## 5. Implementation on this branch
 
 - **librmclient**: `crm_win_rm_resource_import(rm_handle, resource_id, &gem, &size, &modifier,

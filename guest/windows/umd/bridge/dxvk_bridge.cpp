@@ -352,6 +352,11 @@ struct HeliosDxvkDeviceImpl {
   // Registration failure is terminal; it never permits an unordered read.
   std::uint64_t present_stream_cookie = 0;
 
+  // Flush gate: the CS sequence number the last gate covered (UINT64_MAX:
+  // none yet), so an empty flush sends nothing. Guarded by flush_gate_mutex.
+  std::mutex flush_gate_mutex;
+  std::uint64_t flush_gate_seq = UINT64_MAX;
+
   ~HeliosDxvkDeviceImpl() {
     if (vehicle_semaphore_handle) CloseHandle(vehicle_semaphore_handle);
     if (context) context->Release();
@@ -614,6 +619,133 @@ void HeliosDxvkDevice::nvk_rm_fence_close(std::uint32_t fence_handle) const noex
     if (impl && fence_handle && impl->icd.rm_fence_close && impl->device != nullptr)
       impl->icd.rm_fence_close(impl->device->vkd()->device(), fence_handle);
     return true;
+  });
+}
+
+namespace {
+  // The present stream without a producer allocation (a flush names none):
+  // the same one-time registration publish_present_order makes, through the
+  // Venus ICD's producer table directly. True when present_fence is live.
+  bool ensure_flush_stream(HeliosDxvkDeviceImpl& d) {
+    bool initialize = false;
+    {
+      std::unique_lock lock(d.present_order_mutex);
+      while (d.present_fence_initializing)
+        d.present_order_ready.wait(lock);
+      if (d.present_fence_failed)
+        return false;
+      if (d.present_fence != nullptr)
+        return true;
+      d.present_fence_initializing = true;
+      initialize = true;
+    }
+    (void)initialize;
+    dxvk::Rc<dxvk::DxvkFence> fence;
+    std::uint64_t cookie = 0;
+    bool ok = false;
+    try {
+      // The Venus ICD module from the device's own dispatch, as
+      // HeliosProducerBinding resolves it.
+      HMODULE module = nullptr;
+      const auto entry = d.device->vkd()->vkGetSemaphoreCounterValue;
+      if (entry)
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+          | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCWSTR>(entry), &module);
+      const auto get = module ? reinterpret_cast<helios_get_producer_api_fn>(
+        reinterpret_cast<void*>(GetProcAddress(module, "helios_venus_producer_interface"))) : nullptr;
+      helios_producer_api_v1 api = { };
+      if (get && get(HELIOS_PRODUCER_ABI, &api) == VK_SUCCESS
+       && api.version == HELIOS_PRODUCER_ABI && api.size == sizeof(api) && api.stream) {
+        dxvk::DxvkFenceCreateInfo fenceInfo = { };
+        fenceInfo.sharedType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        fence = d.device->createFence(fenceInfo);
+        std::uint32_t ctx = 0;
+        ok = api.stream(reinterpret_cast<uintptr_t>(d.device->vkd()->device()),
+                        std::uint64_t(uintptr_t(fence->handle())), &ctx, &cookie) == VK_SUCCESS
+          && ctx == d.venus_ctx_id && cookie != 0;
+      }
+    } catch (const dxvk::DxvkError&) {
+      ok = false;
+    }
+    {
+      std::lock_guard lock(d.present_order_mutex);
+      d.present_fence_initializing = false;
+      if (ok) {
+        d.present_fence = std::move(fence);
+        d.present_stream_cookie = cookie;
+      } else {
+        d.present_fence_failed = true;
+      }
+    }
+    d.present_order_ready.notify_all();
+    char msg[160];
+    std::snprintf(msg, sizeof(msg), ok
+      ? "flush-gate: present stream registered for flush points ctx=%u cookie=%llu"
+      : "flush-gate: no present stream (ctx=%u cookie=%llu): flushes use the wire rung",
+      d.venus_ctx_id, static_cast<unsigned long long>(cookie));
+    umd_log(msg);
+    return ok;
+  }
+}
+
+std::int32_t HeliosDxvkDevice::flush_gate_point(std::uint32_t mode,
+                                                std::uint32_t* ctx_id,
+                                                std::uint32_t* value32,
+                                                std::uint64_t* cookie,
+                                                std::uint32_t* fence,
+                                                std::uint64_t* fence_value) const noexcept {
+  *ctx_id = 0; *value32 = 0; *cookie = 0; *fence = 0; *fence_value = 0;
+  if (!impl || !impl->context || impl->device == nullptr)
+    return -1;
+  return bridge_guard("flush_gate_point", std::int32_t(-2), [&]() -> std::int32_t {
+    auto* immediate = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
+    std::lock_guard gate(impl->flush_gate_mutex);
+    const std::uint64_t seq = immediate->HeliosFlushSequence();
+    if (seq == impl->flush_gate_seq)
+      return 0;
+
+    if (mode == kFlushGateStream) {
+      if (impl->backend != helios_bridge::IcdBackend::Venus || !impl->venus_ctx_id
+       || !ensure_flush_stream(*impl))
+        return -1;
+      std::uint64_t value = 0;
+      dxvk::Rc<dxvk::DxvkFence> streamFence;
+      {
+        std::lock_guard lock(impl->present_order_mutex);
+        if (impl->present_fence_failed || impl->present_fence == nullptr
+         || impl->present_value >= UINT32_MAX - 1)
+          return -1;
+        // The stream's values are shared with present markers: the KMD wants
+        // each tag above the last one submitted, so the increment and the
+        // recording stay in one order with publish_present_order.
+        value = ++impl->present_value;
+        streamFence = impl->present_fence;
+        impl->flush_gate_seq = immediate->HeliosSignalFlushPoint(streamFence, value);
+      }
+      *ctx_id = impl->venus_ctx_id;
+      *value32 = std::uint32_t(value);
+      *cookie = impl->present_stream_cookie;
+      return 1;
+    }
+
+    if (mode == kFlushGateWire || mode == kFlushGateRmFence) {
+      if (mode == kFlushGateRmFence && (impl->backend != helios_bridge::IcdBackend::NvkRm
+       || !impl->icd.queue_rm_fence || !(impl->icd.caps & HELIOS_ICD_CAP_RM_FENCE)))
+        return -1;
+      if (!immediate->HeliosWaitFrameSubmitted())
+        return -2;
+      impl->flush_gate_seq = seq;
+      if (mode == kFlushGateWire)
+        return 1;
+      const VkResult vr = queue_rm_fence(*impl, fence, fence_value);
+      if (vr != VK_SUCCESS || *fence == 0) {
+        *fence = 0;
+        return -1;
+      }
+      return 1;
+    }
+    return -1;
   });
 }
 

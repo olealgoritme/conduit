@@ -808,3 +808,64 @@ pub extern "C" fn helios_scanout_ledger_snapshot_v2(
     }
     slots as u32
 }
+
+// ---- Flush gate capabilities (docs/flush-gate.md, decision 7) ------------
+
+/// Venus stream points and the wire rung: `HELIOS_SCANOUT_CAP_FLUSH_GATE` in
+/// the PROBE reply. An older KMD copies an `HEFL` and gates nothing, so the
+/// UMD never sends one without the bit.
+pub(crate) fn flush_gate_capable() -> bool {
+    PROBE_STATE.load(Ordering::Acquire) == PROBE_OK
+        && PROBE_CAPS.load(Ordering::Relaxed) & helios_protocol::HELIOS_SCANOUT_CAP_FLUSH_GATE != 0
+}
+
+/// NVRM `QUERY_CAPS.supported_ops`, once per process: 0 unknown, else the
+/// bits with bit 63 forced on as "asked" (bit 63 is no capability).
+static NVRM_OPS: AtomicU64 = AtomicU64::new(0);
+const NVRM_OPS_ASKED: u64 = 1 << 63;
+
+/// The RM-fence flush gate: NVRM `QUERY_CAPS.supported_ops` bit 34
+/// (`HELIOS_NVRM_CAP_FLUSH_GATE`), asked once per process through this
+/// device's escape callback.
+///
+/// # Safety
+/// `dev` is a live device (its callback table valid for the call).
+pub(crate) unsafe fn nvrm_flush_gate_capable(dev: &HeliosDevice) -> bool {
+    let mut ops = NVRM_OPS.load(Ordering::Relaxed);
+    if ops == 0 {
+        ops = NVRM_OPS_ASKED;
+        let rt_adapter = LAST_RT_ADAPTER.load(Ordering::Acquire);
+        if !dev.kt_callbacks.is_null() && rt_adapter != 0 {
+            // SAFETY: HeliosNvrmQueryCaps is plain data; all-zero is valid.
+            let mut q: helios_protocol::HeliosNvrmQueryCaps = unsafe { core::mem::zeroed() };
+            q.head.hdr = HeliosEscapeHeader::new(
+                helios_protocol::HELIOS_ESCAPE_NVRM,
+                size_of::<helios_protocol::HeliosNvrmQueryCaps>() as u32,
+            );
+            q.head.abi_version = helios_protocol::HELIOS_NVRM_ABI_VERSION;
+            q.head.op = helios_protocol::HELIOS_NVRM_OP_QUERY_CAPS;
+            // SAFETY: `q` is a live stack struct of exactly the advertised size.
+            let hr = unsafe {
+                call_escape(
+                    dev.kt_callbacks,
+                    rt_adapter,
+                    dev.h_rt_device as usize,
+                    0,
+                    (&mut q as *mut helios_protocol::HeliosNvrmQueryCaps).cast(),
+                    size_of::<helios_protocol::HeliosNvrmQueryCaps>() as u32,
+                )
+            };
+            if hr >= 0 && q.head.status == 0 {
+                ops |= q.supported_ops;
+            }
+            log_error!(
+                "flush-gate: NVRM QUERY_CAPS hr=0x{:08x} status={} supported_ops=0x{:016x}",
+                hr as u32,
+                q.head.status,
+                q.supported_ops
+            );
+        }
+        NVRM_OPS.store(ops, Ordering::Relaxed);
+    }
+    ops & helios_protocol::HELIOS_NVRM_CAP_FLUSH_GATE != 0
+}

@@ -1521,7 +1521,7 @@ unsafe fn nvk_present_impl(
         }
         // A keyed-mutex surface may be released right after this present.
         context.Flush();
-        nvk_keyed_flush_wait(h, &context);
+        flush_gate(h, &context);
     }
     let correlation = match nvk_present_frame(h, shown) {
         Ok(c) => c,
