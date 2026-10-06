@@ -3034,7 +3034,9 @@ impl VirtioGpu {
         // this register, so the device may still be asserting INTx from that
         // completion. Clear it now (PASSIVE) so the line starts deasserted
         // before the interrupt-driven runtime paths take over.
-        if gpu.isr_status_va != 0 {
+        if gpu.isr_status_va != 0 && gpu.msi_isr_state == 0 {
+            // (Not in message mode: the virtio spec says not to touch the ISR
+            // status register once MSI-X is in use.)
             // SAFETY: `isr_status_va` is the mapped MMIO VA of the 1-byte
             // read-to-clear ISR-status register; a volatile read clears it.
             let _ = unsafe { core::ptr::read_volatile(gpu.isr_status_va as *const u8) };

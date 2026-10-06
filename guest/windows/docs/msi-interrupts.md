@@ -79,7 +79,12 @@ glue is `kmd_render/src/virtio/msi.rs`.
    return TRUE. INTx mode: unchanged, byte for byte.
 5. **DPC**: unchanged. It already drains the whole used ring and every queue's
    consumer on every run, so which message fired does not matter.
-6. **INF**: `MSISupported=1`, `MessageNumberLimit=3`.
+6. **INF**: ships DORMANT: `MSISupported=0` (NOCLOBBER, so a test setting survives a
+   driver update) and `MessageNumberLimit=3`. Enable per device for testing (below).
+   Reason (review): if messages are granted but never delivered, nothing recovers
+   (WDDM fence completions and the HPD wake ride the DPC, and render-only adapters
+   have no timer to poll), and conduit-vmm binds its call fd at DRIVER_OK, so a
+   later Enable bit would leave it on the INTx fd for the session.
 
 ## Fallback matrix
 
@@ -96,16 +101,17 @@ glue is `kmd_render/src/virtio/msi.rs`.
 
 ## Knobs
 
-* **Force INTx (bisect a boot failure).** This is a PnP decision, so it is the
-  device key, not the service key:
+* **Enable MSI-X for a test (shipped off).** This is a PnP decision, so it is the
+  device key, not the service key. Set it to 1 (to go back, set it to 0):
 
   ```
-  reg add "HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_1AF4&DEV_106D&SUBSYS_11001AF4&REV_01\<instance>\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" /v MSISupported /t REG_DWORD /d 0 /f
+  reg add "HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_1AF4&DEV_106D&SUBSYS_11001AF4&REV_01\<instance>\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" /v MSISupported /t REG_DWORD /d 1 /f
   pnputil /restart-device "PCI\VEN_1AF4&DEV_106D&SUBSYS_11001AF4&REV_01\<instance>"
   ```
 
-  A driver install/update re-applies the INF and sets it back to 1. If the boot
-  hangs before this is possible, install a package whose INF says 0.
+  The INF line is NOCLOBBER, so a driver install/update keeps whatever is set. If
+  the boot hangs with it enabled, set it to 0 offline or install a package that
+  forces 0.
   There is deliberately no service-key knob for this: once the OS has connected
   messages, the INTx line is not connected, so a driver that "chose INTx" anyway
   would never be woken.
@@ -123,9 +129,9 @@ message mode; dumped at DestroyDevice).
 
 ## Must be verified on hardware, in this order
 
-1. **Boot with `MSISupported=0`** on the new binary: behaves as v307 (`MsiGrant=0`,
+1. **Boot with the shipped default (`MSISupported=0`)**: behaves as v307 (`MsiGrant=0`,
    `MsiInts=0`). This proves the probes did not disturb the INTx path.
-2. **Boot with the new INF.** Read `MsiCap`/`MsiList`/`MsiGrant`. Expect `MsiCap`
+2. **Then enable MSI-X on the device key** (above) and restart the device. Read `MsiCap`/`MsiList`/`MsiGrant`. Expect `MsiCap`
    with bit 15 set and table size field 2 (3 entries); `MsiGrant` 3 if the OS
    lists one descriptor per message, 1 if it lists one descriptor for the whole
    set (still correct, single vector).

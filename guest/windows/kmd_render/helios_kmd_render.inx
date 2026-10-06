@@ -104,15 +104,19 @@ AddReg = Helios_PCI_MSIX
 ; was granted, and never programs a vector above the granted count), so a device
 ; that offers fewer messages (conduit-vmm) or none still works.
 ;
-; To force the legacy INTx line for a bisect, on the installed device key:
-;   reg add "HKLM\SYSTEM\CurrentControlSet\Enum\<instance path>\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" /v MSISupported /t REG_DWORD /d 0 /f
+; SHIPPED DORMANT: MSISupported is 0 (the legacy INTx line, as before this work).
+; MSI-X has never run on hardware, and if the OS connects messages that are never
+; delivered, nothing recovers (fence completions and the HPD wake ride the DPC).
+; To try it, on the installed device key:
+;   reg add "HKLM\SYSTEM\CurrentControlSet\Enum\<instance path>\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" /v MSISupported /t REG_DWORD /d 1 /f
 ;   pnputil /restart-device "<instance id>"
-; (a driver update re-applies this section and sets it back to 1). See
-; docs/msi-interrupts.md.
+; The line below is NOCLOBBER (0x00000002), so a driver update keeps that setting.
+; Flip the default to 1 only after `MsiInts` has been seen growing on the target
+; hosts. See docs/msi-interrupts.md.
 [Helios_PCI_MSIX]
 HKR, "Interrupt Management",, 0x00000010
 HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
-HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, %REG_DWORD%, 1
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010003, 0
 HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, %REG_DWORD%, 3
 
 ; ──── Software key / UMD registration ──────────────────────────────────────
