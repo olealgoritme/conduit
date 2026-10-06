@@ -716,6 +716,12 @@ pub mod knobs {
     /// while the heartbeat is armed, to run the watchdog (needs `VsWatchdog` above 0). Read at
     /// every StartDevice; mirrored as `VsIdlEff`.
     pub const VS_IDLE_WAKE: KnobName = KnobName::new(b"VsIdleWake");
+    /// `VsWdTimer` (default 1 = on, v329): the independent watchdog timer (a 250 ms Ex timer
+    /// started at StartDevice and cancelled at StopDevice) that re-arms a heartbeat that has been
+    /// silent for at least max(250 ms, 16 periods) while armed and the adapter is in D0, and asks
+    /// the worker to refresh the heartbeat block every 2 s. 0 never arms it. Read at every
+    /// StartDevice; mirrored as `VsWdTmEff`.
+    pub const VS_WD_TIMER: KnobName = KnobName::new(b"VsWdTimer");
     /// Segment topology. Legal values 0 and 10 only — see `BarSegTopology`.
     pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
     /// CpuVisible cached-allocation kill switch (default 1 = cached).

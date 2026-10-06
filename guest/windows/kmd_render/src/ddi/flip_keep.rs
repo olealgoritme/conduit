@@ -68,6 +68,12 @@ static WORKER: AtomicU32 = AtomicU32::new(0);
 static DMA: AtomicU32 = AtomicU32::new(0);
 static ASYNC: AtomicU32 = AtomicU32::new(0);
 static DDI: AtomicU32 = AtomicU32::new(0);
+/// Unpaired `SetVidPnSourceAddress` handles that were allocations of an OLDER transport
+/// generation (`FkGen`, a subset of `FkDdi`), and flips the worker completed kept because their
+/// source was dead, any allocation class (`FkStale`, a subset of `FkKeep`):
+/// `helios_kmd_logic::restart_flip`.
+static GEN_STALE_DDI: AtomicU32 = AtomicU32::new(0);
+static STALE_WORKER: AtomicU32 = AtomicU32::new(0);
 /// DMA Presents that wrote a keep record (the Present side of the DMA lane).
 static DMA_RECORDS: AtomicU32 = AtomicU32::new(0);
 /// Flips of a host-less shared placeholder the Present completed instead of failing (both
@@ -110,6 +116,28 @@ pub(crate) fn keep_passive(adapter: &AdapterContext, address: u64, why: KeepWhy,
         crate::diag::record_named_bytes(b"FkWhy", why.code());
         crate::diag::record_named_bytes(b"FkKeep", n);
     }
+}
+
+/// A `SetVidPnSourceAddress` handle that paired with nothing was an allocation of an older
+/// transport generation (`FkGen`). Atomics only, any IRQL; mirrored by [`publish_counters`] (the
+/// DDI can run at DIRQL, so it never writes the registry itself).
+pub(crate) fn note_stale_generation_ddi() {
+    GEN_STALE_DDI.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The worker's programming had no live source (`restart_flip::DeadKind`): publish `address` as a
+/// kept picture, whatever the allocation class, and count it under `reason` (`FkKeep`,
+/// `FkWorker`, `FkKeep08` / `FkKeep05`) and `FkStale`. PASSIVE. A zero address publishes nothing.
+pub(crate) fn keep_dead_source(adapter: &AdapterContext, address: u64, reason: KeepWhy) -> bool {
+    if fc::keep_address(address).is_none() {
+        return false;
+    }
+    let n = STALE_WORKER.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if fc::mirror_due(n) {
+        crate::diag::record_named_bytes(b"FkStale", n);
+    }
+    keep_passive(adapter, address, reason, Lane::Worker);
+    true
 }
 
 /// A DMA Present (PASSIVE) wrote a keep record for a flip it skipped: counted, the first and
@@ -175,6 +203,8 @@ pub(crate) fn reset_for_start() {
         &ASYNC,
         &DDI,
         &DMA_RECORDS,
+        &GEN_STALE_DDI,
+        &STALE_WORKER,
         &PH_FLIPS,
         &DEFER_BUDGET_EXITS,
         &VENUS_EXITS,
@@ -198,7 +228,11 @@ pub(crate) fn publish_counters() {
     let defer_exits = DEFER_BUDGET_EXITS.load(Ordering::Relaxed);
     let venus_exits = VENUS_EXITS.load(Ordering::Relaxed);
     let owed = MIRROR_PENDING.swap(0, Ordering::AcqRel) != 0;
+    let stale_gen = GEN_STALE_DDI.load(Ordering::Relaxed);
+    let stale_worker = STALE_WORKER.load(Ordering::Relaxed);
     if kept == 0
+        && stale_gen == 0
+        && stale_worker == 0
         && records == 0
         && placeholders == 0
         && defer_exits == 0
@@ -207,6 +241,8 @@ pub(crate) fn publish_counters() {
     {
         return;
     }
+    rec(b"FkGen", stale_gen);
+    rec(b"FkStale", stale_worker);
     rec(b"FkDefBud", defer_exits);
     rec(b"FkVenus", venus_exits);
     rec(b"FkPhFlip", placeholders);

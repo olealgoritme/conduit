@@ -283,6 +283,11 @@ static FLIP_PUB_T: AtomicU32 = AtomicU32::new(0);
 /// word instead, so an OLDER flip's address is never fired for this one (`FlipWdBig`).
 pub(crate) fn note_flip_issued(address: u64) {
     let seq = FLIP_ISS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    // The newest address dxgkrnl issued, for the restart seed (`restart_flip::seed_address`).
+    // Never zeroed by a generation, and a zero address (nothing assigned) never replaces it.
+    if address != 0 {
+        LAST_ISSUED.store(address, Ordering::Release);
+    }
     match sd::pack_flip(seq, address) {
         Some(word) => FLIP_WORD.store(word, Ordering::Release),
         None => {
@@ -314,6 +319,17 @@ pub(crate) fn note_published(address: u64) {
 /// The newest issued flip as one packed word (`stall_diag::pack_flip`: its number and address),
 /// and the number of the newest flip that is DONE (published by anyone, the watchdog included).
 static FLIP_WORD: AtomicU64 = AtomicU64::new(0);
+/// The newest address dxgkrnl ever issued in a flip (`SetVidPnSourceAddress`, or a DMA flip
+/// record), full width. Process-lifetime: [`start_generation`] deliberately leaves it alone,
+/// because dxgkrnl's own flip queue survives a device restart and a flip it issued before the
+/// stop may be the one it still waits to see retired. Read by `reset_display_publication_state`
+/// to seed the heartbeat's address and by the worker's dead-source exit.
+static LAST_ISSUED: AtomicU64 = AtomicU64::new(0);
+
+/// The newest address dxgkrnl issued in a flip, 0 if it never did. Atomics only, any IRQL.
+pub(crate) fn last_issued_address() -> u64 {
+    LAST_ISSUED.load(Ordering::Acquire)
+}
 static DONE_SEQ: AtomicU32 = AtomicU32::new(0);
 /// The vsync DPC's state between ticks (`stall_diag::PendState`): the consecutive-pending run
 /// (`VsPendN`), its maximum (`VsPendMax`), the no-publication clock and the `FlipPub` last seen.
@@ -454,11 +470,11 @@ pub(crate) fn on_vsync_tick(adapter: &AdapterContext, period_100ns: u64) {
 /// mirror, which does not). PASSIVE.
 pub(crate) fn publish_vsync_ticks() {
     use crate::diag::record_named_bytes as rec;
-    rec(b"VsTickN", VS_TICKS.load(Ordering::Relaxed));
+    rec_live(1, b"VsTickN", VS_TICKS.load(Ordering::Relaxed));
     rec(b"VsOffN", VS_OFF.load(Ordering::Relaxed));
     // The time of the last tick, written in the same call as the count: a count that stays put
     // while `StallT` (or `VpDmpT`) moves is a heartbeat that stopped, whatever the mirror's age.
-    rec(b"VsTickT", VS_TICK_T.load(Ordering::Relaxed));
+    rec_live(2, b"VsTickT", VS_TICK_T.load(Ordering::Relaxed));
     rec(b"VsGapMaxMs", VS_GAP_MAX_MS.load(Ordering::Relaxed));
     rec(b"VsArmN", VS_ARM_N.load(Ordering::Relaxed));
     rec(b"VsDisN", VS_DIS_N.load(Ordering::Relaxed));
@@ -481,6 +497,32 @@ pub(crate) fn publish_vsync_ticks() {
     rec(b"LkWaitMs", LK_WAIT_MS.load(Ordering::Relaxed));
     rec(b"StopSub", STOP_SUB.load(Ordering::Relaxed));
     rec(b"StopSubT", STOP_SUB_T.load(Ordering::Relaxed));
+    // v329: when this block was written (every value above is a snapshot as of this time: the
+    // heartbeat is judged by `VsLiveT` against `VsTickT`, never by a count that did not move
+    // between two reads of a mirror nothing refreshed), the callback breadcrumbs, the watchdog.
+    rec_live(0, b"VsLiveT", AdapterContext::interrupt_time_ms());
+    rec_live(3, b"VsCbIn", VS_CB_IN.load(Ordering::Relaxed));
+    rec_live(4, b"VsCbOut", VS_CB_OUT.load(Ordering::Relaxed));
+    rec(b"VsCbSyncB", VS_CB_SYNC_B.load(Ordering::Relaxed));
+    rec(b"VsCbSyncOk", VS_CB_SYNC_OK.load(Ordering::Relaxed));
+    rec(b"VsCbSyncSt", VS_CB_SYNC_ST.load(Ordering::Relaxed));
+    rec(b"VsCbSyncT", VS_CB_SYNC_T.load(Ordering::Relaxed));
+    rec_live(5, b"VsWdTkN", VS_WD_TK_N.load(Ordering::Relaxed));
+    rec_live(6, b"VsWdTkT", VS_WD_TK_T.load(Ordering::Relaxed));
+    rec_live(7, b"VsWdAgeMs", VS_WD_AGE_MS.load(Ordering::Relaxed));
+    rec_live(8, b"VsWdFixN", VS_WD_FIX_N.load(Ordering::Relaxed));
+    rec_live(9, b"VsWdHungN", VS_WD_HUNG_N.load(Ordering::Relaxed));
+    rec(b"VsWdPubN", VS_WD_PUB_N.load(Ordering::Relaxed));
+    rec(b"VsWdOn", VS_WD_ON.load(Ordering::Relaxed));
+    rec(b"VsWdNoTm", VS_WD_NO_TIMER.load(Ordering::Relaxed));
+    rec(b"VsWdSAt", VS_WD_S_AT.load(Ordering::Relaxed));
+    rec(b"VsWdSArm", VS_WD_S_ARM.load(Ordering::Relaxed));
+    rec(b"VsWdSRef", VS_WD_S_REF.load(Ordering::Relaxed));
+    rec(b"VsWdSDl", VS_WD_S_DL.load(Ordering::Relaxed));
+    rec(b"VsWdSAge", VS_WD_S_AGE.load(Ordering::Relaxed));
+    rec(b"VsWdSCbI", VS_WD_S_CB_I.load(Ordering::Relaxed));
+    rec(b"VsWdSCbO", VS_WD_S_CB_O.load(Ordering::Relaxed));
+    rec(b"VsWdSSyT", VS_WD_S_SY_T.load(Ordering::Relaxed));
 }
 
 // ---- the heartbeat's life (T5 anomaly 2) -----------------------------------------------------
@@ -617,6 +659,202 @@ pub(crate) fn note_vsync_revived(reference: u64, now: u64) -> bool {
     true
 }
 
+// ---- v329: tick callback breadcrumbs and the independent watchdog timer ----------------------
+
+/// Tick callbacks entered and returned (`VsCbIn`, `VsCbOut`; either timer source). NEVER zeroed
+/// (a callback of the previous generation may still be inside): `VsCbIn` above `VsCbOut` for
+/// more than a few milliseconds is a callback that is blocked. The synchronized call inside the
+/// tick (`DxgkCbSynchronizeExecution` through `signal_crtc_vsync`): begun (`VsCbSyncB`),
+/// returned (`VsCbSyncOk`, whatever the status), the status of the last return (`VsCbSyncSt`)
+/// and the interrupt time (ms) the last one began (`VsCbSyncT`).
+static VS_CB_IN: AtomicU32 = AtomicU32::new(0);
+static VS_CB_OUT: AtomicU32 = AtomicU32::new(0);
+static VS_CB_SYNC_B: AtomicU32 = AtomicU32::new(0);
+static VS_CB_SYNC_OK: AtomicU32 = AtomicU32::new(0);
+static VS_CB_SYNC_ST: AtomicU32 = AtomicU32::new(0);
+static VS_CB_SYNC_T: AtomicU32 = AtomicU32::new(0);
+/// The watchdog timer: its ticks (`VsWdTkN`) and the time of the last (`VsWdTkT`), the silence
+/// of the heartbeat it saw at the last tick (`VsWdAgeMs`), re-arms it did (`VsWdFixN`), ticks that
+/// found a blocked callback (`VsWdHungN`), mirror refreshes it asked the worker for
+/// (`VsWdPubN`), whether it is armed (`VsWdOn`), the `VsWdTimer` knob in force (`VsWdTmEff`) and
+/// whether the timer could not be allocated (`VsWdNoTm`).
+static VS_WD_TK_N: AtomicU32 = AtomicU32::new(0);
+static VS_WD_TK_T: AtomicU32 = AtomicU32::new(0);
+static VS_WD_AGE_MS: AtomicU32 = AtomicU32::new(0);
+static VS_WD_FIX_N: AtomicU32 = AtomicU32::new(0);
+static VS_WD_HUNG_N: AtomicU32 = AtomicU32::new(0);
+static VS_WD_PUB_N: AtomicU32 = AtomicU32::new(0);
+static VS_WD_ON: AtomicU32 = AtomicU32::new(0);
+static VS_WD_TIMER: AtomicU32 = AtomicU32::new(1);
+static VS_WD_NO_TIMER: AtomicU32 = AtomicU32::new(0);
+/// What the watchdog saw the last time it acted (a fix or a hang): when (`VsWdSAt`), whether the
+/// heartbeat was armed (`VsWdSArm`), the reference and the pending deadline in interrupt ms
+/// (`VsWdSRef`, `VsWdSDl`), the silence (`VsWdSAge`), the callback counts (`VsWdSCbI`,
+/// `VsWdSCbO`) and when the last synchronized call began (`VsWdSSyT`).
+static VS_WD_S_AT: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_ARM: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_REF: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_DL: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_AGE: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_CB_I: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_CB_O: AtomicU32 = AtomicU32::new(0);
+static VS_WD_S_SY_T: AtomicU32 = AtomicU32::new(0);
+/// What the watchdog asked the worker to write (0 nothing, 1 the ten-value live block, 2 the
+/// whole heartbeat block); the worker takes it. `VS_WD_LAST_FULL` is the watchdog tick number of
+/// the last full request (0 = none this generation), for `vsync_wd::publish_plan`.
+static LIVE_WANTED: AtomicU32 = AtomicU32::new(0);
+static VS_WD_LAST_FULL: AtomicU32 = AtomicU32::new(0);
+/// The last value written for each of the ten live values (`u64::MAX` = unknown: written next
+/// time). Every writer of those names goes through [`rec_live`], so the cache is the registry's
+/// content; [`start_generation`] makes it unknown again before it writes the block's zeros.
+const LIVE_N: usize = 10;
+static LIVE_CACHE: [AtomicU64; LIVE_N] = [
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+    AtomicU64::new(u64::MAX),
+];
+
+/// Write one of the ten live values unless it is what the registry already holds. PASSIVE.
+fn rec_live(slot: usize, name: &[u8], value: u32) {
+    if LIVE_CACHE[slot].swap(value as u64, Ordering::Relaxed) == value as u64 {
+        return;
+    }
+    crate::diag::record_named_bytes(name, value);
+}
+
+/// A tick callback was entered / returned (any IRQL <= DISPATCH, atomics only).
+pub(crate) fn cb_enter() {
+    VS_CB_IN.fetch_add(1, Ordering::AcqRel);
+}
+pub(crate) fn cb_leave() {
+    VS_CB_OUT.fetch_add(1, Ordering::AcqRel);
+}
+
+/// The callback counts `(entered, returned)`; returned is read FIRST so a callback that finishes
+/// between the two loads reads as in flight, never as the impossible "returned before entered".
+pub(crate) fn cb_counts() -> (u32, u32) {
+    let out = VS_CB_OUT.load(Ordering::Acquire);
+    let inn = VS_CB_IN.load(Ordering::Acquire);
+    (inn, out)
+}
+
+/// The tick is about to call `DxgkCbSynchronizeExecution` (`now_ms`: interrupt time, ms).
+pub(crate) fn cb_sync_begin(now_ms: u32) {
+    VS_CB_SYNC_T.store(now_ms, Ordering::Relaxed);
+    VS_CB_SYNC_B.fetch_add(1, Ordering::AcqRel);
+}
+
+/// The synchronized call returned with `status`.
+pub(crate) fn cb_sync_end(status: i32) {
+    VS_CB_SYNC_ST.store(status as u32, Ordering::Relaxed);
+    VS_CB_SYNC_OK.fetch_add(1, Ordering::AcqRel);
+}
+
+/// `VsWdTimer` in force (0 = the watchdog timer is never armed).
+pub(crate) fn vs_wd_timer() -> bool {
+    VS_WD_TIMER.load(Ordering::Relaxed) != 0
+}
+
+/// The watchdog timer is armed (1) or stopped (0).
+pub(crate) fn note_wd_on(on: bool) {
+    VS_WD_ON.store(on as u32, Ordering::Relaxed);
+}
+
+/// `ExAllocateTimer` for the watchdog returned NULL: there is none this adapter lifetime.
+pub(crate) fn note_wd_no_timer() {
+    VS_WD_NO_TIMER.store(1, Ordering::Relaxed);
+}
+
+/// One watchdog tick: its count and time, and the heartbeat's silence it saw. Returns the new
+/// tick count. DISPATCH, atomics only.
+pub(crate) fn note_wd_tick(now_ms: u32, age_ms: u32) -> u32 {
+    VS_WD_TK_T.store(now_ms, Ordering::Relaxed);
+    VS_WD_AGE_MS.store(age_ms, Ordering::Relaxed);
+    VS_WD_TK_N.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+}
+
+/// The watchdog re-armed a silent heartbeat (`fix`) or found a blocked callback.
+pub(crate) fn note_wd_acted(fix: bool) {
+    if fix {
+        VS_WD_FIX_N.fetch_add(1, Ordering::Relaxed);
+    } else {
+        VS_WD_HUNG_N.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The state the watchdog acted on, before it acted (`VsWdS*`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn note_wd_snapshot(
+    now_ms: u32,
+    armed: bool,
+    reference_ms: u32,
+    deadline_ms: u32,
+    age_ms: u32,
+) {
+    let (inn, out) = cb_counts();
+    VS_WD_S_AT.store(now_ms, Ordering::Relaxed);
+    VS_WD_S_ARM.store(armed as u32, Ordering::Relaxed);
+    VS_WD_S_REF.store(reference_ms, Ordering::Relaxed);
+    VS_WD_S_DL.store(deadline_ms, Ordering::Relaxed);
+    VS_WD_S_AGE.store(age_ms, Ordering::Relaxed);
+    VS_WD_S_CB_I.store(inn, Ordering::Relaxed);
+    VS_WD_S_CB_O.store(out, Ordering::Relaxed);
+    VS_WD_S_SY_T.store(VS_CB_SYNC_T.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// The heartbeat's last tick time in 100 ns (0 = none since the arm).
+pub(crate) fn vsync_last_tick() -> u64 {
+    VS_TICK_AT.load(Ordering::Relaxed)
+}
+
+/// This watchdog tick (`tick_n`) acted or not: the publication it asks the worker for
+/// (`vsync_wd::publish_plan`; DISPATCH, atomics only). `true` when the worker must be woken.
+pub(crate) fn request_live_publish(tick_n: u32, acted: bool) -> bool {
+    use helios_kmd_logic::vsync_wd::{publish_plan, Publish};
+    let want = match publish_plan(tick_n, acted, VS_WD_LAST_FULL.load(Ordering::Relaxed)) {
+        Publish::None => return false,
+        Publish::Small => 1,
+        Publish::Full => {
+            VS_WD_LAST_FULL.store(tick_n, Ordering::Relaxed);
+            2
+        }
+    };
+    VS_WD_PUB_N.fetch_add(1, Ordering::Relaxed);
+    LIVE_WANTED.fetch_max(want, Ordering::AcqRel);
+    true
+}
+
+/// The worker's pass: write what the watchdog asked for. PASSIVE.
+pub(crate) fn publish_live_if_wanted() {
+    match LIVE_WANTED.swap(0, Ordering::AcqRel) {
+        0 => {}
+        1 => publish_live_small(),
+        _ => publish_vsync_ticks(),
+    }
+}
+
+/// The ten values that say whether the heartbeat is alive (`VsLiveT` first: the time of the
+/// write), unchanged ones skipped.
+pub(crate) fn publish_live_small() {
+    rec_live(0, b"VsLiveT", AdapterContext::interrupt_time_ms());
+    rec_live(1, b"VsTickN", VS_TICKS.load(Ordering::Relaxed));
+    rec_live(2, b"VsTickT", VS_TICK_T.load(Ordering::Relaxed));
+    rec_live(3, b"VsCbIn", VS_CB_IN.load(Ordering::Relaxed));
+    rec_live(4, b"VsCbOut", VS_CB_OUT.load(Ordering::Relaxed));
+    rec_live(5, b"VsWdTkN", VS_WD_TK_N.load(Ordering::Relaxed));
+    rec_live(6, b"VsWdTkT", VS_WD_TK_T.load(Ordering::Relaxed));
+    rec_live(7, b"VsWdAgeMs", VS_WD_AGE_MS.load(Ordering::Relaxed));
+    rec_live(8, b"VsWdFixN", VS_WD_FIX_N.load(Ordering::Relaxed));
+    rec_live(9, b"VsWdHungN", VS_WD_HUNG_N.load(Ordering::Relaxed));
+}
+
 /// `DxgkDdiSetPowerState` was called for `device_uid`; `d0` is whether the state is D0.
 pub(crate) fn note_power(device_uid: u32, d0: bool) {
     PWR_N.fetch_add(1, Ordering::Relaxed);
@@ -725,6 +963,12 @@ pub(crate) fn reread_knobs() {
     crate::diag::record_named_bytes(b"VsPwrEff", pm);
     crate::diag::record_named_bytes(b"VsWdgEff", wd);
     crate::diag::record_named_bytes(b"VsIdlEff", idle);
+    let wd_timer = helios_kmd_logic::vsync_wd::clamp_wd_timer(crate::diag::read_config_dword(
+        crate::diag::knobs::VS_WD_TIMER,
+        1,
+    ));
+    VS_WD_TIMER.store(wd_timer, Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"VsWdTmEff", wd_timer);
 }
 
 // ---- v327 breadcrumbs: what the previous generation left, where the worker and the mode set are
@@ -754,6 +998,70 @@ pub(crate) fn note_start_entry(adapter: &AdapterContext, hpd_indicates: u32) {
     ENT_HPD_TH.store(u32::from(adapter.hpd_worker_registered()), Ordering::Relaxed);
     ENT_HPD_N.store(hpd_indicates, Ordering::Relaxed);
     ENT_VS_TK.store(VS_TICKS.load(Ordering::Relaxed), Ordering::Relaxed);
+    // The programming state this StartDevice inherited (the stop's reset already cleared it, so
+    // anything here is a start with no stop before it) and the address the heartbeat carries.
+    REST_PEND_START.store(adapter.restart_programming_flags(), Ordering::Relaxed);
+    REST_ISS.store(last_issued_address(), Ordering::Relaxed);
+}
+
+/// Flip retirement across a restart (`restart_flip`): the programming state at StopDevice and at
+/// StartDevice entry, the heartbeat's address at StopDevice entry and at StartDevice exit, the
+/// newest address dxgkrnl issued, and the worker wake StartDevice owed. NOT zeroed by
+/// [`start_generation`]: they describe the restart itself and are written around it.
+static REST_PEND_STOP: AtomicU32 = AtomicU32::new(0);
+static REST_PEND_START: AtomicU32 = AtomicU32::new(0);
+static REST_ADDR_STOP: AtomicU64 = AtomicU64::new(0);
+static REST_ADDR_EXIT: AtomicU64 = AtomicU64::new(0);
+static REST_ISS: AtomicU64 = AtomicU64::new(0);
+static REST_SIG: AtomicU32 = AtomicU32::new(0);
+
+/// StopDevice, after the worker and the heartbeat were stopped and BEFORE the display state is
+/// reset: what was pending, and the address the heartbeat was carrying. PASSIVE.
+pub(crate) fn note_stop_entry(adapter: &AdapterContext) {
+    REST_PEND_STOP.store(adapter.restart_programming_flags(), Ordering::Relaxed);
+    REST_ADDR_STOP.store(
+        adapter.last_primary_address.load(Ordering::Acquire),
+        Ordering::Relaxed,
+    );
+}
+
+/// StartDevice, last: the heartbeat's address now (the restart seed), and the one worker wake a
+/// programming that survived (or was raised while this start ran) is owed. Writes the `ScRest*`
+/// block. PASSIVE.
+pub(crate) fn note_restart_exit(adapter: &AdapterContext) {
+    let flags = adapter.restart_programming_flags();
+    REST_ADDR_EXIT.store(
+        adapter.last_primary_address.load(Ordering::Acquire),
+        Ordering::Relaxed,
+    );
+    if helios_kmd_logic::restart_flip::needs_worker_signal(flags & 1 != 0, flags & 2 != 0) {
+        REST_SIG.fetch_add(1, Ordering::Relaxed);
+        adapter.signal_hpd();
+    }
+    publish_restart();
+}
+
+/// The `ScRest*` block (PASSIVE).
+pub(crate) fn publish_restart() {
+    use crate::diag::record_named_bytes as rec;
+    let stop = REST_ADDR_STOP.load(Ordering::Relaxed);
+    let iss = REST_ISS.load(Ordering::Relaxed);
+    let exit = REST_ADDR_EXIT.load(Ordering::Relaxed);
+    rec(
+        b"ScRestPend",
+        helios_kmd_logic::restart_flip::pending_breadcrumb(
+            REST_PEND_STOP.load(Ordering::Relaxed),
+            REST_PEND_START.load(Ordering::Relaxed),
+        ),
+    );
+    rec(b"ScRestAdr0", stop as u32);
+    rec(b"ScRestAddr", exit as u32);
+    rec(b"ScRestIss", iss as u32);
+    rec(
+        b"ScRestHi",
+        helios_kmd_logic::restart_flip::high_bytes(stop, iss, exit),
+    );
+    rec(b"ScRestSig", REST_SIG.load(Ordering::Relaxed));
 }
 
 /// The HPD worker's phase this generation (1 thread entered, 2 StartDevice's return seen, 3 first
@@ -838,6 +1146,7 @@ fn publish_breadcrumbs() {
     rec(b"HpdPhaseT", HPD_PHASE_T.load(Ordering::Relaxed));
     rec(b"HpdFirstT", HPD_FIRST_T.load(Ordering::Relaxed));
     publish_mode();
+    publish_restart();
 }
 
 /// A new generation (StartDevice): zero every counter of this module (never the knobs, and not
@@ -913,8 +1222,28 @@ pub(crate) fn start_generation() {
         &VS_GAP_SITE,
         &VS_GAP_FLAGS,
         &VS_GAP_INFL,
+        &VS_WD_TK_N,
+        &VS_WD_TK_T,
+        &VS_WD_AGE_MS,
+        &VS_WD_FIX_N,
+        &VS_WD_HUNG_N,
+        &VS_WD_PUB_N,
+        &VS_WD_S_AT,
+        &VS_WD_S_ARM,
+        &VS_WD_S_REF,
+        &VS_WD_S_DL,
+        &VS_WD_S_AGE,
+        &VS_WD_S_CB_I,
+        &VS_WD_S_CB_O,
+        &VS_WD_S_SY_T,
+        &LIVE_WANTED,
+        &VS_WD_LAST_FULL,
     ] {
         c.store(0, Ordering::Relaxed);
+    }
+    // The registry is about to be rewritten with this generation's zeros: forget what was cached.
+    for c in &LIVE_CACHE {
+        c.store(u64::MAX, Ordering::Relaxed);
     }
     HPD_SITE_AT.store(0, Ordering::Relaxed);
     // Every v326 static that outlives a StopDevice starts the generation in its initial state: the

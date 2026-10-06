@@ -28,6 +28,7 @@ pub(super) fn round_up_page(size: u64) -> u64 {
 ///
 /// Runs at PASSIVE_LEVEL during StartDevice, after `set_virtio` installs the
 /// transport (all round-trips ride `virtio::ctrl`'s PASSIVE waits).
+#[inline(never)]
 pub fn allocate_host_visible_blob(
     passive: PassiveLevel,
     adapter: &AdapterContext,

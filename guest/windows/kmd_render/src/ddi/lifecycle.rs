@@ -613,6 +613,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // now only a bounded fallback (`HpdStTo` counts it firing). Safe to signal
     // even when the worker was never started — nothing else waits on this.
     adapter.signal_start_complete();
+    // `ScRestAddr` / `ScRestSig`: the heartbeat's restart seed, and the one wake a programming
+    // that survived the restart is owed (`restart_flip::needs_worker_signal`).
+    crate::ddi::stall_diag::note_restart_exit(adapter);
     start_stage(4);
     STATUS_SUCCESS
 }
@@ -705,6 +708,9 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         crate::ddi::stall_diag::stop_sub(ss::FINAL_PUBLISH);
         crate::ddi::publish_nvrm_counters();
         crate::ddi::stall_diag::stop_sub(ss::RESET_PUBLICATION);
+        // `ScRestPend` / `ScRestAdr0`: what was pending and which address the heartbeat carried
+        // when the device stopped, taken before the reset below (`restart_flip`).
+        crate::ddi::stall_diag::note_stop_entry(adapter);
         // AFTER stop_hpd, so the worker can no longer re-publish into the state
         // we are about to clear. Every scanout identity below belongs to the
         // transport generation being torn down; carrying it into the next

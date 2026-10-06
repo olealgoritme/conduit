@@ -272,6 +272,9 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         let retire_wanted = adapter.scanout_retire_wanted.swap(0, Ordering::AcqRel) != 0;
         // The vsync heartbeat's watchdog (`hpd_wake::vsync_watch`): re-arm one that died.
         adapter.vsync_watch(true);
+        // The independent watchdog timer asked for the heartbeat block (`VsLiveT`): without it a
+        // worker asleep in its infinite wait leaves the mirror frozen at its last pass.
+        stall_diag::publish_live_if_wanted();
 
         // The KEVENT is the primary completion path (ISR -> DPC -> drain ->
         // signal). If that device interrupt is delayed, poll only while one

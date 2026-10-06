@@ -661,6 +661,11 @@ pub struct AdapterContext {
     /// The pointer is deleted exactly once from `Drop` at final RemoveDevice,
     /// after `stop_vsync` has cancelled it.
     pub vsync_ex_timer: AtomicUsize,
+    /// The independent heartbeat watchdog's `PEX_TIMER` (0 = allocation failed or not yet
+    /// allocated) and whether it is meant to run (set by `start_vsync`, cleared by `stop_vsync`).
+    /// Deleted with `vsync_ex_timer` at RemoveDevice.
+    pub vsync_wd_timer: AtomicUsize,
+    pub vsync_wd_on: AtomicU32,
     /// Interrupt-time deadline (100 ns units) of the one-shot tick currently
     /// armed. Advancing this fixed phase avoids both the old 16 ms/62.5 Hz mode
     /// mismatch and cumulative DPC-latency drift.
@@ -1245,6 +1250,8 @@ impl AdapterContext {
             vsync_timer: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             vsync_dpc: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             vsync_ex_timer: AtomicUsize::new(0),
+            vsync_wd_timer: AtomicUsize::new(0),
+            vsync_wd_on: AtomicU32::new(0),
             vsync_deadline_100ns: AtomicU64::new(0),
             vsync_enabled: AtomicU32::new(0),
             committed_refresh_mhz: AtomicU32::new(0),
@@ -1357,9 +1364,11 @@ impl AdapterContext {
     ///    and the desktop copied into an unrelated blob, while the copy is
     ///    submitted against a Venus image from a destroyed context.
     ///
-    /// Note `pnputil /restart-device` does NOT reproduce either sequence: it
-    /// re-runs AddDevice, which allocates a fresh zeroed context. The carry-over
-    /// path is a PnP stop/start on the same context.
+    /// Whether `pnputil /restart-device` re-runs AddDevice (a fresh zeroed
+    /// context) or keeps the context is NOT settled by the code
+    /// (docs/zero-copy-present.md sections 19 and 20 assume it is kept; `StartN`
+    /// rising with `EntArm` / `EntHpdTh` showing the old generation settles it).
+    /// Process-lifetime statics survive either way.
     ///
     /// This is a hand-written list and its failure mode is a future field nobody
     /// adds to it. The durable encoding is the transport-owned
@@ -1393,7 +1402,22 @@ impl AdapterContext {
         self.active_scanout_resource.store(0, Ordering::Release);
         self.active_scanout_wh.store(0, Ordering::Release);
         self.host_bound_scanout_resource.store(0, Ordering::Release);
-        self.last_primary_address.store(0, Ordering::Release);
+        // NOT zero (docs/zero-copy-present.md, "DWM after a device restart"). dxgkrnl keeps its
+        // flip queue across a PnP stop/start and retires a flip only when a CRTC_VSYNC carries ITS
+        // address; the flip it issued last may be the one it still waits for. Zeroing this word
+        // left the restarted heartbeat reporting 0, so that flip never retired and, with a queue
+        // depth of 1, no later flip was ever issued. The seed is the newest address dxgkrnl
+        // issued (`restart_flip::seed_address`; an address names a segment location, not a
+        // transport object, so it survives the restart). The displayed IDENTITY below is cleared
+        // all the same: `same_active_identity` requires `already_bound`, which is false now.
+        // Stored again at the END of this function: the lease teardown below can publish a
+        // withheld address of the old generation over it.
+        self.last_primary_address.store(
+            helios_kmd_logic::restart_flip::seed_address(
+                crate::ddi::stall_diag::last_issued_address(),
+            ),
+            Ordering::Release,
+        );
         self.dedicated_scanout_resource.store(0, Ordering::Release);
         self.dedicated_scanout_image.store(0, Ordering::Release);
         self.dedicated_scanout_memory.store(0, Ordering::Release);
@@ -1452,8 +1476,26 @@ impl AdapterContext {
         // the reclaim rules make inert by construction.
         self.read_ledger.reset();
 
+        // The seed again, last: ending the leases above publishes a withheld old-generation
+        // address (`publish_displayed_primary`) that must not displace what dxgkrnl waits for.
+        self.last_primary_address.store(
+            helios_kmd_logic::restart_flip::seed_address(
+                crate::ddi::stall_diag::last_issued_address(),
+            ),
+            Ordering::Release,
+        );
+
         crate::diag::record_named_bytes(b"StRst", was_programming);
         crate::diag::record_named_bytes(b"StRstR", was_resource);
+    }
+
+    /// `restart_flip::pending_flags` of this adapter now: bit 0 a worker programming handle is
+    /// pending, bit 1 the programming gate is raised. Atomics only.
+    pub(crate) fn restart_programming_flags(&self) -> u32 {
+        helios_kmd_logic::restart_flip::pending_flags(
+            self.pending_vidpn_allocation.load(Ordering::Acquire) != 0,
+            gate_active(self.vidpn_programming.load(Ordering::Acquire)),
+        )
     }
 
     /// The display half's scanout-0 mode `(width, height)`: the host-reported size

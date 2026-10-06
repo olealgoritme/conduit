@@ -56,9 +56,11 @@ pub mod present_foreign;
 pub mod msi;
 pub mod paging;
 pub mod shared_placeholder;
+pub mod restart_flip;
 pub mod stall_diag;
 pub mod sweep_budget;
 pub mod vsync_rate;
+pub mod vsync_wd;
 pub mod windowed_ready;
 pub mod slice_budget;
 

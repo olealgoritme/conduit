@@ -167,7 +167,23 @@ pub mod site {
 ///   `VsGapT`, `VsGapSite`, `VsGapFlg`, `VsGapInfl`: for the longest (`VsGapMaxMs`): when it
 ///   ended, the worker's `HpdSite` then, flags (bit 0 scanout mutex held, 1 Venus mutex held, 2
 ///   worker idle in its wait, 3 programming pending), the DDIs in flight (ids 0..32).
-pub const COUNTERS: [&str; 99] = [
+/// * `VsLiveT`: interrupt time (ms) the heartbeat block (`VsTickN` ... `VsWd*`) was last written. Every
+///   value of that block is a snapshot as of `VsLiveT`: compare `VsTickT` with `VsLiveT`, and
+///   `VsLiveT` with the uptime, before calling a heartbeat dead. The watchdog timer asks the worker
+///   to rewrite ten of its values every 2 s (the rest only after it acted, at most once per 2 s).
+/// * `VsCbIn`, `VsCbOut`: tick callbacks entered and returned (never zeroed; `VsCbIn` above
+///   `VsCbOut` for longer than a tick is a blocked callback). `VsCbSyncB`, `VsCbSyncOk`,
+///   `VsCbSyncSt`, `VsCbSyncT`: `DxgkCbSynchronizeExecution` calls the tick began and returned,
+///   the last status, and when the last began (ms).
+/// * `VsWdTkN`, `VsWdTkT`, `VsWdAgeMs`, `VsWdFixN`, `VsWdHungN`, `VsWdPubN`, `VsWdOn`,
+///   `VsWdNoTm`, `VsWdTmEff`: the independent watchdog timer: its ticks and the time of the last,
+///   the heartbeat's silence it saw at the last, re-arms it did, ticks that found a blocked
+///   callback, mirror refreshes it asked for, armed (1), no timer could be allocated, the
+///   `VsWdTimer` knob in force. `VsWdSAt`, `VsWdSArm`, `VsWdSRef`, `VsWdSDl`, `VsWdSAge`,
+///   `VsWdSCbI`, `VsWdSCbO`, `VsWdSSyT`: what it saw the last time it acted (when, armed, the
+///   reference and deadline in ms, the silence, the callback counts, when the last synchronized
+///   call began).
+pub const COUNTERS: [&str; 129] = [
     "HpdLoopN",
     "HpdLoopT",
     "HpdSite",
@@ -277,6 +293,42 @@ pub const COUNTERS: [&str; 99] = [
     "VsGapSite",
     "VsGapFlg",
     "VsGapInfl",
+    // v329 (docs/zero-copy-present.md, "Heartbeat stops after (re)start"): when the heartbeat
+    // block was written, the tick callback breadcrumbs, the independent watchdog timer.
+    "VsLiveT",
+    "VsCbIn",
+    "VsCbOut",
+    "VsCbSyncB",
+    "VsCbSyncOk",
+    "VsCbSyncSt",
+    "VsCbSyncT",
+    "VsWdTkN",
+    "VsWdTkT",
+    "VsWdAgeMs",
+    "VsWdFixN",
+    "VsWdHungN",
+    "VsWdPubN",
+    "VsWdOn",
+    "VsWdNoTm",
+    "VsWdSAt",
+    "VsWdSArm",
+    "VsWdSRef",
+    "VsWdSDl",
+    "VsWdSAge",
+    "VsWdSCbI",
+    "VsWdSCbO",
+    "VsWdSSyT",
+    "VsWdTmEff",
+    // Flip retirement across a device restart (`restart_flip`, docs/zero-copy-present.md "DWM
+    // after a device restart"): the programming state found at the two edges, the heartbeat's
+    // address at StopDevice entry and at StartDevice exit, the newest address dxgkrnl issued,
+    // their high bytes, and the worker wake StartDevice owed.
+    "ScRestPend",
+    "ScRestAdr0",
+    "ScRestAddr",
+    "ScRestIss",
+    "ScRestHi",
+    "ScRestSig",
 ];
 
 // ---- the scanout mutex -----------------------------------------------------------------------
@@ -417,6 +469,10 @@ pub mod stop_sub {
     pub const REMOVE_ENTER: u32 = 20;
     pub const REMOVE_DROP: u32 = 21;
     pub const REMOVE_DONE: u32 = 22;
+    /// Written INSIDE `REMOVE_DROP`..`REMOVE_DONE` (so it follows 21 and precedes 22 in time), just
+    /// before `ExDeleteTimer(wait)` of the heartbeat and watchdog timers: a callback blocked in
+    /// `DxgkCbSynchronizeExecution` hangs that wait, and `StopSub` 23 names it.
+    pub const REMOVE_TIMER: u32 = 23;
 }
 
 // ---- knobs ---------------------------------------------------------------------------------
@@ -1509,6 +1565,7 @@ mod tests {
             assert!(w[0] < w[1]);
         }
         assert!(REMOVE_ENTER > DONE && REMOVE_DROP > REMOVE_ENTER && REMOVE_DONE > REMOVE_DROP);
+        assert!(REMOVE_TIMER > REMOVE_DONE);
     }
 
     #[test]
