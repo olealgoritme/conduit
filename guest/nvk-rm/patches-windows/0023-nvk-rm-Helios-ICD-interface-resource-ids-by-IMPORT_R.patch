@@ -1,4 +1,4 @@
-From f761e1a4bb760e2dfe2194c02aff42214c419d5f Mon Sep 17 00:00:00 2001
+From 8e97b7c8b6c142f2e52a4268ffa4fb06d7902012 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Tue, 6 Oct 2026 03:17:09 +0200
 Subject: [PATCH] nvk/rm: Helios ICD interface, resource ids by IMPORT_RM,
@@ -37,9 +37,9 @@ VK_ERROR_FEATURE_NOT_PRESENT. NVK_HELIOS_RESID=0 turns resource ids off.
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  44 ++++
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c  |   6 +
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c  |   3 +
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c  | 209 ++++++++++++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c  | 219 +++++++++++++++++-
  src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h |  17 ++
- 10 files changed, 708 insertions(+), 4 deletions(-)
+ 10 files changed, 718 insertions(+), 4 deletions(-)
  create mode 100644 src/nouveau/vulkan/helios_icd_interface.h
  create mode 100644 src/nouveau/vulkan/nvk_helios.c
 
@@ -651,7 +651,7 @@ index 4fbad77..c58eb58 100644
        nvkmd_rm_close_gem(dev, mem->gem_handle);
     simple_mtx_destroy(&mem->export_mutex);
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
-index e37dd56..59cb881 100644
+index e37dd56..d822535 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
 @@ -372,7 +372,11 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
@@ -667,7 +667,7 @@ index e37dd56..59cb881 100644
        result = vk_errorf(log_obj, VK_ERROR_SURFACE_LOST_KHR,
                           "ScanoutFlip of GEM %u: %d (%s)", mem->gem_handle,
                           ret, ret < 0 ? strerror(-ret) : "?");
-@@ -391,3 +395,206 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
+@@ -391,3 +395,216 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
  
     return result;
  }
@@ -788,6 +788,16 @@ index e37dd56..59cb881 100644
 +   VkResult result = VK_SUCCESS;
 +
 +   *res_id_out = 0;
++
++   /* Cached: no escape on the way to a resource id we already have */
++   simple_mtx_lock(&mem->export_mutex);
++   const uint32_t cached = mem->helios_res_id;
++   simple_mtx_unlock(&mem->export_mutex);
++   if (cached != 0) {
++      *res_id_out = cached;
++      return VK_SUCCESS;
++   }
++
 +   if (!nvkmd_rm_scanout_supported(dev->base.pdev) ||
 +       !nvkmd_rm_win_rm_import_served())
 +      return VK_ERROR_FEATURE_NOT_PRESENT;
