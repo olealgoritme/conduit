@@ -237,6 +237,14 @@ impl VirtioGpu {
         Some((s.handle, s.device_type))
     }
 
+    /// Pop one handle of ANY owner (the transport is being retired and every
+    /// remaining handle is closed on the host first, one at a time, outside the
+    /// lock): the owner, the handle and its `device_type`.
+    pub fn take_nvrm_handle_any(&mut self) -> Option<(DeviceOwner, u32, u32)> {
+        let s = self.nvrm_handles.pop()?;
+        Some((s.owner, s.handle, s.device_type))
+    }
+
     /// Latch an `EventReady` for `handle` (see `NvrmHandleSlot::ready_latched`).
     /// `false` if no process has it open.
     pub(super) fn latch_nvrm_ready(&mut self, handle: u32) -> bool {
@@ -417,6 +425,13 @@ impl VirtioGpu {
         Some((s.handle, s.kmd_id, s.host_id))
     }
 
+    /// Pop one mapping of ANY owner (see [`Self::take_nvrm_handle_any`]): its
+    /// handle and host id.
+    pub fn take_nvrm_map_any(&mut self) -> Option<(u32, u32)> {
+        let s = self.nvrm_maps.pop()?;
+        Some((s.handle, s.host_id))
+    }
+
     // ---- pins ------------------------------------------------------------------------
 
     /// How many pins `owner` holds (for the quota check before locking pages).
@@ -528,19 +543,33 @@ impl VirtioGpu {
         Some(self.nvrm_pins.swap_remove(idx))
     }
 
+    /// Pop one pin of ANY owner (see [`Self::take_nvrm_handle_any`]); the caller
+    /// unlocks it outside the lock.
+    pub fn take_nvrm_pin_any(&mut self) -> Option<NvrmPin> {
+        self.nvrm_pins.pop()
+    }
+
     // ---- transport teardown -------------------------------------------------------
 
-    /// The transport is being dropped (`StopDevice`, or a failed start): whatever
-    /// its owners left tracked dies with it. Called from `Drop`, PASSIVE, outside
-    /// the virtio lock, AFTER the device was reset: the host holds no alias of a
-    /// pinned page any more, so the pages are unlocked, and the host's handles and
-    /// mappings are gone with it, so their records are dropped WITHOUT any message
-    /// to the (dead) transport.
+    /// The transport is being dropped (`StopDevice`, a failed start, a
+    /// replacement): whatever its owners left tracked dies with it. Called from
+    /// `Drop`, PASSIVE, outside the virtio lock, AFTER the device was reset.
     ///
-    /// Idempotent against the per-device `close_all_for_owner`: both take entries
-    /// out of these same tables, so whichever runs first releases them and the
-    /// other finds nothing (once the transport is gone `with_virtio` fails and the
-    /// per-device path is a no-op).
+    /// This is the FALLBACK, for a transport that could not be asked (it failed, or
+    /// was already gone) or that something re-populated after the live sweep. It
+    /// sends nothing, so it cannot tell the host to let go of anything, and the
+    /// reset does NOT make the host drop its RM files either (the backend resets
+    /// only at its next feature negotiation, i.e. the next `StartDevice`): a pin
+    /// unlocked here may still be held by the host. The path that is safe for the
+    /// pages is `nvrm::retire_transport`, which closes every handle on the host
+    /// while the transport is alive and only then lets this run. Unlocking is still
+    /// the right thing here: user pages left locked bugcheck their process at exit
+    /// (0x76), and a failed transport has no better answer.
+    ///
+    /// Idempotent against the live sweep and the per-device `close_all_for_owner`:
+    /// all take entries out of these same tables, so whichever runs first releases
+    /// them and the others find nothing (once the transport is gone `with_virtio`
+    /// fails and the per-device path is a no-op).
     ///
     /// The user VIEWS of the mappings are not here: they live in
     /// `AdapterContext::mappings` and can only be unmapped in their owning process
@@ -556,6 +585,15 @@ impl VirtioGpu {
         swept = swept
             .saturating_add(self.nvrm_maps.len() as u32)
             .saturating_add(self.nvrm_handles.len() as u32);
+        // A fence handle is a handle: the `Close` and device-destroy paths count it
+        // as closed (`NvFenceCl`), so this one must too, or `NvFence - NvFenceCl`
+        // drifts upward for every fence a stop swept.
+        let fences = self
+            .nvrm_handles
+            .iter()
+            .filter(|s| is_fence_type(s.device_type))
+            .count() as u32;
+        crate::virtio::nvrm::NVRM_FENCES_CLOSED.fetch_add(fences, Ordering::Relaxed);
         // Plain data: nothing in them needs PASSIVE.
         self.nvrm_maps.clear();
         self.nvrm_handles.clear();

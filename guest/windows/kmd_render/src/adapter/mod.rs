@@ -1713,7 +1713,14 @@ impl Drop for AdapterContext {
         self.delete_vsync_ex_timer();
         self.stop_hpd();
         // The transport owns callbacks into producer status. Drop it before
-        // that page, including the RemoveDevice-without-StopDevice path.
+        // that page, including the RemoveDevice-without-StopDevice path. A
+        // transport still alive here is asked to close every RM handle first (the
+        // device reset in its Drop does not make the host drop them; a pinned page
+        // must not be unlocked while the host holds it). No views to mark: the
+        // table dies with this context.
+        // SAFETY: RemoveDevice, which drops the boxed context, is PASSIVE_LEVEL.
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        crate::virtio::nvrm::close_all_on_host(passive, self);
         self.set_virtio(None);
         // Free the contiguous paging-RAM segment. RemoveDevice (which drops the
         // boxed AdapterContext) runs at PASSIVE_LEVEL, where MmFreeContiguousMemory

@@ -1287,3 +1287,141 @@ pub fn close_all_for_owner(
     }
     closed
 }
+
+/// Longest the live sweep ([`close_all_on_host`]) keeps sending, in 100 ns: a
+/// healthy host answers a `Close` in milliseconds, so this only bounds a host
+/// that is slow rather than gone (a gone one trips the first-failure stop).
+const SWEEP_SEND_BUDGET_100NS: u64 = 10 * 10_000_000;
+
+/// Retire the live transport's NVRM state while it can still be asked: send the
+/// host a `Munmap` for every mapping and a `Close` for every handle ANY owner left
+/// open, then unlock the pins.
+///
+/// The order is the point. The host does not drop its RM files when the guest
+/// resets the device (QEMU's generic vhost-user device never sends
+/// `RESET_DEVICE`; the backend resets at its next feature negotiation, i.e. the
+/// next `StartDevice`), and a registered OS descriptor makes the GPU alias the
+/// guest pages until its file is closed. `VirtioGpu::drop`'s sweep can only unlock;
+/// unlocking pages the host still holds lets the guest reuse memory the GPU may
+/// still write. So the host is told FIRST, as `close_all_for_owner` does per owner.
+///
+/// Best effort and bounded: it stops sending after the first timeout or failed
+/// send (a wedged host costs seconds per call) or when [`SWEEP_SEND_BUDGET_100NS`]
+/// is spent, but keeps clearing the tables, so nothing is left for the fallback in
+/// `VirtioGpu::drop` except what a concurrent call re-populated. A transport that
+/// has already failed (or is absent) is not asked at all and nothing is touched
+/// here: the fallback handles it.
+///
+/// Event registrations stay: `VirtioGpu::drop` wakes them (their owners must see
+/// the loss) and releases them. The user views of the mappings cannot be unmapped
+/// from here (see `reclaim_stale_views`).
+///
+/// PASSIVE, no lock held (each table access is its own short `with_virtio`; every
+/// wire call and every pin unlock is outside it). Returns how many handles were
+/// closed or dropped.
+pub fn close_all_on_host(passive: PassiveLevel, adapter: &AdapterContext) -> u32 {
+    let alive = adapter
+        .with_virtio(|v| !v.transport_failed())
+        .unwrap_or(false);
+    if !alive {
+        return 0;
+    }
+    let started = crate::adapter::foreign_scanout::now_100ns();
+    let mut sending = true;
+    // Asked before each send: a timeout or error ended sending, and so does a
+    // spent budget.
+    let still_sending = |sending: &mut bool| {
+        if *sending
+            && crate::adapter::foreign_scanout::now_100ns().wrapping_sub(started)
+                > SWEEP_SEND_BUDGET_100NS
+        {
+            *sending = false;
+        }
+        *sending
+    };
+    // Mappings first (the ABI's order: unmap, then close).
+    loop {
+        let map = adapter
+            .with_virtio(|v| v.take_nvrm_map_any())
+            .ok()
+            .flatten();
+        let Some((handle, host_id)) = map else {
+            break;
+        };
+        if still_sending(&mut sending)
+            && release_host_map(passive, adapter, handle, host_id).is_err()
+        {
+            sending = false;
+        }
+    }
+    let mut closed = 0u32;
+    loop {
+        let taken = adapter
+            .with_virtio(|v| v.take_nvrm_handle_any())
+            .ok()
+            .flatten();
+        let Some((owner, handle, device_type)) = taken else {
+            break;
+        };
+        if nvrm_fence::is_fence(device_type) {
+            NVRM_FENCES_CLOSED.fetch_add(1, Ordering::Relaxed);
+        }
+        // A foreign scanout source on this file ends with it (a no-op after
+        // `StopDevice` already reset the display state).
+        adapter.foreign_scanout_release_handle(owner, handle);
+        if still_sending(&mut sending) {
+            let mut req = [0u8; MSG_HDR];
+            req[..4].copy_from_slice(&MSG_CLOSE.to_le_bytes());
+            req[4..8].copy_from_slice(&handle.to_le_bytes());
+            let mut resp = [0u8; MSG_HDR];
+            if ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, 5_000).is_err() {
+                sending = false;
+            }
+        }
+        closed += 1;
+    }
+    // Last: the host has closed what held the pages (or is not answering and the
+    // transport is about to be reset), so they may be unlocked.
+    loop {
+        let pin = adapter
+            .with_virtio(|v| v.take_nvrm_pin_any())
+            .ok()
+            .flatten();
+        let Some(pin) = pin else {
+            break;
+        };
+        release_pin(pin);
+    }
+    closed
+}
+
+/// Drop the live transport (if there is one) the safe way: tell the host to let go
+/// of everything first ([`close_all_on_host`]), then `set_virtio(None)` (whose
+/// `VirtioGpu::drop` resets the device and runs the fallback sweep), then mark the
+/// user views of the dropped transport stale. The one place every path that
+/// replaces or ends a live transport goes through: `StopDevice`, and `StartDevice`
+/// when no stop came before it.
+///
+/// Returns whether a transport was dropped. PASSIVE.
+pub fn retire_transport(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
+    let had = adapter.with_virtio(|_| ()).is_ok();
+    if had {
+        close_all_on_host(passive, adapter);
+    }
+    adapter.set_virtio(None);
+    if had {
+        mark_views_stale(adapter);
+    }
+    had
+}
+
+/// The transport that made every NVRM view below the next id is gone: mark them
+/// stale, so each owner's next NVRM call unmaps its own (`reclaim_stale_views`).
+/// After the drop, so no older id can be minted any more; an `MMAP` caught between
+/// its id mint and its view insert is marked by the insert itself
+/// (`MappingTable::insert_unique`). Returns how many views were marked.
+fn mark_views_stale(adapter: &AdapterContext) -> u32 {
+    let stale = adapter.mappings.mark_nvrm_views_stale(next_map_id());
+    NVRM_STALE_VIEWS.fetch_add(stale, Ordering::Relaxed);
+    stale
+}
