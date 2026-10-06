@@ -94,6 +94,7 @@ is the next step. Seven more Mesa patches on top of the 13 above, in `patches-wi
 | 18 | `nak: leave nouveau's winsys and DRM out of the bindings on Windows` | only NAK's Linux hardware tests use them |
 | 19 | `nvk: build for Windows with the RM backend only` | `with_nouveau_drm` (false on Windows): no nouveau winsys / `nvkmd/nouveau`; chipset limits split into `nouveau_device_limits.[ch]`; the RM backend's DRM side moved to `nvkmd_rm_drm.c` (Linux only, stubs otherwise); `VK_EXT_physical_device_drm` and DRM syncobj copies Linux only; empty `<sys/ioccom.h>` for `drm.h`; `TRUE`/`FALSE` from `<windows.h>`; `vulkan_nouveau.dll` with `vulkan_api.def` exports |
 | 20 | `nvk: Win32 WSI` | `VK_KHR_win32_surface` + swapchain through Mesa's win32 WSI, as a software device (CPU copy per present) |
+| 21 | `nvk/rm, vulkan/wsi: zero-copy Win32 present through the Helios scanout` | swapchain images in VRAM, imported once on a host render node as GEM objects and shown with ScanoutFlip (see "Zero-copy present on Windows" below); GDI stays the fallback |
 
 Linux behaviour is unchanged: the full series (20 patches) builds the Linux
 NVK (nouveau + RM) as before, with the same `.so` exports; the patches apply
@@ -192,6 +193,46 @@ new files), later runs do not.
 
 (and "librmclient could not be loaded" without the DLL next to the driver).
 librmclient's unit tests (`test_unit.exe`, 300 checks) pass under wine.
+
+### Zero-copy present on Windows (patch 21, Helios WSI)
+
+On the Helios adapter the Win32 WSI does not copy frames to a window: the
+swapchain images are linear images in dedicated VRAM which NVK makes
+presentable once, the way patch 13 makes a dma-buf on Linux, except that
+librmclient's Windows transport carries the DRM side to the host:
+`NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD` into a fresh control channel
+(`crm_win_open_device(255)`), `DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY` on host
+render node `NVK_HELIOS_DRI` (default 0, `crm_win_open_device(512 + n)`),
+one GEM handle per image. `vkQueuePresentKHR` waits for the image's
+rendering on the CPU and sends `crm_win_scanout_flip` (owner = the render
+node, GEM handle, size, stride, `XRGB8888`/`XBGR8888`, linear, increasing
+seq); the host exports the GEM object as a dma-buf for the viewer. The
+window is never used, so a hidden window on an invisible desktop (an ssh
+session) presents fine.
+
+- `NVK_HELIOS_WSI=0`: off (GDI copy, which fails with
+  `VK_ERROR_MEMORY_MAP_FAILED` on an invisible desktop).
+- `MESA_WSI_SCANOUT_HZ`: FIFO pacing without a vblank event, default 60,
+  0 = unpaced.
+- No release event from the host yet: an image comes back two presents
+  after it was shown, so use three or more images.
+- If the images cannot be exported (no render node, old librmclient without
+  `crm_win_*`) the swapchain falls back to GDI.
+
+`tests/vk_scanout_present.c` (from `windows/build-tests.sh`): a spinning
+triangle on a hidden window, `vk_scanout_present [seconds] [width height]
+[images]`. In `win11` (RTX 5090, KMD 22.22.307.0), 1920x1080, three images:
+
+| run | result |
+|---|---|
+| FIFO, 30 s | 60.0 fps, 1801 flips, 0 failed; KMD `NvFlip` +1801 |
+| FIFO, 60 s, host busy compiling | 51.7 fps average before the pacing fix for late frames, 3105 flips, 0 failed |
+| `MESA_WSI_SCANOUT_HZ=0`, 10 s | 2784 fps, 27841 flips, 0 failed |
+| `NVK_HELIOS_DRI=99` | "cannot open host render node 99", falls back to GDI |
+
+Next: block-linear images with NVIDIA's DRM modifier (a linear image is
+rendered through NVK's tiled shadow plus a copy), a host release event
+instead of the fixed hold, vblank pacing.
 
 ### Linux-only code and how the Windows build handles it
 

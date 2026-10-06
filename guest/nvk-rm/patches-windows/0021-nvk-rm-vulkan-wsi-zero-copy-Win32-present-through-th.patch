@@ -1,0 +1,1000 @@
+From ee9fc9a40b86df48e3c1f19e15312aa9a5f230a3 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 02:32:05 +0200
+Subject: [PATCH] nvk/rm, vulkan/wsi: zero-copy Win32 present through the
+ Helios scanout
+
+On Conduit's Helios adapter a Windows guest can show GPU memory on its
+display without the compositor: librmclient's Windows transport opens one
+of the host's DRM render nodes, imports RM memory there as a GEM object
+and names it in a ScanoutFlip, which the host exports as a dma-buf for the
+viewer (guest/rmclient crm_scanout_smoke). The Win32 WSI now presents that
+way instead of copying every frame through GDI.
+
+vulkan/wsi (Win32):
+- wsi_device::win32.scanout_export/scanout_flip: a driver that can show
+  device memory sets them. Swapchains then use a new image type,
+  WSI_IMAGE_TYPE_WIN32_SCANOUT: linear images in dedicated device-local
+  memory, made presentable once when created (scanout_export) and shown
+  by scanout_flip on present, after the CPU wait for rendering that the
+  software path already does. No window, DC or DIB is involved, so it
+  works for a window that is not on a visible desktop.
+- No release event yet: a presented image is held until two later
+  presents (one on screen, one the display may still be reading), so
+  three or more images rotate FIFO-like.
+- FIFO is paced at MESA_WSI_SCANOUT_HZ (default 60, 0 = unpaced) with a
+  high-resolution waitable timer; Sleep()'s 15.6 ms tick held it at
+  32 fps.
+- Formats B8G8R8A8 and R8G8B8A8 (UNORM/SRGB) as XRGB8888/XBGR8888, linear.
+  If the images cannot be exported the swapchain falls back to GDI.
+
+nvk/rm (Windows):
+- nvkmd_rm_win.c: the Windows counterpart of nvkmd_rm_drm.c's export:
+  OS_UNIX_EXPORT_OBJECT_TO_FD into a fresh control channel
+  (crm_win_open_device 255), DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY on host
+  render node NVK_HELIOS_DRI (default 0, crm_win_open_device 512 + n,
+  opened on first use) through crm_win_ioctl, one GEM handle per memory
+  (closed when the memory is freed, the node when the device is
+  destroyed), and crm_win_scanout_flip with an increasing seq.
+- librmclient's crm_win_* entry points are loaded as optional symbols;
+  NVK sets the WSI hooks only when they are there and NVK_HELIOS_WSI is
+  not 0. Flip totals are logged when the device is destroyed.
+
+In win11 on an RTX 5090 (Helios KMD 22.22.307.0), vk_scanout_present at
+1920x1080 with three images: 60.0 fps for 30 s (1801 flips, 0 failed,
+the KMD's NvFlip counter +1801); unpaced, 2784 fps (27841 flips in 10 s,
+0 failed).
+
+Still to do: block-linear images with NVIDIA's DRM modifier (NVK renders
+a linear swapchain image through a tiled shadow and a copy), a release
+event from the host instead of the fixed hold, and vblank pacing.
+---
+ src/nouveau/vulkan/meson.build              |   3 +
+ src/nouveau/vulkan/nvk_wsi.c                |  38 +++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  44 ++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  |  11 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c  |   5 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c  | 279 ++++++++++++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h |  17 ++
+ src/vulkan/wsi/wsi_common.c                 |   5 +
+ src/vulkan/wsi/wsi_common.h                 |  25 ++
+ src/vulkan/wsi/wsi_common_private.h         |   6 +
+ src/vulkan/wsi/wsi_common_win32.cpp         | 242 ++++++++++++++++-
+ 11 files changed, 668 insertions(+), 7 deletions(-)
+ create mode 100644 src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+
+diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
+index 262a77f..122d2f3 100644
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -315,6 +315,9 @@ if not get_option('nvk-rm').disabled()
+   if with_nouveau_drm
+     nvk_flags += '-DNVK_RM_WITH_DRM=1'
+     nvk_files += files('nvkmd/rm/nvkmd_rm_drm.c')
++  elif host_machine.system() == 'windows'
++    # Scanout presentation through Conduit's Helios KMD
++    nvk_files += files('nvkmd/rm/nvkmd_rm_win.c')
+   endif
+ endif
+ 
+diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
+index 8a6f7da..4eb718d 100644
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -7,6 +7,37 @@
+ #include "nvkmd/nvkmd.h"
+ #include "wsi_common.h"
+ 
++#ifdef _WIN32
++#include "nvk_device.h"
++#include "nvk_device_memory.h"
++#include "nvkmd/rm/nvkmd_rm.h"
++
++/* Conduit's Helios adapter: swapchain images are shown by a host scanout
++ * flip of the VRAM they live in (nvkmd_rm_win.c), no copy to a window.
++ */
++static VkResult
++nvk_wsi_scanout_export(VkDevice _device, VkDeviceMemory _mem)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++   VK_FROM_HANDLE(nvk_device_memory, mem, _mem);
++
++   return nvkmd_rm_mem_export_scanout(mem->mem, &dev->vk.base);
++}
++
++static VkResult
++nvk_wsi_scanout_flip(VkDevice _device, VkDeviceMemory _mem,
++                     const struct wsi_win32_scanout_flip *flip)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++   VK_FROM_HANDLE(nvk_device_memory, mem, _mem);
++
++   return nvkmd_rm_mem_scanout_flip(mem->mem, &dev->vk.base,
++                                    flip->width, flip->height,
++                                    flip->stride, flip->offset,
++                                    flip->fourcc, flip->modifier);
++}
++#endif
++
+ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+ nvk_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
+ {
+@@ -47,6 +78,13 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
+       pdev->nvkmd->kmd_info.has_dma_buf &&
+       pdev->nvkmd->sync_types[0]->export_sync_file == NULL;
+ 
++#ifdef _WIN32
++   if (nvkmd_rm_scanout_supported(pdev->nvkmd)) {
++      pdev->wsi_device.win32.scanout_export = nvk_wsi_scanout_export;
++      pdev->wsi_device.win32.scanout_flip = nvk_wsi_scanout_flip;
++   }
++#endif
++
+    pdev->vk.wsi_device = &pdev->wsi_device;
+ 
+    return result;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index f1936b5..83b0835 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -78,6 +78,16 @@ struct nvkmd_rm_lib {
+    int (*event_wait)(crm_client *c, int event_fd, uint32_t timeout_ms);
+    int (*alloc_pages)(crm_client *c, uint64_t size, void **addr);
+    int (*free_pages)(crm_client *c, void *addr, uint64_t size);
++
++   /* Windows transport extras (Conduit's Helios KMD): host DRM render
++    * nodes, ioctls on them, and ScanoutFlip, for presenting RM memory with
++    * no copy (nvkmd_rm_win.c).  NULL elsewhere or with an older library.
++    */
++   int (*win_open_device)(uint32_t device_type, int *fd);
++   void (*win_close_device)(int fd);
++   int (*win_ioctl)(int fd, uint32_t cmd, void *arg, uint32_t size,
++                    void *nested, uint32_t nested_len);
++   int (*win_scanout_flip)(const struct nvrm_crm_scanout_flip *flip);
+ };
+ 
+ /* Returns NULL if librmclient cannot be loaded */
+@@ -176,8 +186,17 @@ struct nvkmd_rm_dev {
+    /* Set once draining the event failed: poll() is useless then */
+    bool nonstall_undrainable;
+ 
+-   /* Open nvidia-drm node for dma-buf export/import, -1 if none */
++   /* Open nvidia-drm node for dma-buf export/import, -1 if none.  On
++    * Windows: the host render node scanout memory is imported on, opened on
++    * first use (nvkmd_rm_win.c) under drm_mutex.
++    */
+    int drm_fd;
++#ifdef _WIN32
++   simple_mtx_t drm_mutex;
++   bool drm_open_failed;
++   uint64_t flip_seq;
++   uint64_t flips_ok, flips_failed;
++#endif
+ 
+    simple_mtx_t heap_mutex;
+    struct util_vma_heap heap;
+@@ -288,6 +307,11 @@ nvkmd_rm_open_drm(const char *path)
+    return -1;
+ }
+ 
++#ifdef _WIN32
++/* nvkmd_rm_win.c: a host render node through the Helios KMD */
++void nvkmd_rm_close_drm(int fd);
++void nvkmd_rm_close_gem(struct nvkmd_rm_dev *dev, uint32_t gem_handle);
++#else
+ static inline void
+ nvkmd_rm_close_drm(int fd)
+ {
+@@ -297,6 +321,7 @@ static inline void
+ nvkmd_rm_close_gem(struct nvkmd_rm_dev *dev, uint32_t gem_handle)
+ {
+ }
++#endif
+ 
+ static inline VkResult
+ nvkmd_rm_import_dma_buf(struct nvkmd_dev *dev, struct vk_object_base *log_obj,
+@@ -313,6 +338,23 @@ nvkmd_rm_mem_export_dma_buf(struct nvkmd_mem *mem,
+ }
+ #endif
+ 
++#ifdef _WIN32
++/*
++ * Scanout presentation on Windows (nvkmd_rm_win.c): RM memory imported on a
++ * host DRM render node as a GEM object, once, and shown with ScanoutFlip
++ * through the Helios KMD.  The Win32 WSI uses this when the library has the
++ * Windows extras (nvkmd_rm_scanout_supported).
++ */
++bool nvkmd_rm_scanout_supported(struct nvkmd_pdev *pdev);
++VkResult nvkmd_rm_mem_export_scanout(struct nvkmd_mem *mem,
++                                     struct vk_object_base *log_obj);
++VkResult nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *mem,
++                                   struct vk_object_base *log_obj,
++                                   uint32_t width, uint32_t height,
++                                   uint32_t stride, uint32_t offset,
++                                   uint32_t fourcc, uint64_t modifier);
++#endif
++
+ /*
+  * GPU virtual address ranges
+  */
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index af69daf..9085a48 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -6,6 +6,7 @@
+ #include "nvkmd_rm.h"
+ 
+ #include "c11/threads.h"
++#include <inttypes.h>
+ #include "util/log.h"
+ #include "util/os_time.h"
+ #include "util/u_math.h"
+@@ -120,6 +121,9 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+    dev->lib = lib;
+    dev->nonstall_fd = -1;
+    dev->drm_fd = -1;
++#ifdef _WIN32
++   simple_mtx_init(&dev->drm_mutex, mtx_plain);
++#endif
+ 
+    list_inithead(&dev->base.mems);
+    simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
+@@ -258,6 +262,13 @@ nvkmd_rm_dev_destroy(struct nvkmd_dev *_dev)
+ 
+    /* GEM objects made from our memory go with the file */
+    nvkmd_rm_close_drm(dev->drm_fd);
++#ifdef _WIN32
++   if (dev->flips_ok + dev->flips_failed != 0) {
++      mesa_logi("NVK: %" PRIu64 " scanout flips, %" PRIu64 " failed",
++                dev->flips_ok, dev->flips_failed);
++   }
++   simple_mtx_destroy(&dev->drm_mutex);
++#endif
+ 
+    simple_mtx_destroy(&dev->base.mems_mutex);
+    FREE(dev);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index 12a9623..a89eca2 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -224,6 +224,11 @@ nvkmd_rm_lib_load(void)
+    LOAD(new_handle,   "crm_new_handle",   false);
+    LOAD(release_handle, "crm_release_handle", false);
+ 
++   LOAD(win_open_device,  "crm_win_open_device",  false);
++   LOAD(win_close_device, "crm_win_close_device", false);
++   LOAD(win_ioctl,        "crm_win_ioctl",        false);
++   LOAD(win_scanout_flip, "crm_win_scanout_flip", false);
++
+    LOAD(event_wait,   "crm_event_wait",   false);
+    LOAD(alloc_pages,  "crm_alloc_pages",  false);
+    LOAD(free_pages,   "crm_free_pages",   false);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+new file mode 100644
+index 0000000..9679e68
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+@@ -0,0 +1,279 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * Scanout presentation on Windows through Conduit's Helios KMD.
++ *
++ * A Windows guest has no nvidia-drm, but librmclient's Windows transport
++ * reaches the host's: it opens one of the host's DRM render nodes
++ * (crm_win_open_device), sends ioctls there (crm_win_ioctl) and names a GEM
++ * object of that node in a ScanoutFlip (crm_win_scanout_flip), which the host
++ * turns into a dma-buf for the display.  So RM memory is presented the way
++ * nvkmd_rm_drm.c turns it into a dma-buf on Linux: exported to a fresh
++ * control channel (NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD), imported on
++ * the render node as a GEM object (DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY), once
++ * per memory.  Every present is then one ScanoutFlip of that GEM object; the
++ * VRAM NVK rendered into is what the viewer shows.
++ *
++ *   NVK_HELIOS_WSI=0   off (the Win32 WSI then copies through GDI)
++ *   NVK_HELIOS_DRI=n   host render node n (default 0)
++ */
++
++#include "nvkmd_rm.h"
++
++#include "util/log.h"
++#include "util/u_atomic.h"
++#include "util/u_debug.h"
++#include "vk_log.h"
++
++#include <errno.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++
++/* What crm_win_open_device takes (rmclient_transport.h) */
++#define NVKMD_RM_WIN_DEV_CTL      255u
++#define NVKMD_RM_WIN_DEV_DRI_BASE 512u
++
++/* Full Linux ioctl numbers, as the host sees them: there is no <drm.h> here.
++ * DRM_IOWR(DRM_COMMAND_BASE + 0x01, 32 bytes) and DRM_IOW(0x09, 8 bytes).
++ */
++#define NVKMD_RM_WIN_IOCTL_GEM_IMPORT_NVKMS_MEMORY 0xc0206441u
++#define NVKMD_RM_WIN_IOCTL_GEM_CLOSE               0x40086409u
++
++static_assert(sizeof(struct nvrm_drm_nvidia_gem_import_nvkms_memory_params) == 32,
++              "GEM_IMPORT_NVKMS_MEMORY size is in the ioctl number");
++
++bool
++nvkmd_rm_scanout_supported(struct nvkmd_pdev *pdev)
++{
++   const struct nvkmd_rm_lib *lib = nvkmd_rm_lib_get();
++
++   if (!debug_get_bool_option("NVK_HELIOS_WSI", true))
++      return false;
++
++   return lib != NULL &&
++          lib->win_open_device != NULL && lib->win_close_device != NULL &&
++          lib->win_ioctl != NULL && lib->win_scanout_flip != NULL;
++}
++
++void
++nvkmd_rm_close_drm(int fd)
++{
++   const struct nvkmd_rm_lib *lib = nvkmd_rm_lib_get();
++
++   if (fd >= 0 && lib != NULL && lib->win_close_device != NULL)
++      lib->win_close_device(fd);
++}
++
++void
++nvkmd_rm_close_gem(struct nvkmd_rm_dev *dev, uint32_t gem_handle)
++{
++   struct {
++      uint32_t handle;
++      uint32_t pad;
++   } gem_close = { .handle = gem_handle };
++
++   if (dev->drm_fd >= 0 && dev->lib->win_ioctl != NULL) {
++      dev->lib->win_ioctl(dev->drm_fd, NVKMD_RM_WIN_IOCTL_GEM_CLOSE,
++                          &gem_close, sizeof(gem_close), NULL, 0);
++   }
++}
++
++/* The render node, opened on first use */
++static VkResult
++get_drm_fd(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
++           int *fd_out)
++{
++   const struct nvkmd_rm_lib *lib = dev->lib;
++   VkResult result = VK_SUCCESS;
++
++   simple_mtx_lock(&dev->drm_mutex);
++   if (dev->drm_fd < 0 && !dev->drm_open_failed) {
++      const uint32_t dri = debug_get_num_option("NVK_HELIOS_DRI", 0);
++      int fd = -1;
++      int ret = lib->win_open_device(NVKMD_RM_WIN_DEV_DRI_BASE + dri, &fd);
++      if (ret != 0 || fd < 0) {
++         dev->drm_open_failed = true;
++         mesa_logw("NVK: cannot open host render node %u (%d), "
++                   "no scanout presentation", dri, ret);
++      } else {
++         dev->drm_fd = fd;
++         if (dev->base.pdev->debug_flags & NVK_DEBUG_VM)
++            fprintf(stderr, "NVK: host render node %u is handle %d\n",
++                    dri, fd);
++      }
++   }
++   if (dev->drm_fd < 0)
++      result = vk_error(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
++   *fd_out = dev->drm_fd;
++   simple_mtx_unlock(&dev->drm_mutex);
++
++   return result;
++}
++
++static VkResult
++export_to_gem(struct nvkmd_rm_dev *dev, struct nvkmd_rm_mem *mem,
++              struct vk_object_base *log_obj, uint32_t *gem_handle_out)
++{
++   const struct nvkmd_rm_lib *lib = dev->lib;
++   VkResult result;
++   int ret;
++
++   if (mem->os_pages != NULL) {
++      return vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
++                       "RM: memory backed by our own pages cannot be "
++                       "exported");
++   }
++
++   int drm_fd;
++   result = get_drm_fd(dev, log_obj, &drm_fd);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* A fresh control channel is the envelope, as /dev/nvidiactl on Linux */
++   int ctl_fd = -1;
++   ret = lib->win_open_device(NVKMD_RM_WIN_DEV_CTL, &ctl_fd);
++   if (ret != 0 || ctl_fd < 0) {
++      return vk_errorf(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY,
++                       "RM: open a control channel for export: %d", ret);
++   }
++
++   NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS ex = {
++      .object = {
++         .type = NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM,
++         .rmObject = {
++            .hDevice = dev->h_device,
++            .hParent = dev->h_device,
++            .hObject = mem->h_memory,
++         },
++      },
++      .fd = ctl_fd,
++   };
++   result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_OUT_OF_HOST_MEMORY,
++                           lib->control(dev->client, lib->root(dev->client),
++                                        NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD,
++                                        &ex, sizeof(ex)),
++                           "OS_UNIX_EXPORT_OBJECT_TO_FD");
++   if (result != VK_SUCCESS)
++      goto out;
++
++   struct nvrm_nvkms_kapi_priv_import_memory_params nvkms = {
++      .memFd = ctl_fd,
++      .surfaceParams = {
++         .layout = mem->pte_kind != 0 ?
++                   NVRM_NVKMS_SURFACE_MEMORY_LAYOUT_BLOCK_LINEAR :
++                   NVRM_NVKMS_SURFACE_MEMORY_LAYOUT_PITCH,
++         .blockLinear = {
++            .log2GobsPerBlock = {
++               .x = 0,
++               .y = (mem->tile_mode >> 4) & 0xf,
++               .z = (mem->tile_mode >> 8) & 0xf,
++            },
++            .pitchInBlocks = 0,
++            .genericMemory = mem->pte_kind != 0,
++         },
++      },
++   };
++   struct nvrm_drm_nvidia_gem_import_nvkms_memory_params imp = {
++      .mem_size = mem->base.size_B,
++      .nvkms_params_ptr = (uint64_t)(uintptr_t)&nvkms,
++      .nvkms_params_size = sizeof(nvkms),
++   };
++   /* The transport sends the NVKMS block after the struct and puts the
++    * host's descriptor for memFd in it.
++    */
++   ret = lib->win_ioctl(drm_fd, NVKMD_RM_WIN_IOCTL_GEM_IMPORT_NVKMS_MEMORY,
++                        &imp, sizeof(imp), &nvkms, sizeof(nvkms));
++   if (ret != 0 || imp.handle == 0) {
++      result = vk_errorf(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY,
++                         "DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY: %d (%s)", ret,
++                         ret < 0 ? strerror(-ret) : "no handle");
++      goto out;
++   }
++
++   *gem_handle_out = imp.handle;
++
++out:
++   /* nvidia-drm has its own reference now */
++   lib->win_close_device(ctl_fd);
++
++   return result;
++}
++
++VkResult
++nvkmd_rm_mem_export_scanout(struct nvkmd_mem *_mem,
++                            struct vk_object_base *log_obj)
++{
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
++   VkResult result = VK_SUCCESS;
++
++   if (!nvkmd_rm_scanout_supported(dev->base.pdev))
++      return vk_error(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
++
++   simple_mtx_lock(&mem->export_mutex);
++   if (mem->gem_handle == 0)
++      result = export_to_gem(dev, mem, log_obj, &mem->gem_handle);
++   const uint32_t gem_handle = mem->gem_handle;
++   simple_mtx_unlock(&mem->export_mutex);
++
++   if (result == VK_SUCCESS && (dev->base.pdev->debug_flags & NVK_DEBUG_VM)) {
++      fprintf(stderr, "NVK: RM memory 0x%x (%" PRIu64 " B, kind 0x%x, "
++              "tile 0x%x) is scanout GEM %u on handle %d\n",
++              mem->h_memory, mem->base.size_B, mem->pte_kind,
++              mem->tile_mode, gem_handle, dev->drm_fd);
++   }
++
++   return result;
++}
++
++VkResult
++nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
++                          struct vk_object_base *log_obj,
++                          uint32_t width, uint32_t height,
++                          uint32_t stride, uint32_t offset,
++                          uint32_t fourcc, uint64_t modifier)
++{
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
++
++   VkResult result = nvkmd_rm_mem_export_scanout(_mem, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const struct nvrm_crm_scanout_flip flip = {
++      .scanout = 0,
++      .owner_handle = (uint32_t)dev->drm_fd,
++      .host_handle = mem->gem_handle,
++      .width = width,
++      .height = height,
++      .stride = stride,
++      .offset = offset,
++      .fourcc = fourcc,
++      .modifier = modifier,
++      .seq = p_atomic_inc_return(&dev->flip_seq),
++   };
++   int ret = dev->lib->win_scanout_flip(&flip);
++   if (ret == 0) {
++      p_atomic_inc(&dev->flips_ok);
++   } else {
++      p_atomic_inc(&dev->flips_failed);
++      result = vk_errorf(log_obj, VK_ERROR_SURFACE_LOST_KHR,
++                         "ScanoutFlip of GEM %u: %d (%s)", mem->gem_handle,
++                         ret, ret < 0 ? strerror(-ret) : "?");
++   }
++
++   if (dev->base.pdev->debug_flags & NVK_DEBUG_VM) {
++      const uint64_t n = dev->flips_ok + dev->flips_failed;
++      if (n == 1 || n % 600 == 0) {
++         fprintf(stderr, "NVK: flip %" PRIu64 ": GEM %u %ux%u stride %u "
++                 "fourcc 0x%08x modifier 0x%" PRIx64 ", %" PRIu64 " ok, %"
++                 PRIu64 " failed\n", flip.seq, flip.host_handle, width,
++                 height, stride, fourcc, modifier, dev->flips_ok,
++                 dev->flips_failed);
++      }
++   }
++
++   return result;
++}
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+index 9123690..cee625e 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -622,6 +622,22 @@ struct nvrm_nvkms_kapi_priv_export_memory_params {
+    int memFd;
+ };
+ 
++/* librmclient's struct crm_scanout_flip (rmclient_transport.h), the Conduit
++ * ScanoutFlip message: show GEM object host_handle of the host DRM file
++ * owner_handle.
++ */
++struct nvrm_crm_scanout_flip {
++   uint32_t scanout;
++   uint32_t owner_handle;
++   uint32_t host_handle;
++   uint32_t width, height;
++   uint32_t stride;
++   uint32_t offset;
++   uint32_t fourcc;
++   uint64_t modifier;
++   uint64_t seq;
++};
++
+ /* USERD layout (Nvc36fControl .. Nvca6fControl) */
+ #define NVRM_USERD_GP_GET                         0x88
+ #define NVRM_USERD_GP_PUT                         0x8c
+@@ -654,6 +670,7 @@ static_assert(sizeof(NVA06F_CTRL_BIND_PARAMS) == 4, "BIND");
+ static_assert(sizeof(NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS) == 4, "GET_WORK_SUBMIT_TOKEN");
+ static_assert(sizeof(NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS) == 4, "SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX");
+ static_assert(sizeof(NvNotification) == 16, "NvNotification");
++static_assert(sizeof(struct nvrm_crm_scanout_flip) == 48, "crm_scanout_flip");
+ static_assert(sizeof(NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS) == 24, "OS_UNIX_EXPORT_OBJECT_TO_FD");
+ static_assert(sizeof(NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS) == 20, "OS_UNIX_IMPORT_OBJECT_FROM_FD");
+ static_assert(sizeof(NV0041_CTRL_GET_SURFACE_INFO_PARAMS) == 16, "GET_SURFACE_INFO");
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index a4841aa..b836da3 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -422,6 +422,9 @@ get_blit_type(const struct wsi_device *wsi,
+          container_of(params, const struct wsi_dxgi_image_params, base);
+       return wsi_dxgi_image_needs_blit(wsi, dxgi_params, device);
+    }
++   case WSI_IMAGE_TYPE_WIN32_SCANOUT:
++      /* Rendered where it is shown: a linear image in device memory */
++      return WSI_SWAPCHAIN_NO_BLIT;
+ #endif
+ #if defined(VK_USE_PLATFORM_METAL_EXT)
+    case WSI_IMAGE_TYPE_METAL: {
+@@ -471,6 +474,8 @@ configure_image(const struct wsi_swapchain *chain,
+          container_of(params, const struct wsi_dxgi_image_params, base);
+       return wsi_dxgi_configure_image(chain, pCreateInfo, dxgi_params, info);
+    }
++   case WSI_IMAGE_TYPE_WIN32_SCANOUT:
++      return wsi_win32_scanout_configure_image(chain, pCreateInfo, info);
+ #endif
+ #if defined(VK_USE_PLATFORM_METAL_EXT)
+    case WSI_IMAGE_TYPE_METAL: {
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index 5677eec..bdcfa3b 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -54,6 +54,15 @@ struct driOptionCache;
+ 
+ #define VK_ICD_WSI_PLATFORM_MAX (VK_ICD_WSI_PLATFORM_METAL + 1)
+ 
++/* What wsi_device::win32.scanout_flip shows: plane 0 of the memory */
++struct wsi_win32_scanout_flip {
++   uint32_t width, height;
++   uint32_t stride;    /* bytes */
++   uint32_t offset;    /* bytes */
++   uint32_t fourcc;    /* DRM_FORMAT_* */
++   uint64_t modifier;  /* DRM_FORMAT_MOD_*, 0 = linear */
++};
++
+ struct wsi_device {
+    /* Allocator for the instance */
+    VkAllocationCallbacks instance_alloc;
+@@ -145,6 +154,22 @@ struct wsi_device {
+       VkResult (*create_image_memory)(VkDevice device, void *resource,
+                                       const VkAllocationCallbacks *alloc,
+                                       VkDeviceMemory *out);
++
++      /* Scanout presentation: the driver can show device memory on the
++       * display itself (a host scanout flip, as Conduit's Helios adapter
++       * offers), so swapchain images are rendered in device memory and a
++       * present names the image's memory instead of copying it to a window.
++       * Both NULL: GDI or DXGI as usual.
++       *
++       * scanout_export is called once per swapchain image, right after its
++       * (dedicated, device-local) memory is allocated; a failure makes the
++       * swapchain fall back to the software path.  The memory stays
++       * presentable until it is freed.  scanout_flip shows it; the image's
++       * rendering has finished when it is called.
++       */
++      VkResult (*scanout_export)(VkDevice device, VkDeviceMemory memory);
++      VkResult (*scanout_flip)(VkDevice device, VkDeviceMemory memory,
++                               const struct wsi_win32_scanout_flip *flip);
+    } win32;
+ 
+    struct {
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index 3d2cd7d..5aa8f48 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -49,6 +49,7 @@ enum wsi_image_type {
+    WSI_IMAGE_TYPE_DRM,
+    WSI_IMAGE_TYPE_DXGI,
+    WSI_IMAGE_TYPE_METAL,
++   WSI_IMAGE_TYPE_WIN32_SCANOUT,
+ };
+ 
+ struct wsi_base_image_params {
+@@ -400,6 +401,11 @@ wsi_dxgi_configure_image(const struct wsi_swapchain *chain,
+                          const struct wsi_dxgi_image_params *params,
+                          struct wsi_image_info *info);
+ 
++VkResult
++wsi_win32_scanout_configure_image(const struct wsi_swapchain *chain,
++                                  const VkSwapchainCreateInfoKHR *pCreateInfo,
++                                  struct wsi_image_info *info);
++
+ bool
+ wsi_cpu_image_needs_buffer_blit(const struct wsi_device *wsi,
+                                 const struct wsi_cpu_image_params *params);
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index 0622857..4864486 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -27,6 +27,8 @@
+ #include <string.h>
+ 
+ #include "util/cnd_monotonic.h"
++#include "util/os_time.h"
++#include "util/u_debug.h"
+ #include "util/timespec.h"
+ #include "util/u_thread.h"
+ #include "vk_format.h"
+@@ -109,6 +111,27 @@ struct wsi_win32_swapchain {
+    VkExtent2D                 extent;
+    HWND wnd;
+    HDC chain_dc;
++
++   /* Scanout presentation (wsi_device::win32.scanout_flip) */
++   struct {
++      bool enabled;
++      uint32_t fourcc;
++      /* Presented images kept from the application: the one on screen and
++       * the one before it, which the display may still be reading.  There
++       * is no release event yet, so an image comes back after this many
++       * later presents.
++       */
++      uint32_t hold;
++      /* FIFO pacing without a vblank event: at most this often, 0 = never */
++      uint64_t period_ns;
++      uint64_t next_flip_ns;
++      /* Sleep() has the scheduler tick's granularity (15.6 ms by default),
++       * too coarse for a 16.7 ms frame: a high-resolution waitable timer.
++       */
++      HANDLE timer;
++      bool flip_failed;
++   } scanout;
++
+    struct wsi_win32_image     images[0];
+ };
+ 
+@@ -558,6 +581,154 @@ wsi_dxgi_configure_image(const struct wsi_swapchain *chain,
+    return VK_SUCCESS;
+ }
+ 
++/*
++ * Scanout presentation
++ *
++ * The driver shows device memory on the display itself (under Conduit, a
++ * host scanout flip of the GPU memory the image lives in), so the swapchain
++ * images are linear images in dedicated device memory that the driver makes
++ * presentable once (scanout_export) and names in every present
++ * (scanout_flip).  Nothing is copied to a window.
++ */
++
++#define WSI_DRM_FORMAT_XRGB8888 0x34325258u /* 'XR24' */
++#define WSI_DRM_FORMAT_XBGR8888 0x34324258u /* 'XB24' */
++
++static uint32_t
++wsi_win32_scanout_fourcc(VkFormat format)
++{
++   switch (format) {
++   case VK_FORMAT_B8G8R8A8_UNORM:
++   case VK_FORMAT_B8G8R8A8_SRGB:
++      return WSI_DRM_FORMAT_XRGB8888;
++   case VK_FORMAT_R8G8B8A8_UNORM:
++   case VK_FORMAT_R8G8B8A8_SRGB:
++      return WSI_DRM_FORMAT_XBGR8888;
++   default:
++      return 0;
++   }
++}
++
++static VkResult
++wsi_win32_create_scanout_image_mem(const struct wsi_swapchain *chain,
++                                   const struct wsi_image_info *info,
++                                   struct wsi_image *image)
++{
++   const struct wsi_device *wsi = chain->wsi;
++   VkResult result;
++
++   VkMemoryRequirements reqs;
++   wsi->GetImageMemoryRequirements(chain->device, image->image, &reqs);
++
++   VkImageSubresource subresource = {};
++   subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++   VkSubresourceLayout layout;
++   wsi->GetImageSubresourceLayout(chain->device, image->image,
++                                  &subresource, &layout);
++
++   VkMemoryDedicatedAllocateInfo dedicated = {};
++   dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
++   dedicated.image = image->image;
++
++   VkMemoryAllocateInfo memory_info = {};
++   memory_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++   memory_info.pNext = &dedicated;
++   memory_info.allocationSize = reqs.size;
++   memory_info.memoryTypeIndex =
++      info->select_image_memory_type(wsi, reqs.memoryTypeBits);
++
++   result = wsi->AllocateMemory(chain->device, &memory_info,
++                                &chain->alloc, &image->memory);
++   if (result != VK_SUCCESS)
++      return result;
++
++   image->num_planes = 1;
++   image->sizes[0] = reqs.size;
++   image->row_pitches[0] = layout.rowPitch;
++   image->offsets[0] = layout.offset;
++
++   return wsi->win32.scanout_export(chain->device, image->memory);
++}
++
++VkResult
++wsi_win32_scanout_configure_image(const struct wsi_swapchain *chain,
++                                  const VkSwapchainCreateInfoKHR *pCreateInfo,
++                                  struct wsi_image_info *info)
++{
++   VkResult result = wsi_configure_image(chain, pCreateInfo, 0, info);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* What the display takes without knowing the driver's tilings */
++   info->create.tiling = VK_IMAGE_TILING_LINEAR;
++   info->select_image_memory_type = wsi_select_device_memory_type;
++   info->create_mem = wsi_win32_create_scanout_image_mem;
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++wsi_win32_queue_present_scanout(struct wsi_win32_swapchain *chain,
++                                struct wsi_win32_image *image)
++{
++   const struct wsi_device *wsi = chain->wsi->wsi;
++
++   /* FIFO without a vblank to wait for: do not outrun the display */
++   if (chain->scanout.period_ns != 0) {
++      const uint64_t now = os_time_get_nano();
++      if (now < chain->scanout.next_flip_ns) {
++         const uint64_t wait_ns = chain->scanout.next_flip_ns - now;
++         LARGE_INTEGER due;
++         due.QuadPart = -(LONGLONG)(wait_ns / 100); /* relative, 100 ns */
++         if (chain->scanout.timer &&
++             SetWaitableTimer(chain->scanout.timer, &due, 0, NULL, NULL, FALSE))
++            WaitForSingleObject(chain->scanout.timer, INFINITE);
++         else
++            os_time_sleep(wait_ns / 1000);
++         chain->scanout.next_flip_ns += chain->scanout.period_ns;
++      } else if (now - chain->scanout.next_flip_ns <
++                 chain->scanout.period_ns) {
++         /* A little late: keep the schedule, catch up next frame */
++         chain->scanout.next_flip_ns += chain->scanout.period_ns;
++      } else {
++         /* Far behind (or the first frame): restart the schedule */
++         chain->scanout.next_flip_ns = now + chain->scanout.period_ns;
++      }
++   }
++
++   struct wsi_win32_scanout_flip flip = {};
++   flip.width = chain->extent.width;
++   flip.height = chain->extent.height;
++   flip.stride = image->base.row_pitches[0];
++   flip.offset = image->base.offsets[0];
++   flip.fourcc = chain->scanout.fourcc;
++   flip.modifier = 0; /* DRM_FORMAT_MOD_LINEAR: the images are linear */
++
++   VkResult result = wsi->win32.scanout_flip(chain->base.device,
++                                             image->base.memory, &flip);
++
++   /* A lost frame is not a lost surface: report it once and go on */
++   if (result != VK_SUCCESS && !chain->scanout.flip_failed) {
++      chain->scanout.flip_failed = true;
++      fprintf(stderr, "MESA-WSI: scanout flip failed (%d), frames dropped\n",
++              result);
++   }
++
++   mtx_lock(&chain->acquire_mutex);
++   image->state = WSI_IMAGE_QUEUED;
++   for (uint32_t i = 0; i < chain->base.image_count; i++) {
++      struct wsi_win32_image *other = &chain->images[i];
++      if (other->state == WSI_IMAGE_QUEUED &&
++          other->base.present_serial + chain->scanout.hold <=
++          chain->base.present_serial)
++         other->state = WSI_IMAGE_IDLE;
++   }
++   u_cnd_monotonic_broadcast(&chain->acquire_cond);
++   mtx_unlock(&chain->acquire_mutex);
++
++   return VK_SUCCESS;
++}
++
+ static VkResult
+ wsi_win32_image_init(VkDevice device_h,
+                      struct wsi_win32_swapchain *chain,
+@@ -574,7 +745,7 @@ wsi_win32_image_init(VkDevice device_h,
+    chain->wnd = win32_surface->hwnd;
+    image->chain = chain;
+ 
+-   if (chain->dxgi)
++   if (chain->dxgi || chain->scanout.enabled)
+       return VK_SUCCESS;
+ 
+    chain->chain_dc = GetDC(chain->wnd);
+@@ -628,7 +799,10 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
+    for (uint32_t i = 0; i < chain->base.image_count; i++)
+       wsi_win32_image_finish(chain, allocator, &chain->images[i]);
+ 
+-   DeleteDC(chain->chain_dc);
++   if (chain->chain_dc)
++      DeleteDC(chain->chain_dc);
++   if (chain->scanout.timer)
++      CloseHandle(chain->scanout.timer);
+ 
+    if (chain->surface->current_swapchain == chain)
+       chain->surface->current_swapchain = NULL;
+@@ -838,6 +1012,9 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
+    if (chain->dxgi)
+       return wsi_win32_queue_present_dxgi(chain, image, damage);
+ 
++   if (chain->scanout.enabled)
++      return wsi_win32_queue_present_scanout(chain, image);
++
+    char *ptr = (char *)image->base.cpu_map;
+    char *dptr = (char *)image->sw.ppvBits;
+ 
+@@ -977,15 +1154,33 @@ wsi_win32_surface_create_swapchain(
+       { WSI_IMAGE_TYPE_CPU },
+    };
+ 
++   struct wsi_base_image_params scanout_image_params = {
++      WSI_IMAGE_TYPE_WIN32_SCANOUT,
++   };
++
+    bool supports_dxgi = wsi->dxgi.factory &&
+                         wsi->dxgi.dcomp &&
+                         wsi->wsi->win32.get_d3d12_command_queue;
+    struct wsi_base_image_params *image_params = supports_dxgi ?
+       &dxgi_image_params.base : &cpu_image_params.base;
+ 
+-   VkResult result = wsi_swapchain_init(wsi_device, &chain->base, device,
+-                                        create_info, image_params,
+-                                        allocator);
++   const uint32_t scanout_fourcc =
++      wsi_win32_scanout_fourcc(create_info->imageFormat);
++   const bool try_scanout = wsi_device->win32.scanout_export != NULL &&
++                            wsi_device->win32.scanout_flip != NULL &&
++                            scanout_fourcc != 0 &&
++                            create_info->imageArrayLayers == 1;
++   if (try_scanout)
++      image_params = &scanout_image_params;
++
++   VkResult result;
++retry:
++   result = wsi_swapchain_init(wsi_device, &chain->base, device,
++                               create_info, image_params, allocator);
++   if (result != VK_SUCCESS && image_params == &scanout_image_params) {
++      image_params = &cpu_image_params.base;
++      goto retry;
++   }
+    if (result != VK_SUCCESS) {
+       u_cnd_monotonic_destroy(&chain->acquire_cond);
+       mtx_destroy(&chain->acquire_mutex);
+@@ -1006,6 +1201,22 @@ wsi_win32_surface_create_swapchain(
+ 
+    chain->surface = surface;
+ 
++   if (image_params->image_type == WSI_IMAGE_TYPE_WIN32_SCANOUT) {
++      chain->scanout.enabled = true;
++      chain->scanout.fourcc = scanout_fourcc;
++      chain->scanout.hold = MIN2(2u, num_images - 1);
++      const uint64_t hz = debug_get_num_option("MESA_WSI_SCANOUT_HZ", 60);
++      chain->scanout.period_ns =
++         chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR && hz > 0 ?
++         1000000000ull / hz : 0;
++      if (chain->scanout.period_ns != 0) {
++         chain->scanout.timer =
++            CreateWaitableTimerExW(NULL, NULL,
++                                   CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                   TIMER_ALL_ACCESS);
++      }
++   }
++
+    if (image_params->image_type == WSI_IMAGE_TYPE_DXGI) {
+       result = wsi_win32_surface_create_swapchain_dxgi(surface, device, wsi, create_info, chain);
+       if (result != VK_SUCCESS)
+@@ -1017,11 +1228,30 @@ wsi_win32_surface_create_swapchain(
+                                     create_info, allocator,
+                                     &chain->images[image]);
+       if (result != VK_SUCCESS)
+-         goto fail;
++         break;
+ 
+       chain->base.image_count++;
+    }
+ 
++   /* The driver could not make the images presentable: software path */
++   if (result != VK_SUCCESS && chain->scanout.enabled) {
++      fprintf(stderr, "MESA-WSI: scanout images unavailable (%d), "
++              "presenting through GDI\n", result);
++      for (uint32_t i = 0; i < chain->base.image_count; i++)
++         wsi_win32_image_finish(chain, allocator, &chain->images[i]);
++      memset(chain->images, 0, num_images * sizeof(chain->images[0]));
++      chain->base.image_count = 0;
++      wsi_swapchain_finish(&chain->base);
++      memset(&chain->base, 0, sizeof(chain->base));
++      if (chain->scanout.timer)
++         CloseHandle(chain->scanout.timer);
++      memset(&chain->scanout, 0, sizeof(chain->scanout));
++      image_params = &cpu_image_params.base;
++      goto retry;
++   }
++   if (result != VK_SUCCESS)
++      goto fail;
++
+    *swapchain_out = &chain->base;
+ 
+    return VK_SUCCESS;
