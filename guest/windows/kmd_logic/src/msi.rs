@@ -229,6 +229,14 @@ pub const fn isr_state(plan: &Plan) -> u32 {
     STATE_ACTIVE | plan.config as u32
 }
 
+/// The ISR state of a start that got messages but runs with NO vector programmed
+/// (the device refused every plan): message mode, config unassigned, so any stray
+/// message is queue work. Never 0. Nothing is expected to fire; completions are
+/// found by polling (`virtio::msi`).
+pub const fn polling_only_state() -> u32 {
+    STATE_ACTIVE | NO_VECTOR as u32
+}
+
 /// What the ISR should do for one interrupt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IsrRoute {
@@ -309,15 +317,20 @@ const fn plan_eq(a: &Plan, b: &Plan) -> bool {
 /// The service-key knob `MsiMode`: which interrupt mode the driver asks PnP for.
 /// PnP decides from the device key's `MSISupported` before `StartDevice`, so
 /// this is realised by writing that value (see [`key_action`]), which takes
-/// effect at the next device start.
+/// effect at the NEXT device start: the first restart after a change writes the
+/// key, a second restart (or a reboot) applies it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// 0 (default): MSI-X as the INF ships it, INTx once a start latched it.
+    /// 0 (default): follow the INF / the device key as it stands. The driver
+    /// only ever LOWERS it on its own (a latched start).
     Auto,
     /// 1: INTx always (the A/B and the escape hatch). Survives a driver update.
     ForceIntx,
-    /// 2: MSI-X always: ignores and clears the latch (to retry after a fix).
+    /// 2: MSI-X (writes the key to 1), but the breaker and the latch still win:
+    /// a start that never became healthy, or a convicted delivery, puts INTx back.
     ForceMsi,
+    /// 3: MSI-X, no breaker and no latch: debugging only.
+    ForceMsiNoBreaker,
 }
 
 impl Mode {
@@ -326,6 +339,7 @@ impl Mode {
         match value {
             1 => Mode::ForceIntx,
             2 => Mode::ForceMsi,
+            3 => Mode::ForceMsiNoBreaker,
             _ => Mode::Auto,
         }
     }
@@ -336,6 +350,7 @@ impl Mode {
             Mode::Auto => 0,
             Mode::ForceIntx => 1,
             Mode::ForceMsi => 2,
+            Mode::ForceMsiNoBreaker => 3,
         }
     }
 }
@@ -370,19 +385,25 @@ impl KeyAction {
     }
 }
 
-/// The key action for `mode` and whether an earlier start latched INTx.
+/// The key action for `mode` and whether INTx is latched (an earlier start's
+/// conviction, or the boot-loop breaker, see [`breaker_trips`]).
 ///
-/// The KMD writes only when it has a reason: raising the value to 1 is the
-/// INF's job (every install and update does it), so `Auto` without a latch
-/// leaves the key alone and a hand-set 0 stays 0 until the next driver update.
-/// Lowering it is the KMD's: it is the one that sees MSI fail.
+/// The shipped INF value (INTx in this package) is the single source of truth:
+/// `Auto` leaves the key alone, except that a latch lowers it (lowering is always
+/// safe). `ForceMsi` raises it, but never over a latch; only `ForceMsiNoBreaker`
+/// does. `ForceIntx` always lowers it. After a change of `MsiMode` the first
+/// restart writes the key; the second applies it. Going back to `Auto` leaves the
+/// key where the last forcing put it, until the next package install rewrites it
+/// from the INF.
 pub const fn key_action(mode: Mode, latched: bool) -> KeyAction {
     match mode {
         Mode::ForceIntx => KeyAction::SetIntx,
-        Mode::ForceMsi => KeyAction::SetMsi,
-        Mode::Auto => {
+        Mode::ForceMsiNoBreaker => KeyAction::SetMsi,
+        Mode::ForceMsi | Mode::Auto => {
             if latched {
                 KeyAction::SetIntx
+            } else if matches!(mode, Mode::ForceMsi) {
+                KeyAction::SetMsi
             } else {
                 KeyAction::Leave
             }
@@ -390,9 +411,36 @@ pub const fn key_action(mode: Mode, latched: bool) -> KeyAction {
     }
 }
 
-/// Whether `mode` erases the INTx latch (a forced retry of MSI-X).
-pub const fn clears_latch(mode: Mode) -> bool {
-    matches!(mode, Mode::ForceMsi)
+/// The boot-loop breaker. A start in message mode sets the `MsiStarting` marker
+/// (flushed to disk) and clears it once interrupts are seen to arrive
+/// ([`marker_may_clear`]). `AddDevice` finding the marker still set means the
+/// previous message-mode start never became healthy (a hang, a bugcheck, a
+/// reboot into the same fault): that trips the breaker, which latches INTx.
+/// `ForceMsiNoBreaker` is the only mode that does not act on it.
+pub const fn breaker_trips(mode: Mode, marker_found: bool) -> bool {
+    marker_found && !matches!(mode, Mode::ForceMsiNoBreaker)
+}
+
+/// How long after a start finished the marker waits before it may be cleared
+/// (3 s, 100 ns units): a start that dies within seconds of looking healthy
+/// still trips the breaker.
+pub const MARKER_CLEAR_AFTER_100NS: u64 = 30_000_000;
+
+/// Whether the `MsiStarting` marker may be cleared now: run-time judging is armed
+/// (`armed_at` is its time, 0 = not armed), delivery is not convicted, at least one
+/// interrupt arrived, and either the start is ending cleanly (`stopping`) or
+/// [`MARKER_CLEAR_AFTER_100NS`] has passed.
+pub const fn marker_may_clear(
+    armed_at: u64,
+    now: u64,
+    ints_seen: u32,
+    convicted: bool,
+    stopping: bool,
+) -> bool {
+    armed_at != 0
+        && !convicted
+        && ints_seen > 0
+        && (stopping || now.saturating_sub(armed_at) >= MARKER_CLEAR_AFTER_100NS)
 }
 
 // ── Counting: per-vector interrupts and DPCs ─────────────────────────────────
@@ -546,13 +594,15 @@ pub mod latch_why {
     pub const REFUSED: u32 = 2;
     /// The common configuration could not be mapped.
     pub const NO_CFG: u32 = 3;
+    /// The boot-loop breaker: the previous message-mode start never became healthy.
+    pub const BREAKER: u32 = 4;
 }
 
 /// Service-key value names of the message-interrupt counters, written by
 /// `kmd_render/src/virtio/msi.rs` only. `MsiMode` and `MsiVectors` are knobs the
 /// operator writes and are not listed; `MsiLatch` is both: the KMD writes 1, an
 /// operator may write either. At most 14 characters each.
-pub const COUNTERS: [&str; 33] = [
+pub const COUNTERS: [&str; 36] = [
     // The set-up breadcrumbs.
     "MsiCap",
     "MsiList",
@@ -586,12 +636,16 @@ pub const COUNTERS: [&str; 33] = [
     "MsiStart",
     "MsiPoll",
     "MsiPollN",
+    "MsiPollOnly",
     // Policy and the latch.
     "MsiModeEff",
     "MsiLatch",
     "MsiLatchWhy",
     "MsiWant",
     "MsiKeyWr",
+    // The boot-loop breaker: the marker a message-mode start sets, how often it tripped.
+    "MsiStarting",
+    "MsiBreaker",
 ];
 
 #[cfg(test)]
@@ -825,37 +879,96 @@ mod tests {
         assert_eq!(Mode::from_knob(0), Mode::Auto);
         assert_eq!(Mode::from_knob(1), Mode::ForceIntx);
         assert_eq!(Mode::from_knob(2), Mode::ForceMsi);
+        assert_eq!(Mode::from_knob(3), Mode::ForceMsiNoBreaker);
         // Unknown values do not pick a mode.
-        assert_eq!(Mode::from_knob(3), Mode::Auto);
+        assert_eq!(Mode::from_knob(4), Mode::Auto);
         assert_eq!(Mode::from_knob(u32::MAX), Mode::Auto);
-        for m in [Mode::Auto, Mode::ForceIntx, Mode::ForceMsi] {
+        for m in [
+            Mode::Auto,
+            Mode::ForceIntx,
+            Mode::ForceMsi,
+            Mode::ForceMsiNoBreaker,
+        ] {
             assert_eq!(Mode::from_knob(m.code()), m);
         }
     }
 
     #[test]
     fn key_action_table() {
-        // Default and healthy: the INF's value stands.
+        // Default, nothing latched: the INF's value stands (INTx in this package).
         assert_eq!(key_action(Mode::Auto, false), KeyAction::Leave);
-        // A start latched INTx: lower the key.
+        // A latch lowers the key whatever the mode asks, except the debugging mode.
         assert_eq!(key_action(Mode::Auto, true), KeyAction::SetIntx);
-        // The operator's choice wins over the latch, both ways.
+        assert_eq!(key_action(Mode::ForceMsi, true), KeyAction::SetIntx);
         assert_eq!(key_action(Mode::ForceIntx, false), KeyAction::SetIntx);
         assert_eq!(key_action(Mode::ForceIntx, true), KeyAction::SetIntx);
+        // The opt-in raises the key.
         assert_eq!(key_action(Mode::ForceMsi, false), KeyAction::SetMsi);
-        assert_eq!(key_action(Mode::ForceMsi, true), KeyAction::SetMsi);
-        // Only the forced retry erases the latch.
-        assert!(clears_latch(Mode::ForceMsi));
-        assert!(!clears_latch(Mode::Auto));
-        assert!(!clears_latch(Mode::ForceIntx));
+        assert_eq!(
+            key_action(Mode::ForceMsiNoBreaker, false),
+            KeyAction::SetMsi
+        );
+        assert_eq!(key_action(Mode::ForceMsiNoBreaker, true), KeyAction::SetMsi);
     }
 
     #[test]
-    fn auto_never_raises_the_key() {
-        // Raising MSISupported is the INF's job; the KMD only ever lowers it on its own.
+    fn only_an_explicit_opt_in_raises_the_key() {
+        // Raising MSISupported without being asked is the INF's job, never the KMD's.
         for latched in [false, true] {
             assert_ne!(key_action(Mode::Auto, latched), KeyAction::SetMsi);
+            assert_ne!(key_action(Mode::ForceIntx, latched), KeyAction::SetMsi);
         }
+        // And a latch beats everything but mode 3.
+        for mode in [Mode::Auto, Mode::ForceIntx, Mode::ForceMsi] {
+            assert_ne!(key_action(mode, true), KeyAction::SetMsi);
+        }
+    }
+
+    #[test]
+    fn the_breaker_trips_on_a_leftover_marker_in_every_mode_but_the_debugging_one() {
+        for mode in [Mode::Auto, Mode::ForceIntx, Mode::ForceMsi] {
+            assert!(breaker_trips(mode, true));
+            assert!(!breaker_trips(mode, false));
+        }
+        assert!(!breaker_trips(Mode::ForceMsiNoBreaker, true));
+        assert!(!breaker_trips(Mode::ForceMsiNoBreaker, false));
+        // A tripped breaker is a latch, and a latch lowers an opted-in key.
+        let latched = breaker_trips(Mode::ForceMsi, true);
+        assert_eq!(key_action(Mode::ForceMsi, latched), KeyAction::SetIntx);
+    }
+
+    #[test]
+    fn the_marker_clears_only_when_interrupts_were_seen_and_the_start_is_old_enough() {
+        let armed = 1_000_000u64;
+        let after = armed + MARKER_CLEAR_AFTER_100NS;
+        // Not armed yet: never.
+        assert!(!marker_may_clear(0, after, 5, false, false));
+        assert!(!marker_may_clear(0, after, 5, false, true));
+        // Armed, interrupts seen, old enough.
+        assert!(marker_may_clear(armed, after, 1, false, false));
+        // Too young, unless the start is ending cleanly.
+        assert!(!marker_may_clear(armed, after - 1, 1, false, false));
+        assert!(marker_may_clear(armed, armed, 1, false, true));
+        // No interrupt: a quiet device is not a healthy one, even stopping.
+        assert!(!marker_may_clear(armed, after, 0, false, false));
+        assert!(!marker_may_clear(armed, after, 0, false, true));
+        // A convicted delivery keeps the marker.
+        assert!(!marker_may_clear(armed, after, 9, true, false));
+        assert!(!marker_may_clear(armed, after, 9, true, true));
+        // A clock that went backwards does not clear early.
+        assert!(!marker_may_clear(armed, 0, 1, false, false));
+    }
+
+    #[test]
+    fn the_polling_only_state_is_message_mode_with_nothing_to_route() {
+        let st = polling_only_state();
+        assert_ne!(st, 0);
+        for m in [0, 1, 2, 3, 40] {
+            // No config vector: every message is queue work, never a config change.
+            assert_eq!(isr_route(st, m), IsrRoute::Queue);
+        }
+        // It is not what a plan with a vector encodes.
+        assert_ne!(st, isr_state(&plan(3, 2, false)));
     }
 
     #[test]
@@ -1096,8 +1209,10 @@ mod tests {
                         let ok = if is_rtt {
                             name == "nvrm.rs"
                         } else {
-                            // `MsiLatch` is also a knob, declared with the others in diag.rs.
-                            name == "msi.rs" || (*mine == "MsiLatch" && name == "diag.rs")
+                            // These are also read as knobs, declared with the others in diag.rs.
+                            name == "msi.rs"
+                                || (["MsiLatch", "MsiStarting", "MsiBreaker"].contains(mine)
+                                    && name == "diag.rs")
                         };
                         assert!(ok, "{mine} is also spelled in {}", file.display());
                     }

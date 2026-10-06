@@ -469,6 +469,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // budget) and passed in as a bare u32. 0 = INTx = the driver's historical
     // behaviour, byte for byte. See `virtio::msi`.
     let msi_granted = crate::virtio::msi::probe_granted(unsafe { &*dxgkrnl_interface });
+    // This start's interrupt counters begin at zero, and a start that got messages sets the
+    // boot-loop breaker's marker (flushed) before anything below can hang. Own noinline frame.
+    crate::virtio::msi::begin_start(passive, msi_granted);
     // The host's buffer-release event (`NVGPU_F_SCANOUT_RELEASE`) is acked only with the
     // display half: it serves the foreign scanout sources and the RM ring presenter,
     // which exist only there. A render-only start acks nothing new (the host then keeps
@@ -799,6 +802,9 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         crate::ddi::stall_diag::stop_sub(ss::HPD_STOPPED);
         budget = stop_credit(budget, joined_from);
         stop_stage(entry, 4);
+        // A clean stop of a start that saw interrupts is a healthy one: the boot-loop breaker's
+        // marker goes (`virtio::msi::service`).
+        crate::virtio::msi::service(true);
         // The HPD worker did the `Nv*` registry mirror and is gone: leave the
         // registry with the final counts (PASSIVE, StopDevice).
         crate::ddi::stall_diag::stop_sub(ss::FINAL_PUBLISH);

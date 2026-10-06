@@ -2855,6 +2855,7 @@ impl VirtioGpu {
             let queues = [CTRL_QUEUE, nvrm_events::EVENT_QUEUE];
             let live = if nvrm_event_ring.is_some() { 2 } else { 1 };
             match super::msi::program_vectors(
+                passive,
                 &DxgkConfigAccess::new(dxgkrnl),
                 msi_granted,
                 &queues[..live],

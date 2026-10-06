@@ -26,7 +26,7 @@
 //!
 //! # Default, fallback, measurement
 //!
-//! MSI-X is the shipped default (the INF writes `MSISupported=1`). What happens
+//! MSI-X is an opt-in in this package (`MsiMode=2`; the INF writes `MSISupported=0`). What happens
 //! when it does not work is the second half of this file: the per-vector
 //! counters the ISR and DPC feed, the health logic (a "rescue" is a waiter's
 //! polling drain finding a completion no interrupt announced), the polling
@@ -42,7 +42,7 @@
 //! at DIRQL / DISPATCH; the registry is written only by [`publish_counters`],
 //! [`latch_intx`] and the set-up breadcrumbs, all PASSIVE.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use helios_kmd_logic::msi::{self, Health, Mode, Plan};
 
@@ -149,17 +149,20 @@ unsafe fn write_plan(va: usize, plan: &Plan, queues: &[u16]) -> bool {
 /// state word ([`msi::isr_state`]; never 0 on `Ok`).
 ///
 /// Order (`msi::setup_plan`): the plan first; if the device refuses any vector, ONE
-/// retry with every queue on message 0; if that is refused too, `Err` and the
-/// caller fails the transport (a device on messages that cannot be given one would
-/// never interrupt: failing `StartDevice`'s transport is the safe outcome, a hang
-/// is not) after latching INTx for the next start. `queues` are the queue numbers
-/// that exist, control first.
+/// retry with every queue on message 0. If that is refused too (or the common cfg
+/// cannot be mapped a second time), the transport STAYS UP with no vector programmed
+/// ([`msi::polling_only_state`]): the OS connected messages and not the line, so the
+/// device cannot be heard, but every completion is still found by polling (a waiter's
+/// drain after each slice, the worker's safety net, `POLL_ONLY` / `MsiPollOnly`), which
+/// keeps the display half instead of failing the transport. INTx is latched for the
+/// next start either way. `queues` are the queue numbers that exist, control first.
 ///
 /// Must run before DRIVER_OK: QEMU wires each queue's call eventfd to KVM as an
 /// irqfd when the guest notifiers are set up at DRIVER_OK, from the vectors
 /// programmed by then.
 #[inline(never)]
 pub(crate) fn program_vectors(
+    passive: PassiveLevel,
     access: &DxgkConfigAccess,
     granted: u32,
     queues: &[u16],
@@ -170,8 +173,7 @@ pub(crate) fn program_vectors(
     let va = map_common_cfg(access);
     if va == 0 {
         crate::diag::record_named_bytes(b"MsiNoCfg", 1);
-        latch_intx(msi::latch_why::NO_CFG);
-        return Err(());
+        return Ok(give_up_on_vectors(passive, 0, msi::latch_why::NO_CFG, &[]));
     }
     let shared_only = crate::diag::read_config_dword(crate::diag::knobs::MSI_VECTORS, 0) != 0;
     // The plan, then (if the device refuses a vector) every queue on message 0, then give up.
@@ -188,11 +190,28 @@ pub(crate) fn program_vectors(
         refusals += 1;
         crate::diag::record_named_bytes(b"MsiRefused", refusals);
     }
-    // Out of plans. The OS connected messages and not the line, so there is no way to the
-    // device in this start: the transport fails (render-only) and the NEXT start asks PnP
-    // for INTx (the latch, applied by `AddDevice`).
-    latch_intx(msi::latch_why::REFUSED);
-    Err(())
+    Ok(give_up_on_vectors(
+        passive,
+        va,
+        msi::latch_why::REFUSED,
+        queues,
+    ))
+}
+
+/// Out of plans: unassign every vector the device may have taken (`va` 0: the cfg could not
+/// be mapped, nothing to write), latch INTx for the next start, and run this one polling-only.
+/// Returns the ISR state for a message-mode start with no vector.
+#[inline(never)]
+fn give_up_on_vectors(passive: PassiveLevel, va: usize, why: u32, queues: &[u16]) -> u32 {
+    if va != 0 {
+        // SAFETY: `va` is the mapped common cfg checked by the caller; PASSIVE, pre-DRIVER_OK.
+        // NO_VECTOR is always accepted; the result is not needed.
+        let _ = unsafe { write_plan(va, &Plan::NONE, queues) };
+    }
+    POLL_ONLY.store(1, Ordering::Release);
+    crate::diag::record_named_bytes(b"MsiVec", 0xFFFF);
+    latch_intx(passive, why);
+    msi::polling_only_state()
 }
 
 // ── Policy at AddDevice: what the device key should ask PnP for ──────────────
@@ -215,20 +234,31 @@ static MSI_SUPPORTED_W: [u16; MSI_SUPPORTED.len()] =
 /// was granted; a mismatch on the first start after a change means the write came late. The
 /// driver follows what PnP granted either way.
 ///
-/// Only LOWERS the value on its own (the latch) or obeys the operator (`MsiMode`): raising it
-/// is the INF's job. Best effort: a failure is a breadcrumb (`MsiKeyWr` = the NTSTATUS), never
+/// Only LOWERS the value on its own (the latch, the breaker) or obeys the operator (`MsiMode`:
+/// 1 lowers it, 2 and 3 raise it, 0 leaves it): the INF is the source of truth otherwise. Best effort: a failure is a breadcrumb (`MsiKeyWr` = the NTSTATUS), never
 /// an error, and `MsiKeyWr` = 0xFFFFFFFF means nothing was written.
 #[inline(never)]
 pub(crate) fn apply_key_policy(passive: PassiveLevel, pdo: PDEVICE_OBJECT) {
     use crate::diag::{knobs, read_config_dword, record_named_bytes as rec};
     let mode = Mode::from_knob(read_config_dword(knobs::MSI_MODE, 0));
-    let latched = read_config_dword(knobs::MSI_LATCH, 0) != 0;
+    let mut latched = read_config_dword(knobs::MSI_LATCH, 0) != 0;
+    // The boot-loop breaker: a message-mode start that never became healthy left its marker.
+    // The marker is consumed here whatever the mode; `MsiMode=3` ignores it, the rest latch INTx.
+    let marker = read_config_dword(knobs::MSI_STARTING, 0) != 0;
+    if marker {
+        rec(b"MsiStarting", 0);
+        if msi::breaker_trips(mode, true) {
+            rec(
+                b"MsiBreaker",
+                read_config_dword(knobs::MSI_BREAKER, 0).saturating_add(1),
+            );
+            latch_intx(passive, msi::latch_why::BREAKER);
+            latched = true;
+        }
+    }
     let action = msi::key_action(mode, latched);
     rec(b"MsiModeEff", mode.code());
     rec(b"MsiWant", action.mirror());
-    if latched && msi::clears_latch(mode) {
-        rec(b"MsiLatch", 0);
-    }
     let Some(value) = action.value() else {
         rec(b"MsiKeyWr", u32::MAX);
         return;
@@ -244,10 +274,13 @@ pub(crate) fn apply_key_policy(passive: PassiveLevel, pdo: PDEVICE_OBJECT) {
 }
 
 /// Ask for INTx at the next start (PASSIVE): the latch `AddDevice` reads. `why` is one of
-/// `msi::latch_why`. Written without a guard against repeats: callers are once per start.
-pub(crate) fn latch_intx(why: u32) {
+/// `msi::latch_why`. FLUSHED to disk: the faults it records are the ones that end in a hang or
+/// a bugcheck, and a latch the lazy writer had not written would be lost with them. Written
+/// without a guard against repeats: callers are once per start.
+pub(crate) fn latch_intx(passive: PassiveLevel, why: u32) {
     crate::diag::record_named_bytes(b"MsiLatch", 1);
     crate::diag::record_named_bytes(b"MsiLatchWhy", why);
+    crate::diag::flush_service_key(passive);
 }
 
 // ── Counting: interrupts and DPCs by vector (DIRQL / DISPATCH, atomics only) ──
@@ -356,19 +389,27 @@ static POLL: AtomicU32 = AtomicU32::new(0);
 static POLL_N: AtomicU32 = AtomicU32::new(0);
 /// This start began with the latch set (an earlier start convicted delivery).
 static LATCHED: AtomicU32 = AtomicU32::new(0);
+/// The device refused every vector plan (or the cfg could not be mapped) and this start runs
+/// polling-only: transport up, no vector programmed (`MsiPollOnly`).
+static POLL_ONLY: AtomicU32 = AtomicU32::new(0);
+/// The `MsiStarting` marker is set in the registry for this start.
+static STARTING: AtomicU32 = AtomicU32::new(0);
+/// Interrupt time (100 ns) when run-time judging was armed; 0 = not armed.
+static ARMED_AT: AtomicU64 = AtomicU64::new(0);
 /// The latch was written by the run-time verdict of this start.
 static RUNTIME_LATCHED: AtomicU32 = AtomicU32::new(0);
 /// Message total and ring pops when the transport went live, for the end-of-start verdict.
 static INTS_BASE: AtomicU32 = AtomicU32::new(0);
 static POPS_BASE: AtomicU32 = AtomicU32::new(0);
 
-/// The transport is built and its ISR state is about to be published (PASSIVE, `StartDevice`,
-/// before the interrupt can be claimed): start a new health generation. `messages` is whether
-/// the device is in message mode; in INTx mode everything below stays inert.
+/// A start begins (PASSIVE, `StartDevice`, right after `probe_granted`, before `init`): the
+/// counters of this start are zeroed (a `pnputil /restart-device` into the other mode must read
+/// as that mode's numbers, not a sum: the image, and these statics, outlive the restart), and a
+/// start that got messages sets the boot-loop breaker's `MsiStarting` marker and flushes it to
+/// disk BEFORE anything that could hang. `finish_start` / `service` clear it once interrupts
+/// arrive. In INTx mode nothing is set.
 #[inline(never)]
-pub(crate) fn on_transport_up(messages: bool) {
-    // The counters are this start's: a `pnputil /restart-device` into the other mode must read
-    // as that mode's numbers, not a sum (the image, and these statics, outlive the restart).
+pub(crate) fn begin_start(passive: PassiveLevel, granted: u32) {
     for c in INTS.iter().chain(DPCS.iter()) {
         c.0.store(0, Ordering::Relaxed);
     }
@@ -380,10 +421,25 @@ pub(crate) fn on_transport_up(messages: bool) {
         &MSI_IDLE,
         &RESCUES,
         &POLL_N,
+        &POLL_ONLY,
     ] {
         c.store(0, Ordering::Relaxed);
     }
     DPC_CAUSE.0.store(0, Ordering::Relaxed);
+    ARMED_AT.store(0, Ordering::Relaxed);
+    STARTING.store(0, Ordering::Relaxed);
+    if granted != 0 {
+        STARTING.store(1, Ordering::Release);
+        crate::diag::record_named_bytes(b"MsiStarting", 1);
+        crate::diag::flush_service_key(passive);
+    }
+}
+
+/// The transport is built and its ISR state is about to be published (PASSIVE, `StartDevice`,
+/// before the interrupt can be claimed): start a new health generation. `messages` is whether
+/// the device is in message mode; in INTx mode everything below stays inert.
+#[inline(never)]
+pub(crate) fn on_transport_up(messages: bool) {
     HEALTH.store(Health::Unknown.code(), Ordering::Relaxed);
     START_VERDICT.store(Health::Unknown.code(), Ordering::Relaxed);
     STREAK.store(0, Ordering::Relaxed);
@@ -397,9 +453,11 @@ pub(crate) fn on_transport_up(messages: bool) {
     let latched = messages && crate::diag::read_config_dword(crate::diag::knobs::MSI_LATCH, 0) != 0;
     LATCHED.store(u32::from(latched), Ordering::Relaxed);
     // An earlier start convicted delivery and PnP still handed this one messages (the key
-    // write came late, or the operator forced MSI-X): poll from the first moment.
+    // write came late, or the operator forced MSI-X), or no vector could be programmed: poll
+    // from the first moment.
+    let polling_only = messages && POLL_ONLY.load(Ordering::Acquire) != 0;
     POLL.store(
-        u32::from(messages && msi::polling_wanted(latched, Health::Unknown)),
+        u32::from(polling_only || (messages && msi::polling_wanted(latched, Health::Unknown))),
         Ordering::Release,
     );
 }
@@ -410,6 +468,8 @@ pub(crate) fn on_transport_up(messages: bool) {
 #[inline(never)]
 pub(crate) fn finish_start(adapter: &AdapterContext) {
     if adapter.msi_state.load(Ordering::Acquire) == 0 {
+        // INTx (or no transport): nothing to judge, but the registry shows THIS start now.
+        publish_counters();
         return;
     }
     let ints = ints_total().wrapping_sub(INTS_BASE.load(Ordering::Relaxed));
@@ -424,7 +484,36 @@ pub(crate) fn finish_start(adapter: &AdapterContext) {
     }
     INTS_PREV.store(ints_total(), Ordering::Relaxed);
     STREAK.store(0, Ordering::Relaxed);
+    ARMED_AT.store(
+        crate::adapter::foreign_scanout::now_100ns().max(1),
+        Ordering::Relaxed,
+    );
     ARMED.store(1, Ordering::Release);
+    // Zeros and the verdict into the registry now, so it shows this start immediately rather
+    // than the last one's numbers until the first periodic mirror.
+    publish_counters();
+}
+
+/// Clear the `MsiStarting` marker once the start proved healthy (`msi::marker_may_clear`:
+/// armed, not convicted, an interrupt arrived, and 3 s old, or `stopping` cleanly). PASSIVE;
+/// one load when the marker is not set. Called from the HPD worker's pass, the periodic mirror
+/// and StopDevice. The clear is not flushed: losing it costs one false trip of the breaker,
+/// which is the safe direction.
+pub(crate) fn service(stopping: bool) {
+    if STARTING.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let convicted = HEALTH.load(Ordering::Relaxed) == Health::Broken.code();
+    if msi::marker_may_clear(
+        ARMED_AT.load(Ordering::Relaxed),
+        crate::adapter::foreign_scanout::now_100ns(),
+        ints_total(),
+        convicted,
+        stopping,
+    ) && STARTING.swap(0, Ordering::AcqRel) != 0
+    {
+        crate::diag::record_named_bytes(b"MsiStarting", 0);
+    }
 }
 
 /// A waiter's polling drain found a completion after its wait slice timed out (PASSIVE).
@@ -434,7 +523,7 @@ pub(crate) fn finish_start(adapter: &AdapterContext) {
 /// so the event queue and the fences are drained too (the rescuer drained the control ring
 /// only). A conviction latches INTx for the next start. The device keeps working meanwhile.
 #[inline(never)]
-pub(crate) fn note_rescue(_passive: PassiveLevel, adapter: &AdapterContext) {
+pub(crate) fn note_rescue(passive: PassiveLevel, adapter: &AdapterContext) {
     RESCUES.fetch_add(1, Ordering::Relaxed);
     if adapter.msi_state.load(Ordering::Acquire) == 0 || ARMED.load(Ordering::Acquire) == 0 {
         return;
@@ -451,7 +540,7 @@ pub(crate) fn note_rescue(_passive: PassiveLevel, adapter: &AdapterContext) {
         POLL.store(1, Ordering::Release);
     }
     if msi::should_latch(step.health) && RUNTIME_LATCHED.swap(1, Ordering::Relaxed) == 0 {
-        latch_intx(msi::latch_why::SILENT);
+        latch_intx(passive, msi::latch_why::SILENT);
     }
     crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
 }
@@ -493,6 +582,7 @@ pub(crate) fn note_poll() {
 pub(crate) fn publish_counters() {
     use crate::diag::record_named_bytes as rec;
     reassess_health();
+    service(false);
     let n = |c: &[Padded], i: usize| c[i].0.load(Ordering::Relaxed);
     rec(b"MsiInts", ints_total());
     rec(b"MsiV0", n(&INTS, 0));
@@ -516,4 +606,5 @@ pub(crate) fn publish_counters() {
     rec(b"MsiStart", START_VERDICT.load(Ordering::Relaxed));
     rec(b"MsiPoll", POLL.load(Ordering::Relaxed));
     rec(b"MsiPollN", POLL_N.load(Ordering::Relaxed));
+    rec(b"MsiPollOnly", POLL_ONLY.load(Ordering::Relaxed));
 }

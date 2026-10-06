@@ -368,6 +368,8 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // 15.18.16: the mirror thread writes it; this step hands it over.
         stall_diag::hpd_enter(site::NVRM_PUBLISH);
         super::escape::nvrm_publish_service(!crate::ddi::flip_announce::worker_idle(adapter));
+        // The boot-loop breaker's marker, once the start has proved healthy (one load otherwise).
+        crate::virtio::msi::service(false);
 
         // Publish the unsampled scanout-bind trace. This is the ONE PASSIVE
         // site that mirrors it; accumulation happens at DIRQL/DISPATCH with

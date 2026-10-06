@@ -1313,17 +1313,24 @@ pub mod knobs {
     pub const MSI_VECTORS: KnobName = KnobName::new(b"MsiVectors");
 
     /// `MsiMode` (default 0 = auto). Which interrupt mode the driver asks PnP for
-    /// (`docs/msi-interrupts.md`): 0 = MSI-X as the INF ships it, INTx once a start
-    /// latched `MsiLatch`; 1 = INTx always; 2 = MSI-X always (ignores and clears the
-    /// latch). Realised by `AddDevice` writing the device key's `MSISupported`, so it
-    /// takes effect at the next device start (`pnputil /restart-device`), and the
-    /// driver follows whatever PnP actually granted either way. Mirrored as `MsiModeEff`.
-    /// Never written by the driver.
+    /// (`docs/msi-interrupts.md`): 0 = follow the INF / the device key as it stands (INTx in
+    /// this package; a latch lowers it); 1 = INTx always; 2 = MSI-X (raises the key to 1), but
+    /// the boot-loop breaker and the latch still win; 3 = MSI-X with no breaker and no latch
+    /// (debugging). Realised by `AddDevice` writing the device key's `MSISupported`, so the
+    /// FIRST restart after a change writes the key and a SECOND restart (or a reboot) applies
+    /// it; the driver follows whatever PnP actually granted either way. Mirrored as
+    /// `MsiModeEff`. Never written by the driver.
     pub const MSI_MODE: KnobName = KnobName::new(b"MsiMode");
-    /// `MsiLatch` (default 0). Set to 1 by the driver when message delivery was convicted
-    /// (or vector set-up failed): the next `AddDevice` then asks PnP for INTx. An operator
-    /// may clear it (0), or set it to 1 to rehearse the fallback.
+    /// `MsiLatch` (default 0). Set to 1 by the driver when message delivery was convicted,
+    /// vector set-up failed, or the breaker tripped: the next `AddDevice` then asks PnP for
+    /// INTx. An operator clears it (0) to retry MSI-X, or sets it to 1 to rehearse the fallback.
     pub const MSI_LATCH: KnobName = KnobName::new(b"MsiLatch");
+    /// `MsiStarting` (default 0). The boot-loop breaker's marker: a start that got messages
+    /// sets it (flushed to disk) and clears it once interrupts arrive; `AddDevice` finding it
+    /// set means the previous start never became healthy.
+    pub const MSI_STARTING: KnobName = KnobName::new(b"MsiStarting");
+    /// `MsiBreaker` (default 0). How many times the breaker tripped (a count the driver keeps).
+    pub const MSI_BREAKER: KnobName = KnobName::new(b"MsiBreaker");
 
     /// Default-enabled capacity notification for retry of a full Venus transport
     /// queue. 0 preserves historical 1 ms polling; no capacity change.

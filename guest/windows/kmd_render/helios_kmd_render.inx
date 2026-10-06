@@ -115,34 +115,38 @@ HKR,,TypesSupported,%REG_DWORD%,7
 [Helios_Install.HW]
 AddReg = Helios_PCI_MSIX
 
-; Message-signalled interrupts, ON by default. The device is vhost-user-test-device-pci with
-; two queues and 3 MSI-X vectors (config, control queue, event queue); a third (RM) queue would
-; bring a fourth. MessageNumberLimit caps what PnP may grant. PnP decides MSI versus the INTx
-; line from MSISupported (read from this device key when the device is started), and the driver
-; follows whatever it is actually given: it reads the MSI-X Enable bit and the resource list at
-; StartDevice, handles INTx when no message was granted, and never programs a vector above the
-; granted count, so a device that offers fewer messages (conduit-vmm) or none still works.
+; Message-signalled interrupts: SHIPPED OFF (INTx), opt-in. The device is vhost-user-test-device-pci
+; with two queues and 3 MSI-X vectors (config, control queue, event queue); a third (RM) queue
+; would bring a fourth. MessageNumberLimit caps what PnP may grant. PnP decides MSI versus the
+; INTx line from MSISupported (read from this device key when the device is started), and the
+; driver follows whatever it is actually given: it reads the MSI-X Enable bit and the resource
+; list at StartDevice, handles INTx when no message was granted, and never programs a vector
+; above the granted count, so a device that offers fewer messages (conduit-vmm) or none still
+; works.
 ;
-; MSISupported is written WITHOUT the NOCLOBBER flag (0x00000002) on purpose. It used to be
-; shipped as 0 WITH it, so every existing install holds an INF-written 0 that NOCLOBBER would
-; keep through any update: the flip would never reach them. Without the flag, every install and
-; every in-place update of this package writes 1. What survives an update is therefore not a
-; hand-set value in this key but the service-key knob MsiMode (1 = force INTx, 2 = force MSI-X)
-; and the INTx latch (MsiLatch) the driver sets itself when message delivery fails; the driver
-; applies both to this value at AddDevice (it only lowers it, or obeys MsiMode), so a forced or
-; latched INTx also survives the update, from the second start on at the latest.
-; PnP reads the value again at each device start, so a change takes effect at the next
-; `pnputil /restart-device` (a driver update restarts the device, or asks for a reboot).
+; MSISupported is written WITHOUT the NOCLOBBER flag (0x00000002) on purpose: every install and
+; every in-place update of this package resets it to 0, so this INF is the single source of
+; truth for the shipped default, and a hand-edited or driver-latched value does not outlive an
+; update. (Earlier packages wrote 0 WITH NOCLOBBER, which is why a later flip of the default to 1
+; must not use the flag either: it would never reach an install that holds that 0.) What survives
+; an update is the service-key knob MsiMode (1 = force
+; INTx, 2 = MSI-X opt-in, 3 = MSI-X without the breaker): the driver applies it to this value
+; at AddDevice, for the NEXT start (the first restart after a change writes the key, a second
+; restart or a reboot applies it), and it only ever lowers the value on its own (a latched
+; start, the boot-loop breaker).
 ;
+; To try MSI-X (docs/msi-interrupts.md, "Minimum safe test procedure"):
+;   reg add "HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render" /v MsiMode /t REG_DWORD /d 2 /f
+;   pnputil /restart-device "<instance id>"      (writes the key; restart again to apply it)
+; Back to INTx: MsiMode = 1 (or delete it and reinstall the package, which writes 0 below).
 ; Recovery from a start that does not come up (no display): in safe mode or offline, set
-;   reg add "HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render" /v MsiMode /t REG_DWORD /d 1 /f
-; (the driver then writes MSISupported=0 here at AddDevice), or set it directly:
 ;   reg add "HKLM\SYSTEM\CurrentControlSet\Enum\<instance path>\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" /v MSISupported /t REG_DWORD /d 0 /f
-; See docs/msi-interrupts.md.
+; and MsiMode = 1 in the service key. The driver's boot-loop breaker also latches INTx by
+; itself after one message-mode start that never became healthy.
 [Helios_PCI_MSIX]
 HKR, "Interrupt Management",, 0x00000010
 HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
-HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, %REG_DWORD%, 1
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, %REG_DWORD%, 0
 HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, %REG_DWORD%, 3
 
 ; ──── Software key / UMD registration ──────────────────────────────────────
