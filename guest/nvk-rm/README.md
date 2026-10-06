@@ -224,8 +224,8 @@ presents fine.
 
 - `NVK_HELIOS_WSI=0`: off (GDI copy, which fails with
   `VK_ERROR_MEMORY_MAP_FAILED` on an invisible desktop).
-- `MESA_WSI_SCANOUT_HZ`: FIFO pacing without a vblank event, default 60,
-  0 = unpaced.
+- Unpaced by default (FIFO pacing is to come from the KMD's present path,
+  not a timer); `MESA_WSI_SCANOUT_HZ=N` caps presents at N per second.
 - No release event from the host yet: an image comes back two presents
   after it was shown, so use three or more images.
 - If the images cannot be exported (no render node, old librmclient without
@@ -237,9 +237,9 @@ triangle on a hidden window, `vk_scanout_present [seconds] [width height]
 
 | run | result |
 |---|---|
-| FIFO, 30 s | 60.0 fps, 1801 flips, 0 failed; KMD `NvFlip` +1801 |
-| FIFO, 60 s, host busy compiling | 51.7 fps average before the pacing fix for late frames, 3105 flips, 0 failed |
-| `MESA_WSI_SCANOUT_HZ=0`, 10 s | 2784 fps, 27841 flips, 0 failed |
+| KMD 22.22.308, scanout source (SET/PRESENT/RELEASE), unpaced, 10 s | 1234 fps, 12338 flips, 0 failed; source 1920x1080 stride 7680 XR24 linear, lapse 2000 ms, released on destroy |
+| KMD 22.22.307, raw ScanoutFlip, unpaced, 10 s | 2784 fps, 27841 flips, 0 failed; KMD `NvFlip` +27841 |
+| KMD 22.22.307, `MESA_WSI_SCANOUT_HZ=60`, 30 s | 60.0 fps, 1801 flips, 0 failed; `NvFlip` +1801 |
 | `NVK_HELIOS_DRI=99` | "cannot open host render node 99", falls back to GDI |
 
 Next: block-linear images with NVIDIA's DRM modifier (a linear image is

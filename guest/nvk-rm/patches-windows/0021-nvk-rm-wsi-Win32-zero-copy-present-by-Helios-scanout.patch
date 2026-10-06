@@ -1,4 +1,4 @@
-From 47c888d56f13372c209c07a68766944a1477154d Mon Sep 17 00:00:00 2001
+From 70f12f2251c71555b22ebe5f98ec4b2007ec1cc9 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Tue, 6 Oct 2026 02:32:05 +0200
 Subject: [PATCH] nvk/rm, wsi: Win32 zero-copy present by Helios scanout
@@ -21,9 +21,10 @@ vulkan/wsi (Win32):
 - No release event yet: a presented image is held until two later
   presents (one on screen, one the display may still be reading), so
   three or more images rotate FIFO-like.
-- FIFO is paced at MESA_WSI_SCANOUT_HZ (default 60, 0 = unpaced) with a
-  high-resolution waitable timer; Sleep()'s 15.6 ms tick held it at
-  32 fps.
+- Unpaced by default: FIFO pacing is to come from the present path (the
+  KMD's scanout source, vblank), not a fixed timer. MESA_WSI_SCANOUT_HZ=N
+  is an opt-in cap, with a high-resolution waitable timer (Sleep()'s
+  15.6 ms tick held a 60 Hz cap at 32 fps).
 - Formats B8G8R8A8 and R8G8B8A8 (UNORM/SRGB) as XRGB8888/XBGR8888, linear.
   If the images cannot be exported the swapchain falls back to GDI.
 
@@ -48,9 +49,9 @@ nvk/rm (Windows):
   not 0. Flip totals are logged when the device is destroyed.
 
 In win11 on an RTX 5090 (Helios KMD 22.22.307.0), vk_scanout_present at
-1920x1080 with three images: 60.0 fps for 30 s (1801 flips, 0 failed,
-the KMD's NvFlip counter +1801); unpaced, 2784 fps (27841 flips in 10 s,
-0 failed).
+1920x1080 with three images: unpaced 2784 fps (27841 flips in 10 s,
+0 failed, the KMD's NvFlip counter +27841); capped at 60 Hz, 60.0 fps for
+30 s (1801 flips, 0 failed).
 
 Still to do: block-linear images with NVIDIA's DRM modifier (NVK renders
 a linear swapchain image through a tiled shadow and a copy), a release
@@ -66,8 +67,8 @@ event from the host instead of the fixed hold, and vblank pacing.
  src/vulkan/wsi/wsi_common.c                 |   5 +
  src/vulkan/wsi/wsi_common.h                 |  28 ++
  src/vulkan/wsi/wsi_common_private.h         |   6 +
- src/vulkan/wsi/wsi_common_win32.cpp         | 248 +++++++++++-
- 11 files changed, 835 insertions(+), 7 deletions(-)
+ src/vulkan/wsi/wsi_common_win32.cpp         | 250 ++++++++++++-
+ 11 files changed, 837 insertions(+), 7 deletions(-)
  create mode 100644 src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
 
 diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
@@ -850,7 +851,7 @@ index 3d2cd7d..5aa8f48 100644
  wsi_cpu_image_needs_buffer_blit(const struct wsi_device *wsi,
                                  const struct wsi_cpu_image_params *params);
 diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
-index 0622857..5afaa51 100644
+index 0622857..55f416c 100644
 --- a/src/vulkan/wsi/wsi_common_win32.cpp
 +++ b/src/vulkan/wsi/wsi_common_win32.cpp
 @@ -27,6 +27,8 @@
@@ -862,7 +863,7 @@ index 0622857..5afaa51 100644
  #include "util/timespec.h"
  #include "util/u_thread.h"
  #include "vk_format.h"
-@@ -109,6 +111,28 @@ struct wsi_win32_swapchain {
+@@ -109,6 +111,30 @@ struct wsi_win32_swapchain {
     VkExtent2D                 extent;
     HWND wnd;
     HDC chain_dc;
@@ -877,7 +878,9 @@ index 0622857..5afaa51 100644
 +       * later presents.
 +       */
 +      uint32_t hold;
-+      /* FIFO pacing without a vblank event: at most this often, 0 = never */
++      /* Optional cap (MESA_WSI_SCANOUT_HZ, default 0 = unpaced): real FIFO
++       * pacing belongs to the present path (the KMD), not a fixed timer.
++       */
 +      uint64_t period_ns;
 +      uint64_t next_flip_ns;
 +      /* Sleep() has the scheduler tick's granularity (15.6 ms by default),
@@ -891,7 +894,7 @@ index 0622857..5afaa51 100644
     struct wsi_win32_image     images[0];
  };
  
-@@ -558,6 +582,155 @@ wsi_dxgi_configure_image(const struct wsi_swapchain *chain,
+@@ -558,6 +584,155 @@ wsi_dxgi_configure_image(const struct wsi_swapchain *chain,
     return VK_SUCCESS;
  }
  
@@ -987,7 +990,7 @@ index 0622857..5afaa51 100644
 +{
 +   const struct wsi_device *wsi = chain->wsi->wsi;
 +
-+   /* FIFO without a vblank to wait for: do not outrun the display */
++   /* Opt-in cap (MESA_WSI_SCANOUT_HZ): there is no vblank to wait for yet */
 +   if (chain->scanout.period_ns != 0) {
 +      const uint64_t now = os_time_get_nano();
 +      if (now < chain->scanout.next_flip_ns) {
@@ -1047,7 +1050,7 @@ index 0622857..5afaa51 100644
  static VkResult
  wsi_win32_image_init(VkDevice device_h,
                       struct wsi_win32_swapchain *chain,
-@@ -574,7 +747,7 @@ wsi_win32_image_init(VkDevice device_h,
+@@ -574,7 +749,7 @@ wsi_win32_image_init(VkDevice device_h,
     chain->wnd = win32_surface->hwnd;
     image->chain = chain;
  
@@ -1056,7 +1059,7 @@ index 0622857..5afaa51 100644
        return VK_SUCCESS;
  
     chain->chain_dc = GetDC(chain->wnd);
-@@ -625,10 +798,17 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
+@@ -625,10 +800,17 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
     struct wsi_win32_swapchain *chain =
        (struct wsi_win32_swapchain *) drv_chain;
  
@@ -1075,7 +1078,7 @@ index 0622857..5afaa51 100644
  
     if (chain->surface->current_swapchain == chain)
        chain->surface->current_swapchain = NULL;
-@@ -838,6 +1018,9 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
+@@ -838,6 +1020,9 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
     if (chain->dxgi)
        return wsi_win32_queue_present_dxgi(chain, image, damage);
  
@@ -1085,7 +1088,7 @@ index 0622857..5afaa51 100644
     char *ptr = (char *)image->base.cpu_map;
     char *dptr = (char *)image->sw.ppvBits;
  
-@@ -977,15 +1160,33 @@ wsi_win32_surface_create_swapchain(
+@@ -977,15 +1162,33 @@ wsi_win32_surface_create_swapchain(
        { WSI_IMAGE_TYPE_CPU },
     };
  
@@ -1122,7 +1125,7 @@ index 0622857..5afaa51 100644
     if (result != VK_SUCCESS) {
        u_cnd_monotonic_destroy(&chain->acquire_cond);
        mtx_destroy(&chain->acquire_mutex);
-@@ -1006,6 +1207,22 @@ wsi_win32_surface_create_swapchain(
+@@ -1006,6 +1209,22 @@ wsi_win32_surface_create_swapchain(
  
     chain->surface = surface;
  
@@ -1130,7 +1133,7 @@ index 0622857..5afaa51 100644
 +      chain->scanout.enabled = true;
 +      chain->scanout.fourcc = scanout_fourcc;
 +      chain->scanout.hold = MIN2(2u, num_images - 1);
-+      const uint64_t hz = debug_get_num_option("MESA_WSI_SCANOUT_HZ", 60);
++      const uint64_t hz = debug_get_num_option("MESA_WSI_SCANOUT_HZ", 0);
 +      chain->scanout.period_ns =
 +         chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR && hz > 0 ?
 +         1000000000ull / hz : 0;
@@ -1145,7 +1148,7 @@ index 0622857..5afaa51 100644
     if (image_params->image_type == WSI_IMAGE_TYPE_DXGI) {
        result = wsi_win32_surface_create_swapchain_dxgi(surface, device, wsi, create_info, chain);
        if (result != VK_SUCCESS)
-@@ -1017,11 +1234,30 @@ wsi_win32_surface_create_swapchain(
+@@ -1017,11 +1236,30 @@ wsi_win32_surface_create_swapchain(
                                      create_info, allocator,
                                      &chain->images[image]);
        if (result != VK_SUCCESS)
