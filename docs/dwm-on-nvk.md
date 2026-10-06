@@ -104,6 +104,29 @@ Expected leftovers on Venus:
   video and HDR content.
 * The secure desktop until the shell has soaked.
 
+#### 4.2.1a Measured moves (22.22.326.1, 2026-10-06, Venus DWM with ForeignImport=1)
+
+Each category on NVK by `NvkAllowList` only (`Icd=venus` kept), its processes restarted in the
+user session, checked for: NVK device, resource ids, DWM's opens of their surfaces, a screen
+capture of the composed window, crashes. Built into the UMD as `kBuiltinNvkDefault`, applied with
+`HKLM\SOFTWARE\Helios!NvkDefaults=1` (default 0; `NvkDenyList` still wins).
+
+| category | verdict | evidence / blocker |
+|---|---|---|
+| csrss, winlogon, fontdrvhost, rdpclip | move | never create a D3D device (no UMD log in 1038 logs) |
+| taskmgr | move | NVK device, 3 resource ids, window composed |
+| mmc | move | no D3D device |
+| startmenuexperiencehost | move | NVK, 5 resource ids, A8 surfaces opened by DWM, Start menu drawn |
+| systemsettings + applicationframehost | move | NVK, 3 and 12 resource ids, Settings drawn |
+| explorer | blocked | taskbar, wallpaper, File Explorer drawn on NVK, but a device-wide DEVICE_REMOVED (every process, Venus too; DWM restarted) followed within a minute, after an NVK frame-wait timeout in explorer; cause open (KMD/host) |
+| shellexperiencehost, textinputhost | blocked | ShellExperienceHost crashed at its NVK start (Windows.UI.Xaml c000027b, no UMD log); textinputhost caught in the removal |
+| searchhost | n/a | crash-loops on Venus as well since 14:36 (KERNELBASE 0xe06d7363) |
+| msedge, msedgewebview2 (Chromium family) | blocked | pages render, video stalls on NVK: YouTube VP9 frozen at 0.7 s, local H.264 6 frames in 10 s (Venus: 600). GPU process writes no UMD log (sandbox) |
+| VLC (D3D11 output) | software decode: move; D3D11VA: blocked | D3D11VA on NVK shows green: decode into an NV12 texture array sampled through R8/R8G8 plane SRVs |
+| MPC-HC (MPC Video Renderer, LAV) | not measured | NVK device + video DDI, playback did not start from the command line |
+| nvidia share.exe | removed from the list | no NVIDIA driver in the guest |
+| logonui, consent, lockapp | after the shell | |
+
 #### 4.2.2 What NVK-to-NVK sharing still lacks (blocks the list above)
 
 | gap | fix | owner |

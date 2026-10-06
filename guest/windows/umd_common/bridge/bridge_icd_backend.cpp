@@ -50,6 +50,30 @@ constexpr const char* kBuiltinDeny[] = {
   "cefsharp.browsersubprocess.exe",
 };
 
+// Deny-list entries measured to work on NVK under a Venus DWM
+// (docs/dwm-on-nvk.md 4.2.1, 22.22.326.1, 2026-10-06): they make an NVK
+// device, DWM opens their surfaces (A8 included), their windows compose, no
+// crash. With HKLM\SOFTWARE\Helios!NvkDefaults=1 (REG_DWORD, default 0)
+// they go to NVK even under Icd=venus and leave the built-in deny-list, as if
+// NvkAllowList named them; an explicit NvkDenyList still wins. Off by default
+// until the desktop moves to NVK as a whole (DwmIcd).
+//  - csrss, winlogon, fontdrvhost, rdpclip: never create a D3D device (no UMD
+//    log in 1038 logs), listed for completeness;
+//  - taskmgr (NVK device, 3 resource ids), mmc (no D3D device);
+//  - startmenuexperiencehost (NVK, 5 resource ids, Start menu drawn);
+//  - systemsettings + applicationframehost (Settings: NVK, 3 and 12 resource
+//    ids, window drawn).
+// Not here, and why: explorer, shellexperiencehost, searchhost, textinputhost
+// (a device-wide removal while explorer ran on NVK; ShellExperienceHost
+// crashed at its NVK start; SearchHost crash-loops on Venus too), msedge and
+// the Chromium family (video frames stall on NVK), video players (VLC's
+// D3D11VA output is green on NVK), logonui/consent/lockapp (after the shell).
+constexpr const char* kBuiltinNvkDefault[] = {
+  "csrss.exe", "winlogon.exe", "fontdrvhost.exe", "rdpclip.exe",
+  "taskmgr.exe", "mmc.exe", "startmenuexperiencehost.exe",
+  "systemsettings.exe", "applicationframehost.exe",
+};
+
 void lower_ascii(char* s) {
   for (; *s; s++) {
     if (*s >= 'A' && *s <= 'Z') *s = char(*s - 'A' + 'a');
@@ -101,9 +125,29 @@ bool list_has(const char* list, const char* exe) {
   return false;
 }
 
+// NvkDefaults=1 and `exe` is one of kBuiltinNvkDefault.
+bool nvk_default(const char* exe) {
+  DWORD on = 0;
+  if (!reg_dword("NvkDefaults", &on) || on == 0)
+    return false;
+  for (const char* name : kBuiltinNvkDefault) {
+    if (std::strcmp(name, exe) == 0)
+      return true;
+  }
+  return false;
+}
+
+// NvkDenyList (REG_SZ) names `exe`.
+bool explicitly_denied(const char* exe) {
+  char deny[4096];
+  return reg_sz("NvkDenyList", deny, sizeof(deny)) && list_has(deny, exe);
+}
+
 bool denied(const char* exe, const char** why) {
   char allow[4096];
   if (reg_sz("NvkAllowList", allow, sizeof(allow)) && list_has(allow, exe))
+    return false;
+  if (nvk_default(exe) && !explicitly_denied(exe))
     return false;
   char deny[4096];
   if (reg_sz("NvkDenyList", deny, sizeof(deny))) {
@@ -324,7 +368,8 @@ IcdBackendChoice decide() {
     // per-category lever of docs/dwm-on-nvk.md 4.2 (move one category off
     // the Venus defaults at a time, Icd=venus staying for everything else).
     char allow[4096];
-    const bool allowed = reg_sz("NvkAllowList", allow, sizeof(allow)) && list_has(allow, c.exe);
+    const bool allowed = (reg_sz("NvkAllowList", allow, sizeof(allow)) && list_has(allow, c.exe))
+      || (nvk_default(c.exe) && !explicitly_denied(c.exe));
     char mode[16];
     if (!allowed && reg_sz("Icd", mode, sizeof(mode))) {
       lower_ascii(mode);
@@ -334,7 +379,7 @@ IcdBackendChoice decide() {
       }
     }
     if (allowed)
-      c.reason = "NvkAllowList names this executable";
+      c.reason = "NvkAllowList or NvkDefaults names this executable";
 #endif
     const char* why = nullptr;
     if (denied(c.exe, &why)) {
