@@ -10,16 +10,21 @@ every workload has an NVK path.
 This file is the working plan. It is updated as stages land; the numbers are
 measurements, with the setup named.
 
-## Where it stands (2026-10-06)
+## Where it stands (2026-10-06, evening)
+
+Measured in the win11 guest (5120x1440@240) through the installed driver
+package 22.22.320.1 (KMD v320), NVK chosen per process unless noted.
 
 | | Venus path (today's default) | NVK-on-RM |
 |---|---|---|
-| Unigine Heaven, D3D11, 1600x900 Medium | 139 fps | 357 fps mean, p99 ~5 ms (full NVK stack, zero-copy present, release) |
-| Host, native OpenGL Heaven, for reference | | ~350 fps |
-| `vk_scanout_present` demo, 1080p | | 11748 fps (block-linear, zero copies) |
-| OpenGL gears (wgl), 1280x720 | 831 fps | 4148–4763 fps (Zink on NVK) |
-| D3D12 triangle + compute, 1280x720 | (was broken; host fix pending) | ~5300 fps (vkd3d on NVK, standalone) |
-| H.264 decode, 1080p (Vulkan Video) | | ~925 fps, bit-exact (patch 0035) |
+| Unigine Heaven, D3D11, 1600x900 Medium, through the installed UMD | 171 fps | 377 fps (render thread 2.6% kernel time; native OpenGL Heaven on the host ~350 fps) |
+| D3D11 spin test: zero-copy scanout / composed by DWM | 7900–8800 fps (Venus) | 4400–4900 / 9600–13500 fps |
+| D3D12 triangle + compute, 1280x720, zero-copy present | 900–1270 fps | 1100–4450 fps |
+| OpenGL gears (wgl, Zink), 1280x720 | 775–873 fps | 4200–4350 fps |
+| H.264 decode through the UMD's D3D11 video DDI | | 5 of 6 clips bit-exact (custom scaling matrices unsupported by NVK) |
+| Cross-process shared surfaces and keyed mutex | pass | pass (releaser CPU wait; the GPU-ordered hand-off ledger is being fixed) |
+| Live driver replacement | DWM and the shell survive (device-lost handling in the Venus ICD and the UMD) | |
+| DWM on NVK (`DwmIcd=nvk`, `ForeignFlip=1`) | | runs; its first frames reach the screen with zero copies, then it stalls on flip completion (KMD v321 fix) |
 
 What made NVK fast, in the order it was found:
 
@@ -28,15 +33,14 @@ What made NVK fast, in the order it was found:
 2. Zero-copy present through the KMD's scanout source, block-linear swapchain
    images: 297 → ~350 fps; the demo doubled.
 3. RM backend fixes measured on the host against NVIDIA's driver: cacheable
-   GPU mappings of system memory, compression, ZCULL, release builds. On the
-   host these bring NVK to parity with NVIDIA in every measured category; in
-   Heaven at Medium they are within run-to-run noise (Heaven is GPU-bound).
+   GPU mappings of system memory, compression, ZCULL, release builds.
 4. NVK per-draw cost (patches-common 0001–0007): from 2.2–5.5x NVIDIA's to
    0.89–1.24x, bit-identical output.
-5. RM forwarding: a CPU map + unmap went 52 ms → 0.4 ms (QEMU patch 0008, one
-   memslot per shared-memory region; KMD v309 registry counters off the escape
-   path); channel open/close 2.2 ms → 0.11 ms. An RM control still costs
-   ~55 µs from the guest (INTx path; MSI-X is next).
+5. RM forwarding: a CPU map + unmap went 52 ms → 0.4 ms (QEMU patch 0008);
+   channel open/close 2.2 ms → 0.11 ms.
+6. The installed UMD stopped sending frames NVK already flipped to scanout
+   through DWM's redirection blit as well (a full-frame copy per frame on the
+   render thread): Heaven 198 → 377 fps.
 
 ## Architecture
 
@@ -55,36 +59,42 @@ flips frames.
 
 ## Stages
 
-| Stage | What | State | Owner / branch |
+| Stage | What | State | Branch |
 |---|---|---|---|
-| S1 | Heaven via app-local DXVK on NVK | done (297 → ~350 fps) | `spike/heaven-dxvk-nvk`, `feat/nvk-rm-bar-heap` |
-| S2 | Zero-copy present for NVK apps | done (linear and block-linear) | `feat/nvk-rm-windows-wsi`, `feat/nvk-rm-wsi-blocklinear` |
-| S3 | The Helios D3D11 UMD runs DXVK on NVK for every app, global with a deny-list, Venus fallback | built; going in as one combined package with S4/S5/S6/packaging on KMD v314 | `feat/s3-umd-on-nvk` → `feat/umd-nvk-combined` |
-| S4 | GPU fences instead of the CPU wait at present (RM semaphore-surface fences as the WDDM present boundary) | KMD marker in v313; UMD/NVK done (present thread 1228 → 73 µs per frame under load) | `feat/s4-rm-fences` |
-| S5 | D3D12 on NVK (vkd3d-proton in the Helios UMD12); FL 12_0, SM 6.8, no DXR | built; standalone D3D12 on NVK works | `feat/s5-d3d12-on-nvk` |
-| S6 | DWM on NVK, the KMD's own RM client, Venus removed | KMD RM client levels 1–2 pass in win11 (v312), levels 3–4 in v314; cross-process NVK sharing built (KMD v313 op + host msg 31); DWM design written | `kmd/rm-client*`, `feat/s6-shared-surfaces`, `feat/s6-backend` |
+| S1 | Heaven via app-local DXVK on NVK | done | `spike/heaven-dxvk-nvk`, `feat/nvk-rm-bar-heap` |
+| S2 | Zero-copy present for NVK apps | done (linear and block-linear; three scanout images) | `feat/nvk-rm-windows-wsi`, `feat/nvk-rm-wsi-blocklinear` |
+| S3 | The Helios D3D11 UMD runs DXVK on NVK, global with a deny-list, Venus fallback | done, in the combined package | `feat/umd-nvk-combined` |
+| S4 | RM fences as the present boundary | done | `feat/s4-rm-fences` |
+| S5 | D3D12 on NVK (vkd3d-proton in UMD12) | done (NVK and Venus) | `feat/umd-nvk-combined` |
+| S6a | Cross-process shared surfaces and keyed mutex on NVK | done with a releaser CPU wait; GPU-ordered hand-off ledger in progress | `fix/s6-handoff-ledger` |
+| S6b | DWM on NVK | DWM runs on NVK; KMD `ForeignFlip` flips its buffers zero-copy; flip completion for every foreign flip in KMD v321 | `feat/dwm-on-nvk`, KMD `worktree-kmd-start-debug` |
+| S6c | Shrink the deny-list (each entry exists only because of NVK↔Venus sharing) | system processes, task manager and RGB video players can move now; the shell needs 8 bpp shared ids, browsers need NV12/P010/fp16 ids (guest side done, KMD v321) | `feat/nvk-share-formats`, `docs/dwm-on-nvk.md` |
+| S6d | Venus removed | after S6c; DXR titles stay on Venus until NVK has ray tracing | |
 
-Decisions taken: NVK is global with a deny-list (not per app); the Helios DXVK
-fork is used (built without its Venus paths on NVK); vkd3d's FL12
-conservative-raster check is relaxed for NVK; the KMD moves to its own RM
-client; KMD builds are installed live (an occasional reboot during the swap is
-accepted).
+Measured and decided on the way: the KMD's own RM-memory desktop primary
+(level 5) works (allocation, map, flips) but is only shown before DWM starts,
+so it does not carry the desktop; DWM opens no KMD-made surfaces, so
+RM-backed GDI redirection is not needed; the KMD authors 128-byte-aligned
+pitches for anything NVK must import.
+
+Decisions taken: NVK is global with a deny-list; the Helios DXVK fork is used;
+vkd3d's FL12 conservative-raster check is relaxed for NVK; the KMD has its own
+RM client; KMD builds are installed live.
 
 ## Workloads outside D3D11 and the desktop
 
 | Workload | Plan |
 |---|---|
-| D3D12 games | S5 |
+| D3D12 games | S5, done |
 | Native Vulkan games | NVK registered per adapter by the driver package (done, `feat/helios-nvk-package`) |
 | OpenGL apps | Zink on NVK as the adapter's OpenGL ICD (done; OpenGL 4.6) |
-| Video decode/encode (browsers, players) | H.264 Vulkan Video decode on NVK works (0035); a DXVK D3D11VA decoder for browsers is in progress; until then video apps stay on the deny-list (Venus) |
+| Video decode/encode (browsers, players) | H.264 decode through the UMD's D3D11 video DDI on NVK works (bit-exact); browsers also need NV12/P010 shared ids (S6c) |
 | Ray tracing (DXR, VK_KHR_ray_tracing) | NVK has none; these stay on Venus until upstream adds it |
 | Fullscreen exclusive, multi-monitor, HDR, sleep/resume | Test once the desktop is on NVK |
 
 ## Performance work still open
 
-- NVK per-draw cost: 2–5x NVIDIA's (~25 ns vs ~6 ns per draw; dynamic UBO
-  offsets and descriptor switches worst). `perf/nvk-per-draw`.
+- Venus present path: Heaven at 171 fps through the UMD (snapshot/WindowedBlt route), not yet profiled.
 - MSI-X for the GPU device (3 vectors are exposed; the KMD path is merged but
   dormant) to cut the ~55 µs per RM call.
 - DXVK's own shader translation at start-up (~0.6 s hitch on every launch;
@@ -95,23 +105,14 @@ accepted).
 
 ## Stability work still open
 
-- Cross-process keyed-mutex hand-offs misorder on Venus and NVK (found
-  2026-10-06); the UMD cannot see keyed-mutex calls, so the fix is a GPU-side
-  completion boundary on flushes of devices holding shared resources
-  (`kmd/flush-completion`).
-- An intermittent access violation in ntdll at start-up/exit of NVK test
-  processes (~2 in 25) is being hunted (`fix/nvk-rm-win-crash`).
-- D3D12 on Venus failed device creation: the conduit-venus sandbox blocked
-  libcuda when VK_KHR_acceleration_structure is enabled. Fixed on
-  `fix/d3d12-venus-create-device`, not yet installed.
-
-- KMD v312: paging data-safety fixes (a skipped eviction must not be followed
-  by a stale page-in), the pin leak on process exit. v311 already stops the
-  0x10E bugcheck (BuildPagingBuffer no longer returns a status VidMm treats as
-  illegal; an oversized transfer is clamped).
-- Live driver replacement: survived on v311; the stop/start breadcrumbs
-  (StopStg, StopMs, StopBlobs, StopSwept, StartStg) make the next failure
-  readable.
+- NVK crash at process exit when the hand-off ledger is on (imported-memory
+  lifetime, near `nvkmd_mem_unref`); timing-dependent.
+- Venus ICD: a NULL object on the D3D device teardown path after a device
+  loss (seen once at a live swap).
+- SearchHost.exe crash loop in the guest (a C++ exception in Windows' search
+  UI; not in the Helios drivers as far as the logs show).
+- A full host disk pauses the VM; after the resume the backend's NVIDIA side
+  needs a full restart.
 
 ## NVK patch stack (Windows)
 
