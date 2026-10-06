@@ -171,6 +171,8 @@ mod ffi {
         unsafe fn flush_gate_point(
             self: &HeliosDxvkDevice,
             mode: u32,
+            resources: *const usize,
+            resource_count: u32,
             ctx_id: *mut u32,
             value32: *mut u32,
             cookie: *mut u64,
@@ -806,14 +808,23 @@ impl BridgeDevice {
 
     /// Flush gate: flush and get what the HEFL packet carries (see
     /// [`FlushGatePoint`]). `mode` is one of `FLUSH_GATE_*`.
-    pub(crate) fn flush_gate_point(&self, mode: u32) -> FlushGatePoint {
+    pub(crate) fn flush_gate_point(&self, mode: u32, publish: &[usize]) -> FlushGatePoint {
         let Some(d) = self.get() else {
             return FlushGatePoint::Unavailable;
         };
         let (mut ctx, mut value, mut cookie, mut fence, mut fence_value) = (0u32, 0u32, 0u64, 0u32, 0u64);
         // SAFETY: every out-pointer borrows a live local for this synchronous call.
         let r = unsafe {
-            d.flush_gate_point(mode, &mut ctx, &mut value, &mut cookie, &mut fence, &mut fence_value)
+            d.flush_gate_point(
+                mode,
+                publish.as_ptr(),
+                publish.len() as u32,
+                &mut ctx,
+                &mut value,
+                &mut cookie,
+                &mut fence,
+                &mut fence_value,
+            )
         };
         match r {
             0 => FlushGatePoint::Nothing,

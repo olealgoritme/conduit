@@ -385,7 +385,8 @@ pub struct HeliosDevice {
     /// (docs/shared-surfaces.md §4): the runtime's keyed-mutex release is
     /// ordered against our DMA buffers only, NVK's GPU work is not in them, and
     /// the keyed mutex itself is invisible at the DDI.
-    pub nvk_keyed_resources: std::sync::Mutex<Vec<usize>>,
+    /// `(pDrvPrivate, created here)`; an opened resource has `false`.
+    pub nvk_keyed_resources: std::sync::Mutex<Vec<(usize, bool)>>,
     pub direct_scanout_allocations:
         std::sync::Mutex<Vec<(u32, helios_protocol::HeliosPresentPrivateData)>>,
     /// Runtime corelayer handle + callbacks (pfnSetErrorCb) so VOID-returning

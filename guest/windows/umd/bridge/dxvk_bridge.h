@@ -153,7 +153,12 @@ struct HeliosDxvkDevice {
   //                     *fence_value diagnostic).
   // Returns 0 = nothing recorded since the previous gate (send nothing),
   // 1 = ready, -1 = this mode is unavailable here (fall back), -2 = failed.
+  // kFlushGateStream also publishes the point on every resource in
+  // `resources` (ID3D11Resource* as size_t) that has an allocation producer
+  // binding, so an importer's read waits for it.
   std::int32_t flush_gate_point(std::uint32_t mode,
+                                const std::size_t* resources,
+                                std::uint32_t resource_count,
                                 std::uint32_t* ctx_id,
                                 std::uint32_t* value32,
                                 std::uint64_t* cookie,

@@ -126,6 +126,28 @@ the submission thread. Without a carrier the CPU wait above remains (NVK by defa
 `HELIOS_KEYED_FLUSH_WAIT=1`). A failed packet never fails the flush. `d3d11_share keyed-load`
 prints the KMD's `FlGRec FlGStrm FlGFnc FlGWire FlGDeg` deltas.
 
+**Revised after 316.1/317.1 (flush-gate.md section 9; `fix/s6-keyed-acquire`):** the `HEFL` gate
+alone did not order the hand-off (keyed-load stale in 19/20 rounds on Venus, 20/20 on NVK, with
+`FlGStrm`/`FlGFnc` counting): it withholds the releaser's WDDM fence, but dxgkrnl's keyed mutex
+only holds the acquirer's DMA buffers, and the acquirer's reads go through the Venus ring or the
+RM channel. And its packet heads the adapter-wide WDDM queue until the point retires (DWM's
+D3D12 swap-chain buffers turned that into a 250 ms stall per frame, 969 -> 4 fps). Now:
+
+* Venus: the flush point is published on the shared allocations the device created
+  (`HeliosProducerBinding::publish`, DXVK patch 0006 retains one producer operation per
+  allocation on the signal's command list). An importer's read of the image already waits for the
+  allocation's announced epoch in its own submission worker (`heliosPresentWaitBeforeRefresh`), so
+  the acquirer, and only the acquirer, waits for exactly this producer. Devices that only opened
+  shared surfaces (DWM) do nothing. Not covered: a creator reading what an opener wrote (DXVK waits
+  only on imported images); `HELIOS_FLUSH_GATE_PUBLISH=all` publishes opened resources too.
+* NVK: the releaser completes its work on the CPU at the hand-off (an acquirer-side wait needs the
+  releaser's RM semaphore surface in the acquirer: RmResourceImport of the semaphore memory plus a
+  semaphore acquire before the first read; not done).
+* `HEFL` is off by default (`HELIOS_FLUSH_GATE_HEFL=1` for experiments).
+* Diagnosis knobs (process environment): `HELIOS_FLUSH_GATE_CPU_WAIT=1` (every backend completes on
+  the CPU), `=0` (no CPU wait: shows the unordered acquirer), `HELIOS_FLUSH_GATE_PUBLISH=0` (no
+  publication).
+
 ## 5. Implementation on this branch
 
 - **librmclient**: `crm_win_rm_resource_import(rm_handle, resource_id, &gem, &size, &modifier,
