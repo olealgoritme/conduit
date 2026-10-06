@@ -2719,3 +2719,212 @@ preempt breadcrumbs are diagnosis only.
 3. `pnputil /restart-device` with an app running: returns; `EscAbortStop` may count.
 4. A wedge with `FlipPendWdMs=0`, then 500: `FlipPendWd` moves and the flip queue resumes.
 5. `EscWaitMs=0`, `FlipPendWdMs=0`, `RmGateMs=0` restore v334 behaviour (kill and stop exits stay).
+
+## 24. Asynchronous composed present (BltAsync, BltNoMirror)
+
+Status: implemented behind two knobs that default to 0 (the previous behaviour). Nothing here has run: the KMD cannot be
+built or run in the authoring environment. The pure logic (`kmd_logic/src/blt_async.rs`, 23 tests) is host-tested; the
+render crate was rustfmt-parsed and type-checked against the stub harness (the error set equals the base's, apart from
+stub-only unknown-field and arity errors in the new files).
+
+### 24.1 The measurement
+
+Heaven 1600x900 windowed, composed under DWM, KMD 334.1: the host renders 576 fps, the VM shows 148 fps. PresentMon:
+`msBetweenPresents` p50 6.61 ms, `msInPresentAPI` p50 3.55 ms ("Composed: Copy with GPU GDI"); the UMD present gate
+averages 2.56 ms in mode 0 (a CPU wait); about 1.1 ms of the rest is the KMD. Host GPU utilization on this path is
+55-70 %: each frame runs CPU, then GPU, then CPU, serially.
+
+### 24.2 What the DDI waits for today, and why (read, `ddi/display.rs`, Blt arm, non-snapshot branch)
+
+A Blt whose source is an adopted foreign (NVK-on-RM) allocation (`foreign_source_if_enabled`, `ForeignCopy=1`) and whose
+destination is a KMD standard buffer (`PitchedStandardBuffer`, `PresentDestinationDesc::StandardBuffer`: DWM's redirection
+surface) runs, on the app thread, in this order:
+
+1. `begin_present_buffer_write_legacy` (`virtio/ctrl.rs`): take the buffer's writer ownership (`PresentBufferAccess`
+   `KmdWriter`). It sleeps in 1 ms slices (rounded to the timer quantum, 5 s budget) while a consumer (DWM) has not
+   finished reading the previous frame or a writer is on it.
+2. `submit_present_blt`: import the NVK image into the KMD's Venus device (cached after the first frame), enqueue the
+   reusable copy command on ring 1 (`submit_venus_async_present`). Per frame this also allocates two contiguous DMA
+   buffers (`stage_display_submit`), unchanged here.
+3. `wait_fence(gpu_fence, 5 s)`: sleep until the copy's ring-1 wire fence completes. THIS IS THE CPU WAIT.
+4. `present_buffer_cpu_mirror_ready` (ownership is now `KmdCpuMirror`: the ring completion moved it there) and
+   `mirror_present_system_backing`: take the system-backing content mutex, map the destination blob
+   (`RESOURCE_MAP_BLOB` + `MmMapIoSpace`) and memcpy the whole frame (5.76 MB at 1600x900) into the system pages VidMm
+   gave the allocation, if it keeps a lease on any (`SystemBackingPolicy::PresentLinearBuffer`; none: the call is a
+   mutex and a lookup).
+5. `complete_present_buffer_cpu_mirror` (ownership back to `ExternalReady`), `merge_fence(gpu_fence)` into the DMA
+   private data, return.
+
+Why step 3 exists. It is NOT what makes the Present's DMA fence mean "the copy is done". That is already tied to the copy's
+wire fence by the private record (`PresentSubmissionPrivate::gpu_fence_id`, written by step 5's merge): SubmitCommand
+(`note_and_maybe_signal` -> `note_wddm_submission`) gates the packet on that exact fence in the GPU-completion domain
+(`RetireDomain::IncludingGpu`, `wddm_boundary::select`), and the completion DPC signals `DMA_COMPLETED` when the wire fence
+has retired. The wait exists because (a) the mirror (4) reads the blob and must run after the copy, and (b) the hand-back of
+the buffer ownership (5) was done by the DDI after the mirror. Remove the mirror, or move it off the app thread, and the
+wait has no job.
+
+What orders the copy after the producer today. Nothing in this arm. The Present's stream boundary (the RM fence the UMD
+attaches with carrier (b), `NvkRmFencePresent`) is merged into the private record in `present_complete`, so the DMA FENCE
+waits for the producer, but the Venus copy is submitted at once, in the DDI, whether the producer has finished or not. Today
+that is harmless only because the UMD's present gate (the 2.56 ms CPU wait) makes the producer finish before the Present is
+issued. With the UMD wait removed, the copy of the legacy arm would read a frame the NVK queue may still be writing. The host
+cannot order a Venus ring-1 command after an RM fence (they are different drivers). The ordering has to be the KMD's:
+submit the copy only after the boundary is ready.
+
+Who reads what (allocation classes). The Venus consumer of a dedicated present buffer (identity bit 0
+`DEDICATED_PRESENT_BUFFER`, `rm-backed-standard.md` 1.2) imports the buffer's own memory as a linear image: a GPU read of
+the blob, after the Present's DMA fence, through the ownership table (`claim_present_buffer_read`, which refuses while the
+KMD is a writer). The system backing is read only by CPU views of the allocation (GDI `LockCb` readers; a CPU mapping of a
+staging or shadow surface) and is the source of a page-in. The census in `rm-backed-standard.md` found DWM opening no KMD
+STANDARD allocation at all in its own runs and reading the UMD-made images instead; for the redirection surfaces this
+section is about, the requester states DWM reads the GPU copy. That is the premise of `BltNoMirror` and it is
+unverified here (24.8).
+
+### 24.3 Design
+
+`BltAsync` (default 0): for a foreign source into a standard buffer, `DxgkDdiPresent` never waits for the copy. The route is
+`helios_kmd_logic::blt_async::decide`:
+
+| situation | route |
+|---|---|
+| knob 0, source not foreign, snapshot present, destination not a standard buffer | legacy arm, unchanged |
+| producer boundary live and NOT ready; or live and the mirror is on; or an older copy for the destination is still queued | DEFERRED |
+| producer boundary live and ready, mirror off, nothing queued for the destination, table room | DIRECT |
+| no boundary (the UMD waited on the CPU), mirror off, nothing queued | DIRECT |
+| no boundary and the mirror is on; dead boundary; full table; the queue or the token refused | legacy arm (counted `BltAsyncFall`, reason `BltAsyncWhy`) |
+| no boundary, an older copy for the destination is queued | wait (bounded) for the queue to drain, then the legacy arm (`BltDrainN`) |
+
+DIRECT (`ddi/blt_async.rs::direct`, `virtio/gpu/blt_async.rs::enqueue_async_submit_blt`). The destination ownership is taken, or
+joined, in the same critical section of the transport lock as the ring-1 enqueue, and the copy is recorded in a small fixed
+table (`kmd_logic::blt_async::Table`, 8 entries). The DDI then merges the copy's wire fence into the private record exactly as
+before and returns. The completion DPC (`blt_async_retire`, next to the other per-fence retirements of `drain_used`) hands the
+buffer back when the LAST direct copy of it retires. Several frames for one destination may be in flight at once (an app that
+presents faster than the copy completes): ring-1 submissions of one context retire in order, so "the last to retire" is
+also the last to write. A writer that is not a direct copy (a deferred copy, a CPU mirror) is never joined (`begin`).
+
+DEFERRED (`queue_async_blt`, then the existing WindowedBlt machinery). The reusable copy is prepared, a request is queued in
+the WindowedBlt FIFO under the producer's boundary and its token is merged into the private record (the same two-phase
+transaction a DXVK snapshot Blt has): SubmitCommand admits it once the destination's residency is effective, the HPD worker
+(`service_windowed_blt`) submits it when BOTH the boundary is ready (`scanout_boundary_ready`: an RM gate fires through the
+EventReady DPC, `rm_gate_fire`, and the worker is woken) and the destination can be written (`try_begin_present_buffer_write`;
+a completion wakes the worker), and the ring completion terminalizes the token the Present's DMA fence waits for. The two
+additions to the request are `async_blt` (timed and counted) and `no_mirror`; an NVK source is not a snapshot, so no read
+ledger slot is taken. With the mirror on, the worker's existing PASSIVE mirror runs after the ring completion and the token
+terminalizes after it; with `BltNoMirror` the ring completion hands the buffer back and terminalizes at once.
+
+`BltNoMirror` (default 0, independent of `BltAsync`): for the same class of Blt the CPU mirror is not made. Instead the
+destination's system copy is marked invalid (`mark_stale_if_backed`, the "system copy invalid" machinery of
+`build_paging_buffer.rs`: `SystemBackingTable::mark_system_copy_invalid`) when, and only when, VidMm holds system pages with a
+KMD lease for it. A later SYSTEM_TO_LOCAL page-in of the allocation is then skipped (`PgInvSk`) instead of copying the older
+system pages over the blob, and the next whole-allocation eviction (blob to system) revalidates the mark (`PgInvClr`). Not
+marking an allocation that has no backing keeps the bounded invalid set (overflow skips every page-in, `PgInvOvf` must stay 0)
+out of the per-frame path. The mark is placed immediately before the copy is submitted (the DDI for DIRECT and the legacy arm,
+the worker for DEFERRED), so the window in which a page-in can see pages older than the copy in flight is the copy itself.
+
+### 24.4 Invariants
+
+1. The Present's DMA fence retires only after the copy has completed on the host GPU. DIRECT: the private record names the
+   copy's wire fence (unchanged mechanism). DEFERRED: the fence waits for the request's terminal token, which exists only after
+   the ring completion (and after the mirror, if there is one). A gate that fires with an error, or expires (`RmGateMs`),
+   releases the copy; the producer's frame may then be incomplete, the same trade the gate always made.
+2. The copy never starts before the producer has finished. DIRECT is chosen only for "no boundary" (the UMD's CPU wait already
+   ordered it) or a boundary already ready; otherwise the copy waits in the FIFO until `scanout_boundary_ready`.
+3. One destination, one order. A DIRECT copy never overtakes a queued one for the same destination (`dst_deferred_pending`), a
+   queued copy cannot start while direct copies hold the buffer, and a legacy Blt that cannot be queued waits for the queue
+   to drain first. A deferred request's dispatch is FIFO in admission order.
+4. Ownership. The destination is KmdWriter from the enqueue (DIRECT) or the dispatch (DEFERRED) until the copy's completion; no
+   consumer claim is accepted meanwhile (`claim_present_buffer_read` is `Busy`), allocation teardown waits
+   (`begin_present_buffer_teardown`), and the cached copy command is drained by `release_present_blits_for_resource` as before.
+5. A failed copy still completes the Present. The host's error response for a ring-1 command means it touched nothing: the wire
+   fence retires regardless (the DMA fence signals), the destination keeps the previous frame, `BltAsyncFail` counts it, and the
+   buffer is handed back. (The legacy arm pinned the buffer for ever in this case. A transport latch is different: everything
+   is abandoned with the transport generation.)
+6. Nothing sleeps in the DDI except the legacy fallbacks (`BltAsyncBusy`, `BltDrainN`).
+
+### 24.5 Hazards
+
+* Source reuse (write after read). Before, the DDI returned after the copy had read the NVK source, so the app could draw into
+  it at once. Now the Present returns with the copy still queued behind the producer (milliseconds). dxgkrnl's allocation
+  tracking orders the app's next WDDM submission after the Present's DMA fence, but NVK on RM submits through its own channel,
+  which dxgkrnl does not see. Whatever recycles the swap-chain buffer must wait for the Present's fence; the KMD cannot enforce
+  it. Symptom if not: a frame with the next frame's pixels in it (tearing, one frame early). First thing to look for in the
+  checklist.
+* DWM reading before the copy completes: only if the DMA fence signalled early. The fence is tied to the copy (24.4 item 1);
+  `PBFnc` shows the fence or token each Present carried.
+* `BltNoMirror` and CPU readers. A GDI or CPU reader of the destination (a `LockCb`, a CPU-mapped staging surface) sees the pages
+  VidMm holds, which are no longer updated while the allocation is system-resident and are skipped on page-in. If DWM reads the
+  system pages rather than the GPU copy, composition shows stale content: `BltMirrorSk` rising with a frozen window is the
+  signature. Turn the knob off.
+* The eviction race. A whole-allocation eviction that completes while a copy is in flight copies a partial frame into the
+  system pages and clears the mark; a later page-in then puts that frame over the blob until the next Present rewrites it
+  (one frame). The mark is re-placed on the next Present.
+* A failed copy (`BltAsyncFail`): see 24.4 item 5.
+* A dead boundary (the producing process was killed): DIRECT is not used, the legacy arm copies at once (unordered, as before
+  this change); a queued request whose stream dies is cancelled by the existing teardown paths.
+* A deferred request makes the Present's DMA fence depend on the worker. A wedged worker stalls composed presents; the
+  existing `WddmHeadMs` rebase bounds it as for snapshot Blts.
+* `KmdRmClient` 5: the level 5 `primary_changed` edge after a Blt is not raised by the asynchronous routes. The only
+  destination it names is an RM sysmem primary, which never takes this arm (`sysmem_blt::primary`).
+
+### 24.6 Counters (at most 14 characters, unique across `kmd_render` and `kmd_logic`; `kmd_logic::blt_async::COUNTERS`)
+
+| counter | meaning |
+|---|---|
+| `BltAsyncKnob`, `BltNoMirKnob` | the knobs in force (written at every StartDevice, 0 included) |
+| `BltAsyncN` | asynchronous Blts made; `BltAsyncDir` direct, `BltAsyncDefer` deferred (producer not ready, mirror on, or an older frame queued) |
+| `BltAsyncInfl`, `BltAsyncPk` | submitted or queued with the copy not yet complete, now and the most at once |
+| `BltAsyncLat0..7` | submission to copy completion: < 250 us, < 500 us, < 1 ms, < 2 ms, < 4 ms, < 8 ms, < 16 ms, more |
+| `BltDeferUs` | microseconds deferred Blts waited in the FIFO from Present to submission |
+| `BltAsyncFail` | copies the host answered with an error |
+| `BltAsyncFall`, `BltAsyncWhy`, `BltAsyncMask` | eligible Blts that took the legacy arm; last reason code and the set of reasons seen (bit `code - 1`: 2 not foreign, 3 not a buffer, 4 no boundary with the mirror on, 5 dead boundary, 6 queue refused, 7 token refused, 8 submit refused, 9 older copy queued and no boundary, 10 table full, 11 destination busy) |
+| `BltAsyncBusy`, `BltDrainN` | of those, destination busy; legacy Blts that drained the queue first |
+| `BltWaitN`, `BltWaitUs`, `BltWait0..7` | the legacy arm's CPU wait for the copy (same buckets): what `BltAsync` saves |
+| `BltMirrorN`, `BltMirrorSk`, `BltMirrorUs` | CPU mirrors done (legacy and worker), skipped by `BltNoMirror`, microseconds spent in them |
+| `BltNoMirInv` | destination system copies newly marked invalid (an Already mark is not counted) |
+
+`PBCpy` is 3 for a DIRECT Blt and 4 for a DEFERRED one (`PBFnc`: the wire fence or the token); `PBSyCp` is 3 when the mirror
+was skipped. A new transport generation zeroes the counters (`reset_for_start`).
+
+### 24.7 Where the code is
+
+`kmd_logic/src/blt_async.rs` (route table, ownership rule `begin`, in-flight `Table`, buckets, stale-mark rule, counter list and
+the name scans); `kmd_render/src/ddi/blt_async.rs` (knobs, counters, `try_async`, `direct`, `deferred`, `drain`);
+`kmd_render/src/virtio/gpu/blt_async.rs` (in-flight table in the transport, `enqueue_async_submit_blt`, `blt_async_retire`,
+`queue_async_blt`, ownership release); hooks: `ddi/display.rs` (Blt arm, worker), `virtio/ctrl.rs::submit_venus_async_blt`,
+`virtio/venus/present.rs::submit_present_blt_direct`, `virtio/gpu/mod.rs` (the retire arm, the request fields, the ring
+completion), `adapter/backing.rs::mark_stale_if_backed`, `diag.rs` (knob names), `ddi/lifecycle.rs`, `ddi/submit_command.rs`.
+
+### 24.8 Verified, and not
+
+Verified (host tests): the route table, exhaustively over its inputs (Direct only with its preconditions, never with a producer
+that has not finished, never past a queued older copy; Deferred only behind a live boundary); the ownership rule; the in-flight
+table (last-writer hand-back, any completion order, bounded, fence ordering); histogram buckets at their edges; the stale-mark
+rule; counter names (listed = written by `ddi/blt_async.rs`, written nowhere else, at most 14, unique).
+
+NOT verified: anything on hardware or the WDK build; that the host executes ring-1 copies of the KMD context in submission order
+across the destination (assumed from the Venus per-queue order, which the legacy arm already relied on for its own fence);
+that a deferred request for a source that is not a snapshot passes every WindowedBlt precondition (admission, terminal
+membership, teardown by resource id): the paths are shared but were written for snapshots; that `merge_blt_boundaries` accepts
+the RM gate boundary beside a Venus stream boundary in one private record (a refusal is counted `TokenRefused` and falls
+back); the premise that DWM reads the GPU copy (24.2).
+
+### 24.9 Hardware checklist (Heaven 1600x900 windowed, composed; lowest mode first: 1920x1080 at 60 Hz, then bigger)
+
+Run each row ten minutes, read the counters after, and record PresentMon `msInPresentAPI`, `msBetweenPresents`, host GPU
+utilization (`nvidia-smi dmon -s u` on the host) and fps.
+
+| row | `HELIOS_NVK_RM_FENCE_PRESENT` | `BltAsync` | `BltNoMirror` | expect |
+|---|---|---|---|---|
+| 1 | 0 | 0 | 0 | the baseline; `BltWaitUs / BltWaitN` is the DDI's wait, `BltMirrorUs / BltMirrorN` the mirror |
+| 2 | 0 | 0 | 1 | `BltMirrorSk` = Presents, `BltMirrorN` 0, `BltNoMirInv` > 0 only if VidMm paged the surface; the wait unchanged |
+| 3 | 0 | 1 | 1 | no boundary: all DIRECT (`BltAsyncDir`), `BltWaitN` 0, `BltAsyncPk` small, `BltAsyncLat` mostly < 2 ms |
+| 4 | 1 | 0 | 0 | the ordering gap of 24.2 shows as torn or old frames if the producer is slower than the DDI |
+| 5 | 1 | 1 | 0 | all DEFERRED (mirror on), `BltDeferUs / BltAsyncDefer` is the wait for the producer, `BltMirrorN` from the worker |
+| 6 | 1 | 1 | 1 | the target: DEFERRED while the producer runs, DIRECT when it had finished (`BltAsyncDir`); `BltWaitN` 0, `BltMirrorN` 0 |
+
+Pass: `BltAsyncFail`, `BltAsyncBusy`, `BltDrainN` 0 or tiny; `BltAsyncInfl` returns to 0 at idle; `PgInvOvf` 0; no `RmGExp`, no
+`WddmHeadMs` rebase; `FlipPendWd` 0; no tearing or one-frame-early content in Heaven's moving scene (the source-reuse hazard);
+a GDI app (Notepad, Explorer) beside it stays correct with `BltNoMirror` 1 (the CPU-reader hazard); `pnputil /restart-device`
+with the app running returns and the counters restart from 0. Compare rows 1, 3, 5 and 6 on `msInPresentAPI` (the saved
+wait), `msBetweenPresents`, fps and host GPU utilization. Recommend the defaults only after rows 3 and 6 are clean; turn
+`BltNoMirror` on separately, after the question of who reads the system pages is settled.
