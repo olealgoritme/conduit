@@ -34,6 +34,7 @@ pub mod foreign_errno;
 pub mod flip_completion;
 pub mod flip_flags;
 pub mod flip_pipeline;
+pub mod flip_retire;
 pub mod foreign_flip;
 pub mod foreign_resource;
 pub mod foreign_scanout;

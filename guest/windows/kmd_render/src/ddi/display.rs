@@ -1879,6 +1879,8 @@ pub unsafe extern "C" fn dxgkddi_commit_vidpn(
     // `return SUCCESS` that never checks the pin is exactly viogpu3d's "commit but
     // light nothing" failure). Scanout itself is issued from SetVidPnSourceAddress.
     let adapter = unsafe { &*p };
+    // `FlipAnnounce`: the accepted allocations were checked against the OLD mode's extent.
+    crate::ddi::flip_announce::invalidate_all();
     let status = crate::ddi::vidpn::legalize_vidpn(unsafe {
         crate::ddi::vidpn::commit_vidpn(adapter, commit as *const DXGKARG_COMMITVIDPN)
     });
@@ -1938,6 +1940,10 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     // `FlipIss` (`ddi::stall_diag`): a flip dxgkrnl issued, recorded as the newest for the
     // watchdog. Atomics only, legal at DIRQL. Before anything below can publish or raise the gate.
     crate::ddi::stall_diag::note_flip_issued(primary_address);
+    // `FlipAnnounce`: forget an unconfirmed announcement and read, BEFORE this flip raises the
+    // programming gate, whether the worker is idle (`docs/kmd-rm-client.md` 15.18.15). One
+    // relaxed load with the knob off.
+    let announce_idle = crate::ddi::flip_announce::on_ddi_entry(adapter);
 
     // Dxgkrnl's MMIO-flip path invokes this DDI under DxgkCbSynchronizeExecution
     // at DIRQL. At that IRQL it is illegal to write registry diagnostics, wait on
@@ -1997,12 +2003,26 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         if previous != 0 && previous != h_alloc as usize {
             crate::ddi::scanout_trace::note_ddi_coalesced(previous);
         }
-        // `FfAsyncWin`: wake the worker NOW, through the DPC (`DxgkCbQueueDpc` is legal at
-        // DIRQL; `KeSetEvent` on the worker's event is not), instead of leaving the pending
-        // slot to the next vsync tick: at 240 Hz that tick is up to 4.17 ms away, a whole frame
-        // of publication latency. Atomics and the one DPC request only.
-        if crate::virtio::foreign_flip::early_wake() {
-            crate::virtio::foreign_flip::note_early_queued();
+        // `FlipAnnounce`: publish this flip's address toward dxgkrnl NOW (atomics only), so the
+        // next tick retires it; the worker programs it afterwards. Decided by
+        // `helios_kmd_logic::flip_retire::announce_decide`.
+        unsafe {
+            crate::ddi::flip_announce::at_ddi(adapter, h_alloc, primary_address, announce_idle)
+        };
+        // `FfAsyncWin` / `FlipEarlyWake` / `FlipAnnounce`: wake the worker NOW, through the DPC
+        // (`DxgkCbQueueDpc` is legal at DIRQL; `KeSetEvent` on the worker's event is not),
+        // instead of leaving the pending slot to the next vsync tick: at 240 Hz that tick is up
+        // to 4.17 ms away, a whole frame of publication latency. Atomics and the one DPC
+        // request only.
+        let ffl_wake = crate::virtio::foreign_flip::early_wake();
+        let ann_wake = crate::ddi::flip_announce::wakes_early();
+        if ffl_wake || ann_wake {
+            if ffl_wake {
+                crate::virtio::foreign_flip::note_early_queued();
+            }
+            if ann_wake {
+                crate::ddi::flip_announce::note_early();
+            }
             crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
         }
         return STATUS_SUCCESS;
@@ -2502,6 +2522,9 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
         }
         Err(reject) => {
             reject.report();
+            // `FlipAnnounce`: an announced flip the worker refuses already retired (the screen
+            // keeps its previous picture): `FaRefuse`.
+            crate::ddi::flip_announce::note_worker_refused(h_alloc);
             if reject.retryable() {
                 // A refusal is not a Deferred outcome: the `DeferBudget` count is of consecutive
                 // Deferred outcomes, so the one in progress (if any) ends here, whether the
