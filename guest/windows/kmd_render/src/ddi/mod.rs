@@ -15,6 +15,7 @@ mod build_paging_buffer;
 mod child;
 pub(crate) mod cpu_host_aperture;
 pub(crate) mod create_allocation;
+pub(crate) mod device_lost;
 pub(crate) mod display;
 mod escape;
 mod escape_foreign;
@@ -36,6 +37,7 @@ pub(crate) mod segment_table;
 pub(crate) mod shared_placeholder;
 pub(crate) mod stall_diag;
 pub(crate) mod submit_command;
+pub(crate) mod traced;
 pub(crate) mod vidpn;
 pub(crate) mod wddm_surface;
 

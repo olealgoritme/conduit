@@ -59,6 +59,7 @@ use crate::ddi::create_allocation::SystemBackingPolicy;
 use crate::ddi::create_allocation::{paging_alloc_info, set_bar_placement};
 use crate::dxgk::*;
 use crate::virtio::rm_client::sysmem_flip::primary_changed;
+use helios_kmd_logic::device_lost as dl;
 use helios_kmd_logic::paging::{self as pg, Clamp};
 use helios_kmd_logic::rm_refresh::Edge;
 
@@ -1739,11 +1740,98 @@ fn note_unserialized_eviction(
 /// `DxgkDdiBuildPagingBuffer` — translate a memory-management operation into GPU
 /// DMA. Null engine for the aperture / page-table segments; REAL content engine
 /// for BAR-segment allocations. See the module doc.
+#[inline(never)]
 pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     h_adapter: *mut c_void,
     build_paging_buffer: *mut DXGKARG_BUILDPAGINGBUFFER,
 ) -> NTSTATUS {
+    // The last-operation record, the Evict counts and the longest call
+    // (`ddi::device_lost`, `PgLast*` / `PgEv*` / `PgLongUs`): atomics and two clock reads, no
+    // change to what the inner function decides or answers.
+    let started = crate::adapter::foreign_scanout::now_100ns();
+    let mut note = PagingNote::new();
+    // SAFETY: the DDI contract, forwarded unchanged.
+    let status = unsafe { build_paging_buffer_inner(h_adapter, build_paging_buffer, &mut note) };
+    crate::ddi::device_lost::paging_done(
+        note.op,
+        note.handle,
+        note.size,
+        note.kind,
+        note.result,
+        started,
+    );
+    status
+}
+
+/// What the call did, for `ddi::device_lost::paging_done`.
+struct PagingNote {
+    op: u32,
+    /// The allocation handle's low 32 bits (never dereferenced here), 0 for none.
+    handle: u32,
+    /// The bytes the operation names, low 32 bits.
+    size: u32,
+    kind: dl::PagingKind,
+    /// A `dl::paging_result` code.
+    result: u32,
+}
+
+impl PagingNote {
+    const fn new() -> Self {
+        Self {
+            op: 0xFFFF_FFFF,
+            handle: 0,
+            size: 0,
+            kind: dl::PagingKind::Other,
+            result: dl::paging_result::NOT_OURS,
+        }
+    }
+
+    /// Fill `handle`, `size` and `kind` from the parsed operation. `bar` is the BAR segment id.
+    fn describe(&mut self, operation: &PagingOperation<'_>, bar: u32) {
+        use crate::dxgk::_DXGK_MEMORY_TRANSFER_DIRECTION as Direction;
+        match operation {
+            PagingOperation::Transfer(t) => {
+                self.handle = t.hAllocation as usize as u32;
+                self.size = t.TransferSize as u32;
+                self.kind = dl::transfer_kind(t.Source.SegmentId, t.Destination.SegmentId, bar);
+            }
+            PagingOperation::Fill(f) => {
+                self.handle = f.hAllocation as usize as u32;
+                self.size = f.FillSize as u32;
+            }
+            PagingOperation::DiscardContent(d) => {
+                self.handle = d.hAllocation as usize as u32;
+            }
+            PagingOperation::VirtualFill(fv) => {
+                self.handle = fv.hAllocation as usize as u32;
+                self.size = fv.FillSizeInBytes as u32;
+            }
+            PagingOperation::VirtualTransfer(tv) => {
+                self.handle = tv.hAllocation as usize as u32;
+                self.size = tv.TransferSizeInBytes as u32;
+                self.kind = match tv.TransferDirection {
+                    Direction::DXGK_MEMORY_TRANSFER_LOCAL_TO_SYSTEM => dl::PagingKind::Evict,
+                    Direction::DXGK_MEMORY_TRANSFER_SYSTEM_TO_LOCAL => dl::PagingKind::PageIn,
+                    _ => dl::PagingKind::Other,
+                };
+            }
+            PagingOperation::UpdatePageTable(u) => {
+                self.handle = u.hAllocation as usize as u32;
+            }
+            PagingOperation::Other => {}
+        }
+    }
+}
+
+/// The body of [`dxgkddi_build_paging_buffer`]; every return records its outcome in `note`.
+#[inline(never)]
+unsafe fn build_paging_buffer_inner(
+    h_adapter: *mut c_void,
+    build_paging_buffer: *mut DXGKARG_BUILDPAGINGBUFFER,
+    note: &mut PagingNote,
+) -> NTSTATUS {
     if h_adapter.is_null() || build_paging_buffer.is_null() {
+        note.result = dl::paging_result::BAD_ARGS;
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1752,6 +1840,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // on the CPU right here, before the paging fence retires).
     let args = unsafe { &*build_paging_buffer };
     let op = args.Operation as u32;
+    note.op = op;
     PAGING_LAST_OP.store(op, Ordering::Relaxed);
     PAGING_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
     if op < 32 {
@@ -1761,6 +1850,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // SAFETY: dxgkrnl hands back our AdapterContext as the miniport context.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     let Some(bar) = adapter.bar_segment() else {
+        note.result = dl::paging_result::NO_BAR;
         return STATUS_SUCCESS; // BAR segment inactive → pure null engine
     };
 
@@ -1768,6 +1858,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // SAFETY: `Operation` describes the arm dxgkrnl initialised — the DDI
     // contract, now relied on in exactly one place instead of six.
     let operation = unsafe { PagingOperation::parse(args) };
+    note.describe(&operation, bar.seg_id);
 
     // Placement harvest is DISPATCH-safe (atomic store only) — no IRQL gate.
     if let PagingOperation::UpdatePageTable(update) = operation {
@@ -1797,15 +1888,18 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
             // this range resolves nothing and is skipped and counted
             // (PgEv + PgSkipV) rather than copied through a wrong page.
             BAR_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            note.result = dl::paging_result::SKIPPED;
             return paging_failure();
         }
         unsafe { bar_harvest_page_table(adapter, bar.seg_id, bar.size, update) };
+        note.result = dl::paging_result::PTE;
         return STATUS_SUCCESS;
     }
 
     // The content-op set is a method on the parsed value, so it cannot drift
     // from the dispatch below.
     if !operation.is_content_op() {
+        note.result = dl::paging_result::NOT_OURS;
         return STATUS_SUCCESS;
     }
     // Content ops need PASSIVE (host round-trips, Mm mapping calls). The DDI
@@ -1836,6 +1930,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         if irql <= DISPATCH_LEVEL_IRQL {
             note_unserialized_eviction(adapter, bar.seg_id, &operation);
         }
+        note.result = dl::paging_result::BAD_IRQL;
         return STATUS_SUCCESS;
     }
     // SAFETY: the strongest mint in the driver — `DxgkDdiBuildPagingBuffer` is
@@ -1850,7 +1945,17 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // copy plus its backing-table transition atomic with respect to those
     // paths. This is a sleeping mutex: multi-megabyte copies never run under a
     // spinlock or at raised IRQL.
-    let Some(content_guard) = adapter.system_backings.serialize(passive) else {
+    // `PgMtxMaxUs` / `PgMtxFail`: how long VidMm's paging thread waited for the content mutex
+    // (a teardown or a Present mirror holding it across a host round trip shows here).
+    let wait_started = crate::adapter::foreign_scanout::now_100ns();
+    let guard = adapter.system_backings.serialize(passive);
+    crate::ddi::device_lost::paging_mutex_wait(
+        (crate::adapter::foreign_scanout::now_100ns().saturating_sub(wait_started) / 10)
+            .min(u32::MAX as u64) as u32,
+        guard.is_some(),
+    );
+    let Some(content_guard) = guard else {
+        note.result = dl::paging_result::NO_GUARD;
         BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
         BAR_SKIPPED.fetch_add(1, Ordering::Relaxed);
         // Both directions are skipped. A skipped EVICTION still has to be
@@ -1967,6 +2072,11 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     if matches!(outcome, PagingOpOutcome::Failed(_)) {
         BAR_SKIPPED.fetch_add(1, Ordering::Relaxed);
     }
+    note.result = match outcome {
+        PagingOpOutcome::Executed => dl::paging_result::EXECUTED,
+        PagingOpOutcome::NotOurs => dl::paging_result::NOT_OURS,
+        PagingOpOutcome::Failed(_) => dl::paging_result::SKIPPED,
+    };
     // Registry diagnostics can block independently; the backing transaction is
     // complete, so do not unnecessarily serialize another Present behind it.
     drop(content_guard);
