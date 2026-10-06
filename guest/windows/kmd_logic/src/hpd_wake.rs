@@ -295,7 +295,7 @@ pub const fn power_vsync(device_uid: u32, d0: bool, display_half: bool) -> Power
 
 // ---- v327: the v326 behaviour changes behind knobs, defaults = the v325 behaviour ------------
 
-/// `VsPowerMode` (default 0): 0 = KMD 325 (any non-D0 call of any `DeviceUid` quiesces the
+/// `VsPowerMode` (default 1 since v330, hardware-accepted on 328.1: 5/5 device restarts): 0 = KMD 325 (any non-D0 call of any `DeviceUid` quiesces the
 /// heartbeat), 1 = KMD 326 (only the ADAPTER leaving D0 does). Anything above 1 reads as 1.
 pub const fn clamp_power_mode(v: u32) -> u32 {
     if v > 1 {
@@ -305,7 +305,7 @@ pub const fn clamp_power_mode(v: u32) -> u32 {
     }
 }
 
-/// `VsWatchdog` (default 0): 0 = off (KMD 325), 1 = revive a heartbeat that is armed but silent,
+/// `VsWatchdog` (default 1 since v330): 0 = off (KMD 325), 1 = revive a heartbeat that is armed but silent,
 /// 2 = also re-arm one that was quiesced although the adapter is in D0 (KMD 326). Above 2 reads
 /// as 2.
 pub const fn clamp_watchdog(v: u32) -> u32 {

@@ -939,7 +939,7 @@ pub unsafe extern "C" fn dxgkddi_set_power_state(
     let d0 = device_power_state == _DEVICE_POWER_STATE::PowerDeviceD0;
     crate::ddi::stall_diag::power_stage(1);
     crate::ddi::stall_diag::note_power(device_uid, d0);
-    // v327: `VsPowerMode` 0 (the default) is KMD 325: any non-D0 state of any uid quiesces.
+    // v330: `VsPowerMode` 1 (the default) quiesces only on the ADAPTER leaving D0; 0 is KMD 325 (any non-D0 state of any uid).
     match helios_kmd_logic::hpd_wake::power_vsync_mode(
         crate::ddi::stall_diag::vs_power_mode(),
         device_uid,

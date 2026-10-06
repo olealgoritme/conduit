@@ -2305,3 +2305,15 @@ stall. If dxgkrnl does not wait for the address of the newest issued flip (H1 wr
 address that matches no flip, exactly as 0 did) and the stall has another cause: H3 and H4 are the next reads. Verified:
 host tests of `restart_flip`, the whole `kmd_render` through the stub harness with the error set identical to the base.
 NOT verified: anything on hardware, the WDK build, that dxgkrnl keeps its flip queue across the restart.
+
+## 21. Default flip: `VsPowerMode=1`, `VsWatchdog=1` (v330)
+
+Hardware acceptance on 328.1 (5/5 device restarts, `ForeignFlip` 0,1,0,1,0, `VsPowerMode=1`,
+`VsWatchdog=1`, an NVK `d3d11_spin` on scanout across each `pnputil /restart-device`): the mode stayed
+5120x1440@240, the same DWM survived with no kill, `VpPres` +230..236 per sample, all breadcrumbs nominal.
+On 327.1 (both knobs 0) the same DWM never re-opened the adapter after a monitor-child D3 and
+froze. From v330 the defaults are `VsPowerMode=1` (only the ADAPTER leaving D0 quiesces the heartbeat)
+and `VsWatchdog=1` (revive an armed but silent heartbeat). `VsIdleWake` stays 0; `VsWdTimer` stays 1.
+Both old behaviours remain selectable (`VsPowerMode=0`, `VsWatchdog=0`), re-read at every StartDevice
+(prefer a VM reboot when changing them). The knob tables in 13.8 and 15.4 list the old defaults and
+are superseded by this section.
