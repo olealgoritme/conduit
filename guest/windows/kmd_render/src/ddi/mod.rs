@@ -18,6 +18,7 @@ pub(crate) mod create_allocation;
 pub(crate) mod device_lost;
 pub(crate) mod display;
 mod escape;
+pub(crate) mod escape_wait;
 mod escape_foreign;
 mod escape_foreign_rm_resource;
 mod escape_foreign_scanout;

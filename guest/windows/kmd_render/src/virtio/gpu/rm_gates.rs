@@ -37,6 +37,10 @@ pub static RMG_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// marker (`RmGTake`): the UMD cannot know the tail was refused, so the handle is
 /// the KMD's whatever became of the marker.
 pub static RMG_TAKEN: AtomicU32 = AtomicU32::new(0);
+/// Points the worker declared fired because their `EventReady` never came for `RmGateMs`
+/// (`RmGExp`), and the knob in force (`RmGateMsEff`, 0 = never).
+pub static RMG_EXPIRED: AtomicU32 = AtomicU32::new(0);
+pub static RMG_EXPIRE_MS: AtomicU32 = AtomicU32::new(0);
 /// Gates open now (a count, not a counter): `DestroyProcess` reads it before it
 /// touches the adapter, so a process exit with no gate open costs one load.
 static RMG_OPEN: AtomicU32 = AtomicU32::new(0);
@@ -59,6 +63,8 @@ pub fn publish_rm_gate_counters() {
     rec(b"RmGCan", RMG_CANCELLED.load(Ordering::Relaxed));
     rec(b"RmGRef", RMG_REFUSED.load(Ordering::Relaxed));
     rec(b"RmGTake", RMG_TAKEN.load(Ordering::Relaxed));
+    rec(b"RmGExp", RMG_EXPIRED.load(Ordering::Relaxed));
+    rec(b"RmGateMsEff", RMG_EXPIRE_MS.load(Ordering::Relaxed));
 }
 
 /// One gate: the process it belongs to, the present-stream slot that carries its
@@ -227,7 +233,11 @@ impl VirtioGpu {
                     return refuse(gate_refusal(why));
                 }
             };
-        let point = match self.rm_gates[gi].gate.attach(fence, early.is_some()) {
+        let point = match self.rm_gates[gi].gate.attach_at(
+            fence,
+            early.is_some(),
+            crate::adapter::AdapterContext::interrupt_time_ms().max(1),
+        ) {
             Ok(p) => p,
             // Checked above; if it ever happens the fence is the KMD's already, so
             // close it rather than strand it.
@@ -321,6 +331,36 @@ impl VirtioGpu {
             self.rm_gate_sync(gi);
         }
         self.fence_want_close(fence);
+    }
+
+    /// The worker's pass over the gates (PASSIVE, `virtio_lock`): every point whose fence has
+    /// not fired `limit_ms` after it was attached is declared fired (its `EventReady` was lost:
+    /// the host's own fence timeout is 5 s and fires with an error status), its handle queued for
+    /// closing, and its retirement published so the present it gated completes. A boundary that
+    /// can never become ready is thereby ready after a bounded time. Returns how many points
+    /// expired (the caller wakes the DPC-side waiters through `rm_gate_sync`, done here).
+    pub fn rm_gates_expire(&mut self, now_ms: u32, limit_ms: u32) -> u32 {
+        if limit_ms == 0 || RMG_OPEN.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        let mut n = 0;
+        for gi in 0..self.rm_gates.len() {
+            if !self.rm_gates[gi].in_use {
+                continue;
+            }
+            let mut any = false;
+            while let Some(fence) = self.rm_gates[gi].gate.take_expired(now_ms, limit_ms) {
+                RMG_EXPIRED.fetch_add(1, Ordering::Relaxed);
+                RMG_FIRED.fetch_add(1, Ordering::Relaxed);
+                self.fence_want_close(fence);
+                any = true;
+                n += 1;
+            }
+            if any {
+                self.rm_gate_sync(gi);
+            }
+        }
+        n
     }
 
     /// Cancel gate `gi`: queue every unfired fence for closing, count the points it
