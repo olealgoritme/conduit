@@ -845,6 +845,7 @@ desktop session (scheduled task, `/it`):
 | 312.0 | 32-bit, NVK, `vulkan_nouveau32.dll` + `librmclient32.dll` | NVK | pass | pass | 4555 fps |
 | 312.0 | 64-bit, NVK, `NVK_HELIOS_WSI=0` (GDI present) | NVK | pass | pass | 1561 fps |
 | 312.0 | 64-bit, `ZINK_VULKAN_ICD=loader` (Venus) | Venus | pass | pass | 831 fps |
+| 43 | `nvkmd: keep the device's memory list consistent; log misuse with a stack` | `nvkmd_dev_alloc_mapped_mem`'s map-failure path freed a listed memory without unlinking it; add/remove on `dev->mems` are idempotent and `nvkmd_rm_mem_free` unlinks a still-listed memory, each misuse logged (`mesa_loge`, module+offset stack, 16 per process). Turns the ledger-on exit crash (`nvkmd_mem_unref` `list_del` on a freed neighbour) into a log line that names the culprit |
 
 On KMD 311.0 the gears were present-bound: NVK's Helios scanout flip was
 refused with EBUSY ("frames dropped"), and the GDI path gave the same rate.
