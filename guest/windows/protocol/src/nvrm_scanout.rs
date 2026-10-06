@@ -34,7 +34,7 @@
 //! device that does not hold it is refused `FORBIDDEN`.
 //!
 //! The ops are advertised in `HeliosNvrmQueryCaps.supported_ops` (bits 9, 10, 11). A
-//! fourth, `SCANOUT_STATUS` (bit 12, with capability bit 34), exists only where the host's
+//! fourth, `SCANOUT_STATUS` (bit 12, with capability bit 35), exists only where the host's
 //! buffer releases are on: the precise answer to "may I write this image again?".
 //! Calls from one device should be serialised by the client, as `FORWARD` is: the
 //! KMD mints `seq` in call order but the host takes frames in arrival order.
@@ -63,7 +63,7 @@ pub const HELIOS_NVRM_SCANOUT_STATUS_OPS: u64 = 1 << HELIOS_NVRM_OP_SCANOUT_STAT
 /// the host's `NVGPU_F_SCANOUT_RELEASE`, so `SCANOUT_STATUS` and the event kind
 /// `HELIOS_NVRM_EVENT_SCANOUT_RELEASED` work and the KMD's own ring presenter waits for
 /// releases. Gate on this bit, never on the op bit alone.
-pub const HELIOS_NVRM_CAP_SCANOUT_RELEASE: u64 = 1 << 34;
+pub const HELIOS_NVRM_CAP_SCANOUT_RELEASE: u64 = 1 << 35;
 
 /// `SET`: another device holds scanout 0 and is still presenting.
 pub const HELIOS_NVRM_ST_SCANOUT_BUSY: i32 = 13;

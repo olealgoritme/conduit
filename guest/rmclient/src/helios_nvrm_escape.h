@@ -351,7 +351,7 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmUnpin, pin_id) == 40, "unpin.pin_id
  * the event, SCANOUT_STATUS, and only if out_released_seq < P wait (with a timeout), then
  * SCANOUT_STATUS again. The event also wakes on TRANSPORT_LOST. */
 #define HELIOS_NVRM_OP_SCANOUT_STATUS 12u
-#define HELIOS_NVRM_CAP_SCANOUT_RELEASE (1ull << 34)
+#define HELIOS_NVRM_CAP_SCANOUT_RELEASE (1ull << 35)
 
 typedef struct HeliosNvrmScanoutSet {
   HeliosNvrmHeader head;

@@ -175,7 +175,7 @@ exactly when a viewer or an encoder holds a buffer.
 
 ### What user mode gets
 
-Capability: `QUERY_CAPS.supported_ops` bit 34 `HELIOS_NVRM_CAP_SCANOUT_RELEASE`, set iff the
+Capability: `QUERY_CAPS.supported_ops` bit 35 `HELIOS_NVRM_CAP_SCANOUT_RELEASE`, set iff the
 transport acked the feature (with it: op bit 12 and `supported_event_kinds` bit 3). Probe the
 capability, never the op bit alone. Without it keep the old rule.
 
