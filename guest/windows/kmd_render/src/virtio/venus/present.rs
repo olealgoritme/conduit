@@ -1604,7 +1604,15 @@ impl VenusClient {
             }
         }
         if self.rm_blt_stage_allocs >= RM_BLT_STAGE_MAX_ALLOCS {
-            crate::diag::record_named_bytes(b"RmSysBltStg", 0x8000_0000 | self.rm_blt_stage_allocs);
+            // One registry write per exhaustion, not one per Present.
+            static EXHAUSTED_NOTED: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !EXHAUSTED_NOTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                crate::diag::record_named_bytes(
+                    b"RmSysBltStg",
+                    0x8000_0000 | self.rm_blt_stage_allocs,
+                );
+            }
             return Err(VirtioError::OutOfMemory);
         }
         let (want_w, want_h) = match self.rm_blt_stage {
