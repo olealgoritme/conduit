@@ -85,9 +85,16 @@ impl Venus {
         if c.resource_id == 0 || self.resources.contains_key(&c.resource_id) {
             return Err(RESP_ERR_INVALID_RESOURCE_ID);
         }
-        // Nothing to map (the guest gets no CPU view of RM memory), nothing
-        // to share beyond what the resource id already does, no guest pages.
-        if c.blob_flags != 0 || c.nr_entries != 0 || c.size == 0 {
+        // No guest pages. MAPPABLE only for system memory (checked once the
+        // object is known); SHAREABLE changes nothing (the resource id is
+        // what is shared); nothing else.
+        let known_flags = BLOB_FLAG_USE_MAPPABLE | BLOB_FLAG_USE_SHAREABLE;
+        let mappable = c.blob_flags & BLOB_FLAG_USE_MAPPABLE != 0;
+        if c.blob_flags & !known_flags != 0
+            || c.nr_entries != 0
+            || c.size == 0
+            || (mappable && crate::shm_regions::page_align(c.size) > self.hostmem_len)
+        {
             return self.refuse_rm(
                 RESP_ERR_INVALID_PARAMETER,
                 libc::EINVAL,
@@ -119,6 +126,27 @@ impl Venus {
                 return self.refuse_rm(resp, errno, "refused: rm export");
             }
         };
+        // A mapping is the dma-buf's own mmap placed in region 3: only system
+        // memory is guest memory that way, with the CPU caching RM gave it.
+        // Video memory sits behind BAR1 and is refused, as is memory whose
+        // allocation the backend did not see.
+        let map_cache = obj.placement.and_then(|p| p.map_cache());
+        if mappable && map_cache.is_none() {
+            log::warn!(
+                "venus: RM-export blob res {}: MAPPABLE asked of {} memory; only system memory \
+                 maps",
+                c.resource_id,
+                match obj.placement {
+                    Some(_) => "video",
+                    None => "unknown (allocation not seen)",
+                }
+            );
+            return self.refuse_rm(
+                RESP_ERR_INVALID_PARAMETER,
+                libc::EOPNOTSUPP,
+                "refused: rm blob not mappable",
+            );
+        }
         // The guest's size may be smaller than the object (RM rounds to
         // 64 KiB) but never larger: the renderer would let a context bind an
         // image that runs past the end of the memory.
@@ -165,8 +193,8 @@ impl Venus {
             Resource {
                 ctx_id: ctx,
                 size: c.size,
-                flags: 0,
-                map_info: 0,
+                flags: c.blob_flags,
+                map_info: map_cache.filter(|_| mappable).unwrap_or(0),
                 fd: obj.dmabuf,
                 mapped: None,
                 attached: HashSet::from([ctx]),

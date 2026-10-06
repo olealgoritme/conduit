@@ -130,6 +130,8 @@ impl NvidiaBackend {
 
         // dma-bufs exported for scanout from this file hold its objects alive.
         self.forget_scanout_file(handle);
+        // An export descriptor names a placement only while it is open.
+        self.rm_placements.handle_closed(handle as u32);
 
         self.fences.remove(&handle);
         self.forget_os_events(handle);

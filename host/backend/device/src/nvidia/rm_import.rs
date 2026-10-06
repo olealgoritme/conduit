@@ -114,13 +114,120 @@ pub fn modifier_for(layout: SurfaceLayout, tiling: Tiling) -> Option<u64> {
     }
 }
 
+/// Where an RM memory object lives and how the CPU caches it: the `attr`
+/// word RM wrote back into `NV_MEMORY_ALLOCATION_PARAMS` when it allocated
+/// the object (location in bits 26:25, CPU coherency in 31:29; RM answers
+/// with what it actually did, e.g. 0x2a800000 for cached PCI sysmem).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RmPlacement {
+    pub attr: u32,
+}
+
+/// `NVOS32_ATTR_LOCATION_PCI`: system memory.
+const ATTR_LOCATION_PCI: u32 = 1;
+
+impl RmPlacement {
+    /// System memory (`NVOS32_ATTR_LOCATION_PCI`), as opposed to video memory.
+    pub fn sysmem(&self) -> bool {
+        (self.attr >> 25) & 3 == ATTR_LOCATION_PCI
+    }
+
+    /// `NVOS32_ATTR_COHERENCY_*`.
+    pub fn coherency(&self) -> u32 {
+        self.attr >> 29
+    }
+
+    /// The `VIRTIO_GPU_MAP_CACHE_*` a CPU mapping of the object has, or
+    /// `None` for memory that is not CPU-mappable through its dma-buf as
+    /// guest memory (video memory: behind BAR1). Cached and write-back are
+    /// cached (the GPU snoops them: `SYSTEM_COHERENT` PTE aperture);
+    /// write-combined is WC; uncached, write-through and write-protect are
+    /// reported uncached.
+    pub fn map_cache(&self) -> Option<u32> {
+        use protocol::venus::{MAP_CACHE_CACHED, MAP_CACHE_UNCACHED, MAP_CACHE_WC};
+        if !self.sysmem() {
+            return None;
+        }
+        Some(match self.coherency() {
+            1 | 5 => MAP_CACHE_CACHED,
+            2 => MAP_CACHE_WC,
+            _ => MAP_CACHE_UNCACHED,
+        })
+    }
+}
+
+/// RM memory classes whose `NV_MEMORY_ALLOCATION_PARAMS.attr` is recorded:
+/// `NV01_MEMORY_SYSTEM`, `NV01_MEMORY_LOCAL_USER`.
+const PLACED_CLASSES: [u32; 2] = [0x3e, 0x40];
+/// `NV_MEMORY_ALLOCATION_PARAMS.attr`.
+const ALLOC_ATTR: usize = 24;
+/// `NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD` and its parameters:
+/// `object.type` (1 = RM object) at 0, `rmObject.hObject` at 12, `fd` at 16.
+const CTRL_EXPORT_OBJECT_TO_FD: u32 = 0x3d05;
+const EXPORT_TYPE_RM: u32 = 1;
+const EXPORT_H_OBJECT: usize = 12;
+const EXPORT_FD: usize = 16;
+/// Entries kept at once in each map below.
+const MAX_PLACEMENTS: usize = 65536;
+
+/// How each RM memory object the guest allocated is placed, followed from
+/// the allocation to the export descriptor to the GEM object NVK imports
+/// (`RmLayouts::placement`), because nvidia-drm cannot say (a dma-buf of
+/// RM memory carries neither location nor caching) and RM answers neither
+/// through any control a user client may make on the object: its
+/// `GET_SURFACE_INFO` `PHYS_ATTR` is 0 for these, and `RM_MAP_MEMORY` echoes
+/// the default caching type it was asked for.
+#[derive(Default)]
+pub(super) struct RmPlacements {
+    /// (client, object) to placement, from successful `RM_ALLOC`s.
+    objects: HashMap<(u32, u32), RmPlacement>,
+    /// Export descriptor (the guest's handle for it) to the placement of
+    /// the object exported into it.
+    exports: HashMap<u32, RmPlacement>,
+}
+
+impl RmPlacements {
+    fn put<K: std::hash::Hash + Eq>(m: &mut HashMap<K, RmPlacement>, k: K, v: RmPlacement) {
+        if m.len() >= MAX_PLACEMENTS && !m.contains_key(&k) {
+            return;
+        }
+        m.insert(k, v);
+    }
+
+    /// The guest's handle `handle` closed: an export descriptor it was goes.
+    pub(super) fn handle_closed(&mut self, handle: u32) {
+        self.exports.remove(&handle);
+    }
+
+    #[cfg(test)]
+    pub(super) fn objects(&self) -> usize {
+        self.objects.len()
+    }
+}
+
 /// What the backend remembers of each GEM object NVK imported: its modifier,
 /// or `None` when it has none a 2D image can name. Keyed by (DRM file
-/// handle, host GEM handle).
+/// handle, host GEM handle). Beside it, where the memory behind the object
+/// lives ([`RmPlacement`]), when the backend followed it from the
+/// allocation.
 #[derive(Default)]
-pub(super) struct RmLayouts(HashMap<(u32, u32), Option<u64>>);
+pub(super) struct RmLayouts(
+    HashMap<(u32, u32), Option<u64>>,
+    HashMap<(u32, u32), RmPlacement>,
+);
 
 impl RmLayouts {
+    pub(super) fn set_placement(&mut self, owner: u32, gem: u32, p: RmPlacement) {
+        RmPlacements::put(&mut self.1, (owner, gem), p);
+    }
+
+    /// Where the memory behind GEM handle `gem` of file `owner` lives, when
+    /// known.
+    #[cfg_attr(not(feature = "venus"), allow(dead_code))]
+    pub(super) fn placement(&self, owner: u32, gem: u32) -> Option<RmPlacement> {
+        self.1.get(&(owner, gem)).copied()
+    }
+
     pub(super) fn insert(&mut self, owner: u32, gem: u32, modifier: Option<u64>) {
         if self.0.len() >= MAX_LAYOUTS && !self.0.contains_key(&(owner, gem)) {
             log::warn!(
@@ -141,10 +248,12 @@ impl RmLayouts {
 
     pub(super) fn forget(&mut self, owner: u32, gem: u32) {
         self.0.remove(&(owner, gem));
+        self.1.remove(&(owner, gem));
     }
 
     pub(super) fn forget_owner(&mut self, owner: u32) {
         self.0.retain(|(o, _), _| *o != owner);
+        self.1.retain(|(o, _), _| *o != owner);
     }
 
     pub(super) fn len(&self) -> usize {
@@ -152,7 +261,107 @@ impl RmLayouts {
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0.is_empty() && self.1.is_empty()
+    }
+}
+
+impl NvidiaBackend {
+    /// After the host answered an RM call: follow where memory objects live
+    /// (`RmPlacements`). An allocation of a memory class records the `attr`
+    /// RM wrote back; a free forgets it (all of a client's, when the client
+    /// goes); a duplicate copies it; an export to a descriptor carries it to
+    /// that descriptor, from which [`Self::note_gem_import`] takes it.
+    pub(super) fn note_rm_placement(&mut self, payload: &[u8], resp: &[u8]) {
+        const ESC_RM_FREE: u32 = 0x29;
+        const ESC_RM_CONTROL: u32 = 0x2a;
+        const ESC_RM_ALLOC: u32 = 0x2b;
+        const ESC_RM_DUP_OBJECT: u32 = 0x34;
+        if payload.len() < size_of::<IoctlReq>() {
+            return;
+        }
+        let req = read_struct::<IoctlReq>(payload, 0);
+        if (req.cmd >> 8) & 0xFF != b'F' as u32 {
+            return;
+        }
+        let head = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        if resp.len() < head || read_struct::<MsgHeader>(resp, 0).status != 0 {
+            return;
+        }
+        let r = read_struct::<IoctlResp>(resp, size_of::<MsgHeader>());
+        let (data_len, nested_len) = (r.data_len as usize, r.nested_len as usize);
+        let Some(out) = resp.get(head..head + data_len + nested_len) else {
+            return;
+        };
+        let (top, nested) = out.split_at(data_len);
+        let w = |b: &[u8], at: usize| {
+            b.get(at..at + 4)
+                .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        };
+        let p = &mut self.rm_placements;
+        match req.cmd & 0xFF {
+            // NVOS64: hRoot, hObjectParent, hObjectNew, hClass, pAllocParms,
+            // pRightsRequested, paramsSize, flags, status at 40.
+            ESC_RM_ALLOC => {
+                let (Some(client), Some(object), Some(class), Some(status)) =
+                    (w(top, 0), w(top, 8), w(top, 12), w(top, 40))
+                else {
+                    return;
+                };
+                if status != 0 || !PLACED_CLASSES.contains(&class) {
+                    return;
+                }
+                if let Some(attr) = w(nested, ALLOC_ATTR) {
+                    RmPlacements::put(&mut p.objects, (client, object), RmPlacement { attr });
+                }
+            }
+            // NVOS00: hRoot, hObjectParent, hObjectOld, status.
+            ESC_RM_FREE => {
+                let (Some(client), Some(object), Some(0)) = (w(top, 0), w(top, 8), w(top, 12))
+                else {
+                    return;
+                };
+                if client == object {
+                    p.objects.retain(|(c, _), _| *c != client);
+                } else {
+                    p.objects.remove(&(client, object));
+                }
+            }
+            // NVOS55: hClient, hParent, hObject, hClientSrc, hObjectSrc,
+            // flags, status.
+            ESC_RM_DUP_OBJECT => {
+                let (Some(client), Some(object), Some(sc), Some(so), Some(0)) =
+                    (w(top, 0), w(top, 8), w(top, 12), w(top, 16), w(top, 24))
+                else {
+                    return;
+                };
+                if let Some(pl) = p.objects.get(&(sc, so)).copied() {
+                    RmPlacements::put(&mut p.objects, (client, object), pl);
+                }
+            }
+            // NVOS54: hClient, hObject, cmd, flags, params, paramsSize,
+            // status at 28.
+            ESC_RM_CONTROL => {
+                let (Some(client), Some(CTRL_EXPORT_OBJECT_TO_FD), Some(0)) =
+                    (w(top, 0), w(top, 8), w(top, 28))
+                else {
+                    return;
+                };
+                let (Some(EXPORT_TYPE_RM), Some(object), Some(fd)) = (
+                    w(nested, 0),
+                    w(nested, EXPORT_H_OBJECT),
+                    w(nested, EXPORT_FD),
+                ) else {
+                    return;
+                };
+                match p.objects.get(&(client, object)).copied() {
+                    Some(pl) => RmPlacements::put(&mut p.exports, fd, pl),
+                    None => {
+                        p.exports.remove(&fd);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -214,6 +423,16 @@ impl NvidiaBackend {
         let body = &payload[size_of::<IoctlReq>()..];
         let start = req.data_len as usize;
         let end = start + req.nested_len as usize;
+        // `memFd` (the guest's handle for the export descriptor) opens the
+        // NVKMS block: where the memory lives comes with it, when the
+        // backend saw the allocation and the export.
+        if let Some(pl) = body
+            .get(start..start + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .and_then(|fd| self.rm_placements.exports.get(&fd).copied())
+        {
+            self.rm_layouts.set_placement(owner, gem, pl);
+        }
         let layout = body
             .get(start..end)
             .and_then(parse_nvkms_import)
@@ -272,6 +491,9 @@ pub struct RmObject {
     /// Its modifier, when the backend saw the GEM import (`None`: not seen,
     /// or a layout with no 2D modifier).
     pub modifier: Option<u64>,
+    /// Where its memory lives, when the backend followed it from the RM
+    /// allocation (`None`: not seen).
+    pub placement: Option<RmPlacement>,
 }
 
 #[cfg_attr(not(feature = "venus"), allow(dead_code))]
@@ -296,6 +518,7 @@ impl RmView<'_> {
         Ok(RmObject {
             dmabuf,
             modifier: self.layouts.get(rm_handle, gem_handle).flatten(),
+            placement: self.layouts.placement(rm_handle, gem_handle),
         })
     }
 }
@@ -519,6 +742,158 @@ mod tests {
             be.rm_layouts.get(dri as u32, GEM_HANDLE),
             Some(Some(MOD_LINEAR))
         );
+    }
+
+    /// An answered RM call as `note_rm_placement` sees it: the request
+    /// (command, top-level struct, nested block) and the response carrying
+    /// what the host wrote back into both.
+    fn rm_answer(be: &mut NvidiaBackend, esc: u32, top: &[u8], nested: &[u8]) {
+        let mut payload = vec![0u8; size_of::<IoctlReq>()];
+        write_struct(
+            &mut payload,
+            &IoctlReq {
+                cmd: 0xC000_4600 | esc,
+                data_len: top.len() as u32,
+                nested_offset: top.len() as u32,
+                nested_len: nested.len() as u32,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        payload.extend_from_slice(top);
+        payload.extend_from_slice(nested);
+        let mut resp = vec![0u8; size_of::<MsgHeader>() + size_of::<IoctlResp>()];
+        write_struct(&mut resp, &MsgHeader::ok(MsgType::Ioctl, 0));
+        write_struct(
+            &mut resp[size_of::<MsgHeader>()..],
+            &IoctlResp {
+                data_len: top.len() as u32,
+                nested_len: nested.len() as u32,
+                deep_len: 0,
+            },
+        );
+        resp.extend_from_slice(top);
+        resp.extend_from_slice(nested);
+        be.note_rm_placement(&payload, &resp);
+    }
+
+    fn words(n: usize, set: &[(usize, u32)]) -> Vec<u8> {
+        let mut v = vec![0u8; n];
+        for &(at, x) in set {
+            v[at..at + 4].copy_from_slice(&x.to_le_bytes());
+        }
+        v
+    }
+
+    const CLIENT: u32 = 0xc1d0_0042;
+    const MEM: u32 = 0x5c00_0005;
+
+    /// RM_ALLOC of `class` answered with `attr`.
+    fn alloc(be: &mut NvidiaBackend, class: u32, object: u32, attr: u32) {
+        rm_answer(
+            be,
+            0x2b,
+            &words(
+                48,
+                &[(0, CLIENT), (4, 0x5c00_0001), (8, object), (12, class)],
+            ),
+            &words(128, &[(ALLOC_ATTR, attr)]),
+        );
+    }
+
+    /// OS_UNIX_EXPORT_OBJECT_TO_FD of `object` into descriptor `fd`.
+    fn export(be: &mut NvidiaBackend, object: u32, fd: u32) {
+        rm_answer(
+            be,
+            0x2a,
+            &words(
+                32,
+                &[(0, CLIENT), (4, CLIENT), (8, CTRL_EXPORT_OBJECT_TO_FD)],
+            ),
+            &words(
+                24,
+                &[
+                    (0, EXPORT_TYPE_RM),
+                    (4, 0x5c00_0001),
+                    (8, 0x5c00_0001),
+                    (EXPORT_H_OBJECT, object),
+                    (EXPORT_FD, fd),
+                ],
+            ),
+        );
+    }
+
+    /// Where the memory behind a GEM object lives is followed from RM's
+    /// answer to the allocation, through the export descriptor, to the GEM
+    /// import that names it; a free or a closed descriptor ends the trail.
+    #[test]
+    fn the_placement_follows_the_allocation_to_the_gem_object() {
+        // What RM wrote back on the host (rm_sysmem_flip): cached PCI
+        // sysmem, write-combined PCI sysmem, video memory.
+        const SYS_CACHED: u32 = 0x2a80_0000;
+        const SYS_WC: u32 = 0x4a80_0000;
+        const VIDMEM: u32 = 0x1100_0000;
+        let p = |attr| RmPlacement { attr };
+        assert_eq!(
+            p(SYS_CACHED).map_cache(),
+            Some(protocol::venus::MAP_CACHE_CACHED)
+        );
+        assert_eq!(p(SYS_WC).map_cache(), Some(protocol::venus::MAP_CACHE_WC));
+        assert_eq!(p(VIDMEM).map_cache(), None);
+        assert_eq!(
+            p(1 << 25).map_cache(),
+            Some(protocol::venus::MAP_CACHE_UNCACHED)
+        );
+
+        let (mut be, dri, ctl, _) = drm_backend(1 << 20);
+        alloc(&mut be, 0x3e, MEM, SYS_CACHED);
+        alloc(&mut be, 0x0071, MEM + 1, SYS_CACHED); // not a placed class
+        assert_eq!(be.rm_placements.objects(), 1);
+        export(&mut be, MEM, ctl as u32);
+        import_layout(&mut be, dri, ctl, NVKMS_LAYOUT_PITCH, 0);
+        assert_eq!(
+            be.rm_layouts.placement(dri as u32, GEM_HANDLE),
+            Some(p(SYS_CACHED))
+        );
+        let o = be.rm_view().export(dri as u32, GEM_HANDLE).unwrap();
+        assert_eq!(o.placement, Some(p(SYS_CACHED)));
+
+        // Video memory exported into the same descriptor replaces it.
+        alloc(&mut be, 0x40, MEM + 2, VIDMEM);
+        export(&mut be, MEM + 2, ctl as u32);
+        import_layout(&mut be, dri, ctl, NVKMS_LAYOUT_PITCH, 0);
+        assert_eq!(
+            be.rm_layouts.placement(dri as u32, GEM_HANDLE),
+            Some(p(VIDMEM))
+        );
+
+        // A freed object exports nothing known; the GEM close forgets.
+        rm_answer(&mut be, 0x29, &words(16, &[(0, CLIENT), (8, MEM)]), &[]);
+        export(&mut be, MEM, ctl as u32);
+        be.rm_layouts.forget(dri as u32, GEM_HANDLE);
+        import_layout(&mut be, dri, ctl, NVKMS_LAYOUT_PITCH, 0);
+        assert_eq!(be.rm_layouts.placement(dri as u32, GEM_HANDLE), None);
+
+        // A client's free takes all of its objects; a dup copies one.
+        alloc(&mut be, 0x3e, MEM, SYS_WC);
+        rm_answer(
+            &mut be,
+            0x34,
+            &words(28, &[(0, CLIENT), (8, MEM + 9), (12, CLIENT), (16, MEM)]),
+            &[],
+        );
+        assert_eq!(be.rm_placements.objects(), 3);
+        rm_answer(&mut be, 0x29, &words(16, &[(0, CLIENT), (8, CLIENT)]), &[]);
+        assert_eq!(be.rm_placements.objects(), 0);
+
+        // A failed allocation records nothing.
+        rm_answer(
+            &mut be,
+            0x2b,
+            &words(48, &[(0, CLIENT), (8, MEM), (12, 0x3e), (40, 0x51)]),
+            &words(128, &[(ALLOC_ATTR, SYS_CACHED)]),
+        );
+        assert_eq!(be.rm_placements.objects(), 0);
     }
 
     #[test]

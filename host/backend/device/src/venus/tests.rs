@@ -167,6 +167,8 @@ impl Renderer for Shared {
 #[derive(Default)]
 struct FakeRm {
     objects: HashMap<(u32, u32), (u64, Option<u64>)>,
+    /// The `attr` RM allocated each with, when the test says.
+    placements: HashMap<(u32, u32), u32>,
     /// The file descriptors handed out, by inode, so a test can tell the
     /// renderer got the same object.
     exported: Mutex<Vec<u64>>,
@@ -180,7 +182,14 @@ impl RmExports for FakeRm {
                 .ok_or(if rm == 7 { libc::ENOENT } else { libc::EBADF })?;
         let dmabuf = conduit_venus::mock::memfd(size).map_err(|_| libc::EIO)?;
         self.exported.lock().unwrap().push(inode(dmabuf.as_fd()));
-        Ok(crate::nvidia::RmObject { dmabuf, modifier })
+        Ok(crate::nvidia::RmObject {
+            dmabuf,
+            modifier,
+            placement: self
+                .placements
+                .get(&(rm, gem))
+                .map(|&attr| crate::nvidia::RmPlacement { attr }),
+        })
     }
 }
 

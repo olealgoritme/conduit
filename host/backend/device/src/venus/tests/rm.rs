@@ -122,14 +122,15 @@ fn rm_blob_refusals_say_why() {
         refusal(&mut t, &rm_blob_cmd(1, 50, 7, 78, 1 << 20)),
         (RESP_ERR_INVALID_PARAMETER, libc::ENOENT)
     );
-    // Its shape: no flags (so never mappable), no entries, a size.
+    // Its shape: no flags but MAPPABLE and SHAREABLE, no entries, a size.
     for c in [
         ResourceCreateBlob {
-            blob_flags: BLOB_FLAG_USE_MAPPABLE,
+            blob_flags: BLOB_FLAG_USE_CROSS_DEVICE,
             ..ok
         },
         ResourceCreateBlob {
-            blob_flags: BLOB_FLAG_USE_SHAREABLE,
+            blob_flags: BLOB_FLAG_USE_MAPPABLE,
+            size: HOSTMEM + 4096,
             ..ok
         },
         ResourceCreateBlob { size: 0, ..ok },
@@ -139,6 +140,17 @@ fn rm_blob_refusals_say_why() {
             (RESP_ERR_INVALID_PARAMETER, libc::EINVAL)
         );
     }
+    // MAPPABLE of memory whose placement the backend did not follow.
+    assert_eq!(
+        refusal(
+            &mut t,
+            &ResourceCreateBlob {
+                blob_flags: BLOB_FLAG_USE_MAPPABLE,
+                ..ok
+            }
+        ),
+        (RESP_ERR_INVALID_PARAMETER, libc::EOPNOTSUPP)
+    );
     // Context and resource ids as for any blob; no errno for those.
     assert_eq!(
         refusal(&mut t, &rm_blob_cmd(3, 50, 7, 77, 1 << 20)),
@@ -321,4 +333,106 @@ fn a_reset_lets_go_of_every_rm_blob() {
         })
         .count();
     assert_eq!(open, 0, "the object is still held");
+}
+
+/// RM `attr` as RM answers it for cached PCI sysmem, WC PCI sysmem and video
+/// memory (measured with rm_sysmem_flip on the host).
+const SYS_CACHED: u32 = 0x2a80_0000;
+const SYS_WC: u32 = 0x4a80_0000;
+const VIDMEM: u32 = 0x1100_0000;
+
+/// A MAPPABLE RM-export blob of system memory is mapped like a HOST3D blob:
+/// its dma-buf placed at the guest's offset in region 3, `map_info` the CPU
+/// caching RM gave the memory. The guest writes through it into the very
+/// object, an unmap takes the view away, and the resource (with the object)
+/// lives on until UNREF.
+#[test]
+fn a_mappable_sysmem_rm_blob_maps_into_region_3() {
+    let mut t = Rig::new();
+    let object = 1u64 << 20;
+    t.rm.objects.insert((7, 77), (object, Some(0)));
+    t.rm.placements.insert((7, 77), SYS_CACHED);
+    t.rm.objects.insert((7, 78), (object, Some(0)));
+    t.rm.placements.insert((7, 78), SYS_WC);
+    t.rm.objects.insert((7, 79), (object, Some(0)));
+    t.rm.placements.insert((7, 79), VIDMEM);
+    t.ctx(1);
+    let mappable = |id, gem, size| ResourceCreateBlob {
+        blob_flags: BLOB_FLAG_USE_MAPPABLE | BLOB_FLAG_USE_SHAREABLE,
+        ..rm_blob_cmd(1, id, 7, gem, size)
+    };
+    // Video memory is behind BAR1: not mappable this way.
+    assert_eq!(
+        refusal(&mut t, &mappable(52, 79, object)),
+        (RESP_ERR_INVALID_PARAMETER, libc::EOPNOTSUPP)
+    );
+    // Any size up to the object's; the mapping covers whole pages.
+    assert_eq!(
+        t.ty(&mappable(50, 77, object - 100).to_bytes()),
+        RESP_OK_NODATA
+    );
+    assert_eq!(t.ty(&mappable(51, 78, 8192).to_bytes()), RESP_OK_NODATA);
+
+    // MAP_BLOB: the offset's checks are region 3's; map_info is the caching.
+    assert_eq!(t.map(50, 100), RESP_ERR_INVALID_PARAMETER);
+    let (h, body) = t.send(&map_cmd(50, 1 << 20));
+    assert_eq!(h.ty, RESP_OK_MAP_INFO);
+    assert_eq!(
+        u32::from_le_bytes(body[0..4].try_into().unwrap()) & MAP_CACHE_MASK,
+        MAP_CACHE_CACHED
+    );
+    let (h, body) = t.send(&map_cmd(51, 4 << 20));
+    assert_eq!(h.ty, RESP_OK_MAP_INFO);
+    assert_eq!(
+        u32::from_le_bytes(body[0..4].try_into().unwrap()) & MAP_CACHE_MASK,
+        MAP_CACHE_WC
+    );
+    assert_eq!(
+        t.region.calls(),
+        vec![("place", 1 << 20, object), ("place", 4 << 20, 8192)]
+    );
+
+    // Writes through region 3 land in the object (the backend's own fd).
+    let at = t.region.base + (1 << 20);
+    // SAFETY: inside the placed mapping.
+    unsafe { std::ptr::write_volatile((at + 4096) as *mut u32, 0x00c0_ffee) };
+    let fd = t.venus.resources[&50].fd.as_raw_fd();
+    let mut word = [0u8; 4];
+    // SAFETY: a 4-byte read into a local from a descriptor we hold.
+    assert_eq!(
+        unsafe { libc::pread(fd, word.as_mut_ptr().cast(), 4, 4096) },
+        4
+    );
+    assert_eq!(u32::from_le_bytes(word), 0x00c0_ffee);
+
+    // UNMAP takes the view away; the resource and its object stay.
+    assert_eq!(
+        t.ty(&res_cmd(CMD_RESOURCE_UNMAP_BLOB, 0, 50)),
+        RESP_OK_NODATA
+    );
+    assert_eq!(
+        t.region.calls().last(),
+        Some(&("withdraw", 1 << 20, object))
+    );
+    assert_eq!(t.venus.resources(), 2);
+    assert_eq!(
+        unsafe { libc::pread(fd, word.as_mut_ptr().cast(), 4, 4096) },
+        4,
+        "still the backend's"
+    );
+    // Mapped again (elsewhere), then UNREF while mapped: unmapped first.
+    assert_eq!(t.map(50, 8 << 20), RESP_OK_MAP_INFO);
+    assert_eq!(t.ty(&res_cmd(CMD_RESOURCE_UNREF, 0, 50)), RESP_OK_NODATA);
+    assert_eq!(
+        t.region.calls().last(),
+        Some(&("withdraw", 8 << 20, object))
+    );
+    assert_eq!(t.venus.mappings(), 1);
+
+    // Without MAPPABLE an RM blob still cannot be mapped.
+    assert_eq!(
+        t.ty(&rm_blob_cmd(1, 53, 7, 77, 4096).to_bytes()),
+        RESP_OK_NODATA
+    );
+    assert_eq!(t.map(53, 16 << 20), RESP_ERR_INVALID_PARAMETER);
 }
