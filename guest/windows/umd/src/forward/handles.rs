@@ -47,6 +47,13 @@ com_handles!(
     // DC-local command-list region is a borrowed COPY of the same word,
     // closed by clearing — the DC table's close shim, never `release`.
     crate::ddi::D3D11DDI_HCOMMANDLIST,
+    // The D3D11.1 video DDI (`forward/video.rs`): each holds its DXVK object.
+    crate::ddi::D3D11_1DDI_HDECODE,
+    crate::ddi::D3D11_1DDI_HVIDEOPROCESSORENUM,
+    crate::ddi::D3D11_1DDI_HVIDEOPROCESSOR,
+    crate::ddi::D3D11_1DDI_HVIDEODECODEROUTPUTVIEW,
+    crate::ddi::D3D11_1DDI_HVIDEOPROCESSORINPUTVIEW,
+    crate::ddi::D3D11_1DDI_HVIDEOPROCESSOROUTPUTVIEW,
 );
 
 boxed_handles!(

@@ -479,6 +479,14 @@ unsafe extern "system" fn create_device(
                 );
             }
         }
+        // The >=11.1 interfaces fetch sub-object tables (the D3D11.1 video DDI)
+        // through ppfnRetrieveSubObject; 11.0's argument struct ends before it.
+        // `retrieve_sub_object` itself decides per device (`VideoDdi` knob).
+        if matches!(negotiated, NegotiatedInterface::D3D11_1 | NegotiatedInterface::Wddm1_3)
+            && !create.ppfnRetrieveSubObject.is_null()
+        {
+            *create.ppfnRetrieveSubObject = Some(forward::retrieve_sub_object);
+        }
     }
 
     // The device is handed to the runtime from here; it owns teardown through

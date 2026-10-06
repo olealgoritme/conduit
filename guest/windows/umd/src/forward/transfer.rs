@@ -194,6 +194,13 @@ pub(crate) unsafe extern "system" fn resource_map(
         return;
     };
     let mut out = D3D11_MAPPED_SUBRESOURCE::default();
+    // Video decoder buffers are staging buffers (forward/video.rs), which take
+    // no DISCARD/NO_OVERWRITE map. Only checked for those two map types.
+    let map_type = if (map_type == 4 || map_type == 5) && is_decoder_buffer(h_resource) {
+        decoder_buffer_map_type(map_type as u32) as ddi::D3D10_DDI_MAP
+    } else {
+        map_type
+    };
     // DDI D3D10_DDI_MAP values match D3D11_MAP (READ=1, WRITE=2, ...).
     match context.Map(
         &*res,

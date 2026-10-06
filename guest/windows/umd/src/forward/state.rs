@@ -51,6 +51,9 @@ pub struct ResourceState {
     /// resources, so no validity test can turn this source into a scanout
     /// selector.
     pub(crate) snapshot_source: Option<SnapshotSourceDesc>,
+    /// A D3D11.1 video decoder buffer (`DecoderBufferType` != 0): a staging
+    /// buffer the runtime maps for the app and `forward/video.rs` reads back.
+    pub(crate) decoder_buffer: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -665,7 +668,22 @@ pub(crate) unsafe fn store_resource(
         ownership,
         present_private,
         snapshot_source,
+        decoder_buffer: false,
     });
+}
+
+/// Marks a just-stored resource as a video decoder buffer.
+pub(crate) unsafe fn mark_decoder_buffer(h_res: ddi::D3D10DDI_HRESOURCE) {
+    if let Some(slot) = boxed_slot(h_res) {
+        let state = slot.ptr();
+        if !state.is_null() {
+            (*state).decoder_buffer = true;
+        }
+    }
+}
+
+pub(crate) unsafe fn is_decoder_buffer(h_res: ddi::D3D10DDI_HRESOURCE) -> bool {
+    resource_state(h_res).is_some_and(|s| s.decoder_buffer)
 }
 
 pub(crate) unsafe fn stamp_dxvk_resource_kmt_handles(

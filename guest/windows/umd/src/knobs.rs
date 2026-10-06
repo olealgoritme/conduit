@@ -377,6 +377,15 @@ pub(crate) fn nvk_present_mode() -> u32 {
     })
 }
 
+/// `VideoDdi`: which devices get the D3D11.1 video DDI (decoder and video
+/// processor, `forward/video.rs`). 0 = none (the behaviour before it existed:
+/// no `ID3D11VideoDevice` at all), 1 = NVK devices (default; H.264 decode on
+/// Vulkan Video when the NVK build has it), 2 = every device (Venus gets the
+/// DXVK video processor and no decoder). The bridge also sets
+/// `NVK_EXPERIMENTAL=video` for NVK processes unless this is 0
+/// (`umd_common/bridge/bridge_icd_backend.cpp`).
+pub(crate) static VIDEO_DDI: DwordKnob = DwordKnob::new(c"VideoDdi", 1);
+
 pub(crate) fn nvk_placeholder_allocations() -> bool {
     NVK_PLACEHOLDER_ALLOCATIONS.get()
 }

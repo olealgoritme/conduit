@@ -24,6 +24,9 @@ pub(crate) unsafe extern "system" fn check_format_support(
         }
     }
     let raw_caps = caps;
+    // Whether this device has the video DDI (`forward/video.rs`); the runtime
+    // validates the video format bits against it.
+    let video = helios_device(h).is_some_and(video_ddi_enabled);
     // Keep format support coherent with the active feature-level profile and
     // D3D11.3 §19.2.5. API D3D11_FORMAT_SUPPORT:
     // MULTISAMPLE_RESOLVE=0x40000, MULTISAMPLE_RENDERTARGET=0x200000,
@@ -34,7 +37,10 @@ pub(crate) unsafe extern "system" fn check_format_support(
     const MSAA_BITS: u32 = MSAA_RESOLVE | MSAA_RENDERTARGET | MSAA_LOAD;
     const DDI_MSAA_RENDERTARGET: u32 = 0x0000_0008;
     const DDI_MSAA_LOAD: u32 = 0x0000_0010;
+    // DECODER_OUTPUT, VIDEO_PROCESSOR_OUTPUT, VIDEO_PROCESSOR_INPUT, VIDEO_ENCODER
     const VIDEO_BITS: u32 = 0x0800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000;
+    const VIDEO_ENCODER: u32 = 0x4000_0000;
+    const DECODER_OUTPUT: u32 = 0x0800_0000;
     const TEXTURE1D: u32 = 0x0000_0010;
     const TEXTURE3D: u32 = 0x0000_0040;
     const SHADER_SAMPLE: u32 = 0x0000_0200;
@@ -139,11 +145,13 @@ pub(crate) unsafe extern "system" fn check_format_support(
         if dxgi_resolve_required(fmt as u32) {
             caps |= MSAA_RESOLVE;
         }
-        // Helios does not implement the D3D11 video DDI. DXVK's API-level
-        // CheckFormatSupport marks ordinary sampled/output formats as video
-        // processor inputs/outputs, but the Microsoft runtime validates those
-        // bits as part of the UMD feature contract.
-        caps &= !VIDEO_BITS;
+        // Without the video DDI (`VideoDdi` knob, Venus by default) DXVK's
+        // API-level CheckFormatSupport still marks ordinary sampled/output
+        // formats as video processor inputs/outputs, but the Microsoft runtime
+        // validates those bits as part of the UMD feature contract.
+        if !video {
+            caps &= !VIDEO_BITS;
+        }
         if dxgi_color_typeless_parent(fmt as u32) {
             caps = TYPELESS_PARENT_TEXTURE_CAPS;
         }
@@ -267,6 +275,8 @@ pub(crate) unsafe extern "system" fn check_format_support(
         );
     }
     if !out.is_null() {
-        *out = caps;
+        // No encoder anywhere; no decoder output without the video DDI
+        // (DXVK reports it on NVK whenever Vulkan Video decode is there).
+        *out = if video { caps & !VIDEO_ENCODER } else { caps & !(DECODER_OUTPUT | VIDEO_ENCODER) };
     }
 }
