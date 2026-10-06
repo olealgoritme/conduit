@@ -947,11 +947,11 @@ pub(crate) fn reread_knobs() {
     crate::diag::record_named_bytes(b"DefBudEff", budget);
     let pm = hpd_wake::clamp_power_mode(crate::diag::read_config_dword(
         crate::diag::knobs::VS_POWER_MODE,
-        0,
+        1,
     ));
     let wd = hpd_wake::clamp_watchdog(crate::diag::read_config_dword(
         crate::diag::knobs::VS_WATCHDOG,
-        0,
+        1,
     ));
     let idle = hpd_wake::clamp_idle_wake(crate::diag::read_config_dword(
         crate::diag::knobs::VS_IDLE_WAKE,

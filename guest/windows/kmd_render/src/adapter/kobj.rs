@@ -469,7 +469,7 @@ impl AdapterContext {
         use core::sync::atomic::Ordering;
         use helios_kmd_logic::hpd_wake::VsyncWatch;
         use wdk_sys::ntddk::KeQueryInterruptTimePrecise;
-        // v327: `VsWatchdog` 0 (the default) is KMD 325: no watchdog, nothing re-arms a heartbeat
+        // v330: `VsWatchdog` 1 is the default (revive an armed but silent heartbeat); 0 is KMD 325: no watchdog, nothing re-arms a heartbeat
         // but StartDevice and a D0 power call.
         let level = crate::ddi::stall_diag::vs_watchdog();
         if level == 0 || !self.display_half() {
