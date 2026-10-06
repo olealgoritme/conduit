@@ -61,20 +61,69 @@ From `C:\ProgramData\Helios\umd-<dwm pid>.log`:
   Venus while the earlier devices stay on NVK. Decide whether DWM should fail that creation instead, so
   that DWM restarts and the guard counts it.
 
-### 4.2 Composition inputs (the hard part)
+### 4.2 Composition inputs: the main route is "nearly everything on NVK"
 
-| source | today on an NVK DWM | fix | owner |
+DWM composes every window, so an NVK DWM must open every surface. The main route is to shrink the
+deny-list until nearly every process runs on NVK. Video decode, D3D12 and OpenGL (Zink) all run on NVK
+now, so DWM's inputs become NVK surfaces, which it imports by resource id (works). Venus-to-NVK
+cross-import (4.2.3) remains the fallback for what stays on Venus.
+
+**Order:**
+
+1. With DWM still on Venus, set `ForeignImport=1` (the Venus DWM composes NVK surfaces; today the
+   default 0 gives a blank placeholder).
+2. Move entries off the deny-list one category at a time with `NvkAllowList`.
+3. Then turn DWM itself to NVK (`DwmIcd=nvk`).
+
+#### 4.2.1 The built-in deny-list today, entry by entry
+
+Source: `kBuiltinDeny`, `umd_common/bridge/bridge_icd_backend.cpp`. Its stated reason: "DWM and the
+shell compose everything else (S6 moves them); the rest open or produce surfaces shared with Venus
+processes (video, browsers, overlays, capture), which an NVK process cannot import". Every entry is
+there because of **cross-process sharing between an NVK and a Venus process**, not because NVK cannot
+render for it. Once both ends of every share are NVK, that reason is gone. What is left are the limits
+of NVK-to-NVK sharing, listed as "blocker" in the table and in 4.2.2.
+
+| entries | why listed | can move now? | blocker | test |
+|---|---|---|---|---|
+| `dwm.exe` | the compositor | with this branch (`DwmIcd=nvk`) | 4.3 (`ForeignFlip`), 4.2.2 | T2/T3 |
+| `csrss.exe`, `winlogon.exe`, `fontdrvhost.exe`, `rdpclip.exe` | system processes; they rarely or never create a D3D11 device | yes | none known (GDI does not go through the UMD) | allow; boot to desktop; no `umd-<pid>.log` for them, or a clean one |
+| `explorer.exe`, `sihost.exe`, `shellexperiencehost.exe`, `shellhost.exe`, `startmenuexperiencehost.exe`, `searchhost.exe`, `searchapp.exe`, `textinputhost.exe`, `widgets.exe`, `widgetservice.exe`, `phoneexperiencehost.exe`, `crossdeviceresume.exe`, `applicationframehost.exe`, `systemsettings.exe`, `runtimebroker.exe`, `dllhost.exe` | the shell: XAML / DirectComposition surfaces DWM opens; `applicationframehost` and `dllhost` (thumbnails) share surfaces with other processes | after A8 resource ids | **8 bpp surfaces**: T1 shows DWM opening `A8_UNORM` (fmt 65) shell surfaces (800x704, 704x704, 32x32). NVK mints ids for 32 bpp only, and the KMD's layout record takes only the four 32 bpp fourccs | allow one exe, restart it, open the start menu / search / taskbar; DWM log: `foreign` opens, no placeholder |
+| `logonui.exe`, `consent.exe`, `lockapp.exe` | secure-desktop and lock-screen UI composed by DWM | after the shell | same as the shell; a failure here blocks logon or UAC, so move these last of the shell | lock (Win+L), a UAC prompt, unlock |
+| `taskmgr.exe`, `mmc.exe` | interop-heavy (DirectComposition, hosted surfaces) | yes, to try | probably none; DComp swap chains are 32 bpp | open both; their graphs and windows compose |
+| `msedge.exe`, `msedgewebview2.exe`, `chrome.exe`, `firefox.exe`, `brave.exe`, `opera.exe` | multi-process GPU sharing (renderer to GPU process to DComp), keyed mutex, NV12 video | not yet | (1) cross-process keyed mutex ordering: the S6 hand-off ledger, in progress; (2) **NV12/P010 shared textures** for video (decode, VideoProcessor, DComp video overlays): no ids for non-32 bpp or multi-plane; (3) fp16 for HDR video | allow one browser; scroll a page (32 bpp sharing), then play H.264 video; GPU process and DWM logs |
+| `teams.exe`, `ms-teams.exe`, `discord.exe`, `slack.exe`, `spotify.exe`, `code.exe`, `steamwebhelper.exe`, `epicwebhelper.exe`, `cefsharp.browsersubprocess.exe` | Chromium/Electron/CEF: same model as browsers | with the browsers | same as browsers | same as browsers |
+| `vlc.exe`, `mpc-hc64.exe`, `mpc-be64.exe`, `video.ui.exe`, `microsoft.photos.exe`, `photos.exe` | D3D11VA decode, NV12/YUV swap chains, MF / DComp video | partly: a player that presents RGB through its own swap chain can move now (NVK has H.264 decode; other codecs fall back to software) | NV12/YUV swap chains or shared NV12 surfaces, as for browsers | play H.264 and HEVC in each; frame drops, DWM opens |
+| `obs64.exe`, `obs32.exe` | capture: Desktop Duplication (opens DWM's output) and game-capture shared textures | after DWM on NVK | duplication of an NVK DWM's primary (a foreign resource; 32 bpp, should import); game capture is then NVK to NVK | display capture, window capture, game capture of an NVK D3D11 app |
+| `nvidia share.exe` | GeForce overlay; no NVIDIA driver in the guest | remove the entry | none | n/a |
+
+Expected leftovers on Venus:
+
+* **DXR / ray-tracing titles** (`NvkDenyList12`, D3D12 only; NVK reports no DXR).
+* Until 8 bpp, multi-plane and fp16 resource ids exist: browsers, Electron apps and video apps for
+  video and HDR content.
+* The secure desktop until the shell has soaked.
+
+#### 4.2.2 What NVK-to-NVK sharing still lacks (blocks the list above)
+
+| gap | fix | owner |
+|---|---|---|
+| 8 bpp (`A8`, `R8`) resource ids: the shell's composition surfaces | `memory_res_id` (NVK 0025) beyond 32 bpp; KMD layout record fourccs (`DRM_FORMAT_R8` and others) and a per-format bpp in the stride/extent check; host `RmResourceImport` takes any RM-export object (no change expected) | NVK, KMD |
+| NV12 / P010 (two planes), fp16 (8 bpp per texel), 10:10:10:2 | layout record with plane 1 (offset, stride); NVK 0025/0031 for multi-plane images; DXVK video textures marked shareable | NVK, KMD, DXVK |
+| cross-process keyed mutex and producer ordering | S6 hand-off ledger (in progress) | UMD, KMD |
+| KMD-made surfaces DWM opens (GDI redirection / standard allocations, `KmdOptimalGdiTexture`, shared primary; `mem_type` 0 in T1) | RM memory with a foreign id per allocation (`shared-surfaces.md` 7 item 4, level 5), or dma-buf with a modifier (4.2.3) | KMD |
+
+#### 4.2.3 Fallback for the leftovers: Venus-to-NVK cross-import
+
+| step | what | owner | state |
 |---|---|---|---|
-| NVK app surfaces (foreign ids) | imported by resource id | none | done |
-| Venus app surfaces (deny-listed browsers, video, shell apps) | NVK open refused. On this branch DWM gets a **blank placeholder** instead of an `E_FAIL` that would kill it, so the window is black | (a) Venus UMD/DXVK: ordinary shared images use `DMA_BUF` export with DRM-modifier tiling (today `OPAQUE_FD`, `0001-helios-nvk-backend-and-foreign-import.patch`), and the modifier, stride and offset go into the WDDM meta / layout trailer. (b) KMD: op 3 accepts a non-foreign resource the caller's process opened (today `NoSuchResource`); the host decides dma-buf vs `EINVAL`. (c) DXVK patch 0002 and the bridge's `nvk_can_open`: import a Venus dma-buf with the meta's layout | UMD + DXVK, KMD, host (deploy the `feat/rm-export-map-blob` `rm_resource`) |
-| KMD-made surfaces (GDI redirection / standard allocations, `KmdOptimalGdiTexture`, shared primary) | Venus blobs; placeholder (black) | KMD: either dma-buf with an explicit modifier (then 4.2 (b) covers them), or RM memory with a foreign id per allocation (`shared-surfaces.md` 7 item 4, level 5 style) | KMD |
-| Non-32 bpp surfaces (NV12/P010 video, fp16 HDR, 10:10:10:2) | NVK refuses a resource id (`memory_res_id`: 32 bpp only) | multi-plane and other bpp in `IMPORT_RM` / the layout record / NVK 0025 | NVK + KMD |
+| a | Venus DXVK: ordinary shared images get `DMA_BUF` export with DRM-modifier tiling, not `OPAQUE_FD` (`0001-helios-nvk-backend-and-foreign-import.patch`). The modifier, stride and offset go into the WDDM meta / layout trailer | UMD + DXVK | not started |
+| b | KMD op 3 (`RM_RESOURCE_IMPORT`) accepts a non-foreign resource that the caller's process opened. Today it is refused with `NoSuchResource` (`kmd_logic::rm_resource_import::authorize` requires a foreign record) | KMD | not started |
+| c | Host msg 31 for a Venus blob whose renderer export is a dma-buf | host | **deployed**: backend a51a8c6 (host-all 489b71f, `venus/rm.rs` `rm_resource`) answers a dma-buf Venus blob with an unknown modifier, `EINVAL` for `OPAQUE_FD`, `ENOENT` for an unknown id |
+| d | DXVK patch 0002 and the bridge's `nvk_can_open`: import a Venus dma-buf with the layout from the open's meta | UMD + DXVK | not started |
 
-**Can the deny-list shrink instead?** Only partly. An all-NVK desktop still needs the following on
-Venus or new work: GDI and KMD surfaces (KMD row above); DXR titles (`NvkDenyList12`; NVK reports no
-DXR); and video and HDR (non-32 bpp shared surfaces). Browsers also need cross-process keyed mutex
-(the hand-off ledger in progress) and NV12 sharing. So the Venus to NVK import route (4.2 (a) to (c))
-is needed for the transition. Shrinking the deny-list is the end state, not the first step.
+Until then, an NVK DWM gets a **blank placeholder** for any surface it cannot import (this branch),
+not the `E_FAIL` that killed DWM.
 
 ### 4.3 Flipping DWM's buffers (KMD; the `ForeignFlip` arm in progress)
 
