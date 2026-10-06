@@ -379,6 +379,13 @@ pub const fn repeat_gate_100ns(knob_ms: u32) -> u64 {
     ms as u64 * 10_000
 }
 
+/// Whether the shared wake word still holds the wake this arm asked for a held repeat
+/// (`held` = the time it stored, 0 = none; `current` = the word now): only then may the arm
+/// clear it. A different value is another owner's (level 5, the presenter's pacing) and stays.
+pub const fn owns_held_wake(held: u64, current: u64) -> bool {
+    held != 0 && current == held
+}
+
 /// What the repeat gate says about a refresh edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Repeat {
@@ -412,7 +419,7 @@ pub fn target_ready(t: Option<&Target>, epoch: u64) -> bool {
 /// [`ref_name`]). At most 13 characters each, all with the `Ff` prefix no other counter uses.
 /// `FfKnob` (when the knob is read) and `FfGaveUp` (at the event) are also written at their
 /// event; everything else only by the throttled mirror.
-pub const COUNTERS: [&str; 48] = [
+pub const COUNTERS: [&str; 49] = [
     "FfKnob",
     "FfProg",
     "FfSame",
@@ -467,6 +474,8 @@ pub const COUNTERS: [&str; 48] = [
     "FfNewGem",
     "FfWaitN",
     "FfRepMsEff",
+    // Held-repeat wakes cleared because nothing was left to repeat (`owns_held_wake`).
+    "FfStaleWake",
 ];
 
 /// Name of the per-reason refusal counter: `FfRef01` .. `FfRef15`.
@@ -1365,6 +1374,14 @@ mod tests {
         }
         assert!(flips <= 101, "{flips} repeats in 10 s");
         assert!(flips >= 90, "{flips} repeats in 10 s: the gate starves the picture");
+    }
+
+    #[test]
+    fn a_held_wake_is_cleared_only_when_it_is_still_ours() {
+        assert!(owns_held_wake(5_000, 5_000));
+        assert!(!owns_held_wake(0, 0), "nothing was held");
+        assert!(!owns_held_wake(5_000, 0), "already cleared");
+        assert!(!owns_held_wake(5_000, 4_000), "another owner's earlier wake");
     }
 
     #[test]
