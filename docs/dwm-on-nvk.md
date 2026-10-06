@@ -343,3 +343,28 @@ Run each step only in a quiet window agreed with the install agent. Always end w
 * `FfNoRec` rises only while DWM runs on Venus.
 * Mirrors: `VsCnt`/`VsCntT` frozen; `ScVs` flat while `VpVsN` advances.
 * Reverts clean; no crash.
+
+### T5 (2026-10-06 14:11 to 14:35, 22.22.325.1; `ForeignFlip=1`, `DwmIcd=nvk`, motion load)
+
+Load during each pass: an NVK `d3d11_spin` window (1280x720, `HELIOS_NVK_PRESENT=2`, about 8000
+fps), whose log says "composed by DWM", plus `gdi-move.ps1` (about 36 window moves/s). Three
+passes, with `FfAsyncWin` 0, 2 and 4.
+
+| FfAsyncWin | FfFrames = FfSeq = FsPres (per second) | mean RTT | FfProg / FfEdges | FlipIss / FlipPub | VsTickN, VpVsN |
+|---|---|---|---|---|---|
+| 0 | 149-157 | 77 us | 4 (flat) | 5 / 5 (flat) | flat while NVK |
+| 2 | 152-157 | 140 us | 4 (flat) | 5 / 5 (flat) | flat while NVK |
+| 4 | 159-160 | 131 us | 4 (flat) | 5 / 5 (flat) | flat while NVK |
+
+* **The counted ~155 frames/s are not new DWM frames.** They are re-flips of the kept picture,
+  driven by the HPD loop spinning at about 9600 loops/s (`HpdSite` 11).
+* DWM's programmed flips stop at 4, its vsync/flip-done mirrors freeze, and it made only about 26
+  presents in 40 s of motion: its flips are not retired.
+* The async window does not help, because the host round trip (77-140 us) was never the limit. The
+  next KMD item is retiring flips for foreign primaries: vsync ticks and flip completion to dxgkrnl
+  while the foreign source owns scanout.
+* In-guest screenshots show a correct composition: the NVK spin window and the moving GDI window, a
+  black (placeholder) wallpaper, the taskbar. This is what the guest reads, not a check of the host
+  viewer.
+* `FfFlipFail`, `FkKeep`, `FfAsOrph` and `PBRet` are 0. No crash; every pass reverted to a stable
+  Venus DWM.
