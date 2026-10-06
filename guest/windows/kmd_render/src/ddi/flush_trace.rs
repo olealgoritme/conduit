@@ -14,7 +14,7 @@
 //!   submit ([`submit_trace`], [`SubmitTrace::record`]); the boundary it decoded is compared
 //!   with the one the Render merged.
 //! * RETIRE, the completion DPC, or SubmitCommand itself when the fence was satisfiable at
-//!   once ([`note_retire`], [`SubmitTrace::retire_at_submit`]).
+//!   once ([`note_retire`], and [`SubmitTrace::record`] for [`Disposition::Immediate`]).
 //!
 //! The gate kind (Venus stream point, RM fence, wire rung) rides on every event. The counters
 //! are published by [`publish_counters`] from `publish_nvrm_counters` (PASSIVE).
@@ -48,6 +48,14 @@ static BATCHED: AtomicU32 = AtomicU32::new(0);
 static MATCHED: AtomicU32 = AtomicU32::new(0);
 /// `FlGMis`: SubmitCommands that did not find it.
 static MISMATCHED: AtomicU32 = AtomicU32::new(0);
+/// `FlGExempt`: SubmitCommands of a record that replaced an earlier pending one (batched
+/// into one DMA buffer): counted in `FlGSub`, in neither `FlGMat` nor `FlGMis`.
+static EXEMPT: AtomicU32 = AtomicU32::new(0);
+/// `FlGSigFail`: fences satisfiable at SubmitCommand whose `DMA_COMPLETED` could not be
+/// delivered there (notification failed, or no callback table); not tracked.
+static SIGNAL_FAILED: AtomicU32 = AtomicU32::new(0);
+/// `FlGSyncSkip`: `FlGSyncMs` waits skipped because the live IRQL was above PASSIVE.
+static SYNC_SKIPPED: AtomicU32 = AtomicU32::new(0);
 /// `FlGEmpty`: SubmitCommands that found NO private-data record at all (a subset of
 /// `FlGMis` when the Render expected one): the buffer's private data was not the one the
 /// Render wrote, or dxgkrnl handed SubmitCommand a different range.
@@ -87,6 +95,9 @@ pub(crate) fn init_from_registry() {
         0,
     ));
     SYNC_MS.store(ms, Ordering::Relaxed);
+    // A restart (`pnputil /restart-device`) must not inherit queued-fence slots of the
+    // previous transport: those fences will never retire.
+    note_abandon();
 }
 
 /// The `FlGSyncMs` value in force (0 = off).
@@ -145,6 +156,8 @@ pub(crate) fn note_render(context: Option<&ContextHandleRef<'_>>, info: &RenderI
             render_flags: flags,
             expected_boundary,
             expected_floor,
+            // Set by the stash itself, under the context's lock.
+            replaced: false,
         })
     });
     if batched {
@@ -196,11 +209,24 @@ pub(crate) unsafe fn submit_trace(
     })
 }
 
+/// What SubmitCommand did with the fence of a traced packet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// Left in the WDDM FIFO for the completion DPC.
+    Queued,
+    /// Satisfiable at once and `DMA_COMPLETED` was delivered inside SubmitCommand.
+    Immediate,
+    /// Satisfiable at once but the notification failed, or dxgkrnl's callback table was
+    /// unavailable: not delivered, not tracked (`FlGSigFail`).
+    SignalFailed,
+}
+
 impl SubmitTrace {
-    /// SUBMIT, step 2: record the event, inside the notification lock and before the fence
-    /// can be signalled or retired by anyone else. `immediate`: the fence is satisfiable
-    /// now and SubmitCommand will complete it (nothing is queued). Atomics only.
-    pub(crate) fn record(&self, fence: u32, immediate: bool) {
+    /// SUBMIT, step 2: record the event (and, for [`Disposition::Immediate`], the retire),
+    /// inside the notification lock and AFTER the signal decision, so the completion DPC
+    /// cannot retire the fence before its submit is recorded and the event says what
+    /// really happened. Atomics only.
+    pub(crate) fn record(&self, fence: u32, disposition: Disposition) {
         let stamp = now();
         let p = &self.pending;
         SUBMITS.fetch_add(1, Ordering::Relaxed);
@@ -213,16 +239,26 @@ impl SubmitTrace {
         let mut flags = ft::gate_bits(p.render_flags);
         if matched {
             flags |= flag::MATCH;
-            MATCHED.fetch_add(1, Ordering::Relaxed);
-        } else {
-            MISMATCHED.fetch_add(1, Ordering::Relaxed);
         }
+        match ft::account(p, matched) {
+            ft::Account::Matched => MATCHED.fetch_add(1, Ordering::Relaxed),
+            ft::Account::Mismatched => MISMATCHED.fetch_add(1, Ordering::Relaxed),
+            ft::Account::Exempt => {
+                flags |= flag::EXEMPT;
+                EXEMPT.fetch_add(1, Ordering::Relaxed)
+            }
+        };
         if self.empty {
             flags |= flag::EMPTY;
             EMPTY.fetch_add(1, Ordering::Relaxed);
         }
-        if immediate {
-            flags |= flag::IMMEDIATE;
+        match disposition {
+            Disposition::Immediate => flags |= flag::IMMEDIATE,
+            Disposition::SignalFailed => {
+                flags |= flag::SIGNAL_FAILED;
+                SIGNAL_FAILED.fetch_add(1, Ordering::Relaxed);
+            }
+            Disposition::Queued => {}
         }
         RING.record(
             kind::SUBMIT,
@@ -237,14 +273,21 @@ impl SubmitTrace {
             },
             stamp,
         );
-        if !immediate && OUTSTANDING.insert(fence, stamp) == Insert::Refused {
-            TABLE_FULL.fetch_add(1, Ordering::Relaxed);
+        match disposition {
+            Disposition::Queued => {
+                if OUTSTANDING.insert(fence, stamp) == Insert::Refused {
+                    TABLE_FULL.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Disposition::Immediate => self.retire_at_submit(fence),
+            // Nothing was delivered and nothing is queued by this call: not tracked.
+            Disposition::SignalFailed => {}
         }
     }
 
     /// RETIRE, for a fence SubmitCommand completed itself (after a successful
     /// `DMA_COMPLETED`): the gate held nothing.
-    pub(crate) fn retire_at_submit(&self, fence: u32) {
+    fn retire_at_submit(&self, fence: u32) {
         IMMEDIATE.fetch_add(1, Ordering::Relaxed);
         RETIRED.fetch_add(1, Ordering::Relaxed);
         RING.record(
@@ -314,11 +357,12 @@ pub(crate) fn note_transport_submit() {
 ///
 /// Bounded: at most `FlGSyncMs` (clamped to `ft::SYNC_MS_MAX`) plus one timer tick of
 /// overshoot (`KeDelayExecutionThread` rounds a 1 ms sleep up to the timer granularity,
-/// ~15.6 ms by default). PASSIVE only. No lock is held across the wait: each poll takes
-/// `virtio_lock` for one read-only readiness test and drops it before the sleep. A
-/// transport that is down or failed ends the wait (nothing could complete).
+/// ~15.6 ms by default). PASSIVE only, and CHECKED: the live IRQL is read with
+/// `PassiveLevel::try_assume` (the `assume` token is only a counter) and a caller above
+/// PASSIVE returns without sleeping (`FlGSyncSkip`). No lock is held across the wait: each
+/// poll takes `virtio_lock` for one read-only readiness test and drops it before the
+/// sleep. A transport that is down or failed ends the wait (nothing could complete).
 pub(crate) fn sync_wait(
-    passive: crate::irql::PassiveLevel,
     adapter: &AdapterContext,
     boundary: Option<u64>,
     floor: Option<u64>,
@@ -341,6 +385,11 @@ pub(crate) fn sync_wait(
     if ready(adapter) {
         return;
     }
+    // About to sleep: only at a PASSIVE_LEVEL that `KeGetCurrentIrql` confirms.
+    let Some(passive) = crate::irql::PassiveLevel::try_assume() else {
+        SYNC_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
     SYNC_WAITS.fetch_add(1, Ordering::Relaxed);
     let started = now();
     let deadline = started.saturating_add(ms as u64 * 10_000);
@@ -412,6 +461,9 @@ pub(crate) fn publish_counters() {
     rec(b"FlGMat", s.matched);
     rec(b"FlGMis", s.mismatched);
     rec(b"FlGEmpty", EMPTY.load(Ordering::Relaxed));
+    rec(b"FlGExempt", EXEMPT.load(Ordering::Relaxed));
+    rec(b"FlGSigFail", SIGNAL_FAILED.load(Ordering::Relaxed));
+    rec(b"FlGSyncSkip", SYNC_SKIPPED.load(Ordering::Relaxed));
     rec(b"FlGImm", s.immediate);
     rec(b"FlGRet", s.retired);
     rec(b"FlGReb", s.rebased);

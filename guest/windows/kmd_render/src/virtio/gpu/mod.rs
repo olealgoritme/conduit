@@ -6082,7 +6082,9 @@ impl VirtioGpu {
     /// * Neither: nothing to wait for.
     pub fn flush_gate_ready(&self, boundary: u64, floor: u64) -> bool {
         if boundary != 0 {
-            return self.scanout_boundary_ready(boundary)
+            // A failed transport can retire nothing: do not burn the knob's budget on it.
+            return self.failed
+                || self.scanout_boundary_ready(boundary)
                 || !self.present_stream_boundary_live(boundary);
         }
         floor == 0

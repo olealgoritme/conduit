@@ -960,6 +960,11 @@ fn note_and_maybe_signal(
         // cleared, and SubmitCommand cannot precede it. The submission stays in
         // the FIFO for the DPC either way.
         DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
+        // The pending record was already taken: record it so the trace stays consistent
+        // (nothing delivered, nothing tracked).
+        if let Some(trace) = trace {
+            trace.record(fence, crate::ddi::flush_trace::Disposition::SignalFailed);
+        }
         return SubmitAck::Accepted;
     };
     adapter.with_wddm_notify_lock(|guard| {
@@ -997,19 +1002,18 @@ fn note_and_maybe_signal(
             })
             // Transport down (bring-up / teardown): no venus work can gate it.
             .unwrap_or(false);
-        // Under the notification lock, so the completion DPC cannot retire the fence
-        // before its submit is recorded.
-        if let Some(trace) = trace {
-            trace.record(fence, signal_now);
-        }
+        // What became of the fence, for the trace (recorded below, still under the
+        // notification lock, so the completion DPC cannot retire a queued fence before its
+        // submit is recorded).
+        let mut disposition = crate::ddi::flush_trace::Disposition::Queued;
         if signal_now {
             // SAFETY: the notification lock is held and dxgkrnl is live.
             let status = unsafe { signal_dma_completed(guard, dxgkrnl, fence) };
-            if status == STATUS_SUCCESS {
-                if let Some(trace) = trace {
-                    trace.retire_at_submit(fence);
-                }
-            }
+            disposition = if status == STATUS_SUCCESS {
+                crate::ddi::flush_trace::Disposition::Immediate
+            } else {
+                crate::ddi::flush_trace::Disposition::SignalFailed
+            };
             if status != STATUS_SUCCESS {
                 // Same handling as the DPC path in R209: count it and leave the
                 // retirement to a later DPC rather than failing the submission.
@@ -1020,6 +1024,9 @@ fn note_and_maybe_signal(
                     unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
                 }
             }
+        }
+        if let Some(trace) = trace {
+            trace.record(fence, disposition);
         }
     });
     if execution_boundary.is_some() {
@@ -1827,13 +1834,12 @@ unsafe fn flush_gate_record(
         },
     );
     // `FlGSyncMs` (default 0 = off, and then NOTHING below runs, not even the IRQL check):
-    // hold this Render until the boundary the packet carries has retired.
+    // hold this Render until the boundary the packet carries has retired. `DxgkDdiRender`
+    // is documented PASSIVE_LEVEL, but the wait SLEEPS, so the live IRQL is checked rather
+    // than assumed (`PassiveLevel::assume` only counts a wrong claim): above PASSIVE the
+    // wait is skipped and counted (`FlGSyncSkip`). No lock is held here.
     if crate::ddi::flush_trace::sync_ms() != 0 {
-        // SAFETY: `flush_gate_record` runs only from `DxgkDdiRender`, documented
-        // "IRQL: PASSIVE_LEVEL" (`DXGKDDI_RENDER`); no lock is held here (the table
-        // work above has returned). Counted by `IrqlBad` if that ever changes.
-        let passive = unsafe { crate::irql::PassiveLevel::assume() };
-        crate::ddi::flush_trace::sync_wait(passive, adapter, boundary, floor);
+        crate::ddi::flush_trace::sync_wait(adapter, boundary, floor);
     }
 }
 

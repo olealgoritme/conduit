@@ -257,19 +257,31 @@ impl<'a> ContextHandleRef<'a> {
     /// Flush-gate trace: leave `pending` for the SubmitCommand of this Render's DMA
     /// buffer. Returns true when an earlier one was still waiting (batched, or never
     /// submitted) and was replaced. PASSIVE (`DxgkDdiRender`).
-    pub fn stash_flush_pending(&self, pending: helios_kmd_logic::flush_trace::PendingFlush) -> bool {
-        let replaced = self.context.flush_pending.lock().replace(pending).is_some();
-        self.context.flush_pending_flag.store(1, Ordering::Release);
+    pub fn stash_flush_pending(
+        &self,
+        mut pending: helios_kmd_logic::flush_trace::PendingFlush,
+    ) -> bool {
+        let mut slot = self.context.flush_pending.lock();
+        let replaced = slot.is_some();
+        // The stored record knows it replaced one (it is exempt from the match accounting).
+        pending.replaced = replaced;
+        *slot = Some(pending);
+        // The flag changes only under the lock, so it can never disagree with the slot.
+        self.context.flush_pending_flag.store(1, Ordering::Relaxed);
         replaced
     }
 
-    /// Flush-gate trace: take the record the last `HEFL` Render left, if any. One atomic
-    /// swap for the (normal) context with nothing pending. DISPATCH (SubmitCommand).
+    /// Flush-gate trace: take the record the last `HEFL` Render left, if any. One relaxed
+    /// load for the (normal) context with nothing pending; the lock only when the flag says
+    /// there is one. DISPATCH (SubmitCommand).
     pub fn take_flush_pending(&self) -> Option<helios_kmd_logic::flush_trace::PendingFlush> {
-        if self.context.flush_pending_flag.swap(0, Ordering::Acquire) == 0 {
+        if self.context.flush_pending_flag.load(Ordering::Relaxed) == 0 {
             return None;
         }
-        self.context.flush_pending.lock().take()
+        let mut slot = self.context.flush_pending.lock();
+        let taken = slot.take();
+        self.context.flush_pending_flag.store(0, Ordering::Relaxed);
+        taken
     }
 }
 
