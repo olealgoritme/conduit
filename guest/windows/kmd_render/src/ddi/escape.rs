@@ -1571,6 +1571,10 @@ fn escape_submit_venus(
 /// `STATUS_CANCELLED` (0xC0000120): a batch entry that was not submitted because an
 /// earlier entry of the same batch was refused.
 const STATUS_CANCELLED: NTSTATUS = 0xC000_0120_u32 as i32;
+/// `STATUS_ACCESS_DENIED` (0xC0000022), defined here like `STATUS_CANCELLED`: the
+/// `wdk_sys` glob does not export every NT status (the attach arm uses it only
+/// when `ATTACH_ENFORCE` is set).
+const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32 as i32;
 
 /// One submission, shared by `HELIOS_ESCAPE_SUBMIT_VENUS` and every entry of
 /// `HELIOS_ESCAPE_SUBMIT_VENUS_BATCH`, so a batched submit takes exactly the path
