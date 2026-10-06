@@ -20,6 +20,7 @@
 
 pub mod edid;
 pub mod external_memory;
+pub mod nvrm_clients;
 pub mod nvrm_events;
 pub mod nvrm_fastpath;
 pub mod nvrm_fence;
