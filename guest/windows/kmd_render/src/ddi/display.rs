@@ -35,6 +35,16 @@ pub static PRESENT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Drives the throttle for this DDI's IDENTITY dumps (`diag::sample_tick`).
 /// Failure values — PBRet, PBCpy, PBSyWt, PBSyCp and PBFlip's error arms — are
 /// never sampled; they stay unconditional.
+/// Outcome breadcrumbs of the Present BLT arms, written only on change
+/// (`diag::record_named_on_change`): a steady stream of successful BLTs cost
+/// five synchronous registry writes per frame on the presenting thread
+/// (xperf, Heaven 2026-10-06: `RtlWriteRegistryValue` under DdiPresent).
+static PB_CPY_LAST: crate::diag::NamedLast = crate::diag::NamedLast::new();
+static PB_SYWT_LAST: crate::diag::NamedLast = crate::diag::NamedLast::new();
+static PB_SYCP_LAST: crate::diag::NamedLast = crate::diag::NamedLast::new();
+static PB_CONV_LAST: crate::diag::NamedLast = crate::diag::NamedLast::new();
+/// `PBFnc` (the BLT's fence or token) changes every frame: sampled.
+static PB_FNC_TICK: AtomicU32 = AtomicU32::new(0);
 static PRESENT_TRACE_TICK: AtomicU32 = AtomicU32::new(0);
 /// Drives the independent success-result mirror. `PBRet` used to perform a
 /// synchronous registry write for every successful Present, directly on the
@@ -573,7 +583,7 @@ unsafe fn dxgkddi_present_inner(
                         };
                     }
                 }
-                crate::diag::record_named_bytes(b"PBCpy", 0xE1);
+                crate::diag::record_named_on_change(b"PBCpy", 0xE1, &PB_CPY_LAST);
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return crate::ddi::present_foreign::invalid(if adapter.is_none() {
                     site::BLT_NO_ADAPTER
@@ -617,13 +627,13 @@ unsafe fn dxgkddi_present_inner(
                 (source_dxgi_format, destination_dxgi_format)
             else {
                 blt_foreign_skip!(Refusal::BltFormat);
-                crate::diag::record_named_bytes(b"PBCpy", 0xE2);
+                crate::diag::record_named_on_change(b"PBCpy", 0xE2, &PB_CPY_LAST);
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return crate::ddi::present_foreign::invalid(site::BLT_FORMAT);
             };
             if source.kind != HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY {
                 blt_foreign_skip!(Refusal::BltSourceKind);
-                crate::diag::record_named_bytes(b"PBCpy", 0xE6);
+                crate::diag::record_named_on_change(b"PBCpy", 0xE6, &PB_CPY_LAST);
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return crate::ddi::present_foreign::invalid(site::BLT_SOURCE_KIND);
             }
@@ -643,7 +653,7 @@ unsafe fn dxgkddi_present_inner(
                     Err(_) => {
                         crate::ddi::scanout_trace::note_snapshot_fallback();
                         blt_foreign_skip!(Refusal::BltSnapshot);
-                        crate::diag::record_named_bytes(b"PBCpy", 0xE7);
+                        crate::diag::record_named_on_change(b"PBCpy", 0xE7, &PB_CPY_LAST);
                         PRESENT_LAST_STATUS
                             .store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                         return crate::ddi::present_foreign::invalid(site::BLT_SNAPSHOT);
@@ -753,13 +763,13 @@ unsafe fn dxgkddi_present_inner(
             let (Some(source_desc), Some(destination_desc)) = (source_desc, destination_desc)
             else {
                 blt_foreign_skip!(Refusal::BltDescriptor);
-                crate::diag::record_named_bytes(b"PBCpy", 0xE2);
+                crate::diag::record_named_on_change(b"PBCpy", 0xE2, &PB_CPY_LAST);
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return crate::ddi::present_foreign::invalid(site::BLT_DESCRIPTOR);
             };
             if source.width != destination.width || source.height != destination.height {
                 blt_foreign_skip!(Refusal::BltExtent);
-                crate::diag::record_named_bytes(b"PBCpy", 0xE3);
+                crate::diag::record_named_on_change(b"PBCpy", 0xE3, &PB_CPY_LAST);
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return crate::ddi::present_foreign::invalid(site::BLT_EXTENT);
             }
@@ -770,7 +780,7 @@ unsafe fn dxgkddi_present_inner(
             if snapshot_source.is_some() {
                 let Some(boundary) = present_stream_boundary else {
                     blt_foreign_skip!(Refusal::BltBoundary);
-                    crate::diag::record_named_bytes(b"PBCpy", 0xE8);
+                    crate::diag::record_named_on_change(b"PBCpy", 0xE8, &PB_CPY_LAST);
                     PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                     return crate::ddi::present_foreign::invalid(site::BLT_BOUNDARY);
                 };
@@ -804,7 +814,7 @@ unsafe fn dxgkddi_present_inner(
                     Ok(token) => token,
                     Err(VirtioError::OutOfMemory | VirtioError::QueueFull) => {
                         blt_foreign_skip!(Refusal::BltQueue);
-                        crate::diag::record_named_bytes(b"PBCpy", 0xE4);
+                        crate::diag::record_named_on_change(b"PBCpy", 0xE4, &PB_CPY_LAST);
                         PRESENT_LAST_STATUS.store(STATUS_NO_MEMORY as u32, Ordering::Relaxed);
                         return crate::ddi::present_foreign::site(
                             site::BLT_QUEUE,
@@ -813,7 +823,7 @@ unsafe fn dxgkddi_present_inner(
                     }
                     Err(_) => {
                         blt_foreign_skip!(Refusal::BltQueue);
-                        crate::diag::record_named_bytes(b"PBCpy", 0xE5);
+                        crate::diag::record_named_on_change(b"PBCpy", 0xE5, &PB_CPY_LAST);
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
                         return crate::ddi::present_foreign::site(
@@ -835,12 +845,14 @@ unsafe fn dxgkddi_present_inner(
                     if status != STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER {
                         blt_foreign_skip!(Refusal::BltQueue);
                     }
-                    crate::diag::record_named_bytes(b"PBCpy", 0xE6);
+                    crate::diag::record_named_on_change(b"PBCpy", 0xE6, &PB_CPY_LAST);
                     PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
                     return crate::ddi::present_foreign::site(site::BLT_TOKEN_MERGE, status);
                 }
-                crate::diag::record_named_bytes(b"PBCpy", 2);
-                crate::diag::record_named_bytes(b"PBFnc", token as u32);
+                crate::diag::record_named_on_change(b"PBCpy", 2, &PB_CPY_LAST);
+                if crate::diag::sample_tick(&PB_FNC_TICK) {
+                    crate::diag::record_named_bytes(b"PBFnc", token as u32);
+                }
             } else {
                 // SAFETY: `DxgkDdiPresent` is documented "IRQL: PASSIVE_LEVEL" (WDK
                 // DXGKDDI_PRESENT) — it is a pageable DDI, and the BLT arm below
@@ -883,7 +895,7 @@ unsafe fn dxgkddi_present_inner(
                             });
                         }
                         blt_foreign_skip!(Refusal::BltSubmit);
-                        crate::diag::record_named_bytes(b"PBCpy", 0xE4);
+                        crate::diag::record_named_on_change(b"PBCpy", 0xE4, &PB_CPY_LAST);
                         PRESENT_LAST_STATUS.store(STATUS_NO_MEMORY as u32, Ordering::Relaxed);
                         return crate::ddi::present_foreign::site(
                             site::BLT_SUBMIT,
@@ -897,7 +909,7 @@ unsafe fn dxgkddi_present_inner(
                             });
                         }
                         blt_foreign_skip!(Refusal::BltSubmit);
-                        crate::diag::record_named_bytes(b"PBCpy", 0xE5);
+                        crate::diag::record_named_on_change(b"PBCpy", 0xE5, &PB_CPY_LAST);
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
                         return crate::ddi::present_foreign::site(
@@ -906,9 +918,10 @@ unsafe fn dxgkddi_present_inner(
                         );
                     }
                 };
-                crate::diag::record_named_bytes(
+                crate::diag::record_named_on_change(
                     b"PBConv",
                     u32::from(source_dxgi_format != destination_dxgi_format),
+                    &PB_CONV_LAST,
                 );
                 // Windows can page a lockable standard staging destination from
                 // the BAR/Venus allocation into system memory and keep DWM's CPU
@@ -924,10 +937,10 @@ unsafe fn dxgkddi_present_inner(
                         5_000_000_000,
                     ) {
                         crate::virtio::ctrl::WaitFenceOutcome::Complete => {
-                            crate::diag::record_named_bytes(b"PBSyWt", 1);
+                            crate::diag::record_named_on_change(b"PBSyWt", 1, &PB_SYWT_LAST);
                         }
                         crate::virtio::ctrl::WaitFenceOutcome::TimedOut => {
-                            crate::diag::record_named_bytes(b"PBSyWt", 0xE1);
+                            crate::diag::record_named_on_change(b"PBSyWt", 0xE1, &PB_SYWT_LAST);
                             PRESENT_LAST_STATUS
                                 .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
                             return crate::ddi::present_foreign::site(
@@ -936,7 +949,7 @@ unsafe fn dxgkddi_present_inner(
                             );
                         }
                         crate::virtio::ctrl::WaitFenceOutcome::Invalid => {
-                            crate::diag::record_named_bytes(b"PBSyWt", 0xE2);
+                            crate::diag::record_named_on_change(b"PBSyWt", 0xE2, &PB_SYWT_LAST);
                             PRESENT_LAST_STATUS
                                 .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
                             return crate::ddi::present_foreign::site(
@@ -954,7 +967,7 @@ unsafe fn dxgkddi_present_inner(
                         // A retired wire id is not enough: a rejected host
                         // response leaves KmdWriter poisoned and must never
                         // authorize a CPU read or external reacquire.
-                        crate::diag::record_named_bytes(b"PBSyWt", 0xE3);
+                        crate::diag::record_named_on_change(b"PBSyWt", 0xE3, &PB_SYWT_LAST);
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
                         return crate::ddi::present_foreign::site(
@@ -972,23 +985,23 @@ unsafe fn dxgkddi_present_inner(
                         )
                     } {
                         Some(true) => {
-                            crate::diag::record_named_bytes(b"PBSyCp", 1);
+                            crate::diag::record_named_on_change(b"PBSyCp", 1, &PB_SYCP_LAST);
                             true
                         }
                         // No backing existed under the serialized post-retire
                         // check, so the Venus blob remains authoritative. A
                         // later eviction copies those current bytes itself.
                         None => {
-                            crate::diag::record_named_bytes(b"PBSyCp", 2);
+                            crate::diag::record_named_on_change(b"PBSyCp", 2, &PB_SYCP_LAST);
                             true
                         }
                         Some(false) => {
-                            crate::diag::record_named_bytes(b"PBSyCp", 0xE1);
+                            crate::diag::record_named_on_change(b"PBSyCp", 0xE1, &PB_SYCP_LAST);
                             false
                         }
                     }
                 } else {
-                    crate::diag::record_named_bytes(b"PBSyCp", 0);
+                    crate::diag::record_named_on_change(b"PBSyCp", 0, &PB_SYCP_LAST);
                     true
                 };
                 if destination_buffer.is_some() {
@@ -1019,15 +1032,18 @@ unsafe fn dxgkddi_present_inner(
                         gpu_fence,
                     )
                 } {
-                    crate::diag::record_named_bytes(b"PBCpy", 0xE6);
+                    crate::diag::record_named_on_change(b"PBCpy", 0xE6, &PB_CPY_LAST);
                     PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
                     return crate::ddi::present_foreign::site(site::BLT_FENCE_MERGE, status);
                 }
-                // NOT sampled: PBCpy is the value a failed Present is read from
-                // (its 0xE1..0xE6 arms), so its success arm has to keep the same
-                // cadence or "last PBCpy" stops meaning "what the last BLT did".
-                crate::diag::record_named_bytes(b"PBCpy", 1);
-                crate::diag::record_named_bytes(b"PBFnc", gpu_fence as u32);
+                // PBCpy is the value a failed Present is read from (its
+                // 0xE1..0xE8 arms): every arm writes it through PB_CPY_LAST, so
+                // "last PBCpy" still means "what the last BLT did", but a run of
+                // successes costs one registry write, not one per frame.
+                crate::diag::record_named_on_change(b"PBCpy", 1, &PB_CPY_LAST);
+                if crate::diag::sample_tick(&PB_FNC_TICK) {
+                    crate::diag::record_named_bytes(b"PBFnc", gpu_fence as u32);
+                }
                 // Level 5: a standard-buffer destination was waited for above, so the blit is
                 // in the memory: if it is the RM primary the screen shows, a frame is owed.
                 // Atomics only; one relaxed load with the knob below 5.
@@ -1438,7 +1454,7 @@ unsafe fn present_blt_to_rm_primary(
     };
     let Some(source) = source else {
         // Unreadable: no allocation behind the source handle.
-        crate::diag::record_named_bytes(b"PBCpy", 0xE1);
+        crate::diag::record_named_on_change(b"PBCpy", 0xE1, &PB_CPY_LAST);
         PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
         return Err(crate::ddi::present_foreign::invalid(site::RM_BLT_NO_SOURCE));
     };
@@ -1495,7 +1511,7 @@ unsafe fn present_blt_to_rm_primary(
     // 3 = copied by the CPU into the RM primary, 4 = skipped (answered with success).
     let cpy = if done.skipped.is_some() { 4 } else { 3 };
     if RM_BLT_LAST_CPY.swap(cpy, Ordering::Relaxed) != cpy {
-        crate::diag::record_named_bytes(b"PBCpy", cpy);
+        crate::diag::record_named_on_change(b"PBCpy", cpy, &PB_CPY_LAST);
     }
     // The primary changed iff bytes were written (a skipped Present may have written some).
     if done.wrote > 0 {
