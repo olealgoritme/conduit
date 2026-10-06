@@ -495,6 +495,12 @@ const BIND_CMD_POOL: usize = 4;
 const NOTIFICATION_EVENT: i32 = 0;
 /// `IO_NO_INCREMENT` priority boost for `KeSetEvent`.
 const IO_NO_INCREMENT: i32 = 0;
+/// Priority boost for the thread a raw RM forward's completion wakes
+/// (`IO_VIDEO_INCREMENT`): that thread is a user-mode caller blocked in a
+/// synchronous call, and without a boost it can sit behind a busy guest CPU for
+/// a whole quantum after its reply is already in. Only a thread at a variable
+/// priority is boosted, and only until its next quantum ends.
+const RAW_WAKE_INCREMENT: i32 = 1;
 
 /// A PASSIVE waiter's completion block. Lives on the waiter's stack; the
 /// registered pointer stays valid because the waiter ALWAYS deregisters (or
@@ -848,6 +854,22 @@ impl WaitBlockRef<'_> {
     pub fn copy_resp(&self, out: &mut [u8]) {
         // SAFETY: as above; `copy_resp`'s own contract covers the ordering.
         unsafe { self.ptr.as_ref() }.copy_resp(out);
+    }
+
+    /// A lock-free HINT that the drain has started completing this block: the
+    /// only use is `ctrl::spin_for_completion`, a bounded PASSIVE poll that runs
+    /// BEFORE the real wait, so a reply that lands within a few microseconds is
+    /// seen without a sleep and a wake.
+    ///
+    /// ⚠ IT AUTHORIZES NOTHING. `done` is stored one instruction before the
+    /// drain's `KeSetEvent`, so a waiter that LEFT on it could pop the frame this
+    /// block lives in while the drain still touches it (the 22.22.218.0 `0xA`;
+    /// see `ctrl::wait_block`). The caller must still leave through
+    /// `KeWaitForSingleObject` (or the abandon path) and never read `resp`,
+    /// `used` or the reply buffer on the strength of this alone.
+    pub fn spin_hint_done(&self) -> bool {
+        // SAFETY: the block outlives this borrow; an atomic load.
+        unsafe { self.ptr.as_ref() }.done.load(Ordering::Acquire)
     }
 
     /// Reply bytes a raw forward received (see `SyncWaitBlock::used`). Valid
@@ -4650,8 +4672,21 @@ impl VirtioGpu {
                         };
                         (*b).used.store(n as u32, Ordering::Release);
                         (*b).done.store(true, Ordering::Release);
-                        KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                        KeSetEvent(&mut (*b).event, RAW_WAKE_INCREMENT, 0);
                     }
+                }
+                // The reply is already in the waiter's `dest`, so nothing reads
+                // `meta` again: hand it straight back to the pool, as the fast
+                // bind does with its command buffer. Without this every forward
+                // parked its buffer and the NEXT forward paid three lock holds
+                // (begin / recycle / finish) to put it where this puts it in a
+                // push. A push into the reserved pool neither allocates nor
+                // frees, so it is legal here; a buffer the pool would refuse
+                // (too big, pool full) parks as before and is freed at PASSIVE.
+                if entry.venus.is_none() && self.dma_pool_accepts(entry.meta.capacity()) {
+                    let (meta, _none) = entry.into_dma_buffers();
+                    self.dma_pool_push(meta);
+                    continue;
                 }
                 if self.parked.len() < MAX_PARKED {
                     self.parked.push(entry);
@@ -5178,13 +5213,25 @@ impl VirtioGpu {
             DMA_POOL_MISSES.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let Some((idx, _)) = self
-            .dma_pool
-            .iter()
-            .enumerate()
-            .filter(|(_, buf)| buf.can_hold(len))
-            .min_by_key(|(_, buf)| buf.capacity())
-        else {
+        // Smallest buffer that fits, as before, but stop at the first one that is
+        // already the smallest a buffer can be (one page): with a pool of up to
+        // MAX_DMA_POOL entries this runs under the device spinlock on every
+        // forward, and the whole scan bought nothing once a page-sized buffer
+        // was in hand.
+        let mut best: Option<(usize, usize)> = None;
+        for (i, buf) in self.dma_pool.iter().enumerate() {
+            if !buf.can_hold(len) {
+                continue;
+            }
+            let cap = buf.capacity();
+            if best.is_none_or(|(_, c)| cap < c) {
+                best = Some((i, cap));
+                if cap <= DmaBuffer::MIN_CAPACITY {
+                    break;
+                }
+            }
+        }
+        let Some((idx, _)) = best else {
             DMA_POOL_MISSES.fetch_add(1, Ordering::Relaxed);
             return None;
         };
@@ -5200,16 +5247,31 @@ impl VirtioGpu {
         Some(buf)
     }
 
+    /// Whether the pool would take one more buffer of `capacity` bytes: the
+    /// single eligibility rule, shared by the PASSIVE reap and the drain.
+    fn dma_pool_accepts(&self, capacity: usize) -> bool {
+        capacity <= MAX_DMA_POOL_BUFFER_BYTES
+            && self.dma_pool.len() < MAX_DMA_POOL
+            && self.dma_pool_bytes.saturating_add(capacity) <= MAX_DMA_POOL_BYTES
+    }
+
+    /// Push a buffer [`Self::dma_pool_accepts`] approved. Inside the capacity
+    /// reserved at construction, so it never reallocates under the spinlock, and
+    /// it never frees: legal at DISPATCH.
+    fn dma_pool_push(&mut self, buf: DmaBuffer) {
+        debug_assert!(self.dma_pool_accepts(buf.capacity()));
+        self.dma_pool_bytes += buf.capacity();
+        self.dma_pool.push(buf);
+        DMA_POOL_CACHED_BYTES.store(self.dma_pool_bytes as u32, Ordering::Relaxed);
+    }
+
     /// Move eligible completed buffers into the bounded pool without allocation.
     /// Any excess remains in `buffers` and is returned for PASSIVE-level drop.
     pub fn recycle_dma_buffers(&mut self, mut buffers: Vec<DmaBuffer>) -> Vec<DmaBuffer> {
         let mut i = 0;
         while i < buffers.len() {
             let capacity = buffers[i].capacity();
-            let eligible = capacity <= MAX_DMA_POOL_BUFFER_BYTES
-                && self.dma_pool.len() < MAX_DMA_POOL
-                && self.dma_pool_bytes.saturating_add(capacity) <= MAX_DMA_POOL_BYTES;
-            if !eligible {
+            if !self.dma_pool_accepts(capacity) {
                 DMA_POOL_DROPS.fetch_add(1, Ordering::Relaxed);
                 i += 1;
                 continue;

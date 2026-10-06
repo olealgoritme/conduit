@@ -530,6 +530,13 @@ pub mod knobs {
 
     /// Breadcrumb ring level. 0 (default) = the `S<idx>` ring is off.
     pub const DIAG_LEVEL: KnobName = KnobName::new(b"DiagLevel");
+    /// `NvSpinUs` (default 50): how long, in microseconds, a forwarded RM message
+    /// polls for its reply before it blocks (`virtio::ctrl::raw_roundtrip`). 0
+    /// turns the spin off; above 200 it is clamped. Adaptive on top of this: the
+    /// spin backs off by itself while the host answers slower than the budget
+    /// (`helios_kmd_logic::nvrm_fastpath::spin`). Read once, at the first forward;
+    /// the outcome is mirrored in `NvSpinHit` / `NvSpinMis`.
+    pub const NV_SPIN_US: KnobName = KnobName::new(b"NvSpinUs");
     /// Segment topology. Legal values 0 and 10 only — see `BarSegTopology`.
     pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
     /// CpuVisible cached-allocation kill switch (default 1 = cached).
