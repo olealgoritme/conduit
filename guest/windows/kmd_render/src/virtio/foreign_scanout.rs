@@ -184,6 +184,38 @@ pub fn present(
     }
 }
 
+/// Show GEM object `gem` of the KMD's own DRM file `handle` (`owner` =
+/// `DeviceOwner::KMD_RM`): the RM client's presenter (`rm_present.rs`), which runs on
+/// the HPD worker once per frame. Same ownership and mint as [`present`], with the
+/// caller's bound on how long the host gets to take the flip (a worker that
+/// `stop_hpd` joins must not wait the full [`FLIP_TIMEOUT_MS`]), and two differences:
+///
+/// * it NEVER queues behind fenced presents. A resident source is foreground only when
+///   no user source is, and the queue holds only user sources' entries (the pump drops
+///   any whose generation is not the live one, closing their fences), so it cannot hold
+///   anything this flip must stay behind. A flip of the resident source is always the
+///   screen's newest; the pump's one late flip of a source that has just ended is
+///   answered by [`AdapterContext::foreign_scanout_flip_done`] (see the state machine
+///   in `docs/kmd-rm-client.md`, section 13.12);
+/// * the answer for a source that is no longer the live one is `NoSource` (the
+///   presenter reads it as "yielded", not as a failure).
+pub fn present_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    handle: u32,
+    gem: u32,
+    timeout_ms: u64,
+) -> Result<u64, PresentRefusal> {
+    let flip = mint(adapter, owner, handle, false)?;
+    let sent = send(passive, adapter, &flip, gem, timeout_ms);
+    adapter.foreign_scanout_flip_done(flip.generation, sent.is_ok());
+    match sent {
+        Ok(()) => Ok(flip.seq),
+        Err(e) => Err(PresentRefusal::Device(e)),
+    }
+}
+
 /// `SCANOUT_PRESENT` with `RM_FENCE`: queue the flip behind `fence`, a fence of the
 /// caller's that the KMD takes over, and return at once with the `seq`. The flip is
 /// sent when the fence fires (or now, if it already had and nothing waits ahead).

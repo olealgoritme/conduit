@@ -22,6 +22,12 @@
 //! the worker again for the rest, so a bring-up never holds the display's refresh
 //! for more than a few round trips at a time.
 //!
+//! LEVEL 3 (the ring). The client builds [`rc::RING_SLOTS`] surfaces, each with its
+//! CPU view, and `rm_present` (same worker, same pass) shows the desktop through
+//! them. The views are then written outside the `CLIENT` lock, by a frame copy that
+//! holds a LEASE (`lease_slot`, `end_lease`): `retire_begin` and `cleanup` wait for it
+//! before they unmap, so a view never goes away under a write.
+//!
 //! LOCKING. `CLIENT` is a LEAF spinlock holding plain data (`rm_client::Client`):
 //! never held across a host round trip, a wait, an allocation or another lock; every
 //! step copies what it needs out under the lock, does its I/O with no lock held, and
@@ -36,6 +42,7 @@
 
 use super::gpu::DeviceOwner;
 use super::nvrm::{self, MapRefusal, Refusal};
+use super::rm_present;
 use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
@@ -75,12 +82,18 @@ static CLIENT: SpinLock<Client> = SpinLock::new(Client::new());
 
 /// `KNOB_LEVEL` before the knob has been read for this transport generation.
 const KNOB_UNREAD: u32 = u32::MAX;
-/// The `KmdRmClient` knob (0, 1 or 2), or [`KNOB_UNREAD`]: read once per transport
+/// The `KmdRmClient` knob (0 to 4), or [`KNOB_UNREAD`]: read once per transport
 /// generation (so `reg add` + `pnputil /restart-device` applies it), by resetting it to
 /// unread in [`forget`], which `retire_transport` runs for every transport it drops.
 /// With the knob at 0 (the default) [`service`] is this one atomic load and nothing
 /// else: no virtio lock, no registry read.
 static KNOB_LEVEL: AtomicU32 = AtomicU32::new(KNOB_UNREAD);
+
+/// Whether the ring level (3) is in force this generation: one relaxed load.
+pub(super) fn ring_level_on() -> bool {
+    let level = KNOB_LEVEL.load(Ordering::Relaxed);
+    level != KNOB_UNREAD && level >= 3
+}
 
 /// Counters, mirrored by [`publish_counters`] (names at most 14 characters).
 ///
@@ -112,6 +125,9 @@ pub static RM_BUSY: AtomicU32 = AtomicU32::new(0);
 pub static RM_CLOSED: AtomicU32 = AtomicU32::new(0);
 pub static RM_SOFT: AtomicU32 = AtomicU32::new(0);
 pub static RM_REGFD_REFUSED: AtomicU32 = AtomicU32::new(0);
+/// Times a retire stopped waiting for a frame copy to release its view lease and
+/// unmapped anyway (`RmLeaseTmo`; must stay 0: the worker is joined before a retire).
+pub static RM_LEASE_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
 
 /// Mirror the counters to the registry. PASSIVE only. Cheap to call when the knob
 /// is off: nothing is written until the client has done something.
@@ -144,6 +160,9 @@ pub(crate) fn publish_counters() {
     rec(b"RmClosed", RM_CLOSED.load(Ordering::Relaxed));
     rec(b"RmSoft", RM_SOFT.load(Ordering::Relaxed));
     rec(b"RmRegFd", RM_REGFD_REFUSED.load(Ordering::Relaxed));
+    rec(b"RmLeaseTmo", RM_LEASE_TIMEOUTS.load(Ordering::Relaxed));
+    super::rm_foreign::publish_counters();
+    rm_present::publish_counters();
 }
 
 // ---- the worker's entry ------------------------------------------------------------
@@ -175,7 +194,7 @@ fn knob_level() -> u32 {
 /// per transport generation that needs it.
 #[inline(never)]
 fn read_knob() -> u32 {
-    let v = crate::diag::read_config_dword(crate::diag::knobs::KMD_RM_CLIENT, 0).min(2);
+    let v = crate::diag::read_config_dword(crate::diag::knobs::KMD_RM_CLIENT, 0).min(4);
     KNOB_LEVEL.store(v, Ordering::Relaxed);
     // Nothing is written for the default (off): the registry stays as it was.
     if v != 0 {
@@ -209,14 +228,20 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     // A new transport generation: every handle of the old one is gone. The kernel view
     // is unmapped first (retire normally did it already; this is the belt).
     {
-        let mut view = None;
+        let mut views = rc::Views::default();
         let mut g = CLIENT.lock();
-        if g.epoch() != epoch {
-            view = g.take_view();
+        let changed = g.epoch() != epoch;
+        if changed {
+            views = g.take_views();
             g.sync_epoch(epoch);
         }
         drop(g);
-        unmap_view(view);
+        if changed {
+            // The ring of the old generation is gone with its views: so is the
+            // presenter's memory of showing it.
+            rm_present::reset();
+        }
+        unmap_views(&views);
     }
 
     let io = Io {
@@ -224,6 +249,11 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         adapter,
         epoch,
     };
+    // Level 3: the presenter first, so a ring about to be torn down (a new extent) is
+    // withdrawn from scanout before the steps close the GEM under it.
+    if level >= 3 && !io.stopping() {
+        rm_present::service(passive, adapter, epoch, want, false);
+    }
     let mut did = 0usize;
     let mut more = false;
     for i in 0..STEPS_PER_PASS {
@@ -274,6 +304,11 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         RM_STATUS.store(word, Ordering::Relaxed);
         publish_counters();
     }
+    // Level 3: the ring is the desktop's scanout. After the client's own steps, so a
+    // ring completed in this very pass is used in it; a no-op until the ring is whole.
+    if level >= 3 && !io.stopping() {
+        rm_present::service(passive, adapter, epoch, want, true);
+    }
     if more {
         // The rest of the bring-up goes on after the worker has done its other duties.
         adapter.signal_hpd();
@@ -320,6 +355,9 @@ fn apply(epoch: u64, step: Step, result: Result<Out, Fail>, before: &Client) -> 
         Step::KernelMap if g.view().is_some() => {
             RM_VIEWS.fetch_add(1, Ordering::Relaxed);
         }
+        Step::ForeignImport if g.foreign() != 0 => {
+            super::rm_foreign::RM_FG_IMPORTED.fetch_add(1, Ordering::Relaxed);
+        }
         Step::ScanoutPresent if g.probe() == rc::Probe::Shown => {
             RM_PROBES.fetch_add(1, Ordering::Relaxed);
         }
@@ -340,11 +378,20 @@ fn apply(epoch: u64, step: Step, result: Result<Out, Fail>, before: &Client) -> 
 /// frees every RM client made on it; closing the DRM file drops its GEM handles).
 /// Nothing is retried; the client stays dead until the next transport generation.
 fn cleanup(io: &Io<'_>) {
-    let (view, handles) = {
+    let (views, handles) = {
         let mut g = CLIENT.lock();
-        (g.take_view(), g.take_cleanup())
+        (g.take_views(), g.take_cleanup())
     };
-    unmap_view(view);
+    wait_for_lease(io.passive);
+    unmap_views(&views);
+    // The foreign resources it made (level 4) are Venus blobs owned by the KMD's own
+    // owner: reclaim them before their DRM file goes (the host import holds its own
+    // dma-buf reference, so the order is only tidiness).
+    // Skipped when StopDevice asked the worker to go (the transport sweep reclaims the
+    // blobs), and bounded as a whole by one step's allowance otherwise.
+    if !io.stopping() {
+        super::rm_foreign::release_all(io.passive, io.adapter, TIMEOUT_MS);
+    }
     for &h in handles.as_slice() {
         // Bounded like the step loop: once StopDevice asks, or the transport has
         // failed, stop sending. The handles are still in the NVRM tables, and the
@@ -375,9 +422,13 @@ fn cleanup(io: &Io<'_>) {
 /// client's handles are in the NVRM tables under [`DeviceOwner::KMD_RM`] and are
 /// closed by that same sweep.
 #[inline(never)]
-pub(crate) fn retire_begin(_passive: PassiveLevel) {
-    let view = CLIENT.lock().take_view();
-    unmap_view(view);
+pub(crate) fn retire_begin(passive: PassiveLevel) {
+    let views = CLIENT.lock().take_views();
+    // A frame copy that leased a view before the views were taken is still writing
+    // through it: wait for it (it is the worker, which StopDevice joined before this
+    // in every normal path) so no virtual address outlives its window range.
+    wait_for_lease(passive);
+    unmap_views(&views);
 }
 
 /// The transport is gone: forget everything (the sweep closed the host side). A view
@@ -385,13 +436,17 @@ pub(crate) fn retire_begin(_passive: PassiveLevel) {
 /// path on which a worker can still be running) is unmapped here, so none outlives it.
 #[inline(never)]
 pub(crate) fn forget() {
-    let view = {
+    let views = {
         let mut g = CLIENT.lock();
-        let view = g.take_view();
+        let views = g.take_views();
         g.forget();
-        view
+        views
     };
-    unmap_view(view);
+    // A copy is not in flight any more (the worker was joined, or `retire_begin` waited
+    // for it); a lease flag left over would stall the next generation's retire.
+    VIEW_LEASED.store(0, Ordering::Release);
+    unmap_views(&views);
+    rm_present::reset();
     // The next transport generation reads the knob again (once).
     KNOB_LEVEL.store(KNOB_UNREAD, Ordering::Relaxed);
 }
@@ -406,6 +461,84 @@ fn unmap_view(view: Option<(u64, u64)>) {
         RM_VIEWS_FREED.fetch_add(1, Ordering::Relaxed);
     }
 }
+
+#[inline(never)]
+fn unmap_views(views: &rc::Views) {
+    for v in views.as_slice() {
+        unmap_view(Some(*v));
+    }
+}
+
+// ---- view leases (the presenter's copy) -----------------------------------------------
+
+/// Nonzero while the presenter is writing a frame through one of the client's views.
+/// Set under `CLIENT`'s lock (so it is ordered against `take_views`), cleared by the
+/// worker when the copy ends.
+static VIEW_LEASED: AtomicU32 = AtomicU32::new(0);
+
+/// A slot of the ring, leased for a frame copy: what the presenter needs, copied out.
+#[derive(Clone, Copy)]
+pub(super) struct Lease {
+    pub drm: u32,
+    pub gem: u32,
+    pub view: (u64, u64),
+    pub layout: rc::SurfaceLayout,
+}
+
+/// Whether the client's ring is complete for `want` in transport generation `epoch`.
+pub(super) fn ring_ready(epoch: u64, want: Want) -> bool {
+    let g = CLIENT.lock();
+    g.epoch() == epoch && g.presentable(want)
+}
+
+/// The DRM file and layout the resident source registers with (slot 0's: every slot of
+/// a ring has the same).
+pub(super) fn ring_identity(epoch: u64) -> Option<(u32, rc::SurfaceLayout)> {
+    let g = CLIENT.lock();
+    if g.epoch() != epoch || g.is_dead() {
+        return None;
+    }
+    g.slot(0).map(|s| (g.drm(), s.layout))
+}
+
+/// Lease slot `slot` for a frame copy: `None` unless the ring is whole in this
+/// generation. The lease keeps the retire path from unmapping the view until
+/// [`end_lease`].
+pub(super) fn lease_slot(epoch: u64, want: Want, slot: usize) -> Option<Lease> {
+    let g = CLIENT.lock();
+    if g.epoch() != epoch || !g.presentable(want) {
+        return None;
+    }
+    let s = g.slot(slot)?;
+    VIEW_LEASED.store(1, Ordering::Release);
+    Some(Lease {
+        drm: g.drm(),
+        gem: s.gem,
+        view: s.view,
+        layout: s.layout,
+    })
+}
+
+pub(super) fn end_lease() {
+    VIEW_LEASED.store(0, Ordering::Release);
+}
+
+/// Wait (bounded) for the presenter to end a lease. PASSIVE.
+#[inline(never)]
+fn wait_for_lease(passive: PassiveLevel) {
+    let mut waited = 0u32;
+    while VIEW_LEASED.load(Ordering::Acquire) != 0 {
+        if waited >= LEASE_WAIT_MS {
+            RM_LEASE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        super::ctrl::sleep_ms(passive, 1);
+        waited += 1;
+    }
+}
+
+/// How long a retire waits for a frame copy (a whole-frame copy takes tens of ms).
+const LEASE_WAIT_MS: u32 = 2_000;
 
 // ---- the I/O -----------------------------------------------------------------------
 
@@ -609,9 +742,15 @@ impl Io<'_> {
             }
             Step::HostMunmap => {
                 let (id, _) = c.view_host();
-                nvrm::release_host_map(self.passive, self.adapter, c.map_ch(), id)
-                    .map(|()| Out::Unit)
-                    .map_err(|e| fail_of(Refusal::Transport(e)))
+                nvrm::release_host_map_within(
+                    self.passive,
+                    self.adapter,
+                    c.map_ch(),
+                    id,
+                    TIMEOUT_MS,
+                )
+                .map(|()| Out::Unit)
+                .map_err(|e| fail_of(Refusal::Transport(e)))
             }
             Step::RmUnmapMemory => self.rm_unmap_memory(c),
             Step::CloseMapCh => self.close_checked(c.map_ch()),
@@ -619,6 +758,20 @@ impl Io<'_> {
             Step::FillPattern => self.fill_pattern(c),
             Step::ScanoutSet => self.scanout_set(c),
             Step::ScanoutPresent => self.scanout_present(c),
+
+            // Pure moves between the ring's slots: nothing to ask the host.
+            Step::Park | Step::Unpark => Ok(Out::Unit),
+
+            // Level 4: the surface as a foreign (Venus) resource under the KMD's owner.
+            Step::ForeignImport => {
+                super::rm_foreign::import_surface(self.passive, self.adapter, c, TIMEOUT_MS)
+            }
+            Step::ForeignRelease => super::rm_foreign::release_surface(
+                self.passive,
+                self.adapter,
+                c.foreign(),
+                TIMEOUT_MS,
+            ),
         }
     }
 
@@ -984,11 +1137,27 @@ impl Io<'_> {
         let size = page_up(layout.size);
         // Offset 0 on the freshly armed channel, as librmclient does: the mapping is
         // the channel's own.
-        match nvrm::host_mmap(self.passive, self.adapter, KMD, c.map_ch(), true, 0, size) {
+        // Bounded like every message of a step: this runs on the worker StopDevice joins.
+        match nvrm::host_mmap_within(
+            self.passive,
+            self.adapter,
+            KMD,
+            c.map_ch(),
+            true,
+            0,
+            size,
+            TIMEOUT_MS,
+        ) {
             Ok(m) if m.size >= size => Ok(Out::HostMapped(m.host_id, m.offset)),
             Ok(m) => {
                 // Too small: give the mapping back before failing.
-                let _ = nvrm::release_host_map(self.passive, self.adapter, c.map_ch(), m.host_id);
+                let _ = nvrm::release_host_map_within(
+                    self.passive,
+                    self.adapter,
+                    c.map_ch(),
+                    m.host_id,
+                    TIMEOUT_MS,
+                );
                 Err(Fail::new(FailKind::Layout, 0x20))
             }
             Err(MapRefusal::Host(errno)) => Err(Fail::new(FailKind::Host, errno.unsigned_abs())),
@@ -1101,8 +1270,18 @@ impl Io<'_> {
     /// Send the one `ScanoutFlip`, through the same path `SCANOUT_PRESENT` uses.
     #[inline(never)]
     fn scanout_present(&self, c: &Client) -> Result<Out, Fail> {
-        use crate::virtio::foreign_scanout::{present, PresentRefusal};
-        let result = match present(self.passive, self.adapter, KMD, c.drm(), c.gem()) {
+        use crate::virtio::foreign_scanout::{present_within, PresentRefusal};
+        // Direct and bounded like the ring's flips: this runs on the worker StopDevice joins,
+        // and the only source that can be live here is the KMD's own (`ScanoutSet` found no
+        // user source), so there is no fenced queue of a live source to stay behind.
+        let result = match present_within(
+            self.passive,
+            self.adapter,
+            KMD,
+            c.drm(),
+            c.gem(),
+            TIMEOUT_MS,
+        ) {
             Ok(_seq) => Ok(Out::Unit),
             Err(PresentRefusal::NoTransport) => Err(Fail::new(FailKind::Transport, 4)),
             Err(PresentRefusal::NotOwned) => Err(Fail::new(FailKind::Refused, 2)),

@@ -24,6 +24,8 @@ pub mod msi;
 pub mod nvrm;
 pub mod pci_caps;
 pub mod rm_client;
+pub mod rm_foreign;
+pub mod rm_present;
 pub mod rm_resource_import;
 pub mod venus;
 

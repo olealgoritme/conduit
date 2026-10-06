@@ -173,6 +173,19 @@ transferable, and **they must not become shareable**. The rules, as implemented:
   hardening pass must check each against `nvrm_handle_owned(owner, ...)` before forwarding.
   Until then cross-process sharing "works by accident" through those slots; nothing in this
   design relies on it, and nothing may.
+* R5. Known gap, not fixed here (security last): **adoption of a KMD-created resource is weaker than
+  the same-device rule.** A resource the KMD's own RM client made (`KmdRmClient` = 4,
+  `kmd-rm-client.md` section 14; creator token `KMD_RM`) has no creating device, so
+  `VirtioGpu::adopt_for_allocation` cannot ask "is the holder context still the creating device's":
+  for that creator it asks only that the record's context is nonzero (`ctx_id != 0`; the pure table
+  still requires the allocation to name the record's context, which is the KMD's own Venus context,
+  a small integer a process can try) and that the blob slot is still `KMD_RM`'s. Any process whose
+  `D3DKMTCreateAllocation` declares a foreign resource with the right resid, context and exact
+  geometry can adopt an unadopted KMD-created resource. Narrow today (level 4 is a validation knob
+  and the ring surfaces are not meant to be adopted by anything), and closed by the same fix as
+  the user-created case (an adoption cookie from the creator, or the caller's process identity at
+  `CreateAllocation`; see `zero-copy-present.md` section 8), where the KMD's own allocation arm
+  (`kmd-rm-client.md` 14.2) would not need one.
 
 ## 6. Do NVK-to-NVK consumers need a re-export route?
 

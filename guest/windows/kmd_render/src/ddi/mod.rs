@@ -40,6 +40,9 @@ pub use base::{
     dxgkddi_reset_device, dxgkddi_unload,
 };
 pub use blob_map::unmap_io_pages_from_user;
+// The cache attribute of a host blob mapping as MM's: the KMD's own presenter maps the
+// primary's blob (`virtio/rm_present.rs`). `blob_map` itself stays private to `ddi`.
+pub(crate) use blob_map::map_cache_to_mm;
 pub(crate) use build_paging_buffer::PagingPteShadow;
 pub use build_paging_buffer::{
     diag_dump_gpummu_atomics, dxgkddi_build_paging_buffer, dxgkddi_get_root_page_table_size,

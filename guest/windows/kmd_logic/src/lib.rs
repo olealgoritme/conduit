@@ -31,6 +31,7 @@ pub mod foreign_scanout;
 pub mod rm_resource_import;
 pub mod page_runs;
 pub mod rm_client;
+pub mod rm_present;
 pub mod producer_completion;
 pub mod execution_completion;
 pub mod rm_fence_present;
