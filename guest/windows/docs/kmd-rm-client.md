@@ -1,7 +1,9 @@
 # The KMD's own RM client (slice 1)
 
-Status: written on `kmd/rm-client` against `044b242` (KMD 22.22.309). **Never built, never
-run**: the KMD cannot be compiled where this was written. The pure logic is host-tested
+Status: slice 1 written on `kmd/rm-client` against `044b242` (KMD 22.22.309); slice 2
+(sections 12 and 13: the decision on CPU access, the source priority stack, the level 3 ring and
+presenter) on `kmd/rm-client-s2` against `bd5bef6`. **Never built, never run**: the KMD cannot
+be compiled where this was written. The pure logic is host-tested
 (`cargo test` in `guest/windows/kmd_logic`, 38 tests in `rm_client`); the I/O file was
 type-checked against a shim that copies the signatures of the code it calls, and read by
 hand. Everything marked **UNVERIFIED** needs the hardware run in section 9.
@@ -220,7 +222,8 @@ decidable without hardware, listed by what they buy:
 
 The recommendation is **C for frames and A or B for the GDI-written surface**, i.e. the
 primary stays two objects (a CPU-written one, and the flip target a GPU copy fills), which is
-what Windows does on bare metal too. The surface this slice makes is C's flip target; its
+what Windows does on bare metal too. **Section 12 settles this** (and replaces A and B by
+something sharper). The surface this slice makes is C's flip target; its
 allocation, export and flip are what slices 1b and 2 reuse unchanged. Changing the memory kind is
 a change of class and `attr` in `mem_alloc_params` and one constant; no payload of the other
 steps changes.
@@ -395,3 +398,117 @@ HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`.
 6. **The 5 s `ScanoutFlip` wait on the HPD worker.** A wedged host holds the display worker for the
    flip's timeout once (the probe only); every other host round trip of the client is bounded by 2.5 s
    and happens a few at a time.
+
+## 12. Slice 2: how CPU data reaches a KMD allocation that lives in RM memory (decided)
+
+Decided from the code, before any of slice 2 was written, and still unmeasured: every number is an
+estimate and every "hardware" line is a hypothesis the checklist in section 13.9 tests.
+
+### 12.1 How dxgkrnl reaches the primary today (read, not measured)
+
+* **Two segments** are reported (`ddi/bar_segment.rs`, `build_segment_table`): the *aperture*
+  (id 1, system memory: pages dxgkrnl owns, mapped for the GPU by `MapApertureSegment`; the segment
+  VidMm carves paging buffers from) and the *BAR memory segment* (id 2) in the **CpuHostAperture
+  shape** (`SegmentSpec::bar`), the only memory-segment CPU shape this dxgkrnl accepts (the classic
+  `CpuVisible` + `CpuTranslatedAddress` form fails AddAdapter with Code 43, ETW-proven). The BAR
+  segment's base is the **Venus window** (shared-memory region 0), `min(window / 2, 1 GiB)` long;
+  `configure_window_reserve` keeps the KMD's own blob allocator out of that head.
+* **`KmdLinearPrimary` is a Venus HOST3D blob** (`allocate_linear_scanout_image_blob`) placed in
+  that segment. When dxgkrnl needs the CPU on it (a `Lock`, win32k GDI raster) it calls
+  `DxgkDdiMapCpuHostAperture` with the aperture pages **it chose** inside the window head, and
+  the KMD answers by `RESOURCE_MAP_BLOB`-ing the blob **at exactly that window offset**
+  (`ddi/cpu_host_aperture.rs` -> `ctrl::map_blob_at`; whole allocation, consecutive pages only,
+  anything else refused loudly with `ChE*`). The CPU VAs dxgkrnl builds over `window base + page *
+  4 KiB` then read and write the blob's own bytes: one memory for GDI, the host GPU and DWM's
+  Venus import. Content ops of paging (`build_paging_buffer.rs`) copy between the system MDL and a
+  transient kernel map of the blob.
+* **It is fast because it is RAM.** The window is host shared memory, cache-coherent for every
+  agent on the same pages, so `AllocCached` (default 1) flags CpuVisible allocations `Cached` and
+  dxgkrnl maps WB. The same stack measured write-combined *reads* at ~200 MB/s (36 ms for a 7.8 MiB
+  frame, 2026-07-06): GDI is read-modify-write (ClearType, alpha), a WC view cannot be what it
+  writes.
+* **What reaches scanout.** With DWM composing, frames are Venus GPU copies into the adapter's
+  dedicated LINEAR scanout image (`production_linear_scanout`), published as
+  `primary_scanout_*` (resource, extent, pitch, allocation size, seqlock) and bound with
+  `SET_SCANOUT_BLOB`; the desktop's `RESOURCE_FLUSH` is queued by the HPD worker when the copy's
+  completion marks scanout dirty. A DWM image the UMD binds directly (`direct_scanout`) is a
+  different resource and is not published as the primary.
+
+### 12.2 Why an RM allocation cannot sit behind that aperture
+
+| | Venus blob (today) | RM memory (this client's) |
+|---|---|---|
+| who picks the guest-visible address | **dxgkrnl** (aperture page index); the KMD asks the host to map the blob *there* | **the host** (`NV_ESC_RM_MAP_MEMORY` allocates the shm range, `Mmap` reports it) |
+| region | 0, the Venus window head: the BAR segment's declared aperture | 1, the RM window (4 GiB, per-device user-map quota window / 4) |
+| CPU view | WB over RAM-backed host shmem (host `MAP_INFO`, `AllocCached`) | what the KMD asks `MmMapIoSpace` for: WC (vidmem is BAR1 on the host), reads ~200 MB/s |
+| GDI read-modify-write | yes | no |
+
+An RM mapping cannot be placed at dxgkrnl's offsets, so **dxgkrnl cannot CPU-map an RM surface through
+the existing segment**, and a WDDM allocation backed by one would have no usable CPU view for GDI at all.
+
+### 12.3 The candidates, and what was found
+
+* **(a) RM SYSTEM memory as the primary** (`NV01_MEMORY_SYSTEM`, or an OS descriptor over pages the
+  KMD pins), flipped directly. As the GDI-written surface it has the same placement problem as
+  any RM memory (12.2). As a *flip source* the host side has no objection (`handle_scanout_flip`
+  PRIME-exports whatever GEM it is given: no memory-type check); whether NVKMS' GEM import and
+  `EXPORT_OBJECT_TO_FD` accept a system-memory or OS-descriptor object, and whether the host
+  compositor can sample a 29 MB sysmem dma-buf at the display rate over PCIe, is **unknown**. A
+  one-constant hardware experiment (`ATTR_LOCATION`, class), listed, not built.
+* **(b) A shadow in CPU-coherent memory plus the KMD's own copy into an RM vidmem surface through its
+  own write-combined RM-window view, at present time.** Needs nothing of dxgkrnl, nothing of the host.
+  **Chosen for this slice** (12.4).
+* **(c) An RM system-memory POOL as the CPU-visible segment.** One RM memory object (hundreds of MiB),
+  mapped once into region 1 by the host, and the BAR segment's CpuHostAperture declared over *it*
+  instead of over the Venus window head. dxgkrnl's chosen aperture offsets are then valid CPU
+  addresses by construction (no per-allocation `map_blob_at`), GDI read-modify-write runs at WB
+  speed **if the host maps RM sysmem cacheable**, the GPU sees the same bytes (NVK imports a
+  sub-range; `ScanoutFlip` has a plane `offset`), and every KMD allocation becomes a sub-range of
+  one RM object. This is the destination for `KmdStandardBuffer` and the GDI surfaces. It is also
+  the biggest change: `BarSegMode` and the segment base, the paging content ops (in-pool memcpy
+  instead of blob maps), the Venus-less arms of `create_one`, a host guarantee of a cached map,
+  sub-range import into NVK. **Not this slice**; every one of those is a blind decision today.
+* **(d) An OS descriptor over dxgkrnl's own pages.** The pin machinery already builds the page-run
+  table from any locked MDL (`build_table`), but locks *user* ranges (`helios_lock_user_pages_seh`):
+  the KMD needs a variant for the MDL of `MAP_APERTURE_SEGMENT` (kernel-owned pages), and
+  NVKMS import of an OS-descriptor object is unlikely for display. The right tool to make GDI
+  memory *GPU-readable* (DWM-on-NVK sampling a redirection surface) if (c) fails; irrelevant to
+  scanout.
+
+### 12.4 The decision
+
+1. **CPU-written bytes live in memory dxgkrnl maps natively (today: the Venus blob in the BAR
+   segment; destination: the pool of (c)); RM window memory is only ever written, never read, by
+   the KMD.** The GDI-written surface is never RM vidmem and never a WC view.
+2. **This slice (`KmdRmClient` = 3) leaves every allocation exactly as it is** (Venus blob, dxgkrnl's
+   CPU path, `AllocCached`, paging: zero change in what dxgkrnl sees, which is what makes the Venus
+   fallback total) and moves **scanout** of the composited desktop to RM: the LINEAR primary the
+   display worker already keeps current is the *shadow*; the RM ring is the *flip target*; the KMD
+   copies the one into the other at present time with write-combined non-temporal stores and flips
+   with its own `ScanoutFlip` (candidate (b)). When the shadow later moves to the pool of (c) only
+   the *source address* of that copy changes (and, for pool memory that is itself RM memory, the
+   copy can disappear).
+3. **Why not allocate the VidPn primary from RM now.** The surface that dxgkrnl and win32k write is
+   in neither of the two places an RM allocation can be made visible to them (12.2); the only designs
+   that do it ((c), (d)) each need a host decision and a segment/paging rewrite that cannot be
+   verified blind, and (c) is the right *destination* for the GDI surfaces, not a primary-only
+   change. What can be built blind, tested on the host and reverted by a knob is the scanout half,
+   which is also what a user-mode NVK source needs the KMD side of (priority, restore).
+4. **Performance, stated so nobody mistakes level 3 for the fast path.** One 5120x1440 XRGB frame is
+   29.5 MB (1920x1080: 8.3 MB). 240 whole-frame copies a second would be 7 GB/s of streaming WC
+   writes *and* the same in source reads: not a CPU-copy workload. So the presenter paces to 60 Hz
+   and coalesces (the newest content wins); a frame costs one pass over both buffers, estimated
+   3 to 10 ms of WC writes at 5120x1440 (non-temporal 64-byte bursts) plus the read of the source,
+   whose speed is **the** unknown: from a WB-mapped host blob it is at memory speed, from a WC-mapped
+   one (host `MAP_INFO`) it is ~200 MB/s, 150 ms a frame, and the path is a demo. `RmCopyMs` /
+   `RmCopyMaxMs` measure it. The fast paths are not this copy: a user-mode NVK source flips its own
+   RM images with no KMD copy (the priority stack below makes it win), and DWM-on-NVK presents the
+   same way (S3/S4/S6) with this ring only the fallback. Dirty rectangles: GDI CPU raster reports
+   none to the KMD and the desktop edge at the refresh gate carries none, so the first slice copies
+   whole frames; the plan type already takes a row range (`CopyPlan` `y0..y1`) for the two next
+   steps, listed in 13.10, band diffing against a guest mirror and the GPU copy engine.
+5. **Reuse protection without a host release.** The flip has no completion and the backend does not
+   forward `EV_RELEASE` (`docs/SCANOUT.md`, Buffer release), so the ring has two surfaces and a frame
+   is never written to the surface flipped last; the residual hazard is a viewer that still samples
+   the previous buffer a whole flip interval later (tearing, never corruption). Three surfaces is a
+   constant (`RING_SLOTS`); the exact fix is the host forwarding the release.
