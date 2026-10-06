@@ -305,3 +305,61 @@ pub unsafe fn install_wddm1_3(
     f.pfnSetMarkerMode = Some(set_marker_mode);
     FilledWddm1_3(())
 }
+
+/// Proof that [`install_wddm2_3`] has run. Terminal.
+#[must_use]
+pub struct FilledWddm2_3(());
+
+/// The WDDM 2.3 device table (`D3DWDDM2_2DDI_DEVICEFUNCS`): replace the slots
+/// WDDM 2.0 retyped (the 1.3 chain wrote 10.x/11.x-typed handlers there) and
+/// fill the ten appended entries. See `forward/wddm2.rs`.
+pub unsafe fn install_wddm2_3(
+    level_wddm1_3: FilledWddm1_3,
+    funcs: *mut ddi::D3DWDDM2_2DDI_DEVICEFUNCS,
+) -> FilledWddm2_3 {
+    let FilledWddm1_3(()) = level_wddm1_3;
+    let f = &mut *funcs;
+    f.pfnFlush = Some(flush_wddm2_0);
+    f.pfnCalcPrivateShaderResourceViewSize = Some(calc_size_srv_wddm2_0);
+    f.pfnCreateShaderResourceView = Some(create_srv_wddm2_0);
+    f.pfnCalcPrivateRenderTargetViewSize = Some(calc_size_rtv_wddm2_0);
+    f.pfnCreateRenderTargetView = Some(create_rtv_wddm2_0);
+    f.pfnCalcPrivateRasterizerStateSize = Some(calc_size_raster_wddm2_0);
+    f.pfnCreateRasterizerState = Some(create_rasterizer_state_wddm2_0);
+    f.pfnCalcPrivateQuerySize = Some(calc_size_query_wddm2_0);
+    f.pfnCreateQuery = Some(create_query_wddm2_0);
+    f.pfnCalcPrivateUnorderedAccessViewSize = Some(calc_size_uav_wddm2_0);
+    f.pfnCreateUnorderedAccessView = Some(create_uav_wddm2_0);
+    f.pfnSetHardwareProtection = Some(set_hardware_protection);
+    f.pfnGetResourceLayout = Some(get_resource_layout);
+    f.pfnRetrieveShaderComment = Some(retrieve_shader_comment);
+    f.pfnSetHardwareProtectionState = Some(set_hardware_protection_state);
+    f.pfnAcquireResource = Some(acquire_resource_wddm2_1);
+    f.pfnReleaseResource = Some(release_resource_wddm2_1);
+    f.pfnCalcPrivateShaderCacheSessionSize = Some(calc_size_shader_cache_session);
+    f.pfnCreateShaderCacheSession = Some(create_shader_cache_session);
+    f.pfnDestroyShaderCacheSession = Some(destroy_shader_cache_session);
+    f.pfnSetShaderCacheSession = Some(set_shader_cache_session);
+    FilledWddm2_3(())
+}
+
+/// DXGI 1.6.1 (WDDM 2.3 devices): the 1.3 handlers where the argument layout
+/// is a prefix match, the 1.5 Offer/Reclaim1 forms, and the 1.4 entries.
+/// Every slot is named, so the generated stub fill is overwritten entirely.
+pub unsafe fn install_dxgi_1_6_1(funcs: *mut ddi::DXGI1_6_1_DDI_BASE_FUNCTIONS) {
+    let f = &mut *funcs;
+    f.pfnBlt1 = Some(dxgi_blt1);
+    f.pfnOfferResources1 = Some(dxgi_offer_resources1);
+    f.pfnReclaimResources = Some(dxgi_reclaim_resources);
+    f.pfnGetMultiplaneOverlayCaps = Some(dxgi_get_mpo_caps);
+    f.pfnGetMultiplaneOverlayGroupCaps = Some(dxgi_get_mpo_group_caps);
+    f.pfnReserved1 = Some(dxgi_reserved_unsupported);
+    f.pfnPresentMultiplaneOverlay = Some(dxgi_present_mpo);
+    f.pfnReserved2 = Some(dxgi_reserved_unsupported);
+    f.pfnPresent1 = Some(dxgi_present1_6_1);
+    f.pfnCheckPresentDurationSupport = Some(dxgi_check_present_duration_support);
+    f.pfnTrimResidencySet = Some(dxgi_trim_residency_set);
+    f.pfnCheckMultiplaneOverlayColorSpaceSupport = Some(dxgi_check_mpo_color_space_support);
+    f.pfnPresentMultiplaneOverlay1 = Some(dxgi_present_mpo1);
+    f.pfnReclaimResources1 = Some(dxgi_reclaim_resources1);
+}
