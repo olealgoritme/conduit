@@ -136,7 +136,7 @@ at init.
 Touches no device state, so it works with the transport down (then `device_features = 0`,
 event ops/kinds absent, `epoch = 0`). Fills: `max_buffer_bytes` (1 MiB),
 `default_timeout_ms` (30000), `supported_ops`, `supported_event_kinds` (`0b110` while events
-are usable, else 0), `supported_cache_types` (`0b1111`), `device_features` (the virtio config
+are usable, `0b1110` with the host's buffer-release event acked, else 0), `supported_cache_types` (`0b1111`), `device_features` (the virtio config
 `features` word read at init), `max_handles` 128, `max_mappings` 256, `max_pins` 256,
 `max_pin_pages` 262143, `pin_deep_kinds` (direct | indirect = 3). The `max_*` values are the
 per-process limits of section 5.
@@ -293,7 +293,8 @@ Lets a user-mode event be signalled when the host reports that a backend file be
 readable (the Linux `poll()` wakeup) or when the transport is lost.
 
 Fields: `handle` (an owned backend handle, or 0 for `TRANSPORT_LOST`), `kind`
-(`READY` 1, `TRANSPORT_LOST` 2), `event_handle` (user `HANDLE`, zero-extended; ignored by
+(`READY` 1, `TRANSPORT_LOST` 2, `SCANOUT_RELEASED` 3: handle 0, only with the release capability,
+`foreign-scanout.md` "Buffer release"), `event_handle` (user `HANDLE`, zero-extended; ignored by
 UNREGISTER), `flags` (0), out `out_state`.
 
 **Availability.** Events ride the device's second virtqueue (index 1, the event queue),
@@ -426,7 +427,7 @@ All `MAX_*` values are read from the code. "Per process" really means per device
 | `HELIOS_NVRM_PAGE_RUNS_MAX` / `page_runs::DIRECT_MAX_RUNS` | 1024 | protocol / `kmd_logic/page_runs.rs` | runs in a direct table (8 + 1024 x 16 bytes) |
 | `page_runs::INDIRECT_MAX_RUNS` | 262143 | `page_runs.rs` | runs an indirect table can hold |
 | `MAX_NVRM_EVENTS` | 1024 | `gpu/nvrm_events.rs` | registrations, all owners; storage reserved at init (0 if no event queue) |
-| `MAX_NVRM_EVENTS_PER_OWNER` | 129 | same (`MAX_NVRM_HANDLES_PER_OWNER + 1`) | one `READY` per handle plus one `TRANSPORT_LOST` |
+| `MAX_NVRM_EVENTS_PER_OWNER` | 130 | same (`MAX_NVRM_HANDLES_PER_OWNER + 2`) | one `READY` per handle plus one `TRANSPORT_LOST` and one `SCANOUT_RELEASED` |
 | `EVENT_QUEUE_SIZE` / `EVENT_BUF_BYTES` | 16 / 256 | same | event virtqueue (kept small on purpose: the by-value queue slot sits on the boot stack under `VirtioGpu::init`, gated by `tools/kmd-frame-sizes.ps1`) |
 | `OTHER_KICK_LIMIT` | 1024 | same | non-`EventReady` messages after which reposts stop kicking |
 | mapping id range | `1 .. 0x7FFFFFF0` | `virtio/nvrm.rs::mint_map_id`, `kmd_logic/nvrm_views.rs` | KMD-minted from ONE counter for the life of the driver (never restarted by a new transport, never reused); the table key is `id | 0x80000000` in `AdapterContext::mappings` |

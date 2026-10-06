@@ -1945,15 +1945,16 @@ fn escape_nvrm_op(
             caps.default_timeout_ms = NVRM_DEFAULT_TIMEOUT_MS;
             // Events exist only while the KMD's event queue is up and the transport is
             // up; the transport being down is not an error for QUERY_CAPS.
-            let (event_kinds, device_features, fence_served) = adapter
+            let (event_kinds, device_features, fence_served, release_on) = adapter
                 .with_virtio(|v| {
                     (
                         v.nvrm_event_kinds(),
                         v.nvrm_device_features(),
                         v.rm_fence_served(),
+                        v.scanout_release_on(),
                     )
                 })
-                .unwrap_or((0, 0, false));
+                .unwrap_or((0, 0, false, false));
             // Bits 32..63 are capabilities, not ops (`protocol/src/rm_fence.rs`).
             let fence_caps = if fence_served {
                 helios_protocol::HELIOS_NVRM_CAP_SCANOUT_FENCE
@@ -1961,9 +1962,18 @@ fn escape_nvrm_op(
             } else {
                 0
             };
+            // The host's buffer releases (`NVGPU_F_SCANOUT_RELEASE` acked, display half on):
+            // the capability bit, the status op and (in `event_kinds`) the event kind.
+            let release_caps = if release_on {
+                helios_protocol::HELIOS_NVRM_CAP_SCANOUT_RELEASE
+                    | helios_protocol::HELIOS_NVRM_SCANOUT_STATUS_OPS
+            } else {
+                0
+            };
             caps.supported_ops = NVRM_OPS_IMPLEMENTED
                 | helios_protocol::HELIOS_NVRM_SCANOUT_OPS
                 | fence_caps
+                | release_caps
                 | if event_kinds != 0 { NVRM_EVENT_OPS } else { 0 };
             caps.supported_event_kinds = event_kinds;
             caps.supported_cache_types = NVRM_CACHE_TYPES;
@@ -1989,6 +1999,7 @@ fn escape_nvrm_op(
         // Foreign scanout source (own scanout 0, present GEM objects to it).
         helios_protocol::HELIOS_NVRM_OP_SCANOUT_SET
         | helios_protocol::HELIOS_NVRM_OP_SCANOUT_PRESENT
+        | helios_protocol::HELIOS_NVRM_OP_SCANOUT_STATUS
         | helios_protocol::HELIOS_NVRM_OP_SCANOUT_RELEASE => {
             super::escape_foreign_scanout::escape_scanout_op(
                 passive, adapter, buf, hdr, owner, head.op, epoch,

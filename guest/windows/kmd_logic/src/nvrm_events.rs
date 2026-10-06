@@ -25,12 +25,28 @@ use alloc::vec::Vec;
 pub const KIND_READY: u32 = 1;
 /// The device was reset or the transport replaced: every registration wakes.
 pub const KIND_LOST: u32 = 2;
-/// Bitmask over the kinds above (bit `n` <=> kind `n`), as `QUERY_CAPS` reports.
+/// A buffer of the caller's scanout source was released by the host
+/// (`ScanoutReleased`, `docs/foreign-scanout.md`), or a flip that was waiting for it
+/// was found never to have reached the host. Handle-less, like `KIND_LOST`: the
+/// registration is the process's, keyed with handle 0. Offered only on a device that
+/// negotiated `NVGPU_F_SCANOUT_RELEASE`.
+pub const KIND_SCANOUT_RELEASED: u32 = 3;
+/// Bitmask over the kinds that exist on every device (bit `n` <=> kind `n`), as
+/// `QUERY_CAPS` reports.
 pub const KINDS_ALL: u32 = (1 << KIND_READY) | (1 << KIND_LOST);
+/// The kinds that exist only with the release feature: ORed into the `QUERY_CAPS` word
+/// by the driver when the host's release events are on.
+pub const KINDS_SCANOUT_RELEASE: u32 = 1 << KIND_SCANOUT_RELEASED;
 
-/// Whether `kind` is one this table knows.
+/// Whether `kind` is one this table knows (whether the DEVICE can serve it is the
+/// driver's to say: [`KINDS_ALL`] always, [`KINDS_SCANOUT_RELEASE`] with the feature).
 pub const fn kind_known(kind: u32) -> bool {
-    kind < 32 && (KINDS_ALL >> kind) & 1 != 0
+    kind < 32 && ((KINDS_ALL | KINDS_SCANOUT_RELEASE) >> kind) & 1 != 0
+}
+
+/// Whether a registration of `kind` names no backend handle (the key uses handle 0).
+pub const fn kind_has_no_handle(kind: u32) -> bool {
+    kind == KIND_LOST || kind == KIND_SCANOUT_RELEASED
 }
 
 /// What [`Registry::add`] did.
@@ -175,6 +191,21 @@ impl<E: Copy + PartialEq> Registry<E> {
         n
     }
 
+    /// Call `f` with the event of every registration of `kind` that `owner` holds.
+    /// Returns how many. Allocation-free (see [`Self::signal_handle`]).
+    pub fn signal_owner_kind(&self, owner: usize, kind: u32, mut f: impl FnMut(E)) -> usize {
+        let mut n = 0;
+        for r in self
+            .regs
+            .iter()
+            .filter(|r| r.owner == owner && r.kind == kind)
+        {
+            f(r.event);
+            n += 1;
+        }
+        n
+    }
+
     /// Call `f` with the event of every registration, whatever its kind. Returns
     /// how many.
     pub fn signal_all(&self, mut f: impl FnMut(E)) -> usize {
@@ -200,10 +231,14 @@ mod tests {
         assert!(kind_known(KIND_READY));
         assert!(kind_known(KIND_LOST));
         assert!(!kind_known(0));
-        assert!(!kind_known(3));
+        assert!(kind_known(KIND_SCANOUT_RELEASED));
+        assert!(!kind_known(4));
         assert!(!kind_known(32));
         assert!(!kind_known(u32::MAX));
         assert_eq!(KINDS_ALL, 0b110);
+        assert_eq!(KINDS_SCANOUT_RELEASE, 0b1000);
+        assert!(kind_has_no_handle(KIND_LOST) && kind_has_no_handle(KIND_SCANOUT_RELEASED));
+        assert!(!kind_has_no_handle(KIND_READY));
     }
 
     #[test]
@@ -282,6 +317,34 @@ mod tests {
         // The lost registration is on handle 10 but of the other kind.
         assert_eq!(r.signal_handle(10, KIND_LOST, |e| hit.push(e)), 1);
         assert_eq!(hit, [3]);
+    }
+
+    #[test]
+    fn a_scanout_release_wakes_only_the_owner_that_registered_for_it() {
+        let mut r = reg(8, 8);
+        r.add(1, 0, KIND_SCANOUT_RELEASED, 1);
+        r.add(2, 0, KIND_SCANOUT_RELEASED, 2);
+        r.add(1, 0, KIND_LOST, 3);
+        r.add(1, 10, KIND_READY, 4);
+        let mut hit = StdVec::new();
+        assert_eq!(
+            r.signal_owner_kind(1, KIND_SCANOUT_RELEASED, |e| hit.push(e)),
+            1
+        );
+        assert_eq!(hit, [1]);
+        hit.clear();
+        assert_eq!(
+            r.signal_owner_kind(3, KIND_SCANOUT_RELEASED, |e| hit.push(e)),
+            0
+        );
+        assert!(hit.is_empty());
+        // The loss of the transport still wakes it, with every other kind.
+        assert_eq!(r.signal_all(|e| hit.push(e)), 4);
+        // Re-registering replaces (same owner, handle 0, kind).
+        assert_eq!(r.add(1, 0, KIND_SCANOUT_RELEASED, 9), Added::Replaced(1));
+        // A user Close of an unrelated handle takes none of the handle-less ones.
+        assert_eq!(r.take_for_handle(1, 10), Some(4));
+        assert_eq!(r.take_for_handle(1, 10), None);
     }
 
     #[test]

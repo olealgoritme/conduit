@@ -23,9 +23,24 @@
 //! that ACKS it gets the keyboard and mouse as `InputEvent`s on this queue instead
 //! of the emulated devices, and the Windows driver cannot consume them. This KMD
 //! therefore never acks it and does not read it: `init` acks only
-//! `CONDUIT_REQUIRED_FEATURES`, and an assertion below keeps bit 12 out of it. A
-//! host only sends `InputEvent` to a guest that acked the bit; anything but
-//! `EventReady` that does arrive is counted (`NvEvOther`) and dropped.
+//! `CONDUIT_REQUIRED_FEATURES` and `CONDUIT_OPTIONAL_FEATURES`, and an assertion below
+//! keeps bit 12 out of both. A host only sends `InputEvent` to a guest that acked the
+//! bit; anything but `EventReady` (and `ScanoutReleased`, below) that does arrive is
+//! counted (`NvEvOther`) and dropped.
+//!
+//! # `ScanoutReleased` and its feature bit
+//!
+//! Bit 15 (`NVGPU_F_SCANOUT_RELEASE`) is the opposite case, and is acked when the host
+//! offers it and the display half is on (the host offers it only with a display; the
+//! consumers live in the display half): the host then sends `MsgType::ScanoutReleased`
+//! (28, 48 bytes, `kmd_logic::scanout_release`) on this queue whenever the latest flip of
+//! a buffer was replaced and every display client is done with it. [`drain_nvrm_events`]
+//! hands each to `virtio::scanout_release` (the flip book), wakes the HPD worker when it
+//! retired a flip of the KMD's own ring presenter, and signals the registered
+//! `SCANOUT_RELEASED` events of a user owner's. The 256-byte buffers hold it whole. A
+//! host that did not get the ack sends none; one that sends it anyway is counted
+//! (`RelUnasked`, `NvEvOther`) and dropped. The feature is wholly additive: a host that
+//! does not offer it leaves everything here as it was.
 //!
 //! # Locking and IRQL
 //!
@@ -41,7 +56,13 @@ use crate::virtio::nvrm::{
     NVRM_EV_DROPS, NVRM_EV_ERRORS, NVRM_EV_LATCHED, NVRM_EV_LOST, NVRM_EV_OTHER, NVRM_EV_SIGNALS,
     NVRM_FENCE_ERRORS, NVRM_FENCE_FIRED,
 };
-use helios_kmd_logic::nvrm_events::{kind_known, Added, KINDS_ALL, KIND_LOST, KIND_READY};
+use helios_kmd_logic::nvrm_events::{
+    kind_has_no_handle, kind_known, Added, KINDS_ALL, KINDS_SCANOUT_RELEASE, KIND_LOST, KIND_READY,
+    KIND_SCANOUT_RELEASED,
+};
+use helios_kmd_logic::scanout_release::{
+    parse as parse_release, Parsed, Released, MSG_SCANOUT_RELEASED,
+};
 use helios_kmd_logic::nvrm_fence::Noted;
 use helios_kmd_logic::rm_fence_present::Attach;
 use super::nvrm_tables::FenceFire;
@@ -49,12 +70,12 @@ use super::nvrm_tables::FenceFire;
 /// Most registrations across every process (each is one object reference).
 pub const MAX_NVRM_EVENTS: usize = 1024;
 /// Most one process may hold: a `READY` registration per handle it can have open,
-/// plus its `TRANSPORT_LOST` one.
-pub const MAX_NVRM_EVENTS_PER_OWNER: usize = MAX_NVRM_HANDLES_PER_OWNER + 1;
+/// plus its `TRANSPORT_LOST` and `SCANOUT_RELEASED` ones.
+pub const MAX_NVRM_EVENTS_PER_OWNER: usize = MAX_NVRM_HANDLES_PER_OWNER + 2;
 
 /// Virtio feature bit 12 (`NVGPU_CFG_TAKES_INPUT`), which this driver must never
 /// ack (see the module docs). Named only for the assertion below.
-const NEVER_ACKED_TAKES_INPUT: u64 = 1 << 12;
+const NEVER_ACKED_TAKES_INPUT: u64 = helios_protocol::NVGPU_F_TAKES_INPUT;
 
 /// The event queue's index and size (16 buffers; see `EVENT_QUEUE_SIZE`).
 pub(super) const EVENT_QUEUE: u16 = 1;
@@ -63,10 +84,10 @@ pub(super) const EVENT_QUEUE: u16 = 1;
 /// tools/kmd-frame-sizes.ps1). Events are rare and level-triggered on the host,
 /// so a handful of buffers is plenty.
 const EVENT_QUEUE_SIZE: usize = 16;
-/// Bytes of one posted buffer: room for the 16-byte `EventReady`, and, should a
-/// host send one anyway, a short `DisplayMode` (anything longer is the host's to
-/// truncate or drop; this driver only reads the header). Divides a page, so no
-/// buffer straddles one.
+/// Bytes of one posted buffer: room for the 16-byte `EventReady`, the 48-byte
+/// `ScanoutReleased`, and, should a host send one anyway, a short `DisplayMode`
+/// (anything longer is the host's to truncate or drop; this driver only reads the
+/// header). Divides a page, so no buffer straddles one.
 const EVENT_BUF_BYTES: usize = 256;
 
 /// Messages other than `EventReady` after which the queue is no longer kicked on
@@ -78,6 +99,14 @@ const MSG_EVENT_READY: u32 = 8;
 // Bit 12 must never become part of what `init` acks.
 const _: () = {
     assert!(CONDUIT_REQUIRED_FEATURES & NEVER_ACKED_TAKES_INPUT == 0);
+    assert!(CONDUIT_OPTIONAL_FEATURES & NEVER_ACKED_TAKES_INPUT == 0);
+    // The one optional bit is the release event, and the registry's kind for it is the ABI's.
+    assert!(CONDUIT_OPTIONAL_FEATURES == helios_protocol::NVGPU_F_SCANOUT_RELEASE);
+    assert!(KIND_SCANOUT_RELEASED == helios_protocol::HELIOS_NVRM_EVENT_SCANOUT_RELEASED);
+    assert!(KINDS_SCANOUT_RELEASE == helios_protocol::HELIOS_NVRM_EVENT_KINDS_SCANOUT_RELEASE);
+    assert!(MSG_SCANOUT_RELEASED == 28);
+    // The whole 48-byte message fits one posted buffer.
+    assert!(EVENT_BUF_BYTES >= helios_kmd_logic::scanout_release::MSG_BYTES);
     // The registry's kinds are the ABI's.
     assert!(KIND_READY == helios_protocol::HELIOS_NVRM_EVENT_READY);
     assert!(KIND_LOST == helios_protocol::HELIOS_NVRM_EVENT_TRANSPORT_LOST);
@@ -150,6 +179,8 @@ enum Taken {
     /// `EventReady` for this backend handle, with the header `status` (0, or a
     /// fence's error such as `-ETIMEDOUT`).
     Ready(u32, i32),
+    /// `ScanoutReleased` (message 28), whole.
+    Released(Released),
     /// Some other message (or a short or bad one): dropped.
     Other,
     /// The queue misbehaved: stop draining this pass.
@@ -192,6 +223,14 @@ fn take_event(ring: &mut EventRing) -> Taken {
             (true, Some(MSG_EVENT_READY), Some(handle), Some(status)) => {
                 Taken::Ready(handle, status as i32)
             }
+            (true, Some(MSG_SCANOUT_RELEASED), _, _) => match parse_release(bytes, len) {
+                Parsed::Released(r) => Taken::Released(r),
+                // A short one: counted `RelBad`, then dropped like any other message.
+                Parsed::Short | Parsed::NotRelease => {
+                    crate::virtio::scanout_release::REL_BAD.fetch_add(1, Ordering::Relaxed);
+                    Taken::Other
+                }
+            },
             _ => Taken::Other,
         }
     };
@@ -255,9 +294,37 @@ impl VirtioGpu {
     pub fn nvrm_event_kinds(&self) -> u32 {
         if self.nvrm_events_state() == NvrmEventsState::Ready {
             KINDS_ALL
+                | if self.scanout_release {
+                    KINDS_SCANOUT_RELEASE
+                } else {
+                    0
+                }
         } else {
             0
         }
+    }
+
+    /// Whether the host's buffer-release event (`NVGPU_F_SCANOUT_RELEASE`) was acked and
+    /// the queue that carries it is up. Fixed for this transport.
+    pub fn scanout_release_on(&self) -> bool {
+        self.scanout_release
+    }
+
+    /// Wake every `SCANOUT_RELEASED` registration `owner` holds (`DeviceOwner::raw`): a
+    /// flip of its source may have become reusable. Allocation-free and `Wait = FALSE`,
+    /// so legal under the virtio lock at DISPATCH_LEVEL. Returns how many woke.
+    pub fn signal_scanout_released(&mut self, owner: usize) -> usize {
+        let n = self
+            .nvrm_events
+            .signal_owner_kind(owner, KIND_SCANOUT_RELEASED, |event| {
+                // SAFETY: the table holds a reference to the event; Wait = FALSE is
+                // legal at DISPATCH_LEVEL under a spinlock.
+                unsafe { KeSetEvent(event.as_ptr(), IO_NO_INCREMENT, 0) };
+            });
+        if n != 0 {
+            crate::virtio::scanout_release::REL_SIGNALS.fetch_add(n as u32, Ordering::Relaxed);
+        }
+        n
     }
 
     /// The device's config `features` word (`NVGPU_CFG_*`), read at init.
@@ -299,12 +366,16 @@ impl VirtioGpu {
         if !kind_known(kind) {
             return Err(NvrmEventRefusal::Unavailable);
         }
+        // The release kind exists only where the host's release event was acked.
+        if kind == KIND_SCANOUT_RELEASED && !self.scanout_release {
+            return Err(NvrmEventRefusal::Unavailable);
+        }
         match self.nvrm_events_state() {
             NvrmEventsState::Unavailable => return Err(NvrmEventRefusal::Unavailable),
             NvrmEventsState::Lost => return Err(NvrmEventRefusal::TransportLost),
             NvrmEventsState::Ready => {}
         }
-        let key_handle = if kind == KIND_LOST { 0 } else { handle };
+        let key_handle = if kind_has_no_handle(kind) { 0 } else { handle };
         // Checked and recorded under this one lock hold, so a registration can
         // never name a handle a concurrent `Close` has already taken.
         if kind == KIND_READY && !self.nvrm_handle_owned(owner, key_handle) {
@@ -333,7 +404,7 @@ impl VirtioGpu {
         handle: u32,
         kind: u32,
     ) -> Option<NonNull<KEVENT>> {
-        let key_handle = if kind == KIND_LOST { 0 } else { handle };
+        let key_handle = if kind_has_no_handle(kind) { 0 } else { handle };
         self.nvrm_events.remove(owner.raw(), key_handle, kind)
     }
 
@@ -439,13 +510,35 @@ impl VirtioGpu {
         wake_worker
     }
 
-    /// The event queue's consumer, from the interrupt DPC (under the virtio
-    /// lock): hand each `EventReady` to the registered events and give the
-    /// buffers back. At most one ring's worth per call, so a host that floods it
-    /// cannot hold the DPC; the rest waits for the next interrupt.
+    /// One `ScanoutReleased`: retire the flip it names in the book, then wake whoever
+    /// waits for it: a user owner's registered `SCANOUT_RELEASED` events, or (the KMD's
+    /// own ring presenter) the HPD worker. Allocation-free; leaf lock inside.
     ///
-    /// Returns whether a fence a carrier waits on fired: the caller then wakes the
-    /// HPD worker (`KeSetEvent`, legal here) to send the flip / close the handle.
+    /// Returns whether the HPD worker has work now (a ring surface was released).
+    fn deliver_scanout_released(&mut self, release: &Released) -> bool {
+        use crate::virtio::scanout_release::{on_released, Outcome};
+        match on_released(release) {
+            Outcome::Ignored => false,
+            Outcome::Matched { owner } => {
+                if owner == DeviceOwner::KMD_RM.raw() {
+                    true
+                } else {
+                    self.signal_scanout_released(owner);
+                    false
+                }
+            }
+        }
+    }
+
+    /// The event queue's consumer, from the interrupt DPC (under the virtio
+    /// lock): hand each `EventReady` to the registered events, each `ScanoutReleased`
+    /// to the flip book (see `deliver_scanout_released`), and give the buffers back. At
+    /// most one ring's worth per call, so a host that floods it cannot hold the DPC;
+    /// the rest waits for the next interrupt.
+    ///
+    /// Returns whether the HPD worker has work: a fence a carrier waits on fired, or a
+    /// surface of the KMD's ring presenter was released. The caller then wakes it
+    /// (`KeSetEvent`, legal here) to send the flip / close the handle / copy the frame.
     pub fn drain_nvrm_events(&mut self) -> bool {
         if self.failed {
             return false;
@@ -461,6 +554,18 @@ impl VirtioGpu {
                 Taken::Ready(handle, status) => {
                     reposted = true;
                     wake_worker |= self.deliver_nvrm_ready(handle, status);
+                }
+                Taken::Released(release) => {
+                    // No kick for the reposted buffer (`reposted` stays as it was): a
+                    // release arrives once per frame and a doorbell is a VM exit; the host
+                    // looks for a posted buffer again every 2 ms, so none is needed.
+                    if self.scanout_release {
+                        wake_worker |= self.deliver_scanout_released(&release);
+                    } else {
+                        // Never asked for (the feature was not acked): a host bug. Dropped.
+                        crate::virtio::scanout_release::REL_UNASKED.fetch_add(1, Ordering::Relaxed);
+                        NVRM_EV_OTHER.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Taken::Other => {
                     reposted = true;

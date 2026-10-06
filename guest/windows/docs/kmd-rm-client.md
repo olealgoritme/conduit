@@ -255,7 +255,7 @@ Consequences, stated so nobody finds them by surprise:
 * The flip has **no completion**: the host's reply is a bare header and the viewer's release event
   is not forwarded. The probe writes the picture before the flip and never touches the surface
   after it, so no reuse protection is needed; a production source needs N buffers or a release
-  signal (`dxvk-on-nvk.md` 3.6).
+  signal (`dxvk-on-nvk.md` 3.6; the signal now exists, `foreign-scanout.md` "Buffer release").
 * A production KMD source has no lapse and no end; it must **yield** to a user-mode source (a
   fullscreen NVK app) and resume when that ends, which the single-source state machine does not
   yet express (it would need a priority for the KMD token and a restore that re-flips the KMD
@@ -525,11 +525,14 @@ the existing segment**, and a WDDM allocation backed by one would have no usable
    none to the KMD and the desktop edge at the refresh gate carries none, so the first slice copies
    whole frames; the plan type already takes a row range (`CopyPlan` `y0..y1`) for the two next
    steps, listed in 13.10, band diffing against a guest mirror and the GPU copy engine.
-5. **Reuse protection without a host release.** The flip has no completion and the backend does not
-   forward `EV_RELEASE` (`docs/SCANOUT.md`, Buffer release), so the ring has two surfaces and a frame
-   is never written to the surface flipped last; the residual hazard is a viewer that still samples
-   the previous buffer a whole flip interval later (tearing, never corruption). Three surfaces is a
-   constant (`RING_SLOTS`); the exact fix is the host forwarding the release.
+5. **Reuse protection.** The flip has no completion, so the ring has two surfaces and a frame is
+   never written to the surface flipped last; the residual hazard is a viewer that still samples
+   the previous buffer a whole flip interval later (tearing, never corruption). With the host's
+   buffer-release event (`NVGPU_F_SCANOUT_RELEASE`, acked with the display half; `foreign-scanout.md`,
+   "Buffer release") the presenter also WAITS for the host to release the surface it will write
+   (the book of `kmd_logic::scanout_release`, `Presenter::back_wait_seq`), at most 500 ms
+   (`RelRWaits`, `RelRTimeouts`), and a host without the feature keeps the old rotation. Three
+   surfaces remains a constant (`RING_SLOTS`) and a way to make the wait rarer.
 
 ## 13. Slice 2 as built: the source priority stack, the ring and the presenter (`KmdRmClient` = 3)
 
@@ -763,7 +766,8 @@ Stop at the first step that fails; each says what to read. Same registry key as 
    `(owner_handle, host_handle)`, so it should be fine; the viewer's handling of an `ATTACH` of one of
    two alternating dma-bufs at 60 Hz is unverified.
 3. **Tearing without a release.** If the viewer samples the previous buffer more than one flip
-   interval later, a frame tears. Three slots or `EV_RELEASE` forwarding fix it.
+   interval later, a frame tears. Fixed where the host offers `NVGPU_F_SCANOUT_RELEASE` (the
+   presenter waits for the surface's release, 500 ms at most); three slots also make it rarer.
 4. **No lapse for the resident source.** A wedged HPD worker freezes the screen on the last frame; it
    also serves HPD and the refresh, so nothing else would work either, but the user-source lapse
    cannot rescue it. The worker's own bounded waits are the protection.

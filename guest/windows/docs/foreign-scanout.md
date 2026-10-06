@@ -79,6 +79,173 @@ by the HPD worker when the fence fires (flags bit 0, `rm_fence_handle` at offset
 capability bit `HELIOS_NVRM_CAP_SCANOUT_FENCE`). See `rm-fence-marker.md` (ordering, the
 image reuse rule, ownership of the fence handle, counters).
 
+## Buffer release (`NVGPU_F_SCANOUT_RELEASE`, `SCANOUT_STATUS`, `SCANOUT_RELEASED`)
+
+Status: implemented on `kmd/scanout-release`, never built or run (the KMD cannot be compiled
+where it was written); the pure rules are host-tested (`kmd_logic::scanout_release`, the
+presenter in `kmd_logic::rm_present`). Host contract: the host's `docs/SCANOUT.md` ("Buffer
+release", branch `feat/host-s6-flip-release`).
+
+**Why.** A host flip has no completion: `PRESENT` returning, or even the host's reply, says
+nothing about when the viewer (or the encoder) stops reading the previous image. Until now the
+only rules were "write another image than the last one flipped" (the RM ring presenter) and
+"not before the next frame's fence fired and its call returned" (`rm-fence-marker.md`): both
+guesses, both able to tear. The host now says when it is done.
+
+### Negotiation
+
+The device offers the virtio feature `NVGPU_F_SCANOUT_RELEASE = 1 << 15` (config `features`
+bit 15 is unused) whenever it has a display. `VirtioGpu::init` acks it iff the device offers it
+AND the display half is on (`DisplayHalf`, the knob `StartDevice` passes in): every consumer
+lives in the display half, and a render-only start acks nothing new, so the host keeps no
+bookkeeping for it. The ack is part of the one `FEATURES_OK` write; a device that does not leave
+`FEATURES_OK` set for the larger set is reset and offered the required set alone
+(`negotiate_features`, counter `RelNeg`), so the optional bit never costs the transport.
+`VIRTIO_F_VERSION_1` stays the only required bit. Bit 12 (`TAKES_INPUT`) is still NEVER acked
+(`helios_protocol::NVGPU_F_TAKES_INPUT`; a const assertion in `gpu/nvrm_events.rs` keeps it out of
+both feature sets). Counters: `RelAck` (1 = acked), `RelNoQ` (acked but the event queue is not up:
+nothing can be delivered, the consumers stay off).
+
+A host that does not offer the feature (conduit-vmm offers only `VERSION_1`, an older backend, a
+backend with no display) leaves every behaviour as it was: no event arrives, `QUERY_CAPS` has no
+release bit, `SCANOUT_STATUS` answers `UNSUPPORTED`, and the ring presenter alternates its two
+surfaces by the old rule. A transport reset clears everything below (`foreign_scanout_reset` ->
+`scanout_release::reset`); the next `StartDevice` turns tracking on again if the new transport
+acked it.
+
+### The event
+
+Event queue (virtqueue 1) message `ScanoutReleased` = 28: the 16-byte `MsgHeader` (handle 0,
+status 0) and 32 bytes `{u32 scanout (0), u32 flags, u32 owner_handle, u32 host_handle, u64 seq,
+u64 reserved}`; flags `RESOURCE` 1, `NOT_SHOWN` 2, `FORCED` 4. Meaning: the buffer's latest flip
+(`seq`) was replaced (or the scanout disabled) and every display client it was sent to is done
+with it; the buffer on the scanout is never released, a re-flipped buffer is released again later,
+a buffer whose GEM handle or file the guest closes is forgotten with no event. The 256-byte posted
+buffers hold it whole. `drain_nvrm_events` (the DPC, under the virtio lock; no allocation) parses
+it (`scanout_release::parse`) and gives it to the flip book; a reposted buffer is NOT kicked for a
+release (a doorbell per frame is a VM exit; the host looks for a posted buffer every 2 ms).
+`RESOURCE` (a Venus `SET_SCANOUT_BLOB` resource) is counted only (`RelRes`); see the read ledger
+below. Counters: `RelRecv RelMatch RelDrop RelRes RelNotShown RelForced RelBad RelUnasked`
+(`RelDrop`: named no flip the KMD minted, e.g. a forwarded `ScanoutFlip` or a buffer already
+forgotten).
+
+### The flip book (`kmd_logic::scanout_release::ReleaseBook`)
+
+A fixed table (32 entries, leaf spinlock `BOOK`, DPC-safe) of the flips the KMD minted and sent:
+`(seq, owner, drm handle, gem)`, each `Queued` (minted; in the fenced queue or in flight) ->
+`OnHost` (the host took it) -> `Done`. A flip is `Done` when the host released its buffer; when
+the SAME buffer was flipped again (the later seq carries the buffer; the host's event names the
+latest); when it never reached the host (skipped for a newer ready frame, dropped with its source,
+refused: `Drain::gone_seqs`); or when it has been `OnHost` for 2 s after it was replaced with no
+event (a closed GEM gets none; a stuck entry must not hold the numbers back for ever). The current
+buffer never ages. A full table overwrites its oldest done entry, else its oldest (`RelEvict`).
+Entries are forgotten when their DRM file is closed, their device destroyed or the transport
+reset. `floor(handle)` is the highest `S` such that every flip of that handle with `seq <= S` is
+done: contiguous, hence conservative (a slow buffer delays the images flipped after it, never the
+other way).
+
+Ordering the book is robust against: the host sends a buffer's release BEFORE the reply of the
+flip that replaced it, so the event can reach the DPC while the flip's sender is still waiting for
+its reply. A release only needs the entry to exist (it was minted before the next flip), and the
+`sent` that follows reports whether it finished older flips of the same buffer, in which case the
+owner is woken again (otherwise a waiter woken by the event would read a floor the pending `sent`
+was about to move, and sleep through it). A send that times out is assumed taken (the image stays
+reserved until the host says otherwise or it ages out).
+
+### The RM ring presenter
+
+`kmd_logic::rm_present::Presenter` replaces "never write the surface flipped last" with: write
+the surface that was NOT flipped last only after the host released its last flip. It remembers
+each surface's latest flip seq (`note_seq`, from `present_within`'s return), and when a frame is
+due and `Inputs.release_tracked` it asks (`back_wait_seq`, answered from the book by
+`virtio/rm_present.rs`) whether that flip is done:
+
+* done: copy and flip as before;
+* not done: hold the frame (still owed, `Act::WaitUntil`) until the release arrives (the DPC wakes
+  the HPD worker when the event retires a flip of the KMD's owner) or until 500 ms after the
+  surface was replaced (the host's own `FORCED` limit, `RING_WAIT_100NS`): then write anyway and
+  count it. Counters `RelRWaits` (a wait began, once per episode) and `RelRTimeouts`;
+* a surface never flipped, and a ring of one surface (whose back surface is the one on screen and
+  can never be released), do not wait; a resume re-flip writes nothing and never waits;
+* a host without the feature (`release_tracked` false) is the old rotation, unchanged.
+
+With two surfaces the release of the back surface normally arrives with the previous flip (no
+client to wait for: before that flip's reply), so the wait costs nothing in steady state; it bites
+exactly when a viewer or an encoder holds a buffer.
+
+### What user mode gets
+
+Capability: `QUERY_CAPS.supported_ops` bit 34 `HELIOS_NVRM_CAP_SCANOUT_RELEASE`, set iff the
+transport acked the feature (with it: op bit 12 and `supported_event_kinds` bit 3). Probe the
+capability, never the op bit alone. Without it keep the old rule.
+
+**`SCANOUT_STATUS` (op 12)**, 64 bytes, `HeliosNvrmScanoutStatus` (C: `helios_nvrm_escape.h`):
+
+| offset | field | |
+|---|---|---|
+| 0..40 | `HeliosNvrmHeader head` | `epoch` returned as for every op |
+| 40 | `u32 handle` | in: the DRM-node handle given to `SCANOUT_SET` (a handle of the caller; `NOT_OWNED` / `FORBIDDEN` as for `SET`) |
+| 44 | `u32 flags` | in: zero (`BAD_RANGE` otherwise) |
+| 48 | `u64 out_released_seq` | out: every flip of `handle` with `seq <=` this is done; 0 = none |
+| 56 | `u64 out_last_seq` | out: the newest `seq` the KMD remembers for `handle` |
+
+Statuses: `OK`; `UNSUPPORTED` (no release feature); `NOT_OWNED` / `FORBIDDEN` (handle); `BAD_RANGE`
+(flags); NTSTATUS `STATUS_DEVICE_NOT_READY` with no transport. No live source is needed (a lapsed
+source can still be drained). A handle the KMD has no flips of answers the highest seq ever minted
+in both fields.
+
+**Client rule:** an image whose latest `PRESENT` returned `out_seq == P` may be written again once
+`out_released_seq >= P`. Never true for the image on screen. This replaces, where the capability
+exists, the heuristic of `rm-fence-marker.md` ("do not write the image of P before P+1's fence fired
+and P+1's call returned"), and it also covers a fenced present that was skipped or dropped (it is
+done at once). One image per flip suffices: with N >= 2 images a client waits only when the host
+or a client still reads the image it wants.
+
+**`SCANOUT_RELEASED` event (kind 3)**, `EVENT_REGISTER` with `handle = 0` (like `TRANSPORT_LOST`),
+once per process; replaces by `(owner, kind)`; per-process quota `MAX_NVRM_EVENTS_PER_OWNER` is now
+`MAX_NVRM_HANDLES_PER_OWNER + 2`. Signalled when `out_released_seq` may have advanced for that
+process's flips (a release matched one of its flips; a queued flip was skipped, dropped or refused;
+an older flip of a re-flipped buffer was finished); also by `TRANSPORT_LOST`'s wake-all. It is a
+doorbell, not a count: a spurious wake costs one `STATUS`. Without the feature `REGISTER` of kind
+3 answers `UNSUPPORTED`. The wait protocol that loses no wakeup (the event is not latched):
+
+```
+register kind 3 (handle 0) once
+for each image to reuse (latest present seq P):
+    reset the event (or use an auto-reset event)
+    SCANOUT_STATUS  -> if out_released_seq >= P: go
+    wait on the event, with a timeout (>= 600 ms is past the host's 500 ms forced release)
+    SCANOUT_STATUS again; a timeout with the transport up (same `epoch`) means: proceed (tearing is
+    the price of a host that stopped answering) and count it
+```
+
+Counters: `RelSig` events signalled, `RelTrack` flips entered, `RelGone` retired without an event,
+`RelEvict`.
+
+### The read ledger: assessed, not wired
+
+A Venus `RESOURCE` release could in principle retire the desktop's scanout read in
+`adapter/read_ledger.rs`. It is not a clean fit and is not done: the ledger retires a read at the
+host's FLUSH reply per flush token, and a desktop that flushes ONE resource over and over (GDI, a
+single-buffered primary) is never replaced, so it is never released; making the ledger wait for
+the release would pin the front buffer's entry for ever and stall every UMD acquire that waits on
+it. A flip-model swap chain (two or more resources) is where a release is exact; wiring it needs a
+per-resource "latest flush token" next to the release (resource id -> token), the retire moved to
+`max(flush reply, release)` only for resources that have a successor, and a timeout fallback like
+the ring's. Left for the slice that removes the Venus flush (`kmd-rm-client.md` slice 3), where the
+RM ring replaces this path anyway. Venus resource releases are counted (`RelRes`) so the traffic
+is visible.
+
+### Failure modes
+
+* A release lost or never sent (a closed GEM, a host bug): the book ages the entry out 2 s after
+  its replacement; the ring waits at most 500 ms per surface and counts it (`RelRTimeouts`, should
+  read 0 on a healthy session; climbing means the viewer or encoder is slow or the host does not
+  send them).
+* A host that sends `ScanoutReleased` without the ack: counted (`RelUnasked`, `NvEvOther`), dropped.
+* The event queue is full of releases nobody can read (DPC starved): the host retries every 2 ms; the
+  DPC drains at most a ring's worth (16) per interrupt.
+
 ## Counters (`publish_nvrm_counters`, also on SET/RELEASE/lapse)
 
 `FsSet FsPres FsRel FsLapse FsEnd FsTake FsSupp FsRest FsRef FsErr`. Live sources =
@@ -94,9 +261,9 @@ live is a bug. `FsRest` should track `FsRel + FsLapse + FsEnd`.
   the flip's reply. `vsync_count` and the pending-vidpn machinery already exist for
   that; it needs a hardware run to get the ordering right and was not attempted
   blind.
-* No release event to the app: the host never sends one, so the app must not reuse a
-  GEM image before the next `PRESENT` has returned (N-buffer rotation, as the smoke
-  test does).
+* Without the host's release feature (see "Buffer release") there is no release event to the
+  app: it must not reuse a GEM image before the next `PRESENT` has returned (N-buffer rotation,
+  as the smoke test does). With it, `SCANOUT_STATUS` says exactly when.
 * One `PRESENT` at a time per device is the client's job; the KMD mints `seq` in call
   order but the host takes frames in arrival order.
 * Desktop cursor and `ScanoutDisable` paths are not touched.

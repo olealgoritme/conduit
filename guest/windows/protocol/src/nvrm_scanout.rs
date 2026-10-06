@@ -33,7 +33,9 @@
 //! [`HELIOS_NVRM_ST_SCANOUT_BUSY`], and a `FORWARD` of a `ScanoutFlip` from a
 //! device that does not hold it is refused `FORBIDDEN`.
 //!
-//! The ops are advertised in `HeliosNvrmQueryCaps.supported_ops` (bits 9, 10, 11).
+//! The ops are advertised in `HeliosNvrmQueryCaps.supported_ops` (bits 9, 10, 11). A
+//! fourth, `SCANOUT_STATUS` (bit 12, with capability bit 34), exists only where the host's
+//! buffer releases are on: the precise answer to "may I write this image again?".
 //! Calls from one device should be serialised by the client, as `FORWARD` is: the
 //! KMD mints `seq` in call order but the host takes frames in arrival order.
 //!
@@ -48,10 +50,20 @@ pub const HELIOS_NVRM_OP_SCANOUT_SET: u32 = 9;
 pub const HELIOS_NVRM_OP_SCANOUT_PRESENT: u32 = 10;
 /// Give scanout 0 back. See [`HeliosNvrmScanoutRelease`].
 pub const HELIOS_NVRM_OP_SCANOUT_RELEASE: u32 = 11;
+/// Read which presented images the host is done with. See [`HeliosNvrmScanoutStatus`].
+/// Offered only with [`HELIOS_NVRM_CAP_SCANOUT_RELEASE`].
+pub const HELIOS_NVRM_OP_SCANOUT_STATUS: u32 = 12;
 /// The bits these ops occupy in `QueryCaps.supported_ops`.
 pub const HELIOS_NVRM_SCANOUT_OPS: u64 = (1 << HELIOS_NVRM_OP_SCANOUT_SET)
     | (1 << HELIOS_NVRM_OP_SCANOUT_PRESENT)
     | (1 << HELIOS_NVRM_OP_SCANOUT_RELEASE);
+/// The op bit of `SCANOUT_STATUS`, ORed in only on a device with buffer releases.
+pub const HELIOS_NVRM_SCANOUT_STATUS_OPS: u64 = 1 << HELIOS_NVRM_OP_SCANOUT_STATUS;
+/// `supported_ops` bit 34 (a capability, like bits 32 and 33 in `rm_fence`): the KMD acked
+/// the host's `NVGPU_F_SCANOUT_RELEASE`, so `SCANOUT_STATUS` and the event kind
+/// `HELIOS_NVRM_EVENT_SCANOUT_RELEASED` work and the KMD's own ring presenter waits for
+/// releases. Gate on this bit, never on the op bit alone.
+pub const HELIOS_NVRM_CAP_SCANOUT_RELEASE: u64 = 1 << 34;
 
 /// `SET`: another device holds scanout 0 and is still presenting.
 pub const HELIOS_NVRM_ST_SCANOUT_BUSY: i32 = 13;
@@ -115,6 +127,68 @@ pub struct HeliosNvrmScanoutPresent {
 }
 pub const HELIOS_NVRM_SCANOUT_PRESENT_BYTES: usize = 64;
 
+/// `STATUS`. 64 bytes. Which of the caller's presented images the host is done with.
+///
+/// Only on a device that acked the host's `NVGPU_F_SCANOUT_RELEASE` (and has its
+/// display half on): [`HELIOS_NVRM_CAP_SCANOUT_RELEASE`] is set in
+/// `QUERY_CAPS.supported_ops` and so are op bit 12 and event kind
+/// `HELIOS_NVRM_EVENT_SCANOUT_RELEASED`. Elsewhere the op answers `UNSUPPORTED` and a
+/// client keeps the old rule of `rm-fence-marker.md` (with N >= 3 images, do not write
+/// the image of present P before present P+1 has returned and its fence fired).
+///
+/// `handle` must be a DRM-node handle of the caller (`NOT_OWNED` / `FORBIDDEN` as for
+/// `SET`); no live source is needed, so a source that lapsed can still be drained.
+/// Answers `OK`; a nonzero `flags` is `BAD_RANGE`.
+///
+/// # What the numbers mean
+///
+/// Every `PRESENT` returns the `seq` of its flip (`out_seq`), and a flip moves
+/// *queued* (fenced, waiting; or being sent) -> *on the host* -> *done*. A flip is done
+/// when ANY of these holds:
+///
+/// * the host released the buffer: it was replaced by a flip of another buffer (or the
+///   scanout was disabled) and every display client it was sent is finished reading it
+///   (or the host overruled a slow client after 500 ms);
+/// * the same buffer was flipped again (the later `seq` now carries the buffer: use IT);
+/// * the flip never reached the host: skipped for a newer ready frame, dropped when the
+///   source ended, or refused by the host;
+/// * its release is overdue by 2 s after replacement (a buffer the guest closed gets no
+///   event; this keeps a stuck entry from holding the numbers back).
+///
+/// `out_released_seq` is the highest `S` such that EVERY flip of this handle with
+/// `seq <= S` is done, `0` if none. `out_last_seq` is the highest `seq` the KMD still
+/// remembers for the handle (the newest present). Client rule: an image whose latest
+/// present returned `seq == P` may be written again once `out_released_seq >= P`, which
+/// is never true while it is the image on screen (the buffer on the scanout is not
+/// released). A slow buffer delays every image presented after it (`released_seq` is
+/// contiguous): sound, and bounded by the host's 500 ms. A handle the KMD has no flips of
+/// answers the highest seq the KMD ever minted in BOTH fields (nothing of yours is
+/// outstanding).
+///
+/// # Waiting without polling
+///
+/// `EVENT_REGISTER` an event with kind `HELIOS_NVRM_EVENT_SCANOUT_RELEASED` (handle 0)
+/// once. It is signalled whenever `out_released_seq` may have advanced (a release
+/// matched one of this process's flips; a queued flip was found skipped or dropped).
+/// Lose-no-wakeup order: reset the event (manual-reset) or rely on the auto-reset
+/// state, call `STATUS`, and only if `out_released_seq < P` wait on the event (with a
+/// timeout; the transport's loss also signals it, `epoch` in the reply header tells), then
+/// call `STATUS` again. A spurious wake costs one more `STATUS`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosNvrmScanoutStatus {
+    pub head: HeliosNvrmHeader,
+    /// in: the handle given to `SET` (a DRM-node handle of the caller).
+    pub handle: u32,
+    /// in: zero.
+    pub flags: u32,
+    /// out: every flip of `handle` with `seq <=` this is done; 0 = none.
+    pub out_released_seq: u64,
+    /// out: the newest `seq` the KMD remembers for `handle`.
+    pub out_last_seq: u64,
+}
+pub const HELIOS_NVRM_SCANOUT_STATUS_BYTES: usize = 64;
+
 /// `RELEASE`. 48 bytes. Idempotent: nothing to release is `OK`. Somebody else's
 /// source is `NOT_OWNED`.
 #[repr(C)]
@@ -149,6 +223,15 @@ const _: () = {
     assert!(offset_of!(HeliosNvrmScanoutPresent, flags) == 48);
     assert!(offset_of!(HeliosNvrmScanoutPresent, rm_fence_handle) == 52);
     assert!(offset_of!(HeliosNvrmScanoutPresent, out_seq) == 56);
+
+    assert!(size_of::<HeliosNvrmScanoutStatus>() == HELIOS_NVRM_SCANOUT_STATUS_BYTES);
+    assert!(offset_of!(HeliosNvrmScanoutStatus, handle) == 40);
+    assert!(offset_of!(HeliosNvrmScanoutStatus, flags) == 44);
+    assert!(offset_of!(HeliosNvrmScanoutStatus, out_released_seq) == 48);
+    assert!(offset_of!(HeliosNvrmScanoutStatus, out_last_seq) == 56);
+    assert!(HELIOS_NVRM_SCANOUT_STATUS_OPS == 0x1000);
+    // The capability bit is above every op number and apart from the fence caps.
+    assert!(HELIOS_NVRM_CAP_SCANOUT_RELEASE >> 34 == 1);
 
     assert!(size_of::<HeliosNvrmScanoutRelease>() == HELIOS_NVRM_SCANOUT_RELEASE_BYTES);
     assert!(offset_of!(HeliosNvrmScanoutRelease, handle) == 40);

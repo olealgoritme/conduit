@@ -12,13 +12,18 @@
 //!   it is paced, when the source yields to a user-mode source (and what a resume
 //!   needs), and when to give up and leave scanout to Venus for the generation;
 //! * [`CopyPlan`]: every bound of a frame copy, checked once, so the I/O layer's raw
-//!   pointer loop has nothing left to check.
+//!   pointer loop has nothing left to check;
+//! * the wait for the host's buffer release (`Inputs::release_tracked`,
+//!   [`Presenter::back_wait_seq`]; the rule is `scanout_release::ring_wait`): a surface
+//!   is written again only after its last flip was released, or 500 ms after it was
+//!   replaced.
 //!
 //! Nothing here touches memory, the transport or the clock. Time is `now` in 100 ns
 //! units. Design, performance numbers and the open questions:
 //! `docs/kmd-rm-client.md` section 13.
 
 use crate::foreign_scanout::{MAX_DIM, MAX_STRIDE, MIN_DIM};
+use crate::scanout_release::{ring_wait, Wait};
 
 /// Smallest time between two flips of copied frames: 60 Hz. The desktop edge that
 /// asks for a frame can come at the display's rate (240 Hz); a whole-frame CPU copy
@@ -216,7 +221,9 @@ impl Ring {
     }
 
     /// The surface the next frame is written to: never the one shown last, because
-    /// the viewer may still be reading it (the host flip has no completion).
+    /// the viewer may still be reading it. Whether the one it is IS still being read is
+    /// the host's release event ([`Presenter::back_wait_seq`]); without the event this
+    /// rotation is all the protection there is.
     pub fn back(&self) -> u8 {
         match self.front {
             Some(f) if self.n > 1 => (f + 1) % self.n,
@@ -255,6 +262,14 @@ pub struct Inputs {
     pub frame_edge: bool,
     /// A user source ended and the resident one took the screen back.
     pub resume_edge: bool,
+    /// The host reports buffer releases (`NVGPU_F_SCANOUT_RELEASE` was acked): the
+    /// surface to be written next must have been released first
+    /// ([`Presenter::back_wait_seq`] says which flip to ask about). Without it the
+    /// rule is the old one: write the surface that was not shown last.
+    pub release_tracked: bool,
+    /// With `release_tracked`: the flip named by [`Presenter::back_wait_seq`] is done
+    /// (or there is none). Ignored without it.
+    pub back_released: bool,
 }
 
 /// What to do now.
@@ -303,7 +318,19 @@ pub struct Presenter {
     retry_at: u64,
     fails: u8,
     gave_up: bool,
+    /// The `seq` of each surface's latest flip the host took (0 = none): what the host's
+    /// release event for that surface must cover before it is written again.
+    slot_seq: [u64; MAX_RING],
+    /// A frame is held back for a release (a wait episode is open).
+    waiting: bool,
+    /// An episode began / ended in a timeout since the caller last asked
+    /// ([`Self::take_wait_started`], [`Self::take_wait_timeout`]).
+    wait_started: bool,
+    wait_timed_out: bool,
 }
+
+/// Most surfaces a ring can have (the per-slot flip seqs are a fixed array).
+pub const MAX_RING: usize = 4;
 
 impl Presenter {
     pub const fn new(ring_slots: u8) -> Presenter {
@@ -316,6 +343,10 @@ impl Presenter {
             retry_at: 0,
             fails: 0,
             gave_up: false,
+            slot_seq: [0; MAX_RING],
+            waiting: false,
+            wait_started: false,
+            wait_timed_out: false,
         }
     }
 
@@ -335,6 +366,39 @@ impl Presenter {
         self.owed_frame
     }
 
+    /// The flip the next frame's surface (`Ring::back`) must be released from before
+    /// it is written: its latest flip's `seq`, or `None` when there is nothing to wait
+    /// for (never flipped, or it IS the surface on screen, as with a one-surface ring).
+    pub fn back_wait_seq(&self) -> Option<u64> {
+        let back = self.ring.back();
+        if self.ring.front() == Some(back) {
+            return None;
+        }
+        self.slot_seq
+            .get(usize::from(back))
+            .copied()
+            .filter(|s| *s != 0)
+    }
+
+    /// The host took the flip of surface `slot` as `seq`. Called after a SHOWN flip.
+    pub fn note_seq(&mut self, slot: u8, seq: u64) {
+        if let Some(s) = self.slot_seq.get_mut(usize::from(slot)) {
+            *s = seq;
+        }
+    }
+
+    /// Whether a frame was held back for a release since the last call (once per
+    /// episode, not once per look).
+    pub fn take_wait_started(&mut self) -> bool {
+        core::mem::take(&mut self.wait_started)
+    }
+
+    /// Whether a frame went ahead without its release (the limit passed) since the
+    /// last call.
+    pub fn take_wait_timeout(&mut self) -> bool {
+        core::mem::take(&mut self.wait_timed_out)
+    }
+
     fn fail(&mut self) {
         self.fails = self.fails.saturating_add(1);
         if self.fails >= MAX_CONSECUTIVE_FAILS {
@@ -346,6 +410,7 @@ impl Presenter {
         self.registered = false;
         self.owed_frame = false;
         self.owed_resume = false;
+        self.waiting = false;
         self.ring.clear();
     }
 
@@ -413,6 +478,27 @@ impl Presenter {
             if i.now < due {
                 return Act::WaitUntil(due);
             }
+            // The surface to be written must have been released by the host (when it
+            // reports releases): rewriting one a viewer still reads tears the picture.
+            // It was replaced by the flip at `last_flip`; the host overrules a client
+            // that holds it after 500 ms and so do we.
+            if i.release_tracked && self.back_wait_seq().is_some() {
+                match ring_wait(i.back_released, self.last_flip, i.now) {
+                    Wait::Go => self.waiting = false,
+                    Wait::Hold { until } => {
+                        if !self.waiting {
+                            self.waiting = true;
+                            self.wait_started = true;
+                        }
+                        return Act::WaitUntil(until);
+                    }
+                    Wait::TimedOut => {
+                        self.waiting = false;
+                        self.wait_timed_out = true;
+                    }
+                }
+            }
+            self.waiting = false;
             self.owed_frame = false;
             self.owed_resume = false;
             return Act::CopyFlip {
@@ -689,6 +775,8 @@ mod tests {
             foreground: true,
             frame_edge: false,
             resume_edge: false,
+            release_tracked: false,
+            back_released: true,
         }
     }
 
@@ -797,6 +885,149 @@ mod tests {
         let mut i = inp(601 * MS + 1);
         i.resume_edge = true;
         assert_eq!(p.decide(i), Act::Reflip { slot: 0 });
+    }
+
+    // ---- the host's buffer release ------------------------------------------------
+
+    /// A tracked input: the host reports releases; `released` says whether the flip
+    /// named by `back_wait_seq` is done.
+    fn tracked(now: u64, released: bool) -> Inputs {
+        let mut i = inp(now);
+        i.release_tracked = true;
+        i.back_released = released;
+        i.frame_edge = true;
+        i
+    }
+
+    /// Shown slot 0 as seq 5 at `t`, then slot 1 as seq 6 at `t2`: slot 0 is the next to
+    /// be written.
+    fn two_shown(t: u64, t2: u64) -> Presenter {
+        let mut p = shown(t);
+        p.note_seq(0, 5);
+        let due = t + MIN_FRAME_INTERVAL_100NS;
+        assert_eq!(
+            p.decide(tracked(due.max(t2), true)),
+            Act::CopyFlip { slot: 1 }
+        );
+        p.flipped(1, true, FlipResult::Shown, t2);
+        p.note_seq(1, 6);
+        p
+    }
+
+    #[test]
+    fn a_tracked_ring_waits_for_the_surface_it_will_write_to_be_released() {
+        let t2 = 100 * MS;
+        let mut p = two_shown(10 * MS, t2);
+        assert_eq!(p.back_wait_seq(), Some(5));
+        let due = t2 + MIN_FRAME_INTERVAL_100NS;
+        // Due, but the host still has slot 0: hold until the limit, owing the frame.
+        let want = Act::WaitUntil(t2 + crate::scanout_release::RING_WAIT_100NS);
+        assert_eq!(p.decide(tracked(due, false)), want);
+        assert!(p.frame_owed(), "a held frame is still owed");
+        assert!(p.take_wait_started());
+        // Looking again (an unrelated wake) is the same episode.
+        assert_eq!(p.decide(tracked(due + 5 * MS, false)), want);
+        assert!(!p.take_wait_started());
+        assert!(!p.take_wait_timeout());
+        // The release arrives: the frame goes into slot 0, and nothing was counted late.
+        assert_eq!(
+            p.decide(tracked(due + 6 * MS, true)),
+            Act::CopyFlip { slot: 0 }
+        );
+        assert!(!p.take_wait_timeout());
+        assert!(!p.frame_owed());
+    }
+
+    #[test]
+    fn a_release_that_never_comes_is_overruled_at_the_limit_and_counted() {
+        let t2 = 100 * MS;
+        let mut p = two_shown(10 * MS, t2);
+        let limit = t2 + crate::scanout_release::RING_WAIT_100NS;
+        assert!(matches!(
+            p.decide(tracked(limit - 1, false)),
+            Act::WaitUntil(t) if t == limit
+        ));
+        assert_eq!(p.decide(tracked(limit, false)), Act::CopyFlip { slot: 0 });
+        assert!(p.take_wait_timeout());
+        assert!(!p.take_wait_timeout(), "once");
+        // A new episode after the flip is a new wait.
+        p.flipped(0, true, FlipResult::Shown, limit);
+        p.note_seq(0, 7);
+        assert_eq!(p.back_wait_seq(), Some(6));
+        assert!(matches!(
+            p.decide(tracked(limit + MIN_FRAME_INTERVAL_100NS, false)),
+            Act::WaitUntil(_)
+        ));
+        assert!(p.take_wait_started());
+    }
+
+    #[test]
+    fn without_release_events_the_ring_rotates_as_before() {
+        let t2 = 100 * MS;
+        let mut p = two_shown(10 * MS, t2);
+        let due = t2 + MIN_FRAME_INTERVAL_100NS;
+        // `release_tracked` false: the (false) release answer is not even looked at.
+        let mut i = tracked(due, false);
+        i.release_tracked = false;
+        assert_eq!(p.decide(i), Act::CopyFlip { slot: 0 });
+        assert!(!p.take_wait_started() && !p.take_wait_timeout());
+    }
+
+    #[test]
+    fn a_surface_never_flipped_or_the_one_on_screen_is_not_waited_for() {
+        let mut p = shown(10 * MS);
+        // Slot 1 was never flipped: nothing to wait for even if "not released".
+        p.note_seq(0, 5);
+        assert_eq!(
+            p.back_wait_seq(),
+            None,
+            "the back surface is slot 1, unflipped"
+        );
+        assert_eq!(
+            p.decide(tracked(10 * MS + MIN_FRAME_INTERVAL_100NS, false)),
+            Act::CopyFlip { slot: 1 }
+        );
+        // A one-surface ring writes the surface on screen: it can never be released
+        // (the current buffer is not), so it must not wait for it.
+        let mut one = Presenter::new(1);
+        assert_eq!(one.decide(inp(1)), Act::Register);
+        one.registration(true, 1);
+        assert_eq!(one.decide(inp(1)), Act::CopyFlip { slot: 0 });
+        one.flipped(0, true, FlipResult::Shown, 1);
+        one.note_seq(0, 9);
+        assert_eq!(one.back_wait_seq(), None);
+        let i = tracked(1 + MIN_FRAME_INTERVAL_100NS, false);
+        assert_eq!(one.decide(i), Act::CopyFlip { slot: 0 });
+    }
+
+    #[test]
+    fn a_resume_re_flip_does_not_wait_and_a_withdrawal_keeps_the_seqs() {
+        let t2 = 100 * MS;
+        let mut p = two_shown(10 * MS, t2);
+        // A user source holds scanout 0, then ends: a re-flip of the front surface needs
+        // no release (it writes nothing).
+        let mut i = tracked(200 * MS, false);
+        i.frame_edge = false;
+        i.foreground = false;
+        assert_eq!(p.decide(i), Act::Idle);
+        let mut i = tracked(300 * MS, false);
+        i.frame_edge = false;
+        i.resume_edge = true;
+        assert_eq!(p.decide(i), Act::Reflip { slot: 1 });
+        // Standing down (the source went away) forgets what is on screen, not what the
+        // host may still be reading.
+        let mut i = tracked(400 * MS, true);
+        i.source_ok = false;
+        assert_eq!(p.decide(i), Act::Withdraw);
+        assert_eq!(p.front(), None);
+        assert_eq!(
+            p.back_wait_seq(),
+            Some(5),
+            "slot 0 was last flipped as seq 5"
+        );
+        // A new generation forgets all of it.
+        p.reset();
+        assert_eq!(p.back_wait_seq(), None);
     }
 
     #[test]
@@ -1121,6 +1352,8 @@ mod tests {
                         foreground: self.arb.resident_foreground(),
                         frame_edge: fe,
                         resume_edge: re,
+                        release_tracked: false,
+                        back_released: true,
                     };
                     fe = false;
                     re = false;
@@ -1279,6 +1512,8 @@ mod tests {
                 foreground: true,
                 frame_edge: false,
                 resume_edge: false,
+                release_tracked: false,
+                back_released: true,
             };
             assert_eq!(r.p.decide(i), Act::Withdraw);
             assert_eq!(
@@ -1529,6 +1764,8 @@ mod tests {
                         foreground: self.arb.resident_foreground(),
                         frame_edge: fe,
                         resume_edge: re,
+                        release_tracked: false,
+                        back_released: true,
                     };
                     fe = false;
                     re = false;

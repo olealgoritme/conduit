@@ -15,12 +15,12 @@ use bytemuck::{bytes_of, pod_read_unaligned, Pod};
 use helios_kmd_logic::foreign_scanout::{Layout, ReleaseOutcome, SetError};
 use helios_protocol::{
     HeliosEscapeHeader, HeliosNvrmHeader, HeliosNvrmScanoutPresent, HeliosNvrmScanoutRelease,
-    HeliosNvrmScanoutSet, HELIOS_NVRM_OP_SCANOUT_PRESENT, HELIOS_NVRM_OP_SCANOUT_RELEASE,
-    HELIOS_NVRM_OP_SCANOUT_SET, HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE,
-    HELIOS_NVRM_ST_BAD_RANGE, HELIOS_NVRM_ST_DEVICE_ERROR, HELIOS_NVRM_ST_FENCE_ATTACHED,
-    HELIOS_NVRM_ST_FORBIDDEN, HELIOS_NVRM_ST_NOT_OWNED, HELIOS_NVRM_ST_NO_SOURCE,
-    HELIOS_NVRM_ST_OK, HELIOS_NVRM_ST_QUEUE_FULL, HELIOS_NVRM_ST_SCANOUT_BUSY,
-    HELIOS_NVRM_ST_UNSUPPORTED,
+    HeliosNvrmScanoutSet, HeliosNvrmScanoutStatus, HELIOS_NVRM_OP_SCANOUT_PRESENT,
+    HELIOS_NVRM_OP_SCANOUT_RELEASE, HELIOS_NVRM_OP_SCANOUT_SET, HELIOS_NVRM_OP_SCANOUT_STATUS,
+    HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE, HELIOS_NVRM_ST_BAD_RANGE,
+    HELIOS_NVRM_ST_DEVICE_ERROR, HELIOS_NVRM_ST_FENCE_ATTACHED, HELIOS_NVRM_ST_FORBIDDEN,
+    HELIOS_NVRM_ST_NOT_OWNED, HELIOS_NVRM_ST_NO_SOURCE, HELIOS_NVRM_ST_OK,
+    HELIOS_NVRM_ST_QUEUE_FULL, HELIOS_NVRM_ST_SCANOUT_BUSY, HELIOS_NVRM_ST_UNSUPPORTED,
 };
 
 use crate::adapter::AdapterContext;
@@ -76,8 +76,59 @@ pub(super) fn escape_scanout_op(
         HELIOS_NVRM_OP_SCANOUT_SET => scanout_set(adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_SCANOUT_PRESENT => scanout_present(passive, adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_SCANOUT_RELEASE => scanout_release(adapter, buf, hdr, owner, epoch),
+        HELIOS_NVRM_OP_SCANOUT_STATUS => scanout_status(adapter, buf, hdr, owner, epoch),
         _ => STATUS_INVALID_PARAMETER,
     }
+}
+
+/// `SCANOUT_STATUS`: how far the host is done with the caller's presented images
+/// (`HeliosNvrmScanoutStatus`; the rules are in `protocol/src/nvrm_scanout.rs` and
+/// `docs/foreign-scanout.md`). Answers `UNSUPPORTED` unless the transport acked the host's
+/// buffer releases. Two reads under leaf locks; no host round trip.
+fn scanout_status(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    epoch: u64,
+) -> NTSTATUS {
+    let mut req: HeliosNvrmScanoutStatus = match bind(buf, hdr) {
+        Ok(r) => r,
+        Err(st) => return st,
+    };
+    req.out_released_seq = 0;
+    req.out_last_seq = 0;
+    let status = 'verdict: {
+        if req.flags != 0 {
+            break 'verdict HELIOS_NVRM_ST_BAD_RANGE;
+        }
+        let (on, device_type) = match adapter.with_virtio(|v| {
+            (
+                v.scanout_release_on(),
+                v.nvrm_handle_device_type(owner, req.handle),
+            )
+        }) {
+            Ok(r) => r,
+            Err(_) => return STATUS_DEVICE_NOT_READY,
+        };
+        if !on {
+            break 'verdict HELIOS_NVRM_ST_UNSUPPORTED;
+        }
+        match device_type {
+            None => break 'verdict HELIOS_NVRM_ST_NOT_OWNED,
+            Some(t) if t < DEVICE_TYPE_DRI_FIRST => break 'verdict HELIOS_NVRM_ST_FORBIDDEN,
+            Some(_) => {}
+        }
+        let (floor, last) = crate::virtio::scanout_release::floor(
+            req.handle,
+            crate::adapter::foreign_scanout::now_100ns(),
+        );
+        req.out_released_seq = floor;
+        req.out_last_seq = last;
+        HELIOS_NVRM_ST_OK
+    };
+    finish(&mut req.head, status, epoch);
+    write_back(buf, &req)
 }
 
 fn scanout_set(

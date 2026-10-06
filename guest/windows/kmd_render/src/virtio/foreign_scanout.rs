@@ -11,6 +11,7 @@
 
 use super::ctrl;
 use super::hal::MSG_HDR_LEN;
+use super::scanout_release;
 use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
@@ -90,7 +91,7 @@ fn send(
     // reserved[4] at p + 48 stays zero.
 
     let mut resp = [0u8; 2 * MSG_HDR_LEN];
-    match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, timeout_ms) {
+    let sent = match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, timeout_ms) {
         // MsgHeader.status (offset 8) is a signed errno; 0 is success.
         Ok(n) if n >= MSG_HDR_LEN => {
             let status = i32::from_le_bytes([resp[8], resp[9], resp[10], resp[11]]);
@@ -102,6 +103,24 @@ fn send(
         }
         Ok(_) => Err(VirtioError::DeviceError),
         Err(e) => Err(e),
+    };
+    note_flip_sent(adapter, flip.seq, &sent);
+    sent
+}
+
+/// Tell the release book what became of flip `seq`: the host took it (or, on a TIMEOUT,
+/// may yet: it is assumed to have, which keeps the image reserved), or it never will. A
+/// no-op when the host's releases are not tracked. Wakes whoever waits when that moved
+/// the floor.
+fn note_flip_sent(adapter: &AdapterContext, seq: u64, sent: &Result<(), VirtioError>) {
+    let owner = match sent {
+        Ok(()) | Err(VirtioError::Timeout) => {
+            scanout_release::sent(seq, crate::adapter::foreign_scanout::now_100ns())
+        }
+        Err(_) => scanout_release::gone(seq),
+    };
+    if let Some(owner) = owner {
+        scanout_release::wake(adapter, owner);
     }
 }
 
@@ -169,10 +188,12 @@ pub fn present(
     gem: u32,
 ) -> Result<u64, PresentRefusal> {
     let flip = mint(adapter, owner, handle, false)?;
+    scanout_release::minted(flip.seq, owner.raw(), flip.handle, gem);
     if adapter.foreign_fence_queue_busy() {
-        adapter
-            .foreign_fence_enqueue(owner, flip, gem, 0)
-            .map_err(queue_refusal)?;
+        if let Err(e) = adapter.foreign_fence_enqueue(owner, flip, gem, 0) {
+            scanout_release::gone(flip.seq);
+            return Err(queue_refusal(e));
+        }
         adapter.foreign_fence_pump(passive);
         return Ok(flip.seq);
     }
@@ -208,6 +229,7 @@ pub fn present_within(
     timeout_ms: u64,
 ) -> Result<u64, PresentRefusal> {
     let flip = mint(adapter, owner, handle, false)?;
+    scanout_release::minted(flip.seq, owner.raw(), flip.handle, gem);
     let sent = send(passive, adapter, &flip, gem, timeout_ms);
     adapter.foreign_scanout_flip_done(flip.generation, sent.is_ok());
     match sent {
@@ -238,9 +260,12 @@ pub fn present_fenced(
         Some(_) => {}
     }
     let flip = mint(adapter, owner, handle, true)?;
-    adapter
-        .foreign_fence_enqueue(owner, flip, gem, fence)
-        .map_err(queue_refusal)?;
+    scanout_release::minted(flip.seq, owner.raw(), flip.handle, gem);
+    if let Err(e) = adapter.foreign_fence_enqueue(owner, flip, gem, fence) {
+        // Refused: it never reaches the host, so nothing is waited for.
+        scanout_release::gone(flip.seq);
+        return Err(queue_refusal(e));
+    }
     // Already fired and nothing ahead: this sends it before returning.
     adapter.foreign_fence_pump(passive);
     Ok(flip.seq)

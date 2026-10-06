@@ -219,9 +219,16 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmMunmap, mapping_id) == 40, "munmap.
 #define HELIOS_NVRM_EVENT_READY 1u          /* host EventReady for `handle` */
 #define HELIOS_NVRM_EVENT_TRANSPORT_LOST 2u /* device reset; handle ignored (0);
                                                wakes EVERY registration */
+/* A flip of your scanout source can be reused (see SCANOUT_STATUS below); handle
+ * ignored (0). Only where HELIOS_NVRM_CAP_SCANOUT_RELEASE is set. Signalled whenever
+ * out_released_seq may have advanced; also wakes with TRANSPORT_LOST. */
+#define HELIOS_NVRM_EVENT_SCANOUT_RELEASED 3u
 /* what QUERY_CAPS.supported_event_kinds reports while events are usable */
 #define HELIOS_NVRM_EVENT_KINDS_ALL                                            \
   ((1u << HELIOS_NVRM_EVENT_READY) | (1u << HELIOS_NVRM_EVENT_TRANSPORT_LOST))
+/* ... plus this bit on a device with buffer releases */
+#define HELIOS_NVRM_EVENT_KINDS_SCANOUT_RELEASE                                \
+  (1u << HELIOS_NVRM_EVENT_SCANOUT_RELEASED)
 /* EVENT_REGISTER needs the KMD's event queue (virtqueue 1) to be up; if it is
  * not, REGISTER answers HELIOS_NVRM_ST_UNSUPPORTED and supported_event_kinds is
  * 0. No feature bit is involved (the KMD never acks the input bit). A registration is keyed (process, handle, kind);
@@ -251,6 +258,7 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmEvent, event_handle) == 48, "event.
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmEvent, flags) == 56, "event.flags");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmEvent, out_state) == 60, "event.out_state");
 HELIOS_NVRM_STATIC_ASSERT(HELIOS_NVRM_EVENT_KINDS_ALL == 6u, "event kinds");
+HELIOS_NVRM_STATIC_ASSERT(HELIOS_NVRM_EVENT_KINDS_SCANOUT_RELEASE == 8u, "event kinds (release)");
 
 /* ---- PIN / UNPIN: memory registered by CPU address ------------------------- */
 /* IoctlReq.deep_ptr_offset values the host reads as a page-run table (host
@@ -329,6 +337,20 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmUnpin, pin_id) == 40, "unpin.pin_id
 #define HELIOS_NVRM_CAP_SCANOUT_FENCE (1ull << 32)
 #define HELIOS_NVRM_CAP_PRESENT_FENCE (1ull << 33)
 
+/* ---- buffer release: SCANOUT_STATUS + HELIOS_NVRM_EVENT_SCANOUT_RELEASED -----
+ * (guest/windows/docs/foreign-scanout.md "Buffer release"; protocol/src/nvrm_scanout.rs)
+ * Where the KMD acked the host's NVGPU_F_SCANOUT_RELEASE, QueryCaps.supported_ops has
+ * HELIOS_NVRM_CAP_SCANOUT_RELEASE (and op bit 12, event kind bit 3). Then SCANOUT_STATUS
+ * tells which presented images the host is done with: an image whose latest present
+ * returned out_seq == P may be written again once out_released_seq >= P (never true for
+ * the image on screen). Without the cap keep the old rule (rm-fence-marker.md: with N >= 3
+ * images, not before present P+1 returned and its fence fired). Wait without polling:
+ * EVENT_REGISTER kind SCANOUT_RELEASED (handle 0) once; per image: auto-reset (or reset)
+ * the event, SCANOUT_STATUS, and only if out_released_seq < P wait (with a timeout), then
+ * SCANOUT_STATUS again. The event also wakes on TRANSPORT_LOST. */
+#define HELIOS_NVRM_OP_SCANOUT_STATUS 12u
+#define HELIOS_NVRM_CAP_SCANOUT_RELEASE (1ull << 34)
+
 typedef struct HeliosNvrmScanoutSet {
   HeliosNvrmHeader head;
   uint32_t handle;         /* in:  backend handle of a DRM-node file (device_type >= 512) */
@@ -373,6 +395,20 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, gem) == 44, "spres.
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, flags) == 48, "spres.flags");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, rm_fence_handle) == 52, "spres.rm_fence_handle");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, out_seq) == 56, "spres.out_seq");
+
+typedef struct HeliosNvrmScanoutStatus {
+  HeliosNvrmHeader head;
+  uint32_t handle;            /* in:  the handle given to SCANOUT_SET (a DRM-node handle of yours) */
+  uint32_t flags;             /* in:  zero */
+  uint64_t out_released_seq;  /* out: every flip of `handle` with seq <= this is done (0 = none) */
+  uint64_t out_last_seq;      /* out: the newest seq the KMD remembers for `handle` */
+} HeliosNvrmScanoutStatus;
+#define HELIOS_NVRM_SCANOUT_STATUS_BYTES 64u
+HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmScanoutStatus) == HELIOS_NVRM_SCANOUT_STATUS_BYTES, "ScanoutStatus");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutStatus, handle) == 40, "sstat.handle");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutStatus, flags) == 44, "sstat.flags");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutStatus, out_released_seq) == 48, "sstat.out_released_seq");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutStatus, out_last_seq) == 56, "sstat.out_last_seq");
 
 typedef struct HeliosNvrmScanoutRelease {
   HeliosNvrmHeader head;

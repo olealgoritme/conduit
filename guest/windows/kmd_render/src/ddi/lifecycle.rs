@@ -356,7 +356,16 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // budget) and passed in as a bare u32. 0 = INTx = the driver's historical
     // behaviour, byte for byte. See `virtio::msi`.
     let msi_granted = crate::virtio::msi::probe_granted(unsafe { &*dxgkrnl_interface });
-    match crate::virtio::VirtioGpu::init(passive, unsafe { &*dxgkrnl_interface }, msi_granted) {
+    // The host's buffer-release event (`NVGPU_F_SCANOUT_RELEASE`) is acked only with the
+    // display half: it serves the foreign scanout sources and the RM ring presenter,
+    // which exist only there. A render-only start acks nothing new (the host then keeps
+    // no release bookkeeping for this guest).
+    match crate::virtio::VirtioGpu::init(
+        passive,
+        unsafe { &*dxgkrnl_interface },
+        msi_granted,
+        knobs.display_half,
+    ) {
         Ok(mut gpu) => {
             let Some(generation) = adapter.producer.start_transport() else {
                 crate::diag::record_named_bytes(b"PrGenF", 1);
@@ -467,6 +476,13 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // this, but a start that inherits a latched gate or a stale resource id from
     // a previous transport generation is unrecoverable, so pay for it twice.
     adapter.reset_display_publication_state();
+    // The flips the KMD tracks for the host's release events belong to the transport
+    // that just came up (the reset above emptied the book): on if it acked them.
+    crate::virtio::scanout_release::set_tracking(
+        adapter
+            .with_virtio(|v| v.scanout_release_on())
+            .unwrap_or(false),
+    );
     // R505: zero the deferred-programming refusal counters and write the zeros
     // through. Registry counter values persist across boots, so without this a
     // reader cannot tell a counter that is merely PRESENT from one that moved

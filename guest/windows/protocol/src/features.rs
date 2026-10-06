@@ -36,6 +36,30 @@ pub const HELIOS_REQUIRED_FEATURES: u64 = VIRTIO_F_VERSION_1
 pub const HELIOS_OPTIONAL_FEATURES: u64 =
     VIRTIO_F_RING_RESET | VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_RESOURCE_UUID;
 
+// ── Conduit device features (the backend's own bits, above the virtio-gpu ones) ─────
+//
+// The Conduit device offers `VIRTIO_F_VERSION_1` and, with options, a few vendor feature
+// bits. This KMD acks exactly what it can serve; see `virtio/gpu/mod.rs` (`init`).
+
+/// `NVGPU_CFG_TAKES_INPUT` (virtio feature bit 12). Acking it moves the keyboard and
+/// mouse onto `InputEvent`s on the event queue, which this driver cannot consume: it is
+/// NEVER acked (a const assertion in `virtio/gpu/nvrm_events.rs` keeps it out of every
+/// set the driver writes back).
+pub const NVGPU_F_TAKES_INPUT: u64 = 1 << 12;
+/// `NVGPU_F_SCANOUT_RELEASE` (virtio feature bit 15; config `features` bit 15 stays
+/// unused). The host offers it whenever it has a display. A guest that acks it gets
+/// `MsgType::ScanoutReleased` (28) on the event queue whenever the latest flip of a buffer
+/// was replaced and every display client that was sent it is done, and the host keeps
+/// release bookkeeping only for such a guest. `docs/foreign-scanout.md` ("Buffer
+/// release") is the KMD's use of it.
+pub const NVGPU_F_SCANOUT_RELEASE: u64 = 1 << 15;
+/// Conduit device features this driver acks when the device offers them (and, for
+/// `NVGPU_F_SCANOUT_RELEASE`, when the display half is on): the optional set,
+/// besides `VIRTIO_F_VERSION_1`.
+pub const CONDUIT_OPTIONAL_FEATURES: u64 = NVGPU_F_SCANOUT_RELEASE;
+
+const _: () = assert!(CONDUIT_OPTIONAL_FEATURES & NVGPU_F_TAKES_INPUT == 0);
+
 // ── Device status bits (VirtIO spec §2.1) ──────────────────────────────────
 pub const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
 pub const VIRTIO_STATUS_DRIVER: u8 = 2;
