@@ -965,11 +965,29 @@ pub fn ctx_attach_resource(
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    ctx_attach_resource_within(
+        passive,
+        adapter,
+        ctx_id,
+        resource_id,
+        SYNC_ROUNDTRIP_TIMEOUT_MS,
+    )
+}
+
+/// [`ctx_attach_resource`] with an explicit wait, for a caller that runs on a thread
+/// StopDevice joins (the HPD worker).
+fn ctx_attach_resource_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    resource_id: u32,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuCtxResource::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
     cmd.hdr.ctx_id = ctx_id;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
 }
 
 /// Detach a resource from a 3D context.
@@ -1240,6 +1258,30 @@ fn resource_create_blob_errno(
     size: u64,
     errno_out: Option<&mut u32>,
 ) -> Result<u32, VirtioError> {
+    resource_create_blob_errno_within(
+        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size, errno_out, None,
+    )
+}
+
+/// [`resource_create_blob_errno`] under an optional [`SweepBudget`]: the create, the
+/// attach and (on an attach that failed) the unref share it, so the whole call is over
+/// when the budget is, and with it spent nothing more is sent (`Timeout`). `None` is
+/// the plain call (each command waits the whole synchronous timeout).
+#[allow(clippy::too_many_arguments)]
+fn resource_create_blob_errno_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    errno_out: Option<&mut u32>,
+    budget: Option<&SweepBudget>,
+) -> Result<u32, VirtioError> {
+    let Some(create_timeout_ms) = sweep_timeout_ms(budget) else {
+        return Err(VirtioError::Timeout);
+    };
     let reserved = adapter
         .with_virtio(|v| v.reserve_resource_slot())
         .map_err(|_| VirtioError::DeviceError)?;
@@ -1269,7 +1311,7 @@ fn resource_create_blob_errno(
         bytes_of(&cmd),
         None,
         &mut resp,
-        SYNC_ROUNDTRIP_TIMEOUT_MS,
+        create_timeout_ms,
         None,
     );
     let created = match sent {
@@ -1290,10 +1332,19 @@ fn resource_create_blob_errno(
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
-    if let Err(e) = ctx_attach_resource(passive, adapter, ctx_id, resource_id) {
+    let attached = match sweep_timeout_ms(budget) {
+        Some(timeout_ms) => {
+            ctx_attach_resource_within(passive, adapter, ctx_id, resource_id, timeout_ms)
+        }
+        None => Err(VirtioError::Timeout),
+    };
+    if let Err(e) = attached {
         // The resource exists host-side but could not attach: drop it so it
-        // does not leak untracked.
-        let _ = resource_unref(passive, adapter, resource_id);
+        // does not leak untracked (with the budget spent the transport reset that
+        // follows a stop reclaims it).
+        if let Some(timeout_ms) = sweep_timeout_ms(budget) {
+            let _ = resource_unref_within(passive, adapter, resource_id, timeout_ms);
+        }
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
@@ -1332,6 +1383,27 @@ pub fn alloc_blob_errno(
     owner: Option<DeviceOwner>,
     errno_out: Option<&mut u32>,
 ) -> Result<u32, VirtioError> {
+    alloc_blob_errno_within(
+        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size, owner, errno_out, None,
+    )
+}
+
+/// [`alloc_blob_errno`] under an optional [`SweepBudget`] shared by every command of
+/// the call (create, attach, and the unref of a failed attach): for the KMD's own RM
+/// client, which runs on the HPD worker StopDevice joins for a bounded time.
+#[allow(clippy::too_many_arguments)]
+pub fn alloc_blob_errno_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    owner: Option<DeviceOwner>,
+    errno_out: Option<&mut u32>,
+    budget: Option<&SweepBudget>,
+) -> Result<u32, VirtioError> {
     if size == 0 {
         return Err(VirtioError::DeviceError);
     }
@@ -1341,8 +1413,8 @@ pub fn alloc_blob_errno(
     if !reserved {
         return Err(VirtioError::OutOfMemory);
     }
-    match resource_create_blob_errno(
-        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size, errno_out,
+    match resource_create_blob_errno_within(
+        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size, errno_out, budget,
     ) {
         Ok(resource_id) => {
             let _ = adapter.with_virtio(|v| v.commit_blob(owner, ctx_id, resource_id, size));
@@ -1361,6 +1433,7 @@ fn resource_map_blob_roundtrip(
     adapter: &AdapterContext,
     resource_id: u32,
     offset: u64,
+    timeout_ms: u64,
 ) -> Result<u32, VirtioError> {
     let mut cmd = VirtioGpuResourceMapBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
@@ -1373,7 +1446,7 @@ fn resource_map_blob_roundtrip(
         bytes_of(&cmd),
         None,
         &mut resp,
-        SYNC_ROUNDTRIP_TIMEOUT_MS,
+        timeout_ms,
         None,
     )?;
     let resp_type = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
@@ -1416,6 +1489,20 @@ pub fn map_blob_prepare(
     owner: OwnerFilter,
     resource_id: u32,
 ) -> Result<BlobMapPrep, VirtioError> {
+    map_blob_prepare_within(passive, adapter, owner, resource_id, None)
+}
+
+/// [`map_blob_prepare`] under an optional [`SweepBudget`] (for the KMD's own presenter
+/// on the HPD worker): the wait for a busy slot and the `RESOURCE_MAP_BLOB` round trip
+/// both end with it (`Timeout`); `None` is the plain call. A mapping that already exists
+/// returns at once either way, with no round trip.
+pub fn map_blob_prepare_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: OwnerFilter,
+    resource_id: u32,
+    budget: Option<&SweepBudget>,
+) -> Result<BlobMapPrep, VirtioError> {
     let mut busy = Budget::new(MAP_BUSY_MAX_MS);
     loop {
         let begin = adapter
@@ -1425,13 +1512,25 @@ pub fn map_blob_prepare(
             BlobMapBegin::Mapped(prep) => return Ok(prep),
             BlobMapBegin::Failed(e) => return Err(e),
             BlobMapBegin::Busy => {
-                if busy.charge_slice() {
+                if busy.charge_slice() || sweep_timeout_ms(budget).is_none() {
                     return Err(VirtioError::Timeout);
                 }
                 sleep_ms(passive, RETRY_SLICE_MS);
             }
             BlobMapBegin::Start { offset, len } => {
-                let cache = resource_map_blob_roundtrip(passive, adapter, resource_id, offset);
+                // With the budget spent no host command is sent; the reserved range is
+                // given back by `blob_map_finish` (the host rejected it, as for any
+                // failed map).
+                let cache = match sweep_timeout_ms(budget) {
+                    Some(timeout_ms) => resource_map_blob_roundtrip(
+                        passive,
+                        adapter,
+                        resource_id,
+                        offset,
+                        timeout_ms,
+                    ),
+                    None => Err(VirtioError::Timeout),
+                };
                 let cache_ok = cache.as_ref().ok().copied();
                 let fin = adapter
                     .with_virtio(|v| v.blob_map_finish(resource_id, offset, len, cache_ok))
@@ -1444,7 +1543,12 @@ pub fn map_blob_prepare(
                     BlobMapFinish::SlotGone => {
                         // Owner teardown raced the map: undo the host mapping
                         // and return the reserved range.
-                        let _ = resource_unmap_blob(passive, adapter, resource_id);
+                        let _ = resource_unmap_blob_within(
+                            passive,
+                            adapter,
+                            resource_id,
+                            sweep_timeout_ms(budget).unwrap_or(1),
+                        );
                         let _ = adapter.with_virtio(|v| v.free_window_range_pub(offset, len));
                         Err(VirtioError::DeviceError)
                     }
@@ -1517,8 +1621,13 @@ pub fn map_blob_at(
                     let _ = resource_unmap_blob(passive, adapter, resource_id);
                     let _ = adapter.with_virtio(|v| v.free_window_range_pub(old_offset, old_len));
                 }
-                let cache =
-                    resource_map_blob_roundtrip(passive, adapter, resource_id, window_offset);
+                let cache = resource_map_blob_roundtrip(
+                    passive,
+                    adapter,
+                    resource_id,
+                    window_offset,
+                    SYNC_ROUNDTRIP_TIMEOUT_MS,
+                );
                 let cache_ok = cache.as_ref().ok().copied();
                 let fin = adapter
                     .with_virtio(|v| v.blob_map_finish(resource_id, window_offset, len, cache_ok))
@@ -1546,6 +1655,21 @@ pub fn release_blob_for_owner(
     owner: DeviceOwner,
     ctx_id: u32,
     resource_id: u32,
+) -> Result<(), VirtioError> {
+    release_blob_for_owner_within(passive, adapter, owner, ctx_id, resource_id, None)
+}
+
+/// [`release_blob_for_owner`] under an optional [`SweepBudget`] shared by its commands
+/// (unmap, detach, unref). With the budget spent the slot is still taken out of the
+/// table, but the commands not yet sent are not (the transport reset reclaims the host
+/// side) and the answer is `Timeout`. `None` is the plain call.
+pub fn release_blob_for_owner_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    ctx_id: u32,
+    resource_id: u32,
+    budget: Option<&SweepBudget>,
 ) -> Result<(), VirtioError> {
     let taken = adapter
         .with_virtio(|v| v.take_blob_matching(owner, ctx_id, resource_id))
@@ -1578,15 +1702,22 @@ pub fn release_blob_for_owner(
     });
     terminal?;
     if mapped {
-        let _ = resource_unmap_blob(passive, adapter, res);
+        if let Some(timeout_ms) = sweep_timeout_ms(budget) {
+            let _ = resource_unmap_blob_within(passive, adapter, res, timeout_ms);
+        }
         let _ = adapter.with_virtio(|v| v.free_window_range_pub(map_offset, map_len));
     }
     let first_teardown = adapter
         .with_virtio(|v| v.take_live_resource(res))
         .unwrap_or(false);
     let result = if first_teardown {
-        let _ = ctx_detach_resource(passive, adapter, ctx_id, res);
-        resource_unref(passive, adapter, res)
+        if let Some(timeout_ms) = sweep_timeout_ms(budget) {
+            let _ = ctx_detach_resource_within(passive, adapter, ctx_id, res, timeout_ms);
+        }
+        match sweep_timeout_ms(budget) {
+            Some(timeout_ms) => resource_unref_within(passive, adapter, res, timeout_ms),
+            None => Err(VirtioError::Timeout),
+        }
     } else {
         Ok(())
     };

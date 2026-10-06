@@ -32,6 +32,14 @@ pub const MIN_FRAME_INTERVAL_100NS: u64 = 160_000;
 pub const MAX_CONSECUTIVE_FAILS: u8 = 3;
 /// Pause before registering again after the arbiter ended our registration under us.
 pub const REREGISTER_PAUSE_100NS: u64 = 1_000_000;
+/// Pause (100 ms) before the next attempt after a registration, a flip or a source read
+/// that FAILED. It is what keeps [`MAX_CONSECUTIVE_FAILS`] strikes apart in time: a
+/// transient condition (a dedicated image being replaced, a host that is busy for a
+/// moment) must not be able to spend all of them inside one worker pass and end the
+/// presenter for the whole generation. The presenter enforces it itself
+/// ([`Presenter::decide`] answers [`Act::WaitUntil`]), whatever the caller's pass
+/// structure.
+pub const RETRY_AFTER_FAIL_100NS: u64 = 1_000_000;
 
 // ---- the source -------------------------------------------------------------------
 
@@ -389,11 +397,20 @@ impl Presenter {
         if !i.foreground {
             // A user source holds scanout 0. Frames stay owed; on resume the newest
             // content is copied, or the front surface re-flipped if nothing changed.
+            // A failure's pause is moot: the screen is not ours until that source
+            // ends, and the first act after it is a fresh one (the strikes stay).
+            self.retry_at = 0;
             return Act::Idle;
         }
         if self.owed_frame {
-            let due = self.last_flip.saturating_add(MIN_FRAME_INTERVAL_100NS);
-            if self.last_flip != 0 && i.now < due {
+            let mut due = if self.last_flip == 0 {
+                0
+            } else {
+                self.last_flip.saturating_add(MIN_FRAME_INTERVAL_100NS)
+            };
+            // After a failure: not before the pause, even when 16 ms have passed.
+            due = due.max(self.retry_at);
+            if i.now < due {
                 return Act::WaitUntil(due);
             }
             self.owed_frame = false;
@@ -403,6 +420,9 @@ impl Presenter {
             };
         }
         if self.owed_resume {
+            if i.now < self.retry_at {
+                return Act::WaitUntil(self.retry_at);
+            }
             self.owed_resume = false;
             return match self.ring.front() {
                 Some(slot) => Act::Reflip { slot },
@@ -417,11 +437,15 @@ impl Presenter {
     }
 
     /// The answer to [`Act::Register`]: the arbiter took (`true`) or refused the
-    /// registration. A refusal counts as a failure.
-    pub fn registration(&mut self, ok: bool) {
-        if !ok {
+    /// registration, at `now`. A refusal counts as a failure and the next attempt waits
+    /// [`RETRY_AFTER_FAIL_100NS`].
+    pub fn registration(&mut self, ok: bool, now: u64) {
+        if ok {
+            self.retry_at = 0;
+        } else {
             self.stand_down();
             self.fail();
+            self.retry_at = now.saturating_add(RETRY_AFTER_FAIL_100NS);
         }
     }
 
@@ -433,6 +457,7 @@ impl Presenter {
                 self.ring.commit(slot);
                 self.last_flip = now.max(1);
                 self.fails = 0;
+                self.retry_at = 0;
             }
             FlipResult::Yielded => {
                 if copied {
@@ -448,6 +473,10 @@ impl Presenter {
                     self.owed_resume = true;
                 }
                 self.fail();
+                // The next attempt is not before `now + 100 ms`, in whatever pass it
+                // would otherwise be made (a retry spacing only the caller's wake
+                // enforced let two strikes fall in one pass).
+                self.retry_at = now.saturating_add(RETRY_AFTER_FAIL_100NS);
             }
         }
     }
@@ -667,7 +696,7 @@ mod tests {
     fn shown(t: u64) -> Presenter {
         let mut p = Presenter::new(2);
         assert_eq!(p.decide(inp(t)), Act::Register);
-        p.registration(true);
+        p.registration(true, t);
         assert_eq!(p.decide(inp(t)), Act::CopyFlip { slot: 0 });
         p.flipped(0, true, FlipResult::Shown, t);
         p
@@ -695,7 +724,7 @@ mod tests {
         let mut p = Presenter::new(2);
         assert_eq!(p.decide(inp(1)), Act::Register);
         assert!(p.registered());
-        p.registration(true);
+        p.registration(true, 1);
         // No edge at all: the first frame is owed anyway (the screen shows Venus').
         assert_eq!(p.decide(inp(1)), Act::CopyFlip { slot: 0 });
         p.flipped(0, true, FlipResult::Shown, 1);
@@ -826,6 +855,103 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_frame_is_not_retried_before_the_pause_whatever_the_pass_structure() {
+        let mut p = shown(10 * MS);
+        let t = 500 * MS;
+        let mut i = inp(t);
+        i.frame_edge = true;
+        let Act::CopyFlip { slot } = p.decide(i) else {
+            panic!("a frame was due")
+        };
+        p.flipped(slot, true, FlipResult::SourceFailed, t);
+        assert_eq!(p.fails(), 1);
+        // The second `service` call of the same worker pass (same instant), and later
+        // ones inside the pause, are all told when to come back: no second strike.
+        let back = t + RETRY_AFTER_FAIL_100NS;
+        for dt in [0, 1, 20 * MS, 99 * MS] {
+            assert_eq!(p.decide(inp(t + dt)), Act::WaitUntil(back), "dt {dt}");
+        }
+        assert!(p.frame_owed());
+        assert_eq!(p.fails(), 1);
+        // At the pause's end the frame is attempted again.
+        assert!(matches!(p.decide(inp(back)), Act::CopyFlip { .. }));
+    }
+
+    #[test]
+    fn three_strikes_cannot_be_spent_in_one_pass() {
+        // A pass is "decide, perform, answer" up to three times at one instant, the second
+        // `service` call of the pass doing the same again: six acts at `t`.
+        let mut p = shown(10 * MS);
+        let t = 500 * MS;
+        let mut strikes = 0;
+        for n in 0..6 {
+            let mut i = inp(t);
+            i.frame_edge = n == 0;
+            if let Act::CopyFlip { slot } = p.decide(i) {
+                p.flipped(slot, true, FlipResult::Failed, t);
+                strikes += 1;
+            }
+        }
+        assert_eq!(strikes, 1);
+        assert_eq!(p.fails(), 1);
+        assert!(!p.gave_up());
+    }
+
+    #[test]
+    fn a_failed_resume_re_flip_waits_too_and_a_refused_registration_waits() {
+        let mut p = shown(10 * MS);
+        let t = 700 * MS;
+        let mut i = inp(t);
+        i.resume_edge = true;
+        assert_eq!(p.decide(i), Act::Reflip { slot: 0 });
+        p.flipped(0, false, FlipResult::Failed, t);
+        assert_eq!(
+            p.decide(inp(t + MS)),
+            Act::WaitUntil(t + RETRY_AFTER_FAIL_100NS)
+        );
+        assert_eq!(
+            p.decide(inp(t + RETRY_AFTER_FAIL_100NS)),
+            Act::Reflip { slot: 0 }
+        );
+        // A refused registration: the next attempt is a pause away, not the next act.
+        let mut q = Presenter::new(2);
+        assert_eq!(q.decide(inp(t)), Act::Register);
+        q.registration(false, t);
+        assert_eq!(q.decide(inp(t)), Act::WaitUntil(t + RETRY_AFTER_FAIL_100NS));
+        assert_eq!(q.fails(), 1);
+        assert_eq!(q.decide(inp(t + RETRY_AFTER_FAIL_100NS)), Act::Register);
+    }
+
+    #[test]
+    fn a_yield_is_not_delayed_and_a_user_source_voids_a_failures_pause() {
+        let mut p = shown(10 * MS);
+        let t = 500 * MS;
+        let mut i = inp(t);
+        i.frame_edge = true;
+        let Act::CopyFlip { slot } = p.decide(i) else {
+            panic!()
+        };
+        p.flipped(slot, true, FlipResult::Yielded, t);
+        assert!(matches!(p.decide(inp(t + 1)), Act::CopyFlip { .. }));
+        // A failure, then a user source takes the screen and ends within the pause: the
+        // resume is not held back by the pause (the strike stays counted).
+        let mut p = shown(10 * MS);
+        let mut i = inp(t);
+        i.frame_edge = true;
+        let Act::CopyFlip { slot } = p.decide(i) else {
+            panic!()
+        };
+        p.flipped(slot, true, FlipResult::Failed, t);
+        let mut i = inp(t + 10 * MS);
+        i.foreground = false;
+        assert_eq!(p.decide(i), Act::Idle);
+        let mut i = inp(t + 20 * MS);
+        i.resume_edge = true;
+        assert!(matches!(p.decide(i), Act::CopyFlip { .. }));
+        assert_eq!(p.fails(), 1);
+    }
+
+    #[test]
     fn a_shown_frame_forgives_earlier_failures() {
         let mut p = shown(10 * MS);
         let mut i = inp(100 * MS);
@@ -860,7 +986,7 @@ mod tests {
         assert_eq!(p.decide(i), Act::Idle);
         // The primary is on screen again.
         assert_eq!(p.decide(inp(200 * MS)), Act::Register);
-        p.registration(true);
+        p.registration(true, 200 * MS);
         assert_eq!(p.decide(inp(200 * MS)), Act::CopyFlip { slot: 0 });
     }
 
@@ -899,9 +1025,9 @@ mod tests {
         let mut now = MS;
         for _ in 0..MAX_CONSECUTIVE_FAILS {
             assert_eq!(p.decide(inp(now)), Act::Register);
-            p.registration(false);
+            p.registration(false, now);
             assert!(!p.registered());
-            now += 10 * MS;
+            now += RETRY_AFTER_FAIL_100NS;
         }
         assert!(p.gave_up());
         assert_eq!(p.decide(inp(now)), Act::Idle);
@@ -913,7 +1039,7 @@ mod tests {
         let mut i = inp(MS);
         i.foreground = false;
         assert_eq!(p.decide(i), Act::Register);
-        p.registration(true);
+        p.registration(true, MS);
         assert_eq!(
             p.decide(i),
             Act::Idle,
@@ -1004,7 +1130,7 @@ mod tests {
                         Act::Idle | Act::WaitUntil(_) => break,
                         Act::Register => {
                             let ok = self.arb.resident_set(K, KH, 3, layout(), self.now).is_ok();
-                            self.p.registration(ok);
+                            self.p.registration(ok, self.now);
                         }
                         Act::Withdraw => {
                             self.arb.resident_drop();
@@ -1187,6 +1313,531 @@ mod tests {
             seqs.insert(2, u1);
             seqs.insert(3, u2);
             assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+        }
+    }
+
+    // ---- the arbiter, the fenced-present queue and the presenter, together -------------
+    //
+    // A model of what `adapter/foreign_scanout.rs` and `virtio/rm_present.rs` do with the
+    // three pure state machines (`ForeignScanout`, `ScanoutQueue`, `Presenter`): the same
+    // calls in the same order, with a wire that records every flip that reached the host
+    // and a fence table that counts closes. The section 13.12 state machine of
+    // `docs/kmd-rm-client.md` is what these tests pin.
+
+    mod combined {
+        use super::*;
+        use crate::foreign_scanout::{ForeignScanout, Layout, Poll, PresentError, ReleaseOutcome};
+        use crate::foreign_scanout::{ResidentDrop, FOURCC_XRGB8888};
+        use crate::rm_fence_present::{QEntry, ScanoutQueue};
+        use std::collections::BTreeMap;
+
+        const K: u64 = u64::MAX;
+        const KH: u32 = 3;
+        const U1: u64 = 0xA000;
+        const U2: u64 = 0xB000;
+        const UH: u32 = 9;
+        const EPOCH: u64 = 3;
+
+        fn layout() -> Layout {
+            Layout {
+                width: 1920,
+                height: 1080,
+                stride: 7680,
+                offset: 0,
+                fourcc: FOURCC_XRGB8888,
+                modifier: 0,
+            }
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Who {
+            Kmd,
+            User,
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum End {
+            Release,
+            CloseFile,
+            OwnerExit,
+            Lapse,
+            Reset,
+        }
+
+        struct World {
+            arb: ForeignScanout,
+            q: ScanoutQueue,
+            p: Presenter,
+            now: u64,
+            /// Every flip that reached the host, in arrival order: (who, kind, seq).
+            wire: Vec<(Who, &'static str, u64)>,
+            /// Fence handles the KMD took over (attached), and whether each has fired.
+            fired: BTreeMap<u32, bool>,
+            /// How often the KMD asked for each attached fence to be closed.
+            closes: BTreeMap<u32, u32>,
+            frame_edge: bool,
+            resume_edge: bool,
+            refresh_requested: bool,
+            /// Desktop flushes that reached Venus.
+            venus_flushes: u32,
+        }
+
+        impl World {
+            fn new() -> World {
+                World {
+                    arb: ForeignScanout::new(),
+                    q: ScanoutQueue::new(),
+                    p: Presenter::new(2),
+                    now: 100 * MS,
+                    wire: Vec::new(),
+                    fired: BTreeMap::new(),
+                    closes: BTreeMap::new(),
+                    frame_edge: false,
+                    resume_edge: false,
+                    refresh_requested: false,
+                    venus_flushes: 0,
+                }
+            }
+
+            fn advance(&mut self, ms: u64) {
+                self.now += ms * MS;
+            }
+
+            /// `foreign_scanout_restore_desktop`: a re-flip of the resident surface when it
+            /// took the screen back, else one desktop refresh.
+            fn restore(&mut self) {
+                if self.arb.take_resume_owed() {
+                    self.resume_edge = true;
+                    return;
+                }
+                self.refresh_requested = true;
+            }
+
+            /// The display worker's refresh arm: the gate asks the arbiter.
+            fn refresh(&mut self) {
+                if !self.refresh_requested {
+                    return;
+                }
+                self.refresh_requested = false;
+                match self.arb.suppress_desktop(self.now) {
+                    // Resident on screen: the withheld flush is a frame to copy. A user
+                    // source on screen: a flag the presenter folds in for later.
+                    Some(_) => self.frame_edge = true,
+                    None => {
+                        self.venus_flushes += 1;
+                        self.arb.desktop_restored();
+                    }
+                }
+            }
+
+            /// The desktop changed (the gate saw a flush it had to withhold).
+            fn desktop_changed(&mut self) {
+                self.refresh_requested = true;
+                self.refresh();
+            }
+
+            /// `foreign_scanout_flip_done`.
+            fn flip_done(&mut self, generation: u32) {
+                self.arb.extend(generation, self.now);
+                let live = self
+                    .arb
+                    .suppress_desktop(self.now)
+                    .is_some_and(|a| a.generation == generation);
+                if !live {
+                    self.restore();
+                }
+            }
+
+            /// `foreign_fence_pump`, one drain.
+            fn drain_once(&mut self) -> Option<QEntry> {
+                let live = self
+                    .arb
+                    .suppress_desktop(self.now)
+                    .map(|a| (a.generation, a.epoch));
+                let fired = self.fired.clone();
+                let d = self
+                    .q
+                    .drain(live, |f| fired.get(&f).copied().unwrap_or(true));
+                for &c in d.closes() {
+                    *self.closes.entry(c).or_default() += 1;
+                }
+                d.send
+            }
+
+            fn send_entry(&mut self, e: QEntry) {
+                let who = if e.flip.handle == KH {
+                    Who::Kmd
+                } else {
+                    Who::User
+                };
+                self.wire.push((who, "queued", e.flip.seq));
+                self.flip_done(e.flip.generation);
+            }
+
+            fn pump(&mut self) {
+                while let Some(e) = self.drain_once() {
+                    self.send_entry(e);
+                }
+            }
+
+            fn user_set(&mut self, owner: u64) -> Result<crate::foreign_scanout::SetOutcome, ()> {
+                self.arb
+                    .set(owner, UH, EPOCH, layout(), 0, self.now)
+                    .map_err(|_| ())
+            }
+
+            /// `present_fenced`: mint, queue behind `fence`, pump.
+            fn user_present_fenced(&mut self, owner: u64, fence: u32) -> Result<u64, PresentError> {
+                let flip = match self.arb.present(owner, UH, self.now) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        if e == PresentError::Lapsed {
+                            self.restore();
+                        }
+                        return Err(e);
+                    }
+                };
+                self.fired.entry(fence).or_insert(false);
+                self.closes.entry(fence).or_insert(0);
+                self.q
+                    .push(QEntry {
+                        flip,
+                        gem: 100 + fence,
+                        fence,
+                    })
+                    .unwrap();
+                self.pump();
+                Ok(flip.seq)
+            }
+
+            fn fire(&mut self, fence: u32) {
+                self.fired.insert(fence, true);
+            }
+
+            /// `rm_present::service` (one call).
+            fn present_pass(&mut self) {
+                let (mut fe, mut re) = (
+                    core::mem::take(&mut self.frame_edge),
+                    core::mem::take(&mut self.resume_edge),
+                );
+                for _ in 0..3 {
+                    let i = Inputs {
+                        now: self.now,
+                        ring_ready: true,
+                        source_ok: true,
+                        arbiter_has_resident: self.arb.resident().is_some(),
+                        foreground: self.arb.resident_foreground(),
+                        frame_edge: fe,
+                        resume_edge: re,
+                    };
+                    fe = false;
+                    re = false;
+                    match self.p.decide(i) {
+                        Act::Idle | Act::WaitUntil(_) => break,
+                        Act::Register => {
+                            let ok = self
+                                .arb
+                                .resident_set(K, KH, EPOCH, layout(), self.now)
+                                .is_ok();
+                            self.p.registration(ok, self.now);
+                        }
+                        Act::Withdraw => {
+                            if self.arb.resident_drop() == ResidentDrop::Ended {
+                                self.restore();
+                            }
+                            break;
+                        }
+                        act @ (Act::CopyFlip { .. } | Act::Reflip { .. }) => {
+                            let (slot, copied) = match act {
+                                Act::CopyFlip { slot } => (slot, true),
+                                Act::Reflip { slot } => (slot, false),
+                                _ => unreachable!(),
+                            };
+                            let result = match self.arb.present(K, KH, self.now) {
+                                Ok(f) => {
+                                    self.wire.push((
+                                        Who::Kmd,
+                                        if copied { "copy" } else { "reflip" },
+                                        f.seq,
+                                    ));
+                                    // `present_within` sends direct, then `flip_done`.
+                                    self.flip_done(f.generation);
+                                    FlipResult::Shown
+                                }
+                                Err(_) => FlipResult::Yielded,
+                            };
+                            self.p.flipped(slot, copied, result, self.now);
+                        }
+                    }
+                }
+            }
+
+            /// One HPD worker pass, in the worker's order: the display refresh arm, the
+            /// lapse poll, the fenced queue, the RM client's presenter.
+            fn pass(&mut self) {
+                self.refresh();
+                if let Poll::Lapsed { .. } = self.arb.poll(self.now) {
+                    self.restore();
+                }
+                self.pump();
+                self.present_pass();
+            }
+
+            fn settle(&mut self) {
+                for _ in 0..4 {
+                    self.advance(20);
+                    self.pass();
+                }
+            }
+
+            fn end(&mut self, how: End) {
+                match how {
+                    End::Release => {
+                        if let ReleaseOutcome::Released { .. } = self.arb.release(U1, Some(UH)) {
+                            self.restore();
+                        }
+                    }
+                    End::CloseFile => {
+                        if self.arb.release_handle(U1, UH) {
+                            self.restore();
+                        }
+                    }
+                    End::OwnerExit => {
+                        if self.arb.release_owner(U1) {
+                            self.restore();
+                        }
+                    }
+                    End::Lapse => self.advance(2_100),
+                    End::Reset => {
+                        // `foreign_scanout_reset`, then the transport sweep closes whatever
+                        // the queue still held (`close_all_on_host`).
+                        self.arb.reset();
+                        self.q.clear();
+                        self.p.reset();
+                        self.frame_edge = false;
+                        self.resume_edge = false;
+                        self.refresh_requested = false;
+                        let open: Vec<u32> = self
+                            .closes
+                            .iter()
+                            .filter(|(_, n)| **n == 0)
+                            .map(|(f, _)| *f)
+                            .collect();
+                        for f in open {
+                            *self.closes.get_mut(&f).unwrap() += 1;
+                        }
+                    }
+                }
+            }
+
+            /// The resident is registered and shown; a user source with three fenced
+            /// presents holds scanout 0 (fence 101 fired and sent, 102 and 103 waiting).
+            fn user_tenure() -> World {
+                let mut w = World::new();
+                w.pass();
+                assert_eq!(w.wire, [(Who::Kmd, "copy", 1)]);
+                w.advance(20);
+                assert_eq!(
+                    w.user_set(U1).unwrap().kind,
+                    crate::foreign_scanout::SetKind::Preempted
+                );
+                assert!(w.arb.resident().is_some(), "parked, not ended");
+                w.pass();
+                assert_eq!(w.wire.len(), 1, "the presenter yields to the user source");
+                for f in [101, 102, 103] {
+                    w.user_present_fenced(U1, f).unwrap();
+                }
+                assert_eq!(w.q.len(), 3, "nothing fired yet");
+                w.fire(101);
+                w.pass();
+                assert_eq!(w.q.len(), 2, "101 was sent");
+                assert_eq!(w.wire.last().unwrap().0, Who::User);
+                // The desktop kept changing under the game.
+                w.advance(20);
+                w.desktop_changed();
+                w
+            }
+
+            fn assert_quiet_and_exactly_once(&self) {
+                assert!(self.q.is_empty(), "the queue is empty");
+                for (f, n) in &self.closes {
+                    assert_eq!(*n, 1, "fence {f} was closed {n} times");
+                }
+                let seqs: Vec<u64> = self.wire.iter().map(|w| w.2).collect();
+                assert!(
+                    seqs.windows(2).all(|w| w[0] < w[1]),
+                    "seq never goes back on the wire: {seqs:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn every_end_of_a_user_source_with_fenced_presents_closes_each_fence_once_and_resumes_the_resident_one(
+        ) {
+            for how in [End::Release, End::CloseFile, End::OwnerExit, End::Lapse] {
+                let mut w = World::user_tenure();
+                let last_user = w.wire.last().unwrap().2;
+                w.end(how);
+                w.settle();
+                w.assert_quiet_and_exactly_once();
+                // The resident source has the screen back, with the newest content: a
+                // COPY (the desktop changed during the tenure) after the user's last flip.
+                let (who, kind, seq) = *w.wire.last().unwrap();
+                assert_eq!((who, kind), (Who::Kmd, "copy"), "{how:?}: {:?}", w.wire);
+                assert!(seq > last_user, "{how:?}");
+                assert!(w.arb.resident_foreground(), "{how:?}");
+                assert!(w.p.registered(), "{how:?}");
+                assert_eq!(w.venus_flushes, 0, "{how:?}: no Venus flush while resident");
+                // 102 and 103 never reached the host.
+                assert_eq!(
+                    w.wire.iter().filter(|f| f.0 == Who::User).count(),
+                    1,
+                    "{how:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_quiet_tenure_ends_in_a_re_flip_not_a_copy_and_not_a_venus_flush() {
+            let mut w = World::new();
+            w.pass();
+            w.advance(20);
+            w.user_set(U1).unwrap();
+            w.pass();
+            w.user_present_fenced(U1, 101).unwrap();
+            w.fire(101);
+            w.pass();
+            w.end(End::Release);
+            w.settle();
+            w.assert_quiet_and_exactly_once();
+            assert_eq!(
+                w.wire.last().map(|f| (f.0, f.1)),
+                Some((Who::Kmd, "reflip")),
+                "{:?}",
+                w.wire
+            );
+            assert_eq!(w.venus_flushes, 0);
+        }
+
+        #[test]
+        fn a_transport_reset_ends_everything_and_the_sweep_closes_each_fence_once() {
+            let mut w = World::user_tenure();
+            w.end(End::Reset);
+            assert!(w.q.is_empty());
+            for (f, n) in &w.closes {
+                assert_eq!(*n, 1, "fence {f}");
+            }
+            assert!(
+                w.arb.resident().is_none(),
+                "the registration died with the transport"
+            );
+            // The new generation starts cold: it registers again, with a first frame.
+            let before = w.wire.len();
+            w.settle();
+            assert!(w.wire.len() > before);
+            assert_eq!(w.wire.last().map(|f| f.0), Some(Who::Kmd));
+        }
+
+        #[test]
+        fn without_a_resident_source_the_end_of_a_user_source_flushes_venus_once() {
+            // Level 0 to 2: no presenter, no resident source. The S4 behaviour is unchanged.
+            let mut w = World::new();
+            w.user_set(U1).unwrap();
+            w.user_present_fenced(U1, 101).unwrap();
+            w.user_present_fenced(U1, 102).unwrap();
+            w.end(End::Release);
+            w.pass();
+            assert_eq!(w.venus_flushes, 1);
+            assert!(w.q.is_empty());
+            assert_eq!(w.closes.values().copied().collect::<Vec<_>>(), [1, 1]);
+        }
+
+        #[test]
+        fn a_flip_taken_off_the_queue_just_before_its_source_ended_lands_late_and_the_resident_answers(
+        ) {
+            let mut w = World::new();
+            w.pass();
+            w.advance(20);
+            w.user_set(U1).unwrap();
+            w.pass();
+            w.closes.entry(101).or_insert(0);
+            w.fired.insert(101, true);
+            // The pump drained a ready entry (its fence is closed) and is about to send ...
+            let flip = w.arb.present(U1, UH, w.now).unwrap();
+            w.q.push(QEntry {
+                flip,
+                gem: 7,
+                fence: 101,
+            })
+            .unwrap();
+            let late = w.drain_once().expect("a ready entry");
+            // ... when the game exits: the resident source takes the screen back and the
+            // worker re-flips it.
+            w.end(End::OwnerExit);
+            w.pass();
+            assert_eq!(w.wire.last().map(|f| f.1), Some("reflip"));
+            // The late flip is accepted by the host AFTER that. It is what is on screen now,
+            // and `flip_done` finds its source gone: the resident source owes a frame again.
+            w.send_entry(late);
+            w.settle();
+            assert_eq!(
+                w.wire.last().map(|f| (f.0, f.1)),
+                Some((Who::Kmd, "copy")),
+                "{:?}",
+                w.wire
+            );
+            assert_eq!(w.venus_flushes, 0);
+            assert_eq!(w.closes[&101], 1);
+        }
+
+        #[test]
+        fn a_resident_flip_in_flight_when_a_user_source_takes_over_costs_nothing() {
+            let mut w = World::new();
+            w.pass();
+            w.advance(20);
+            // The presenter minted a flip ...
+            let f = w.arb.present(K, KH, w.now).unwrap();
+            // ... and the user source set (preempting) before the host answered.
+            w.user_set(U1).unwrap();
+            w.wire.push((Who::Kmd, "copy", f.seq));
+            w.flip_done(f.generation);
+            // No resume is owed (the user source is what is live), no Venus flush.
+            assert!(!w.arb.take_resume_owed());
+            w.refresh();
+            assert_eq!(w.venus_flushes, 0);
+            // The user's frames flow; the desktop changed meanwhile; the game exits.
+            w.user_present_fenced(U1, 101).unwrap();
+            w.fire(101);
+            w.pass();
+            w.desktop_changed();
+            w.end(End::Release);
+            w.settle();
+            w.assert_quiet_and_exactly_once();
+            assert_eq!(w.wire.last().map(|f| (f.0, f.1)), Some((Who::Kmd, "copy")));
+            assert_eq!(w.venus_flushes, 0);
+        }
+
+        #[test]
+        fn another_users_source_replaces_a_lapsed_one_and_the_old_ones_queue_is_dropped() {
+            let mut w = World::user_tenure();
+            // U2 cannot take scanout 0 while U1 is within its lapse.
+            assert!(w.user_set(U2).is_err());
+            // U1 goes silent past its lapse (its fences 102, 103 never fire); U2 takes over.
+            w.advance(2_100);
+            assert_eq!(
+                w.user_set(U2).unwrap().kind,
+                crate::foreign_scanout::SetKind::TookOver
+            );
+            w.user_present_fenced(U2, 201).unwrap();
+            w.pass();
+            // U1's entries were dropped by generation (and closed), exactly once; U2's own
+            // waits for its fence.
+            assert_eq!(w.q.len(), 1);
+            assert_eq!(w.closes[&201], 0);
+            assert_eq!(w.closes[&102], 1);
+            assert_eq!(w.closes[&103], 1);
+            assert!(w.arb.resident().is_some(), "still parked behind U2");
+            assert!(!w.arb.resident_foreground());
         }
     }
 }

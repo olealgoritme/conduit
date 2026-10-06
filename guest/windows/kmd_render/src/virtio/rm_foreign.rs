@@ -42,6 +42,7 @@ use helios_kmd_logic::foreign_resource::{
     MOD_LINEAR,
 };
 use helios_kmd_logic::rm_client::{Client, Fail, FailKind, Out};
+use helios_kmd_logic::sweep_budget::{SweepBudget, UNITS_PER_MS};
 use helios_protocol::HELIOS_BLOB_MEM_RM_EXPORT;
 
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;
@@ -70,6 +71,18 @@ pub(crate) fn publish_counters() {
     rec(b"RmFgWhy", RM_FG_WHY.load(Ordering::Relaxed));
 }
 
+/// A budget of `timeout_ms` in all, from now, shared by every host command of one call
+/// (also the per-command cap): these calls run on the HPD worker, which StopDevice joins
+/// for a bounded time, so a call is over when its allowance is, however many commands it
+/// is made of (create + attach + unref; unmap + detach + unref).
+fn budget_of(timeout_ms: u64) -> SweepBudget {
+    SweepBudget::new(
+        crate::adapter::foreign_scanout::now_100ns(),
+        timeout_ms.saturating_mul(UNITS_PER_MS),
+        timeout_ms,
+    )
+}
+
 fn failed(why: u32, errno: u32) -> Fail {
     RM_FG_FAILED.fetch_add(1, Ordering::Relaxed);
     RM_FG_WHY.store(why, Ordering::Relaxed);
@@ -93,13 +106,16 @@ pub fn surface_foreign_layout(l: &helios_kmd_logic::rm_client::SurfaceLayout) ->
 /// Import the client's working-slot surface (its GEM on the KMD's DRI file) as a
 /// foreign resource of owner [`DeviceOwner::KMD_RM`] on the KMD's own Venus context.
 /// The resource id the KMD minted, as `Out::Resource`. PASSIVE: it waits on the control
-/// queue, with no lock held.
+/// queue, with no lock held, `timeout_ms` in all (create, attach and the undo of a
+/// failed one share it).
 #[inline(never)]
 pub(super) fn import_surface(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     c: &Client,
+    timeout_ms: u64,
 ) -> Result<Out, Fail> {
+    let budget = budget_of(timeout_ms);
     let Some((layout, _mem, gem)) = c.ready_surface() else {
         return Err(Fail::new(FailKind::Parse, 0x40));
     };
@@ -126,7 +142,7 @@ pub(super) fn import_surface(
         ForeignBegin::Quota(_) => return Err(failed(4, 0)),
     };
     let mut errno = 0u32;
-    let created = ctrl::alloc_blob_errno(
+    let created = ctrl::alloc_blob_errno_within(
         passive,
         adapter,
         ctx,
@@ -136,6 +152,7 @@ pub(super) fn import_surface(
         size,
         Some(KMD),
         Some(&mut errno),
+        Some(&budget),
     );
     let resource_id = match created {
         Ok(id) => id,
@@ -156,7 +173,16 @@ pub(super) fn import_surface(
         // Teardown (or a closed DRM file) raced the round trip: the resource exists host
         // side with no record, release it through the ordinary path.
         Ok(_) | Err(_) => {
-            let _ = ctrl::release_blob_for_owner(passive, adapter, KMD, ctx, resource_id);
+            // What is left of the allowance, and nothing when it is spent: the resource
+            // is then reclaimed by `release_all` or the transport's own sweep.
+            let _ = ctrl::release_blob_for_owner_within(
+                passive,
+                adapter,
+                KMD,
+                ctx,
+                resource_id,
+                Some(&budget),
+            );
             Err(failed(7, 0))
         }
     }
@@ -166,18 +192,29 @@ pub(super) fn import_surface(
 /// drop the slot and the record. A resource a WDDM allocation adopted since is no longer
 /// the client's (its slot is owned by no one): the release is then a no-op and the
 /// allocation's destroy releases it, so a surface may be freed while a WDDM allocation
-/// still names it (the host import holds its own reference to the memory).
+/// still names it (the host import holds its own reference to the memory). The host
+/// commands (unmap, detach, unref) share `timeout_ms`; with it spent the answer is a
+/// transport failure and the transport's sweep reclaims the rest.
 #[inline(never)]
 pub(super) fn release_surface(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_id: u32,
+    timeout_ms: u64,
 ) -> Result<Out, Fail> {
     if resource_id == 0 {
         return Ok(Out::Unit);
     }
     let ctx = adapter.venus_ctx_id();
-    match ctrl::release_blob_for_owner(passive, adapter, KMD, ctx, resource_id) {
+    let budget = budget_of(timeout_ms);
+    match ctrl::release_blob_for_owner_within(
+        passive,
+        adapter,
+        KMD,
+        ctx,
+        resource_id,
+        Some(&budget),
+    ) {
         Ok(()) => {
             RM_FG_RELEASED.fetch_add(1, Ordering::Relaxed);
             Ok(Out::Unit)
@@ -190,10 +227,14 @@ pub(super) fn release_surface(
 }
 
 /// Reclaim every resource the KMD's client still owns (a dead client, a retire): the
-/// ones nobody adopted. PASSIVE.
+/// ones nobody adopted. PASSIVE, `timeout_ms` for the whole sweep: with it spent the
+/// remaining slots are still taken out of the table, but nothing more is sent (the
+/// transport's sweep reclaims the host side), so a dead client's cleanup, which runs on
+/// the HPD worker, cannot outlast one step's allowance.
 #[inline(never)]
-pub(super) fn release_all(passive: PassiveLevel, adapter: &AdapterContext) {
-    let n = ctrl::release_blobs_for_owner(passive, adapter, Some(KMD));
+pub(super) fn release_all(passive: PassiveLevel, adapter: &AdapterContext, timeout_ms: u64) {
+    let budget = budget_of(timeout_ms);
+    let n = ctrl::release_blobs_for_owner_within(passive, adapter, Some(KMD), Some(&budget));
     if n != 0 {
         RM_FG_RELEASED.fetch_add(n, Ordering::Relaxed);
     }

@@ -40,8 +40,8 @@ use helios_kmd_logic::rm_fence_present::{Attach, QEntry, ScanoutQueue};
 
 use super::AdapterContext;
 use crate::ddi::scanout_trace::LeaseEnd;
-use crate::sync::SpinLock;
 use crate::irql::PassiveLevel;
+use crate::sync::SpinLock;
 use crate::virtio::gpu::{DeviceOwner, FenceClaim, FenceRefusal};
 use wdk_sys::ntddk::KeSetEvent;
 
@@ -294,10 +294,21 @@ impl AdapterContext {
         owner: DeviceOwner,
         handle: Option<u32>,
     ) -> ReleaseOutcome {
-        let result = STATE.lock().release(owner.raw() as u64, handle);
+        let (result, was_resident) = {
+            let mut g = STATE.lock();
+            let was = g.resident_foreground();
+            (g.release(owner.raw() as u64, handle), was)
+        };
         match result {
             ReleaseOutcome::Released { .. } => {
-                FS_RELEASES.fetch_add(1, Ordering::Relaxed);
+                // The KMD's own resident source ended by its client (`GemClose` of the
+                // surface it shows) is `RmResEnd`, as every other end of it: `FsSet`
+                // never counted it, so `FsRel` must not either.
+                if was_resident {
+                    crate::virtio::rm_present::RM_RES_ENDED.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    FS_RELEASES.fetch_add(1, Ordering::Relaxed);
+                }
                 self.foreign_scanout_restore_desktop();
             }
             ReleaseOutcome::NotOwner => {

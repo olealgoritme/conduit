@@ -252,7 +252,7 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     // Level 3: the presenter first, so a ring about to be torn down (a new extent) is
     // withdrawn from scanout before the steps close the GEM under it.
     if level >= 3 && !io.stopping() {
-        rm_present::service(passive, adapter, epoch, want);
+        rm_present::service(passive, adapter, epoch, want, false);
     }
     let mut did = 0usize;
     let mut more = false;
@@ -307,7 +307,7 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     // Level 3: the ring is the desktop's scanout. After the client's own steps, so a
     // ring completed in this very pass is used in it; a no-op until the ring is whole.
     if level >= 3 && !io.stopping() {
-        rm_present::service(passive, adapter, epoch, want);
+        rm_present::service(passive, adapter, epoch, want, true);
     }
     if more {
         // The rest of the bring-up goes on after the worker has done its other duties.
@@ -387,7 +387,11 @@ fn cleanup(io: &Io<'_>) {
     // The foreign resources it made (level 4) are Venus blobs owned by the KMD's own
     // owner: reclaim them before their DRM file goes (the host import holds its own
     // dma-buf reference, so the order is only tidiness).
-    super::rm_foreign::release_all(io.passive, io.adapter);
+    // Skipped when StopDevice asked the worker to go (the transport sweep reclaims the
+    // blobs), and bounded as a whole by one step's allowance otherwise.
+    if !io.stopping() {
+        super::rm_foreign::release_all(io.passive, io.adapter, TIMEOUT_MS);
+    }
     for &h in handles.as_slice() {
         // Bounded like the step loop: once StopDevice asks, or the transport has
         // failed, stop sending. The handles are still in the NVRM tables, and the
@@ -738,9 +742,15 @@ impl Io<'_> {
             }
             Step::HostMunmap => {
                 let (id, _) = c.view_host();
-                nvrm::release_host_map(self.passive, self.adapter, c.map_ch(), id)
-                    .map(|()| Out::Unit)
-                    .map_err(|e| fail_of(Refusal::Transport(e)))
+                nvrm::release_host_map_within(
+                    self.passive,
+                    self.adapter,
+                    c.map_ch(),
+                    id,
+                    TIMEOUT_MS,
+                )
+                .map(|()| Out::Unit)
+                .map_err(|e| fail_of(Refusal::Transport(e)))
             }
             Step::RmUnmapMemory => self.rm_unmap_memory(c),
             Step::CloseMapCh => self.close_checked(c.map_ch()),
@@ -753,10 +763,15 @@ impl Io<'_> {
             Step::Park | Step::Unpark => Ok(Out::Unit),
 
             // Level 4: the surface as a foreign (Venus) resource under the KMD's owner.
-            Step::ForeignImport => super::rm_foreign::import_surface(self.passive, self.adapter, c),
-            Step::ForeignRelease => {
-                super::rm_foreign::release_surface(self.passive, self.adapter, c.foreign())
+            Step::ForeignImport => {
+                super::rm_foreign::import_surface(self.passive, self.adapter, c, TIMEOUT_MS)
             }
+            Step::ForeignRelease => super::rm_foreign::release_surface(
+                self.passive,
+                self.adapter,
+                c.foreign(),
+                TIMEOUT_MS,
+            ),
         }
     }
 
@@ -1122,11 +1137,27 @@ impl Io<'_> {
         let size = page_up(layout.size);
         // Offset 0 on the freshly armed channel, as librmclient does: the mapping is
         // the channel's own.
-        match nvrm::host_mmap(self.passive, self.adapter, KMD, c.map_ch(), true, 0, size) {
+        // Bounded like every message of a step: this runs on the worker StopDevice joins.
+        match nvrm::host_mmap_within(
+            self.passive,
+            self.adapter,
+            KMD,
+            c.map_ch(),
+            true,
+            0,
+            size,
+            TIMEOUT_MS,
+        ) {
             Ok(m) if m.size >= size => Ok(Out::HostMapped(m.host_id, m.offset)),
             Ok(m) => {
                 // Too small: give the mapping back before failing.
-                let _ = nvrm::release_host_map(self.passive, self.adapter, c.map_ch(), m.host_id);
+                let _ = nvrm::release_host_map_within(
+                    self.passive,
+                    self.adapter,
+                    c.map_ch(),
+                    m.host_id,
+                    TIMEOUT_MS,
+                );
                 Err(Fail::new(FailKind::Layout, 0x20))
             }
             Err(MapRefusal::Host(errno)) => Err(Fail::new(FailKind::Host, errno.unsigned_abs())),
@@ -1239,8 +1270,18 @@ impl Io<'_> {
     /// Send the one `ScanoutFlip`, through the same path `SCANOUT_PRESENT` uses.
     #[inline(never)]
     fn scanout_present(&self, c: &Client) -> Result<Out, Fail> {
-        use crate::virtio::foreign_scanout::{present, PresentRefusal};
-        let result = match present(self.passive, self.adapter, KMD, c.drm(), c.gem()) {
+        use crate::virtio::foreign_scanout::{present_within, PresentRefusal};
+        // Direct and bounded like the ring's flips: this runs on the worker StopDevice joins,
+        // and the only source that can be live here is the KMD's own (`ScanoutSet` found no
+        // user source), so there is no fenced queue of a live source to stay behind.
+        let result = match present_within(
+            self.passive,
+            self.adapter,
+            KMD,
+            c.drm(),
+            c.gem(),
+            TIMEOUT_MS,
+        ) {
             Ok(_seq) => Ok(Out::Unit),
             Err(PresentRefusal::NoTransport) => Err(Fail::new(FailKind::Transport, 4)),
             Err(PresentRefusal::NotOwned) => Err(Fail::new(FailKind::Refused, 2)),

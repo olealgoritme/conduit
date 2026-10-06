@@ -955,6 +955,36 @@ pub fn host_mmap(
     offset: u64,
     size: u64,
 ) -> Result<HostMapping, MapRefusal> {
+    host_mmap_within(
+        passive,
+        adapter,
+        owner,
+        handle,
+        write,
+        offset,
+        size,
+        HOST_MMAP_TIMEOUT_MS,
+    )
+}
+
+/// How long the host gets to answer an `Mmap` for a user-mode caller.
+const HOST_MMAP_TIMEOUT_MS: u64 = 30_000;
+
+/// [`host_mmap`] with the caller's bound on the host's answer, for a caller that runs on
+/// a thread StopDevice joins (the KMD's own RM client, on the HPD worker). A timed-out
+/// `Mmap` may still have been served host-side: the mapping id is lost with the reply,
+/// and the host's own sweep (the file's `Close`, or the transport's) reclaims it.
+#[allow(clippy::too_many_arguments)]
+pub fn host_mmap_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    handle: u32,
+    write: bool,
+    offset: u64,
+    size: u64,
+    timeout_ms: u64,
+) -> Result<HostMapping, MapRefusal> {
     let Some(device_type) = adapter
         .with_virtio(|v| v.nvrm_handle_device_type(owner, handle))
         .ok()
@@ -994,7 +1024,7 @@ pub fn host_mmap(
     req[24..32].copy_from_slice(&offset.to_le_bytes());
     req[32..36].copy_from_slice(&(if write { 3u32 } else { 1u32 }).to_le_bytes());
     let mut resp = [0u8; 64];
-    let n = ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, 30_000)
+    let n = ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, timeout_ms)
         .map_err(MapRefusal::Transport)?;
     if let Some(status) = rd_i32(&resp, 8) {
         if status < 0 {
@@ -1064,7 +1094,7 @@ pub fn release_host_map(
 }
 
 /// [`release_host_map`] waiting at most `timeout_ms` for the host.
-fn release_host_map_within(
+pub fn release_host_map_within(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     handle: u32,

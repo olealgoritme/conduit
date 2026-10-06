@@ -196,7 +196,7 @@ pub fn present(
 ///   anything this flip must stay behind. A flip of the resident source is always the
 ///   screen's newest; the pump's one late flip of a source that has just ended is
 ///   answered by [`AdapterContext::foreign_scanout_flip_done`] (see the state machine
-///   in `docs/kmd-rm-client.md`, section 12.5);
+///   in `docs/kmd-rm-client.md`, section 13.12);
 /// * the answer for a source that is no longer the live one is `NoSource` (the
 ///   presenter reads it as "yielded", not as a failure).
 pub fn present_within(

@@ -45,6 +45,7 @@ use helios_kmd_logic::rm_client::{flip_layout, Want, RING_SLOTS};
 use helios_kmd_logic::rm_present::{
     source_layout, Act, CopyPlan, FlipResult, Inputs, Presenter, SourceLayout, SourceRefusal,
 };
+use helios_kmd_logic::sweep_budget::{SweepBudget, UNITS_PER_MS};
 use wdk_sys::ntddk::{MmMapIoSpace, MmUnmapIoSpace};
 use wdk_sys::PHYSICAL_ADDRESS;
 
@@ -61,9 +62,14 @@ const MIRROR_EVERY_FRAMES: u32 = 600;
 /// backend sends without waiting for the viewer, so this is generous; it is short
 /// because the HPD worker flips every frame and StopDevice joins it for a bounded time.
 const FLIP_TIMEOUT_MS: u64 = 1_000;
+/// How long the host gets to map the primary's blob (`RESOURCE_MAP_BLOB`, the first
+/// frame of a blob; later frames find the mapping and send nothing), for the same reason.
+const MAP_TIMEOUT_MS: u64 = 1_000;
 /// How long after a frame that could not be shown the worker is woken to try again
-/// (100 ms): the failure counter, and so giving up, moves only if it does.
-const RETRY_AFTER_100NS: u64 = 1_000_000;
+/// (100 ms): the failure counter, and so giving up, moves only if it does. The
+/// presenter itself refuses to act earlier (`helios_kmd_logic::rm_present::
+/// RETRY_AFTER_FAIL_100NS`, the same 100 ms), so this is only when the worker is woken.
+const RETRY_AFTER_100NS: u64 = helios_kmd_logic::rm_present::RETRY_AFTER_FAIL_100NS;
 /// Consecutive flips that found the source yielded before it counts as a failure (a
 /// registration the arbiter keeps refusing to let us show, with no user source).
 pub const MAX_YIELDS: u32 = 8;
@@ -266,10 +272,26 @@ fn read_source(
 }
 
 /// One pass of the presenter, from [`rm_client::service`] (PASSIVE, the HPD worker),
-/// at level 3, after the client's own steps. `want` is what the client was driven
-/// toward this pass.
+/// at level 3. `want` is what the client was driven toward this pass.
+///
+/// `service` calls this twice per worker pass (before the client's steps, so a ring about
+/// to be torn down is withdrawn first, and after them, so a ring completed in this pass is
+/// used in it). `again` is the second call: it leaves the pass alone while a wake the
+/// first call asked for (a paced frame, the pause after a failure) is still in the
+/// future, instead of acting on a decision the first call already made. (The presenter
+/// enforces its own pauses too, `Presenter::decide`; this keeps the second call from
+/// even looking.)
 #[inline(never)]
-pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, epoch: u64, want: Want) {
+pub(crate) fn service(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    epoch: u64,
+    want: Want,
+    again: bool,
+) {
+    if again && WAKE_AT.load(Ordering::Acquire) > now_100ns() {
+        return;
+    }
     WAKE_AT.store(0, Ordering::Release);
     let mut frame_edge = FRAME_EDGE.swap(0, Ordering::AcqRel) != 0;
     let mut resume_edge = RESUME_EDGE.swap(0, Ordering::AcqRel) != 0;
@@ -332,6 +354,12 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext, epoch: u6
             }
             Act::Register => {
                 if !register(adapter, epoch) {
+                    // Refused: the presenter pauses before the next attempt and the
+                    // worker is woken for it (nothing else would, on an idle desktop).
+                    WAKE_AT.store(
+                        now_100ns().saturating_add(RETRY_AFTER_100NS),
+                        Ordering::Release,
+                    );
                     return;
                 }
             }
@@ -396,7 +424,7 @@ fn register(adapter: &AdapterContext, epoch: u64) -> bool {
     {
         let mut g = PRESENTER.lock();
         if g.epoch == epoch {
-            g.p.registration(ok);
+            g.p.registration(ok, now_100ns());
         }
     }
     crate::diag::record_named_bytes(b"RmReg", u32::from(ok));
@@ -509,15 +537,30 @@ fn copy_flip(
     {
         return FlipResult::SourceFailed;
     }
-    let Ok(prep) = crate::virtio::ctrl::map_blob_prepare(passive, adapter, OwnerFilter::Any, resid)
-    else {
+    // StopDevice is joining the worker: no host round trip is started (a source that is
+    // not read is not a failure: the generation is ending).
+    if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
+        return FlipResult::Yielded;
+    }
+    let budget = SweepBudget::new(
+        now_100ns(),
+        MAP_TIMEOUT_MS.saturating_mul(UNITS_PER_MS),
+        MAP_TIMEOUT_MS,
+    );
+    let Ok(prep) = crate::virtio::ctrl::map_blob_prepare_within(
+        passive,
+        adapter,
+        OwnerFilter::Any,
+        resid,
+        Some(&budget),
+    ) else {
         return FlipResult::SourceFailed;
     };
     let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
     pa.QuadPart = prep.gpa as i64;
     // The cache attribute MUST be the host's (`MAP_INFO`): an alias with another one
     // is architecturally invalid, and reading a WC view is slow but correct.
-    let cache = crate::ddi::blob_map::map_cache_to_mm(prep.map_cache);
+    let cache = crate::ddi::map_cache_to_mm(prep.map_cache);
     // SAFETY: PASSIVE (the HPD worker); the range was RESOURCE_MAP_BLOB'd into the
     // host-visible window by `map_blob_prepare`, so the pages are backed. Unmapped
     // below, on every path.
