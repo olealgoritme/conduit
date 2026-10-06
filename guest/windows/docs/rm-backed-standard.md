@@ -12,6 +12,16 @@ branch `s6-order2`); treat those as secondary evidence. "Unknown" is said where 
 refer to `kmd-rm-client.md`; `shared-foreign-surfaces.md`, `zero-copy-present.md` and `nvrm-escape.md` are in this
 directory.
 
+> **Status: PARKED (measured census).** A fresh Venus DWM restart reopened every window in 44 s with 125
+> OpenResource calls, all kind=1 DEVICE_MEMORY (UMD-made, about 15 processes, Venus ctxs 3-111); DWM opened NO
+> KMD-made STANDARD (kind=2) allocation in the T1 or T2 runs. The mem_type=0 opens seen earlier were NVK apps'
+> foreign ids. Mix: about 45 A8_UNORM (atlases and masks, 32x32 to 1024x1024), about 55 B8G8R8A8 (64x32 to
+> 1952x1088, one 5152x1440), about 25 R8G8B8A8 from two Chromium/Electron-style processes; pitches 256-aligned;
+> nearly all opens happen at DWM start, a few per minute in steady state. RM-backed GDI redirection is therefore
+> not on DWM's critical path: what matters for the NVK desktop is the shell processes moving to NVK with A8
+> resource ids (v321 shared formats) and the existing 32 bpp ids. Nothing below is scheduled; it stays as the
+> design to pick up if a census on another workload shows KMD-made STANDARD opens.
+
 ## 0. The answer in ten lines
 
 1. What DWM on NVK cannot open today is the CPU-visible KMD standard buffer (shadow, staging, every GDI surface type
