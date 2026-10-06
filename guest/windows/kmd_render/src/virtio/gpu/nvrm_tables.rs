@@ -640,9 +640,22 @@ impl VirtioGpu {
     pub(super) fn teardown_nvrm_state(&mut self) -> u32 {
         let mut swept = 0u32;
         // Pins: popped one at a time and dropped (= unlocked) here, not under any lock.
+        //
+        // Anything still tracked here was NOT confirmed closed by the host: the live
+        // sweep (`close_all_on_host`) takes every pin out of the table itself, so a
+        // pin found now belongs to a transport that already failed (nothing was
+        // sent) or was re-populated concurrently. The host keeps its RM files across
+        // a device reset, so a pin a `FORWARD` claimed may still be aliased by the
+        // GPU; unlocking it would let the guest reuse that RAM underneath the host.
+        // Those stay locked (`NvPinLeak`); unclaimed ones are unlocked as before.
         while let Some(pin) = self.nvrm_pins.pop() {
             swept = swept.saturating_add(1);
-            drop(pin);
+            if pin.host_may_alias() {
+                crate::virtio::nvrm::NVRM_PIN_LEAKS.fetch_add(1, Ordering::Relaxed);
+                core::mem::forget(pin);
+            } else {
+                drop(pin);
+            }
         }
         swept = swept
             .saturating_add(self.nvrm_maps.len() as u32)
