@@ -55,6 +55,11 @@ pub const HELIOS_NVRM_CAP_SCANOUT_FENCE: u64 = 1 << 32;
 /// A UMD must not send a (b) record without it: an older KMD ignores a longer
 /// `HERF`, which merely degrades to the legacy wait, but REFUSES `HE12` version 4.
 pub const HELIOS_NVRM_CAP_PRESENT_FENCE: u64 = 1 << 33;
+/// `supported_ops` bit 34: the flush gate (`HEFL`, [`crate::flush_gate`]) honours its
+/// RM fence variant. Set under the same preconditions as bit 33. A UMD must not send a
+/// `HEFL` with an RM fence without it: an older KMD does not know the record, gates
+/// nothing and does not take the handle.
+pub const HELIOS_NVRM_CAP_FLUSH_GATE: u64 = 1 << 34;
 
 // ---------------------------------------------------------------------------
 // Statuses (`HeliosNvrmHeader.status`). 13 and 14 are `SCANOUT_BUSY` / `NO_SOURCE`.
@@ -223,6 +228,7 @@ const _: () = {
     assert!(size_of::<HeliosD3D12SubmitCmdV4>() == 48);
     assert!(offset_of!(HeliosD3D12SubmitCmdV4, fence) == 32);
     assert!(HELIOS_NVRM_CAP_SCANOUT_FENCE >> 32 == 1 && HELIOS_NVRM_CAP_PRESENT_FENCE >> 33 == 1);
+    assert!(HELIOS_NVRM_CAP_FLUSH_GATE >> 34 == 1);
 };
 
 #[cfg(test)]

@@ -165,6 +165,18 @@ mod ffi {
         ) -> i32;
         /// NVK: close a fence the caller still owns.
         fn nvk_rm_fence_close(self: &HeliosDxvkDevice, fence_handle: u32);
+        /// Flush gate (docs/flush-gate.md): flush, then the point the HEFL
+        /// packet carries. 0 nothing new, 1 ready, -1 unavailable, -2 failed.
+        /// # Safety: every pointer is live writable storage.
+        unsafe fn flush_gate_point(
+            self: &HeliosDxvkDevice,
+            mode: u32,
+            ctx_id: *mut u32,
+            value32: *mut u32,
+            cookie: *mut u64,
+            fence: *mut u32,
+            fence_value: *mut u64,
+        ) -> i32;
 
         /// Create a dedicated OPTIMAL, DMA_BUF-exportable image and report
         /// logical scanout metadata. `kmd_transfer_source` selects the
@@ -520,6 +532,26 @@ pub(crate) struct ForeignLayout {
 
 /// A foreign resource id minted for one texture.
 #[derive(Clone, Copy, Default, Debug)]
+/// `mode` of [`BridgeDevice::flush_gate_point`] (dxvk_bridge.h kFlushGate*).
+pub(crate) const FLUSH_GATE_STREAM: u32 = 0;
+pub(crate) const FLUSH_GATE_WIRE: u32 = 1;
+pub(crate) const FLUSH_GATE_RM_FENCE: u32 = 2;
+
+/// What a flush gate carries (docs/flush-gate.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlushGatePoint {
+    /// Nothing recorded since the previous gate: send no packet.
+    Nothing,
+    /// Ready: a stream point (`ctx`, `value`, `cookie`; STREAM mode), an RM
+    /// fence the caller now owns (`fence`; RM_FENCE mode), or neither (WIRE
+    /// mode: the work reached the transport).
+    Ready { ctx: u32, value: u32, cookie: u64, fence: u32, fence_value: u64 },
+    /// This mode cannot be served here: fall back.
+    Unavailable,
+    /// The command stream or submission failed.
+    Failed,
+}
+
 pub(crate) struct ForeignIdentity {
     pub(crate) resource_id: u32,
     pub(crate) ctx_id: u32,
@@ -769,6 +801,25 @@ impl BridgeDevice {
     pub(crate) fn nvk_rm_fence_close(&self, fence: u32) {
         if let Some(d) = self.get() {
             d.nvk_rm_fence_close(fence);
+        }
+    }
+
+    /// Flush gate: flush and get what the HEFL packet carries (see
+    /// [`FlushGatePoint`]). `mode` is one of `FLUSH_GATE_*`.
+    pub(crate) fn flush_gate_point(&self, mode: u32) -> FlushGatePoint {
+        let Some(d) = self.get() else {
+            return FlushGatePoint::Unavailable;
+        };
+        let (mut ctx, mut value, mut cookie, mut fence, mut fence_value) = (0u32, 0u32, 0u64, 0u32, 0u64);
+        // SAFETY: every out-pointer borrows a live local for this synchronous call.
+        let r = unsafe {
+            d.flush_gate_point(mode, &mut ctx, &mut value, &mut cookie, &mut fence, &mut fence_value)
+        };
+        match r {
+            0 => FlushGatePoint::Nothing,
+            1 => FlushGatePoint::Ready { ctx, value, cookie, fence, fence_value },
+            -1 => FlushGatePoint::Unavailable,
+            _ => FlushGatePoint::Failed,
         }
     }
 

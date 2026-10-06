@@ -296,7 +296,180 @@ pub(crate) unsafe extern "system" fn resource_read_after_write_hazard(
 pub(crate) unsafe extern "system" fn flush(h: Hdevice) {
     if let Some(context) = d3d11_context(h) {
         context.Flush();
-        nvk_keyed_flush_wait(h, &context);
+        flush_gate(h, &context);
+    }
+}
+
+static FLUSH_GATE_SENT: [AtomicUsize; 3] =
+    [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+static FLUSH_GATE_RENDER_FAILED: AtomicUsize = AtomicUsize::new(0);
+static FLUSH_GATE_FALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+/// The flush gate (docs/flush-gate.md, shared-surfaces.md section 4): on a
+/// flush of a device that holds a cross-process shared resource, and only when
+/// work was recorded since the previous gate, one `HEFL` render packet on the
+/// device's own context whose WDDM fence retires when that work is done on the
+/// GPU, so the runtime's keyed-mutex release (right after this `pfnFlush`,
+/// ordered by dxgkrnl against our last packet) cannot overtake it.
+///
+/// Carriers, each gated on its KMD capability: NVK an RM fence for the
+/// submitted batch (NVRM caps bit 34); Venus a point of the present stream
+/// signalled behind the recorded work (scanout probe bit 5), else the wire
+/// rung after the work reached the transport. Without a carrier: the CPU wait
+/// (`nvk_keyed_flush_wait`; NVK by default, Venus with
+/// `HELIOS_KEYED_FLUSH_WAIT=1`). A failed packet never fails the flush.
+pub(crate) unsafe fn flush_gate(h: Hdevice, context: &ID3D11DeviceContext) {
+    use crate::bridge::{FlushGatePoint, FLUSH_GATE_RM_FENCE, FLUSH_GATE_STREAM, FLUSH_GATE_WIRE};
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    if lock_ignore_poison(&dev.nvk_keyed_resources).is_empty() {
+        return;
+    }
+    if dev.dxvk.is_nvk() {
+        if crate::knobs::nvk_rm_fence() && crate::scanout_acquire::nvrm_flush_gate_capable(dev) {
+            match dev.dxvk.flush_gate_point(FLUSH_GATE_RM_FENCE) {
+                FlushGatePoint::Nothing => return,
+                FlushGatePoint::Ready { fence, fence_value, .. } if fence != 0 => {
+                    // The handle is the KMD's from here on, whatever happens.
+                    send_flush_gate(
+                        dev,
+                        helios_protocol::HELIOS_FLUSH_GATE_FLAG_RM_FENCE,
+                        (0, 0, 0),
+                        Some((fence, fence_value)),
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        FLUSH_GATE_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        nvk_keyed_flush_wait(h, context);
+        return;
+    }
+    if crate::scanout_acquire::flush_gate_capable() {
+        match dev.dxvk.flush_gate_point(FLUSH_GATE_STREAM) {
+            FlushGatePoint::Nothing => return,
+            FlushGatePoint::Ready { ctx, value, cookie, .. } if ctx != 0 && cookie != 0 => {
+                send_flush_gate(
+                    dev,
+                    helios_protocol::HELIOS_FLUSH_GATE_FLAG_STREAM,
+                    (ctx, value, cookie),
+                    None,
+                );
+                return;
+            }
+            _ => {}
+        }
+        // No stream point: the wire rung once the work reached the transport.
+        match dev.dxvk.flush_gate_point(FLUSH_GATE_WIRE) {
+            FlushGatePoint::Nothing => return,
+            FlushGatePoint::Ready { .. } => {
+                send_flush_gate(dev, 0, (0, 0, 0), None);
+                return;
+            }
+            _ => {}
+        }
+    }
+    FLUSH_GATE_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    nvk_keyed_flush_wait(h, context);
+}
+
+/// One `HEFL` (`HeliosFlushGateCmd`, 48 bytes) through `pfnRenderCb` on the
+/// device's context: no allocations, no patches. Logs a failure; never
+/// propagates it.
+unsafe fn send_flush_gate(
+    dev: &crate::device_funcs::HeliosDevice,
+    flags: u32,
+    stream: (u32, u32, u64),
+    fence: Option<(u32, u64)>,
+) {
+    let kind = if flags & helios_protocol::HELIOS_FLUSH_GATE_FLAG_RM_FENCE != 0 {
+        2
+    } else if flags & helios_protocol::HELIOS_FLUSH_GATE_FLAG_STREAM != 0 {
+        1
+    } else {
+        0
+    };
+    let fail = |why: &str| {
+        let n = FLUSH_GATE_RENDER_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n % 1024 == 0 {
+            log_error!("DDI flush gate (kind {kind}) not sent: {why} (x{n})");
+        }
+    };
+    let Some(ctx) = dev.context.as_ref() else {
+        return fail("no runtime context");
+    };
+    if dev.kt_callbacks.is_null() {
+        return fail("no callback table");
+    }
+    let Some(render_cb) = (*dev.kt_callbacks).pfnRenderCb else {
+        return fail("pfnRenderCb missing");
+    };
+    let len = core::mem::size_of::<helios_protocol::HeliosFlushGateCmd>() as u32;
+    let Some(window) = ctx.command.get() else {
+        return fail("no command buffer");
+    };
+    if window.capacity < len {
+        return fail("command buffer too small");
+    }
+    let (fence_handle, fence_value) = fence.unwrap_or((0, 0));
+    let cmd = helios_protocol::HeliosFlushGateCmd {
+        magic: helios_protocol::HELIOS_FLUSH_GATE_MAGIC,
+        version: helios_protocol::HELIOS_FLUSH_GATE_VERSION,
+        flags,
+        ctx_id: stream.0,
+        value: stream.1,
+        reserved: 0,
+        cookie: stream.2,
+        fence: helios_protocol::HeliosRmFenceTail {
+            rm_fence_handle: fence_handle,
+            flags: if fence.is_some() { helios_protocol::HELIOS_RM_FENCE_TAIL_FLAG_FENCE } else { 0 },
+            rm_fence_value: fence_value,
+        },
+    };
+    (window.ptr.as_ptr() as *mut helios_protocol::HeliosFlushGateCmd).write_unaligned(cmd);
+    let mut render = ddi::D3DDDICB_RENDER::default();
+    render.CommandLength = len;
+    render.CommandOffset = 0;
+    render.NumAllocations = 0;
+    render.NumPatchLocations = 0;
+    render.hContext = ctx.handle.as_ptr();
+    let hr = render_cb(dev.h_rt_device, &mut render);
+    if hr < 0 {
+        return fail(&format!("pfnRenderCb hr=0x{:08x}", hr as u32));
+    }
+    if render.NewCommandBufferSize != 0 {
+        if let Some(w) = crate::device_funcs::Window::new(render.pNewCommandBuffer, render.NewCommandBufferSize) {
+            ctx.command.set(Some(w));
+        }
+    }
+    if render.NewAllocationListSize != 0 {
+        if let Some(w) = crate::device_funcs::Window::new(render.pNewAllocationList, render.NewAllocationListSize) {
+            ctx.allocations.set(Some(w));
+        }
+    }
+    if render.NewPatchLocationListSize != 0 {
+        if let Some(w) =
+            crate::device_funcs::Window::new(render.pNewPatchLocationList, render.NewPatchLocationListSize)
+        {
+            ctx.patches.set(Some(w));
+        }
+    }
+    let n = FLUSH_GATE_SENT[kind].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n % 4096 == 0 {
+        log_error!(
+            "DDI flush gate: {} #{n} (ctx {} value {} fence {}; wire {} stream {} fence {}, fallbacks {}, failed {})",
+            ["wire", "stream", "rm-fence"][kind],
+            stream.0,
+            stream.1,
+            fence_handle,
+            FLUSH_GATE_SENT[0].load(Ordering::Relaxed),
+            FLUSH_GATE_SENT[1].load(Ordering::Relaxed),
+            FLUSH_GATE_SENT[2].load(Ordering::Relaxed),
+            FLUSH_GATE_FALLBACK.load(Ordering::Relaxed),
+            FLUSH_GATE_RENDER_FAILED.load(Ordering::Relaxed),
+        );
     }
 }
 

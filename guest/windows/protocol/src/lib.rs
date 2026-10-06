@@ -22,6 +22,7 @@
 
 pub mod escape;
 pub mod features;
+pub mod flush_gate;
 pub mod foreign;
 pub mod ioctl;
 pub mod nvrm;
@@ -33,6 +34,7 @@ pub mod wddm;
 
 pub use escape::*;
 pub use features::*;
+pub use flush_gate::*;
 pub use foreign::*;
 pub use ioctl::*;
 pub use nvrm::*;

@@ -24,7 +24,7 @@
 //
 // Build (MinGW-w64 on Linux):
 //   x86_64-w64-mingw32-g++ -O2 -static d3d11_share.cpp -o d3d11_share.exe \
-//       -ld3d11 -ldxgi -luuid
+//       -ld3d11 -ldxgi -luuid -ladvapi32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11_1.h>
@@ -188,6 +188,34 @@ static int opener(const char *mode, UINT w, UINT h, const char *kmt) {
 
 static UINT32 round_seed(UINT r, bool b) { return 0x1000193u * (r + 1) ^ (b ? 0x5bd1e995u : 0x2545f491u); }
 
+// The KMD's flush-gate counters (docs/flush-gate.md section 6), DWORDs under
+// HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render. Published on the
+// present edge (DWM's presents refresh them). Read only.
+static const char *const kFlushGateCounters[] = {"FlGRec", "FlGStrm", "FlGFnc", "FlGWire", "FlGDeg"};
+static const int kFlushGateCounterCount = 5;
+
+static void read_flush_gate_counters(DWORD *out) {
+  for (int i = 0; i < kFlushGateCounterCount; i++) {
+    DWORD v = 0, size = sizeof(v);
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\helios_kmd_render",
+                     kFlushGateCounters[i], RRF_RT_REG_DWORD, nullptr, &v, &size) != ERROR_SUCCESS)
+      v = 0xffffffffu;
+    out[i] = v;
+  }
+}
+
+static void print_flush_gate_counters(const DWORD *before, const DWORD *after) {
+  std::printf("       A: KMD flush gate:");
+  for (int i = 0; i < kFlushGateCounterCount; i++) {
+    if (after[i] == 0xffffffffu)
+      std::printf(" %s=absent", kFlushGateCounters[i]);
+    else
+      std::printf(" %s=%lu (+%lu)", kFlushGateCounters[i], static_cast<unsigned long>(after[i]),
+                  static_cast<unsigned long>(after[i] - (before[i] == 0xffffffffu ? 0 : before[i])));
+  }
+  std::printf("\n");
+}
+
 static ID3D11Texture2D *make_plain(ID3D11Device1 *dev, UINT w, UINT h) {
   D3D11_TEXTURE2D_DESC d{};
   d.Width = w;
@@ -289,6 +317,8 @@ static int keyed_load(UINT w, UINT h, UINT rounds, UINT load) {
     return 1;
   }
   Sleep(1500); // B opens and blocks in AcquireSync(1)
+  DWORD counters_before[kFlushGateCounterCount];
+  read_flush_gate_counters(counters_before);
 
   UINT bad_rounds = 0;
   LARGE_INTEGER f, t0, t1;
@@ -312,6 +342,10 @@ static int keyed_load(UINT w, UINT h, UINT rounds, UINT load) {
   std::printf("       A: %u rounds of %u copies, ReleaseSync took %.2f ms on average\n", rounds, load,
               release_ms / rounds);
   check("every round, A saw B's writes at its AcquireSync", bad_rounds == 0);
+  Sleep(500); // the KMD publishes on the next present edge (DWM)
+  DWORD counters_after[kFlushGateCounterCount];
+  read_flush_gate_counters(counters_after);
+  print_flush_gate_counters(counters_before, counters_after);
   WaitForSingleObject(pi.hProcess, 120000);
   DWORD code = 1;
   GetExitCodeProcess(pi.hProcess, &code);
