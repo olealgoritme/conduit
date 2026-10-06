@@ -2077,7 +2077,8 @@ stashes the allocation and `process_deferred_vidpn_source_address` calls the sam
 | 6 | **flips are failing**: the presenter gave up (its restart pause is pending), or a registration or a flip failed within the presenter's 100 ms retry pause | refuse `Failing` (13) | `FfRef13` |
 | 7 | not adopted / destroyed / the importer closed the file (poisoned) / the KMD's own vidmem import | refuse `NotAdopted` (6) / `Destroyed` (7) / `FileClosed` (8) / `KmdOwned` (9) | `FfRef06` to `FfRef09` |
 | 8 | the allocation carries `MISC_DIRECT_SCANOUT` (the fast bind of a flip, `fast_bind_from_flip`, would race the resident source for the screen; DWM-on-NVK's allocations never carry it) | refuse `DirectScanout` (14) | `FfRef14` |
-| 9 | the recorded layout is not a `ScanoutFlip` layout (extent under 64, format) / its extent is not the mode's | refuse `BadLayout` (10) / `Extent` (11) | `FfRef10`, `FfRef11` |
+| 8b | the record is a shared format beyond the four 32 bpp RGB ones (`shared-formats.md`: `R8`, fp16, `YUYV`, `NV12`, ...) or carries a plane 1: a `ScanoutFlip` names one 32 bpp plane, so it would be read wrong | refuse `SharedFormat` (15, appended: the codes before it did not move) | `FfRef15` |
+| 9 | the recorded layout is not a `ScanoutFlip` layout (extent under 64, a fourcc nobody shares) / its extent is not the mode's | refuse `BadLayout` (10) / `Extent` (11) | `FfRef10`, `FfRef11` |
 | 10 | the importer's `rm_handle` is not that device's DRM file in this transport generation | refuse `OwnerGone` (12) | `FfRef12` |
 | 11 | otherwise | `Take(target)`: `{resid, owner = the importer's token, drm = rm_handle, gem, epoch, layout}` | `FfProg` |
 
@@ -2262,7 +2263,7 @@ what they did.
 | `FfKnob` | the knob's value (also written when read, if nonzero) | 1 |
 | `FfProg` / `FfSame` / `FfMoved` / `FfReowned` | allocations taken / the same again / another of the same device / of another device | grows / grows / grows / 0 or 1 per device |
 | `FfNoRec` | programmed with no foreign record | the GDI primary before DWM, placeholders |
-| `FfRef`, `FfWhy`, `FfRef01` to `FfRef14` | refused to Venus / last reason / per reason (15.18.3) | 0 |
+| `FfRef`, `FfWhy`, `FfRef01` to `FfRef15` | refused to Venus / last reason / per reason (15.18.3) | 0 (`FfRef15` nonzero: an allocation holding a shared format was programmed as a scanout source, which nothing should do) |
 | `FfRegs` / `FfRegFail` / `FfWithdrawn` / `FfGaveUp` | registrations / refused registrations / withdrawals / giving-ups | 1 / 0 / 0 / 0 |
 | `FfFrames` / `FfReflips` / `FfYielded` / `FfFlipFail` | flips for an edge / for a resume / that found the source yielded / refused | grows / small / small / 0 |
 | `FfStale` / `FfGone` / `FfPoison` | flips refused because the importer's file is not its own / shown allocations dropped / records poisoned by a close | 0 / 0 / 0 until a device or file closes |

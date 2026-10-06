@@ -317,6 +317,9 @@ the escape fails `STATUS_BUFFER_TOO_SMALL`). The 72-byte struct is unchanged, so
 104-byte one by appending. Only the first 72 bytes are written back.
 
 ```c
+/* Shared formats (shared-formats.md): the fourcc column below is the four 32 bpp RGB
+   formats; with HELIOS_FOREIGN_CAP_LAYOUT_FORMATS the record also takes the other formats of that
+   document's table, and flags bit 1 (FLAG_PLANE1) appends a 16-byte plane 1 (120 bytes in all). */
 struct helios_foreign_layout {          /* 32 bytes, plane 0 only */
    uint32_t width;     /* 1..=16384 */
    uint32_t height;    /* 1..=16384 */
@@ -662,7 +665,8 @@ same-boot bisect. `FcKnob` mirrors it.
 |---|---|
 | `FcDevWant` / `FcDevX` | tier 0 attempted / obtained (written at device creation) |
 | `FcImp`, `FcScan`, `FcBlt` | complete imports; of which for the primary copy and for the Blt (`FcImp = FcScan + FcBlt`) |
-| `FcRefuse`, `FcRefCode` | refusals the KMD decided, and the last code: 1 dimensions, 2 fourcc, 3 stride, 4 modifier, 5 layout larger than the resource, 6 no format, 7 extent differs, 8 size 0, 9 image needs more than the resource, 10 no memory type |
+| `FcRefuse`, `FcRefCode` | refusals the KMD decided, and the last code: 1 dimensions, 2 fourcc, 3 stride, 4 modifier, 5 layout larger than the resource, 6 no format, 7 extent differs, 8 size 0, 9 image needs more than the resource, 10 no memory type, 11 plane fault (a plane 1 on a one-plane format) |
+| `FcNotRgb32` | of those, records refused as a shared format this 32 bpp one-plane copy cannot carry (code 6; `shared-formats.md`) |
 | `FcHostErr` | the host refused a step (image, requirements, memory, bind) |
 | `FcNoExt` | foreign source on a device without the extension |
 | `FcStale` | the allocation's layout disagreed with the table, or no record |
