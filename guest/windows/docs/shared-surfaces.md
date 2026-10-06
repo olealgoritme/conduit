@@ -192,7 +192,7 @@ sweeps, hand-offs) are in the UMD log every 4096 hand-offs and from `d3d11_share
 `d3d11_share churn N` creates, hands off and destroys N shared textures and checks that the slots
 in use come back.
 
-Causal bound (ledger v4, DXVK patch 0009): points are a ledger-wide publication sequence, and a
+Causal bound (ledger v4, DXVK patch 0011): points are a ledger-wide publication sequence, and a
 device's CS thread only waits for foreign points published before its own next point that the CS
 thread has not reached yet (the UMD keeps the published-but-not-reached points per DxvkDevice;
 `HeliosSignalHandoffPoint` reports reaching one). The work being recorded was issued before that

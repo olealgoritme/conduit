@@ -919,7 +919,10 @@ namespace helios_handoff {
 
   void pending_push(const void* device, std::uint64_t point) {
     std::lock_guard lock(s_pending_mutex);
-    pending_points()[device].push_back(point);
+    auto& v = pending_points()[device];
+    v.push_back(point);
+    trace_line("handoff trace: device %p publishes point %llu (%zu not reached by its CS thread)", device,
+               static_cast<unsigned long long>(point), v.size());
   }
 
   void pending_forget(const void* device) {
@@ -937,12 +940,15 @@ namespace helios_handoff {
     while (done < v.size() && v[done] <= point)
       done++;
     v.erase(v.begin(), v.begin() + done);
+    trace_line("handoff trace: device %p CS thread reached point %llu (%zu left, next %llu)", device,
+               static_cast<unsigned long long>(point), v.size(),
+               static_cast<unsigned long long>(v.empty() ? 0ull : v.front()));
   }
 
   // The work the CS thread records now was issued before the device's next
   // own point it has not reached; a point published after that one cannot
   // be a dependency, and waiting for it could close a cycle with the other
-  // process (DXVK patch 0009).
+  // process (DXVK patch 0011).
   std::uint32_t sample_before(std::uint32_t key, const void* device, std::uint64_t* out,
                               std::uint32_t max) {
     std::uint64_t bound = kPointMask;
@@ -957,6 +963,9 @@ namespace helios_handoff {
     std::uint32_t kept = 0;
     for (std::uint32_t i = 0; i < n; i++) {
       if ((all[i] & kPointMask) < bound) {
+        trace_line("handoff trace: device %p key %u waits for point %llu of record %u (bound %llu)", device, key,
+                   static_cast<unsigned long long>(all[i] & kPointMask), unsigned(all[i] >> 52),
+                   static_cast<unsigned long long>(bound));
         if (kept < max)
           out[kept++] = all[i];
       } else {
@@ -983,8 +992,11 @@ namespace helios_handoff {
     QueryPerformanceCounter(&t0);
     for (std::uint32_t spin = 0;; spin++) {
       if ((dev.gen.load(std::memory_order_acquire) & kGenMask) != gen
-       || dev.completed.load(std::memory_order_acquire) >= point)
+       || dev.completed.load(std::memory_order_acquire) >= point) {
+        if (spin > 256)
+          trace_line("handoff trace: point %llu of record %u done after %u spins", static_cast<unsigned long long>(point), d, spin);
         return true;
+      }
       QueryPerformanceCounter(&now);
       const double ns = double(now.QuadPart - t0.QuadPart) * 1e9 / double(f.QuadPart);
       if (ns >= double(timeout_ns)) {
@@ -1143,9 +1155,12 @@ std::int32_t HeliosDxvkDevice::handoff_publish(const std::size_t* resources,
     impl->flush_gate_seq = immediate->HeliosSignalHandoffPoint(impl->handoff_fence, point);
     auto* record = &table->devices[impl->handoff_device];
     const std::uint32_t gen = impl->handoff_gen;
-    impl->handoff_fence->enqueueWait(point, [record, gen, point]() {
+    const std::uint32_t record_index = impl->handoff_device;
+    impl->handoff_fence->enqueueWait(point, [record, gen, point, record_index]() {
       if (record->gen.load(std::memory_order_acquire) != gen)
         return; // the record went with its device
+      helios_handoff::trace_line("handoff trace: record %u completed point %llu", record_index,
+                                 static_cast<unsigned long long>(point));
       std::uint64_t cur = record->completed.load(std::memory_order_relaxed);
       while (cur < point && !record->completed.compare_exchange_weak(
                cur, point, std::memory_order_release, std::memory_order_relaxed)) { }
