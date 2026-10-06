@@ -531,7 +531,14 @@ impl Venus {
     ///
     /// `window` is `None` on a device reset: the frontend has dropped every
     /// placement already, as for the window and the aperture.
-    pub fn reset(&mut self, window: Option<&dyn WindowPlacer>) -> Vec<Completion> {
+    ///
+    /// `display`, when given, is told the scanout is off: the resource it
+    /// named is gone, and the next generation reuses its id.
+    pub fn reset(
+        &mut self,
+        window: Option<&dyn WindowPlacer>,
+        display: Option<&DisplayLink>,
+    ) -> Vec<Completion> {
         let (c, r, m, h) = (
             self.contexts.len(),
             self.resources.len(),
@@ -544,7 +551,13 @@ impl Venus {
             );
         }
         let tell = !self.lost;
-        self.release(window, None, tell);
+        if let Some(s) = self.scanout.as_ref() {
+            log::info!(
+                "venus: the scanout (resource {}) goes with the reset",
+                s.resource_id
+            );
+        }
+        self.release(window, display, tell);
         self.fences.fail_all();
         // A renderer that was lost stays lost: a new boot has nothing to
         // talk to either.
