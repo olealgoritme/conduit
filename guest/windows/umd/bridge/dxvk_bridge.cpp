@@ -563,14 +563,19 @@ namespace helios_handoff {
         }
       }
       auto* t = static_cast<Table*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Table)));
-      // The view keeps the section alive; the handle is not needed.
-      CloseHandle(mapping);
+      // The handle and the view stay for the life of the process. A view keeps
+      // the section object alive but not its name: the name leaves the
+      // session's namespace with the last handle, and the next process then
+      // created a new, empty section under it (each process had its own
+      // table on 320.1).
+      if (!t)
+        CloseHandle(mapping);
       {
         char msg[400];
         std::snprintf(msg, sizeof(msg),
           "handoff: ledger section %s (%s, pid %lu, session %lu, %zu bytes) at %p: magic %08x, "
           "%u records claimed so far, %u in use",
-          kname, create_error == ERROR_ALREADY_EXISTS ? "opened" : "created", GetCurrentProcessId(), session,
+          kname, create_error == ERROR_ALREADY_EXISTS ? "opened existing" : "created", GetCurrentProcessId(), session,
           sizeof(Table), static_cast<void*>(t), t ? t->magic.load() : 0u, t ? t->next_device.load() : 0u,
           t ? t->records_in_use.load() : 0u);
         umd_log(msg);
@@ -586,10 +591,13 @@ namespace helios_handoff {
     return s_table;
   }
 
+  // Opt-in (HELIOS_HANDOFF_LEDGER=1, in every sharing process) until the
+  // cross-process table is verified; the default is the releaser CPU wait
+  // (forward/transfer.rs).
   bool enabled() {
     static const bool on = []() {
       const char* v = std::getenv("HELIOS_HANDOFF_LEDGER");
-      return !(v && v[0] == '0');
+      return v && v[0] == '1';
     }();
     return on;
   }
