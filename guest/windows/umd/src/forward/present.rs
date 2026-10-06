@@ -1538,6 +1538,7 @@ unsafe fn nvk_present_frame(
                     ..PresentStreamCorrelation::default()
                 },
                 on_scanout: false,
+                compose: true,
             });
         }
     }
@@ -1585,6 +1586,10 @@ unsafe fn nvk_present_frame(
 struct NvkFrame {
     correlation: PresentStreamCorrelation,
     on_scanout: bool,
+    /// For a frame on scanout: does it also go through the WDDM present
+    /// (`NvkScanoutComposeEvery`)? Decided in `on_scanout`, so the
+    /// already-on-scanout claim is only fetched for frames that carry it.
+    compose: bool,
 }
 
 impl NvkFrame {
@@ -1593,7 +1598,21 @@ impl NvkFrame {
     /// already-on-scanout claim (`helios_onscanout.h`), so a KMD that can
     /// verify it completes the Blt without copying; an older NVK (no
     /// `scanout_frame`) or KMD gives no claim / ignores it: the ordinary Blt.
+    ///
+    /// The claim is fetched only when this frame is composed: a skipped WDDM
+    /// present (the default at DDI 1.3) has no use for it, and `scanout_frame`
+    /// takes NVK's device mutex, which the flip path holds across its KMD
+    /// escape, so asking every frame serialised the app behind the last flip
+    /// (S3 B 4400-5450 -> 2383 fps on 328.1).
     fn on_scanout(dev: &HeliosDevice, src: &ID3D11Resource) -> Self {
+        let compose = nvk_scanout_compose_decide();
+        if !compose {
+            return Self {
+                correlation: PresentStreamCorrelation::default(),
+                on_scanout: true,
+                compose: false,
+            };
+        }
         let claim = dev.dxvk.nvk_scanout_frame(src).map(|(sequence, generation)| {
             crate::bridge::OnScanoutClaim {
                 sequence,
@@ -1613,6 +1632,7 @@ impl NvkFrame {
                 ..PresentStreamCorrelation::default()
             },
             on_scanout: true,
+            compose: true,
         }
     }
 }
@@ -1632,9 +1652,13 @@ static NVK_SCANOUT_COMPOSED: AtomicUsize = AtomicUsize::new(0);
 /// 1024 scanout frames: with the WDDM present skipped, ETW-based tools
 /// (PresentMon) no longer see the frames, so this line is the frame clock.
 fn nvk_scanout_compose(frame: NvkFrame) -> bool {
-    if !frame.on_scanout {
-        return true;
-    }
+    !frame.on_scanout || frame.compose
+}
+
+/// The per-frame half of `nvk_scanout_compose`, called once per scanout
+/// frame from `NvkFrame::on_scanout`: counts the frame, decides whether it
+/// is composed, and logs the frame rate every 1024 frames.
+fn nvk_scanout_compose_decide() -> bool {
     let n = NVK_SCANOUT_FRAMES.fetch_add(1, Ordering::Relaxed);
     let every = crate::knobs::nvk_scanout_compose_every() as usize;
     let compose = n == 0 || (every != 0 && n % every == 0);
