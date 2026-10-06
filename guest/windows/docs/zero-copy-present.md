@@ -250,3 +250,25 @@ hardening items below.
   applies. If that is awkward, relax step 3 to "same creator process" (needs the process in the
   NVRM handle slot).
 - **O6 The vehicle's `PresentSource` for a foreign image** (section 6): who owns the change.
+
+## Review findings, deferred (IMPORT_RM, gated off)
+
+Found by a read-only review of the first import commit. None affects the build
+or behaviour while `RM_IMPORT_SERVED` is false; fix before opening the gate.
+
+1. A device can exceed the per-device byte quota by adopting imported resources
+   into WDDM allocations and importing again, up to 512 x 1 GiB pinned on the
+   host. Add a global byte cap summed over entries and reservations in
+   `check_quota`, or keep charging the creator until the record is removed.
+2. Between `alloc_blob` and `foreign_commit_import` the new blob is an ordinary
+   owner slot, so a second thread of the same device that guesses the next
+   resource id can `MAP_BLOB` it (a CPU view of foreign memory). Refuse maps on
+   a mid-import blob, or record the foreign marker in the same lock hold as
+   the slot.
+3. `foreign.remove` runs before the host resource is torn down on the
+   `release_blob_for_owner` / `release_blobs_for_owner` paths that deliberately
+   leak a host resource on a drain failure, so the quota is freed while the
+   host memory stays pinned. Remove the record after teardown succeeds, or
+   adopt it on the leak path.
+4. `out_host_errno` is documented as the host's errno on `ST_DEVICE_ERROR` but
+   is always 0. Reword the field's doc or plumb the errno out.
