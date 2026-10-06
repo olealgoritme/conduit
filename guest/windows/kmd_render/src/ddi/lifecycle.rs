@@ -500,6 +500,9 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // the (about-to-be-torn-down) context.
         adapter.stop_vsync();
         adapter.stop_hpd();
+        // The HPD worker did the `Nv*` registry mirror and is gone: leave the
+        // registry with the final counts (PASSIVE, StopDevice).
+        crate::ddi::publish_nvrm_counters();
         // AFTER stop_hpd, so the worker can no longer re-publish into the state
         // we are about to clear. Every scanout identity below belongs to the
         // transport generation being torn down; carrying it into the next

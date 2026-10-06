@@ -169,6 +169,15 @@ pub(crate) fn publish_nvrm_counters() {
         b"NvFlip",
         crate::virtio::nvrm::NVRM_FLIPS.load(Ordering::Relaxed),
     );
+    // The pre-wait spin (`NvSpinUs`): replies it saw in time / gave up on.
+    crate::diag::record_named_bytes(
+        b"NvSpinHit",
+        crate::virtio::ctrl::NVRM_SPIN_HITS.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"NvSpinMis",
+        crate::virtio::ctrl::NVRM_SPIN_MISSES.load(Ordering::Relaxed),
+    );
     // Pins made / released / failed: `NvPin - NvUnpin` is what is locked now.
     crate::diag::record_named_bytes(
         b"NvPin",

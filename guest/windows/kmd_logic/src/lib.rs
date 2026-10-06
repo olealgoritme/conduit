@@ -21,6 +21,7 @@
 pub mod edid;
 pub mod external_memory;
 pub mod nvrm_events;
+pub mod nvrm_fastpath;
 pub mod foreign_resource;
 pub mod foreign_scanout;
 pub mod page_runs;

@@ -1767,19 +1767,30 @@ fn escape_nvrm(
     owner: DeviceOwner,
 ) -> NTSTATUS {
     let st = escape_nvrm_op(passive, adapter, buf, hdr, owner);
-    nvrm_publish_counters_if_due();
+    nvrm_publish_counters_if_due(adapter);
+    // No HPD worker (render-only `DisplayHalf=0`, or its creation failed): nobody
+    // else would ever run the mirror, so do it here. Still rate limited by the
+    // same gate, and one load when nothing is wanted.
+    if !adapter.hpd_running() {
+        nvrm_publish_service();
+    }
     st
 }
 
-/// Write the `Nv*` registry counters when a session-shaping count moved
-/// (open / close / map / pin / event registration) or every 256th call. The registry write is far too
-/// slow for every forward, but these escapes can run for a whole session with no
-/// present, which is the other place the counters are published.
-fn nvrm_publish_counters_if_due() {
+/// Set while the `Nv*` registry mirror is wanted and not yet done. The escape
+/// path only ever sets it (and wakes the HPD worker); the worker clears it.
+static NVRM_PUBLISH_WANTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// What the last mirror covered: the session shape, the 256-call bucket, and
+/// when (interrupt time, 100 ns; 0 = never).
+static NVRM_LAST_SHAPE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static NVRM_LAST_BUCKET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static NVRM_LAST_PUBLISH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(shape, calls)`: a hash of the session-shaping counts (open / close / map /
+/// pin / event registration) and the forwards seen. Plain loads.
+fn nvrm_shape_and_calls() -> (u32, u32) {
     use crate::virtio::nvrm as n;
-    use core::sync::atomic::{AtomicU32, Ordering};
-    static LAST_SHAPE: AtomicU32 = AtomicU32::new(0);
-    static CALLS: AtomicU32 = AtomicU32::new(0);
+    use core::sync::atomic::Ordering;
     let shape = [
         &n::NVRM_OPENS,
         &n::NVRM_CLOSES,
@@ -1791,10 +1802,76 @@ fn nvrm_publish_counters_if_due() {
     ]
     .iter()
         .fold(0u32, |a, c| a.wrapping_mul(31).wrapping_add(c.load(Ordering::Relaxed)));
-    let tick = CALLS.fetch_add(1, Ordering::Relaxed).wrapping_add(1) & 0xFF == 0;
-    if LAST_SHAPE.swap(shape, Ordering::Relaxed) != shape || tick {
-        crate::ddi::publish_nvrm_counters();
+    let calls = n::NVRM_IOCTLS
+        .load(Ordering::Relaxed)
+        .wrapping_add(n::NVRM_OTHER.load(Ordering::Relaxed));
+    (shape, calls)
+}
+
+/// Ask for the `Nv*` registry mirror when a session-shaping count moved (open /
+/// close / map / pin / event registration) or the forward count crossed a 256
+/// bucket. The escape path does NOTHING slower than atomic loads, plus one
+/// atomic swap and one `KeSetEvent` per request: the mirror itself (~40
+/// synchronous registry writes, about a millisecond) used to run right here, in
+/// the latency of every Open / Close / Map / Pin and of every 256th forward. It
+/// now runs on the HPD worker ([`nvrm_publish_service`]), which is a PASSIVE
+/// system thread that lives for the whole device lifetime, and is also driven by
+/// the present edge and by StopDevice. A request is dropped while one is
+/// outstanding, so a storm of pin / unpin raises one wake, not one per call.
+fn nvrm_publish_counters_if_due(adapter: &AdapterContext) {
+    use core::sync::atomic::Ordering;
+    use helios_kmd_logic::nvrm_fastpath::publish_gate as gate;
+    let (shape, calls) = nvrm_shape_and_calls();
+    if !gate::candidate(
+        shape,
+        NVRM_LAST_SHAPE.load(Ordering::Relaxed),
+        calls,
+        NVRM_LAST_BUCKET.load(Ordering::Relaxed),
+    ) {
+        return;
     }
+    if NVRM_PUBLISH_WANTED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    if NVRM_PUBLISH_WANTED.swap(1, Ordering::AcqRel) == 0 {
+        // A SynchronizationEvent the worker already treats as "something to look
+        // at"; a wake it has nothing to do for costs it one pass of its loop.
+        adapter.signal_hpd();
+    }
+}
+
+/// Whether a mirror was asked for and has not happened yet. The HPD worker
+/// bounds its sleep while this holds, so the trailing state of a burst is
+/// published even if no further escape arrives.
+pub(super) fn nvrm_publish_pending() -> bool {
+    NVRM_PUBLISH_WANTED.load(core::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// The HPD worker's half: do the mirror if one was asked for and at least 250 ms
+/// passed since the last (`helios_kmd_logic::nvrm_fastpath::publish_gate`). PASSIVE.
+/// Cheap (one load) when nothing was asked.
+pub(super) fn nvrm_publish_service() {
+    use core::sync::atomic::Ordering;
+    use helios_kmd_logic::nvrm_fastpath::publish_gate as gate;
+    if NVRM_PUBLISH_WANTED.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut qpc = 0u64;
+    // SAFETY: a scalar time read, callable at any IRQL; it waits on nothing and
+    // fills the valid out-pointer.
+    let now = unsafe { wdk_sys::ntddk::KeQueryInterruptTimePrecise(&mut qpc) };
+    if !gate::interval_elapsed(now, NVRM_LAST_PUBLISH.load(Ordering::Relaxed)) {
+        // Still wanted: the worker sleeps at most one interval while it is.
+        return;
+    }
+    // Memo first, flag second, mirror last: a count that moves from here on
+    // makes the next escape a candidate again, and its request is not lost.
+    let (shape, calls) = nvrm_shape_and_calls();
+    NVRM_LAST_SHAPE.store(shape, Ordering::Relaxed);
+    NVRM_LAST_BUCKET.store(gate::bucket(calls), Ordering::Relaxed);
+    NVRM_LAST_PUBLISH.store(now, Ordering::Relaxed);
+    NVRM_PUBLISH_WANTED.store(0, Ordering::Release);
+    crate::ddi::publish_nvrm_counters();
 }
 
 fn escape_nvrm_op(
@@ -1817,7 +1894,13 @@ fn escape_nvrm_op(
     }
     // 0 when the transport is down: QUERY_CAPS still answers (it touches no
     // device state), and every other op then fails as the transport does.
-    let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
+    // FORWARD samples it itself, inside a lock hold it needs anyway (the hot
+    // path takes one lock fewer); the value here is unused for it.
+    let epoch = if head.op == HELIOS_NVRM_OP_FORWARD {
+        0
+    } else {
+        adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0)
+    };
 
     match head.op {
         HELIOS_NVRM_OP_QUERY_CAPS => {
@@ -1849,7 +1932,7 @@ fn escape_nvrm_op(
             wire.write_back(&caps);
             STATUS_SUCCESS
         }
-        HELIOS_NVRM_OP_FORWARD => nvrm_forward(passive, adapter, buf, hdr, owner, head, epoch),
+        HELIOS_NVRM_OP_FORWARD => nvrm_forward(passive, adapter, buf, hdr, owner, head),
         // Valid in the ABI, not implemented by this KMD build: QUERY_CAPS says so.
         HELIOS_NVRM_OP_MMAP => nvrm_mmap(passive, adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_MUNMAP => nvrm_munmap(passive, adapter, buf, hdr, owner, epoch),
@@ -2272,9 +2355,11 @@ fn nvrm_forward(
     hdr: &HeliosEscapeHeader,
     owner: DeviceOwner,
     head: HeliosNvrmHeader,
-    epoch: u64,
 ) -> NTSTATUS {
     use crate::virtio::nvrm::{self, Refusal};
+    // The device generation, for every answer that does not come back through
+    // `nvrm::forward` (which samples it in its own first lock hold).
+    let epoch_now = || adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
     let mut fwd = match EscapeBuf::<HeliosNvrmForward>::new(buf, hdr) {
         Ok(w) => w.read(),
         Err(st) => return st,
@@ -2289,12 +2374,12 @@ fn nvrm_forward(
         .and_then(|padded| HELIOS_NVRM_FORWARD_BYTES.checked_add(padded))
         .and_then(|resp_off| resp_off.checked_add(resp_cap).map(|total| (resp_off, total)));
     let Some((resp_off, total)) = layout else {
-        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch);
+        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch_now());
     };
     // A message is `MsgHeader | payload` both ways, so each side must be longer
     // than the 16-byte header.
     if fwd.pin_id == 0 && fwd.rm_status_off != 0 {
-        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch);
+        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch_now());
     }
     if req_len < 16
         || resp_cap < 16
@@ -2302,7 +2387,7 @@ fn nvrm_forward(
         || total > HELIOS_NVRM_MAX_BUFFER as usize
         || total != hdr.size as usize
     {
-        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch);
+        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch_now());
     }
     let timeout_ms = match fwd.timeout_ms {
         0 => NVRM_DEFAULT_TIMEOUT_MS,
@@ -2318,6 +2403,7 @@ fn nvrm_forward(
         return refuse_short_buffer();
     };
 
+    let mut sampled_epoch = None;
     let outcome = nvrm::forward(
         passive,
         adapter,
@@ -2327,7 +2413,13 @@ fn nvrm_forward(
         u64::from(timeout_ms),
         fwd.pin_id,
         fwd.rm_status_off,
+        &mut sampled_epoch,
     );
+    let epoch = match sampled_epoch {
+        Some(e) => e,
+        // Refused before any lock was taken: nothing moved, now is as good as then.
+        None => epoch_now(),
+    };
     let (status, resp_len) = match outcome {
         Ok(n) => (HELIOS_NVRM_ST_OK, n as u32),
         Err(Refusal::MsgType) => (HELIOS_NVRM_ST_MSG_TYPE_REFUSED, 0),

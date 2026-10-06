@@ -168,6 +168,10 @@ fn owned(adapter: &AdapterContext, owner: DeviceOwner, handle: u32) -> bool {
 /// `pin_id != 0` (an `Ioctl` only) splices the KMD-built page-run table of that
 /// pin into the request; `rm_status_off` says where RM's status sits in the reply
 /// so the pin is kept only if the registration worked.
+///
+/// `epoch` is set to the device generation as of the first transport lock this
+/// call took (an `Ioctl` folds the read into its ownership check, so the hot path
+/// pays no lock for it); it stays `None` when the call was refused before any.
 #[allow(clippy::too_many_arguments)]
 pub fn forward(
     passive: PassiveLevel,
@@ -178,6 +182,7 @@ pub fn forward(
     timeout_ms: u64,
     pin_id: u32,
     rm_status_off: u32,
+    epoch: &mut Option<u64>,
 ) -> Result<usize, Refusal> {
     let refused = |r: Refusal| {
         NVRM_REFUSED.fetch_add(1, Ordering::Relaxed);
@@ -192,6 +197,11 @@ pub fn forward(
     }
     if pin_id != 0 && msg != MSG_IOCTL {
         return Err(refused(Refusal::Forbidden));
+    }
+    if msg != MSG_IOCTL {
+        // Open / Close / ScanoutFlip / the file listings are rare next to Ioctl:
+        // one extra lock hold, sampled before the message goes out as ever.
+        *epoch = Some(adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0));
     }
     match msg {
         MSG_OPEN => open(passive, adapter, owner, req, resp, timeout_ms),
@@ -253,7 +263,13 @@ pub fn forward(
             }
         }
         MSG_IOCTL => {
-            if !owned(adapter, owner, handle) {
+            // Ownership and the device generation in ONE lock hold. Transport
+            // down: not owned, generation 0, exactly as the two reads answered.
+            let (is_owned, generation) = adapter
+                .with_virtio(|v| (v.nvrm_handle_owned(owner, handle), v.nvrm_epoch()))
+                .unwrap_or((false, 0));
+            *epoch = Some(generation);
+            if !is_owned {
                 return Err(refused(Refusal::NotOwned));
             }
             if let Err(r) = check_ioctl(req, pin_id != 0) {
