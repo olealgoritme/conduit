@@ -1,9 +1,12 @@
 # MSI-X interrupts for the Helios KMD
 
-Status: MSI-X is the shipped DEFAULT (INF `MSISupported=1`), with an INTx fallback and per-vector
-counters. NOT verified on hardware: the KMD could not be compiled or run where this was written;
-everything marked "verify" is a claim that only a boot can confirm. The recovery path if a start
-does not come up is in "Recovery".
+Status: implemented and shipped OFF. This package's INF writes `MSISupported=0` (INTx, as
+before); MSI-X is an opt-in (`MsiMode=2`, "Minimum safe test procedure") until one hardware run
+passes, and then the default is flipped by changing one INF line ("The flip plan"). The INTx
+fallback, the boot-loop breaker, the polling safety net and the per-vector counters are in the
+package either way. NOT verified on hardware: the KMD could not be compiled or run where this was
+written; everything marked "verify" is a claim that only a boot can confirm. The recovery path
+if a start does not come up is in "Recovery".
 
 ## Why
 
@@ -47,7 +50,7 @@ guest. An NVK frame makes several RM calls, so this is frame time.
   never be woken. What the driver CAN do is change the value for the NEXT start
   (see "Making the flip reach existing installs" and "Fallback").
 
-## What a default flip needs (the exact mechanics)
+## The INF value, the device key, and the flip plan
 
 ### The INF values
 
@@ -57,63 +60,85 @@ which is what `HKR` means in a `DDInstall.HW` section) in
 
 | Value | Shipped | Meaning |
 | --- | --- | --- |
-| `MSISupported` | `1` (REG_DWORD, flag `0x00010001`) | PnP may give the device messages. `0` = the INTx line. |
+| `MSISupported` | `0` (REG_DWORD, flag `0x00010001`, no NOCLOBBER) | `1` = PnP may give the device messages, `0` = the INTx line. |
 | `MessageNumberLimit` | `3` (REG_DWORD) | The most messages PnP may grant: config, control queue, event queue. A third (RM) queue is a fourth. Omitted, PnP asks for as many as the device offers. |
 | `Affinity Policy\DevicePolicy` / `DevicePriority` | not shipped | See "Affinity". |
 
 `0x00010001` is `FLG_ADDREG_TYPE_DWORD`; `0x00000002` is `FLG_ADDREG_NOCLOBBER`
-("do not overwrite a value that exists"). The dormant package wrote
+("do not overwrite a value that exists"). The dormant package (v325) wrote
 `0x00010003` = DWORD + NOCLOBBER.
 
-### What NOCLOBBER did to existing installs, and why it is gone
+### Why no NOCLOBBER, and what an update does
 
-NOCLOBBER keeps ANY existing value, including one the INF itself wrote. Every
-install made with the dormant package therefore holds an INF-written
-`MSISupported=0`, and a new package that still said NOCLOBBER would have left it
-at 0 through every update: the flip would have reached new installs only. So the
-shipped line has no NOCLOBBER, and:
+NOCLOBBER keeps ANY existing value, including one the INF itself wrote. With it,
+the INF is not the source of truth: a hand-edited value, or a value the driver
+latched, would outlive every update, and a later flip of the shipped default to 1
+would not reach the installs that hold the 0 the dormant package wrote. So the
+line is written WITHOUT it, and this INF is the single source of truth for the
+shipped default:
 
-* **new install:** the `.HW` section creates the keys and writes `1` and `3`;
+* **new install:** the `.HW` section creates the keys and writes `0` and `3`;
 * **in-place update** (a newer-ranked package selected for the device, by
   `pnputil /add-driver ... /install`, Device Manager, Windows Update): the
   device is re-installed, the `.HW` section runs again, `MSISupported` is
-  overwritten with `1`, and PnP restarts the device (or asks for a reboot, exit
-  code 3010, which `Install-Helios.ps1` already accepts);
+  overwritten with `0` (a hand-set 1, or a 0 the driver wrote, is reset to the
+  shipped value), and PnP restarts the device (or asks for a reboot, exit code
+  3010, which `Install-Helios.ps1` already accepts);
 * **same package reinstalled** (`pnputil` answers 259, "already installed"):
-  the INF does NOT run again and the old `0` stays. Apply it by hand
-  (below) or bump `driver-version.env`;
-* **a hand-set 0 does not survive an update any more.** What does survive is the
-  service-key knob `MsiMode` and the driver's own latch (below), which the driver
-  applies to the device key at `AddDevice`. This is the replacement for
-  "NOCLOBBER keeps my test setting".
+  the INF does NOT run again and the key keeps whatever it holds.
 
-### Can the KMD flip it for the same start?
+What survives an update is the service-key knob `MsiMode` (below), which the
+driver applies to the key at `AddDevice`; that is how an operator keeps MSI-X
+(or a forced INTx) across package updates without editing the device key.
 
-Not by a documented mechanism. `MSISupported` is read by the PnP manager (the PCI
-bus driver building the interrupt requirements) for a device start. The KMD sees
-the PDO in `DxgkDdiAddDevice`, which runs before the requirements are built for
-that start, so a write there MAY be read by the start that follows, but Windows
-documents no such ordering. The driver treats the write as guaranteed for the
-NEXT start and as a bonus for the current one, and always follows what PnP
-actually granted (`probe_granted`). `MsiWant` (what `AddDevice` asked for) next
-to `MsiGrant` (what PnP gave) is the measurement of whether the write came in
-time (verify, checklist D).
+### Can the KMD change it for the start in progress?
 
-### Exact registry steps (package or install script)
+No. `MSISupported` is read by the PnP manager (the PCI bus driver building the
+interrupt requirements) for a device start. The KMD sees the PDO in
+`DxgkDdiAddDevice`, which runs before the requirements are built for that start,
+so a write there MAY be read by the start that follows, but Windows documents no
+such ordering. The driver therefore treats the write as guaranteed for the NEXT
+start only, and always follows what PnP actually granted (`probe_granted`).
 
-New installs and updates: nothing beyond the INF. By hand, on a device that
-holds `0` (same-version reinstall, or an install made by hand):
+**After changing `MsiMode`, the first restart writes the key and a SECOND restart
+(or a reboot) applies it.** `MsiWant` (what `AddDevice` asked for) next to
+`MsiGrant` (what PnP gave) shows which: after `MsiMode=2` the first restart reads
+`MsiWant=1`, `MsiKeyWr=0`, `MsiGrant=0` (the write came late), the second
+`MsiGrant=3`. If the first already reads `MsiGrant=3`, the write was in time
+(then one restart is enough; record it, checklist C). `MsiMode` going back
+from 1 or 2 to 0 leaves the key where the forcing put it: `0` means "follow the
+key", it does not write one. Only a package install (the INF), `MsiMode=1`, or a
+latch lowers it.
+
+### Exact registry steps
+
+New installs and updates: the INF, nothing more. To opt in on this package, the
+service-key way (no device key editing, survives updates):
 
 ```
-reg add "HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_1AF4&DEV_106D&SUBSYS_11001AF4&REV_01\<instance>\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" /v MSISupported /t REG_DWORD /d 1 /f
-reg add "HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_1AF4&DEV_106D&SUBSYS_11001AF4&REV_01\<instance>\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" /v MessageNumberLimit /t REG_DWORD /d 3 /f
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render" /v MsiMode /t REG_DWORD /d 2 /f
+pnputil /restart-device "PCI\VEN_1AF4&DEV_106D&SUBSYS_11001AF4&REV_01\<instance>"
 pnputil /restart-device "PCI\VEN_1AF4&DEV_106D&SUBSYS_11001AF4&REV_01\<instance>"
 ```
 
-(`DEV_1069` for the id-41 test VMs.) The service-key way, which needs no device
-key and survives updates: `reg add "HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render" /v MsiMode /t REG_DWORD /d 2 /f`
-(force MSI-X) then restart the device; the driver writes `MSISupported=1` at
-`AddDevice`.
+(`DEV_1069` for the id-41 test VMs; the second restart applies what the first wrote.)
+The device-key way, if the service key is not an option:
+
+```
+reg add "HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_1AF4&DEV_106D&SUBSYS_11001AF4&REV_01\<instance>\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" /v MSISupported /t REG_DWORD /d 1 /f
+pnputil /restart-device "PCI\VEN_1AF4&DEV_106D&SUBSYS_11001AF4&REV_01\<instance>"
+```
+
+and `/d 0` to go back; the next package install rewrites it to 0.
+
+### The flip plan (later, after one hardware run passes)
+
+1. One INF line: `MSISupported, %REG_DWORD%, 1`, still WITHOUT NOCLOBBER. Every install and
+   update then writes 1, including over the 0 this package wrote.
+2. Installs that must stay on INTx set `MsiMode=1` in the service key first (it survives).
+3. The breaker, the latch, the polling safety net and the fallback stay as they are: they are
+   what makes the default safe, and they are already exercised by the opt-in.
+4. A same-version reinstall does not run the INF; use the `reg add` above or bump the version.
 
 ### Affinity
 
@@ -132,9 +157,10 @@ measure before shipping any.
 All decisions are in `kmd_logic/src/msi.rs` (host tested); the WDK glue is
 `kmd_render/src/virtio/msi.rs`.
 
-1. **Policy at `AddDevice`** (`apply_key_policy`, PASSIVE, own noinline frame):
-   `MsiMode` (service key, below) and the latch `MsiLatch` give
-   `msi::key_action`: leave the key alone, write 0, or write 1. See "Knobs".
+1. **Policy at `AddDevice`** (`apply_key_policy`, PASSIVE, own noinline frame): the
+   boot-loop breaker's marker is consumed (below), then `MsiMode` (service key) and the
+   latch `MsiLatch` give `msi::key_action`: leave the key alone, write 0, or write 1. See
+   "Knobs".
 2. **Detect** (`probe_granted`, in `StartDevice` before `VirtioGpu::init`,
    own noinline frame): messages were granted if the MSI-X capability's Enable
    bit is set OR the translated resource list has a message interrupt descriptor.
@@ -156,11 +182,12 @@ All decisions are in `kmd_logic/src/msi.rs` (host tested); the WDK glue is
    common cfg a second time, write `msix_config` and each existing queue's
    `queue_msix_vector`, read every one back. `msi::setup_plan` is the order: the
    plan, then (on a refusal) every queue on vector 0 (skipped when the plan
-   already was that), then give up. Giving up fails the transport
-   (`StartDevice` continues render-only, `StVio`) and latches INTx for the next
-   start; it cannot fall back to INTx in this start (the line is not connected).
-   Before `DRIVER_OK` so QEMU builds the per-queue irqfds from the programmed
-   vectors.
+   already was that), then give up. Giving up does NOT fail the transport: every
+   vector is unassigned, the start runs POLLING-ONLY (`msi::polling_only_state`,
+   `MsiPollOnly=1`, the safety net on from the first moment), and INTx is latched
+   for the next start. It cannot fall back to INTx in this start (the line is not
+   connected), and failing the transport would lose the display half. Before
+   `DRIVER_OK` so QEMU builds the per-queue irqfds from the programmed vectors.
 5. **ISR** (`ddi/interrupt.rs`): `AdapterContext::msi_state` (0 = INTx, else bit
    31 | config vector). Message mode: no ISR-status read, count per vector, latch
    `config_change_pending` when the message is the config vector, `DxgkCbQueueDpc`,
@@ -169,7 +196,17 @@ All decisions are in `kmd_logic/src/msi.rs` (host tested); the WDK glue is
 6. **DPC**: unchanged in what it does. It drains the whole used ring and every
    queue's consumer on every run, so which message fired does not matter. It
    takes the "cause" mask the ISRs left and counts itself per vector.
-7. **INF**: ships `MSISupported=1` (no NOCLOBBER) and `MessageNumberLimit=3`.
+7. **Boot-loop breaker** (`begin_start`, `service`, `apply_key_policy`): a start that got
+   messages sets `MsiStarting=1` in the service key and FLUSHES it to disk before anything
+   that could hang (set in `StartDevice` after `probe_granted`, not in `AddDevice`: only a
+   message-mode start can be the one that loops, and an INTx start must not leave a marker).
+   It is cleared (`msi::marker_may_clear`) once run-time judging is armed, an interrupt has
+   been seen, delivery is not convicted, and the start is 3 s old, or at once at a clean
+   `StopDevice`. If `AddDevice` finds it still set, the previous message-mode start never
+   became healthy (a hang, a bugcheck, a reboot into the same fault): the breaker trips,
+   `MsiLatch=1` (`MsiLatchWhy=4`), `MsiBreaker` counts it, and the key goes to INTx.
+   `MsiMode=2` does NOT override it; only `MsiMode=3` (debugging) does.
+8. **INF**: ships `MSISupported=0` (no NOCLOBBER) and `MessageNumberLimit=3`.
 
 ### Is the shared interrupt code right for MSI?
 
@@ -206,38 +243,45 @@ All decisions are in `kmd_logic/src/msi.rs` (host tested); the WDK glue is
 
 | Condition | Detected | Action |
 | --- | --- | --- |
-| OS granted a line (`MSISupported=0`, no MSI-X capability, no messages offered) | `probe_granted` = 0 | INTx path, as v307. Extra work at start: one config-space capability walk (read-only). |
-| `MsiMode=1`, or the latch is set | `AddDevice` (`key_action`) | Writes `MSISupported=0`: INTx at the NEXT start (this one if PnP had not read it yet). |
+| OS granted a line (`MSISupported=0`, no MSI-X capability, no messages offered) | `probe_granted` = 0 | INTx path, as v307. Extra work at start: one config-space capability walk (read-only). This is the shipped default. |
+| `MsiMode=1`, or the latch is set | `AddDevice` (`key_action`) | Writes `MSISupported=0`: INTx at the NEXT start. |
+| `MsiMode=2` | `AddDevice` | Writes `1` unless the latch is set (the latch and the breaker win), applied at the next start after that. |
 | OS granted 1 message / list unparseable | `probe_granted` | One shared vector, config unassigned. |
 | OS granted 2 | | Config on 0, both queues on 1. |
 | OS granted 3+ | | Config 0, control 1, event 2. |
-| Device refuses a vector | read-back in `write_plan` | `setup_plan`: shared on 0; refused again, or the common cfg cannot be mapped: transport fails (render-only, `StVio`), `MsiLatch=1` with `MsiLatchWhy` 2 / 3 (`MsiRefused`, `MsiNoCfg`), INTx next start. |
+| Device refuses a vector | read-back in `write_plan` | `setup_plan`: shared on 0. |
+| Every plan refused, or the common cfg cannot be mapped | `program_vectors` | POLLING-ONLY: transport up, no vector, `MsiPollOnly=1`, safety net on, `MsiLatch=1` (`MsiLatchWhy` 2 / 3, flushed), INTx next start. Slow (every wait costs a slice, fences ride the worker's 10 ms poll) but alive. |
+| A message-mode start never became healthy (hang, bugcheck, reboot loop) | `AddDevice` finds `MsiStarting` | Breaker: `MsiLatch=1` (`MsiLatchWhy=4`, flushed), `MsiBreaker` + 1, INTx for this start's key write. |
 | Start finished and completions were polled with no interrupt | `finish_start` (`msi::start_verdict`: no interrupt, >= 3 completions since the transport went live) | `MsiStart=2` (suspect), the polling safety net turns on. Never latches by itself: whether dxgkrnl delivers interrupts to a device that is still starting is not assumed. |
-| Lost interrupt (delivery broken) | `wait_block`: a polling drain, after a wait slice timed out, found a completion (`IrqRescue`). `msi::rescue_step`: no interrupt since the previous rescue = silent; 3 silent in a row convict | First doubt: polling safety net on, the rescue queues the DPC (so events and fences drain too). Conviction: `MsiHealth=3`, `MsiLatch=1` (`MsiLatchWhy=1`), INTx next start. The device keeps working meanwhile at polling latency. |
+| Lost interrupt (delivery broken) | `wait_block`: a polling drain, after a wait slice timed out, found a completion (`IrqRescue`). `msi::rescue_step`: no interrupt since the previous rescue = silent; 3 silent in a row convict | First doubt: polling safety net on, the rescue queues the DPC (so events and fences drain too). Conviction: `MsiHealth=3`, `MsiLatch=1` (`MsiLatchWhy=1`, flushed), INTx next start. The device keeps working meanwhile at polling latency. |
 | Interrupt storm | not a message-mode failure | Messages are edge events with no level line: the line-based storm detector (`~10000 unclaimed ISRs -> Code 43`) cannot happen. A device that fires without work is bounded by DPC coalescing and counted in `MsiIdle`. |
 | A previous start latched INTx but PnP still gave messages | `on_transport_up` | Polling safety net from the first moment. |
 
-**The safety net** (`virtio::msi::polling`, `ddi/hpd.rs`): while on, the HPD worker
-(display half) wakes every 10 ms and runs `drain_used_and_complete`, the same drain
-the DPC runs, counted in `MsiPollN`. It also runs while a vsync heartbeat is
-armed (the vsync DPC drains). A render-only adapter has no worker: there a
-rescue still queues the DPC, so the NVRM path (which rescues on every slow call)
-keeps its events moving, but an idle render-only adapter with broken delivery is
-not covered. That is why the conviction latches INTx for the next start. A suspect
-verdict (not a conviction, not a latched start) is cleared by the periodic mirror
-once interrupts have arrived since the evidence that raised it (`msi::reassess`), and
-the net goes off with it: an end-of-start "no interrupts yet" does not keep the worker
-polling for the whole run.
+Every latch write is flushed to disk (`flush_service_key`): the faults that set it end in a
+hang or a bugcheck, and a latch the lazy writer had not written would go with them.
 
-**What cannot be done:** switch to INTx inside the start that got messages. The
-line is not connected, and an enabled-but-unconnected level interrupt is a hang.
-The fallback is therefore "this start degrades to polling, the next start is INTx".
+**The safety net** (`virtio::msi::polling`, `ddi/hpd.rs`, `hpd_wake::WaitInputs::poll`): while on,
+the HPD worker (display half) wakes every 10 ms and runs `drain_used_and_complete`, the same
+drain the DPC runs, counted in `MsiPollN`. It also runs while a vsync heartbeat is armed (the
+vsync DPC drains). A render-only adapter has no worker: there a rescue still queues the DPC, so
+the NVRM path (which rescues on every slow call) keeps its events moving, but an idle render-only
+adapter with broken delivery is not covered. That is why the conviction latches INTx for the
+next start. A suspect verdict (not a conviction, not a latched start) is cleared by the periodic
+mirror once interrupts have arrived since the evidence that raised it (`msi::reassess`), and the
+net goes off with it: an end-of-start "no interrupts yet" does not keep the worker polling for the
+whole run.
+
+**What cannot be done:** switch to INTx inside the start that got messages. The line is not
+connected, and an enabled-but-unconnected level interrupt is a hang. The fallback is therefore
+"this start degrades to polling, the next start is INTx".
 
 ### Is the INTx fallback exercised by tests?
 
 Host tests (`kmd_logic`, `cargo test`) cover every decision: `setup_plan` (order,
-no identical retry, never an ungranted vector), `key_action` (the table; `Auto`
-never raises the key), `Mode::from_knob` (unknown values are `Auto`),
+no identical retry, never an ungranted vector), `key_action` (the table; only an explicit
+opt-in raises the key, a latch beats everything but mode 3), `breaker_trips` and
+`marker_may_clear` (the marker clears only with an interrupt seen and a start old enough),
+`polling_only_state`, `Mode::from_knob` (unknown values are `Auto`),
 `rescue_step` / `start_verdict` / `polling_wanted` / `should_latch` (the start
 verdict never convicts; an interrupt between rescues ends the streak; wrap
 tolerant), the vector slots and cause bits, the routing of `isr_route` in both
@@ -251,20 +295,24 @@ itself is unchanged code with counters added, and its first test is a boot with
 
 | Knob (service key `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`, DWORD) | Values | Applies |
 | --- | --- | --- |
-| `MsiMode` (default 0) | 0 = auto: MSI-X as the INF ships it, INTx once the latch is set. 1 = INTx always. 2 = MSI-X always (ignores and clears the latch). Unknown values are 0. Never written by the driver; mirrored as `MsiModeEff`. | `AddDevice` writes the device key from it; next device start (`pnputil /restart-device`). Survives driver updates. |
-| `MsiLatch` (default 0) | 1 = a start convicted message delivery (or could not set it up): the next `AddDevice` asks for INTx. The driver sets it (`MsiLatchWhy`: 1 silent rescues, 2 vectors refused, 3 common cfg unmapped). Clear it with 0 (or `MsiMode=2`) once the cause is fixed; set it to 1 to rehearse the fallback. | `AddDevice`. |
+| `MsiMode` (default 0) | 0 = auto: follow the INF / the device key as it stands (INTx in this package); a latch lowers it. 1 = INTx always. 2 = MSI-X opt-in: raises the key to 1, but the latch and the breaker still win. 3 = MSI-X with no breaker and no latch (debugging only). Unknown values are 0. Never written by the driver; mirrored as `MsiModeEff`. | `AddDevice` writes the device key from it: the first restart after a change writes, a second restart or a reboot applies. Survives driver updates. Going back to 0 leaves the key where the forcing put it. |
+| `MsiLatch` (default 0) | 1 = a start convicted message delivery, could not set vectors up, or the breaker tripped: the next `AddDevice` asks for INTx. The driver sets it (`MsiLatchWhy`: 1 silent rescues, 2 vectors refused, 3 common cfg unmapped, 4 breaker). Clear it with 0 once the cause is fixed (mode 2 does not clear it); set it to 1 to rehearse the fallback. | `AddDevice`. |
+| `MsiStarting` (default 0) | The breaker's marker (below). The driver sets and clears it; do not set it by hand except to rehearse the breaker. | `AddDevice`. |
+| `MsiBreaker` (default 0) | How many times the breaker tripped (the driver's count). | Read at `AddDevice`. |
 | `MsiVectors` (default 0, unchanged) | 0 = per-source vectors when enough messages were granted. 1 = one shared message 0 for every queue. NOT a switch to INTx. | Transport init. The same-boot A/B between per-queue and shared vectors. |
 
 Backward compatibility: `MsiVectors` keeps its meaning. The previously documented
 way to force INTx, setting the device key's `MSISupported` to 0 by hand, still
-works until the next package install or update rewrites it to 1; `MsiMode=1` is
+works until the next package install rewrites it from the INF; `MsiMode=1` is
 the form that survives updates.
 
 ## Counters (service key, DWORD)
 
 Written by `publish_nvrm_counters`, the periodic mirror (the HPD worker, rate
 limited, plus the present edge and StopDevice): first at the first open or
-present, then every 256 forwards and on every session change. Registry writes are
+present, then every 256 forwards and on every session change; and the `Msi*` / `Intx*`
+block once more at the end of `StartDevice` (`finish_start`), so the registry shows the
+current start at once, zeros included, and not the last one's numbers. Registry writes are
 PASSIVE only; the ISR and the DPC touch atomics. The interrupt and DPC counters
 and `NvRtt*` are per start (zeroed when the transport goes live, so a restart into
 the other mode reads as that mode alone). `IrqN` / `DpcN` / `0x0F0C` / `0x0F0D`
@@ -282,8 +330,10 @@ keep their old meaning (all interrupts, all DPCs, cumulative since the image loa
 | `IrqRescue` | Waits whose polling drain found a completion after a slice timeout. Both modes. A healthy run reads 0 or near it. |
 | `MsiSilent`, `MsiHealth`, `MsiStart` | Silent rescues in a row now; health (0 unknown, 1 healthy, 2 suspect, 3 broken); the end-of-start verdict (0/1/2). |
 | `MsiPoll`, `MsiPollN` | The polling safety net is on; worker wakes that drained under it. |
+| `MsiPollOnly` | 1 = this start got messages but no vector could be programmed: transport up, polling only. |
+| `MsiStarting`, `MsiBreaker` | The breaker's marker (1 from the start of a message-mode start until it proved healthy) and how many times it tripped. |
 | `MsiModeEff`, `MsiWant`, `MsiKeyWr` | `MsiMode` as read; what `AddDevice` asked of `MSISupported` (0xFF = left alone, else the value); the NTSTATUS of that write (0 = done, 0xFFFFFFFF = not attempted). |
-| `MsiLatch`, `MsiLatchWhy` | The INTx latch and why. |
+| `MsiLatch`, `MsiLatchWhy` | The INTx latch and why (1 silent rescues, 2 refused, 3 cfg unmapped, 4 breaker). |
 | `NvRttN`, `NvRttMinUs`, `NvRttMeanUs`, `NvRttMaxUs` | Forwarded RM `Ioctl` round trips as the calling thread saw them (see below): count, min, mean, max in microseconds. |
 | `NvRttB0` .. `NvRttB7` | Histogram of the same, bounds `< 15, 25, 40, 60, 100, 250, 1000` us, last open. The INTx cost (about 55 us) lands in B3, a 25 us MSI-X call in B2. |
 | `NvRttON`, `NvRttOMinUs`, `NvRttOMeanUs`, `NvRttOMaxUs` | The same for every other forwarded message: open, close, scan-out flip, the pinned registration, listings. |
@@ -302,74 +352,105 @@ event queue's interrupts are visible in `MsiV2` / `MsiDpc2`).
 
 ## Recovery
 
-A wrong MSI-X default can leave a device that does not start, or starts and
-shows nothing. In order of how much still works:
+A wrong MSI-X start can leave a device that does not start, or starts and shows
+nothing. The breaker (above) makes the second boot INTx by itself in the cases it can
+see (a start that hung or bugchecked before interrupts proved healthy); these are the
+steps when it does not. In order of how much still works:
 
-1. **The device starts but is slow or stalls**: the safety net and the latch are
-   automatic; read `MsiHealth` / `MsiLatch`. Restart the device
-   (`pnputil /restart-device`) and the next start is INTx.
-2. **The device does not start** (Code 43 / black screen, a remote session still
-   up): `reg add "HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render" /v MsiMode /t REG_DWORD /d 1 /f`
-   then `pnputil /restart-device`; `AddDevice` writes `MSISupported=0`. If the
-   first restart still comes up on messages (the write came late), restart again.
-3. **No session at all**: boot to safe mode (or mount the hive offline) and set
-   the device key directly: `...\Enum\PCI\VEN_1AF4&DEV_106D&SUBSYS_11001AF4&REV_01\<instance>\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties\MSISupported` = 0,
-   and `MsiMode` = 1 so an update does not undo it. Device Manager "Roll Back
-   Driver" to a package with `MSISupported=0` also works (the INF rewrites it).
-4. **Host side**: a VMM that offers no MSI-X capability gives INTx whatever the
-   key says; the QEMU `vectors=0` property on the device does the same.
+**With a live channel (RDP, SSH, the QEMU monitor's guest agent) into the guest:**
 
-The fallback is written to be robust rather than clever: it never convicts on
-the end-of-start verdict, it requires three silent rescues in a row, it never
-raises the key on its own, and a failure of any registry write only loses the
-latch (the polling net still runs this start).
+1. `reg add "HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render" /v MsiMode /t REG_DWORD /d 1 /f`
+   then `pnputil /restart-device` (twice if the first restart still comes up on
+   messages: the first writes the key, the second applies it). Also
+   `reg add ... /v MsiLatch /t REG_DWORD /d 1 /f` if you want the latch to hold it.
+2. If the device is up but slow or stalled: read `MsiHealth` / `MsiLatch` /
+   `MsiPollOnly`; the safety net and the latch are automatic.
 
-## Must be verified on hardware, in this order
+**Without a channel (black screen, no network):**
 
-Compare each run's `NvRtt*` and `Msi*` / `Intx*` counters. The loop: the same NVK
-or `crm` smoke workload for each run, and the call-time table librmclient writes when
-`CRM_WIN_PROF_FILE` is set (per-call times from user mode, which includes the
-escape and the ioctl path the KMD counters do not).
+3. Revert the VM to the snapshot taken before the test (the procedure below starts with
+   one); that is the fast path.
+4. Otherwise boot to safe mode (Microsoft Basic Display takes over) or mount the hive
+   offline from another VM, and set the device key directly:
+   `...\Enum\PCI\VEN_1AF4&DEV_106D&SUBSYS_11001AF4&REV_01\<instance>\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties\MSISupported` = 0,
+   and `MsiMode` = 1 (service key) so a later start does not raise it again.
+   Installing this package again also rewrites the key to 0 (the INF, no NOCLOBBER).
+5. **Host side**: a VMM that offers no MSI-X capability gives INTx whatever the key says;
+   the QEMU `vectors=0` property on the device does the same. Starting the VM with that
+   property is a recovery that needs nothing from the guest.
 
-A. **Baseline, INTx** (`MsiMode=1`, restart the device; expect `MsiGrant=0`,
-   `IntxInts > 0`, `MsiInts=0`, `MsiHealth=0`): record `NvRttMeanUs`, `NvRttMinUs`,
-   `NvRttMaxUs`, `NvRttB0..B7`, the `CRM_WIN_PROF_FILE` table, `IrqN`. This also
-   proves the new counters and the probes did not disturb the INTx path.
-B. **MSI-X default** (`MsiMode=0` after a driver install that wrote
-   `MSISupported=1`, or `MsiMode=2` after A; restart): read `MsiCap` (bit 15 set,
-   table size field 2), `MsiList`, `MsiGrant` (3 if the OS lists one descriptor per
-   message, 1 if one for the whole set: still correct, single vector).
-   `MsiV1` and `MsiV2` grow, `MsiV0` stays 0 (no config interrupts), `MsiDpc1` /
-   `MsiDpc2` track them, `MsiStart=1`, `MsiHealth` 0 or 1, `IrqRescue` ~0,
-   `MsiPoll=0`. Then the same workload: `NvRttMeanUs` against run A; the host
-   estimate is 20-35 us less per forward. If `MsiGrant` is 0 but Device Manager
-   shows an MSI-X IRQ, detection missed (the `CM_RESOURCE_INTERRUPT_MESSAGE`
-   value `0x2` in `msi.rs` is wrong): control round trips still complete by polling
-   but `MsiInts` stays 0 and `IrqRescue` climbs.
-C. **Forced INTx by the knob**: from B, `MsiMode=1`, `pnputil /restart-device`.
-   `MsiWant=0`, `MsiKeyWr=0`; `MsiGrant`: 0 at the first restart means the
-   `AddDevice` write was in time, 3 means PnP had read the value already and the
-   NEXT restart is INTx (then do it once more and confirm 0). Record which.
-D. **The latch**: `MsiMode=0`, `MsiLatch=1`, restart: `MsiWant=0`, as C. Then
-   `MsiMode=2`: `MsiWant=1`, `MsiLatch` back to 0. For the polling net itself, a
-   start that got messages with the latch set shows `MsiPoll=1` and `MsiPollN`
-   growing.
+The fallback is written to be robust rather than clever: it never convicts on the
+end-of-start verdict, it requires three silent rescues in a row, it never raises the key
+on its own, the breaker and every latch are flushed to disk before the fault can take
+them, and a failure of any registry write only loses the latch (the polling net still
+runs this start).
+
+## Minimum safe test procedure (MSI-X opt-in)
+
+Do this once, in this order, before anyone flips the INF default.
+
+0. **Prepare.** Snapshot the VM (disk, not just memory). Have TWO ways in that do not
+   depend on the display: the console (QEMU monitor / serial / VNC of the emulated
+   adapter) AND a non-display channel (RDP-independent: SSH or the QEMU guest agent,
+   able to run `reg` and `pnputil`). Check the package is the one with `MSISupported=0`
+   (the shipped default), and that `MsiMode`, `MsiLatch`, `MsiStarting` are absent or 0.
+1. **Baseline A, INTx** (`MsiMode` absent or 1). Render-only first (`DisplayHalf=0`),
+   then the display half. Expect `MsiGrant=0`, `IntxInts > 0`, `MsiInts=0`,
+   `MsiHealth=0`. Record `NvRttN/MinUs/MeanUs/MaxUs/B0..B7` for the NVK or `crm` smoke
+   loop, and the `CRM_WIN_PROF_FILE` table. This also proves the new counters and
+   probes did not disturb the INTx path.
+2. **Opt in**: `MsiMode=2`, `pnputil /restart-device`. Read `MsiWant=1`, `MsiKeyWr=0`,
+   `MsiGrant` (0 is expected: the write came late). Restart AGAIN (or reboot): now
+   `MsiGrant` should be 3 (1 or 2 are still correct, see below).
+3. **Checks right after the second start** (the registry shows this start at once):
+   `MsiCap` (bit 15 set, table size field 2), `MsiList`, `MsiGrant`, `MsiInts` > 0 and
+   growing, `MsiV1` and `MsiV2` > 0, `MsiV0` 0, `MsiDpc1`/`MsiDpc2`, `MsiHealth` 0 or 1,
+   `MsiStart=1`, `MsiPoll=0`, `MsiPollOnly=0`, `IrqRescue` ~0, `MsiStarting` back to 0 a few
+   seconds after start, `MsiBreaker=0`, `MsiLatch=0`, then `NvRtt*` against A. Render-only
+   first; only then the display half.
+4. **Only if everything above is clean**: run the load (DX12 / Vulkan soak, the NVK frame
+   loop) for several minutes and re-read; no `0x119` / `0xD1` / `0x133`.
+5. **Back out**: `MsiMode=1` and two restarts, or revert the snapshot.
+
+What each failure looks like: `MsiGrant=0` after two restarts with `MsiWant=1` and
+`MsiKeyWr=0` means PnP did not honour the key (look at Device Manager's resources);
+`MsiInts=0` with `MsiGrant>0` and `IrqRescue` climbing is silent delivery (the host did not
+signal, or the `CM_RESOURCE_INTERRUPT_MESSAGE` value `0x2` in `msi.rs` is wrong): the net keeps
+the device alive and the latch makes the next start INTx; a start that hangs leaves
+`MsiStarting=1`, and the next boot trips the breaker (`MsiBreaker=1`, `MsiLatchWhy=4`).
+
+## Hardware checklist (what each run must settle)
+
+Compare each run's `NvRtt*` and `Msi*` / `Intx*` counters. The loop: the same NVK or `crm`
+smoke workload for each run, and the call-time table librmclient writes when
+`CRM_WIN_PROF_FILE` is set (per-call times from user mode, which includes the escape and the
+ioctl path the KMD counters do not).
+
+A. **Baseline, INTx**: step 1 above.
+B. **MSI-X**: step 3 above; the host estimate is 20-35 us less per forward. If `MsiGrant` is 0
+   but Device Manager shows an MSI-X IRQ, detection missed.
+C. **Same-start or next-start**: after `MsiMode=2` (and again after `MsiMode=1`), does the FIRST
+   restart already read the new `MsiGrant`? Record which: it settles whether the `AddDevice`
+   write is read in time, and whether one restart is enough.
+D. **The latch**: `MsiLatch=1`, restart: `MsiWant=0`. For the polling net itself, a start that got
+   messages with the latch set shows `MsiPoll=1` and `MsiPollN` growing.
 E. **Fewer vectors**: QEMU `vectors=1` and `vectors=2`: `MsiGrant` 1 / 2, still
    interrupt-driven. `MsiVectors=1` with 3 granted: all on `MsiV0`.
-F. **The failure arms**, if a lost interrupt can be provoked (host call fd muted):
-   `IrqRescue` climbs, `MsiHealth` 2 then 3, `MsiLatch=1` / `MsiLatchWhy=1`,
-   `MsiPoll=1`, the desktop keeps painting at polling latency, and the next start
-   is INTx. The refusal arm is hard to provoke.
-G. **Under load** (a DX12 or Vulkan soak, three messages): no `0x119` / `0xD1` /
-   `0x133`; `MsiIdle` small, `DmaNtfF` 0. This
-   settles whether dxgkrnl serialises the ISRs of different messages against the
-   synchronized routine on message 0.
-H. **The claim the design leans on**: interrupts are delivered during
-   `StartDevice` (`MsiStart=1` and `MsiInts > 0` after start; `MsiStart=2` with
-   `MsiGrant > 0` means they are not, or the host does not signal).
-I. `tools/kmd-frame-sizes.ps1`: new noinline frames `on_transport_up`,
-   `finish_start`, `note_rescue`, `apply_key_policy` (a leaf of `AddDevice`), and
-   `wait_block` grew by the rescue branch. Compare against the 17936-byte ceiling.
+F. **The failure arms**, if a lost interrupt can be provoked (host call fd muted): `IrqRescue`
+   climbs, `MsiHealth` 2 then 3, `MsiLatch=1` / `MsiLatchWhy=1`, `MsiPoll=1`, the desktop keeps
+   painting at polling latency, the next start is INTx. The refusal arm (`MsiPollOnly=1`) is hard
+   to provoke. The breaker: `reg add ... /v MsiStarting /t REG_DWORD /d 1 /f`, restart:
+   `MsiBreaker=1`, `MsiLatch=1`, `MsiWant=0`.
+G. **Under load** (a DX12 or Vulkan soak, three messages): no `0x119` / `0xD1` / `0x133`;
+   `MsiIdle` small, `DmaNtfF` 0. This settles whether dxgkrnl serialises the ISRs of different
+   messages against the synchronized routine on message 0.
+H. **The claim the design leans on**: interrupts are delivered during `StartDevice` (`MsiStart=1`
+   and `MsiInts > 0` after start; `MsiStart=2` with `MsiGrant > 0` means they are not, or the host
+   does not signal).
+I. `tools/kmd-frame-sizes.ps1`: new noinline frames `begin_start`, `on_transport_up`,
+   `finish_start` (it publishes ~30 counters), `note_rescue`, `apply_key_policy` (a leaf of
+   `AddDevice`), and `wait_block` grew by the rescue branch. Compare against the 17936-byte
+   ceiling.
 
 ## Not done
 
@@ -382,3 +463,4 @@ I. `tools/kmd-frame-sizes.ps1`: new noinline frames `on_transport_up`,
 * Rewriting the key from the install script: the INF does it on every install and
   update, and the KMD does it for `MsiMode` / the latch; the script would only add
   a way to miss the same-version reinstall, which `reg add` above covers.
+* Flipping the shipped default: one INF line after one passing hardware run ("The flip plan").
