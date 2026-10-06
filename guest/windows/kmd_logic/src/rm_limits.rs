@@ -71,6 +71,17 @@ impl Bounds {
         global_max: usize,
         per_owner_max: usize,
     ) -> Self {
+        Self::growing_fair(initial, headroom, global_max, per_owner_max, 4)
+    }
+
+    /// The growing shape with a fair share of `1 / fair_den` of the table.
+    pub const fn growing_fair(
+        initial: usize,
+        headroom: usize,
+        global_max: usize,
+        per_owner_max: usize,
+        fair_den: usize,
+    ) -> Self {
         Bounds {
             initial,
             headroom,
@@ -79,10 +90,29 @@ impl Bounds {
             scarce_num: 3,
             scarce_den: 4,
             fair_num: 1,
-            fair_den: 4,
+            fair_den,
         }
     }
+
+    /// Whether the fairness rule can ever fire before the per-process bound does: an owner
+    /// must be able to reach its fair share. When this is false the rule is dead code (the
+    /// bug the first handle shape had: fair share 1/4 of 16384 = the per-process bound 4096).
+    pub const fn fairness_reachable(&self) -> bool {
+        self.per_owner_max.saturating_mul(self.fair_den) > self.global_max.saturating_mul(self.fair_num)
+    }
 }
+
+/// The handle table's shape (`virtio/gpu/nvrm_tables.rs`): starts at 1024, grows to 16384, at
+/// most 4096 per process. Fair share 1/8 (2048): once the table is 3/4 full (12288), a process
+/// holding 2048 or more is refused, so the last quarter (4096 slots) is only for processes
+/// below that. Four hostile processes at 4096 cannot fill it and starve the shell.
+pub const HANDLES: Bounds = Bounds::growing_fair(1024, 16, 16_384, 4_096, 8);
+/// The mapping table's shape: starts at 1024, grows to 8192 (the adapter-wide view table),
+/// at most 4096 per process, fair share 1/4 (2048).
+pub const MAPS: Bounds = Bounds::growing(1024, 16, 8_192, 4_096);
+/// `NvWinPolicy` = 0: the old fixed tables (1024 handles, 128 per process; 1024 maps, 256).
+pub const HANDLES_LEGACY: Bounds = Bounds::fixed(1024, 1024, 128);
+pub const MAPS_LEGACY: Bounds = Bounds::fixed(1024, 1024, 256);
 
 /// What a reservation may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +270,79 @@ mod tests {
         assert_eq!(admit(&b, 16384, 16000, 10_000), Admit::Unfair);
         // A small owner still gets the last slots.
         assert_eq!(admit(&b, 16384, 16383, 3), Admit::Ok);
+    }
+
+    /// The production shapes: fairness must be reachable, or it is dead code (the first handle
+    /// shape had fair share 1/4 of 16384 = the per-process bound 4096, so the per-process
+    /// refusal always fired first and `NvHdlFRef` could never move).
+    #[test]
+    fn production_shapes_can_actually_be_fair() {
+        assert!(HANDLES.fairness_reachable());
+        assert!(MAPS.fairness_reachable());
+        // The fixed legacy shapes have no fairness rule and need none.
+        assert!(HANDLES.per_owner_max < HANDLES.global_max);
+        assert!(MAPS.per_owner_max <= MAPS.global_max);
+        // The old shape is the one that was dead.
+        assert!(!Bounds::growing(1024, 16, 16_384, 4_096).fairness_reachable());
+    }
+
+    /// Four hostile processes (each trying to take everything) cannot fill the handle table:
+    /// a fresh process (the shell) still gets slots, and keeps getting them up to its own
+    /// bound.
+    #[test]
+    fn hostile_owners_cannot_starve_a_fresh_one() {
+        let b = HANDLES;
+        let mut cap = b.initial;
+        let mut live = 0usize;
+        let mut hostile = [0usize; 4];
+        let mut refused = [0usize; 3]; // owner bound, global, unfair
+        // Round-robin greedy: every hostile process asks for a slot again and again.
+        for _ in 0..40_000 {
+            for h in 0..4 {
+                if let Some(n) = want_capacity(&b, cap, live) {
+                    cap = n;
+                }
+                match admit(&b, cap, live, hostile[h]) {
+                    Admit::Ok => {
+                        hostile[h] += 1;
+                        live += 1;
+                    }
+                    Admit::OwnerBound => refused[0] += 1,
+                    Admit::GlobalBound => refused[1] += 1,
+                    Admit::Unfair => refused[2] += 1,
+                    Admit::NeedGrow(n) => cap = n,
+                }
+            }
+        }
+        // The fairness rule did the refusing, and it left the last quarter alone.
+        assert!(refused[2] > 0, "NvHdlFRef must be reachable");
+        assert!(live <= b.global_max * 3 / 4 + 4, "hostile took {live}");
+        assert!(hostile.iter().all(|&n| n <= b.per_owner_max));
+        // A fresh owner (nothing held) gets slots, many of them.
+        let mut mine = 0usize;
+        for _ in 0..1000 {
+            if let Some(n) = want_capacity(&b, cap, live) {
+                cap = n;
+            }
+            match admit(&b, cap, live, mine) {
+                Admit::Ok => {
+                    mine += 1;
+                    live += 1;
+                }
+                other => panic!("the fresh owner was refused at {mine}: {other:?}"),
+            }
+        }
+        // ... and up to just below the fair share, whatever the others hold.
+        while mine < b.global_max / 8 - 1 {
+            match admit(&b, cap, live, mine) {
+                Admit::Ok => {
+                    mine += 1;
+                    live += 1;
+                }
+                other => panic!("the fresh owner was refused at {mine}: {other:?}"),
+            }
+        }
+        assert!(live <= b.global_max);
     }
 
     #[test]

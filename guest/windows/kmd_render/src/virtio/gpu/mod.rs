@@ -2377,7 +2377,7 @@ pub struct VirtioGpu {
     scanout_release: bool,
     /// Backend RM handles opened through HELIOS_ESCAPE_NVRM, tagged with the
     /// owning device so a process cannot name another's, and closed at device
-    /// teardown. Starts at NVRM_HANDLES_INITIAL slots and grows (PASSIVE, outside the lock:
+    /// teardown. Starts at 1024 slots and grows (PASSIVE, outside the lock:
     /// `grow_nvrm_tables`) to MAX_NVRM_HANDLES. See `nvrm_tables`.
     nvrm_handles: Vec<nvrm_tables::NvrmHandleSlot>,
     /// Slots reserved by in-flight forwarded `Open`s.
@@ -2397,7 +2397,7 @@ pub struct VirtioGpu {
     nvrm_fences: Box<helios_kmd_logic::nvrm_fence::FenceBook>,
     /// Live HELIOS_NVRM_OP_MMAP mappings (the host's mapping id, the handle it
     /// belongs to, the owner), so `Close` and device teardown can send the host
-    /// `Munmap`. Starts at NVRM_MAPS_INITIAL slots and grows to MAX_NVRM_MAPS (like
+    /// `Munmap`. Starts at 1024 slots and grows to MAX_NVRM_MAPS (like
     /// `nvrm_handles`). The user view itself is in
     /// `AdapterContext::mappings`, under the key `nvrm::map_key(mapping_id)`.
     nvrm_maps: Vec<nvrm_tables::NvrmMapSlot>,

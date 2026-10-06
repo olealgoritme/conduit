@@ -29,22 +29,19 @@ use helios_kmd_logic::rm_limits::{self, Admit, Bounds};
 use helios_kmd_logic::rm_window::{self, Account, Policy};
 use helios_kmd_logic::sweep_budget::{PinAction, PinFate};
 
-/// The sanity bounds of the handle and mapping tables, and where they start. The tables
-/// GROW from `NVRM_*_INITIAL` (what they always held) up to the global bound, at PASSIVE and
-/// outside the lock (`grow_nvrm_tables`); the bounds are far above anything a real client
-/// reaches and are there so a hostile process cannot take the non-paged pool. A bound that
-/// is hit is counted (`NvHdlORef`, `NvHdlGRef`, `NvHdlFRef`, `NvMapTRef`, `NvSanityRef`).
-/// `NvWinPolicy` = 0 puts the old fixed numbers back (`LEGACY_*`), nothing grows.
-/// Rules: `helios_kmd_logic::rm_limits`; the table: `docs/nvrm-escape.md` section 5.
+/// The sanity bounds of the handle and mapping tables, and where they start: the shapes are
+/// `helios_kmd_logic::rm_limits::{HANDLES, MAPS}` (host-tested there). The tables GROW from
+/// 1024 slots (what they always held) up to the global bound, at PASSIVE and outside the lock
+/// (`grow_nvrm_tables`); the bounds are far above anything a real client reaches and are there
+/// so a hostile process cannot take the non-paged pool. A bound that is hit is counted
+/// (`NvHdlORef`, `NvHdlGRef`, `NvHdlFRef`, `NvMapTRef`, `NvSanityRef`). `NvWinPolicy` = 0 puts
+/// the old fixed numbers back (`rm_limits::*_LEGACY`), nothing grows. The table:
+/// `docs/nvrm-escape.md` section 5.
 ///
 /// Backend handles tracked across every process (fence handles included), at most.
-pub const MAX_NVRM_HANDLES: usize = 16_384;
+pub const MAX_NVRM_HANDLES: usize = rm_limits::HANDLES.global_max;
 /// Most one process may hold open at once (`QUERY_CAPS` reports the bound in force).
-pub const MAX_NVRM_HANDLES_PER_OWNER: usize = 4_096;
-/// Slots the handle table starts with.
-pub const NVRM_HANDLES_INITIAL: usize = 1_024;
-/// Slots the handle table keeps free before it grows.
-const NVRM_HANDLES_HEADROOM: usize = 16;
+pub const MAX_NVRM_HANDLES_PER_OWNER: usize = rm_limits::HANDLES.per_owner_max;
 /// Most fence handles the KMD holds at once as its own (attached to a present, or
 /// discarded and owed a `Close`), across every process. A fence moves out of its
 /// creator's per-process quota when the KMD takes it, and into this one: gates hold
@@ -56,16 +53,8 @@ pub const MAX_NVRM_ATTACHED_FENCES: usize = 512;
 /// views live in `AdapterContext::mappings`, one adapter-wide table of 8192 entries shared
 /// with every blob view (`mapping.rs`, `MAX_MAPPINGS`): a bound above it could never be
 /// reached, so this is it (a view refused there is counted as `NvWinRTab`).
-pub const MAX_NVRM_MAPS: usize = 8_192;
-pub const MAX_NVRM_MAPS_PER_OWNER: usize = 4_096;
-/// Slots the mapping table starts with.
-pub const NVRM_MAPS_INITIAL: usize = 1_024;
-const NVRM_MAPS_HEADROOM: usize = 16;
-/// The fixed numbers of `NvWinPolicy` = 0.
-const LEGACY_MAX_HANDLES: usize = 1_024;
-const LEGACY_MAX_HANDLES_PER_OWNER: usize = 128;
-const LEGACY_MAX_MAPS: usize = 1_024;
-const LEGACY_MAX_MAPS_PER_OWNER: usize = 256;
+pub const MAX_NVRM_MAPS: usize = rm_limits::MAPS.global_max;
+pub const MAX_NVRM_MAPS_PER_OWNER: usize = rm_limits::MAPS.per_owner_max;
 /// Owners the window account can hold at once (rows), see `rm_window::Account`.
 const NVRM_WINDOW_OWNER_ROWS: usize = 512;
 
@@ -330,31 +319,12 @@ pub(super) fn new_client_table() -> Box<ClientTable> {
     }
 }
 
-/// The handle and mapping tables' bounds for `policy`.
+/// The handle and mapping tables' bounds for `policy` (the shapes live in
+/// `helios_kmd_logic::rm_limits`, where the host tests hold them to their promises).
 pub(super) fn table_bounds(policy: Policy) -> (Bounds, Bounds) {
     match policy {
-        Policy::Dynamic => (
-            Bounds::growing(
-                NVRM_HANDLES_INITIAL,
-                NVRM_HANDLES_HEADROOM,
-                MAX_NVRM_HANDLES,
-                MAX_NVRM_HANDLES_PER_OWNER,
-            ),
-            Bounds::growing(
-                NVRM_MAPS_INITIAL,
-                NVRM_MAPS_HEADROOM,
-                MAX_NVRM_MAPS,
-                MAX_NVRM_MAPS_PER_OWNER,
-            ),
-        ),
-        Policy::Legacy => (
-            Bounds::fixed(
-                LEGACY_MAX_HANDLES,
-                LEGACY_MAX_HANDLES,
-                LEGACY_MAX_HANDLES_PER_OWNER,
-            ),
-            Bounds::fixed(LEGACY_MAX_MAPS, LEGACY_MAX_MAPS, LEGACY_MAX_MAPS_PER_OWNER),
-        ),
+        Policy::Dynamic => (rm_limits::HANDLES, rm_limits::MAPS),
+        Policy::Legacy => (rm_limits::HANDLES_LEGACY, rm_limits::MAPS_LEGACY),
     }
 }
 
