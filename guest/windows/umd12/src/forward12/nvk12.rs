@@ -10,7 +10,7 @@
 //! has no RM-fence boundary yet (S4), and an `HE12` record without a stream is
 //! refused at Render. So this driver orders the context itself:
 //!
-//! * **Monitored fence** (`Nvk12EclSync=0`, the default). Each queue owns one
+//! * **Monitored fence** (`Nvk12EclSync=0`; off by default since it deadlocked Basemark DX12). Each queue owns one
 //!   WDDM monitored fence created through the kernel callbacks. Every NVK
 //!   boundary appends, on the queue's own context, the runtime admission event
 //!   (exactly as on Venus) followed by a GPU wait for the fence to reach the
@@ -19,7 +19,7 @@
 //!   runtime queues on the context afterwards -- the app's fence signals, its
 //!   presents, DWM's view of them -- waits behind the real GPU work; the app
 //!   thread never blocks.
-//! * **CPU wait** (`Nvk12EclSync=1`, or if the fence cannot be created). After
+//! * **CPU wait** (`Nvk12EclSync=1`, the default, or if the fence cannot be created). After
 //!   the admission event, the DDI waits for the boundary on the calling thread.
 //!   A wait-before-signal pattern (Queue::Wait on a fence the app signals after
 //!   ExecuteCommandLists returns) would deadlock that wait, so it is capped at
@@ -297,17 +297,19 @@ impl FenceArm {
 }
 
 /// The per-queue worker: wait for each handed value on the engine's execution
-/// stream, then signal the fence to it. Values arrive in increasing order; a
-/// burst is coalesced to its maximum (signalling a value implies every smaller
-/// one). On device loss the value is signalled anyway, so the context never
-/// waits for work that will not finish (the device is removed and the runtime
-/// reports it).
+/// stream, then signal the fence to it, strictly in order. On device loss the
+/// value is signalled anyway, so the context never waits for work that will
+/// not finish (the device is removed and the runtime reports it).
+///
+/// ⛔ Never coalesce a burst to its maximum before waiting. Boundary N+1's
+/// engine work is released by its admission event, which the runtime queued on
+/// the context AFTER the GPU wait for boundary N's fence value. A worker that
+/// waits for N+1 first therefore waits for work that cannot start until it
+/// signals N: Basemark GPU DX12 deadlocked after its first frame exactly like
+/// that (2026-10-06). Values already reached cost one cheap wait each.
 fn worker_main(engine_queue: usize, target: SignalTarget, rx: Receiver<u64>, stop: Arc<AtomicBool>) {
     let mut signalled = 0u64;
-    while let Ok(mut value) = rx.recv() {
-        while let Ok(next) = rx.try_recv() {
-            value = value.max(next);
-        }
+    while let Ok(value) = rx.recv() {
         if value <= signalled {
             continue;
         }
