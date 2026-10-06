@@ -1,0 +1,332 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 03:13:30 +0200
+Subject: [PATCH] nvk/rm: host-visible VRAM (a BAR heap)
+
+Expose a DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT memory type on a heap
+of its own, backed by VRAM the CPU maps through BAR1, as NVK on nouveau
+(without ReBAR) and NVIDIA's driver do.  Without it, DXVK and other apps
+keep the buffers they stream into every frame (constants, dynamic vertex
+and index buffers, upload rings) in system memory, and the GPU reads them
+over PCIe on every draw.
+
+- pdev: bar_size_B = min(NVK_RM_BAR_MB (default 256, 0 = off), BAR1/2),
+  from NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE, which was already queried.
+  BAR1 is not all ours: RM keeps part of it, and under Conduit every CPU
+  mapping of GPU memory in the guest shares one host-visible window
+  (1 GiB by default).  NVK's other mappable memory is its own system pages
+  and does not use that window.
+- New nvkmd_info::host_visible_vram_is_pinned: NVK asks for NVKMD_MEM_VRAM
+  for allocations from the host-visible VRAM type.  The RM backend keeps
+  placing NVKMD_MEM_LOCAL | CAN_MAP (NVK's own mapped buffers: push,
+  queries, events, upload queue) in system memory, so only that type
+  lands in the BAR heap.  nouveau does not set the flag; no change there.
+- mem: NVKMD_MEM_VRAM | CAN_MAP is vidmem allocated without
+  MAP_NOT_REQUIRED, CPU-mapped once at allocation (crm_map_memory, BAR1,
+  write-combined) and kept mapped until it is freed.  Internal and client
+  maps alias that mapping, so apps that map and unmap per frame cost
+  nothing.  The heap size is enforced per device: an allocation that does
+  not fit fails with VK_ERROR_OUT_OF_DEVICE_MEMORY, which apps handle by
+  falling back to another type.
+- NVK_DEBUG=vm prints the BAR heap size.
+
+RTX 5090 in a Windows guest (KMD 22.22.309): heaps 0: 32146 MiB VRAM,
+1: 256 MiB VRAM (BAR), 2: 15356 MiB sysmem; types 0: DEVICE_LOCAL,
+1: DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT, 2: HOST_VISIBLE |
+HOST_COHERENT | HOST_CACHED.  A 16 MiB allocation including its mapping
+takes ~2 ms; map/unmap afterwards 0.02 us; CPU writes ~1.7 GB/s.
+---
+ src/nouveau/vulkan/nvk_device_memory.c      |  6 ++
+ src/nouveau/vulkan/nvkmd/nvkmd.h            |  7 ++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      | 13 ++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c  | 83 +++++++++++++++++++--
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c | 32 ++++++--
+ 5 files changed, 129 insertions(+), 12 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
+index 46efbb9..0e13ecf 100644
+--- a/src/nouveau/vulkan/nvk_device_memory.c
++++ b/src/nouveau/vulkan/nvk_device_memory.c
+@@ -203,6 +203,12 @@ nvk_AllocateMemory(VkDevice device,
+       }
+    }
+ 
++   const VkMemoryPropertyFlags bar_type_flags =
++      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
++   if (pdev->nvkmd->kmd_info.host_visible_vram_is_pinned &&
++       (type->propertyFlags & bar_type_flags) == bar_type_flags)
++      pinned_to_vram = true;
++
+    const enum nvkmd_mem_flags flags =
+       nvk_memory_type_flags(type, handle_types, pinned_to_vram);
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
+index 9cb83f6..3d6229b 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+@@ -125,6 +125,13 @@ struct nvkmd_info {
+ 
+    /** VRAM may be mapped by the CPU (exposes a host-visible VRAM type) */
+    bool has_host_visible_vram;
++
++   /** Allocations from the host-visible VRAM type must ask for
++    *  NVKMD_MEM_VRAM: the backend places NVKMD_MEM_LOCAL | NVKMD_MEM_CAN_MAP
++    *  (NVK's own mapped buffers) in system memory, and only that type is
++    *  backed by BAR-mapped VRAM.
++    */
++   bool host_visible_vram_is_pinned;
+ };
+ 
+ struct nvkmd_pdev_ops {
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index c2d0625..5751e9a 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -214,6 +214,13 @@ struct nvkmd_rm_dev {
+    struct util_vma_heap replay_heap;
+ 
+    struct nvkmd_rm_sema_pool sema_pool;
++
++   /* Host-visible VRAM (the BAR heap): bytes of CPU-mapped VRAM currently
++    * allocated, against dev_info.bar_size_B.  Every such allocation keeps
++    * one BAR1 mapping for its whole life (under Conduit the mapping sits in
++    * the shared host-visible window, which is not free to set up).
++    */
++   uint64_t bar_used_B;
+ };
+ 
+ NVKMD_DECL_SUBCLASS(dev, rm);
+@@ -239,6 +246,12 @@ struct nvkmd_rm_mem {
+     */
+    void *os_pages;
+ 
++   /* Host-visible VRAM: the persistent BAR1 mapping made at allocation
++    * time.  Internal and client maps alias it, so mapping and unmapping it
++    * again (per frame, say) costs nothing.
++    */
++   void *bar_map;
++
+    /* Imported from a dma-buf: h_memory came from
+     * NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD and its handle was
+     * reserved with crm_new_handle.
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 8d40c66..4fbad77 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -6,6 +6,7 @@
+ #include "nvkmd_rm.h"
+ 
+ #include "util/log.h"
++#include "util/u_atomic.h"
+ #include "util/os_misc.h"
+ #include "util/u_math.h"
+ #include "vk_log.h"
+@@ -25,11 +26,38 @@
+  *    pages cannot be handed to another RM client.
+  *  - Everything else that may live in VRAM is NV01_MEMORY_LOCAL_USER with
+  *    64 KiB pages.  RM does not migrate it, so NVKMD_MEM_LOCAL means VRAM.
+- *  - VRAM which must be CPU-mapped (NVKMD_MEM_VRAM | CAN_MAP, which NVK
+- *    only asks for when has_host_visible_vram is set) goes through a BAR1
+- *    mapping from crm_map_memory.
++ *  - VRAM which must be CPU-mapped (NVKMD_MEM_VRAM | CAN_MAP: allocations
++ *    from the DEVICE_LOCAL | HOST_VISIBLE memory type, which NVK pins to
++ *    VRAM because host_visible_vram_is_pinned is set) is the BAR heap.  It
++ *    is mapped through BAR1 (crm_map_memory) once, when it is allocated, and
++ *    stays mapped until it is freed: under Conduit a mapping is a trip to
++ *    the host and a slot in the shared window, so apps that map and unmap
++ *    per frame must not pay for it each time.  The heap's size,
++ *    dev_info.bar_size_B, is enforced here.
+  */
+ 
++static bool
++bar_reserve(struct nvkmd_rm_dev *dev, uint64_t size_B)
++{
++   const uint64_t limit_B = dev->base.pdev->dev_info.bar_size_B;
++   uint64_t used = p_atomic_read(&dev->bar_used_B);
++   for (;;) {
++      if (size_B > limit_B || used > limit_B - size_B)
++         return false;
++      const uint64_t seen =
++         p_atomic_cmpxchg(&dev->bar_used_B, used, used + size_B);
++      if (seen == used)
++         return true;
++      used = seen;
++   }
++}
++
++static void
++bar_release(struct nvkmd_rm_dev *dev, uint64_t size_B)
++{
++   p_atomic_add(&dev->bar_used_B, -(int64_t)size_B);
++}
++
+ static VkResult
+ alloc_os_pages(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+                uint64_t size_B, uint32_t *h_memory_out, void **pages_out)
+@@ -204,9 +232,35 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    if (mem == NULL)
+       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
++   /* The BAR heap: VRAM the CPU maps (see the placement policy) */
++   const bool bar = vram && (flags & NVKMD_MEM_VRAM) &&
++                    (flags & NVKMD_MEM_CAN_MAP);
++   if (bar && !bar_reserve(dev, size_B)) {
++      FREE(mem);
++      return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "host-visible VRAM heap full (%" PRIu64 " of %" PRIu64
++                       " MiB used, NVK_RM_BAR_MB)",
++                       p_atomic_read(&dev->bar_used_B) >> 20,
++                       dev_info->bar_size_B >> 20);
++   }
++
+    if (vram) {
+       result = alloc_rm_memory(dev, log_obj, true, size_B, align_B,
+                                flags & NVKMD_MEM_CAN_MAP, &mem->h_memory);
++      if (result == VK_SUCCESS && bar) {
++         result = NVKMD_RM_CHECK(dev->lib, log_obj,
++                                 VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                                 dev->lib->map_memory(dev->client,
++                                    dev->h_device, mem->h_memory, 0, size_B,
++                                    NVRM_DEF(OS33, _FLAGS, _ACCESS,
++                                             _READ_WRITE),
++                                    &mem->bar_map),
++                                 "map host-visible VRAM");
++         if (result != VK_SUCCESS) {
++            mem->bar_map = NULL;
++            nvkmd_rm_free_memory(dev, mem->h_memory);
++         }
++      }
+    } else {
+       result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+       if (!force_rm_sysmem) {
+@@ -221,7 +275,7 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+       }
+    }
+    if (result != VK_SUCCESS)
+-      goto fail_mem;
++      goto fail_bar;
+ 
+    mem->vram = vram;
+    mem->pte_kind = pte_kind;
+@@ -257,10 +311,15 @@ fail_va:
+    nvkmd_va_free(mem->base.va);
+ fail_rm:
+    simple_mtx_destroy(&mem->export_mutex);
++   if (mem->bar_map != NULL)
++      dev->lib->unmap_memory(dev->client, dev->h_device, mem->h_memory,
++                             mem->bar_map, size_B, 0);
+    nvkmd_rm_free_memory(dev, mem->h_memory);
+    if (mem->os_pages != NULL)
+       dev->lib->free_pages(dev->client, mem->os_pages, size_B);
+-fail_mem:
++fail_bar:
++   if (bar)
++      bar_release(dev, size_B);
+    FREE(mem);
+ 
+    return result;
+@@ -282,6 +341,12 @@ nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
+       nvkmd_rm_close_gem(dev, mem->gem_handle);
+    simple_mtx_destroy(&mem->export_mutex);
+ 
++   if (mem->bar_map != NULL) {
++      dev->lib->unmap_memory(dev->client, dev->h_device, mem->h_memory,
++                             mem->bar_map, mem->base.size_B, 0);
++      bar_release(dev, mem->base.size_B);
++   }
++
+    nvkmd_rm_free_memory(dev, mem->h_memory);
+    if (mem->imported && dev->lib->release_handle != NULL)
+       dev->lib->release_handle(dev->client, mem->h_memory);
+@@ -311,6 +376,12 @@ nvkmd_rm_mem_map(struct nvkmd_mem *_mem,
+       return VK_SUCCESS;
+    }
+ 
++   if (mem->bar_map != NULL) {
++      /* Host-visible VRAM: the persistent BAR1 mapping */
++      *map_out = mem->bar_map;
++      return VK_SUCCESS;
++   }
++
+    uint32_t access;
+    if ((map_flags & NVKMD_MEM_MAP_RDWR) == NVKMD_MEM_MAP_RD)
+       access = NVRM_DEF(OS33, _FLAGS, _ACCESS, _READ_ONLY);
+@@ -342,7 +413,7 @@ nvkmd_rm_mem_unmap(struct nvkmd_mem *_mem,
+    struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
+    struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
+ 
+-   if (mem->os_pages != NULL)
++   if (mem->os_pages != NULL || mem->bar_map != NULL)
+       return;
+ 
+    dev->lib->unmap_memory(dev->client, dev->h_device, mem->h_memory,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index 5bd60c8..e884461 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -232,14 +232,31 @@ fill_device_info(struct nvkmd_rm_pdev *pdev,
+     */
+    uint64_t heap_KiB = fb_info_get(fb, NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE);
+    uint64_t ram_KiB = fb_info_get(fb, NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE);
++   uint64_t bar1_KiB = fb_info_get(fb, NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE);
+    info->vram_size_B = (heap_KiB ? heap_KiB : ram_KiB) * 1024;
+    free(fb);
+ 
+-   /* CPU-mappable memory is backed by system pages in this backend (CPU
+-    * maps of VRAM go through BAR1 and, under Conduit, through a small
+-    * shared window), so don't advertise a BAR heap.
++   /* Host-visible VRAM (a DEVICE_LOCAL | HOST_VISIBLE memory type on its own
++    * heap, as NVK on nouveau without ReBAR and NVIDIA's driver have), so
++    * that apps put the buffers they stream into from the CPU (constants,
++    * vertices, upload rings) in VRAM rather than in system memory the GPU
++    * reads over PCIe.  Each allocation is CPU-mapped once, through BAR1, for
++    * its whole life (nvkmd_rm_mem.c).
++    *
++    * Most of BAR1 is not ours to hand out: RM keeps part of it, and under
++    * Conduit every CPU mapping of GPU memory, from every process in the
++    * guest, lands in one shared host-visible window (1 GiB by default).
++    * NVK's other mappable memory is our own system pages and does not use
++    * it.  So the heap is a budget, NVK_RM_BAR_MB (default 256, 0 turns it
++    * off), clamped to half of BAR1.
+     */
+-   info->bar_size_B = 0;
++   const int64_t bar_cap_MB = debug_get_num_option("NVK_RM_BAR_MB", 256);
++   const uint64_t bar_cap_B = bar_cap_MB > 0 ? (uint64_t)bar_cap_MB << 20 : 0;
++   const uint64_t bar1_B = bar1_KiB * 1024;
++   info->bar_size_B = MIN2(bar_cap_B, bar1_B / 2);
++   info->bar_size_B &= ~((uint64_t)NVKMD_RM_BIG_PAGE_SIZE - 1);
++   if (info->bar_size_B >= info->vram_size_B)
++      info->bar_size_B = 0; /* would read as a full BAR; not what this is */
+ 
+    NV2080_CTRL_GR_GET_INFO_V2_PARAMS gr = { 0 };
+    gr.grInfoListSize = 2;
+@@ -357,7 +374,8 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+       .has_map_fixed = false,
+       .has_overmap = false,
+       .has_compression = false,
+-      .has_host_visible_vram = false,
++      .has_host_visible_vram = pdev->base.dev_info.bar_size_B > 0,
++      .host_visible_vram_is_pinned = true,
+    };
+ 
+    /* VRAM is allocated with 64 KiB pages; system memory BOs get their own
+@@ -376,13 +394,15 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+    if (debug_flags & NVK_DEBUG_VM) {
+       fprintf(stderr, "NVK: RM GPU %u: %s (%s, chipset 0x%x) 3d %04x "
+               "compute %04x copy %04x gpfifo %04x usermode %04x "
+-              "vram %" PRIu64 " MiB, %u GPCs, %u TPCs\n",
++              "vram %" PRIu64 " MiB, bar heap %" PRIu64 " MiB, "
++              "%u GPCs, %u TPCs\n",
+               pdev->gpu_id, pdev->base.dev_info.device_name,
+               pdev->base.dev_info.chipset_name,
+               pdev->base.dev_info.chipset, pdev->base.dev_info.cls_eng3d,
+               pdev->base.dev_info.cls_compute, pdev->base.dev_info.cls_copy,
+               pdev->base.dev_info.cls_gpfifo, pdev->cls_usermode,
+               pdev->base.dev_info.vram_size_B >> 20,
++              pdev->base.dev_info.bar_size_B >> 20,
+               pdev->base.dev_info.gpc_count, pdev->base.dev_info.tpc_count);
+    }
+ 
+-- 
+2.43.0
+
