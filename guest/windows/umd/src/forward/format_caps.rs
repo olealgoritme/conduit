@@ -315,41 +315,9 @@ pub(crate) unsafe extern "system" fn check_format_support(
             "FormatSupport(WDDM2) fmt={fmt} api=0x{raw_caps:08x} support2=0x{support2:08x} ddi=0x{caps:08x}"
         );
     }
-    // D3D11_1DDI_FORMAT_SUPPORT_SHAREABLE for the shared-format table
-    // (docs/shared-formats.md): the runtime requires it of a texture created
-    // with MISC_SHARED_NTHANDLE whose format is not in its always-shareable
-    // set (BGRA8, RGBA8, 10:10:10:2, fp16), and DXVK never reports it. Both
-    // backends share these: Venus through its opaque export, NVK through the
-    // KMD's shared-format records. Without it R16G16, B5G6R5, R8G8, ... fail
-    // CreateTexture2D with E_INVALIDARG on NT handles (KMT handles never ask).
-    if caps != 0 && caps != DDI_FORMAT_SUPPORT_NOT_SUPPORTED && shared_table_format(fmt) {
-        caps |= DDI_FORMAT_SUPPORT_SHAREABLE;
-    }
     if !out.is_null() {
         *out = caps;
     }
-}
-
-/// `D3D11_1DDI_FORMAT_SUPPORT_SHAREABLE` (d3d10umddi.h).
-const DDI_FORMAT_SUPPORT_SHAREABLE: u32 = 0x0000_0800;
-
-/// DXGI formats a shared texture may have (docs/shared-formats.md section 2).
-pub(crate) fn shared_table_format(fmt: ddi::DXGI_FORMAT) -> bool {
-    matches!(
-        fmt,
-        9..=14          // R16G16B16A16_*
-        | 23..=25       // R10G10B10A2_*
-        | 27..=32       // R8G8B8A8_*
-        | 33..=38       // R16G16_*
-        | 48..=52       // R8G8_*
-        | 53..=59       // R16_*
-        | 60..=65       // R8_*, A8_UNORM
-        | 85 | 86       // B5G6R5, B5G5R5A1
-        | 87..=88 | 90..=93 // B8G8R8A8/X8 (typeless, SRGB)
-        | 103..=105     // NV12, P010, P016
-        | 107           // YUY2
-        | 115           // B4G4R4A4
-    )
 }
 
 /// D3D11 API `D3D11_FORMAT_SUPPORT` / `D3D11_FORMAT_SUPPORT2` bits -> the
@@ -379,7 +347,6 @@ pub(crate) fn api_to_ddi_format_support(api: u32, api2: u32) -> u32 {
         (0x0000_4000, 0x0000_8000), // MULTIPLANE_OVERLAY
         (0x0000_0200, 0x0001_0000), // TILED
         (0x0000_0040, 0x0002_0000), // UAV_TYPED_LOAD -> UAV_READS
-        (0x0004_0000, 0x0000_0800), // SHAREABLE
     ];
     let mut ddi = 0;
     for &(a, d) in MAP {
@@ -407,17 +374,6 @@ mod tests {
         assert_ne!(ddi & 0x1, 0, "SHADER_SAMPLE");
         assert_ne!(ddi & 0x2, 0, "RENDERTARGET");
         assert_eq!(ddi & 0x2_0000, 0, "no typed UAV load without UAV_TYPED_LOAD");
-    }
-
-    #[test]
-    fn shareable_maps_and_the_table_holds_the_shared_formats() {
-        assert_eq!(api_to_ddi_format_support(0, 0x0004_0000), 0x800);
-        for f in [65, 35, 85, 103, 104, 107, 10, 24] {
-            assert!(super::shared_table_format(f), "{f}");
-        }
-        for f in [2, 41, 45, 71, 89] {
-            assert!(!super::shared_table_format(f), "{f}");
-        }
     }
 
     #[test]
