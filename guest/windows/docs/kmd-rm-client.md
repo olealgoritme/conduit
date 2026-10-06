@@ -2168,6 +2168,12 @@ desktop chain) is the protection; the residual hazard is a viewer that still sam
 interval later (tearing, never corruption). The host's release book still sees every flip (`present_within` mints and sends
 through it; `RelMatch` grows); it is not read. Whether the KMD should read it is checklist step 8.
 
+With `FfAsyncWin` (15.18.13) the host's flips are no longer waited for, so the publication can run ahead of the host. The
+exposure is then bounded by the WINDOW, not by the 250 ms round-trip timeout: while the window is full of flips still
+within their timeout the worker does not drain the pending programming slot (`FfDrainHeld`), so DWM cannot cycle its swap
+chain further ahead of what the host has been told than the window (1 to 4 flips). The residual hazard is the same tear
+(never corruption), at most the window deep; the checklist's tearing row (15.18.13.6 step 8) measures it.
+
 Ordering against the NVK rendering is NOT something this arm provides: it flips when dxgkrnl names the allocation, as the
 level 5 arm does. For the DMA-buffer flip the flip's fence retires behind the programming; for the MMIO flip dxgkrnl names
 the allocation after its fence. That the NVK work for the frame is complete by then is the UMD's contract (the
@@ -2481,37 +2487,58 @@ looked at); both are atomics in the tick (`ddi/stall_diag.rs`), mirrored at PASS
 2. **The answer.** `InFlightKind::RawAsync` (`virtio/gpu/mod.rs`): the used-ring drain, at DISPATCH, reads the reply
    header's `status` and writes ONE word to the slot's static cell (`flip_pipeline::pack_reply`), then signals the worker's
    event. No stack waiter is involved, so there is no abandon race: the cell is `'static`, and a slot that timed out stays
-   occupied until its word arrives (a late answer is only counted), so a reused slot is never written by an old flip.
-   The tag in the word (the low 30 bits of the flip's `seq`) also protects against a word from an earlier transport
+   keeps its cell until its word arrives (a late answer is only counted), so a reused cell is never written by an old
+   flip. The tag in the word (the low 30 bits of the flip's `seq`) also protects against a word from an earlier transport
    generation. A dead transport writes "no reply" into every cell (`latch_failed_and_fail_inflight`).
-3. **Settling** (`settle_async`, first thing of the service, whatever else is shown): the accounting the round trip's return
-   did, driven by the answer. A taken flip: release book `sent`, arbiter `flip_done(true)` (the source's lapse is extended
+   **Orphaning.** A flip still unanswered 3 s after its submission (`ORPHAN_AFTER_100NS`) stops counting toward the window
+   (`FfAsOrph`), so a lost reply cannot shrink the window for good: a dead host costs the window three seconds. Its CELL
+   stays reserved: there are 8 cells for a window of at most 4, so a late word cannot land in a cell a newer flip uses.
+   Only when every cell is held does a new flip take over the OLDEST orphan's cell (`FfAsRecyc`); the tag then keeps the
+   orphan's late word from being read as the new flip's answer (what it cannot prevent: an orphan word that lands after
+   the new flip's own answer overwrites it, and that flip then times out, once).
+3. **Settling** (`foreign_flip::settle`, called by the worker loop BEFORE it drains the pending programming, so an answer that
+   frees the window lets the same pass publish the next flip): the accounting the round trip's return did, driven by the
+   answer, **in sequence order** (`Pipeline::settle_all`, not cell order), and with **at most one strike per pass**: of
+   the failures a pass finds only the first costs the presenter a strike, the others owe the frame without one
+   (`FfStrikeSkip`), as the synchronous path spends one strike per attempt and cannot spend three in a pass. In sequence
+   order a later taken flip clears the strikes of an earlier failure (the next success of the synchronous path would); a
+   newer failure is never cleared by an older flip's ack. **Interrupt-loss tolerance:** while a flip waits, the settle
+   first drains the used ring itself (`drain_used_and_complete`, the DPC's routine, which also retires the fences a drain
+   may consume), and the worker arms a 4 ms poll wake while a flip is flying, so a reply that sits in the ring at the
+   250 ms deadline is read, not counted as a timeout. A taken flip: release book `sent`, arbiter `flip_done(true)` (the source's lapse is extended
    from the ACK), `FfFrames`/`FfReflips`, `Presenter::acked` (strikes and retry pause cleared). A refused flip or no
    reply: `scanout_release::gone`, `flip_done(false)`, `FfFlipFail`, `FAIL_UNTIL`, `Presenter::flipped(Failed)` (a strike,
    the frame owed, the 100 ms retry pause), so three in a row still give up (`FfGaveUp`, five seconds on Venus). A flip
    unanswered after `WORKER_FLIP_TIMEOUT_MS`: ONE failure, assumed taken in the release book, as the round trip's timeout
    always was (`FfAsTmo`). A window of slots that are ALL abandoned counts a failure per attempt
    (`Pipeline::stuck`), so a dead host still reaches the three strikes and the Venus fallback.
-4. **Coalescing.** The window bounds what is in flight (`can_submit`). When it is full the frame stays owed
+4. **Backpressure.** The worker loop does not drain `pending_vidpn_allocation` (it calls `foreign_flip::drain_blocked`
+   before `process_deferred_vidpn_source_address`) while the window is full of flips still within their timeout. So the
+   publication cannot run further ahead of the host than the window: DWM, which is paced by dxgkrnl's completion of
+   what it presented, stalls at most for the host's answer (an answer wakes the worker). The window of flips that timed
+   out (abandoned) does NOT hold the drain: the timeout already bounds the wait, and the three-strike fallback needs
+   the programming to go on. The vsync tick keeps waking the worker while the slot is pending, so the first pass after
+   the answer drains it. `FfDrainHeld` counts the loops that held it.
+5. **Coalescing.** The window bounds what is in flight (`can_submit`). When it is full the frame stays owed
    (`FfWinFull`; the presenter is told `Yielded`, no strike) and the pass ends; the answer that frees a slot wakes the
    worker, which then flips the target's CURRENT picture: older pictures were superseded by the single-slot target
    already, nothing is queued. With window 1 and a healthy host that is "at most one flip in flight, the newest wins".
-5. **Pacing.** `Presenter::submitted` commits the surface and the pacing clock at the submit (one flip per refresh period,
+6. **Pacing.** `Presenter::submitted` commits the surface and the pacing clock at the submit (one flip per refresh period,
    as before); the strikes belong to the answers.
-6. **Release and fence rules unchanged.** `scanout_release::minted` at submit, `sent` / `gone` at the answer (the same
+7. **Release and fence rules unchanged.** `scanout_release::minted` at submit, `sent` / `gone` at the answer (the same
    functions through `note_async_result`); reuse is still the conservative rule of 15.18.5 (the displayed address is
    published at programming, nothing waits for `ScanoutReleased`); the stale-file proof is `mint`'s, at submit; the
    epoch of the presenter rides on the slot so an answer of an earlier epoch does not strike a new presenter; the ring
    presenter's waits (`RelRWaits`) are not involved (a ring of one, no copies).
-7. **Early wake** (the same knob; atomics and one DPC request only): the MMIO DDI at DIRQL asks for the DPC
+8. **Early wake** (the same knob; atomics and one DPC request only): the MMIO DDI at DIRQL asks for the DPC
    (`DxgkCbQueueDpc`, legal at DIRQL) right after it swaps the pending slot, and the DPC wakes the worker when a
    programming is pending (`FfEarlyQ`, `FfEarlyWake`); the vsync tick wakes it for a pending programming with the delivery
    gate closed (`FfGateWake`). The worker then publishes a flip within its own latency (tens of microseconds) instead of at
    the next tick.
 
-What the window does NOT change: publication (`take`) never depended on the host; what is removed is the worker being busy
-inside a round trip when the next programming is waiting. A host that stalls for 100 ms now costs 100 ms of stale picture
-and a counted flip, not 100 ms of every publication.
+What the window changes: publication (`take`) never depended on the host; what is removed is the worker being busy inside
+a round trip when the next programming is waiting. A host that stalls for 100 ms now costs a stale picture and a counted
+flip; DWM waits at most for the window to drain (backpressure), and for no longer than the round trip's 250 ms timeout.
 
 **Host changes: none required.** The host replies to every `ScanoutFlip` today and the reply is what the guest now reads
 asynchronously, so the design works against the current host at its best pipelining (window 1 to 4 over a single in-order
@@ -2528,6 +2555,9 @@ coalesces already; this only helps the window). Neither is built; `host/` is unt
 | `FfAsSub` / `FfAsAck` / `FfAsFail` / `FfAsTmo` / `FfAsLate` | flips submitted / taken / refused or no reply / unanswered within 250 ms / answers after a timeout | `FfAsSub = FfAsAck` (+ the few in flight); the rest 0 |
 | `FfWinFull` / `FfAsQFull` / `FfAsHigh` | frames kept owed because the window was full / submits that found the control queue full / most flips in flight | small / 0 / at most the window |
 | `FfRttN`, `FfRttUsSum`, `FfRttUsMax` | host round trip in microseconds as the worker saw it, in BOTH modes (sync: the whole `present_within`; async: submit to the pass that read the answer): count, sum (wraps at 2^32 us, 71 minutes), maximum | mean = Sum / N: a healthy host 200 to 1500 us; Max below 20 ms |
+| `FfAsOrph` / `FfAsRecyc` | flips given up on after 3 s (no longer in the window) / orphaned cells a newer flip took over | 0 / 0 |
+| `FfStrikeSkip` | failures in the same pass as another, which cost no strike | 0 |
+| `FfDrainHeld` | worker loops that left the pending programming undrained because the window was full of flips in flight (the backpressure) | small: a loop or two per flip at most; a count near `FfProg` times 10 means the host's RTT is the pacing |
 | `FfEarlyQ` / `FfEarlyWake` / `FfGateWake` | DPCs requested by the DDI at DIRQL / DPCs that woke the worker for a pending programming / ticks that did with the gate closed | `FfEarlyQ` near `FfProg`; `FfGateWake` small |
 | `VsTickN` / `VsOffN` (service key, `VpVsN` dump) | vsync timer ticks / of which with the delivery gate closed | `VsTickN` at the refresh rate |
 
@@ -2551,23 +2581,35 @@ Always use the lowest mode first: 1920x1080 at 60 Hz, then the larger modes and 
    restart the device (once per generation). `FfAsyWin=1`. Repeat step 1: `FfAsSub` grows and equals `FfAsAck` within the
    in-flight count (`FfAsHigh` 1), `FfAsFail`, `FfAsTmo`, `FfAsLate`, `FfAsQFull` 0, `FfFlipFail` 0, `FfWinFull` 0
    to small (nonzero means the RTT exceeded a frame period and frames coalesced). `FfFrames + FfReflips` matches `FfAsAck`.
-   `FfEarlyQ` about `FfProg`; `FfEarlyWake` at most `FfEarlyQ`. The picture must be as smooth as step 1 or smoother, with no
-   new tear (15.18.11 step 8: `RelMatch`, `RelDrop` as in the baseline) and no stale frame after the motion stops (the
-   last flip must reach the host: the viewer shows the final position; if it shows the one before, report `FfWinFull`).
+   `FfEarlyQ` about `FfProg`; `FfEarlyWake` at most `FfEarlyQ`; `FfAsOrph`, `FfAsRecyc`, `FfStrikeSkip` 0. The picture must
+   be as smooth as step 1 or smoother and show no stale frame after the motion stops (the last flip must reach the
+   host: the viewer shows the final position; if it shows the one before, report `FfWinFull`). Tearing is step 8.
 4. **Window 2 to 4.** Only if step 3 shows `FfWinFull` growing: `FfAsyncWin` 2, then 4; `FfAsHigh` reaches the window.
    More than 1 in flight lets a RTT longer than the period be hidden; it does not shorten the RTT.
 5. **240 Hz** (after 60 and 144 pass): the mode at 240 Hz. Targets: `FfProg` up to 240 per second under motion, `VsTickN` 240
    per second, `FfRttUsSum / FfRttN` under 4 ms (above it the window must be 2 or more and `FfWinFull` stays small),
    `FfAsFail`, `FfAsTmo`, `FfGaveUp` 0, `FkKeep` stable, no `FfRef13`.
-6. **Host stall.** Stop the host's viewer or pause the backend for 2 s and resume: with the window on, DWM must not stall
-   (`FlipPub` keeps advancing, `VsPendN` small), `FfAsTmo` grows by one per stuck slot, `FfAsLate` follows when the host
-   resumes, `FfFlipFail` up to 3 and `FfGaveUp` at most 1 (the Venus fallback, then back after five seconds).
+6. **Stalled host (the row that proves the fixes).** With the window on (1, then 2), pause the backend for 2 s and resume.
+   Expect: DWM waits for the window, not for the stall (`FfDrainHeld` climbs while the host is paused, `VsPendN` large
+   only during it, `FlipPub` advances again within a tick of the first answer); one `FfAsTmo` per flip in flight at
+   the 250 ms mark (the timeout is read AFTER a drain: a reply already in the used ring is not a timeout, so a host that
+   answers just before 250 ms gives `FfAsAck`, not `FfAsTmo`); `FfFlipFail` and strikes at most 1 per pass
+   (`FfStrikeSkip` explains any difference between `FfAsTmo + FfAsFail` and `FfFlipFail` strikes), `FfGaveUp` at most 1
+   (the Venus fallback for five seconds); `FfAsLate` follows when the host resumes. Then pause it for 5 s: `FfAsOrph`
+   rises about 3 s after the first stuck flip and the window is usable again (`FfAsSub` grows with the fallback
+   restarted); `FfAsRecyc` stays 0 unless more than 8 flips were lost.
 7. **Fallback.** `FfAsyncWin` removed or 0 and a device restart: `FfAsyWin=0`, `FfAsSub=0`, the flips are round trips again
    (`FfRttN` grows with `FfFrames`).
+8. **Tearing with the window** (the exposure of 15.18.5, now bounded by the window): drag a window over a moving video for
+   a minute at window 1, 2 and 4, and at the synchronous baseline; count visible tears each time and read `RelMatch`,
+   `RelDrop`, `FfDrainHeld`. Expect no more tears than the baseline at window 1 and 2; if tears grow with the window, the
+   window is the exposure and the answer is the smallest window that keeps `FfWinFull` small. Report the counts before the knob
+   is recommended on.
 
 Verified here: the pure window, slot lifecycle, acknowledgement word and the presenter's submit / answer split
 (`kmd_logic`, new tests in `flip_pipeline.rs` and `rm_present.rs`); the counter names (length, uniqueness, one writer file,
-the lists); the whole tree parses and type-checks against a stub harness for everything but the WDK's own types. NOT verified:
+the lists), the orphan age, the cell recycling and its tag check, the sequence order, the one-strike rule and the
+backpressure predicate (`flip_pipeline.rs`); the whole tree parses and type-checks against a stub harness for everything but the WDK's own types. NOT verified:
 anything that runs: that the drain's new arm and the DPC wake behave on a real queue, that `DxgkCbQueueDpc` from inside the
 MMIO flip's `DxgkCbSynchronizeExecution` callback is accepted at DIRQL (it is documented callable from the ISR, which is also
 DIRQL), the host's RTT, the effect on smoothness. Risks: a new `InFlightKind` in the transport's drain (a bug there is a
