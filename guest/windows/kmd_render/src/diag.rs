@@ -631,6 +631,14 @@ pub mod knobs {
     /// (`helios_kmd_logic::nvrm_fastpath::spin`). Read once, at the first forward;
     /// the outcome is mirrored in `NvSpinHit` / `NvSpinMis`.
     pub const NV_SPIN_US: KnobName = KnobName::new(b"NvSpinUs");
+    /// `NvDupHarden` (default 1). Cross-client hardening of forwarded RM ioctls
+    /// (`virtio::nvrm_harden`, `docs/nvrm-escape.md` section 12): every RM client and
+    /// backend handle a forwarded `Ioctl` names must be the calling process's own.
+    /// 1 = enforce (the request is refused, `NvDupDeny` / `NvRef`), 0 = off (nothing is
+    /// recorded or checked: the behaviour before the hardening), 2 = log-only (everything
+    /// is recorded and checked, what mode 1 would refuse is counted in `NvDupWould` and
+    /// forwarded). Any other value enforces. Read once per boot.
+    pub const NV_DUP_HARDEN: KnobName = KnobName::new(b"NvDupHarden");
     /// Segment topology. Legal values 0 and 10 only — see `BarSegTopology`.
     pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
     /// CpuVisible cached-allocation kill switch (default 1 = cached).

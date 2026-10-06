@@ -22,6 +22,7 @@
 
 use super::*;
 use alloc::boxed::Box;
+use helios_kmd_logic::nvrm_clients::{ClientTable, Commit, Verdict};
 use helios_kmd_logic::nvrm_fence::{is_fence as is_fence_type, Noted, DEVICE_TYPE_FENCE};
 use helios_kmd_logic::rm_fence_present::{same_process, Attach, FenceMeta};
 use helios_kmd_logic::sweep_budget::{PinAction, PinFate};
@@ -282,7 +283,79 @@ pub(super) fn new_fence_book() -> Box<helios_kmd_logic::nvrm_fence::FenceBook> {
     Box::new(helios_kmd_logic::nvrm_fence::FenceBook::new())
 }
 
+/// Build the client table in its own (popped) frame; see the field's comment.
+#[inline(never)]
+pub(super) fn new_client_table() -> Box<ClientTable> {
+    Box::new(ClientTable::new())
+}
+
 impl VirtioGpu {
+    // ---- RM clients (cross-client hardening) -----------------------------------------
+    //
+    // `kmd_logic::nvrm_clients` holds the rules; these are the table's doors, all short and
+    // allocation-free (they run under the virtio spinlock). The glue is
+    // `virtio/nvrm_harden.rs`.
+
+    /// Judge a forwarded `Ioctl` request of `owner` on a backend file of `device_type`:
+    /// does every client and backend handle it names belong to `owner`? Called in the
+    /// same lock hold that resolved the file's `device_type`.
+    pub fn nvrm_judge(&self, owner: DeviceOwner, device_type: u32, req: &[u8]) -> Verdict {
+        helios_kmd_logic::nvrm_clients::judge(
+            &self.nvrm_clients,
+            owner.raw(),
+            device_type,
+            req,
+            |h| self.nvrm_handle_owned(owner, h),
+        )
+    }
+
+    /// Whether `owner` was given RM client `client`.
+    pub fn nvrm_client_owned(&self, owner: DeviceOwner, client: u32) -> bool {
+        self.nvrm_clients.is_client_owned_by(owner.raw(), client)
+    }
+
+    /// Promise a table slot to a client allocation about to be forwarded. `false`: full.
+    pub fn reserve_nvrm_client(&mut self, owner: DeviceOwner) -> bool {
+        self.nvrm_clients.reserve(owner.raw())
+    }
+
+    /// Give a promised slot back (the allocation failed).
+    pub fn cancel_nvrm_client(&mut self) {
+        self.nvrm_clients.cancel();
+    }
+
+    /// Record the client RM made for `owner` through file `via`; `reserved` consumes the
+    /// promise [`Self::reserve_nvrm_client`] made.
+    pub fn commit_nvrm_client(
+        &mut self,
+        owner: DeviceOwner,
+        via: u32,
+        client: u32,
+        reserved: bool,
+    ) -> Commit {
+        self.nvrm_clients.commit(owner.raw(), via, client, reserved)
+    }
+
+    /// Forget one client of `owner` (its free went through). `false`: not its client.
+    pub fn forget_nvrm_client(&mut self, owner: DeviceOwner, client: u32) -> bool {
+        self.nvrm_clients.forget_client(owner.raw(), client)
+    }
+
+    /// Forget every client of `owner` made through file `via` (the file closed).
+    pub fn forget_nvrm_clients_via(&mut self, owner: DeviceOwner, via: u32) -> u32 {
+        self.nvrm_clients.forget_via(owner.raw(), via)
+    }
+
+    /// Forget every client of `owner` (its device is destroyed).
+    pub fn forget_nvrm_clients_for_owner(&mut self, owner: DeviceOwner) -> u32 {
+        self.nvrm_clients.forget_owner(owner.raw())
+    }
+
+    /// Forget every client of every owner (the transport's handles are all closed).
+    pub fn clear_nvrm_clients(&mut self) -> u32 {
+        self.nvrm_clients.clear()
+    }
+
     // ---- handles -----------------------------------------------------------------
 
     /// Reserve a tracking slot for an in-flight `Open`. Refuses when the table

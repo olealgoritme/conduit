@@ -298,6 +298,11 @@ pub(crate) fn publish_nvrm_counters() {
     // `FcRefCode`), host refusals (`FcHostErr`), device without the extension
     // (`FcNoExt`), stale or unknown records (`FcStale`), knob off (`FcOff`).
     crate::virtio::venus::publish_foreign_copy_counters();
+    // Cross-client hardening of forwarded RM ioctls (`NvDupHarden`): clients recorded /
+    // dropped / refused for room (`NvCli*`), and requests that named a client or file
+    // that is not the caller's (`NvDup*`). Nonzero `NvDupDeny` / `NvDupWould` outside a
+    // deliberate negative test means a process names something that is not its own.
+    crate::virtio::nvrm_harden::publish_counters();
     // RM fence handles (a forwarded SEMSURF_FENCE_CREATE): `NvFence` made and
     // recorded, `NvFenceCl` released (Close or teardown; the difference is what is
     // live), `NvFenceSig` EventReadys seen for fences, `NvFenceEarly` of those that

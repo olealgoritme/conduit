@@ -1838,6 +1838,8 @@ fn nvrm_shape_and_calls() -> (u32, u32) {
         &n::NVRM_EV_UNREGS,
         &n::NVRM_FENCES,
         &n::NVRM_FENCES_CLOSED,
+        &crate::virtio::nvrm_harden::NVRM_CLIENTS_RECORDED,
+        &crate::virtio::nvrm_harden::NVRM_DUP_DENIED,
     ]
     .iter()
         .fold(0u32, |a, c| a.wrapping_mul(31).wrapping_add(c.load(Ordering::Relaxed)));
