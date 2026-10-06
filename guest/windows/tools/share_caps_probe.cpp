@@ -63,7 +63,7 @@ static void probe(const char *label, D3D_DRIVER_TYPE type) {
   std::printf("%s: adapter \"%ls\" FL 0x%x, UMD version %u.%u.%u.%u, ExtendedResourceSharing %d\n", label,
               ades.Description, got, HIWORD(umd.HighPart), LOWORD(umd.HighPart), HIWORD(umd.LowPart),
               LOWORD(umd.LowPart), o.ExtendedResourceSharing);
-  std::printf("  %-9s %-6s %-5s %-10s %-10s %-10s %-10s %-10s %-10s\n", "format", "tex2d", "shr2", "kmt", "kmt-keyed",
+  std::printf("  %-9s %-9s %-9s %-6s %-5s %-10s %-10s %-10s %-10s %-10s %-10s\n", "format", "support", "support2", "tex2d", "shr2", "kmt", "kmt-keyed",
               "nt", "nt-keyed", "nt-handle", "ntk-handle");
   for (const Fmt &f : kFmts) {
     D3D11_FEATURE_DATA_FORMAT_SUPPORT fs = {f.f, 0};
@@ -99,11 +99,21 @@ static void probe(const char *label, D3D_DRIVER_TYPE type) {
       }
       if (t) t->Release();
     }
-    std::printf("  %-9s %-6s %-5s %08lx   %08lx   %08lx   %08lx   %08lx   %08lx\n", f.name,
+    std::printf("  %-9s %08x  %08x  %-6s %-5s %08lx   %08lx   %08lx   %08lx   %08lx   %08lx\n", f.name,
+                fs.OutFormatSupport, fs2.OutFormatSupport2,
                 (fs.OutFormatSupport & D3D11_FORMAT_SUPPORT_TEXTURE2D) ? "yes" : "no",
                 (fs2.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_SHAREABLE) ? "yes" : "no", (unsigned long)res[0],
                 (unsigned long)res[1], (unsigned long)res[2], (unsigned long)res[3], (unsigned long)sh[0],
                 (unsigned long)sh[1]);
+  }
+  // Every DXGI format's support masks, for a diff against another device.
+  for (UINT f = 1; f <= 132; f++) {
+    D3D11_FEATURE_DATA_FORMAT_SUPPORT fs = {DXGI_FORMAT(f), 0};
+    D3D11_FEATURE_DATA_FORMAT_SUPPORT2 fs2 = {DXGI_FORMAT(f), 0};
+    HRESULT h1 = dev->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs));
+    HRESULT h2 = dev->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &fs2, sizeof(fs2));
+    if (SUCCEEDED(h1) || SUCCEEDED(h2))
+      std::printf("  fmt %3u support %08x support2 %08x\n", f, fs.OutFormatSupport, fs2.OutFormatSupport2);
   }
   if (ad) ad->Release();
   if (dx) dx->Release();
