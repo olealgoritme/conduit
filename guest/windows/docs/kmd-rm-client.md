@@ -2758,6 +2758,170 @@ a moving window as in T5; always `StallT`, `VpDmpT`, `HpdBusyUs`):
 6. `FfRepeatMs` 0 and a device restart: the old behaviour (every edge flips) for comparison.
 
 
+#### 15.18.15 Flip retirement latency and 240 Hz: the chain, the ceiling, `FlipAnnounce` / `FlipEarlyWake`, and what is measured (built; compiled by nothing, run by nothing on hardware)
+
+**Why this section exists.** T5 (15.18.14) and the T6 baseline on KMD 330.2 with DWM on VENUS (`ForeignFlip` 0, no knobs, a
+windowed Venus spin composed by DWM) agree: the desktop is stuck at about 120 flips a second at 5120x1440@240, whatever the
+host does. PresentMon on `dwm.exe` over 20 s: 2233 presents, `msBetweenPresents` p50 8.48 / p99 8.77 ms (111.7 a second),
+`msUntilDisplayed` p50 8.14 ms (two vblanks), ONE 554 ms gap. KMD over 10.6 s: `FlipIss` 122.6 and `FlipPub` 122.5 a second,
+`VsTickN` 245.7 a second, `HpdLoopN` 366.7 a second. That is exactly one flip per TWO ticks, on the plain Venus path, with no
+`Ff*` counter involved: the ceiling is in the chain every flip class shares.
+
+##### 15.18.15.1 The chain, step by step (file:line at this commit)
+
+`DXGK_FLIPCAPS.FlipOnVSyncMmIo` only (`ddi/query_adapter_info.rs:384`, the word in `FlipCapV`), `MaxQueuedFlipOnVSync` = 1
+(`query_adapter_info.rs:398-428`, knob `FlipQueueN`, default 1, mirrored `FlipQueV`; the member is `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync`,
+`d3dkmddi.h:2426` of the 10.0.26100.0 WDK, a `UINT` whose header carries no comment on its semantics beyond its name).
+
+| # | what happens | where | cost |
+|---|---|---|---|
+| 1 | The heartbeat tick starts (one-shot high-resolution `ExSetTimer`, fixed phase from the previous deadline: `vsync_deadline::next`), reads the address it will carry: `last_primary_address` | `adapter/kobj.rs:933` | the address is read at the START of the tick |
+| 2 | It delivers the `CRTC_VSYNC` (`signal_crtc_vsync`, a `DxgkCbSynchronizeExecution` that calls `DxgkCbNotifyInterrupt` and queues the device DPC); dxgkrnl retires the queued flip whose address it carries | `adapter/kobj.rs:941`, `ddi/submit_command.rs:911` | |
+| 3 | The device DPC runs `DxgkCbNotifyDpc` (dxgkrnl processes the interrupt data: retires the flip, and with the queue below its depth issues the NEXT queued flip, `SetVidPnSourceAddress` at DIRQL) | `ddi/interrupt.rs:453` | the next flip is issued right here, a few microseconds after tick N started (`FlipInDpc`, `FlipPh0` measure it) |
+| 4 | `SetVidPnSourceAddress` pairs the handle, swaps it into the ONE pending slot and raises the programming gate. It publishes NOTHING | `ddi/display.rs:1912`, `2349`, `2001` | atomics |
+| 5 | Back in the tick: `pending_vidpn_allocation != 0` -> `signal_hpd` (this is the only default wake for an MMIO flip), but that line ran BEFORE step 3 issued the flip, so it wakes the worker for the flip pending at tick N+1 | `adapter/kobj.rs:990` | the wake is ONE TICK LATE |
+| 6 | The worker programs the flip (Venus: bind / copy / `SET_SCANOUT_BLOB`; foreign: `ffl::program` -> `take`) and publishes: `publish_displayed_primary` stores `last_primary_address` | `ddi/hpd.rs:333`, `adapter/mod.rs:1624` | worker wake plus programming |
+| 7 | The NEXT tick that STARTS after the store carries the new address and retires the flip | `adapter/kobj.rs:933` | |
+
+**The arithmetic ceiling (confirmed, with a correction to the premise).** A flip issued by step 3 right after tick N (phase 0: the
+case whenever DWM already has the next present queued, because dxgkrnl issues it the moment the previous retires) is seen by the
+worker at tick N+1 (step 5) and published AFTER tick N+1 read its address (step 1), so it is carried by tick N+2: **two ticks per
+flip, 120 a second at 240 Hz, 60 at 120 Hz, and no worker latency below one period changes it**. With the worker slower than a
+period it is worse (3 ticks: 80 a second at 240 Hz; latency over two periods: 60). The T6 baseline (111.7 a second, 1.5 loops per
+tick) is exactly this. The correction: the flip is NOT issued "between ticks": with `MaxQueuedFlipOnVSync` 1 it is issued by
+dxgkrnl inside the retirement of the previous one (step 3), which is why the chain locks to the tick. A flip that arrives
+asynchronously (DWM presented with nothing queued) at phase `phi` is also 2 ticks (latency `2P - phi`).
+`helios_kmd_logic::flip_retire::retire_ticks` is that rule and its tests are the table below:
+
+| publish point | worker latency | ticks per flip | flips/s at 240 Hz (depth 1) | issue-to-retire |
+|---|---|---|---|---|
+| worker, woken by the tick (default) | any under one period | 2 | 120 | `2P` (8.3 ms) |
+| worker, woken by the tick | 5 ms | 3 | 80 | `3P` |
+| worker, woken at issue (`FlipEarlyWake`) | under one period | 1 | 240 | `P` (4.17 ms) |
+| worker, woken at issue | 5 ms | 2 | 120 | `2P` |
+| DDI (`FlipAnnounce`) | irrelevant | 1 | 240 | `P` |
+
+**Where step 3 runs is an inference, and the measurement decides it.** `kobj.rs:972` assumed the DDI could run inside the synchronized
+callback of step 2, in which case the `signal_hpd` of step 5 (same tick, after the callback) would already see the flip pending and the default
+chain would be one tick whenever the worker beats the period. The T6 baseline (exactly two ticks per flip) fits the DPC placement
+and not that one; `FlipInDpc` and `FlipPh0` (DDI entries inside `DxgkCbNotifyDpc` / in the first quarter of the period) confirm it on the next run.
+
+The 554 ms gap is not explained by the arithmetic; candidates in the code, each now distinguishable by the new counters
+(`FlipMaxUs`, `FlipMaxT`, `FlipMaxSite`, `FlipMaxFl`): a synchronous `set_scanout_blob` round trip under the scanout mutex
+that waited out the host (`virtio/ctrl.rs` slices), a Deferred programming waiting for its producer boundary (the head bound
+`WddmHeadMs` defaults to 250 ms, two of them are 500), the retry budget (`SCANOUT_RETRY_BUDGET` refusals, each retry waits for a
+tick), the heartbeat watchdog (250 ms of silence before it revives the timer), or a host stall. `FlipMaxSite` is the HPD
+worker's step when the longest flip retired and `FlipMaxFl` says whether a programming was pending, the gate raised and the Venus mutex held.
+
+##### 15.18.15.2 What retires a flip, and the documented unknowns
+
+Believed from the code (`ProgrammedPrimary::kept_picture` documents it as the driver's model, never observed strictly): dxgkrnl
+retires the queued flip whose new `PhysicalAddress` the `CRTC_VSYNC` names. UNKNOWN U1: whether it also retires OLDER flips when a
+tick names a newer address (the queue-depth question): `FlipSkip` counts the issued-and-unretired flips a retiring tick passed over,
+and `FlipLive` / `FlipIss - FlipRetN - FlipSkip` shows whether any wedge. UNKNOWN U2: whether dxgkrnl issues the next flip of a deeper
+queue before the previous one retired (it should, up to `MaxQueuedFlipOnVSync`).
+
+##### 15.18.15.3 The design
+
+Three independent parts, all behind knobs (`diag.rs`), read at every StartDevice:
+
+* **`FlipEarlyWake` = 1** (also implied by any non-zero `FlipAnnounce`): the DDI asks for the device DPC (`DxgkCbQueueDpc`, legal at
+  DIRQL; the `FfAsyncWin` mechanism, now independent of it) and the DPC signals the worker when a programming is pending, also right
+  after `DxgkCbNotifyDpc` (`ddi/interrupt.rs:453`), where a flip issued by the retirement left it pending. The worker publishes a
+  flip tens of microseconds after it is issued, so the very next tick can carry it: 1 tick per flip while the worker beats the period.
+  Not independent of the worker's load: its latency under load is what `FlipPrgLat*` measures.
+* **`FlipAnnounce`**: at the DDI (atomics only, DIRQL) the new address is stored into `last_primary_address`
+  (`AdapterContext::publish_announced_primary`, plus the `FlipPub` census), so tick N+1 retires the flip whatever the worker
+  does; the worker programs it afterwards (bind, copy, host flip), and its own publication of the SAME address is swallowed by the
+  funnel in `publish_displayed_primary` (`ddi::flip_announce::funnel`: `FaWorker`), while a publication of an OLDER address after a newer
+  announce is dropped (`FaLate`: it would hand the heartbeat a regressed address). Mode 1: only a foreign allocation the `ForeignFlip` arm
+  accepted at an earlier programming (a 16-entry table of resource ids filled by `take`, emptied by every refusal, failure,
+  close, give-up, mode commit and new generation) and only while the arm is not failing (`foreign_flip::failing_atomics`). Mode 2: every flip
+  whose handle pairs. The decision table is `flip_retire::announce_decide`.
+* **`FlipQueueN` = 2** (the existing knob, `MaxQueuedFlipOnVSync`): the experiment, NOT part of the recommendation. With 2 and the
+  tick-woken worker a flip would need 2 ticks and two would be in flight: one per tick if U1 holds (dxgkrnl retires a flip whose address
+  was coalesced away), and a wedged queue if it does not. The measurement is built in (`FlipSkip`, `FlipLive`): run it only after
+  `FlipAnnounce` 2 alone, and stop if `FlipLive` stays at 2 with `FlipIss` not growing.
+
+**The semantics change for the Venus path (mode 2), precisely.** Today a Venus flip retires only after the KMD's programming published
+the address (`publish_bound_primary` after the host accepted `SET_SCANOUT_BLOB` or the fast bind, `publish_displayed_primary` from the ring-1
+copy completion DPC), so "retired" implied "the host reads the new buffer (or the copy of it finished)". With announce, dxgkrnl retires
+flip N one tick after it was issued and hands the PREVIOUS buffer (the one the host still scans, or the copy source) back to the
+compositor BEFORE the worker bound N. Which buffer is read by what: the direct path scans the flipped allocation itself
+(`SET_SCANOUT_BLOB` of the primary the flip names); the linear fallback's ring-1 `vkCmdCopyImage` reads the allocation the flip names
+and writes the adapter-owned linear image. dxgkrnl releases a buffer when the flip AFTER the one that displayed it retires, so the
+copy of flip N reads A_N, which stays owned until flip N+1 retires. **The hazard is therefore flip N+1 announced while the copy or bind
+of N is unfinished** (N+1 would retire at the next tick and free A_N while the copy still reads it). It is bounded by the idle rule:
+a flip is announced only if, at its DDI (before it raises the gate), `pending_vidpn_allocation == 0` and the programming gate is lowered
+(`flip_announce::worker_idle`; the gate is lowered when the bind finished, or by the copy-completion DPC for the copy path, or by the
+Deferred path only when the producer boundary retired). Otherwise it retires the normal way (`FaNoBusy`). So at most ONE announced flip is ever
+unprogrammed, and the buffer of any copy or bind still in flight is never released early. What remains: during the one announced flip's
+window (announce to the worker's bind, `FlipPrgLat*`) the compositor may reuse the previous buffer while the host still scans it: a
+TEAR in the viewer for up to that window, no corruption of a copy, no black frame (the producer-boundary and lease gating of 13.4 are
+untouched: the worker still waits for the producer before it binds). A refusal after an announce (`FaRefuse`) leaves the screen on the previous
+picture, as every foreign refusal already does (`flip_keep`); for Venus classes that is new (a refused flip used to hold the compositor): the
+`FkKeep` / `Sc*Err` counters still count the refusal.
+
+For the foreign class (mode 1) the rule is the same; its host flip is paced and asynchronous anyway (15.18.13), so the exposure is the
+conservative-reuse one of 15.18.5, one tick earlier.
+
+##### 15.18.15.4 What is measured (`FlipLat`, default 1; atomics; mirrored once a second by the stall-diagnosis block)
+
+`ddi/flip_lat.rs`, pure part `kmd_logic/flip_retire.rs`. The ring of the last 16 issued flips is matched by address at every DELIVERED tick.
+
+| counters | meaning |
+|---|---|
+| `FlipLat0..7`, `FlipMaxUs`, `FlipP50Us`, `FlipP99Us`, `FlipRetN` | issue-to-retire latency: from the DDI's entry to the start of the tick that carried the address. Edges: <0.5, <1, <2, <4.2, <8.4, <17, <50 ms, the rest. `FlipP99Us` is the UPPER edge of the bucket holding the 99th percentile (never below the true value, above it by under one bucket width; it is clamped to `FlipMaxUs`): "p99 below 5 ms" is proven by an estimate of 4200 or less |
+| `FlipMaxT` / `FlipMaxSite` / `FlipMaxFl` | when the longest retired, the worker's step then (`stall_diag::site`), `pending` \| `gate` << 1 \| `Venus mutex held` << 2 |
+| `FlipSkip`, `FlipLive` | unretired older flips a tick passed over (U1); unretired flips now |
+| `FlipPrgLat0..7`, `FlipPrgMax`, `FlipPrgP99` | entry to the worker's publication: the programming, including the host's acknowledgement of `SET_SCANOUT_BLOB` on the direct path, the foreign take; a copy that publishes from its completion DPC is not in it (see `FlipLat`) |
+| `FlipHostLat0..7`, `FlipHostMax`, `FlipHostP99` | entry to the `ForeignFlip` host flip SUBMITTED (the viewer shows it a moment later: add the host's own latency) |
+| `IfGap0..7`, `IfGapMax`, `IfN`, `IfIdle`, `IfStall8`, `IfP99Us` | interval between two retiring ticks, in periods: <1.5, <2.5, <3.5, <5, <9, <17, <50, more; `IfGapMax` in ms; `IfStall8` intervals over 8 ms; `IfIdle` intervals over 250 ms (idleness; not in the histogram; read DELTAS during motion) |
+| `VbTicks`, `VbUsed`, `VbUsedPm` | delivered ticks with a source shown; of those, the ticks that retired a flip; the share in permille ("every vblank used") |
+| `VsLate0..7`, `VsLateMaxUs` | the heartbeat's lateness against its scheduled deadline: <0.1, <0.25, <0.5, <1, <2, <4.2, <8.4 ms, more |
+| `FlipPh0..3`, `FlipInDpc` | where in the period the DDI ran (quarters after the last tick); DDIs that ran while the device DPC was inside `DxgkCbNotifyDpc` (dxgkrnl issuing the next flip as part of the retirement): the check of step 3 |
+| `FaKnob` (`FlipAnnounce` \| `FlipEarlyWake` << 8), `FaDdi`, `FaWorker`, `FaRefuse`, `FaLate`, `FaTick`, `FaNo`, `FaNoWhy`, `FaNoBusy`, `FaNoUnk`, `FaNoFail`, `FaNoOther`, `FaEarly` | announced at the DDI / confirmed by the worker / refused by the worker / older publication dropped / retire ticks of announced flips / not announced and why (`FaNoWhy`: 1 off, 2 no address, 3 no resource, 4 busy, 5 unknown allocation, 6 foreign arm failing) / early DPC requests |
+| `FlipLatOn` | the knob in force |
+
+**Bounding the worst case at 240 Hz (period 4.17 ms).** With `FlipAnnounce` and the idle rule a flip issued by dxgkrnl right after tick N retires at tick
+N+1: issue-to-retire is one period plus the heartbeat's lateness (`VsLate*`, the high-resolution `ExSetTimer` one-shot is anchored to
+the previous deadline so lateness does not accumulate and a late tick is not followed by a burst), independent of the worker, the host and the
+copy: about 4.2 to 5 ms, under the 8 ms bar. With the early wake alone the bound holds only while the worker's wake-and-program latency stays under
+the remainder of the period (a worker pass delayed by a registry mirror, a Venus mutex hold or a host round trip costs a whole extra tick:
+2 periods, 8.3 ms); the announce removes that dependence. A flip that finds the worker busy falls back to the early-wake bound.
+**Jitter that remains:** the heartbeat timer (the system's high-resolution timer; its period error is the integer 100 ns period, 41 667 for
+240 Hz, +0.0008%; `VsLate*` and `VsGapMaxMs` show the rest), the DPC delivery of the device DPC and of `DxgkCbNotifyDpc`, dxgkrnl's own
+issue of the next flip (a compositor that has not presented yet leaves a tick unused: `VbUsedPm`), the host viewer's own commit and the
+copy / bind latency for what is DISPLAYED (`FlipPrgLat*`, `FlipHostLat*`), and the worker's latency under load for the programming (not for the retire, with announce).
+Present-to-displayed in vblanks = `FlipLat` (to retire) plus the programming still owed at that point: the T6 figure of 2 vblanks is
+`2P` of retire latency alone; with announce the retire is 1 vblank and the displayed picture follows the programming, which must also fit
+the same period (`FlipPrgP99` below 4200 us is that check).
+
+##### 15.18.15.5 Hardware checklist (T6 on 330.2 / 331: lowest mode first, 1920x1080@60, then 5120x1440@240)
+
+Read every counter twice 10 s apart; PresentMon on `dwm.exe` alongside. Knobs: service key `helios_kmd_render`, REG_DWORD, `pnputil /restart-device`.
+
+1. **Baseline, no knobs** (Venus DWM; then `DwmIcd` = nvk with `ForeignFlip` 1): `FlipIss` and `FlipRetN` per second (about 120 at 240 Hz), `FlipLat` mass in
+   bucket 4 (4.2 to 8.4 ms), `IfGap` mass in bucket 1 (two periods), `VbUsedPm` about 500, `VsTickN` 240 a second, `VsLate*` mostly buckets 0 to 2, `FlipPh0` (and `FlipInDpc`)
+   carrying nearly every DDI (the issue happens in the retirement, step 3). If instead `FlipPh` is spread over the period, flips are issued asynchronously and the
+   2-tick cost is paid at every arrival (latency `2P - phi`). `FlipMaxUs`, `FlipMaxSite`, `FlipMaxFl` locate the long gap.
+2. **`FlipEarlyWake` 1**: `FaEarly` near `FlipIss`; `FlipLat` mass moves to bucket 3 if the worker keeps up; `FlipPrgP99` under 2000 us. Otherwise the worker's latency is the limit.
+3. **`FlipAnnounce` 2** (Venus): `FaDdi` near `FlipIss`, `FaNoBusy` small, `FaWorker` near `FaDdi`, `FaTick` near `FlipRetN`, `FaRefuse` 0, `FaLate` 0, `FlipLat` all in bucket 3 (about one period),
+   `IfGap` bucket 0, `IfStall8` 0, `VbUsedPm` near 1000 under motion, `FlipP99Us` 4200 or less, `FlipMaxUs` under 8000. Watch for tearing (the exposure above) with a moving video, `ScCpyErr` / `ScSetErr` (0), and `FkKeep` (a
+   refusal now completes silently). If `FaNoBusy` is large the worker did not finish a flip within a period: `FlipPrgLat*` says how long it takes.
+4. **`FlipAnnounce` 1** with `DwmIcd` = nvk and `ForeignFlip` 1: the same, plus `FfFrames` / `FfProg` per second, `FlipHostLat*` (host flip submitted within a period), `FaNoUnk` only for the first flip of each swap-chain buffer.
+5. **Queue depth experiment** (only if 3 leaves `VbUsedPm` low because dxgkrnl has no flip queued): `FlipQueueN` 2 with `FlipAnnounce` 2: `FlipSkip` growing means a tick named a newer address than an older unretired flip's; the flip rate continuing
+   to grow with `FlipLive` bounded by 2 means dxgkrnl retires coalesced flips (U1 holds); `FlipLive` stuck at 2 with `FlipIss` flat means it does not: go back to 1.
+6. **Restart / open / close**: `pnputil /restart-device` twice with a moving window: `IfStall8`, `IfGapMax` and `FlipMaxUs` over the restart; open and close a window and a fullscreen app; `FaLate` and `FaRefuse` stay 0.
+
+**Verified here:** the model, the bucket functions, the percentile estimate (an upper bound, tested against a sampled population), the ring match, the
+announce decision table, the idle rule's behaviour for a fast and a slow worker, the counter names (length, uniqueness, exactly the listed set written by the two
+I/O files and by nobody else); `kmd_logic` (1244 tests) and `protocol` pass, the whole tree parses, the stub type-check shows no new error kind.
+**Not verified:** anything that runs: that dxgkrnl issues the next flip inside the retirement (step 3, which `FlipInDpc` / `FlipPh0` test), that it
+retires on the address alone, the tear exposure, the cost of the measurement (a few dozen atomics per flip and tick, about 55 registry writes a second in the existing mirror).
+With `FlipAnnounce` 0 and `FlipEarlyWake` 0 the flip path is the old one: one relaxed load at the DDI, in the funnel and in the DPC; `FlipLat` 0 removes the measurement.
+
+
 ### 15.19 KMD-made STANDARD allocations for DWM on NVK (design only; `rm-backed-standard.md`)
 
 The question of 15.2 and 15.14 item 5, asked by the DWM-on-NVK work: what is the smallest step that lets an NVK DWM open the
