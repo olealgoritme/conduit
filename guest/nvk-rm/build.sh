@@ -10,6 +10,7 @@
 #   MESA_BASE       Mesa commit the series applies to (default below)
 #   MESON           meson binary (needs >= 1.4; default: meson in PATH)
 #   MESON_ARGS      extra `meson setup` arguments
+#   BUILDTYPE       meson buildtype (default release, with b_ndebug=true)
 #   RMCLIENT_INCLUDE  directory holding rmclient.h (default: guest/rmclient/include
 #                   in this tree if present; otherwise Mesa uses the copy in
 #                   the patch, which is identical)
@@ -69,14 +70,25 @@ fi
 
 # 4. Configure and build only NVK
 cd "$MESA_DIR"
+# Release: -O3, no C asserts (b_ndebug), and NAK (Rust) without debug
+# assertions or overflow checks.  debugoptimized keeps all three on, which
+# costs CPU time per draw and per shader compile (and on Windows an assert
+# is a dialog).  BUILDTYPE=debugoptimized for debugging.
+BUILDTYPE=${BUILDTYPE:-release}
+if [ "$BUILDTYPE" = release ]; then NDEBUG=true; else NDEBUG=false; fi
 if [ ! -f "$BUILD_DIR/build.ninja" ]; then
   # shellcheck disable=SC2086
   "$MESON" setup "$BUILD_DIR" \
     -Dvulkan-drivers=nouveau \
     -Dgallium-drivers= \
     -Dnvk-rm=enabled \
-    -Dbuildtype=debugoptimized \
+    -Dbuildtype="$BUILDTYPE" \
+    -Db_ndebug="$NDEBUG" \
     $MESON_ARGS
+else
+  # Existing build directories from older versions of this script were
+  # debugoptimized; bring them in line.
+  "$MESON" configure "$BUILD_DIR" -Dbuildtype="$BUILDTYPE" -Db_ndebug="$NDEBUG"
 fi
 ninja -C "$BUILD_DIR" \
   src/nouveau/vulkan/libvulkan_nouveau.so \

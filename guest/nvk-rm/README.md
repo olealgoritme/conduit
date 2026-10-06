@@ -41,6 +41,10 @@ Mesa `main` at **`70c4c018cbe5b78a1db7e9413bc7e511b366fd95`**
 | 11 | `nvk/rm: stop polling a non-stall event whose data cannot be read` | a refused `NV_ESC_RM_GET_EVENT_DATA` leaves the event readable for good; waits sleep instead of spinning through refused escapes |
 | 12 | `vulkan/wsi, nvk: wait for rendering before presenting without implicit sync` | `wsi_device::wait_before_present`, set by NVK when the backend has dma-bufs but no sync_file export (RM) |
 | 13 | `nvk/rm: dma-buf export and import through nvidia-drm, DRM format modifiers` | `has_dma_buf` + `has_alloc_tiled` for RM: export/import of RM memory as dma-bufs via `OS_UNIX_EXPORT/IMPORT_OBJECT` and nvidia-drm's GEM import/export; DRM node discovery; `VK_EXT_image_drm_format_modifier` |
+| 14 | `nvk/rm: host-visible VRAM (a BAR heap)` | port of `patches-windows/0022` (feat/nvk-rm-bar-heap) to this series: a DEVICE_LOCAL + HOST_VISIBLE type on a BAR1-mapped VRAM heap (`NVK_RM_BAR_MB`, default 256). Drop it where 0022 is applied. |
+| 15 | `nvk/rm: let the GPU cache coherent host-visible system memory in L2` | host-visible system memory mapped `GPU_CACHEABLE_YES`, L2 sysmem invalidate at the start of every submit (`NVK_RM_SYSMEM_CACHED=0` turns it off); UBOs and vertex buffers in system memory 20-60x faster, on par with NVIDIA |
+| 16 | `nvk/rm: compressible VRAM for images on GB20x` | `has_compression`: dedicated image memory allocated COMPR_ANY (as NVKMS does) and mapped with the compressible GMK kind (`NVK_RM_COMPRESSION=0` off); clears 15x faster, blending on par with NVIDIA |
+| 17 | `nvk/rm: ZCULL from NV2080_CTRL_CMD_GR_GET_ZCULL_INFO` | `has_zcull_info` (`NVK_RM_ZCULL=0` off); depth-tested overdraw 3.4x faster, on par with NVIDIA |
 
 Each patch builds on its own.
 
@@ -58,7 +62,7 @@ throwaway `rmclient.pc`, and builds only NVK:
 
 ```sh
 meson setup build-rm -Dvulkan-drivers=nouveau -Dgallium-drivers= \
-    -Dnvk-rm=enabled -Dbuildtype=debugoptimized
+    -Dnvk-rm=enabled -Dbuildtype=release -Db_ndebug=true
 ninja -C build-rm src/nouveau/vulkan/libvulkan_nouveau.so \
     src/nouveau/vulkan/nouveau_devenv_icd.x86_64.json
 ```
