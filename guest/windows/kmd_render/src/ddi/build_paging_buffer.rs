@@ -132,17 +132,30 @@ enum PagingOpOutcome {
     Failed(NTSTATUS),
 }
 
-/// The single failure status this DDI returns, for every arm.
+/// The status a content operation that did not happen is answered with.
 ///
-/// STATUS_INSUFFICIENT_RESOURCES is the value the shadow-full arm of this same
-/// function already returns, and it is what two sibling DDIs
-/// (`create_allocation.rs`, `cpu_host_aperture.rs`) were changed to when
-/// STATUS_UNSUCCESSFUL was proven out of contract — dxgkrnl logged it as
-/// "Driver returned an invalid NTSTATUS" 197x with adapter resets. Routing every
-/// arm through one function keeps the legal-return set a one-line audit.
+/// It is `STATUS_SUCCESS`, for every arm, and it must stay that way: VidMm accepts
+/// only `STATUS_SUCCESS` and `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER` from this
+/// DDI (the latter only means "retry with a bigger DMA buffer", which a driver
+/// that emits no DMA cannot honestly ask for). Anything else is "Driver returned
+/// an invalid error code from BuildPagingBuffer" and bugchecks 0x10E
+/// (VIDEO_MEMORY_MANAGEMENT_INTERNAL, parameter 1 = 0xB). That was measured with
+/// STATUS_INSUFFICIENT_RESOURCES (0xC000009A) on a VIRTUAL_TRANSFER eviction after
+/// an in-place driver update; 0ab908b had already hit the same bugcheck for the
+/// classic TRANSFER with no transport and only guarded that one arm.
+///
+/// So a failed content op moves nothing, is COUNTED (`PgSkipV`, plus the
+/// per-reason `Pg*` counter at the failing site) and answers success. Content is
+/// intrinsic to the venus blob, which a skipped LOCAL_TO_SYSTEM leaves intact; a
+/// skipped SYSTEM_TO_LOCAL leaves the blob at its last content, so only writes
+/// made while the allocation was system-resident are lost. That is the price of
+/// never taking the machine down, and `PgSkipV` makes it visible.
 const fn paging_failure() -> NTSTATUS {
-    STATUS_INSUFFICIENT_RESOURCES
+    STATUS_SUCCESS
 }
+
+/// The rule above is a compile-time fact, checked by the host-tested predicate.
+const _: () = assert!(helios_kmd_logic::paging::is_legal_status(paging_failure()));
 
 // Counters (registry-visible after any BAR-segment op; atomics are the source
 // of truth and stay readable by symbol even if the registry write is skipped).
@@ -172,6 +185,13 @@ static BAR_ERR_DISCONTIG: AtomicU32 = AtomicU32::new(0); // leaf PTEs not contig
 static BAR_ERR_VIRTUAL: AtomicU32 = AtomicU32::new(0); // unresolved paging-process VA
 static BAR_ERR_MDL: AtomicU32 = AtomicU32::new(0); // system-MDL kernel map failed
 static BAR_ERR_SHADOW_FULL: AtomicU32 = AtomicU32::new(0); // PTE shadow capacity exhausted
+/// Content ops that did NOT move their data and were answered STATUS_SUCCESS
+/// anyway (`PgSkipV`). Any nonzero value is content VidMm believes moved and
+/// did not; the per-reason counter beside it says why.
+static BAR_SKIPPED: AtomicU32 = AtomicU32::new(0);
+/// Transfers/fills whose range ran past the recorded allocation size and were
+/// cut to it (`PgClamp`): the bytes past the allocation are padding.
+static BAR_CLAMPED: AtomicU32 = AtomicU32::new(0);
 /// A classic TRANSFER (`PgEh`) / FILL (`PgFh`) named an `hAllocation` that does
 /// not resolve to a live Helios allocation. Both were bare `return`s: the op did
 /// not run, nothing was counted, and the DDI still answered STATUS_SUCCESS, so
@@ -229,6 +249,8 @@ static PAGING_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         f(b"PgEv", &BAR_ERR_VIRTUAL),
         f(b"PgEx", &BAR_ERR_MDL),
         f(b"PgEf", &BAR_ERR_SHADOW_FULL),
+        f(b"PgSkipV", &BAR_SKIPPED),
+        e(b"PgClamp", &BAR_CLAMPED),
         e(b"PgVp", &BAR_VIRTUAL_PTES),
         e64(b"PgVs", &BAR_LAST_VIRTUAL_SRC),
         e64(b"PgVd", &BAR_LAST_VIRTUAL_DST),
@@ -288,8 +310,9 @@ fn dump_bar_counters(_passive: PassiveLevel) {
 ///
 /// VidMm maps a bounded paging-process scratch range around each virtual content
 /// operation and unmaps it immediately afterward. 65,536 4-KiB pages covers
-/// 256 MiB of simultaneous transfers. Exhaustion is returned to VidMm as
-/// `STATUS_INSUFFICIENT_RESOURCES`; it is never silently treated as success.
+/// 256 MiB of simultaneous transfers. Exhaustion is counted (`PgEf`, `PgSkipV`)
+/// and answered STATUS_SUCCESS — VidMm bugchecks on any other status — so the
+/// ranges that were not retained are skipped when a transfer cannot resolve them.
 const MAX_PAGING_SYSTEM_PTES: usize = 65_536;
 
 #[derive(Clone, Copy)]
@@ -776,10 +799,28 @@ unsafe fn bar_virtual_transfer(
     }
 
     let offset = transfer.AllocationOffsetInBytes;
-    let size = transfer.TransferSizeInBytes;
-    if offset.checked_add(size).is_none_or(|end| end > alloc.size) {
-        BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
-        return false;
+    // The transfer is bounded by what this driver recorded of the allocation, and
+    // an overrun is CUT, not refused: VidMm sizes the VA window of a virtual
+    // transfer itself (measured 0x1E10000 against a recorded 0x1C20000), and the
+    // only status that could refuse it is one VidMm bugchecks on. The part past
+    // the allocation is padding and moves nothing.
+    let size = match helios_kmd_logic::paging::clamp_range(
+        alloc.size,
+        offset,
+        transfer.TransferSizeInBytes,
+    ) {
+        helios_kmd_logic::paging::Clamp::Full(n) => n,
+        helios_kmd_logic::paging::Clamp::Clamped(n) => {
+            BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
+            n
+        }
+        helios_kmd_logic::paging::Clamp::Nothing => {
+            BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+    };
+    if size == 0 {
+        return true;
     }
     BAR_LAST_XFER_OFF.store(offset as u32, Ordering::Relaxed);
     BAR_LAST_XFER_FLAGS.store(
@@ -964,7 +1005,23 @@ unsafe fn bar_transfer(
     BAR_LAST_XFER_FLAGS.store(flags, Ordering::Relaxed);
     BAR_LAST_XFER_OFF.store(t.TransferOffset, Ordering::Relaxed);
     BAR_LAST_MDL_OFF.store(t.MdlOffset, Ordering::Relaxed);
-    let bytes = t.TransferSize as u64;
+    // Cut to the recorded allocation, as in `bar_virtual_transfer`; nothing known
+    // to move is a counted no-op, not an error.
+    let bytes = match helios_kmd_logic::paging::clamp_range(
+        alloc.size,
+        t.TransferOffset as u64,
+        t.TransferSize as u64,
+    ) {
+        helios_kmd_logic::paging::Clamp::Full(n) => n,
+        helios_kmd_logic::paging::Clamp::Clamped(n) => {
+            BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
+            n
+        }
+        helios_kmd_logic::paging::Clamp::Nothing => {
+            BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
+            return PagingOpOutcome::NotOurs;
+        }
+    };
     // Microsoft defines these two offsets independently: TransferOffset is a
     // byte offset applied only to the segment location, while MdlOffset names
     // the first system-memory page inside the MDL. Never leak TransferOffset's
@@ -1115,18 +1172,26 @@ unsafe fn bar_fill(
         BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
         return PagingOpOutcome::NotOurs;
     }
-    let fill_len = f.FillSize as u64;
+    let fill_len = match helios_kmd_logic::paging::clamp_range(alloc.size, 0, f.FillSize as u64) {
+        helios_kmd_logic::paging::Clamp::Full(n) => n,
+        helios_kmd_logic::paging::Clamp::Clamped(n) => {
+            BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
+            n
+        }
+        helios_kmd_logic::paging::Clamp::Nothing => {
+            BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
+            return PagingOpOutcome::NotOurs;
+        }
+    };
     let pattern = f.FillPattern;
     let system_backing = content_guard.snapshot(alloc.resource_id);
     let mut filled = false;
     let ok = unsafe {
         with_blob_bytes(passive, adapter, alloc.resource_id, |dst, len| {
-            // REFUSE, do not clamp (M8/k-paging-19). The VIRTUAL_FILL arm twelve
-            // lines below has always refused an over-long fill; clamping here
-            // meant one condition had two policies, and the clamped tail was a
-            // silent partial fill. The classic FILL arm carries no allocation
-            // offset, so "fill from blob start" stays correct — only
-            // clamp-versus-refuse changes.
+            // A fill longer than the MAPPED blob (a blob smaller than the recorded
+            // allocation) is refused whole — counted PgEb, and answered success
+            // with PgSkipV like every skipped op. The recorded-size overrun was
+            // already cut above; this is the second, mapped-length bound.
             if fill_len > len {
                 BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -1405,7 +1470,14 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
             // Nothing is lost: `update_leaf` already stored `BAR_ERR_SHADOW_FULL`
             // (PgEf) into its atomic, and the next PASSIVE content op mirrors the
             // whole block, so only the latency of that one value changes.
-            return STATUS_INSUFFICIENT_RESOURCES;
+            //
+            // The status is STATUS_SUCCESS all the same: VidMm bugchecks on
+            // STATUS_INSUFFICIENT_RESOURCES from this DDI (see `paging_failure`).
+            // The mapping was not retained, so a later virtual transfer through
+            // this range resolves nothing and is skipped and counted
+            // (PgEv + PgSkipV) rather than copied through a wrong page.
+            BAR_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return paging_failure();
         }
         unsafe { bar_harvest_page_table(bar.seg_id, bar.size, update) };
         return STATUS_SUCCESS;
@@ -1447,6 +1519,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // spinlock or at raised IRQL.
     let Some(content_guard) = adapter.system_backings.serialize(passive) else {
         BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
+        BAR_SKIPPED.fetch_add(1, Ordering::Relaxed);
         return paging_failure();
     };
 
@@ -1484,7 +1557,21 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                 }
                 Some(alloc) => {
                     let off = fv.AllocationOffsetInBytes;
-                    let fill_len = fv.FillSizeInBytes;
+                    let fill_len = match helios_kmd_logic::paging::clamp_range(
+                        alloc.size,
+                        off,
+                        fv.FillSizeInBytes,
+                    ) {
+                        helios_kmd_logic::paging::Clamp::Full(n) => n,
+                        helios_kmd_logic::paging::Clamp::Clamped(n) => {
+                            BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
+                            n
+                        }
+                        helios_kmd_logic::paging::Clamp::Nothing => {
+                            BAR_CLAMPED.fetch_add(1, Ordering::Relaxed);
+                            0
+                        }
+                    };
                     let pattern = fv.FillPattern;
                     let system_backing = content_guard.snapshot(alloc.resource_id);
                     if system_backing.is_some() {
@@ -1532,11 +1619,16 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         // is a compile error in BOTH places at once.
         PagingOperation::UpdatePageTable(_) | PagingOperation::Other => PagingOpOutcome::NotOurs,
     };
+    // Counted BEFORE the mirror below, so the registry carries it on this op.
+    if matches!(outcome, PagingOpOutcome::Failed(_)) {
+        BAR_SKIPPED.fetch_add(1, Ordering::Relaxed);
+    }
     // Registry diagnostics can block independently; the backing transaction is
     // complete, so do not unnecessarily serialize another Present behind it.
     drop(content_guard);
     dump_bar_counters(passive);
     match outcome {
+        // `reason` is `paging_failure()` at every producer: STATUS_SUCCESS.
         PagingOpOutcome::Failed(reason) => reason,
         PagingOpOutcome::Executed | PagingOpOutcome::NotOurs => STATUS_SUCCESS,
     }

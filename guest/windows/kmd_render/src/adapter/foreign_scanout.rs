@@ -246,7 +246,9 @@ impl AdapterContext {
         let Some(src) = snapshot else {
             return false;
         };
-        let valid = DeviceOwner::new(src.owner as usize).is_some_and(|owner| {
+        // `from_token`, not `new`: the owner may be the KMD's own RM client
+        // (`DeviceOwner::KMD_RM`), which `new` refuses on purpose.
+        let valid = DeviceOwner::from_token(src.owner as usize).is_some_and(|owner| {
             self.with_virtio(|v| {
                 v.nvrm_epoch() == src.epoch
                     && v.nvrm_handle_device_type(owner, src.handle)

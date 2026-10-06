@@ -2197,7 +2197,7 @@ fn nvrm_mmap(
     // Track it and mint its id under one lock hold, which also re-checks that the
     // handle is still ours (a concurrent Close may have forgotten it).
     let kmd_id = adapter
-        .with_virtio(|v| v.push_nvrm_map(owner, m.handle, host.host_id))
+        .with_virtio(|v| v.push_nvrm_map(owner, m.handle, host.host_id, m.size, uvm))
         .ok()
         .flatten();
     let inserted = kmd_id.is_some_and(|id| {

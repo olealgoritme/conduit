@@ -464,6 +464,96 @@ impl CounterBlock {
     }
 }
 
+/// The service key as a native registry path, for `ZwOpenKey`.
+const SERVICE_KEY_PATH: &[u8] =
+    b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\helios_kmd_render";
+
+const fn widen<const N: usize>(ascii: &[u8]) -> [u16; N] {
+    let mut out = [0u16; N];
+    let mut i = 0;
+    while i < N {
+        out[i] = ascii[i] as u16;
+        i += 1;
+    }
+    out
+}
+
+static SERVICE_KEY_PATH_W: [u16; SERVICE_KEY_PATH.len()] =
+    widen::<{ SERVICE_KEY_PATH.len() }>(SERVICE_KEY_PATH);
+
+/// `UNICODE_STRING`, spelled out because `wdk-sys` 0.5 gives no helper to build one
+/// from a static (same reason `kobj.rs` declares its own `Ex*` timer imports).
+#[repr(C)]
+struct NtUnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+/// `OBJECT_ATTRIBUTES` (48 bytes on x64).
+#[repr(C)]
+struct NtObjectAttributes {
+    length: u32,
+    root_directory: *mut core::ffi::c_void,
+    object_name: *mut NtUnicodeString,
+    attributes: u32,
+    security_descriptor: *mut core::ffi::c_void,
+    security_quality_of_service: *mut core::ffi::c_void,
+}
+
+const _: () = assert!(core::mem::size_of::<NtObjectAttributes>() == 48);
+const _: () = assert!(core::mem::size_of::<NtUnicodeString>() == 16);
+
+#[link(name = "ntoskrnl")]
+extern "system" {
+    fn ZwOpenKey(
+        key_handle: *mut *mut core::ffi::c_void,
+        desired_access: u32,
+        object_attributes: *mut NtObjectAttributes,
+    ) -> i32;
+    fn ZwFlushKey(key_handle: *mut core::ffi::c_void) -> i32;
+}
+
+/// `OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE`.
+const OBJ_KEY_ATTRIBUTES: u32 = 0x40 | 0x200;
+/// `KEY_QUERY_VALUE`. `ZwFlushKey` needs no particular access to the handle.
+const KEY_QUERY_VALUE: u32 = 0x1;
+
+/// Force the service key (and so every breadcrumb written to it) to disk.
+///
+/// `RtlWriteRegistryValue` only updates the in-memory hive; the lazy writer would
+/// lose the last values of a stop that bugchecks. This pays one synchronous hive
+/// flush, which is why it is called twice per StopDevice and nowhere else. Best
+/// effort: every failure is ignored.
+///
+/// PASSIVE_LEVEL only (`ZwOpenKey` / `ZwFlushKey` / `ZwClose`).
+pub fn flush_service_key(_passive: crate::irql::PassiveLevel) {
+    let bytes = (SERVICE_KEY_PATH_W.len() * 2) as u16;
+    let mut name = NtUnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: SERVICE_KEY_PATH_W.as_ptr() as *mut u16,
+    };
+    let mut attributes = NtObjectAttributes {
+        length: core::mem::size_of::<NtObjectAttributes>() as u32,
+        root_directory: core::ptr::null_mut(),
+        object_name: &mut name,
+        attributes: OBJ_KEY_ATTRIBUTES,
+        security_descriptor: core::ptr::null_mut(),
+        security_quality_of_service: core::ptr::null_mut(),
+    };
+    let mut key: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: PASSIVE_LEVEL (the token); `attributes` and the name it points to
+    // outlive the call, and the path buffer is a static. The handle, if opened,
+    // is a kernel handle closed below.
+    unsafe {
+        if ZwOpenKey(&mut key, KEY_QUERY_VALUE, &mut attributes) >= 0 && !key.is_null() {
+            let _ = ZwFlushKey(key);
+            let _ = wdk_sys::ntddk::ZwClose(key as wdk_sys::HANDLE);
+        }
+    }
+}
+
 /// `record_named` convenience: build the UTF-16 value name from an ASCII byte
 /// slice (≤14 chars). PASSIVE_LEVEL only.
 pub fn record_named_bytes(name: &[u8], value: u32) {
@@ -530,6 +620,10 @@ pub mod knobs {
 
     /// Breadcrumb ring level. 0 (default) = the `S<idx>` ring is off.
     pub const DIAG_LEVEL: KnobName = KnobName::new(b"DiagLevel");
+    /// `StopFlush` (default 1): flush the service key to disk at StopDevice's
+    /// first and last stage, so `StopStg` survives a bugcheck inside the stop.
+    /// 0 skips the two `ZwFlushKey` calls.
+    pub const STOP_FLUSH: KnobName = KnobName::new(b"StopFlush");
     /// `NvSpinUs` (default 50): how long, in microseconds, a forwarded RM message
     /// polls for its reply before it blocks (`virtio::ctrl::raw_roundtrip`). 0
     /// turns the spin off; above 200 it is clamped. Adaptive on top of this: the
@@ -547,6 +641,13 @@ pub mod knobs {
     /// restores) is `crate::virtio::gpu::VirtioGpu::dma_gpu_fence`; the unread
     /// `AdapterKnobs` copy was deleted 2026-08-05.
     pub const DMA_GPU_FENCE: KnobName = KnobName::new(b"DmaGpuFence");
+    /// `KmdRmClient` (default 0 = off, nothing is opened and nothing is written).
+    /// The KMD's own RM client (`virtio::rm_client`, `docs/kmd-rm-client.md`): 1 =
+    /// open an RM client over the forwarding path and allocate, export and import a
+    /// video-memory surface of the VidPn primary's size (invisible); 2 = also map it,
+    /// paint a test picture and show it once through the KMD's own `ScanoutFlip`.
+    /// Read once per transport generation. Values above 2 count as 2.
+    pub const KMD_RM_CLIENT: KnobName = KnobName::new(b"KmdRmClient");
     /// `BindFlushMode` (default 0). Selects when the bind edge tells the host
     /// to READ the freshly bound primary (ROADMAP defect 0ab-B):
     ///   0 = completion-ordered against the boundary this buffer's own present

@@ -47,6 +47,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 use helios_kmd_logic::nvrm_fence;
 use helios_kmd_logic::page_runs;
+use helios_kmd_logic::sweep_budget::SweepBudget;
 use helios_protocol::{
     HELIOS_NVRM_DEEP_PAGE_RUNS, HELIOS_NVRM_DEEP_PAGE_RUNS_INDIRECT, HELIOS_NVRM_FORWARD_MSG_TYPES,
     HELIOS_NVRM_SCANOUT_FLIP_BYTES,
@@ -128,6 +129,11 @@ pub static NVRM_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// Live mappings made, and their failures. Published as `NvMap`, `NvMapErr`.
 pub static NVRM_MAPS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_MAP_ERRORS: AtomicU32 = AtomicU32::new(0);
+/// Bytes currently mapped through MMAP, all owners (`NvMapMb`, in MiB). Refreshed
+/// under the table lock at every change.
+pub static NVRM_MAP_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// MMAPs refused by the per-device byte quota (`NvMapQRef`).
+pub static NVRM_MAP_QUOTA_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// Pins made, pins released, pin failures. `NvPin - NvUnpin` is what is locked
 /// now; a count that only grows is a leak. Published as `NvPin`, `NvUnpin`,
 /// `NvPinErr`.
@@ -941,6 +947,15 @@ pub fn host_mmap(
     if !quota_ok {
         return Err(MapRefusal::NoResources);
     }
+    // The byte quota (a quarter of the RM window per device), before the host is
+    // asked to map anything. The UVM aperture is exempt.
+    let bytes_ok = adapter
+        .with_virtio(|v| v.nvrm_map_bytes_room(owner, device_type == 256, size))
+        .unwrap_or(false);
+    if !bytes_ok {
+        NVRM_MAP_QUOTA_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return Err(MapRefusal::NoResources);
+    }
 
     // MsgHeader{Mmap, handle} | MmapReq { size u64, offset u64, prot u32, pad u32 }.
     // `prot` as the guest module sends it: 3 for a writable mapping, 1 otherwise.
@@ -986,13 +1001,24 @@ pub fn host_munmap(
     handle: u32,
     host_id: u32,
 ) -> Result<(), VirtioError> {
+    host_munmap_within(passive, adapter, handle, host_id, 5_000)
+}
+
+/// [`host_munmap`] waiting at most `timeout_ms`.
+fn host_munmap_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    handle: u32,
+    host_id: u32,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
     // MsgHeader{Munmap, handle} | MunmapReq { mapping_id u32, pad u32 }.
     let mut req = [0u8; MSG_HDR + 8];
     req[..4].copy_from_slice(&MSG_MUNMAP.to_le_bytes());
     req[4..8].copy_from_slice(&handle.to_le_bytes());
     req[16..20].copy_from_slice(&host_id.to_le_bytes());
     let mut resp = [0u8; MSG_HDR];
-    ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, 5_000).map(|_| ())
+    ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, timeout_ms).map(|_| ())
 }
 
 /// Release the HOST side of a mapping whose table slot is already gone (or was
@@ -1006,6 +1032,17 @@ pub fn release_host_map(
     handle: u32,
     host_id: u32,
 ) -> Result<(), VirtioError> {
+    release_host_map_within(passive, adapter, handle, host_id, 5_000)
+}
+
+/// [`release_host_map`] waiting at most `timeout_ms` for the host.
+fn release_host_map_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    handle: u32,
+    host_id: u32,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
     if host_id == 0 {
         return Ok(());
     }
@@ -1015,7 +1052,7 @@ pub fn release_host_map(
     if still_used {
         return Ok(());
     }
-    host_munmap(passive, adapter, handle, host_id)
+    host_munmap_within(passive, adapter, handle, host_id, timeout_ms)
 }
 
 /// `Close` of `handle`: unmap each view this process holds on it, then tell the
@@ -1288,11 +1325,6 @@ pub fn close_all_for_owner(
     closed
 }
 
-/// Longest the live sweep ([`close_all_on_host`]) keeps sending, in 100 ns: a
-/// healthy host answers a `Close` in milliseconds, so this only bounds a host
-/// that is slow rather than gone (a gone one trips the first-failure stop).
-const SWEEP_SEND_BUDGET_100NS: u64 = 10 * 10_000_000;
-
 /// Retire the live transport's NVRM state while it can still be asked: send the
 /// host a `Munmap` for every mapping and a `Close` for every handle ANY owner left
 /// open, then unlock the pins.
@@ -1306,8 +1338,9 @@ const SWEEP_SEND_BUDGET_100NS: u64 = 10 * 10_000_000;
 /// still write. So the host is told FIRST, as `close_all_for_owner` does per owner.
 ///
 /// Best effort and bounded: it stops sending after the first timeout or failed
-/// send (a wedged host costs seconds per call) or when [`SWEEP_SEND_BUDGET_100NS`]
-/// is spent, but keeps clearing the tables, so nothing is left for the fallback in
+/// send (a wedged host costs seconds per call) or when `budget` is spent (each
+/// `Close`/`Munmap` waits at most the budget's per-call allowance, never more than
+/// what is left of it), but keeps clearing the tables, so nothing is left for the fallback in
 /// `VirtioGpu::drop` except what a concurrent call re-populated. A transport that
 /// has already failed (or is absent) is not asked at all and nothing is touched
 /// here: the fallback handles it.
@@ -1319,25 +1352,35 @@ const SWEEP_SEND_BUDGET_100NS: u64 = 10 * 10_000_000;
 /// PASSIVE, no lock held (each table access is its own short `with_virtio`; every
 /// wire call and every pin unlock is outside it). Returns how many handles were
 /// closed or dropped.
-pub fn close_all_on_host(passive: PassiveLevel, adapter: &AdapterContext) -> u32 {
+pub fn close_all_on_host(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    budget: &SweepBudget,
+) -> u32 {
+    // The KMD's own RM client keeps a kernel view of an RM mapping: it must be
+    // unmapped BEFORE the host closes the file that holds the mapping (and whether
+    // or not the host is still being asked). Its handles are in the tables below
+    // under `DeviceOwner::KMD_RM`, so the sweep closes them like any other owner's.
+    // Idempotent: StopDevice sweeps explicitly and again through `retire_transport`.
+    super::rm_client::retire_begin(passive);
     let alive = adapter
         .with_virtio(|v| !v.transport_failed())
         .unwrap_or(false);
     if !alive {
         return 0;
     }
-    let started = crate::adapter::foreign_scanout::now_100ns();
     let mut sending = true;
-    // Asked before each send: a timeout or error ended sending, and so does a
-    // spent budget.
-    let still_sending = |sending: &mut bool| {
-        if *sending
-            && crate::adapter::foreign_scanout::now_100ns().wrapping_sub(started)
-                > SWEEP_SEND_BUDGET_100NS
-        {
+    // Asked before each send: how long the next command may wait, or `None` when
+    // a timeout or error already ended sending or the budget is spent.
+    let next_timeout_ms = |sending: &mut bool| -> Option<u64> {
+        if !*sending {
+            return None;
+        }
+        let timeout = budget.call_timeout_ms(crate::adapter::foreign_scanout::now_100ns());
+        if timeout.is_none() {
             *sending = false;
         }
-        *sending
+        timeout
     };
     // Mappings first (the ABI's order: unmap, then close).
     loop {
@@ -1348,10 +1391,10 @@ pub fn close_all_on_host(passive: PassiveLevel, adapter: &AdapterContext) -> u32
         let Some((handle, host_id)) = map else {
             break;
         };
-        if still_sending(&mut sending)
-            && release_host_map(passive, adapter, handle, host_id).is_err()
-        {
-            sending = false;
+        if let Some(timeout_ms) = next_timeout_ms(&mut sending) {
+            if release_host_map_within(passive, adapter, handle, host_id, timeout_ms).is_err() {
+                sending = false;
+            }
         }
     }
     let mut closed = 0u32;
@@ -1369,12 +1412,12 @@ pub fn close_all_on_host(passive: PassiveLevel, adapter: &AdapterContext) -> u32
         // A foreign scanout source on this file ends with it (a no-op after
         // `StopDevice` already reset the display state).
         adapter.foreign_scanout_release_handle(owner, handle);
-        if still_sending(&mut sending) {
+        if let Some(timeout_ms) = next_timeout_ms(&mut sending) {
             let mut req = [0u8; MSG_HDR];
             req[..4].copy_from_slice(&MSG_CLOSE.to_le_bytes());
             req[4..8].copy_from_slice(&handle.to_le_bytes());
             let mut resp = [0u8; MSG_HDR];
-            if ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, 5_000).is_err() {
+            if ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, timeout_ms).is_err() {
                 sending = false;
             }
         }
@@ -1403,12 +1446,18 @@ pub fn close_all_on_host(passive: PassiveLevel, adapter: &AdapterContext) -> u32
 /// when no stop came before it.
 ///
 /// Returns whether a transport was dropped. PASSIVE.
-pub fn retire_transport(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
+pub fn retire_transport(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    budget: &SweepBudget,
+) -> bool {
     let had = adapter.with_virtio(|_| ()).is_ok();
     if had {
-        close_all_on_host(passive, adapter);
+        close_all_on_host(passive, adapter, budget);
     }
     adapter.set_virtio(None);
+    // Its handles were closed by the sweep (or died with the transport): forget them.
+    super::rm_client::forget();
     if had {
         mark_views_stale(adapter);
     }
