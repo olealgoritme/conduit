@@ -433,12 +433,44 @@ unsafe fn dxgkddi_present_inner(
             }
         }
 
+        // Level 5 (`KmdRmClient` = 5): a Blt whose destination is the RM system-memory
+        // primary has no Present buffer behind it, so the arm below would fail the Present
+        // (`begin_present_buffer_write_legacy` knows no such buffer). It takes the CPU-copy
+        // fallback instead (docs/kmd-rm-client.md 15.17). `primary` is one relaxed load and
+        // `None` with the knob below 5, and for every destination that is not an adopted RM
+        // primary: those take the arm below, unchanged.
+        let rm_blt_primary = match (adapter, dst_info) {
+            (Some(adapter), Some(destination)) if present_flags & 1 != 0 => {
+                crate::virtio::rm_client::sysmem_blt::primary(adapter, destination.resource_id)
+            }
+            _ => None,
+        };
         // DXGK_PRESENTFLAGS.Blt is bit 0. Dxgkrnl has already resolved both
         // fixed allocation-list entries to our typed open handles. Perform the
         // actual full-surface source -> destination copy before emitting the
         // scheduler marker; a no-op Present leaves DWM's shared render target
         // black even though the application's source rendered correctly.
-        if present_flags & 1 != 0 {
+        if let Some(primary) = rm_blt_primary {
+            let Some(adapter) = adapter else {
+                PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
+                return STATUS_INVALID_PARAMETER;
+            };
+            // SAFETY: `args` is dxgkrnl's present struct for this call, and its flags name the
+            // Blt arm.
+            match unsafe {
+                present_blt_to_rm_primary(
+                    args,
+                    present_allocations,
+                    adapter,
+                    src_info,
+                    primary,
+                    stashed_snapshot.is_some(),
+                )
+            } {
+                Ok(capacity) => patch_capacity = Some(capacity),
+                Err(status) => return status,
+            }
+        } else if present_flags & 1 != 0 {
             let bytes = core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmd>() as UINT;
             if args.pDmaBuffer.is_null() || args.DmaSize < bytes {
                 PRESENT_LAST_STATUS.store(
@@ -1079,6 +1111,128 @@ unsafe fn dxgkddi_present_inner(
 
     PRESENT_LAST_STATUS.store(STATUS_SUCCESS as u32, Ordering::Relaxed);
     STATUS_SUCCESS
+}
+
+/// The last `PBCpy` this arm wrote: the value changes rarely and the legacy arm's per-Present
+/// registry write is not repeated here.
+static RM_BLT_LAST_CPY: AtomicU32 = AtomicU32::new(0);
+
+/// A Blt Present whose destination is the level 5 RM system-memory primary: the CPU-copy
+/// fallback (docs/kmd-rm-client.md 15.17, `virtio/rm_client/sysmem_blt.rs`).
+///
+/// Never fails the Present for an internal reason. What it refuses is what dxgkrnl's own protocol
+/// asks for (a DMA buffer too small for the marker the tail writes: dxgkrnl retries with a bigger
+/// one, so this checks before copying anything and the retry cannot copy twice) and a Present
+/// whose source handle names no allocation (nothing to read).
+///
+/// `Ok` carries the patch-capacity token the tail consumes, as the legacy arm's does.
+///
+/// # Safety
+/// `args` is dxgkrnl's `DXGKARG_PRESENT` for this call (PASSIVE_LEVEL: `DxgkDdiPresent` is
+/// documented PASSIVE_LEVEL), with the Blt flag set; `pDstSubRects` is valid for `SubRectCnt`
+/// entries when non-null.
+unsafe fn present_blt_to_rm_primary(
+    args: &mut DXGKARG_PRESENT,
+    present_allocations: PresentAllocations,
+    adapter: &AdapterContext,
+    source: Option<crate::ddi::create_allocation::PresentAllocInfo>,
+    primary: crate::virtio::rm_client::sysmem_blt::Primary,
+    has_snapshot: bool,
+) -> Result<PatchCapacity, NTSTATUS> {
+    use crate::virtio::rm_client::sysmem_blt;
+    use helios_kmd_logic::rm_blt::Rect;
+
+    let bytes = core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmd>() as UINT;
+    if args.pDmaBuffer.is_null()
+        || args.DmaSize < bytes
+        || args.pDmaBufferPrivateData.is_null()
+        || (args.DmaBufferPrivateDataSize as usize)
+            < core::mem::size_of::<PresentSubmissionPrivate>()
+    {
+        PRESENT_LAST_STATUS.store(
+            STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER as u32,
+            Ordering::Relaxed,
+        );
+        return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
+    }
+    // BEFORE any copy, as in the legacy arm: an insufficient-buffer retry must not duplicate it.
+    let capacity = match present_allocations.validate_patch_capacity(args) {
+        Ok(capacity) => capacity,
+        Err(status) => {
+            PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+            return Err(status);
+        }
+    };
+    let Some(source) = source else {
+        // Unreadable: no allocation behind the source handle.
+        crate::diag::record_named_bytes(b"PBCpy", 0xE1);
+        PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+
+    // SAFETY: PASSIVE_LEVEL, per the contract.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    let done = match sysmem_blt::classify(adapter, &source, has_snapshot) {
+        Ok(src) => {
+            let sub_count = if args.pDstSubRects.is_null() {
+                0
+            } else {
+                args.SubRectCnt
+            };
+            let sub_ptr = args.pDstSubRects;
+            let subs = (0..sub_count).map(move |i| {
+                // SAFETY: dxgkrnl's array of `SubRectCnt` RECTs, valid for this call; read
+                // unaligned because the DDI does not promise alignment.
+                let r = unsafe { core::ptr::read_unaligned(sub_ptr.add(i as usize)) };
+                Rect::new(r.left, r.top, r.right, r.bottom)
+            });
+            sysmem_blt::present(
+                passive,
+                adapter,
+                &primary,
+                src,
+                Rect::new(
+                    args.DstRect.left,
+                    args.DstRect.top,
+                    args.DstRect.right,
+                    args.DstRect.bottom,
+                ),
+                Rect::new(
+                    args.SrcRect.left,
+                    args.SrcRect.top,
+                    args.SrcRect.right,
+                    args.SrcRect.bottom,
+                ),
+                sub_count,
+                subs,
+            )
+        }
+        Err(why) => sysmem_blt::skipped(why),
+    };
+    // The GPU copy's fence is complete (waited for), so this gates nothing; it gives the
+    // scheduler a record that names no pending work instead of one a recycled DMA buffer left.
+    // The capacity was checked above, so this cannot fail.
+    let _ = unsafe {
+        PresentSubmissionPrivate::merge_fence(
+            args.pDmaBufferPrivateData,
+            args.DmaBufferPrivateDataSize,
+            done.fence.unwrap_or(0),
+        )
+    };
+    // 3 = copied by the CPU into the RM primary, 4 = skipped (answered with success).
+    let cpy = if done.skipped.is_some() { 4 } else { 3 };
+    if RM_BLT_LAST_CPY.swap(cpy, Ordering::Relaxed) != cpy {
+        crate::diag::record_named_bytes(b"PBCpy", cpy);
+    }
+    // The primary changed iff bytes were written (a skipped Present may have written some).
+    if done.wrote > 0 {
+        crate::virtio::rm_client::sysmem_flip::primary_changed(
+            adapter,
+            Edge::PresentBlt,
+            primary.resource_id,
+        );
+    }
+    Ok(capacity)
 }
 
 /// PASSIVE continuation for two-phase WindowedBlt presents. Present only

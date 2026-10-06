@@ -331,6 +331,11 @@ pub struct VenusClient {
     /// already-live local `VkDeviceMemory`; no resource-id heuristic or
     /// same-device re-import is permitted.
     owned_memory_blobs: Vec<OwnedMemoryBlob>,
+    /// The staging LINEAR image of the level 5 Blt CPU-copy fallback, and the allocation
+    /// attempts made for it (`present::RmBltStage`). `None` / 0 until a Blt into an RM
+    /// primary needed one: at levels below 5 nothing ever allocates it.
+    rm_blt_stage: Option<RmBltStage>,
+    rm_blt_stage_allocs: u32,
 }
 
 impl VenusClient {

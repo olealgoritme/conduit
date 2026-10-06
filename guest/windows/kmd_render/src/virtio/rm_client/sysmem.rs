@@ -196,6 +196,8 @@ pub(crate) fn publish_counters() {
     rec(b"RmSysRelWait", SYS_REL_WAIT.load(Ordering::Relaxed));
     rec(b"RmSysRelTmo", SYS_REL_TMO.load(Ordering::Relaxed));
     super::sysmem_flip::publish_counters();
+    // The Blt CPU-copy fallback (`RmSysBlt*`; 15.17): written once it has run.
+    super::sysmem_blt::publish_counters();
 }
 
 fn state_word(svc: &Svc) -> u32 {
