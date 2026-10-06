@@ -72,6 +72,21 @@ unsafe extern "system" {
     fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
 }
 
+// The KMD-view loss table shared with the Venus ICD
+// (`umd_common/bridge/helios_kmdmap.h`, compiled in by `bridge_kmdmap.cpp`).
+// The KMD maps the ledger page into this process itself and unmaps it in
+// DxgkDdiDestroyDevice when it stops under live processes (a live driver
+// update); a registered page that vanishes is backed with zeros instead of
+// faulting (dwm.exe died here at the 319.1 -> 319.2 swap), and the device's
+// recorded loss epoch moves so the readers below stop using it.
+unsafe extern "C" {
+    fn helios_kmdmap_c_attach() -> i32;
+    fn helios_kmdmap_c_detach();
+    fn helios_kmdmap_c_register(va: *const core::ffi::c_void, size: u64, owner: u64);
+    fn helios_kmdmap_c_unregister_owner(owner: u64);
+    fn helios_kmdmap_c_lost(epoch: i32) -> bool;
+}
+
 /// Probe latch. UNKNOWN until the first device init runs the probe; then OK or
 /// OFF for the rest of the process — "never retry per present" is the §4
 /// contract, and per-device init reads the latch instead of re-probing.
@@ -152,6 +167,10 @@ struct DeviceEntry {
     /// User VA of this device's read-only [`HeliosReadLedgerPage`] view.
     /// 0 = mapping failed; the entry then contributes nothing to lookups.
     ledger_va: usize,
+    /// Loss epoch at the time the ledger view was registered in the shared
+    /// KMD-view table (only meaningful with `ledger_va != 0`). Once the epoch
+    /// moves the KMD is gone and the view is zeros, so readers skip it.
+    loss_epoch: i32,
     /// Owned auto-reset event handle (0 = creation failed).
     event: usize,
     /// Whether the KMD accepted the REGISTER (TABLE_FULL leaves the event
@@ -369,6 +388,13 @@ unsafe fn ledger_page_valid(va: usize) -> bool {
         && slot_count == HELIOS_READ_LEDGER_SLOTS as u32
 }
 
+/// A ledger view the readers may use: mapped, and the KMD that mapped it has
+/// not gone away since (after a loss the view is zero pages, see above).
+fn ledger_live(e: &DeviceEntry) -> bool {
+    // SAFETY: plain call into bridge_kmdmap.cpp.
+    e.ledger_va != 0 && !unsafe { helios_kmdmap_c_lost(e.loss_epoch) }
+}
+
 /// Recompute the fast-path flag from the registry. Call under the mutex.
 fn recompute_enabled(entries: &[DeviceEntry]) {
     let on = crate::scanout_acquire_knob()
@@ -468,6 +494,8 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
         }
     }
 
+    // Loss epoch recorded when the ledger view is registered (below).
+    let mut loss_epoch: i32 = 0;
     // Map this device's read-only view of the ledger page.
     // SAFETY: as for the probe above.
     let ledger_va = match unsafe {
@@ -497,6 +525,17 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
             // the checked conversion preserves its address and full extent.
             let valid = va.filter(|va| unsafe { ledger_page_valid(*va) });
             if let Some(va) = valid {
+                // SAFETY: plain calls into bridge_kmdmap.cpp; `va` is the
+                // KMD's live view of `out_size` bytes, owned by this device
+                // (keyed by `key`) until teardown unregisters it.
+                unsafe {
+                    loss_epoch = helios_kmdmap_c_attach();
+                    helios_kmdmap_c_register(
+                        va as *const core::ffi::c_void,
+                        u64::from(m.out_size),
+                        key as u64,
+                    );
+                }
                 va
             } else {
                 log_error!(
@@ -579,6 +618,7 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
         rt_adapter,
         kt_callbacks: kt_callbacks as usize,
         ledger_va,
+        loss_epoch,
         event,
         event_registered,
     });
@@ -644,6 +684,12 @@ pub(crate) fn teardown_for_device(key: usize) {
         unsafe { CloseHandle(entry.event as *mut core::ffi::c_void) };
     }
     if entry.ledger_va != 0 {
+        // Out of the shared KMD-view table BEFORE the KMD unmaps the view.
+        // SAFETY: plain calls into bridge_kmdmap.cpp, paired with init.
+        unsafe {
+            helios_kmdmap_c_unregister_owner(entry.key as u64);
+            helios_kmdmap_c_detach();
+        }
         // SAFETY: as for the unregister escape above.
         let unmapped = unsafe {
             escape_map_ledger(
@@ -698,7 +744,7 @@ pub extern "C" fn helios_scanout_ledger_lookup_v2(
     let Ok(reg) = REGISTRY.lock() else {
         return false;
     };
-    let Some(va) = reg.iter().find(|e| e.ledger_va != 0).map(|e| e.ledger_va) else {
+    let Some(va) = reg.iter().find(|e| ledger_live(e)).map(|e| e.ledger_va) else {
         return false;
     };
     // SAFETY: `va` belongs to a registered entry and the registry mutex is
@@ -759,7 +805,7 @@ pub extern "C" fn helios_scanout_ledger_snapshot_v2(
     let Ok(reg) = REGISTRY.lock() else {
         return 0;
     };
-    let Some(va) = reg.iter().find(|e| e.ledger_va != 0).map(|e| e.ledger_va) else {
+    let Some(va) = reg.iter().find(|e| ledger_live(e)).map(|e| e.ledger_va) else {
         return 0;
     };
     // SAFETY: see helios_scanout_ledger_lookup_v2 — same mutex-held contract.
