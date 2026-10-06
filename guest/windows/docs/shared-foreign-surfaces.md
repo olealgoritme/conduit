@@ -373,3 +373,74 @@ queue there).
   (resource, file), not per call, but the caller's files are its own quota).
 * `ATTACH_ENFORCE`: when to turn it on (section 4), and whether the named context should also
   have to belong to the caller.
+
+## 11. Shared placeholder allocations
+
+**The case.** An NVK process that cannot mint a resource id for a SHARED texture (A8,
+R10G10B10A2, fp16, R8G8, NV12 without the shared-format cap, BGRA8 with
+`NVK_HELIOS_RESID=0`) still has to give the D3D runtime a WDDM allocation, so the UMD creates a
+placeholder: kind `STANDARD`, adopt id 0, context 0, 96 bytes of private data
+(`HeliosWddmAllocPrivate` + `HeliosWddmAllocMeta`, no layout trailer), the shared creation flag set
+(`CARFlg` reads 3). It is never flipped, scanned out or copied; NVK exchanges the real content by
+other means. It used to fail `pfnAllocateCb`, which the runtime turns into
+`DXGI_ERROR_DEVICE_REMOVED` (the app loses its device).
+
+**Why it failed.** Nothing in `dxgkddi_create_allocation` looks at the shared flag or refuses an
+identity-less `STANDARD` allocation, and `create_one` (`create_allocation.rs`) has no
+`STATUS_INVALID_PARAMETER` for this shape (its four are: a short or invalid private record, a
+contradictory tracking record, a failed adoption, and the RM-export `blob_mem`). What the shape did
+was take the ordinary `STANDARD` path: `classify` answers `KmdStandardBuffer`, `build_backing` creates
+a real Venus present buffer (`allocate_present_buffer_blob`: a Vulkan buffer, device memory and a
+command submission on the host Venus renderer, then `register_present_buffer`), the allocation is
+BAR-placed and `CpuVisible`, and its open takes the dedicated-Present-buffer capability
+(`dxgkddi_open_allocation`: `creator_process == 0` fails with `STATUS_INVALID_PARAMETER`, an
+unregistered buffer with `STATUS_INSUFFICIENT_RESOURCES`). That machinery is built for the
+KMD-originated DWM / IddCx surfaces, needs a live Venus client (`STATUS_DEVICE_NOT_READY` otherwise,
+which is not in `DxgkDdiCreateAllocation`'s legal set), and had never carried a UMD-created SHARED
+allocation. The exact failing return was not captured (there is no VM in this review): the registry
+breadcrumbs `0x0C01_00E1`, `0x0C01_00E2`, `0x0C01_00E3` and `0x0C02_00E4`, and `PBOwn`, say which on
+the next run. The fix does not depend on which: a placeholder no longer takes any of those paths.
+
+**What it is now** (`helios_kmd_logic::shared_placeholder`, host-tested; the I/O half is
+`kmd_render/src/ddi/shared_placeholder.rs`). A shared, identity-less `STANDARD` allocation is created
+HOST-LESS:
+
+* resource id 0, the "unbacked allocation" every resource-keyed path already treats as nothing
+  (`scanout_alloc_info` refuses it, the BAR paging arms skip a non-BAR allocation, destroy has
+  nothing to release): no Venus context needed, no host round-trip, aperture placement exactly like
+  every adopted allocation (the shared shape the foreign adoption already proves), not BAR-eligible,
+  not a dedicated Present buffer;
+* no identity is written back: the private data stays what the creator wrote (adopt id 0), so every
+  opener reads "no identity" and no Venus UMD can mistake the allocation for a Venus resource it
+  could import.
+
+**The decision table** (first matching row wins; every row but the last two is the ordinary path,
+validated exactly as before):
+
+| row | verdict |
+|---|---|
+| kind is not `STANDARD` | ordinary (`NotStandard`) |
+| `CreateShared` (`DXGK_CREATEALLOCATIONFLAGS` bit 1) clear | ordinary (`NotShared`) |
+| adopt id != 0 | ordinary (`AdoptId`: the adoption is validated as today) |
+| creator context != 0 | ordinary (`Context`: the KMD-originated surfaces) |
+| private size != 96 | ordinary (`PrivateSize`: 128 / 144 carry a layout trailer) |
+| any identity bit: blob id, RM-export `blob_mem`, tracker flag, layout trailer, `PRIMARY`, `OPTIMAL_GDI_TEXTURE`, `DIRECT_SCANOUT`, a standard-allocation or GDI type | ordinary (`Identity`) |
+| size above 4 GiB | refused (`TooLarge`): `STATUS_NO_MEMORY`, the runtime's `E_OUTOFMEMORY` for that one resource |
+| otherwise | placeholder |
+
+**Open by another process.** An opener reads no identity (`present: None`), so
+`DxgkDdiOpenAllocation` succeeds and the Present rules see an unresolved allocation: the
+foreign-unknown skip-and-count of `present_foreign` (`zero-copy-present.md`), never a misread. The
+opener's UMD makes its own blank placeholder (an NVK DWM) or refuses the open (any other NVK
+process), as it does today for any id-less resource; the placeholder never carries content between
+processes, and the KMD never resolves it to a resource for a copy, a Blt or a scan-out.
+
+**Counters** (registry: first event and every 64th): `ShPhMade` / `ShPhBytes` (created, last size),
+`ShPhRefuse` (soft refusals), `ShPhNear` (shared id-less `STANDARD` allocations that were not
+placeholders; `ShPhWhy` holds the reason, `Existing::code` 1..6 or `Refusal::code` 0x10), `ShPhOpen`
+(identity-less opens of the placeholder shape), `ShPhFree` (destroyed).
+
+**Not decided here.** An UNSHARED id-less `STANDARD` allocation keeps the Venus present-buffer path
+(a primary is never a placeholder). If the next run shows `ShPhNear` moving, the UMD is sending a
+size or trailer this table does not name; if `CARFlg` is not 3 for a shared texture, bit 1 is not
+`CreateShared` and the table's second row needs the right bit.

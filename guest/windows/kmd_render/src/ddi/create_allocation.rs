@@ -2131,6 +2131,17 @@ unsafe fn destroy_allocation_ctx(
         drop(ctx);
         return;
     }
+    // A shared placeholder has no host resource, image or memory: nothing resource-keyed to
+    // release (and the resource-keyed calls below would act on "id 0", which is the empty
+    // marker of several tables). Only a deferred SetVidPnSourceAddress that names this handle
+    // must be cancelled before the Box goes.
+    if ctx.resource_id == 0 && ctx.venus_memory_id == 0 && ctx.venus_image_id == 0 {
+        unregister_scanout_allocation_handle(allocation_handle);
+        let _ = adapter.retire_scanout_allocation(passive, allocation_handle, 0);
+        crate::ddi::shared_placeholder::note_destroyed();
+        drop(ctx);
+        return;
+    }
     // Withdraw the DMA-flip lookup FIRST: after this no Present can resolve
     // this resource id to a handle whose Box is about to be dropped.
     unregister_scanout_allocation(ctx.resource_id);
@@ -2426,6 +2437,29 @@ struct CreatedBacking {
 pub(crate) enum SystemBackingPolicy {
     None,
     PresentLinearBuffer,
+}
+
+/// The backing of a shared placeholder (`helios_kmd_logic::shared_placeholder`): no host
+/// resource at all. Resource id 0 is the "unbacked allocation" every resource-keyed path
+/// already answers with nothing (`scanout_alloc_info` refuses it, `bar_virtual_transfer`
+/// skips a non-BAR allocation, `destroy_allocation_ctx` has nothing to release), the size is
+/// accounting only (not BAR-eligible: aperture placement, like every adopted allocation), and
+/// the geometry is the creator's, passed through.
+fn placeholder_backing(ap: &HeliosWddmAllocPrivate, meta: &HeliosWddmAllocMeta) -> CreatedBacking {
+    CreatedBacking {
+        resource_id: 0,
+        venus_memory_id: 0,
+        venus_image_id: 0,
+        pitch: meta.pitch,
+        plane_offset: meta.plane_offset,
+        dxgi_format: meta.dxgi_format,
+        venus_alloc_size: 0,
+        memory_type_index: 0,
+        blob_size: BackingSize::NonHostAuthoritative(ap.size),
+        system_backing_policy: SystemBackingPolicy::None,
+        dedicated_present_buffer: false,
+        foreign: ForeignBacking::No,
+    }
 }
 
 /// Produce the backing for one classified allocation.
@@ -2780,6 +2814,7 @@ unsafe fn create_one(
     resource_private_size: UINT,
     info: &mut DXGK_ALLOCATIONINFO,
     resource_associated: bool,
+    create_flags: u32,
 ) -> Result<(), NTSTATUS> {
     // ── Read + validate the ICD's private driver data ───────────────────────
     //
@@ -2847,11 +2882,30 @@ unsafe fn create_one(
     }
     let mut ap = ap;
     let mut supplied_resource_id = 0u32;
+    // A SHARED, identity-less STANDARD allocation is a placeholder (NVK has no resource id for
+    // the texture): host-less backing instead of a Venus present buffer. Anything carrying an
+    // identity, and every unshared allocation, is `false` here and validated as before. The
+    // decision and its table: `helios_kmd_logic::shared_placeholder`.
+    let placeholder_input = crate::ddi::shared_placeholder::create_input(
+        &ap,
+        create_flags,
+        priv_len,
+        meta.misc_flags,
+        unsafe { read_layout_trailer(priv_ptr as *const c_void, priv_len as UINT) }.is_some(),
+    );
+    let placeholder_verdict = helios_kmd_logic::shared_placeholder::decide(&placeholder_input);
+    crate::ddi::shared_placeholder::note_verdict(&placeholder_input, placeholder_verdict);
+    let placeholder = match placeholder_verdict {
+        helios_kmd_logic::shared_placeholder::Verdict::Placeholder => true,
+        helios_kmd_logic::shared_placeholder::Verdict::Existing(_) => false,
+        // A soft, per-resource failure (E_OUTOFMEMORY), never a removed device.
+        helios_kmd_logic::shared_placeholder::Verdict::Refuse(_) => return Err(STATUS_NO_MEMORY),
+    };
     if ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
-        if ap.ctx_id == 0 {
+        if ap.ctx_id == 0 && !placeholder {
             ap.ctx_id = adapter.venus_ctx_id();
         }
-        if ap.ctx_id == 0 {
+        if ap.ctx_id == 0 && !placeholder {
             crate::diag::record(0x0C01_00E2);
             return Err(STATUS_DEVICE_NOT_READY);
         }
@@ -2923,7 +2977,11 @@ unsafe fn create_one(
     // PRIMARY | OPTIMAL_GDI_TEXTURE combination, which classifies as the primary.
     let is_optimal_gdi_texture = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
         && (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE) != 0;
-    let created = build_backing(passive, adapter, backing, &ap, &meta, &foreign_input)?;
+    let created = if placeholder {
+        placeholder_backing(&ap, &meta)
+    } else {
+        build_backing(passive, adapter, backing, &ap, &meta, &foreign_input)?
+    };
 
     // THE one update site. `meta`/`ap` used to be mutated in place by each arm
     // and read again 100-470 lines later, with nothing stating which fields an
@@ -2979,7 +3037,10 @@ unsafe fn create_one(
         // imports attach explicitly through HELIOS_ESCAPE_ATTACH_RESOURCE.
         crate::diag::record(0x0C3A_1000 | (resource_id & 0x0FFF));
     }
+    // A placeholder records NO identity: its private data stays what the creator wrote (adopt
+    // id 0), so every opener reads "no identity" and none can mistake it for a Venus resource.
     if ap.kind != HELIOS_WDDM_ALLOC_KIND_TRACKING
+        && !placeholder
         && write_target_len >= size_of::<HeliosWddmOpenIdentity>()
         && !write_target.is_null()
     {
@@ -3283,6 +3344,9 @@ unsafe fn create_one(
     crate::diag::record(0x0C16_0000 | (meta.width.min(0xFFFF) as u32));
     crate::diag::record(0x0C17_0000 | (meta.height.min(0xFFFF) as u32));
     crate::diag::record(0x0C18_0000 | (meta.format & 0xFFFF));
+    if placeholder {
+        crate::ddi::shared_placeholder::note_created(ap.size);
+    }
     Ok(())
 }
 
@@ -3376,6 +3440,7 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
                 args.PrivateDriverDataSize,
                 info,
                 wants_resource,
+                create_flags,
             )
         } {
             // Unwind the allocations already created in this call, then the
@@ -3641,6 +3706,17 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 .or_else(|| read_alloc_identity(args.pPrivateDriverData, args.PrivateDriverSize))
         };
         let resource_id = ident.map(|d| d.resource_id).unwrap_or(0);
+        if ident.is_none() {
+            // A shared placeholder (or any allocation with no identity) opens with no
+            // identity: counted, never resolved to a resource.
+            unsafe {
+                crate::ddi::shared_placeholder::note_identityless_open(
+                    info.pPrivateDriverData,
+                    info.PrivateDriverDataSize,
+                    meta.map_or(0, |m| m.misc_flags),
+                );
+            }
+        }
 
         // C1 liveness gate: an identified allocation whose venus resource is no
         // longer alive must FAIL the open loudly. Succeeding here is what used

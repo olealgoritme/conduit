@@ -86,7 +86,9 @@ format outside the table, a 3-plane or disjoint image, more than one mip or
 layer, MSAA, a plane with a tiling outside the family, and, without the KMD
 cap, anything but 32 bpp RGB. The UMD then makes the KMD placeholder allocation
 it makes today for an id-less texture, and the opener sees an ordinary
-non-foreign resource (refused on NVK, blank placeholder in an NVK DWM).
+non-foreign resource (refused on NVK, blank placeholder in an NVK DWM). A SHARED
+placeholder is created host-less by the KMD (no Venus buffer, no identity;
+`shared-foreign-surfaces.md` section 11), so it succeeds without a resource id.
 
 ## 4. Protocol (on this branch, `guest/windows/protocol`)
 
