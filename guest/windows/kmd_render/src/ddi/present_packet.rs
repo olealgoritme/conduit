@@ -261,6 +261,12 @@ const _: () = {
 pub(crate) static PRESENT_MARKER_WRITES: AtomicU32 = AtomicU32::new(0);
 pub(crate) static PRESENT_MARKER_LAST_FENCE: AtomicU32 = AtomicU32::new(0);
 pub(crate) static PRESENT_MARKER_LAST_SIZE: AtomicU32 = AtomicU32::new(0);
+/// Boundaries of two different streams / RM gates that met in one DMA buffer, where
+/// the later present's wait could not be kept (`PrBndDrop`): the present may be
+/// released before its producer finished. `helios_kmd_logic::rm_fence_present::
+/// merge_stream_boundaries` says when. Expected zero for a client that uses one
+/// kind of marker per context.
+pub(crate) static PRESENT_BOUNDARY_DROPPED: AtomicU32 = AtomicU32::new(0);
 
 /// KMD-private scheduler handoff for a BLT submitted while building Present.
 ///
@@ -364,9 +370,16 @@ impl PresentSubmissionPrivate {
     }
 
     /// Merge one same-context registered stream boundary into this submission.
-    /// A context owns at most one live stream, so repeated Present records can
-    /// only advance the same generation-qualified handle.  Different handles
-    /// are refused instead of being numerically compared across namespaces.
+    /// Values of one generation-qualified handle are monotonic and merge to the
+    /// larger; handles are never compared numerically across namespaces.
+    ///
+    /// A context may carry more than one handle in one DMA buffer: a registered
+    /// stream and the process's RM gate (a fenced present beside a CPU-complete
+    /// marker, or a stream present beside a fence). The merge NEVER fails the
+    /// Present for that, since by then Render has already taken the fence handle.
+    /// The rules, and why the older wait is the one kept when two real waits
+    /// collide, are `rm_fence_present::merge_stream_boundaries`; a dropped wait is
+    /// counted (`PrBndDrop`).
     pub(crate) unsafe fn merge_stream_boundary(
         private_data: *mut c_void,
         private_size: u32,
@@ -393,19 +406,17 @@ impl PresentSubmissionPrivate {
         } else {
             (0, 0, 0)
         };
-        let merged_boundary = if old_boundary == 0 || old_boundary == boundary {
-            boundary
-        } else if (old_boundary >> 63) == 1
-            && (boundary >> 63) == 1
-            && ((old_boundary >> 32) & 0x7fff_ffff) == ((boundary >> 32) & 0x7fff_ffff)
-        {
-            // Same stream handle: values are monotonic, so the later/larger
-            // value subsumes the earlier marker without crossing namespaces.
-            let value = (old_boundary as u32).max(boundary as u32);
-            (boundary & !0xffff_ffff) | value as u64
-        } else {
-            return Err(STATUS_INVALID_PARAMETER);
-        };
+        // A boundary that carries a WindowedBlt token stays (the token is valid only
+        // under it).
+        let merged = helios_kmd_logic::rm_fence_present::merge_stream_boundaries_with(
+            old_boundary,
+            boundary,
+            blt_token != 0,
+        );
+        if merged.dropped {
+            PRESENT_BOUNDARY_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        let merged_boundary = merged.boundary;
         unsafe {
             core::ptr::write_unaligned(
                 private_data.cast::<PresentSubmissionPrivate>(),
@@ -450,25 +461,29 @@ impl PresentSubmissionPrivate {
         } else {
             (0, 0, 0)
         };
-        let same_stream = old_boundary == 0
-            || (old_boundary >> 63) == 1
-                && ((old_boundary >> 32) & 0x7fff_ffff) == ((boundary >> 32) & 0x7fff_ffff);
-        if !same_stream {
+        // The same handle merges as it always did. A different handle (a gate beside
+        // a stream) replaces a plain boundary of the buffer, because the request is
+        // valid only under its own boundary; only a second request of another handle
+        // cannot be carried (the caller cancels it). See `merge_blt_boundaries`.
+        let Some(merged) = helios_kmd_logic::rm_fence_present::merge_blt_boundaries(
+            old_boundary,
+            old_token,
+            boundary,
+            token,
+        ) else {
             return Err(STATUS_INVALID_PARAMETER);
-        }
-        let merged_boundary = if old_boundary == 0 || old_boundary == boundary {
-            boundary
-        } else {
-            (boundary & !0xffff_ffff) | u64::from((old_boundary as u32).max(boundary as u32))
         };
+        if merged.dropped {
+            PRESENT_BOUNDARY_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
         unsafe {
             core::ptr::write_unaligned(
                 private_data.cast::<PresentSubmissionPrivate>(),
                 Self::for_parts(
                     PRESENT_SUBMISSION_MAGIC,
                     gpu_fence_id,
-                    merged_boundary,
-                    old_token.max(token),
+                    merged.boundary,
+                    merged.token,
                 ),
             );
         }

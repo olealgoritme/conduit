@@ -41,8 +41,17 @@ Three carriers, one fence object:
   `EVENT_REGISTER`, `FORWARD` on or reuse the handle: the KMD re-tags the entry to its own
   owner (`DeviceOwner::KMD_RM`), so every such call answers `NOT_OWNED`. The KMD closes the
   handle on the host when it fires, and on every teardown (see below).
-  A REFUSED carrier changes nothing: the handle stays the caller's, who may CPU-wait on
-  the semaphore and `Close` it as usual.
+  A REFUSED carrier whose call status the caller sees ((a), and `HE12` v4: `Render`
+  fails) changes nothing: the handle stays the caller's, who may CPU-wait on the
+  semaphore and `Close` it as usual. A `HERF` / `HEPR` tail is the exception, because
+  its `Render` returns success whatever became of the tail and the UMD cannot learn a
+  refusal: **for ANY parsed fence tail whose handle is a fence of the presenting
+  process, the KMD takes and closes the handle, attached as the present's marker or
+  not** (see (b) below). A handle that is not such a fence (another process's, not a
+  fence, already the KMD's) is never touched.
+  When the KMD takes a handle, what its creator had registered on it (`EVENT_REGISTER`)
+  is released at the same time: the KMD's own close does not release registrations
+  the way a user `Close` does.
 * **The wait value is baked into the fence.** `rm_fence_value` exists only in the (b) tail
   and is diagnostic: it is never read for a decision. (a) has no room for it and drops it.
 * **Fire:** the host sends one `EventReady{handle}` whose header `status` is 0 or the
@@ -143,8 +152,9 @@ struct HeliosRmFenceTail {
   bumped version would be ignored whole and lose the scanout-refresh arm. The tail is read
   only when `CommandLength >= 48`. The stream tail (`present_ctx_id`, `present_value`,
   `present_cookie`) must be zero when a fence is carried: the two markers are EXCLUSIVE; a
-  record carrying both is not attached (counted `RmGRef`), the present follows the legacy
-  rule.
+  record carrying both has its stream marker honoured and its fence NOT attached
+  (counted `RmGRef`); the fence handle is still taken and closed (`RmGTake`, see the
+  refusal rule below).
 * **`HEPR`** (`HeliosPresentRenderCmd`, 80 B): append the tail, 96 B, set
   `present.reserved |= HELIOS_PRESENT_PRIVATE_FLAG_RM_FENCE` (bit 3). Honoured only when
   the command covers all 96 bytes and the flag is set; same exclusivity. Same reasoning
@@ -158,7 +168,21 @@ struct HeliosRmFenceTail {
   version IS bumped**: an older KMD refuses a v4 record (`Render` fails with
   `STATUS_INVALID_PARAMETER`), which is the right failure for D3D12, where silently
   skipping the completion proof would let a runtime fence signal early. Hence the gate on
-  `HELIOS_NVRM_CAP_PRESENT_FENCE`.
+  `HELIOS_NVRM_CAP_PRESENT_FENCE`. `HE12` is carrier (a)-like: the UMD sees `Render`'s
+  status, so every refusal leaves the handle the caller's, and everything that can
+  still refuse is checked BEFORE the fence is taken: a context's last bound stream must
+  be this process's gate (or none yet; a context that mixed stream and fence `HE12`s is
+  refused up front, not after the take), and `Render`'s own argument checks (patch
+  lists) come before any parsing of tails.
+* **Refusal rule for `HERF` / `HEPR` (the UMD cannot see it).** Their `Render` returns
+  success whatever became of the tail, so a handle the KMD merely declined would leak
+  one of the process's 128. For ANY parsed tail (`flags != 0` or a handle, and
+  `CommandLength` covering it) whose handle is a fence of the presenting process (the
+  ownership check below), the KMD takes and closes the handle whether or not the
+  marker is attached: both markers in one record, a partial stream tail, a tail
+  without `FENCE`, no gate or point room, an unserved host. `RmGRef` counts the markers
+  refused, `RmGTake` the handles taken and closed without a marker. Nothing is taken
+  that is not such a fence.
 * **Ownership check.** The Render/Present context belongs to the D3DKMT device of the
   runtime, NOT to the NVRM escape device that created the fence (NVK's NVRM device
   differs from the WDDM device), so "same device" cannot be verified at `DISPATCH` and is
@@ -168,9 +192,15 @@ struct HeliosRmFenceTail {
   the 0x55 reply (the escape device is alive then; reading it later, from Render, could
   race its destruction). The entry must also be a fence (`device_type` 511), not already
   attached, and not owned by the KMD already. Any failure drops the marker (counted
-  `RmGRef`) and the present follows the legacy rule; nothing is closed or consumed.
+  `RmGRef`) and the present follows the legacy rule; for `HE12` nothing is closed or
+  consumed, for `HERF` / `HEPR` the handle is taken and closed when it passes the same
+  claim (see the refusal rule above). The check is read-only and runs BEFORE a gate
+  or stream slot is taken, so a junk handle opens no gate (a gate would last until the
+  process exits).
   Cost: a linear scan of the (at most 1024) handle table under `virtio_lock`, no
-  allocation, no PASSIVE-only lock; it runs at `DISPATCH` in the Present DDI.
+  allocation, no PASSIVE-only lock; the table work runs at `DISPATCH` inside
+  `DxgkDdiRender` (PASSIVE), which then releases what the creator registered on the
+  handle and, with no HPD worker, runs the worker's pass (below).
 * **Representation (KMD-internal; the ABI above does not depend on it).** The boundary
   stays in the existing tagged stream namespace (bit 63 set, generation-qualified 31-bit
   handle, 32-bit value), so every consumer of boundaries keeps working unchanged:
@@ -183,6 +213,20 @@ struct HeliosRmFenceTail {
   of the gate fired (prefix retirement, so a merged DMA buffer carrying two presents of
   one process waits for both, and an out-of-order fire never lets a later point read as
   retired before an earlier one).
+* **Two handles in one DMA buffer.** The private record carries ONE boundary, and a
+  process can now put two handles in a buffer (a gate and a registered stream: a fenced
+  present beside the CPU-complete marker `(ctx, 0, cookie)`, or a stream beside a
+  fence). Merging never fails the Present (its fence was already taken at Render)
+  (`kmd_logic::rm_fence_present::merge_stream_boundaries`): the same handle takes the
+  larger value; a value-0 ("already complete") boundary of either handle is no
+  dependency and gives way, lossless; two handles that both wait keep the OLDER wait
+  and drop the later present's, counted `PrBndDrop` (a present may then be released
+  before its producer finished). Why the older and not the wire watermark: that
+  fallback would drop BOTH waits, and the legacy watermark does not cover an RM gate's
+  work at all. A WindowedBlt request (token) is valid only under its own boundary, so
+  it replaces a plain boundary of another handle (`PrBndDrop` if that one waited), and
+  two requests of different handles in one buffer are the one case still refused (the
+  request is cancelled, as before).
 * **Retirement.** `EventReady{handle, status}` in the `nvrm_events` DPC marks the fence
   fired (once; a second `EventReady` for the number is ignored), fires its gate point,
   advances the gate's retired value, observes pending execution waits, and the same DPC
@@ -193,8 +237,15 @@ struct HeliosRmFenceTail {
   `ExecuteCommandLists` in flight than that has its next v4 record refused: the UMD then
   falls back to a CPU wait plus the `COMPLETE` variant), and a gate refuses past 2^32 - 1025
   points (about 49 days at 1000 presents/s; it is recycled when its process exits). The
+  KMD holds at most 512 fence handles as its own at a time (attached or owed a close,
+  `MAX_NVRM_ATTACHED_FENCES`): a fence leaves its creator's 128-per-process quota when
+  the KMD takes it and is counted there instead, so attached fences can neither fill the
+  table nor starve the KMD's own RM client (which shares the `KMD_RM` owner); past the
+  bound the carrier is refused like a full gate (`NoRoom`, `QUEUE_FULL` for (a)). The
   generic `WddmHeadMs` bound (250 ms by default) applies to a gate boundary like to any
   stream boundary: a frame whose fence takes longer is released early, counted `WfBReb`.
+  It does not apply to an `HE12` (execution) packet, which keeps every completion
+  obligation and is only ended by its fence, a purge of its gate, or a scheduler reset.
 
 ## What the UMD/NVK sends when it wants no fence
 
@@ -220,6 +271,19 @@ The retire-on-teardown for (b) follows the existing dead-stream rule: a purged s
 an explicit cancellation, the DMA fence completes (otherwise the adapter-wide, head of line
 WDDM FIFO would stall until the `WddmHeadMs` rebase), and the event is counted.
 
+Two kinds of wait name a gate, and a purge ends both explicitly. A plain present or
+windowed-blit wait (`stream_boundary` of a FIFO entry) is discharged by
+`discharge_dead_present_stream_waits`, as for any dead stream. An `HE12` EXECUTION wait is
+NOT touched by that function (it skips every entry with an execution wait, and an
+execution packet is never rebased: it must keep every completion obligation), so the gate's
+own cancel (`rm_gate_cancel`, which runs for the process purge and for the transport
+purge alike) latches the execution waits that named its stream handle as ended, in the
+same step that hands its fences to the closer. Without that, a purge would leave such a
+packet pinned at the head of the adapter-wide FIFO for good (nobody can fire a closed
+fence). A Venus stream's execution waits keep their own, unchanged rule. In practice
+dxgkrnl has retired a process's DMA buffers before `DestroyProcess`; this is the net
+under an abnormal exit.
+
 ## Capability bits
 
 `HeliosNvrmQueryCaps` has no spare field and keeps its 88 bytes. `supported_ops` is a
@@ -243,9 +307,12 @@ foreign scanout's `SCANOUT_BUSY` / `NO_SOURCE`). Reused: `NOT_OWNED`, `FORBIDDEN
 `FsFErr` fired with an error status, `FsFEarly` queued already fired, `FsFSkip` ready entries
 superseded, `FsFDrop` dropped unsent, `FsFRef` refused, `FsFFull` refused for a full queue.
 Waiting now = `FsFQue - FsFSent - FsFSkip - FsFDrop`.
-(b): `RmGAtt` points attached, `RmGFire`, `RmGErr`, `RmGEarly`, `RmGCan` cancelled by
+(b): `RmGAtt` points attached, `RmGFire`, `RmGErr` (including a fence that fired with an
+error before its create was recorded), `RmGEarly`, `RmGCan` cancelled by
 teardown, `RmGRef` markers refused (not owned / not a fence / already attached / both
-markers / no gate room).
+markers / no gate room or fence quota), `RmGTake` handles of a `HERF` / `HEPR` tail
+taken and closed although no marker was attached (the refusal rule), `PrBndDrop`
+boundaries of two handles that met in one DMA buffer and cost the later present its wait.
 Common: `NvFenceCl` (existing) counts every fence handle closed, including the KMD's;
 `FnCloseErr` counts the KMD's closes the host did not take.
 
@@ -262,7 +329,32 @@ Common: `NvFenceCl` (existing) counts every fence handle closed, including the K
   HPD worker's, outside every lock.
 * Double retire is impossible by construction: a point and a queue entry have one
   `fired` bit set by the first `EventReady`; the handle's `Close` is taken from the table
-  by the one worker (take-then-send).
+  by the one worker (take-then-send). A `Close` is only ever owed for an entry that is
+  the KMD's (owner `KMD_RM`) and attached to something, so a stale queue entry or a
+  purged gate's point cannot close a live fence of someone else if the host reused the
+  number.
+* **No HPD worker** (render-only `DisplayHalf=0`, or its creation failed). The fence path
+  does not need one (`rm_fence_served` checks the event queue and the host feature, not
+  the worker), so the work that is the worker's goes to a PASSIVE thread that is there
+  anyway: every NVRM escape ends with the fence pass (as it already ends with the
+  counter mirror), and the `Render` that takes a fence runs it too. Making the fence
+  path require the worker instead would have switched off the `HE12` v4 path, the one
+  render-only use. With a worker, none of this runs.
+* **`DestroyProcess`** runs for every process exit, so it first reads one atomic (the
+  count of open gates) and returns at once when it is zero: no `wddm_notify_lock`, no
+  `virtio_lock`, and the adapter pointer is not even dereferenced. A gate lives in the
+  transport, which the adapter owns, and the transport's `Drop` purges every gate (and
+  zeroes the count) before the adapter can go, so while the count is nonzero the
+  adapter is alive. The purge it then runs only wakes the worker for the `Close`s it
+  owes; with no worker the next NVRM escape or fence `Render` sends them.
+* **The pass is bounded** (the HPD worker runs it, and `stop_hpd` joins the worker for
+  5 s, twice): each host round trip (a queued flip, a `Close`) waits at most 2.5 s, and
+  the pass ends at the first timeout (the host is not answering) and once `hpd_stop` is
+  set; what it did not reach stays queued or owed (the debt flag is raised again) for
+  the next pass or the transport sweep. One pump runs at a time: a caller that finds it
+  busy leaves a note and retries the acquire once after the note, so the holder's exit
+  cannot strand it (the note is never left set with nobody pumping); there is no
+  `signal_hpd` there, since a failing caller that is the worker itself would spin.
 
 ## Deviations from the requesting side's list
 

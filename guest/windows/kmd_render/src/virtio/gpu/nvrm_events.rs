@@ -346,6 +346,14 @@ impl VirtioGpu {
         self.nvrm_events.take_for_handle(owner.raw(), handle)
     }
 
+    /// The KMD took fence `handle` over (it is attached to a present): pop one
+    /// registration ANYONE holds on it, called until it returns `None`. The
+    /// creator's registrations must not outlive its ownership (a user `Close`
+    /// releases them; the KMD's own close does not).
+    pub fn take_nvrm_event_for_handle_any(&mut self, handle: u32) -> Option<NonNull<KEVENT>> {
+        self.nvrm_events.take_any_for_handle(handle)
+    }
+
     /// Device teardown: pop one registration `owner` still holds.
     pub fn take_nvrm_event_for_owner(&mut self, owner: DeviceOwner) -> Option<NonNull<KEVENT>> {
         self.nvrm_events.take_for_owner(owner.raw())
@@ -393,7 +401,9 @@ impl VirtioGpu {
             FenceFire::Fired(attach) => {
                 NVRM_FENCE_FIRED.fetch_add(1, Ordering::Relaxed);
                 match attach {
-                    Attach::None => {}
+                    // Nothing waits for these: a discarded handle was owed its
+                    // `Close` when it was taken.
+                    Attach::None | Attach::Discard => {}
                     Attach::Scanout => {
                         crate::adapter::foreign_scanout::note_fence_fired(status);
                         wake_worker = true;
@@ -415,7 +425,7 @@ impl VirtioGpu {
         } else if self.latch_nvrm_ready(handle) {
             NVRM_EV_LATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
-            match self.note_nvrm_fence_ready(handle) {
+            match self.note_nvrm_fence_ready(handle, status) {
                 Noted::Kept => {}
                 Noted::NotTracking => {
                     NVRM_EV_DROPS.fetch_add(1, Ordering::Relaxed);

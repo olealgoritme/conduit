@@ -26,6 +26,10 @@ const DEVICE_TYPE_DRI_FIRST: u32 = 512;
 /// How long the host gets to take one flip. A flip is a header-only reply; the
 /// backend acks it without waiting for the viewer.
 const FLIP_TIMEOUT_MS: u64 = 5_000;
+/// The same for a flip sent from the queue (`send_queued`), which runs on the HPD
+/// worker as often as on an escape: at most half of what `stop_hpd` gives the worker
+/// to exit (5 s, twice), like the RM client's steps and the fence `Close`.
+const QUEUED_FLIP_TIMEOUT_MS: u64 = 2_500;
 
 /// Why a present did not reach the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +71,7 @@ fn send(
     adapter: &AdapterContext,
     flip: &Flip,
     gem: u32,
+    timeout_ms: u64,
 ) -> Result<(), VirtioError> {
     // MsgHeader { msg_type, handle = 0, status = 0, padding = 0 } | ScanoutFlip.
     let mut req = [0u8; MSG_HDR_LEN + HELIOS_NVRM_SCANOUT_FLIP_BYTES];
@@ -85,7 +90,7 @@ fn send(
     // reserved[4] at p + 48 stays zero.
 
     let mut resp = [0u8; 2 * MSG_HDR_LEN];
-    match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, FLIP_TIMEOUT_MS) {
+    match ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, timeout_ms) {
         // MsgHeader.status (offset 8) is a signed errno; 0 is success.
         Ok(n) if n >= MSG_HDR_LEN => {
             let status = i32::from_le_bytes([resp[8], resp[9], resp[10], resp[11]]);
@@ -103,9 +108,14 @@ fn send(
 /// Send a flip that was queued behind a fence (the pump's), and do the same
 /// bookkeeping a direct present does. A failure is counted (`FsErr`); the caller of
 /// the original `PRESENT` is long gone and the frame is lost.
-pub fn send_queued(passive: PassiveLevel, adapter: &AdapterContext, flip: Flip, gem: u32) {
-    let sent = send(passive, adapter, &flip, gem);
+///
+/// Returns `false` when the host did not answer in time: the caller stops sending
+/// for this pass (every further flip would cost another full wait, on a worker that
+/// `stop_hpd` joins).
+pub fn send_queued(passive: PassiveLevel, adapter: &AdapterContext, flip: Flip, gem: u32) -> bool {
+    let sent = send(passive, adapter, &flip, gem, QUEUED_FLIP_TIMEOUT_MS);
     adapter.foreign_scanout_flip_done(flip.generation, sent.is_ok());
+    !matches!(sent, Err(VirtioError::Timeout))
 }
 
 /// Ownership of the source handle and the minted flip, in a transport generation:
@@ -166,7 +176,7 @@ pub fn present(
         adapter.foreign_fence_pump(passive);
         return Ok(flip.seq);
     }
-    let sent = send(passive, adapter, &flip, gem);
+    let sent = send(passive, adapter, &flip, gem, FLIP_TIMEOUT_MS);
     adapter.foreign_scanout_flip_done(flip.generation, sent.is_ok());
     match sent {
         Ok(()) => Ok(flip.seq),

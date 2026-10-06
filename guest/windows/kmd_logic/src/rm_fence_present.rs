@@ -24,6 +24,10 @@ pub enum Attach {
     Scanout,
     /// Carrier (b): a point of the gate with this index waits for it.
     Gate(u8),
+    /// Carrier (b), a `HERF` / `HEPR` tail whose marker could not be attached (both
+    /// markers, no gate room, ...): the KMD took the handle anyway and only closes
+    /// it. Nothing waits for it.
+    Discard,
 }
 
 /// Why [`FenceMeta::attach`] refused.
@@ -424,6 +428,150 @@ impl Gate {
     pub fn reset(&mut self) {
         *self = Self::new();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Merging the boundaries of one DMA buffer.
+// ---------------------------------------------------------------------------
+//
+// One DMA buffer can carry several presents (Windows batches them), and the private
+// record has room for ONE tagged boundary. Until RM gates existed a context owned at
+// most one stream, so two boundaries of a buffer always shared a handle and the
+// larger value subsumed the other. A gate is a second handle: a client that mixes
+// fenced presents with the CPU-complete marker `(ctx, 0, cookie)`, or a stream with a
+// fence, puts two handles in one buffer. Refusing the second Present would fail a
+// frame whose fence the KMD already owns, so the rules below never fail a plain
+// boundary.
+
+/// What merging a new boundary into a record's boundary produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundaryMerge {
+    /// The boundary the record carries from now on.
+    pub boundary: u64,
+    /// A wait the merge could not keep: the present it named may now be released
+    /// before its producer finished (counted by the caller).
+    pub dropped: bool,
+}
+
+/// Merge `new` (a tagged boundary, validated by the caller) into `old` (what the
+/// record carries, 0 for none).
+///
+/// * nothing before, or the same boundary: `new`;
+/// * the same handle: the larger value (values of one handle are monotonic);
+/// * `new` has value 0 ("already complete", no dependency): `old` stays, nothing is
+///   lost;
+/// * `old` has value 0: `new` replaces it, nothing is lost;
+/// * two different handles that both wait for something: the OLDER boundary stays
+///   and `new` is dropped (`dropped`). A record holds one boundary, so one wait is
+///   lost either way. The wire-watermark fallback would lose BOTH (and does not
+///   cover an RM gate's work at all), whereas keeping the older one keeps the
+///   earliest wait of the buffer and costs only the later present's wait. The
+///   present is never failed: its fence was taken at Render.
+pub fn merge_stream_boundaries(old: u64, new: u64) -> BoundaryMerge {
+    merge_stream_boundaries_with(old, new, false)
+}
+
+/// As [`merge_stream_boundaries`], for a record whose boundary carries a
+/// WindowedBlt token (`old_pinned`): the token is valid only under that boundary, so
+/// a different handle can never replace it, even one with value 0 (only the new
+/// wait, if it has one, is lost).
+pub fn merge_stream_boundaries_with(old: u64, new: u64, old_pinned: bool) -> BoundaryMerge {
+    use crate::present_stream::{decode_boundary, encode_boundary};
+    let Some((nh, nv)) = decode_boundary(new) else {
+        return BoundaryMerge {
+            boundary: old,
+            dropped: new != 0,
+        };
+    };
+    let Some((oh, ov)) = decode_boundary(old) else {
+        // Nothing usable before (an untagged value is not one this crate writes).
+        return BoundaryMerge {
+            boundary: new,
+            dropped: false,
+        };
+    };
+    if oh == nh {
+        return BoundaryMerge {
+            boundary: encode_boundary(oh, ov.max(nv)),
+            dropped: false,
+        };
+    }
+    if nv == 0 {
+        return BoundaryMerge {
+            boundary: old,
+            dropped: false,
+        };
+    }
+    if ov == 0 && !old_pinned {
+        return BoundaryMerge {
+            boundary: new,
+            dropped: false,
+        };
+    }
+    BoundaryMerge {
+        boundary: old,
+        dropped: true,
+    }
+}
+
+/// What merging a WindowedBlt request into a record produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BltMerge {
+    pub boundary: u64,
+    pub token: u64,
+    /// The record's earlier boundary waited for something and was replaced.
+    pub dropped: bool,
+}
+
+/// Merge a WindowedBlt `(token, boundary)` into the record's `(boundary, token)`.
+/// `None`: the request cannot be carried (the caller cancels it and fails the
+/// Present, as before): `token == 0`, an unusable `boundary`, or two requests of
+/// different handles in one buffer.
+///
+/// A token is only valid under the boundary it was queued with (`SubmitCommand`
+/// promotes it when that boundary is reached), so unlike a plain boundary it cannot
+/// stay behind a different one. The same handle merges as before (larger token and
+/// value). A different handle replaces an old boundary that carries no token: the
+/// request, which exists only under its own boundary, wins, and the replaced wait is
+/// `dropped` unless it was value 0.
+pub fn merge_blt_boundaries(
+    old_boundary: u64,
+    old_token: u64,
+    boundary: u64,
+    token: u64,
+) -> Option<BltMerge> {
+    use crate::present_stream::{decode_boundary, encode_boundary};
+    let (nh, nv) = decode_boundary(boundary)?;
+    if token == 0 {
+        return None;
+    }
+    let token_max = old_token.max(token);
+    let Some((oh, ov)) = decode_boundary(old_boundary) else {
+        return Some(BltMerge {
+            boundary,
+            token: token_max,
+            dropped: false,
+        });
+    };
+    if oh == nh {
+        return Some(BltMerge {
+            boundary: if old_boundary == boundary {
+                boundary
+            } else {
+                encode_boundary(nh, ov.max(nv))
+            },
+            token: token_max,
+            dropped: false,
+        });
+    }
+    if old_token != 0 {
+        return None;
+    }
+    Some(BltMerge {
+        boundary,
+        token,
+        dropped: ov != 0,
+    })
 }
 
 #[cfg(test)]
@@ -827,5 +975,146 @@ mod tests {
             2,
             "a reset gate cannot lower retirement"
         );
+    }
+
+    // ---- merging the boundaries of one DMA buffer ---------------------------------
+
+    use crate::present_stream::encode_boundary as enc;
+
+    #[test]
+    fn same_handle_takes_the_larger_value_in_either_order() {
+        let m = merge_stream_boundaries(enc(5, 3), enc(5, 9));
+        assert_eq!((m.boundary, m.dropped), (enc(5, 9), false));
+        let m = merge_stream_boundaries(enc(5, 9), enc(5, 3));
+        assert_eq!((m.boundary, m.dropped), (enc(5, 9), false));
+        let m = merge_stream_boundaries(enc(5, 9), enc(5, 9));
+        assert_eq!((m.boundary, m.dropped), (enc(5, 9), false));
+    }
+
+    #[test]
+    fn an_empty_record_takes_the_boundary_whatever_it_is() {
+        for b in [enc(5, 3), enc(5, 0), enc(0x7fff, u32::MAX)] {
+            let m = merge_stream_boundaries(0, b);
+            assert_eq!((m.boundary, m.dropped), (b, false));
+        }
+    }
+
+    #[test]
+    fn a_cpu_complete_marker_of_another_handle_is_a_no_op_beside_a_wait() {
+        // The reported case: a fenced present, then a CPU-complete marker of a
+        // registered stream, in one DMA buffer. The second must not fail.
+        let gate = enc(0x41, 7);
+        let stream_complete = enc(0x82, 0);
+        let m = merge_stream_boundaries(gate, stream_complete);
+        assert_eq!((m.boundary, m.dropped), (gate, false));
+        // And the other order: the complete marker first, the wait replaces it.
+        let m = merge_stream_boundaries(stream_complete, gate);
+        assert_eq!((m.boundary, m.dropped), (gate, false));
+    }
+
+    #[test]
+    fn two_waits_of_different_handles_keep_the_older_and_say_so() {
+        let gate = enc(0x41, 7);
+        let stream = enc(0x82, 3);
+        let m = merge_stream_boundaries(gate, stream);
+        assert_eq!((m.boundary, m.dropped), (gate, true));
+        let m = merge_stream_boundaries(stream, gate);
+        assert_eq!((m.boundary, m.dropped), (stream, true));
+    }
+
+    #[test]
+    fn two_complete_markers_of_different_handles_keep_one_without_loss() {
+        let m = merge_stream_boundaries(enc(0x41, 0), enc(0x82, 0));
+        assert_eq!((m.boundary, m.dropped), (enc(0x41, 0), false));
+    }
+
+    #[test]
+    fn a_boundary_that_carries_a_blt_token_is_never_replaced_by_another_handle() {
+        let pinned = enc(0x82, 0);
+        let m = merge_stream_boundaries_with(pinned, enc(0x41, 7), true);
+        assert_eq!((m.boundary, m.dropped), (pinned, true));
+        let m = merge_stream_boundaries_with(pinned, enc(0x41, 0), true);
+        assert_eq!((m.boundary, m.dropped), (pinned, false));
+        // The same handle still merges, token or not.
+        let m = merge_stream_boundaries_with(enc(0x82, 3), enc(0x82, 5), true);
+        assert_eq!((m.boundary, m.dropped), (enc(0x82, 5), false));
+    }
+
+    #[test]
+    fn an_unusable_new_boundary_never_replaces_the_record() {
+        let m = merge_stream_boundaries(enc(5, 3), 12345);
+        assert_eq!((m.boundary, m.dropped), (enc(5, 3), true));
+        let m = merge_stream_boundaries(enc(5, 3), 0);
+        assert_eq!((m.boundary, m.dropped), (enc(5, 3), false));
+    }
+
+    #[test]
+    fn a_merge_never_invents_a_dependency_or_lowers_one() {
+        // For every pair the result is one of the inputs or the same-handle max, and
+        // never below the larger value of a same-handle pair; a wait is reported
+        // dropped only when both really wait.
+        let hs = [1u32, 2, 3];
+        let vs = [0u32, 1, 5, u32::MAX];
+        for &ha in &hs {
+            for &va in &vs {
+                for &hb in &hs {
+                    for &vb in &vs {
+                        let (a, b) = (enc(ha, va), enc(hb, vb));
+                        let m = merge_stream_boundaries(a, b);
+                        if ha == hb {
+                            assert_eq!(m.boundary, enc(ha, va.max(vb)));
+                            assert!(!m.dropped);
+                        } else {
+                            assert!(m.boundary == a || m.boundary == b);
+                            assert_eq!(m.dropped, va != 0 && vb != 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_blt_token_merges_under_one_handle_as_it_always_did() {
+        let m = merge_blt_boundaries(0, 0, enc(5, 3), 10).unwrap();
+        assert_eq!((m.boundary, m.token, m.dropped), (enc(5, 3), 10, false));
+        let m = merge_blt_boundaries(enc(5, 3), 10, enc(5, 9), 11).unwrap();
+        assert_eq!((m.boundary, m.token, m.dropped), (enc(5, 9), 11, false));
+        let m = merge_blt_boundaries(enc(5, 9), 11, enc(5, 3), 12).unwrap();
+        assert_eq!((m.boundary, m.token, m.dropped), (enc(5, 9), 12, false));
+        // A plain boundary of the same handle before the first token.
+        let m = merge_blt_boundaries(enc(5, 4), 0, enc(5, 2), 7).unwrap();
+        assert_eq!((m.boundary, m.token, m.dropped), (enc(5, 4), 7, false));
+    }
+
+    #[test]
+    fn a_blt_token_replaces_a_plain_boundary_of_another_handle() {
+        // The token lives only under its own boundary; the replaced wait is counted
+        // unless it was value 0.
+        let m = merge_blt_boundaries(enc(0x82, 3), 0, enc(0x41, 7), 9).unwrap();
+        assert_eq!((m.boundary, m.token, m.dropped), (enc(0x41, 7), 9, true));
+        let m = merge_blt_boundaries(enc(0x82, 0), 0, enc(0x41, 7), 9).unwrap();
+        assert_eq!((m.boundary, m.token, m.dropped), (enc(0x41, 7), 9, false));
+    }
+
+    #[test]
+    fn two_blt_requests_of_different_handles_cannot_share_a_buffer() {
+        assert_eq!(merge_blt_boundaries(enc(0x82, 3), 4, enc(0x41, 7), 9), None);
+    }
+
+    #[test]
+    fn a_blt_merge_refuses_what_the_caller_should_not_have_sent() {
+        assert_eq!(merge_blt_boundaries(0, 0, enc(5, 3), 0), None);
+        assert_eq!(merge_blt_boundaries(0, 0, 77, 1), None);
+        assert_eq!(merge_blt_boundaries(0, 0, 0, 1), None);
+    }
+
+    #[test]
+    fn a_discarded_fence_is_attached_to_nothing_but_not_attachable_again() {
+        let mut m = FenceMeta::new(9);
+        assert_eq!(m.attach(Attach::Discard), Ok(None));
+        assert_eq!(m.attached(), Attach::Discard);
+        assert_eq!(m.attach(Attach::Scanout), Err(AttachError::AlreadyAttached));
+        assert!(m.want_close());
     }
 }

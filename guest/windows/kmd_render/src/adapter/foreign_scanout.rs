@@ -51,6 +51,38 @@ static FENCES: SpinLock<ScanoutQueue> = SpinLock::new(ScanoutQueue::new());
 static PUMP_BUSY: AtomicU32 = AtomicU32::new(0);
 static PUMP_AGAIN: AtomicU32 = AtomicU32::new(0);
 
+/// Become the pump, or leave a note for whoever is. `true`: this caller pumps.
+///
+/// The holder's exit is `PUMP_BUSY = 0` then `swap(PUMP_AGAIN, 0)`. A caller that
+/// failed the compare-exchange before that store and stores its note after that swap
+/// would leave the note set with nobody pumping (a lost wakeup), so after the note it
+/// tries once more: either the holder has released (we take over and pump, which
+/// covers what the note was for), or it has not yet, and then its swap comes after
+/// our note and sees it. All four operations are `SeqCst`: this is a store-then-load
+/// pattern on two locations, which release/acquire does not order. No `signal_hpd`
+/// here: when the failing caller IS the worker, a wake per failed attempt would spin
+/// it for as long as an escape thread holds the pump in a host round trip; the
+/// worker's own service pass already looks at `PUMP_AGAIN`.
+fn pump_acquire() -> bool {
+    if PUMP_BUSY
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        // Everything queued so far is seen by the pass that starts now.
+        PUMP_AGAIN.store(0, Ordering::SeqCst);
+        return true;
+    }
+    PUMP_AGAIN.store(1, Ordering::SeqCst);
+    if PUMP_BUSY
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        PUMP_AGAIN.store(0, Ordering::SeqCst);
+        return true;
+    }
+    false
+}
+
 /// Sources started (`FsSet`), flips sent (`FsPres`), sources ended by an explicit
 /// `RELEASE` (`FsRel`), by the lapse (`FsLapse`), by teardown or an invalid handle
 /// or epoch (`FsEnd`); another owner's source replaced after its lapse (`FsTake`);
@@ -394,6 +426,9 @@ impl AdapterContext {
                         Err(FenceRefusal::AlreadyAttached) => {
                             return Err(EnqueueRefusal::AlreadyAttached)
                         }
+                        // The KMD holds as many fences as it may: the same answer
+                        // as a full queue (present without a fence, or retry).
+                        Err(FenceRefusal::Quota) => return Err(EnqueueRefusal::Full),
                     }
                 } else {
                     None
@@ -412,6 +447,11 @@ impl AdapterContext {
         match outcome {
             Ok(early) => {
                 FS_FENCE_QUEUED.fetch_add(1, Ordering::Relaxed);
+                if fence != 0 {
+                    // PASSIVE (the escape), outside every lock: what the creator
+                    // registered on a handle that is now the KMD's goes with it.
+                    crate::virtio::nvrm::release_events_of_taken_fence(self, fence);
+                }
                 if let Some(status) = early {
                     FS_FENCE_EARLY.fetch_add(1, Ordering::Relaxed);
                     note_fence_fired(status);
@@ -433,16 +473,24 @@ impl AdapterContext {
     /// busy leaves a note and the holder goes round again, so a flip queued while
     /// another was being sent is never left waiting for the next wake. PASSIVE: it
     /// does the host round trips.
+    ///
+    /// Bounded for the HPD worker (which `stop_hpd` joins for 5 s, twice): a flip waits
+    /// at most 2.5 s for the host and the pass ends at the first timeout (the host is
+    /// not answering) and as soon as `hpd_stop` is set; the flips not reached stay
+    /// queued for the next pass or for the teardown that drops them.
     pub(crate) fn foreign_fence_pump(&self, passive: PassiveLevel) {
-        if PUMP_BUSY
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            PUMP_AGAIN.store(1, Ordering::Release);
+        if !pump_acquire() {
             return;
         }
         loop {
+            let mut host_slow = false;
             loop {
+                if self.hpd_stop.load(Ordering::Acquire) != 0 {
+                    // StopDevice is joining the worker: stop sending; the sweep of
+                    // the transport closes the fences and drops the queue.
+                    host_slow = true;
+                    break;
+                }
                 let now = now_100ns();
                 let live = STATE
                     .lock()
@@ -470,17 +518,24 @@ impl AdapterContext {
                     break;
                 };
                 FS_FENCE_SENT.fetch_add(1, Ordering::Relaxed);
-                crate::virtio::foreign_scanout::send_queued(passive, self, entry.flip, entry.gem);
+                if !crate::virtio::foreign_scanout::send_queued(
+                    passive, self, entry.flip, entry.gem,
+                ) {
+                    host_slow = true;
+                    break;
+                }
             }
-            crate::virtio::nvrm::close_owed_fences(passive, self);
-            PUMP_BUSY.store(0, Ordering::Release);
-            if PUMP_AGAIN.swap(0, Ordering::AcqRel) == 0 {
+            if !host_slow {
+                // (A slow host would cost the next wait as well; `close_owed_fences`
+                // has its own bound and stop rules, and the debt flag survives.)
+                crate::virtio::nvrm::close_owed_fences(passive, self);
+            }
+            // SeqCst on the release / note pair (see `pump_acquire`).
+            PUMP_BUSY.store(0, Ordering::SeqCst);
+            if host_slow || PUMP_AGAIN.swap(0, Ordering::SeqCst) == 0 {
                 break;
             }
-            if PUMP_BUSY
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
+            if !pump_acquire() {
                 break;
             }
         }

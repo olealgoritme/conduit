@@ -5,7 +5,14 @@
  * A fence is a backend handle returned by a forwarded SEMSURF_FENCE_CREATE (nvidia-drm
  * 0x55, low 16 bits of the ioctl number 0x6455). The KMD takes it over when a carrier
  * is accepted: never Close / EVENT_REGISTER / reuse it afterwards. Gate every record
- * below on QueryCaps.supported_ops & HELIOS_NVRM_CAP_PRESENT_FENCE (1ull << 33). */
+ * below on QueryCaps.supported_ops & HELIOS_NVRM_CAP_PRESENT_FENCE (1ull << 33).
+ *
+ * Refusals: SCANOUT_PRESENT and HE12 v4 report one (the call fails) and leave the
+ * handle yours. A HERF / HEPR tail does NOT: its Render returns success whatever
+ * happened to the tail, so for ANY parsed tail whose handle is a fence of the
+ * presenting process the KMD takes the handle and closes it, attached as the
+ * present's marker or not (both markers, a partial stream tail, no room). Do not
+ * Close a handle you put in such a tail. */
 #ifndef HELIOS_RM_FENCE_H
 #define HELIOS_RM_FENCE_H
 #include <stdint.h>

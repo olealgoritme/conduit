@@ -134,6 +134,19 @@ impl<E: Copy + PartialEq> Registry<E> {
         Some(self.regs.swap_remove(idx).event)
     }
 
+    /// Pop one registration anyone holds on `handle` (any kind): the KMD took the
+    /// handle over (an RM fence attached to a present), so what its creator
+    /// registered on it must not outlive the creator's ownership. Called until it
+    /// returns `None`. A `TRANSPORT_LOST` registration is keyed 0 and never matches
+    /// a (nonzero) handle.
+    pub fn take_any_for_handle(&mut self, handle: u32) -> Option<E> {
+        if handle == 0 {
+            return None;
+        }
+        let idx = self.regs.iter().position(|r| r.handle == handle)?;
+        Some(self.regs.swap_remove(idx).event)
+    }
+
     /// Pop one registration `owner` holds: the owner's device teardown.
     pub fn take_for_owner(&mut self, owner: usize) -> Option<E> {
         let idx = self.regs.iter().position(|r| r.owner == owner)?;
@@ -298,6 +311,25 @@ mod tests {
         assert_eq!(got, [1, 2]);
         assert_eq!(r.len(), 2);
         assert_eq!(r.take_for_handle(1, 10), None);
+    }
+
+    #[test]
+    fn a_taken_over_handle_loses_every_owners_registrations_and_nothing_else() {
+        let mut r = reg(8, 8);
+        r.add(1, 10, KIND_READY, 1);
+        r.add(2, 10, KIND_READY, 3);
+        r.add(1, 11, KIND_READY, 4);
+        r.add(1, 0, KIND_LOST, 5);
+        let mut got = StdVec::new();
+        while let Some(e) = r.take_any_for_handle(10) {
+            got.push(e);
+        }
+        got.sort();
+        assert_eq!(got, [1, 3]);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r.take_any_for_handle(10), None);
+        assert_eq!(r.take_any_for_handle(0), None, "handle 0 is the LOST key");
+        assert_eq!(r.len(), 2);
     }
 
     #[test]

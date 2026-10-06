@@ -539,17 +539,35 @@ pub unsafe extern "C" fn dxgkddi_destroy_process(
         // The process's RM gate (`docs/rm-fence-marker.md`) goes with it: waits that
         // named it are discharged and the fences it still held are closed. The token
         // is only compared, never dereferenced.
-        // SAFETY: dxgkrnl passes back the adapter context it was given.
-        if let Some(adapter) = unsafe { (miniport_device_context as *const AdapterContext).as_ref() } {
-            let purged = adapter.with_wddm_notify_lock(|guard| {
-                guard
-                    .with_virtio(|order, v| v.rm_gate_purge_process_ordered(order, h_process as usize))
-                    .unwrap_or(0)
-            });
-            if purged != 0 {
-                crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
-                // The fences the gate still held are owed a host `Close`.
-                adapter.signal_hpd();
+        //
+        // Every process exit comes through here, and almost none of them ever opened
+        // a gate: one atomic load says so before the adapter is touched (a gate lives
+        // in the transport, which the adapter owns, so while one is open the adapter
+        // is alive; the transport's `Drop` purges them all and brings the count back
+        // to zero before the adapter can go). Without it each exit would take
+        // `wddm_notify_lock` and `virtio_lock` for nothing, and dereference an adapter
+        // pointer in a callback that can run while the adapter is being torn down.
+        if crate::virtio::gpu::rm_gates_open() {
+            // SAFETY: dxgkrnl passes back the adapter context it was given, and a gate
+            // is open, so the adapter and its transport are alive (see above).
+            if let Some(adapter) =
+                unsafe { (miniport_device_context as *const AdapterContext).as_ref() }
+            {
+                let purged = adapter.with_wddm_notify_lock(|guard| {
+                    guard
+                        .with_virtio(|order, v| {
+                            v.rm_gate_purge_process_ordered(order, h_process as usize)
+                        })
+                        .unwrap_or(0)
+                });
+                if purged != 0 {
+                    crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+                    // The fences the gate still held are owed a host `Close`: the
+                    // worker sends it. With no worker the next NVRM escape or fence
+                    // `Render` does (this callback's IRQL is not relied on for a
+                    // host round trip).
+                    adapter.signal_hpd();
+                }
             }
         }
         // SAFETY: h_process was produced by Box::into_raw in create_process and

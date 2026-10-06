@@ -1797,6 +1797,12 @@ fn escape_nvrm(
     // same gate, and one load when nothing is wanted.
     if !adapter.hpd_running() {
         nvrm_publish_service();
+        // The same for the fences the KMD owes the host a `Close` (the HE12 v4
+        // fence path works without a worker: `rm_fence_served` does not need one):
+        // a render-only config would otherwise leave every fired fence as a table
+        // entry with its `Close` owed, until the table fills. Cheap when nothing is
+        // owed. The `Render` that takes a fence does the same (`submit_command.rs`).
+        adapter.foreign_fence_service(passive);
     }
     st
 }

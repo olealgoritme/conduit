@@ -74,7 +74,9 @@ pub use nvrm_events::{
     MAX_NVRM_EVENTS_PER_OWNER,
 };
 
-pub use rm_gates::{publish_rm_gate_counters, GateAttached, GateRefusal, RMG_REFUSED};
+pub use rm_gates::{
+    publish_rm_gate_counters, rm_gates_open, GateAttached, GateRefusal, RMG_REFUSED,
+};
 
 pub use nvrm_tables::{
     FenceClaim, FenceCommit, FenceRefusal, NvrmPin, PinTake, MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER, MAX_NVRM_MAPS,

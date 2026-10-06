@@ -33,6 +33,21 @@ pub static RMG_ERRORS: AtomicU32 = AtomicU32::new(0);
 pub static RMG_EARLY: AtomicU32 = AtomicU32::new(0);
 pub static RMG_CANCELLED: AtomicU32 = AtomicU32::new(0);
 pub static RMG_REFUSED: AtomicU32 = AtomicU32::new(0);
+/// Handles of a `HERF` / `HEPR` tail the KMD took and closed although it attached no
+/// marker (`RmGTake`): the UMD cannot know the tail was refused, so the handle is
+/// the KMD's whatever became of the marker.
+pub static RMG_TAKEN: AtomicU32 = AtomicU32::new(0);
+/// Gates open now (a count, not a counter): `DestroyProcess` reads it before it
+/// touches the adapter, so a process exit with no gate open costs one load.
+static RMG_OPEN: AtomicU32 = AtomicU32::new(0);
+
+/// Whether any process has a gate open. A gate is opened at Render under
+/// `virtio_lock`, and a process that opened one cannot exit before its Render
+/// returned, so a zero here at `DestroyProcess` means nothing of the process's is
+/// left to purge.
+pub fn rm_gates_open() -> bool {
+    RMG_OPEN.load(Ordering::Acquire) != 0
+}
 
 /// Mirror the counters to the registry. PASSIVE only.
 pub fn publish_rm_gate_counters() {
@@ -43,6 +58,7 @@ pub fn publish_rm_gate_counters() {
     rec(b"RmGEarly", RMG_EARLY.load(Ordering::Relaxed));
     rec(b"RmGCan", RMG_CANCELLED.load(Ordering::Relaxed));
     rec(b"RmGRef", RMG_REFUSED.load(Ordering::Relaxed));
+    rec(b"RmGTake", RMG_TAKEN.load(Ordering::Relaxed));
 }
 
 /// One gate: the process it belongs to, the present-stream slot that carries its
@@ -104,6 +120,14 @@ pub struct GateAttached {
     pub wake_worker: bool,
 }
 
+fn gate_refusal(why: FenceRefusal) -> GateRefusal {
+    match why {
+        FenceRefusal::NotOwned | FenceRefusal::AlreadyAttached => GateRefusal::NotOwned,
+        FenceRefusal::NotFence => GateRefusal::NotFence,
+        FenceRefusal::Quota => GateRefusal::NoRoom,
+    }
+}
+
 impl VirtioGpu {
     /// Whether the WDDM carriers can be honoured now: the event queue is up and the
     /// host serves fences (`NVGPU_CFG_DRM_FENCES`).
@@ -148,6 +172,7 @@ impl VirtioGpu {
         g.process = process;
         g.stream_index = si;
         g.gate.reset();
+        RMG_OPEN.fetch_add(1, Ordering::AcqRel);
         Some(gi)
     }
 
@@ -155,8 +180,12 @@ impl VirtioGpu {
     /// return the boundary naming it. The ownership rule is `FenceClaim::Process`:
     /// a fence recorded as created in this process, not already the KMD's.
     ///
-    /// Nothing changes on a refusal: capacity is checked before the fence is taken
-    /// over, so no rollback exists.
+    /// Nothing changes on a refusal: the claim is probed read-only BEFORE a gate and a
+    /// stream slot are taken (a junk handle must not open a gate that lasts until
+    /// process exit), and the room is checked before the fence is taken over, so no
+    /// rollback exists in the normal flow. The probe and the attach are one
+    /// `virtio_lock` hold (this takes `&mut self`), so the attach cannot then refuse;
+    /// if it ever did, a gate this call opened is closed again.
     pub fn rm_gate_attach(
         &mut self,
         fence: u32,
@@ -169,26 +198,34 @@ impl VirtioGpu {
         if process == 0 || fence == 0 || !self.rm_fence_served() {
             return refuse(GateRefusal::Unsupported);
         }
-        let gi = match self.rm_gate_of(process) {
-            Some(gi) => gi,
+        if let Err(why) = self.fence_claimable(FenceClaim::Process(process), fence) {
+            return refuse(gate_refusal(why));
+        }
+        let (gi, opened) = match self.rm_gate_of(process) {
+            Some(gi) => (gi, false),
             None => match self.rm_gate_open(process) {
-                Some(gi) => gi,
+                Some(gi) => (gi, true),
                 None => return refuse(GateRefusal::NoRoom),
             },
         };
         {
             let gate = &self.rm_gates[gi].gate;
             if gate.pending() as usize >= GATE_POINTS || gate.needs_recycle() {
+                if opened {
+                    self.rm_gate_cancel(gi);
+                }
                 return refuse(GateRefusal::NoRoom);
             }
         }
         let early =
             match self.fence_attach(FenceClaim::Process(process), fence, Attach::Gate(gi as u8)) {
                 Ok(early) => early,
-                Err(FenceRefusal::NotOwned) | Err(FenceRefusal::AlreadyAttached) => {
-                    return refuse(GateRefusal::NotOwned)
+                Err(why) => {
+                    if opened {
+                        self.rm_gate_cancel(gi);
+                    }
+                    return refuse(gate_refusal(why));
                 }
-                Err(FenceRefusal::NotFence) => return refuse(GateRefusal::NotFence),
             };
         let point = match self.rm_gates[gi].gate.attach(fence, early.is_some()) {
             Ok(p) => p,
@@ -217,6 +254,35 @@ impl VirtioGpu {
             early: early.is_some(),
             wake_worker,
         })
+    }
+
+    /// The stream handle of `process`'s gate, if it has one open: what a context that
+    /// already bound a boundary must match (`execution_completion::may_bind_stream`).
+    pub fn rm_gate_stream_handle(&self, process: usize) -> Option<u32> {
+        let gi = self.rm_gate_of(process)?;
+        let si = self.rm_gates[gi].stream_index;
+        Some(self.present_streams[si].handle(si))
+    }
+
+    /// A `HERF` / `HEPR` tail named fence `fence` of `process`, and its marker was not
+    /// attached (both markers, a partial stream tail, no room, a refused attach): the
+    /// UMD was told nothing (Render returned success), so it cannot close the handle,
+    /// and every such handle would leak one of its 128. The KMD takes it and owes the
+    /// host its `Close`, whether or not a marker exists. Only a fence recorded as
+    /// created in this process (the claim of an attach) is taken: any other handle
+    /// is not ours to close. Returns whether the handle was taken (a `Close` is then
+    /// owed and the caller wakes the worker). Counted `RmGTake`.
+    pub fn rm_fence_take(&mut self, fence: u32, process: usize) -> bool {
+        if self.failed || process == 0 || fence == 0 {
+            return false;
+        }
+        match self.fence_discard(FenceClaim::Process(process), fence) {
+            Ok(_) => {
+                RMG_TAKEN.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Publish a gate's retirement into its stream slot and let waits that named it
@@ -270,12 +336,26 @@ impl VirtioGpu {
             self.fence_want_close(fence);
         }
         let si = self.rm_gates[gi].stream_index;
+        let handle = self.present_streams[si].handle(si);
         self.rm_gates[gi].gate.reset();
         self.rm_gates[gi].in_use = false;
         self.rm_gates[gi].process = 0;
         if self.present_streams[si].live {
             self.retire_present_stream_slot(si);
+            // An execution (HE12 v4) wait that named this gate: nobody will ever fire
+            // its fences (they were just handed to the closer), and an execution
+            // packet is never rebased or discharged by the generic dead-stream rule,
+            // so left alone it would pin the head of the adapter-wide WDDM FIFO. It is
+            // a cancellation, counted in `RmGCan` with the points, not a fire: latch
+            // those waits as ended. A Venus stream's execution waits keep their own
+            // rule (`discharge_dead_present_stream_waits`).
+            for pending_wddm in self.wddm_pending.iter_mut() {
+                if let Some(wait) = pending_wddm.execution.as_mut() {
+                    wait.observe(handle, u32::MAX);
+                }
+            }
         }
+        RMG_OPEN.fetch_sub(1, Ordering::AcqRel);
         RMG_CANCELLED.fetch_add(pending, Ordering::Relaxed);
         pending
     }
