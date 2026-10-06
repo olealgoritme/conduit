@@ -1436,11 +1436,44 @@ static NVK_WAIT_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Does DWM import NVK-made surfaces? The same `ForeignImport` knob the Venus
 /// side of this driver reads (DWM's DXVK enables explicit DRM-modifier imports).
+///
+/// A DWM on NVK (`DwmIcd=nvk`, docs/dwm-on-nvk.md) imports NVK surfaces by
+/// resource id natively, so it composes them too: then an NVK app's frames go
+/// to DWM like any app's instead of taking scanout 0 for the whole screen
+/// (which interleaved with DWM's own flips about once a second).
 fn nvk_dwm_composes() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| {
         helios_umd_common::knobs::reg_dword(c"ForeignImport").is_some_and(|v| v != 0)
+            || dwm_on_nvk_marker()
     })
+}
+
+/// The marker the DWM on NVK holds (`Local\HeliosDwmOnNvk`,
+/// `umd_common/bridge/bridge_icd_backend.cpp` "the desktop follows DWM"),
+/// with `DwmIcd=nvk` in the registry. ERROR_ACCESS_DENIED (a sandboxed
+/// opener) also means it exists.
+fn dwm_on_nvk_marker() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenEventA(access: u32, inherit: i32, name: *const u8) -> *mut c_void;
+        fn CloseHandle(h: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    if !helios_umd_common::knobs::reg_sz(c"DwmIcd").is_some_and(|v| v.trim().eq_ignore_ascii_case("nvk")) {
+        return false;
+    }
+    // SAFETY: a NUL-terminated name; the handle is closed at once.
+    unsafe {
+        let h = OpenEventA(SYNCHRONIZE, 0, c"Local\\HeliosDwmOnNvk".as_ptr().cast());
+        if !h.is_null() {
+            CloseHandle(h);
+            return true;
+        }
+        GetLastError() == ERROR_ACCESS_DENIED
+    }
 }
 
 static NVK_FENCED_PRESENTS: AtomicUsize = AtomicUsize::new(0);

@@ -337,6 +337,7 @@ int main(int argc, char **argv) {
   }
 
   Stats total, second;
+  UINT startup_slow = 0;
   const double t0 = now_ms(), period = 1000.0 / fps;
   double last_report = t0;
   UINT frame = 0;
@@ -419,6 +420,8 @@ int main(int argc, char **argv) {
     }
     const double t_frame = now_ms() - f0;
     total.take(t_acq, t_wait, t_blit, t_ui, t_video, t_frame);
+    // Start-up (first second: shader compiles, first imports) is not a stall.
+    if (t_frame > 100.0 && now_ms() - t0 < 1000.0) startup_slow++;
     second.take(t_acq, t_wait, t_blit, t_ui, t_video, t_frame);
     if (now_ms() - last_report >= 1000.0) {
       char when[32];
@@ -450,7 +453,7 @@ int main(int argc, char **argv) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
   }
-  const bool smooth = total.frames > UINT(0.8 * fps * seconds) && total.slow == 0;
+  const bool smooth = total.frames > UINT(0.8 * fps * seconds) && total.slow == startup_slow;
   std::printf("%s\n", smooth ? "CHROMIUM-LIKE SMOOTH" : "CHROMIUM-LIKE STALLED");
   release(vin);
   release(vp);

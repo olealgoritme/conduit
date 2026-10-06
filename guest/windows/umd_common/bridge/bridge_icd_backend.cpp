@@ -12,6 +12,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <sddl.h>
 
 #include <atomic>
 #include <cstdio>
@@ -224,6 +225,70 @@ bool dwm_nvk_guard_allows(const char** why) {
   return true;
 }
 
+// "The desktop follows DWM" (docs/dwm-on-nvk.md 4.2): a DWM on NVK cannot
+// import surfaces Venus processes made (it shows a blank placeholder for them:
+// the gray Start menu, search and notification centre). So while DWM runs on
+// NVK, every D3D11 process goes to NVK too: Icd=venus and the built-in
+// deny-list no longer apply (the deny-list exists because an NVK process and a
+// Venus process cannot share surfaces, which is exactly what it would cause
+// now); only an explicit NvkDenyList keeps a process on Venus.
+// DesktopFollowsDwm (REG_DWORD, default 1) = 0 turns this off.
+//
+// The marker is a named event in the session's namespace that the DWM on NVK
+// creates when it chooses NVK and closes when NVK fails for it; it dies with
+// that DWM. So it names the DWM that runs now (the crash-loop guard sending a
+// DWM to Venus leaves no marker), not just the registry value. Sandboxed
+// processes may not open it (its DACL admits everyone for SYNCHRONIZE, but a
+// restricted token can still be refused): ERROR_ACCESS_DENIED also means it
+// exists.
+constexpr const char kDwmOnNvkEvent[] = "Local\\HeliosDwmOnNvk";
+HANDLE g_dwm_marker = nullptr;
+
+void dwm_marker_create() {
+  if (g_dwm_marker)
+    return;
+  // Everyone (and restricted / AppContainer tokens) may wait on it; low label.
+  const char* sddl = "D:(A;;0x100001;;;WD)(A;;0x100001;;;RC)(A;;0x100001;;;AC)(A;;GA;;;SY)S:(ML;;NW;;;LW)";
+  PSECURITY_DESCRIPTOR sd = nullptr;
+  SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, FALSE };
+  if (ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl, SDDL_REVISION_1, &sd, nullptr))
+    sa.lpSecurityDescriptor = sd;
+  g_dwm_marker = CreateEventA(&sa, TRUE, TRUE, kDwmOnNvkEvent);
+  if (sd)
+    LocalFree(sd);
+  umd_log(g_dwm_marker ? "icd backend: DWM on NVK: the desktop follows (marker Local\\HeliosDwmOnNvk set)"
+                       : "icd backend: DWM on NVK, but its marker event could not be created");
+}
+
+void dwm_marker_drop() {
+  if (g_dwm_marker) {
+    CloseHandle(g_dwm_marker);
+    g_dwm_marker = nullptr;
+    umd_log("icd backend: DWM left NVK: marker Local\\HeliosDwmOnNvk dropped");
+  }
+}
+
+// A non-DWM process: does the running DWM compose on NVK (and should this
+// process follow it)?
+[[maybe_unused]] bool desktop_follows_dwm_on_nvk() {
+  DWORD follow = 1;
+  reg_dword("DesktopFollowsDwm", &follow);
+  if (follow == 0)
+    return false;
+  char dwm[16];
+  if (!reg_sz("DwmIcd", dwm, sizeof(dwm)))
+    return false;
+  lower_ascii(dwm);
+  if (std::strcmp(dwm, "nvk") != 0)
+    return false;
+  HANDLE h = OpenEventA(SYNCHRONIZE, FALSE, kDwmOnNvkEvent);
+  if (h) {
+    CloseHandle(h);
+    return true;
+  }
+  return GetLastError() == ERROR_ACCESS_DENIED;
+}
+
 bool file_exists(const wchar_t* path) {
   const DWORD a = GetFileAttributesW(path);
   return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
@@ -352,6 +417,7 @@ IcdBackendChoice decide() {
         }
         force_nvk = true;
         c.reason = "HKLM\\SOFTWARE\\Helios!DwmIcd=nvk";
+        dwm_marker_create();
       }
     }
   }
@@ -367,6 +433,20 @@ IcdBackendChoice decide() {
     // NvkAllowList names executables that go to NVK whatever Icd says: the
     // per-category lever of docs/dwm-on-nvk.md 4.2 (move one category off
     // the Venus defaults at a time, Icd=venus staying for everything else).
+    if (std::strcmp(c.exe, "dwm.exe") != 0 && desktop_follows_dwm_on_nvk()) {
+      if (explicitly_denied(c.exe)) {
+        c.reason = "DWM is on NVK, but NvkDenyList names this executable";
+        return c;
+      }
+      if (!find_nvk_icd(c.nvk_path, sizeof(c.nvk_path) / sizeof(c.nvk_path[0]))) {
+        c.reason = "DWM is on NVK, but no NVK ICD was found";
+        return c;
+      }
+      c.backend = IcdBackend::NvkRm;
+      c.reason = "DWM is on NVK (DwmIcd=nvk, marker set): the desktop follows, "
+                 "Icd and the built-in deny-list do not apply";
+      return c;
+    }
     char allow[4096];
     const bool allowed = (reg_sz("NvkAllowList", allow, sizeof(allow)) && list_has(allow, c.exe))
       || (nvk_default(c.exe) && !explicitly_denied(c.exe));
@@ -503,6 +583,7 @@ IcdBackend effective_icd_backend() {
 
 void note_nvk_failed(const char* why) {
   if (!g_nvk_failed.exchange(true, std::memory_order_acq_rel)) {
+    dwm_marker_drop();
     char msg[256];
     std::snprintf(msg, sizeof(msg), "icd backend: NVK failed (%s); Venus for this process", why);
     umd_log(msg);
