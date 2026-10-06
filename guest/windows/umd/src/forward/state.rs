@@ -1012,8 +1012,20 @@ pub(crate) enum Tex2DShape {
     MsArray,
 }
 
-pub(crate) const fn tex1d_shape(array_size: u32) -> Tex1DShape {
-    if array_size > 1 {
+/// Whether a view needs the API's array dimension.
+///
+/// The DDI has one `Tex1D`/`Tex2D` arm where the API has separate plain and
+/// array dimensions, so `{ FirstArraySlice, ArraySize }` is all the driver
+/// gets. A one-slice view of slice N > 0 (a decoder surface pool sampled
+/// slice by slice, a shadow cascade rendered layer by layer) is an array
+/// view: the plain dimensions have no slice field and would silently name
+/// slice 0. Same predicate as umd12's `needs_array_form`.
+pub(crate) const fn needs_array_form(array_size: u32, first_array_slice: u32) -> bool {
+    array_size > 1 || first_array_slice > 0
+}
+
+pub(crate) const fn tex1d_shape(array_size: u32, first_array_slice: u32) -> Tex1DShape {
+    if needs_array_form(array_size, first_array_slice) {
         Tex1DShape::Array
     } else {
         Tex1DShape::Plain
@@ -1026,8 +1038,8 @@ pub(crate) const fn tex1d_shape(array_size: u32) -> Tex1DShape {
 /// The evaluation order is load-bearing and matches all three originals: MSAA
 /// wins over array-ness, so a multisampled array is `MsArray` and NOT
 /// `Array`.
-pub(crate) const fn tex2d_shape(array_size: u32, sample_count: u32) -> Tex2DShape {
-    match (sample_count > 1, array_size > 1) {
+pub(crate) const fn tex2d_shape(array_size: u32, first_array_slice: u32, sample_count: u32) -> Tex2DShape {
+    match (sample_count > 1, needs_array_form(array_size, first_array_slice)) {
         (true, true) => Tex2DShape::MsArray,
         (true, false) => Tex2DShape::Ms,
         (false, true) => Tex2DShape::Array,

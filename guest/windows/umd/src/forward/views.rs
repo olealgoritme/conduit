@@ -90,7 +90,7 @@ pub(crate) unsafe fn rtv_desc(
         }
         RES_TEX1D => {
             let t = a.__bindgen_anon_1.Tex1D;
-            Some(match tex1d_shape(t.ArraySize) {
+            Some(match tex1d_shape(t.ArraySize, t.FirstArraySlice) {
                 Tex1DShape::Array => D3D11_RENDER_TARGET_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_RTV_DIMENSION_TEXTURE1DARRAY,
@@ -116,7 +116,7 @@ pub(crate) unsafe fn rtv_desc(
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
             Some(
-                match tex2d_shape(t.ArraySize, resource_sample_count(h_res)) {
+                match tex2d_shape(t.ArraySize, t.FirstArraySlice, resource_sample_count(h_res)) {
                     Tex2DShape::MsArray => D3D11_RENDER_TARGET_VIEW_DESC {
                         Format: format,
                         ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY,
@@ -264,7 +264,7 @@ pub(crate) unsafe fn dsv_desc(
     match a.ResourceDimension {
         RES_TEX1D => {
             let t = a.__bindgen_anon_1.Tex1D;
-            Some(match tex1d_shape(t.ArraySize) {
+            Some(match tex1d_shape(t.ArraySize, t.FirstArraySlice) {
                 Tex1DShape::Array => D3D11_DEPTH_STENCIL_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_DSV_DIMENSION_TEXTURE1DARRAY,
@@ -292,7 +292,7 @@ pub(crate) unsafe fn dsv_desc(
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
             Some(
-                match tex2d_shape(t.ArraySize, resource_sample_count(h_res)) {
+                match tex2d_shape(t.ArraySize, t.FirstArraySlice, resource_sample_count(h_res)) {
                     Tex2DShape::MsArray => D3D11_DEPTH_STENCIL_VIEW_DESC {
                         Format: format,
                         ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY,
@@ -525,7 +525,7 @@ pub(crate) unsafe fn srv_desc(
         }
         RES_TEX1D => {
             let t = a.__bindgen_anon_1.Tex1D;
-            Some(match tex1d_shape(t.ArraySize) {
+            Some(match tex1d_shape(t.ArraySize, t.FirstArraySlice) {
                 Tex1DShape::Array => D3D11_SHADER_RESOURCE_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_SRV_DIMENSION_TEXTURE1DARRAY,
@@ -553,7 +553,7 @@ pub(crate) unsafe fn srv_desc(
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
             Some(
-                match tex2d_shape(t.ArraySize, resource_sample_count(h_res)) {
+                match tex2d_shape(t.ArraySize, t.FirstArraySlice, resource_sample_count(h_res)) {
                     Tex2DShape::MsArray => D3D11_SHADER_RESOURCE_VIEW_DESC {
                         Format: format,
                         ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY,
@@ -770,7 +770,7 @@ pub(crate) unsafe fn uav_desc(
         }
         RES_TEX1D => {
             let t = a.__bindgen_anon_1.Tex1D;
-            Some(match tex1d_shape(t.ArraySize) {
+            Some(match tex1d_shape(t.ArraySize, t.FirstArraySlice) {
                 Tex1DShape::Array => D3D11_UNORDERED_ACCESS_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_UAV_DIMENSION_TEXTURE1DARRAY,
@@ -795,7 +795,7 @@ pub(crate) unsafe fn uav_desc(
         }
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
-            match tex2d_shape(t.ArraySize, NO_MULTISAMPLED_FORM) {
+            match tex2d_shape(t.ArraySize, t.FirstArraySlice, NO_MULTISAMPLED_FORM) {
                 Tex2DShape::Array => Some(D3D11_UNORDERED_ACCESS_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_UAV_DIMENSION_TEXTURE2DARRAY,
