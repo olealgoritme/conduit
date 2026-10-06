@@ -419,6 +419,64 @@ pub struct HeliosNvrmMunmap {
 pub const HELIOS_NVRM_MUNMAP_BYTES: usize = 48;
 
 // ---------------------------------------------------------------------------
+// WINDOW_INFO
+// ---------------------------------------------------------------------------
+
+/// Read-only report of the RM window (shared-memory region 1, where `MMAP` places memory):
+/// how big it is, how much is mapped, and how much of it the CALLING process may use. For
+/// NVK's live `VK_EXT_memory_budget`. Op 13; advertised by [`HELIOS_NVRM_CAP_WINDOW_INFO`] in
+/// `QUERY_CAPS.supported_ops` (bit 36) and by op bit 13.
+pub const HELIOS_NVRM_OP_WINDOW_INFO: u32 = 13;
+
+/// `supported_ops` bit 36: `WINDOW_INFO` exists (the KMD has an RM window policy to report).
+/// Bits 32..35 are `SCANOUT_FENCE`, `PRESENT_FENCE`, `FLUSH_GATE`, `SCANOUT_RELEASE`.
+pub const HELIOS_NVRM_CAP_WINDOW_INFO: u64 = 1 << 36;
+
+/// `flags` bit 0: `owner_limit_bytes` is below `window_bytes`: this process cannot use the whole
+/// window (the legacy per-process quota, or the reserve held back for the shell, or an operator
+/// bound).
+pub const HELIOS_NVRM_WINDOW_FLAG_OWNER_LIMIT: u32 = 1 << 0;
+/// `flags` bit 1: the window can grow while the guest runs. Always 0 today (the host sizes it
+/// once, at start); `generation` would bump if it ever changed.
+pub const HELIOS_NVRM_WINDOW_FLAG_CAN_GROW: u32 = 1 << 1;
+/// `flags` bit 2: `owner_limit_bytes` is a ceiling on `window_used_bytes` (every process's maps
+/// together: the dynamic policy), so the room left for this process is
+/// `owner_limit_bytes - window_used_bytes`. Clear: it is a ceiling on `owner_used_bytes` alone
+/// (the legacy quota), and the room is `owner_limit_bytes - owner_used_bytes`. Either way the
+/// real room is also bounded by what the host can place (it may still refuse: `DEVICE_ERROR`).
+pub const HELIOS_NVRM_WINDOW_FLAG_SHARED_CEILING: u32 = 1 << 2;
+
+/// `WINDOW_INFO`. 88 bytes, no trailing data. Always `status == OK`; no side effect, no host
+/// round trip: a few atomic reads and one short lock hold, cheap enough for every new memory
+/// chunk (a caller may cache the answer for 10 ms). With the transport down every size is 0.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosNvrmWindowInfo {
+    pub head: HeliosNvrmHeader,
+    /// out: the RM window's size in bytes, as the device reports it.
+    pub window_bytes: u64,
+    /// out: bytes of the window mapped now by every process (the UVM aperture is a different
+    /// region and not counted).
+    pub window_used_bytes: u64,
+    /// out: the ceiling that applies to the caller under the current policy. Dynamic policy: a
+    /// ceiling on `window_used_bytes` (`SHARED_CEILING` set): the window size, minus the
+    /// reserve for any process that is not the shell's; `NvWinMaxMb` lowers both. Legacy
+    /// policy: a quarter of the window, a ceiling on `owner_used_bytes`.
+    pub owner_limit_bytes: u64,
+    /// out: bytes of the window the calling process (device) has mapped, all its `MMAP`s of
+    /// region 1 (UVM aperture maps are not window bytes and are not counted).
+    pub owner_used_bytes: u64,
+    /// out: bumps when the window size or the policy changes (once per transport start today).
+    pub generation: u64,
+    /// out: `HELIOS_NVRM_WINDOW_FLAG_*`.
+    pub flags: u32,
+    /// out: zero.
+    pub reserved: u32,
+}
+
+pub const HELIOS_NVRM_WINDOW_INFO_BYTES: usize = 88;
+
+// ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 
@@ -651,6 +709,19 @@ const _: () = {
     assert!(size_of::<HeliosNvrmMunmap>() == HELIOS_NVRM_MUNMAP_BYTES);
     assert!(offset_of!(HeliosNvrmMunmap, mapping_id) == 40);
 
+    assert!(size_of::<HeliosNvrmWindowInfo>() == HELIOS_NVRM_WINDOW_INFO_BYTES);
+    assert!(offset_of!(HeliosNvrmWindowInfo, window_bytes) == 40);
+    assert!(offset_of!(HeliosNvrmWindowInfo, window_used_bytes) == 48);
+    assert!(offset_of!(HeliosNvrmWindowInfo, owner_limit_bytes) == 56);
+    assert!(offset_of!(HeliosNvrmWindowInfo, owner_used_bytes) == 64);
+    assert!(offset_of!(HeliosNvrmWindowInfo, generation) == 72);
+    assert!(offset_of!(HeliosNvrmWindowInfo, flags) == 80);
+    assert!(offset_of!(HeliosNvrmWindowInfo, reserved) == 84);
+    // Bit 13 of the op mask and bit 36 of the capability word are free: no op or capability
+    // of the other modules uses them.
+    assert!(HELIOS_NVRM_OP_WINDOW_INFO == 13);
+    assert!(HELIOS_NVRM_CAP_WINDOW_INFO == 1u64 << 36);
+
     assert!(size_of::<HeliosNvrmEvent>() == HELIOS_NVRM_EVENT_BYTES);
     assert!(offset_of!(HeliosNvrmEvent, handle) == 40);
     assert!(offset_of!(HeliosNvrmEvent, kind) == 44);
@@ -671,3 +742,79 @@ const _: () = {
     assert!(size_of::<HeliosNvrmUnpin>() == HELIOS_NVRM_UNPIN_BYTES);
     assert!(offset_of!(HeliosNvrmUnpin, pin_id) == 40);
 };
+
+#[cfg(test)]
+mod window_info_tests {
+    use super::*;
+    use bytemuck::bytes_of;
+
+    /// The wire form is little-endian at the documented offsets (the C mirror and the UMD read
+    /// these bytes).
+    #[test]
+    fn window_info_bytes_are_where_the_abi_says() {
+        let mut w = HeliosNvrmWindowInfo::zeroed();
+        w.window_bytes = 0x0000_0008_0000_0000; // 32 GiB
+        w.window_used_bytes = 0x1122_3344_5566_7788;
+        w.owner_limit_bytes = 0x0000_0007_F000_0000;
+        w.owner_used_bytes = 0xAABB_CCDD_EEFF_0011;
+        w.generation = 7;
+        w.flags = HELIOS_NVRM_WINDOW_FLAG_OWNER_LIMIT | HELIOS_NVRM_WINDOW_FLAG_SHARED_CEILING;
+        let b = bytes_of(&w);
+        assert_eq!(b.len(), 88);
+        assert_eq!(&b[40..48], &0x0000_0008_0000_0000u64.to_le_bytes());
+        assert_eq!(&b[48..56], &0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(&b[56..64], &0x0000_0007_F000_0000u64.to_le_bytes());
+        assert_eq!(&b[64..72], &0xAABB_CCDD_EEFF_0011u64.to_le_bytes());
+        assert_eq!(&b[72..80], &7u64.to_le_bytes());
+        assert_eq!(&b[80..84], &5u32.to_le_bytes());
+        assert_eq!(&b[84..88], &0u32.to_le_bytes());
+    }
+
+    /// 32 and 128 GiB do not fit a u32: the fields are 64-bit.
+    #[test]
+    fn window_info_sizes_are_64_bit() {
+        let mut w = HeliosNvrmWindowInfo::zeroed();
+        w.window_bytes = 128 << 30;
+        assert!(w.window_bytes > u64::from(u32::MAX));
+        assert_eq!(core::mem::size_of_val(&w.window_bytes), 8);
+    }
+
+    /// The new op and capability bit collide with no other op or capability of this ABI.
+    #[test]
+    fn window_info_op_and_capability_are_free() {
+        let ops = (1u64 << HELIOS_NVRM_OP_QUERY_CAPS)
+            | (1 << HELIOS_NVRM_OP_FORWARD)
+            | (1 << HELIOS_NVRM_OP_MMAP)
+            | (1 << HELIOS_NVRM_OP_MUNMAP)
+            | (1 << HELIOS_NVRM_OP_EVENT_REGISTER)
+            | (1 << HELIOS_NVRM_OP_EVENT_UNREGISTER)
+            | (1 << HELIOS_NVRM_OP_PIN)
+            | (1 << HELIOS_NVRM_OP_UNPIN)
+            | crate::HELIOS_NVRM_SCANOUT_OPS
+            | crate::HELIOS_NVRM_SCANOUT_STATUS_OPS;
+        assert_eq!(ops & (1 << HELIOS_NVRM_OP_WINDOW_INFO), 0);
+        let caps = [
+            crate::HELIOS_NVRM_CAP_SCANOUT_FENCE,
+            crate::HELIOS_NVRM_CAP_PRESENT_FENCE,
+            crate::HELIOS_NVRM_CAP_FLUSH_GATE,
+            crate::HELIOS_NVRM_CAP_SCANOUT_RELEASE,
+        ];
+        for c in caps {
+            assert_eq!(c & HELIOS_NVRM_CAP_WINDOW_INFO, 0);
+        }
+        // A capability is a single bit in the high half; an op is below 32.
+        assert_eq!(HELIOS_NVRM_CAP_WINDOW_INFO.count_ones(), 1);
+        assert!(HELIOS_NVRM_CAP_WINDOW_INFO >= 1 << 32);
+        assert!(HELIOS_NVRM_OP_WINDOW_INFO < 32);
+        // The flag bits are distinct.
+        assert_eq!(
+            HELIOS_NVRM_WINDOW_FLAG_OWNER_LIMIT
+                & (HELIOS_NVRM_WINDOW_FLAG_CAN_GROW | HELIOS_NVRM_WINDOW_FLAG_SHARED_CEILING),
+            0
+        );
+        assert_eq!(
+            HELIOS_NVRM_WINDOW_FLAG_CAN_GROW & HELIOS_NVRM_WINDOW_FLAG_SHARED_CEILING,
+            0
+        );
+    }
+}

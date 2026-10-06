@@ -1764,7 +1764,11 @@ const NVRM_OPS_IMPLEMENTED: u64 = (1 << HELIOS_NVRM_OP_QUERY_CAPS)
     | (1 << HELIOS_NVRM_OP_MMAP)
     | (1 << HELIOS_NVRM_OP_MUNMAP)
     | (1 << HELIOS_NVRM_OP_PIN)
-    | (1 << HELIOS_NVRM_OP_UNPIN);
+    | (1 << HELIOS_NVRM_OP_UNPIN)
+    // Op 13 and its capability bit 36: the RM window report (always answerable: with the
+    // transport down it reports a window of 0 bytes).
+    | (1 << helios_protocol::HELIOS_NVRM_OP_WINDOW_INFO)
+    | helios_protocol::HELIOS_NVRM_CAP_WINDOW_INFO;
 /// The event ops, reported (`QUERY_CAPS.supported_ops`) only while events are
 /// usable on this device; see `virtio::gpu::nvrm_events`.
 const NVRM_EVENT_OPS: u64 =
@@ -2002,8 +2006,10 @@ fn escape_nvrm_op(
             caps.supported_event_kinds = event_kinds;
             caps.supported_cache_types = NVRM_CACHE_TYPES;
             caps.device_features = device_features;
-            caps.max_handles = crate::virtio::gpu::MAX_NVRM_HANDLES_PER_OWNER as u32;
-            caps.max_mappings = crate::virtio::gpu::MAX_NVRM_MAPS_PER_OWNER as u32;
+            // The per-process sanity bounds in force (the old fixed 128 / 256 under
+            // `NvWinPolicy` = 0; those same 128 / 256 before the first transport).
+            caps.max_handles = crate::virtio::nvrm_window::handles_per_owner();
+            caps.max_mappings = crate::virtio::nvrm_window::maps_per_owner();
             caps.max_pins = crate::virtio::gpu::MAX_NVRM_PINS_PER_OWNER as u32;
             caps.max_pin_pages = crate::virtio::gpu::MAX_NVRM_PIN_PAGES as u32;
             caps.pin_deep_kinds = HELIOS_NVRM_PIN_DEEP_BIT_DIRECT | HELIOS_NVRM_PIN_DEEP_BIT_INDIRECT;
@@ -2018,6 +2024,7 @@ fn escape_nvrm_op(
         HELIOS_NVRM_OP_MUNMAP => nvrm_munmap(passive, adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_PIN => nvrm_pin(passive, adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_UNPIN => nvrm_unpin(adapter, buf, hdr, owner, epoch),
+        helios_protocol::HELIOS_NVRM_OP_WINDOW_INFO => nvrm_window_info(adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_EVENT_REGISTER => nvrm_event_register(adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_EVENT_UNREGISTER => nvrm_event_unregister(adapter, buf, hdr, owner, epoch),
         // Foreign scanout source (own scanout 0, present GEM objects to it).
@@ -2031,6 +2038,52 @@ fn escape_nvrm_op(
         }
         _ => STATUS_INVALID_PARAMETER,
     }
+}
+
+/// `HELIOS_NVRM_OP_WINDOW_INFO`: the RM window as the caller sees it (`HeliosNvrmWindowInfo`),
+/// for NVK's live `VK_EXT_memory_budget`. Read-only and cheap: no host round trip, no registry
+/// write (the counters are mirrored by the worker, as always), one short virtio-lock hold
+/// over the window account (`O(owners)`), after one read of the scanout state's leaf lock
+/// (the privilege evidence, taken BEFORE the virtio lock). Always `OK` in the header: a
+/// transport that is down reports a window of 0 bytes. A buffer too small for the struct
+/// answers `BAD_RANGE` in the header (counted in the short-buffer counter every escape verb
+/// shares, QUERY_STATS `out_escape_short_buffer`), and writes only the header.
+fn nvrm_window_info(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    epoch: u64,
+) -> NTSTATUS {
+    use helios_protocol::HeliosNvrmWindowInfo;
+    let need = size_of::<HeliosNvrmWindowInfo>();
+    if buf.len() < need || (hdr.size as usize) < need {
+        // `escape_nvrm_op` already checked the header fits.
+        ESCAPE_SHORT_BUFFER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let head: HeliosNvrmHeader = pod_read_unaligned(&buf[..size_of::<HeliosNvrmHeader>()]);
+        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch);
+    }
+    let mut wire = match EscapeBuf::<HeliosNvrmWindowInfo>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut w = wire.read();
+    crate::virtio::nvrm_window::INFO_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let live_privileged = crate::virtio::nvrm_window::live_privileged(adapter, owner);
+    let info = adapter
+        .with_virtio(|v| v.nvrm_window_info(owner, live_privileged))
+        .ok();
+    w.window_bytes = info.map_or(0, |i| i.window_bytes);
+    w.window_used_bytes = info.map_or(0, |i| i.used_bytes);
+    w.owner_limit_bytes = info.map_or(0, |i| i.owner_limit_bytes);
+    w.owner_used_bytes = info.map_or(0, |i| i.owner_used_bytes);
+    w.generation = crate::virtio::nvrm_window::generation();
+    w.flags = info.map_or(0, |i| i.flags);
+    w.reserved = 0;
+    w.head.status = HELIOS_NVRM_ST_OK;
+    w.head.epoch = epoch;
+    wire.write_back(&w);
+    STATUS_SUCCESS
 }
 
 /// `HELIOS_NVRM_OP_EVENT_REGISTER`: tie the caller's event to `(handle, kind)`, so
@@ -2223,13 +2276,12 @@ fn nvrm_mmap(
         status
     };
     let region = nvrm::region_for(adapter, host.device_type);
+    // 64-bit throughout: the window is the GPU's BAR1 (32 GiB, 128 GiB on a big card), so an
+    // offset or a sum past 4 GiB is the normal case, and a host that names a span that
+    // wraps (or whose physical address would not fit `PHYSICAL_ADDRESS`) is refused.
     let in_range = |r: &crate::virtio::pci_caps::HostVisibleWindow| {
-        host.offset % 4096 == 0
-            && host.size >= m.size
-            && host
-                .offset
-                .checked_add(m.size)
-                .is_some_and(|end| end <= r.len)
+        host.size >= m.size
+            && helios_kmd_logic::window_units::place(r.base, r.len, host.offset, m.size).is_some()
     };
     let Some(region) = region.filter(|r| in_range(r)) else {
         let status = undo(if region.is_none() {
@@ -2272,14 +2324,22 @@ fn nvrm_mmap(
     let Some((user_va, mdl)) = mapped else {
         crate::virtio::gpu::MAP_PAGES_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         crate::virtio::nvrm::NVRM_MAP_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // No MDL or no user address space for the view: counted as `NvWinRAddr`.
+        crate::virtio::nvrm_window::count_addr_space();
         let status = undo(HELIOS_NVRM_ST_NO_RESOURCES);
         return finish(&mut m, status, 0);
     };
 
     // Track it and mint its id under one lock hold, which also re-checks that the
-    // handle is still ours (a concurrent Close may have forgotten it).
+    // handle is still ours (a concurrent Close may have forgotten it), the table's
+    // bounds, and charges the window account. The process id is for the per-process
+    // report (`NvWinT*`); privilege is read BEFORE the lock (it takes the scanout lock).
+    let pid = crate::virtio::nvrm_window::current_pid();
+    let live_privileged = crate::virtio::nvrm_window::live_privileged(adapter, owner);
     let kmd_id = adapter
-        .with_virtio(|v| v.push_nvrm_map(owner, m.handle, host.host_id, m.size, uvm))
+        .with_virtio(|v| {
+            v.push_nvrm_map(owner, m.handle, host.host_id, m.size, uvm, pid, live_privileged)
+        })
         .ok()
         .flatten();
     let inserted = kmd_id.is_some_and(|id| {
@@ -2292,7 +2352,10 @@ fn nvrm_mmap(
     });
     let Some(kmd_id) = kmd_id.filter(|_| inserted) else {
         if let Some(id) = kmd_id {
-            // The slot was made but the view could not be recorded: take both back.
+            // The slot was made but the view could not be recorded (the adapter-wide
+            // mapping table is full or the id is taken): take both back, and count it as
+            // the bookkeeping being full (`NvWinRTab`).
+            crate::virtio::nvrm_window::count_refusal(helios_kmd_logic::rm_window::Refusal::TableFull);
             let _ = adapter.with_virtio(|v| v.take_nvrm_map(owner, id));
         }
         // SAFETY: still in the owning process at PASSIVE; the pair is the one

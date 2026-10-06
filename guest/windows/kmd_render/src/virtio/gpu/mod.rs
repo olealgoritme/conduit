@@ -70,8 +70,7 @@ mod rm_resource_import_tables;
 pub use foreign_tables::{AllocAdopt, ForeignBegin, ForeignClose, ForeignCommit, ForeignSnapshot};
 
 pub use nvrm_events::{
-    release_nvrm_event, NvrmEventRefusal, NvrmEventRegistered, NvrmEventsState, MAX_NVRM_EVENTS,
-    MAX_NVRM_EVENTS_PER_OWNER,
+    release_nvrm_event, NvrmEventRefusal, NvrmEventRegistered, NvrmEventsState,
 };
 
 pub use rm_gates::{
@@ -79,8 +78,8 @@ pub use rm_gates::{
 };
 
 pub use nvrm_tables::{
-    FenceClaim, FenceCommit, FenceRefusal, NvrmPin, PinTake, MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER, MAX_NVRM_MAPS,
-    MAX_NVRM_MAPS_PER_OWNER, MAX_NVRM_PINS, MAX_NVRM_PINS_PER_OWNER, MAX_NVRM_PIN_PAGES,
+    grow_nvrm_tables, FenceClaim, FenceCommit, FenceRefusal, NvrmPin, PinTake, MAX_NVRM_PINS,
+    MAX_NVRM_PINS_PER_OWNER, MAX_NVRM_PIN_PAGES,
 };
 
 use super::config::DxgkConfigAccess;
@@ -2377,7 +2376,8 @@ pub struct VirtioGpu {
     scanout_release: bool,
     /// Backend RM handles opened through HELIOS_ESCAPE_NVRM, tagged with the
     /// owning device so a process cannot name another's, and closed at device
-    /// teardown. Reserved to MAX_NVRM_HANDLES at init. See `nvrm_tables`.
+    /// teardown. Starts at 1024 slots and grows (PASSIVE, outside the lock:
+    /// `grow_nvrm_tables`) to MAX_NVRM_HANDLES. See `nvrm_tables`.
     nvrm_handles: Vec<nvrm_tables::NvrmHandleSlot>,
     /// Slots reserved by in-flight forwarded `Open`s.
     nvrm_reserved: usize,
@@ -2396,9 +2396,16 @@ pub struct VirtioGpu {
     nvrm_fences: Box<helios_kmd_logic::nvrm_fence::FenceBook>,
     /// Live HELIOS_NVRM_OP_MMAP mappings (the host's mapping id, the handle it
     /// belongs to, the owner), so `Close` and device teardown can send the host
-    /// `Munmap`. Reserved to MAX_NVRM_MAPS at init. The user view itself is in
+    /// `Munmap`. Starts at 1024 slots and grows to MAX_NVRM_MAPS (like
+    /// `nvrm_handles`). The user view itself is in
     /// `AdapterContext::mappings`, under the key `nvrm::map_key(mapping_id)`.
     nvrm_maps: Vec<nvrm_tables::NvrmMapSlot>,
+    /// The RM window's byte accounting and policy (`helios_kmd_logic::rm_window`): who holds
+    /// how many bytes of region 1, the reserve, the refusals. Boxed like the other tables.
+    /// With the sanity bounds and growth rules of the handle and mapping tables
+    /// (`helios_kmd_logic::rm_limits`; fixed numbers under `NvWinPolicy` = 0). ONE box: see
+    /// [`nvrm_tables::NvrmLimits`] for why (the init frame budget).
+    nvrm_limits: Box<nvrm_tables::NvrmLimits>,
     // (Mapping ids are minted by `virtio::nvrm::mint_map_id`, one counter for the
     // life of the driver: the host's own ids are not unique, the RM path answers
     // 0 for all of them, and the views outlive this transport.)
@@ -2985,8 +2992,17 @@ impl VirtioGpu {
         // which case HELIOS_NVRM_OP_MMAP answers UNSUPPORTED.
         let nvrm_window = scan_shm_region(&DxgkConfigAccess::new(dxgkrnl), SHM_ID_WINDOW);
         let nvrm_aperture = scan_shm_region(&DxgkConfigAccess::new(dxgkrnl), SHM_ID_APERTURE);
-        crate::diag::record_named_bytes(b"NvWinMb", nvrm_window.map_or(0, |w| (w.len >> 20) as u32));
-        crate::diag::record_named_bytes(b"NvAptMb", nvrm_aperture.map_or(0, |w| (w.len >> 20) as u32));
+        // MiB through the saturating helper: a 32 or 128 GiB window is 32768 / 131072, and a
+        // region past what a u32 of MiB holds (4 PiB) reads as the maximum, never as a small
+        // number (`helios_kmd_logic::window_units`).
+        crate::diag::record_named_bytes(
+            b"NvWinMb",
+            nvrm_window.map_or(0, |w| helios_kmd_logic::window_units::mib_u32(w.len)),
+        );
+        crate::diag::record_named_bytes(
+            b"NvAptMb",
+            nvrm_aperture.map_or(0, |w| helios_kmd_logic::window_units::mib_u32(w.len)),
+        );
 
         // Locate + map the ISR-status register so the (real) ISR can read-to-clear
         // the level-triggered INTx line and stop the unhandled-interrupt storm.
@@ -3019,16 +3035,21 @@ impl VirtioGpu {
         let rm_gates = rm_gates::allocate_rm_gates()?;
         let present_buffer_syncs = allocate_present_buffer_syncs()?;
         let present_buffer_opens = allocate_present_buffer_opens()?;
+        // The RM window policy and the tables' bounds (knobs `NvWinPolicy`, `NvWinReserveMb`,
+        // `NvWinMaxMb`), read here at PASSIVE.
+        let nvrm_limits =
+            nvrm_tables::new_window_account(nvrm_window).ok_or(VirtioError::OutOfMemory)?;
         // Nothing to register against without the event queue: reserve nothing.
-        let nvrm_events = helios_kmd_logic::nvrm_events::Registry::try_new(
-            if nvrm_event_ring.is_some() {
-                MAX_NVRM_EVENTS
+        let nvrm_events = {
+            let b = &nvrm_limits.event_bounds;
+            let (initial, total) = if nvrm_event_ring.is_some() {
+                (b.initial, b.global_max)
             } else {
-                0
-            },
-            MAX_NVRM_EVENTS_PER_OWNER,
-        )
-        .ok_or(VirtioError::OutOfMemory)?;
+                (0, 0)
+            };
+            helios_kmd_logic::nvrm_events::Registry::try_new_growing(initial, total, b.per_owner_max)
+                .ok_or(VirtioError::OutOfMemory)?
+        };
         // The release event is delivered on the event queue: without it (a device with no
         // second queue, no memory for its buffers) the ack buys nothing, so the consumers
         // stay off. `RelNoQ` = 1 names that case (the host then keeps bookkeeping it can
@@ -3061,11 +3082,12 @@ impl VirtioGpu {
             nvrm_events,
             cfg_features,
             scanout_release: scanout_release_on,
-            nvrm_handles: Vec::with_capacity(MAX_NVRM_HANDLES),
+            nvrm_handles: Vec::with_capacity(nvrm_limits.handle_bounds.initial),
             nvrm_reserved: 0,
             nvrm_clients: nvrm_tables::new_client_table(),
             nvrm_fences: nvrm_tables::new_fence_book(),
-            nvrm_maps: Vec::with_capacity(MAX_NVRM_MAPS),
+            nvrm_maps: Vec::with_capacity(nvrm_limits.map_bounds.initial),
+            nvrm_limits,
             nvrm_pins: Vec::with_capacity(MAX_NVRM_PINS),
             nvrm_next_pin: 1,
             nvrm_window,

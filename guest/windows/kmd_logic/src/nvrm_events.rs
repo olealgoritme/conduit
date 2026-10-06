@@ -70,6 +70,10 @@ struct Reg<E> {
     event: E,
 }
 
+/// Storage for a [`Registry`] that grows: opaque, built by [`Registry::spare`], consumed by
+/// [`Registry::install`].
+pub struct Spare<E>(Vec<Reg<E>>);
+
 /// The registrations of every process, bounded.
 pub struct Registry<E: Copy + PartialEq> {
     regs: Vec<Reg<E>>,
@@ -89,6 +93,51 @@ impl<E: Copy + PartialEq> Registry<E> {
             max_total,
             max_per_owner,
         })
+    }
+
+    /// A table that starts with room for `initial` registrations and may grow
+    /// ([`Self::install`]) to `max_total`, `max_per_owner` of them one owner's. `None` if the
+    /// allocator refuses the first storage. PASSIVE.
+    pub fn try_new_growing(initial: usize, max_total: usize, max_per_owner: usize) -> Option<Self> {
+        let mut regs = Vec::new();
+        regs.try_reserve_exact(initial.min(max_total)).ok()?;
+        Some(Self {
+            regs,
+            max_total,
+            max_per_owner,
+        })
+    }
+
+    /// Slots of storage now (what `add` can fill before it answers `TotalFull`).
+    pub fn capacity(&self) -> usize {
+        self.regs.capacity().min(self.max_total)
+    }
+
+    /// The capacity this table wants before the next registration, by `b`'s growth rule
+    /// (`rm_limits::want_capacity`); `None` when it has room or is at its bound.
+    pub fn want_capacity(&self, b: &crate::rm_limits::Bounds) -> Option<usize> {
+        crate::rm_limits::want_capacity(b, self.capacity(), self.regs.len())
+    }
+
+    /// New storage for `n` registrations, allocated by the caller at PASSIVE with no lock held.
+    pub fn spare(n: usize) -> Option<Spare<E>> {
+        let mut v = Vec::new();
+        v.try_reserve_exact(n).ok()?;
+        Some(Spare(v))
+    }
+
+    /// Swap `fresh` in under the caller's lock: the registrations move over (a copy, no
+    /// allocation: `fresh` holds them all) and the old, empty storage comes back for the caller
+    /// to free with no lock held. A `fresh` that is not larger than what is here, or cannot hold
+    /// what is here, or would exceed `max_total`, comes back untouched.
+    pub fn install(&mut self, fresh: Option<Spare<E>>) -> Option<Spare<E>> {
+        let mut fresh = fresh?;
+        if fresh.0.capacity() <= self.regs.capacity() || fresh.0.capacity() < self.regs.len() {
+            return Some(fresh);
+        }
+        fresh.0.append(&mut self.regs);
+        core::mem::swap(&mut self.regs, &mut fresh.0);
+        Some(fresh)
     }
 
     /// How many registrations are live.
@@ -224,6 +273,64 @@ mod tests {
 
     fn reg(total: usize, per_owner: usize) -> Registry<u32> {
         Registry::try_new(total, per_owner).expect("reserve")
+    }
+
+    #[test]
+    fn a_growing_registry_grows_without_losing_or_reordering_anything() {
+        let mut r: Registry<u32> = Registry::try_new_growing(4, 64, 64).expect("reserve");
+        let b = crate::rm_limits::Bounds::growing(4, 2, 64, 64);
+        for h in 1..=4u32 {
+            assert_eq!(r.add(1, h, KIND_READY, h), Added::New);
+        }
+        // Full: nothing changed.
+        assert_eq!(r.add(1, 5, KIND_READY, 5), Added::TotalFull);
+        let want = r.want_capacity(&b).expect("full, wants more");
+        assert!(want >= 4 + 2 + 1);
+        let old = r.install(Registry::spare(want));
+        // The old storage came back empty for the caller to free outside the lock.
+        assert!(old.is_some());
+        assert_eq!(r.len(), 4);
+        assert!(r.capacity() >= want);
+        assert_eq!(r.add(1, 5, KIND_READY, 5), Added::New);
+        for h in 1..=5u32 {
+            assert_eq!(r.remove(1, h, KIND_READY), Some(h));
+        }
+    }
+
+    #[test]
+    fn growth_stops_at_the_bound_and_a_stale_spare_is_refused() {
+        let mut r: Registry<u32> = Registry::try_new_growing(2, 3, 3).expect("reserve");
+        assert_eq!(r.capacity(), 2);
+        let _ = r.install(Registry::spare(100));
+        // Never reports more than max_total, and `add` never exceeds it.
+        assert_eq!(r.capacity(), 3);
+        for h in 1..=3u32 {
+            assert_eq!(r.add(1, h, KIND_READY, h), Added::New);
+        }
+        assert_eq!(r.add(1, 4, KIND_READY, 4), Added::TotalFull);
+        // A spare that is not larger comes back untouched.
+        let again = r.install(Registry::spare(1));
+        assert!(again.is_some());
+        assert_eq!(r.len(), 3);
+        // No spare, nothing happens.
+        assert!(r.install(None).is_none());
+    }
+
+    #[test]
+    fn a_process_can_hold_as_many_events_as_handles() {
+        // The production event shape: well past the old 130.
+        let b = crate::rm_limits::EVENTS;
+        let mut r: Registry<u32> =
+            Registry::try_new_growing(b.initial, b.global_max, b.per_owner_max).expect("reserve");
+        for h in 1..=2_000u32 {
+            if let Some(n) = r.want_capacity(&b) {
+                let _ = r.install(Registry::spare(n));
+            }
+            assert_eq!(r.add(7, h, KIND_READY, h), Added::New, "handle {h}");
+        }
+        assert_eq!(r.count_for_owner(7), 2_000);
+        // The per-process bound is the handle bound + 2.
+        assert_eq!(b.per_owner_max, 4_096 + 2);
     }
 
     #[test]

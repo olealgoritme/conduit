@@ -67,11 +67,10 @@ use helios_kmd_logic::nvrm_fence::Noted;
 use helios_kmd_logic::rm_fence_present::Attach;
 use super::nvrm_tables::FenceFire;
 
-/// Most registrations across every process (each is one object reference).
-pub const MAX_NVRM_EVENTS: usize = 1024;
-/// Most one process may hold: a `READY` registration per handle it can have open,
-/// plus its `TRANSPORT_LOST` and `SCANOUT_RELEASED` ones.
-pub const MAX_NVRM_EVENTS_PER_OWNER: usize = MAX_NVRM_HANDLES_PER_OWNER + 2;
+// The registry's bounds (most registrations in all, and per process: a `READY` per handle a
+// process can have open plus its `TRANSPORT_LOST` and `SCANOUT_RELEASED`) are
+// `helios_kmd_logic::rm_limits::EVENTS`, DERIVED from the handle bounds and grown like the handle
+// table (`grow_nvrm_tables`); 1024 / 130 fixed under `NvWinPolicy` = 0.
 
 /// Virtio feature bit 12 (`NVGPU_CFG_TAKES_INPUT`), which this driver must never
 /// ack (see the module docs). Named only for the assertion below.
@@ -279,6 +278,23 @@ pub struct NvrmEventRegistered {
 }
 
 impl VirtioGpu {
+    /// The capacity the event registry wants before the next registration, if it wants more
+    /// (`None` when there is no event queue: nothing is reserved and nothing grows).
+    pub(super) fn nvrm_events_want(&self) -> Option<usize> {
+        if self.nvrm_event_ring.is_none() {
+            return None;
+        }
+        self.nvrm_events.want_capacity(&self.nvrm_limits.event_bounds)
+    }
+
+    /// Swap in the larger registry storage allocated outside the lock.
+    pub(super) fn nvrm_events_install(
+        &mut self,
+        fresh: Option<helios_kmd_logic::nvrm_events::Spare<NonNull<KEVENT>>>,
+    ) -> Option<helios_kmd_logic::nvrm_events::Spare<NonNull<KEVENT>>> {
+        self.nvrm_events.install(fresh)
+    }
+
     /// Whether events are usable; see [`NvrmEventsState`].
     pub fn nvrm_events_state(&self) -> NvrmEventsState {
         if self.nvrm_event_ring.is_none() {
@@ -464,7 +480,9 @@ impl VirtioGpu {
         // first one also routes to what the fence was attached to
         // (`docs/rm-fence-marker.md`): both are flag writes under this lock.
         let mut wake_worker = false;
-        match self.fence_note_fired(handle, status) {
+        // One scan of the handle table for the whole event (the DPC, under the virtio lock).
+        let idx = self.nvrm_handle_index(handle);
+        match self.fence_note_fired_at(idx, status) {
             FenceFire::NotFence => {}
             FenceFire::Repeat => {
                 NVRM_FENCE_FIRED.fetch_add(1, Ordering::Relaxed);
@@ -493,7 +511,7 @@ impl VirtioGpu {
         });
         if woke != 0 {
             NVRM_EV_SIGNALS.fetch_add(woke as u32, Ordering::Relaxed);
-        } else if self.latch_nvrm_ready(handle) {
+        } else if self.latch_nvrm_ready_at(idx) {
             NVRM_EV_LATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             match self.note_nvrm_fence_ready(handle, status) {

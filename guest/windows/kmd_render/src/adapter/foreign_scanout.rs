@@ -320,6 +320,11 @@ impl AdapterContext {
                 if o.kind != SetKind::Updated {
                     FS_CUR_GEN.store(o.generation, Ordering::Relaxed);
                 }
+                // The device that sets the scanout source is the shell's: it may use the
+                // RM window's reserve until its device is destroyed (`NvWinReserveMb`).
+                // After the `STATE` lock above was dropped: `with_virtio` is never
+                // called with it held.
+                let _ = self.with_virtio(|v| v.nvrm_window_mark_privileged(owner));
                 // The HPD worker arms the lapse deadline when it loops: wake a
                 // worker parked in an untimed wait so it sees this (new or shorter)
                 // deadline, or a hung owner on an idle desktop is never timed out.
@@ -532,6 +537,17 @@ impl AdapterContext {
         // generation, and so is the tracking (`StartDevice` turns it on again if the new
         // transport acked the feature).
         crate::virtio::scanout_release::reset();
+    }
+
+    /// Whether `owner` holds the foreign scanout source right now (a user source that is
+    /// live, lapsed or not). The RM window policy's evidence that `owner` is the shell's
+    /// device and may use the window's reserve (`virtio::nvrm_window::live_privileged`).
+    /// Takes the `STATE` leaf lock: never call with `virtio_lock` held.
+    pub(crate) fn foreign_scanout_owner_is(&self, owner: DeviceOwner) -> bool {
+        STATE
+            .lock()
+            .live()
+            .is_some_and(|a| a.owner == owner.raw() as u64)
     }
 
     /// Whether a FORWARDed `ScanoutFlip` from `owner` must be refused because

@@ -204,8 +204,8 @@ done at once). One image per flip suffices: with N >= 2 images a client waits on
 or a client still reads the image it wants.
 
 **`SCANOUT_RELEASED` event (kind 3)**, `EVENT_REGISTER` with `handle = 0` (like `TRANSPORT_LOST`),
-once per process; replaces by `(owner, kind)`; per-process quota `MAX_NVRM_EVENTS_PER_OWNER` is now
-`MAX_NVRM_HANDLES_PER_OWNER + 2`. Signalled when `out_released_seq` may have advanced for that
+once per process; replaces by `(owner, kind)`; per-process bound is the handle bound + 2 (`rm_limits::EVENTS`,
+`nvrm-escape.md` section 13.8). Signalled when `out_released_seq` may have advanced for that
 process's flips (a release matched one of its flips; a queued flip was skipped, dropped or refused;
 an older flip of a re-flipped buffer was finished); also by `TRANSPORT_LOST`'s wake-all. It is a
 doorbell, not a count: a spurious wake costs one `STATUS`. Without the feature `REGISTER` of kind
