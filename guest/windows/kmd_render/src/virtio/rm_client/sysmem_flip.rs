@@ -393,8 +393,18 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
     if epoch == 0 {
         return;
     }
-    rm_present::clear_wake_at();
-    let (mut frame_edge, mut resume_edge) = rm_present::take_edges();
+    // `ForeignFlip` (`virtio/foreign_flip.rs`) holds the screen: the shared frame and resume
+    // edges are ITS edges and its pass takes them; this one only stands down (its target is
+    // gone). With the knob off `holds_screen` is one load of 0 and nothing changes.
+    let foreign = crate::virtio::foreign_flip::holds_screen();
+    if !foreign {
+        rm_present::clear_wake_at();
+    }
+    let (mut frame_edge, mut resume_edge) = if foreign {
+        (false, false)
+    } else {
+        rm_present::take_edges()
+    };
     // The cap on flips is the mode's: one per refresh period, whatever rate the edges come at.
     let interval = rr::flip_interval_100ns(adapter.effective_refresh_mhz());
     INTERVAL.store(interval, Ordering::Relaxed);
@@ -408,7 +418,14 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
         }
         g.p.set_min_interval(interval);
         g.r.set_poll_ms(poll);
-        g.r.edges(rm_present::take_edge_count(), frame_edge);
+        g.r.edges(
+            if foreign {
+                0
+            } else {
+                rm_present::take_edge_count()
+            },
+            frame_edge,
+        );
     }
     for _ in 0..ACTS_PER_PASS {
         // StopDevice is joining the worker: start nothing. The transport reset that
@@ -419,7 +436,9 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
         let t = now();
         let target = TARGET.lock().current();
         let ready = rs::target_ready(target.as_ref(), epoch);
-        let (has_resident, foreground) = adapter.foreign_scanout_resident_state();
+        // Only the KMD's own resident source is this presenter's (a user device's, registered by
+        // `ForeignFlip`, is not its to see or to withdraw).
+        let (has_resident, foreground) = adapter.foreign_scanout_resident_state_of(true);
         // A ring of one: no release is ever waited for (`rm_sysmem::flip_inputs`).
         let mut inputs =
             rs::flip_inputs(t, ready, has_resident, foreground, frame_edge, resume_edge);
@@ -523,7 +542,7 @@ fn register(adapter: &AdapterContext, epoch: u64, target: Option<Target>) -> boo
 
 #[inline(never)]
 fn withdraw(adapter: &AdapterContext) {
-    let _ = adapter.foreign_scanout_resident_drop();
+    let _ = adapter.foreign_scanout_resident_drop_of(true);
     SYS_WITHDRAWN.fetch_add(1, Ordering::Relaxed);
 }
 

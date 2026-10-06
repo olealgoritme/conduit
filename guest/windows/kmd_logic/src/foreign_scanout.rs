@@ -591,6 +591,25 @@ impl ForeignScanout {
         ResidentDrop::Parked
     }
 
+    /// `(a resident source of the given class is registered, it is the foreground source)`.
+    /// The class is "the KMD's own" (`owner == kmd`: the RM client's ring and primary, levels
+    /// 3 to 5) or "a user device's" (`ForeignFlip`: a foreign allocation's flip, whose
+    /// source is its creator's); each flip service asks only about its own, so neither
+    /// withdraws or counts the other's.
+    pub fn resident_state_of(&self, kmd: u64, kmd_class: bool) -> (bool, bool) {
+        let mine = self.resident.is_some_and(|r| (r.owner == kmd) == kmd_class);
+        (mine, mine && self.resident_foreground())
+    }
+
+    /// [`Self::resident_drop`] for one class only (see [`Self::resident_state_of`]); a
+    /// resident source of the other class is left alone and the answer is `None`.
+    pub fn resident_drop_of(&mut self, kmd: u64, kmd_class: bool) -> ResidentDrop {
+        match self.resident {
+            Some(r) if (r.owner == kmd) == kmd_class => self.resident_drop(),
+            _ => ResidentDrop::None,
+        }
+    }
+
     /// The registered resident source, if any.
     pub fn resident(&self) -> Option<Resident> {
         self.resident

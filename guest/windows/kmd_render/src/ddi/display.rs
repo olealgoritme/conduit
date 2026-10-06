@@ -2600,11 +2600,38 @@ unsafe fn program_vidpn_source_inner(
         ) {
             Programmed::NotOurs => rm_flip::other_source(adapter),
             Programmed::Ok => {
+                // The screen's source is the KMD's own primary: a foreign allocation shown
+                // by `ForeignFlip` before it is forgotten (one load when it shows nothing).
+                crate::virtio::foreign_flip::other_source(adapter);
                 trace.target_resource = source.resource_id;
                 return Ok(ScanoutOutcome::Programmed);
             }
             Programmed::BadLayout => return Err(ScanoutReject::Layout),
             Programmed::Retry => return Err(ScanoutReject::SetFailed),
+        }
+    }
+    // `ForeignFlip` (Option B for any foreign allocation, `docs/kmd-rm-client.md` 15.18): an
+    // allocation that adopted an RM resource a user-mode device imported (DWM-on-NVK's
+    // swap-chain buffers) is shown by a flip of that device's DRM file and GEM through the
+    // arbiter's resident source: no `ScanoutTarget`, no bind, no `SET_SCANOUT_BLOB`. Knob off
+    // (the default): one relaxed load and the Venus path below, unchanged. A refusal (the
+    // importer's file is gone, an unusable layout, the host lacks the import, ring level) is
+    // counted (`FfRef<NN>`) and the Venus path below runs.
+    {
+        use crate::virtio::foreign_flip::{self as ffl, Programmed as FfProgrammed};
+        match ffl::program(
+            adapter,
+            source.resource_id,
+            source.primary_address,
+            width,
+            height,
+            source.direct_scanout,
+        ) {
+            FfProgrammed::NotOurs | FfProgrammed::Refused => ffl::other_source(adapter),
+            FfProgrammed::Ok => {
+                trace.target_resource = source.resource_id;
+                return Ok(ScanoutOutcome::Programmed);
+            }
         }
     }
     // A UMD-created exact pPrimaryDesc may already have the proven scan-out
