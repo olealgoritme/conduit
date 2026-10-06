@@ -41,8 +41,13 @@ if ! git -C "$MESA_DIR" cat-file -e "$MESA_BASE^{commit}" 2>/dev/null; then
   git -C "$MESA_DIR" fetch --depth 200 origin "$MESA_BASE"
 fi
 
-# 2. Apply the series on a local branch, unless it is already there
-last_subject=$(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$(ls "$here"/patches/*.patch | tail -1)")
+# 2. Apply the series on a local branch, unless it is already there:
+#    patches/ (NVK on RM), then patches-common/ (generic NVK patches that
+#    apply on top of the Windows stack as well)
+series=$(ls "$here"/patches/*.patch "$here"/patches-common/*.patch)
+last_patch=$(printf "%s\n" $series | tail -1)
+last_subject=$(awk '/^Subject: /{s = $0; while ((getline l) > 0 && l ~ /^ /) s = s l;
+                    sub(/^Subject: \[PATCH[^]]*\] /, "", s); print s; exit}' "$last_patch")
 if git -C "$MESA_DIR" log --format=%s "$MESA_BASE..HEAD" 2>/dev/null | grep -qxF "$last_subject"; then
   echo "nvk-rm: series already applied in $MESA_DIR"
 else
@@ -51,7 +56,8 @@ else
     exit 1
   fi
   git -C "$MESA_DIR" checkout -B nvk-rm "$MESA_BASE"
-  git -C "$MESA_DIR" am --3way "$here"/patches/*.patch
+  # shellcheck disable=SC2086
+  git -C "$MESA_DIR" am --3way $series
 fi
 
 # 3. Point meson at Conduit's rmclient.h through a throwaway pkg-config file
