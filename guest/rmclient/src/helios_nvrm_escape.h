@@ -119,7 +119,8 @@ typedef struct HeliosNvrmQueryCaps {
   uint32_t max_buffer_bytes;      /* out */
   uint32_t default_timeout_ms;    /* out: FORWARD default for timeout_ms == 0 */
   uint64_t supported_ops;         /* out: bit n <=> HELIOS_NVRM_OP_* == n (ops 5, 6
-                                     only while events are usable) */
+                                     only while events are usable); bits 32..63 are
+                                     capabilities (HELIOS_NVRM_CAP_*) */
   uint32_t supported_event_kinds; /* out: bit n <=> HELIOS_NVRM_EVENT_* == n;
                                      0 when events are not usable */
   uint32_t supported_cache_types; /* out: bit n <=> HELIOS_NVRM_CACHE_* == n */
@@ -312,6 +313,22 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmUnpin, pin_id) == 40, "unpin.pin_id
 #define HELIOS_NVRM_ST_SCANOUT_BUSY 13
 #define HELIOS_NVRM_ST_NO_SOURCE 14
 
+/* ---- RM fence presents (guest/windows/docs/rm-fence-marker.md) --------------
+ * SCANOUT_PRESENT with HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE: rm_fence_handle
+ * is a backend handle from a forwarded SEMSURF_FENCE_CREATE (0x6455) that the KMD
+ * TAKES OVER (never Close / EVENT_REGISTER / reuse it after status OK). The flip
+ * is sent when the fence fires; out_seq is returned at once. Refusals leave the
+ * handle the caller's: NOT_OWNED (not yours), FORBIDDEN (yours, not a fence),
+ * FENCE_ATTACHED, QUEUE_FULL (HELIOS_NVRM_SCANOUT_FENCE_DEPTH waiting), NO_SOURCE,
+ * UNSUPPORTED. Probe QueryCaps.supported_ops for the capability bits (>= 32, so
+ * they cannot collide with op numbers). */
+#define HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE 1u
+#define HELIOS_NVRM_ST_FENCE_ATTACHED 15
+#define HELIOS_NVRM_ST_QUEUE_FULL 16
+#define HELIOS_NVRM_SCANOUT_FENCE_DEPTH 8u
+#define HELIOS_NVRM_CAP_SCANOUT_FENCE (1ull << 32)
+#define HELIOS_NVRM_CAP_PRESENT_FENCE (1ull << 33)
+
 typedef struct HeliosNvrmScanoutSet {
   HeliosNvrmHeader head;
   uint32_t handle;         /* in:  backend handle of a DRM-node file (device_type >= 512) */
@@ -344,8 +361,9 @@ typedef struct HeliosNvrmScanoutPresent {
   HeliosNvrmHeader head;
   uint32_t handle;   /* in:  the handle given to SET */
   uint32_t gem;      /* in:  GEM handle (in that DRM file) of the image to show */
-  uint32_t flags;    /* in:  zero */
-  uint32_t reserved; /* in:  zero */
+  uint32_t flags;    /* in:  HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE or zero */
+  uint32_t rm_fence_handle; /* in: with the flag, a fence handle (forwarded
+                               SEMSURF_FENCE_CREATE) the KMD takes over; zero without */
   uint64_t out_seq;  /* out: the seq the KMD put in the ScanoutFlip */
 } HeliosNvrmScanoutPresent;
 #define HELIOS_NVRM_SCANOUT_PRESENT_BYTES 64u
@@ -353,7 +371,7 @@ HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmScanoutPresent) == HELIOS_NVRM_SCANOU
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, handle) == 40, "spres.handle");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, gem) == 44, "spres.gem");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, flags) == 48, "spres.flags");
-HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, reserved) == 52, "spres.reserved");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, rm_fence_handle) == 52, "spres.rm_fence_handle");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, out_seq) == 56, "spres.out_seq");
 
 typedef struct HeliosNvrmScanoutRelease {

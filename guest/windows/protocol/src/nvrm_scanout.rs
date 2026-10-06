@@ -103,10 +103,13 @@ pub struct HeliosNvrmScanoutPresent {
     pub handle: u32,
     /// in: the GEM handle, in that DRM file, of the image to show.
     pub gem: u32,
-    /// in: zero.
+    /// in: `HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE` or zero (`rm_fence`).
     pub flags: u32,
-    /// in: zero.
-    pub reserved: u32,
+    /// in: with the `RM_FENCE` flag, a fence handle of the caller's (from a
+    /// forwarded `SEMSURF_FENCE_CREATE`) that the KMD takes over: the flip is sent
+    /// when it fires and `out_seq` is returned at once. Zero without the flag.
+    /// See `rm_fence` and `docs/rm-fence-marker.md`.
+    pub rm_fence_handle: u32,
     /// out: the `seq` the KMD put in the `ScanoutFlip`.
     pub out_seq: u64,
 }
@@ -144,7 +147,7 @@ const _: () = {
     assert!(offset_of!(HeliosNvrmScanoutPresent, handle) == 40);
     assert!(offset_of!(HeliosNvrmScanoutPresent, gem) == 44);
     assert!(offset_of!(HeliosNvrmScanoutPresent, flags) == 48);
-    assert!(offset_of!(HeliosNvrmScanoutPresent, reserved) == 52);
+    assert!(offset_of!(HeliosNvrmScanoutPresent, rm_fence_handle) == 52);
     assert!(offset_of!(HeliosNvrmScanoutPresent, out_seq) == 56);
 
     assert!(size_of::<HeliosNvrmScanoutRelease>() == HELIOS_NVRM_SCANOUT_RELEASE_BYTES);
