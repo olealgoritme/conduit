@@ -287,6 +287,12 @@ pub mod wire {
     /// Conduit: x = 1 the client wants frames from now on, 0 it does not
     /// (any more). Only from a client with [`CAP_IDLE`], which starts idle.
     pub const EV_ACTIVE: u16 = 19;
+    /// Conduit: send the current frame again. The client dropped the frames
+    /// it was sent while it could not show them yet -- the viewer drops the
+    /// first frame of a (fourcc, modifier) while it proves the display can
+    /// import it -- and on an idle guest no new flip comes to replace them.
+    /// A backend that does not know it ignores it.
+    pub const EV_REFRESH: u16 = 20;
 
     pub const F_FULLSCREEN: u16 = 1 << 2;
     /// ATTACH flags: the fd is a sealed memfd to present from shared memory
@@ -2212,6 +2218,17 @@ impl DisplayLink {
         self.deliver_releases();
     }
 
+    /// EV_REFRESH from client `i`: the current frame again, now (a frame it
+    /// dropped while proving the format was the only one an idle guest sent).
+    fn refresh(&self, i: usize) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(r) = self.resend_frame_locked(&mut st, i) {
+            log::info!("display: client {i} asked for the frame again: {r:?}");
+        }
+        drop(st);
+        self.deliver_releases();
+    }
+
     /// The link thread: frames owed to clients whose sockets drained.
     fn retry_frames(&self, writable: &[usize]) {
         let mut st = self.state.lock().unwrap();
@@ -2994,6 +3011,7 @@ impl DisplayLink {
                 self.hello_at(i, p.w1);
             }
             EV_ACTIVE => self.set_active(i, p.x != 0),
+            EV_REFRESH => self.refresh(i),
             EV_RELEASE => {
                 self.client_released(i, (p.w0 as u64) | ((p.w1 as u64) << 32), p.x as u32)
             }
@@ -3842,6 +3860,57 @@ mod tests {
         );
         assert_eq!(broker_recv(broker2.as_raw_fd()).0.ty, wire::CMD_ATTACH);
         assert_eq!(*exports.lock().unwrap(), 1, "kept, not exported again");
+    }
+
+    /// The win11 case: a viewer restarted on an idle desktop gets the frame
+    /// at HELLO, drops it while it proves the format, and asks again with
+    /// EV_REFRESH; the same frame comes back at once, with no guest flip.
+    /// Every scanout path keeps its frame the same way: a GEM flip (Linux,
+    /// NVK/RM) and a dma-buf flip (Venus, RM-export blobs).
+    #[test]
+    fn a_refresh_resends_the_current_frame_without_a_flip() {
+        for venus in [false, true] {
+            let link = DisplayLink::new(None);
+            let buf = memfd();
+            if venus {
+                let g = FrameGeometry {
+                    width: 1920,
+                    height: 1080,
+                    stride: 7680,
+                    offset: 0,
+                    fourcc: 0x34325241,
+                    modifier: 0x0300_0000_0060_6014,
+                };
+                link.flip_dmabuf(buf.as_raw_fd(), &g, Some(7));
+            } else {
+                // No client: the GEM path parks the buffer unexported.
+                fake_exporter(&link, &buf);
+                let drm = memfd();
+                assert!(link.park(drm.as_raw_fd(), &flip(1, 1920)));
+            }
+            let (ours, broker) = socketpair();
+            link.adopt(ours);
+            link.note_packet(0, &pkt(wire::EV_HELLO, 0, 0, 0, 2, 0));
+            let (c, f) = next_frame(broker.as_raw_fd());
+            assert_eq!(c.width, 1920, "venus {venus}");
+            assert_eq!(inode(f.as_raw_fd()), inode(buf.as_raw_fd()));
+            assert_eq!(pending_bytes(broker.as_raw_fd()), 0);
+            link.note_packet(0, &pkt(wire::EV_REFRESH, 0, 0, 0, 0, 0));
+            let (c, f) = next_frame(broker.as_raw_fd());
+            assert_eq!((c.ty, c.width), (wire::CMD_ATTACH, 1920));
+            assert_eq!(inode(f.as_raw_fd()), inode(buf.as_raw_fd()));
+            assert_eq!(pending_bytes(broker.as_raw_fd()), 0, "one frame");
+        }
+        // Nothing shown yet, or a client that is idle: nothing to send.
+        let link = DisplayLink::new(None);
+        let (ours, broker) = socketpair();
+        link.adopt(ours);
+        link.note_packet(0, &pkt(wire::EV_HELLO, 0, 0, 0, 2, wire::CAP_IDLE));
+        assert_eq!(broker_recv(broker.as_raw_fd()).0.ty, wire::CMD_CAPS);
+        let buf = memfd();
+        link.flip(buf.as_raw_fd(), &flip(1, 1920));
+        link.note_packet(0, &pkt(wire::EV_REFRESH, 0, 0, 0, 0, 0));
+        assert_eq!(pending_bytes(broker.as_raw_fd()), 0, "idle: nothing");
     }
 
     /// No client: a flip is one atomic load for the caller, and the link

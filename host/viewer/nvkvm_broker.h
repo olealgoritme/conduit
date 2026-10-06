@@ -412,6 +412,9 @@ void nb_sink_format_verdict(struct nb_sink *s, uint32_t fourcc, uint64_t mod,
 void nb_sink_surface(struct nb_sink *s, unsigned w, unsigned h,
                      unsigned refresh_mhz);
 void nb_sink_frame(struct nb_sink *s);
+/* EV_REFRESH: ask the client for its current frame again, after dropping
+ * frames it could not show yet (the import probe). */
+void nb_sink_refresh(struct nb_sink *s);
 /* virtio-nvgpu EV_MODE_HINT; see the protocol header.  Not deduplicated
  * here: the backend knows what it last asked for. */
 void nb_sink_mode_hint(struct nb_sink *s, unsigned w, unsigned h,

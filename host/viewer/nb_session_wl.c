@@ -882,8 +882,12 @@ static int wl_pair_slot(struct nb_wl *w, uint32_t fourcc, uint64_t mod,
  * probing is that we learn this WITHOUT the connection being torn down.
  *
  * The probe buffer itself is discarded either way.  Showing it would mean
- * threading a deferred attach through the commit path for one frame's benefit;
- * dropping it costs a single frame the first time a pair is seen.
+ * threading a deferred attach through the commit path (and holding a buffer
+ * already released to the guest), so on `created` the client is asked for its
+ * current frame again (EV_REFRESH) instead.  Without that, the frame dropped
+ * here is lost for good when it was the only one: a viewer that (re)connects
+ * to an idle guest got exactly one frame, the probe, and kept showing
+ * "WAITING FOR THE VM" until the guest next drew something.
  */
 static void probe_created(void *data, struct zwp_linux_buffer_params_v1 *params,
                           struct wl_buffer *buf)
@@ -902,6 +906,11 @@ static void probe_created(void *data, struct zwp_linux_buffer_params_v1 *params,
     }
     wl_buffer_destroy(buf);
     zwp_linux_buffer_params_v1_destroy(params);
+    /* The pair is proven: the frame the probe swallowed (and any dropped
+     * while it was out) can be shown now. */
+    if (w->sink) {
+        nb_sink_refresh(w->sink);
+    }
 }
 
 static void probe_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
