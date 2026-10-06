@@ -18,6 +18,13 @@
 //!   lock exactly as long as the GPU may use the pages (see `helios_protocol::nvrm`
 //!   `HeliosNvrmPin`). Of RM it recognises one call, `NV_ESC_RM_FREE`.
 //!
+//! * cross-client references: an `Ioctl` whose payload names an RM client or a backend
+//!   handle that is not the caller's is counted (`NvDupHarden` = 2, the default for now)
+//!   or refused (= 1) (`nvrm_harden`, the pure rules in
+//!   `helios_kmd_logic::nvrm_clients`; `docs/nvrm-escape.md` section 12). The KMD learns
+//!   a process's clients from the reply of its `NV_ESC_RM_ALLOC` of a root class and
+//!   forgets them on the free, on `Close` of the file and on teardown.
+//!
 //! * RM fence handles: a successful forwarded `SEMSURF_FENCE_CREATE` on an owned DRM
 //!   node returns a backend handle that is not `Open`ed; `forward_fence_create`
 //!   records it as the caller's under `DEVICE_TYPE_FENCE`, so `EVENT_REGISTER`,
@@ -37,6 +44,7 @@ use super::gpu::{
     MAX_NVRM_PINS_PER_OWNER, MAX_NVRM_PIN_PAGES,
 };
 use super::hal::DmaBuffer;
+use super::nvrm_harden as harden;
 use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
@@ -45,6 +53,7 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
+use helios_kmd_logic::nvrm_clients::Verdict;
 use helios_kmd_logic::nvrm_fence;
 use helios_kmd_logic::page_runs;
 use helios_kmd_logic::sweep_budget::{CloseTally, PinAction, PinFate, SweepBudget};
@@ -310,6 +319,8 @@ pub fn forward(
                         // already, so the gap is harmless). A failed Close keeps
                         // them, because the handle stays open.
                         release_events_for_handle(adapter, owner, handle);
+                        // The RM clients made through this file went with it.
+                        harden::forget_via(adapter, owner, handle);
                         // The host's objects, and its alias of the pinned pages,
                         // are gone: the pins hang off this handle and unlock now.
                         release_pins_for_handle(adapter, owner, handle);
@@ -326,6 +337,7 @@ pub fn forward(
                         NVRM_FENCES_CLOSED.fetch_add(1, Ordering::Relaxed);
                     }
                     release_events_for_handle(adapter, owner, handle);
+                    harden::forget_via(adapter, owner, handle);
                     adapter.foreign_scanout_release_handle(owner, handle);
                     Err(Refusal::Transport(VirtioError::Timeout))
                 }
@@ -337,11 +349,21 @@ pub fn forward(
             }
         }
         MSG_IOCTL => {
-            // Ownership, the handle's kind and the device generation in ONE lock
-            // hold. Transport down: not owned, generation 0.
-            let (device_type, generation) = adapter
-                .with_virtio(|v| (v.nvrm_handle_device_type(owner, handle), v.nvrm_epoch()))
-                .unwrap_or((None, 0));
+            // The knob (one atomic load once read; never judged for the KMD's own client).
+            let hmode = harden::mode_for(passive, owner);
+            // Ownership, the handle's kind, the device generation and (with hardening on)
+            // the verdict on every client / handle the request names, in ONE lock hold.
+            // Transport down: not owned, generation 0.
+            let (device_type, generation, verdict) = adapter
+                .with_virtio(|v| {
+                    let device_type = v.nvrm_handle_device_type(owner, handle);
+                    let verdict = match device_type {
+                        Some(t) if hmode != harden::MODE_OFF => v.nvrm_judge(owner, t, req),
+                        _ => Verdict::Allow,
+                    };
+                    (device_type, v.nvrm_epoch(), verdict)
+                })
+                .unwrap_or((None, 0, Verdict::Allow));
             *epoch = Some(generation);
             let Some(device_type) = device_type else {
                 return Err(refused(Refusal::NotOwned));
@@ -352,6 +374,12 @@ pub fn forward(
                 return Err(refused(Refusal::Forbidden));
             }
             if let Err(r) = check_ioctl(req, pin_id != 0) {
+                return Err(refused(r));
+            }
+            // A request that names a client or a file that is not the caller's
+            // (`docs/nvrm-escape.md` section 12). After the layout check, so a request
+            // the lengths already refuse is refused for that.
+            if let Err(r) = harden::apply(hmode, verdict) {
                 return Err(refused(r));
             }
             if let (Some(cmd), Some(data_len)) = (rd_u32(req, 16), rd_u32(req, 20)) {
@@ -388,9 +416,25 @@ pub fn forward(
                 )
                 .map_err(refused);
             }
+            // A client allocation reserves its slot in the client table first: a full
+            // table refuses before the host makes a client nobody tracks.
+            let reserved = harden::begin(adapter, owner, hmode, req).map_err(refused)?;
             NVRM_IOCTLS.fetch_add(1, Ordering::Relaxed);
-            let n = ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms)
-                .map_err(Refusal::Transport)?;
+            let n = match ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms) {
+                Ok(n) => n,
+                Err(e) => {
+                    harden::after_failed(
+                        adapter,
+                        owner,
+                        hmode,
+                        reserved,
+                        req,
+                        matches!(e, VirtioError::Timeout),
+                    );
+                    return Err(Refusal::Transport(e));
+                }
+            };
+            harden::after_reply(adapter, owner, handle, hmode, reserved, req, resp, n);
             after_ioctl(adapter, owner, req, resp, n);
             Ok(n)
         }
@@ -1416,6 +1460,9 @@ pub fn close_all_for_owner(
     owner: DeviceOwner,
 ) -> u32 {
     let mut closed = 0u32;
+    // Its RM clients: whatever the host does with them below, none may be named again
+    // (and the host may mint the numbers anew).
+    harden::forget_owner(adapter, owner);
     // Events first: nothing of this owner's may be signalled from here on, and the
     // references are PASSIVE-only to drop.
     release_events_for_owner(adapter, owner);
@@ -1646,6 +1693,8 @@ pub fn close_all_on_host(
         }
         closed += 1;
     }
+    // Every file is closed (or forgotten), and the host frees a client with its file.
+    harden::forget_all(adapter);
     // Last: the pins. Unlocked only if the host confirmed every close above; if
     // sending stopped early they stay locked (leaked, `NvPinLeak`), because the
     // host keeps its RM files across a device reset and the GPU may still write
@@ -1684,6 +1733,8 @@ pub fn retire_transport(
     adapter.set_virtio(None);
     // Its handles were closed by the sweep (or died with the transport): forget them.
     super::rm_client::forget();
+    // `ForeignFlip`: the shown allocation and its presenter belong to the old generation.
+    super::foreign_flip::forget();
     // The mapping table died with the transport; the gauge is only refreshed by a
     // table change, so without this it kept the last total until the next push.
     NVRM_MAP_BYTES.store(0, Ordering::Relaxed);

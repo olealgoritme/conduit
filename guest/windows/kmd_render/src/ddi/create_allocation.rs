@@ -18,16 +18,17 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bytemuck::{bytes_of, pod_read_unaligned, Zeroable};
 use helios_protocol::{
-    HeliosWddmAllocLayout, HeliosWddmAllocMeta, HeliosWddmAllocPrivate, HeliosWddmOpenIdentity,
-    HELIOS_BLOB_MEM_RM_EXPORT, HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+    HeliosWddmAllocLayout, HeliosWddmAllocMeta, HeliosWddmAllocPlane, HeliosWddmAllocPrivate,
+    HeliosWddmOpenIdentity, HELIOS_BLOB_MEM_RM_EXPORT, HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
     HELIOS_WDDM_ALLOC_KIND_STANDARD, HELIOS_WDDM_ALLOC_KIND_TRACKING,
     HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT, HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK,
     HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT, HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE,
     HELIOS_WDDM_ALLOC_MISC_PRIMARY, HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED,
     HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK, HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT,
     HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER, HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING,
-    HELIOS_WDDM_LAYOUT_OFFSET, HELIOS_WDDM_OPEN_FLAG_FOREIGN,
-    HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+    HELIOS_WDDM_LAYOUT_OFFSET, HELIOS_WDDM_LAYOUT_PLANE1_OFFSET, HELIOS_WDDM_LAYOUT_VERSION_PLANES,
+    HELIOS_WDDM_OPEN_FLAG_FOREIGN, HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES,
+    HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
     VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_WC,
 };
 
@@ -270,6 +271,12 @@ struct OpenAllocationContext {
     /// whichever of {the adopting allocation's destroy, the last such close}
     /// comes last (`docs/shared-foreign-surfaces.md` section 3).
     foreign_open: Option<ForeignOpenRef>,
+    /// The open found no identity and the private data has the host-less shared placeholder's
+    /// shape (`shared_placeholder::identityless_open_is_placeholder`): the KMD's own record that
+    /// the allocation has no host resource. Read only by [`present_alloc_is_placeholder`], so
+    /// the Present can complete a flip of it (`helios_kmd_logic::flip_completion`) instead of
+    /// failing it for want of an identity.
+    host_less_placeholder: bool,
 }
 
 /// What one counted foreign open must give back.
@@ -337,6 +344,12 @@ pub struct PresentAllocInfo {
     /// to read, which is why the Present path takes it from here and not from the
     /// table.
     pub foreign: Option<fr::Layout>,
+    /// The open identity's FOREIGN flag: the KMD's own record (a foreign-table hit at
+    /// open, never creator data) that this allocation adopted a foreign resource. Unlike
+    /// [`Self::foreign`] it is not a layout hint and needs no lock to read; Present uses it
+    /// to answer a refusal for a foreign allocation with a counted success instead of a
+    /// failure (`helios_kmd_logic::present_foreign`).
+    pub foreign_identity: bool,
 }
 
 /// TRACE-ONLY companion to [`PresentAllocInfo`], resolved by
@@ -578,6 +591,23 @@ pub unsafe fn present_alloc_info(
     open.present
 }
 
+/// Whether `h` is an open handle of the current transport generation that the KMD recorded as a
+/// host-less shared placeholder at open time (no identity, the placeholder's shape). Such a flip
+/// source has no [`PresentAllocInfo`] and no host resource, and its flip still has to COMPLETE
+/// (`helios_kmd_logic::flip_completion`). Venus allocations (an identity) answer `false`.
+///
+/// # Safety
+/// As [`present_alloc_info`].
+pub unsafe fn present_alloc_is_placeholder(adapter: Option<&AdapterContext>, h: HANDLE) -> bool {
+    let Some(open) = (unsafe { open_allocation_context(h) }) else {
+        return false;
+    };
+    if adapter.is_some_and(|a| !a.is_current_generation(open.serial)) {
+        return false;
+    }
+    open.present.is_none() && open.host_less_placeholder
+}
+
 /// Validate an `hDeviceSpecificAllocation` BEFORE forming a reference to it.
 ///
 /// The handle is an integer from dxgkrnl and the check cannot be encoded — but
@@ -613,6 +643,40 @@ unsafe fn open_allocation_context<'a>(h: HANDLE) -> Option<&'a OpenAllocationCon
     }
     // SAFETY: the magic matched, so this is one of our contexts.
     Some(unsafe { &*p })
+}
+
+/// Why `present_alloc_info(adapter, h)` is `None` (or that it is not): the same steps, side-effect
+/// free (no `OaBadH` / `PgStale` count: the resolution that failed already counted). Called only
+/// at a Present refusal, to name the cause in `PrUnrWhy`.
+///
+/// # Safety
+/// As [`present_alloc_info`].
+pub(crate) unsafe fn present_alloc_cause(
+    adapter: Option<&AdapterContext>,
+    h: HANDLE,
+) -> helios_kmd_logic::present_foreign::HandleCause {
+    use helios_kmd_logic::present_foreign::HandleCause as C;
+    if h.is_null() {
+        return C::Null;
+    }
+    let p = h as *const OpenAllocationContext;
+    if !p.is_aligned() {
+        return C::NotOurs;
+    }
+    // SAFETY: as `open_allocation_context`: only the magic is read, through a raw unaligned read.
+    let magic = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*p).magic)) };
+    if magic != OPEN_ALLOCATION_CTX_MAGIC {
+        return C::NotOurs;
+    }
+    // SAFETY: the magic matched, so this is one of our contexts.
+    let open = unsafe { &*p };
+    if adapter.is_some_and(|a| !a.is_current_generation(open.serial)) {
+        return C::StaleGeneration;
+    }
+    if open.present.is_none() {
+        return C::NoIdentity;
+    }
+    C::Resolved
 }
 
 /// Non-null open-allocation handles that failed alignment or the magic check.
@@ -853,6 +917,13 @@ pub(crate) struct WindowsPrimary {
     /// from this primary's own layout; everything else here (address, epoch,
     /// retirement) still describes the flipped allocation.
     pub snapshot: Option<SnapshotDescriptor>,
+    /// Which flip-completion rule this allocation follows (`helios_kmd_logic::flip_completion`):
+    /// a foreign adoption (the KMD's own adoption record), or a hollow allocation the Venus path
+    /// can never show (decided from geometry, `direct_scanout` and the Venus identity, which come
+    /// from the creator's trailer: a creator can only make its OWN allocation hollow), still
+    /// completes its flip as a kept picture when the programming cannot show it. A Venus
+    /// allocation keeps every path it had.
+    pub flip_source: helios_kmd_logic::flip_completion::Source,
 }
 
 /// A scan-out surface that has been validated as legal for `SET_SCANOUT_BLOB`.
@@ -1190,7 +1261,39 @@ pub(crate) unsafe fn scanout_alloc_info(
         present_epoch: ctx.vidpn_present_epoch.load(Ordering::Relaxed),
         frame_watermark: ctx.vidpn_frame_watermark.load(Ordering::Relaxed),
         snapshot,
+        flip_source: flip_source_of(ctx),
     })
+}
+
+/// [`helios_kmd_logic::flip_completion::classify`] of an allocation context (lock-free).
+fn flip_source_of(ctx: &AllocationContext) -> helios_kmd_logic::flip_completion::Source {
+    helios_kmd_logic::flip_completion::classify(&helios_kmd_logic::flip_completion::SourceFacts {
+        resource_id: ctx.resource_id,
+        foreign: ctx.foreign.is_some(),
+        direct_scanout: ctx.direct_scanout,
+        width: ctx.width,
+        height: ctx.height,
+        venus_identity: ctx.venus_image_id != 0 || ctx.venus_alloc_size != 0,
+    })
+}
+
+/// What flip completion needs from a `SetVidPnSourceAddress` handle that
+/// [`scanout_alloc_info`] may refuse: the rule it follows and the address Windows paired with it.
+/// Unlike [`scanout_alloc_info`] it also answers for an allocation with NO resource id (the shared
+/// placeholder), which is exactly the one whose flip must still complete. `None` for a null,
+/// foreign or older-generation handle (no address is known).
+///
+/// # Safety
+/// Same contract as [`scanout_alloc_info`].
+pub(crate) unsafe fn flip_completion_info(
+    adapter: &AdapterContext,
+    h: HANDLE,
+) -> Option<(helios_kmd_logic::flip_completion::Source, u64)> {
+    let ctx = unsafe { resolve_current_alloc(adapter, h) }?;
+    Some((
+        flip_source_of(ctx),
+        ctx.vidpn_primary_address.load(Ordering::Acquire),
+    ))
 }
 
 /// Rebuild the published [`PreparedImageCopy`] snapshot from its atomic mirror.
@@ -1406,7 +1509,17 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
                 copy
             }
         };
-        let fence = client.submit_prepared_image_copy(adapter, &copy, primary_address, ticket)?;
+        // A foreign or hollow source whose copy fails on the host still completes its flip
+        // (`flip_completion`); a Venus source publishes nothing on failure, as before.
+        let keep_on_failure =
+            primary.flip_source != helios_kmd_logic::flip_completion::Source::Venus;
+        let fence = client.submit_prepared_image_copy(
+            adapter,
+            &copy,
+            primary_address,
+            ticket,
+            keep_on_failure,
+        )?;
         ctx.scanout_copy_last_fence.store(fence, Ordering::Release);
         Ok::<u64, crate::virtio::VirtioError>(fence)
     });
@@ -1459,7 +1572,8 @@ pub(crate) unsafe fn set_bar_placement(h: HANDLE, offset: u64) {
 /// kernel pointer through it would be both a leak and forgeable. The venus
 /// resource id is the one identity both sides already hold honestly.
 ///
-/// Only DIRECT-SCAN-OUT allocations are registered, which is what keeps a fixed
+/// Only DIRECT-SCAN-OUT allocations are registered (and, with `ForeignFlip` on, adopted
+/// foreign ones: DWM-on-NVK rotates 3 to 4 swap-chain buffers), which is what keeps a fixed
 /// table adequate: DWM rotates 3 and an app's flip chain 2-4, so the live set is
 /// under ten even across a fullscreen transition.
 const SCANOUT_ALLOC_SLOTS: usize = 32;
@@ -1691,51 +1805,94 @@ unsafe fn read_standard_meta(
     Some(pod_read_unaligned(&raw))
 }
 
+/// A layout trailer read from a private-data buffer: the 32-byte [`HeliosWddmAllocLayout`] and,
+/// for a version-2 (two-plane) record, [`HeliosWddmAllocPlane`] after it.
+#[derive(Clone, Copy)]
+struct ReadTrailer {
+    layout: HeliosWddmAllocLayout,
+    plane1: Option<HeliosWddmAllocPlane>,
+}
+
 /// The creator's optional [`HeliosWddmAllocLayout`] trailer (foreign adoption
 /// only). `None` when the buffer cannot hold it or the record is not a valid
 /// one: absent and malformed read alike, and the adoption then simply has no
 /// supplied layout to compare (the recorded one is what counts).
-unsafe fn read_layout_trailer(
-    private: *const c_void,
-    private_size: UINT,
-) -> Option<HeliosWddmAllocLayout> {
+///
+/// A version-1 record is the 32 bytes at [`HELIOS_WDDM_LAYOUT_OFFSET`], as always. A version-2
+/// record (`HELIOS_WDDM_LAYOUT_VERSION_PLANES`, plane count 2) also needs plane 1 after it
+/// ([`HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES`] in all); in a buffer too short for that it reads
+/// as no trailer, like any other malformed one (the adoption of a two-plane record then fails on
+/// its own room check, not on a half-read plane).
+unsafe fn read_layout_trailer(private: *const c_void, private_size: UINT) -> Option<ReadTrailer> {
     if private.is_null() || (private_size as usize) < HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES {
         return None;
     }
-    // SAFETY: the length check above proves HELIOS_WDDM_LAYOUT_OFFSET + 32 bytes
-    // exist at `private`; read unaligned like every other private-data read.
+    // SAFETY: the length check above proves at least HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES
+    // bytes exist at `private`, and the slice is no longer than `private_size`; read unaligned
+    // like every other private-data read.
     let bytes = unsafe {
         core::slice::from_raw_parts(
-            (private as *const u8).add(HELIOS_WDDM_LAYOUT_OFFSET),
-            size_of::<HeliosWddmAllocLayout>(),
+            private as *const u8,
+            (private_size as usize).min(HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES),
         )
     };
-    let layout: HeliosWddmAllocLayout = pod_read_unaligned(bytes);
-    layout.is_valid().then_some(layout)
+    if let Some(layout) = HeliosWddmAllocLayout::read_open(bytes) {
+        return Some(ReadTrailer {
+            layout,
+            plane1: None,
+        });
+    }
+    let (layout, plane1) = HeliosWddmAllocLayout::read_open_planes(bytes)?;
+    crate::virtio::foreign::TRAILER_V2_READ.fetch_add(1, Ordering::Relaxed);
+    Some(ReadTrailer {
+        layout,
+        plane1: Some(plane1),
+    })
 }
 
+/// The plane count a version-2 trailer carries in `HeliosWddmAllocLayout::reserved`.
+const TRAILER_V2_PLANE_COUNT: u32 = 2;
+
 /// Write the KMD's recorded layout over the [`HeliosWddmAllocLayout`] trailer of a
-/// per-allocation private-data buffer. Returns whether the buffer had room (at
-/// least [`HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES`]); nothing is written if not.
+/// per-allocation private-data buffer. Returns whether the buffer had room
+/// ([`fr::trailer_bytes`]: [`HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES`] for a one-plane record,
+/// [`HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES`] for a two-plane one); NOTHING is written if not
+/// (a version-2 header with no plane 1 behind it would read as a record with a plane that is
+/// not there).
 /// Called at create time (so the creator and later openers read the KMD-validated
 /// record, not what the creator wrote) and again at every open of a foreign
 /// allocation (so an opener never reads anything but the KMD's table).
+///
+/// A one-plane record, whatever its format, is written as version 1 with `reserved` 0, exactly
+/// as before the shared formats. A two-plane record is version 2 (`reserved` = the plane
+/// count) with plane 1 at [`HELIOS_WDDM_LAYOUT_PLANE1_OFFSET`]; a version-1 reader refuses it.
 unsafe fn write_foreign_layout_trailer(
     private: *mut c_void,
     private_size: UINT,
     layout: &fr::Layout,
 ) -> bool {
-    if private.is_null() || (private_size as usize) < HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES {
+    if private.is_null() || (private_size as usize) < fr::trailer_bytes(layout) {
+        if layout.plane1.is_some() {
+            crate::virtio::foreign::TRAILER_V2_NO_ROOM.fetch_add(1, Ordering::Relaxed);
+        }
         return false;
     }
     let trailer = HeliosWddmAllocLayout {
         modifier: layout.modifier,
         magic: helios_protocol::HELIOS_WDDM_LAYOUT_MAGIC,
-        version: helios_protocol::HELIOS_WDDM_LAYOUT_VERSION,
+        version: if layout.plane1.is_some() {
+            HELIOS_WDDM_LAYOUT_VERSION_PLANES
+        } else {
+            helios_protocol::HELIOS_WDDM_LAYOUT_VERSION
+        },
         fourcc: layout.fourcc,
         stride: layout.stride,
         plane_offset: layout.offset,
-        reserved: 0,
+        reserved: if layout.plane1.is_some() {
+            TRAILER_V2_PLANE_COUNT
+        } else {
+            0
+        },
     };
     // SAFETY: the length check above proves HELIOS_WDDM_LAYOUT_OFFSET + 32 bytes
     // exist at `private`; the buffer is the per-allocation runtime-owned one,
@@ -1748,6 +1905,24 @@ unsafe fn write_foreign_layout_trailer(
         )
     };
     dst.copy_from_slice(bytes_of(&trailer));
+    if let Some(p) = layout.plane1 {
+        let plane = HeliosWddmAllocPlane {
+            modifier: p.modifier,
+            stride: p.stride,
+            plane_offset: p.offset,
+        };
+        // SAFETY: `trailer_bytes` for a two-plane record is
+        // HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES, checked above, so the 16 bytes at
+        // HELIOS_WDDM_LAYOUT_PLANE1_OFFSET exist in the same buffer.
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(
+                (private as *mut u8).add(HELIOS_WDDM_LAYOUT_PLANE1_OFFSET),
+                size_of::<HeliosWddmAllocPlane>(),
+            )
+        };
+        dst.copy_from_slice(bytes_of(&plane));
+        crate::virtio::foreign::TRAILER_V2_WRITTEN.fetch_add(1, Ordering::Relaxed);
+    }
     true
 }
 
@@ -2124,6 +2299,17 @@ unsafe fn destroy_allocation_ctx(
         drop(ctx);
         return;
     }
+    // A shared placeholder has no host resource, image or memory: nothing resource-keyed to
+    // release (and the resource-keyed calls below would act on "id 0", which is the empty
+    // marker of several tables). Only a deferred SetVidPnSourceAddress that names this handle
+    // must be cancelled before the Box goes.
+    if ctx.resource_id == 0 && ctx.venus_memory_id == 0 && ctx.venus_image_id == 0 {
+        unregister_scanout_allocation_handle(allocation_handle);
+        let _ = adapter.retire_scanout_allocation(passive, allocation_handle, 0);
+        crate::ddi::shared_placeholder::note_destroyed();
+        drop(ctx);
+        return;
+    }
     // Withdraw the DMA-flip lookup FIRST: after this no Present can resolve
     // this resource id to a handle whose Box is about to be dropped.
     unregister_scanout_allocation(ctx.resource_id);
@@ -2364,6 +2550,8 @@ struct ForeignAdoptInput {
     supplied_layout: Option<fr::Layout>,
     /// The per-allocation buffer is large enough for the trailer the KMD writes.
     trailer_room: bool,
+    /// ... and for plane 1 after it (a two-plane record's version-2 trailer).
+    plane_room: bool,
 }
 
 /// Foreign-adoption refusals, for the registry trace (`FgAdRf`): first and every
@@ -2419,6 +2607,29 @@ struct CreatedBacking {
 pub(crate) enum SystemBackingPolicy {
     None,
     PresentLinearBuffer,
+}
+
+/// The backing of a shared placeholder (`helios_kmd_logic::shared_placeholder`): no host
+/// resource at all. Resource id 0 is the "unbacked allocation" every resource-keyed path
+/// already answers with nothing (`scanout_alloc_info` refuses it, `bar_virtual_transfer`
+/// skips a non-BAR allocation, `destroy_allocation_ctx` has nothing to release), the size is
+/// accounting only (not BAR-eligible: aperture placement, like every adopted allocation), and
+/// the geometry is the creator's, passed through.
+fn placeholder_backing(ap: &HeliosWddmAllocPrivate, meta: &HeliosWddmAllocMeta) -> CreatedBacking {
+    CreatedBacking {
+        resource_id: 0,
+        venus_memory_id: 0,
+        venus_image_id: 0,
+        pitch: meta.pitch,
+        plane_offset: meta.plane_offset,
+        dxgi_format: meta.dxgi_format,
+        venus_alloc_size: 0,
+        memory_type_index: 0,
+        blob_size: BackingSize::NonHostAuthoritative(ap.size),
+        system_backing_policy: SystemBackingPolicy::None,
+        dedicated_present_buffer: false,
+        foreign: ForeignBacking::No,
+    }
 }
 
 /// Produce the backing for one classified allocation.
@@ -2512,6 +2723,7 @@ fn build_backing(
                 claimed_alloc_size: meta.venus_alloc_size,
                 supplied_layout: foreign.supplied_layout,
                 trailer_room: foreign.trailer_room,
+                plane_room: foreign.plane_room,
             };
             let (adopted_blob_size, foreign_backing) =
                 match adapter.with_virtio(|v| v.adopt_for_allocation(resource_id, &request)) {
@@ -2773,6 +2985,7 @@ unsafe fn create_one(
     resource_private_size: UINT,
     info: &mut DXGK_ALLOCATIONINFO,
     resource_associated: bool,
+    create_flags: u32,
 ) -> Result<(), NTSTATUS> {
     // ── Read + validate the ICD's private driver data ───────────────────────
     //
@@ -2799,6 +3012,7 @@ unsafe fn create_one(
     }
     if priv_ptr.is_null() || priv_len < size_of::<HeliosWddmAllocPrivate>() {
         crate::diag::record(0x0C01_0002);
+        crate::ddi::shared_placeholder::note_early_refusal(true, priv_len as u32);
         return Err(STATUS_INVALID_PARAMETER);
     }
     // SAFETY: bounds-checked above; the runtime guarantees `priv_len` bytes at
@@ -2812,6 +3026,7 @@ unsafe fn create_one(
     crate::diag::record(0x0C32_0000 | (ap.ctx_id & 0xFFFF));
     if !ap.is_valid() {
         crate::diag::record(0x0C01_0003);
+        crate::ddi::shared_placeholder::note_early_refusal(false, ap.magic);
         return Err(STATUS_INVALID_PARAMETER);
     }
     if ap.kind == HELIOS_WDDM_ALLOC_KIND_TRACKING
@@ -2840,11 +3055,30 @@ unsafe fn create_one(
     }
     let mut ap = ap;
     let mut supplied_resource_id = 0u32;
+    // A SHARED, identity-less STANDARD allocation is a placeholder (NVK has no resource id for
+    // the texture): host-less backing instead of a Venus present buffer. Anything carrying an
+    // identity, and every unshared allocation, is `false` here and validated as before. The
+    // decision and its table: `helios_kmd_logic::shared_placeholder`.
+    let placeholder_input = crate::ddi::shared_placeholder::create_input(
+        &ap,
+        create_flags,
+        priv_len,
+        meta.misc_flags,
+        unsafe { read_layout_trailer(priv_ptr as *const c_void, priv_len as UINT) }.is_some(),
+    );
+    let placeholder_verdict = helios_kmd_logic::shared_placeholder::decide(&placeholder_input);
+    crate::ddi::shared_placeholder::note_verdict(&placeholder_input, placeholder_verdict);
+    let placeholder = match placeholder_verdict {
+        helios_kmd_logic::shared_placeholder::Verdict::Placeholder => true,
+        helios_kmd_logic::shared_placeholder::Verdict::Existing(_) => false,
+        // A soft, per-resource failure (E_OUTOFMEMORY), never a removed device.
+        helios_kmd_logic::shared_placeholder::Verdict::Refuse(_) => return Err(STATUS_NO_MEMORY),
+    };
     if ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
-        if ap.ctx_id == 0 {
+        if ap.ctx_id == 0 && !placeholder {
             ap.ctx_id = adapter.venus_ctx_id();
         }
-        if ap.ctx_id == 0 {
+        if ap.ctx_id == 0 && !placeholder {
             crate::diag::record(0x0C01_00E2);
             return Err(STATUS_DEVICE_NOT_READY);
         }
@@ -2901,13 +3135,22 @@ unsafe fn create_one(
         .map(|t| fr::Layout {
             width: meta.width,
             height: meta.height,
-            stride: t.stride,
-            offset: t.plane_offset,
-            fourcc: t.fourcc,
-            modifier: t.modifier,
+            stride: t.layout.stride,
+            offset: t.layout.plane_offset,
+            fourcc: t.layout.fourcc,
+            modifier: t.layout.modifier,
+            plane1: t.plane1.map(|p| fr::Plane {
+                stride: p.stride,
+                offset: p.plane_offset,
+                modifier: p.modifier,
+            }),
         }),
         trailer_room: !write_target.is_null()
             && write_target_len >= HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES,
+        // A two-plane record is refused without this (`AdoptRefusal::NoPlaneRoom`): the
+        // version-2 trailer the KMD writes back needs plane 1 after the layout.
+        plane_room: !write_target.is_null()
+            && write_target_len >= HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES,
     };
     let is_primary = (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_PRIMARY) != 0;
     // Deliberately the FLAG, not the backing arm. This is a VidMm policy input
@@ -2916,7 +3159,11 @@ unsafe fn create_one(
     // PRIMARY | OPTIMAL_GDI_TEXTURE combination, which classifies as the primary.
     let is_optimal_gdi_texture = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
         && (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE) != 0;
-    let created = build_backing(passive, adapter, backing, &ap, &meta, &foreign_input)?;
+    let created = if placeholder {
+        placeholder_backing(&ap, &meta)
+    } else {
+        build_backing(passive, adapter, backing, &ap, &meta, &foreign_input)?
+    };
 
     // THE one update site. `meta`/`ap` used to be mutated in place by each arm
     // and read again 100-470 lines later, with nothing stating which fields an
@@ -2972,7 +3219,10 @@ unsafe fn create_one(
         // imports attach explicitly through HELIOS_ESCAPE_ATTACH_RESOURCE.
         crate::diag::record(0x0C3A_1000 | (resource_id & 0x0FFF));
     }
+    // A placeholder records NO identity: its private data stays what the creator wrote (adopt
+    // id 0), so every opener reads "no identity" and none can mistake it for a Venus resource.
     if ap.kind != HELIOS_WDDM_ALLOC_KIND_TRACKING
+        && !placeholder
         && write_target_len >= size_of::<HeliosWddmOpenIdentity>()
         && !write_target.is_null()
     {
@@ -3146,8 +3396,19 @@ unsafe fn create_one(
 
     // ── VidMm metadata: segment placement + CPU visibility ──────────────────
     let is_direct_scanout = ctx.direct_scanout;
+    // An adopted foreign allocation (DWM-on-NVK's swap chain: not `MISC_DIRECT_SCANOUT`) is
+    // registered for the DMA-buffer flip too when `ForeignFlip` is on: its flip then reaches
+    // the `ForeignFlip` hook of `program_vidpn_source_inner` through `arm_dma_flip`. One
+    // relaxed load with the knob off (the default); an ordinary allocation never takes it.
+    let register_for_flip =
+        is_direct_scanout || (ctx.foreign.is_some() && crate::virtio::foreign_flip::enabled());
     let ctx_resource_id = ctx.resource_id;
     let ctx_serial = ctx.serial;
+    if placeholder {
+        // Counted BEFORE the producer registration below can fail and destroy the context, so
+        // `ShPhFree` never runs ahead of `ShPhMade`.
+        crate::ddi::shared_placeholder::note_created(ap.size);
+    }
     if adapter
         .producer
         .register_allocation((&*ctx as *const AllocationContext) as usize)
@@ -3167,7 +3428,7 @@ unsafe fn create_one(
     }
     // Register AFTER the Box is leaked, so the pointer published here is the
     // one dxgkrnl will hand back.
-    if is_direct_scanout {
+    if register_for_flip {
         register_scanout_allocation(ctx_resource_id, info.hAllocation as usize, ctx_serial);
     }
     info.Size = vidmm_size;
@@ -3363,6 +3624,7 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
                 args.PrivateDriverDataSize,
                 info,
                 wants_resource,
+                create_flags,
             )
         } {
             // Unwind the allocations already created in this call, then the
@@ -3628,6 +3890,18 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 .or_else(|| read_alloc_identity(args.pPrivateDriverData, args.PrivateDriverSize))
         };
         let resource_id = ident.map(|d| d.resource_id).unwrap_or(0);
+        let mut host_less_placeholder = false;
+        if ident.is_none() {
+            // A shared placeholder (or any allocation with no identity) opens with no
+            // identity: counted, never resolved to a resource.
+            host_less_placeholder = unsafe {
+                crate::ddi::shared_placeholder::note_identityless_open(
+                    info.pPrivateDriverData,
+                    info.PrivateDriverDataSize,
+                    meta.map_or(0, |m| m.misc_flags),
+                )
+            };
+        }
 
         // C1 liveness gate: an identified allocation whose venus resource is no
         // longer alive must FAIL the open loudly. Succeeding here is what used
@@ -3669,7 +3943,14 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         let mut foreign_layout: Option<fr::Layout> = None;
         if let Some(id) = ident.as_mut() {
             match adapter.with_virtio(|v| v.foreign_open(resource_id, creator_process)) {
-                Ok(fr::OpenOutcome::NotForeign) => {}
+                Ok(fr::OpenOutcome::NotForeign) => {
+                    // The flag is the table's record and nothing else: a FOREIGN flag the
+                    // private data carried (a previous open's, or a creator's forgery)
+                    // without a live table record is dropped, here and in the identity
+                    // written back below. `Present` reads it as a fact
+                    // (`helios_kmd_logic::present_foreign`).
+                    id.foreign = false;
+                }
                 Ok(fr::OpenOutcome::Opened(record)) => {
                     foreign_ref = Some(ForeignOpenRef {
                         resource_id,
@@ -3708,10 +3989,14 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         // The foreign layout trailer, if the KMD wrote one (see
         // `PresentAllocInfo::foreign`). Read like the meta above: this entry's
         // private data first, the call's second.
+        // Only the version-1 form feeds the copy import's hint (`foreign_layout_from_open`): it
+        // copies 32 bpp one-plane images, so a two-plane record has no hint to give.
         let foreign_trailer = unsafe {
             read_layout_trailer(info.pPrivateDriverData, info.PrivateDriverDataSize)
                 .or_else(|| read_layout_trailer(args.pPrivateDriverData, args.PrivateDriverSize))
-        };
+        }
+        .filter(|t| t.plane1.is_none())
+        .map(|t| t.layout);
         let present = ident.map(|identity| {
             let misc_flags = meta.map(|m| m.misc_flags).unwrap_or(0);
             let storage = if identity.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
@@ -3740,6 +4025,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 memory_type_index: identity.memory_type_index,
                 direct_scanout: misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT != 0,
                 foreign: foreign_layout_from_open(identity.kind, meta, foreign_trailer),
+                foreign_identity: identity.foreign,
             }
         });
         // Trace-only companion (R316): these seven values have no consumer
@@ -3791,6 +4077,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             serial: adapter.current_transport_serial().unwrap_or(0),
             present_buffer_capability,
             foreign_open: foreign_ref,
+            host_less_placeholder,
         });
         let registered = crate::adapter::producer::with_allocation_reference(
             passive,

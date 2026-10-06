@@ -107,6 +107,13 @@ pub(super) fn ring_level_on() -> bool {
     level != KNOB_UNREAD && (3..=4).contains(&level)
 }
 
+/// The `KmdRmClient` level of this transport generation if the worker has read it, `None`
+/// before that (`ForeignFlip` refuses to decide on an unknown level).
+pub(super) fn level_if_read() -> Option<u32> {
+    let level = KNOB_LEVEL.load(Ordering::Relaxed);
+    (level != KNOB_UNREAD).then_some(level)
+}
+
 /// Whether the RM system-memory level (5) is in force this generation: one relaxed load.
 fn sysmem_level_on() -> bool {
     let level = KNOB_LEVEL.load(Ordering::Relaxed);
@@ -220,11 +227,16 @@ fn read_knob() -> u32 {
     let v = crate::diag::read_config_dword(crate::diag::knobs::KMD_RM_CLIENT, 0)
         .min(helios_kmd_logic::rm_sysmem::LEVEL);
     KNOB_LEVEL.store(v, Ordering::Relaxed);
-    // Nothing is written for the default (off): the registry stays as it was.
-    if v != 0 {
-        crate::diag::record_named_bytes(b"RmKnob", v);
-    }
+    // Mirrored on EVERY read, 0 included: "nothing is written for the default" left a previous
+    // run's value in the registry after the knob was set back to 0.
+    crate::diag::record_named_bytes(b"RmKnob", v);
     v
+}
+
+/// Read `KmdRmClient` for this transport generation now and mirror it (StartDevice, after
+/// [`forget`] reset it). PASSIVE.
+pub(crate) fn reread_knob_at_start() -> u32 {
+    read_knob()
 }
 
 /// One pass of the client, from the HPD worker's loop (PASSIVE). Does nothing at all

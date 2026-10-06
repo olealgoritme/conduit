@@ -103,6 +103,13 @@ pub struct ContextContext {
     present_stream_marker: crate::sync::SpinLock<Option<StashedMarker>>,
     /// One authenticated, generation-qualified execution stream per context.
     execution_stream: AtomicU64,
+    /// Flush-gate trace (`ddi::flush_trace`): what the last `HEFL` Render of this
+    /// context left for the SubmitCommand of the same DMA buffer. DIAGNOSTIC ONLY:
+    /// nothing in the driver's behaviour reads it. `flush_pending_flag` is the lock-free
+    /// "is there one" test, so SubmitCommand takes the lock only for a context that has
+    /// a pending record.
+    flush_pending: crate::sync::SpinLock<Option<helios_kmd_logic::flush_trace::PendingFlush>>,
+    flush_pending_flag: AtomicU32,
 }
 
 /// Typed borrowed view of a scheduler context handle.
@@ -240,6 +247,42 @@ impl<'a> ContextHandleRef<'a> {
     pub fn take_present_stream_marker_stash(&self) -> Option<StashedMarker> {
         self.context.present_stream_marker.lock().take()
     }
+
+    /// Low 32 bits of the context handle (a pointer): enough to tell contexts apart in
+    /// the flush-gate trace.
+    pub fn trace_id(&self) -> u32 {
+        (self.context as *const ContextContext as usize) as u32
+    }
+
+    /// Flush-gate trace: leave `pending` for the SubmitCommand of this Render's DMA
+    /// buffer. Returns true when an earlier one was still waiting (batched, or never
+    /// submitted) and was replaced. PASSIVE (`DxgkDdiRender`).
+    pub fn stash_flush_pending(
+        &self,
+        mut pending: helios_kmd_logic::flush_trace::PendingFlush,
+    ) -> bool {
+        let mut slot = self.context.flush_pending.lock();
+        let replaced = slot.is_some();
+        // The stored record knows it replaced one (it is exempt from the match accounting).
+        pending.replaced = replaced;
+        *slot = Some(pending);
+        // The flag changes only under the lock, so it can never disagree with the slot.
+        self.context.flush_pending_flag.store(1, Ordering::Relaxed);
+        replaced
+    }
+
+    /// Flush-gate trace: take the record the last `HEFL` Render left, if any. One relaxed
+    /// load for the (normal) context with nothing pending; the lock only when the flag says
+    /// there is one. DISPATCH (SubmitCommand).
+    pub fn take_flush_pending(&self) -> Option<helios_kmd_logic::flush_trace::PendingFlush> {
+        if self.context.flush_pending_flag.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let mut slot = self.context.flush_pending.lock();
+        let taken = slot.take();
+        self.context.flush_pending_flag.store(0, Ordering::Relaxed);
+        taken
+    }
 }
 
 /// Typed borrowed view of a D3D **device** handle.
@@ -362,6 +405,15 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // because the diag dumps between also require it; still ONE mint for
         // this DDI.
         let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        // FIRST, before anything below that can wait on the host: the process behind this
+        // device is gone (dxgkrnl destroys the devices of a killed process), so a foreign
+        // scanout source it held ends now and the desktop is restored. The sweeps below
+        // are host round trips of up to 30 s each under the scanout / Venus mutexes, and
+        // `close_all_for_owner`, which used to be the only place the source ended, comes
+        // after all of them. Idempotent: `close_all_for_owner` finds nothing left to end.
+        if let Some(device_owner) = crate::virtio::gpu::DeviceOwner::new(owner) {
+            adapter.foreign_scanout_owner_exit(device_owner);
+        }
         // Drain THIS device's mappings in batches, unmapping outside the table
         // lock (MmUnmapLockedPages needs PASSIVE; the table lock raises to
         // DISPATCH). One acquisition per entry was O(n) acquisitions and O(n^2)
@@ -471,6 +523,8 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         snap_purpose: AtomicU32::new(0),
         present_stream_marker: crate::sync::SpinLock::new(None),
         execution_stream: AtomicU64::new(0),
+        flush_pending: crate::sync::SpinLock::new(None),
+        flush_pending_flag: AtomicU32::new(0),
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;
 

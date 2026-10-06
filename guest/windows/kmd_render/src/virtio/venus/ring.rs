@@ -562,8 +562,14 @@ impl VenusRing {
         self.fatal = true;
         match reason {
             FatalReason::HostStatusFatal => crate::diag::record_named_bytes(b"VnRingFt", 1),
-            FatalReason::HeadWaitTimeout { elapsed_ms } => {
-                crate::diag::record_named_bytes(b"VnRingWd", elapsed_ms as u32)
+            FatalReason::HeadWaitTimeout {
+                elapsed_ms,
+                slept_ms,
+                real_first,
+            } => {
+                crate::diag::record_named_bytes(b"VnRingWd", elapsed_ms as u32);
+                crate::diag::record_named_bytes(b"VnRingSl", slept_ms as u32);
+                crate::diag::record_named_bytes(b"VnRingRt", real_first as u32);
             }
         }
     }
@@ -629,6 +635,11 @@ impl VenusRing {
             core::hint::spin_loop();
         }
         let mut slept_ms: u64 = 0;
+        // `sleep_ms(1)` rounds up to the timer quantum (~15.6 ms), so the slice count
+        // alone made this "30 s" budget up to ~468 s of real time, under the Venus (and
+        // often the scanout) mutex the HPD worker waits on without a timeout. The real
+        // clock bounds it too: whichever of the two reaches the budget first ends the wait.
+        let started = crate::adapter::foreign_scanout::now_100ns();
         loop {
             if ready(self) {
                 return Ok(());
@@ -639,9 +650,17 @@ impl VenusRing {
                 self.latch_fatal(FatalReason::HostStatusFatal);
                 return Err(VirtioError::DeviceError);
             }
-            if slept_ms >= RING_WAIT_TIMEOUT_MS {
+            let real_ms = helios_kmd_logic::slice_budget::elapsed_ms(
+                started,
+                crate::adapter::foreign_scanout::now_100ns(),
+            );
+            let verdict =
+                helios_kmd_logic::slice_budget::verdict(slept_ms, real_ms, RING_WAIT_TIMEOUT_MS);
+            if verdict != helios_kmd_logic::slice_budget::Verdict::Within {
                 self.latch_fatal(FatalReason::HeadWaitTimeout {
-                    elapsed_ms: slept_ms,
+                    elapsed_ms: helios_kmd_logic::slice_budget::reported_ms(slept_ms, real_ms),
+                    slept_ms,
+                    real_first: verdict == helios_kmd_logic::slice_budget::Verdict::RealSpent,
                 });
                 return Err(VirtioError::DeviceError);
             }

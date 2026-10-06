@@ -47,6 +47,15 @@
  * backing then goes allocation-granule by granule, and a granule that is taken
  * is left alone: a fault there goes to the next handler exactly as before.
  *
+ * The loss is often seen (a failed escape) BEFORE the KMD has unmapped the
+ * views, so the sweep at that moment finds them still mapped. To keep the
+ * window in which the freed VA can be handed to someone else short, every
+ * helios_kmdmap_lost() that answers "lost" re-sweeps the old generation's
+ * unbacked ranges (at most once per tick, never waiting for the lock). At the
+ * 320.1 swap dwm.exe's restarted D3D device got a read-only 12 KiB view placed
+ * on a freed feedback buffer 4 s after the loss. The other half of that fix
+ * is in Venus: a lost device does not touch its mappings at all.
+ *
  * Plain C99 / C++ (clang-cl, mingw gcc), Win32 only, no CRT allocation.
  * Define HELIOS_KMDMAP_LOG(fmt, ...) before including to get diagnostics.
  */
@@ -94,6 +103,7 @@ struct helios_kmdmap_table {
 
 /* Per-module state (each including module has its own copy). */
 static struct helios_kmdmap_table *volatile helios_kmdmap_t;
+static volatile LONG64 helios_kmdmap_sweep_tick;
 static PVOID helios_kmdmap_veh;
 static volatile LONG helios_kmdmap_users;
 static SRWLOCK helios_kmdmap_module_lock = SRWLOCK_INIT;
@@ -347,12 +357,39 @@ helios_kmdmap_detach(void)
    ReleaseSRWLockExclusive(&helios_kmdmap_module_lock);
 }
 
-/* Has the device behind a user that attached at `epoch` been lost? */
+/* After a loss: back the old generation's ranges that the KMD has unmapped
+ * since. At most once per tick per module and only if the lock is free, so it
+ * is cheap to call from every path that notices the loss. */
+HELIOS_KMDMAP_FN void
+helios_kmdmap_resweep(struct helios_kmdmap_table *t)
+{
+   const LONG64 now = (LONG64)GetTickCount64();
+   const LONG64 last = helios_kmdmap_sweep_tick;
+   if (now == last ||
+       InterlockedCompareExchange64(&helios_kmdmap_sweep_tick, now, last) != last)
+      return;
+   const LONG tid = (LONG)GetCurrentThreadId();
+   if (InterlockedCompareExchange(&t->lock, tid, 0) != 0)
+      return;
+   for (uint32_t i = 0; i < t->count; i++) {
+      struct helios_kmdmap_entry *m = &t->e[i];
+      if (m->epoch != t->epoch && !m->backed_whole &&
+          helios_kmdmap_free((uintptr_t)m->base, 1))
+         helios_kmdmap_back_locked(t, m, 0);
+   }
+   helios_kmdmap_unlock(t);
+}
+
+/* Has the device behind a user that attached at `epoch` been lost? A "lost"
+ * answer also re-sweeps (see helios_kmdmap_resweep). */
 HELIOS_KMDMAP_FN bool
 helios_kmdmap_lost(int32_t epoch)
 {
    struct helios_kmdmap_table *t = helios_kmdmap_t;
-   return t && (int32_t)InterlockedCompareExchange(&t->epoch, 0, 0) != epoch;
+   if (!t || (int32_t)InterlockedCompareExchange(&t->epoch, 0, 0) == epoch)
+      return false;
+   helios_kmdmap_resweep(t);
+   return true;
 }
 
 /* A view the KMD just mapped, for the user identified by `owner`. */

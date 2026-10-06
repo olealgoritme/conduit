@@ -56,6 +56,17 @@ pub fn level() -> u32 {
     level
 }
 
+/// Forget the cached `DiagLevel` and read it again, mirroring the value in force (`DiagLvl`,
+/// written on every read, 0 included). StartDevice: the static outlives a `pnputil
+/// /restart-device` (the image is not reloaded), so without this a changed `DiagLevel` needed a
+/// reboot. PASSIVE_LEVEL.
+pub fn reread_level() -> u32 {
+    DIAG_LEVEL.store(u32::MAX, Ordering::Relaxed);
+    let level = level();
+    record_named_bytes(b"DiagLvl", level);
+    level
+}
+
 /// `RTL_REGISTRY_SERVICES` — Path is relative to
 /// `\Registry\Machine\System\CurrentControlSet\Services`.
 const RTL_REGISTRY_SERVICES: u32 = 1;
@@ -367,6 +378,28 @@ pub fn sample_tick(ticks: &AtomicU32) -> bool {
     level() >= 1 || n == 1 || n % SAMPLE_EVERY == 0
 }
 
+/// The last value a [`record_named_on_change`] site wrote; starts as "never".
+pub struct NamedLast(core::sync::atomic::AtomicU64);
+
+impl NamedLast {
+    pub const fn new() -> Self {
+        Self(core::sync::atomic::AtomicU64::new(u64::MAX))
+    }
+}
+
+/// A fixed-name outcome value ("what the last operation did") written only
+/// when it differs from the value this name last got, so the registry still
+/// always holds the latest outcome but a steady success costs no synchronous
+/// `RtlWriteRegistryValue` per call. EVERY write of `name` (success and
+/// failure arms alike) must go through the same `last`, or a skipped write
+/// could leave a stale failure code in place. `DiagLevel >= 1` writes always.
+pub fn record_named_on_change(name: &[u8], value: u32, last: &NamedLast) {
+    let prev = last.0.swap(u64::from(value), Ordering::Relaxed);
+    if prev != u64::from(value) || level() >= 1 {
+        record_named_bytes(name, value);
+    }
+}
+
 /// One-shot throttled identity value, for a site with no surrounding block.
 /// Same policy as [`sample_tick`].
 pub fn sample_named(name: &[u8], value: u32, ticks: &AtomicU32) {
@@ -631,6 +664,31 @@ pub mod knobs {
     /// (`helios_kmd_logic::nvrm_fastpath::spin`). Read once, at the first forward;
     /// the outcome is mirrored in `NvSpinHit` / `NvSpinMis`.
     pub const NV_SPIN_US: KnobName = KnobName::new(b"NvSpinUs");
+    /// `NvDupHarden` (default 2 = log-only, for the first shipped package). Cross-client
+    /// hardening of forwarded RM ioctls (`virtio::nvrm_harden`, `docs/nvrm-escape.md`
+    /// section 12): every RM client and backend handle a forwarded `Ioctl` names must be
+    /// the calling process's own. 2 = log-only (everything is recorded and checked, what
+    /// mode 1 would refuse is counted in `NvDupWould` and forwarded), 1 = enforce (the
+    /// request is refused, `NvDupDeny` / `NvRef`), 0 = off (nothing is recorded or checked:
+    /// the behaviour before the hardening). A value present and other than 0 or 2 enforces.
+    /// Read once per boot. Flip the default to 1 after a real NVK run shows `NvCliRec` close
+    /// to `NvOpen`, `NvDupWould` 0 and `NvDupDoubt` small.
+    pub const NV_DUP_HARDEN: KnobName = KnobName::new(b"NvDupHarden");
+    /// `FlipWdogMs` (default 0 = off). The opt-in flip watchdog (`ddi::stall_diag`,
+    /// `docs/zero-copy-present.md` "Stall diagnosis"): when a pending flip has gone this many
+    /// milliseconds (in vsync ticks) with no address published, the vsync DPC publishes the
+    /// flip's address as a KEPT picture (for any class of allocation, Venus included), and the
+    /// Venus direct exits (a spent retry budget, a permanent reject) publish kept too. The kept
+    /// address names a picture that is not on the screen: a diagnostic and recovery valve, not a
+    /// completion. Nonzero values are clamped to 50..60000. Read at every StartDevice; mirrored
+    /// as `FlWdMsEff`.
+    pub const FLIP_WDOG_MS: KnobName = KnobName::new(b"FlipWdogMs");
+    /// `DeferBudget` (default 0 = unlimited, today's behaviour). The most Deferred programming
+    /// attempts of one primary (about one per vsync tick) before the worker publishes the flip's
+    /// address kept and lowers the gate instead of retrying again (`FkDefBud`). 240 is about
+    /// four seconds at 60 Hz. Nonzero values are clamped to 16..4000000. Read at every
+    /// StartDevice; mirrored as `DefBudEff`.
+    pub const DEFER_BUDGET: KnobName = KnobName::new(b"DeferBudget");
     /// Segment topology. Legal values 0 and 10 only — see `BarSegTopology`.
     pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
     /// CpuVisible cached-allocation kill switch (default 1 = cached).
@@ -678,6 +736,16 @@ pub mod knobs {
     /// (`rm_refresh::TAIL_100NS`, always on) covers what trails it. Read once per transport
     /// generation (`docs/kmd-rm-client.md` 15.16).
     pub const KMD_RM_SYS_POLL_MS: KnobName = KnobName::new(b"KmdRmSysPollMs");
+    /// `ForeignFlip` (default 0 = off: the foreign-allocation flip does not exist and every
+    /// allocation takes the path it took before). Nonzero: a WDDM allocation that adopted an
+    /// RM resource a user-mode device imported (DWM-on-NVK's swap-chain buffers, open identity
+    /// FOREIGN) is shown by the KMD's own `ScanoutFlip` of its DRM file and GEM, with the
+    /// arbiter's resident source registered under the importing device, instead of
+    /// `SET_SCANOUT_BLOB` plus a Venus flush (`virtio::foreign_flip`,
+    /// `docs/kmd-rm-client.md` 15.18). Refused, with a counted reason (`FfRef<NN>`), and the
+    /// old path runs, when the importer's file is gone, the layout is unusable, the host lacks
+    /// the import, or `KmdRmClient` is 3 or 4. Read once per transport generation.
+    pub const FOREIGN_FLIP: KnobName = KnobName::new(b"ForeignFlip");
     /// `BindFlushMode` (default 0). Selects when the bind edge tells the host
     /// to READ the freshly bound primary (ROADMAP defect 0ab-B):
     ///   0 = completion-ordered against the boundary this buffer's own present
@@ -697,10 +765,10 @@ pub mod knobs {
     pub const DISPATCH_BIND: KnobName = KnobName::new(b"DispatchBind");
     /// Per-present probe instrumentation (default 0).
     pub const PRESENT_PROBE: KnobName = KnobName::new(b"PresentProbe");
-    /// `ForeignCopy` (default 1 = ON). The KMD's explicit-modifier copy of a
-    /// foreign (NVK-on-RM) resource into the scan-out image, and the device
-    /// extension tier it needs. 0 restores the pre-feature device and import for
-    /// a same-boot bisect; read at AddAdapter/StartDevice like every knob.
+    /// `ForeignCopy` (default 0 = OFF; set 1 to use it). The KMD's explicit-modifier copy of
+    /// a foreign (NVK-on-RM) resource into the scan-out image, and the device
+    /// extension tier it needs. 0, the default, is the pre-feature device and import;
+    /// read at AddAdapter/StartDevice like every knob.
     pub const FOREIGN_COPY: KnobName = KnobName::new(b"ForeignCopy");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
@@ -841,6 +909,17 @@ pub mod knobs {
     /// ⛔ Clamped in code to `[WDDM_HEAD_MS_MIN, WDDM_HEAD_MS_MAX]` when nonzero:
     /// too large reinstates the TDR, too small re-opens the 0ab-B stale-frame class.
     pub const WDDM_HEAD_MS: KnobName = KnobName::new(b"WddmHeadMs");
+    /// `FlGSyncMs` (default 0 = OFF; DIAGNOSTIC, `docs/flush-gate.md` section 9).
+    ///
+    /// A `HEFL` flush-gate Render waits up to N ms (PASSIVE, no lock held, clamped in
+    /// code to `flush_trace::SYNC_MS_MAX`) until the boundary its packet carries has
+    /// retired, then returns, so the runtime's key release follows the GPU completion on
+    /// the CPU. If the keyed-mutex ordering failure goes away with it, the failure is a
+    /// CPU-vs-GPU race (the release outruns the work); if it does not, the gate is not
+    /// what orders the acquirer. Snapshotted at transport init: `pnputil /restart-device`
+    /// applies it. Read `FlGSyncWt` (waits that ran) first: 0 means the experiment did
+    /// not run.
+    pub const FLG_SYNC_MS: KnobName = KnobName::new(b"FlGSyncMs");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.

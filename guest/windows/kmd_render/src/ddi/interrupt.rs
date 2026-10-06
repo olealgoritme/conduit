@@ -293,6 +293,8 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
                 super::submit_command::signal_dma_completed(guard, dxgkrnl, ready.fence())
             };
             if status == STATUS_SUCCESS {
+                // Flush-gate trace (atomics only; one load when no `HEFL` fence is queued).
+                super::flush_trace::note_retire(ready.fence(), ready.rebased());
                 let terminal_prefix = ready.terminal_prefix();
                 ready.delivered();
                 if let Some(prefix) = terminal_prefix {

@@ -1,0 +1,266 @@
+diff --git a/src/virtio/vulkan/helios_kmdmap.h b/src/virtio/vulkan/helios_kmdmap.h
+index 747a3b25610..44ac1b0a754 100644
+--- a/src/virtio/vulkan/helios_kmdmap.h
++++ b/src/virtio/vulkan/helios_kmdmap.h
+@@ -47,6 +47,15 @@
+  * backing then goes allocation-granule by granule, and a granule that is taken
+  * is left alone: a fault there goes to the next handler exactly as before.
+  *
++ * The loss is often seen (a failed escape) BEFORE the KMD has unmapped the
++ * views, so the sweep at that moment finds them still mapped. To keep the
++ * window in which the freed VA can be handed to someone else short, every
++ * helios_kmdmap_lost() that answers "lost" re-sweeps the old generation's
++ * unbacked ranges (at most once per tick, never waiting for the lock). At the
++ * 320.1 swap dwm.exe's restarted D3D device got a read-only 12 KiB view placed
++ * on a freed feedback buffer 4 s after the loss. The other half of that fix
++ * is in Venus: a lost device does not touch its mappings at all.
++ *
+  * Plain C99 / C++ (clang-cl, mingw gcc), Win32 only, no CRT allocation.
+  * Define HELIOS_KMDMAP_LOG(fmt, ...) before including to get diagnostics.
+  */
+@@ -94,6 +103,7 @@ struct helios_kmdmap_table {
+ 
+ /* Per-module state (each including module has its own copy). */
+ static struct helios_kmdmap_table *volatile helios_kmdmap_t;
++static volatile LONG64 helios_kmdmap_sweep_tick;
+ static PVOID helios_kmdmap_veh;
+ static volatile LONG helios_kmdmap_users;
+ static SRWLOCK helios_kmdmap_module_lock = SRWLOCK_INIT;
+@@ -347,12 +357,39 @@ helios_kmdmap_detach(void)
+    ReleaseSRWLockExclusive(&helios_kmdmap_module_lock);
+ }
+ 
+-/* Has the device behind a user that attached at `epoch` been lost? */
++/* After a loss: back the old generation's ranges that the KMD has unmapped
++ * since. At most once per tick per module and only if the lock is free, so it
++ * is cheap to call from every path that notices the loss. */
++HELIOS_KMDMAP_FN void
++helios_kmdmap_resweep(struct helios_kmdmap_table *t)
++{
++   const LONG64 now = (LONG64)GetTickCount64();
++   const LONG64 last = helios_kmdmap_sweep_tick;
++   if (now == last ||
++       InterlockedCompareExchange64(&helios_kmdmap_sweep_tick, now, last) != last)
++      return;
++   const LONG tid = (LONG)GetCurrentThreadId();
++   if (InterlockedCompareExchange(&t->lock, tid, 0) != 0)
++      return;
++   for (uint32_t i = 0; i < t->count; i++) {
++      struct helios_kmdmap_entry *m = &t->e[i];
++      if (m->epoch != t->epoch && !m->backed_whole &&
++          helios_kmdmap_free((uintptr_t)m->base, 1))
++         helios_kmdmap_back_locked(t, m, 0);
++   }
++   helios_kmdmap_unlock(t);
++}
++
++/* Has the device behind a user that attached at `epoch` been lost? A "lost"
++ * answer also re-sweeps (see helios_kmdmap_resweep). */
+ HELIOS_KMDMAP_FN bool
+ helios_kmdmap_lost(int32_t epoch)
+ {
+    struct helios_kmdmap_table *t = helios_kmdmap_t;
+-   return t && (int32_t)InterlockedCompareExchange(&t->epoch, 0, 0) != epoch;
++   if (!t || (int32_t)InterlockedCompareExchange(&t->epoch, 0, 0) == epoch)
++      return false;
++   helios_kmdmap_resweep(t);
++   return true;
+ }
+ 
+ /* A view the KMD just mapped, for the user identified by `owner`. */
+diff --git a/src/virtio/vulkan/vn_device_memory.c b/src/virtio/vulkan/vn_device_memory.c
+index 3bc8d3ccfb1..ee6f4fe9c59 100644
+--- a/src/virtio/vulkan/vn_device_memory.c
++++ b/src/virtio/vulkan/vn_device_memory.c
+@@ -97,6 +97,11 @@ static void
+ vn_device_memory_cache_op_coherent_cached_mappings(struct vn_device *dev,
+                                                    bool invalidate)
+ {
++   /* Cache ops on mappings a lost device may no longer have (Helios: the KMD
++    * unmapped them, and the VA may already be someone else's). */
++   if (unlikely(vn_renderer_is_lost(dev->renderer)))
++      return;
++
+    simple_mtx_lock(&dev->mutex);
+    list_for_each_entry(struct vn_device_memory, mem,
+                        &dev->coherent_cached_memory,
+diff --git a/src/virtio/vulkan/vn_feedback.c b/src/virtio/vulkan/vn_feedback.c
+index 0f9ab82a3f2..13720aa9ad5 100644
+--- a/src/virtio/vulkan/vn_feedback.c
++++ b/src/virtio/vulkan/vn_feedback.c
+@@ -10,6 +10,7 @@
+ #include "vn_physical_device.h"
+ #include "vn_query_pool.h"
+ #include "vn_queue.h"
++#include "vn_renderer.h"
+ 
+ static uint32_t
+ vn_get_memory_type_index(const VkPhysicalDeviceMemoryProperties *mem_props,
+@@ -234,6 +235,12 @@ vn_feedback_pool_alloc(struct vn_feedback_pool *pool,
+    uint32_t offset;
+    struct vn_feedback_slot *slot;
+ 
++   /* A slot lives in mapped device memory, which a lost device may no longer
++    * have (Helios: the KMD unmapped it, and the VA can already belong to
++    * someone else). Callers fall back to the non-feedback path. */
++   if (unlikely(vn_renderer_is_lost(pool->dev->renderer)))
++      return NULL;
++
+    simple_mtx_lock(&pool->mutex);
+    if (!list_is_empty(&pool->free_slots)) {
+       slot =
+diff --git a/src/virtio/vulkan/vn_query_pool.c b/src/virtio/vulkan/vn_query_pool.c
+index 383eea694b9..fbcd761d09c 100644
+--- a/src/virtio/vulkan/vn_query_pool.c
++++ b/src/virtio/vulkan/vn_query_pool.c
+@@ -13,6 +13,7 @@
+ #include "venus-protocol/vn_protocol_driver_query_pool.h"
+ 
+ #include "vn_device.h"
++#include "vn_renderer.h"
+ #include "vn_feedback.h"
+ #include "vn_physical_device.h"
+ 
+@@ -188,7 +189,8 @@ vn_ResetQueryPool(VkDevice device,
+ 
+    vn_async_vkResetQueryPool(dev->primary_ring, device, queryPool, firstQuery,
+                              queryCount);
+-   if (pool->fb_buf) {
++   /* The feedback buffer is mapped device memory, gone with a lost device. */
++   if (pool->fb_buf && !vn_renderer_is_lost(dev->renderer)) {
+       /* Feedback results are always 64 bit and include availability bit
+        * (also 64 bit)
+        */
+@@ -433,6 +435,9 @@ vn_GetQueryPoolResults(VkDevice device,
+    struct vn_query_pool *pool = vn_query_pool_from_handle(queryPool);
+    VkResult result;
+ 
++   if (unlikely(vn_renderer_is_lost(dev->renderer)))
++      return vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
++
+    /* Get results from feedback buffers
+     * Not possible for VK_QUERY_RESULT_PARTIAL_BIT
+     */
+diff --git a/src/virtio/vulkan/vn_queue.c b/src/virtio/vulkan/vn_queue.c
+index f4849bc0e7e..f1664fddf80 100644
+--- a/src/virtio/vulkan/vn_queue.c
++++ b/src/virtio/vulkan/vn_queue.c
+@@ -2605,6 +2605,12 @@ vn_QueueWaitIdle(VkQueue _queue)
+    struct vn_device *dev = vn_device_from_handle(dev_handle);
+    VkResult result;
+ 
++   /* Nothing will ever complete; and the lazily created wait fence below
++    * would initialise a feedback slot in mapped memory (dwm.exe crashed
++    * exactly there at the 320.1 swap, destroying a D2D device). */
++   if (unlikely(vn_device_is_lost(dev)))
++      return vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
++
+    vn_wsi_flush(queue);
+ 
+    /* lazily create queue wait fence for queue idle waiting */
+@@ -2682,7 +2688,7 @@ vn_fence_feedback_init(struct vn_device *dev,
+    if (fence->is_external)
+       return VK_SUCCESS;
+ 
+-   if (VN_PERF(NO_FENCE_FEEDBACK))
++   if (VN_PERF(NO_FENCE_FEEDBACK) || vn_device_is_lost(dev))
+       return VK_SUCCESS;
+ 
+    slot = vn_feedback_pool_alloc(&dev->feedback_pool, VN_FEEDBACK_TYPE_FENCE);
+@@ -2880,7 +2886,7 @@ vn_ResetFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences)
+       assert(perm->type == VN_SYNC_TYPE_DEVICE_ONLY);
+       fence->payload = perm;
+ 
+-      if (fence->feedback.slot) {
++      if (fence->feedback.slot && !vn_device_is_lost(dev)) {
+          vn_feedback_reset_status(fence->feedback.slot);
+          fence->feedback.pollable = true;
+       }
+@@ -2932,6 +2938,10 @@ vn_get_fence_status(VkDevice dev_handle,
+    struct vn_fence *fence = vn_fence_from_handle(fence_handle);
+    struct vn_sync_payload *payload = fence->payload;
+ 
++   /* The feedback slot below is mapped device memory. */
++   if (unlikely(vn_device_is_lost(dev)))
++      return VK_ERROR_DEVICE_LOST;
++
+    VkResult result;
+    switch (payload->type) {
+    case VN_SYNC_TYPE_DEVICE_ONLY:
+@@ -3393,7 +3403,7 @@ vn_semaphore_feedback_init(struct vn_device *dev,
+    }
+ #endif
+ 
+-   if (VN_PERF(NO_SEMAPHORE_FEEDBACK))
++   if (VN_PERF(NO_SEMAPHORE_FEEDBACK) || vn_device_is_lost(dev))
+       return VK_SUCCESS;
+ 
+    slot =
+@@ -4083,6 +4093,9 @@ vn_SignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo)
+    if (sem->helios_present_stream_cookie)
+       return helios_stream_mutation_refused(dev, "CPU signal");
+    helios_semaphore_revoke_stream_eligibility(sem);
++   /* The feedback slot update below is mapped device memory. */
++   if (unlikely(vn_device_is_lost(dev)))
++      return vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
+ #endif
+ 
+    /* Helios: the HOST timeline for a WDDM-folded semaphore is advanced
+@@ -4523,7 +4536,7 @@ vn_event_feedback_init(struct vn_device *dev, struct vn_event *ev)
+ {
+    struct vn_feedback_slot *slot;
+ 
+-   if (VN_PERF(NO_EVENT_FEEDBACK))
++   if (VN_PERF(NO_EVENT_FEEDBACK) || vn_device_is_lost(dev))
+       return VK_SUCCESS;
+ 
+    slot = vn_feedback_pool_alloc(&dev->feedback_pool, VN_FEEDBACK_TYPE_EVENT);
+@@ -4609,6 +4622,9 @@ vn_GetEventStatus(VkDevice device, VkEvent event)
+    struct vn_event *ev = vn_event_from_handle(event);
+    VkResult result;
+ 
++   if (unlikely(vn_device_is_lost(dev)))
++      return vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
++
+    if (ev->feedback_slot)
+       result = vn_feedback_get_status(ev->feedback_slot);
+    else
+@@ -4624,6 +4640,9 @@ vn_SetEvent(VkDevice device, VkEvent event)
+    struct vn_device *dev = vn_device_from_handle(device);
+    struct vn_event *ev = vn_event_from_handle(event);
+ 
++   if (unlikely(vn_device_is_lost(dev)))
++      return VK_SUCCESS; /* no effect left to have; never touch the slot */
++
+    if (ev->feedback_slot) {
+       vn_feedback_set_status(ev->feedback_slot, VK_EVENT_SET);
+       vn_async_vkSetEvent(dev->primary_ring, device, event);
+@@ -4643,6 +4662,9 @@ vn_ResetEvent(VkDevice device, VkEvent event)
+    struct vn_device *dev = vn_device_from_handle(device);
+    struct vn_event *ev = vn_event_from_handle(event);
+ 
++   if (unlikely(vn_device_is_lost(dev)))
++      return VK_SUCCESS; /* no effect left to have; never touch the slot */
++
+    if (ev->feedback_slot) {
+       vn_feedback_reset_status(ev->feedback_slot);
+       vn_async_vkResetEvent(dev->primary_ring, device, event);
+diff --git a/src/virtio/vulkan/vn_renderer_helios.c b/src/virtio/vulkan/vn_renderer_helios.c
+index 80c37d70b0a..d69b0904b23 100644
+--- a/src/virtio/vulkan/vn_renderer_helios.c
++++ b/src/virtio/vulkan/vn_renderer_helios.c
+@@ -1452,9 +1452,12 @@ helios_escape_ex(struct helios *helios, void *buf, uint32_t size, bool hardware_
+       return false;
+    }
+    /* The device is gone; its handles are dead and every escape would fail
+-    * (and log three lines). */
+-   if (helios_is_lost(helios))
++    * (and log three lines). Also back whatever the KMD unmapped since the
++    * loss was noticed (helios_kmdmap_resweep, rate-limited). */
++   if (helios_is_lost(helios)) {
++      helios_kmdmap_lost(helios->base.loss_epoch0);
+       return false;
++   }
+ 
+    D3DKMT_ESCAPE esc;
+    memset(&esc, 0, sizeof(esc));

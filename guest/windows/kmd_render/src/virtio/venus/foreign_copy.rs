@@ -61,6 +61,10 @@ pub(crate) static FC_STALE: AtomicU32 = AtomicU32::new(0);
 /// A foreign source seen while the `ForeignCopy` knob is 0: it takes the
 /// ordinary OPTIMAL import, as before this feature (`FcOff`).
 pub(crate) static FC_KNOB_OFF: AtomicU32 = AtomicU32::new(0);
+/// A foreign source whose record is a shared format this 32 bpp, one-plane copy cannot carry
+/// (`R8`, `YUYV`, `NV12`, fp16, ... or any record with a plane 1: `docs/shared-formats.md`),
+/// refused instead of read as BGRA (`FcNotRgb32`). Included in `FcRefuse`; `FcRefCode` is 6.
+pub(crate) static FC_NOT_RGB32: AtomicU32 = AtomicU32::new(0);
 
 /// Mirror the counters to the service key. PASSIVE_LEVEL only; called with the
 /// rest of the NVRM counters (`publish_nvrm_counters`).
@@ -74,6 +78,7 @@ pub(crate) fn publish_counters() {
     crate::diag::record_named_bytes(b"FcNoExt", FC_NO_EXT.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"FcStale", FC_STALE.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"FcOff", FC_KNOB_OFF.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"FcNotRgb32", FC_NOT_RGB32.load(Ordering::Relaxed));
 }
 
 fn refuse(code: u32) -> VirtioError {
@@ -109,9 +114,10 @@ impl ForeignSource {
 /// The source to import as a foreign resource, or `None` for the ordinary path.
 ///
 /// `layout` is `Some` only for an allocation that adopted a foreign resource. The
-/// `ForeignCopy` knob (default on) is the bisect lever: at 0 the foreign source is
-/// treated exactly as it was before this feature existed (the plain OPTIMAL
-/// import, which the host refuses for these resources), and counted as `FcOff`.
+/// `ForeignCopy` knob (default 0 = OFF, `adapter::Knobs::foreign_copy`; set 1 to use the
+/// foreign copy) is the switch: at 0, the default, the foreign source is treated exactly
+/// as it was before this feature existed (the plain OPTIMAL import, which the host
+/// refuses for these resources), and counted as `FcOff`.
 pub(crate) fn foreign_source_if_enabled(
     adapter: &AdapterContext,
     layout: Option<fr::Layout>,
@@ -167,6 +173,9 @@ impl VenusClient {
         fc::ForeignImage::from_record(&source.layout, source.record_size, width, height).map_err(
             |reason| {
                 crate::diag::record_named_bytes(b"FcImpSt", 0xE3);
+                if reason == fc::Refusal::Format {
+                    FC_NOT_RGB32.fetch_add(1, Ordering::Relaxed);
+                }
                 refuse(reason.code())
             },
         )

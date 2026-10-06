@@ -166,3 +166,40 @@ wholly taken, the escape-status path, and a user attached after the loss. Build
 commands are in the file; x64 and x86 both PASS in win11. The Mesa copy must
 stay identical: `cmp guest/windows/umd_common/bridge/helios_kmdmap.h
 <mesa>/src/virtio/vulkan/helios_kmdmap.h`.
+
+## 0004 — a lost device touches none of its mappings
+
+On top of 0003 (in `series`).
+
+**Why.** At the 319.4 -> 320.1 live install dwm.exe died at
+`vulkan_virtio.dll+0x2ac650`: `vn_CreateFence` writing the initial status into
+a fresh fence's feedback slot, called from `vn_QueueWaitIdle` (it lazily
+creates its wait fence) under `vk_common_DeviceWaitIdle`, from the UMD
+destroying a D2D device after the loss. The loss had been caught by the escape
+path (`STATUS_DEVICE_REMOVED`) before the KMD unmapped the views, so the sweep
+at that moment found the feedback buffer still mapped. By the time of the write,
+4 s later, its VA held a read-only 12 KiB `MEM_MAPPED` view (the restarted D3D
+device), and both modules' handlers correctly declined it (`declined=2` in
+the shared table in the dump).
+
+**What.**
+- Venus does not touch feedback slots or mapped memory once the device is
+  lost:
+  - no new feedback slots are created (fence, semaphore and event creation
+    fall back to the non-feedback path);
+  - `vkQueueWaitIdle` (and through it `vkDeviceWaitIdle`), fence status,
+    `vkGetEventStatus`, `vkSignalSemaphore` and `vkGetQueryPoolResults` return
+    `VK_ERROR_DEVICE_LOST`;
+  - `vkResetFences`, `vkSetEvent`/`vkResetEvent` and `vkResetQueryPool` skip
+    their slot writes;
+  - coherent-cached flush/invalidate are skipped.
+- `helios_kmdmap.h`: every `helios_kmdmap_lost()` that answers "lost" re-sweeps
+  the old generation's unbacked ranges (once per tick, never waiting for the
+  lock), and every escape attempted on a lost renderer calls it. A view the KMD
+  unmaps after the loss was noticed is then claimed within one tick of the next
+  touch of the lost renderer, instead of being left free for anything else.
+  The UMD's ledger readers call it too.
+
+**Test.** `helios_kmdmap_test.c` case 5: the loss is marked while the view is
+still mapped, the view is then unmapped, and the next `lost()` check backs it.
+x64 and x86 PASS in win11.

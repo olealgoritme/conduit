@@ -214,6 +214,21 @@ namespace helios_bridge {
       _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                   "C:\\ProgramData\\Helios\\umd-%lu.log",
                   (unsigned long)GetCurrentProcessId());
+      // A same-named file left by an earlier process with this pid under
+      // another account may refuse our append (docs/dwm-on-nvk.md, T3): then
+      // the name also carries the process creation time, as umd_common's
+      // log.rs computes it.
+      if (FILE* probe = _fsopen(buf, "a", _SH_DENYNO)) {
+        fclose(probe);
+      } else if (GetFileAttributesA(buf) != INVALID_FILE_ATTRIBUTES) {
+        FILETIME c = {}, e = {}, k = {}, u = {};
+        unsigned long long created = 0;
+        if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u))
+          created = (static_cast<unsigned long long>(c.dwHighDateTime) << 32) | c.dwLowDateTime;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "C:\\ProgramData\\Helios\\umd-%lu-%llx.log",
+                    (unsigned long)GetCurrentProcessId(), created);
+      }
       return std::string(buf);
     }();
     return path.c_str();
@@ -531,15 +546,55 @@ namespace helios_handoff {
       if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
             L"D:(A;;GA;;;WD)(A;;GA;;;SY)(A;;GA;;;AC)S:(ML;;NW;;;LW)", SDDL_REVISION_1, &sd, nullptr))
         sa.lpSecurityDescriptor = sd;
+      SetLastError(0);
       HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, sa.lpSecurityDescriptor ? &sa : nullptr,
         PAGE_READWRITE, 0, DWORD(sizeof(Table)), L"Local\\HeliosHandoffLedger3");
+      const DWORD create_error = GetLastError();
       if (sd)
         LocalFree(sd);
-      if (!mapping)
+      DWORD session = 0;
+      ProcessIdToSessionId(GetCurrentProcessId(), &session);
+      if (!mapping) {
+        char msg[200];
+        std::snprintf(msg, sizeof(msg), "handoff: ledger section not created (error %lu, session %lu)",
+                      create_error, session);
+        umd_log(msg);
         return nullptr;
+      }
+      // The kernel name of the section: two processes share the ledger only
+      // when this is the same path.
+      char kname[160] = "?";
+      using NtQueryObjectFn = LONG(WINAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+      if (auto* query = reinterpret_cast<NtQueryObjectFn>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject"))) {
+        alignas(8) unsigned char buf[1024] = {};
+        ULONG len = 0;
+        // ObjectNameInformation (1): a UNICODE_STRING followed by its text.
+        if (query(mapping, 1, buf, sizeof(buf), &len) >= 0) {
+          struct Name { USHORT Length, MaximumLength; const wchar_t* Buffer; };
+          const auto* us = reinterpret_cast<const Name*>(buf);
+          if (us->Buffer)
+            std::snprintf(kname, sizeof(kname), "%.*ls", int(us->Length / sizeof(wchar_t)), us->Buffer);
+        }
+      }
       auto* t = static_cast<Table*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Table)));
-      // The view keeps the section alive; the handle is not needed.
-      CloseHandle(mapping);
+      // The handle and the view stay for the life of the process. A view keeps
+      // the section object alive but not its name: the name leaves the
+      // session's namespace with the last handle, and the next process then
+      // created a new, empty section under it (each process had its own
+      // table on 320.1).
+      if (!t)
+        CloseHandle(mapping);
+      {
+        char msg[400];
+        std::snprintf(msg, sizeof(msg),
+          "handoff: ledger section %s (%s, pid %lu, session %lu, %zu bytes) at %p: magic %08x, "
+          "%u records claimed so far, %u in use",
+          kname, create_error == ERROR_ALREADY_EXISTS ? "opened existing" : "created", GetCurrentProcessId(), session,
+          sizeof(Table), static_cast<void*>(t), t ? t->magic.load() : 0u, t ? t->next_device.load() : 0u,
+          t ? t->records_in_use.load() : 0u);
+        umd_log(msg);
+      }
       if (!t)
         return nullptr;
       std::uint32_t zero = 0;
@@ -551,10 +606,13 @@ namespace helios_handoff {
     return s_table;
   }
 
+  // Opt-in (HELIOS_HANDOFF_LEDGER=1, in every sharing process) until the
+  // cross-process table is verified; the default is the releaser CPU wait
+  // (forward/transfer.rs).
   bool enabled() {
     static const bool on = []() {
       const char* v = std::getenv("HELIOS_HANDOFF_LEDGER");
-      return !(v && v[0] == '0');
+      return v && v[0] == '1';
     }();
     return on;
   }
@@ -3123,6 +3181,11 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
   if (backend == helios_bridge::IcdBackend::NvkRm) {
     configure_dxvk_env_once(backend);
     auto nvk = run_with_stack([&]() -> std::unique_ptr<HeliosDxvkDevice> {
+      // NVK's own policy (Mesa 0032) hides its GPU from a process that Icd,
+      // the deny-list or HELIOS_ICD send to Venus; the UMD chose NVK past
+      // them (DwmIcd=nvk under Icd=venus: DWM got "Failed to initialize
+      // DXVK", docs/dwm-on-nvk.md T2), so NVK is told the same here.
+      helios_bridge::NvkPolicyScope policy;
       return bridge_guard<std::unique_ptr<HeliosDxvkDevice>>(
           "helios_dxvk_create_device(nvk)", nullptr,
           [&]() -> std::unique_ptr<HeliosDxvkDevice> {

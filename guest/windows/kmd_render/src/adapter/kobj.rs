@@ -232,6 +232,33 @@ impl AdapterContext {
             != 0
     }
 
+    /// Interrupt time in whole milliseconds, wrapping at 2^32 (49.7 days): the
+    /// time base of every `*VsT` / `VpDmpT` diagnostic value. Any IRQL.
+    pub(crate) fn interrupt_time_ms() -> u32 {
+        let mut qpc_timestamp = 0;
+        // SAFETY: a scalar clock read; `qpc_timestamp` is a live local.
+        let now = unsafe { wdk_sys::ntddk::KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
+        helios_kmd_logic::vsync_rate::ms_from_100ns(now)
+    }
+
+    /// Interrupt time of the tick that last advanced `vsync_count`, in
+    /// milliseconds (0 before the first), the companion of that count.
+    pub(crate) fn vsync_last_ms(&self) -> u32 {
+        helios_kmd_logic::vsync_rate::ms_from_100ns(
+            self.vsync_last_100ns
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// `VsMinGap` as published: smallest tick gap in 100 ns units, saturated,
+    /// `u32::MAX` while none has been measured.
+    pub(crate) fn vsync_min_gap_published(&self) -> u32 {
+        helios_kmd_logic::vsync_rate::publish_gap(
+            self.vsync_min_gap_100ns
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     /// True once AddDevice successfully allocated the system high-resolution
     /// timer. The choice is immutable for this adapter lifetime: a failed
     /// allocation deliberately preserves the proven embedded-KTIMER fallback.
@@ -348,6 +375,10 @@ impl AdapterContext {
         {
             return;
         }
+        // The first tick after an arm has no predecessor: do not measure its gap
+        // against a tick from before a quiesce/resume.
+        self.vsync_gap_prev_100ns
+            .store(0, core::sync::atomic::Ordering::Relaxed);
         // SAFETY: KTIMER/KDPC were initialized at this stable address by
         // `init_kernel_events`, before the adapter became visible to dxgkrnl.
         unsafe {
@@ -412,6 +443,7 @@ impl AdapterContext {
             }
         }
         self.vsync_deadline_100ns.store(0, Ordering::Release);
+        self.vsync_gap_prev_100ns.store(0, Ordering::Relaxed);
     }
 
     /// Initialize the embedded kernel dispatcher objects. MUST be called once,
@@ -511,6 +543,9 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     {
         crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
     }
+    // The foreign scanout source's no-present watchdog: ends a source whose lapse the HPD
+    // worker has not polled in time. One relaxed load while no user source is live.
+    adapter.foreign_scanout_tick();
     if !adapter.display_half() || adapter.vsync_armed.load(Ordering::Acquire) == 0 {
         return;
     }
@@ -521,7 +556,10 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     // the prior interrupt-time deadline so ordinary callback latency does not
     // become drift; if delayed across several periods, skip to one future
     // deadline rather than emitting a burst of synthetic retraces.
-    unsafe {
+    //
+    // The block's value is the interrupt time this tick was serviced at, for
+    // `vsync_last_100ns`.
+    let tick_time_100ns = unsafe {
         use wdk_sys::ntddk::KeQueryInterruptTimePrecise;
 
         let mut qpc_timestamp = 0;
@@ -532,6 +570,20 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         // into cumulative phase drift, defeating the one-shot scheme.
         let anchor = if previous == 0 { now } else { previous };
         let period = helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(adapter));
+        // Gap statistics (diag `VsMinGap` / `VsFast`): the evidence that the
+        // heartbeat does not burst. A few relaxed accesses, no lock and no
+        // registry access; the tick is serialized (one-shot, rearmed below), and
+        // a lost update in a race with arm/disarm only blurs a diagnostic.
+        let gap_prev = adapter.vsync_gap_prev_100ns.load(Ordering::Relaxed);
+        adapter.vsync_gap_prev_100ns.store(now, Ordering::Relaxed);
+        if let Some(gap) = helios_kmd_logic::vsync_rate::tick_gap(gap_prev, now) {
+            if gap < adapter.vsync_min_gap_100ns.load(Ordering::Relaxed) {
+                adapter.vsync_min_gap_100ns.store(gap, Ordering::Relaxed);
+            }
+            if helios_kmd_logic::vsync_rate::is_fast(gap, period) {
+                adapter.vsync_fast.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let Some(deadline) = helios_kmd_logic::vsync_deadline::next(anchor, now, period) else {
             // Interrupt-time representation exhausted. The current one-shot
             // has fired; leave it disarmed rather than schedule an immediate
@@ -553,7 +605,16 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
             adapter.cancel_vsync_one_shot();
             return;
         }
-    }
+        now
+    };
+    // Stall diagnosis (`ddi::stall_diag`): the consecutive-pending-tick count `VsPendN` and its
+    // maximum, and, only with `FlipWdogMs` set, the flip watchdog. Atomics only (DISPATCH),
+    // before the delivery gate below so a disabled delivery does not blind the count; the
+    // watchdog's kept address is read by the `phys` load further down, in this very tick.
+    crate::ddi::stall_diag::on_vsync_tick(
+        adapter,
+        helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(adapter)),
+    );
     // ControlInterrupt may close only the delivery gate at DIRQL. Keep the
     // one-shot heartbeat free-running while disabled so a later enable needs no
     // illegal timer operation and resumes on the next nominal retrace.
@@ -617,6 +678,12 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
         adapter.signal_hpd();
     }
+    // Time first, then the count: a reader that loads the count and then the time
+    // sees a pair that is at most one tick apart, never a time older than its
+    // count.
+    adapter
+        .vsync_last_100ns
+        .store(tick_time_100ns, Ordering::Relaxed);
     adapter.vsync_count.fetch_add(1, Ordering::Relaxed);
 }
 

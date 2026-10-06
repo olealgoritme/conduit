@@ -422,6 +422,12 @@ pub static WDDM_HOLD_MS: AtomicU32 = AtomicU32::new(0);
 /// A static, not a `VirtioGpu` field, for the same reason as [`WDDM_HOLD_MS`]: one
 /// read site, and readable without `virtio_lock`.
 pub static WDDM_HEAD_MS: AtomicU32 = AtomicU32::new(WDDM_HEAD_MS_DEFAULT);
+/// `WbStaleRdy`: front tokens of the WindowedBlt ready queue popped because no undispatched
+/// request stood behind them (`helios_kmd_logic::windowed_ready`). Must read 0 on a healthy
+/// boot; a nonzero value is a request that was retired without its token (a killed process
+/// whose snapshot resource was torn down with admitted blts queued) and was healed by the
+/// worker instead of wedging every later windowed present.
+pub static WINDOWED_READY_STALE: AtomicU32 = AtomicU32::new(0);
 /// `WddmHeadMs`'s shipping default, in ms, and it is a DECISION (AGENTS.md rule 8).
 ///
 /// The bound exists because `present_stream_marker_boundary` accepts any nonzero
@@ -595,6 +601,10 @@ pub struct ScanoutNotify {
     /// `ScStale` instead of clearing a gate that is not its own.
     ticket: crate::adapter::ProgrammingTicket,
     primary_address: u64,
+    /// The copy's source is a foreign or hollow allocation (`flip_completion::Source`): a copy
+    /// whose GPU completion FAILS still completes the flip, by publishing `primary_address` as a
+    /// kept picture. False for a Venus allocation, whose failure publishes nothing as before.
+    keep_on_failure: bool,
     event: NonNull<KEVENT>,
 }
 
@@ -771,6 +781,7 @@ impl ScanoutNotify {
         adapter: &crate::adapter::AdapterContext,
         primary_address: u64,
         ticket: crate::adapter::ProgrammingTicket,
+        keep_on_failure: bool,
     ) -> Self {
         Self {
             pending: NonNull::from(&adapter.scanout_refresh_pending),
@@ -778,6 +789,7 @@ impl ScanoutNotify {
             programming: NonNull::from(&adapter.vidpn_programming),
             ticket,
             primary_address,
+            keep_on_failure,
             // SAFETY: hpd_event is embedded in the stable adapter and
             // initialized by init_kernel_events before StartDevice creates any
             // Venus submissions.
@@ -2212,6 +2224,13 @@ impl WddmReady {
         self.pending.fence
     }
 
+    /// Whether this fence was released by the `WddmHeadMs` rebase (its tagged
+    /// dependency replaced by the conservative wire prefix). Read-only; the flush-gate
+    /// trace records it.
+    pub(crate) fn rebased(&self) -> bool {
+        self.pending.rebased
+    }
+
     pub(crate) fn terminal_prefix(&self) -> Option<WindowedBltTerminalPrefix> {
         self.terminal_prefix
     }
@@ -2346,6 +2365,12 @@ pub struct VirtioGpu {
     nvrm_handles: Vec<nvrm_tables::NvrmHandleSlot>,
     /// Slots reserved by in-flight forwarded `Open`s.
     nvrm_reserved: usize,
+    /// RM clients (`NV01_ROOT`) each owner was given, learned from forwarded replies, so
+    /// a payload that names a client can be checked against the caller
+    /// (`kmd_logic::nvrm_clients`, `virtio/nvrm_harden.rs`). Part of the transport: a
+    /// new transport starts with none. Boxed (4 KiB) and built by
+    /// [`nvrm_tables::new_client_table`], for the same frame-size reason as `nvrm_fences`.
+    nvrm_clients: Box<helios_kmd_logic::nvrm_clients::ClientTable>,
     /// `SEMSURF_FENCE_CREATE`s in flight and the `EventReady`s that beat their
     /// handle's recording (see `kmd_logic::nvrm_fence`). Also reserved slots: a
     /// create reserves one in `nvrm_reserved` like an `Open`.
@@ -3022,6 +3047,7 @@ impl VirtioGpu {
             scanout_release: scanout_release_on,
             nvrm_handles: Vec::with_capacity(MAX_NVRM_HANDLES),
             nvrm_reserved: 0,
+            nvrm_clients: nvrm_tables::new_client_table(),
             nvrm_fences: nvrm_tables::new_fence_book(),
             nvrm_maps: Vec::with_capacity(MAX_NVRM_MAPS),
             nvrm_pins: Vec::with_capacity(MAX_NVRM_PINS),
@@ -3089,6 +3115,8 @@ impl VirtioGpu {
             host_edid_len: 0,
         });
         let mut gpu = gpu;
+        crate::diag::record_named_bytes(b"DmaGfEff", u32::from(gpu.dma_gpu_fence));
+        crate::diag::record_named_bytes(b"PrWmkEff", u32::from(gpu.present_exact_watermark));
         if let Some(n) = host_edid_len {
             if let (Some(src), Some(dst)) = (
                 resp_buf.get(EDID_RESP_OFFSET..EDID_RESP_OFFSET + n),
@@ -3110,6 +3138,9 @@ impl VirtioGpu {
                 .min(WDDM_HOLD_MS_MAX),
             Ordering::Relaxed,
         );
+        // The knobs this init snapshots, mirrored with the value IN FORCE (every init, 0
+        // included): a registry value set back to its default must not leave a stale one showing.
+        crate::diag::record_named_bytes(b"WdHoldEff", WDDM_HOLD_MS.load(Ordering::Relaxed));
         // `WddmHeadMs` (K-F2 / A5's consumer-side head bound). Snapshotted with
         // every other knob, and CLAMPED IN BOTH DIRECTIONS rather than trusted: too
         // large reinstates the unbounded head and hence the TDR, too small turns a
@@ -3125,6 +3156,10 @@ impl VirtioGpu {
             ),
             Ordering::Relaxed,
         );
+        crate::diag::record_named_bytes(b"WdHeadEff", WDDM_HEAD_MS.load(Ordering::Relaxed));
+        // `FlGSyncMs` (flush-gate diagnostic, default 0 = off): snapshotted here with the
+        // other knobs; clamped in `flush_trace::init_from_registry`.
+        crate::ddi::flush_trace::init_from_registry();
         // (The old Gate-2 venus ctx self-test is gone: the StartDevice venus
         // client bring-up right after transport init exercises the full context
         // + blob lifecycle for real.)
@@ -4496,6 +4531,9 @@ impl VirtioGpu {
         self.next_wire_fence += 1;
         let ring = cmd.hdr.ring_idx;
         ASYNC_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+        // Flush-gate trace (diagnostic): one relaxed load. Counts a transport submission
+        // that entered while a queued `HEFL` fence was outstanding (`FlGUnord`).
+        crate::ddi::flush_trace::note_transport_submit();
         if ring != 0 {
             RING_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
         }
@@ -5177,7 +5215,28 @@ impl VirtioGpu {
                                         .displayed_primary
                                         .as_ref()
                                         .store(notify.primary_address, Ordering::Release);
+                                    // `FlipPub`: this DPC stores through the pointer, not
+                                    // through `publish_displayed_primary`.
+                                    crate::ddi::stall_diag::note_published(notify.primary_address);
                                     notify.pending.as_ref().store(1, Ordering::Release);
+                                } else if notify.keep_on_failure
+                                    && notify.primary_address != 0
+                                {
+                                    // FLIP COMPLETION (`helios_kmd_logic::flip_completion`): the
+                                    // copy of a foreign or hollow primary failed on the host, so
+                                    // nothing will ever publish this address and dxgkrnl would
+                                    // hold the flip. Publish it as a kept picture (the screen
+                                    // keeps what it showed; no refresh is requested): the same
+                                    // atomic store as above, legal at this DISPATCH_LEVEL.
+                                    notify
+                                        .displayed_primary
+                                        .as_ref()
+                                        .store(notify.primary_address, Ordering::Release);
+                                    crate::ddi::stall_diag::note_published(notify.primary_address);
+                                    crate::ddi::flip_keep::count(
+                                        helios_kmd_logic::flip_completion::KeepWhy::AsyncCopyFailed,
+                                        crate::ddi::flip_keep::Lane::Async,
+                                    );
                                 }
                                 // Ticketed clear, unconditional on response_ok
                                 // exactly as before: a failed copy must still
@@ -5881,7 +5940,16 @@ impl VirtioGpu {
     /// claimed-but-never-submitted and in-flight consumer ownership before
     /// releasing the closing stream slots. This is never called on an
     /// ambiguous or rejected destroy.
-    pub fn finalize_closed_present_streams_for_context(&mut self, ctx_id: u32) -> u32 {
+    ///
+    /// Retiring a closing slot turns every WDDM FIFO entry whose boundary names it into one
+    /// that names a dead stream, which the purges' `discharge_dead_present_stream_waits`
+    /// cancels; that sweep ran at purge time, when the slot still counted as live, so it is
+    /// repeated here (it takes the notification-ordered token the callers already hold).
+    pub fn finalize_closed_present_streams_for_context(
+        &mut self,
+        order: &crate::adapter::NotifyOrdered<'_>,
+        ctx_id: u32,
+    ) -> u32 {
         let mut finalized = 0u32;
         for index in 0..self.present_streams.len() {
             let slot = self.present_streams[index];
@@ -5901,6 +5969,15 @@ impl VirtioGpu {
             }
             self.retire_present_stream_slot(index);
             finalized += 1;
+        }
+        if finalized != 0 {
+            // The purge that closed these slots ran these sweeps while they still counted as
+            // live (a closing slot keeps its handle until now): the FIFO entries and the
+            // undispatched requests of a stream that just died are cancelled here, or they
+            // wait on a boundary that is never satisfied and keep their ledger tickets and
+            // token slots until some unrelated purge comes along. Same order as the purges.
+            let _ = self.discharge_dead_present_stream_waits(order);
+            self.cancel_dead_undispatched_windowed_blt();
         }
         finalized
     }
@@ -6057,6 +6134,28 @@ impl VirtioGpu {
     /// generation issued, or `None` when it has issued none.
     pub fn flush_wire_floor(&self) -> Option<u64> {
         helios_kmd_logic::flush_gate::wire_floor(self.wire_fence_base, self.next_wire_fence)
+    }
+
+    /// Whether the wait a flush-gate packet carries has been satisfied (read-only;
+    /// `FlGSyncMs`, `ddi::flush_trace::sync_wait`). `boundary` is the tagged boundary the
+    /// packet kept (0 for none), `floor` the wire floor it was stamped with (0 for none).
+    ///
+    /// * A tagged boundary is ready when [`Self::scanout_boundary_ready`] says so, or
+    ///   when its stream is gone: a dead stream's wait is discharged by the lifecycle
+    ///   code, not by completing, and waiting on it would only burn the knob's budget.
+    /// * A wire floor `f` is the last fence this generation had issued, so "everything up
+    ///   to and including `f` retired" is `async_retired_up_to(f + 1)`.
+    /// * Neither: nothing to wait for.
+    pub fn flush_gate_ready(&self, boundary: u64, floor: u64) -> bool {
+        if boundary != 0 {
+            // A failed transport can retire nothing: do not burn the knob's budget on it.
+            return self.failed
+                || self.scanout_boundary_ready(boundary)
+                || !self.present_stream_boundary_live(boundary);
+        }
+        floor == 0
+            || self.failed
+            || self.async_retired_up_to(floor.saturating_add(1), RetireDomain::IncludingGpu)
     }
 
     fn present_stream_marker_boundary_counted(
@@ -6936,12 +7035,31 @@ impl VirtioGpu {
     /// boundary are mandatory; a retired producer without residency admission
     /// remains inert in `pending`.
     pub fn take_ready_windowed_blt(&mut self) -> Option<WindowedBltPending> {
-        let token = *self.windowed_blt.ready.front()?;
-        let index = self
-            .windowed_blt
-            .pending
-            .iter()
-            .position(|request| request.token == token)?;
+        // A front token with no undispatched request behind it can never be dispatched
+        // (the request was retired through a terminal, or already went out): pop it, or
+        // it holds every later request of every process behind it for the rest of the
+        // boot (`helios_kmd_logic::windowed_ready`). Counted in `WbStaleRdy`.
+        let index = loop {
+            let front = self.windowed_blt.ready.front().copied();
+            let index = front.and_then(|token| {
+                self.windowed_blt
+                    .pending
+                    .iter()
+                    .position(|request| request.token == token)
+            });
+            let entry = index.map(|index| self.windowed_blt.pending[index].dispatched);
+            match helios_kmd_logic::windowed_ready::classify(front, entry) {
+                helios_kmd_logic::windowed_ready::Head::Empty => return None,
+                helios_kmd_logic::windowed_ready::Head::Stale => {
+                    self.windowed_blt.ready.pop_front();
+                    WINDOWED_READY_STALE.fetch_add(1, Ordering::Relaxed);
+                }
+                helios_kmd_logic::windowed_ready::Head::Candidate => {
+                    // `Candidate` means a front token with a pending, undispatched request.
+                    break index?;
+                }
+            }
+        };
         let boundary = self.windowed_blt.pending[index].stream_boundary;
         if !self.windowed_blt.pending[index].admitted
             || self.windowed_blt.pending[index].dispatched
@@ -6993,6 +7111,14 @@ impl VirtioGpu {
         let Some(request) = self.windowed_blt.pending.remove(index) else {
             return;
         };
+        if !request.dispatched {
+            // Retired before the worker took it (the teardown of its snapshot resource
+            // gives an admitted request a terminal): its token must not stay at the
+            // front of `ready`, where nothing would ever dispatch it or pop it.
+            self.windowed_blt
+                .ready
+                .retain(|known| *known != request.token);
+        }
         if !request.ledger_retired {
             adapter.read_ledger.retire(request.ledger_ticket, !ok);
         }

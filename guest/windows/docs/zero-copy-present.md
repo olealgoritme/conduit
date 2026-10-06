@@ -317,6 +317,9 @@ the escape fails `STATUS_BUFFER_TOO_SMALL`). The 72-byte struct is unchanged, so
 104-byte one by appending. Only the first 72 bytes are written back.
 
 ```c
+/* Shared formats (shared-formats.md): the fourcc column below is the four 32 bpp RGB
+   formats; with HELIOS_FOREIGN_CAP_LAYOUT_FORMATS the record also takes the other formats of that
+   document's table, and flags bit 1 (FLAG_PLANE1) appends a 16-byte plane 1 (120 bytes in all). */
 struct helios_foreign_layout {          /* 32 bytes, plane 0 only */
    uint32_t width;     /* 1..=16384 */
    uint32_t height;    /* 1..=16384 */
@@ -508,7 +511,10 @@ What the UMD must change (not done here): `PresentStreamCorrelation::is_complete
 2. **Layout on the host wire.** The 56-byte `RESOURCE_CREATE_BLOB` has no room for the layout; the host
    learns it from the GEM object or from a new message. Needed before the gate opens.
 3. **KMD-driven `ScanoutFlip`** in `program_vidpn_source_inner` (plan 3.6 Option B): read
-   `foreign_layout` for `stride`, `fourcc`, `modifier`.
+   `foreign_layout` for `stride`, `fourcc`, `modifier`. **Done, behind the knob `ForeignFlip` (default off): see
+   `kmd-rm-client.md` 15.18** (the arbiter's resident source under the importing device, `present_within`, the
+   poison of records whose DRM file closed; the wire still names `(owner_handle, GEM)`, so a flip by resource id is a
+   host change, 15.18.6).
 4. **Hardening**: ownership check of the adopting process (the holder-context binding is a consistency
    check only, 10.2); `ATTACH_RESOURCE` and snapshot descriptors for a foreign resid (section 8).
 
@@ -659,7 +665,8 @@ same-boot bisect. `FcKnob` mirrors it.
 |---|---|
 | `FcDevWant` / `FcDevX` | tier 0 attempted / obtained (written at device creation) |
 | `FcImp`, `FcScan`, `FcBlt` | complete imports; of which for the primary copy and for the Blt (`FcImp = FcScan + FcBlt`) |
-| `FcRefuse`, `FcRefCode` | refusals the KMD decided, and the last code: 1 dimensions, 2 fourcc, 3 stride, 4 modifier, 5 layout larger than the resource, 6 no format, 7 extent differs, 8 size 0, 9 image needs more than the resource, 10 no memory type |
+| `FcRefuse`, `FcRefCode` | refusals the KMD decided, and the last code: 1 dimensions, 2 fourcc, 3 stride, 4 modifier, 5 layout larger than the resource, 6 no format, 7 extent differs, 8 size 0, 9 image needs more than the resource, 10 no memory type, 11 plane fault (a plane 1 on a one-plane format) |
+| `FcNotRgb32` | of those, records refused as a shared format this 32 bpp one-plane copy cannot carry (code 6; `shared-formats.md`) |
 | `FcHostErr` | the host refused a step (image, requirements, memory, bind) |
 | `FcNoExt` | foreign source on a device without the extension |
 | `FcStale` | the allocation's layout disagreed with the table, or no record |
@@ -696,3 +703,688 @@ refusal retries every frame (a per-resource negative cache is needed), the memor
 type is chosen from the image requirement only (the dma-buf fd's own `memoryTypeBits`
 are not consulted), and `vkCmdBlitImage` from a modifier image needs BLIT_SRC in
 that modifier's tiling features.
+
+## 12. Present never fails on a foreign source
+
+Measured (win11 tester, DWM on NVK): `PBRet` went 0 to `0xC000000D` (`STATUS_INVALID_PARAMETER`) and stayed,
+while DWM presented IMPORT_RM-adopted DEVICE_MEMORY swap-chain buffers (5120x1440, `MISC_PRIMARY`)
+with `ForeignCopy=0`. A failed `DxgkDdiPresent` is a device error for dxgkrnl, so a surface the KMD's Venus
+arms were never written for must not be able to cause one.
+
+### 12.1 Rule
+
+A refusal that a FOREIGN allocation causes is answered with `STATUS_SUCCESS`, counted, and the work is
+skipped: a Blt leaves the destination as it was; a DMA flip arms nothing and the display keeps the previous
+picture; a flip's format check is simply not enforced. An ordinary (Venus) allocation fails exactly as
+before: every added statement is behind a refusal that was already a failure, and the only new work on the
+success path is one atomic store at the start of the call and the arm decode.
+
+Foreign means the KMD's own record, never the creator's word: the open identity's FOREIGN flag
+(`PresentAllocInfo::foreign_identity`, from the foreign-table hit at `OpenAllocation`), or a
+`foreign_record(resource_id)` hit looked up at the refusal (the table lock is taken only then). The layout
+trailer is not a fact: a creator can forge it, and a forged one keeps failing. The decision is
+`helios_kmd_logic::present_foreign::decide` (host tests); the arms call
+`ddi::present_foreign::skip`.
+
+What is never skipped: a null `DXGKARG_PRESENT`, `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER` (dxgkrnl's retry protocol), `STATUS_NO_MEMORY` and the
+rest after a host copy was submitted (the wait, the mirror, the ownership release of a standard-buffer
+destination cannot be unwound; they are not foreign-specific), and a foreign source that the existing arms
+handle: `ForeignCopy=1` imports it as before, and the level 5 Blt fallback (`sysmem_blt`) keeps taking an RM
+primary destination.
+
+A skipped Blt finishes through the same tail as a copied one (patch references, the refresh marker in the DMA
+buffer, the stream boundary), after writing a fence-0 marker so the scheduler sees a record that names no
+pending work, like the level 5 fallback does.
+
+### 12.2 Counters
+
+All are atomics on the Present path. The first skip and every 64th reach the registry at once; the throttled
+mirror (`publish_nvrm_counters`) writes the rest. No registry write per Present.
+
+| counter | meaning |
+|---|---|
+| `PrFgSkip` | refusals a foreign allocation caused, answered with success |
+| `PrFgWhy` | the last one: `arm << 12 \| destination_foreign << 9 \| source_foreign << 8 \| refusal` (arm 1 Blt, 2 MMIO flip, 3 DMA flip); bit 10 is the unresolved ADAPTER of reason 15 |
+| `PrFgBlt`, `PrFgFlip` | the same per arm (`PrFgFlip` holds both flip contracts) |
+| `PrFgHand` | DMA flips of a foreign allocation armed for `ForeignFlip`'s programming (12.6); not skips |
+| `PrUnres` | Blts answered with success because the adapter, source or destination handle resolved to nothing, on EVERY transport (12.7); not counted in `PrFgSkip` (which stays "a foreign allocation caused it") |
+| `PrUnrWhy` | the last one's causes: `source \| destination << 4 \| adapter_unresolved << 8`, each side 0 resolved, 1 null list slot, 2 not an open context of ours (`OaBadH`), 3 open of an older transport generation, 4 open that recorded no identity |
+| `PrColFill` | `ColorFill` Blts with no source allocation, a no-op (12.7) |
+| `PBRetSite` | the site id of the last non-success return of `DxgkDdiPresent` (table 12.4), written when it changes and then every 64th failure; 0 = a status no site names |
+
+Refusal codes (`PrFgWhy`, low byte):
+
+| code | refusal | what it replaces | effect |
+|---|---|---|---|
+| 1 | Blt destination handle resolves to nothing, source foreign (superseded by 15, which skips every unresolved handle; the code is kept stable and no longer produced) | `PBCpy` 0xE1 | no copy |
+| 2 | unresolved DXGI format (source or destination) | `PBCpy` 0xE2 | no copy |
+| 3 | source kind is not DEVICE_MEMORY | `PBCpy` 0xE6 | no copy |
+| 4 | WindowedBlt snapshot does not match the source | `PBCpy` 0xE7 | no copy |
+| 5 | no import descriptor (also a foreign format the import does not take) | `PBCpy` 0xE2 | no copy |
+| 6 | source and destination extents differ (a 5120x1440 foreign source into a 1600x900 destination) | `PBCpy` 0xE3 | no copy |
+| 7 | snapshot Blt without a stream boundary | `PBCpy` 0xE8 | no copy |
+| 8 | the two-phase snapshot Blt could not be queued, or its token merged | `PBCpy` 0xE4 / 0xE5 / 0xE6 | no copy |
+| 9 | the destination Present buffer cannot be taken for the write (a foreign STANDARD destination without a level 5 primary) | `PBOwn` 0xE1 | no copy |
+| 10 | the host copy was refused or could not be submitted before anything was written (a foreign import the host refused, with `ForeignCopy=0` or 1) | `PBCpy` 0xE4 / 0xE5 | no copy |
+| 11 | flip: unresolved DXGI format (a check only) | `PBFlip` 0xE2 | flip proceeds |
+| 12 | DMA flip: the resource is not in the direct-scan-out table, `ForeignFlip` off (or registered while it is off) | `PBFlip` 0xE6 | nothing armed, previous picture kept |
+| 13 | completion tail: the stream boundary cannot be merged into the DMA private data | tail return | boundary dropped, legacy retirement |
+| 14 | DMA flip, `ForeignFlip` on, foreign allocation that is not registered in the table (it was full, or the allocation predates the knob) | `PBFlip` 0xE6 | nothing armed, previous picture kept |
+| 15 | Blt: the adapter, source or destination resolves to nothing, unconditionally (12.7); `PrFgWhy` bits 10 / 8 / 9 name the UNRESOLVED adapter / source / destination | `PBCpy` 0xE1 | no copy, destination keeps its bytes |
+| 16 | Blt with `ColorFill` and no source allocation (12.7) | `PBCpy` 0xE1 | no copy (a no-op fill) |
+
+Roles: refusals 1, 3, 4, 11, 12 and 14 concern the source; 9 the destination; the rest either (the `source` and
+`destination` bits of `PrFgWhy` say which was foreign). A flip has no destination entry.
+
+### 12.3 Where the failing status came from (read the breadcrumbs this way)
+
+* `PBCpy` values 0xE1 to 0xE8 are DECIMAL 225 to 232 in a registry dump: a `PBCpy` of 225 is 0xE1, the Blt
+  arm's "adapter, source or destination unresolved" refusal, not a count. The legacy Blt arm writes `PBCpy`
+  on every call (1 copied, 2 snapshot queued) and the level 5 arm only when it changes (3 copied, 4 skipped);
+  `PBFlip` 1 is SAMPLED while its failure values are unconditional. So a `PBCpy` that "does not move" at 225
+  is a failure that repeats, and the `PBs*` / `PBd*` block next to it describes an older Present.
+* `PBcall`, `PBflag`, `PBcnt`, `PBalst`, `PBDma`, `PBPatch`, `PBkpsz` and the whole `PBs*` / `PBd*` block are
+  SAMPLED (first call, then every 600th, or every call at `DiagLevel >= 1`): they show the last sampled
+  Present, which is not the failing one. `PBcnt` is `NumSrcAllocations << 16 | NumDstAllocations` of that
+  sample. The allocation list is read by its fixed slots, never by those counts.
+* The early returns of `dxgkddi_present_inner` before the arms are the null argument, the MPO refusal
+  (`STATUS_NOT_SUPPORTED`) and nothing else: there is no argument, flag or rect validation ahead of the Blt
+  and Flip arms. Everything else that can return `STATUS_INVALID_PARAMETER` is in the arms or the tail, and is
+  in table 12.4. `PBRetSite` names which one fired, so the dump no longer needs the `PBCpy` / `PBFlip` code to
+  be inferred.
+
+### 12.4 `PBRetSite` ids
+
+| id | return |
+|---|---|
+| 1 | null `DXGKARG_PRESENT` |
+| 2 | level 5 Blt arm without an adapter |
+| 3 / 4 / 5 | Blt arm: no adapter / the source handle resolves to nothing / the destination handle resolves to nothing |
+| 6 / 7 / 8 | Blt arm: unresolved format / source kind not DEVICE_MEMORY / snapshot mismatch |
+| 9 / 10 / 11 | Blt arm: no import descriptor / extents differ / snapshot Blt without a boundary |
+| 12 | Blt arm: the WindowedBlt token could not be merged |
+| 13 / 14 / 15 | flip arm: no adapter / the source handle resolves to nothing / unresolved format |
+| 16 / 17 | DMA flip: no allocation-list source / resource not in the direct-scan-out table |
+| 18 | level 5 Blt arm: no allocation behind the source handle |
+| 19 | completion tail: stream boundary cannot be merged |
+| 20 | completion tail: the patch-location capacity or write failed (insufficient, dxgkrnl retries) |
+| 21 | `FlipWithMultiPlaneOverlay` (`STATUS_NOT_SUPPORTED`) |
+| 22 | Blt arm (legacy or level 5): DMA buffer or its private data too small (insufficient, retried) |
+| 23 | Blt arm (legacy or level 5): patch-location capacity (insufficient, retried) |
+| 24 / 25 / 26 | Blt arm: snapshot queue failed / destination Present buffer not takeable / host copy refused or not submittable |
+| 27 | Blt arm, after the copy was submitted: fence wait, CPU mirror or ownership release failed |
+| 28 | Blt arm: fence marker not mergeable into the DMA private data |
+| 29 | completion tail: DMA buffer smaller than the refresh marker (insufficient, retried) |
+| 30 | DMA flip: the flip record does not fit the DMA private data (insufficient, retried) |
+
+Every non-success return of `dxgkddi_present_inner` and of the level 5 arm names one of these; a status that does not
+come from them (none known) would read 0. A return by a callee that already named its own site (the level 5 arm's
+`Err`) is passed through unchanged.
+
+Sites 1 and 13 to 14 (null argument, flip without an adapter or source) stay failures by design. Sites 3, 4, 5
+(Blt adapter, source, destination) and 18 (level 5 arm source) are skips on every transport since 12.7: they stay in
+the table because the code below the skip is the failure a Blt would have returned, and `PBRetSite` still reads them
+if that decision is ever wrong (it cannot be reached for a Blt today).
+
+### 12.5 Not verified, risks
+
+Nothing here has run on win11; the KMD cannot be built here. The pure decision has host tests
+(`cargo test present_foreign` in `kmd_logic`), and the arms' code shapes (the macro defined after the
+let-else bindings, `patch_capacity.take()` in a return, the shared tail as a function) were compiled in a
+model crate against the real `present_foreign.rs`; display.rs itself was only rustfmt-parsed.
+
+* A skipped DMA flip arms nothing: dxgkrnl is told the flip happened and nothing is shown. If dxgkrnl keeps the
+  flip pending until a CRTC_VSYNC that carries the new address, the flip queue can stall behind it; the
+  counters (`PrFgFlip` rising while the screen is frozen) would say so.
+* A skipped Blt shows a stale destination. A source that always hits refusal 6 shows nothing, forever, instead
+  of failing: that is the intent, but it makes `PrFgSkip` the number to watch.
+* Refusal 10 repeats the host's refusal every frame (as before; the persistent-refusal negative cache of
+  11.5 is still open).
+* The skip of 13 drops a producer boundary: the buffer retires by the legacy rule, which can show a frame the
+  producer has not finished.
+* `PresentAllocInfo::foreign_identity` is new state read at the refusals; an allocation opened before the
+  foreign table recorded it is only caught by the table lookup. It is purely the table's record:
+  `OpenAllocation` clears a FOREIGN flag the private data carried when `foreign_open` finds no table entry
+  (`NotForeign`), so a previous open's flag or a creator's forgery never counts. A legitimate foreign open
+  (`Opened`) sets it, as before; a `Refused` open fails the open, as before.
+
+### 12.6 DMA flips of a foreign allocation: handed to `ForeignFlip`
+
+DWM on NVK flips DEVICE_MEMORY + `MISC_PRIMARY` buffers that are not `MISC_DIRECT_SCANOUT`, so they are not in the
+direct-scan-out table that the DMA-buffer flip contract (interval 0) resolves its source from, and the flip used to
+fail (`PBFlip` 0xE6) before `arm_dma_flip` could run. Skipping those flips outright would have hidden every
+interval-0 flip from `ForeignFlip` (`docs/kmd-rm-client.md` 15.18). So:
+
+* With `ForeignFlip` on, `CreateAllocation` registers an adopted foreign allocation (`ctx.foreign`, the KMD's own
+  adoption record, independent of `ForeignCopy`) in the same table as a direct-scan-out one (`register_for_flip`).
+  With the knob off, one relaxed load, nothing registered, nothing changes.
+* The DMA flip arm routes with `present_foreign::flip_route(knob, in_table, direct_scanout, source facts)`:
+
+| `ForeignFlip` | in the table | foreign (identity / table record) | direct flag | route |
+|---|---|---|---|---|
+| any | yes | any | yes | arm, as always (byte-identical) |
+| any | yes | no | no | arm, as always |
+| on | yes | yes | no | arm; counted `PrFgHand`; the deferred programming reaches `ForeignFlip`'s hook in `program_vidpn_source_inner` |
+| off | yes | yes | no | skip, reason 12 (a registration from before the knob went off) |
+| any | no | no | any | fail `PBFlip` 0xE6, as always (Venus) |
+| off | no | yes | any | skip, reason 12 |
+| on | no | yes | any | skip, reason 14 |
+
+* What happens after the flip is armed is the MMIO route's, unchanged: `process_deferred_vidpn_source_address` calls
+  `program_vidpn_source`, whose `ForeignFlip` hook takes the allocation (`FfProg`) or refuses it with a counted reason
+  (`FfRef*`). A refusal there runs the Venus path of the same function (`production_linear_scanout`, the KMD copy of the
+  foreign resource, which needs `ForeignCopy=1`; with it off the host refuses the import, counted, and the screen keeps
+  the previous picture), exactly as for a refused MMIO flip. The Present does not wait for that decision, so a
+  `ForeignFlip` refusal is NOT visible in the Present status or in `PrFg*`; `FfRef` / `FfWhy` carry it.
+* With the knob on, the KMD's own level 5 sysmem primary (adopted too) is registered the same way; its DMA flips are
+  then armed and answered by the level 5 arm, where they used to be skipped or refused. That is the intended route for
+  them, but it is a change to read in a level 5 run.
+* The MMIO flip (`pDmaBuffer == NULL`) is unchanged: it returns success and `SetVidPnSourceAddress` follows.
+
+### 12.7 Unresolved handles and ColorFill (`PBCpy` 0xE1, sites 3 / 4 / 5 / 18): unconditional
+
+Evidence. T1 (DWM on NVK): `PBCpy` 225 (= 0xE1) with `PBFlip` and the sampled blocks unmoved. T2 (DWM stayed on Venus,
+no foreign allocation anywhere): `PBRet` 0 to `0xC000000D` and `PBCpy` 2 to 225 during a DWM restart, on its first
+presents. So this refusal does not need a foreign allocation; the earlier gate (a live foreign record or `ForeignFlip`)
+was wrong and is removed. A Blt whose adapter, source or destination does not resolve is a counted success on every
+transport (reason 15, `PrUnres`); a `ColorFill` Blt with no source and a resolved destination is reason 16
+(`PrColFill`). Both finish through `present_complete` after a fence-0 marker, like every skipped Blt, and the level 5
+arm does the same for an unreadable source. Flips (`PBFlip` 0xE1, site 14) are not covered.
+
+Trade-off, stated plainly: a Blt that cannot be resolved loses that frame's picture instead of failing the Present
+(which dxgkrnl turns into a device error for DWM). A real handle bug is hidden from dxgkrnl and visible only as
+`PrUnres` with `PrUnrWhy` naming the cause; read those two first when a window shows stale content.
+
+When `present_alloc_info(adapter, h)` returns `None` (static reading of `ddi/create_allocation.rs`), in order:
+
+1. `h` is NULL: the list slot is not part of this operation. dxgkrnl encodes an absent source or destination as a NULL
+   `hDeviceSpecificAllocation` (`PresentAllocations::from_allocation_list`). The Blt shape with NO source by definition
+   is `ColorFill`. This is the one cause that needs no restart or race to occur, and it is a KMD defect, not a
+   dxgkrnl one: `docs/kmd-rm-client.md` 15.16 says "ColorFill ... accepted as no-ops", but the Blt arm required
+   both entries and answered every `Blt | ColorFill` with 0xE1. A freshly started DWM clears its buffers with fills
+   before it has composed anything, which fits "the first present(s) of a fresh DWM" and `PBCpy` 2 to 225. It is
+   fixed (reason 16) because it changes only a path that always failed. It is not proven to be T2's cause: `PBcnt`
+   is sampled and cannot show it, hence `PrUnrWhy`.
+2. `h` is not an `OpenAllocationContext` of ours (misaligned, or the `HOPN` magic does not match; counted `OaBadH`): a
+   handle this driver did not mint, or one already closed.
+3. The open belongs to an older transport generation (`is_current_generation` false; counted `STALE_ALLOC_REFUSED`).
+   `alloc_is_current` is false for serial 0 ("never stamped") and while no transport is up, so every open made across a
+   StopDevice/StartDevice (a device restart, a TDR-style reset) is refused for good even though dxgkrnl and DWM still
+   hold it: resource ids restart at 1 per generation, so serving it could name another live blob. That is intended
+   safety, and a reason the presents that follow a restart can hit this refusal.
+4. The open context recorded no identity: `read_alloc_identity` found neither a `HeliosWddmOpenIdentity` nor a
+   `HeliosWddmAllocPrivate` with a non-zero adopt id in the open-time private data (null or under 48 bytes, or an
+   allocation the KMD created without a Venus backing, or a private-data buffer dxgkrnl did not carry the create-time
+   write-back into). `present` is then `None` although the handle is ours.
+
+Causes 2 to 4 are not a KMD bug that can be fixed blind: each is the driver correctly declining to guess. Which one
+T2 hit is not known; `PrUnrWhy` records it per side (codes in the counters table) so the next dump names it. Neither the
+open-before-present ordering (dxgkrnl cannot reference a `hDeviceSpecificAllocation` before `DxgkDdiOpenAllocation`
+returned it) nor a different handle table (the list entries are always the open handles this driver returned) is a
+candidate: a handle that was never returned is cause 2.
+
+## 13. Flip completion invariant for foreign primaries
+
+Built, host-tested (`kmd_logic/src/flip_completion.rs`), compiled by nothing that links the WDK, run by nothing.
+Branch `kmd/flip-completion`. Read 13.4 (unknowns) before believing any of it.
+
+### 13.1 The problem
+
+DWM on NVK presented about twice and then blocked, where a Venus DWM presents about 157 times. First found by a static
+trace, then supported by T3 (320.1, `ForeignFlip` 1, 45 s): four NVK DWM frames reached the screen with no refusal
+(`FfProg` 4, `FfFrames` 4, `FfSeq` 4, `FfEdges` 4, every `FfRef*` / `FfFlipFail` / `FfGaveUp` 0), then DWM stalled
+behind one more flip: `FfNoRec` 1 (an allocation with no foreign record), `PrFgHand` 0 and `PrFgFlip` 0 (so the flips
+were MMIO), `ScUnav` 0 to 2.
+
+The KMD's completion model: dxgkrnl retires a queued flip when a `DXGK_INTERRUPT_CRTC_VSYNC` carries the flip's NEW
+`PhysicalAddress`. The KMD's VSync (`adapter/kobj.rs`) sends `AdapterContext::last_primary_address`, and that word was
+written only by a programming that BOUND the allocation (`publish_bound_primary`: a host bind, a finished copy, a level 5
+or `ForeignFlip` programming). For a foreign primary every one of those can fail or be switched off, and nothing
+completed the flip then:
+
+| route | what happened | exit that published |
+|---|---|---|
+| MMIO flip, `ForeignFlip` 0 (default) | the worker's `program_vidpn_source_inner` reached the Venus copy; the host refuses a plain OPTIMAL import of a foreign resource (`ForeignCopy` 0); `CopyFailed` is retried four times, then `GaveUp` drops the gate | none |
+| DMA flip, skipped at the Present (`PrFgWhy` reason 12 / 14) | `present_complete` and no `PresentFlipPrivate`, so `arm_dma_flip` armed nothing | none |
+| `ForeignFlip` 1, refused (any `FfRef*`, the presenter `Failing` for five seconds after three failed flips) | fell to the same Venus copy | none |
+| an allocation with no foreign record that the copy cannot take (T3's `FfNoRec`; the host-less shared placeholder has no resource id at all) | `NotOurs` (or `BadAlloc`, `ScRid` 0) then the same copy | none |
+| extent not the mode's | permanent reject before every arm (`ScBadExt`) | none |
+| `ForeignCopy` 1 and the queued copy fails on the host | the ring-1 completion DPC stored the address only on success | none |
+
+### 13.2 The invariant and its rule
+
+The KMD OWNS flip completion toward dxgkrnl. Whether the pixels reached the screen is a different question with its
+own counters. A flip whose programming cannot bind a non-Venus allocation completes anyway by publishing its address as
+a KEPT picture (`ProgrammedPrimary::kept_picture`, `AdapterContext::publish_kept_primary`): the address moves, the
+screen keeps whatever it showed, no refresh or bind is requested. One atomic store, legal at any IRQL.
+
+Which allocations (`flip_completion::classify`, from the allocation context the KMD built at create time). Honest
+about provenance: whether an allocation is FOREIGN is the KMD's own adoption record; the other inputs (`width`,
+`height`, `direct_scanout`, `venus_alloc_size`, the Venus image id) come from the creator's private-data trailer. A
+creator can therefore make ITS OWN allocation look hollow; the only effect is that ITS flips complete as kept pictures
+instead of failing, which is self-harm and reaches no other allocation:
+
+* `Foreign`: adopted NVK-on-RM resource (`AllocationContext::foreign`, the KMD's record).
+* `Hollow`: not foreign and the Venus path can never show it: no resource id (the host-less shared placeholder), or a
+  non-direct allocation with no geometry (`submit_primary_scanout_copy` refuses `ctx.width != width`, and an allocation
+  with no geometry is programmed at the mode's extent) or no Venus identity to import. A direct-scanout allocation with
+  a resource id is never hollow: the host binds its own resource and its own failure paths stay.
+* `Venus`: everything else. NOTHING CHANGES for it, on any route: `decide` answers `None` for every outcome of a Venus
+  source except `Programmed` (the existing bound publication), and the host test asserts it for every contract, knob
+  and outcome.
+
+Decision table (`flip_completion::decide`; `venus_can_bind` = `ForeignCopy` on for a foreign allocation, or direct
+scan-out; never for a hollow one). Foreign and Hollow follow one column; the contract only decides WHERE a kept
+publication is made (the worker for MMIO and for an armed DMA flip, the Present and submit for a skipped DMA flip):
+
+| outcome | Venus | Foreign / Hollow, `venus_can_bind` off | `venus_can_bind` on |
+|---|---|---|---|
+| Programmed (bound by the existing code) | Bound | Bound | Bound |
+| NotOurs (`ForeignFlip` off, no record, sysmem) | n/a | Kept | None (the Venus path runs) |
+| Refused (`ForeignFlip` on, any `Why`; foreign only) | n/a | Kept | None |
+| CopyFailed (retryable, budget left) | None | None (gate held) | None |
+| GaveUp (budget spent) | None | Kept | Kept |
+| Extent | None | Kept | Kept |
+| Rejected (layout, format, producer abandoned, no resource id) | None | Kept | Kept |
+| Unresolved (`SetVidPnSourceAddress` handle pairs with nothing) | None | Kept | Kept |
+| PresentSkip (DMA Present answered without arming; DMA only) | n/a | Kept | Kept |
+| AsyncCopyFailed (ring-1 completion, host error) | None | Kept | Kept |
+
+The T3 rows are the Hollow ones: `NotOurs` with `ForeignFlip` on and off, MMIO and DMA, are `Kept`; a resource id of 0
+is `Rejected` at the worker (it never reaches the arm) and `Kept`; the DMA Present of a hollow allocation (which used to
+fail `PBFlip` 0xE6) is `PresentSkip`.
+
+### 13.3 What is built, exit by exit
+
+* `adapter/mod.rs`, `adapter/scanout.rs`: `ProgrammedPrimary::kept_picture(address)` (doc comment: why it is legal) and
+  `publish_kept_primary`. Deliberately not `publish_bound_primary`, whose lease census (`LsPub`) counts binds.
+* `ddi/create_allocation.rs`: `WindowsPrimary::flip_source` and `flip_completion_info(adapter, h)`, which, unlike
+  `scanout_alloc_info`, also answers for an allocation with no resource id (the placeholder whose flip must complete).
+* `ddi/display.rs`, `program_vidpn_source_inner`, after the `ForeignFlip` arm: a `NotOurs` or `Refused` non-Venus source
+  whose Venus path cannot bind is completed as a kept picture and returns `Programmed` (the gate lowers), skipping the
+  copy that could only fail. `ForeignFlip`'s shown target is NOT dropped on a kept flip (the screen keeps its picture; the
+  arm still withdraws it when its file or device goes, or when it gives up). Venus sources fall through unchanged.
+* `ddi/display.rs`, both wrappers' `Err` arms: a foreign or hollow source publishes kept on `GaveUp` and on every
+  permanent reject (extent, layout, format, producer abandoned, no resource id); the inline wrapper treats every refusal as
+  final. Statuses returned to dxgkrnl are unchanged.
+* `dxgkddi_set_vidpn_source_address`: an unpaired handle (stale transport generation, foreign, null) publishes the
+  address Windows named (`FkDdi`), still returning `STATUS_INVALID_PARAMETER`.
+* DMA lane: `display.rs` writes a keep record (`PresentFlipPrivate::write_keep`, its own magic `HPKP`, so `take` still
+  refuses a zero allocation) for a skipped foreign flip and for the `Fail` route of a hollow allocation;
+  `submit_command::arm_dma_flip` takes it (`take_keep`, one-shot) and publishes `kept_picture(physical_address)`. Atomics
+  only, legal at DISPATCH. A zero physical address publishes nothing. STALE REPLAY: dxgkrnl recycles DMA private
+  buffers; if `present_complete` FAILS after the record was written (patch capacity, stream boundary), the slot is
+  zeroed (`PresentFlipPrivate::clear_keep`, in `display::present_flip_kept`) so a recycled buffer cannot publish an old
+  address as kept for another flip. Not host-testable (raw DMA private memory); it is read, not run. The ordinary flip
+  record (`HPFL`) has the same exposure and is not changed here.
+* Placeholder flips (`FkPhFlip`). A host-less shared placeholder has no identity, so `present_alloc_info` is `None` and the
+  flip arm failed `PBFlip` 0xE1 before any of the above. The open now records `host_less_placeholder` (no identity and
+  the placeholder's shape, `shared_placeholder::identityless_open_is_placeholder`, the KMD's own test) and the flip arm
+  completes such a flip: MMIO returns success (`SetVidPnSourceAddress` follows with the global handle, resource id 0,
+  which the worker rejects and completes as a kept picture) and DMA writes a keep record for the allocation list's
+  address. An identity-less allocation that does not have the placeholder's shape still fails 0xE1, as does every
+  Venus allocation.
+* `virtio/gpu/mod.rs` and the three call layers above it (`submit_prepared_image_copy`, `submit_venus_async_scanout`,
+  `scanout_notify`): `ScanoutNotify::keep_on_failure`, set for a non-Venus source. The ring-1 completion DPC then stores
+  the address when the copy's GPU completion FAILS (`response_ok` false), where it stored it only on success. The
+  transport-latch arm is untouched (an epoch abort).
+* `ForeignFlip` and the host round trip. Publication was already decoupled from the host's acknowledgement (`take`
+  publishes at programming; the flip is sent later by the worker). What was coupled was the worker: it drains
+  `pending_vidpn_allocation` (`hpd.rs`, before `foreign_flip::service`), so a flip waiting on a slow or silent host sat in
+  front of every later publication for up to `FLIP_TIMEOUT_MS` = 1 s. The timeout is now
+  `flip_completion::WORKER_FLIP_TIMEOUT_MS` = 250 ms (host-tested bounds: at least two 60 Hz frames, at most 250 ms, well
+  under a second), with the retry and failure accounting untouched (a timeout is `Failed`, three in a row give up for
+  five seconds, `FAIL_UNTIL`). It was first 100 ms; a tester's run showed three 100 ms host stalls withdrawing the
+  `ForeignFlip` source in about 0.6 s (three strikes plus the retry pauses), so it is 250 ms. Chosen
+  over a second thread (new lifetime and lock-order surface, unverifiable without hardware) and over draining between acts
+  (starves the flips under a steady stream of programmings). With every refusal now completing as a kept picture, a
+  spurious timeout costs a stale picture for the pause, not a held flip. The level 5 presenter's 1 s is untouched.
+
+### 13.4 Unknowns (read before trusting this)
+
+1. Whether dxgkrnl retires flips STRICTLY by CRTC_VSYNC address match has never been observed. The model is the driver's
+   own (`viogpu3d`'s `m_sourceAddress`, `last_primary_address`'s documented contract) and the stall it explains is derived
+   from reading the code, then matched to T3's counters, not seen in a trace. If dxgkrnl retires on something else (the
+   DMA fence, an interval, another interrupt type), this changes nothing and the stall has another cause. The first run
+   answers it: `FkKeep` moving with `SaCnt` and `VpVsN` following, and DWM's present count with it.
+2. What a kept picture does to a flip chain: dxgkrnl may reuse the previous buffer of the chain once the new address is
+   reported. The screen shows stale content (that is the point), but a stale picture is not a frozen compositor. If DWM
+   renders into a buffer the KMD is still showing (`ForeignFlip`, the conservative reuse rule, 15.18.5) the picture may
+   tear; unobserved.
+3. `last_primary_address` now names an address that is not on the screen. Readers: `same_active_identity` (direct sources
+   only, requires `already_bound`), the `SaLo` / `SaHi` diagnostics, the ring-1 DPC (stores its own). A later DIRECT
+   Venus source with the very same physical address as a kept foreign one could read `same_active_identity` true; the
+   address is a per-allocation segment address and the window is theoretical, but it is not proven impossible.
+4. The `Hollow` test is derived from the code (`submit_primary_scanout_copy` refuses what it names), not from a trace. A
+   real Venus allocation that is non-direct with a geometry and an identity stays `Venus` and keeps its failure paths: a
+   T3-style stall behind such an allocation (a plain Venus flip with `FfNoRec` and a copy that fails) is NOT fixed by
+   this, by design (Venus byte-identical). `FfNoRec` alone cannot tell the two apart; the checklist below separates them.
+5. An unpaired handle (`FkDdi`) publishes at DIRQL while the DDI still returns `STATUS_INVALID_PARAMETER`. Whether
+   dxgkrnl waits for a retire after a failed DDI is unknown; the publication is harmless if it does not.
+6. `ScUnav` has two sources. `ScanoutReject::ProducerAbandoned` (completed here when the source is non-Venus) and the HPD
+   worker's refresh arm (`ScanoutRefreshQueue::Unavailable`: a dirty edge with no bound scanout, which a `ForeignFlip` or
+   kept screen legitimately has). The second is a dropped refresh, not a flip, and has no address to publish.
+
+### 13.5 Counters
+
+New (`Fk`, at most 14 characters, `kmd_logic::flip_completion::COUNTERS`, enforced by host tests against every other
+counter name in `kmd_render`; written once a flip was completed this way, the first and every 64th at PASSIVE, the rest
+by the periodic mirror):
+
+| name | meaning |
+|---|---|
+| `FkKeep` | flips completed as a kept picture |
+| `FkWorker`, `FkDma`, `FkAsync`, `FkDdi` | by whom: the programming worker; the DMA lane at submit; the ring-1 DPC (copy failed); `SetVidPnSourceAddress` (unpaired) |
+| `FkDmaRec` | DMA Presents that wrote a keep record (the Present side of `FkDma`) |
+| `FkWhy` | the last reason: 1 NotOurs, 2 Refused, 3 GaveUp, 4 Extent, 5 Rejected, 6 PresentSkip, 7 AsyncCopyFailed, 8 Unresolved |
+| `FkKeep01` .. `FkKeep08` | per reason |
+
+### 13.6 Verified, and not
+
+Verified (host tests, `kmd_logic`): the full decision table (2 contracts x 3 sources x ForeignFlip on/off x 10 outcomes,
+unreachable rows asserted unreachable); Venus rows publish nothing new for every knob; Kept never for Venus or for a
+programming that bound; every terminal foreign dead end completes; the T3 rows; `classify` for each shape; the 100 ms
+bound (at most 250 ms); counter names (length, uniqueness, no `Fk` literal elsewhere in `kmd_render`, exact list);
+first-and-every-64th.
+Type-checked: the whole `kmd_render` against the stub harness (a build script supplies the base NT types), with the
+error set of the touched tree IDENTICAL to the base, and a probe confirming the harness reports an injected arity error in
+`create_allocation.rs` and an unknown variant in `submit_command.rs`.
+
+NOT verified: anything on hardware; the WDK build; that the stub harness's remaining errors (the display types it lacks)
+hide nothing in the functions that use those types; the DISPATCH-level claims (read, not run); the `Hollow` rule against a
+live allocation.
+
+### 13.7 Hardware checklist, in order
+
+Run the 1920x1080 low-rate case first, then larger. Read the values from the service key after the run; a counter that
+was never written is zero.
+
+1. Is a flip arriving at all? `DXGK_PRESENTFLAGS`: `Blt` = 0x1, `ColorFill` = 0x2, `Flip` = 0x4. A tester's "0x1 then
+   0x2" is Blt and ColorFill, with NO flip in it. Check explicitly: `PBflag` (sampled: the last sampled call's flags; bit
+   0x4 must appear at least once), `PBFlip` (1 = a sampled flip passed; 0xE1 / 0xE2 / 0xE4 / 0xE5 / 0xE6 are the error
+   arms), `PBMmio` (1 = the MMIO contract was met), and the unsampled census in the `scanout_trace` dump: `VpPres`
+   (Present calls), `VpBlt`, `VpFlip` (flip presents), `VpMmio`, `VpDmaF` / `VpDmaA` (DMA flips seen / armed), plus
+   `PrFgFlip` and `PrFgBlt` (skips per arm). If DWM presents only Blt and ColorFill, no flip ever exists and none of
+   this section applies.
+2. Is `SetVidPnSourceAddress` called? `SaCnt` (programming entries; also `VpSA`, sampled), `VpEnt` (DDI entries), `VpPrF`
+   (handles that paired with nothing), `VpDSt` (the worker's last status; 0 is success), `VpVsN` (VSync ticks), `SaLo` /
+   `SaHi` (the address the VSync is reporting now).
+3. What did the programming do? `ScSet` (the last programming step: 1 bound, 0xD extent, 0xE3 layout, 0xE host refused,
+   0xE1 / 0xE2 / 0xE4 the others), `CpCpy` (1 submitted, 0xE1 .. 0xE4 refused), `ScCpyErr`, `ScRetry`, `ScGaveUp`,
+   `ScBadExt`, `ScUnav`, `ScRid` (0 = a handle that did not resolve to a resource).
+4. Which knobs? `FcKnob` (ForeignCopy), `FfKnob` (ForeignFlip), `FfNoRec` and `FfRef01`..`FfRef15`, `FfWhy`, `PrFgWhy`.
+5. Is the new rule engaged? `FkKeep` > 0; split `FkWorker` / `FkDma` / `FkAsync` / `FkDdi`; `FkWhy` and `FkKeep0N` say
+   which exit. Expectations: default knobs with DWM on NVK: `FkKeep` tracks `SaCnt` and `FkWhy` is 1 (MMIO) or 6 (DMA);
+   `ForeignFlip` 1: `FkKeep` stays near zero while `FfProg` rises, and a T3-style `FfNoRec` flip is `FkKeep01`.
+6. The effect: DWM's present count (`VpPres`, `PBcall`) growing with `VpVsN` advancing and `SaCnt` following; the
+   pre-change signature is `SaCnt` stuck at 2 to 4, `ScCpyErr` rising by 4 per flip, `ScGaveUp` rising.
+7. If `FkKeep` moves and DWM still blocks, unknown 1 is the answer: dxgkrnl is not retiring on the VSync address. Then
+   compare `SaLo` / `SaHi` with the flip's address and look at the `DMA_COMPLETED` fence path (`WfDone`, `WtOut`) before
+   suspecting this rule.
+8. A Venus-only session should read `FkKeep` 0 (the `Fk*` block is written once per StartDevice as zeros, then only on
+   events). A nonzero `FkKeep` there is either an allocation `classify` called hollow (read `SaSeg`, `ScSrc`, `ScWH`,
+   `ScDir` for it), or the DIRQL unpaired-handle publication (`FkDdi`, `FkKeep08`): a stale-generation or foreign handle
+   of an otherwise ordinary Venus session can bump it. Confirm `VpPrF` (handles that paired with nothing) is 0 on a Venus
+   baseline before reading a nonzero `FkDdi` as a defect; `FkDdi` should equal the growth of `VpPrF`.
+9. `ForeignFlip` 1: `FfFlipFail` and `FfGaveUp` are the timeout's cost; with the 250 ms bound a loaded host may fail more
+   than with 1 s. A rise with `FkKeep02` (refused while failing) is the stale-picture window, expected for five seconds.
+10. Every knob mirror in the table of 13.8 is the value in force at this StartDevice, 0 included: read `FfKnob`, `FcKnob`,
+    `RmKnob`, `NvDupMode`, `DiagLvl` before trusting any block that depends on them.
+
+### 13.8 Knob read times and their mirrors (the table), and the stale-block rule
+
+Found on hardware: `FfKnob` = 1 stayed in the service key after the registry knob was set to 0 and the device restarted,
+and the whole `Ff*` block (written only once an allocation was seen) stayed frozen at a previous run's values. Two
+causes: the lazy knob readers wrote their mirror only for a NONZERO value, and event-gated counter blocks write nothing
+until their first event. Rules now: (1) a knob mirror is written on EVERY read, 0 included; (2) every cached knob is
+read again at StartDevice, so `reg add` + `pnputil /restart-device` applies a change; (3) a block that is written only
+on events is zeroed in the service key (and its statics) once per StartDevice, and the `Ff*` and `Fk*` blocks publish a
+full zero block once per generation even if nothing is ever seen.
+
+| knob | read at | cached in | mirror (value in force) |
+|---|---|---|---|
+| `DiagLevel` | StartDevice (`diag::reread_level`), lazily before | static | `DiagLvl` (new) |
+| `StopFlush` | each StopDevice | not cached | none (behaviour only) |
+| `NvSpinUs` | StartDevice (`ctrl::reread_spin_knob`), lazily before | static (was: once per driver load) | `NvSpinUs` (new) |
+| `NvDupHarden` | StartDevice (`nvrm_harden::reread_mode`), lazily before | static (was: once per driver load) | `NvDupMode` (now on every read) |
+| `AllocCached`, `BindFlushMode`, `DispatchBind`, `PresentProbe`, `ForeignCopy`, `DisplayHalf`, `DirectFlipCaps`, `CrossAdaptCaps`, `BarSegFlags`, `BarSegBaseMB`, `BarSegMode`, `VidMmVramMB`, `SubSpaceWake` | AddDevice and StartDevice (`AdapterKnobs::read`, `read_at_start`) | `AdapterContext::knobs` | `AlcC`, `BndFM`, `DspBnd`, `PBPrEn`, `FcKnob`, `DspH`, `BarF`, `BarB`, `BarM` (written at every start); the others none |
+| `DmaGpuFence`, `PresentWmk`, `WddmHoldMs`, `WddmHeadMs` | transport init (`VirtioGpu::init`, every StartDevice) | `VirtioGpu` fields / statics | `DmaGfEff`, `PrWmkEff`, `WdHoldEff`, `WdHeadEff` (new) |
+| `FlGSyncMs` | transport init (`flush_trace::init_from_registry`) | static | `FlGSyncEff` (now written at every init; before, only once a flush-gate Render was seen) |
+| `MsiVectors` | transport init (MSI plan) | local | `MsiVec` |
+| `VsyncRateMhz` | StartDevice | static | `VsRate` |
+| `OutputTech` | each child-capabilities query | not cached | `OutTech` |
+| `FlipCapsX`, `FlipQueueN` | each QueryAdapterInfo caps query | not cached | `FlipCapV`, `FlipQueV` |
+| `KmdRmClient` | StartDevice, after `retire_transport` (`rm_client::reread_knob_at_start`); `forget` resets it per transport | static | `RmKnob` (now on every read, 0 included) |
+| `KmdRmSysCache` | each level 5 primary bring-up | state | `RmSysCache` (level 5 counter block) |
+| `KmdRmSysPollMs` | lazily at level 5, per transport generation (`forget` resets it) | static | `RmSysPollMs` (now on every read, 0 included) |
+| `ForeignFlip` | StartDevice, after `retire_transport` (via `foreign_flip::publish_counters`), lazily otherwise; `forget` resets it | static | `FfKnob` (now on every read, 0 included) |
+| `FlipWdogMs`, `DeferBudget` | each StartDevice (`stall_diag::reread_knobs`, from `reread_cached_knobs`) | statics | `FlWdMsEff`, `DefBudEff` (clamped value in force, 0 included; section 14) |
+
+Event-gated counter blocks, and what resets them: `Ff*` (`foreign_flip::forget` zeroes the counters at every
+`retire_transport`, the block is published once as zeros, then on events), `Fk*` (`flip_keep::reset_for_start`, same),
+`PrFg*` / `PrUnres*` / `PrColFill` (`present_foreign::reset_for_start`), `ShPh*` and `CrPrivSmall` / `CrApInvalid`
+(`shared_placeholder::reset_for_start`). Not changed, and still event-gated, so a value in the service key may predate
+this boot until its first event: the `Rm*` presenter and level 5 blocks (`RmKnob` itself is now fresh), `Fc*`
+(`FcKnob` is fresh), `FlG*`. The `Nv*`, `Vs*` and `Sa*` counters are written by the periodic mirror without a gate.
+`reset_fault_counters` already zeroes the fault set at StartDevice.
+The stall-diagnosis block (`HpdLoop*`, `HpdSite*`, `ScLk*`, `Flip*`, `VsPend*`, `StartN`, `StartT`, `FlipWd*`, `FkDefBud`,
+`FkVenus`; section 14) is zeroed and written once at every StartDevice (`stall_diag::start_generation`, from
+`start_generation_mirrors`; `StartN` itself counts generations, so it is bumped, not zeroed).
+
+## 14. Stall diagnosis and the opt-in flip watchdog (v322)
+
+Built, host-tested for its pure half (`kmd_logic/src/stall_diag.rs`), type-checked against the stub harness, compiled by
+nothing that links the WDK, run by nothing. Branch `kmd/stall-watchdog`. Every knob defaults to today's behaviour; with
+the knobs at their defaults the only changes are new passive registry counters and a few relaxed atomic stores.
+
+### 14.1 Why
+
+A tester saw an unexplained desktop stall: the Venus DWM stopped presenting after a user NVK scan-out app exited. No TDR,
+no crash, and the counters could not name a cause: the registry mirrors are event gated and survive restarts, and the
+`Vp*` dump only runs on every 128th HPD worker wake, so a stuck worker shows a STALE dump. A read-only trace of the code
+left three candidates:
+
+1. The HPD worker, or the Venus programming, blocked inside the KMD. `retire_scanout_allocation_locked` holds the scanout
+   mutex across `ctrl_fifo_barrier` and `set_scanout_blob` (each up to `SYNC_ROUNDTRIP_TIMEOUT_MS` = 30 s), and
+   `with_scanout_lifecycle` waits on that mutex forever (`adapter/locks.rs`). Or a Deferred programming
+   (`apply_deferred_vidpn_source_address_locked`) re-arming itself with no budget: the vsync DPC wakes the worker every
+   tick while `pending_vidpn_allocation` is nonzero.
+2. A Venus flip whose completion is withheld: `flip_completion::decide` deliberately answers `None` for a Venus source
+   except `Programmed`, including `GaveUp`, `Rejected`, `AsyncCopyFailed`; a `GaveUp` drops the gate without publishing.
+3. A host or UMD ring wait the KMD cannot see.
+
+This section is the instrument that tells them apart, and two default-off valves.
+
+### 14.2 What is built
+
+Counters written by `ddi/stall_diag.rs` (at most 14 characters; the list is `kmd_logic::stall_diag::COUNTERS`, enforced by
+a host test that also scans every `b"..."` literal of `kmd_render` and every quoted name of `kmd_logic` for collisions and
+for truncation onto one of these). Times are interrupt time in milliseconds (wraps at 2^32; subtract with wrapping
+arithmetic), the clock of `VpDmpT`, `VpVsT` and `VsCntT`.
+
+| name | meaning |
+|---|---|
+| `StallT` | the time this block was last written: the "now" of every age below. A `StallT` that does not move between two reads means NOBODY is writing the block (see below) |
+| `HpdLoopN`, `HpdLoopT` | HPD worker loops (wakes) and the time of the last wake |
+| `HpdSite`, `HpdSiteT` | the step the worker is in or last entered (ids below) and the time it entered it. Age in the step = `StallT - HpdSiteT`. The pair is two stores: a reader may see the id of one step with the time of the next |
+| `ScLkN`, `ScLkRelN`, `ScLkAcqT`, `ScLkRelT` | acquisitions and releases of the scanout mutex, and the time of the last acquisition and of the last release. HELD NOW when `ScLkN` and `ScLkRelN` differ (counts, not the millisecond stamps: an acquire and a release in one millisecond cannot be ordered by time); its age is `StallT - ScLkAcqT`. Every holder is counted (the worker, the DDI threads, `DestroyAllocation`), which is what lets a worker that waits on the mutex be told from one that holds it |
+| `FlipIss` | flips dxgkrnl issued: each `SetVidPnSourceAddress` with an argument, each DMA flip record the submit took (a flip record or a keep record) |
+| `FlipPub`, `FlipPubT` | publications of a displayed address (`publish_displayed_primary`: bound or kept, any class, plus the ring-1 completion DPC's two direct stores) and the time of the last. A flip can publish more than once, so `FlipPub` can exceed `FlipIss` by a little; coalescing (`VpCoal`: dxgkrnl flipping faster than the worker drains, handles dropped) makes `FlipIss` exceed it. Healthy at quiescence: `FlipIss - FlipPub - VpCoal` about 0 |
+| `VsPendN`, `VsPendMax` | consecutive vsync ticks with a pending programming (`pending_vidpn_allocation != 0` or the programming gate raised; the vsync DPC maintains it with atomics only) and the longest run this generation. 0 and a small max is a quiet pipeline |
+| `StartN`, `StartT` | StartDevice generations since the image was loaded (a driver reload restarts it at 1) and the time of the last. Bumped at EVERY StartDevice: a `pnputil /restart-device` is visible as `StartN + 1` and a reset of everything below |
+| `FlipWd`, `FlipWdT`, `FlipWdBig` | watchdog publications, the time of the last, and flips it could not record (an address above 2^40, never expected) |
+| `FkDefBud`, `FkVenus` | `Fk` counters, written by `flip_keep.rs`, in neither `FkKeep` nor `FkWhy`: Deferred programmings that spent `DeferBudget` and published kept; Venus GaveUp / permanent-reject exits that published kept under `FlipWdogMs` |
+| `FlWdMsEff`, `DefBudEff` | the knobs in force (clamped, 0 included), written at every StartDevice |
+
+`HpdSite` ids (`kmd_logic::stall_diag::site`; owner-readable ABI, append only):
+
+| id | step |
+|---|---|
+| 0 | none (the worker has not run since the reset) |
+| 1 | `wait`: asleep on the wake event. Healthy, says nothing about a stall |
+| 2 | `start_wait`: the prologue wait for StartDevice to return |
+| 3 | `indicate_child`: `DxgkCbIndicateChildStatus` |
+| 4 | `drain_used`: `drain_used_and_complete` (holds `virtio_lock`) |
+| 5 | `foreign_scanout_service` |
+| 6 | `foreign_fence_service` |
+| 7 | `process_deferred_vidpn_source_address`, WAITING for the scanout mutex |
+| 16 | the same function with the scanout mutex HELD: the programming itself (`SET_SCANOUT_BLOB`, the Venus copy, a host round trip) |
+| 8 | `service_windowed_blt` |
+| 9 | `rm_client::service`: the level 5 service |
+| 10 | `foreign_flip::service` |
+| 11 | `nvrm_publish_service`: the `Nv*` mirror |
+| 12 | `dump_periodic`: the `Vp*` dump (about 120 registry writes) |
+| 13 | the one-shot Present probe (a fence wait and a host map round trip) |
+| 14 | `queue_active_scanout_refresh`, WAITING for the scanout mutex |
+| 17 | the same with the mutex HELD |
+| 18 | `process_deferred_vidpn_source_address` AFTER the mutex was released (the `VpDSt` registry write) |
+| 19 | `queue_active_scanout_refresh` AFTER the mutex was released (the pacing snapshot, about 40 registry writes) |
+| 15 | the worker is terminating |
+
+Where the numbers come from, and why they survive a stuck worker. The worker's own stores (`HpdLoopN`, `HpdSite`, ...) are
+atomics, written on entering each step (one clock read per step); nothing about them depends on the worker running
+afterwards. They are PUBLISHED from three places. `publish_nvrm_counters` (the escape-driven `Nv*` mirror) and the pacing
+snapshot (the existing periodic mirror) both run ON the worker, so a stuck worker stops them. The third does not:
+`dxgkddi_escape` calls `stall_diag::publish_from_escape`, which writes the block on the CALLER's thread (user mode calls
+an escape at PASSIVE on its own thread), but ONLY while the worker LOOKS STUCK, and at most every 500 ms. The block is
+about twenty registry writes (each opens the key by path, about half a millisecond), and the `Nv*` mirror was already
+moved off the escape path for a similar cost, so a healthy worker costs the escape one clock read, one load and the
+loads of the test, and nothing else. "Looks stuck" is `kmd_logic::stall_diag::worker_looks_stuck`: the worker has been
+in a step other than the idle wait for more than 1 s (`HpdSite` not 0, 1 or 15, age of `HpdSiteT`), or the scanout mutex
+has been held for more than 1 s (`ScLkN` != `ScLkRelN`, age of `ScLkAcqT`), or a programming is pending (slot or gate)
+and `HpdLoopT` is older than 2 s. Ages are on the wrapping 32-bit clock; a stamp ahead of now is age 0. So a stall dump
+is fresh as long as SOMETHING calls an escape (an NVK process: every NVRM message is one; a Venus submit; the tester's
+own tool) after the worker has been stuck for a second or two. If `StallT` does not move and nothing is calling an
+escape, every value is as old as `StallT`: make one call (start any Vulkan app) and read again. If `StallT` does not
+move although escapes ARE being called, the worker does not look stuck by the rules above (row 7).
+
+Where the hooks are: `HpdSite` / `HpdLoop*`: `ddi/hpd.rs` (every service and step) and `display.rs` /
+`adapter/scanout.rs` (the two mutex-held sites). Scanout mutex: `adapter/locks.rs`, `with_scanout_lifecycle`. `FlipIss`:
+the top of `dxgkddi_set_vidpn_source_address` (after the null check) and `submit_command::arm_dma_flip` (both the
+flip-record and keep-record branches). `FlipPub`: `AdapterContext::publish_displayed_primary` and the two stores of the
+ring-1 completion DPC (`virtio/gpu/mod.rs`). `VsPendN` and the watchdog: `adapter/kobj.rs::service_vsync_tick`, before the
+delivery gate (so a disabled `ControlInterrupt` does not blind it). `StartN`: `start_generation_mirrors` (zeroes the
+module, writes the zero block once, per the 13.8 rule).
+
+### 14.3 The two knobs
+
+Both are read at every StartDevice (`reg add` + `pnputil /restart-device` applies them, 13.8) and mirrored as `FlWdMsEff` /
+`DefBudEff`.
+
+`DeferBudget` (default 0 = unlimited). Caps the Deferred programming loop. A Deferred outcome is "wait for the producer
+boundary" or "the publication is busy" or "the host SET timed out": the exact handle is re-armed and the gate stays
+raised, and the vsync DPC wakes the worker again (one attempt per tick, more when completions also wake it). With a
+budget, the attempt that exceeds it (the same convention as `SCANOUT_RETRY_BUDGET`: `attempts > budget`, a different
+handle restarts the count, and ANY other outcome of the deferred wrapper forgets it: a programmed or failed primary,
+a copy queued, a superseded handle, a retryable refusal whether re-armed or given up; the count is of CONSECUTIVE Deferred
+outcomes of one handle, so a later Deferred of the same handle never continues an old count; `kmd_logic::DeferState`) does what the refusal retry's `GaveUp` does:
+releases the leases, publishes the flip's address KEPT (any class, Venus included, `FkDefBud`), and lowers the gate
+instead of re-arming. Clamped to 16..4 000 000 when nonzero; 240 is about four seconds at 60 Hz.
+
+Why the default is 0: the budget cannot be proven never to cut a working flow. A Deferred wait is legitimate for as long
+as a producer boundary takes to retire, which is a GPU time the KMD does not bound (a heavy frame, a host that is slow
+but alive). Cutting it publishes an address whose picture may still be bound a moment later, and abandons the
+retry-until-ready contract that `apply_deferred_vidpn_source_address_locked` and `program_vidpn_source` rely on (the
+`Timeout` arm: "releasing either would allow a newer SET to overtake an unknown host selection"). A budget of 240 is
+generous for a working flow, which waits one or two frames, but "generous" is not "proven". Use it on a diagnosis run, as
+the A/B that tells a Deferred livelock (the stall clears, `FkDefBud` moves) from everything else.
+
+`FlipWdogMs` (default 0 = off). Clamped to 50..60 000 when nonzero. With it set:
+
+* EVERY flip dxgkrnl issues is recorded as the newest flip, as one packed word of its number (the new `FlipIss`, 24 bits)
+  and its address: `note_flip_issued` at the top of `SetVidPnSourceAddress` and in both DMA branches of `arm_dma_flip`,
+  before the flip can be paired, raise the gate, or be completed by a direct publisher (an unpaired handle `FkDdi`, a DMA
+  keep record, `ForeignFlip`). The last DONE flip number is advanced by EVERY publication (`note_published`, from
+  `publish_displayed_primary` and the ring-1 DPC): when the published address is the newest recorded flip's, that flip is
+  done. When the pending run (`VsPendN`) has gone more than `FlipWdogMs` worth of ticks (`ticks_for_ms`, rounded up) with
+  NO publication since (every publication restarts the clock, so a stream of flips that each publish is progress however
+  long the gate stays raised), and the newest recorded flip is NEWER than the last one done (wrapping 24-bit order), it
+  publishes that flip's address with `publish_kept_primary` (one atomic store, legal at DISPATCH), counted `FlipWd` /
+  `FlipWdT`. Class independent, Venus included. So it never publishes the same flip twice, never the address of an OLDER
+  flip than one already done (a flip n stuck behind a gate while a direct publisher completes flip n+1 stays unpublished),
+  and a newer flip that is still stuck after the interval fires again; the watchdog's own publication restarts the clock.
+  A flip whose address the word cannot carry (zero, 40 bits or more) clears the word instead (`FlipWdBig`), so no older
+  address is fired for it. It does not lower the gate or touch the pending slot: the worker still owns the programming.
+* The Venus direct exits publish kept too: `GaveUp` (the refusal-retry budget) and permanent rejects of a VENUS flip in
+  the deferred wrapper, which by default complete nothing (`FkVenus`). Foreign and hollow flips are untouched (they
+  already publish kept). The inline (PASSIVE DDI) wrapper is not changed: its refusal status reaches dxgkrnl directly.
+
+The risk, plainly. A KEPT address names a picture that is NOT on the screen. dxgkrnl retires the flip on seeing it and
+issues the next one, so the compositor keeps running and the screen shows a stale picture, until a flip that does program.
+If the programming was slow and not stuck, the bind lands later and the screen catches up (a visible hitch, no damage). If
+the address model is wrong (13.4 unknown 1: dxgkrnl may not retire strictly on the address), nothing changes. It is a
+DIAGNOSTIC AND RECOVERY valve, off by default, and what it hides is the very condition it reports: read `FlipWd` and
+`FkVenus` before trusting any run that had it on. The 50 ms floor exists because a flip's programming takes a few ticks by
+design.
+
+What the watchdog does NOT cover: a flip whose gate was already lowered without a publication (the pending run is 0, so
+there is nothing to count): a Venus `AsyncCopyFailed` (the ring-1 DPC lowers the gate and stores nothing for a Venus
+source), a `Superseded` outcome that published nothing. Those read as `VsPendN` 0 with `FlipIss` ahead of `FlipPub`
+(14.5, row 2).
+
+### 14.4 What to dump during a stall
+
+Read the service key (`reg query HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`) TWICE, 10 s apart, and note the
+uptime in milliseconds at each read (`StallT` is the driver's own clock, but a tester's note of the wall clock detects a
+frozen `StallT`). A stalled system is read by what MOVES between the two reads; a value read once says little.
+
+* Clocks and freshness: `StallT`, `VpDmpT`, `VpVsT` (and `VsCntT`), `StartN`, `StartT`.
+* Pending state: `VpGate`, `VpPend`, `VpDSt` (the worker's last status, 0 = success), `VpVsEn`, `VpLpa` (and `SaLo` /
+  `SaHi`: the address the vsync reports), `SaCnt`, `VpPrgN`, `VpCoal`.
+* New: `HpdLoopN`, `HpdLoopT`, `HpdSite`, `HpdSiteT`, `ScLkN`, `ScLkRelN`, `ScLkAcqT`, `ScLkRelT`, `FlipIss`, `FlipPub`, `FlipPubT`,
+  `VsPendN`, `VsPendMax`, `FlipWd`, `FlipWdT`, `FkDefBud`, `FkVenus`, `FlWdMsEff`, `DefBudEff`.
+* Programming outcomes: `ScUnav`, `ScRetry`, `ScGaveUp`, `FkKeep`, `FkWhy`, `PrUnres`.
+* Refresh pipeline: `RfCnt`, `RfDone`, `RfFail`, `RfUnb`, `RfWait`.
+* Foreign scan-out source: `FsSupp`, `FsFDrop`, `FsPres`, `FsErr`, `FsFErr`, `FnCloseErr`.
+* Host releases and rings: `RelRecv`, `RelMatch`, `RelRTimeouts`, `RngSub`, `RngCmp`, `IrqN`, `DpcN`, `NvEvErr`.
+
+(An `RfInfl` was asked for; this tree has no counter of that name. The refresh pipeline's in-flight bit is
+`scanout_flush_inflight`, not mirrored under that name; `RfCnt`, `RfDone`, `RfFail` and `RfWait` are what the refresh arm
+writes.)
+
+### 14.5 Decision table
+
+"Moves" is between the two reads. `age(X)` is `StallT - X`. A row is a pattern, not a proof: read the counters it names
+together. If `StallT` does not move, see 14.2 (nothing is writing the block).
+
+| # | pattern | means | next |
+|---|---|---|---|
+| 1a | `HpdSite` 7 or 14 (waiting on the mutex), age growing; `ScLkN` ahead of `ScLkRelN`, `ScLkAcqT` age growing, `ScLkN` flat; `VsPendN` growing; `VpVsN` moves | hypothesis 1: ANOTHER thread holds the scanout mutex across a host round trip (`retire_scanout_allocation_locked`: `ctrl_fifo_barrier`, `set_scanout_blob`, up to 30 s each), the worker queues on it | the age is the answer: near 30 s or 60 s is the barrier / SET timeout; `NvEvErr`, `RelRTimeouts`, `RngSub - RngCmp` say whether the host is answering |
+| 1b | `HpdSite` 16 or 17 (mutex held by the worker), age growing; `ScLkN` flat; `FlipPub` flat | hypothesis 1: the worker is INSIDE the programming (a Venus copy, `SET_SCANOUT_BLOB`) waiting on the host | `IrqN` / `DpcN` flat = the host is not interrupting; moving = it answers, the wait is on a fence or producer |
+| 1c | `HpdLoopN` moves fast (about the vsync rate), `HpdSite` flickers between 1 and 16, `ScLkN` moves, `VpPrgN` moves, `VpPend` nonzero or `VsPendN` growing, `FlipPub` flat, `VpDSt` 0, `ScRetry` / `ScGaveUp` flat | hypothesis 1: a DEFERRED programming retrying forever (no budget; it has no counter of its own) | set `DeferBudget` 240: `FkDefBud` moves and the stall clears = confirmed |
+| 1d | `HpdSite` is another step (4, 5, 6, 9, 10, 11, 12, 13), age growing | the worker is stuck in that service, not in the programming | 4: `virtio_lock` / the used ring; 5, 6: `Fs*`, `FnCloseErr`; 9: `Rm*`; 10: `Ff*`; 12: the registry |
+| 2 | `HpdSite` 1 (wait), `VsPendN` 0 with `VsPendMax` small, `VpVsN` moves; `FlipIss - FlipPub - VpCoal` at least 1 and constant; `ScGaveUp` or `ScRetry` or `ScUnav` or `VpDSt` (nonzero) changed around the stall | hypothesis 2: a flip's programming gave up, the gate dropped, nothing published, dxgkrnl waits for a retire that never comes. `VpLpa` still names the old address | `FkVenus` with `FlipWdogMs` set confirms (it publishes at the GaveUp / reject exit); `ScSet`, `ScCpyErr`, `FcKnob` say why the programming failed; `FkKeep` / `FkWhy` 0 means a Venus source (`decide` answers `None`) |
+| 2b | `VsPendN` growing, `FlipPub` flat, `HpdSite` 1 (the worker is idle), `VpPend` 0, `VpGate` 1 | the gate is raised with nothing pending: a programming handed to a copy completion that never came (`CopyQueued`) or a stale gate (`ScStale`) | `FlipWdogMs` publishes at the interval: `FlipWd` moving and the stall clearing confirms; `AsDone` against `AsSub` |
+| 3 | `HpdSite` 1, `HpdLoopN` flat, `VsPendN` 0, `FlipIss - FlipPub - VpCoal` about 0, `FlipIss` flat | the KMD holds nothing: everything handed to it was published and no flip arrives. dxgkrnl has issued none, so the stall is upstream | `VpPres` / `PBcall` (Present calls) flat: DWM is not presenting, blocked in user mode or on the host (a UMD ring wait). Moving with `FlipIss` flat: blocked inside dxgkrnl (a fence: `WfDone`, `WtOut`) |
+| 3b | as 3 and `RngSub - RngCmp` growing, `IrqN` / `DpcN` flat | the host stopped answering a ring: the wait is invisible to the KMD by design | host side |
+| 4 | `VpVsN` does not move, or `VpVsEn` 0 | the vsync heartbeat is dead or its delivery gate closed: a separate failure from all of the above | `VpVsEn`, `VsMinGap`, the timer / DPC |
+| 5 | `FlipWd` moves and the compositor still blocks | `FlipWd` published, dxgkrnl did not retire on the address (13.4 unknown 1): the stall has another cause | the DMA fence path (`WfDone`, `WtOut`); do not read the knob as a fix |
+| 6 | `StartN` moved | the device restarted: every block above was zeroed; compare only values written after `StartT` | |
+| 7 | `StallT` frozen | either nothing is calling an escape and the worker's mirrors are not running, or escapes are called and the worker looks healthy to `worker_looks_stuck` (asleep in `wait`, mutex free, nothing pending, or in a step for less than a second): a block written only by the escape path stays quiet while the worker is healthy | start any Vulkan app (any NVRM message is an escape), wait two seconds and read again; a stall of a few hundred milliseconds is not visible here |
+
+### 14.6 Verified, and not
+
+Verified (host tests, `kmd_logic`): the vsync tick bookkeeping (pending run, maximum, saturation, the no-publication clock
+restarting on every publication, idle ticks resetting it); the watchdog decision (off never fires; fires after exactly the
+interval, never earlier; once per flip word; again for a newer stuck flip; a stream of publishing flips is progress; needs
+a recorded flip; idle never fires; never a flip older than one already done, across the 24-bit wrap too; a publication completes
+the newest recorded flip only when it names its address); the flip word (round trip, never 0, 40-bit limit, 24-bit sequence wrap); ticks from
+milliseconds (rounded up, never earlier, zero = off); the Deferred budget (0 unlimited, exactly `budget` attempts, a new
+handle restarts it, and an outcome in between that is not a Deferred ends the count; the clear on each non-Deferred arm
+is wiring in `display.rs`, read and type-checked, not host-run); the knob clamps; the site ids (dense, unique); the counter names (at most 14 characters, unique, no
+collision with any other literal in `kmd_render` or quoted name in `kmd_logic`, no 14-character truncation onto one, the
+writer file spells exactly the list, histogram and `Vp<hex>` ring stems excluded). Type-checked: the whole `kmd_render`
+against the stub harness, the error set IDENTICAL to the base (v321), with five injected errors (one per touched file
+group) all reported, so the touched code is checked and not skipped.
+
+NOT verified: anything on hardware; the WDK build; that dxgkrnl retires a flip on the kept address (13.4 unknown 1); the
+DISPATCH / DIRQL legality claims (read, not run: the new code is relaxed atomics and, in `publish_displayed_primary`, one
+`KeQueryInterruptTimePrecise` per publication); the cost of one clock read per HPD worker step, two per scanout lifecycle
+operation and one per publication (a scalar read, assumed small next to what each step does); the stuck test's thresholds
+(1 s, 1 s, 2 s) against real stalls (a stall that is none of its three patterns, such as a worker that loops fast and never
+publishes, looks healthy to it; `VsPendN` and `FlipIss - FlipPub` see that, and the worker's own mirrors still write); the
+cost of the 500 ms write from an escape thread while the worker looks stuck (about 20 values); that a Deferred wait never
+legitimately exceeds a budget (why it defaults to off).
+
+Risks: the kept address (14.3); `DeferBudget` abandons a programming whose host SET may still land; the watchdog and the
+direct exits only exist while the knob is set, and a run with it set is no longer a baseline.

@@ -195,6 +195,17 @@ impl AdapterContext {
         crate::ddi::scanout_trace::note_lease_primary_published();
     }
 
+    /// Complete a flip of a foreign primary that could not be shown: publish its address as a
+    /// kept picture (`ProgrammedPrimary::kept_picture`). One atomic store and nothing else: legal
+    /// at any IRQL, including the DMA flip lane's DISPATCH submit and the ring-1 completion DPC.
+    ///
+    /// Deliberately NOT `publish_bound_primary`: that one also feeds the lease census
+    /// (`LsPub`), and nothing was bound here. The caller decides through
+    /// `helios_kmd_logic::flip_completion::decide` and counts through `ddi::flip_keep`.
+    pub(crate) fn publish_kept_primary(&self, address: u64) {
+        self.publish_displayed_primary(super::ProgrammedPrimary::kept_picture(address));
+    }
+
     /// Mark already-completed scanout contents dirty. The normal copied path
     /// does this from the ring-1 GPU-completion DPC; the direct-primary
     /// zero-copy case has no KMD GPU submission, so SetVidPn uses this after
@@ -637,8 +648,13 @@ impl AdapterContext {
         passive: PassiveLevel,
     ) -> ScanoutRefreshQueue {
         let outcome = self.with_scanout_lifecycle(passive, |lock| {
+            // Stall breadcrumb: the HPD worker (the only caller) holds the scanout mutex now.
+            crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::REFRESH_LOCKED);
             self.queue_active_scanout_refresh_locked(lock)
         });
+        // The mutex is free again: the pacing snapshot below must not run under a site that
+        // says it is held.
+        crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::REFRESH_POST);
         // R318: the pacing snapshot runs OUTSIDE `scanout_mutex`. It used to run
         // inside it — 32 synchronous registry transactions every 16 queued
         // refreshes, roughly 3.75 bursts per second at 60 Hz, on the PASSIVE
@@ -681,6 +697,8 @@ impl AdapterContext {
             return;
         }
 
+        // The stall-diagnosis block rides the same periodic mirror (`ddi::stall_diag`).
+        crate::ddi::stall_diag::publish_counters();
         crate::diag::record_named_bytes(b"RfRid", resource_id);
         crate::diag::record_named_bytes(b"RfWH", (width << 16) | (height & 0xFFFF));
         crate::diag::record_named_bytes(b"RfCnt", n);
@@ -704,6 +722,7 @@ impl AdapterContext {
         );
 
         crate::diag::record_named_bytes(b"VsCnt", self.vsync_count.load(Ordering::Relaxed));
+        crate::diag::record_named_bytes(b"VsCntT", self.vsync_last_ms());
         crate::diag::record_named_bytes(b"VsEn", self.vsync_enabled.load(Ordering::Relaxed));
         crate::diag::record_named_bytes(
             b"SaCnt",
@@ -1223,6 +1242,9 @@ impl AdapterContext {
         if resource_id == 0 {
             return true;
         }
+        // `ForeignFlip`: a shown foreign allocation that is destroyed stops being the source
+        // before its importer can close the GEM (one load when it shows nothing).
+        crate::virtio::foreign_flip::target_gone(self, resource_id);
         // Freeze the DISPATCH bind producer before resolving the final host
         // selection. The PASSIVE worker is already excluded by `scanout_mutex`.
         // Any SET issued before this point is ahead of the pure-query FIFO

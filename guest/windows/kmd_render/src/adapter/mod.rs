@@ -662,6 +662,21 @@ pub struct AdapterContext {
     committed_refresh_mhz: AtomicU32,
     /// Count of CRTC_VSYNC interrupts synthesized this boot (diag `ScVs`).
     pub vsync_count: AtomicU32,
+    /// Interrupt time (100 ns units) of the tick that last advanced
+    /// `vsync_count`; 0 before the first. Published as milliseconds beside every
+    /// mirror of the count (`ScVsT`, `VpVsT`, `VsCntT`), because a count with no
+    /// time cannot be turned into a rate. See `kmd_logic::vsync_rate`.
+    pub vsync_last_100ns: AtomicU64,
+    /// Interrupt time of the previous timer tick, for the gap statistics; 0 =
+    /// none yet, which is how the first tick after an arm is ignored (arm and
+    /// disarm both store 0).
+    pub vsync_gap_prev_100ns: AtomicU64,
+    /// Smallest gap between two consecutive ticks seen this boot (100 ns
+    /// units); `u64::MAX` = none measured (diag `VsMinGap`).
+    pub vsync_min_gap_100ns: AtomicU64,
+    /// Ticks that came closer than half a period to the previous one this boot
+    /// (diag `VsFast`). 0 on a healthy heartbeat.
+    pub vsync_fast: AtomicU32,
     /// Physical address of the last primary actually programmed for display,
     /// reported in each CRTC_VSYNC packet so dxgkrnl can retire the matching
     /// queued flip (viogpu3d `m_sourceAddress`). Direct scanout publishes only
@@ -1057,6 +1072,29 @@ impl ProgrammedPrimary {
     pub(crate) fn after_scanout_bind(address: u64) -> Self {
         Self { address }
     }
+
+    /// Complete a flip of a FOREIGN or HOLLOW primary the KMD could not show: publish its address
+    /// WITHOUT claiming the screen shows its content. The screen keeps the previous picture.
+    ///
+    /// WHY THIS IS LEGAL. `last_primary_address` is not a claim about pixels, it is the word
+    /// `DXGK_INTERRUPT_CRTC_VSYNC` carries so dxgkrnl can retire the queued flip whose new
+    /// `PhysicalAddress` it matches (the driver's model, `viogpu3d`'s `m_sourceAddress`; whether
+    /// dxgkrnl is strictly address-driven has never been observed, see
+    /// `docs/zero-copy-present.md`, "Flip completion invariant for foreign primaries"). The KMD
+    /// OWNS flip completion toward dxgkrnl; whether the picture was displayed is a separate
+    /// question with its own counters (`ScCpyErr`, `FkKeep`, `FfRef*`). Leaving the address on the
+    /// previous primary instead does not keep the screen honest, it holds the flip until dxgkrnl
+    /// stops issuing source addresses and the compositor blocks after a couple of presents.
+    ///
+    /// ONLY for a foreign or hollow allocation (`flip_completion::classify`): a Venus allocation
+    /// that fails to program keeps the old address exactly as before
+    /// (`helios_kmd_logic::flip_completion::decide` never answers `Kept` for one), and every call
+    /// site goes through that decision. Named differently from
+    /// [`Self::after_scanout_bind`] on purpose, so the two cannot be confused and a grep for
+    /// `kept_picture` finds every place a flip is completed without a bind.
+    pub(crate) fn kept_picture(address: u64) -> Self {
+        Self { address }
+    }
 }
 
 impl Drop for ProgrammingInterval<'_> {
@@ -1195,6 +1233,10 @@ impl AdapterContext {
             vsync_enabled: AtomicU32::new(0),
             committed_refresh_mhz: AtomicU32::new(0),
             vsync_count: AtomicU32::new(0),
+            vsync_last_100ns: AtomicU64::new(0),
+            vsync_gap_prev_100ns: AtomicU64::new(0),
+            vsync_min_gap_100ns: AtomicU64::new(u64::MAX),
+            vsync_fast: AtomicU32::new(0),
             last_primary_address: AtomicU64::new(0),
             active_scanout_resource: AtomicU32::new(0),
             active_scanout_wh: AtomicU64::new(0),
@@ -1506,8 +1548,9 @@ impl AdapterContext {
         &self,
         primary_address: u64,
         ticket: ProgrammingTicket,
+        keep_on_failure: bool,
     ) -> crate::virtio::ScanoutNotify {
-        crate::virtio::ScanoutNotify::for_adapter(self, primary_address, ticket)
+        crate::virtio::ScanoutNotify::for_adapter(self, primary_address, ticket, keep_on_failure)
     }
 
     /// Publish the address the CRTC_VSYNC packet reports as the display
@@ -1523,6 +1566,9 @@ impl AdapterContext {
     pub(crate) fn publish_displayed_primary(&self, primary: ProgrammedPrimary) {
         self.last_primary_address
             .store(primary.address, Ordering::Release);
+        // `FlipPub` / `FlipPubT` (`ddi::stall_diag`): every publication, bound or kept, any
+        // class. Atomics only, as this is reached from DIRQL and DISPATCH too.
+        crate::ddi::stall_diag::note_published(primary.address);
     }
 
     /// The state StartDevice established, or `None` before it ran.

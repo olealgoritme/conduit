@@ -194,6 +194,40 @@ fn stop_credit(
     budget.credit(crate::adapter::foreign_scanout::now_100ns().saturating_sub(from_100ns))
 }
 
+/// Knobs cached in statics that outlive a `pnputil /restart-device` (the image is not reloaded),
+/// read again at EVERY StartDevice and mirrored in the service key with the value in force, 0
+/// included: `DiagLevel` (`DiagLvl`), `NvDupHarden` (`NvDupMode`), `NvSpinUs`. The per-transport
+/// knobs (`ForeignFlip`, `KmdRmClient`, `KmdRmSysPollMs`) are reset by `retire_transport` and
+/// re-read by [`start_generation_mirrors`]; the rest are read by `AdapterKnobs::read_at_start`
+/// or at transport init. The table: `docs/zero-copy-present.md` section 13.8. PASSIVE.
+#[inline(never)]
+fn reread_cached_knobs() {
+    let _ = crate::diag::reread_level();
+    let _ = crate::virtio::nvrm_harden::reread_mode();
+    let _ = crate::virtio::ctrl::reread_spin_knob();
+    // `FlipWdogMs` and `DeferBudget` (`FlWdMsEff`, `DefBudEff`): 0 = off, today's behaviour.
+    crate::ddi::stall_diag::reread_knobs();
+}
+
+/// After the previous transport's state was forgotten (`retire_transport`): the new generation's
+/// per-transport knobs are read and mirrored now, and the event-gated counter blocks are zeroed
+/// in the service key (and in their statics), so a value an earlier run left there is never read
+/// as this generation's. PASSIVE.
+#[inline(never)]
+fn start_generation_mirrors() {
+    let _ = crate::virtio::rm_client::reread_knob_at_start();
+    crate::ddi::flip_keep::reset_for_start();
+    crate::ddi::present_foreign::reset_for_start();
+    crate::ddi::shared_placeholder::reset_for_start();
+    // `foreign_flip::forget` zeroed its counters and owes the block; this writes it (reading and
+    // mirroring `FfKnob` first), as does the `Fk*` block.
+    crate::virtio::foreign_flip::publish_counters();
+    crate::ddi::flip_keep::publish_counters();
+    // The stall-diagnosis block (`HpdLoopN`, `FlipIss`, `VsPendN`, ...): zeroed, `StartN` bumped,
+    // written once. After the worker of the previous generation was stopped.
+    crate::ddi::stall_diag::start_generation();
+}
+
 /// Flush the service key (when `flush`) so the stage just recorded survives a
 /// bugcheck, and credit the flush time back to the budget.
 fn stop_flush(
@@ -261,6 +295,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // restart` re-runs this without a reboot), together with the breadcrumbs that
     // mirror them. The descriptor writers and the caps path take this value, so
     // none of them can reach the registry themselves. See `AdapterKnobs`.
+    reread_cached_knobs();
     let mut knobs = crate::adapter::AdapterKnobs::read_at_start();
 
     // Registry values persist across boots, so a stale nonzero fault counter is
@@ -339,6 +374,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             crate::adapter::foreign_scanout::now_100ns(),
         ),
     );
+    start_generation_mirrors();
     // Whatever the previous generation recorded against its resource ids (system
     // backing leases, "system copy invalid" marks) is meaningless now: ids restart
     // at 1 and would name different resources.

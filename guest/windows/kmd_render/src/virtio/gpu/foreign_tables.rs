@@ -299,9 +299,37 @@ impl VirtioGpu {
         self.foreign.sysmem_source(resource_id)
     }
 
+    /// What the KMD's foreign flip decides on for `resource_id`'s record (importer, DRM
+    /// file and GEM, layout, life), or `None` for an id with no record.
+    pub fn foreign_flip_record(&self, resource_id: u32) -> Option<fr::FlipRecord> {
+        self.foreign.flip_record(resource_id)
+    }
+
+    /// `owner` closed DRM file `rm_handle`: poison the records it made from it (their
+    /// `(rm_handle, gem)` is never flipped again). Returns how many.
+    pub fn foreign_file_closed(&mut self, owner: DeviceOwner, rm_handle: u32) -> usize {
+        self.foreign.file_closed(owner.raw() as u64, rm_handle)
+    }
+
+    /// `owner`'s device is gone: poison every record it made.
+    pub fn foreign_owner_closed(&mut self, owner: DeviceOwner) -> usize {
+        self.foreign.owner_closed(owner.raw() as u64)
+    }
+
     /// Count a request refused before it reached any table.
     pub fn foreign_note_refusal(&mut self, kind: RefusalKind) {
         self.foreign.note_refusal(kind);
+    }
+
+    /// Count an `IMPORT_RM` request `validate_request` refused: a bad request, and which
+    /// shared-format reason (`ForeignTable::note_request_refusal`). `layout` is the decoded
+    /// layout the request carried, if any.
+    pub fn foreign_note_request_refusal(
+        &mut self,
+        why: fr::RequestError,
+        layout: Option<&fr::Layout>,
+    ) {
+        self.foreign.note_request_refusal(why, layout);
     }
 
     /// Limits, occupancy and counters; `owner` is the caller, whose own count

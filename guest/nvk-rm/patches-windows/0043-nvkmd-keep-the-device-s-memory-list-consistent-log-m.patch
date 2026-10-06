@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 10:56:10 +0200
+Subject: [PATCH] nvkmd: keep the device's memory list consistent; log misuse
+ with a stack
+
+An NVK process using the Helios hand-off ledger crashed at exit in
+nvkmd_mem_unref's list_del (vkDestroyCommandPool from DXVK's device
+teardown): the memory object and its prev were intact, but its next and the
+list head's prev pointed into freed, decommitted heap. Memory objects
+allocated after it had been freed while still on dev->mems (or added
+twice), and the next unlink near them faulted. Page heap hides it, so the
+free is not caught in the act there.
+
+- nvkmd_dev_alloc_mapped_mem's map-failure path freed the object with
+  ops->free although it was already on the list; it unrefs it now.
+- Adding an object that is already on the list, or removing one that is not,
+  no longer corrupts the list.
+- The RM backend's free checks that the object is off the list; if not, it
+  logs and unlinks it first.
+- Each misuse is logged once (up to 16) with the caller's stack as
+  module+offset, so the path that frees a listed object shows up in a normal
+  run.
+---
+ src/nouveau/vulkan/nvkmd/nvkmd.c           | 72 +++++++++++++++++++++-
+ src/nouveau/vulkan/nvkmd/nvkmd.h           |  5 ++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c |  2 +
+ 3 files changed, 76 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.c b/src/nouveau/vulkan/nvkmd/nvkmd.c
+index 0c3abca..7633714 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.c
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.c
+@@ -12,16 +12,71 @@
+ #endif
+ #include "nv_push.h"
+ #include "util/cache_ops.h"
++#include "util/log.h"
++#include "util/u_atomic.h"
+ #include "util/u_math.h"
+ 
+ #include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
++/* nvkmd_dev::mems misuse: a memory object added twice, removed while not on
++ * the list, or freed while still on it.  Each of these corrupts the list and
++ * shows up much later as a crash in an unrelated list_del (an NVK exit crash
++ * under the Helios hand-off ledger did), so it is logged where it happens,
++ * with the stack as module+offset, and the list is left consistent.
++ */
++static void
++nvkmd_mem_list_misuse(const struct nvkmd_mem *mem, const char *what)
++{
++   static uint32_t reports;
++   if (p_atomic_inc_return(&reports) > 16)
++      return;
++
++   char frames[512] = "";
++#ifdef _WIN32
++   void *stack[12];
++   const USHORT n = RtlCaptureStackBackTrace(1, 12, stack, NULL);
++   size_t len = 0;
++   for (USHORT i = 0; i < n && len < sizeof(frames) - 48; i++) {
++      HMODULE module = NULL;
++      char name[MAX_PATH] = "?";
++      if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                             (LPCSTR)stack[i], &module)) {
++         char path[MAX_PATH];
++         if (GetModuleFileNameA(module, path, sizeof(path))) {
++            const char *base = strrchr(path, '\\');
++            snprintf(name, sizeof(name), "%s", base ? base + 1 : path);
++         }
++      }
++      len += snprintf(frames + len, sizeof(frames) - len, " %s+0x%" PRIxPTR,
++                      name, (uintptr_t)stack[i] - (uintptr_t)module);
++   }
++#endif
++   mesa_loge("NVK: memory object %p (%" PRIu64 " B, flags 0x%x) %s; "
++             "stack:%s", (void *)mem, mem->size_B, mem->flags, what, frames);
++}
++
++static inline bool
++nvkmd_mem_on_list(const struct nvkmd_mem *mem)
++{
++   return mem->link.next != NULL;
++}
+ 
+ static void
+ nvkmd_dev_add_mem(struct nvkmd_dev *dev,
+                   struct nvkmd_mem *mem)
+ {
+    simple_mtx_lock(&dev->mems_mutex);
+-   list_addtail(&mem->link, &dev->mems);
++   if (nvkmd_mem_on_list(mem))
++      nvkmd_mem_list_misuse(mem, "added to the device's memory list twice");
++   else
++      list_addtail(&mem->link, &dev->mems);
+    simple_mtx_unlock(&dev->mems_mutex);
+ }
+ 
+@@ -37,10 +92,20 @@ nvkmd_dev_remove_mem(struct nvkmd_dev *dev,
+                      struct nvkmd_mem *mem)
+ {
+    simple_mtx_lock(&dev->mems_mutex);
+-   list_del(&mem->link);
++   if (nvkmd_mem_on_list(mem))
++      list_del(&mem->link); /* leaves the link NULL */
+    simple_mtx_unlock(&dev->mems_mutex);
+ }
+ 
++void
++nvkmd_mem_check_unlinked(struct nvkmd_mem *mem)
++{
++   if (likely(!nvkmd_mem_on_list(mem)))
++      return;
++   nvkmd_mem_list_misuse(mem, "freed while on the device's memory list");
++   nvkmd_dev_remove_mem(mem->dev, mem);
++}
++
+ static struct nvkmd_mem *
+ nvkmd_dev_lookup_mem_by_va_locked(struct nvkmd_dev *dev,
+                                   uint64_t addr,
+@@ -173,7 +238,8 @@ nvkmd_dev_alloc_mapped_mem(struct nvkmd_dev *dev,
+    assert(!(map_flags & NVKMD_MEM_MAP_FIXED));
+    result = nvkmd_mem_map(mem, log_obj, map_flags, NULL, NULL);
+    if (result != VK_SUCCESS) {
+-      mem->ops->free(mem);
++      /* It is on the device's memory list: unlink it with the unref */
++      nvkmd_mem_unref(mem);
+       return result;
+    }
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
+index 654aaeb..fdd4352 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+@@ -502,6 +502,11 @@ nvkmd_dev_import_dma_buf(struct nvkmd_dev *dev,
+  * backend's Helios resource import): put it on the device's memory list,
+  * which nvkmd_mem_unref() takes it off again.
+  */
++/* Called by a backend's mem free: logs and unlinks an object still on its
++ * device's memory list (it must not be).
++ */
++void nvkmd_mem_check_unlinked(struct nvkmd_mem *mem);
++
+ void
+ nvkmd_dev_track_imported_mem(struct nvkmd_dev *dev,
+                              struct nvkmd_mem *mem);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 7057745..b4deb02 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -455,6 +455,8 @@ nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
+    struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
+    struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
+ 
++   nvkmd_mem_check_unlinked(_mem);
++
+    /* The GPU mapping has to go before the memory object */
+    nvkmd_va_free(mem->base.va);
+ 
+-- 
+2.43.0
+

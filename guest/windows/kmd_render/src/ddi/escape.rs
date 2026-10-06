@@ -347,6 +347,12 @@ pub unsafe extern "C" fn dxgkddi_escape(
     // deadlock rather than a new one. Counted by `IrqlBad` if that ever changes.
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
 
+    // The stall-diagnosis block (`ddi::stall_diag`), on THIS thread, only while the HPD worker
+    // looks stuck and at most twice a second: every other mirror runs on the worker (the `Nv*`
+    // mirror an escape asks for included), so a stuck worker leaves them stale. A healthy worker
+    // costs one clock read and a few loads, and no registry write.
+    crate::ddi::stall_diag::publish_from_escape(adapter);
+
     match hdr.cmd_type {
         HELIOS_ESCAPE_SNAPSHOT_STATUS => {
             let status = escape_snapshot_status(passive, adapter, buf, &hdr, args.hDevice, args.hContext);
@@ -1838,6 +1844,12 @@ fn nvrm_shape_and_calls() -> (u32, u32) {
         &n::NVRM_EV_UNREGS,
         &n::NVRM_FENCES,
         &n::NVRM_FENCES_CLOSED,
+        &crate::virtio::nvrm_harden::NVRM_CLIENTS_RECORDED,
+        &crate::virtio::nvrm_harden::NVRM_CLIENTS_FULL,
+        &crate::virtio::nvrm_harden::NVRM_DUP_DENIED,
+        // Log-only runs (the default) refuse nothing: their evidence is these two.
+        &crate::virtio::nvrm_harden::NVRM_DUP_WOULD,
+        &crate::virtio::nvrm_harden::NVRM_DUP_DOUBT,
     ]
     .iter()
         .fold(0u32, |a, c| a.wrapping_mul(31).wrapping_add(c.load(Ordering::Relaxed)));
