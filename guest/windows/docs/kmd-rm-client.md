@@ -95,7 +95,10 @@ here it is also the client on the other end.
 * **Quotas.** Per-owner limits (128 handles, 256 mappings, 256 pins) apply to this owner alone;
   the client holds at most five handles (control, GPU channel, DRM node, plus one export file
   and one map channel at a time; at level 3 a map channel stays open per ring slot, so up to six)
-  and no pins and no tracked mappings. The 1024 global handle
+  and no pins and no tracked mappings. Fences the KMD took over for fenced presents
+  (`rm-fence-marker.md`) are re-tagged to this same owner but counted apart, against
+  `MAX_NVRM_ATTACHED_FENCES` (512, KMD-wide), and are excluded from the owner's 128 count, so
+  neither budget can starve the other (13.12). The 1024 global handle
   slots are shared: a process that fills them makes the client's `Open` fail
   (`Refusal::NoResources`, counted in `NvRef`), which kills the client for the generation and
   leaves Venus in charge. `QUERY_CAPS` is unchanged.
@@ -108,8 +111,9 @@ here it is also the client on the other end.
 * **`Nv*` counters.** The client goes through `forward`, so its `Open`/`Close`/`Ioctl`s are
   counted in `NvOpen`/`NvClose`/`NvIoctl` like anyone's. With the client up, `NvOpen - NvClose`
   is 3 more than the user-mode handles (control, GPU, DRM); teardown closes are not counted
-  (existing rule), so after a stop `NvOpen - NvClose` stays 3 too. `NvPin`, `NvMap`, events and
-  fences are never touched (no pins, no `push_nvrm_map`, no events).
+  (existing rule), so after a stop `NvOpen - NvClose` stays 3 too. `NvPin`, `NvMap` and events are
+  never touched (no pins, no `push_nvrm_map`, no events), and the client never creates, attaches or
+  closes a fence: the ones owned by `KMD_RM` are the fenced presents' (counted by the fence counters of `rm-fence-marker.md`).
 * **`Rm*` counters** (REG_DWORD, mirrored by `rm_client::publish_counters` from
   `publish_nvrm_counters`; written only once the client has run, so a knob-off driver writes
   none of them):
@@ -274,9 +278,16 @@ Consequences, stated so nobody finds them by surprise:
 * **Bounded at StopDevice.** `stop_hpd` joins the worker for 5 s, twice, and leaks the worker and
   the adapter if it does not exit. So a client caught mid-bring-up (knob on) must not hold it: each
   message is bounded by `TIMEOUT_MS` = 2.5 s (was 10 s), the step loop checks `hpd_stop` before every
-  step, and `cleanup` checks it before every `Close` and stops sending after the first transport
-  failure. What was not closed stays in the NVRM tables under `KMD_RM`, and the sweep closes it
-  (or drops it when the host is gone).
+  step, and `cleanup` checks it before the blob release and before every `Close` and stops sending
+  after the first transport failure. **Every call inside a step is bounded too**, not only the
+  forwarded messages: the level 4 import and release (`rm_foreign`) share one `TIMEOUT_MS` budget
+  across all their host commands (`alloc_blob_errno_within`, `release_blob_for_owner_within`,
+  a `SweepBudget`), `release_all` is the same budget, the host `Mmap` and its undo take `TIMEOUT_MS`
+  (`host_mmap_within`, `release_host_map_within`), and the presenter's source map and flip take 1 s
+  each. Before this merge those were 30 s calls (the control queue's ordinary synchronous bound).
+  What was not closed stays in the NVRM tables under `KMD_RM`, and the sweep closes it (or drops it
+  when the host is gone); a KMD-owned blob not released because the worker was stopping is reclaimed
+  by the context destroy and the device reset that follow in StopDevice.
 * **Frames.** `service`, `retire_begin`, `forget` (which builds a `Client` by value) and `unmap_view`
   are `#[inline(never)]`, so they add nothing to the frames of `retire_transport`,
   `close_all_on_host`, `dxgkddi_start_device` or the worker.
@@ -523,10 +534,13 @@ the existing segment**, and a WDDM allocation backed by one would have no usable
 ## 13. Slice 2 as built: the source priority stack, the ring and the presenter (`KmdRmClient` = 3)
 
 Pure logic: `kmd_logic/src/foreign_scanout.rs` (resident source), `rm_client.rs` (ring slots),
-`rm_present.rs` (source eligibility, copy plan, ring, presenter); 568 host tests in the crate (about 70 of them this slice's), including a co-simulation of the presenter against the real arbiter. I/O:
+`rm_present.rs` (source eligibility, copy plan, ring, presenter); 620 host tests in the crate, including co-simulations of the presenter against the real arbiter (alone, and with the fenced-present queue of `rm-fence-marker.md`: 13.12). I/O:
 `kmd_render/src/virtio/rm_present.rs` and the hooks in `adapter/foreign_scanout.rs` and
-`virtio/rm_client.rs`. The I/O half was type-checked against a shim of the signatures it calls and
-read by hand, as slice 1 was; **it has not been built**.
+`virtio/rm_client.rs`. The I/O half (and the `ctrl.rs` / `nvrm.rs` functions it calls that this slice
+changed) was type-checked against a harness generated from the REAL module declarations and
+signatures of `kmd_render` (module visibility is taken from the real `mod` lines, never typed by
+hand: an earlier shim declared a private module `pub` and hid a privacy error) and read by hand;
+**it has not been built**.
 
 ### 13.1 What level 3 is, and is not
 
@@ -590,20 +604,25 @@ front surface unchanged.
   wins). The first frame after a registration is always owed. A flip that finds the source yielded
   (a user source took scanout 0 in between) is not a failure; three failures of any kind in a row,
   with no shown frame between, give up for the transport generation: the resident source is withdrawn.
+  After a failure (a refused registration, a copy or flip that failed) the presenter itself waits
+  100 ms before the next attempt (`WaitUntil`), so the three strikes are never spent in one pass.
 * **A frame**: `lease_slot` (under `CLIENT`'s lock: the epoch, the ring whole, the slot's view and
-  GEM copied out, `VIEW_LEASED` set), `map_blob_prepare` + `MmMapIoSpace` of the primary's blob with
+  GEM copied out, `VIEW_LEASED` set), `map_blob_prepare_within` (1 s in all, none started once the
+  worker is stopping; a mapped blob needs no round trip) + `MmMapIoSpace` of the primary's blob with
   the host's `MAP_INFO` cache type, `CopyPlan` (every bound of both mappings proven once), a row
   loop of `_mm_loadu_si128` loads and `_mm_stream_si128` stores (a 16-byte aligned destination: the
   pitch is a multiple of 256 and the view starts on a page), `sfence`, unmap, `end_lease`, then
-  `present_within` (the same `ScanoutFlip` path user mode uses, with a **1 s** bound instead of 5 s
-  because the HPD worker flips every frame and StopDevice joins it).
+  `present_within` (the same mint and `ScanoutFlip` as user mode's `present`, with a **1 s** bound
+  instead of 5 s because the HPD worker flips every frame and StopDevice joins it; it sends direct and
+  never queues behind fenced presents, 13.12).
 * **Source eligibility** (`source_layout`, from one coherent read of `active_scanout_resource` and the
   `primary_scanout_*` seqlock): something is bound and published, it is the same resource, the extent
   is the ring's, the pitch holds a row, the rows fit the published allocation size.
 * **Order in the worker pass**: `rm_client::service` runs after the deferred VidPn programming and
   before the scanout refresh arm, and calls the presenter **twice**: before the client's steps (so a
   ring about to be torn down is withdrawn from scanout before `GemClose` runs under it) and after
-  them (so a ring completed this pass is used in it). A bind to a direct resource in this very pass
+  them (so a ring completed this pass is used in it); the second call is skipped while a wake the
+  first one asked for (a paced frame, the pause after a failure) is still in the future. A bind to a direct resource in this very pass
   is seen before the refresh arm, so its flush is not withheld.
 
 ### 13.4 Failure and fallback
@@ -612,13 +631,14 @@ front surface unchanged.
 |---|---|---|---|
 | bring-up, surface, any slot's surface path | as slice 1 (section 7) | client dead for the generation, every slot's files closed | Venus |
 | a slot's view (map channel, `RM_MAP_MEMORY`, host `Mmap`, `MmMapIoSpace`) | any | that slot unwound, ring not presentable, client lives | Venus (nothing is registered) |
-| registration refused | arbiter | counted as a failure | Venus |
+| registration refused | arbiter | counted as a failure; the next attempt waits 100 ms | Venus |
 | source not eligible (`RmSrcWhy`) | a UMD image bound, wrong extent, bad pitch | resident source withdrawn / never registered | Venus |
 | source blob cannot be mapped / planned | map or plan failure | the frame is skipped (`RmSrcBad`), counts as a failure | after three, Venus |
-| flip refused or timed out (1 s) | host / transport | the frame is skipped (`RmFlipFail`), counts as a failure | after three, Venus |
+| flip refused or timed out (1 s) | host / transport | the frame is skipped (`RmFlipFail`), counts as a failure; the next attempt waits 100 ms | after three (so no sooner than 200 ms later), Venus |
 | flip finds the source yielded | a user source took scanout 0 | the frame stays owed; eight in a row count as a failure (a registration that never gets to show) | the user source's end resumes |
 | the arbiter ended our registration | file closed, epoch or generation invalid | counted as a failure, re-register after 100 ms | Venus meanwhile (the desktop was owed a flush) |
 | mode change | extent differs | withdrawn, ring torn down and rebuilt, registered again | Venus meanwhile |
+| StopDevice while the presenter or a step is in a host call | every call of the worker is bounded: a step's allowance is `TIMEOUT_MS` = 2.5 s in all (the foreign import's create + attach + undo, the release's unmap + detach + unref share it), the host `Mmap` 2.5 s, its undo 2.5 s, the source map 1 s, the flip 1 s; `cleanup` skips the blob release once `hpd_stop` is set and otherwise spends at most one step's allowance on it | the worker returns inside the join (5 s, twice); what was not closed stays in the tables and the transport sweep closes it |
 | StopDevice / retire | `retire_begin` | views taken, then **wait (2 s) for a frame copy's lease**, then unmapped; `forget` clears the presenter | the transport reset ends the resident source |
 | worker stopping | `hpd_stop` | nothing new is started | n/a |
 
@@ -642,8 +662,8 @@ front surface unchanged.
   the gate (one more relaxed load of the knob level when a *user* source is live), the worker wait
   (a clock read only when a source or a paced frame exists), `release_owner` / `release_handle` (one
   lock hold instead of one lock call, the same counters while no resident source exists),
-  `forget` (a leaf lock and four atomic stores per retire) and `present` (now `present_within`
-  with the old constant).
+  `forget` (a leaf lock and four atomic stores per retire) and the flip path (`present_within` is
+  a new function; `present` keeps its constant and, since the fenced-present merge, its queue check).
 
 ### 13.6 Counters (`Rm*`, REG_DWORD, written once the presenter has done something)
 
@@ -667,7 +687,7 @@ source's ends are counted in `RmResEnd`, not `FsEnd`.
 
 ### 13.7 Verified here, and not
 
-Verified on the host (568 tests in `kmd_logic`): the resident source's every transition (foreground,
+Verified on the host (620 tests in `kmd_logic`): the resident source's every transition (foreground,
 preempt, every way a user source ends, the resident one's own ends, parked-file closure, withdraw,
 re-registration keeping the generation, a resume cancelled by another user source, reset, `seq`);
 the ring's build order, whole teardown on a new extent, the failure of the second slot closing the
@@ -675,7 +695,8 @@ first one's files, a given-up view, `take_views`, the exact status word; the pre
 60 Hz under a 240 Hz edge stream, yield, resume (copy after a busy tenure, re-flip after a quiet
 one), failure counting and giving up, losing the source, the arbiter ending it, the copy plan's
 bounds and its execution on buffers; a co-simulation of presenter and arbiter over a whole session.
-Type-checked against a shim (clippy clean there): the I/O files. **Not verified by anything**: that
+Type-checked against the generated harness (13 header): the I/O files, the merged adapter and virtio
+flip files, the changed `ctrl.rs` functions. **Not verified by anything**: that
 `kmd_render` compiles; every host reaction (the ring surfaces' second GEM import in the same DRM
 file, flips of alternating GEMs, the viewer's presentation of them, dropped frames under a full
 socket); the primary blob's cache attribute and so the copy's speed; the picture on screen; IRQL
@@ -747,6 +768,148 @@ Stop at the first step that fails; each says what to read. Same registry key as 
    also serves HPD and the refresh, so nothing else would work either, but the user-source lapse
    cannot rescue it. The worker's own bounded waits are the protection.
 5. **NVKMS and system memory** (12.3 (a)), and whether any 5120x1440 sysmem flip is worth having.
+
+### 13.12 The merged state machine: user sources with queued fenced presents, and the resident source
+
+Two features were built apart and meet here. **Fenced presents** (`rm-fence-marker.md`): a user
+`SCANOUT_PRESENT` with `RM_FENCE` returns at once; its flip waits in a per-source FIFO
+(`ScanoutQueue`, 8 deep) until its fence fires, is sent from the HPD worker (or an escape thread
+that finds nothing ahead), and its fence handle, which the KMD took over (owner `KMD_RM`,
+`Attach::Scanout`), is closed exactly once. **The resident source** (this document): the KMD's own
+ring, flipped by the presenter through the same `ScanoutFlip` machinery, preempted by any user
+source and resumed when that one ends. This section is the contract between them. The pure
+parts are pinned by `kmd_logic::rm_present::tests::combined` (a model that makes the same calls
+the adapter makes, with a wire log and a fence close counter).
+
+**Who runs what.**
+
+| actor | thread / IRQL | touches |
+|---|---|---|
+| user `SET` / `PRESENT` / `RELEASE`, `Close` | the app's escape, PASSIVE | `STATE` (arbiter), `FENCES` (queue), the pump |
+| fence fired | DPC, DISPATCH | the fence table (`fence_note_fired`), wakes the worker |
+| lapse poll, the pump (`foreign_fence_service`), the presenter (`rm_client::service`) | HPD worker, PASSIVE, in that order | all of it |
+| the refresh gate (`foreign_scanout_suppresses`) | PASSIVE under `scanout_mutex` | `STATE`, raises `FRAME_EDGE` |
+
+Locks: `STATE` and `FENCES` and `PRESENTER` and `CLIENT` are leaves; `virtio_lock` -> `FENCES`;
+`STATE` is never taken under `FENCES` or `virtio_lock`; the presenter reads `STATE` before it takes
+`PRESENTER` and never holds both.
+
+**The state.** The arbiter's `State` (`Inactive`, `Active(source)`, `ReleasePending`) plus the
+resident registration (none, parked, or the foreground source itself) and `resume_owed`; the queue
+(entries carry the generation and epoch of the source that minted them); the presenter
+(`registered`, owed frame, owed resume, the front slot, the failure count and the pause).
+
+```text
+                    resident_set (ring ready, nothing live)             user SET (Preempted)
+  Inactive ─────────────────────────────────────► Active(resident) ───────────────────────► Active(user)
+     ▲ ▲   user SET (Activated)                    ▲        │                                  │  │
+     │ └───────────────────────────────────────────┼────────┼──────────────────────────────────┘  │
+     │                                              │        │ withdraw, DRM file closed,          │
+     │                                              │        │ invalid generation/epoch            │
+     │      desktop_restored (one Venus flush)      │        ▼                                     │
+  ReleasePending ◄──────────────────────────────────┼── (resident forgotten)                       │
+     ▲                                              │                                              │
+     │  user source ends and NO resident registered │   user source ends (release, lapse, file    │
+     └──────────────────────────────────────────────┼── closed, owner exit, invalid handle):       │
+                                                    │   resident takes the screen back,           │
+                                                    └── resume_owed = true ◄──────────────────────┘
+  any state ── transport reset ──► Inactive (resident forgotten, queue cleared, no restore owed)
+```
+
+**What each event does** (`restore` = `foreign_scanout_restore_desktop`: it first asks
+`take_resume_owed()`; true raises `RESUME_EDGE` and the presenter re-flips, false asks for one
+Venus desktop refresh; both signal the worker).
+
+| event | arbiter | queue and fences | screen |
+|---|---|---|---|
+| user `SET`, resident foreground | `Preempted`, new generation, `resume_owed` cleared; the resident registration stays, parked | nothing queued yet | the presenter's next decision is "not foreground": idle, the pause of a past failure is voided; frames stay owed |
+| user `SET`, another user live and within its lapse | `Busy`, nothing changes | | |
+| user `SET`, another user lapsed | `TookOver`, new generation | the old source's entries are dropped by generation at the next drain, each fence closed once | |
+| user `PRESENT` (unfenced), queue empty and pump idle | mint (seq), send, `flip_done` (lapse runs from acceptance) | | the flip |
+| user `PRESENT` unfenced, queue busy | mint, enqueue as a ready entry (fence 0) so flips keep their order | | later |
+| user `PRESENT` with fence | mint, `fence_attach` (re-tag to `KMD_RM`, counted against `MAX_NVRM_ATTACHED_FENCES` = 512, not the owner's 128), enqueue, pump | the flip is sent when the fence fires; the fence is closed when its entry leaves the queue (sent, superseded by a newer ready one, or dropped) | |
+| fence fires | | the worker's next pass drains in order: the leading run of ready entries sends only the newest | |
+| **release** (`SCANOUT_RELEASE`) | `foreground_ended`: resident registered -> `Active(resident)` + `resume_owed`; none -> `ReleasePending` | the worker's next pass drains with the live generation = the resident's (or none): every entry of the ended source is dropped and its fence closed | re-flip of the front surface, or a copy if the desktop changed during the tenure (`note_desktop_changed` flagged it); or one Venus flush when nothing is resident |
+| **lapse** (`poll` on the worker, or a refused `PRESENT`) | same as release | same. The deadline moves when the host *accepts* a flip (`flip_done`), not when one is minted or queued (`ForeignScanout::present` does not extend it), so a source whose fences are slower than its lapse (2 s by default) is ended while its flips wait, and its queue is dropped | same |
+| **file closed** (`release_handle` from a forwarded `Close`) | same | same; the fence handles are separate handles and are closed by the queue's drop, not by the file's `Close` (they are `KMD_RM`'s now) | same |
+| **owner exit** (`release_owner` from DestroyDevice / StopDevice) | same | same; `close_all_for_owner` never sees an attached fence (re-tagged) | same |
+| invalid handle or epoch (the gate's `invalidate`) | same | same | same |
+| **transport reset** (`foreign_scanout_reset`, with the display publication state) | `Inactive`, resident forgotten, `resume_owed` cleared, **no restore**: the display state is rebuilt from scratch | `FENCES.clear()` (counted `FsFDrop`); the entries' fence handles are still in the NVRM table and the transport sweep (`close_all_on_host`) takes each out and closes it: once | the next generation registers the presenter again from cold |
+| resident ends (withdraw, DRM file closed under it, invalid generation) | resident forgotten, `ReleasePending`, one Venus flush owed | n/a (the resident never attaches a fence) | Venus |
+| presenter: frame due and foreground | `present_within(KMD_RM, drm, gem)`: mint, **send direct** (never queued), `flip_done` | | the copy / re-flip |
+| presenter: flip finds the source yielded (`NoSource`) | | | not a failure; the frame stays owed |
+
+**Why the resident's flips never queue.** The queue holds only user sources' entries (and the
+level-2 probe's), and the pump drops every entry whose generation is not the live one, so while the
+resident is the foreground source the queue holds nothing it must stay behind (stale entries are
+dropped, with their fences closed, by the worker pass that precedes the presenter's in the same loop
+iteration). `present` (user and probe) queues behind a busy queue to keep order; `present_within` does
+not, and sends with the caller's bound (1 s for the presenter).
+
+**Ordering inside one worker pass** (`ddi/hpd.rs`): the lapse poll, then the fenced queue (drop
+stale, send ready, close owed), then the VidPn deferral, then `rm_client::service` (presenter, client
+steps, presenter again). So a source that ended is dealt with (its queue dropped, its fences closed)
+before the presenter's first act of the pass, and an end that raised a resume edge is answered in the
+pass that sees it.
+
+**The two races, and why they end right.**
+
+1. *A flip taken off the queue just as its source ends.* The pump drained a ready entry (its fence is
+   already closed) on an escape thread or the worker; the source ends, the resident takes the screen
+   back and the presenter re-flips; then the late user flip is accepted by the host, after it. The
+   host takes frames in arrival order, so the user's frame is on screen. `flip_done` finds the
+   flip's generation no longer live and calls `restore`; `take_resume_owed` is already consumed, so
+   it asks for a desktop refresh, whose gate finds the resident source live and answers with a
+   frame edge: the presenter copies the newest content and flips it after the late one. The wire
+   order is `[reflip, user (late), copy]`; Venus is never flushed. (`a_flip_taken_off_the_queue...`.)
+2. *A resident flip in flight when a user source sets.* The resident's flip lands after the `SET`
+   but before the user's first frame; `flip_done` finds it not live; `resume_owed` was cleared by the
+   `SET`, so the refresh's gate sees a user source and only flags "desktop changed". The user's
+   first frame replaces it; at the user's end the resume is a copy. Costs nothing but one
+   superseded frame.
+
+**Exactly-once close of a fence handle.** Producers of a close: the queue's `drain` (sent,
+superseded and dropped entries; `Drain::closes()` names each entry's fence once, and the entry
+leaves the queue in the same call) and the transport sweep (every handle still in the table). A drain's
+close goes through `fence_want_close`, which acts only on a fence that is `KMD_RM`-owned and attached
+and sets `close_wanted` once (`FenceMeta::want_close` returns false the second time); the pop for
+the host `Close` removes the table entry first, so a sweep afterwards finds nothing and a `Close`
+of a recycled number is never sent from a stale queue entry. Reset clears the queue without closes
+and leaves the handles to the sweep. A close the host refused is put back as a `Discard` fence the
+sweep closes (no retry loop). None of the resident's code touches a fence, and the RM client's own
+cleanup closes only the handles *it* opened (a list), never "everything of `KMD_RM`".
+
+**Handle accounting with both on `KMD_RM`.** The owner token is shared, the budgets are not: the RM
+client's opens (control, GPU, DRM, export and map channels: a handful) count against the owner's 128
+(`MAX_NVRM_HANDLES_PER_OWNER`), which `reserve_nvrm_handle_slot` computes over the owner's entries
+**excluding** attached fences; attached or discarded fences count against `MAX_NVRM_ATTACHED_FENCES`
+(512, KMD-wide) and a refused attach is `Full`, never a refusal of the client's `Open`. Both draw on
+the 1024-entry table; the only way for the client to be refused is that table being full (documented:
+`NoResources`, client dead, Venus). Pinned by the harness tests
+the S4 review harness (the real `nvrm_tables.rs` and `rm_gates.rs` compiled against stubs, out of
+tree because `kmd_render` cannot host tests), re-run on the merged tree with two tests added
+for this merge: `the_rm_clients_cap_and_the_attached_fence_cap_are_independent` (the client at its
+128 stays at 128 with 512 user fences attached, and closing one of either frees exactly one
+slot of that kind) and `no_sweep_by_owner_reaches_a_fence_the_kmd_took_and_the_sweep_of_all_closes_it_once`.
+The foreign-resource table (level 4) is a different table with its own per-owner quota (64
+resources) and is not touched by fences.
+
+**Counters.** `FsSet - FsRel - FsLapse - FsEnd - FsTake` is the number of *user* sources live (0 or
+1): the resident source is set by `resident_set` (not counted in `FsSet`) and every end of it,
+including a `GemClose` of its surface through `foreign_scanout_release`, counts in `RmResEnd`, not
+`FsRel` / `FsEnd`. Waiting fenced presents = `FsFQue - FsFSent - FsFSkip - FsFDrop` returns to 0 when
+idle; a reset adds the cleared entries to `FsFDrop`.
+
+**Failure pauses.** A registration, a copy or a flip that fails sets the presenter's own pause (100 ms,
+`RETRY_AFTER_FAIL_100NS`): `decide` answers `WaitUntil` for an owed frame or resume until it is over,
+whichever pass or `service` call asks, so the three strikes that end the presenter for a generation
+are always at least 100 ms apart (they could all fall in one worker pass before). A flip that only
+found the source yielded is not a failure and is not delayed; a user source on screen voids the pause
+(the resume after it starts fresh, the strikes stay counted). The worker's wake for the retry is
+`WAKE_AT`; the pass's second presenter call leaves the pass alone while that wake is in the future.
+
+**Not covered by anything but the model.** The adapter's wiring of these calls was type-checked and
+read, not run; no hardware has seen a user source with fenced presents over a running ring.
 
 ## 14. The KMD's own RM allocations as foreign resources (`KmdRmClient` = 4, and the hooks for the rest)
 
@@ -858,7 +1021,11 @@ question as 13.11 item 2).
    `FgRiRef` counts it: the expected answer until 14.2 exists).
 ### 14.5 Bounds
 
-`import_surface` waits on the host for `RESOURCE_CREATE_BLOB` with the control queue's ordinary
-   synchronous bound on the HPD worker, which StopDevice joins for a bounded time (section 6): at level 4 a host
-   that stops answering during an import can cost the worker its join. It is a validation level for that reason;
-   the allocation arms (14.2) run on the creator's thread, not the worker.
+`import_surface` and `release_surface` run on the HPD worker, which StopDevice joins for a bounded
+time (section 6), so each is allowed `TIMEOUT_MS` (2.5 s) **in all**: the create, the attach and the
+unref of a failed attach (or the unmap, detach and unref of a release) draw on one `SweepBudget`, each
+command waiting at most what is left, and with it spent nothing more is sent (`Timeout`; the
+transport's sweep reclaims the host side). `release_all` is the same, and is skipped once the worker
+is stopping. The allocation arms (14.2) run on the creator's thread, not the worker. Not covered by
+the bound: the host's own answer to a command that did arrive late (a created resource whose reply was
+lost): it is reclaimed with the context it was created in.

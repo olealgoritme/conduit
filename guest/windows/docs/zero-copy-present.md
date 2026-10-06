@@ -237,6 +237,9 @@ hardening items below.
   device handle); it is bound to the import's holder context, which a hostile process could guess.
   Closing it needs the caller's process identity at CreateAllocation (nothing in the KMD reads the
   current process today) or an adoption cookie returned by `IMPORT_RM`.
+- Adoption of a resource the KMD's own RM client made (`KMD_RM` creator, `kmd-rm-client.md` 14.1) is
+  checked only by `ctx_id != 0` in place of the creating-device rule (there is none): see
+  `shared-foreign-surfaces.md` R5.
 - Cross-process lifetime of an imported foreign resource that two devices of one process use:
   the importing device's DestroyDevice frees it even if the bridge's device still imports it.
   **S6 (`shared-foreign-surfaces.md`): after adoption the lifetime is refcounted over the opens

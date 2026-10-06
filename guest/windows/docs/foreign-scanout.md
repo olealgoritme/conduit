@@ -64,7 +64,9 @@ kind of source with the lower priority of the two: it has no lapse, a user `SCAN
 preempts it at once (the user source becomes the `Active` one; the resident registration is kept),
 and when the user source ends by any of the paths above the resident source takes scanout 0 back and
 the restore is a re-flip of its surface instead of a desktop flush. It is counted apart (`Rm*`), so
-the live-source arithmetic of the counters below stays a count of user sources.
+the live-source arithmetic of the counters below stays a count of user sources. How it composes
+with fenced presents (`rm-fence-marker.md`: a user source's queued flips, preemption, resume, every end
+path) is the state machine of `kmd-rm-client.md` section 13.12.
 
 A forwarded `ScanoutFlip` (FORWARD) from a device that does not hold a live source is
 refused `FORBIDDEN`; with no source live FORWARD flips behave as before (and race the

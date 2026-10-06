@@ -104,8 +104,11 @@ HeliosNvrmScanoutPresent {            // 64 bytes, unchanged size
   `{generation, gem, seq, fence}` and RETURNS AT ONCE. The flip is sent from the HPD
   worker (PASSIVE; the DPC cannot do the host round trip) when the fence fires, or before
   the escape returns when the fence had already fired and nothing waits ahead of it.
-* The source's lapse timer is pushed out at `PRESENT` as for a plain one and again when a
-  flip is sent.
+* The source's lapse deadline is pushed out when the host ACCEPTS a flip (`foreign_scanout_flip_done`,
+  from the pump too), not when a flip is minted or queued: `ForeignScanout::present` deliberately does
+  not extend it, so a flip that fails or waits does not keep a source alive. A client whose fences
+  are slower than its `lapse_ms` (2 s by default, up to 30 s) loses its source while its flips wait:
+  the queue is then dropped and the fences closed like any other end.
 * **Ordering: FIFO per source, with ready-prefix coalescing.**
   * Flips are sent in submission order. A later present whose fence fires first WAITS
     behind the earlier one (the display never shows frame N+1 while frame N's fence is
@@ -255,6 +258,16 @@ struct HeliosRmFenceTail {
   transport's wire fence at submission, a cheap condition on a system with little Venus
   traffic). Nothing new is needed.
 * (b) `HE12`: the v4 record with `flags = COMPLETE`.
+
+## With the KMD's own resident source (`KmdRmClient` = 3)
+
+A user source with queued fenced presents preempts the KMD's resident ring source; when it ends (any
+of the paths of the table below) the worker drops its queue (closing each fence once, before the
+presenter's first act of that pass) and the resident source takes the screen back with a re-flip
+or a copy, never a Venus flush. The resident source's own flips are sent direct (`present_within`)
+and never queue. The whole state machine, the two races (a flip taken off the queue just as its
+source ends; a resident flip in flight when a user source sets), and the handle accounting with both on
+the `KMD_RM` owner are in `kmd-rm-client.md` section 13.12.
 
 ## Teardown and reset
 

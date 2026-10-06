@@ -713,6 +713,9 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
   exports it to a control descriptor of its OWN and never needs another process's handle.
   Once the slots above are checked, a process can reach another process's memory only through
   the resource id the KMD gates (`shared-foreign-surfaces.md` section 6).
+- **Adoption of a KMD-created resource has no same-device check** (`ctx_id != 0` in place of the
+  creating device's context; `shared-foreign-surfaces.md` R5). Level 4 of the KMD's own RM client
+  (`kmd-rm-client.md` section 14) is the only creator of such a resource.
 - **Pin tags are trusted.** `h_root`/`h_object` on `PIN` are the caller's word; the KMD only
   uses them to decide when `RM_FREE` unlocks a pin. A mis-tagging process can unlock its own
   pages while the host still maps them. Hardening TODO: take the object handle from the
