@@ -61,11 +61,26 @@ static inline int crm_win_gen_lost(const struct crm_win_gen *g, int32_t table_ep
     return g->generation != 0 && table_epoch != g->loss_epoch0;
 }
 
-/* Does reply header `h` (from an escape whose NTSTATUS was success) end this
- * generation? */
-static inline int crm_win_gen_reply_lost(const struct crm_win_gen *g, const HeliosNvrmHeader *h)
+/* Is escape buffer `buf` (`size` bytes) an NVRM reply whose header can be
+ * judged? The same D3DKMTEscape path also carries the transport's other Helios
+ * escapes (Venus holder contexts, blob release, foreign resources), which are
+ * shorter than an NVRM header or number their statuses differently: reading
+ * their bytes 24..39 as status and epoch would judge garbage. */
+static inline int crm_win_gen_judged(const void *buf, uint32_t size)
 {
-    return g->generation != 0 && helios_nvrm_reply_is_lost(g->init_epoch, h);
+    if (size < HELIOS_NVRM_HEADER_BYTES)
+        return 0;
+    const HeliosEscapeHeader *e = (const HeliosEscapeHeader *)buf;
+    return e->magic == HELIOS_ESCAPE_MAGIC && e->cmd_type == HELIOS_ESCAPE_NVRM;
+}
+
+/* Does reply `buf` (`size` bytes, from an escape whose NTSTATUS was success)
+ * end this generation? Only NVRM replies are judged (crm_win_gen_judged). */
+static inline int crm_win_gen_reply_lost(const struct crm_win_gen *g, const void *buf,
+                                         uint32_t size)
+{
+    return g->generation != 0 && crm_win_gen_judged(buf, size) &&
+           helios_nvrm_reply_is_lost(g->init_epoch, (const HeliosNvrmHeader *)buf);
 }
 
 /* After a loss: the next generation attaches at the table's current epoch and
