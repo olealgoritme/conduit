@@ -1400,6 +1400,16 @@ static NVK_PRESENT_NO_ID: AtomicUsize = AtomicUsize::new(0);
 /// Log the allocation an NVK present shows and whether it carries a foreign
 /// resource id: the first 64 presents, then every one without an id (first
 /// 64 of those) and every 512th.
+/// Was `shown` made by `finish_wddm_tex2d_nvk` as a primary (fullscreen
+/// exclusive flip chain) with a resource id?
+unsafe fn nvk_source_is_primary(shown: ddi::D3D10DDI_HRESOURCE) -> bool {
+    let alloc = resource_allocation(shown);
+    lock_ignore_poison(&NVK_ALLOC_BOOK)
+        .iter()
+        .find(|e| e.0 == alloc)
+        .is_some_and(|e| e.1 != 0 && e.4)
+}
+
 unsafe fn nvk_log_present_source(shown: ddi::D3D10DDI_HRESOURCE) {
     let alloc = resource_allocation(shown);
     let entry = lock_ignore_poison(&NVK_ALLOC_BOOK).iter().find(|e| e.0 == alloc).copied();
@@ -1515,11 +1525,19 @@ unsafe fn nvk_present_frame(
     // DWM itself never takes scanout 0 through NVK's own source (a level-2
     // user source would hide its flips from dxgkrnl's flip queue and present
     // statistics): every DWM frame is a WDDM flip (docs/dwm-on-nvk.md).
+    // A fullscreen-exclusive source (a primary: DXGI flips it, DWM composes
+    // nothing) goes to scanout 0 with its RM fence even when DWM composes NVK
+    // apps: that path neither waits on the CPU nor waits for DWM, while the
+    // composed path costs a CPU wait per frame (Heaven 5120x1440 fullscreen
+    // under an NVK DWM: 134 fps composed, the S3 wait; scanout 0 is GPU bound).
     let scanout = match crate::knobs::nvk_present_mode() {
         _ if crate::knobs::is_dwm_process() => false,
         1 => true,
         2 => false,
-        _ => !(nvk_dwm_composes() && NVK_PRESENT_BUFFERS.load(Ordering::Relaxed) == 1),
+        _ => {
+            nvk_source_is_primary(shown)
+                || !(nvk_dwm_composes() && NVK_PRESENT_BUFFERS.load(Ordering::Relaxed) == 1)
+        }
     };
     let caps = dev.dxvk.nvk_icd_caps();
     let fences = crate::knobs::nvk_rm_fence() && caps & HELIOS_ICD_CAP_RM_FENCE != 0;
