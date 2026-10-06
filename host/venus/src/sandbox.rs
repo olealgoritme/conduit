@@ -33,8 +33,13 @@
 //                The sysfs directories of the PCI devices behind /dev/dri and
 //                of the NVIDIA GPUs: libdrm's device enumeration.
 //   read-write   /dev/nvidiactl, /dev/nvidia[0-15], /dev/nvidia-modeset and
-//   + ioctl      /dev/dri: the GPU. Not /dev/nvidia-uvm (Vulkan does not
-//                open it), not /dev/nvidia-uvm-tools, not /dev/udmabuf.
+//   + ioctl      /dev/dri: the GPU. /dev/nvidia-uvm: a device created with
+//                VK_KHR_acceleration_structure brings up libcuda inside the
+//                driver (acceleration-structure builds), which opens it;
+//                without it vkCreateDevice fails with
+//                VK_ERROR_INITIALIZATION_FAILED, and every D3D12 device
+//                (vkd3d-proton enables DXR) with it. Not
+//                /dev/nvidia-uvm-tools, not /dev/udmabuf.
 //   read-write   $XDG_CACHE_HOME/conduit/venus/VM (one per VM; the driver's
 //   + create     shader cache, pointed at by __GL_SHADER_DISK_CACHE_PATH).
 //
@@ -60,9 +65,15 @@
 // way out of the process: exec, fork, ptrace and the cross-process memory
 // calls, bpf/perf/io_uring/userfaultfd/keyctl, mounts and namespaces, module
 // and kexec loading; and any socket but AF_UNIX stream/seqpacket, with
-// connect/bind/listen/accept refused outright, so there is no way to reach a
-// named socket (the X server, D-Bus, journald) after the sandbox is on -- the
-// one connection the renderer serves is accepted before it.
+// connect and accept refused outright, so there is no way to reach a named
+// socket (the X server, D-Bus, journald) after the sandbox is on -- the one
+// connection the renderer serves is accepted before it. bind and listen are
+// allowed: the libcuda that acceleration structures bring up binds and
+// listens on an abstract socket (cuda-uvmfd-NS-PID, to hand its UVM
+// descriptor to CUDA IPC peers) and fails its initialization if either is
+// refused. Landlock grants MAKE_SOCK nowhere (but the socket's own directory
+// on ABI < 8), so a bind can only name an abstract socket, and with accept
+// refused nothing that connects to it is ever served.
 //
 // Ordering. Landlock restricts the calling thread and threads it creates
 // later, and before ABI 8 nothing else. virglrenderer's render server is a
@@ -246,7 +257,8 @@ pub fn rules(cache_dir: Option<&Path>) -> Rules {
     r.read_only.extend(std::env::current_exe().ok());
     r.read_only.extend(gpu_sysfs());
 
-    r.devices.extend(["/dev/nvidiactl", "/dev/nvidia-modeset", "/dev/dri"].map(p));
+    // nvidia-uvm: libcuda, for acceleration structures (see the module comment).
+    r.devices.extend(["/dev/nvidiactl", "/dev/nvidia-modeset", "/dev/nvidia-uvm", "/dev/dri"].map(p));
     r.devices.extend((0..16).map(|n| PathBuf::from(format!("/dev/nvidia{n}"))));
 
     r.read_write.extend(cache_dir.map(Path::to_path_buf));
@@ -754,10 +766,9 @@ mod seccomp {
             libc::SYS_adjtimex,
             libc::SYS_sethostname,
             libc::SYS_setdomainname,
-            // named sockets: the one connection is accepted before this
+            // named sockets: the one connection is accepted before this.
+            // Not bind and listen: libcuda's abstract socket (module comment).
             libc::SYS_connect,
-            libc::SYS_bind,
-            libc::SYS_listen,
             libc::SYS_accept,
             libc::SYS_accept4,
         ];
@@ -918,10 +929,18 @@ pub fn selftest(rules: &Rules) -> Vec<String> {
     }
     let r = std::os::unix::net::UnixStream::connect("/run/dbus/system_bus_socket").map(drop);
     check("refuse connecting to the D-Bus system socket", r.is_err(), res(r));
+    if let Some(cache) = rules.read_write.first() {
+        let r = std::os::unix::net::UnixListener::bind(cache.join("selftest.sock")).map(drop);
+        check("refuse binding a named socket in the shader cache", r.is_err(), res(r));
+    }
 
     // Must be allowed.
     let r = open_rw("/dev/nvidiactl");
     check("open /dev/nvidiactl read-write", r.is_ok(), res(r));
+    if Path::new("/dev/nvidia-uvm").exists() {
+        let r = open_rw("/dev/nvidia-uvm");
+        check("open /dev/nvidia-uvm read-write", r.is_ok(), res(r));
+    }
     if let Some(icd) = nvidia_icd() {
         let r = std::fs::read(&icd).map(drop);
         check("read the NVIDIA ICD json", r.is_ok(), res(r));
@@ -998,8 +1017,15 @@ mod tests {
             libc::SYS_io_uring_setup,
             libc::SYS_unshare,
             libc::SYS_connect,
+            libc::SYS_accept,
+            libc::SYS_accept4,
         ] {
             assert!(list.contains(&nr), "{nr} not denied");
+        }
+        // libcuda (acceleration structures) binds and listens on an abstract
+        // socket; refusing either fails vkCreateDevice.
+        for nr in [libc::SYS_bind, libc::SYS_listen] {
+            assert!(!list.contains(&nr), "{nr} denied");
         }
         assert!(list.len() < 250, "jump offsets are u8");
     }

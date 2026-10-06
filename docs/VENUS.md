@@ -383,4 +383,8 @@ shader cache (`$XDG_CACHE_HOME/conduit/venus/VM`), nothing executable; and a
 seccomp denylist (exec, fork, ptrace, mounts and namespaces, module loading,
 io_uring, bpf, ...; no sockets but AF_UNIX, and no new connections). It is
 wider than the backend's: the driver loads libraries and patches its own
-code. `--no-sandbox` is for debugging only.
+code, and a device with `VK_KHR_acceleration_structure` (every vkd3d-proton
+D3D12 device, which enables DXR) brings up libcuda inside the driver, which
+opens `/dev/nvidia-uvm` and binds and listens on an abstract socket; refused,
+that `vkCreateDevice` fails with `VK_ERROR_INITIALIZATION_FAILED`.
+`--no-sandbox` is for debugging only.
