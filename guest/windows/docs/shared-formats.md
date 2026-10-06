@@ -206,8 +206,30 @@ A creates a shared texture of the format, fills it with a byte pattern
 through a staging copy, writes a second pattern, waits for its GPU work; A reads
 B's pattern back. Pixel-exact both ways. `HELIOS_ICD=nvk` for both processes.
 
-Results: section 9.
+Results: section 10.
 
-## 9. Results
+## 9. LINEAR surfaces with a recorded pitch (KMD-made RM surfaces)
+
+An NVK DWM must also open RM-backed surfaces the KMD makes (GDI redirection,
+`dwm-on-nvk.md` 4.2.2), which are LINEAR with a pitch the KMD chose. The
+rebuild-and-check import cannot take them: the opener's own LINEAR pitch is
+NVK's (`align(width * bpp, 128)`) and DXVK builds shared images OPTIMAL.
+
+* **NVK patch 0041**: `VK_EXT_image_drm_format_modifier` on Windows
+  (`has_alloc_tiled` no longer depends on the DRM path; RM applies kinds per
+  mapping). nil already takes an explicit LINEAR row pitch for an import, any
+  multiple of 32 bytes (below 128 NVK uses its render workaround).
+  `NVK_HELIOS_MODIFIERS=0` hides it.
+* **DXVK patch 0010**: an NVK device enables the extension; an NVK import whose
+  record is LINEAR, single-plane and has a pitch is created with
+  `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and an explicit plane layout
+  (offset, rowPitch from the trailer), as 0001 does for Venus. Block-linear
+  records (every ordinary OPTIMAL share) and two-plane records are unchanged.
+* **Import check** (`nvk_helios_check_import_layout`): unchanged code; the
+  explicit image has the recorded layout by construction.
+* **KMD**: author 128-byte-aligned pitches for RM surfaces NVK will open
+  (NVK's own LINEAR stride, no render workaround); 256-aligned also imports.
+
+## 10. Results
 
 (filled in as runs complete)

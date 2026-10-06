@@ -1,0 +1,92 @@
+Helios DXVK fork: an NVK import of a LINEAR foreign surface uses its recorded layout
+
+Conduit guest/windows/docs/shared-formats.md section 9. Applied after 0009 by
+ci/windows/Build-Driver.ps1.
+
+An NVK opener rebuilds a shared image from the D3D description and NVK
+checks its layout against the KMD's record. That cannot work for a LINEAR
+record whose pitch is not NVK's own choice: a KMD-made RM surface (GDI
+redirection, 256- or 128-aligned pitches) or a linear NVK surface. With the
+record's modifier LINEAR, one plane and a pitch, the image is now created
+with VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT and an explicit plane layout
+(offset, rowPitch from the trailer), as 0001 does for Venus foreign
+imports; NVK's import check then matches by construction. An NVK device
+enables VK_EXT_image_drm_format_modifier for this (NVK patch 0041 exposes
+it on Windows). Block-linear records, i.e. every ordinary OPTIMAL share,
+and two-plane records take the old path unchanged.
+
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index 0a78f3c6..9b16e980 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -690,7 +690,10 @@ namespace dxvk {
+     // Helios: a Venus device that composes NVK-made surfaces imports them as
+     // explicit DRM-modifier images. Only then, because the Venus paths are
+     // tuned for devices without this extension (see extExternalMemoryDmaBuf).
+-    if (heliosForeignImport() && m_extensionsSupported.extImageDrmFormatModifier.specVersion
++    // An NVK device enables it too, for LINEAR foreign surfaces (patch 0010):
++    // NVK's OPTIMAL images do not change with it.
++    if ((heliosForeignImport() || heliosBackendNvk())
++     && m_extensionsSupported.extImageDrmFormatModifier.specVersion
+      && !m_extensionsEnabled.extImageDrmFormatModifier.specVersion) {
+       m_extensionsEnabled.extImageDrmFormatModifier.specVersion =
+         m_extensionsSupported.extImageDrmFormatModifier.specVersion;
+diff --git a/src/dxvk/dxvk_image.cpp b/src/dxvk/dxvk_image.cpp
+index 1da4ac0f..c9cec504 100644
+--- a/src/dxvk/dxvk_image.cpp
++++ b/src/dxvk/dxvk_image.cpp
+@@ -196,6 +196,7 @@ namespace dxvk {
+ 
+     copyFormatList(createInfo.viewFormatCount, createInfo.viewFormats);
+     m_unifiedLayoutAvailable = device->features().khrUnifiedImageLayouts.unifiedImageLayouts;
++    m_heliosDrmModifiers = device->features().extImageDrmFormatModifier;
+ 
+     // Assign debug name to image
+     if (device->debugFlags().test(DxvkDebugFlag::Capture)) {
+@@ -472,6 +473,32 @@ namespace dxvk {
+       useHeliosRendererExternalMemory = false;
+     }
+ 
++    // Helios on NVK, importing a LINEAR foreign surface (a KMD-made RM surface,
++    // or an NVK one the creator laid out linearly): the opener cannot rebuild
++    // that layout from the D3D description (its own LINEAR pitch is NVK's
++    // choice, OPTIMAL is block-linear), so the image takes the recorded one
++    // explicitly. Block-linear records (every ordinary OPTIMAL share) and
++    // two-plane records keep the rebuild-and-check path unchanged.
++    const bool heliosNvkExplicit = heliosNvkImport && m_heliosDrmModifiers
++      && m_info.sharing.heliosForeignModifier == 0u /* DRM_FORMAT_MOD_LINEAR */
++      && !m_info.sharing.heliosForeignPlane1Stride
++      && m_info.sharing.heliosForeignStride;
++    VkImageDrmFormatModifierExplicitCreateInfoEXT heliosNvkModifier = {
++      VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT };
++    VkSubresourceLayout heliosNvkPlane = { };
++    if (heliosNvkExplicit) {
++      heliosNvkPlane.offset   = m_info.sharing.heliosForeignOffset;
++      heliosNvkPlane.rowPitch = m_info.sharing.heliosForeignStride;
++      heliosNvkModifier.drmFormatModifier = 0u;
++      heliosNvkModifier.drmFormatModifierPlaneCount = 1u;
++      heliosNvkModifier.pPlaneLayouts = &heliosNvkPlane;
++      heliosNvkModifier.pNext = std::exchange(imageInfo.pNext, &heliosNvkModifier);
++      imageInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++      Logger::info(str::format("DxvkImage: NVK explicit LINEAR import of resource ",
++        m_info.sharing.heliosResourceId, " ", m_info.extent.width, "x", m_info.extent.height,
++        " pitch ", m_info.sharing.heliosForeignStride, " offset ", m_info.sharing.heliosForeignOffset));
++    }
++
+     // Helios on Venus, importing a resource NVK made (an RM-exported dma-buf):
+     // only an explicit DRM-modifier image with the creator's layout reads it.
+     const bool heliosForeign = useHeliosRendererExternalMemory
+diff --git a/src/dxvk/dxvk_image.h b/src/dxvk/dxvk_image.h
+index 46b08c8e..1d0be4ab 100644
+--- a/src/dxvk/dxvk_image.h
++++ b/src/dxvk/dxvk_image.h
+@@ -1100,6 +1100,9 @@ namespace dxvk {
+ 
+     bool                        m_unifiedLayoutEnabled = false;
+     bool                        m_unifiedLayoutAvailable = false;
++    // Helios NVK: the device enabled VK_EXT_image_drm_format_modifier, so a
++    // LINEAR foreign surface imports with the recorded layout (patch 0010)
++    bool                        m_heliosDrmModifiers = false;
+ 
+     Rc<DxvkKeyedMutex>          m_mutex       = nullptr;
+ 
