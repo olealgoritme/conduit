@@ -1440,11 +1440,22 @@ pub(crate) unsafe fn arm_dma_flip_programming(
     // so a substituted flip takes by the descriptor's resid, and everything
     // downstream (`arm_bind_refresh`, the D2 identity arm, `RfUnb`, epochs,
     // leases, the D4a ledger) self-aligns because armed = bound = snapshot.
-    let source_resource = unsafe { crate::ddi::create_allocation::allocation_resource_id(h_alloc) };
+    //
+    // A handle that is null, foreign, or from an older transport generation is
+    // refused HERE, before any mark is taken: its resource id (or, with a
+    // snapshot, the descriptor that rode with it) could name a different live
+    // resource's frame watermark, and `take_flip_frame_watermark` consumes it.
+    let Some(source_resource) =
+        (unsafe { crate::ddi::create_allocation::allocation_resource_id(adapter, h_alloc) })
+    else {
+        crate::ddi::scanout_trace::note_ddi_pair_failed();
+        return false;
+    };
     let target_resource = snapshot.map_or(source_resource, |snap| snap.resource_id);
     let frame_watermark = adapter.take_flip_frame_watermark(target_resource);
     if !unsafe {
         crate::ddi::create_allocation::set_vidpn_primary_address(
+            adapter,
             h_alloc,
             0,
             primary_address,
@@ -1702,6 +1713,7 @@ unsafe fn set_vidpn_source_address_dirql(
     // the PASSIVE worker has actually programmed this primary.
     if !unsafe {
         crate::ddi::create_allocation::set_vidpn_primary_address(
+            adapter,
             h_alloc,
             primary_segment,
             primary_address,
