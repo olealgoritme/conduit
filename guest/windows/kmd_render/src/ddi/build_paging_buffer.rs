@@ -58,7 +58,9 @@ use crate::adapter::{AdapterContext, SystemBackingGuard, MAX_SYSTEM_BACKING_RANG
 use crate::ddi::create_allocation::SystemBackingPolicy;
 use crate::ddi::create_allocation::{paging_alloc_info, set_bar_placement};
 use crate::dxgk::*;
+use crate::virtio::rm_client::sysmem_flip::primary_changed;
 use helios_kmd_logic::paging::{self as pg, Clamp};
+use helios_kmd_logic::rm_refresh::Edge;
 
 /// DISPATCH-safe paging tracers (ntoseye reads these by symbol — no IRQL
 /// violation, unlike the `diag::record` ring).
@@ -1187,6 +1189,8 @@ unsafe fn bar_virtual_transfer_inner(
             BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
         }
         BAR_XFER_IN.fetch_add(1, Ordering::Relaxed);
+        // Level 5: the page-in wrote the primary through the CPU (see `bar_transfer`).
+        primary_changed(adapter, Edge::Paging, alloc.resource_id);
     }
     true
 }
@@ -1319,6 +1323,9 @@ unsafe fn bar_transfer(
                 BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
             }
             BAR_XFER_IN.fetch_add(1, Ordering::Relaxed);
+            // Level 5: this wrote the primary the screen may be showing through the CPU, with
+            // no present call: a frame is owed (atomics only; nothing when it is another surface).
+            primary_changed(adapter, Edge::Paging, alloc.resource_id);
             PagingOpOutcome::Executed
         }
         // Eviction: blob → system backing. From here every way of not completing
@@ -1483,6 +1490,8 @@ unsafe fn bar_fill(
         return PagingOpOutcome::Failed(paging_failure());
     }
     BAR_FILLS.fetch_add(1, Ordering::Relaxed);
+    // Level 5: the fill wrote the primary (see `bar_transfer`).
+    primary_changed(adapter, Edge::Paging, alloc.resource_id);
     PagingOpOutcome::Executed
 }
 

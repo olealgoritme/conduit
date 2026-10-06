@@ -321,6 +321,10 @@ pub struct Presenter {
     /// The `seq` of each surface's latest flip the host took (0 = none): what the host's
     /// release event for that surface must cover before it is written again.
     slot_seq: [u64; MAX_RING],
+    /// Smallest time between two flips of copied frames. [`MIN_FRAME_INTERVAL_100NS`] (60 Hz)
+    /// for the ring levels; level 5 sets it to the mode's refresh period
+    /// ([`Presenter::set_min_interval`], `rm_refresh::flip_interval_100ns`).
+    min_interval: u64,
     /// A frame is held back for a release (a wait episode is open).
     waiting: bool,
     /// An episode began / ended in a timeout since the caller last asked
@@ -344,6 +348,7 @@ impl Presenter {
             fails: 0,
             gave_up: false,
             slot_seq: [0; MAX_RING],
+            min_interval: MIN_FRAME_INTERVAL_100NS,
             waiting: false,
             wait_started: false,
             wait_timed_out: false,
@@ -364,6 +369,18 @@ impl Presenter {
     }
     pub fn frame_owed(&self) -> bool {
         self.owed_frame
+    }
+
+    /// The smallest time between two flips of copied frames, in 100 ns (never 0: a zero
+    /// interval would let every pass flip). Level 5 calls this before each `decide` with
+    /// the interval of the mode's refresh rate; the ring levels never call it and keep
+    /// [`MIN_FRAME_INTERVAL_100NS`].
+    pub fn set_min_interval(&mut self, interval_100ns: u64) {
+        self.min_interval = interval_100ns.max(1);
+    }
+
+    pub fn min_interval(&self) -> u64 {
+        self.min_interval
     }
 
     /// The flip the next frame's surface (`Ring::back`) must be released from before
@@ -471,7 +488,7 @@ impl Presenter {
             let mut due = if self.last_flip == 0 {
                 0
             } else {
-                self.last_flip.saturating_add(MIN_FRAME_INTERVAL_100NS)
+                self.last_flip.saturating_add(self.min_interval)
             };
             // After a failure: not before the pause, even when 16 ms have passed.
             due = due.max(self.retry_at);
@@ -570,7 +587,9 @@ impl Presenter {
     /// The transport generation changed or the client was forgotten: everything of
     /// the old generation is gone. A new generation gets a fresh chance.
     pub fn reset(&mut self) {
+        let interval = self.min_interval;
         *self = Presenter::new(self.ring.n);
+        self.min_interval = interval;
     }
 }
 

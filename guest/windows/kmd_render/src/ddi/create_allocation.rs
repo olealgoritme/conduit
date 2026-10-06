@@ -1909,7 +1909,16 @@ unsafe fn write_open_identity(
                 ident.global_vidmm_tracker_cookie,
             ]
         } else if ident.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
-            [ident.standard_contract_flags, 0]
+            // The KMD's own RM system-memory primary (`ident.foreign` is the KMD's record, set
+            // at creation and at an open that hit the foreign table, never creator data) tells
+            // its openers it is a LINEAR dma-buf and not Venus memory: bit 1, beside the
+            // dedicated-buffer bit 0 (a primary is never that one).
+            let foreign = if ident.foreign {
+                helios_protocol::HELIOS_WDDM_STANDARD_CONTRACT_FOREIGN_SYSMEM
+            } else {
+                0
+            };
+            [ident.standard_contract_flags | foreign, 0]
         } else {
             [0; 2]
         },

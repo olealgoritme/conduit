@@ -539,6 +539,11 @@ fn build_steps(
             return Err(err(Why::Alloc, stage::ALLOC, f));
         }
     };
+    // THE ONE SIZE. The host checks the declared size against the dma-buf's `lseek(SEEK_END)`
+    // (larger: ERANGE), and a size RM rounded up (to 64 KiB) passes only if the GEM import's
+    // `mem_size` is that same rounded value: this variable goes to `gem_import`, to the
+    // layout check, to the import request and reservation and to the resource creation
+    // below, and the record keeps it (`docs/kmd-rm-client.md` 15.16).
     let size = rs::adopt_size(lay.size, reported)
         .map_err(|w| err(w, stage::ALLOC, Fail::new(FailKind::Layout, 0x30)))?;
     let fl = rs::foreign_layout(lay, size)

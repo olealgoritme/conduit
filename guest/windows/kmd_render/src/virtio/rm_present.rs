@@ -102,6 +102,9 @@ static PRESENTER: SpinLock<PState> = SpinLock::new(PState {
 static FRAME_EDGE: AtomicU32 = AtomicU32::new(0);
 /// A user source ended and the resident one took the screen back.
 static RESUME_EDGE: AtomicU32 = AtomicU32::new(0);
+/// Frame edges raised since the worker last asked ([`take_edge_count`]). Level 5 reads it to
+/// count what coalesced (many edges, one flip); level 3 never does and the number just wraps.
+static EDGE_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Absolute time (100 ns) the worker must wake at for a paced frame, 0 = none.
 static WAKE_AT: AtomicU64 = AtomicU64::new(0);
 /// Consecutive yielded flips.
@@ -208,6 +211,7 @@ fn mirror_due() -> bool {
 /// screen): a frame is due. Atomics and `KeSetEvent(Wait = FALSE)` only: legal at
 /// any IRQL up to DISPATCH.
 pub(crate) fn note_frame_edge(adapter: &AdapterContext) {
+    EDGE_COUNT.fetch_add(1, Ordering::Relaxed);
     FRAME_EDGE.store(1, Ordering::Release);
     adapter.signal_hpd();
 }
@@ -251,9 +255,24 @@ pub(crate) fn take_edges() -> (bool, bool) {
     )
 }
 
+/// How many frame edges were raised since the last call (level 5's coalescing census).
+pub(crate) fn take_edge_count() -> u32 {
+    EDGE_COUNT.swap(0, Ordering::AcqRel)
+}
+
 /// Ask the worker to wake at `at` (100 ns, absolute) for a paced flip.
 pub(crate) fn set_wake_at(at: u64) {
     WAKE_AT.store(at, Ordering::Release);
+}
+
+/// Ask for a wake at `at` unless an earlier one is already asked for: the earliest deadline
+/// wins (the worker's single timed wait serves the presenter's pacing and the refresher's
+/// tail). Written by the worker only.
+pub(crate) fn set_wake_at_min(at: u64) {
+    let cur = WAKE_AT.load(Ordering::Acquire);
+    if cur == 0 || at < cur {
+        WAKE_AT.store(at, Ordering::Release);
+    }
 }
 
 /// Forget a wake nobody is owed any more.
@@ -271,6 +290,7 @@ pub(crate) fn reset() {
     }
     FRAME_EDGE.store(0, Ordering::Release);
     RESUME_EDGE.store(0, Ordering::Release);
+    EDGE_COUNT.store(0, Ordering::Release);
     WAKE_AT.store(0, Ordering::Release);
     YIELDS.store(0, Ordering::Release);
     GAVE_UP_COUNTED.store(false, Ordering::Release);

@@ -21,6 +21,7 @@ use crate::dxgk::*;
 use crate::irql::PassiveLevel;
 use crate::virtio::venus::{OptimalPresentImageDesc, PresentBufferDesc, PresentDestinationDesc};
 use crate::virtio::VirtioError;
+use helios_kmd_logic::rm_refresh::Edge;
 use helios_kmd_logic::scanout_worker_bind::{
     decide as decide_worker_bind, decide_epoch as decide_worker_epoch, Action as WorkerBindAction,
     Dispatch as WorkerBindDispatch, EpochPolicy as WorkerEpochPolicy,
@@ -850,6 +851,16 @@ unsafe fn dxgkddi_present_inner(
                 // cadence or "last PBCpy" stops meaning "what the last BLT did".
                 crate::diag::record_named_bytes(b"PBCpy", 1);
                 crate::diag::record_named_bytes(b"PBFnc", gpu_fence as u32);
+                // Level 5: a standard-buffer destination was waited for above, so the blit is
+                // in the memory: if it is the RM primary the screen shows, a frame is owed.
+                // Atomics only; one relaxed load with the knob below 5.
+                if destination_buffer.is_some() {
+                    crate::virtio::rm_client::sysmem_flip::primary_changed(
+                        adapter,
+                        Edge::PresentBlt,
+                        destination.resource_id,
+                    );
+                }
             }
         }
     }
@@ -1140,6 +1151,14 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
             let _ = adapter.with_virtio(|v| {
                 v.complete_windowed_blt_mirror(adapter, request.token, request.stream_boundary, ok)
             });
+            // Level 5: the ring copy and the mirror are done, so the blit is in the memory: if
+            // the destination is the RM primary the screen shows, a frame is owed. This runs on
+            // the HPD worker, ahead of the same pass's level 5 service.
+            crate::virtio::rm_client::sysmem_flip::primary_changed(
+                adapter,
+                Edge::WindowedBlt,
+                request.destination_resource_id,
+            );
             crate::ddi::scanout_timeline::note(
                 crate::ddi::scanout_timeline::kind::WINDOWED_BLT_MIRROR,
                 if ok {
