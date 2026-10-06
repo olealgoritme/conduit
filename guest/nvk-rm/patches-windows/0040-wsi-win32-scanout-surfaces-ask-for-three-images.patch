@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 10:00:00 +0200
+Subject: [PATCH] wsi/win32: scanout surfaces ask for three images
+
+With scanout release tracking (patch 0036) an image comes back to the
+app only once the host has stopped reading it, i.e. after a later image
+replaced it on the display and the host released it.  With two images
+(patch 0039's minimum) every acquire therefore waited for the other
+image's release: wgl_test (Zink on NVK, 1280x720) ran at 1283 fps,
+against 3888 fps with NVK_SCANOUT_RELEASE=0.
+
+Report minImageCount 3 when the driver flips: one image on display, one
+being released, one to draw into.  MESA_WSI_SCANOUT_MIN_IMAGES (1-8)
+overrides it, for measurements.
+
+Order: after 0039.
+---
+ src/vulkan/wsi/wsi_common_win32.cpp | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -233,12 +233,17 @@ wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
+        */
+       caps->surfaceCapabilities.minImageCount = caps->surfaceCapabilities.maxImageCount = 2;
+    } else {
+-      /* A scanout swapchain (Helios) shows its images in place: with one
+-       * image the app would draw into the buffer on display.  Ask for two
+-       * when the driver flips (apps such as Zink take minImageCount).
++      /* A scanout swapchain (Helios) shows its images in place, and with
++       * release tracking an image comes back only once the host is done
++       * with it: one on display, one released, one to draw into.  Ask for
++       * three when the driver flips (apps such as Zink take minImageCount;
++       * with two, every acquire waited for the other image's release).
++       * MESA_WSI_SCANOUT_MIN_IMAGES overrides it.
+        */
+       caps->surfaceCapabilities.minImageCount =
+-         wsi_device->win32.scanout_flip != NULL ? 2 : 1;
++         wsi_device->win32.scanout_flip != NULL ?
++         (uint32_t)CLAMP(debug_get_num_option("MESA_WSI_SCANOUT_MIN_IMAGES", 3),
++                         1, 8) : 1;
+       /* Software callbacke, there is no real maximum */
+       caps->surfaceCapabilities.maxImageCount = 0;
+    }
+--
+2.43.0
+
