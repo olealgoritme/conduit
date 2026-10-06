@@ -183,11 +183,23 @@ foreach ($chain in $Chains) {
     $parts = $chain -split ','
     $sum = 0
     $missing = $false
-    foreach ($part in $parts) {
-        if ($frames.ContainsKey($part)) { $sum += $frames[$part] } else { $missing = $true }
+    $leafInlined = $false
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        $part = $parts[$i]
+        if ($frames.ContainsKey($part)) { $sum += $frames[$part] }
+        elseif ($i -eq $parts.Count - 1 -and $i -gt 0) {
+            # The LAST symbol of a chain missing from the .map was inlined into its caller
+            # (typically a generic from a dependency crate, e.g. PciTransport::new, which we
+            # cannot mark #[inline(never)]): its frame is part of the caller's measured frame,
+            # so the chain is still bounded. A missing symbol anywhere else is unmeasured.
+            $leafInlined = $true
+        }
+        else { $missing = $true }
     }
     $names = ($parts | ForEach-Object { ($_ -replace '^[0-9]+', '') }) -join ' -> '
-    $note = if ($missing) { '  (INCOMPLETE: a symbol was not measured)' } else { '' }
+    $note = if ($missing) { '  (INCOMPLETE: a symbol was not measured)' }
+            elseif ($leafInlined) { '  (last symbol inlined into its caller: included in the caller frame)' }
+            else { '' }
     Write-Host ("{0,6} bytes  {1}{2}" -f $sum, $names, $note)
     if ($missing) { $problems += "chain not measured: $names" }
     if (-not $missing -and $sum -gt $worst) { $worst = $sum }
