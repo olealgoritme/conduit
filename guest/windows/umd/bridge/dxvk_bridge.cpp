@@ -477,7 +477,7 @@ namespace {
 
 // ---- Cross-process hand-off ledger (docs/shared-surfaces.md section 4) -----
 //
-// One shared table per Windows session ("Local\\HeliosHandoffLedger3"), used by
+// One shared table per Windows session ("Local\\HeliosHandoffLedger4"), used by
 // every process with the Helios UMD. At a hand-off (a flush of a device that
 // holds cross-process shared resources) the releaser writes, for each of those
 // resources keyed by its KMD resource id, "device record d (generation g),
@@ -497,7 +497,7 @@ namespace {
 // gone. Slots and records whose processes died are swept when the table runs
 // low. Counters in the header: slots and records in use, fallbacks, sweeps.
 namespace helios_handoff {
-  constexpr std::uint32_t kMagic   = 0x334C4448u; // 'HDL3'
+  constexpr std::uint32_t kMagic   = 0x344C4448u; // 'HDL4'
   constexpr std::uint32_t kDevices = 4096u;
   constexpr std::uint32_t kSlots   = 32768u;
   constexpr std::uint32_t kProbe   = 64u;
@@ -529,10 +529,14 @@ namespace helios_handoff {
     std::atomic<std::uint32_t> fallbacks;
     std::atomic<std::uint32_t> sweeps;
     std::atomic<std::uint32_t> handoffs;
+    // Points are this ledger-wide sequence (not per device), so points of
+    // different devices compare in publication order (sample_before).
+    std::atomic<std::uint64_t> publish_seq;
     Device devices[kDevices];
     Slot slots[kSlots];
   };
   static_assert(sizeof(Device) == 16 && sizeof(Slot) == 64, "ledger layout");
+  static_assert(sizeof(Table) == 40 + sizeof(Device) * kDevices + sizeof(Slot) * kSlots, "ledger header");
 
   inline std::uint64_t pack(std::uint32_t dev, std::uint32_t gen, std::uint64_t point) {
     return (std::uint64_t(dev) << 52) | (std::uint64_t(gen & kGenMask) << 40) | (point & kPointMask);
@@ -548,7 +552,7 @@ namespace helios_handoff {
         sa.lpSecurityDescriptor = sd;
       SetLastError(0);
       HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, sa.lpSecurityDescriptor ? &sa : nullptr,
-        PAGE_READWRITE, 0, DWORD(sizeof(Table)), L"Local\\HeliosHandoffLedger3");
+        PAGE_READWRITE, 0, DWORD(sizeof(Table)), L"Local\\HeliosHandoffLedger4");
       const DWORD create_error = GetLastError();
       if (sd)
         LocalFree(sd);
@@ -905,6 +909,65 @@ namespace helios_handoff {
     return sample_all(key, &point, 1) ? point : 0;
   }
 
+  // Own hand-off points published (application thread) whose signal the
+  // device's CS thread has not reached yet, per DxvkDevice, in order.
+  std::mutex s_pending_mutex;
+  std::unordered_map<const void*, std::vector<std::uint64_t>>& pending_points() {
+    static std::unordered_map<const void*, std::vector<std::uint64_t>> pending;
+    return pending;
+  }
+
+  void pending_push(const void* device, std::uint64_t point) {
+    std::lock_guard lock(s_pending_mutex);
+    pending_points()[device].push_back(point);
+  }
+
+  void pending_forget(const void* device) {
+    std::lock_guard lock(s_pending_mutex);
+    pending_points().erase(device);
+  }
+
+  void cs_reached(const void* device, std::uint64_t point) {
+    std::lock_guard lock(s_pending_mutex);
+    auto it = pending_points().find(device);
+    if (it == pending_points().end())
+      return;
+    auto& v = it->second;
+    std::size_t done = 0;
+    while (done < v.size() && v[done] <= point)
+      done++;
+    v.erase(v.begin(), v.begin() + done);
+  }
+
+  // The work the CS thread records now was issued before the device's next
+  // own point it has not reached; a point published after that one cannot
+  // be a dependency, and waiting for it could close a cycle with the other
+  // process (DXVK patch 0009).
+  std::uint32_t sample_before(std::uint32_t key, const void* device, std::uint64_t* out,
+                              std::uint32_t max) {
+    std::uint64_t bound = kPointMask;
+    {
+      std::lock_guard lock(s_pending_mutex);
+      auto it = pending_points().find(device);
+      if (it != pending_points().end() && !it->second.empty())
+        bound = it->second.front();
+    }
+    std::uint64_t all[kEntries];
+    const std::uint32_t n = sample_all(key, all, kEntries);
+    std::uint32_t kept = 0;
+    for (std::uint32_t i = 0; i < n; i++) {
+      if ((all[i] & kPointMask) < bound) {
+        if (kept < max)
+          out[kept++] = all[i];
+      } else {
+        trace_line("handoff trace: key %u: point %llu is after our next point %llu, not a dependency", key,
+                   static_cast<unsigned long long>(all[i] & kPointMask),
+                   static_cast<unsigned long long>(bound));
+      }
+    }
+    return kept;
+  }
+
   bool wait(std::uint32_t, std::uint64_t packed, std::uint64_t timeout_ns) {
     Table* t = table();
     if (!t)
@@ -924,8 +987,20 @@ namespace helios_handoff {
         return true;
       QueryPerformanceCounter(&now);
       const double ns = double(now.QuadPart - t0.QuadPart) * 1e9 / double(f.QuadPart);
-      if (ns >= double(timeout_ns))
-        return !process_alive(dev.pid.load(std::memory_order_relaxed)); // gone: done
+      if (ns >= double(timeout_ns)) {
+        const bool gone = !process_alive(dev.pid.load(std::memory_order_relaxed));
+        static std::atomic<std::uint32_t> s_timeouts{0};
+        const std::uint32_t k = s_timeouts.fetch_add(1) + 1;
+        if (!gone && (k <= 8 || (k % 1024) == 0)) {
+          char msg[160];
+          std::snprintf(msg, sizeof(msg),
+            "handoff: wait for point %llu of record %u still pending after %llu ms (%u so far)",
+            static_cast<unsigned long long>(point), d,
+            static_cast<unsigned long long>(timeout_ns / 1000000ull), k);
+          umd_log(msg);
+        }
+        return gone; // gone: done
+      }
       if (spin < 64)
         YieldProcessor();
       else if (spin < 256)
@@ -935,7 +1010,7 @@ namespace helios_handoff {
     }
   }
 
-  const dxvk::HeliosHandoffHooks kHooks = { &sample, &wait, &sample_all };
+  const dxvk::HeliosHandoffHooks kHooks = { &sample, &wait, &sample_all, &sample_before, &cs_reached };
 
   void install_hooks_once() {
     static const bool done = []() {
@@ -954,6 +1029,8 @@ void HeliosDxvkDeviceImpl::release_handoff_record() {
     (void)handoff_fence->waitBounded(handoff_value, 2000000000ull);
   helios_handoff::free_device(static_cast<helios_handoff::Table*>(handoff_table), handoff_device);
   handoff_device = UINT32_MAX;
+  if (device != nullptr)
+    helios_handoff::pending_forget(device.ptr());
 }
 
 namespace {
@@ -1033,11 +1110,15 @@ std::int32_t HeliosDxvkDevice::handoff_publish(const std::size_t* resources,
       }
       impl->handoff_table = table;
     }
-    const std::uint64_t point = ++impl->handoff_value;
+    const std::uint64_t point = table->publish_seq.fetch_add(1) + 1;
     if (point > helios_handoff::kPointMask) {
       table->fallbacks.fetch_add(1);
       return -1;
     }
+    impl->handoff_value = point;
+    // Pending from before anyone can see it until the CS thread reaches its
+    // signal (sample_before).
+    helios_handoff::pending_push(impl->device.ptr(), point);
     const std::uint64_t packed = helios_handoff::pack(impl->handoff_device, impl->handoff_gen, point);
     std::uint32_t published = 0;
     bool overflow = false;
@@ -1059,7 +1140,7 @@ std::int32_t HeliosDxvkDevice::handoff_publish(const std::size_t* resources,
                                  static_cast<unsigned long long>(point), impl->handoff_device);
       published++;
     }
-    impl->flush_gate_seq = immediate->HeliosSignalFlushPoint(impl->handoff_fence, point);
+    impl->flush_gate_seq = immediate->HeliosSignalHandoffPoint(impl->handoff_fence, point);
     auto* record = &table->devices[impl->handoff_device];
     const std::uint32_t gen = impl->handoff_gen;
     impl->handoff_fence->enqueueWait(point, [record, gen, point]() {
