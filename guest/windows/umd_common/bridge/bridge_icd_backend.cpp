@@ -212,9 +212,13 @@ bool nvk_next_to_umd(wchar_t* out, std::size_t cap) {
 
 bool find_nvk_icd(wchar_t* out, std::size_t cap) {
   out[0] = 0;
+  // An override that names no file (a stale test copy, deleted since) falls
+  // through to the installed NVK instead of putting the process on Venus:
+  // that silently turned "HELIOS_ICD=nvk" runs into Venus runs (2026-10-06,
+  // Heaven with HELIOS_NVK_ICD=...\s315\nvk32 after the copy was removed).
   const DWORD n = GetEnvironmentVariableW(L"HELIOS_NVK_ICD", out, DWORD(cap));
-  if (n > 0 && n < cap)
-    return file_exists(out);
+  if (n > 0 && n < cap && file_exists(out))
+    return true;
 #if defined(_WIN64)
   if (reg_wsz(L"NvkIcdPath", out, DWORD(cap)) && file_exists(out))
     return true;
