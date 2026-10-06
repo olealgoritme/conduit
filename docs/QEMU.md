@@ -92,14 +92,21 @@ Why each nvgpu-related argument is there:
     the same as `conduit-vmm`.
 - The shared memory regions are not given on the command line. QEMU asks
   the backend for them with `GET_SHMEM_CONFIG`. The backend answers shmid 1
-  (window, `--window-mib`, default 4 GiB) and shmid 2 (UVM aperture,
-  32 GiB), and with `--venus` shmid 3 (Venus host-visible blobs,
-  `--venus-hostmem-mib`, default 8 GiB).
+  (window, `--window-mib`, default `auto`: the host GPU's BAR1, 32 GiB on an
+  RTX 5090) and shmid 2 (UVM aperture, 32 GiB), and with `--venus` shmid 3
+  (Venus host-visible blobs, `--venus-hostmem-mib`, default 8 GiB). Nothing
+  on the QEMU command line or in the libvirt XML names the window's size, so
+  a new size needs only a backend restart (and a VM restart, since the BAR
+  is sized at boot).
 - `-cpu host,host-phys-bits=on` matters because the shared-memory BAR is
-  64 GiB and 64-bit (128 GiB with a large `--venus-hostmem-mib` or
-  `--window-mib`: window + 32 GiB + Venus, rounded up to a power of two). The
-  firmware places it above 4 GiB, which needs real physical-address width.
-  For OVMF see [VENUS.md](VENUS.md) "Windows/OVMF guests".
+  64-bit and large: window + 32 GiB + Venus, rounded up to a power of two.
+  That is 64 GiB with a window of 16 GiB or less, 128 GiB with a 32 GiB
+  window, and twice the window from 64 GiB up (256 GiB for an RTX PRO 6000's
+  128 GiB BAR1). OVMF places it in its 64-bit MMIO window, the top eighth of
+  `min(physical address bits, 46)`: 8 TiB on a 46-bit or wider host, which
+  is why `auto` stops at a 2 TiB window there and lower on narrower CPUs
+  ([ARCHITECTURE.md](ARCHITECTURE.md#limits)). For OVMF without the host's
+  address width see [VENUS.md](VENUS.md) "Windows/OVMF guests".
 
 Networking is the same as with `conduit-vmm`. `conduit up` creates the VM's
 `conduitN` tap (N is the VM's network number; `conduit0` in the example),
@@ -171,9 +178,9 @@ layout below needs no driver change.
 | --- | --- | --- |
 | PCI id / class | 1af4:106d rev 1, class 0x0380 (display) | 1af4:106d rev 1, class 0x0380 (display), set with the `class` property (patch 0007). The Linux driver binds by virtio id either way and builds its own PCI device for NVIDIA userspace (in a PCI domain of its own, see [ARCHITECTURE.md](ARCHITECTURE.md#guest-module)); Windows' display stack needs a display class to start its driver. |
 | virtio config structures | all in BAR 0 (32-bit, 16 KiB): common, isr, notify, MSI-X, device cfg at 0x1000 | BAR 2 (64-bit): common 0x0, isr 0x1000, device cfg 0x2000 (4 KiB window), notify 0x3000. MSI-X in BAR 1 |
-| window (shmid 1) | BAR 2, `gpu-forward.window-mib` (default 4 GiB, must equal the backend's `--window-mib`) | BAR 4 at offset 0, `--window-mib` (default 4 GiB) |
-| aperture (shmid 2) | BAR 4, 32 GiB | BAR 4 right after the window, 32 GiB (BAR 4 is 64 GiB, rounded up to a power of two by patch 0006) |
-| Venus blobs (shmid 3, `--venus`) | none | BAR 4 after the aperture (BAR 4 stays 64 GiB, 128 GiB when region 3 is 32 GiB or more) |
+| window (shmid 1) | BAR 2, `gpu-forward.window-mib` (`conduit up` writes the backend's number; unset, the same `auto` rule) | BAR 4 at offset 0, `--window-mib` (default `auto`: the host GPU's BAR1) |
+| aperture (shmid 2) | BAR 4, 32 GiB | BAR 4 right after the window, 32 GiB (BAR 4 is the regions' total rounded up to a power of two by patch 0006: 64 GiB with a window of 16 GiB or less, 128 GiB with 32 GiB, twice the window from 64 GiB up) |
+| Venus blobs (shmid 3, `--venus`) | none | BAR 4 after the aperture (it doubles BAR 4 once window + 32 GiB + region 3 passes a power of two) |
 | MSI-X vectors | 3 | 3 with patch 0004, 1 stock (the guest then falls back to INTx) |
 | unplaced window range | backed by zero pages (memfd), so writes stick | a hole: KVM exits to QEMU, reads return 0 and writes are dropped |
 | window withdraw | the range is overwritten with zero pages | the range is unmapped and becomes a hole again |

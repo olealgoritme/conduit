@@ -368,16 +368,18 @@ resource ids unique; blob size nonzero and ≤ region 3 once rounded up to a pag
 page-aligned, inside region 3, not overlapping another mapping; scanout only
 0; at most 1024 contexts and 65536 resources per VM.
 
-**Windows/OVMF guests.** BAR 4 (the shared-memory BAR) is 64 GiB with or
-without `--venus`, and 128 GiB when `--venus-hostmem-mib` is above 31 GiB
-(with the default 4 GiB window; in general when window + 32 GiB + region 3
-is more than 64 GiB).
+**Windows/OVMF guests.** BAR 4 (the shared-memory BAR) is window + 32 GiB +
+region 3 rounded up to a power of two: 128 GiB with the `auto` window on an
+RTX 5090 (32 GiB) and `--venus`, 256 GiB on an RTX PRO 6000 (128 GiB), 64 GiB
+with a window of 16 GiB or less.
 OVMF places it only if the guest sees the host's physical address width:
 QEMU `-cpu host,host-phys-bits=on`, libvirt `<maxphysaddr mode='passthrough'/>`
-(`conduit up` and `conduit attach` already set this). Failing that, give OVMF
-a larger 64-bit MMIO window with
-`-fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=131072` (`262144` for a 128 GiB
-BAR).
+(`conduit up` and `conduit attach` already set this). OVMF's 64-bit MMIO
+window is then the top eighth of `min(bits, 46)`, 8 TiB on most hosts, and
+`auto` keeps the BAR within half of it. Failing that, give OVMF a larger
+64-bit MMIO window with `-fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=N`, N at
+least twice the BAR in MiB (`262144` for a 128 GiB BAR), or set
+`conduit config set gpu.window_mib 4096`.
 
 ### RM-export resources in a second process (`RmResourceImport`, MsgType 31)
 

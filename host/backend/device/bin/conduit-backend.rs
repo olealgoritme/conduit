@@ -161,12 +161,20 @@ struct Args {
     trace_socket: Option<PathBuf>,
 
     /// Size of the window (shared memory region 1), where every guest CPU
-    /// mapping of RM memory is placed, in MiB. A power of two from 32 to
-    /// 65536. Address space, not memory. conduit-vmm's `gpu-forward.window-mib`
-    /// must be the same number (QEMU asks; conduit-vmm's BAR is configured).
-    #[arg(long, value_name = "MIB",
-          default_value_t = device::shm_regions::WINDOW_MIB_DEFAULT)]
-    window_mib: u64,
+    /// mapping of RM memory is placed, in MiB: a power of two from 32 to
+    /// 4194304, or `auto`, the host GPU's BAR1 (as Resizable BAR on bare
+    /// metal) within what the guest's 64-bit MMIO window holds, 4096 when
+    /// there is no GPU to go by. Address space, not memory. conduit-vmm's
+    /// `gpu-forward.window-mib` must be the same number (QEMU asks;
+    /// conduit-vmm's BAR is configured); `--print-window-mib` tells it.
+    #[arg(long, value_name = "auto|MIB", default_value = "auto")]
+    window_mib: device::shm_regions::WindowMib,
+
+    /// Print the window size `--window-mib` comes to on this host, in MiB,
+    /// and exit (`conduit up` gives that number to the backend and to
+    /// conduit-vmm alike).
+    #[arg(long)]
+    print_window_mib: bool,
 
     /// Serve Venus to a Windows guest (docs/VENUS.md): sets the config bit,
     /// answers GpuCmd and advertises shared memory region 3. Needs a frontend
@@ -1720,6 +1728,37 @@ fn open_trace_file(
     Ok(Some((file, format)))
 }
 
+/// Region 3's size as `--venus` and `--venus-hostmem-mib` make it, or 0
+/// (refused sizes are reported where the region is made).
+fn venus_len(args: &Args) -> u64 {
+    #[cfg(feature = "venus")]
+    if args.venus {
+        return device::shm_regions::venus_hostmem_len(args.venus_hostmem_mib).unwrap_or(0);
+    }
+    let _ = args;
+    0
+}
+
+/// `--window-mib` on this host, in MiB, and why: `auto` from the GPU's BAR1
+/// and the CPU's physical address bits (`shm_regions::auto_window_mib`).
+fn window_mib(args: &Args) -> (u64, String) {
+    use device::shm_regions::{self as r, WindowMib};
+    let (bar1, bits) = r::host_window_inputs();
+    let limit = r::window_mib_limit(bits, venus_len(args));
+    let host = format!(
+        "host BAR1 {}, {} physical address bits, guest limit {limit} MiB",
+        bar1.map_or("unknown".into(), |b| format!("{} MiB", b >> 20)),
+        bits.map_or("unknown".into(), |b| b.to_string()),
+    );
+    match args.window_mib {
+        WindowMib::Auto => (
+            r::auto_window_mib(bar1, bits, venus_len(args)),
+            format!("auto: {host}"),
+        ),
+        WindowMib::Mib(n) => (n, format!("--window-mib {n}: {host}")),
+    }
+}
+
 /// The renderer `--venus` talks to: the conduit-venus process at
 /// `--venus-renderer`. `CONDUIT_VENUS_MOCK=1` serves from the in-memory
 /// mock instead, which renders nothing, for testing the device without a
@@ -1779,6 +1818,14 @@ fn disconnect_is_ok(e: vhost_user_backend::Error) -> Result<(), vhost_user_backe
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    // Before the sandbox and before any device: sysfs and CPUID only.
+    let (window_mib, window_why) = window_mib(&args);
+    if args.print_window_mib {
+        device::shm_regions::window_len(window_mib)
+            .map_err(|e| anyhow::anyhow!("{e} ({window_why})"))?;
+        println!("{window_mib}");
+        return Ok(());
+    }
     // Before the sandbox, which may not allow the fstat that checks it.
     let activated = activated_listener();
     // Before any device is opened: the host driver judges every guest call by
@@ -1905,9 +1952,19 @@ fn main() -> anyhow::Result<()> {
         (None, _) => None,
     };
 
-    let window_len = device::shm_regions::window_len(args.window_mib)
+    let window_len = device::shm_regions::window_len(window_mib)
         .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
-    log::info!("window: {} MiB (shmid {SHM_ID_WINDOW})", args.window_mib);
+    log::info!("window: {window_mib} MiB (shmid {SHM_ID_WINDOW}; {window_why})");
+    let limit = device::shm_regions::window_mib_limit(
+        device::shm_regions::host_phys_bits(),
+        venus_len(&args),
+    );
+    if window_mib > limit {
+        log::warn!(
+            "window: {window_mib} MiB is above the {limit} MiB this host's guests can place; \
+             the firmware may leave the device's BAR unassigned"
+        );
+    }
     #[allow(unused_mut)]
     let mut nvgpu = NvGpuBackend::new(
         &args.proc_nvidia,

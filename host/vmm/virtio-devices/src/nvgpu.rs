@@ -104,28 +104,100 @@ const SHM_BAR: usize = 2;
 /// "undefined" id, which a guest discards without a word.
 const NV_SHM_ID: u8 = 1;
 
-/// Default size of the window, in MiB: the backend's `--window-mib` default
-/// (`shm_regions::WINDOW_MIB_DEFAULT`). The window must cover every offset the
-/// backend's allocator can hand out -- its three zones total exactly this --
-/// so a config that sets `gpu-forward.window-mib` must give the backend the
-/// same number.
+/// The window's fallback size, in MiB: the backend's
+/// (`shm_regions::WINDOW_MIB_DEFAULT`), used when `auto` finds no GPU. The
+/// window must cover every offset the backend's allocator can hand out -- its
+/// three zones total exactly the backend's `--window-mib` -- so the two must
+/// agree. `conduit up` resolves the backend's `auto` once
+/// (`conduit-backend --print-window-mib`) and gives both the number.
 ///
 /// Nothing is committed for it here. The reservation is PROT_NONE and the
 /// pages arrive only as the backend asks for them, one mapping at a time.
 pub const WINDOW_MIB_DEFAULT: u64 = 4096;
 const WINDOW_MIB_MIN: u64 = 32;
-const WINDOW_MIB_MAX: u64 = 65536;
+/// The backend's `WINDOW_MIB_MAX`: 4 TiB, the largest power of two a KVM
+/// memory slot can be (QEMU makes the window one slot).
+const WINDOW_MIB_MAX: u64 = 4 << 20;
 
-/// The window's size in bytes for `gpu-forward.window-mib` (`None`: the
-/// default): a power of two, as a BAR is, within the backend's own bounds.
+/// The window's size in bytes for `gpu-forward.window-mib` (`None`: `auto`,
+/// [`auto_window_mib`]): a power of two, as a BAR is, within the backend's
+/// own bounds.
 pub fn window_len(mib: Option<u64>) -> Result<u64> {
-    let mib = mib.unwrap_or(WINDOW_MIB_DEFAULT);
+    let mib = mib.unwrap_or_else(auto_window_mib);
     anyhow::ensure!(
         mib.is_power_of_two() && (WINDOW_MIB_MIN..=WINDOW_MIB_MAX).contains(&mib),
         "window-mib {mib}: must be a power of two from {WINDOW_MIB_MIN} to {WINDOW_MIB_MAX}, \
          and the backend's --window-mib"
     );
     Ok(mib << 20)
+}
+
+/// The backend's `--window-mib auto` (`shm_regions::auto_window_mib`, which
+/// has the reasoning and the tests), repeated here because conduit-vmm
+/// builds on its own: the host GPU's BAR1 rounded up to a power of two, from
+/// 4096 MiB to the largest window whose BAR fits in half of the guest's
+/// 64-bit MMIO window, 4096 MiB when there is no GPU.
+pub fn auto_window_mib() -> u64 {
+    auto_window_mib_for(
+        host_bar1_len(Path::new("/sys/bus/pci/devices")),
+        host_phys_bits(),
+    )
+}
+
+fn auto_window_mib_for(bar1: Option<u64>, phys_bits: Option<u8>) -> u64 {
+    const APERTURE: u64 = 32 << 30;
+    let Some(bar1) = bar1.filter(|&b| b > 0) else {
+        return WINDOW_MIB_DEFAULT;
+    };
+    // `shm_regions::guest_mmio64_len`: OVMF's top eighth of at most 46 bits.
+    let bits = phys_bits.unwrap_or(39).clamp(36, 46);
+    let room = (1u64 << (bits - 3)) / 2;
+    let mut limit = WINDOW_MIB_MAX;
+    while limit > WINDOW_MIB_DEFAULT && ((limit << 20) + APERTURE).next_power_of_two() > room {
+        limit /= 2;
+    }
+    let mib = bar1
+        .div_ceil(1 << 20)
+        .checked_next_power_of_two()
+        .unwrap_or(WINDOW_MIB_MAX);
+    mib.clamp(WINDOW_MIB_DEFAULT, limit)
+}
+
+/// The largest BAR1 among the NVIDIA GPUs bound to `nvidia`
+/// (`shm_regions::host_bar1_len`).
+fn host_bar1_len(pci_devices: &Path) -> Option<u64> {
+    let read = |p: std::path::PathBuf| std::fs::read_to_string(p).ok();
+    let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    std::fs::read_dir(pci_devices)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let d = e.path();
+            let nvidia = hex(&read(d.join("vendor"))?)? == 0x10de;
+            let display = hex(&read(d.join("class"))?)? >> 16 == 0x03;
+            let driver = std::fs::read_link(d.join("driver")).ok()?;
+            if !nvidia || !display || driver.file_name()? != "nvidia" {
+                return None;
+            }
+            let res = read(d.join("resource"))?;
+            let mut f = res.lines().nth(1)?.split_whitespace();
+            let (start, end) = (hex(f.next()?)?, hex(f.next()?)?);
+            (end > start).then(|| end - start + 1)
+        })
+        .max()
+}
+
+/// CPUID 0x8000_0008 EAX[7:0].
+fn host_phys_bits() -> Option<u8> {
+    use std::arch::x86_64::__cpuid;
+    #[allow(unused_unsafe)]
+    let max = unsafe { __cpuid(0x8000_0000) }.eax;
+    if max < 0x8000_0008 {
+        return None;
+    }
+    #[allow(unused_unsafe)]
+    let bits = (unsafe { __cpuid(0x8000_0008) }.eax & 0xff) as u8;
+    (bits != 0).then_some(bits)
 }
 
 /// BAR 4 is the UVM aperture: one memory slot per mapping of a UVM file, which
@@ -1123,14 +1195,34 @@ mod tests {
     #[test]
     fn window_len_matches_the_backend() {
         use super::window_len;
-        // host/backend/device/src/shm_regions.rs: WINDOW_MIB_DEFAULT 4096.
-        assert_eq!(window_len(None).unwrap(), 4 << 30);
+        // host/backend/device/src/shm_regions.rs: WINDOW_MIB_MIN 32,
+        // WINDOW_MIB_MAX 4 TiB; unset is `auto`, always a valid size.
+        assert!(window_len(None).is_ok());
         assert_eq!(window_len(Some(1024)).unwrap(), 1 << 30);
         assert_eq!(window_len(Some(32)).unwrap(), 32 << 20);
         assert_eq!(window_len(Some(65536)).unwrap(), 64 << 30);
-        for bad in [0, 16, 3000, 131072] {
+        assert_eq!(window_len(Some(131072)).unwrap(), 128 << 30);
+        assert_eq!(window_len(Some(4 << 20)).unwrap(), 4 << 40);
+        for bad in [0, 16, 3000, 32769, 8 << 20] {
             assert!(window_len(Some(bad)).is_err(), "{bad}");
         }
+    }
+
+    /// The backend's `auto_is_the_bar1_rounded_up_and_clamped`, without
+    /// region 3 (conduit-vmm has none).
+    #[test]
+    fn auto_matches_the_backend() {
+        use super::{WINDOW_MIB_DEFAULT, auto_window_mib_for as auto};
+        assert_eq!(auto(Some(32 << 30), Some(48)), 32768, "RTX 5090");
+        assert_eq!(auto(Some(128 << 30), Some(46)), 131072, "RTX PRO 6000");
+        assert_eq!(auto(Some(24 << 30), Some(48)), 32768);
+        assert_eq!(auto(Some(256 << 20), Some(48)), WINDOW_MIB_DEFAULT);
+        assert_eq!(auto(None, Some(48)), WINDOW_MIB_DEFAULT);
+        assert_eq!(auto(Some(128 << 30), Some(41)), 65536);
+        assert_eq!(auto(Some(32 << 30), Some(39)), WINDOW_MIB_DEFAULT);
+        assert_eq!(auto(Some(32 << 30), None), WINDOW_MIB_DEFAULT);
+        assert_eq!(auto(Some(u64::MAX), Some(52)), 2 << 20);
+        assert_eq!(auto(Some(1 << 50), Some(43)), 256 << 10);
     }
 
     use super::*;
