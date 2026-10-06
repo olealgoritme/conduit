@@ -264,10 +264,13 @@ pub enum Why {
     /// page-in will be skipped and the Venus blob kept, so the pages must not become the copy
     /// target (and a live guest blob is retired). A decision, no strike.
     SystemStale,
+    /// The create was sent and not answered within [`deadline::CREATE_MS`]: the host may still
+    /// create the blob over the pages, so they stay pinned (poisons).
+    CreateTimeout,
 }
 
 impl Why {
-    pub const ALL: [Why; 29] = [
+    pub const ALL: [Why; 30] = [
         Why::KnobOff,
         Why::NotAdvertised,
         Why::NotBuffer,
@@ -297,6 +300,7 @@ impl Why {
         Why::ReleaseFailed,
         Why::HostCrossFile,
         Why::SystemStale,
+        Why::CreateTimeout,
     ];
 
     /// 1-based, stable: the value of `GbWhy`.
@@ -331,6 +335,7 @@ impl Why {
             Why::ReleaseFailed => 27,
             Why::HostCrossFile => 28,
             Why::SystemStale => 29,
+            Why::CreateTimeout => 30,
         }
     }
 
@@ -348,7 +353,99 @@ impl Why {
     /// Whether the failure leaves host objects that may still write the pages, so the
     /// destination must keep them pinned and never retry.
     pub const fn poisons(self) -> bool {
-        matches!(self, Why::DrainTimeout | Why::ReleaseFailed)
+        matches!(
+            self,
+            Why::DrainTimeout | Why::ReleaseFailed | Why::CreateTimeout
+        )
+    }
+}
+
+/// The KMD's own bounds on every wait of a create and of a retire (policy, not host contract).
+///
+/// A create runs on a Present thread under the content transaction, a retire on the paging
+/// thread (`BuildPagingBuffer`), a Present thread or StopDevice, under the content transaction
+/// and the Venus mutex: a sick host must cost them at most a few seconds, never the 30 s of a
+/// default control round trip or ring wait per step. The I/O half runs each phase inside a
+/// bounded section (`ddi::escape_wait::begin_bounded`) whose deadline every wait primitive it
+/// reaches already obeys (the control round trip, the Venus ring wait, the mutex acquires, the
+/// enqueue retry budget: `wait_bound`), and passes the per-step limits below where a call takes
+/// a timeout of its own. A phase that runs out is a strike that POISONS the destination (the
+/// host may still act on what was sent: the pages stay pinned until the generation ends);
+/// `BuildPagingBuffer` answers success either way.
+pub mod deadline {
+    /// One wire fence of a copy into a guest buffer, or one queue marker (its
+    /// `vkWaitForFences` carries this as its host-side timeout, so a marker never blocks the
+    /// host's ring for longer either).
+    pub const FENCE_MS: u32 = 250;
+    /// The Venus half of a retire, all of it: the Venus mutex, the drain (every fence and the
+    /// marker), the release of the cached commands, the destroy, the free and the fence after it.
+    pub const DRAIN_MS: u32 = 1_000;
+    /// The `RESOURCE_UNREF` of a guest blob.
+    pub const UNREF_MS: u32 = 1_000;
+    /// The `RESOURCE_CREATE_BLOB` round trip.
+    pub const CREATE_MS: u32 = 1_000;
+    /// The import: the Venus mutex and every ring command of it, its unwind included.
+    pub const IMPORT_MS: u32 = 1_000;
+    /// The longest a create can block its thread: the create, the import, the UNREF of a
+    /// refused import.
+    pub const CREATE_TOTAL_MS: u32 = CREATE_MS + IMPORT_MS + UNREF_MS;
+
+    /// The limits of one retire.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Limits {
+        pub drain_ms: u32,
+        pub unref_ms: u32,
+    }
+
+    impl Limits {
+        /// A retire from the paging path, a Present or a destroy.
+        pub const NORMAL: Limits = Limits {
+            drain_ms: DRAIN_MS,
+            unref_ms: UNREF_MS,
+        };
+
+        /// A retire under a caller's per-call allowance (StopDevice's sweep budget,
+        /// `SweepBudget::call_timeout_ms`): each limit cut to `cap_ms`, never 0 (a 0 deadline
+        /// would mean "none").
+        pub const fn capped(cap_ms: u64) -> Limits {
+            Limits {
+                drain_ms: cut(DRAIN_MS, cap_ms),
+                unref_ms: cut(UNREF_MS, cap_ms),
+            }
+        }
+
+        /// The longest the retire can block its thread.
+        pub const fn total_ms(&self) -> u32 {
+            self.drain_ms.saturating_add(self.unref_ms)
+        }
+    }
+
+    const fn cut(limit_ms: u32, cap_ms: u64) -> u32 {
+        let v = if (limit_ms as u64) < cap_ms {
+            limit_ms
+        } else {
+            cap_ms as u32
+        };
+        if v == 0 {
+            1
+        } else {
+            v
+        }
+    }
+
+    /// The timeout of one fence wait inside a section with `left_ms` remaining (`None`: not in
+    /// a bounded section): [`FENCE_MS`], cut to what is left, at least 1 ms.
+    pub const fn fence_wait_ms(left_ms: Option<u32>) -> u32 {
+        match left_ms {
+            Some(left) if left < FENCE_MS => {
+                if left == 0 {
+                    1
+                } else {
+                    left
+                }
+            }
+            _ => FENCE_MS,
+        }
     }
 }
 
@@ -1362,6 +1459,51 @@ mod tests {
         }
         assert!(Why::DrainTimeout.poisons() && Why::ReleaseFailed.poisons());
         assert!(!Why::HostShape.poisons());
+    }
+
+    #[test]
+    fn deadlines_bound_every_wait_to_seconds() {
+        use super::deadline::*;
+        // Each step is far below the 30 s of a default round trip or ring wait, and a whole
+        // retire or create blocks for a few seconds at most.
+        for ms in [FENCE_MS, DRAIN_MS, UNREF_MS, CREATE_MS, IMPORT_MS] {
+            assert!(ms > 0 && ms <= 1_000, "{ms}");
+        }
+        assert!(FENCE_MS < DRAIN_MS);
+        assert_eq!(CREATE_TOTAL_MS, CREATE_MS + IMPORT_MS + UNREF_MS);
+        assert!(CREATE_TOTAL_MS <= 3_000);
+        assert!(Limits::NORMAL.total_ms() <= 2_000);
+        // A cap cuts both limits, never to 0, and never raises them.
+        assert_eq!(Limits::capped(u64::MAX), Limits::NORMAL);
+        assert_eq!(
+            Limits::capped(300),
+            Limits {
+                drain_ms: 300,
+                unref_ms: 300
+            }
+        );
+        assert_eq!(Limits::capped(0), Limits { drain_ms: 1, unref_ms: 1 });
+        for cap in [0u64, 1, 250, 999, 1_000, 1_001, 5_000] {
+            let l = Limits::capped(cap);
+            assert!(l.drain_ms >= 1 && l.drain_ms <= DRAIN_MS);
+            assert!(l.unref_ms >= 1 && l.unref_ms <= UNREF_MS);
+        }
+        // One fence wait: the per-fence limit, cut to what the section has left, never 0.
+        assert_eq!(fence_wait_ms(None), FENCE_MS);
+        assert_eq!(fence_wait_ms(Some(10_000)), FENCE_MS);
+        assert_eq!(fence_wait_ms(Some(100)), 100);
+        assert_eq!(fence_wait_ms(Some(0)), 1);
+    }
+
+    #[test]
+    fn an_unanswered_create_poisons() {
+        let mut r = Record::new(1);
+        r.begin_create().unwrap();
+        r.create_failed(Why::CreateTimeout);
+        assert!(r.poisoned && r.disabled());
+        assert!(!r.may_unlock());
+        assert_eq!(r.begin_drain(), Drain::Poisoned);
+        assert!(Why::CreateTimeout.strikes() && Why::CreateTimeout.poisons());
     }
 
     #[test]

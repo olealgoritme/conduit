@@ -6,7 +6,7 @@
 //!
 //! PASSIVE_LEVEL, under the Venus mutex, like every other function in the module.
 
-use helios_kmd_logic::guest_blob::{contract as gbc, Why};
+use helios_kmd_logic::guest_blob::{contract as gbc, deadline, Why};
 
 use super::ring::*;
 use super::*;
@@ -14,10 +14,6 @@ use super::*;
 /// Guest buffers alive at once: one per standard destination at most, bounded like the
 /// Present-buffer cache.
 const MAX_GUEST_BUFFERS: usize = MAX_PRESENT_BUFFERS;
-
-/// The wire-fence wait of the drain, per copy: the copy is a few milliseconds; a host that
-/// takes a second is not coming back, and the paging thread that waits must answer.
-const DRAIN_WAIT_NS: u64 = 1_000_000_000;
 
 /// One imported guest blob: the copy destination of the KMD standard buffer `destination`.
 #[derive(Clone, Copy)]
@@ -44,18 +40,32 @@ pub(crate) struct ImportFailed {
 }
 
 impl VenusClient {
-    /// The live guest buffer `desc` copies into, if any: not retired, and large enough for the
-    /// copy's extent (`pitch * (height - 1) + width * bpp`). The ONE predicate every Present
-    /// arm uses, under this client's mutex, so the arm's mirror/stale decision and the copy
-    /// cannot disagree.
-    pub(super) fn guest_target_for(&self, desc: &PresentBufferDesc) -> Option<GuestBuffer> {
+    /// The live guest buffer `desc` copies into, if any: not retired, large enough for the
+    /// copy's extent (`pitch * (height - 1) + width * bpp`), and still the copy target of the
+    /// destination's record (`Record::copy_target` naming this blob; one spinlock, only when a
+    /// guest buffer of the destination exists). The record matters when a retire could not
+    /// reach this client (its mutex wait ran out, the client was gone): the record is then
+    /// poisoned and no longer a copy target, while this buffer was never marked retired. The
+    /// ONE predicate every Present arm uses, under this client's mutex, so the arm's
+    /// mirror/stale decision and the copy cannot disagree.
+    pub(super) fn guest_target_for(
+        &self,
+        adapter: &AdapterContext,
+        desc: &PresentBufferDesc,
+    ) -> Option<GuestBuffer> {
         let extent = u64::from(desc.pitch)
             .checked_mul(u64::from(desc.height.checked_sub(1)?))?
             .checked_add(u64::from(desc.width) * u64::from(desc.pixel_format.bytes_per_pixel()))?;
-        self.guest_buffers
+        let candidate = self
+            .guest_buffers
             .iter()
             .find(|g| g.destination == desc.resource_id && !g.retired && g.size >= extent)
-            .copied()
+            .copied()?;
+        adapter
+            .system_backings
+            .guest_record(desc.resource_id)
+            .is_some_and(|record| record.copy_target() && record.guest == candidate.guest)
+            .then_some(candidate)
     }
 
     /// Whether a Present into the KMD standard buffer `destination` copies into a live guest
@@ -151,11 +161,16 @@ impl VenusClient {
     }
 
     /// Submit an empty fence marker and wait for it: every earlier ring command has executed
-    /// and every earlier queue submission has completed when this returns `Ok`.
+    /// and every earlier queue submission has completed when this returns `Ok`. The host waits
+    /// at most [`deadline::FENCE_MS`] (`vkWaitForFences`), so its ring is never blocked longer;
+    /// the guest side is bounded by the caller's section (`escape_wait::begin_bounded`).
     fn guest_queue_marker(&mut self, adapter: &AdapterContext) -> Result<(), VirtioError> {
         let fence = self.create_fence(adapter)?;
         self.queue_submit_fence_marker(adapter, fence)?;
-        self.wait_for_fence(adapter, fence)?;
+        let ns = u64::from(deadline::fence_wait_ms(
+            crate::ddi::escape_wait::bounded_left_ms(),
+        )) * 1_000_000;
+        self.wait_for_fence_within(adapter, fence, ns)?;
         self.destroy_fence(adapter, fence)
     }
 
@@ -265,7 +280,9 @@ impl VenusClient {
     ///
     /// 1. no new copy targets it (`retired`);
     /// 2. drain: the wire fence of the last copy of every cached command into it, then a queue
-    ///    fence marker (bounded waits; PASSIVE, the paging thread may be the caller);
+    ///    fence marker (each at most `deadline::FENCE_MS`, all of it inside the caller's
+    ///    bounded section of `deadline::DRAIN_MS`; PASSIVE, the paging thread may be the
+    ///    caller);
     /// 3. release the cached copy commands;
     /// 4. `vkDestroyBuffer` + `vkFreeMemory`;
     /// 5. a fence after the free (Venus ring commands are asynchronous to the UNREF).
@@ -293,12 +310,12 @@ impl VenusClient {
             if blt.destination_resource_id != guest || blt.last_wire_fence_id == 0 {
                 continue;
             }
-            match ctrl::wait_fence(
-                self.passive(),
-                adapter,
-                blt.last_wire_fence_id,
-                DRAIN_WAIT_NS,
-            ) {
+            // Per fence at most `deadline::FENCE_MS`, cut to what the caller's section has
+            // left (the whole drain is `deadline::DRAIN_MS`).
+            let ns = u64::from(deadline::fence_wait_ms(
+                crate::ddi::escape_wait::bounded_left_ms(),
+            )) * 1_000_000;
+            match ctrl::wait_fence(self.passive(), adapter, blt.last_wire_fence_id, ns) {
                 ctrl::WaitFenceOutcome::Complete => {}
                 ctrl::WaitFenceOutcome::TimedOut | ctrl::WaitFenceOutcome::Invalid => {
                     return Err(Why::DrainTimeout);

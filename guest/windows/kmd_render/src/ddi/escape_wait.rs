@@ -9,6 +9,11 @@
 //! inside an escape (the HPD worker, a DPC, the paging path, a DDI dxgkrnl calls on a terminating
 //! thread to clean up) is never aborted by any of it.
 //!
+//! The one exception is a `GuestBlob` bounded section ([`begin_bounded`]): a thread inside one
+//! sees that section's deadline through [`probe`] as if it were an escape's (no kill, no stop),
+//! so every "never aborts a thread outside an escape" in the wait primitives reads "outside an
+//! escape or a bounded section". No section is ever opened with `GuestBlob` 0.
+//!
 //! The abort is a FAILURE of the wait, delivered through the path the wait already has for a
 //! timeout (`wait_block` -> the abandon path -> `VirtioError::Timeout` -> the escape's own timeout
 //! status; a mutex acquire -> `None` / `NotStarted`; a retry budget -> spent), so the escape
@@ -98,6 +103,75 @@ pub(crate) fn reread_knobs() {
     crate::diag::record_named_bytes(b"EscWaitMsEff", ms);
 }
 
+/// Bounded KMD sections (`GuestBlob`: one phase of a guest-blob create or retire,
+/// `helios_kmd_logic::guest_blob::deadline`): a thread that is NOT inside an escape registers
+/// here for the length of one phase, and every wait primitive that obeys an escape's deadline
+/// (the control round trip, the Venus ring wait, the abortable mutex acquires, the enqueue retry
+/// budget) obeys this deadline too, through the same [`probe`]. Unlike an escape, a bounded
+/// section is never ended by a kill or by the stopping flag (StopDevice retires guest blobs
+/// itself, after raising it), and its aborts are not counted as escape aborts: the caller counts
+/// its own outcome. Every section runs under the content transaction, so one slot is in use at
+/// a time; a full table leaves the phase with the old, unbounded waits.
+const BOUNDED_SLOTS: usize = 4;
+static BOUNDED: wb::Slots<BOUNDED_SLOTS> = wb::Slots::new();
+/// Sections registered now: `probe` scans [`BOUNDED`] only while this is nonzero, so a thread
+/// outside every section pays one relaxed load.
+static BOUNDED_LIVE: AtomicU32 = AtomicU32::new(0);
+
+/// The calling thread's bounded section: registered by [`begin_bounded`], released on drop.
+pub(crate) struct Bounded {
+    slot: Option<usize>,
+}
+
+/// Enter a bounded section of `limit_ms` (at least 1) from now. A thread already inside an
+/// escape or a section keeps the deadline it has (nested: nothing registered). PASSIVE.
+pub(crate) fn begin_bounded(limit_ms: u32) -> Bounded {
+    let id = thread_id();
+    if TABLE.find(id).is_some() {
+        return Bounded { slot: None };
+    }
+    let deadline = wb::deadline_for(now_ms(), limit_ms.max(1));
+    // Counted first, so a `probe` of this thread never misses its own slot.
+    BOUNDED_LIVE.fetch_add(1, Ordering::AcqRel);
+    match BOUNDED.enter(id, deadline) {
+        Some(Ok(i)) => Bounded { slot: Some(i) },
+        Some(Err(_)) | None => {
+            BOUNDED_LIVE.fetch_sub(1, Ordering::AcqRel);
+            Bounded { slot: None }
+        }
+    }
+}
+
+impl Drop for Bounded {
+    fn drop(&mut self) {
+        if let Some(i) = self.slot {
+            BOUNDED.leave(i);
+            BOUNDED_LIVE.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// The deadline of the calling thread's bounded section, if it is in one.
+fn bounded_deadline(id: u32) -> Option<u32> {
+    if BOUNDED_LIVE.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    BOUNDED.find(id)
+}
+
+/// Milliseconds left of the calling thread's bounded section (`None`: not in one). For the
+/// waits that take a timeout of their own (`ctrl::wait_fence`).
+pub(crate) fn bounded_left_ms() -> Option<u32> {
+    let deadline = bounded_deadline(thread_id())?;
+    wb::remaining_ms(now_ms(), deadline)
+}
+
+/// Whether the calling thread's bounded section is spent (always `false` outside one, and for
+/// an escape: this is for the loops that must not change for escapes).
+pub(crate) fn bounded_spent() -> bool {
+    bounded_left_ms() == Some(0)
+}
+
 /// The calling thread's escape scope: registered by [`begin`], released on drop.
 pub(crate) struct Scope {
     /// The table slot this scope owns (`None`: a nested scope, a full table, no thread id).
@@ -146,7 +220,18 @@ impl Drop for Scope {
 pub(crate) fn probe() -> wb::Probe {
     let id = thread_id();
     let Some(deadline_ms) = TABLE.find(id) else {
-        return wb::Probe::default();
+        // Not an escape: a bounded section's deadline, or nothing (one relaxed load when no
+        // section is open: always, with `GuestBlob` 0).
+        return match bounded_deadline(id) {
+            Some(deadline_ms) => wb::Probe {
+                scoped: true,
+                terminating: false,
+                stopping: false,
+                now_ms: now_ms(),
+                deadline_ms,
+            },
+            None => wb::Probe::default(),
+        };
     };
     // SAFETY: both are scalar reads on the current thread, legal at PASSIVE.
     let terminating = unsafe { PsIsThreadTerminating(crate::ddi::mirror_thread::current_thread()) } != 0;
@@ -170,8 +255,11 @@ pub(crate) fn abort_now() -> Option<wb::Abort> {
     wb::verdict(probe())
 }
 
-/// A wait gave up for `why`: count it.
+/// A wait gave up for `why`: count it (an escape's; a bounded section's caller counts its own).
 pub(crate) fn note_abort(why: wb::Abort) {
+    if BOUNDED_LIVE.load(Ordering::Acquire) != 0 && TABLE.find(thread_id()).is_none() {
+        return;
+    }
     let counter = match why {
         wb::Abort::Killed => &ABORT_KILL,
         wb::Abort::Stopping => &ABORT_STOP,

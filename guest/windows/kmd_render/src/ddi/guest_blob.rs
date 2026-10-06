@@ -22,9 +22,11 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use helios_kmd_logic::guest_blob::deadline::{self, Limits};
 use helios_kmd_logic::guest_blob::{self as gb, contract as gbc, Drain, Eligible, Why};
 
 use crate::adapter::{AdapterContext, SystemBackingGuard};
+use crate::ddi::escape_wait::begin_bounded;
 use crate::irql::PassiveLevel;
 use crate::virtio::ctrl::{self, GuestBlobCreateError};
 
@@ -206,7 +208,7 @@ pub(crate) fn prepare(
         Eligible::Retire(why) => {
             note_refused(why);
             if let Some(guard) = adapter.system_backings.serialize(passive) {
-                retire(passive, adapter, &guard, resource_id);
+                retire(passive, adapter, &guard, resource_id, Limits::NORMAL);
             }
         }
         Eligible::Create => {
@@ -306,14 +308,20 @@ fn create(
     let Some(pin) = snapshot.pin() else {
         return fail_create(&guard, resource_id, Why::Kmd, runs32);
     };
-    let guest = match ctrl::create_guest_blob(
-        passive,
-        adapter,
-        adapter.venus_ctx_id(),
-        &entries,
-        runs32,
-        cover,
-    ) {
+    // The round trip, its enqueue retries and the virtio lock: at most `deadline::CREATE_MS`.
+    let created = {
+        let _bounded = begin_bounded(deadline::CREATE_MS);
+        ctrl::create_guest_blob(
+            passive,
+            adapter,
+            adapter.venus_ctx_id(),
+            &entries,
+            runs32,
+            cover,
+            u64::from(deadline::CREATE_MS),
+        )
+    };
+    let guest = match created {
         Ok(guest) => guest,
         Err(GuestBlobCreateError::Host { resp_type, errno }) => {
             let why = gbc::classify_create(resp_type, errno);
@@ -325,13 +333,37 @@ fn create(
         Err(GuestBlobCreateError::NoSlot) => {
             return fail_create(&guard, resource_id, Why::Kmd, runs32);
         }
+        Err(GuestBlobCreateError::Unanswered) => {
+            // The host may still create the blob over these pages: they stay pinned for the
+            // life of this generation (`CreateTimeout` poisons; the budget is not refunded,
+            // the host may count it). The record keeps the pin.
+            let disabled = guard
+                .guest_update(resource_id, false, |record, _| {
+                    record.create_failed(Why::CreateTimeout);
+                    record.disabled()
+                })
+                .unwrap_or(false);
+            note_failed(Why::CreateTimeout, disabled);
+            if let Err(pin) = guard.guest_set_pin(resource_id, pin) {
+                // No record to hold it: leak it rather than unlock pages the host may map.
+                core::mem::forget(pin);
+            }
+            mirror_live(adapter);
+            return;
+        }
     };
     let _ = guard.guest_update(resource_id, false, |record, _| record.sent(guest, runs32));
     RUNS.store(runs32, Ordering::Relaxed);
     BYTES.store(cover.min(u32::MAX as u64) as u32, Ordering::Relaxed);
-    let imported = adapter.with_venus_client(passive, |client| {
-        client.import_guest_blob(adapter, resource_id, guest, cover)
-    });
+    // The Venus mutex and every ring command of the import (its unwind included): at most
+    // `deadline::IMPORT_MS`. A wait that runs out fails its step; a step whose objects may
+    // exist on the host makes the import unclean (the pages then stay pinned).
+    let imported = {
+        let _bounded = begin_bounded(deadline::IMPORT_MS);
+        adapter.with_venus_client(passive, |client| {
+            client.import_guest_blob(adapter, resource_id, guest, cover)
+        })
+    };
     let failure = match imported {
         Ok(Ok(())) => None,
         Ok(Err(crate::virtio::venus::ImportFailed { why, clean })) => Some((why, clean)),
@@ -344,7 +376,7 @@ fn create(
                 // Unreachable (the record exists under this transaction). Never unlock pages
                 // the host maps: keep this pin alive for ever, then retire the blob.
                 core::mem::forget(pin);
-                retire(passive, adapter, &guard, resource_id);
+                retire(passive, adapter, &guard, resource_id, Limits::NORMAL);
                 return;
             }
             MADE.fetch_add(1, Ordering::Relaxed);
@@ -353,13 +385,13 @@ fn create(
             // the new blob before any copy targets it.
             if guard.system_copy_invalid(resource_id) {
                 note_refused(Why::SystemStale);
-                retire(passive, adapter, &guard, resource_id);
+                retire(passive, adapter, &guard, resource_id, Limits::NORMAL);
             }
         }
         Some((why, clean)) => {
             // Everything the import made was released (and fenced): the blob can go, and only
             // after its UNREF answered may the pin (the pages) go.
-            if clean && ctrl::release_guest_blob(passive, adapter, guest).is_ok() {
+            if clean && release_blob(passive, adapter, guest, deadline::UNREF_MS).is_ok() {
                 fail_create(&guard, resource_id, why, runs32);
                 drop(pin);
             } else {
@@ -395,6 +427,13 @@ fn create(
 /// stay locked whatever the lease change does) and the destination is poisoned. Never fails
 /// the caller: `BuildPagingBuffer` must answer success whatever happens here.
 ///
+/// Bounded by `limits` (`helios_kmd_logic::guest_blob::deadline`): steps 1 to 5, the Venus
+/// mutex included, run in one bounded section of `limits.drain_ms` (each fence and marker at
+/// most `FENCE_MS` of it), step 6 in one of `limits.unref_ms`. A wait that runs out is a
+/// strike that poisons (`DrainTimeout` / `ReleaseFailed`): the record stops being a copy
+/// target at once (`VenusClient::guest_target_for` reads it), the pages stay pinned until the
+/// generation ends, and the thread is back within about two seconds whatever the host does.
+///
 /// PASSIVE, content transaction held (`guard`): content -> Venus -> virtio.
 #[inline(never)]
 fn retire(
@@ -402,6 +441,7 @@ fn retire(
     adapter: &AdapterContext,
     guard: &SystemBackingGuard<'_>,
     resource_id: u32,
+    limits: Limits,
 ) -> bool {
     let guest = match guard.guest_update(resource_id, false, |record, _| record.begin_drain()) {
         None | Some(Drain::Nothing) => return true,
@@ -409,17 +449,20 @@ fn retire(
         Some(Drain::Release { guest }) => guest,
     };
     let t0 = crate::ddi::blt_async::now_100ns();
-    let released = adapter.with_venus_client(passive, |client| {
-        client.retire_guest_buffer(adapter, resource_id, guest)
-    });
+    let released = {
+        let _bounded = begin_bounded(limits.drain_ms);
+        adapter.with_venus_client(passive, |client| {
+            client.retire_guest_buffer(adapter, resource_id, guest)
+        })
+    };
     let step = match released {
         Ok(result) => result,
-        // No Venus client (or its mutex could not be taken): nothing proves the import is gone,
-        // so the pages stay pinned. The generation reset that follows a lost client frees them.
+        // No Venus client, or its mutex wait ran out: nothing proves the import is gone, so the
+        // pages stay pinned. The generation reset that follows a lost client frees them.
         Err(_) => Err(Why::ReleaseFailed),
     };
     let step = step.and_then(|()| {
-        ctrl::release_guest_blob(passive, adapter, guest).map_err(|_| Why::ReleaseFailed)
+        release_blob(passive, adapter, guest, limits.unref_ms).map_err(|_| Why::ReleaseFailed)
     });
     let us =
         (crate::ddi::blt_async::now_100ns().saturating_sub(t0) / 10).min(u32::MAX as u64) as u32;
@@ -462,7 +505,19 @@ pub(crate) fn before_lease_change(
     if record.may_unlock() {
         return;
     }
-    retire(passive, adapter, guard, resource_id);
+    retire(passive, adapter, guard, resource_id, Limits::NORMAL);
+}
+
+/// The guest blob's `RESOURCE_UNREF`, in a bounded section of `limit_ms` (the enqueue retries
+/// and the virtio lock included) and with the same round-trip timeout.
+fn release_blob(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    guest: u32,
+    limit_ms: u32,
+) -> Result<(), crate::virtio::VirtioError> {
+    let _bounded = begin_bounded(limit_ms);
+    ctrl::release_guest_blob_within(passive, adapter, guest, u64::from(limit_ms))
 }
 
 /// The transport generation is about to end (StopDevice, or a StartDevice that finds an old
@@ -495,11 +550,12 @@ pub(crate) fn retire_all_for_stop(
             break;
         };
         let now = crate::adapter::foreign_scanout::now_100ns();
-        if budget.call_timeout_ms(now).is_none() {
+        let Some(cap_ms) = budget.call_timeout_ms(now) else {
             // Spent: send nothing more. The pins stay until the generation reset.
             break;
-        }
-        retire(passive, adapter, &guard, resource_id);
+        };
+        // Each phase cut to the budget's per-call allowance.
+        retire(passive, adapter, &guard, resource_id, Limits::capped(cap_ms));
     }
 }
 

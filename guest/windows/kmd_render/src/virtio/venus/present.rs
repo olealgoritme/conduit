@@ -1242,7 +1242,7 @@ impl VenusClient {
         // the cache key (one predicate, under this mutex: `guest_target_for`).
         let guest = match destination {
             PresentDestinationDesc::StandardBuffer(desc) if allow_guest => {
-                self.guest_target_for(&desc)
+                self.guest_target_for(adapter, &desc)
             }
             _ => None,
         };

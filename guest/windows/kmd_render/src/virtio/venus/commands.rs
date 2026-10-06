@@ -1648,6 +1648,18 @@ impl VenusClient {
         adapter: &AdapterContext,
         fence_id: VkFenceId,
     ) -> Result<(), VirtioError> {
+        self.wait_for_fence_within(adapter, fence_id, 5_000_000_000) // 5 s
+    }
+
+    /// [`Self::wait_for_fence`] with the host-side `vkWaitForFences` timeout `timeout_ns`
+    /// (the host's ring blocks for at most that long; a fence not signalled by then answers
+    /// `VK_TIMEOUT`, a refused result).
+    pub(super) fn wait_for_fence_within(
+        &mut self,
+        adapter: &AdapterContext,
+        fence_id: VkFenceId,
+        timeout_ns: u64,
+    ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_WAIT_FOR_FENCES, CMD_FLAG_GENERATE_REPLY);
         w.handle(self.device_id);
@@ -1655,7 +1667,7 @@ impl VenusClient {
         w.u64(1); // pFences array_size
         w.handle(fence_id);
         w.u32(1); // waitAll
-        w.u64(5_000_000_000); // 5 s
+        w.u64(timeout_ns);
         self.ring_command_expect(
             adapter,
             w.as_slice()?,
