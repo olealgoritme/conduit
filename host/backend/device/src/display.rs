@@ -995,16 +995,101 @@ pub trait InputSink: Send {
         data.len()
     }
 
-    /// Whether the guest takes Conduit input at all: its driver has brought
-    /// up the event queue and posted buffers on it (the Linux guest posts
-    /// them at probe). A guest whose driver never does (Windows: the Helios
-    /// KMD runs only the control queue) has no use for `InputEvent`s; with a
-    /// boot console attached, its input goes to the VM's emulated keyboard
-    /// and tablet instead, whoever shows the picture. Asked by the link
-    /// thread at every turn; must be cheap and must not block.
+    /// Whether the guest takes Conduit input at all ([`guest_takes_input`]):
+    /// its driver says it consumes `InputEvent`s (it acked
+    /// `NVGPU_CFG_TAKES_INPUT`, or it is a Linux guest module from before the
+    /// bit) and has its event queue up with buffers posted. A guest that
+    /// does not (Windows: the Helios KMD never acks the bit, whether or not
+    /// it runs the event queue) has no use for `InputEvent`s; with a boot
+    /// console attached, its input goes to the VM's emulated keyboard and
+    /// tablet instead, whoever shows the picture. Asked by the link thread
+    /// at every turn; must be cheap and must not block.
     fn takes_input(&mut self) -> bool {
         true
     }
+}
+
+/// What the guest's driver has said about taking Conduit input since the
+/// device last started, shared between the request path (which learns it)
+/// and the input sink (which asks, [`InputSink::takes_input`]). Cleared on
+/// every device start or reset: the next driver says it again.
+#[derive(Debug, Default)]
+pub struct GuestInputClaims {
+    /// The guest acked the virtio feature `NVGPU_CFG_TAKES_INPUT`.
+    acked: AtomicBool,
+    /// The guest asked for `GetSysFiles` or `GetProcFiles` before anything
+    /// else that identifies a driver: the Linux guest module does, at probe,
+    /// in every version, so this is a Linux guest even when its module
+    /// predates the feature bit.
+    linux: AtomicBool,
+    /// An `Open`, `Ioctl`, `ScanoutFlip` or `GpuCmd` came first. The Windows
+    /// KMD has always sent scanout or Venus traffic by the time an
+    /// application's NVK forwards its own `GetSysFiles` (librmclient asks for
+    /// it at `crm_open`), so a later one says nothing about the driver.
+    other_first: AtomicBool,
+}
+
+impl GuestInputClaims {
+    /// The device (re)started with these acked driver features. Whatever an
+    /// earlier driver said is gone with it.
+    pub fn device_started(&self, acked_features: u64) {
+        let bit = u64::from(protocol::messages::NVGPU_CFG_TAKES_INPUT);
+        self.acked
+            .store(acked_features & bit != 0, Ordering::Release);
+        self.linux.store(false, Ordering::Release);
+        self.other_first.store(false, Ordering::Release);
+    }
+
+    /// The device was reset: nothing is known about the next driver.
+    pub fn reset(&self) {
+        self.device_started(0);
+    }
+
+    /// A request of this `MsgType` value was served.
+    #[inline]
+    pub fn saw_request(&self, msg_type: u32) {
+        use protocol::messages::MsgType;
+        if self.linux.load(Ordering::Relaxed) || self.other_first.load(Ordering::Relaxed) {
+            return;
+        }
+        if msg_type == MsgType::GetSysFiles as u32 || msg_type == MsgType::GetProcFiles as u32 {
+            self.linux.store(true, Ordering::Release);
+        } else if msg_type == MsgType::Open as u32
+            || msg_type == MsgType::Ioctl as u32
+            || msg_type == MsgType::ScanoutFlip as u32
+            || msg_type == MsgType::GpuCmd as u32
+        {
+            self.other_first.store(true, Ordering::Release);
+        }
+    }
+
+    /// The guest acked `NVGPU_CFG_TAKES_INPUT`.
+    pub fn acked(&self) -> bool {
+        self.acked.load(Ordering::Acquire)
+    }
+
+    /// The guest identified itself as the Linux guest module.
+    pub fn linux(&self) -> bool {
+        self.linux.load(Ordering::Acquire)
+    }
+
+    /// [`guest_takes_input`] with what is known so far.
+    pub fn takes_input(&self, event_queue_live: bool) -> bool {
+        guest_takes_input(event_queue_live, self.acked(), self.linux())
+    }
+}
+
+/// The routing rule (docs/SCANOUT.md "Input"): the guest takes Conduit input
+/// when its event queue is live (started, buffers posted) **and** it says it
+/// consumes `InputEvent`s -- it acked `NVGPU_CFG_TAKES_INPUT`, or, for a
+/// Linux guest module from before that bit, it is the Linux module
+/// (`linux_guest`). A queue alone is not enough: the Windows KMD runs one to
+/// receive `EventReady`, never acks the bit, never asks for `GetSysFiles`
+/// before its own scanout or Venus traffic (NVK on RM forwards one later,
+/// from an application), and its keyboard and mouse are QEMU's emulated
+/// devices.
+pub fn guest_takes_input(event_queue_live: bool, acked_bit: bool, linux_guest: bool) -> bool {
+    event_queue_live && (acked_bit || linux_guest)
 }
 
 /// The boot console (`crate::console`): where input goes while it is shown,
@@ -2249,15 +2334,18 @@ impl DisplayLink {
             let takes = sink.takes_input();
             let attached = self.console_attached.load(Ordering::Relaxed);
             if attached && takes && *guest_input == Some(false) {
-                log::info!("display: the guest posted event-queue buffers; it takes input events");
+                log::info!(
+                    "display: the guest takes Conduit input events (event queue live, input declared)"
+                );
             }
             *guest_input = Some(takes);
             let console = self.input_to_console(takes);
             let now_kept = console && !self.console_shown();
             if now_kept && !*kept {
                 log::info!(
-                    "display: the guest's frames are shown, but it posts no event-queue buffers \
-                     (no Conduit input driver); input stays on the VM's emulated keyboard and tablet"
+                    "display: the guest's frames are shown, but it takes no Conduit input \
+                     (no NVGPU_CFG_TAKES_INPUT, or no event-queue buffers); input stays on the \
+                     VM's emulated keyboard and tablet"
                 );
             }
             *kept = now_kept;
@@ -2787,6 +2875,80 @@ fn connect_unix(path: &Path) -> io::Result<OwnedFd> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// The routing rule for the three guests there are: a Linux guest whose
+    /// module acks `NVGPU_CFG_TAKES_INPUT`, a Linux guest whose module
+    /// predates it, and the Windows KMD, which runs the event queue (for
+    /// `EventReady`) but never acks the bit. None takes input before its
+    /// event queue is live.
+    #[test]
+    fn input_goes_to_guests_that_declare_it_and_run_the_event_queue() {
+        use protocol::messages::{MsgType, NVGPU_CFG_TAKES_INPUT};
+        const VERSION_1: u64 = 1 << 32;
+        let claims = GuestInputClaims::default();
+        assert!(!claims.takes_input(false));
+        assert!(!claims.takes_input(true), "nothing declared yet");
+
+        // Linux, current module: acks the bit (and asks for sys files).
+        claims.device_started(VERSION_1 | u64::from(NVGPU_CFG_TAKES_INPUT));
+        assert!(!claims.takes_input(false), "the queue is still required");
+        assert!(claims.takes_input(true));
+        claims.saw_request(MsgType::GetSysFiles as u32);
+        assert!(claims.takes_input(true));
+
+        // Linux, a module from before the bit: acks only VERSION_1, but asks
+        // for sys or proc files at probe, before anything else.
+        claims.device_started(VERSION_1);
+        assert!(!claims.takes_input(true), "not yet identified");
+        claims.saw_request(MsgType::GetSysFiles as u32);
+        assert!(claims.takes_input(true));
+        claims.saw_request(MsgType::Open as u32);
+        assert!(claims.takes_input(true), "later traffic does not undo it");
+        assert!(!claims.takes_input(false));
+        claims.device_started(VERSION_1);
+        claims.saw_request(MsgType::GetProcFiles as u32);
+        assert!(claims.takes_input(true));
+
+        // Windows: VERSION_1 only, event queue live, RM and Venus traffic,
+        // never sys files. Input stays on the console.
+        claims.device_started(VERSION_1);
+        for t in [
+            MsgType::Open,
+            MsgType::Ioctl,
+            MsgType::ScanoutFlip,
+            MsgType::GpuCmd,
+            MsgType::Close,
+        ] {
+            claims.saw_request(t as u32);
+        }
+        assert!(!claims.takes_input(true));
+        // ...and then NVK on RM in an application, whose librmclient
+        // forwards GetSysFiles through the KMD: still not the Linux module.
+        claims.saw_request(MsgType::GetSysFiles as u32);
+        claims.saw_request(MsgType::GetProcFiles as u32);
+        assert!(!claims.takes_input(true), "Windows NVK's GetSysFiles came late");
+
+        // A Linux guest reboots into Windows: the restart forgets it.
+        claims.device_started(VERSION_1 | u64::from(NVGPU_CFG_TAKES_INPUT));
+        claims.saw_request(MsgType::GetSysFiles as u32);
+        assert!(claims.takes_input(true));
+        claims.reset();
+        assert!(!claims.takes_input(true));
+        claims.device_started(VERSION_1);
+        assert!(!claims.takes_input(true));
+
+        // The rule itself.
+        for (live, acked, linux, want) in [
+            (false, false, false, false),
+            (false, true, true, false),
+            (true, false, false, false),
+            (true, true, false, true),
+            (true, false, true, true),
+            (true, true, true, true),
+        ] {
+            assert_eq!(guest_takes_input(live, acked, linux), want);
+        }
+    }
 
     #[test]
     fn modes_parse_and_nonsense_does_not() {

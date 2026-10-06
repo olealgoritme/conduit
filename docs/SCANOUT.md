@@ -204,7 +204,8 @@ guest flip ─► backend ─ export ─┤
 - **Cursor and clipboard** are per client: each gets the cursor when it
   becomes active and whenever it changes; the guest's clipboard goes to every
   connected client, and the host clipboard from any client goes to the guest.
-- **Input** from any client goes to the guest. Keys and buttons held through
+- **Input** from any client goes to the guest (one that takes Conduit
+  input; see [Boot console](#boot-console)). Keys and buttons held through
   a client are released when that client disconnects or loses focus, without
   touching what the other holds.
 - **Buffer release.** The backend does not forward `EV_RELEASE` (see
@@ -247,13 +248,31 @@ to it and input goes to the guest driver as usual. The console takes over
 again after a device reset, when the event queue stops, or when a
 `ScanoutDisable` is not followed by a flip within 250 ms.
 
-Input follows the picture only for a guest that takes Conduit input, which
-the backend reads from the event queue: the guest has started it and posted
-buffers on it (the Linux driver posts them at probe; cleared when the queue
-stops). A guest that never does -- Windows, whose Helios KMD runs only the
-control queue -- keeps its keyboard and pointer on the emulated PS/2 keyboard
-and USB tablet through the console's VNC connection even while its own
-frames are shown, since that is all it understands. The pointer is then
+Input follows the picture only for a guest that takes Conduit input. The
+rule (`device::display::guest_takes_input`) has two parts, both required:
+
+1. **The guest declares it.** The backend offers the virtio device feature
+   bit 12, `NVGPU_CFG_TAKES_INPUT` (a driver feature the guest acks, not a
+   config `features` bit; config bit 12 stays unused). The Linux module lists
+   it in its feature table and so acks it; the backend sees the acked
+   features at device start. A Linux module from before the bit acks only
+   `VIRTIO_F_VERSION_1`, but it is recognised anyway: it is the only guest
+   that sends `GetSysFiles`/`GetProcFiles` before any `Open`, `Ioctl`,
+   `ScanoutFlip` or `GpuCmd`, which every version does at probe. Both are
+   forgotten when the device restarts or resets.
+2. **Its event queue is live**: the guest has started it and posted buffers
+   on it (the Linux driver posts them at probe; cleared when the queue
+   stops).
+
+A guest that does not declare it -- Windows, whose Helios KMD acks only
+`VIRTIO_F_VERSION_1` and runs the event queue for `EventReady`, but sends
+`GetSysFiles` only when an application's NVK on RM forwards one, long after
+its own scanout and Venus traffic -- keeps its keyboard and pointer on the emulated
+PS/2 keyboard and USB tablet through the console's VNC connection even while
+its own frames are shown, since that is all it understands. The frontend must
+pass device feature bits through: QEMU's generic vhost-user device does;
+conduit-vmm offers the guest only `VIRTIO_F_VERSION_1`, so a guest there is
+taken for a Linux one by its `GetSysFiles` (the only guest conduit-vmm runs). The pointer is then
 placed by the guest's picture: absolute positions as the same fraction of
 QEMU's screen (which QEMU scales onto the tablet's range), relative motion in
 guest-frame pixels. Held keys and buttons are released on the side input

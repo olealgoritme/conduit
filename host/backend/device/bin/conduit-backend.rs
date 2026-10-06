@@ -36,7 +36,7 @@ use device::caps::Caps;
 use device::chain::{
     ReadableAfterWritable, Segment, capacity, sort_chain, writable, write_scattered,
 };
-use device::display::{DisplayLink, DisplayMode, InputSink};
+use device::display::{DisplayLink, DisplayMode, GuestInputClaims, InputSink};
 use device::host;
 use device::nvidia::NvidiaBackend;
 use device::shm::WindowPlacer;
@@ -50,8 +50,8 @@ use device::shm_regions::{SHM_ID_VENUS, region_sizes_with_venus};
 use device::virtio::{NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use protocol::messages::{
     CLIPBOARD_MESSAGE_HEAD, CLIPBOARD_MIME_TEXT, ClipboardChunk, DISPLAY_MODE_MESSAGE_LEN,
-    DisplayModeEvent, InputEventEntry, MsgHeader, MsgType, clipboard_mime, encode_clipboard_chunk,
-    encode_display_mode, encode_input_events, input_events_that_fit,
+    DisplayModeEvent, InputEventEntry, MsgHeader, MsgType, NVGPU_CFG_TAKES_INPUT, clipboard_mime,
+    encode_clipboard_chunk, encode_display_mode, encode_input_events, input_events_that_fit,
 };
 use std::os::fd::{BorrowedFd, RawFd};
 use vhost::vhost_user::message::{
@@ -463,6 +463,9 @@ struct VqInputSink {
     /// The guest has posted event-queue buffers since the queue last
     /// started (see `takes_input`).
     posted: bool,
+    /// What the guest's driver said about taking input, learnt on the
+    /// request path.
+    claims: Arc<GuestInputClaims>,
 }
 
 /// Whether the guest has posted buffers on the event queue since it last
@@ -492,10 +495,12 @@ fn event_buffers_posted(
 const CLIP_CHUNKS_PER_PASS: usize = 16;
 
 impl InputSink for VqInputSink {
-    /// The guest takes `InputEvent`s if its driver posts event-queue
-    /// buffers. The Linux guest posts 64 at probe, long before its first
-    /// frame; the Windows KMD never starts the queue at all (it runs only
-    /// the control queue), and has nowhere to put an `InputEvent` anyway.
+    /// The guest takes `InputEvent`s if its driver declares it (acks
+    /// `NVGPU_CFG_TAKES_INPUT`, or is the Linux module from before the bit)
+    /// and posts event-queue buffers (`device::display::guest_takes_input`).
+    /// The Linux guest does both at probe, long before its first frame. The
+    /// Windows KMD may run the event queue (for `EventReady`) but never acks
+    /// the bit, and has nowhere to put an `InputEvent`.
     fn takes_input(&mut self) -> bool {
         let target = self.target.lock().expect("event target").clone();
         self.posted = match target {
@@ -503,7 +508,7 @@ impl InputSink for VqInputSink {
             // No guest request served yet: nothing posted that we know of.
             None => false,
         };
-        self.posted
+        self.claims.takes_input(self.posted)
     }
 
     fn push(&mut self, events: &[InputEventEntry]) -> usize {
@@ -932,6 +937,9 @@ struct NvGpuBackend {
     watches: Option<Sender<Watch>>,
     /// Where display input goes; filled in alongside `watches`.
     input_target: EventTarget,
+    /// Whether the guest takes display input: set from the acked features
+    /// and the requests served, read by the input sink.
+    input_claims: Arc<GuestInputClaims>,
     /// The request and response of the chain being served, kept across chains.
     /// A fresh 64 KiB response zeroed per request cost more than the host's
     /// whole RM call, and only the bytes dispatch writes are sent back.
@@ -985,6 +993,7 @@ impl NvGpuBackend {
         vram_limit_mib: Option<u64>,
         display: Option<(DisplayMode, Arc<DisplayLink>, bool)>,
         input_target: EventTarget,
+        input_claims: Arc<GuestInputClaims>,
     ) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
@@ -1045,6 +1054,7 @@ impl NvGpuBackend {
             config,
             watches: None,
             input_target,
+            input_claims,
             req: Vec::new(),
             resp: vec![0u8; RESP_MAX],
             readable: Vec::new(),
@@ -1165,6 +1175,7 @@ impl NvGpuBackend {
         #[cfg(feature = "venus")]
         self.venus.held.lock().expect("held chains").clear();
         self.served = false;
+        self.input_claims.reset();
     }
 
     /// Drain one virtqueue, dispatching every chain.
@@ -1217,6 +1228,13 @@ impl NvGpuBackend {
                         std::io::Error::other(format!("read request descriptor: {e}"))
                     })?;
                 }
+            }
+
+            // The Linux module identifies itself by what it asks for (input
+            // routing, `GuestInputClaims`).
+            if let Some(t) = self.req.get(..4) {
+                self.input_claims
+                    .saw_request(u32::from_le_bytes(t.try_into().expect("4 bytes")));
             }
 
             let written = match layout {
@@ -1308,6 +1326,8 @@ impl VhostUserBackendMut for NvGpuBackend {
         (1 << VIRTIO_F_VERSION_1)
             | (1 << VIRTIO_F_NOTIFY_ON_EMPTY)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
+            // Acked by a guest that consumes `InputEvent` (the Linux module).
+            | u64::from(NVGPU_CFG_TAKES_INPUT)
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
     }
 
@@ -1337,10 +1357,22 @@ impl VhostUserBackendMut for NvGpuBackend {
     /// Having served requests before then means they came from the previous
     /// boot, whose files, RM objects and VRAM would otherwise stay held until
     /// this process exits.
-    fn acked_features(&mut self, _features: u64) {
+    ///
+    /// The acked features also say whether this guest's driver takes display
+    /// input (`NVGPU_CFG_TAKES_INPUT`).
+    fn acked_features(&mut self, features: u64) {
         if self.served {
             self.reset("device restarted (guest reboot or driver reload)");
         }
+        self.input_claims.device_started(features);
+        log::info!(
+            "guest driver features {features:#x}: {}",
+            if features & u64::from(NVGPU_CFG_TAKES_INPUT) != 0 {
+                "takes Conduit input"
+            } else {
+                "no NVGPU_CFG_TAKES_INPUT (Windows, or a Linux module from before it)"
+            }
+        );
     }
 
     fn set_backend_req_fd(&mut self, backend: Backend) {
@@ -1627,6 +1659,7 @@ fn main() -> anyhow::Result<()> {
     // thread of its own that connects, reads input and reconnects. Started
     // after the sandbox, which must go on while this process is one thread.
     let input_target: EventTarget = Arc::new(Mutex::new(None));
+    let input_claims = Arc::new(GuestInputClaims::default());
     let display = if args.display.is_some() || !args.display_socket.is_empty() {
         let mode = args.display.unwrap_or(DisplayMode::DEFAULT);
         let link = DisplayLink::with_paths(args.display_socket.clone(), mode);
@@ -1637,6 +1670,7 @@ fn main() -> anyhow::Result<()> {
             warned_clip_small: false,
             msg: Vec::new(),
             posted: false,
+            claims: input_claims.clone(),
         };
         if link.path().is_some() {
             let l = link.clone();
@@ -1696,6 +1730,7 @@ fn main() -> anyhow::Result<()> {
         args.vram_limit_mib,
         display,
         input_target,
+        input_claims,
     )?;
     #[cfg(feature = "venus")]
     if args.venus {
@@ -1802,6 +1837,64 @@ mod tests {
         mem.memory().write_obj(64u16.to_le(), avail_idx).unwrap();
         vring.set_queue_ready(false);
         assert!(!event_buffers_posted(&vring, &mem, true));
+    }
+
+    /// The sink routes input to the guest only for a driver that declares it
+    /// and has posted event buffers: a Linux guest with the feature bit, a
+    /// Linux guest whose module predates the bit (known by its `GetSysFiles`),
+    /// but not the Windows KMD, which runs the event queue without the bit.
+    #[test]
+    fn the_sink_takes_input_only_for_a_guest_that_declares_it() {
+        const VERSION_1: u64 = 1 << VIRTIO_F_VERSION_1;
+        let gm = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryAtomic::new(gm);
+        let vring = VringRwLock::new(mem.clone(), 256).unwrap();
+        let target: EventTarget = Arc::new(Mutex::new(None));
+        let claims = Arc::new(GuestInputClaims::default());
+        let mut sink = VqInputSink {
+            target: target.clone(),
+            warned_small: false,
+            warned_clip_small: false,
+            msg: Vec::new(),
+            posted: false,
+            claims: claims.clone(),
+        };
+        let live = |on: bool| {
+            vring.set_queue_ready(on);
+        };
+        vring.set_queue_size(16);
+        vring.set_queue_info(0x1000, 0x2000, 0x3000).unwrap();
+        mem.memory()
+            .write_obj(64u16.to_le(), GuestAddress(0x2002))
+            .unwrap();
+
+        // No guest request yet: no target, nothing taken.
+        claims.device_started(VERSION_1 | u64::from(NVGPU_CFG_TAKES_INPUT));
+        assert!(!sink.takes_input());
+        *target.lock().unwrap() = Some((vring.clone(), mem.clone()));
+
+        // Linux with the bit: once the queue is live.
+        live(false);
+        assert!(!sink.takes_input(), "queue not started");
+        live(true);
+        assert!(sink.takes_input());
+
+        // Linux from before the bit: once it asked for sys files.
+        claims.device_started(VERSION_1);
+        assert!(!sink.takes_input());
+        claims.saw_request(MsgType::GetSysFiles as u32);
+        assert!(sink.takes_input());
+
+        // Windows: event queue live and posted, no bit, no sys files.
+        claims.device_started(VERSION_1);
+        claims.saw_request(MsgType::ScanoutFlip as u32);
+        claims.saw_request(MsgType::Open as u32);
+        claims.saw_request(MsgType::GpuCmd as u32);
+        assert!(!sink.takes_input(), "input stays on QEMU's devices");
+        // NVK on RM there forwards GetSysFiles from user mode: too late to
+        // be the Linux module.
+        claims.saw_request(MsgType::GetSysFiles as u32);
+        assert!(!sink.takes_input(), "Windows NVK is not the Linux module");
     }
 
     /// A fence's status rides in the header, signed, as the guest reads it.

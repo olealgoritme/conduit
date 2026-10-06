@@ -242,6 +242,15 @@ struct nvgpu_open_resp {
  * answers with a handle, which gets one EventReady when the host fence
  * signals (docs/SYNC.md, nvgpu_fence.h). Bit 10 is Venus, for Windows. */
 #define NVGPU_CFG_DRM_FENCES (1u << 11)
+/*
+ * The other direction: a virtio *device feature* this driver acks, not a
+ * config bit (protocol NVGPU_CFG_TAKES_INPUT = 1 << 12). It tells the backend
+ * that this driver consumes INPUT_EVENT on its event queue, so viewer input
+ * comes here rather than to the VM's emulated keyboard and tablet. The
+ * Windows KMD runs an event queue too and never acks it (docs/SCANOUT.md
+ * "Input"). A feature number, for the feature table below.
+ */
+#define NVGPU_F_TAKES_INPUT 12
 
 /*
  * The largest nvidia-drm GEM parameter struct this driver forwards, and the
@@ -6941,12 +6950,14 @@ module_param(virtio_id, uint, 0444);
 MODULE_PARM_DESC(virtio_id, "virtio device ID to bind (default 45)");
 
 /*
- * No device feature bits. What the backend serves travels in config `caps`;
- * three feature bits were declared here once, and nothing offered or tested
- * them.
+ * One device feature bit: NVGPU_F_TAKES_INPUT, the driver's "send me input
+ * events". What the backend serves travels in config `caps` and `features`;
+ * three other feature bits were declared here once, and nothing offered or
+ * tested them. A backend that does not offer the bit just leaves it unacked.
  */
 static unsigned int features[] = {
     VIRTIO_F_VERSION_1,
+    NVGPU_F_TAKES_INPUT,
 };
 
 static struct virtio_driver nvgpu_driver = {

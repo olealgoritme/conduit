@@ -44,7 +44,11 @@ What changed in `kmd_render/src/virtio`:
 - **Identity.** The INF and packaging scripts match virtio id 45 (`DEV_106D`)
   and id 41 (`DEV_1069`). Conduit's QEMU runs the device as id 45
   (`virtio-id=45`); id 41 is the alternative, as `conduit_gpu.ko virtio_id=41` is on Linux.
-- **Negotiation.** Only `VIRTIO_F_VERSION_1` is offered or required. Config
+- **Negotiation.** Only `VIRTIO_F_VERSION_1` is required, and the KMD acks
+  nothing else. The device also offers feature bit 12,
+  `NVGPU_CFG_TAKES_INPUT` ("send me `InputEvent`s"); the KMD must keep it
+  unacked, event queue or not, so keyboard and mouse stay on QEMU's emulated
+  devices ([SCANOUT.md](../../docs/SCANOUT.md#boot-console)). Config
   `features` must carry `NVGPU_CFG_VENUS` (offset 3884), i.e. the backend runs
   with `--venus`, or the KMD fails `StartDevice` with a message.
 - **Framing.** Every control-queue message is `MsgHeader{GpuCmd}` + the
