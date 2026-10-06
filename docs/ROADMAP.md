@@ -32,9 +32,10 @@
 - [ ] Display pacing: forward buffer release, drive the guest vblank from the
       host's presentation feedback ([KNOWN-ISSUES.md](KNOWN-ISSUES.md))
 - [ ] Windows guests on NVK-on-RM: the desktop and every app and game through
-      Mesa NVK on the host's RM, zero-copy, Venus removed in the end. Heaven
-      already runs at ~350 fps there against 139 on Venus. Goal, stages and
-      state: [NVK-ROADMAP.md](NVK-ROADMAP.md)
+      Mesa NVK on the host's RM, zero-copy, Venus removed in the end. The
+      desktop/DWM, D3D11, D3D12, Vulkan and OpenGL already run on NVK (DWM up
+      to 237 fps at 240 Hz, Heaven 285-511 fps on the scanout). Goal, stages
+      and state: [NVK-ROADMAP.md](NVK-ROADMAP.md)
 - [ ] Windows guests through Venus (in progress, experimental `--venus`):
       Helios's guest drivers over Conduit's device ([WINDOWS.md](WINDOWS.md),
       [VENUS.md](VENUS.md)); runs in a Windows 11 guest.

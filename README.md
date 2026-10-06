@@ -24,13 +24,30 @@ from GPU memory to your screen: no copying, no video compression.
 | Clipboard both ways, sound (speakers + mic) | ✅ |
 | Streaming to Moonlight (AV1/HEVC/H.264, up to 240 fps) | ✅ |
 | virt-manager / virsh (start, pause, reboot, stop; attach to existing VMs) | ✅ |
-| Windows VMs (D3D11/12, Vulkan) | experimental, opt-in (`--venus`, built by hand: [Windows guests](docs/WINDOWS.md)) |
+| Windows VMs: desktop/DWM, D3D11, D3D12, Vulkan, OpenGL (Zink) on NVK, Venus as fallback | experimental, opt-in (`--venus`, driver built by hand: [Windows guests](docs/WINDOWS.md)) |
 | NVK (Mesa's open Vulkan driver) on NVIDIA's kernel driver, in a Linux VM | experimental, opt-in (`NVK_RM=1`: [guest/nvk-rm](guest/nvk-rm/README.md), [librmclient](guest/rmclient/README.md)) |
 
 > Conduit is early software, tested mainly on an RTX 5090 with Ubuntu 24.04
 > and Hyprland. Expect rough edges. Windows guests are experimental (`--venus`),
 > and the guest driver is test-signed ([docs/WINDOWS.md](docs/WINDOWS.md),
 > [Roadmap](docs/ROADMAP.md)).
+
+### Windows guests
+
+A Windows 11 guest renders through Mesa's NVK driver talking to the host's
+NVIDIA kernel driver (RM) through Conduit ("NVK-on-RM"): the desktop and DWM,
+D3D11 (DXVK) and D3D12 (vkd3d-proton) in the Helios UMDs, Vulkan, and OpenGL
+through Zink, with zero-copy presentation. Venus (Vulkan replayed by the
+host's Vulkan driver) is still there as the fallback for anything the policy
+keeps off NVK, and goes once every workload has an NVK path. Tested only on an
+RTX 5090.
+
+- [docs/WINDOWS.md](docs/WINDOWS.md): set up the VM, build and install the
+  driver package, the opt-ins
+- [docs/NVK-ROADMAP.md](docs/NVK-ROADMAP.md): measured state and what is left
+- [docs/SECOND-MACHINE.md](docs/SECOND-MACHINE.md): the whole setup on another
+  NVIDIA host
+- [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md#windows-guests-venus): limits
 
 ## What you need
 
@@ -239,7 +256,7 @@ The Windows guest components come from [Helios](https://github.com/winboat-org/h
 by the WinBoat project (rupansh, TibixDev), with
 [DXVK](https://github.com/doitsujin/dxvk),
 [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton),
-[Mesa](https://mesa3d.org) (Venus) and
+[Mesa](https://mesa3d.org) (NVK, Zink, Venus) and
 [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer).
 Licenses: see [LICENSE](LICENSE) and the `NOTICE` files in each component.
 

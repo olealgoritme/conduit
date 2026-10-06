@@ -10,7 +10,35 @@ every workload has an NVK path.
 This file is the working plan. It is updated as stages land; the numbers are
 measurements, with the setup named.
 
-## Where it stands (2026-10-06, afternoon)
+## Where it stands (2026-10-07)
+
+Driver package 22.22.341.3 (KMD v341) is on main and was tested on the
+RTX 5090 (win11 guest, 5120x1440@240). The desktop and DWM run on NVK
+(`DwmIcd=nvk`, KMD `ForeignFlip=1`); D3D11, D3D12, Vulkan and OpenGL (Zink)
+run on NVK; Venus stays as the fallback.
+
+| | NVK-on-RM |
+|---|---|
+| NVK DWM desktop at 240 Hz | up to 237 fps, with the flip-announce fix (KMD v333/v334: flip announce on by default, `FlipAnnForeign` default with `ForeignFlip`) |
+| Unigine Heaven D3D11 1600x900, app owns the scanout | 285-511 fps after NVK patch 0051 (UBO descriptors no longer promoted to bound cbufs on Windows; GPU time per draw 2.7 -> 0.7 µs) |
+| Unigine Heaven D3D11 1600x900, windowed (composed by DWM) | ~200-220 fps |
+| RM-fence present (`NvkRmFencePresent`) | on by default: composed NVK presents retire on the RM fence, no CPU wait |
+
+Remaining, in order:
+
+1. The windowed blt path: a guest-memory blob as the Venus copy destination
+   removes the CPU copy and the fence wait from the composed Present. Host
+   side done (`venus.guest_blobs`, [VENUS.md](VENUS.md) "Guest-memory
+   blobs"); KMD v343 in review.
+2. Recovery after `pnputil /restart-device`: open issues (wrong buffer on
+   scanout after a restart,
+   [zero-copy-present.md](../guest/windows/docs/zero-copy-present.md) 25;
+   NVK's holder context renewal, Mesa patch 0052).
+3. Unigine Heaven x86 OpenGL (Zink, 32-bit) renders a white scene.
+4. The KMD's own RM client at level 5 has not been run.
+5. Venus removal (S6d).
+
+## Earlier measurements (2026-10-06, afternoon)
 
 Measured in the win11 guest (5120x1440@240) through the installed driver
 package 22.22.325.1 (KMD v325), NVK chosen per process unless noted.
@@ -72,10 +100,10 @@ flips frames.
 | S1 | Heaven via app-local DXVK on NVK | done | `spike/heaven-dxvk-nvk`, `feat/nvk-rm-bar-heap` |
 | S2 | Zero-copy present for NVK apps | done (linear and block-linear; three scanout images) | `feat/nvk-rm-windows-wsi`, `feat/nvk-rm-wsi-blocklinear` |
 | S3 | The Helios D3D11 UMD runs DXVK on NVK, global with a deny-list, Venus fallback | done, in the combined package | `feat/umd-nvk-combined` |
-| S4 | RM fences as the present boundary | done | `feat/s4-rm-fences` |
+| S4 | RM fences as the present boundary | done; RM-fence present on by default | `feat/s4-rm-fences`, `feat/umd-nvk-combined` |
 | S5 | D3D12 on NVK (vkd3d-proton in UMD12) | done (NVK and Venus) | `feat/umd-nvk-combined` |
 | S6a | Cross-process shared surfaces and keyed mutex on NVK | done with a releaser CPU wait; GPU-ordered hand-off ledger in progress | `fix/s6-handoff-ledger` |
-| S6b | DWM on NVK | DWM runs on NVK and composes NVK windows; KMD `ForeignFlip` shows its buffers zero-copy; open: flip completion (the vsync timer stops while a foreign primary is shown), the KMD worker spinning | `feat/dwm-on-nvk`, KMD `worktree-kmd-start-debug` (v320–v325) |
+| S6b | DWM on NVK | done: DWM on NVK composes the desktop, KMD `ForeignFlip` shows its buffers zero-copy, up to 237 fps at 240 Hz with flip announce (v333/v334) | `feat/dwm-on-nvk`, `feat/umd-nvk-combined` (KMD v320–v341) |
 | S6c | Shrink the deny-list | shared ids for every desktop/browser format work (A8 for the shell, NV12/P010 for video, fp16/10-bit); category moves in progress | `feat/nvk-share-formats`, `docs/dwm-on-nvk.md` |
 | S6d | Venus removed | after S6b/S6c; DXR titles stay on Venus until NVK has ray tracing | |
 
@@ -111,8 +139,9 @@ RM client; KMD builds are installed live.
 
 ## Performance work still open
 
-- DWM on NVK at the display rate (240 Hz): flip completion and vsync while a
-  foreign primary is shown (KMD).
+- The windowed (composed) Present: guest-memory blob copy destination
+  (KMD v343 in review); today ~200-220 fps windowed against 285-511 fps on
+  the scanout in Heaven.
 - MSI-X for the GPU device as the default, to cut the ~55 µs per RM call
   (KMD lane in progress).
 - Scanout release tracking (Mesa 0036) caps NVK apps that own the screen;
@@ -147,6 +176,8 @@ Canonical branch: `nvk-rm/integration`.
 | `0027–0029` | cached system-memory GPU mappings, compression, ZCULL |
 | `0030` | S4 fences (in progress) |
 | `0031` | S6 shared surfaces (in progress) |
+| `0051` | UBO descriptors not promoted to bound cbufs on Windows (Heaven GPU time per draw 2.7 -> 0.7 µs) |
+| `0052` | the Helios holder context renewed after a KMD restart |
 | `patches-windows-dxvk/0001–0004` | i686 build fix, no present-wait advertised, R/B in the GDI path, wait knobs |
 
 ## How changes get tested

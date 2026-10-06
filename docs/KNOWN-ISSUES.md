@@ -61,7 +61,9 @@ Experimental, behind `--venus` ([WINDOWS.md](WINDOWS.md), [VENUS.md](VENUS.md)).
   when the blob holds the padded rows). An optimal-tiling scanout whose
   height is a whole number of blocks (768, 1024) is taken as linear and shows
   garbage.
-- Only `HOST3D` blobs; guest-memory blobs are refused.
+- Guest-memory blobs only with `conduit config set venus.guest_blobs true`
+  (opt-in, [VENUS.md](VENUS.md) "Guest-memory blobs"); otherwise only
+  `HOST3D` blobs.
 - A fence on a ring with no queue bound makes virglrenderer destroy the
   context, which the backend cannot see.
 

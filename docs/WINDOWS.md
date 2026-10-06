@@ -1,12 +1,19 @@
 # Windows guests (experimental)
 
-A Windows 11 guest renders on the host GPU through Venus: D3D11 through
-DXVK, D3D12 through vkd3d-proton and Vulkan through Mesa's Venus driver in
-the guest, executed by the host's NVIDIA Vulkan driver in `conduit-venus`.
-The guest drivers come from Helios ([guest/windows/HELIOS.md](../guest/windows/HELIOS.md));
-the host side is in [VENUS.md](VENUS.md). It is opt-in (`--venus`),
-tested on one machine (RTX 5090, a 5120×1440 240 Hz monitor), and has the
-limits listed in [KNOWN-ISSUES.md](KNOWN-ISSUES.md#windows-guests-venus).
+A Windows 11 guest renders on the host GPU through NVK-on-RM: Mesa's NVK
+Vulkan driver in the guest talks to the host's NVIDIA kernel driver (RM)
+through librmclient, the Helios KMD and `conduit-backend`. The desktop and
+DWM, D3D11 (DXVK in the Helios UMD), D3D12 (vkd3d-proton in UMD12), Vulkan
+and OpenGL (Zink) run on NVK, with zero-copy presentation. Venus (Vulkan
+command encoding executed by the host's NVIDIA Vulkan driver in
+`conduit-venus`) is still there as the fallback for processes the policy
+keeps off NVK. The guest drivers come from Helios
+([guest/windows/HELIOS.md](../guest/windows/HELIOS.md)); the host side is in
+[VENUS.md](VENUS.md); state and measurements are in
+[NVK-ROADMAP.md](NVK-ROADMAP.md). It is opt-in (`--venus`), tested on one
+machine (RTX 5090, a 5120×1440 240 Hz monitor), and has the limits listed in
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md#windows-guests-venus). For a fresh setup on
+another host, follow [SECOND-MACHINE.md](SECOND-MACHINE.md).
 
 ## Host
 
@@ -78,15 +85,68 @@ one CCD made no measurable difference.
 
 ## Guest driver
 
-Build it with `.github/workflows/windows.yml` (the full package:
-`HeliosSetup.exe` with the KMD, UMDs, Mesa Venus ICD, Zink, loaders) or, for
-the driver alone, in a local build VM ([guest/windows/ci/vm/README.md](../guest/windows/ci/vm/README.md)).
-Install the full package once with `HeliosSetup.exe`
-([guest/windows/packaging/windows/README.md](../guest/windows/packaging/windows/README.md));
-a driver-only build then replaces the driver with `pnputil` (version bump
-needed, see the build VM README). The current driver is 22.22.297.0
-(`guest/windows/kmd_render/driver-version.env`). The adapter shows as
-"Conduit Helios", the monitor as "Conduit".
+The driver package is the WDDM KMD, the x64/x86 D3D11 and D3D12 UMDs, NVK on
+RM with librmclient (64- and 32-bit) and Zink. The current version is
+22.22.341.3 (`guest/windows/kmd_render/driver-version.env`, the only place
+the version is set). The adapter shows as "Conduit Helios", the monitor as
+"Conduit".
+
+**First install: the full package.** Build `HeliosSetup.exe` with
+`.github/workflows/windows.yml` (KMD, UMDs, NVK, Zink, the Mesa Venus ICD,
+Khronos loaders) and run it once in the guest
+([guest/windows/packaging/windows/README.md](../guest/windows/packaging/windows/README.md)).
+The first run turns on test-signing and asks for a reboot; run it again after
+the reboot, then reboot once more.
+
+**Driver updates: the local build VM**
+([guest/windows/ci/vm/README.md](../guest/windows/ci/vm/README.md)):
+
+```sh
+git submodule update --init --recursive guest/windows/third_party/dxvk guest/windows/third_party/vkd3d-proton
+guest/nvk-rm/windows/stage-helios-package.sh          # NVK + Zink, cross-built -> dist/nvk-windows
+WIN_SSH=user@127.0.0.1 guest/windows/ci/vm/win-build.sh Release
+```
+
+The package is signed with a development certificate
+(`helios-dev-test.cer`, in the package). In the guest, from an administrator
+prompt:
+
+```bat
+bcdedit /set testsigning on
+certutil -addstore -f Root helios-dev-test.cer
+certutil -addstore -f TrustedPublisher helios-dev-test.cer
+pnputil /add-driver helios_kmd_render.inf /install
+```
+
+then reboot (or `pnputil /restart-device` on the adapter). pnputil keeps an
+installed driver of the same version: bump `HELIOS_KMD_VERSION` for every
+build installed over an earlier one.
+
+**Which driver a process gets.** One policy, read by the UMDs, NVK and Zink
+(`guest/windows/protocol/include/helios_icd_policy.h`), decides per process,
+from values under `HKLM\SOFTWARE\Helios`: NVK by default, except the built-in
+deny-list (DWM, the shell, browsers and other interop-heavy apps stay on
+Venus); `NvkDenyList` / `NvkAllowList` (executable names, `;`-separated)
+adjust it; `Icd=venus` puts D3D, Vulkan and OpenGL back on Venus. When DWM
+is on NVK (`DwmIcd=nvk`, below) the rest of the desktop follows it, and only
+`NvkDenyList` still keeps a process on Venus (`DesktopFollowsDwm=0` turns
+that off).
+
+## Opt-ins
+
+Off by default while new; each one was measured on the test machine
+([NVK-ROADMAP.md](NVK-ROADMAP.md)).
+
+| Where | Setting | What it does |
+|---|---|---|
+| Host | `conduit config set venus.guest_blobs true` | the backend serves guest-memory blobs (`--venus-guest-blobs`, [VENUS.md](VENUS.md) "Guest-memory blobs"): Venus copy destinations over the guest's own pages, for the KMD's windowed Present. Applies when the VM's backend next starts. Needs the patched virglrenderer (patch 0002) |
+| Guest, `HKLM\SOFTWARE\Helios` | `DwmIcd` = `nvk` (REG_SZ) | DWM on NVK, read only by `dwm.exe` when it starts. A crash-loop guard sends DWM back to Venus after `DwmNvkMaxStarts` (2) starts within `DwmNvkGuardSeconds` (600) ([dwm-on-nvk.md](dwm-on-nvk.md) 4.1). Use with `ForeignFlip=1` |
+| Guest, KMD service key | `ForeignFlip` = 1 | the KMD flips the NVK DWM's swap-chain buffers to the scanout itself, zero-copy. Read at adapter start (`pnputil /restart-device`) |
+| Guest, `HKLM\SOFTWARE\Helios` | `DirectFlipSupport` = 1 (or `HELIOS_DIRECT_FLIP_SUPPORT` per process) | the D3D11.1 `CheckDirectFlipSupport` DDI answers yes when dxgkrnl reports DirectFlip for the adapter and size and format match; 2 = whenever size and format match (test lever); 0 (default) = never. Windows uses the answer for independent flip and the blt-to-flip upgrade |
+
+On by default, with a way back: `NvkRmFencePresent` (composed NVK presents
+retire on the RM fence; 0, or `HELIOS_NVK_RM_FENCE_PRESENT=0`, restores the
+CPU wait).
 
 ## Display
 
