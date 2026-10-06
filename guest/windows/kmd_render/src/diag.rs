@@ -1063,6 +1063,11 @@ pub mod knobs {
     /// invalid" instead. Independent of `BltAsync`. Read at every StartDevice; mirrored as
     /// `BltNoMirKnob`.
     pub const BLT_NO_MIRROR: KnobName = KnobName::new(b"BltNoMirror");
+    /// `BltAsyncVenus` (default 0 = the knobs act on foreign sources only). 1: `BltAsync` and
+    /// `BltNoMirror` also act on a Venus-native source (an image the UMD created through Venus)
+    /// blitted into a standard buffer. Has no effect with both of those knobs at 0. Read at every
+    /// StartDevice; mirrored as `BltVenusKnob`. `docs/zero-copy-present.md` section 24.11.
+    pub const BLT_ASYNC_VENUS: KnobName = KnobName::new(b"BltAsyncVenus");
     /// `BltLookahead` (default 1 = the front of the ready queue only, the behaviour before
     /// v337). How many entries of the WindowedBlt ready queue the HPD worker looks at when it
     /// picks the next copy to submit: a request whose producer has not finished, or whose

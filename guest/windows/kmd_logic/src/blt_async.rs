@@ -121,7 +121,9 @@ pub struct Facts {
     pub async_on: bool,
     /// `BltNoMirror` is on.
     pub no_mirror_on: bool,
-    /// The source is an adopted foreign resource (the KMD's own record, never the creator's word).
+    /// The source is one the knobs act on (`class_eligible`: an adopted foreign resource the KMD
+    /// copies as one, or a Venus-native one with `BltAsyncVenus`; the KMD's own record, never the
+    /// creator's word).
     pub foreign_source: bool,
     /// A WindowedBlt snapshot accompanies the Present.
     pub snapshot: bool,
@@ -159,6 +161,132 @@ pub const fn no_mirror_applies(
     dst_standard_buffer: bool,
 ) -> bool {
     no_mirror_on && foreign_source && !snapshot && dst_standard_buffer
+}
+
+/// What a Blt's source is, as far as the asynchronous arm is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceClass {
+    /// An adopted foreign (NVK-on-RM) allocation the KMD copies through the explicit-modifier
+    /// import (`ForeignCopy=1`).
+    Foreign,
+    /// An adopted foreign allocation seen while `ForeignCopy` is 0: the legacy arm treats it as an
+    /// ordinary OPTIMAL source (the plain import the host refuses for these resources, counted
+    /// `FcOff`), so neither knob may act on it. This is what Heaven's present was on the v337.2
+    /// hardware runs: every Blt counted `FcOff`, none took the asynchronous arm.
+    ForeignCopyOff,
+    /// A Venus-native source: an image the UMD created through Venus (cross-context or
+    /// opaque-fd). The copy is ordered after the producer by the Venus ring itself.
+    Venus,
+}
+
+/// Why neither knob acted on a Blt (`BltEntryWhy` holds the last code, `BltEntryMask` has bit
+/// `code - 1` for every code seen). The codes are in the order [`entry`] tries them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryWhy {
+    /// `BltAsync` and `BltNoMirror` are both 0 (`BltNoEntryK`).
+    KnobOff = 1,
+    /// A WindowedBlt snapshot accompanies the Present (`BltNoEntryM`): it has its own two-phase
+    /// path, which neither knob changes.
+    Snapshot = 2,
+    /// The source is Venus-native and `BltAsyncVenus` is 0 (`BltNoEntryF`).
+    NotForeign = 3,
+    /// The source is foreign but `ForeignCopy` is 0 (`BltNoEntryFc`): the knobs cannot act on a
+    /// source the KMD does not copy as a foreign one. Set `ForeignCopy=1`.
+    ForeignCopyOff = 4,
+    /// The destination is not a KMD standard buffer (`BltNoEntryS`).
+    NotBuffer = 5,
+    /// Never returned by [`entry`]: a Blt of the arm that returned before the decision (patch
+    /// capacity, an unresolved allocation, format, source kind, snapshot validation, descriptors,
+    /// extent). Counted as `BltNoEntryO`, derived as the arm's Blts minus the decided ones.
+    Other = 6,
+}
+
+impl EntryWhy {
+    /// The code written to `BltEntryWhy`.
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+
+    /// The bit this reason owns in `BltEntryMask`.
+    pub const fn bit(self) -> u32 {
+        1 << (self as u32 - 1)
+    }
+}
+
+/// Everything [`entry`] needs.
+#[derive(Debug, Clone, Copy)]
+pub struct EntryFacts {
+    /// `BltAsync` is on.
+    pub async_on: bool,
+    /// `BltNoMirror` is on.
+    pub no_mirror_on: bool,
+    /// `BltAsyncVenus` is on: both knobs also act on Venus-native sources.
+    pub async_venus_on: bool,
+    /// The class of the source.
+    pub source: SourceClass,
+    /// A WindowedBlt snapshot accompanies the Present.
+    pub snapshot: bool,
+    /// The destination is a KMD standard buffer.
+    pub dst_standard_buffer: bool,
+}
+
+/// What [`entry`] decided (the in-flight table's record is [`Entry`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryDecision {
+    /// The Blt goes to `try_async` (and its [`decide`]).
+    pub async_enter: bool,
+    /// `BltNoMirror` applies to the Blt, whichever arm copies it.
+    pub no_mirror: bool,
+    /// The first reason neither knob acts; `None` when at least one does.
+    pub why: Option<EntryWhy>,
+}
+
+/// Whether the source class is one the knobs act on: a foreign source with its copy enabled, or
+/// a Venus-native one when `BltAsyncVenus` says so.
+pub const fn class_eligible(source: SourceClass, async_venus_on: bool) -> bool {
+    match source {
+        SourceClass::Foreign => true,
+        SourceClass::ForeignCopyOff => false,
+        SourceClass::Venus => async_venus_on,
+    }
+}
+
+/// The entry decision of a Blt, made once, before [`decide`] and before the legacy arm.
+///
+/// The table (reasons are tried top down; `eligible` = class, destination and snapshot rows pass):
+///
+/// | knobs | snapshot | source | destination | result |
+/// |---|---|---|---|---|
+/// | both 0 | any | any | any | none: `KnobOff` |
+/// | any on | yes | any | any | none: `Snapshot` |
+/// | any on | no | Venus, `BltAsyncVenus` 0 | any | none: `NotForeign` |
+/// | any on | no | foreign, `ForeignCopy` 0 | any | none: `ForeignCopyOff` |
+/// | any on | no | eligible | not a standard buffer | none: `NotBuffer` |
+/// | any on | no | eligible | standard buffer | `async_enter` = `BltAsync`, `no_mirror` = `BltNoMirror` |
+///
+/// What stays out of this function and in [`decide`]: the producer boundary, the in-flight table,
+/// the deferred queue (they need the transport). A Blt that enters can still fall back there
+/// (`BltAsyncFall`).
+pub const fn entry(f: EntryFacts) -> EntryDecision {
+    let why = if !f.async_on && !f.no_mirror_on {
+        Some(EntryWhy::KnobOff)
+    } else if f.snapshot {
+        Some(EntryWhy::Snapshot)
+    } else if matches!(f.source, SourceClass::ForeignCopyOff) {
+        Some(EntryWhy::ForeignCopyOff)
+    } else if !class_eligible(f.source, f.async_venus_on) {
+        Some(EntryWhy::NotForeign)
+    } else if !f.dst_standard_buffer {
+        Some(EntryWhy::NotBuffer)
+    } else {
+        None
+    };
+    let eligible = why.is_none();
+    EntryDecision {
+        async_enter: eligible && f.async_on,
+        no_mirror: eligible && f.no_mirror_on,
+        why,
+    }
 }
 
 /// The route of one Blt.
@@ -528,6 +656,20 @@ pub const COUNTERS: &[&str] = &[
     // Knobs in force.
     "BltAsyncKnob",
     "BltNoMirKnob",
+    "BltVenusKnob",
+    // The entry decision, made before everything else: Blts of the arm, Blts decided, Blts a
+    // knob acts on, the last and every reason none did, and one counter per reason.
+    "BltEntrySeen",
+    "BltEntryDec",
+    "BltEntryOk",
+    "BltEntryWhy",
+    "BltEntryMask",
+    "BltNoEntryK",
+    "BltNoEntryM",
+    "BltNoEntryF",
+    "BltNoEntryFc",
+    "BltNoEntryS",
+    "BltNoEntryO",
     // Asynchronous Blts: total, by route, current and peak in flight, failures, fallbacks.
     "BltAsyncN",
     "BltAsyncDir",
@@ -1129,6 +1271,256 @@ mod tests {
         assert!(t.add(Entry::new(1, 1, 0)));
     }
 
+    fn ef() -> EntryFacts {
+        EntryFacts {
+            async_on: true,
+            no_mirror_on: true,
+            async_venus_on: false,
+            source: SourceClass::Foreign,
+            snapshot: false,
+            dst_standard_buffer: true,
+        }
+    }
+
+    #[test]
+    fn entry_foreign_into_a_buffer_enters_with_both_knobs() {
+        let e = entry(ef());
+        assert_eq!(
+            e,
+            EntryDecision {
+                async_enter: true,
+                no_mirror: true,
+                why: None
+            }
+        );
+    }
+
+    #[test]
+    fn entry_knobs_are_independent() {
+        let only_async = entry(EntryFacts {
+            no_mirror_on: false,
+            ..ef()
+        });
+        assert!(only_async.async_enter && !only_async.no_mirror && only_async.why.is_none());
+        let only_mirror = entry(EntryFacts {
+            async_on: false,
+            ..ef()
+        });
+        assert!(!only_mirror.async_enter && only_mirror.no_mirror && only_mirror.why.is_none());
+    }
+
+    #[test]
+    fn entry_both_knobs_off_is_knob_off_whatever_else_is_true() {
+        for source in [
+            SourceClass::Foreign,
+            SourceClass::ForeignCopyOff,
+            SourceClass::Venus,
+        ] {
+            for snapshot in [false, true] {
+                for dst in [false, true] {
+                    for venus in [false, true] {
+                        let e = entry(EntryFacts {
+                            async_on: false,
+                            no_mirror_on: false,
+                            async_venus_on: venus,
+                            source,
+                            snapshot,
+                            dst_standard_buffer: dst,
+                        });
+                        assert_eq!(e.why, Some(EntryWhy::KnobOff));
+                        assert!(!e.async_enter && !e.no_mirror);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The hardware finding (v337.2, Heaven composed): a foreign source with `ForeignCopy` 0
+    /// is not entered by either knob, and says so.
+    #[test]
+    fn entry_foreign_with_foreign_copy_off_is_refused_with_its_own_reason() {
+        let e = entry(EntryFacts {
+            source: SourceClass::ForeignCopyOff,
+            async_venus_on: true,
+            ..ef()
+        });
+        assert_eq!(e.why, Some(EntryWhy::ForeignCopyOff));
+        assert!(!e.async_enter && !e.no_mirror);
+    }
+
+    #[test]
+    fn entry_venus_source_needs_its_own_knob() {
+        let off = entry(EntryFacts {
+            source: SourceClass::Venus,
+            ..ef()
+        });
+        assert_eq!(off.why, Some(EntryWhy::NotForeign));
+        assert!(!off.async_enter && !off.no_mirror);
+        let on = entry(EntryFacts {
+            source: SourceClass::Venus,
+            async_venus_on: true,
+            ..ef()
+        });
+        assert!(on.async_enter && on.no_mirror && on.why.is_none());
+    }
+
+    #[test]
+    fn entry_snapshot_and_image_destination_never_enter() {
+        for source in [SourceClass::Foreign, SourceClass::Venus] {
+            let snap = entry(EntryFacts {
+                source,
+                async_venus_on: true,
+                snapshot: true,
+                ..ef()
+            });
+            assert_eq!(snap.why, Some(EntryWhy::Snapshot));
+            assert!(!snap.async_enter && !snap.no_mirror);
+            let image = entry(EntryFacts {
+                source,
+                async_venus_on: true,
+                dst_standard_buffer: false,
+                ..ef()
+            });
+            assert_eq!(image.why, Some(EntryWhy::NotBuffer));
+            assert!(!image.async_enter && !image.no_mirror);
+        }
+    }
+
+    #[test]
+    fn entry_reason_order_is_knob_snapshot_source_destination() {
+        // Everything wrong at once: the knob row wins only when both knobs are off.
+        let all_wrong = EntryFacts {
+            async_on: true,
+            no_mirror_on: false,
+            async_venus_on: false,
+            source: SourceClass::ForeignCopyOff,
+            snapshot: true,
+            dst_standard_buffer: false,
+        };
+        assert_eq!(entry(all_wrong).why, Some(EntryWhy::Snapshot));
+        let no_snap = EntryFacts {
+            snapshot: false,
+            ..all_wrong
+        };
+        assert_eq!(entry(no_snap).why, Some(EntryWhy::ForeignCopyOff));
+        let venus = EntryFacts {
+            source: SourceClass::Venus,
+            ..no_snap
+        };
+        assert_eq!(entry(venus).why, Some(EntryWhy::NotForeign));
+        let venus_on = EntryFacts {
+            async_venus_on: true,
+            ..venus
+        };
+        assert_eq!(entry(venus_on).why, Some(EntryWhy::NotBuffer));
+    }
+
+    /// Exhaustive over every input: a knob acts iff it is on and nothing refuses, `why` is
+    /// `None` exactly then, and `no_mirror` agrees with `no_mirror_applies` for foreign sources.
+    #[test]
+    fn entry_exhaustive_agrees_with_its_definition() {
+        let classes = [
+            SourceClass::Foreign,
+            SourceClass::ForeignCopyOff,
+            SourceClass::Venus,
+        ];
+        for bits in 0u32..32 {
+            for source in classes {
+                let f = EntryFacts {
+                    async_on: bits & 1 != 0,
+                    no_mirror_on: bits & 2 != 0,
+                    async_venus_on: bits & 4 != 0,
+                    snapshot: bits & 8 != 0,
+                    dst_standard_buffer: bits & 16 != 0,
+                    source,
+                };
+                let e = entry(f);
+                let eligible = (f.async_on || f.no_mirror_on)
+                    && !f.snapshot
+                    && f.dst_standard_buffer
+                    && match source {
+                        SourceClass::Foreign => true,
+                        SourceClass::ForeignCopyOff => false,
+                        SourceClass::Venus => f.async_venus_on,
+                    };
+                assert_eq!(e.why.is_none(), eligible, "{f:?}");
+                assert_eq!(e.async_enter, eligible && f.async_on, "{f:?}");
+                assert_eq!(e.no_mirror, eligible && f.no_mirror_on, "{f:?}");
+                if source == SourceClass::Foreign {
+                    assert_eq!(
+                        e.no_mirror,
+                        no_mirror_applies(f.no_mirror_on, true, f.snapshot, f.dst_standard_buffer),
+                        "{f:?}"
+                    );
+                }
+                // The entry never admits what `decide` refuses for its own reasons.
+                if e.async_enter {
+                    let route = decide(Facts {
+                        async_on: true,
+                        no_mirror_on: f.no_mirror_on,
+                        foreign_source: class_eligible(source, f.async_venus_on),
+                        snapshot: false,
+                        dst_standard_buffer: true,
+                        boundary: Boundary::Live { ready: true },
+                        dst_deferred_pending: false,
+                        table_has_room: true,
+                    });
+                    assert!(!matches!(
+                        route,
+                        Route::Legacy {
+                            why: Why::Off | Why::NotForeign | Why::NotBuffer
+                        }
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn entry_why_codes_are_distinct_and_have_their_own_bit() {
+        let all = [
+            EntryWhy::KnobOff,
+            EntryWhy::Snapshot,
+            EntryWhy::NotForeign,
+            EntryWhy::ForeignCopyOff,
+            EntryWhy::NotBuffer,
+            EntryWhy::Other,
+        ];
+        let mut mask = 0u32;
+        for w in &all {
+            assert_eq!(mask & w.bit(), 0, "{w:?} shares a bit");
+            mask |= w.bit();
+            assert!(w.code() >= 1 && w.code() <= 32);
+        }
+        assert_eq!(mask.count_ones() as usize, all.len());
+    }
+
+    #[test]
+    fn a_venus_source_is_ordered_by_decide_like_a_foreign_one() {
+        // With no boundary (nothing but the Venus ring orders a Venus source's copy) and the
+        // mirror off the copy is direct; with the mirror on it needs the worker, so it falls back.
+        let base = Facts {
+            async_on: true,
+            no_mirror_on: true,
+            foreign_source: class_eligible(SourceClass::Venus, true),
+            snapshot: false,
+            dst_standard_buffer: true,
+            boundary: Boundary::None,
+            dst_deferred_pending: false,
+            table_has_room: true,
+        };
+        assert_eq!(decide(base), Route::Direct);
+        assert_eq!(
+            decide(Facts {
+                no_mirror_on: false,
+                ..base
+            }),
+            Route::Legacy {
+                why: Why::NoBoundaryMirror
+            }
+        );
+    }
+
     #[test]
     fn why_codes_are_distinct_and_have_their_own_bit() {
         let all = [
@@ -1219,7 +1611,7 @@ mod tests {
         }
         for l in &written {
             // The knob names (read, not written) are the only other literals of the file.
-            if l == "BltAsync" || l == "BltNoMirror" || l == "BltLookahead" {
+            if l == "BltAsync" || l == "BltNoMirror" || l == "BltLookahead" || l == "BltAsyncVenus" {
                 continue;
             }
             assert!(
@@ -1272,9 +1664,11 @@ mod tests {
         assert!(text.contains("KnobName::new(b\"BltAsync\")"));
         assert!(text.contains("KnobName::new(b\"BltNoMirror\")"));
         assert!(text.contains("KnobName::new(b\"BltLookahead\")"));
+        assert!(text.contains("KnobName::new(b\"BltAsyncVenus\")"));
         for n in COUNTERS {
             assert_ne!(*n, "BltAsync");
             assert_ne!(*n, "BltNoMirror");
+            assert_ne!(*n, "BltAsyncVenus");
         }
     }
 }

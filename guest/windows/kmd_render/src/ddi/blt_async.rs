@@ -5,8 +5,10 @@
 //! `docs/zero-copy-present.md`, "Asynchronous composed present (BltAsync, BltNoMirror)".
 //!
 //! Scope. Both knobs apply to ONE class of Present: a Blt whose source is an adopted foreign
-//! (NVK-on-RM) allocation and whose destination is a KMD standard buffer (DWM's redirection
-//! surface). Every other Blt takes the arm it always took.
+//! (NVK-on-RM) allocation the KMD copies as one (`ForeignCopy=1`) and whose destination is a KMD
+//! standard buffer (DWM's redirection surface); with `BltAsyncVenus=1` also a Venus-native source.
+//! Every other Blt takes the arm it always took. `helios_kmd_logic::blt_async::entry` decides, once
+//! per Blt and before anything else, whether a knob acts; `BltEntry*`/`BltNoEntry*` say why not.
 //!
 //! Knobs (REG_DWORD in the service key, default 0 = the previous behaviour; read at every
 //! StartDevice by [`reset_for_start`], and once on first use):
@@ -22,7 +24,16 @@
 //! Counters (at most 14 characters, the list is `helios_kmd_logic::blt_async::COUNTERS`; atomics,
 //! written to the registry by [`publish_counters`] from `publish_nvrm_counters`):
 //!
-//! * `BltAsyncKnob` / `BltNoMirKnob`: the knobs in force.
+//! * `BltAsyncKnob` / `BltNoMirKnob` / `BltVenusKnob`: the knobs in force.
+//! * `BltEntrySeen`: Blts that reached the arm. `BltEntryDec`: of those, the ones that passed every
+//!   precondition and were decided; `BltEntryOk`: of those, the ones a knob acts on (`BltAsyncN` +
+//!   `BltAsyncFall` + the no-mirror Blts). `BltEntryWhy` / `BltEntryMask`: the last and the set of
+//!   reasons none did (`blt_async::EntryWhy`, bit `code - 1`: 1 both knobs off, 2 snapshot, 3 Venus
+//!   source with `BltAsyncVenus` 0, 4 foreign source with `ForeignCopy` 0, 5 destination not a
+//!   standard buffer, 6 returned before the decision). Per reason: `BltNoEntryK` (knobs),
+//!   `BltNoEntryM` (snapshot), `BltNoEntryF` (source not eligible), `BltNoEntryFc` (foreign,
+//!   `ForeignCopy` off: also `FcOff`), `BltNoEntryS` (destination), `BltNoEntryO` (before the
+//!   decision: `BltEntrySeen - BltEntryDec`).
 //! * `BltAsyncN`: asynchronous Blts made (`BltAsyncDir` direct, `BltAsyncDefer` deferred to the
 //!   worker because the producer had not finished, or the mirror is on, or an older frame for the
 //!   destination was still queued).
@@ -64,6 +75,7 @@ use crate::virtio::VirtioError;
 const UNREAD: u32 = u32::MAX;
 static ASYNC_KNOB: AtomicU32 = AtomicU32::new(UNREAD);
 static NO_MIRROR_KNOB: AtomicU32 = AtomicU32::new(UNREAD);
+static VENUS_KNOB: AtomicU32 = AtomicU32::new(UNREAD);
 
 static ASYNC_N: AtomicU32 = AtomicU32::new(0);
 static DIRECT: AtomicU32 = AtomicU32::new(0);
@@ -88,6 +100,16 @@ static NOMIR_INVALID: AtomicU32 = AtomicU32::new(0);
 static SRC_BUSY: AtomicU32 = AtomicU32::new(0);
 static LOOKAHEAD: AtomicU32 = AtomicU32::new(ba::LOOKAHEAD_DEFAULT);
 static LOOK_N: AtomicU32 = AtomicU32::new(0);
+static ENTRY_SEEN: AtomicU32 = AtomicU32::new(0);
+static ENTRY_DECIDED: AtomicU32 = AtomicU32::new(0);
+static ENTRY_OK: AtomicU32 = AtomicU32::new(0);
+static ENTRY_WHY: AtomicU32 = AtomicU32::new(0);
+static ENTRY_MASK: AtomicU32 = AtomicU32::new(0);
+static NO_ENTRY_KNOB: AtomicU32 = AtomicU32::new(0);
+static NO_ENTRY_SNAPSHOT: AtomicU32 = AtomicU32::new(0);
+static NO_ENTRY_SOURCE: AtomicU32 = AtomicU32::new(0);
+static NO_ENTRY_FC_OFF: AtomicU32 = AtomicU32::new(0);
+static NO_ENTRY_DST: AtomicU32 = AtomicU32::new(0);
 
 /// Interrupt time in 100 ns units; legal at any IRQL, no lock.
 pub(crate) fn now_100ns() -> u64 {
@@ -120,6 +142,11 @@ pub(crate) fn no_mirror_on() -> bool {
     knob(&NO_MIRROR_KNOB, crate::diag::knobs::BLT_NO_MIRROR)
 }
 
+/// `BltAsyncVenus` is on: the knobs also act on Venus-native sources. One relaxed load once read.
+pub(crate) fn async_venus_on() -> bool {
+    knob(&VENUS_KNOB, crate::diag::knobs::BLT_ASYNC_VENUS)
+}
+
 /// A new transport generation: the knobs are read again (a `reg add` + `pnputil /restart-device`
 /// takes effect without a reboot), mirrored with the value in force, 0 included, and the counters
 /// are zeroed so a value an earlier run left in the service key is never read as this
@@ -144,6 +171,16 @@ pub(crate) fn reset_for_start() {
         &MIRROR_SKIPPED,
         &MIRROR_US,
         &NOMIR_INVALID,
+        &ENTRY_SEEN,
+        &ENTRY_DECIDED,
+        &ENTRY_OK,
+        &ENTRY_WHY,
+        &ENTRY_MASK,
+        &NO_ENTRY_KNOB,
+        &NO_ENTRY_SNAPSHOT,
+        &NO_ENTRY_SOURCE,
+        &NO_ENTRY_FC_OFF,
+        &NO_ENTRY_DST,
     ] {
         cell.store(0, Ordering::Relaxed);
     }
@@ -154,6 +191,7 @@ pub(crate) fn reset_for_start() {
     LOOK_N.store(0, Ordering::Relaxed);
     let a = read_knob(&ASYNC_KNOB, crate::diag::knobs::BLT_ASYNC);
     let m = read_knob(&NO_MIRROR_KNOB, crate::diag::knobs::BLT_NO_MIRROR);
+    let v = read_knob(&VENUS_KNOB, crate::diag::knobs::BLT_ASYNC_VENUS);
     let depth = ba::clamp_lookahead(crate::diag::read_config_dword(
         crate::diag::knobs::BLT_LOOKAHEAD,
         ba::LOOKAHEAD_DEFAULT,
@@ -161,6 +199,7 @@ pub(crate) fn reset_for_start() {
     LOOKAHEAD.store(depth, Ordering::Relaxed);
     crate::diag::record_named_bytes(b"BltAsyncKnob", a as u32);
     crate::diag::record_named_bytes(b"BltNoMirKnob", m as u32);
+    crate::diag::record_named_bytes(b"BltVenusKnob", v as u32);
     crate::diag::record_named_bytes(b"BltLookKnob", depth);
 }
 
@@ -173,6 +212,33 @@ pub(crate) fn lookahead() -> usize {
 /// The worker dispatched a copy ahead of a front entry that could not go.
 pub(crate) fn note_lookahead() {
     LOOK_N.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A Blt reached the non-RM-primary Blt arm of `DxgkDdiPresent` (before any precondition).
+pub(crate) fn note_entry_seen() {
+    ENTRY_SEEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The entry decision of a Blt that passed every precondition (`helios_kmd_logic::blt_async::
+/// entry`): counted by outcome, and by the first reason neither knob acted.
+pub(crate) fn note_entry(entry: ba::EntryDecision) {
+    ENTRY_DECIDED.fetch_add(1, Ordering::Relaxed);
+    let Some(why) = entry.why else {
+        ENTRY_OK.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    ENTRY_WHY.store(why.code(), Ordering::Relaxed);
+    ENTRY_MASK.fetch_or(why.bit(), Ordering::Relaxed);
+    let cell = match why {
+        ba::EntryWhy::KnobOff => &NO_ENTRY_KNOB,
+        ba::EntryWhy::Snapshot => &NO_ENTRY_SNAPSHOT,
+        ba::EntryWhy::NotForeign => &NO_ENTRY_SOURCE,
+        ba::EntryWhy::ForeignCopyOff => &NO_ENTRY_FC_OFF,
+        ba::EntryWhy::NotBuffer => &NO_ENTRY_DST,
+        // Derived at publish time, never decided.
+        ba::EntryWhy::Other => return,
+    };
+    cell.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The source of a Present is still being read by an earlier asynchronous copy.
@@ -225,7 +291,8 @@ pub(crate) fn publish_counters() {
         | MIRROR_SKIPPED.load(Ordering::Relaxed)
         | FAILED.load(Ordering::Relaxed)
         | SRC_BUSY.load(Ordering::Relaxed)
-        | LOOK_N.load(Ordering::Relaxed);
+        | LOOK_N.load(Ordering::Relaxed)
+        | ENTRY_SEEN.load(Ordering::Relaxed);
     if events == 0 {
         return;
     }
@@ -256,6 +323,31 @@ pub(crate) fn publish_counters() {
     rec(b"BltNoMirInv", NOMIR_INVALID.load(Ordering::Relaxed));
     rec(b"BltSrcBusy", SRC_BUSY.load(Ordering::Relaxed));
     rec(b"BltLookN", LOOK_N.load(Ordering::Relaxed));
+    // The entry decision. `BltNoEntryO` is derived: Blts of the arm that returned before the
+    // decision (a precondition: capacity, resolution, format, kind, snapshot validation,
+    // descriptors, extent). Not an independent count, so it cannot drift from the others.
+    let seen = ENTRY_SEEN.load(Ordering::Relaxed);
+    let decided = ENTRY_DECIDED.load(Ordering::Relaxed);
+    let other = seen.saturating_sub(decided);
+    let mut mask = ENTRY_MASK.load(Ordering::Relaxed);
+    let mut why = ENTRY_WHY.load(Ordering::Relaxed);
+    if other != 0 {
+        mask |= ba::EntryWhy::Other.bit();
+        if why == 0 {
+            why = ba::EntryWhy::Other.code();
+        }
+    }
+    rec(b"BltEntrySeen", seen);
+    rec(b"BltEntryDec", decided);
+    rec(b"BltEntryOk", ENTRY_OK.load(Ordering::Relaxed));
+    rec(b"BltEntryWhy", why);
+    rec(b"BltEntryMask", mask);
+    rec(b"BltNoEntryK", NO_ENTRY_KNOB.load(Ordering::Relaxed));
+    rec(b"BltNoEntryM", NO_ENTRY_SNAPSHOT.load(Ordering::Relaxed));
+    rec(b"BltNoEntryF", NO_ENTRY_SOURCE.load(Ordering::Relaxed));
+    rec(b"BltNoEntryFc", NO_ENTRY_FC_OFF.load(Ordering::Relaxed));
+    rec(b"BltNoEntryS", NO_ENTRY_DST.load(Ordering::Relaxed));
+    rec(b"BltNoEntryO", other);
 }
 
 // ---- counters, callable at any IRQL (atomics only) -----------------------------------------
@@ -348,8 +440,8 @@ pub(crate) enum Taken {
 }
 
 /// Take the Blt asynchronously when the rules allow (`helios_kmd_logic::blt_async::decide`). The
-/// caller has checked [`async_on`] and that the source is a foreign allocation and the
-/// destination a standard buffer (the descriptors say which).
+/// caller has the entry decision (`ba::entry`: [`async_on`], a source class the knobs act on, a
+/// standard-buffer destination, no snapshot), so `foreign_source` below is true by construction.
 ///
 /// `Ok(Legacy)` leaves everything as it was: nothing is queued, owned or marked that the legacy
 /// arm does not expect. `Err` is only the private record refusing the copy's fence AFTER the copy
