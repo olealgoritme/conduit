@@ -88,6 +88,39 @@ pub fn reg_dword(name: &CStr) -> Option<u32> {
     }
 }
 
+const RRF_RT_REG_SZ: u32 = 0x02;
+
+/// Read one REG_SZ from `HKLM\SOFTWARE\Helios` (at most 4 KiB), or `None` if
+/// it is absent, unreadable, empty or not a string. Same hive, view and FFI
+/// site discipline as [`reg_dword`].
+pub fn reg_sz(name: &CStr) -> Option<String> {
+    let mut buf = [0u8; 4096];
+    let mut len: u32 = buf.len() as u32;
+    // SAFETY: `name` and `SUBKEY` are NUL-terminated; `buf`/`len` are stack
+    // locals borrowed only for the call, and `len` bounds what advapi32 writes.
+    let rc = unsafe {
+        RegGetValueA(
+            HKEY_LOCAL_MACHINE,
+            SUBKEY.as_ptr().cast(),
+            name.as_ptr().cast(),
+            RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+            core::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let s = String::from_utf8_lossy(&buf[..end]).into_owned();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// A REG_DWORD knob read once per process, with its absent-value default
 /// written at the definition site.
 pub struct DwordKnob {

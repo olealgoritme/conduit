@@ -28,6 +28,9 @@
 //! | `UmdFreeThreaded` | DWORD | `true` (explicit 0 reverts the threading surface) |
 //! | `UmdCommandLists` | DWORD | `true` (explicit 0 reverts to emulated lists) |
 //! | `UmdDeferredDiagnostics` | DWORD | `false` (diagnostic atomics, opt-in) |
+//! | `UmdDdiLevel` | DWORD | `0x10` (D3D11 DDI WDDM1.3; `0x24` adds WDDM2.3) |
+//! | `UmdDdiLevelDwm` | DWORD | `0x10` (the same, dwm.exe only) |
+//! | `UmdDdiAllowList` | REG_SZ | absent (`;`-separated executables that get WDDM2.3) |
 //!
 //! ⛔ **`PresentGateUs` and `PresentOrder` were DELETED 2026-07-29 by owner
 //! directive and must not come back.** They were the producer-side CPU
@@ -189,6 +192,16 @@ pub(crate) static UMD_COMMAND_LISTS: BoolKnob = BoolKnob::new(c"UmdCommandLists"
 /// OFF means a timed run does no diagnostic atomic RMW at all.
 pub(crate) static UMD_DEFERRED_DIAGNOSTICS: BoolKnob = BoolKnob::new(c"UmdDeferredDiagnostics", false);
 
+/// D3D11 DDI interface the adapter advertises (`ddi_level.rs`). Absent = 0x10
+/// (D3DWDDM1_3, what every process negotiated before); 0x24 (D3DWDDM2_3)
+/// advertises the WDDM 2.3 D3D11 DDI above it. Never applied to dwm.exe, which
+/// has its own `UmdDdiLevelDwm` (same values, absent = 0x10).
+pub(crate) static UMD_DDI_LEVEL: DwordKnob = DwordKnob::new(c"UmdDdiLevel", 0x10);
+
+/// `UmdDdiLevel` for dwm.exe only. Absent = 0x10: DWM keeps the WDDM 1.3 D3D11
+/// DDI until the 2.3 path has been proven in ordinary processes.
+pub(crate) static UMD_DDI_LEVEL_DWM: DwordKnob = DwordKnob::new(c"UmdDdiLevelDwm", 0x10);
+
 /// The knob inventory, so the set is enumerable instead of grep-discoverable.
 ///
 /// Each entry is `(value name, resolved value as text)`. Resolving forces every
@@ -205,7 +218,7 @@ pub(crate) fn log_knob_inventory() {
     helios_umd_common::log::log_knob_inventory(&resolved_inventory());
 }
 
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 11] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
     [
         ("UmdTrace", UMD_TRACE.get() as u32),
         ("UmdTimerRes", UMD_TIMER_RESOLUTION.get() as u32),
@@ -218,6 +231,8 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 11] {
         ("UmdFreeThreaded", UMD_FREE_THREADED.get() as u32),
         ("UmdCommandLists", UMD_COMMAND_LISTS.get() as u32),
         ("UmdDeferredDiagnostics", UMD_DEFERRED_DIAGNOSTICS.get() as u32),
+        ("UmdDdiLevel", UMD_DDI_LEVEL.get()),
+        ("UmdDdiLevelDwm", UMD_DDI_LEVEL_DWM.get()),
     ]
 }
 

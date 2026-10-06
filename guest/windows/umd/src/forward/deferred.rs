@@ -920,6 +920,47 @@ pub(crate) unsafe fn fill_dc_wddm1_3(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS)
     (*funcs).pfnRelocateDeviceFuncs = Some(dc_relocate_wddm1_3);
 }
 
+unsafe extern "system" fn dc_relocate_wddm2_2(
+    _h_device: Hdevice,
+    _funcs: *mut ddi::D3DWDDM2_2DDI_DEVICEFUNCS,
+) {
+    dc_relocate_log("WDDM2.2");
+}
+
+/// WDDM 2.3 parent device (`D3DWDDM2_2DDI_DEVICEFUNCS`): the 1.3 DC fill, then
+/// the slots WDDM 2.0 retyped get their DC shims through the 2.2 view (the
+/// 11.0-view overrides wrote 11.0-typed shims there), the retyped size getters
+/// and Flush are NULL as on every DC table, and the appended entries get the
+/// device handlers (none of them touches immediate-context state except
+/// ReleaseResource's flush, which the runtime only issues on the IC).
+pub(crate) unsafe fn fill_dc_wddm2_3(funcs: *mut ddi::D3DWDDM2_2DDI_DEVICEFUNCS) {
+    if funcs.is_null() {
+        log_error!("DC fill: null WDDM2.2 funcs table");
+        return;
+    }
+    let f = &mut *stub_fill_dc_table(funcs);
+    let base = install(f);
+    let l1 = install_11_1(base, funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
+    let l13 = install_wddm1_3(l1, funcs as *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS);
+    let _l23 = install_wddm2_3(l13, funcs);
+    apply_dc_overrides(f);
+    apply_dc_overrides_11_1(&mut *(funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS));
+    let f2 = &mut *funcs;
+    f2.pfnCreateShaderResourceView = DcOpen::open();
+    f2.pfnCreateRenderTargetView = DcOpen::open();
+    f2.pfnCreateRasterizerState = DcOpen::open();
+    f2.pfnCreateQuery = DcOpen::open();
+    f2.pfnCreateUnorderedAccessView = DcOpen::open();
+    f2.pfnCalcPrivateShaderResourceViewSize = None;
+    f2.pfnCalcPrivateRenderTargetViewSize = None;
+    f2.pfnCalcPrivateRasterizerStateSize = None;
+    f2.pfnCalcPrivateQuerySize = None;
+    f2.pfnCalcPrivateUnorderedAccessViewSize = None;
+    f2.pfnFlush = None;
+    f2.pfnCalcPrivateShaderCacheSessionSize = None;
+    f2.pfnRelocateDeviceFuncs = Some(dc_relocate_wddm2_2);
+}
+
 /// Fill the DC's context-funcs table through the union member matching the
 /// parent device's negotiated level — the same member/fill/level triple
 /// discipline as `create_device`'s step 3 (R802).
@@ -928,6 +969,7 @@ unsafe fn fill_dc_funcs(
     funcs: &ddi::D3D11DDIARG_CREATEDEFERREDCONTEXT__bindgen_ty_1,
 ) {
     match negotiated {
+        NegotiatedInterface::Wddm2_3 => fill_dc_wddm2_3(funcs.pWDDM2_2ContextFuncs),
         NegotiatedInterface::Wddm1_3 => fill_dc_wddm1_3(funcs.pWDDM1_3ContextFuncs),
         NegotiatedInterface::D3D11_1 => fill_dc_11_1(funcs.p11_1ContextFuncs),
         NegotiatedInterface::D3D11_0 => fill_dc_11_0(funcs.p11ContextFuncs),

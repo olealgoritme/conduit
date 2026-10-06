@@ -274,9 +274,113 @@ pub(crate) unsafe extern "system" fn check_format_support(
             dxgi_output_bits_per_sample(fmt as u32, caps)
         );
     }
+    // No encoder anywhere; no decoder output without the video DDI
+    // (DXVK reports it on NVK whenever Vulkan Video decode is there).
+    let mut caps = if video { caps & !VIDEO_ENCODER } else { caps & !(DECODER_OUTPUT | VIDEO_ENCODER) };
+    // WDDM 2.3 devices (`ddi_level.rs`): the runtime reads this value as
+    // D3D10_DDI_FORMAT_SUPPORT_* bits -- d3d11!CDevice::CheckFormatSupportImpl
+    // takes every capability its requirement table marks optional from those
+    // bits (0x200 UAV_WRITES -> TYPED_UNORDERED_ACCESS_VIEW, 0x1 -> SHADER_SAMPLE,
+    // 0x20000 UAV_READS -> UAV_TYPED_LOAD, ...). The WDDM 1.3 tables leave
+    // almost nothing optional, which is why passing the API value through has
+    // worked there; at 2.3 it would claim typed UAV stores for every sampleable
+    // format (API SHADER_SAMPLE is 0x200) and typed UAV loads for every
+    // lockable one (API CPU_LOCKABLE is 0x20000). Translate for 2.3 only, so
+    // the 1.3 path DWM uses is unchanged.
+    if helios_device(h).is_some_and(|dev| dev.negotiated.is_wddm2()) {
+        let mut support2: u32 = 0;
+        if let Some(device) = d3d11_device(h) {
+            let mut data = D3D11_FEATURE_DATA_FORMAT_SUPPORT2 {
+                InFormat: DXGI_FORMAT(fmt as i32),
+                OutFormatSupport2: 0,
+            };
+            if device
+                .CheckFeatureSupport(
+                    D3D11_FEATURE_FORMAT_SUPPORT2,
+                    &mut data as *mut _ as *mut c_void,
+                    core::mem::size_of::<D3D11_FEATURE_DATA_FORMAT_SUPPORT2>() as u32,
+                )
+                .is_ok()
+            {
+                support2 = data.OutFormatSupport2;
+            }
+        }
+        let ddi = api_to_ddi_format_support(caps, support2);
+        caps = if ddi == 0 && fmt == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM {
+            DDI_FORMAT_SUPPORT_NOT_SUPPORTED
+        } else {
+            ddi
+        };
+        trace_line!(
+            "FormatSupport(WDDM2) fmt={fmt} api=0x{raw_caps:08x} support2=0x{support2:08x} ddi=0x{caps:08x}"
+        );
+    }
     if !out.is_null() {
-        // No encoder anywhere; no decoder output without the video DDI
-        // (DXVK reports it on NVK whenever Vulkan Video decode is there).
-        *out = if video { caps & !VIDEO_ENCODER } else { caps & !(DECODER_OUTPUT | VIDEO_ENCODER) };
+        *out = caps;
+    }
+}
+
+/// D3D11 API `D3D11_FORMAT_SUPPORT` / `D3D11_FORMAT_SUPPORT2` bits -> the
+/// `D3D10_DDI_FORMAT_SUPPORT_*` / `D3D11_1DDI_FORMAT_SUPPORT_*` /
+/// `D3DWDDM1_3DDI_FORMAT_SUPPORT_*` / `D3DWDDM2_0DDI_FORMAT_SUPPORT_*` bits
+/// (d3d10umddi.h, WDK 10.0.26100). Bits with no DDI counterpart (texture
+/// dimensions, mips, depth-stencil, CPU lockable, display, ...) are the
+/// runtime's own business: its requirement tables answer them.
+pub(crate) fn api_to_ddi_format_support(api: u32, api2: u32) -> u32 {
+    const MAP: &[(u32, u32)] = &[
+        (0x0000_0200, 0x0000_0001), // SHADER_SAMPLE
+        (0x0000_4000, 0x0000_0002), // RENDER_TARGET -> RENDERTARGET
+        (0x0000_8000, 0x0000_0004), // BLENDABLE
+        (0x0020_0000, 0x0000_0008), // MULTISAMPLE_RENDERTARGET
+        (0x0040_0000, 0x0000_0010), // MULTISAMPLE_LOAD
+        (0x0800_0000, 0x0000_0020), // DECODER_OUTPUT
+        (0x1000_0000, 0x0000_0040), // VIDEO_PROCESSOR_OUTPUT
+        (0x2000_0000, 0x0000_0080), // VIDEO_PROCESSOR_INPUT
+        (0x0000_0002, 0x0000_0100), // IA_VERTEX_BUFFER -> VERTEX_BUFFER
+        (0x0200_0000, 0x0000_0200), // TYPED_UNORDERED_ACCESS_VIEW -> UAV_WRITES
+        (0x0000_0001, 0x0000_0400), // BUFFER
+        (0x4000_0000, 0x0000_1000), // VIDEO_ENCODER
+        (0x0080_0000, 0x0000_4000), // SHADER_GATHER
+    ];
+    const MAP2: &[(u32, u32)] = &[
+        (0x0000_0100, 0x0000_2000), // OUTPUT_MERGER_LOGIC_OP
+        (0x0000_4000, 0x0000_8000), // MULTIPLANE_OVERLAY
+        (0x0000_0200, 0x0001_0000), // TILED
+        (0x0000_0040, 0x0002_0000), // UAV_TYPED_LOAD -> UAV_READS
+    ];
+    let mut ddi = 0;
+    for &(a, d) in MAP {
+        if api & a != 0 {
+            ddi |= d;
+        }
+    }
+    for &(a, d) in MAP2 {
+        if api2 & a != 0 {
+            ddi |= d;
+        }
+    }
+    ddi
+}
+
+#[cfg(test)]
+mod tests {
+    use super::api_to_ddi_format_support;
+
+    #[test]
+    fn bgra8_unorm_on_nvk_keeps_typed_uav_writes() {
+        // DXVK's answer for B8G8R8A8_UNORM on NVK (FFXIV trace, 2026-10-06).
+        let ddi = api_to_ddi_format_support(0x32fe_f3f3, 0x0001_4680);
+        assert_ne!(ddi & 0x200, 0, "UAV_WRITES");
+        assert_ne!(ddi & 0x1, 0, "SHADER_SAMPLE");
+        assert_ne!(ddi & 0x2, 0, "RENDERTARGET");
+        assert_eq!(ddi & 0x2_0000, 0, "no typed UAV load without UAV_TYPED_LOAD");
+    }
+
+    #[test]
+    fn cpu_lockable_and_sample_alone_claim_no_uav() {
+        // API SHADER_SAMPLE (0x200) and CPU_LOCKABLE (0x20000) collide with
+        // DDI UAV_WRITES and UAV_READS; neither may leak through.
+        let ddi = api_to_ddi_format_support(0x0002_0200, 0);
+        assert_eq!(ddi, 0x1);
     }
 }
