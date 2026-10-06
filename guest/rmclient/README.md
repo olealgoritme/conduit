@@ -181,7 +181,7 @@ such verb or the host does not serve the import yet (`CAP_RM_IMPORT` clear), so 
 is safe to run before the host half is installed. Otherwise it allocates pitch-linear
 vidmem, exports it into a GEM object on a DRM render node (as `crm_scanout_smoke`),
 creates a Venus context, sends `IMPORT_RM` with its layout and expects `ST_OK` and
-a resource id, releases it with `RELEASE_BLOB` (a second release must fail), then
+a resource id, releases it with `RELEASE_BLOB` (a second release is an idempotent success), then
 sends six deliberate mistakes and checks the status and `out_host_errno` of each
 (unknown GEM: `ST_NOT_OWNED`/ENOENT; oversize: `ST_BAD_RANGE`/ERANGE; a non-DRI
 channel: `ST_NOT_OWNED`; a foreign context: `ST_BAD_CONTEXT`; no layout flag and a

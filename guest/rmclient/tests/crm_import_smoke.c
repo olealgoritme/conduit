@@ -491,7 +491,9 @@ int main(int argc, char **argv)
                caps1.imported == caps0.imported + 1,
            w, e);
 
-    /* Release it; a second release must fail. */
+    /* Release it. A second release of the same resource is an idempotent success in
+     * the KMD (a release can race the device-destroy sweeps, and the Venus ICD
+     * releases defensively): it must not fail AND must not disturb the counters. */
     {
         const uint32_t released = resid;
         r = release_blob(ctx, released, &nt);
@@ -504,7 +506,7 @@ int main(int argc, char **argv)
         r = release_blob(ctx, released, &nt);
         snprintf(w, sizeof w, "second RELEASE_BLOB (ctx %u, resource %u): rc %d NTSTATUS 0x%08x",
                  ctx, released, r, (unsigned)nt);
-        report(r != 0, w, "the escape to fail (the resource is gone)");
+        report(r == 0, w, "an idempotent success (the resource is already gone)");
     }
     r = query_caps(&caps1, &nt);
     snprintf(w, sizeof w, "QUERY_CAPS after the release: this device %u (was %u)",
