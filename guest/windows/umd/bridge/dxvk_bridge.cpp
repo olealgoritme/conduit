@@ -531,15 +531,50 @@ namespace helios_handoff {
       if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
             L"D:(A;;GA;;;WD)(A;;GA;;;SY)(A;;GA;;;AC)S:(ML;;NW;;;LW)", SDDL_REVISION_1, &sd, nullptr))
         sa.lpSecurityDescriptor = sd;
+      SetLastError(0);
       HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, sa.lpSecurityDescriptor ? &sa : nullptr,
         PAGE_READWRITE, 0, DWORD(sizeof(Table)), L"Local\\HeliosHandoffLedger3");
+      const DWORD create_error = GetLastError();
       if (sd)
         LocalFree(sd);
-      if (!mapping)
+      DWORD session = 0;
+      ProcessIdToSessionId(GetCurrentProcessId(), &session);
+      if (!mapping) {
+        char msg[200];
+        std::snprintf(msg, sizeof(msg), "handoff: ledger section not created (error %lu, session %lu)",
+                      create_error, session);
+        umd_log(msg);
         return nullptr;
+      }
+      // The kernel name of the section: two processes share the ledger only
+      // when this is the same path.
+      char kname[160] = "?";
+      using NtQueryObjectFn = LONG(WINAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+      if (auto* query = reinterpret_cast<NtQueryObjectFn>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject"))) {
+        alignas(8) unsigned char buf[1024] = {};
+        ULONG len = 0;
+        // ObjectNameInformation (1): a UNICODE_STRING followed by its text.
+        if (query(mapping, 1, buf, sizeof(buf), &len) >= 0) {
+          struct Name { USHORT Length, MaximumLength; const wchar_t* Buffer; };
+          const auto* us = reinterpret_cast<const Name*>(buf);
+          if (us->Buffer)
+            std::snprintf(kname, sizeof(kname), "%.*ls", int(us->Length / sizeof(wchar_t)), us->Buffer);
+        }
+      }
       auto* t = static_cast<Table*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Table)));
       // The view keeps the section alive; the handle is not needed.
       CloseHandle(mapping);
+      {
+        char msg[400];
+        std::snprintf(msg, sizeof(msg),
+          "handoff: ledger section %s (%s, pid %lu, session %lu, %zu bytes) at %p: magic %08x, "
+          "%u records claimed so far, %u in use",
+          kname, create_error == ERROR_ALREADY_EXISTS ? "opened" : "created", GetCurrentProcessId(), session,
+          sizeof(Table), static_cast<void*>(t), t ? t->magic.load() : 0u, t ? t->next_device.load() : 0u,
+          t ? t->records_in_use.load() : 0u);
+        umd_log(msg);
+      }
       if (!t)
         return nullptr;
       std::uint32_t zero = 0;
