@@ -68,14 +68,6 @@ impl VenusClient {
             .then_some(candidate)
     }
 
-    /// Whether a Present into the KMD standard buffer `destination` copies into a live guest
-    /// buffer (size not checked: the import made it exactly `pitch * height` rounded up).
-    pub(crate) fn guest_target_live(&self, destination: u32) -> bool {
-        self.guest_buffers
-            .iter()
-            .any(|g| g.destination == destination && !g.retired)
-    }
-
     /// `vkGetMemoryResourcePropertiesMESA(guest)`: the resource's `memoryTypeBits`.
     fn guest_resource_memory_bits(
         &mut self,

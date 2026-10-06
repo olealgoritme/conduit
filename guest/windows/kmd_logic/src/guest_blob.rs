@@ -906,6 +906,30 @@ pub const fn present_effect(guest_hit: bool, no_mirror_on: bool) -> Effect {
     }
 }
 
+/// What the DIRECT asynchronous route does with a copy it has prepared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectCopy {
+    /// The route was open only because of a guest blob (`BltNoMirror` 0) and the copy does not
+    /// go into one: submit nothing, the legacy arm (which mirrors) runs.
+    Refuse,
+    /// Submit it; `mark_stale`: mark the system copy invalid first.
+    Submit { mark_stale: bool },
+}
+
+/// The DIRECT route's decision from the ONE predicate: `guest` is the target the prepare chose
+/// (`VenusClient::guest_target_for`, in the same hold of the Venus mutex as the submission),
+/// never a second look at the guest buffers. `need_guest`: the route was open only because of
+/// the destination's guest blob (`BltNoMirror` is 0). The route is otherwise open only with
+/// `BltNoMirror` on, so the stale mark is [`present_effect`]'s with it on.
+pub const fn direct_copy(need_guest: bool, guest: bool) -> DirectCopy {
+    if need_guest && !guest {
+        return DirectCopy::Refuse;
+    }
+    DirectCopy::Submit {
+        mark_stale: present_effect(guest, true).mark_stale,
+    }
+}
+
 /// Whether an open of `resource_id` belongs to a process other than `presenter` (rows are
 /// `(resource_id, process, refs)` of the Present-buffer open table). The presenter is the
 /// process whose app device presents into the destination: the census (`rm-backed-standard.md`
@@ -1429,6 +1453,35 @@ mod tests {
                 mark_stale: false
             }
         );
+    }
+
+    #[test]
+    fn the_direct_route_marks_exactly_when_its_copy_misses_the_guest_buffer() {
+        // Opened by the guest blob alone: a copy that still goes into it needs no mark; one
+        // that does not is refused (the legacy arm mirrors), never submitted unmarked.
+        assert_eq!(
+            direct_copy(true, true),
+            DirectCopy::Submit { mark_stale: false }
+        );
+        assert_eq!(direct_copy(true, false), DirectCopy::Refuse);
+        // Opened by `BltNoMirror`: the copy goes out either way, marked unless it went into
+        // the guest buffer (the pages themselves).
+        assert_eq!(
+            direct_copy(false, true),
+            DirectCopy::Submit { mark_stale: false }
+        );
+        assert_eq!(
+            direct_copy(false, false),
+            DirectCopy::Submit { mark_stale: true }
+        );
+        // Never a submission that leaves the pages older than the blob without a mark.
+        for need in [false, true] {
+            for guest in [false, true] {
+                if let DirectCopy::Submit { mark_stale } = direct_copy(need, guest) {
+                    assert_eq!(mark_stale, !guest);
+                }
+            }
+        }
     }
 
     #[test]

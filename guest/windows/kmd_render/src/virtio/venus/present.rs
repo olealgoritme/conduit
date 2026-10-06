@@ -1484,15 +1484,17 @@ impl VenusClient {
     /// destination, submitted through `ctrl::submit_venus_async_blt`, which takes (or joins) the
     /// destination's writer ownership in the same transport critical section as the enqueue and
     /// leaves its hand-back to the completion DPC. The caller never waits for the host.
-    pub fn submit_present_blt_direct(
+    ///
+    /// `prepared` comes from [`Self::prepare_present_blt_guest`] in the SAME hold of this
+    /// client's mutex: the caller decides the stale mark (and whether the route still stands)
+    /// from `prepared.guest_target()`, the target this copy then writes, so the two cannot
+    /// disagree (`helios_kmd_logic::guest_blob::direct_copy`).
+    pub fn submit_prepared_present_blt_direct(
         &mut self,
         adapter: &AdapterContext,
         source: OptimalPresentImageDesc,
-        destination: PresentDestinationDesc,
+        prepared: PreparedPresentBltSubmission,
     ) -> Result<ctrl::BltSubmit, VirtioError> {
-        // May copy into a guest buffer: the caller decided the stale mark under this same
-        // mutex with `guest_target_live`, the predicate `prepare_present_blt_to` applies.
-        let prepared = self.prepare_present_blt_to(adapter, source, destination, true)?;
         let blt_index = self.validate_prepared_present_blt(prepared)?;
         let PresentDestinationDesc::StandardBuffer(buffer) = prepared.destination else {
             return Err(VirtioError::DeviceError);
