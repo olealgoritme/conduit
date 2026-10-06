@@ -1170,6 +1170,22 @@ pub fn set_scanout_blob(
     Ok(seq.get())
 }
 
+/// `SET_SCANOUT_BLOB` with resource 0 (scanout 0 off), for StopDevice: the host keeps the scanout
+/// binding of a transport it is about to lose only if nobody turns it off, and ids restart at 1 in
+/// the next generation (docs/zero-copy-present.md section 25). Waits at most `timeout_ms` (the
+/// StopDevice budget's share); it takes no wire-order mint, because the display state it would
+/// update is zeroed by `reset_display_publication_state` right after and the transport is dropped.
+/// PASSIVE_LEVEL only.
+pub fn disable_scanout_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
+    let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
+    fill_set_scanout_blob(&mut cmd, 0, 0, 0, 0, 0, 0);
+    ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
+}
+
 /// Encode one `SET_SCANOUT_BLOB` into `cmd`, whoever owns the storage.
 ///
 /// THE ONE ENCODER. Its two callers are the synchronous round-trip above, which
