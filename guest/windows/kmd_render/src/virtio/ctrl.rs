@@ -2222,12 +2222,13 @@ pub fn submit_venus_async_scanout(
     stream: &[u8],
     primary_address: u64,
     ticket: crate::adapter::ProgrammingTicket,
+    keep_on_failure: bool,
 ) -> Result<u64, VirtioError> {
     let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
     // One construction site, on the adapter, so all four pointers necessarily
     // come from the same adapter; and `enqueue_scanout_submit` is the only way
     // to attach it, so it necessarily lands on the ring the drain honours.
-    let notify = adapter.scanout_notify(primary_address, ticket);
+    let notify = adapter.scanout_notify(primary_address, ticket, keep_on_failure);
 
     display_submit_outcome(adapter.with_virtio(move |v| {
         v.drain_used();

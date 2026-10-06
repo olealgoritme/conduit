@@ -304,6 +304,9 @@ pub(crate) fn publish_nvrm_counters() {
     // A Present refusal caused by a foreign allocation, answered with success: `PrFgSkip`
     // (last reason `PrFgWhy`, per arm `PrFgBlt` / `PrFgFlip`), written once one happened.
     crate::ddi::present_foreign::publish_counters();
+    // A flip of a foreign primary completed without a bind (`kept_picture`): `FkKeep`, the lane
+    // split `FkWorker` / `FkDma` / `FkAsync`, the last reason `FkWhy`, written once one happened.
+    crate::ddi::flip_keep::publish_counters();
     // Cross-client hardening of forwarded RM ioctls (`NvDupHarden`): clients recorded /
     // dropped / refused for room (`NvCli*`), and requests that named a client or file
     // that is not the caller's (`NvDup*`). Nonzero `NvDupDeny` / `NvDupWould` outside a
@@ -1165,6 +1168,21 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
     let Some((h_alloc, primary_address, snapshot)) =
         (unsafe { crate::ddi::present_packet::PresentFlipPrivate::take(base, total) })
     else {
+        // No flip to program. A KEEP record is the Present's skip of a flip the programming path
+        // cannot take (a foreign or hollow allocation): complete it toward dxgkrnl by publishing
+        // its address as a kept picture, so the next CRTC_VSYNC retires it
+        // (`helios_kmd_logic::flip_completion`). One atomic store and counters: legal here at
+        // DISPATCH_LEVEL; the registry mirror is `publish_counters`.
+        if let Some(address) =
+            unsafe { crate::ddi::present_packet::PresentFlipPrivate::take_keep(base, total) }
+        {
+            let _ = crate::ddi::flip_keep::keep(
+                adapter,
+                address,
+                helios_kmd_logic::flip_completion::KeepWhy::PresentSkip,
+                crate::ddi::flip_keep::Lane::Dma,
+            );
+        }
         return;
     };
     // NOTE (0ab-B, 22.22.210.0): capturing the completion boundary HERE was

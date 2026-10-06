@@ -20,6 +20,7 @@ mod escape;
 mod escape_foreign;
 mod escape_foreign_rm_resource;
 mod escape_foreign_scanout;
+pub(crate) mod flip_keep;
 pub(crate) mod flush_trace;
 mod gpummu;
 pub(crate) mod hpd;

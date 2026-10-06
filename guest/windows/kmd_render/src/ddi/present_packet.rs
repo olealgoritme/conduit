@@ -52,6 +52,9 @@ pub(crate) unsafe fn execution_record(
 
 const PRESENT_FLIP_MAGIC: u32 = 0x4850_464C; // "HPFL"
 const PRESENT_FLIP_VERSION: u32 = 1;
+/// The marker of a KEEP record: same slot and layout as a flip record, `allocation` 0, only
+/// `physical_address` meaningful. See [`PresentFlipPrivate::write_keep`].
+const PRESENT_KEEP_MAGIC: u32 = 0x4850_4B50; // "HPKP"
 
 /// KMD-private flip record for the DMA-BUFFER FLIP contract.
 ///
@@ -167,6 +170,84 @@ impl PresentFlipPrivate {
             );
         }
         Ok(())
+    }
+
+    /// Write a KEEP record in the flip slot: a DMA flip of an allocation the programming path
+    /// cannot take (a foreign or hollow one the Present skipped) still has to COMPLETE toward
+    /// dxgkrnl, and only a CRTC_VSYNC carrying the flip's `physical_address` retires it
+    /// (`helios_kmd_logic::flip_completion`). `submit_command::arm_dma_flip` takes the record and
+    /// publishes that address as a kept picture (an atomic store, legal at its DISPATCH_LEVEL);
+    /// nothing is programmed. It has its own magic, not an `allocation == 0` flip record, so
+    /// [`Self::take`] keeps refusing a zero allocation exactly as before and a keep record can
+    /// never be mistaken for a flip to program (or the reverse).
+    ///
+    /// # Safety
+    /// As [`Self::write`].
+    pub(crate) unsafe fn write_keep(
+        private_data: *mut c_void,
+        private_size: u32,
+        physical_address: u64,
+    ) -> Result<(), NTSTATUS> {
+        if private_data.is_null()
+            || (private_size as usize)
+                < PRESENT_FLIP_PRIVATE_OFFSET + core::mem::size_of::<PresentFlipPrivate>()
+        {
+            return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
+        }
+        let record = PresentFlipPrivate {
+            magic: PRESENT_KEEP_MAGIC,
+            version: PRESENT_FLIP_VERSION,
+            allocation: 0,
+            physical_address,
+            snap_resid: 0,
+            snap_width: 0,
+            snap_height: 0,
+            snap_pitch: 0,
+            snap_dxgi_format: 0,
+            snap_plane_offset: 0,
+            snap_alloc_size: 0,
+        };
+        // SAFETY: the size check above proves the record fits at its offset; unaligned as in
+        // `write`.
+        unsafe {
+            core::ptr::write_unaligned(
+                private_data
+                    .cast::<u8>()
+                    .add(PRESENT_FLIP_PRIVATE_OFFSET)
+                    .cast::<PresentFlipPrivate>(),
+                record,
+            );
+        }
+        Ok(())
+    }
+
+    /// Take a keep record at submit time (see [`Self::write_keep`]): the flip's physical address,
+    /// or `None` when this DMA buffer carries none. One-shot like [`Self::take`]: the magic is
+    /// zeroed, so a recycled buffer cannot replay it.
+    ///
+    /// # Safety
+    /// As [`Self::take`].
+    pub(crate) unsafe fn take_keep(private_data: *mut c_void, private_size: u32) -> Option<u64> {
+        if private_data.is_null()
+            || (private_size as usize)
+                < PRESENT_FLIP_PRIVATE_OFFSET + core::mem::size_of::<PresentFlipPrivate>()
+        {
+            return None;
+        }
+        let slot = unsafe {
+            private_data
+                .cast::<u8>()
+                .add(PRESENT_FLIP_PRIVATE_OFFSET)
+                .cast::<PresentFlipPrivate>()
+        };
+        // SAFETY: size-checked above; unaligned as in `take`.
+        let record = unsafe { core::ptr::read_unaligned(slot) };
+        if record.magic != PRESENT_KEEP_MAGIC || record.version != PRESENT_FLIP_VERSION {
+            return None;
+        }
+        // SAFETY: same slot; only the magic word is written.
+        unsafe { core::ptr::write_unaligned(slot.cast::<u32>(), 0) };
+        Some(record.physical_address)
     }
 
     /// Take a flip record at submit time, or `None` when this DMA buffer

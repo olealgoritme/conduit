@@ -53,9 +53,16 @@ const KMD: DeviceOwner = DeviceOwner::KMD_RM;
 
 /// Acts performed per worker pass (a registration is followed by the first flip).
 const ACTS_PER_PASS: usize = 3;
-/// How long the host gets to take one flip (the worker flips every frame and StopDevice
-/// joins it for a bounded time, as the level 5 flip).
-const FLIP_TIMEOUT_MS: u64 = 1_000;
+/// How long the host gets to take one flip. The worker flips every frame, StopDevice joins it for
+/// a bounded time, and the SAME worker drains `pending_vidpn_allocation` (every later flip's
+/// address publication) BEFORE it runs this service, so a slow or silent host used to delay every
+/// later publication by up to a second per attempt (it was 1 000 ms, as the level 5 presenter's
+/// own, which is untouched). A few frame periods now (`flip_completion::WORKER_FLIP_TIMEOUT_MS`,
+/// host-tested bounds); the failure accounting is exactly as it was (a timeout is `Failed`, three
+/// in a row give up for five seconds), and every refusal that follows completes its flip as a
+/// kept picture (`flip_completion`), so a spurious timeout costs a stale picture, not a held flip.
+/// Publication itself never waits for the host: `take` publishes at programming.
+const FLIP_TIMEOUT_MS: u64 = helios_kmd_logic::flip_completion::WORKER_FLIP_TIMEOUT_MS;
 /// Consecutive flips that found the source yielded before it counts as a failure.
 const MAX_YIELDS: u32 = 8;
 
