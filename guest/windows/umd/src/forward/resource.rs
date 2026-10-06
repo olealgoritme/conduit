@@ -779,7 +779,14 @@ pub(crate) unsafe fn finish_wddm_tex2d_nvk(
                     hr as u32,
                     foreign.map_or(0, |f| f.resource_id)
                 );
-                set_runtime_error(h, hr);
+                // An id-less texture (a format or kind NVK cannot mint a
+                // resource id for, or a KMD without the shared-format cap,
+                // docs/shared-formats.md) falls back to a KMD placeholder; when
+                // that is refused too, fail this one creation with the error
+                // CreateResource may return (E_OUTOFMEMORY: the app sees a
+                // failed CreateTexture2D and can fall back) instead of an
+                // error the runtime turns into a removed device.
+                set_runtime_error(h, if foreign.is_none() { E_OUTOFMEMORY } else { hr });
                 return;
             }
         };
