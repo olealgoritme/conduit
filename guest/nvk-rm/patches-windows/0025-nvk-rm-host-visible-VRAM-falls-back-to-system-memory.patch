@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 03:49:20 +0200
+Subject: [PATCH] nvk/rm: host-visible VRAM falls back to system memory when
+ its CPU map fails
+
+Every allocation from the BAR heap (patch 0022) is CPU-mapped once, when it
+is allocated.  Under Conduit that mapping sits in the one host-visible window
+the whole guest shares, and with several NVK processes (all D3D apps on NVK)
+the window can run out: the host refuses the map, the guest driver returns an
+error, and vkAllocateMemory failed (VK_ERROR_OUT_OF_HOST_MEMORY for the
+host's ENOMEM) for a heap whose budget still showed room.  Apps that do not
+retry another memory type then die; the window can fill at any moment from
+other processes, so this is not something an app can plan around.
+
+Now a failed map frees the VRAM and the allocation is backed by our own
+system pages instead (OS-descriptor memory, as for the other host-visible
+types; it takes no window space).  The app still gets a DEVICE_LOCAL |
+HOST_VISIBLE | HOST_COHERENT allocation that works, only slower for the GPU
+to read.  It stays charged to the BAR heap until freed, so the heap keeps
+its reported size and a full heap still fails with
+VK_ERROR_OUT_OF_DEVICE_MEMORY (DXVK answers that by trying the next type).
+
+Tested in a Windows guest (RTX 5090, 1 GiB window): an 800 MiB allocation
+from the BAR heap (NVK_RM_BAR_MB=2048) is more than the host's 768 MiB
+write-combine zone, so the host refuses its map.  Before: vkAllocateMemory
+-> VK_ERROR_OUT_OF_HOST_MEMORY.  After: the warning below, and vk_bar_test's
+CPU write -> compute -> CPU read check passes on all 209715200 values; the
+default 256 MiB heap still maps through BAR1 and its fill test still stops
+at the heap size.
+
+The first fallback per device is logged with mesa_logw (NVK_DEBUG=vm logs
+every one).  Only the map failure falls back; a VRAM allocation failure is
+an error as before.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     | 11 ++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c | 70 ++++++++++++++++++----
+ 2 files changed, 68 insertions(+), 13 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 5751e9a..9bbb1f9 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -221,6 +221,11 @@ struct nvkmd_rm_dev {
+     * the shared host-visible window, which is not free to set up).
+     */
+    uint64_t bar_used_B;
++
++   /* Allocations from the BAR heap whose CPU map failed and which were
++    * given system memory instead (nvkmd_rm_mem.c).
++    */
++   uint32_t bar_fallbacks;
+ };
+ 
+ NVKMD_DECL_SUBCLASS(dev, rm);
+@@ -252,6 +257,12 @@ struct nvkmd_rm_mem {
+     */
+    void *bar_map;
+ 
++   /* Charged against the BAR heap (dev->bar_used_B) until freed: host-
++    * visible VRAM, or the system memory that stands in for it when the CPU
++    * map of the VRAM failed.
++    */
++   bool bar_charged;
++
+    /* Imported from a dma-buf: h_memory came from
+     * NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD and its handle was
+     * reserved with crm_new_handle.
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 4fbad77..a683868 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -13,6 +13,7 @@
+ 
+ #include <inttypes.h>
+ #include <stdio.h>
++#include <string.h>
+ 
+ /*
+  * Placement policy
+@@ -34,6 +35,18 @@
+  *    the host and a slot in the shared window, so apps that map and unmap
+  *    per frame must not pay for it each time.  The heap's size,
+  *    dev_info.bar_size_B, is enforced here.
++ *  - If that CPU map fails (under Conduit: the shared window is full, or
++ *    the guest driver's per-process share of it is used up, and the map
++ *    comes back as an error), the allocation does not fail: the VRAM is
++ *    freed and the memory is our own system pages instead, as for any
++ *    other host-visible type.  It is still DEVICE_LOCAL | HOST_VISIBLE |
++ *    HOST_COHERENT as far as the app knows, only slower for the GPU to
++ *    read, and it still counts against the heap, so the heap keeps the
++ *    size it reports and a full heap still fails the allocation with
++ *    VK_ERROR_OUT_OF_DEVICE_MEMORY (which DXVK and others answer by trying
++ *    the next type).  Failing the allocation on a map error instead would
++ *    take down apps that do not retry, and the window can fill at any time
++ *    from other processes.
+  */
+ 
+ static bool
+@@ -58,6 +71,29 @@ bar_release(struct nvkmd_rm_dev *dev, uint64_t size_B)
+    p_atomic_add(&dev->bar_used_B, -(int64_t)size_B);
+ }
+ 
++/* The CPU map of host-visible VRAM failed: say so once per device (and
++ * every time with NVK_DEBUG=vm).  The allocation goes on in system memory.
++ */
++static void
++bar_map_failed(struct nvkmd_rm_dev *dev, uint64_t size_B, int ret)
++{
++   const struct nvkmd_rm_lib *lib = dev->lib;
++   char why[64];
++   if (ret < 0)
++      snprintf(why, sizeof(why), "%s", strerror(-ret));
++   else
++      snprintf(why, sizeof(why), "0x%x (%s)", ret,
++               lib->status_name ? lib->status_name(ret) : "?");
++
++   const uint32_t n = p_atomic_inc_return(&dev->bar_fallbacks);
++   if (n == 1 || (dev->base.pdev->debug_flags & NVK_DEBUG_VM)) {
++      mesa_logw("NVK: host-visible VRAM: CPU map of %" PRIu64 " MiB failed: "
++                "%s (shared mapping window full?); using system memory for "
++                "it%s (%u so far)", size_B >> 20, why,
++                n == 1 ? " and for later ones that fail the same way" : "", n);
++   }
++}
++
+ static VkResult
+ alloc_os_pages(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+                uint64_t size_B, uint32_t *h_memory_out, void **pages_out)
+@@ -223,8 +259,8 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+       vram = false;
+ 
+    assert(util_is_power_of_two_or_zero64(align_B));
+-   const uint32_t page_size_B = vram ? NVKMD_RM_BIG_PAGE_SIZE
+-                                     : NVKMD_RM_SYSMEM_PAGE_SIZE;
++   uint32_t page_size_B = vram ? NVKMD_RM_BIG_PAGE_SIZE
++                               : NVKMD_RM_SYSMEM_PAGE_SIZE;
+    align_B = MAX2(align_B, page_size_B);
+    size_B = align64(size_B, align_B);
+ 
+@@ -248,20 +284,26 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+       result = alloc_rm_memory(dev, log_obj, true, size_B, align_B,
+                                flags & NVKMD_MEM_CAN_MAP, &mem->h_memory);
+       if (result == VK_SUCCESS && bar) {
+-         result = NVKMD_RM_CHECK(dev->lib, log_obj,
+-                                 VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                                 dev->lib->map_memory(dev->client,
+-                                    dev->h_device, mem->h_memory, 0, size_B,
+-                                    NVRM_DEF(OS33, _FLAGS, _ACCESS,
+-                                             _READ_WRITE),
+-                                    &mem->bar_map),
+-                                 "map host-visible VRAM");
+-         if (result != VK_SUCCESS) {
++         const int ret =
++            dev->lib->map_memory(dev->client, dev->h_device, mem->h_memory,
++                                 0, size_B,
++                                 NVRM_DEF(OS33, _FLAGS, _ACCESS, _READ_WRITE),
++                                 &mem->bar_map);
++         if (ret != 0) {
++            /* No CPU mapping to be had (the window is full): system memory
++             * stands in, still charged to the heap (the placement policy).
++             * size_B and align_B are whole big pages, which suits it too.
++             */
+             mem->bar_map = NULL;
+             nvkmd_rm_free_memory(dev, mem->h_memory);
++            mem->h_memory = 0;
++            bar_map_failed(dev, size_B, ret);
++            vram = false;
++            page_size_B = NVKMD_RM_SYSMEM_PAGE_SIZE;
+          }
+       }
+-   } else {
++   }
++   if (!vram) {
+       result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+       if (!force_rm_sysmem) {
+          result = alloc_os_pages(dev, log_obj, size_B,
+@@ -278,6 +320,7 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+       goto fail_bar;
+ 
+    mem->vram = vram;
++   mem->bar_charged = bar;
+    mem->pte_kind = pte_kind;
+    mem->tile_mode = tile_mode;
+    simple_mtx_init(&mem->export_mutex, mtx_plain);
+@@ -344,8 +387,9 @@ nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
+    if (mem->bar_map != NULL) {
+       dev->lib->unmap_memory(dev->client, dev->h_device, mem->h_memory,
+                              mem->bar_map, mem->base.size_B, 0);
+-      bar_release(dev, mem->base.size_B);
+    }
++   if (mem->bar_charged)
++      bar_release(dev, mem->base.size_B);
+ 
+    nvkmd_rm_free_memory(dev, mem->h_memory);
+    if (mem->imported && dev->lib->release_handle != NULL)
+-- 
+2.43.0
+

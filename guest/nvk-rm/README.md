@@ -97,6 +97,9 @@ is the next step. Nine more Mesa patches on top of the 13 above, in `patches-win
 | 20 | `nvk: Win32 WSI` | `VK_KHR_win32_surface` + swapchain through Mesa's win32 WSI, as a software device (CPU copy per present) |
 | 21 | `nvk/rm, wsi: Win32 zero-copy present by Helios scanout` | swapchain images in VRAM, imported once on a host render node as GEM objects and shown with ScanoutFlip (see "Zero-copy present on Windows" below); GDI stays the fallback |
 | 22 | `nvk/rm: host-visible VRAM (a BAR heap)` | a DEVICE_LOCAL \| HOST_VISIBLE \| HOST_COHERENT type on a heap of its own, backed by vidmem mapped once through BAR1 (see "Host-visible VRAM" below). Generic RM code, Linux too |
+| 27 | `nvk/rm: let the GPU cache coherent host-visible system memory in L2` | host-visible system memory mapped GPU-cacheable, L2 sysmem invalidate at the start of every submit (`NVK_RM_SYSMEM_CACHED=0` off). Generic RM code (Linux series: patch 15 on perf/nvk-rm-efficiency) |
+| 28 | `nvk/rm: compressible VRAM for images on GB20x` | `has_compression`: dedicated image memory allocated COMPR_ANY and mapped with the compressible GMK kind (`NVK_RM_COMPRESSION=0` off). Generic RM code (Linux: patch 16) |
+| 29 | `nvk/rm: ZCULL from NV2080_CTRL_CMD_GR_GET_ZCULL_INFO` | `has_zcull_info` (`NVK_RM_ZCULL=0` off). Generic RM code (Linux: patch 17) |
 
 Linux behaviour is unchanged: the full series (20 patches) builds the Linux
 NVK (nouveau + RM) as before, with the same `.so` exports; the patches apply
@@ -435,6 +438,16 @@ driver have. On the RTX 5090 in `win11`:
   allocated and stays mapped until freed; internal and client maps alias
   that mapping, so mapping per frame costs nothing. An allocation that
   does not fit the heap fails with `VK_ERROR_OUT_OF_DEVICE_MEMORY`.
+- When the CPU map fails (patch 0025: the shared window is full, or the
+  KMD's per-process share of it is used up), the allocation still succeeds.
+  The VRAM is freed and the allocation gets system pages (OS descriptors,
+  which take no window space). The app still sees the same memory type, the
+  GPU just reads it more slowly, and it still counts against the heap. The
+  first such fallback per device logs `NVK: host-visible VRAM: CPU map of N
+  MiB failed ... using system memory` (`NVK_DEBUG=vm`: every one). Patch
+  order: 0022, 0023 (S3 Helios ICD interface) if present, 0024 (block-linear
+  WSI) if present, then 0025, then `patches-windows-dxvk/`. The patch applies
+  with or without 0023.
 - Only that type lands in the BAR: `nvkmd_info::host_visible_vram_is_pinned`
   makes NVK ask for `NVKMD_MEM_VRAM` there, while NVK's own
   `LOCAL | CAN_MAP` buffers (push, queries, events, upload) stay in system

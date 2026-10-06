@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 03:37:52 +0200
+Subject: [PATCH 28/29] nvk/rm: compressible VRAM for images on GB20x
+
+NVK compresses color, depth/stencil and storage images in dedicated
+allocations when the kernel driver supports it; the RM backend reported
+has_compression = false, so every render target was uncompressed.
+
+On GB20x, allocate VRAM for compressible PTE kinds (GMK compressible)
+the way NVKMS does: block linear, 32 bpp, COMPR_ANY, so RM backs it with
+compression resources.  Map the memory's own VA, which NVK uses for a
+compressed image, with the image's kind.  If RM declines compression,
+fall back to the uncompressed GMK kind.  NVK_RM_COMPRESSION=0 turns it
+off.
+
+RTX 5090, 2560x1440, dedicated render targets:
+  16 clears of RGBA16F:          0.28 ms -> 0.018 ms (NVIDIA: 0.036 ms)
+  16 blended passes on RGBA16F:  0.272 ms -> 0.244 ms (NVIDIA: 0.244 ms)
+Rendered images are bit-identical with and without compression.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c  | 69 +++++++++++++++++++--
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c |  6 +-
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h |  7 +++
+ 3 files changed, 75 insertions(+), 7 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+index 38fbfdf..ecf357d 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
+@@ -5,6 +5,8 @@
+ 
+ #include "nvkmd_rm.h"
+ 
++#include "clcd97.h"
++
+ #include "util/log.h"
+ #include "util/u_atomic.h"
+ #include "util/os_misc.h"
+@@ -165,10 +167,26 @@ alloc_os_pages(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+    return VK_SUCCESS;
+ }
+ 
++/* Turing+ PTE kinds (dev_mmu.h); GB20x only has these two */
++#define NVKMD_RM_PTE_KIND_GENERIC_MEMORY              0x06
++#define NVKMD_RM_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE 0x08
++
++static bool
++pte_kind_is_compressible(const struct nv_device_info *info, uint8_t kind)
++{
++   /* NIL only picks compressible kinds when has_compression is set, and the
++    * RM backend sets it for GB20x only, where compression is GMK
++    * compressible (with or without PLC).
++    */
++   return info->cls_eng3d >= BLACKWELL_A &&
++          (kind == NVKMD_RM_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE ||
++           kind == NVKMD_RM_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE + 1);
++}
++
+ static VkResult
+ alloc_rm_memory(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+                 bool vram, uint64_t size_B, uint64_t align_B, bool can_map,
+-                uint32_t *h_memory_out)
++                bool *compressed_inout, uint32_t *h_memory_out)
+ {
+    const struct nvkmd_rm_lib *lib = dev->lib;
+ 
+@@ -185,8 +203,19 @@ alloc_rm_memory(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+       hclass = NV01_MEMORY_LOCAL_USER;
+       params.attr = NVRM_DEF(OS32, _ATTR, _LOCATION, _VIDMEM) |
+                     NVRM_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG) |
+-                    NVRM_DEF(OS32, _ATTR, _PHYSICALITY, _ALLOW_NONCONTIGUOUS) |
+-                    NVRM_DEF(OS32, _ATTR, _COMPR, _NONE);
++                    NVRM_DEF(OS32, _ATTR, _PHYSICALITY, _ALLOW_NONCONTIGUOUS);
++      /* Compressible memory is asked for the way NVKMS does it: block
++       * linear, 32 bpp, COMPR_ANY.  RM then backs it with compression
++       * resources and picks a compressible kind; the kind the image needs
++       * is applied per mapping.
++       */
++      if (*compressed_inout) {
++         params.attr |= NVRM_DEF(OS32, _ATTR, _FORMAT, _BLOCK_LINEAR) |
++                        NVRM_DEF(OS32, _ATTR, _DEPTH, _32) |
++                        NVRM_DEF(OS32, _ATTR, _COMPR, _ANY);
++      } else {
++         params.attr |= NVRM_DEF(OS32, _ATTR, _COMPR, _NONE);
++      }
+       params.attr2 = NVRM_DEF(OS32, _ATTR2, _ZBC, _PREFER_NO_ZBC) |
+                      NVRM_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _YES);
+       if (!can_map)
+@@ -210,6 +239,11 @@ alloc_rm_memory(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   /* RM reports back whether it could make the memory compressible */
++   if (*compressed_inout &&
++       NVRM_GET(params.attr, OS32, _ATTR, _COMPR) == NVOS32_ATTR_COMPR_NONE)
++      *compressed_inout = false;
++
+    *h_memory_out = h_memory;
+ 
+    return VK_SUCCESS;
+@@ -298,9 +332,24 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+                        dev_info->bar_size_B >> 20);
+    }
+ 
++   /* NVK only asks for a compressible kind for a dedicated allocation of
++    * an image it then uses through the memory's own VA.
++    */
++   const bool image_mem = vram && pte_kind_is_compressible(dev_info, pte_kind);
++   bool compressed = image_mem;
+    if (vram) {
++      const bool want_compressed = compressed;
+       result = alloc_rm_memory(dev, log_obj, true, size_B, align_B,
+-                               flags & NVKMD_MEM_CAN_MAP, &mem->h_memory);
++                               flags & NVKMD_MEM_CAN_MAP, &compressed,
++                               &mem->h_memory);
++      if (result == VK_SUCCESS && want_compressed && !compressed) {
++         /* NVK already treats the image as compressed; the uncompressed
++          * kind keeps the memory usable (compression state is ignored).
++          */
++         mesa_logw("NVK: RM refused compressible memory, using kind 0x%x",
++                   NVKMD_RM_PTE_KIND_GENERIC_MEMORY);
++         pte_kind = NVKMD_RM_PTE_KIND_GENERIC_MEMORY;
++      }
+       if (result == VK_SUCCESS && bar) {
+          const int ret =
+             dev->lib->map_memory(dev->client, dev->h_device, mem->h_memory,
+@@ -330,8 +379,10 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+       if (result != VK_SUCCESS) {
+          if (!force_rm_sysmem)
+             mesa_logd("NVK: OS-descriptor memory failed, using RM sysmem");
++         bool no_compr = false;
+          result = alloc_rm_memory(dev, log_obj, false, size_B, align_B,
+-                                  flags & NVKMD_MEM_CAN_MAP, &mem->h_memory);
++                                  flags & NVKMD_MEM_CAN_MAP, &no_compr,
++                                  &mem->h_memory);
+       }
+    }
+    if (result != VK_SUCCESS)
+@@ -353,8 +404,14 @@ nvkmd_rm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_rm_mem_ops,
+                   flags, size_B, page_size_B);
+ 
++   /* So the memory's own VA gets the image's kind (compressible, or GMK if
++    * RM declined).  Everything else maps the memory as generic and gives
++    * images their kind on their own VA.
++    */
++   const uint8_t mem_va_kind = image_mem ? pte_kind : 0;
++
+    enum nvkmd_va_flags va_flags = vram ? 0 : NVKMD_VA_GART;
+-   result = nvkmd_dev_alloc_va(&dev->base, log_obj, va_flags, 0 /* kind */,
++   result = nvkmd_dev_alloc_va(&dev->base, log_obj, va_flags, mem_va_kind,
+                                size_B, align_B, 0 /* fixed_addr */,
+                                &mem->base.va);
+    if (result != VK_SUCCESS)
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index e884461..41ff10e 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -5,6 +5,8 @@
+ 
+ #include "nvkmd_rm.h"
+ 
++#include "clcd97.h"
++
+ #include "nouveau_device_limits.h"
+ #include "util/cache_ops.h"
+ #include "util/log.h"
+@@ -373,7 +375,9 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+       .has_alloc_tiled = NVKMD_RM_WITH_DRM,
+       .has_map_fixed = false,
+       .has_overmap = false,
+-      .has_compression = false,
++      /* GB20x: compressible generic memory (see nvkmd_rm_mem.c) */
++      .has_compression = pdev->base.dev_info.cls_eng3d >= BLACKWELL_A &&
++                         debug_get_bool_option("NVK_RM_COMPRESSION", true),
+       .has_host_visible_vram = pdev->base.dev_info.bar_size_B > 0,
+       .host_visible_vram_is_pinned = true,
+    };
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+index 7e009b0..66f4b2f 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -56,6 +56,8 @@ typedef NvU32 NvHandle;
+    (((NvU32)NV##d##r##f##c) << DRF_LO(NV##d##r##f))
+ #define NVRM_NUM(d, r, f, n) \
+    ((((NvU32)(n)) & DRF_MASK(NV##d##r##f)) << DRF_LO(NV##d##r##f))
++#define NVRM_GET(v, d, r, f) \
++   ((((NvU32)(v)) >> DRF_LO(NV##d##r##f)) & DRF_MASK(NV##d##r##f))
+ 
+ /* nvstatuscodes.h */
+ #define NV_OK                                     0x00000000
+@@ -107,8 +109,13 @@ typedef NvU32 NvHandle;
+ 
+ #define NVOS32_DESCRIPTOR_TYPE_VIRTUAL_ADDRESS    0
+ 
++#define NVOS32_ATTR_DEPTH                         2:0
++#define NVOS32_ATTR_DEPTH_32                      0x00000004
+ #define NVOS32_ATTR_COMPR                         13:12
+ #define NVOS32_ATTR_COMPR_NONE                    0x00000000
++#define NVOS32_ATTR_COMPR_ANY                     0x00000002
++#define NVOS32_ATTR_FORMAT                        17:16
++#define NVOS32_ATTR_FORMAT_BLOCK_LINEAR           0x00000002
+ #define NVOS32_ATTR_PAGE_SIZE                     24:23
+ #define NVOS32_ATTR_PAGE_SIZE_DEFAULT             0x00000000
+ #define NVOS32_ATTR_PAGE_SIZE_4KB                 0x00000001
