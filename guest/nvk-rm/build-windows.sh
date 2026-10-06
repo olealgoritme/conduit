@@ -139,10 +139,14 @@ else
     -Dvideo-codecs= -Dvulkan-layers= \
     -Degl=disabled -Dgbm=disabled -Dglx=disabled -Dopengl=false \
     -Dgles1=disabled -Dgles2=disabled \
-    -Dshader-cache=disabled -Dzlib=disabled -Dzstd=disabled -Dexpat=disabled \
+    -Dshader-cache=enabled -Dzlib=disabled -Dzstd=disabled -Dexpat=disabled \
     -Dxmlconfig=disabled -Dperfetto=false -Dbuild-tests=false \
     -Dbuildtype="$BUILDTYPE" -Db_ndebug="$NDEBUG" \
     $MESON_ARGS
+fi
+# Build directories from before patch 26 have the shader cache off
+if ! grep -q 'ENABLE_SHADER_CACHE' "$BUILD_DIR/build.ninja"; then
+  "$MESON" configure "$BUILD_DIR" -Dshader-cache=enabled
 fi
 capped ninja -C "$BUILD_DIR" -j"$JOBS" \
   src/nouveau/vulkan/vulkan_nouveau.dll \
