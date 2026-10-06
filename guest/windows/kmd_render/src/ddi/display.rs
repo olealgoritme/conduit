@@ -531,6 +531,9 @@ unsafe fn dxgkddi_present_inner(
                 Err(status) => return status,
             }
         } else if present_flags & 1 != 0 {
+            // The Blt arm proper: the entry decision below is counted against this
+            // (`BltEntrySeen`), so a Blt that returns before it shows as `BltNoEntryO`.
+            crate::ddi::blt_async::note_entry_seen();
             let bytes = core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmd>() as UINT;
             if args.pDmaBuffer.is_null() || args.DmaSize < bytes {
                 PRESENT_LAST_STATUS.store(
@@ -670,9 +673,11 @@ unsafe fn dxgkddi_present_inner(
                 },
                 None => None,
             };
-            // The source is an adopted foreign (NVK-on-RM) allocation: the only source `BltAsync`
-            // and `BltNoMirror` act on (`ddi/blt_async.rs`).
-            let mut source_foreign = false;
+            // What the source is, for `BltAsync` and `BltNoMirror` (`ddi/blt_async.rs`): an adopted
+            // foreign (NVK-on-RM) allocation the KMD copies as one, one it does not (`ForeignCopy`
+            // 0: the legacy arm below imports it as an ordinary image, so neither knob may act on
+            // it), or a Venus-native image.
+            let mut source_class = helios_kmd_logic::blt_async::SourceClass::Venus;
             let source_desc = if let Some(snapshot) = snapshot_source {
                 // D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET. The
                 // image was created by the UMD snapshot ring with exactly these
@@ -697,7 +702,7 @@ unsafe fn dxgkddi_present_inner(
                 // explicit-modifier dma-buf image from its layout record. The
                 // pixel format is the record's fourcc. Every other source takes
                 // the match below, unchanged.
-                source_foreign = true;
+                source_class = helios_kmd_logic::blt_async::SourceClass::Foreign;
                 OptimalPresentImageDesc::new_foreign_dma_buf(
                     source.resource_id,
                     source.width,
@@ -706,6 +711,10 @@ unsafe fn dxgkddi_present_inner(
                     foreign,
                 )
             } else {
+                if source.foreign.is_some() {
+                    // `foreign_source_if_enabled` refused it (counted `FcOff`).
+                    source_class = helios_kmd_logic::blt_async::SourceClass::ForeignCopyOff;
+                }
                 match source.storage {
                     PresentAllocationStorage::OptimalCrossContextImage => {
                         OptimalPresentImageDesc::new_cross_context_dma_buf(
@@ -786,6 +795,21 @@ unsafe fn dxgkddi_present_inner(
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return crate::ddi::present_foreign::invalid(site::BLT_EXTENT);
             }
+            // The entry decision, once, before either path below and after every precondition:
+            // whether `BltAsync` / `BltNoMirror` act on this Blt, and if neither does, why
+            // (`BltEntryWhy`, `BltNoEntry*`). Pure: `helios_kmd_logic::blt_async::entry`.
+            let entry = helios_kmd_logic::blt_async::entry(helios_kmd_logic::blt_async::EntryFacts {
+                async_on: crate::ddi::blt_async::async_on(),
+                no_mirror_on: crate::ddi::blt_async::no_mirror_on(),
+                async_venus_on: crate::ddi::blt_async::async_venus_on(),
+                source: source_class,
+                snapshot: snapshot_source.is_some(),
+                dst_standard_buffer: matches!(
+                    destination_desc,
+                    PresentDestinationDesc::StandardBuffer(_)
+                ),
+            });
+            crate::ddi::blt_async::note_entry(entry);
             // A typed WindowedBlt snapshot is a TWO-PHASE transaction. Prepare
             // its reusable Venus command and reserve the exact reader lease at
             // Present, but do not submit until SubmitCommand admits the same
@@ -876,16 +900,10 @@ unsafe fn dxgkddi_present_inner(
                     PresentDestinationDesc::StandardBuffer(desc) => Some(desc.resource_id()),
                     PresentDestinationDesc::OptimalImage(_) => None,
                 };
-                // `BltNoMirror` applies to a foreign source into a standard buffer, whichever arm
-                // below copies it; `BltAsync` takes such a Blt out of this arm altogether.
-                let skip_mirror = helios_kmd_logic::blt_async::no_mirror_applies(
-                    crate::ddi::blt_async::no_mirror_on(),
-                    source_foreign,
-                    false,
-                    destination_buffer.is_some(),
-                );
-                if source_foreign && destination_buffer.is_some() && crate::ddi::blt_async::async_on()
-                {
+                // `BltNoMirror` applies to a Blt the entry decision admitted, whichever arm below
+                // copies it; `BltAsync` takes such a Blt out of this arm altogether.
+                let skip_mirror = entry.no_mirror;
+                if entry.async_enter {
                     // SAFETY: `args` is dxgkrnl's present struct for this call (PASSIVE_LEVEL)
                     // and the capacity of its private data was validated above.
                     match unsafe {
