@@ -109,9 +109,10 @@ impl ForeignSource {
 /// The source to import as a foreign resource, or `None` for the ordinary path.
 ///
 /// `layout` is `Some` only for an allocation that adopted a foreign resource. The
-/// `ForeignCopy` knob (default on) is the bisect lever: at 0 the foreign source is
-/// treated exactly as it was before this feature existed (the plain OPTIMAL
-/// import, which the host refuses for these resources), and counted as `FcOff`.
+/// `ForeignCopy` knob (default 0 = OFF, `adapter::Knobs::foreign_copy`; set 1 to use the
+/// foreign copy) is the switch: at 0, the default, the foreign source is treated exactly
+/// as it was before this feature existed (the plain OPTIMAL import, which the host
+/// refuses for these resources), and counted as `FcOff`.
 pub(crate) fn foreign_source_if_enabled(
     adapter: &AdapterContext,
     layout: Option<fr::Layout>,

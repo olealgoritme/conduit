@@ -717,10 +717,10 @@ pub mod knobs {
     pub const DISPATCH_BIND: KnobName = KnobName::new(b"DispatchBind");
     /// Per-present probe instrumentation (default 0).
     pub const PRESENT_PROBE: KnobName = KnobName::new(b"PresentProbe");
-    /// `ForeignCopy` (default 1 = ON). The KMD's explicit-modifier copy of a
-    /// foreign (NVK-on-RM) resource into the scan-out image, and the device
-    /// extension tier it needs. 0 restores the pre-feature device and import for
-    /// a same-boot bisect; read at AddAdapter/StartDevice like every knob.
+    /// `ForeignCopy` (default 0 = OFF; set 1 to use it). The KMD's explicit-modifier copy of
+    /// a foreign (NVK-on-RM) resource into the scan-out image, and the device
+    /// extension tier it needs. 0, the default, is the pre-feature device and import;
+    /// read at AddAdapter/StartDevice like every knob.
     pub const FOREIGN_COPY: KnobName = KnobName::new(b"ForeignCopy");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.

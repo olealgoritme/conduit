@@ -299,6 +299,12 @@ impl VirtioGpu {
         self.foreign.sysmem_source(resource_id)
     }
 
+    /// Entries in the foreign table (adopted ones included): whether the transport holds any
+    /// foreign resource at all. `Present` reads it only at a refusal.
+    pub fn foreign_live(&self) -> usize {
+        self.foreign.live()
+    }
+
     /// What the KMD's foreign flip decides on for `resource_id`'s record (importer, DRM
     /// file and GEM, layout, life), or `None` for an id with no record.
     pub fn foreign_flip_record(&self, resource_id: u32) -> Option<fr::FlipRecord> {

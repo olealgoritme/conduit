@@ -301,6 +301,9 @@ pub(crate) fn publish_nvrm_counters() {
     // `FcRefCode`), host refusals (`FcHostErr`), device without the extension
     // (`FcNoExt`), stale or unknown records (`FcStale`), knob off (`FcOff`).
     crate::virtio::venus::publish_foreign_copy_counters();
+    // A Present refusal caused by a foreign allocation, answered with success: `PrFgSkip`
+    // (last reason `PrFgWhy`, per arm `PrFgBlt` / `PrFgFlip`), written once one happened.
+    crate::ddi::present_foreign::publish_counters();
     // Cross-client hardening of forwarded RM ioctls (`NvDupHarden`): clients recorded /
     // dropped / refused for room (`NvCli*`), and requests that named a client or file
     // that is not the caller's (`NvDup*`). Nonzero `NvDupDeny` / `NvDupWould` outside a

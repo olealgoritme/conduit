@@ -337,6 +337,12 @@ pub struct PresentAllocInfo {
     /// to read, which is why the Present path takes it from here and not from the
     /// table.
     pub foreign: Option<fr::Layout>,
+    /// The open identity's FOREIGN flag: the KMD's own record (a foreign-table hit at
+    /// open, never creator data) that this allocation adopted a foreign resource. Unlike
+    /// [`Self::foreign`] it is not a layout hint and needs no lock to read; Present uses it
+    /// to answer a refusal for a foreign allocation with a counted success instead of a
+    /// failure (`helios_kmd_logic::present_foreign`).
+    pub foreign_identity: bool,
 }
 
 /// TRACE-ONLY companion to [`PresentAllocInfo`], resolved by
@@ -1459,7 +1465,8 @@ pub(crate) unsafe fn set_bar_placement(h: HANDLE, offset: u64) {
 /// kernel pointer through it would be both a leak and forgeable. The venus
 /// resource id is the one identity both sides already hold honestly.
 ///
-/// Only DIRECT-SCAN-OUT allocations are registered, which is what keeps a fixed
+/// Only DIRECT-SCAN-OUT allocations are registered (and, with `ForeignFlip` on, adopted
+/// foreign ones: DWM-on-NVK rotates 3 to 4 swap-chain buffers), which is what keeps a fixed
 /// table adequate: DWM rotates 3 and an app's flip chain 2-4, so the live set is
 /// under ten even across a fullscreen transition.
 const SCANOUT_ALLOC_SLOTS: usize = 32;
@@ -3146,6 +3153,12 @@ unsafe fn create_one(
 
     // ── VidMm metadata: segment placement + CPU visibility ──────────────────
     let is_direct_scanout = ctx.direct_scanout;
+    // An adopted foreign allocation (DWM-on-NVK's swap chain: not `MISC_DIRECT_SCANOUT`) is
+    // registered for the DMA-buffer flip too when `ForeignFlip` is on: its flip then reaches
+    // the `ForeignFlip` hook of `program_vidpn_source_inner` through `arm_dma_flip`. One
+    // relaxed load with the knob off (the default); an ordinary allocation never takes it.
+    let register_for_flip =
+        is_direct_scanout || (ctx.foreign.is_some() && crate::virtio::foreign_flip::enabled());
     let ctx_resource_id = ctx.resource_id;
     let ctx_serial = ctx.serial;
     if adapter
@@ -3167,7 +3180,7 @@ unsafe fn create_one(
     }
     // Register AFTER the Box is leaked, so the pointer published here is the
     // one dxgkrnl will hand back.
-    if is_direct_scanout {
+    if register_for_flip {
         register_scanout_allocation(ctx_resource_id, info.hAllocation as usize, ctx_serial);
     }
     info.Size = vidmm_size;
@@ -3669,7 +3682,14 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         let mut foreign_layout: Option<fr::Layout> = None;
         if let Some(id) = ident.as_mut() {
             match adapter.with_virtio(|v| v.foreign_open(resource_id, creator_process)) {
-                Ok(fr::OpenOutcome::NotForeign) => {}
+                Ok(fr::OpenOutcome::NotForeign) => {
+                    // The flag is the table's record and nothing else: a FOREIGN flag the
+                    // private data carried (a previous open's, or a creator's forgery)
+                    // without a live table record is dropped, here and in the identity
+                    // written back below. `Present` reads it as a fact
+                    // (`helios_kmd_logic::present_foreign`).
+                    id.foreign = false;
+                }
                 Ok(fr::OpenOutcome::Opened(record)) => {
                     foreign_ref = Some(ForeignOpenRef {
                         resource_id,
@@ -3740,6 +3760,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 memory_type_index: identity.memory_type_index,
                 direct_scanout: misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT != 0,
                 foreign: foreign_layout_from_open(identity.kind, meta, foreign_trailer),
+                foreign_identity: identity.foreign,
             }
         });
         // Trace-only companion (R316): these seven values have no consumer

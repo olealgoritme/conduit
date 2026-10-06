@@ -444,7 +444,7 @@ impl VenusInstance {
     ///
     /// Tier 0 (export trio plus `VK_EXT_image_drm_format_modifier`) is the one
     /// device a foreign (NVK-on-RM) resource can be imported on. It is tried first
-    /// ONLY when `ForeignCopy` (default on) allows it, the adapter is the display
+    /// ONLY when `ForeignCopy` (default off; set 1) allows it, the adapter is the display
     /// half, and the host serves `IMPORT_RM` (so a foreign resource can exist at
     /// all); on every other configuration the ladder starts exactly where it did
     /// before this tier existed, and the device is byte-for-byte the same one. A
@@ -510,7 +510,7 @@ impl VenusInstance {
         // The modifier tier is the ONE departure from the 38th-session rule above,
         // and it is scoped to where it has a use: a host that serves IMPORT_RM
         // (the only way a foreign resource exists) on the display half, with the
-        // `ForeignCopy` knob not turned off. Everywhere else `want_modifier` is
+        // `ForeignCopy` knob turned on (default off). Everywhere else `want_modifier` is
         // false and the ladder is the one it was. If enabling the extension ever
         // shows the old symptoms (undersized-import refusals on ordinary shared
         // images, DWM failures), `ForeignCopy=0` + restart removes it.
