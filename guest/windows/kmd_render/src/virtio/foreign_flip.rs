@@ -30,18 +30,33 @@
 //!   `ScanoutReleased`; the swap chain's depth is the protection. (The host's flips are entered
 //!   in the release book by `present_within` all the same; see 15.18.5.)
 //!
-//! LOCKING (`TARGET`, `PRES` leaf spinlocks over plain data, never held across I/O or another
+//! PIPELINING (`FfAsyncWin`, default off; `helios_kmd_logic::flip_pipeline`, docs 15.18.13). With
+//! the knob on the host `ScanoutFlip` is SUBMITTED (`present_submit`) and the worker goes on: the
+//! used-ring drain writes one acknowledgement word per in-flight flip and signals the worker's
+//! event, and the next pass SETTLES the answers (`settle_async`): the same accounting the round
+//! trip's return did (strikes, the retry pause, the give-up, the release book), driven by the
+//! answer instead of by a wait. At most the window's worth are in flight; a full window keeps the
+//! newest frame owed (the target is one slot, so a pass flips the newest picture, never a queue
+//! of old ones). Programming (`program`, `publish_bound_primary`) never depended on the host;
+//! what the window removes is the worker being BUSY in a round trip when the next
+//! `SetVidPnSourceAddress` is waiting to be drained.
+//!
+//! LOCKING (`TARGET`, `PRES`, `PIPE` leaf spinlocks over plain data, never held across I/O or another
 //! lock, never together; the `STATE` of the arbiter is taken only through the adapter
 //! methods, after both are released). `program` runs at PASSIVE under the scanout lifecycle
 //! lock, as `sysmem_flip::program`; it sends nothing. The flips are the HPD worker's.
 
-use super::foreign_scanout::{present_within, PresentRefusal};
+use super::foreign_scanout::{
+    note_async_result, present_submit, present_within, AsyncResult, PresentRefusal,
+};
 use super::gpu::DeviceOwner;
 use super::rm_present;
+use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use helios_kmd_logic::flip_pipeline::{self as fp, Ack, Pipeline, Settled};
 use helios_kmd_logic::foreign_flip::{
     self as ff, ref_name, Book, Change, Facts, Target, Verdict, Why,
 };
@@ -95,6 +110,25 @@ static RESTART_AT: AtomicU64 = AtomicU64::new(0);
 /// The `seq` of the last flip the host took.
 static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// The pipelined flip's window in force (`FfAsyncWin`, 0 = off), readable at any IRQL: the
+/// `SetVidPnSourceAddress` DDI (DIRQL), the DPC and the vsync tick ask [`early_wake`].
+static WINDOW: AtomicU32 = AtomicU32::new(0);
+/// The window's slots (leaf lock, the worker's) and their acknowledgement words (written by the
+/// used-ring drain through a pointer taken at submit: `'static`, never reallocated).
+static PIPE: SpinLock<Pipeline> = SpinLock::new(Pipeline::new());
+static CELLS: [AtomicU64; fp::MAX_WINDOW] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+/// Slots held (flying or abandoned), mirrored from `PIPE` so the service pass is one load when
+/// the pipeline is off and empty.
+static OCCUPIED: AtomicU32 = AtomicU32::new(0);
+/// The wake time this module put into the shared `rm_present` wake word for the oldest
+/// in-flight flip (0 = none), so a deadline that has passed is not left behind as a 1 kHz timer.
+static ASYNC_WAKE: AtomicU64 = AtomicU64::new(0);
+
 // Counters (service key, `Ff*`, at most 13 characters; written once the arm has seen an
 // allocation: `publish_counters`). `FfProg` allocations taken, of which `FfSame` the same
 // one again, `FfMoved` another of the same device, `FfReowned` of another device; `FfNoRec`
@@ -106,6 +140,31 @@ static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
 // its own (the shown allocation is dropped), `FfGone` shown allocations dropped (destroyed, file
 // or device closed), `FfPoison` records poisoned by a close, `FfPres` the presenter word, `FfSeq`
 // the last flip's `seq`, `FfEdges` frames owed.
+//
+// Pipelining and the host round trip (`docs/kmd-rm-client.md` 15.18.13): `FfAsyWin` the window in
+// force, `FfAsSub` flips submitted without a wait, `FfAsAck` of those the host took, `FfAsFail`
+// refused (or no usable reply), `FfAsTmo` unanswered within `WORKER_FLIP_TIMEOUT_MS` (a failure,
+// counted once; the slot stays held), `FfAsLate` answers that arrived after that, `FfWinFull`
+// frames kept owed because the window was full, `FfAsQFull` submits that found the control queue
+// full, `FfAsHigh` most flips in flight at once. `FfRttN` / `FfRttUsSum` / `FfRttUsMax` the host
+// round trip as the worker saw it, in microseconds (sync: the whole `present_within`; async:
+// submit to the pass that read the answer), the means by which the host's latency is MEASURED
+// on hardware. `FfEarlyQ` DPCs requested by the DDI at DIRQL, `FfEarlyWake` DPCs that found a
+// programming pending and woke the worker, `FfGateWake` vsync ticks that did so with the
+// delivery gate closed.
+static AS_SUB: AtomicU32 = AtomicU32::new(0);
+static AS_ACK: AtomicU32 = AtomicU32::new(0);
+static AS_FAIL: AtomicU32 = AtomicU32::new(0);
+static AS_TMO: AtomicU32 = AtomicU32::new(0);
+static AS_LATE: AtomicU32 = AtomicU32::new(0);
+static WIN_FULL: AtomicU32 = AtomicU32::new(0);
+static AS_QFULL: AtomicU32 = AtomicU32::new(0);
+static RTT_N: AtomicU32 = AtomicU32::new(0);
+static RTT_SUM_US: AtomicU32 = AtomicU32::new(0);
+static RTT_MAX_US: AtomicU32 = AtomicU32::new(0);
+static EARLY_Q: AtomicU32 = AtomicU32::new(0);
+static EARLY_WAKE: AtomicU32 = AtomicU32::new(0);
+static GATE_WAKE: AtomicU32 = AtomicU32::new(0);
 static PROG: AtomicU32 = AtomicU32::new(0);
 static SAME: AtomicU32 = AtomicU32::new(0);
 static MOVED: AtomicU32 = AtomicU32::new(0);
@@ -194,6 +253,23 @@ pub(crate) fn publish_counters() {
     rec(b"FfPres", PRES_WORD.load(Ordering::Relaxed));
     rec(b"FfSeq", LAST_SEQ.load(Ordering::Relaxed) as u32);
     rec(b"FfEdges", EDGES.load(Ordering::Relaxed));
+    rec(b"FfAsyWin", WINDOW.load(Ordering::Relaxed));
+    rec(b"FfAsSub", AS_SUB.load(Ordering::Relaxed));
+    rec(b"FfAsAck", AS_ACK.load(Ordering::Relaxed));
+    rec(b"FfAsFail", AS_FAIL.load(Ordering::Relaxed));
+    rec(b"FfAsTmo", AS_TMO.load(Ordering::Relaxed));
+    rec(b"FfAsLate", AS_LATE.load(Ordering::Relaxed));
+    rec(b"FfWinFull", WIN_FULL.load(Ordering::Relaxed));
+    rec(b"FfAsQFull", AS_QFULL.load(Ordering::Relaxed));
+    // Read under the lock, written after it: a registry write must not run at DISPATCH.
+    let high = u32::from(PIPE.lock().high_water());
+    rec(b"FfAsHigh", high);
+    rec(b"FfRttN", RTT_N.load(Ordering::Relaxed));
+    rec(b"FfRttUsSum", RTT_SUM_US.load(Ordering::Relaxed));
+    rec(b"FfRttUsMax", RTT_MAX_US.load(Ordering::Relaxed));
+    rec(b"FfEarlyQ", EARLY_Q.load(Ordering::Relaxed));
+    rec(b"FfEarlyWake", EARLY_WAKE.load(Ordering::Relaxed));
+    rec(b"FfGateWake", GATE_WAKE.load(Ordering::Relaxed));
 }
 
 fn now() -> u64 {
@@ -215,6 +291,17 @@ fn knob_on() -> bool {
 #[inline(never)]
 fn read_knob() -> u32 {
     let v = crate::diag::read_config_dword(crate::diag::knobs::FOREIGN_FLIP, 0);
+    // The window is only meaningful with the arm on; read beside it, once per generation.
+    let win = if v != 0 {
+        fp::window_from_knob(crate::diag::read_config_dword(
+            crate::diag::knobs::FOREIGN_FLIP_WIN,
+            0,
+        ))
+    } else {
+        0
+    };
+    PIPE.lock().set_window(win);
+    WINDOW.store(u32::from(win), Ordering::Release);
     KNOB.store(v, Ordering::Relaxed);
     // Mirrored on EVERY read, 0 included: "nothing is written for the default" left FfKnob = 1 in
     // the registry after the knob was set back to 0 and the device restarted (tester evidence),
@@ -244,12 +331,23 @@ pub(crate) fn forget() {
     RESTART_AT.store(0, Ordering::Release);
     FAIL_UNTIL.store(0, Ordering::Release);
     LAST_SEQ.store(0, Ordering::Relaxed);
+    // The transport is gone: no completion can come for a flip in flight. (A word written by a
+    // drain that was still running carries its flip's tag, which no new flip shares by chance
+    // for long: a mismatch is read as "nothing yet".)
+    PIPE.lock().reset();
+    for c in &CELLS {
+        c.store(0, Ordering::Relaxed);
+    }
+    OCCUPIED.store(0, Ordering::Release);
+    ASYNC_WAKE.store(0, Ordering::Release);
+    WINDOW.store(0, Ordering::Release);
     KNOB.store(KNOB_UNREAD, Ordering::Relaxed);
     // The counters are this generation's: zero them, and owe the service key the zero block.
     for c in [
         &PROG, &SAME, &MOVED, &REOWNED, &NO_REC, &REFUSED, &WHY, &REGS, &REG_FAIL, &WITHDRAWN,
         &GAVE_UP, &FRAMES, &REFLIPS, &YIELDED, &FLIP_FAIL, &STALE, &GONE, &POISONED, &EDGES,
-        &PRES_WORD, &YIELDS,
+        &PRES_WORD, &YIELDS, &AS_SUB, &AS_ACK, &AS_FAIL, &AS_TMO, &AS_LATE, &WIN_FULL,
+        &AS_QFULL, &RTT_N, &RTT_SUM_US, &RTT_MAX_US, &EARLY_Q, &EARLY_WAKE, &GATE_WAKE,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -263,6 +361,28 @@ pub(crate) fn forget() {
 /// shared frame and resume edges alone then (they are this arm's).
 pub(crate) fn holds_screen() -> bool {
     SHOWN_RESID.load(Ordering::Acquire) != 0
+}
+
+/// Whether the pipelined flip is on (`FfAsyncWin` != 0): one atomic load, legal at any IRQL.
+/// The DDI at DIRQL, the DPC and the vsync tick wake the worker early only then
+/// ([`note_early_queued`], [`note_early_woke`], [`note_gate_wake`]).
+pub(crate) fn early_wake() -> bool {
+    WINDOW.load(Ordering::Acquire) != 0
+}
+
+/// `SetVidPnSourceAddress` (DIRQL) asked for the DPC that wakes the worker. Atomics only.
+pub(crate) fn note_early_queued() {
+    EARLY_Q.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The DPC found a programming pending and woke the worker. Atomics only.
+pub(crate) fn note_early_woke() {
+    EARLY_WAKE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A vsync tick woke the worker for a pending programming with the delivery gate closed.
+pub(crate) fn note_gate_wake() {
+    GATE_WAKE.fetch_add(1, Ordering::Relaxed);
 }
 
 // ---- the programming hook --------------------------------------------------------------
@@ -489,10 +609,109 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     if KNOB.load(Ordering::Relaxed) == 0 {
         return;
     }
+    // Answers first, whatever else is due: a flip in flight is settled even when nothing is
+    // shown any more, and its slot is what a new flip waits for.
+    if OCCUPIED.load(Ordering::Acquire) != 0 {
+        settle_async(adapter);
+    }
     if SHOWN_RESID.load(Ordering::Acquire) == 0 && !PRES.lock().p.registered() {
+        if OCCUPIED.load(Ordering::Acquire) != 0 {
+            arm_async_wake();
+        }
         return;
     }
     service_pass(passive, adapter);
+    if OCCUPIED.load(Ordering::Acquire) != 0 {
+        arm_async_wake();
+    }
+}
+
+/// The host gets this long to answer a pipelined flip (the round trip's own bound).
+const ASYNC_TIMEOUT_100NS: u64 = FLIP_TIMEOUT_MS * 10_000;
+
+/// Settle every flip in flight whose answer is in (or whose time is up): the accounting the
+/// round trip's return did, driven by the acknowledgement word. PASSIVE (the release book and the
+/// arbiter's flip bookkeeping may take the virtio lock).
+#[inline(never)]
+fn settle_async(adapter: &AdapterContext) {
+    // A wake time this module asked for has been served by being here.
+    let asked = ASYNC_WAKE.swap(0, Ordering::AcqRel);
+    if asked != 0 && rm_present::wake_at() == asked {
+        rm_present::clear_wake_at();
+    }
+    let t = now();
+    for (i, cell) in CELLS.iter().enumerate() {
+        let word = cell.load(Ordering::Acquire);
+        let settled = {
+            let mut g = PIPE.lock();
+            let r = g.settle(i, word, t, ASYNC_TIMEOUT_100NS);
+            OCCUPIED.store(g.occupied() as u32, Ordering::Release);
+            r
+        };
+        match settled {
+            Settled::Pending => {}
+            Settled::Acked { slot, ack } => {
+                note_rtt(fp::elapsed_us(slot.at, t));
+                if ack == Ack::Taken {
+                    AS_ACK.fetch_add(1, Ordering::Relaxed);
+                    note_async_result(adapter, slot.seq, slot.generation, AsyncResult::Taken);
+                    LAST_SEQ.store(slot.seq, Ordering::Relaxed);
+                    YIELDS.store(0, Ordering::Relaxed);
+                    if slot.copied {
+                        FRAMES.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        REFLIPS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let mut g = PRES.lock();
+                    if g.epoch == slot.epoch {
+                        g.p.acked();
+                    }
+                } else {
+                    AS_FAIL.fetch_add(1, Ordering::Relaxed);
+                    note_async_result(adapter, slot.seq, slot.generation, AsyncResult::Failed);
+                    finish(slot.epoch, slot.pslot, slot.copied, FlipResult::Failed);
+                    rm_present::set_wake_at_min(
+                        t.saturating_add(helios_kmd_logic::rm_present::RETRY_AFTER_FAIL_100NS),
+                    );
+                }
+            }
+            Settled::TimedOut { slot } => {
+                AS_TMO.fetch_add(1, Ordering::Relaxed);
+                note_async_result(adapter, slot.seq, slot.generation, AsyncResult::TimedOut);
+                finish(slot.epoch, slot.pslot, slot.copied, FlipResult::Failed);
+                rm_present::set_wake_at_min(
+                    t.saturating_add(helios_kmd_logic::rm_present::RETRY_AFTER_FAIL_100NS),
+                );
+            }
+            Settled::Late { slot, ack } => {
+                AS_LATE.fetch_add(1, Ordering::Relaxed);
+                let r = if ack == Ack::Taken {
+                    AsyncResult::LateTaken
+                } else {
+                    AsyncResult::LateFailed
+                };
+                note_async_result(adapter, slot.seq, slot.generation, r);
+            }
+        }
+    }
+}
+
+/// Ask for a wake when the oldest flip in flight would time out (the used-ring drain wakes the
+/// worker for an answer; this is for the answer that never comes).
+fn arm_async_wake() {
+    let due = PIPE.lock().next_deadline(ASYNC_TIMEOUT_100NS);
+    if let Some(at) = due {
+        rm_present::set_wake_at_min(at);
+        ASYNC_WAKE.store(at, Ordering::Release);
+    }
+}
+
+/// One host round trip (or answer) of `us` microseconds: the count, the sum (wrapping) and the
+/// maximum.
+fn note_rtt(us: u32) {
+    RTT_N.fetch_add(1, Ordering::Relaxed);
+    RTT_SUM_US.fetch_add(us, Ordering::Relaxed);
+    RTT_MAX_US.fetch_max(us, Ordering::Relaxed);
 }
 
 #[inline(never)]
@@ -590,7 +809,37 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
             }
             Act::CopyFlip { slot } | Act::Reflip { slot } => {
                 let copied = matches!(act, Act::CopyFlip { .. });
+                if WINDOW.load(Ordering::Acquire) != 0 {
+                    match flip_async(passive, adapter, epoch, slot, copied, target) {
+                        // Submitted: the answer is settled by a later pass. Go on (the next
+                        // act of this pass is `Idle`, or the next programming's).
+                        Submit::Sent => continue,
+                        // Not now: the frame stays owed and the pass ends. The answer that
+                        // frees a slot (or the timeout that gives the host up) wakes it.
+                        Submit::Full(retry_at) => {
+                            let t = now();
+                            PRES.lock().p.flipped(slot, copied, FlipResult::Yielded, t);
+                            if let Some(at) = retry_at {
+                                rm_present::set_wake_at(at);
+                            }
+                            return;
+                        }
+                        Submit::Done(result) => {
+                            finish(epoch, slot, copied, result);
+                            rm_present::set_wake_at(
+                                now().saturating_add(
+                                    helios_kmd_logic::rm_present::RETRY_AFTER_FAIL_100NS,
+                                ),
+                            );
+                            return;
+                        }
+                    }
+                }
+                let t0 = now();
                 let result = flip(passive, adapter, target);
+                if result == FlipResult::Shown {
+                    note_rtt(fp::elapsed_us(t0, now()));
+                }
                 finish(epoch, slot, copied, result);
                 if result != FlipResult::Shown {
                     rm_present::set_wake_at(
@@ -661,8 +910,22 @@ fn flip(passive: PassiveLevel, adapter: &AdapterContext, target: Option<Target>)
             LAST_SEQ.store(seq, Ordering::Relaxed);
             FlipResult::Shown
         }
-        Err(PresentRefusal::NoSource) => FlipResult::Yielded,
-        Err(PresentRefusal::NotOwned) | Err(PresentRefusal::Forbidden) => {
+        Err(e) => refusal_result(adapter, owner, &t, e),
+    }
+}
+
+/// What a refused flip (round trip or submit) means for the presenter. `NoSource` is "yielded";
+/// a file that is not the importer's own any more drops the allocation; anything else is a
+/// failure.
+fn refusal_result(
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    t: &Target,
+    e: PresentRefusal,
+) -> FlipResult {
+    match e {
+        PresentRefusal::NoSource => FlipResult::Yielded,
+        PresentRefusal::NotOwned | PresentRefusal::Forbidden => {
             // The importer's file is not its own any more and no hook saw it: drop the
             // allocation (the worker withdraws the source next) and refuse the record.
             STALE.fetch_add(1, Ordering::Relaxed);
@@ -673,7 +936,81 @@ fn flip(passive: PassiveLevel, adapter: &AdapterContext, target: Option<Target>)
             let _ = adapter.with_virtio(|v| v.foreign_file_closed(owner, t.drm));
             FlipResult::Failed
         }
-        Err(_) => FlipResult::Failed,
+        _ => FlipResult::Failed,
+    }
+}
+
+/// What submitting a pipelined flip came to.
+enum Submit {
+    /// On the control queue; its answer is settled by [`settle_async`].
+    Sent,
+    /// Nothing sent, nothing lost: the window is full or the queue is (a time to try again, if
+    /// no answer is due to wake the worker).
+    Full(Option<u64>),
+    /// Refused before the ring (yielded, stale, failed): the presenter's usual result.
+    Done(FlipResult),
+}
+
+/// The pipelined [`flip`]: the same re-check of the target at submit time, the same ownership
+/// proof and mint (`present_submit`), then NO wait for the host. A frame is submitted only when
+/// the window has a free slot; the newest frame is always the target's current one, so a full
+/// window loses nothing (the older pictures it did not send were superseded already).
+#[inline(never)]
+fn flip_async(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    epoch: u64,
+    pslot: u8,
+    copied: bool,
+    target: Option<Target>,
+) -> Submit {
+    let Some(t) = target else {
+        return Submit::Done(FlipResult::Yielded);
+    };
+    let Some(owner) = DeviceOwner::from_token(t.owner as usize) else {
+        return Submit::Done(FlipResult::Failed);
+    };
+    // The allocation may have been destroyed, or its file closed, since the pass looked.
+    if TARGET.lock().current() != Some(t) {
+        return Submit::Done(FlipResult::Yielded);
+    }
+    let free = {
+        let g = PIPE.lock();
+        (g.free_slot(), g.stuck())
+    };
+    let Some(i) = free.0 else {
+        // Every slot holds a flip the host never answered: that is the round trip's timeout
+        // over and over (three strikes, then the Venus path has the screen back), not a window
+        // that is merely busy.
+        if free.1 {
+            return Submit::Done(FlipResult::Failed);
+        }
+        WIN_FULL.fetch_add(1, Ordering::Relaxed);
+        return Submit::Full(None);
+    };
+    let at = now();
+    match present_submit(passive, adapter, owner, t.drm, t.gem, &CELLS[i]) {
+        Ok((seq, generation)) => {
+            {
+                let mut g = PIPE.lock();
+                let _ = g.begin_at(i, seq, at, generation, epoch, pslot, copied);
+                OCCUPIED.store(g.occupied() as u32, Ordering::Release);
+            }
+            {
+                let mut g = PRES.lock();
+                if g.epoch == epoch {
+                    g.p.submitted(pslot, at);
+                }
+            }
+            AS_SUB.fetch_add(1, Ordering::Relaxed);
+            Submit::Sent
+        }
+        Err(PresentRefusal::Device(VirtioError::QueueFull)) => {
+            AS_QFULL.fetch_add(1, Ordering::Relaxed);
+            // Nothing wakes the worker for a queue that drains: come back in a couple of ms.
+            Submit::Full(Some(now().saturating_add(20_000)))
+        }
+        Err(e) => Submit::Done(refusal_result(adapter, owner, &t, e)),
     }
 }
 

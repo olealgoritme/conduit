@@ -953,6 +953,24 @@ enum InFlightKind {
         waiter: Option<NonNull<SyncWaitBlock>>,
         dest: NonNull<u8>,
     },
+    /// A RAW forwarded message whose caller does NOT wait (`ForeignFlip`'s pipelined
+    /// `ScanoutFlip`, `helios_kmd_logic::flip_pipeline`). At completion the drain writes ONE
+    /// word to `cell` (`flip_pipeline::pack_reply` with the reply header's `status`, or
+    /// `pack_no_reply` when the reply is shorter than a header or the transport died) and
+    /// signals `wake_event`; nothing else is touched, and the reply stays in the entry's own
+    /// buffer, which goes straight back to the pool.
+    ///
+    /// `cell` names a `'static` word and `wake_event` a field of the adapter, whose lifetime
+    /// encloses the transport: neither can dangle, unlike a stack waiter, so there is no
+    /// abandon path and no second exit to argue about. A completion that outlives its flip's
+    /// timeout still writes the word; the owner keeps the slot occupied until it arrives
+    /// (`flip_pipeline::Pipeline`), and `tag` lets it tell this flip's word from an earlier
+    /// flip's of the same slot.
+    RawAsync {
+        cell: NonNull<AtomicU64>,
+        tag: u32,
+        wake_event: NonNull<KEVENT>,
+    },
     /// An async fenced SUBMIT_3D carrying `fence_id` (KMD-assigned wire id).
     /// `ring_idx` 0 = host CPU ring (retires at decode); >= 1 = a per-queue
     /// GPU-completion fence (virglrenderer vkr sync thread) that legally stays
@@ -3408,6 +3426,43 @@ impl VirtioGpu {
         Ok(SyncTicket { token })
     }
 
+    /// Enqueue a RAW forwarded message that nobody waits for (`InFlightKind::RawAsync`).
+    /// `meta` is laid out as for [`Self::enqueue_raw`]; the completion writes the flip
+    /// acknowledgement word `cell` (tagged `tag`) and signals `wake_event`. The caller zeroes
+    /// `cell` BEFORE this call. On refusal the buffer is handed back.
+    pub fn enqueue_raw_async(
+        &mut self,
+        meta: DmaBuffer,
+        req_len: usize,
+        resp_len: usize,
+        cell: NonNull<AtomicU64>,
+        tag: u32,
+        wake_event: NonNull<KEVENT>,
+    ) -> Result<(), (DmaBuffer, VirtioError)> {
+        const MH: usize = super::hal::MSG_HDR_LEN;
+        if req_len < MH || resp_len <= MH {
+            return Err((meta, VirtioError::DeviceError));
+        }
+        let chain = Chain::Raw { req_len };
+        let token = match self.enqueue_core(chain, &meta, None, resp_len) {
+            Ok(token) => token,
+            Err(e) => return Err((meta, e)),
+        };
+        self.publish_then_notify(InFlight {
+            token,
+            kind: InFlightKind::RawAsync {
+                cell,
+                tag,
+                wake_event,
+            },
+            meta,
+            chain,
+            resp_len,
+            venus: None,
+        });
+        Ok(())
+    }
+
     /// Enqueue a control command without a blocking waiter.  Completion still
     /// consumes and validates the device response in [`Self::drain_used`], owns
     /// `meta` until then, clears the adapter-owned `completion` gate, and wakes
@@ -4612,6 +4667,25 @@ impl VirtioGpu {
                         }
                     }
                 }
+                InFlightKind::RawAsync {
+                    cell,
+                    tag,
+                    wake_event,
+                } => {
+                    // The transport is dead: the flip got no reply. The word says so and the
+                    // worker is woken to settle it (a failure of this flip, nothing frozen).
+                    //
+                    // SAFETY: `cell` is a `'static` word and `wake_event` an adapter field
+                    // (see `InFlightKind::RawAsync`); `KeSetEvent` with Wait = FALSE is legal
+                    // at DISPATCH.
+                    unsafe {
+                        cell.as_ref().store(
+                            helios_kmd_logic::flip_pipeline::pack_no_reply(tag),
+                            Ordering::Release,
+                        );
+                        KeSetEvent(wake_event.as_ptr(), IO_NO_INCREMENT, 0);
+                    }
+                }
                 InFlightKind::Sync { waiter, .. } => {
                     if let Some(block) = waiter {
                         // No response is copied on purpose: `SyncWaitBlock::new_zeroed`
@@ -4881,6 +4955,57 @@ impl VirtioGpu {
                 }
                 continue;
             }
+            // A pipelined flip (`InFlightKind::RawAsync`): its reply is a bare `MsgHeader`
+            // whose `status` (offset 8, a signed errno) is the whole answer. One word is
+            // written for the worker and the worker is woken; nothing is copied anywhere.
+            if let InFlightKind::RawAsync {
+                cell,
+                tag,
+                wake_event,
+            } = &entry.kind
+            {
+                const MH: usize = super::hal::MSG_HDR_LEN;
+                let (cell, tag, wake_event) = (*cell, *tag, *wake_event);
+                let wrote = (written as usize).min(resp_len);
+                let src = if wrote >= MH {
+                    entry.meta.span(entry.chain.resp_offset(), MH)
+                } else {
+                    None
+                };
+                // SAFETY: `src` is a span of the entry-owned buffer the device has finished
+                // writing (at least a header, proved by `wrote >= MH`); `cell` and
+                // `wake_event` outlive the transport (see `InFlightKind::RawAsync`). The word
+                // is stored (Release) before the signal, as the Sync and Raw arms order theirs.
+                unsafe {
+                    let word = match src {
+                        Some(span) => {
+                            let b = span.as_slice();
+                            helios_kmd_logic::flip_pipeline::pack_reply(
+                                tag,
+                                i32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+                            )
+                        }
+                        None => helios_kmd_logic::flip_pipeline::pack_no_reply(tag),
+                    };
+                    cell.as_ref().store(word, Ordering::Release);
+                    KeSetEvent(wake_event.as_ptr(), IO_NO_INCREMENT, 0);
+                }
+                // Nothing reads `meta` again: back to the pool, or parked for the PASSIVE
+                // reaper, exactly as a finished raw forward.
+                if entry.venus.is_none() && self.dma_pool_accepts(entry.meta.capacity()) {
+                    let (meta, _none) = entry.into_dma_buffers();
+                    self.dma_pool_push(meta);
+                    continue;
+                }
+                if self.parked.len() < MAX_PARKED {
+                    self.parked.push(entry);
+                    bump_high_water(&PARKED_HIGH_WATER, self.parked.len());
+                } else {
+                    PARKED_LEAKS.fetch_add(1, Ordering::Relaxed);
+                    core::mem::forget(entry);
+                }
+                continue;
+            }
             let resp_base = {
                 // SAFETY: the resp span is within the entry-owned meta buffer,
                 // which the device wrote and nothing else aliases now. A mutable
@@ -4900,8 +5025,8 @@ impl VirtioGpu {
             // SAFETY: as above; unaligned because the offset is command-shaped.
             let resp_type = unsafe { core::ptr::read_unaligned(resp_base as *const u32) };
             match entry.kind {
-                // Completed and parked above; never reaches here.
-                InFlightKind::Raw { .. } => {}
+                // Completed and parked above; never reach here.
+                InFlightKind::Raw { .. } | InFlightKind::RawAsync { .. } => {}
                 InFlightKind::Sync {
                     waiter,
                     scanout_bind,

@@ -115,6 +115,8 @@ pub mod site {
 ///   `FlipPub`: publications of a displayed address (bound or kept, any class). `FlipPubT`: when.
 /// * `VsPendN`, `VsPendMax`: consecutive vsync ticks with a pending programming (handle in the
 ///   slot, or the programming gate raised), and the longest run this generation.
+/// * `VsTickN`, `VsOffN`: every vsync heartbeat tick, and those that ran with the CRTC_VSYNC
+///   delivery gate closed (`ControlInterrupt` disable); `VsTickN - VsOffN` is `VpVsN`.
 /// * `ScLkN`, `ScLkRelN`, `ScLkAcqT`, `ScLkRelT`: acquisitions and releases of the scanout mutex
 ///   (held now when they differ, [`lock_held`]) and the interrupt time of the last acquisition
 ///   and release.
@@ -124,7 +126,7 @@ pub mod site {
 /// * `StallT`: interrupt time (ms) of the publication of this block: the "now" of every age.
 /// * `FlWdMsEff`, `DefBudEff`: the `FlipWdogMs` and `DeferBudget` knobs in force (clamped, 0
 ///   included), written at every StartDevice.
-pub const COUNTERS: [&str; 21] = [
+pub const COUNTERS: [&str; 23] = [
     "HpdLoopN",
     "HpdLoopT",
     "HpdSite",
@@ -138,6 +140,8 @@ pub const COUNTERS: [&str; 21] = [
     "FlipPubT",
     "VsPendN",
     "VsPendMax",
+    "VsTickN",
+    "VsOffN",
     "StartN",
     "StartT",
     "FlipWd",

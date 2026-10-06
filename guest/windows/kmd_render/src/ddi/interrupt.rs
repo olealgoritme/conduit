@@ -430,6 +430,15 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
         adapter.signal_hpd();
     }
 
+    // `FfAsyncWin`: a `SetVidPnSourceAddress` (DIRQL) left a programming pending and asked for
+    // this DPC; wake the worker that drains it (it used to wait for the next vsync tick).
+    if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0
+        && crate::virtio::foreign_flip::early_wake()
+    {
+        crate::virtio::foreign_flip::note_early_woke();
+        adapter.signal_hpd();
+    }
+
     // Let dxgkrnl process any interrupt data queued by DxgkCbNotifyInterrupt
     // (the WDDM fence completions signaled below re-queue this DPC, and this
     // call drains their packets — the viogpu3d NotifyDpcRoutine ordering).

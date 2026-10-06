@@ -303,6 +303,12 @@ Recipe, using only values written by one dump (or one `enum_cofunc_modality` cal
    (the registry keeps the previous boot's values until the first dump).
 4. `VsMinGap` close to the period and `VsFast` near 0 (against `VpVsN`) confirm no burst.
 
+`VpVsN` counts only the ticks DELIVERED to dxgkrnl (the `ControlInterrupt` gate open), so a rate far
+below the mode's refresh is either an idle dxgkrnl that keeps the gate closed or a slow timer.
+`VsTickN` (every tick, whatever the gate) and `VsOffN` (ticks with the gate closed), written by
+the same dump, tell which: `VsTickN - VsOffN = VpVsN`, and the rate of `VsTickN` against `VpDmpT`
+is the timer's own (docs/kmd-rm-client.md 15.18.13.3).
+
 A count and its time are two registry values read at slightly different instants, so a
 pair can be one tick (4 ms at 240 Hz) apart; this matters for intervals of a few ticks, not
 for seconds.

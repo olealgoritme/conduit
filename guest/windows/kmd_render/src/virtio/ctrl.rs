@@ -720,6 +720,57 @@ pub fn raw_roundtrip(
     Ok(n)
 }
 
+/// Submit one RM message VERBATIM and do NOT wait for the reply (`ForeignFlip`'s pipelined
+/// `ScanoutFlip`, `helios_kmd_logic::flip_pipeline`). `req` is `MsgHeader | payload` as for
+/// [`raw_roundtrip`]; the reply is a bare header whose `status` the used-ring drain turns into
+/// ONE word, `cell` (tagged `tag`: `flip_pipeline::pack_reply` / `pack_no_reply`), before it
+/// signals the HPD worker's event. The caller zeroes `cell` BEFORE the call and settles it
+/// later (`virtio/foreign_flip.rs`).
+///
+/// PASSIVE, one attempt: a full queue is returned as `QueueFull` at once (no sleeping retry
+/// loop as the round trip has; the worker keeps the frame owed and comes back), an allocation
+/// failure as `OutOfMemory`. On every error return nothing reached the ring and `cell` is
+/// untouched. `cell` must be `'static` (it is read by the drain after this returns).
+pub fn raw_submit_async(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    cell: &'static core::sync::atomic::AtomicU64,
+    tag: u32,
+) -> Result<(), VirtioError> {
+    const MH: usize = super::hal::MSG_HDR_LEN;
+    let req_len = req.len();
+    if req_len < MH {
+        return Err(VirtioError::DeviceError);
+    }
+    // A bare header plus one more descriptor's worth, as `raw_roundtrip` gives a header-only
+    // reply (see `Chain::Raw`); the drain reads only the header's `status`.
+    let resp_len = 2 * MH;
+    let total = req_len + resp_len;
+    let (work, pooled) =
+        match adapter.with_virtio(|v| (v.begin_parked_reap(), v.take_dma_buffer(total))) {
+            Ok((work, pooled)) => (Ok(work), pooled),
+            Err(e) => (Err(e), None),
+        };
+    reap_parked_work(passive, adapter, work);
+    let mut meta = pooled
+        .or_else(|| DmaBuffer::new(passive, total))
+        .ok_or(VirtioError::OutOfMemory)?;
+    meta.as_mut_slice()[..req_len].copy_from_slice(req);
+    let wake = NonNull::new(adapter.hpd_event.get()).ok_or(VirtioError::DeviceError)?;
+    let cell = NonNull::from(cell);
+    let queued = adapter.with_virtio(move |v| {
+        v.drain_used();
+        v.enqueue_raw_async(meta, req_len, resp_len, cell, tag, wake)
+    });
+    match queued {
+        Ok(Ok(())) => Ok(()),
+        // The buffer comes back here, at PASSIVE, to be dropped.
+        Ok(Err((_meta, e))) => Err(e),
+        Err(_) => Err(VirtioError::DeviceError),
+    }
+}
+
 /// Round-trip expecting a bare `VirtioGpuCtrlHdr` response; checks RESP_OK.
 fn ctrl_roundtrip_ok(
     passive: PassiveLevel,

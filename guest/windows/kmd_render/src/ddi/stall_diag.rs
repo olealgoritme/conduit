@@ -141,6 +141,13 @@ static DONE_SEQ: AtomicU32 = AtomicU32::new(0);
 /// (`VsPendN`), its maximum (`VsPendMax`), the no-publication clock and the `FlipPub` last seen.
 static VS_PEND: AtomicU32 = AtomicU32::new(0);
 static VS_PEND_MAX: AtomicU32 = AtomicU32::new(0);
+/// Every tick of the vsync heartbeat (`VsTickN`), whether or not dxgkrnl has the CRTC_VSYNC
+/// delivery gate open, and those that ran with it closed (`VsOffN`). `VpVsN` counts only the
+/// ticks that were delivered, so `VsTickN - VsOffN` is `VpVsN` (and `VsTickN` against `StallT`
+/// is the timer's own rate): the pair says whether a low `VpVsN` rate is a slow timer or a gate
+/// that dxgkrnl keeps closed.
+static VS_TICKS: AtomicU32 = AtomicU32::new(0);
+static VS_OFF: AtomicU32 = AtomicU32::new(0);
 static VS_STALL: AtomicU32 = AtomicU32::new(0);
 static VS_SEEN_PUB: AtomicU32 = AtomicU32::new(0);
 /// Watchdog publications (`FlipWd`), the time of the last (`FlipWdT`), and flips it could not
@@ -168,6 +175,7 @@ static DEFER_BUDGET: AtomicU32 = AtomicU32::new(0);
 /// allows it. It does not lower the programming gate or touch the pending slot: the worker
 /// still owns the programming and will bind or reject it as before.
 pub(crate) fn on_vsync_tick(adapter: &AdapterContext, period_100ns: u64) {
+    VS_TICKS.fetch_add(1, Ordering::Relaxed);
     let pending = adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0
         || gate_active(adapter.vidpn_programming.load(Ordering::Acquire));
     let wdog_ms = WDOG_MS.load(Ordering::Relaxed);
@@ -202,6 +210,20 @@ pub(crate) fn on_vsync_tick(adapter: &AdapterContext, period_100ns: u64) {
         WD_COUNT.fetch_add(1, Ordering::Relaxed);
         WD_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
     }
+}
+
+/// Mirror the two tick counts beside `VpVsN` (`scanout_trace::dump`, the worker's periodic dump,
+/// which keeps running with `ForeignFlip` on; the rest of this block rides the Venus refresh
+/// mirror, which does not). PASSIVE.
+pub(crate) fn publish_vsync_ticks() {
+    use crate::diag::record_named_bytes as rec;
+    rec(b"VsTickN", VS_TICKS.load(Ordering::Relaxed));
+    rec(b"VsOffN", VS_OFF.load(Ordering::Relaxed));
+}
+
+/// A vsync tick ran with the CRTC_VSYNC delivery gate closed (`VsOffN`). Atomics only (DISPATCH).
+pub(crate) fn note_gate_closed_tick() {
+    VS_OFF.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Whether the watchdog knob is on (`FlipWdogMs` != 0): the direct Venus exits
@@ -286,6 +308,8 @@ pub(crate) fn start_generation() {
         &FLIP_PUB_T,
         &VS_PEND,
         &VS_PEND_MAX,
+        &VS_TICKS,
+        &VS_OFF,
         &VS_STALL,
         &VS_SEEN_PUB,
         &WD_COUNT,
@@ -322,6 +346,8 @@ pub(crate) fn publish_counters() {
     rec(b"FlipPubT", FLIP_PUB_T.load(Ordering::Relaxed));
     rec(b"VsPendN", VS_PEND.load(Ordering::Relaxed));
     rec(b"VsPendMax", VS_PEND_MAX.load(Ordering::Relaxed));
+    rec(b"VsTickN", VS_TICKS.load(Ordering::Relaxed));
+    rec(b"VsOffN", VS_OFF.load(Ordering::Relaxed));
     rec(b"StartN", START_N.load(Ordering::Relaxed));
     rec(b"StartT", START_T.load(Ordering::Relaxed));
     rec(b"FlipWd", WD_COUNT.load(Ordering::Relaxed));
