@@ -22,11 +22,13 @@ inc = include_directories('include')
 # ICD also uses (system include: they carry MSVC pragmas).
 wdk_inc = is_windows ? include_directories(
   '../windows/icd/win-build/wdk-include', is_system : true) : []
+# helios_kmdmap.h: the KMD-view loss table shared with the Venus ICD and the UMD
+kmdmap_inc = is_windows ? include_directories('../windows/umd_common/bridge') : []
 
 rmclient_lib = library('rmclient',
   'src/rmclient.c', 'src/status.c', 'src/transport_linux.c',
   'src/transport_windows.c',
-  include_directories : [inc, include_directories('src'), wdk_inc],
+  include_directories : [inc, include_directories('src'), wdk_inc, kmdmap_inc],
   dependencies : deps,
   gnu_symbol_visibility : 'default',
   # MinGW: no libgcc DLL next to librmclient.dll
