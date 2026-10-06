@@ -1,7 +1,9 @@
 # Shared foreign surfaces: opening an NVK (RM) allocation from another process
 
 Status: KMD half implemented on `kmd/s6-shared-foreign` (plan stage S6, section 3.7 of
-`docs/dxvk-on-nvk.md` on `research/dxvk-on-nvk`). Nothing here has run on a Windows guest.
+`docs/dxvk-on-nvk.md` on `research/dxvk-on-nvk`); the re-export route of section 6 (route R) is
+implemented as `RM_RESOURCE_IMPORT` on `kmd/rm-resource-import`. Nothing here has run on a Windows
+guest.
 The UMD / NVK half (who opens, who imports) is written by another session against the ABI
 in section 2. Read `zero-copy-present.md` (sections 3, 10) first: this document starts where
 its adoption (S3) ends.
@@ -187,7 +189,7 @@ Options for the second case:
 | route | what | verdict |
 |---|---|---|
 | **F** fd hand-off | A's exported fd (a backend handle of A's device, an `Open`ed control file bound by 0x3d05) is passed to B, B runs 0x3d06 on it | **Rejected.** It needs a second capability system beside WDDM sharing (a token the KMD mints), breaks the one-owner rule of every table (handles, pins, mappings, events, teardown), and A's `Close` of the fd would pull the memory from B. It needs the host to dup the fd anyway. |
-| **R** reverse export | a new FOREIGN op `EXPORT_RM(resource_id, drm_rm_handle)` returns a GEM handle in the caller's DRM file made by the host from the resource's own dma-buf; the caller then runs `DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY` -> fd -> 0x3d06 and gets its own RM object | **Recommended, not implemented.** The authorization is already in the KMD (below); the host verb (a wire message, not `RESOURCE_CREATE_BLOB`) does not exist and is the host's design. |
+| **R** reverse export | a new FOREIGN op `RM_RESOURCE_IMPORT(resource_id, drm_rm_handle)` returns a GEM handle in the caller's DRM file made by the host from the resource's own dma-buf; the caller then runs `DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY` -> fd -> 0x3d06 and gets its own RM object | **Chosen and implemented** (section 6.1) on top of the host's `RmResourceImport` message (`MsgType` 31, host branch `feat/s6-backend`, `docs/VENUS.md` "RM-export resources in a second process"). |
 
 KMD requirements of route R, each already available after this change:
 
@@ -204,9 +206,81 @@ KMD requirements of route R, each already available after this change:
 5. unreachable from `FORWARD` (the verb is a separate escape, like `IMPORT_RM`), so the
    unchecked payload handles of section 5 R4 are not part of its trust.
 
-Not implemented because items 1 to 3 gate a host call whose shape is not agreed, and a KMD
-half without the host half is dead code that cannot be tested. It is a small addition once the
-host verb exists (an `OP_EXPORT_RM` next to `OP_IMPORT_RM`, validated and reserved the same way).
+Items 1, 2 and 5 are implemented as written. Items 3 and 4 were decided the other way, see
+6.1 ("What changed from the sketch above").
+
+### 6.1 `RM_RESOURCE_IMPORT` (implemented)
+
+**ABI** (`protocol/src/foreign.rs`, mirrored in `protocol/include/helios_foreign.h`, sizes and
+offsets asserted on both sides). A new op on `HELIOS_ESCAPE_FOREIGN_RESOURCE` (0x0018):
+
+| item | value |
+|---|---|
+| op | `HELIOS_FOREIGN_OP_RM_RESOURCE_IMPORT = 3` (bit 3 of `QueryCaps.supported_ops`) |
+| cap bit | `HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT = 1 << 2` in `QueryCaps.caps_flags`. Set only when `RM_IMPORT` is served (config features bits 13 and 10) AND the host advertises `NVGPU_CFG_RM_RESOURCE_IMPORT` (bit 14). Unlike `CAP_SHARED_OPEN` it needs the host |
+| struct | `HeliosForeignRmResourceImport`, 80 bytes: header (40) \| `rm_handle u32` @40 in \| `resource_id u32` @44 in \| `flags u32` @48 in (0) \| `out_gem_handle u32` @52 \| `out_size u64` @56 \| `out_modifier u64` @64 \| `out_flags u32` @72 (`HELIOS_FOREIGN_RM_RESOURCE_IMPORT_MODIFIER` = bit 0) \| `out_host_errno u32` @76 |
+| status | `HeliosForeignHeader.status`: `OK`; `UNSUPPORTED` (gate closed, host `EOPNOTSUPP`, older backend `EPROTO`); `NOT_OWNED` (every KMD refusal below, host `EBADF`/`ENOENT`); `BAD_RANGE` (zero ids, nonzero flags, host `EINVAL`/`ERANGE`); `NO_RESOURCES` (host `ENOMEM`); `DEVICE_ERROR` (anything else: transport failure, short or malformed reply, other errno). `STATUS_DEVICE_NOT_READY` for the escape if there is no transport |
+
+**The caller's recipe** (NVK, user mode): `QUERY_CAPS` requires `CAP_RM_RESOURCE_IMPORT`; open the
+shared allocation (the open identity gives `resource_id`); `FOREIGN RM_RESOURCE_IMPORT{rm_handle =
+own DRM node, resource_id}`; `GEM_EXPORT_NVKMS_MEMORY(gem)` to a control descriptor of its own;
+`NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD` (0x3d06) into its RM client; `DRM_IOCTL_GEM_CLOSE`
+(all `FORWARD`ed). The same resource on the same file answers the same handle, so one close undoes
+any number of imports. The memory the RM client imported lives independently of the GEM handle, of
+the resource and of A.
+
+**What the KMD checks** (`helios_kmd_logic::rm_resource_import::authorize`, evaluated in ONE device
+lock hold with the handle table read: `VirtioGpu::rm_resource_import_begin`):
+
+1. `rm_handle` is a backend handle of the caller's DEVICE (`nvrm_handle_device_type(owner, h)`) and
+   a DRM node (`>= 512`: not the control file, a GPU minor, UVM, a fence);
+2. the resource is a foreign record, not destroyed (a destroyed allocation whose host resource is
+   kept alive for opens still draining is "defer-pending": no NEW reference may start on it);
+3. the caller's device created it (`IMPORT_RM`, before adoption), OR the caller's process
+   (`hKmdProcess`, 0 disables this route) holds an open row of it (the `FgOpen` record);
+4. the request is built exactly (`MSG_HDR + 16` bytes, `flags = reserved = 0`);
+5. the reply is read only as far as the transport says it was written; a success needs
+   `>= MSG_HDR + 24` bytes and a nonzero GEM handle; unknown `flags` bits are dropped and the
+   modifier is 0 unless bit 0 says it is valid;
+6. after the round trip (no lock held across it), in one hold: the caller still owns `rm_handle`
+   in the same transport generation (`nvrm_epoch`). A handle closed during the wait may be reused
+   by the host for another process's file, so a GEM handle made in it is withheld (`FgRiStale`).
+
+Every refusal of 1 to 3 is `NOT_OWNED`, one code, so a process learns nothing about another's
+handles or resources. After ADOPTION the creating device is no longer "the creator" (the record's
+creator is `None`) and holds no open row, so it cannot use this op for its own surface: it already
+has the GEM handle it imported from. A second device of the same process as an opener may: the open
+row is per process.
+
+**What changed from the sketch above.**
+
+* *Quota (item 3)*: none. The new GEM handle is per (resource, file), the host answers the same
+  handle for a repeat, and the files are the caller's own (their count is the existing handle
+  quota), so the number of live GEM handles is bounded by resources times the caller's DRM
+  files. A per-device byte count would double-count memory the host already holds for the
+  resource.
+* *Recording the GEM handle (item 4)*: none. The host closes a DRM file's GEM handles when the
+  file closes, and the KMD already closes every DRM file a device left open (`DestroyDevice` and
+  the transport sweeps), so there is nothing to release that the existing teardown does not, and
+  a record would be a second table to keep consistent with `GEM_CLOSE` going through `FORWARD`
+  (which the KMD does not parse). The cost: a caller that never `GEM_CLOSE`s keeps the host
+  memory pinned until its file closes, bounded by its own handle quota.
+* *FORWARD*: message 31 is NOT in `HELIOS_NVRM_FORWARD_MSG_TYPES` (asserted by a `const` in the
+  protocol crate). The only route to it is this op, so the gate above cannot be bypassed.
+
+**Counters** (registry, throttled with the rest of this verb): `FgRiOk` (GEM handles returned),
+`FgRiRef` (KMD refusals before the wire, incl. nonzero flags), `FgRiErr` (round trips that failed
+or that the host refused or answered badly), `FgRiUns` (gate closed), `FgRiStale` (replies
+withheld because the handle or the transport changed during the wait). Healthy: `FgRiErr` and
+`FgRiStale` 0; `FgRiRef` counts a caller that tried without an open.
+
+**Known gaps.** The process an open is recorded under is dxgkrnl's `hKmdProcess`; the check
+compares it with the escaping device's (the same rule as `ATTACH_RESOURCE`). Another process
+that learns a resource id still cannot get a handle (it has no open row), but a process that holds
+an open may name ANY of its own DRM nodes, which is what it is for. The host's reply `size` and
+`modifier` are not cross-checked against the KMD's own record (the dma-buf may be rounded up).
+The cross-client slots of `FORWARD` (`RM_DUP_OBJECT` and the fd slots) remain unchecked; the list
+is in `nvrm-escape.md` section 10.1.
 
 ## 7. Counters (registry, throttled: first and every 16th open/close, every 64th escape)
 
@@ -220,6 +294,7 @@ host verb exists (an `OP_EXPORT_RM` next to `OP_IMPORT_RM`, validated and reserv
 | `FgOrphan` | destroyed allocations whose release still waits for opens now | 0 at rest |
 | `FgDestDef` | resource id of the last deferred (or repeated) destroy | |
 | `FgAtt`, `FgAttUns` | attach attempts of foreign resids / of those by a caller with no open and not the creator | `FgAttUns` 0 before `ATTACH_ENFORCE` goes on |
+| `FgRiOk`, `FgRiRef`, `FgRiErr`, `FgRiUns`, `FgRiStale` | `RM_RESOURCE_IMPORT`: GEM handles returned / refused by the KMD before the wire / failed or refused by the host / gate closed / withheld after a handle or transport change | `FgRiErr`, `FgRiStale` 0 |
 
 (Existing `FgImp FgRel FgAdo FgLive FgHi FgRef*` are unchanged and now also published from these
 paths. All names are <= 14 bytes, asserted by the glue tests.)
@@ -236,7 +311,8 @@ paths. All names are <= 14 bytes, asserted by the glue tests.)
 | S6 | `ATTACH_RESOURCE` of a foreign resid is counted and classified; enforcement is a const, off. | Keeps today's behaviour, makes the sanctioned route measurable. |
 | S7 | `CAP_SHARED_OPEN` is KMD-only and always set. | A producer can refuse to share on an old KMD without a host round trip. |
 | S8 | RM handles never cross owners; the cross-process route is the resid. | Every ownership table is per device. |
-| S9 | Re-export is route R (resid -> GEM in the caller's DRM file), specified, not implemented; fd hand-off rejected. | Needs a host verb; the KMD authorization exists already. |
+| S9 | Re-export is route R (resid -> GEM in the caller's DRM file), implemented as `FOREIGN RM_RESOURCE_IMPORT` over the host's `RmResourceImport` (msg 31); fd hand-off rejected. | The authorization is the KMD's (open row or creator, DRM node of the caller's device); the host cannot tell processes apart. |
+| S11 | `RM_RESOURCE_IMPORT` records nothing and has no quota; message 31 is not forwardable. | The host closes GEM handles with the file and the KMD sweeps files; the handle is per (resource, file). |
 | S10 | Payload-handle hardening of `FORWARD` stays deferred, with the exact slots listed. | Security last; nothing here depends on it. |
 
 ## 9. Tests, and what is not tested
@@ -246,6 +322,14 @@ paths. All names are <= 14 bytes, asserted by the glue tests.)
 | open/close/destroy state machine (14 tests: per-process rows, drain-order, deferred release exactly once, refusals, bounded storage, attach classification, a randomized reference-model test) | `kmd_logic/src/foreign_resource.rs` | host `cargo test` (scratch copy: cargo refuses inside the worktree) |
 | ABI: identity flag shapes, layout trailer read from private data, C mirror of the new cap bit | `protocol/src/wddm.rs`, `protocol/src/foreign.rs`, `protocol/include/helios_foreign.h` | host `cargo test` |
 | the real `foreign_tables.rs`, `foreign.rs`, `escape_foreign.rs` against a stub of the surrounding crate: open/close/destroy glue with the real table methods, a transport sweep between destroy and close, attach classification, `QUERY_CAPS` bits, every counter name <= 14 | a scratch harness (not in the tree) | `cargo test` in the stub |
+| `RM_RESOURCE_IMPORT`: request builder, reply parser (short, malformed, flags bit 0, errno), the gate (creator / open / destroyed / not a DRM node / unknown process), errno mapping incl. `EPROTO` | `kmd_logic/src/rm_resource_import.rs`, `kmd_logic/src/foreign_errno.rs` | host `cargo test` |
+| the same through the REAL `virtio/rm_resource_import.rs`, `virtio/gpu/rm_resource_import_tables.rs`, `ddi/escape_foreign_rm_resource.rs` and `escape_foreign.rs` against a stub whose `raw_roundtrip` is scripted and panics if the device lock is held across it: exact 32-byte request, refusals send nothing, gate bits 13/10/14, handle closed or transport restarted during the wait, short/broken replies, `QUERY_CAPS` bits | a scratch harness (not in the tree) | `cargo test` in the stub |
+| the C mirror (`helios_foreign_rm_resource_import` sizes and offsets) | `protocol/include/helios_foreign.h` | compile with any C11 compiler; the Rust test pins the `#define`s |
+
+**Not compiled and not run (RM_RESOURCE_IMPORT):** the `escape.rs` dispatch arm (computes
+`hKmdProcess` like the attach arm), the `virtio/mod.rs` / `virtio/gpu/mod.rs` / `ddi/mod.rs` module
+lines, and the real `ctrl::raw_roundtrip` (scripted in the harness). Never run against a host that
+serves message 31.
 
 **Not compiled and not run:** `ddi/create_allocation.rs` (open, close, destroy and unwind edits),
 `ddi/escape.rs` (the attach arm), `virtio/ctrl.rs` (`release_allocation_resource`). They were
@@ -267,6 +351,8 @@ queue there).
   longer counts against its creator, and an orphan (a destroyed allocation waiting for its last
   opener) holds host memory longer. The global table cap (512) bounds it; a global byte cap is
   the fix.
-* Route R needs the host verb (section 6).
+* Route R: done (6.1). Open: whether the quota-free design is acceptable once a hostile NVK
+  process is in scope (a loop of `RM_RESOURCE_IMPORT` costs the host one GEM handle per
+  (resource, file), not per call, but the caller's files are its own quota).
 * `ATTACH_ENFORCE`: when to turn it on (section 4), and whether the named context should also
   have to belong to the caller.
