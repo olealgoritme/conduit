@@ -404,6 +404,9 @@ impl AdapterContext {
     /// [`Self::start_vsync`]. PASSIVE_LEVEL only.
     pub unsafe fn resume_vsync(&self) {
         unsafe { self.arm_vsync() };
+        // The watchdog timer stopped with the quiesce (`quiesce_vsync`): no new activity in a
+        // power-down window, and it comes back with the heartbeat it watches.
+        unsafe { self.start_vsync_wd() };
     }
 
     /// Arm the already-initialized one-shot timer. The final arm check closes
@@ -507,6 +510,11 @@ impl AdapterContext {
     /// that set the one-shot. Legal at any IRQL up to DISPATCH (`ExSetTimer` is).
     pub(crate) fn revive_heartbeat(&self, reference: u64, now: u64, period: u64) -> bool {
         use core::sync::atomic::Ordering;
+        // A heartbeat that is no longer armed (a quiesce won the race with the caller's read) is
+        // not revived: neither `VsRevN` nor the `VsCanN` of the cancel below is bumped for it.
+        if self.vsync_armed.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         if !crate::ddi::stall_diag::note_vsync_revived(reference, now) {
             return false;
         }
@@ -602,6 +610,12 @@ impl AdapterContext {
             unsafe { ExCancelTimer(timer as ExTimer, core::ptr::null_mut()) };
             return;
         }
+        // Outside D0 the watchdog does nothing at all (no decision, no counter, no worker wake):
+        // there is no new activity in a power-down or shutdown window. It stays armed so it is
+        // back with the adapter.
+        if !crate::ddi::stall_diag::adapter_d0() {
+            return;
+        }
         let mut qpc_timestamp = 0;
         // SAFETY: a scalar clock read; `qpc_timestamp` is a live local.
         let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
@@ -660,6 +674,7 @@ impl AdapterContext {
     /// Quiesce for a transient D3 transition, preserving ControlInterrupt's
     /// delivery gate for the later D0 resume. PASSIVE_LEVEL only.
     pub fn quiesce_vsync(&self) {
+        self.stop_vsync_wd();
         self.disarm_vsync();
     }
 
