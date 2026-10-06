@@ -417,6 +417,8 @@ struct GuestTable {
 
 impl SystemBackingTable {
     const MAX_ALLOCATIONS: usize = 128;
+    /// Guest-blob records at most (one per allocation).
+    pub(crate) const GUEST_RECORDS: usize = Self::MAX_ALLOCATIONS;
 
     pub fn new(passive: PassiveLevel) -> Self {
         Self {
@@ -454,6 +456,23 @@ impl SystemBackingTable {
             .iter()
             .find(|entry| entry.record.resource_id == resource_id)
             .map(|entry| entry.record)
+    }
+
+    /// Whether any guest-blob record exists. Spinlock only.
+    pub(crate) fn guest_any(&self) -> bool {
+        self.guest.lock().entries.len() != 0
+    }
+
+    /// The first destination whose guest blob is live (`Ready`: a copy target), if any.
+    /// Spinlock only.
+    pub(crate) fn guest_first_ready(&self) -> Option<u32> {
+        self.guest
+            .lock()
+            .entries
+            .as_slice()
+            .iter()
+            .find(|entry| entry.record.copy_target())
+            .map(|entry| entry.record.resource_id)
     }
 
     /// The host's live guest-blob totals `(blobs, runs)`. Spinlock only.
@@ -834,9 +853,14 @@ impl SystemBackingGuard<'_> {
     /// to a different live resource. Leases are released outside the spinlock.
     pub(crate) fn reset_generation(&self) {
         self.table.invalid.lock().clear_all();
-        // Guest blobs first: the transport of their generation is gone (the device was reset,
-        // which drops every host resource, guest blobs and their page mappings included), so
-        // no host object names these pages any more and every pin may go, poisoned ones too.
+        // Guest blobs first. Every caller resets the transport before this (StopDevice and
+        // StartDevice drop it through `retire_transport`; `VirtioGpu::drop` writes device status
+        // 0, and a reset virtio device may not access guest memory, which is all a guest blob's
+        // mapping is), and the live blobs were retired before that while the host still
+        // answered (`guest_blob::retire_all_for_stop`). What is left is a poisoned record (a
+        // release the host did not confirm) or one a spent stop budget skipped: the reset is
+        // the host's acknowledgment that nothing writes those pages any more, so every pin may
+        // go, poisoned ones too. Dropping them earlier (with the transport up) would not be.
         loop {
             let taken = {
                 let mut table = self.table.guest.lock();

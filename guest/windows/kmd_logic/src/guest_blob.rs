@@ -1179,6 +1179,30 @@ mod tests {
     }
 
     #[test]
+    fn a_retire_always_leaves_ready() {
+        // The StopDevice sweep (`retire_all_for_stop`) retires "the first Ready record" until
+        // there is none: every outcome of a retire must leave Ready, or the sweep would spin.
+        for outcome in 0..3 {
+            let mut r = Record::new(1);
+            r.begin_create().unwrap();
+            r.sent(3, 1);
+            assert!(r.created());
+            assert!(r.copy_target());
+            assert_eq!(r.begin_drain(), Drain::Release { guest: 3 });
+            match outcome {
+                0 => {
+                    r.drained();
+                }
+                1 => r.drain_failed(Why::DrainTimeout),
+                _ => r.drain_failed(Why::ReleaseFailed),
+            }
+            assert!(!r.copy_target(), "outcome {outcome}");
+            // A poisoned record keeps its pages until the generation reset.
+            assert_eq!(r.may_unlock(), outcome == 0, "outcome {outcome}");
+        }
+    }
+
+    #[test]
     fn a_failed_release_of_a_draining_record_retries_as_poisoned() {
         let mut r = Record::new(1);
         r.begin_create().unwrap();

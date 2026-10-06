@@ -465,6 +465,44 @@ pub(crate) fn before_lease_change(
     retire(passive, adapter, guard, resource_id);
 }
 
+/// The transport generation is about to end (StopDevice, or a StartDevice that finds an old
+/// transport): while the transport and the Venus client still answer, retire every live guest
+/// blob in the host's order (drain, destroy, free, fence, UNREF), so that no copy the host may
+/// still run can write a page whose pin the generation reset (`reset_generation`) then drops.
+///
+/// Bounded by `budget` (the sweep budget of the caller): nothing is sent once it is spent. A
+/// blob that is not retired (budget spent, a step failed: poisoned) keeps its pin until the
+/// generation reset, which runs only after the transport was reset (`VirtioGpu::drop` sets the
+/// device status to 0; a reset device may not access guest memory, and a guest blob's mapping
+/// is exactly such an access), so the pages are unlocked only once the host can no longer write
+/// them. One spinlock lookup when there is no record (always, with the knob at 0). PASSIVE, no
+/// lock held (takes the content transaction, then the Venus mutex: the paging path's order).
+pub(crate) fn retire_all_for_stop(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    budget: &helios_kmd_logic::sweep_budget::SweepBudget,
+) {
+    if !adapter.system_backings.guest_any() {
+        return;
+    }
+    let Some(guard) = adapter.system_backings.serialize(passive) else {
+        return;
+    };
+    // `retire` moves a live record out of `Ready` whatever happens, so each turn retires a
+    // different destination; the bound is the table's size.
+    for _ in 0..crate::adapter::SystemBackingTable::GUEST_RECORDS {
+        let Some(resource_id) = adapter.system_backings.guest_first_ready() else {
+            break;
+        };
+        let now = crate::adapter::foreign_scanout::now_100ns();
+        if budget.call_timeout_ms(now).is_none() {
+            // Spent: send nothing more. The pins stay until the generation reset.
+            break;
+        }
+        retire(passive, adapter, &guard, resource_id);
+    }
+}
+
 /// The destination is destroyed: retire its guest blob and forget its record (a poisoned one
 /// stays, pin and all, until the generation ends). PASSIVE, content transaction held.
 pub(crate) fn destination_gone(
