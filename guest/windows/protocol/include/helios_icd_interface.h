@@ -39,7 +39,8 @@ extern "C" {
 #endif
 
 #define HELIOS_ICD_INTERFACE_EXPORT "helios_icd_interface_v2"
-#define HELIOS_ICD_INTERFACE_VERSION 2u
+/* The export keeps its name; version 3 only appends entries (and caps 4..6). */
+#define HELIOS_ICD_INTERFACE_VERSION 3u
 
 enum helios_icd_backend {
    HELIOS_ICD_BACKEND_VENUS = 1,
@@ -57,6 +58,17 @@ enum helios_icd_backend {
 /* The producer interface (escape 0x13 streams keyed on a Venus timeline)
  * exists. NVK: no; presents are CPU-complete (value 0 markers). */
 #define HELIOS_ICD_CAP_PRODUCER (1u << 3)
+/* Version 3: queue_rm_fence / rm_fence_wait / rm_fence_close /
+ * scanout_present_fenced work (NVK: librmclient with RM fences and a host with
+ * DRM fences, guest/windows/docs/rm-fence-marker.md, dxvk-on-nvk S4). */
+#define HELIOS_ICD_CAP_RM_FENCE (1u << 4)
+/* scanout_present_fenced hands the fence to the KMD, which flips when it fires
+ * (QueryCaps HELIOS_NVRM_CAP_SCANOUT_FENCE). Without it a thread in the ICD
+ * waits for the fence; the caller returns at once either way. */
+#define HELIOS_ICD_CAP_SCANOUT_FENCE_KMD (1u << 5)
+/* The KMD takes RM fences in WDDM present markers (HERF/HEPR tail, HE12 v4;
+ * QueryCaps HELIOS_NVRM_CAP_PRESENT_FENCE, protocol/include/helios_rm_fence.h). */
+#define HELIOS_ICD_CAP_PRESENT_FENCE_KMD (1u << 6)
 
 /* DRM fourcc / modifier values used below (drm_fourcc.h). */
 #define HELIOS_DRM_FORMAT_XRGB8888 0x34325258u
@@ -134,6 +146,34 @@ struct helios_icd_api {
 
    /* The producer interface (helios_producer_abi.h), or NULL. */
    const void *(*producer)(void);
+
+   /* ---- version 3 (size covers them; NULL = not supported) ---------------
+    * RM fences (HELIOS_ICD_CAP_RM_FENCE). A fence is a backend handle of the
+    * NVRM escape device the ICD's librmclient opened in this process: it fires
+    * once when the GPU has finished the work it stands for (or after the host's
+    * 5 s timeout). */
+
+   /* Signal the device's present timeline on `queue` after everything
+    * submitted to it so far and make a fence for that point. The caller holds
+    * the queue as vkQueueSubmit requires (DXVK: lockSubmission). *fence_handle
+    * is the caller's: hand it to the KMD (scanout_present_fenced, a present
+    * marker tail) or give it back with rm_fence_close. *value (may be NULL) is
+    * the timeline value, diagnostic. VK_ERROR_FEATURE_NOT_PRESENT: no fences
+    * here; wait on the CPU as before. */
+   VkResult (*queue_rm_fence)(VkDevice device, VkQueue queue,
+                              uint32_t *fence_handle, uint64_t *value);
+   /* Wait for a fence the caller still owns. VK_SUCCESS fired, VK_TIMEOUT. */
+   VkResult (*rm_fence_wait)(VkDevice device, uint32_t fence_handle,
+                             uint64_t timeout_ns);
+   /* Close a fence the caller still owns (fired or not). */
+   void (*rm_fence_close)(VkDevice device, uint32_t fence_handle);
+   /* scanout_present, sent when `fence_handle` fires instead of after a CPU
+    * wait; returns at once. TAKES the fence in every case (success or not).
+    * Image reuse: with N >= 3 images, do not render into the image of present
+    * P before the fence of present P+1 fired and P+1's call returned
+    * (rm-fence-marker.md). */
+   VkResult (*scanout_present_fenced)(VkDevice device, VkDeviceMemory memory,
+                                      VkImage image, uint32_t fence_handle);
 };
 
 typedef VkResult (*PFN_helios_icd_interface_v2)(uint32_t version, struct helios_icd_api *out);

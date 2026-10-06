@@ -472,6 +472,103 @@ stalled on PCIe reads of DXVK's dynamic buffers in system memory, not
 computing. (The "off" rows are faster than the 62 fps in the table above
 because KMD 22.22.309/310 and the backend got faster in between.)
 
+### Presents on RM fences, no CPU wait (patch 30, dxvk-on-nvk S4)
+
+Before patch 30 every present on the Helios scanout waited on the CPU for the
+frame's GPU work and then flipped: the Win32 WSI through
+`wait_before_present`, the Helios D3D11 UMD (S3) through its frame gate. Patch
+30 hands the flip an RM fence instead and the presenting thread returns at
+once. The KMD side is `guest/windows/docs/rm-fence-marker.md`.
+
+How a present gets its fence:
+
+1. **Present timeline.** Per queue that presents, a 64-bit semaphore that is
+   one entry (32 bytes on GB20x, value at offset 0) of an RM
+   `NV_SEMAPHORE_SURFACE` (class 0xda, under the subdevice) over 4 KiB of
+   RM-allocated system memory (`NVKMD_RM_MEM_RM_SYSMEM`: RM maps the memory
+   itself, and an OS descriptor is refused with `NV_ERR_NOT_SUPPORTED`). It is
+   an ordinary `nvkmd_rm_sync` whose value lives in the surface, so the queue
+   signals it with the usual `SEM_EXECUTE` release + `NON_STALL_INTERRUPT`. A
+   context binds its channel to the surface before its first release into it
+   (`NV_SEMAPHORE_SURFACE_CTRL_CMD_BIND_CHANNEL`, notifier
+   `NV2080_NOTIFIERS_FIFO_EVENT_MTHD`, the host engine's non-stall interrupt
+   that the method raises), so RM checks the surface's waiters on it.
+2. **Fence context.** The entry is imported on the host render node with
+   nvidia-drm `SEMSURF_FENCE_CTX_CREATE` (0x54, NVKMS block
+   `{hClient, hSemaphoreSurface, size}`, index = entry), once per timeline.
+3. **Per present.** `vk_queue_signal_sync()` (exported by the runtime in
+   patch 30) of the timeline's next value after everything submitted to the
+   queue so far, then `SEMSURF_FENCE_CREATE` (0x55, `timeout_ms` 5000) for that
+   value: a backend handle, recorded by the KMD (22.22.311+) as a fence of
+   librmclient's NVRM device, which fires one `EventReady` when the GPU writes
+   the value (or with an error after 5 s).
+4. **Flip.** `nvkmd_rm_mem_scanout_flip_fenced()`:
+   - KMD with `QueryCaps.supported_ops` bit 32 (`HELIOS_NVRM_CAP_SCANOUT_FENCE`):
+     `SCANOUT_PRESENT` with flag `RM_FENCE` and the handle at offset 52; on OK
+     the KMD owns the handle and sends the flip from its worker when the fence
+     fires (FIFO per source, ready prefix coalesced). `QUEUE_FULL` (8 waiting):
+     wait for our own fence (all older ones are then ready) and retry, so a
+     plain flip never overtakes queued ones. Any other refusal: the handle is
+     still ours, and the flip thread below takes over for good.
+   - KMD without the bit (22.22.311): a flip thread per device waits on the
+     fence (`EVENT_REGISTER` on the handle, no polling), closes it and sends a
+     plain `SCANOUT_PRESENT`, in order, at most 8 frames behind (the producer
+     blocks beyond that).
+   - No DRM fences on the host (config bit 11), an older librmclient, or
+     `NVK_RM_FENCE=0`: the CPU wait as before.
+
+Consumers: the Win32 WSI (`wsi_device::win32.scanout_flip_fenced`; a scanout
+swapchain then skips the CPU wait, `wsi_swapchain::gpu_ordered_present`) and
+`helios_icd_interface` version 3 (`queue_rm_fence`, `rm_fence_wait`,
+`rm_fence_close`, `scanout_present_fenced`; caps `RM_FENCE`,
+`SCANOUT_FENCE_KMD`, `PRESENT_FENCE_KMD`), which the Helios UMD uses on
+`feat/s4-rm-fences` (DXVK's queue taken with `lockSubmission()`; the frame
+only made SUBMITTED, not complete). librmclient adds `crm_win_caps`,
+`crm_win_semsurf_ctx_create`, `crm_win_semsurf_fence_create`,
+`crm_win_fence_wait` and `crm_win_scanout_present_fenced` (all loaded as
+optional symbols).
+
+Knobs: `NVK_RM_FENCE=0` (off), `NVK_RM_FENCE_KMD=0` (never hand fences to the
+KMD: flip thread).
+
+Image reuse: the swapchain keeps its rule (an image comes back two presents
+later). With the KMD carrying the fence the rule the KMD documents is "do not
+render into the image of present P before present P+1's fence fired and its
+call returned"; on one queue the GPU write into P's image is ordered after
+P+1's and P+2's work, so the remaining window is one KMD worker wake.
+
+Limits: the timeline is signalled on the present queue, so the flip is
+ordered after work submitted to *that* queue. Work of another queue is
+covered when the present waits on it with a semaphore: on Windows NVK has no
+`copy_sync_payloads`, so the WSI's pre-present submit really waits on the
+present queue, before the timeline signal. The UMD signals on DXVK's graphics
+queue, which already waits for DXVK's transfer queue. A fence costs one escape (60-80 us): a
+trivial frame (vk_scanout_present's triangle) is faster with the CPU wait
+(5645 vs 4899 fps), any frame with real GPU work is faster fenced. A fence for
+a value already reached fires after up to ~1 ms (the backend's event pump
+misses the edge of a sync_file that signalled before it was watched and finds
+it on its 1 ms sweep, `conduit-backend.rs` `event_pump`); fences made while the
+GPU still works fire within ~0.1 ms of the write.
+
+`win11`, KMD 22.22.311 (no bit 32, so the flip thread), RTX 5090:
+
+- `crm_semsurf_smoke` (librmclient only, CPU `SET_VALUE`): fence create 62 us
+  median, `SET_VALUE` to event 932 us median (p99 976), Close 67 us; already
+  reached 0.83 ms; a 200 ms timeout fires after 201.5 ms.
+- `vk_rmfence_test` (NVK, GPU release): no fence ever fired before the
+  submit's own `VkFence` (checked every round). 2 GiB fill: wake 2091 us after
+  submit (RM fence) vs 2157 us (`vkWaitForFences`); 64 MiB fill 298 vs 361 us.
+- `vk_rmfence_test` presenting 1920x1080 on scanout 0 with three images and
+  frame pipelining (wait for frame P-2): 1 GiB fill per frame 808 -> 982 fps,
+  presenting thread 1228 -> 73 us per frame in present; 64 MiB fill 3711 ->
+  6481 fps. 0 failed flips, 0 fences that did not fire.
+- KMD counters after 38561 fences: `NvFence` = `NvFenceCl` = `NvFenceSig` =
+  38561, `NvFenceEarly` 638, `NvFenceErr` 0.
+
+Patch order: 0022, 0023 (Helios ICD interface, required: patch 30 extends
+`nvk_helios.c`), 0024 if present, 0025, 0027-0029, **0030**, then
+`patches-windows-dxvk/`. It does not apply without 0025 and 0027-0029.
+
 ## Running (in a guest)
 
 ```sh
