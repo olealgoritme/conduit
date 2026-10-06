@@ -1252,14 +1252,18 @@ impl Io<'_> {
         let (_, off) = c.view_host();
         // `minor` (<= 254) is never UVM's 256, so this is the RM window.
         let region = nvrm::region_for(self.adapter, c.minor()).ok_or(Fail::new(FailKind::Os, 4))?;
-        let end = off
-            .checked_add(size)
-            .ok_or(Fail::new(FailKind::Layout, 0x21))?;
-        if off % PAGE != 0 || end > region.len {
-            return Err(Fail::new(FailKind::Layout, 0x22));
+        if off.checked_add(size).is_none() {
+            return Err(Fail::new(FailKind::Layout, 0x21));
         }
+        // The physical address of the span, in checked 64-bit arithmetic (the window is the
+        // GPU's BAR1: 32 GiB and up, above 4 GiB in guest physical space).
+        let Some(phys) =
+            helios_kmd_logic::window_units::place(region.base, region.len, off, size)
+        else {
+            return Err(Fail::new(FailKind::Layout, 0x22));
+        };
         let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
-        pa.QuadPart = (region.base + off) as i64;
+        pa.QuadPart = phys as i64;
         // SAFETY: PASSIVE (the HPD worker); `region.base + off .. + size` lies inside the
         // window the host just placed this mapping in (checked above), page aligned.
         // Write-combined as the user-mode map of the same memory is (the Linux module's

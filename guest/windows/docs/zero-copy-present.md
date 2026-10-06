@@ -1153,7 +1153,8 @@ full zero block once per generation even if nothing is ever seen.
 | `MsiVectors` | transport init (MSI plan) | local | `MsiVec` |
 | `VsyncRateMhz` | StartDevice | static | `VsRate` |
 | `OutputTech` | each child-capabilities query | not cached | `OutTech` |
-| `FlipCapsX`, `FlipQueueN` | each QueryAdapterInfo caps query | not cached | `FlipCapV`, `FlipQueV` |
+| `FlipCapsX` | AddDevice and StartDevice (`AdapterKnobs::read`, `read_at_start`; section 18) | `AdapterContext::knobs` | `FlipCapsXEff`, `FlipCapsXMsk`, `FlipCapsRep` (written at every start, 0 included), `FlipCapV` (each caps query) |
+| `FlipQueueN` | each QueryAdapterInfo caps query | not cached | `FlipQueV` |
 | `KmdRmClient` | StartDevice, after `retire_transport` (`rm_client::reread_knob_at_start`); `forget` resets it per transport | static | `RmKnob` (now on every read, 0 included) |
 | `KmdRmSysCache` | each level 5 primary bring-up | state | `RmSysCache` (level 5 counter block) |
 | `KmdRmSysPollMs` | lazily at level 5, per transport generation (`forget` resets it) | static | `RmSysPollMs` (now on every read, 0 included) |
@@ -1506,3 +1507,503 @@ the mode is 5120x1440@240 (Display settings and `SetDisplayConfig` query), DWM p
 is 4 within a second, `HpdLoopN` rises on a desktop that changes, `VsTickN` rises (the heartbeat runs), `HpdN` is 1 (per
 generation now). Run it with the NVK spin app running in at least two of the five, and once with `VsPowerMode` 1 and
 `VsWatchdog` 2 to see whether the v326 behaviour is what breaks it (it should be run last, after the defaults pass).
+
+## 16. Adapter-wide device removed (v326.1 incident; instrument added after v327)
+
+### 16.1 Symptom
+
+KMD 326.1 (`VsWatchdog` on). The counters below were read about five minutes after the event. Between about 15:30:50 and 15:31:07 VM time EVERY
+live D3D device on the adapter, Venus and NVK processes alike, got `D3DDDIERR_DEVICEREMOVED` (0x88760870). DWM logged
+"Evict FAILED" eleven times on its primaries, then DestroyDevice, a failed CreateDevice and its exit (Windows restarted it).
+No System 4101, no dump, `StartN` 1 (no device restart), nothing on the host (no Xid, no backend WARN/ERROR; one Venus
+context with fence latencies up to 650 ms). Just before: an NVK explorer logged "NVK present: frame wait timed out,
+presenting anyway", and another process was restarting explorer (NVK to Venus): process teardown plus device creation at that
+moment. Counters at 15:36:17 (uptime 1209 s): `PgSe` 2, `PgSc` 2, `PgTo` 3, `PgFn` 8, `PgUn` 8, `PgMr` 1303, `PgMc` 1, `PgDn`
+191, `PgDi` 630, every other `Pg*` failure counter 0; `HpdPassMaxUs` 2 408 319, `HpdBusyUs` 14.5 s, `HpdDumpUs` 1.45 s,
+`VsGapMaxMs` 5825, `VsRevN` 4, `VsPendMax` 578, `VsArmN` 1, `ScLkN` = `ScLkRelN` 125693, `HpdSite` 19.
+
+### 16.2 What the code says (read, not measured)
+
+**Statuses.** Every DDI the OS calls at run time answers `STATUS_SUCCESS` by construction. The non-success returns that exist are
+argument checks (`STATUS_INVALID_PARAMETER` on a null pointer or a bad escape header) and capability refusals; none of them is
+reachable from a running adapter with valid arguments. Specifically:
+
+* `DxgkDdiBuildPagingBuffer` (`ddi/build_paging_buffer.rs`, `build_paging_buffer_inner`, about line 1826): the only non-success
+  return is `STATUS_INVALID_PARAMETER` for a null adapter or null args. Every failed content operation (`PagingOpOutcome::Failed`)
+  is answered through `paging_failure()` (line 173), which is `STATUS_SUCCESS`, with `PgSkipV` and a per-reason counter; the
+  compile-time assert at line 176 ties that to `helios_kmd_logic::paging::is_legal_status`. `PgSkipV` 0 in the event means no
+  content operation was skipped, so no eviction was refused.
+* `PgSe` is NOT an exception counter. It is `BAR_SYSTEM_BACKING_ERRORS` ("system backing errors"): a failed or refused lease on
+  the system pages of an eviction (`remember_system_backing`, line 880; the lease and record steps in `bar_virtual_transfer_inner`,
+  about lines 1105 to 1190; `bar_transfer`, about line 1323 and 1404), or a Present mirror that could not take the content mutex
+  or copy (`mirror_present_system_backing`, line 908). Every one of those sites is "the copy is complete or skipped, only the
+  record that lets Present keep mirroring into the system copy is not" and the DDI still answers success. There is no `__try`
+  anywhere in the paging path: the only SEH in the driver is `seh_shim.c` (user-mode blob mapping, `helios_lock_*`), none of it
+  reachable from `BuildPagingBuffer`. The KMD panic handler is `KeBugCheck` (`wdk-panic`), so a Rust panic is a bugcheck, not a hang.
+  `PgSe` 2 with `PgSc` 2 (captures) and `PgTo` 3 (blob to system copies) says: three evictions of a BAR allocation happened in
+  the whole 20 minutes, two of them kept a lease and two lease/record steps failed (one eviction can account for both). It does
+  not say an eviction failed. `PgDn` 191 are discards, `PgDi` 630 are paging operations on device-local allocations that are
+  host-owned and correctly not ours (`NotOurs`).
+* `DxgkDdiSubmitCommand`, `SubmitCommandVirtual` (`ddi/submit_command.rs`, 1420 and 1352 area): `STATUS_SUCCESS` always after the
+  null checks. `PreemptCommand` (1592): `STATUS_DEVICE_NOT_READY` only when `adapter.dxgkrnl()` is `Err` (never after start).
+  `ResetFromTimeout` (1623), `RestartFromTimeout`, `ResetEngine`, `QueryEngineStatus` (`ddi/scheduler.rs`): success.
+* Device/context/process DDIs (`device.rs`): success, except the null-argument checks. `DestroyDevice` (387) ALWAYS returns
+  success, but it is where the time goes (see 16.4, H3).
+* Power: `DxgkDdiSetPowerState` (`ddi/lifecycle.rs`, 863) answers success for every state. Only the adapter leaving D0
+  quiesces the heartbeat under `VsPowerMode` 1 (v326); `VsArmN` 1 says there was no quiesce-and-resume (resume goes through
+  `arm_vsync`, which counts) so the adapter did not go D3 and back in this generation.
+* Callbacks: the DMA completion notify (`notify_at_dirql`, `ddi/submit_command.rs` 802) can fail; the fence is put back (the
+  `DMA_NOTIFY_FAILS` retry path), the DDI still answers success. `DxgkCbIndicateChildStatus` (`ddi/hpd.rs` 43) result was kept
+  only as 16 bits in `HpdI`.
+* "Fatal" latches: there is no latch that makes DDIs fail. A latched ring (`transport_failed`, the v323 30 s ring budget) makes
+  host round trips fail (`VirtioError`), which the DDIs absorb (`PgEm`, `PgTxG`, `RfFail`...); nothing reports device loss to
+  dxgkrnl by status, by `DxgkCbIndicateChildStatus` or by an interrupt type. The KMD never calls `DxgkCbSetPowerComponent...`,
+  `DxgkCbQueryVidPnInterface` outside the VidPn DDIs, and signals only `DMA_COMPLETED`, `DMA_PREEMPTED` and `CRTC_VSYNC`.
+
+So by construction the KMD cannot tell dxgkrnl "the device is lost". What can make dxgkrnl declare it with no 4101 is therefore
+indirect: dxgkrnl or VidMm/VidSch deciding from TIME (a fence, a paging operation or a DDI that did not return in time), from a
+status the KMD does not return today (excluded by reading, and now watched by `LostN`), or from the OS (PnP, session, display
+power, TDR with logging not reaching the log). The instrument added in this change is aimed at the first.
+
+### 16.3 "Evict FAILED" on DWM's primaries
+
+DWM's eviction is a D3DKMT call (`D3DKMTEvict` / `EvictResources`) on its own allocations. A failure there with every device
+already removed is a CONSEQUENCE (the call fails on a lost device), not evidence of the cause; DWM evicts its primaries when
+the display is powered down, the session is disconnected or locked, or under memory pressure. The KMD's part in an eviction is
+`BuildPagingBuffer` `TRANSFER` (BAR to system) or `VIRTUAL_TRANSFER` `LOCAL_TO_SYSTEM`, and only for allocations that are
+`bar_eligible`; a scanout-source primary that is a Venus or foreign (adopted) resource, a host-less placeholder (resource id 0)
+or a device-local image is `NotOurs` and answers success at once (`PgDi`). For a BAR allocation whose host resource was retired
+(owner death at DestroyDevice before the blob sweep), `paging_alloc_info` refuses a stale or dead handle (`PgStale`, `PgEh`,
+`PgFh`) and the arm answers `Failed` through `paging_failure()`: success plus the invalid mark (`PgInv`), never a failure
+status. All of `PgStale`, `PgEh`, `PgInv`, `PgSkipV` were 0 in the event. `PgTo` 3 over 20 minutes also says VidMm was not under
+eviction pressure.
+
+The one way the paging path can hurt VidMm is TIME. It runs `serialize()` (a sleeping mutex, `adapter.system_backings`, the same
+one a Present mirror and a teardown take: line 1949) and, for a BAR allocation, `map_blob_prepare` (a `RESOURCE_MAP_BLOB`
+round trip on the control queue, up to `SYNC_ROUNDTRIP_TIMEOUT_MS` 30 s, one retry on timeout; `with_blob_bytes`, line 729).
+A paging operation that waited behind a 30 s class stall holds VidMm's paging thread for that long; `PgMtxMaxUs`, `PgLongUs`
+and `PgLastUs` now say whether that happened (16.5). With `PgTo` 3 and `PgTi` small, only three operations in the whole run
+could have, so H3 below rests on the other DDIs.
+
+### 16.4 Ranked hypotheses
+
+Ranked by what the code and the counters of the event support; none is proven. "Read" says which counters decide it.
+
+1. **H1: a silent stall of the whole guest (host steal, a vCPU parked, a CPU at DISPATCH) of seconds, which dxgkrnl's
+   scheduler timeout turned into a TDR-class recovery (preempt, ResetFromTimeout, every device `HUNG`/`REMOVED`), the
+   System log not showing 4101.** For: `VsGapMaxMs` 5825 is a silence of the vsync one-shot, and that tick runs at DISPATCH
+   (`adapter/kobj.rs` `service_vsync_tick`, 601) taking no PASSIVE lock, so a PASSIVE mutex held across a host round trip
+   CANNOT make it late: only a CPU not running timers can (a spinning CPU at DISPATCH on `virtio_lock` / `wddm_notify_lock`,
+   an ISR or DPC that does not end, or a vCPU the hypervisor did not schedule); `HpdPassMaxUs` 2.4 s and `VsRevN` 4 (a
+   revive means 250 ms of silence, the watchdog cannot tell late from dead) fit one cause; `StartN` 1 and no host error fit a
+   guest-side timing event; "frame wait timed out" in an NVK process and 650 ms Venus fence latencies are the same slowness
+   seen from above. Against: no 4101 (a logged recovery is the usual trace), no TDR counter existed to confirm.
+   Read: `NPreempt`, `NResetTmo`, `NRestartTmo`, `NResetEng` (calls of the TDR DDIs; nonzero is the proof of a
+   TDR-class recovery), `TResetTmo`/`TPreempt` (when), `AbnDrop` (fences dropped; `scanout.rs` mirror), `DdiFailN` 0; `VsGapFlg`
+   bit 2 set with no mutex held, `VsGapInfl` 0, `HpdLongUs` small while `VsGapMaxMs` is large = the timer/CPU, not the driver.
+2. **H2: a DDI or the HPD worker held inside the KMD for seconds under the Venus / scanout / content mutex during the explorer
+   teardown, so VidMm/VidSch waited on it.** For: `DestroyDevice` (`device.rs` 387) runs the owner sweeps
+   `release_blobs_for_owner` (476), `destroy_contexts_for_owner` (478) and `nvrm::close_all_for_owner` (482), each a host round
+   trip of up to 30 s (`ctrl.rs` 100) under `venus_mutex`, whose wait is infinite (`adapter/locks.rs` 239, `KeWaitForSingleObject`
+   with a NULL timeout) for every other taker (`with_venus_client`, 319; the worker's `DEFERRED_VIDPN`, `REFRESH` and
+   `FOREIGN_FLIP` steps; Present; DestroyAllocation through the scanout mutex); the event was exactly an explorer teardown plus
+   creation. A worker pass of 2.4 s (`HpdPassMaxUs`) fits a step waiting on that mutex. Against: it cannot make the vsync tick
+   late (see H1), VidMm has no per-DDI watchdog (it times fences, not calls), and `ScLkN` = `ScLkRelN` says the scanout mutex
+   was FREE when read; `HpdSite` 19 is `REFRESH_POST` (`stall_diag::site`), which is the step that WRITES this block
+   (`pacing_snapshot` calls `publish_counters`, `adapter/scanout.rs` 688), so it is where the worker is when IT prints, not a
+   stuck site; if the escape thread wrote the block instead (it only does while the worker looks stuck: a step older than
+   1 s), `StallT - HpdSiteT` above 1000 ms would instead mean the worker sat in those 100 odd synchronous registry writes, i.e.
+   a registry stall (an explorer restart writes the registry heavily) and not a host round trip: read both before choosing.
+   Read: `DdiOldId` / `DdiOldMs` (the DDI inside longest right now), `Dz*` ring and `DdiSlowN`, `DdiLongMs`/`DdiLongId`,
+   `VnLkHoldMs` / `VnLkWaitMs` / `VnLkHeldMs`, `ScLkHoldMs`, `HpdLongSite` / `HpdLongUs`, `HpdStep100N`.
+3. **H3: the heartbeat/worker race of v326 (the v327 knobs).** `VsWatchdog` on (v326): `vsync_watch` re-arms from the worker AND
+   from every escape; `note_vsync_revived` re-bases the reference with one compare-exchange so only one caller sets the one-shot,
+   and `set_vsync_one_shot` on an armed Ex timer replaces the expiry. No path that hangs inside `DxgkCbSynchronizeExecution` was
+   found: the revive path calls only `ExSetTimer` and atomics (legal at DISPATCH, `kobj.rs` 437 to 520). Weak. It is excluded
+   or confirmed by `VsRevN` against `VsGap100N` (a revive per silence = late timer, not a race) and by the default-off v327 build.
+4. **H4: a status outside every DDI's legal set that the reading missed** (a wrapped DDI answering `STATUS_GRAPHICS_*`,
+   `DEVICE_NOT_READY`, a removed-class status, a scheduler or paging DDI answering anything but success). Excluded by reading
+   for the runtime paths; the sticky first-fatal record makes the next occurrence name it. Read: `LostN` (0 = none), then
+   `LostDdi`, `LostSt`, `LostT`, `LostThr`, `LostIrql`, `LostHint`, `LostInfL`/`LostInfH`.
+5. **H5: the OS side, with a display-state trigger (monitor power, session lock/unlock, topology change)** that explains DWM
+   evicting its primaries just before it was removed. KMD evidence only by absence: `PwrN`/`PwrD3N`/`PwrUid`, `HpdN`
+   (indications), `ModeN`/`ModeStg`/`ModeSt` against the values before the event; `VsArmN` 1 already says no adapter D3/D0
+   cycle in this generation. Keep: ask the tester for the Windows side (`Microsoft-Windows-Kernel-PnP`, `Display`,
+   `dxgkrnl` operational log, `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` TdrLevel / TdrDelay).
+
+### 16.5 Breadcrumbs: what existed, what is new
+
+Existing, paging (`ddi/build_paging_buffer.rs`, `PAGING_COUNTERS` line 270 on, mirrored every 64th content operation and on a
+failure-counter change; atomics are the source of truth):
+
+| name | counts | incremented at |
+| --- | --- | --- |
+| `PgTi` / `PgTo` | `PgTi` system to blob copies (page-ins), `PgTo` blob to system copies (evictions) | end of `bar_transfer`, `bar_virtual_transfer_inner` |
+| `PgTm` | segment to segment moves (no copy) | `bar_transfer`, virtual `LOCAL_TO_LOCAL` |
+| `PgFn` / `PgDn` | fills / discards | `bar_fill`, `VirtualFill` arm / `DiscardContent` arm |
+| `PgUn` | leaf PTE placements harvested | `bar_harvest_page_table` |
+| `PgMr`, `PgMc` | last resource id mapped for a content op, last map cache mode | `with_blob_bytes` |
+| `PgSf`, `PgTs`, `PgTd` | last transfer flags / offset / MDL offset | `bar_transfer` |
+| `PgEi` | content op arrived above PASSIVE (skipped) | `build_paging_buffer_inner` IRQL gate |
+| `PgEm` | blob map or kernel map failed after retries | `with_blob_bytes` |
+| `PgTxG` | paging transfer with no transport | transfer arms |
+| `PgEb` / `PgEc` / `PgEv` / `PgEx` / `PgEf` | range outside the blob / discontiguous PTEs / unresolved paging VA / MDL map failed / PTE shadow full | the respective checks |
+| `PgSkipV` | content ops that did not move data and answered `STATUS_SUCCESS` | `build_paging_buffer_inner` tail, no-guard and shadow-full arms |
+| `PgRetry` | extra attempts of a transient failure | `backoff` |
+| `PgInv` / `PgInvOvf` / `PgInvSk` / `PgInvClr` | allocations marked "system copy invalid" / overflow / page-ins skipped for it / marks cleared | `note_skipped_eviction`, page-in arms, `note_eviction_done` |
+| `PgV64` | virtual transfers with nonzero `Flags` | `bar_virtual_transfer_inner` |
+| `PgStale` | refused stale handles | `create_allocation::paging_alloc_info` |
+| `PgClamp` | ranges cut to the allocation / blob | clamp sites |
+| `PgVp`, `PgVs`, `PgVd` | retained system PTEs, last virtual src / dst | PTE shadow, virtual arm |
+| `PgDi` | content ops naming a device-local allocation (`NotOurs`) | transfer / fill arms |
+| `PgSc` / `PgSm` / `PgSe` | system-backing leases captured / Present mirrors done / lease or mirror errors (not exceptions) | `remember_system_backing`, `mirror_present_system_backing`, the lease sites |
+| `PgEh` / `PgFh` | classic TRANSFER / FILL naming no live allocation | `bar_transfer`, `bar_fill` |
+| `PgFv` | VIRTUAL_FILL while the allocation was system-resident | `VirtualFill` arm |
+
+Also readable by symbol (ntoseye), not in the registry: `PAGING_LAST_OP`, `PAGING_CALL_COUNT`, `PAGING_OP_SEEN_MASK` (bit n = operation n
+was seen; UPDATE_PAGE_TABLE is 11). What each value would look like: H1 and H5 leave every `Pg*` failure counter at 0
+and `PgLongUs` small; H2 shows `PgMtxMaxUs` or `PgLongUs` in the seconds only if a paging operation happened to be in flight;
+H4 shows nothing in `Pg*` (the paging DDI returns only success) and the answer in `Lost*`.
+
+New (this change; writer `ddi/device_lost.rs`, the pure half `helios_kmd_logic::device_lost`, wrappers `ddi/traced.rs` which
+`lib.rs` wires into the DDI table; the real DDIs are untouched; `DxgkDdiStartDevice` is NOT wrapped, it is the frame-size-gated
+nested pair, see `tools/kmd-frame-sizes.ps1`, and its failures are in `StVio` / `InitStg`). Atomics at any IRQL; the registry is
+written at PASSIVE only, through ONE function, `device_lost::publish_block(Trigger)`, which is the only caller of the writer
+(redirect it and the whole block moves to another thread). Three triggers: `Periodic` (`stall_diag::publish_counters`: the worker's
+mirror, the escape thread's stuck-only publisher, which also fires when a suspect/fatal status or a slow call appeared, and the
+StartDevice zero write; the block is written only when a ring moved or 30 s passed since the last write, so it does not ride every
+`REFRESH_POST`), `Stop` (`StopDevice`, before its first hive flush, always) and `Teardown` (the `DestroyDevice` wrapper: only for a
+suspect, fatal or slow event, never because an expected refusal moved a ring, and after the call's duration is taken so the stall is
+already in `Dz*`).
+
+* The sticky first-fatal record, `Lost*` (image lifetime, first wins, never overwritten; `LostN` counts all fatal events):
+  `LostN`, `LostDdi` (DDI id, 16.7), `LostSt` (status), `LostT` (interrupt ms), `LostThr` (thread id), `LostHint`, `LostIrql`,
+  `LostSeq` (the failure sequence number), `LostInfL` / `LostInfH` (DDIs in flight then, bitmask by id, ids 0 to 31 / 32 to 63). A fatal
+  verdict is: a non-success from `BuildPagingBuffer` other than `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER` (so `STATUS_INVALID_PARAMETER`
+  from paging is fatal), any non-success from the scheduler DDIs, a removed-class status from any DDI or callback, a `STATUS_GRAPHICS_*`
+  or `STATUS_DEVICE_NOT_READY` from a DDI outside its expected set (`device_lost::verdict`, host-tested; the table is `is_expected`).
+  The two callbacks (ids 42, 43) are never fatal for anything but a removed-class status: `STATUS_DEVICE_NOT_READY` from the DMA
+  notify (no `DxgkCbSynchronizeExecution` at shutdown, or a refused sync) is expected, anything else they say is suspect.
+* The DDI failure rings, dynamic names `<stem><kind><two hex digits>`, index 0 newest: stems `Dd` (last 16 non-success returns of any
+  wrapped DDI or the two callbacks, except the routine refusals of `QueryAdapterInfo` / `ControlInterrupt`, which would push the
+  entries that matter out), `Dx` (last 8 whose verdict was suspect or fatal), `Dz` (last 8 calls that took 250 ms or more,
+  5 s for Escape); kinds `S` (status; milliseconds in `Dz`), `D` (DDI id in the top byte, a 24-bit hint below: the handle's low
+  bits, the escape code, `uid << 16 | state << 8 | action` for SetPowerState, the interrupt type for ControlInterrupt), `T`
+  (interrupt time ms). Totals `DdiFailN`, `DdiSuspN`, `DdiSlowN`; the longest call `DdiLongMs`, `DdiLongId`, `DdiLongT`; who is
+  inside a DDI right now `DdiInflL`/`DdiInflH` (bitmask) and `DdiOldId` / `DdiOldMs` (the oldest entry); `DdiPubT` (when this was
+  written).
+* Calls of the DDIs a TDR or a teardown drives: `NPreempt`, `NResetTmo`, `NRestartTmo`, `NResetEng`, `NCreateDev`, `NDestroyDev`,
+  `NCreateCtx`, `NDestroyCtx`, `NCreateProc`, `NDestroyProc`, `NStopDev`, `NSetPower`; `TResetTmo`, `TPreempt` (last call, interrupt ms).
+* The last paging operation: `PgLastOp` (the raw `DXGK_BUILDPAGINGBUFFER_OPERATION` value, see `d3dkmddi.h`; 0xFFFFFFFF = none yet), `PgLastRes` (1 executed, 2 not ours, 3 skipped (answered
+  success), 4 no content mutex, 5 above PASSIVE, 6 no BAR segment, 7 page-table update, 8 null args), `PgLastAl` (allocation handle,
+  low 32 bits), `PgLastSz` (bytes named), `PgLastT`, `PgLastUs` (its duration). Evictions by result: `PgEvTot`, `PgEvOk` (copied),
+  `PgEvSkip` (refused, answered success), `PgEvNo` (not ours / no BAR), `PgEvBad` (no mutex or above PASSIVE); page-ins `PgPiOk`,
+  `PgPiSkip`. Time: `PgLongUs` / `PgLongOp` / `PgLongT` (the longest `BuildPagingBuffer` call), `PgMtxMaxUs` (the longest wait for
+  the content mutex), `PgMtxFail` (could not take it).
+* Locks: `VnLkN`, `VnLkWaitMs` (longest wait to get the Venus mutex), `VnLkHoldMs` / `VnLkHoldT` / `VnLkThr` (longest hold, when
+  it ended, the holder's thread), `VnLkHeldMs` (age of the current hold, 0 = free), `ScLkHoldMs` (longest hold of the scanout mutex).
+* The worker and the heartbeat (`ddi/stall_diag.rs`): `HpdLongSite` (a `stall_diag::site` id: the STEP that held the worker longest
+  in one go), `HpdLongUs`, `HpdLongT`, `HpdLongInfl` (DDIs in flight when it ended), `HpdStep100N` (steps of 100 ms or more),
+  `HpdPass100N` / `HpdPass500N` (whole passes of 100 ms / 500 ms or more); `VsGap100N` / `VsGap1000N` (silences of the heartbeat of
+  100 ms / 1 s or more), and for the longest one (`VsGapMaxMs`): `VsGapT` (when it ended), `VsGapSite` (the worker's `HpdSite`
+  then), `VsGapFlg` (bit 0 scanout mutex held, 1 Venus mutex held, 2 worker idle in its wait, 3 programming pending), `VsGapInfl`
+  (DDIs in flight, ids 0 to 31).
+
+Names are at most 14 characters and unique across both crates: `helios_kmd_logic::device_lost::COUNTERS` and the new rows of
+`stall_diag::COUNTERS` are checked against every `b"..."` literal of `kmd_render` (test
+`counters_collide_with_nothing_in_either_tree` and the existing stall_diag scan).
+
+### 16.6 What to read after the next event, in this order
+
+1. `LostN`. Nonzero: read `LostDdi` / `LostSt` / `LostT` / `LostThr` / `LostIrql` / `LostHint` / `LostSeq` / `LostInfL` and stop: the
+   KMD answered a status it should not have (H4); `LostSt` 0xC01E.... is a graphics status, 0xC000009A is INSUFFICIENT_RESOURCES.
+2. `NPreempt`, `NResetTmo`, `NRestartTmo`, `NResetEng`, `TResetTmo`, `AbnDrop`. Any nonzero = a TDR-class recovery ran (H1); when
+   (`T*`) against the event; `AbnDrop` is how many pending fences it dropped.
+3. `DdiPubT` (the block is fresh), then `Dx00..Dx07` (suspect and fatal returns, newest first) and `Dd00..Dd0F` (all non-success).
+4. `DdiOldId` + `DdiOldMs` (a DDI inside the KMD that long NOW), `DdiSlowN`, `Dz00..Dz07` (DDI id and hint, milliseconds), `DdiLongMs`
+   + `DdiLongId`. A `DestroyDevice` (id 6) of seconds, or a `BuildPagingBuffer` (13), is H2.
+5. `VnLkHoldMs`, `VnLkWaitMs`, `VnLkThr`, `VnLkHeldMs`, `ScLkHoldMs`: which mutex was held for how long; `PgMtxMaxUs`, `PgLongUs`.
+6. `HpdLongSite` + `HpdLongUs`, `HpdStep100N`, `HpdPass500N`; `VsGapMaxMs`, `VsGap1000N`, `VsGapFlg`, `VsGapSite`, `VsGapInfl`.
+7. `PgLastOp`, `PgLastRes`, `PgLastAl`, `PgLastT`, `PgEvTot` / `PgEvOk` / `PgEvSkip` / `PgEvNo` / `PgEvBad`, the existing `PgSkipV`, `PgInv*`,
+   `PgStale`, `PgEh`, `PgSe`.
+8. `PwrN`, `PwrD3N`, `PwrUid`, `HpdN`, `ModeN`, `ModeStg`, `StartN`, `VsArmN`, `VsDisN`, `VsEarlyN`, `VsRevN`.
+
+What each hypothesis predicts: **H1** (guest stall): step 2 nonzero or `AbnDrop` > 0; `LostN` 0; `VsGapMaxMs` large with `VsGapFlg` bit
+2 and no other bit, `VsGapInfl` 0, `HpdLongUs` and `DdiLongMs` small. **H2** (blocked DDI): `DdiLongMs` / `Dz*` / `HpdLongUs` in
+the seconds with `DdiLongId` 6 (DestroyDevice) or 13, `VnLkHoldMs` of the same size, `VsGapFlg` bits 0 or 1 at a gap that is NOT
+accompanied by an idle worker. **H3** (revive race): `VsRevN` greater than `VsGap100N`, no `Dz*`, `HpdLongUs` small. **H4**: step 1.
+**H5**: everything quiet, `PwrD3N` or `HpdN` / `ModeN` moved across the event.
+
+### 16.7 DDI ids (`helios_kmd_logic::device_lost::ddi`)
+
+1 StartDevice, 2 StopDevice, 3 RemoveDevice, 4 SetPowerState, 5 CreateDevice, 6 DestroyDevice, 7 CreateContext, 8 DestroyContext, 9
+CreateProcess, 10 DestroyProcess, 11 CreateAllocation, 12 DestroyAllocation, 13 BuildPagingBuffer, 14 SubmitCommand, 15
+SubmitCommandVirtual, 16 PreemptCommand, 17 ResetFromTimeout, 18 RestartFromTimeout, 19 ResetEngine, 20 QueryEngineStatus, 21 Render,
+22 RenderKm, 23 RenderGdi, 24 Present, 25 OpenAllocation, 26 CloseAllocation, 27 MapCpuHostAperture, 28 SetVidPnSourceAddress, 29
+CommitVidPn, 30 Escape, 31 QueryAdapterInfo, 32 UnmapCpuHostAperture, 33 Patch, 34 ControlInterrupt, 35 IsSupportedVidPn, 36
+UpdateActiveVidPnPresentPath, 37 SetVidPnSourceVisibility, 38 EnumVidPnCofuncModality, 39 RecommendFunctionalVidPn, 40
+QueryChildStatus, 41 QueryChildRelations, 42 `cb:IndicateChildStatus` (the HPD worker's hot-plug callback), 43 `cb:NotifyDmaCompleted`
+(`DxgkCbSynchronizeExecution` / `DxgkCbNotifyInterrupt` refused a DMA completion or a vsync).
+
+### 16.8 The worker pass and the vsync gap: what is blocking, and the fix (design; NOT implemented here)
+
+The HPD worker's pass (`ddi/hpd.rs`, loop from line 232 to 436) is a sequence of steps, each of which can block; `HpdLongSite` now names the
+one that did. Every blocking call reachable from it, with the step id (`stall_diag::site`):
+
+| step | call | what blocks | bound today |
+| --- | --- | --- | --- |
+| 3 `INDICATE` (299) | `DxgkCbIndicateChildStatus` | dxgkrnl's own VidPn / child locks | none (dxgkrnl) |
+| 4 `DRAIN_USED` (292) | `drain_used_and_complete` | `virtio_lock`, `wddm_notify_lock` (spinlocks, short) | none needed |
+| 5/6 `FOREIGN_SCANOUT`, `FOREIGN_FENCE` (305, 310) | host `Close` round trips | the control queue | per-call timeouts |
+| 7/16/18 `DEFERRED_*` (324) | `with_scanout_lifecycle`: `KeWaitForSingleObject(scanout_mutex, NULL)` (`adapter/locks.rs` 271); inside it `SET_SCANOUT_BLOB` and the Venus copy | the scanout mutex (infinite wait), the host (up to 30 s) | none on the wait; 30 s on the call |
+| 8 `WINDOWED_BLT`, 9 `RM_CLIENT`, 10 `FOREIGN_FLIP` | host round trips under `venus_mutex` (infinite wait, `locks.rs` 239) | the Venus mutex, the host | `SweepBudget` on some |
+| 11 `NVRM_PUBLISH`, 12 `DUMP`, 19 `REFRESH_POST` | about 60 to 150 synchronous `RtlWriteRegistryValue` per call | the registry / hive lock (shared with every process writing the registry: an explorer restart is one) | none |
+| 13 `PROBE` | a 5 s fence wait and a map round trip | the host | 5 s |
+| 14/17 `REFRESH` | `with_scanout_lifecycle` as above | the scanout mutex | none on the wait |
+
+The cheapest culprit for a 2.4 s pass in a window with a registry-heavy event (an explorer teardown and start) is the registry
+mirror: `HpdDumpUs` 1.45 s over all dumps says each dump is cheap in the mean, so a single 2.4 s pass would be a step blocked,
+not a mirror that is always slow; `HpdLongSite` decides. Design of the fix, in order of cost:
+
+1. Revive the heartbeat from the interrupt DPC (`ddi/interrupt.rs` `dxgkddi_dpc_routine`, 517k calls in the run, about 430 per
+   second) by calling `vsync_watch(false)` there: it needs no PASSIVE state (`ExSetTimer` and atomics), so a stuck worker no
+   longer delays a revive. This changes behaviour only for a heartbeat that has been silent 250 ms.
+2. Replace the infinite waits on `scanout_mutex` and `venus_mutex` in the WORKER's steps with a bounded wait (20 ms), and on timeout
+   set a "retry" flag the existing wake logic turns into a short timer: the step is requeued, the pass ends, the heartbeat's
+   reviver and the other steps run. The DDI threads keep the infinite wait (they have a caller to block).
+3. Move the registry mirrors (steps 11, 12, 19: `nvrm_publish_service`, `dump_periodic`, `pacing_snapshot`) to a low-priority
+   "diag" system thread that the worker only signals: it removes the largest unbounded blocker from the pass at no change to
+   behaviour. Only the stuck-only publisher (escape thread) and `StopDevice` keep writing inline.
+4. Host round trips in the worker (steps 5, 7, 8 to 10, 13) run under a `SweepBudget` slice of tens of milliseconds and carry their
+   progress in a state machine between passes (the foreign-flip service already does for `FfAsyncWin`). Anything that cannot be sliced
+   moves to its own service thread with a bounded queue.
+
+None of these is applied in this change; `HpdLongSite`, `HpdStep100N`, `VsGapFlg` and `Dz*` exist to say which one to build first.
+
+### 16.9 Checklist
+
+* After a v327+ build is installed: `reg query` the service key, confirm `DdiPubT`, `LostN` 0, `DdiFailN` small, `NCreateDev` rising
+  with application starts, `PgLastT` moving on a paging operation, `VnLkN` rising.
+* Reproduce: restart explorer from another process while NVK and Venus devices are live (the event's conditions); read the block
+  within seconds (the escape publisher refreshes it when a suspect or fatal status or a slow call appeared; otherwise the next
+  `pacing_snapshot`, about every 10 s of presents).
+* If every device is removed again: follow 16.6 in order and record the values; the first fatal record is not overwritten.
+* Before pushing a change to this instrument: run `kmd_logic` tests (the collision scan), the protocol crate tests (the v315 lesson),
+  and the type check; `traced.rs` is a table of signatures, so a bindgen name that changed shows as a compile error there.
+## 18. FlipCapsX and flip flag counters (S-0a)
+
+For the independent-flip probe S-0a of `independent-flip.md` (branch `kmd/independent-flip-design`): no rebuild per matrix
+row, and a read of the flip flags the driver ignores. Header facts are from WDK 10.0.26100.0, `d3dkmddi.h` under
+`/home/user/.local/share/conduit-dev/wdk-10.0.26100.0/` (not copied into the repo).
+
+### 18.1 FlipCapsX: raw DXGK_FLIPCAPS bits OR'd into the reported word
+
+`FlipCaps` is `DXGK_DRIVERCAPS` offset 60, a `DXGK_FLIPCAPS` union whose `Value` is a UINT; `query_driver_caps` writes that
+UINT (`out.set(caps_offset!(FlipCaps), ...)`), not the bit fields, so the knob is a raw bit mask. Bits (`d3dkmddi.h:1967-1992`):
+
+| bit | mask | field | note |
+|---|---|---|---|
+| 0 | 0x01 | `FlipOnVSyncWithNoWait` | not accepted from the knob |
+| 1 | 0x02 | `FlipOnVSyncMmIo` | the driver's own default word; load-mandatory (Code 43 without it) |
+| 2 | 0x04 | `FlipInterval` | not accepted from the knob |
+| 3 | 0x08 | `FlipImmediateMmIo` | not accepted: deliberately clear, setting it was a measured regression (`query_adapter_info.rs`, defect 0ab) |
+| 4 | 0x10 | `FlipIndependent` | accepted. "MMIO flip to redirected surfaces bypassing DWM Present" (:1978, WDDM 1.3+) |
+| 5 | 0x20 | `DdiPresentForIFlip` | accepted. "Call `DxgkDdiPresent` when independent flip Present might be issued" (:1980, WDDM 2.0+) |
+| 6 | 0x40 | `FlipImmediateOnHSync` | accepted (:1981, WDDM 2.0+) |
+| 7+ | | `Reserved` | not accepted |
+
+Semantics (`kmd_logic::flip_flags::resolve_flip_caps`): reported = `FlipOnVSyncMmIo` | (`FlipCapsX` & 0x70). `FlipCapsX`
+0 (the default, or absent) reports 0x2, byte-identical to before. `0x10` reports 0x12, `0x30` reports 0x32, `0x70` reports 0x72;
+writing the full word (`0x12`, `0x32`) reports the same, since the default's own bit is a no-op. Every other bit is dropped; the
+dropped bits are published as `FlipCapsXMsk` (0 when nothing was dropped).
+
+Behaviour change: until now a nonzero `FlipCapsX` REPLACED the whole word (any bit pattern, unfiltered), and the one documented
+use, `FlipCapsX=2`, was the default word anyway. A value that cleared `FlipOnVSyncMmIo` or set `FlipImmediateMmIo` could still be
+typed; neither is any longer possible. Anything that only used 2, or 0, behaves as before.
+
+Read time: `AdapterKnobs::read` at AddAdapter and again at StartDevice (`read_at_start`), like `DirectFlipCaps`, so the caps the
+query reports and the mirrors cannot disagree; before it was re-read on every caps query. Mirrors, written at EVERY StartDevice,
+0 included (13.8 rule 1): `FlipCapsXEff` (the accepted bits), `FlipCapsXMsk` (the dropped bits), `FlipCapsRep` (the final reported
+word). `FlipCapV` (the word actually written, at each caps query) is unchanged. A quick check after a restart: `FlipCapsRep` equals
+`0x2 | (FlipCapsX & 0x70)`; `FlipCapsX=0x10` and `FlipCapsRep` still 2 means the value was not read at this start.
+
+### 18.2 Flip flag counters (read-only)
+
+The driver ignores these flags; the counters only say whether dxgkrnl ever sets them. Atomics only (`SetVidPnSourceAddress` can run
+at DIRQL), zeroed at every StartDevice with the rest of `scanout_trace` (`reset`), published at PASSIVE from `scanout_trace::dump`
+(the HPD worker's periodic dump, which is also the only call site). The DDIs' behaviour is unchanged.
+
+| value | meaning |
+|---|---|
+| `IdfSpaTrans` | `SetVidPnSourceAddress` calls with `SharedPrimaryTransition` set (`Flags` & 0x40) |
+| `IdfSpaExcl` | ... with `IndependentFlipExclusive` set (`Flags` & 0x80) |
+| `IdfSpaMove` | ... with `MoveFlip` set (`Flags` & 0x100) |
+| `IdfSpaFlg` | the last full `DXGK_SETVIDPNSOURCEADDRESS_FLAGS.Value` seen |
+| `IdfPrRedir` | `DxgkDdiPresent` calls with `RedirectedFlip` set (`Flags` & 0x2000) |
+| `IdfPrFlg` | the last full `DXGK_PRESENTFLAGS.Value` seen |
+
+CORRECTION to the bit values quoted in `independent-flip.md` (10.2: `SharedPrimaryTransition` 0x20, `IndependentFlipExclusive` 0x40,
+`MoveFlip` 0x80, taken from the comments in the header). Those comments are stale: `DXGK_SETVIDPNSOURCEADDRESS_FLAGS`
+(`d3dkmddi.h:6212-6245`) has `ModeChange`, `FlipImmediate`, `FlipOnNextVSync`, `FlipStereo`, `FlipStereoTemporaryMono`,
+`FlipStereoPreferRight` (bits 0..5; the two stereo comments both say 0x10), then `SharedPrimaryTransition` (bit 6), 
+`IndependentFlipExclusive` (bit 7), `MoveFlip` (bit 8), `Reserved :23` (9 + 23 = 32 bits). The compiler's, and so bindgen's `.Value`,
+values are 0x40 / 0x80 / 0x100, which is what is counted. A reader of `IdfSpaFlg` therefore sees 0x40 for a transition, not 0x20
+(0x20 is `FlipStereoPreferRight`). `DXGK_PRESENTFLAGS.RedirectedFlip` is 0x2000 as commented (`:167-199`: 13 fields before it);
+the existing present-flags histogram (`FlR<n>` / `FlC<n>` / `FlTot`) already holds every present `Flags` word, `IdfPrFlg` holds the latest one.
+
+`IdfSpaFlg` / `IdfPrFlg` are last-writer values (a flip carrying a flag can be followed by one that does not); the counters are
+the evidence, the last values are for decoding what an unexpected flag word is.
+
+### 18.3 The S-0a procedure
+
+Matrix: `FlipCapsX` in {0, 0x10, 0x30} x `DirectFlipCaps` in {0, 1}, six rows, baseline first (`FlipCapsX` 0, `DirectFlipCaps` 0).
+Lowest mode first (1920x1080 at 60 Hz), then the real mode.
+
+For each row:
+
+1. Set the knobs in the service key (`reg add ... /v FlipCapsX /t REG_DWORD /d <v> /f`, same for `DirectFlipCaps`) and REBOOT the VM.
+   The knobs are read at StartDevice, and `pnputil /restart-device` re-reads them, but dxgkrnl derives the user-mode caps answers
+   from what the adapter reported when it was created: a reboot is the way to be sure a row's answer is that row's. Check `FlipCapsXEff`, `FlipCapsRep` and `DirectFlipCaps`' mirror
+   (`0x01D7` bit 2) match the row before trusting anything below.
+2. User-mode probe (a `tools/adapter_type_probe.cpp`-style program): `D3DKMTQueryAdapterInfo` with `KMTQAITYPE_DIRECTFLIP_SUPPORT`
+   (19, `D3DKMT_DIRECTFLIP_SUPPORT`) and `KMTQAITYPE_INDEPENDENTFLIP_SUPPORT` (28); the rest of the S-0a list of
+   `independent-flip.md` (`INDEPENDENTFLIP_SECONDARY_SUPPORT` 39, `MULTIPLANEOVERLAY_SUPPORT` 20, `MPO3DDI_SUPPORT` 43,
+   `SCANOUT_CAPS` 67, `DISPLAY_CAPS` 74) if cheap. Record which `Supported` values changed: that is dxgkrnl's derivation from our
+   caps, before any application runs.
+3. Then a borderless, flip-model, fullscreen application at exactly the display mode (`d3d11_triangle.cpp` is the existing vehicle),
+   with PresentMon running: record `PresentMode` ("Composed: Flip" against "Hardware: Independent Flip" or "Hardware Composed")
+   and the flip rate; and read the counters after the run: `IdfSpaTrans`, `IdfSpaExcl`, `IdfSpaMove`, `IdfSpaFlg`, `IdfPrRedir`,
+   `IdfPrFlg`, with `VpFlip`, `VpMmio`, `VpDmaF`, `PBFlip`, `FkKeep*`, `FlipCapV`. A promoted flip is `IdfPrRedir` / `IdfSpaExcl`
+   rising; a nonzero `IdfPrRedir` with `IdfSpaExcl` 0 says dxgkrnl redirected the Present but never asked for the exclusive primary.
+4. Write the six rows into the S-0 result table of `independent-flip.md` (the two docs live on different branches).
+
+Safety. A wrong caps combination can change what DWM does: `FlipIndependent` is "MMIO flip to redirected surfaces bypassing DWM
+Present" and may change how dxgkrnl issues DWM's OWN flips, and a promoted application with no pointer and a KMD that does not
+program the application's buffers can freeze the screen. Watch `PBFlip`, `FkKeep*`, `VpPrF` and DWM's present count on the first
+boot with a bit set, and have the VM snapshot. Recovery: delete (or set to 0) `FlipCapsX` and `DirectFlipCaps` in the service key and
+reboot; if the VM cannot be reached, set the same values from the offline registry (the service key under the Helios driver's
+`HKLM\SYSTEM\CurrentControlSet\Services`) or revert to the snapshot. The defaults (`FlipCapsX` 0, `DirectFlipCaps` 0) are what ships.
+
+### 18.4 Verified, and not
+
+Verified on the host: the pure decode and mask (`kmd_logic::flip_flags`, host tests: default 0x2 byte-identical, the matrix values,
+dropped bits, the bit values above); the bit values against the header text; rustfmt parse of every KMD source; the WDK-less type
+check of `kmd_render` with stubs. NOT verified: a WDK build of `kmd_render`; that `FlipCapsRep` etc. appear in a VM service key;
+what dxgkrnl does with any non-default row (that is the experiment).
+
+## 17. Incident: HPD worker "frozen at site 11", display asleep, and a guest that would not shut down (v327)
+
+### 17.1 Symptom
+
+KMD 327.1, no device restart since boot. Two registry dumps 10 s apart (uptime 1121046 / 1131578 ms) read
+`HpdLoopT` = `HpdSiteT` = `HpdPhaseT` = `ScLkAcqT` = `ScLkRelT` = 824616, `HpdSite` 11 (`nvrm_publish_service`),
+`StallT` 824619, `HpdPassMaxUs` 30011, `VpPend` 0 then 2562804832. A later checked restart (`shutdown /s`) left the guest
+unresponsive (SSH timed out at the banner, the VM "running" with an idle CPU) until it was powered off from the host.
+
+### 17.2 What the counters actually say (read this before the hypotheses)
+
+1. **The worker was not blocked.** `HpdSite`, `HpdLoopN`, `HpdLoopT`, `ScLk*` are written ONLY by
+   `stall_diag::publish_counters`, and that ran last at `StallT` 824619, from the worker itself, three
+   milliseconds after it entered site 11 (the `Nv*` mirror calls it). Nobody refreshed it afterwards: the escape
+   thread refreshes it only while the worker "looks stuck", and an idle worker (asleep in `WAIT`, nothing pending) never
+   does. The `HpdSite` 11 / `HpdLoopT` 824616 pair is a snapshot of a worker that then went to sleep.
+   The live values of the same dump say so: `HpdWait` 0 (an infinite wait, `hpd_wake::wait_us`), `HpdWkEvt` 106648 ->
+   106772 (the worker woke 124 times in between), `HpdBusyUs` +10 ms, and `VpDmpT` 1129213 (the worker ran the periodic
+   dump right after the heartbeat's tick at 1129212). The worker enters `site::WAIT` (1) before every sleep, so a
+   sleeping worker never leaves 11 in the LIVE atomics.
+2. **`HpdPassMaxUs` 30011 is microseconds**: the longest pass was 30 ms (a pass that ran the ~8 ms `Vp*` dump plus
+   work), not 30 s. There is no 30 s timeout in the evidence.
+3. **`VpPend` 2562804832 is not garbage.** `scanout_trace::dump` writes `pending_vidpn_allocation as u32`: the
+   low 32 bits of the 64-bit allocation handle dxgkrnl passed to `SetVidPnSourceAddress` (the `Vp*D` ring holds
+   the same family of values, `PrCreateLo` 2562808192). 0 = nothing deferred (the first read, a dump from 824566, stale);
+   nonzero = a deferred programming waiting for the worker (the second read, taken right after the display woke).
+   `VpGate` 0 -> 1 is the programming gate raised for it.
+4. **Dump 1 was a stale dump.** Its `VpDmpT` is 824566, its `VsTickT` 640239: it is the registry as the last
+   dump left it, 300 s old. Dump 2 is the first fresh one (`VpDmpT` 1129213).
+5. **The heartbeat stopped at 640 s by a power call.** `VsArmN` 1, `VsDisN` 1, `VsCanN` 1, `PwrN` 1, `PwrUid` 0
+   (a child), `PwrD3N` 1, `VpVsEn` 0 (dxgkrnl disabled CRTC_VSYNC): the monitor child went to D3 (most likely the display
+   idle timeout, about ten minutes after boot) and `VsPowerMode` 0 (KMD 325 semantics) quiesced the heartbeat for
+   it. `FlipPubT` 625804 is the last flip the display retired before that. At 1129 s a D0 call (`PwrN` 2, `VsArmN` 2)
+   re-armed it and `VpEnt` / `VpPrgN` / `FlipPub` moved again, DWM with them.
+
+So the DWM "stall" is the display asleep (nothing asks for vsync, DWM presents nothing), and a user NVK scan-out source
+(`FsLastP` 824582, `FsEndBy` 5 = process exit at 824796) kept the screen alive through the foreign scanout while
+Windows believed the monitor off. It is not a worker deadlock.
+
+### 17.3 Ranked hypotheses, with what each predicts
+
+| rank | hypothesis | predicts | verdict |
+| --- | --- | --- | --- |
+| 1 | the monitor child's D3 (display idle timeout) with the heartbeat quiesced; the worker idle | `PwrChSt` 0, `VsCiSt` 0, `VsTickT` frozen, `HpdWait` 0, `HpdWkEvt` nearly still, `VpPend` set when the display wakes | matches every live value. Not a KMD defect by itself. |
+| 2 | stale snapshot misread (the worker "stuck at 11") | `StallT` older than `VpDmpT` | proved above; fixed by v328 (the block is written by every dump and by the escape thread when 5 s old) |
+| 3 | worker blocked in a registry write at site 11 | `HpdSite` 11 AND `StallT` / `HpdWkEvt` frozen, the escape publication firing (it fires when the worker looks stuck) | refuted: `HpdWkEvt` moves, `HpdWait` is 0, no escape publication. Still a latent risk (a registry write can block behind a hive flush), see 17.6 |
+| 4 | lock inversion worker / owner-death thread (`DestroyDevice`) | the scanout mutex held (`ScLkN` != `ScLkRelN`) | refuted for this run: `ScLkN` = `ScLkRelN` and the worker woke afterwards |
+| 5 | an infinite wait ending at a 30 s timeout | `HpdPassMaxUs` of 30 s | refuted (30 ms) |
+
+### 17.4 The guest that would not shut down
+
+NOT explained by the evidence: no dump exists from the wedge, and no stop-progress counter existed. What the audit
+of the paths a graceful shutdown takes (SetPowerState D3, StopDevice, RemoveDevice) found:
+
+* `quiesce_vsync` on a heartbeat that is already disarmed returns at the first `swap` (`kobj.rs` `disarm_vsync`); no wait.
+* `ExCancelTimer` does not wait for a callback; `ExDeleteTimer(cancel, wait)` is only in `Drop` (RemoveDevice), and a
+  disarmed heartbeat has no callback in flight. The embedded-timer fallback's `KeFlushQueuedDpcs` is used only when
+  `ExAllocateTimer` failed.
+* `stop_hpd` sets `hpd_stop` and THEN signals `hpd_event` (`kobj.rs` `stop_hpd`), so an idle worker with an infinite
+  wait wakes and exits; the joins are bounded (5 s on the exit event, 5 s on the thread), and a leak latch protects
+  RemoveDevice.
+* The host round trips of the stop are bounded by one `SweepBudget` plus one in-flight command (30 s,
+  `SYNC_ROUNDTRIP_TIMEOUT_MS`).
+* Three waits are INFINITE by design (they are mutexes): the venus mutex (`acquire_venus_mutex`, also taken by
+  `set_venus_client(None)` in StopDevice), the scanout mutex (`with_scanout_lifecycle`, taken by the display DDIs, the
+  worker, DestroyAllocation ...) and the content mutex (`PassiveMutex`). They are events, not owner-tracked mutexes: a
+  holder that never releases (a thread parked in a host round trip behind a stopped host, a path that forgot to
+  release, or a recursive take) blocks every later taker, including a power or stop path, with no timer to end it
+  and an idle CPU. These are the candidates for a wedge of this shape.
+
+Nothing found proves a defect there, so v328 makes the next one nameable instead of changing the locking.
+
+### 17.5 v328: what changed (diagnosis only; defaults and behaviour are v327's)
+
+* **No default changes.** `VsPowerMode` stays 0, `VsWatchdog` 0, `VsIdleWake` 0. Reason: in this incident dxgkrnl
+  itself had disabled CRTC_VSYNC (`VpVsEn` 0) for the sleeping display, so a heartbeat kept alive by `VsPowerMode` 1
+  would tick with the delivery gate closed (`VsOffN`) and deliver nothing; DWM waits for the display, not for the
+  heartbeat. `VsPowerMode` 1 is also the v326 behaviour whose restart mode loss (section 15) is unexplained. Test the
+  restart with `VsPowerMode` 1 on v328 before making it a default.
+* **The stall block is never a stale snapshot for long.** `scanout_trace::dump` now calls `stall_diag::publish_counters`
+  (the whole block, the two mirrors it wrote alone included), and the escape thread publishes the block when
+  it is 5 s old even if the worker does not look stuck (`escape_publish_due`, host-tested), at most twice a second, and
+  also on an unpublished suspect or fatal status (`device_lost::serious_dirty`, section 16). Every write of the block
+  still goes through `stall_diag::publish_counters`, which ends in the single `device_lost::publish_block(Periodic)`
+  funnel of section 16. Read the age as `VpDmpT - StallT` (`snapshot_is_stale`).
+* **The sliced waits and the section 16 instrument**: `wait_logged` only splits the same KeWait into 5 s slices; the
+  Venus mutex's wait/hold accounting (`VnLkWaitMs`, `VnLkHoldMs`, `venus_acquired`) brackets the whole wait and starts
+  its hold clock after it, and the traced DDI wrappers' in-flight marks bracket the whole DDI, so neither sees the
+  slices. `LkWait*` (this section) and `VnLk*` (section 16) are two views of the same wait.
+* **The display's power history is visible**: `PwrT`, `PwrAdSt`, `PwrChSt` (1 D0, 0 not D0, 0xFF no call yet),
+  `VsCiT`, `VsCiSt` (the last `ControlInterrupt(CRTC_VSYNC)`), and `PwrStg` (1 entered, 3 done: a power call that never
+  reached 3 hung inside).
+* **The infinite mutex waits are sliced, not bounded** (`sync::wait_logged`): 5 s slices, each expiry counted
+  (`LkWaitN`, `LkWaitWh` 1 venus / 2 scanout / 3 content, `LkWaitT`, `LkWaitMs`) and the wait goes on, so mutual exclusion
+  is never given up and nothing can proceed unlocked; a holder that never lets go shows in the next dump.
+* **Stop progress**: `StopSub` / `StopSubT` (`stall_diag::stop_sub`, 17 steps of StopDevice, 20-22 for RemoveDevice),
+  written to the registry BEFORE each step. `StopStg` / `StopMs` (stages 1-10) are unchanged. After a wedge the next
+  boot's service key holds the last step entered: read `StopSub`, `StopSubT`, `PwrStg`, `PwrChSt`.
+
+### 17.6 Not done, and why
+
+The proposed move of every registry publication off the HPD worker onto a dedicated publisher thread is NOT in
+v328: the evidence refutes a blocked worker, and a new system thread with its own start, stop and join (and a
+stuck-registry deadlock of its own at StopDevice) cannot be built or run here. The worker's registry writes remain
+(`HpdDumpUs` / `HpdDumpN` = 8 ms per dump); `HpdPassMaxUs` is the number to watch (30 ms in this run). If a future
+dump shows `HpdSite` 11 or 12 with a LIVE `StallT` (`StallT` within a second of `VpDmpT`) and `HpdLoopT` frozen, the
+worker is blocked in a registry write and the publisher thread becomes the fix.
+
+### 17.7 Counters to read after a wedge or a stall
+
+`VpDmpT` and `StallT` (age of the block), `HpdWait` (0 = infinite), `HpdWkEvt` (moving = alive), `PwrChSt` / `PwrAdSt` /
+`PwrT`, `VsCiSt` / `VsCiT`, `VsArmN` / `VsDisN`, `VsTickT`, `LkWaitN` / `LkWaitWh` / `LkWaitMs`, `StopSub` / `StopSubT`,
+`StopStg` / `StopMs`, `PwrStg`.
+
+Tester: set the display idle timeout to 0 (`powercfg /x monitor-timeout-ac 0` and `-dc 0`) in the test image, or wake the
+display with input, before a user NVK run; the sleeping display is the reason DWM "stalled".

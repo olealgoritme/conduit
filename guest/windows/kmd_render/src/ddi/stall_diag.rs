@@ -43,9 +43,42 @@ static HPD_SITE_T: AtomicU32 = AtomicU32::new(0);
 /// The worker entered `step`: one store of the id and one of the clock. HPD worker only (its
 /// stores are not read-modify-write: one writer). Any IRQL, in practice PASSIVE.
 pub(crate) fn hpd_enter(step: u32) {
+    // The step being left ran from `HPD_SITE_AT` to now: the longest such dwell is `HpdLongSite`
+    // / `HpdLongUs` (which STEP made a long pass long: a pass is a sequence of steps and the
+    // pass total alone never said which). The idle wait, the prologue wait and the exit are not
+    // work. One clock read more than before, atomics only.
+    let now = crate::adapter::foreign_scanout::now_100ns();
+    let left = HPD_SITE.load(Ordering::Relaxed);
+    let since = HPD_SITE_AT.load(Ordering::Relaxed);
+    if since != 0 && !matches!(left, site::NONE | site::WAIT | site::START_WAIT | site::EXITED) {
+        let us = (now.saturating_sub(since) / 10).min(u32::MAX as u64) as u32;
+        if us >= 100_000 {
+            HPD_STEP_100_N.fetch_add(1, Ordering::Relaxed);
+        }
+        let ms = helios_kmd_logic::vsync_rate::ms_from_100ns(now);
+        if HPD_LONG.note(us, left, ms) {
+            // What else was going on when the longest step ended: the DDIs inside the driver.
+            HPD_LONG_INFL.store(crate::ddi::device_lost::inflight_low(), Ordering::Relaxed);
+        }
+    }
     HPD_SITE.store(step, Ordering::Relaxed);
-    HPD_SITE_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
+    HPD_SITE_AT.store(now, Ordering::Relaxed);
+    HPD_SITE_T.store(
+        helios_kmd_logic::vsync_rate::ms_from_100ns(now),
+        Ordering::Relaxed,
+    );
 }
+
+/// When the current step was entered (100 ns; 0 = never), the longest step dwell (microseconds,
+/// the step id, when it ended) and the DDIs in flight (ids 0..32) when it ended, and the steps
+/// that took 100 ms or more.
+static HPD_SITE_AT: AtomicU64 = AtomicU64::new(0);
+static HPD_LONG: helios_kmd_logic::device_lost::Longest = helios_kmd_logic::device_lost::Longest::new();
+static HPD_LONG_INFL: AtomicU32 = AtomicU32::new(0);
+static HPD_STEP_100_N: AtomicU32 = AtomicU32::new(0);
+/// Passes of the worker that took 100 ms or more, and 500 ms or more.
+static HPD_PASS_100_N: AtomicU32 = AtomicU32::new(0);
+static HPD_PASS_500_N: AtomicU32 = AtomicU32::new(0);
 
 /// The worker woke for another pass of its loop; `timed_out` is whether its wait ended by the
 /// timeout (else an event). Counts the wake (`HpdWkEvt` / `HpdWkTmo`), takes the causes signalled
@@ -131,6 +164,12 @@ pub(crate) fn hpd_pass_end() {
     let us = (now.saturating_sub(start) / 10).min(u32::MAX as u64) as u32;
     BUSY_US.fetch_add(us, Ordering::Relaxed);
     PASS_MAX_US.fetch_max(us, Ordering::Relaxed);
+    if us >= 100_000 {
+        HPD_PASS_100_N.fetch_add(1, Ordering::Relaxed);
+    }
+    if us >= 500_000 {
+        HPD_PASS_500_N.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// A signal of `cause` was sent to the worker (`AdapterContext::signal_hpd_for`). Atomics only,
@@ -210,7 +249,14 @@ pub(crate) fn note_lock_acquired() {
 
 /// The scanout mutex is about to be released. PASSIVE. Stamp, then count.
 pub(crate) fn note_lock_released() {
-    LOCK_REL_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
+    let now = AdapterContext::interrupt_time_ms();
+    // `ScLkHoldMs` (`ddi::device_lost`): the longest hold of this mutex, from the stamp of the
+    // acquisition just ended.
+    crate::ddi::device_lost::scanout_released(
+        sd::age_ms(now, LOCK_ACQ_T.load(Ordering::Relaxed)),
+        now,
+    );
+    LOCK_REL_T.store(now, Ordering::Relaxed);
     LOCK_REL_N.fetch_add(1, Ordering::Release);
 }
 
@@ -335,7 +381,32 @@ pub(crate) fn on_vsync_tick(adapter: &AdapterContext, period_100ns: u64) {
     if previous != 0 {
         let gap_ms = (now.saturating_sub(previous) / helios_kmd_logic::vsync_rate::UNITS_PER_MS)
             .min(u32::MAX as u64) as u32;
-        VS_GAP_MAX_MS.fetch_max(gap_ms, Ordering::Relaxed);
+        let longest_before = VS_GAP_MAX_MS.fetch_max(gap_ms, Ordering::Relaxed);
+        if gap_ms >= 100 {
+            VS_GAP_100_N.fetch_add(1, Ordering::Relaxed);
+        }
+        if gap_ms >= 1000 {
+            VS_GAP_1000_N.fetch_add(1, Ordering::Relaxed);
+        }
+        if gap_ms >= 100 && gap_ms > longest_before {
+            // What the driver was doing when the longest silence ENDED (this tick is the first
+            // thing to run after it): when, the worker's step, the mutexes held and the DDIs in
+            // flight. Atomics only (DISPATCH).
+            VS_GAP_T.store(helios_kmd_logic::vsync_rate::ms_from_100ns(now), Ordering::Relaxed);
+            VS_GAP_SITE.store(HPD_SITE.load(Ordering::Relaxed), Ordering::Relaxed);
+            let scanout_held = sd::lock_held(
+                LOCK_N.load(Ordering::Acquire),
+                LOCK_REL_N.load(Ordering::Acquire),
+            );
+            let flags = u32::from(scanout_held)
+                | (u32::from(crate::ddi::device_lost::venus_held_ms() != 0) << 1)
+                | (u32::from(HPD_SITE.load(Ordering::Relaxed) == site::WAIT) << 2)
+                | (u32::from(
+                    adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0,
+                ) << 3);
+            VS_GAP_FLAGS.store(flags, Ordering::Relaxed);
+            VS_GAP_INFL.store(crate::ddi::device_lost::inflight_low(), Ordering::Relaxed);
+        }
     }
     VS_TICK_T.store(
         helios_kmd_logic::vsync_rate::ms_from_100ns(now),
@@ -398,6 +469,18 @@ pub(crate) fn publish_vsync_ticks() {
     rec(b"PwrN", PWR_N.load(Ordering::Relaxed));
     rec(b"PwrUid", PWR_UID.load(Ordering::Relaxed));
     rec(b"PwrD3N", PWR_D3_N.load(Ordering::Relaxed));
+    rec(b"PwrT", PWR_T.load(Ordering::Relaxed));
+    rec(b"PwrAdSt", PWR_AD_ST.load(Ordering::Relaxed));
+    rec(b"PwrChSt", PWR_CH_ST.load(Ordering::Relaxed));
+    rec(b"PwrStg", PWR_STG.load(Ordering::Relaxed));
+    rec(b"VsCiT", VS_CI_T.load(Ordering::Relaxed));
+    rec(b"VsCiSt", VS_CI_ST.load(Ordering::Relaxed));
+    rec(b"LkWaitN", LK_WAIT_N.load(Ordering::Relaxed));
+    rec(b"LkWaitWh", LK_WAIT_WH.load(Ordering::Relaxed));
+    rec(b"LkWaitT", LK_WAIT_T.load(Ordering::Relaxed));
+    rec(b"LkWaitMs", LK_WAIT_MS.load(Ordering::Relaxed));
+    rec(b"StopSub", STOP_SUB.load(Ordering::Relaxed));
+    rec(b"StopSubT", STOP_SUB_T.load(Ordering::Relaxed));
 }
 
 // ---- the heartbeat's life (T5 anomaly 2) -----------------------------------------------------
@@ -408,6 +491,18 @@ pub(crate) fn publish_vsync_ticks() {
 static VS_TICK_T: AtomicU32 = AtomicU32::new(0);
 static VS_TICK_AT: AtomicU64 = AtomicU64::new(0);
 static VS_GAP_MAX_MS: AtomicU32 = AtomicU32::new(0);
+/// Silences of 100 ms and of 1 s or more between two ticks, and the context the longest one
+/// ended in: its time, the worker's step (`HpdSite` value), flags (bit 0 scanout mutex held,
+/// 1 Venus mutex held, 2 worker idle in its wait, 3 a programming pending) and the DDIs in
+/// flight (ids 0..32). A 5.8 s gap with the worker in a step and a mutex held is that step
+/// blocking the heartbeat's reviver; with the worker idle and nothing held it is the timer or
+/// the CPU, not the driver.
+static VS_GAP_100_N: AtomicU32 = AtomicU32::new(0);
+static VS_GAP_1000_N: AtomicU32 = AtomicU32::new(0);
+static VS_GAP_T: AtomicU32 = AtomicU32::new(0);
+static VS_GAP_SITE: AtomicU32 = AtomicU32::new(0);
+static VS_GAP_FLAGS: AtomicU32 = AtomicU32::new(0);
+static VS_GAP_INFL: AtomicU32 = AtomicU32::new(0);
 static VS_REF_AT: AtomicU64 = AtomicU64::new(0);
 /// Effective arms and disarms, cancels of the one-shot, ticks that returned before the count,
 /// deadline exhaustions, revives by the watchdog.
@@ -421,6 +516,58 @@ static VS_REV_N: AtomicU32 = AtomicU32::new(0);
 static PWR_N: AtomicU32 = AtomicU32::new(0);
 static PWR_UID: AtomicU32 = AtomicU32::new(0);
 static PWR_D3_N: AtomicU32 = AtomicU32::new(0);
+/// v328: when the last `DxgkDdiSetPowerState` came (ms), the adapter's and the monitor child's
+/// last state (1 = D0, 0 = not D0, 0xFF = none yet), how far the last call got, and the time and
+/// argument of the last `ControlInterrupt(CRTC_VSYNC)` (0xFF = none yet).
+static PWR_T: AtomicU32 = AtomicU32::new(0);
+static PWR_AD_ST: AtomicU32 = AtomicU32::new(0xFF);
+static PWR_CH_ST: AtomicU32 = AtomicU32::new(0xFF);
+static PWR_STG: AtomicU32 = AtomicU32::new(0);
+static VS_CI_T: AtomicU32 = AtomicU32::new(0);
+static VS_CI_ST: AtomicU32 = AtomicU32::new(0xFF);
+/// Waits on a mutex that outlived a 5 s slice: count, which lock, when, longest wait (ms).
+static LK_WAIT_N: AtomicU32 = AtomicU32::new(0);
+static LK_WAIT_WH: AtomicU32 = AtomicU32::new(0);
+static LK_WAIT_T: AtomicU32 = AtomicU32::new(0);
+static LK_WAIT_MS: AtomicU32 = AtomicU32::new(0);
+/// The finest StopDevice / RemoveDevice step entered and when (never zeroed by a StartDevice: it
+/// names where the PREVIOUS stop was if this generation is the one after a hang or a crash).
+static STOP_SUB: AtomicU32 = AtomicU32::new(0);
+static STOP_SUB_T: AtomicU32 = AtomicU32::new(0);
+/// The interrupt time (ms) of the last [`publish_counters`] (`StallT`), whoever ran it; 0 = never.
+static STALL_PUB_T: AtomicU32 = AtomicU32::new(0);
+
+/// `DxgkDdiSetPowerState` got as far as `stage` (1 entered, 3 done).
+/// Atomics only: it must survive a registry that is the thing that hangs.
+pub(crate) fn power_stage(stage: u32) {
+    PWR_STG.store(stage, Ordering::Relaxed);
+}
+
+/// `DxgkDdiControlInterrupt(CRTC_VSYNC, enable)` (DIRQL: atomics only).
+pub(crate) fn note_control_vsync(enable: bool) {
+    VS_CI_ST.store(enable as u32, Ordering::Relaxed);
+    VS_CI_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
+}
+
+/// A wait on lock `which` (`stall_diag::lock`) outlived `slices` 5 s slices and goes on waiting.
+/// PASSIVE, atomics only (the registry mirror is `publish_vsync_ticks`).
+pub(crate) fn note_long_wait(which: u32, slices: u32) {
+    LK_WAIT_N.fetch_add(1, Ordering::Relaxed);
+    LK_WAIT_WH.store(which, Ordering::Relaxed);
+    LK_WAIT_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
+    LK_WAIT_MS.fetch_max(sd::long_wait_ms(slices), Ordering::Relaxed);
+}
+
+/// StopDevice / RemoveDevice is about to run `step` (`stall_diag::stop_sub`): the atomics and two
+/// registry values, written BEFORE the step so a hang names it. PASSIVE.
+pub(crate) fn stop_sub(step: u32) {
+    use crate::diag::record_named_bytes as rec;
+    let now = AdapterContext::interrupt_time_ms();
+    STOP_SUB.store(step, Ordering::Relaxed);
+    STOP_SUB_T.store(now, Ordering::Relaxed);
+    rec(b"StopSub", step);
+    rec(b"StopSubT", now);
+}
 
 /// The heartbeat was armed at `now` (100 ns): the first tick has no predecessor, and the
 /// watchdog counts its silence from here. Any IRQL.
@@ -477,8 +624,12 @@ pub(crate) fn note_power(device_uid: u32, d0: bool) {
     if !d0 {
         PWR_D3_N.fetch_add(1, Ordering::Relaxed);
     }
+    PWR_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
     if device_uid == hpd_wake::DISPLAY_ADAPTER_HW_ID {
         ADAPTER_D0.store(d0 as u32, Ordering::Release);
+        PWR_AD_ST.store(d0 as u32, Ordering::Relaxed);
+    } else {
+        PWR_CH_ST.store(d0 as u32, Ordering::Relaxed);
     }
 }
 
@@ -655,6 +806,24 @@ pub(crate) fn publish_mode() {
     rec(b"ModeSt", MODE_ST.load(Ordering::Relaxed));
 }
 
+/// The longest worker step and the longest vsync silence, with the context each ended in.
+fn publish_long_events() {
+    use crate::diag::record_named_bytes as rec;
+    rec(b"HpdLongSite", HPD_LONG.tag.load(Ordering::Relaxed));
+    rec(b"HpdLongUs", HPD_LONG.value.load(Ordering::Relaxed));
+    rec(b"HpdLongT", HPD_LONG.t.load(Ordering::Relaxed));
+    rec(b"HpdLongInfl", HPD_LONG_INFL.load(Ordering::Relaxed));
+    rec(b"HpdStep100N", HPD_STEP_100_N.load(Ordering::Relaxed));
+    rec(b"HpdPass100N", HPD_PASS_100_N.load(Ordering::Relaxed));
+    rec(b"HpdPass500N", HPD_PASS_500_N.load(Ordering::Relaxed));
+    rec(b"VsGap100N", VS_GAP_100_N.load(Ordering::Relaxed));
+    rec(b"VsGap1000N", VS_GAP_1000_N.load(Ordering::Relaxed));
+    rec(b"VsGapT", VS_GAP_T.load(Ordering::Relaxed));
+    rec(b"VsGapSite", VS_GAP_SITE.load(Ordering::Relaxed));
+    rec(b"VsGapFlg", VS_GAP_FLAGS.load(Ordering::Relaxed));
+    rec(b"VsGapInfl", VS_GAP_INFL.load(Ordering::Relaxed));
+}
+
 /// The entry snapshot, the worker's phase and the mode-set breadcrumbs, mirrored with the rest.
 fn publish_breadcrumbs() {
     use crate::diag::record_named_bytes as rec;
@@ -731,9 +900,23 @@ pub(crate) fn start_generation() {
         &MODE_T,
         &MODE_N,
         &MODE_ST,
+        &HPD_LONG.value,
+        &HPD_LONG.tag,
+        &HPD_LONG.t,
+        &HPD_LONG_INFL,
+        &HPD_STEP_100_N,
+        &HPD_PASS_100_N,
+        &HPD_PASS_500_N,
+        &VS_GAP_100_N,
+        &VS_GAP_1000_N,
+        &VS_GAP_T,
+        &VS_GAP_SITE,
+        &VS_GAP_FLAGS,
+        &VS_GAP_INFL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
+    HPD_SITE_AT.store(0, Ordering::Relaxed);
     // Every v326 static that outlives a StopDevice starts the generation in its initial state: the
     // watchdog's reference (the heartbeat is armed again after this, which sets it).
     VS_REF_AT.store(0, Ordering::Relaxed);
@@ -742,6 +925,15 @@ pub(crate) fn start_generation() {
     }
     WAIT_US_MIN.store(u32::MAX, Ordering::Relaxed);
     ADAPTER_D0.store(1, Ordering::Release);
+    PWR_AD_ST.store(1, Ordering::Relaxed);
+    PWR_CH_ST.store(0xFF, Ordering::Relaxed);
+    PWR_STG.store(0, Ordering::Relaxed);
+    VS_CI_ST.store(0xFF, Ordering::Relaxed);
+    VS_CI_T.store(0, Ordering::Relaxed);
+    LK_WAIT_N.store(0, Ordering::Relaxed);
+    LK_WAIT_WH.store(0, Ordering::Relaxed);
+    LK_WAIT_T.store(0, Ordering::Relaxed);
+    LK_WAIT_MS.store(0, Ordering::Relaxed);
     PASS_START.store(0, Ordering::Relaxed);
     VS_TICK_AT.store(0, Ordering::Relaxed);
     FLIP_WORD.store(0, Ordering::Release);
@@ -757,7 +949,9 @@ pub(crate) fn start_generation() {
 /// is already a mirror.
 pub(crate) fn publish_counters() {
     use crate::diag::record_named_bytes as rec;
-    rec(b"StallT", AdapterContext::interrupt_time_ms());
+    let now = AdapterContext::interrupt_time_ms();
+    STALL_PUB_T.store(now.max(1), Ordering::Relaxed);
+    rec(b"StallT", now);
     rec(b"HpdLoopN", HPD_LOOP_N.load(Ordering::Relaxed));
     rec(b"HpdLoopT", HPD_LOOP_T.load(Ordering::Relaxed));
     rec(b"HpdSite", HPD_SITE.load(Ordering::Relaxed));
@@ -775,6 +969,10 @@ pub(crate) fn publish_counters() {
     publish_vsync_ticks();
     publish_hpd_wake();
     publish_breadcrumbs();
+    publish_long_events();
+    // The DDI failure rings, the sticky first-fatal record, the paging and lock records: the
+    // adapter-wide device-removed instrument (`ddi::device_lost`).
+    crate::ddi::device_lost::publish_block(crate::ddi::device_lost::Trigger::Periodic);
     rec(b"StartN", START_N.load(Ordering::Relaxed));
     rec(b"StartT", START_T.load(Ordering::Relaxed));
     rec(b"FlipWd", WD_COUNT.load(Ordering::Relaxed));
@@ -782,8 +980,6 @@ pub(crate) fn publish_counters() {
     rec(b"FlipWdBig", WD_BIG.load(Ordering::Relaxed));
 }
 
-/// How often the escape thread may write the block while the worker looks stuck: twice a second.
-const ESCAPE_PUBLISH_MS: u32 = 500;
 /// Interrupt time (ms, never 0) of the last publication from an escape.
 static LAST_ESCAPE_PUBLISH: AtomicU32 = AtomicU32::new(0);
 
@@ -809,7 +1005,7 @@ fn worker_looks_stuck(adapter: &AdapterContext, now: u32) -> bool {
 /// Publish the block from the escape thread, but ONLY while the HPD worker looks stuck
 /// (`stall_diag::worker_looks_stuck`: in a step other than the idle wait for more than a second,
 /// or the scanout mutex held for more than a second, or work pending and no wake for two), and at
-/// most every [`ESCAPE_PUBLISH_MS`]. An escape is called by user mode at PASSIVE on ITS OWN
+/// most every `ESCAPE_PUBLISH_MS` (`helios_kmd_logic::stall_diag`). An escape is called by user mode at PASSIVE on ITS OWN
 /// thread, so this refreshes the counters even when the worker is stuck (the other mirrors run on
 /// the worker, including the `Nv*` mirror an escape asks for). While the worker is healthy this
 /// does NOTHING beyond one clock read, one load and the loads of the stuck test: the block is
@@ -818,10 +1014,17 @@ fn worker_looks_stuck(adapter: &AdapterContext, now: u32) -> bool {
 pub(crate) fn publish_from_escape(adapter: &AdapterContext) {
     let now = AdapterContext::interrupt_time_ms().max(1);
     let last = LAST_ESCAPE_PUBLISH.load(Ordering::Relaxed);
-    if last != 0 && now.wrapping_sub(last) < ESCAPE_PUBLISH_MS {
-        return;
-    }
-    if !worker_looks_stuck(adapter, now) {
+    // Twice a second at most; then while the worker looks stuck, or a suspect / fatal status or a
+    // slow DDI call is unpublished (`ddi::device_lost`: the escape thread is the one that can write
+    // while the HPD worker is gone with the adapter), or while the block is a snapshot older than
+    // 5 s (a worker asleep with nothing to wake it writes no block of its own, and a reader must
+    // not take its frozen `HpdSite` / `HpdLoopT` for live values).
+    if !sd::escape_publish_due(
+        worker_looks_stuck(adapter, now) || crate::ddi::device_lost::serious_dirty(),
+        now,
+        last,
+        STALL_PUB_T.load(Ordering::Relaxed),
+    ) {
         return;
     }
     // One thread publishes per interval: the others see the new stamp.

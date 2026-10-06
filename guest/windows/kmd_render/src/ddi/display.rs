@@ -1949,6 +1949,8 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     let primary_segment = unsafe { (*address).PrimarySegment };
     let primary_address = unsafe { (*address).PrimaryAddress.QuadPart as u64 };
     let primary_flags = unsafe { (*address).Flags.__bindgen_anon_1.Value };
+    // S-0a: count the flip flags this DDI ignores (atomics only, legal at DIRQL).
+    crate::ddi::scanout_trace::note_set_vidpn_flags(primary_flags);
     // `FlipIss` (`ddi::stall_diag`): a flip dxgkrnl issued, recorded as the newest for the
     // watchdog. Atomics only, legal at DIRQL. Before anything below can publish or raise the gate.
     crate::ddi::stall_diag::note_flip_issued(primary_address);

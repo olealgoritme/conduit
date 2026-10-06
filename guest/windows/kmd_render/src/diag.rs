@@ -674,6 +674,21 @@ pub mod knobs {
     /// Read once per boot. Flip the default to 1 after a real NVK run shows `NvCliRec` close
     /// to `NvOpen`, `NvDupWould` 0 and `NvDupDoubt` small.
     pub const NV_DUP_HARDEN: KnobName = KnobName::new(b"NvDupHarden");
+    /// `NvWinPolicy` (default 1). The RM window policy (`helios_kmd_logic::rm_window`,
+    /// `docs/nvrm-escape.md`, "The RM window policy"): 1 = dynamic (any device may map until
+    /// the window is full, minus the reserve kept for the privileged device; the handle and
+    /// mapping tables grow to their sanity bounds), 0 = the legacy rule byte for byte (a
+    /// quarter of the window per device, fixed tables of 1024 entries and 128 / 256 per
+    /// process). Read once per transport (StartDevice); mirrored as `NvWinPol`.
+    pub const NV_WIN_POLICY: KnobName = KnobName::new(b"NvWinPolicy");
+    /// `NvWinReserveMb` (default 256). MiB of the RM window only the privileged device (the
+    /// one that holds the foreign scanout source, DWM-on-NVK; the KMD's own RM client) may
+    /// use. Any u32 value is valid (clamped to the window). Read per transport; `NvWinResMb`.
+    pub const NV_WIN_RESERVE_MB: KnobName = KnobName::new(b"NvWinReserveMb");
+    /// `NvWinMaxMb` (default 0 = the whole window). Caps the bytes mapped through the RM
+    /// window below the window's size: an operator bound on the non-paged pool the mapping
+    /// MDLs cost (2 KiB per MiB mapped). Read per transport; `NvWinCapMb`.
+    pub const NV_WIN_MAX_MB: KnobName = KnobName::new(b"NvWinMaxMb");
     /// `FlipWdogMs` (default 0 = off). The opt-in flip watchdog (`ddi::stall_diag`,
     /// `docs/zero-copy-present.md` "Stall diagnosis"): when a pending flip has gone this many
     /// milliseconds (in vsync ticks) with no address published, the vsync DPC publishes the
@@ -812,12 +827,15 @@ pub mod knobs {
     /// Reported device-memory capacity in MiB. 0 (default) preserves the proven
     /// one-GiB capacity of the existing aperture+BAR topology.
     pub const VIDMM_VRAM_MB: KnobName = KnobName::new(b"VidMmVramMB");
-    /// `DXGK_FLIPCAPS` OVERRIDE. 0 (default) = the driver's own word
-    /// (`FlipOnVSyncMmIo | FlipImmediateMmIo`); nonzero replaces it verbatim,
-    /// so `FlipCapsX=2` restores the pre-2026-07-29 advertisement for an A/B.
-    /// Bit order (bindgen, WDK 10.0.26100): 0 `FlipOnVSyncWithNoWait`,
-    /// 1 `FlipOnVSyncMmIo`, 2 `FlipInterval`, 3 `FlipImmediateMmIo`. Read at
-    /// AddAdapter, so `pnputil /restart-device` applies it without a rebuild.
+    /// `DXGK_FLIPCAPS` extra bits (default 0 = the driver's own word, `FlipOnVSyncMmIo`).
+    /// A raw `DXGK_FLIPCAPS` bit mask OR'd into it: only bit 4 `FlipIndependent` (0x10), bit 5
+    /// `DdiPresentForIFlip` (0x20) and bit 6 `FlipImmediateOnHSync` (0x40) are accepted (WDK
+    /// 10.0.26100.0 `d3dkmddi.h`); every other bit is dropped and reported in `FlipCapsXMsk`.
+    /// `FlipCapsX=0x10` therefore reports 0x12. It used to REPLACE the whole word; the replaced
+    /// bits were never survivable except as a no-op (`FlipCapsX=2` equals the default).
+    /// Read once per AddAdapter/StartDevice with the other knobs (`AdapterKnobs`), so a change
+    /// applies at the next StartDevice (reboot preferred); mirrored as `FlipCapsXEff` and
+    /// `FlipCapsRep` at every start.
     pub const FLIP_CAPS_EXTRA: KnobName = KnobName::new(b"FlipCapsX");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical

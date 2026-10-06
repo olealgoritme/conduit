@@ -56,6 +56,12 @@ fn indicate_child_status(adapter: &AdapterContext, connected: bool) {
     // SAFETY: live callback interface; `status` is a fully-initialized child-status
     // packet valid for the synchronous call. PASSIVE_LEVEL (worker thread).
     let st = unsafe { indicate(dxgkrnl.DeviceHandle, &mut status) };
+    // A refusal of the hot-plug indication, in the DDI failure rings (`ddi::device_lost`).
+    crate::ddi::device_lost::note_cb(
+        helios_kmd_logic::device_lost::ddi::CB_INDICATE_CHILD,
+        st,
+        connected as u32,
+    );
     crate::diag::record_named_bytes(b"HpdI", ((connected as u32) << 16) | (st as u32 & 0xFFFF));
     HPD_INDICATE_COUNT.fetch_add(1, Ordering::Relaxed);
     crate::diag::record_named_bytes(b"HpdN", HPD_INDICATE_COUNT.load(Ordering::Relaxed));

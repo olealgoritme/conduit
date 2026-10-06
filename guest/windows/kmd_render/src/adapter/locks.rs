@@ -237,22 +237,24 @@ impl ScanoutGuard<'_> {
 impl AdapterContext {
     /// Acquire the PASSIVE venus mutex (blocks; PASSIVE_LEVEL only).
     pub(super) fn acquire_venus_mutex(&self) {
+        // `VnLkWaitMs` / `VnLkHoldMs` / `VnLkHeldMs` (`ddi::device_lost`): the longest wait for
+        // this mutex, the longest hold, and the age of the current hold. Two clock reads.
+        let wait_started = crate::adapter::foreign_scanout::now_100ns();
         // SAFETY: the event was initialized in place by `init_kernel_events`;
         // an infinite Executive/KernelMode wait at PASSIVE_LEVEL. The
         // SynchronizationEvent auto-clears on a satisfied wait (mutex acquire).
         let _ = unsafe {
-            KeWaitForSingleObject(
+            crate::sync::wait_logged(
                 self.venus_mutex.get() as PVOID,
-                0, // Executive
-                0, // KernelMode
-                0, // non-alertable
-                core::ptr::null_mut(),
+                helios_kmd_logic::stall_diag::lock::VENUS,
             )
         };
+        crate::ddi::device_lost::venus_acquired(wait_started);
     }
 
     /// Release the PASSIVE venus mutex.
     pub(super) fn release_venus_mutex(&self) {
+        crate::ddi::device_lost::venus_released();
         // SAFETY: initialized event; KeSetEvent with Wait=FALSE is callable at
         // <= DISPATCH_LEVEL (we are at PASSIVE).
         unsafe { KeSetEvent(self.venus_mutex.get(), 0, 0) };
@@ -271,12 +273,9 @@ impl AdapterContext {
         // SAFETY: initialized in place by `init_kernel_events`; all callers are
         // PASSIVE-level display worker or allocation-lifecycle paths.
         let _ = unsafe {
-            KeWaitForSingleObject(
+            crate::sync::wait_logged(
                 self.scanout_mutex.get() as PVOID,
-                0, // Executive
-                0, // KernelMode
-                0, // non-alertable
-                core::ptr::null_mut(),
+                helios_kmd_logic::stall_diag::lock::SCANOUT,
             )
         };
         // `ScLkN` / `ScLkAcqT` / `ScLkRelT` (`ddi::stall_diag`): when the mutex was last taken

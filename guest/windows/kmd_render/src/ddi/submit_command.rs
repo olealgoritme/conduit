@@ -276,11 +276,16 @@ pub(crate) fn publish_nvrm_counters() {
     crate::adapter::foreign_scanout::publish_counters();
     // Producer completion table occupancy (`Prd*`): see `adapter::producer`.
     crate::adapter::producer::publish_counters();
-    // Bytes mapped through MMAP now (all owners, MiB), and MMAPs refused by the
-    // per-device quota of a quarter of the RM window.
+    // The RM window policy (`NvWin*`), the handle and mapping tables behind the
+    // per-process bounds (`NvHdl*`, `NvMapT*`, `NvSanityRef`): `virtio::nvrm_window`.
+    crate::virtio::nvrm_window::publish_counters();
+    // Bytes mapped through MMAP now (all owners, MiB), and every MMAP refusal or failure of
+    // the window policy, all reasons (`NvMapQRef`; by reason: `NvWinR*`).
     crate::diag::record_named_bytes(
         b"NvMapMb",
-        (crate::virtio::nvrm::NVRM_MAP_BYTES.load(Ordering::Relaxed) >> 20) as u32,
+        helios_kmd_logic::window_units::mib_u32(
+            crate::virtio::nvrm::NVRM_MAP_BYTES.load(Ordering::Relaxed),
+        ),
     );
     crate::diag::record_named_bytes(
         b"NvMapQRef",
@@ -822,13 +827,30 @@ unsafe fn notify_at_dirql(
         };
         DMA_SYNC_STATUS_LOW.store(status as u32, Ordering::Relaxed);
         DMA_SYNC_RET.store(ret as u32, Ordering::Relaxed);
+        // A refusal of the completion callback, in the DDI failure rings
+        // (`ddi::device_lost`, atomics only: legal at DISPATCH).
         if status != STATUS_SUCCESS {
+            crate::ddi::device_lost::note_cb(
+                helios_kmd_logic::device_lost::ddi::CB_NOTIFY_DMA,
+                status,
+                1,
+            );
             return status;
         }
         if ret == 0 {
+            crate::ddi::device_lost::note_cb(
+                helios_kmd_logic::device_lost::ddi::CB_NOTIFY_DMA,
+                STATUS_DEVICE_NOT_READY,
+                2,
+            );
             return STATUS_DEVICE_NOT_READY;
         }
     } else {
+        crate::ddi::device_lost::note_cb(
+            helios_kmd_logic::device_lost::ddi::CB_NOTIFY_DMA,
+            STATUS_DEVICE_NOT_READY,
+            3,
+        );
         return STATUS_DEVICE_NOT_READY;
     }
     STATUS_SUCCESS

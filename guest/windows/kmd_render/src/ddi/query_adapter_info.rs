@@ -294,13 +294,6 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // (reachability re-proven the same boot: with every `Gd*` service value
     // deleted, a full GDI-heavy session — explorer restart, maximized notepad, GDI
     // canary, repaint, paintcap — reproduced none of them).
-    const FLIPCAPS_FLIP_ON_VSYNC_MMIO: u32 = 1 << 1;
-    /// `DXGK_FLIPCAPS.FlipImmediateMmIo` — bit 3 in the bindgen field order
-    /// (0 `FlipOnVSyncWithNoWait`, 1 `FlipOnVSyncMmIo`, 2 `FlipInterval`,
-    /// 3 `FlipImmediateMmIo`). See the `flip_caps` note below for why it is
-    /// required and why it is honest.
-    #[allow(dead_code, reason = "reachable only through the FlipCapsX override")]
-    const FLIPCAPS_FLIP_IMMEDIATE_MMIO: u32 = 1 << 3;
     const SCHEDULINGCAPS_MULTI_ENGINE_AWARE: u32 = 1 << 0;
     const SCHEDULINGCAPS_PREEMPTION_AWARE: u32 = 1 << 2;
     const MEMORYMANAGEMENTCAPS_SECTION_BACKED_PRIMARY: u32 = 1 << 3;
@@ -371,9 +364,11 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // It is an honest advertisement, not a second unbacked cap: a Helios "flip"
     // IS a `SET_SCANOUT_BLOB`, which has no vertical-blank to wait for.
     //
-    // `FlipCapsX` (service key, default 0) OVERRIDES the whole word when
-    // nonzero, so `FlipCapsX=2` restores the pre-fix advertisement exactly for
-    // an A/B via `reg add` + `pnputil /restart-device` — no rebuild per arm.
+    // `FlipCapsX` (service key, default 0) is a mask of EXTRA raw `DXGK_FLIPCAPS` bits OR'd into
+    // the word (`helios_kmd_logic::flip_flags`): only 4 `FlipIndependent`, 5 `DdiPresentForIFlip`
+    // and 6 `FlipImmediateOnHSync` are accepted, for the independent-flip probe S-0a
+    // (docs/zero-copy-present.md). It is read once per StartDevice with the rest of
+    // `AdapterKnobs`. 0 reports exactly `FlipOnVSyncMmIo`, as before.
     // ⚠ `FlipImmediateMmIo` is DELIBERATELY NOT SET, and re-adding it is a
     // regression. It was set on 2026-07-29 to stop dxgkrnl routing immediate
     // flips down a DMA-buffer contract this driver ignored (defect 0aa), and it
@@ -386,12 +381,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // present markers writing the buffer that was on screen (defect 0ab).
     // `ddi/present_packet.rs`'s `PresentFlipPrivate` implements the DMA-buffer
     // contract instead, which is the one designed for exactly this hardware.
-    const FLIPCAPS_DEFAULT: UINT = FLIPCAPS_FLIP_ON_VSYNC_MMIO;
-    let flip_caps: UINT = match crate::diag::read_config_dword(crate::diag::knobs::FLIP_CAPS_EXTRA, 0)
-    {
-        0 => FLIPCAPS_DEFAULT,
-        override_word => override_word,
-    };
+    let flip_caps: UINT = knobs.flip_caps().reported;
     let scheduling_caps: UINT = SCHEDULINGCAPS_MULTI_ENGINE_AWARE | SCHEDULINGCAPS_PREEMPTION_AWARE;
     out.set(caps_offset!(PresentationCaps), presentation_caps);
     out.set(caps_offset!(FlipCaps), flip_caps);

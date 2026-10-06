@@ -183,6 +183,10 @@ pub(crate) struct AdapterKnobs {
     /// Nonzero restores the legacy bring-up advertisement, in BOTH the adapter
     /// cap and the aperture segment flags, which is the point of reading it once.
     pub direct_flip: bool,
+    /// `FlipCapsX` (default 0), raw: the bits OR'd into the reported `DXGK_FLIPCAPS`. Never
+    /// used unfiltered; [`Self::flip_caps`] applies the accepted-bit mask. Read here, once per
+    /// StartDevice, so the caps query reports what the `FlipCapsXEff`/`FlipCapsRep` mirrors say.
+    pub flip_caps_x: u32,
     /// `CrossAdaptCaps` (default 0). Nonzero advertises
     /// `DXGK_VIDMMCAPS.CrossAdapterResource` (tier-1 cross-adapter copy support).
     /// The compile-time `DECLARE_CROSS_ADAPTER_RESOURCE` this used to be OR'd
@@ -244,6 +248,7 @@ impl AdapterKnobs {
         foreign_copy: false,
         display_half: true,
         direct_flip: false,
+        flip_caps_x: 0,
         cross_adapter: false,
         bar_seg_flags: 0x1C,
         bar_seg_base_mb: 0,
@@ -275,12 +280,18 @@ impl AdapterKnobs {
             foreign_copy: read_config_dword(knobs::FOREIGN_COPY, 0) != 0,
             display_half: read_config_dword(knobs::DISPLAY_HALF, 1) != 0,
             direct_flip: read_config_dword(knobs::DIRECT_FLIP_CAPS, 0) != 0,
+            flip_caps_x: read_config_dword(knobs::FLIP_CAPS_EXTRA, 0),
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
             bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
             bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),
             bar_seg_mode: read_config_dword(knobs::BAR_SEG_MODE, 10),
             vidmm_vram_mb: read_config_dword(knobs::VIDMM_VRAM_MB, VIDMM_VRAM_MB_AUTO),
         }
+    }
+
+    /// The `DXGK_DRIVERCAPS.FlipCaps` word this snapshot reports, and what of `FlipCapsX` it kept.
+    pub fn flip_caps(&self) -> helios_kmd_logic::flip_flags::FlipCaps {
+        helios_kmd_logic::flip_flags::resolve_flip_caps(self.flip_caps_x)
     }
 
     /// [`Self::read`] plus the fixed-name breadcrumbs that mirror the knobs.
@@ -299,6 +310,11 @@ impl AdapterKnobs {
         crate::diag::record_named_bytes(b"BarF", knobs.bar_seg_flags);
         crate::diag::record_named_bytes(b"BarB", knobs.bar_seg_base_mb);
         crate::diag::record_named_bytes(b"BarM", knobs.bar_seg_mode);
+        // The flip caps this start will report, 0 included (docs 13.8 rule 1).
+        let flip = knobs.flip_caps();
+        crate::diag::record_named_bytes(b"FlipCapsXEff", flip.effective);
+        crate::diag::record_named_bytes(b"FlipCapsXMsk", flip.dropped);
+        crate::diag::record_named_bytes(b"FlipCapsRep", flip.reported);
         // VidVram is recorded after StartDevice resolves the absent-value
         // sentinel from the virtio host-visible capability.
         crate::diag::record_named_bytes(b"VidVBad", 0);
