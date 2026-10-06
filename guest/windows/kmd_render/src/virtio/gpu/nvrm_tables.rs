@@ -994,8 +994,17 @@ impl VirtioGpu {
     /// the device is reset or the transport replaced, which is exactly when every
     /// backend handle of the earlier generation stopped existing. The wire fence
     /// base is already stride-separated per transport instance.
+    ///
+    /// The bare base repeated across a driver image reload (every image's first transport had base
+    /// 1, so a client that survived `pnputil /restart-device` saw the SAME epoch, never latched
+    /// "device lost" and went on with the old generation's handle numbers): the per-image salt is
+    /// mixed in (`helios_kmd_logic::generation_id::nvrm_epoch`). Never 0.
     pub fn nvrm_epoch(&self) -> u64 {
-        self.wire_fence_base
+        helios_kmd_logic::generation_id::nvrm_epoch(
+            crate::adapter::image_salt(),
+            self.wire_fence_base,
+            WIRE_FENCE_INSTANCE_STRIDE,
+        )
     }
 
     // ---- mappings -----------------------------------------------------------------

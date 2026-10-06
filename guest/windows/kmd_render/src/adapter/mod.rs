@@ -510,10 +510,37 @@ pub(crate) struct TransportGeneration {
 /// The last transport-generation serial handed out (0 = none yet).
 static TRANSPORT_SERIAL: AtomicU64 = AtomicU64::new(0);
 
-/// A fresh transport-generation serial: nonzero and unique for the life of the
-/// driver. Call once per StartDevice, for the [`TransportGeneration`] it builds.
+/// The per-IMAGE salt (`helios_kmd_logic::generation_id`), 0 until first asked for.
+///
+/// `pnputil /restart-device` reloads the driver image, which zeroes every static: without a salt
+/// the first generation of each image was "serial 1, NVRM epoch 1", so an allocation or a
+/// long-lived NVK client from the previous image compared EQUAL to the new generation
+/// (docs/zero-copy-present.md section 25). The clock only moves forward within a boot, so images
+/// loaded later get larger salts. Any IRQL after the first call; the first call reads the interrupt
+/// time (a scalar read, legal through DISPATCH) and races benignly (the first compare-exchange wins,
+/// every caller returns the winner).
+static IMAGE_SALT: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn image_salt() -> u64 {
+    let current = IMAGE_SALT.load(Ordering::Acquire);
+    if current != 0 {
+        return current;
+    }
+    let fresh = helios_kmd_logic::generation_id::image_salt(foreign_scanout::now_100ns());
+    match IMAGE_SALT.compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => fresh,
+        Err(winner) => winner,
+    }
+}
+
+/// A fresh transport-generation serial: nonzero and unique across StartDevice calls AND across
+/// image reloads of one boot (`generation_id::transport_serial`). Call once per StartDevice, for the
+/// [`TransportGeneration`] it builds.
 pub(crate) fn mint_transport_serial() -> u64 {
-    TRANSPORT_SERIAL.fetch_add(1, Ordering::Relaxed) + 1
+    helios_kmd_logic::generation_id::transport_serial(
+        image_salt(),
+        TRANSPORT_SERIAL.fetch_add(1, Ordering::Relaxed) + 1,
+    )
 }
 
 pub struct AdapterContext {
