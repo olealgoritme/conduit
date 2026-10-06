@@ -1355,6 +1355,13 @@ adapter-wide view table they feed), counted when hit (`NvHdl*Ref`, `NvMapTRef`, 
   them and no more; a fresh process (DWM) still gets slots (`hostile_owners_cannot_starve_a_fresh_one`,
   and `production_shapes_can_actually_be_fair` holds both shapes to it). Below the scarce point
   only the per-process bound applies.
+* **Init frame budget.** `VirtioGpu::init` builds the transport by value on the boot stack, and
+  the `StartDevice` + `init` pair was at its ceiling (17936 bytes was the last good nested pair, 18800
+  did not boot, `tools/kmd-frame-sizes.ps1`). The window account and both tables' bounds therefore
+  live in ONE `Box<NvrmLimits>` built by `new_window_account` (`#[inline(never)]`, one pointer
+  returned, its registry reads in its own frame), so `init` gains 8 bytes of struct and no return
+  slot. **The script must be run on the build** (`new_window_account` is in its default symbols and
+  chains); the numbers were not measured here.
 * The window account's owner rows (512) are reserved at init; a 513th device mapping at once is
   `NvWinRTab`.
 * Behaviour in the working range is unchanged: refusals only appear past the old numbers.

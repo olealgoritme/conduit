@@ -2403,11 +2403,10 @@ pub struct VirtioGpu {
     nvrm_maps: Vec<nvrm_tables::NvrmMapSlot>,
     /// The RM window's byte accounting and policy (`helios_kmd_logic::rm_window`): who holds
     /// how many bytes of region 1, the reserve, the refusals. Boxed like the other tables.
-    nvrm_window_acct: Box<helios_kmd_logic::rm_window::Account>,
-    /// Sanity bounds and growth rules of the handle and mapping tables
-    /// (`helios_kmd_logic::rm_limits`; fixed numbers under `NvWinPolicy` = 0).
-    nvrm_handle_bounds: helios_kmd_logic::rm_limits::Bounds,
-    nvrm_map_bounds: helios_kmd_logic::rm_limits::Bounds,
+    /// With the sanity bounds and growth rules of the handle and mapping tables
+    /// (`helios_kmd_logic::rm_limits`; fixed numbers under `NvWinPolicy` = 0). ONE box: see
+    /// [`nvrm_tables::NvrmLimits`] for why (the init frame budget).
+    nvrm_limits: Box<nvrm_tables::NvrmLimits>,
     // (Mapping ids are minted by `virtio::nvrm::mint_map_id`, one counter for the
     // life of the driver: the host's own ids are not unique, the RM path answers
     // 0 for all of them, and the views outlive this transport.)
@@ -3039,7 +3038,7 @@ impl VirtioGpu {
         let present_buffer_opens = allocate_present_buffer_opens()?;
         // The RM window policy and the tables' bounds (knobs `NvWinPolicy`, `NvWinReserveMb`,
         // `NvWinMaxMb`), read here at PASSIVE.
-        let (nvrm_window_acct, nvrm_handle_bounds, nvrm_map_bounds) =
+        let nvrm_limits =
             nvrm_tables::new_window_account(nvrm_window).ok_or(VirtioError::OutOfMemory)?;
         // Nothing to register against without the event queue: reserve nothing.
         let nvrm_events = helios_kmd_logic::nvrm_events::Registry::try_new(
@@ -3083,14 +3082,12 @@ impl VirtioGpu {
             nvrm_events,
             cfg_features,
             scanout_release: scanout_release_on,
-            nvrm_handles: Vec::with_capacity(nvrm_handle_bounds.initial),
+            nvrm_handles: Vec::with_capacity(nvrm_limits.handle_bounds.initial),
             nvrm_reserved: 0,
             nvrm_clients: nvrm_tables::new_client_table(),
             nvrm_fences: nvrm_tables::new_fence_book(),
-            nvrm_maps: Vec::with_capacity(nvrm_map_bounds.initial),
-            nvrm_window_acct,
-            nvrm_handle_bounds,
-            nvrm_map_bounds,
+            nvrm_maps: Vec::with_capacity(nvrm_limits.map_bounds.initial),
+            nvrm_limits,
             nvrm_pins: Vec::with_capacity(MAX_NVRM_PINS),
             nvrm_next_pin: 1,
             nvrm_window,
