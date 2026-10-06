@@ -47,7 +47,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 use helios_kmd_logic::nvrm_fence;
 use helios_kmd_logic::page_runs;
-use helios_kmd_logic::sweep_budget::{CloseTally, PinFate, SweepBudget};
+use helios_kmd_logic::sweep_budget::{CloseTally, PinAction, PinFate, SweepBudget};
 use helios_protocol::{
     HELIOS_NVRM_DEEP_PAGE_RUNS, HELIOS_NVRM_DEEP_PAGE_RUNS_INDIRECT, HELIOS_NVRM_FORWARD_MSG_TYPES,
     HELIOS_NVRM_SCANOUT_FLIP_BYTES,
@@ -1348,18 +1348,23 @@ pub fn close_all_for_owner(
 ///
 /// Only a pin a `FORWARD` claimed (`host_may_alias`) can be aliased by the host;
 /// an unclaimed one is unlocked either way. A leaked pin costs its locked pages,
-/// its MDL and its table buffer until the next boot, and is counted (`NvPinLeak`). Unlocking pages the GPU may still
-/// write is not a leak but a corruption: the guest would reuse that RAM underneath
-/// the host. The pin is removed from the transport's table first (the caller took
-/// it), so `VirtioGpu::drop`'s fallback sweep cannot unlock it either.
+/// its MDL, its table buffer and its owner's EPROCESS reference until the next boot,
+/// and is counted (`NvPinLeak`). Unlocking pages the GPU may still write is not a
+/// leak but a corruption: the guest would reuse that RAM underneath the host. The
+/// pin is removed from the transport's table first (the caller took it), so
+/// `VirtioGpu::drop`'s fallback sweep cannot unlock it either.
+///
+/// Locked user pages bugcheck the owning process when its address space goes
+/// (0x76 `PROCESS_HAS_LOCKED_PAGES`). The leaked pin's process reference
+/// (`NvrmPin::leak`) is meant to keep the process object, and with it that check,
+/// from running; that is UNVERIFIED (see `NvrmPin`). If it does not hold, the
+/// price of a host that never confirmed its closes is a bugcheck at the owner's
+/// exit rather than DMA into reused RAM.
 fn release_or_leak_pin(pin: NvrmPin, fate: PinFate) {
-    match fate {
-        PinFate::Leak if pin.host_may_alias() => {
-            NVRM_PIN_LEAKS.fetch_add(1, Ordering::Relaxed);
-            core::mem::forget(pin);
-        }
+    match fate.action(pin.host_may_alias()) {
+        PinAction::Leak => pin.leak(),
         // Confirmed closed, or never described to the host (no FORWARD claimed it).
-        PinFate::Unlock | PinFate::Leak => release_pin(pin),
+        PinAction::Unlock => release_pin(pin),
     }
 }
 

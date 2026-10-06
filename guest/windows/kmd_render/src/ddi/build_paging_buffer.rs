@@ -113,6 +113,10 @@ pub fn diag_dump_gpummu_atomics(_passive: PassiveLevel) {
 use crate::ddi::PASSIVE_LEVEL_IRQL;
 use crate::irql::PassiveLevel;
 
+/// `DISPATCH_LEVEL` (KIRQL 2): the highest IRQL at which a spinlock may be taken
+/// with `KeAcquireSpinLockRaiseToDpc`.
+const DISPATCH_LEVEL_IRQL: u8 = 2;
+
 /// What one content-op executor did, as a value the dispatch must consume.
 ///
 /// The executors used to return `()`: every failure inside them — an
@@ -156,8 +160,11 @@ enum PagingOpOutcome {
 /// eviction copied the content to system memory, so it will later page those
 /// (garbage) pages back over the good blob. A skipped eviction therefore records
 /// its allocation as "system copy invalid" (`SystemBackingTable`), and a page-in
-/// of such an allocation is itself skipped (`PgInvSk`) until a whole-allocation
-/// eviction succeeds, the content is discarded, or the allocation is destroyed.
+/// of such an allocation is itself skipped (`PgInvSk`) until the successful
+/// eviction chunks since the mark cover the whole allocation (`PgInvClr`; one
+/// whole-allocation eviction or several chunks, see
+/// `helios_kmd_logic::paging::InvalidSet::evict_chunk_done`), the content is
+/// discarded, or the allocation is destroyed.
 /// Transient causes (a mapping returning NULL, an allocation failing) are retried
 /// first: [`helios_kmd_logic::paging::retry_after_failure`].
 const fn paging_failure() -> NTSTATUS {
@@ -238,6 +245,10 @@ static BAR_INVALID_MARKED: AtomicU32 = AtomicU32::new(0);
 /// The invalid-copy set was full and went to overflow (`PgInvOvf`): until the
 /// next transport generation EVERY page-in is skipped. Must stay 0.
 static BAR_INVALID_OVERFLOW: AtomicU32 = AtomicU32::new(0);
+/// "System copy invalid" marks cleared by successful evictions that, together,
+/// covered the whole allocation (`PgInvClr`). `PgInv - PgInvClr` that keeps
+/// growing is allocations that stay marked (their page-ins keep being skipped).
+static BAR_INVALID_CLEARED: AtomicU32 = AtomicU32::new(0);
 /// SYSTEM_TO_LOCAL page-ins skipped because the allocation's system copy is
 /// invalid (`PgInvSk`).
 static BAR_INVALID_SKIPS: AtomicU32 = AtomicU32::new(0);
@@ -287,6 +298,7 @@ static PAGING_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         f(b"PgInv", &BAR_INVALID_MARKED),
         f(b"PgInvOvf", &BAR_INVALID_OVERFLOW),
         e(b"PgInvSk", &BAR_INVALID_SKIPS),
+        e(b"PgInvClr", &BAR_INVALID_CLEARED),
         f(b"PgV64", &BAR_VIRTUAL_FLAGS),
         e(
             b"PgStale",
@@ -589,16 +601,20 @@ fn eviction_skipped(adapter: &AdapterContext, resource_id: u32) -> PagingOpOutco
     PagingOpOutcome::Failed(paging_failure())
 }
 
-/// A whole-allocation eviction just succeeded: the system copy is real again.
+/// A LOCAL_TO_SYSTEM eviction chunk just succeeded; `moved` is the count ACTUALLY
+/// copied (not the requested size). Once the chunks that succeeded since the mark
+/// cover the whole allocation, the system copy is real again and the mark goes.
 fn note_eviction_done(
     content_guard: &SystemBackingGuard<'_>,
     alloc_size: u64,
     offset: u64,
-    bytes: u64,
+    moved: u64,
     resource_id: u32,
 ) {
-    if pg::eviction_revalidates(alloc_size, offset, bytes) {
-        content_guard.clear_system_copy_invalid(resource_id);
+    if content_guard.evict_chunk_done(resource_id, alloc_size, offset, moved)
+        == pg::Chunk::Revalidated
+    {
+        BAR_INVALID_CLEARED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1012,7 +1028,7 @@ unsafe fn bar_virtual_transfer_inner(
     // From here on this is a content op on a live allocation of this generation.
     if blob_to_system {
         *evicting = Some(alloc.resource_id);
-    } else if pg::page_in_decision(content_guard.system_copy_invalid(alloc.resource_id))
+    } else if pg::page_in_decision(content_guard.page_in_blocked(alloc.resource_id))
         == pg::PageIn::SkipBlobAuthoritative
     {
         // The matching eviction was skipped: the system pages are not this
@@ -1160,7 +1176,7 @@ unsafe fn bar_virtual_transfer_inner(
         }
         // The system copy now holds the content: whole-allocation evictions clear
         // an earlier "invalid" mark.
-        note_eviction_done(content_guard, alloc.size, offset, size, alloc.resource_id);
+        note_eviction_done(content_guard, alloc.size, offset, moved, alloc.resource_id);
         BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
     } else {
         // The page-in copied; the blob is authoritative again. A record that
@@ -1245,7 +1261,7 @@ unsafe fn bar_transfer(
         (0, s) if s == bar_id => {
             // A skipped eviction left the SYSTEM pages holding garbage while VidMm
             // believes they hold the content. The blob is the only good copy.
-            if pg::page_in_decision(content_guard.system_copy_invalid(alloc.resource_id))
+            if pg::page_in_decision(content_guard.page_in_blocked(alloc.resource_id))
                 == pg::PageIn::SkipBlobAuthoritative
             {
                 BAR_INVALID_SKIPS.fetch_add(1, Ordering::Relaxed);
@@ -1326,6 +1342,12 @@ unsafe fn bar_transfer(
                 return eviction_skipped(adapter, alloc.resource_id);
             };
             let mut copied = false;
+            // The bytes actually moved: `bytes` cut again to the MAPPED blob. A
+            // blob shorter than the recorded allocation moves its prefix, and the
+            // lease and the "invalid" bookkeeping below must describe that prefix,
+            // not the request (a lease running past the blob makes every later
+            // Present mirror and fill of this allocation fail).
+            let mut moved = 0u64;
             let ok = unsafe {
                 with_blob_bytes(passive, adapter, alloc.resource_id, |src, len| {
                     let n = match pg::clamp_to_mapped(blob_off, bytes, len) {
@@ -1346,6 +1368,7 @@ unsafe fn bar_transfer(
                         dst_start,
                         n as usize,
                     );
+                    moved = n;
                     copied = true;
                 })
             };
@@ -1363,14 +1386,14 @@ unsafe fn bar_transfer(
                         content_guard,
                         alloc.resource_id,
                         blob_off,
-                        bytes,
+                        moved,
                         dst_start,
                     )
                 }
             {
                 // Any older record of this range no longer describes the system
                 // image. Best effort; both failures are already in PgSe.
-                if !content_guard.remove_range(passive, alloc.resource_id, blob_off, bytes) {
+                if !content_guard.remove_range(passive, alloc.resource_id, blob_off, moved) {
                     BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1378,7 +1401,7 @@ unsafe fn bar_transfer(
                 content_guard,
                 alloc.size,
                 blob_off,
-                bytes,
+                moved,
                 alloc.resource_id,
             );
             BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
@@ -1789,8 +1812,21 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // and a same-boot nonzero value is a design-gap escalation, not something
     // to absorb.
     // SAFETY: KeGetCurrentIrql is callable at any IRQL.
-    if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
+    let irql = unsafe { KeGetCurrentIrql() };
+    if irql != PASSIVE_LEVEL_IRQL {
         BAR_ERR_IRQL.fetch_add(1, Ordering::Relaxed);
+        // The skipped op may be the eviction of one of OUR live allocations: VidMm
+        // will believe the system pages hold its content, and they do not, so the
+        // matching page-in must not copy them over the blob. Remembering that
+        // reads only the allocation handle (atomics, the generation check) and
+        // takes the invalid set's own spinlock (raise-to-DPC, legal up to
+        // DISPATCH_LEVEL) — no guard, no mutex, no Mm call — so it is safe at any
+        // IRQL this DDI could be called at. Above DISPATCH the spinlock is not
+        // legal and nothing can be recorded; that is not a state this DDI is
+        // documented to run in, and PgEi already makes it loud.
+        if irql <= DISPATCH_LEVEL_IRQL {
+            note_unserialized_eviction(adapter, bar.seg_id, &operation);
+        }
         return STATUS_SUCCESS;
     }
     // SAFETY: the strongest mint in the driver — `DxgkDdiBuildPagingBuffer` is

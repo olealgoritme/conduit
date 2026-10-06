@@ -1032,10 +1032,16 @@ impl ScanoutTarget {
 /// writer, so an unconditional store is what guarantees a bind cannot read a
 /// value left behind by an older flip of the same allocation.
 ///
+/// Returns false for a null, foreign or STALE handle (an allocation of an older
+/// transport generation, see [`resolve_current_alloc`]): nothing is stored, and
+/// the caller treats it as "the handle could not be paired".
+///
 /// SAFETY: `h` is the live KMD allocation handle supplied by dxgkrnl to
 /// `DxgkDdiSetVidPnSourceAddress`, or the one this driver copied into the
 /// kernel-only DMA private data for a flip.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn set_vidpn_primary_address(
+    adapter: &AdapterContext,
     h: HANDLE,
     primary_segment: u32,
     primary_address: u64,
@@ -1044,13 +1050,9 @@ pub(crate) unsafe fn set_vidpn_primary_address(
     frame_watermark: u64,
     snapshot: Option<SnapshotDescriptor>,
 ) -> bool {
-    if h.is_null() {
+    let Some(ctx) = (unsafe { resolve_current_alloc(adapter, h) }) else {
         return false;
-    }
-    let ctx = unsafe { &*(h as *const AllocationContext) };
-    if ctx.magic != ALLOCATION_CTX_MAGIC {
-        return false;
-    }
+    };
     ctx.vidpn_primary_segment
         .store(primary_segment, Ordering::Relaxed);
     ctx.vidpn_primary_flags
@@ -1090,23 +1092,20 @@ pub(crate) unsafe fn set_vidpn_primary_address(
     true
 }
 
-/// The venus resource behind an `hAllocation`, or 0 for a null/foreign handle or
-/// an unbacked allocation.
+/// The venus resource behind an `hAllocation`: `Some(0)` for an unbacked
+/// allocation, `None` for a null/foreign handle or one of an older transport
+/// generation (its `resource_id` names a DIFFERENT live blob now, so a caller
+/// that keyed a frame mark by it would take another resource's watermark).
 ///
 /// Exists so the DISPATCH-level flip arm can name the buffer whose frame mark it
 /// must take without building a whole [`WindowsPrimary`] for one field.
+/// DISPATCH-safe (see [`resolve_current_alloc`]).
 ///
 /// # Safety
 /// Same contract as [`scanout_alloc_info`].
-pub(crate) unsafe fn allocation_resource_id(h: HANDLE) -> u32 {
-    if h.is_null() {
-        return 0;
-    }
-    let ctx = unsafe { &*(h as *const AllocationContext) };
-    if ctx.magic != ALLOCATION_CTX_MAGIC {
-        return 0;
-    }
-    ctx.resource_id
+pub(crate) unsafe fn allocation_resource_id(adapter: &AdapterContext, h: HANDLE) -> Option<u32> {
+    let ctx = unsafe { resolve_current_alloc(adapter, h) }?;
+    Some(ctx.resource_id)
 }
 
 /// Resolve a primary allocation's `hAllocation` (the CreateAllocation handle
@@ -1301,12 +1300,13 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
     if h.is_null() || target_image_id == 0 || width == 0 || height == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let ctx = unsafe { &*(h as *const AllocationContext) };
-    if ctx.magic != ALLOCATION_CTX_MAGIC
-        || ctx.resource_id == 0
-        || ctx.width != width
-        || ctx.height != height
-    {
+    // A handle of an older transport generation is refused like a foreign one:
+    // its venus ids and cached prepared copy mean nothing to the live host.
+    let Some(ctx) = (unsafe { resolve_current_alloc(adapter, h) }) else {
+        crate::diag::record_named_bytes(b"CpCpy", 0xE1);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    if ctx.resource_id == 0 || ctx.width != width || ctx.height != height {
         crate::diag::record_named_bytes(b"CpCpy", 0xE1);
         return Err(STATUS_INVALID_PARAMETER);
     }
