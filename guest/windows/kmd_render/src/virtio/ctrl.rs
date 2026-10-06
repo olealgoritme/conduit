@@ -1885,6 +1885,9 @@ pub fn release_allocation_resource(
         let _ = ctx_detach_resource(passive, adapter, ctx_id, resource_id);
         let _ = resource_unref(passive, adapter, resource_id);
     }
+    // `KmdRmClient` = 5: a resource that was the KMD's own RM system memory also owes its
+    // GEM and its RM memory (one atomic load when the service holds nothing).
+    super::rm_client::sysmem::released(passive, adapter, resource_id);
 }
 
 // ── Venus submission ─────────────────────────────────────────────────────────

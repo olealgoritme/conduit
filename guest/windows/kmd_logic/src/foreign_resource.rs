@@ -370,6 +370,12 @@ pub struct Entry {
     /// The adopting allocation was destroyed: the release is the last close's job
     /// (or already done). Never set before adoption.
     pub destroyed: bool,
+    /// The memory is RM SYSTEM memory the KMD made for one of its own allocations
+    /// (`KmdRmClient` = 5, `rm_sysmem`) and the host maps into the Venus window on
+    /// `RESOURCE_MAP_BLOB`: the one class of foreign resource that has a CPU view. Set
+    /// by the KMD's own service only ([`ForeignTable::mark_sysmem`]), between the import
+    /// and the adoption; no user-mode request can set it.
+    pub sysmem: bool,
 }
 
 /// Why a request that never became a resource was turned away, for
@@ -756,6 +762,7 @@ impl ForeignTable {
             size: r.size,
             layout,
             destroyed: false,
+            sysmem: false,
         });
         self.counters.imported = self.counters.imported.saturating_add(1);
         let live = self.entries.len() as u32;
@@ -786,6 +793,40 @@ impl ForeignTable {
             }
             None => false,
         }
+    }
+
+    /// Mark `resource_id` as the KMD's own RM system memory: from now on it may be mapped
+    /// into the host-visible window ([`Self::cpu_mappable`]). Only a resource that no
+    /// allocation has adopted yet, whose creator is `owner` (the KMD's own token), can be
+    /// marked; `false` otherwise (and nothing changes).
+    pub fn mark_sysmem(&mut self, resource_id: u32, owner: u64) -> bool {
+        match self
+            .entries
+            .iter_mut()
+            .find(|e| e.resource_id == resource_id && e.creator == Some(owner))
+        {
+            Some(e) => {
+                e.sysmem = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `resource_id` is a foreign resource with a CPU view (see
+    /// [`Entry::sysmem`]). Every other foreign resource, user-imported or the KMD's
+    /// vidmem, stays unmappable.
+    pub fn cpu_mappable(&self, resource_id: u32) -> bool {
+        self.get(resource_id).is_some_and(|e| e.sysmem)
+    }
+
+    /// The facts a flip of an allocation that adopted RM system memory needs: the DRM
+    /// file and GEM handle the resource was imported from, the layout and the size.
+    /// `None` unless it is sysmem AND adopted (an allocation owns it).
+    pub fn sysmem_source(&self, resource_id: u32) -> Option<(u32, u32, Layout, u64)> {
+        self.get(resource_id)
+            .filter(|e| e.sysmem && e.creator.is_none() && !e.destroyed)
+            .map(|e| (e.rm_handle, e.gem_handle, e.layout, e.size))
     }
 
     /// The layout recorded for `resource_id`, for a scanout flip or an importer.
@@ -2228,5 +2269,49 @@ mod tests {
             assert!(t.reserve(KMD, MIB).is_ok());
         }
         assert!(t.reserve(KMD, MIB).is_err());
+    }
+
+    // ---- KmdRmClient = 5: the KMD's own RM system memory has a CPU view ------------
+
+    #[test]
+    fn only_the_kmds_own_sysmem_is_mappable_and_only_after_the_service_marked_it() {
+        let mut t = with_import(); // owner 1 imported resource 50
+        assert!(t.contains(50));
+        assert!(!t.cpu_mappable(50), "an import is unmappable by default");
+        assert!(
+            !t.cpu_mappable(51),
+            "a resource that is not foreign is not ours to say"
+        );
+        // Another owner cannot mark it, nor can a dead id be marked.
+        assert!(!t.mark_sysmem(50, 2));
+        assert!(!t.mark_sysmem(99, 1));
+        assert!(!t.cpu_mappable(50));
+        assert!(t.mark_sysmem(50, 1));
+        assert!(t.cpu_mappable(50));
+        // Not a flip source until a WDDM allocation owns it.
+        assert_eq!(t.sysmem_source(50), None);
+        assert!(adopt(&mut t, &req()).is_ok());
+        let (rm, gem, layout, size) = t.sysmem_source(50).unwrap();
+        assert_eq!(layout, lay());
+        assert_eq!(size, 8 * MIB);
+        assert_eq!(
+            (rm, gem),
+            (t.get(50).unwrap().rm_handle, t.get(50).unwrap().gem_handle)
+        );
+        // An adopted resource can no longer be marked (the creator is gone).
+        assert!(!t.mark_sysmem(50, 1));
+        // The destroy ends it as a source and removes the record.
+        assert_eq!(t.allocation_destroyed(50), DestroyOutcome::Release);
+        assert_eq!(t.sysmem_source(50), None);
+        assert!(t.remove(50).is_some());
+        assert!(!t.cpu_mappable(50));
+    }
+
+    #[test]
+    fn an_unmarked_adopted_resource_is_never_a_sysmem_source() {
+        let mut t = with_import();
+        assert!(adopt(&mut t, &req()).is_ok());
+        assert_eq!(t.sysmem_source(50), None);
+        assert!(!t.cpu_mappable(50));
     }
 }

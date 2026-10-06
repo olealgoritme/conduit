@@ -2554,6 +2554,34 @@ fn build_backing(
             })
         }
         Backing::KmdLinearPrimary { width, height } => {
+            // `KmdRmClient` = 5: the primary from RM SYSTEM memory, adopted as a foreign
+            // resource of the KMD's own (`docs/kmd-rm-client.md` section 15). Any refusal or
+            // failure (with the knob below 5: always, after one atomic load) falls through to
+            // the Venus blob below, which is unchanged.
+            if let Some(rm) = crate::virtio::rm_client::sysmem::try_create_primary(
+                passive,
+                adapter,
+                width,
+                height,
+                meta.dxgi_format,
+            ) {
+                return Ok(CreatedBacking {
+                    resource_id: rm.resource_id,
+                    venus_memory_id: 0,
+                    venus_image_id: 0,
+                    pitch: rm.layout.stride,
+                    plane_offset: u64::from(rm.layout.offset),
+                    dxgi_format: meta.dxgi_format,
+                    venus_alloc_size: rm.size,
+                    memory_type_index: 0,
+                    // The size the aperture check, the blob mapping and VidMm all use: the
+                    // recorded one, page-granular.
+                    blob_size: BackingSize::HostAuthoritative(rm.size),
+                    system_backing_policy: SystemBackingPolicy::None,
+                    dedicated_present_buffer: false,
+                    foreign: ForeignBacking::Adopted(rm.layout),
+                });
+            }
             match adapter.with_venus_client(passive, |c| {
                 c.allocate_linear_scanout_image_blob(adapter, width, height)
             }) {
@@ -3195,7 +3223,12 @@ unsafe fn create_one(
         if is_primary {
             crate::diag::record(0x0C3E_0000 | (resource_id & 0xFFFF));
         }
-        if adapter.alloc_cached() && placement.cached {
+        // `KmdRmSysCache` = 2: the RM system-memory primary asks dxgkrnl for a write-back
+        // view too (an experiment: the Cached-with-Primary refusal of the 36th session).
+        let rm_primary_cached = is_primary
+            && matches!(foreign_backing, ForeignBacking::Adopted(_))
+            && crate::virtio::rm_client::sysmem::primary_cached_flag();
+        if adapter.alloc_cached() && (placement.cached || rm_primary_cached) {
             info.__bindgen_anon_4
                 .FlagsWddm2
                 .__bindgen_anon_1
