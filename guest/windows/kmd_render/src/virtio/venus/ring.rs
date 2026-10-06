@@ -564,9 +564,11 @@ impl VenusRing {
             FatalReason::HostStatusFatal => crate::diag::record_named_bytes(b"VnRingFt", 1),
             FatalReason::HeadWaitTimeout {
                 elapsed_ms,
+                slept_ms,
                 real_first,
             } => {
                 crate::diag::record_named_bytes(b"VnRingWd", elapsed_ms as u32);
+                crate::diag::record_named_bytes(b"VnRingSl", slept_ms as u32);
                 crate::diag::record_named_bytes(b"VnRingRt", real_first as u32);
             }
         }
@@ -657,6 +659,7 @@ impl VenusRing {
             if verdict != helios_kmd_logic::slice_budget::Verdict::Within {
                 self.latch_fatal(FatalReason::HeadWaitTimeout {
                     elapsed_ms: helios_kmd_logic::slice_budget::reported_ms(slept_ms, real_ms),
+                    slept_ms,
                     real_first: verdict == helios_kmd_logic::slice_budget::Verdict::RealSpent,
                 });
                 return Err(VirtioError::DeviceError);

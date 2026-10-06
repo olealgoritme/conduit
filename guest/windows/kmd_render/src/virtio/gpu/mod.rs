@@ -5938,7 +5938,16 @@ impl VirtioGpu {
     /// claimed-but-never-submitted and in-flight consumer ownership before
     /// releasing the closing stream slots. This is never called on an
     /// ambiguous or rejected destroy.
-    pub fn finalize_closed_present_streams_for_context(&mut self, ctx_id: u32) -> u32 {
+    ///
+    /// Retiring a closing slot turns every WDDM FIFO entry whose boundary names it into one
+    /// that names a dead stream, which the purges' `discharge_dead_present_stream_waits`
+    /// cancels; that sweep ran at purge time, when the slot still counted as live, so it is
+    /// repeated here (it takes the notification-ordered token the callers already hold).
+    pub fn finalize_closed_present_streams_for_context(
+        &mut self,
+        order: &crate::adapter::NotifyOrdered<'_>,
+        ctx_id: u32,
+    ) -> u32 {
         let mut finalized = 0u32;
         for index in 0..self.present_streams.len() {
             let slot = self.present_streams[index];
@@ -5960,10 +5969,12 @@ impl VirtioGpu {
             finalized += 1;
         }
         if finalized != 0 {
-            // The purge that closed these slots ran this sweep while they still counted as
-            // live (a closing slot keeps its handle until now): the undispatched requests
-            // of a stream that just died are cancelled here, or they keep their ledger
-            // tickets and token slots until some unrelated purge comes along.
+            // The purge that closed these slots ran these sweeps while they still counted as
+            // live (a closing slot keeps its handle until now): the FIFO entries and the
+            // undispatched requests of a stream that just died are cancelled here, or they
+            // wait on a boundary that is never satisfied and keep their ledger tickets and
+            // token slots until some unrelated purge comes along. Same order as the purges.
+            let _ = self.discharge_dead_present_stream_waits(order);
             self.cancel_dead_undispatched_windowed_blt();
         }
         finalized

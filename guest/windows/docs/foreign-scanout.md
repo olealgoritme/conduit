@@ -52,7 +52,7 @@ flush or finds nothing bound), on:
   changed (re-checked on every suppressed refresh, so a missed hook cannot wedge it);
 * the lapse: no `PRESENT` for `lapse_ms` (default 2 s, 100 ms..30 s). The HPD worker
   waits with a timeout equal to the remaining lapse while a source is live, so a
-  silent owner gives the desktop back with no other edge A DISPATCH-level watchdog on the vsync tick ends a source the worker has not
+  silent owner gives the desktop back with no other edge. A DISPATCH-level watchdog on the vsync tick ends a source the worker has not
   polled 250 ms after its deadline.
 * transport reset / StopDevice (`reset_display_publication_state`): `Inactive`, no
   restore (the display state is rebuilt).
@@ -350,6 +350,9 @@ Suppression cannot outlive the lapse by construction: `suppress_desktop(now)` is
 it with the current time. A source nobody polled therefore stops suppressing at its deadline
 whatever the worker is doing. What a stuck worker cannot do is run the restore (a worker task),
 and the state stays `Active` until something polls it, so the counters keep counting it live.
+The watchdog's counters (`FsLapse`, `FsDpcLps`, `FsEndBy`, `FsEndT`) cannot be written to the registry at DISPATCH, so
+the tick sets a publish-due flag and the next PASSIVE caller mirrors the block: the HPD worker's service pass,
+or the escape thread's stuck-only publish (`stall_diag::publish_from_escape`) while the worker looks stuck.
 The DISPATCH watchdog closes that second half: the vsync tick (free running, independent of the
 worker and of every mutex the worker waits on) checks one atomic (`FS_WATCH_AT`, the live user
 source's deadline plus 250 ms; 0 with no source, so a load per tick by default), and past it ends
@@ -375,7 +378,7 @@ refused as full) and `RelGone = FsFFull + FsFSkip (+ whatever left the book firs
 | `FsEndBy`, `FsEndGen`, `FsEndT` | `EndCause` code (table above), generation and time of the LAST end |
 | `FsPubT` | time of this publication: every `Fs*`/`Rel*`/`Nv*` value is a mirror written at an edge, so compare it with the uptime before reading anything as "unchanged" |
 | `FsDpcLps`, `FsXitEnd` | the two new end paths |
-| `WbStaleRdy`, `BlbAbandoned`, `VnRingWd`, `VnRingRt` | the Venus-side findings below |
+| `WbStaleRdy`, `BlbAbandoned`, `VnRingWd`, `VnRingSl`, `VnRingRt` | the Venus-side findings below |
 
 Publication edges: SET, RELEASE, the worker's lapse, every end by device teardown (new: it
 used to leave `FsEnd` unpublished until some later edge; an end by a closed file or the suppression
@@ -422,8 +425,10 @@ Venus present cannot touch it. The ~104 ms per frame is not the S4 queue.
    dump, still stalled, against a 7.8 minute ceiling, and the device restart that followed, fit.
    What makes the host stop consuming the ring is NOT determined (a dead process's Venus context
    teardown on the host is the suspect). Fix: the real clock bounds the wait as well
-   (`slice_budget`): 30 s of real time, then the existing fatal latch, with `VnRingWd` now the real
-   elapsed time and `VnRingRt` = 1 when the clock, not the count, ended it. Cost: a host that
+   (`slice_budget`): 30 s of real time, then the existing fatal latch, with `VnRingWd` now the larger of
+   the real elapsed time and the slice count, `VnRingSl` the slice count alone and `VnRingRt` = 1 when
+   the real time reached the budget first (which is nearly always: real time is a little ahead of the
+   count even with an exact 1 ms timer, so `VnRingRt` proves nothing; `VnRingSl` far below 30 000 does). Cost: a host that
    stalls the ring for 30 s to 7 minutes and then recovers used to come back and now latches the
    ring fatal (a device restart brings it back); healthy waits (milliseconds) are unchanged.
 3. **A blob sweep that stops at the first ambiguity (fixed).** `release_blobs_for_owner_within`
@@ -431,12 +436,18 @@ Venus present cannot touch it. The ~104 ms per frame is not the S4 queue.
    leaving the owner's remaining blobs in the table with a dead owner token and their pending
    windowed blts (each holding a read-ledger ticket and one of 64 token slots) un-cancelled.
    Killed apps fill the blob table, the token slots and the ledger a few at a time. Now the rest
-   are drained without host commands, their undispatched windowed blts cancelled (`BlbAbandoned`,
+   are drained without host commands, their undispatched windowed blts cancelled and their
+   read-ledger claims ended (the 8-slot ledger would otherwise run out and every windowed
+   present would get `STATUS_NO_MEMORY`; a claim with a reader still active is pinned until that
+   reader's ticket retires, then reclaimed) (`BlbAbandoned`,
    must read 0).
 4. **Closing present-stream slots keep undispatched requests alive (fixed).** A purge that finds a
    mid-frame stream only marks it closing; the sweep that cancels the requests of dead streams
    ran at that moment, when the slot still counted as live, and was not repeated when the
-   context's `CTX_DESTROY` finalized the slot. It is now repeated there.
+   context's `CTX_DESTROY` finalized the slot. It is now repeated there, together with
+   `discharge_dead_present_stream_waits` (the callers hold the notification-ordered token already, and
+   finalize only runs after a successful `CTX_DESTROY`, i.e. an explicit cancellation, which is the case
+   that sweep is defined for).
 5. Not changed, named for the next look: a windowed blt destination buffer left in `KmdWriter` /
    `KmdCpuMirror` after a rejected blt or an early return in the legacy Present arm
    (`present_buffer` ownership never returns, `try_begin_present_buffer_write` stays Busy and the
@@ -459,8 +470,9 @@ periods at 240 Hz happens to be 104.17 ms but nothing counts them.
    `kmd/stall-watchdog` lane).
 3. After a kill of a Venus windowed app that was slow and queued (Heaven at 5152x1440): `WbStaleRdy`
    (a healed wedge: expected 0 or small once, never growing), `BlbAbandoned` (0 unless a blit
-   was in flight), `VnRingWd` / `VnRingRt` (present only if a ring wait expired; `VnRingRt` 1
-   proves the quantum mismatch).
+   was in flight), `VnRingWd` / `VnRingSl` / `VnRingRt` (present only if a ring wait
+   expired; `VnRingSl` of about 2 000 against a budget of 30 000 with `VnRingWd` about 30 000 proves the
+   timer-quantum mismatch; `VnRingRt` alone does not).
 4. DWM present counts before and after a deliberate kill and a notepad window, as in
    `killrepro.sh`; a stall with `VnRingWd` absent for under 30 s of real time points at the ring wait
    (the latch fires at 30 s), a stall with `WfBBlt` rising points at item 1.
