@@ -265,6 +265,26 @@ int crm_win_fence_wait(int fence, uint32_t timeout_ms);
  * gone, otherwise the KMD status as an errno. */
 int crm_win_scanout_present_fenced(uint32_t handle, uint32_t gem, int fence, uint64_t *seq);
 
+/*
+ * Buffer release (KMD 22.22.315+ on a host with NVGPU_F_SCANOUT_RELEASE,
+ * guest/windows/docs/foreign-scanout.md "Buffer release"). Rule: an image
+ * whose latest SCANOUT_PRESENT returned seq P may be written again once the
+ * released floor of its DRM handle is >= P (never true for the image on
+ * screen). QUERY_CAPS bit 35; without it both answer -ENOSYS (keep the older
+ * reuse rule).
+ */
+#define CRM_WIN_CAP_SCANOUT_RELEASE (1ull << 35)
+/* SCANOUT_STATUS: *released_seq = every flip of `handle` with seq <= it is done,
+ * *last_seq = the newest seq the KMD remembers. Either may be NULL. */
+int crm_win_scanout_status(uint32_t handle, uint64_t *released_seq, uint64_t *last_seq);
+/* Block until the floor reaches `seq` (SCANOUT_RELEASED event, registered once
+ * per process, waited on without losing a wake). 1 = released, 0 = not within
+ * timeout_ms (0 = just ask), negative errno otherwise (-ENOSYS: no release
+ * tracking; -ENODEV etc.: the transport went away). *released_seq (may be NULL)
+ * gets the last floor read. */
+int crm_win_scanout_wait_released(uint32_t handle, uint64_t seq, uint32_t timeout_ms,
+                                  uint64_t *released_seq);
+
 /* The platform default transport (what crm_open(.., NULL) uses). */
 const struct crm_transport *crm_default_transport(void);
 

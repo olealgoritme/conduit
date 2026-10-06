@@ -1,0 +1,597 @@
+From 64d672b2a93240f89121b0964635f319fa1309d2 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 06:20:02 +0200
+Subject: [PATCH] nvk/rm, wsi: scanout images come back when the host releases
+ them
+
+KMD 22.22.315 on a host with NVGPU_F_SCANOUT_RELEASE (feature bit 15)
+tracks when the host is done with a flipped image
+(guest/windows/docs/foreign-scanout.md, "Buffer release"):
+SCANOUT_STATUS (op 12) answers the released floor of a DRM handle (every
+flip with seq <= it is done; skipped and dropped fenced presents count as
+done), and the SCANOUT_RELEASED event (kind 3, handle 0) rings whenever it
+may have moved.  QueryCaps.supported_ops bit 35 says so.
+
+Until now the Win32 scanout swapchain handed an image back a fixed two
+presents after it was shown, a guess that can tear.  With the capability:
+
+- nvk/rm: every flip through the KMD's source records its out_seq on the
+  memory (plain and fenced SCANOUT_PRESENT; the flip thread's flips record
+  it when sent, and a memory with flips still queued there has no seq yet,
+  so a wait on it first waits for the thread).
+  nvkmd_rm_mem_scanout_wait_released() waits until the floor reaches the
+  memory's latest seq: librmclient's crm_win_scanout_wait_released (reset
+  the event, ask, then wait: no lost wake), at most the caller's timeout,
+  and at most 1 s; past the host's own 500 ms forced release the image is
+  written anyway and counted.  A transport that went away counts as done.
+- wsi/win32: wsi_device::win32.scanout_wait_released (optional; called
+  with VK_NULL_HANDLE at swapchain creation to ask whether it works).  A
+  scanout swapchain with it hands an image back as soon as a later one is
+  shown, marked release-pending; acquire picks the idle image shown
+  longest ago and waits for its release outside the lock (VK_TIMEOUT /
+  VK_NOT_READY within the app's timeout, the image then stays idle).
+  Without it: the old two-presents rule, unchanged.
+- librmclient: crm_win_scanout_status, crm_win_scanout_wait_released
+  (loaded as optional symbols).
+
+NVK_SCANOUT_RELEASE=0 keeps the old rule.
+
+win11, KMD 22.22.312 (no capability): "not tracked", vk_scanout_present
+1920x1080 with two and three images as before (6400 / 6160 fps, 0
+failed, 0 release waits).  The tracked path needs KMD 22.22.315 and a
+backend with feature bit 15.
+
+Order: after 0030 (presents on RM fences), before patches-windows-dxvk/.
+---
+ src/nouveau/vulkan/nvk_wsi.c                  |  19 +++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h        |  37 +++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c    |   6 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c    |   2 +
+ .../vulkan/nvkmd/rm/nvkmd_rm_rmfence.c        | 130 +++++++++++++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c    |  11 +-
+ src/vulkan/wsi/wsi_common.h                   |   9 ++
+ src/vulkan/wsi/wsi_common_win32.cpp           |  86 +++++++++++-
+ 8 files changed, 284 insertions(+), 16 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
+index 1de0f26..769ff85 100644
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -91,6 +91,23 @@ nvk_wsi_scanout_flip_fenced(VkDevice _device, VkQueue _queue,
+                                            fence);
+ }
+ 
++/* Buffer release (KMD 22.22.315+): the host says when it no longer reads an
++ * image, so the WSI hands it back exactly then.
++ */
++static VkResult
++nvk_wsi_scanout_wait_released(VkDevice _device, VkDeviceMemory _mem,
++                              uint64_t timeout_ns)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++   VK_FROM_HANDLE(nvk_device_memory, mem, _mem);
++
++   if (mem == NULL) {
++      return nvkmd_rm_dev_scanout_release_tracked(dev->nvkmd) ?
++             VK_SUCCESS : VK_ERROR_FEATURE_NOT_PRESENT;
++   }
++   return nvkmd_rm_mem_scanout_wait_released(mem->mem, timeout_ns);
++}
++
+ static void
+ nvk_wsi_scanout_release(VkDevice _device)
+ {
+@@ -144,6 +161,8 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
+    if (nvkmd_rm_scanout_supported(pdev->nvkmd)) {
+       pdev->wsi_device.win32.scanout_export = nvk_wsi_scanout_export;
+       pdev->wsi_device.win32.scanout_flip = nvk_wsi_scanout_flip;
++      pdev->wsi_device.win32.scanout_wait_released =
++         nvk_wsi_scanout_wait_released;
+       pdev->wsi_device.win32.scanout_flip_fenced =
+          debug_get_bool_option("NVK_RM_FENCE", true) ?
+          nvk_wsi_scanout_flip_fenced : NULL;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index caf22eb..5087aa1 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -114,6 +114,14 @@ struct nvkmd_rm_lib {
+    int (*win_fence_wait)(int fence, uint32_t timeout_ms);
+    int (*win_scanout_present_fenced)(uint32_t handle, uint32_t gem,
+                                      int fence, uint64_t *seq);
++   /* Buffer release (KMD 22.22.315+, QueryCaps bit 35): when the host is done
++    * with a flipped image (guest/windows/docs/foreign-scanout.md).
++    */
++   int (*win_scanout_status)(uint32_t handle, uint64_t *released_seq,
++                             uint64_t *last_seq);
++   int (*win_scanout_wait_released)(uint32_t handle, uint64_t seq,
++                                    uint32_t timeout_ms,
++                                    uint64_t *released_seq);
+ };
+ 
+ /* Returns NULL if librmclient cannot be loaded */
+@@ -236,6 +244,13 @@ struct nvkmd_rm_dev {
+    struct nvkmd_rm_rmfence *rmfence;
+    simple_mtx_t rmfence_mutex;
+    bool rmfence_failed;
++
++   /* Buffer release tracking (KMD capability bit 35): 0 unknown, 1 yes,
++    * -1 no.  Waits that timed out with the transport up (the host stopped
++    * answering; the image is written anyway).
++    */
++   int8_t release_tracked;
++   uint64_t release_waits, release_timeouts;
+ #endif
+ 
+    /* Map coherent host-visible system memory GPU-cacheable */
+@@ -321,6 +336,13 @@ struct nvkmd_rm_mem {
+    uint32_t helios_res_id;
+    uint32_t helios_res_ctx;
+    bool helios_res_adopted;
++
++   /* Scanout buffer release: the seq the KMD returned for this memory's
++    * latest flip (0 = never flipped through the KMD's source), and the flips
++    * of it still queued in the flip thread (whose seq is not known yet).
++    */
++   uint64_t scanout_seq;
++   uint32_t scanout_pending;
+ };
+ 
+ NVKMD_DECL_SUBCLASS(mem, rm);
+@@ -488,6 +510,21 @@ void nvkmd_rm_rmfence_finish(struct nvkmd_rm_dev *dev);
+ /* Waits until the flip thread has sent every flip queued so far */
+ void nvkmd_rm_rmfence_drain(struct nvkmd_rm_dev *dev);
+ 
++/*
++ * Scanout buffer release (KMD 22.22.315+, QueryCaps bit 35,
++ * guest/windows/docs/foreign-scanout.md "Buffer release"): the host says
++ * when it is done reading a flipped image.
++ */
++/* Whether the KMD tracks releases (asked once per device) */
++bool nvkmd_rm_dev_scanout_release_tracked(struct nvkmd_dev *dev);
++/* Waits until the host is done with `mem`'s latest flip (an image never
++ * flipped is done).  VK_SUCCESS, VK_TIMEOUT (not within timeout_ns),
++ * VK_ERROR_FEATURE_NOT_PRESENT without release tracking.  A transport that
++ * went away counts as done.
++ */
++VkResult nvkmd_rm_mem_scanout_wait_released(struct nvkmd_mem *mem,
++                                            uint64_t timeout_ns);
++
+ /* nvkmd_rm_win.c internals shared with nvkmd_rm_rmfence.c */
+ VkResult nvkmd_rm_win_drm_fd(struct nvkmd_rm_dev *dev,
+                              struct vk_object_base *log_obj, int *fd_out);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index 2df5eb6..beb5e75 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -278,8 +278,10 @@ nvkmd_rm_dev_destroy(struct nvkmd_dev *_dev)
+    nvkmd_rm_close_drm(dev->drm_fd);
+ #ifdef _WIN32
+    if (dev->flips_ok + dev->flips_failed != 0) {
+-      mesa_logi("NVK: %" PRIu64 " scanout flips, %" PRIu64 " failed",
+-                dev->flips_ok, dev->flips_failed);
++      mesa_logi("NVK: %" PRIu64 " scanout flips, %" PRIu64 " failed; %" PRIu64
++                " release waits, %" PRIu64 " timed out",
++                dev->flips_ok, dev->flips_failed, dev->release_waits,
++                dev->release_timeouts);
+    }
+    simple_mtx_destroy(&dev->drm_mutex);
+    simple_mtx_destroy(&dev->rmfence_mutex);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index ef9691f..377c3a3 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -242,6 +242,8 @@ nvkmd_rm_lib_load(void)
+    LOAD(win_semsurf_fence_create,   "crm_win_semsurf_fence_create",   false);
+    LOAD(win_fence_wait,             "crm_win_fence_wait",             false);
+    LOAD(win_scanout_present_fenced, "crm_win_scanout_present_fenced", false);
++   LOAD(win_scanout_status,         "crm_win_scanout_status",         false);
++   LOAD(win_scanout_wait_released,  "crm_win_scanout_wait_released",  false);
+ 
+    LOAD(event_wait,   "crm_event_wait",   false);
+    LOAD(alloc_pages,  "crm_alloc_pages",  false);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
+index 2e28402..1932447 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
+@@ -36,6 +36,7 @@
+ #include "util/os_time.h"
+ #include "util/u_atomic.h"
+ #include "util/u_debug.h"
++#include "util/timespec.h"
+ #include "vk_log.h"
+ 
+ #include <errno.h>
+@@ -342,7 +343,8 @@ nvkmd_rm_rmfence_kmd_flip(struct nvkmd_dev *_dev)
+  */
+ static int
+ kmd_source_present_fenced(struct nvkmd_rm_dev *dev,
+-                          const struct nvrm_crm_scanout_flip *flip, int fence)
++                          const struct nvrm_crm_scanout_flip *flip, int fence,
++                          uint64_t *seq)
+ {
+    const struct nvkmd_rm_lib *lib = dev->lib;
+    int ret;
+@@ -363,14 +365,14 @@ kmd_source_present_fenced(struct nvkmd_rm_dev *dev,
+    }
+ 
+    ret = lib->win_scanout_present_fenced(flip->owner_handle, flip->host_handle,
+-                                         fence, NULL);
++                                         fence, seq);
+    if (ret == -ENOENT) {
+       /* The source lapsed (or the KMD reset): register it again */
+       dev->source_live = false;
+       ret = nvkmd_rm_win_source_set_locked(dev, flip);
+       if (ret == 0)
+          ret = lib->win_scanout_present_fenced(flip->owner_handle,
+-                                               flip->host_handle, fence, NULL);
++                                               flip->host_handle, fence, seq);
+    }
+ 
+ out:
+@@ -413,9 +415,11 @@ flip_thread(void *arg)
+       nvkmd_rm_mem_scanout_flip(it.mem, NULL, it.width, it.height, it.stride,
+                                 it.offset, it.fourcc, it.modifier);
+       p_atomic_inc(&rf->thread_flips);
+-      nvkmd_mem_unref(it.mem);
+ 
+       mtx_lock(&rf->q_mutex);
++      /* Its seq is known now (nvkmd_rm_mem_scanout_flip recorded it) */
++      nvkmd_rm_mem(it.mem)->scanout_pending--;
++      nvkmd_mem_unref(it.mem);
+       rf->busy = false;
+       cnd_broadcast(&rf->q_cond);
+    }
+@@ -450,6 +454,7 @@ flip_thread_queue(struct nvkmd_rm_dev *dev, struct nvkmd_rm_rmfence *rf,
+       cnd_wait(&rf->q_cond, &rf->q_mutex);
+ 
+    nvkmd_mem_ref(mem);
++   nvkmd_rm_mem(mem)->scanout_pending++;
+    rf->q[(rf->q_head + rf->q_count) % NVKMD_RM_FLIPQ_DEPTH] =
+       (struct nvkmd_rm_flip_item) {
+          .mem = mem,
+@@ -513,7 +518,8 @@ nvkmd_rm_mem_scanout_flip_fenced(struct nvkmd_mem *_mem,
+    };
+ 
+    if (rf->kmd_flip) {
+-      int ret = kmd_source_present_fenced(dev, &flip, fence);
++      uint64_t seq = 0;
++      int ret = kmd_source_present_fenced(dev, &flip, fence, &seq);
+       /* QUEUE_FULL: eight frames already wait in the KMD.  Ours fires after
+        * theirs (one timeline), so once it has fired they are all ready and
+        * the next try is taken (and coalesced).  A plain flip here could
+@@ -524,10 +530,14 @@ nvkmd_rm_mem_scanout_flip_fenced(struct nvkmd_mem *_mem,
+          dev->lib->win_fence_wait(fence, NVKMD_RM_RMFENCE_TIMEOUT_MS);
+          if (i > 0)
+             os_time_sleep(1000);
+-         ret = kmd_source_present_fenced(dev, &flip, fence);
++         ret = kmd_source_present_fenced(dev, &flip, fence, &seq);
+       }
+       if (ret == 0) {
+-         /* The KMD owns the fence now and flips when it fires */
++         /* The KMD owns the fence now and flips when it fires; the seq is
++          * minted already (a skipped or dropped frame is released at once).
++          */
++         if (seq != 0)
++            p_atomic_set(&mem->scanout_seq, seq);
+          p_atomic_inc(&dev->flips_ok);
+          p_atomic_inc(&rf->kmd_flips);
+          return VK_SUCCESS;
+@@ -580,3 +590,109 @@ nvkmd_rm_rmfence_finish(struct nvkmd_rm_dev *dev)
+    dev->rmfence = NULL;
+    rmfence_free(dev, rf);
+ }
++
++/*
++ * Scanout buffer release (KMD 22.22.315+, guest/windows/docs/foreign-scanout.md
++ * "Buffer release").  An image whose latest present returned seq P may be
++ * written again once SCANOUT_STATUS's released floor for our DRM handle is
++ * >= P; the KMD's SCANOUT_RELEASED event wakes the wait.
++ */
++
++/* Past the host's own forced release (500 ms) */
++#define NVKMD_RM_RELEASE_MAX_WAIT_MS 1000u
++
++bool
++nvkmd_rm_dev_scanout_release_tracked(struct nvkmd_dev *_dev)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++   const struct nvkmd_rm_lib *lib = dev->lib;
++
++   if (p_atomic_read(&dev->release_tracked) != 0)
++      return dev->release_tracked > 0;
++
++   uint64_t ops = 0;
++   const bool tracked =
++      debug_get_bool_option("NVK_SCANOUT_RELEASE", true) &&
++      lib->win_caps != NULL && lib->win_scanout_status != NULL &&
++      lib->win_scanout_wait_released != NULL &&
++      lib->win_caps(&ops, NULL) == 0 && (ops & (1ull << 35)) != 0;
++   p_atomic_set(&dev->release_tracked, tracked ? 1 : -1);
++   if (dev->base.pdev->debug_flags & NVK_DEBUG_VM) {
++      fprintf(stderr, "NVK: scanout buffer release %s\n",
++              tracked ? "tracked by the KMD" : "not tracked (older KMD or host)");
++   }
++   return tracked;
++}
++
++VkResult
++nvkmd_rm_mem_scanout_wait_released(struct nvkmd_mem *_mem, uint64_t timeout_ns)
++{
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
++   struct nvkmd_rm_rmfence *rf = dev->rmfence;
++
++   if (!nvkmd_rm_dev_scanout_release_tracked(&dev->base))
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   const uint64_t abs_timeout = os_time_get_absolute_timeout(timeout_ns);
++
++   /* A flip of it still in the flip thread has no seq yet: the thread sends
++    * them in order, so wait for it to go first.
++    */
++   if (rf != NULL && rf->thread_started) {
++      mtx_lock(&rf->q_mutex);
++      while (p_atomic_read(&mem->scanout_pending) != 0) {
++         if (timeout_ns == 0) {
++            mtx_unlock(&rf->q_mutex);
++            return VK_TIMEOUT;
++         }
++         struct timespec ts;
++         timespec_from_nsec(&ts, abs_timeout);
++         if (cnd_timedwait(&rf->q_cond, &rf->q_mutex, &ts) == thrd_timedout &&
++             p_atomic_read(&mem->scanout_pending) != 0) {
++            mtx_unlock(&rf->q_mutex);
++            return VK_TIMEOUT;
++         }
++      }
++      mtx_unlock(&rf->q_mutex);
++   }
++
++   const uint64_t seq = p_atomic_read(&mem->scanout_seq);
++   if (seq == 0 || dev->drm_fd < 0)
++      return VK_SUCCESS;
++
++   const uint64_t now = os_time_get_nano();
++   uint64_t left_ms = abs_timeout > now ?
++                      DIV_ROUND_UP(abs_timeout - now, 1000000) : 0;
++   if (left_ms > NVKMD_RM_RELEASE_MAX_WAIT_MS)
++      left_ms = NVKMD_RM_RELEASE_MAX_WAIT_MS;
++
++   uint64_t released = 0;
++   p_atomic_inc(&dev->release_waits);
++   const int ret = dev->lib->win_scanout_wait_released((uint32_t)dev->drm_fd,
++                                                       seq, (uint32_t)left_ms,
++                                                       &released);
++   if (ret == 1)
++      return VK_SUCCESS;
++   if (ret == 0) {
++      /* Within the caller's timeout: report it.  Past the host's forced
++       * release with the transport up: the host stopped answering; write
++       * the image anyway (it may tear) rather than stall the app.
++       */
++      if (left_ms < NVKMD_RM_RELEASE_MAX_WAIT_MS)
++         return VK_TIMEOUT;
++      const uint64_t n = p_atomic_inc_return(&dev->release_timeouts);
++      if (n <= 4 || n % 600 == 0)
++         mesa_logw("NVK: scanout image (seq %" PRIu64 ") not released after "
++                   "%u ms (floor %" PRIu64 "), reusing it (%" PRIu64 " so far)",
++                   seq, NVKMD_RM_RELEASE_MAX_WAIT_MS, released, n);
++      return VK_SUCCESS;
++   }
++   if (ret == -ENOSYS) {
++      /* The capability went away (a device reset onto another host) */
++      p_atomic_set(&dev->release_tracked, -1);
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   }
++   /* The transport went away: nothing reads the image any more */
++   return VK_SUCCESS;
++}
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+index 0df4960..203a113 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+@@ -274,7 +274,7 @@ nvkmd_rm_win_source_set_locked(struct nvkmd_rm_dev *dev,
+  */
+ static int
+ kmd_source_present(struct nvkmd_rm_dev *dev,
+-                   const struct nvrm_crm_scanout_flip *flip)
++                   const struct nvrm_crm_scanout_flip *flip, uint64_t *seq)
+ {
+    const struct nvkmd_rm_lib *lib = dev->lib;
+    int ret;
+@@ -309,14 +309,14 @@ kmd_source_present(struct nvkmd_rm_dev *dev,
+    }
+ 
+    ret = lib->win_scanout_present(flip->owner_handle, flip->host_handle,
+-                                  NULL);
++                                  seq);
+    if (ret == -ENOENT) {
+       /* The source lapsed (or the KMD reset): register it again */
+       dev->source_live = false;
+       ret = nvkmd_rm_win_source_set_locked(dev, flip);
+       if (ret == 0)
+          ret = lib->win_scanout_present(flip->owner_handle,
+-                                        flip->host_handle, NULL);
++                                        flip->host_handle, seq);
+    }
+ 
+ out:
+@@ -369,9 +369,12 @@ nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *_mem,
+       .modifier = modifier,
+       .seq = p_atomic_inc_return(&dev->flip_seq),
+    };
+-   int ret = kmd_source_present(dev, &flip);
++   uint64_t seq = 0;
++   int ret = kmd_source_present(dev, &flip, &seq);
+    if (ret == -ENOSYS)
+       ret = dev->lib->win_scanout_flip(&flip);
++   else if (ret == 0 && seq != 0)
++      p_atomic_set(&mem->scanout_seq, seq);
+    if (ret == 0) {
+       p_atomic_inc(&dev->flips_ok);
+    } else {
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index cf99648..32c041c 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -181,6 +181,15 @@ struct wsi_device {
+       VkResult (*scanout_flip_fenced)(VkDevice device, VkQueue queue,
+                                       VkDeviceMemory memory,
+                                       const struct wsi_win32_scanout_flip *flip);
++      /* Optional: the display tells when it is done with a shown image.
++       * Waits (at most timeout_ns) until the display no longer reads
++       * `memory` (an image never shown is done): VK_SUCCESS, VK_TIMEOUT.
++       * memory == VK_NULL_HANDLE asks whether this works on `device` at all:
++       * VK_SUCCESS or VK_ERROR_FEATURE_NOT_PRESENT.  Without it an image comes
++       * back a fixed number of presents after it was shown.
++       */
++      VkResult (*scanout_wait_released)(VkDevice device, VkDeviceMemory memory,
++                                        uint64_t timeout_ns);
+       void (*scanout_release)(VkDevice device);
+    } win32;
+ 
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index 352d55f..09e9260 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -72,6 +72,10 @@ enum wsi_win32_image_state {
+ struct wsi_win32_image {
+    struct wsi_image base;
+    enum wsi_win32_image_state state;
++   /* Scanout with release tracking: idle, but the display may still read it
++    * (acquire waits for its release first).
++    */
++   bool release_pending;
+    struct wsi_win32_swapchain *chain;
+    struct {
+       ID3D12Resource *swapchain_res;
+@@ -133,6 +137,11 @@ struct wsi_win32_swapchain {
+       HANDLE timer;
+       bool flip_failed;
+       bool presented;
++      /* The driver tells when the display is done with an image
++       * (scanout_wait_released): an image comes back as soon as a later one
++       * is shown, and acquire waits for its release.  Otherwise `hold`.
++       */
++      bool release;
+    } scanout;
+ 
+    struct wsi_win32_image     images[0];
+@@ -735,12 +744,19 @@ wsi_win32_queue_present_scanout(struct wsi_win32_swapchain *chain,
+ 
+    mtx_lock(&chain->acquire_mutex);
+    image->state = WSI_IMAGE_QUEUED;
++   image->release_pending = false;
+    for (uint32_t i = 0; i < chain->base.image_count; i++) {
+       struct wsi_win32_image *other = &chain->images[i];
+-      if (other->state == WSI_IMAGE_QUEUED &&
+-          other->base.present_serial + chain->scanout.hold <=
+-          chain->base.present_serial)
++      if (other->state != WSI_IMAGE_QUEUED || other == image)
++         continue;
++      if (chain->scanout.release) {
++         /* Replaced on the display: acquire waits for its release */
+          other->state = WSI_IMAGE_IDLE;
++         other->release_pending = true;
++      } else if (other->base.present_serial + chain->scanout.hold <=
++                 chain->base.present_serial) {
++         other->state = WSI_IMAGE_IDLE;
++      }
+    }
+    u_cnd_monotonic_broadcast(&chain->acquire_cond);
+    mtx_unlock(&chain->acquire_mutex);
+@@ -891,6 +907,21 @@ static bool
+ wsi_win32_find_idle_image(struct wsi_win32_swapchain *chain,
+                           uint32_t *out_image_index)
+ {
++   if (chain->scanout.release) {
++      /* The idle image shown longest ago: the likeliest to be released */
++      int best = -1;
++      for (uint32_t i = 0; i < chain->base.image_count; i++) {
++         if (chain->images[i].state == WSI_IMAGE_IDLE &&
++             (best < 0 || chain->images[i].base.present_serial <
++                          chain->images[best].base.present_serial))
++            best = (int)i;
++      }
++      if (best < 0)
++         return false;
++      *out_image_index = (uint32_t)best;
++      chain->images[best].state = WSI_IMAGE_DRAWING;
++      return true;
++   }
+    for (uint32_t i = 0; i < chain->base.image_count; i++) {
+       if (chain->images[i].state == WSI_IMAGE_IDLE) {
+          *out_image_index = i;
+@@ -939,6 +970,49 @@ wsi_win32_acquire_idle_cpu_image(struct wsi_win32_swapchain *chain,
+    return result;
+ }
+ 
++/* Scanout with release tracking: an idle image, then the wait for the
++ * display to be done with it (outside the lock; presents go on meanwhile).
++ */
++static VkResult
++wsi_win32_acquire_released_scanout_image(struct wsi_win32_swapchain *chain,
++                                         const VkAcquireNextImageInfoKHR *info,
++                                         uint32_t *out_image_index)
++{
++   const struct wsi_device *wsi = chain->wsi->wsi;
++   const uint64_t start = os_time_get_nano();
++
++   VkResult result = wsi_win32_acquire_idle_cpu_image(chain, info,
++                                                      out_image_index);
++   if (result != VK_SUCCESS)
++      return result;
++
++   struct wsi_win32_image *image = &chain->images[*out_image_index];
++   if (!image->release_pending)
++      return VK_SUCCESS;
++
++   const uint64_t spent = os_time_get_nano() - start;
++   const uint64_t left = info->timeout == UINT64_MAX ? UINT64_MAX :
++                         info->timeout > spent ? info->timeout - spent : 0;
++   result = wsi->win32.scanout_wait_released(chain->base.device,
++                                             image->base.memory, left);
++   if (result == VK_SUCCESS || result == VK_ERROR_FEATURE_NOT_PRESENT) {
++      /* Released (or no tracking any more: the old rule from now on) */
++      if (result == VK_ERROR_FEATURE_NOT_PRESENT)
++         chain->scanout.release = false;
++      mtx_lock(&chain->acquire_mutex);
++      image->release_pending = false;
++      mtx_unlock(&chain->acquire_mutex);
++      return VK_SUCCESS;
++   }
++
++   /* Not released within the app's timeout: give the image back */
++   mtx_lock(&chain->acquire_mutex);
++   image->state = WSI_IMAGE_IDLE;
++   u_cnd_monotonic_broadcast(&chain->acquire_cond);
++   mtx_unlock(&chain->acquire_mutex);
++   return info->timeout == 0 ? VK_NOT_READY : VK_TIMEOUT;
++}
++
+ static VkResult
+ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
+                              const VkAcquireNextImageInfoKHR *info,
+@@ -952,6 +1026,8 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
+       return chain->status;
+ 
+    /* acquire timeout has to be explicitly handled for sw wsi */
++   if (!chain->dxgi && chain->scanout.release)
++      return wsi_win32_acquire_released_scanout_image(chain, info, image_index);
+    if (!chain->dxgi)
+       return wsi_win32_acquire_idle_cpu_image(chain, info, image_index);
+ 
+@@ -1230,6 +1306,10 @@ retry:
+       chain->scanout.hold = MIN2(2u, num_images - 1);
+       chain->base.gpu_ordered_present =
+          wsi_device->win32.scanout_flip_fenced != NULL;
++      chain->scanout.release =
++         wsi_device->win32.scanout_wait_released != NULL &&
++         wsi_device->win32.scanout_wait_released(device, VK_NULL_HANDLE, 0) ==
++            VK_SUCCESS;
+       const uint64_t hz = debug_get_num_option("MESA_WSI_SCANOUT_HZ", 0);
+       chain->scanout.period_ns =
+          chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR && hz > 0 ?
+-- 
+2.43.0
+

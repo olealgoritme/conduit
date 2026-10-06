@@ -130,6 +130,10 @@ struct win_ctx {
         HANDLE ev;
     } *evs;
     uint32_t n_evs, cap_evs;
+
+    /* The SCANOUT_RELEASED registration (kind 3, handle 0), made on first use
+     * by crm_win_scanout_wait_released: an auto-reset event, under `lock`. */
+    HANDLE release_ev;
 };
 
 static struct win_ctx g_ctx = { .lock = SRWLOCK_INIT, .ctl_handle = -1 };
@@ -613,17 +617,24 @@ static void win_close(void *vctx, int fd)
     win_close_one(c, fd);
 }
 
-/* HELIOS_NVRM_OP_EVENT_REGISTER / UNREGISTER for channel `fd`, kind READY. */
-static int nvrm_event_call(struct win_ctx *c, uint32_t op, uint32_t fd, HANDLE ev)
+/* HELIOS_NVRM_OP_EVENT_REGISTER / UNREGISTER for channel `fd`, kind `kind`. */
+static int nvrm_event_call_kind(struct win_ctx *c, uint32_t op, uint32_t fd, uint32_t kind,
+                                HANDLE ev)
 {
     HeliosNvrmEvent e;
     memset(&e, 0, sizeof(e));
     helios_nvrm_init(&e.head, op, sizeof(e));
     e.handle = fd;
-    e.kind = HELIOS_NVRM_EVENT_READY;
+    e.kind = kind;
     e.event_handle = (uint64_t)(uintptr_t)ev;
     int r = nvrm_escape(c, &e, sizeof(e));
     return r ? r : kmd_status_to_errno(e.head.status);
+}
+
+/* ... kind READY, the channel events of event_wait. */
+static int nvrm_event_call(struct win_ctx *c, uint32_t op, uint32_t fd, HANDLE ev)
+{
+    return nvrm_event_call_kind(c, op, fd, HELIOS_NVRM_EVENT_READY, ev);
 }
 
 /* Forget channel `fd`'s event (before the channel itself closes). */
@@ -1437,6 +1448,104 @@ int crm_win_scanout_present_fenced(uint32_t handle, uint32_t gem, int fence, uin
     return 0;
 }
 
+/* ---- buffer release (KMD 22.22.315+, guest/windows/docs/foreign-scanout.md
+ * "Buffer release"): SCANOUT_STATUS and the SCANOUT_RELEASED event. ---------- */
+
+int crm_win_scanout_status(uint32_t handle, uint64_t *released_seq, uint64_t *last_seq)
+{
+    struct win_ctx *c = &g_ctx;
+    if (!c->ready)
+        return -ENODEV;
+    if (!(c->supported_ops & HELIOS_NVRM_CAP_SCANOUT_RELEASE) ||
+        !(c->supported_ops & (1ull << HELIOS_NVRM_OP_SCANOUT_STATUS)))
+        return -ENOSYS;
+    HeliosNvrmScanoutStatus st;
+    memset(&st, 0, sizeof(st));
+    helios_nvrm_init(&st.head, HELIOS_NVRM_OP_SCANOUT_STATUS, sizeof(st));
+    st.handle = handle;
+    int r = nvrm_escape(c, &st, sizeof(st));
+    if (r)
+        return r;
+    if (st.head.status != HELIOS_NVRM_ST_OK)
+        return kmd_status_to_errno(st.head.status);
+    if (released_seq)
+        *released_seq = st.out_released_seq;
+    if (last_seq)
+        *last_seq = st.out_last_seq;
+    return 0;
+}
+
+/* The process's SCANOUT_RELEASED event, registered on first use. */
+static int release_event(struct win_ctx *c, HANDLE *out)
+{
+    int r = 0;
+    AcquireSRWLockExclusive(&c->lock);
+    if (!c->release_ev) {
+        HANDLE ev = CreateEventW(NULL, FALSE /* auto reset */, FALSE, NULL);
+        if (!ev) {
+            r = -ENOMEM;
+        } else {
+            r = nvrm_event_call_kind(c, HELIOS_NVRM_OP_EVENT_REGISTER, 0,
+                                     HELIOS_NVRM_EVENT_SCANOUT_RELEASED, ev);
+            if (r == 0)
+                c->release_ev = ev;
+            else
+                CloseHandle(ev);
+        }
+    }
+    *out = c->release_ev;
+    ReleaseSRWLockExclusive(&c->lock);
+    return r;
+}
+
+int crm_win_scanout_wait_released(uint32_t handle, uint64_t seq, uint32_t timeout_ms,
+                                  uint64_t *released_seq)
+{
+    struct win_ctx *c = &g_ctx;
+    uint64_t released = 0;
+    int r = crm_win_scanout_status(handle, &released, NULL);
+    if (released_seq)
+        *released_seq = released;
+    if (r)
+        return r;
+    if (released >= seq)
+        return 1;
+    if (timeout_ms == 0)
+        return 0;
+
+    HANDLE ev = NULL;
+    r = release_event(c, &ev);
+    if (r)
+        return r;
+    /* The event is a doorbell, not a latch: reset, ask, and only then wait,
+     * so a release between the question and the wait still wakes us. */
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    for (;;) {
+        ResetEvent(ev);
+        r = crm_win_scanout_status(handle, &released, NULL);
+        if (released_seq)
+            *released_seq = released;
+        if (r)
+            return r;
+        if (released >= seq)
+            return 1;
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline)
+            return 0;
+        const DWORD w = WaitForSingleObject(ev, (DWORD)(deadline - now));
+        if (w == WAIT_TIMEOUT) {
+            r = crm_win_scanout_status(handle, &released, NULL);
+            if (released_seq)
+                *released_seq = released;
+            if (r)
+                return r;
+            return released >= seq ? 1 : 0;
+        }
+        if (w != WAIT_OBJECT_0)
+            return -EIO;
+    }
+}
+
 /* ---- Helios extras beyond NVRM: adapter identity, Venus holder contexts,
  * foreign resources (guest/windows/protocol/src/foreign.rs). All go through the
  * same D3DKMT device as the RM escapes, so the KMD sees one owner for the DRM
@@ -1733,6 +1842,19 @@ int crm_win_fence_wait(int fence, uint32_t timeout_ms)
 int crm_win_scanout_present_fenced(uint32_t handle, uint32_t gem, int fence, uint64_t *seq)
 {
     (void)handle; (void)gem; (void)fence; (void)seq;
+    return -ENOSYS;
+}
+
+int crm_win_scanout_status(uint32_t handle, uint64_t *released_seq, uint64_t *last_seq)
+{
+    (void)handle; (void)released_seq; (void)last_seq;
+    return -ENOSYS;
+}
+
+int crm_win_scanout_wait_released(uint32_t handle, uint64_t seq, uint32_t timeout_ms,
+                                  uint64_t *released_seq)
+{
+    (void)handle; (void)seq; (void)timeout_ms; (void)released_seq;
     return -ENOSYS;
 }
 
