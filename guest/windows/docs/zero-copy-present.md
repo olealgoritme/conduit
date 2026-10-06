@@ -2125,3 +2125,162 @@ by the code (the re-arm precedes the call) nor by the LiveKD of the second stop.
    `VsWdFixN` above 0 is a lost one-shot the old code left dead; read `VsWdSArm`, `VsWdSRef` and `VsWdSDl` for the state it
    found.
 4. `HpdLoopN` rising about every 2 s with `HpdSgOth` is the watchdog's refresh wake.
+
+## 20. DWM after a device restart (flip retirement; v329 follow-up)
+
+### 20.1 The report
+
+KMD 327.1 (`VsPowerMode` 1, `VsWatchdog` 1, `ForeignFlip` 0), a Venus `d3d11_spin` window composed by an animating DWM,
+`pnputil /restart-device`. After the restart the mode is kept (5120x1440@240) and the heartbeat runs (section 19: the
+counters had been a lazy mirror; the ticks ran at about 238.8 Hz), but DWM does not compose. The UMD's log of both DWM
+processes (1772, then a freshly started 1808): `Evict` returns DEVICE_REMOVED, DestroyDevice / CloseAdapter,
+OpenAdapter10_2 and CreateDevice succeed (new Venus contexts on the restarted KMD, same LUID), then about 60 flip presents
+(`Present1` flags 0x2, interval 1; the render and present callbacks return S_OK), then DWM sits at 0 CPU with no error.
+The fresh DWM does the same after 64. `VpPres` / `VpFlip` and `FlipIss` stop moving. Second capture: `VpGate` 1,
+`VpVsEn` 1, `VpPend` nonzero (low 32 bits of an allocation handle), `HpdLoopN` 424, `HpdSite` 1, `FsLive` 0.
+
+So DWM's own recovery works and it is the NEW generation's allocations that are flipped. dxgkrnl accepts the presents
+but stops issuing flips (`FlipIss` flat), which, with `MaxQueuedFlipOnVSync` 1 (`FlipQueueN`, default 1), means the
+flip it issued LAST is not seen retired and everything queues behind it.
+
+### 20.2 Ranked hypotheses
+
+1. **H1, the restart zeroed the address every CRTC_VSYNC carries (fixed, 20.3).** dxgkrnl retires a queued flip only
+   when a CRTC_VSYNC carries ITS address (`signal_crtc_vsync`, `adapter/kobj.rs`, reading
+   `AdapterContext::last_primary_address`) and issues the next flip after that (depth 1). It keeps its flip queue and
+   VidPn state across a PnP stop/start. `reset_display_publication_state` (`adapter/mod.rs`, called from StopDevice and
+   again from StartDevice, `ddi/lifecycle.rs`) stored 0 in `last_primary_address`. A flip dxgkrnl had issued and not yet
+   seen retired when the device stopped (near certain with an animating compositor) was therefore never named again:
+   the restarted heartbeat reported 0 until a NEW flip had been programmed, and a new flip is not issued while the old
+   one is outstanding. This fits every observation: the ticks run, `VpVsEn` 1, `FlipIss` flat, a fresh DWM stalls the
+   same way after the same count (dxgkrnl's own present queue, 60 to 64 deep, fills and blocks the compositor), a
+   static desktop restarts fine (no flip in flight), nothing failed in the KMD (nothing was ever asked of it).
+   Counters: `SaLo` / `SaHi` and `VpLpa` read 0 after the restart; `ScRestAdr0` (the heartbeat's address at StopDevice)
+   and `ScRestIss` nonzero while `ScRestAddr` was 0 before the fix and equals `ScRestIss` after it; `FlipIss` frozen.
+   NOT proven on hardware: that dxgkrnl waits for exactly the newest issued address (it is the address of the flip it
+   issued last, which is what `note_flip_issued` records; if that flip was already retired the report is the harmless
+   "this is what is displayed").
+2. **H2, a flip that no later step of the KMD can complete (partly fixed, 20.3).** The completion invariant (section 13)
+   covered foreign and hollow sources. A handle that no longer resolves at the worker (`scanout_alloc_info` None:
+   destroyed, or an allocation of an older transport generation: `ScanoutReject::BadAlloc`) and a Venus
+   `ProducerAbandoned` (the host resource is not live, a destroy barrier is up, the exact producer boundary was purged)
+   completed nothing, because `flip_completion::decide` answers `None` for a Venus source and `flip_completion_info`
+   returns `None` for an unresolved handle. At `SetVidPnSourceAddress` itself an unpaired handle already published
+   (`FkDdi`, `KeepWhy::Unresolved`), so only the worker's exits were open. Counters: `FkStale` (new), `FkGen` (new, a
+   subset of `FkDdi` for handles of an older generation), `FkKeep05` / `FkKeep08`, `VpPrF`, `PgStale`, `PrUnres`.
+3. **H3, the worker's programming Deferred for ever (not a restart defect in itself; unproven, instrument in place).**
+   `VpGate` 1 with `VpPend` nonzero is what a Deferred re-arm leaves (`apply_deferred_vidpn_source_address_locked`
+   re-stores the handle and keeps the gate), and the second capture had it. Causes: `stage_worker_scanout_bind`
+   `Waiting` (`virtio/gpu/mod.rs`: a publication active, a fast owner, the producer boundary not ready) or the linear
+   fallback's `publication_active()` (`ddi/display.rs`, `program_vidpn_source_inner`). The mirror is only as fresh as the
+   worker's last dump (every 128 passes and 1 s), so a nonzero `VpPend` at a quiet moment is also what one flip issued
+   after the last dump looks like. Discriminate with the 14.5 rows 1c and 2b: `HpdLoopN` rising at about the vsync rate
+   with `VsPendN` growing and `FlipPub` flat is a Deferred loop; `DeferBudget` 240 as the A/B (`FkDefBud` moves and the
+   stall clears). Under H1 nothing new is issued, so `VpPend` is 0 or one handle and `VsPendN` stays small.
+4. **H4, a stale fence high-water (examined, refuted by the observations).** `last_completed_fence` (`adapter/mod.rs`) is
+   never reset at a start. If dxgkrnl restarted its fence numbering at 1, every `signal_dma_completed` would be skipped
+   as stale (`DmStl` counts them: `submit_command.rs`, `fence_is_forward`) and every fence, paging included, would
+   stall. But the new generation's contexts were created, made resident, rendered and presented about 60 times, which
+   needs completions. `DmStl` stays on the checklist to close it.
+5. **H5, resource id collision across generations (examined, refuted).** Ids restart at 1. Every identity that could
+   make the new generation's `already_bound` / `same_active_identity` true by accident is cleared by
+   `reset_display_publication_state` at StopDevice and StartDevice: `active_scanout_resource`, `active_scanout_wh`,
+   `host_bound_scanout_resource`, `dedicated_scanout_*`, `primary_scanout_*` (the generation is bumped), the bind sequence
+   pair and `scanout_bind_wire_resource`, the leases and epochs, `frame_watermark_*`, the read ledger; the host-side state
+   belongs to the new `VirtioGpu`. `same_active_identity` also requires `already_bound`. An allocation handle of the old
+   generation is refused by `resolve_current_alloc` (`is_current_generation`).
+6. **H6, CommitVidPn not re-issued (observed, not a flip blocker).** `ModeStg` 5 after the restart: the last mode DDI
+   entered was `EnumVidPnCofuncModality`, no `CommitVidPn` (7 / 8). dxgkrnl keeps the active VidPn across a stop/start.
+   The only thing the KMD keeps from a commit is `committed_refresh_mhz`, which StartDevice zeroes: the heartbeat then
+   follows the host's preferred rate until a commit. The ticks ran at 238.8 Hz, so it was harmless here; a user-chosen
+   rate other than the host's would be lost. Not changed.
+7. **H7, handles dxgkrnl passes after the restart (refuted).** The DDIs take the adapter context pointer from AddDevice;
+   `publish_started` REPLACES the boxed `StartedState` at every StartDevice, so the callback table and `DeviceHandle` that
+   the heartbeat and the notifications use are the new ones. The heartbeat's notify status is `VsCbSyncSt`.
+
+### 20.3 What changed
+
+* **The heartbeat's address survives the restart.** `ddi::stall_diag::LAST_ISSUED` records the newest address dxgkrnl ever
+  issued in a flip (`note_flip_issued`: every `SetVidPnSourceAddress` and every DMA flip record; process-lifetime,
+  `start_generation` leaves it alone). `reset_display_publication_state` stores `restart_flip::seed_address(LAST_ISSUED)` in
+  `last_primary_address` instead of 0, at its start and again at its end (the lease teardown can publish a withheld
+  old-generation address over it). Only the ADDRESS word is kept: the displayed identity, the binding, the gate, the
+  pending slot and every resource-id keyed table are still cleared. A new flip's programming still publishes its own
+  address through `publish_bound_primary` / `publish_kept_primary` as before.
+* **Dead-source flips complete whatever their class.** `ddi/display.rs::complete_dead_source`, from the worker's
+  permanent-reject exit and from the inline wrapper: `BadAlloc` (handle unresolved) and `ProducerAbandoned` publish a kept
+  picture (`restart_flip::worker_dead_exit`: the allocation's own address if it still resolves, else the newest issued
+  flip's), for Venus, foreign and hollow alike, counted `FkStale` and under `FkKeep08` (unresolved) / `FkKeep05`
+  (rejected). The status returned to dxgkrnl is unchanged. `SetVidPnSourceAddress` counts an unpaired handle of an OLDER
+  generation as `FkGen` (`create_allocation::alloc_is_stale_generation`) in addition to `FkDdi`.
+* **StartDevice / StopDevice breadcrumbs and wake.** `ScRestPend` (bits 0 and 1: a programming handle was pending / the
+  gate was raised at StopDevice, after the worker and heartbeat stopped and before the reset; bits 2 and 3 the same at
+  StartDevice entry), `ScRestAdr0` (the heartbeat's address at StopDevice, low 32 bits), `ScRestAddr` (at StartDevice
+  exit: the seed), `ScRestIss` (the newest issued address), `ScRestHi` (their bits 32..39: stop 16..23, issued 8..15,
+  exit 0..7), `ScRestSig` (worker wakes StartDevice owed). The wake is one `signal_hpd` at the end of StartDevice when
+  `restart_flip::needs_worker_signal` (the reset clears both, so it fires only for a programming raised while the start
+  ran). The `ScRest*` values are never zeroed by `start_generation`: they describe the restart itself.
+* Pure logic and tests: `kmd_logic/src/restart_flip.rs`; the counter lists are `stall_diag::COUNTERS` (`ScRest*`) and
+  `flip_completion::COUNTERS` (`FkGen`, `FkStale`).
+
+### 20.4 State that survives StopDevice / StartDevice: the audit and the decisions
+
+Every process-lifetime static and `AdapterContext` field that holds scanout, flip, present, fence, vsync, retry, epoch,
+lease, bind-sequence, producer-stream or generation state was read for what StopDevice / StartDevice does to it
+(`kmd_render/src`, line numbers of the tree before this change). Nothing found makes a NEW-generation
+`SetVidPnSourceAddress` or worker programming Deferred, Superseded or refused for ever, and no stale static suppresses a
+worker wake. Decision column: RESET (already), CHANGED (this section), KEPT (on purpose), LEFT (unreset, judged harmless).
+
+| state | where | at a restart | decision |
+|---|---|---|---|
+| `last_primary_address` (the CRTC_VSYNC address) | `adapter/mod.rs:706`, zeroed at `:1403`, read `adapter/kobj.rs:898` | was zeroed at Stop and Start | CHANGED: seeded from `LAST_ISSUED` (H1) |
+| `FLIP_WORD`, `DONE_SEQ`, `FLIP_ISS`, `FLIP_PUB` | `ddi/stall_diag.rs:271,316-317` | zeroed in `start_generation` (the only record of the newest issued address was lost) | RESET; the address now also lives in `LAST_ISSUED`, which is KEPT |
+| `vidpn_programming`, `pending_vidpn_allocation` | `adapter/mod.rs:826,712` | zeroed by `reset_display_publication_state` | RESET; the state at the Stop edge is now recorded (`ScRestPend`), and a surviving programming wakes the worker |
+| `active_scanout_*`, `host_bound_scanout_resource`, `dedicated_scanout_*`, `primary_scanout_*` (generation bumped), epochs and leases, bind-sequence trio, `frame_watermark_*`, `scanout_refresh_pending`, `scanout_flush_inflight`, read ledger | `adapter/mod.rs` `:1388-1470`, `adapter/read_ledger.rs:508` | zeroed | RESET (H5) |
+| `committed_refresh_mhz` | `adapter/mod.rs:683`, `lifecycle.rs:319` | zeroed at Start | LEFT (H6) |
+| `last_completed_fence` | `adapter/mod.rs:553`, read/written `adapter/locks.rs:143-150`, `ddi/submit_command.rs:874-904` | NOT reset | LEFT: if dxgkrnl keeps its VidSch node the carried value is right, and zeroing a value dxgkrnl has seen risks bugcheck 0x119 (`submit_command.rs:1526`); `DmStl` closes it (H4) |
+| `ForeignScanout` `STATE` / `FENCES`, scanout-release book | `adapter/foreign_scanout.rs:47,53`, `virtio/scanout_release.rs:38` | `foreign_scanout_reset` | RESET; its `seq` is KEPT (the host must never see it go back) |
+| `foreign_flip` statics (`KNOB`, `WINDOW`, `FLYING`, `FAIL_UNTIL`, `REPEAT_GATE`, ...) | `virtio/foreign_flip.rs:90-249` | `forget()` from `retire_transport` | RESET; `drain_blocked()` cannot latch |
+| `rm_client`, `rm_present`, `sysmem`, `sysmem_flip` | `virtio/rm_client.rs:92,101` | `rm_client::forget` | RESET |
+| `RETRY_HANDLE`, `RETRY_ATTEMPTS` | `ddi/display.rs:2889-2890` | cleared at Start only (`lifecycle.rs:538`) | LEFT: heap-pointer key, budget 4, a collision costs one early GaveUp (which completes kept) |
+| `DEFER_HANDLE`, `DEFER_ATTEMPTS`, `DEFER_BUDGET` | `ddi/stall_diag.rs:842-843` | zeroed at Start; budget 0 = unlimited | RESET |
+| `ProducerCompletion` table | `adapter/producer.rs` | `start_transport` bumps the generation embedded in every stream key; the table is cleared when the old transport drops | KEPT (pages and generation counter on purpose) |
+| `SCANOUT_ALLOCS` (32 slots) | `ddi/create_allocation.rs:1602` | not cleared | KEPT: a new-serial allocation takes over a stale id (`:1620-1627`), a stale destroy withdraws by handle (`:2294`) |
+| `TRANSPORT_SERIAL`, `NEXT_WIRE_FENCE_BASE`, `scanout_timeline` ring | `adapter/mod.rs`, `virtio/gpu/mod.rs:1763` | monotonic | KEPT |
+| `scanout_retire_wanted` coalescing | `adapter/mod.rs:782`, `ddi/submit_command.rs:1084`, `ddi/hpd.rs:272` | zeroed at Stop | LEFT: a submit during StartDevice can have its single signal eaten by the worker's start-edge wait, which delays only the windowed-Blt retire edge, not flips |
+| `hpd_exited`, `config_change_pending`, `pending_refresh_resource`, `frame_watermark_fence`, `PUMP_BUSY` / `PUMP_AGAIN`, `WDDM_HEAD_DEADLINE_100NS` | `adapter/mod.rs`, `adapter/foreign_scanout.rs:56-57`, `virtio/gpu/mod.rs:495` | not reset | LEFT: one extra indication, one refused refresh, one spurious DPC |
+| `flip_keep` (incl. `MIRROR_PENDING`), `present_foreign`, `scanout_trace`, `stall_diag` counters | `lifecycle.rs:219,220,541`, `stall_diag::start_generation` | zeroed | RESET; diagnostic only. `ScRest*` are NOT zeroed (they describe the restart) |
+| `vsync_enabled`, `VsPowerMode` / `VsWatchdog` / `VsIdleWake` | `adapter/mod.rs:676`, `ddi/stall_diag.rs:342-344` | start forces the gate open; knobs re-read | RESET; `VsPowerMode` 0 quiesces the heartbeat on any non-D0 call (not restart specific) |
+
+The doc comment on `reset_display_publication_state` says `pnputil /restart-device` re-runs AddDevice and allocates a fresh context;
+section 19 says the context is kept (the Ex timers and the adapter survive). The two cannot both hold. `StartN` rising while
+`EntArm`, `EntHpdTh` and `EntVsTk` show the old generation's heartbeat and worker in the statics, together with a matching `HpdN`, says
+the context is reused; the fix is correct either way (`LAST_ISSUED` is a static).
+
+### 20.5 Hardware checklist
+
+After `pnputil /restart-device` with a Venus `d3d11_spin` window and DWM running (1920x1080 low rate first, then
+5120x1440@240):
+
+1. `VpPres` keeps rising, DWM's CPU time moves, the spin window animates, `FlipIss` and `FlipPub` rise together.
+2. Read `ScRestPend`, `ScRestAdr0`, `ScRestAddr`, `ScRestIss`, `ScRestHi`, `ScRestSig`: with an animating compositor
+   `ScRestAdr0` and `ScRestIss` are nonzero and `ScRestAddr` equals `ScRestIss` (low 32 bits). On a pre-fix image
+   `ScRestAddr` read 0 and that is the H1 signature.
+3. `SaLo` / `SaHi` and `VpLpa` just after the restart equal `ScRestIss` until the first new flip is programmed.
+4. `FkKeep`, `FkStale`, `FkGen`, `FkKeep05`, `FkKeep08`, `PBRetSite`, `VpPend`, `VpGate`, `VpPrF`, `PgStale`: small or 0.
+   A nonzero `FkStale` after a restart means H2 was also live.
+5. If DWM still stalls: `VsPendN`, `HpdLoopN`, `HpdSite`, `FlipIss - FlipPub - VpCoal` (14.5 rows 1c, 2, 2b), `DeferBudget` 240
+   as the A/B (H3), `DmStl` (H4), `VsCbSyncSt` (the heartbeat's notify status) and, before any recovery, `cdb -pv` stacks
+   of the stalled DWM plus the v328 rings (`Dx` / `Dd` / `Dz`, `Lost*`, `PgLast*`).
+6. Regression: a restart with an idle desktop, with the NVK spin app (`ForeignFlip` 0 and 1) and a plain boot
+   (`ScRestAddr` 0 on the first boot, where nothing was ever issued).
+
+### 20.6 Risks and what is not verified
+
+A kept or re-reported address names a picture that is not on the screen; dxgkrnl retires the flip and the screen shows the
+previous contents until the next programming (13.4). If the first new flip's address equals the seeded one (the segment
+allocator can hand the same address out again) dxgkrnl retires it a moment before it is programmed: a stale frame, not a
+stall. If dxgkrnl does not wait for the address of the newest issued flip (H1 wrong), the seed is inert (it reports an
+address that matches no flip, exactly as 0 did) and the stall has another cause: H3 and H4 are the next reads. Verified:
+host tests of `restart_flip`, the whole `kmd_render` through the stub harness with the error set identical to the base.
+NOT verified: anything on hardware, the WDK build, that dxgkrnl keeps its flip queue across the restart.

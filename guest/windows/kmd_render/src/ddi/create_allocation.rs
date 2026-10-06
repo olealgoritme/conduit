@@ -778,6 +778,17 @@ unsafe fn resolve_current_alloc(
     }
 }
 
+/// Whether `h` is one of our allocation contexts that belongs to an OLDER transport generation than
+/// the one `adapter` has up (`FkGen`: a flip naming an allocation that survived a device restart in
+/// dxgkrnl's tables). `false` for null, foreign, and current-generation handles. DISPATCH-safe
+/// (the same read `resolve_current_alloc` just made on this handle).
+///
+/// # Safety
+/// As [`resolve_alloc`].
+pub(crate) unsafe fn alloc_is_stale_generation(adapter: &AdapterContext, h: HANDLE) -> bool {
+    unsafe { resolve_alloc(h) }.is_some_and(|ctx| !adapter.is_current_generation(ctx.serial))
+}
+
 /// Geometry `DxgkDdiDescribeAllocation` reports, from a magic-checked handle.
 pub(crate) struct DescribeInfo {
     pub width: u32,
