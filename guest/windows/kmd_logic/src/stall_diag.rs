@@ -170,7 +170,7 @@ pub mod site {
 /// * `VsLiveT`: interrupt time (ms) the heartbeat block (`VsTickN` ... `VsWd*`) was last written. Every
 ///   value of that block is a snapshot as of `VsLiveT`: compare `VsTickT` with `VsLiveT`, and
 ///   `VsLiveT` with the uptime, before calling a heartbeat dead. The watchdog timer asks the worker
-///   to rewrite it every 2 s.
+///   to rewrite ten of its values every 2 s (the rest only after it acted, at most once per 2 s).
 /// * `VsCbIn`, `VsCbOut`: tick callbacks entered and returned (never zeroed; `VsCbIn` above
 ///   `VsCbOut` for longer than a tick is a blocked callback). `VsCbSyncB`, `VsCbSyncOk`,
 ///   `VsCbSyncSt`, `VsCbSyncT`: `DxgkCbSynchronizeExecution` calls the tick began and returned,
@@ -459,6 +459,10 @@ pub mod stop_sub {
     pub const REMOVE_ENTER: u32 = 20;
     pub const REMOVE_DROP: u32 = 21;
     pub const REMOVE_DONE: u32 = 22;
+    /// Written INSIDE `REMOVE_DROP`..`REMOVE_DONE` (so it follows 21 and precedes 22 in time), just
+    /// before `ExDeleteTimer(wait)` of the heartbeat and watchdog timers: a callback blocked in
+    /// `DxgkCbSynchronizeExecution` hangs that wait, and `StopSub` 23 names it.
+    pub const REMOVE_TIMER: u32 = 23;
 }
 
 // ---- knobs ---------------------------------------------------------------------------------
@@ -1551,6 +1555,7 @@ mod tests {
             assert!(w[0] < w[1]);
         }
         assert!(REMOVE_ENTER > DONE && REMOVE_DROP > REMOVE_ENTER && REMOVE_DONE > REMOVE_DROP);
+        assert!(REMOVE_TIMER > REMOVE_DONE);
     }
 
     #[test]

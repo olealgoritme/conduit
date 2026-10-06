@@ -1152,6 +1152,7 @@ full zero block once per generation even if nothing is ever seen.
 | `FlGSyncMs` | transport init (`flush_trace::init_from_registry`) | static | `FlGSyncEff` (now written at every init; before, only once a flush-gate Render was seen) |
 | `MsiVectors` | transport init (MSI plan) | local | `MsiVec` |
 | `VsyncRateMhz` | StartDevice | static | `VsRate` |
+| `VsPowerMode`, `VsWatchdog`, `VsIdleWake`, `VsWdTimer` (15.4, 19.3) | StartDevice (`stall_diag::reread_knobs`) | static | `VsPwrEff`, `VsWdgEff`, `VsIdlEff`, `VsWdTmEff` (every start, 0 included) |
 | `OutputTech` | each child-capabilities query | not cached | `OutTech` |
 | `FlipCapsX` | AddDevice and StartDevice (`AdapterKnobs::read`, `read_at_start`; section 18) | `AdapterContext::knobs` | `FlipCapsXEff`, `FlipCapsXMsk`, `FlipCapsRep` (written at every start, 0 included), `FlipCapV` (each caps query) |
 | `FlipQueueN` | each QueryAdapterInfo caps query | not cached | `FlipQueV` |
@@ -1468,6 +1469,7 @@ All read at every StartDevice from the service key (DWORD), mirrored with the va
 | `VsPowerMode` | 0 | 0 = v325: ANY non-D0 `DxgkDdiSetPowerState` of ANY uid quiesces the heartbeat; 1 = v326: adapter only | `VsPwrEff` |
 | `VsWatchdog` | 0 | 0 = off (v325); 1 = revive an armed-but-silent heartbeat; 2 = also re-arm a quiesced one while the adapter is in D0 (v326) | `VsWdgEff` |
 | `VsIdleWake` | 0 | 1 = the worker wakes 4 times a second while the heartbeat is armed (v326); needs `VsWatchdog` above 0 | `VsIdlEff` |
+| `VsWdTimer` | 1 | 1 = the independent 250 ms watchdog timer (19.3) runs; 0 = off (KMD 328). Re-arms an ARMED silent heartbeat whatever `VsWatchdog` says; never resurrects a quiesced one | `VsWdTmEff` |
 
 With the defaults the vsync/power/wait behaviour is v325's: the HPD worker waits exactly as it did (infinite when nothing is
 due), nothing arms the heartbeat but StartDevice and a D0 call, and a child's D3 stops it. Kept from v326 because they are
@@ -1986,7 +1988,7 @@ Nothing found proves a defect there, so v328 makes the next one nameable instead
 * **The infinite mutex waits are sliced, not bounded** (`sync::wait_logged`): 5 s slices, each expiry counted
   (`LkWaitN`, `LkWaitWh` 1 venus / 2 scanout / 3 content, `LkWaitT`, `LkWaitMs`) and the wait goes on, so mutual exclusion
   is never given up and nothing can proceed unlocked; a holder that never lets go shows in the next dump.
-* **Stop progress**: `StopSub` / `StopSubT` (`stall_diag::stop_sub`, 17 steps of StopDevice, 20-22 for RemoveDevice),
+* **Stop progress**: `StopSub` / `StopSubT` (`stall_diag::stop_sub`, 17 steps of StopDevice, 20-22 for RemoveDevice, and 23, written between 21 and 22 before the timer deletion waits: section 19.3),
   written to the registry BEFORE each step. `StopStg` / `StopMs` (stages 1-10) are unchanged. After a wedge the next
   boot's service key holds the last step entered: read `StopSub`, `StopSubT`, `PwrStg`, `PwrChSt`.
 
@@ -2083,20 +2085,39 @@ escape. Each tick (`AdapterContext::vsync_wd_tick`, DISPATCH, atomics and `ExSet
   counted `VsRevN` and `VsWdFixN`);
 * the same silence with a tick callback entered and not returned (`VsCbIn` above `VsCbOut`): count `VsWdHungN` and do not
   re-arm (a re-arm cannot unblock a callback);
-* every 8th tick (2 s), and at once after acting: ask the worker to write the heartbeat block (`request_live_publish`,
-  then `signal_hpd`; the worker calls `publish_live_if_wanted` after its watchdog call). This is what keeps the mirror
-  from going stale while the worker is otherwise asleep: `VsLiveT` is the time of the write.
+* every 8th tick (2 s): ask the worker to write ten live values (`VsLiveT`, `VsTickN`, `VsTickT`, `VsCbIn`, `VsCbOut`,
+  `VsWdTkN`, `VsWdTkT`, `VsWdAgeMs`, `VsWdFixN`, `VsWdHungN`; a value that did not change since its last write is
+  skipped, `stall_diag::rec_live`); after an action (a fix or a hang): the whole heartbeat block, but at most once per
+  2 s however often it acts (`vsync_wd::publish_plan`; a hang does not re-base the reference and acts on every tick, a fix
+  repeats about every 500 ms: neither may become 4 wakes and ~190 registry writes a second). The request is
+  `request_live_publish` then `signal_hpd`; the worker calls `publish_live_if_wanted` after its watchdog call. This is what
+  keeps the mirror from going stale while the worker is otherwise asleep: `VsLiveT` is the time of the write;
+* nothing at all while the adapter is not in D0: a heartbeat quiesce (`quiesce_vsync`) stops the timer and a D0 resume
+  restarts it, and its callback is a no-op outside D0, so the power-down and shutdown windows see no new activity.
+
+Independence from `VsWatchdog`: with `VsWatchdog` 0 (the default) the timer STILL re-arms an armed, silent heartbeat
+(`VsWdTimer` 1). It never resurrects a quiesced one: `vsync_wd::decide` requires `armed`, so the `VsWatchdog` 2 "Resume" of
+the old watchdog has no counterpart here. A revive that loses the race with a quiesce bumps nothing
+(`revive_heartbeat` checks `vsync_armed` before `VsRevN`).
 
 A healthy chain never meets it: the silence limit is 60 periods at 240 Hz. Cost: one DISPATCH callback and a few atomics
-every 250 ms, one worker wake and about 40 registry writes every 2 s. The wake shows as `HpdSgOth` and `HpdLoopN` rising
-about every 2 s on an idle desktop: that is this timer, not a regression. It also changes the `HpdWait` accounting not at
-all (the worker's wait stays infinite; the event is set). `VsWdTimer` 0 turns the timer off (KMD 328 behaviour).
+every 250 ms, and on an idle desktop one worker wake and three or four registry writes every 2 s (`VsLiveT`, `VsWdTkN`,
+`VsWdTkT` always change; the rest only when they move). The wake shows as `HpdSgOth` and `HpdLoopN` rising about every 2 s:
+that is this timer, not a regression. A side effect of the wakes: `dump_periodic` has a 128-pass gate, so on an idle desktop
+the ~120-write `Vp*` dump now runs about every 256 s instead of never. It changes the `HpdWait` accounting not at all (the
+worker's wait stays infinite; the event is set). `VsWdTimer` 0 turns the timer off (KMD 328 behaviour).
+
+Timer lifetime (review fix): the watchdog timer, unlike the heartbeat, has no KTIMER fallback, so its pointer must never
+read 0 while a callback can run. The callback loads it once and returns on 0; `delete_vsync_ex_timer` publishes 0 only AFTER
+`ExDeleteTimer(wait)` returned (which cannot return while a callback runs), for both timers. Before `ExDeleteTimer` it writes
+`StopSub` 23 (`stop_sub::REMOVE_TIMER`, written between 21 and 22): a heartbeat callback blocked in
+`DxgkCbSynchronizeExecution` hangs that wait with no timeout, and `StopSub` 23 with `VsCbIn` above `VsCbOut` would name it.
 
 ### 19.4 New breadcrumbs (all in the heartbeat block, written by `publish_vsync_ticks`)
 
 | value | meaning |
 |---|---|
-| `VsLiveT` | interrupt time (ms) the heartbeat block was written; EVERY value below and `VsTickN`/`VsTickT`/`VsRevN`/... is as of this time |
+| `VsLiveT` | interrupt time (ms) the heartbeat block was written (by the 2 s ten-value write or a full write); EVERY value below and `VsTickN`/`VsTickT`/`VsRevN`/... is as of the last full write, and the ten live ones (`VsLiveT`, `VsTickN`, `VsTickT`, `VsCbIn`, `VsCbOut`, `VsWdTkN`, `VsWdTkT`, `VsWdAgeMs`, `VsWdFixN`, `VsWdHungN`) as of `VsLiveT` |
 | `VsCbIn`, `VsCbOut` | tick callbacks entered / returned (either timer source; NEVER zeroed). `VsCbIn` > `VsCbOut` for more than a tick is a blocked callback |
 | `VsCbSyncB`, `VsCbSyncOk` | `DxgkCbSynchronizeExecution` calls the tick began / returned (any status); `B` > `Ok` is a hung sync |
 | `VsCbSyncSt`, `VsCbSyncT` | status of the last return; interrupt ms the last sync began |
