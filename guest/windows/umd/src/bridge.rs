@@ -530,8 +530,6 @@ pub(crate) struct ForeignLayout {
     pub(crate) fourcc: u32,
 }
 
-/// A foreign resource id minted for one texture.
-#[derive(Clone, Copy, Default, Debug)]
 /// `mode` of [`BridgeDevice::flush_gate_point`] (dxvk_bridge.h kFlushGate*).
 pub(crate) const FLUSH_GATE_STREAM: u32 = 0;
 pub(crate) const FLUSH_GATE_WIRE: u32 = 1;
@@ -552,6 +550,8 @@ pub(crate) enum FlushGatePoint {
     Failed,
 }
 
+/// A foreign resource id minted for one texture.
+#[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct ForeignIdentity {
     pub(crate) resource_id: u32,
     pub(crate) ctx_id: u32,
