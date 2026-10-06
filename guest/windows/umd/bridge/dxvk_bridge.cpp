@@ -1342,6 +1342,29 @@ std::int32_t HeliosDxvkDevice::nvk_scanout_present(
   });
 }
 
+bool HeliosDxvkDevice::nvk_scanout_frame(std::size_t d3d11_resource_ptr,
+                                         std::uint64_t* sequence,
+                                         std::uint32_t* generation) const noexcept {
+  return bridge_guard("nvk_scanout_frame", false, [&]() -> bool {
+    *sequence = 0;
+    *generation = 0;
+    // helios_icd_interface.h version 5; an older NVK leaves the slot NULL
+    // (nvk_icd_api zeroes the table before the ICD fills its prefix).
+    if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm
+     || !impl->icd.scanout_frame)
+      return false;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memory_offset = 0;
+    if (!texture_image_memory(d3d11_resource_ptr, &image, &memory, &memory_offset)
+     || memory_offset != 0)
+      return false;
+    return impl->icd.scanout_frame(impl->device->vkd()->device(), memory, sequence,
+                                   generation) == VK_SUCCESS
+        && *sequence != 0 && *generation != 0;
+  });
+}
+
 std::uint32_t HeliosDxvkDevice::nvk_icd_caps() const noexcept {
   return impl && impl->backend == helios_bridge::IcdBackend::NvkRm ? impl->icd.caps : 0u;
 }

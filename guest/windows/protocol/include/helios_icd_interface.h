@@ -41,7 +41,7 @@ extern "C" {
 #define HELIOS_ICD_INTERFACE_EXPORT "helios_icd_interface_v2"
 /* The export keeps its name; version 3 only appends entries (and caps 4..6),
  * version 4 appends memory_res_plane1 (and cap 8). */
-#define HELIOS_ICD_INTERFACE_VERSION 4u
+#define HELIOS_ICD_INTERFACE_VERSION 5u
 
 enum helios_icd_backend {
    HELIOS_ICD_BACKEND_VENUS = 1,
@@ -238,6 +238,17 @@ struct helios_icd_api {
     * single-plane one (nothing to add to the version-1 trailer). */
    VkResult (*memory_res_plane1)(VkDevice device, VkImage image,
                                  struct helios_icd_plane *plane1);
+
+   /* ---- version 5 (size covers it; NULL = not supported) ----------------
+    * The KMD's names for the frame `memory` was last put on scanout with:
+    * *sequence = the out_seq SCANOUT_PRESENT returned for it, *generation =
+    * the out_generation SCANOUT_SET returned for the live user source
+    * (helios_nvrm_escape.h). For the already-on-scanout present tag
+    * (helios_onscanout.h, docs/zero-copy-present.md section 15). VK_SUCCESS
+    * with both nonzero; VK_NOT_READY (both 0) when no frame of this memory
+    * was minted by a live KMD source. */
+   VkResult (*scanout_frame)(VkDevice device, VkDeviceMemory memory,
+                             uint64_t *sequence, uint32_t *generation);
 };
 
 typedef VkResult (*PFN_helios_icd_interface_v2)(uint32_t version, struct helios_icd_api *out);

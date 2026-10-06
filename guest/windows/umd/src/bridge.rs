@@ -161,6 +161,15 @@ mod ffi {
             self: &HeliosDxvkDevice,
             d3d11_resource_ptr: usize,
         ) -> i32;
+        /// NVK: the KMD's seq and source generation of the texture's latest
+        /// scanout frame (already-on-scanout present tag). False without them.
+        /// # Safety: a live `ID3D11Resource*`; both pointers live writable storage.
+        unsafe fn nvk_scanout_frame(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+            sequence: *mut u64,
+            generation: *mut u32,
+        ) -> bool;
         /// NVK RM fences (S4): a fence for everything submitted so far, for a
         /// WDDM present marker. 0 = `*fence_handle` is the caller's.
         /// # Safety: both pointers are live writable storage.
@@ -656,6 +665,22 @@ pub(crate) struct PresentStreamCorrelation {
     pub(crate) rm_fence_handle: u32,
     /// Diagnostic only: the timeline value behind `rm_fence_handle`.
     pub(crate) rm_fence_value: u64,
+    /// NVK: the frame is already on scanout 0 through the user foreign-scanout
+    /// source: the `HERF` marker carries the `HOSC` tag (`helios_onscanout.h`)
+    /// so the KMD can complete the Blt present without copying. `None` = no
+    /// claim (the ordinary Blt).
+    pub(crate) on_scanout: Option<OnScanoutClaim>,
+}
+
+/// The already-on-scanout claim: the KMD's own names for the frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OnScanoutClaim {
+    /// `out_seq` of the frame's `SCANOUT_PRESENT`. Nonzero.
+    pub(crate) sequence: u64,
+    /// `out_generation` of the live source's `SCANOUT_SET`. Nonzero.
+    pub(crate) generation: u32,
+    /// Helios resource id of the presented allocation, 0 = not stated.
+    pub(crate) resource_id: u32,
 }
 
 impl PresentStreamCorrelation {
@@ -819,6 +844,16 @@ impl BridgeDevice {
             1 => None,
             _ => Some(false),
         }
+    }
+
+    /// NVK: `(sequence, generation)` of `res`'s latest scanout frame, as the
+    /// KMD minted them (already-on-scanout present tag).
+    pub(crate) fn nvk_scanout_frame(&self, res: &ID3D11Resource) -> Option<(u64, u32)> {
+        let d = self.get()?;
+        let (mut seq, mut generation) = (0u64, 0u32);
+        // SAFETY: `res` is borrowed live for the call; both out-pointers borrow locals.
+        unsafe { d.nvk_scanout_frame(res.as_raw() as usize, &mut seq, &mut generation) }
+            .then_some((seq, generation))
     }
 
     /// NVK RM fences (S4): a fence (handle, diagnostic timeline value) for
