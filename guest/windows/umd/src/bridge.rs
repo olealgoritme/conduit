@@ -168,6 +168,17 @@ mod ffi {
         /// Flush gate (docs/flush-gate.md): flush, then the point the HEFL
         /// packet carries. 0 nothing new, 1 ready, -1 unavailable, -2 failed.
         /// # Safety: every pointer is live writable storage.
+        /// Hand-off ledger: give a shared resource its key now.
+        /// # Safety: a live `ID3D11Resource*`.
+        unsafe fn handoff_register(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize);
+        /// Hand-off ledger: publish a point on `resources`. 0 nothing new,
+        /// 1 published, -1 unavailable/full, -2 failed.
+        /// # Safety: `resources` addresses `resource_count` live resources.
+        unsafe fn handoff_publish(
+            self: &HeliosDxvkDevice,
+            resources: *const usize,
+            resource_count: u32,
+        ) -> i32;
         unsafe fn flush_gate_point(
             self: &HeliosDxvkDevice,
             mode: u32,
@@ -804,6 +815,23 @@ impl BridgeDevice {
         if let Some(d) = self.get() {
             d.nvk_rm_fence_close(fence);
         }
+    }
+
+    /// Hand-off ledger: `res` (a cross-process shared resource) gets its key.
+    pub(crate) fn handoff_register(&self, res: usize) {
+        if let Some(d) = self.get() {
+            // SAFETY: the caller passes a live resource pointer.
+            unsafe { d.handoff_register(res) };
+        }
+    }
+
+    /// Hand-off ledger: publish this device's next point on `resources`.
+    pub(crate) fn handoff_publish(&self, resources: &[usize]) -> i32 {
+        let Some(d) = self.get() else {
+            return -1;
+        };
+        // SAFETY: the slice borrows live resource pointers for the call.
+        unsafe { d.handoff_publish(resources.as_ptr(), resources.len() as u32) }
     }
 
     /// Flush gate: flush and get what the HEFL packet carries (see

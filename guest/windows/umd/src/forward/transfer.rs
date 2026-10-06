@@ -346,6 +346,30 @@ pub(crate) unsafe fn flush_gate(h: Hdevice, context: &ID3D11DeviceContext) {
         return;
     }
     let cpu_wait = gate_cpu_wait();
+    // The hand-off ledger: publish a point of this device on every shared
+    // resource it holds; readers in other processes wait for its completion
+    // in their submission worker. Nobody waits here.
+    if ledger_enabled() {
+        let all = shared_resources(dev, true);
+        match dev.dxvk.handoff_publish(&all) {
+            0 => return,
+            1 => {
+                LEDGER_HANDOFFS.fetch_add(1, Ordering::Relaxed);
+                if cpu_wait == GateCpuWait::Forced {
+                    nvk_keyed_flush_wait(h, context, true);
+                }
+                return;
+            }
+            _ => {
+                // No ledger (or full): the releaser completes its work.
+                FLUSH_GATE_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                if cpu_wait != GateCpuWait::Off {
+                    nvk_keyed_flush_wait(h, context, true);
+                }
+                return;
+            }
+        }
+    }
     let hefl = hefl_enabled();
     if dev.dxvk.is_nvk() {
         if hefl && crate::knobs::nvk_rm_fence() && crate::scanout_acquire::nvrm_flush_gate_capable(dev) {
@@ -403,6 +427,38 @@ pub(crate) unsafe fn flush_gate(h: Hdevice, context: &ID3D11DeviceContext) {
     }
 }
 
+static LEDGER_HANDOFFS: AtomicUsize = AtomicUsize::new(0);
+
+/// `HELIOS_HANDOFF_LEDGER=0` (process environment): the previous hand-off
+/// handling (Venus producer publication, NVK releaser CPU wait, optional HEFL)
+/// instead of the ledger.
+fn ledger_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("HELIOS_HANDOFF_LEDGER").is_ok_and(|v| v == "0"))
+}
+
+/// The registered shared resources of `dev` as `ID3D11Resource*`; opened ones
+/// too when `opened`.
+fn shared_resources(dev: &crate::device_funcs::HeliosDevice, opened: bool) -> Vec<usize> {
+    let list = lock_ignore_poison(&dev.nvk_keyed_resources);
+    let mut out = Vec::with_capacity(list.len());
+    for &(key, created) in list.iter() {
+        if !created && !opened {
+            continue;
+        }
+        // SAFETY: `key` is the live pDrvPrivate of a resource of this device
+        // (destroy removes it from the list before the slot goes).
+        if let Some(res) = unsafe {
+            load_resource(ddi::D3D10DDI_HRESOURCE {
+                pDrvPrivate: key as *mut c_void,
+            })
+        } {
+            out.push(res.as_raw() as usize);
+        }
+    }
+    out
+}
+
 /// `HELIOS_FLUSH_GATE_HEFL=1` (process environment): also send the `HEFL`
 /// flush-gate packet (needs the KMD capability). Off by default: see
 /// `flush_gate`.
@@ -447,23 +503,7 @@ fn publish_list(dev: &crate::device_funcs::HeliosDevice) -> Vec<usize> {
     if mode == 0 {
         return Vec::new();
     }
-    let list = lock_ignore_poison(&dev.nvk_keyed_resources);
-    let mut out = Vec::with_capacity(list.len());
-    for &(key, created) in list.iter() {
-        if !created && mode != 2 {
-            continue;
-        }
-        // SAFETY: `key` is the live pDrvPrivate of a resource of this device
-        // (destroy removes it from the list before the slot goes).
-        if let Some(res) = unsafe {
-            load_resource(ddi::D3D10DDI_HRESOURCE {
-                pDrvPrivate: key as *mut c_void,
-            })
-        } {
-            out.push(res.as_raw() as usize);
-        }
-    }
-    out
+    shared_resources(dev, mode == 2)
 }
 
 /// One `HEFL` (`HeliosFlushGateCmd`, 48 bytes) through `pfnRenderCb` on the

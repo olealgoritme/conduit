@@ -1,0 +1,214 @@
+Helios DXVK fork: wait for other processes' hand-offs of shared images
+
+Conduit guest/windows/docs/shared-surfaces.md section 4. Applied after 0006
+by ci/windows/Build-Driver.ps1.
+
+A keyed-mutex acquirer (or any reader after a cross-process flush) reads a
+shared image through the Venus ring or NVK's RM channel, which dxgkrnl's
+keyed mutex does not hold. The Helios UMD keeps a session-wide hand-off
+ledger: at a hand-off the releaser publishes "device record d, point p" for
+each shared resource (by KMD resource id), and its fence worker stores the
+point's GPU completion. This patch is the reader's half:
+
+- HeliosHandoffHooks (dxvk_helios_backend.h): sample/wait, installed by the
+  UMD.
+- DxvkImage::heliosHandoffKey / setHeliosHandoffKey: the resource id (an
+  import has it from its sharing info, the UMD sets it on its own images).
+- heliosPresentWaitBeforeRefresh samples the ledger for any shared image it
+  reads (copy source, sampled view) and DxvkCommandList::waitHandoff records
+  the point; the submission worker waits for it beside the producer waits,
+  bounded. heliosNoteSampledShared now notes every shared image while the
+  hooks are installed, so a creator reading what an opener wrote waits too.
+
+diff --git a/src/dxvk/dxvk_cmdlist.cpp b/src/dxvk/dxvk_cmdlist.cpp
+index b5b13cb2..3f6961cd 100644
+--- a/src/dxvk/dxvk_cmdlist.cpp
++++ b/src/dxvk/dxvk_cmdlist.cpp
+@@ -2,6 +2,7 @@
+ #include <chrono>
+ 
+ #include "dxvk_cmdlist.h"
++#include "dxvk_helios_backend.h"
+ #include "dxvk_device.h"
+ #include "dxvk_helios_feed_trace.h"
+ 
+@@ -492,12 +493,25 @@ namespace dxvk {
+       }
+       if (stopped.load(std::memory_order_acquire)) return VK_ERROR_DEVICE_LOST;
+     }
++    if (!m_handoffWaits.empty()) {
++      if (const auto* hooks = heliosHandoffHooks()) {
++        for (const auto& wait : m_handoffWaits) {
++          // Bounded: a publisher that died or a lost point costs this list
++          // at most two seconds, never the device.
++          for (uint32_t i = 0; i < 40 && !stopped.load(std::memory_order_acquire); i++) {
++            if (hooks->wait(wait.first, wait.second, 50000000ull))
++              break;
++          }
++        }
++      }
++    }
+     return VK_SUCCESS;
+   }
+ 
+   void DxvkCommandList::reset() {
+     m_producerWaits.clear();
+     m_producerSignals.clear();
++    m_handoffWaits.clear();
+     resetCheckpoints();
+ 
+     // We will re-apply heap bindings first thing in a
+diff --git a/src/dxvk/dxvk_cmdlist.h b/src/dxvk/dxvk_cmdlist.h
+index 9e42d861..8051208e 100644
+--- a/src/dxvk/dxvk_cmdlist.h
++++ b/src/dxvk/dxvk_cmdlist.h
+@@ -417,6 +417,22 @@ namespace dxvk {
+ 
+     VkResult waitProducers(const std::atomic<bool>& stopped);
+ 
++    /**
++     * \brief Helios: wait for another process's hand-off point
++     *
++     * The submission worker waits (dxvk_helios_backend.h hand-off hooks)
++     * before this list's first submission, beside the producer waits.
++     */
++    void waitHandoff(uint32_t key, uint64_t point) {
++      for (auto& known : m_handoffWaits) {
++        if (known.first == key) {
++          if (point > known.second) known.second = point;
++          return;
++        }
++      }
++      m_handoffWaits.push_back({ key, point });
++    }
++
+     void trackProducer(const Rc<HeliosProducerOperation>& operation) {
+       m_producerSignals.push_back(operation);
+     }
+@@ -1396,6 +1412,7 @@ namespace dxvk {
+ 
+     small_vector<DxvkFenceValuePair, 4> m_waitSemaphores;
+     small_vector<HeliosProducerDependency, 4> m_producerWaits;
++    small_vector<std::pair<uint32_t, uint64_t>, 4> m_handoffWaits;
+     small_vector<Rc<HeliosProducerOperation>, 4> m_producerSignals;
+     small_vector<DxvkFenceValuePair, 4> m_signalSemaphores;
+ 
+diff --git a/src/dxvk/dxvk_context.cpp b/src/dxvk/dxvk_context.cpp
+index f7d03e43..3b674fda 100644
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ -9824,6 +9824,17 @@ namespace dxvk {
+         m_cmd->waitFence(captured->externalSemaphore, captured->epoch);
+       return *captured;
+     }
++    // Cross-process hand-off: another process's last published point for
++    // this shared image (keyed mutex or flush hand-off), waited by the
++    // submission worker. Any shared image, imported or our own.
++    if (image->info().shared) {
++      if (const auto* hooks = heliosHandoffHooks()) {
++        if (const uint32_t key = image->heliosHandoffKey()) {
++          if (const uint64_t point = hooks->sample(key))
++            m_cmd->waitHandoff(key, point);
++        }
++      }
++    }
+     if (image->info().sharing.mode != DxvkSharedHandleMode::Import)
+       return { };
+     if (image->info().sharing.heliosDedicatedPresentBuffer)
+@@ -9846,7 +9857,11 @@ namespace dxvk {
+   }
+ 
+   void DxvkContext::heliosNoteSampledShared(DxvkImage* image) {
+-    if (image->info().sharing.mode != DxvkSharedHandleMode::Import) return;
++    // Imported images for the producer wait, and any shared image for the
++    // hand-off ledger (heliosPresentWaitBeforeRefresh).
++    if (image->info().sharing.mode != DxvkSharedHandleMode::Import
++     && !(image->info().shared && heliosHandoffHooks()))
++      return;
+     for (const auto& known : m_heliosImportedReads)
+       if (known.ptr() == image) return;
+     m_heliosImportedReads.emplace_back(image);
+diff --git a/src/dxvk/dxvk_helios_backend.h b/src/dxvk/dxvk_helios_backend.h
+index 56224b43..b61fbcbf 100644
+--- a/src/dxvk/dxvk_helios_backend.h
++++ b/src/dxvk/dxvk_helios_backend.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <atomic>
++#include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
+ 
+@@ -51,6 +53,33 @@ namespace dxvk {
+     uint32_t        reserved;
+   };
+ 
++  /**
++   * \brief Helios: cross-process hand-off ledger hooks
++   *
++   * Installed once by the Helios UMD (Conduit docs/shared-surfaces.md section
++   * 4). `sample` answers the latest hand-off point another process published
++   * for a shared resource (by its KMD resource id), 0 when none; `wait` blocks
++   * until that point's GPU work is done, false on timeout. A read of a shared
++   * image samples at recording time and the submission worker waits before
++   * submitting, so the acquirer of a keyed mutex (or any reader after a
++   * cross-process flush) is ordered behind the releaser's GPU work on any
++   * backend, and nothing blocks the releaser or the adapter's queue.
++   */
++  struct HeliosHandoffHooks {
++    uint64_t (*sample)(uint32_t key);
++    bool (*wait)(uint32_t key, uint64_t point, uint64_t timeoutNs);
++  };
++
++  inline std::atomic<const HeliosHandoffHooks*> g_heliosHandoffHooks = { nullptr };
++
++  inline void heliosSetHandoffHooks(const HeliosHandoffHooks* hooks) {
++    g_heliosHandoffHooks.store(hooks, std::memory_order_release);
++  }
++
++  inline const HeliosHandoffHooks* heliosHandoffHooks() {
++    return g_heliosHandoffHooks.load(std::memory_order_acquire);
++  }
++
+   constexpr VkStructureType VK_STRUCTURE_TYPE_EXPORT_MEMORY_RESOURCE_INFO_HELIOS =
+     VkStructureType(1000384003);
+ 
+diff --git a/src/dxvk/dxvk_image.h b/src/dxvk/dxvk_image.h
+index a7248650..46b08c8e 100644
+--- a/src/dxvk/dxvk_image.h
++++ b/src/dxvk/dxvk_image.h
+@@ -946,6 +946,25 @@ namespace dxvk {
+       return m_heliosStagingImage;
+     }
+ 
++    /**
++     * \brief Helios hand-off ledger key (the KMD resource id)
++     *
++     * An imported image has it from its sharing info; the creator's image
++     * gets it from the UMD the first time it publishes a hand-off point.
++     * \returns The key, 0 when the image is not in the ledger
++     */
++    uint32_t heliosHandoffKey() const {
++      const uint32_t key = m_heliosHandoffKey.load(std::memory_order_relaxed);
++      if (key)
++        return key;
++      return m_info.sharing.mode == DxvkSharedHandleMode::Import
++        ? m_info.sharing.heliosResourceId : 0u;
++    }
++
++    void setHeliosHandoffKey(uint32_t key) {
++      m_heliosHandoffKey.store(key, std::memory_order_relaxed);
++    }
++
+     /**
+      * \brief Whether this is a Helios debug-magenta private image
+      *
+@@ -1057,6 +1076,7 @@ namespace dxvk {
+     // resource; per-frame vkCmdCopyImage(alias -> private image) detiles the
+     // creator's OPTIMAL layout (a linear buffer copy cannot).
+     Rc<DxvkImage>               m_heliosStagingImage = nullptr;
++    std::atomic<uint32_t> m_heliosHandoffKey = { 0u };
+     // Device pointer for constructing the internal alias image during
+     // allocateStorageWithUsage (only Helios uses this).
+     DxvkDevice*                 m_heliosDevice = nullptr;

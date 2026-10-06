@@ -3,7 +3,10 @@
 // through D3DKMTOpenResource / DxgkDdiOpenAllocation like any app.
 //
 //   d3d11_share.exe [nt|nt-keyed|kmt] [width=1920 height=1080]
-//   d3d11_share.exe keyed-load [width height [rounds=20 [copies=400]]]
+//   d3d11_share.exe keyed-load [width height [rounds=20 [copies=400 [perf]]]]
+//
+// `perf` skips the readbacks (no correctness check) and reports the
+// producer's flush+release time and hand-offs per second.
 //
 // keyed-load checks keyed-mutex ordering under load (see keyed_load below).
 //
@@ -231,7 +234,7 @@ static ID3D11Texture2D *make_plain(ID3D11Device1 *dev, UINT w, UINT h) {
   return t;
 }
 
-static int keyed_load_opener(UINT w, UINT h, UINT rounds) {
+static int keyed_load_opener(UINT w, UINT h, UINT rounds, bool perf) {
   role = "B";
   ID3D11Device1 *dev = nullptr;
   ID3D11DeviceContext *ctx = nullptr;
@@ -253,7 +256,7 @@ static int keyed_load_opener(UINT w, UINT h, UINT rounds) {
       check("AcquireSync(1)", false);
       return 1;
     }
-    long bad = count_bad(dev, ctx, tex, w, 0, h, round_seed(r, false), false);
+    long bad = perf ? 0 : count_bad(dev, ctx, tex, w, 0, h, round_seed(r, false), false);
     if (bad) {
       bad_rounds++;
       if (bad > worst) worst = bad;
@@ -273,7 +276,7 @@ static int keyed_load_opener(UINT w, UINT h, UINT rounds) {
   return failed;
 }
 
-static int keyed_load(UINT w, UINT h, UINT rounds, UINT load) {
+static int keyed_load(UINT w, UINT h, UINT rounds, UINT load, bool perf) {
   ID3D11Device1 *dev = nullptr;
   ID3D11DeviceContext *ctx = nullptr;
   if (!make_device(&dev, &ctx)) {
@@ -308,7 +311,8 @@ static int keyed_load(UINT w, UINT h, UINT rounds, UINT load) {
 
   char self[MAX_PATH], cmd[1024];
   GetModuleFileNameA(nullptr, self, sizeof(self));
-  std::snprintf(cmd, sizeof(cmd), "\"%s\" open keyed-load %u %u %u", self, w, h, rounds);
+  std::snprintf(cmd, sizeof(cmd), "\"%s\" open keyed-load %u %u %u %u", self, w, h, rounds,
+                perf ? 1u : 0u);
   STARTUPINFOA si{};
   si.cb = sizeof(si);
   PROCESS_INFORMATION pi{};
@@ -321,15 +325,18 @@ static int keyed_load(UINT w, UINT h, UINT rounds, UINT load) {
   read_flush_gate_counters(counters_before);
 
   UINT bad_rounds = 0;
-  LARGE_INTEGER f, t0, t1;
+  LARGE_INTEGER f, t0, t1, loop0, loop1;
   QueryPerformanceFrequency(&f);
   double release_ms = 0;
+  QueryPerformanceCounter(&loop0);
   for (UINT r = 0; r < rounds; r++) {
     write_rows(ctx, pat, w, 0, h, round_seed(r, false));
     for (UINT i = 0; i < load; i++) ctx->CopyResource(tex, (i & 1) ? pat : junk);
     ctx->CopyResource(tex, pat);
-    ctx->Flush();
+    // The producer's cost of a hand-off: flush (where a releaser-side CPU
+    // wait would drain the GPU) and the release.
     QueryPerformanceCounter(&t0);
+    ctx->Flush();
     km->ReleaseSync(1);
     QueryPerformanceCounter(&t1);
     release_ms += 1000.0 * double(t1.QuadPart - t0.QuadPart) / double(f.QuadPart);
@@ -337,10 +344,13 @@ static int keyed_load(UINT w, UINT h, UINT rounds, UINT load) {
       check("AcquireSync(2)", false);
       break;
     }
-    if (count_bad(dev, ctx, tex, w, h / 2, h, round_seed(r, true), false)) bad_rounds++;
+    if (!perf && count_bad(dev, ctx, tex, w, h / 2, h, round_seed(r, true), false)) bad_rounds++;
   }
-  std::printf("       A: %u rounds of %u copies, ReleaseSync took %.2f ms on average\n", rounds, load,
-              release_ms / rounds);
+  QueryPerformanceCounter(&loop1);
+  const double loop_s = double(loop1.QuadPart - loop0.QuadPart) / double(f.QuadPart);
+  std::printf("       A: %u rounds of %u copies, flush+ReleaseSync took %.3f ms on average, "
+              "%.0f hand-offs/s (2 per round)%s\n", rounds, load, release_ms / rounds,
+              2.0 * rounds / loop_s, perf ? ", perf mode: no readbacks" : "");
   check("every round, A saw B's writes at its AcquireSync", bad_rounds == 0);
   Sleep(500); // the KMD publishes on the next present edge (DWM)
   DWORD counters_after[kFlushGateCounterCount];
@@ -367,13 +377,15 @@ static int keyed_load(UINT w, UINT h, UINT rounds, UINT load) {
 int main(int argc, char **argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   if (argc >= 6 && !std::strcmp(argv[1], "open") && !std::strcmp(argv[2], "keyed-load"))
-    return keyed_load_opener(UINT(std::atoi(argv[3])), UINT(std::atoi(argv[4])), UINT(std::atoi(argv[5])));
+    return keyed_load_opener(UINT(std::atoi(argv[3])), UINT(std::atoi(argv[4])), UINT(std::atoi(argv[5])),
+                             argc > 6 && std::atoi(argv[6]) != 0);
   if (argc >= 5 && !std::strcmp(argv[1], "open"))
     return opener(argv[2], UINT(std::atoi(argv[3])), UINT(std::atoi(argv[4])), argc > 5 ? argv[5] : "0");
   if (argc > 1 && !std::strcmp(argv[1], "keyed-load")) {
     std::printf("       A: mode keyed-load, HELIOS_ICD=%s\n", std::getenv("HELIOS_ICD") ? std::getenv("HELIOS_ICD") : "(unset)");
     return keyed_load(argc > 3 ? UINT(std::atoi(argv[2])) : 1920, argc > 3 ? UINT(std::atoi(argv[3])) : 1080,
-                      argc > 4 ? UINT(std::atoi(argv[4])) : 20, argc > 5 ? UINT(std::atoi(argv[5])) : 400);
+                      argc > 4 ? UINT(std::atoi(argv[4])) : 20, argc > 5 ? UINT(std::atoi(argv[5])) : 400,
+                      argc > 6 && !std::strcmp(argv[6], "perf"));
   }
 
   const char *mode = argc > 1 ? argv[1] : "nt";

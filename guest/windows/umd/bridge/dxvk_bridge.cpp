@@ -357,6 +357,13 @@ struct HeliosDxvkDeviceImpl {
   std::mutex flush_gate_mutex;
   std::uint64_t flush_gate_seq = UINT64_MAX;
 
+  // Hand-off ledger (helios_handoff): this device's record, its local
+  // timeline and last point. Guarded by flush_gate_mutex.
+  std::uint32_t handoff_device = UINT32_MAX;
+  bool handoff_failed = false;
+  dxvk::Rc<dxvk::DxvkFence> handoff_fence;
+  std::uint64_t handoff_value = 0;
+
   ~HeliosDxvkDeviceImpl() {
     if (vehicle_semaphore_handle) CloseHandle(vehicle_semaphore_handle);
     if (context) context->Release();
@@ -443,6 +450,278 @@ namespace {
     return *image != VK_NULL_HANDLE && *memory != VK_NULL_HANDLE;
   }
 }
+
+// ---- Cross-process hand-off ledger (docs/shared-surfaces.md section 4) -----
+//
+// One page set per Windows session ("Local\\HeliosHandoffLedger"), shared by
+// every process with the Helios UMD. At a hand-off (a flush of a device that
+// holds cross-process shared resources) the releaser writes, for each of those
+// resources keyed by its KMD resource id, "device record d, point p"; a fence
+// worker of the releaser's DXVK device stores `completed = p` into record d
+// when the GPU finished everything recorded before the hand-off. A reader of a
+// shared image samples the slot when it records the read and its submission
+// worker waits until record d's `completed` reaches p (DXVK patch 0007). So the
+// releaser never waits, the acquirer waits only for that producer, and nothing
+// heads the adapter's queue, on Venus and NVK alike.
+namespace helios_handoff {
+  constexpr std::uint32_t kMagic   = 0x4C474448u; // 'HDGL'
+  constexpr std::uint32_t kDevices = 65536u;      // never reused within a session
+  constexpr std::uint32_t kSlots   = 32768u;      // keys, never freed
+  constexpr std::uint32_t kProbe   = 64u;
+  constexpr std::uint64_t kPointMask = (1ull << 48) - 1ull;
+
+  struct Device {
+    std::atomic<std::uint32_t> pid;
+    std::uint32_t reserved;
+    std::atomic<std::uint64_t> completed;
+  };
+  struct Slot {
+    std::atomic<std::uint32_t> key;
+    std::uint32_t reserved;
+    std::atomic<std::uint64_t> packed; // device << 48 | point
+  };
+  struct Table {
+    std::atomic<std::uint32_t> magic;
+    std::uint32_t version;
+    std::atomic<std::uint32_t> next_device;
+    std::uint32_t reserved;
+    Device devices[kDevices];
+    Slot slots[kSlots];
+  };
+  static_assert(sizeof(Device) == 16 && sizeof(Slot) == 16, "ledger layout");
+
+  Table* table() {
+    static Table* s_table = []() -> Table* {
+      // Every principal of the session (DWM runs as its own user) may map it.
+      SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, FALSE };
+      PSECURITY_DESCRIPTOR sd = nullptr;
+      if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;GA;;;WD)(A;;GA;;;SY)(A;;GA;;;AC)S:(ML;;NW;;;LW)", SDDL_REVISION_1, &sd, nullptr))
+        sa.lpSecurityDescriptor = sd;
+      HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, sa.lpSecurityDescriptor ? &sa : nullptr,
+        PAGE_READWRITE, 0, DWORD(sizeof(Table)), L"Local\\HeliosHandoffLedger");
+      if (sd)
+        LocalFree(sd);
+      if (!mapping)
+        return nullptr;
+      auto* t = static_cast<Table*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Table)));
+      // The view keeps the section alive; the handle is not needed.
+      CloseHandle(mapping);
+      if (!t)
+        return nullptr;
+      std::uint32_t zero = 0;
+      t->magic.compare_exchange_strong(zero, kMagic);
+      if (t->magic.load() != kMagic)
+        return nullptr;
+      return t;
+    }();
+    return s_table;
+  }
+
+  bool enabled() {
+    static const bool on = []() {
+      const char* v = std::getenv("HELIOS_HANDOFF_LEDGER");
+      return !(v && v[0] == '0');
+    }();
+    return on;
+  }
+
+  std::uint32_t claim_device() {
+    Table* t = table();
+    if (!t)
+      return UINT32_MAX;
+    const std::uint32_t d = t->next_device.fetch_add(1);
+    if (d >= kDevices)
+      return UINT32_MAX;
+    t->devices[d].completed.store(0);
+    t->devices[d].pid.store(GetCurrentProcessId());
+    return d;
+  }
+
+  Slot* find(Table* t, std::uint32_t key, bool claim) {
+    std::uint32_t h = (key * 2654435761u) % kSlots;
+    for (std::uint32_t i = 0; i < kProbe; i++, h = (h + 1) % kSlots) {
+      Slot& s = t->slots[h];
+      std::uint32_t k = s.key.load(std::memory_order_acquire);
+      if (k == key)
+        return &s;
+      if (k == 0) {
+        if (!claim)
+          return nullptr;
+        if (s.key.compare_exchange_strong(k, key) || k == key)
+          return &s;
+      }
+    }
+    return nullptr;
+  }
+
+  // dxvk_helios_backend.h hooks.
+  std::uint64_t sample(std::uint32_t key) {
+    Table* t = table();
+    if (!t || !key)
+      return 0;
+    Slot* s = find(t, key, false);
+    if (!s)
+      return 0;
+    const std::uint64_t packed = s->packed.load(std::memory_order_acquire);
+    const std::uint32_t d = std::uint32_t(packed >> 48);
+    const std::uint64_t point = packed & kPointMask;
+    if (!point || d >= kDevices)
+      return 0;
+    const Device& dev = t->devices[d];
+    if (dev.pid.load(std::memory_order_relaxed) == GetCurrentProcessId())
+      return 0; // our own hand-off: same-process order is DXVK's
+    if (dev.completed.load(std::memory_order_acquire) >= point)
+      return 0;
+    return packed;
+  }
+
+  bool wait(std::uint32_t, std::uint64_t packed, std::uint64_t timeout_ns) {
+    Table* t = table();
+    if (!t)
+      return true;
+    const std::uint32_t d = std::uint32_t(packed >> 48);
+    const std::uint64_t point = packed & kPointMask;
+    if (d >= kDevices)
+      return true;
+    const Device& dev = t->devices[d];
+    LARGE_INTEGER f, t0, now;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    for (std::uint32_t spin = 0;; spin++) {
+      if (dev.completed.load(std::memory_order_acquire) >= point)
+        return true;
+      QueryPerformanceCounter(&now);
+      const double ns = double(now.QuadPart - t0.QuadPart) * 1e9 / double(f.QuadPart);
+      if (ns >= double(timeout_ns)) {
+        // A publisher that is gone completes nothing: do not wait for it.
+        const DWORD pid = dev.pid.load(std::memory_order_relaxed);
+        HANDLE p = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : nullptr;
+        const bool alive = p && WaitForSingleObject(p, 0) == WAIT_TIMEOUT;
+        if (p)
+          CloseHandle(p);
+        return !alive;
+      }
+      if (spin < 64)
+        YieldProcessor();
+      else if (spin < 256)
+        SwitchToThread();
+      else
+        Sleep(1);
+    }
+  }
+
+  const dxvk::HeliosHandoffHooks kHooks = { &sample, &wait };
+
+  void install_hooks_once() {
+    static const bool done = []() {
+      if (enabled() && table())
+        dxvk::heliosSetHandoffHooks(&kHooks);
+      return true;
+    }();
+    (void)done;
+  }
+}
+
+namespace {
+  // The ledger key of a shared texture: its KMD resource id. An import has it
+  // from the open; our own resource asks the ICD (Venus blob / NVK IMPORT_RM
+  // id, cached by the ICD) once and keeps it on the image.
+  std::uint32_t handoff_key(HeliosDxvkDeviceImpl& d, std::size_t resource) {
+    auto* texture = dxvk::GetCommonTexture(reinterpret_cast<ID3D11Resource*>(resource));
+    if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
+      return 0;
+    auto image = texture->GetImage();
+    std::uint32_t key = image->heliosHandoffKey();
+    if (key || !d.icd.memory_res_id || d.device == nullptr)
+      return key;
+    VkImage vkImage = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    if (!texture_image_memory(resource, &vkImage, &memory, &offset) || offset != 0)
+      return 0;
+    std::uint32_t res = 0;
+    if (d.icd.memory_res_id(d.device->vkd()->device(), memory, vkImage, &res, nullptr) != VK_SUCCESS)
+      return 0;
+    image->setHeliosHandoffKey(res);
+    return res;
+  }
+}
+
+void HeliosDxvkDevice::handoff_register(std::size_t d3d11_resource_ptr) const noexcept {
+  bridge_guard("handoff_register", false, [&]() -> bool {
+    if (!impl || !helios_handoff::enabled())
+      return false;
+    helios_handoff::install_hooks_once();
+    return handoff_key(*impl, d3d11_resource_ptr) != 0;
+  });
+}
+
+std::int32_t HeliosDxvkDevice::handoff_publish(const std::size_t* resources,
+                                               std::uint32_t resource_count) const noexcept {
+  if (!impl || !impl->context || impl->device == nullptr || !helios_handoff::enabled())
+    return -1;
+  return bridge_guard("handoff_publish", std::int32_t(-2), [&]() -> std::int32_t {
+    auto* table = helios_handoff::table();
+    if (!table)
+      return -1;
+    helios_handoff::install_hooks_once();
+    auto* immediate = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
+    std::lock_guard gate(impl->flush_gate_mutex);
+    const std::uint64_t seq = immediate->HeliosFlushSequence();
+    if (seq == impl->flush_gate_seq)
+      return 0;
+    if (impl->handoff_failed)
+      return -1; // ledger full: the caller falls back
+    if (impl->handoff_fence == nullptr) {
+      impl->handoff_device = helios_handoff::claim_device();
+      if (impl->handoff_device == UINT32_MAX) {
+        impl->handoff_failed = true;
+        return -1;
+      }
+      dxvk::DxvkFenceCreateInfo info = { };
+      info.initialValue = 0;
+      impl->handoff_fence = impl->device->createFence(info);
+    }
+    const std::uint64_t point = ++impl->handoff_value;
+    if (point > helios_handoff::kPointMask)
+      return -1;
+    const std::uint64_t packed = (std::uint64_t(impl->handoff_device) << 48) | point;
+    std::uint32_t published = 0;
+    bool overflow = false;
+    for (std::uint32_t i = 0; resources && i < resource_count; i++) {
+      const std::uint32_t key = handoff_key(*impl, resources[i]);
+      if (!key)
+        continue;
+      auto* slot = helios_handoff::find(table, key, true);
+      if (!slot) {
+        overflow = true;
+        continue;
+      }
+      slot->packed.store(packed, std::memory_order_release);
+      published++;
+    }
+    impl->flush_gate_seq = immediate->HeliosSignalFlushPoint(impl->handoff_fence, point);
+    auto* device_record = &table->devices[impl->handoff_device];
+    impl->handoff_fence->enqueueWait(point, [device_record, point]() {
+      std::uint64_t cur = device_record->completed.load(std::memory_order_relaxed);
+      while (cur < point && !device_record->completed.compare_exchange_weak(
+               cur, point, std::memory_order_release, std::memory_order_relaxed)) { }
+    });
+    static std::atomic<std::uint64_t> s_handoffs{0};
+    const auto n = s_handoffs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 4 || (n % 4096u) == 0) {
+      char msg[192];
+      std::snprintf(msg, sizeof(msg),
+        "handoff: point %llu of device record %u on %u shared resource(s)%s (#%llu)",
+        static_cast<unsigned long long>(point), impl->handoff_device, published,
+        overflow ? ", LEDGER FULL for some" : "", static_cast<unsigned long long>(n));
+      umd_log(msg);
+    }
+    return overflow ? -1 : 1;
+  });
+}
+
 
 bool HeliosDxvkDevice::get_resource_foreign_identity(
     std::size_t d3d11_resource_ptr,

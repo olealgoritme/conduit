@@ -821,6 +821,10 @@ unsafe fn note_nvk_keyed_resource(
     let mut list = lock_ignore_poison(&dev.nvk_keyed_resources);
     let key = h_resource.pDrvPrivate as usize;
     if !list.iter().any(|&(k, _)| k == key) {
+        // Reads of it now wait for other processes' hand-offs (ledger key).
+        if let Some(res) = load_resource(h_resource) {
+            dev.dxvk.handoff_register(res.as_raw() as usize);
+        }
         list.push((key, created));
         log_error!(
             "DDI NVK shared resource hDrv=0x{key:x}: flushes now wait for the GPU ({} live)",
