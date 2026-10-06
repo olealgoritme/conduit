@@ -1081,10 +1081,14 @@ bool HeliosDxvkDevice::get_resource_foreign_identity(
     std::uint64_t* modifier,
     std::uint32_t* stride,
     std::uint32_t* offset,
-    std::uint32_t* fourcc) const noexcept {
+    std::uint32_t* fourcc,
+    std::uint64_t* plane1_modifier,
+    std::uint32_t* plane1_stride,
+    std::uint32_t* plane1_offset) const noexcept {
   return bridge_guard("get_resource_foreign_identity", false, [&]() -> bool {
     *resource_id = 0; *ctx_id = 0; *size = 0; *modifier = 0;
     *stride = 0; *offset = 0; *fourcc = 0;
+    *plane1_modifier = 0; *plane1_stride = 0; *plane1_offset = 0;
     if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm
      || !impl->icd.memory_res_id)
       return false;
@@ -1111,6 +1115,28 @@ bool HeliosDxvkDevice::get_resource_foreign_identity(
     }
     if (vr != VK_SUCCESS || !res)
       return false;
+    // A two-plane id (NV12/P010/P016, docs/shared-formats.md) needs plane 1
+    // for the WDDM trailer; without it the KMD refuses the adoption, so fail
+    // here (the texture gets a KMD placeholder, as any id-less one).
+    // DRM_FORMAT_NV12 / P010 / P016 (helios_foreign.h HELIOS_DRM_FORMAT_*)
+    constexpr std::uint32_t kNv12 = 0x3231564Eu, kP010 = 0x30313050u, kP016 = 0x36313050u;
+    if (layout.fourcc == kNv12 || layout.fourcc == kP010 || layout.fourcc == kP016) {
+      helios_icd_plane plane1 = {};
+      const VkResult pr = impl->icd.memory_res_plane1
+        ? impl->icd.memory_res_plane1(impl->device->vkd()->device(), image, &plane1)
+        : VK_ERROR_FEATURE_NOT_PRESENT;
+      char msg[192];
+      std::snprintf(msg, sizeof(msg),
+        "nvk resource id %u plane 1: vr=%d stride=%u offset=%u modifier=0x%016llx",
+        res, int(pr), plane1.stride, plane1.offset,
+        static_cast<unsigned long long>(plane1.modifier));
+      umd_log(msg);
+      if (pr != VK_SUCCESS || plane1.stride == 0)
+        return false;
+      *plane1_modifier = plane1.modifier;
+      *plane1_stride = plane1.stride;
+      *plane1_offset = plane1.offset;
+    }
     *resource_id = res;
     *ctx_id = impl->icd.ctx_id ? impl->icd.ctx_id(impl->instance->handle()) : 0;
     *size = layout.size;
@@ -1669,7 +1695,10 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     bool foreign,
     std::uint64_t foreign_modifier,
     std::uint32_t foreign_stride,
-    std::uint32_t foreign_offset) const {
+    std::uint32_t foreign_offset,
+    std::uint64_t foreign_plane1_modifier,
+    std::uint32_t foreign_plane1_stride,
+    std::uint32_t foreign_plane1_offset) const {
   if (!impl || !impl->d3d11 || !global || !renderer_resource_id || !width || !height)
     return 0;
   bool nvk_blank = false;
@@ -1801,6 +1830,9 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       importInfo.ForeignModifier = foreign_modifier;
       importInfo.ForeignStride   = foreign_stride;
       importInfo.ForeignOffset   = foreign_offset;
+      importInfo.ForeignPlane1Modifier = foreign_plane1_modifier;
+      importInfo.ForeignPlane1Stride   = foreign_plane1_stride;
+      importInfo.ForeignPlane1Offset   = foreign_plane1_offset;
 
       // static_cast, matching the sibling context downcast in this file. Zero
       // runtime change today (the base sits at offset 0), but if an upstream DXVK

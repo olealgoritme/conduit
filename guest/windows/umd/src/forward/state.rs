@@ -202,6 +202,9 @@ pub(crate) struct RuntimeAllocPrivate {
     /// NVK-made allocation; every other allocation still sends the 96-byte
     /// prefix, exactly as before.
     pub(crate) layout: helios_protocol::HeliosWddmAllocLayout,
+    /// Plane 1 of a two-plane NVK-made allocation (NV12/P010/P016, version-2
+    /// layout, docs/shared-formats.md): sent (144 bytes) only then.
+    pub(crate) plane1: helios_protocol::HeliosWddmAllocPlane,
 }
 
 const _: () = {
@@ -210,8 +213,12 @@ const _: () = {
             == helios_protocol::HELIOS_WDDM_LAYOUT_OFFSET
     );
     assert!(
+        core::mem::offset_of!(RuntimeAllocPrivate, plane1)
+            == helios_protocol::HELIOS_WDDM_LAYOUT_PLANE1_OFFSET
+    );
+    assert!(
         core::mem::size_of::<RuntimeAllocPrivate>()
-            == helios_protocol::HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES
+            == helios_protocol::HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES
     );
 };
 
@@ -228,14 +235,28 @@ pub(crate) unsafe fn read_open_layout(
     {
         return None;
     }
-    let layout = core::ptr::read_unaligned(
-        (ptr as *const u8).add(HELIOS_WDDM_LAYOUT_OFFSET) as *const HeliosWddmAllocLayout,
-    );
-    layout.is_valid().then_some(crate::bridge::ForeignLayout {
+    // SAFETY: the caller hands over dxgkrnl's private-data buffer of `size`
+    // bytes; the slice covers exactly that.
+    let private = core::slice::from_raw_parts(ptr as *const u8, size as usize);
+    // A two-plane record (version 2, plane 1 at 128) or a version-1 one.
+    if let Some((layout, plane1)) = HeliosWddmAllocLayout::read_open_planes(private) {
+        return Some(crate::bridge::ForeignLayout {
+            modifier: layout.modifier,
+            stride: layout.stride,
+            offset: layout.plane_offset,
+            fourcc: layout.fourcc,
+            plane1_modifier: plane1.modifier,
+            plane1_stride: plane1.stride,
+            plane1_offset: plane1.plane_offset,
+        });
+    }
+    let layout = HeliosWddmAllocLayout::read_open(private)?;
+    Some(crate::bridge::ForeignLayout {
         modifier: layout.modifier,
         stride: layout.stride,
         offset: layout.plane_offset,
         fourcc: layout.fourcc,
+        ..Default::default()
     })
 }
 

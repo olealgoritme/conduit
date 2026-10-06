@@ -233,6 +233,21 @@ struct crm_foreign_import {
  * for a layout the KMD refuses, -EIO for a host refusal (*host_errno). */
 int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id,
                       uint32_t *host_errno);
+/* Plane 1 of a two-plane format (NV12/P010/P016), guest/windows/docs/
+ * shared-formats.md: its own modifier, pitch and offset. */
+struct crm_foreign_plane {
+    uint64_t modifier;
+    uint32_t stride;
+    uint32_t offset;
+};
+/* IMPORT_RM for any format of the shared-format table (KMD QUERY_CAPS bit 3,
+ * HELIOS_FOREIGN_CAP_LAYOUT_FORMATS): `plane1` NULL sends the 104-byte request
+ * crm_win_import_rm sends, otherwise the 120-byte one with the PLANE1 flag.
+ * Errors as crm_win_import_rm; an older KMD refuses a non-32 bpp fourcc or the
+ * PLANE1 flag with -EINVAL. */
+int crm_win_import_rm_planes(const struct crm_foreign_import *in,
+                             const struct crm_foreign_plane *plane1,
+                             uint32_t *resource_id, uint32_t *host_errno);
 
 /*
  * RM fences (KMD 22.22.311+, guest/windows/docs/rm-fence-marker.md, docs/SYNC.md).

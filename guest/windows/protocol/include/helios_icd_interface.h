@@ -39,8 +39,9 @@ extern "C" {
 #endif
 
 #define HELIOS_ICD_INTERFACE_EXPORT "helios_icd_interface_v2"
-/* The export keeps its name; version 3 only appends entries (and caps 4..6). */
-#define HELIOS_ICD_INTERFACE_VERSION 3u
+/* The export keeps its name; version 3 only appends entries (and caps 4..6),
+ * version 4 appends memory_res_plane1 (and cap 8). */
+#define HELIOS_ICD_INTERFACE_VERSION 4u
 
 enum helios_icd_backend {
    HELIOS_ICD_BACKEND_VENUS = 1,
@@ -75,6 +76,12 @@ enum helios_icd_backend {
  * crm_win_rm_resource_import; whether the KMD and host serve it shows only
  * when it is tried. */
 #define HELIOS_ICD_CAP_SHARED_IMPORT (1u << 7)
+/* Version 4: memory_res_id mints ids for every format of the shared-format
+ * table (guest/windows/docs/shared-formats.md: 8/16/64 bpp, 10:10:10:2, YUYV,
+ * NV12/P010/P016 with plane 1), not only 32 bpp RGB (NVK: the KMD advertises
+ * HELIOS_FOREIGN_CAP_LAYOUT_FORMATS). A two-plane id's plane 1 comes from
+ * memory_res_plane1, and goes into the WDDM trailer (version 2, 144 bytes). */
+#define HELIOS_ICD_CAP_LAYOUT_FORMATS (1u << 8)
 
 /* DRM fourcc / modifier values used below (drm_fourcc.h). */
 #define HELIOS_DRM_FORMAT_XRGB8888 0x34325258u
@@ -138,6 +145,21 @@ struct helios_import_memory_resource_info {
    uint64_t modifier;     /* DRM_FORMAT_MOD_* the image must have */
    uint32_t stride;       /* plane 0 row pitch the image must have */
    uint32_t offset;       /* plane 0 offset the image must have */
+   /* With HELIOS_IMPORT_MEMORY_RESOURCE_FLAG_PLANE1 in `flags` only (an older
+    * caller's struct ends above): plane 1 of a two-plane surface, from the
+    * open's version-2 trailer. */
+   uint64_t plane1_modifier;
+   uint32_t plane1_stride;
+   uint32_t plane1_offset;
+};
+/* helios_import_memory_resource_info.flags: the plane1_* fields are there. */
+#define HELIOS_IMPORT_MEMORY_RESOURCE_FLAG_PLANE1 (1u << 0)
+
+/* Plane 1 of a two-plane image behind a resource id (memory_res_plane1). */
+struct helios_icd_plane {
+   uint64_t modifier; /* DRM_FORMAT_MOD_* of plane 1 */
+   uint32_t stride;   /* row pitch, bytes */
+   uint32_t offset;   /* bytes from the start of the object */
 };
 
 struct helios_icd_api {
@@ -156,7 +178,9 @@ struct helios_icd_api {
     * offset 0 (NVK needs it for the layout; Venus ignores it). Fills `layout`
     * (may be NULL). VK_ERROR_FEATURE_NOT_PRESENT when ids cannot be made now
     * (NVK: IMPORT_RM not served), VK_ERROR_FORMAT_NOT_SUPPORTED for an image
-    * the importers cannot take (NVK: not 32 bpp, 3D tiling, suballocated). */
+    * the importers cannot take (NVK: a format outside the shared-format table,
+    * or not 32 bpp RGB without HELIOS_ICD_CAP_LAYOUT_FORMATS; 3D tiling,
+    * suballocated). */
    VkResult (*memory_res_id)(VkDevice device, VkDeviceMemory memory, VkImage image,
                              uint32_t *res_id, struct helios_icd_layout *layout);
 
@@ -206,6 +230,14 @@ struct helios_icd_api {
     * (rm-fence-marker.md). */
    VkResult (*scanout_present_fenced)(VkDevice device, VkDeviceMemory memory,
                                       VkImage image, uint32_t fence_handle);
+
+   /* ---- version 4 (size covers it; NULL = not supported) ----------------
+    * Plane 1 of `image` as its resource id records it (call after
+    * memory_res_id succeeded for the same memory and image). VK_SUCCESS and
+    * *plane1 filled for a two-plane image; VK_ERROR_FORMAT_NOT_SUPPORTED for a
+    * single-plane one (nothing to add to the version-1 trailer). */
+   VkResult (*memory_res_plane1)(VkDevice device, VkImage image,
+                                 struct helios_icd_plane *plane1);
 };
 
 typedef VkResult (*PFN_helios_icd_interface_v2)(uint32_t version, struct helios_icd_api *out);

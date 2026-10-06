@@ -188,7 +188,7 @@ is not covered here.
 
 * **librmclient**: `crm_win_import_rm_planes` sends the 120-byte request (the
   104-byte one when there is no plane 1); `crm_win_import_rm` is unchanged.
-* **NVK** (patch 0040): `memory_res_id` maps the image's Vulkan format to the
+* **NVK** (patch 0041): `memory_res_id` maps the image's Vulkan format to the
   table, builds plane 0 and plane 1 from the nil layout, and asks for the
   non-32 bpp path only when `QUERY_CAPS` shows `CAP_LAYOUT_FORMATS`; the export
   memory of a two-plane image gets plane 0's PTE kind. The opener's check
@@ -208,8 +208,43 @@ A creates a shared texture of the format, fills it with a byte pattern
 through a staging copy, writes a second pattern, waits for its GPU work; A reads
 B's pattern back. Pixel-exact both ways. `HELIOS_ICD=nvk` for both processes.
 
-Results: section 9.
+Results: section 10.
 
-## 9. Results
+## 9. LINEAR surfaces with a recorded pitch (KMD-made RM surfaces)
 
-(filled in as runs complete)
+An NVK DWM must also open RM-backed surfaces the KMD makes (GDI redirection,
+`dwm-on-nvk.md` 4.2.2), which are LINEAR with a pitch the KMD chose. The
+rebuild-and-check import cannot take them: the opener's own LINEAR pitch is
+NVK's (`align(width * bpp, 128)`) and DXVK builds shared images OPTIMAL.
+
+* **NVK patch 0042**: `VK_EXT_image_drm_format_modifier` on Windows
+  (`has_alloc_tiled` no longer depends on the DRM path; RM applies kinds per
+  mapping). nil already takes an explicit LINEAR row pitch for an import, any
+  multiple of 32 bytes (below 128 NVK uses its render workaround).
+  `NVK_HELIOS_MODIFIERS=0` hides it.
+* **DXVK patch 0010**: an NVK device enables the extension; an NVK import whose
+  record is LINEAR, single-plane and has a pitch is created with
+  `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and an explicit plane layout
+  (offset, rowPitch from the trailer), as 0001 does for Venus. Block-linear
+  records (every ordinary OPTIMAL share) and two-plane records are unchanged.
+* **Import check** (`nvk_helios_check_import_layout`): unchanged code; the
+  explicit image has the recorded layout by construction.
+* **KMD**: author 128-byte-aligned pitches for RM surfaces NVK will open
+  (NVK's own LINEAR stride, no render workaround); 256-aligned also imports.
+
+## 10. Results
+
+2026-10-06, win11 (22.22.319.x KMD from feat/umd-nvk-combined, no
+`CAP_LAYOUT_FORMATS` yet), NVK loaded per process with
+`HELIOS_NVK_ICD=W:\fmt\nvk\vulkan_nouveau.dll` (patches 0041, 0042), the
+installed UMD otherwise:
+
+| run | result |
+|---|---|
+| NVK to NVK `bgra8`, kmt 256x128 and nt 1920x1080 (0041, 0041+0042) | byte-exact both ways (32 bpp path unchanged) |
+| Venus to Venus `a8`, `r10g10b10a2`, `rgba16f`, `nv12` | byte-exact both ways (validates the tool, planes included) |
+| NVK `a8`, `r8g8`, `r10g10b10a2`, `rgba16f`, `nv12` | refused as designed on this KMD (`memory_res_id` -11, no escape); the UMD's KMD placeholder is then refused by `pfnAllocateCb` (E_INVALIDARG) and the runtime reported DEVICE_REMOVED. Pre-existing: the same happens to `bgra8` with `NVK_HELIOS_RESID=0`. The UMD now answers E_OUTOFMEMORY for that one creation (commit e38d158); relayed to the KMD session |
+| health | no dumps, no TDR, no app crash, DWM pid unchanged |
+
+Pending: the non-32 bpp formats end to end need the KMD change (section 5);
+then `d3d11_share.exe fmt all kmt|nt` on NVK.

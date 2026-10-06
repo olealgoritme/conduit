@@ -1,0 +1,586 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 10:17:59 +0200
+Subject: [PATCH] nvk/rm: Helios resource ids for every shared format,
+ two-plane images
+
+Conduit guest/windows/docs/shared-formats.md: the Windows desktop and the
+browsers share more than 32 bpp RGB between processes (A8 shell surfaces,
+R8/R8G8/R16/R16G16 and 5:6:5 resources, 10:10:10:2 and fp16 HDR, YUY2,
+NV12/P010/P016 video), which kept them off NVK.
+
+- memory_res_id records any format of the shared-format table: 8, 16, 32
+  and 64 bpp RGB, YUYV, and the two-plane NV12/P010/P016 with plane 1's
+  own pitch, offset and modifier (NVK picks the block height per plane).
+  One resource id per image: both planes live in the one dedicated
+  memory. Linear or GB20x block-linear, as nil laid the image out.
+- Only when the KMD serves it (FOREIGN_RESOURCE QUERY_CAPS bit 3,
+  HELIOS_FOREIGN_CAP_LAYOUT_FORMATS) and librmclient has
+  crm_win_import_rm_planes; otherwise 32 bpp RGB as before, and
+  VK_ERROR_FORMAT_NOT_SUPPORTED with no escape for the rest. Scanout
+  stays 32 bpp RGB. NVK_HELIOS_FORMATS=0 turns the wider set off.
+- Interface version 4: HELIOS_ICD_CAP_LAYOUT_FORMATS and
+  memory_res_plane1 (plane 1 for the WDDM trailer); the shared-surface
+  import checks plane 1 too when the opener passes it
+  (HELIOS_IMPORT_MEMORY_RESOURCE_FLAG_PLANE1).
+- The export memory of a two-plane image gets plane 0's PTE kind (the
+  same uncompressed kind for both planes).
+---
+ src/nouveau/vulkan/helios_icd_interface.h   |  38 +++-
+ src/nouveau/vulkan/nvk_device_memory.c      |  15 +-
+ src/nouveau/vulkan/nvk_helios.c             | 218 +++++++++++++++++---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  15 ++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c  |   1 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c  |  32 ++-
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h |   7 +
+ 7 files changed, 286 insertions(+), 40 deletions(-)
+
+diff --git a/src/nouveau/vulkan/helios_icd_interface.h b/src/nouveau/vulkan/helios_icd_interface.h
+index 14df724..6b4b338 100644
+--- a/src/nouveau/vulkan/helios_icd_interface.h
++++ b/src/nouveau/vulkan/helios_icd_interface.h
+@@ -39,8 +39,9 @@ extern "C" {
+ #endif
+ 
+ #define HELIOS_ICD_INTERFACE_EXPORT "helios_icd_interface_v2"
+-/* The export keeps its name; version 3 only appends entries (and caps 4..6). */
+-#define HELIOS_ICD_INTERFACE_VERSION 3u
++/* The export keeps its name; version 3 only appends entries (and caps 4..6),
++ * version 4 appends memory_res_plane1 (and cap 8). */
++#define HELIOS_ICD_INTERFACE_VERSION 4u
+ 
+ enum helios_icd_backend {
+    HELIOS_ICD_BACKEND_VENUS = 1,
+@@ -75,6 +76,12 @@ enum helios_icd_backend {
+  * crm_win_rm_resource_import; whether the KMD and host serve it shows only
+  * when it is tried. */
+ #define HELIOS_ICD_CAP_SHARED_IMPORT (1u << 7)
++/* Version 4: memory_res_id mints ids for every format of the shared-format
++ * table (guest/windows/docs/shared-formats.md: 8/16/64 bpp, 10:10:10:2, YUYV,
++ * NV12/P010/P016 with plane 1), not only 32 bpp RGB (NVK: the KMD advertises
++ * HELIOS_FOREIGN_CAP_LAYOUT_FORMATS). A two-plane id's plane 1 comes from
++ * memory_res_plane1, and goes into the WDDM trailer (version 2, 144 bytes). */
++#define HELIOS_ICD_CAP_LAYOUT_FORMATS (1u << 8)
+ 
+ /* DRM fourcc / modifier values used below (drm_fourcc.h). */
+ #define HELIOS_DRM_FORMAT_XRGB8888 0x34325258u
+@@ -138,6 +145,21 @@ struct helios_import_memory_resource_info {
+    uint64_t modifier;     /* DRM_FORMAT_MOD_* the image must have */
+    uint32_t stride;       /* plane 0 row pitch the image must have */
+    uint32_t offset;       /* plane 0 offset the image must have */
++   /* With HELIOS_IMPORT_MEMORY_RESOURCE_FLAG_PLANE1 in `flags` only (an older
++    * caller's struct ends above): plane 1 of a two-plane surface, from the
++    * open's version-2 trailer. */
++   uint64_t plane1_modifier;
++   uint32_t plane1_stride;
++   uint32_t plane1_offset;
++};
++/* helios_import_memory_resource_info.flags: the plane1_* fields are there. */
++#define HELIOS_IMPORT_MEMORY_RESOURCE_FLAG_PLANE1 (1u << 0)
++
++/* Plane 1 of a two-plane image behind a resource id (memory_res_plane1). */
++struct helios_icd_plane {
++   uint64_t modifier; /* DRM_FORMAT_MOD_* of plane 1 */
++   uint32_t stride;   /* row pitch, bytes */
++   uint32_t offset;   /* bytes from the start of the object */
+ };
+ 
+ struct helios_icd_api {
+@@ -156,7 +178,9 @@ struct helios_icd_api {
+     * offset 0 (NVK needs it for the layout; Venus ignores it). Fills `layout`
+     * (may be NULL). VK_ERROR_FEATURE_NOT_PRESENT when ids cannot be made now
+     * (NVK: IMPORT_RM not served), VK_ERROR_FORMAT_NOT_SUPPORTED for an image
+-    * the importers cannot take (NVK: not 32 bpp, 3D tiling, suballocated). */
++    * the importers cannot take (NVK: a format outside the shared-format table,
++    * or not 32 bpp RGB without HELIOS_ICD_CAP_LAYOUT_FORMATS; 3D tiling,
++    * suballocated). */
+    VkResult (*memory_res_id)(VkDevice device, VkDeviceMemory memory, VkImage image,
+                              uint32_t *res_id, struct helios_icd_layout *layout);
+ 
+@@ -206,6 +230,14 @@ struct helios_icd_api {
+     * (rm-fence-marker.md). */
+    VkResult (*scanout_present_fenced)(VkDevice device, VkDeviceMemory memory,
+                                       VkImage image, uint32_t fence_handle);
++
++   /* ---- version 4 (size covers it; NULL = not supported) ----------------
++    * Plane 1 of `image` as its resource id records it (call after
++    * memory_res_id succeeded for the same memory and image). VK_SUCCESS and
++    * *plane1 filled for a two-plane image; VK_ERROR_FORMAT_NOT_SUPPORTED for a
++    * single-plane one (nothing to add to the version-1 trailer). */
++   VkResult (*memory_res_plane1)(VkDevice device, VkImage image,
++                                 struct helios_icd_plane *plane1);
+ };
+ 
+ typedef VkResult (*PFN_helios_icd_interface_v2)(uint32_t version, struct helios_icd_api *out);
+diff --git a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
+index 085090b..10992e8 100644
+--- a/src/nouveau/vulkan/nvk_device_memory.c
++++ b/src/nouveau/vulkan/nvk_device_memory.c
+@@ -222,10 +222,17 @@ nvk_AllocateMemory(VkDevice device,
+             alignment = (1ULL << 21);
+          else
+             alignment = (1ULL << 16);
+-      } else if (helios_export && image->plane_count == 1 &&
+-                 image->planes[0].nil.pte_kind != 0) {
+-         /* Uncompressed block-linear: the layout an importer can read */
+-         alignment = MAX2(alignment, image->planes[0].nil.align_B);
++      } else if (helios_export && image->planes[0].nil.pte_kind != 0 &&
++                 (image->plane_count == 1 ||
++                  (image->plane_count == 2 && !image->disjoint &&
++                   image->planes[1].nil.pte_kind ==
++                   image->planes[0].nil.pte_kind))) {
++         /* Uncompressed block-linear: the layout an importer can read.  A
++          * two-plane image (NV12/P010, Conduit shared-formats.md) has one
++          * PTE kind for both planes; the export names plane 0's tiling.
++          */
++         for (uint8_t p = 0; p < image->plane_count; p++)
++            alignment = MAX2(alignment, image->planes[p].nil.align_B);
+          pte_kind = image->planes[0].nil.pte_kind;
+          tile_mode = image->planes[0].nil.tile_mode;
+       }
+diff --git a/src/nouveau/vulkan/nvk_helios.c b/src/nouveau/vulkan/nvk_helios.c
+index 218c4de..d3c34a5 100644
+--- a/src/nouveau/vulkan/nvk_helios.c
++++ b/src/nouveau/vulkan/nvk_helios.c
+@@ -27,6 +27,11 @@
+ #include <inttypes.h>
+ #include <string.h>
+ 
++/* The DRM fourcc a resource id records for an image of `format`: the shared
++ * format table of Conduit's guest/windows/docs/shared-formats.md (DXVK's
++ * images for the DXGI formats the desktop and browsers share).  0: not
++ * shareable.
++ */
+ static uint32_t
+ helios_fourcc(VkFormat format)
+ {
+@@ -36,65 +41,162 @@ helios_fourcc(VkFormat format)
+       return DRM_FORMAT_ARGB8888;
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
++   case VK_FORMAT_R8G8B8A8_SNORM:
++   case VK_FORMAT_R8G8B8A8_UINT:
++   case VK_FORMAT_R8G8B8A8_SINT:
+       return DRM_FORMAT_ABGR8888;
++   case VK_FORMAT_R8_UNORM:
++   case VK_FORMAT_R8_SNORM:
++   case VK_FORMAT_R8_UINT:
++   case VK_FORMAT_R8_SINT:
++   case VK_FORMAT_A8_UNORM_KHR:
++      return DRM_FORMAT_R8;
++   case VK_FORMAT_R8G8_UNORM:
++   case VK_FORMAT_R8G8_SNORM:
++   case VK_FORMAT_R8G8_UINT:
++   case VK_FORMAT_R8G8_SINT:
++      return DRM_FORMAT_GR88;
++   case VK_FORMAT_R16_UNORM:
++   case VK_FORMAT_R16_SNORM:
++   case VK_FORMAT_R16_UINT:
++   case VK_FORMAT_R16_SINT:
++   case VK_FORMAT_R16_SFLOAT:
++      return DRM_FORMAT_R16;
++   case VK_FORMAT_R16G16_UNORM:
++   case VK_FORMAT_R16G16_SNORM:
++   case VK_FORMAT_R16G16_UINT:
++   case VK_FORMAT_R16G16_SINT:
++   case VK_FORMAT_R16G16_SFLOAT:
++      return DRM_FORMAT_GR1616;
++   case VK_FORMAT_R5G6B5_UNORM_PACK16:
++      return DRM_FORMAT_RGB565;
++   case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
++      return DRM_FORMAT_ARGB1555;
++   case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
++      return DRM_FORMAT_ARGB4444;
++   case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++   case VK_FORMAT_A2B10G10R10_UINT_PACK32:
++      return DRM_FORMAT_ABGR2101010;
++   case VK_FORMAT_R16G16B16A16_SFLOAT:
++      return DRM_FORMAT_ABGR16161616F;
++   case VK_FORMAT_R16G16B16A16_UNORM:
++   case VK_FORMAT_R16G16B16A16_SNORM:
++   case VK_FORMAT_R16G16B16A16_UINT:
++   case VK_FORMAT_R16G16B16A16_SINT:
++      return DRM_FORMAT_ABGR16161616;
++   case VK_FORMAT_G8B8G8R8_422_UNORM:
++      return DRM_FORMAT_YUYV;
++   case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
++      return DRM_FORMAT_NV12;
++   case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
++      return DRM_FORMAT_P010;
++   case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
++      return DRM_FORMAT_P016;
+    default:
+       return 0;
+    }
+ }
+ 
+-/* The layout of `image` at offset 0 of its dedicated memory, in the terms of
+- * HELIOS_ESCAPE_FOREIGN_RESOURCE (protocol/src/foreign.rs): plane 0, 32 bpp,
+- * pitch-linear or 2D block-linear with NVIDIA's GB20x DRM modifier.
+- */
+-static VkResult
+-helios_image_layout(const struct nvk_image *image,
+-                    struct nvkmd_rm_foreign_layout *out,
+-                    uint8_t *pte_kind, uint16_t *tile_mode)
++static bool
++helios_fourcc_is_rgb32(uint32_t fourcc)
+ {
+-   if (image->plane_count != 1 || image->vk.image_type != VK_IMAGE_TYPE_2D ||
+-       image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+-       image->vk.array_layers != 1)
+-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++   return fourcc == DRM_FORMAT_XRGB8888 || fourcc == DRM_FORMAT_ARGB8888 ||
++          fourcc == DRM_FORMAT_XBGR8888 || fourcc == DRM_FORMAT_ABGR8888;
++}
+ 
+-   const uint32_t fourcc = helios_fourcc(image->vk.format);
+-   if (fourcc == 0)
+-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++static bool
++helios_fourcc_two_planes(uint32_t fourcc)
++{
++   return fourcc == DRM_FORMAT_NV12 || fourcc == DRM_FORMAT_P010 ||
++          fourcc == DRM_FORMAT_P016;
++}
+ 
+-   const struct nvk_image_plane *plane = &image->planes[0];
++/* Plane `p` of `image` in the terms of the layout record: pitch-linear or 2D
++ * block-linear with NVIDIA's GB20x DRM modifier, at its byte offset in the
++ * dedicated memory.
++ */
++static VkResult
++helios_plane_layout(const struct nvk_image *image, uint32_t p,
++                    uint64_t *modifier, uint32_t *stride, uint32_t *offset)
++{
++   const struct nvk_image_plane *plane = &image->planes[p];
+    const struct nil_image_level *level = &plane->nil.levels[0];
+ 
+-   uint64_t modifier;
+    if (level->tiling.gob_type == NIL_GOB_TYPE_LINEAR) {
+-      modifier = DRM_FORMAT_MOD_LINEAR;
++      *modifier = DRM_FORMAT_MOD_LINEAR;
+    } else if (level->tiling.gob_type == NIL_GOB_TYPE_TURING_COLOR2_D &&
+               level->tiling.x_log2 == 0 && level->tiling.z_log2 == 0 &&
+               level->tiling.y_log2 <= 5) {
+-      modifier = HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X | level->tiling.y_log2;
++      *modifier = HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X | level->tiling.y_log2;
+    } else {
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+ 
+-   const uint64_t offset = plane->plane_offset_B + level->offset_B;
+-   if (offset > UINT32_MAX)
++   const uint64_t off = plane->plane_offset_B + level->offset_B;
++   if (off > UINT32_MAX || level->row_stride_B > UINT32_MAX)
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++   *stride = level->row_stride_B;
++   *offset = (uint32_t)off;
++   return VK_SUCCESS;
++}
++
++/* The layout of `image` at offset 0 of its dedicated memory, in the terms of
++ * HELIOS_ESCAPE_FOREIGN_RESOURCE (protocol/src/foreign.rs).  `formats`: the
++ * KMD takes the whole shared-format table (FOREIGN_RESOURCE caps bit 3);
++ * without it, and always for scanout, only 32 bpp RGB in one plane.
++ */
++static VkResult
++helios_image_layout(const struct nvk_image *image, bool formats,
++                    struct nvkmd_rm_foreign_layout *out,
++                    uint8_t *pte_kind, uint16_t *tile_mode)
++{
++   if (image->vk.image_type != VK_IMAGE_TYPE_2D ||
++       image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
++       image->vk.array_layers != 1 || image->disjoint)
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++
++   const uint32_t fourcc = helios_fourcc(image->vk.format);
++   if (fourcc == 0 || (!formats && !helios_fourcc_is_rgb32(fourcc)))
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++   const uint32_t planes = helios_fourcc_two_planes(fourcc) ? 2 : 1;
++   if (image->plane_count != planes)
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
+    *out = (struct nvkmd_rm_foreign_layout) {
+       .width = image->vk.extent.width,
+       .height = image->vk.extent.height,
+-      .stride = level->row_stride_B,
+-      .offset = (uint32_t)offset,
+       .fourcc = fourcc,
+-      .modifier = modifier,
++      .plane_count = planes,
+    };
+-   *pte_kind = plane->nil.pte_kind;
+-   *tile_mode = plane->nil.tile_mode;
++   VkResult result = helios_plane_layout(image, 0, &out->modifier,
++                                         &out->stride, &out->offset);
++   if (result != VK_SUCCESS)
++      return result;
++
++   if (planes == 2) {
++      result = helios_plane_layout(image, 1, &out->plane1_modifier,
++                                   &out->plane1_stride, &out->plane1_offset);
++      if (result != VK_SUCCESS)
++         return result;
++      /* One memory kind for the object: both planes linear, or both
++       * block-linear of the same (generic, uncompressed) PTE kind
++       */
++      if ((out->modifier == DRM_FORMAT_MOD_LINEAR) !=
++          (out->plane1_modifier == DRM_FORMAT_MOD_LINEAR) ||
++          image->planes[0].nil.pte_kind != image->planes[1].nil.pte_kind ||
++          out->plane1_offset < out->offset)
++         return VK_ERROR_FORMAT_NOT_SUPPORTED;
++   }
++
++   *pte_kind = image->planes[0].nil.pte_kind;
++   *tile_mode = image->planes[0].nil.tile_mode;
+    return VK_SUCCESS;
+ }
+ 
+ /* The opener's image must be laid out exactly like the creator's: NVK on
+  * Windows has no VK_EXT_image_drm_format_modifier, so the image is created
+  * from the same D3D description and checked here against the layout the
+- * KMD recorded for the resource.
++ * KMD recorded for the resource (plane 1 too when the opener passed it).
+  */
+ VkResult
+ nvk_helios_check_import_layout(const struct nvk_image *image,
+@@ -103,7 +205,11 @@ nvk_helios_check_import_layout(const struct nvk_image *image,
+    struct nvkmd_rm_foreign_layout fl;
+    uint8_t pte_kind;
+    uint16_t tile_mode;
+-   VkResult result = helios_image_layout(image, &fl, &pte_kind, &tile_mode);
++   /* Whatever a creator could mint, an opener can map: the KMD checked the
++    * record when it was made
++    */
++   VkResult result = helios_image_layout(image, true, &fl, &pte_kind,
++                                         &tile_mode);
+    if (result != VK_SUCCESS) {
+       return vk_errorf(&image->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                        "Helios shared surface %u: the image (format %d, "
+@@ -121,6 +227,20 @@ nvk_helios_check_import_layout(const struct nvk_image *image,
+                        fl.stride, fl.offset, info->modifier, info->stride,
+                        info->offset);
+    }
++   if (fl.plane_count == 2 &&
++       (info->flags & HELIOS_IMPORT_MEMORY_RESOURCE_FLAG_PLANE1) &&
++       (fl.plane1_modifier != info->plane1_modifier ||
++        fl.plane1_stride != info->plane1_stride ||
++        fl.plane1_offset != info->plane1_offset)) {
++      return vk_errorf(&image->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                       "Helios shared surface %u: plane 1 is laid out "
++                       "modifier 0x%" PRIx64 " stride %u offset %u, the "
++                       "creator's is modifier 0x%" PRIx64 " stride %u "
++                       "offset %u", info->resource_id, fl.plane1_modifier,
++                       fl.plane1_stride, fl.plane1_offset,
++                       info->plane1_modifier, info->plane1_stride,
++                       info->plane1_offset);
++   }
+    return VK_SUCCESS;
+ }
+ 
+@@ -148,7 +268,9 @@ helios_memory_res_id(VkDevice _device, VkDeviceMemory _mem, VkImage _image,
+    struct nvkmd_rm_foreign_layout fl;
+    uint8_t pte_kind;
+    uint16_t tile_mode;
+-   VkResult result = helios_image_layout(image, &fl, &pte_kind, &tile_mode);
++   VkResult result =
++      helios_image_layout(image, nvkmd_rm_win_layout_formats_served(), &fl,
++                          &pte_kind, &tile_mode);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -219,7 +341,7 @@ helios_scanout_present(VkDevice _device, VkDeviceMemory _mem, VkImage _image)
+    struct nvkmd_rm_foreign_layout fl;
+    uint8_t pte_kind;
+    uint16_t tile_mode;
+-   VkResult result = helios_image_layout(image, &fl, &pte_kind, &tile_mode);
++   VkResult result = helios_image_layout(image, false, &fl, &pte_kind, &tile_mode);
+    if (result != VK_SUCCESS)
+       return result;
+    nvkmd_rm_mem_set_export_layout(mem->mem, pte_kind, tile_mode);
+@@ -281,7 +403,7 @@ helios_scanout_present_fenced(VkDevice _device, VkDeviceMemory _mem,
+    uint16_t tile_mode;
+    if (mem != NULL && image != NULL && mem->dedicated_image == image &&
+        !image->is_compressed)
+-      result = helios_image_layout(image, &fl, &pte_kind, &tile_mode);
++      result = helios_image_layout(image, false, &fl, &pte_kind, &tile_mode);
+    if (result != VK_SUCCESS) {
+       /* Takes the fence in every case: nothing will wait on it now */
+       nvkmd_rm_rmfence_close(dev->nvkmd, fence);
+@@ -294,6 +416,34 @@ helios_scanout_present_fenced(VkDevice _device, VkDeviceMemory _mem,
+                                            fl.fourcc, fl.modifier, fence);
+ }
+ 
++/* helios_icd_interface.h version 4 */
++static VkResult
++helios_memory_res_plane1(VkDevice _device, VkImage _image,
++                         struct helios_icd_plane *plane1)
++{
++   VK_FROM_HANDLE(nvk_image, image, _image);
++   (void)_device;
++
++   if (plane1 != NULL)
++      memset(plane1, 0, sizeof(*plane1));
++   if (image == NULL || plane1 == NULL)
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++
++   struct nvkmd_rm_foreign_layout fl;
++   uint8_t pte_kind;
++   uint16_t tile_mode;
++   VkResult result = helios_image_layout(image, true, &fl, &pte_kind,
++                                         &tile_mode);
++   if (result != VK_SUCCESS || fl.plane_count != 2)
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++   *plane1 = (struct helios_icd_plane) {
++      .modifier = fl.plane1_modifier,
++      .stride = fl.plane1_stride,
++      .offset = fl.plane1_offset,
++   };
++   return VK_SUCCESS;
++}
++
+ static void
+ helios_scanout_release(VkDevice _device)
+ {
+@@ -320,8 +470,11 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
+    if (lib != NULL && lib->win_open_device != NULL &&
+        lib->win_scanout_set != NULL) {
+       caps |= HELIOS_ICD_CAP_SCANOUT;
+-      if (nvkmd_rm_win_rm_import_served())
++      if (nvkmd_rm_win_rm_import_served()) {
+          caps |= HELIOS_ICD_CAP_RES_ID;
++         if (nvkmd_rm_win_layout_formats_served())
++            caps |= HELIOS_ICD_CAP_LAYOUT_FORMATS;
++      }
+    }
+    uint64_t ops = 0;
+    uint32_t features = 0;
+@@ -357,6 +510,7 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
+       .rm_fence_wait = helios_rm_fence_wait,
+       .rm_fence_close = helios_rm_fence_close,
+       .scanout_present_fenced = helios_scanout_present_fenced,
++      .memory_res_plane1 = helios_memory_res_plane1,
+    };
+    memcpy(out, &api, cap);
+    return VK_SUCCESS;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 5310890..e03d9cf 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -121,6 +121,13 @@ struct nvkmd_rm_lib {
+                                  uint32_t *gem_handle, uint64_t *size,
+                                  uint64_t *modifier, uint32_t *flags,
+                                  uint32_t *host_errno);
++   /* IMPORT_RM of any shared format, with plane 1 (KMD FOREIGN_RESOURCE caps
++    * bit 3, Conduit guest/windows/docs/shared-formats.md); NULL with an
++    * older library
++    */
++   int (*win_import_rm_planes)(const struct nvrm_crm_foreign_import *in,
++                               const struct nvrm_crm_foreign_plane *plane1,
++                               uint32_t *resource_id, uint32_t *host_errno);
+    /* Buffer release (KMD 22.22.315+, QueryCaps bit 35): when the host is done
+     * with a flipped image (guest/windows/docs/foreign-scanout.md).
+     */
+@@ -559,11 +566,19 @@ int nvkmd_rm_win_source_set_locked(struct nvkmd_rm_dev *dev,
+ struct nvkmd_rm_foreign_layout {
+    uint32_t width, height, stride, offset, fourcc;
+    uint64_t modifier;
++   /* 2 for NV12/P010/P016: plane 1 below (shared-formats.md), else 1 */
++   uint32_t plane_count;
++   uint32_t plane1_stride, plane1_offset;
++   uint64_t plane1_modifier;
+ };
+ /* The Helios adapter's LUID, false if unknown */
+ bool nvkmd_rm_win_adapter_luid(uint8_t luid[8]);
+ /* FOREIGN_RESOURCE caps bit 0: IMPORT_RM is served end to end */
+ bool nvkmd_rm_win_rm_import_served(void);
++/* FOREIGN_RESOURCE caps bit 3 (and librmclient's crm_win_import_rm_planes):
++ * ids for every shared format, not only 32 bpp RGB
++ */
++bool nvkmd_rm_win_layout_formats_served(void);
+ /* The process's holder Venus context for imports, 0 before the first one */
+ uint32_t nvkmd_rm_win_holder_ctx(void);
+ VkResult nvkmd_rm_mem_helios_res_id(struct nvkmd_mem *mem,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index 353623e..5ec98af 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -359,6 +359,7 @@ nvkmd_rm_lib_load(void)
+    LOAD(win_fence_wait,             "crm_win_fence_wait",             false);
+    LOAD(win_scanout_present_fenced, "crm_win_scanout_present_fenced", false);
+    LOAD(win_rm_resource_import, "crm_win_rm_resource_import", false);
++   LOAD(win_import_rm_planes,   "crm_win_import_rm_planes",   false);
+    LOAD(win_scanout_status,         "crm_win_scanout_status",         false);
+    LOAD(win_scanout_wait_released,  "crm_win_scanout_wait_released",  false);
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+index d6c7581..aba5d1b 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+@@ -502,6 +502,23 @@ nvkmd_rm_win_rm_import_served(void)
+    return (caps & 1u) != 0;
+ }
+ 
++bool
++nvkmd_rm_win_layout_formats_served(void)
++{
++   const struct nvkmd_rm_lib *lib = nvkmd_rm_lib_get();
++   uint32_t caps = 0;
++
++   if (!debug_get_bool_option("NVK_HELIOS_FORMATS", true))
++      return false;
++   if (lib == NULL || lib->win_foreign_caps == NULL ||
++       lib->win_import_rm_planes == NULL)
++      return false;
++   if (lib->win_foreign_caps(&caps) != 0)
++      return false;
++   /* HELIOS_FOREIGN_CAP_RM_IMPORT | HELIOS_FOREIGN_CAP_LAYOUT_FORMATS */
++   return (caps & 1u) != 0 && (caps & (1u << 3)) != 0;
++}
++
+ uint32_t
+ nvkmd_rm_win_holder_ctx(void)
+ {
+@@ -599,7 +616,20 @@ nvkmd_rm_mem_helios_res_id(struct nvkmd_mem *_mem,
+          .offset = layout->offset,
+       };
+       uint32_t res_id = 0, host_errno = 0;
+-      int ret = lib->win_import_rm(&imp, &res_id, &host_errno);
++      int ret;
++      if (layout->plane_count == 2) {
++         /* The caller checked nvkmd_rm_win_layout_formats_served() */
++         const struct nvrm_crm_foreign_plane plane1 = {
++            .modifier = layout->plane1_modifier,
++            .stride = layout->plane1_stride,
++            .offset = layout->plane1_offset,
++         };
++         ret = lib->win_import_rm_planes != NULL ?
++               lib->win_import_rm_planes(&imp, &plane1, &res_id,
++                                         &host_errno) : -ENOSYS;
++      } else {
++         ret = lib->win_import_rm(&imp, &res_id, &host_errno);
++      }
+       if (ret == 0 && res_id != 0) {
+          mem->helios_res_id = res_id;
+          mem->helios_res_ctx = ctx;
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+index 3947801..d132c0e 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -707,6 +707,13 @@ struct nvrm_crm_foreign_import {
+    uint32_t offset;
+ };
+ 
++/* librmclient's struct crm_foreign_plane: plane 1 of a two-plane format */
++struct nvrm_crm_foreign_plane {
++   uint64_t modifier;
++   uint32_t stride;
++   uint32_t offset;
++};
++
+ /* USERD layout (Nvc36fControl .. Nvca6fControl) */
+ #define NVRM_USERD_GP_GET                         0x88
+ #define NVRM_USERD_GP_PUT                         0x8c
+-- 
+2.43.0
+

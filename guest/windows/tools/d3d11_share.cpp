@@ -9,6 +9,12 @@
 //                                        the ledger's slots must not leak
 //   d3d11_share.exe ledger               print the ledger's counters
 //
+//   d3d11_share.exe fmt <all|a8|r8|r8g8|r16|r16g16|b5g6r5|r10g10b10a2|rgba16f|
+//                        yuy2|nv12|p010|p016|bgra8> [kmt|nt] [w h]
+//                                        one shared texture per format, every
+//                                        byte of every plane checked both ways
+//                                        (docs/shared-formats.md; fmt_share)
+//
 // `perf` skips the readbacks (no correctness check) and reports the
 // producer's flush+release time and hand-offs per second.
 //
@@ -459,8 +465,265 @@ static int churn(UINT count) {
   return failed;
 }
 
+// ---- fmt: one shared texture of each format the desktop and browsers share --
+//
+// guest/windows/docs/shared-formats.md. A creates a shared texture of the
+// format, fills every byte of every plane with a pattern (UpdateSubresource),
+// waits for the GPU and starts B; B opens it, reads every byte back through a
+// staging copy, writes a second pattern over the whole texture and waits for
+// its GPU work; A reads B's pattern back. Bytes, not texels: pixel-exact for
+// every format, planes included (D3D11 lays a planar subresource out as plane
+// 0's rows, then plane 1's rows, at one row pitch).
+
+struct FmtSpec {
+  const char *name;
+  DXGI_FORMAT format;
+  UINT bpp0;     // bytes per texel unit of plane 0 (YUY2: per 2 pixels)
+  UINT hdiv0;    // plane 0 texel units per row = ceil(w / hdiv0)
+  bool two_planes; // 4:2:0, plane 1: ceil(w/2) pairs of 2*bpp0 bytes, ceil(h/2) rows
+  UINT bind;
+};
+
+static const FmtSpec kFmts[] = {
+    {"bgra8", DXGI_FORMAT_B8G8R8A8_UNORM, 4, 1, false, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET},
+    {"a8", DXGI_FORMAT_A8_UNORM, 1, 1, false, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET},
+    {"r8", DXGI_FORMAT_R8_UNORM, 1, 1, false, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET},
+    {"r8g8", DXGI_FORMAT_R8G8_UNORM, 2, 1, false, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET},
+    {"r16", DXGI_FORMAT_R16_UNORM, 2, 1, false, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET},
+    {"r16g16", DXGI_FORMAT_R16G16_UNORM, 4, 1, false, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET},
+    {"b5g6r5", DXGI_FORMAT_B5G6R5_UNORM, 2, 1, false, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET},
+    {"r10g10b10a2", DXGI_FORMAT_R10G10B10A2_UNORM, 4, 1, false, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET},
+    {"rgba16f", DXGI_FORMAT_R16G16B16A16_FLOAT, 8, 1, false, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET},
+    {"yuy2", DXGI_FORMAT_YUY2, 4, 2, false, D3D11_BIND_SHADER_RESOURCE},
+    {"nv12", DXGI_FORMAT_NV12, 1, 1, true, D3D11_BIND_SHADER_RESOURCE},
+    {"p010", DXGI_FORMAT_P010, 2, 1, true, D3D11_BIND_SHADER_RESOURCE},
+    {"p016", DXGI_FORMAT_P016, 2, 1, true, D3D11_BIND_SHADER_RESOURCE},
+};
+
+static const FmtSpec *find_fmt(const char *name) {
+  for (const FmtSpec &f : kFmts)
+    if (!std::strcmp(f.name, name)) return &f;
+  return nullptr;
+}
+
+// Rows of the whole subresource and bytes of row `r` (plane 0 rows first).
+static UINT fmt_rows(const FmtSpec &f, UINT h) { return h + (f.two_planes ? (h + 1) / 2 : 0); }
+static UINT fmt_row_bytes(const FmtSpec &f, UINT w, UINT h, UINT r) {
+  if (r < h) return ((w + f.hdiv0 - 1) / f.hdiv0) * f.bpp0;
+  return ((w + 1) / 2) * f.bpp0 * 2;
+}
+
+static BYTE fmt_byte(UINT r, UINT x, UINT32 seed) {
+  UINT32 v = (r * 2654435761u) ^ (x * 40503u) ^ seed;
+  v ^= v >> 13;
+  v *= 0x5bd1e995u;
+  return BYTE(v ^ (v >> 15));
+}
+
+static void fmt_fill(ID3D11DeviceContext *ctx, ID3D11Texture2D *tex, const FmtSpec &f, UINT w, UINT h,
+                     UINT32 seed) {
+  const UINT pitch = (fmt_row_bytes(f, w, h, 0) > fmt_row_bytes(f, w, h, h) ? fmt_row_bytes(f, w, h, 0)
+                                                                           : fmt_row_bytes(f, w, h, h)) +
+                     64;
+  const UINT rows = fmt_rows(f, h);
+  BYTE *buf = static_cast<BYTE *>(std::calloc(size_t(pitch) * rows, 1));
+  for (UINT r = 0; r < rows; r++)
+    for (UINT x = 0, n = fmt_row_bytes(f, w, h, r); x < n; x++) buf[size_t(r) * pitch + x] = fmt_byte(r, x, seed);
+  ctx->UpdateSubresource(tex, 0, nullptr, buf, pitch, pitch * rows);
+  std::free(buf);
+}
+
+// Bytes of `tex` that differ from `seed`'s pattern, -1 when it cannot be read.
+static long fmt_count_bad(ID3D11Device1 *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *tex, const FmtSpec &f,
+                          UINT w, UINT h, UINT32 seed) {
+  D3D11_TEXTURE2D_DESC d{};
+  tex->GetDesc(&d);
+  d.Usage = D3D11_USAGE_STAGING;
+  d.BindFlags = 0;
+  d.MiscFlags = 0;
+  d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ID3D11Texture2D *st = nullptr;
+  if (FAILED(dev->CreateTexture2D(&d, nullptr, &st))) return -1;
+  ctx->CopyResource(st, tex);
+  D3D11_MAPPED_SUBRESOURCE m{};
+  if (FAILED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+    st->Release();
+    return -1;
+  }
+  long bad = 0, shown = 0;
+  for (UINT r = 0, rows = fmt_rows(f, h); r < rows; r++) {
+    const BYTE *row = static_cast<const BYTE *>(m.pData) + size_t(r) * m.RowPitch;
+    for (UINT x = 0, n = fmt_row_bytes(f, w, h, r); x < n; x++) {
+      if (row[x] != fmt_byte(r, x, seed)) {
+        if (shown++ < 4)
+          std::printf("       %s: row %u byte %u: 0x%02x, want 0x%02x\n", role, r, x, row[x], fmt_byte(r, x, seed));
+        bad++;
+      }
+    }
+  }
+  ctx->Unmap(st, 0);
+  st->Release();
+  return bad;
+}
+
+static void wait_gpu(ID3D11Device1 *dev, ID3D11DeviceContext *ctx) {
+  D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
+  ID3D11Query *q = nullptr;
+  dev->CreateQuery(&qd, &q);
+  ctx->End(q);
+  BOOL done = FALSE;
+  while (ctx->GetData(q, &done, sizeof(done), 0) != S_OK || !done) Sleep(1);
+  q->Release();
+}
+
+static const UINT32 kFmtSeedA = 0x1b873593u, kFmtSeedB = 0xcc9e2d51u;
+
+static int fmt_opener(const FmtSpec &f, const char *mode, UINT w, UINT h, const char *kmt) {
+  role = "B";
+  ID3D11Device1 *dev = nullptr;
+  ID3D11DeviceContext *ctx = nullptr;
+  if (!make_device(&dev, &ctx)) {
+    check("a D3D11 device", false);
+    return 1;
+  }
+  ID3D11Texture2D *tex = nullptr;
+  HRESULT hr;
+  if (!std::strcmp(mode, "kmt")) {
+    HANDLE hs = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(std::strtoull(kmt, nullptr, 0)));
+    hr = dev->OpenSharedResource(hs, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex));
+  } else {
+    hr = dev->OpenSharedResourceByName(kName, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                                       __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex));
+  }
+  std::printf("       B: open %s (%s): 0x%08lx\n", f.name, mode, static_cast<unsigned long>(hr));
+  check("open A's shared texture", SUCCEEDED(hr) && tex);
+  if (FAILED(hr) || !tex) return 1;
+  D3D11_TEXTURE2D_DESC d{};
+  tex->GetDesc(&d);
+  check("the opened texture has A's format and size", d.Format == f.format && d.Width == w && d.Height == h);
+  long bad = fmt_count_bad(dev, ctx, tex, f, w, h, kFmtSeedA);
+  std::printf("       B: %ld bytes differ from A's pattern\n", bad);
+  check("A's bytes, every plane", bad == 0);
+  fmt_fill(ctx, tex, f, w, h, kFmtSeedB);
+  ctx->Flush();
+  wait_gpu(dev, ctx);
+  tex->Release();
+  ctx->Release();
+  dev->Release();
+  std::printf("%s\n", failed ? "B FAILED" : "B PASSED");
+  return failed;
+}
+
+static int fmt_share(const FmtSpec &f, const char *mode, UINT w, UINT h) {
+  const bool kmt = !std::strcmp(mode, "kmt");
+  const char *icd = std::getenv("HELIOS_ICD");
+  std::printf("       A: fmt %s (DXGI %u), %s, %ux%u, HELIOS_ICD=%s\n", f.name, unsigned(f.format), mode, w, h,
+              icd ? icd : "(unset)");
+  ID3D11Device1 *dev = nullptr;
+  ID3D11DeviceContext *ctx = nullptr;
+  if (!make_device(&dev, &ctx)) {
+    check("a D3D11 device", false);
+    return 1;
+  }
+  UINT support = 0;
+  dev->CheckFormatSupport(f.format, &support);
+  std::printf("       A: format support 0x%08x\n", support);
+  D3D11_TEXTURE2D_DESC d{};
+  d.Width = w;
+  d.Height = h;
+  d.MipLevels = 1;
+  d.ArraySize = 1;
+  d.Format = f.format;
+  d.SampleDesc.Count = 1;
+  d.Usage = D3D11_USAGE_DEFAULT;
+  d.BindFlags = f.bind;
+  d.MiscFlags = kmt ? D3D11_RESOURCE_MISC_SHARED : D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+  ID3D11Texture2D *tex = nullptr;
+  HRESULT hr = dev->CreateTexture2D(&d, nullptr, &tex);
+  std::printf("       A: CreateTexture2D bind 0x%x misc 0x%x: 0x%08lx\n", d.BindFlags, d.MiscFlags,
+              static_cast<unsigned long>(hr));
+  check("a shared texture", SUCCEEDED(hr) && tex);
+  if (FAILED(hr) || !tex) return 1;
+  fmt_fill(ctx, tex, f, w, h, kFmtSeedA);
+  long bad = fmt_count_bad(dev, ctx, tex, f, w, h, kFmtSeedA);
+  check("A reads its own bytes", bad == 0);
+
+  char kmtarg[32] = "0";
+  HANDLE nt = nullptr;
+  if (kmt) {
+    IDXGIResource *res = nullptr;
+    HANDLE hs = nullptr;
+    tex->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void **>(&res));
+    hr = res ? res->GetSharedHandle(&hs) : E_NOINTERFACE;
+    check("GetSharedHandle", SUCCEEDED(hr) && hs);
+    std::snprintf(kmtarg, sizeof(kmtarg), "0x%llx", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(hs)));
+    if (res) res->Release();
+  } else {
+    IDXGIResource1 *res = nullptr;
+    tex->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&res));
+    hr = res ? res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, kName, &nt)
+             : E_NOINTERFACE;
+    check("CreateSharedHandle by name", SUCCEEDED(hr) && nt);
+    if (res) res->Release();
+  }
+  ctx->Flush();
+  wait_gpu(dev, ctx);
+
+  char self[MAX_PATH], cmd[1024];
+  GetModuleFileNameA(nullptr, self, sizeof(self));
+  std::snprintf(cmd, sizeof(cmd), "\"%s\" open-fmt %s %s %u %u %s", self, f.name, mode, w, h, kmtarg);
+  STARTUPINFOA si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  if (!CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    check("start B", false);
+    return 1;
+  }
+  WaitForSingleObject(pi.hProcess, 120000);
+  DWORD code = 1;
+  GetExitCodeProcess(pi.hProcess, &code);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+  check("B passed", code == 0);
+
+  bad = fmt_count_bad(dev, ctx, tex, f, w, h, kFmtSeedB);
+  std::printf("       A: %ld bytes differ from B's pattern\n", bad);
+  check("A sees B's bytes (the same memory)", bad == 0);
+  if (nt) CloseHandle(nt);
+  tex->Release();
+  ctx->Release();
+  dev->Release();
+  std::printf("%s %s\n", f.name, failed ? "FMT FAILED" : "FMT PASSED");
+  return failed;
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc >= 7 && !std::strcmp(argv[1], "open-fmt")) {
+    const FmtSpec *f = find_fmt(argv[2]);
+    return f ? fmt_opener(*f, argv[3], UINT(std::atoi(argv[4])), UINT(std::atoi(argv[5])), argv[6]) : 2;
+  }
+  if (argc >= 3 && !std::strcmp(argv[1], "fmt")) {
+    const char *mode = argc > 3 ? argv[3] : "kmt";
+    const UINT w = argc > 5 ? UINT(std::atoi(argv[4])) : 1920;
+    const UINT h = argc > 5 ? UINT(std::atoi(argv[5])) : 1080;
+    if (!std::strcmp(argv[2], "all")) {
+      int fails = 0;
+      for (const FmtSpec &f : kFmts) {
+        failed = 0;
+        fails += fmt_share(f, mode, w, h) != 0;
+      }
+      std::printf("fmt all: %d format(s) failed\n", fails);
+      return fails != 0;
+    }
+    const FmtSpec *f = find_fmt(argv[2]);
+    if (!f || (std::strcmp(mode, "kmt") && std::strcmp(mode, "nt"))) {
+      std::fprintf(stderr, "usage: %s fmt <all|bgra8|a8|r8|r8g8|r16|r16g16|b5g6r5|r10g10b10a2|rgba16f|yuy2|nv12|p010|p016> [kmt|nt] [w h]\n",
+                   argv[0]);
+      return 2;
+    }
+    return fmt_share(*f, mode, w, h);
+  }
   if (argc >= 6 && !std::strcmp(argv[1], "open") && !std::strcmp(argv[2], "keyed-load"))
     return keyed_load_opener(UINT(std::atoi(argv[3])), UINT(std::atoi(argv[4])), UINT(std::atoi(argv[5])),
                              argc > 6 && std::atoi(argv[6]) != 0);

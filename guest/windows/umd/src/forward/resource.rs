@@ -281,6 +281,11 @@ pub(crate) unsafe fn allocate_wddm_resource(
             plane_offset: 0,
             reserved: 0,
         },
+        plane1: helios_protocol::HeliosWddmAllocPlane {
+            modifier: 0,
+            stride: 0,
+            plane_offset: 0,
+        },
         alloc: HeliosWddmAllocPrivate::new(
             if backing.is_some() {
                 HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
@@ -360,15 +365,29 @@ pub(crate) unsafe fn allocate_wddm_resource(
         private.meta.venus_alloc_size = 0;
         private.meta.memory_type_index = 0;
         private.meta.plane_offset = u64::from(f.layout.offset);
+        // A two-plane resource (NV12/P010/P016, docs/shared-formats.md):
+        // version 2, the plane count in `reserved`, plane 1 at byte 128.
+        let two_planes = f.layout.plane1_stride != 0;
         private.layout = helios_protocol::HeliosWddmAllocLayout {
             modifier: f.layout.modifier,
             magic: helios_protocol::HELIOS_WDDM_LAYOUT_MAGIC,
-            version: helios_protocol::HELIOS_WDDM_LAYOUT_VERSION,
+            version: if two_planes {
+                helios_protocol::HELIOS_WDDM_LAYOUT_VERSION_PLANES
+            } else {
+                helios_protocol::HELIOS_WDDM_LAYOUT_VERSION
+            },
             fourcc: f.layout.fourcc,
             stride: f.layout.stride,
             plane_offset: f.layout.offset,
-            reserved: 0,
+            reserved: if two_planes { 2 } else { 0 },
         };
+        if two_planes {
+            private.plane1 = helios_protocol::HeliosWddmAllocPlane {
+                modifier: f.layout.plane1_modifier,
+                stride: f.layout.plane1_stride,
+                plane_offset: f.layout.plane1_offset,
+            };
+        }
     }
     let pre_private_alloc = private.alloc;
     let pre_private_meta = private.meta;
@@ -395,11 +414,14 @@ pub(crate) unsafe fn allocate_wddm_resource(
 
     let mut allocation_info = ddi::D3DDDI_ALLOCATIONINFO2::default();
     let private_ptr = (&mut private as *mut RuntimeAllocPrivate).cast();
-    // 128 bytes (with the layout trailer) only for a foreign adoption.
-    let private_size = if foreign.is_some() {
-        helios_protocol::HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES as u32
-    } else {
-        core::mem::offset_of!(RuntimeAllocPrivate, layout) as u32
+    // 128 bytes (with the layout trailer) only for a foreign adoption, 144
+    // (plane 1 too) for a two-plane one.
+    let private_size = match foreign {
+        Some(f) if f.layout.plane1_stride != 0 => {
+            helios_protocol::HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES as u32
+        }
+        Some(_) => helios_protocol::HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES as u32,
+        None => core::mem::offset_of!(RuntimeAllocPrivate, layout) as u32,
     };
     allocation_info.pPrivateDriverData = private_ptr;
     allocation_info.PrivateDriverDataSize = private_size;
@@ -757,7 +779,14 @@ pub(crate) unsafe fn finish_wddm_tex2d_nvk(
                     hr as u32,
                     foreign.map_or(0, |f| f.resource_id)
                 );
-                set_runtime_error(h, hr);
+                // An id-less texture (a format or kind NVK cannot mint a
+                // resource id for, or a KMD without the shared-format cap,
+                // docs/shared-formats.md) falls back to a KMD placeholder; when
+                // that is refused too, fail this one creation with the error
+                // CreateResource may return (E_OUTOFMEMORY: the app sees a
+                // failed CreateTexture2D and can fall back) instead of an
+                // error the runtime turns into a removed device.
+                set_runtime_error(h, if foreign.is_none() { E_OUTOFMEMORY } else { hr });
                 return;
             }
         };
