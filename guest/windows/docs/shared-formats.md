@@ -232,4 +232,17 @@ NVK's (`align(width * bpp, 128)`) and DXVK builds shared images OPTIMAL.
 
 ## 10. Results
 
-(filled in as runs complete)
+2026-10-06, win11 (22.22.319.x KMD from feat/umd-nvk-combined, no
+`CAP_LAYOUT_FORMATS` yet), NVK loaded per process with
+`HELIOS_NVK_ICD=W:\fmt\nvk\vulkan_nouveau.dll` (patches 0040, 0041), the
+installed UMD otherwise:
+
+| run | result |
+|---|---|
+| NVK to NVK `bgra8`, kmt 256x128 and nt 1920x1080 (0040, 0040+0041) | byte-exact both ways (32 bpp path unchanged) |
+| Venus to Venus `a8`, `r10g10b10a2`, `rgba16f`, `nv12` | byte-exact both ways (validates the tool, planes included) |
+| NVK `a8`, `r8g8`, `r10g10b10a2`, `rgba16f`, `nv12` | refused as designed on this KMD (`memory_res_id` -11, no escape); the UMD's KMD placeholder is then refused by `pfnAllocateCb` (E_INVALIDARG) and the runtime reported DEVICE_REMOVED. Pre-existing: the same happens to `bgra8` with `NVK_HELIOS_RESID=0`. The UMD now answers E_OUTOFMEMORY for that one creation (commit e38d158); relayed to the KMD session |
+| health | no dumps, no TDR, no app crash, DWM pid unchanged |
+
+Pending: the non-32 bpp formats end to end need the KMD change (section 5);
+then `d3d11_share.exe fmt all kmt|nt` on NVK.
