@@ -17,9 +17,10 @@
 //! # The policy (`Policy::Dynamic`)
 //!
 //! * No fixed per-process share. Any device may map until the window is full.
-//! * A reserve (default 256 MiB, `NvWinReserveMb`) at the top of the window is held back for
-//!   the privileged device (DWM's): a non-privileged map is refused once it would take the
-//!   in-use total past `cap - reserve`; a privileged one may use everything up to `cap`.
+//! * A reserve (default 256 MiB, `NvWinReserveMb`, never more than a quarter of the cap) at the
+//!   top of the window is held back for the privileged device (DWM's): a non-privileged map
+//!   is refused once it would take the in-use total past `cap - reserve`; a privileged one
+//!   may use everything up to `cap`.
 //! * `cap` is the window size, or `NvWinMaxMb` when that is set and smaller (an operator
 //!   bound on the non-paged pool the MDLs cost: 2 KiB per MiB mapped).
 //! * A refusal is counted by reason and answered `NO_RESOURCES` (what the UMD already
@@ -137,15 +138,19 @@ pub struct Config {
 }
 
 impl Config {
-    /// `window_bytes`: the window's length. `reserve_mib`: `NvWinReserveMb`. `max_mib`:
-    /// `NvWinMaxMb` (0 = no bound beyond the window). Any u32 MiB value is valid: the
-    /// products are u64 (4 PiB at most).
+    /// `window_bytes`: the window's length. `reserve_mib`: `NvWinReserveMb`, clamped to a
+    /// quarter of the cap (so an ordinary device always has at least three quarters).
+    /// `max_mib`: `NvWinMaxMb` (0 = no bound beyond the window). Any u32 MiB value is valid:
+    /// the products are u64 (4 PiB at most).
     pub fn new(window_bytes: u64, reserve_mib: u32, max_mib: u32, policy: Policy) -> Self {
         let mut cap = window_bytes & !(PAGE - 1);
         if max_mib != 0 {
             cap = cap.min((u64::from(max_mib) << 20) & !(PAGE - 1));
         }
-        let reserve = (u64::from(reserve_mib) << 20).min(cap);
+        // At most a quarter of the cap: a reserve as large as a small window (a 256 MiB BAR1
+        // without ReBAR, or `NvWinMaxMb` at or below the reserve) would leave an ordinary
+        // device nothing at all, which is worse than the legacy window/4 it replaces.
+        let reserve = (u64::from(reserve_mib) << 20).min((cap / 4) & !(PAGE - 1));
         Config {
             window: window_bytes,
             cap,
@@ -704,8 +709,9 @@ mod tests {
         // The largest representable knob values.
         let c = Config::new(u64::MAX, u32::MAX, u32::MAX, Policy::Dynamic);
         assert_eq!(c.cap, (u64::from(u32::MAX) << 20) & !(PAGE - 1));
-        assert_eq!(c.reserve, c.cap);
-        assert_eq!(c.ordinary_limit(), 0);
+        // The reserve is clamped to a quarter of the cap, however large the knob.
+        assert_eq!(c.reserve, c.cap / 4);
+        assert_eq!(c.ordinary_limit(), c.cap - c.cap / 4);
     }
 
     #[test]
@@ -720,14 +726,51 @@ mod tests {
     }
 
     #[test]
-    fn reserve_never_exceeds_cap() {
+    fn reserve_never_exceeds_a_quarter_of_the_cap() {
+        // A 128 MiB window with the default 256 MiB reserve: 32 MiB reserved, 96 MiB ordinary.
         let c = Config::new(128 * MIB, 256, 0, Policy::Dynamic);
-        assert_eq!(c.reserve, 128 * MIB);
-        assert_eq!(c.ordinary_limit(), 0);
+        assert_eq!(c.reserve, 32 * MIB);
+        assert_eq!(c.ordinary_limit(), 96 * MIB);
         let a = Account::new(c, 4).unwrap();
-        // Nothing is left for an ordinary device; the privileged one has it all.
-        assert_eq!(a.check(1, false, 4096), Err(Refusal::TooBig));
+        assert_eq!(a.check(1, false, 96 * MIB), Ok(()));
+        assert_eq!(a.check(1, false, 96 * MIB + 4096), Err(Refusal::TooBig));
         assert_eq!(a.check(1, true, 128 * MIB), Ok(()));
+    }
+
+    /// Small windows (a BAR1 without ReBAR) and operator bounds at or below the reserve: an
+    /// ordinary device is never locked out, and never gets less than the legacy window/4.
+    #[test]
+    fn small_windows_table() {
+        // (window MiB, NvWinMaxMb, reserve knob MiB) -> (cap MiB, reserve MiB)
+        let rows: &[(u64, u32, u32, u64, u64)] = &[
+            (256, 0, 256, 256, 64),      // BAR1 256 MiB, default reserve
+            (256, 256, 256, 256, 64),    // bound equal to the window
+            (512, 0, 256, 512, 128),
+            (1024, 0, 256, 1024, 256),   // the reserve fits exactly at a quarter
+            (4096, 0, 256, 4096, 256),   // 4 GiB: the knob applies
+            (32768, 0, 256, 32768, 256),
+            (32768, 128, 256, 128, 32),  // NvWinMaxMb below the reserve
+            (32768, 256, 256, 256, 64),  // NvWinMaxMb == reserve
+            (256, 0, 0, 256, 0),         // reserve knob 0
+            (4, 0, 256, 4, 1),
+            (0, 0, 256, 0, 0),           // no window
+        ];
+        for &(win, max, knob, cap, reserve) in rows {
+            let c = Config::new(win * MIB, knob, max, Policy::Dynamic);
+            assert_eq!((c.cap, c.reserve), (cap * MIB, reserve * MIB), "{win} {max} {knob}");
+            assert!(c.ordinary_limit() >= c.cap - c.cap / 4 || c.cap == 0, "{win} {max} {knob}");
+            assert!(
+                c.ordinary_limit() >= c.legacy_quota().min(c.cap),
+                "never below the legacy quota: {win} {max} {knob}"
+            );
+            if cap > 0 {
+                let a = Account::new(c, 4).unwrap();
+                // A first ordinary map of a quarter of the window is accepted (crm_smoke, NVK
+                // before DWM's first SCANOUT_SET).
+                assert_eq!(a.check(1, false, cap * MIB / 4), Ok(()), "{win} {max} {knob}");
+                assert_eq!(a.check(1, false, 4096), Ok(()));
+            }
+        }
     }
 
     #[test]

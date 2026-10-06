@@ -1175,7 +1175,10 @@ free extent": `NvWinFreeMb` is `cap - in use`, an upper bound.
 * No fixed per-process share. Any device may map until the window is full.
 * A reserve (`NvWinReserveMb`, default 256 MiB) is kept for the privileged device: a map by anybody
   else is refused once it would take the in-use total past `cap - reserve`; the privileged device
-  may use everything up to `cap`.
+  may use everything up to `cap`. The reserve is clamped to a quarter of the cap, so a small
+  window (a 256 MiB BAR1 without ReBAR keeps 64 MiB) or an `NvWinMaxMb` at or below the reserve
+  still gives an ordinary device at least three quarters: never less than the legacy window/4
+  (`small_windows_table`).
 * `cap` is the window size, or `NvWinMaxMb` when that is set and smaller: an operator bound on the
   non-paged pool (each mapping costs an MDL of 2 KiB per MiB: 64 MiB of pool for a full 32 GiB, 256
   MiB for 128 GiB; `NvWinMaxMb` = 16384 would hold it to 32 MiB).
