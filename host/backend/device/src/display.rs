@@ -47,8 +47,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use protocol::messages::{
-    CursorUpdate, DisplayModeEvent, INPUT_ABS_MAX, InputEventEntry, ScanoutFlip, input,
+    CursorUpdate, DisplayModeEvent, INPUT_ABS_MAX, InputEventEntry, ScanoutFlip, ScanoutReleased,
+    input,
 };
+
+pub use crate::scanout_release::BufKey;
+use crate::scanout_release::ReleaseTracker;
 
 /// CLOCK_MONOTONIC in microseconds: the broker's clock too, so a frame stamped
 /// with it (`CLIENT_SEQ_USEC`) lets the broker measure flip -> screen.
@@ -301,6 +305,11 @@ pub mod wire {
     /// (a stream host with no client attached wants none). Also makes it a
     /// session client for the mode policy ([`super::ModeArbiter`]).
     pub const CAP_IDLE: u32 = 1 << 14;
+    /// Conduit: the broker's [`EV_RELEASE`] carries, in x, the `seq` of the
+    /// newest ATTACH of that buffer it covers, and every ATTACH is released
+    /// eventually (one the display refused or dropped at once). Without it a
+    /// buffer counts as done for that broker once it was sent another one.
+    pub const CAP_RELEASE_SEQ: u32 = 1 << 15;
     /// CMD_CAPS bit: a clipboard agent is behind this client.
     pub const CLIENT_CLIPBOARD: u32 = 1 << 0;
     /// CMD_CAPS bit: ATTACH/COMMIT `seq` is our CLOCK_MONOTONIC microseconds.
@@ -1009,6 +1018,16 @@ pub trait InputSink: Send {
     }
 }
 
+/// Where `ScanoutReleased` events go: the event queue, in the vhost-user
+/// binary. Called from the thread serving guest requests (a flip that
+/// replaced a buffer no client holds) and from the link thread (a client's
+/// release); must not block and must not call back into the link.
+pub trait ReleaseSink: Send + Sync {
+    /// Deliver as many of `r` as there are event buffers posted, in order.
+    /// Returns how many were consumed; the rest are retried shortly.
+    fn released(&self, r: &[ScanoutReleased]) -> usize;
+}
+
 /// What the guest's driver has said about taking Conduit input since the
 /// device last started, shared between the request path (which learns it)
 /// and the input sink (which asks, [`InputSink::takes_input`]). Cleared on
@@ -1240,6 +1259,10 @@ struct LinkState {
     /// The third field is the ATTACH flags ([`wire::CMD_F_SHM`] for the
     /// console's shared-memory frames).
     frame: Option<(Arc<OwnedFd>, ScanoutFlip, u16)>,
+    /// Which guest buffer `frame` is (`None` for the console's).
+    frame_key: Option<BufKey>,
+    /// Which buffers clients still read (docs/SCANOUT.md "Buffer release").
+    release: ReleaseTracker,
     /// The last frame / cursor while nobody wanted them (see [`Parked`]).
     parked_frame: Option<Parked<ScanoutFlip>>,
     parked_cursor: Option<Parked<CursorUpdate>>,
@@ -1272,6 +1295,8 @@ pub struct LinkStats {
     pub clip_to_host: AtomicU64,
     /// Frames re-sent to a client whose socket had been full.
     pub resent: AtomicU64,
+    /// `ScanoutReleased` events delivered to the guest.
+    pub released: AtomicU64,
 }
 
 /// The backend's connections to its display clients (brokers): the local
@@ -1300,7 +1325,28 @@ pub struct DisplayLink {
     console_shown: AtomicBool,
     /// A console is attached ([`DisplayLink::attach_console`]).
     console_attached: AtomicBool,
+    /// The guest wants `ScanoutReleased` (lock-free check on every flip).
+    release_on: AtomicBool,
+    release_sink: Mutex<Option<Arc<dyn ReleaseSink>>>,
     pub stats: LinkStats,
+}
+
+/// The guest's name for a `ScanoutFlip` buffer.
+fn gem_key(f: &ScanoutFlip) -> BufKey {
+    BufKey::Gem {
+        owner: f.owner_handle,
+        handle: f.host_handle,
+    }
+}
+
+/// A dma-buf's inode: its identity to a display client (`EV_RELEASE`).
+fn fd_inode(fd: RawFd) -> u64 {
+    // SAFETY: fstat into a zeroed struct on a descriptor live for the call.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return 0;
+    }
+    st.st_ino
 }
 
 fn real_export(drm: RawFd, host_handle: u32) -> Result<OwnedFd, i32> {
@@ -1353,6 +1399,8 @@ impl DisplayLink {
             exporter: Mutex::new(Arc::new(real_export)),
             console_shown: AtomicBool::new(false),
             console_attached: AtomicBool::new(false),
+            release_on: AtomicBool::new(false),
+            release_sink: Mutex::new(None),
             stats: LinkStats::default(),
         })
     }
@@ -1360,6 +1408,127 @@ impl DisplayLink {
     /// Replace the PRIME export used for parked buffers (tests).
     pub fn set_exporter(&self, f: Arc<Exporter>) {
         *self.exporter.lock().unwrap() = f;
+    }
+
+    /// Where `ScanoutReleased` events go.
+    pub fn set_release_sink(&self, sink: Arc<dyn ReleaseSink>) {
+        *self.release_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// The guest acked `NVGPU_F_SCANOUT_RELEASE` at device start (`true`), or
+    /// the device started or reset without it (`false`, which also forgets
+    /// every tracked buffer).
+    pub fn set_release_enabled(&self, on: bool) {
+        let mut st = self.state.lock().unwrap();
+        st.release.set_enabled(on);
+        self.release_on.store(on, Ordering::Release);
+    }
+
+    /// The guest wants `ScanoutReleased` events.
+    #[inline]
+    pub fn release_enabled(&self) -> bool {
+        self.release_on.load(Ordering::Acquire)
+    }
+
+    /// The guest flipped `key` (`None`: the console): note it, and queue
+    /// whatever that frees.
+    fn flipped_locked(&self, st: &mut LinkState, key: Option<BufKey>, seq: u64) {
+        if !self.release_enabled() {
+            return;
+        }
+        let now = Instant::now();
+        st.release.flipped(key, seq, now);
+        st.release.collect(now);
+    }
+
+    /// Hand queued releases to the sink. Called without the state lock.
+    fn deliver_releases(&self) {
+        if !self.release_enabled() {
+            return;
+        }
+        let batch = {
+            let mut st = self.state.lock().unwrap();
+            if !st.release.pending() {
+                return;
+            }
+            st.release.take()
+        };
+        let sink = self.release_sink.lock().unwrap().clone();
+        let n = match sink {
+            Some(s) => s.released(&batch).min(batch.len()),
+            // Nobody to tell: dropped.
+            None => batch.len(),
+        };
+        self.stats.released.fetch_add(n as u64, Ordering::Relaxed);
+        if n < batch.len() {
+            self.state
+                .lock()
+                .unwrap()
+                .release
+                .untake(batch[n..].to_vec());
+        }
+    }
+
+    /// The link thread: forced releases that came due, and releases a guest
+    /// with no event buffer posted could not take before. Returns when to
+    /// look again, if anything waits.
+    fn tick_releases(&self) -> Option<Duration> {
+        if !self.release_enabled() {
+            return None;
+        }
+        {
+            let mut st = self.state.lock().unwrap();
+            st.release.collect(Instant::now());
+        }
+        self.deliver_releases();
+        let st = self.state.lock().unwrap();
+        if st.release.pending() {
+            return Some(Duration::from_millis(2));
+        }
+        st.release
+            .next_deadline()
+            .map(|d| d.saturating_duration_since(Instant::now()))
+    }
+
+    /// Client `i` released the buffer with inode `inode` up to its ATTACH
+    /// stamped `stamp` (`EV_RELEASE` from a `CAP_RELEASE_SEQ` client).
+    fn client_released(&self, i: usize, inode: u64, stamp: u32) {
+        if !self.release_enabled() {
+            return;
+        }
+        {
+            let mut st = self.state.lock().unwrap();
+            if st
+                .clients
+                .get(i)
+                .is_none_or(|c| c.broker_caps & wire::CAP_RELEASE_SEQ == 0)
+            {
+                return;
+            }
+            st.release.released(i, inode, stamp);
+            st.release.collect(Instant::now());
+        }
+        self.deliver_releases();
+    }
+
+    /// Client `i` reads nothing any more (gone, or idle).
+    fn client_gone_locked(&self, st: &mut LinkState, i: usize) {
+        if st.release.enabled() {
+            st.release.client_gone(i);
+            st.release.collect(Instant::now());
+        }
+    }
+
+    /// The guest destroyed Venus resource `id`: it is no longer tracked.
+    pub fn forget_resource(&self, id: u32) {
+        if !self.release_enabled() {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        st.release.forget(|k| k == BufKey::Resource(id));
+        if st.frame_key == Some(BufKey::Resource(id)) {
+            st.frame_key = None;
+        }
     }
 
     /// The guest wants the current host clipboard (again): its driver just
@@ -1432,8 +1601,10 @@ impl DisplayLink {
         // The guest's cursor and last frame outlive a connection: the next
         // broker gets them once it has said HELLO.
         st.clients[i].reset(Some(Arc::new(sock)));
+        self.client_gone_locked(&mut st, i);
         self.recount(&st);
         drop(st);
+        self.deliver_releases();
         self.stats.connects.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1446,6 +1617,8 @@ impl DisplayLink {
     fn drop_conn(&self, i: usize, sock: &Arc<OwnedFd>) {
         let mut st = self.state.lock().unwrap();
         self.drop_conn_locked(&mut st, i, sock);
+        drop(st);
+        self.deliver_releases();
     }
 
     fn drop_conn_locked(&self, st: &mut LinkState, i: usize, sock: &Arc<OwnedFd>) {
@@ -1456,6 +1629,7 @@ impl DisplayLink {
             // SAFETY: shutdown on a live descriptor; wakes the reader's poll.
             unsafe { libc::shutdown(sock.as_raw_fd(), libc::SHUT_RDWR) };
             c.reset(None);
+            self.client_gone_locked(st, i);
             self.recount(st);
         }
     }
@@ -1470,18 +1644,21 @@ impl DisplayLink {
         if self.wants_frames() {
             return false;
         }
-        let Some(drm) = Self::drm_for(&st, drm, f.owner_handle) else {
-            return true;
-        };
-        st.frame = None;
-        st.parked_frame = Some(Parked {
-            drm,
-            owner: f.owner_handle,
-            host_handle: f.host_handle,
-            what: *f,
-        });
-        self.note_parked(&st);
-        self.stats.no_broker.fetch_add(1, Ordering::Relaxed);
+        self.flipped_locked(&mut st, Some(gem_key(f)), f.seq);
+        if let Some(drm) = Self::drm_for(&st, drm, f.owner_handle) {
+            st.frame = None;
+            st.frame_key = None;
+            st.parked_frame = Some(Parked {
+                drm,
+                owner: f.owner_handle,
+                host_handle: f.host_handle,
+                what: *f,
+            });
+            self.note_parked(&st);
+            self.stats.no_broker.fetch_add(1, Ordering::Relaxed);
+        }
+        drop(st);
+        self.deliver_releases();
         true
     }
 
@@ -1546,6 +1723,16 @@ impl DisplayLink {
             st.parked_cursor = None;
         }
         self.note_parked(&st);
+        if st.release.enabled() {
+            let gone = BufKey::Gem {
+                owner,
+                handle: host_handle,
+            };
+            st.release.forget(|k| k == gone);
+            if st.frame_key == Some(gone) {
+                st.frame_key = None;
+            }
+        }
     }
 
     /// The guest closed drm file `owner`: drop parked buffers (and the
@@ -1559,6 +1746,13 @@ impl DisplayLink {
             st.parked_cursor = None;
         }
         self.note_parked(&st);
+        if st.release.enabled() {
+            let gone = |k: BufKey| matches!(k, BufKey::Gem { owner: o, .. } if o == owner);
+            st.release.forget(gone);
+            if st.frame_key.is_some_and(gone) {
+                st.frame_key = None;
+            }
+        }
     }
 
     /// A client became active: export what was parked while nobody looked.
@@ -1569,7 +1763,10 @@ impl DisplayLink {
         let export = self.exporter.lock().unwrap().clone();
         if let Some(p) = st.parked_frame.take() {
             match export(p.drm.as_raw_fd(), p.host_handle) {
-                Ok(fd) => st.frame = Some((Arc::new(fd), p.what, 0)),
+                Ok(fd) => {
+                    st.frame = Some((Arc::new(fd), p.what, 0));
+                    st.frame_key = Some(gem_key(&p.what));
+                }
                 Err(e) => log::warn!(
                     "display: export of the parked frame (handle {} on file {}): errno {e}",
                     p.host_handle,
@@ -1598,13 +1795,22 @@ impl DisplayLink {
     /// Present `dmabuf` as described by `f` to every client that wants
     /// frames. Never blocks.
     pub fn flip(&self, dmabuf: RawFd, f: &ScanoutFlip) -> FlipOutcome {
+        self.flip_keyed(dmabuf, f, Some(gem_key(f)))
+    }
+
+    fn flip_keyed(&self, dmabuf: RawFd, f: &ScanoutFlip, key: Option<BufKey>) -> FlipOutcome {
         let mut st = self.state.lock().unwrap();
         self.guest_shows_locked(&mut st, f);
-        if !self.wants_frames() {
+        self.flipped_locked(&mut st, key, f.seq);
+        let out = if !self.wants_frames() {
             self.stats.no_broker.fetch_add(1, Ordering::Relaxed);
-            return FlipOutcome::NoBroker;
-        }
-        self.present_locked(&mut st, dmabuf, f, 0)
+            FlipOutcome::NoBroker
+        } else {
+            self.present_locked(&mut st, dmabuf, f, 0, key)
+        };
+        drop(st);
+        self.deliver_releases();
+        out
     }
 
     /// Keep `fd` as the current frame and send it to every client that
@@ -1615,8 +1821,10 @@ impl DisplayLink {
         fd: RawFd,
         f: &ScanoutFlip,
         flags: u16,
+        key: Option<BufKey>,
     ) -> FlipOutcome {
         st.frame = Self::keep(fd).map(|k| (k, *f, flags));
+        st.frame_key = key;
         if st.parked_frame.take().is_some() {
             self.note_parked(st);
         }
@@ -1643,7 +1851,15 @@ impl DisplayLink {
     /// what happens with nobody looking. A GEM buffer is parked unexported,
     /// but this one is exported already (once per resource), so it is kept
     /// as the frame a client that attaches later is shown first.
-    pub fn flip_dmabuf(&self, dmabuf: RawFd, g: &FrameGeometry) -> FlipOutcome {
+    ///
+    /// `resource` is the Venus resource shown, which `ScanoutReleased` names.
+    pub fn flip_dmabuf(
+        &self,
+        dmabuf: RawFd,
+        g: &FrameGeometry,
+        resource: Option<u32>,
+    ) -> FlipOutcome {
+        let key = resource.map(BufKey::Resource);
         let f = ScanoutFlip {
             width: g.width,
             height: g.height,
@@ -1657,15 +1873,19 @@ impl DisplayLink {
             let mut st = self.state.lock().unwrap();
             self.guest_shows_locked(&mut st, &f);
             if !self.wants_frames() {
+                self.flipped_locked(&mut st, key, 0);
                 st.frame = Self::keep(dmabuf).map(|k| (k, f, 0));
+                st.frame_key = key;
                 if st.parked_frame.take().is_some() {
                     self.note_parked(&st);
                 }
                 self.stats.no_broker.fetch_add(1, Ordering::Relaxed);
+                drop(st);
+                self.deliver_releases();
                 return FlipOutcome::NoBroker;
             }
         }
-        self.flip(dmabuf, &f)
+        self.flip_keyed(dmabuf, &f, key)
     }
 
     /// One frame to client `i`. A full socket owes it the newest frame,
@@ -1766,6 +1986,11 @@ impl DisplayLink {
         match send_records(fd, &frame, Some(dmabuf)) {
             Ok(()) => {
                 c.frame_owed = false;
+                let reports = c.broker_caps & wire::CAP_RELEASE_SEQ != 0;
+                if st.release.enabled() {
+                    let key = st.frame_key;
+                    st.release.sent(i, key, fd_inode(dmabuf), stamp, reports);
+                }
                 self.stats.sent.fetch_add(1, Ordering::Relaxed);
                 FlipOutcome::Sent
             }
@@ -1967,6 +2192,9 @@ impl DisplayLink {
         }
         c.active = on;
         c.frame_owed = false;
+        if !on {
+            self.client_gone_locked(&mut st, i);
+        }
         self.recount(&st);
         log::info!(
             "display: client {i} {}",
@@ -1975,6 +2203,8 @@ impl DisplayLink {
         if on {
             self.became_active_locked(&mut st, i);
         }
+        drop(st);
+        self.deliver_releases();
     }
 
     /// The link thread: frames owed to clients whose sockets drained.
@@ -2104,6 +2334,10 @@ impl DisplayLink {
     ///
     /// With a boot console attached, the console takes over after
     /// [`CONSOLE_GRACE`] unless the guest flips again first.
+    ///
+    /// For a guest that takes `ScanoutReleased`, the buffer that was shown is
+    /// released once the clients are done with it, so it is no longer kept to
+    /// be re-sent to a client that attaches later: the guest may draw into it.
     pub fn disable(&self) {
         let mut st = self.state.lock().unwrap();
         for c in st.clients.iter_mut() {
@@ -2115,6 +2349,20 @@ impl DisplayLink {
                 ConsoleMode::Pending(Instant::now() + CONSOLE_GRACE),
             );
         }
+        if st.release.enabled() {
+            let now = Instant::now();
+            st.release.disabled(now);
+            st.release.collect(now);
+            if st.frame_key.is_some() {
+                st.frame = None;
+                st.frame_key = None;
+            }
+            if st.parked_frame.take().is_some() {
+                self.note_parked(&st);
+            }
+        }
+        drop(st);
+        self.deliver_releases();
     }
 
     // -- The boot console (crate::console) ---------------------------------
@@ -2238,14 +2486,20 @@ impl DisplayLink {
         if st.console_mode != Some(ConsoleMode::Shown) {
             return FlipOutcome::NoBroker;
         }
-        if !self.wants_frames() {
+        self.flipped_locked(&mut st, None, 0);
+        let out = if !self.wants_frames() {
             st.frame = Self::keep(memfd).map(|k| (k, f, wire::CMD_F_SHM));
+            st.frame_key = None;
             if st.parked_frame.take().is_some() {
                 self.note_parked(&st);
             }
-            return FlipOutcome::NoBroker;
-        }
-        self.present_locked(&mut st, memfd, &f, wire::CMD_F_SHM)
+            FlipOutcome::NoBroker
+        } else {
+            self.present_locked(&mut st, memfd, &f, wire::CMD_F_SHM, None)
+        };
+        drop(st);
+        self.deliver_releases();
+        out
     }
 
     /// Try once to connect client `i`. `Ok(false)` when it has no path.
@@ -2453,6 +2707,10 @@ impl DisplayLink {
             } else {
                 2
             };
+            // Wake for releases that are due or undelivered.
+            if let Some(d) = self.tick_releases() {
+                timeout = timeout.min((d.as_millis() as i32).max(1));
+            }
             // Wake for the next reconnect attempt.
             for (i, s) in socks.iter().enumerate() {
                 if s.is_none() && paths.get(i).is_some_and(Option::is_some) {
@@ -2731,6 +2989,9 @@ impl DisplayLink {
                 self.hello_at(i, p.w1);
             }
             EV_ACTIVE => self.set_active(i, p.x != 0),
+            EV_RELEASE => {
+                self.client_released(i, (p.w0 as u64) | ((p.w1 as u64) << 32), p.x as u32)
+            }
             EV_FORMAT => {
                 let m = (p.w0 as u64) | ((p.w1 as u64) << 32);
                 if p.x == 1 {
@@ -2926,7 +3187,10 @@ mod tests {
         // forwards GetSysFiles through the KMD: still not the Linux module.
         claims.saw_request(MsgType::GetSysFiles as u32);
         claims.saw_request(MsgType::GetProcFiles as u32);
-        assert!(!claims.takes_input(true), "Windows NVK's GetSysFiles came late");
+        assert!(
+            !claims.takes_input(true),
+            "Windows NVK's GetSysFiles came late"
+        );
 
         // A Linux guest reboots into Windows: the restart forgets it.
         claims.device_started(VERSION_1 | u64::from(NVGPU_CFG_TAKES_INPUT));
@@ -4249,5 +4513,177 @@ mod tests {
             .clip_to_guest
             .load(Ordering::Relaxed)
             == 2));
+    }
+
+    // -- Buffer release (docs/SCANOUT.md "Buffer release") -----------------
+
+    /// What reached the guest's event queue, with room for `room` more.
+    struct Releases {
+        got: Mutex<Vec<ScanoutReleased>>,
+        room: Mutex<usize>,
+    }
+
+    impl ReleaseSink for Releases {
+        fn released(&self, r: &[ScanoutReleased]) -> usize {
+            let mut room = self.room.lock().unwrap();
+            let n = r.len().min(*room);
+            *room -= n;
+            self.got.lock().unwrap().extend_from_slice(&r[..n]);
+            n
+        }
+    }
+
+    fn releasing(link: &DisplayLink) -> Arc<Releases> {
+        let sink = Arc::new(Releases {
+            got: Mutex::new(Vec::new()),
+            room: Mutex::new(usize::MAX),
+        });
+        link.set_release_sink(sink.clone());
+        link.set_release_enabled(true);
+        sink
+    }
+
+    fn gflip(seq: u64, handle: u32) -> ScanoutFlip {
+        ScanoutFlip {
+            host_handle: handle,
+            ..flip(seq, 1920)
+        }
+    }
+
+    fn released(sink: &Releases) -> Vec<(u32, u64, u32)> {
+        std::mem::take(&mut *sink.got.lock().unwrap())
+            .iter()
+            .map(|r| (r.host_handle, r.seq, r.flags))
+            .collect()
+    }
+
+    const NOT_SHOWN: u32 = protocol::messages::SCANOUT_RELEASED_NOT_SHOWN;
+
+    #[test]
+    fn a_guest_that_did_not_ask_gets_no_release() {
+        let link = DisplayLink::new(None);
+        let sink = releasing(&link);
+        link.set_release_enabled(false);
+        let (a, b) = (memfd(), memfd());
+        link.flip(a.as_raw_fd(), &gflip(1, 10));
+        link.flip(b.as_raw_fd(), &gflip(2, 11));
+        assert!(released(&sink).is_empty());
+    }
+
+    #[test]
+    fn with_nobody_watching_the_replaced_buffer_is_released_at_once() {
+        let link = DisplayLink::new(None);
+        let sink = releasing(&link);
+        let drm = memfd();
+        // Parked (GEM, never exported) and kept (a Venus dma-buf) alike.
+        assert!(link.park(drm.as_raw_fd(), &gflip(1, 10)));
+        assert!(released(&sink).is_empty(), "the shown buffer is in use");
+        assert!(link.park(drm.as_raw_fd(), &gflip(2, 11)));
+        assert_eq!(released(&sink), vec![(10, 1, NOT_SHOWN)]);
+        let v = memfd();
+        let g = FrameGeometry {
+            width: 64,
+            height: 64,
+            stride: 256,
+            ..Default::default()
+        };
+        link.flip_dmabuf(v.as_raw_fd(), &g, Some(77));
+        assert_eq!(released(&sink), vec![(11, 2, NOT_SHOWN)]);
+        link.flip_dmabuf(v.as_raw_fd(), &g, Some(78));
+        assert_eq!(
+            released(&sink),
+            vec![(
+                77,
+                0,
+                NOT_SHOWN | protocol::messages::SCANOUT_RELEASED_RESOURCE
+            )]
+        );
+        // Turning the scanout off releases what it showed.
+        link.disable();
+        assert_eq!(released(&sink).len(), 1);
+    }
+
+    #[test]
+    fn a_reporting_client_holds_a_buffer_until_it_releases_it() {
+        let (ours, broker) = socketpair();
+        let link = DisplayLink::new(None);
+        let sink = releasing(&link);
+        link.adopt(ours);
+        link.hello_for_test(wire::CAP_RELEASE_SEQ);
+        let (a, b) = (memfd(), memfd());
+        assert_eq!(link.flip(a.as_raw_fd(), &gflip(1, 10)), FlipOutcome::Sent);
+        let (ca, fa) = next_frame(broker.as_raw_fd());
+        assert_eq!(link.flip(b.as_raw_fd(), &gflip(2, 11)), FlipOutcome::Sent);
+        let (cb, fb) = next_frame(broker.as_raw_fd());
+        assert!(released(&sink).is_empty(), "replaced, but still read");
+        // A release with the wrong stamp, or of the buffer on screen, frees
+        // nothing.
+        link.client_released(0, inode(fa.as_raw_fd()), ca.seq.wrapping_sub(1));
+        link.client_released(0, inode(fb.as_raw_fd()), cb.seq);
+        assert!(released(&sink).is_empty());
+        link.client_released(0, inode(fa.as_raw_fd()), ca.seq);
+        assert_eq!(released(&sink), vec![(10, 1, 0)]);
+        // Buffer 11 was released while on screen: it goes as soon as it is
+        // replaced.
+        assert_eq!(link.flip(a.as_raw_fd(), &gflip(3, 10)), FlipOutcome::Sent);
+        assert_eq!(released(&sink), vec![(11, 2, 0)]);
+    }
+
+    #[test]
+    fn an_older_client_is_done_once_sent_the_next_buffer() {
+        let (link, a, b) = two_clients();
+        let sink = releasing(&link);
+        link.hello_at(0, wire::CAP_RELEASE_SEQ);
+        link.hello_at(1, 0); // a client from before CAP_RELEASE_SEQ
+        let (x, y) = (memfd(), memfd());
+        link.flip(x.as_raw_fd(), &gflip(1, 10));
+        let (cx, fx) = next_frame(a.as_raw_fd());
+        let _ = next_frame(b.as_raw_fd());
+        link.flip(y.as_raw_fd(), &gflip(2, 11));
+        let _ = next_frame(a.as_raw_fd());
+        let _ = next_frame(b.as_raw_fd());
+        assert!(released(&sink).is_empty(), "client 0 still reads it");
+        // The older client's EV_RELEASE (no stamp semantics) means nothing.
+        link.client_released(1, inode(fx.as_raw_fd()), cx.seq);
+        assert!(released(&sink).is_empty());
+        link.client_released(0, inode(fx.as_raw_fd()), cx.seq);
+        assert_eq!(released(&sink), vec![(10, 1, 0)]);
+    }
+
+    #[test]
+    fn a_client_that_leaves_or_idles_releases_what_it_held() {
+        let (link, a, b) = two_clients();
+        let sink = releasing(&link);
+        link.hello_at(0, wire::CAP_RELEASE_SEQ);
+        link.hello_at(1, wire::CAP_RELEASE_SEQ | wire::CAP_IDLE);
+        link.set_active(1, true);
+        let (x, y) = (memfd(), memfd());
+        link.flip(x.as_raw_fd(), &gflip(1, 10));
+        link.flip(y.as_raw_fd(), &gflip(2, 11));
+        let _ = (next_frame(a.as_raw_fd()), next_frame(b.as_raw_fd()));
+        let _ = (next_frame(a.as_raw_fd()), next_frame(b.as_raw_fd()));
+        link.set_active(1, false);
+        assert!(released(&sink).is_empty(), "client 0 still holds it");
+        // Client 0 goes away.
+        link.drop_conn(0, &link.sockets()[0].clone().unwrap());
+        assert_eq!(released(&sink), vec![(10, 1, 0)]);
+    }
+
+    #[test]
+    fn releases_wait_for_event_buffers_and_closed_buffers_are_forgotten() {
+        let link = DisplayLink::new(None);
+        let sink = releasing(&link);
+        *sink.room.lock().unwrap() = 0;
+        let drm = memfd();
+        link.park(drm.as_raw_fd(), &gflip(1, 10));
+        link.park(drm.as_raw_fd(), &gflip(2, 11));
+        link.park(drm.as_raw_fd(), &gflip(3, 12));
+        assert!(released(&sink).is_empty());
+        // The guest closed handle 11 meanwhile: nobody waits for it.
+        link.forget(3, 11);
+        *sink.room.lock().unwrap() = usize::MAX;
+        assert_eq!(link.tick_releases(), None);
+        assert_eq!(released(&sink), vec![(10, 1, NOT_SHOWN)]);
+        assert_eq!(link.stats.released.load(Ordering::Relaxed), 1);
     }
 }

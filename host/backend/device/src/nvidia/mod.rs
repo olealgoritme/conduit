@@ -1027,6 +1027,7 @@ impl NvidiaBackend {
                 MsgType::DisplayMode => "display_mode",
                 MsgType::CursorUpdate => "cursor_update",
                 MsgType::ClipboardFromHost => "clipboard_from_host",
+                MsgType::ScanoutReleased => "scanout_released",
                 MsgType::ClipboardToHost => "clipboard_to_host",
                 MsgType::ClipboardRequest => "clipboard_request",
                 MsgType::GpuCmd => "gpu_cmd",
@@ -1058,7 +1059,8 @@ impl NvidiaBackend {
             MsgType::EventReady
             | MsgType::InputEvent
             | MsgType::DisplayMode
-            | MsgType::ClipboardFromHost => {
+            | MsgType::ClipboardFromHost
+            | MsgType::ScanoutReleased => {
                 log::warn!(
                     "{msg_type:?} arrived from the guest; that message only travels outward"
                 );

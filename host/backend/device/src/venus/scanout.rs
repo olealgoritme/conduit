@@ -203,7 +203,7 @@ impl Venus {
         // An RM-export blob already is a dma-buf, the backend's own: shown
         // as it is, with no renderer export.
         if r.rm.is_some() {
-            link.flip_dmabuf(r.fd.as_raw_fd(), &g);
+            link.flip_dmabuf(r.fd.as_raw_fd(), &g, Some(id));
             return Ok(Reply::NoData);
         }
         if r.export.as_ref().is_none_or(|e| e.layout != layout) {
@@ -233,7 +233,7 @@ impl Venus {
         // The guest's layout, which the renderer echoes into the dma-buf,
         // and the modifier SET_SCANOUT_BLOB inferred: the renderer's is
         // always linear, as it cannot know better.
-        link.flip_dmabuf(e.fd.as_raw_fd(), &g);
+        link.flip_dmabuf(e.fd.as_raw_fd(), &g, Some(id));
         Ok(Reply::NoData)
     }
 

@@ -105,6 +105,12 @@ pub enum MsgType {
     /// or `-ENODEV` without a display. Older backends answer it with an
     /// unknown-type error, which the guest ignores.
     ClipboardRequest = 27,
+    /// **Host → guest**, on the event queue: no display client reads a
+    /// buffer the guest flipped any more, so the guest may draw into it
+    /// again. Payload [`ScanoutReleased`]. Sent only to a guest that acked the
+    /// device feature [`NVGPU_F_SCANOUT_RELEASE`]. See docs/SCANOUT.md
+    /// "Buffer release".
+    ScanoutReleased = 28,
     /// Guest → host, control queue: one virtio-gpu control command for the
     /// Venus renderer (docs/VENUS.md), laid out as `crate::venus` describes.
     /// The reply is a header and the virtio-gpu response. Served only when
@@ -141,6 +147,7 @@ impl MsgType {
             25 => Self::ClipboardFromHost,
             26 => Self::ClipboardToHost,
             27 => Self::ClipboardRequest,
+            28 => Self::ScanoutReleased,
             30 => Self::GpuCmd,
             31 => Self::RmResourceImport,
             _ => return None,
@@ -438,6 +445,115 @@ pub const NVGPU_CFG_RM_IMPORT: u32 = 1 << 13;
 /// object of the caller's render node). Set whenever RM import is.
 pub const NVGPU_CFG_RM_RESOURCE_IMPORT: u32 = 1 << 14;
 
+/// A **virtio device feature** the guest acks (like [`NVGPU_CFG_TAKES_INPUT`],
+/// not a config `features` bit; config bit 15 stays unused): the guest wants
+/// `ScanoutReleased` events. The backend offers it in its device features
+/// whenever it has a display; a guest that does not ack it (every guest
+/// written before it: the Linux module, the Helios KMD) never gets one.
+/// See docs/SCANOUT.md "Buffer release".
+pub const NVGPU_F_SCANOUT_RELEASE: u32 = 1 << 15;
+
+/// [`ScanoutReleased::flags`]: the buffer was shown through Venus
+/// (`SET_SCANOUT_BLOB`); `host_handle` is its resource id and `owner_handle`
+/// and `seq` are 0. Clear: a `ScanoutFlip` buffer, named as the flip named it.
+pub const SCANOUT_RELEASED_RESOURCE: u32 = 1 << 0;
+/// [`ScanoutReleased::flags`]: no display client was sent the buffer's last
+/// flip (none connected, none wanted frames, or every socket was full); it
+/// was released when the next flip replaced it.
+pub const SCANOUT_RELEASED_NOT_SHOWN: u32 = 1 << 1;
+/// [`ScanoutReleased::flags`]: a display client still had not said it was
+/// done with the buffer [`SCANOUT_RELEASE_TIMEOUT_MS`] after the next flip
+/// replaced it, and the backend released it anyway (a stuck or broken client;
+/// drawing into it may show in that client).
+pub const SCANOUT_RELEASED_FORCED: u32 = 1 << 2;
+/// How long a replaced buffer may stay unreleased by a client before the
+/// backend releases it regardless ([`SCANOUT_RELEASED_FORCED`]).
+pub const SCANOUT_RELEASE_TIMEOUT_MS: u32 = 500;
+
+/// Event-queue payload for `MsgType::ScanoutReleased`, following a
+/// `MsgHeader` (handle 0, status 0). 32 bytes.
+///
+/// The buffer's most recent flip (`seq`) was replaced by a later flip of
+/// another buffer (or by `ScanoutDisable`), and every display client that
+/// was sent it has finished reading it. The buffer currently on the scanout is
+/// never released: it is read until it is replaced. One event per release;
+/// a buffer flipped again later is released again later.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanoutReleased {
+    /// 0; one scanout for now.
+    pub scanout: u32,
+    /// `SCANOUT_RELEASED_*`.
+    pub flags: u32,
+    /// `ScanoutFlip::owner_handle` of the flip; 0 for a Venus resource.
+    pub owner_handle: u32,
+    /// `ScanoutFlip::host_handle`, or the Venus resource id
+    /// ([`SCANOUT_RELEASED_RESOURCE`]).
+    pub host_handle: u32,
+    /// `ScanoutFlip::seq` of the buffer's most recent flip; 0 for Venus.
+    pub seq: u64,
+    /// 0.
+    pub reserved: u64,
+}
+
+impl ScanoutReleased {
+    pub fn to_bytes(&self) -> [u8; 32] {
+        let mut o = [0u8; 32];
+        for (i, v) in [
+            self.scanout,
+            self.flags,
+            self.owner_handle,
+            self.host_handle,
+        ]
+        .iter()
+        .enumerate()
+        {
+            o[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        o[16..24].copy_from_slice(&self.seq.to_le_bytes());
+        o[24..32].copy_from_slice(&self.reserved.to_le_bytes());
+        o
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < 32 {
+            return None;
+        }
+        let w = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let q = |at: usize| (w(at) as u64) | ((w(at + 4) as u64) << 32);
+        Some(Self {
+            scanout: w(0),
+            flags: w(4),
+            owner_handle: w(8),
+            host_handle: w(12),
+            seq: q(16),
+            reserved: q(24),
+        })
+    }
+}
+
+/// Size of a whole `ScanoutReleased` event-queue message.
+pub const SCANOUT_RELEASED_MESSAGE_LEN: usize =
+    size_of::<MsgHeader>() + size_of::<ScanoutReleased>();
+
+const _: () = assert!(size_of::<ScanoutReleased>() == 32);
+
+/// Encode one `ScanoutReleased` message (header and payload) into `out`.
+pub fn encode_scanout_released(r: &ScanoutReleased, out: &mut [u8]) -> Option<usize> {
+    if out.len() < SCANOUT_RELEASED_MESSAGE_LEN {
+        return None;
+    }
+    let hdr = MsgHeader::ok(MsgType::ScanoutReleased, 0);
+    for (i, v) in [hdr.msg_type, hdr.handle, hdr.status as u32, hdr.padding]
+        .iter()
+        .enumerate()
+    {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    out[16..48].copy_from_slice(&r.to_bytes());
+    Some(SCANOUT_RELEASED_MESSAGE_LEN)
+}
+
 /// Request payload for `MsgType::RmResourceImport`, following a `MsgHeader`
 /// (whose `handle` is 0). 16 bytes.
 #[repr(C)]
@@ -448,7 +564,8 @@ pub struct RmResourceImport {
     /// handle will belong to.
     pub owner_handle: u32,
     /// An RM-export resource (`RESOURCE_CREATE_BLOB` with
-    /// [`crate::venus::BLOB_MEM_RM_EXPORT`]) that still exists.
+    /// [`crate::venus::BLOB_MEM_RM_EXPORT`]), or a Venus blob whose renderer
+    /// export is a dma-buf (no modifier then), that still exists.
     pub resource_id: u32,
     /// 0.
     pub flags: u32,
@@ -1107,7 +1224,10 @@ mod tests {
         assert_eq!(MsgType::ClipboardFromHost as u32, 25);
         assert_eq!(MsgType::ClipboardToHost as u32, 26);
         assert_eq!(MsgType::ClipboardRequest as u32, 27);
-        assert_eq!(MsgType::from_u32(28), None);
+        assert_eq!(MsgType::ScanoutReleased as u32, 28);
+        assert_eq!(MsgType::from_u32(28), Some(MsgType::ScanoutReleased));
+        // A device feature, next to TAKES_INPUT (12), below the transport bits.
+        assert_eq!(NVGPU_F_SCANOUT_RELEASE, 1 << 15);
         assert_eq!(MsgType::from_u32(29), None);
         assert_eq!(MsgType::GpuCmd as u32, 30);
         assert_eq!(MsgType::RmResourceImport as u32, 31);
@@ -1136,6 +1256,33 @@ mod tests {
         assert_eq!(crate::venus::BLOB_MEM_RM_EXPORT, 0x8000_0001);
         assert_eq!(crate::venus::rm_export_ids(0x0000_0007_0000_004d), (7, 77));
         assert_eq!(crate::venus::errno_padding(-34), [34, 0, 0]);
+    }
+
+    /// Header, then {scanout, flags, owner_handle, host_handle, seq, 0}.
+    #[test]
+    fn scanout_released_encodes_after_a_header() {
+        let r = ScanoutReleased {
+            scanout: 0,
+            flags: SCANOUT_RELEASED_NOT_SHOWN,
+            owner_handle: 7,
+            host_handle: 0x1234,
+            seq: 0x1_0000_0002,
+            reserved: 0,
+        };
+        let mut buf = [0xffu8; 64];
+        assert_eq!(encode_scanout_released(&r, &mut buf[..47]), None);
+        assert_eq!(encode_scanout_released(&r, &mut buf), Some(48));
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 28);
+        assert_eq!(&buf[4..16], &[0u8; 12]);
+        assert_eq!(u32::from_le_bytes(buf[20..24].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(buf[24..28].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(buf[28..32].try_into().unwrap()), 0x1234);
+        assert_eq!(
+            u64::from_le_bytes(buf[32..40].try_into().unwrap()),
+            0x1_0000_0002
+        );
+        assert_eq!(&buf[40..48], &[0u8; 8]);
+        assert_eq!(ScanoutReleased::from_bytes(&buf[16..48]), Some(r));
     }
 
     /// The event the guest's event-queue handler decodes: header, then

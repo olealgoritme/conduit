@@ -36,7 +36,7 @@ use device::caps::Caps;
 use device::chain::{
     ReadableAfterWritable, Segment, capacity, sort_chain, writable, write_scattered,
 };
-use device::display::{DisplayLink, DisplayMode, GuestInputClaims, InputSink};
+use device::display::{DisplayLink, DisplayMode, GuestInputClaims, InputSink, ReleaseSink};
 use device::host;
 use device::nvidia::NvidiaBackend;
 use device::shm::WindowPlacer;
@@ -50,8 +50,10 @@ use device::shm_regions::{SHM_ID_VENUS, region_sizes_with_venus};
 use device::virtio::{NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use protocol::messages::{
     CLIPBOARD_MESSAGE_HEAD, CLIPBOARD_MIME_TEXT, ClipboardChunk, DISPLAY_MODE_MESSAGE_LEN,
-    DisplayModeEvent, InputEventEntry, MsgHeader, MsgType, NVGPU_CFG_TAKES_INPUT, clipboard_mime,
-    encode_clipboard_chunk, encode_display_mode, encode_input_events, input_events_that_fit,
+    DisplayModeEvent, InputEventEntry, MsgHeader, MsgType, NVGPU_CFG_TAKES_INPUT,
+    NVGPU_F_SCANOUT_RELEASE, SCANOUT_RELEASED_MESSAGE_LEN, ScanoutReleased, clipboard_mime,
+    encode_clipboard_chunk, encode_display_mode, encode_input_events, encode_scanout_released,
+    input_events_that_fit,
 };
 use std::os::fd::{BorrowedFd, RawFd};
 use vhost::vhost_user::message::{
@@ -679,6 +681,63 @@ impl InputSink for VqInputSink {
     }
 }
 
+/// `ScanoutReleased` onto the event queue, one message per buffer posted
+/// (docs/SCANOUT.md "Buffer release"). Shares the queue with input and
+/// `EventReady`; a guest that posts no buffer gets them later.
+struct VqReleaseSink {
+    target: EventTarget,
+    warned_small: std::sync::atomic::AtomicBool,
+}
+
+impl ReleaseSink for VqReleaseSink {
+    fn released(&self, r: &[ScanoutReleased]) -> usize {
+        let Some((vring, mem)) = self.target.lock().expect("event target").clone() else {
+            // No guest yet: nobody waits for anything.
+            return r.len();
+        };
+        let guard = mem.memory();
+        let mut done = 0;
+        let mut signalled = false;
+        while done < r.len() {
+            let mut vr = vring.get_mut();
+            let Ok(mut avail) = vr.get_queue_mut().iter(guard.clone()) else {
+                break;
+            };
+            let Some(chain) = avail.next() else {
+                break; // no buffer posted; the rest is retried shortly
+            };
+            let head = chain.head_index();
+            drop(vr);
+            let segs = writable(chain);
+            let mut written = 0u32;
+            if capacity(&segs) >= SCANOUT_RELEASED_MESSAGE_LEN {
+                let mut msg = [0u8; SCANOUT_RELEASED_MESSAGE_LEN];
+                let n = encode_scanout_released(&r[done], &mut msg).expect("sized for it");
+                if let Ok(w) = write_scattered(&*guard, &segs, &msg[..n]) {
+                    written = w as u32;
+                }
+            } else if !self
+                .warned_small
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                log::warn!(
+                    "display: guest event buffers are {} bytes, too small for ScanoutReleased; dropped",
+                    capacity(&segs)
+                );
+            }
+            done += 1;
+            if vring.add_used(head, written).is_err() {
+                break;
+            }
+            signalled = true;
+        }
+        if signalled {
+            let _ = vring.signal_used_queue();
+        }
+        done
+    }
+}
+
 /// Watch the host's descriptors and tell the guest when one has something to
 /// say.
 ///
@@ -999,6 +1058,9 @@ struct NvGpuBackend {
     /// Whether the guest takes display input: set from the acked features
     /// and the requests served, read by the input sink.
     input_claims: Arc<GuestInputClaims>,
+    /// The display, when there is one: told whether the guest wants
+    /// `ScanoutReleased` at every device start and reset.
+    display_link: Option<Arc<DisplayLink>>,
     /// The request and response of the chain being served, kept across chains.
     /// A fresh 64 KiB response zeroed per request cost more than the host's
     /// whole RM call, and only the bytes dispatch writes are sent back.
@@ -1109,11 +1171,17 @@ impl NvGpuBackend {
         let mut config = VirtioGpuNvConfig::new(&version, &gpus, caps, nvidia_vram_mib);
         // The event pump below reports fence handles once (docs/SYNC.md).
         config.set_drm_fences();
+        let mut display_link = None;
         if let Some((mode, link, cursor)) = display {
             config.set_display(mode.width, mode.height, mode.refresh_hz);
             if cursor {
                 config.set_cursor();
             }
+            link.set_release_sink(Arc::new(VqReleaseSink {
+                target: input_target.clone(),
+                warned_small: std::sync::atomic::AtomicBool::new(false),
+            }));
+            display_link = Some(link.clone());
             nvidia.set_display(link);
         }
         Ok(Self {
@@ -1127,6 +1195,7 @@ impl NvGpuBackend {
             watches: None,
             input_target,
             input_claims,
+            display_link,
             req: Vec::new(),
             resp: vec![0u8; RESP_MAX],
             readable: Vec::new(),
@@ -1260,6 +1329,9 @@ impl NvGpuBackend {
         self.venus.held.lock().expect("held chains").clear();
         self.served = false;
         self.input_claims.reset();
+        if let Some(link) = self.display_link.as_ref() {
+            link.set_release_enabled(false);
+        }
     }
 
     /// Drain one virtqueue, dispatching every chain.
@@ -1417,6 +1489,13 @@ impl VhostUserBackendMut for NvGpuBackend {
             | (1 << VIRTIO_RING_F_EVENT_IDX)
             // Acked by a guest that consumes `InputEvent` (the Linux module).
             | u64::from(NVGPU_CFG_TAKES_INPUT)
+            // Acked by a guest that wants `ScanoutReleased`; offered only
+            // with a display.
+            | if self.display_link.is_some() {
+                u64::from(NVGPU_F_SCANOUT_RELEASE)
+            } else {
+                0
+            }
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
     }
 
@@ -1454,12 +1533,21 @@ impl VhostUserBackendMut for NvGpuBackend {
             self.reset("device restarted (guest reboot or driver reload)");
         }
         self.input_claims.device_started(features);
+        let release = features & u64::from(NVGPU_F_SCANOUT_RELEASE) != 0;
+        if let Some(link) = self.display_link.as_ref() {
+            link.set_release_enabled(release);
+        }
         log::info!(
-            "guest driver features {features:#x}: {}",
+            "guest driver features {features:#x}: {}{}",
             if features & u64::from(NVGPU_CFG_TAKES_INPUT) != 0 {
                 "takes Conduit input"
             } else {
                 "no NVGPU_CFG_TAKES_INPUT (Windows, or a Linux module from before it)"
+            },
+            if release {
+                ", wants scanout buffer releases"
+            } else {
+                ""
             }
         );
     }
