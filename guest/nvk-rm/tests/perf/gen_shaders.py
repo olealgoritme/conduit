@@ -120,6 +120,61 @@ void main() {
    col = vec4(gl_TessCoord.xy, p.z, 1.0);
 }
 """
+S["tri.vert"] = """#version 450
+layout(push_constant) uniform PC { vec4 p; } pc;
+layout(location = 0) out vec2 uv;
+void main() {
+   int n = int(pc.p.y);
+   int tri = gl_VertexIndex / 3;
+   int c = gl_VertexIndex % 3;
+   int cell = tri >> 1;
+   vec2 base = vec2(cell % n, cell / n);
+   vec2 o[6] = vec2[](vec2(0,0), vec2(1,0), vec2(0,1), vec2(1,0), vec2(1,1), vec2(0,1));
+   vec2 q = (base + o[(tri & 1) * 3 + c]) / float(n);
+   uv = q;
+   gl_Position = vec4(q * 2.0 - 1.0, 0.5, 1.0);
+}
+"""
+S["tri.tesc"] = """#version 450
+layout(vertices = 3) out;
+layout(push_constant) uniform PC { vec4 p; } pc;
+layout(set = 0, binding = 0) uniform U { mat4 m; vec4 c; } u;
+layout(location = 0) in vec2 uv[];
+layout(location = 0) out vec2 uv_out[];
+float lvl(vec4 a, vec4 b) {
+   float d = length((u.m * (a + b) * 0.5).xyz - vec3(0.0, 0.0, -2.0));
+   return clamp(pc.p.x * 2.0 / d, 1.0, 64.0);
+}
+void main() {
+   gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
+   uv_out[gl_InvocationID] = uv[gl_InvocationID];
+   if (gl_InvocationID == 0) {
+      gl_TessLevelOuter[0] = lvl(gl_in[1].gl_Position, gl_in[2].gl_Position);
+      gl_TessLevelOuter[1] = lvl(gl_in[2].gl_Position, gl_in[0].gl_Position);
+      gl_TessLevelOuter[2] = lvl(gl_in[0].gl_Position, gl_in[1].gl_Position);
+      gl_TessLevelInner[0] = (gl_TessLevelOuter[0] + gl_TessLevelOuter[1] + gl_TessLevelOuter[2]) / 3.0;
+   }
+}
+"""
+S["tri.tese"] = """#version 450
+layout(triangles, fractional_odd_spacing, cw) in;
+layout(set = 0, binding = 1) uniform sampler2D t;
+layout(set = 0, binding = 0) uniform U { mat4 m; vec4 c; } u;
+layout(location = 0) in vec2 uv[];
+layout(location = 0) out vec4 col;
+void main() {
+   vec3 b = gl_TessCoord;
+   vec4 p = gl_in[0].gl_Position * b.x + gl_in[1].gl_Position * b.y + gl_in[2].gl_Position * b.z;
+   vec2 q = uv[0] * b.x + uv[1] * b.y + uv[2] * b.z;
+   float h = textureLod(t, q * 4.0, 0.0).r;
+   float hx = textureLod(t, q * 4.0 + vec2(0.001, 0.0), 0.0).r;
+   float hy = textureLod(t, q * 4.0 + vec2(0.0, 0.001), 0.0).r;
+   vec3 nrm = normalize(vec3(h - hx, h - hy, 0.05));
+   p.z = 0.5 + 0.2 * h;
+   gl_Position = u.m * p;
+   col = vec4(nrm * 0.5 + 0.5, 1.0) * u.c;
+}
+"""
 S["copy.comp"] = """#version 450
 layout(local_size_x = 256) in;
 layout(std430, set = 0, binding = 0) readonly buffer A { vec4 a[]; };
