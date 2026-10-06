@@ -137,7 +137,14 @@ restart-device/stress pass is clean.
    (MSI-X) A/B.
 3. Stability: restart-device recovery, NVK holder renewal (0052) across a real
    restart, Explorer repaint after a DWM restart.
-4. Heaven x86 OpenGL (Zink 32-bit) white scene.
+4. Edge video on NVK: a reported 2-2.5 s per-frame stall (older packages; not
+   re-checked on 343.1). Repro `tools/chromium_like.cpp` + `cl_run.ps1` on
+   branch `fix/nvk-browser-video` (d55da5e): Chromium's DComp NV12/BGRA video
+   path with keyed-mutex / shared-fence hand-off, prints SMOOTH or STALLED.
+   Suspect: `NVK_PRESENT_WAIT_US` = 2 s in present.rs timing out on a fence that
+   never signals; the Edge GPU-process log (`C:\ProgramData\Helios\sandbox`)
+   would show "NVK present: frame wait timed out".
+5. Heaven x86 OpenGL (Zink 32-bit) white scene.
 5. Flip-model route for windowed apps (parked), level 5 (on hold), Venus
    removal (S6d).
 6. Second machine (RTX 4070, Ada): never tested; RM ABI tables and NVK on Ada
