@@ -1,0 +1,764 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 03:46:06 +0200
+Subject: [PATCH] util/disk_cache: multi-file shader cache on Windows
+
+Mesa's disk cache had no Windows implementation (disk_cache_os.c: "TODO:
+implement disk cache support on windows") and meson refused
+-Dshader-cache on Windows, so NVK on Windows compiled every shader again
+in every process: a DXVK game started with seconds of compile stalls on
+each launch.
+
+Implement the multi-file cache (the default type) for Windows:
+
+- directory: MESA_SHADER_CACHE_DIR, else %LOCALAPPDATA%, else %TEMP%,
+  plus mesa_shader_cache; paths may use '\' as well as '/';
+- the index (shared size counter and key table) is a file mapping, which
+  other processes see like the MAP_SHARED mmap;
+- an entry is written to <name>.tmp through a handle that shares nothing
+  (the flock), then renamed in place while still open
+  (SetFileInformationByHandle(FileRenameInfo), never replacing), or
+  deleted on close if another process won;
+- entries are read with FILE_SHARE_DELETE so eviction can delete them;
+- eviction deletes the least recently used tenth of a random two-hex
+  subdirectory, or of the next one that has files (FindFirstFile);
+- size accounting uses 4 KiB clusters.
+
+The single-file (Fossilize) and database caches stay unimplemented on
+Windows; their open functions already fail there.
+
+Builds without zlib and zstd (the MinGW cross build) store entries
+uncompressed instead of failing to configure.
+
+meson: shader-cache is auto-disabled on Windows instead of refused, so
+other Windows builds (MSVC, dozen) are unchanged; -Dshader-cache=enabled
+turns it on.
+---
+ meson.build              |   6 +-
+ src/util/compress.c      |  38 ++++
+ src/util/compress.h      |   2 +-
+ src/util/disk_cache.c    |  12 +-
+ src/util/disk_cache_os.c | 410 ++++++++++++++++++++++++++++++++++++++-
+ src/util/disk_cache_os.h |   8 -
+ 6 files changed, 451 insertions(+), 25 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index 1d818fc..8f809e4 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1242,8 +1242,10 @@ if with_split_debug.allowed() and get_option('debug')
+   add_project_link_arguments('-Wl,--gdb-index', language : ['c', 'cpp'])
+ endif
+ 
++# On Windows, only the multi-file cache is implemented; ask for it with
++# -Dshader-cache=enabled.
+ with_shader_cache = get_option('shader-cache') \
+-  .require(host_machine.system() != 'windows', error_message : 'Shader Cache does not currently work on Windows') \
++  .disable_auto_if(host_machine.system() == 'windows') \
+   .allowed()
+ 
+ if with_shader_cache
+@@ -1893,7 +1895,7 @@ endif
+ with_compression = dep_zlib.found() or dep_zstd.found()
+ if with_compression
+   pre_args += '-DHAVE_COMPRESSION'
+-elif with_shader_cache
++elif with_shader_cache and host_machine.system() != 'windows'
+   error('Shader Cache requires compression')
+ endif
+ 
+diff --git a/src/util/compress.c b/src/util/compress.c
+index 1f4b429..39fc9cd 100644
+--- a/src/util/compress.c
++++ b/src/util/compress.c
+@@ -166,4 +166,42 @@ util_compress_inflate(const uint8_t *in_data, size_t in_data_size,
+ #endif
+ }
+ 
++#elif defined(ENABLE_SHADER_CACHE)
++
++/* No zlib or zstd (Windows cross builds): the shader cache stores entries
++ * as they are.
++ */
++
++#include <string.h>
++
++#include "util/compress.h"
++
++size_t
++util_compress_max_compressed_len(size_t in_data_size)
++{
++   return in_data_size;
++}
++
++size_t
++util_compress_deflate(const uint8_t *in_data, size_t in_data_size,
++                      uint8_t *out_data, size_t out_buff_size)
++{
++   if (in_data_size > out_buff_size)
++      return 0;
++
++   memcpy(out_data, in_data, in_data_size);
++   return in_data_size;
++}
++
++bool
++util_compress_inflate(const uint8_t *in_data, size_t in_data_size,
++                      uint8_t *out_data, size_t out_data_size)
++{
++   if (in_data_size != out_data_size)
++      return false;
++
++   memcpy(out_data, in_data, in_data_size);
++   return true;
++}
++
+ #endif
+diff --git a/src/util/compress.h b/src/util/compress.h
+index fffaaa7..e734a2a 100644
+--- a/src/util/compress.h
++++ b/src/util/compress.h
+@@ -21,7 +21,7 @@
+  * IN THE SOFTWARE.
+  */
+ 
+-#ifdef HAVE_COMPRESSION
++#if defined(HAVE_COMPRESSION) || defined(ENABLE_SHADER_CACHE)
+ 
+ #include <stdbool.h>
+ #include <inttypes.h>
+diff --git a/src/util/disk_cache.c b/src/util/disk_cache.c
+index 1f43388..ff6242a 100644
+--- a/src/util/disk_cache.c
++++ b/src/util/disk_cache.c
+@@ -23,19 +23,23 @@
+ 
+ #ifdef ENABLE_SHADER_CACHE
+ 
++#include "util/detect_os.h"
++
+ #include <ctype.h>
+-#include <ftw.h>
+ #include <string.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+-#include <sys/file.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+-#include <sys/mman.h>
+ #include <fcntl.h>
+ #include <errno.h>
+-#include <dirent.h>
+ #include <inttypes.h>
++#if !DETECT_OS_WINDOWS
++#include <dirent.h>
++#include <ftw.h>
++#include <sys/file.h>
++#include <sys/mman.h>
++#endif
+ 
+ #include "util/compress.h"
+ #include "util/crc32.h"
+diff --git a/src/util/disk_cache_os.c b/src/util/disk_cache_os.c
+index 66a3f5b..8b31ca1 100644
+--- a/src/util/disk_cache_os.c
++++ b/src/util/disk_cache_os.c
+@@ -81,22 +81,29 @@ disk_cache_get_function_identifier(void *ptr, blake3_hasher *ctx)
+ 
+ #ifdef ENABLE_SHADER_CACHE
+ 
+-#if DETECT_OS_WINDOWS
+-/* TODO: implement disk cache support on windows */
++#include <errno.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/types.h>
++#include <sys/stat.h>
+ 
++#if DETECT_OS_WINDOWS
++/* The multi-file cache, with Win32 calls where POSIX has no equivalent on
++ * Windows: directories through FindFirstFile, the index through a file
++ * mapping, and the flock + rename of a new entry through an exclusive
++ * handle renamed in place. The single-file and database caches are not
++ * implemented (their open functions fail).
++ */
++#include "util/u_dynarray.h"
++#include "util/u_string.h"
+ #else
+-
+ #include <dirent.h>
+-#include <errno.h>
+ #include <pwd.h>
+-#include <stdio.h>
+-#include <string.h>
+ #include <sys/file.h>
+ #include <sys/mman.h>
+-#include <sys/types.h>
+-#include <sys/stat.h>
+ #include <unistd.h>
+ #include "utime.h"
++#endif
+ 
+ #include "util/blob.h"
+ #include "util/crc32.h"
+@@ -104,6 +111,29 @@ disk_cache_get_function_identifier(void *ptr, blake3_hasher *ctx)
+ #include "util/ralloc.h"
+ #include "util/rand_xor.h"
+ 
++#if DETECT_OS_WINDOWS
++static bool
++is_dir_separator(char c)
++{
++   return c == '/' || c == '\\';
++}
++
++/* What a file of this size takes on disk, for the cache size accounting
++ * (st_blocks * 512 on POSIX; NTFS allocates 4 KiB clusters).
++ */
++static uint64_t
++win32_disk_usage(uint64_t size)
++{
++   return (size + 4095) & ~(uint64_t)4095;
++}
++#else
++static bool
++is_dir_separator(char c)
++{
++   return c == '/';
++}
++#endif
++
+ /* Check if directory exists or if mkdir_if_needed param is set create a
+  * directory named 'path' if it does not already exist.
+  * This is for use by find_or_create_dir(). Use that instead.
+@@ -114,6 +144,26 @@ disk_cache_get_function_identifier(void *ptr, blake3_hasher *ctx)
+ static int
+ find_or_mkdir_if_needed(const char *path, bool mkdir_if_needed)
+ {
++#if DETECT_OS_WINDOWS
++   DWORD attr = GetFileAttributesA(path);
++   if (attr != INVALID_FILE_ATTRIBUTES) {
++      if (attr & FILE_ATTRIBUTE_DIRECTORY)
++         return 0;
++      fprintf(stderr, "Cannot use %s for shader cache (not a directory)"
++                      "---disabling.\n", path);
++      return -1;
++   }
++
++   if (!mkdir_if_needed)
++      return -1;
++
++   if (CreateDirectoryA(path, NULL) || GetLastError() == ERROR_ALREADY_EXISTS)
++      return 0;
++
++   fprintf(stderr, "Failed to create %s for shader cache (error %lu)"
++                   "---disabling.\n", path, GetLastError());
++   return -1;
++#else
+    struct stat sb;
+ 
+    /* If the path exists already, then our work is done if it's a
+@@ -140,6 +190,7 @@ find_or_mkdir_if_needed(const char *path, bool mkdir_if_needed)
+            path, strerror(errno));
+ 
+    return -1;
++#endif
+ }
+ 
+ /* Check if directory exists or if mkdir param is set create a directory named
+@@ -161,12 +212,13 @@ find_or_create_dir(const char *path, bool mkdir_with_parents_if_needed)
+    p = strdup(path);
+    end = p + strlen(p) + 1; /* end points to the \0 terminator */
+    for (char *q = p; q != end; q++) {
+-      if (*q == '/' || q == end - 1) {
++      if (is_dir_separator(*q) || q == end - 1) {
+          if (q == p) {
+             /* Skip the first / of an absolute path. */
+             continue;
+          }
+ 
++         char sep = *q;
+          *q = '\0';
+ 
+          if (find_or_mkdir_if_needed(p, mkdir_with_parents_if_needed) == -1) {
+@@ -174,7 +226,7 @@ find_or_create_dir(const char *path, bool mkdir_with_parents_if_needed)
+             return -1;
+          }
+ 
+-         *q = '/';
++         *q = sep;
+       }
+    }
+    free(p);
+@@ -206,6 +258,83 @@ concatenate_and_mkdir(void *ctx, const char *path, const char *name,
+    return NULL;
+ }
+ 
++#if DETECT_OS_WINDOWS
++struct win32_lru_file {
++   uint64_t atime;
++   uint64_t size;
++   char name[MAX_PATH];
++};
++
++static int
++win32_lru_file_compare(const void *a, const void *b)
++{
++   const struct win32_lru_file *fa = a, *fb = b;
++   return fa->atime < fb->atime ? -1 : fa->atime > fb->atime;
++}
++
++/* Delete the least recently used tenth (at least one) of the cache files in
++ * dir_path, skipping ".tmp" files being written.
++ *
++ * Returns: the disk space freed, (0 if nothing was deleted).
++ */
++static uint64_t
++unlink_lru_file_from_directory(const char *dir_path)
++{
++   char *pattern;
++   if (asprintf(&pattern, "%s/*", dir_path) == -1)
++      return 0;
++
++   WIN32_FIND_DATAA fd;
++   HANDLE find = FindFirstFileA(pattern, &fd);
++   free(pattern);
++   if (find == INVALID_HANDLE_VALUE)
++      return 0;
++
++   struct util_dynarray files;
++   util_dynarray_init(&files, NULL);
++   do {
++      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
++         continue;
++
++      size_t len = strlen(fd.cFileName);
++      if (len >= 4 && strcmp(&fd.cFileName[len - 4], ".tmp") == 0)
++         continue;
++
++      struct win32_lru_file *f =
++         util_dynarray_grow(&files, struct win32_lru_file, 1);
++      if (!f)
++         break;
++      f->atime = ((uint64_t)fd.ftLastAccessTime.dwHighDateTime << 32) |
++                 fd.ftLastAccessTime.dwLowDateTime;
++      f->size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
++      snprintf(f->name, sizeof(f->name), "%s", fd.cFileName);
++   } while (FindNextFileA(find, &fd));
++   FindClose(find);
++
++   unsigned count =
++      util_dynarray_num_elements(&files, struct win32_lru_file);
++   uint64_t freed = 0;
++   if (count) {
++      qsort(files.data, count, sizeof(struct win32_lru_file),
++            win32_lru_file_compare);
++
++      unsigned lru_count = count > 10 ? count / 10 : 1;
++      for (unsigned i = 0; i < lru_count; i++) {
++         struct win32_lru_file *f =
++            util_dynarray_element(&files, struct win32_lru_file, i);
++         char *filename;
++         if (asprintf(&filename, "%s/%s", dir_path, f->name) == -1)
++            continue;
++         if (DeleteFileA(filename))
++            freed += win32_disk_usage(f->size);
++         free(filename);
++      }
++   }
++   util_dynarray_fini(&files);
++
++   return freed;
++}
++#else
+ struct lru_file {
+    struct list_head node;
+    char *lru_name;
+@@ -431,6 +560,7 @@ is_two_character_sub_directory(const char *path, const struct stat *sb,
+ 
+    return true;
+ }
++#endif
+ 
+ /* Create the directory that will be needed for the cache file for \key.
+  *
+@@ -451,6 +581,44 @@ make_cache_file_directory(struct disk_cache *cache, const cache_key key)
+    free(dir);
+ }
+ 
++#if DETECT_OS_WINDOWS
++/* Evict least recently used cache items: from a random two-character
++ * subdirectory, or the next one that has files.
++ */
++void
++disk_cache_evict_lru_item(struct disk_cache *cache)
++{
++   uint64_t rand64 = rand_xorshift128plus(cache->seed_xorshift128plus);
++
++   for (unsigned i = 0; i < 256; i++) {
++      char *dir_path;
++      if (asprintf(&dir_path, "%s/%02x", cache->path,
++                   (unsigned)((rand64 + i) & 0xff)) < 0)
++         return;
++
++      uint64_t size = unlink_lru_file_from_directory(dir_path);
++      free(dir_path);
++
++      if (size) {
++         p_atomic_add(&cache->size->value, - (uint64_t)size);
++         return;
++      }
++   }
++}
++
++void
++disk_cache_evict_item(struct disk_cache *cache, char *filename)
++{
++   WIN32_FILE_ATTRIBUTE_DATA data;
++   if (GetFileAttributesExA(filename, GetFileExInfoStandard, &data) &&
++       DeleteFileA(filename)) {
++      uint64_t size = ((uint64_t)data.nFileSizeHigh << 32) |
++                      data.nFileSizeLow;
++      p_atomic_add(&cache->size->value, - win32_disk_usage(size));
++   }
++   free(filename);
++}
++#else
+ static ssize_t
+ read_all(int fd, void *buf, size_t count)
+ {
+@@ -546,6 +714,7 @@ disk_cache_evict_item(struct disk_cache *cache, char *filename)
+    if (sb.st_blocks)
+       p_atomic_add(&cache->size->value, - (uint64_t)sb.st_blocks * 512);
+ }
++#endif
+ 
+ static void *
+ parse_and_validate_cache_item(struct disk_cache *cache, void *cache_item,
+@@ -629,6 +798,47 @@ parse_and_validate_cache_item(struct disk_cache *cache, void *cache_item,
+    return NULL;
+ }
+ 
++#if DETECT_OS_WINDOWS
++void *
++disk_cache_load_item(struct disk_cache *cache, char *filename, size_t *size)
++{
++   uint8_t *data = NULL;
++   uint8_t *uncompressed_data = NULL;
++
++   /* FILE_SHARE_DELETE: eviction may delete the file while it is read. */
++   HANDLE file = CreateFileA(filename, GENERIC_READ,
++                             FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
++                             OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
++   free(filename);
++   if (file == INVALID_HANDLE_VALUE)
++      return NULL;
++
++   LARGE_INTEGER file_size;
++   if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart == 0 ||
++       file_size.QuadPart > UINT32_MAX)
++      goto done;
++
++   DWORD len = (DWORD)file_size.QuadPart, done = 0;
++   data = malloc(len);
++   if (data == NULL)
++      goto done;
++
++   while (done < len) {
++      DWORD n;
++      if (!ReadFile(file, data + done, len - done, &n, NULL) || n == 0)
++         goto done;
++      done += n;
++   }
++
++   uncompressed_data = parse_and_validate_cache_item(cache, data, len, size);
++
++ done:
++   free(data);
++   CloseHandle(file);
++
++   return uncompressed_data;
++}
++#else
+ void *
+ disk_cache_load_item(struct disk_cache *cache, char *filename, size_t *size)
+ {
+@@ -670,6 +880,7 @@ disk_cache_load_item(struct disk_cache *cache, char *filename, size_t *size)
+ 
+    return NULL;
+ }
++#endif
+ 
+ /* Return a filename within the cache's directory corresponding to 'key'.
+  *
+@@ -768,6 +979,103 @@ create_cache_item_header_and_blob(struct disk_cache_put_job *dc_job,
+    return false;
+ }
+ 
++#if DETECT_OS_WINDOWS
++/* Rename (or, with path NULL, delete on close) the file behind handle. */
++static bool
++win32_rename_or_delete_open_file(HANDLE handle, const char *path)
++{
++   if (!path) {
++      FILE_DISPOSITION_INFO disposition = { .DeleteFile = TRUE };
++      return SetFileInformationByHandle(handle, FileDispositionInfo,
++                                        &disposition, sizeof(disposition));
++   }
++
++   int wlen = MultiByteToWideChar(CP_ACP, 0, path, -1, NULL, 0);
++   if (wlen <= 0)
++      return false;
++
++   size_t info_size = sizeof(FILE_RENAME_INFO) + wlen * sizeof(WCHAR);
++   FILE_RENAME_INFO *info = calloc(1, info_size);
++   if (!info)
++      return false;
++
++   /* Like rename() after the POSIX flock: never replace an entry another
++    * process put in place meanwhile.
++    */
++   info->ReplaceIfExists = FALSE;
++   info->RootDirectory = NULL;
++   info->FileNameLength = (wlen - 1) * sizeof(WCHAR);
++   MultiByteToWideChar(CP_ACP, 0, path, -1, info->FileName, wlen);
++
++   bool ok = SetFileInformationByHandle(handle, FileRenameInfo, info,
++                                        info_size);
++   free(info);
++   return ok;
++}
++
++void
++disk_cache_write_item_to_disk(struct disk_cache_put_job *dc_job,
++                              char *filename)
++{
++   HANDLE file = INVALID_HANDLE_VALUE;
++   struct blob cache_blob;
++   blob_init(&cache_blob);
++
++   /* Write to a temporary file, then rename it to the final name while it
++    * is still open, so that readers never see a partial entry. The handle
++    * shares nothing: while one process writes the temporary file, another
++    * one fails to open it and leaves the entry to the first, as the POSIX
++    * code does with flock().
++    */
++   char *filename_tmp = NULL;
++   if (asprintf(&filename_tmp, "%s.tmp", filename) == -1)
++      goto done;
++
++   for (int attempt = 0; attempt < 2; attempt++) {
++      file = CreateFileA(filename_tmp, GENERIC_WRITE | DELETE, 0, NULL,
++                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++      if (file != INVALID_HANDLE_VALUE ||
++          GetLastError() != ERROR_PATH_NOT_FOUND)
++         break;
++
++      /* Make the two-character subdirectory within the cache as needed. */
++      make_cache_file_directory(dc_job->cache, dc_job->key);
++   }
++   if (file == INVALID_HANDLE_VALUE)
++      goto done;
++
++   /* Another process won the race between when we saw that the file didn't
++    * exist and now: leave it be, (to keep the size accounting right).
++    */
++   if (GetFileAttributesA(filename) != INVALID_FILE_ATTRIBUTES) {
++      win32_rename_or_delete_open_file(file, NULL);
++      goto done;
++   }
++
++   if (!create_cache_item_header_and_blob(dc_job, &cache_blob) ||
++       cache_blob.size > UINT32_MAX) {
++      win32_rename_or_delete_open_file(file, NULL);
++      goto done;
++   }
++
++   DWORD written;
++   if (!WriteFile(file, cache_blob.data, (DWORD)cache_blob.size, &written,
++                  NULL) || written != cache_blob.size ||
++       !win32_rename_or_delete_open_file(file, filename)) {
++      win32_rename_or_delete_open_file(file, NULL);
++      goto done;
++   }
++
++   p_atomic_add(&dc_job->cache->size->value,
++                win32_disk_usage(cache_blob.size));
++
++ done:
++   if (file != INVALID_HANDLE_VALUE)
++      CloseHandle(file);
++   free(filename_tmp);
++   blob_finish(&cache_blob);
++}
++#else
+ void
+ disk_cache_write_item_to_disk(struct disk_cache_put_job *dc_job,
+                               char *filename)
+@@ -874,6 +1182,7 @@ disk_cache_write_item_to_disk(struct disk_cache_put_job *dc_job,
+    free(filename_tmp);
+    blob_finish(&cache_blob);
+ }
++#endif
+ 
+ /* Determine path for cache based on the first defined name as follows:
+  *
+@@ -882,6 +1191,11 @@ disk_cache_write_item_to_disk(struct disk_cache_put_job *dc_job,
+  *   $HOME/.cache/mesa_shader_cache*
+  *   <pwd.pw_dir>/.cache/mesa_shader_cache*
+  *
++ * On Windows, the last three are replaced by
++ *
++ *   %LOCALAPPDATA%\mesa_shader_cache*
++ *   %TEMP%\mesa_shader_cache*
++ *
+  * The directory 'mesa_shader_cache*' is named depending of cache type:
+  *  - For DISK_CACHE_MULTI_FILE: mesa_shader_cache
+  *  - For DISK_CACHE_SINGLE_FILE: mesa_shader_cache_sf
+@@ -926,6 +1240,21 @@ disk_cache_generate_cache_dir(void *mem_ctx, const char *gpu_name,
+          return NULL;
+    }
+ 
++#if DETECT_OS_WINDOWS
++   const char *win32_dirs[] = { "LOCALAPPDATA", "TEMP" };
++   for (unsigned i = 0; !path && i < ARRAY_SIZE(win32_dirs); i++) {
++      const char *dir = os_get_option_secure(win32_dirs[i]);
++
++      if (dir) {
++         path = concatenate_and_mkdir(mem_ctx, dir, cache_dir_name, mkdir);
++         if (!path)
++            return NULL;
++      }
++   }
++
++   if (!path)
++      return NULL;
++#else
+    if (path == NULL) {
+       const char *xdg_cache_home = os_get_option_secure("XDG_CACHE_HOME");
+ 
+@@ -985,6 +1314,7 @@ disk_cache_generate_cache_dir(void *mem_ctx, const char *gpu_name,
+       if (!path)
+          return NULL;
+    }
++#endif
+ 
+    if (cache_type == DISK_CACHE_SINGLE_FILE) {
+       path = concatenate_and_mkdir(mem_ctx, path, driver_id, mkdir);
+@@ -1082,6 +1412,11 @@ disk_cache_load_cache_index_foz(void *mem_ctx, struct disk_cache *cache)
+ void
+ disk_cache_touch_cache_user_marker(char *path)
+ {
++#if DETECT_OS_WINDOWS
++   /* The marker only dates a multi-file cache for disk_cache_delete_old_cache
++    * once the database cache is the default, which Windows does not have.
++    */
++#else
+    char *marker_path = NULL;
+    UNUSED int _unused = asprintf(&marker_path, "%s/marker", path);
+    if (!marker_path)
+@@ -1099,8 +1434,55 @@ disk_cache_touch_cache_user_marker(char *path)
+       (void)utime(marker_path, NULL);
+    }
+    free(marker_path);
++#endif
+ }
+ 
++#if DETECT_OS_WINDOWS
++bool
++disk_cache_mmap_cache_index(void *mem_ctx, struct disk_cache *cache)
++{
++   char *path = ralloc_asprintf(mem_ctx, "%s/index", cache->path);
++   if (path == NULL)
++      return false;
++
++   HANDLE file = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
++                             FILE_SHARE_READ | FILE_SHARE_WRITE |
++                             FILE_SHARE_DELETE, NULL, OPEN_ALWAYS,
++                             FILE_ATTRIBUTE_NORMAL, NULL);
++   if (file == INVALID_HANDLE_VALUE)
++      return false;
++
++   /* A mapping larger than the file grows the file to that size. Views of
++    * the same file in other processes see the same pages, so the size kept
++    * with atomic adds stays shared as with the MAP_SHARED mmap on POSIX.
++    */
++   size_t size = sizeof(*cache->size) + CACHE_INDEX_MAX_KEYS * CACHE_KEY_SIZE;
++   HANDLE mapping = CreateFileMappingA(file, NULL, PAGE_READWRITE, 0,
++                                       (DWORD)size, NULL);
++   CloseHandle(file);
++   if (mapping == NULL)
++      return false;
++
++   cache->index_mmap = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0,
++                                     size);
++   CloseHandle(mapping);
++   if (cache->index_mmap == NULL)
++      return false;
++   cache->index_mmap_size = size;
++
++   cache->size = (p_atomic_uint64_t *) cache->index_mmap;
++   cache->stored_keys = cache->index_mmap + sizeof(uint64_t);
++
++   return true;
++}
++
++void
++disk_cache_destroy_mmap(struct disk_cache *cache)
++{
++   if (cache->index_mmap)
++      UnmapViewOfFile(cache->index_mmap);
++}
++#else
+ bool
+ disk_cache_mmap_cache_index(void *mem_ctx, struct disk_cache *cache)
+ {
+@@ -1182,6 +1564,7 @@ disk_cache_destroy_mmap(struct disk_cache *cache)
+ {
+    munmap(cache->index_mmap, cache->index_mmap_size);
+ }
++#endif
+ 
+ void *
+ disk_cache_db_load_item(struct disk_cache *cache, const cache_key key,
+@@ -1223,6 +1606,13 @@ disk_cache_db_load_cache_index(void *mem_ctx, struct disk_cache *cache)
+    return mesa_cache_db_multipart_open(&cache->cache_db, cache->path);
+ }
+ 
++#if DETECT_OS_WINDOWS
++void
++disk_cache_delete_old_cache(void)
++{
++   /* Only called for the database cache, which Windows does not have. */
++}
++#else
+ static void
+ delete_dir(const char* path)
+ {
+diff --git a/src/util/disk_cache_os.h b/src/util/disk_cache_os.h
+index 8950839..fb96f05 100644
+--- a/src/util/disk_cache_os.h
++++ b/src/util/disk_cache_os.h
+@@ -27,12 +27,6 @@
+ #include "util/u_queue.h"
+ #include "util/disk_cache.h"
+ 
+-#if DETECT_OS_WINDOWS
+-
+-/* TODO: implement disk cache support on windows */
+-
+-#else
+-
+ #include "util/fossilize_db.h"
+ #include "util/mesa_cache_db.h"
+ #include "util/mesa_cache_db_multipart.h"
+@@ -190,6 +184,4 @@ disk_cache_delete_old_cache(void);
+ }
+ #endif
+ 
+-#endif
+-
+ #endif /* DISK_CACHE_OS_H */
+-- 
+2.43.0
+

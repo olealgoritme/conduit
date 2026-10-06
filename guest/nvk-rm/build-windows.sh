@@ -14,6 +14,7 @@
 #   MESA_BASE     Mesa commit the series applies to (default below)
 #   MESON         meson binary (>= 1.7 for Mesa's Rust; default: meson in PATH)
 #   MESON_ARGS    extra `meson setup` arguments for Mesa
+#   VIDEO_CODECS  Mesa -Dvideo-codecs (default h264dec; empty for none)
 #   MESA_CLC_DIR  directory holding native mesa_clc and vtn_bindgen2 (NVK's
 #                 OpenCL kernels are compiled on the build machine). Default:
 #                 built from MESA_DIR into BUILD_DIR-host (needs the LLVM/clang
@@ -59,7 +60,8 @@ capped() {
 }
 
 # 1. Mesa checkout with the series: patches/ (NVK on RM), patches-windows/
-#    (the Windows build) and patches-windows-dxvk/ on a local branch
+#    (the Windows build), patches-windows-dxvk/ and patches-common/ on a
+#    local branch
 if [ ! -d "$MESA_DIR/.git" ] && [ ! -f "$MESA_DIR/.git" ]; then
   git clone --depth 200 "$MESA_URL" "$MESA_DIR"
 fi
@@ -67,11 +69,15 @@ if ! git -C "$MESA_DIR" cat-file -e "$MESA_BASE^{commit}" 2>/dev/null; then
   git -C "$MESA_DIR" fetch --depth 200 origin "$MESA_BASE"
 fi
 # patches-windows-dxvk/: what a D3D11 game on DXVK needs (32-bit build fix,
-# no present wait on Win32, R/B order of the GDI present); applied last.
-series="$here/patches/*.patch $here/patches-windows/*.patch $here/patches-windows-dxvk/*.patch"
+# no present wait on Win32, R/B order of the GDI present).
+# patches-common/: generic NVK patches (per-draw cost) shared with the Linux
+# series, applied after everything else.
+series="$here/patches/*.patch $here/patches-windows/*.patch $here/patches-windows-dxvk/*.patch $here/patches-common/*.patch"
 # shellcheck disable=SC2086
 last_patch=$(printf "%s\n" $series | tail -1)
-last_subject=$(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$last_patch" | head -1)
+# (a Subject header may continue on indented lines)
+last_subject=$(awk '/^Subject: /{s = $0; while ((getline l) > 0 && l ~ /^ /) s = s l;
+                    sub(/^Subject: \[PATCH[^]]*\] /, "", s); print s; exit}' "$last_patch")
 if git -C "$MESA_DIR" log --format=%s "$MESA_BASE..HEAD" 2>/dev/null | grep -qxF "$last_subject"; then
   echo "nvk-rm: Windows series already applied in $MESA_DIR"
 else
@@ -127,22 +133,29 @@ cd "$MESA_DIR"
 # debugoptimized for debugging.
 BUILDTYPE=${BUILDTYPE:-release}
 if [ "$BUILDTYPE" = release ]; then NDEBUG=true; else NDEBUG=false; fi
+# H.264 decode for patch 35 (NVDEC; off at runtime unless NVK_EXPERIMENTAL=video)
+VIDEO_CODECS=${VIDEO_CODECS-h264dec}
 if [ -f "$BUILD_DIR/build.ninja" ]; then
   # Build directories from older versions of this script were debugoptimized
-  "$MESON" configure "$BUILD_DIR" -Dbuildtype="$BUILDTYPE" -Db_ndebug="$NDEBUG"
+  "$MESON" configure "$BUILD_DIR" -Dbuildtype="$BUILDTYPE" -Db_ndebug="$NDEBUG" \
+    -Dvideo-codecs="$VIDEO_CODECS"
 else
   # shellcheck disable=SC2086
   "$MESON" setup "$BUILD_DIR" --cross-file "$cross" \
     -Dvulkan-drivers=nouveau -Dnvk-rm=enabled -Dgallium-drivers= \
     -Dplatforms=windows -Dllvm=disabled \
     -Dmesa-clc=system -Dprecomp-compiler=system \
-    -Dvideo-codecs= -Dvulkan-layers= \
+    -Dvideo-codecs="$VIDEO_CODECS" -Dvulkan-layers= \
     -Degl=disabled -Dgbm=disabled -Dglx=disabled -Dopengl=false \
     -Dgles1=disabled -Dgles2=disabled \
-    -Dshader-cache=disabled -Dzlib=disabled -Dzstd=disabled -Dexpat=disabled \
+    -Dshader-cache=enabled -Dzlib=disabled -Dzstd=disabled -Dexpat=disabled \
     -Dxmlconfig=disabled -Dperfetto=false -Dbuild-tests=false \
     -Dbuildtype="$BUILDTYPE" -Db_ndebug="$NDEBUG" \
     $MESON_ARGS
+fi
+# Build directories from before patch 26 have the shader cache off
+if ! grep -q 'ENABLE_SHADER_CACHE' "$BUILD_DIR/build.ninja"; then
+  "$MESON" configure "$BUILD_DIR" -Dshader-cache=enabled
 fi
 capped ninja -C "$BUILD_DIR" -j"$JOBS" \
   src/nouveau/vulkan/vulkan_nouveau.dll \

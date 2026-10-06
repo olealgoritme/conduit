@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 04:04:22 +0200
+Subject: [PATCH 3/7] nvk: skip root table loads of dwords the GPU already has
+
+Every vkCmdBindDescriptorSets with a dynamic buffer loads the four
+swizzled dynamic buffer arrays and the whole set_dynamic_buffer_start
+array into the root table, five LOAD_ROOT_TABLE packets of which usually
+only one dword actually changed: a new dynamic offset moves the base
+address in dynamic_buffers[0] and nothing else.
+
+Keep a shadow of the root table as written from the CPU in this command
+buffer, with a valid bit per dword, and only load the dwords that differ
+(merging loads across gaps of up to two unchanged dwords, since a load
+costs a header and a selector).  The shadow starts empty in every command
+buffer and after vkCmdExecuteCommands (nvk_cmd_invalidate_graphics_state
+clears it with the rest of the graphics state), and is dropped around
+meta operations and after generated commands, which write push
+constants from the GPU.  The draw parameters at the start of the table
+are not tracked: the MME macros write them too.
+
+vk_perf_bench, 20000 draws on an RTX 5090: a new dynamic UBO offset per
+draw 0.189 -> 0.109 ms GPU (NVIDIA 0.121 ms), a descriptor set switch per
+draw 0.322 -> 0.299 ms, the same set and offset bound again before each
+draw with two pipelines alternating 1.070 -> 0.926 ms.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.h |  9 +++++
+ src/nouveau/vulkan/nvk_cmd_draw.c   | 55 ++++++++++++++++++++++++++---
+ 2 files changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 89cc8f4..63a79a6 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -228,6 +228,14 @@ struct nvk_graphics_state {
+       uint32_t base_vertex;
+    } draw_params;
+ 
++   /* The root table as last written from the CPU in this command buffer,
++    * so that unchanged dwords are not loaded again.  Only dwords from
++    * sets onwards are tracked; the draw parameters before them are also
++    * written by MME macros.
++    */
++   uint32_t root_shadow[sizeof(struct nvk_root_descriptor_table) / 4];
++   BITSET_DECLARE(root_shadow_valid, sizeof(struct nvk_root_descriptor_table) / 4);
++
+    /* Used for meta save/restore */
+    VkDeviceAddressRangeKHR vb0;
+ 
+@@ -354,6 +362,7 @@ static inline void
+ nvk_cmd_forget_gfx_gpu_state(struct nvk_cmd_buffer *cmd)
+ {
+    cmd->state.gfx.draw_params.valid = false;
++   BITSET_ZERO(cmd->state.gfx.root_shadow_valid);
+ }
+ void nvk_cmd_invalidate_compute_state(struct nvk_cmd_buffer *cmd);
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 6ac3dc8..083da50 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -739,15 +739,13 @@ nvk_cmd_buffer_dirty_render_pass(struct nvk_cmd_buffer *cmd)
+ }
+ 
+ static void
+-nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
+-                            struct nvk_descriptor_state *desc,
+-                            size_t offset, size_t size)
++nvk_cmd_load_gfx_root_desc(struct nvk_cmd_buffer *cmd,
++                           struct nvk_descriptor_state *desc,
++                           uint32_t start_dw, uint32_t end_dw)
+ {
+    const struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+ 
+-   const uint32_t start_dw = offset / 4;
+-   const uint32_t end_dw = DIV_ROUND_UP(offset + size, 4);
+    const uint32_t *root_dw = (uint32_t *)desc->root;
+ 
+    if (nvk_use_hw_root_table(&pdev->info, true)) {
+@@ -784,6 +782,53 @@ nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
+    }
+ }
+ 
++static void
++nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
++                            struct nvk_descriptor_state *desc,
++                            size_t offset, size_t size)
++{
++   struct nvk_graphics_state *gfx = &cmd->state.gfx;
++   const uint32_t start_dw = offset / 4;
++   const uint32_t end_dw = DIV_ROUND_UP(offset + size, 4);
++   const uint32_t *root_dw = (uint32_t *)desc->root;
++   const uint32_t first_tracked_dw = nvk_root_descriptor_offset(sets) / 4;
++
++   if (end_dw <= first_tracked_dw) {
++      nvk_cmd_load_gfx_root_desc(cmd, desc, start_dw, end_dw);
++      return;
++   }
++
++   /* A new load costs a header and a selector, so loads are merged across
++    * gaps of up to two unchanged dwords.
++    */
++   const uint32_t max_gap_dw = 2;
++   uint32_t dw = start_dw;
++   while (dw < end_dw) {
++      while (dw < end_dw && dw >= first_tracked_dw &&
++             BITSET_TEST(gfx->root_shadow_valid, dw) &&
++             gfx->root_shadow[dw] == root_dw[dw])
++         dw++;
++      if (dw == end_dw)
++         break;
++
++      uint32_t last_dw = dw;
++      for (uint32_t i = dw + 1; i < end_dw && i - last_dw <= max_gap_dw; i++) {
++         if (i < first_tracked_dw ||
++             !BITSET_TEST(gfx->root_shadow_valid, i) ||
++             gfx->root_shadow[i] != root_dw[i])
++            last_dw = i;
++      }
++
++      nvk_cmd_load_gfx_root_desc(cmd, desc, dw, last_dw + 1);
++
++      for (uint32_t i = MAX2(dw, first_tracked_dw); i <= last_dw; i++) {
++         gfx->root_shadow[i] = root_dw[i];
++         BITSET_SET(gfx->root_shadow_valid, i);
++      }
++      dw = last_dw + 1;
++   }
++}
++
+ void
+ nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
+                               const VkCommandBufferBeginInfo *pBeginInfo)

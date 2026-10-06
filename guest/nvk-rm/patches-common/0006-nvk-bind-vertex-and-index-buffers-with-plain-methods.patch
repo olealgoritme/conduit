@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 04:20:16 +0200
+Subject: [PATCH 6/7] nvk: bind vertex and index buffers with plain methods on
+ Turing+
+
+vkCmdBindVertexBuffers and vkCmdBindIndexBuffer called NVK_MME_BIND_VB /
+NVK_MME_BIND_IB for every buffer.  The macros exist so that generated
+commands can bind buffers too, but for binds recorded on the CPU
+everything they compute (zero size for a null address, the restart index
+and index size for the index type) is known on the CPU.  On Turing+ emit
+SET_VERTEX_STREAM_A_LOCATION_A/B + SET_VERTEX_STREAM_SIZE_A/B and
+SET_INDEX_BUFFER_A/B + SET_INDEX_BUFFER_SIZE_A/B +
+SET_DA_PRIMITIVE_RESTART_INDEX + SET_INDEX_BUFFER_E directly, and skip
+binding the range that is already bound, which DXVK-style recording does
+before most draws.  The tracking starts empty in every command buffer
+and is dropped after vkCmdExecuteCommands, around meta and after
+generated commands (which bind buffers through the macros).
+
+vk_perf_bench, 20000 small indexed draws that each bind a vertex and an
+index buffer (the offsets change every fourth draw) on an RTX 5090:
+0.318 -> 0.156 ms GPU (NVIDIA 0.163 ms).
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.h | 16 +++++++
+ src/nouveau/vulkan/nvk_cmd_draw.c   | 66 +++++++++++++++++++++++++++++
+ 2 files changed, 82 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index dbe711b..5f07622 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -243,6 +243,20 @@ struct nvk_graphics_state {
+    uint32_t root_shadow[sizeof(struct nvk_root_descriptor_table) / 4];
+    BITSET_DECLARE(root_shadow_valid, sizeof(struct nvk_root_descriptor_table) / 4);
+ 
++   /* Vertex and index buffer ranges as last bound from the CPU on Turing+,
++    * where they are bound with plain methods; binding the same range again
++    * is skipped.  vb_known has a bit per vertex stream.
++    */
++   uint32_t vb_known;
++   struct {
++      uint64_t addr;
++      uint32_t size;
++   } vb[32];
++   bool ib_known;
++   uint32_t ib_size;
++   uint64_t ib_addr;
++   VkIndexType ib_type;
++
+    /* Used for meta save/restore */
+    VkDeviceAddressRangeKHR vb0;
+ 
+@@ -372,6 +386,8 @@ nvk_cmd_forget_gfx_gpu_state(struct nvk_cmd_buffer *cmd)
+    BITSET_ZERO(cmd->state.gfx.root_shadow_valid);
+    for (uint32_t g = 0; g < ARRAY_SIZE(cmd->state.gfx.cbuf_groups); g++)
+       cmd->state.gfx.cbuf_groups[g].bound_known = 0;
++   cmd->state.gfx.vb_known = 0;
++   cmd->state.gfx.ib_known = false;
+ }
+ void nvk_cmd_invalidate_compute_state(struct nvk_cmd_buffer *cmd);
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 85d2228..c6b3807 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -4557,6 +4557,48 @@ nvk_CmdBindIndexBuffer3KHR(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+    const VkDeviceAddressRangeKHR addr_range = pInfo->addressRange;
++   assert(addr_range.size <= UINT32_MAX);
++
++   if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
++      /* What NVK_MME_BIND_IB does, with plain methods */
++      struct nvk_graphics_state *gfx = &cmd->state.gfx;
++      const uint32_t size_B = addr_range.address ? addr_range.size : 0;
++      if (gfx->ib_known && gfx->ib_addr == addr_range.address &&
++          gfx->ib_size == size_B && gfx->ib_type == pInfo->indexType)
++         return;
++
++      gfx->ib_known = true;
++      gfx->ib_addr = addr_range.address;
++      gfx->ib_size = size_B;
++      gfx->ib_type = pInfo->indexType;
++
++      uint32_t restart, index_size;
++      switch (pInfo->indexType) {
++      case VK_INDEX_TYPE_UINT8_KHR:
++         restart = UINT8_MAX;
++         index_size = NVC597_SET_INDEX_BUFFER_E_INDEX_SIZE_ONE_BYTE;
++         break;
++      case VK_INDEX_TYPE_UINT16:
++         restart = UINT16_MAX;
++         index_size = NVC597_SET_INDEX_BUFFER_E_INDEX_SIZE_TWO_BYTES;
++         break;
++      default:
++         restart = UINT32_MAX;
++         index_size = NVC597_SET_INDEX_BUFFER_E_INDEX_SIZE_FOUR_BYTES;
++         break;
++      }
++
++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 10);
++      P_MTHD(p, NV9097, SET_INDEX_BUFFER_A);
++      P_NV9097_SET_INDEX_BUFFER_A(p, addr_range.address >> 32);
++      P_NV9097_SET_INDEX_BUFFER_B(p, addr_range.address);
++      P_MTHD(p, NVC597, SET_INDEX_BUFFER_SIZE_A);
++      P_NVC597_SET_INDEX_BUFFER_SIZE_A(p, 0);
++      P_NVC597_SET_INDEX_BUFFER_SIZE_B(p, size_B);
++      P_IMMD(p, NV9097, SET_DA_PRIMITIVE_RESTART_INDEX, restart);
++      P_IMMD(p, NVC597, SET_INDEX_BUFFER_E, index_size);
++      return;
++   }
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
+    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_BIND_IB));
+@@ -4679,6 +4721,30 @@ nvk_cmd_bind_vertex_buffer(struct nvk_cmd_buffer *cmd, uint32_t vb_idx,
+    if (vb_idx == 0)
+       cmd->state.gfx.vb0 = addr_range;
+ 
++   if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
++      /* What NVK_MME_BIND_VB does, with plain methods */
++      struct nvk_graphics_state *gfx = &cmd->state.gfx;
++      assert(addr_range.size <= UINT32_MAX);
++      const uint32_t size_B = addr_range.address ? addr_range.size : 0;
++      if ((gfx->vb_known & BITFIELD_BIT(vb_idx)) &&
++          gfx->vb[vb_idx].addr == addr_range.address &&
++          gfx->vb[vb_idx].size == size_B)
++         return;
++
++      gfx->vb_known |= BITFIELD_BIT(vb_idx);
++      gfx->vb[vb_idx].addr = addr_range.address;
++      gfx->vb[vb_idx].size = size_B;
++
++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
++      P_MTHD(p, NV9097, SET_VERTEX_STREAM_A_LOCATION_A(vb_idx));
++      P_NV9097_SET_VERTEX_STREAM_A_LOCATION_A(p, vb_idx, addr_range.address >> 32);
++      P_NV9097_SET_VERTEX_STREAM_A_LOCATION_B(p, vb_idx, addr_range.address);
++      P_MTHD(p, NVC597, SET_VERTEX_STREAM_SIZE_A(vb_idx));
++      P_NVC597_SET_VERTEX_STREAM_SIZE_A(p, vb_idx, 0);
++      P_NVC597_SET_VERTEX_STREAM_SIZE_B(p, vb_idx, size_B);
++      return;
++   }
++
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
+    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_BIND_VB));
+    P_INLINE_DATA(p, vb_idx);

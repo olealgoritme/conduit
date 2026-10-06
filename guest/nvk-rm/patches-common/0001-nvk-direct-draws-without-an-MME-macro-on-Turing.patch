@@ -1,0 +1,403 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 03:57:52 +0200
+Subject: [PATCH 1/7] nvk: direct draws without an MME macro on Turing+
+
+Every vkCmdDraw* went through the NVK_MME_DRAW / NVK_MME_DRAW_INDEXED
+macro, which compares the draw parameters (first vertex, base instance,
+draw index, view index) against the shadow RAM, loads them into the root
+table when they change, sets the base vertex and then draws.  On an RTX
+5090 (GB202) the macro is the bottleneck for small draws: about 25 ns of
+GPU time per draw, 2.2x NVIDIA's driver.
+
+For direct draws the CPU knows all of those values, so track what the GPU
+last saw in nvk_graphics_state::draw_params, emit only what changed with
+plain methods (the shadow scratch, SET_GLOBAL_BASE_INSTANCE_INDEX and the
+root table, exactly as the macro does, so later macros still compare
+against the right values) and draw with SET_DRAW_CONTROL_A/B plus
+DRAW_VERTEX_ARRAY_BEGIN_END_A/B or DRAW_INDEX_BUFFER_BEGIN_END_A/B.
+
+The tracking starts out unknown in every command buffer and is dropped
+whenever something else writes those values: the indirect, mesh and
+transform feedback draw macros, multiview draws (which still use the
+macro for the per-view loop), meta operations and generated commands.
+
+vk_perf_bench (guest/nvk-rm/tests/perf in Conduit), 20000 draws, GPU
+time, median of 3 x 21 runs on an RTX 5090 (NVIDIA 610.57.04 in
+parentheses): plain draws 0.509 -> 0.226 ms (0.230), a new dynamic UBO
+offset per draw 0.667 -> 0.224 ms (0.121), a descriptor set switch per
+draw 0.712 -> 0.317 ms (0.143), vertex and index buffers bound per draw
+0.808 -> 0.318 ms (0.163).  Rendered images are bit-identical, also for
+a test that mixes direct, indexed, multi and indirect draws with varying
+first vertex, vertex offset, first instance and draw index.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.h   |  27 ++++
+ src/nouveau/vulkan/nvk_cmd_draw.c     | 188 ++++++++++++++++++++++++++
+ src/nouveau/vulkan/nvk_cmd_indirect.c |   3 +
+ src/nouveau/vulkan/nvk_cmd_meta.c     |   4 +
+ 4 files changed, 222 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 2261c84..89cc8f4 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -210,6 +210,24 @@ struct nvk_graphics_state {
+       struct nvk_cbuf cbufs[16];
+    } cbuf_groups[5];
+ 
++   /* The draw parameters as the GPU last saw them: the root table's
++    * draw.vs.base_vertex, draw.vs.base_instance, draw.draw_index and
++    * draw.view_index, the MME shadow scratch and methods that mirror them
++    * (SET_GLOBAL_BASE_INSTANCE_INDEX), and SET_GLOBAL_BASE_VERTEX_INDEX /
++    * SET_VERTEX_ID_BASE.  Direct draws on Turing+ set these from the CPU
++    * when they change and then draw with plain methods, without an MME
++    * macro.  Anything else that writes them (the draw macros, meta) clears
++    * valid.
++    */
++   struct nvk_draw_params_state {
++      bool valid;
++      uint32_t first_vertex;
++      uint32_t base_instance;
++      uint32_t draw_index;
++      uint32_t view_index;
++      uint32_t base_vertex;
++   } draw_params;
++
+    /* Used for meta save/restore */
+    VkDeviceAddressRangeKHR vb0;
+ 
+@@ -328,6 +346,15 @@ void nvk_cmd_buffer_begin_compute(struct nvk_cmd_buffer *cmd,
+                                   const VkCommandBufferBeginInfo *pBeginInfo);
+ 
+ void nvk_cmd_invalidate_graphics_state(struct nvk_cmd_buffer *cmd);
++
++/* Forget what the CPU knows about GPU graphics state that something other
++ * than the CPU-side tracking may have changed (meta, generated commands).
++ */
++static inline void
++nvk_cmd_forget_gfx_gpu_state(struct nvk_cmd_buffer *cmd)
++{
++   cmd->state.gfx.draw_params.valid = false;
++}
+ void nvk_cmd_invalidate_compute_state(struct nvk_cmd_buffer *cmd);
+ 
+ void nvk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd,
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index f77181f..79f0c41 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -4878,6 +4878,144 @@ nvk_mme_draw(struct mme_builder *b)
+    nvk_mme_build_draw(b, draw_index);
+ }
+ 
++static inline void
++nvk_cmd_draw_params_unknown(struct nvk_cmd_buffer *cmd)
++{
++   cmd->state.gfx.draw_params.valid = false;
++}
++
++/* Direct draws skip the MME on Turing+ unless multiview needs its loop */
++static inline bool
++nvk_cmd_can_draw_direct(struct nvk_cmd_buffer *cmd)
++{
++   return nvk_cmd_buffer_3d_cls(cmd) >= TURING_A &&
++          cmd->state.gfx.render.view_mask == 0;
++}
++
++static void
++nvk_cmd_load_root_table0(struct nv_push *p, uint32_t offset_B,
++                         const uint32_t *dw, uint32_t count)
++{
++   P_1INC(p, NVC597, SET_ROOT_TABLE_SELECTOR);
++   P_NVC597_SET_ROOT_TABLE_SELECTOR(p, {
++      .root_table = offset_B / NVK_HW_ROOT_TABLE_SIZE,
++      .offset = offset_B % NVK_HW_ROOT_TABLE_SIZE,
++   });
++   P_INLINE_ARRAY(p, dw, count);
++}
++
++/* What nvk_mme_build_set_draw_params() does, from the CPU, emitting only
++ * what changed since the last direct draw.
++ */
++static void
++nvk_cmd_set_draw_params(struct nvk_cmd_buffer *cmd,
++                        uint32_t base_vertex,
++                        uint32_t first_vertex,
++                        uint32_t first_instance,
++                        uint32_t draw_index)
++{
++   STATIC_ASSERT(nvk_root_descriptor_offset(draw.vs.base_instance) ==
++                 nvk_root_descriptor_offset(draw.vs.base_vertex) + 4);
++   STATIC_ASSERT(nvk_root_descriptor_offset(draw.view_index) ==
++                 nvk_root_descriptor_offset(draw.draw_index) + 4);
++   STATIC_ASSERT(nvk_root_descriptor_offset(draw.view_index) <
++                 NVK_HW_ROOT_TABLE_SIZE);
++
++   struct nvk_draw_params_state *dp = &cmd->state.gfx.draw_params;
++   const bool all = !dp->valid;
++   const bool fv = all || dp->first_vertex != first_vertex;
++   const bool bi = all || dp->base_instance != first_instance;
++   const bool di = all || dp->draw_index != draw_index;
++   const bool vi = all || dp->view_index != 0;
++   const bool bv = all || dp->base_vertex != base_vertex;
++
++   if (!(fv || bi || di || vi || bv))
++      return;
++
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 24);
++
++   if (fv) {
++      P_IMMD(p, NV9097, SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_CB0_FIRST_VERTEX),
++             first_vertex);
++   }
++   if (bi)
++      P_IMMD(p, NV9097, SET_GLOBAL_BASE_INSTANCE_INDEX, first_instance);
++   if (fv || bi) {
++      const uint32_t dw[2] = { first_vertex, first_instance };
++      const uint32_t start = fv ? 0 : 1, end = bi ? 2 : 1;
++      nvk_cmd_load_root_table0(p, nvk_root_descriptor_offset(draw.vs.base_vertex) +
++                                  start * 4, &dw[start], end - start);
++   }
++
++   if (di) {
++      P_IMMD(p, NV9097, SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_CB0_DRAW_INDEX),
++             draw_index);
++   }
++   if (vi)
++      P_IMMD(p, NV9097, SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_CB0_VIEW_INDEX), 0);
++   if (di || vi) {
++      const uint32_t dw[2] = { draw_index, 0 };
++      const uint32_t start = di ? 0 : 1, end = vi ? 2 : 1;
++      nvk_cmd_load_root_table0(p, nvk_root_descriptor_offset(draw.draw_index) +
++                                  start * 4, &dw[start], end - start);
++   }
++
++   if (bv) {
++      P_IMMD(p, NV9097, SET_GLOBAL_BASE_VERTEX_INDEX, base_vertex);
++      P_IMMD(p, NV9097, SET_VERTEX_ID_BASE, base_vertex);
++   }
++
++   dp->valid = true;
++   dp->first_vertex = first_vertex;
++   dp->base_instance = first_instance;
++   dp->draw_index = draw_index;
++   dp->view_index = 0;
++   dp->base_vertex = base_vertex;
++}
++
++static void
++nvk_cmd_draw_direct(struct nvk_cmd_buffer *cmd, uint32_t draw_index,
++                    uint32_t vertex_count, uint32_t instance_count,
++                    uint32_t first_vertex, uint32_t first_instance)
++{
++   nvk_cmd_set_draw_params(cmd, 0, first_vertex, first_instance, draw_index);
++
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
++   P_MTHD(p, NVC597, SET_DRAW_CONTROL_A);
++   P_NVC597_SET_DRAW_CONTROL_A(p, {
++      .primitive_id = PRIMITIVE_ID_FIRST,
++      .instance_id = INSTANCE_ID_FIRST,
++      .split_mode = SPLIT_MODE_NORMAL_BEGIN_NORMAL_END,
++      .instance_iterate_enable = true,
++   });
++   P_NVC597_SET_DRAW_CONTROL_B(p, instance_count);
++   P_MTHD(p, NVC597, DRAW_VERTEX_ARRAY_BEGIN_END_A);
++   P_NVC597_DRAW_VERTEX_ARRAY_BEGIN_END_A(p, first_vertex);
++   P_NVC597_DRAW_VERTEX_ARRAY_BEGIN_END_B(p, vertex_count);
++}
++
++static void
++nvk_cmd_draw_indexed_direct(struct nvk_cmd_buffer *cmd, uint32_t draw_index,
++                            uint32_t index_count, uint32_t instance_count,
++                            uint32_t first_index, int32_t vertex_offset,
++                            uint32_t first_instance)
++{
++   nvk_cmd_set_draw_params(cmd, vertex_offset, vertex_offset,
++                           first_instance, draw_index);
++
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
++   P_MTHD(p, NVC597, SET_DRAW_CONTROL_A);
++   P_NVC597_SET_DRAW_CONTROL_A(p, {
++      .primitive_id = PRIMITIVE_ID_FIRST,
++      .instance_id = INSTANCE_ID_FIRST,
++      .split_mode = SPLIT_MODE_NORMAL_BEGIN_NORMAL_END,
++      .instance_iterate_enable = true,
++   });
++   P_NVC597_SET_DRAW_CONTROL_B(p, instance_count);
++   P_NVC597_DRAW_INDEX_BUFFER_BEGIN_END_A(p, first_index);
++   P_NVC597_DRAW_INDEX_BUFFER_BEGIN_END_B(p, index_count);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ nvk_CmdDraw(VkCommandBuffer commandBuffer,
+             uint32_t vertexCount,
+@@ -4892,6 +5030,14 @@ nvk_CmdDraw(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_flush_gfx_state(cmd);
+ 
++   if (nvk_cmd_can_draw_direct(cmd)) {
++      nvk_cmd_draw_direct(cmd, 0, vertexCount, instanceCount,
++                          firstVertex, firstInstance);
++      return;
++   }
++
++   nvk_cmd_draw_params_unknown(cmd);
++
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW));
+    P_INLINE_DATA(p, 0 /* draw_index */);
+@@ -4916,6 +5062,18 @@ nvk_CmdDrawMultiEXT(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_flush_gfx_state(cmd);
+ 
++   if (nvk_cmd_can_draw_direct(cmd)) {
++      for (uint32_t draw_index = 0; draw_index < drawCount; draw_index++) {
++         nvk_cmd_draw_direct(cmd, draw_index, pVertexInfo->vertexCount,
++                             instanceCount, pVertexInfo->firstVertex,
++                             firstInstance);
++         pVertexInfo = ((void *)pVertexInfo) + stride;
++      }
++      return;
++   }
++
++   nvk_cmd_draw_params_unknown(cmd);
++
+    for (uint32_t draw_index = 0; draw_index < drawCount; draw_index++) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+       P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW));
+@@ -5070,6 +5228,14 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_flush_gfx_state(cmd);
+ 
++   if (nvk_cmd_can_draw_direct(cmd)) {
++      nvk_cmd_draw_indexed_direct(cmd, 0, indexCount, instanceCount,
++                                  firstIndex, vertexOffset, firstInstance);
++      return;
++   }
++
++   nvk_cmd_draw_params_unknown(cmd);
++
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
+    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW_INDEXED));
+    P_INLINE_DATA(p, 0 /* draw_index */);
+@@ -5096,6 +5262,20 @@ nvk_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_flush_gfx_state(cmd);
+ 
++   if (nvk_cmd_can_draw_direct(cmd)) {
++      for (uint32_t draw_index = 0; draw_index < drawCount; draw_index++) {
++         const int32_t vertex_offset =
++            pVertexOffset != NULL ? *pVertexOffset : pIndexInfo->vertexOffset;
++         nvk_cmd_draw_indexed_direct(cmd, draw_index, pIndexInfo->indexCount,
++                                     instanceCount, pIndexInfo->firstIndex,
++                                     vertex_offset, firstInstance);
++         pIndexInfo = ((void *)pIndexInfo) + stride;
++      }
++      return;
++   }
++
++   nvk_cmd_draw_params_unknown(cmd);
++
+    for (uint32_t draw_index = 0; draw_index < drawCount; draw_index++) {
+       const uint32_t vertex_offset =
+          pVertexOffset != NULL ? *pVertexOffset : pIndexInfo->vertexOffset;
+@@ -5181,6 +5361,7 @@ nvk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
+    }
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_draw_params_unknown(cmd);
+ 
+    if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+@@ -5289,6 +5470,7 @@ nvk_CmdDrawIndexedIndirect2KHR(VkCommandBuffer commandBuffer,
+    }
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_draw_params_unknown(cmd);
+ 
+    if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+@@ -5373,6 +5555,7 @@ nvk_CmdDrawIndirectCount2KHR(VkCommandBuffer commandBuffer,
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_draw_params_unknown(cmd);
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 8);
+    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW_INDIRECT_COUNT));
+@@ -5428,6 +5611,7 @@ nvk_CmdDrawIndexedIndirectCount2KHR(VkCommandBuffer commandBuffer,
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_draw_params_unknown(cmd);
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 8);
+    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW_INDEXED_INDIRECT_COUNT));
+@@ -5540,6 +5724,7 @@ nvk_CmdDrawIndirectByteCount2EXT(VkCommandBuffer commandBuffer,
+       return;
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_draw_params_unknown(cmd);
+ 
+    uint64_t counter_addr = pCounterInfo->addressRange.address;
+    if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
+@@ -5696,6 +5881,7 @@ nvk_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y, u
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_draw_params_unknown(cmd);
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
+    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW_MESH));
+@@ -5753,6 +5939,7 @@ nvk_CmdDrawMeshTasksIndirect2EXT(VkCommandBuffer commandBuffer,
+    }
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_draw_params_unknown(cmd);
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW_MESH_INDIRECT));
+@@ -5804,6 +5991,7 @@ nvk_CmdDrawMeshTasksIndirectCount2EXT(VkCommandBuffer commandBuffer,
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+ 
+    nvk_cmd_flush_gfx_state(cmd);
++   nvk_cmd_draw_params_unknown(cmd);
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 8);
+    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW_MESH_INDIRECT_COUNT));
+diff --git a/src/nouveau/vulkan/nvk_cmd_indirect.c b/src/nouveau/vulkan/nvk_cmd_indirect.c
+index 5f9ca03..0c01389 100644
+--- a/src/nouveau/vulkan/nvk_cmd_indirect.c
++++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
+@@ -1227,6 +1227,9 @@ nvk_CmdExecuteGeneratedCommandsEXT(VkCommandBuffer commandBuffer,
+          cmd->state.gfx.shaders_dirty |= NVK_SHADER_STAGE_GRAPHICS_BITS;
+       }
+    }
++
++   if (layout->stages & NVK_SHADER_STAGE_GRAPHICS_BITS)
++      nvk_cmd_forget_gfx_gpu_state(cmd);
+ }
+ 
+ struct nvk_copy_indirect_push {
+diff --git a/src/nouveau/vulkan/nvk_cmd_meta.c b/src/nouveau/vulkan/nvk_cmd_meta.c
+index 1f98fc7..cc4f0b6 100644
+--- a/src/nouveau/vulkan/nvk_cmd_meta.c
++++ b/src/nouveau/vulkan/nvk_cmd_meta.c
+@@ -117,6 +117,8 @@ nvk_meta_begin_gfx(struct nvk_cmd_buffer *cmd,
+    P_IMMD(p, NV9097, SET_ZPASS_PIXEL_COUNT, ENABLE_FALSE);
+    P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL, MODE_METHOD_TRACK_WITH_FILTER);
+ 
++   nvk_cmd_forget_gfx_gpu_state(cmd);
++
+    save->dynamic = cmd->vk.dynamic_graphics_state;
+    save->_dynamic_vi = cmd->state.gfx._dynamic_vi;
+    save->_dynamic_sl = cmd->state.gfx._dynamic_sl;
+@@ -211,6 +213,8 @@ nvk_meta_end_gfx(struct nvk_cmd_buffer *cmd,
+    P_IMMD(p, NV9097, SET_STATISTICS_COUNTER, {});
+    P_IMMD(p, NV9097, SET_RENDER_ENABLE_OVERRIDE, MODE_USE_RENDER_ENABLE);
+    P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL, MODE_METHOD_TRACK_WITH_FILTER);
++
++   nvk_cmd_forget_gfx_gpu_state(cmd);
+ }
+ 
+ static void

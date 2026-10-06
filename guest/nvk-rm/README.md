@@ -97,9 +97,12 @@ is the next step. Nine more Mesa patches on top of the 13 above, in `patches-win
 | 20 | `nvk: Win32 WSI` | `VK_KHR_win32_surface` + swapchain through Mesa's win32 WSI, as a software device (CPU copy per present) |
 | 21 | `nvk/rm, wsi: Win32 zero-copy present by Helios scanout` | swapchain images in VRAM, imported once on a host render node as GEM objects and shown with ScanoutFlip (see "Zero-copy present on Windows" below); GDI stays the fallback |
 | 22 | `nvk/rm: host-visible VRAM (a BAR heap)` | a DEVICE_LOCAL \| HOST_VISIBLE \| HOST_COHERENT type on a heap of its own, backed by vidmem mapped once through BAR1 (see "Host-visible VRAM" below). Generic RM code, Linux too |
+| 24 | `nvk/rm, wsi: block-linear Win32 scanout swapchains with NVIDIA's modifier` | the zero-copy swapchain images keep NVK's tiling (block-linear, `0x0300000000606015` on GB20x) and are presented with that DRM modifier, so NVK no longer renders through a tiled shadow plus a copy into a linear image every frame; `NVK_HELIOS_WSI_LINEAR=1` or a refused modifier: linear as before (see "Block-linear scanout" below). 23 is S3's, 25+ follow |
+| 26 | `util/disk_cache: multi-file shader cache on Windows` | Mesa's disk cache had no Windows code (`-Dshader-cache` was refused): the multi-file cache through Win32 calls, in `%LOCALAPPDATA%\mesa_shader_cache` (see "Shader cache on Windows" below). 23-25 are other branches' |
 | 27 | `nvk/rm: let the GPU cache coherent host-visible system memory in L2` | host-visible system memory mapped GPU-cacheable, L2 sysmem invalidate at the start of every submit (`NVK_RM_SYSMEM_CACHED=0` off). Generic RM code (Linux series: patch 15 on perf/nvk-rm-efficiency) |
 | 28 | `nvk/rm: compressible VRAM for images on GB20x` | `has_compression`: dedicated image memory allocated COMPR_ANY and mapped with the compressible GMK kind (`NVK_RM_COMPRESSION=0` off). Generic RM code (Linux: patch 16) |
 | 29 | `nvk/rm: ZCULL from NV2080_CTRL_CMD_GR_GET_ZCULL_INFO` | `has_zcull_info` (`NVK_RM_ZCULL=0` off). Generic RM code (Linux: patch 17) |
+| 35 | `nvk/rm: video decode on an NVDEC channel` | NVK's H.264 Vulkan Video decode on GB20x's NVDEC (NVCFB0): `cls_vdec` from the class list, `NVKMD_ENGINE_VDEC` contexts on the NVDEC0 runlist, SET_OBJECT with the device's class. Needs `-Dvideo-codecs=h264dec` and `NVK_EXPERIMENTAL=video`; bit-exact in `win11` and on the host (see `docs/video.md`). Generic RM code |
 
 Linux behaviour is unchanged: the full series (20 patches) builds the Linux
 NVK (nouveau + RM) as before, with the same `.so` exports; the patches apply
@@ -123,7 +126,7 @@ meson setup build-win --cross-file guest/nvk-rm/windows/mingw-x86_64.ini \
     -Dvulkan-drivers=nouveau -Dnvk-rm=enabled -Dgallium-drivers= \
     -Dplatforms=windows -Dllvm=disabled -Dmesa-clc=system -Dprecomp-compiler=system \
     -Dvideo-codecs= -Dvulkan-layers= -Degl=disabled -Dgbm=disabled -Dglx=disabled \
-    -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dshader-cache=disabled \
+    -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dshader-cache=enabled \
     -Dzlib=disabled -Dzstd=disabled -Dexpat=disabled -Dxmlconfig=disabled \
     -Dperfetto=false -Dbuild-tests=false -Dbuildtype=debugoptimized
 ```
@@ -247,9 +250,81 @@ triangle on a hidden window, `vk_scanout_present [seconds] [width height]
 | KMD 22.22.307, `MESA_WSI_SCANOUT_HZ=60`, 30 s | 60.0 fps, 1801 flips, 0 failed; `NvFlip` +1801 |
 | `NVK_HELIOS_DRI=99` | "cannot open host render node 99", falls back to GDI |
 
-Next: block-linear images with NVIDIA's DRM modifier (a linear image is
-rendered through NVK's tiled shadow plus a copy), a host release event
-instead of the fixed hold, vblank pacing.
+Next: a host release event instead of the fixed hold, vblank pacing.
+
+### Block-linear scanout (patch 24)
+
+NVK cannot render into a linear color image. With linear swapchain images
+(patch 21) every render pass drew into a hidden tiled shadow
+(`linear_tiled_shadows`, `nvk_cmd_draw.c`) and copied it into the linear
+image. Patch 24 keeps NVK's own tiling instead, named by NVIDIA's DRM format
+modifier, which the host's display path reads as such. NVIDIA's driver
+imports NVK-on-RM block-linear memory pixel-exact (`spike/host-nvk-import`,
+`host_import_spike.c`).
+
+- The Win32 WSI asks the driver for its uncompressed NVIDIA block-linear 2D
+  modifiers for the format, filters them by usage and extent (as
+  `wsi_common_drm.c` does) and creates the images with
+  `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and that list. This works even
+  though NVK on Windows does not advertise `VK_EXT_image_drm_format_modifier`.
+  NVK picks the tallest block, `0x0300000000606015` (kind 0x06, GOB kind
+  generation 2, sector layout 1, h = 5) for B8G8R8A8 and R8G8B8A8 on GB20x.
+- `scanout_export` returns the modifier the image got.
+  `vkGetImageDrmFormatModifierPropertiesEXT` is Linux-only in the runtime,
+  so the WSI cannot ask for it itself. The dedicated allocation already
+  carries the image's PTE kind and tile mode, and the export passes them to
+  NVKMS on `DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY` as block-linear surface
+  params (`log2GobsPerBlock.y`, `genericMemory`), as `nvkmd_rm_drm.c` does
+  on Linux. The export refuses memory whose layout is not the modifier's.
+- `SCANOUT_SET` carries the modifier. KMD 22.22.308 to 311
+  (`kmd_logic/src/foreign_scanout.rs`, `Layout::validate`) checks only the
+  size, the fourcc and `stride >= width * 4`, so block-linear passes. Its
+  unit test has `modifier = 0x0300_0000_0000_0010; // block linear is
+  allowed`. No KMD change is needed. The stride is the GOB-aligned row
+  pitch, which is 7680 at 1920.
+- Fallback to linear: `NVK_HELIOS_WSI_LINEAR=1`, or a `SCANOUT_SET` refused
+  with `-EINVAL` for a non-linear modifier. In that case the flip returns
+  `VK_ERROR_FORMAT_NOT_SUPPORTED` to the WSI, which goes linear for later
+  swapchains and returns `VK_ERROR_OUT_OF_DATE_KHR`.
+
+Correctness: `tests/vk_bl_readback.c` builds the WSI's image: B8G8R8A8,
+the modifier list, dedicated device-local memory. It writes a `(y << 16) | x`
+pattern with the copy engine and clears an odd rectangle across GOB and
+block edges with `vkCmdClearAttachments`, which uses the 3D engine with the
+image as a color target. It then reads the memory's raw bytes back through
+a buffer bound to the same memory and checks every pixel at the address the
+modifier gives it, using NIL's TuringColor2D GOB as in `host_import_spike.c`.
+These raw bytes are what NVKMS exports. In `win11` with KMD 22.22.311, a
+release build:
+
+| run | result |
+|---|---|
+| 1920x1080, `...6015` (what the WSI picks) | PASS: 2073600 pixels, 524835 of them cleared by the 3D engine, 0 wrong through the image, 0 wrong raw |
+| 1920x1080 `...6014`, 1280x720 `...6015` | PASS |
+| LINEAR (control) | PASS |
+| `...6015` read as `...6014` (negative control) | FAIL as expected, 1799059 wrong |
+| `...6015` read as linear (negative control) | FAIL as expected, 1833118 wrong |
+
+`NVK_DEBUG=vm` in the demo and in Heaven shows the swapchain memory as
+`kind 0x6, tile 0x50` and the scanout source as `modifier
+0x300000000606015` (Heaven: 1600x900, stride 6400, XB24, two images). There
+were 0 failed flips.
+
+Performance, the same release build (`buildtype=release`, on top of patch
+22), KMD 22.22.311, linear through `NVK_HELIOS_WSI_LINEAR=1`. Host
+`nvidia-smi dmon -s pu` was sampled during each run:
+
+| run | linear (patch 21) | block-linear (patch 24) |
+|---|---|---|
+| `vk_scanout_present 15 1920 1080 3`, unpaced | 6573 fps, SM 11-13 % (one sample 21), ~102-129 W | **11748 fps**, SM 6-8 % (two samples 19, 24), ~108-116 W |
+| Heaven 32-bit, 1600x900 Medium, zero-copy WSI unpaced, `heaven-nvk-fps.ps1` 30 s after 25 s | 355.7 fps, median 2.38 / p99 5.18 ms, SM 90-95 %, 162-226 W | 344.1 fps, median 2.43 / p99 5.19 ms, SM 86-97 %, 164-252 W |
+
+The demo nearly doubles. It is a triangle per frame, so the shadow copy was
+most of its GPU work, and SM time per frame drops by about 3x. Heaven does
+not change: the two runs follow the same 5 s buckets within noise (e.g.
+45 s: 514 vs 515 fps). It is bound by NVK's own rendering at 90-95 % SM. A
+1600x900 copy is small against a ~2.8 ms frame. Heaven with GDI present and
+the BAR heap was 297 fps (patch 22's measurement).
 
 ### Linux-only code and how the Windows build handles it
 
@@ -484,6 +559,162 @@ The GPU was busy all the time either way, but at higher power: it was
 stalled on PCIe reads of DXVK's dynamic buffers in system memory, not
 computing. (The "off" rows are faster than the 62 fps in the table above
 because KMD 22.22.309/310 and the backend got faster in between.)
+
+### Shader cache on Windows (patch 26, 2026-10-06, `win11`, KMD 22.22.311.0)
+
+What was off, and why:
+
+- **NVK's disk shader cache.** Mesa has no Windows disk cache:
+  `disk_cache_os.c` is a `TODO` there, and meson refuses
+  `-Dshader-cache` on Windows. `build-windows.sh` also passed
+  `-Dshader-cache=disabled`. So `pdev->vk.disk_cache` was never created
+  and NVK compiled every shader again in every process. NVK itself was
+  ready: `vk_pipeline_cache` falls back to the physical device's disk cache,
+  and patch 17's build id (Mesa version + DLL timestamp) keys it.
+- **DXVK's state cache** does not exist any more. DXVK 3.0.2 (the fork)
+  has no `dxvk.state` / `DXVK_STATE_CACHE_PATH` and no `VkPipelineCache` of
+  its own. Persistence is the driver's job, which is NVK's disk cache.
+- **Graphics pipeline libraries were already on.** NVK exposes
+  `VK_EXT_graphics_pipeline_library` with
+  `graphicsPipelineLibraryIndependentInterpolationDecoration`, so
+  `dxvk.enableGraphicsPipelineLibrary = Auto` turns them on.
+  `Heaven_d3d11.log` says "Graphics pipeline libraries supported" and
+  lists the extension as enabled.
+
+Patch 26 implements Mesa's multi-file cache (the default type) for Windows
+and enables it in `build-windows.sh`:
+
+- Location: `MESA_SHADER_CACHE_DIR`, else `%LOCALAPPDATA%`, else `%TEMP%`,
+  plus `\mesa_shader_cache`. That is per user and writable without setup.
+  `MESA_SHADER_CACHE_DISABLE=1` turns it off.
+- The index is a file mapping shared by all processes, like the
+  `MAP_SHARED` mmap on Linux.
+- A new entry is written to a `.tmp` file opened with no sharing. That
+  plays the part of the `flock`. The file is renamed to its final name while
+  still open (`FileRenameInfo`, never replacing), so no reader sees half an
+  entry.
+- Eviction deletes the least recently used tenth of a random subdirectory
+  (the 1 GiB default size limit).
+- Entries are stored uncompressed: the MinGW build has neither zlib nor
+  zstd. Heaven needs 5.3 MB for 635 entries.
+
+The single-file and database caches stay unimplemented on Windows. Other
+Windows builds (MSVC, dozen) are unchanged: the option is auto-disabled
+there, not refused.
+
+Measured with `windows/heaven-cache-run.ps1` (next to `run-heaven-nvk.bat`). It
+launches Heaven, records 45 s from launch with the shim frame log, then
+kills Heaven by PID. The setup is the same as above (1600x900 Medium,
+tessellation normal, GDI present, BAR heap) on a **release** build
+(`-Dbuildtype=release -Db_ndebug=true`, NAK at opt-level 3). "Cold" deletes
+the cache first; "warm" is the next launch. "Scene" is counted from the end
+of Heaven's ~3.6 s loading screen, which every run has.
+
+| run | launch -> first present | first 30 s from launch: fps / p99 | first 10 s of the scene: p99 / worst frame | time lost in frames > 40 ms, first 10 s | new cache entries |
+|---|---|---|---|---|---|
+| cold 1 | 0.73 s | 241 / 6.6 ms | 23.6 / 837 ms | 1037 ms | 635 |
+| cold 2 | 0.62 s | 232 / 6.5 ms | 16.8 / 715 ms | 941 ms | 635 |
+| warm 1 | 0.61 s | 248 / 5.2 ms | 16.0 / 576 ms | 817 ms | 0 |
+| warm 2 | 0.61 s | 234 / 7.3 ms | 22.1 / 603 ms | 1588 ms* | 0 |
+| cold, GPL off | 0.62 s | 237 / 6.5 ms | 17.3 / 1105 ms | 1335 ms | 403 |
+| warm, GPL off | 0.62 s | 241 / 5.2 ms | 19.5 / 638 ms | 942 ms | 0 |
+
+\* includes two 350 ms hitches at 6.8 s and 7.5 s. Hitches like these
+show up at random in cold and warm runs alike (also at 14-21 s in other
+runs), so they are not compiles.
+
+- The cache works: a warm run writes nothing new, so every NVK compile is a
+  hit.
+- With GPL on, Heaven's start-up stutter is one long frame ~0.4 s into the
+  scene, plus a few 40-120 ms frames in the first 1.5 s. The cache shortens
+  the long frame from 715-837 ms to 576-603 ms. Without GPL it is 1105 ms
+  cold and 638 ms warm. So NVK compiles cost ~150-250 ms of it with GPL
+  and ~470 ms without. The remaining ~600 ms is not NVK compiling, since it
+  happens on full cache hits. DXVK's own DXBC translation, which is not
+  cached anywhere, or resource creation are the next suspects.
+- Time to steady fps is the same cold and warm, about 1.5 s into the scene
+  (~5.7 s after launch). From the first 5 s bucket on, both follow the same
+  camera-path fps within 5% (cold 158 208 275 365 381, warm 171 215 282 374
+  383). The last 10 s of each 45 s run reach 284-311 fps.
+- An earlier set on KMD 310, with other agents' tests running, had 1-4.6 s
+  to the first present cold and 0.6-1.1 s warm. On 311 with an idle GPU, it
+  is 0.6-0.7 s either way. On a release build, the missing cache was not
+  what made launches "slow for many seconds". The debugoptimized build
+  (asserts on, NAK debug assertions) compiles more slowly; it was not
+  measured here.
+
+### Integration stack (branch `nvk-rm/integration`, 2026-10-06, `win11`)
+
+The canonical Windows build: every finished NVK-on-RM patch in one series.
+`build-windows.sh` applies, with `git am --3way` on `MESA_BASE`:
+
+| order | patches | what |
+|---|---|---|
+| 1 | `patches/0001-0013` | NVK on RM (Linux backend, generic) |
+| 2 | `patches-windows/0014-0022` | Windows build, Win32 WSI, zero-copy Helios scanout (21), BAR heap (22) |
+| 3 | `patches-windows/0024` | block-linear scanout swapchains |
+| 4 | `patches-windows/0025` | BAR heap falls back to system memory when the CPU map fails |
+| 5 | `patches-windows/0026` | shader cache on Windows |
+| 6 | `patches-windows/0027-0029` | L2-cached sysmem, compression, ZCULL info (`NVK_RM_SYSMEM_CACHED=0`, `NVK_RM_COMPRESSION=0`, `NVK_RM_ZCULL=0`) |
+| 7 | `patches-windows/0035` | H.264 decode on NVDEC (`NVK_EXPERIMENTAL=video`) |
+| 8 | `patches-windows-dxvk/0001-0004` | what DXVK needs |
+| 9 | `patches-common/0001-0007` | per-draw cost (shared with the Linux series) |
+
+0023 (S3's Helios ICD interface) is not in this stack: S3 stages its own
+build on top. 0027-0029 are the efficiency patches from
+`perf/nvk-rm-efficiency-win` (there 23-25), renumbered and rebased onto 0025.
+Release build (`b_ndebug`), shader cache on, `-Dvideo-codecs=h264dec`.
+
+Note: the "series already applied" check compares the last patch's subject,
+so a Mesa checkout that has an older stack with the same last patch is not
+re-patched. Use a fresh checkout, or reset its branch to `MESA_BASE` first.
+
+Tests, x86_64, KMD 22.22.312.0: `vk_summary` (184 extensions), `vk_compute_test`
+(host-visible and copy), `vk_offscreen_test 5000`, `vk_bar_test ... fill`,
+`vk_coherence_test`, `vk_bl_readback`, `vk_scanout_present` (1920x1080,
+9749 fps, 0 failed flips) and `vk_video_probe` all pass. One run of
+`vk_offscreen_test` (and earlier one of `vk_coherence_test`) died with an
+access violation in ntdll before printing anything. It did not reproduce in
+9 reruns, and it is still open.
+
+`tests/vk_coherence_test.c` checks patch 27 on Windows, where the GPU-cacheable
+mapping flags go through the KMD. Per iteration, for every HOST_VISIBLE |
+HOST_COHERENT type: the CPU writes a new pattern, compute reads and rewrites
+it, the CPU checks it, the CPU rewrites the even elements, compute runs
+again, and the CPU checks again. Each iteration uses a new pattern and a new
+multiplier. Result: 1000 iterations, 0 bad, on the BAR type and on cached
+sysmem. That holds alone and while another process runs compute over 32 MiB
+of host-visible sysmem plus an offscreen draw loop.
+
+Heaven 4.0 (32-bit), 1600x900 Medium, tessellation normal,
+`heaven-nvk-fps.ps1 -Warmup 25 -Seconds 30`, host `nvidia-smi dmon -s pu`
+over the window. The same DXVK and shim throughout; the driver is picked with
+`NVK_SHIM_DRIVER` in `env.cmd`.
+
+Zero-copy present (unpaced), KMD 312, full stack against 0022 alone,
+interleaved:
+
+| build | fps | median / p99 ms | SM % avg | W avg |
+|---|---|---|---|---|
+| full stack, first pass (fills the shader cache) | 363.3 | 2.31 / 5.02 | 91 | 187 |
+| full stack | 356.3, 352.1 | 2.51 / 5.06-5.41 | 90-91 | 199-204 |
+| 0022 alone | 316.1, 346.8 | 2.48-2.87 / 5.2 | 93 | 200-201 |
+
+Zero-copy, linear (before 0024/0026/patches-common), KMD 311: 0022 alone
+336.2 / 328.1 / 293.4. 0022+0025+0027-0029: 287.5 / 306.8 / 352.2. With
+`NVK_RM_COMPRESSION=0`: 338.3 / 329.5. With `NVK_RM_SYSMEM_CACHED=0`: 326.4.
+With `NVK_RM_ZCULL=0`: 324.4.
+
+GDI present, KMD 311: every build lands at 200-227 fps (0022 alone, +0025,
++0027-0029, each of 27/28/29 off), at 70-77% SM. vkQueuePresentKHR averages
+4.4 ms there, so the GDI copy is the limit.
+
+Reading: Heaven at Medium on the BAR heap is GPU-bound (90-93% SM). The same
+build varies by about ±10% from run to run. Within that, 0027-0029 change
+nothing measurable either way. The full stack is about 8% above 0022 alone
+on zero-copy (357 against 331 fps on average), which is what block-linear
+scanout (0024) gives on its own (344-356). Per-draw cost does not limit this
+benchmark.
 
 ### Presents on RM fences, no CPU wait (patch 30, dxvk-on-nvk S4)
 

@@ -5,8 +5,9 @@
 #
 # Builds icd_smoke.exe, vk_summary.exe, vk_compute_test.exe,
 # vk_offscreen_test.exe, vk_scanout_present.exe, vk_bar_test.exe,
-# vk_coherence_test.exe, helios_icd_test.exe, vk_rmfence_test.exe and
-# helios_share_test.exe plus their SPIR-V
+# vk_coherence_test.exe, vk_bl_readback.exe, vk_video_probe.exe,
+# helios_icd_test.exe, vk_rmfence_test.exe and helios_share_test.exe plus their
+# SPIR-V
 # (glslangValidator). MinGW ships no Vulkan import library: one for
 # vulkan-1.dll is generated from the Vulkan headers' prototypes (only the
 # functions a test calls end up imported, all of them loader exports).
@@ -46,7 +47,7 @@ glslangValidator -V "$tests/triangle.frag" -o "$OUT_DIR/triangle.frag.spv" >/dev
 glslangValidator -V "$tests/spin.vert" -o "$OUT_DIR/spin.vert.spv" >/dev/null
 glslangValidator -V "$tests/bar.comp" -o "$OUT_DIR/bar.comp.spv" >/dev/null
 
-for t in vk_summary vk_compute_test vk_offscreen_test vk_scanout_present vk_bar_test vk_coherence_test; do
+for t in vk_summary vk_compute_test vk_offscreen_test vk_scanout_present vk_bar_test vk_coherence_test vk_bl_readback vk_video_probe; do
   "$CC" -O1 -Wall -I"$OUT_DIR/include" "$tests/$t.c" -L"$OUT_DIR" -lvulkan-1 -lm -o "$OUT_DIR/$t.exe"
 done
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/icd_smoke.c" -o "$OUT_DIR/icd_smoke.exe"

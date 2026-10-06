@@ -60,8 +60,8 @@ $span = [double]$win[-1].t_ms - [double]$win[0].t_ms
 $pres = ($win | ForEach-Object { [double]$_.present_ms } | Measure-Object -Average).Average
 "shim: frames {0}  avg fps {1:N1}  median frame {2:N2} ms  p99 frame {3:N2} ms  max {4:N2} ms  vkQueuePresentKHR avg {5:N2} ms" -f `
   $dt.Count, (1000.0 * $dt.Count / $span), $dt[[int]($dt.Count/2)], $dt[[int]($dt.Count*0.99)], $dt[-1], $pres
-# Whole run in 5 s buckets: shader-compile stalls (NVK's shader cache is off in
-# this build, so every run compiles everything) versus steady state.
+# Whole run in 5 s buckets: start-up stalls versus steady state. (Before patch
+# 26 NVK had no shader cache on Windows and every run compiled everything.)
 $all = @($rows | ForEach-Object { [pscustomobject]@{ t = [double]$_.t_ms; p = [double]$_.present_ms } })
 for ($b = 0; $b * 5000 -le $all[-1].t; $b++) {
   $d = @(); $pp = @()
