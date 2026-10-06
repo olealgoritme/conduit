@@ -301,6 +301,9 @@ pub(crate) unsafe extern "system" fn resource_read_after_write_hazard(
 }
 
 pub(crate) unsafe extern "system" fn flush(h: Hdevice) {
+    if report_if_removed(h, "Flush") {
+        return;
+    }
     if let Some(context) = d3d11_context(h) {
         context.Flush();
         flush_gate(h, &context);

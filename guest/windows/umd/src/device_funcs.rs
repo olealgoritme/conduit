@@ -398,6 +398,9 @@ pub struct HeliosDevice {
     /// SAME shape (`D3D11DDIARG_CREATEDEFERREDCONTEXT`'s funcs union member is
     /// selected by the device's negotiated level).
     pub negotiated: crate::adapter::NegotiatedInterface,
+    /// Device removal when the KMD goes away under this process (see
+    /// `device_loss.rs`): the loss epoch at creation.
+    pub loss: crate::device_loss::LossWatch,
 }
 
 /// Per-deferred-context UMD state, constructed in-place in the runtime-
