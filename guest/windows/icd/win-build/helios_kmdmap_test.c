@@ -253,6 +253,25 @@ main(void)
       helios_kmdmap_detach();
    }
 
+   /* 5. The escape fails BEFORE the KMD unmaps (the 320.1 swap): the sweep at
+    *    the loss finds the view still mapped; the next lost() check after the
+    *    unmap backs it, before anyone else can take the VA. */
+   {
+      const int32_t e = helios_kmdmap_attach();
+      struct view v = view_map(0x10000);
+      helios_kmdmap_register(v.va, v.size, 4);
+      volatile uint32_t *p = v.va;
+      helios_kmdmap_mark_lost(e);
+      CHECK(state_of(p) == MAPPED_RW); /* still the KMD's */
+      view_unmap(&v);
+      CHECK(state_of(p) == MEM_FREE);
+      Sleep(40); /* next tick: resweeps are rate-limited per tick */
+      CHECK(helios_kmdmap_lost(e));
+      CHECK(state_of(p) == PRIVATE_RW);
+      helios_kmdmap_unregister((void *)p);
+      helios_kmdmap_detach();
+   }
+
    mod_detach();
    helios_kmdmap_detach();
    CHECK(helios_kmdmap_veh == NULL);
