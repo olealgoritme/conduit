@@ -713,6 +713,22 @@ pub const COUNTERS: &[&str] = &[
     "BltMirrorSk",
     "BltMirrorUs",
     "BltNoMirInv",
+    // `DxgkDdiPresent`'s own wall time: Blt arm (count, microseconds, maximum, histogram) and flip
+    // arm (count, microseconds, maximum).
+    "PrDdiBltN",
+    "PrDdiBltUs",
+    "PrDdiBltMax",
+    "PrDdiBlt0",
+    "PrDdiBlt1",
+    "PrDdiBlt2",
+    "PrDdiBlt3",
+    "PrDdiBlt4",
+    "PrDdiBlt5",
+    "PrDdiBlt6",
+    "PrDdiBlt7",
+    "PrDdiFlipN",
+    "PrDdiFlipUs",
+    "PrDdiFlipMax",
 ];
 
 #[cfg(test)]

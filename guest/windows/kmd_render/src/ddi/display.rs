@@ -208,6 +208,12 @@ pub unsafe extern "C" fn dxgkddi_present(
     // fixed timeline write is the only per-call publication: no registry I/O,
     // allocation, lock, wait, or producer polling is introduced here.
     let end_100ns = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
+    // `PrDdi*`: this DDI's own wall time by arm (flip bit 2 of the present flags), so a Present
+    // cost seen by the UMD can be placed inside or outside the KMD. Atomics only.
+    crate::ddi::blt_async::note_present_wall(
+        PRESENT_LAST_FLAGS.load(Ordering::Relaxed) & (1 << 2) == 0,
+        end_100ns.saturating_sub(start_100ns),
+    );
     crate::ddi::scanout_timeline::note(
         crate::ddi::scanout_timeline::kind::PRESENT_RETURN,
         if status == STATUS_SUCCESS {
