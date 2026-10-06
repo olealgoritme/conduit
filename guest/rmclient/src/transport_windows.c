@@ -40,6 +40,8 @@
 
 #if defined(_WIN32)
 
+#include <stdarg.h>
+#include <stddef.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -64,6 +66,38 @@ typedef LONG NTSTATUS, *PNTSTATUS;
 #include "nv_ioctl_defs.h"
 #include "win_wire.h"
 
+/* ---- device loss: KMD views that vanish under a live process -------------
+ *
+ * The CPU mappings below are views the KMD maps into this process itself
+ * (HELIOS_NVRM_OP_MMAP: USERD, GPFIFO rings, semaphores, BAR memory). When
+ * the KMD stops under live processes (a live driver update, a device
+ * restart), dxgkrnl destroys the devices and the KMD unmaps those views; the
+ * next plain load or store from NVK is an access violation (an NVK process
+ * died writing GP_PUT into USERD at a device restart). helios_kmdmap.h is
+ * the one process-wide table and exception-handler protocol the Venus ICD
+ * and the Helios UMD use for the same problem (see there): every view is
+ * registered, a vanished one is backed with zero pages, and the process's
+ * loss epoch moves, which NVK reads through crm_win_loss_epoch(). After a
+ * loss this library sends no escape any more (the device handles are dead,
+ * and fd numbers of the dead generation could alias a later one's): a
+ * process needs restarting to get the GPU back through RM. */
+static void crm_kmdmap_log(const char *fmt, ...)
+{
+    FILE *f = fopen("C:\\ProgramData\\Helios\\helios_icd_diag.log", "a");
+    if (!f)
+        return;
+    fprintf(f, "%lu pid=%lu rmclient ", (unsigned long)GetTickCount(),
+            (unsigned long)GetCurrentProcessId());
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+#define HELIOS_KMDMAP_LOG(...) crm_kmdmap_log(__VA_ARGS__)
+#include "helios_kmdmap.h"
+
 /* ---- D3DKMT, resolved at run time so the build needs no gdi32 import ------ */
 
 typedef NTSTATUS(APIENTRY *pfn_enum_adapters2)(D3DKMT_ENUMADAPTERS2 *);
@@ -79,6 +113,11 @@ struct win_ctx {
     SRWLOCK lock;
     int ready;
 
+    /* Device loss (helios_kmdmap.h): attached to the shared table once, at
+     * the first successful init; the loss epoch then. */
+    int kmdmap_attached;
+    int32_t loss_epoch0;
+
     pfn_enum_adapters2 enum_adapters2;
     pfn_create_device create_device;
     pfn_destroy_device destroy_device;
@@ -93,8 +132,12 @@ struct win_ctx {
     D3DKMT_HANDLE context;
 
     uint32_t max_buffer; /* QUERY_CAPS.max_buffer_bytes */
-    uint64_t supported_ops; /* QUERY_CAPS.supported_ops: bit n = HELIOS_NVRM_OP n */
+    uint64_t supported_ops; /* QUERY_CAPS.supported_ops: bit n = HELIOS_NVRM_OP n;
+                               bits 32..63 HELIOS_NVRM_CAP_* */
+    uint32_t device_features; /* QUERY_CAPS.device_features (NVGPU_CFG_*) */
+    uint64_t foreign_ops;   /* FOREIGN_RESOURCE QUERY_CAPS.supported_ops, 0 until asked */
     uint64_t epoch;      /* the KMD's device generation at init */
+    LUID luid;           /* the chosen adapter's LUID (D3DKMTEnumAdapters2) */
 
     /* Host's per-class allocation parameter sizes (GetSysFiles section 3). */
     uint32_t *alloc_pairs; /* {class, size} * n_alloc */
@@ -103,6 +146,7 @@ struct win_ctx {
     /* Live CPU mappings made by map_memory, found again by pointer at unmap. */
     struct win_map {
         void *ptr;        /* the address handed to the caller */
+        void *base;       /* the start of the KMD's view (registered for loss) */
         int fd;           /* the channel kept for this mapping */
         uint32_t id;      /* the KMD/host mapping id */
     } *maps;
@@ -127,6 +171,10 @@ struct win_ctx {
         HANDLE ev;
     } *evs;
     uint32_t n_evs, cap_evs;
+
+    /* The SCANOUT_RELEASED registration (kind 3, handle 0), made on first use
+     * by crm_win_scanout_wait_released: an auto-reset event, under `lock`. */
+    HANDLE release_ev;
 };
 
 static struct win_ctx g_ctx = { .lock = SRWLOCK_INIT, .ctl_handle = -1 };
@@ -279,8 +327,17 @@ static int nvrm_escape(struct win_ctx *c, void *buf, uint32_t size)
     return r;
 }
 
+/* Has the KMD gone away under this process since init? */
+static int win_lost(struct win_ctx *c)
+{
+    return c->kmdmap_attached && helios_kmdmap_lost(c->loss_epoch0);
+}
+
 static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size)
 {
+    if (win_lost(c))
+        return -ENODEV;
+
     D3DKMT_ESCAPE esc;
     memset(&esc, 0, sizeof(esc));
     esc.hAdapter = c->adapter;
@@ -291,6 +348,13 @@ static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size)
     esc.pPrivateDriverData = buf;
     esc.PrivateDriverDataSize = size;
     const NTSTATUS st = c->escape(&esc);
+    if (st != 0 && c->kmdmap_attached && helios_kmdmap_status_is_device_gone(st)) {
+        if (!win_lost(c))
+            crm_kmdmap_log("device-lost: D3DKMTEscape status=0x%08lx, no more RM "
+                           "escapes in this process", (unsigned long)st);
+        helios_kmdmap_mark_lost(c->loss_epoch0);
+        return -ENODEV;
+    }
     return st == 0 ? 0 : nt_to_errno(st);
 }
 
@@ -411,6 +475,7 @@ static int probe_adapter(struct win_ctx *c, D3DKMT_HANDLE adapter, D3DKMT_HANDLE
             goto reject;
         c->max_buffer = caps.max_buffer_bytes;
         c->supported_ops = caps.supported_ops;
+        c->device_features = caps.device_features;
         c->epoch = caps.head.epoch;
         *out_device = cd.hDevice;
         *out_context = context;
@@ -475,6 +540,7 @@ static int find_adapter(struct win_ctx *c)
         const int try_candidate = chosen == 0 && (name_match || !query_ok);
         if (try_candidate && probe_adapter(c, h, &device, &context) == 0) {
             chosen = h;
+            c->luid = ea.pAdapters[i].AdapterLuid;
             found = 0;
             continue;
         }
@@ -524,6 +590,10 @@ static int win_init(struct win_ctx *c)
             r = find_adapter(c);
         if (r == 0) {
             c->ready = 1;
+            if (!c->kmdmap_attached) {
+                c->loss_epoch0 = helios_kmdmap_attach();
+                c->kmdmap_attached = 1;
+            }
             read_host_tables(c);
         }
     }
@@ -608,17 +678,24 @@ static void win_close(void *vctx, int fd)
     win_close_one(c, fd);
 }
 
-/* HELIOS_NVRM_OP_EVENT_REGISTER / UNREGISTER for channel `fd`, kind READY. */
-static int nvrm_event_call(struct win_ctx *c, uint32_t op, uint32_t fd, HANDLE ev)
+/* HELIOS_NVRM_OP_EVENT_REGISTER / UNREGISTER for channel `fd`, kind `kind`. */
+static int nvrm_event_call_kind(struct win_ctx *c, uint32_t op, uint32_t fd, uint32_t kind,
+                                HANDLE ev)
 {
     HeliosNvrmEvent e;
     memset(&e, 0, sizeof(e));
     helios_nvrm_init(&e.head, op, sizeof(e));
     e.handle = fd;
-    e.kind = HELIOS_NVRM_EVENT_READY;
+    e.kind = kind;
     e.event_handle = (uint64_t)(uintptr_t)ev;
     int r = nvrm_escape(c, &e, sizeof(e));
     return r ? r : kmd_status_to_errno(e.head.status);
+}
+
+/* ... kind READY, the channel events of event_wait. */
+static int nvrm_event_call(struct win_ctx *c, uint32_t op, uint32_t fd, HANDLE ev)
+{
+    return nvrm_event_call_kind(c, op, fd, HELIOS_NVRM_EVENT_READY, ev);
 }
 
 /* Forget channel `fd`'s event (before the channel itself closes). */
@@ -921,7 +998,7 @@ static int nvrm_munmap_call(struct win_ctx *c, uint32_t id)
     return r ? r : kmd_status_to_errno(u.head.status);
 }
 
-static int map_table_add(struct win_ctx *c, void *ptr, int fd, uint32_t id)
+static int map_table_add(struct win_ctx *c, void *ptr, void *base, int fd, uint32_t id)
 {
     int r = 0;
     AcquireSRWLockExclusive(&c->lock);
@@ -936,7 +1013,7 @@ static int map_table_add(struct win_ctx *c, void *ptr, int fd, uint32_t id)
         }
     }
     if (r == 0)
-        c->maps[c->n_maps++] = (struct win_map){ .ptr = ptr, .fd = fd, .id = id };
+        c->maps[c->n_maps++] = (struct win_map){ .ptr = ptr, .base = base, .fd = fd, .id = id };
     ReleaseSRWLockExclusive(&c->lock);
     return r;
 }
@@ -1026,7 +1103,9 @@ static int win_map_memory(void *vctx, int ctl_fd, const struct crm_map_request *
         uint32_t id = 0;
         r = nvrm_mmap_call(c, (uint32_t)fd, prot, 0, end - start, &base, &id);
         if (r == 0)
-            r = map_table_add(c, (uint8_t *)base + (req->offset - start), fd, id);
+            r = map_table_add(c, (uint8_t *)base + (req->offset - start), base, fd, id);
+        if (r == 0)
+            helios_kmdmap_register(base, end - start, (uint64_t)(uintptr_t)c);
         if (r != 0) {
             if (base && id)
                 (void)nvrm_munmap_call(c, id);
@@ -1058,7 +1137,9 @@ static int win_unmap_memory(void *vctx, int ctl_fd, const struct crm_map_request
         return -ENOENT;
     /* The view goes first, then the host's mapping. The channel RM armed the
      * mapping on stays open until the library's NV_ESC_RM_UNMAP_MEMORY (win_ioctl
-     * closes it then), or until the control channel closes. */
+     * closes it then), or until the control channel closes. Out of the loss
+     * table before the KMD unmaps the view. */
+    helios_kmdmap_unregister(m.base);
     (void)nvrm_munmap_call(c, m.id);
     if (pend_add(c, req->h_memory, cookie, m.fd) != 0)
         win_close(c, m.fd);
@@ -1305,6 +1386,494 @@ int crm_win_scanout_release(uint32_t handle)
     return kmd_status_to_errno(rel.head.status);
 }
 
+/* ---- RM fences (guest/windows/docs/rm-fence-marker.md, docs/SYNC.md) ------
+ * nvidia-drm's semaphore-surface fences on a host render node: a fence context
+ * imports an RM NV_SEMAPHORE_SURFACE of one of this guest's RM clients, a fence
+ * is a backend handle that fires one EventReady when the surface's slot reaches
+ * a value (or after nvidia-drm's timeout). The KMD records the handle a
+ * forwarded SEMSURF_FENCE_CREATE returns as this device's (KMD 22.22.311+), so
+ * EVENT_REGISTER and Close work on it, and SCANOUT_PRESENT can take it over. */
+
+#define CRM_DRM_IOWR(nr, size) ((3u << 30) | ((uint32_t)(size) << 16) | ('d' << 8) | (nr))
+#define CRM_SEMSURF_FENCE_CTX_CREATE CRM_DRM_IOWR(0x54, 32)
+#define CRM_SEMSURF_FENCE_CREATE CRM_DRM_IOWR(0x55, 24)
+#define CRM_NVGPU_CFG_DRM_FENCES (1u << 11)
+
+int crm_win_caps(uint64_t *supported_ops, uint32_t *device_features)
+{
+    struct win_ctx *c = &g_ctx;
+    int r = win_init(c);
+    if (r)
+        return r;
+    if (supported_ops)
+        *supported_ops = c->supported_ops;
+    if (device_features)
+        *device_features = c->device_features;
+    return 0;
+}
+
+int crm_win_semsurf_ctx_create(int drm_fd, uint32_t h_client, uint32_t h_semsurf,
+                               uint64_t size, uint64_t index, uint32_t *ctx)
+{
+    struct win_ctx *c = &g_ctx;
+    *ctx = 0;
+    if (!c->ready)
+        return -ENODEV;
+    if (!(c->device_features & CRM_NVGPU_CFG_DRM_FENCES))
+        return -ENOSYS;
+    struct {
+        uint64_t index;
+        uint64_t nvkms_params_ptr;
+        uint64_t nvkms_params_size;
+        uint32_t handle;
+        uint32_t pad;
+    } p;
+    /* NvKmsKapiPrivImportSemaphoreSurfaceParams */
+    struct {
+        uint32_t h_client;
+        uint32_t h_semaphore_surface;
+        uint64_t size;
+    } nvkms = { h_client, h_semsurf, size };
+    memset(&p, 0, sizeof(p));
+    p.index = index;
+    p.nvkms_params_ptr = (uint64_t)(uintptr_t)&nvkms;
+    p.nvkms_params_size = sizeof(nvkms);
+    int r = ioctl_wire_cmd(c, drm_fd, CRM_SEMSURF_FENCE_CTX_CREATE, &p, sizeof(p), &nvkms,
+                           sizeof(nvkms), 0, 0);
+    if (r)
+        return r;
+    if (p.handle == 0)
+        return -EIO;
+    *ctx = p.handle;
+    return 0;
+}
+
+int crm_win_semsurf_fence_create(int drm_fd, uint32_t ctx, uint64_t wait_value,
+                                 uint32_t timeout_ms, int *fence)
+{
+    struct win_ctx *c = &g_ctx;
+    *fence = -1;
+    if (!c->ready)
+        return -ENODEV;
+    struct {
+        uint32_t ctx;
+        uint32_t timeout_ms;
+        uint64_t wait_value;
+        int32_t fd;
+        uint32_t pad;
+    } p = { ctx, timeout_ms, wait_value, -1, 0 };
+    int r = ioctl_wire_cmd(c, drm_fd, CRM_SEMSURF_FENCE_CREATE, &p, sizeof(p), NULL, 0, 0, 0);
+    if (r)
+        return r;
+    if (p.fd <= 0)
+        return -EIO;
+    *fence = p.fd;
+    return 0;
+}
+
+int crm_win_fence_wait(int fence, uint32_t timeout_ms)
+{
+    if (!g_ctx.ready)
+        return -ENODEV;
+    return win_event_wait(&g_ctx, fence, timeout_ms);
+}
+
+int crm_win_scanout_present_fenced(uint32_t handle, uint32_t gem, int fence, uint64_t *seq)
+{
+    struct win_ctx *c = &g_ctx;
+    int r = scanout_op_ready(c, HELIOS_NVRM_OP_SCANOUT_PRESENT);
+    if (r)
+        return r;
+    if (!(c->supported_ops & HELIOS_NVRM_CAP_SCANOUT_FENCE))
+        return -ENOSYS;
+    if (fence <= 0)
+        return -EINVAL;
+    HeliosNvrmScanoutPresent p;
+    memset(&p, 0, sizeof(p));
+    helios_nvrm_init(&p.head, HELIOS_NVRM_OP_SCANOUT_PRESENT, sizeof(p));
+    p.handle = handle;
+    p.gem = gem;
+    p.flags = HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE;
+    p.rm_fence_handle = (uint32_t)fence;
+    r = nvrm_escape(c, &p, sizeof(p));
+    if (r)
+        return r;
+    switch (p.head.status) {
+    case HELIOS_NVRM_ST_OK:
+        break;
+    case HELIOS_NVRM_ST_QUEUE_FULL:
+        return -EAGAIN;
+    case HELIOS_NVRM_ST_FENCE_ATTACHED:
+        return -EALREADY;
+    default:
+        return kmd_status_to_errno(p.head.status);
+    }
+    if (seq)
+        *seq = p.out_seq;
+    return 0;
+}
+
+/* ---- buffer release (KMD 22.22.315+, guest/windows/docs/foreign-scanout.md
+ * "Buffer release"): SCANOUT_STATUS and the SCANOUT_RELEASED event. ---------- */
+
+int crm_win_scanout_status(uint32_t handle, uint64_t *released_seq, uint64_t *last_seq)
+{
+    struct win_ctx *c = &g_ctx;
+    if (!c->ready)
+        return -ENODEV;
+    if (!(c->supported_ops & HELIOS_NVRM_CAP_SCANOUT_RELEASE) ||
+        !(c->supported_ops & (1ull << HELIOS_NVRM_OP_SCANOUT_STATUS)))
+        return -ENOSYS;
+    HeliosNvrmScanoutStatus st;
+    memset(&st, 0, sizeof(st));
+    helios_nvrm_init(&st.head, HELIOS_NVRM_OP_SCANOUT_STATUS, sizeof(st));
+    st.handle = handle;
+    int r = nvrm_escape(c, &st, sizeof(st));
+    if (r)
+        return r;
+    if (st.head.status != HELIOS_NVRM_ST_OK)
+        return kmd_status_to_errno(st.head.status);
+    if (released_seq)
+        *released_seq = st.out_released_seq;
+    if (last_seq)
+        *last_seq = st.out_last_seq;
+    return 0;
+}
+
+/* The process's SCANOUT_RELEASED event, registered on first use. */
+static int release_event(struct win_ctx *c, HANDLE *out)
+{
+    int r = 0;
+    AcquireSRWLockExclusive(&c->lock);
+    if (!c->release_ev) {
+        HANDLE ev = CreateEventW(NULL, FALSE /* auto reset */, FALSE, NULL);
+        if (!ev) {
+            r = -ENOMEM;
+        } else {
+            r = nvrm_event_call_kind(c, HELIOS_NVRM_OP_EVENT_REGISTER, 0,
+                                     HELIOS_NVRM_EVENT_SCANOUT_RELEASED, ev);
+            if (r == 0)
+                c->release_ev = ev;
+            else
+                CloseHandle(ev);
+        }
+    }
+    *out = c->release_ev;
+    ReleaseSRWLockExclusive(&c->lock);
+    return r;
+}
+
+int crm_win_scanout_wait_released(uint32_t handle, uint64_t seq, uint32_t timeout_ms,
+                                  uint64_t *released_seq)
+{
+    struct win_ctx *c = &g_ctx;
+    uint64_t released = 0;
+    int r = crm_win_scanout_status(handle, &released, NULL);
+    if (released_seq)
+        *released_seq = released;
+    if (r)
+        return r;
+    if (released >= seq)
+        return 1;
+    if (timeout_ms == 0)
+        return 0;
+
+    HANDLE ev = NULL;
+    r = release_event(c, &ev);
+    if (r)
+        return r;
+    /* The event is a doorbell, not a latch: reset, ask, and only then wait,
+     * so a release between the question and the wait still wakes us. */
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    for (;;) {
+        ResetEvent(ev);
+        r = crm_win_scanout_status(handle, &released, NULL);
+        if (released_seq)
+            *released_seq = released;
+        if (r)
+            return r;
+        if (released >= seq)
+            return 1;
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline)
+            return 0;
+        const DWORD w = WaitForSingleObject(ev, (DWORD)(deadline - now));
+        if (w == WAIT_TIMEOUT) {
+            r = crm_win_scanout_status(handle, &released, NULL);
+            if (released_seq)
+                *released_seq = released;
+            if (r)
+                return r;
+            return released >= seq ? 1 : 0;
+        }
+        if (w != WAIT_OBJECT_0)
+            return -EIO;
+    }
+}
+
+/* ---- Helios extras beyond NVRM: adapter identity, Venus holder contexts,
+ * foreign resources (guest/windows/protocol/src/foreign.rs). All go through the
+ * same D3DKMT device as the RM escapes, so the KMD sees one owner for the DRM
+ * file, the context and the imported resource. ------------------------------ */
+
+int crm_win_adapter_luid(uint32_t *low, int32_t *high)
+{
+    struct win_ctx *c = &g_ctx;
+    int r = win_init(c);
+    if (r)
+        return r;
+    if (low)
+        *low = c->luid.LowPart;
+    if (high)
+        *high = c->luid.HighPart;
+    return 0;
+}
+
+/* The HeliosEscapeHeader every non-NVRM verb starts with (protocol escape.rs). */
+struct crm_helios_hdr {
+    uint32_t magic, cmd_type, version, size;
+};
+#define CRM_HELIOS_MAGIC 0x48454C53u
+#define CRM_HELIOS_ESC_CTX_CREATE 0x0002u
+#define CRM_HELIOS_ESC_CTX_DESTROY 0x0003u
+#define CRM_HELIOS_ESC_RELEASE_BLOB 0x0008u
+#define CRM_HELIOS_ESC_FOREIGN 0x0018u
+#define CRM_VIRTIO_GPU_CAPSET_VENUS 4u
+
+static void helios_hdr(struct crm_helios_hdr *h, uint32_t cmd, uint32_t size)
+{
+    h->magic = CRM_HELIOS_MAGIC;
+    h->cmd_type = cmd;
+    h->version = 1;
+    h->size = size;
+}
+
+int crm_win_venus_ctx_create(uint32_t *ctx_id)
+{
+    struct win_ctx *c = &g_ctx;
+    *ctx_id = 0;
+    int r = win_init(c);
+    if (r)
+        return r;
+    struct {
+        struct crm_helios_hdr hdr;
+        uint32_t capset_id, out_ctx_id;
+    } q;
+    memset(&q, 0, sizeof(q));
+    helios_hdr(&q.hdr, CRM_HELIOS_ESC_CTX_CREATE, sizeof(q));
+    q.capset_id = CRM_VIRTIO_GPU_CAPSET_VENUS;
+    r = nvrm_escape(c, &q, sizeof(q));
+    if (r)
+        return r;
+    if (q.out_ctx_id == 0)
+        return -EIO;
+    *ctx_id = q.out_ctx_id;
+    return 0;
+}
+
+void crm_win_venus_ctx_destroy(uint32_t ctx_id)
+{
+    struct win_ctx *c = &g_ctx;
+    if (!c->ready || ctx_id == 0)
+        return;
+    struct {
+        struct crm_helios_hdr hdr;
+        uint32_t ctx_id, padding;
+    } q;
+    memset(&q, 0, sizeof(q));
+    helios_hdr(&q.hdr, CRM_HELIOS_ESC_CTX_DESTROY, sizeof(q));
+    q.ctx_id = ctx_id;
+    (void)nvrm_escape(c, &q, sizeof(q));
+}
+
+int crm_win_release_blob(uint32_t ctx_id, uint32_t resource_id)
+{
+    struct win_ctx *c = &g_ctx;
+    if (!c->ready)
+        return -ENODEV;
+    struct {
+        struct crm_helios_hdr hdr;
+        uint32_t ctx_id, resource_id, flags, padding;
+    } q;
+    memset(&q, 0, sizeof(q));
+    helios_hdr(&q.hdr, CRM_HELIOS_ESC_RELEASE_BLOB, sizeof(q));
+    q.ctx_id = ctx_id;
+    q.resource_id = resource_id;
+    return nvrm_escape(c, &q, sizeof(q));
+}
+
+/* helios_foreign.h, restated (it lives in guest/windows/protocol/include). */
+struct crm_foreign_head {
+    struct crm_helios_hdr hdr;
+    uint32_t abi_version, op;
+    int32_t status;
+    uint32_t reserved;
+    uint64_t epoch;
+};
+_Static_assert(sizeof(struct crm_foreign_head) == 40, "foreign head");
+
+static int foreign_status(int32_t st)
+{
+    switch (st) {
+    case 0: return 0;
+    case 1: return -ENOSYS;  /* UNSUPPORTED: gate closed */
+    case 2: return -EBADF;   /* NOT_OWNED */
+    case 3: return -ESRCH;   /* BAD_CONTEXT */
+    case 4: return -EINVAL;  /* BAD_RANGE */
+    case 5: return -ENOSPC;  /* NO_RESOURCES */
+    default: return -EIO;    /* DEVICE_ERROR */
+    }
+}
+
+int crm_win_foreign_caps(uint32_t *caps_flags)
+{
+    struct win_ctx *c = &g_ctx;
+    *caps_flags = 0;
+    int r = win_init(c);
+    if (r)
+        return r;
+    struct {
+        struct crm_foreign_head head;
+        uint64_t supported_ops;
+        uint32_t caps_flags, max_per_owner, max_total, reserved0;
+        uint64_t max_bytes_per_resource, max_bytes_per_owner;
+        uint32_t live_total, live_owner, imported, refused;
+    } q;
+    _Static_assert(sizeof(q) == 96, "query caps");
+    memset(&q, 0, sizeof(q));
+    helios_hdr(&q.head.hdr, CRM_HELIOS_ESC_FOREIGN, sizeof(q));
+    q.head.abi_version = 1;
+    q.head.op = 1; /* QUERY_CAPS */
+    r = nvrm_escape(c, &q, sizeof(q));
+    if (r)
+        return r; /* -ENOSYS: a KMD without the verb */
+    r = foreign_status(q.head.status);
+    if (r)
+        return r;
+    c->foreign_ops = q.supported_ops;
+    *caps_flags = q.caps_flags;
+    return 0;
+}
+
+int crm_win_import_rm_planes(const struct crm_foreign_import *in,
+                             const struct crm_foreign_plane *plane1,
+                             uint32_t *resource_id, uint32_t *host_errno)
+{
+    struct win_ctx *c = &g_ctx;
+    *resource_id = 0;
+    if (host_errno)
+        *host_errno = 0;
+    if (!c->ready)
+        return -ENODEV;
+    /* helios_foreign_import_rm_planes (protocol/include/helios_foreign.h); the
+     * first 104 bytes are helios_foreign_import_rm_layout, all a request without
+     * plane 1 sends. */
+    struct {
+        struct crm_foreign_head head;
+        uint32_t ctx_id, rm_handle, gem_handle, flags;
+        uint64_t size;
+        uint32_t out_resource_id, out_host_errno;
+        uint32_t width, height, stride, offset, fourcc, reserved;
+        uint64_t modifier;
+        uint64_t p1_modifier;
+        uint32_t p1_stride, p1_offset;
+    } q;
+    _Static_assert(sizeof(q) == 120, "import rm + layout + plane 1");
+    _Static_assert(offsetof(__typeof__(q), p1_modifier) == 104, "plane 1 tail");
+    const uint32_t bytes = plane1 != NULL ? 120u : 104u;
+    memset(&q, 0, sizeof(q));
+    helios_hdr(&q.head.hdr, CRM_HELIOS_ESC_FOREIGN, bytes);
+    q.head.abi_version = 1;
+    q.head.op = 2; /* IMPORT_RM */
+    q.ctx_id = in->ctx_id;
+    q.rm_handle = in->rm_handle;
+    q.gem_handle = in->gem_handle;
+    q.flags = 1; /* LAYOUT */
+    q.size = in->size;
+    q.width = in->width;
+    q.height = in->height;
+    q.stride = in->stride;
+    q.offset = in->offset;
+    q.fourcc = in->fourcc;
+    q.modifier = in->modifier;
+    if (plane1 != NULL) {
+        q.flags |= 2; /* PLANE1 */
+        q.p1_modifier = plane1->modifier;
+        q.p1_stride = plane1->stride;
+        q.p1_offset = plane1->offset;
+    }
+    int r = nvrm_escape(c, &q, bytes);
+    if (r)
+        return r;
+    if (host_errno)
+        *host_errno = q.out_host_errno;
+    r = foreign_status(q.head.status);
+    if (r)
+        return r;
+    if (q.out_resource_id == 0)
+        return -EIO;
+    *resource_id = q.out_resource_id;
+    return 0;
+}
+
+int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id,
+                      uint32_t *host_errno)
+{
+    return crm_win_import_rm_planes(in, NULL, resource_id, host_errno);
+}
+
+/* FOREIGN_RESOURCE RM_RESOURCE_IMPORT (op 3, KMD 22.22.313+ with a host that
+ * serves RmResourceImport): resource `resource_id`, which this device imported
+ * or this process opened, as a GEM handle of our DRM file `rm_handle`. */
+int crm_win_rm_resource_import(uint32_t rm_handle, uint32_t resource_id, uint32_t *gem_handle,
+                               uint64_t *size, uint64_t *modifier, uint32_t *flags,
+                               uint32_t *host_errno)
+{
+    struct win_ctx *c = &g_ctx;
+    *gem_handle = 0;
+    if (host_errno)
+        *host_errno = 0;
+    if (!c->ready)
+        return -ENODEV;
+    if (c->foreign_ops == 0) {
+        uint32_t caps_flags = 0;
+        (void)crm_win_foreign_caps(&caps_flags);
+    }
+    if (!(c->foreign_ops & (1ull << 3)))
+        return -ENOSYS;
+    struct {
+        struct crm_foreign_head head;
+        uint32_t rm_handle, resource_id, flags, out_gem_handle;
+        uint64_t out_size, out_modifier;
+        uint32_t out_flags, out_host_errno;
+    } q;
+    _Static_assert(sizeof(q) == 80, "rm resource import");
+    memset(&q, 0, sizeof(q));
+    helios_hdr(&q.head.hdr, CRM_HELIOS_ESC_FOREIGN, sizeof(q));
+    q.head.abi_version = 1;
+    q.head.op = 3; /* RM_RESOURCE_IMPORT */
+    q.rm_handle = rm_handle;
+    q.resource_id = resource_id;
+    int r = nvrm_escape(c, &q, sizeof(q));
+    if (r)
+        return r;
+    if (host_errno)
+        *host_errno = q.out_host_errno;
+    r = foreign_status(q.head.status);
+    if (r)
+        return r;
+    if (q.out_gem_handle == 0)
+        return -EIO;
+    *gem_handle = q.out_gem_handle;
+    if (size)
+        *size = q.out_size;
+    if (modifier)
+        *modifier = q.out_modifier;
+    if (flags)
+        *flags = q.out_flags & CRM_RM_IMPORT_MODIFIER_VALID;
+    return 0;
+}
+
 static struct crm_transport windows_transport = {
     .abi = CRM_TRANSPORT_ABI,
     .flags = 0,
@@ -1321,6 +1890,30 @@ static struct crm_transport windows_transport = {
     .free_pages = win_free_pages,
 };
 
+int32_t crm_win_loss_epoch(void)
+{
+    struct helios_kmdmap_table *t = helios_kmdmap_t;
+    if (!t)
+        return 0;
+    /* A "lost" answer also backs views the KMD unmapped since (rate-limited). */
+    if (g_ctx.kmdmap_attached)
+        (void)helios_kmdmap_lost(g_ctx.loss_epoch0);
+    return (int32_t)InterlockedCompareExchange(&t->epoch, 0, 0);
+}
+
+/* The vectored handler lives in this DLL: take it out when the DLL is
+ * unloaded while the process goes on (FreeLibrary; at process exit nothing
+ * runs any more). The table entries stay: the Venus ICD or the UMD may still
+ * hold handlers on the same table, and our views are the KMD's to unmap. */
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved);
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+{
+    (void)inst;
+    if (reason == DLL_PROCESS_DETACH && reserved == NULL && g_ctx.kmdmap_attached)
+        helios_kmdmap_detach();
+    return TRUE;
+}
+
 const struct crm_transport *crm_windows_transport(void)
 {
     return &windows_transport;
@@ -1334,6 +1927,7 @@ const struct crm_transport *crm_default_transport(void)
 #else /* !_WIN32 */
 
 const struct crm_transport *crm_windows_transport(void) { return NULL; }
+int32_t crm_win_loss_epoch(void) { return 0; }
 
 #include <errno.h>
 
@@ -1359,6 +1953,17 @@ int crm_win_scanout_flip(const struct crm_scanout_flip *flip)
     return -ENOSYS;
 }
 
+int crm_win_rm_resource_import(uint32_t rm_handle, uint32_t resource_id, uint32_t *gem_handle,
+                               uint64_t *size, uint64_t *modifier, uint32_t *flags,
+                               uint32_t *host_errno)
+{
+    (void)rm_handle; (void)resource_id; (void)size; (void)modifier; (void)flags;
+    *gem_handle = 0;
+    if (host_errno)
+        *host_errno = 0;
+    return -ENOSYS;
+}
+
 int crm_win_scanout_set(struct crm_scanout_source *src)
 {
     (void)src;
@@ -1377,4 +1982,102 @@ int crm_win_scanout_release(uint32_t handle)
     return -ENOSYS;
 }
 
+int crm_win_caps(uint64_t *supported_ops, uint32_t *device_features)
+{
+    if (supported_ops)
+        *supported_ops = 0;
+    if (device_features)
+        *device_features = 0;
+    return -ENOSYS;
+}
+
+int crm_win_semsurf_ctx_create(int drm_fd, uint32_t h_client, uint32_t h_semsurf,
+                               uint64_t size, uint64_t index, uint32_t *ctx)
+{
+    (void)drm_fd; (void)h_client; (void)h_semsurf; (void)size; (void)index;
+    *ctx = 0;
+    return -ENOSYS;
+}
+
+int crm_win_semsurf_fence_create(int drm_fd, uint32_t ctx, uint64_t wait_value,
+                                 uint32_t timeout_ms, int *fence)
+{
+    (void)drm_fd; (void)ctx; (void)wait_value; (void)timeout_ms;
+    *fence = -1;
+    return -ENOSYS;
+}
+
+int crm_win_fence_wait(int fence, uint32_t timeout_ms)
+{
+    (void)fence; (void)timeout_ms;
+    return -ENOSYS;
+}
+
+int crm_win_scanout_present_fenced(uint32_t handle, uint32_t gem, int fence, uint64_t *seq)
+{
+    (void)handle; (void)gem; (void)fence; (void)seq;
+    return -ENOSYS;
+}
+
+int crm_win_scanout_status(uint32_t handle, uint64_t *released_seq, uint64_t *last_seq)
+{
+    (void)handle; (void)released_seq; (void)last_seq;
+    return -ENOSYS;
+}
+
+int crm_win_scanout_wait_released(uint32_t handle, uint64_t seq, uint32_t timeout_ms,
+                                  uint64_t *released_seq)
+{
+    (void)handle; (void)seq; (void)timeout_ms; (void)released_seq;
+    return -ENOSYS;
+}
+
+int crm_win_adapter_luid(uint32_t *low, int32_t *high)
+{
+    (void)low; (void)high;
+    return -ENOSYS;
+}
+
+int crm_win_venus_ctx_create(uint32_t *ctx_id)
+{
+    *ctx_id = 0;
+    return -ENOSYS;
+}
+
+void crm_win_venus_ctx_destroy(uint32_t ctx_id) { (void)ctx_id; }
+
+int crm_win_release_blob(uint32_t ctx_id, uint32_t resource_id)
+{
+    (void)ctx_id; (void)resource_id;
+    return -ENOSYS;
+}
+
+int crm_win_foreign_caps(uint32_t *caps_flags)
+{
+    *caps_flags = 0;
+    return -ENOSYS;
+}
+
+int crm_win_import_rm_planes(const struct crm_foreign_import *in,
+                             const struct crm_foreign_plane *plane1,
+                             uint32_t *resource_id, uint32_t *host_errno)
+{
+    (void)in; (void)plane1;
+    *resource_id = 0;
+    if (host_errno)
+        *host_errno = 0;
+    return -ENOSYS;
+}
+
+int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id,
+                      uint32_t *host_errno)
+{
+    (void)in;
+    *resource_id = 0;
+    if (host_errno)
+        *host_errno = 0;
+    return -ENOSYS;
+}
+
 #endif
+

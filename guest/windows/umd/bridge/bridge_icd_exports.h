@@ -15,6 +15,8 @@
 
 #include <cstdint>
 
+struct helios_icd_api;  // helios_icd_interface.h
+
 namespace helios_bridge {
 
 /// The venus context id the ICD reports for the CALLING THREAD. Fallback only.
@@ -36,5 +38,12 @@ std::uint64_t venus_memory_vidmm_global_identity_from_handle(
     VkDeviceMemory memory);
 bool venus_memory_open_vidmm_tracker(VkDeviceMemory memory,
                                      std::uint64_t global_identity);
+
+/// The Venus ICD as a `helios_icd_api` table (`helios_icd_interface.h`), built
+/// from the readers above: the backend-neutral interface the bridge talks to,
+/// with the Venus ICD's existing `helios_venus_*` exports underneath, so an ICD
+/// without `helios_icd_interface_v2` keeps working unchanged. The blob id and
+/// the VidMm tracker stay Venus-only readers (no NVK counterpart).
+const ::helios_icd_api* venus_icd_api();
 
 }  // namespace helios_bridge

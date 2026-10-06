@@ -103,6 +103,17 @@ is the next step. Nine more Mesa patches on top of the 13 above, in `patches-win
 | 28 | `nvk/rm: compressible VRAM for images on GB20x` | `has_compression`: dedicated image memory allocated COMPR_ANY and mapped with the compressible GMK kind (`NVK_RM_COMPRESSION=0` off). Generic RM code (Linux: patch 16) |
 | 29 | `nvk/rm: ZCULL from NV2080_CTRL_CMD_GR_GET_ZCULL_INFO` | `has_zcull_info` (`NVK_RM_ZCULL=0` off). Generic RM code (Linux: patch 17) |
 | 35 | `nvk/rm: video decode on an NVDEC channel` | NVK's H.264 Vulkan Video decode on GB20x's NVDEC (NVCFB0): `cls_vdec` from the class list, `NVKMD_ENGINE_VDEC` contexts on the NVDEC0 runlist, SET_OBJECT with the device's class. Needs `-Dvideo-codecs=h264dec` and `NVK_EXPERIMENTAL=video`; bit-exact in `win11` and on the host (see `docs/video.md`). Generic RM code |
+| 37 | `util/queue: destroy the finish barrier after every thread has left it` | fixes the intermittent 0xC0000005 in ntdll (`RtlpWaitOnCriticalSection+0xbd`) at `vkDestroyInstance`: `util_queue_finish` (from `disk_cache_destroy`) let a queue thread `DeleteCriticalSection` the barrier mutex while another thread was still waking up in it. Mesa's mutex + condvar barrier (Windows, macOS) returned "serial thread" in every thread. Hit whenever the shader cache queue had two threads, i.e. on runs that wrote new cache entries (111 of 150 `vk_offscreen_test` runs with an empty cache; 0 of 500 after). Generic Mesa code |
+| 38 | `nvk/rm: a Helios shared-surface import goes on the device's memory list` | patch 31's `nvkmd_rm_mem_import_resource` made the memory outside the `nvkmd_dev_*` wrappers, so it never went on `dev->mems`, and `nvkmd_mem_unref` took it off: an access violation in `nvkmd_mem_unref` when the opener freed an imported shared surface (`d3d11_share` on NVK, every mode, KMD 22.22.318.1). `nvkmd_dev_track_imported_mem` puts it on the list like every other import |
+| 39 | `wsi/win32: scanout swapchains get two images; a one-image one does not hang` | Zink's kopper creates its swapchain with the surface's `minImageCount`, which the Win32 surface reported as 1. After patch 36 a one-image scanout chain kept its only image QUEUED after the present, so the next acquire waited forever (wgl_test on NVK hung in its first `SwapBuffers`, also with `NVK_RM_FENCE=0` and `NVK_SCANOUT_RELEASE=0`; `NVK_HELIOS_WSI=0` passed). The surface now reports 2 when the driver flips, and a one-image chain gets its image back at once, as before patch 36 |
+| 43 | `nvkmd: keep the device's memory list consistent; log misuse with a stack` | `nvkmd_dev_alloc_mapped_mem`'s map-failure path freed a listed memory without unlinking it; add/remove on `dev->mems` are idempotent and `nvkmd_rm_mem_free` unlinks a still-listed memory, each misuse logged (`mesa_loge`, module+offset stack, 16 per process). Turns the ledger-on exit crash (`nvkmd_mem_unref` `list_del` on a freed neighbour) into a log line that names the culprit |
+| 46 | `nvk/rm: helios_icd_interface version 5, scanout_frame (the KMD's seq and generation of a scanout frame)` | `scanout_frame(device, memory, &sequence, &generation)`: the `out_seq` the KMD returned for the memory's latest `SCANOUT_PRESENT` and the live user source's `SCANOUT_SET` `out_generation` (already recorded in `nvkmd_rm_mem::scanout_seq` / `nvkmd_rm_dev::source`), `VK_NOT_READY` without a live KMD source or minted seq. The D3D11 UMD names the frame with them in the already-on-scanout present tag (`helios_onscanout.h`) |
+| 45 | `nvk/rm: host-visible VRAM has no fixed budget; a full heap falls back to system memory` | Replaces patch 22's 256 MiB budget: the BAR heap is sized from BAR1 (one big page below VRAM so it never reads as a full ReBAR) and is no longer a hard limit. An allocation past the reported size goes to system memory, as one whose CPU map the host refused (patch 25) already did, and neither is charged to the heap. The host's window is the real limit. A full heap used to return `VK_ERROR_OUT_OF_DEVICE_MEMORY`, which DXVK latched in the command buffer it was recording and `vkEndCommandBuffer` then failed. `NVK_RM_BAR_MB` still overrides the reported size (0 = off) |
+| 44 | `nvk/rm: a device whose KMD went away touches none of its mappings` | Windows device loss (a live driver update or device restart under a running NVK process): librmclient registers every KMD view of RM memory in the loss table it shares with the Venus ICD and the Helios UMD (`guest/windows/umd_common/bridge/helios_kmdmap.h`), so a vanished view reads as zero pages, and the loss epoch moves (`crm_win_loss_epoch`, optional). A device records the epoch at creation; once it moves, exec-context flush/exec/wait/signal/sync, every CPU wait step and sync signal/get_value return `VK_ERROR_DEVICE_LOST` before touching a mapping, and new syncs are CPU-only. Fixes the crash in `nvkmd_rm_exec_ctx_flush` writing GP_PUT into a USERD view the KMD had unmapped (323.1, `vulkan_nouveau.dll+0x5dbf61`). After a loss librmclient sends no escape: the process needs restarting to use RM again |
+
+| 32 | `nvk/rm: Windows: RM device on by default under the Helios ICD policy; librmclient32.dll` | Windows only: `NVK_RM` defaults to on (`NVK_RM=0` off). The Helios ICD policy of the D3D UMD (`HELIOS_ICD`, `HKLM\SOFTWARE\Helios` `Icd` / `NvkDenyList` / `NvkAllowList`, the UMD's built-in deny-list) hides the device from processes sent to Venus, so the loader hands them Venus; exported as `nvk_helios_process_allowed()`. A 32-bit build loads `librmclient32.dll` first (one driver-store directory for both architectures) |
+| 33 | `nvk: tiled shadows for linear swapchain images` | the Win32 WSI's swapchain images are `TILING_LINEAR`; rendering to one with a depth buffer (vkcube, Zink) needs NVK's tiled shadow, whose layout was only set up for `DRM_FORMAT_MOD_LINEAR` images (zero-sized shadow, `NV_ERR_INVALID_ARGUMENT`, `vkEndCommandBuffer` = `VK_ERROR_OUT_OF_DEVICE_MEMORY`) |
+| 34 | `zink: load a Vulkan ICD directly on Windows (NVK on RM for the Helios adapter)` | Zink (Mesa's gallium WGL ICD, `GL=1` builds) loads NVK itself: `ZINK_VULKAN_ICD`, `NvkIcdPath`/`NvkIcdPath32`, NVK next to the WGL DLL, `%ProgramFiles%\Helios\nvk`; the loader for processes the Helios policy sends to Venus. See "OpenGL on NVK: Zink" below |
 
 Linux behaviour is unchanged: the full series (20 patches) builds the Linux
 NVK (nouveau + RM) as before, with the same `.so` exports; the patches apply
@@ -505,14 +516,17 @@ driver have. On the RTX 5090 in `win11`:
   VRAM go through BAR1 and, under Conduit, through the host-visible window
   every CPU mapping in the guest shares (1 GiB, `NvWinMb`), and each map
   cost a host round trip (5.7 ms before KMD 309, 0.4 ms now).
-- What it uses now: `bar_size_B = min(NVK_RM_BAR_MB (default 256, 0 = off),
-  BAR1 / 2)`, BAR1 from `NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE`. NVK's other
-  mappable memory is its own system pages (OS descriptors) and takes no
-  window space, so 256 MiB per device fits. Each allocation from the type
+- What it uses now (patch 45): `bar_size_B` = BAR1 from
+  `NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE`, kept one big page below VRAM
+  (`NVK_RM_BAR_MB` overrides, 0 = off; patch 22 had a 256 MiB default and
+  BAR1 / 2). NVK's other mappable memory is its own system pages (OS
+  descriptors) and takes no window space. Each allocation from the type
   is mapped once (`crm_map_memory`, write-combined in the KMD) when it is
   allocated and stays mapped until freed; internal and client maps alias
-  that mapping, so mapping per frame costs nothing. An allocation that
-  does not fit the heap fails with `VK_ERROR_OUT_OF_DEVICE_MEMORY`.
+  that mapping, so mapping per frame costs nothing. The heap size is not a
+  hard limit: an allocation past it goes to system memory, like one whose
+  map the host refused (below). Until patch 45 it failed with
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY`.
 - When the CPU map fails (patch 0025: the shared window is full, or the
   KMD's per-process share of it is used up), the allocation still succeeds.
   The VRAM is freed and the allocation gets system pages (OS descriptors,
@@ -715,6 +729,174 @@ nothing measurable either way. The full stack is about 8% above 0022 alone
 on zero-copy (357 against 331 fps on average), which is what block-linear
 scanout (0024) gives on its own (344-356). Per-draw cost does not limit this
 benchmark.
+
+### Presents on RM fences, no CPU wait (patch 30, dxvk-on-nvk S4)
+
+Before patch 30 every present on the Helios scanout waited on the CPU for the
+frame's GPU work and then flipped: the Win32 WSI through
+`wait_before_present`, the Helios D3D11 UMD (S3) through its frame gate. Patch
+30 hands the flip an RM fence instead and the presenting thread returns at
+once. The KMD side is `guest/windows/docs/rm-fence-marker.md`.
+
+How a present gets its fence:
+
+1. **Present timeline.** Per queue that presents, a 64-bit semaphore that is
+   one entry (32 bytes on GB20x, value at offset 0) of an RM
+   `NV_SEMAPHORE_SURFACE` (class 0xda, under the subdevice) over 4 KiB of
+   RM-allocated system memory (`NVKMD_RM_MEM_RM_SYSMEM`: RM maps the memory
+   itself, and an OS descriptor is refused with `NV_ERR_NOT_SUPPORTED`). It is
+   an ordinary `nvkmd_rm_sync` whose value lives in the surface, so the queue
+   signals it with the usual `SEM_EXECUTE` release + `NON_STALL_INTERRUPT`. A
+   context binds its channel to the surface before its first release into it
+   (`NV_SEMAPHORE_SURFACE_CTRL_CMD_BIND_CHANNEL`, notifier
+   `NV2080_NOTIFIERS_FIFO_EVENT_MTHD`, the host engine's non-stall interrupt
+   that the method raises), so RM checks the surface's waiters on it.
+2. **Fence context.** The entry is imported on the host render node with
+   nvidia-drm `SEMSURF_FENCE_CTX_CREATE` (0x54, NVKMS block
+   `{hClient, hSemaphoreSurface, size}`, index = entry), once per timeline.
+3. **Per present.** `vk_queue_signal_sync()` (exported by the runtime in
+   patch 30) of the timeline's next value after everything submitted to the
+   queue so far, then `SEMSURF_FENCE_CREATE` (0x55, `timeout_ms` 5000) for that
+   value: a backend handle, recorded by the KMD (22.22.311+) as a fence of
+   librmclient's NVRM device, which fires one `EventReady` when the GPU writes
+   the value (or with an error after 5 s).
+4. **Flip.** `nvkmd_rm_mem_scanout_flip_fenced()`:
+   - KMD with `QueryCaps.supported_ops` bit 32 (`HELIOS_NVRM_CAP_SCANOUT_FENCE`):
+     `SCANOUT_PRESENT` with flag `RM_FENCE` and the handle at offset 52; on OK
+     the KMD owns the handle and sends the flip from its worker when the fence
+     fires (FIFO per source, ready prefix coalesced). `QUEUE_FULL` (8 waiting):
+     wait for our own fence (all older ones are then ready) and retry, so a
+     plain flip never overtakes queued ones. Any other refusal: the handle is
+     still ours, and the flip thread below takes over for good.
+   - KMD without the bit (22.22.311): a flip thread per device waits on the
+     fence (`EVENT_REGISTER` on the handle, no polling), closes it and sends a
+     plain `SCANOUT_PRESENT`, in order, at most 8 frames behind (the producer
+     blocks beyond that).
+   - No DRM fences on the host (config bit 11), an older librmclient, or
+     `NVK_RM_FENCE=0`: the CPU wait as before.
+
+Consumers: the Win32 WSI (`wsi_device::win32.scanout_flip_fenced`; a scanout
+swapchain then skips the CPU wait, `wsi_swapchain::gpu_ordered_present`) and
+`helios_icd_interface` version 3 (`queue_rm_fence`, `rm_fence_wait`,
+`rm_fence_close`, `scanout_present_fenced`; caps `RM_FENCE`,
+`SCANOUT_FENCE_KMD`, `PRESENT_FENCE_KMD`), which the Helios UMD uses on
+`feat/s4-rm-fences` (DXVK's queue taken with `lockSubmission()`; the frame
+only made SUBMITTED, not complete). librmclient adds `crm_win_caps`,
+`crm_win_semsurf_ctx_create`, `crm_win_semsurf_fence_create`,
+`crm_win_fence_wait` and `crm_win_scanout_present_fenced` (all loaded as
+optional symbols).
+
+Knobs: `NVK_RM_FENCE=0` (off), `NVK_RM_FENCE_KMD=0` (never hand fences to the
+KMD: flip thread).
+
+Image reuse: the swapchain keeps its rule (an image comes back two presents
+later). With the KMD carrying the fence the rule the KMD documents is "do not
+render into the image of present P before present P+1's fence fired and its
+call returned"; on one queue the GPU write into P's image is ordered after
+P+1's and P+2's work, so the remaining window is one KMD worker wake.
+
+Limits: the timeline is signalled on the present queue, so the flip is
+ordered after work submitted to *that* queue. Work of another queue is
+covered when the present waits on it with a semaphore: on Windows NVK has no
+`copy_sync_payloads`, so the WSI's pre-present submit really waits on the
+present queue, before the timeline signal. The UMD signals on DXVK's graphics
+queue, which already waits for DXVK's transfer queue. A fence costs one escape (60-80 us): a
+trivial frame (vk_scanout_present's triangle) is faster with the CPU wait
+(5645 vs 4899 fps), any frame with real GPU work is faster fenced. A fence for
+a value already reached fires after up to ~1 ms (the backend's event pump
+misses the edge of a sync_file that signalled before it was watched and finds
+it on its 1 ms sweep, `conduit-backend.rs` `event_pump`); fences made while the
+GPU still works fire within ~0.1 ms of the write.
+
+`win11`, KMD 22.22.311 (no bit 32, so the flip thread), RTX 5090:
+
+- `crm_semsurf_smoke` (librmclient only, CPU `SET_VALUE`): fence create 62 us
+  median, `SET_VALUE` to event 932 us median (p99 976), Close 67 us; already
+  reached 0.83 ms; a 200 ms timeout fires after 201.5 ms.
+- `vk_rmfence_test` (NVK, GPU release): no fence ever fired before the
+  submit's own `VkFence` (checked every round). 2 GiB fill: wake 2091 us after
+  submit (RM fence) vs 2157 us (`vkWaitForFences`); 64 MiB fill 298 vs 361 us.
+- `vk_rmfence_test` presenting 1920x1080 on scanout 0 with three images and
+  frame pipelining (wait for frame P-2): 1 GiB fill per frame 808 -> 982 fps,
+  presenting thread 1228 -> 73 us per frame in present; 64 MiB fill 3711 ->
+  6481 fps. 0 failed flips, 0 fences that did not fire.
+- KMD counters after 38561 fences: `NvFence` = `NvFenceCl` = `NvFenceSig` =
+  38561, `NvFenceEarly` 638, `NvFenceErr` 0.
+
+Patch order: 0022, 0023 (Helios ICD interface, required: patch 30 extends
+`nvk_helios.c`), 0024 if present, 0025, 0027-0029, **0030**, then
+`patches-windows-dxvk/`. It does not apply without 0025 and 0027-0029.
+
+### OpenGL on NVK: Zink (patches 32-34, 2026-10-06, `win11`, KMD 22.22.311.0 and 312.0)
+
+`GL=1 guest/nvk-rm/build-windows.sh` also builds Zink as Mesa's gallium WGL
+ICD (`libgallium_wgl.dll`) and Mesa's `opengl32.dll`, from the same tree as
+NVK (`-Dgallium-drivers=zink -Dopengl=true`; it builds with MinGW as is).
+Zink loads NVK directly (patch 34), so the Vulkan loader and the Venus ICD
+are not involved. Installed through the driver package
+(`feat/helios-nvk-package`), the adapter's `OpenGLDriverName` points at the
+WGL DLL in the driver store, next to NVK.
+
+`windows/wgl_test.c` (built by `windows/build-tests.sh`) checks a frame
+with glReadPixels, runs a GL 4.3 compute shader over 64 Ki values and spins
+glxgears' gears with swap interval 0. App-local `opengl32.dll` +
+`libgallium_wgl.dll` + `vulkan_nouveau.dll` + `librmclient.dll`, run in the
+desktop session (scheduled task, `/it`):
+
+| KMD | build | renderer | readback | compute | gears 1280x720 |
+|---|---|---|---|---|---|
+| 311.0 | 64-bit, NVK | `zink Vulkan 1.4(NVIDIA GeForce RTX 5090 (NVK GB202) (MESA_NVK))`, GL 4.6 compat | pass | pass | 406-447 fps |
+| 311.0 | 32-bit (WoW64), NVK | same | pass | pass | 440 fps |
+| 311.0 | 64-bit, `ZINK_VULKAN_ICD=loader` (Venus) | `zink Vulkan 1.4(Virtio-GPU Venus (NVIDIA GeForce RTX 5090) (NVIDIA_PROPRIETARY))` | pass | pass | 353 fps |
+| 312.0 | 64-bit, NVK, driver-store layout (`stage-helios-package.sh`) | NVK, as above | pass | pass | 4148-4763 fps |
+| 312.0 | 32-bit, NVK, `vulkan_nouveau32.dll` + `librmclient32.dll` | NVK | pass | pass | 4555 fps |
+| 312.0 | 64-bit, NVK, `NVK_HELIOS_WSI=0` (GDI present) | NVK | pass | pass | 1561 fps |
+| 312.0 | 64-bit, `ZINK_VULKAN_ICD=loader` (Venus) | Venus | pass | pass | 831 fps |
+
+On KMD 311.0 the gears were present-bound: NVK's Helios scanout flip was
+refused with EBUSY ("frames dropped"), and the GDI path gave the same rate.
+On 312.0 the flip works: zero-copy present to the scanout (the window's
+content goes to scanout 0, as for every NVK swapchain without
+ForeignImport), 5x Venus. `HELIOS_ICD=venus` sends Zink to the loader
+(Venus). Without patch 33 the first frame failed: Zink renders its default
+framebuffer, a linear swapchain image, with a depth buffer.
+
+The same build registered as a Vulkan ICD (a manifest next to
+`vulkan_nouveau.dll` under `HKLM\SOFTWARE\Khronos\Vulkan\Drivers`, for
+the test only) is what an ordinary app sees through the system loader
+(`windows/vk_loader_list.c`, desktop session): NVK first, with the Helios
+adapter's LUID (librmclient with `crm_win_adapter_luid`), Venus second;
+the first discrete GPU, NVK, creates a device and completes a submit. With
+`HELIOS_ICD=venus` NVK enumerates nothing and the app gets Venus.
+
+### Scanout images back on host release (patch 36, KMD 22.22.315)
+
+With KMD 22.22.315 on a backend with `NVGPU_F_SCANOUT_RELEASE` (feature bit
+15) the KMD reports when the host is done with a flipped image
+(`guest/windows/docs/foreign-scanout.md` on `worktree-kmd-start-debug`,
+"Buffer release"; `QueryCaps.supported_ops` bit 35). Patch 36 replaces the
+swapchain's "an image comes back two presents later" with it:
+
+- every flip through the KMD's source (plain or fenced) records the
+  `out_seq` it returned on the memory; a flip still queued in the flip
+  thread has no seq yet, so a wait on that memory first waits for the thread;
+- `vkAcquireNextImageKHR` gets an image as soon as a later one is shown,
+  takes the idle image shown longest ago and blocks (outside the swapchain
+  lock) until `SCANOUT_STATUS`'s released floor reaches that image's seq,
+  woken by the `SCANOUT_RELEASED` event (kind 3, handle 0) with the
+  reset/ask/wait order that loses no wake (librmclient
+  `crm_win_scanout_wait_released`). The wait honours the app's timeout
+  (`VK_TIMEOUT`/`VK_NOT_READY`, the image stays idle) and is capped at 1 s:
+  past the host's 500 ms forced release the image is written anyway and
+  counted. A lost transport counts as released;
+- without bit 35 (any KMD before 315, or a host without bit 15) the old rule,
+  unchanged. `NVK_SCANOUT_RELEASE=0` forces the old rule.
+
+`win11`, KMD 22.22.312 (no bit 35): "not tracked", `vk_scanout_present` with
+two and three images as before, 0 release waits. The tracked path is untested
+(needs KMD 315 and the backend with bit 15).
+
+Order: after 0030, before `patches-windows-dxvk/`.
 
 ## Running (in a guest)
 
@@ -956,7 +1138,7 @@ unsubmitted values instead of leaving GPU acquires spinning).
 | dma-buf / opaque-fd memory export and import | done (see "Zero-copy presentation") | cross-driver import (a dma-buf nvidia-drm cannot name) is refused |
 | external semaphore/fence fds, explicit sync | not supported (no handle types) | `NV_SEMAPHORE_SURFACE` + nvidia-drm's `SEMSURF_FENCE_*` (Conduit forwards them) for sync_files and syncobjs; then drop `wait_before_present` and use Wayland explicit sync / DRI3 syncobj |
 | presentation | zero-copy (dma-buf + modifiers), CPU wait before each present | explicit sync, above |
-| host-visible VRAM, BAR heap | 256 MiB (patch 22, `NVK_RM_BAR_MB`) | the window size from the KMD/backend, to size the heap from it |
+| host-visible VRAM, BAR heap | BAR1, not a hard limit: past it, or when the host refuses a map, system memory (patches 22, 25, 45; `NVK_RM_BAR_MB` overrides) | a heap size that tracks the host window's free space |
 | compression | off | comptags (`NVOS32_ATTR_COMPR_REQUIRED`) and compressed modifiers |
 | transfer queue (async CE channel), video decode | off | a second TSG with `NV2080_ENGINE_TYPE_COPY(n)` |
 | zcull info | not queried | `NV2080_CTRL_CMD_GR_GET_ZCULL_INFO` |

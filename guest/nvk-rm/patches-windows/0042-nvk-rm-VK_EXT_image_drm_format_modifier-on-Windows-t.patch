@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 10:34:47 +0200
+Subject: [PATCH] nvk/rm: VK_EXT_image_drm_format_modifier on Windows too
+
+Conduit guest/windows/docs/shared-formats.md section 10: an NVK process
+opening a LINEAR surface whose pitch is not NVK's own choice (a KMD-made
+RM surface such as a GDI redirection surface, or a linear NVK one) must
+build its image with the recorded pitch and offset. NVK already takes
+VkImageDrmFormatModifierExplicitCreateInfoEXT (nil accepts imported
+LINEAR pitches down to 32 B) and the RM backend applies kinds per
+mapping, so only the advertisement was missing: has_alloc_tiled no longer
+depends on the DRM path. The Helios shared-surface import check then
+matches the explicit layout by construction. NVK_HELIOS_MODIFIERS=0
+hides the extension on Windows.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      | 5 +++--
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c | 8 ++++++--
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index e03d9cf..47d7e44 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -395,8 +395,9 @@ void nvkmd_rm_free_memory(struct nvkmd_rm_dev *dev, uint32_t h_memory);
+ 
+ /*
+  * DRM: nvidia-drm node discovery, dma-buf export/import (nvkmd_rm_drm.c).
+- * Linux only.  Without it (Windows) there are no dma-bufs and no DRM format
+- * modifiers: has_dma_buf and has_alloc_tiled stay false.
++ * Linux only.  Without it (Windows) there are no dma-bufs: has_dma_buf stays
++ * false.  DRM format modifiers stay (has_alloc_tiled): images with an explicit
++ * layout need no dma-buf.
+  */
+ 
+ #ifdef NVK_RM_WITH_DRM
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index 6ef4528..2903b92 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -404,9 +404,13 @@ nvkmd_rm_try_create_pdev(const struct nvkmd_rm_lib *lib,
+       .has_get_vram_used = true,
+       /* Kinds are applied per mapping; a "tiled" allocation only records
+        * the layout for NVKMS.  This is what enables
+-       * VK_EXT_image_drm_format_modifier.
++       * VK_EXT_image_drm_format_modifier.  On Windows too (Conduit
++       * shared-formats.md section 10): a Helios opener imports a LINEAR
++       * surface the KMD made with its recorded pitch through an explicit
++       * modifier layout.  NVK_HELIOS_MODIFIERS=0 hides it there.
+        */
+-      .has_alloc_tiled = NVKMD_RM_WITH_DRM,
++      .has_alloc_tiled = NVKMD_RM_WITH_DRM ||
++                         debug_get_bool_option("NVK_HELIOS_MODIFIERS", true),
+       .has_map_fixed = false,
+       .has_overmap = false,
+       /* GB20x: compressible generic memory (see nvkmd_rm_mem.c) */
+-- 
+2.43.0
+

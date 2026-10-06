@@ -25,6 +25,17 @@ helios_umd.dll = 1,,
 helios_umd12.dll = 1,,
 helios_umd32.dll = 1,,
 helios_umd12_32.dll = 1,,
+; NVK on RM (Vulkan) and Zink (OpenGL on Vulkan), cross-built from Mesa with
+; guest/nvk-rm/build-windows.sh. File names are unique across both
+; architectures: everything lands in the one driver-store directory.
+vulkan_nouveau.dll = 1,,
+librmclient.dll = 1,,
+helios_nvk64.json = 1,,
+vulkan_nouveau32.dll = 1,,
+librmclient32.dll = 1,,
+helios_nvk32.json = 1,,
+helios_gl64.dll = 1,,
+helios_gl32.dll = 1,,
 
 ; ──── Manufacturer / Models ────────────────────────────────────────────────
 
@@ -72,6 +83,14 @@ helios_umd.dll
 helios_umd12.dll
 helios_umd32.dll
 helios_umd12_32.dll
+vulkan_nouveau.dll
+librmclient.dll
+helios_nvk64.json
+vulkan_nouveau32.dll
+librmclient32.dll
+helios_nvk32.json
+helios_gl64.dll
+helios_gl32.dll
 
 [Helios_Install.Services]
 AddService = helios_kmd_render, 0x00000002, Helios_ServiceInstall, Helios_EventLog
@@ -96,11 +115,28 @@ HKR,,TypesSupported,%REG_DWORD%,7
 [Helios_Install.HW]
 AddReg = Helios_PCI_MSIX
 
+; Message-signalled interrupts. The device is vhost-user-test-device-pci with two
+; queues and 3 MSI-X vectors (config, control queue, event queue); a third (RM)
+; queue would bring a fourth. MessageNumberLimit caps what PnP may grant, and the
+; driver follows whatever it is actually given (it reads the MSI-X Enable bit and
+; the resource list at StartDevice, falls back to INTx handling when no message
+; was granted, and never programs a vector above the granted count), so a device
+; that offers fewer messages (conduit-vmm) or none still works.
+;
+; SHIPPED DORMANT: MSISupported is 0 (the legacy INTx line, as before this work).
+; MSI-X has never run on hardware, and if the OS connects messages that are never
+; delivered, nothing recovers (fence completions and the HPD wake ride the DPC).
+; To try it, on the installed device key:
+;   reg add "HKLM\SYSTEM\CurrentControlSet\Enum\<instance path>\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" /v MSISupported /t REG_DWORD /d 1 /f
+;   pnputil /restart-device "<instance id>"
+; The line below is NOCLOBBER (0x00000002), so a driver update keeps that setting.
+; Flip the default to 1 only after `MsiInts` has been seen growing on the target
+; hosts. See docs/msi-interrupts.md.
 [Helios_PCI_MSIX]
 HKR, "Interrupt Management",, 0x00000010
 HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
-HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, %REG_DWORD%, 0
-HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, %REG_DWORD%, 1
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010003, 0
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, %REG_DWORD%, 3
 
 ; ──── Software key / UMD registration ──────────────────────────────────────
 ; TWO user-mode APIs, each built for AMD64 and x86, since stage S5 (docs/dx12/ARCHITECTURE.md 9.1
@@ -154,12 +190,33 @@ HKR,, InstalledDisplayDrivers,  %REG_MULTI_SZ%, helios_umd,helios_umd12,helios_u
 ; behind. Keep the literal "Helios" substring: the ICD matcher depends on it.
 HKR,, HardwareInformation.AdapterString, %REG_SZ%, %DeviceDesc%
 
-; ──── Vulkan ICD registration ──────────────────────────────────────────────
-; A universal INF may only write device-relative (HKR) registry keys, not the
-; absolute HKLM\SOFTWARE\Khronos\Vulkan\Drivers value the Vulkan loader reads.
-; ICD registration is therefore handled at ICD deployment (Phase 5/6) — via the
-; ICD's own installer / a setup step that registers helios_vulkan.json — not by
-; this KMD package.
+; ──── Vulkan and OpenGL ICD registration (NVK on RM, Zink) ────────────────
+; Per-adapter registration, read from this software key by the Vulkan loader
+; (VulkanDriverName / VulkanDriverNameWow, through D3DKMT) and by opengl32.dll
+; (OpenGLDriverName / ...Wow). Every Vulkan and OpenGL app finds NVK and Zink
+; for the Helios adapter without anything under HKLM\SOFTWARE\Khronos.
+;
+;   helios_nvk64.json / helios_nvk32.json  NVK's ICD manifests (library_path
+;       .\vulkan_nouveau.dll / .\vulkan_nouveau32.dll, next to them)
+;   helios_gl64.dll / helios_gl32.dll      Mesa's gallium WGL ICD with Zink,
+;       which loads NVK from this directory directly (not through the loader)
+;
+; The Helios UMDs find NVK here too (bridge_icd_backend.cpp: next to the UMD,
+; after HELIOS_NVK_ICD and NvkIcdPath). NVK itself applies the Helios ICD
+; policy (HKLM\SOFTWARE\Helios Icd / NvkDenyList / NvkAllowList, the
+; UMD's built-in deny-list): a process sent to Venus sees no NVK device, so
+; the loader hands it the Venus ICD (still registered under
+; HKLM\SOFTWARE\Khronos\Vulkan\Drivers by the installer: the UMD's DXVK
+; on Venus, DWM above all, reaches Venus through the loader), and Zink falls
+; back to the loader. Icd=venus turns NVK off for D3D, Vulkan and OpenGL.
+HKR,, VulkanDriverName,     %REG_MULTI_SZ%, %13%\helios_nvk64.json
+HKR,, VulkanDriverNameWow,  %REG_MULTI_SZ%, %13%\helios_nvk32.json
+HKR,, OpenGLDriverName,     %REG_MULTI_SZ%, %13%\helios_gl64.dll
+HKR,, OpenGLVersion,        %REG_DWORD%, 2
+HKR,, OpenGLFlags,          %REG_DWORD%, 1
+HKR,, OpenGLDriverNameWow,  %REG_MULTI_SZ%, %13%\helios_gl32.dll
+HKR,, OpenGLVersionWow,     %REG_DWORD%, 2
+HKR,, OpenGLFlagsWow,       %REG_DWORD%, 1
 
 ; ──── Strings ──────────────────────────────────────────────────────────────
 

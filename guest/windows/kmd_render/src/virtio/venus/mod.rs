@@ -50,6 +50,7 @@ use crate::irql::PassiveLevel;
 mod bringup;
 mod commands;
 mod diagnostics;
+mod foreign_copy;
 mod present;
 mod protocol;
 mod ring;
@@ -57,6 +58,10 @@ mod scanout;
 
 pub(crate) use bringup::*;
 use commands::*;
+pub(crate) use foreign_copy::{
+    foreign_source_if_enabled, publish_counters as publish_foreign_copy_counters, ForeignSource,
+    FC_BLT, FC_SCANOUT,
+};
 pub(crate) use present::*;
 pub(crate) use protocol::*;
 use ring::*;
@@ -275,6 +280,11 @@ pub struct VenusClient {
     /// venus device handle. Not `Option`: a `VenusClient` without a device is
     /// unrepresentable, which is the whole point of the typestate.
     device_id: VkDeviceId,
+    /// Whether `device_id` was created with `VK_EXT_image_drm_format_modifier`
+    /// (ladder tier 0). Only such a device can import a foreign resource as an
+    /// explicit-modifier image; without it the foreign copy path is unavailable
+    /// (counted `FcNoExt`) and everything else works as it always did.
+    modifier_import_device: bool,
     /// Graphics queue handle from family 0, queue 0.
     queue_id: VkQueueId,
     /// HOST_VISIBLE|HOST_COHERENT memory type chosen during bring-up.
@@ -321,6 +331,11 @@ pub struct VenusClient {
     /// already-live local `VkDeviceMemory`; no resource-id heuristic or
     /// same-device re-import is permitted.
     owned_memory_blobs: Vec<OwnedMemoryBlob>,
+    /// The staging LINEAR image of the level 5 Blt CPU-copy fallback, and the allocation
+    /// attempts made for it (`present::RmBltStage`). `None` / 0 until a Blt into an RM
+    /// primary needed one: at levels below 5 nothing ever allocates it.
+    rm_blt_stage: Option<RmBltStage>,
+    rm_blt_stage_allocs: u32,
 }
 
 impl VenusClient {

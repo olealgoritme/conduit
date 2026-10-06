@@ -21,6 +21,7 @@ pub unsafe extern "C" fn dxgkddi_query_child_relations(
     child_relations_size: u32,
 ) -> NTSTATUS {
     crate::diag::record(0x1200_0001);
+    crate::ddi::stall_diag::mode_step(1);
     crate::diag::record(0x1201_0000 | (child_relations_size & 0xFFFF));
 
     if miniport_device_context.is_null() {
@@ -106,6 +107,7 @@ pub unsafe extern "C" fn dxgkddi_query_child_status(
     non_destructive_only: BOOLEAN,
 ) -> NTSTATUS {
     crate::diag::record(0x1200_0002);
+    crate::ddi::stall_diag::mode_step(2);
     if !child_status.is_null() {
         crate::diag::record(0x1202_0000 | unsafe { (*child_status).ChildUid & 0xFFFF });
     }

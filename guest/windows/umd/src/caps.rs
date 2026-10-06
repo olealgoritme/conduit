@@ -157,6 +157,7 @@ pub(crate) unsafe extern "system" fn get_caps(
         D3D10_2DDICAPS_TYPE_D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT as D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT,
         D3D10_2DDICAPS_TYPE_D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 as D3DWDDM1_3DDICAPS_D3D11_OPTIONS1,
         D3D10_2DDICAPS_TYPE_D3DWDDM1_3DDICAPS_MARKER as D3DWDDM1_3DDICAPS_MARKER,
+        D3D10_2DDICAPS_TYPE_D3DWDDM2_0DDICAPS_GPUVA_CAPS as D3DWDDM2_0DDICAPS_GPUVA_CAPS,
     };
     // The old literals, pinned so the alias swap is provably value-preserving.
     const _: () = assert!(D3D11DDICAPS_THREADING == 128);
@@ -167,6 +168,7 @@ pub(crate) unsafe extern "system" fn get_caps(
     const _: () = assert!(D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT == 134);
     const _: () = assert!(D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 == 136);
     const _: () = assert!(D3DWDDM1_3DDICAPS_MARKER == 137);
+    const _: () = assert!(D3DWDDM2_0DDICAPS_GPUVA_CAPS == 153);
 
     if !args.is_null() {
         let args = unsafe { &*args };
@@ -244,6 +246,17 @@ pub(crate) unsafe extern "system" fn get_caps(
                     let caps = feature_profile().options1;
                     unsafe { *(args.pData as *mut u32) = caps };
                     log_error!("  GetCaps: D3D11_OPTIONS1 TiledResourcesSupportFlags=0x{caps:x}");
+                }
+                // Queried only by a WDDM 2.x D3D11 device (`ddi_level.rs`).
+                // Non-zero, and 40 bits for the same reason as umd12's
+                // GPUVA_CAPS: kmd_render declares a 40-bit GPU VA and vkd3d
+                // hardcodes 40. The other WDDM 2.x caps (OPTIONS2 = conservative
+                // tier, OPTIONS3, MEMORY_ARCHITECTURE, SHADERCACHE, TEXTURE_LAYOUT,
+                // SWIZZLE_PATTERN) keep the zeroed answer: not supported/discrete.
+                D3DWDDM2_0DDICAPS_GPUVA_CAPS if args.DataSize >= 4 => {
+                    const HELIOS_GPU_VA_BITS: u32 = 40;
+                    unsafe { *(args.pData as *mut u32) = HELIOS_GPU_VA_BITS };
+                    log_error!("  GetCaps: GPUVA MaxGPUVirtualAddressBitsPerResource={HELIOS_GPU_VA_BITS}");
                 }
                 D3DWDDM1_3DDICAPS_MARKER if args.DataSize >= 4 => {
                     const D3DWDDM1_3DDI_MARKER_TYPE_NONE: u32 = 0;

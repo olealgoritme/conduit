@@ -645,23 +645,83 @@ pub(crate) fn note_worker_epoch_conflict() {
     WORKER_EPOCH_CONFLICT.fetch_add(1, Ordering::Relaxed);
 }
 
+// ---- S-0a: the flip flags the driver observes but does not act on -------------------------
+//
+// Read-only. The independent-flip probe (docs/zero-copy-present.md, "FlipCapsX and flip flag
+// counters (S-0a)") needs to know whether dxgkrnl ever sets `SharedPrimaryTransition`,
+// `IndependentFlipExclusive` or `MoveFlip` in `SetVidPnSourceAddress` (which can run at DIRQL, so
+// atomics only) or `RedirectedFlip` in `DxgkDdiPresent`. Nothing here gates or changes either
+// DDI; the decode is `helios_kmd_logic::flip_flags`. Counted per call, zeroed by [`reset`] at
+// every StartDevice, published by [`publish_idf_flags`] from [`dump`] (the one PASSIVE site).
+
+/// `SetVidPnSourceAddress` calls with `SharedPrimaryTransition` set (`IdfSpaTrans`).
+static IDF_SPA_TRANS: AtomicU32 = AtomicU32::new(0);
+/// ... with `IndependentFlipExclusive` set (`IdfSpaExcl`).
+static IDF_SPA_EXCL: AtomicU32 = AtomicU32::new(0);
+/// ... with `MoveFlip` set (`IdfSpaMove`).
+static IDF_SPA_MOVE: AtomicU32 = AtomicU32::new(0);
+/// The last full `DXGK_SETVIDPNSOURCEADDRESS_FLAGS.Value` seen (`IdfSpaFlg`).
+static IDF_SPA_FLG: AtomicU32 = AtomicU32::new(0);
+/// `DxgkDdiPresent` calls with `RedirectedFlip` set (`IdfPrRedir`).
+static IDF_PR_REDIR: AtomicU32 = AtomicU32::new(0);
+/// The last full `DXGK_PRESENTFLAGS.Value` seen (`IdfPrFlg`).
+static IDF_PR_FLG: AtomicU32 = AtomicU32::new(0);
+
+/// Note the flags of one `SetVidPnSourceAddress` call. Any IRQL, atomics only.
+pub(crate) fn note_set_vidpn_flags(value: u32) {
+    let d = helios_kmd_logic::flip_flags::decode_spa_flags(value);
+    if d.shared_primary_transition {
+        IDF_SPA_TRANS.fetch_add(1, Ordering::Relaxed);
+    }
+    if d.independent_flip_exclusive {
+        IDF_SPA_EXCL.fetch_add(1, Ordering::Relaxed);
+    }
+    if d.move_flip {
+        IDF_SPA_MOVE.fetch_add(1, Ordering::Relaxed);
+    }
+    IDF_SPA_FLG.store(value, Ordering::Relaxed);
+}
+
+/// Note the flags of one `DxgkDdiPresent` call. Any IRQL, atomics only.
+fn note_present_idf_flags(value: u32) {
+    if helios_kmd_logic::flip_flags::present_is_redirected(value) {
+        IDF_PR_REDIR.fetch_add(1, Ordering::Relaxed);
+    }
+    IDF_PR_FLG.store(value, Ordering::Relaxed);
+}
+
+/// Mirror the S-0a counters into the service key. PASSIVE_LEVEL only; called from [`dump`] alone.
+fn publish_idf_flags() {
+    crate::diag::record_named_bytes(b"IdfSpaTrans", IDF_SPA_TRANS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"IdfSpaExcl", IDF_SPA_EXCL.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"IdfSpaMove", IDF_SPA_MOVE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"IdfSpaFlg", IDF_SPA_FLG.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"IdfPrRedir", IDF_PR_REDIR.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"IdfPrFlg", IDF_PR_FLG.load(Ordering::Relaxed));
+}
+
 /// Ticks [`dump_periodic`].
 static DUMP_TICKS: AtomicU32 = AtomicU32::new(0);
 
-/// Dump cadence, in HPD-worker wakeups.
-///
-/// The worker wakes once per dirty edge plus once per control completion, so
-/// during a workload this is roughly 128 frames — about one dump per second at
-/// the 155 flush/s the handoff measured, and no dumps at all while idle (where
-/// there is nothing to observe). One dump is ~120 registry writes, so the
-/// cadence is the whole cost control: it must stay well above the per-frame
-/// rate this driver spent T1b removing.
-const DUMP_EVERY: u32 = 128;
+/// The wake count and the time (ms) of the last dump ([`dump_periodic`]).
+static DUMP_LAST_N: AtomicU32 = AtomicU32::new(0);
+static DUMP_LAST_MS: AtomicU32 = AtomicU32::new(0);
+
+// Dump cadence: `hpd_wake::dump_due`, at least `DUMP_EVERY_LOOPS` (128) HPD-worker wakes AND
+// `DUMP_MIN_INTERVAL_MS` (1 s) since the previous dump.
+//
+// The worker wakes once per dirty edge plus once per control completion, so during a Venus
+// workload 128 wakes were roughly 128 frames — about one dump per second at the 155 flush/s the
+// handoff measured, and no dumps at all while idle (where there is nothing to observe). One dump
+// is ~300 registry writes, so the cadence is the whole cost control: it must stay well above the
+// per-frame rate this driver spent T1b removing. With a workload that wakes the worker per
+// present (T5: 9000 wakes a second) the count alone was 70 dumps a second, hence the interval.
 
 /// Note one `dxgkddi_present` entry and which arms its flags select. Any IRQL.
 pub(crate) fn note_present(flags: u32, flip_interval: u32, has_dma: bool, blt: bool, flip: bool) {
     PRESENT_CALLS.fetch_add(1, Ordering::Relaxed);
     PRESENT_FLAGS_HISTOGRAM.note(flags);
+    note_present_idf_flags(flags);
     PRESENT_INTERVAL_HISTOGRAM.note((flip_interval << 8) | u32::from(has_dma));
     if blt {
         PRESENT_BLTS.fetch_add(1, Ordering::Relaxed);
@@ -820,7 +880,29 @@ pub(crate) fn dump(adapter: &crate::adapter::AdapterContext) {
         b"VpGate",
         adapter.vidpn_programming.load(Ordering::Acquire) as u32,
     );
-    crate::diag::record_named_bytes(b"VpVsN", adapter.vsync_count.load(Ordering::Relaxed));
+    // The vsync heartbeat's rate is `VpVsN` / time, and the time is the one the
+    // count was produced at, not the time of whenever somebody reads the key:
+    // `VpVsT` is the interrupt time (ms) of the tick that last advanced `VpVsN`,
+    // `VpDmpT` the interrupt time of this dump (the same clock, wraps at 2^32 ms),
+    // `VsMinGap` the smallest gap between two ticks in 100 ns units (0xFFFFFFFF =
+    // none yet) and `VsFast` the ticks closer than half a period to the one
+    // before. Count first, then its time: a pair is at most one tick apart.
+    // Rate recipe: `docs/foreign-scanout.md`, "Reading vsync rates".
+    let vsync_count = adapter.vsync_count.load(Ordering::Relaxed);
+    let vsync_last_ms = adapter.vsync_last_ms();
+    let dump_ms = crate::adapter::AdapterContext::interrupt_time_ms();
+    crate::diag::record_named_bytes(b"VpVsN", vsync_count);
+    crate::diag::record_named_bytes(b"VpVsT", vsync_last_ms);
+    crate::diag::record_named_bytes(b"VpDmpT", dump_ms);
+    // The timer's own tick count and those with the delivery gate closed, on the same dump
+    // as `VpVsN` (`VpVsN` = `VsTickN` - `VsOffN`): see `ddi::stall_diag`.
+    // The whole stall block with it (it includes the two mirrors that used to be written here
+    // alone): until v328 `HpdSite` / `HpdLoopT` / `StallT` were only ever refreshed by the `Nv*`
+    // mirror and a stuck-worker escape, so a dump read after an idle spell showed a worker frozen
+    // at the site of the last such write.
+    crate::ddi::stall_diag::publish_counters();
+    crate::diag::record_named_bytes(b"VsMinGap", adapter.vsync_min_gap_published());
+    crate::diag::record_named_bytes(b"VsFast", adapter.vsync_fast.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"VpVsEn", adapter.vsync_enabled.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(
         b"VpPend",
@@ -955,6 +1037,7 @@ pub(crate) fn dump(adapter: &crate::adapter::AdapterContext) {
     PRESENT_FLIP_HISTOGRAM.dump([b'P', b'b']);
     PRESENT_FLAGS_HISTOGRAM.dump([b'F', b'l']);
     PRESENT_INTERVAL_HISTOGRAM.dump([b'F', b'i']);
+    publish_idf_flags();
 
     // The D4a read-ledger census (`Rd*`/`Aq*` — FIX-DESIGN-d4a.md §3.4).
     // Identity for every run: `RdIss == RdRet` at quiescence, `RdIss <= FfTot`
@@ -965,8 +1048,26 @@ pub(crate) fn dump(adapter: &crate::adapter::AdapterContext) {
 /// Throttled [`dump`] for the HPD worker loop. PASSIVE_LEVEL only.
 pub(crate) fn dump_periodic(adapter: &crate::adapter::AdapterContext) {
     let n = DUMP_TICKS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-    if n == 1 || n % DUMP_EVERY == 0 {
+    let since = n.wrapping_sub(DUMP_LAST_N.load(Ordering::Relaxed));
+    // The cadence is a function of TIME as well as of wakes (`hpd_wake::dump_due`): the loop
+    // count alone ran the ~300 registry writes of a dump about 70 times a second in the T5 run
+    // (9000 wakes a second), taking the worker out of its flip pacing for much of each second.
+    let now_ms = crate::adapter::AdapterContext::interrupt_time_ms();
+    if helios_kmd_logic::hpd_wake::dump_due(
+        n == 1,
+        since,
+        now_ms,
+        DUMP_LAST_MS.load(Ordering::Relaxed),
+    ) {
+        DUMP_LAST_N.store(n, Ordering::Relaxed);
+        DUMP_LAST_MS.store(now_ms, Ordering::Relaxed);
+        let t0 = crate::adapter::foreign_scanout::now_100ns();
         dump(adapter);
+        let us = (crate::adapter::foreign_scanout::now_100ns().saturating_sub(t0) / 10)
+            .min(u32::MAX as u64) as u32;
+        crate::ddi::stall_diag::note_dump(us);
+    } else if since >= helios_kmd_logic::hpd_wake::DUMP_EVERY_LOOPS {
+        crate::ddi::stall_diag::note_dump_skipped();
     }
 }
 
@@ -1026,7 +1127,15 @@ pub(crate) fn reset(adapter: &crate::adapter::AdapterContext) {
         &FAST_BIND_SKIPS,
         &WORKER_EPOCH_SUPERSEDED,
         &WORKER_EPOCH_CONFLICT,
+        &IDF_SPA_TRANS,
+        &IDF_SPA_EXCL,
+        &IDF_SPA_MOVE,
+        &IDF_SPA_FLG,
+        &IDF_PR_REDIR,
+        &IDF_PR_FLG,
         &DUMP_TICKS,
+        &DUMP_LAST_N,
+        &DUMP_LAST_MS,
     ] {
         counter.store(0, Ordering::Relaxed);
     }

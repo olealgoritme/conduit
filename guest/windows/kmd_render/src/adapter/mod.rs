@@ -22,6 +22,7 @@ use crate::virtio::VirtioGpu;
 use helios_kmd_logic::DisplayMode;
 
 mod backing;
+pub(crate) mod foreign_scanout;
 pub(crate) mod kobj;
 mod locks;
 pub(crate) use locks::ControlSpaceWaiter;
@@ -156,6 +157,16 @@ pub(crate) struct AdapterKnobs {
     /// steady-state path never waits or maps a frame, and the per-pair
     /// `probe_done` state statically prevents repeated readbacks.
     pub present_probe: bool,
+    /// `ForeignCopy` (default 0 = OFF; set 1 to test). The KMD copy of a foreign (NVK-on-RM)
+    /// resource into the LINEAR scan-out image: the explicit-modifier dma-buf
+    /// import (`virtio::venus::foreign_copy`) and, with it, the
+    /// `VK_EXT_image_drm_format_modifier` device-extension tier of the
+    /// `CreateDevice` ladder (only on a host that serves `IMPORT_RM`, and only
+    /// at device creation, i.e. the next StartDevice). 0 is the bisect lever: the
+    /// device is the export-only one it was before the feature, and a foreign
+    /// source takes the ordinary OPTIMAL import (which the host refuses for these
+    /// resources). `FcOff` counts foreign sources seen while it is 0.
+    pub foreign_copy: bool,
     /// `DisplayHalf` (default 1 = ON — the render+display miniport IS the
     /// product; the hardware-accelerated desktop shipped on it). When nonzero,
     /// StartDevice advertises ONE video-present source + ONE child
@@ -172,6 +183,10 @@ pub(crate) struct AdapterKnobs {
     /// Nonzero restores the legacy bring-up advertisement, in BOTH the adapter
     /// cap and the aperture segment flags, which is the point of reading it once.
     pub direct_flip: bool,
+    /// `FlipCapsX` (default 0), raw: the bits OR'd into the reported `DXGK_FLIPCAPS`. Never
+    /// used unfiltered; [`Self::flip_caps`] applies the accepted-bit mask. Read here, once per
+    /// StartDevice, so the caps query reports what the `FlipCapsXEff`/`FlipCapsRep` mirrors say.
+    pub flip_caps_x: u32,
     /// `CrossAdaptCaps` (default 0). Nonzero advertises
     /// `DXGK_VIDMMCAPS.CrossAdapterResource` (tier-1 cross-adapter copy support).
     /// The compile-time `DECLARE_CROSS_ADAPTER_RESOURCE` this used to be OR'd
@@ -230,8 +245,10 @@ impl AdapterKnobs {
         bind_flush_immediate: false,
         dispatch_bind: true,
         present_probe: false,
+        foreign_copy: false,
         display_half: true,
         direct_flip: false,
+        flip_caps_x: 0,
         cross_adapter: false,
         bar_seg_flags: 0x1C,
         bar_seg_base_mb: 0,
@@ -260,14 +277,21 @@ impl AdapterKnobs {
             bind_flush_immediate: read_config_dword(knobs::BIND_FLUSH_MODE, 0) == 1,
             dispatch_bind: read_config_dword(knobs::DISPATCH_BIND, 1) != 0,
             present_probe: read_config_dword(knobs::PRESENT_PROBE, 0) != 0,
+            foreign_copy: read_config_dword(knobs::FOREIGN_COPY, 0) != 0,
             display_half: read_config_dword(knobs::DISPLAY_HALF, 1) != 0,
             direct_flip: read_config_dword(knobs::DIRECT_FLIP_CAPS, 0) != 0,
+            flip_caps_x: read_config_dword(knobs::FLIP_CAPS_EXTRA, 0),
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
             bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
             bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),
             bar_seg_mode: read_config_dword(knobs::BAR_SEG_MODE, 10),
             vidmm_vram_mb: read_config_dword(knobs::VIDMM_VRAM_MB, VIDMM_VRAM_MB_AUTO),
         }
+    }
+
+    /// The `DXGK_DRIVERCAPS.FlipCaps` word this snapshot reports, and what of `FlipCapsX` it kept.
+    pub fn flip_caps(&self) -> helios_kmd_logic::flip_flags::FlipCaps {
+        helios_kmd_logic::flip_flags::resolve_flip_caps(self.flip_caps_x)
     }
 
     /// [`Self::read`] plus the fixed-name breadcrumbs that mirror the knobs.
@@ -281,10 +305,16 @@ impl AdapterKnobs {
         crate::diag::record_named_bytes(b"BndFM", knobs.bind_flush_immediate as u32);
         crate::diag::record_named_bytes(b"DspBnd", knobs.dispatch_bind as u32);
         crate::diag::record_named_bytes(b"PBPrEn", knobs.present_probe as u32);
+        crate::diag::record_named_bytes(b"FcKnob", knobs.foreign_copy as u32);
         crate::diag::record_named_bytes(b"DspH", knobs.display_half as u32);
         crate::diag::record_named_bytes(b"BarF", knobs.bar_seg_flags);
         crate::diag::record_named_bytes(b"BarB", knobs.bar_seg_base_mb);
         crate::diag::record_named_bytes(b"BarM", knobs.bar_seg_mode);
+        // The flip caps this start will report, 0 included (docs 13.8 rule 1).
+        let flip = knobs.flip_caps();
+        crate::diag::record_named_bytes(b"FlipCapsXEff", flip.effective);
+        crate::diag::record_named_bytes(b"FlipCapsXMsk", flip.dropped);
+        crate::diag::record_named_bytes(b"FlipCapsRep", flip.reported);
         // VidVram is recorded after StartDevice resolves the absent-value
         // sentinel from the virtio host-visible capability.
         crate::diag::record_named_bytes(b"VidVBad", 0);
@@ -470,6 +500,20 @@ pub(crate) struct TransportGeneration {
     /// The persistent venus 3D context id (`VIRTIO_GPU_CAPSET_VENUS`) the venus
     /// client rides, created in StartDevice and destroyed in StopDevice. `0` = none.
     pub venus_ctx_id: u32,
+    /// Identity of this generation: minted by [`mint_transport_serial`] for each
+    /// StartDevice, never 0, never reused. Every `AllocationContext` is stamped
+    /// with it at creation, because resource ids RESTART AT 1 in each generation
+    /// and an id from an older one can name a different live blob in this one.
+    pub serial: u64,
+}
+
+/// The last transport-generation serial handed out (0 = none yet).
+static TRANSPORT_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh transport-generation serial: nonzero and unique for the life of the
+/// driver. Call once per StartDevice, for the [`TransportGeneration`] it builds.
+pub(crate) fn mint_transport_serial() -> u64 {
+    TRANSPORT_SERIAL.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 pub struct AdapterContext {
@@ -515,12 +559,21 @@ pub struct AdapterContext {
     wddm_notify_lock: UnsafeCell<KSPIN_LOCK>,
     /// Mapped kernel VA of the virtio ISR-status register (read-to-clear), or 0
     /// until StartDevice wires it. `DxgkDdiInterruptRoutine` reads this at DIRQL to
-    /// acknowledge the level-triggered INTx line (the device is `MSISupported=0`);
+    /// acknowledge the level-triggered INTx line when PnP gave the device INTx (see `msi_state`);
     /// without it the line stays asserted → interrupt storm → Windows disables the
     /// adapter (Code 43). Set once in StartDevice, read lock-free in the ISR — an
     /// atomic (not behind `virtio_lock`) because the ISR runs at DIRQL and cannot
     /// take the spinlock.
     pub isr_status: AtomicUsize,
+    /// Message-mode state for the DIRQL ISR (`helios_kmd_logic::msi::isr_state`):
+    /// 0 = the device is on the INTx line and `isr_status` is the ISR's ack
+    /// register; nonzero = the device's MSI-X vectors were programmed, so the ISR
+    /// routes by message number and never reads the ISR-status register (there is
+    /// no shared line to acknowledge). Published by StartDevice with `Release`
+    /// BEFORE the transport goes live, cleared first thing in StopDevice, read
+    /// lock-free with `Acquire` in the ISR. An atomic for the same reason as
+    /// `isr_status`: DIRQL cannot take `virtio_lock`.
+    pub msi_state: AtomicU32,
     /// Serializes ALL access to `virtio` (the control virtqueue + the shared
     /// scratch page). Held by escape submissions at PASSIVE_LEVEL and, from M3.4,
     /// by the used-ring DPC at DISPATCH_LEVEL — a spinlock (not a mutex) is
@@ -608,6 +661,11 @@ pub struct AdapterContext {
     /// The pointer is deleted exactly once from `Drop` at final RemoveDevice,
     /// after `stop_vsync` has cancelled it.
     pub vsync_ex_timer: AtomicUsize,
+    /// The independent heartbeat watchdog's `PEX_TIMER` (0 = allocation failed or not yet
+    /// allocated) and whether it is meant to run (set by `start_vsync`, cleared by `stop_vsync`).
+    /// Deleted with `vsync_ex_timer` at RemoveDevice.
+    pub vsync_wd_timer: AtomicUsize,
+    pub vsync_wd_on: AtomicU32,
     /// Interrupt-time deadline (100 ns units) of the one-shot tick currently
     /// armed. Advancing this fixed phase avoids both the old 16 ms/62.5 Hz mode
     /// mismatch and cumulative DPC-latency drift.
@@ -625,6 +683,21 @@ pub struct AdapterContext {
     committed_refresh_mhz: AtomicU32,
     /// Count of CRTC_VSYNC interrupts synthesized this boot (diag `ScVs`).
     pub vsync_count: AtomicU32,
+    /// Interrupt time (100 ns units) of the tick that last advanced
+    /// `vsync_count`; 0 before the first. Published as milliseconds beside every
+    /// mirror of the count (`ScVsT`, `VpVsT`, `VsCntT`), because a count with no
+    /// time cannot be turned into a rate. See `kmd_logic::vsync_rate`.
+    pub vsync_last_100ns: AtomicU64,
+    /// Interrupt time of the previous timer tick, for the gap statistics; 0 =
+    /// none yet, which is how the first tick after an arm is ignored (arm and
+    /// disarm both store 0).
+    pub vsync_gap_prev_100ns: AtomicU64,
+    /// Smallest gap between two consecutive ticks seen this boot (100 ns
+    /// units); `u64::MAX` = none measured (diag `VsMinGap`).
+    pub vsync_min_gap_100ns: AtomicU64,
+    /// Ticks that came closer than half a period to the previous one this boot
+    /// (diag `VsFast`). 0 on a healthy heartbeat.
+    pub vsync_fast: AtomicU32,
     /// Physical address of the last primary actually programmed for display,
     /// reported in each CRTC_VSYNC packet so dxgkrnl can retire the matching
     /// queued flip (viogpu3d `m_sourceAddress`). Direct scanout publishes only
@@ -1020,6 +1093,29 @@ impl ProgrammedPrimary {
     pub(crate) fn after_scanout_bind(address: u64) -> Self {
         Self { address }
     }
+
+    /// Complete a flip of a FOREIGN or HOLLOW primary the KMD could not show: publish its address
+    /// WITHOUT claiming the screen shows its content. The screen keeps the previous picture.
+    ///
+    /// WHY THIS IS LEGAL. `last_primary_address` is not a claim about pixels, it is the word
+    /// `DXGK_INTERRUPT_CRTC_VSYNC` carries so dxgkrnl can retire the queued flip whose new
+    /// `PhysicalAddress` it matches (the driver's model, `viogpu3d`'s `m_sourceAddress`; whether
+    /// dxgkrnl is strictly address-driven has never been observed, see
+    /// `docs/zero-copy-present.md`, "Flip completion invariant for foreign primaries"). The KMD
+    /// OWNS flip completion toward dxgkrnl; whether the picture was displayed is a separate
+    /// question with its own counters (`ScCpyErr`, `FkKeep`, `FfRef*`). Leaving the address on the
+    /// previous primary instead does not keep the screen honest, it holds the flip until dxgkrnl
+    /// stops issuing source addresses and the compositor blocks after a couple of presents.
+    ///
+    /// ONLY for a foreign or hollow allocation (`flip_completion::classify`): a Venus allocation
+    /// that fails to program keeps the old address exactly as before
+    /// (`helios_kmd_logic::flip_completion::decide` never answers `Kept` for one), and every call
+    /// site goes through that decision. Named differently from
+    /// [`Self::after_scanout_bind`] on purpose, so the two cannot be confused and a grep for
+    /// `kept_picture` finds every place a flip is completed without a bind.
+    pub(crate) fn kept_picture(address: u64) -> Self {
+        Self { address }
+    }
 }
 
 impl Drop for ProgrammingInterval<'_> {
@@ -1130,6 +1226,7 @@ impl AdapterContext {
             last_completed_fence: AtomicU32::new(0),
             wddm_notify_lock: UnsafeCell::new(0),
             isr_status: AtomicUsize::new(0),
+            msi_state: AtomicU32::new(0),
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
             // SAFETY: inert placeholder, initialized in place before publication.
@@ -1153,10 +1250,16 @@ impl AdapterContext {
             vsync_timer: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             vsync_dpc: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             vsync_ex_timer: AtomicUsize::new(0),
+            vsync_wd_timer: AtomicUsize::new(0),
+            vsync_wd_on: AtomicU32::new(0),
             vsync_deadline_100ns: AtomicU64::new(0),
             vsync_enabled: AtomicU32::new(0),
             committed_refresh_mhz: AtomicU32::new(0),
             vsync_count: AtomicU32::new(0),
+            vsync_last_100ns: AtomicU64::new(0),
+            vsync_gap_prev_100ns: AtomicU64::new(0),
+            vsync_min_gap_100ns: AtomicU64::new(u64::MAX),
+            vsync_fast: AtomicU32::new(0),
             last_primary_address: AtomicU64::new(0),
             active_scanout_resource: AtomicU32::new(0),
             active_scanout_wh: AtomicU64::new(0),
@@ -1261,9 +1364,11 @@ impl AdapterContext {
     ///    and the desktop copied into an unrelated blob, while the copy is
     ///    submitted against a Venus image from a destroyed context.
     ///
-    /// Note `pnputil /restart-device` does NOT reproduce either sequence: it
-    /// re-runs AddDevice, which allocates a fresh zeroed context. The carry-over
-    /// path is a PnP stop/start on the same context.
+    /// Whether `pnputil /restart-device` re-runs AddDevice (a fresh zeroed
+    /// context) or keeps the context is NOT settled by the code
+    /// (docs/zero-copy-present.md sections 19 and 20 assume it is kept; `StartN`
+    /// rising with `EntArm` / `EntHpdTh` showing the old generation settles it).
+    /// Process-lifetime statics survive either way.
     ///
     /// This is a hand-written list and its failure mode is a future field nobody
     /// adds to it. The durable encoding is the transport-owned
@@ -1281,6 +1386,9 @@ impl AdapterContext {
         let was_programming = gate_active(self.vidpn_programming.load(Ordering::Acquire)) as u32;
         let was_resource = self.active_scanout_resource.load(Ordering::Acquire);
 
+        // A foreign scanout source names RM handles of the generation being
+        // abandoned; the display state below is rebuilt, so no restore is owed.
+        self.foreign_scanout_reset();
         self.vidpn_programming.store(0, Ordering::Release);
         self.pending_vidpn_allocation.store(0, Ordering::Release);
         for slot in &self.frame_watermark_resource {
@@ -1294,7 +1402,22 @@ impl AdapterContext {
         self.active_scanout_resource.store(0, Ordering::Release);
         self.active_scanout_wh.store(0, Ordering::Release);
         self.host_bound_scanout_resource.store(0, Ordering::Release);
-        self.last_primary_address.store(0, Ordering::Release);
+        // NOT zero (docs/zero-copy-present.md, "DWM after a device restart"). dxgkrnl keeps its
+        // flip queue across a PnP stop/start and retires a flip only when a CRTC_VSYNC carries ITS
+        // address; the flip it issued last may be the one it still waits for. Zeroing this word
+        // left the restarted heartbeat reporting 0, so that flip never retired and, with a queue
+        // depth of 1, no later flip was ever issued. The seed is the newest address dxgkrnl
+        // issued (`restart_flip::seed_address`; an address names a segment location, not a
+        // transport object, so it survives the restart). The displayed IDENTITY below is cleared
+        // all the same: `same_active_identity` requires `already_bound`, which is false now.
+        // Stored again at the END of this function: the lease teardown below can publish a
+        // withheld address of the old generation over it.
+        self.last_primary_address.store(
+            helios_kmd_logic::restart_flip::seed_address(
+                crate::ddi::stall_diag::last_issued_address(),
+            ),
+            Ordering::Release,
+        );
         self.dedicated_scanout_resource.store(0, Ordering::Release);
         self.dedicated_scanout_image.store(0, Ordering::Release);
         self.dedicated_scanout_memory.store(0, Ordering::Release);
@@ -1353,8 +1476,26 @@ impl AdapterContext {
         // the reclaim rules make inert by construction.
         self.read_ledger.reset();
 
+        // The seed again, last: ending the leases above publishes a withheld old-generation
+        // address (`publish_displayed_primary`) that must not displace what dxgkrnl waits for.
+        self.last_primary_address.store(
+            helios_kmd_logic::restart_flip::seed_address(
+                crate::ddi::stall_diag::last_issued_address(),
+            ),
+            Ordering::Release,
+        );
+
         crate::diag::record_named_bytes(b"StRst", was_programming);
         crate::diag::record_named_bytes(b"StRstR", was_resource);
+    }
+
+    /// `restart_flip::pending_flags` of this adapter now: bit 0 a worker programming handle is
+    /// pending, bit 1 the programming gate is raised. Atomics only.
+    pub(crate) fn restart_programming_flags(&self) -> u32 {
+        helios_kmd_logic::restart_flip::pending_flags(
+            self.pending_vidpn_allocation.load(Ordering::Acquire) != 0,
+            gate_active(self.vidpn_programming.load(Ordering::Acquire)),
+        )
     }
 
     /// The display half's scanout-0 mode `(width, height)`: the host-reported size
@@ -1465,8 +1606,9 @@ impl AdapterContext {
         &self,
         primary_address: u64,
         ticket: ProgrammingTicket,
+        keep_on_failure: bool,
     ) -> crate::virtio::ScanoutNotify {
-        crate::virtio::ScanoutNotify::for_adapter(self, primary_address, ticket)
+        crate::virtio::ScanoutNotify::for_adapter(self, primary_address, ticket, keep_on_failure)
     }
 
     /// Publish the address the CRTC_VSYNC packet reports as the display
@@ -1482,6 +1624,9 @@ impl AdapterContext {
     pub(crate) fn publish_displayed_primary(&self, primary: ProgrammedPrimary) {
         self.last_primary_address
             .store(primary.address, Ordering::Release);
+        // `FlipPub` / `FlipPubT` (`ddi::stall_diag`): every publication, bound or kept, any
+        // class. Atomics only, as this is reached from DIRQL and DISPATCH too.
+        crate::ddi::stall_diag::note_published(primary.address);
     }
 
     /// The state StartDevice established, or `None` before it ran.
@@ -1641,6 +1786,30 @@ impl AdapterContext {
         unsafe { *state.transport.get() = generation };
     }
 
+    /// The serial of the transport generation that is up now, or `None` between
+    /// StopDevice and the next StartDevice. DISPATCH-safe (reads published state).
+    pub(crate) fn current_transport_serial(&self) -> Option<u64> {
+        self.transport_generation().map(|t| t.serial)
+    }
+
+    /// Whether an object stamped with `serial` at creation belongs to the
+    /// transport generation that is up now (see [`TransportGeneration::serial`]).
+    pub(crate) fn is_current_generation(&self, serial: u64) -> bool {
+        helios_kmd_logic::paging::alloc_is_current(serial, self.current_transport_serial())
+    }
+
+    /// Forget every system-backing range and "system copy invalid" mark: both are
+    /// keyed by resource ids of a transport generation that is ending (StopDevice)
+    /// or already ended (a start with no stop before it), and ids restart at 1.
+    /// PASSIVE (the leases unlock pages as they drop).
+    #[inline(never)]
+    pub(crate) fn reset_system_backings(&self, passive: crate::irql::PassiveLevel) {
+        match self.system_backings.serialize(passive) {
+            Some(guard) => guard.reset_generation(),
+            None => crate::diag::record_named_bytes(b"PgRstF", 1),
+        }
+    }
+
     /// The venus 3D context id for this transport generation, or 0.
     pub fn venus_ctx_id(&self) -> u32 {
         self.transport_generation().map_or(0, |t| t.venus_ctx_id)
@@ -1709,7 +1878,20 @@ impl Drop for AdapterContext {
         self.delete_vsync_ex_timer();
         self.stop_hpd();
         // The transport owns callbacks into producer status. Drop it before
-        // that page, including the RemoveDevice-without-StopDevice path.
+        // that page, including the RemoveDevice-without-StopDevice path. A
+        // transport still alive here is asked to close every RM handle first (the
+        // device reset in its Drop does not make the host drop them; a pinned page
+        // must not be unlocked while the host holds it). No views to mark: the
+        // table dies with this context.
+        // SAFETY: RemoveDevice, which drops the boxed context, is PASSIVE_LEVEL.
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        crate::virtio::nvrm::close_all_on_host(
+            passive,
+            self,
+            &helios_kmd_logic::sweep_budget::SweepBudget::live(
+                crate::adapter::foreign_scanout::now_100ns(),
+            ),
+        );
         self.set_virtio(None);
         // Free the contiguous paging-RAM segment. RemoveDevice (which drops the
         // boxed AdapterContext) runs at PASSIVE_LEVEL, where MmFreeContiguousMemory

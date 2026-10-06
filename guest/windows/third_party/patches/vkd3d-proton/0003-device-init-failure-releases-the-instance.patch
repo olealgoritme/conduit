@@ -1,0 +1,35 @@
+Helios vkd3d-proton fork: a failed d3d12_device_init releases the instance
+
+d3d12_device_init() takes a reference on the vkd3d instance first, but the
+error label that drops it sat above the lock and mutex labels, so every
+failure from vkd3d_create_vk_device() on (no physical device, vkCreateDevice
+failing) jumped past the decref, and the mutex-init failure destroyed locks
+that were never initialized. The leaked reference kept the process-wide
+instance singleton alive: the next vkd3d_create_device() in the process was
+handed the old VkInstance and ignored its own instance create info.
+
+In the Helios D3D12 UMD that made the Venus fallback after a failed NVK
+device run on the NVK instance again ("No physical device available" twice,
+D3D12CreateDevice 0x887a0004). The instance reference is now released last,
+after the locks and the mutex, on every failure path.
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -11918,14 +11918,14 @@
+     d3d12_device_destroy_vkd3d_queues(device);
+     vk_procs = &device->vk_procs;
+     VK_CALL(vkDestroyDevice(device->vk_device, NULL));
+-out_free_instance:
+-    vkd3d_instance_decref(device->vkd3d_instance);
+ out_free_fragment_output_lock:
+     rwlock_destroy(&device->fragment_output_lock);
+ out_free_vertex_input_lock:
+     rwlock_destroy(&device->vertex_input_lock);
+ out_free_mutex:
+     pthread_mutex_destroy(&device->mutex);
++out_free_instance:
++    vkd3d_instance_decref(device->vkd3d_instance);
+     return hr;
+ }
+

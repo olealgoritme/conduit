@@ -439,12 +439,24 @@ Write-HeliosJson $vulkanX86Json $vulkanManifestX86Path -Encoding ASCII
 Ensure-HeliosRegistryKey $vulkanRegistryX86
 New-ItemProperty -LiteralPath $vulkanRegistryX86 -Name $vulkanManifestX86Path -Value 0 -PropertyType DWord -Force | Out-Null
 
-New-ItemProperty -LiteralPath $classKey -Name "OpenGLDriverName" -Value $wglPath -PropertyType String -Force | Out-Null
-New-ItemProperty -LiteralPath $classKey -Name "OpenGLVersion" -Value 2 -PropertyType DWord -Force | Out-Null
-New-ItemProperty -LiteralPath $classKey -Name "OpenGLFlags" -Value 1 -PropertyType DWord -Force | Out-Null
-New-ItemProperty -LiteralPath $classKey -Name "OpenGLDriverNameWow" -Value $wglX86Path -PropertyType String -Force | Out-Null
-New-ItemProperty -LiteralPath $classKey -Name "OpenGLVersionWow" -Value 2 -PropertyType DWord -Force | Out-Null
-New-ItemProperty -LiteralPath $classKey -Name "OpenGLFlagsWow" -Value 1 -PropertyType DWord -Force | Out-Null
+# OpenGL and NVK's Vulkan registration come from the driver package itself:
+# its INF writes OpenGLDriverName(Wow) (Zink on NVK, helios_gl64/32.dll) and
+# VulkanDriverName(Wow) (helios_nvk64/32.json) into this software key, next
+# to the UMDs in the driver store. The Venus Zink in the runtime ($wglPath,
+# $wglX86Path) is no longer registered: with HKLM\SOFTWARE\Helios!Icd=venus
+# (or a denied executable) Zink on NVK falls back to the Vulkan loader, which
+# hands it the Venus ICD registered above. The Venus ICD stays registered:
+# the UMDs' DXVK on Venus (DWM and every denied process) reaches it through
+# the loader.
+if ([string](Get-Item -LiteralPath $classKey).GetValue("OpenGLDriverName", "") -notmatch "helios_gl64\.dll") {
+    Write-Warning "The driver package did not register Zink on NVK as the OpenGL ICD; registering the Venus Zink."
+    New-ItemProperty -LiteralPath $classKey -Name "OpenGLDriverName" -Value $wglPath -PropertyType String -Force | Out-Null
+    New-ItemProperty -LiteralPath $classKey -Name "OpenGLVersion" -Value 2 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -LiteralPath $classKey -Name "OpenGLFlags" -Value 1 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -LiteralPath $classKey -Name "OpenGLDriverNameWow" -Value $wglX86Path -PropertyType String -Force | Out-Null
+    New-ItemProperty -LiteralPath $classKey -Name "OpenGLVersionWow" -Value 2 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -LiteralPath $classKey -Name "OpenGLFlagsWow" -Value 1 -PropertyType DWord -Force | Out-Null
+}
 
 Ensure-HeliosRegistryKey $openClRegistry
 New-ItemProperty -LiteralPath $openClRegistry -Name $clvkPath -Value 0 -PropertyType DWord -Force | Out-Null

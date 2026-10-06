@@ -21,6 +21,53 @@ pub(crate) static REFUSED: AtomicU32 = AtomicU32::new(0);
 pub(crate) static PUBLISHED: AtomicU32 = AtomicU32::new(0);
 pub(crate) static RETIRED: AtomicU32 = AtomicU32::new(0);
 
+// Table occupancy, mirrored from `Table::stats` under the producer lock after every
+// mutation (relaxed stores; the registry mirror reads them at PASSIVE). `PrdPend` is the
+// number of allocation epochs in flight now and must track the frames in flight, not
+// grow: a value that only rises is a completion that never arrives. See
+// `docs/producer-completion.md`.
+static PRD_PENDING: AtomicU32 = AtomicU32::new(0);
+static PRD_PENDING_HIGH: AtomicU32 = AtomicU32::new(0);
+static PRD_WRITERS: AtomicU32 = AtomicU32::new(0);
+static PRD_WRITERS_HIGH: AtomicU32 = AtomicU32::new(0);
+static PRD_MARKS: AtomicU32 = AtomicU32::new(0);
+static PRD_FULL_PENDING: AtomicU32 = AtomicU32::new(0);
+static PRD_FULL_WRITERS: AtomicU32 = AtomicU32::new(0);
+static PRD_MARKS_FULL: AtomicU32 = AtomicU32::new(0);
+static PRD_SKIPPED: AtomicU32 = AtomicU32::new(0);
+static PRD_EARLY: AtomicU32 = AtomicU32::new(0);
+
+/// Mirror the table occupancy counters into the registry. PASSIVE only. The
+/// refusals (`PrdFull`: no pending slot, `PrdWrFull`: no writer slot) are the
+/// two ways a publication returns STATUS_INSUFFICIENT_RESOURCES from the table.
+pub(crate) fn publish_counters() {
+    use crate::diag::record_named_bytes as rec;
+    rec(b"PrdPend", PRD_PENDING.load(Ordering::Relaxed));
+    rec(b"PrdHi", PRD_PENDING_HIGH.load(Ordering::Relaxed));
+    rec(b"PrdWr", PRD_WRITERS.load(Ordering::Relaxed));
+    rec(b"PrdWrHi", PRD_WRITERS_HIGH.load(Ordering::Relaxed));
+    rec(b"PrdMarks", PRD_MARKS.load(Ordering::Relaxed));
+    rec(b"PrdFull", PRD_FULL_PENDING.load(Ordering::Relaxed));
+    rec(b"PrdWrFull", PRD_FULL_WRITERS.load(Ordering::Relaxed));
+    rec(b"PrdMarkFull", PRD_MARKS_FULL.load(Ordering::Relaxed));
+    rec(b"PrdSkip", PRD_SKIPPED.load(Ordering::Relaxed));
+    rec(b"PrdEarly", PRD_EARLY.load(Ordering::Relaxed));
+}
+
+fn mirror_stats(s: &State) {
+    let st = s.table.stats();
+    PRD_PENDING.store(st.pending, Ordering::Relaxed);
+    PRD_PENDING_HIGH.store(st.pending_high, Ordering::Relaxed);
+    PRD_WRITERS.store(st.writers, Ordering::Relaxed);
+    PRD_WRITERS_HIGH.store(st.writers_high, Ordering::Relaxed);
+    PRD_MARKS.store(st.marks, Ordering::Relaxed);
+    PRD_FULL_PENDING.store(st.refused_pending, Ordering::Relaxed);
+    PRD_FULL_WRITERS.store(st.refused_writers, Ordering::Relaxed);
+    PRD_MARKS_FULL.store(st.marks_full, Ordering::Relaxed);
+    PRD_SKIPPED.store(st.skipped, Ordering::Relaxed);
+    PRD_EARLY.store(st.early, Ordering::Relaxed);
+}
+
 /// WDDM 2.x requires Acquire/ReleaseHandleData for BOTH private-data views.
 /// Legacy GetHandleData is rejected by dxgkrnl's WDDM2 validation and calling
 /// it with an acquired reference outstanding bugchecks 0x113/0x26 (.263 dump).
@@ -87,7 +134,13 @@ fn slots<T: Clone>(count: usize, empty: T) -> Result<Vec<T>, Error> {
 impl State {
     fn new() -> Result<Self, Error> {
         Ok(Self {
-            table: Table::new(HELIOS_PRODUCER_SLOTS, 8192, 16384)?,
+            // One watermark mark per registrable present stream.
+            table: Table::with_marks(
+                HELIOS_PRODUCER_SLOTS,
+                8192,
+                16384,
+                helios_kmd_logic::present_stream::MAX_STREAMS,
+            )?,
             opens: Opens::new(OPENS)?,
             bindings: slots(BINDINGS, None)?,
             waits: Waiters::new(WAITS)?,
@@ -189,6 +242,7 @@ impl ProducerCompletion {
     }
 
     fn sync(&self, s: &mut State) {
+        mirror_stats(s);
         let Some(page) = self.page() else {
             return;
         };

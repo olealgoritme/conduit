@@ -1,0 +1,73 @@
+Helios DXVK fork: flush-gate points that shared allocations publish
+
+Conduit guest/windows/docs/shared-surfaces.md section 4 and
+docs/flush-gate.md section 9. Applied after 0005 by
+ci/windows/Build-Driver.ps1.
+
+The HEFL flush gate withholds the releaser's WDDM fence, but nothing orders
+the acquirer behind it: dxgkrnl's keyed mutex holds only the acquirer's DMA
+buffers, and a D3D11 device on Venus reads through the Venus ring. The
+existing consumer wait does order it (an imported image's read waits for its
+allocation producer's announced epoch, heliosPresentWaitBeforeRefresh), as
+long as the releaser publishes an epoch at the hand-off.
+
+- D3D11ImmediateContext::HeliosSignalFlushPointTracked: the flush point's
+  signal, with one HeliosProducerOperation retained per allocation the UMD
+  then publishes the point on, so a waiter is failed rather than hung if the
+  signal is never submitted.
+
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 26744591..22556a5c 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -1243,6 +1243,26 @@ namespace dxvk {
+   }
+ 
+ 
++  uint64_t D3D11ImmediateContext::HeliosSignalFlushPointTracked(
++    const Rc<DxvkFence>&        Fence,
++          uint64_t              Value,
++          std::vector<Rc<HeliosProducerOperation>> Operations) {
++    D3D10DeviceLock lock = LockContext();
++
++    EmitCs([
++      cFence = Fence,
++      cValue = Value,
++      cOperations = std::move(Operations)
++    ] (DxvkContext* ctx) {
++      for (const auto& operation : cOperations)
++        ctx->trackProducer(operation);
++      ctx->signalFence(cFence, cValue);
++    });
++    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, false);
++    return GetCurrentSequenceNumber();
++  }
++
++
+   void D3D11ImmediateContext::HeliosSignalPresentFence(
+     const Rc<DxvkFence>&        Fence,
+           uint64_t              Value,
+diff --git a/src/d3d11/d3d11_context_imm.h b/src/d3d11/d3d11_context_imm.h
+index 26a1deed..b8371502 100644
+--- a/src/d3d11/d3d11_context_imm.h
++++ b/src/d3d11/d3d11_context_imm.h
+@@ -191,6 +191,19 @@ namespace dxvk {
+       const Rc<DxvkFence>&        Fence,
+             uint64_t              Value);
+ 
++    /**
++     * \brief Helios flush gate: a stream point that producers publish
++     *
++     * As \ref HeliosSignalFlushPoint, and the command list that carries the
++     * signal also retains `Operations` (one per shared allocation the caller
++     * then publishes the point on), so a consumer waiting on such an epoch is
++     * woken as a failure if the signal never reaches the GPU.
++     */
++    uint64_t HeliosSignalFlushPointTracked(
++      const Rc<DxvkFence>&        Fence,
++            uint64_t              Value,
++            std::vector<Rc<HeliosProducerOperation>> Operations);
++
+     /**
+      * \brief Helios: image-level copy for the dcomp present vehicle
+      *

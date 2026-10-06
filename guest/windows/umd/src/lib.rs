@@ -32,7 +32,9 @@ mod adapter;
 mod bridge;
 pub(crate) mod caps;
 mod ddi;
+mod ddi_level;
 mod device_funcs;
+mod device_loss;
 mod forward;
 mod knobs;
 

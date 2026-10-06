@@ -117,6 +117,34 @@ helios_lock_system_buffer_seh(
     return mdl;
 }
 
+/*
+ * Lock a range of the CALLING process's user memory for the lifetime of the lock,
+ * for HELIOS_ESCAPE_NVRM PIN. MmProbeAndLockPages RAISES on an invalid or
+ * non-writable range, and the range comes from user mode, so the raise is
+ * converted to a NULL return. Must run at PASSIVE_LEVEL in the owning process.
+ * Release with helios_unlock_system_buffer (MmUnlockPages + IoFreeMdl), which may
+ * run in any process context. UserMode=1, IoWriteAccess=1 are stable WDK ABI values.
+ */
+PMDL
+helios_lock_user_pages_seh(PVOID VirtualAddress, ULONG Length)
+{
+    PMDL mdl;
+
+    if (!VirtualAddress || !Length)
+        return (PMDL)0;
+    mdl = IoAllocateMdl(VirtualAddress, Length,
+                        /*SecondaryBuffer*/ 0, /*ChargeQuota*/ 0, (PVOID)0);
+    if (!mdl)
+        return (PMDL)0;
+    __try {
+        MmProbeAndLockPages(mdl, /*UserMode*/ 1, /*IoWriteAccess*/ 1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        IoFreeMdl(mdl);
+        return (PMDL)0;
+    }
+    return mdl;
+}
+
 void
 helios_unlock_system_buffer(PMDL Mdl)
 {
@@ -125,4 +153,40 @@ helios_unlock_system_buffer(PMDL Mdl)
     /* MmUnlockPages also releases a system mapping owned by this MDL. */
     MmUnlockPages(Mdl);
     IoFreeMdl(Mdl);
+}
+
+/*
+ * Process reference for a pin (HELIOS_ESCAPE_NVRM PIN), header-free like the
+ * rest of this file: IoGetCurrentProcess / ObfReferenceObject /
+ * ObfDereferenceObject are the exports behind the PsGetCurrentProcess /
+ * ObReferenceObject / ObDereferenceObject macros (FASTCALL is the only x64
+ * convention, so the prototypes need no decoration).
+ *
+ * helios_reference_current_process takes one reference on the CALLING process's
+ * EPROCESS and returns it. It is paired with exactly one
+ * helios_dereference_process, which NvrmPin's Drop makes AFTER the pages are
+ * unlocked, at PASSIVE_LEVEL, in any process context. A pin that is leaked on
+ * purpose (the host may still alias its pages) never reaches the dereference,
+ * so the process object stays alive. Whether that defers the kernel's
+ * locked-pages check at process teardown is NOT verified (see NvrmPin).
+ */
+long long ObfReferenceObject(PVOID Object);
+long long ObfDereferenceObject(PVOID Object);
+PVOID IoGetCurrentProcess(void);
+
+PVOID
+helios_reference_current_process(void)
+{
+    PVOID process = IoGetCurrentProcess();
+
+    if (process)
+        ObfReferenceObject(process);
+    return process;
+}
+
+void
+helios_dereference_process(PVOID Process)
+{
+    if (Process)
+        ObfDereferenceObject(Process);
 }

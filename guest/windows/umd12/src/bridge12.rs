@@ -137,8 +137,48 @@ mod ffi {
             maximum_feature_level: &mut u32,
             shader_model: &mut u32,
             raytracing_tier: &mut u32,
+            rovs: &mut u32,
+            conservative_tier: &mut u32,
             device_uuid: &mut [u8],
         ) -> bool;
+
+        /// S5: the ICD under the engine, 1 = Venus, 2 = NVK on RM.
+        fn icd_backend(self: &HeliosVkd3dDevice) -> u32;
+
+        /// S5, NVK only: the KMD resource id NVK mints for a 2D texture's
+        /// dedicated memory, its holder context, layout and memory.
+        ///
+        /// # Safety
+        /// `resource` is a borrowed live `ID3D12Resource*` of this engine; every
+        /// out-pointer addresses writable storage and is written on every path.
+        unsafe fn resource_foreign_identity(
+            self: &HeliosVkd3dDevice,
+            resource: usize,
+            out_res_id: *mut u32,
+            out_ctx_id: *mut u32,
+            out_size: *mut u64,
+            out_modifier: *mut u64,
+            out_stride: *mut u32,
+            out_offset: *mut u32,
+            out_fourcc: *mut u32,
+            out_vk_memory: *mut u64,
+            out_memory_type_index: *mut u32,
+        ) -> bool;
+
+        /// S5, NVK only: show `resource` on scanout 0. 0 = shown.
+        ///
+        /// # Safety
+        /// `resource` is a borrowed live `ID3D12Resource*` of this engine.
+        unsafe fn nvk_scanout_present(self: &HeliosVkd3dDevice, resource: usize) -> i32;
+
+        /// S5, NVK only: give scanout 0 back to the desktop.
+        fn nvk_scanout_release(self: &HeliosVkd3dDevice);
+
+        /// S5, NVK only: wait for the queue's execution stream to reach `value`.
+        ///
+        /// # Safety
+        /// `queue` is a borrowed live engine `ID3D12CommandQueue*`.
+        unsafe fn helios_vkd3d_bridge_wait_execution(queue: usize, value: u64, timeout_ns: u64) -> i32;
 
         /// Stateless forward to the engine's second entry point.
         ///
@@ -336,6 +376,10 @@ pub(crate) struct NativeOptionalCaps {
     pub maximum_feature_level: u32,
     pub shader_model: u32,
     pub raytracing_tier: u32,
+    /// S5: the engine's `ROVsSupported` (0 on NVK: no fragment shader interlock).
+    pub rovs: u32,
+    /// S5: the engine's conservative rasterization tier (2 on NVK).
+    pub conservative_tier: u32,
     pub device_uuid: [u8; 16],
 }
 
@@ -384,6 +428,8 @@ impl BridgeDevice12 {
                 &mut caps.maximum_feature_level,
                 &mut caps.shader_model,
                 &mut caps.raytracing_tier,
+                &mut caps.rovs,
+                &mut caps.conservative_tier,
                 &mut caps.device_uuid,
             )
             .then_some(caps)
@@ -537,6 +583,85 @@ impl BridgeDevice12 {
         };
         // SAFETY: as `resource_venus_identity`; no out-params.
         unsafe { device.transfer_resource_ownership(resource) }
+    }
+
+    /// S5: true when the engine runs on NVK on RM (`HELIOS_ICD_BACKEND_NVK_RM`).
+    pub(crate) fn is_nvk(&self) -> bool {
+        self.get().is_some_and(|d| d.icd_backend() == 2)
+    }
+
+    /// S5, NVK only: the KMD resource id and layout NVK mints for a texture's
+    /// dedicated memory, or `None` (not a dedicated 2D texture, or the KMD
+    /// cannot mint ids now).
+    ///
+    /// # Safety
+    /// `resource` is a borrowed live `ID3D12Resource*` of this engine.
+    pub(crate) unsafe fn resource_foreign_identity(&self, resource: usize) -> Option<ForeignIdentity12> {
+        let device = self.get()?;
+        let mut id = ForeignIdentity12::default();
+        // SAFETY: every out-pointer is a field of the local `id`.
+        let ok = unsafe {
+            device.resource_foreign_identity(
+                resource,
+                &mut id.resource_id,
+                &mut id.ctx_id,
+                &mut id.size,
+                &mut id.modifier,
+                &mut id.stride,
+                &mut id.offset,
+                &mut id.fourcc,
+                &mut id.vk_memory,
+                &mut id.memory_type_index,
+            )
+        };
+        (ok && id.resource_id != 0 && id.ctx_id != 0).then_some(id)
+    }
+
+    /// S5, NVK only: show `resource` on scanout 0. True if shown.
+    ///
+    /// # Safety
+    /// `resource` is a borrowed live `ID3D12Resource*` of this engine.
+    pub(crate) unsafe fn nvk_scanout_present(&self, resource: usize) -> bool {
+        // SAFETY: forwarded precondition.
+        self.get().is_some_and(|d| unsafe { d.nvk_scanout_present(resource) } == 0)
+    }
+
+    /// S5, NVK only: give scanout 0 back to the desktop.
+    pub(crate) fn nvk_scanout_release(&self) {
+        if let Some(d) = self.get() {
+            d.nvk_scanout_release();
+        }
+    }
+}
+
+/// S5: an NVK-made (foreign) resource id for one D3D12 texture, with the layout
+/// the KMD recorded at IMPORT_RM (`HeliosWddmAllocLayout`).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ForeignIdentity12 {
+    pub(crate) resource_id: u32,
+    pub(crate) ctx_id: u32,
+    pub(crate) size: u64,
+    pub(crate) modifier: u64,
+    pub(crate) stride: u32,
+    pub(crate) offset: u32,
+    pub(crate) fourcc: u32,
+    pub(crate) vk_memory: u64,
+    pub(crate) memory_type_index: u32,
+}
+
+/// S5, NVK only: wait until the engine queue's execution stream reaches `value`.
+/// `Ok(true)` reached, `Ok(false)` timed out, `Err(hr)` on device loss.
+///
+/// # Safety
+/// `queue` is a borrowed live engine `ID3D12CommandQueue*`.
+pub(crate) unsafe fn wait_execution(queue: usize, value: u64, timeout_ns: u64) -> Result<bool, i32> {
+    // SAFETY: forwarded precondition.
+    let hr = unsafe { ffi::helios_vkd3d_bridge_wait_execution(queue, value, timeout_ns) };
+    match hr {
+        0 => Ok(true),
+        1 => Ok(false),
+        hr if hr < 0 => Err(hr),
+        _ => Ok(false),
     }
 }
 
@@ -729,9 +854,17 @@ pub(crate) unsafe fn execute(
             &mut cookie,
         )
     };
+    boundary(hr, ctx, value, cookie)
+}
+
+/// The engine's execution boundary: a registered Venus producer stream point
+/// (`ctx`, `value`, `cookie` all nonzero), or on NVK on RM (S5) a point on the
+/// queue's local execution stream (`ctx` = `cookie` = 0, `value` nonzero) that
+/// the UMD orders the runtime context behind itself (`queue.rs`'s NVK sync).
+fn boundary(hr: i32, ctx: u32, value: u32, cookie: u64) -> Result<(u32, u32, u64), i32> {
     if hr < 0 {
         Err(hr)
-    } else if ctx == 0 || value == 0 || cookie == 0 {
+    } else if value == 0 || (ctx == 0) != (cookie == 0) {
         Err(helios_umd_common::hr::E_FAIL)
     } else {
         Ok((ctx, value, cookie))
@@ -829,11 +962,5 @@ pub(crate) unsafe fn copy_tiles(
 }
 
 fn tile_boundary(hr: i32, ctx: u32, value: u32, cookie: u64) -> Result<(u32, u32, u64), i32> {
-    if hr < 0 {
-        Err(hr)
-    } else if ctx == 0 || value == 0 || cookie == 0 {
-        Err(helios_umd_common::hr::E_FAIL)
-    } else {
-        Ok((ctx, value, cookie))
-    }
+    boundary(hr, ctx, value, cookie)
 }

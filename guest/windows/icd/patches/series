@@ -1,0 +1,5 @@
+# Patches ci/windows/build-mesa.sh applies to third_party/mesa, in order.
+# 0001 (signal-batch deferral) stays manual: it is an opt-in A/B.
+0002-helios-device-lost-under-live-process.patch
+0003-helios-kmdmap-shared-with-the-umd.patch
+0004-helios-lost-device-touches-no-mapping.patch

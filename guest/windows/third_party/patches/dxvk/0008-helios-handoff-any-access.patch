@@ -1,0 +1,159 @@
+Helios DXVK fork: any first access of a shared image waits for hand-offs
+
+Conduit guest/windows/docs/shared-surfaces.md section 4. Applied after 0007
+by ci/windows/Build-Driver.ps1.
+
+0007 sampled the hand-off ledger only for copy sources and sampled views. A
+reader that renders into, clears, UAV-writes or blends onto a shared image
+after acquiring it races the producer's pending writes as well. The ledger
+is now sampled where every resource access is tracked: the first tracking of
+a shared image in a submission (DxvkCommandList::track, once per image and
+access kind thanks to trackId) records the hand-off wait, whatever the
+usage, and the submission worker waits once per publishing device per image
+per submission.
+
+The ledger keeps one point per publishing device per resource
+(HeliosHandoffHooks::sampleAll, appended): with a single "last publisher"
+point, the reader's own publication could replace the releaser's before the
+reader sampled it, and the reader then waited for nothing.
+
+diff --git a/src/dxvk/dxvk_cmdlist.cpp b/src/dxvk/dxvk_cmdlist.cpp
+index 3f6961cd..3d7bfe14 100644
+--- a/src/dxvk/dxvk_cmdlist.cpp
++++ b/src/dxvk/dxvk_cmdlist.cpp
+@@ -2,6 +2,7 @@
+ #include <chrono>
+ 
+ #include "dxvk_cmdlist.h"
++#include "dxvk_image.h"
+ #include "dxvk_helios_backend.h"
+ #include "dxvk_device.h"
+ #include "dxvk_helios_feed_trace.h"
+@@ -482,6 +483,26 @@ namespace dxvk {
+   }
+ 
+   
++  void DxvkCommandList::heliosHandoffSampleImage(DxvkImage* image) {
++    if (!image->info().shared)
++      return;
++    const auto* hooks = heliosHandoffHooks();
++    if (!hooks)
++      return;
++    const uint32_t key = image->heliosHandoffKey();
++    if (!key)
++      return;
++    if (hooks->sampleAll) {
++      uint64_t points[4];
++      const uint32_t n = hooks->sampleAll(key, points, 4u);
++      for (uint32_t i = 0; i < n && i < 4u; i++)
++        waitHandoff(key, points[i]);
++    } else if (const uint64_t point = hooks->sample(key)) {
++      waitHandoff(key, point);
++    }
++  }
++
++
+   VkResult DxvkCommandList::waitProducers(const std::atomic<bool>& stopped) {
+     for (const auto& dependency : m_producerWaits) {
+       while (!stopped.load(std::memory_order_acquire)) {
+diff --git a/src/dxvk/dxvk_cmdlist.h b/src/dxvk/dxvk_cmdlist.h
+index 8051208e..69ed72b2 100644
+--- a/src/dxvk/dxvk_cmdlist.h
++++ b/src/dxvk/dxvk_cmdlist.h
+@@ -352,22 +352,45 @@ namespace dxvk {
+      */
+     template<typename T>
+     void track(Rc<T>&& object, DxvkAccess access) {
+-      if (object->trackId(m_trackingId, access))
++      if (object->trackId(m_trackingId, access)) {
++        heliosHandoffTrack(object.ptr());
+         m_objectTracker.track<DxvkResourceRef>(std::move(object), access);
++      }
+     }
+ 
+     template<typename T>
+     void track(const Rc<T>& object, DxvkAccess access) {
+-      if (object->trackId(m_trackingId, access))
++      if (object->trackId(m_trackingId, access)) {
++        heliosHandoffTrack(object.ptr());
+         m_objectTracker.track<DxvkResourceRef>(object.ptr(), access);
++      }
+     }
+ 
+     template<typename T>
+     void track(T* object, DxvkAccess access) {
+-      if (object->trackId(m_trackingId, access))
++      if (object->trackId(m_trackingId, access)) {
++        heliosHandoffTrack(object);
+         m_objectTracker.track<DxvkResourceRef>(object, access);
++      }
++    }
++
++    /**
++     * \brief Helios: the first access of a shared image in this submission
++     *
++     * Whatever the access (read, render target, clear, UAV write, blend), a
++     * shared image's first tracking in a submission samples the hand-off
++     * ledger, so the submission worker waits for another process's pending
++     * hand-off point before this list runs (write-after-write included).
++     * trackId makes this once per image and access kind per submission.
++     */
++    template<typename T>
++    void heliosHandoffTrack(T* object) {
++      if constexpr (std::is_same_v<T, DxvkImage>)
++        heliosHandoffSampleImage(object);
+     }
+ 
++    void heliosHandoffSampleImage(DxvkImage* image);
++
+     /**
+      * \brief Tracks a graphics pipeline
+      * \param [in] pipeline Pipeline
+@@ -424,8 +447,11 @@ namespace dxvk {
+      * before this list's first submission, beside the producer waits.
+      */
+     void waitHandoff(uint32_t key, uint64_t point) {
++      // Points are the UMD's packed (device, generation, point): one wait per
++      // publishing device, the later point wins.
++      constexpr uint64_t DeviceMask = ~((1ull << 40) - 1ull);
+       for (auto& known : m_handoffWaits) {
+-        if (known.first == key) {
++        if ((known.second & DeviceMask) == (point & DeviceMask)) {
+           if (point > known.second) known.second = point;
+           return;
+         }
+diff --git a/src/dxvk/dxvk_context.cpp b/src/dxvk/dxvk_context.cpp
+index 3b674fda..49553a9b 100644
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ -9827,14 +9827,7 @@ namespace dxvk {
+     // Cross-process hand-off: another process's last published point for
+     // this shared image (keyed mutex or flush hand-off), waited by the
+     // submission worker. Any shared image, imported or our own.
+-    if (image->info().shared) {
+-      if (const auto* hooks = heliosHandoffHooks()) {
+-        if (const uint32_t key = image->heliosHandoffKey()) {
+-          if (const uint64_t point = hooks->sample(key))
+-            m_cmd->waitHandoff(key, point);
+-        }
+-      }
+-    }
++    m_cmd->heliosHandoffSampleImage(image.ptr());
+     if (image->info().sharing.mode != DxvkSharedHandleMode::Import)
+       return { };
+     if (image->info().sharing.heliosDedicatedPresentBuffer)
+diff --git a/src/dxvk/dxvk_helios_backend.h b/src/dxvk/dxvk_helios_backend.h
+index b61fbcbf..dc685cda 100644
+--- a/src/dxvk/dxvk_helios_backend.h
++++ b/src/dxvk/dxvk_helios_backend.h
+@@ -68,6 +68,10 @@ namespace dxvk {
+   struct HeliosHandoffHooks {
+     uint64_t (*sample)(uint32_t key);
+     bool (*wait)(uint32_t key, uint64_t point, uint64_t timeoutNs);
++    // Appended: every pending point of other processes for `key` (a slot
++    // keeps one per publishing device, so the reader's own publication never
++    // hides the releaser's), up to `max`; returns the count. NULL: use sample.
++    uint32_t (*sampleAll)(uint32_t key, uint64_t* points, uint32_t max);
+   };
+ 
+   inline std::atomic<const HeliosHandoffHooks*> g_heliosHandoffHooks = { nullptr };

@@ -18,10 +18,51 @@
 
 #![no_std]
 
+pub mod device_lost;
 pub mod edid;
 pub mod external_memory;
+pub mod nvrm_clients;
+pub mod nvrm_events;
+pub mod nvrm_fastpath;
+pub mod nvrm_fence;
+pub mod nvrm_views;
+pub mod window_units;
+pub mod rm_limits;
+pub mod rm_window;
+pub mod foreign_copy;
+pub mod foreign_errno;
+pub mod flip_completion;
+pub mod flip_flags;
+pub mod flip_pipeline;
+pub mod foreign_flip;
+pub mod foreign_resource;
+pub mod foreign_scanout;
+pub mod hpd_wake;
+pub mod rm_resource_import;
+pub mod page_runs;
+pub mod rm_client;
+pub mod rm_present;
+pub mod rm_refresh;
+pub mod rm_blt;
+pub mod scanout_release;
+pub mod rm_standard;
+pub mod rm_sysmem;
 pub mod producer_completion;
 pub mod execution_completion;
+pub mod flush_gate;
+pub mod flush_trace;
+pub mod rm_fence_present;
+pub mod present_foreign;
+pub mod msi;
+pub mod paging;
+pub mod shared_placeholder;
+pub mod restart_flip;
+pub mod stall_diag;
+pub mod sweep_budget;
+pub mod vsync_rate;
+pub mod vsync_wd;
+pub mod windowed_ready;
+pub mod slice_budget;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///
@@ -841,6 +882,8 @@ pub const ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: i32 = 1000072001;
 pub const ST_EXPORT_MEMORY_ALLOCATE_INFO: i32 = 1000072002;
 pub const ST_MEMORY_DEDICATED_ALLOCATE_INFO: i32 = 1000127001;
 pub const ST_IMPORT_MEMORY_RESOURCE_INFO_MESA: i32 = 1000384002;
+/// `VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT`.
+pub const ST_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT: i32 = 1000158004;
 
 pub const IMAGE_TYPE_2D: u32 = 1;
 pub const SAMPLE_COUNT_1: u32 = 0x0000_0001;
@@ -859,6 +902,10 @@ pub const IMAGE_TILING_OPTIMAL: u32 = 0;
 /// and the host built a tiled image the display importer read as linear: a black
 /// screen with no error anywhere. It is 1. Do not "simplify" it.
 pub const IMAGE_TILING_LINEAR: u32 = 1;
+/// `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`. Only valid on a device created with
+/// `VK_EXT_image_drm_format_modifier`; the one user is the foreign-resource copy
+/// import ([`foreign_copy`]).
+pub const IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT: u32 = 1000158000;
 
 /// Which pNext chain a `VkImageCreateInfo` carries.
 ///
@@ -867,15 +914,32 @@ pub const IMAGE_TILING_LINEAR: u32 = 1;
 /// cannot be encoded.
 ///
 /// The `ExternalMemoryWithModifierList` variant the review specifies is NOT
-/// here: `ST_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO`, `DRM_FORMAT_MOD_LINEAR`
-/// and `IMAGE_TILING_DRM_FORMAT_MODIFIER` all went with T6/R906 when the modifier
-/// path was deleted, so it would have zero users.
+/// here: `ST_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO` and
+/// `DRM_FORMAT_MOD_LINEAR` went with T6/R906 when the modifier path was deleted,
+/// so it would have zero users. The EXPLICIT variant below is a different thing:
+/// it is the one chain a foreign (NVK-on-RM) resource can be imported with, and
+/// it has a user ([`foreign_copy`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ImagePNext {
     /// An internal image with no external-memory contract.
     None,
     /// `VkExternalMemoryImageCreateInfo` with the given `VkExternalMemoryHandleTypeFlags`.
     ExternalMemory { handle_type: u32 },
+    /// `VkExternalMemoryImageCreateInfo` -> `VkImageDrmFormatModifierExplicitCreateInfoEXT`
+    /// with exactly one plane layout `{offset = plane_offset, rowPitch = row_pitch}`
+    /// (`size`, `arrayPitch` and `depthPitch` are 0, as
+    /// VUID-VkImageDrmFormatModifierExplicitCreateInfoEXT-size-02267 and its two
+    /// siblings require for a single-layer 2D image). Pair it with
+    /// [`IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`]. The explicit struct is nested
+    /// INSIDE the external-memory struct's pNext, so its fields are written
+    /// first and the external struct's own `handleTypes` comes last (the same
+    /// order rule as `MemoryPNext::ExportDedicated`).
+    ExternalMemoryDrmExplicit {
+        handle_type: u32,
+        modifier: u64,
+        plane_offset: u64,
+        row_pitch: u64,
+    },
 }
 
 /// Everything the three image creates differ by. The rest of
@@ -906,6 +970,29 @@ pub fn encode_image_create(device_id: u64, image_id: u64, spec: &ImageCreateSpec
             w.count(true);
             w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
             w.count(false);
+            w.u32(handle_type);
+        }
+        ImagePNext::ExternalMemoryDrmExplicit {
+            handle_type,
+            modifier,
+            plane_offset,
+            row_pitch,
+        } => {
+            w.count(true);
+            w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+            // pNext of the external struct: the explicit-modifier struct.
+            w.count(true);
+            w.i32(ST_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+            w.count(false); // its own pNext ends the chain
+            w.u64(modifier); // drmFormatModifier
+            w.u32(1); // drmFormatModifierPlaneCount
+            w.u64(1); // pPlaneLayouts array_size
+            w.u64(plane_offset); // VkSubresourceLayout.offset
+            w.u64(0); // size
+            w.u64(row_pitch); // rowPitch
+            w.u64(0); // arrayPitch
+            w.u64(0); // depthPitch
+                      // The EXTERNAL struct's own field, after the nested one.
             w.u32(handle_type);
         }
     }
@@ -952,6 +1039,12 @@ pub enum MemoryPNext {
     ExportDedicatedBuffer { handle_type: u32, buffer: u64 },
     /// `VkImportMemoryResourceInfoMESA` — adopt an existing virtio resource.
     ImportResource { resource_id: u32 },
+    /// `VkImportMemoryResourceInfoMESA` -> `VkMemoryDedicatedAllocateInfo` for an
+    /// image: a dedicated import. The dedicated struct is nested inside the
+    /// import struct's pNext, so `image`/`buffer` are written before `resourceId`
+    /// (the `ExportDedicated` rule again). This is the shape the host's NVIDIA
+    /// driver requires to import a dma-buf as an explicit-modifier image.
+    ImportResourceDedicated { resource_id: u32, image: u64 },
 }
 
 /// Everything the memory-allocation command variants differ by.
@@ -1019,6 +1112,17 @@ pub fn encode_memory_allocate(device_id: u64, memory_id: u64, spec: &MemoryAlloc
             w.count(true);
             w.i32(ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
             w.count(false);
+            w.u32(resource_id);
+        }
+        MemoryPNext::ImportResourceDedicated { resource_id, image } => {
+            w.count(true);
+            w.i32(ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+            w.count(true);
+            w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
+            w.count(false);
+            w.u64(image);
+            w.u64(0); // buffer
+                      // The IMPORT struct's own field, after the nested dedicated one.
             w.u32(resource_id);
         }
     }
@@ -5948,6 +6052,67 @@ pub mod present_stream {
     pub const fn marker_runs_ahead(value: u32, submitted_value: u32) -> bool {
         marker_lookahead(value, submitted_value) != 0
     }
+
+    /// How a present-marker tail `(ctx_id, value, cookie)` reads.
+    ///
+    /// `value == 0` is "already complete" (S3 of the DXVK-on-NVK plan): a
+    /// CPU-complete present whose producer waited for its own GPU work before
+    /// sending the marker, so there is no Venus timeline point to wait for. It
+    /// still NAMES a registered stream (`ctx_id` and `cookie` nonzero), which is
+    /// what tells it apart from an ABSENT tail: an old UMD leaves the tail
+    /// all-zero, and that must keep meaning "legacy current-wire watermark", or
+    /// every old-UMD present would bind without waiting.
+    ///
+    /// The UMD's own `PresentStreamCorrelation` never emits a partial tuple
+    /// (it is all-zero or all-nonzero), so `Complete` is a shape no shipping
+    /// writer produced before.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum MarkerTail {
+        /// All three zero: no marker, the legacy rule applies.
+        Absent,
+        /// Stream named, `value != 0`: wait for that point on the stream.
+        Point,
+        /// Stream named, `value == 0`: already complete, wait for nothing.
+        Complete,
+        /// Any other mix (an id without its cookie, a value with no stream):
+        /// not a marker; the legacy rule applies and nothing is trusted.
+        Partial,
+    }
+
+    pub const fn classify_tail(ctx_id: u32, value: u32, cookie: u64) -> MarkerTail {
+        if ctx_id == 0 && value == 0 && cookie == 0 {
+            MarkerTail::Absent
+        } else if ctx_id == 0 || cookie == 0 {
+            MarkerTail::Partial
+        } else if value == 0 {
+            MarkerTail::Complete
+        } else {
+            MarkerTail::Point
+        }
+    }
+
+    /// Whether the tail selects a stream boundary at all (`Point` or
+    /// `Complete`). The two parse sites in `DxgkDdiRender` use this where they
+    /// used `ctx_id != 0 && value != 0 && cookie != 0`; for every nonzero
+    /// `value` the answer is unchanged.
+    pub const fn tail_selects_boundary(ctx_id: u32, value: u32, cookie: u64) -> bool {
+        matches!(
+            classify_tail(ctx_id, value, cookie),
+            MarkerTail::Point | MarkerTail::Complete
+        )
+    }
+
+    /// `present_stream_marker_boundary`'s argument gate: the tail selects a
+    /// boundary and the caller carries a KMD-process association. The stream
+    /// itself is then matched against the live registered slots.
+    pub const fn marker_admissible(
+        ctx_id: u32,
+        value: u32,
+        cookie: u64,
+        creator_process: usize,
+    ) -> bool {
+        creator_process != 0 && tail_selects_boundary(ctx_id, value, cookie)
+    }
 }
 
 #[cfg(test)]
@@ -5993,6 +6158,91 @@ mod present_stream_tests {
         assert_eq!(marker_lookahead(0, u32::MAX), 0);
         assert_eq!(marker_lookahead(1, u32::MAX), 0);
         assert!(!marker_runs_ahead(0, u32::MAX));
+    }
+}
+
+#[cfg(test)]
+mod present_marker_tail_tests {
+    use super::present_stream::{
+        classify_tail, decode_boundary, encode_boundary, marker_admissible, marker_lookahead,
+        slot_handle, slot_ready, tail_selects_boundary, MarkerTail,
+    };
+
+    #[test]
+    fn an_all_zero_tail_is_absent_and_keeps_the_legacy_rule() {
+        assert_eq!(classify_tail(0, 0, 0), MarkerTail::Absent);
+        assert!(!tail_selects_boundary(0, 0, 0));
+        assert!(!marker_admissible(0, 0, 0, 1));
+    }
+
+    #[test]
+    fn a_nonzero_point_is_exactly_what_it_was() {
+        // The old gate: ctx != 0 && value != 0 && cookie != 0 (&& process != 0).
+        for (ctx, value, cookie, process) in [
+            (1u32, 1u32, 1u64, 1usize),
+            (7, 41, 0xDEAD_BEEF_0000_0001, 0x1234),
+            (u32::MAX, u32::MAX, u64::MAX, usize::MAX),
+            (1, 1, 1, 0),
+            (0, 5, 5, 1),
+            (5, 5, 0, 1),
+            (5, 0, 5, 1), // the one input whose answer changes (value == 0)
+            (0, 0, 5, 1),
+            (5, 0, 0, 1),
+            (0, 5, 0, 1),
+        ] {
+            let old = ctx != 0 && value != 0 && cookie != 0 && process != 0;
+            let new = marker_admissible(ctx, value, cookie, process);
+            if value != 0 {
+                assert_eq!(old, new, "{ctx} {value} {cookie:#x} {process:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn value_zero_with_a_stream_is_complete_not_absent() {
+        assert_eq!(classify_tail(5, 0, 9), MarkerTail::Complete);
+        assert!(tail_selects_boundary(5, 0, 9));
+        assert!(marker_admissible(5, 0, 9, 1));
+        // Still needs the process association.
+        assert!(!marker_admissible(5, 0, 9, 0));
+    }
+
+    #[test]
+    fn partial_tails_are_not_markers() {
+        // An id with no cookie, a cookie with no id, a value with neither.
+        assert_eq!(classify_tail(5, 0, 0), MarkerTail::Partial);
+        assert_eq!(classify_tail(0, 0, 9), MarkerTail::Partial);
+        assert_eq!(classify_tail(5, 3, 0), MarkerTail::Partial);
+        assert_eq!(classify_tail(0, 3, 9), MarkerTail::Partial);
+        assert_eq!(classify_tail(0, 3, 0), MarkerTail::Partial);
+        for (c, v, k) in [(5, 0, 0), (0, 0, 9), (5, 3, 0), (0, 3, 9), (0, 3, 0)] {
+            assert!(!tail_selects_boundary(c, v, k));
+        }
+        assert_eq!(classify_tail(5, 3, 9), MarkerTail::Point);
+    }
+
+    #[test]
+    fn a_complete_boundary_is_a_valid_tagged_boundary_and_ready_while_live() {
+        let handle = slot_handle(3, 2);
+        let boundary = encode_boundary(handle, 0);
+        // Nonzero (the tag bit), so no consumer can mistake it for "no
+        // boundary"; and it decodes, so it stays in the stream namespace and is
+        // never fed to the wire-fence `< watermark` scan.
+        assert_ne!(boundary, 0);
+        assert_eq!(decode_boundary(boundary), Some((handle, 0)));
+        // Ready at once on a live stream whatever it has retired...
+        assert!(slot_ready(true, 3, 2, handle, 0, 0));
+        assert!(slot_ready(true, 3, 2, handle, 0, 17));
+        // ...and exactly as unready as any other boundary once the stream dies
+        // or its generation moves: a dead stream is never success.
+        assert!(!slot_ready(false, 3, 2, handle, 0, 17));
+        assert!(!slot_ready(true, 4, 2, handle, 0, 17));
+    }
+
+    #[test]
+    fn a_complete_marker_never_counts_as_running_ahead() {
+        assert_eq!(marker_lookahead(0, 0), 0);
+        assert_eq!(marker_lookahead(0, 41), 0);
     }
 }
 

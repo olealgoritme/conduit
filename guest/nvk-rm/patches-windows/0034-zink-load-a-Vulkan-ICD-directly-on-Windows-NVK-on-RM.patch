@@ -1,0 +1,230 @@
+From bb47be9d26d29a2ff5881b89468c99a549411ed2 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 04:33:23 +0200
+Subject: [PATCH 34/34] zink: load a Vulkan ICD directly on Windows (NVK on RM
+ for the Helios adapter)
+
+Zink's WGL screen went through vulkan-1.dll and took the loader's first
+physical device. For the Helios adapter, Zink now loads NVK itself and uses
+its vk_icdGetInstanceProcAddr (the loader-less path the Helios D3D UMD
+takes for DXVK): no dependency on what the loader enumerates, no Venus
+device to pick by mistake. vkGetDeviceProcAddr comes from the instance;
+vkEnumerateInstanceLayerProperties, which only the loader implements,
+reports no layers.
+
+The ICD is, in order:
+
+  ZINK_VULKAN_ICD                          a DLL path, or "loader"
+  HKLM\SOFTWARE\Helios!NvkIcdPath          64-bit (NvkIcdPath32: 32-bit),
+                                           the values the D3D UMD reads
+  vulkan_nouveau.dll next to this module   (32-bit: vulkan_nouveau32.dll
+                                           first), the driver store layout
+  %ProgramFiles%\Helios\nvk\vulkan_nouveau.dll
+
+Unless ZINK_VULKAN_ICD named it, NVK's nvk_helios_process_allowed() applies
+the Helios ICD policy: a process it sends to Venus keeps the loader, as
+does any process when no ICD is found or the ICD does not load.
+---
+ src/gallium/drivers/zink/zink_screen.c | 158 +++++++++++++++++++++++++
+ 1 file changed, 158 insertions(+)
+
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index 8e92a9d..bdce379 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -67,6 +67,7 @@ bool zink_tracing = false;
+ 
+ #if DETECT_OS_WINDOWS
+ #include <io.h>
++#include <windows.h>
+ #define VK_LIBNAME "vulkan-1.dll"
+ #else
+ #include <unistd.h>
+@@ -3448,6 +3449,147 @@ zink_cl_cts_version(struct pipe_screen *pscreen)
+    return "v2024-08-08-00";
+ }
+ 
++#if DETECT_OS_WINDOWS
++/* Helios: Zink on NVK-on-RM without the Vulkan loader.
++ *
++ * The ICD comes from, in order: ZINK_VULKAN_ICD (a DLL path, or "loader"),
++ * HKLM\SOFTWARE\Helios NvkIcdPath (64-bit) / NvkIcdPath32 (32-bit), NVK next
++ * to this module, %ProgramFiles%\Helios\nvk.  Unless ZINK_VULKAN_ICD named
++ * it, NVK's nvk_helios_process_allowed() applies the Helios ICD policy (the
++ * D3D UMD's): a process it sends to Venus keeps the loader.
++ */
++static bool
++zink_helios_reg_sz(const char *name, char *out, DWORD cap)
++{
++   out[0] = 0;
++   DWORD size = cap;
++   return RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", name,
++                       RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, NULL, out,
++                       &size) == ERROR_SUCCESS && out[0];
++}
++
++static bool
++zink_file_exists(const char *path)
++{
++   const DWORD a = GetFileAttributesA(path);
++   return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
++}
++
++static bool
++zink_find_direct_icd(char *out, size_t cap, bool *explicit_icd)
++{
++   const char *env = os_get_option("ZINK_VULKAN_ICD");
++   *explicit_icd = false;
++   if (env && *env) {
++      if (!strcasecmp(env, "loader"))
++         return false;
++      snprintf(out, cap, "%s", env);
++      *explicit_icd = true;
++      return true;
++   }
++
++#ifdef _WIN64
++   if (zink_helios_reg_sz("NvkIcdPath", out, (DWORD)cap) && zink_file_exists(out))
++      return true;
++   static const char *const names[] = { "vulkan_nouveau.dll" };
++#else
++   if (zink_helios_reg_sz("NvkIcdPath32", out, (DWORD)cap) && zink_file_exists(out))
++      return true;
++   static const char *const names[] = { "vulkan_nouveau32.dll", "vulkan_nouveau.dll" };
++#endif
++
++   HMODULE self = NULL;
++   char dir[MAX_PATH];
++   if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                          GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                          (LPCSTR)(void *)zink_find_direct_icd, &self)) {
++      DWORD len = GetModuleFileNameA(self, dir, sizeof(dir));
++      char *slash = len && len < sizeof(dir) ? strrchr(dir, '\\') : NULL;
++      if (slash) {
++         slash[1] = '\0';
++         for (unsigned i = 0; i < ARRAY_SIZE(names); i++) {
++            snprintf(out, cap, "%s%s", dir, names[i]);
++            if (zink_file_exists(out))
++               return true;
++         }
++      }
++   }
++
++   /* "Program Files (x86)" in a WoW64 process */
++   const char *pf = getenv("ProgramFiles");
++   if (pf) {
++      snprintf(out, cap, "%s\\Helios\\nvk\\vulkan_nouveau.dll", pf);
++      if (zink_file_exists(out))
++         return true;
++   }
++   out[0] = '\0';
++   return false;
++}
++
++/* Layers are the loader's business: an ICD exports no
++ * vkEnumerateInstanceLayerProperties, and Zink wants one.
++ */
++static PFN_vkGetInstanceProcAddr zink_direct_icd_gipa;
++
++static VKAPI_ATTR VkResult VKAPI_CALL
++zink_direct_no_layers(uint32_t *count, VkLayerProperties *props)
++{
++   *count = 0;
++   return VK_SUCCESS;
++}
++
++static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++zink_direct_gipa(VkInstance instance, const char *name)
++{
++   PFN_vkVoidFunction f = zink_direct_icd_gipa(instance, name);
++   if (!f && !strcmp(name, "vkEnumerateInstanceLayerProperties"))
++      f = (PFN_vkVoidFunction)zink_direct_no_layers;
++   return f;
++}
++
++static bool
++zink_open_direct_icd(struct zink_screen *screen)
++{
++   char path[MAX_PATH];
++   bool explicit_icd;
++   if (!zink_find_direct_icd(path, sizeof(path), &explicit_icd))
++      return false;
++
++   HMODULE icd = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
++   if (!icd) {
++      mesa_loge("ZINK: cannot load the Vulkan ICD %s (error %lu), using the loader",
++                path, GetLastError());
++      return false;
++   }
++
++   typedef int (*allowed_fn)(void);
++   allowed_fn allowed = (allowed_fn)(void *)GetProcAddress(icd, "nvk_helios_process_allowed");
++   if (!explicit_icd && allowed && !allowed()) {
++      FreeLibrary(icd);
++      return false;
++   }
++
++   typedef VkResult (VKAPI_PTR *negotiate_fn)(uint32_t *version);
++   negotiate_fn negotiate = (negotiate_fn)(void *)
++         GetProcAddress(icd, "vk_icdNegotiateLoaderICDInterfaceVersion");
++   PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)(void *)
++      GetProcAddress(icd, "vk_icdGetInstanceProcAddr");
++   uint32_t version = 7;
++   if (!gipa || (negotiate && negotiate(&version) != VK_SUCCESS)) {
++      mesa_loge("ZINK: %s is not a usable Vulkan ICD, using the loader", path);
++      FreeLibrary(icd);
++      return false;
++   }
++
++   screen->loader_lib = (struct util_dl_library *)icd;
++   zink_direct_icd_gipa = gipa;
++   screen->vk_GetInstanceProcAddr = zink_direct_gipa;
++   /* Filled in from the instance once it exists. */
++   screen->vk_GetDeviceProcAddr = NULL;
++   return true;
++}
++#endif
++
+ static struct zink_screen *
+ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev_major, int64_t dev_minor, uint64_t adapter_luid)
+ {
+@@ -3481,6 +3623,11 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
+ 
+    u_trace_state_init();
+ 
++   bool direct_icd = false;
++#if DETECT_OS_WINDOWS
++   direct_icd = zink_open_direct_icd(screen);
++#endif
++   if (!direct_icd) {
+    screen->loader_lib = util_dl_open(VK_LIBNAME);
+    if (!screen->loader_lib) {
+       if (!screen->driver_name_is_inferred)
+@@ -3496,6 +3643,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
+          mesa_loge("ZINK: failed to get proc address");
+       goto fail;
+    }
++   }
+ 
+    if (config) {
+       driParseConfigFiles(config->options, config->options_info,
+@@ -3523,6 +3671,16 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
+    screen->instance_info = &instance_info;
+    simple_mtx_unlock(&instance_lock);
+ 
++   if (!screen->vk_GetDeviceProcAddr) {
++      screen->vk_GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)
++         screen->vk_GetInstanceProcAddr(screen->instance, "vkGetDeviceProcAddr");
++      if (!screen->vk_GetDeviceProcAddr) {
++         if (!screen->driver_name_is_inferred)
++            mesa_loge("ZINK: failed to get proc address");
++         goto fail;
++      }
++   }
++
+    if (zink_debug & ZINK_DEBUG_VALIDATION) {
+       if (!screen->instance_info->have_layer_KHRONOS_validation &&
+           !screen->instance_info->have_layer_LUNARG_standard_validation) {
+-- 
+2.43.0
+

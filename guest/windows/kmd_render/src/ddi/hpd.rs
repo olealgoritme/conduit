@@ -15,6 +15,8 @@ use core::sync::atomic::Ordering;
 
 use crate::adapter::{AdapterContext, ScanoutRefreshQueue};
 use crate::dxgk::*;
+use crate::ddi::stall_diag::{self, site};
+use helios_kmd_logic::hpd_wake;
 use wdk_sys::ntddk::{KeWaitForSingleObject, PsTerminateSystemThread};
 
 const STATUS_TIMEOUT: NTSTATUS = 0x0000_0102;
@@ -29,15 +31,13 @@ const STATUS_TIMEOUT: NTSTATUS = 0x0000_0102;
 /// existence of a timeout.
 const START_COMPLETE_FALLBACK_100NS: i64 = -5_000_000; // 500 ms, relative
 
-/// Bounded lost-interrupt fallback while one async ctrl command owns descriptors.
-///
-/// NOT the R515 defect: the KEVENT (ISR -> DPC -> drain -> signal) is the real
-/// wake source and this only covers a delayed device interrupt.
-const CTRL_INFLIGHT_POLL_100NS: i64 = -40_000; // 4 ms, relative
+// The control-queue poll (4 ms) and the refresh retry (16 ms) are
+// `hpd_wake::CTRL_INFLIGHT_POLL_100NS` and `REFRESH_RETRY_100NS`, host-tested with the rest of
+// the wait (`hpd_wake::wait_plan`).
 
-/// Retry delay after a loud scanout-refresh enqueue failure. Also a real bound,
-/// not a stand-in: the failure has no wake source of its own.
-const REFRESH_RETRY_100NS: i64 = -160_000; // 16 ms, relative
+/// How long the worker sleeps while an `Nv*` counter mirror is wanted but not yet
+/// due: the mirror's own minimum interval (`publish_gate::MIN_INTERVAL_100NS`).
+const NVRM_PUBLISH_RECHECK_100NS: i64 = -2_500_000; // 250 ms, relative
 
 /// Indicate the single child video-output's connection state to the OS. PASSIVE.
 fn indicate_child_status(adapter: &AdapterContext, connected: bool) {
@@ -56,6 +56,12 @@ fn indicate_child_status(adapter: &AdapterContext, connected: bool) {
     // SAFETY: live callback interface; `status` is a fully-initialized child-status
     // packet valid for the synchronous call. PASSIVE_LEVEL (worker thread).
     let st = unsafe { indicate(dxgkrnl.DeviceHandle, &mut status) };
+    // A refusal of the hot-plug indication, in the DDI failure rings (`ddi::device_lost`).
+    crate::ddi::device_lost::note_cb(
+        helios_kmd_logic::device_lost::ddi::CB_INDICATE_CHILD,
+        st,
+        connected as u32,
+    );
     crate::diag::record_named_bytes(b"HpdI", ((connected as u32) << 16) | (st as u32 & 0xFFFF));
     HPD_INDICATE_COUNT.fetch_add(1, Ordering::Relaxed);
     crate::diag::record_named_bytes(b"HpdN", HPD_INDICATE_COUNT.load(Ordering::Relaxed));
@@ -65,8 +71,20 @@ fn indicate_child_status(adapter: &AdapterContext, connected: bool) {
     crate::diag::record_named_bytes(b"HpdStTo", HPD_START_EDGE_TIMEOUTS.load(Ordering::Relaxed));
 }
 
-/// Count of child-status indications this boot (diag `HpdN`).
+/// Count of child-status indications of this generation (diag `HpdN`; zeroed at every
+/// StartDevice since v327, so it is the worker of THIS start that wrote it).
 static HPD_INDICATE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The previous generation's `HpdN`, for the StartDevice-entry breadcrumb (`EntHpdN`).
+pub(crate) fn indicate_count() -> u32 {
+    HPD_INDICATE_COUNT.load(Ordering::Relaxed)
+}
+
+/// StartDevice: the indication count and the start-edge timeouts are this generation's.
+pub(crate) fn reset_for_start() {
+    HPD_INDICATE_COUNT.store(0, Ordering::Relaxed);
+    HPD_START_EDGE_TIMEOUTS.store(0, Ordering::Relaxed);
+}
 
 /// Times the prologue's bounded fallback fired instead of the real start edge
 /// (diag `HpdStTo`). Must read 0 on a healthy boot: a nonzero value means
@@ -111,6 +129,12 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
     // scanout/config-change paths: a wake that is not the start edge must not be
     // mistaken for one. The loop is bounded by the same fallback per iteration
     // and by `hpd_stop`.
+    //
+    // Stall breadcrumbs (`HpdSite`, `ddi::stall_diag`): every service and step below stores its
+    // id and the clock when it is entered, so a worker that stops answering names the step it
+    // stopped in. Atomics only; nothing here changes what the worker does.
+    stall_diag::hpd_phase(1);
+    stall_diag::hpd_enter(site::START_WAIT);
     while adapter.start_complete.load(Ordering::Acquire) == 0 {
         if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
             break;
@@ -135,6 +159,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         }
     }
     if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
+        stall_diag::hpd_enter(site::EXITED);
         // Publish "worker exited" BEFORE terminating, so stop_hpd's join does
         // not depend on ObReferenceObjectByHandle succeeding.
         // SAFETY: initialized NotificationEvent on the adapter, which outlives
@@ -156,8 +181,11 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
     // Swapping first means a bit set DURING the indication survives to the next
     // iteration and is acted on there. The steady-state loop already had this
     // right; only this one-shot prologue did not.
+    stall_diag::hpd_phase(2);
     adapter.config_change_pending.swap(0, Ordering::AcqRel);
+    stall_diag::hpd_enter(site::INDICATE);
     indicate_child_status(adapter, true);
+    stall_diag::hpd_phase(3);
 
     // Steady state is event/dirty driven. A real virtio display-change wakes us
     // to re-indicate the child; a completed primary GPU copy wakes us to queue
@@ -174,22 +202,59 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         let ctrl_inflight = adapter.scanout_flush_inflight.load(Ordering::Acquire) != 0;
         let retry_pending =
             adapter.scanout_refresh_pending.load(Ordering::Acquire) != 0 && !ctrl_inflight;
-        let mut timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
-        let timeout_ptr = if ctrl_inflight {
-            timeout.QuadPart = CTRL_INFLIGHT_POLL_100NS;
-            &mut timeout
-        } else if retry_pending {
-            timeout.QuadPart = REFRESH_RETRY_100NS;
-            &mut timeout
+        // The wait is `hpd_wake::wait_plan` (host-tested): the control poll while one async
+        // command owns descriptors, else the refresh retry, else the EARLIER of the optional due
+        // times (a foreign source's lapse or the presenter's paced frame, a not-yet-due `Nv*`
+        // mirror, the vsync heartbeat's watchdog tick), all RELATIVE (negative) 100 ns units.
+        // Every timed wait is at least 0.5 ms, so no input can make the worker spin on a zero or
+        // an absolute timeout.
+        let optional = !ctrl_inflight && !retry_pending;
+        let foreign = if optional {
+            adapter.foreign_scanout_wait_100ns()
         } else {
-            core::ptr::null_mut()
+            None
         };
+        let mirror = (optional && super::escape::nvrm_publish_pending())
+            .then_some(NVRM_PUBLISH_RECHECK_100NS);
+        // While the heartbeat is meant to run the worker wakes 4 times a second even when idle,
+        // to check it (`AdapterContext::vsync_watch`): an MMIO flip is woken by the heartbeat
+        // alone, so a dead heartbeat and a sleeping worker would hold the flip for ever.
+        // v327: off unless `VsIdleWake` (and a watchdog level) ask for it: the default wait is KMD
+        // 325's, infinite when nothing is due.
+        let watch = hpd_wake::idle_watch(
+            stall_diag::vs_idle_wake(),
+            stall_diag::vs_watchdog(),
+            optional,
+            adapter.display_half(),
+            adapter.vsync_armed.load(Ordering::Acquire) != 0,
+        );
+        let (due, class) = hpd_wake::wait_plan(hpd_wake::WaitInputs {
+            ctrl_inflight,
+            retry_pending,
+            foreign,
+            mirror,
+            watch,
+        });
+        let mut timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
+        let timeout_ptr = match due {
+            Some(d) => {
+                timeout.QuadPart = d;
+                &mut timeout as *mut LARGE_INTEGER
+            }
+            None => core::ptr::null_mut(),
+        };
+        // `HpdWait`, `HpdWaitMin`, `HpdTm*`: what this wait is, for the next run's reading.
+        stall_diag::hpd_wait(class, due);
+        // The healthy resting place: a stall dump that finds `HpdSite` here with a recent
+        // `HpdSiteT` or `HpdLoopT` has a worker that is asleep, not stuck.
+        stall_diag::hpd_enter(site::WAIT);
         // SAFETY: wait on the initialized event; NULL timeout means sleep until
         // config change, scanout dirty, completion, or StopDevice.
         let wait_status = unsafe {
             KeWaitForSingleObject(adapter.hpd_event.get() as PVOID, 0, 0, 0, timeout_ptr)
         };
         if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
+            stall_diag::hpd_enter(site::EXITED);
             // Publish "worker exited" BEFORE terminating, so stop_hpd's join
             // does not depend on ObReferenceObjectByHandle succeeding.
             // SAFETY: initialized NotificationEvent on the adapter, which
@@ -199,6 +264,17 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             let _ = unsafe { PsTerminateSystemThread(STATUS_SUCCESS) };
             return;
         }
+        stall_diag::hpd_loop(wait_status == STATUS_TIMEOUT);
+        stall_diag::hpd_phase(4);
+        // The retire flag is consumed on EVERY pass, whatever else woke the worker: submits
+        // signal only its 0 -> 1 edge (`note_and_maybe_signal`), so a flag left set by a pass
+        // that drained for another reason would silence every later wake.
+        let retire_wanted = adapter.scanout_retire_wanted.swap(0, Ordering::AcqRel) != 0;
+        // The vsync heartbeat's watchdog (`hpd_wake::vsync_watch`): re-arm one that died.
+        adapter.vsync_watch(true);
+        // The independent watchdog timer asked for the heartbeat block (`VsLiveT`): without it a
+        // worker asleep in its infinite wait leaves the mirror frozen at its last pass.
+        stall_diag::publish_live_if_wanted();
 
         // The KEVENT is the primary completion path (ISR -> DPC -> drain ->
         // signal). If that device interrupt is delayed, poll only while one
@@ -214,34 +290,75 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             // (ROADMAP defect 0ab-B). This is that work's PASSIVE home, and it
             // is a real edge rather than a poll: the same store that sets the
             // flag signals the event we just woke on.
-            || adapter.scanout_retire_wanted.swap(0, Ordering::AcqRel) != 0
+            || retire_wanted
         {
+            stall_diag::hpd_enter(site::DRAIN_USED);
             crate::ddi::interrupt::drain_used_and_complete(adapter);
         }
 
         // The ISR owns setting this bit; the PASSIVE worker consumes it after
         // the DPC's wake so a scanout-completion wake cannot masquerade as HPD.
         if adapter.config_change_pending.swap(0, Ordering::AcqRel) != 0 {
+            stall_diag::hpd_enter(site::INDICATE);
             indicate_child_status(adapter, true);
         }
+
+        // Expire a foreign scanout source whose owner stopped presenting (and ask
+        // for the desktop's restore flush, consumed by the refresh arm below).
+        stall_diag::hpd_enter(site::FOREIGN_SCANOUT);
+        adapter.foreign_scanout_service();
+
+        // Fenced presents: send the flips whose fences fired (in order) and close
+        // the fence handles the KMD owes the host. A no-op with nothing queued.
+        stall_diag::hpd_enter(site::FOREIGN_FENCE);
+        adapter.foreign_fence_service(passive);
 
         // Consume only the allocation identity supplied by Windows through
         // SetVidPnSourceAddress. The DDI can be called at DIRQL, where neither
         // Venus waits nor registry diagnostics are legal; this worker is the
         // PASSIVE continuation for that exact callback.
-        crate::ddi::display::process_deferred_vidpn_source_address(passive, adapter);
+        //
+        // `FfAsyncWin`: first settle the pipelined host flips whose answer is in (an answer frees
+        // the window), then leave the slot alone while the window is still full of flips in
+        // flight: that is the backpressure that keeps DWM from cycling ahead of the host. With
+        // the knob off both are one load and nothing is held back.
+        stall_diag::hpd_enter(site::FOREIGN_FLIP);
+        crate::virtio::foreign_flip::settle(adapter);
+        stall_diag::hpd_enter(site::DEFERRED_VIDPN);
+        if !crate::virtio::foreign_flip::drain_blocked() {
+            crate::ddi::display::process_deferred_vidpn_source_address(passive, adapter);
+        }
 
         // WindowedBlt has an event-driven PASSIVE continuation distinct from
         // scanout refresh: the request must first be admitted by SubmitCommand
         // and have its exact producer stream retire. This call merely consumes
         // those already-signalled edges; it never polls a producer.
+        stall_diag::hpd_enter(site::WINDOWED_BLT);
         crate::ddi::display::service_windowed_blt(passive, adapter);
+
+        // The KMD's own RM client (`KmdRmClient`, off by default: a no-op then). After
+        // the deferred programming above, so a primary bound in this very pass is seen.
+        stall_diag::hpd_enter(site::RM_CLIENT);
+        crate::virtio::rm_client::service(passive, adapter);
+
+        // `ForeignFlip`: the flips of a foreign allocation Windows is showing (off by default:
+        // one atomic load). After the level 5 service, which leaves the shared edges to it
+        // while it holds the screen.
+        stall_diag::hpd_enter(site::FOREIGN_FLIP);
+        crate::virtio::foreign_flip::service(passive, adapter);
+
+        // The `Nv*` registry mirror the NVRM escapes asked for. It used to run
+        // inside the escape (about a millisecond added to every Open / Close /
+        // Map / Pin and to every 256th forward); here it costs nobody's latency.
+        stall_diag::hpd_enter(site::NVRM_PUBLISH);
+        super::escape::nvrm_publish_service();
 
         // Publish the unsampled scanout-bind trace. This is the ONE PASSIVE
         // site that mirrors it; accumulation happens at DIRQL/DISPATCH with
         // atomics only. Throttled inside `dump_periodic` — a dump is ~120
         // registry writes, so it must never run per frame. Placed after the
         // deferred programming so a dump reflects the bind that just ran.
+        stall_diag::hpd_enter(site::DUMP);
         crate::ddi::scanout_trace::dump_periodic(adapter);
 
         // T6/R901 deleted the `ScanoutDiag` forced-rebind experiment that used
@@ -265,6 +382,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // volatile reads and 7 registry writes — runs HERE, at PASSIVE, with no
         // lock held and off the Present path entirely.
         if adapter.probe_pending.swap(0, Ordering::AcqRel) != 0 {
+            stall_diag::hpd_enter(site::PROBE);
             let pending = adapter
                 .with_venus_client(passive, |client| client.take_pending_probe())
                 .ok()
@@ -291,6 +409,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         }
 
         if adapter.scanout_refresh_pending.swap(0, Ordering::AcqRel) != 0 {
+            stall_diag::hpd_enter(site::REFRESH);
             match adapter.queue_active_scanout_refresh(passive) {
                 ScanoutRefreshQueue::Queued => {}
                 ScanoutRefreshQueue::Busy | ScanoutRefreshQueue::Failed => {
@@ -320,5 +439,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             crate::diag::record_named_bytes(b"RfFail", failed);
             reported_fail = failed;
         }
+        // `HpdBusyUs` / `HpdPassMaxUs`: the pass is over.
+        stall_diag::hpd_pass_end();
     }
 }

@@ -1667,6 +1667,14 @@ unsafe fn adopt_committed_allocation(
 ) -> Result<(), Hresult> {
     let engine_resource = resource.as_raw() as usize;
 
+    if dev.engine.is_nvk() {
+        // S5: NVK on RM mints its own resource ids (`adopt_committed_allocation_nvk`).
+        // SAFETY: forwarded preconditions.
+        return unsafe {
+            adopt_committed_allocation_nvk(dev, device10, resource, heap_arg, res_arg, desc, h_rt_resource)
+        };
+    }
+
     // ── 1. the identity, from the engine and then from the ICD ─────────────
     //
     // SAFETY: `resource` is the `ID3D12Resource` this driver's own engine just
@@ -1857,7 +1865,8 @@ unsafe fn adopt_committed_allocation(
             // from a D3D12 resource-flags word would be a translation no reader asked
             // for."* Both halves are false — see [`meta_bind_flags`] for the reader and
             // for what the verbatim word decodes as.
-            bind_flags: meta_bind_flags(res_arg.Flags),
+            bind_flags: meta_bind_flags(res_arg.Flags)
+                | present_buffer_bind(heap_arg, res_arg),
             // ⛔ NOT `HELIOS_WDDM_ALLOC_MISC_PRIMARY`, and NOT
             // `HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT` -- see this function's doc for
             // both arguments. A windowed DWM-composited back buffer is not the VidPn
@@ -2162,6 +2171,351 @@ unsafe fn adopt_committed_allocation(
 /// has not already been deallocated; passing one twice is a kernel-handle double
 /// free. On [`DeallocateForm::ByResource`] the handle must be the runtime resource
 /// the allocation was associated with at the create.
+/// S5: can this fused heap+resource be a flip-model swap-chain buffer? A 2D,
+/// single-mip, single-sample, non-array render target in a 32 bpp scanout
+/// format on a GPU-local heap (the formats NVK's resource ids and the KMD's
+/// foreign layout carry), or anything the runtime declared PRIMARY.
+fn nvk_present_candidate(
+    heap_arg: &ddi12::D3D12DDIARG_CREATEHEAP_0001,
+    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+) -> bool {
+    if heap_arg.Flags & v::HEAP_PRIMARY != 0 {
+        return true;
+    }
+    // DXGI_FORMAT: R8G8B8A8_UNORM(_SRGB) 28/29, B8G8R8A8_UNORM 87,
+    // B8G8R8X8_UNORM 88, B8G8R8A8_UNORM_SRGB 91.
+    let format_ok = matches!(res_arg.Format as u32, 28 | 29 | 87 | 88 | 91);
+    res_arg.ResourceType == v::RT_TEXTURE2D
+        && format_ok
+        && res_arg.MipLevels == 1
+        && res_arg.DepthOrArraySize == 1
+        && res_arg.SampleDesc.Count == 1
+        && res_arg.Flags & v::RES_RENDER_TARGET != 0
+        && heap_arg.CPUPageProperty
+            != ddi12::D3D12DDI_CPU_PAGE_PROPERTY_D3D12DDI_CPU_PAGE_PROPERTY_WRITE_COMBINE
+        && heap_arg.CPUPageProperty
+            != ddi12::D3D12DDI_CPU_PAGE_PROPERTY_D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK
+}
+
+/// `D3D10_DDI_BIND_PRESENT` in the D3D11 DDI bind word of the meta, for a
+/// resource a flip-model swap chain can be made of ([`nvk_present_candidate`]).
+///
+/// The reader is DWM's D3D11 `pfnOpenResource`: a shared resource WITHOUT this
+/// bit is a cross-process keyed-mutex surface to it (`note_nvk_keyed_resource`
+/// in `umd/src/forward/resource.rs`), and since the flush gate (HEFL, 22.22.316)
+/// every DWM `pfnFlush` with work then sends a STREAM gate packet. That packet
+/// heads the adapter-wide WDDM FIFO until DWM's point retires or the
+/// `WddmHeadMs` rebase (250 ms) fires, and every D3D12 frame waited behind it:
+/// d3d12_tri on Venus fell from ~970 to 4 fps. A D3D11 swap chain's buffers
+/// carry the bit (`meta_bind=0xa8` in DWM's log), so their hand-off stays the
+/// present path's business; a D3D12 back buffer now says the same. The runtime
+/// never names the back buffers on this DDI (see `create_fused_heap_and_resource`),
+/// so the swap-chain shape is the test, as for NVK's export request.
+/// `api_bind_flags` drops the bit, so the imported alias's usage is unchanged.
+fn present_buffer_bind(
+    heap_arg: &ddi12::D3D12DDIARG_CREATEHEAP_0001,
+    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+) -> u32 {
+    const DDI_BIND_PRESENT: u32 = 0x0000_0080;
+    if nvk_present_candidate(heap_arg, res_arg) {
+        DDI_BIND_PRESENT
+    } else {
+        0
+    }
+}
+
+/// The private data of an NVK-made (foreign) primary: the 96-byte prefix plus the
+/// layout trailer the KMD checks against what it recorded at IMPORT_RM.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ForeignAllocPrivate {
+    alloc: helios_protocol::HeliosWddmAllocPrivate,
+    meta: helios_protocol::HeliosWddmAllocMeta,
+    layout: helios_protocol::HeliosWddmAllocLayout,
+}
+
+const _: () = {
+    assert!(
+        core::mem::size_of::<ForeignAllocPrivate>()
+            == helios_protocol::HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES
+    );
+    assert!(
+        core::mem::offset_of!(ForeignAllocPrivate, layout) == helios_protocol::HELIOS_WDDM_LAYOUT_OFFSET
+    );
+};
+
+/// `adopt_committed_allocation` on NVK on RM (dxvk-on-nvk S5).
+///
+/// Every fused resource still gets a WDDM allocation (the runtime may share any
+/// of them later, see `create_fused_heap_and_resource`), but on NVK only a
+/// present candidate (`nvk_present_candidate`) gets a real one:
+///
+/// * A candidate adopts the KMD resource id NVK mints for its dedicated memory
+///   (IMPORT_RM), with the layout trailer, so DWM can open and compose it
+///   (`ForeignImport=1` on the Venus side) and the scanout can show it. When the
+///   KMD cannot mint one (its IMPORT_RM gate is closed) it gets a KMD-backed
+///   placeholder of its linear size and reaches the screen only through NVK's
+///   scanout present.
+/// * Anything else gets a one-page KMD placeholder: the allocation has to exist,
+///   the bytes are NVK's, and nothing outside this process can read them.
+///
+/// # Safety
+/// As [`adopt_committed_allocation`].
+unsafe fn adopt_committed_allocation_nvk(
+    dev: &HeliosD3D12Device,
+    device10: &ID3D12Device10,
+    resource: &ID3D12Resource,
+    heap_arg: &ddi12::D3D12DDIARG_CREATEHEAP_0001,
+    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+    desc: &D3D12_RESOURCE_DESC1,
+    h_rt_resource: ddi12::D3D12DDI_HRTRESOURCE,
+) -> Result<(), Hresult> {
+    let engine_resource = resource.as_raw() as usize;
+    let candidate = nvk_present_candidate(heap_arg, res_arg);
+    let foreign = if candidate {
+        // SAFETY: `resource` is the live engine resource this create just made.
+        unsafe { dev.engine.resource_foreign_identity(engine_resource) }
+    } else {
+        None
+    };
+
+    let api_desc = resource_desc(desc);
+    let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+        Offset: 0,
+        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+            Format: DXGI_FORMAT(0),
+            Width: 0,
+            Height: 0,
+            Depth: 0,
+            RowPitch: FOOTPRINT_UNANSWERED_U32,
+        },
+    };
+    unsafe {
+        device10.GetCopyableFootprints(
+            &api_desc,
+            0,
+            1,
+            0,
+            Some(core::ptr::from_mut(&mut footprint)),
+            None,
+            None,
+            None,
+        );
+    }
+    let linear_pitch = if footprint.Footprint.RowPitch == FOOTPRINT_UNANSWERED_U32 {
+        0
+    } else {
+        footprint.Footprint.RowPitch
+    };
+    let pitch = foreign.map_or(linear_pitch, |f| f.stride);
+    let size = match foreign {
+        Some(f) => f.size,
+        None if candidate => (u64::from(linear_pitch) * u64::from(res_arg.Height.max(1))).max(4096),
+        None => 4096,
+    };
+
+    let meta = helios_protocol::HeliosWddmAllocMeta {
+        width: res_arg.Width.min(u64::from(u32::MAX)) as u32,
+        height: res_arg.Height,
+        format: 0,
+        pitch,
+        bind_flags: meta_bind_flags(res_arg.Flags) | present_buffer_bind(heap_arg, res_arg),
+        misc_flags: 0,
+        venus_alloc_size: 0,
+        memory_type_index: 0,
+        dxgi_format: res_arg.Format as u32,
+        plane_offset: foreign.map_or(0, |f| u64::from(f.offset)),
+    };
+    let mut private = ForeignAllocPrivate {
+        alloc: match foreign {
+            // zero-copy-present.md 10.2: DEVICE_MEMORY adopting the foreign resid,
+            // the vendor RM-export blob type, no blob id, no cache policy.
+            Some(f) => helios_protocol::HeliosWddmAllocPrivate::new(
+                helios_protocol::HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+                f.ctx_id,
+                0,
+                f.size,
+                helios_protocol::HELIOS_BLOB_MEM_RM_EXPORT,
+                0,
+                0,
+                f.resource_id,
+            ),
+            // A KMD-backed placeholder (the D3D11 driver's NVK fallback shape).
+            None => helios_protocol::HeliosWddmAllocPrivate::new(
+                helios_protocol::HELIOS_WDDM_ALLOC_KIND_STANDARD,
+                0,
+                0,
+                size,
+                helios_protocol::VIRTIO_GPU_BLOB_MEM_HOST3D,
+                helios_protocol::VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+                helios_protocol::VIRTIO_GPU_MAP_CACHE_CACHED,
+                0,
+            ),
+        },
+        meta,
+        layout: match foreign {
+            Some(f) => helios_protocol::HeliosWddmAllocLayout {
+                modifier: f.modifier,
+                magic: helios_protocol::HELIOS_WDDM_LAYOUT_MAGIC,
+                version: helios_protocol::HELIOS_WDDM_LAYOUT_VERSION,
+                fourcc: f.fourcc,
+                stride: f.stride,
+                plane_offset: f.offset,
+                reserved: 0,
+            },
+            None => helios_protocol::HeliosWddmAllocLayout {
+                modifier: 0,
+                magic: 0,
+                version: 0,
+                fourcc: 0,
+                stride: 0,
+                plane_offset: 0,
+                reserved: 0,
+            },
+        },
+    };
+    if !candidate {
+        L4_REFUSALS.nvk_committed_placeholder.bump();
+    } else if foreign.is_none() {
+        note_refusal(&L4_REFUSALS.nvk_primary_placeholder);
+        let n = L4_REFUSALS.nvk_primary_placeholder.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "L4: NVK present candidate {:#x} has no KMD resource id (IMPORT_RM \
+                 unavailable) -- KMD placeholder allocation, scanout present only. \
+                 {}x{} fmt={} (x{n})",
+                engine_resource,
+                res_arg.Width,
+                res_arg.Height,
+                res_arg.Format,
+            );
+        }
+    }
+
+    if dev.um_callbacks.is_null() {
+        note_refusal(&L4_REFUSALS.allocate_cb_missing);
+        return Err(E_FAIL);
+    }
+    let Some(allocate_cb) = (unsafe { (*dev.um_callbacks).pfnAllocateCb }) else {
+        note_refusal(&L4_REFUSALS.allocate_cb_missing);
+        return Err(E_FAIL);
+    };
+    let private_ptr = core::ptr::from_mut(&mut private).cast::<c_void>();
+    // 128 bytes (with the layout trailer) only for a foreign adoption; a
+    // placeholder sends the 96-byte prefix every other allocation sends.
+    let private_size = if foreign.is_some() {
+        helios_protocol::HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES as u32
+    } else {
+        core::mem::offset_of!(ForeignAllocPrivate, layout) as u32
+    };
+    let mut allocation_info = ddi12::D3D12DDI_ALLOCATION_INFO_0022 {
+        hAllocation: 0,
+        pSystemMem: core::ptr::null(),
+        pPrivateDriverData: private_ptr,
+        PrivateDriverDataSize: private_size,
+        VidPnSourceId: 0,
+        Flags: ddi12::D3D12DDI_ALLOCATION_INFO_FLAGS_0022_D3D12DDI_ALLOCATION_INFO_FLAGS_0022_NONE,
+        GpuVirtualAddress: 0,
+        Priority: 0,
+        Reserved: [0; 5],
+    };
+    let mut alloc = ddi12::D3D12DDICB_ALLOCATE_0022 {
+        pPrivateDriverData: private_ptr,
+        PrivateDriverDataSize: private_size,
+        hResource: h_rt_resource.handle,
+        hKMResource: 0,
+        NumAllocations: 1,
+        pAllocationInfo: core::ptr::from_mut(&mut allocation_info),
+    };
+    // SAFETY: runtime callback; every pointer addresses live locals.
+    let hr = unsafe { allocate_cb(dev.h_rt_device, core::ptr::from_mut(&mut alloc)) };
+    if hr < 0 || allocation_info.hAllocation == 0 {
+        note_refusal(&L4_REFUSALS.allocate_cb_failed);
+        log_error!(
+            "L4: NVK pfnAllocateCb FAILED hr={:#010x} alloc={:#x} for primary {:#x} (foreign res_id {} size {})",
+            hr as u32,
+            allocation_info.hAllocation,
+            engine_resource,
+            foreign.map_or(0, |f| f.resource_id),
+            size,
+        );
+        return Err(if hr < 0 { hr } else { E_FAIL });
+    }
+    let h_allocation = allocation_info.hAllocation;
+
+    if let Some(f) = foreign {
+        // SAFETY: the live engine resource; the allocation adopted its id.
+        let transferred = unsafe { dev.engine.transfer_resource_ownership(engine_resource) };
+        if transferred != f.resource_id {
+            note_refusal(&L4_REFUSALS.ownership_transfer_failed);
+            log_error!(
+                "L4: NVK ownership transfer FAILED for primary {:#x}: res_id {} handed back {} -- \
+                 rolling the allocation back",
+                engine_resource,
+                f.resource_id,
+                transferred,
+            );
+            unsafe { deallocate_adopted(dev, h_allocation, DeallocateForm::ByHandleList) };
+            return Err(E_FAIL);
+        }
+    }
+
+    let identity = identity12::AllocationIdentity {
+        engine_resource,
+        vk_memory: foreign.map_or(0, |f| f.vk_memory),
+        memory_offset: 0,
+        memory_size: size,
+        venus_res_id: foreign.map_or(0, |f| f.resource_id),
+        venus_alloc_size: foreign.map_or(0, |f| f.size),
+        memory_type_index: foreign.map_or(0, |f| f.memory_type_index),
+        h_allocation,
+        h_km_resource: alloc.hKMResource,
+        h_rt_resource: h_rt_resource.handle as usize,
+        ctx_id: foreign.map_or(0, |f| f.ctx_id),
+        geometry: identity12::IdentityGeometry {
+            width: res_arg.Width,
+            height: res_arg.Height,
+            depth_or_array_size: res_arg.DepthOrArraySize,
+            mip_levels: res_arg.MipLevels,
+            sample_count: res_arg.SampleDesc.Count,
+            dxgi_format: res_arg.Format as u32,
+        },
+        pitch,
+        heap_flags: heap_arg.Flags as u32,
+    };
+    match identity12::record(identity) {
+        identity12::RecordOutcome::Inserted | identity12::RecordOutcome::Replaced => {
+            L4_REFUSALS.identity_recorded.bump();
+            if foreign.is_some() {
+                L4_REFUSALS.nvk_primary_adopted.bump();
+            }
+        }
+        _ => {
+            note_refusal(&L4_REFUSALS.identity_registry_alloc_failed);
+            unsafe { deallocate_adopted(dev, h_allocation, DeallocateForm::ByHandleList) };
+            return Err(E_FAIL);
+        }
+    }
+    let n = L4_REFUSALS.nvk_primary_adopted.get();
+    if foreign.is_some() && n <= LOG_BUDGET {
+        log_error!(
+            "L4: NVK primary adopted res={:#x} alloc={:#x} foreign_res_id={} ctx={} {}x{} pitch={} \
+             modifier={:#x} size={} fmt={} (x{n})",
+            engine_resource,
+            h_allocation,
+            identity.venus_res_id,
+            identity.ctx_id,
+            res_arg.Width,
+            res_arg.Height,
+            pitch,
+            foreign.map_or(0, |f| f.modifier),
+            size,
+            res_arg.Format,
+        );
+    }
+    Ok(())
+}
+
 unsafe fn deallocate_adopted(
     dev: &HeliosD3D12Device,
     h_allocation: ddi12::D3DKMT_HANDLE,
@@ -2326,8 +2680,20 @@ unsafe fn create_fused_heap_and_resource(
     // dedicated import needs to decode the tiles -- without it RADV imports the
     // buffer as LINEAR and every D3D12 present shows as horizontal stripes on
     // AMD (2026-09-09, vkd3d fork `d3d12_heap_helios_allocate_pending`).
-    engine_heap_flags |= HELIOS_HEAP_FLAG_VENUS_EXPORT;
-    L4_REFUSALS.committed_venus_export.bump();
+    if !dev.engine.is_nvk() {
+        engine_heap_flags |= HELIOS_HEAP_FLAG_VENUS_EXPORT;
+        L4_REFUSALS.committed_venus_export.bump();
+    } else if nvk_present_candidate(heap_arg, res_arg) {
+        // S5 (dxvk-on-nvk): on NVK the export request makes NVK allocate the
+        // memory standalone and uncompressed, dedicated to the texture, so it can
+        // mint a KMD resource id (vkd3d patch 0002). The runtime never says which
+        // fused resource is a back buffer (above), so only resources a flip-model
+        // swap chain can be made of get it; everything else keeps NVK's ordinary
+        // (compressible, suballocated) memory and a one-page KMD placeholder
+        // allocation (`adopt_committed_allocation_nvk`).
+        engine_heap_flags |= HELIOS_HEAP_FLAG_VENUS_EXPORT;
+        L4_REFUSALS.nvk_present_candidates.bump();
+    }
 
     let engine_heap_desc = D3D12_HEAP_DESC {
         SizeInBytes: heap_arg.ByteSize,
@@ -4421,6 +4787,16 @@ struct L4Refusals {
     /// The dynamic allocation-identity registry could not reserve another entry.
     /// Expected 0; the just-created WDDM allocation is rolled back.
     identity_registry_alloc_failed: RefusalCounter,
+    /// S5: fused resources on NVK that may be swap-chain buffers and got the
+    /// export request (standalone, uncompressed NVK memory). A census.
+    nvk_present_candidates: RefusalCounter,
+    /// S5: fused resources on NVK given a one-page KMD placeholder allocation.
+    nvk_committed_placeholder: RefusalCounter,
+    /// S5: present candidates on NVK without a KMD resource id (IMPORT_RM closed):
+    /// scanout present only. Expected zero with an IMPORT_RM-serving KMD.
+    nvk_primary_placeholder: RefusalCounter,
+    /// S5: present candidates that adopted their NVK-minted resource id.
+    nvk_primary_adopted: RefusalCounter,
 }
 
 static L4_REFUSALS: L4Refusals = L4Refusals {
@@ -4490,6 +4866,10 @@ static L4_REFUSALS: L4Refusals = L4Refusals {
     meta_bind_flag_unknown: RefusalCounter::new("MetaBindFlagUnknown"),
     committed_venus_export: RefusalCounter::new("CommittedVenusExport"),
     identity_registry_alloc_failed: RefusalCounter::new("IdentityRegistryAllocFailed"),
+    nvk_present_candidates: RefusalCounter::new("Nvk12PresentCandidates"),
+    nvk_committed_placeholder: RefusalCounter::new("Nvk12CommittedPlaceholder"),
+    nvk_primary_placeholder: RefusalCounter::new("Nvk12PrimaryPlaceholder"),
+    nvk_primary_adopted: RefusalCounter::new("Nvk12PrimaryAdopted"),
 };
 
 /// L4's refusal set, printed by `crate::log_refusal_summary` at this lane's
@@ -4569,4 +4949,8 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L4_REFUSALS.meta_bind_flag_unknown,
     &L4_REFUSALS.committed_venus_export,
     &L4_REFUSALS.identity_registry_alloc_failed,
+    &L4_REFUSALS.nvk_present_candidates,
+    &L4_REFUSALS.nvk_committed_placeholder,
+    &L4_REFUSALS.nvk_primary_placeholder,
+    &L4_REFUSALS.nvk_primary_adopted,
 ];

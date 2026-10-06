@@ -13,7 +13,9 @@
 # WIN_SSH (required: the VM's SSH destination), WIN_PORT (2222), WIN_ROOT
 # (W:), OUT (dist/windows-driver/<Configuration> in the checkout), WIN_SRC
 # (another checkout or worktree whose guest/windows to build; the build
-# scripts in ci/vm still come from this one), CLEAN (0).
+# scripts in ci/vm still come from this one), CLEAN (0), NVK_ARTIFACT (NVK
+# and Zink as guest/nvk-rm/windows/stage-helios-package.sh stages them;
+# default dist/nvk-windows in this checkout).
 set -euo pipefail
 config=${1:-Release}
 case "$config" in Release|Debug) ;; *) echo "usage: $0 [Release|Debug]" >&2; exit 2 ;; esac
@@ -22,7 +24,7 @@ conf=${WIN_BUILD_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/conduit/win-build.env}
 if [ -f "$conf" ]; then
     # What the environment sets wins over the file.
     declare -A from_env=()
-    for k in WIN_SSH WIN_PORT WIN_ROOT OUT WIN_SRC CLEAN; do
+    for k in WIN_SSH WIN_PORT WIN_ROOT OUT WIN_SRC CLEAN NVK_ARTIFACT; do
         if [ -n "${!k+x}" ]; then from_env[$k]=${!k}; fi
     done
     # shellcheck source=/dev/null
@@ -97,6 +99,15 @@ mv "$manifest.new" "$manifest"
 if [ "$repo" != "$self" ]; then
     tar -C "$self" -cf - guest/windows/ci/vm | ssh_win "tar -xf - -C $root\\src"
 fi
+
+nvk=${NVK_ARTIFACT:-$self/dist/nvk-windows}
+if [ ! -f "$nvk/vulkan_nouveau.dll" ] || [ ! -f "$nvk/helios_gl32.dll" ]; then
+    echo "no NVK/Zink files in $nvk; run guest/nvk-rm/windows/stage-helios-package.sh (or set NVK_ARTIFACT)" >&2
+    exit 1
+fi
+echo "==> copying NVK and Zink ($nvk) to $root\\nvk"
+ssh_win "if (Test-Path $root\\nvk) { Remove-Item -Recurse -Force $root\\nvk }; New-Item -ItemType Directory -Force $root\\nvk | Out-Null"
+tar -C "$nvk" -cf - . | ssh_win "tar -xf - -C $root\\nvk"
 
 echo "==> building $config in the VM"
 # PowerShell 7, as windows.yml's `shell: pwsh` steps.

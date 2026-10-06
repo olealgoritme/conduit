@@ -33,7 +33,9 @@ mod tables;
 mod tiles;
 mod transfer;
 mod vehicle;
+mod video;
 mod views;
+mod wddm2;
 
 pub(super) use crate::bridge::{DstRes, PresentStreamCorrelation, SrcRes};
 pub(super) use alloc::{ScanoutGeometry, VenusBacking};
@@ -54,7 +56,11 @@ pub(crate) use tables::*;
 pub(crate) use tiles::*;
 pub(crate) use transfer::*;
 pub(crate) use vehicle::*;
+pub(crate) use video::{
+    decoder_buffer_desc, decoder_buffer_map_type, retrieve_sub_object, video_ddi_enabled,
+};
 pub(crate) use views::*;
+pub(crate) use wddm2::*;
 // NOT re-exported: `boxed_slot` is `pub(super)` in `handles` and its
 // `BoxedHandle` bound names types (`ResourceState`, `RtvState`, `LayoutData`)
 // that are private to this subtree, so a `pub(super)` re-export would leak

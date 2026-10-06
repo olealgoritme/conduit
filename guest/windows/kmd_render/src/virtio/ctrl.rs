@@ -53,6 +53,7 @@
 
 use core::cell::Cell;
 use core::mem::size_of;
+use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicU32;
 
@@ -61,16 +62,20 @@ use wdk_sys::ntddk::{KeDelayExecutionThread, KeQueryInterruptTimePrecise, KeWait
 use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::gpu::{
-    BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner, FenceWaitPrep,
+    BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner, FenceWaitPrep, InFlight,
     OwnerFilter, SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, CTRL_TEARDOWN_ABANDONS,
-    CTRL_TIMEOUT_COUNT, ESCAPE_SUBMIT_COUNT, ESCAPE_SUBMIT_RING_COUNT, FENCE_WAIT_TABLE_FULL,
+    CTRL_TIMEOUT_COUNT, ESCAPE_SUBMIT_CALLS, ESCAPE_SUBMIT_COUNT, ESCAPE_SUBMIT_RING_COUNT,
+    FENCE_WAIT_TABLE_FULL,
     FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
 use crate::adapter::AdapterContext;
+use crate::error::NotStarted;
 use crate::irql::PassiveLevel;
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
+use helios_kmd_logic::sweep_budget::SweepBudget;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
     VirtioGpuGetCapsetInfo, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
@@ -248,8 +253,21 @@ fn wait_block(
 /// Reap completed entries at PASSIVE and retain their DMA buffers for reuse.
 /// `MmAllocateContiguousMemory` per tiny Venus submission dominated DWM's
 /// command rate; recycling page-backed buffers removes that steady-state cost.
-pub fn reap_parked(_passive: PassiveLevel, adapter: &AdapterContext) {
+pub fn reap_parked(passive: PassiveLevel, adapter: &AdapterContext) {
     let work = adapter.with_virtio(|v| v.begin_parked_reap());
+    reap_parked_work(passive, adapter, work);
+}
+
+/// The rest of [`reap_parked`] for a caller that took the `begin_parked_reap`
+/// result inside a `with_virtio` hold it needed anyway (`raw_roundtrip` does it
+/// in the same hold as its pool take, one lock instead of two). Whatever `work`
+/// holds MUST be passed here, or `reap_in_progress` stays set and reaping is
+/// disabled for good (see `abort_parked_reap`).
+fn reap_parked_work(
+    _passive: PassiveLevel,
+    adapter: &AdapterContext,
+    work: Result<Option<(Vec<InFlight>, Vec<DmaBuffer>)>, NotStarted>,
+) {
     let Ok(Some((mut dead, mut buffers))) = work else {
         return;
     };
@@ -455,6 +473,304 @@ fn ctrl_roundtrip(
     })
 }
 
+/// Replies up to this many bytes (the capacity the device is told it may write)
+/// land in a buffer on the caller's stack instead of the heap. 1 KiB covers the
+/// reply of almost every RM call (header, `IoctlResp`, a few hundred bytes of
+/// parameters) and is small next to a 24 KiB kernel stack.
+const RAW_REPLY_STACK: usize = 1024;
+
+/// `NvSpinUs` as read from the service key (clamped), or `u32::MAX` while unread.
+/// Read at StartDevice ([`reread_spin_knob`]) and, if unread, at the first forward (PASSIVE);
+/// mirrored as `NvSpinUs` on every read.
+static NVRM_SPIN_US: AtomicU32 = AtomicU32::new(u32::MAX);
+/// The spin governor's packed state (`helios_kmd_logic::nvrm_fastpath::spin`).
+/// Plain load / store, never a read-modify-write: it is a heuristic, a lost
+/// update costs nothing, and a locked instruction on a line every forwarding
+/// thread shares is exactly what this path is trying to stop paying.
+static NVRM_SPIN_STATE: AtomicU32 =
+    AtomicU32::new(helios_kmd_logic::nvrm_fastpath::spin::initial());
+/// Forwards whose pre-wait spin saw the reply (`NvSpinHit`) and whose spin gave up
+/// (`NvSpinMis`). `hit / (hit + miss)` is the governor's input; both flat at 0
+/// with forwards running means the spin is off (`NvSpinUs = 0`).
+pub static NVRM_SPIN_HITS: AtomicU32 = AtomicU32::new(0);
+pub static NVRM_SPIN_MISSES: AtomicU32 = AtomicU32::new(0);
+/// `BlbAbandoned`: blob teardowns of a destroyed device that were not sent to the host
+/// because an earlier blob of the same device was ambiguous (a blit still in flight, a
+/// failed release): the ambiguous one itself and every blob taken out of the table after it
+/// (`release_blobs_for_owner_within`). Must read 0 on a healthy session.
+pub static BLOB_SWEEP_ABANDONED: AtomicU32 = AtomicU32::new(0);
+
+/// Read `NvSpinUs` (clamped), cache it and mirror it. PASSIVE.
+fn read_spin_knob() -> u32 {
+    use helios_kmd_logic::nvrm_fastpath::spin;
+    let us = crate::diag::read_config_dword(crate::diag::knobs::NV_SPIN_US, spin::BUDGET_US_DEFAULT)
+        .min(spin::BUDGET_US_MAX);
+    NVRM_SPIN_US.store(us, Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"NvSpinUs", us);
+    us
+}
+
+/// Forget the cached `NvSpinUs` and read it again (StartDevice, PASSIVE): the static outlives a
+/// `pnputil /restart-device`, and this knob used to need a driver reload.
+pub(crate) fn reread_spin_knob() -> u32 {
+    read_spin_knob()
+}
+
+/// The pre-wait spin budget in 100 ns units; 0 = disabled by the knob.
+fn nvrm_spin_budget_100ns(_passive: PassiveLevel) -> u64 {
+    use helios_kmd_logic::nvrm_fastpath::spin;
+    let mut us = NVRM_SPIN_US.load(Ordering::Relaxed);
+    if us == u32::MAX {
+        us = read_spin_knob();
+    }
+    spin::budget_100ns(us)
+}
+
+/// Poll `block` for up to `budget_100ns`, at PASSIVE with no lock held, and
+/// return whether the drain was seen starting to complete it.
+///
+/// This is a HINT and nothing leaves on it: whatever it returns, the caller goes
+/// on to [`wait_block`], whose `KeWaitForSingleObject` is still the only
+/// completion-side exit (see its doc for why a lock-free `done` read must not be
+/// one). What the spin buys is that a reply landing within a few microseconds
+/// finds the waiter running: the wait then returns at once, without arming a
+/// timer, switching context, or waking a halted vCPU. The drain is driven by the
+/// device interrupt as always; this never touches the transport or its lock, so
+/// it cannot hold up the DPC that completes the call.
+/// Most clock-read rounds one pre-wait spin may take (each round is
+/// `POLLS_PER_CLOCK_READ` polls and one clock read): far above what a 50 us budget
+/// needs even on a slow emulated timer, far below an unbounded spin.
+const SPIN_MAX_ROUNDS: u32 = 20_000;
+
+fn spin_for_completion(block: &WaitBlockRef<'_>, budget_100ns: u64) -> bool {
+    /// Polls between two clock reads: the clock read costs more than a poll.
+    const POLLS_PER_CLOCK_READ: u32 = 8;
+    let mut qpc = 0u64;
+    // SAFETY: a scalar time read, callable at any IRQL; it waits on nothing and
+    // fills the valid out-pointer.
+    let start = unsafe { KeQueryInterruptTimePrecise(&mut qpc) };
+    // A hard cap on top of the clock: should the interrupt clock ever fail to
+    // advance, this must not become an unbounded spin on the path of every forward.
+    let mut rounds = 0u32;
+    loop {
+        rounds += 1;
+        if rounds > SPIN_MAX_ROUNDS {
+            return block.spin_hint_done();
+        }
+        for _ in 0..POLLS_PER_CLOCK_READ {
+            if block.spin_hint_done() {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        // SAFETY: as above.
+        let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc) };
+        if now.wrapping_sub(start) >= budget_100ns {
+            return block.spin_hint_done();
+        }
+    }
+}
+
+/// Forward one RM message VERBATIM and wait for the reply (HELIOS_ESCAPE_NVRM).
+///
+/// `req` is `MsgHeader | payload` exactly as the caller built it — nothing is
+/// stamped or interpreted here — and the device's reply (`MsgHeader | payload`,
+/// or the header-less stream of `GetSysFiles`) is written into `resp_out`, whose
+/// length is the capacity the device is given. Returns how many reply bytes the
+/// device wrote, which is never 0 on success.
+///
+/// The drain runs at DISPATCH under the device lock, so it cannot be trusted to
+/// write `resp_out` (the runtime's copy of the escape's private data, whose
+/// paging is not ours to assume): it copies the reply into a driver-owned
+/// non-paged buffer instead (see `InFlightKind::Raw`), and the copy into
+/// `resp_out` happens here, at PASSIVE, after the wake. That buffer is on this
+/// frame for a reply up to [`RAW_REPLY_STACK`] bytes (the same standing the
+/// `SyncWaitBlock`'s own response bytes have: the drain writes it only under the
+/// lock and only while `waiter` is still set, and `abandon_sync` clears `waiter`
+/// under that lock before this frame can pop), and otherwise on the heap. It is
+/// never zero-filled: the drain writes exactly the bytes it reports in `used`,
+/// and only those are read back.
+///
+/// A timeout abandons the entry; its eventual completion neither copies nor
+/// signals. An RM call that outlives `timeout_ms` may still have taken effect on
+/// the host, so the caller must treat the handle as indeterminate.
+pub fn raw_roundtrip(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    resp_out: &mut [u8],
+    timeout_ms: u64,
+) -> Result<usize, VirtioError> {
+    const MH: usize = super::hal::MSG_HDR_LEN;
+    let req_len = req.len();
+    let want = resp_out.len();
+    if req_len < MH || want < MH {
+        return Err(VirtioError::DeviceError);
+    }
+    // What the device is told it may write: one byte more than a bare header, so
+    // the reply is two non-empty descriptors (see `Chain::Raw`).
+    let resp_len = want.max(MH + 1);
+    // The reply's landing buffer, declared before the wait block so it outlives
+    // the abandon path. Heap storage is reserved fallibly — the size is
+    // caller-controlled — and only for a reply that does not fit the stack.
+    let mut stack_reply = MaybeUninit::<[u8; RAW_REPLY_STACK]>::uninit();
+    let mut heap_reply = Vec::<u8>::new();
+    let dest = if resp_len <= RAW_REPLY_STACK {
+        stack_reply.as_mut_ptr() as *mut u8
+    } else {
+        if heap_reply.try_reserve_exact(resp_len).is_err() {
+            return Err(VirtioError::OutOfMemory);
+        }
+        heap_reply.as_mut_ptr()
+    };
+    let Some(dest) = NonNull::new(dest) else {
+        return Err(VirtioError::DeviceError);
+    };
+
+    // One lock hold for what used to be two: whether completed entries wait to be
+    // reaped (almost never now, see `drain_used`'s Raw arm) and a pooled buffer.
+    let total = req_len + resp_len;
+    let (work, pooled) =
+        match adapter.with_virtio(|v| (v.begin_parked_reap(), v.take_dma_buffer(total))) {
+            Ok((work, pooled)) => (Ok(work), pooled),
+            Err(e) => (Err(e), None),
+        };
+    // Finish the reap BEFORE anything below can return, or `reap_in_progress`
+    // stays set (see `reap_parked_work`).
+    reap_parked_work(passive, adapter, work);
+    let mut meta = pooled
+        .or_else(|| DmaBuffer::new(passive, total))
+        .ok_or(VirtioError::OutOfMemory)?;
+    meta.as_mut_slice()[..req_len].copy_from_slice(req);
+
+    let used = SyncWaitBlock::with(|block| {
+        // As in `ctrl_roundtrip`: the buffer is a loop value, handed back by every
+        // refusal arm, so a retry that forgets it does not compile.
+        let mut budget = Budget::new(ENQUEUE_RETRY_MAX_MS);
+        let ticket = loop {
+            let res = adapter.with_virtio(move |v| {
+                v.drain_used();
+                v.enqueue_raw(meta, req_len, resp_len, block.as_ptr(), dest)
+            });
+            match res {
+                Err(_) => return Err(VirtioError::DeviceError), // transport gone
+                Ok(Ok(ticket)) => break ticket,
+                Ok(Err((m_back, VirtioError::QueueFull))) => {
+                    meta = m_back;
+                    if budget.charge_slice() {
+                        return Err(VirtioError::QueueFull);
+                    }
+                    reap_parked(passive, adapter);
+                    sleep_ms(passive, RETRY_SLICE_MS);
+                }
+                Ok(Err((_m, e))) => return Err(e), // buffer dropped at PASSIVE
+            }
+        };
+
+        // A short bounded poll before the real wait (see `spin_for_completion`).
+        {
+            use helios_kmd_logic::nvrm_fastpath::spin;
+            let state = NVRM_SPIN_STATE.load(Ordering::Relaxed);
+            if spin::should_spin(state) {
+                let spin_budget = nvrm_spin_budget_100ns(passive);
+                if spin_budget != 0 {
+                    let hit = spin_for_completion(block, spin_budget);
+                    let fresh = NVRM_SPIN_STATE.load(Ordering::Relaxed);
+                    NVRM_SPIN_STATE.store(spin::next(fresh, true, hit), Ordering::Relaxed);
+                    let counter = if hit {
+                        &NVRM_SPIN_HITS
+                    } else {
+                        &NVRM_SPIN_MISSES
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                NVRM_SPIN_STATE.store(spin::next(state, false, false), Ordering::Relaxed);
+            }
+        }
+
+        if !wait_block(passive, adapter, block, timeout_ms) {
+            match adapter.with_virtio(|v| {
+                v.drain_used();
+                v.abandon_sync(ticket, block.as_ptr())
+            }) {
+                // The drain already completed it; the reply is in `dest`.
+                Ok(SyncOutcome::AlreadyCompleted) => {}
+                Ok(SyncOutcome::Abandoned) => {
+                    CTRL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    return Err(VirtioError::Timeout);
+                }
+                Ok(SyncOutcome::NotOurs) => return Err(VirtioError::DeviceError),
+                Err(_) => return Err(VirtioError::DeviceError),
+            }
+        }
+        match block.used() as usize {
+            0 => Err(VirtioError::DeviceError),
+            n => Ok(n),
+        }
+    })?;
+    // PASSIVE: now the reply may go to the caller's buffer. `used` is what the
+    // drain copied into `dest` and is at most `resp_len`, the size of `dest`.
+    let n = used.min(want);
+    // SAFETY: the drain initialised the first `used >= n` bytes of `dest` (and
+    // no other writer exists once the wait was satisfied or the abandon found the
+    // entry completed); `dest` and `resp_out` are distinct allocations; `n` is at
+    // most both lengths.
+    unsafe { core::ptr::copy_nonoverlapping(dest.as_ptr(), resp_out.as_mut_ptr(), n) };
+    Ok(n)
+}
+
+/// Submit one RM message VERBATIM and do NOT wait for the reply (`ForeignFlip`'s pipelined
+/// `ScanoutFlip`, `helios_kmd_logic::flip_pipeline`). `req` is `MsgHeader | payload` as for
+/// [`raw_roundtrip`]; the reply is a bare header whose `status` the used-ring drain turns into
+/// ONE word, `cell` (tagged `tag`: `flip_pipeline::pack_reply` / `pack_no_reply`), before it
+/// signals the HPD worker's event. The caller zeroes `cell` BEFORE the call and settles it
+/// later (`virtio/foreign_flip.rs`).
+///
+/// PASSIVE, one attempt: a full queue is returned as `QueueFull` at once (no sleeping retry
+/// loop as the round trip has; the worker keeps the frame owed and comes back), an allocation
+/// failure as `OutOfMemory`. On every error return nothing reached the ring and `cell` is
+/// untouched. `cell` must be `'static` (it is read by the drain after this returns).
+pub fn raw_submit_async(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    cell: &'static core::sync::atomic::AtomicU64,
+    tag: u32,
+) -> Result<(), VirtioError> {
+    const MH: usize = super::hal::MSG_HDR_LEN;
+    let req_len = req.len();
+    if req_len < MH {
+        return Err(VirtioError::DeviceError);
+    }
+    // A bare header plus one more descriptor's worth, as `raw_roundtrip` gives a header-only
+    // reply (see `Chain::Raw`); the drain reads only the header's `status`.
+    let resp_len = 2 * MH;
+    let total = req_len + resp_len;
+    let (work, pooled) =
+        match adapter.with_virtio(|v| (v.begin_parked_reap(), v.take_dma_buffer(total))) {
+            Ok((work, pooled)) => (Ok(work), pooled),
+            Err(e) => (Err(e), None),
+        };
+    reap_parked_work(passive, adapter, work);
+    let mut meta = pooled
+        .or_else(|| DmaBuffer::new(passive, total))
+        .ok_or(VirtioError::OutOfMemory)?;
+    meta.as_mut_slice()[..req_len].copy_from_slice(req);
+    let wake = NonNull::new(adapter.hpd_event.get()).ok_or(VirtioError::DeviceError)?;
+    let cell = NonNull::from(cell);
+    let queued = adapter.with_virtio(move |v| {
+        v.drain_used();
+        v.enqueue_raw_async(meta, req_len, resp_len, cell, tag, wake)
+    });
+    match queued {
+        Ok(Ok(())) => Ok(()),
+        // The buffer comes back here, at PASSIVE, to be dropped.
+        Ok(Err((_meta, e))) => Err(e),
+        Err(_) => Err(VirtioError::DeviceError),
+    }
+}
+
 /// Round-trip expecting a bare `VirtioGpuCtrlHdr` response; checks RESP_OK.
 fn ctrl_roundtrip_ok(
     passive: PassiveLevel,
@@ -475,16 +791,28 @@ fn ctrl_roundtrip_ok_seq(
     extra: Option<&[u8]>,
     bind: Option<BindMint<'_>>,
 ) -> Result<(), VirtioError> {
-    let mut resp = [0u8; size_of::<VirtioGpuCtrlHdr>()];
-    ctrl_roundtrip(
+    ctrl_roundtrip_ok_timed(
         passive,
         adapter,
         req,
         extra,
-        &mut resp,
-        SYNC_ROUNDTRIP_TIMEOUT_MS,
         bind,
-    )?;
+        SYNC_ROUNDTRIP_TIMEOUT_MS,
+    )
+}
+
+/// [`ctrl_roundtrip_ok_seq`] with an explicit wait budget, for the teardown
+/// sweeps that must not wait the full 30 s on a host that is not answering.
+fn ctrl_roundtrip_ok_timed(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    extra: Option<&[u8]>,
+    bind: Option<BindMint<'_>>,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
+    let mut resp = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+    ctrl_roundtrip(passive, adapter, req, extra, &mut resp, timeout_ms, bind)?;
     let resp_type = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
     if resp_is_ok(resp_type) {
         Ok(())
@@ -578,6 +906,29 @@ pub fn ctx_destroy(
     owner: Option<DeviceOwner>,
     ctx_id: u32,
 ) -> Result<(), VirtioError> {
+    ctx_destroy_within(passive, adapter, owner, ctx_id, None)
+}
+
+/// How long the next command of a teardown sweep may wait: the whole synchronous
+/// timeout when there is no budget, the budget's per-call allowance otherwise,
+/// and `None` once the budget is spent (send nothing more).
+fn sweep_timeout_ms(budget: Option<&SweepBudget>) -> Option<u64> {
+    match budget {
+        None => Some(SYNC_ROUNDTRIP_TIMEOUT_MS),
+        Some(b) => b.call_timeout_ms(crate::adapter::foreign_scanout::now_100ns()),
+    }
+}
+
+/// [`ctx_destroy`] under an optional [`SweepBudget`]. With the budget spent the
+/// context is still untracked (the table entry goes) but no `CTX_DESTROY` is sent;
+/// the transport reset that follows a StopDevice sweep reclaims it.
+pub fn ctx_destroy_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: Option<DeviceOwner>,
+    ctx_id: u32,
+    budget: Option<&SweepBudget>,
+) -> Result<(), VirtioError> {
     let owned = adapter
         .with_wddm_notify_lock(|guard| {
             guard.with_virtio(|order, v| {
@@ -599,11 +950,18 @@ pub fn ctx_destroy(
     let mut cmd = VirtioGpuCtxDestroy::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
     cmd.hdr.ctx_id = ctx_id;
-    let result = ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None);
+    let result = match sweep_timeout_ms(budget) {
+        Some(timeout_ms) => {
+            ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
+        }
+        None => Err(VirtioError::Timeout),
+    };
     if result.is_ok() {
         let finalized = adapter.with_wddm_notify_lock(|guard| {
             guard
-                .with_virtio(|_order, v| v.finalize_closed_present_streams_for_context(ctx_id))
+                .with_virtio(|order, v| {
+                    v.finalize_closed_present_streams_for_context(order, ctx_id)
+                })
                 .unwrap_or(0)
         });
         if finalized != 0 {
@@ -621,8 +979,9 @@ pub fn ctx_destroy_kmd(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
+    budget: Option<&SweepBudget>,
 ) -> Result<(), VirtioError> {
-    ctx_destroy(passive, adapter, None, ctx_id)
+    ctx_destroy_within(passive, adapter, None, ctx_id, budget)
 }
 
 /// `CTX_DESTROY` every context still owned by `owner` (device teardown).
@@ -653,7 +1012,9 @@ pub fn destroy_contexts_for_owner(
         if ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None).is_ok() {
             let finalized = adapter.with_wddm_notify_lock(|guard| {
                 guard
-                    .with_virtio(|_order, v| v.finalize_closed_present_streams_for_context(ctx_id))
+                    .with_virtio(|order, v| {
+                        v.finalize_closed_present_streams_for_context(order, ctx_id)
+                    })
                     .unwrap_or(0)
             });
             if finalized != 0 {
@@ -678,11 +1039,29 @@ pub fn ctx_attach_resource(
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    ctx_attach_resource_within(
+        passive,
+        adapter,
+        ctx_id,
+        resource_id,
+        SYNC_ROUNDTRIP_TIMEOUT_MS,
+    )
+}
+
+/// [`ctx_attach_resource`] with an explicit wait, for a caller that runs on a thread
+/// StopDevice joins (the HPD worker).
+fn ctx_attach_resource_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    resource_id: u32,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuCtxResource::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
     cmd.hdr.ctx_id = ctx_id;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
 }
 
 /// Detach a resource from a 3D context.
@@ -692,11 +1071,27 @@ pub fn ctx_detach_resource(
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    ctx_detach_resource_within(
+        passive,
+        adapter,
+        ctx_id,
+        resource_id,
+        SYNC_ROUNDTRIP_TIMEOUT_MS,
+    )
+}
+
+fn ctx_detach_resource_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    resource_id: u32,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuCtxResource::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
     cmd.hdr.ctx_id = ctx_id;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
 }
 
 /// Bind a venus blob `resource_id` to scanout 0 (the QEMU gtk/sdl display) via
@@ -866,10 +1261,19 @@ pub fn resource_unref(
     adapter: &AdapterContext,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    resource_unref_within(passive, adapter, resource_id, SYNC_ROUNDTRIP_TIMEOUT_MS)
+}
+
+fn resource_unref_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuResourceUnref::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNREF;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
 }
 
 /// Attach an EXISTING live resource id to a context without taking ownership
@@ -908,6 +1312,50 @@ pub fn resource_create_blob(
     blob_id: u64,
     size: u64,
 ) -> Result<u32, VirtioError> {
+    resource_create_blob_errno(
+        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size, None,
+    )
+}
+
+/// [`resource_create_blob`], plus the host's errno when it refuses the create:
+/// the host reports one only for the RM-export blob type
+/// (`foreign_errno::from_resp_hdr`). With `errno_out == None` this is exactly the
+/// plain call.
+#[allow(clippy::too_many_arguments)]
+fn resource_create_blob_errno(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    errno_out: Option<&mut u32>,
+) -> Result<u32, VirtioError> {
+    resource_create_blob_errno_within(
+        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size, errno_out, None,
+    )
+}
+
+/// [`resource_create_blob_errno`] under an optional [`SweepBudget`]: the create, the
+/// attach and (on an attach that failed) the unref share it, so the whole call is over
+/// when the budget is, and with it spent nothing more is sent (`Timeout`). `None` is
+/// the plain call (each command waits the whole synchronous timeout).
+#[allow(clippy::too_many_arguments)]
+fn resource_create_blob_errno_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    errno_out: Option<&mut u32>,
+    budget: Option<&SweepBudget>,
+) -> Result<u32, VirtioError> {
+    let Some(create_timeout_ms) = sweep_timeout_ms(budget) else {
+        return Err(VirtioError::Timeout);
+    };
     let reserved = adapter
         .with_virtio(|v| v.reserve_resource_slot())
         .map_err(|_| VirtioError::DeviceError)?;
@@ -930,14 +1378,47 @@ pub fn resource_create_blob(
     cmd.nr_entries = 0;
     cmd.blob_id = blob_id;
     cmd.size = size;
-    if let Err(e) = ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None) {
+    let mut resp = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+    let sent = ctrl_roundtrip(
+        passive,
+        adapter,
+        bytes_of(&cmd),
+        None,
+        &mut resp,
+        create_timeout_ms,
+        None,
+    );
+    let created = match sent {
+        Ok(_) => {
+            let t = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+            if resp_is_ok(t) {
+                Ok(())
+            } else {
+                if let Some(e) = errno_out {
+                    *e = helios_kmd_logic::foreign_errno::from_resp_hdr(&resp);
+                }
+                Err(VirtioError::DeviceError)
+            }
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = created {
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
-    if let Err(e) = ctx_attach_resource(passive, adapter, ctx_id, resource_id) {
+    let attached = match sweep_timeout_ms(budget) {
+        Some(timeout_ms) => {
+            ctx_attach_resource_within(passive, adapter, ctx_id, resource_id, timeout_ms)
+        }
+        None => Err(VirtioError::Timeout),
+    };
+    if let Err(e) = attached {
         // The resource exists host-side but could not attach: drop it so it
-        // does not leak untracked.
-        let _ = resource_unref(passive, adapter, resource_id);
+        // does not leak untracked (with the budget spent the transport reset that
+        // follows a stop reclaims it).
+        if let Some(timeout_ms) = sweep_timeout_ms(budget) {
+            let _ = resource_unref_within(passive, adapter, resource_id, timeout_ms);
+        }
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
@@ -957,6 +1438,46 @@ pub fn alloc_blob(
     size: u64,
     owner: Option<DeviceOwner>,
 ) -> Result<u32, VirtioError> {
+    alloc_blob_errno(
+        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size, owner, None,
+    )
+}
+
+/// [`alloc_blob`] that also reports the host's errno for a refused create (see
+/// [`resource_create_blob_errno`]).
+#[allow(clippy::too_many_arguments)]
+pub fn alloc_blob_errno(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    owner: Option<DeviceOwner>,
+    errno_out: Option<&mut u32>,
+) -> Result<u32, VirtioError> {
+    alloc_blob_errno_within(
+        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size, owner, errno_out, None,
+    )
+}
+
+/// [`alloc_blob_errno`] under an optional [`SweepBudget`] shared by every command of
+/// the call (create, attach, and the unref of a failed attach): for the KMD's own RM
+/// client, which runs on the HPD worker StopDevice joins for a bounded time.
+#[allow(clippy::too_many_arguments)]
+pub fn alloc_blob_errno_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    owner: Option<DeviceOwner>,
+    errno_out: Option<&mut u32>,
+    budget: Option<&SweepBudget>,
+) -> Result<u32, VirtioError> {
     if size == 0 {
         return Err(VirtioError::DeviceError);
     }
@@ -966,8 +1487,8 @@ pub fn alloc_blob(
     if !reserved {
         return Err(VirtioError::OutOfMemory);
     }
-    match resource_create_blob(
-        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size,
+    match resource_create_blob_errno_within(
+        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size, errno_out, budget,
     ) {
         Ok(resource_id) => {
             let _ = adapter.with_virtio(|v| v.commit_blob(owner, ctx_id, resource_id, size));
@@ -986,6 +1507,7 @@ fn resource_map_blob_roundtrip(
     adapter: &AdapterContext,
     resource_id: u32,
     offset: u64,
+    timeout_ms: u64,
 ) -> Result<u32, VirtioError> {
     let mut cmd = VirtioGpuResourceMapBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
@@ -998,7 +1520,7 @@ fn resource_map_blob_roundtrip(
         bytes_of(&cmd),
         None,
         &mut resp,
-        SYNC_ROUNDTRIP_TIMEOUT_MS,
+        timeout_ms,
         None,
     )?;
     let resp_type = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
@@ -1017,10 +1539,32 @@ pub fn resource_unmap_blob(
     adapter: &AdapterContext,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    resource_unmap_blob_within(passive, adapter, resource_id, SYNC_ROUNDTRIP_TIMEOUT_MS)
+}
+
+/// [`resource_unmap_blob`] under a [`SweepBudget`]: with it spent nothing is sent (`Timeout`).
+pub fn resource_unmap_blob_budgeted(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    budget: &SweepBudget,
+) -> Result<(), VirtioError> {
+    match sweep_timeout_ms(Some(budget)) {
+        Some(timeout_ms) => resource_unmap_blob_within(passive, adapter, resource_id, timeout_ms),
+        None => Err(VirtioError::Timeout),
+    }
+}
+
+fn resource_unmap_blob_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuResourceUnmapBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
 }
 
 /// Map a blob into the host-visible window (idempotent — returns the existing
@@ -1032,6 +1576,20 @@ pub fn map_blob_prepare(
     owner: OwnerFilter,
     resource_id: u32,
 ) -> Result<BlobMapPrep, VirtioError> {
+    map_blob_prepare_within(passive, adapter, owner, resource_id, None)
+}
+
+/// [`map_blob_prepare`] under an optional [`SweepBudget`] (for the KMD's own presenter
+/// on the HPD worker): the wait for a busy slot and the `RESOURCE_MAP_BLOB` round trip
+/// both end with it (`Timeout`); `None` is the plain call. A mapping that already exists
+/// returns at once either way, with no round trip.
+pub fn map_blob_prepare_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: OwnerFilter,
+    resource_id: u32,
+    budget: Option<&SweepBudget>,
+) -> Result<BlobMapPrep, VirtioError> {
     let mut busy = Budget::new(MAP_BUSY_MAX_MS);
     loop {
         let begin = adapter
@@ -1041,13 +1599,25 @@ pub fn map_blob_prepare(
             BlobMapBegin::Mapped(prep) => return Ok(prep),
             BlobMapBegin::Failed(e) => return Err(e),
             BlobMapBegin::Busy => {
-                if busy.charge_slice() {
+                if busy.charge_slice() || sweep_timeout_ms(budget).is_none() {
                     return Err(VirtioError::Timeout);
                 }
                 sleep_ms(passive, RETRY_SLICE_MS);
             }
             BlobMapBegin::Start { offset, len } => {
-                let cache = resource_map_blob_roundtrip(passive, adapter, resource_id, offset);
+                // With the budget spent no host command is sent; the reserved range is
+                // given back by `blob_map_finish` (the host rejected it, as for any
+                // failed map).
+                let cache = match sweep_timeout_ms(budget) {
+                    Some(timeout_ms) => resource_map_blob_roundtrip(
+                        passive,
+                        adapter,
+                        resource_id,
+                        offset,
+                        timeout_ms,
+                    ),
+                    None => Err(VirtioError::Timeout),
+                };
                 let cache_ok = cache.as_ref().ok().copied();
                 let fin = adapter
                     .with_virtio(|v| v.blob_map_finish(resource_id, offset, len, cache_ok))
@@ -1060,7 +1630,12 @@ pub fn map_blob_prepare(
                     BlobMapFinish::SlotGone => {
                         // Owner teardown raced the map: undo the host mapping
                         // and return the reserved range.
-                        let _ = resource_unmap_blob(passive, adapter, resource_id);
+                        let _ = resource_unmap_blob_within(
+                            passive,
+                            adapter,
+                            resource_id,
+                            sweep_timeout_ms(budget).unwrap_or(1),
+                        );
                         let _ = adapter.with_virtio(|v| v.free_window_range_pub(offset, len));
                         Err(VirtioError::DeviceError)
                     }
@@ -1133,8 +1708,13 @@ pub fn map_blob_at(
                     let _ = resource_unmap_blob(passive, adapter, resource_id);
                     let _ = adapter.with_virtio(|v| v.free_window_range_pub(old_offset, old_len));
                 }
-                let cache =
-                    resource_map_blob_roundtrip(passive, adapter, resource_id, window_offset);
+                let cache = resource_map_blob_roundtrip(
+                    passive,
+                    adapter,
+                    resource_id,
+                    window_offset,
+                    SYNC_ROUNDTRIP_TIMEOUT_MS,
+                );
                 let cache_ok = cache.as_ref().ok().copied();
                 let fin = adapter
                     .with_virtio(|v| v.blob_map_finish(resource_id, window_offset, len, cache_ok))
@@ -1163,10 +1743,26 @@ pub fn release_blob_for_owner(
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    release_blob_for_owner_within(passive, adapter, owner, ctx_id, resource_id, None)
+}
+
+/// [`release_blob_for_owner`] under an optional [`SweepBudget`] shared by its commands
+/// (unmap, detach, unref). With the budget spent the slot is still taken out of the
+/// table, but the commands not yet sent are not (the transport reset reclaims the host
+/// side) and the answer is `Timeout`. `None` is the plain call.
+pub fn release_blob_for_owner_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    ctx_id: u32,
+    resource_id: u32,
+    budget: Option<&SweepBudget>,
+) -> Result<(), VirtioError> {
     let taken = adapter
         .with_virtio(|v| v.take_blob_matching(owner, ctx_id, resource_id))
         .map_err(|_| VirtioError::DeviceError)?;
     let Some((res, mapped, map_offset, map_len)) = taken else {
+        crate::virtio::foreign::RELEASE_DUP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return Ok(());
     };
     // A snapshot/DWM resource cannot detach while a deferred WindowedBlt
@@ -1193,15 +1789,22 @@ pub fn release_blob_for_owner(
     });
     terminal?;
     if mapped {
-        let _ = resource_unmap_blob(passive, adapter, res);
+        if let Some(timeout_ms) = sweep_timeout_ms(budget) {
+            let _ = resource_unmap_blob_within(passive, adapter, res, timeout_ms);
+        }
         let _ = adapter.with_virtio(|v| v.free_window_range_pub(map_offset, map_len));
     }
     let first_teardown = adapter
         .with_virtio(|v| v.take_live_resource(res))
         .unwrap_or(false);
     let result = if first_teardown {
-        let _ = ctx_detach_resource(passive, adapter, ctx_id, res);
-        resource_unref(passive, adapter, res)
+        if let Some(timeout_ms) = sweep_timeout_ms(budget) {
+            let _ = ctx_detach_resource_within(passive, adapter, ctx_id, res, timeout_ms);
+        }
+        match sweep_timeout_ms(budget) {
+            Some(timeout_ms) => resource_unref_within(passive, adapter, res, timeout_ms),
+            None => Err(VirtioError::Timeout),
+        }
     } else {
         Ok(())
     };
@@ -1227,7 +1830,25 @@ pub fn release_blobs_for_owner(
     adapter: &AdapterContext,
     owner: Option<DeviceOwner>,
 ) -> u32 {
+    release_blobs_for_owner_within(passive, adapter, owner, None)
+}
+
+/// [`release_blobs_for_owner`] under an optional [`SweepBudget`] (StopDevice's
+/// KMD-owned sweep). Once the budget is spent the remaining slots are still taken
+/// out of the table, but no host command (`UNMAP_BLOB`, detach, unref) is sent for
+/// them: the transport reset that follows reclaims the host side.
+pub fn release_blobs_for_owner_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: Option<DeviceOwner>,
+    budget: Option<&SweepBudget>,
+) -> u32 {
     let mut reclaimed = 0u32;
+    // Set once one blob's teardown was ambiguous (see below): the rest of the owner's table
+    // entries are still taken out, so a dead owner cannot hold blob slots for ever, but they
+    // are not sent to the host (the first ambiguity already says the host or an in-flight
+    // blit cannot be trusted to answer), and only the host-free part runs for them.
+    let mut abandoned = false;
     loop {
         let taken = adapter
             .with_virtio(|v| v.take_blob_for_owner(owner))
@@ -1235,13 +1856,42 @@ pub fn release_blobs_for_owner(
         let Some((ctx_id, res, mapped, map_offset, map_len)) = taken else {
             return reclaimed;
         };
+        if abandoned {
+            // Undispatched windowed blts that name this resource have no host reader: end
+            // them, or each keeps a ledger ticket and one of the 64 token slots for ever.
+            // Nothing else: the host objects stay until the Venus teardown, as for the
+            // blob that was ambiguous.
+            let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
+            // And the resid's claim on the 8-slot read ledger: skipping it leaked one slot
+            // per abandoned blob, until `queue_windowed_blt` could issue no ticket at all.
+            // `note_alloc_retired` pins the claim while a reader is still active and
+            // reclaims it when the last ticket retires, so it is safe for any state.
+            retire_ledger_claim(passive, adapter, res);
+            BLOB_SWEEP_ABANDONED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let terminal = adapter.with_scanout_lifecycle(passive, |lock| {
             let cache_release = lock.with_venus_client(|client| {
                 let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
                 client.release_present_blits_for_resource(adapter, res)
             });
-            if !matches!(cache_release, Ok(Ok(()))) {
-                return false;
+            match cache_release {
+                Ok(Ok(())) => {}
+                // The release itself failed: ambiguous drain, retain (below).
+                Ok(Err(_)) => return false,
+                // `NotStarted`: there is no venus client, so there are no Present
+                // blits cached for this resource to release. StopDevice drops the
+                // client BEFORE this sweep on purpose (its ring/reply mappings are
+                // unmapped first, and the ring blob is itself a KMD blob this sweep
+                // frees), so for that caller this arm is the normal one. Returning
+                // false here instead abandoned the sweep after the first blob had
+                // already been taken out of the table: the rest were never released
+                // (`StopBlobs` always read 0). Only the windowed-blt cancel the
+                // closure would have done remains to do.
+                Err(_) => {
+                    let _ =
+                        adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
+                }
             }
 
             // As in the single-resource path, the worker cannot pass this
@@ -1255,28 +1905,53 @@ pub fn release_blobs_for_owner(
             // The blob tracking entry was intentionally taken first. Retaining
             // the host objects on an ambiguous drain leaks safely until Venus
             // teardown; continuing would detach a possibly in-flight resource.
-            return reclaimed;
+            //
+            // Returning here used to leave every REMAINING blob of the owner in the table
+            // with a dead owner token (the device is being destroyed: nothing will ever
+            // sweep them again) and their windowed blts pending, which fills the blob table
+            // and the 64 WindowedBlt token slots across a few killed processes. The rest
+            // are drained without host commands (`abandoned`, above).
+            abandoned = true;
+            // The ambiguous blob's own ledger claim as well (pinned while its reader is
+            // active, reclaimed when that reader's ticket retires).
+            retire_ledger_claim(passive, adapter, res);
+            BLOB_SWEEP_ABANDONED.fetch_add(1, Ordering::Relaxed);
+            continue;
         }
         if mapped {
-            let _ = resource_unmap_blob(passive, adapter, res);
+            if let Some(timeout_ms) = sweep_timeout_ms(budget) {
+                let _ = resource_unmap_blob_within(passive, adapter, res, timeout_ms);
+            }
             let _ = adapter.with_virtio(|v| v.free_window_range_pub(map_offset, map_len));
         }
         let first_teardown = adapter
             .with_virtio(|v| v.take_live_resource(res))
             .unwrap_or(false);
         if first_teardown {
-            let _ = ctx_detach_resource(passive, adapter, ctx_id, res);
-            let _ = resource_unref(passive, adapter, res);
+            if let Some(timeout_ms) = sweep_timeout_ms(budget) {
+                let _ = ctx_detach_resource_within(passive, adapter, ctx_id, res, timeout_ms);
+            }
+            if let Some(timeout_ms) = sweep_timeout_ms(budget) {
+                let _ = resource_unref_within(passive, adapter, res, timeout_ms);
+            }
         }
         // Same D4b ledger reclaim as `release_blob_for_owner`: this sweep is
         // how a crashed/exited process's snapshot resids reach the ledger at
         // all (`RdOvf` must stay 0 across app restarts). Per-resid acquisition
         // keeps the display worker's lock hold times unchanged during a sweep.
-        adapter.with_scanout_lifecycle(passive, |_lock| {
-            adapter.read_ledger.note_alloc_retired(res);
-        });
+        retire_ledger_claim(passive, adapter, res);
         reclaimed += 1;
     }
+}
+
+/// End `res`'s claim on the D4a read ledger (`ReadLedger::note_alloc_retired`) under the
+/// scanout lifecycle mutex, which serialises the ledger's claim discipline. Every blob
+/// teardown path of `release_blobs_for_owner_within` ends here, the ones that send nothing
+/// to the host included.
+fn retire_ledger_claim(passive: PassiveLevel, adapter: &AdapterContext, res: u32) {
+    adapter.with_scanout_lifecycle(passive, |_lock| {
+        adapter.read_ledger.note_alloc_retired(res);
+    });
 }
 
 /// Drop the KMD-internal (owner-0) blob slot for an allocation at
@@ -1306,6 +1981,38 @@ pub fn forget_allocation_blob(
         return true;
     }
     false
+}
+
+/// Release the host resource an allocation owns, exactly once: drop its blob slot
+/// (and a foreign record), then, only for the first claimant of the live-resource
+/// entry, detach it from `ctx_id` and `RESOURCE_UNREF` it.
+///
+/// The one place both release triggers meet: `DxgkDdiDestroyAllocation` (nothing
+/// open) and the last `DxgkDdiCloseAllocation` of an allocation destroyed while
+/// still open (`ForeignTable::allocation_destroyed` / `close`). The old adopted
+/// arm unref'd unconditionally, which double-freed resources another path had
+/// already reclaimed (QEMU "virgl_cmd_resource_unref: resource does not exist");
+/// `take_live_resource` is the guard. Best-effort on the virtio operations:
+/// teardown must not get stuck, and a context that is already gone just makes the
+/// detach fail. PASSIVE only.
+pub fn release_allocation_resource(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    resource_id: u32,
+) {
+    // `forget_allocation_blob` already OWNS the unmap decision (T6/R915).
+    let _ = forget_allocation_blob(passive, adapter, resource_id);
+    let first_teardown = adapter
+        .with_virtio(|v| v.take_live_resource(resource_id))
+        .unwrap_or(false);
+    if first_teardown {
+        let _ = ctx_detach_resource(passive, adapter, ctx_id, resource_id);
+        let _ = resource_unref(passive, adapter, resource_id);
+    }
+    // `KmdRmClient` = 5: a resource that was the KMD's own RM system memory also owes its
+    // GEM and its RM memory (one atomic load when the service holds nothing).
+    super::rm_client::sysmem::released(passive, adapter, resource_id);
 }
 
 // ── Venus submission ─────────────────────────────────────────────────────────
@@ -1424,30 +2131,31 @@ fn submit_venus_async_inner(
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }
-    // Ownership is resolved under the device lock, the same lock the enqueue
-    // below takes, so a foreign command stream cannot reach another process's
-    // Venus ring. This costs no extra acquisition on the ~89 us submit path.
-    let owned = adapter
-        .with_virtio(|v| v.resolve_owned_ctx(owner, ctx_id))
-        .map_err(|_| VirtioError::DeviceError)?;
-    let Some(owned) = owned else {
-        return Err(VirtioError::NotOwned);
-    };
-    let ctx_id = owned.id();
     if !stream_fits(stream) {
         return Err(VirtioError::DeviceError);
     }
     reap_parked(passive, adapter);
-    let mut meta = adapter
-        .with_virtio(|v| v.take_dma_buffer(SUBMIT_META_BYTES))
-        .ok()
-        .flatten()
+    // Ownership is resolved under the device lock, the same lock the enqueue
+    // below takes, so a foreign command stream cannot reach another process's
+    // Venus ring. The two staging buffers come out of the pool in the SAME hold
+    // (one acquisition instead of three per submit, ~2000 submits/s); a buffer
+    // the pool cannot supply is allocated below at PASSIVE, never under the lock.
+    let staged = adapter
+        .with_virtio(|v| {
+            let owned = v.resolve_owned_ctx(owner, ctx_id)?;
+            let meta = v.take_dma_buffer(SUBMIT_META_BYTES);
+            let venus = v.take_dma_buffer(stream.len());
+            Some((owned, meta, venus))
+        })
+        .map_err(|_| VirtioError::DeviceError)?;
+    let Some((owned, pooled_meta, pooled_venus)) = staged else {
+        return Err(VirtioError::NotOwned);
+    };
+    let ctx_id = owned.id();
+    let mut meta = pooled_meta
         .or_else(|| DmaBuffer::new(passive, SUBMIT_META_BYTES))
         .ok_or(VirtioError::OutOfMemory)?;
-    let mut venus = adapter
-        .with_virtio(|v| v.take_dma_buffer(stream.len()))
-        .ok()
-        .flatten()
+    let mut venus = pooled_venus
         .or_else(|| DmaBuffer::new(passive, stream.len()))
         .ok_or(VirtioError::OutOfMemory)?;
     venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
@@ -1560,6 +2268,12 @@ fn submit_venus_async_inner(
     }
 }
 
+/// Count one received submission escape (`EscCalls`); see
+/// `ESCAPE_SUBMIT_CALLS`. Counted on receipt, accepted or not.
+pub fn count_submit_escape() {
+    ESCAPE_SUBMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// The prologue both per-frame display submitters share: refuse an empty
 /// stream, reap parked buffers, and stage the meta + venus DMA buffers.
 ///
@@ -1620,12 +2334,13 @@ pub fn submit_venus_async_scanout(
     stream: &[u8],
     primary_address: u64,
     ticket: crate::adapter::ProgrammingTicket,
+    keep_on_failure: bool,
 ) -> Result<u64, VirtioError> {
     let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
     // One construction site, on the adapter, so all four pointers necessarily
     // come from the same adapter; and `enqueue_scanout_submit` is the only way
     // to attach it, so it necessarily lands on the ring the drain honours.
-    let notify = adapter.scanout_notify(primary_address, ticket);
+    let notify = adapter.scanout_notify(primary_address, ticket, keep_on_failure);
 
     display_submit_outcome(adapter.with_virtio(move |v| {
         v.drain_used();

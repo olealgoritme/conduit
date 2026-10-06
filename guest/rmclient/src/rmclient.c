@@ -597,6 +597,58 @@ int crm_alloc(crm_client *c, uint32_t parent, uint32_t *object, uint32_t hclass,
     return 0;
 }
 
+int crm_dup_object(crm_client *c, uint32_t parent, uint32_t *object, uint32_t client_src,
+                   uint32_t object_src, uint32_t hclass, uint32_t flags)
+{
+    if (!c || !object || !client_src || !object_src)
+        return -EINVAL;
+    if (parent == 0)
+        parent = c->root;
+
+    uint32_t h = *object;
+    int picked = 0;
+    if (h == 0) {
+        crm_mutex_lock(&c->lock);
+        h = handle_reserve(c);
+        crm_mutex_unlock(&c->lock);
+        if (!h)
+            return -ENOMEM;
+        picked = 1;
+    }
+
+    NVOS55_PARAMETERS p = {
+        .hClient = c->root,
+        .hParent = parent,
+        .hObject = h,
+        .hClientSrc = client_src,
+        .hObjectSrc = object_src,
+        .flags = flags,
+    };
+    int r = esc(c, -1, NV_ESC_RM_DUP_OBJECT, &p, sizeof(p));
+    if (r == 0 && p.status != NV_OK)
+        r = (int)p.status;
+
+    crm_mutex_lock(&c->lock);
+    if (r != 0) {
+        if (picked)
+            handle_unreserve(c, h);
+        crm_mutex_unlock(&c->lock);
+        return r;
+    }
+    struct crm_obj *o = obj_put(c, h, SLOT_USED);
+    if (o) {
+        o->parent = parent;
+        o->hclass = hclass;
+        o->devinst = 0;
+        struct crm_obj *po = obj_find(c, parent);
+        if (po && po->state == SLOT_USED)
+            po->children++;
+    }
+    crm_mutex_unlock(&c->lock);
+    *object = h;
+    return 0;
+}
+
 int crm_free(crm_client *c, uint32_t parent, uint32_t object)
 {
     if (!c || object == 0)

@@ -56,6 +56,17 @@ pub fn level() -> u32 {
     level
 }
 
+/// Forget the cached `DiagLevel` and read it again, mirroring the value in force (`DiagLvl`,
+/// written on every read, 0 included). StartDevice: the static outlives a `pnputil
+/// /restart-device` (the image is not reloaded), so without this a changed `DiagLevel` needed a
+/// reboot. PASSIVE_LEVEL.
+pub fn reread_level() -> u32 {
+    DIAG_LEVEL.store(u32::MAX, Ordering::Relaxed);
+    let level = level();
+    record_named_bytes(b"DiagLvl", level);
+    level
+}
+
 /// `RTL_REGISTRY_SERVICES` — Path is relative to
 /// `\Registry\Machine\System\CurrentControlSet\Services`.
 const RTL_REGISTRY_SERVICES: u32 = 1;
@@ -367,6 +378,28 @@ pub fn sample_tick(ticks: &AtomicU32) -> bool {
     level() >= 1 || n == 1 || n % SAMPLE_EVERY == 0
 }
 
+/// The last value a [`record_named_on_change`] site wrote; starts as "never".
+pub struct NamedLast(core::sync::atomic::AtomicU64);
+
+impl NamedLast {
+    pub const fn new() -> Self {
+        Self(core::sync::atomic::AtomicU64::new(u64::MAX))
+    }
+}
+
+/// A fixed-name outcome value ("what the last operation did") written only
+/// when it differs from the value this name last got, so the registry still
+/// always holds the latest outcome but a steady success costs no synchronous
+/// `RtlWriteRegistryValue` per call. EVERY write of `name` (success and
+/// failure arms alike) must go through the same `last`, or a skipped write
+/// could leave a stale failure code in place. `DiagLevel >= 1` writes always.
+pub fn record_named_on_change(name: &[u8], value: u32, last: &NamedLast) {
+    let prev = last.0.swap(u64::from(value), Ordering::Relaxed);
+    if prev != u64::from(value) || level() >= 1 {
+        record_named_bytes(name, value);
+    }
+}
+
 /// One-shot throttled identity value, for a site with no surrounding block.
 /// Same policy as [`sample_tick`].
 pub fn sample_named(name: &[u8], value: u32, ticks: &AtomicU32) {
@@ -464,6 +497,96 @@ impl CounterBlock {
     }
 }
 
+/// The service key as a native registry path, for `ZwOpenKey`.
+const SERVICE_KEY_PATH: &[u8] =
+    b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\helios_kmd_render";
+
+const fn widen<const N: usize>(ascii: &[u8]) -> [u16; N] {
+    let mut out = [0u16; N];
+    let mut i = 0;
+    while i < N {
+        out[i] = ascii[i] as u16;
+        i += 1;
+    }
+    out
+}
+
+static SERVICE_KEY_PATH_W: [u16; SERVICE_KEY_PATH.len()] =
+    widen::<{ SERVICE_KEY_PATH.len() }>(SERVICE_KEY_PATH);
+
+/// `UNICODE_STRING`, spelled out because `wdk-sys` 0.5 gives no helper to build one
+/// from a static (same reason `kobj.rs` declares its own `Ex*` timer imports).
+#[repr(C)]
+struct NtUnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+/// `OBJECT_ATTRIBUTES` (48 bytes on x64).
+#[repr(C)]
+struct NtObjectAttributes {
+    length: u32,
+    root_directory: *mut core::ffi::c_void,
+    object_name: *mut NtUnicodeString,
+    attributes: u32,
+    security_descriptor: *mut core::ffi::c_void,
+    security_quality_of_service: *mut core::ffi::c_void,
+}
+
+const _: () = assert!(core::mem::size_of::<NtObjectAttributes>() == 48);
+const _: () = assert!(core::mem::size_of::<NtUnicodeString>() == 16);
+
+#[link(name = "ntoskrnl")]
+extern "system" {
+    fn ZwOpenKey(
+        key_handle: *mut *mut core::ffi::c_void,
+        desired_access: u32,
+        object_attributes: *mut NtObjectAttributes,
+    ) -> i32;
+    fn ZwFlushKey(key_handle: *mut core::ffi::c_void) -> i32;
+}
+
+/// `OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE`.
+const OBJ_KEY_ATTRIBUTES: u32 = 0x40 | 0x200;
+/// `KEY_QUERY_VALUE`. `ZwFlushKey` needs no particular access to the handle.
+const KEY_QUERY_VALUE: u32 = 0x1;
+
+/// Force the service key (and so every breadcrumb written to it) to disk.
+///
+/// `RtlWriteRegistryValue` only updates the in-memory hive; the lazy writer would
+/// lose the last values of a stop that bugchecks. This pays one synchronous hive
+/// flush, which is why it is called twice per StopDevice and nowhere else. Best
+/// effort: every failure is ignored.
+///
+/// PASSIVE_LEVEL only (`ZwOpenKey` / `ZwFlushKey` / `ZwClose`).
+pub fn flush_service_key(_passive: crate::irql::PassiveLevel) {
+    let bytes = (SERVICE_KEY_PATH_W.len() * 2) as u16;
+    let mut name = NtUnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: SERVICE_KEY_PATH_W.as_ptr() as *mut u16,
+    };
+    let mut attributes = NtObjectAttributes {
+        length: core::mem::size_of::<NtObjectAttributes>() as u32,
+        root_directory: core::ptr::null_mut(),
+        object_name: &mut name,
+        attributes: OBJ_KEY_ATTRIBUTES,
+        security_descriptor: core::ptr::null_mut(),
+        security_quality_of_service: core::ptr::null_mut(),
+    };
+    let mut key: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: PASSIVE_LEVEL (the token); `attributes` and the name it points to
+    // outlive the call, and the path buffer is a static. The handle, if opened,
+    // is a kernel handle closed below.
+    unsafe {
+        if ZwOpenKey(&mut key, KEY_QUERY_VALUE, &mut attributes) >= 0 && !key.is_null() {
+            let _ = ZwFlushKey(key);
+            let _ = wdk_sys::ntddk::ZwClose(key as wdk_sys::HANDLE);
+        }
+    }
+}
+
 /// `record_named` convenience: build the UTF-16 value name from an ASCII byte
 /// slice (≤14 chars). PASSIVE_LEVEL only.
 pub fn record_named_bytes(name: &[u8], value: u32) {
@@ -530,6 +653,75 @@ pub mod knobs {
 
     /// Breadcrumb ring level. 0 (default) = the `S<idx>` ring is off.
     pub const DIAG_LEVEL: KnobName = KnobName::new(b"DiagLevel");
+    /// `StopFlush` (default 1): flush the service key to disk at StopDevice's
+    /// first and last stage, so `StopStg` survives a bugcheck inside the stop.
+    /// 0 skips the two `ZwFlushKey` calls.
+    pub const STOP_FLUSH: KnobName = KnobName::new(b"StopFlush");
+    /// `NvSpinUs` (default 50): how long, in microseconds, a forwarded RM message
+    /// polls for its reply before it blocks (`virtio::ctrl::raw_roundtrip`). 0
+    /// turns the spin off; above 200 it is clamped. Adaptive on top of this: the
+    /// spin backs off by itself while the host answers slower than the budget
+    /// (`helios_kmd_logic::nvrm_fastpath::spin`). Read once, at the first forward;
+    /// the outcome is mirrored in `NvSpinHit` / `NvSpinMis`.
+    pub const NV_SPIN_US: KnobName = KnobName::new(b"NvSpinUs");
+    /// `NvDupHarden` (default 2 = log-only, for the first shipped package). Cross-client
+    /// hardening of forwarded RM ioctls (`virtio::nvrm_harden`, `docs/nvrm-escape.md`
+    /// section 12): every RM client and backend handle a forwarded `Ioctl` names must be
+    /// the calling process's own. 2 = log-only (everything is recorded and checked, what
+    /// mode 1 would refuse is counted in `NvDupWould` and forwarded), 1 = enforce (the
+    /// request is refused, `NvDupDeny` / `NvRef`), 0 = off (nothing is recorded or checked:
+    /// the behaviour before the hardening). A value present and other than 0 or 2 enforces.
+    /// Read once per boot. Flip the default to 1 after a real NVK run shows `NvCliRec` close
+    /// to `NvOpen`, `NvDupWould` 0 and `NvDupDoubt` small.
+    pub const NV_DUP_HARDEN: KnobName = KnobName::new(b"NvDupHarden");
+    /// `NvWinPolicy` (default 1). The RM window policy (`helios_kmd_logic::rm_window`,
+    /// `docs/nvrm-escape.md`, "The RM window policy"): 1 = dynamic (any device may map until
+    /// the window is full, minus the reserve kept for the privileged device; the handle and
+    /// mapping tables grow to their sanity bounds), 0 = the legacy rule byte for byte (a
+    /// quarter of the window per device, fixed tables of 1024 entries and 128 / 256 per
+    /// process). Read once per transport (StartDevice); mirrored as `NvWinPol`.
+    pub const NV_WIN_POLICY: KnobName = KnobName::new(b"NvWinPolicy");
+    /// `NvWinReserveMb` (default 256). MiB of the RM window only the privileged device (the
+    /// one that holds the foreign scanout source, DWM-on-NVK; the KMD's own RM client) may
+    /// use. Any u32 value is valid (clamped to the window). Read per transport; `NvWinResMb`.
+    pub const NV_WIN_RESERVE_MB: KnobName = KnobName::new(b"NvWinReserveMb");
+    /// `NvWinMaxMb` (default 0 = the whole window). Caps the bytes mapped through the RM
+    /// window below the window's size: an operator bound on the non-paged pool the mapping
+    /// MDLs cost (2 KiB per MiB mapped). Read per transport; `NvWinCapMb`.
+    pub const NV_WIN_MAX_MB: KnobName = KnobName::new(b"NvWinMaxMb");
+    /// `FlipWdogMs` (default 0 = off). The opt-in flip watchdog (`ddi::stall_diag`,
+    /// `docs/zero-copy-present.md` "Stall diagnosis"): when a pending flip has gone this many
+    /// milliseconds (in vsync ticks) with no address published, the vsync DPC publishes the
+    /// flip's address as a KEPT picture (for any class of allocation, Venus included), and the
+    /// Venus direct exits (a spent retry budget, a permanent reject) publish kept too. The kept
+    /// address names a picture that is not on the screen: a diagnostic and recovery valve, not a
+    /// completion. Nonzero values are clamped to 50..60000. Read at every StartDevice; mirrored
+    /// as `FlWdMsEff`.
+    pub const FLIP_WDOG_MS: KnobName = KnobName::new(b"FlipWdogMs");
+    /// `DeferBudget` (default 0 = unlimited, today's behaviour). The most Deferred programming
+    /// attempts of one primary (about one per vsync tick) before the worker publishes the flip's
+    /// address kept and lowers the gate instead of retrying again (`FkDefBud`). 240 is about
+    /// four seconds at 60 Hz. Nonzero values are clamped to 16..4000000. Read at every
+    /// StartDevice; mirrored as `DefBudEff`.
+    pub const DEFER_BUDGET: KnobName = KnobName::new(b"DeferBudget");
+    /// `VsPowerMode` (default 1 = adapter-only quiesce, KMD 326; 0 = KMD 325, any non-D0 call of any uid): which `DxgkDdiSetPowerState` calls quiesce the vsync
+    /// heartbeat. 0: any non-D0 state of any `DeviceUid` (the monitor child's included), 1: only
+    /// the adapter leaving D0 (KMD 326). Read at every StartDevice; mirrored as `VsPwrEff`.
+    pub const VS_POWER_MODE: KnobName = KnobName::new(b"VsPowerMode");
+    /// `VsWatchdog` (default 1 = revive an armed but silent heartbeat; 0 = off, KMD 325): the heartbeat watchdog. 1 revives an armed but
+    /// silent heartbeat, 2 also re-arms a quiesced one while the adapter is in D0 (KMD 326). Read
+    /// at every StartDevice; mirrored as `VsWdgEff`.
+    pub const VS_WATCHDOG: KnobName = KnobName::new(b"VsWatchdog");
+    /// `VsIdleWake` (default 0 = off, KMD 325): 1 makes the HPD worker wake 4 times a second
+    /// while the heartbeat is armed, to run the watchdog (needs `VsWatchdog` above 0). Read at
+    /// every StartDevice; mirrored as `VsIdlEff`.
+    pub const VS_IDLE_WAKE: KnobName = KnobName::new(b"VsIdleWake");
+    /// `VsWdTimer` (default 1 = on, v329): the independent watchdog timer (a 250 ms Ex timer
+    /// started at StartDevice and cancelled at StopDevice) that re-arms a heartbeat that has been
+    /// silent for at least max(250 ms, 16 periods) while armed and the adapter is in D0, and asks
+    /// the worker to refresh the heartbeat block every 2 s. 0 never arms it. Read at every
+    /// StartDevice; mirrored as `VsWdTmEff`.
+    pub const VS_WD_TIMER: KnobName = KnobName::new(b"VsWdTimer");
     /// Segment topology. Legal values 0 and 10 only — see `BarSegTopology`.
     pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
     /// CpuVisible cached-allocation kill switch (default 1 = cached).
@@ -540,6 +732,68 @@ pub mod knobs {
     /// restores) is `crate::virtio::gpu::VirtioGpu::dma_gpu_fence`; the unread
     /// `AdapterKnobs` copy was deleted 2026-08-05.
     pub const DMA_GPU_FENCE: KnobName = KnobName::new(b"DmaGpuFence");
+    /// `KmdRmClient` (default 0 = off, nothing is opened and nothing is written).
+    /// The KMD's own RM client (`virtio::rm_client`, `docs/kmd-rm-client.md`): 1 =
+    /// open an RM client over the forwarding path and allocate, export and import a
+    /// video-memory surface of the VidPn primary's size (invisible); 2 = also map it,
+    /// paint a test picture and show it once through the KMD's own `ScanoutFlip`;
+    /// 3 = a ring of two such surfaces, and the composited desktop (the LINEAR
+    /// primary the display worker keeps current) is copied into the one not shown and
+    /// flipped, in place of Venus' `RESOURCE_FLUSH`, with Venus as the fallback
+    /// (`virtio::rm_present`, `docs/kmd-rm-client.md` section 13).
+    /// 4 = 3 plus each ring surface imported as a foreign resource under the KMD's own
+    /// owner (the resource id a WDDM allocation adopts, `docs/kmd-rm-client.md` section
+    /// 14).
+    /// 5 = no ring: the VidPn primary itself is allocated from RM SYSTEM memory (Venus is
+    /// the fallback for it), mapped by the host into the window dxgkrnl's CPU aperture
+    /// uses, and flipped with the KMD's own `ScanoutFlip` (section 15).
+    /// Read once per transport generation. Values above 5 count as 5 (before level 3
+    /// existed, 3 and more counted as 2: a service key left at 3 turns the ring on).
+    pub const KMD_RM_CLIENT: KnobName = KnobName::new(b"KmdRmClient");
+    /// `KmdRmSysCache` (default 0). With `KmdRmClient` = 5: what the RM system-memory
+    /// primary is made of (read at the service's bring-up; `docs/kmd-rm-client.md` 15.5).
+    /// 0 or 1 = WRITE-COMBINED memory (the default: every view of it agrees with dxgkrnl's
+    /// write-combined mapping of the primary, so there is no alias; 1 is the same, spelled
+    /// out). 2 = cached memory AND the `Cached` flag on the primary (an opt-in experiment:
+    /// dxgkrnl may refuse it). 3 = cached memory under dxgkrnl's write-combined view, a
+    /// write-back / write-combined ALIAS of the same pages (an opt-in, counted `RmSysAlias`).
+    /// Any other value is the default: an unknown value never picks an alias.
+    pub const KMD_RM_SYS_CACHE: KnobName = KnobName::new(b"KmdRmSysCache");
+    /// `KmdRmSysPollMs` (default 0 = off). With `KmdRmClient` = 5: a heartbeat for a primary
+    /// that is written with no event the KMD can see (a GDI-only session, no DWM: GDI draws
+    /// through the CPU aperture mapping and nobody tells the driver). While an RM primary is
+    /// shown, it is flipped again at this period (milliseconds, 50 to 5000), also with
+    /// nothing reported. Costs a flip (a dup, one message, one compositor commit) per period for
+    /// as long as the desktop exists, so it is off by default: with DWM every change comes with
+    /// a present, a paging write or a marker, and the short tail after the last of them
+    /// (`rm_refresh::TAIL_100NS`, always on) covers what trails it. Read once per transport
+    /// generation (`docs/kmd-rm-client.md` 15.16).
+    pub const KMD_RM_SYS_POLL_MS: KnobName = KnobName::new(b"KmdRmSysPollMs");
+    /// `ForeignFlip` (default 0 = off: the foreign-allocation flip does not exist and every
+    /// allocation takes the path it took before). Nonzero: a WDDM allocation that adopted an
+    /// RM resource a user-mode device imported (DWM-on-NVK's swap-chain buffers, open identity
+    /// FOREIGN) is shown by the KMD's own `ScanoutFlip` of its DRM file and GEM, with the
+    /// arbiter's resident source registered under the importing device, instead of
+    /// `SET_SCANOUT_BLOB` plus a Venus flush (`virtio::foreign_flip`,
+    /// `docs/kmd-rm-client.md` 15.18). Refused, with a counted reason (`FfRef<NN>`), and the
+    /// old path runs, when the importer's file is gone, the layout is unusable, the host lacks
+    /// the import, or `KmdRmClient` is 3 or 4. Read once per transport generation.
+    pub const FOREIGN_FLIP: KnobName = KnobName::new(b"ForeignFlip");
+    /// `FfAsyncWin` (default 0 = off: every `ForeignFlip` host flip is a synchronous round trip
+    /// on the HPD worker, as it always was). 1 to 4 (larger is 4), only with `ForeignFlip` on:
+    /// the host `ScanoutFlip` is SUBMITTED on the control queue without waiting for its reply,
+    /// with at most this many in flight; the worker settles the answers when the used-ring drain
+    /// wakes it, so programming never waits for the host. Also lets the `SetVidPnSourceAddress`
+    /// DDI wake the worker through a DPC at once instead of at the next vsync tick, and the
+    /// tick wake it with the vsync delivery gate closed. Read once per transport generation
+    /// (`docs/kmd-rm-client.md` 15.18.13).
+    pub const FOREIGN_FLIP_WIN: KnobName = KnobName::new(b"FfAsyncWin");
+    /// `FfRepeatMs` (default 100, 0 = off, at most 10000), only with `ForeignFlip` on: the least
+    /// time between two host flips that only REPEAT the picture the previous flip showed (a
+    /// desktop refresh edge, as opposed to a programming dxgkrnl issued). 0 flips on every edge,
+    /// as KMD 325 did (155 flips a second of an unchanged picture in the T5 run). Read once per
+    /// transport generation (`docs/kmd-rm-client.md` 15.18.14).
+    pub const FOREIGN_FLIP_REPEAT: KnobName = KnobName::new(b"FfRepeatMs");
     /// `BindFlushMode` (default 0). Selects when the bind edge tells the host
     /// to READ the freshly bound primary (ROADMAP defect 0ab-B):
     ///   0 = completion-ordered against the boundary this buffer's own present
@@ -559,6 +813,11 @@ pub mod knobs {
     pub const DISPATCH_BIND: KnobName = KnobName::new(b"DispatchBind");
     /// Per-present probe instrumentation (default 0).
     pub const PRESENT_PROBE: KnobName = KnobName::new(b"PresentProbe");
+    /// `ForeignCopy` (default 0 = OFF; set 1 to use it). The KMD's explicit-modifier copy of
+    /// a foreign (NVK-on-RM) resource into the scan-out image, and the device
+    /// extension tier it needs. 0, the default, is the pre-feature device and import;
+    /// read at AddAdapter/StartDevice like every knob.
+    pub const FOREIGN_COPY: KnobName = KnobName::new(b"ForeignCopy");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");
@@ -574,12 +833,15 @@ pub mod knobs {
     /// Reported device-memory capacity in MiB. 0 (default) preserves the proven
     /// one-GiB capacity of the existing aperture+BAR topology.
     pub const VIDMM_VRAM_MB: KnobName = KnobName::new(b"VidMmVramMB");
-    /// `DXGK_FLIPCAPS` OVERRIDE. 0 (default) = the driver's own word
-    /// (`FlipOnVSyncMmIo | FlipImmediateMmIo`); nonzero replaces it verbatim,
-    /// so `FlipCapsX=2` restores the pre-2026-07-29 advertisement for an A/B.
-    /// Bit order (bindgen, WDK 10.0.26100): 0 `FlipOnVSyncWithNoWait`,
-    /// 1 `FlipOnVSyncMmIo`, 2 `FlipInterval`, 3 `FlipImmediateMmIo`. Read at
-    /// AddAdapter, so `pnputil /restart-device` applies it without a rebuild.
+    /// `DXGK_FLIPCAPS` extra bits (default 0 = the driver's own word, `FlipOnVSyncMmIo`).
+    /// A raw `DXGK_FLIPCAPS` bit mask OR'd into it: only bit 4 `FlipIndependent` (0x10), bit 5
+    /// `DdiPresentForIFlip` (0x20) and bit 6 `FlipImmediateOnHSync` (0x40) are accepted (WDK
+    /// 10.0.26100.0 `d3dkmddi.h`); every other bit is dropped and reported in `FlipCapsXMsk`.
+    /// `FlipCapsX=0x10` therefore reports 0x12. It used to REPLACE the whole word; the replaced
+    /// bits were never survivable except as a no-op (`FlipCapsX=2` equals the default).
+    /// Read once per AddAdapter/StartDevice with the other knobs (`AdapterKnobs`), so a change
+    /// applies at the next StartDevice (reboot preferred); mirrored as `FlipCapsXEff` and
+    /// `FlipCapsRep` at every start.
     pub const FLIP_CAPS_EXTRA: KnobName = KnobName::new(b"FlipCapsX");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical
@@ -618,6 +880,17 @@ pub mod knobs {
     /// exactly. Snapshotted at transport init, so `pnputil /restart-device`
     /// flips it without a reboot.
     pub const PRESENT_EXACT_WATERMARK: KnobName = KnobName::new(b"PresentWmk");
+
+    /// `MsiVectors` (default 0 = per-source vectors when the OS granted enough
+    /// messages). 1 forces ONE shared message 0 for every queue even when more
+    /// were granted: the same-boot A/B between per-queue and shared vectors.
+    ///
+    /// This is NOT a switch back to INTx. Whether the OS hands the driver
+    /// messages or the INTx line is decided by PnP before `StartDevice` from the
+    /// device key's `MSISupported`; see `docs/msi-interrupts.md` for the one
+    /// `reg add` that forces INTx. Snapshotted at transport init, so
+    /// `pnputil /restart-device` applies it without a reboot.
+    pub const MSI_VECTORS: KnobName = KnobName::new(b"MsiVectors");
 
     /// Default-enabled capacity notification for retry of a full Venus transport
     /// queue. 0 preserves historical 1 ms polling; no capacity change.
@@ -687,6 +960,17 @@ pub mod knobs {
     /// ⛔ Clamped in code to `[WDDM_HEAD_MS_MIN, WDDM_HEAD_MS_MAX]` when nonzero:
     /// too large reinstates the TDR, too small re-opens the 0ab-B stale-frame class.
     pub const WDDM_HEAD_MS: KnobName = KnobName::new(b"WddmHeadMs");
+    /// `FlGSyncMs` (default 0 = OFF; DIAGNOSTIC, `docs/flush-gate.md` section 9).
+    ///
+    /// A `HEFL` flush-gate Render waits up to N ms (PASSIVE, no lock held, clamped in
+    /// code to `flush_trace::SYNC_MS_MAX`) until the boundary its packet carries has
+    /// retired, then returns, so the runtime's key release follows the GPU completion on
+    /// the CPU. If the keyed-mutex ordering failure goes away with it, the failure is a
+    /// CPU-vs-GPU race (the release outruns the work); if it does not, the gate is not
+    /// what orders the acquirer. Snapshotted at transport init: `pnputil /restart-device`
+    /// applies it. Read `FlGSyncWt` (waits that ran) first: 0 means the experiment did
+    /// not run.
+    pub const FLG_SYNC_MS: KnobName = KnobName::new(b"FlGSyncMs");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.

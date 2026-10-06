@@ -729,12 +729,16 @@ pub unsafe fn enum_cofunc_modality(
     // Flush the live CRTC_VSYNC heartbeat count (incremented at DISPATCH in the
     // VSync DPC, which cannot touch the registry). This PASSIVE DDI runs ×dozens
     // during the mode-set retry loop, so `ScVs` shows whether VSync is flowing.
+    // `ScVsT` is the interrupt time (ms) of the tick that last advanced the
+    // count: the pair gives a rate against any other mirror of the count
+    // (`VpVsN`/`VpVsT`, `VsCnt`/`VsCntT`), see `docs/foreign-scanout.md`.
     rec(
         b"ScVs",
         adapter
             .vsync_count
             .load(core::sync::atomic::Ordering::Relaxed),
     );
+    rec(b"ScVsT", adapter.vsync_last_ms());
     // Which numbered stage failed, if any. Replaces the bare `fp: u32`; the
     // registry value is unchanged (see `CofuncStage::code`).
     let mut stage = CofuncStage::MissingCallback;

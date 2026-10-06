@@ -22,14 +22,26 @@
 
 pub mod escape;
 pub mod features;
+pub mod flush_gate;
+pub mod foreign;
 pub mod ioctl;
+pub mod nvrm;
+pub mod nvrm_scanout;
+pub mod onscanout;
 pub mod producer;
+pub mod rm_fence;
 pub mod virtio_gpu;
 pub mod wddm;
 
 pub use escape::*;
 pub use features::*;
+pub use flush_gate::*;
+pub use foreign::*;
 pub use ioctl::*;
+pub use nvrm::*;
+pub use nvrm_scanout::*;
+pub use onscanout::*;
 pub use producer::*;
+pub use rm_fence::*;
 pub use virtio_gpu::*;
 pub use wddm::*;

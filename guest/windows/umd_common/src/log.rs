@@ -121,12 +121,161 @@ pub fn umd_log_path() -> &'static std::path::Path {
         let dir = std::path::Path::new(r"C:\ProgramData\Helios");
         // Best effort: ignore AlreadyExists / permission errors.
         let _ = std::fs::create_dir_all(dir);
-        dir.join(format!(
-            "{}-{}.log",
-            BASENAME.get().copied().unwrap_or("umd"),
-            std::process::id()
-        ))
+        let base = BASENAME.get().copied().unwrap_or("umd");
+        let path = dir.join(format!("{base}-{}.log", std::process::id()));
+        // A file of the same name left by an earlier process with this pid,
+        // created under another account (dwm.exe runs as a fresh DWM-<n> each
+        // restart), may refuse our append: every line of this process would
+        // vanish (docs/dwm-on-nvk.md, T3). Then the name also carries the
+        // process creation time, which the C++ bridges compute the same way.
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => dir.join(format!(
+                "{base}-{}-{:x}.log",
+                std::process::id(),
+                process_creation_time()
+            )),
+            _ => path,
+        }
     })
+}
+
+
+/// `C:\ProgramData\Helios\sandbox`: for processes that may NOT create files
+/// in the main log directory — browser GPU processes (Chromium/Edge: low integrity and a
+/// restricted token), AppContainers. Created by the first unsandboxed process
+/// that logs (DWM at boot, any app) with an ACL that lets Everyone, the
+/// restricted SID and all AppContainers create files in it, and a low
+/// mandatory label, so a sandboxed process can open its own per-pid file
+/// there with plain Win32 calls. A process that can use neither directory
+/// logs through `OutputDebugString` (`tools/ods_capture.exe` collects it).
+const SANDBOX_DIR: &str = r"C:\ProgramData\Helios\sandbox";
+
+fn log_file_name() -> String {
+    format!("{}-{}.log", BASENAME.get().copied().unwrap_or("umd"), std::process::id())
+}
+
+/// Lines go to `OutputDebugString` because no log file could be opened.
+static LOG_TO_DEBUGGER: AtomicBool = AtomicBool::new(false);
+
+/// Where this process's log really is: [`umd_log_path`], the sandbox
+/// directory, or nowhere (the debugger output), for the first line.
+static LOG_WHERE: OnceLock<String> = OnceLock::new();
+
+fn ensure_sandbox_dir() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateDirectoryW(path: *const u16, sa: *const SecurityAttributes) -> i32;
+        fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl: *const u16,
+            revision: u32,
+            sd: *mut *mut c_void,
+            size: *mut u32,
+        ) -> i32;
+    }
+    #[repr(C)]
+    struct SecurityAttributes {
+        length: u32,
+        sd: *mut c_void,
+        inherit: i32,
+    }
+    if std::path::Path::new(SANDBOX_DIR).is_dir() {
+        return;
+    }
+    // Everyone, restricted code, all (and all restricted) AppContainers:
+    // full control, inherited by the files; low integrity label (no write-up).
+    let sddl: Vec<u16> = "D:(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)(A;OICI;FA;;;RC)\
+                          (A;OICI;FA;;;AC)(A;OICI;FA;;;S-1-15-2-2)S:(ML;OICI;NW;;;LW)"
+        .encode_utf16()
+        .chain(core::iter::once(0))
+        .collect();
+    let path: Vec<u16> = SANDBOX_DIR.encode_utf16().chain(core::iter::once(0)).collect();
+    // SAFETY: valid NUL-terminated strings; the descriptor is freed below.
+    unsafe {
+        let mut sd: *mut c_void = core::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut sd, core::ptr::null_mut())
+            == 0
+        {
+            return;
+        }
+        let sa = SecurityAttributes { length: core::mem::size_of::<SecurityAttributes>() as u32, sd, inherit: 0 };
+        CreateDirectoryW(path.as_ptr(), &sa);
+        LocalFree(sd);
+    }
+}
+
+fn debugger_line(line: &str) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OutputDebugStringW(s: *const u16);
+    }
+    let w: Vec<u16> = format!("[helios {}] {line}\n", BASENAME.get().copied().unwrap_or("umd"))
+        .encode_utf16()
+        .chain(core::iter::once(0))
+        .collect();
+    // SAFETY: NUL-terminated.
+    unsafe { OutputDebugStringW(w.as_ptr()) };
+}
+
+/// Write one complete line as is (no prefix): the C++ bridges' `umd_log`
+/// comes through here, so a sandboxed process's bridge lines take the same
+/// fallbacks as the Rust ones.
+pub fn log_raw(line: &str) {
+    if let Ok(mut slot) = log_file().lock() {
+        if let Some(f) = slot.as_mut() {
+            let _ = writeln!(f, "{line}");
+            return;
+        }
+    }
+    if LOG_TO_DEBUGGER.load(Ordering::Relaxed) {
+        debugger_line(line);
+    }
+}
+
+/// C entry point for the C++ bridges (`bridge_common.h` `umd_log`).
+///
+/// # Safety
+/// `line` is NULL or a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn helios_umd_log_raw(line: *const core::ffi::c_char) {
+    if line.is_null() {
+        return;
+    }
+    // SAFETY: the caller passes a NUL-terminated string.
+    let s = unsafe { core::ffi::CStr::from_ptr(line) };
+    log_raw(&s.to_string_lossy());
+}
+
+/// This process's creation time (FILETIME, 100 ns since 1601), 0 if unknown.
+fn process_creation_time() -> u64 {
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetProcessTimes(
+            process: isize,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+    let (mut c, mut e, mut k, mut u) =
+        (FileTime::default(), FileTime::default(), FileTime::default(), FileTime::default());
+    // SAFETY: the pseudo handle needs no closing; all four pointers are live locals.
+    let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
+    if ok == 0 {
+        return 0;
+    }
+    (u64::from(c.high) << 32) | u64::from(c.low)
 }
 
 /// The unconditional log writer.
@@ -155,7 +304,11 @@ pub fn log_line(message: &str) {
                 current_thread_id(),
                 message
             );
+            return;
         }
+    }
+    if LOG_TO_DEBUGGER.load(Ordering::Relaxed) {
+        debugger_line(&format!("[pid={} tid={}] {}", std::process::id(), current_thread_id(), message));
     }
 }
 
@@ -182,14 +335,37 @@ fn current_thread_id() -> u32 {
 /// is no way to release the handle at all.
 fn log_file() -> &'static std::sync::Mutex<Option<std::fs::File>> {
     LOG_FILE.get_or_init(|| {
-        std::sync::Mutex::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(umd_log_path())
-                .ok(),
-        )
+        let open = |p: &std::path::Path| {
+            std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
+        };
+        let primary = umd_log_path();
+        if let Some(f) = open(primary) {
+            // An unsandboxed process: make the directory sandboxed ones use.
+            ensure_sandbox_dir();
+            let _ = LOG_WHERE.set(primary.display().to_string());
+            return std::sync::Mutex::new(Some(f));
+        }
+        let alt = std::path::Path::new(SANDBOX_DIR).join(log_file_name());
+        if let Some(f) = open(&alt) {
+            let _ = LOG_WHERE.set(alt.display().to_string());
+            return std::sync::Mutex::new(Some(f));
+        }
+        let _ = LOG_WHERE.set("OutputDebugString".to_string());
+        LOG_TO_DEBUGGER.store(true, Ordering::Relaxed);
+        debugger_line(&format!(
+            "pid {}: no log file ({} and {} refused), logging to the debugger output",
+            std::process::id(),
+            primary.display(),
+            alt.display()
+        ));
+        std::sync::Mutex::new(None)
     })
+}
+
+/// Where this process's log lines go (for the module line).
+pub fn log_destination() -> &'static str {
+    let _ = log_file();
+    LOG_WHERE.get().map(|s| s.as_str()).unwrap_or("?")
 }
 
 /// Close the log handle because this DLL is being unloaded.
@@ -319,7 +495,11 @@ pub fn log_self_module_path() {
             let mut buf = [0u16; 512];
             let n = GetModuleFileNameW(hmod, buf.as_mut_ptr(), buf.len() as u32) as usize;
             if n > 0 && n < buf.len() {
-                crate::log_error!("UMD module: {}", String::from_utf16_lossy(&buf[..n]));
+                crate::log_error!(
+                    "UMD module: {} (log: {})",
+                    String::from_utf16_lossy(&buf[..n]),
+                    log_destination()
+                );
                 return;
             }
         }

@@ -30,7 +30,10 @@
 
   The budget applies to a CHAIN of simultaneously live frames, not to the sum of
   everything measured, so -Chains declares which symbols call which. Exits 1 if
-  the deepest declared chain is over the ceiling.
+  the deepest declared chain is over the ceiling, and ALSO exits 1 if a declared chain
+  could not be measured (one of its symbols missing from the .map, no address, not in
+  the disassembly): a fully inlined chain used to be skipped as INCOMPLETE and the
+  script still printed a headroom figure and exited 0, passing without measuring.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File Z:\tools\kmd-frame-sizes.ps1
@@ -48,17 +51,44 @@ param(
     [string[]] $Symbols = @(
         '9lifecycle20dxgkddi_start_device',
         '9VirtioGpu4init',
-        # Unique across crate-hash changes: const queue size 0x40 followed by
-        # VirtQueue::new's concrete PciTransport argument.
-        'Kj40_E3newNtNtNtB5_9transport3pci12PciTransport',
+        # The event queue is built from init (before DRIVER_OK), beside the
+        # control queue's constructor.
+        '14new_event_ring',
+        # MSI-X bring-up (virtio/msi.rs). `probe_granted` -> `listed_messages`
+        # runs BEFORE init (sequential, never nested in it) and carries the
+        # ~150-byte DXGK_DEVICE_INFO; `program_vectors` is a leaf under init.
+        '13probe_granted',
+        '15listed_messages',
+        '15program_vectors',
+        # VirtQueue::new's concrete PciTransport argument. Deliberately WITHOUT
+        # the const queue size before it (`Kj40_` for 64): that prefix made this
+        # symbol vanish from the gate when the ring size changed, silently
+        # dropping its by-value return slot from the budget.
+        'E3newNtNtNtB5_9transport3pci12PciTransport',
         '24allocate_present_streams',
+        # The RM gate table (virtio/gpu/rm_gates.rs): a RmGateSlot is ~1.1 KiB (128
+        # points) built by value in this `inline(never)` frame, called from init like
+        # the present-stream allocator.
+        '17allocate_rm_gates',
         '30allocate_scanout_refresh_state',
+        # The RM window account (virtio/gpu/nvrm_tables.rs): built in its own frame, returns
+        # one Box pointer (the window account and both table bounds in one allocation).
+        '18new_window_account',
         '14bring_up_venus',
         '26allocate_host_visible_blob',
         '9VenusRing8bring_up',
         '9VenusRing13into_instance',
         '13VenusInstance11into_device',
-        '13VenusInstance29create_device_with_ext_ladder'
+        '13VenusInstance29create_device_with_ext_ladder',
+        # The device-lost instrument's DDI wrappers (ddi/traced.rs) and the DDIs they front. Each is
+        # `#[inline(never)]` so the symbol exists; DxgkDdiStartDevice is deliberately NOT wrapped.
+        '6traced11stop_device',
+        '9lifecycle19dxgkddi_stop_device',
+        '6traced14destroy_device',
+        '6device22dxgkddi_destroy_device',
+        '6traced19build_paging_buffer',
+        '19build_paging_buffer27dxgkddi_build_paging_buffer',
+        '19build_paging_buffer25build_paging_buffer_inner'
     ),
     # Call chains to sum. The 24 KB budget applies to a CHAIN of simultaneously
     # live frames, never to the sum of every symbol measured, so the chains are
@@ -66,10 +96,18 @@ param(
     # $Symbols entries, outermost first.
     [string[]] $Chains = @(
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init',
-        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,Kj40_E3newNtNtNtB5_9transport3pci12PciTransport',
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,E3newNtNtNtB5_9transport3pci12PciTransport',
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,14new_event_ring,E3newNtNtNtB5_9transport3pci12PciTransport',
+        '9lifecycle20dxgkddi_start_device,13probe_granted,15listed_messages',
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,15program_vectors',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,24allocate_present_streams',
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,17allocate_rm_gates',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,30allocate_scanout_refresh_state',
-        '9lifecycle20dxgkddi_start_device,14bring_up_venus,26allocate_host_visible_blob,13VenusInstance11into_device,13VenusInstance29create_device_with_ext_ladder'
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,18new_window_account',
+        '9lifecycle20dxgkddi_start_device,14bring_up_venus,26allocate_host_visible_blob,13VenusInstance11into_device,13VenusInstance29create_device_with_ext_ladder',
+        '6traced11stop_device,9lifecycle19dxgkddi_stop_device',
+        '6traced14destroy_device,6device22dxgkddi_destroy_device',
+        '6traced19build_paging_buffer,19build_paging_buffer27dxgkddi_build_paging_buffer,19build_paging_buffer25build_paging_buffer_inner'
     ),
     [int]      $Window  = 24
 )
@@ -98,6 +136,7 @@ for ($i = 0; $i -lt $dis.Count; $i++) {
 }
 
 $frames = @{}
+$problems = @()   # filled by the chain loop: a symbol outside every chain (informational) may be absent
 foreach ($sym in $Symbols) {
     $hit = Select-String -Path $map -Pattern ([regex]::Escape($sym)) -SimpleMatch |
            Select-Object -First 1
@@ -144,15 +183,33 @@ foreach ($chain in $Chains) {
     $parts = $chain -split ','
     $sum = 0
     $missing = $false
-    foreach ($part in $parts) {
-        if ($frames.ContainsKey($part)) { $sum += $frames[$part] } else { $missing = $true }
+    $leafInlined = $false
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        $part = $parts[$i]
+        if ($frames.ContainsKey($part)) { $sum += $frames[$part] }
+        elseif ($i -eq $parts.Count - 1 -and $i -gt 0) {
+            # The LAST symbol of a chain missing from the .map was inlined into its caller
+            # (typically a generic from a dependency crate, e.g. PciTransport::new, which we
+            # cannot mark #[inline(never)]): its frame is part of the caller's measured frame,
+            # so the chain is still bounded. A missing symbol anywhere else is unmeasured.
+            $leafInlined = $true
+        }
+        else { $missing = $true }
     }
     $names = ($parts | ForEach-Object { ($_ -replace '^[0-9]+', '') }) -join ' -> '
-    $note = if ($missing) { '  (INCOMPLETE: a symbol was not measured)' } else { '' }
+    $note = if ($missing) { '  (INCOMPLETE: a symbol was not measured)' }
+            elseif ($leafInlined) { '  (last symbol inlined into its caller: included in the caller frame)' }
+            else { '' }
     Write-Host ("{0,6} bytes  {1}{2}" -f $sum, $names, $note)
+    if ($missing) { $problems += "chain not measured: $names" }
     if (-not $missing -and $sum -gt $worst) { $worst = $sum }
 }
 Write-Host ""
+if ($problems.Count -gt 0) {
+    Write-Host "** UNMEASURED: the gate did not measure everything it declares (a symbol was inlined away or renamed) **"
+    $problems | ForEach-Object { Write-Host ("   " + $_) }
+    exit 1
+}
 if ($worst -gt 17936) {
     Write-Host ("DEEPEST CHAIN {0} bytes  ** OVER the 17936-byte 22.22.180.0 ceiling **" -f $worst)
     exit 1

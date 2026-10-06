@@ -199,6 +199,9 @@ pub(crate) unsafe fn allocate_wddm_resource(
     // direct OPTIMAL uses a logical scanout stride while QEMU validates the
     // opaque allocation with its exact Vulkan allocation size.
     scanout: Option<ScanoutGeometry>,
+    // An NVK-made backing (KMD foreign resource, dxvk-on-nvk S3): the KMD
+    // adopts `resource_id` with this layout. Exclusive with `backing`.
+    foreign: Option<crate::bridge::ForeignIdentity>,
 ) -> Result<(Option<ResidentAllocation>, ddi::D3DKMT_HANDLE), i32> {
     const DDI_BIND_PRESENT: u32 = 0x0000_0080;
 
@@ -219,8 +222,13 @@ pub(crate) unsafe fn allocate_wddm_resource(
         return Err(E_FAIL);
     };
 
-    let venus_ctx_id = dev.dxvk.venus_context_id();
-    if venus_ctx_id == 0 {
+    // NVK: the holder context the foreign resource was imported on (the KMD
+    // checks the allocation names it). Venus: this device's context.
+    let venus_ctx_id = match foreign {
+        Some(f) => f.ctx_id,
+        None => dev.dxvk.venus_context_id(),
+    };
+    if venus_ctx_id == 0 && !dev.dxvk.is_nvk() {
         log_error!("DDI allocate_wddm_resource: no Venus context id");
     }
 
@@ -233,17 +241,20 @@ pub(crate) unsafe fn allocate_wddm_resource(
     // A LINEAR scan-out primary reports its exact COLOR row pitch; use it verbatim so
     // `SET_SCANOUT_BLOB` reads rows at the true host stride instead of the
     // cross-adapter guess (a wrong stride shears the scanned-out image).
-    let pitch = match scanout {
-        Some(g) => g.pitch.get(),
-        None => pitch,
+    let pitch = match (foreign, scanout) {
+        // The KMD requires the meta to repeat the recorded layout.
+        (Some(f), _) => f.layout.stride,
+        (None, Some(g)) => g.pitch.get(),
+        (None, None) => pitch,
     };
     let linear_size = (pitch as u64)
         .saturating_mul(mip0.TexelHeight.max(1) as u64)
         .max(4096);
     // A live backing with a zero blob_size still falls back to the linear size:
     // blob_id is the only field that gates a mode.
-    let size = match backing {
-        Some(b) if b.blob_size != 0 => b.blob_size,
+    let size = match (foreign, backing) {
+        (Some(f), _) => f.size,
+        (None, Some(b)) if b.blob_size != 0 => b.blob_size,
         _ => linear_size,
     };
 
@@ -261,6 +272,20 @@ pub(crate) unsafe fn allocate_wddm_resource(
     };
 
     let mut private = RuntimeAllocPrivate {
+        layout: helios_protocol::HeliosWddmAllocLayout {
+            modifier: 0,
+            magic: 0,
+            version: 0,
+            fourcc: 0,
+            stride: 0,
+            plane_offset: 0,
+            reserved: 0,
+        },
+        plane1: helios_protocol::HeliosWddmAllocPlane {
+            modifier: 0,
+            stride: 0,
+            plane_offset: 0,
+        },
         alloc: HeliosWddmAllocPrivate::new(
             if backing.is_some() {
                 HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
@@ -322,6 +347,48 @@ pub(crate) unsafe fn allocate_wddm_resource(
             plane_offset: scanout.map_or(0, |g| g.plane_offset),
         },
     };
+    if let Some(f) = foreign {
+        // zero-copy-present.md 10.2: DEVICE_MEMORY adopting the foreign resid,
+        // blob_mem declaring the vendor RM-export type, no blob id, no cache
+        // policy, the meta repeating the recorded geometry, the creator's
+        // layout trailer (the KMD checks it and writes the record back).
+        private.alloc = HeliosWddmAllocPrivate::new(
+            HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+            f.ctx_id,
+            0,
+            f.size,
+            helios_protocol::HELIOS_BLOB_MEM_RM_EXPORT,
+            0,
+            0,
+            f.resource_id,
+        );
+        private.meta.venus_alloc_size = 0;
+        private.meta.memory_type_index = 0;
+        private.meta.plane_offset = u64::from(f.layout.offset);
+        // A two-plane resource (NV12/P010/P016, docs/shared-formats.md):
+        // version 2, the plane count in `reserved`, plane 1 at byte 128.
+        let two_planes = f.layout.plane1_stride != 0;
+        private.layout = helios_protocol::HeliosWddmAllocLayout {
+            modifier: f.layout.modifier,
+            magic: helios_protocol::HELIOS_WDDM_LAYOUT_MAGIC,
+            version: if two_planes {
+                helios_protocol::HELIOS_WDDM_LAYOUT_VERSION_PLANES
+            } else {
+                helios_protocol::HELIOS_WDDM_LAYOUT_VERSION
+            },
+            fourcc: f.layout.fourcc,
+            stride: f.layout.stride,
+            plane_offset: f.layout.offset,
+            reserved: if two_planes { 2 } else { 0 },
+        };
+        if two_planes {
+            private.plane1 = helios_protocol::HeliosWddmAllocPlane {
+                modifier: f.layout.plane1_modifier,
+                stride: f.layout.plane1_stride,
+                plane_offset: f.layout.plane1_offset,
+            };
+        }
+    }
     let pre_private_alloc = private.alloc;
     let pre_private_meta = private.meta;
 
@@ -347,7 +414,15 @@ pub(crate) unsafe fn allocate_wddm_resource(
 
     let mut allocation_info = ddi::D3DDDI_ALLOCATIONINFO2::default();
     let private_ptr = (&mut private as *mut RuntimeAllocPrivate).cast();
-    let private_size = core::mem::size_of::<RuntimeAllocPrivate>() as u32;
+    // 128 bytes (with the layout trailer) only for a foreign adoption, 144
+    // (plane 1 too) for a two-plane one.
+    let private_size = match foreign {
+        Some(f) if f.layout.plane1_stride != 0 => {
+            helios_protocol::HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES as u32
+        }
+        Some(_) => helios_protocol::HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES as u32,
+        None => core::mem::offset_of!(RuntimeAllocPrivate, layout) as u32,
+    };
     allocation_info.pPrivateDriverData = private_ptr;
     allocation_info.PrivateDriverDataSize = private_size;
     let is_present = (a.BindFlags & DDI_BIND_PRESENT) != 0;
@@ -484,6 +559,10 @@ pub(crate) unsafe fn finish_wddm_tex2d(
     direct_scanout_primary: bool,
     scanout: Option<ScanoutGeometry>,
 ) {
+    if helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk()) {
+        unsafe { finish_wddm_tex2d_nvk(h, a, mip0, h_rt, h_resource, res) };
+        return;
+    }
     let (memory, memory_size, memory_offset, resource_id) = dxvk_resource_memory_info(h, &res);
     let needs_importable = needs_wddm_texture_allocation(a);
     let (backing_blob_id, backing_blob_size, backing_resource_id) = if memory != 0
@@ -558,7 +637,7 @@ pub(crate) unsafe fn finish_wddm_tex2d(
         return;
     }
     let (allocation, km_resource) =
-        match allocate_wddm_resource(h, a, mip0, h_rt, backing, direct_scanout_primary, scanout) {
+        match allocate_wddm_resource(h, a, mip0, h_rt, backing, direct_scanout_primary, scanout, None) {
             Ok(allocation) => allocation,
             Err(hr) => {
                 log_error!(
@@ -657,7 +736,173 @@ pub(crate) unsafe fn finish_wddm_tex2d(
     }
 }
 
+/// `finish_wddm_tex2d` on NVK (dxvk-on-nvk S3). A WDDM-backed texture's
+/// allocation adopts the KMD resource id NVK minted for its dedicated memory
+/// (IMPORT_RM), so DWM can open and compose it; when the KMD cannot mint one
+/// (gate closed, an image kind the importers cannot take) the allocation is a
+/// KMD-backed placeholder and the texture can only reach the screen through
+/// the NVK scanout present. No producer binding, no snapshot identity, no
+/// direct-scanout private data: those name Venus timelines and resources.
+pub(crate) unsafe fn finish_wddm_tex2d_nvk(
+    h: Hdevice,
+    a: &ddi::D3D11DDIARG_CREATERESOURCE,
+    mip0: &ddi::D3D10DDI_MIPINFO,
+    h_rt: ddi::D3D10DDI_HRTRESOURCE,
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    res: ID3D11Resource,
+) {
+    let Some(dev) = helios_device(h) else {
+        set_runtime_error(h, E_FAIL);
+        return;
+    };
+    let foreign = if needs_wddm_texture_allocation(a) && !crate::knobs::nvk_placeholder_allocations() {
+        dev.dxvk.foreign_identity(&res)
+    } else {
+        None
+    };
+    const DDI_BIND_PRESENT: u32 = 0x0000_0080;
+    if (a.BindFlags & DDI_BIND_PRESENT) != 0 || !a.pPrimaryDesc.is_null() {
+        super::present::note_nvk_present_buffer(foreign.is_some());
+    }
+    if needs_wddm_texture_allocation(a) && foreign.is_none() {
+        log_error!(
+            "DDI create_resource(tex2d) NVK: no resource id, KMD placeholder {}x{} fmt={} bind=0x{:x} misc=0x{:x}",
+            mip0.TexelWidth, mip0.TexelHeight, a.Format, a.BindFlags, a.MiscFlags
+        );
+    }
+    let (allocation, km_resource) =
+        match allocate_wddm_resource(h, a, mip0, h_rt, None, false, None, foreign) {
+            Ok(allocation) => allocation,
+            Err(hr) => {
+                log_error!(
+                    "DDI create_resource(tex2d) NVK: WDDM allocation/residency failed hr=0x{:08x} foreign_res_id={}",
+                    hr as u32,
+                    foreign.map_or(0, |f| f.resource_id)
+                );
+                // An id-less texture (a format or kind NVK cannot mint a
+                // resource id for, or a KMD without the shared-format cap,
+                // docs/shared-formats.md) falls back to a KMD placeholder; when
+                // that is refused too, fail this one creation with the error
+                // CreateResource may return (E_OUTOFMEMORY: the app sees a
+                // failed CreateTexture2D and can fall back) instead of an
+                // error the runtime turns into a removed device.
+                set_runtime_error(h, if foreign.is_none() { E_OUTOFMEMORY } else { hr });
+                return;
+            }
+        };
+    let allocation_handle = allocation
+        .as_ref()
+        .map(ResidentAllocation::handle)
+        .unwrap_or(0);
+    super::present::note_nvk_allocation(
+        allocation_handle,
+        foreign.map_or(0, |f| f.resource_id),
+        mip0.TexelWidth,
+        mip0.TexelHeight,
+        !a.pPrimaryDesc.is_null(),
+    );
+    if allocation_handle != 0 && foreign.is_some() {
+        // SAFETY: `res` is the live resource this DDI just created.
+        if !unsafe { dev.dxvk.transfer_resource_ownership(res.as_raw() as usize) } {
+            log_error!(
+                "DDI create_resource(tex2d) NVK: ownership transfer failed res_id={}",
+                foreign.map_or(0, |f| f.resource_id)
+            );
+        }
+    }
+    stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
+    store_resource(
+        h_resource,
+        res,
+        allocation,
+        km_resource,
+        h_rt.handle,
+        AllocationOwnership::CreatedByUmd,
+        empty_present_private(),
+        None,
+    );
+}
+
+/// `D3D10_DDI_RESOURCE_MISC_SHARED`.
+const DDI_MISC_SHARED_FLAG: u32 = 0x0000_0002;
+/// `D3D10_DDI_BIND_PRESENT`.
+const DDI_BIND_PRESENT_FLAG: u32 = 0x0000_0080;
+
+/// NVK: remember a live cross-process shared resource of this device, so
+/// flushes and presents complete NVK's work on the CPU while it exists
+/// (`nvk_keyed_flush_wait`).
+///
+/// The keyed mutex is invisible at the DDI: `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`
+/// (0x100) is "reserved" in `D3D10_DDI_RESOURCE_MISC_FLAG` (d3d10umddi.h), the
+/// runtime passes such a texture down as plain `MISC_SHARED` (seen: API misc
+/// 0x900 arrives as DDI 0x2) and drives `D3DKMT*KeyedMutex2` itself after
+/// `pfnFlush`. So every shared resource counts, except DXGI present buffers
+/// (`BIND_PRESENT`), whose hand-off to DWM is the present path's business.
+unsafe fn note_nvk_keyed_resource(
+    h: Hdevice,
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    misc: u32,
+    bind: u32,
+    created: bool,
+) {
+    if misc & DDI_MISC_SHARED_FLAG == 0
+        || bind & DDI_BIND_PRESENT_FLAG != 0
+        || load_resource(h_resource).is_none()
+    {
+        return;
+    }
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    let mut list = lock_ignore_poison(&dev.nvk_keyed_resources);
+    let key = h_resource.pDrvPrivate as usize;
+    if !list.iter().any(|&(k, _)| k == key) {
+        // Reads of it now wait for other processes' hand-offs (ledger key).
+        if let Some(res) = load_resource(h_resource) {
+            dev.dxvk.handoff_register(res.as_raw() as usize);
+        }
+        list.push((key, created));
+        log_error!(
+            "DDI NVK shared resource hDrv=0x{key:x}: flushes now wait for the GPU ({} live)",
+            list.len()
+        );
+    }
+}
+
+/// Forget a resource `note_nvk_keyed_resource` remembered (any resource may be
+/// passed).
+pub(crate) unsafe fn forget_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE) {
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    let mut list = lock_ignore_poison(&dev.nvk_keyed_resources);
+    if list.is_empty() {
+        return;
+    }
+    let key = h_resource.pDrvPrivate as usize;
+    let before = list.len();
+    list.retain(|&(k, _)| k != key);
+    if list.len() != before {
+        // The ledger slot is freed when no process holds the resource.
+        if let Some(res) = load_resource(h_resource) {
+            dev.dxvk.handoff_unregister(res.as_raw() as usize);
+        }
+    }
+}
+
 pub(crate) unsafe extern "system" fn create_resource(
+    h: Hdevice,
+    arg: *const ddi::D3D11DDIARG_CREATERESOURCE,
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    h_rt: ddi::D3D10DDI_HRTRESOURCE,
+) {
+    create_resource_inner(h, arg, h_resource, h_rt);
+    if !arg.is_null() {
+        note_nvk_keyed_resource(h, h_resource, (*arg).MiscFlags, (*arg).BindFlags, true);
+    }
+}
+
+unsafe fn create_resource_inner(
     h: Hdevice,
     arg: *const ddi::D3D11DDIARG_CREATERESOURCE,
     h_resource: ddi::D3D10DDI_HRESOURCE,
@@ -811,16 +1056,23 @@ pub(crate) unsafe extern "system" fn create_resource(
                     !a.pPrimaryDesc.is_null()
                 );
             }
-            let desc = D3D11_BUFFER_DESC {
-                ByteWidth: mip0.TexelWidth,
-                Usage: D3D11_USAGE(a.Usage as i32),
-                BindFlags: bind,
-                CPUAccessFlags: cpu,
-                MiscFlags: misc,
-                StructureByteStride: a.ByteStride,
+            // A video decoder buffer (D3D11.1 video DDI) is read back by the
+            // UMD at SubmitBuffers, whatever usage the runtime asked for.
+            let decoder_buffer = a.DecoderBufferType != 0;
+            let desc = if decoder_buffer {
+                decoder_buffer_desc(mip0.TexelWidth)
+            } else {
+                D3D11_BUFFER_DESC {
+                    ByteWidth: mip0.TexelWidth,
+                    Usage: D3D11_USAGE(a.Usage as i32),
+                    BindFlags: bind,
+                    CPUAccessFlags: cpu,
+                    MiscFlags: misc,
+                    StructureByteStride: a.ByteStride,
+                }
             };
             let (allocation, km_resource) =
-                match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
+                match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None, None) {
                     Ok(allocation) => allocation,
                     Err(hr) => {
                         log_error!(
@@ -879,6 +1131,9 @@ pub(crate) unsafe extern "system" fn create_resource(
                     empty_present_private(),
                     None,
                 );
+                if decoder_buffer {
+                    mark_decoder_buffer(h_resource);
+                }
             });
             if !stored && allocation_handle != 0 {
                 // The buffer arm allocates first and creates second, so a failed
@@ -952,7 +1207,11 @@ pub(crate) unsafe extern "system" fn create_resource(
             // Windows' pPrimaryDesc is the authoritative, non-heuristic marker
             // for a scan-out primary. The supported 32-bit Windows primary
             // formats become dedicated OPTIMAL DMA_BUF exports.
-            let is_scanout = !a.pPrimaryDesc.is_null() && matches!(a.Format as u32, 28 | 87 | 88);
+            // NVK has no direct-scanout primary path: a primary is an ordinary
+            // WDDM-backed texture there (finish_wddm_tex2d_nvk).
+            let is_scanout = !a.pPrimaryDesc.is_null()
+                && matches!(a.Format as u32, 28 | 87 | 88)
+                && !helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk());
             let mut handled = false;
             if is_scanout {
                 // The QEMU fork reconstructs this exact same-driver OPTIMAL
@@ -1160,7 +1419,7 @@ pub(crate) unsafe extern "system" fn create_resource(
             };
             finish_create(h, created, res, |res| {
                 let (allocation, km_resource) = match allocate_wddm_resource(
-                    h, a, &mip0, h_rt, None, false, None,
+                    h, a, &mip0, h_rt, None, false, None, None,
                 ) {
                     Ok(allocation) => allocation,
                     Err(hr) => {
@@ -1252,7 +1511,7 @@ pub(crate) unsafe extern "system" fn create_resource(
                 // the last statement of create_resource, so that is the same
                 // exit it was before.
                 let (allocation, km_resource) = match allocate_wddm_resource(
-                    h, a, &mip0, h_rt, None, false, None,
+                    h, a, &mip0, h_rt, None, false, None, None,
                 ) {
                     Ok(allocation) => allocation,
                     Err(hr) => {
@@ -1303,12 +1562,25 @@ pub(crate) unsafe extern "system" fn open_resource(
     h_resource: ddi::D3D10DDI_HRESOURCE,
     h_rt: ddi::D3D10DDI_HRTRESOURCE,
 ) {
+    // An opened resource is shared by definition; the creator's bind flags
+    // travel in the meta trailer.
+    let bind = open_resource_inner(h, arg, h_resource, h_rt);
+    note_nvk_keyed_resource(h, h_resource, DDI_MISC_SHARED_FLAG, bind, false);
+}
+
+/// Returns the creator's DDI bind flags (0 when the open failed early).
+unsafe fn open_resource_inner(
+    h: Hdevice,
+    arg: *const ddi::D3D10DDIARG_OPENRESOURCE,
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    h_rt: ddi::D3D10DDI_HRTRESOURCE,
+) -> u32 {
     clear_handle(h_resource);
 
     if arg.is_null() {
         log_error!("DDI open_resource: null args");
         set_runtime_error(h, E_INVALIDARG);
-        return;
+        return 0;
     }
 
     let a = &*arg;
@@ -1327,10 +1599,14 @@ pub(crate) unsafe extern "system" fn open_resource(
         unsafe { read_open_identity(a.pPrivateDriverData, a.PrivateDriverDataSize) },
         Some((_, None))
     );
+    // An NVK-made (foreign) resource carries the KMD's layout trailer: the
+    // opener must import it as an explicit DRM-modifier image (dxvk-on-nvk S3).
+    let mut foreign_layout =
+        unsafe { read_open_layout(a.pPrivateDriverData, a.PrivateDriverDataSize) };
     if a.NumAllocations != 0 && info2.is_null() {
         log_error!("DDI open_resource FAILED: allocation array is null");
         set_runtime_error(h, E_INVALIDARG);
-        return;
+        return 0;
     }
     for index in 0..a.NumAllocations as usize {
         let info = &*info2.add(index);
@@ -1339,6 +1615,10 @@ pub(crate) unsafe extern "system" fn open_resource(
         }
         let allocation_identity =
             unsafe { read_open_identity(info.pPrivateDriverData, info.PrivateDriverDataSize) };
+        if foreign_layout.is_none() {
+            foreign_layout =
+                unsafe { read_open_layout(info.pPrivateDriverData, info.PrivateDriverDataSize) };
+        }
         // Only a candidate that carries the meta TRAILER can be selected — the
         // type says so now. The KMD stamps the identity into both the
         // per-allocation and the resource-level private buffer
@@ -1435,7 +1715,7 @@ pub(crate) unsafe extern "system" fn open_resource(
             );
         }
         set_runtime_error(h, E_FAIL);
-        return;
+        return 0;
     };
     let ident = opened.ident;
     let meta = opened.meta;
@@ -1446,13 +1726,13 @@ pub(crate) unsafe extern "system" fn open_resource(
             ident.resource_id
         );
         set_runtime_error(h, E_FAIL);
-        return;
+        return 0;
     }
 
     let Some(dev) = helios_device(h) else {
         log_error!("DDI open_resource FAILED: no Helios device -> E_FAIL");
         set_runtime_error(h, E_FAIL);
-        return;
+        return 0;
     };
 
     let open_bind = api_bind_flags(meta.bind_flags);
@@ -1508,6 +1788,7 @@ pub(crate) unsafe extern "system" fn open_resource(
         dedicated_present_buffer,
         0, // Ordinary WDDM open, not a vehicle v3 source-template borrow.
         false,
+        foreign_layout,
     );
     if opened.is_none() {
         // Import of a KMD-validated-live resource failed: a real bug, not a
@@ -1517,11 +1798,11 @@ pub(crate) unsafe extern "system" fn open_resource(
             meta.width, meta.height, meta.format, allocation, a.hKMResource, ident.resource_id
         );
         set_runtime_error(h, E_FAIL);
-        return;
+        return 0;
     }
 
     let Some(res) = opened else {
-        return;
+        return 0;
     };
     let raw = res.as_raw() as usize;
     stamp_dxvk_resource_kmt_handles(h, &res, allocation, a.hKMResource.handle);
@@ -1534,7 +1815,7 @@ pub(crate) unsafe extern "system" fn open_resource(
                 hr as u32
             );
             set_runtime_error(h, hr);
-            return;
+            return 0;
         }
     };
     log_error!(
@@ -1569,6 +1850,7 @@ pub(crate) unsafe extern "system" fn open_resource(
         empty_present_private(),
         snapshot_source,
     );
+    meta.bind_flags
 }
 
 pub(crate) unsafe extern "system" fn calc_size_opened_resource(

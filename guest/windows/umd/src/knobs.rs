@@ -28,6 +28,9 @@
 //! | `UmdFreeThreaded` | DWORD | `true` (explicit 0 reverts the threading surface) |
 //! | `UmdCommandLists` | DWORD | `true` (explicit 0 reverts to emulated lists) |
 //! | `UmdDeferredDiagnostics` | DWORD | `false` (diagnostic atomics, opt-in) |
+//! | `UmdDdiLevel` | DWORD | `0x10` (D3D11 DDI WDDM1.3; `0x24` adds WDDM2.3) |
+//! | `UmdDdiLevelDwm` | DWORD | `0x10` (the same, dwm.exe only) |
+//! | `UmdDdiAllowList` | REG_SZ | absent (`;`-separated executables that get WDDM2.3) |
 //!
 //! ⛔ **`PresentGateUs` and `PresentOrder` were DELETED 2026-07-29 by owner
 //! directive and must not come back.** They were the producer-side CPU
@@ -189,6 +192,16 @@ pub(crate) static UMD_COMMAND_LISTS: BoolKnob = BoolKnob::new(c"UmdCommandLists"
 /// OFF means a timed run does no diagnostic atomic RMW at all.
 pub(crate) static UMD_DEFERRED_DIAGNOSTICS: BoolKnob = BoolKnob::new(c"UmdDeferredDiagnostics", false);
 
+/// D3D11 DDI interface the adapter advertises (`ddi_level.rs`). Absent = 0x10
+/// (D3DWDDM1_3, what every process negotiated before); 0x24 (D3DWDDM2_3)
+/// advertises the WDDM 2.3 D3D11 DDI above it. Never applied to dwm.exe, which
+/// has its own `UmdDdiLevelDwm` (same values, absent = 0x10).
+pub(crate) static UMD_DDI_LEVEL: DwordKnob = DwordKnob::new(c"UmdDdiLevel", 0x10);
+
+/// `UmdDdiLevel` for dwm.exe only. Absent = 0x10: DWM keeps the WDDM 1.3 D3D11
+/// DDI until the 2.3 path has been proven in ordinary processes.
+pub(crate) static UMD_DDI_LEVEL_DWM: DwordKnob = DwordKnob::new(c"UmdDdiLevelDwm", 0x10);
+
 /// The knob inventory, so the set is enumerable instead of grep-discoverable.
 ///
 /// Each entry is `(value name, resolved value as text)`. Resolving forces every
@@ -205,7 +218,7 @@ pub(crate) fn log_knob_inventory() {
     helios_umd_common::log::log_knob_inventory(&resolved_inventory());
 }
 
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 11] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 13] {
     [
         ("UmdTrace", UMD_TRACE.get() as u32),
         ("UmdTimerRes", UMD_TIMER_RESOLUTION.get() as u32),
@@ -218,6 +231,8 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 11] {
         ("UmdFreeThreaded", UMD_FREE_THREADED.get() as u32),
         ("UmdCommandLists", UMD_COMMAND_LISTS.get() as u32),
         ("UmdDeferredDiagnostics", UMD_DEFERRED_DIAGNOSTICS.get() as u32),
+        ("UmdDdiLevel", UMD_DDI_LEVEL.get()),
+        ("UmdDdiLevelDwm", UMD_DDI_LEVEL_DWM.get()),
     ]
 }
 
@@ -345,4 +360,140 @@ pub(crate) fn umd_command_lists() -> bool {
 /// counter or log-throttle atomic RMWs.
 pub(crate) fn umd_deferred_diagnostics() -> bool {
     UMD_DEFERRED_DIAGNOSTICS.get()
+}
+
+// --- NVK on RM (dxvk-on-nvk S3) ----------------------------------------------
+//
+// Which ICD a process runs on is decided in the bridge
+// (`umd_common/bridge/bridge_icd_backend.h`: `Icd`, `NvkDenyList`,
+// `NvkAllowList`, `NvkIcdPath`, and `ForeignImport` for Venus processes that
+// compose NVK surfaces). These two only shape how an NVK device presents.
+
+/// `NvkPresent`: 0 = automatic (compose through DWM when the KMD gave the back
+/// buffer a resource id, else show it on scanout 0), 1 = always scanout 0
+/// (zero-copy flip of the back buffer; the desktop is hidden while the app
+/// presents), 2 = always the WDDM present (DWM composes).
+pub(crate) static NVK_PRESENT: DwordKnob = DwordKnob::new(c"NvkPresent", 0);
+
+/// `NvkScanoutComposeEvery`: how often a frame that NVK already showed on
+/// scanout 0 also goes through the WDDM present (`pfnPresentCb`) to DWM.
+/// 0 (default) = only the first frame; N = the first and every Nth after it;
+/// 1 = every frame (the behaviour before this knob).
+///
+/// For a blt-model swapchain (`DXGI_SWAP_EFFECT_DISCARD`, windowed: Heaven)
+/// that present is a Blt into DWM's GDI redirection surface: the KMD copies
+/// the frame on the host, waits for the copy on the presenting thread and
+/// mirrors it into the surface's system pages, and dxgkrnl copies it again
+/// through GDI (`DxgkEngBltViaGDI`). Measured 2026-10-06 (Heaven 1600x900,
+/// xperf): about a fifth of the render thread, which made it CPU-bound at
+/// ~170-200 fps against 357 for app-local DXVK, which never presents through
+/// DXGI. DWM's copy is not shown anyway while the app owns scanout 0.
+pub(crate) static NVK_SCANOUT_COMPOSE_EVERY: DwordKnob =
+    DwordKnob::new(c"NvkScanoutComposeEvery", 0);
+
+/// `NvkScanoutComposeEvery`, or `HELIOS_NVK_SCANOUT_COMPOSE_EVERY` from the
+/// process environment.
+pub(crate) fn nvk_scanout_compose_every() -> u32 {
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("HELIOS_NVK_SCANOUT_COMPOSE_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .or_else(|| helios_umd_common::knobs::reg_dword(c"NvkScanoutComposeEvery"))
+            .unwrap_or_else(|| {
+                // A WDDM 2.x D3D11 device must hand every frame to the runtime:
+                // d3d11!NDXGI::CDevice::PresentImpl throttles flip-model presents
+                // on its frame-latency semaphore (2 s timeout per Present), which
+                // is only released through the per-frame WDDM present. Skipping
+                // it after the NVK scanout flip (the 470a978 default) made FFXIV
+                // run at ~0.3 fps under HELIOS_UMD_DDI=2.3. Until the KMD can
+                // retire a "shown on scanout, nothing to copy" present cheaply,
+                // 2.3 processes pay the per-frame present (WDDM 1.3 keeps 0).
+                if crate::ddi_level::ddi_level() == crate::ddi_level::DdiLevel::Wddm2_3 {
+                    1
+                } else {
+                    NVK_SCANOUT_COMPOSE_EVERY.get()
+                }
+            })
+    })
+}
+
+/// `NvkPlaceholderAllocations`: 1 = never ask NVK for resource ids; every
+/// WDDM-backed texture gets a KMD placeholder (A/B and fallback lever).
+pub(crate) static NVK_PLACEHOLDER_ALLOCATIONS: BoolKnob =
+    BoolKnob::new(c"NvkPlaceholderAllocations", false);
+
+/// This process is dwm.exe. DWM on NVK (`DwmIcd=nvk`, docs/dwm-on-nvk.md)
+/// presents only through the WDDM flip: its frames are the desktop, and the
+/// KMD flips its swap-chain buffers (their foreign resource ids) itself.
+pub(crate) fn is_dwm_process() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().eq_ignore_ascii_case("dwm.exe")))
+            .unwrap_or(false)
+    })
+}
+
+/// `NvkPresent`, or `HELIOS_NVK_PRESENT` from the process environment (tests:
+/// one process, no registry write).
+pub(crate) fn nvk_present_mode() -> u32 {
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("HELIOS_NVK_PRESENT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| NVK_PRESENT.get())
+    })
+}
+
+/// `VideoDdi`: which devices get the D3D11.1 video DDI (decoder and video
+/// processor, `forward/video.rs`). 0 = none (the behaviour before it existed:
+/// no `ID3D11VideoDevice` at all), 1 = NVK devices (default; H.264 decode on
+/// Vulkan Video when the NVK build has it), 2 = every device (Venus gets the
+/// DXVK video processor and no decoder). The bridge also sets
+/// `NVK_EXPERIMENTAL=video` for NVK processes unless this is 0
+/// (`umd_common/bridge/bridge_icd_backend.cpp`).
+pub(crate) static VIDEO_DDI: DwordKnob = DwordKnob::new(c"VideoDdi", 1);
+
+pub(crate) fn nvk_placeholder_allocations() -> bool {
+    NVK_PLACEHOLDER_ALLOCATIONS.get()
+}
+
+// --- NVK on RM: RM fences (dxvk-on-nvk S4, docs/rm-fence-marker.md) ---------
+
+/// `NvkRmFence`: 1 (default) = an NVK present hands its flip an RM fence and
+/// does not wait on the CPU for the frame (needs NVK with
+/// `helios_icd_interface` version 3 and a host with DRM fences; the KMD flips
+/// on the fence with capability bit 32, else NVK's flip thread does). 0 = the
+/// S3 CPU wait before every NVK present.
+pub(crate) static NVK_RM_FENCE: BoolKnob = BoolKnob::new(c"NvkRmFence", true);
+
+/// `NvkRmFencePresent`: 1 = when DWM composes an NVK app's frames, the WDDM
+/// present carries the RM fence in its `HEPR`/`HERF` tail and the KMD retires
+/// the present on it (needs capability bit 33, the KMD's (b) carrier).
+/// 0 (default until that KMD is tested) = the S3 CPU wait for composed frames.
+pub(crate) static NVK_RM_FENCE_PRESENT: BoolKnob = BoolKnob::new(c"NvkRmFencePresent", false);
+
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name).ok().and_then(|v| match v.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    })
+}
+
+/// `NvkRmFence`, or `HELIOS_NVK_RM_FENCE` from the process environment.
+pub(crate) fn nvk_rm_fence() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| env_bool("HELIOS_NVK_RM_FENCE").unwrap_or_else(|| NVK_RM_FENCE.get()))
+}
+
+/// `NvkRmFencePresent`, or `HELIOS_NVK_RM_FENCE_PRESENT` from the environment.
+pub(crate) fn nvk_rm_fence_present() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        env_bool("HELIOS_NVK_RM_FENCE_PRESENT").unwrap_or_else(|| NVK_RM_FENCE_PRESENT.get())
+    })
 }

@@ -12,6 +12,7 @@
 #include <sddl.h>
 
 #include <cstddef>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -47,6 +48,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 #include "dxvk_instance.h"
 #include "dxvk_adapter.h"
@@ -64,10 +66,13 @@
 #include "d3d11_context_imm.h"
 #include "dxvk_helios_feed_trace.h"
 #include "dxvk_helios_producer.h"
+#include "dxvk_helios_backend.h"
 
 // After the DXVK headers: see the include-order note in this header.
 #include "bridge_icd_anchor.h"
+#include "bridge_icd_backend.h"
 #include "bridge_icd_exports.h"
+#include "helios_icd_interface.h"
 
 // ── the shared bridge_guard, with this bridge's one engine-specific arm ──────
 //
@@ -209,6 +214,21 @@ namespace helios_bridge {
       _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                   "C:\\ProgramData\\Helios\\umd-%lu.log",
                   (unsigned long)GetCurrentProcessId());
+      // A same-named file left by an earlier process with this pid under
+      // another account may refuse our append (docs/dwm-on-nvk.md, T3): then
+      // the name also carries the process creation time, as umd_common's
+      // log.rs computes it.
+      if (FILE* probe = _fsopen(buf, "a", _SH_DENYNO)) {
+        fclose(probe);
+      } else if (GetFileAttributesA(buf) != INVALID_FILE_ATTRIBUTES) {
+        FILETIME c = {}, e = {}, k = {}, u = {};
+        unsigned long long created = 0;
+        if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u))
+          created = (static_cast<unsigned long long>(c.dwHighDateTime) << 32) | c.dwLowDateTime;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "C:\\ProgramData\\Helios\\umd-%lu-%llx.log",
+                    (unsigned long)GetCurrentProcessId(), created);
+      }
       return std::string(buf);
     }();
     return path.c_str();
@@ -225,6 +245,11 @@ namespace helios_bridge {
     if (f) {
       fprintf(f, "[dxvk-bridge] %s\n", msg);
       fclose(f);
+    } else {
+      // Not ours to create (sandboxed process): umd_common's fallbacks.
+      char line[1100];
+      _snprintf_s(line, sizeof(line), _TRUNCATE, "[dxvk-bridge] %s", msg);
+      helios_umd_log_raw(line);
     }
   }
 
@@ -323,6 +348,11 @@ struct HeliosDxvkDeviceImpl {
   ID3D11Device*        d3d11   = nullptr; // QI'd from D3D11DXGIDevice; holds it alive
   ID3D11DeviceContext* context = nullptr; // immediate context
   std::uint32_t venus_ctx_id = 0;
+  // The ICD under DXVK and its backend-neutral table (helios_icd_interface.h):
+  // the Venus ICD's helios_venus_* exports wrapped (venus_icd_api), or NVK's
+  // helios_icd_interface_v2.
+  helios_bridge::IcdBackend backend = helios_bridge::IcdBackend::Venus;
+  helios_icd_api icd = {};
   // WSI borrows its handle only until Present returns. Keep a duplicate for
   // exact object comparison and an imported semaphore for the helper device.
   std::mutex vehicle_semaphore_mutex;
@@ -344,7 +374,26 @@ struct HeliosDxvkDeviceImpl {
   // Registration failure is terminal; it never permits an unordered read.
   std::uint64_t present_stream_cookie = 0;
 
+  // Flush gate: the CS sequence number the last gate covered (UINT64_MAX:
+  // none yet), so an empty flush sends nothing. Guarded by flush_gate_mutex.
+  std::mutex flush_gate_mutex;
+  std::uint64_t flush_gate_seq = UINT64_MAX;
+
+  // Hand-off ledger (helios_handoff): this device's record and its
+  // generation, the local timeline and last point. Guarded by
+  // flush_gate_mutex; the record is freed in the destructor.
+  std::uint32_t handoff_device = UINT32_MAX;
+  std::uint32_t handoff_gen = 0;
+  void* handoff_table = nullptr;
+  dxvk::Rc<dxvk::DxvkFence> handoff_fence;
+  std::uint64_t handoff_value = 0;
+
+  // Defined after helios_handoff: free this device's ledger record once its
+  // last point is done (so no late completion lands in a reused record).
+  void release_handoff_record();
+
   ~HeliosDxvkDeviceImpl() {
+    release_handoff_record();
     if (vehicle_semaphore_handle) CloseHandle(vehicle_semaphore_handle);
     if (context) context->Release();
     if (d3d11) d3d11->Release();
@@ -406,6 +455,1200 @@ std::size_t HeliosDxvkDevice::d3d11_context_ptr() const {
 
 std::uint32_t HeliosDxvkDevice::venus_context_id() const {
   return impl ? impl->venus_ctx_id : 0;
+}
+
+std::uint32_t HeliosDxvkDevice::icd_backend() const {
+  return impl ? static_cast<std::uint32_t>(impl->backend) : 0;
+}
+
+namespace {
+  // The texture's image and the memory it is bound to, or false.
+  bool texture_image_memory(std::size_t d3d11_resource_ptr, VkImage* image,
+                            VkDeviceMemory* memory, VkDeviceSize* offset) {
+    if (!d3d11_resource_ptr)
+      return false;
+    auto* texture = dxvk::GetCommonTexture(
+      reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr));
+    if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
+      return false;
+    auto img = texture->GetImage();
+    auto info = img->storage()->getMemoryInfo();
+    *image = img->handle();
+    *memory = info.memory;
+    *offset = info.offset;
+    return *image != VK_NULL_HANDLE && *memory != VK_NULL_HANDLE;
+  }
+}
+
+// ---- Cross-process hand-off ledger (docs/shared-surfaces.md section 4) -----
+//
+// One shared table per Windows session ("Local\\HeliosHandoffLedger5"), used by
+// every process with the Helios UMD. At a hand-off (a flush of a device that
+// holds cross-process shared resources) the releaser writes, for each of those
+// resources keyed by its KMD resource id, "device record d (generation g),
+// point p" in that device's entry of the slot (a slot keeps one entry per
+// publishing device, so the reader's own publication never hides the
+// releaser's); a fence worker of the releaser's DXVK device stores
+// `completed = p` into record d when the GPU finished everything recorded
+// before the hand-off. Any first access of a shared image in a reader's
+// command list samples the slot and its submission worker waits until record
+// d (still generation g) completes p (DXVK patch 0007). So the releaser never
+// waits, the acquirer waits only for that producer, and nothing heads the
+// adapter's queue, on Venus and NVK alike.
+//
+// Reclamation: a slot lists the processes that hold its resource (up to four
+// pids, more are counted) and is freed when the last one lets go; a device
+// record is freed when its device goes and taken over when its process is
+// gone. Slots and records whose processes died are swept when the table runs
+// low. Counters in the header: slots and records in use, fallbacks, sweeps.
+namespace helios_handoff {
+  constexpr std::uint32_t kMagic   = 0x354C4448u; // 'HDL5'
+  constexpr std::uint32_t kDevices = 4096u;
+  constexpr std::uint32_t kSlots   = 32768u;
+  constexpr std::uint32_t kProbe   = 64u;
+  constexpr std::uint32_t kPids    = 4u;
+  constexpr std::uint32_t kEntries = 4u; // publishing devices per resource
+  constexpr std::uint32_t kTombstone = 0xFFFFFFFFu;
+  // packed = device (12 bits) << 52 | generation (12 bits) << 40 | point (40 bits)
+  constexpr std::uint64_t kPointMask = (1ull << 40) - 1ull;
+  constexpr std::uint32_t kGenMask = 0xFFFu;
+
+  constexpr std::uint32_t kRecent = 12u; // published points kept per device
+  struct Device {
+    std::atomic<std::uint32_t> pid;
+    std::atomic<std::uint32_t> gen;
+    std::atomic<std::uint64_t> completed;
+    // The device's last kRecent published points (ring, written by its one
+    // publisher): a reader whose bound is below the device's latest point
+    // needs the latest one before its bound (sample_before), which the slot
+    // (latest point only) no longer has.
+    std::atomic<std::uint64_t> recent[kRecent];
+    std::atomic<std::uint32_t> recent_head;
+    std::uint32_t reserved;
+  };
+  struct Slot {
+    std::atomic<std::uint32_t> key;
+    std::atomic<std::uint32_t> extra_holders; // holders beyond `pids`
+    std::atomic<std::uint32_t> pids[kPids];
+    std::atomic<std::uint64_t> points[kEntries]; // packed, one per publishing device
+    std::uint64_t reserved;
+  };
+  struct Table {
+    std::atomic<std::uint32_t> magic;
+    std::uint32_t version;
+    std::atomic<std::uint32_t> next_device;
+    std::atomic<std::uint32_t> records_in_use;
+    std::atomic<std::uint32_t> slots_in_use;
+    std::atomic<std::uint32_t> fallbacks;
+    std::atomic<std::uint32_t> sweeps;
+    std::atomic<std::uint32_t> handoffs;
+    // Points are this ledger-wide sequence (not per device), so points of
+    // different devices compare in publication order (sample_before).
+    std::atomic<std::uint64_t> publish_seq;
+    Device devices[kDevices];
+    Slot slots[kSlots];
+  };
+  static_assert(sizeof(Device) == 16 + 8 * kRecent + 8 && sizeof(Slot) == 64, "ledger layout");
+  static_assert(sizeof(Table) == 40 + sizeof(Device) * kDevices + sizeof(Slot) * kSlots, "ledger header");
+
+  inline std::uint64_t pack(std::uint32_t dev, std::uint32_t gen, std::uint64_t point) {
+    return (std::uint64_t(dev) << 52) | (std::uint64_t(gen & kGenMask) << 40) | (point & kPointMask);
+  }
+
+  Table* table() {
+    static Table* s_table = []() -> Table* {
+      // Every principal of the session (DWM runs as its own user) may map it.
+      SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, FALSE };
+      PSECURITY_DESCRIPTOR sd = nullptr;
+      if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;GA;;;WD)(A;;GA;;;SY)(A;;GA;;;AC)S:(ML;;NW;;;LW)", SDDL_REVISION_1, &sd, nullptr))
+        sa.lpSecurityDescriptor = sd;
+      SetLastError(0);
+      HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, sa.lpSecurityDescriptor ? &sa : nullptr,
+        PAGE_READWRITE, 0, DWORD(sizeof(Table)), L"Local\\HeliosHandoffLedger5");
+      const DWORD create_error = GetLastError();
+      if (sd)
+        LocalFree(sd);
+      DWORD session = 0;
+      ProcessIdToSessionId(GetCurrentProcessId(), &session);
+      if (!mapping) {
+        char msg[200];
+        std::snprintf(msg, sizeof(msg), "handoff: ledger section not created (error %lu, session %lu)",
+                      create_error, session);
+        umd_log(msg);
+        return nullptr;
+      }
+      // The kernel name of the section: two processes share the ledger only
+      // when this is the same path.
+      char kname[160] = "?";
+      using NtQueryObjectFn = LONG(WINAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+      if (auto* query = reinterpret_cast<NtQueryObjectFn>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject"))) {
+        alignas(8) unsigned char buf[1024] = {};
+        ULONG len = 0;
+        // ObjectNameInformation (1): a UNICODE_STRING followed by its text.
+        if (query(mapping, 1, buf, sizeof(buf), &len) >= 0) {
+          struct Name { USHORT Length, MaximumLength; const wchar_t* Buffer; };
+          const auto* us = reinterpret_cast<const Name*>(buf);
+          if (us->Buffer)
+            std::snprintf(kname, sizeof(kname), "%.*ls", int(us->Length / sizeof(wchar_t)), us->Buffer);
+        }
+      }
+      auto* t = static_cast<Table*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Table)));
+      // The handle and the view stay for the life of the process. A view keeps
+      // the section object alive but not its name: the name leaves the
+      // session's namespace with the last handle, and the next process then
+      // created a new, empty section under it (each process had its own
+      // table on 320.1).
+      if (!t)
+        CloseHandle(mapping);
+      {
+        char msg[400];
+        std::snprintf(msg, sizeof(msg),
+          "handoff: ledger section %s (%s, pid %lu, session %lu, %zu bytes) at %p: magic %08x, "
+          "%u records claimed so far, %u in use",
+          kname, create_error == ERROR_ALREADY_EXISTS ? "opened existing" : "created", GetCurrentProcessId(), session,
+          sizeof(Table), static_cast<void*>(t), t ? t->magic.load() : 0u, t ? t->next_device.load() : 0u,
+          t ? t->records_in_use.load() : 0u);
+        umd_log(msg);
+      }
+      if (!t)
+        return nullptr;
+      std::uint32_t zero = 0;
+      t->magic.compare_exchange_strong(zero, kMagic);
+      if (t->magic.load() != kMagic)
+        return nullptr;
+      return t;
+    }();
+    return s_table;
+  }
+
+  // Opt-in (HELIOS_HANDOFF_LEDGER=1, in every sharing process) until the
+  // cross-process table is verified; the default is the releaser CPU wait
+  // (forward/transfer.rs).
+  bool enabled() {
+    static const bool on = []() {
+      const char* v = std::getenv("HELIOS_HANDOFF_LEDGER");
+      return v && v[0] == '1';
+    }();
+    return on;
+  }
+
+  bool trace() {
+    static const bool on = []() {
+      const char* v = std::getenv("HELIOS_HANDOFF_TRACE");
+      return v && v[0] == '1';
+    }();
+    return on;
+  }
+
+  void trace_line(const char* fmt, ...) {
+    static std::atomic<std::uint32_t> s_lines{0};
+    if (!trace() || s_lines.fetch_add(1) >= 2000)
+      return;
+    char msg[256];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    umd_log(msg);
+  }
+
+  bool process_alive(std::uint32_t pid) {
+    if (!pid)
+      return false;
+    if (pid == GetCurrentProcessId())
+      return true;
+    HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!p)
+      return GetLastError() == ERROR_ACCESS_DENIED; // exists, not ours to open
+    const bool alive = WaitForSingleObject(p, 0) == WAIT_TIMEOUT;
+    CloseHandle(p);
+    return alive;
+  }
+
+  // ---- device records
+
+  void free_device(Table* t, std::uint32_t d) {
+    Device& dev = t->devices[d];
+    dev.completed.store(UINT64_MAX, std::memory_order_release);
+    dev.gen.fetch_add(1, std::memory_order_acq_rel);
+    dev.pid.store(0, std::memory_order_release);
+    t->records_in_use.fetch_sub(1);
+  }
+
+  // A fresh record, else a freed one, else one whose process is gone.
+  std::uint32_t claim_device(Table* t, std::uint32_t* gen_out) {
+    const std::uint32_t me = GetCurrentProcessId();
+    auto take = [&](std::uint32_t d) {
+      Device& dev = t->devices[d];
+      const std::uint32_t gen = dev.gen.fetch_add(1, std::memory_order_acq_rel) + 1;
+      dev.completed.store(0, std::memory_order_release);
+      for (auto& r : dev.recent)
+        r.store(0, std::memory_order_relaxed);
+      dev.recent_head.store(0, std::memory_order_release);
+      *gen_out = gen;
+      t->records_in_use.fetch_add(1);
+      return d;
+    };
+    std::uint32_t d = t->next_device.load();
+    while (d < kDevices) {
+      if (t->next_device.compare_exchange_weak(d, d + 1)) {
+        t->devices[d].pid.store(me);
+        return take(d);
+      }
+    }
+    for (std::uint32_t i = 0; i < kDevices; i++) {
+      std::uint32_t zero = 0;
+      if (t->devices[i].pid.compare_exchange_strong(zero, me))
+        return take(i);
+    }
+    t->sweeps.fetch_add(1);
+    for (std::uint32_t i = 0; i < kDevices; i++) {
+      std::uint32_t pid = t->devices[i].pid.load();
+      if (pid && !process_alive(pid) && t->devices[i].pid.compare_exchange_strong(pid, me)) {
+        t->records_in_use.fetch_sub(1);
+        return take(i);
+      }
+    }
+    return UINT32_MAX;
+  }
+
+  // ---- slots
+
+  Slot* find(Table* t, std::uint32_t key) {
+    std::uint32_t h = (key * 2654435761u) % kSlots;
+    for (std::uint32_t i = 0; i < kProbe; i++, h = (h + 1) % kSlots) {
+      const std::uint32_t k = t->slots[h].key.load(std::memory_order_acquire);
+      if (k == key)
+        return &t->slots[h];
+      if (k == 0)
+        return nullptr;
+    }
+    return nullptr;
+  }
+
+  void sweep_slots(Table* t);
+
+  Slot* find_or_claim(Table* t, std::uint32_t key) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+      if (Slot* s = find(t, key))
+        return s;
+      std::uint32_t h = (key * 2654435761u) % kSlots;
+      for (std::uint32_t i = 0; i < kProbe; i++, h = (h + 1) % kSlots) {
+        Slot& s = t->slots[h];
+        std::uint32_t k = s.key.load(std::memory_order_acquire);
+        if (k == key)
+          return &s;
+        if (k == 0 || k == kTombstone) {
+          if (s.key.compare_exchange_strong(k, key)) {
+            for (auto& e : s.points)
+              e.store(0, std::memory_order_release);
+            s.extra_holders.store(0);
+            for (auto& p : s.pids)
+              p.store(0);
+            t->slots_in_use.fetch_add(1);
+            return &s;
+          }
+          if (k == key)
+            return &s;
+        }
+      }
+      sweep_slots(t); // full window: reclaim what dead processes left
+    }
+    return nullptr;
+  }
+
+  bool slot_empty(const Slot& s) {
+    if (s.extra_holders.load())
+      return false;
+    for (const auto& p : s.pids)
+      if (p.load())
+        return false;
+    return true;
+  }
+
+  void maybe_free_slot(Table* t, Slot& s, std::uint32_t key) {
+    if (!slot_empty(s))
+      return;
+    std::uint32_t k = key;
+    if (s.key.compare_exchange_strong(k, kTombstone)) {
+      for (auto& e : s.points)
+        e.store(0, std::memory_order_release);
+      t->slots_in_use.fetch_sub(1);
+    }
+  }
+
+  void add_holder(Slot& s, std::uint32_t pid) {
+    for (auto& p : s.pids)
+      if (p.load() == pid)
+        return;
+    for (auto& p : s.pids) {
+      std::uint32_t zero = 0;
+      if (p.compare_exchange_strong(zero, pid))
+        return;
+    }
+    s.extra_holders.fetch_add(1);
+  }
+
+  void remove_holder(Slot& s, std::uint32_t pid) {
+    for (auto& p : s.pids) {
+      std::uint32_t mine = pid;
+      if (p.compare_exchange_strong(mine, 0))
+        return;
+    }
+    std::uint32_t extra = s.extra_holders.load();
+    while (extra && !s.extra_holders.compare_exchange_weak(extra, extra - 1)) { }
+  }
+
+  void sweep_slots(Table* t) {
+    static std::mutex s_sweep;
+    std::unique_lock lock(s_sweep, std::try_to_lock);
+    if (!lock.owns_lock())
+      return;
+    t->sweeps.fetch_add(1);
+    for (std::uint32_t i = 0; i < kSlots; i++) {
+      Slot& s = t->slots[i];
+      const std::uint32_t key = s.key.load();
+      if (key == 0 || key == kTombstone)
+        continue;
+      for (auto& p : s.pids) {
+        std::uint32_t pid = p.load();
+        if (pid && !process_alive(pid))
+          p.compare_exchange_strong(pid, 0);
+      }
+      // Holders beyond the pid list cannot be checked: such a slot stays.
+      maybe_free_slot(t, s, key);
+    }
+  }
+
+  // Process-local count of registrations per key (several devices or
+  // resources of one process may hold the same resource id).
+  std::mutex s_local_mutex;
+  std::unordered_map<std::uint32_t, std::uint32_t>& local_holds() {
+    static std::unordered_map<std::uint32_t, std::uint32_t> holds;
+    return holds;
+  }
+
+  void hold(std::uint32_t key) {
+    Table* t = table();
+    if (!t || !key)
+      return;
+    std::lock_guard lock(s_local_mutex);
+    if (local_holds()[key]++ == 0) {
+      if (Slot* s = find_or_claim(t, key))
+        add_holder(*s, GetCurrentProcessId());
+      else
+        t->fallbacks.fetch_add(1);
+    }
+  }
+
+  void release(std::uint32_t key) {
+    Table* t = table();
+    if (!t || !key)
+      return;
+    std::lock_guard lock(s_local_mutex);
+    auto it = local_holds().find(key);
+    if (it == local_holds().end() || --it->second != 0)
+      return;
+    local_holds().erase(it);
+    if (Slot* s = find(t, key)) {
+      remove_holder(*s, GetCurrentProcessId());
+      maybe_free_slot(t, *s, key);
+    }
+  }
+
+  // ---- publishing: this device's entry of a slot
+
+  // An entry is free for a new device when it is empty, its record moved on
+  // (generation) or its point completed.
+  bool entry_done(Table* t, std::uint64_t packed) {
+    if (!packed)
+      return true;
+    const std::uint32_t d = std::uint32_t(packed >> 52);
+    if (d >= kDevices)
+      return true;
+    const Device& dev = t->devices[d];
+    return (dev.gen.load(std::memory_order_acquire) & kGenMask) != (std::uint32_t(packed >> 40) & kGenMask)
+        || dev.completed.load(std::memory_order_acquire) >= (packed & kPointMask);
+  }
+
+  // false: no entry could take it (more than kEntries devices with pending
+  // points on one resource); counted as a fallback by the caller.
+  bool publish_point(Table* t, Slot& s, std::uint64_t packed) {
+    constexpr std::uint64_t kDeviceGen = ~kPointMask;
+    for (auto& e : s.points) {
+      std::uint64_t cur = e.load(std::memory_order_acquire);
+      if (cur && (cur & kDeviceGen) == (packed & kDeviceGen)) {
+        while ((cur & kDeviceGen) == (packed & kDeviceGen) && (cur & kPointMask) < (packed & kPointMask)
+            && !e.compare_exchange_weak(cur, packed, std::memory_order_acq_rel)) { }
+        return true;
+      }
+    }
+    for (auto& e : s.points) {
+      std::uint64_t cur = e.load(std::memory_order_acquire);
+      if (entry_done(t, cur) && e.compare_exchange_strong(cur, packed, std::memory_order_acq_rel))
+        return true;
+    }
+    return false;
+  }
+
+  // ---- dxvk_helios_backend.h hooks
+
+  std::uint32_t sample_all(std::uint32_t key, std::uint64_t* out, std::uint32_t max) {
+    Table* t = table();
+    if (!t || !key)
+      return 0;
+    Slot* s = find(t, key);
+    if (!s) {
+      trace_line("handoff trace: sample key %u: no slot", key);
+      return 0;
+    }
+    const std::uint32_t me = GetCurrentProcessId();
+    std::uint32_t n = 0;
+    for (auto& e : s->points) {
+      const std::uint64_t packed = e.load(std::memory_order_acquire);
+      if (!packed || entry_done(t, packed))
+        continue;
+      const std::uint32_t d = std::uint32_t(packed >> 52);
+      if (t->devices[d].pid.load(std::memory_order_relaxed) == me)
+        continue; // our own hand-off: same-process order is DXVK's
+      if (n < max)
+        out[n++] = packed;
+    }
+    trace_line("handoff trace: sample key %u: %u pending point(s) of other processes", key, n);
+    return n;
+  }
+
+  std::uint64_t sample(std::uint32_t key) {
+    std::uint64_t point = 0;
+    return sample_all(key, &point, 1) ? point : 0;
+  }
+
+  // Own hand-off points published (application thread) whose signal the
+  // device's CS thread has not reached yet, per DxvkDevice, in order.
+  std::mutex s_pending_mutex;
+  std::unordered_map<const void*, std::vector<std::uint64_t>>& pending_points() {
+    static std::unordered_map<const void*, std::vector<std::uint64_t>> pending;
+    return pending;
+  }
+
+  void pending_push(const void* device, std::uint64_t point) {
+    std::lock_guard lock(s_pending_mutex);
+    auto& v = pending_points()[device];
+    v.push_back(point);
+    trace_line("handoff trace: device %p publishes point %llu (%zu not reached by its CS thread)", device,
+               static_cast<unsigned long long>(point), v.size());
+  }
+
+  void pending_forget(const void* device) {
+    std::lock_guard lock(s_pending_mutex);
+    pending_points().erase(device);
+  }
+
+  void cs_reached(const void* device, std::uint64_t point) {
+    std::lock_guard lock(s_pending_mutex);
+    auto it = pending_points().find(device);
+    if (it == pending_points().end())
+      return;
+    auto& v = it->second;
+    std::size_t done = 0;
+    while (done < v.size() && v[done] <= point)
+      done++;
+    v.erase(v.begin(), v.begin() + done);
+    trace_line("handoff trace: device %p CS thread reached point %llu (%zu left, next %llu)", device,
+               static_cast<unsigned long long>(point), v.size(),
+               static_cast<unsigned long long>(v.empty() ? 0ull : v.front()));
+  }
+
+  // The work the CS thread records now was issued before the device's next
+  // own point it has not reached; a point published after that one cannot
+  // be a dependency, and waiting for it could close a cycle with the other
+  // process (DXVK patch 0011).
+  std::uint32_t sample_before(std::uint32_t key, const void* device, std::uint64_t* out,
+                              std::uint32_t max) {
+    std::uint64_t bound = kPointMask;
+    {
+      std::lock_guard lock(s_pending_mutex);
+      auto it = pending_points().find(device);
+      if (it != pending_points().end() && !it->second.empty())
+        bound = it->second.front();
+    }
+    std::uint64_t all[kEntries];
+    const std::uint32_t n = sample_all(key, all, kEntries);
+    Table* t = table();
+    std::uint32_t kept = 0;
+    for (std::uint32_t i = 0; i < n; i++) {
+      bool from_history = false;
+      if ((all[i] & kPointMask) >= bound && t) {
+        // The device's latest point is too new for this work; its latest
+        // point before our bound, from its history, is the dependency.
+        const std::uint32_t d = std::uint32_t(all[i] >> 52);
+        const Device& dev = t->devices[d];
+        std::uint64_t best = 0, oldest = kPointMask;
+        std::uint32_t filled = 0;
+        for (const auto& r : dev.recent) {
+          const std::uint64_t v = r.load(std::memory_order_acquire);
+          if (!v)
+            continue;
+          filled++;
+          if (v < oldest)
+            oldest = v;
+          if (v < bound && v > best)
+            best = v;
+        }
+        if (!best && filled == kRecent) {
+          // History too short (more than kRecent points of that device since
+          // our bound): wait for its oldest known one, conservative.
+          best = oldest;
+          trace_line("handoff trace: key %u: record %u history too short for bound %llu, waits for %llu", key, d,
+                     static_cast<unsigned long long>(bound), static_cast<unsigned long long>(best));
+        }
+        if (!best || dev.completed.load(std::memory_order_acquire) >= best) {
+          trace_line("handoff trace: key %u: record %u has nothing pending before our next point %llu", key, d,
+                     static_cast<unsigned long long>(bound));
+          continue;
+        }
+        all[i] = (all[i] & ~kPointMask) | best;
+        from_history = true;
+      }
+      if (from_history || (all[i] & kPointMask) < bound) {
+        trace_line("handoff trace: device %p key %u waits for point %llu of record %u (bound %llu)", device, key,
+                   static_cast<unsigned long long>(all[i] & kPointMask), unsigned(all[i] >> 52),
+                   static_cast<unsigned long long>(bound));
+        if (kept < max)
+          out[kept++] = all[i];
+      } else {
+        trace_line("handoff trace: key %u: point %llu is after our next point %llu, not a dependency", key,
+                   static_cast<unsigned long long>(all[i] & kPointMask),
+                   static_cast<unsigned long long>(bound));
+      }
+    }
+    return kept;
+  }
+
+  bool wait(std::uint32_t, std::uint64_t packed, std::uint64_t timeout_ns) {
+    Table* t = table();
+    if (!t)
+      return true;
+    const std::uint32_t d = std::uint32_t(packed >> 52);
+    const std::uint32_t gen = std::uint32_t(packed >> 40) & kGenMask;
+    const std::uint64_t point = packed & kPointMask;
+    if (d >= kDevices)
+      return true;
+    const Device& dev = t->devices[d];
+    LARGE_INTEGER f, t0, now;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    for (std::uint32_t spin = 0;; spin++) {
+      if ((dev.gen.load(std::memory_order_acquire) & kGenMask) != gen
+       || dev.completed.load(std::memory_order_acquire) >= point) {
+        if (spin > 256)
+          trace_line("handoff trace: point %llu of record %u done after %u spins", static_cast<unsigned long long>(point), d, spin);
+        return true;
+      }
+      QueryPerformanceCounter(&now);
+      const double ns = double(now.QuadPart - t0.QuadPart) * 1e9 / double(f.QuadPart);
+      if (ns >= double(timeout_ns)) {
+        const bool gone = !process_alive(dev.pid.load(std::memory_order_relaxed));
+        static std::atomic<std::uint32_t> s_timeouts{0};
+        const std::uint32_t k = s_timeouts.fetch_add(1) + 1;
+        if (!gone && (k <= 8 || (k % 1024) == 0)) {
+          char msg[160];
+          std::snprintf(msg, sizeof(msg),
+            "handoff: wait for point %llu of record %u still pending after %llu ms (%u so far)",
+            static_cast<unsigned long long>(point), d,
+            static_cast<unsigned long long>(timeout_ns / 1000000ull), k);
+          umd_log(msg);
+        }
+        return gone; // gone: done
+      }
+      if (spin < 64)
+        YieldProcessor();
+      else if (spin < 256)
+        SwitchToThread();
+      else
+        Sleep(1);
+    }
+  }
+
+  const dxvk::HeliosHandoffHooks kHooks = { &sample, &wait, &sample_all, &sample_before, &cs_reached };
+
+  void install_hooks_once() {
+    static const bool done = []() {
+      if (enabled() && table())
+        dxvk::heliosSetHandoffHooks(&kHooks);
+      return true;
+    }();
+    (void)done;
+  }
+}
+
+void HeliosDxvkDeviceImpl::release_handoff_record() {
+  if (handoff_device == UINT32_MAX || !handoff_table)
+    return;
+  if (handoff_fence != nullptr && handoff_value)
+    (void)handoff_fence->waitBounded(handoff_value, 2000000000ull);
+  helios_handoff::free_device(static_cast<helios_handoff::Table*>(handoff_table), handoff_device);
+  handoff_device = UINT32_MAX;
+  if (device != nullptr)
+    helios_handoff::pending_forget(device.ptr());
+}
+
+namespace {
+  // The ledger key of a shared texture: its KMD resource id. An import has it
+  // from the open; our own resource asks the ICD (Venus blob / NVK IMPORT_RM
+  // id, cached by the ICD) once and keeps it on the image.
+  std::uint32_t handoff_key(HeliosDxvkDeviceImpl& d, std::size_t resource) {
+    auto* texture = dxvk::GetCommonTexture(reinterpret_cast<ID3D11Resource*>(resource));
+    if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
+      return 0;
+    auto image = texture->GetImage();
+    std::uint32_t key = image->heliosHandoffKey();
+    if (key || !d.icd.memory_res_id || d.device == nullptr)
+      return key;
+    VkImage vkImage = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    if (!texture_image_memory(resource, &vkImage, &memory, &offset) || offset != 0)
+      return 0;
+    std::uint32_t res = 0;
+    if (d.icd.memory_res_id(d.device->vkd()->device(), memory, vkImage, &res, nullptr) != VK_SUCCESS)
+      return 0;
+    image->setHeliosHandoffKey(res);
+    return res;
+  }
+}
+
+void HeliosDxvkDevice::handoff_register(std::size_t d3d11_resource_ptr) const noexcept {
+  bridge_guard("handoff_register", false, [&]() -> bool {
+    if (!impl || !helios_handoff::enabled())
+      return false;
+    helios_handoff::install_hooks_once();
+    const std::uint32_t key = handoff_key(*impl, d3d11_resource_ptr);
+    helios_handoff::hold(key);
+    helios_handoff::trace_line("handoff trace: register resource %p key %u",
+                               reinterpret_cast<void*>(d3d11_resource_ptr), key);
+    return key != 0;
+  });
+}
+
+void HeliosDxvkDevice::handoff_unregister(std::size_t d3d11_resource_ptr) const noexcept {
+  bridge_guard("handoff_unregister", false, [&]() -> bool {
+    if (!impl || !helios_handoff::enabled())
+      return false;
+    auto* texture = dxvk::GetCommonTexture(reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr));
+    if (!texture || !texture->GetImage())
+      return false;
+    helios_handoff::release(texture->GetImage()->heliosHandoffKey());
+    return true;
+  });
+}
+
+std::int32_t HeliosDxvkDevice::handoff_publish(const std::size_t* resources,
+                                               std::uint32_t resource_count) const noexcept {
+  if (!impl || !impl->context || impl->device == nullptr || !helios_handoff::enabled())
+    return -1;
+  return bridge_guard("handoff_publish", std::int32_t(-2), [&]() -> std::int32_t {
+    auto* table = helios_handoff::table();
+    if (!table)
+      return -1;
+    helios_handoff::install_hooks_once();
+    auto* immediate = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
+    std::lock_guard gate(impl->flush_gate_mutex);
+    const std::uint64_t seq = immediate->HeliosFlushSequence();
+    if (seq == impl->flush_gate_seq)
+      return 0;
+    if (impl->handoff_device == UINT32_MAX) {
+      impl->handoff_device = helios_handoff::claim_device(table, &impl->handoff_gen);
+      if (impl->handoff_device == UINT32_MAX) {
+        table->fallbacks.fetch_add(1);
+        return -1; // no record free: the caller falls back, counted
+      }
+      if (impl->handoff_fence == nullptr) {
+        dxvk::DxvkFenceCreateInfo info = { };
+        info.initialValue = 0;
+        impl->handoff_fence = impl->device->createFence(info);
+      }
+      impl->handoff_table = table;
+    }
+    const std::uint64_t point = table->publish_seq.fetch_add(1) + 1;
+    if (point > helios_handoff::kPointMask) {
+      table->fallbacks.fetch_add(1);
+      return -1;
+    }
+    impl->handoff_value = point;
+    // Pending from before anyone can see it until the CS thread reaches its
+    // signal (sample_before).
+    helios_handoff::pending_push(impl->device.ptr(), point);
+    {
+      auto& rec = table->devices[impl->handoff_device];
+      const std::uint32_t h = rec.recent_head.fetch_add(1, std::memory_order_relaxed);
+      rec.recent[h % helios_handoff::kRecent].store(point, std::memory_order_release);
+    }
+    const std::uint64_t packed = helios_handoff::pack(impl->handoff_device, impl->handoff_gen, point);
+    std::uint32_t published = 0;
+    bool overflow = false;
+    for (std::uint32_t i = 0; resources && i < resource_count; i++) {
+      const std::uint32_t key = handoff_key(*impl, resources[i]);
+      if (!key)
+        continue;
+      auto* slot = helios_handoff::find(table, key);
+      if (!slot) {
+        // Registered but no slot (it was full then): try again now.
+        helios_handoff::hold(key);
+        slot = helios_handoff::find(table, key);
+      }
+      if (!slot || !helios_handoff::publish_point(table, *slot, packed)) {
+        overflow = true;
+        continue;
+      }
+      helios_handoff::trace_line("handoff trace: publish key %u point %llu record %u", key,
+                                 static_cast<unsigned long long>(point), impl->handoff_device);
+      published++;
+    }
+    impl->flush_gate_seq = immediate->HeliosSignalHandoffPoint(impl->handoff_fence, point);
+    auto* record = &table->devices[impl->handoff_device];
+    const std::uint32_t gen = impl->handoff_gen;
+    const std::uint32_t record_index = impl->handoff_device;
+    impl->handoff_fence->enqueueWait(point, [record, gen, point, record_index]() {
+      if (record->gen.load(std::memory_order_acquire) != gen)
+        return; // the record went with its device
+      helios_handoff::trace_line("handoff trace: record %u completed point %llu", record_index,
+                                 static_cast<unsigned long long>(point));
+      std::uint64_t cur = record->completed.load(std::memory_order_relaxed);
+      while (cur < point && !record->completed.compare_exchange_weak(
+               cur, point, std::memory_order_release, std::memory_order_relaxed)) { }
+    });
+    const auto n = table->handoffs.fetch_add(1) + 1;
+    if (overflow)
+      table->fallbacks.fetch_add(1);
+    static std::atomic<std::uint32_t> s_logs{0};
+    if (overflow || s_logs.fetch_add(1) < 4 || (n % 4096u) == 0) {
+      char msg[256];
+      std::snprintf(msg, sizeof(msg),
+        "handoff: point %llu of record %u on %u resource(s)%s; ledger: %u slots, %u records "
+        "in use, %u fallbacks, %u sweeps, %u hand-offs",
+        static_cast<unsigned long long>(point), impl->handoff_device, published,
+        overflow ? ", LEDGER FULL for some" : "", table->slots_in_use.load(),
+        table->records_in_use.load(), table->fallbacks.load(), table->sweeps.load(), n);
+      umd_log(msg);
+    }
+    return overflow ? -1 : 1;
+  });
+}
+
+
+bool HeliosDxvkDevice::get_resource_foreign_identity(
+    std::size_t d3d11_resource_ptr,
+    std::uint32_t* resource_id,
+    std::uint32_t* ctx_id,
+    std::uint64_t* size,
+    std::uint64_t* modifier,
+    std::uint32_t* stride,
+    std::uint32_t* offset,
+    std::uint32_t* fourcc,
+    std::uint64_t* plane1_modifier,
+    std::uint32_t* plane1_stride,
+    std::uint32_t* plane1_offset) const noexcept {
+  return bridge_guard("get_resource_foreign_identity", false, [&]() -> bool {
+    *resource_id = 0; *ctx_id = 0; *size = 0; *modifier = 0;
+    *stride = 0; *offset = 0; *fourcc = 0;
+    *plane1_modifier = 0; *plane1_stride = 0; *plane1_offset = 0;
+    if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm
+     || !impl->icd.memory_res_id)
+      return false;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memory_offset = 0;
+    if (!texture_image_memory(d3d11_resource_ptr, &image, &memory, &memory_offset)
+     || memory_offset != 0)
+      return false;
+    helios_icd_layout layout = {};
+    std::uint32_t res = 0;
+    const VkResult vr = impl->icd.memory_res_id(
+      impl->device->vkd()->device(), memory, image, &res, &layout);
+    static std::atomic<std::uint32_t> s_logs{0};
+    if (bridge_log_budget(s_logs, 64, 512)) {
+      char msg[288];
+      std::snprintf(msg, sizeof(msg),
+        "nvk resource id: vr=%d res_id=%u %ux%u stride=%u offset=%u fourcc=0x%08x "
+        "modifier=0x%016llx size=%llu",
+        int(vr), res, layout.width, layout.height, layout.stride, layout.offset,
+        layout.fourcc, static_cast<unsigned long long>(layout.modifier),
+        static_cast<unsigned long long>(layout.size));
+      umd_log(msg);
+    }
+    if (vr != VK_SUCCESS || !res)
+      return false;
+    // A two-plane id (NV12/P010/P016, docs/shared-formats.md) needs plane 1
+    // for the WDDM trailer; without it the KMD refuses the adoption, so fail
+    // here (the texture gets a KMD placeholder, as any id-less one).
+    // DRM_FORMAT_NV12 / P010 / P016 (helios_foreign.h HELIOS_DRM_FORMAT_*)
+    constexpr std::uint32_t kNv12 = 0x3231564Eu, kP010 = 0x30313050u, kP016 = 0x36313050u;
+    if (layout.fourcc == kNv12 || layout.fourcc == kP010 || layout.fourcc == kP016) {
+      helios_icd_plane plane1 = {};
+      const VkResult pr = impl->icd.memory_res_plane1
+        ? impl->icd.memory_res_plane1(impl->device->vkd()->device(), image, &plane1)
+        : VK_ERROR_FEATURE_NOT_PRESENT;
+      char msg[192];
+      std::snprintf(msg, sizeof(msg),
+        "nvk resource id %u plane 1: vr=%d stride=%u offset=%u modifier=0x%016llx",
+        res, int(pr), plane1.stride, plane1.offset,
+        static_cast<unsigned long long>(plane1.modifier));
+      umd_log(msg);
+      if (pr != VK_SUCCESS || plane1.stride == 0)
+        return false;
+      *plane1_modifier = plane1.modifier;
+      *plane1_stride = plane1.stride;
+      *plane1_offset = plane1.offset;
+    }
+    *resource_id = res;
+    *ctx_id = impl->icd.ctx_id ? impl->icd.ctx_id(impl->instance->handle()) : 0;
+    *size = layout.size;
+    *modifier = layout.modifier;
+    *stride = layout.stride;
+    *offset = layout.offset;
+    *fourcc = layout.fourcc;
+    return *ctx_id != 0;
+  });
+}
+
+std::int32_t HeliosDxvkDevice::nvk_scanout_present(
+    std::size_t d3d11_resource_ptr) const noexcept {
+  return bridge_guard("nvk_scanout_present", std::int32_t(-1), [&]() -> std::int32_t {
+    if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm
+     || !impl->icd.scanout_present)
+      return -1;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memory_offset = 0;
+    if (!texture_image_memory(d3d11_resource_ptr, &image, &memory, &memory_offset)
+     || memory_offset != 0)
+      return -2;
+    const VkResult vr = impl->icd.scanout_present(
+      impl->device->vkd()->device(), memory, image);
+    if (vr != VK_SUCCESS) {
+      static std::atomic<std::uint32_t> s_fail{0};
+      const std::uint32_t n = s_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n % 512u) == 0) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "nvk scanout present failed vr=%d (x%u)", int(vr), n);
+        umd_log(msg);
+      }
+      return -3;
+    }
+    return 0;
+  });
+}
+
+bool HeliosDxvkDevice::nvk_scanout_frame(std::size_t d3d11_resource_ptr,
+                                         std::uint64_t* sequence,
+                                         std::uint32_t* generation) const noexcept {
+  return bridge_guard("nvk_scanout_frame", false, [&]() -> bool {
+    *sequence = 0;
+    *generation = 0;
+    // helios_icd_interface.h version 5; an older NVK leaves the slot NULL
+    // (nvk_icd_api zeroes the table before the ICD fills its prefix).
+    if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm
+     || !impl->icd.scanout_frame)
+      return false;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memory_offset = 0;
+    if (!texture_image_memory(d3d11_resource_ptr, &image, &memory, &memory_offset)
+     || memory_offset != 0)
+      return false;
+    return impl->icd.scanout_frame(impl->device->vkd()->device(), memory, sequence,
+                                   generation) == VK_SUCCESS
+        && *sequence != 0 && *generation != 0;
+  });
+}
+
+std::uint32_t HeliosDxvkDevice::nvk_icd_caps() const noexcept {
+  return impl && impl->backend == helios_bridge::IcdBackend::NvkRm ? impl->icd.caps : 0u;
+}
+
+namespace {
+  // An RM fence for everything submitted to DXVK's graphics queue so far
+  // (helios_icd_interface.h queue_rm_fence). The queue is DXVK's: take it the
+  // way external submitters must (lockSubmission also drains DXVK's own
+  // submission queue first, so the frame's command buffers are in it).
+  VkResult queue_rm_fence(const HeliosDxvkDeviceImpl& d, std::uint32_t* fence,
+                          std::uint64_t* value) {
+    if (d.backend != helios_bridge::IcdBackend::NvkRm || !d.icd.queue_rm_fence
+     || !(d.icd.caps & HELIOS_ICD_CAP_RM_FENCE) || d.device == nullptr)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+    const VkQueue queue = d.device->queues().graphics.queueHandle;
+    d.device->lockSubmission();
+    const VkResult vr = d.icd.queue_rm_fence(d.device->vkd()->device(), queue, fence, value);
+    d.device->unlockSubmission();
+    return vr;
+  }
+}
+
+std::int32_t HeliosDxvkDevice::nvk_scanout_present_fenced(
+    std::size_t d3d11_resource_ptr) const noexcept {
+  return bridge_guard("nvk_scanout_present_fenced", std::int32_t(-1), [&]() -> std::int32_t {
+    if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm
+     || !impl->icd.scanout_present_fenced || !impl->icd.queue_rm_fence)
+      return 1;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memory_offset = 0;
+    if (!texture_image_memory(d3d11_resource_ptr, &image, &memory, &memory_offset)
+     || memory_offset != 0)
+      return -2;
+    std::uint32_t fence = 0;
+    std::uint64_t value = 0;
+    VkResult vr = queue_rm_fence(*impl, &fence, &value);
+    if (vr == VK_ERROR_FEATURE_NOT_PRESENT)
+      return 1;
+    if (vr != VK_SUCCESS || fence == 0) {
+      static std::atomic<std::uint32_t> s_fail{0};
+      const std::uint32_t n = s_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n % 512u) == 0) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "nvk queue_rm_fence failed vr=%d (x%u)", int(vr), n);
+        umd_log(msg);
+      }
+      return 1;
+    }
+    // Takes the fence whatever it answers.
+    vr = impl->icd.scanout_present_fenced(impl->device->vkd()->device(), memory, image, fence);
+    if (vr != VK_SUCCESS) {
+      static std::atomic<std::uint32_t> s_fail{0};
+      const std::uint32_t n = s_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n % 512u) == 0) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "nvk scanout_present_fenced failed vr=%d (x%u)",
+                      int(vr), n);
+        umd_log(msg);
+      }
+      return -3;
+    }
+    static std::atomic<std::uint32_t> s_ok{0};
+    const std::uint32_t n = s_ok.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || (n % 4096u) == 0) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+        "nvk fenced scanout present #%u (timeline value %llu, %s)", n,
+        static_cast<unsigned long long>(value),
+        (impl->icd.caps & HELIOS_ICD_CAP_SCANOUT_FENCE_KMD) ? "the KMD flips on the fence"
+                                                            : "NVK's flip thread waits");
+      umd_log(msg);
+    }
+    return 0;
+  });
+}
+
+std::int32_t HeliosDxvkDevice::nvk_present_fence(std::uint32_t* fence_handle,
+                                                 std::uint64_t* value) const noexcept {
+  return bridge_guard("nvk_present_fence", std::int32_t(1), [&]() -> std::int32_t {
+    *fence_handle = 0;
+    *value = 0;
+    if (!impl)
+      return 1;
+    const VkResult vr = queue_rm_fence(*impl, fence_handle, value);
+    if (vr != VK_SUCCESS || *fence_handle == 0) {
+      *fence_handle = 0;
+      return 1;
+    }
+    return 0;
+  });
+}
+
+void HeliosDxvkDevice::nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept {
+  bridge_guard("nvk_rm_fence_close", false, [&]() -> bool {
+    if (impl && fence_handle && impl->icd.rm_fence_close && impl->device != nullptr)
+      impl->icd.rm_fence_close(impl->device->vkd()->device(), fence_handle);
+    return true;
+  });
+}
+
+namespace {
+  // The present stream without a producer allocation (a flush names none):
+  // the same one-time registration publish_present_order makes, through the
+  // Venus ICD's producer table directly. True when present_fence is live.
+  bool ensure_flush_stream(HeliosDxvkDeviceImpl& d) {
+    bool initialize = false;
+    {
+      std::unique_lock lock(d.present_order_mutex);
+      while (d.present_fence_initializing)
+        d.present_order_ready.wait(lock);
+      if (d.present_fence_failed)
+        return false;
+      if (d.present_fence != nullptr)
+        return true;
+      d.present_fence_initializing = true;
+      initialize = true;
+    }
+    (void)initialize;
+    dxvk::Rc<dxvk::DxvkFence> fence;
+    std::uint64_t cookie = 0;
+    bool ok = false;
+    try {
+      // The Venus ICD module from the device's own dispatch, as
+      // HeliosProducerBinding resolves it.
+      HMODULE module = nullptr;
+      const auto entry = d.device->vkd()->vkGetSemaphoreCounterValue;
+      if (entry)
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+          | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCWSTR>(entry), &module);
+      const auto get = module ? reinterpret_cast<helios_get_producer_api_fn>(
+        reinterpret_cast<void*>(GetProcAddress(module, "helios_venus_producer_interface"))) : nullptr;
+      helios_producer_api_v1 api = { };
+      if (get && get(HELIOS_PRODUCER_ABI, &api) == VK_SUCCESS
+       && api.version == HELIOS_PRODUCER_ABI && api.size == sizeof(api) && api.stream) {
+        dxvk::DxvkFenceCreateInfo fenceInfo = { };
+        fenceInfo.sharedType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        fence = d.device->createFence(fenceInfo);
+        std::uint32_t ctx = 0;
+        ok = api.stream(reinterpret_cast<uintptr_t>(d.device->vkd()->device()),
+                        std::uint64_t(uintptr_t(fence->handle())), &ctx, &cookie) == VK_SUCCESS
+          && ctx == d.venus_ctx_id && cookie != 0;
+      }
+    } catch (const dxvk::DxvkError&) {
+      ok = false;
+    }
+    {
+      std::lock_guard lock(d.present_order_mutex);
+      d.present_fence_initializing = false;
+      if (ok) {
+        d.present_fence = std::move(fence);
+        d.present_stream_cookie = cookie;
+      } else {
+        d.present_fence_failed = true;
+      }
+    }
+    d.present_order_ready.notify_all();
+    char msg[160];
+    std::snprintf(msg, sizeof(msg), ok
+      ? "flush-gate: present stream registered for flush points ctx=%u cookie=%llu"
+      : "flush-gate: no present stream (ctx=%u cookie=%llu): flushes use the wire rung",
+      d.venus_ctx_id, static_cast<unsigned long long>(cookie));
+    umd_log(msg);
+    return ok;
+  }
+}
+
+std::int32_t HeliosDxvkDevice::flush_gate_point(std::uint32_t mode,
+                                                const std::size_t* resources,
+                                                std::uint32_t resource_count,
+                                                std::uint32_t* ctx_id,
+                                                std::uint32_t* value32,
+                                                std::uint64_t* cookie,
+                                                std::uint32_t* fence,
+                                                std::uint64_t* fence_value) const noexcept {
+  *ctx_id = 0; *value32 = 0; *cookie = 0; *fence = 0; *fence_value = 0;
+  if (!impl || !impl->context || impl->device == nullptr)
+    return -1;
+  return bridge_guard("flush_gate_point", std::int32_t(-2), [&]() -> std::int32_t {
+    auto* immediate = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
+    std::lock_guard gate(impl->flush_gate_mutex);
+    const std::uint64_t seq = immediate->HeliosFlushSequence();
+    if (seq == impl->flush_gate_seq)
+      return 0;
+
+    if (mode == kFlushGateStream) {
+      if (impl->backend != helios_bridge::IcdBackend::Venus || !impl->venus_ctx_id
+       || !ensure_flush_stream(*impl))
+        return -1;
+      std::uint64_t value = 0;
+      dxvk::Rc<dxvk::DxvkFence> streamFence;
+      {
+        std::lock_guard lock(impl->present_order_mutex);
+        if (impl->present_fence_failed || impl->present_fence == nullptr
+         || impl->present_value >= UINT32_MAX - 1)
+          return -1;
+        // The stream's values are shared with present markers: the KMD wants
+        // each tag above the last one submitted, so the increment and the
+        // recording stay in one order with publish_present_order.
+        value = ++impl->present_value;
+        streamFence = impl->present_fence;
+        // The shared allocations this point is published on (each with an
+        // operation the signal's command list retains), so an importer's
+        // read waits for this point (flush-gate.md section 9).
+        std::vector<dxvk::Rc<dxvk::HeliosProducerBinding>> producers;
+        std::vector<dxvk::Rc<dxvk::HeliosProducerOperation>> operations;
+        for (std::uint32_t i = 0; resources && i < resource_count; i++) {
+          auto* texture = dxvk::GetCommonTexture(reinterpret_cast<ID3D11Resource*>(resources[i]));
+          if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
+            continue;
+          auto producer = texture->GetImage()->storage()->heliosProducer();
+          if (producer == nullptr)
+            continue;
+          bool known = false;
+          for (const auto& p : producers)
+            known |= p.ptr() == producer.ptr();
+          if (known)
+            continue;
+          producers.push_back(producer);
+          operations.push_back(new dxvk::HeliosProducerOperation(producer));
+        }
+        impl->flush_gate_seq = operations.empty()
+          ? immediate->HeliosSignalFlushPoint(streamFence, value)
+          : immediate->HeliosSignalFlushPointTracked(streamFence, value, operations);
+        static std::atomic<std::uint64_t> s_published{0}, s_publishFailed{0};
+        for (const auto& producer : producers) {
+          std::uint64_t epoch = 0;
+          if (producer->publish(streamFence->handle(), value, &epoch)) {
+            s_published.fetch_add(1, std::memory_order_relaxed);
+          } else {
+            producer->abort();
+            const auto n = s_publishFailed.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || (n % 1024u) == 0) {
+              char msg[128];
+              std::snprintf(msg, sizeof(msg), "flush-gate: publishing point %llu failed (x%llu)",
+                static_cast<unsigned long long>(value), static_cast<unsigned long long>(n));
+              umd_log(msg);
+            }
+          }
+        }
+        const auto published = s_published.load(std::memory_order_relaxed);
+        if (!producers.empty() && (published <= 4 || (published % 4096u) == 0)) {
+          char msg[160];
+          std::snprintf(msg, sizeof(msg),
+            "flush-gate: point %llu published on %zu shared allocation(s) (%llu so far)",
+            static_cast<unsigned long long>(value), producers.size(),
+            static_cast<unsigned long long>(published));
+          umd_log(msg);
+        }
+      }
+      *ctx_id = impl->venus_ctx_id;
+      *value32 = std::uint32_t(value);
+      *cookie = impl->present_stream_cookie;
+      return 1;
+    }
+
+    if (mode == kFlushGateWire || mode == kFlushGateRmFence) {
+      if (mode == kFlushGateRmFence && (impl->backend != helios_bridge::IcdBackend::NvkRm
+       || !impl->icd.queue_rm_fence || !(impl->icd.caps & HELIOS_ICD_CAP_RM_FENCE)))
+        return -1;
+      if (!immediate->HeliosWaitFrameSubmitted())
+        return -2;
+      impl->flush_gate_seq = seq;
+      if (mode == kFlushGateWire)
+        return 1;
+      const VkResult vr = queue_rm_fence(*impl, fence, fence_value);
+      if (vr != VK_SUCCESS || *fence == 0) {
+        *fence = 0;
+        return -1;
+      }
+      return 1;
+    }
+    return -1;
+  });
+}
+
+void HeliosDxvkDevice::nvk_scanout_release() const noexcept {
+  bridge_guard("nvk_scanout_release", false, [&]() -> bool {
+    if (impl && impl->backend == helios_bridge::IcdBackend::NvkRm
+     && impl->icd.scanout_release && impl->device != nullptr)
+      impl->icd.scanout_release(impl->device->vkd()->device());
+    return true;
+  });
 }
 
 std::uint64_t HeliosDxvkDevice::feed_trace_timestamp_ns() const noexcept {
@@ -471,13 +1714,17 @@ bool HeliosDxvkDevice::set_resource_kmt_handles(
       return false;
 
     auto image = texture->GetImage();
-    dxvk::Rc<dxvk::HeliosProducerBinding> producer = new dxvk::HeliosProducerBinding(
-      impl->device->vkd()->device(), impl->device->vkd()->vkGetSemaphoreCounterValue, local);
-    if (!image->storage()->setHeliosProducer(producer))
-      return false;
-    if (image->heliosStagingImage() != nullptr
-     && !image->heliosStagingImage()->storage()->setHeliosProducer(producer))
-      return false;
+    // The producer binding (escape 0x13, keyed on a Venus timeline) exists
+    // only on Venus; NVK presents are CPU-complete (value-0 markers).
+    if (impl->backend == helios_bridge::IcdBackend::Venus) {
+      dxvk::Rc<dxvk::HeliosProducerBinding> producer = new dxvk::HeliosProducerBinding(
+        impl->device->vkd()->device(), impl->device->vkd()->vkGetSemaphoreCounterValue, local);
+      if (!image->storage()->setHeliosProducer(producer))
+        return false;
+      if (image->heliosStagingImage() != nullptr
+       && !image->heliosStagingImage()->storage()->setHeliosProducer(producer))
+        return false;
+    }
     image->storage()->setKmtHandles(local, global);
 
     static std::atomic<std::uint32_t> s_setKmtLogs{0};
@@ -510,6 +1757,10 @@ bool HeliosDxvkDevice::get_resource_memory_info(
 
     if (!d3d11_resource_ptr)
       return false;
+    // The Venus blob id and its exact-size identity have no NVK counterpart:
+    // an NVK texture is named by get_resource_foreign_identity instead.
+    if (!impl || impl->backend != helios_bridge::IcdBackend::Venus)
+      return false;
 
     auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr);
     auto* texture = dxvk::GetCommonTexture(resource);
@@ -519,7 +1770,10 @@ bool HeliosDxvkDevice::get_resource_memory_info(
     auto info = texture->GetImage()->storage()->getMemoryInfo();
     const auto rawMemory = memory_handle_bits(info.memory);
     const auto venusId = venus_memory_id_from_handle(info.memory);
-    const auto resourceId = venus_memory_resource_id_from_handle(info.memory);
+    std::uint32_t resourceId = 0;
+    if (impl->icd.memory_res_id)
+      impl->icd.memory_res_id(impl->device->vkd()->device(), info.memory,
+                              texture->GetImage()->handle(), &resourceId, nullptr);
     if (memory)
       *memory = venusId;
     if (size)
@@ -567,9 +1821,12 @@ bool HeliosDxvkDevice::get_resource_alloc_identity(
     if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
       return false;
 
+    if (!impl || impl->backend != helios_bridge::IcdBackend::Venus
+     || !impl->icd.memory_alloc_info)
+      return false;
     auto info = texture->GetImage()->storage()->getMemoryInfo();
-    const bool valid = venus_memory_alloc_info_from_handle(
-      info.memory, venus_alloc_size, memory_type_index);
+    const bool valid = impl->icd.memory_alloc_info(
+      info.memory, venus_alloc_size, memory_type_index) == VK_TRUE;
     if (valid && global_vidmm_tracker) {
       *global_vidmm_tracker =
         venus_memory_vidmm_global_identity_from_handle(info.memory);
@@ -590,7 +1847,8 @@ bool HeliosDxvkDevice::transfer_resource_ownership(
       return false;
 
     auto info = texture->GetImage()->storage()->getMemoryInfo();
-    const auto resourceId = venus_memory_transfer_resource_ownership(info.memory);
+    const auto resourceId = impl && impl->icd.transfer_ownership
+      ? impl->icd.transfer_ownership(info.memory) : 0u;
 
     static std::atomic<std::uint32_t> s_xferOwnLogs{0};
     if (bridge_log_budget(s_xferOwnLogs, 64, 512)) {
@@ -622,9 +1880,47 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     bool cross_context_optimal,
     bool dedicated_present_buffer,
     std::size_t source_image_create_info,
-    bool source_external_ownership) const {
+    bool source_external_ownership,
+    bool foreign,
+    std::uint64_t foreign_modifier,
+    std::uint32_t foreign_stride,
+    std::uint32_t foreign_offset,
+    std::uint64_t foreign_plane1_modifier,
+    std::uint32_t foreign_plane1_stride,
+    std::uint32_t foreign_plane1_offset) const {
   if (!impl || !impl->d3d11 || !global || !renderer_resource_id || !width || !height)
     return 0;
+  bool nvk_blank = false;
+  if (impl->backend != helios_bridge::IcdBackend::Venus) {
+    // NVK opens another NVK process's surface (a foreign resource: the KMD's
+    // layout trailer) by resource id (shared-surfaces.md, NVK patch 0031,
+    // DXVK patch 0002). A surface Venus made cannot be imported (no
+    // host-Vulkan -> RM direction, dxvk-on-nvk.md 3.7): such apps stay on the
+    // deny-list.
+    const bool nvk_can_open = foreign
+      && (impl->icd.caps & HELIOS_ICD_CAP_SHARED_IMPORT) != 0
+      && !scanout_linear && !linear_scanout_target && !source_image_create_info;
+    // DWM on NVK (DwmIcd=nvk, docs/dwm-on-nvk.md): a failed open of a window's
+    // surface takes DWM down (dwmcore 0x8898008d), and every Venus app's and
+    // every KMD-made (GDI, cursor) surface is one NVK cannot import yet. DWM
+    // gets a blank texture of the same size instead: that window composes
+    // black, the desktop stays up. Any other NVK process still sees the open
+    // fail.
+    if (!nvk_can_open && helios_bridge::is_dwm_process()) {
+      nvk_blank = true;
+    } else if (!nvk_can_open) {
+      static std::atomic<std::uint32_t> s_nvkOpen{0};
+      const std::uint32_t n = s_nvkOpen.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n % 512u) == 0) {
+        char msg[192];
+        std::snprintf(msg, sizeof(msg),
+          "OpenDdiTexture2D REFUSED on NVK: res_id=%u foreign=%d icd caps 0x%x (x%u)",
+          renderer_resource_id, int(foreign), impl->icd.caps, n);
+        umd_log(msg);
+      }
+      return 0;
+    }
+  }
 
   return bridge_guard("open_ddi_texture2d", std::size_t(0), [&]() -> std::size_t {
       {
@@ -638,6 +1934,47 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
             static_cast<unsigned long long>(global_vidmm_tracker));
           umd_log(msg);
         }
+      }
+
+      // A Venus process opening an NVK-made surface with ForeignImport off
+      // (the default): the import would throw, and an E_FAIL from this open
+      // takes DWM down (dwmcore 0x8898008d when a windowed NVK swap chain is
+      // created: DXGI has DWM open the buffers whatever the present path).
+      // Hand back an ordinary blank texture of the same size instead: the
+      // window composes black, and the NVK app shows its frames on scanout 0
+      // as designed (NvkPresent auto picks scanout without ForeignImport).
+      if (nvk_blank || (foreign && impl->backend == helios_bridge::IcdBackend::Venus
+          && !dxvk::heliosForeignImport())) {
+        D3D11_TEXTURE2D_DESC td = { };
+        td.Width = width;
+        td.Height = height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = static_cast<DXGI_FORMAT>(format);
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = bind_flags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+        ID3D11Texture2D* placeholder = nullptr;
+        HRESULT phr = static_cast<dxvk::D3D11Device*>(impl->d3d11)->CreateTexture2D(
+            &td, nullptr, &placeholder);
+        ID3D11Resource* res = nullptr;
+        if (SUCCEEDED(phr) && placeholder) {
+          phr = placeholder->QueryInterface(__uuidof(ID3D11Resource),
+                                            reinterpret_cast<void**>(&res));
+          placeholder->Release();
+        }
+        static std::atomic<std::uint32_t> s_placeholders{0};
+        const std::uint32_t n = s_placeholders.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n % 512u) == 0) {
+          char msg[240];
+          std::snprintf(msg, sizeof(msg),
+            nvk_blank
+              ? "OpenDdiTexture2D res_id=%u %ux%u (foreign=%d) on NVK DWM, not importable: blank placeholder hr=0x%08lx (x%u)"
+              : "OpenDdiTexture2D foreign res_id=%u %ux%u (foreign=%d) with ForeignImport off: blank placeholder hr=0x%08lx (x%u)",
+            renderer_resource_id, width, height, int(foreign), static_cast<unsigned long>(phr), n);
+          umd_log(msg);
+        }
+        return (SUCCEEDED(phr) && res) ? reinterpret_cast<std::size_t>(res) : std::size_t(0);
       }
 
       dxvk::D3D11_COMMON_TEXTURE_DESC desc = { };
@@ -676,6 +2013,15 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       importInfo.SourceCreateInfo =
         reinterpret_cast<const VkImageCreateInfo*>(source_image_create_info);
       importInfo.SourceExternalOwnership = source_external_ownership;
+      // An NVK-made resource (the KMD's foreign layout trailer): import it as
+      // an explicit DRM-modifier image (DXVK patch, ForeignImport knob).
+      importInfo.Foreign         = foreign;
+      importInfo.ForeignModifier = foreign_modifier;
+      importInfo.ForeignStride   = foreign_stride;
+      importInfo.ForeignOffset   = foreign_offset;
+      importInfo.ForeignPlane1Modifier = foreign_plane1_modifier;
+      importInfo.ForeignPlane1Stride   = foreign_plane1_stride;
+      importInfo.ForeignPlane1Offset   = foreign_plane1_offset;
 
       // static_cast, matching the sibling context downcast in this file. Zero
       // runtime change today (the base sits at offset 0), but if an upstream DXVK
@@ -1323,6 +2669,9 @@ bool HeliosDxvkDevice::publish_present_order(std::size_t d3d11_resource_ptr,
   if (out_cookie) *out_cookie = 0;
   if (!impl || !impl->context)
     return false;
+  // Producer streams are Venus timelines; NVK presents are CPU-complete.
+  if (impl->backend != helios_bridge::IcdBackend::Venus)
+    return false;
 
   return bridge_guard("publish_present_order", false, [&]() -> bool {
     if (!d3d11_resource_ptr)
@@ -1726,25 +3075,40 @@ std::size_t HeliosDxvkDevice::create_compute_shader(const std::uint8_t* code, st
       });
 }
 
-std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
-    std::uint32_t luid_low,
-    std::int32_t  luid_high,
-    bool timer_resolution) {
-  // R824: configuration delivered as a process-global side effect, whose
-  // correctness used to be statement position -- these writes happened on EVERY
-  // CreateDevice DDI, and one process (dwm) creates several D3D11 devices, so
-  // the block was rewritten while earlier DxvkInstances were live and
-  // _putenv_s is not safe against a concurrent getenv. The values are identical
-  // on every call, so doing it once is behaviour-preserving; what goes away is
-  // the repeat writes and the concurrent-write window.
-  //
-  // Static guarantee: none. std::call_once is a runtime construct and an
-  // `EnvConfigured` token would be ceremony around one call site. _putenv_s
-  // stays the mechanism because DXVK reads env; changing that is out of scope.
-  static std::once_flag s_envOnce;
-  std::call_once(s_envOnce, [] {
-    // Force selection of the Helios venus device if other ICDs are present.
-    _putenv_s("DXVK_FILTER_DEVICE_NAME", "Virtio-GPU Venus");
+namespace {
+
+  // HKLM\SOFTWARE\Helios REG_DWORD, `fallback` when absent.
+  DWORD helios_reg_dword(const char* name, DWORD fallback) {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", name,
+                     RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, nullptr, &value,
+                     &size) == ERROR_SUCCESS)
+      return value;
+    return fallback;
+  }
+
+  // The per-backend DXVK environment. _putenv_s is not safe against a
+  // concurrent getenv, so this runs before any instance of the backend exists:
+  // once per process for the backend chosen, and once more only if NVK fails
+  // and the process falls back to Venus.
+  void configure_dxvk_env(helios_bridge::IcdBackend backend) {
+    if (backend == helios_bridge::IcdBackend::NvkRm) {
+      // DXVK only sees NVK (the instance is NVK's own, no loader), but keep
+      // the filter explicit; the backend switch turns the Venus-only export
+      // paths off (third_party/patches/dxvk).
+      _putenv_s("DXVK_FILTER_DEVICE_NAME", "NVK");
+      _putenv_s("HELIOS_DXVK_BACKEND", "nvk");
+    } else {
+      // Force selection of the Helios venus device if other ICDs are present.
+      _putenv_s("DXVK_FILTER_DEVICE_NAME", "Virtio-GPU Venus");
+      _putenv_s("HELIOS_DXVK_BACKEND", "");
+      // ForeignImport=1: this Venus process (DWM above all) composes surfaces
+      // NVK processes made, through explicit DRM-modifier imports. Off by
+      // default: it enables VK_EXT_image_drm_format_modifier on the device.
+      _putenv_s("HELIOS_DXVK_FOREIGN_IMPORT",
+                helios_reg_dword("ForeignImport", 0) ? "1" : "");
+    }
     // HELIOS_DXVK_KMT_SHARED is no longer forced here: the engine defaults it
     // ON (2026-08-05). Forcing it made a knob that could not be off in any
     // configuration this process ever produced, which hid the fact that the
@@ -1763,45 +3127,112 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     if (haveDump)
       _putenv_s("DXVK_SHADER_DUMP_PATH", dumpPath);
 
-    char msg[MAX_PATH + 128];
+    char msg[MAX_PATH + 160];
     std::snprintf(msg, sizeof(msg),
-      "dxvk env configured once: DXVK_FILTER_DEVICE_NAME=Virtio-GPU Venus "
-      "kmt-shared=default-on DXVK_SHADER_DUMP_PATH=%s",
+      "dxvk env configured: backend=%s DXVK_FILTER_DEVICE_NAME=%s "
+      "kmt-shared=default-on foreign-import=%s DXVK_SHADER_DUMP_PATH=%s",
+      backend == helios_bridge::IcdBackend::NvkRm ? "nvk" : "venus",
+      backend == helios_bridge::IcdBackend::NvkRm ? "NVK" : "Virtio-GPU Venus",
+      std::getenv("HELIOS_DXVK_FOREIGN_IMPORT") && std::getenv("HELIOS_DXVK_FOREIGN_IMPORT")[0] == '1'
+        ? "on" : "off",
       haveDump ? dumpPath : "(unset)");
     umd_log(msg);
-  });
+  }
 
-  return bridge_guard<std::unique_ptr<HeliosDxvkDevice>>(
-      "helios_dxvk_create_device", nullptr,
-      [&]() -> std::unique_ptr<HeliosDxvkDevice> {
-      auto out = std::make_unique<HeliosDxvkDevice>();
-      out->impl = std::make_unique<HeliosDxvkDeviceImpl>(timer_resolution);
-      auto& d = *out->impl;
+  std::mutex g_envMutex;
+  bool g_envConfigured[3] = {};
 
+  void configure_dxvk_env_once(helios_bridge::IcdBackend backend) {
+    std::lock_guard lock(g_envMutex);
+    const auto i = static_cast<std::size_t>(backend);
+    if (i < 3 && !g_envConfigured[i]) {
+      configure_dxvk_env(backend);
+      g_envConfigured[i] = true;
+    }
+  }
+
+  // An ICD's vk_icdGetInstanceProcAddr serves no layer queries (that is the
+  // loader's job): NVK's MinGW build returns NULL for
+  // vkEnumerateInstanceLayerProperties (its vk_common_ fallback is a weak
+  // symbol), and DxvkInstance::initVulkanInstance calls it unconditionally,
+  // a call through NULL. Answer "no layers" and forward everything else, as
+  // vkd3d's 0002-helios-nvk-backend does for D3D12. One ICD per process.
+  PFN_vkGetInstanceProcAddr g_nvkIcdGipa = nullptr;
+
+  VKAPI_ATTR VkResult VKAPI_CALL nvk_icd_enumerate_instance_layers(
+      uint32_t* count, VkLayerProperties* layers) {
+    (void)layers;
+    *count = 0;
+    return VK_SUCCESS;
+  }
+
+  VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL nvk_icd_get_instance_proc_addr(
+      VkInstance instance, const char* name) {
+    if (!instance && name && !std::strcmp(name, "vkEnumerateInstanceLayerProperties"))
+      return reinterpret_cast<PFN_vkVoidFunction>(nvk_icd_enumerate_instance_layers);
+    return g_nvkIcdGipa(instance, name);
+  }
+
+  // Build the DXVK instance/adapter/device and the D3D11 COM device on
+  // `backend`. Returns false (with `d` partly filled) on any failure; the
+  // caller drops `d`.
+  bool create_on_backend(HeliosDxvkDeviceImpl& d, helios_bridge::IcdBackend backend,
+                         std::uint32_t luid_low, std::int32_t luid_high) {
+    d.backend = backend;
+    if (backend == helios_bridge::IcdBackend::NvkRm) {
+      auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+        helios_bridge::nvk_icd_get_instance_proc_addr());
+      if (!gipa || !helios_bridge::nvk_icd_api(&d.icd)) {
+        helios_bridge::note_nvk_failed("the NVK ICD did not load or has no helios_icd_interface_v2");
+        return false;
+      }
+      // NVK's own vk_icdGetInstanceProcAddr: no Vulkan loader, no registry,
+      // and no Venus ICD in this instance.
+      g_nvkIcdGipa = gipa;
+      dxvk::DxvkInstanceImportInfo import = { };
+      import.loaderProc = nvk_icd_get_instance_proc_addr;
+      d.instance = new dxvk::DxvkInstance(import, dxvk::DxvkInstanceFlags());
+    } else {
+      d.icd = *helios_bridge::venus_icd_api();
       d.instance = new dxvk::DxvkInstance(dxvk::DxvkInstanceFlags());
+    }
 
-      if (luid_low != 0 || luid_high != 0) {
-        LUID luid;
-        luid.LowPart  = luid_low;
-        luid.HighPart = luid_high;
-        d.adapter = d.instance->findAdapterByLuid(&luid);
-        if (d.adapter == nullptr)
-          umd_log("findAdapterByLuid found nothing; falling back to adapter 0");
-      }
-
+    if (luid_low != 0 || luid_high != 0) {
+      LUID luid;
+      luid.LowPart  = luid_low;
+      luid.HighPart = luid_high;
+      d.adapter = d.instance->findAdapterByLuid(&luid);
       if (d.adapter == nullptr)
-        d.adapter = d.instance->enumAdapters(0);
+        umd_log("findAdapterByLuid found nothing; falling back to adapter 0");
+    }
 
-      if (d.adapter == nullptr) {
-        umd_log("no Vulkan adapter enumerated (venus ICD not present?)");
-        return nullptr;
-      }
+    if (d.adapter == nullptr)
+      d.adapter = d.instance->enumAdapters(0);
 
-      d.device = d.adapter->createDevice();
-      if (d.device == nullptr) {
-        umd_log("DxvkAdapter::createDevice returned null");
-        return nullptr;
-      }
+    if (d.adapter == nullptr) {
+      umd_log(backend == helios_bridge::IcdBackend::NvkRm
+        ? "no Vulkan adapter enumerated (NVK found no RM GPU?)"
+        : "no Vulkan adapter enumerated (venus ICD not present?)");
+      return false;
+    }
+
+    d.device = d.adapter->createDevice();
+    if (d.device == nullptr) {
+      umd_log("DxvkAdapter::createDevice returned null");
+      return false;
+    }
+
+    if (backend == helios_bridge::IcdBackend::NvkRm) {
+      // The holder context is NVK's (created at the first IMPORT_RM); the
+      // Venus ICD anchor does not concern this device.
+      d.venus_ctx_id = 0;
+      char msg[192];
+      std::snprintf(msg, sizeof(msg),
+        "DxvkDevice created on NVK OK (icd caps 0x%x: res_id=%u scanout=%u)",
+        d.icd.caps, (d.icd.caps & HELIOS_ICD_CAP_RES_ID) ? 1u : 0u,
+        (d.icd.caps & HELIOS_ICD_CAP_SCANOUT) ? 1u : 0u);
+      umd_log(msg);
+    } else {
       d.venus_ctx_id = read_instance_venus_context_id(d.instance->handle());
       // ⛔ S4b (`ARCHITECTURE.md` §6.4). The read above is the first thing that
       // forces `resolve_helios_icd_module`, which now reconciles against the
@@ -1820,37 +3251,139 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
       if (helios_bridge::icd_anchor_poisoned()) {
         umd_log("REFUSING DXVK device: venus ICD anchor mismatch "
                 "(two ICD modules live in this process)");
-        return nullptr;
+        return false;
       }
       if (!d.venus_ctx_id)
         umd_log("DXVK device created but Venus context export returned 0");
       umd_log("DxvkDevice created on venus adapter OK");
+    }
 
-      // Instantiate DXVK's full D3D11 COM device from the DxvkDevice. The DDI
-      // device-funcs forward to this ID3D11Device / its immediate context.
-      // `new HeliosStubAdapter()` starts at refcount 1 and is only released AFTER
-      // the D3D11DXGIDevice constructor returns — but that constructor builds the
-      // D3D11 device and its immediate context and can throw dxvk::DxvkError, in
-      // which case the catch below returns nullptr and the Release() never runs.
-      // The guard makes the zero-refcount window exit through exactly one path.
-      ComRelease<HeliosStubAdapter> stubAdapter(new HeliosStubAdapter());
-      auto* dxgiDevice = new dxvk::D3D11DXGIDevice(
-          stubAdapter.get(), nullptr, nullptr,
-          d.instance, d.adapter, d.device,
-          D3D_FEATURE_LEVEL_11_0, 0);
-      stubAdapter.reset(); // dxgiDevice holds its own ref now
+    // Instantiate DXVK's full D3D11 COM device from the DxvkDevice. The DDI
+    // device-funcs forward to this ID3D11Device / its immediate context.
+    // `new HeliosStubAdapter()` starts at refcount 1 and is only released AFTER
+    // the D3D11DXGIDevice constructor returns — but that constructor builds the
+    // D3D11 device and its immediate context and can throw dxvk::DxvkError, in
+    // which case the catch below returns nullptr and the Release() never runs.
+    // The guard makes the zero-refcount window exit through exactly one path.
+    ComRelease<HeliosStubAdapter> stubAdapter(new HeliosStubAdapter());
+    auto* dxgiDevice = new dxvk::D3D11DXGIDevice(
+        stubAdapter.get(), nullptr, nullptr,
+        d.instance, d.adapter, d.device,
+        D3D_FEATURE_LEVEL_11_0, 0);
+    stubAdapter.reset(); // dxgiDevice holds its own ref now
 
-      HRESULT hr = dxgiDevice->QueryInterface(__uuidof(ID3D11Device),
-                                              reinterpret_cast<void**>(&d.d3d11));
-      if (FAILED(hr) || d.d3d11 == nullptr) {
-        umd_log("QueryInterface(ID3D11Device) on D3D11DXGIDevice failed");
-        // dxgiDevice has refcount 0 here (QI failed) — drop it.
-        delete dxgiDevice;
+    HRESULT hr = dxgiDevice->QueryInterface(__uuidof(ID3D11Device),
+                                            reinterpret_cast<void**>(&d.d3d11));
+    if (FAILED(hr) || d.d3d11 == nullptr) {
+      umd_log("QueryInterface(ID3D11Device) on D3D11DXGIDevice failed");
+      // dxgiDevice has refcount 0 here (QI failed) — drop it.
+      delete dxgiDevice;
+      return false;
+    }
+    // d.d3d11 now holds the one ref that keeps dxgiDevice alive.
+    d.d3d11->GetImmediateContext(&d.context);
+    umd_log("D3D11 COM device + immediate context created OK");
+    return true;
+  }
+
+}  // namespace
+
+namespace {
+
+// NVK's device bring-up (instance, physical device, the device and its first
+// internal shaders through NAK) needs far more stack than a Venus one: frames
+// of 17 to 43 KiB in vulkan_nouveau and the UMD, more than 128 KiB in all.
+// DWM creates its device on "DWM LPC Port Thread", whose stack is 128 KiB:
+// DWM on NVK died there with STATUS_STACK_OVERFLOW (docs/dwm-on-nvk.md, T1).
+// So a creation on a thread with less than kNvkCreateStack of stack runs on a
+// helper thread with that much, and the caller waits for it.
+constexpr SIZE_T kNvkCreateStack = SIZE_T(8) << 20;
+
+template <typename F>
+struct StackJob {
+  F* fn;
+  std::unique_ptr<HeliosDxvkDevice> out;
+  static DWORD WINAPI run(LPVOID p) {
+    auto* j = static_cast<StackJob*>(p);
+    j->out = (*j->fn)();
+    return 0;
+  }
+};
+
+template <typename F>
+std::unique_ptr<HeliosDxvkDevice> run_with_stack(F&& fn) {
+  ULONG_PTR low = 0, high = 0;
+  GetCurrentThreadStackLimits(&low, &high);
+  if (high - low >= kNvkCreateStack)
+    return fn();
+  using Fn = std::remove_reference_t<F>;
+  StackJob<Fn> job{&fn, nullptr};
+  HANDLE t = CreateThread(nullptr, kNvkCreateStack, &StackJob<Fn>::run, &job,
+                          STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+  if (!t) {
+    umd_log("NVK device creation: no helper thread, creating on the caller's stack");
+    return fn();
+  }
+  static std::atomic<std::uint32_t> s_logs{0};
+  if (s_logs.fetch_add(1, std::memory_order_relaxed) < 4) {
+    char msg[160];
+    std::snprintf(msg, sizeof(msg),
+                  "NVK device creation on a helper thread (caller's stack %llu KiB < %llu KiB)",
+                  static_cast<unsigned long long>((high - low) >> 10),
+                  static_cast<unsigned long long>(kNvkCreateStack >> 10));
+    umd_log(msg);
+  }
+  WaitForSingleObject(t, INFINITE);
+  CloseHandle(t);
+  return std::move(job.out);
+}
+
+}  // namespace
+
+std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
+    std::uint32_t luid_low,
+    std::int32_t  luid_high,
+    bool timer_resolution) {
+  // R824: configuration delivered as a process-global side effect. One process
+  // (dwm) creates several D3D11 devices, so the environment is written once per
+  // backend, before that backend's first instance (configure_dxvk_env_once).
+  //
+  // ICD selection (S3, bridge_icd_backend.h): global NVK with a deny-list,
+  // Venus whenever NVK is denied, missing or failed in this process.
+  helios_bridge::IcdBackend backend = helios_bridge::effective_icd_backend();
+
+  if (backend == helios_bridge::IcdBackend::NvkRm) {
+    configure_dxvk_env_once(backend);
+    auto nvk = run_with_stack([&]() -> std::unique_ptr<HeliosDxvkDevice> {
+      // NVK's own policy (Mesa 0032) hides its GPU from a process that Icd,
+      // the deny-list or HELIOS_ICD send to Venus; the UMD chose NVK past
+      // them (DwmIcd=nvk under Icd=venus: DWM got "Failed to initialize
+      // DXVK", docs/dwm-on-nvk.md T2), so NVK is told the same here.
+      helios_bridge::NvkPolicyScope policy;
+      return bridge_guard<std::unique_ptr<HeliosDxvkDevice>>(
+          "helios_dxvk_create_device(nvk)", nullptr,
+          [&]() -> std::unique_ptr<HeliosDxvkDevice> {
+          auto out = std::make_unique<HeliosDxvkDevice>();
+          out->impl = std::make_unique<HeliosDxvkDeviceImpl>(timer_resolution);
+          if (!create_on_backend(*out->impl, backend, luid_low, luid_high))
+            return nullptr;
+          return out;
+      });
+    });
+    if (nvk)
+      return nvk;
+    helios_bridge::note_nvk_failed("DXVK device creation on NVK failed");
+    backend = helios_bridge::IcdBackend::Venus;
+  }
+
+  configure_dxvk_env_once(backend);
+  return bridge_guard<std::unique_ptr<HeliosDxvkDevice>>(
+      "helios_dxvk_create_device", nullptr,
+      [&]() -> std::unique_ptr<HeliosDxvkDevice> {
+      auto out = std::make_unique<HeliosDxvkDevice>();
+      out->impl = std::make_unique<HeliosDxvkDeviceImpl>(timer_resolution);
+      if (!create_on_backend(*out->impl, backend, luid_low, luid_high))
         return nullptr;
-      }
-      // d.d3d11 now holds the one ref that keeps dxgiDevice alive.
-      d.d3d11->GetImmediateContext(&d.context);
-      umd_log("D3D11 COM device + immediate context created OK");
       return out;
   });
 }

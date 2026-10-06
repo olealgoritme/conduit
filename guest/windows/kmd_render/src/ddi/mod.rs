@@ -15,19 +15,29 @@ mod build_paging_buffer;
 mod child;
 pub(crate) mod cpu_host_aperture;
 pub(crate) mod create_allocation;
+pub(crate) mod device_lost;
 pub(crate) mod display;
 mod escape;
+mod escape_foreign;
+mod escape_foreign_rm_resource;
+mod escape_foreign_scanout;
+pub(crate) mod flip_keep;
+pub(crate) mod flush_trace;
 mod gpummu;
 pub(crate) mod hpd;
 pub(crate) mod interrupt;
 mod lifecycle;
+pub(crate) mod present_foreign;
 pub(crate) mod present_packet;
 pub(crate) mod query_adapter_info;
 pub(crate) mod scanout_timeline;
 pub(crate) mod scanout_trace;
 mod scheduler;
 pub(crate) mod segment_table;
+pub(crate) mod shared_placeholder;
+pub(crate) mod stall_diag;
 pub(crate) mod submit_command;
+pub(crate) mod traced;
 pub(crate) mod vidpn;
 pub(crate) mod wddm_surface;
 
@@ -37,6 +47,9 @@ pub use base::{
     dxgkddi_reset_device, dxgkddi_unload,
 };
 pub use blob_map::unmap_io_pages_from_user;
+// The cache attribute of a host blob mapping as MM's: the KMD's own presenter maps the
+// primary's blob (`virtio/rm_present.rs`). `blob_map` itself stays private to `ddi`.
+pub(crate) use blob_map::map_cache_to_mm;
 pub(crate) use build_paging_buffer::PagingPteShadow;
 pub use build_paging_buffer::{
     diag_dump_gpummu_atomics, dxgkddi_build_paging_buffer, dxgkddi_get_root_page_table_size,
@@ -82,7 +95,7 @@ pub use scheduler::{
     dxgkddi_submit_command_to_hw_queue, dxgkddi_switch_to_hw_context_list,
 };
 pub(crate) use submit_command::{
-    abandon_pending_submissions, record_present_handoff_telemetry, AbandonOutcome,
+    abandon_pending_submissions, publish_nvrm_counters, record_present_handoff_telemetry, AbandonOutcome,
     ABANDONED_FENCES, DMA_STALE_SKIP_COUNT,
 };
 pub use submit_command::{

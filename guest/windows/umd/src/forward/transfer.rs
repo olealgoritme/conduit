@@ -194,6 +194,13 @@ pub(crate) unsafe extern "system" fn resource_map(
         return;
     };
     let mut out = D3D11_MAPPED_SUBRESOURCE::default();
+    // Video decoder buffers are staging buffers (forward/video.rs), which take
+    // no DISCARD/NO_OVERWRITE map. Only checked for those two map types.
+    let map_type = if (map_type == 4 || map_type == 5) && is_decoder_buffer(h_resource) {
+        decoder_buffer_map_type(map_type as u32) as ddi::D3D10_DDI_MAP
+    } else {
+        map_type
+    };
     // DDI D3D10_DDI_MAP values match D3D11_MAP (READ=1, WRITE=2, ...).
     match context.Map(
         &*res,
@@ -294,8 +301,393 @@ pub(crate) unsafe extern "system" fn resource_read_after_write_hazard(
 }
 
 pub(crate) unsafe extern "system" fn flush(h: Hdevice) {
+    if report_if_removed(h, "Flush") {
+        return;
+    }
     if let Some(context) = d3d11_context(h) {
         context.Flush();
+        flush_gate(h, &context);
+    }
+}
+
+static FLUSH_GATE_SENT: [AtomicUsize; 3] =
+    [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+static FLUSH_GATE_RENDER_FAILED: AtomicUsize = AtomicUsize::new(0);
+static FLUSH_GATE_FALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+/// Cross-process hand-off of shared surfaces at a flush (shared-surfaces.md
+/// section 4, flush-gate.md section 9), for a device holding a cross-process
+/// shared resource (created or opened `MISC_SHARED`, not `BIND_PRESENT`) and
+/// only when work was recorded since the previous hand-off.
+///
+/// The runtime releases a keyed mutex right after `pfnFlush`; the acquirer's
+/// `AcquireSync` returns on the CPU, and its reads go through the Venus ring or
+/// NVK's RM channel, which nothing in dxgkrnl holds. So the order must come
+/// from the acquirer's side, or from the releaser completing first:
+///
+/// * Venus: a point of the device's present stream is signalled behind the
+///   recorded work and published on the shared allocations this device
+///   created (`HELIOS_FLUSH_GATE_PUBLISH=all`: opened ones too). An importer's
+///   read of the image waits for the allocation's announced epoch in its own
+///   submission worker (DXVK's producer wait), so only the acquirer waits,
+///   only for this producer, and nothing heads the adapter's WDDM queue. A
+///   device that only opened shared surfaces (DWM) does nothing.
+/// * NVK: no acquirer-side wait yet (that needs the releaser's RM semaphore in
+///   the acquirer, S4 fences), so the releaser completes its work on the CPU.
+///
+/// The `HEFL` flush-gate packet (flush-gate.md) is OFF by default: it orders
+/// only dxgkrnl's release, which nobody needs once the acquirer waits, and its
+/// packet heads the adapter-wide WDDM queue until the point retires (DWM's
+/// D3D12 swap-chain buffers made that a 250 ms stall per frame). It stays for
+/// experiments behind `HELIOS_FLUSH_GATE_HEFL=1`, on the KMD's capability.
+pub(crate) unsafe fn flush_gate(h: Hdevice, context: &ID3D11DeviceContext) {
+    use crate::bridge::{FlushGatePoint, FLUSH_GATE_RM_FENCE, FLUSH_GATE_STREAM};
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    if lock_ignore_poison(&dev.nvk_keyed_resources).is_empty() {
+        return;
+    }
+    let cpu_wait = gate_cpu_wait();
+    // The hand-off ledger: publish a point of this device on every shared
+    // resource it holds; readers in other processes wait for its completion
+    // in their submission worker. Nobody waits here.
+    if ledger_enabled() {
+        let all = shared_resources(dev, true);
+        match dev.dxvk.handoff_publish(&all) {
+            0 => return,
+            1 => {
+                LEDGER_HANDOFFS.fetch_add(1, Ordering::Relaxed);
+                if cpu_wait == GateCpuWait::Forced {
+                    nvk_keyed_flush_wait(h, context, true);
+                }
+                return;
+            }
+            _ => {
+                // No ledger (or full): the releaser completes its work.
+                FLUSH_GATE_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                if cpu_wait != GateCpuWait::Off {
+                    nvk_keyed_flush_wait(h, context, true);
+                }
+                return;
+            }
+        }
+    }
+    let hefl = hefl_enabled();
+    if dev.dxvk.is_nvk() {
+        if hefl && crate::knobs::nvk_rm_fence() && crate::scanout_acquire::nvrm_flush_gate_capable(dev) {
+            match dev.dxvk.flush_gate_point(FLUSH_GATE_RM_FENCE, &[]) {
+                FlushGatePoint::Nothing => return,
+                FlushGatePoint::Ready { fence, fence_value, .. } if fence != 0 => {
+                    // The handle is the KMD's from here on, whatever happens.
+                    send_flush_gate(
+                        dev,
+                        helios_protocol::HELIOS_FLUSH_GATE_FLAG_RM_FENCE,
+                        (0, 0, 0),
+                        Some((fence, fence_value)),
+                    );
+                }
+                _ => {}
+            }
+        }
+        if cpu_wait != GateCpuWait::Off {
+            nvk_keyed_flush_wait(h, context, true);
+        }
+        return;
+    }
+    // Venus.
+    let publish = publish_list(dev);
+    if publish.is_empty() {
+        // Nothing of ours another process reads through a producer wait.
+        if cpu_wait == GateCpuWait::Forced {
+            nvk_keyed_flush_wait(h, context, true);
+        }
+        return;
+    }
+    match dev.dxvk.flush_gate_point(FLUSH_GATE_STREAM, &publish) {
+        FlushGatePoint::Nothing => return,
+        FlushGatePoint::Ready { ctx, value, cookie, .. } if ctx != 0 && cookie != 0 => {
+            if hefl && crate::scanout_acquire::flush_gate_capable() {
+                send_flush_gate(
+                    dev,
+                    helios_protocol::HELIOS_FLUSH_GATE_FLAG_STREAM,
+                    (ctx, value, cookie),
+                    None,
+                );
+            }
+            if cpu_wait == GateCpuWait::Forced {
+                nvk_keyed_flush_wait(h, context, true);
+            }
+        }
+        _ => {
+            // No present stream (old ICD/KMD): nothing published, so the
+            // releaser completes its work unless told otherwise.
+            FLUSH_GATE_FALLBACK.fetch_add(1, Ordering::Relaxed);
+            if cpu_wait != GateCpuWait::Off {
+                nvk_keyed_flush_wait(h, context, true);
+            }
+        }
+    }
+}
+
+static LEDGER_HANDOFFS: AtomicUsize = AtomicUsize::new(0);
+
+/// `HELIOS_HANDOFF_LEDGER=1` (process environment, in every process sharing
+/// the surface): the hand-off ledger. Off by default until it is verified
+/// across processes; the default is the previous hand-off handling (Venus
+/// producer publication, NVK releaser CPU wait, optional HEFL).
+fn ledger_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HELIOS_HANDOFF_LEDGER").is_ok_and(|v| v == "1"))
+}
+
+/// The registered shared resources of `dev` as `ID3D11Resource*`; opened ones
+/// too when `opened`.
+fn shared_resources(dev: &crate::device_funcs::HeliosDevice, opened: bool) -> Vec<usize> {
+    let list = lock_ignore_poison(&dev.nvk_keyed_resources);
+    let mut out = Vec::with_capacity(list.len());
+    for &(key, created) in list.iter() {
+        if !created && !opened {
+            continue;
+        }
+        // SAFETY: `key` is the live pDrvPrivate of a resource of this device
+        // (destroy removes it from the list before the slot goes).
+        if let Some(res) = unsafe {
+            load_resource(ddi::D3D10DDI_HRESOURCE {
+                pDrvPrivate: key as *mut c_void,
+            })
+        } {
+            out.push(res.as_raw() as usize);
+        }
+    }
+    out
+}
+
+/// `HELIOS_FLUSH_GATE_HEFL=1` (process environment): also send the `HEFL`
+/// flush-gate packet (needs the KMD capability). Off by default: see
+/// `flush_gate`.
+fn hefl_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HELIOS_FLUSH_GATE_HEFL").is_ok_and(|v| v == "1"))
+}
+
+/// `HELIOS_FLUSH_GATE_CPU_WAIT` (process environment): what the releaser
+/// does on the CPU at a hand-off. Unset: NVK completes its work (there is no
+/// acquirer-side wait on NVK yet), Venus relies on the published point. `1`:
+/// every backend completes its work (the diagnosis of flush-gate.md section
+/// 9). `0`: no CPU wait anywhere (shows the unordered acquirer).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GateCpuWait {
+    Default,
+    Forced,
+    Off,
+}
+
+fn gate_cpu_wait() -> GateCpuWait {
+    static MODE: std::sync::OnceLock<GateCpuWait> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("HELIOS_FLUSH_GATE_CPU_WAIT").as_deref() {
+        Ok("1") => GateCpuWait::Forced,
+        Ok("0") => GateCpuWait::Off,
+        _ => GateCpuWait::Default,
+    })
+}
+
+/// `HELIOS_FLUSH_GATE_PUBLISH` (process environment): which shared resources a
+/// Venus flush gate publishes its point on. Unset: the ones this device
+/// created (an opener of many surfaces, DWM above all, would otherwise publish
+/// on every one at every flush). `all`: opened ones too. `0`: none (shows the
+/// unordered acquirer).
+fn publish_list(dev: &crate::device_funcs::HeliosDevice) -> Vec<usize> {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("HELIOS_FLUSH_GATE_PUBLISH").as_deref() {
+        Ok("0") => 0,
+        Ok("all") => 2,
+        _ => 1,
+    });
+    if mode == 0 {
+        return Vec::new();
+    }
+    shared_resources(dev, mode == 2)
+}
+
+/// One `HEFL` (`HeliosFlushGateCmd`, 48 bytes) through `pfnRenderCb` on the
+/// device's context: no allocations, no patches. Logs a failure; never
+/// propagates it.
+unsafe fn send_flush_gate(
+    dev: &crate::device_funcs::HeliosDevice,
+    flags: u32,
+    stream: (u32, u32, u64),
+    fence: Option<(u32, u64)>,
+) {
+    let kind = if flags & helios_protocol::HELIOS_FLUSH_GATE_FLAG_RM_FENCE != 0 {
+        2
+    } else if flags & helios_protocol::HELIOS_FLUSH_GATE_FLAG_STREAM != 0 {
+        1
+    } else {
+        0
+    };
+    let fail = |why: &str| {
+        let n = FLUSH_GATE_RENDER_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n % 1024 == 0 {
+            log_error!("DDI flush gate (kind {kind}) not sent: {why} (x{n})");
+        }
+    };
+    let Some(ctx) = dev.context.as_ref() else {
+        return fail("no runtime context");
+    };
+    if dev.kt_callbacks.is_null() {
+        return fail("no callback table");
+    }
+    let Some(render_cb) = (*dev.kt_callbacks).pfnRenderCb else {
+        return fail("pfnRenderCb missing");
+    };
+    let len = core::mem::size_of::<helios_protocol::HeliosFlushGateCmd>() as u32;
+    let Some(window) = ctx.command.get() else {
+        return fail("no command buffer");
+    };
+    if window.capacity < len {
+        return fail("command buffer too small");
+    }
+    let (fence_handle, fence_value) = fence.unwrap_or((0, 0));
+    let cmd = helios_protocol::HeliosFlushGateCmd {
+        magic: helios_protocol::HELIOS_FLUSH_GATE_MAGIC,
+        version: helios_protocol::HELIOS_FLUSH_GATE_VERSION,
+        flags,
+        ctx_id: stream.0,
+        value: stream.1,
+        reserved: 0,
+        cookie: stream.2,
+        fence: helios_protocol::HeliosRmFenceTail {
+            rm_fence_handle: fence_handle,
+            flags: if fence.is_some() { helios_protocol::HELIOS_RM_FENCE_TAIL_FLAG_FENCE } else { 0 },
+            rm_fence_value: fence_value,
+        },
+    };
+    (window.ptr.as_ptr() as *mut helios_protocol::HeliosFlushGateCmd).write_unaligned(cmd);
+    let mut render = ddi::D3DDDICB_RENDER::default();
+    render.CommandLength = len;
+    render.CommandOffset = 0;
+    render.NumAllocations = 0;
+    render.NumPatchLocations = 0;
+    render.hContext = ctx.handle.as_ptr();
+    let hr = render_cb(dev.h_rt_device, &mut render);
+    if hr < 0 {
+        return fail(&format!("pfnRenderCb hr=0x{:08x}", hr as u32));
+    }
+    if render.NewCommandBufferSize != 0 {
+        if let Some(w) = crate::device_funcs::Window::new(render.pNewCommandBuffer, render.NewCommandBufferSize) {
+            ctx.command.set(Some(w));
+        }
+    }
+    if render.NewAllocationListSize != 0 {
+        if let Some(w) = crate::device_funcs::Window::new(render.pNewAllocationList, render.NewAllocationListSize) {
+            ctx.allocations.set(Some(w));
+        }
+    }
+    if render.NewPatchLocationListSize != 0 {
+        if let Some(w) =
+            crate::device_funcs::Window::new(render.pNewPatchLocationList, render.NewPatchLocationListSize)
+        {
+            ctx.patches.set(Some(w));
+        }
+    }
+    let n = FLUSH_GATE_SENT[kind].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n % 4096 == 0 {
+        log_error!(
+            "DDI flush gate: {} #{n} (ctx {} value {} fence {}; wire {} stream {} fence {}, fallbacks {}, failed {})",
+            ["wire", "stream", "rm-fence"][kind],
+            stream.0,
+            stream.1,
+            fence_handle,
+            FLUSH_GATE_SENT[0].load(Ordering::Relaxed),
+            FLUSH_GATE_SENT[1].load(Ordering::Relaxed),
+            FLUSH_GATE_SENT[2].load(Ordering::Relaxed),
+            FLUSH_GATE_FALLBACK.load(Ordering::Relaxed),
+            FLUSH_GATE_RENDER_FAILED.load(Ordering::Relaxed),
+        );
+    }
+}
+
+static NVK_KEYED_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+/// `HELIOS_KEYED_FLUSH_WAIT=1` (process environment): the keyed-mutex flush
+/// wait on any backend, Venus included. Diagnostic: d3d11_share keyed-load
+/// shows Venus devices misorder keyed-mutex hand-offs across processes too
+/// (docs/shared-surfaces.md section 4); off by default there because DWM
+/// runs on Venus.
+pub(crate) fn keyed_flush_wait_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("HELIOS_KEYED_FLUSH_WAIT").is_ok_and(|v| v == "1")
+    })
+}
+
+/// NVK with a live keyed-mutex shared resource (docs/shared-surfaces.md §4,
+/// v1): wait on the CPU until every command this device submitted so far has
+/// completed on the GPU. The Microsoft runtime releases a keyed mutex right
+/// after `pfnFlush`, and dxgkrnl orders that release against this device's
+/// DMA buffers only; NVK submits to RM directly, so without the wait another
+/// process could acquire the key and read before our GPU writes landed. The
+/// acquirer needs nothing: its `AcquireSync` returns only after this release.
+///
+/// An event query issued after the flush signals when all earlier work is
+/// done (DXVK tracks it with the submission's fence; on NVK an RM semaphore).
+/// S4 replaces this with an RM-fence boundary on the DMA buffer, no CPU wait.
+pub(crate) unsafe fn nvk_keyed_flush_wait(h: Hdevice, context: &ID3D11DeviceContext, force: bool) {
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    if (!force && !dev.dxvk.is_nvk() && !keyed_flush_wait_forced())
+        || lock_ignore_poison(&dev.nvk_keyed_resources).is_empty()
+    {
+        return;
+    }
+    let Some(device) = dev.dxvk.d3d11_device() else {
+        return;
+    };
+    let desc = windows::Win32::Graphics::Direct3D11::D3D11_QUERY_DESC {
+        Query: windows::Win32::Graphics::Direct3D11::D3D11_QUERY_EVENT,
+        MiscFlags: 0,
+    };
+    let mut query = None;
+    if device.CreateQuery(&desc, Some(&mut query)).is_err() {
+        return;
+    }
+    let Some(query) = query else {
+        return;
+    };
+    context.End(&query);
+    let start = std::time::Instant::now();
+    let mut done: windows::Win32::Foundation::BOOL = Default::default();
+    loop {
+        // Raw HRESULT: S_FALSE (not yet) must not read as success. Flags 0
+        // flushes, so the query itself is submitted.
+        let hr = (Interface::vtable(context).GetData)(
+            Interface::as_raw(context),
+            Interface::as_raw(&query),
+            (&mut done as *mut windows::Win32::Foundation::BOOL).cast(),
+            core::mem::size_of::<windows::Win32::Foundation::BOOL>() as u32,
+            0,
+        );
+        if hr.0 == 0 && done.as_bool() {
+            break;
+        }
+        if hr.0 < 0 {
+            log_error!("DDI NVK keyed-mutex flush wait: GetData 0x{:08x}", hr.0 as u32);
+            break;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            log_error!("DDI NVK keyed-mutex flush wait: GPU not done after 5 s, releasing anyway");
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let n = NVK_KEYED_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n % 1024 == 0 {
+        log_error!(
+            "DDI NVK keyed-mutex flush wait #{n}: {} us",
+            start.elapsed().as_micros()
+        );
     }
 }
 

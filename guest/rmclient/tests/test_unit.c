@@ -32,6 +32,7 @@ static int unsetenv(const char *name) { return _putenv_s(name, ""); }
 #define NV_ERR_INVALID_CLASS      0x22u
 #define NV_ERR_NOT_SUPPORTED      0x56u
 #define FAKE_CLIENT               0xc1d00001u
+#define FAKE_CLIENT_SRC           0xc1d00002u /* another process's client */
 #define FAKE_SYSMEM_OTHER         0x3Fu /* a class the library doesn't know is sysmem */
 
 static int failures, checks;
@@ -67,6 +68,7 @@ struct fake {
     NVOS64_PARAMETERS last_alloc;
     NVOS54_PARAMETERS last_ctrl;
     NVOS00_PARAMETERS last_free;
+    NVOS55_PARAMETERS last_dup;
     NVOS46_PARAMETERS last_map_dma;
     NVOS47_PARAMETERS last_unmap_dma;
     NVOS34_PARAMETERS last_unmap;
@@ -234,6 +236,23 @@ static int f_ioctl(void *ctx, int fd, uint32_t nr, void *arg, uint32_t size)
             data = ap->data;
         }
         F.objs[F.nobj++] = (struct fobj){ p->hObjectNew, p->hObjectParent, p->hClass, 1, va, data };
+        p->status = NV_OK;
+        return 0;
+    }
+    case NV_ESC_RM_DUP_OBJECT: {
+        NVOS55_PARAMETERS *p = arg;
+        if (size != sizeof(*p)) return -EINVAL;
+        if (F.fd_node[fd] != CRM_NODE_CTL) return -EINVAL;
+        F.last_dup = *p;
+        if (!F.client_live || p->hClient != FAKE_CLIENT) { p->status = 0x0Eu; return 0; }
+        /* The fake knows one foreign client, FAKE_CLIENT_SRC, whose objects are
+         * this client's own objects (a stand-in for "the same RM object"). */
+        if (p->hClientSrc != FAKE_CLIENT_SRC && p->hClientSrc != FAKE_CLIENT) { p->status = 0x0Eu; return 0; }
+        struct fobj *src = fobj_find(p->hObjectSrc);
+        if (!src) { p->status = NV_ERR_OBJECT_NOT_FOUND; return 0; }
+        if (p->hParent != FAKE_CLIENT && !fobj_find(p->hParent)) { p->status = NV_ERR_OBJECT_NOT_FOUND; return 0; }
+        if (p->hObject == 0 || fobj_find(p->hObject)) { p->status = NV_ERR_INVALID_OBJECT_HANDLE; return 0; }
+        F.objs[F.nobj++] = (struct fobj){ p->hObject, p->hParent, src->hclass, 1, 0, 0 };
         p->status = NV_OK;
         return 0;
     }
@@ -668,6 +687,52 @@ static void test_free_cascade(void)
     crm_close(c);
 }
 
+static void test_dup_object(void)
+{
+    fake_reset();
+    crm_client *c = open_client();
+    if (!c) return;
+    uint32_t dev = 0, mem = 0, dup = 0, dup2 = 0x5c00beefu;
+    CHECK_EQ(crm_alloc(c, 0, &dev, NV01_DEVICE_0, NULL, 0), 0);
+    CHECK_EQ(crm_alloc(c, dev, &mem, NV01_MEMORY_SYSTEM, NULL, 0), 0);
+
+    /* library-picked handle, marshalled as NVOS55 */
+    CHECK_EQ(crm_dup_object(c, dev, &dup, FAKE_CLIENT_SRC, mem, NV01_MEMORY_SYSTEM, 0), 0);
+    CHECK(dup != 0 && dup != mem);
+    CHECK_EQ(F.last_dup.hClient, FAKE_CLIENT);
+    CHECK_EQ(F.last_dup.hParent, dev);
+    CHECK_EQ(F.last_dup.hObject, dup);
+    CHECK_EQ(F.last_dup.hClientSrc, FAKE_CLIENT_SRC);
+    CHECK_EQ(F.last_dup.hObjectSrc, mem);
+    CHECK_EQ(crm_object_count(c), 3);
+
+    /* caller-picked handle */
+    CHECK_EQ(crm_dup_object(c, dev, &dup2, FAKE_CLIENT_SRC, mem, 0, 0), 0);
+    CHECK_EQ(dup2, 0x5c00beefu);
+    CHECK_EQ(crm_object_count(c), 4);
+
+    /* RM's refusals come back as NV_STATUS and leave no handle behind */
+    uint32_t bad = 0;
+    CHECK_EQ(crm_dup_object(c, dev, &bad, 0xc1d0dead, mem, 0, 0), 0x0E);
+    CHECK_EQ(bad, 0u);
+    CHECK_EQ(crm_dup_object(c, dev, &bad, FAKE_CLIENT_SRC, 0x5c0fffffu, 0, 0),
+             (int)NV_ERR_OBJECT_NOT_FOUND);
+    CHECK_EQ(crm_dup_object(c, dev, &bad, 0, mem, 0, 0), -EINVAL);
+    CHECK_EQ(crm_object_count(c), 4);
+
+    /* the duplicate is an object like any other: CPU-mapped by its class,
+     * freed on its own or with its parent */
+    void *p = NULL;
+    CHECK_EQ(crm_map_memory(c, dev, dup, 0, 4096, 0, &p), 0);
+    CHECK_EQ(crm_mapping_count(c), 1);
+    CHECK_EQ(crm_free(c, dev, dup2), 0);
+    CHECK_EQ(crm_object_count(c), 3);
+    CHECK_EQ(crm_free(c, 0, dev), 0);
+    CHECK_EQ(crm_object_count(c), 0);
+    CHECK_EQ(crm_mapping_count(c), 0);
+    crm_close(c);
+}
+
 static void test_cpu_mappings(void)
 {
     fake_reset();
@@ -1048,6 +1113,7 @@ int main(void)
     test_handles_and_marshalling();
     test_errors();
     test_free_cascade();
+    test_dup_object();
     test_cpu_mappings();
     test_gpu_mappings();
     test_events();

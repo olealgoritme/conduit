@@ -51,6 +51,9 @@ pub struct ResourceState {
     /// resources, so no validity test can turn this source into a scanout
     /// selector.
     pub(crate) snapshot_source: Option<SnapshotSourceDesc>,
+    /// A D3D11.1 video decoder buffer (`DecoderBufferType` != 0): a staging
+    /// buffer the runtime maps for the app and `forward/video.rs` reads back.
+    pub(crate) decoder_buffer: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -195,6 +198,66 @@ pub struct RtvState {
 pub(crate) struct RuntimeAllocPrivate {
     pub(crate) alloc: HeliosWddmAllocPrivate,
     pub(crate) meta: HeliosWddmAllocMeta,
+    /// The foreign-layout trailer at byte 96. Sent (128 bytes) only for an
+    /// NVK-made allocation; every other allocation still sends the 96-byte
+    /// prefix, exactly as before.
+    pub(crate) layout: helios_protocol::HeliosWddmAllocLayout,
+    /// Plane 1 of a two-plane NVK-made allocation (NV12/P010/P016, version-2
+    /// layout, docs/shared-formats.md): sent (144 bytes) only then.
+    pub(crate) plane1: helios_protocol::HeliosWddmAllocPlane,
+}
+
+const _: () = {
+    assert!(
+        core::mem::offset_of!(RuntimeAllocPrivate, layout)
+            == helios_protocol::HELIOS_WDDM_LAYOUT_OFFSET
+    );
+    assert!(
+        core::mem::offset_of!(RuntimeAllocPrivate, plane1)
+            == helios_protocol::HELIOS_WDDM_LAYOUT_PLANE1_OFFSET
+    );
+    assert!(
+        core::mem::size_of::<RuntimeAllocPrivate>()
+            == helios_protocol::HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES
+    );
+};
+
+/// The KMD's foreign-layout trailer of an OPENED allocation (written by the KMD
+/// at create time for an NVK-made resource), or `None` for every other one.
+pub(crate) unsafe fn read_open_layout(
+    ptr: *const c_void,
+    size: u32,
+) -> Option<crate::bridge::ForeignLayout> {
+    use helios_protocol::{HeliosWddmAllocLayout, HELIOS_WDDM_LAYOUT_OFFSET};
+    if ptr.is_null()
+        || (size as usize)
+            < HELIOS_WDDM_LAYOUT_OFFSET + core::mem::size_of::<HeliosWddmAllocLayout>()
+    {
+        return None;
+    }
+    // SAFETY: the caller hands over dxgkrnl's private-data buffer of `size`
+    // bytes; the slice covers exactly that.
+    let private = core::slice::from_raw_parts(ptr as *const u8, size as usize);
+    // A two-plane record (version 2, plane 1 at 128) or a version-1 one.
+    if let Some((layout, plane1)) = HeliosWddmAllocLayout::read_open_planes(private) {
+        return Some(crate::bridge::ForeignLayout {
+            modifier: layout.modifier,
+            stride: layout.stride,
+            offset: layout.plane_offset,
+            fourcc: layout.fourcc,
+            plane1_modifier: plane1.modifier,
+            plane1_stride: plane1.stride,
+            plane1_offset: plane1.plane_offset,
+        });
+    }
+    let layout = HeliosWddmAllocLayout::read_open(private)?;
+    Some(crate::bridge::ForeignLayout {
+        modifier: layout.modifier,
+        stride: layout.stride,
+        offset: layout.plane_offset,
+        fourcc: layout.fourcc,
+        ..Default::default()
+    })
 }
 
 #[inline]
@@ -458,6 +521,45 @@ pub(crate) unsafe fn set_runtime_error(h: Hdevice, hr: i32) {
     }
 }
 
+/// Whether the device behind `h` is removed: the KMD went away under this
+/// process since the device was created (the shared loss epoch,
+/// `device_loss.rs`), or DXVK saw `VK_ERROR_DEVICE_LOST`
+/// (`GetDeviceRemovedReason` is not S_OK).
+pub(crate) unsafe fn device_removed(h: Hdevice) -> bool {
+    let Some(dev) = helios_device(h) else {
+        return false;
+    };
+    if dev.loss.kmd_lost() {
+        return true;
+    }
+    dev.dxvk
+        .d3d11_device()
+        .is_some_and(|device| device.GetDeviceRemovedReason().is_err())
+}
+
+/// If the device behind `h` is removed, tell the runtime
+/// (`pfnSetErrorCb(D3DDDIERR_DEVICEREMOVED)`) and return `true`: the caller
+/// then does no work and, for the DXGI DDIs, returns
+/// `D3DDDIERR_DEVICEREMOVED`. The runtime turns that into
+/// `DXGI_ERROR_DEVICE_REMOVED` for the API call, which is what makes DWM drop
+/// the device and create a new one on the restarted adapter instead of
+/// presenting into a lost renderer forever.
+pub(crate) unsafe fn report_if_removed(h: Hdevice, site: &str) -> bool {
+    if !device_removed(h) {
+        return false;
+    }
+    if let Some(dev) = helios_device(h) {
+        if dev.loss.first_report() {
+            log_error!(
+                "device removed (KMD gone: {}) at {site}: reporting D3DDDIERR_DEVICEREMOVED to the runtime",
+                dev.loss.kmd_lost()
+            );
+        }
+    }
+    set_runtime_error(h, crate::hr::D3DDDIERR_DEVICEREMOVED);
+    true
+}
+
 /// The D3D11 context this handle records on, borrowed: the bridge's immediate
 /// context for a device handle, the DC's own DXVK deferred COM context for a
 /// deferred-context handle. Every context forwarder resolves through this, so
@@ -626,7 +728,22 @@ pub(crate) unsafe fn store_resource(
         ownership,
         present_private,
         snapshot_source,
+        decoder_buffer: false,
     });
+}
+
+/// Marks a just-stored resource as a video decoder buffer.
+pub(crate) unsafe fn mark_decoder_buffer(h_res: ddi::D3D10DDI_HRESOURCE) {
+    if let Some(slot) = boxed_slot(h_res) {
+        let state = slot.ptr();
+        if !state.is_null() {
+            (*state).decoder_buffer = true;
+        }
+    }
+}
+
+pub(crate) unsafe fn is_decoder_buffer(h_res: ddi::D3D10DDI_HRESOURCE) -> bool {
+    resource_state(h_res).is_some_and(|s| s.decoder_buffer)
 }
 
 pub(crate) unsafe fn stamp_dxvk_resource_kmt_handles(
@@ -895,8 +1012,20 @@ pub(crate) enum Tex2DShape {
     MsArray,
 }
 
-pub(crate) const fn tex1d_shape(array_size: u32) -> Tex1DShape {
-    if array_size > 1 {
+/// Whether a view needs the API's array dimension.
+///
+/// The DDI has one `Tex1D`/`Tex2D` arm where the API has separate plain and
+/// array dimensions, so `{ FirstArraySlice, ArraySize }` is all the driver
+/// gets. A one-slice view of slice N > 0 (a decoder surface pool sampled
+/// slice by slice, a shadow cascade rendered layer by layer) is an array
+/// view: the plain dimensions have no slice field and would silently name
+/// slice 0. Same predicate as umd12's `needs_array_form`.
+pub(crate) const fn needs_array_form(array_size: u32, first_array_slice: u32) -> bool {
+    array_size > 1 || first_array_slice > 0
+}
+
+pub(crate) const fn tex1d_shape(array_size: u32, first_array_slice: u32) -> Tex1DShape {
+    if needs_array_form(array_size, first_array_slice) {
         Tex1DShape::Array
     } else {
         Tex1DShape::Plain
@@ -909,8 +1038,8 @@ pub(crate) const fn tex1d_shape(array_size: u32) -> Tex1DShape {
 /// The evaluation order is load-bearing and matches all three originals: MSAA
 /// wins over array-ness, so a multisampled array is `MsArray` and NOT
 /// `Array`.
-pub(crate) const fn tex2d_shape(array_size: u32, sample_count: u32) -> Tex2DShape {
-    match (sample_count > 1, array_size > 1) {
+pub(crate) const fn tex2d_shape(array_size: u32, first_array_slice: u32, sample_count: u32) -> Tex2DShape {
+    match (sample_count > 1, needs_array_form(array_size, first_array_slice)) {
         (true, true) => Tex2DShape::MsArray,
         (true, false) => Tex2DShape::Ms,
         (false, true) => Tex2DShape::Array,
@@ -1061,6 +1190,7 @@ pub(crate) unsafe fn release_rtv(h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW) {
 }
 
 pub(crate) unsafe fn release_resource(h: Hdevice, h_res: ddi::D3D10DDI_HRESOURCE) {
+    crate::forward::resource::forget_nvk_keyed_resource(h, h_res);
     let Some(slot) = boxed_slot(h_res) else {
         return;
     };

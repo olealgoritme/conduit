@@ -22,11 +22,13 @@ inc = include_directories('include')
 # ICD also uses (system include: they carry MSVC pragmas).
 wdk_inc = is_windows ? include_directories(
   '../windows/icd/win-build/wdk-include', is_system : true) : []
+# helios_kmdmap.h: the KMD-view loss table shared with the Venus ICD and the UMD
+kmdmap_inc = is_windows ? include_directories('../windows/umd_common/bridge') : []
 
 rmclient_lib = library('rmclient',
   'src/rmclient.c', 'src/status.c', 'src/transport_linux.c',
   'src/transport_windows.c',
-  include_directories : [inc, include_directories('src'), wdk_inc],
+  include_directories : [inc, include_directories('src'), wdk_inc, kmdmap_inc],
   dependencies : deps,
   gnu_symbol_visibility : 'default',
   # MinGW: no libgcc DLL next to librmclient.dll
@@ -65,5 +67,15 @@ executable('crm_pin_smoke', 'tests/crm_pin_smoke.c',
 # Zero-copy present of RM video memory on a Windows guest (DRM node, GEM import,
 # ScanoutFlip through the KMD); exits 77 elsewhere.
 executable('crm_scanout_smoke', 'tests/crm_scanout_smoke.c',
+  include_directories : [inc, include_directories('src')],
+  dependencies : rmclient_dep)
+# RM semaphore-surface fences through the KMD (dxvk-on-nvk S4): fence create,
+# EVENT_REGISTER on the fence handle, signal latency; exits 77 elsewhere.
+executable('crm_semsurf_smoke', 'tests/crm_semsurf_smoke.c',
+  include_directories : [inc, include_directories('src')],
+  dependencies : rmclient_dep)
+# One RM memory object in two processes (NV_ESC_RM_DUP_OBJECT across clients),
+# the base of shared surfaces between NVK processes on Windows.
+executable('crm_share_smoke', 'tests/crm_share_smoke.c',
   include_directories : [inc, include_directories('src')],
   dependencies : rmclient_dep)

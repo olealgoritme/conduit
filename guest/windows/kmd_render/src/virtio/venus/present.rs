@@ -29,6 +29,13 @@ pub struct OptimalPresentImageDesc {
     /// only *outside* `venus.rs`).
     pub(super) pixel_format: PresentPixelFormat,
     pub(super) transport: OptimalImageTransport,
+    /// `Some` for a foreign (NVK-on-RM) source: the import is then an
+    /// explicit-modifier dma-buf image built from this record, and
+    /// `memory_type_index`, `ddi_bind_flags` and `transport` are not consulted.
+    /// Part of the descriptor's identity, so a cache hit can never reuse an
+    /// ordinary alias for a foreign resource or the other way round. `None` for
+    /// every ordinary resource, which keeps its code path unchanged.
+    pub(super) foreign: Option<ForeignSource>,
 }
 
 impl OptimalPresentImageDesc {
@@ -53,6 +60,7 @@ impl OptimalPresentImageDesc {
             dxgi_format,
             pixel_format,
             transport,
+            foreign: None,
         })
     }
 
@@ -87,6 +95,35 @@ impl OptimalPresentImageDesc {
             dxgi_format,
             OptimalImageTransport::OpaqueFd,
         )
+    }
+
+    /// A foreign (NVK-on-RM) resource as a Present source: imported as an
+    /// explicit-modifier dma-buf image from `source`'s record (see
+    /// [`foreign_copy`](super::foreign_copy)). The pixel format is the record's
+    /// fourcc, not the allocation's DXGI format (`dxgi_format` is kept for the
+    /// descriptor's identity and traces only). `None` when the record's fourcc has
+    /// no Present format or an extent is zero.
+    pub fn new_foreign_dma_buf(
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        dxgi_format: u32,
+        source: ForeignSource,
+    ) -> Option<Self> {
+        let pixel_format = source.pixel_format()?;
+        (resource_id != 0 && source.record_size != 0 && width != 0 && height != 0).then_some(Self {
+            resource_id,
+            allocation_size: source.record_size,
+            // Not consulted: the KMD device picks the memory type itself.
+            memory_type_index: 0,
+            width,
+            height,
+            ddi_bind_flags: 0,
+            dxgi_format,
+            pixel_format,
+            transport: OptimalImageTransport::CrossContextDmaBuf,
+            foreign: Some(source),
+        })
     }
 
     /// KMD GDI textures and direct-optimal scanout images are exported through
@@ -512,6 +549,12 @@ impl VenusClient {
         adapter: &AdapterContext,
         desc: OptimalPresentImageDesc,
     ) -> Result<ImportedOptimalImage, VirtioError> {
+        // A foreign source is a different import (explicit-modifier dma-buf
+        // image, own memory type); everything below is the ordinary OPTIMAL one,
+        // untouched.
+        if let Some(source) = desc.foreign {
+            return self.import_foreign_present_image(adapter, desc, &source);
+        }
         if desc.memory_type_index >= self.memory_type_count {
             return Err(VirtioError::DeviceError);
         }
@@ -577,6 +620,30 @@ impl VenusClient {
             return Err(e);
         }
 
+        Ok(ImportedOptimalImage {
+            desc,
+            image_id,
+            memory_id,
+        })
+    }
+
+    /// The foreign half of [`Self::import_optimal_present_image`]: preflight
+    /// (no host contact), attach, then the explicit-modifier import. The returned
+    /// record is the ordinary [`ImportedOptimalImage`], so the cache, its
+    /// identity check and `release_present_blits_for_resource` treat it like any
+    /// other import.
+    fn import_foreign_present_image(
+        &mut self,
+        adapter: &AdapterContext,
+        desc: OptimalPresentImageDesc,
+        source: &ForeignSource,
+    ) -> Result<ImportedOptimalImage, VirtioError> {
+        let image =
+            self.foreign_preflight(adapter, desc.resource_id, source, desc.width, desc.height)?;
+        ctrl::attach_resource_checked(self.passive(), adapter, self.ctx_id(), desc.resource_id)?;
+        let (image_id, memory_id) =
+            self.import_foreign_source(adapter, desc.resource_id, &image)?;
+        FC_BLT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(ImportedOptimalImage {
             desc,
             image_id,
@@ -1491,5 +1558,220 @@ impl VenusClient {
             }
         }
         Ok(())
+    }
+}
+
+// ---- the level 5 Blt fallback: the GPU half (docs/kmd-rm-client.md 15.17) --------------------
+
+/// Staging-image allocation ATTEMPTS the fallback may make in one Venus client's life. The
+/// image only ever grows (a mode change to a larger primary); a replaced one, and the objects
+/// of an attempt that failed half way, are kept until context teardown like every
+/// `owned_linear_images` entry, so this bounds that leak.
+const RM_BLT_STAGE_MAX_ALLOCS: u32 = 8;
+
+/// The staging image of the level 5 Blt fallback: an adapter-owned LINEAR host-visible BGRA
+/// image (the shape `allocate_linear_scanout_image_blob` makes), private to this fallback. It
+/// is NOT the adapter's dedicated scanout image: that one is published as the primary scanout
+/// (`primary_scanout_*`, `SET_SCANOUT_BLOB`) and the RM primary is shown by its own flip, so
+/// sharing it would publish the wrong identity.
+///
+/// Copies are `width` x `height` from the top-left; a source smaller than the image uses its
+/// top-left part, and `row_pitch` / `plane_offset` are what Vulkan reported for the image.
+#[derive(Clone, Copy)]
+pub(crate) struct RmBltStage {
+    pub(crate) image_id: VkImageId,
+    /// The virtio resource of the image's HOST3D blob (what the guest maps).
+    pub(crate) resource_id: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) row_pitch: u32,
+    pub(crate) plane_offset: u32,
+    /// Page-rounded size of the blob.
+    pub(crate) size: u64,
+}
+
+impl VenusClient {
+    /// The staging image, allocated on first use and again (larger) when a source outgrows it.
+    fn ensure_rm_blt_stage(
+        &mut self,
+        adapter: &AdapterContext,
+        width: u32,
+        height: u32,
+    ) -> Result<RmBltStage, VirtioError> {
+        if let Some(stage) = self.rm_blt_stage {
+            if stage.width >= width && stage.height >= height {
+                return Ok(stage);
+            }
+        }
+        if self.rm_blt_stage_allocs >= RM_BLT_STAGE_MAX_ALLOCS {
+            // One registry write per exhaustion, not one per Present.
+            static EXHAUSTED_NOTED: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !EXHAUSTED_NOTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                crate::diag::record_named_bytes(
+                    b"RmSysBltStg",
+                    0x8000_0000 | self.rm_blt_stage_allocs,
+                );
+            }
+            return Err(VirtioError::OutOfMemory);
+        }
+        let (want_w, want_h) = match self.rm_blt_stage {
+            Some(old) => (old.width.max(width), old.height.max(height)),
+            None => (width, height),
+        };
+        self.rm_blt_stage_allocs += 1;
+        let blob = self.allocate_linear_scanout_image_blob(adapter, want_w, want_h)?;
+        let stage = RmBltStage {
+            image_id: blob.image_id,
+            resource_id: blob.blob.res_id,
+            width: want_w,
+            height: want_h,
+            row_pitch: blob.row_pitch,
+            plane_offset: blob.plane_offset,
+            size: blob.blob.size,
+        };
+        self.rm_blt_stage = Some(stage);
+        crate::diag::record_named_bytes(b"RmSysBltStg", stage.resource_id);
+        Ok(stage)
+    }
+
+    /// GPU-copy one Venus-backed Present source (an imported OPTIMAL image, converted to BGRA
+    /// when its Vulkan format is not) into the staging LINEAR image, and return the stage and
+    /// the ring-1 wire fence of the copy. The caller waits for the fence (outside this client's
+    /// mutex) and then reads the stage through its guest mapping.
+    ///
+    /// The copy is the whole source image: the reusable command is the one
+    /// `prepare_optimal_scanout_copy` records (`record_reusable_image_copy` /
+    /// `record_reusable_converted_image_copy`), baked once per (source, stage) pair in the
+    /// same `present_blits` cache as an ordinary Present BLT, so teardown of the source
+    /// (`release_present_blits_for_resource`) releases it with the rest. The import is the
+    /// ordinary cached `ensure_present_image`. The submit is `submit_venus_async_present`
+    /// with no destination buffer: ring 1, no scanout notify, nothing marked dirty.
+    ///
+    /// Callers serialize on the stage themselves (one fallback Present at a time between
+    /// this call and the end of the CPU read).
+    pub(crate) fn rm_blt_copy_to_stage(
+        &mut self,
+        adapter: &AdapterContext,
+        source: OptimalPresentImageDesc,
+    ) -> Result<(RmBltStage, u64), VirtioError> {
+        // A resource has one interpretation for the cache lifetime: a source that is a
+        // borrowed Present buffer is never an image.
+        if self
+            .present_buffers
+            .iter()
+            .any(|buffer| buffer.desc.resource_id == source.resource_id)
+        {
+            return Err(VirtioError::DeviceError);
+        }
+        let stage = self.ensure_rm_blt_stage(adapter, source.width, source.height)?;
+        // Setup completed at allocation (`initialize_linear_image`) before the memory was
+        // exposed to the CPU: never redo a discard here.
+        if !self.owned_linear_images.iter().any(|image| {
+            image.image_id == stage.image_id
+                && image.access.may_publish()
+                && image.resource_id.is_some()
+        }) {
+            crate::diag::record_named_bytes(b"SdgLIni", 0xE1);
+            return Err(VirtioError::DeviceError);
+        }
+        let existing = self.present_blits.iter().position(|blt| {
+            blt.source_resource_id == source.resource_id
+                && blt.destination_resource_id == stage.resource_id
+        });
+        if existing.is_none() {
+            reserve_present_cache_slot(&mut self.present_blits, MAX_PRESENT_BLITS, b"PBLRef")?;
+        }
+        // Validated on every call, cache hits included (a recycled resource id cannot select
+        // a command baked for another allocation).
+        let source_image = self.ensure_present_image(adapter, source)?;
+        let blt_index = match existing {
+            Some(index) => index,
+            None => {
+                let target_pixel_format = PresentPixelFormat::Bgra8Unorm;
+                let mut conversion_image_id = None;
+                let mut conversion_memory_id = None;
+                let mut conversion_init_pool_id = None;
+                let (command_pool_id, command_buffer_id) =
+                    if source.pixel_format().vk_format() != target_pixel_format.vk_format() {
+                        let conversion = self.create_bound_present_conversion_image(
+                            adapter,
+                            source.width,
+                            source.height,
+                            target_pixel_format,
+                        )?;
+                        conversion_image_id = Some(conversion.0);
+                        conversion_memory_id = Some(conversion.1);
+                        let command = match self.record_reusable_converted_image_copy(
+                            adapter,
+                            source_image.image_id,
+                            conversion.0,
+                            stage.image_id,
+                            source.width,
+                            source.height,
+                        ) {
+                            Ok(command) => command,
+                            Err(e) => {
+                                // Never submitted: safe to unwind completely.
+                                let _ = self.destroy_image_on_ring(adapter, conversion.0);
+                                let _ = self.free_memory_object(adapter, conversion.1);
+                                return Err(e);
+                            }
+                        };
+                        conversion_init_pool_id =
+                            match self.initialize_present_conversion_image(adapter, conversion.0) {
+                                Ok(pool_id) => Some(pool_id),
+                                Err(e) => {
+                                    // The initializer's submission is ambiguous: its scratch
+                                    // objects wait for context teardown; the never-submitted
+                                    // reusable command is safe to release.
+                                    let _ = self.destroy_command_pool(adapter, command.0);
+                                    return Err(e);
+                                }
+                            };
+                        command
+                    } else {
+                        self.record_reusable_image_copy(
+                            adapter,
+                            source_image.image_id,
+                            stage.image_id,
+                            source.width,
+                            source.height,
+                        )?
+                    };
+                self.present_blits.push(PreparedPresentBlt {
+                    source_resource_id: source.resource_id,
+                    destination_resource_id: stage.resource_id,
+                    command_pool_id,
+                    command_buffer_id,
+                    conversion_image_id,
+                    conversion_memory_id,
+                    conversion_init_pool_id,
+                    last_wire_fence_id: 0,
+                    submit_count: 0,
+                    // No destination buffer to sample.
+                    probe_done: true,
+                });
+                record_present_cache_high_water(
+                    self.present_blits.len(),
+                    &mut self.present_blits_high_water,
+                    b"PBLHi",
+                );
+                self.present_blits.len() - 1
+            }
+        };
+        let command_buffer_id = self.present_blits[blt_index].command_buffer_id;
+        let submit = self.encode_command_buffer_submit(command_buffer_id);
+        let fence_id = ctrl::submit_venus_async_present(
+            self.passive(),
+            adapter,
+            self.ctx_id(),
+            submit.as_slice()?,
+            None,
+        )?;
+        let blt = &mut self.present_blits[blt_index];
+        blt.last_wire_fence_id = fence_id;
+        blt.submit_count = blt.submit_count.saturating_add(1);
+        Ok((stage, fence_id))
     }
 }

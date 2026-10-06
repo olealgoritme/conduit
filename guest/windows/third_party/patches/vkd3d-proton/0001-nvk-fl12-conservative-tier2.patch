@@ -1,0 +1,29 @@
+Helios vkd3d-proton fork: admit FL12 with conservative rasterization tier 2 on NVK
+
+Conduit dxvk-on-nvk.md decision D4 (user decision 2026-10-06): NVK reports
+fullyCoveredFragmentShaderInputVariable = false, so its conservative raster
+tier is 2; the fork's native FL12 admission otherwise refuses it. Only for
+VK_DRIVER_ID_MESA_NVK. Groundwork for S5 (D3D12 on NVK).
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index ed8732d1..845be940 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -11509,9 +11509,16 @@ HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device *iface, uint32_t
+         ERR("Native FL12 admission requires VK_EXT_device_generated_commands; no private emulation is installed.\n");
+         return DXGI_ERROR_UNSUPPORTED;
+     }
++    /* Helios on NVK (Conduit dxvk-on-nvk, decision D4): NVK reports
++     * fullyCoveredFragmentShaderInputVariable = false, so conservative
++     * rasterization is tier 2 there; upstream vkd3d-proton admits FL12 with
++     * that, and so does this check for VK_DRIVER_ID_MESA_NVK. */
++    const D3D12_CONSERVATIVE_RASTERIZATION_TIER fl12_conservative_tier =
++            device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_NVK
++            ? D3D12_CONSERVATIVE_RASTERIZATION_TIER_2 : D3D12_CONSERVATIVE_RASTERIZATION_TIER_3;
+     if (minimum_feature_level >= D3D_FEATURE_LEVEL_12_0 &&
+             (caps->options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3 ||
+-             caps->options.ConservativeRasterizationTier < D3D12_CONSERVATIVE_RASTERIZATION_TIER_3 ||
++             caps->options.ConservativeRasterizationTier < fl12_conservative_tier ||
+              !device->device_info.maintenance_8_features.maintenance8 || !device->vk_info.EXT_depth_range_unrestricted ||
+              !device->device_info.vulkan_1_2_features.storageBuffer8BitAccess || !device->device_info.vulkan_1_2_features.shaderInt8 ||
+              !device->device_info.features2.features.shaderStorageImageMultisample ||

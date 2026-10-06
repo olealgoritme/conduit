@@ -34,6 +34,26 @@ const SUPPORTED_DDI_VERSIONS: &[u64] = &[
     ddi_supported(11, 10, 2), // D3D11_0_DDI_SUPPORTED
 ];
 
+/// `SUPPORTED_DDI_VERSIONS` with D3DWDDM2_3 (interface 0x000b0024, build 1, the
+/// pair d3d11.dll lists for that interface) in front, for processes
+/// `ddi_level` puts on WDDM 2.3. The device-funcs table for 2.3 is
+/// `D3DWDDM2_2DDI_DEVICEFUNCS` (2.3 added no device entry points) and the DXGI
+/// base table is `DXGI1_6_1_DDI_BASE_FUNCTIONS` (IS_DXGI1_6_1_BASE_FUNCTIONS is
+/// true for every interface above D3DWDDM2_2).
+const SUPPORTED_DDI_VERSIONS_WDDM2_3: &[u64] = &[
+    ddi_supported(11, 36, 1), // D3DWDDM2_3_DDI_SUPPORTED
+    ddi_supported(11, 16, 1),
+    ddi_supported(11, 15, 0),
+    ddi_supported(11, 10, 2),
+];
+
+fn supported_ddi_versions() -> &'static [u64] {
+    match crate::ddi_level::ddi_level() {
+        crate::ddi_level::DdiLevel::Wddm2_3 => SUPPORTED_DDI_VERSIONS_WDDM2_3,
+        crate::ddi_level::DdiLevel::Wddm1_3 => SUPPORTED_DDI_VERSIONS,
+    }
+}
+
 /// The DDI interface versions `GetSupportedVersions` advertises, as a closed
 /// set. `CreateDevice` dispatches on this and nothing else: the previous
 /// `if/else-if/else` chain treated "unknown or older interface" as D3D11.0 and
@@ -51,16 +71,26 @@ pub(crate) enum NegotiatedInterface {
     D3D11_0,
     D3D11_1,
     Wddm1_3,
+    /// D3DWDDM2_3: `D3DWDDM2_2DDI_DEVICEFUNCS` + `DXGI1_6_1_DDI_BASE_FUNCTIONS`.
+    /// Only reachable when `ddi_level` advertised it.
+    Wddm2_3,
 }
 
 impl NegotiatedInterface {
     const D3D11_0_INTERFACE: u32 = 0x000b_000a;
     const D3D11_1_INTERFACE: u32 = 0x000b_000f;
     const WDDM1_3_INTERFACE: u32 = 0x000b_0010;
+    const WDDM2_3_INTERFACE: u32 = 0x000b_0024;
 
-    /// Panic-free: a linear scan of a three-element array literal, no indexing.
+    /// Panic-free: a linear scan of a small array literal, no indexing. The
+    /// WDDM 2.3 interface is accepted only when this process advertised it.
     fn from_interface(interface: u32) -> Option<Self> {
         match interface {
+            Self::WDDM2_3_INTERFACE
+                if crate::ddi_level::ddi_level() == crate::ddi_level::DdiLevel::Wddm2_3 =>
+            {
+                Some(Self::Wddm2_3)
+            }
             Self::WDDM1_3_INTERFACE => Some(Self::Wddm1_3),
             Self::D3D11_1_INTERFACE => Some(Self::D3D11_1),
             Self::D3D11_0_INTERFACE => Some(Self::D3D11_0),
@@ -70,10 +100,17 @@ impl NegotiatedInterface {
 
     pub(crate) fn name(self) -> &'static str {
         match self {
+            Self::Wddm2_3 => "WDDM2_3",
             Self::Wddm1_3 => "WDDM1_3",
             Self::D3D11_1 => "D3D11_1",
             Self::D3D11_0 => "D3D11_0",
         }
+    }
+
+    /// The device uses the WDDM 2.x argument structures (views, rasterizer
+    /// state, queries, flush) and DDI-style format-support bits.
+    pub(crate) fn is_wddm2(self) -> bool {
+        matches!(self, Self::Wddm2_3)
     }
 }
 
@@ -94,6 +131,13 @@ const _: () = {
     assert!((SUPPORTED_DDI_VERSIONS[0] >> 32) as u32 == NegotiatedInterface::WDDM1_3_INTERFACE);
     assert!((SUPPORTED_DDI_VERSIONS[1] >> 32) as u32 == NegotiatedInterface::D3D11_1_INTERFACE);
     assert!((SUPPORTED_DDI_VERSIONS[2] >> 32) as u32 == NegotiatedInterface::D3D11_0_INTERFACE);
+    assert!(SUPPORTED_DDI_VERSIONS_WDDM2_3.len() == 4);
+    assert!(
+        (SUPPORTED_DDI_VERSIONS_WDDM2_3[0] >> 32) as u32 == NegotiatedInterface::WDDM2_3_INTERFACE
+    );
+    assert!(SUPPORTED_DDI_VERSIONS_WDDM2_3[1] == SUPPORTED_DDI_VERSIONS[0]);
+    assert!(SUPPORTED_DDI_VERSIONS_WDDM2_3[2] == SUPPORTED_DDI_VERSIONS[1]);
+    assert!(SUPPORTED_DDI_VERSIONS_WDDM2_3[3] == SUPPORTED_DDI_VERSIONS[2]);
 };
 
 // The seven d3d10umddi ABI structs that used to be hand-transcribed here
@@ -310,7 +354,9 @@ unsafe extern "system" fn create_device(
         // The final callback field was added in 11.1. Read only the negotiated
         // prefix, using pointer-sized words so x86 never walks an x64 bound.
         let bytes = match NegotiatedInterface::from_interface(create.Interface) {
-            Some(NegotiatedInterface::D3D11_1) | Some(NegotiatedInterface::Wddm1_3) => {
+            Some(NegotiatedInterface::D3D11_1)
+            | Some(NegotiatedInterface::Wddm1_3)
+            | Some(NegotiatedInterface::Wddm2_3) => {
                 core::mem::size_of::<ddi::D3D10DDIARG_CREATEDEVICE>()
             }
             Some(NegotiatedInterface::D3D11_0) | None => {
@@ -409,10 +455,12 @@ unsafe extern "system" fn create_device(
                 // scanout_copy_count, composition_source). The exact-primary
                 // identity path is `direct_scanout_allocations` plus
                 // `presented_primary_private`, and it is now the only one.
+                nvk_keyed_resources: std::sync::Mutex::new(Vec::new()),
                 direct_scanout_allocations: std::sync::Mutex::new(Vec::new()),
                 h_rt_core_layer: create.hRTCoreLayer.handle,
                 um_callbacks: p_um_callbacks.cast(),
                 negotiated,
+                loss: crate::device_loss::LossWatch::new(),
             },
         );
     }
@@ -458,6 +506,14 @@ unsafe extern "system" fn create_device(
     // would still compile.
     unsafe {
         match negotiated {
+            NegotiatedInterface::Wddm2_3 => {
+                device_funcs::fill_wddm2_3_device_funcs(
+                    create.__bindgen_anon_1.pWDDM2_2DeviceFuncs,
+                );
+                device_funcs::fill_dxgi_1_6_1_base_funcs(
+                    create.DXGIBaseDDI.__bindgen_anon_1.pDXGIDDIBaseFunctions6_1,
+                );
+            }
             NegotiatedInterface::Wddm1_3 => {
                 device_funcs::fill_wddm1_3_device_funcs(
                     create.__bindgen_anon_1.pWDDM1_3DeviceFuncs,
@@ -478,6 +534,17 @@ unsafe extern "system" fn create_device(
                     create.DXGIBaseDDI.__bindgen_anon_1.pDXGIDDIBaseFunctions,
                 );
             }
+        }
+        // The >=11.1 interfaces fetch sub-object tables (the D3D11.1 video DDI)
+        // through ppfnRetrieveSubObject; 11.0's argument struct ends before it.
+        // `retrieve_sub_object` itself decides per device (`VideoDdi` knob).
+        if matches!(
+            negotiated,
+            NegotiatedInterface::D3D11_1 | NegotiatedInterface::Wddm1_3 | NegotiatedInterface::Wddm2_3
+        )
+            && !create.ppfnRetrieveSubObject.is_null()
+        {
+            *create.ppfnRetrieveSubObject = Some(forward::retrieve_sub_object);
         }
     }
 
@@ -580,22 +647,23 @@ unsafe extern "system" fn get_supported_versions(
     }
 
     let requested_entries = unsafe { *entries };
+    let advertised = supported_ddi_versions();
     log_error!(
         "GetSupportedVersions requested={requested_entries} bufNull={} (advertising {:#018x?})",
         supported_versions.is_null(),
-        SUPPORTED_DDI_VERSIONS,
+        advertised,
     );
-    unsafe { *entries = SUPPORTED_DDI_VERSIONS.len() as u32 };
+    unsafe { *entries = advertised.len() as u32 };
 
     if supported_versions.is_null() {
         return S_OK;
     }
 
-    if requested_entries < SUPPORTED_DDI_VERSIONS.len() as u32 {
+    if requested_entries < advertised.len() as u32 {
         return E_OUTOFMEMORY;
     }
 
-    for (index, version) in SUPPORTED_DDI_VERSIONS.iter().enumerate() {
+    for (index, version) in advertised.iter().enumerate() {
         unsafe { *supported_versions.add(index) = *version };
     }
     S_OK

@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 09:30:00 +0200
+Subject: [PATCH] wsi/win32: scanout swapchains get two images; a one-image
+ one does not hang
+
+Zink (wgl_test through the package's libgallium_wgl, NVK, Helios
+scanout WSI) hung in its first SwapBuffers on KMD 22.22.316-318: the
+main thread waited in wsi_win32_acquire_next_image for an idle image
+that never came (u_cnd_monotonic_timedwait, timeout UINT64_MAX), with
+or without RM fences (NVK_RM_FENCE=0) and release tracking
+(NVK_SCANOUT_RELEASE=0); NVK_HELIOS_WSI=0 (GDI) passed.
+
+Kopper creates its swapchain with the surface's minImageCount, which
+the non-DXGI Win32 surface reports as 1.  A one-image scanout chain has
+hold = 0; before patch 0036 the present loop then put the just-presented
+image straight back to IDLE (serial + 0 <= serial).  0036 skips the
+presented image in that loop (other == image), so the only image stayed
+QUEUED and the next acquire waited forever.
+
+- The surface reports minImageCount 2 when the driver flips
+  (win32.scanout_flip): a scanout image is shown in place, and with one
+  image the app draws into the buffer on display.
+- A one-image scanout chain (an app that asks for one anyway) gets its
+  image back at once again, as before 0036.
+
+Order: after 0036, before patches-windows-dxvk/ (whose 0003 touches
+other hunks of this file).
+---
+ src/vulkan/wsi/wsi_common_win32.cpp | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -233,7 +233,12 @@ wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
+        */
+       caps->surfaceCapabilities.minImageCount = caps->surfaceCapabilities.maxImageCount = 2;
+    } else {
+-      caps->surfaceCapabilities.minImageCount = 1;
++      /* A scanout swapchain (Helios) shows its images in place: with one
++       * image the app would draw into the buffer on display.  Ask for two
++       * when the driver flips (apps such as Zink take minImageCount).
++       */
++      caps->surfaceCapabilities.minImageCount =
++         wsi_device->win32.scanout_flip != NULL ? 2 : 1;
+       /* Software callbacke, there is no real maximum */
+       caps->surfaceCapabilities.maxImageCount = 0;
+    }
+@@ -915,7 +920,12 @@ wsi_win32_queue_present_scanout(struct wsi_win32_swapchain *chain,
+    }
+ 
+    mtx_lock(&chain->acquire_mutex);
+-   image->state = WSI_IMAGE_QUEUED;
++   /* A one-image swapchain cannot wait for a later image to replace this
++    * one: it is the app's again at once, drawn while on display (as before
++    * release tracking).  Holding it QUEUED blocked the next acquire forever.
++    */
++   image->state = chain->base.image_count == 1 ? WSI_IMAGE_IDLE
++                                               : WSI_IMAGE_QUEUED;
+    image->release_pending = false;
+    for (uint32_t i = 0; i < chain->base.image_count; i++) {
+       struct wsi_win32_image *other = &chain->images[i];
+--
+2.43.0
+

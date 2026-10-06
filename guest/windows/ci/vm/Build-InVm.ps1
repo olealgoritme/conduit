@@ -4,12 +4,16 @@
 # so the package installs on a VM in test-signing mode.
 #
 #   pwsh -ExecutionPolicy Bypass -File Build-InVm.ps1 [-Configuration Release|Debug] [-Root W:\]
+#        [-NvkArtifact <Root>\nvk]
 #
-# Source: <Root>\src\guest\windows (win-build.sh copies it there). Output:
+# Source: <Root>\src\guest\windows (win-build.sh copies it there), NVK and
+# Zink from <Root>\nvk (win-build.sh copies dist/nvk-windows there, see
+# guest/nvk-rm/windows/stage-helios-package.sh). Output:
 # <Root>\out\<Configuration>.
 param(
     [ValidateSet("Debug", "Release")][string]$Configuration = "Release",
     [string]$Root = "W:\",
+    [string]$NvkArtifact = "",
     [switch]$Clean
 )
 Set-StrictMode -Version Latest
@@ -29,6 +33,7 @@ foreach ($name in @("Path", "RUSTUP_HOME", "CARGO_HOME", "RUST_TOOLCHAIN", "LIBC
 $Root = $Root.TrimEnd('\') + '\'
 $repo = Join-Path $Root "src\guest\windows"
 $out = Join-Path $Root "out\$Configuration"
+if (-not $NvkArtifact) { $NvkArtifact = Join-Path $Root "nvk" }
 if (-not (Test-Path (Join-Path $repo "ci\windows\Build-Driver.ps1"))) {
     throw "no source at $repo (copy guest/windows there, or run win-build.sh on the host)"
 }
@@ -39,7 +44,7 @@ if (Test-Path $out) { Remove-Item -LiteralPath $out -Recurse -Force }
 if (-not $Clean) { $env:HELIOS_KEEP_ENGINE_BUILDS = "1" }
 $started = Get-Date
 & (Join-Path $repo "ci\windows\Build-Driver.ps1") -RepoRoot $repo -OutputDir $out `
-    -Configuration $Configuration -BuildRoot (Join-Path $Root "helios-build")
+    -Configuration $Configuration -BuildRoot (Join-Path $Root "helios-build") -NvkArtifact $NvkArtifact
 # Sign as Assemble-Package.ps1 does in CI, with the development certificate
 # (tools/sign-helios-development.ps1 makes it once and reuses it): the SYS
 # and the four UMDs, then a fresh catalog over their final bytes, then the

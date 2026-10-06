@@ -1,0 +1,1498 @@
+From 380ca1edf767d38d5e3a59d7f6c5a1e07e3e9be7 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 04:48:06 +0200
+Subject: [PATCH] nvk/rm, wsi: presents retire on RM fences, no CPU wait (S4)
+
+Until now every present on the Helios scanout waited on the CPU for the
+frame's GPU work (the WSI's wait_before_present, the Helios UMD's frame
+gate) and then flipped.  Now the present hands the flip an RM fence and
+returns at once (guest/windows/docs/rm-fence-marker.md, dxvk-on-nvk S4):
+
+- A per-queue "present timeline": a 64-bit semaphore, one entry of an RM
+  NV_SEMAPHORE_SURFACE over 4 KiB of RM-allocated system memory (RM must
+  map it itself; an OS descriptor is refused with NV_ERR_NOT_SUPPORTED),
+  imported on the host render node as a nvidia-drm semaphore-surface fence
+  context (SEMSURF_FENCE_CTX_CREATE, one per entry).  It is an ordinary
+  nvkmd_rm_sync whose value lives in the surface; a context binds its
+  channel to the surface (NV_SEMAPHORE_SURFACE_CTRL_CMD_BIND_CHANNEL, host
+  non-stall notifier) before its first release into it, so RM checks the
+  surface's waiters on the NON_STALL_INTERRUPT the release already raises.
+- Per present: vk_queue_signal_sync() (now exported by the runtime) of the
+  timeline's next value after everything submitted to the queue so far,
+  then SEMSURF_FENCE_CREATE for that value: a backend handle that fires one
+  host EventReady when the GPU writes it (KMD 22.22.311 records it as ours).
+- The fenced flip (nvkmd_rm_mem_scanout_flip_fenced): with KMD capability
+  bit 32 (HELIOS_NVRM_CAP_SCANOUT_FENCE) SCANOUT_PRESENT carries the fence
+  (flag RM_FENCE, handle at offset 52) and the KMD sends the flip when it
+  fires; QUEUE_FULL waits for our own fence and retries, so a plain flip
+  never overtakes queued ones.  Without the capability (KMD 22.22.311) a
+  flip thread of the device waits on the fence (EVENT_REGISTER, no
+  polling) and sends a plain SCANOUT_PRESENT, in order, at most eight
+  frames behind.  Without DRM fences or a new enough librmclient: the CPU
+  wait as before.
+- WSI: wsi_device::win32.scanout_flip_fenced (optional).  A scanout
+  swapchain with it skips the CPU wait before queue_present
+  (wsi_swapchain::gpu_ordered_present) and hands the present queue to the
+  driver; VK_ERROR_FEATURE_NOT_PRESENT falls back to the wait.
+- helios_icd_interface version 3 (appended, same export): queue_rm_fence,
+  rm_fence_wait, rm_fence_close, scanout_present_fenced, caps RM_FENCE,
+  SCANOUT_FENCE_KMD and PRESENT_FENCE_KMD, for the Helios D3D11 UMD
+  (feat/s4-rm-fences).
+- librmclient: crm_win_caps, crm_win_semsurf_ctx_create,
+  crm_win_semsurf_fence_create, crm_win_fence_wait,
+  crm_win_scanout_present_fenced, all optional.
+
+NVK_RM_FENCE=0 turns it off; NVK_RM_FENCE_KMD=0 keeps fences from the KMD
+(flip thread).
+
+win11, KMD 22.22.311 (no capability bit 32, so the flip thread), RTX 5090,
+vk_rmfence_test: no fence ever fired before the submit's own fence
+(checked every round); 2 GiB fill: wake 2091 us after submit with the RM
+fence vs 2157 us with vkWaitForFences; scanout 1920x1080, three images,
+1 GiB fill per frame: 808 -> 982 fps, the presenting thread's time in
+present 1228 -> 73 us per frame; 64 MiB fill: 3711 -> 6481 fps.
+vk_scanout_present (trivial triangle) through the WSI: 5645 fps with the
+CPU wait, 4899 fps fenced (a fence costs one escape, about 60-80 us, which a
+trivial frame does not repay).  KMD counters after 38561 fences: NvFence =
+NvFenceCl = NvFenceSig, NvFenceErr 0.
+
+Order: after 0029 (applies with 0022, 0023, 0025 and 0027-0029 before it),
+before patches-windows-dxvk/.
+---
+ src/nouveau/vulkan/helios_icd_interface.h     |  42 +-
+ src/nouveau/vulkan/meson.build                |   3 +-
+ src/nouveau/vulkan/nvk_helios.c               |  87 +++
+ src/nouveau/vulkan/nvk_wsi.c                  |  56 ++
+ src/nouveau/vulkan/nvk_wsi.h                  |  14 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h        |  88 +++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c    |  62 ++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c    |   9 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c    |   5 +
+ .../vulkan/nvkmd/rm/nvkmd_rm_rmfence.c        | 582 ++++++++++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c    |  21 +-
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h   |  41 ++
+ src/vulkan/runtime/vk_queue.c                 |   4 +-
+ src/vulkan/runtime/vk_queue.h                 |   7 +
+ src/vulkan/wsi/wsi_common.c                   |   8 +-
+ src/vulkan/wsi/wsi_common.h                   |   9 +
+ src/vulkan/wsi/wsi_common_private.h           |   8 +
+ src/vulkan/wsi/wsi_common_win32.cpp           |  21 +-
+ 18 files changed, 1049 insertions(+), 18 deletions(-)
+ create mode 100644 src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
+
+diff --git a/src/nouveau/vulkan/helios_icd_interface.h b/src/nouveau/vulkan/helios_icd_interface.h
+index a1093a1..bed5bb4 100644
+--- a/src/nouveau/vulkan/helios_icd_interface.h
++++ b/src/nouveau/vulkan/helios_icd_interface.h
+@@ -39,7 +39,8 @@ extern "C" {
+ #endif
+ 
+ #define HELIOS_ICD_INTERFACE_EXPORT "helios_icd_interface_v2"
+-#define HELIOS_ICD_INTERFACE_VERSION 2u
++/* The export keeps its name; version 3 only appends entries (and caps 4..6). */
++#define HELIOS_ICD_INTERFACE_VERSION 3u
+ 
+ enum helios_icd_backend {
+    HELIOS_ICD_BACKEND_VENUS = 1,
+@@ -57,6 +58,17 @@ enum helios_icd_backend {
+ /* The producer interface (escape 0x13 streams keyed on a Venus timeline)
+  * exists. NVK: no; presents are CPU-complete (value 0 markers). */
+ #define HELIOS_ICD_CAP_PRODUCER (1u << 3)
++/* Version 3: queue_rm_fence / rm_fence_wait / rm_fence_close /
++ * scanout_present_fenced work (NVK: librmclient with RM fences and a host with
++ * DRM fences, guest/windows/docs/rm-fence-marker.md, dxvk-on-nvk S4). */
++#define HELIOS_ICD_CAP_RM_FENCE (1u << 4)
++/* scanout_present_fenced hands the fence to the KMD, which flips when it fires
++ * (QueryCaps HELIOS_NVRM_CAP_SCANOUT_FENCE). Without it a thread in the ICD
++ * waits for the fence; the caller returns at once either way. */
++#define HELIOS_ICD_CAP_SCANOUT_FENCE_KMD (1u << 5)
++/* The KMD takes RM fences in WDDM present markers (HERF/HEPR tail, HE12 v4;
++ * QueryCaps HELIOS_NVRM_CAP_PRESENT_FENCE, protocol/include/helios_rm_fence.h). */
++#define HELIOS_ICD_CAP_PRESENT_FENCE_KMD (1u << 6)
+ 
+ /* DRM fourcc / modifier values used below (drm_fourcc.h). */
+ #define HELIOS_DRM_FORMAT_XRGB8888 0x34325258u
+@@ -134,6 +146,34 @@ struct helios_icd_api {
+ 
+    /* The producer interface (helios_producer_abi.h), or NULL. */
+    const void *(*producer)(void);
++
++   /* ---- version 3 (size covers them; NULL = not supported) ---------------
++    * RM fences (HELIOS_ICD_CAP_RM_FENCE). A fence is a backend handle of the
++    * NVRM escape device the ICD's librmclient opened in this process: it fires
++    * once when the GPU has finished the work it stands for (or after the host's
++    * 5 s timeout). */
++
++   /* Signal the device's present timeline on `queue` after everything
++    * submitted to it so far and make a fence for that point. The caller holds
++    * the queue as vkQueueSubmit requires (DXVK: lockSubmission). *fence_handle
++    * is the caller's: hand it to the KMD (scanout_present_fenced, a present
++    * marker tail) or give it back with rm_fence_close. *value (may be NULL) is
++    * the timeline value, diagnostic. VK_ERROR_FEATURE_NOT_PRESENT: no fences
++    * here; wait on the CPU as before. */
++   VkResult (*queue_rm_fence)(VkDevice device, VkQueue queue,
++                              uint32_t *fence_handle, uint64_t *value);
++   /* Wait for a fence the caller still owns. VK_SUCCESS fired, VK_TIMEOUT. */
++   VkResult (*rm_fence_wait)(VkDevice device, uint32_t fence_handle,
++                             uint64_t timeout_ns);
++   /* Close a fence the caller still owns (fired or not). */
++   void (*rm_fence_close)(VkDevice device, uint32_t fence_handle);
++   /* scanout_present, sent when `fence_handle` fires instead of after a CPU
++    * wait; returns at once. TAKES the fence in every case (success or not).
++    * Image reuse: with N >= 3 images, do not render into the image of present
++    * P before the fence of present P+1 fired and P+1's call returned
++    * (rm-fence-marker.md). */
++   VkResult (*scanout_present_fenced)(VkDevice device, VkDeviceMemory memory,
++                                      VkImage image, uint32_t fence_handle);
+ };
+ 
+ typedef VkResult (*PFN_helios_icd_interface_v2)(uint32_t version, struct helios_icd_api *out);
+diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
+index 9d85aa3..79b923a 100644
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -317,7 +317,8 @@ if not get_option('nvk-rm').disabled()
+     nvk_files += files('nvkmd/rm/nvkmd_rm_drm.c')
+   elif host_machine.system() == 'windows'
+     # Scanout presentation through Conduit's Helios KMD
+-    nvk_files += files('nvkmd/rm/nvkmd_rm_win.c', 'nvk_helios.c',
++    nvk_files += files('nvkmd/rm/nvkmd_rm_win.c',
++                       'nvkmd/rm/nvkmd_rm_rmfence.c', 'nvk_helios.c',
+                        'helios_icd_interface.h')
+   endif
+ endif
+diff --git a/src/nouveau/vulkan/nvk_helios.c b/src/nouveau/vulkan/nvk_helios.c
+index d49d13b..e847b56 100644
+--- a/src/nouveau/vulkan/nvk_helios.c
++++ b/src/nouveau/vulkan/nvk_helios.c
+@@ -16,7 +16,10 @@
+ #include "nvk_device_memory.h"
+ #include "nvk_image.h"
+ #include "nvk_physical_device.h"
++#include "nvk_wsi.h"
+ #include "nvkmd/rm/nvkmd_rm.h"
++#include "util/u_debug.h"
++#include "vk_queue.h"
+ 
+ #include "helios_icd_interface.h"
+ #include "drm-uapi/drm_fourcc.h"
+@@ -192,6 +195,71 @@ helios_scanout_present(VkDevice _device, VkDeviceMemory _mem, VkImage _image)
+                                     fl.fourcc, fl.modifier);
+ }
+ 
++/* RM fences (helios_icd_interface.h version 3; dxvk-on-nvk S4) */
++static VkResult
++helios_queue_rm_fence(VkDevice _device, VkQueue _queue, uint32_t *fence_handle,
++                      uint64_t *value)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++   VK_FROM_HANDLE(vk_queue, queue, _queue);
++
++   *fence_handle = 0;
++   if (dev == NULL || queue == NULL)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   int fence = -1;
++   VkResult result = nvk_queue_rm_fence(dev, queue, &fence, value);
++   if (result != VK_SUCCESS)
++      return result;
++   *fence_handle = (uint32_t)fence;
++   return VK_SUCCESS;
++}
++
++static VkResult
++helios_rm_fence_wait(VkDevice _device, uint32_t fence_handle,
++                     uint64_t timeout_ns)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++
++   return nvkmd_rm_rmfence_wait(dev->nvkmd, (int)fence_handle, timeout_ns);
++}
++
++static void
++helios_rm_fence_close(VkDevice _device, uint32_t fence_handle)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++
++   nvkmd_rm_rmfence_close(dev->nvkmd, (int)fence_handle);
++}
++
++static VkResult
++helios_scanout_present_fenced(VkDevice _device, VkDeviceMemory _mem,
++                              VkImage _image, uint32_t fence_handle)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++   VK_FROM_HANDLE(nvk_device_memory, mem, _mem);
++   VK_FROM_HANDLE(nvk_image, image, _image);
++   const int fence = (int)fence_handle;
++
++   VkResult result = VK_ERROR_FORMAT_NOT_SUPPORTED;
++   struct nvkmd_rm_foreign_layout fl;
++   uint8_t pte_kind;
++   uint16_t tile_mode;
++   if (mem != NULL && image != NULL && mem->dedicated_image == image &&
++       !image->is_compressed)
++      result = helios_image_layout(image, &fl, &pte_kind, &tile_mode);
++   if (result != VK_SUCCESS) {
++      /* Takes the fence in every case: nothing will wait on it now */
++      nvkmd_rm_rmfence_close(dev->nvkmd, fence);
++      return result;
++   }
++   nvkmd_rm_mem_set_export_layout(mem->mem, pte_kind, tile_mode);
++
++   return nvkmd_rm_mem_scanout_flip_fenced(mem->mem, &dev->vk.base, fl.width,
++                                           fl.height, fl.stride, fl.offset,
++                                           fl.fourcc, fl.modifier, fence);
++}
++
+ static void
+ helios_scanout_release(VkDevice _device)
+ {
+@@ -221,6 +289,21 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
+       if (nvkmd_rm_win_rm_import_served())
+          caps |= HELIOS_ICD_CAP_RES_ID;
+    }
++   uint64_t ops = 0;
++   uint32_t features = 0;
++   if (lib != NULL && lib->win_caps != NULL &&
++       lib->win_semsurf_ctx_create != NULL &&
++       lib->win_semsurf_fence_create != NULL && lib->win_fence_wait != NULL &&
++       debug_get_bool_option("NVK_RM_FENCE", true) &&
++       lib->win_caps(&ops, &features) == 0 && (features & (1u << 11))) {
++      caps |= HELIOS_ICD_CAP_RM_FENCE;
++      /* QueryCaps.supported_ops bits 32 / 33 (helios_nvrm_escape.h) */
++      if ((ops & (1ull << 32)) && lib->win_scanout_present_fenced != NULL &&
++          debug_get_bool_option("NVK_RM_FENCE_KMD", true))
++         caps |= HELIOS_ICD_CAP_SCANOUT_FENCE_KMD;
++      if (ops & (1ull << 33))
++         caps |= HELIOS_ICD_CAP_PRESENT_FENCE_KMD;
++   }
+ 
+    struct helios_icd_api api = {
+       .version = HELIOS_ICD_INTERFACE_VERSION,
+@@ -234,6 +317,10 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
+       .scanout_present = helios_scanout_present,
+       .scanout_release = helios_scanout_release,
+       .producer = NULL,
++      .queue_rm_fence = helios_queue_rm_fence,
++      .rm_fence_wait = helios_rm_fence_wait,
++      .rm_fence_close = helios_rm_fence_close,
++      .scanout_present_fenced = helios_scanout_present_fenced,
+    };
+    memcpy(out, &api, cap);
+    return VK_SUCCESS;
+diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
+index c13ab12..f6e02dd 100644
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -14,6 +14,7 @@
+ #include "nvkmd/rm/nvkmd_rm.h"
+ #include "drm-uapi/drm_fourcc.h"
+ #include "util/u_debug.h"
++#include "vk_queue.h"
+ 
+ /* Conduit's Helios adapter: swapchain images are shown by a host scanout
+  * flip of the VRAM they live in (nvkmd_rm_win.c), no copy to a window.
+@@ -48,6 +49,58 @@ nvk_wsi_scanout_flip(VkDevice _device, VkDeviceMemory _mem,
+                                     flip->fourcc, flip->modifier);
+ }
+ 
++VkResult
++nvk_queue_rm_fence(struct nvk_device *dev, struct vk_queue *queue,
++                   int *fence_out, uint64_t *value_out)
++{
++   uint64_t value = 0;
++
++   *fence_out = -1;
++   struct vk_sync *sync = nvkmd_rm_rmfence_sync(dev->nvkmd, &dev->vk.base,
++                                                queue, &value);
++   if (sync == NULL)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   /* In submission order on this queue, so after the frame's work on the
++    * GPU too (one channel per queue).
++    */
++   VkResult result = vk_queue_signal_sync(queue, sync, value);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result = nvkmd_rm_rmfence_create(dev->nvkmd, &dev->vk.base, sync, value,
++                                    fence_out);
++   if (result != VK_SUCCESS)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   if (value_out != NULL)
++      *value_out = value;
++   return VK_SUCCESS;
++}
++
++/* The present without a CPU wait: the flip goes when the GPU has finished
++ * everything submitted to the present queue so far (nvkmd_rm_rmfence.c).
++ */
++static VkResult
++nvk_wsi_scanout_flip_fenced(VkDevice _device, VkQueue _queue,
++                            VkDeviceMemory _mem,
++                            const struct wsi_win32_scanout_flip *flip)
++{
++   VK_FROM_HANDLE(nvk_device, dev, _device);
++   VK_FROM_HANDLE(vk_queue, queue, _queue);
++   VK_FROM_HANDLE(nvk_device_memory, mem, _mem);
++
++   int fence;
++   VkResult result = nvk_queue_rm_fence(dev, queue, &fence, NULL);
++   if (result != VK_SUCCESS)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   return nvkmd_rm_mem_scanout_flip_fenced(mem->mem, &dev->vk.base,
++                                           flip->width, flip->height,
++                                           flip->stride, flip->offset,
++                                           flip->fourcc, flip->modifier,
++                                           fence);
++}
++
+ static void
+ nvk_wsi_scanout_release(VkDevice _device)
+ {
+@@ -101,6 +154,9 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
+    if (nvkmd_rm_scanout_supported(pdev->nvkmd)) {
+       pdev->wsi_device.win32.scanout_export = nvk_wsi_scanout_export;
+       pdev->wsi_device.win32.scanout_flip = nvk_wsi_scanout_flip;
++      pdev->wsi_device.win32.scanout_flip_fenced =
++         debug_get_bool_option("NVK_RM_FENCE", true) ?
++         nvk_wsi_scanout_flip_fenced : NULL;
+       pdev->wsi_device.win32.scanout_release = nvk_wsi_scanout_release;
+       /* Block-linear swapchain images with NVIDIA's DRM modifier unless
+        * NVK_HELIOS_WSI_LINEAR=1 (linear: NVK renders through a tiled
+diff --git a/src/nouveau/vulkan/nvk_wsi.h b/src/nouveau/vulkan/nvk_wsi.h
+index 6b6a0f6..eb41019 100644
+--- a/src/nouveau/vulkan/nvk_wsi.h
++++ b/src/nouveau/vulkan/nvk_wsi.h
+@@ -10,4 +10,18 @@
+ VkResult nvk_init_wsi(struct nvk_physical_device *pdev);
+ void nvk_finish_wsi(struct nvk_physical_device *pdev);
+ 
++#ifdef _WIN32
++struct nvk_device;
++struct vk_queue;
++
++/* RM fences (dxvk-on-nvk S4): signals the device's present timeline for
++ * `queue` after everything submitted to it so far and makes an RM fence for
++ * that point.  *fence_out > 0 is a backend handle the caller owns.  The
++ * caller holds the queue as for vkQueueSubmit.  VK_ERROR_FEATURE_NOT_PRESENT
++ * when RM fences cannot be had (the caller waits on the CPU instead).
++ */
++VkResult nvk_queue_rm_fence(struct nvk_device *dev, struct vk_queue *queue,
++                            int *fence_out, uint64_t *value_out);
++#endif
++
+ #endif
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 5c0540a..934ca4b 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -100,6 +100,20 @@ struct nvkmd_rm_lib {
+    int (*win_foreign_caps)(uint32_t *caps_flags);
+    int (*win_import_rm)(const struct nvrm_crm_foreign_import *in,
+                         uint32_t *resource_id, uint32_t *host_errno);
++   /* RM fences (KMD 22.22.311+, guest/windows/docs/rm-fence-marker.md):
++    * nvidia-drm semaphore-surface fences on the host render node, waits on
++    * them through the KMD, and SCANOUT_PRESENT that takes one over.
++    */
++   int (*win_caps)(uint64_t *supported_ops, uint32_t *device_features);
++   int (*win_semsurf_ctx_create)(int drm_fd, uint32_t h_client,
++                                 uint32_t h_semsurf, uint64_t size,
++                                 uint64_t index, uint32_t *ctx);
++   int (*win_semsurf_fence_create)(int drm_fd, uint32_t ctx,
++                                   uint64_t wait_value, uint32_t timeout_ms,
++                                   int *fence);
++   int (*win_fence_wait)(int fence, uint32_t timeout_ms);
++   int (*win_scanout_present_fenced)(uint32_t handle, uint32_t gem,
++                                     int fence, uint64_t *seq);
+ };
+ 
+ /* Returns NULL if librmclient cannot be loaded */
+@@ -215,6 +229,13 @@ struct nvkmd_rm_dev {
+    bool no_kmd_source;
+    bool source_live;
+    struct nvrm_crm_scanout_source source;
++
++   /* RM fences for presents (nvkmd_rm_rmfence.c, dxvk-on-nvk S4), made on
++    * first use under rmfence_mutex.
++    */
++   struct nvkmd_rm_rmfence *rmfence;
++   simple_mtx_t rmfence_mutex;
++   bool rmfence_failed;
+ #endif
+ 
+    /* Map coherent host-visible system memory GPU-cacheable */
+@@ -418,6 +439,66 @@ VkResult nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *mem,
+ /* Gives scanout 0 back to the desktop (no-op without a live source) */
+ void nvkmd_rm_dev_scanout_release(struct nvkmd_dev *dev);
+ 
++/*
++ * RM fences for presents (nvkmd_rm_rmfence.c; guest/windows/docs/
++ * rm-fence-marker.md, dxvk-on-nvk S4).
++ *
++ * The device keeps a "present timeline" per presenting queue: a 64-bit
++ * semaphore, one entry of an RM NV_SEMAPHORE_SURFACE (RM-allocated system
++ * memory), imported on the host render node as a nvidia-drm
++ * semaphore-surface fence context.  A
++ * present signals the timeline's next value on its queue, after all the work
++ * submitted so far (rmfence_sync + vk_queue_signal_sync), and turns that value
++ * into a fence: a backend handle that fires one host EventReady when the GPU
++ * gets there.  Either the KMD takes the fence over with the flip
++ * (SCANOUT_PRESENT with the RM fence flag, KMD capability bit 32) and sends
++ * the flip itself when it fires, or, with an older KMD, a flip thread of this
++ * device waits on it and sends a plain SCANOUT_PRESENT.  The presenting
++ * thread never waits for the GPU.
++ */
++struct nvkmd_rm_rmfence;
++
++/* The present timeline of queue_key (a vk_queue) and its next value, or NULL
++ * when RM fences cannot be had here (no DRM fences on the host, an old
++ * librmclient or KMD, NVK_RM_FENCE=0); the caller then waits on the CPU as
++ * before.
++ */
++struct vk_sync *nvkmd_rm_rmfence_sync(struct nvkmd_dev *dev,
++                                      struct vk_object_base *log_obj,
++                                      const void *queue_key,
++                                      uint64_t *value_out);
++/* A fence for `value` of that sync: *fence_out > 0 is a backend handle the
++ * caller owns (pass it on or nvkmd_rm_rmfence_close it).
++ */
++VkResult nvkmd_rm_rmfence_create(struct nvkmd_dev *dev,
++                                 struct vk_object_base *log_obj,
++                                 struct vk_sync *sync, uint64_t value,
++                                 int *fence_out);
++VkResult nvkmd_rm_rmfence_wait(struct nvkmd_dev *dev, int fence,
++                               uint64_t timeout_ns);
++void nvkmd_rm_rmfence_close(struct nvkmd_dev *dev, int fence);
++/* Whether the KMD takes fences with SCANOUT_PRESENT (capability bit 32) */
++bool nvkmd_rm_rmfence_kmd_flip(struct nvkmd_dev *dev);
++/* nvkmd_rm_mem_scanout_flip once `fence` has fired, without waiting for it
++ * here.  Takes the fence in every case.
++ */
++VkResult nvkmd_rm_mem_scanout_flip_fenced(struct nvkmd_mem *mem,
++                                          struct vk_object_base *log_obj,
++                                          uint32_t width, uint32_t height,
++                                          uint32_t stride, uint32_t offset,
++                                          uint32_t fourcc, uint64_t modifier,
++                                          int fence);
++/* Called by nvkmd_rm_dev_destroy: drains the flip thread, frees the surface */
++void nvkmd_rm_rmfence_finish(struct nvkmd_rm_dev *dev);
++/* Waits until the flip thread has sent every flip queued so far */
++void nvkmd_rm_rmfence_drain(struct nvkmd_rm_dev *dev);
++
++/* nvkmd_rm_win.c internals shared with nvkmd_rm_rmfence.c */
++VkResult nvkmd_rm_win_drm_fd(struct nvkmd_rm_dev *dev,
++                             struct vk_object_base *log_obj, int *fd_out);
++int nvkmd_rm_win_source_set_locked(struct nvkmd_rm_dev *dev,
++                                   const struct nvrm_crm_scanout_flip *flip);
++
+ /*
+  * Helios resource ids (nvkmd_rm_win.c, guest/windows/docs/dxvk-on-nvk.md S3):
+  * RM memory exported to a GEM object and imported by the KMD
+@@ -508,6 +589,13 @@ struct nvkmd_rm_sync {
+    uint64_t pending;
+ 
+    uint64_t cpu_only_value;
++
++   /* An RM NV_SEMAPHORE_SURFACE this value lives in (the present timeline,
++    * nvkmd_rm_rmfence.c), 0 for pool slots.  A context that signals it binds
++    * its channel to the surface first, so RM checks the surface's waiters
++    * on the channel's non-stall interrupts.
++    */
++   uint32_t h_semsurf;
+ };
+ 
+ struct vk_sync_type nvkmd_rm_sync_get_type(void);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index 16ed858..20fd8c4 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -108,6 +108,11 @@ struct nvkmd_rm_exec_ctx {
+       uint32_t put;
+    } track[NVKMD_RM_GPFIFO_ENTRIES];
+ 
++   /* The NV_SEMAPHORE_SURFACE this channel is bound to (an RM-fence
++    * timeline it signals, nvkmd_rm_win.c), 0 if none.
++    */
++   uint32_t h_semsurf_bound;
++
+    /* Semaphore acquires queued by wait(), emitted before the next push */
+    uint32_t pending_op_count;
+    struct nvkmd_rm_sem_op pending_ops[NVKMD_RM_MAX_PENDING_OPS];
+@@ -461,6 +466,43 @@ nvkmd_rm_exec_ctx_wait(struct nvkmd_ctx *_ctx,
+    return VK_SUCCESS;
+ }
+ 
++/* Before the first release into a semaphore surface: bind the channel, so
++ * RM checks the surface's waiters (nvidia-drm's fences) on the non-stall
++ * interrupt our NON_STALL_INTERRUPT method raises.  That interrupt is the
++ * host engine's (NV2080_NOTIFIERS_FIFO_EVENT_MTHD), the one our own CPU-wait
++ * event listens to as well.
++ */
++static VkResult
++bind_semsurf(struct nvkmd_rm_exec_ctx *ctx, struct vk_object_base *log_obj,
++             uint32_t h_semsurf)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(ctx->base.dev);
++   const struct nvkmd_rm_lib *lib = dev->lib;
++
++   if (ctx->h_semsurf_bound == h_semsurf)
++      return VK_SUCCESS;
++   if (ctx->h_semsurf_bound != 0) {
++      return vk_errorf(log_obj, VK_ERROR_UNKNOWN,
++                       "RM: channel already bound to semaphore surface 0x%x",
++                       ctx->h_semsurf_bound);
++   }
++
++   NV_SEMAPHORE_SURFACE_CTRL_BIND_CHANNEL_PARAMS bind = {
++      .hChannel = ctx->h_channel,
++      .numNotifyIndices = 1,
++      .notifyIndices = { NV2080_NOTIFIERS_FIFO_EVENT_MTHD },
++   };
++   VkResult result =
++      NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_UNKNOWN,
++                     lib->control(dev->client, h_semsurf,
++                                  NV_SEMAPHORE_SURFACE_CTRL_CMD_BIND_CHANNEL,
++                                  &bind, sizeof(bind)),
++                     "NV_SEMAPHORE_SURFACE_CTRL_CMD_BIND_CHANNEL");
++   if (result == VK_SUCCESS)
++      ctx->h_semsurf_bound = h_semsurf;
++   return result;
++}
++
+ static VkResult
+ nvkmd_rm_exec_ctx_signal(struct nvkmd_ctx *_ctx,
+                          struct vk_object_base *log_obj,
+@@ -470,6 +512,15 @@ nvkmd_rm_exec_ctx_signal(struct nvkmd_ctx *_ctx,
+    struct nvkmd_rm_exec_ctx *ctx = nvkmd_rm_exec_ctx(_ctx);
+    VkResult result;
+ 
++   for (uint32_t i = 0; i < signal_count; i++) {
++      const struct nvkmd_rm_sync *sync = nvkmd_rm_sync(signals[i].sync);
++      if (sync->h_semsurf != 0) {
++         result = bind_semsurf(ctx, log_obj, sync->h_semsurf);
++         if (result != VK_SUCCESS)
++            return result;
++      }
++   }
++
+    result = emit_pending_waits(ctx, log_obj);
+    if (result != VK_SUCCESS)
+       return result;
+@@ -554,6 +605,17 @@ nvkmd_rm_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
+    struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_ctx->dev);
+    const struct nvkmd_rm_lib *lib = dev->lib;
+ 
++   if (ctx->h_semsurf_bound != 0) {
++      NV_SEMAPHORE_SURFACE_CTRL_BIND_CHANNEL_PARAMS unbind = {
++         .hChannel = ctx->h_channel,
++         .numNotifyIndices = 1,
++         .notifyIndices = { NV2080_NOTIFIERS_FIFO_EVENT_MTHD },
++      };
++      lib->control(dev->client, ctx->h_semsurf_bound,
++                   NV_SEMAPHORE_SURFACE_CTRL_CMD_UNBIND_CHANNEL,
++                   &unbind, sizeof(unbind));
++   }
++
+    /* Freeing the TSG frees the channel and the engine objects under it */
+    if (ctx->h_tsg != 0) {
+       NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS sched = { .bEnable = false };
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index dd10c4a..2df5eb6 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -124,6 +124,7 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+    dev->drm_fd = -1;
+ #ifdef _WIN32
+    simple_mtx_init(&dev->drm_mutex, mtx_plain);
++   simple_mtx_init(&dev->rmfence_mutex, mtx_plain);
+ #endif
+    dev->sysmem_cached = debug_get_bool_option("NVK_RM_SYSMEM_CACHED", true);
+ 
+@@ -246,6 +247,13 @@ nvkmd_rm_dev_destroy(struct nvkmd_dev *_dev)
+    struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
+    const struct nvkmd_rm_lib *lib = dev->lib;
+ 
++#ifdef _WIN32
++   /* Flips still waiting on fences go first (they hold memory), then the
++    * present timeline's surface and memory.
++    */
++   nvkmd_rm_rmfence_finish(dev);
++#endif
++
+    /* Frees memory, so it needs the heaps and the client */
+    nvkmd_rm_sema_pool_finish(dev);
+ 
+@@ -274,6 +282,7 @@ nvkmd_rm_dev_destroy(struct nvkmd_dev *_dev)
+                 dev->flips_ok, dev->flips_failed);
+    }
+    simple_mtx_destroy(&dev->drm_mutex);
++   simple_mtx_destroy(&dev->rmfence_mutex);
+ #endif
+ 
+    simple_mtx_destroy(&dev->base.mems_mutex);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index e17e7a8..ef9691f 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -237,6 +237,11 @@ nvkmd_rm_lib_load(void)
+    LOAD(win_release_blob,      "crm_win_release_blob",      false);
+    LOAD(win_foreign_caps,      "crm_win_foreign_caps",      false);
+    LOAD(win_import_rm,         "crm_win_import_rm",         false);
++   LOAD(win_caps,                   "crm_win_caps",                   false);
++   LOAD(win_semsurf_ctx_create,     "crm_win_semsurf_ctx_create",     false);
++   LOAD(win_semsurf_fence_create,   "crm_win_semsurf_fence_create",   false);
++   LOAD(win_fence_wait,             "crm_win_fence_wait",             false);
++   LOAD(win_scanout_present_fenced, "crm_win_scanout_present_fenced", false);
+ 
+    LOAD(event_wait,   "crm_event_wait",   false);
+    LOAD(alloc_pages,  "crm_alloc_pages",  false);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
+new file mode 100644
+index 0000000..ed4c9cf
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_rmfence.c
+@@ -0,0 +1,582 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * RM fences for presents on Windows (guest/windows/docs/rm-fence-marker.md,
++ * dxvk-on-nvk S4).  See nvkmd_rm.h.
++ *
++ * Before this, every present waited on the CPU for the frame's GPU work and
++ * then flipped.  Now a present signals a "present timeline" on its queue,
++ * after the frame's work, and turns the value into an RM fence: nvidia-drm's
++ * semaphore-surface fence on the host render node, a backend handle that
++ * fires one host EventReady when the GPU writes the value.  The fence goes
++ * with the flip to the KMD (SCANOUT_PRESENT with the RM fence flag, KMD
++ * capability bit 32), which sends the flip when it fires.  With a KMD that
++ * cannot, a flip thread of the device waits on the fence (EVENT_REGISTER, no
++ * polling) and sends a plain SCANOUT_PRESENT.  Either way the presenting
++ * thread returns at once.
++ *
++ * The timelines live in one 4 KiB RM system-memory allocation (an
++ * NV_SEMAPHORE_SURFACE wants memory RM can map itself: OS-descriptor memory
++ * is refused with NV_ERR_NOT_SUPPORTED), one surface entry (32 bytes on GB20x,
++ * the 64-bit value at offset 0) per queue that presents, so the values on a
++ * timeline only grow.  Each entry has its own nvidia-drm fence context.  A
++ * context binds its channel to the surface before its first release into it
++ * (nvkmd_rm_ctx.c), so RM checks the waiters on that channel's non-stall
++ * interrupts.
++ *
++ *   NVK_RM_FENCE=0      no RM fences: CPU wait before every flip (S3)
++ *   NVK_RM_FENCE_KMD=0  never hand fences to the KMD: the flip thread waits
++ */
++
++#include "nvkmd_rm.h"
++
++#include "c11/threads.h"
++#include "util/log.h"
++#include "util/os_time.h"
++#include "util/u_atomic.h"
++#include "util/u_debug.h"
++#include "vk_log.h"
++
++#include <errno.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++
++#define NVKMD_RM_RMFENCE_MEM_SIZE   4096u
++#define NVKMD_RM_RMFENCE_TIMELINES  8u
++#define NVKMD_RM_RMFENCE_TIMEOUT_MS 5000u /* nvidia-drm's own cap */
++#define NVKMD_RM_FLIPQ_DEPTH        8u    /* as the KMD's per-source queue */
++/* QueryCaps.supported_ops bit 32 (helios_nvrm_escape.h) */
++#define NVKMD_RM_CAP_SCANOUT_FENCE  (1ull << 32)
++/* QueryCaps.device_features: NVGPU_CFG_DRM_FENCES */
++#define NVKMD_RM_CFG_DRM_FENCES     (1u << 11)
++
++struct nvkmd_rm_rmfence_tl {
++   const void *key;          /* the queue */
++   struct nvkmd_rm_sync sync;
++   uint32_t fence_ctx;       /* GEM handle of the fence context */
++   uint64_t next_value;
++};
++
++struct nvkmd_rm_flip_item {
++   struct nvkmd_mem *mem;    /* a reference */
++   uint32_t width, height, stride, offset, fourcc;
++   uint64_t modifier;
++   int fence;
++};
++
++struct nvkmd_rm_rmfence {
++   struct nvkmd_mem *mem;
++   uint32_t h_semsurf;
++   uint64_t entry_size_B;
++   uint32_t tl_count;        /* under rmfence_mutex */
++   struct nvkmd_rm_rmfence_tl tl[NVKMD_RM_RMFENCE_TIMELINES];
++
++   /* The KMD takes fences with SCANOUT_PRESENT */
++   bool kmd_flip;
++
++   uint64_t fences, kmd_flips, kmd_queue_full, thread_flips;
++   uint64_t fence_timeouts, cpu_flips;
++
++   /* Flip thread, for a KMD without the capability */
++   mtx_t q_mutex;
++   cnd_t q_cond;
++   thrd_t thread;
++   bool thread_started, thread_failed, stop;
++   bool busy;
++   uint32_t q_head, q_count;
++   struct nvkmd_rm_flip_item q[NVKMD_RM_FLIPQ_DEPTH];
++};
++
++static void
++rmfence_free(struct nvkmd_rm_dev *dev, struct nvkmd_rm_rmfence *rf)
++{
++   if (rf->h_semsurf != 0)
++      dev->lib->free(dev->client, dev->h_subdevice, rf->h_semsurf);
++   if (rf->mem != NULL)
++      nvkmd_mem_unref(rf->mem);
++   FREE(rf);
++}
++
++static struct nvkmd_rm_rmfence *
++rmfence_init(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj)
++{
++   const struct nvkmd_rm_lib *lib = dev->lib;
++
++   if (!debug_get_bool_option("NVK_RM_FENCE", true))
++      return NULL;
++   if (lib->win_caps == NULL || lib->win_semsurf_ctx_create == NULL ||
++       lib->win_semsurf_fence_create == NULL || lib->win_fence_wait == NULL ||
++       lib->win_close_device == NULL) {
++      mesa_logi("NVK: librmclient has no RM fences, CPU waits before flips");
++      return NULL;
++   }
++
++   uint64_t ops = 0;
++   uint32_t features = 0;
++   if (lib->win_caps(&ops, &features) != 0 ||
++       !(features & NVKMD_RM_CFG_DRM_FENCES)) {
++      mesa_logi("NVK: the host has no DRM fences (features 0x%x), CPU waits "
++                "before flips", features);
++      return NULL;
++   }
++
++   int drm_fd;
++   if (nvkmd_rm_win_drm_fd(dev, log_obj, &drm_fd) != VK_SUCCESS)
++      return NULL;
++
++   NV2080_CTRL_FB_GET_SEMAPHORE_SURFACE_LAYOUT_PARAMS layout;
++   memset(&layout, 0, sizeof(layout));
++   int ret = lib->control(dev->client, dev->h_subdevice,
++                          NV2080_CTRL_CMD_FB_GET_SEMAPHORE_SURFACE_LAYOUT,
++                          &layout, sizeof(layout));
++   if (ret != 0 || layout.size < 8 || layout.size > 256 ||
++       !(layout.caps &
++         NV2080_CTRL_FB_GET_SEMAPHORE_SURFACE_LAYOUT_CAPS_64BIT_SEMAPHORES_SUPPORTED)) {
++      mesa_logw("NVK: no 64-bit semaphore surfaces (%d, entry %" PRIu64
++                " B, caps 0x%x), CPU waits before flips", ret,
++                (uint64_t)layout.size, layout.caps);
++      return NULL;
++   }
++
++   struct nvkmd_rm_rmfence *rf = CALLOC_STRUCT(nvkmd_rm_rmfence);
++   if (rf == NULL)
++      return NULL;
++   rf->entry_size_B = layout.size;
++
++   VkResult result =
++      nvkmd_dev_alloc_mapped_mem(&dev->base, log_obj,
++                                 NVKMD_RM_RMFENCE_MEM_SIZE, 0,
++                                 NVKMD_MEM_GART | NVKMD_RM_MEM_RM_SYSMEM,
++                                 NVKMD_MEM_MAP_RDWR, &rf->mem);
++   if (result != VK_SUCCESS)
++      goto fail;
++   memset(rf->mem->map, 0, NVKMD_RM_RMFENCE_MEM_SIZE);
++
++   NV_SEMAPHORE_SURFACE_ALLOC_PARAMETERS sa = {
++      .hSemaphoreMem = nvkmd_rm_mem(rf->mem)->h_memory,
++   };
++   ret = lib->alloc(dev->client, dev->h_subdevice, &rf->h_semsurf,
++                    NV_SEMAPHORE_SURFACE, &sa, sizeof(sa));
++   if (ret != 0) {
++      rf->h_semsurf = 0;
++      mesa_logw("NVK: NV_SEMAPHORE_SURFACE: %s, CPU waits before flips",
++                lib->status_name(ret));
++      goto fail;
++   }
++
++   rf->kmd_flip = (ops & NVKMD_RM_CAP_SCANOUT_FENCE) != 0 &&
++                  lib->win_scanout_present_fenced != NULL &&
++                  debug_get_bool_option("NVK_RM_FENCE_KMD", true);
++
++   if (mtx_init(&rf->q_mutex, mtx_plain) != thrd_success)
++      goto fail;
++   if (cnd_init(&rf->q_cond) != thrd_success) {
++      mtx_destroy(&rf->q_mutex);
++      goto fail;
++   }
++
++   mesa_logi("NVK: presents retire on RM fences (%s; semaphore surface 0x%x, "
++             "entry %" PRIu64 " B)", rf->kmd_flip ?
++             "the KMD flips when they fire" : "a flip thread waits for them",
++             rf->h_semsurf, rf->entry_size_B);
++   return rf;
++
++fail:
++   rmfence_free(dev, rf);
++   return NULL;
++}
++
++static struct nvkmd_rm_rmfence *
++rmfence_get(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj)
++{
++   simple_mtx_lock(&dev->rmfence_mutex);
++   if (dev->rmfence == NULL && !dev->rmfence_failed) {
++      dev->rmfence = rmfence_init(dev, log_obj);
++      dev->rmfence_failed = dev->rmfence == NULL;
++   }
++   struct nvkmd_rm_rmfence *rf = dev->rmfence;
++   simple_mtx_unlock(&dev->rmfence_mutex);
++   return rf;
++}
++
++/* The timeline of `key` (a queue), made on first use; under rmfence_mutex */
++static struct nvkmd_rm_rmfence_tl *
++rmfence_tl_locked(struct nvkmd_rm_dev *dev, struct nvkmd_rm_rmfence *rf,
++                  const void *key)
++{
++   for (uint32_t i = 0; i < rf->tl_count; i++) {
++      if (rf->tl[i].key == key)
++         return &rf->tl[i];
++   }
++
++   const uint32_t index = rf->tl_count;
++   if (index >= NVKMD_RM_RMFENCE_TIMELINES ||
++       (index + 1) * rf->entry_size_B > NVKMD_RM_RMFENCE_MEM_SIZE)
++      return NULL;
++
++   uint32_t ctx = 0;
++   int ret = dev->lib->win_semsurf_ctx_create(dev->drm_fd,
++                                              dev->lib->root(dev->client),
++                                              rf->h_semsurf,
++                                              NVKMD_RM_RMFENCE_MEM_SIZE,
++                                              index, &ctx);
++   if (ret != 0 || ctx == 0) {
++      mesa_logw("NVK: SEMSURF_FENCE_CTX_CREATE (entry %u): %d (%s)", index,
++                ret, ret < 0 ? strerror(-ret) : "?");
++      return NULL;
++   }
++
++   struct nvkmd_rm_pdev *pdev = nvkmd_rm_pdev(dev->base.pdev);
++   struct nvkmd_rm_rmfence_tl *tl = &rf->tl[index];
++   const uint64_t offset_B = index * rf->entry_size_B;
++   memset(tl, 0, sizeof(*tl));
++   tl->key = key;
++   tl->fence_ctx = ctx;
++   tl->sync.base.type = &pdev->sync_type;
++   tl->sync.base.flags = VK_SYNC_IS_TIMELINE;
++   tl->sync.dev = dev;
++   tl->sync.slot = UINT32_MAX;
++   tl->sync.value = (volatile uint64_t *)((uint8_t *)rf->mem->map + offset_B);
++   tl->sync.gpu_va = rf->mem->va->addr + offset_B;
++   tl->sync.h_semsurf = rf->h_semsurf;
++   rf->tl_count = index + 1;
++
++   if (dev->base.pdev->debug_flags & NVK_DEBUG_VM) {
++      fprintf(stderr, "NVK: present timeline %u for queue %p: semaphore "
++              "surface 0x%x entry %u (GPU VA 0x%" PRIx64 "), fence context "
++              "%u\n", index, key, rf->h_semsurf, index, tl->sync.gpu_va, ctx);
++   }
++   return tl;
++}
++
++struct vk_sync *
++nvkmd_rm_rmfence_sync(struct nvkmd_dev *_dev, struct vk_object_base *log_obj,
++                      const void *queue_key, uint64_t *value_out)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++   struct nvkmd_rm_rmfence *rf = rmfence_get(dev, log_obj);
++   if (rf == NULL)
++      return NULL;
++
++   simple_mtx_lock(&dev->rmfence_mutex);
++   struct nvkmd_rm_rmfence_tl *tl = rmfence_tl_locked(dev, rf, queue_key);
++   struct vk_sync *sync = NULL;
++   if (tl != NULL) {
++      *value_out = ++tl->next_value;
++      sync = &tl->sync.base;
++   }
++   simple_mtx_unlock(&dev->rmfence_mutex);
++   return sync;
++}
++
++VkResult
++nvkmd_rm_rmfence_create(struct nvkmd_dev *_dev, struct vk_object_base *log_obj,
++                        struct vk_sync *sync, uint64_t value, int *fence_out)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++   struct nvkmd_rm_rmfence *rf = dev->rmfence;
++
++   *fence_out = -1;
++   if (rf == NULL)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   uint32_t ctx = 0;
++   simple_mtx_lock(&dev->rmfence_mutex);
++   for (uint32_t i = 0; i < rf->tl_count; i++) {
++      if (&rf->tl[i].sync.base == sync)
++         ctx = rf->tl[i].fence_ctx;
++   }
++   simple_mtx_unlock(&dev->rmfence_mutex);
++   if (ctx == 0)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   int fence = -1;
++   int ret = dev->lib->win_semsurf_fence_create(dev->drm_fd, ctx, value,
++                                                NVKMD_RM_RMFENCE_TIMEOUT_MS,
++                                                &fence);
++   if (ret != 0 || fence <= 0) {
++      return vk_errorf(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY,
++                       "SEMSURF_FENCE_CREATE(%" PRIu64 "): %d (%s)", value,
++                       ret, ret < 0 ? strerror(-ret) : "?");
++   }
++   p_atomic_inc(&rf->fences);
++   *fence_out = fence;
++   return VK_SUCCESS;
++}
++
++VkResult
++nvkmd_rm_rmfence_wait(struct nvkmd_dev *_dev, int fence, uint64_t timeout_ns)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++
++   if (fence <= 0 || dev->lib->win_fence_wait == NULL)
++      return VK_ERROR_UNKNOWN;
++   uint32_t ms = UINT32_MAX;
++   if (timeout_ns != UINT64_MAX)
++      ms = (uint32_t)MIN2(DIV_ROUND_UP(timeout_ns, 1000000), UINT32_MAX - 1);
++   const int ret = dev->lib->win_fence_wait(fence, ms);
++   return ret == 1 ? VK_SUCCESS : ret == 0 ? VK_TIMEOUT : VK_ERROR_UNKNOWN;
++}
++
++void
++nvkmd_rm_rmfence_close(struct nvkmd_dev *_dev, int fence)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++
++   if (fence > 0 && dev->lib->win_close_device != NULL)
++      dev->lib->win_close_device(fence);
++}
++
++bool
++nvkmd_rm_rmfence_kmd_flip(struct nvkmd_dev *_dev)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++   return dev->rmfence != NULL && dev->rmfence->kmd_flip;
++}
++
++/* SCANOUT_PRESENT with the fence (the KMD takes it on success), the source
++ * set as for a plain present.  -EAGAIN when the KMD's queue is full; any error
++ * leaves the fence ours.
++ */
++static int
++kmd_source_present_fenced(struct nvkmd_rm_dev *dev,
++                          const struct nvrm_crm_scanout_flip *flip, int fence)
++{
++   const struct nvkmd_rm_lib *lib = dev->lib;
++   int ret;
++
++   simple_mtx_lock(&dev->drm_mutex);
++   const bool same_layout = dev->source_live &&
++      dev->source.handle == flip->owner_handle &&
++      dev->source.width == flip->width &&
++      dev->source.height == flip->height &&
++      dev->source.stride == flip->stride &&
++      dev->source.offset == flip->offset &&
++      dev->source.fourcc == flip->fourcc &&
++      dev->source.modifier == flip->modifier;
++   if (!same_layout) {
++      ret = nvkmd_rm_win_source_set_locked(dev, flip);
++      if (ret != 0)
++         goto out;
++   }
++
++   ret = lib->win_scanout_present_fenced(flip->owner_handle, flip->host_handle,
++                                         fence, NULL);
++   if (ret == -ENOENT) {
++      /* The source lapsed (or the KMD reset): register it again */
++      dev->source_live = false;
++      ret = nvkmd_rm_win_source_set_locked(dev, flip);
++      if (ret == 0)
++         ret = lib->win_scanout_present_fenced(flip->owner_handle,
++                                               flip->host_handle, fence, NULL);
++   }
++
++out:
++   simple_mtx_unlock(&dev->drm_mutex);
++   return ret;
++}
++
++static int
++flip_thread(void *arg)
++{
++   struct nvkmd_rm_dev *dev = arg;
++   struct nvkmd_rm_rmfence *rf = dev->rmfence;
++
++   mtx_lock(&rf->q_mutex);
++   while (true) {
++      while (rf->q_count == 0 && !rf->stop)
++         cnd_wait(&rf->q_cond, &rf->q_mutex);
++      if (rf->q_count == 0)
++         break;
++
++      struct nvkmd_rm_flip_item it = rf->q[rf->q_head];
++      rf->q_head = (rf->q_head + 1) % NVKMD_RM_FLIPQ_DEPTH;
++      rf->q_count--;
++      rf->busy = true;
++      cnd_broadcast(&rf->q_cond);
++      mtx_unlock(&rf->q_mutex);
++
++      /* The host fires every fence within 5 s (with an error then); the
++       * extra second only covers a lost wake.
++       */
++      const int fired =
++         dev->lib->win_fence_wait(it.fence, NVKMD_RM_RMFENCE_TIMEOUT_MS + 1000);
++      if (fired != 1) {
++         const uint64_t n = p_atomic_inc_return(&rf->fence_timeouts);
++         if (n <= 4 || n % 600 == 0)
++            mesa_logw("NVK: present fence %d did not fire (%d), flipping "
++                      "anyway (%" PRIu64 " so far)", it.fence, fired, n);
++      }
++      dev->lib->win_close_device(it.fence);
++      nvkmd_rm_mem_scanout_flip(it.mem, NULL, it.width, it.height, it.stride,
++                                it.offset, it.fourcc, it.modifier);
++      p_atomic_inc(&rf->thread_flips);
++      nvkmd_mem_unref(it.mem);
++
++      mtx_lock(&rf->q_mutex);
++      rf->busy = false;
++      cnd_broadcast(&rf->q_cond);
++   }
++   mtx_unlock(&rf->q_mutex);
++   return 0;
++}
++
++/* Queues a flip for the flip thread (started on first use).  False if there
++ * is no thread; the caller then waits itself.
++ */
++static bool
++flip_thread_queue(struct nvkmd_rm_dev *dev, struct nvkmd_rm_rmfence *rf,
++                  struct nvkmd_mem *mem, const struct nvrm_crm_scanout_flip *f,
++                  int fence)
++{
++   mtx_lock(&rf->q_mutex);
++   if (!rf->thread_started && !rf->thread_failed) {
++      if (thrd_create(&rf->thread, flip_thread, dev) == thrd_success) {
++         rf->thread_started = true;
++      } else {
++         rf->thread_failed = true;
++         mesa_logw("NVK: no flip thread, CPU waits before flips");
++      }
++   }
++   if (!rf->thread_started || rf->stop) {
++      mtx_unlock(&rf->q_mutex);
++      return false;
++   }
++
++   /* Back-pressure: at most NVKMD_RM_FLIPQ_DEPTH frames wait */
++   while (rf->q_count == NVKMD_RM_FLIPQ_DEPTH)
++      cnd_wait(&rf->q_cond, &rf->q_mutex);
++
++   nvkmd_mem_ref(mem);
++   rf->q[(rf->q_head + rf->q_count) % NVKMD_RM_FLIPQ_DEPTH] =
++      (struct nvkmd_rm_flip_item) {
++         .mem = mem,
++         .width = f->width,
++         .height = f->height,
++         .stride = f->stride,
++         .offset = f->offset,
++         .fourcc = f->fourcc,
++         .modifier = f->modifier,
++         .fence = fence,
++      };
++   rf->q_count++;
++   cnd_broadcast(&rf->q_cond);
++   mtx_unlock(&rf->q_mutex);
++   return true;
++}
++
++void
++nvkmd_rm_rmfence_drain(struct nvkmd_rm_dev *dev)
++{
++   struct nvkmd_rm_rmfence *rf = dev->rmfence;
++   if (rf == NULL || !rf->thread_started)
++      return;
++
++   mtx_lock(&rf->q_mutex);
++   while (rf->q_count != 0 || rf->busy)
++      cnd_wait(&rf->q_cond, &rf->q_mutex);
++   mtx_unlock(&rf->q_mutex);
++}
++
++VkResult
++nvkmd_rm_mem_scanout_flip_fenced(struct nvkmd_mem *_mem,
++                                 struct vk_object_base *log_obj,
++                                 uint32_t width, uint32_t height,
++                                 uint32_t stride, uint32_t offset,
++                                 uint32_t fourcc, uint64_t modifier,
++                                 int fence)
++{
++   struct nvkmd_rm_mem *mem = nvkmd_rm_mem(_mem);
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_mem->dev);
++   struct nvkmd_rm_rmfence *rf = dev->rmfence;
++
++   VkResult result = nvkmd_rm_mem_export_scanout(_mem, log_obj, modifier);
++   if (result != VK_SUCCESS || rf == NULL) {
++      /* Nothing will wait on it: the work is done before the caller learns */
++      nvkmd_rm_rmfence_wait(&dev->base, fence, UINT64_MAX);
++      nvkmd_rm_rmfence_close(&dev->base, fence);
++      return result != VK_SUCCESS ? result : VK_ERROR_FEATURE_NOT_PRESENT;
++   }
++
++   const struct nvrm_crm_scanout_flip flip = {
++      .scanout = 0,
++      .owner_handle = (uint32_t)dev->drm_fd,
++      .host_handle = mem->gem_handle,
++      .width = width,
++      .height = height,
++      .stride = stride,
++      .offset = offset,
++      .fourcc = fourcc,
++      .modifier = modifier,
++   };
++
++   if (rf->kmd_flip) {
++      int ret = kmd_source_present_fenced(dev, &flip, fence);
++      /* QUEUE_FULL: eight frames already wait in the KMD.  Ours fires after
++       * theirs (one timeline), so once it has fired they are all ready and
++       * the next try is taken (and coalesced).  A plain flip here could
++       * overtake them.
++       */
++      for (uint32_t i = 0; ret == -EAGAIN && i < 8; i++) {
++         p_atomic_inc(&rf->kmd_queue_full);
++         dev->lib->win_fence_wait(fence, NVKMD_RM_RMFENCE_TIMEOUT_MS);
++         if (i > 0)
++            os_time_sleep(1000);
++         ret = kmd_source_present_fenced(dev, &flip, fence);
++      }
++      if (ret == 0) {
++         /* The KMD owns the fence now and flips when it fires */
++         p_atomic_inc(&dev->flips_ok);
++         p_atomic_inc(&rf->kmd_flips);
++         return VK_SUCCESS;
++      }
++      if (ret != -EAGAIN) {
++         mesa_logw("NVK: the KMD refused a fenced present (%d, %s); the flip "
++                   "thread waits from now on", ret,
++                   ret < 0 ? strerror(-ret) : "?");
++         rf->kmd_flip = false;
++      }
++   }
++
++   if (flip_thread_queue(dev, rf, _mem, &flip, fence))
++      return VK_SUCCESS;
++
++   /* No thread: the S3 behaviour, a CPU wait (on our own fence) */
++   dev->lib->win_fence_wait(fence, NVKMD_RM_RMFENCE_TIMEOUT_MS + 1000);
++   dev->lib->win_close_device(fence);
++   p_atomic_inc(&rf->cpu_flips);
++   return nvkmd_rm_mem_scanout_flip(_mem, log_obj, width, height, stride,
++                                    offset, fourcc, modifier);
++}
++
++void
++nvkmd_rm_rmfence_finish(struct nvkmd_rm_dev *dev)
++{
++   struct nvkmd_rm_rmfence *rf = dev->rmfence;
++   if (rf == NULL)
++      return;
++
++   if (rf->thread_started) {
++      mtx_lock(&rf->q_mutex);
++      rf->stop = true;
++      cnd_broadcast(&rf->q_cond);
++      mtx_unlock(&rf->q_mutex);
++      thrd_join(rf->thread, NULL);
++   }
++   mtx_destroy(&rf->q_mutex);
++   cnd_destroy(&rf->q_cond);
++
++   if (rf->fences != 0) {
++      mesa_logi("NVK: %" PRIu64 " present fences: %" PRIu64 " flipped by the "
++                "KMD (queue full %" PRIu64 "x), %" PRIu64 " by the flip thread "
++                "(%" PRIu64 " did not fire), %" PRIu64 " after a CPU wait",
++                rf->fences, rf->kmd_flips, rf->kmd_queue_full,
++                rf->thread_flips, rf->fence_timeouts, rf->cpu_flips);
++   }
++
++   /* The fence contexts are GEM handles of the render node: they go with it */
++   dev->rmfence = NULL;
++   rmfence_free(dev, rf);
++}
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+index bec2d3e..e7930fa 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+@@ -90,9 +90,9 @@ nvkmd_rm_close_gem(struct nvkmd_rm_dev *dev, uint32_t gem_handle)
+ }
+ 
+ /* The render node, opened on first use */
+-static VkResult
+-get_drm_fd(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
+-           int *fd_out)
++VkResult
++nvkmd_rm_win_drm_fd(struct nvkmd_rm_dev *dev, struct vk_object_base *log_obj,
++                    int *fd_out)
+ {
+    const struct nvkmd_rm_lib *lib = dev->lib;
+    VkResult result = VK_SUCCESS;
+@@ -136,7 +136,7 @@ export_to_gem(struct nvkmd_rm_dev *dev, struct nvkmd_rm_mem *mem,
+    }
+ 
+    int drm_fd;
+-   result = get_drm_fd(dev, log_obj, &drm_fd);
++   result = nvkmd_rm_win_drm_fd(dev, log_obj, &drm_fd);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -269,9 +269,9 @@ nvkmd_rm_mem_export_scanout(struct nvkmd_mem *_mem,
+ }
+ 
+ /* SCANOUT_SET for the layout of `flip` */
+-static int
+-kmd_source_set_locked(struct nvkmd_rm_dev *dev,
+-                      const struct nvrm_crm_scanout_flip *flip)
++int
++nvkmd_rm_win_source_set_locked(struct nvkmd_rm_dev *dev,
++                               const struct nvrm_crm_scanout_flip *flip)
+ {
+    struct nvrm_crm_scanout_source src = {
+       .handle = flip->owner_handle,
+@@ -328,7 +328,7 @@ kmd_source_present(struct nvkmd_rm_dev *dev,
+       dev->source.fourcc == flip->fourcc &&
+       dev->source.modifier == flip->modifier;
+    if (!same_layout) {
+-      ret = kmd_source_set_locked(dev, flip);
++      ret = nvkmd_rm_win_source_set_locked(dev, flip);
+       /* -EINVAL: a layout the KMD does not forward */
+       *layout_rejected = ret == -EINVAL;
+       if (ret == -ENOSYS) {
+@@ -345,7 +345,7 @@ kmd_source_present(struct nvkmd_rm_dev *dev,
+    if (ret == -ENOENT) {
+       /* The source lapsed (or the KMD reset): register it again */
+       dev->source_live = false;
+-      ret = kmd_source_set_locked(dev, flip);
++      ret = nvkmd_rm_win_source_set_locked(dev, flip);
+       if (ret == 0)
+          ret = lib->win_scanout_present(flip->owner_handle,
+                                         flip->host_handle, NULL);
+@@ -361,6 +361,9 @@ nvkmd_rm_dev_scanout_release(struct nvkmd_dev *_dev)
+ {
+    struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
+ 
++   /* Flips still waiting on their fences would take the scanout back */
++   nvkmd_rm_rmfence_drain(dev);
++
+    simple_mtx_lock(&dev->drm_mutex);
+    if (dev->source_live && dev->lib->win_scanout_release != NULL) {
+       int ret = dev->lib->win_scanout_release(dev->source.handle);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+index 94abb11..fd55553 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -743,4 +743,45 @@ static_assert(sizeof(struct nvrm_drm_nvidia_gem_export_nvkms_memory_params) == 2
+ static_assert(sizeof(struct nvrm_nvkms_kapi_priv_import_memory_params) == 28, "NvKmsKapiPrivImportMemoryParams");
+ static_assert(sizeof(struct nvrm_nvkms_kapi_priv_export_memory_params) == 4, "NvKmsKapiPrivExportMemoryParams");
+ 
++/*
++ * Semaphore surfaces (class/cl00da.h, ctrl/ctrl00da.h,
++ * ctrl/ctrl2080/ctrl2080fb.h): an array of semaphore entries in system memory
++ * whose waiters RM checks on the non-stall interrupts of bound channels.
++ * nvidia-drm's semaphore-surface fences sit on top.
++ */
++#define NV_SEMAPHORE_SURFACE                      (0x000000da)
++#define NVRM_ALIGN8 __attribute__((aligned(8)))
++
++typedef struct NV_SEMAPHORE_SURFACE_ALLOC_PARAMETERS {
++   NvHandle hSemaphoreMem;
++   NvHandle hMaxSubmittedMem;
++   NvU64 flags NVRM_ALIGN8;
++} NV_SEMAPHORE_SURFACE_ALLOC_PARAMETERS;
++
++#define NV_SEMAPHORE_SURFACE_CTRL_CMD_BIND_CHANNEL         (0x00da0002)
++#define NV_SEMAPHORE_SURFACE_CTRL_CMD_UNBIND_CHANNEL       (0x00da0006)
++#define NV_SEMAPHORE_SURFACE_CTRL_CMD_BIND_CHANNEL_MAX_INDICES 8
++
++typedef struct NV_SEMAPHORE_SURFACE_CTRL_BIND_CHANNEL_PARAMS {
++   NvHandle hChannel;
++   NvU32 numNotifyIndices;
++   NvU32 notifyIndices[NV_SEMAPHORE_SURFACE_CTRL_CMD_BIND_CHANNEL_MAX_INDICES];
++} NV_SEMAPHORE_SURFACE_CTRL_BIND_CHANNEL_PARAMS;
++
++#define NV2080_CTRL_CMD_FB_GET_SEMAPHORE_SURFACE_LAYOUT    (0x20801352)
++#define NV2080_CTRL_FB_GET_SEMAPHORE_SURFACE_LAYOUT_CAPS_64BIT_SEMAPHORES_SUPPORTED (0x00000002)
++
++typedef struct NV2080_CTRL_FB_GET_SEMAPHORE_SURFACE_LAYOUT_PARAMS {
++   NvU64 maxSubmittedSemaphoreValueOffset NVRM_ALIGN8;
++   NvU64 monitoredFenceThresholdOffset NVRM_ALIGN8;
++   NvU64 size NVRM_ALIGN8;
++   NvU32 caps;
++} NV2080_CTRL_FB_GET_SEMAPHORE_SURFACE_LAYOUT_PARAMS;
++
++static_assert(sizeof(NV_SEMAPHORE_SURFACE_ALLOC_PARAMETERS) == 16, "cl00da");
++static_assert(sizeof(NV_SEMAPHORE_SURFACE_CTRL_BIND_CHANNEL_PARAMS) == 40,
++              "ctrl00da bind");
++static_assert(sizeof(NV2080_CTRL_FB_GET_SEMAPHORE_SURFACE_LAYOUT_PARAMS) == 32,
++              "semaphore surface layout");
++
+ #endif /* NVRM_API_H */
+diff --git a/src/vulkan/runtime/vk_queue.c b/src/vulkan/runtime/vk_queue.c
+index 78439db..18b511a 100644
+--- a/src/vulkan/runtime/vk_queue.c
++++ b/src/vulkan/runtime/vk_queue.c
+@@ -1188,10 +1188,10 @@ vk_queue_merge_submit(struct vk_queue *queue,
+    return result;
+ }
+ 
+-static VkResult
++VkResult
+ vk_queue_signal_sync(struct vk_queue *queue,
+                      struct vk_sync *sync,
+-                     uint32_t signal_value)
++                     uint64_t signal_value)
+ {
+    struct vk_queue_submit *submit = vk_queue_submit_alloc(queue, 0, 0, 0, 0, 0,
+                                                           0, 0, 1, false);
+diff --git a/src/vulkan/runtime/vk_queue.h b/src/vulkan/runtime/vk_queue.h
+index 82b8d14..f8731e2 100644
+--- a/src/vulkan/runtime/vk_queue.h
++++ b/src/vulkan/runtime/vk_queue.h
+@@ -248,6 +248,13 @@ VkResult vk_queue_enable_submit_thread(struct vk_queue *queue);
+ 
+ VkResult vk_queue_flush(struct vk_queue *queue, uint32_t *submit_count_out);
+ 
++/* Signals sync (at signal_value, for a timeline) after everything submitted
++ * to queue so far, as an empty submit would.  The caller holds the queue the
++ * way vkQueueSubmit2 requires.
++ */
++VkResult vk_queue_signal_sync(struct vk_queue *queue, struct vk_sync *sync,
++                              uint64_t signal_value);
++
+ VkResult PRINTFLIKE(4, 5)
+ _vk_queue_set_lost(struct vk_queue *queue,
+                    const char *file, int line,
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index 807a655..ef8eaf2 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -2893,9 +2893,10 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+ #endif
+       }
+ 
+-      if (wsi->sw ||
+-          (wsi->wait_before_present && !swapchain->image_info.explicit_sync &&
+-           swapchain->dma_buf_semaphore == VK_NULL_HANDLE)) {
++      if (!swapchain->gpu_ordered_present &&
++          (wsi->sw ||
++           (wsi->wait_before_present && !swapchain->image_info.explicit_sync &&
++            swapchain->dma_buf_semaphore == VK_NULL_HANDLE))) {
+          wsi->WaitForFences(vk_device_to_handle(dev),
+                             1, &swapchain->fences[image_index], true, ~0ull);
+       }
+@@ -2904,6 +2905,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+       if (regions && regions->pRegions)
+          region = &regions->pRegions[i];
+ 
++      swapchain->present_queue = vk_queue_to_handle(queue);
+       results[i] = swapchain->queue_present(swapchain, image_index,
+                                             image_signal_infos[i].present_id,
+                                             region);
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index 6120072..6c44722 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -181,6 +181,15 @@ struct wsi_device {
+                                  VkDeviceMemory memory, uint64_t *modifier);
+       VkResult (*scanout_flip)(VkDevice device, VkDeviceMemory memory,
+                                const struct wsi_win32_scanout_flip *flip);
++      /* Optional: scanout_flip without the CPU wait for rendering.  The
++       * driver orders the flip after everything submitted to `queue` so far
++       * (the present's own submission included), on the GPU or wherever it
++       * likes, and returns at once.  VK_ERROR_FEATURE_NOT_PRESENT: it cannot
++       * now; the WSI then waits and calls scanout_flip as before.
++       */
++      VkResult (*scanout_flip_fenced)(VkDevice device, VkQueue queue,
++                                      VkDeviceMemory memory,
++                                      const struct wsi_win32_scanout_flip *flip);
+       void (*scanout_release)(VkDevice device);
+       bool scanout_linear;
+    } win32;
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index 5aa8f48..89ebc86 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -257,6 +257,14 @@ struct wsi_swapchain {
+ 
+    uint64_t present_serial;
+ 
++   /* queue_present orders the present after the present queue's work on
++    * the GPU itself (Win32 scanout with wsi_device::win32.scanout_flip_fenced):
++    * no CPU wait for the rendering before it.  present_queue is the queue of
++    * the vkQueuePresentKHR being handled.
++    */
++   bool gpu_ordered_present;
++   VkQueue present_queue;
++
+    struct {
+       enum wsi_swapchain_blit_type type;
+       VkSemaphore *semaphores;
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index be3e082..0821c49 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -859,8 +859,23 @@ wsi_win32_queue_present_scanout(struct wsi_win32_swapchain *chain,
+    flip.fourcc = chain->scanout.fourcc;
+    flip.modifier = image->scanout_modifier;
+ 
+-   VkResult result = wsi->win32.scanout_flip(chain->base.device,
+-                                             image->base.memory, &flip);
++   VkResult result = VK_ERROR_FEATURE_NOT_PRESENT;
++   if (chain->base.gpu_ordered_present) {
++      result = wsi->win32.scanout_flip_fenced(chain->base.device,
++                                              chain->base.present_queue,
++                                              image->base.memory, &flip);
++      if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
++         /* Not to be had (any more): wait for the rendering as before */
++         chain->base.gpu_ordered_present = false;
++      }
++   }
++   if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
++      const uint32_t index = (uint32_t)(image - chain->images);
++      wsi->WaitForFences(chain->base.device, 1, &chain->base.fences[index],
++                         true, ~0ull);
++      result = wsi->win32.scanout_flip(chain->base.device,
++                                       image->base.memory, &flip);
++   }
+    chain->scanout.presented = true;
+ 
+    /* The display path does not take the driver's tiling: linear swapchains
+@@ -1382,6 +1397,8 @@ retry:
+       chain->scanout.enabled = true;
+       chain->scanout.fourcc = scanout_fourcc;
+       chain->scanout.hold = MIN2(2u, num_images - 1);
++      chain->base.gpu_ordered_present =
++         wsi_device->win32.scanout_flip_fenced != NULL;
+       const uint64_t hz = debug_get_num_option("MESA_WSI_SCANOUT_HZ", 0);
+       chain->scanout.period_ns =
+          chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR && hz > 0 ?
+-- 
+2.43.0
+

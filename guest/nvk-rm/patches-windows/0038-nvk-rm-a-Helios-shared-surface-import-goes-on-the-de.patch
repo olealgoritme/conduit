@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 09:04:44 +0200
+Subject: [PATCH] nvk/rm: a Helios shared-surface import goes on the device's
+ memory list
+
+nvkmd_rm_mem_import_resource() (patch 0031) creates the memory outside
+the nvkmd_dev_* wrappers, so it was never put on dev->mems, but
+nvkmd_mem_unref() takes every memory off that list: list_del() on a
+zeroed link, an access violation when the opener frees an imported
+shared surface (d3d11_share on NVK, vulkan_nouveau.dll in
+nvkmd_mem_unref). Track it like every other import, and free it the
+same way on the size-check failure path.
+---
+ src/nouveau/vulkan/nvk_device_memory.c | 1 +
+ src/nouveau/vulkan/nvkmd/nvkmd.c       | 7 +++++++
+ src/nouveau/vulkan/nvkmd/nvkmd.h       | 8 ++++++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
+index d5c6c02..085090b 100644
+--- a/src/nouveau/vulkan/nvk_device_memory.c
++++ b/src/nouveau/vulkan/nvk_device_memory.c
+@@ -272,6 +272,7 @@ nvk_AllocateMemory(VkDevice device,
+                                             &mem->mem);
+       if (result != VK_SUCCESS)
+          goto fail_alloc;
++      nvkmd_dev_track_imported_mem(dev->nvkmd, mem->mem);
+       if (pAllocateInfo->allocationSize > mem->mem->size_B) {
+          result = vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                             "Helios shared surface %u is %" PRIu64 " B, "
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.c b/src/nouveau/vulkan/nvkmd/nvkmd.c
+index fc96432..0c3abca 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.c
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.c
+@@ -25,6 +25,13 @@ nvkmd_dev_add_mem(struct nvkmd_dev *dev,
+    simple_mtx_unlock(&dev->mems_mutex);
+ }
+ 
++void
++nvkmd_dev_track_imported_mem(struct nvkmd_dev *dev,
++                             struct nvkmd_mem *mem)
++{
++   nvkmd_dev_add_mem(dev, mem);
++}
++
+ static void
+ nvkmd_dev_remove_mem(struct nvkmd_dev *dev,
+                      struct nvkmd_mem *mem)
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
+index ac878d3..654aaeb 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+@@ -498,6 +498,14 @@ nvkmd_dev_import_dma_buf(struct nvkmd_dev *dev,
+                          struct vk_object_base *log_obj,
+                          int fd, struct nvkmd_mem **mem_out);
+ 
++/* A memory a backend created outside the nvkmd_dev_* wrappers (the RM
++ * backend's Helios resource import): put it on the device's memory list,
++ * which nvkmd_mem_unref() takes it off again.
++ */
++void
++nvkmd_dev_track_imported_mem(struct nvkmd_dev *dev,
++                             struct nvkmd_mem *mem);
++
+ struct nvkmd_mem *
+ nvkmd_dev_lookup_mem_by_va(struct nvkmd_dev *dev,
+                            uint64_t addr,

@@ -20,6 +20,19 @@ pub fn advances_context(previous: u64, next: u64) -> bool {
         && (previous == 0 || (stream(previous) == stream(next) && next as u32 > previous as u32))
 }
 
+/// Whether a context whose last bound stream is `previous` (0: none) can bind a new
+/// boundary of stream `handle`: the same stream or none yet. `handle` is `None` when
+/// the stream does not exist yet (a gate that has not been opened), which only a
+/// context that has bound nothing can use. `advances_context` is the final word at
+/// bind time; this is its answer BEFORE the caller takes something irreversible (an
+/// RM fence at Render), so the later bind cannot refuse what the caller took.
+pub const fn may_bind_stream(previous: u32, handle: Option<u32>) -> bool {
+    match handle {
+        Some(h) => previous == 0 || previous == h,
+        None => previous == 0,
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Record {
@@ -135,6 +148,14 @@ impl Progress {
     }
     pub fn retired(self) -> u32 {
         self.retired
+    }
+
+    /// Advance to `value` (never backwards). The one writer that is not a Venus
+    /// used-ring response is an RM gate (`rm_fence_present::Gate`), whose points
+    /// retire from a host `EventReady` for a fence handle: there is no wire fence to
+    /// check, and the gate itself owns the prefix rule.
+    pub fn advance_to(&mut self, value: u32) {
+        self.retired = self.retired.max(value);
     }
 
     /// Called only on a successful used-ring response for the original tag.
@@ -331,6 +352,28 @@ mod tests {
                 epoch = table.publish(key, 3, 9, progress.completed() >= 9).unwrap();
             }
             assert_eq!(table.predicate(key, epoch), Ok(Predicate::Ready));
+        }
+    }
+
+    #[test]
+    fn the_bind_precheck_agrees_with_what_the_bind_would_do() {
+        // For a boundary of `handle` with a point above the context's last one, the
+        // pre-check says yes exactly when `advances_context` does.
+        let b = |h: u32, v: u32| (1u64 << 63) | (u64::from(h) << 32) | u64::from(v);
+        for previous_handle in [0u32, 5, 6] {
+            for gate in [None, Some(5), Some(7)] {
+                let previous = if previous_handle == 0 {
+                    0
+                } else {
+                    b(previous_handle, 3)
+                };
+                let advances = gate.map_or(previous == 0, |h| advances_context(previous, b(h, 4)));
+                assert_eq!(
+                    may_bind_stream(previous_handle, gate),
+                    advances,
+                    "previous {previous_handle} gate {gate:?}"
+                );
+            }
         }
     }
 

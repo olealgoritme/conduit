@@ -89,6 +89,7 @@ mod bridge12;
 mod caps12;
 mod ddi12;
 mod device12;
+mod device_loss12;
 mod forward12;
 mod knobs12;
 mod probe12;
@@ -548,6 +549,7 @@ static UMD12_REFUSAL_SETS: &[&[&RefusalCounter]] = &[
     forward12::present12::REFUSALS,   // L8: present
     forward12::misc::REFUSALS,        // L9: the tail
     forward12::tables12::REFUSALS,    // typed extended-feature negotiation
+    forward12::nvk12::REFUSALS,       // S5: NVK on RM context ordering
 ];
 
 /// Bump one refusal counter and emit the whole set's summary on its FIRST hit.

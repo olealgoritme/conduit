@@ -45,6 +45,10 @@ pub(crate) struct PresentStreamMarker {
     pub value: u32,
     pub cookie: u64,
     pub creator_process: usize,
+    /// Nonzero: an RM fence already attached at Render
+    /// (`docs/rm-fence-marker.md`), and the boundary naming it. `ctx_id`, `value` and
+    /// `cookie` are then zero; the marker is not a Venus stream point.
+    pub rm_boundary: u64,
 }
 
 impl AdapterContext {
@@ -191,6 +195,17 @@ impl AdapterContext {
         crate::ddi::scanout_trace::note_lease_primary_published();
     }
 
+    /// Complete a flip of a foreign primary that could not be shown: publish its address as a
+    /// kept picture (`ProgrammedPrimary::kept_picture`). One atomic store and nothing else: legal
+    /// at any IRQL, including the DMA flip lane's DISPATCH submit and the ring-1 completion DPC.
+    ///
+    /// Deliberately NOT `publish_bound_primary`: that one also feeds the lease census
+    /// (`LsPub`), and nothing was bound here. The caller decides through
+    /// `helios_kmd_logic::flip_completion::decide` and counts through `ddi::flip_keep`.
+    pub(crate) fn publish_kept_primary(&self, address: u64) {
+        self.publish_displayed_primary(super::ProgrammedPrimary::kept_picture(address));
+    }
+
     /// Mark already-completed scanout contents dirty. The normal copied path
     /// does this from the ring-1 GPU-completion DPC; the direct-primary
     /// zero-copy case has no KMD GPU submission, so SetVidPn uses this after
@@ -209,9 +224,9 @@ impl AdapterContext {
         self.pending_refresh_resource
             .store(resource_id, Ordering::Release);
         self.scanout_refresh_pending.store(1, Ordering::Release);
-        // SAFETY: hpd_event is initialized in place and stable for the adapter
-        // lifetime; KeSetEvent(Wait=FALSE) is legal through DISPATCH_LEVEL.
-        unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
+        // `signal_hpd_for`: KeSetEvent(Wait=FALSE) on the initialized hpd_event, legal through
+        // DISPATCH_LEVEL, and counted per cause (`HpdSgRfr`).
+        self.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::REFRESH);
     }
 
     /// The marker and bind edges publish their pending identity while holding
@@ -257,6 +272,9 @@ impl AdapterContext {
                 .with_virtio(|order, v| {
                     let watermark = stream_marker
                         .and_then(|marker| {
+                            if marker.rm_boundary != 0 {
+                                return Some(marker.rm_boundary);
+                            }
                             v.present_stream_marker_boundary(
                                 marker.ctx_id,
                                 marker.value,
@@ -630,8 +648,13 @@ impl AdapterContext {
         passive: PassiveLevel,
     ) -> ScanoutRefreshQueue {
         let outcome = self.with_scanout_lifecycle(passive, |lock| {
+            // Stall breadcrumb: the HPD worker (the only caller) holds the scanout mutex now.
+            crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::REFRESH_LOCKED);
             self.queue_active_scanout_refresh_locked(lock)
         });
+        // The mutex is free again: the pacing snapshot below must not run under a site that
+        // says it is held.
+        crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::REFRESH_POST);
         // R318: the pacing snapshot runs OUTSIDE `scanout_mutex`. It used to run
         // inside it — 32 synchronous registry transactions every 16 queued
         // refreshes, roughly 3.75 bursts per second at 60 Hz, on the PASSIVE
@@ -641,6 +664,16 @@ impl AdapterContext {
         // against another.
         if matches!(outcome, ScanoutRefreshQueue::Queued) {
             self.pacing_snapshot();
+        }
+        // A desktop flush that was queued, or that found nothing bound, pays off
+        // the restore a foreign scanout source's end owes the desktop. (`Dropped`,
+        // `Busy` and `Failed` leave it owed; the worker retries or the next dirty
+        // edge arrives.)
+        if matches!(
+            outcome,
+            ScanoutRefreshQueue::Queued | ScanoutRefreshQueue::Unavailable
+        ) {
+            self.foreign_scanout_desktop_flushed();
         }
         outcome
     }
@@ -664,6 +697,8 @@ impl AdapterContext {
             return;
         }
 
+        // The stall-diagnosis block rides the same periodic mirror (`ddi::stall_diag`).
+        crate::ddi::stall_diag::publish_counters();
         crate::diag::record_named_bytes(b"RfRid", resource_id);
         crate::diag::record_named_bytes(b"RfWH", (width << 16) | (height & 0xFFFF));
         crate::diag::record_named_bytes(b"RfCnt", n);
@@ -687,6 +722,7 @@ impl AdapterContext {
         );
 
         crate::diag::record_named_bytes(b"VsCnt", self.vsync_count.load(Ordering::Relaxed));
+        crate::diag::record_named_bytes(b"VsCntT", self.vsync_last_ms());
         crate::diag::record_named_bytes(b"VsEn", self.vsync_enabled.load(Ordering::Relaxed));
         crate::diag::record_named_bytes(
             b"SaCnt",
@@ -872,6 +908,27 @@ impl AdapterContext {
                 crate::ddi::scanout_timeline::refresh_outcome::ACTIVE_CHANGED,
             );
             return ScanoutRefreshQueue::Busy;
+        }
+
+        // FOREIGN SCANOUT SOURCE (`adapter/foreign_scanout.rs`): an app holds
+        // scanout 0 through HELIOS_NVRM_OP_SCANOUT_*, and a host flush of the
+        // desktop's resource would replace its picture. Withhold exactly that
+        // flush. Everything else of the desktop's present path (binds, WDDM
+        // fences, vsync, the ledger) already ran and is untouched; what is
+        // cancelled here is cancelled the way the ownership-gate drops below
+        // cancel it, so no publication transaction or lease waits for a read
+        // that will never be issued. Self-healing like those drops: the armed id
+        // is cleared, and the source's end requests a fresh refresh.
+        if self.foreign_scanout_suppresses() {
+            let armed_resource = self.pending_refresh_resource.swap(0, Ordering::AcqRel);
+            self.release_all_scanout_leases(LeaseEnd::Cancelled);
+            let _ = self.with_virtio(|v| v.cancel_publication_exact(resource_id, bound_epoch));
+            note_dropped(
+                resource_id,
+                armed_resource,
+                crate::ddi::scanout_timeline::refresh_outcome::FOREIGN_SOURCE,
+            );
+            return ScanoutRefreshQueue::Dropped;
         }
 
         // THE CENSUS the ownership gate below acts on. It was count-only until
@@ -1185,6 +1242,9 @@ impl AdapterContext {
         if resource_id == 0 {
             return true;
         }
+        // `ForeignFlip`: a shown foreign allocation that is destroyed stops being the source
+        // before its importer can close the GEM (one load when it shows nothing).
+        crate::virtio::foreign_flip::target_gone(self, resource_id);
         // Freeze the DISPATCH bind producer before resolving the final host
         // selection. The PASSIVE worker is already excluded by `scanout_mutex`.
         // Any SET issued before this point is ahead of the pure-query FIFO

@@ -119,7 +119,8 @@ typedef struct HeliosNvrmQueryCaps {
   uint32_t max_buffer_bytes;      /* out */
   uint32_t default_timeout_ms;    /* out: FORWARD default for timeout_ms == 0 */
   uint64_t supported_ops;         /* out: bit n <=> HELIOS_NVRM_OP_* == n (ops 5, 6
-                                     only while events are usable) */
+                                     only while events are usable); bits 32..63 are
+                                     capabilities (HELIOS_NVRM_CAP_*) */
   uint32_t supported_event_kinds; /* out: bit n <=> HELIOS_NVRM_EVENT_* == n;
                                      0 when events are not usable */
   uint32_t supported_cache_types; /* out: bit n <=> HELIOS_NVRM_CACHE_* == n */
@@ -214,13 +215,58 @@ typedef struct HeliosNvrmMunmap {
 HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmMunmap) == HELIOS_NVRM_MUNMAP_BYTES, "Munmap");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmMunmap, mapping_id) == 40, "munmap.mapping_id");
 
+/* ---- WINDOW_INFO (op 13, 88 bytes): read-only report of the RM window ------- *
+ * How big the RM window (region 1, where MMAP places memory) is, how much is mapped, and how
+ * much of it the CALLING process may use: for a live VK_EXT_memory_budget. Present only where
+ * HELIOS_NVRM_CAP_WINDOW_INFO is set in QUERY_CAPS.supported_ops (bit 36). Always status OK,
+ * no side effect, no host round trip (a few atomic reads and one short lock hold): a caller
+ * may cache the answer for 10 ms. With the transport down every size is 0. */
+#define HELIOS_NVRM_OP_WINDOW_INFO 13u
+#define HELIOS_NVRM_CAP_WINDOW_INFO (1ull << 36)
+/* flags bit 0: owner_limit_bytes < window_bytes (this process cannot use the whole window:
+ * the legacy quota, the reserve held back for the shell, or an operator bound). */
+#define HELIOS_NVRM_WINDOW_FLAG_OWNER_LIMIT (1u << 0)
+/* flags bit 1: the window can grow while the guest runs. Always 0 today. */
+#define HELIOS_NVRM_WINDOW_FLAG_CAN_GROW (1u << 1)
+/* flags bit 2: owner_limit_bytes is a ceiling on window_used_bytes (every process's maps
+ * together; the dynamic policy), so the room left is owner_limit_bytes - window_used_bytes.
+ * Clear: a ceiling on owner_used_bytes alone (the legacy quota): room = owner_limit_bytes -
+ * owner_used_bytes. The host may still refuse a map it cannot place (DEVICE_ERROR). */
+#define HELIOS_NVRM_WINDOW_FLAG_SHARED_CEILING (1u << 2)
+typedef struct HeliosNvrmWindowInfo {
+  HeliosNvrmHeader head;
+  uint64_t window_bytes;      /* out: the RM window's size */
+  uint64_t window_used_bytes; /* out: mapped now by every process (UVM aperture excluded) */
+  uint64_t owner_limit_bytes; /* out: the ceiling that applies to the caller (see flag bit 2) */
+  uint64_t owner_used_bytes;  /* out: this process's window bytes (UVM aperture excluded) */
+  uint64_t generation;        /* out: bumps when the window size or the policy changes */
+  uint32_t flags;             /* out: HELIOS_NVRM_WINDOW_FLAG_* */
+  uint32_t reserved;          /* out: zero */
+} HeliosNvrmWindowInfo;
+#define HELIOS_NVRM_WINDOW_INFO_BYTES 88u
+HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmWindowInfo) == HELIOS_NVRM_WINDOW_INFO_BYTES, "WindowInfo");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, window_bytes) == 40, "window_info.window_bytes");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, window_used_bytes) == 48, "window_info.window_used_bytes");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, owner_limit_bytes) == 56, "window_info.owner_limit_bytes");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, owner_used_bytes) == 64, "window_info.owner_used_bytes");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, generation) == 72, "window_info.generation");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, flags) == 80, "window_info.flags");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, reserved) == 84, "window_info.reserved");
+
 /* ---- events (persistent, level-triggered, no lost wakeup) ------------------ */
 #define HELIOS_NVRM_EVENT_READY 1u          /* host EventReady for `handle` */
 #define HELIOS_NVRM_EVENT_TRANSPORT_LOST 2u /* device reset; handle ignored (0);
                                                wakes EVERY registration */
+/* A flip of your scanout source can be reused (see SCANOUT_STATUS below); handle
+ * ignored (0). Only where HELIOS_NVRM_CAP_SCANOUT_RELEASE is set. Signalled whenever
+ * out_released_seq may have advanced; also wakes with TRANSPORT_LOST. */
+#define HELIOS_NVRM_EVENT_SCANOUT_RELEASED 3u
 /* what QUERY_CAPS.supported_event_kinds reports while events are usable */
 #define HELIOS_NVRM_EVENT_KINDS_ALL                                            \
   ((1u << HELIOS_NVRM_EVENT_READY) | (1u << HELIOS_NVRM_EVENT_TRANSPORT_LOST))
+/* ... plus this bit on a device with buffer releases */
+#define HELIOS_NVRM_EVENT_KINDS_SCANOUT_RELEASE                                \
+  (1u << HELIOS_NVRM_EVENT_SCANOUT_RELEASED)
 /* EVENT_REGISTER needs the KMD's event queue (virtqueue 1) to be up; if it is
  * not, REGISTER answers HELIOS_NVRM_ST_UNSUPPORTED and supported_event_kinds is
  * 0. No feature bit is involved (the KMD never acks the input bit). A registration is keyed (process, handle, kind);
@@ -250,6 +296,7 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmEvent, event_handle) == 48, "event.
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmEvent, flags) == 56, "event.flags");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmEvent, out_state) == 60, "event.out_state");
 HELIOS_NVRM_STATIC_ASSERT(HELIOS_NVRM_EVENT_KINDS_ALL == 6u, "event kinds");
+HELIOS_NVRM_STATIC_ASSERT(HELIOS_NVRM_EVENT_KINDS_SCANOUT_RELEASE == 8u, "event kinds (release)");
 
 /* ---- PIN / UNPIN: memory registered by CPU address ------------------------- */
 /* IoctlReq.deep_ptr_offset values the host reads as a page-run table (host
@@ -312,6 +359,38 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmUnpin, pin_id) == 40, "unpin.pin_id
 #define HELIOS_NVRM_ST_SCANOUT_BUSY 13
 #define HELIOS_NVRM_ST_NO_SOURCE 14
 
+/* ---- RM fence presents (guest/windows/docs/rm-fence-marker.md) --------------
+ * SCANOUT_PRESENT with HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE: rm_fence_handle
+ * is a backend handle from a forwarded SEMSURF_FENCE_CREATE (0x6455) that the KMD
+ * TAKES OVER (never Close / EVENT_REGISTER / reuse it after status OK). The flip
+ * is sent when the fence fires; out_seq is returned at once. Refusals leave the
+ * handle the caller's: NOT_OWNED (not yours), FORBIDDEN (yours, not a fence),
+ * FENCE_ATTACHED, QUEUE_FULL (HELIOS_NVRM_SCANOUT_FENCE_DEPTH waiting), NO_SOURCE,
+ * UNSUPPORTED. Probe QueryCaps.supported_ops for the capability bits (>= 32, so
+ * they cannot collide with op numbers). */
+#define HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE 1u
+#define HELIOS_NVRM_ST_FENCE_ATTACHED 15
+#define HELIOS_NVRM_ST_QUEUE_FULL 16
+#define HELIOS_NVRM_SCANOUT_FENCE_DEPTH 8u
+#define HELIOS_NVRM_CAP_SCANOUT_FENCE (1ull << 32)
+#define HELIOS_NVRM_CAP_PRESENT_FENCE (1ull << 33)
+/* The WDDM flush gate (HEFL, protocol/include/helios_flush_gate.h) honours its RM fence variant. */
+#define HELIOS_NVRM_CAP_FLUSH_GATE (1ull << 34)
+
+/* ---- buffer release: SCANOUT_STATUS + HELIOS_NVRM_EVENT_SCANOUT_RELEASED -----
+ * (guest/windows/docs/foreign-scanout.md "Buffer release"; protocol/src/nvrm_scanout.rs)
+ * Where the KMD acked the host's NVGPU_F_SCANOUT_RELEASE, QueryCaps.supported_ops has
+ * HELIOS_NVRM_CAP_SCANOUT_RELEASE (and op bit 12, event kind bit 3). Then SCANOUT_STATUS
+ * tells which presented images the host is done with: an image whose latest present
+ * returned out_seq == P may be written again once out_released_seq >= P (never true for
+ * the image on screen). Without the cap keep the old rule (rm-fence-marker.md: with N >= 3
+ * images, not before present P+1 returned and its fence fired). Wait without polling:
+ * EVENT_REGISTER kind SCANOUT_RELEASED (handle 0) once; per image: auto-reset (or reset)
+ * the event, SCANOUT_STATUS, and only if out_released_seq < P wait (with a timeout), then
+ * SCANOUT_STATUS again. The event also wakes on TRANSPORT_LOST. */
+#define HELIOS_NVRM_OP_SCANOUT_STATUS 12u
+#define HELIOS_NVRM_CAP_SCANOUT_RELEASE (1ull << 35)
+
 typedef struct HeliosNvrmScanoutSet {
   HeliosNvrmHeader head;
   uint32_t handle;         /* in:  backend handle of a DRM-node file (device_type >= 512) */
@@ -344,8 +423,9 @@ typedef struct HeliosNvrmScanoutPresent {
   HeliosNvrmHeader head;
   uint32_t handle;   /* in:  the handle given to SET */
   uint32_t gem;      /* in:  GEM handle (in that DRM file) of the image to show */
-  uint32_t flags;    /* in:  zero */
-  uint32_t reserved; /* in:  zero */
+  uint32_t flags;    /* in:  HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE or zero */
+  uint32_t rm_fence_handle; /* in: with the flag, a fence handle (forwarded
+                               SEMSURF_FENCE_CREATE) the KMD takes over; zero without */
   uint64_t out_seq;  /* out: the seq the KMD put in the ScanoutFlip */
 } HeliosNvrmScanoutPresent;
 #define HELIOS_NVRM_SCANOUT_PRESENT_BYTES 64u
@@ -353,8 +433,22 @@ HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmScanoutPresent) == HELIOS_NVRM_SCANOU
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, handle) == 40, "spres.handle");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, gem) == 44, "spres.gem");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, flags) == 48, "spres.flags");
-HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, reserved) == 52, "spres.reserved");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, rm_fence_handle) == 52, "spres.rm_fence_handle");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, out_seq) == 56, "spres.out_seq");
+
+typedef struct HeliosNvrmScanoutStatus {
+  HeliosNvrmHeader head;
+  uint32_t handle;            /* in:  the handle given to SCANOUT_SET (a DRM-node handle of yours) */
+  uint32_t flags;             /* in:  zero */
+  uint64_t out_released_seq;  /* out: every flip of `handle` with seq <= this is done (0 = none) */
+  uint64_t out_last_seq;      /* out: the newest seq the KMD remembers for `handle` */
+} HeliosNvrmScanoutStatus;
+#define HELIOS_NVRM_SCANOUT_STATUS_BYTES 64u
+HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmScanoutStatus) == HELIOS_NVRM_SCANOUT_STATUS_BYTES, "ScanoutStatus");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutStatus, handle) == 40, "sstat.handle");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutStatus, flags) == 44, "sstat.flags");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutStatus, out_released_seq) == 48, "sstat.out_released_seq");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutStatus, out_last_seq) == 56, "sstat.out_last_seq");
 
 typedef struct HeliosNvrmScanoutRelease {
   HeliosNvrmHeader head;
@@ -377,6 +471,30 @@ static inline void helios_nvrm_init(HeliosNvrmHeader *h, uint32_t op, uint32_t t
   h->status = 0;
   h->reserved = 0;
   h->epoch = 0;
+}
+
+/* ---- client rules (not wire: how a client must read the replies) ----------
+ *
+ * The transport a client initialised against is gone when ANY reply says so:
+ *   - HELIOS_NVRM_ST_TRANSPORT_RESET (EVENT_REGISTER on a failed transport), or
+ *   - `epoch` differs from the one QUERY_CAPS gave at init. The epoch is the
+ *     transport instance's generation: it changes at every StartDevice, and
+ *     reads 0 when there is no transport at all (a live one is never 0). Every
+ *     handle, mapping, pin and event of the earlier generation is gone, so the
+ *     process must reopen; a client that cannot (librmclient) treats the device
+ *     as lost for good.
+ * The header is valid whenever the escape's NTSTATUS was success (the KMD writes
+ * `epoch` on every success return, including a nonzero `status`). */
+static inline int helios_nvrm_reply_is_lost(uint64_t init_epoch, const HeliosNvrmHeader *h) {
+  return h->status == HELIOS_NVRM_ST_TRANSPORT_RESET || h->epoch != init_epoch;
+}
+
+/* NTSTATUS values of a failed escape that mean the device is gone, not that the
+ * request was bad: STATUS_DEVICE_NOT_READY (EVENT_REGISTER / UNREGISTER with no
+ * transport) and STATUS_DEVICE_REMOVED (the adapter was removed). */
+static inline int helios_nvrm_ntstatus_is_lost(int32_t ntstatus) {
+  const uint32_t s = (uint32_t)ntstatus;
+  return s == 0xC00000A3u || s == 0xC00002B6u;
 }
 
 #ifdef __cplusplus

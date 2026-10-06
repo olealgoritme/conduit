@@ -1,0 +1,272 @@
+From 655fd20370bcbb78980779ff83a9062096c175ed Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 14:20:12 +0200
+Subject: [PATCH] nvk/rm: a device whose KMD went away touches none of its
+ mappings
+
+On Windows the Helios KMD maps RM memory into the process itself (USERD,
+the GPFIFO ring and push slots, notifiers, semaphores, BAR memory). When it
+stops under a live process (a live driver update, a device restart) it
+unmaps those views, and the next store faulted: an NVK process died in
+nvkmd_rm_exec_ctx_flush writing GP_PUT into USERD at a device restart.
+
+librmclient now registers every such view in the KMD-view loss table it
+shares with the Venus ICD and the Helios UMD (Conduit
+guest/windows/umd_common/bridge/helios_kmdmap.h): a vanished view reads as
+zero pages instead of faulting, and the process's loss epoch moves
+(crm_win_loss_epoch, optional; an older librmclient has none).
+
+The device records that epoch when it is created and is lost once it
+moves: flush, exec, wait, signal and sync on an exec context, every CPU wait
+step, and CPU signal/get_value of a sync then return VK_ERROR_DEVICE_LOST
+before touching any mapping, and new syncs on a lost device are CPU-only.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      | 24 +++++++++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c  | 46 +++++++++++++++++++--
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c  |  8 ++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c  |  1 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c | 13 ++++++
+ 5 files changed, 89 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 47d7e44..5a96fb5 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -136,6 +136,12 @@ struct nvkmd_rm_lib {
+    int (*win_scanout_wait_released)(uint32_t handle, uint64_t seq,
+                                     uint32_t timeout_ms,
+                                     uint64_t *released_seq);
++   /* The process's device-loss epoch (librmclient's KMD-view loss table,
++    * Conduit guest/windows/umd_common/bridge/helios_kmdmap.h): it moves when
++    * the KMD went away under this process (a live driver update, a device
++    * restart).  NULL with an older library.
++    */
++   int32_t (*win_loss_epoch)(void);
+ };
+ 
+ /* Returns NULL if librmclient cannot be loaded */
+@@ -277,6 +283,11 @@ struct nvkmd_rm_dev {
+    /* Map coherent host-visible system memory GPU-cacheable */
+    bool sysmem_cached;
+ 
++   /* lib->win_loss_epoch() when the device was created; see
++    * nvkmd_rm_dev_lost()
++    */
++   int32_t loss_epoch;
++
+    simple_mtx_t heap_mutex;
+    struct util_vma_heap heap;
+    struct util_vma_heap replay_heap;
+@@ -298,6 +309,19 @@ struct nvkmd_rm_dev {
+ 
+ NVKMD_DECL_SUBCLASS(dev, rm);
+ 
++/* The KMD behind this device went away (Windows: librmclient's loss epoch
++ * moved since the device was created).  The KMD unmapped its views of our
++ * memory then (USERD, the GPFIFO ring, semaphores, BAR mappings), so nothing
++ * may touch them any more, and everything reports VK_ERROR_DEVICE_LOST.  A
++ * device created after the KMD came back is not lost.
++ */
++static inline bool
++nvkmd_rm_dev_lost(const struct nvkmd_rm_dev *dev)
++{
++   return dev->lib->win_loss_epoch != NULL &&
++          dev->lib->win_loss_epoch() != dev->loss_epoch;
++}
++
+ VkResult nvkmd_rm_create_dev(struct nvkmd_pdev *pdev,
+                              struct vk_object_base *log_obj,
+                              struct nvkmd_dev **dev_out);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index da286da..1f22d40 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -137,10 +137,25 @@ host_mthd_incr(uint32_t mthd, uint32_t count)
+    return (1u << 29) | (count << 16) | (0u << 13) | (mthd >> 2);
+ }
+ 
++/* Every entry point that touches the ring, USERD, the push slots, the
++ * notifiers or a semaphore checks this first: they are all KMD views. */
++static VkResult
++check_lost(struct nvkmd_rm_exec_ctx *ctx, struct vk_object_base *log_obj)
++{
++   if (likely(!nvkmd_rm_dev_lost(nvkmd_rm_dev(ctx->base.dev))))
++      return VK_SUCCESS;
++   return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST,
++                    "RM: the device went away (KMD stopped or restarted)");
++}
++
+ static VkResult
+ check_channel_error(struct nvkmd_rm_exec_ctx *ctx,
+                     struct vk_object_base *log_obj)
+ {
++   VkResult lost = check_lost(ctx, log_obj);
++   if (lost != VK_SUCCESS)
++      return lost;
++
+    const uint16_t status =
+       ctx->notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR].status;
+    if (likely(status == 0))
+@@ -170,6 +185,10 @@ ring_free(struct nvkmd_rm_exec_ctx *ctx)
+ static VkResult
+ wait_ring_space(struct nvkmd_rm_exec_ctx *ctx, struct vk_object_base *log_obj)
+ {
++   VkResult lost = check_lost(ctx, log_obj);
++   if (lost != VK_SUCCESS)
++      return lost;
++
+    if (ring_free(ctx) >= 2)
+       return VK_SUCCESS;
+ 
+@@ -344,7 +363,14 @@ nvkmd_rm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+    struct nvkmd_rm_exec_ctx *ctx = nvkmd_rm_exec_ctx(_ctx);
+    struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_ctx->dev);
+ 
+-   VkResult result = emit_pending_waits(ctx, log_obj);
++   /* GP_PUT goes into USERD and the token into the doorbell, both KMD
++    * views (an NVK process died here, writing GP_PUT, at a device restart).
++    */
++   VkResult result = check_lost(ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result = emit_pending_waits(ctx, log_obj);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -402,7 +428,11 @@ nvkmd_rm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+ {
+    struct nvkmd_rm_exec_ctx *ctx = nvkmd_rm_exec_ctx(_ctx);
+ 
+-   VkResult result = emit_pending_waits(ctx, log_obj);
++   VkResult result = check_lost(ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result = emit_pending_waits(ctx, log_obj);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -434,6 +464,10 @@ nvkmd_rm_exec_ctx_wait(struct nvkmd_ctx *_ctx,
+ {
+    struct nvkmd_rm_exec_ctx *ctx = nvkmd_rm_exec_ctx(_ctx);
+ 
++   VkResult lost = check_lost(ctx, log_obj);
++   if (lost != VK_SUCCESS)
++      return lost;
++
+    for (uint32_t i = 0; i < wait_count; i++) {
+       struct nvkmd_rm_sync *sync = nvkmd_rm_sync(waits[i].sync);
+       const uint64_t value = waits[i].wait_value;
+@@ -514,7 +548,9 @@ nvkmd_rm_exec_ctx_signal(struct nvkmd_ctx *_ctx,
+                          const struct vk_sync_signal *signals)
+ {
+    struct nvkmd_rm_exec_ctx *ctx = nvkmd_rm_exec_ctx(_ctx);
+-   VkResult result;
++   VkResult result = check_lost(ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
+ 
+    for (uint32_t i = 0; i < signal_count; i++) {
+       const struct nvkmd_rm_sync *sync = nvkmd_rm_sync(signals[i].sync);
+@@ -571,6 +607,10 @@ nvkmd_rm_exec_ctx_sync(struct nvkmd_ctx *_ctx,
+    struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_ctx->dev);
+    VkResult result;
+ 
++   result = check_lost(ctx, log_obj);
++   if (result != VK_SUCCESS)
++      return result;
++
+    const struct nvkmd_rm_sem_op op = {
+       .gpu_va = ctx->ctx_sema_va,
+       .value = ++ctx->ctx_seqno,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+index f0f4621..2faf259 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_dev.c
+@@ -121,6 +121,7 @@ nvkmd_rm_create_dev(struct nvkmd_pdev *_pdev,
+    dev->base.va_start = NVKMD_RM_HEAP_START;
+    dev->base.va_end = NVKMD_RM_REPLAY_HEAP_END;
+    dev->lib = lib;
++   dev->loss_epoch = lib->win_loss_epoch != NULL ? lib->win_loss_epoch() : 0;
+    dev->nonstall_fd = -1;
+    dev->drm_fd = -1;
+ #ifdef _WIN32
+@@ -340,6 +341,11 @@ VkResult
+ nvkmd_rm_wait_step(struct nvkmd_rm_dev *dev, uint32_t *iter,
+                    uint64_t abs_timeout_ns)
+ {
++   /* Nothing will ever signal on a lost device, and every CPU wait polls
++    * memory the KMD may have unmapped. */
++   if (dev != NULL && nvkmd_rm_dev_lost(dev))
++      return VK_ERROR_DEVICE_LOST;
++
+    const uint64_t now = os_time_get_nano();
+    if (now >= abs_timeout_ns)
+       return VK_TIMEOUT;
+@@ -394,6 +400,8 @@ nvkmd_rm_wait_value(struct nvkmd_rm_dev *dev,
+ {
+    uint32_t iter = 0;
+    while (true) {
++      if (dev != NULL && nvkmd_rm_dev_lost(dev))
++         return VK_ERROR_DEVICE_LOST;
+       if (p_atomic_read(value) >= wait_value)
+          return VK_SUCCESS;
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index 5ec98af..71699ba 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -362,6 +362,7 @@ nvkmd_rm_lib_load(void)
+    LOAD(win_import_rm_planes,   "crm_win_import_rm_planes",   false);
+    LOAD(win_scanout_status,         "crm_win_scanout_status",         false);
+    LOAD(win_scanout_wait_released,  "crm_win_scanout_wait_released",  false);
++   LOAD(win_loss_epoch,             "crm_win_loss_epoch",             false);
+ 
+    LOAD(event_wait,   "crm_event_wait",   false);
+    LOAD(alloc_pages,  "crm_alloc_pages",  false);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+index 2544f43..eae5873 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_sync.c
+@@ -139,6 +139,10 @@ nvkmd_rm_sync_init(struct vk_device *device,
+    struct nvkmd_rm_sync *sync = nvkmd_rm_sync(_sync);
+    struct nvkmd_rm_dev *dev = vk_device_to_rm_dev(device);
+ 
++   /* A lost device's semaphore pool is KMD views that may be gone: CPU-only */
++   if (dev != NULL && nvkmd_rm_dev_lost(dev))
++      dev = NULL;
++
+    if (dev != NULL) {
+       VkResult result = nvkmd_rm_sema_pool_alloc(dev, &device->base,
+                                                  &sync->slot, &sync->value,
+@@ -174,6 +178,9 @@ nvkmd_rm_sync_signal(struct vk_device *device, struct vk_sync *_sync,
+ {
+    struct nvkmd_rm_sync *sync = nvkmd_rm_sync(_sync);
+ 
++   if (sync->dev != NULL && nvkmd_rm_dev_lost(sync->dev))
++      return VK_ERROR_DEVICE_LOST;
++
+    nvkmd_rm_sync_mark_pending(sync, value);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    *sync->value = value;
+@@ -187,6 +194,9 @@ nvkmd_rm_sync_get_value(struct vk_device *device, struct vk_sync *_sync,
+ {
+    struct nvkmd_rm_sync *sync = nvkmd_rm_sync(_sync);
+ 
++   if (sync->dev != NULL && nvkmd_rm_dev_lost(sync->dev))
++      return VK_ERROR_DEVICE_LOST;
++
+    *value = p_atomic_read(sync->value);
+ 
+    return VK_SUCCESS;
+@@ -215,6 +225,9 @@ nvkmd_rm_sync_wait_many(struct vk_device *device,
+    uint32_t iter = 0;
+ 
+    while (true) {
++      if (dev != NULL && nvkmd_rm_dev_lost(dev))
++         return VK_ERROR_DEVICE_LOST;
++
+       bool all = true, any = false;
+       for (uint32_t i = 0; i < wait_count; i++) {
+          if (wait_satisfied(&waits[i], wait_flags))

@@ -93,6 +93,21 @@ pub unsafe fn map_io_pages_to_user(
     size: u64,
     cache: _MEMORY_CACHING_TYPE::Type,
 ) -> Option<(u64, PMDL)> {
+    map_io_pages_to_user_prot(gpa, size, cache, false)
+}
+
+/// [`map_io_pages_to_user`], read-only when `read_only` (the view is created with
+/// `MDL_MAPPING_NO_WRITE`, so a store from the process faults instead of reaching
+/// the device).
+///
+/// # Safety
+/// As [`map_io_pages_to_user`].
+pub unsafe fn map_io_pages_to_user_prot(
+    gpa: u64,
+    size: u64,
+    cache: _MEMORY_CACHING_TYPE::Type,
+    read_only: bool,
+) -> Option<(u64, PMDL)> {
     // SAFETY: VirtualAddress = NULL is valid for a manually-populated MDL; Length is
     // page-aligned so the PFN-array span is exactly `size >> PAGE_SHIFT`.
     let mdl = IoAllocateMdl(
@@ -116,7 +131,10 @@ pub unsafe fn map_io_pages_to_user(
         // SAFETY: `pfns[0..pages]` is the freshly-allocated PFN array.
         *pfns.add(i) = pfn0 + i as u64;
     }
-    let priority = NORMAL_PAGE_PRIORITY | MDL_MAPPING_NO_EXECUTE;
+    let mut priority = NORMAL_PAGE_PRIORITY | MDL_MAPPING_NO_EXECUTE;
+    if read_only {
+        priority |= MDL_MAPPING_NO_WRITE;
+    }
     // SAFETY: `mdl` is a valid, populated, locked MDL; maps into the current (user)
     // process. The shim catches the UserMode failure raise and returns NULL.
     let va = helios_mm_map_locked_pages_user_seh(mdl, USER_MODE, cache as i32, priority);

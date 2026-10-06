@@ -28,6 +28,7 @@ pub(super) fn round_up_page(size: u64) -> u64 {
 ///
 /// Runs at PASSIVE_LEVEL during StartDevice, after `set_virtio` installs the
 /// transport (all round-trips ride `virtio::ctrl`'s PASSIVE waits).
+#[inline(never)]
 pub fn allocate_host_visible_blob(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -406,7 +407,7 @@ impl VenusInstance {
         diag(0x0008);
 
         // ── 7. vkCreateDevice — one queue, family 0, priority 1.0 ─────────────
-        let device_id = self.create_device_with_ext_ladder(adapter)?;
+        let (device_id, modifier_import_device) = self.create_device_with_ext_ladder(adapter)?;
         diag(0x0009);
 
         let queue_id = self.get_device_queue(adapter, device_id)?;
@@ -417,6 +418,7 @@ impl VenusInstance {
             probe_pending: None,
             scanout_copy_last_fence: 0,
             device_id,
+            modifier_import_device,
             queue_id,
             memory_type_index,
             memory_type_flags,
@@ -433,10 +435,24 @@ impl VenusInstance {
             present_buffers_high_water: 0,
             present_blits_high_water: 0,
             owned_memory_blobs: Vec::with_capacity(MAX_OWNED_MEMORY_BLOBS),
+            rm_blt_stage: None,
+            rm_blt_stage_allocs: 0,
         })
     }
 
-    /// The CreateDevice extension ladder: export-trio → none.
+    /// The CreateDevice extension ladder: export-trio + modifier → export-trio
+    /// → none. Returns the device and whether it got the modifier extension.
+    ///
+    /// Tier 0 (export trio plus `VK_EXT_image_drm_format_modifier`) is the one
+    /// device a foreign (NVK-on-RM) resource can be imported on. It is tried first
+    /// ONLY when `ForeignCopy` (default off; set 1) allows it, the adapter is the display
+    /// half, and the host serves `IMPORT_RM` (so a foreign resource can exist at
+    /// all); on every other configuration the ladder starts exactly where it did
+    /// before this tier existed, and the device is byte-for-byte the same one. A
+    /// host that refuses the extension steps down to tier 1 and the foreign copy
+    /// path is merely unavailable (`FcNoExt` at use, `FcDevX` 0 now); it is never
+    /// a bring-up failure. See the 38th-session note inside for why the
+    /// extension is not simply always on.
     ///
     /// The proven scanout/export shape (`/tmp/vk-dmabuf-scanout.c`, the CachyOS
     /// NVIDIA egl-headless success) needs only the external-memory + DMA_BUF
@@ -460,11 +476,22 @@ impl VenusInstance {
     pub(super) fn create_device_with_ext_ladder(
         &mut self,
         adapter: &AdapterContext,
-    ) -> Result<VkDeviceId, VirtioError> {
+    ) -> Result<(VkDeviceId, bool), VirtioError> {
         const EXT_EXPORT: [&[u8]; 3] = [
             b"VK_KHR_external_memory\0",
             b"VK_KHR_external_memory_fd\0",
             b"VK_EXT_external_memory_dma_buf\0",
+        ];
+        // Tier 0: the trio plus the one extension an explicit-modifier import
+        // needs. Deliberately NOT `VK_KHR_image_format_list`: the foreign import
+        // does not use a format list, the host spike (c6fab91) imported with
+        // exactly these four, and the list is the other half of the 38th
+        // session's set.
+        const EXT_EXPORT_MODIFIER: [&[u8]; 4] = [
+            b"VK_KHR_external_memory\0",
+            b"VK_KHR_external_memory_fd\0",
+            b"VK_EXT_external_memory_dma_buf\0",
+            helios_kmd_logic::foreign_copy::EXT_IMAGE_DRM_FORMAT_MODIFIER,
         ];
         // ⚠ THE MODIFIER TIER IS GONE, AND THAT IS THE POINT (T6/R901).
         // `EXT_FULL` additionally requested `VK_KHR_image_format_list` and
@@ -481,6 +508,21 @@ impl VenusInstance {
         // Production DisplayHalf needs only the export trio for its dedicated
         // plain LINEAR DMA_BUF image.
         let want_scanout_exts = self.ring.ctx_id != 0 && adapter.display_half();
+        // The modifier tier is the ONE departure from the 38th-session rule above,
+        // and it is scoped to where it has a use: a host that serves IMPORT_RM
+        // (the only way a foreign resource exists) on the display half, with the
+        // `ForeignCopy` knob turned on (default off). Everywhere else `want_modifier` is
+        // false and the ladder is the one it was. If enabling the extension ever
+        // shows the old symptoms (undersized-import refusals on ordinary shared
+        // images, DWM failures), `ForeignCopy=0` + restart removes it.
+        let want_modifier = want_scanout_exts
+            && helios_kmd_logic::foreign_copy::modifier_tier_wanted(
+                adapter.knobs().foreign_copy,
+                adapter.display_half(),
+                crate::virtio::foreign::rm_import_served(adapter),
+            );
+        crate::diag::record_named_bytes(b"FcDevWant", want_modifier as u32);
+        crate::diag::record_named_bytes(b"FcDevX", 0);
         // Clear the knock-down VkResult so a clean first-tier success leaves it
         // 0 and a prior boot's value can't be mistaken for this boot's (names
         // persist across boots).
@@ -488,9 +530,11 @@ impl VenusInstance {
         // Tier 1 = export-only, 2 = none. Render-only starts at 2, exactly the
         // old no-ext behaviour. Tier numbering is UNCHANGED so `SdgDevX` keeps
         // its meaning across the deletion: a DisplayHalf boot still reads 1.
-        let mut ext_tier: u32 = if want_scanout_exts { 1 } else { 2 };
+        let mut ext_tier: u32 =
+            helios_kmd_logic::foreign_copy::ladder_start_tier(want_scanout_exts, want_modifier);
         loop {
             let exts: &[&[u8]] = match ext_tier {
+                0 => &EXT_EXPORT_MODIFIER,
                 1 => &EXT_EXPORT,
                 _ => &[],
             };
@@ -550,7 +594,9 @@ impl VenusInstance {
                 // scanout can't work and SdgLImg/SdgLMem will show the
                 // rejection downstream.
                 crate::diag::record_named_bytes(b"SdgDevX", ext_tier);
-                return Ok(device_id);
+                // 1 = the foreign copy path exists on this device.
+                crate::diag::record_named_bytes(b"FcDevX", (ext_tier == 0) as u32);
+                return Ok((device_id, ext_tier == 0));
             }
             // Record the VkResult that knocked this tier down before stepping.
             crate::diag::record_named_bytes(b"SdgDevR", result as u32);

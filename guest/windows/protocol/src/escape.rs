@@ -165,6 +165,70 @@ pub struct HeliosEscapeSubmitVenus {
     pub present_value32: u32,
 }
 
+/// Several `SUBMIT_VENUS` submissions in ONE escape. Each entry is exactly what
+/// one [`HELIOS_ESCAPE_SUBMIT_VENUS`] would have carried, and the KMD runs them
+/// in entry order, each as its own fenced SUBMIT_3D with its own wire fence id —
+/// ordering and fence semantics are those of N consecutive single escapes; only
+/// the user→kernel transition (a WoW64 thunk plus dxgkrnl) is paid once.
+///
+/// Buffer layout (`PrivateDriverDataSize` covers all of it; `hdr.size` is the
+/// head plus the entry table, as for SUBMIT_VENUS the streams ride beyond it):
+///
+/// ```text
+/// +0                         HeliosEscapeSubmitVenusBatch       (24 bytes)
+/// +24                        HeliosSubmitBatchEntry[count]      (32 bytes each)
+/// +24 + 32*count             stream 0 | stream 1 | ...          (sum buffer_size)
+/// ```
+///
+/// `count == 0` is a capability probe: an up-to-date KMD answers STATUS_SUCCESS
+/// and does nothing, an older one rejects the unknown verb.
+///
+/// The whole request is validated before anything is submitted (every
+/// `buffer_size` nonzero, the sizes sum to no more than the bytes supplied,
+/// `count <= HELIOS_SUBMIT_BATCH_MAX_ENTRIES`); a malformed one fails with
+/// STATUS_INVALID_PARAMETER and submits nothing. After that each entry reports
+/// its own result in `out_status`; the escape itself returns STATUS_SUCCESS. The
+/// first entry the transport refuses stops the batch: its `out_status` is the
+/// NTSTATUS of the refusal and every later entry reads `STATUS_CANCELLED`
+/// (nothing of it was submitted), so the caller never sees a gap.
+pub const HELIOS_ESCAPE_SUBMIT_VENUS_BATCH: u32 = 0x0017;
+/// Most entries one batch escape may carry.
+pub const HELIOS_SUBMIT_BATCH_MAX_ENTRIES: u32 = 64;
+
+/// Head of `HELIOS_ESCAPE_SUBMIT_VENUS_BATCH`. 24 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeSubmitVenusBatch {
+    pub hdr: HeliosEscapeHeader,
+    /// in: entries following the head (0 = capability probe).
+    pub count: u32,
+    /// in: zero (reserved).
+    pub flags: u32,
+}
+
+/// One submission of a batch. 32 bytes; field meanings as in
+/// [`HeliosEscapeSubmitVenus`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosSubmitBatchEntry {
+    /// in: present-stream cookie when `present_value32 != 0`, otherwise ignored.
+    /// out: the KMD-assigned wire fence id (wait on THIS value).
+    pub fence_id: u64,
+    pub ctx_id: u32,
+    pub ring_idx: u32,
+    /// in: bytes of this entry's Venus stream within the stream area.
+    pub buffer_size: u32,
+    /// in: zero for an ordinary submit, nonzero for present-stream work.
+    pub present_value32: u32,
+    /// out: 0 on success, otherwise the NTSTATUS (see the module docs above).
+    pub out_status: i32,
+    /// in: zero.
+    pub reserved: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<HeliosEscapeSubmitVenusBatch>() == 24);
+const _: () = assert!(core::mem::size_of::<HeliosSubmitBatchEntry>() == 32);
+
 /// `HELIOS_ESCAPE_PRESENT_STREAM` operations.
 pub const HELIOS_PRESENT_STREAM_OP_REGISTER: u32 = 1;
 pub const HELIOS_PRESENT_STREAM_OP_UNREGISTER: u32 = 2;
@@ -567,6 +631,10 @@ pub const HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM: u32 = 1 << 2;
 pub const HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT: u32 = 1 << 3;
 /// SNAPSHOT_STATUS includes deferred WindowedBlt CPU mirrors and context stashes.
 pub const HELIOS_SCANOUT_CAP_SNAPSHOT_STATUS: u32 = 1 << 4;
+/// The KMD honours the flush gate record (`HEFL`, `crate::flush_gate`): a tiny render
+/// packet from the D3D11 `pfnFlush` whose WDDM fence retires on a registered stream
+/// point (or the legacy wire prefix). The UMD must never send it without this bit.
+pub const HELIOS_SCANOUT_CAP_FLUSH_GATE: u32 = 1 << 5;
 
 /// out_state values for the two D4a escapes.
 pub const HELIOS_SCANOUT_ACQ_OK: u32 = 0;

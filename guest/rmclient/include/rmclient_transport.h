@@ -202,6 +202,126 @@ int crm_win_scanout_present(uint32_t handle, uint32_t gem, uint64_t *seq);
 /* Give scanout 0 back; handle 0 = whatever source this process holds. */
 int crm_win_scanout_release(uint32_t handle);
 
+/*
+ * Helios extras for presenting through a WDDM allocation (guest/windows/docs/
+ * zero-copy-present.md, dxvk-on-nvk.md S3). Same D3DKMT device as the RM
+ * escapes, so the DRM file, the holder context and the import share an owner.
+ */
+/* LUID of the Helios adapter this transport talks to. */
+int crm_win_adapter_luid(uint32_t *low, int32_t *high);
+/* A Venus context of this device: the holder IMPORT_RM attaches resources to. */
+int crm_win_venus_ctx_create(uint32_t *ctx_id);
+void crm_win_venus_ctx_destroy(uint32_t ctx_id);
+/* RELEASE_BLOB: drop an imported resource no WDDM allocation adopted. */
+int crm_win_release_blob(uint32_t ctx_id, uint32_t resource_id);
+/* HELIOS_ESCAPE_FOREIGN_RESOURCE QUERY_CAPS: *caps_flags bit 0 = IMPORT_RM
+ * served. -ENOSYS from a KMD without the verb. */
+int crm_win_foreign_caps(uint32_t *caps_flags);
+struct crm_foreign_import {
+    uint32_t ctx_id;     /* from crm_win_venus_ctx_create */
+    uint32_t rm_handle;  /* fd from crm_win_open_device(CRM_WIN_DEV_DRI_BASE + n) */
+    uint32_t gem_handle; /* GEM handle in that file */
+    uint32_t fourcc;     /* DRM_FORMAT_{XRGB,ARGB,XBGR,ABGR}8888 */
+    uint64_t size;       /* bytes of the exported object, page multiple */
+    uint64_t modifier;   /* DRM_FORMAT_MOD_LINEAR or 0x0300000000606010 | h */
+    uint32_t width, height;
+    uint32_t stride;     /* plane 0 row pitch, bytes */
+    uint32_t offset;     /* plane 0 offset, bytes */
+};
+/* IMPORT_RM with layout: the KMD mints a resource id. -ENOSYS when the gate is
+ * closed (no CAP_RM_IMPORT), -EBADF / -ESRCH for the handle / context, -EINVAL
+ * for a layout the KMD refuses, -EIO for a host refusal (*host_errno). */
+int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id,
+                      uint32_t *host_errno);
+/* Plane 1 of a two-plane format (NV12/P010/P016), guest/windows/docs/
+ * shared-formats.md: its own modifier, pitch and offset. */
+struct crm_foreign_plane {
+    uint64_t modifier;
+    uint32_t stride;
+    uint32_t offset;
+};
+/* IMPORT_RM for any format of the shared-format table (KMD QUERY_CAPS bit 3,
+ * HELIOS_FOREIGN_CAP_LAYOUT_FORMATS): `plane1` NULL sends the 104-byte request
+ * crm_win_import_rm sends, otherwise the 120-byte one with the PLANE1 flag.
+ * Errors as crm_win_import_rm; an older KMD refuses a non-32 bpp fourcc or the
+ * PLANE1 flag with -EINVAL. */
+int crm_win_import_rm_planes(const struct crm_foreign_import *in,
+                             const struct crm_foreign_plane *plane1,
+                             uint32_t *resource_id, uint32_t *host_errno);
+
+/*
+ * RM fences (KMD 22.22.311+, guest/windows/docs/rm-fence-marker.md, docs/SYNC.md).
+ * A semaphore-surface fence context on render node drm_fd imports RM
+ * NV_SEMAPHORE_SURFACE h_semsurf (of RM client h_client, `size` bytes of
+ * semaphore memory) at slot `index`; a fence is a backend handle that fires
+ * once when that slot reaches wait_value, or after timeout_ms (at most 5000,
+ * nvidia-drm's cap) with an error the caller cannot see: re-check the value.
+ * Close a fence with crm_win_close_device unless SCANOUT_PRESENT took it.
+ */
+/* QUERY_CAPS: supported_ops (bits 32..63: HELIOS_NVRM_CAP_*, bit 32 = scanout
+ * fences) and the host's device_features (bit 11 = NVGPU_CFG_DRM_FENCES). */
+#define CRM_WIN_CAP_SCANOUT_FENCE (1ull << 32)
+#define CRM_WIN_CAP_PRESENT_FENCE (1ull << 33)
+int crm_win_caps(uint64_t *supported_ops, uint32_t *device_features);
+/* SEMSURF_FENCE_CTX_CREATE: *ctx is a GEM handle of drm_fd. -ENOSYS when the
+ * host has no DRM fences (feature bit 11). */
+int crm_win_semsurf_ctx_create(int drm_fd, uint32_t h_client, uint32_t h_semsurf,
+                               uint64_t size, uint64_t index, uint32_t *ctx);
+/* SEMSURF_FENCE_CREATE: *fence > 0 is a backend handle this device owns. */
+int crm_win_semsurf_fence_create(int drm_fd, uint32_t ctx, uint64_t wait_value,
+                                 uint32_t timeout_ms, int *fence);
+/* Block until the fence fired: 1, 0 on timeout, or a negative errno. */
+int crm_win_fence_wait(int fence, uint32_t timeout_ms);
+/* SCANOUT_PRESENT with HELIOS_NVRM_SCANOUT_PRESENT_FLAG_RM_FENCE: the KMD sends
+ * the flip when the fence fires and returns at once. On 0 the KMD OWNS the
+ * fence (never close, wait on or reuse it). Any error leaves it the caller's:
+ * -ENOSYS without CRM_WIN_CAP_SCANOUT_FENCE, -EAGAIN when 8 presents already
+ * wait (QUEUE_FULL), -EALREADY when it is attached, -ENOENT when the source is
+ * gone, otherwise the KMD status as an errno. */
+int crm_win_scanout_present_fenced(uint32_t handle, uint32_t gem, int fence, uint64_t *seq);
+
+/* HELIOS_ESCAPE_FOREIGN_RESOURCE RM_RESOURCE_IMPORT (op 3; KMD 22.22.313+ and a
+ * backend that serves RmResourceImport, guest/windows/docs/shared-surfaces.md):
+ * the memory behind resource `resource_id` (another process's shared surface
+ * this process opened, or one this device imported) becomes a GEM handle of
+ * the DRM file `rm_handle` (from crm_win_open_device). The caller imports it
+ * into its own RM client (DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY,
+ * OS_UNIX_IMPORT_OBJECT_FROM_FD) and closes it. *flags bit 0: *modifier is the
+ * host's. -ENOSYS without the op or with the gate closed, -EBADF for a file or resource the
+ * caller may not name, -EINVAL for zero ids, -EIO otherwise (*host_errno). */
+#define CRM_RM_IMPORT_MODIFIER_VALID 1u
+int crm_win_rm_resource_import(uint32_t rm_handle, uint32_t resource_id, uint32_t *gem_handle,
+                               uint64_t *size, uint64_t *modifier, uint32_t *flags,
+                               uint32_t *host_errno);
+
+/*
+ * Buffer release (KMD 22.22.315+ on a host with NVGPU_F_SCANOUT_RELEASE,
+ * guest/windows/docs/foreign-scanout.md "Buffer release"). Rule: an image
+ * whose latest SCANOUT_PRESENT returned seq P may be written again once the
+ * released floor of its DRM handle is >= P (never true for the image on
+ * screen). QUERY_CAPS bit 35; without it both answer -ENOSYS (keep the older
+ * reuse rule).
+ */
+#define CRM_WIN_CAP_SCANOUT_RELEASE (1ull << 35)
+/* SCANOUT_STATUS: *released_seq = every flip of `handle` with seq <= it is done,
+ * *last_seq = the newest seq the KMD remembers. Either may be NULL. */
+int crm_win_scanout_status(uint32_t handle, uint64_t *released_seq, uint64_t *last_seq);
+/* Block until the floor reaches `seq` (SCANOUT_RELEASED event, registered once
+ * per process, waited on without losing a wake). 1 = released, 0 = not within
+ * timeout_ms (0 = just ask), negative errno otherwise (-ENOSYS: no release
+ * tracking; -ENODEV etc.: the transport went away). *released_seq (may be NULL)
+ * gets the last floor read. */
+int crm_win_scanout_wait_released(uint32_t handle, uint64_t seq, uint32_t timeout_ms,
+                                  uint64_t *released_seq);
+
+/* The process's device-loss epoch (Conduit guest/windows/umd_common/bridge/
+ * helios_kmdmap.h, shared with the Venus ICD and the Helios UMD). It moves
+ * once when the KMD goes away under this process (a live driver update, a
+ * device restart): from then on the KMD's views of RM memory may be unmapped
+ * (they read as zeros if touched) and every escape fails with -ENODEV. A user
+ * records it when it starts and is lost once it differs. 0 off Windows. */
+int32_t crm_win_loss_epoch(void);
+
 /* The platform default transport (what crm_open(.., NULL) uses). */
 const struct crm_transport *crm_default_transport(void);
 

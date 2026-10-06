@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 07:27:35 +0200
+Subject: [PATCH] helios: an NVK import has no producer binding to wait for
+
+heliosPresentWaitBeforeRefresh threw "imported source has no allocation
+producer binding" for every read of an imported image, and on NVK
+(S6: another NVK process's shared surface) there is never a Venus
+allocation producer. The opener's first command stream was quarantined
+and its device lost (d3d11_share nt/nt-keyed/kmt on NVK: Map
+DXGI_ERROR_DEVICE_REMOVED). On NVK the order comes from the creator's
+flush and the keyed mutex; skip the producer wait there.
+---
+ src/dxvk/dxvk_context.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/dxvk/dxvk_context.cpp b/src/dxvk/dxvk_context.cpp
+index b899da06..f7d03e43 100644
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ -9,6 +9,7 @@
+ #include "dxvk_device.h"
+ #include "dxvk_context.h"
+ #include "dxvk_helios_producer.h"
++#include "dxvk_helios_backend.h"
+ #include "dxvk_helios_wsi_ownership.h"
+ 
+ namespace dxvk {
+@@ -9828,6 +9829,12 @@ namespace dxvk {
+     if (image->info().sharing.heliosDedicatedPresentBuffer)
+       return { }; // The separate KMD reader ownership handshake orders this source.
+     auto binding = image->storage()->heliosProducer();
++    // On NVK an import is another NVK process's RM memory (S6): it never has
++    // a Venus allocation producer, and the cross-process order comes from the
++    // creator's flush (RM fence / HEFL flush gate) and the keyed mutex, not
++    // from a producer wait here.
++    if (binding == nullptr && heliosBackendNvk())
++      return { };
+     if (binding == nullptr)
+       throw DxvkError("Helios: imported source has no allocation producer binding");
+     helios_producer_snapshot snapshot = { };

@@ -52,6 +52,9 @@ pub(crate) unsafe fn execution_record(
 
 const PRESENT_FLIP_MAGIC: u32 = 0x4850_464C; // "HPFL"
 const PRESENT_FLIP_VERSION: u32 = 1;
+/// The marker of a KEEP record: same slot and layout as a flip record, `allocation` 0, only
+/// `physical_address` meaningful. See [`PresentFlipPrivate::write_keep`].
+const PRESENT_KEEP_MAGIC: u32 = 0x4850_4B50; // "HPKP"
 
 /// KMD-private flip record for the DMA-BUFFER FLIP contract.
 ///
@@ -169,6 +172,94 @@ impl PresentFlipPrivate {
         Ok(())
     }
 
+    /// Write a KEEP record in the flip slot: a DMA flip of an allocation the programming path
+    /// cannot take (a foreign or hollow one the Present skipped) still has to COMPLETE toward
+    /// dxgkrnl, and only a CRTC_VSYNC carrying the flip's `physical_address` retires it
+    /// (`helios_kmd_logic::flip_completion`). `submit_command::arm_dma_flip` takes the record and
+    /// publishes that address as a kept picture (an atomic store, legal at its DISPATCH_LEVEL);
+    /// nothing is programmed. It has its own magic, not an `allocation == 0` flip record, so
+    /// [`Self::take`] keeps refusing a zero allocation exactly as before and a keep record can
+    /// never be mistaken for a flip to program (or the reverse).
+    ///
+    /// # Safety
+    /// As [`Self::write`].
+    pub(crate) unsafe fn write_keep(
+        private_data: *mut c_void,
+        private_size: u32,
+        physical_address: u64,
+    ) -> Result<(), NTSTATUS> {
+        if private_data.is_null()
+            || (private_size as usize)
+                < PRESENT_FLIP_PRIVATE_OFFSET + core::mem::size_of::<PresentFlipPrivate>()
+        {
+            return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
+        }
+        let record = PresentFlipPrivate {
+            magic: PRESENT_KEEP_MAGIC,
+            version: PRESENT_FLIP_VERSION,
+            allocation: 0,
+            physical_address,
+            snap_resid: 0,
+            snap_width: 0,
+            snap_height: 0,
+            snap_pitch: 0,
+            snap_dxgi_format: 0,
+            snap_plane_offset: 0,
+            snap_alloc_size: 0,
+        };
+        // SAFETY: the size check above proves the record fits at its offset; unaligned as in
+        // `write`.
+        unsafe {
+            core::ptr::write_unaligned(
+                private_data
+                    .cast::<u8>()
+                    .add(PRESENT_FLIP_PRIVATE_OFFSET)
+                    .cast::<PresentFlipPrivate>(),
+                record,
+            );
+        }
+        Ok(())
+    }
+
+    /// Zero a keep record this Present wrote, when the Present then FAILED: a recycled DMA
+    /// private buffer must not replay an old address as kept (see `display::present_flip_kept`).
+    /// Only a keep record is cleared; whatever else the slot holds is left alone.
+    ///
+    /// # Safety
+    /// As [`Self::take_keep`].
+    pub(crate) unsafe fn clear_keep(private_data: *mut c_void, private_size: u32) {
+        let _ = unsafe { Self::take_keep(private_data, private_size) };
+    }
+
+    /// Take a keep record at submit time (see [`Self::write_keep`]): the flip's physical address,
+    /// or `None` when this DMA buffer carries none. One-shot like [`Self::take`]: the magic is
+    /// zeroed, so a recycled buffer cannot replay it.
+    ///
+    /// # Safety
+    /// As [`Self::take`].
+    pub(crate) unsafe fn take_keep(private_data: *mut c_void, private_size: u32) -> Option<u64> {
+        if private_data.is_null()
+            || (private_size as usize)
+                < PRESENT_FLIP_PRIVATE_OFFSET + core::mem::size_of::<PresentFlipPrivate>()
+        {
+            return None;
+        }
+        let slot = unsafe {
+            private_data
+                .cast::<u8>()
+                .add(PRESENT_FLIP_PRIVATE_OFFSET)
+                .cast::<PresentFlipPrivate>()
+        };
+        // SAFETY: size-checked above; unaligned as in `take`.
+        let record = unsafe { core::ptr::read_unaligned(slot) };
+        if record.magic != PRESENT_KEEP_MAGIC || record.version != PRESENT_FLIP_VERSION {
+            return None;
+        }
+        // SAFETY: same slot; only the magic word is written.
+        unsafe { core::ptr::write_unaligned(slot.cast::<u32>(), 0) };
+        Some(record.physical_address)
+    }
+
     /// Take a flip record at submit time, or `None` when this DMA buffer
     /// carries none. Validating BOTH magic and version means an uninitialised
     /// or BLT-only private buffer cannot be mistaken for a flip, and the read
@@ -261,6 +352,12 @@ const _: () = {
 pub(crate) static PRESENT_MARKER_WRITES: AtomicU32 = AtomicU32::new(0);
 pub(crate) static PRESENT_MARKER_LAST_FENCE: AtomicU32 = AtomicU32::new(0);
 pub(crate) static PRESENT_MARKER_LAST_SIZE: AtomicU32 = AtomicU32::new(0);
+/// Boundaries of two different streams / RM gates that met in one DMA buffer, where
+/// the later present's wait could not be kept (`PrBndDrop`): the present may be
+/// released before its producer finished. `helios_kmd_logic::rm_fence_present::
+/// merge_stream_boundaries` says when. Expected zero for a client that uses one
+/// kind of marker per context.
+pub(crate) static PRESENT_BOUNDARY_DROPPED: AtomicU32 = AtomicU32::new(0);
 
 /// KMD-private scheduler handoff for a BLT submitted while building Present.
 ///
@@ -332,6 +429,36 @@ impl PresentSubmissionPrivate {
         private_size: u32,
         gpu_fence_id: u64,
     ) -> Result<(), NTSTATUS> {
+        // SAFETY: forwarded: the same private range.
+        let merged = unsafe { Self::merge_fence_record(private_data, private_size, gpu_fence_id) }?;
+        PRESENT_MARKER_LAST_FENCE.store(merged as u32, Ordering::Relaxed);
+        PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
+        PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The flush gate's wire floor (`flush_gate::wire_floor`): [`Self::merge_fence`]
+    /// without the present-marker diagnostics. A flush is not a present, and
+    /// `PRESENT_MARKER_WRITES` / `PRESENT_MARKER_LAST_*` are what the Present path and
+    /// the private-data scan (`diagnostic_scan_present_private`) read.
+    ///
+    /// # Safety
+    /// As [`Self::merge_fence`].
+    pub(crate) unsafe fn merge_flush_fence(
+        private_data: *mut c_void,
+        private_size: u32,
+        gpu_fence_id: u64,
+    ) -> Result<(), NTSTATUS> {
+        // SAFETY: forwarded: the same private range.
+        unsafe { Self::merge_fence_record(private_data, private_size, gpu_fence_id) }.map(|_| ())
+    }
+
+    /// Write the merged record; returns the merged `gpu_fence_id`. No counters.
+    unsafe fn merge_fence_record(
+        private_data: *mut c_void,
+        private_size: u32,
+        gpu_fence_id: u64,
+    ) -> Result<u64, NTSTATUS> {
         if private_data.is_null()
             || (private_size as usize) < core::mem::size_of::<PresentSubmissionPrivate>()
         {
@@ -357,21 +484,60 @@ impl PresentSubmissionPrivate {
                 ),
             );
         }
-        PRESENT_MARKER_LAST_FENCE.store(merged as u32, Ordering::Relaxed);
-        PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
-        PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(merged)
     }
 
     /// Merge one same-context registered stream boundary into this submission.
-    /// A context owns at most one live stream, so repeated Present records can
-    /// only advance the same generation-qualified handle.  Different handles
-    /// are refused instead of being numerically compared across namespaces.
+    /// Values of one generation-qualified handle are monotonic and merge to the
+    /// larger; handles are never compared numerically across namespaces.
+    ///
+    /// A context may carry more than one handle in one DMA buffer: a registered
+    /// stream and the process's RM gate (a fenced present beside a CPU-complete
+    /// marker, or a stream present beside a fence). The merge NEVER fails the
+    /// Present for that, since by then Render has already taken the fence handle.
+    /// The rules, and why the older wait is the one kept when two real waits
+    /// collide, are `rm_fence_present::merge_stream_boundaries`; a dropped wait is
+    /// counted (`PrBndDrop`).
     pub(crate) unsafe fn merge_stream_boundary(
         private_data: *mut c_void,
         private_size: u32,
         boundary: u64,
     ) -> Result<(), NTSTATUS> {
+        // SAFETY: forwarded: the same private range.
+        let merged =
+            unsafe { Self::merge_stream_boundary_record(private_data, private_size, boundary) }?;
+        if merged.dropped {
+            PRESENT_BOUNDARY_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
+        PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The flush gate's merge: [`Self::merge_stream_boundary`] without the present
+    /// diagnostics (`PrBndDrop`, `PRESENT_MARKER_WRITES`, `PRESENT_MARKER_LAST_SIZE`),
+    /// which a flush must not move. Returns the boundary the record carries afterwards,
+    /// so the caller can tell that the buffer kept an older record's wait instead
+    /// (`flush_gate::boundary_kept`).
+    ///
+    /// # Safety
+    /// As [`Self::merge_stream_boundary`].
+    pub(crate) unsafe fn merge_flush_boundary(
+        private_data: *mut c_void,
+        private_size: u32,
+        boundary: u64,
+    ) -> Result<u64, NTSTATUS> {
+        // SAFETY: forwarded: the same private range.
+        unsafe { Self::merge_stream_boundary_record(private_data, private_size, boundary) }
+            .map(|merged| merged.boundary)
+    }
+
+    /// Write the merged record. No counters; the caller counts what it owns.
+    unsafe fn merge_stream_boundary_record(
+        private_data: *mut c_void,
+        private_size: u32,
+        boundary: u64,
+    ) -> Result<helios_kmd_logic::rm_fence_present::BoundaryMerge, NTSTATUS> {
         if private_data.is_null()
             || (private_size as usize) < core::mem::size_of::<PresentSubmissionPrivate>()
         {
@@ -380,7 +546,10 @@ impl PresentSubmissionPrivate {
         // This private record carries only the opaque tagged stream namespace;
         // a legacy wire fence must stay in `gpu_fence_id` rather than being
         // reinterpreted as a stream handle.
-        if boundary >> 63 != 1 || ((boundary >> 32) & 0x7fff_ffff) == 0 || boundary as u32 == 0 {
+        // A value of 0 is valid: a CPU-complete present (the producer's point is
+        // already reached). The tag bit keeps the encoded boundary nonzero, so a
+        // zero `old` still means "none".
+        if boundary >> 63 != 1 || ((boundary >> 32) & 0x7fff_ffff) == 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let old =
@@ -390,33 +559,25 @@ impl PresentSubmissionPrivate {
         } else {
             (0, 0, 0)
         };
-        let merged_boundary = if old_boundary == 0 || old_boundary == boundary {
-            boundary
-        } else if (old_boundary >> 63) == 1
-            && (boundary >> 63) == 1
-            && ((old_boundary >> 32) & 0x7fff_ffff) == ((boundary >> 32) & 0x7fff_ffff)
-        {
-            // Same stream handle: values are monotonic, so the later/larger
-            // value subsumes the earlier marker without crossing namespaces.
-            let value = (old_boundary as u32).max(boundary as u32);
-            (boundary & !0xffff_ffff) | value as u64
-        } else {
-            return Err(STATUS_INVALID_PARAMETER);
-        };
+        // A boundary that carries a WindowedBlt token stays (the token is valid only
+        // under it).
+        let merged = helios_kmd_logic::rm_fence_present::merge_stream_boundaries_with(
+            old_boundary,
+            boundary,
+            blt_token != 0,
+        );
         unsafe {
             core::ptr::write_unaligned(
                 private_data.cast::<PresentSubmissionPrivate>(),
                 Self::for_parts(
                     PRESENT_SUBMISSION_MAGIC,
                     gpu_fence_id,
-                    merged_boundary,
+                    merged.boundary,
                     blt_token,
                 ),
             );
         }
-        PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
-        PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(merged)
     }
 
     /// Carry a bounded WindowedBlt request token into the exact DMA submission
@@ -432,7 +593,6 @@ impl PresentSubmissionPrivate {
         if token == 0
             || boundary >> 63 != 1
             || ((boundary >> 32) & 0x7fff_ffff) == 0
-            || boundary as u32 == 0
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
@@ -448,25 +608,29 @@ impl PresentSubmissionPrivate {
         } else {
             (0, 0, 0)
         };
-        let same_stream = old_boundary == 0
-            || (old_boundary >> 63) == 1
-                && ((old_boundary >> 32) & 0x7fff_ffff) == ((boundary >> 32) & 0x7fff_ffff);
-        if !same_stream {
+        // The same handle merges as it always did. A different handle (a gate beside
+        // a stream) replaces a plain boundary of the buffer, because the request is
+        // valid only under its own boundary; only a second request of another handle
+        // cannot be carried (the caller cancels it). See `merge_blt_boundaries`.
+        let Some(merged) = helios_kmd_logic::rm_fence_present::merge_blt_boundaries(
+            old_boundary,
+            old_token,
+            boundary,
+            token,
+        ) else {
             return Err(STATUS_INVALID_PARAMETER);
-        }
-        let merged_boundary = if old_boundary == 0 || old_boundary == boundary {
-            boundary
-        } else {
-            (boundary & !0xffff_ffff) | u64::from((old_boundary as u32).max(boundary as u32))
         };
+        if merged.dropped {
+            PRESENT_BOUNDARY_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
         unsafe {
             core::ptr::write_unaligned(
                 private_data.cast::<PresentSubmissionPrivate>(),
                 Self::for_parts(
                     PRESENT_SUBMISSION_MAGIC,
                     gpu_fence_id,
-                    merged_boundary,
-                    old_token.max(token),
+                    merged.boundary,
+                    merged.token,
                 ),
             );
         }

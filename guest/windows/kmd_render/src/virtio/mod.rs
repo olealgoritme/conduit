@@ -16,9 +16,21 @@
 pub mod config;
 pub mod counters;
 pub mod ctrl;
+pub mod foreign;
+pub mod foreign_flip;
+pub mod foreign_scanout;
 pub mod gpu;
 pub mod hal;
+pub mod msi;
+pub mod nvrm;
+pub mod nvrm_harden;
+pub mod nvrm_window;
 pub mod pci_caps;
+pub mod rm_client;
+pub mod rm_foreign;
+pub mod rm_present;
+pub mod rm_resource_import;
+pub mod scanout_release;
 pub mod venus;
 
 // `gpu::CompletedBind` is deliberately NOT re-exported: its only consumer names

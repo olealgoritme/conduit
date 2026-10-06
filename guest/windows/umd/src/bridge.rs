@@ -114,7 +114,100 @@ mod ffi {
             dedicated_present_buffer: bool,
             source_image_create_info: usize,
             source_external_ownership: bool,
+            foreign: bool,
+            foreign_modifier: u64,
+            foreign_stride: u32,
+            foreign_offset: u32,
+            foreign_plane1_modifier: u64,
+            foreign_plane1_stride: u32,
+            foreign_plane1_offset: u32,
         ) -> usize;
+
+        /// The ICD backend of this device: 1 = Venus, 2 = NVK on RM
+        /// (`helios_icd_interface.h`).
+        fn icd_backend(self: &HeliosDxvkDevice) -> u32;
+        /// NVK: the KMD resource id (IMPORT_RM) of a WDDM-backed texture's
+        /// dedicated memory, its holder context and recorded layout. False when
+        /// none can be made now.
+        /// # Safety
+        /// `d3d11_resource_ptr` is a live `ID3D11Resource*`; the outputs are
+        /// live writable storage.
+        unsafe fn get_resource_foreign_identity(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+            resource_id: *mut u32,
+            ctx_id: *mut u32,
+            size: *mut u64,
+            modifier: *mut u64,
+            stride: *mut u32,
+            offset: *mut u32,
+            fourcc: *mut u32,
+            plane1_modifier: *mut u64,
+            plane1_stride: *mut u32,
+            plane1_offset: *mut u32,
+        ) -> bool;
+        /// NVK: show the texture on scanout 0 (KMD foreign scanout source).
+        /// 0 = shown. # Safety: a live `ID3D11Resource*`.
+        unsafe fn nvk_scanout_present(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize) -> i32;
+        /// NVK: give scanout 0 back to the desktop.
+        fn nvk_scanout_release(self: &HeliosDxvkDevice);
+        /// NVK: `HELIOS_ICD_CAP_*` of the ICD (0 on Venus).
+        fn nvk_icd_caps(self: &HeliosDxvkDevice) -> u32;
+        /// NVK RM fences (S4): show the texture on scanout 0 once the GPU has
+        /// finished everything submitted so far, without a CPU wait. 0 =
+        /// queued, 1 = no RM fences here (CPU wait + `nvk_scanout_present`),
+        /// negative = not shown. # Safety: a live `ID3D11Resource*`.
+        unsafe fn nvk_scanout_present_fenced(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+        ) -> i32;
+        /// NVK: the KMD's seq and source generation of the texture's latest
+        /// scanout frame (already-on-scanout present tag). False without them.
+        /// # Safety: a live `ID3D11Resource*`; both pointers live writable storage.
+        unsafe fn nvk_scanout_frame(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+            sequence: *mut u64,
+            generation: *mut u32,
+        ) -> bool;
+        /// NVK RM fences (S4): a fence for everything submitted so far, for a
+        /// WDDM present marker. 0 = `*fence_handle` is the caller's.
+        /// # Safety: both pointers are live writable storage.
+        unsafe fn nvk_present_fence(
+            self: &HeliosDxvkDevice,
+            fence_handle: *mut u32,
+            value: *mut u64,
+        ) -> i32;
+        /// NVK: close a fence the caller still owns.
+        fn nvk_rm_fence_close(self: &HeliosDxvkDevice, fence_handle: u32);
+        /// Flush gate (docs/flush-gate.md): flush, then the point the HEFL
+        /// packet carries. 0 nothing new, 1 ready, -1 unavailable, -2 failed.
+        /// # Safety: every pointer is live writable storage.
+        /// Hand-off ledger: give a shared resource its key now.
+        /// # Safety: a live `ID3D11Resource*`.
+        unsafe fn handoff_register(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize);
+        /// Hand-off ledger: the resource goes; this process lets go of its key.
+        /// # Safety: a live `ID3D11Resource*`.
+        unsafe fn handoff_unregister(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize);
+        /// Hand-off ledger: publish a point on `resources`. 0 nothing new,
+        /// 1 published, -1 unavailable/full, -2 failed.
+        /// # Safety: `resources` addresses `resource_count` live resources.
+        unsafe fn handoff_publish(
+            self: &HeliosDxvkDevice,
+            resources: *const usize,
+            resource_count: u32,
+        ) -> i32;
+        unsafe fn flush_gate_point(
+            self: &HeliosDxvkDevice,
+            mode: u32,
+            resources: *const usize,
+            resource_count: u32,
+            ctx_id: *mut u32,
+            value32: *mut u32,
+            cookie: *mut u64,
+            fence: *mut u32,
+            fence_value: *mut u64,
+        ) -> i32;
 
         /// Create a dedicated OPTIMAL, DMA_BUF-exportable image and report
         /// logical scanout metadata. `kmd_transfer_source` selects the
@@ -359,6 +452,7 @@ impl ffi::HeliosDxvkDevice {
         dedicated_present_buffer: bool,
         source_image_create_info: usize,
         source_external_ownership: bool,
+        foreign: Option<ForeignLayout>,
     ) -> Option<ID3D11Resource> {
         // SAFETY: the caller upholds the resource-id/handle preconditions
         // above, and the bridge transfers one reference on success.
@@ -380,8 +474,47 @@ impl ffi::HeliosDxvkDevice {
                 dedicated_present_buffer,
                 source_image_create_info,
                 source_external_ownership,
+                foreign.is_some(),
+                foreign.map_or(0, |f| f.modifier),
+                foreign.map_or(0, |f| f.stride),
+                foreign.map_or(0, |f| f.offset),
+                foreign.map_or(0, |f| f.plane1_modifier),
+                foreign.map_or(0, |f| f.plane1_stride),
+                foreign.map_or(0, |f| f.plane1_offset),
             ))
         }
+    }
+
+    /// The ICD under this device.
+    pub(crate) fn backend(&self) -> IcdBackend {
+        if self.icd_backend() == 2 {
+            IcdBackend::NvkRm
+        } else {
+            IcdBackend::Venus
+        }
+    }
+
+    /// NVK: the KMD resource id and layout of a WDDM-backed texture.
+    pub(crate) fn foreign_identity(&self, res: &ID3D11Resource) -> Option<ForeignIdentity> {
+        let mut id = ForeignIdentity::default();
+        // SAFETY: `res` is a live resource borrowed for the call; every output
+        // points at a field of the local `id`.
+        let ok = unsafe {
+            self.get_resource_foreign_identity(
+                res.as_raw() as usize,
+                &mut id.resource_id,
+                &mut id.ctx_id,
+                &mut id.size,
+                &mut id.layout.modifier,
+                &mut id.layout.stride,
+                &mut id.layout.offset,
+                &mut id.layout.fourcc,
+                &mut id.layout.plane1_modifier,
+                &mut id.layout.plane1_stride,
+                &mut id.layout.plane1_offset,
+            )
+        };
+        (ok && id.resource_id != 0 && id.ctx_id != 0).then_some(id)
     }
 
     /// A dedicated OPTIMAL, DMA_BUF-exportable image, plus its logical
@@ -415,6 +548,57 @@ impl ffi::HeliosDxvkDevice {
         // SAFETY: the bridge transfers one reference on success.
         unsafe { adopt_resource(raw) }.map(|r| (r, row_pitch, offset))
     }
+}
+
+/// The Vulkan ICD a device runs on (`helios_icd_interface.h`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IcdBackend {
+    Venus,
+    NvkRm,
+}
+
+/// What lies in an NVK-made (foreign) resource: plane 0, and plane 1 of a
+/// two-plane format (NV12/P010/P016), as the KMD records it
+/// (`HeliosWddmAllocLayout`, `HeliosWddmAllocPlane`; docs/shared-formats.md).
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct ForeignLayout {
+    pub(crate) modifier: u64,
+    pub(crate) stride: u32,
+    pub(crate) offset: u32,
+    pub(crate) fourcc: u32,
+    /// Plane 1; `plane1_stride` 0 for a single-plane resource.
+    pub(crate) plane1_modifier: u64,
+    pub(crate) plane1_stride: u32,
+    pub(crate) plane1_offset: u32,
+}
+
+/// `mode` of [`BridgeDevice::flush_gate_point`] (dxvk_bridge.h kFlushGate*).
+pub(crate) const FLUSH_GATE_STREAM: u32 = 0;
+pub(crate) const FLUSH_GATE_WIRE: u32 = 1;
+pub(crate) const FLUSH_GATE_RM_FENCE: u32 = 2;
+
+/// What a flush gate carries (docs/flush-gate.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlushGatePoint {
+    /// Nothing recorded since the previous gate: send no packet.
+    Nothing,
+    /// Ready: a stream point (`ctx`, `value`, `cookie`; STREAM mode), an RM
+    /// fence the caller now owns (`fence`; RM_FENCE mode), or neither (WIRE
+    /// mode: the work reached the transport).
+    Ready { ctx: u32, value: u32, cookie: u64, fence: u32, fence_value: u64 },
+    /// This mode cannot be served here: fall back.
+    Unavailable,
+    /// The command stream or submission failed.
+    Failed,
+}
+
+/// A foreign resource id minted for one texture.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct ForeignIdentity {
+    pub(crate) resource_id: u32,
+    pub(crate) ctx_id: u32,
+    pub(crate) size: u64,
+    pub(crate) layout: ForeignLayout,
 }
 
 // NOT wrapped, deliberately: the eight shader creates.
@@ -474,6 +658,29 @@ pub(crate) struct PresentStreamCorrelation {
     pub(crate) ctx_id: u32,
     pub(crate) value32: u32,
     pub(crate) cookie: u64,
+    /// NVK on RM (S4): an RM fence handle the present retires on instead of a
+    /// stream point (`helios_rm_fence.h` tail; exclusive with the three fields
+    /// above, which are then zero). 0 = none. The KMD takes the handle when
+    /// it attaches the marker.
+    pub(crate) rm_fence_handle: u32,
+    /// Diagnostic only: the timeline value behind `rm_fence_handle`.
+    pub(crate) rm_fence_value: u64,
+    /// NVK: the frame is already on scanout 0 through the user foreign-scanout
+    /// source: the `HERF` marker carries the `HOSC` tag (`helios_onscanout.h`)
+    /// so the KMD can complete the Blt present without copying. `None` = no
+    /// claim (the ordinary Blt).
+    pub(crate) on_scanout: Option<OnScanoutClaim>,
+}
+
+/// The already-on-scanout claim: the KMD's own names for the frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OnScanoutClaim {
+    /// `out_seq` of the frame's `SCANOUT_PRESENT`. Nonzero.
+    pub(crate) sequence: u64,
+    /// `out_generation` of the live source's `SCANOUT_SET`. Nonzero.
+    pub(crate) generation: u32,
+    /// Helios resource id of the presented allocation, 0 = not stated.
+    pub(crate) resource_id: u32,
 }
 
 impl PresentStreamCorrelation {
@@ -566,6 +773,7 @@ impl BridgeDevice {
         dedicated_present_buffer: bool,
         source_image_create_info: usize,
         source_external_ownership: bool,
+        foreign: Option<ForeignLayout>,
     ) -> Option<ID3D11Resource> {
         // SAFETY: the caller retains the resource and any source template
         // through the synchronous native import, which copies nested metadata.
@@ -587,7 +795,133 @@ impl BridgeDevice {
                 dedicated_present_buffer,
                 source_image_create_info,
                 source_external_ownership,
+                foreign,
             )
+        }
+    }
+
+    /// The ICD under this device (Venus when there is no bridge device).
+    pub(crate) fn backend(&self) -> IcdBackend {
+        self.get().map_or(IcdBackend::Venus, |d| d.backend())
+    }
+
+    pub(crate) fn is_nvk(&self) -> bool {
+        self.backend() == IcdBackend::NvkRm
+    }
+
+    /// NVK: the KMD resource id and layout of a WDDM-backed texture.
+    pub(crate) fn foreign_identity(&self, res: &ID3D11Resource) -> Option<ForeignIdentity> {
+        self.get()?.foreign_identity(res)
+    }
+
+    /// NVK: show `res` on scanout 0. True if shown.
+    pub(crate) fn nvk_scanout_present(&self, res: &ID3D11Resource) -> bool {
+        // SAFETY: `res` is a live resource borrowed for the call.
+        self.get()
+            .is_some_and(|d| unsafe { d.nvk_scanout_present(res.as_raw() as usize) } == 0)
+    }
+
+    pub(crate) fn nvk_scanout_release(&self) {
+        if let Some(d) = self.get() {
+            d.nvk_scanout_release();
+        }
+    }
+
+    /// NVK: `HELIOS_ICD_CAP_*` (`helios_icd_interface.h`), 0 on Venus.
+    pub(crate) fn nvk_icd_caps(&self) -> u32 {
+        self.get().map_or(0, |d| d.nvk_icd_caps())
+    }
+
+    /// NVK RM fences (S4): flip `res` once the GPU has finished everything
+    /// submitted so far, no CPU wait. `None` when RM fences cannot be had
+    /// here (the caller waits and calls [`Self::nvk_scanout_present`]);
+    /// `Some(shown)` otherwise.
+    pub(crate) fn nvk_scanout_present_fenced(&self, res: &ID3D11Resource) -> Option<bool> {
+        let d = self.get()?;
+        // SAFETY: `res` is a live resource borrowed for the call.
+        match unsafe { d.nvk_scanout_present_fenced(res.as_raw() as usize) } {
+            0 => Some(true),
+            1 => None,
+            _ => Some(false),
+        }
+    }
+
+    /// NVK: `(sequence, generation)` of `res`'s latest scanout frame, as the
+    /// KMD minted them (already-on-scanout present tag).
+    pub(crate) fn nvk_scanout_frame(&self, res: &ID3D11Resource) -> Option<(u64, u32)> {
+        let d = self.get()?;
+        let (mut seq, mut generation) = (0u64, 0u32);
+        // SAFETY: `res` is borrowed live for the call; both out-pointers borrow locals.
+        unsafe { d.nvk_scanout_frame(res.as_raw() as usize, &mut seq, &mut generation) }
+            .then_some((seq, generation))
+    }
+
+    /// NVK RM fences (S4): a fence (handle, diagnostic timeline value) for
+    /// everything submitted so far; the caller owns the handle.
+    pub(crate) fn nvk_present_fence(&self) -> Option<(u32, u64)> {
+        let d = self.get()?;
+        let (mut fence, mut value) = (0u32, 0u64);
+        // SAFETY: both out-pointers borrow live locals for this synchronous call.
+        let r = unsafe { d.nvk_present_fence(&mut fence, &mut value) };
+        (r == 0 && fence != 0).then_some((fence, value))
+    }
+
+    pub(crate) fn nvk_rm_fence_close(&self, fence: u32) {
+        if let Some(d) = self.get() {
+            d.nvk_rm_fence_close(fence);
+        }
+    }
+
+    /// Hand-off ledger: `res` (a cross-process shared resource) gets its key.
+    pub(crate) fn handoff_register(&self, res: usize) {
+        if let Some(d) = self.get() {
+            // SAFETY: the caller passes a live resource pointer.
+            unsafe { d.handoff_register(res) };
+        }
+    }
+
+    /// Hand-off ledger: `res` goes; this process stops holding its key.
+    pub(crate) fn handoff_unregister(&self, res: usize) {
+        if let Some(d) = self.get() {
+            // SAFETY: the caller passes a live resource pointer.
+            unsafe { d.handoff_unregister(res) };
+        }
+    }
+
+    /// Hand-off ledger: publish this device's next point on `resources`.
+    pub(crate) fn handoff_publish(&self, resources: &[usize]) -> i32 {
+        let Some(d) = self.get() else {
+            return -1;
+        };
+        // SAFETY: the slice borrows live resource pointers for the call.
+        unsafe { d.handoff_publish(resources.as_ptr(), resources.len() as u32) }
+    }
+
+    /// Flush gate: flush and get what the HEFL packet carries (see
+    /// [`FlushGatePoint`]). `mode` is one of `FLUSH_GATE_*`.
+    pub(crate) fn flush_gate_point(&self, mode: u32, publish: &[usize]) -> FlushGatePoint {
+        let Some(d) = self.get() else {
+            return FlushGatePoint::Unavailable;
+        };
+        let (mut ctx, mut value, mut cookie, mut fence, mut fence_value) = (0u32, 0u32, 0u64, 0u32, 0u64);
+        // SAFETY: every out-pointer borrows a live local for this synchronous call.
+        let r = unsafe {
+            d.flush_gate_point(
+                mode,
+                publish.as_ptr(),
+                publish.len() as u32,
+                &mut ctx,
+                &mut value,
+                &mut cookie,
+                &mut fence,
+                &mut fence_value,
+            )
+        };
+        match r {
+            0 => FlushGatePoint::Nothing,
+            1 => FlushGatePoint::Ready { ctx, value, cookie, fence, fence_value },
+            -1 => FlushGatePoint::Unavailable,
+            _ => FlushGatePoint::Failed,
         }
     }
 

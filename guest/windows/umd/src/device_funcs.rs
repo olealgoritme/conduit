@@ -379,6 +379,14 @@ pub struct HeliosDevice {
     /// Mutex, not RefCell: written by CreateResource/DestroyResource (any
     /// thread under FREETHREADED caps), read by the present path. Lock with
     /// `crate::forward::lock_ignore_poison`.
+    /// NVK: live cross-process shared resources (not present buffers) this
+    /// device created or opened (`pDrvPrivate` of each). While any exists,
+    /// `pfnFlush` and present wait on the CPU for NVK's submitted work
+    /// (docs/shared-surfaces.md §4): the runtime's keyed-mutex release is
+    /// ordered against our DMA buffers only, NVK's GPU work is not in them, and
+    /// the keyed mutex itself is invisible at the DDI.
+    /// `(pDrvPrivate, created here)`; an opened resource has `false`.
+    pub nvk_keyed_resources: std::sync::Mutex<Vec<(usize, bool)>>,
     pub direct_scanout_allocations:
         std::sync::Mutex<Vec<(u32, helios_protocol::HeliosPresentPrivateData)>>,
     /// Runtime corelayer handle + callbacks (pfnSetErrorCb) so VOID-returning
@@ -390,6 +398,9 @@ pub struct HeliosDevice {
     /// SAME shape (`D3D11DDIARG_CREATEDEFERREDCONTEXT`'s funcs union member is
     /// selected by the device's negotiated level).
     pub negotiated: crate::adapter::NegotiatedInterface,
+    /// Device removal when the KMD goes away under this process (see
+    /// `device_loss.rs`): the loss epoch at creation.
+    pub loss: crate::device_loss::LossWatch,
 }
 
 /// Per-deferred-context UMD state, constructed in-place in the runtime-
@@ -1265,6 +1276,46 @@ pub unsafe fn fill_wddm1_3_device_funcs(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUN
     let l1 = crate::forward::install_11_1(base, funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
     let _l13 = crate::forward::install_wddm1_3(l1, funcs);
     audit_wddm1_3_device_funcs("FillDeviceFuncs", funcs);
+}
+
+/// Fill a WDDM 2.3 device (`D3DWDDM2_2DDI_DEVICEFUNCS`, `ddi_level.rs`). The
+/// 2.2 table is the WDDM 1.3 table with retyped Flush / view / rasterizer /
+/// query slots and ten entries appended (the field-name prefix is identical,
+/// checked against the WDK 26100 header), so the 1.3 chain runs through the
+/// 1.3 view first and `install_wddm2_3` then replaces the retyped slots and
+/// fills the appended ones.
+pub unsafe fn fill_wddm2_3_device_funcs(funcs: *mut ddi::D3DWDDM2_2DDI_DEVICEFUNCS) {
+    let f = &mut *stub_fill_device_table(funcs);
+    install_calc_and_lifecycle(f);
+
+    let base = crate::forward::install(f);
+    let l1 = crate::forward::install_11_1(base, funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
+    let l13 = crate::forward::install_wddm1_3(l1, funcs as *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS);
+    let _l23 = crate::forward::install_wddm2_3(l13, funcs);
+    (*funcs).pfnRelocateDeviceFuncs = Some(ddi_relocate_device_funcs_wddm2_2);
+}
+
+unsafe extern "system" fn ddi_relocate_device_funcs_wddm2_2(
+    _h_device: ddi::D3D10DDI_HDEVICE,
+    _funcs: *mut ddi::D3DWDDM2_2DDI_DEVICEFUNCS,
+) {
+    relocate_log("WDDM2.2");
+}
+
+/// Fill the DXGI 1.6.1 base table a WDDM 2.3 device gets. Same handlers as
+/// DXGI 1.3 where the argument layout is a prefix match (Present1's
+/// `RotationHint` replaces a reserved field; OfferResources1 appends `Flags`;
+/// ReclaimResources1's result array has the same element size and 0 = OK),
+/// plus the three 1.4 entries.
+pub unsafe fn fill_dxgi_1_6_1_base_funcs(funcs: *mut ddi::DXGI1_6_1_DDI_BASE_FUNCTIONS) {
+    if funcs.is_null() {
+        return;
+    }
+    // SAFETY: the caller supplies the full negotiated DXGI table.
+    unsafe { funcs.write(ddi::DXGI1_6_1_DDI_BASE_FUNCTIONS::stubbed::<1>()) };
+    crate::forward::install_dxgi(funcs as *mut ddi::DXGI_DDI_BASE_FUNCTIONS);
+    crate::forward::install_dxgi_1_1(funcs as *mut ddi::DXGI1_1_DDI_BASE_FUNCTIONS);
+    crate::forward::install_dxgi_1_6_1(funcs);
 }
 
 /// Fill the DXGI base DDI table (presentation/resource base funcs) the runtime

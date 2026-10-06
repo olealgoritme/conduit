@@ -19,6 +19,11 @@ struct HeliosDxvkDeviceImpl;
 inline constexpr std::uint32_t kPresentOrderComplete = 0;
 inline constexpr std::uint32_t kPresentOrderSubmitted = 1;
 
+// `mode` of HeliosDxvkDevice::flush_gate_point.
+inline constexpr std::uint32_t kFlushGateStream = 0;
+inline constexpr std::uint32_t kFlushGateWire = 1;
+inline constexpr std::uint32_t kFlushGateRmFence = 2;
+
 struct HeliosDxvkDevice {
   HeliosDxvkDevice() noexcept;
   ~HeliosDxvkDevice();
@@ -84,7 +89,107 @@ struct HeliosDxvkDevice {
       bool cross_context_optimal,
       bool dedicated_present_buffer,
       std::size_t source_image_create_info,
-      bool source_external_ownership) const;
+      bool source_external_ownership,
+      bool foreign,
+      std::uint64_t foreign_modifier,
+      std::uint32_t foreign_stride,
+      std::uint32_t foreign_offset,
+      std::uint64_t foreign_plane1_modifier,
+      std::uint32_t foreign_plane1_stride,
+      std::uint32_t foreign_plane1_offset) const;
+
+  // The ICD backend this device runs on (helios_icd_interface.h's
+  // HELIOS_ICD_BACKEND_*): 1 = Venus, 2 = NVK on RM.
+  std::uint32_t icd_backend() const;
+
+  // NVK: the KMD resource id of a WDDM-backed texture's dedicated memory
+  // (IMPORT_RM through the ICD's helios_icd_interface_v2), the holder context
+  // it is attached to, and the layout the KMD recorded with it. False when the
+  // ICD cannot make one now (the KMD's IMPORT_RM gate is closed, or the image
+  // is not a 32 bpp single-plane 2D image with its own memory); the caller then
+  // gives the allocation a KMD-backed placeholder.
+  bool get_resource_foreign_identity(
+      std::size_t d3d11_resource_ptr,
+      std::uint32_t* resource_id,
+      std::uint32_t* ctx_id,
+      std::uint64_t* size,
+      std::uint64_t* modifier,
+      std::uint32_t* stride,
+      std::uint32_t* offset,
+      std::uint32_t* fourcc,
+      std::uint64_t* plane1_modifier,
+      std::uint32_t* plane1_stride,
+      std::uint32_t* plane1_offset) const noexcept;
+
+  // NVK: show the texture's image on scanout 0 through the KMD's foreign
+  // scanout source (zero copy). The caller has waited for the frame's GPU
+  // work. 0 = shown, negative = not (no scanout source, wrong image kind).
+  std::int32_t nvk_scanout_present(std::size_t d3d11_resource_ptr) const noexcept;
+  // NVK: give scanout 0 back to the desktop.
+  void nvk_scanout_release() const noexcept;
+
+  // NVK RM fences (dxvk-on-nvk S4, helios_icd_interface.h version 3). The
+  // caller has made sure the frame is SUBMITTED (present_frame_gate with
+  // kPresentOrderSubmitted), not complete.
+  //
+  // HELIOS_ICD_CAP_* of the ICD (0 on Venus).
+  std::uint32_t nvk_icd_caps() const noexcept;
+  // Show the texture on scanout 0 once the GPU has finished everything
+  // submitted so far, without waiting here: an RM fence goes with the flip
+  // (the KMD flips when it fires, or NVK's flip thread does). 0 = queued,
+  // 1 = no RM fences here (wait and nvk_scanout_present as before),
+  // negative = the frame was not shown.
+  std::int32_t nvk_scanout_present_fenced(std::size_t d3d11_resource_ptr) const noexcept;
+  // The KMD's names for the texture's latest scanout frame (SCANOUT_PRESENT
+  // out_seq, SCANOUT_SET out_generation), for the already-on-scanout present
+  // tag. False (both 0) without them (older NVK, no live KMD source).
+  bool nvk_scanout_frame(std::size_t d3d11_resource_ptr, std::uint64_t* sequence,
+                         std::uint32_t* generation) const noexcept;
+  // An RM fence for everything submitted so far, for a WDDM present marker
+  // (helios_rm_fence.h). 0 = *fence_handle is the caller's, 1 = none here.
+  std::int32_t nvk_present_fence(std::uint32_t* fence_handle,
+                                 std::uint64_t* value) const noexcept;
+  // Close a fence the caller still owns.
+  void nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept;
+
+  // Flush gate (Conduit docs/flush-gate.md): what pfnFlush's HEFL packet
+  // carries for everything recorded so far. Flushes first. `mode`:
+  //   kFlushGateStream  Venus: a point of the device's present stream,
+  //                     signalled behind all recorded work (*ctx_id,
+  //                     *value32, *cookie);
+  //   kFlushGateWire    wait until the work reached the transport (the
+  //                     submission thread), no point;
+  //   kFlushGateRmFence NVK: wait for the submission, then an RM fence for
+  //                     everything submitted (*fence becomes the caller's,
+  //                     *fence_value diagnostic).
+  // Returns 0 = nothing recorded since the previous gate (send nothing),
+  // 1 = ready, -1 = this mode is unavailable here (fall back), -2 = failed.
+  // Cross-process hand-off ledger (docs/shared-surfaces.md section 4).
+  // handoff_register: a cross-process shared resource of this device gets its
+  // ledger key (KMD resource id) now, so reads of it wait for other processes'
+  // hand-offs. handoff_publish: flush, and if work was recorded since the last
+  // hand-off, publish a point of this device on every resource in `resources`
+  // (ID3D11Resource* as size_t); the GPU's completion of the point is stored
+  // without anyone waiting. 0 = nothing new, 1 = published, -1 = ledger
+  // unavailable or full (fall back), -2 = failed.
+  void handoff_register(std::size_t d3d11_resource_ptr) const noexcept;
+  // The resource goes (DestroyResource): this process stops holding its key;
+  // the slot is freed when no process holds it.
+  void handoff_unregister(std::size_t d3d11_resource_ptr) const noexcept;
+  std::int32_t handoff_publish(const std::size_t* resources,
+                               std::uint32_t resource_count) const noexcept;
+
+  // kFlushGateStream also publishes the point on every resource in
+  // `resources` (ID3D11Resource* as size_t) that has an allocation producer
+  // binding, so an importer's read waits for it.
+  std::int32_t flush_gate_point(std::uint32_t mode,
+                                const std::size_t* resources,
+                                std::uint32_t resource_count,
+                                std::uint32_t* ctx_id,
+                                std::uint32_t* value32,
+                                std::uint64_t* cookie,
+                                std::uint32_t* fence,
+                                std::uint64_t* fence_value) const noexcept;
 
   // Create a dedicated OPTIMAL, DMA_BUF-exportable image (via the
   // D3D11_HELIOS_CREATE_INFO marker) and report logical scanout metadata for

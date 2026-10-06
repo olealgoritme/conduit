@@ -1,18 +1,32 @@
 //! ISR / DPC DDIs — the C3/M3.4 interrupt-driven used-ring drain.
 //!
-//! The virtio-gpu device is line-based INTx (`MSISupported=0`), i.e. *level*-
+//! Two delivery modes, chosen by PnP before `StartDevice` and published to the
+//! ISR as `AdapterContext::msi_state` (see `virtio::msi` and
+//! `docs/msi-interrupts.md`):
+//!
+//! * **MSI/MSI-X** (`msi_state != 0`): the device raises a message per source
+//!   (config change / used ring). There is no shared line and nothing to
+//!   acknowledge, so the ISR never touches the ISR-status register: it routes by
+//!   `MessageNumber`, latches a config change for the DPC, and queues the DPC.
+//! * **INTx** (`msi_state == 0`, the historical and fallback path, below).
+//!
+//! The INTx path: the virtio-gpu device is line-based INTx, i.e. *level*-
 //! triggered: it asserts the shared INTx line when it pushes used-ring entries
 //! and keeps it asserted until the driver reads the read-to-clear virtio
 //! ISR-status register. The ISR reads that register (deasserting the line),
 //! claims the interrupt, and queues the DPC via `DxgkCbQueueDpc`; the DPC
 //! drains the used ring under the device spinlock (`VirtioGpu::drain_used` —
-//! signaling sync/fence KEVENT waiters) and then completes every WDDM
+//! signaling sync/fence KEVENT waiters, and `drain_nvrm_events` for the event
+//! queue's `EventReady` -> RM event registrations) and then completes every WDDM
 //! submission whose venus watermark has been reached
 //! (`DXGK_INTERRUPT_DMA_COMPLETED` at DIRQL via `signal_dma_completed`).
 //!
 //! IRQL: the ISR runs at the device's DIRQL — no allocations, no spinlocks, no
-//! pageable calls; it touches only the lock-free published ISR-status VA and
-//! the saved dxgkrnl callback table. The DPC runs at DISPATCH_LEVEL.
+//! pageable calls; it touches only the lock-free published `msi_state` /
+//! ISR-status VA and the saved dxgkrnl callback table. With several messages
+//! the ISR can run concurrently on different CPUs, which is safe because it
+//! writes nothing but atomics and calls `DxgkCbQueueDpc`. The DPC runs at
+//! DISPATCH_LEVEL.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -27,6 +41,8 @@ use crate::dxgk::*;
 pub static INT_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DPC_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CONTROL_INT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Interrupts taken in message mode (a subset of `INT_ROUTINE_COUNT`).
+pub static MSI_INT_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Ask dxgkrnl to run the normal completion DPC after PASSIVE-side lifecycle
 /// code changed a WDDM wait predicate.  The caller has already preserved the
@@ -55,7 +71,21 @@ pub(crate) fn request_wddm_completion_dpc(adapter: &AdapterContext) {
 /// The bind application lives HERE rather than in `drain_used` because of the
 /// lock order — see the comment on it below.
 pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
-    let _ = adapter.with_virtio(|v| v.drain_used());
+    // The event queue's consumer rides the same lock hold: an `EventReady` becomes
+    // a `KeSetEvent` on the process's registered event (HELIOS_NVRM_OP_EVENT_*).
+    // The device raises the same INTx for either queue, so this is the one place
+    // that sees it. Allocation-free and wait-free; a no-op without the queue.
+    let fence_work = adapter
+        .with_virtio(|v| {
+            v.drain_used();
+            v.drain_nvrm_events()
+        })
+        .unwrap_or(false);
+    if fence_work {
+        // A fence a present waits on fired: the PASSIVE worker sends the flip and
+        // closes the handle (the host round trips are not DPC work).
+        adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::FENCE);
+    }
 
     // A producer completion may have made the one deferred fast bind safe.
     // Promotion and sequence minting share this virtio-lock hold, so the host
@@ -263,6 +293,8 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
                 super::submit_command::signal_dma_completed(guard, dxgkrnl, ready.fence())
             };
             if status == STATUS_SUCCESS {
+                // Flush-gate trace (atomics only; one load when no `HEFL` fence is queued).
+                super::flush_trace::note_retire(ready.fence(), ready.rebased());
                 let terminal_prefix = ready.terminal_prefix();
                 ready.delivered();
                 if let Some(prefix) = terminal_prefix {
@@ -309,7 +341,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
 // — so a nonzero `isr_status` implies a valid callback table.
 pub unsafe extern "C" fn dxgkddi_interrupt_routine(
     miniport_device_context: *mut c_void,
-    _message_number: u32,
+    message_number: u32,
 ) -> BOOLEAN {
     if miniport_device_context.is_null() {
         return 0;
@@ -317,6 +349,13 @@ pub unsafe extern "C" fn dxgkddi_interrupt_routine(
     // SAFETY: dxgkrnl passes our AdapterContext as the miniport device context;
     // it is valid for the device's lifetime and `isr_status` is an atomic.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+    // Message mode: no line to acknowledge, so the ISR-status register is not
+    // read (the virtio spec says not to once MSI-X is enabled). Published by
+    // StartDevice before the transport goes live; 0 means INTx.
+    let msi_state = adapter.msi_state.load(Ordering::Acquire);
+    if msi_state != 0 {
+        return msi_interrupt(adapter, msi_state, message_number);
+    }
     let isr_va = adapter.isr_status.load(Ordering::Acquire);
     if isr_va == 0 {
         // Transport not up yet (or torn down): not in a position to claim it.
@@ -351,6 +390,30 @@ pub unsafe extern "C" fn dxgkddi_interrupt_routine(
     1 // claimed + acknowledged (line now deasserted)
 }
 
+/// The message-signalled half of the ISR. DIRQL: atomics and `DxgkCbQueueDpc`
+/// only. Always claims (TRUE): a message is not shared, so it is ours by
+/// construction; one that arrives before the transport is live merely finds
+/// nothing to drain.
+fn msi_interrupt(adapter: &AdapterContext, msi_state: u32, message_number: u32) -> BOOLEAN {
+    use helios_kmd_logic::msi::{isr_route, IsrRoute};
+    INT_ROUTINE_COUNT.fetch_add(1, Ordering::Relaxed);
+    MSI_INT_COUNT.fetch_add(1, Ordering::Relaxed);
+    // The config-change message (vector 0 when the device has one of its own):
+    // latch it for the DPC, which wakes the HPD worker. Every other message —
+    // and the single shared one — is queue work.
+    if isr_route(msi_state, message_number) == IsrRoute::Config {
+        adapter.config_change_pending.store(1, Ordering::Release);
+    }
+    if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
+        if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
+            // SAFETY: DxgkCbQueueDpc is callable from the ISR at DIRQL;
+            // DeviceHandle is the live dxgkrnl device handle.
+            unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
+        }
+    }
+    1
+}
+
 /// `DxgkDdiDpcRoutine` — runs at DISPATCH_LEVEL after the ISR (or a
 /// `signal_dma_completed` notify pair) queues a DPC.
 pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_void) {
@@ -364,6 +427,15 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
     // A latched config-change (ISR bit 1): wake the HPD worker to re-indicate the
     // child connected. KeSetEvent (Wait=FALSE) is legal at DISPATCH_LEVEL.
     if adapter.config_change_pending.load(Ordering::Acquire) != 0 {
+        adapter.signal_hpd();
+    }
+
+    // `FfAsyncWin`: a `SetVidPnSourceAddress` (DIRQL) left a programming pending and asked for
+    // this DPC; wake the worker that drains it (it used to wait for the next vsync tick).
+    if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0
+        && crate::virtio::foreign_flip::early_wake()
+    {
+        crate::virtio::foreign_flip::note_early_woke();
         adapter.signal_hpd();
     }
 
@@ -408,6 +480,8 @@ pub unsafe extern "C" fn dxgkddi_control_interrupt(
         adapter
             .vsync_enabled
             .store((enable != 0) as u32, Ordering::Release);
+        // `VsCiT`, `VsCiSt`: atomics only (DIRQL).
+        crate::ddi::stall_diag::note_control_vsync(enable != 0);
         return STATUS_SUCCESS;
     }
     STATUS_NOT_IMPLEMENTED
