@@ -175,6 +175,8 @@ static ASYNC_WAKE: AtomicU64 = AtomicU64::new(0);
 // waiting for the presenter's pacing, `FfRepMsEff` the gate in force (ms, 0 = off).
 static EDGE_SUP: AtomicU32 = AtomicU32::new(0);
 static EDGE_HELD_N: AtomicU32 = AtomicU32::new(0);
+/// Held-repeat wakes cleared because the shown target went away first (`FfStaleWake`).
+static STALE_WAKE: AtomicU32 = AtomicU32::new(0);
 static REPEATS: AtomicU32 = AtomicU32::new(0);
 static RE_GEM: AtomicU32 = AtomicU32::new(0);
 static NEW_GEM: AtomicU32 = AtomicU32::new(0);
@@ -318,6 +320,7 @@ pub(crate) fn publish_counters() {
     rec(b"FfAsRecyc", recycled);
     rec(b"FfEdgeSup", EDGE_SUP.load(Ordering::Relaxed));
     rec(b"FfEdgeHeld", EDGE_HELD_N.load(Ordering::Relaxed));
+    rec(b"FfStaleWake", STALE_WAKE.load(Ordering::Relaxed));
     rec(b"FfRepeats", REPEATS.load(Ordering::Relaxed));
     rec(b"FfReGem", RE_GEM.load(Ordering::Relaxed));
     rec(b"FfNewGem", NEW_GEM.load(Ordering::Relaxed));
@@ -407,8 +410,7 @@ pub(crate) fn forget() {
     OCCUPIED.store(0, Ordering::Release);
     FLYING.store(0, Ordering::Release);
     ASYNC_WAKE.store(0, Ordering::Release);
-    EDGE_HELD.store(0, Ordering::Release);
-    HELD_AT.store(0, Ordering::Release);
+    drop_held();
     LAST_FLIP_AT.store(0, Ordering::Release);
     LAST_GEM.store(0, Ordering::Release);
     REPEAT_GATE.store(0, Ordering::Release);
@@ -420,7 +422,7 @@ pub(crate) fn forget() {
         &GAVE_UP, &FRAMES, &REFLIPS, &YIELDED, &FLIP_FAIL, &STALE, &GONE, &POISONED, &EDGES,
         &PRES_WORD, &YIELDS, &AS_SUB, &AS_ACK, &AS_FAIL, &AS_TMO, &AS_LATE, &WIN_FULL,
         &AS_QFULL, &RTT_N, &RTT_SUM_US, &RTT_MAX_US, &EARLY_Q, &EARLY_WAKE, &GATE_WAKE,
-        &AS_ORPH, &STRIKE_SKIP, &DRAIN_HELD, &EDGE_SUP, &EDGE_HELD_N, &REPEATS, &RE_GEM,
+        &AS_ORPH, &STRIKE_SKIP, &DRAIN_HELD, &EDGE_SUP, &EDGE_HELD_N, &STALE_WAKE, &REPEATS, &RE_GEM,
         &NEW_GEM, &WAIT_N,
     ] {
         c.store(0, Ordering::Relaxed);
@@ -442,6 +444,17 @@ pub(crate) fn holds_screen() -> bool {
 /// ([`note_early_queued`], [`note_early_woke`], [`note_gate_wake`]).
 pub(crate) fn early_wake() -> bool {
     WINDOW.load(Ordering::Acquire) != 0
+}
+
+/// Forget a held repeat and take back the wake it asked for, if the shared wake word still holds
+/// exactly that one (a different value is another owner's and stays). Atomics only.
+fn drop_held() {
+    EDGE_HELD.store(0, Ordering::Release);
+    let held = HELD_AT.swap(0, Ordering::AcqRel);
+    if ff::owns_held_wake(held, rm_present::wake_at()) {
+        rm_present::clear_wake_at();
+        STALE_WAKE.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// A refresh edge reached THIS arm's resident source (`foreign_scanout_suppresses`: the desktop
@@ -723,6 +736,9 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     // The answers were settled at the top of this worker pass ([`settle`], before the pending
     // programming is drained).
     if SHOWN_RESID.load(Ordering::Acquire) == 0 && !PRES.lock().p.registered() {
+        // Nothing of this arm is shown or registered: a held repeat has nothing to repeat, and
+        // its wake time must not stay in the shared word (a past time is a 1 ms timer for ever).
+        drop_held();
         if OCCUPIED.load(Ordering::Acquire) != 0 {
             arm_async_wake();
         }
@@ -913,7 +929,7 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
     let holds = holds_screen();
     if !holds {
         // Nothing of this arm is shown: a held repeat has nothing to repeat.
-        EDGE_HELD.store(0, Ordering::Release);
+        drop_held();
     }
     let (mut frame_edge, mut resume_edge) = if holds {
         rm_present::clear_wake_at();
