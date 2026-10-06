@@ -339,12 +339,12 @@ static void test_generation_loss_restart(void)
     memset(&g, 0, sizeof(g));
     int32_t table = 7;
     HeliosNvrmHeader h;
-    memset(&h, 0, sizeof(h));
+    helios_nvrm_init(&h, HELIOS_NVRM_OP_QUERY_CAPS, sizeof(h));
 
     /* Nothing is lost or judged before the first init. */
     CHECK(!crm_win_gen_lost(&g, table));
     h.epoch = 123;
-    CHECK(!crm_win_gen_reply_lost(&g, &h));
+    CHECK(!crm_win_gen_reply_lost(&g, &h, sizeof(h)));
 
     /* Init refuses "no transport" (epoch 0) and stays uninitialised... */
     CHECK(crm_win_gen_accept(&g, 0, table) != 0);
@@ -356,14 +356,14 @@ static void test_generation_loss_restart(void)
     CHECK(!crm_win_gen_lost(&g, table));
     h.epoch = e1;
     h.status = HELIOS_NVRM_ST_OK;
-    CHECK(!crm_win_gen_reply_lost(&g, &h));
+    CHECK(!crm_win_gen_reply_lost(&g, &h, sizeof(h)));
 
     /* A driver image reload: with the KMD's per-image salt the new transport's
      * epoch differs even when the transport counter restarted at the same
      * value, so the first reply from it ends generation 1. */
     const uint64_t e2 = 0x000000015a5a0001ull;
     h.epoch = e2;
-    CHECK(crm_win_gen_reply_lost(&g, &h));
+    CHECK(crm_win_gen_reply_lost(&g, &h, sizeof(h)));
     table++; /* helios_kmdmap_mark_lost moves the table */
     CHECK(crm_win_gen_lost(&g, table));
 
@@ -373,13 +373,36 @@ static void test_generation_loss_restart(void)
     CHECK(!crm_win_gen_lost(&g, table));
     CHECK(crm_win_gen_accept(&g, e2, table) == 0);
     CHECK(g.generation == 2 && g.loss_epoch0 == 8 && g.init_epoch == e2);
-    CHECK(!crm_win_gen_reply_lost(&g, &h)); /* the new transport answers */
+    CHECK(!crm_win_gen_reply_lost(&g, &h, sizeof(h))); /* the new transport answers */
     CHECK(!crm_win_gen_lost(&g, table));
 
     /* A reply of the old transport (a straggler) is a loss for generation 2
      * too: nothing of generation 1 may be taken as an answer now. */
     h.epoch = e1;
-    CHECK(crm_win_gen_reply_lost(&g, &h));
+    CHECK(crm_win_gen_reply_lost(&g, &h, sizeof(h)));
+
+    /* Only NVRM replies are judged. The other Helios escapes on the same path
+     * (a Venus holder context: 16-byte header + two u32, 24 bytes; blob release,
+     * 32 bytes) have no status or epoch where an NVRM header has them: whatever
+     * lies past their end must never be read as a loss (338.1 did, on the first
+     * Venus context of every NVK process). */
+    struct {
+        HeliosEscapeHeader hdr;
+        uint32_t capset_id, out_ctx_id;
+        uint8_t past_end[16]; /* what 338.1 read as status and epoch */
+    } ctx;
+    memset(&ctx, 0xbe, sizeof(ctx));
+    ctx.hdr.magic = HELIOS_ESCAPE_MAGIC;
+    ctx.hdr.cmd_type = 0x0002u; /* CTX_CREATE */
+    ctx.hdr.version = HELIOS_ESCAPE_VERSION;
+    ctx.hdr.size = 24;
+    CHECK(!crm_win_gen_judged(&ctx, 24));
+    CHECK(!crm_win_gen_reply_lost(&g, &ctx, 24));
+    CHECK(!crm_win_gen_judged(&ctx, sizeof(ctx))); /* long enough, not NVRM */
+    CHECK(!crm_win_gen_reply_lost(&g, &ctx, sizeof(ctx)));
+    /* An NVRM buffer shorter than its header is not judged either. */
+    CHECK(!crm_win_gen_judged(&h, HELIOS_NVRM_HEADER_BYTES - 1));
+    CHECK(crm_win_gen_judged(&h, sizeof(h)));
 
     /* A loss someone else saw (the UMD, a vanished view) moves the table: lost,
      * and the restart after it is clean again. */

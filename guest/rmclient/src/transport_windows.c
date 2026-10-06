@@ -408,7 +408,7 @@ static int nvrm_escape_raw(struct win_ctx *c, void *buf, uint32_t size)
      * is set only after init accepted the epoch, so init's own QUERY_CAPS is not
      * judged. */
     const HeliosNvrmHeader *h = (const HeliosNvrmHeader *)buf;
-    if (c->ready && crm_win_gen_reply_lost(&c->gen, h)) {
+    if (c->ready && crm_win_gen_reply_lost(&c->gen, buf, size)) {
         win_mark_lost(c, h->status == HELIOS_NVRM_ST_TRANSPORT_RESET ? "TRANSPORT_RESET, epoch"
                                                                       : "reply from another transport, epoch",
                       (unsigned long)h->epoch);
