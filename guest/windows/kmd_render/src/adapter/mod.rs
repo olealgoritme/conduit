@@ -1730,7 +1730,13 @@ impl Drop for AdapterContext {
         // table dies with this context.
         // SAFETY: RemoveDevice, which drops the boxed context, is PASSIVE_LEVEL.
         let passive = unsafe { crate::irql::PassiveLevel::assume() };
-        crate::virtio::nvrm::close_all_on_host(passive, self);
+        crate::virtio::nvrm::close_all_on_host(
+            passive,
+            self,
+            &helios_kmd_logic::sweep_budget::SweepBudget::live(
+                crate::adapter::foreign_scanout::now_100ns(),
+            ),
+        );
         self.set_virtio(None);
         // Free the contiguous paging-RAM segment. RemoveDevice (which drops the
         // boxed AdapterContext) runs at PASSIVE_LEVEL, where MmFreeContiguousMemory
