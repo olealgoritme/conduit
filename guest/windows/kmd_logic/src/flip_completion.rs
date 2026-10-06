@@ -296,18 +296,22 @@ pub const fn mirror_due(n: u32) -> bool {
 /// publication behind it by up to a second per attempt. A healthy host answers in milliseconds, so
 /// this is a few frame periods; a timeout is the same failure it always was (the presenter's three
 /// strikes, the retry pause), and with a kept publication behind every refusal the cost of a
-/// spurious one is a stale picture for the pause, not a held flip.
-pub const WORKER_FLIP_TIMEOUT_MS: u64 = 100;
+/// spurious one is a stale picture for the pause, not a held flip. 100 ms was first; a tester's
+/// run showed three 100 ms host stalls withdrawing the `ForeignFlip` source in about 0.6 s
+/// (three strikes plus the retry pauses), so it is 250 ms.
+pub const WORKER_FLIP_TIMEOUT_MS: u64 = 250;
 
 /// The service-key counter names this module's I/O half writes (`kmd_render/src/ddi/flip_keep.rs`,
 /// nothing else): at most 14 characters (`record_named_bytes` clamps there), all with the `Fk`
 /// prefix no other counter uses. `FkKeep` total kept publications, of which `FkWorker` by the
 /// programming worker, `FkDma` by the DMA lane at submit, `FkAsync` by the copy-completion DPC,
 /// `FkDdi` by `SetVidPnSourceAddress` itself (an unpaired handle), `FkDmaRec` the DMA Presents
-/// that wrote a keep record; `FkWhy` the last reason ([`KeepWhy::code`]); `FkKeep01`..`FkKeep08`
+/// that wrote a keep record, `FkPhFlip` flips of a host-less placeholder the Present completed;
+/// `FkWhy` the last reason ([`KeepWhy::code`]); `FkKeep01`..`FkKeep08`
 /// per reason.
-pub const COUNTERS: [&str; 15] = [
-    "FkKeep", "FkWhy", "FkWorker", "FkDma", "FkAsync", "FkDdi", "FkDmaRec", "FkKeep01", "FkKeep02",
+pub const COUNTERS: [&str; 16] = [
+    "FkKeep", "FkWhy", "FkWorker", "FkDma", "FkAsync", "FkDdi", "FkDmaRec", "FkPhFlip", "FkKeep01",
+    "FkKeep02",
     "FkKeep03", "FkKeep04", "FkKeep05", "FkKeep06", "FkKeep07", "FkKeep08",
 ];
 
