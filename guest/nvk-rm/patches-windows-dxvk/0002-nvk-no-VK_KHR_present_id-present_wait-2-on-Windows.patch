@@ -1,0 +1,74 @@
+From c83e8e3dbd58dce5c46354673adc7567b4fbd05a Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 02:37:23 +0200
+Subject: [PATCH 2/3] nvk: no VK_KHR_present_id/present_wait(2) on Windows
+
+Mesa's Win32 WSI implements no wait_for_present, so wsi_WaitForPresentKHR
+asserts (swapchain->wait_for_present) and would then call NULL. DXVK
+uses present wait for frame pacing whenever the extension exists, so a
+D3D11 game on DXVK on NVK hit the assert on its first frames.
+---
+ src/nouveau/vulkan/nvk_physical_device.c | 25 ++++++++++++++++--------
+ 1 file changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index 577f23a..d1c05f6 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -4,6 +4,15 @@
+  */
+ #include "nvk_physical_device.h"
+ 
++/* Mesa's Win32 WSI implements no wait_for_present (wsi_WaitForPresentKHR
++ * asserts on it), so VK_KHR_present_id/_wait(2) are not advertised there:
++ * DXVK uses them for frame pacing whenever they exist. */
++#ifdef _WIN32
++#define NVK_WSI_PRESENT_WAIT false
++#else
++#define NVK_WSI_PRESENT_WAIT true
++#endif
++
+ #include "nak.h"
+ #include "nvk_buffer.h"
+ #include "nvk_descriptor_types.h"
+@@ -178,10 +187,10 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
+       .KHR_pipeline_executable_properties = true,
+       .KHR_pipeline_library = true,
+ #ifdef NVK_USE_WSI_PLATFORM
+-      .KHR_present_id = true,
+-      .KHR_present_id2 = true,
+-      .KHR_present_wait = true,
+-      .KHR_present_wait2 = true,
++      .KHR_present_id = NVK_WSI_PRESENT_WAIT,
++      .KHR_present_id2 = NVK_WSI_PRESENT_WAIT,
++      .KHR_present_wait = NVK_WSI_PRESENT_WAIT,
++      .KHR_present_wait2 = NVK_WSI_PRESENT_WAIT,
+ #endif
+       .KHR_push_descriptor = true,
+       .KHR_relaxed_block_layout = true,
+@@ -548,10 +557,10 @@ nvk_get_device_features(const struct nv_device_info *info,
+ 
+ #ifdef NVK_USE_WSI_PLATFORM
+       /* VK_KHR_present_id */
+-      .presentId = true,
++      .presentId = NVK_WSI_PRESENT_WAIT,
+ 
+       /* VK_KHR_present_wait */
+-      .presentWait = true,
++      .presentWait = NVK_WSI_PRESENT_WAIT,
+ #endif
+ 
+       /* VK_KHR_shader_quad_control */
+@@ -823,10 +832,10 @@ nvk_get_device_features(const struct nv_device_info *info,
+ 
+ #ifdef NVK_USE_WSI_PLATFORM
+       /* VK_KHR_present_id2 */
+-      .presentId2 = true,
++      .presentId2 = NVK_WSI_PRESENT_WAIT,
+ 
+       /* VK_KHR_present_wait2 */
+-      .presentWait2 = true,
++      .presentWait2 = NVK_WSI_PRESENT_WAIT,
+ 
+       /* VK_EXT_present_timing */
+       .presentTiming = true,

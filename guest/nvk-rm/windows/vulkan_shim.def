@@ -1,0 +1,7 @@
+LIBRARY vulkan-1.dll
+EXPORTS
+  vkGetInstanceProcAddr
+  vkCreateInstance
+  vkEnumerateInstanceExtensionProperties
+  vkEnumerateInstanceLayerProperties
+  vkEnumerateInstanceVersion

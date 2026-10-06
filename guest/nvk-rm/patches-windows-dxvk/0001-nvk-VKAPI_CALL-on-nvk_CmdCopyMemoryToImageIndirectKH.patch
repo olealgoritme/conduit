@@ -1,0 +1,26 @@
+From f19f9944da6e047bc2881c6397c7c78e298d4c3e Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 02:37:23 +0200
+Subject: [PATCH 1/3] nvk: VKAPI_CALL on nvk_CmdCopyMemoryToImageIndirectKHR
+
+The definition lacked VKAPI_ATTR/VKAPI_CALL, which only matters where
+VKAPI_CALL is not empty: 32-bit Windows (__stdcall), where the build
+fails with conflicting types against nvk_entrypoints.h.
+---
+ src/nouveau/vulkan/nvk_cmd_indirect.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_indirect.c b/src/nouveau/vulkan/nvk_cmd_indirect.c
+index 5f9ca03..044f5f3 100644
+--- a/src/nouveau/vulkan/nvk_cmd_indirect.c
++++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
+@@ -1382,7 +1382,8 @@ nvk_CmdCopyMemoryIndirectKHR(VkCommandBuffer commandBuffer,
+    }
+ }
+ 
+-void nvk_CmdCopyMemoryToImageIndirectKHR(VkCommandBuffer commandBuffer,
++VKAPI_ATTR void VKAPI_CALL
++nvk_CmdCopyMemoryToImageIndirectKHR(VkCommandBuffer commandBuffer,
+       const VkCopyMemoryToImageIndirectInfoKHR* info)
+ {
+    /* Feature unimplemented */

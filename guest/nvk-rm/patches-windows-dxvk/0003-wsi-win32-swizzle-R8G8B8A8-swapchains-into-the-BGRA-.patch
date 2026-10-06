@@ -1,0 +1,54 @@
+From 394aafbc55cbd138637f9e1ffb210e681fb26e67 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 02:41:03 +0200
+Subject: [PATCH 3/3] wsi/win32: swizzle R8G8B8A8 swapchains into the BGRA DIB
+
+The GDI (non-DXGI) present path memcpy()s each row into a BI_RGB DIB,
+which is B,G,R,X in memory, so an R8G8B8A8 swapchain (DXVK picks it for
+a DXGI_FORMAT_R8G8B8A8 back buffer) showed with red and blue swapped.
+Swap the two channels while copying for R8G8B8A8_UNORM/SRGB.
+---
+ src/vulkan/wsi/wsi_common_win32.cpp | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index 0622857..cf1b905 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -107,6 +107,9 @@ struct wsi_win32_swapchain {
+    uint64_t                     flip_sequence;
+    VkResult                     status;
+    VkExtent2D                 extent;
++   /* GDI path: the DIB is BGRA in memory; an R8G8B8A8 swapchain is swizzled
++    * while copying into it. */
++   bool                       swap_rb;
+    HWND wnd;
+    HDC chain_dc;
+    struct wsi_win32_image     images[0];
+@@ -842,7 +845,16 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
+    char *dptr = (char *)image->sw.ppvBits;
+ 
+    for (unsigned h = 0; h < chain->extent.height; h++) {
+-      memcpy(dptr, ptr, chain->extent.width * 4);
++      if (chain->swap_rb) {
++         const uint32_t *src = (const uint32_t *)ptr;
++         uint32_t *dst = (uint32_t *)dptr;
++         for (unsigned w = 0; w < chain->extent.width; w++) {
++            uint32_t v = src[w];
++            dst[w] = (v & 0xff00ff00u) | ((v >> 16) & 0xffu) | ((v & 0xffu) << 16);
++         }
++      } else {
++         memcpy(dptr, ptr, chain->extent.width * 4);
++      }
+       dptr += image->sw.bmp_row_pitch;
+       ptr += image->base.row_pitches[0];
+    }
+@@ -1000,6 +1012,8 @@ wsi_win32_surface_create_swapchain(
+    chain->base.queue_present = wsi_win32_queue_present;
+    chain->base.present_mode = wsi_swapchain_get_present_mode(wsi_device, create_info);
+    chain->extent = create_info->imageExtent;
++   chain->swap_rb = create_info->imageFormat == VK_FORMAT_R8G8B8A8_UNORM ||
++                    create_info->imageFormat == VK_FORMAT_R8G8B8A8_SRGB;
+ 
+    chain->wsi = wsi;
+    chain->status = VK_SUCCESS;
