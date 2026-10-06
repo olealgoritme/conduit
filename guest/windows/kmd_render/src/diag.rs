@@ -805,12 +805,15 @@ pub mod knobs {
     /// Reported device-memory capacity in MiB. 0 (default) preserves the proven
     /// one-GiB capacity of the existing aperture+BAR topology.
     pub const VIDMM_VRAM_MB: KnobName = KnobName::new(b"VidMmVramMB");
-    /// `DXGK_FLIPCAPS` OVERRIDE. 0 (default) = the driver's own word
-    /// (`FlipOnVSyncMmIo | FlipImmediateMmIo`); nonzero replaces it verbatim,
-    /// so `FlipCapsX=2` restores the pre-2026-07-29 advertisement for an A/B.
-    /// Bit order (bindgen, WDK 10.0.26100): 0 `FlipOnVSyncWithNoWait`,
-    /// 1 `FlipOnVSyncMmIo`, 2 `FlipInterval`, 3 `FlipImmediateMmIo`. Read at
-    /// AddAdapter, so `pnputil /restart-device` applies it without a rebuild.
+    /// `DXGK_FLIPCAPS` extra bits (default 0 = the driver's own word, `FlipOnVSyncMmIo`).
+    /// A raw `DXGK_FLIPCAPS` bit mask OR'd into it: only bit 4 `FlipIndependent` (0x10), bit 5
+    /// `DdiPresentForIFlip` (0x20) and bit 6 `FlipImmediateOnHSync` (0x40) are accepted (WDK
+    /// 10.0.26100.0 `d3dkmddi.h`); every other bit is dropped and reported in `FlipCapsXMsk`.
+    /// `FlipCapsX=0x10` therefore reports 0x12. It used to REPLACE the whole word; the replaced
+    /// bits were never survivable except as a no-op (`FlipCapsX=2` equals the default).
+    /// Read once per AddAdapter/StartDevice with the other knobs (`AdapterKnobs`), so a change
+    /// applies at the next StartDevice (reboot preferred); mirrored as `FlipCapsXEff` and
+    /// `FlipCapsRep` at every start.
     pub const FLIP_CAPS_EXTRA: KnobName = KnobName::new(b"FlipCapsX");
     /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
     /// queued and pending on this adapter at once. Default 1 is the historical

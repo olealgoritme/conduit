@@ -1153,7 +1153,8 @@ full zero block once per generation even if nothing is ever seen.
 | `MsiVectors` | transport init (MSI plan) | local | `MsiVec` |
 | `VsyncRateMhz` | StartDevice | static | `VsRate` |
 | `OutputTech` | each child-capabilities query | not cached | `OutTech` |
-| `FlipCapsX`, `FlipQueueN` | each QueryAdapterInfo caps query | not cached | `FlipCapV`, `FlipQueV` |
+| `FlipCapsX` | AddDevice and StartDevice (`AdapterKnobs::read`, `read_at_start`; section 18) | `AdapterContext::knobs` | `FlipCapsXEff`, `FlipCapsXMsk`, `FlipCapsRep` (written at every start, 0 included), `FlipCapV` (each caps query) |
+| `FlipQueueN` | each QueryAdapterInfo caps query | not cached | `FlipQueV` |
 | `KmdRmClient` | StartDevice, after `retire_transport` (`rm_client::reread_knob_at_start`); `forget` resets it per transport | static | `RmKnob` (now on every read, 0 included) |
 | `KmdRmSysCache` | each level 5 primary bring-up | state | `RmSysCache` (level 5 counter block) |
 | `KmdRmSysPollMs` | lazily at level 5, per transport generation (`forget` resets it) | static | `RmSysPollMs` (now on every read, 0 included) |
@@ -1789,3 +1790,103 @@ None of these is applied in this change; `HpdLongSite`, `HpdStep100N`, `VsGapFlg
 * If every device is removed again: follow 16.6 in order and record the values; the first fatal record is not overwritten.
 * Before pushing a change to this instrument: run `kmd_logic` tests (the collision scan), the protocol crate tests (the v315 lesson),
   and the type check; `traced.rs` is a table of signatures, so a bindgen name that changed shows as a compile error there.
+## 18. FlipCapsX and flip flag counters (S-0a)
+
+For the independent-flip probe S-0a of `independent-flip.md` (branch `kmd/independent-flip-design`): no rebuild per matrix
+row, and a read of the flip flags the driver ignores. Header facts are from WDK 10.0.26100.0, `d3dkmddi.h` under
+`/home/user/.local/share/conduit-dev/wdk-10.0.26100.0/` (not copied into the repo).
+
+### 18.1 FlipCapsX: raw DXGK_FLIPCAPS bits OR'd into the reported word
+
+`FlipCaps` is `DXGK_DRIVERCAPS` offset 60, a `DXGK_FLIPCAPS` union whose `Value` is a UINT; `query_driver_caps` writes that
+UINT (`out.set(caps_offset!(FlipCaps), ...)`), not the bit fields, so the knob is a raw bit mask. Bits (`d3dkmddi.h:1967-1992`):
+
+| bit | mask | field | note |
+|---|---|---|---|
+| 0 | 0x01 | `FlipOnVSyncWithNoWait` | not accepted from the knob |
+| 1 | 0x02 | `FlipOnVSyncMmIo` | the driver's own default word; load-mandatory (Code 43 without it) |
+| 2 | 0x04 | `FlipInterval` | not accepted from the knob |
+| 3 | 0x08 | `FlipImmediateMmIo` | not accepted: deliberately clear, setting it was a measured regression (`query_adapter_info.rs`, defect 0ab) |
+| 4 | 0x10 | `FlipIndependent` | accepted. "MMIO flip to redirected surfaces bypassing DWM Present" (:1978, WDDM 1.3+) |
+| 5 | 0x20 | `DdiPresentForIFlip` | accepted. "Call `DxgkDdiPresent` when independent flip Present might be issued" (:1980, WDDM 2.0+) |
+| 6 | 0x40 | `FlipImmediateOnHSync` | accepted (:1981, WDDM 2.0+) |
+| 7+ | | `Reserved` | not accepted |
+
+Semantics (`kmd_logic::flip_flags::resolve_flip_caps`): reported = `FlipOnVSyncMmIo` | (`FlipCapsX` & 0x70). `FlipCapsX`
+0 (the default, or absent) reports 0x2, byte-identical to before. `0x10` reports 0x12, `0x30` reports 0x32, `0x70` reports 0x72;
+writing the full word (`0x12`, `0x32`) reports the same, since the default's own bit is a no-op. Every other bit is dropped; the
+dropped bits are published as `FlipCapsXMsk` (0 when nothing was dropped).
+
+Behaviour change: until now a nonzero `FlipCapsX` REPLACED the whole word (any bit pattern, unfiltered), and the one documented
+use, `FlipCapsX=2`, was the default word anyway. A value that cleared `FlipOnVSyncMmIo` or set `FlipImmediateMmIo` could still be
+typed; neither is any longer possible. Anything that only used 2, or 0, behaves as before.
+
+Read time: `AdapterKnobs::read` at AddAdapter and again at StartDevice (`read_at_start`), like `DirectFlipCaps`, so the caps the
+query reports and the mirrors cannot disagree; before it was re-read on every caps query. Mirrors, written at EVERY StartDevice,
+0 included (13.8 rule 1): `FlipCapsXEff` (the accepted bits), `FlipCapsXMsk` (the dropped bits), `FlipCapsRep` (the final reported
+word). `FlipCapV` (the word actually written, at each caps query) is unchanged. A quick check after a restart: `FlipCapsRep` equals
+`0x2 | (FlipCapsX & 0x70)`; `FlipCapsX=0x10` and `FlipCapsRep` still 2 means the value was not read at this start.
+
+### 18.2 Flip flag counters (read-only)
+
+The driver ignores these flags; the counters only say whether dxgkrnl ever sets them. Atomics only (`SetVidPnSourceAddress` can run
+at DIRQL), zeroed at every StartDevice with the rest of `scanout_trace` (`reset`), published at PASSIVE from `scanout_trace::dump`
+(the HPD worker's periodic dump, which is also the only call site). The DDIs' behaviour is unchanged.
+
+| value | meaning |
+|---|---|
+| `IdfSpaTrans` | `SetVidPnSourceAddress` calls with `SharedPrimaryTransition` set (`Flags` & 0x40) |
+| `IdfSpaExcl` | ... with `IndependentFlipExclusive` set (`Flags` & 0x80) |
+| `IdfSpaMove` | ... with `MoveFlip` set (`Flags` & 0x100) |
+| `IdfSpaFlg` | the last full `DXGK_SETVIDPNSOURCEADDRESS_FLAGS.Value` seen |
+| `IdfPrRedir` | `DxgkDdiPresent` calls with `RedirectedFlip` set (`Flags` & 0x2000) |
+| `IdfPrFlg` | the last full `DXGK_PRESENTFLAGS.Value` seen |
+
+CORRECTION to the bit values quoted in `independent-flip.md` (10.2: `SharedPrimaryTransition` 0x20, `IndependentFlipExclusive` 0x40,
+`MoveFlip` 0x80, taken from the comments in the header). Those comments are stale: `DXGK_SETVIDPNSOURCEADDRESS_FLAGS`
+(`d3dkmddi.h:6212-6245`) has `ModeChange`, `FlipImmediate`, `FlipOnNextVSync`, `FlipStereo`, `FlipStereoTemporaryMono`,
+`FlipStereoPreferRight` (bits 0..5; the two stereo comments both say 0x10), then `SharedPrimaryTransition` (bit 6), 
+`IndependentFlipExclusive` (bit 7), `MoveFlip` (bit 8), `Reserved :23` (9 + 23 = 32 bits). The compiler's, and so bindgen's `.Value`,
+values are 0x40 / 0x80 / 0x100, which is what is counted. A reader of `IdfSpaFlg` therefore sees 0x40 for a transition, not 0x20
+(0x20 is `FlipStereoPreferRight`). `DXGK_PRESENTFLAGS.RedirectedFlip` is 0x2000 as commented (`:167-199`: 13 fields before it);
+the existing present-flags histogram (`FlR<n>` / `FlC<n>` / `FlTot`) already holds every present `Flags` word, `IdfPrFlg` holds the latest one.
+
+`IdfSpaFlg` / `IdfPrFlg` are last-writer values (a flip carrying a flag can be followed by one that does not); the counters are
+the evidence, the last values are for decoding what an unexpected flag word is.
+
+### 18.3 The S-0a procedure
+
+Matrix: `FlipCapsX` in {0, 0x10, 0x30} x `DirectFlipCaps` in {0, 1}, six rows, baseline first (`FlipCapsX` 0, `DirectFlipCaps` 0).
+Lowest mode first (1920x1080 at 60 Hz), then the real mode.
+
+For each row:
+
+1. Set the knobs in the service key (`reg add ... /v FlipCapsX /t REG_DWORD /d <v> /f`, same for `DirectFlipCaps`) and REBOOT the VM.
+   The knobs are read at StartDevice, and `pnputil /restart-device` re-reads them, but dxgkrnl derives the user-mode caps answers
+   from what the adapter reported when it was created: a reboot is the way to be sure a row's answer is that row's. Check `FlipCapsXEff`, `FlipCapsRep` and `DirectFlipCaps`' mirror
+   (`0x01D7` bit 2) match the row before trusting anything below.
+2. User-mode probe (a `tools/adapter_type_probe.cpp`-style program): `D3DKMTQueryAdapterInfo` with `KMTQAITYPE_DIRECTFLIP_SUPPORT`
+   (19, `D3DKMT_DIRECTFLIP_SUPPORT`) and `KMTQAITYPE_INDEPENDENTFLIP_SUPPORT` (28); the rest of the S-0a list of
+   `independent-flip.md` (`INDEPENDENTFLIP_SECONDARY_SUPPORT` 39, `MULTIPLANEOVERLAY_SUPPORT` 20, `MPO3DDI_SUPPORT` 43,
+   `SCANOUT_CAPS` 67, `DISPLAY_CAPS` 74) if cheap. Record which `Supported` values changed: that is dxgkrnl's derivation from our
+   caps, before any application runs.
+3. Then a borderless, flip-model, fullscreen application at exactly the display mode (`d3d11_triangle.cpp` is the existing vehicle),
+   with PresentMon running: record `PresentMode` ("Composed: Flip" against "Hardware: Independent Flip" or "Hardware Composed")
+   and the flip rate; and read the counters after the run: `IdfSpaTrans`, `IdfSpaExcl`, `IdfSpaMove`, `IdfSpaFlg`, `IdfPrRedir`,
+   `IdfPrFlg`, with `VpFlip`, `VpMmio`, `VpDmaF`, `PBFlip`, `FkKeep*`, `FlipCapV`. A promoted flip is `IdfPrRedir` / `IdfSpaExcl`
+   rising; a nonzero `IdfPrRedir` with `IdfSpaExcl` 0 says dxgkrnl redirected the Present but never asked for the exclusive primary.
+4. Write the six rows into the S-0 result table of `independent-flip.md` (the two docs live on different branches).
+
+Safety. A wrong caps combination can change what DWM does: `FlipIndependent` is "MMIO flip to redirected surfaces bypassing DWM
+Present" and may change how dxgkrnl issues DWM's OWN flips, and a promoted application with no pointer and a KMD that does not
+program the application's buffers can freeze the screen. Watch `PBFlip`, `FkKeep*`, `VpPrF` and DWM's present count on the first
+boot with a bit set, and have the VM snapshot. Recovery: delete (or set to 0) `FlipCapsX` and `DirectFlipCaps` in the service key and
+reboot; if the VM cannot be reached, set the same values from the offline registry (the service key under the Helios driver's
+`HKLM\SYSTEM\CurrentControlSet\Services`) or revert to the snapshot. The defaults (`FlipCapsX` 0, `DirectFlipCaps` 0) are what ships.
+
+### 18.4 Verified, and not
+
+Verified on the host: the pure decode and mask (`kmd_logic::flip_flags`, host tests: default 0x2 byte-identical, the matrix values,
+dropped bits, the bit values above); the bit values against the header text; rustfmt parse of every KMD source; the WDK-less type
+check of `kmd_render` with stubs. NOT verified: a WDK build of `kmd_render`; that `FlipCapsRep` etc. appear in a VM service key;
+what dxgkrnl does with any non-default row (that is the experiment).
