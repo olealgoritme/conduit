@@ -55,6 +55,7 @@
 #define NV_ESC_RM_FREE               0x29
 #define NV_ESC_RM_CONTROL            0x2A
 #define NV_ESC_RM_ALLOC              0x2B
+#define NV_ESC_RM_DUP_OBJECT         0x34
 #define NV_ESC_RM_MAP_MEMORY         0x4E
 #define NV_ESC_RM_GET_EVENT_DATA     0x52
 #define NV_ESC_RM_UNMAP_MEMORY       0x4F
@@ -177,6 +178,18 @@ typedef struct {
     uint32_t paramsSize;
     uint32_t status;
 } NVOS54_PARAMETERS;
+
+/* nvos.h NVOS55_PARAMETERS: NV_ESC_RM_DUP_OBJECT. hObject is the new handle in
+ * hClient under hParent; the source is (hClientSrc, hObjectSrc). */
+typedef struct {
+    uint32_t hClient;
+    uint32_t hParent;
+    uint32_t hObject;
+    uint32_t hClientSrc;
+    uint32_t hObjectSrc;
+    uint32_t flags;
+    uint32_t status;
+} NVOS55_PARAMETERS;
 
 typedef struct {
     uint32_t hClient;
@@ -334,6 +347,7 @@ typedef struct {
 #define NVOS32_ATTR_PHYSICALITY_DEFAULT           0x0u
 #define NVOS32_ATTR_PHYSICALITY_NONCONTIGUOUS     0x1u
 #define NVOS32_ATTR_PHYSICALITY_CONTIGUOUS        0x2u
+#define NVOS32_ATTR_PHYSICALITY_ALLOW_NONCONTIGUOUS 0x3u
 #define NVOS32_ATTR_COHERENCY_SHIFT               29   /* 31:29 */
 #define NVOS32_ATTR_COHERENCY_UNCACHED            0x0u
 #define NVOS32_ATTR_COHERENCY_CACHED              0x1u
@@ -412,6 +426,7 @@ _Static_assert(sizeof(nv_ioctl_rm_api_version_t) == 72, "rm_api_version");
 _Static_assert(sizeof(nv_ioctl_alloc_os_event_t) == 16, "alloc_os_event");
 _Static_assert(sizeof(nv_ioctl_register_fd_t) == 4, "register_fd");
 _Static_assert(sizeof(NVOS00_PARAMETERS) == 16, "NVOS00");
+_Static_assert(sizeof(NVOS55_PARAMETERS) == 28, "NVOS55");
 _Static_assert(sizeof(NVOS21_PARAMETERS) == 32, "NVOS21");
 _Static_assert(sizeof(NVOS02_PARAMETERS) == 48, "NVOS02");
 _Static_assert(sizeof(nv_ioctl_nvos02_parameters_with_fd) == 56, "NVOS02 with fd");

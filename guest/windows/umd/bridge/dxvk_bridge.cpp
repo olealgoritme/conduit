@@ -863,19 +863,26 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
   if (!impl || !impl->d3d11 || !global || !renderer_resource_id || !width || !height)
     return 0;
   if (impl->backend != helios_bridge::IcdBackend::Venus) {
-    // An NVK process cannot import a surface another device made (no
-    // Venus/host-Vulkan -> RM direction, dxvk-on-nvk.md 3.7). Such apps belong
-    // on the deny-list.
-    static std::atomic<std::uint32_t> s_nvkOpen{0};
-    const std::uint32_t n = s_nvkOpen.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n <= 8 || (n % 512u) == 0) {
-      char msg[160];
-      std::snprintf(msg, sizeof(msg),
-        "OpenDdiTexture2D REFUSED on NVK: res_id=%u is another device's surface (x%u)",
-        renderer_resource_id, n);
-      umd_log(msg);
+    // NVK opens another NVK process's surface (a foreign resource: the KMD's
+    // layout trailer) by resource id (shared-surfaces.md, NVK patch 0031,
+    // DXVK patch 0002). A surface Venus made cannot be imported (no
+    // host-Vulkan -> RM direction, dxvk-on-nvk.md 3.7): such apps stay on the
+    // deny-list.
+    const bool nvk_can_open = foreign
+      && (impl->icd.caps & HELIOS_ICD_CAP_SHARED_IMPORT) != 0
+      && !scanout_linear && !linear_scanout_target && !source_image_create_info;
+    if (!nvk_can_open) {
+      static std::atomic<std::uint32_t> s_nvkOpen{0};
+      const std::uint32_t n = s_nvkOpen.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n % 512u) == 0) {
+        char msg[192];
+        std::snprintf(msg, sizeof(msg),
+          "OpenDdiTexture2D REFUSED on NVK: res_id=%u foreign=%d icd caps 0x%x (x%u)",
+          renderer_resource_id, int(foreign), impl->icd.caps, n);
+        umd_log(msg);
+      }
+      return 0;
     }
-    return 0;
   }
 
   return bridge_guard("open_ddi_texture2d", std::size_t(0), [&]() -> std::size_t {

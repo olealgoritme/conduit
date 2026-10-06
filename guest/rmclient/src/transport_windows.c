@@ -96,6 +96,7 @@ struct win_ctx {
     uint64_t supported_ops; /* QUERY_CAPS.supported_ops: bit n = HELIOS_NVRM_OP n;
                                bits 32..63 HELIOS_NVRM_CAP_* */
     uint32_t device_features; /* QUERY_CAPS.device_features (NVGPU_CFG_*) */
+    uint64_t foreign_ops;   /* FOREIGN_RESOURCE QUERY_CAPS.supported_ops, 0 until asked */
     uint64_t epoch;      /* the KMD's device generation at init */
     LUID luid;           /* the chosen adapter's LUID (D3DKMTEnumAdapters2) */
 
@@ -1576,6 +1577,7 @@ int crm_win_foreign_caps(uint32_t *caps_flags)
     r = foreign_status(q.head.status);
     if (r)
         return r;
+    c->foreign_ops = q.supported_ops;
     *caps_flags = q.caps_flags;
     return 0;
 }
@@ -1624,6 +1626,58 @@ int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id
     if (q.out_resource_id == 0)
         return -EIO;
     *resource_id = q.out_resource_id;
+    return 0;
+}
+
+/* FOREIGN_RESOURCE RM_RESOURCE_IMPORT (op 3, KMD 22.22.313+ with a host that
+ * serves RmResourceImport): resource `resource_id`, which this device imported
+ * or this process opened, as a GEM handle of our DRM file `rm_handle`. */
+int crm_win_rm_resource_import(uint32_t rm_handle, uint32_t resource_id, uint32_t *gem_handle,
+                               uint64_t *size, uint64_t *modifier, uint32_t *flags,
+                               uint32_t *host_errno)
+{
+    struct win_ctx *c = &g_ctx;
+    *gem_handle = 0;
+    if (host_errno)
+        *host_errno = 0;
+    if (!c->ready)
+        return -ENODEV;
+    if (c->foreign_ops == 0) {
+        uint32_t caps_flags = 0;
+        (void)crm_win_foreign_caps(&caps_flags);
+    }
+    if (!(c->foreign_ops & (1ull << 3)))
+        return -ENOSYS;
+    struct {
+        struct crm_foreign_head head;
+        uint32_t rm_handle, resource_id, flags, out_gem_handle;
+        uint64_t out_size, out_modifier;
+        uint32_t out_flags, out_host_errno;
+    } q;
+    _Static_assert(sizeof(q) == 80, "rm resource import");
+    memset(&q, 0, sizeof(q));
+    helios_hdr(&q.head.hdr, CRM_HELIOS_ESC_FOREIGN, sizeof(q));
+    q.head.abi_version = 1;
+    q.head.op = 3; /* RM_RESOURCE_IMPORT */
+    q.rm_handle = rm_handle;
+    q.resource_id = resource_id;
+    int r = nvrm_escape(c, &q, sizeof(q));
+    if (r)
+        return r;
+    if (host_errno)
+        *host_errno = q.out_host_errno;
+    r = foreign_status(q.head.status);
+    if (r)
+        return r;
+    if (q.out_gem_handle == 0)
+        return -EIO;
+    *gem_handle = q.out_gem_handle;
+    if (size)
+        *size = q.out_size;
+    if (modifier)
+        *modifier = q.out_modifier;
+    if (flags)
+        *flags = q.out_flags & CRM_RM_IMPORT_MODIFIER_VALID;
     return 0;
 }
 
@@ -1678,6 +1732,17 @@ int crm_win_ioctl(int fd, uint32_t cmd, void *arg, uint32_t size, void *nested,
 int crm_win_scanout_flip(const struct crm_scanout_flip *flip)
 {
     (void)flip;
+    return -ENOSYS;
+}
+
+int crm_win_rm_resource_import(uint32_t rm_handle, uint32_t resource_id, uint32_t *gem_handle,
+                               uint64_t *size, uint64_t *modifier, uint32_t *flags,
+                               uint32_t *host_errno)
+{
+    (void)rm_handle; (void)resource_id; (void)size; (void)modifier; (void)flags;
+    *gem_handle = 0;
+    if (host_errno)
+        *host_errno = 0;
     return -ENOSYS;
 }
 

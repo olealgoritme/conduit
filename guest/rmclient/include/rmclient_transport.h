@@ -265,6 +265,20 @@ int crm_win_fence_wait(int fence, uint32_t timeout_ms);
  * gone, otherwise the KMD status as an errno. */
 int crm_win_scanout_present_fenced(uint32_t handle, uint32_t gem, int fence, uint64_t *seq);
 
+/* HELIOS_ESCAPE_FOREIGN_RESOURCE RM_RESOURCE_IMPORT (op 3; KMD 22.22.313+ and a
+ * backend that serves RmResourceImport, guest/windows/docs/shared-surfaces.md):
+ * the memory behind resource `resource_id` (another process's shared surface
+ * this process opened, or one this device imported) becomes a GEM handle of
+ * the DRM file `rm_handle` (from crm_win_open_device). The caller imports it
+ * into its own RM client (DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY,
+ * OS_UNIX_IMPORT_OBJECT_FROM_FD) and closes it. *flags bit 0: *modifier is the
+ * host's. -ENOSYS without the op or with the gate closed, -EBADF for a file or resource the
+ * caller may not name, -EINVAL for zero ids, -EIO otherwise (*host_errno). */
+#define CRM_RM_IMPORT_MODIFIER_VALID 1u
+int crm_win_rm_resource_import(uint32_t rm_handle, uint32_t resource_id, uint32_t *gem_handle,
+                               uint64_t *size, uint64_t *modifier, uint32_t *flags,
+                               uint32_t *host_errno);
+
 /* The platform default transport (what crm_open(.., NULL) uses). */
 const struct crm_transport *crm_default_transport(void);
 

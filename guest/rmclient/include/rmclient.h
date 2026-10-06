@@ -38,6 +38,18 @@ uint32_t crm_root(const crm_client *c);     /* the root client handle */
 int crm_alloc(crm_client *c, uint32_t parent, uint32_t *object, uint32_t hclass, void *params, uint32_t params_size);
 int crm_control(crm_client *c, uint32_t object, uint32_t cmd, void *params, uint32_t params_size);
 int crm_free(crm_client *c, uint32_t parent, uint32_t object);
+/* Duplicate another client's object into this one (NV_ESC_RM_DUP_OBJECT): a
+ * new handle under `parent` (a device or subdevice of this client for memory)
+ * that names the same RM object as (client_src, object_src). RM keeps the object
+ * alive while any handle to it exists, so the source may be freed first. The
+ * source client must be one RM lets this client duplicate from (same process or
+ * security token; in a Conduit guest every client of the VM qualifies, so the
+ * Helios KMD is what decides which sources a process may name). `hclass` is
+ * the source object's class if the caller knows it (0 if not); the library
+ * uses it like crm_alloc's to pick a CPU-mapping channel. *object in/out: 0 =
+ * the library picks a handle. Free with crm_free like any other object. */
+int crm_dup_object(crm_client *c, uint32_t parent, uint32_t *object, uint32_t client_src,
+                   uint32_t object_src, uint32_t hclass, uint32_t flags);
 /* CPU-map an RM memory object (NV_ESC_RM_MAP_MEMORY + mmap on the device fd). device = the NV01_DEVICE_0 (or subdevice) handle. */
 /* Each mapping gets its own fresh channel (Linux: /dev/nvidiaN for video/BAR
  * memory, /dev/nvidiactl for system memory), which RM requires; it stays open

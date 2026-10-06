@@ -1,0 +1,523 @@
+From 06b43f82f04d373626b8b1eac5eb386197adcf98 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 04:48:20 +0200
+Subject: [PATCH] nvk/rm: open another NVK process's shared surface by its
+ Helios resource id
+
+What Conduit's Helios D3D11 UMD needs so that a D3D11 app on NVK can open a
+surface another NVK process made (DXGI shared handle, NT handle, keyed-mutex
+texture), Conduit guest/windows/docs/shared-surfaces.md, dxvk-on-nvk.md S6.
+
+The resource id is the only name that crosses processes: the Helios KMD
+writes it, with the layout it recorded at IMPORT_RM, into the opener's WDDM
+open and never hands out the creator's RM handles. So:
+
+- helios_icd_interface.h (verbatim copy of Conduit's):
+  HELIOS_ICD_CAP_SHARED_IMPORT and HELIOS_STRUCTURE_TYPE_IMPORT_MEMORY_
+  RESOURCE_INFO (1000384004): resource id, object size, and the layout the
+  image must have (modifier, row pitch, offset).
+- vkAllocateMemory with it and a dedicated image: librmclient's
+  crm_win_rm_resource_import (the KMD's FOREIGN_RESOURCE RM_RESOURCE_IMPORT,
+  KMD 22.22.313+, for a resource this process opened or this device
+  imported) asks the host (backend RmResourceImport) to make the resource's
+  memory a GEM object of our render node; we turn that into
+  RM memory of our own client as Linux NVK imports any nvidia-drm dma-buf
+  (DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY to a fresh control channel,
+  OS_UNIX_IMPORT_OBJECT_FROM_FD), close the GEM handle and map it like an
+  imported dma-buf (shared, so images get their own uncompressed VA).
+- The image must already have the creator's layout: NVK on Windows has no
+  VK_EXT_image_drm_format_modifier, so the opener builds the image from the
+  same D3D description and the layout is checked (against the open's and
+  the host's), not assumed.
+- The memory takes the resource id as its own (memory_res_id answers it) and
+  never releases it: the WDDM allocation owns it.
+
+NVK_HELIOS_SHARED_IMPORT=0 turns it off.
+---
+ src/nouveau/vulkan/helios_icd_interface.h  |  32 ++++
+ src/nouveau/vulkan/nvk_device_memory.c     |  46 ++++-
+ src/nouveau/vulkan/nvk_device_memory.h     |  10 +
+ src/nouveau/vulkan/nvk_helios.c            |  36 ++++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h     |  24 +++
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c |   1 +
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c | 202 +++++++++++++++++++++
+ 7 files changed, 350 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/helios_icd_interface.h b/src/nouveau/vulkan/helios_icd_interface.h
+index a1093a1..afd0d2b 100644
+--- a/src/nouveau/vulkan/helios_icd_interface.h
++++ b/src/nouveau/vulkan/helios_icd_interface.h
+@@ -57,6 +57,12 @@ enum helios_icd_backend {
+ /* The producer interface (escape 0x13 streams keyed on a Venus timeline)
+  * exists. NVK: no; presents are CPU-complete (value 0 markers). */
+ #define HELIOS_ICD_CAP_PRODUCER (1u << 3)
++/* Surfaces another process of this backend made can be opened
++ * (guest/windows/docs/shared-surfaces.md): HELIOS_STRUCTURE_TYPE_IMPORT_
++ * MEMORY_RESOURCE_INFO is accepted. NVK: librmclient has
++ * crm_win_rm_resource_import; whether the KMD and host serve it shows only
++ * when it is tried. */
++#define HELIOS_ICD_CAP_SHARED_IMPORT (1u << 4)
+ 
+ /* DRM fourcc / modifier values used below (drm_fourcc.h). */
+ #define HELIOS_DRM_FORMAT_XRGB8888 0x34325258u
+@@ -96,6 +102,32 @@ struct helios_export_memory_resource_info {
+    uint32_t reserved;     /* 0 */
+ };
+ 
++/* Chained into VkMemoryAllocateInfo by the opener's DXVK, together with a
++ * VkMemoryDedicatedAllocateInfo naming the image that will be bound, when a
++ * D3D app on NVK opens a surface another NVK process made (a foreign resource
++ * id the KMD let this device open): NVK maps the creator's memory instead of
++ * allocating. The resource id is the only name that crosses processes; NVK
++ * asks the host to make its memory a GEM object of NVK's own render node
++ * (backend RmResourceImport, docs/VENUS.md "RM-export resources in a second
++ * process") and imports that into its own RM client
++ * (DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY, OS_UNIX_IMPORT_OBJECT_FROM_FD). The
++ * image must have the layout the KMD recorded for the resource (the open's
++ * HeliosWddmAllocLayout trailer): NVK on Windows has no
++ * VK_EXT_image_drm_format_modifier, so it checks instead of building one.
++ * The memory takes the resource id as its own (memory_res_id answers it;
++ * nothing is released with the memory: the WDDM allocation owns the id). */
++#define HELIOS_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO ((VkStructureType)1000384004)
++struct helios_import_memory_resource_info {
++   VkStructureType sType; /* HELIOS_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO */
++   const void *pNext;
++   uint32_t resource_id;  /* the opened allocation's foreign resource id */
++   uint32_t flags;        /* 0 */
++   uint64_t size;         /* the object's size from the open (blob_size), 0: unknown */
++   uint64_t modifier;     /* DRM_FORMAT_MOD_* the image must have */
++   uint32_t stride;       /* plane 0 row pitch the image must have */
++   uint32_t offset;       /* plane 0 offset the image must have */
++};
++
+ struct helios_icd_api {
+    uint32_t version; /* HELIOS_ICD_INTERFACE_VERSION */
+    uint32_t size;    /* sizeof(struct helios_icd_api) the ICD filled */
+diff --git a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
+index 4df32ee..d5c6c02 100644
+--- a/src/nouveau/vulkan/nvk_device_memory.c
++++ b/src/nouveau/vulkan/nvk_device_memory.c
+@@ -6,6 +6,7 @@
+ 
+ #ifdef _WIN32
+ #include "helios_icd_interface.h"
++#include "nvkmd/rm/nvkmd_rm.h"
+ #endif
+ 
+ #include "nvk_device.h"
+@@ -167,10 +168,12 @@ nvk_AllocateMemory(VkDevice device,
+     * image's layout recorded for the export.
+     */
+    bool helios_export = false;
++   const struct helios_import_memory_resource_info *helios_import = NULL;
+    vk_foreach_struct_const(stype, ext, pAllocateInfo->pNext) {
+-      (void)ext;
+       if (stype == HELIOS_STRUCTURE_TYPE_EXPORT_MEMORY_RESOURCE_INFO)
+          helios_export = true;
++      else if (stype == HELIOS_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO)
++         helios_import = (const struct helios_import_memory_resource_info *)ext;
+    }
+ #else
+    const bool helios_export = false;
+@@ -242,6 +245,44 @@ nvk_AllocateMemory(VkDevice device,
+    const uint64_t aligned_size =
+       align64(pAllocateInfo->allocationSize, alignment);
+ 
++#ifdef _WIN32
++   /* Another NVK process's shared surface (helios_icd_interface.h): only
++    * for the image it is, laid out as its creator laid it out.
++    */
++   if (helios_import != NULL) {
++      if (mem->dedicated_image == NULL ||
++          (helios_import->size != 0 &&
++           pAllocateInfo->allocationSize > helios_import->size)) {
++         result = vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                            "Helios shared surface %u: needs a dedicated "
++                            "image no larger than the object (%" PRIu64
++                            " > %" PRIu64 " B)", helios_import->resource_id,
++                            pAllocateInfo->allocationSize,
++                            helios_import->size);
++         goto fail_alloc;
++      }
++      result = nvk_helios_check_import_layout(mem->dedicated_image,
++                                              helios_import);
++      if (result != VK_SUCCESS)
++         goto fail_alloc;
++      result = nvkmd_rm_mem_import_resource(dev->nvkmd, &dev->vk.base,
++                                            helios_import->resource_id,
++                                            helios_import->size,
++                                            true, helios_import->modifier,
++                                            &mem->mem);
++      if (result != VK_SUCCESS)
++         goto fail_alloc;
++      if (pAllocateInfo->allocationSize > mem->mem->size_B) {
++         result = vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                            "Helios shared surface %u is %" PRIu64 " B, "
++                            "%" PRIu64 " B asked", helios_import->resource_id,
++                            mem->mem->size_B, pAllocateInfo->allocationSize);
++         goto fail_mem;
++      }
++      goto imported;
++   }
++#endif
++
+    const bool is_import = fd_info && fd_info->handleType;
+    if (is_import) {
+       assert(fd_info->handleType ==
+@@ -322,6 +363,9 @@ nvk_AllocateMemory(VkDevice device,
+       }
+    }
+ 
++#ifdef _WIN32
++imported:
++#endif
+    if (fd_info && fd_info->handleType) {
+       /* From the Vulkan spec:
+        *
+diff --git a/src/nouveau/vulkan/nvk_device_memory.h b/src/nouveau/vulkan/nvk_device_memory.h
+index cfceeae..3e58f3a 100644
+--- a/src/nouveau/vulkan/nvk_device_memory.h
++++ b/src/nouveau/vulkan/nvk_device_memory.h
+@@ -28,4 +28,14 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(nvk_device_memory, vk.base, VkDeviceMemory,
+ extern const VkExternalMemoryProperties nvk_opaque_fd_mem_props;
+ extern const VkExternalMemoryProperties nvk_dma_buf_mem_props;
+ 
++#ifdef _WIN32
++/* nvk_helios.c: `image` has the layout the creator of a Helios shared
++ * surface recorded (helios_import_memory_resource_info)
++ */
++struct helios_import_memory_resource_info;
++VkResult nvk_helios_check_import_layout(
++   const struct nvk_image *image,
++   const struct helios_import_memory_resource_info *info);
++#endif
++
+ #endif
+diff --git a/src/nouveau/vulkan/nvk_helios.c b/src/nouveau/vulkan/nvk_helios.c
+index d49d13b..e1c0e20 100644
+--- a/src/nouveau/vulkan/nvk_helios.c
++++ b/src/nouveau/vulkan/nvk_helios.c
+@@ -21,6 +21,7 @@
+ #include "helios_icd_interface.h"
+ #include "drm-uapi/drm_fourcc.h"
+ 
++#include <inttypes.h>
+ #include <string.h>
+ 
+ static uint32_t
+@@ -87,6 +88,39 @@ helios_image_layout(const struct nvk_image *image,
+    return VK_SUCCESS;
+ }
+ 
++/* The opener's image must be laid out exactly like the creator's: NVK on
++ * Windows has no VK_EXT_image_drm_format_modifier, so the image is created
++ * from the same D3D description and checked here against the layout the
++ * KMD recorded for the resource.
++ */
++VkResult
++nvk_helios_check_import_layout(const struct nvk_image *image,
++                               const struct helios_import_memory_resource_info *info)
++{
++   struct nvkmd_rm_foreign_layout fl;
++   uint8_t pte_kind;
++   uint16_t tile_mode;
++   VkResult result = helios_image_layout(image, &fl, &pte_kind, &tile_mode);
++   if (result != VK_SUCCESS) {
++      return vk_errorf(&image->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                       "Helios shared surface %u: the image (format %d, "
++                       "%ux%u) is not one a shared surface can be",
++                       info->resource_id, image->vk.format,
++                       image->vk.extent.width, image->vk.extent.height);
++   }
++   if (fl.modifier != info->modifier || fl.stride != info->stride ||
++       fl.offset != info->offset) {
++      return vk_errorf(&image->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                       "Helios shared surface %u: this image is laid out "
++                       "modifier 0x%" PRIx64 " stride %u offset %u, the "
++                       "creator's is modifier 0x%" PRIx64 " stride %u "
++                       "offset %u", info->resource_id, fl.modifier,
++                       fl.stride, fl.offset, info->modifier, info->stride,
++                       info->offset);
++   }
++   return VK_SUCCESS;
++}
++
+ static uint32_t
+ helios_ctx_id(VkInstance instance)
+ {
+@@ -221,6 +255,8 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
+       if (nvkmd_rm_win_rm_import_served())
+          caps |= HELIOS_ICD_CAP_RES_ID;
+    }
++   if (nvkmd_rm_win_shared_import_supported())
++      caps |= HELIOS_ICD_CAP_SHARED_IMPORT;
+ 
+    struct helios_icd_api api = {
+       .version = HELIOS_ICD_INTERFACE_VERSION,
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+index 702cded..c12a7ca 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
+@@ -100,6 +100,12 @@ struct nvkmd_rm_lib {
+    int (*win_foreign_caps)(uint32_t *caps_flags);
+    int (*win_import_rm)(const struct nvrm_crm_foreign_import *in,
+                         uint32_t *resource_id, uint32_t *host_errno);
++   /* Another process's RM-export resource as a GEM handle of our render
++    * node (backend RmResourceImport); NULL with an older library
++    */
++   int (*win_rm_resource_import)(uint32_t rm_handle, uint32_t resource_id,
++                                 uint32_t *gem_handle, uint64_t *size,
++                                 uint64_t *modifier, uint32_t *flags);
+ };
+ 
+ /* Returns NULL if librmclient cannot be loaded */
+@@ -440,6 +446,24 @@ void nvkmd_rm_mem_helios_res_release(struct nvkmd_rm_mem *mem);
+ /* Export with an explicit layout (pte_kind != 0: block-linear tile_mode) */
+ void nvkmd_rm_mem_set_export_layout(struct nvkmd_mem *mem, uint8_t pte_kind,
+                                     uint16_t tile_mode);
++
++/*
++ * Shared surfaces between processes (nvkmd_rm_win.c, Conduit
++ * guest/windows/docs/shared-surfaces.md, dxvk-on-nvk.md S6): another NVK
++ * process's memory, named by the Helios resource id the KMD let us open.
++ */
++/* librmclient can ask for one (crm_win_rm_resource_import) */
++bool nvkmd_rm_win_shared_import_supported(void);
++/* A new nvkmd_mem for resource `res_id`: the host makes it a GEM object of
++ * our render node, we import that into our client.  `modifier` (when
++ * `check_modifier`) must be what the host knows of the resource.  The id
++ * stays the WDDM allocation's (never released with the memory).
++ */
++VkResult nvkmd_rm_mem_import_resource(struct nvkmd_dev *dev,
++                                      struct vk_object_base *log_obj,
++                                      uint32_t res_id, uint64_t size_B,
++                                      bool check_modifier, uint64_t modifier,
++                                      struct nvkmd_mem **mem_out);
+ #endif
+ 
+ /*
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+index e17e7a8..c7c6f2d 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c
+@@ -237,6 +237,7 @@ nvkmd_rm_lib_load(void)
+    LOAD(win_release_blob,      "crm_win_release_blob",      false);
+    LOAD(win_foreign_caps,      "crm_win_foreign_caps",      false);
+    LOAD(win_import_rm,         "crm_win_import_rm",         false);
++   LOAD(win_rm_resource_import, "crm_win_rm_resource_import", false);
+ 
+    LOAD(event_wait,   "crm_event_wait",   false);
+    LOAD(alloc_pages,  "crm_alloc_pages",  false);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+index d822535..eaf5ad8 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
+@@ -608,3 +608,205 @@ nvkmd_rm_mem_helios_res_release(struct nvkmd_rm_mem *mem)
+       lib->win_release_blob(mem->helios_res_ctx, mem->helios_res_id);
+    mem->helios_res_id = 0;
+ }
++
++/*
++ * Shared surfaces between processes (Conduit guest/windows/docs/
++ * shared-surfaces.md, dxvk-on-nvk.md S6).
++ *
++ * A D3D11 app on NVK that opens a surface another NVK process made (a DXGI
++ * shared handle, an NT handle, a keyed-mutex texture) must map the same RM
++ * memory as its creator.  The Helios resource id is the only name that
++ * crosses processes: the KMD writes it (and the layout it recorded at
++ * IMPORT_RM) into the opener's WDDM open, and refuses to hand out the
++ * creator's RM handles.  The backend holds every RM-export resource as a
++ * dma-buf; RmResourceImport has it imported on our render node as a GEM
++ * object, which we turn into RM memory of our own client the way Linux NVK
++ * imports any nvidia-drm dma-buf (nvkmd_rm_drm.c): GEM_EXPORT_NVKMS_MEMORY
++ * to a fresh control channel, OS_UNIX_IMPORT_OBJECT_FROM_FD.  The GEM handle
++ * goes right after; our RM handle keeps the memory alive for as long as we
++ * use it, whatever the creator does.
++ */
++
++/* DRM_IOWR(DRM_COMMAND_BASE + 0x09, 24 bytes) */
++#define NVKMD_RM_WIN_IOCTL_GEM_EXPORT_NVKMS_MEMORY 0xc0186449u
++
++static_assert(sizeof(struct nvrm_drm_nvidia_gem_export_nvkms_memory_params) == 24,
++              "GEM_EXPORT_NVKMS_MEMORY size is in the ioctl number");
++
++bool
++nvkmd_rm_win_shared_import_supported(void)
++{
++   const struct nvkmd_rm_lib *lib = nvkmd_rm_lib_get();
++
++   return lib != NULL && lib->win_rm_resource_import != NULL &&
++          lib->win_open_device != NULL && lib->win_ioctl != NULL &&
++          lib->new_handle != NULL &&
++          debug_get_bool_option("NVK_HELIOS_SHARED_IMPORT", true);
++}
++
++VkResult
++nvkmd_rm_mem_import_resource(struct nvkmd_dev *_dev,
++                             struct vk_object_base *log_obj,
++                             uint32_t res_id, uint64_t size_B,
++                             bool check_modifier, uint64_t modifier,
++                             struct nvkmd_mem **mem_out)
++{
++   struct nvkmd_rm_dev *dev = nvkmd_rm_dev(_dev);
++   const struct nvkmd_rm_lib *lib = dev->lib;
++   VkResult result;
++   int ret;
++
++   if (!nvkmd_rm_win_shared_import_supported() || res_id == 0)
++      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                       "Helios shared surface %u: cannot be imported here "
++                       "(librmclient without crm_win_rm_resource_import?)",
++                       res_id);
++
++   int drm_fd;
++   result = get_drm_fd(dev, log_obj, &drm_fd);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* The host: the resource's memory as a GEM object of our render node */
++   uint32_t gem = 0, flags = 0;
++   uint64_t host_size = 0, host_modifier = 0;
++   ret = lib->win_rm_resource_import((uint32_t)drm_fd, res_id, &gem,
++                                     &host_size, &host_modifier, &flags);
++   if (ret != 0 || gem == 0) {
++      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                       "Helios shared surface %u: RmResourceImport: %d (%s)",
++                       res_id, ret, ret < 0 ? strerror(-ret) : "no handle");
++   }
++
++   if (check_modifier && (flags & 1u) && host_modifier != modifier) {
++      result = vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                         "Helios shared surface %u: the host knows it as "
++                         "modifier 0x%" PRIx64 ", the open said 0x%" PRIx64,
++                         res_id, host_modifier, modifier);
++      goto close_gem;
++   }
++   if (size_B != 0 && host_size != 0 && host_size < size_B) {
++      result = vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                         "Helios shared surface %u: %" PRIu64 " B, the open "
++                         "said %" PRIu64, res_id, host_size, size_B);
++      goto close_gem;
++   }
++
++   /* Ours: GEM object to a fresh control channel, then into our client */
++   int ctl_fd = -1;
++   ret = lib->win_open_device(NVKMD_RM_WIN_DEV_CTL, &ctl_fd);
++   if (ret != 0 || ctl_fd < 0) {
++      result = vk_errorf(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY,
++                         "RM: open a control channel for import: %d", ret);
++      goto close_gem;
++   }
++
++   struct nvrm_nvkms_kapi_priv_export_memory_params nvkms = {
++      .memFd = ctl_fd,
++   };
++   struct nvrm_drm_nvidia_gem_export_nvkms_memory_params exp = {
++      .handle = gem,
++      .nvkms_params_ptr = (uint64_t)(uintptr_t)&nvkms,
++      .nvkms_params_size = sizeof(nvkms),
++   };
++   ret = lib->win_ioctl(drm_fd, NVKMD_RM_WIN_IOCTL_GEM_EXPORT_NVKMS_MEMORY,
++                        &exp, sizeof(exp), &nvkms, sizeof(nvkms));
++   if (ret != 0) {
++      result = vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                         "DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY of shared "
++                         "surface %u: %d (%s)", res_id, ret,
++                         ret < 0 ? strerror(-ret) : "?");
++      goto close_ctl;
++   }
++
++   const uint32_t h_memory = lib->new_handle(dev->client);
++   NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS im = {
++      .fd = ctl_fd,
++      .object = {
++         .type = NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM,
++         .rmObject = {
++            .hDevice = dev->h_device,
++            .hParent = dev->h_device,
++            .hObject = h_memory,
++         },
++      },
++   };
++   ret = lib->control(dev->client, lib->root(dev->client),
++                      NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD,
++                      &im, sizeof(im));
++   if (ret != 0) {
++      if (lib->release_handle != NULL)
++         lib->release_handle(dev->client, h_memory);
++      result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                              ret, "OS_UNIX_IMPORT_OBJECT_FROM_FD");
++      goto close_ctl;
++   }
++   lib->win_close_device(ctl_fd);
++   ctl_fd = -1;
++   /* Only the envelope: our RM handle holds the memory now */
++   nvkmd_rm_close_gem(dev, gem);
++   gem = 0;
++
++   struct nvkmd_rm_mem *mem = CALLOC_STRUCT(nvkmd_rm_mem);
++   if (mem == NULL) {
++      nvkmd_rm_free_memory(dev, h_memory);
++      if (lib->release_handle != NULL)
++         lib->release_handle(dev->client, h_memory);
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++   }
++
++   /* RM-export resources are VRAM: NVK allocates exportable images there */
++   mem->h_memory = h_memory;
++   mem->imported = true;
++   mem->vram = true;
++   mem->helios_res_id = res_id;
++   mem->helios_res_adopted = true;
++   simple_mtx_init(&mem->export_mutex, mtx_plain);
++
++   const enum nvkmd_mem_flags mflags = NVKMD_MEM_SHARED | NVKMD_MEM_LOCAL |
++                                       NVKMD_MEM_COHERENT;
++   const uint32_t page_size_B = NVKMD_RM_BIG_PAGE_SIZE;
++   const uint64_t mem_size_B = align64(host_size ? host_size : size_B,
++                                       page_size_B);
++   nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_rm_mem_ops,
++                  mflags, mem_size_B, page_size_B);
++
++   result = nvkmd_dev_alloc_va(&dev->base, log_obj, 0 /* va_flags */,
++                               0 /* kind */, mem_size_B, page_size_B,
++                               0 /* fixed_addr */, &mem->base.va);
++   if (result != VK_SUCCESS)
++      goto fail_mem;
++
++   result = nvkmd_va_bind_mem(mem->base.va, log_obj, 0, &mem->base,
++                              0, mem_size_B);
++   if (result != VK_SUCCESS)
++      goto fail_va;
++
++   if (dev->base.pdev->debug_flags & NVK_DEBUG_VM) {
++      fprintf(stderr, "NVK: Helios shared surface %u imported as RM memory "
++              "0x%x (%" PRIu64 " B, modifier 0x%" PRIx64 "%s)\n", res_id,
++              h_memory, mem_size_B, host_modifier,
++              (flags & 1u) ? "" : " unknown to the host");
++   }
++
++   *mem_out = &mem->base;
++   return VK_SUCCESS;
++
++fail_va:
++   nvkmd_va_free(mem->base.va);
++fail_mem:
++   simple_mtx_destroy(&mem->export_mutex);
++   nvkmd_rm_free_memory(dev, h_memory);
++   if (lib->release_handle != NULL)
++      lib->release_handle(dev->client, h_memory);
++   FREE(mem);
++   return result;
++
++close_ctl:
++   if (ctl_fd >= 0)
++      lib->win_close_device(ctl_fd);
++close_gem:
++   if (gem != 0)
++      nvkmd_rm_close_gem(dev, gem);
++   return result;
++}
+-- 
+2.43.0
+
