@@ -56,7 +56,7 @@ Still to confirm on Heaven itself: per frame Σ(id 42 − id 41) on the app
 thread versus the previous Blt packet's id 178 → 180 span.
 
 Levers, most promising first:
-1. **Host-side dependency on the producer's RM fence**: submit the copy at
+1. **GPU-side dependency on the producer's RM fence** (best done on the KMD's RM copy-engine channel, see "Removing Venus"; a host-side wait inside a Venus command is the interim alternative): submit the copy at
    Present time; the host queue waits for the producer's fence and starts the
    copy the moment it is done. Removes the 0.61 ms deferral and the worker hop;
    the round trip overlaps the producer. Host feature (wait on an RM fence
@@ -71,6 +71,29 @@ Levers, most promising first:
 4. dxgkrnl serialises each frame behind the previous copy into the one
    redirection surface; not changeable from the KMD. The real way around the
    copy is the flip model (below, parked).
+
+## Removing Venus: what still uses it, and the RM replacement
+
+`conduit up win11 --venus` is still required for Windows guests: the flag
+starts `conduit-venus` in the backend. Apps and DWM run on NVK regardless
+(`DwmIcd=nvk`, per-process policy); Venus is still carried for the pieces
+below. Roadmap stage S6d ("Venus removed") is the end state; this is the
+inventory it needs. Small fix in the meantime: `conduit attach`/`up` should
+enable Venus automatically for a Windows guest so nobody types `--venus`.
+
+| Still on Venus | Why it is there | Replacement on NVK/RM |
+|---|---|---|
+| Windowed (blit-model) Present copy: KMD `Blt` → Venus copy into the guest blob / redirection surface | the copy engine the KMD could reach first | The KMD's own RM client (already exists, "level 5" lane) submits the copy on an RM copy-engine channel. The copy-engine channel waits on the producer's RM semaphore **on the GPU**, so lever 1 above (no CPU deferral, no worker hop) comes for free, without a new host feature. Destination: the same guest-memory pages, mapped to the GPU through RM (system-memory allocation over guest pages) instead of a Venus blob. |
+| Fallback for processes not on NVK (deny-list, DXR titles, 32-bit cases that fail) | NVK gaps | shrink the deny-list (S6c); DXR waits on NVK ray tracing |
+| The Venus scanout path (`ForeignFlip` off, Venus-DWM) | first working desktop | ForeignFlip with DWM on NVK is the default; drop once restart recovery on NVK is solid |
+| Venus fences / ring used by KMD paths (paging, present ready-poll) | built on Venus first | RM fences (S4 done for presents); move the remaining KMD waits to RM semaphores |
+| Host: conduit-venus, virglrenderer patches 0001/0002, `--venus-guest-blobs` | the above | removed with the last row |
+
+Order: (1) windowed copy on the KMD RM client with a GPU semaphore wait (this
+is also the windowed-performance fix, so it goes first), (2) KMD waits on RM
+fences, (3) deny-list down to DXR, (4) Venus scanout path removed, (5) host
+side removed. Each step keeps Venus as a runtime fallback until the next
+restart-device/stress pass is clean.
 
 ## Tried, and what came of it
 
