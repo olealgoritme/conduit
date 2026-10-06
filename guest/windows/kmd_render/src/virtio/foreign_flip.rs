@@ -71,6 +71,8 @@ use helios_kmd_logic::rm_sysmem as rs;
 
 const KMD: DeviceOwner = DeviceOwner::KMD_RM;
 
+/// `FfAsyncWin` when the service key has none and `FlipAnnounce` is on.
+const ANNOUNCE_WINDOW_DEFAULT: u32 = 2;
 /// Acts performed per worker pass (a registration is followed by the first flip).
 const ACTS_PER_PASS: usize = 3;
 /// How long the host gets to take one flip. The worker flips every frame, StopDevice joins it for
@@ -106,6 +108,12 @@ static SHOWN_RESID: AtomicU32 = AtomicU32::new(0);
 /// `rm_present` flags carry can be taken by the level 5 service in the one pass that stands
 /// down, this one cannot be.
 static OWED: AtomicU32 = AtomicU32::new(0);
+/// Programmings taken ([`take`]) and programmings the service pass has served ([`served`]: its
+/// host flip was submitted or done, or nothing is owed any more). `TAKEN != SERVED` is a frame
+/// still owed in the presenter (waiting for its pacing, its window slot, a retry): the part of
+/// [`busy`] that `OWED` alone cannot see, because `OWED` is consumed at the start of the pass.
+static TAKEN: AtomicU32 = AtomicU32::new(0);
+static SERVED: AtomicU32 = AtomicU32::new(0);
 static YIELDS: AtomicU32 = AtomicU32::new(0);
 /// Until when (interrupt time, 100 ns) a failed registration or flip keeps [`program`] from
 /// taking another allocation (the presenter's own retry pause; 0 = none).
@@ -203,6 +211,19 @@ static AS_QFULL: AtomicU32 = AtomicU32::new(0);
 static RTT_N: AtomicU32 = AtomicU32::new(0);
 static RTT_SUM_US: AtomicU32 = AtomicU32::new(0);
 static RTT_MAX_US: AtomicU32 = AtomicU32::new(0);
+/// The host round trip histogram (`FfRttB0..7`), the programmings that never got a flip of
+/// their own (`FfDropped`), the takes that found a frame already owed (`FfCoal`) and the most
+/// host-pinned buffers (flips in flight + the shown one) at a submit (`FfPinPeak`).
+static RTT_B: [AtomicU32; 8] = [Z32; 8];
+static DROPPED: AtomicU32 = AtomicU32::new(0);
+static COAL: AtomicU32 = AtomicU32::new(0);
+static PIN_PEAK: AtomicU32 = AtomicU32::new(0);
+/// `TAKEN` as of the previous host flip, for [`DROPPED`].
+static TAKEN_AT_FLIP: AtomicU32 = AtomicU32::new(0);
+/// `FlipBusyFly` in force: the host flips in flight that still count as idle for the announce.
+static BUSY_FLY: AtomicU32 = AtomicU32::new(0);
+#[allow(clippy::declare_interior_mutable_const)]
+const Z32: AtomicU32 = AtomicU32::new(0);
 static EARLY_Q: AtomicU32 = AtomicU32::new(0);
 static EARLY_WAKE: AtomicU32 = AtomicU32::new(0);
 static GATE_WAKE: AtomicU32 = AtomicU32::new(0);
@@ -311,6 +332,16 @@ pub(crate) fn publish_counters() {
     rec(b"FfRttN", RTT_N.load(Ordering::Relaxed));
     rec(b"FfRttUsSum", RTT_SUM_US.load(Ordering::Relaxed));
     rec(b"FfRttUsMax", RTT_MAX_US.load(Ordering::Relaxed));
+    const RTT_NAMES: [&[u8]; 8] = [
+        b"FfRttB0", b"FfRttB1", b"FfRttB2", b"FfRttB3", b"FfRttB4", b"FfRttB5", b"FfRttB6",
+        b"FfRttB7",
+    ];
+    for (name, c) in RTT_NAMES.iter().zip(RTT_B.iter()) {
+        rec(name, c.load(Ordering::Relaxed));
+    }
+    rec(b"FfDropped", DROPPED.load(Ordering::Relaxed));
+    rec(b"FfCoal", COAL.load(Ordering::Relaxed));
+    rec(b"FfPinPeak", PIN_PEAK.load(Ordering::Relaxed));
     rec(b"FfEarlyQ", EARLY_Q.load(Ordering::Relaxed));
     rec(b"FfEarlyWake", EARLY_WAKE.load(Ordering::Relaxed));
     rec(b"FfGateWake", GATE_WAKE.load(Ordering::Relaxed));
@@ -351,14 +382,26 @@ fn knob_on() -> bool {
 fn read_knob() -> u32 {
     let v = crate::diag::read_config_dword(crate::diag::knobs::FOREIGN_FLIP, 0);
     // The window is only meaningful with the arm on; read beside it, once per generation.
+    // `FfAsyncWin` defaults to 2 when `FlipAnnounce` is on (the Linux guest's model: the flip is
+    // fire-and-forget on the control queue and the retire does not wait for the host); an explicit
+    // value, 0 included, wins. Without announce the default stays 0.
+    let win_default = if crate::ddi::flip_announce::configured_mode().announces() {
+        ANNOUNCE_WINDOW_DEFAULT
+    } else {
+        0
+    };
     let win = if v != 0 {
         fp::window_from_knob(crate::diag::read_config_dword(
             crate::diag::knobs::FOREIGN_FLIP_WIN,
-            0,
+            win_default,
         ))
     } else {
         0
     };
+    BUSY_FLY.store(
+        crate::diag::read_config_dword(crate::diag::knobs::FLIP_BUSY_FLY, 0).min(4),
+        Ordering::Relaxed,
+    );
     PIPE.lock().set_window(win);
     WINDOW.store(u32::from(win), Ordering::Release);
     // The repeat gate of refresh edges (`FfRepeatMs`, default 100 ms, 0 = every edge flips).
@@ -397,6 +440,8 @@ pub(crate) fn forget() {
     }
     SHOWN_RESID.store(0, Ordering::Release);
     OWED.store(0, Ordering::Release);
+    TAKEN.store(0, Ordering::Release);
+    SERVED.store(0, Ordering::Release);
     YIELDS.store(0, Ordering::Relaxed);
     RESTART_AT.store(0, Ordering::Release);
     FAIL_UNTIL.store(0, Ordering::Release);
@@ -422,13 +467,16 @@ pub(crate) fn forget() {
         &PROG, &SAME, &MOVED, &REOWNED, &NO_REC, &REFUSED, &WHY, &REGS, &REG_FAIL, &WITHDRAWN,
         &GAVE_UP, &FRAMES, &REFLIPS, &YIELDED, &FLIP_FAIL, &STALE, &GONE, &POISONED, &EDGES,
         &PRES_WORD, &YIELDS, &AS_SUB, &AS_ACK, &AS_FAIL, &AS_TMO, &AS_LATE, &WIN_FULL,
-        &AS_QFULL, &RTT_N, &RTT_SUM_US, &RTT_MAX_US, &EARLY_Q, &EARLY_WAKE, &GATE_WAKE,
+        &AS_QFULL, &RTT_N, &RTT_SUM_US, &RTT_MAX_US, &DROPPED, &COAL, &PIN_PEAK, &TAKEN_AT_FLIP, &EARLY_Q, &EARLY_WAKE, &GATE_WAKE,
         &AS_ORPH, &STRIKE_SKIP, &DRAIN_HELD, &EDGE_SUP, &EDGE_HELD_N, &STALE_WAKE, &REPEATS, &RE_GEM,
         &NEW_GEM, &WAIT_N,
     ] {
         c.store(0, Ordering::Relaxed);
     }
     for c in &REFUSED_BY {
+        c.store(0, Ordering::Relaxed);
+    }
+    for c in &RTT_B {
         c.store(0, Ordering::Relaxed);
     }
     MIRROR_PENDING.store(1, Ordering::Release);
@@ -438,6 +486,25 @@ pub(crate) fn forget() {
 /// shared frame and resume edges alone then (they are this arm's).
 pub(crate) fn holds_screen() -> bool {
     SHOWN_RESID.load(Ordering::Acquire) != 0
+}
+
+/// Whether this arm still has the previous picture in hand: atomics only, any IRQL. `FlipAnnounce`
+/// reads it at the `SetVidPnSourceAddress` DDI: an announce hands the PREVIOUS buffer back to the
+/// compositor one tick early, which is safe only if the host no longer reads it. Busy while
+/// (a) a programming's frame is owed (`OWED`, or taken and not yet served: waiting for the
+/// presenter's pacing, a full window, a retry), (b) a pipelined host flip is in flight within its
+/// timeout (`FLYING`), or (c) a synchronous host flip is inside its round trip (a taken
+/// programming is served only after `flip` returned). A flip abandoned after its timeout does
+/// not count (the timeout already bounds the wait; it would otherwise hold the announce for 3 s).
+pub(crate) fn busy() -> bool {
+    OWED.load(Ordering::Acquire) != 0
+        || TAKEN.load(Ordering::Acquire) != SERVED.load(Ordering::Acquire)
+        || FLYING.load(Ordering::Acquire) > BUSY_FLY.load(Ordering::Relaxed)
+}
+
+/// The service pass that started when `TAKEN` read `seen` served every programming up to it.
+fn served(seen: u32) {
+    SERVED.store(seen, Ordering::Release);
 }
 
 /// Whether the pipelined flip is on (`FfAsyncWin` != 0): one atomic load, legal at any IRQL.
@@ -681,7 +748,11 @@ fn take(
         Change::New => 0,
     };
     // A frame is owed for every programming, also of the same allocation again.
-    OWED.store(1, Ordering::Release);
+    TAKEN.fetch_add(1, Ordering::AcqRel);
+    if OWED.swap(1, Ordering::AcqRel) != 0 {
+        // The previous programming's frame was still owed: this newer one replaces it.
+        COAL.fetch_add(1, Ordering::Relaxed);
+    }
     EDGES.fetch_add(1, Ordering::Relaxed);
     rm_present::note_frame_edge(adapter);
     Programmed::Ok
@@ -765,6 +836,7 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
         // Nothing of this arm is shown or registered: a held repeat has nothing to repeat, and
         // its wake time must not stay in the shared word (a past time is a 1 ms timer for ever).
         drop_held();
+        served(TAKEN.load(Ordering::Acquire));
         if OCCUPIED.load(Ordering::Acquire) != 0 {
             arm_async_wake();
         }
@@ -931,6 +1003,7 @@ fn arm_async_wake() {
 /// One host round trip (or answer) of `us` microseconds: the count, the sum (wrapping) and the
 /// maximum.
 fn note_rtt(us: u32) {
+    RTT_B[helios_kmd_logic::flip_retire::rtt_bucket(us as u64)].fetch_add(1, Ordering::Relaxed);
     RTT_N.fetch_add(1, Ordering::Relaxed);
     RTT_SUM_US.fetch_add(us, Ordering::Relaxed);
     RTT_MAX_US.fetch_max(us, Ordering::Relaxed);
@@ -938,16 +1011,24 @@ fn note_rtt(us: u32) {
 
 #[inline(never)]
 fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
+    // Every programming taken before this point is served by the terminal act of this pass.
+    let seen = TAKEN.load(Ordering::Acquire);
     // A presenter that gave up waits out its pause whatever wakes the worker.
     let restart_at = RESTART_AT.load(Ordering::Acquire);
+    // An early return below flips nothing, and nothing taken so far will be flipped by this
+    // pass: it is served, or `busy()` (hence `FlipAnnounce`, for every class) would stay true until
+    // some later pass got further.
     if let Some(wake) = rs::restart_pause(restart_at, now()) {
         rm_present::set_wake_at(wake);
+        served(seen);
         return;
     }
     let Ok(epoch) = adapter.with_virtio(|v| v.nvrm_epoch()) else {
+        served(seen);
         return;
     };
     if epoch == 0 {
+        served(seen);
         return;
     }
     // The shared edges are this arm's only while it holds the screen (the level 5 service
@@ -996,7 +1077,10 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
             }
         }
     }
-    let interval = rr::flip_interval_100ns(adapter.effective_refresh_mhz());
+    let interval = helios_kmd_logic::flip_retire::paced_interval(
+        rr::flip_interval_100ns(adapter.effective_refresh_mhz()),
+        WINDOW.load(Ordering::Acquire) != 0,
+    );
     {
         let mut g = PRES.lock();
         if g.epoch != epoch {
@@ -1043,10 +1127,14 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
             let at = now().saturating_add(rs::RESTART_AFTER_GIVING_UP_100NS);
             RESTART_AT.store(at, Ordering::Release);
             rm_present::set_wake_at(at);
+            served(seen);
             return;
         }
         match act {
-            Act::Idle => return,
+            Act::Idle => {
+                served(seen);
+                return;
+            }
             Act::WaitUntil(at) => {
                 WAIT_N.fetch_add(1, Ordering::Relaxed);
                 rm_present::set_wake_at(at);
@@ -1057,21 +1145,34 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
                     rm_present::set_wake_at(
                         now().saturating_add(helios_kmd_logic::rm_present::RETRY_AFTER_FAIL_100NS),
                     );
+                    // The presenter stands down for its retry pause: nothing is flying or owed here.
+                    served(seen);
                     return;
                 }
             }
             Act::Withdraw => {
                 withdraw(adapter);
+                served(seen);
                 return;
             }
             Act::CopyFlip { slot } | Act::Reflip { slot } => {
                 let copied = matches!(act, Act::CopyFlip { .. });
+                // Programmings taken since the previous host flip, less the one this flip
+                // shows: pictures dxgkrnl flipped that the host never saw (`FfDropped`).
+                if copied {
+                    let taken = TAKEN.load(Ordering::Acquire);
+                    let prev = TAKEN_AT_FLIP.swap(taken, Ordering::Relaxed);
+                    DROPPED.fetch_add(taken.wrapping_sub(prev).saturating_sub(1), Ordering::Relaxed);
+                }
                 if WINDOW.load(Ordering::Acquire) != 0 {
                     match flip_async(passive, adapter, epoch, slot, copied, target) {
                         // Submitted: the answer is settled by a later pass. Go on (the next
                         // act of this pass is `Idle`, or the next programming's).
                         Submit::Sent => {
                             crate::ddi::flip_lat::note_host_submit(now());
+                            // In flight within its timeout (`FLYING`, mirrored before this
+                            // returned): `busy` covers it from here.
+                            served(seen);
                             continue;
                         }
                         // Not now: the frame stays owed and the pass ends. The answer that
@@ -1086,6 +1187,9 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
                         }
                         Submit::Done(result) => {
                             finish(epoch, slot, copied, result);
+                            if result != FlipResult::Yielded {
+                                served(seen);
+                            }
                             rm_present::set_wake_at(
                                 now().saturating_add(
                                     helios_kmd_logic::rm_present::RETRY_AFTER_FAIL_100NS,
@@ -1105,6 +1209,11 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
                     }
                 }
                 finish(epoch, slot, copied, result);
+                // The round trip is over: the host no longer reads the previous picture. A
+                // yielded flip is still owed and stays busy.
+                if result != FlipResult::Yielded {
+                    served(seen);
+                }
                 if result != FlipResult::Shown {
                     rm_present::set_wake_at(
                         now().saturating_add(helios_kmd_logic::rm_present::RETRY_AFTER_FAIL_100NS),
@@ -1267,6 +1376,8 @@ fn flip_async(
                 }
             }
             AS_SUB.fetch_add(1, Ordering::Relaxed);
+            // Host-pinned buffers now: the flips in flight (this one included) and the one shown.
+            PIN_PEAK.fetch_max(FLYING.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
             note_host_flip(t.gem, at);
             Submit::Sent
         }

@@ -40,6 +40,31 @@ pub const STALL_100NS: u64 = 80_000;
 /// 100 ns units per microsecond.
 const UNITS_PER_US: u64 = 10;
 
+/// Upper edges of the ForeignFlip host round trip histogram, microseconds (`FfRttB0..7`): the
+/// time the worker saw from submitting (or sending) a `ScanoutFlip` to its answer.
+pub const RTT_EDGES_US: [u32; BUCKETS - 1] = [250, 500, 1_000, 2_000, 4_200, 8_400, 17_000];
+
+/// The bucket of a host round trip in microseconds (`FfRttB0..7`).
+pub const fn rtt_bucket(us: u64) -> usize {
+    bucket_of(us, &RTT_EDGES_US)
+}
+
+/// The least time between two host flips the foreign presenter enforces. With the pipelined flip
+/// the clock starts at the SUBMIT, so the worker's own latency jitter (a wake that was 0.1 ms
+/// late for one flip and on time for the next) shifts the next flip's due time by that jitter
+/// and, with the due time exactly one period, parks every flip that arrives a little early
+/// behind a timed wait of at least a millisecond: the frame behind it is then overwritten
+/// (single owed slot) and one in several is never shown, a beat. A flip is allowed 3/4 of a
+/// period after the previous one instead (still at most one per vblank on average: flips arrive
+/// once per tick). The synchronous round trip keeps the full period.
+pub const fn paced_interval(period_100ns: u64, pipelined: bool) -> u64 {
+    if pipelined {
+        period_100ns - period_100ns / 4
+    } else {
+        period_100ns
+    }
+}
+
 /// The bucket of a latency in microseconds against `edges`.
 pub const fn bucket_of(us: u64, edges: &[u32; BUCKETS - 1]) -> usize {
     let mut i = 0;
@@ -75,8 +100,9 @@ pub const fn gap_bucket(gap_100ns: u64, period_100ns: u64) -> usize {
     }
     let mut i = 0;
     while i < BUCKETS - 1 {
-        // gap < edge/2 periods  <=>  2 * gap < edge * period
-        if (gap_100ns as u128) * 2 < (GAP_EDGES_HALF[i] as u128) * (period_100ns as u128) {
+        // gap < edge/2 periods  <=>  2 * gap < edge * period (saturating u64: no 128-bit
+        // arithmetic in the kernel; a gap that saturates is far past every edge anyway)
+        if gap_100ns.saturating_mul(2) < (GAP_EDGES_HALF[i] as u64).saturating_mul(period_100ns) {
             return i;
         }
         i += 1;
@@ -223,6 +249,23 @@ pub fn retire_match(
     phys: u64,
     tick_t: u64,
 ) -> Option<Hit> {
+    retire_match_at(addrs, times, live, head, phys, tick_t, tick_t)
+}
+
+/// [`retire_match`] with two clocks: `match_t` is the instant AFTER `phys` was read (a flip
+/// issued at or before it may be what `phys` names; one issued later cannot be), `lat_t` the
+/// tick's start, the end of the latency measured. Reading the tick's start time, then the
+/// address, left a window in which an announce that landed between the two (the address already
+/// in `phys`, its issue time after the start) was refused and credited one tick late.
+pub fn retire_match_at(
+    addrs: &[u64; RING],
+    times: &[u64; RING],
+    live: u32,
+    head: u32,
+    phys: u64,
+    match_t: u64,
+    lat_t: u64,
+) -> Option<Hit> {
     if phys == 0 {
         return None;
     }
@@ -235,7 +278,7 @@ pub fn retire_match(
         }
         match hit {
             None => {
-                if addrs[idx] == phys && times[idx] <= tick_t {
+                if addrs[idx] == phys && times[idx] <= match_t {
                     hit = Some(idx);
                 }
             }
@@ -244,7 +287,7 @@ pub fn retire_match(
     }
     hit.map(|idx| Hit {
         idx,
-        latency_100ns: tick_t - times[idx],
+        latency_100ns: lat_t.saturating_sub(times[idx]),
         skipped,
     })
 }
@@ -396,6 +439,11 @@ impl AnnounceMode {
     }
 }
 
+/// The `FlipAnnounce` value when the service key has none: 2, the Venus class announced (the
+/// foreign class waits for `FlipAnnForeign`). 2 on 332.1 hardware: 238 fps overlay, 244 flips and
+/// 244 used vblanks a second, no artifacts. `FlipAnnounce` 0 in the service key turns it off.
+pub const DEFAULT_KNOB: u32 = 2;
+
 /// Whether the DDI asks for the DPC that wakes the worker at issue: an announce mode, or the
 /// `FlipEarlyWake` knob alone (early programming without an early retire).
 pub const fn wakes_early(mode: AnnounceMode, early_wake_knob: u32) -> bool {
@@ -423,6 +471,9 @@ pub enum NoAnnounce {
     /// The foreign arm is failing (the presenter gave up or a flip failed within the retry
     /// pause): the Venus or kept-picture path completes the flip.
     Failing,
+    /// Mode 2 and the flip names a foreign or hollow allocation while `FlipAnnForeign` is 0:
+    /// the Venus path is announced, the foreign one waits until it was validated.
+    ForeignOff,
 }
 
 impl NoAnnounce {
@@ -435,6 +486,7 @@ impl NoAnnounce {
             NoAnnounce::Busy => 4,
             NoAnnounce::Unknown => 5,
             NoAnnounce::Failing => 6,
+            NoAnnounce::ForeignOff => 7,
         }
     }
 }
@@ -453,6 +505,11 @@ pub struct AnnounceFacts {
     pub address: u64,
     /// The allocation's resource id, `None` when the handle did not pair.
     pub resource: Option<u32>,
+    /// The flip names a foreign or hollow allocation (`flip_completion::Source` not `Venus`),
+    /// from the KMD's own lock-free record of the allocation.
+    pub foreign_class: bool,
+    /// `FlipAnnForeign` is on: mode 2 may announce foreign classes too.
+    pub foreign_ok: bool,
     /// The worker is idle: nothing pending and the programming gate lowered, read BEFORE this
     /// flip raises it (the previous flip's bind, copy and completion are all finished).
     pub idle: bool,
@@ -470,6 +527,7 @@ pub struct AnnounceFacts {
 /// | 0 | | | | | | `No(Off)` |
 /// | | 0 | | | | | `No(NoAddress)` |
 /// | | | none or 0 | | | | `No(NoResource)` |
+/// | 2 | | | foreign class, `FlipAnnForeign` 0 | | | `No(ForeignOff)` |
 /// | | | | no | | | `No(Busy)` |
 /// | 1 | | | | no | | `No(Unknown)` |
 /// | | | | | yes | yes | `No(Failing)` |
@@ -484,6 +542,9 @@ pub const fn announce_decide(f: &AnnounceFacts) -> Announce {
     match f.resource {
         None | Some(0) => return Announce::No(NoAnnounce::NoResource),
         Some(_) => {}
+    }
+    if matches!(f.mode, AnnounceMode::All) && f.foreign_class && !f.foreign_ok {
+        return Announce::No(NoAnnounce::ForeignOff);
     }
     if !f.idle {
         return Announce::No(NoAnnounce::Busy);
@@ -548,7 +609,7 @@ pub const COUNTERS: &[&str] = &[
     "VsLateMaxUs",
     // announce
     "FaKnob", "FaEarly", "FaDdi", "FaWorker", "FaRefuse", "FaLate", "FaTick", "FaNo", "FaNoWhy",
-    "FaNoBusy", "FaNoUnk", "FaNoFail", "FaNoOther",
+    "FaNoBusy", "FaNoUnk", "FaNoFail", "FaNoOther", "FaNoFgn",
 ];
 
 #[cfg(test)]
@@ -580,6 +641,64 @@ mod tests {
         // 100 ns units: 4.17 ms is the 240 Hz period and sits under the 4.2 ms edge.
         assert_eq!(lat_bucket_100ns(P240), 3);
         assert_eq!(lat_bucket_100ns(2 * P240), 4);
+    }
+
+    #[test]
+    fn rtt_buckets_and_pacing() {
+        assert_eq!(rtt_bucket(0), 0);
+        assert_eq!(rtt_bucket(249), 0);
+        assert_eq!(rtt_bucket(250), 1);
+        assert_eq!(rtt_bucket(999), 2);
+        assert_eq!(rtt_bucket(1_000), 3);
+        assert_eq!(rtt_bucket(4_199), 4);
+        assert_eq!(rtt_bucket(4_200), 5);
+        assert_eq!(rtt_bucket(8_400), 6);
+        assert_eq!(rtt_bucket(17_000), 7);
+        // the 240 Hz period: pipelined 3/4 (3.1 ms), synchronous the whole period
+        assert_eq!(paced_interval(P240, false), P240);
+        assert_eq!(paced_interval(P240, true), P240 - P240 / 4);
+        assert!(paced_interval(P240, true) > P240 / 2);
+        assert_eq!(paced_interval(0, true), 0);
+    }
+
+    #[test]
+    fn a_pacing_slack_keeps_every_flip_of_a_tick_aligned_chain() {
+        // Flips arrive once per period; the worker submits each `lat` after its arrival and the
+        // presenter lets the next one go `interval` after the previous SUBMIT, or when it
+        // arrives, whichever is later (a timed wait of at least 1 ms for a flip that is early).
+        // Count the arrivals that are overwritten (a newer one arrived before it flew).
+        fn dropped(interval: u64, lats: &[u64]) -> u32 {
+            let mut last_submit = 0u64;
+            let mut dropped = 0u32;
+            let mut t_free = 0u64; // the worker's next flip time for the owed frame
+            let mut owed: Option<u64> = None;
+            for n in 0..400u64 {
+                let arrive = n * P240;
+                // before this arrival, fly the owed frame if it is due
+                if let Some(a) = owed {
+                    let due = (last_submit + interval).max(a);
+                    if due < arrive {
+                        last_submit = due;
+                        owed = None;
+                        t_free = due;
+                    }
+                }
+                if owed.is_some() {
+                    dropped += 1; // overwritten by the newer one
+                }
+                let lat = lats[(n as usize) % lats.len()];
+                owed = Some(arrive + lat);
+                let _ = t_free;
+            }
+            dropped
+        }
+        // worker latency alternating 0.1 ms and 2 ms: the full-period pacing drops frames,
+        // the 3/4 period does not
+        let lats = [1_000u64, 20_000, 1_000, 1_000, 20_000, 3_000];
+        let full = dropped(paced_interval(P240, false), &lats);
+        let slack = dropped(paced_interval(P240, true), &lats);
+        assert!(full > slack, "full {full} slack {slack}");
+        assert_eq!(slack, 0);
     }
 
     #[test]
@@ -757,6 +876,20 @@ mod tests {
     }
 
     #[test]
+    fn an_announce_between_the_tick_start_and_the_address_read_is_carried_by_that_tick() {
+        // flip issued at 5_200, the tick started at 5_000 and read the address at 5_300
+        let (a, t, live, head) = ring_with(&[(0x100, 1_000), (0x200, 5_200)]);
+        // the old single-clock rule refuses it (issued after the tick's start): one tick late
+        assert_eq!(retire_match(&a, &t, live, head, 0x200, 5_000), None);
+        let h = retire_match_at(&a, &t, live, head, 0x200, 5_300, 5_000).unwrap();
+        assert_eq!(h.idx, 1);
+        // latency never underflows when the flip is newer than the tick's start
+        assert_eq!(h.latency_100ns, 0);
+        // a flip issued AFTER the address read cannot have been in it
+        assert_eq!(retire_match_at(&a, &t, live, head, 0x200, 5_100, 5_000), None);
+    }
+
+    #[test]
     fn retire_match_prefers_the_newest_of_two_flips_to_one_address() {
         let (a, t, live, head) = ring_with(&[(0x100, 1_000), (0x200, 2_000), (0x100, 3_000)]);
         let h = retire_match(&a, &t, live, head, 0x100, 9_000).unwrap();
@@ -914,10 +1047,27 @@ mod tests {
             mode: AnnounceMode::Foreign,
             address: 0x1_0000,
             resource: Some(7),
+            foreign_class: true,
+            foreign_ok: true,
             idle: true,
             accepted: true,
             failing: false,
         }
+    }
+
+    #[test]
+    fn the_default_announces_the_venus_class_only() {
+        assert_eq!(AnnounceMode::from_knob(DEFAULT_KNOB), AnnounceMode::All);
+        let venus = AnnounceFacts {
+            mode: AnnounceMode::from_knob(DEFAULT_KNOB),
+            foreign_class: false,
+            foreign_ok: false,
+            accepted: false,
+            ..facts()
+        };
+        assert_eq!(announce_decide(&venus), Announce::Yes);
+        let foreign = AnnounceFacts { foreign_class: true, accepted: true, ..venus };
+        assert_eq!(announce_decide(&foreign), Announce::No(NoAnnounce::ForeignOff));
     }
 
     #[test]
@@ -953,6 +1103,19 @@ mod tests {
         }
         let f = AnnounceFacts { idle: false, ..facts() };
         assert_eq!(announce_decide(&f), Announce::No(NoAnnounce::Busy));
+        // mode 2 announces the Venus class always and the foreign class only with FlipAnnForeign
+        let f = AnnounceFacts {
+            mode: AnnounceMode::All,
+            foreign_class: true,
+            foreign_ok: false,
+            ..facts()
+        };
+        assert_eq!(announce_decide(&f), Announce::No(NoAnnounce::ForeignOff));
+        let f = AnnounceFacts { foreign_class: false, foreign_ok: false, ..f };
+        assert_eq!(announce_decide(&f), Announce::Yes);
+        // mode 1 is the explicit foreign mode: the extra knob does not gate it
+        let f = AnnounceFacts { foreign_ok: false, ..facts() };
+        assert_eq!(announce_decide(&f), Announce::Yes);
         // mode 1 needs a foreign allocation the arm accepted; mode 2 does not
         let f = AnnounceFacts { accepted: false, ..facts() };
         assert_eq!(announce_decide(&f), Announce::No(NoAnnounce::Unknown));
@@ -976,6 +1139,8 @@ mod tests {
             mode: AnnounceMode::Off,
             address: 0,
             resource: None,
+            foreign_class: true,
+            foreign_ok: false,
             idle: false,
             accepted: false,
             failing: true,
@@ -1046,6 +1211,7 @@ mod tests {
             NoAnnounce::Busy,
             NoAnnounce::Unknown,
             NoAnnounce::Failing,
+            NoAnnounce::ForeignOff,
         ];
         let mut codes: std::vec::Vec<u32> = all.iter().map(|w| w.code()).collect();
         assert!(codes.iter().all(|&c| c != 0));
@@ -1074,16 +1240,31 @@ mod tests {
         }
     }
 
+    /// The sibling `kmd_render/src`, or `None` when this copy of the crate has none. With
+    /// `HELIOS_REQUIRE_NAME_SCAN=1` an absent sibling FAILS the test instead of skipping it, so a
+    /// pre-push run that forgot to copy `kmd_render` next to `kmd_logic` cannot pass silently.
+    fn render_src() -> Option<std::path::PathBuf> {
+        let render = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kmd_render/src");
+        if render.exists() {
+            return Some(render);
+        }
+        assert!(
+            std::env::var("HELIOS_REQUIRE_NAME_SCAN").map_or(true, |v| v != "1"),
+            "HELIOS_REQUIRE_NAME_SCAN=1 but {} does not exist: copy kmd_render next to kmd_logic",
+            render.display()
+        );
+        None
+    }
+
     const INDEXED: [&str; 6] = ["FlipLat", "FlipPrgLat", "FlipHostLat", "IfGap", "VsLate", "FlipPh"];
-    const KNOBS: [&str; 3] = ["FlipAnnounce", "FlipEarlyWake", "FlipLat"];
+    const KNOBS: [&str; 4] = ["FlipAnnounce", "FlipEarlyWake", "FlipLat", "FlipAnnForeign"];
 
     #[test]
     fn the_counters_the_driver_writes_are_exactly_the_ones_listed() {
         // Needs `kmd_render` as a sibling of this crate (the pre-push scripts copy both).
-        let render = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kmd_render/src");
-        if !render.exists() {
+        let Some(render) = render_src() else {
             return;
-        }
+        };
         // The byte-string literals of the two I/O files.
         let mut literals: std::vec::Vec<std::string::String> = std::vec::Vec::new();
         for file in ["ddi/flip_lat.rs", "ddi/flip_announce.rs"] {
@@ -1134,10 +1315,9 @@ mod tests {
 
     #[test]
     fn no_other_file_writes_these_names() {
-        let render = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kmd_render/src");
-        if !render.exists() {
+        let Some(render) = render_src() else {
             return;
-        }
+        };
         let mut stack = std::vec![render];
         let mut checked = 0;
         while let Some(dir) = stack.pop() {

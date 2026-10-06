@@ -419,7 +419,7 @@ pub fn target_ready(t: Option<&Target>, epoch: u64) -> bool {
 /// [`ref_name`]). At most 13 characters each, all with the `Ff` prefix no other counter uses.
 /// `FfKnob` (when the knob is read) and `FfGaveUp` (at the event) are also written at their
 /// event; everything else only by the throttled mirror.
-pub const COUNTERS: [&str; 49] = [
+pub const COUNTERS: [&str; 60] = [
     "FfKnob",
     "FfProg",
     "FfSame",
@@ -476,6 +476,21 @@ pub const COUNTERS: [&str; 49] = [
     "FfRepMsEff",
     // Held-repeat wakes cleared because nothing was left to repeat (`owns_held_wake`).
     "FfStaleWake",
+    // The host round trip as a histogram (`flip_retire::RTT_EDGES_US`: <0.25, <0.5, <1, <2, <4.2,
+    // <8.4, <17 ms, the rest), programmings that never got a host flip of their own because a
+    // newer one replaced them (`FfDropped`; `FfCoal` the takes that found a frame already owed),
+    // and the most host-pinned buffers at a submit (flips in flight + the one shown).
+    "FfRttB0",
+    "FfRttB1",
+    "FfRttB2",
+    "FfRttB3",
+    "FfRttB4",
+    "FfRttB5",
+    "FfRttB6",
+    "FfRttB7",
+    "FfDropped",
+    "FfCoal",
+    "FfPinPeak",
 ];
 
 /// Name of the per-reason refusal counter: `FfRef01` .. `FfRef15`.

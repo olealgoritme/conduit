@@ -1478,6 +1478,8 @@ impl AdapterContext {
 
         // The seed again, last: ending the leases above publishes a withheld old-generation
         // address (`publish_displayed_primary`) that must not displace what dxgkrnl waits for.
+        // An unconfirmed announcement of the old generation must not drop the next publication.
+        crate::ddi::flip_announce::forget_unconfirmed();
         self.last_primary_address.store(
             helios_kmd_logic::restart_flip::seed_address(
                 crate::ddi::stall_diag::last_issued_address(),
