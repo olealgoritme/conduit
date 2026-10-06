@@ -1876,11 +1876,9 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 // blob, mirrored into the pages unless `BltNoMirror`). `None` (one bool test)
                 // for every copy not prepared for a guest buffer.
                 let mut retarget_failed = None;
-                if let Some(again) = client.retarget_prepared_present_blt(
-                    adapter,
-                    request.source,
-                    request.prepared,
-                ) {
+                if let Some(again) =
+                    client.retarget_prepared_present_blt(adapter, request.source, request.prepared)
+                {
                     crate::ddi::guest_blob::note_lost();
                     match again {
                         Ok(prepared) => {

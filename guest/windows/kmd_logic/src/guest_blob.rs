@@ -1568,7 +1568,13 @@ mod tests {
                 unref_ms: 300
             }
         );
-        assert_eq!(Limits::capped(0), Limits { drain_ms: 1, unref_ms: 1 });
+        assert_eq!(
+            Limits::capped(0),
+            Limits {
+                drain_ms: 1,
+                unref_ms: 1
+            }
+        );
         for cap in [0u64, 1, 250, 999, 1_000, 1_001, 5_000] {
             let l = Limits::capped(cap);
             assert!(l.drain_ms >= 1 && l.drain_ms <= DRAIN_MS);

@@ -557,7 +557,13 @@ pub(crate) fn retire_all_for_stop(
             break;
         };
         // Each phase cut to the budget's per-call allowance.
-        retire(passive, adapter, &guard, resource_id, Limits::capped(cap_ms));
+        retire(
+            passive,
+            adapter,
+            &guard,
+            resource_id,
+            Limits::capped(cap_ms),
+        );
     }
 }
 
