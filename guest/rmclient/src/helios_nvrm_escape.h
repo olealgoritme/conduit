@@ -328,6 +328,8 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmUnpin, pin_id) == 40, "unpin.pin_id
 #define HELIOS_NVRM_SCANOUT_FENCE_DEPTH 8u
 #define HELIOS_NVRM_CAP_SCANOUT_FENCE (1ull << 32)
 #define HELIOS_NVRM_CAP_PRESENT_FENCE (1ull << 33)
+/* The WDDM flush gate (HEFL, protocol/include/helios_flush_gate.h) honours its RM fence variant. */
+#define HELIOS_NVRM_CAP_FLUSH_GATE (1ull << 34)
 
 typedef struct HeliosNvrmScanoutSet {
   HeliosNvrmHeader head;

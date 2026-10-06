@@ -28,6 +28,7 @@ Three carriers, one fence object:
 | (a) main | `HELIOS_NVRM_OP_SCANOUT_PRESENT` with flag `RM_FENCE`, `rm_fence_handle` at offset 52 | the host `ScanoutFlip` is sent when the fence fires |
 | (b) | `HERF` (`HeliosPresentRefreshCmdFence`, 48 B) and `HEPR` (`HeliosPresentRenderCmdFence`, 96 B) | the present's DMA fence, scanout bind and windowed blit |
 | (b) | `HE12` version 4 (`HeliosD3D12SubmitCmdV4`, 48 B) | the ExecuteCommandLists batch's DMA completion (the runtime's monitored-fence signals) |
+| (b) | `HEFL` (`HeliosFlushGateCmd`, 48 B, `flags = RM_FENCE`) | a D3D11 `pfnFlush` packet's DMA fence, so a keyed-mutex release waits for the real work (`flush-gate.md`) |
 
 ## The fence object (all carriers)
 

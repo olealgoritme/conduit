@@ -132,6 +132,26 @@ pub static D3D12_SUBMIT_MERGED: AtomicU32 = AtomicU32::new(0);
 /// Retired prefix-clearing diagnostic. HE12 v2 keeps a separate immutable execution tail; always zero.
 pub static D3D12_STALE_RECORD_CLEARED: AtomicU32 = AtomicU32::new(0);
 
+// ── Flush gate (`HEFL`, `docs/flush-gate.md`) ────────────────────────────────
+// Bumped in `dxgkddi_render` (PASSIVE), atomics for the same reason as the HE12 set.
+// Invariant: `FlGRec == FlGStrm + FlGFnc + FlGWire`. `FlGDeg` is an overlay on them.
+
+/// Valid `HEFL` records seen by `dxgkddi_render` (`FlGRec`).
+pub static FLUSH_GATE_RECORDS: AtomicU32 = AtomicU32::new(0);
+/// Records whose packet carries a registered stream point as its boundary (`FlGStrm`).
+pub static FLUSH_GATE_STREAM: AtomicU32 = AtomicU32::new(0);
+/// Records whose packet carries an attached RM fence as its boundary (`FlGFnc`).
+pub static FLUSH_GATE_FENCE: AtomicU32 = AtomicU32::new(0);
+/// Records that ended with no boundary of their own: the deliberate wire rung, a
+/// degraded request, or a boundary that could not be merged (`FlGWire`). The packet
+/// then retires by the legacy rule (every transport entry enqueued before SubmitCommand).
+pub static FLUSH_GATE_WIRE: AtomicU32 = AtomicU32::new(0);
+/// Records that asked for a boundary (or were malformed) and did not get it: unknown
+/// flags, an incomplete stream tail, a stream that is not this process's or not live,
+/// a refused fence, no private-data room (`FlGDeg`). Expected zero on a healthy session;
+/// a stream refusal is also in `PRESENT_STREAM_REJECTS`, a fence refusal in `RmGRef`.
+pub static FLUSH_GATE_DEGRADED: AtomicU32 = AtomicU32::new(0);
+
 /// Mirror the HELIOS_ESCAPE_NVRM counters into the registry. PASSIVE_LEVEL only.
 /// Called on the present edge with the rest, and by the NVRM escape itself (which
 /// can run for a whole session without a single present).
@@ -419,6 +439,12 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"D12Clr",
         D3D12_STALE_RECORD_CLEARED.load(Ordering::Relaxed),
     );
+    // Flush gate (`HEFL`): records, and how each retired. See the statics' docs.
+    crate::diag::record_named_bytes(b"FlGRec", FLUSH_GATE_RECORDS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"FlGStrm", FLUSH_GATE_STREAM.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"FlGFnc", FLUSH_GATE_FENCE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"FlGWire", FLUSH_GATE_WIRE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"FlGDeg", FLUSH_GATE_DEGRADED.load(Ordering::Relaxed));
     // ⛔ ADAPTER-GLOBAL, AND DWM MOVES IT. A guest-supplied boundary replaced by
     // the conservative prefix, from EITHER writer — `wddm_boundary::select` decides
     // the rejection before it reads the `d3d12` bit, so the D3D11 present BLT
@@ -1595,6 +1621,103 @@ fn attach_or_take_fence_tail(
     }
 }
 
+/// `HEFL`, the flush gate (`docs/flush-gate.md`): resolve the record's boundary and carry
+/// it in this DMA buffer's private data, where `SubmitCommand` reads it like a Present's
+/// marker (`PresentSubmissionPrivate::stream_boundary`), so the packet's WDDM fence
+/// retires on the producer's real work and not on the empty DMA buffer.
+///
+/// Advisory by design, like `HERF` / `HEPR` and unlike `HE12`: nothing here fails the
+/// Render (a D3D11 `pfnFlush` must not fail over bookkeeping). A boundary the KMD cannot
+/// honour leaves the packet on the legacy wire-prefix rule and is counted; a parsed fence
+/// tail that does not become the carrier is taken and closed (`take_fence_tail`).
+///
+/// It deliberately touches nothing else of the context: no `bind_execution_stream` (the
+/// sticky, strictly increasing per-context stream of `HE12`, which would make a restarted
+/// stream fail every later flush), no present-marker stash (an orphan stash would be
+/// claimed by the NEXT Present on the context), and no scanout refresh (`HERF`'s side
+/// effect). The boundary is an ordinary tagged stream boundary, so every consumer
+/// already works: the `WddmHeadMs` rebase bounds a point that never retires, a dead
+/// stream or an RM gate purge discharges it, and the DPC that retires a stream value or
+/// an RM fence re-evaluates the WDDM FIFO head.
+///
+/// IRQL: PASSIVE, `DxgkDdiRender` only (`attach_or_take_fence_tail` and `fence_taken`
+/// assume it). The table work under `virtio_lock` is scans and fixed-array writes.
+///
+/// # Safety
+/// `private_data` points to `private_size` writable bytes supplied by dxgkrnl for this
+/// Render, or is null (then the boundary cannot be carried and is counted).
+unsafe fn flush_gate_record(
+    context: Option<&crate::device::ContextHandleRef<'_>>,
+    command: &helios_protocol::HeliosFlushGateCmd,
+    private_data: *mut c_void,
+    private_size: u32,
+) {
+    use helios_kmd_logic::flush_gate::{plan, Carrier, Degrade, Request};
+    FLUSH_GATE_RECORDS.fetch_add(1, Ordering::Relaxed);
+    let tail = command.fence;
+    let decision = plan(Request {
+        want_stream: command.flags & helios_protocol::HELIOS_FLUSH_GATE_FLAG_STREAM != 0,
+        want_fence: command.flags & helios_protocol::HELIOS_FLUSH_GATE_FLAG_RM_FENCE != 0,
+        unknown_flags: command.flags & !helios_protocol::HELIOS_FLUSH_GATE_FLAGS_ALL != 0,
+        ctx_id: command.ctx_id,
+        value: command.value,
+        cookie: command.cookie,
+        tail_handle: tail.rm_fence_handle,
+        tail_flags: tail.flags,
+    });
+    let resolved =
+        context.and_then(|context| Some((context.adapter()?, context.creator_process()?)));
+    let Some((adapter, process)) = resolved else {
+        // No live context to authenticate against: unreachable from dxgkrnl, and there is
+        // nothing to take a handle with either.
+        FLUSH_GATE_WIRE.fetch_add(1, Ordering::Relaxed);
+        FLUSH_GATE_DEGRADED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let mut boundary = match decision.carrier {
+        Carrier::Wire => None,
+        Carrier::Stream {
+            ctx_id,
+            value,
+            cookie,
+        } => adapter
+            .with_virtio(|v| v.present_stream_marker_boundary(ctx_id, value, cookie, process))
+            .ok()
+            .flatten(),
+        Carrier::Fence => attach_or_take_fence_tail(adapter, process, &tail)
+            .map(|marker| marker.rm_boundary)
+            .filter(|boundary| *boundary != 0),
+    };
+    if decision.degraded == Degrade::BothMarkers {
+        // Same counter and rule as HERF / HEPR: two markers, the fence is not attached.
+        crate::virtio::gpu::RMG_REFUSED.fetch_add(1, Ordering::Relaxed);
+    }
+    if decision.take_tail {
+        take_fence_tail(adapter, Some(process), &tail);
+    }
+    let mut degraded = decision.degraded != Degrade::None
+        || (boundary.is_none() && decision.carrier != Carrier::Wire);
+    if let Some(carried) = boundary {
+        // SAFETY: forwarded: `private_data` / `private_size` are this Render's private
+        // range; the helper checks null and the record size before any access.
+        let merged = unsafe {
+            PresentSubmissionPrivate::merge_stream_boundary(private_data, private_size, carried)
+        };
+        if merged.is_err() {
+            boundary = None;
+            degraded = true;
+        }
+    }
+    match (boundary, decision.carrier) {
+        (Some(_), Carrier::Stream { .. }) => FLUSH_GATE_STREAM.fetch_add(1, Ordering::Relaxed),
+        (Some(_), Carrier::Fence) => FLUSH_GATE_FENCE.fetch_add(1, Ordering::Relaxed),
+        _ => FLUSH_GATE_WIRE.fetch_add(1, Ordering::Relaxed),
+    };
+    if degraded {
+        FLUSH_GATE_DEGRADED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Hand a resolved marker to the Present that follows this Render on the context:
 /// a stream point is resolved by the Present, an attached RM fence already is.
 fn stash_marker(
@@ -1803,6 +1926,34 @@ pub unsafe extern "C" fn dxgkddi_render(
             // A recycled buffer from another context must not attach its stream.
             // SAFETY: same validated writable runtime-private record.
             unsafe { record.write_unaligned(Default::default()) };
+        }
+    }
+
+    // The flush gate (`HEFL`): a D3D11 `pfnFlush`'s packet, whose fence must mean "this
+    // flush's GPU work is done". Not an ECL (that branch above is `HE12` only), not a
+    // present: it never stashes, binds a stream or arms a refresh.
+    if !is_ecl
+        && cmd_len == size_of::<helios_protocol::HeliosFlushGateCmd>()
+        // SAFETY: non-null `pCommand` with `cmd_len >= 4` readable bytes (checked above).
+        && unsafe { args.pCommand.cast::<u32>().read_unaligned() }
+            == helios_protocol::HELIOS_FLUSH_GATE_MAGIC
+    {
+        // SAFETY: the exact full command size is validated before this read.
+        let command = unsafe {
+            args.pCommand
+                .cast::<helios_protocol::HeliosFlushGateCmd>()
+                .read_unaligned()
+        };
+        if command.is_valid() {
+            // SAFETY: this Render's private-data range, supplied by dxgkrnl.
+            unsafe {
+                flush_gate_record(
+                    execution_context.as_ref(),
+                    &command,
+                    args.pDmaBufferPrivateData,
+                    args.DmaBufferPrivateDataSize,
+                )
+            };
         }
     }
 

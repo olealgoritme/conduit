@@ -49,7 +49,8 @@ use helios_protocol::{
     HELIOS_SCANOUT_ACQ_NOT_FOUND, HELIOS_SCANOUT_ACQ_OK, HELIOS_SCANOUT_ACQ_OP_MAP,
     HELIOS_SCANOUT_ACQ_OP_PROBE, HELIOS_SCANOUT_ACQ_OP_REGISTER, HELIOS_SCANOUT_ACQ_OP_UNMAP,
     HELIOS_SCANOUT_ACQ_OP_UNREGISTER, HELIOS_SCANOUT_ACQ_PROBE_ACK, HELIOS_SCANOUT_ACQ_TABLE_FULL,
-    HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM, HELIOS_SCANOUT_CAP_READ_LEDGER,
+    HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM, HELIOS_SCANOUT_CAP_FLUSH_GATE,
+    HELIOS_SCANOUT_CAP_READ_LEDGER,
     HELIOS_SCANOUT_CAP_SNAPSHOT_BIND, HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT,
     HELIOS_SCANOUT_TIMELINE_BATCH_CAP, HELIOS_SCANOUT_TIMELINE_OP_META,
     HELIOS_SCANOUT_TIMELINE_OP_READ, HELIOS_SCANOUT_TIMELINE_TIME_100NS,
@@ -937,7 +938,10 @@ fn escape_map_read_ledger(
                 | HELIOS_SCANOUT_CAP_SNAPSHOT_BIND
                 | HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM
                 | HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT
-                | HELIOS_SCANOUT_CAP_SNAPSHOT_STATUS,
+                | HELIOS_SCANOUT_CAP_SNAPSHOT_STATUS
+                // `HEFL`: the flush gate. Needs nothing beyond what ASYNC_PRESENT_STREAM
+                // already needs (the stream table), so it is unconditional here.
+                | HELIOS_SCANOUT_CAP_FLUSH_GATE,
             HELIOS_SCANOUT_ACQ_PROBE_ACK,
         ),
         HELIOS_SCANOUT_ACQ_OP_MAP => {
@@ -1958,6 +1962,8 @@ fn escape_nvrm_op(
             let fence_caps = if fence_served {
                 helios_protocol::HELIOS_NVRM_CAP_SCANOUT_FENCE
                     | helios_protocol::HELIOS_NVRM_CAP_PRESENT_FENCE
+                    // `HEFL` with an RM fence: the same preconditions as the (b) carriers.
+                    | helios_protocol::HELIOS_NVRM_CAP_FLUSH_GATE
             } else {
                 0
             };
