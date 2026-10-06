@@ -45,11 +45,26 @@ impl NvidiaBackend {
         param_out: &[u8],
         deep_len: usize,
     ) -> usize {
-        let data_len = (self.current_data_len as usize).min(param_out.len());
-        let deep_len = deep_len.min(param_out.len() - data_len);
-        let nested_len = param_out.len() - data_len - deep_len;
+        self.write_ioctl_resp_parts(resp_buf, cookie, &[param_out], deep_len)
+    }
 
-        let need = size_of::<MsgHeader>() + size_of::<IoctlResp>() + param_out.len();
+    /// As `write_ioctl_resp_deep`, with the parameters given as the pieces
+    /// they were built in -- the top-level struct, the nested block, what its
+    /// pointer addresses -- and copied straight into the response rather than
+    /// joined in a buffer of their own first.
+    pub(super) fn write_ioctl_resp_parts(
+        &self,
+        resp_buf: &mut [u8],
+        cookie: u64,
+        parts: &[&[u8]],
+        deep_len: usize,
+    ) -> usize {
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let data_len = (self.current_data_len as usize).min(total);
+        let deep_len = deep_len.min(total - data_len);
+        let nested_len = total - data_len - deep_len;
+
+        let need = size_of::<MsgHeader>() + size_of::<IoctlResp>() + total;
         if resp_buf.len() < need {
             return self.write_error_resp(resp_buf, Status::BufferTooSmall, cookie, 0);
         }
@@ -72,8 +87,11 @@ impl NvidiaBackend {
                 deep_len: deep_len as u32,
             },
         );
-        resp_buf[off..off + param_out.len()].copy_from_slice(param_out);
-        off + param_out.len()
+        for p in parts {
+            resp_buf[off..off + p.len()].copy_from_slice(p);
+            off += p.len();
+        }
+        off
     }
 
     /// Write a failure.

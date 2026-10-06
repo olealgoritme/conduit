@@ -3,6 +3,9 @@
 
 use super::*;
 
+/// Top-level structs up to this size are copied to the stack, not the heap.
+const OUTER_STACK: usize = 256;
+
 impl NvidiaBackend {
     // ------------------------------------------------------------------
     // Nested-pointer ioctl (RM_CONTROL, RM_ALLOC..)
@@ -29,7 +32,17 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
         }
 
-        let mut outer = param_in[..outer_size].to_vec();
+        // On the stack: every RM and NVKMS struct that comes through here is a
+        // few dozen bytes, and this runs on every control a driver makes.
+        let mut outer_stack = [0u8; OUTER_STACK];
+        let mut outer_heap = Vec::new();
+        let outer: &mut [u8] = if outer_size <= OUTER_STACK {
+            &mut outer_stack[..outer_size]
+        } else {
+            outer_heap.extend_from_slice(&param_in[..outer_size]);
+            &mut outer_heap
+        };
+        outer.copy_from_slice(&param_in[..outer_size]);
         let nested_in = &param_in[outer_size..];
 
         // What the caller had in the pointer field, to put back before the
@@ -300,9 +313,7 @@ impl NvidiaBackend {
                 if let Some(saved) = rights {
                     outer[NVOS64_RIGHTS..NVOS64_RIGHTS + 8].copy_from_slice(&saved);
                 }
-                let mut combined = outer;
-                combined.extend_from_slice(host_buf);
-                return self.write_ioctl_resp_deep(resp_buf, cookie, &combined, 0);
+                return self.write_ioctl_resp_parts(resp_buf, cookie, &[outer, host_buf], 0);
             }
             // A guest from v0.1 describes one pointer in the request struct
             // instead of sending a segment table. It is read as the segment it
@@ -353,9 +364,7 @@ impl NvidiaBackend {
                             .copy_from_slice(&status.to_le_bytes());
                     }
                     outer[ptr_offset..ptr_offset + 8].copy_from_slice(&caller_ptr);
-                    let mut combined = outer;
-                    combined.extend_from_slice(host_buf);
-                    return self.write_ioctl_resp_deep(resp_buf, cookie, &combined, 0);
+                    return self.write_ioctl_resp_parts(resp_buf, cookie, &[outer, host_buf], 0);
                 }
             }
 
@@ -412,7 +421,7 @@ impl NvidiaBackend {
             }
 
             // Call host ioctl — paramsSize field is untouched (may be 0)
-            if let Err(errno) = self.host.ioctl(host_fd, request, &mut outer) {
+            if let Err(errno) = self.host.ioctl(host_fd, request, outer) {
                 log::warn!("nested ioctl(0x{:x}) failed: errno={}", request, errno);
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
@@ -513,13 +522,15 @@ impl NvidiaBackend {
                     }
                 }
             }
-            let mut combined = outer;
-            combined.extend_from_slice(host_buf);
-            combined.extend_from_slice(&deep_buf[..deep_reply]);
-            self.write_ioctl_resp_deep(resp_buf, cookie, &combined, deep_reply)
+            self.write_ioctl_resp_parts(
+                resp_buf,
+                cookie,
+                &[outer, host_buf, &deep_buf[..deep_reply]],
+                deep_reply,
+            )
         } else {
             // No nested params — straightforward passthrough
-            if let Err(errno) = self.host.ioctl(host_fd, request, &mut outer) {
+            if let Err(errno) = self.host.ioctl(host_fd, request, outer) {
                 log::warn!(
                     "nested ioctl(0x{:x}) no-params failed: errno={}",
                     request,
@@ -548,7 +559,7 @@ impl NvidiaBackend {
             if let Some(saved) = rights {
                 outer[NVOS64_RIGHTS..NVOS64_RIGHTS + 8].copy_from_slice(&saved);
             }
-            self.write_ioctl_resp(resp_buf, cookie, &outer)
+            self.write_ioctl_resp(resp_buf, cookie, outer)
         }
     }
 }

@@ -658,6 +658,14 @@ impl NvidiaBackend {
         out
     }
 
+    /// Whether `take_watch_updates` or `take_fence_watches` has anything to
+    /// hand over, for a transport to look without taking.
+    pub fn has_watch_updates(&self) -> bool {
+        !(self.watch_added.is_empty()
+            && self.watch_removed.is_empty()
+            && self.fence_watch_added.is_empty())
+    }
+
     /// Descriptors opened and closed since this was last called.
     ///
     /// A transport calls it after serving messages and keeps its poll set in

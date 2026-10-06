@@ -3086,6 +3086,49 @@ mod tests {
             .cmd
     }
 
+    /// The nested path's own cost: an RM_CONTROL with a 68-byte parameter
+    /// block (GPU_GET_NAME_STRING's size), the shape of most controls a
+    /// driver makes, against a host that answers at once.
+    ///
+    /// ```text
+    /// cargo test --release -p device --lib bench_nested -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn bench_nested() {
+        let (mut be, h) = backend_on(&CountingHost::default());
+        be.set_host(Box::new(NullHost));
+        let mut v = hdr(MsgType::Ioctl, h);
+        let top = rm_control(0x20800110, 68);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_CONTROL, top.len() as u32) as u32,
+                data_len: top.len() as u32,
+                nested_offset: 16,
+                nested_len: 68,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        v.extend_from_slice(&top);
+        v.extend_from_slice(&[0u8; 68]);
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(&v, &mut resp);
+        assert_eq!(parse_resp(&resp).status, 0);
+        const N: u32 = 1_000_000;
+        let mut runs = Vec::new();
+        for _ in 0..8 {
+            let t = std::time::Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(be.dispatch(&v, &mut resp));
+            }
+            runs.push(t.elapsed().as_nanos() as f64 / N as f64);
+        }
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("nested RM_CONTROL (68 bytes), ns/request: {:.1}", runs[4]);
+    }
+
     /// A host that answers at once and remembers nothing.
     struct NullHost;
     impl HostDriver for NullHost {

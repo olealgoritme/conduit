@@ -691,6 +691,16 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
     // How often to re-check a descriptor that is still readable. See the
     // sweep below; this is a safety net, not the notification path.
     const SWEEP: Duration = Duration::from_millis(1);
+    // How soon the sweep may report a descriptor again after it was last
+    // reported. The sweep exists for the report that never arrived -- an edge
+    // missed on add, a notification that found no buffer -- and those are
+    // still found within SWEEP. A descriptor the guest *was* told about
+    // stays readable until the guest drains it with an ioctl, and re-sending
+    // it every SWEEP was an EventReady interrupt per millisecond per idle
+    // event file for as long as nobody drained it. Its repeat is the safety
+    // net for an event the guest woke for and then left queued, which still
+    // finds it within this.
+    const REPEAT: Duration = Duration::from_millis(10);
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -706,6 +716,8 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
     // Fences: reported once and then forgotten, since a signalled sync_file
     // never stops being readable and the sweep would re-send it every pass.
     let mut once: HashSet<u64> = HashSet::new();
+    // When each descriptor was last reported (REPEAT).
+    let mut last_report: HashMap<u64, Instant> = HashMap::new();
     let mut last_sweep = Instant::now();
 
     // Edge-triggered. Level-triggered would report a descriptor as readable
@@ -738,6 +750,7 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
                 }
                 Ok(Watch::Remove(handle)) => {
                     once.remove(&(handle as u64));
+                    last_report.remove(&(handle as u64));
                     if let Some(fd) = watched.remove(&(handle as u64)) {
                         ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle);
                     }
@@ -749,13 +762,21 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
 
         // The safety net: an edge can be missed if a descriptor was already
         // readable when it was added, or if a notification found no buffer
-        // posted. Every 10 ms, ask the descriptors directly and re-notify the
-        // ones that still have something to say. A lost wake costs a tenth of
-        // a frame at 60 Hz rather than a hang.
+        // posted. Every millisecond, ask the descriptors directly and
+        // re-notify the ones that still have something to say and were not
+        // told within REPEAT. A lost wake costs a sixteenth of a frame at
+        // 60 Hz rather than a hang.
         let mut reported: Vec<u64> = Vec::new();
         if last_sweep.elapsed() >= SWEEP {
-            last_sweep = Instant::now();
+            let now = Instant::now();
+            last_sweep = now;
             for (&handle, fd) in watched.iter() {
+                if last_report
+                    .get(&handle)
+                    .is_some_and(|&t| now.duration_since(t) < REPEAT)
+                {
+                    continue;
+                }
                 let mut pfd = libc::pollfd {
                     fd: fd.as_raw_fd(),
                     events: libc::POLLIN,
@@ -767,8 +788,12 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
                     } else {
                         0
                     };
-                    if push_event(&vring, &mem, handle as u32, status) && once.contains(&handle) {
-                        reported.push(handle);
+                    if push_event(&vring, &mem, handle as u32, status) {
+                        if once.contains(&handle) {
+                            reported.push(handle);
+                        } else {
+                            last_report.insert(handle, now);
+                        }
                     }
                 }
             }
@@ -810,6 +835,8 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
                 log::debug!("event pump: no buffer posted for handle {handle}; dropped");
             } else if fence {
                 reported.push(handle as u64);
+            } else {
+                last_report.insert(handle as u64, Instant::now());
             }
         }
         // A fence the guest has heard about is done here. Its descriptor
@@ -952,6 +979,17 @@ struct NvGpuBackend {
     /// A request was served since the device was last (re)started. A restart
     /// that finds this set is a guest that rebooted or reloaded its driver.
     served: bool,
+    /// The backend has descriptors for the event thread to start or stop
+    /// watching. Noted under the lock each request already takes, so a
+    /// drain that opened and closed nothing -- nearly all of them -- does not
+    /// lock the backend again to find that out.
+    watch_dirty: bool,
+    /// The drain just served a `GpuCmd`, so a fence may be ready to return
+    /// at once. Nothing else can complete a held chain, and the fence pump
+    /// returns those anyway; asking after every RM call cost an eventfd read
+    /// and two more locks of the backend.
+    #[cfg(feature = "venus")]
+    gpu_cmd_seen: bool,
     /// Venus, with `--venus`: the size of region 3 (0 without), and the
     /// fenced chains waiting for their fences.
     #[cfg(feature = "venus")]
@@ -1060,6 +1098,9 @@ impl NvGpuBackend {
             readable: Vec::new(),
             writable: Vec::new(),
             served: false,
+            watch_dirty: true,
+            #[cfg(feature = "venus")]
+            gpu_cmd_seen: false,
             #[cfg(feature = "venus")]
             venus: VenusChains::default(),
         })
@@ -1091,6 +1132,9 @@ impl NvGpuBackend {
         if self.venus.hostmem_len == 0 {
             return;
         }
+        if !std::mem::take(&mut self.gpu_cmd_seen) && self.venus.pump {
+            return;
+        }
         deliver_completions(&self.nvidia, &self.venus.held, vring, mem);
         if self.venus.pump {
             return;
@@ -1116,6 +1160,9 @@ impl NvGpuBackend {
     /// owns the original and may close it at any time; a watch holding the same
     /// number would then be watching whatever opened next.
     fn sync_watches(&mut self, vrings: &[VringRwLock]) {
+        if !std::mem::take(&mut self.watch_dirty) && self.watches.is_some() {
+            return;
+        }
         let (added, removed, fences) = {
             let mut nvidia = self.nvidia.lock().expect("backend mutex");
             let (added, removed) = nvidia.take_watch_updates();
@@ -1171,6 +1218,8 @@ impl NvGpuBackend {
     fn reset(&mut self, why: &str) {
         log::info!("{why}: resetting the device");
         self.nvidia.lock().expect("backend mutex").reset();
+        // A reset closes every descriptor, and the event thread must hear.
+        self.watch_dirty = true;
         // Held chains belonged to the queue the frontend just reset.
         #[cfg(feature = "venus")]
         self.venus.held.lock().expect("held chains").clear();
@@ -1262,6 +1311,11 @@ impl NvGpuBackend {
                     };
                     #[cfg(not(feature = "trace"))]
                     let n = nvidia.dispatch(&self.req, resp);
+                    self.watch_dirty |= nvidia.has_watch_updates();
+                    #[cfg(feature = "venus")]
+                    if self.req.get(..4) == Some(&(MsgType::GpuCmd as u32).to_le_bytes()[..]) {
+                        self.gpu_cmd_seen = true;
+                    }
                     // A fenced GpuCmd: nothing written, and the chain stays
                     // off the used ring until the fence pump returns it.
                     // Recorded under the backend lock, so its completion
@@ -1457,27 +1511,33 @@ impl VhostUserBackendMut for NvGpuBackend {
             .memory();
 
         let vring = &vrings[device_event as usize];
+        let mut used = false;
         if self.event_idx {
             // With EVENT_IDX the guest suppresses notifications, so re-arm and
             // drain again rather than waiting for a kick that will not come.
             loop {
                 vring.disable_notification().ok();
-                self.process(vring, &mem)?;
+                used |= self.process(vring, &mem)?;
                 if !vring.enable_notification().unwrap_or(false) {
                     break;
                 }
             }
         } else {
-            self.process(vring, &mem)?;
+            used |= self.process(vring, &mem)?;
         }
         #[cfg(feature = "venus")]
         self.venus_complete(vring, &mem);
         // After serving, not before: a message that opened a descriptor has to
         // have been served for the backend to know about it.
         self.sync_watches(vrings);
-        vring
-            .signal_used_queue()
-            .map_err(|e| std::io::Error::other(format!("signal used queue: {e}")))?;
+        // Only for something put on the used ring: a kick that found nothing
+        // (or only held chains, which the fence pump signals for) would cost
+        // the guest an interrupt that tells it nothing.
+        if used {
+            vring
+                .signal_used_queue()
+                .map_err(|e| std::io::Error::other(format!("signal used queue: {e}")))?;
+        }
         Ok(())
     }
 }
