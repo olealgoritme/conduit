@@ -1764,7 +1764,11 @@ const NVRM_OPS_IMPLEMENTED: u64 = (1 << HELIOS_NVRM_OP_QUERY_CAPS)
     | (1 << HELIOS_NVRM_OP_MMAP)
     | (1 << HELIOS_NVRM_OP_MUNMAP)
     | (1 << HELIOS_NVRM_OP_PIN)
-    | (1 << HELIOS_NVRM_OP_UNPIN);
+    | (1 << HELIOS_NVRM_OP_UNPIN)
+    // Op 13 and its capability bit 36: the RM window report (always answerable: with the
+    // transport down it reports a window of 0 bytes).
+    | (1 << helios_protocol::HELIOS_NVRM_OP_WINDOW_INFO)
+    | helios_protocol::HELIOS_NVRM_CAP_WINDOW_INFO;
 /// The event ops, reported (`QUERY_CAPS.supported_ops`) only while events are
 /// usable on this device; see `virtio::gpu::nvrm_events`.
 const NVRM_EVENT_OPS: u64 =
@@ -2020,6 +2024,7 @@ fn escape_nvrm_op(
         HELIOS_NVRM_OP_MUNMAP => nvrm_munmap(passive, adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_PIN => nvrm_pin(passive, adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_UNPIN => nvrm_unpin(adapter, buf, hdr, owner, epoch),
+        helios_protocol::HELIOS_NVRM_OP_WINDOW_INFO => nvrm_window_info(adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_EVENT_REGISTER => nvrm_event_register(adapter, buf, hdr, owner, epoch),
         HELIOS_NVRM_OP_EVENT_UNREGISTER => nvrm_event_unregister(adapter, buf, hdr, owner, epoch),
         // Foreign scanout source (own scanout 0, present GEM objects to it).
@@ -2033,6 +2038,52 @@ fn escape_nvrm_op(
         }
         _ => STATUS_INVALID_PARAMETER,
     }
+}
+
+/// `HELIOS_NVRM_OP_WINDOW_INFO`: the RM window as the caller sees it (`HeliosNvrmWindowInfo`),
+/// for NVK's live `VK_EXT_memory_budget`. Read-only and cheap: no host round trip, no registry
+/// write (the counters are mirrored by the worker, as always), one short virtio-lock hold
+/// over the window account (`O(owners)`), after one read of the scanout state's leaf lock
+/// (the privilege evidence, taken BEFORE the virtio lock). Always `OK` in the header: a
+/// transport that is down reports a window of 0 bytes. A buffer too small for the struct
+/// answers `BAD_RANGE` in the header (counted in the short-buffer counter every escape verb
+/// shares, QUERY_STATS `out_escape_short_buffer`), and writes only the header.
+fn nvrm_window_info(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    epoch: u64,
+) -> NTSTATUS {
+    use helios_protocol::HeliosNvrmWindowInfo;
+    let need = size_of::<HeliosNvrmWindowInfo>();
+    if buf.len() < need || (hdr.size as usize) < need {
+        // `escape_nvrm_op` already checked the header fits.
+        ESCAPE_SHORT_BUFFER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let head: HeliosNvrmHeader = pod_read_unaligned(&buf[..size_of::<HeliosNvrmHeader>()]);
+        return nvrm_finish(buf, head, HELIOS_NVRM_ST_BAD_RANGE, epoch);
+    }
+    let mut wire = match EscapeBuf::<HeliosNvrmWindowInfo>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut w = wire.read();
+    crate::virtio::nvrm_window::INFO_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let live_privileged = crate::virtio::nvrm_window::live_privileged(adapter, owner);
+    let info = adapter
+        .with_virtio(|v| v.nvrm_window_info(owner, live_privileged))
+        .ok();
+    w.window_bytes = info.map_or(0, |i| i.window_bytes);
+    w.window_used_bytes = info.map_or(0, |i| i.used_bytes);
+    w.owner_limit_bytes = info.map_or(0, |i| i.owner_limit_bytes);
+    w.owner_used_bytes = info.map_or(0, |i| i.owner_used_bytes);
+    w.generation = crate::virtio::nvrm_window::generation();
+    w.flags = info.map_or(0, |i| i.flags);
+    w.reserved = 0;
+    w.head.status = HELIOS_NVRM_ST_OK;
+    w.head.epoch = epoch;
+    wire.write_back(&w);
+    STATUS_SUCCESS
 }
 
 /// `HELIOS_NVRM_OP_EVENT_REGISTER`: tie the caller's event to `(handle, kind)`, so

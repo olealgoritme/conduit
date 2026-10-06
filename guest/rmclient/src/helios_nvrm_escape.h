@@ -215,6 +215,44 @@ typedef struct HeliosNvrmMunmap {
 HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmMunmap) == HELIOS_NVRM_MUNMAP_BYTES, "Munmap");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmMunmap, mapping_id) == 40, "munmap.mapping_id");
 
+/* ---- WINDOW_INFO (op 13, 88 bytes): read-only report of the RM window ------- *
+ * How big the RM window (region 1, where MMAP places memory) is, how much is mapped, and how
+ * much of it the CALLING process may use: for a live VK_EXT_memory_budget. Present only where
+ * HELIOS_NVRM_CAP_WINDOW_INFO is set in QUERY_CAPS.supported_ops (bit 36). Always status OK,
+ * no side effect, no host round trip (a few atomic reads and one short lock hold): a caller
+ * may cache the answer for 10 ms. With the transport down every size is 0. */
+#define HELIOS_NVRM_OP_WINDOW_INFO 13u
+#define HELIOS_NVRM_CAP_WINDOW_INFO (1ull << 36)
+/* flags bit 0: owner_limit_bytes < window_bytes (this process cannot use the whole window:
+ * the legacy quota, the reserve held back for the shell, or an operator bound). */
+#define HELIOS_NVRM_WINDOW_FLAG_OWNER_LIMIT (1u << 0)
+/* flags bit 1: the window can grow while the guest runs. Always 0 today. */
+#define HELIOS_NVRM_WINDOW_FLAG_CAN_GROW (1u << 1)
+/* flags bit 2: owner_limit_bytes is a ceiling on window_used_bytes (every process's maps
+ * together; the dynamic policy), so the room left is owner_limit_bytes - window_used_bytes.
+ * Clear: a ceiling on owner_used_bytes alone (the legacy quota): room = owner_limit_bytes -
+ * owner_used_bytes. The host may still refuse a map it cannot place (DEVICE_ERROR). */
+#define HELIOS_NVRM_WINDOW_FLAG_SHARED_CEILING (1u << 2)
+typedef struct HeliosNvrmWindowInfo {
+  HeliosNvrmHeader head;
+  uint64_t window_bytes;      /* out: the RM window's size */
+  uint64_t window_used_bytes; /* out: mapped now by every process (UVM aperture excluded) */
+  uint64_t owner_limit_bytes; /* out: the ceiling that applies to the caller (see flag bit 2) */
+  uint64_t owner_used_bytes;  /* out: this process's window bytes (UVM aperture excluded) */
+  uint64_t generation;        /* out: bumps when the window size or the policy changes */
+  uint32_t flags;             /* out: HELIOS_NVRM_WINDOW_FLAG_* */
+  uint32_t reserved;          /* out: zero */
+} HeliosNvrmWindowInfo;
+#define HELIOS_NVRM_WINDOW_INFO_BYTES 88u
+HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmWindowInfo) == HELIOS_NVRM_WINDOW_INFO_BYTES, "WindowInfo");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, window_bytes) == 40, "window_info.window_bytes");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, window_used_bytes) == 48, "window_info.window_used_bytes");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, owner_limit_bytes) == 56, "window_info.owner_limit_bytes");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, owner_used_bytes) == 64, "window_info.owner_used_bytes");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, generation) == 72, "window_info.generation");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, flags) == 80, "window_info.flags");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmWindowInfo, reserved) == 84, "window_info.reserved");
+
 /* ---- events (persistent, level-triggered, no lost wakeup) ------------------ */
 #define HELIOS_NVRM_EVENT_READY 1u          /* host EventReady for `handle` */
 #define HELIOS_NVRM_EVENT_TRANSPORT_LOST 2u /* device reset; handle ignored (0);

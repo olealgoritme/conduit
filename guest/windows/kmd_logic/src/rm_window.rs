@@ -183,6 +183,22 @@ pub struct Top {
     pub bytes: u64,
 }
 
+/// `Info.flags` bits: the values of `helios_protocol::HELIOS_NVRM_WINDOW_FLAG_*` (the render
+/// crate asserts they agree; this crate has no protocol dependency).
+pub const INFO_OWNER_LIMIT: u32 = 1 << 0;
+pub const INFO_CAN_GROW: u32 = 1 << 1;
+pub const INFO_SHARED_CEILING: u32 = 1 << 2;
+
+/// What `WINDOW_INFO` reports for one device ([`Account::info`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Info {
+    pub window_bytes: u64,
+    pub used_bytes: u64,
+    pub owner_limit_bytes: u64,
+    pub owner_used_bytes: u64,
+    pub flags: u32,
+}
+
 /// Everything the counters publish, copied out in one call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Snapshot {
@@ -482,6 +498,40 @@ impl Account {
         out
     }
 
+    /// What `WINDOW_INFO` reports to `owner` (see `helios_protocol::HeliosNvrmWindowInfo`):
+    /// the window, what is mapped, the ceiling that applies to this device and what it holds.
+    /// `live_privileged` as in [`Self::check`]. No side effect.
+    ///
+    /// Dynamic policy: the ceiling is on the all-owners total (`INFO_SHARED_CEILING`): `cap`
+    /// for the privileged device, `cap - reserve` for everyone else, so the room left for a
+    /// device is `owner_limit - used`. Legacy: a quarter of the window, a ceiling on the
+    /// device's own bytes (flag clear): the room is `owner_limit - owner_used`.
+    pub fn info(&self, owner: u64, live_privileged: bool) -> Info {
+        let window = self.cfg.window;
+        let (limit, mut flags) = match self.cfg.policy {
+            Policy::Legacy => (self.cfg.legacy_quota(), 0),
+            Policy::Dynamic => {
+                let privileged = live_privileged || self.is_marked_privileged(owner);
+                let limit = if privileged {
+                    self.cfg.cap
+                } else {
+                    self.cfg.ordinary_limit()
+                };
+                (limit, INFO_SHARED_CEILING)
+            }
+        };
+        if limit < window {
+            flags |= INFO_OWNER_LIMIT;
+        }
+        Info {
+            window_bytes: window,
+            used_bytes: self.in_use,
+            owner_limit_bytes: limit,
+            owner_used_bytes: self.bytes_of(owner),
+            flags,
+        }
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let ordinary = self.cfg.ordinary_limit();
         Snapshot {
@@ -539,6 +589,7 @@ pub const COUNTERS: &[&str] = &[
     "NvMapTRef",
     "NvTblOom",
     "NvPinQRef",
+    "NvWinInfo",
     "NvSanityRef",
 ];
 
@@ -1087,6 +1138,104 @@ mod tests {
             let _ = a.charge(owner, 1, false, size);
             assert!(a.in_use() <= GIB - 256 * MIB);
         }
+    }
+
+    #[test]
+    fn info_for_an_ordinary_device_under_the_dynamic_policy() {
+        let mut a = dynamic(32 * GIB, 256);
+        a.charge(1, 10, false, 3 * GIB).unwrap();
+        a.charge(2, 20, false, GIB).unwrap();
+        let i = a.info(1, false);
+        assert_eq!(i.window_bytes, 32 * GIB);
+        assert_eq!(i.used_bytes, 4 * GIB);
+        assert_eq!(i.owner_limit_bytes, 32 * GIB - 256 * MIB);
+        assert_eq!(i.owner_used_bytes, 3 * GIB);
+        assert_eq!(i.flags, INFO_OWNER_LIMIT | INFO_SHARED_CEILING);
+        // The room: the ceiling on the total minus the total.
+        assert_eq!(i.owner_limit_bytes - i.used_bytes, 32 * GIB - 256 * MIB - 4 * GIB);
+        // A device with nothing mapped reports 0 used and the same ceiling.
+        let z = a.info(99, false);
+        assert_eq!(z.owner_used_bytes, 0);
+        assert_eq!(z.owner_limit_bytes, i.owner_limit_bytes);
+        assert_eq!(z.used_bytes, 4 * GIB);
+    }
+
+    #[test]
+    fn info_for_the_privileged_device_has_no_reserve_to_subtract() {
+        let mut a = dynamic(32 * GIB, 256);
+        a.mark_privileged(7, 70);
+        let i = a.info(7, false);
+        assert_eq!(i.owner_limit_bytes, 32 * GIB);
+        // Not below the window: no "owner limit" flag, but the ceiling is still shared.
+        assert_eq!(i.flags, INFO_SHARED_CEILING);
+        // Live evidence without a mark gives the same answer.
+        assert_eq!(a.info(8, true), a.info(8, true));
+        assert_eq!(a.info(8, true).owner_limit_bytes, 32 * GIB);
+    }
+
+    #[test]
+    fn info_with_no_reserve_and_no_bound_reports_the_whole_window() {
+        let a = dynamic(32 * GIB, 0);
+        let i = a.info(1, false);
+        assert_eq!(i.owner_limit_bytes, 32 * GIB);
+        assert_eq!(i.flags, INFO_SHARED_CEILING);
+    }
+
+    #[test]
+    fn info_follows_the_operator_bound() {
+        let a = Account::new(Config::new(32 * GIB, 256, 8 * 1024, Policy::Dynamic), 4).unwrap();
+        let i = a.info(1, false);
+        assert_eq!(i.window_bytes, 32 * GIB);
+        assert_eq!(i.owner_limit_bytes, 8 * GIB - 256 * MIB);
+        assert!(i.flags & INFO_OWNER_LIMIT != 0);
+    }
+
+    #[test]
+    fn info_under_the_legacy_quota_is_per_device() {
+        let mut a = legacy(32 * GIB);
+        a.charge(1, 1, false, 2 * GIB).unwrap();
+        let i = a.info(1, false);
+        assert_eq!(i.owner_limit_bytes, 8 * GIB);
+        assert_eq!(i.owner_used_bytes, 2 * GIB);
+        assert_eq!(i.used_bytes, 2 * GIB);
+        // No shared-ceiling flag: the room is limit minus the device's own bytes.
+        assert_eq!(i.flags, INFO_OWNER_LIMIT);
+        // Privilege means nothing here.
+        assert_eq!(a.info(1, true), i);
+    }
+
+    #[test]
+    fn info_has_no_side_effects_and_is_u64_clean() {
+        let mut a = dynamic(128 * GIB, 256);
+        a.charge(1, 1, false, 100 * GIB).unwrap();
+        let before = (a.in_use(), a.stats(), a.snapshot().peak, a.snapshot().owners);
+        for _ in 0..1000 {
+            let _ = a.info(1, false);
+            let _ = a.info(2, true);
+        }
+        assert_eq!(before, (a.in_use(), a.stats(), a.snapshot().peak, a.snapshot().owners));
+        let i = a.info(1, false);
+        assert_eq!(i.window_bytes, 128 * GIB);
+        assert_eq!(i.owner_used_bytes, 100 * GIB);
+        assert!(i.window_bytes > u64::from(u32::MAX));
+        // No window at all: everything zero, still an answer.
+        let n = dynamic(0, 256);
+        let z = n.info(1, false);
+        assert_eq!(
+            (z.window_bytes, z.used_bytes, z.owner_limit_bytes, z.owner_used_bytes),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(z.flags & INFO_OWNER_LIMIT, 0);
+    }
+
+    #[test]
+    fn info_after_forget_reports_zero_used() {
+        let mut a = dynamic(GIB, 0);
+        a.charge(1, 1, false, 100 * MIB).unwrap();
+        assert_eq!(a.info(1, false).owner_used_bytes, 100 * MIB);
+        a.forget_owner(1);
+        assert_eq!(a.info(1, false).owner_used_bytes, 0);
+        assert_eq!(a.info(1, false).used_bytes, 0);
     }
 
     #[test]

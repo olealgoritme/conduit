@@ -408,6 +408,46 @@ wait with a timeout shorter than the 5 s host timeout and re-check the semaphore
 
 Counters: `NvFence`, `NvFenceCl`, `NvFenceSig`, `NvFenceEarly`, `NvFenceErr` (section 7).
 
+### 4.7 WINDOW_INFO (op 13, 88 bytes)
+
+A read-only report of the RM window for NVK's live `VK_EXT_memory_budget` (policy and
+accounting: section 13). Advertised by `QUERY_CAPS.supported_ops` bit 13 (the op) and bit 36
+(`HELIOS_NVRM_CAP_WINDOW_INFO`; bits 32..35 are `SCANOUT_FENCE`, `PRESENT_FENCE`, `FLUSH_GATE`,
+`SCANOUT_RELEASE`). `HeliosNvrmWindowInfo` (`protocol/src/nvrm.rs`, `guest/rmclient/src/
+helios_nvrm_escape.h`), little endian:
+
+| offset | field | |
+|---|---|---|
+| 0..39 | `head` | `op` = 13 |
+| 40 | `u64 window_bytes` | the RM window's size as the device reports it (0: no window, or the transport is down) |
+| 48 | `u64 window_used_bytes` | mapped now by every process (the UVM aperture is another region and not counted) |
+| 56 | `u64 owner_limit_bytes` | the ceiling that applies to the caller. Dynamic policy: a ceiling on `window_used_bytes` (flag bit 2): `window_bytes` for the privileged device (the shell's), `window_bytes - reserve` (default reserve 256 MiB) for everyone else; `NvWinMaxMb` lowers the window first. `NvWinPolicy` = 0: a quarter of the window, a ceiling on `owner_used_bytes` |
+| 64 | `u64 owner_used_bytes` | this process's (device's) bytes of the window, all its window `MMAP`s (UVM aperture maps excluded); 0 for a process with none |
+| 72 | `u64 generation` | bumps when the window size or the policy may have changed (once per transport start today; 0 before the first) |
+| 80 | `u32 flags` | bit 0: `owner_limit_bytes < window_bytes` (this process cannot use the whole window); bit 1: the window can grow (always 0 today); bit 2: the limit is a ceiling on the all-owners total |
+| 84 | `u32 reserved` | 0 |
+
+Room left for the caller: `owner_limit_bytes - window_used_bytes` with bit 2 set,
+`owner_limit_bytes - owner_used_bytes` with it clear; the host may still refuse a map it cannot place
+(`DEVICE_ERROR`, errno in `flags` of `MMAP`; `NvWinRHost`). The status is always `OK`; no side
+effect, no host round trip, no registry write (the counters are mirrored by the worker); a few
+atomic reads, one read of the scanout state's leaf lock (is the caller the shell's device) and one
+short virtio-lock hold over the window account (`O(owners)`), so it is cheap enough for every new
+memory chunk; a UMD caches the answer for 10 ms. A buffer shorter than 88 bytes answers `BAD_RANGE`
+in the header (when the 40-byte header fits; otherwise `STATUS_BUFFER_TOO_SMALL` like every op) and
+is counted in the short-buffer counter (QUERY_STATS `out_escape_short_buffer`). Counter: `NvWinInfo`
+(calls). Tests: `protocol` (`window_info_*`: offsets, little-endian bytes, 64-bit fields, op and
+capability bits free) and `kmd_logic::rm_window` (`info_*`).
+
+**Phase 2 (design only, not implemented).** A per-process read-only page, mapped like the read
+ledger (`HELIOS_ESCAPE_MAP_READ_LEDGER`) and refreshed under a seqlock by the KMD whenever the
+window account changes (the table doors already call `mirror`), would let the UMD read the budget
+with no escape at all: `{seq, window_bytes, used, owner_limit, owner_used, generation, flags}`
+with the usual odd-while-writing sequence word. It is per process because `owner_limit` and
+`owner_used` are; one page per device, written for every device on every change would cost
+`O(devices)` per map, so the writes would be lazy (marked dirty at the change, refreshed by the
+next escape of that device or by the worker). Not needed while the escape costs about a microsecond.
+
 ## 5. Ownership, quotas and limits
 
 All `MAX_*` values are read from the code. "Per process" really means per device handle
@@ -1177,7 +1217,7 @@ reserve in use is `NvWinRsvUse`; `NvWinPriv` is the number of privileged devices
 Reclaiming an idle mapping is not safe from the KMD alone: the process holds a live user address
 into it, `MmUnmapLockedPages` is only legal in the owner's context, and an access after it faults
 the process instead of failing a call. No mapping is provably idle. The safe design is cooperative:
-a `WINDOW_INFO`-style read-only report (13.10) tells NVK how much room is left, and a future
+the read-only `WINDOW_INFO` report (section 4.7) tells NVK how much room is left, and a future
 "release hint" event (kind 3 or a new one) asks the UMD to `MUNMAP` its least recently used
 persistent maps (NVK knows which are idle; its patch falls back to system memory for the next one).
 The KMD would count hints sent and honoured. Nothing evicts today; the refusal is the pressure
@@ -1224,6 +1264,7 @@ both trees).
 | `NvMapTCap` / `NvMapTGrow` / `NvMapTRef` | mapping table slots, growths, refusals by its bounds |
 | `NvTblOom` | a table wanted to grow and the allocator refused, or a reservation found no storage because growth lagged (only a hostile burst gets there) |
 | `NvPinQRef` | `PIN`s refused by the per-process pin quota (before this counter nothing in the registry showed it) |
+| `NvWinInfo` | `WINDOW_INFO` calls answered (section 4.7) |
 | `NvSanityRef` | every refusal by a sanity bound: `NvHdl*Ref` plus `NvMapTRef` |
 
 ### 13.7 Reading a submission failure: which counters show KMD-side exhaustion

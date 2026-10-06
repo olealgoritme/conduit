@@ -1033,6 +1033,17 @@ impl VirtioGpu {
         r
     }
 
+    /// What `WINDOW_INFO` tells `owner` (`helios_kmd_logic::rm_window::Account::info`). Read
+    /// only: no counter moves.
+    pub fn nvrm_window_info(
+        &self,
+        owner: DeviceOwner,
+        live_privileged: bool,
+    ) -> rm_window::Info {
+        self.nvrm_window_acct
+            .info(owner.raw() as u64, live_privileged)
+    }
+
     /// `owner` set the foreign scanout source: it is the privileged device from now until
     /// its device is destroyed (the reserve is its to use).
     pub fn nvrm_window_mark_privileged(&mut self, owner: DeviceOwner) {

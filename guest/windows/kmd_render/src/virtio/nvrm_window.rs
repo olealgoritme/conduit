@@ -18,6 +18,14 @@ use helios_kmd_logic::rm_window::{pack_top, Config, Refusal, Snapshot, TOP_N};
 use super::gpu::DeviceOwner;
 use crate::adapter::AdapterContext;
 
+// The pure crate has no protocol dependency; its flag values are the ABI's.
+const _: () = {
+    use helios_kmd_logic::rm_window as rw;
+    assert!(rw::INFO_OWNER_LIMIT == helios_protocol::HELIOS_NVRM_WINDOW_FLAG_OWNER_LIMIT);
+    assert!(rw::INFO_CAN_GROW == helios_protocol::HELIOS_NVRM_WINDOW_FLAG_CAN_GROW);
+    assert!(rw::INFO_SHARED_CEILING == helios_protocol::HELIOS_NVRM_WINDOW_FLAG_SHARED_CEILING);
+};
+
 /// Window size, effective cap, reserve and policy in force (set once per transport).
 static WIN_WINDOW: AtomicU64 = AtomicU64::new(0);
 static WIN_CAP: AtomicU64 = AtomicU64::new(0);
@@ -133,8 +141,19 @@ pub fn configure(cfg: &Config, handles_per_owner: usize, maps_per_owner: usize) 
     WIN_CAP.store(cfg.cap, Ordering::Relaxed);
     WIN_RESERVE.store(cfg.reserve, Ordering::Relaxed);
     WIN_POLICY.store(cfg.policy.as_u32(), Ordering::Relaxed);
+    WIN_GENERATION.fetch_add(1, Ordering::Relaxed);
     HANDLES_PER_OWNER.store(handles_per_owner.min(u32::MAX as usize) as u32, Ordering::Relaxed);
     MAPS_PER_OWNER.store(maps_per_owner.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+}
+
+/// `WINDOW_INFO` calls answered (`NvWinInfo`).
+pub static INFO_CALLS: AtomicU32 = AtomicU32::new(0);
+/// Bumps when the window's size or the policy may have changed: once per transport start.
+static WIN_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// `WindowInfo.generation`: 0 before the first transport, then 1, 2, ...
+pub fn generation() -> u64 {
+    WIN_GENERATION.load(Ordering::Relaxed)
 }
 
 /// What `QUERY_CAPS.max_handles` reports: the per-process sanity bound in force.
@@ -239,6 +258,7 @@ pub fn publish_counters() {
     rec(b"NvMapTRef", MAP_REF.load(Ordering::Relaxed));
     rec(b"NvTblOom", TBL_OOM.load(Ordering::Relaxed));
     rec(b"NvPinQRef", PIN_QUOTA_REF.load(Ordering::Relaxed));
+    rec(b"NvWinInfo", INFO_CALLS.load(Ordering::Relaxed));
     // Every refusal by a sanity bound, handles and mappings together.
     rec(
         b"NvSanityRef",
