@@ -82,7 +82,8 @@ sudo. Attached VMs keep whatever network they had.
   session daemon too, and its profile only lets it start `/usr/bin` QEMU;
   Conduit adds one rule to `/etc/apparmor.d/local/usr.sbin.libvirtd` (the
   packages do this on install, `conduit` does it for a source build).
-- `<memoryBacking>` memfd + shared: the backend reads guest RAM.
+- `<memoryBacking>` memfd + shared: the backend reads guest RAM (huge
+  pages, CPU pinning and other host tuning: [HOST-TUNING.md](HOST-TUNING.md)).
 - `<cpu mode='host-passthrough'>` with `<maxphysaddr mode='passthrough'/>`:
   the GPU's shared-memory BAR is 64-bit and large.
 - direct kernel boot: `vms/NAME/boot/{vmlinuz,initrd.img}`, copied out of
