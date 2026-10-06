@@ -405,9 +405,26 @@ BAR-placed and `CpuVisible`, and its open takes the dedicated-Present-buffer cap
 unregistered buffer with `STATUS_INSUFFICIENT_RESOURCES`). That machinery is built for the
 KMD-originated DWM / IddCx surfaces, needs a live Venus client (`STATUS_DEVICE_NOT_READY` otherwise,
 which is not in `DxgkDdiCreateAllocation`'s legal set), and had never carried a UMD-created SHARED
-allocation. The exact failing return was not captured (there is no VM in this review): the registry
-breadcrumbs `0x0C01_00E1`, `0x0C01_00E2`, `0x0C01_00E3` and `0x0C02_00E4`, and `PBOwn`, say which on
-the next run. The fix does not depend on which: a placeholder no longer takes any of those paths.
+allocation. The exact failing return was not captured (there is no VM in this review).
+
+**Most probable original site.** `STATUS_DEVICE_NOT_READY`, an NTSTATUS outside
+`DxgkDdiCreateAllocation`'s legal set, the likeliest source of the `E_INVALIDARG` (not
+`E_OUTOFMEMORY`) the runtime reported: either `create_one` with ctx 0 and no Venus context in the
+KMD (`if ap.ctx_id == 0 { ap.ctx_id = adapter.venus_ctx_id(); } if ap.ctx_id == 0 { ...
+STATUS_DEVICE_NOT_READY }`, breadcrumb `0x0C01_00E2`), or `build_backing`'s `KmdStandardBuffer` arm
+when `with_venus_client` finds no client (`0x0C01_00E1`; a host-side Venus failure there is
+`0x0C01_00E3` with `STATUS_NO_MEMORY`, which would have reached the UMD as `E_OUTOFMEMORY`). An NVK
+guest whose host runs no Venus renderer has neither a Venus context nor a client, and shared id-less
+placeholders were the first UMD-created allocations to need one. Next after those: the open of the
+creating device (`0x0C02_00E4`, `PBOwn`). The fix does not depend on which: a placeholder takes none
+of those paths.
+
+**Unverified assumption: `CreateShared` is bit 1 (0x2).** The only KMD header on disk is Win8-era
+(`Reserved : 31`), so the bit position comes from the user-mode `D3DKMT_CREATEALLOCATIONFLAGS`
+(`CreateResource` 0x1, `CreateShared` 0x2) and from the existing use of bit 0 as `Resource`. The
+shared gate stays, and a wrong bit is made visible: see `ShPhShape`, `ShPhFl1..8`, `ShPhNotSh`,
+`ShPhFlg` and `ShPhPriv` below. If the shape arrives with flags that never include 0x2 while the
+texture is shared, the bit is wrong and the gate must use the right one.
 
 **What it is now** (`helios_kmd_logic::shared_placeholder`, host-tested; the I/O half is
 `kmd_render/src/ddi/shared_placeholder.rs`). A shared, identity-less `STANDARD` allocation is created
@@ -444,11 +461,30 @@ process), as it does today for any id-less resource; the placeholder never carri
 processes, and the KMD never resolves it to a resource for a copy, a Blt or a scan-out.
 
 **Counters** (registry: first event and every 64th): `ShPhMade` / `ShPhBytes` (created, last size),
-`ShPhRefuse` (soft refusals), `ShPhNear` (shared id-less `STANDARD` allocations that were not
-placeholders; `ShPhWhy` holds the reason, `Existing::code` 1..6 or `Refusal::code` 0x10), `ShPhOpen`
-(identity-less opens of the placeholder shape), `ShPhFree` (destroyed).
+`ShPhRefuse` / `ShPhRefWhy` (soft refusals, last `Refusal::code`, 0x10 = too large), `ShPhNear` /
+`ShPhNearWhy` (shared id-less `STANDARD` allocations that were not placeholders, last
+`Existing::code` 1..6), `ShPhOpen` (identity-less opens of the placeholder shape), `ShPhFree`
+(destroyed; counted after `ShPhMade`, which is counted before the producer registration that can
+still fail, so it never runs ahead), `ShPhShape` (identity-less `STANDARD` allocations whatever
+their flags), `ShPhFl1..ShPhFl8` (the creation-flags word of the first eight of them), `ShPhNotSh`
+(those with bit 1 clear) with `ShPhFlg` / `ShPhPriv` (flags word and private size of the last
+one), and `CrPrivSmall` / `CrApInvalid` (the two early refusals of `create_one`: private data under
+48 bytes, value its length; invalid record, value its magic). The private-data to identity-bit
+mapping is `shared_placeholder::identity_bits` (host-tested for every combination).
 
 **Not decided here.** An UNSHARED id-less `STANDARD` allocation keeps the Venus present-buffer path
-(a primary is never a placeholder). If the next run shows `ShPhNear` moving, the UMD is sending a
-size or trailer this table does not name; if `CARFlg` is not 3 for a shared texture, bit 1 is not
-`CreateShared` and the table's second row needs the right bit.
+(a primary is never a placeholder).
+
+**Next VM run checklist.**
+
+1. `CARFlg` for a shared texture: expect 3 (`Resource | CreateShared`); `CARAPSz` and `CARRSz`
+   expect 96 each. `ShPhFl1..8` shows the same words for the id-less shape.
+2. `ShPhMade` moves once per shared placeholder and `ShPhFree` follows it; `ShPhNotSh` stays 0
+   for shared textures (if it moves with `ShPhFlg` not 3, the bit is wrong); `ShPhNear` stays 0
+   (if it moves, `ShPhNearWhy` 5 = a private size other than 96, 6 = an identity bit);
+   `ShPhRefuse` / `ShPhRefWhy` only for a size above 4 GiB.
+3. `ShPhOpen` moves once per open of a placeholder (the creator's own device open included).
+4. If the create still fails: `0x0C01_0002` / `CrPrivSmall` (private data under 48 bytes) against
+   `0x0C01_0003` / `CrApInvalid` (invalid record), and `0x0C11_<kind>` (the kind that arrived;
+   `0x0C11_0002` = STANDARD) say whether the failure is before the decision; `0x0C01_00E1`,
+   `0x0C01_00E2`, `0x0C01_00E3`, `0x0C02_00E4`, `PBOwn` say whether the ordinary path was taken.
