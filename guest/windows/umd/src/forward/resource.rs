@@ -272,7 +272,15 @@ pub(crate) unsafe fn allocate_wddm_resource(
     };
 
     let mut private = RuntimeAllocPrivate {
-        layout: helios_protocol::HeliosWddmAllocLayout::zeroed(),
+        layout: helios_protocol::HeliosWddmAllocLayout {
+            modifier: 0,
+            magic: 0,
+            version: 0,
+            fourcc: 0,
+            stride: 0,
+            plane_offset: 0,
+            reserved: 0,
+        },
         alloc: HeliosWddmAllocPrivate::new(
             if backing.is_some() {
                 HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
