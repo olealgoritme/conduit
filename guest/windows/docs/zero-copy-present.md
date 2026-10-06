@@ -1151,6 +1151,7 @@ full zero block once per generation even if nothing is ever seen.
 | `DmaGpuFence`, `PresentWmk`, `WddmHoldMs`, `WddmHeadMs` | transport init (`VirtioGpu::init`, every StartDevice) | `VirtioGpu` fields / statics | `DmaGfEff`, `PrWmkEff`, `WdHoldEff`, `WdHeadEff` (new) |
 | `FlGSyncMs` | transport init (`flush_trace::init_from_registry`) | static | `FlGSyncEff` (now written at every init; before, only once a flush-gate Render was seen) |
 | `MsiVectors` | transport init (MSI plan) | local | `MsiVec` |
+| `MsiMode`, `MsiLatch` | AddDevice (`virtio::msi::apply_key_policy`; `MsiLatch` also at transport up) | not cached | `MsiModeEff`, `MsiWant`, `MsiKeyWr` (the device-key write), `MsiLatch` (0 or 1) |
 | `VsyncRateMhz` | StartDevice | static | `VsRate` |
 | `VsPowerMode`, `VsWatchdog`, `VsIdleWake`, `VsWdTimer` (15.4, 19.3) | StartDevice (`stall_diag::reread_knobs`) | static | `VsPwrEff`, `VsWdgEff`, `VsIdlEff`, `VsWdTmEff` (every start, 0 included) |
 | `OutputTech` | each child-capabilities query | not cached | `OutTech` |
