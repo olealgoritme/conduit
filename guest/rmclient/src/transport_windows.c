@@ -95,6 +95,7 @@ struct win_ctx {
     uint32_t max_buffer; /* QUERY_CAPS.max_buffer_bytes */
     uint64_t supported_ops; /* QUERY_CAPS.supported_ops: bit n = HELIOS_NVRM_OP n */
     uint64_t epoch;      /* the KMD's device generation at init */
+    LUID luid;           /* the chosen adapter's LUID (D3DKMTEnumAdapters2) */
 
     /* Host's per-class allocation parameter sizes (GetSysFiles section 3). */
     uint32_t *alloc_pairs; /* {class, size} * n_alloc */
@@ -372,6 +373,7 @@ static int find_adapter(struct win_ctx *c)
         const int try_candidate = chosen == 0 && (name_match || !query_ok);
         if (try_candidate && probe_adapter(c, h, &device, &context) == 0) {
             chosen = h;
+            c->luid = ea.pAdapters[i].AdapterLuid;
             found = 0;
             continue;
         }
@@ -1193,6 +1195,196 @@ int crm_win_scanout_release(uint32_t handle)
     return kmd_status_to_errno(rel.head.status);
 }
 
+/* ---- Helios extras beyond NVRM: adapter identity, Venus holder contexts,
+ * foreign resources (guest/windows/protocol/src/foreign.rs). All go through the
+ * same D3DKMT device as the RM escapes, so the KMD sees one owner for the DRM
+ * file, the context and the imported resource. ------------------------------ */
+
+int crm_win_adapter_luid(uint32_t *low, int32_t *high)
+{
+    struct win_ctx *c = &g_ctx;
+    int r = win_init(c);
+    if (r)
+        return r;
+    if (low)
+        *low = c->luid.LowPart;
+    if (high)
+        *high = c->luid.HighPart;
+    return 0;
+}
+
+/* The HeliosEscapeHeader every non-NVRM verb starts with (protocol escape.rs). */
+struct crm_helios_hdr {
+    uint32_t magic, cmd_type, version, size;
+};
+#define CRM_HELIOS_MAGIC 0x48454C53u
+#define CRM_HELIOS_ESC_CTX_CREATE 0x0002u
+#define CRM_HELIOS_ESC_CTX_DESTROY 0x0003u
+#define CRM_HELIOS_ESC_RELEASE_BLOB 0x0008u
+#define CRM_HELIOS_ESC_FOREIGN 0x0018u
+#define CRM_VIRTIO_GPU_CAPSET_VENUS 4u
+
+static void helios_hdr(struct crm_helios_hdr *h, uint32_t cmd, uint32_t size)
+{
+    h->magic = CRM_HELIOS_MAGIC;
+    h->cmd_type = cmd;
+    h->version = 1;
+    h->size = size;
+}
+
+int crm_win_venus_ctx_create(uint32_t *ctx_id)
+{
+    struct win_ctx *c = &g_ctx;
+    *ctx_id = 0;
+    int r = win_init(c);
+    if (r)
+        return r;
+    struct {
+        struct crm_helios_hdr hdr;
+        uint32_t capset_id, out_ctx_id;
+    } q;
+    memset(&q, 0, sizeof(q));
+    helios_hdr(&q.hdr, CRM_HELIOS_ESC_CTX_CREATE, sizeof(q));
+    q.capset_id = CRM_VIRTIO_GPU_CAPSET_VENUS;
+    r = nvrm_escape(c, &q, sizeof(q));
+    if (r)
+        return r;
+    if (q.out_ctx_id == 0)
+        return -EIO;
+    *ctx_id = q.out_ctx_id;
+    return 0;
+}
+
+void crm_win_venus_ctx_destroy(uint32_t ctx_id)
+{
+    struct win_ctx *c = &g_ctx;
+    if (!c->ready || ctx_id == 0)
+        return;
+    struct {
+        struct crm_helios_hdr hdr;
+        uint32_t ctx_id, padding;
+    } q;
+    memset(&q, 0, sizeof(q));
+    helios_hdr(&q.hdr, CRM_HELIOS_ESC_CTX_DESTROY, sizeof(q));
+    q.ctx_id = ctx_id;
+    (void)nvrm_escape(c, &q, sizeof(q));
+}
+
+int crm_win_release_blob(uint32_t ctx_id, uint32_t resource_id)
+{
+    struct win_ctx *c = &g_ctx;
+    if (!c->ready)
+        return -ENODEV;
+    struct {
+        struct crm_helios_hdr hdr;
+        uint32_t ctx_id, resource_id, flags, padding;
+    } q;
+    memset(&q, 0, sizeof(q));
+    helios_hdr(&q.hdr, CRM_HELIOS_ESC_RELEASE_BLOB, sizeof(q));
+    q.ctx_id = ctx_id;
+    q.resource_id = resource_id;
+    return nvrm_escape(c, &q, sizeof(q));
+}
+
+/* helios_foreign.h, restated (it lives in guest/windows/protocol/include). */
+struct crm_foreign_head {
+    struct crm_helios_hdr hdr;
+    uint32_t abi_version, op;
+    int32_t status;
+    uint32_t reserved;
+    uint64_t epoch;
+};
+_Static_assert(sizeof(struct crm_foreign_head) == 40, "foreign head");
+
+static int foreign_status(int32_t st)
+{
+    switch (st) {
+    case 0: return 0;
+    case 1: return -ENOSYS;  /* UNSUPPORTED: gate closed */
+    case 2: return -EBADF;   /* NOT_OWNED */
+    case 3: return -ESRCH;   /* BAD_CONTEXT */
+    case 4: return -EINVAL;  /* BAD_RANGE */
+    case 5: return -ENOSPC;  /* NO_RESOURCES */
+    default: return -EIO;    /* DEVICE_ERROR */
+    }
+}
+
+int crm_win_foreign_caps(uint32_t *caps_flags)
+{
+    struct win_ctx *c = &g_ctx;
+    *caps_flags = 0;
+    int r = win_init(c);
+    if (r)
+        return r;
+    struct {
+        struct crm_foreign_head head;
+        uint64_t supported_ops;
+        uint32_t caps_flags, max_per_owner, max_total, reserved0;
+        uint64_t max_bytes_per_resource, max_bytes_per_owner;
+        uint32_t live_total, live_owner, imported, refused;
+    } q;
+    _Static_assert(sizeof(q) == 96, "query caps");
+    memset(&q, 0, sizeof(q));
+    helios_hdr(&q.head.hdr, CRM_HELIOS_ESC_FOREIGN, sizeof(q));
+    q.head.abi_version = 1;
+    q.head.op = 1; /* QUERY_CAPS */
+    r = nvrm_escape(c, &q, sizeof(q));
+    if (r)
+        return r; /* -ENOSYS: a KMD without the verb */
+    r = foreign_status(q.head.status);
+    if (r)
+        return r;
+    *caps_flags = q.caps_flags;
+    return 0;
+}
+
+int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id,
+                      uint32_t *host_errno)
+{
+    struct win_ctx *c = &g_ctx;
+    *resource_id = 0;
+    if (host_errno)
+        *host_errno = 0;
+    if (!c->ready)
+        return -ENODEV;
+    struct {
+        struct crm_foreign_head head;
+        uint32_t ctx_id, rm_handle, gem_handle, flags;
+        uint64_t size;
+        uint32_t out_resource_id, out_host_errno;
+        uint32_t width, height, stride, offset, fourcc, reserved;
+        uint64_t modifier;
+    } q;
+    _Static_assert(sizeof(q) == 104, "import rm + layout");
+    memset(&q, 0, sizeof(q));
+    helios_hdr(&q.head.hdr, CRM_HELIOS_ESC_FOREIGN, sizeof(q));
+    q.head.abi_version = 1;
+    q.head.op = 2; /* IMPORT_RM */
+    q.ctx_id = in->ctx_id;
+    q.rm_handle = in->rm_handle;
+    q.gem_handle = in->gem_handle;
+    q.flags = 1; /* LAYOUT */
+    q.size = in->size;
+    q.width = in->width;
+    q.height = in->height;
+    q.stride = in->stride;
+    q.offset = in->offset;
+    q.fourcc = in->fourcc;
+    q.modifier = in->modifier;
+    int r = nvrm_escape(c, &q, sizeof(q));
+    if (r)
+        return r;
+    if (host_errno)
+        *host_errno = q.out_host_errno;
+    r = foreign_status(q.head.status);
+    if (r)
+        return r;
+    if (q.out_resource_id == 0)
+        return -EIO;
+    *resource_id = q.out_resource_id;
+    return 0;
+}
+
 static struct crm_transport windows_transport = {
     .abi = CRM_TRANSPORT_ABI,
     .flags = 0,
@@ -1265,4 +1457,41 @@ int crm_win_scanout_release(uint32_t handle)
     return -ENOSYS;
 }
 
+int crm_win_adapter_luid(uint32_t *low, int32_t *high)
+{
+    (void)low; (void)high;
+    return -ENOSYS;
+}
+
+int crm_win_venus_ctx_create(uint32_t *ctx_id)
+{
+    *ctx_id = 0;
+    return -ENOSYS;
+}
+
+void crm_win_venus_ctx_destroy(uint32_t ctx_id) { (void)ctx_id; }
+
+int crm_win_release_blob(uint32_t ctx_id, uint32_t resource_id)
+{
+    (void)ctx_id; (void)resource_id;
+    return -ENOSYS;
+}
+
+int crm_win_foreign_caps(uint32_t *caps_flags)
+{
+    *caps_flags = 0;
+    return -ENOSYS;
+}
+
+int crm_win_import_rm(const struct crm_foreign_import *in, uint32_t *resource_id,
+                      uint32_t *host_errno)
+{
+    (void)in;
+    *resource_id = 0;
+    if (host_errno)
+        *host_errno = 0;
+    return -ENOSYS;
+}
+
 #endif
+
