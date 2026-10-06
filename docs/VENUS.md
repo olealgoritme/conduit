@@ -326,7 +326,9 @@ page-aligned, inside region 3, not overlapping another mapping; scanout only
 0; at most 1024 contexts and 65536 resources per VM.
 
 **Windows/OVMF guests.** BAR 4 (the shared-memory BAR) is 64 GiB with or
-without `--venus`, and 128 GiB when `--venus-hostmem-mib` is above 31 GiB.
+without `--venus`, and 128 GiB when `--venus-hostmem-mib` is above 31 GiB
+(with the default 4 GiB window; in general when window + 32 GiB + region 3
+is more than 64 GiB).
 OVMF places it only if the guest sees the host's physical address width:
 QEMU `-cpu host,host-phys-bits=on`, libvirt `<maxphysaddr mode='passthrough'/>`
 (`conduit up` and `conduit attach` already set this). Failing that, give OVMF

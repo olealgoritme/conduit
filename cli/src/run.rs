@@ -250,6 +250,10 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
             .arg("--venus-renderer")
             .arg(rt.venus_sock());
     }
+    // conduit-vmm is given the same number (vm::vmm_config).
+    if let Some(mib) = crate::config::window_mib() {
+        cmd.arg("--window-mib").arg(mib.to_string());
+    }
     if let Some(m) = mode {
         cmd.arg("--display")
             .arg(m.to_string())

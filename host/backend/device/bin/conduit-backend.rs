@@ -158,6 +158,14 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     trace_socket: Option<PathBuf>,
 
+    /// Size of the window (shared memory region 1), where every guest CPU
+    /// mapping of RM memory is placed, in MiB. A power of two from 32 to
+    /// 65536. Address space, not memory. conduit-vmm's `gpu-forward.window-mib`
+    /// must be the same number (QEMU asks; conduit-vmm's BAR is configured).
+    #[arg(long, value_name = "MIB",
+          default_value_t = device::shm_regions::WINDOW_MIB_DEFAULT)]
+    window_mib: u64,
+
     /// Serve Venus to a Windows guest (docs/VENUS.md): sets the config bit,
     /// answers GpuCmd and advertises shared memory region 3. Needs a frontend
     /// that asks for the region table (QEMU); conduit-vmm's BARs are fixed.
@@ -1024,11 +1032,13 @@ impl NvGpuBackend {
     /// The guest driver rejects `num_gpus == 0`, so a host with no NVIDIA
     /// module loaded is refused here, where the reason can be stated, rather
     /// than in a guest as a bare -EINVAL from probe.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         proc_nvidia: &Path,
         allow_nearest_abi: bool,
         caps: Caps,
         vram_limit_mib: Option<u64>,
+        window_len: u64,
         display: Option<(DisplayMode, Arc<DisplayLink>, bool)>,
         input_target: EventTarget,
         input_claims: Arc<GuestInputClaims>,
@@ -1046,7 +1056,7 @@ impl NvGpuBackend {
         );
         log::info!("host driver {version}, {} GPU(s)", gpus.len());
 
-        let mut nvidia = NvidiaBackend::with_default_zones();
+        let mut nvidia = NvidiaBackend::new(device::shm::ZoneConfig::for_window(window_len));
         let release = abi::version::DriverVersion::parse(&version)
             .ok_or_else(|| anyhow::anyhow!("host driver version {version:?} does not parse"))?;
         nvidia
@@ -1444,7 +1454,7 @@ impl VhostUserBackendMut for NvGpuBackend {
 
     /// The regions a frontend lays out for us: QEMU >= 11.1 asks, because
     /// SHMEM is offered, and refuses the device if this goes unanswered.
-    /// conduit-vmm never asks; it has the same two sizes built in.
+    /// conduit-vmm never asks; its config carries the window's size.
     fn get_shmem_config(&self) -> std::io::Result<VhostUserShMemConfig> {
         SPEC_SHMEM_FRONTEND.store(true, std::sync::atomic::Ordering::Relaxed);
         let window = self.nvidia.lock().expect("backend mutex").shm_total_size();
@@ -1783,12 +1793,16 @@ fn main() -> anyhow::Result<()> {
         (None, _) => None,
     };
 
+    let window_len = device::shm_regions::window_len(args.window_mib)
+        .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
+    log::info!("window: {} MiB (shmid {SHM_ID_WINDOW})", args.window_mib);
     #[allow(unused_mut)]
     let mut nvgpu = NvGpuBackend::new(
         &args.proc_nvidia,
         args.allow_nearest_abi,
         args.caps,
         args.vram_limit_mib,
+        window_len,
         display,
         input_target,
         input_claims,

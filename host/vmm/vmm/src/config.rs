@@ -106,6 +106,12 @@ pub struct GpuForward {
     /// allocate until the card is exhausted.
     #[serde(default)]
     pub vram_limit_mib: Option<u64>,
+    /// Size of the window (BAR 2) the backend places device memory in, in
+    /// MiB: a power of two from 32 to 65536. It must be the backend's
+    /// `--window-mib`, whose allocator hands out offsets up to its own size.
+    /// Omitted, both default to 4096. Address space only.
+    #[serde(default)]
+    pub window_mib: Option<u64>,
 }
 
 fn default_proc_nvidia() -> PathBuf {
