@@ -48,6 +48,20 @@ static volatile LONG64 *signalled_value() {
   return p;
 }
 
+// A file whose existence asks both processes to finish now, from outside the
+// desktop session (a harness must not force-kill an NVK app that may own the
+// screen through scanout): chromium_like.stop next to the executable.
+static bool stop_requested() {
+  static char path[MAX_PATH] = "";
+  if (!path[0]) {
+    GetModuleFileNameA(nullptr, path, sizeof(path));
+    char *slash = std::strrchr(path, '\\');
+    std::snprintf(slash ? slash + 1 : path, sizeof(path) - size_t((slash ? slash + 1 : path) - path),
+                  "chromium_like.stop");
+  }
+  return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
 static double now_ms() {
   static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
   LARGE_INTEGER t;
@@ -134,7 +148,7 @@ static int child(const char *handoff, UINT fps, double seconds, DWORD parent_pid
   const double period = 1000.0 / fps, t0 = now_ms();
   double worst_acquire = 0;
   UINT frame = 0, acquire_timeouts = 0;
-  while (now_ms() - t0 < seconds * 1000.0) {
+  while (now_ms() - t0 < seconds * 1000.0 && !stop_requested()) {
     frame++;
     if (keyed) {
       const double a = now_ms();
@@ -171,7 +185,14 @@ static int child(const char *handoff, UINT fps, double seconds, DWORD parent_pid
 
 // ---- parent: the GPU process ----------------------------------------------
 
-static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcW(h, m, w, l); }
+static bool g_closed = false;
+static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+  if (m == WM_CLOSE) {
+    g_closed = true;
+    return 0;
+  }
+  return DefWindowProcW(h, m, w, l);
+}
 
 struct Stats {
   UINT frames = 0, slow = 0, acquire_timeouts = 0;
@@ -344,6 +365,10 @@ int main(int argc, char **argv) {
   MSG msg;
   while (now_ms() - t0 < seconds * 1000.0) {
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+    if (g_closed || ((frame & 15) == 0 && stop_requested())) {
+      std::printf("       stopped early (stop file or WM_CLOSE)\n");
+      break;
+    }
     const double f0 = now_ms();
     frame++;
     double t_acq = 0, t_wait = 0;
