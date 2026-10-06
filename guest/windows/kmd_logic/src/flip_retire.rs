@@ -606,7 +606,7 @@ pub const COUNTERS: &[&str] = &[
     "VbUsed", "VbTicks", "VbUsedPm",
     // heartbeat lateness
     "VsLate0", "VsLate1", "VsLate2", "VsLate3", "VsLate4", "VsLate5", "VsLate6", "VsLate7",
-    "VsLateMaxUs",
+    "VsLateMaxUs", "VsAheadN", "VsAheadMaxUs",
     // announce
     "FaKnob", "FaEarly", "FaDdi", "FaWorker", "FaRefuse", "FaLate", "FaTick", "FaNo", "FaNoWhy",
     "FaNoBusy", "FaNoUnk", "FaNoFail", "FaNoOther", "FaNoFgn",

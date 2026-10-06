@@ -31,7 +31,7 @@
 //!                the device-teardown family, so ExchangePreStartInfo moved to
 //!                0x0E10_0001 (and its success marker 0x0E00_0002 -> 0x0E10_0002).
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use wdk_sys::ntddk::RtlWriteRegistryValue;
 
@@ -72,6 +72,8 @@ pub fn reread_level() -> u32 {
 const RTL_REGISTRY_SERVICES: u32 = 1;
 /// `REG_DWORD`.
 const REG_DWORD: u32 = 4;
+/// `REG_QWORD`.
+const REG_QWORD: u32 = 11;
 /// Cap on breadcrumbs so a chatty steady state can't grow the key unbounded.
 const MAX_STEPS: u32 = 3000;
 
@@ -124,6 +126,150 @@ fn record_named(name: &[u16], mut code: u32) {
             4,
         );
     }
+}
+
+/// [`record_named`] for a 64-bit value (`REG_QWORD`, 8 bytes): one registry transaction, so a
+/// reader sees the whole value or none of it. PASSIVE_LEVEL only.
+fn record_named_q(name: &[u16], mut value: u64) {
+    // SAFETY: PASSIVE_LEVEL (see module note). `name` is a NUL-terminated UTF-16 value name;
+    // ValueData points to an 8-byte QWORD that RtlWriteRegistryValue copies before returning.
+    unsafe {
+        let _ = RtlWriteRegistryValue(
+            RTL_REGISTRY_SERVICES,
+            SERVICE_NAME.as_ptr(),
+            name.as_ptr(),
+            REG_QWORD,
+            (&mut value as *mut u64).cast::<core::ffi::c_void>(),
+            8,
+        );
+    }
+}
+
+/// The registry mirror's pass-local write policy (15.18.16): inside a pass of `ddi::mirror_thread`
+/// (and only there) a write whose value is what the registry already holds is skipped, and a short
+/// rest is taken every few writes so a hundred-write pass does not keep one processor and the
+/// registry lock for tens of milliseconds. Every OTHER writer is untouched, except that each write
+/// from anywhere updates the cache, so the cache is the registry's content (a name written by a
+/// worker one-shot and by the mirror cannot be skipped wrongly).
+mod mirror {
+    use super::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+    const SLOTS: usize = 2048;
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicU64 = AtomicU64::new(0);
+    /// One entry per name hash: a 32-bit tag of the name in the high half (never 0: an empty slot
+    /// matches nothing) and the last value written in the low half.
+    static CACHE: [AtomicU64; SLOTS] = [Z; SLOTS];
+    /// The thread inside a pass (0 = none), `MirChanged` and `MirYield` in force, writes counted
+    /// in a pass since the last rest, writes made / skipped / rests taken (`MirWrN`, `MirSkipN`,
+    /// `MirYlds`; owned by `ddi::mirror_thread`).
+    static PASS_THREAD: AtomicUsize = AtomicUsize::new(0);
+    static CHANGED_ONLY: AtomicU32 = AtomicU32::new(1);
+    static YIELD_EVERY: AtomicU32 = AtomicU32::new(0);
+    static SINCE_REST: AtomicU32 = AtomicU32::new(0);
+    pub(super) static WRITES: AtomicU32 = AtomicU32::new(0);
+    pub(super) static SKIPPED: AtomicU32 = AtomicU32::new(0);
+
+    extern "system" {
+        /// `KeGetCurrentThread()`: any IRQL.
+        fn KeGetCurrentThread() -> usize;
+    }
+
+    /// FNV-1a over the UTF-16 units of the value name.
+    fn hash(name: &[u16]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for c in name {
+            h ^= *c as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// `(slot, tag)` of a name.
+    pub(super) fn key(name: &[u16]) -> (usize, u32) {
+        let h = hash(name);
+        (((h ^ (h >> 32)) as usize) & (SLOTS - 1), ((h >> 32) as u32) | 1)
+    }
+
+    fn entry(tag: u32, value: u32) -> u64 {
+        ((tag as u64) << 32) | value as u64
+    }
+
+    /// The calling thread is the one inside a pass.
+    pub(super) fn in_pass() -> bool {
+        let t = PASS_THREAD.load(Ordering::Relaxed);
+        // SAFETY: a scalar read of the current thread pointer, any IRQL.
+        t != 0 && t == unsafe { KeGetCurrentThread() }
+    }
+
+    /// The pass's write is redundant: the registry already holds `value` under this name.
+    pub(super) fn unchanged(k: (usize, u32), value: u32) -> bool {
+        CHANGED_ONLY.load(Ordering::Relaxed) != 0
+            && CACHE[k.0].load(Ordering::Relaxed) == entry(k.1, value)
+    }
+
+    /// The cache holds exactly `value` under this name (regardless of `MirChanged` and of the
+    /// calling thread: the per-flip one-value breadcrumbs always use it).
+    pub(super) fn cached_equal(k: (usize, u32), value: u32) -> bool {
+        CACHE[k.0].load(Ordering::Relaxed) == entry(k.1, value)
+    }
+
+    /// `value` was written under this name, by any thread.
+    pub(super) fn wrote(k: (usize, u32), value: u32) {
+        CACHE[k.0].store(entry(k.1, value), Ordering::Relaxed);
+    }
+
+    /// Forget everything (the registry may have been edited by hand: every value is rewritten).
+    pub(crate) fn forget_all() {
+        for c in &CACHE {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// A pass begins on the calling thread, with the knobs in force.
+    pub(crate) fn begin_pass(changed_only: bool, yield_every: u32) {
+        CHANGED_ONLY.store(changed_only as u32, Ordering::Relaxed);
+        YIELD_EVERY.store(yield_every, Ordering::Relaxed);
+        SINCE_REST.store(0, Ordering::Relaxed);
+        // SAFETY: as in `in_pass`.
+        PASS_THREAD.store(unsafe { KeGetCurrentThread() }, Ordering::Release);
+    }
+
+    /// The pass is over.
+    pub(crate) fn end_pass() {
+        PASS_THREAD.store(0, Ordering::Release);
+    }
+
+    /// One write was made inside a pass: count it, and tell whether a rest is due.
+    pub(super) fn made_write() -> bool {
+        WRITES.fetch_add(1, Ordering::Relaxed);
+        let every = YIELD_EVERY.load(Ordering::Relaxed);
+        if every == 0 {
+            return false;
+        }
+        let n = SINCE_REST.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if n >= every {
+            SINCE_REST.store(0, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+}
+
+pub(crate) use mirror::{begin_pass as mirror_begin_pass, end_pass as mirror_end_pass, forget_all as mirror_forget_all};
+
+/// Registry writes the mirror's passes made and skipped as unchanged (`MirWrN`, `MirSkipN`).
+pub(crate) fn mirror_write_counts() -> (u32, u32) {
+    (
+        mirror::WRITES.load(Ordering::Relaxed),
+        mirror::SKIPPED.load(Ordering::Relaxed),
+    )
+}
+
+/// Zero the two mirror write counters (StartDevice).
+pub(crate) fn mirror_reset_counts() {
+    mirror::WRITES.store(0, Ordering::Relaxed);
+    mirror::SKIPPED.store(0, Ordering::Relaxed);
 }
 
 /// A lifecycle failure that must stay visible on a **default** boot.
@@ -576,7 +722,64 @@ pub fn record_named_bytes(name: &[u8], value: u32) {
         i += 1;
     }
     buf[n] = 0;
+    let key = mirror::key(&buf[..n]);
+    let in_pass = mirror::in_pass();
+    if in_pass && mirror::unchanged(key, value) {
+        mirror::SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     record_named(&buf[..=n], value);
+    mirror::wrote(key, value);
+    if in_pass && mirror::made_write() {
+        crate::ddi::mirror_thread::rest();
+    }
+}
+
+/// [`record_named_bytes`] unless the registry already holds `value` under this name, as far as the
+/// writes of this driver tell (every write from every thread updates the same cache). For the
+/// one-value breadcrumbs of a per-flip path (`VpDSt`: the status of every programming, almost
+/// always the same), which cost the HPD worker a registry transaction of a hundred microseconds or
+/// more per flip, between two flips. The value is rewritten at once when it changes, and by the
+/// mirror's full refresh at the latest 30 s after it was lost (`MirChanged`). PASSIVE_LEVEL only.
+pub fn record_named_changed(name: &[u8], value: u32) {
+    let mut buf = [0u16; 16];
+    let n = name.len().min(14);
+    let mut i = 0;
+    while i < n {
+        buf[i] = name[i] as u16;
+        i += 1;
+    }
+    buf[n] = 0;
+    let key = mirror::key(&buf[..n]);
+    if mirror::cached_equal(key, value) {
+        return;
+    }
+    record_named(&buf[..=n], value);
+    mirror::wrote(key, value);
+}
+
+/// Whether the calling thread is inside a pass of the registry mirror thread.
+pub(crate) fn mirror_in_pass() -> bool {
+    mirror::in_pass()
+}
+
+/// [`record_named_bytes`] for a 64-bit value (REG_QWORD): the value is ONE registry transaction,
+/// so the two 32-bit halves of a (count, time) pair are never from different writes. Not part of
+/// the mirror's changed-only cache (the callers keep their own, `stall_diag::rec_live_q`); inside a
+/// mirror pass it counts towards the rest like any write. PASSIVE_LEVEL only.
+pub fn record_named_qword(name: &[u8], value: u64) {
+    let mut buf = [0u16; 16];
+    let n = name.len().min(14);
+    let mut i = 0;
+    while i < n {
+        buf[i] = name[i] as u16;
+        i += 1;
+    }
+    buf[n] = 0;
+    record_named_q(&buf[..=n], value);
+    if mirror::in_pass() && mirror::made_write() {
+        crate::ddi::mirror_thread::rest();
+    }
 }
 
 /// `RTL_QUERY_REGISTRY_DIRECT` — store the value straight into EntryContext
@@ -862,6 +1065,26 @@ pub mod knobs {
     /// mirrored as `MirThrEff`; a thread that could not be joined (`MirLeak` 1) turns it off for
     /// the rest of the driver image's life.
     pub const MIRROR_THREAD: KnobName = KnobName::new(b"MirrorThread");
+    /// `MirPrio` (default 6, 0 = leave the thread's priority alone): the kernel priority the mirror
+    /// thread runs at, below the HPD worker's (8, the default of a system thread), so a registry
+    /// pass never delays the flip path. 1 to 15 are taken as given; anything else is the default.
+    /// Read at every StartDevice, mirrored as `MirPrioEff`. `docs/kmd-rm-client.md` 15.18.16.
+    pub const MIRROR_PRIO: KnobName = KnobName::new(b"MirPrio");
+    /// `MirYield` (default 32, 0 = never): the mirror thread rests (a one-millisecond relative wait
+    /// that ends at once on a stop; the system timer may round it up) after this many registry
+    /// writes of one pass, so a hundred-write pass does not hold one processor for tens of
+    /// milliseconds. Mirrored as `MirYldEff`. `docs/kmd-rm-client.md` 15.18.16.
+    pub const MIRROR_YIELD: KnobName = KnobName::new(b"MirYield");
+    /// `MirChanged` (default 1, 0 = off): inside a mirror pass skip a write whose value is what the
+    /// registry already holds (every value is written again at least every 30 s, so a hand-edited
+    /// or deleted one comes back). 0 writes every value of every pass, as before. Mirrored as
+    /// `MirChgEff`. `docs/kmd-rm-client.md` 15.18.16.
+    pub const MIRROR_CHANGED: KnobName = KnobName::new(b"MirChanged");
+    /// `VsCatchUp` (default 0): 1 serves ONE missed heartbeat slot with an immediate extra tick
+    /// when a tick callback ran between one and 1.5 periods after its own deadline (the missed
+    /// slot is otherwise dropped, no burst). Read at every StartDevice, mirrored as `VsCatchEff`.
+    /// `docs/kmd-rm-client.md` 15.18.16.
+    pub const VS_CATCH_UP: KnobName = KnobName::new(b"VsCatchUp");
     /// `FlipBusyFly` (default 0, at most 4): how many pipelined `ForeignFlip` host flips may be in
     /// flight while the worker still counts as idle for a `FlipAnnounce` (0 = none: strict: the
     /// previous buffer is certainly no longer read when the next flip is announced; 1 lets the

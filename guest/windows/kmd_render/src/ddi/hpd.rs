@@ -354,14 +354,18 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // The `Nv*` registry mirror the NVRM escapes asked for. It used to run
         // inside the escape (about a millisecond added to every Open / Close /
         // Map / Pin and to every 256th forward); here it costs nobody's latency.
+        // 15.18.16: the mirror thread writes it; this step hands it over.
         stall_diag::hpd_enter(site::NVRM_PUBLISH);
-        super::escape::nvrm_publish_service();
+        super::escape::nvrm_publish_service(!crate::ddi::flip_announce::worker_idle(adapter));
 
         // Publish the unsampled scanout-bind trace. This is the ONE PASSIVE
         // site that mirrors it; accumulation happens at DIRQL/DISPATCH with
         // atomics only. Throttled inside `dump_periodic` — a dump is ~120
         // registry writes, so it must never run per frame. Placed after the
         // deferred programming so a dump reflects the bind that just ran.
+        // 15.18.16: with the mirror thread this step only REQUESTS the dump (the writes were
+        // 16 to 31 ms of `FlipMaxUs` at this site); without it the dump waits for a worker
+        // with no flip in hand, 10 s at most.
         stall_diag::hpd_enter(site::DUMP);
         crate::ddi::scanout_trace::dump_periodic(adapter);
 

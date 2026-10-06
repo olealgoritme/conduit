@@ -62,6 +62,7 @@ pub mod restart_flip;
 pub mod stall_diag;
 pub mod sweep_budget;
 pub mod vsync_rate;
+pub mod vsync_snap;
 pub mod vsync_wd;
 pub mod windowed_ready;
 pub mod slice_budget;
@@ -124,6 +125,74 @@ pub mod vsync_deadline {
         candidate.checked_add(advance)
     }
 
+    /// What one tick's re-arm decided ([`advance`]).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Advance {
+        /// The deadline to arm. Never earlier than the first slot after the tick that is running,
+        /// except for a catch-up (`caught_up`), whose deadline is the missed slot itself: already
+        /// past, so [`relative_due`] arms it one 100 ns unit ahead.
+        pub deadline: u64,
+        /// Period slots the grid moved by in this step: 1 for a tick that ran in its own slot,
+        /// more when the callback ran late and slots were dropped. The sum over a run is the
+        /// number of slots that elapsed (`VsSlotN`), whatever the callbacks did.
+        pub slots: u64,
+        /// Slots no tick served: `slots - 1`, and 0 for a catch-up (it serves the missed one).
+        pub skipped: u64,
+        /// The missed slot is served by a tick armed at once (`VsCatchUp`).
+        pub caught_up: bool,
+    }
+
+    /// The re-arm of one tick: [`next`] plus the accounting of the slots it moved over.
+    ///
+    /// `previous` is the deadline that just fired (or `now` for the first tick after an arm), `now`
+    /// the interrupt time the callback runs at. A tick that runs before `previous + period` moves
+    /// the grid one slot. A late one drops the slots it missed (no burst) and counts them in
+    /// `skipped`; with `catch_up`, and a lateness under half a period past the missed slot (the
+    /// callback ran less than 1.5 periods after its own deadline: exactly ONE slot missed), that
+    /// slot is served by an immediate extra tick instead, and the grid carries on from it, so the
+    /// next regular deadline is the one it would have been anyway. A catch-up cannot repeat in a
+    /// row: the tick that serves it runs at most half a period behind the slot it serves, so the
+    /// next candidate is in the future unless the timer itself is again a whole period late (then
+    /// it is a plain skip).
+    pub const fn advance(previous: u64, now: u64, period: u64, catch_up: bool) -> Option<Advance> {
+        if period == 0 {
+            return None;
+        }
+        let Some(candidate) = previous.checked_add(period) else {
+            return None;
+        };
+        if candidate > now {
+            return Some(Advance {
+                deadline: candidate,
+                slots: 1,
+                skipped: 0,
+                caught_up: false,
+            });
+        }
+        let late = now.saturating_sub(candidate);
+        if catch_up && late < period / 2 {
+            return Some(Advance {
+                deadline: candidate,
+                slots: 1,
+                skipped: 0,
+                caught_up: true,
+            });
+        }
+        let intervals = late / period + 1;
+        let Some(moved) = intervals.checked_mul(period) else {
+            return None;
+        };
+        let Some(deadline) = candidate.checked_add(moved) else {
+            return None;
+        };
+        Some(Advance {
+            deadline,
+            slots: intervals + 1,
+            skipped: intervals,
+            caught_up: false,
+        })
+    }
+
     /// Convert a future interrupt-time deadline to a negative relative
     /// `LARGE_INTEGER` due time. A raced/equal deadline is rearmed one 100 ns
     /// unit ahead, never as zero (which has absolute-time semantics).
@@ -162,6 +231,127 @@ pub mod vsync_deadline {
             };
             assert!(deadline > now);
             assert_eq!(deadline, fired + PERIOD_100NS * 5);
+        }
+
+        #[test]
+        fn advance_without_catch_up_is_next_with_the_accounting() {
+            let p = period_100ns(240_000);
+            for (previous, now) in [
+                (1_000_000u64, 1_000_000u64),
+                (1_000_000, 1_000_000 + p - 1),
+                (1_000_000, 1_000_000 + p),
+                (1_000_000, 1_000_000 + p + 1),
+                (1_000_000, 1_000_000 + 3 * p + 7),
+                (1_000_000, 900_000),
+            ] {
+                let a = advance(previous, now, p, false).unwrap();
+                assert_eq!(Some(a.deadline), next(previous, now, p), "{previous} {now}");
+                assert_eq!(a.deadline, previous + a.slots * p);
+                assert_eq!(a.skipped, a.slots - 1);
+                assert!(!a.caught_up);
+            }
+            // on time: one slot, nothing dropped
+            let a = advance(1_000_000, 1_000_000 + 100, p, false).unwrap();
+            assert_eq!((a.slots, a.skipped), (1, 0));
+            // the callback ran a whole period late: the missed slot is dropped
+            let a = advance(1_000_000, 1_000_000 + p + 5, p, false).unwrap();
+            assert_eq!((a.slots, a.skipped), (2, 1));
+            assert_eq!(a.deadline, 1_000_000 + 2 * p);
+            // terminal cases are those of `next`
+            assert_eq!(advance(5, 5, 0, false), None);
+            assert_eq!(advance(u64::MAX - 10, 0, p, true), None);
+        }
+
+        #[test]
+        fn catch_up_serves_one_missed_slot_and_stays_on_the_grid() {
+            let p = period_100ns(240_000);
+            let prev = 5_000_000u64;
+            // 1.0 to just under 1.5 periods after its own deadline: one catch-up
+            for late in [0u64, 1, p / 2 - 1] {
+                let now = prev + p + late;
+                let a = advance(prev, now, p, true).unwrap();
+                assert!(a.caught_up, "{late}");
+                assert_eq!((a.slots, a.skipped), (1, 0));
+                assert_eq!(a.deadline, prev + p);
+                // armed one unit ahead: an immediate re-fire
+                assert_eq!(relative_due(a.deadline, now), -1);
+                // and the tick that serves it re-arms on the original grid
+                let again = advance(a.deadline, now + 600, p, true).unwrap();
+                assert!(!again.caught_up);
+                assert_eq!(again.deadline, prev + 2 * p);
+            }
+            // half a period or more past the missed slot: a plain skip, never a catch-up
+            let now = prev + p + p / 2;
+            let a = advance(prev, now, p, true).unwrap();
+            assert!(!a.caught_up);
+            assert_eq!(a.deadline, prev + 2 * p);
+            assert_eq!((a.slots, a.skipped), (2, 1));
+            // on time is never a catch-up
+            assert!(!advance(prev, prev + 10, p, true).unwrap().caught_up);
+        }
+
+        #[test]
+        fn catch_up_cannot_burst() {
+            // Replay a callback chain whose every callback runs `delay` after its deadline: with the
+            // catch-up on, a catch-up is never followed by another one, every tick serves at least
+            // one slot, and the slots the ticks moved over are exactly the grid that elapsed.
+            let p = period_100ns(240_000);
+            for delay in [0u64, p / 3, p / 2, p - 1, p, p + p / 4, p + p / 2, 2 * p + 3] {
+                let start = 1_000_000u64;
+                let mut deadline = start;
+                let mut slots = 0u64;
+                let mut ticks = 0u64;
+                let mut last_caught = false;
+                let mut fire = deadline + delay;
+                while ticks < 2000 {
+                    let a = advance(deadline, fire, p, true).unwrap();
+                    ticks += 1;
+                    slots += a.slots;
+                    assert!(
+                        !(last_caught && a.caught_up),
+                        "two catch-ups in a row at delay {delay}"
+                    );
+                    last_caught = a.caught_up;
+                    deadline = a.deadline;
+                    fire = if a.caught_up { fire + 1 } else { a.deadline + delay };
+                }
+                assert_eq!(deadline - start, slots * p, "delay {delay}");
+                assert!(ticks <= slots, "delay {delay}: {ticks} ticks over {slots} slots");
+            }
+        }
+
+        #[test]
+        fn catch_up_recovers_the_rate_a_plain_skip_loses() {
+            // Every 10th regular callback runs 1.2 periods late, the rest on time.
+            let p = period_100ns(240_000);
+            let run = |catch_up: bool| -> (u64, u64) {
+                let start = 1_000_000u64;
+                let mut deadline = start;
+                let mut ticks = 0u64;
+                let mut regular = 0u64;
+                let mut fire = deadline;
+                while fire - start < 100 * 10_000_000 {
+                    let a = advance(deadline, fire, p, catch_up).unwrap();
+                    ticks += 1;
+                    deadline = a.deadline;
+                    fire = if a.caught_up {
+                        fire + 1
+                    } else {
+                        regular += 1;
+                        if regular % 10 == 0 {
+                            a.deadline + p + p / 5
+                        } else {
+                            a.deadline
+                        }
+                    };
+                }
+                (ticks, (deadline - start) / p)
+            };
+            let (plain_ticks, plain_slots) = run(false);
+            let (catch_ticks, catch_slots) = run(true);
+            // the catch-up serves (nearly) every slot, the plain skip loses one in eleven
+            assert!(catch_ticks * 1000 >= catch_slots * 995, "{catch_ticks} {catch_slots}");
+            assert!(plain_ticks * 100 <= plain_slots * 93, "{plain_ticks} {plain_slots}");
         }
 
         #[test]
