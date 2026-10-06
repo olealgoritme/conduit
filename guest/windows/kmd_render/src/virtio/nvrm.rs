@@ -144,7 +144,10 @@ pub static NVRM_MAP_ERRORS: AtomicU32 = AtomicU32::new(0);
 /// Bytes currently mapped through MMAP, all owners (`NvMapMb`, in MiB). Refreshed
 /// under the table lock at every change.
 pub static NVRM_MAP_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// MMAPs refused by the per-device byte quota (`NvMapQRef`).
+/// MMAPs the RM window policy refused or that failed for want of window, address space or
+/// host room, ALL reasons (`NvMapQRef`; the split by reason is `NvWinRFull`, `NvWinRRes`,
+/// `NvWinRBig`, `NvWinRTab`, `NvWinRAddr`, `NvWinRHost`, see `virtio::nvrm_window`). Under
+/// `NvWinPolicy` = 0 it counts the legacy per-device quota refusals, as it always did.
 pub static NVRM_MAP_QUOTA_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// Pins made, pins released, pin failures. `NvPin - NvUnpin` is what is locked
 /// now; a count that only grows is a leak. Published as `NvPin`, `NvUnpin`,
@@ -489,6 +492,8 @@ fn open(
     resp: &mut [u8],
     timeout_ms: u64,
 ) -> Result<usize, Refusal> {
+    // The handle table grows here (PASSIVE, no lock) when it is running out of slots.
+    super::gpu::grow_nvrm_tables(adapter);
     let reserved = adapter
         .with_virtio(|v| v.reserve_nvrm_handle_slot(owner))
         .map_err(|_| Refusal::Transport(VirtioError::DeviceError))?;
@@ -544,6 +549,7 @@ fn forward_fence_create(
     resp: &mut [u8],
     timeout_ms: u64,
 ) -> Result<usize, Refusal> {
+    super::gpu::grow_nvrm_tables(adapter);
     let begun = adapter
         .with_virtio(|v| v.begin_nvrm_fence_create(owner))
         .map_err(|_| Refusal::Transport(VirtioError::DeviceError))?;
@@ -808,6 +814,7 @@ pub fn pin_pages(
         .with_virtio(|v| v.nvrm_pin_count(owner) < MAX_NVRM_PINS_PER_OWNER)
         .unwrap_or(false);
     if !quota_ok {
+        super::nvrm_window::count_pin_quota_refusal();
         return Err(PinRefusal::NoResources);
     }
 
@@ -1043,19 +1050,25 @@ pub fn host_mmap_within(
     if size == 0 || size % PAGE != 0 || size > MAX_MAP_BYTES || offset % PAGE != 0 {
         return Err(MapRefusal::BadRange);
     }
-    let quota_ok = adapter
-        .with_virtio(|v| v.nvrm_map_count(owner) < super::gpu::MAX_NVRM_MAPS_PER_OWNER)
+    // The mapping table's sanity bounds, growing the tables first (PASSIVE, no lock).
+    super::gpu::grow_nvrm_tables(adapter);
+    let table_ok = adapter
+        .with_virtio(|v| v.nvrm_map_admit(owner) == helios_kmd_logic::rm_limits::Admit::Ok)
         .unwrap_or(false);
-    if !quota_ok {
+    if !table_ok {
+        super::nvrm_window::count_map_table_refusal();
         return Err(MapRefusal::NoResources);
     }
-    // The byte quota (a quarter of the RM window per device), before the host is
-    // asked to map anything. The UVM aperture is exempt.
-    let bytes_ok = adapter
-        .with_virtio(|v| v.nvrm_map_bytes_room(owner, device_type == 256, size))
+    // The window policy (`helios_kmd_logic::rm_window`), before the host is asked to map
+    // anything: any device may map until the window is full, minus the reserve kept for
+    // the privileged device; `NvWinPolicy` = 0 is the old quarter-of-the-window quota. The
+    // UVM aperture is exempt. A refusal is counted by reason and answered `NO_RESOURCES`.
+    let live_privileged = super::nvrm_window::live_privileged(adapter, owner);
+    let window_ok = adapter
+        .with_virtio(|v| v.nvrm_window_admit(owner, device_type == 256, size, live_privileged))
+        .map(|r| r.is_ok())
         .unwrap_or(false);
-    if !bytes_ok {
-        NVRM_MAP_QUOTA_REFUSED.fetch_add(1, Ordering::Relaxed);
+    if !window_ok {
         return Err(MapRefusal::NoResources);
     }
 
@@ -1072,6 +1085,9 @@ pub fn host_mmap_within(
         .map_err(MapRefusal::Transport)?;
     if let Some(status) = rd_i32(&resp, 8) {
         if status < 0 {
+            // 12 (ENOMEM) is the host's own window zone being full: the byte accounting
+            // above cannot see its extents or its caching zones.
+            super::nvrm_window::count_host_refused(status.wrapping_neg().max(1) as u32);
             return Err(MapRefusal::Host(status.wrapping_neg().max(1)));
         }
     }
@@ -1503,6 +1519,8 @@ pub fn close_all_for_owner(
             tally.unsent();
         }
     }
+    // The window account forgets the device: its sticky privileged mark goes with it.
+    let _ = adapter.with_virtio(|v| v.nvrm_window_forget_owner(owner));
     loop {
         let taken = adapter
             .with_virtio(|v| v.take_nvrm_handle_for_owner(owner))
@@ -1738,6 +1756,7 @@ pub fn retire_transport(
     // The mapping table died with the transport; the gauge is only refreshed by a
     // table change, so without this it kept the last total until the next push.
     NVRM_MAP_BYTES.store(0, Ordering::Relaxed);
+    super::nvrm_window::reset_gauges();
     if had {
         mark_views_stale(adapter);
     }

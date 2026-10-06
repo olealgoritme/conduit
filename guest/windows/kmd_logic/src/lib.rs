@@ -26,6 +26,8 @@ pub mod nvrm_fastpath;
 pub mod nvrm_fence;
 pub mod nvrm_views;
 pub mod window_units;
+pub mod rm_limits;
+pub mod rm_window;
 pub mod foreign_copy;
 pub mod foreign_errno;
 pub mod flip_completion;

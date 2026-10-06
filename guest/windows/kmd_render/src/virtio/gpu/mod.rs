@@ -79,8 +79,8 @@ pub use rm_gates::{
 };
 
 pub use nvrm_tables::{
-    FenceClaim, FenceCommit, FenceRefusal, NvrmPin, PinTake, MAX_NVRM_HANDLES, MAX_NVRM_HANDLES_PER_OWNER, MAX_NVRM_MAPS,
-    MAX_NVRM_MAPS_PER_OWNER, MAX_NVRM_PINS, MAX_NVRM_PINS_PER_OWNER, MAX_NVRM_PIN_PAGES,
+    grow_nvrm_tables, FenceClaim, FenceCommit, FenceRefusal, NvrmPin, PinTake, MAX_NVRM_PINS,
+    MAX_NVRM_PINS_PER_OWNER, MAX_NVRM_PIN_PAGES,
 };
 
 use super::config::DxgkConfigAccess;
@@ -2377,7 +2377,8 @@ pub struct VirtioGpu {
     scanout_release: bool,
     /// Backend RM handles opened through HELIOS_ESCAPE_NVRM, tagged with the
     /// owning device so a process cannot name another's, and closed at device
-    /// teardown. Reserved to MAX_NVRM_HANDLES at init. See `nvrm_tables`.
+    /// teardown. Starts at NVRM_HANDLES_INITIAL slots and grows (PASSIVE, outside the lock:
+    /// `grow_nvrm_tables`) to MAX_NVRM_HANDLES. See `nvrm_tables`.
     nvrm_handles: Vec<nvrm_tables::NvrmHandleSlot>,
     /// Slots reserved by in-flight forwarded `Open`s.
     nvrm_reserved: usize,
@@ -2396,9 +2397,17 @@ pub struct VirtioGpu {
     nvrm_fences: Box<helios_kmd_logic::nvrm_fence::FenceBook>,
     /// Live HELIOS_NVRM_OP_MMAP mappings (the host's mapping id, the handle it
     /// belongs to, the owner), so `Close` and device teardown can send the host
-    /// `Munmap`. Reserved to MAX_NVRM_MAPS at init. The user view itself is in
+    /// `Munmap`. Starts at NVRM_MAPS_INITIAL slots and grows to MAX_NVRM_MAPS (like
+    /// `nvrm_handles`). The user view itself is in
     /// `AdapterContext::mappings`, under the key `nvrm::map_key(mapping_id)`.
     nvrm_maps: Vec<nvrm_tables::NvrmMapSlot>,
+    /// The RM window's byte accounting and policy (`helios_kmd_logic::rm_window`): who holds
+    /// how many bytes of region 1, the reserve, the refusals. Boxed like the other tables.
+    nvrm_window_acct: Box<helios_kmd_logic::rm_window::Account>,
+    /// Sanity bounds and growth rules of the handle and mapping tables
+    /// (`helios_kmd_logic::rm_limits`; fixed numbers under `NvWinPolicy` = 0).
+    nvrm_handle_bounds: helios_kmd_logic::rm_limits::Bounds,
+    nvrm_map_bounds: helios_kmd_logic::rm_limits::Bounds,
     // (Mapping ids are minted by `virtio::nvrm::mint_map_id`, one counter for the
     // life of the driver: the host's own ids are not unique, the RM path answers
     // 0 for all of them, and the views outlive this transport.)
@@ -3028,6 +3037,10 @@ impl VirtioGpu {
         let rm_gates = rm_gates::allocate_rm_gates()?;
         let present_buffer_syncs = allocate_present_buffer_syncs()?;
         let present_buffer_opens = allocate_present_buffer_opens()?;
+        // The RM window policy and the tables' bounds (knobs `NvWinPolicy`, `NvWinReserveMb`,
+        // `NvWinMaxMb`), read here at PASSIVE.
+        let (nvrm_window_acct, nvrm_handle_bounds, nvrm_map_bounds) =
+            nvrm_tables::new_window_account(nvrm_window).ok_or(VirtioError::OutOfMemory)?;
         // Nothing to register against without the event queue: reserve nothing.
         let nvrm_events = helios_kmd_logic::nvrm_events::Registry::try_new(
             if nvrm_event_ring.is_some() {
@@ -3070,11 +3083,14 @@ impl VirtioGpu {
             nvrm_events,
             cfg_features,
             scanout_release: scanout_release_on,
-            nvrm_handles: Vec::with_capacity(MAX_NVRM_HANDLES),
+            nvrm_handles: Vec::with_capacity(nvrm_handle_bounds.initial),
             nvrm_reserved: 0,
             nvrm_clients: nvrm_tables::new_client_table(),
             nvrm_fences: nvrm_tables::new_fence_book(),
-            nvrm_maps: Vec::with_capacity(MAX_NVRM_MAPS),
+            nvrm_maps: Vec::with_capacity(nvrm_map_bounds.initial),
+            nvrm_window_acct,
+            nvrm_handle_bounds,
+            nvrm_map_bounds,
             nvrm_pins: Vec::with_capacity(MAX_NVRM_PINS),
             nvrm_next_pin: 1,
             nvrm_window,

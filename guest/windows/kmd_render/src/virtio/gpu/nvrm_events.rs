@@ -71,7 +71,7 @@ use super::nvrm_tables::FenceFire;
 pub const MAX_NVRM_EVENTS: usize = 1024;
 /// Most one process may hold: a `READY` registration per handle it can have open,
 /// plus its `TRANSPORT_LOST` and `SCANOUT_RELEASED` ones.
-pub const MAX_NVRM_EVENTS_PER_OWNER: usize = MAX_NVRM_HANDLES_PER_OWNER + 2;
+pub const MAX_NVRM_EVENTS_PER_OWNER: usize = 130;
 
 /// Virtio feature bit 12 (`NVGPU_CFG_TAKES_INPUT`), which this driver must never
 /// ack (see the module docs). Named only for the assertion below.

@@ -2002,8 +2002,10 @@ fn escape_nvrm_op(
             caps.supported_event_kinds = event_kinds;
             caps.supported_cache_types = NVRM_CACHE_TYPES;
             caps.device_features = device_features;
-            caps.max_handles = crate::virtio::gpu::MAX_NVRM_HANDLES_PER_OWNER as u32;
-            caps.max_mappings = crate::virtio::gpu::MAX_NVRM_MAPS_PER_OWNER as u32;
+            // The per-process sanity bounds in force (the old fixed 128 / 256 under
+            // `NvWinPolicy` = 0; those same 128 / 256 before the first transport).
+            caps.max_handles = crate::virtio::nvrm_window::handles_per_owner();
+            caps.max_mappings = crate::virtio::nvrm_window::maps_per_owner();
             caps.max_pins = crate::virtio::gpu::MAX_NVRM_PINS_PER_OWNER as u32;
             caps.max_pin_pages = crate::virtio::gpu::MAX_NVRM_PIN_PAGES as u32;
             caps.pin_deep_kinds = HELIOS_NVRM_PIN_DEEP_BIT_DIRECT | HELIOS_NVRM_PIN_DEEP_BIT_INDIRECT;
@@ -2271,14 +2273,22 @@ fn nvrm_mmap(
     let Some((user_va, mdl)) = mapped else {
         crate::virtio::gpu::MAP_PAGES_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         crate::virtio::nvrm::NVRM_MAP_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // No MDL or no user address space for the view: counted as `NvWinRAddr`.
+        crate::virtio::nvrm_window::count_addr_space();
         let status = undo(HELIOS_NVRM_ST_NO_RESOURCES);
         return finish(&mut m, status, 0);
     };
 
     // Track it and mint its id under one lock hold, which also re-checks that the
-    // handle is still ours (a concurrent Close may have forgotten it).
+    // handle is still ours (a concurrent Close may have forgotten it), the table's
+    // bounds, and charges the window account. The process id is for the per-process
+    // report (`NvWinT*`); privilege is read BEFORE the lock (it takes the scanout lock).
+    let pid = crate::virtio::nvrm_window::current_pid();
+    let live_privileged = crate::virtio::nvrm_window::live_privileged(adapter, owner);
     let kmd_id = adapter
-        .with_virtio(|v| v.push_nvrm_map(owner, m.handle, host.host_id, m.size, uvm))
+        .with_virtio(|v| {
+            v.push_nvrm_map(owner, m.handle, host.host_id, m.size, uvm, pid, live_privileged)
+        })
         .ok()
         .flatten();
     let inserted = kmd_id.is_some_and(|id| {
@@ -2291,7 +2301,10 @@ fn nvrm_mmap(
     });
     let Some(kmd_id) = kmd_id.filter(|_| inserted) else {
         if let Some(id) = kmd_id {
-            // The slot was made but the view could not be recorded: take both back.
+            // The slot was made but the view could not be recorded (the adapter-wide
+            // mapping table is full or the id is taken): take both back, and count it as
+            // the bookkeeping being full (`NvWinRTab`).
+            crate::virtio::nvrm_window::count_refusal(helios_kmd_logic::rm_window::Refusal::TableFull);
             let _ = adapter.with_virtio(|v| v.take_nvrm_map(owner, id));
         }
         // SAFETY: still in the owning process at PASSIVE; the pair is the one
