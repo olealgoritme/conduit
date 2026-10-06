@@ -1,4 +1,4 @@
-From 0c6b337d10a26ba6f536c66a0060f850a20b52b5 Mon Sep 17 00:00:00 2001
+From f761e1a4bb760e2dfe2194c02aff42214c419d5f Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Tue, 6 Oct 2026 03:17:09 +0200
 Subject: [PATCH] nvk/rm: Helios ICD interface, resource ids by IMPORT_RM,
@@ -209,7 +209,7 @@ index 122d2f3..9d85aa3 100644
  endif
  
 diff --git a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
-index 46efbb9..83339c9 100644
+index 0e13ecf..4df32ee 100644
 --- a/src/nouveau/vulkan/nvk_device_memory.c
 +++ b/src/nouveau/vulkan/nvk_device_memory.c
 @@ -4,6 +4,10 @@
@@ -247,7 +247,7 @@ index 46efbb9..83339c9 100644
     bool pinned_to_vram = false;
  
     /* Align to os page size (typically 4K) as a start as this works for
-@@ -200,11 +219,19 @@ nvk_AllocateMemory(VkDevice device,
+@@ -200,6 +219,12 @@ nvk_AllocateMemory(VkDevice device,
              alignment = (1ULL << 21);
           else
              alignment = (1ULL << 16);
@@ -259,6 +259,10 @@ index 46efbb9..83339c9 100644
 +         tile_mode = image->planes[0].nil.tile_mode;
        }
     }
+ 
+@@ -209,8 +234,10 @@ nvk_AllocateMemory(VkDevice device,
+        (type->propertyFlags & bar_type_flags) == bar_type_flags)
+       pinned_to_vram = true;
  
 -   const enum nvkmd_mem_flags flags =
 +   enum nvkmd_mem_flags flags =
@@ -515,10 +519,10 @@ index 0000000..d49d13b
 +   return VK_SUCCESS;
 +}
 diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
-index d1c05f6..66d1ea9 100644
+index 577f23a..14c3beb 100644
 --- a/src/nouveau/vulkan/nvk_physical_device.c
 +++ b/src/nouveau/vulkan/nvk_physical_device.c
-@@ -25,6 +25,9 @@
+@@ -16,6 +16,9 @@
  #include "nvk_shader.h"
  #include "nvk_wsi.h"
  #include "nvkmd/nvkmd.h"
@@ -528,7 +532,7 @@ index d1c05f6..66d1ea9 100644
  #include "git_sha1.h"
  #include "util/detect_os.h"
  #include "util/disk_cache.h"
-@@ -1431,6 +1434,17 @@ nvk_get_device_properties(const struct nvk_instance *instance,
+@@ -1422,6 +1425,17 @@ nvk_get_device_properties(const struct nvk_instance *instance,
              sizeof(properties->shaderModuleIdentifierAlgorithmUUID));
  
     nv_device_uuid(info, properties->deviceUUID, VK_UUID_SIZE, true);
@@ -547,7 +551,7 @@ index d1c05f6..66d1ea9 100644
     memcpy(properties->driverUUID, instance->driver_build_sha, VK_UUID_SIZE);
  
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
-index c2d0625..440f6dc 100644
+index 5751e9a..e500262 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h
 @@ -92,6 +92,14 @@ struct nvkmd_rm_lib {
@@ -565,7 +569,7 @@ index c2d0625..440f6dc 100644
  };
  
  /* Returns NULL if librmclient cannot be loaded */
-@@ -254,6 +262,14 @@ struct nvkmd_rm_mem {
+@@ -267,6 +275,14 @@ struct nvkmd_rm_mem {
     /* GEM handle on dev->drm_fd once the memory has been exported, 0 before */
     simple_mtx_t export_mutex;
     uint32_t gem_handle;
@@ -580,7 +584,7 @@ index c2d0625..440f6dc 100644
  };
  
  NVKMD_DECL_SUBCLASS(mem, rm);
-@@ -366,6 +382,34 @@ VkResult nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *mem,
+@@ -379,6 +395,34 @@ VkResult nvkmd_rm_mem_scanout_flip(struct nvkmd_mem *mem,
                                     uint32_t fourcc, uint64_t modifier);
  /* Gives scanout 0 back to the desktop (no-op without a live source) */
  void nvkmd_rm_dev_scanout_release(struct nvkmd_dev *dev);
@@ -633,10 +637,10 @@ index 9a745b0..e17e7a8 100644
     LOAD(event_wait,   "crm_event_wait",   false);
     LOAD(alloc_pages,  "crm_alloc_pages",  false);
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
-index 8d40c66..78b6451 100644
+index 4fbad77..c58eb58 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_mem.c
-@@ -278,6 +278,9 @@ nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
+@@ -337,6 +337,9 @@ nvkmd_rm_mem_free(struct nvkmd_mem *_mem)
     /* nvidia-drm holds its own reference to the memory for as long as a
      * dma-buf of it is alive; this only drops our GEM name for it.
      */
