@@ -101,6 +101,12 @@ pub struct ContextContext {
     /// nor blocks below DISPATCH; `SpinLock` raises/restores IRQL around the
     /// handful of scalar accesses.
     present_stream_marker: crate::sync::SpinLock<Option<StashedMarker>>,
+    /// The "already on scanout" tag (`HOSC`) the last `HERF` Render parsed, for the Present that
+    /// follows on this context (`ddi/onscanout.rs`; same pairing and orphan bound as the marker).
+    /// `onscanout_flag` is the lock-free "is there one": the ordinary Render and Present read one
+    /// relaxed atomic and take the lock only for a context that carries a tag.
+    onscanout_tag: crate::sync::SpinLock<Option<helios_kmd_logic::onscanout::Tag>>,
+    onscanout_flag: AtomicU32,
     /// One authenticated, generation-qualified execution stream per context.
     execution_stream: AtomicU64,
     /// Flush-gate trace (`ddi::flush_trace`): what the last `HEFL` Render of this
@@ -246,6 +252,37 @@ impl<'a> ContextHandleRef<'a> {
     /// one following Present just like the snapshot descriptor.
     pub fn take_present_stream_marker_stash(&self) -> Option<StashedMarker> {
         self.context.present_stream_marker.lock().take()
+    }
+
+    /// Replace the stashed "already on scanout" tag with `tag` (`None` clears it). Returns true if
+    /// a tag that no Present took was thrown away (an orphan, counted by the caller). A
+    /// `HERF` Render calls this for every command, so a tag can only ever pair with the Present
+    /// that immediately follows its own Render. One relaxed load when there is nothing to do.
+    pub fn stash_onscanout_tag(&self, tag: Option<helios_kmd_logic::onscanout::Tag>) -> bool {
+        let ctx = self.context;
+        if tag.is_none() && ctx.onscanout_flag.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let mut slot = ctx.onscanout_tag.lock();
+        let orphan = slot.is_some();
+        *slot = tag;
+        ctx.onscanout_flag
+            .store(u32::from(tag.is_some()), Ordering::Relaxed);
+        orphan
+    }
+
+    /// Take (read + clear) the stashed tag, or `None`: the Present's half of the pairing.
+    /// Called on every present that resolves its context, whatever its arm, so a tag whose
+    /// Present failed cannot reach the next one. One relaxed load for an untagged context.
+    pub fn take_onscanout_tag(&self) -> Option<helios_kmd_logic::onscanout::Tag> {
+        let ctx = self.context;
+        if ctx.onscanout_flag.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let mut slot = ctx.onscanout_tag.lock();
+        let tag = slot.take();
+        ctx.onscanout_flag.store(0, Ordering::Relaxed);
+        tag
     }
 
     /// Low 32 bits of the context handle (a pointer): enough to tell contexts apart in
@@ -523,6 +560,8 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         snap_memory_type: AtomicU32::new(0),
         snap_purpose: AtomicU32::new(0),
         present_stream_marker: crate::sync::SpinLock::new(None),
+        onscanout_tag: crate::sync::SpinLock::new(None),
+        onscanout_flag: AtomicU32::new(0),
         execution_stream: AtomicU64::new(0),
         flush_pending: crate::sync::SpinLock::new(None),
         flush_pending_flag: AtomicU32::new(0),

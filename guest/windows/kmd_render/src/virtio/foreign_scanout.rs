@@ -193,6 +193,11 @@ pub fn present(
     gem: u32,
 ) -> Result<u64, PresentRefusal> {
     let flip = mint(adapter, owner, handle, false)?;
+    // The frame the already-on-scanout tag (`ddi/onscanout.rs`) can later name. Recorded HERE and in
+    // `present_fenced` only, the two callers that run inside the owner's own escape: `note_minted`
+    // reads the owner's device object, which a worker minting for a stored owner token
+    // (`ForeignFlip`'s resident source, the KMD's own presenter) must never do.
+    crate::ddi::onscanout::note_minted(owner, flip.generation, flip.seq);
     scanout_release::minted(flip.seq, owner.raw(), flip.handle, gem);
     if adapter.foreign_fence_queue_busy() {
         if let Err(e) = adapter.foreign_fence_enqueue(owner, flip, gem, 0) {
@@ -342,6 +347,8 @@ pub fn present_fenced(
         Some(_) => {}
     }
     let flip = mint(adapter, owner, handle, true)?;
+    // As in `present`: an escape-side caller, the only kind that may name the owner's device.
+    crate::ddi::onscanout::note_minted(owner, flip.generation, flip.seq);
     scanout_release::minted(flip.seq, owner.raw(), flip.handle, gem);
     if let Err(e) = adapter.foreign_fence_enqueue(owner, flip, gem, fence) {
         // Refused: it never reaches the host, so nothing is waited for.
