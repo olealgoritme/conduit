@@ -60,6 +60,15 @@ pub const CONDUIT_OPTIONAL_FEATURES: u64 = NVGPU_F_SCANOUT_RELEASE;
 
 const _: () = assert!(CONDUIT_OPTIONAL_FEATURES & NVGPU_F_TAKES_INPUT == 0);
 
+// ── Conduit config features (the device config `features` word, `NVGPU_CFG_*`) ─────
+
+/// `NVGPU_CFG_GUEST_BLOB` (config `features` bit 16): the device accepts
+/// `RESOURCE_CREATE_BLOB` with `blob_mem = VIRTIO_GPU_BLOB_MEM_GUEST` and imports such a blob
+/// into Venus (`vkGetMemoryResourcePropertiesMESA` + `VkImportMemoryResourceInfoMESA`).
+/// Meaningful only together with `NVGPU_CFG_VENUS` (bit 10). Set only when the backend runs
+/// with `--venus-guest-blobs`.
+pub const NVGPU_CFG_GUEST_BLOB: u32 = 1 << 16;
+
 // ── Device status bits (VirtIO spec §2.1) ──────────────────────────────────
 pub const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
 pub const VIRTIO_STATUS_DRIVER: u8 = 2;

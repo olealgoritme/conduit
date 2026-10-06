@@ -2337,6 +2337,9 @@ unsafe fn destroy_allocation_ctx(
     // this resource. After the guard is acquired, no stale backing snapshot can
     // write after teardown withdraws the entry.
     if let Some(content_guard) = adapter.system_backings.serialize(passive) {
+        // `GuestBlob`: its guest blob is retired (drained, released, unref'd) and its record
+        // forgotten BEFORE the leases go. One spinlock lookup when there is none.
+        crate::ddi::guest_blob::destination_gone(passive, adapter, &content_guard, ctx.resource_id);
         // Ranges AND the "system copy invalid" mark: the id is gone for good.
         content_guard.remove_all(ctx.resource_id);
     } else {

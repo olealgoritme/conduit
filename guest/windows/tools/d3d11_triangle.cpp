@@ -78,6 +78,13 @@ int main(int argc, char** argv) {
   const char* selSwap    = argc > 2 ? argv[2] : "flip";
   int seconds            = argc > 3 ? atoi(argv[3]) : 20;
   int firstPresentDelayMs = argc > 4 ? atoi(argv[4]) : 0;
+  // Optional 5th argument, a comma-separated list: `modeswitch` sets
+  // DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH and `rgba` makes the back buffer R8G8B8A8_UNORM, the
+  // two properties of a swap chain (Heaven's) that may keep Windows from upgrading a blt-model
+  // window to flip model (`SwapEffectUpgradeEnable`, WINDOWEDSWAPEFFECTUPGRADE_REASON_*).
+  const char* swapOpts   = argc > 5 ? argv[5] : "";
+  bool optModeSwitch = strstr(swapOpts, "modeswitch") != nullptr;
+  bool optRgba = strstr(swapOpts, "rgba") != nullptr;
   bool useFlip = _stricmp(selSwap, "blt") != 0;
   L("d3d11_triangle pid=%lu adapter=%s swap=%s seconds=%d firstPresentDelayMs=%d",
     GetCurrentProcessId(), selAdapter, selSwap, seconds, firstPresentDelayMs);
@@ -115,7 +122,9 @@ int main(int argc, char** argv) {
 
   // --- swapchain (flip-model or legacy blt) ---
   DXGI_SWAP_CHAIN_DESC1 sd = {};
-  sd.Width = 1280; sd.Height = 720; sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  sd.Width = 1280; sd.Height = 720;
+  sd.Format = optRgba ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+  if (optModeSwitch) sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
   sd.SampleDesc.Count = 1; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
   sd.BufferCount = useFlip ? 2 : 1;
   sd.SwapEffect = useFlip ? DXGI_SWAP_EFFECT_FLIP_DISCARD : DXGI_SWAP_EFFECT_DISCARD;

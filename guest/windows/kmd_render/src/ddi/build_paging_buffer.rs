@@ -1028,6 +1028,11 @@ unsafe fn bar_virtual_transfer_inner(
             return false;
         }
     };
+    // `GuestBlob`: a guest blob over this allocation's leased system pages is retired (copies
+    // drained, Venus objects freed, the blob unref'd) BEFORE this transfer reads or writes those
+    // pages or changes the leases; only then can a lease change unlock them. One spinlock
+    // lookup when there is none. Whatever it finds, the transfer goes on (success to VidMm).
+    crate::ddi::guest_blob::before_lease_change(passive, adapter, content_guard, alloc.resource_id);
     // From here on this is a content op on a live allocation of this generation.
     if blob_to_system {
         *evicting = Some(alloc.resource_id);
@@ -1260,6 +1265,9 @@ unsafe fn bar_transfer(
     // low bits into the MDL side.
     let mdl_page = t.MdlOffset;
     let blob_off = t.TransferOffset as u64;
+    // `GuestBlob`: retire a guest blob over this allocation's leased pages before either arm
+    // below touches those pages or the leases (see `bar_virtual_transfer_inner`).
+    crate::ddi::guest_blob::before_lease_change(passive, adapter, content_guard, alloc.resource_id);
 
     match (src_seg, dst_seg) {
         // Page-in: system backing → blob (evicted or initial content).
@@ -1977,6 +1985,13 @@ unsafe fn build_paging_buffer_inner(
         PagingOperation::DiscardContent(d) => {
             let discarded = unsafe { paging_alloc_info(adapter, d.hAllocation) };
             if let Some(alloc) = discarded {
+                // `GuestBlob`: its guest blob goes before the leases it names.
+                crate::ddi::guest_blob::before_lease_change(
+                    passive,
+                    adapter,
+                    &content_guard,
+                    alloc.resource_id,
+                );
                 // The content is gone, so no system copy of it can be "invalid":
                 // drop the backing ranges AND the mark.
                 content_guard.remove_all(alloc.resource_id);
