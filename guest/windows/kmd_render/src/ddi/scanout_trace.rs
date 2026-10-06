@@ -820,7 +820,22 @@ pub(crate) fn dump(adapter: &crate::adapter::AdapterContext) {
         b"VpGate",
         adapter.vidpn_programming.load(Ordering::Acquire) as u32,
     );
-    crate::diag::record_named_bytes(b"VpVsN", adapter.vsync_count.load(Ordering::Relaxed));
+    // The vsync heartbeat's rate is `VpVsN` / time, and the time is the one the
+    // count was produced at, not the time of whenever somebody reads the key:
+    // `VpVsT` is the interrupt time (ms) of the tick that last advanced `VpVsN`,
+    // `VpDmpT` the interrupt time of this dump (the same clock, wraps at 2^32 ms),
+    // `VsMinGap` the smallest gap between two ticks in 100 ns units (0xFFFFFFFF =
+    // none yet) and `VsFast` the ticks closer than half a period to the one
+    // before. Count first, then its time: a pair is at most one tick apart.
+    // Rate recipe: `docs/foreign-scanout.md`, "Reading vsync rates".
+    let vsync_count = adapter.vsync_count.load(Ordering::Relaxed);
+    let vsync_last_ms = adapter.vsync_last_ms();
+    let dump_ms = crate::adapter::AdapterContext::interrupt_time_ms();
+    crate::diag::record_named_bytes(b"VpVsN", vsync_count);
+    crate::diag::record_named_bytes(b"VpVsT", vsync_last_ms);
+    crate::diag::record_named_bytes(b"VpDmpT", dump_ms);
+    crate::diag::record_named_bytes(b"VsMinGap", adapter.vsync_min_gap_published());
+    crate::diag::record_named_bytes(b"VsFast", adapter.vsync_fast.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"VpVsEn", adapter.vsync_enabled.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(
         b"VpPend",
