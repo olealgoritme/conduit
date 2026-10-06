@@ -35,6 +35,7 @@ use super::AdapterContext;
 use crate::ddi::scanout_trace::LeaseEnd;
 use crate::sync::SpinLock;
 use crate::virtio::gpu::DeviceOwner;
+use wdk_sys::ntddk::KeSetEvent;
 
 static STATE: SpinLock<ForeignScanout> = SpinLock::new(ForeignScanout::new());
 
@@ -108,6 +109,12 @@ impl AdapterContext {
             .set(owner.raw() as u64, handle, epoch, layout, lapse_ms, now);
         match &result {
             Ok(o) => {
+                // The HPD worker arms the lapse deadline when it loops: wake a
+                // worker parked in an untimed wait so it sees this (new or shorter)
+                // deadline, or a hung owner on an idle desktop is never timed out.
+                // SAFETY: hpd_event is an embedded, in-place initialized KEVENT;
+                // KeSetEvent(Wait = FALSE) is legal through DISPATCH_LEVEL.
+                unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
                 FS_SETS.fetch_add(1, Ordering::Relaxed);
                 if o.kind == SetKind::TookOver {
                     FS_TAKEOVERS.fetch_add(1, Ordering::Relaxed);
@@ -155,8 +162,15 @@ impl AdapterContext {
             FS_SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
         }
         let live = {
-            let g = STATE.lock();
-            g.suppress_desktop(now_100ns())
+            let mut g = STATE.lock();
+            let now = now_100ns();
+            // A flip the host took keeps the source alive from NOW (the lapse
+            // runs from acceptance, not from when it was minted); a failed one
+            // does not.
+            if sent {
+                g.extend(generation, now);
+            }
+            g.suppress_desktop(now)
                 .is_some_and(|a| a.generation == generation)
         };
         if sent && !live {

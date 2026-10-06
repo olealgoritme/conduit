@@ -263,7 +263,10 @@ impl ForeignScanout {
         })
     }
 
-    /// Mint the next flip of `owner`'s source on `handle` and push the lapse out.
+    /// Mint the next flip of `owner`'s source on `handle`. Does NOT move the lapse
+    /// deadline: a flip that fails, or takes longer than the lapse to be accepted,
+    /// must not keep the source alive. The caller extends it with [`Self::extend`]
+    /// once the host took the flip.
     pub fn present(&mut self, owner: u64, handle: u32, now: u64) -> Result<Flip, PresentError> {
         let State::Active(a) = &mut self.state else {
             return Err(PresentError::NoSource);
@@ -275,7 +278,6 @@ impl ForeignScanout {
             self.state = State::ReleasePending;
             return Err(PresentError::Lapsed);
         }
-        a.deadline = now.saturating_add(a.lapse);
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         Ok(Flip {
@@ -285,6 +287,18 @@ impl ForeignScanout {
             epoch: a.epoch,
             layout: a.layout,
         })
+    }
+
+    /// The host took the flip of `generation`: push the lapse deadline out from
+    /// `now`. `false` (and no change) if that source is no longer the live one.
+    pub fn extend(&mut self, generation: u32, now: u64) -> bool {
+        match &mut self.state {
+            State::Active(a) if a.generation == generation => {
+                a.deadline = now.saturating_add(a.lapse).max(a.deadline);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// `owner` gives scanout 0 back. `handle`, when given, must be the source's.
@@ -503,8 +517,9 @@ mod tests {
         let mut s = ForeignScanout::new();
         active(&mut s, A, 0);
         assert_eq!(s.set(B, 9, 3, layout(), 0, 100 * MS), Err(SetError::Busy));
-        // a present pushes the deadline out
-        s.present(A, 7, 1_500 * MS).unwrap();
+        // an accepted present pushes the deadline out
+        let f = s.present(A, 7, 1_500 * MS).unwrap();
+        assert!(s.extend(f.generation, 1_500 * MS));
         assert_eq!(s.set(B, 9, 3, layout(), 0, 2_500 * MS), Err(SetError::Busy));
         let o = s.set(B, 9, 3, layout(), 0, 3_600 * MS).unwrap();
         assert_eq!(o.kind, SetKind::TookOver);
@@ -577,6 +592,32 @@ mod tests {
         assert_eq!(s.poll(2_001 * MS), Poll::Nothing);
         assert_eq!(s.next_deadline(), None);
         assert!(s.desktop_restored());
+    }
+
+    #[test]
+    fn present_alone_does_not_extend_the_lapse() {
+        let mut s = ForeignScanout::new();
+        let a = active(&mut s, A, 0);
+        // default lapse is 2 s: minting flips for 5 s without the host taking any
+        // must not keep the source alive past the first deadline
+        let f = s.present(A, 7, 1_000 * MS).unwrap();
+        assert_eq!(f.generation, a.generation);
+        assert_eq!(s.next_deadline(), Some(2_000 * MS));
+        assert_eq!(s.present(A, 7, 2_100 * MS), Err(PresentError::Lapsed));
+    }
+
+    #[test]
+    fn extend_only_moves_the_live_generation_forward() {
+        let mut s = ForeignScanout::new();
+        let a = active(&mut s, A, 0);
+        assert!(s.extend(a.generation, 1_000 * MS));
+        assert_eq!(s.next_deadline(), Some(3_000 * MS));
+        // an earlier acceptance never pulls the deadline back
+        assert!(s.extend(a.generation, 500 * MS));
+        assert_eq!(s.next_deadline(), Some(3_000 * MS));
+        // a stale generation is ignored
+        assert!(!s.extend(a.generation + 1, 1_500 * MS));
+        assert_eq!(s.next_deadline(), Some(3_000 * MS));
     }
 
     #[test]
