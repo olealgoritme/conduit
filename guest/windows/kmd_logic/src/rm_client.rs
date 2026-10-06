@@ -441,6 +441,18 @@ pub fn parse_version_reply(data: &[u8]) -> Option<[u8; VERSION_STR_BYTES]> {
     Some(v)
 }
 
+/// The version string out of a whole `QUERY` reply (`resp` is its valid bytes), or all
+/// zero ("no string") when the host refused it (`ReplyError::Host`), the reply is
+/// short, or the string is empty. librmclient ignores a failed `QUERY` the same way:
+/// the strict check is then skipped. Only a transport failure or a policy refusal of
+/// the forward itself (not a reply) is fatal, and those never reach here.
+pub fn version_from_query_reply(resp: &[u8]) -> [u8; VERSION_STR_BYTES] {
+    parse_ioctl_reply(resp)
+        .ok()
+        .and_then(|r| parse_version_reply(r.data))
+        .unwrap_or([0u8; VERSION_STR_BYTES])
+}
+
 /// What `NV_ESC_CARD_INFO` says of the first valid card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CardInfo {
@@ -799,6 +811,11 @@ pub enum Step {
     ExportToFd = 18,
     GemImport = 19,
     CloseExportCh = 20,
+    /// The export file closed as an UNDO: the surface changes while it is still open
+    /// (stages `ExportChOpen`..`Imported`), so it goes before the GEM and the memory
+    /// do. Unlike [`Step::CloseExportCh`] it keeps the stage, and like every undo it
+    /// always advances (a failed close is counted, never retried).
+    CloseExportChUndo = 21,
     GemClose = 24,
     FreeMemory = 25,
     // The optional CPU view.
@@ -1278,7 +1295,12 @@ impl Client {
             let wanted = want.surface;
             if wanted.is_some() && wanted != Some((s.layout.width, s.layout.height)) {
                 // A different extent: tear the surface down; the next call makes
-                // the new one.
+                // the new one. An export file still open (stages `ExportChOpen` ..
+                // `Imported`) goes first: nothing else would close it, and the next
+                // `OpenExportCh` would overwrite its handle.
+                if self.export_ch != 0 {
+                    return Action::Step(Step::CloseExportChUndo);
+                }
                 return Action::Step(if s.gem != 0 && s.stage >= SurfStage::Imported {
                     Step::GemClose
                 } else {
@@ -1352,7 +1374,7 @@ impl Client {
     pub fn finish(&mut self, step: Step, result: Result<Out, Fail>) {
         use Step::*;
         match step {
-            KernelUnmap | HostMunmap | RmUnmapMemory | CloseMapCh => {
+            KernelUnmap | HostMunmap | RmUnmapMemory | CloseMapCh | CloseExportChUndo => {
                 // An undo always advances: a failed one is counted, never retried.
                 if result.is_err() {
                     self.soft_errors = self.soft_errors.saturating_add(1);
@@ -1372,6 +1394,8 @@ impl Client {
                         self.view = ViewStage::FdRegistered;
                         self.view_cookie = 0;
                     }
+                    // The surface keeps its stage: the GEM and the memory are next.
+                    CloseExportChUndo => self.export_ch = 0,
                     _ => {
                         self.view = ViewStage::None;
                         self.map_ch = 0;
@@ -2301,6 +2325,125 @@ mod tests {
         let (layout, mem, _) = c.ready_surface().unwrap();
         assert_eq!((layout.width, layout.height), (1280, 720));
         assert_eq!(mem, memory_handle(2));
+    }
+
+    /// A client brought up on 1920x1080 with the surface path run for `stages` steps
+    /// (1 = AllocMemory, 2 = OpenExportCh, 3 = ExportToFd, 4 = GemImport).
+    fn client_at(stages: usize) -> Client {
+        let mut c = Client::new();
+        for _ in 0..11 + stages {
+            c.begin(1);
+            let Action::Step(s) = c.next(WANT1) else {
+                panic!("the client stopped early")
+            };
+            let out = ok_out(s, &c);
+            c.finish(s, Ok(out));
+        }
+        c
+    }
+
+    const OTHER_EXTENT: Want = Want {
+        level: 1,
+        surface: Some((1280, 720)),
+    };
+
+    /// `client_at(stages)`, then the extent changes: the steps taken until idle.
+    fn change_extent_after(stages: usize) -> (Client, Vec<Step>) {
+        let mut c = client_at(stages);
+        let mut log = Vec::new();
+        while let Action::Step(s) = c.next(OTHER_EXTENT) {
+            assert!(log.len() < 16, "runaway: {log:?}");
+            log.push(s);
+            let out = match s {
+                Step::AllocMemory => Out::Mem(surface_layout(1280, 720).unwrap()),
+                _ => ok_out(s, &c),
+            };
+            // The step that frees the surface must not find an export file open.
+            if matches!(s, Step::FreeMemory | Step::GemClose) {
+                assert_eq!(c.export_ch(), 0, "export file still open at {s:?}");
+            }
+            c.finish(s, Ok(out));
+        }
+        (c, log)
+    }
+
+    #[test]
+    fn a_new_extent_mid_surface_closes_the_export_file_first() {
+        use Step::*;
+        // The log the review found: AllocMemory, OpenExportCh, then the extent changes.
+        // Before the undo step, FreeMemory ran with `export_ch` set and the next
+        // `OpenExportCh` overwrote it.
+        let (c, log) = change_extent_after(2);
+        assert_eq!(
+            log,
+            [
+                CloseExportChUndo,
+                FreeMemory,
+                AllocMemory,
+                OpenExportCh,
+                ExportToFd,
+                GemImport,
+                CloseExportCh
+            ]
+        );
+        assert_eq!(c.export_ch(), 0);
+        assert_eq!(c.soft_errors(), 0);
+        let (layout, _, _) = c.ready_surface().unwrap();
+        assert_eq!((layout.width, layout.height), (1280, 720));
+
+        // After ExportToFd (export file open, nothing imported): the same.
+        let (c, log) = change_extent_after(3);
+        assert_eq!(&log[..2], [CloseExportChUndo, FreeMemory]);
+        assert_eq!(c.export_ch(), 0);
+
+        // After GemImport (the export file is closed by the next normal step, which the
+        // extent change pre-empts): export file, then GEM, then the memory.
+        let (c, log) = change_extent_after(4);
+        assert_eq!(&log[..3], [CloseExportChUndo, GemClose, FreeMemory]);
+        assert_eq!(c.export_ch(), 0);
+        assert!(c.ready_surface().is_some());
+    }
+
+    #[test]
+    fn a_new_extent_with_no_export_file_open_needs_no_undo_step() {
+        use Step::*;
+        let (_, log) = change_extent_after(1);
+        assert_eq!(&log[..2], [FreeMemory, AllocMemory]);
+        assert!(!log[..2].contains(&CloseExportChUndo));
+    }
+
+    #[test]
+    fn a_failed_export_file_undo_still_advances() {
+        use Step::*;
+        let mut c = client_at(2);
+        assert_eq!(c.export_ch(), 20);
+        assert_eq!(c.next(OTHER_EXTENT), Action::Step(CloseExportChUndo));
+        c.finish(CloseExportChUndo, Err(Fail::new(FailKind::Host, 0xC1)));
+        assert!(!c.is_dead());
+        assert_eq!(c.soft_errors(), 1);
+        assert_eq!(c.export_ch(), 0);
+        assert_eq!(c.next(OTHER_EXTENT), Action::Step(FreeMemory));
+    }
+
+    #[test]
+    fn a_failed_version_query_means_no_string() {
+        // A reply the host refused (errno in the header), a bare header claiming
+        // success, a truncated one, and an empty string: none has a string.
+        let mut refused = [0u8; MSG_HDR];
+        put32(&mut refused, 8, (-22i32) as u32);
+        assert_eq!(version_from_query_reply(&refused), [0u8; VERSION_STR_BYTES]);
+        assert_eq!(version_from_query_reply(&[]), [0u8; VERSION_STR_BYTES]);
+        assert_eq!(
+            version_from_query_reply(&[0u8; MSG_HDR]),
+            [0u8; VERSION_STR_BYTES]
+        );
+        // And a good one still yields it.
+        let mut r = std::vec![0u8; REPLY_DATA + VERSION_BYTES];
+        put32(&mut r, MSG_HDR, VERSION_BYTES as u32);
+        r[REPLY_DATA + 8..REPLY_DATA + 8 + 6].copy_from_slice(b"595.58");
+        let v = version_from_query_reply(&r);
+        assert_eq!(&v[..6], b"595.58");
+        assert_eq!(v[6], 0);
     }
 
     #[test]

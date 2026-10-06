@@ -30,7 +30,7 @@ Venus copy still write the Venus primary, and every consumer of an allocation is
 Section 5 says why that was not decidable blind and what the candidates are. The Venus path
 is the fallback for everything, and with the knob at 0 nothing here runs and nothing is
 written (not a registry value, not an RM message): the only difference from `044b242` is
-one `with_virtio` lock hold per HPD worker pass and one registry read of the knob per transport start.
+one atomic load per HPD worker pass (no lock) and one registry read of the knob per transport start.
 
 | `KmdRmClient` | does |
 |---|---|
@@ -39,7 +39,9 @@ one `with_virtio` lock hold per HPD worker pass and one registry read of the kno
 | 2 | 1, plus the kernel view of the surface, the test picture, one flip |
 
 Values above 2 count as 2. The knob is read once per transport generation (so `reg add` +
-`pnputil /restart-device` applies it).
+`pnputil /restart-device` applies it): one atomic holds the level, `u32::MAX` meaning unread, and
+`retire_transport` (through `forget`) resets it to unread. At level 0 `service` returns on that one
+load, before it asks for the virtio lock.
 
 ## 2. Architecture
 
@@ -92,6 +94,12 @@ here it is also the client on the other end.
   slots are shared: a process that fills them makes the client's `Open` fail
   (`Refusal::NoResources`, counted in `NvRef`), which kills the client for the generation and
   leaves Venus in charge. `QUERY_CAPS` is unchanged.
+* **The byte quota does not count the client's view.** `host_mmap` checks the per-device byte
+  quota of RM-window mappings (a quarter of the window, `nvrm_map_bytes_room`) for the KMD owner,
+  but the client's CPU view is never recorded with `push_nvrm_map` (it is not a process's `MMAP`
+  and has no user view), so the bytes are neither accumulated against any quota nor counted in
+  `NvMapMb`. Accepted: it is one mapping at a time, bounded by the surface (8 MB at 1080p, level 2
+  only), and unmapped before the sweep. Left as is.
 * **`Nv*` counters.** The client goes through `forward`, so its `Open`/`Close`/`Ioctl`s are
   counted in `NvOpen`/`NvClose`/`NvIoctl` like anyone's. With the client up, `NvOpen - NvClose`
   is 3 more than the user-mode handles (control, GPU, DRM); teardown closes are not counted
@@ -137,7 +145,7 @@ allow-list refuses an `RM_ALLOC` whose parameter block is not exactly RM's size 
 | `RmStep` | step | message | notes |
 |---|---|---|---|
 | 1 | `OpenCtl` | `Open` device_type 255 | the control file; handle recorded under `KMD_RM` |
-| 2 | `VersionQuery` | `NV_ESC_CHECK_VERSION_STR`, cmd `'2'` | what librmclient does first: the host learns the driver version from a successful reply (its ABI profile and allow-list depend on it). The string is kept |
+| 2 | `VersionQuery` | `NV_ESC_CHECK_VERSION_STR`, cmd `'2'` | what librmclient does first: the host learns the driver version from a successful reply (its ABI profile and allow-list depend on it). The string is kept. A QUERY the host refuses or answers unreadably is **not** fatal (librmclient ignores it too): no string, so step 3 is skipped; only a transport failure or a refused forward ends the client |
 | 3 | `VersionStrict` | the same, cmd 0, with that string | a mismatch is RM's `-EINVAL`, reported in the header. Skipped (success) if no string came back |
 | 4 | `CardInfo` | `NV_ESC_CARD_INFO` (2304 bytes) | first valid card: `gpu_id`@16, `minor_number`@56 of the 72-byte records |
 | 5 | `AllocRoot` | `NV_ESC_RM_ALLOC` NV01_ROOT_CLIENT, `hObjectNew = 0` | RM picks the client handle; read from the reply |
@@ -152,6 +160,7 @@ allow-list refuses an `RM_ALLOC` whose parameter block is not exactly RM's size 
 | 18 | `ExportToFd` | RM_CONTROL `NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD` (0x3d05), 24-byte params, `fd` = the export file's backend handle | the host translates the handle at nested offset 16 |
 | 19 | `GemImport` | DRM ioctl `0xC0206441` on the DRM node: 32-byte data, 28-byte NVKMS block (`memFd`, layout 1 = pitch) | GEM handle at data offset 24 |
 | 20 | `CloseExportCh` | `Close` | nvidia-drm holds its own reference now |
+| 21 | `CloseExportChUndo` | `Close` of the same file, stage kept | only when the extent changes while the export file is still open (stages after `OpenExportCh`, before `CloseExportCh`): it goes before `GemClose` / `FreeMemory`. An undo: a failed close is counted (`RmSoft`), never retried |
 
 Level 2 then runs (`RmStep` 32 to 36, 48 to 50) `OpenMapCh` (GPU channel), `RegisterMapFd`, `RmMapMemory` (`NV_ESC_RM_MAP_MEMORY`
 with fd, on the control file: librmclient's channel-per-mapping protocol), `HostMmap` (`Mmap` of
@@ -231,7 +240,8 @@ Consequences, stated so nobody finds them by surprise:
 
 * While the probe shows, a **user-mode foreign source or a forwarded `ScanoutFlip`** from another
   device is refused (`Busy` / `FORBIDDEN`), and the probe's own `ScanoutSet` finds a user source
-  `Busy` (retried three times, then skipped, `RmBusy`).
+  `Busy` (retried on three successive worker passes, then skipped, `RmBusy`; a `Busy` ends the pass, so
+  the retry waits for the worker's next wake, which the other source's lapse provides).
 * The flip has **no completion**: the host's reply is a bare header and the viewer's release event
   is not forwarded. The probe writes the picture before the flip and never touches the surface
   after it, so no reuse protection is needed; a production source needs N buffers or a release
@@ -251,11 +261,19 @@ Consequences, stated so nobody finds them by surprise:
   lock, discarding the report (and unmapping a view it made) if the generation changed.
 * **Retire.** `close_all_on_host` begins with `retire_begin`: the kernel view is unmapped before
   the host is asked to close the file that holds the mapping (and whether or not the host is
-  alive). The sweep then closes the client's handles like any owner's (`Munmap`, then `Close`, 10 s
-  / first-failure bound); closing the control file frees every RM client made on it, closing the
+  alive). The sweep then closes the client's handles like any owner's (`Close`, with the sweep's own budget; the client's host mapping is not in the map table, so no `Munmap` is sent for it and the host's close of the channel file is what drops it, **untested**); closing the control file frees every RM client made on it, closing the
   DRM file drops its GEM handles and the dma-bufs exported for them. `retire_transport` ends with
   `forget`, which also unmaps a view recorded in the gap. Nothing is double-closed: a `Close` of a
   handle the sweep already took is `NOT_OWNED`.
+* **Bounded at StopDevice.** `stop_hpd` joins the worker for 5 s, twice, and leaks the worker and
+  the adapter if it does not exit. So a client caught mid-bring-up (knob on) must not hold it: each
+  message is bounded by `TIMEOUT_MS` = 2.5 s (was 10 s), the step loop checks `hpd_stop` before every
+  step, and `cleanup` checks it before every `Close` and stops sending after the first transport
+  failure. What was not closed stays in the NVRM tables under `KMD_RM`, and the sweep closes it
+  (or drops it when the host is gone).
+* **Frames.** `service`, `retire_begin`, `forget` (which builds a `Client` by value) and `unmap_view`
+  are `#[inline(never)]`, so they add nothing to the frames of `retire_transport`,
+  `close_all_on_host`, `dxgkddi_start_device` or the worker.
 * **A new transport generation** (`nvrm_epoch`) resets the client to cold (`sync_epoch`), so even a
   missed hook self-heals; surface handles keep counting across generations.
 * **No work at init.** Nothing was added to `VirtioGpu::init` or `StartDevice`; the knob is read by
@@ -273,13 +291,14 @@ Consequences, stated so nobody finds them by surprise:
 | `RegisterGpuFd` / `RegisterMapFd` | host refuses | counted (`RmRegFd`), ignored | continues |
 | view (level 2): map channel, `RM_MAP_MEMORY`, host `Mmap`, `MmMapIoSpace` | any | the view is given up and unwound; the client lives | the surface is still valid for a flip |
 | probe: fill / set / present | any | the probe is skipped; read-back mismatch is only counted | none needed |
-| `ScanoutSet` finds a user source | `Busy` | retried up to three times | skipped |
-| `ScanoutPresent` | host refuses or times out | probe skipped; the source ends by its lapse and the desktop is restored | desktop |
+| `ScanoutSet` finds a user source | `Busy` | retried once per worker pass, up to three times | skipped |
+| `ScanoutPresent` | host refuses or times out | probe skipped; the KMD's source is released at once (`foreign_scanout_release`), so the desktop flush is restored without waiting for the 4 s lapse | desktop |
 | transport stop / replace | `retire_transport` | view unmapped, handles closed, state forgotten | next generation starts cold |
 | transport failed | sweep sends nothing | tables cleared; `VirtioGpu::drop` finishes; state forgotten | n/a |
 | generation changed mid-step | `send` sees a different epoch | `Transport 0xE0`, result discarded | cold start |
 | host table full (`NoResources`) | another process holds the 1024 slots | dead | Venus |
-| surface size changes (mode set) | extent differs from the surface's | undo the view, `GemClose`, `FreeMemory`, allocate again; a failed free is a death | Venus |
+| surface size changes (mode set) | extent differs from the surface's | undo the view, `CloseExportChUndo` if the export file is open, `GemClose`, `FreeMemory`, allocate again; a failed free is a death | Venus |
+| StopDevice while a step runs | `hpd_stop` set | no further step or close is started; the sweep closes what is open | n/a |
 
 Nothing consumes the client in production yet, so "dead" costs nothing but the probe. When
 something does (slice 1b), the consumer asks `ready_surface()` and keeps using Venus when it is
@@ -374,5 +393,5 @@ HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`.
    `NV01_MEMORY_LOCAL_USER`); 8 MB at 1080p. A guest-wide limit that small would make `AllocMemory`
    answer `NV_ERR_NO_MEMORY` (`RmFail` kind 4, code 0x51).
 6. **The 5 s `ScanoutFlip` wait on the HPD worker.** A wedged host holds the display worker for the
-   flip's timeout once (the probe only); every other host round trip of the client is bounded by 10 s
+   flip's timeout once (the probe only); every other host round trip of the client is bounded by 2.5 s
    and happens a few at a time.

@@ -42,7 +42,7 @@ use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use helios_kmd_logic::foreign_scanout::SetError;
 use helios_kmd_logic::rm_client::{
     self as rc, Action, Client, Fail, FailKind, Out, Step, Want, MAX_DRI,
@@ -55,8 +55,11 @@ const KMD: DeviceOwner = DeviceOwner::KMD_RM;
 
 /// Steps performed per worker pass before the worker is woken again.
 const STEPS_PER_PASS: usize = 6;
-/// How long any one host message may take.
-const TIMEOUT_MS: u64 = 10_000;
+/// How long any one host message may take. Short on purpose: `stop_hpd` joins the worker
+/// for 5 s (twice), so a step caught by StopDevice must be over well inside that, or the
+/// worker (and with it the adapter) is leaked. Every host answer here is a few
+/// milliseconds; a message that takes longer is a host that is not answering.
+const TIMEOUT_MS: u64 = 2_500;
 /// How long the probe picture stays on screen: the foreign scanout source's lapse,
 /// after which the HPD worker gives scanout 0 back by itself (`FsLapse`).
 const PROBE_LAPSE_MS: u32 = 4_000;
@@ -70,11 +73,14 @@ const PAGE: u64 = 4096;
 /// The one client. See the module docs for what may touch it and when.
 static CLIENT: SpinLock<Client> = SpinLock::new(Client::new());
 
-/// The `KmdRmClient` knob, read once per transport generation (so `reg add` +
-/// `pnputil /restart-device` applies it). `KNOB_EPOCH` is the generation it was read
-/// for; 0 is no generation.
-static KNOB_EPOCH: AtomicU64 = AtomicU64::new(0);
-static KNOB_LEVEL: AtomicU32 = AtomicU32::new(0);
+/// `KNOB_LEVEL` before the knob has been read for this transport generation.
+const KNOB_UNREAD: u32 = u32::MAX;
+/// The `KmdRmClient` knob (0, 1 or 2), or [`KNOB_UNREAD`]: read once per transport
+/// generation (so `reg add` + `pnputil /restart-device` applies it), by resetting it to
+/// unread in [`forget`], which `retire_transport` runs for every transport it drops.
+/// With the knob at 0 (the default) [`service`] is this one atomic load and nothing
+/// else: no virtio lock, no registry read.
+static KNOB_LEVEL: AtomicU32 = AtomicU32::new(KNOB_UNREAD);
 
 /// Counters, mirrored by [`publish_counters`] (names at most 14 characters).
 ///
@@ -111,10 +117,15 @@ pub static RM_REGFD_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// is off: nothing is written until the client has done something.
 pub(crate) fn publish_counters() {
     use crate::diag::record_named_bytes as rec;
-    if KNOB_LEVEL.load(Ordering::Relaxed) == 0 && RM_STEPS.load(Ordering::Relaxed) == 0 {
+    let level = KNOB_LEVEL.load(Ordering::Relaxed);
+    if level == 0 && RM_STEPS.load(Ordering::Relaxed) == 0 {
         return;
     }
-    rec(b"RmKnob", KNOB_LEVEL.load(Ordering::Relaxed));
+    // Unread (between a transport's retirement and the worker's next pass): the
+    // registry keeps what it has.
+    if level != KNOB_UNREAD {
+        rec(b"RmKnob", level);
+    }
     rec(b"RmStatus", RM_STATUS.load(Ordering::Relaxed));
     rec(b"RmStep", RM_LAST_STEP.load(Ordering::Relaxed));
     rec(b"RmFail", RM_FAIL.load(Ordering::Relaxed));
@@ -150,23 +161,39 @@ fn wanted_surface(adapter: &AdapterContext) -> Option<(u32, u32)> {
     Some(((wh >> 32) as u32, wh as u32))
 }
 
-/// The knob for this transport generation, read once.
-fn level_for(epoch: u64) -> u8 {
-    if KNOB_EPOCH.load(Ordering::Acquire) != epoch {
-        let v = crate::diag::read_config_dword(crate::diag::knobs::KMD_RM_CLIENT, 0);
-        KNOB_LEVEL.store(v.min(2), Ordering::Release);
-        KNOB_EPOCH.store(epoch, Ordering::Release);
-        // Nothing is written for the default (off): the registry stays as it was.
-        if v != 0 {
-            crate::diag::record_named_bytes(b"RmKnob", v.min(2));
-        }
+/// The knob for this transport generation: one atomic load, and the registry read only
+/// when [`forget`] reset it.
+fn knob_level() -> u32 {
+    let level = KNOB_LEVEL.load(Ordering::Relaxed);
+    if level != KNOB_UNREAD {
+        return level;
     }
-    KNOB_LEVEL.load(Ordering::Acquire) as u8
+    read_knob()
+}
+
+/// The registry read behind [`knob_level`], out of line: its frame is for the one pass
+/// per transport generation that needs it.
+#[inline(never)]
+fn read_knob() -> u32 {
+    let v = crate::diag::read_config_dword(crate::diag::knobs::KMD_RM_CLIENT, 0).min(2);
+    KNOB_LEVEL.store(v, Ordering::Relaxed);
+    // Nothing is written for the default (off): the registry stays as it was.
+    if v != 0 {
+        crate::diag::record_named_bytes(b"RmKnob", v);
+    }
+    v
 }
 
 /// One pass of the client, from the HPD worker's loop (PASSIVE). Does nothing at all
-/// unless `KmdRmClient` is nonzero and a VidPn primary is bound.
+/// unless `KmdRmClient` is nonzero and a VidPn primary is bound; with the knob at 0 it
+/// is one atomic load (the virtio lock is never touched). Not inlined: the worker's
+/// frame must not grow by this function's locals.
+#[inline(never)]
 pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
+    let level = knob_level();
+    if level == 0 {
+        return;
+    }
     // No transport: nothing to do, and `retire_transport` already forgot the client.
     let Ok(epoch) = adapter.with_virtio(|v| v.nvrm_epoch()) else {
         return;
@@ -174,12 +201,8 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     if epoch == 0 {
         return;
     }
-    let level = level_for(epoch);
-    if level == 0 {
-        return;
-    }
     let want = Want {
-        level,
+        level: level as u8,
         surface: wanted_surface(adapter),
     };
 
@@ -204,6 +227,12 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
     let mut did = 0usize;
     let mut more = false;
     for i in 0..STEPS_PER_PASS {
+        // StopDevice joins this worker for a bounded time: begin no step once it asked.
+        // What the client holds open stays in the NVRM tables, and the stop sweep
+        // closes it.
+        if io.stopping() {
+            break;
+        }
         let (action, snapshot) = {
             let g = CLIENT.lock();
             (g.next(want), *g)
@@ -222,12 +251,18 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
                 RM_STEPS.fetch_add(1, Ordering::Relaxed);
                 let result = io.perform(step, &snapshot, want);
                 did += 1;
+                // The probe's source is held by another owner: back off to the next
+                // worker pass instead of asking again at once.
+                let busy = matches!(&result, Err(f) if f.kind == FailKind::Busy);
                 if !apply(epoch, step, result, &snapshot) {
                     // The generation changed under the step: it is moot.
                     break;
                 }
                 if CLIENT.lock().is_dead() {
                     cleanup(&io);
+                    break;
+                }
+                if busy {
                     break;
                 }
                 more = i + 1 == STEPS_PER_PASS;
@@ -311,8 +346,19 @@ fn cleanup(io: &Io<'_>) {
     };
     unmap_view(view);
     for &h in handles.as_slice() {
-        if io.close_file(h) {
-            RM_CLOSED.fetch_add(1, Ordering::Relaxed);
+        // Bounded like the step loop: once StopDevice asks, or the transport has
+        // failed, stop sending. The handles are still in the NVRM tables, and the
+        // sweep closes them (or drops them from the tables when the host is gone).
+        if io.stopping() {
+            break;
+        }
+        match io.try_close(h) {
+            Ok(true) => {
+                RM_CLOSED.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {}
+            Err(f) if f.kind == FailKind::Transport => break,
+            Err(_) => {}
         }
     }
     if handles.as_slice().is_empty() {
@@ -328,6 +374,7 @@ fn cleanup(io: &Io<'_>) {
 /// no virtual address outlives the window range the host is about to release. The
 /// client's handles are in the NVRM tables under [`DeviceOwner::KMD_RM`] and are
 /// closed by that same sweep.
+#[inline(never)]
 pub(crate) fn retire_begin(_passive: PassiveLevel) {
     let view = CLIENT.lock().take_view();
     unmap_view(view);
@@ -336,6 +383,7 @@ pub(crate) fn retire_begin(_passive: PassiveLevel) {
 /// The transport is gone: forget everything (the sweep closed the host side). A view
 /// the worker recorded after [`retire_begin`] looked (a start without a stop, the one
 /// path on which a worker can still be running) is unmapped here, so none outlives it.
+#[inline(never)]
 pub(crate) fn forget() {
     let view = {
         let mut g = CLIENT.lock();
@@ -344,8 +392,11 @@ pub(crate) fn forget() {
         view
     };
     unmap_view(view);
+    // The next transport generation reads the knob again (once).
+    KNOB_LEVEL.store(KNOB_UNREAD, Ordering::Relaxed);
 }
 
+#[inline(never)]
 fn unmap_view(view: Option<(u64, u64)>) {
     if let Some((va, len)) = view {
         // SAFETY: `va`/`len` came from `MmMapIoSpace` in `kernel_map` and were taken
@@ -463,23 +514,33 @@ impl Io<'_> {
         }
     }
 
-    /// `Close` of `handle`; whether the host closed it.
-    fn close_file(&self, handle: u32) -> bool {
+    /// StopDevice has asked the worker to go (`stop_hpd` joins it for a bounded time):
+    /// start nothing more.
+    fn stopping(&self) -> bool {
+        self.adapter.hpd_stop.load(Ordering::Acquire) != 0
+    }
+
+    /// `Close` of `handle`: whether the host closed it, or why nothing was asked
+    /// (the forward failed: a transport failure ends a sequence of closes).
+    fn try_close(&self, handle: u32) -> Result<bool, Fail> {
         let mut req = [0u8; 32];
         let Some(n) = rc::build_close(&mut req, handle) else {
-            return false;
+            return Ok(false);
         };
         let mut resp = [0u8; 64];
         let Some(req) = req.get(..n) else {
-            return false;
+            return Ok(false);
         };
-        match self.send(req, &mut resp) {
-            Ok(len) => resp
-                .get(..len)
-                .and_then(rc::reply_status)
-                .is_some_and(|s| s == 0),
-            Err(_) => false,
-        }
+        let len = self.send(req, &mut resp)?;
+        Ok(resp
+            .get(..len)
+            .and_then(rc::reply_status)
+            .is_some_and(|s| s == 0))
+    }
+
+    /// `Close` of `handle`; whether the host closed it.
+    fn close_file(&self, handle: u32) -> bool {
+        self.try_close(handle).unwrap_or(false)
     }
 
     /// `NV_ESC_RM_ALLOC` of `class` as `h_new` under `parent`, with `params`: the reply.
@@ -529,6 +590,9 @@ impl Io<'_> {
             Step::ExportToFd => self.export_to_fd(c),
             Step::GemImport => self.gem_import(c),
             Step::CloseExportCh => self.close_checked(c.export_ch()),
+            // An undo: the export file closed with the stage kept (the extent changed
+            // before it was imported); a refusal is counted, not fatal.
+            Step::CloseExportChUndo => self.close_checked(c.export_ch()),
             Step::GemClose => self.gem_close(c),
             Step::FreeMemory => self.free_memory(c),
 
@@ -572,16 +636,14 @@ impl Io<'_> {
             &[],
             &mut resp,
         )?;
-        let reply = rc::parse_ioctl_reply(resp.get(..n).ok_or(Fail::new(FailKind::Parse, 4))?)
-            .map_err(|e| match e {
-                rc::ReplyError::Host(s) => Fail::new(FailKind::Host, s.unsigned_abs()),
-                rc::ReplyError::Short => Fail::new(FailKind::Parse, 4),
-            })?;
-        // No string is not a failure: the strict check below is then skipped, as a RM
-        // that never enforced it would not notice either.
-        Ok(Out::Version(
-            rc::parse_version_reply(reply.data).unwrap_or([0u8; rc::VERSION_STR_BYTES]),
-        ))
+        // No string is not a failure, and neither is a QUERY the host refused or
+        // answered badly: librmclient ignores it too (rmclient.c), and the strict
+        // check below is then skipped, as a RM that never enforced it would not
+        // notice either. A transport failure or a refused forward (the `?` above)
+        // still ends the client.
+        Ok(Out::Version(rc::version_from_query_reply(
+            resp.get(..n).unwrap_or(&[]),
+        )))
     }
 
     #[inline(never)]
@@ -1040,13 +1102,20 @@ impl Io<'_> {
     #[inline(never)]
     fn scanout_present(&self, c: &Client) -> Result<Out, Fail> {
         use crate::virtio::foreign_scanout::{present, PresentRefusal};
-        match present(self.passive, self.adapter, KMD, c.drm(), c.gem()) {
+        let result = match present(self.passive, self.adapter, KMD, c.drm(), c.gem()) {
             Ok(_seq) => Ok(Out::Unit),
             Err(PresentRefusal::NoTransport) => Err(Fail::new(FailKind::Transport, 4)),
             Err(PresentRefusal::NotOwned) => Err(Fail::new(FailKind::Refused, 2)),
             Err(PresentRefusal::Forbidden) => Err(Fail::new(FailKind::Refused, 4)),
             Err(PresentRefusal::NoSource) => Err(Fail::new(FailKind::Refused, 6)),
             Err(PresentRefusal::Device(e)) => Err(fail_of(Refusal::Transport(e))),
+        };
+        if result.is_err() {
+            // The source was set (`ScanoutSet`) and never shown: end it now, so the
+            // desktop's flush is restored at once instead of after the lapse. A no-op
+            // when it is not live any more.
+            let _ = self.adapter.foreign_scanout_release(KMD, Some(c.drm()));
         }
+        result
     }
 }
