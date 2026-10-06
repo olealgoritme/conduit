@@ -173,7 +173,14 @@ never drained) with user-mode state only; its cost is the reader's submission-wo
 the read needs anyway. A GPU-side wait can replace the CPU wait in the reader's submission worker
 later without changing the ledger.
 
-Reclamation (ledger v2, `Local\\HeliosHandoffLedger2`): a slot lists the processes holding its
+Per-device entries (ledger v3, `Local\\HeliosHandoffLedger3`): a slot keeps one point per
+publishing device (four entries; an entry is reused once its point completed or its record moved
+on). With a single "last publisher" point (442d2c2) the reader's own publication could replace the
+releaser's before the reader sampled it, so it waited for nothing: keyed-load stale on 319.2 in
+both directions on both backends while publishing and perf looked fine. `HELIOS_HANDOFF_TRACE=1`
+logs registrations, publications and samples (keys, points, pending counts) to the UMD log.
+
+Reclamation: a slot lists the processes holding its
 resource id (four pids, more are counted); `DestroyResource` of the last registration in a process
 removes its pid, and the slot becomes a tombstone when no holder is left. Device records (4096)
 carry a generation that is part of every published point: a record is freed when its device is
