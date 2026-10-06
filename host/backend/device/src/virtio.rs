@@ -297,6 +297,13 @@ impl VirtioGpuNvConfig {
             | protocol::messages::NVGPU_CFG_RM_RESOURCE_IMPORT;
     }
 
+    /// Serve guest-memory blobs (docs/VENUS.md "Guest-memory blobs"): sets
+    /// [`protocol::messages::NVGPU_CFG_GUEST_BLOB`]. Only with Venus, only
+    /// when asked for, and only when its renderer imports host memory.
+    pub fn set_guest_blob(&mut self) {
+        self.features |= protocol::messages::NVGPU_CFG_GUEST_BLOB;
+    }
+
     /// Turn host fences into guest fences (docs/SYNC.md): sets
     /// [`protocol::messages::NVGPU_CFG_DRM_FENCES`]. Only by a transport that
     /// delivers one-shot fence watches (`take_watch_updates`); without that
@@ -526,5 +533,20 @@ mod tests {
                 | NVGPU_CFG_RM_RESOURCE_IMPORT
         );
         assert_eq!(NVGPU_CFG_RM_IMPORT, 1 << 13);
+    }
+
+    #[test]
+    fn guest_blobs_are_announced_only_when_set() {
+        use protocol::messages::{NVGPU_CFG_GUEST_BLOB, NVGPU_CFG_VENUS};
+        let mut cfg = VirtioGpuNvConfig::new("615.71.09", &[], crate::caps::Caps::DEFAULT, 0);
+        cfg.set_venus();
+        assert_eq!({ cfg.features } & NVGPU_CFG_GUEST_BLOB, 0);
+        cfg.set_guest_blob();
+        assert_eq!(
+            { cfg.features },
+            FEATURE_RMCTRL_SEGMENTS | NVGPU_CFG_VENUS | NVGPU_CFG_GUEST_BLOB
+        );
+        // The number the guest driver tests (docs/VENUS.md).
+        assert_eq!(NVGPU_CFG_GUEST_BLOB, 1 << 16);
     }
 }

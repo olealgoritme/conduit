@@ -251,6 +251,7 @@ fn rm_blobs_need_a_renderer_that_imports_and_an_rm_side() {
         window: Some(&*t.region),
         display: None,
         rm: None,
+        ram: None,
     };
     let cmd = rm_blob_cmd(1, 50, 7, 77, 1 << 20).to_bytes();
     let Outcome::Done(n) = t.venus.dispatch(&cmd, &mut resp, env) else {

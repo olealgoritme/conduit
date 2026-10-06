@@ -65,6 +65,10 @@ mod op {
     /// only to a server whose features (below) say it knows the op: a server
     /// that does not ends the connection on an unknown op.
     pub const IMPORT_DMABUF: u32 = 12;
+    /// `{res_id u32, count u32, count x {offset u64, len u64}}` and the guest
+    /// RAM file as the request's fd. Sent only to a server whose features
+    /// carry `FEATURE_IMPORT_GUEST_PAGES`.
+    pub const IMPORT_GUEST_PAGES: u32 = 13;
 
     /// `CAPSET_INFO` with this index asks for [`Renderer::features`]: the
     /// reply's first word is the bits. A server from before features passes
@@ -657,6 +661,21 @@ impl Renderer for IpcClient {
         self.call_fd(op::IMPORT_DMABUF, &W::default().u32(res_id).u64(size).0, Some(fd))?;
         Ok(())
     }
+
+    fn import_guest_pages(&mut self, res_id: u32, ram: BorrowedFd<'_>, runs: &[crate::PageRun]) -> Result<()> {
+        if self.features() & crate::FEATURE_IMPORT_GUEST_PAGES == 0 {
+            return Err(Error::Refused("the renderer cannot import guest pages".into()));
+        }
+        if runs.len() > crate::guest_pages::MAX_RUNS {
+            return Err(Error::Refused("too many guest page runs".into()));
+        }
+        let mut w = W::default().u32(res_id).u32(runs.len() as u32);
+        for r in runs {
+            w = w.u64(r.offset).u64(r.len);
+        }
+        self.call_fd(op::IMPORT_GUEST_PAGES, &w.0, Some(ram))?;
+        Ok(())
+    }
 }
 
 // -------------------------------------------------------------------- server
@@ -789,6 +808,23 @@ impl IpcServer {
                     return Err(bad());
                 }
                 let res = rd.import_dmabuf(res, m.fds[0].as_fd(), size).map(|()| Vec::new());
+                self.reply(res, None)
+            }
+            op::IMPORT_GUEST_PAGES => {
+                let mut f = || -> Result<_> { Ok((r.u32()?, r.u32()? as usize)) };
+                let (res, count) = f().map_err(|_| bad())?;
+                if m.fds.len() != 1 || count > crate::guest_pages::MAX_RUNS {
+                    return Err(bad());
+                }
+                let mut runs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mut g = || -> Result<_> { Ok(crate::PageRun { offset: r.u64()?, len: r.u64()? }) };
+                    runs.push(g().map_err(|_| bad())?);
+                }
+                if !r.rest().is_empty() {
+                    return Err(bad());
+                }
+                let res = rd.import_guest_pages(res, m.fds[0].as_fd(), &runs).map(|()| Vec::new());
                 self.reply(res, None)
             }
             op::CREATE_FENCE => {
@@ -1183,7 +1219,11 @@ mod tests {
         inner: Mock,
         can_import: bool,
         log: Arc<Mutex<Vec<(u32, u64, u64)>>>,
+        /// Guest-page imports: resource, inode of the RAM file, runs.
+        guest: GuestLog,
     }
+
+    type GuestLog = Arc<Mutex<Vec<(u32, u64, Vec<crate::PageRun>)>>>;
 
     fn inode(fd: BorrowedFd<'_>) -> u64 {
         // SAFETY: fstat into a zeroed local.
@@ -1235,7 +1275,12 @@ mod tests {
             self.inner.export_scanout(r, l)
         }
         fn features(&mut self) -> u32 {
-            if self.can_import { crate::FEATURE_IMPORT_DMABUF } else { 0 }
+            if self.can_import { crate::FEATURE_IMPORT_DMABUF | crate::FEATURE_IMPORT_GUEST_PAGES } else { 0 }
+        }
+        fn import_guest_pages(&mut self, r: u32, ram: BorrowedFd<'_>, runs: &[crate::PageRun]) -> Result<()> {
+            assert!(self.can_import, "an import reached a renderer without the feature");
+            self.guest.lock().unwrap().push((r, inode(ram), runs.to_vec()));
+            self.inner.import_guest_pages(r, ram, runs)
         }
         fn import_dmabuf(&mut self, r: u32, fd: BorrowedFd<'_>, size: u64) -> Result<()> {
             assert!(self.can_import, "an import reached a renderer without the feature");
@@ -1247,19 +1292,68 @@ mod tests {
     type ImportLog = Arc<Mutex<Vec<(u32, u64, u64)>>>;
 
     fn importer_pair(can_import: bool) -> (IpcClient, ImportLog, JoinHandle<()>) {
+        let (c, log, _, server) = importer_pair_with_guest(can_import);
+        (c, log, server)
+    }
+
+    fn importer_pair_with_guest(can_import: bool) -> (IpcClient, ImportLog, GuestLog, JoinHandle<()>) {
         let (a, b) = socketpair().unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
-        let r = Importer { inner: Mock::new(), can_import, log: log.clone() };
+        let guest = Arc::new(Mutex::new(Vec::new()));
+        let r = Importer { inner: Mock::new(), can_import, log: log.clone(), guest: guest.clone() };
         let server = std::thread::spawn(move || {
             IpcServer::new(b, Box::new(r)).serve().expect("serve");
         });
-        (IpcClient::new(a).unwrap(), log, server)
+        (IpcClient::new(a).unwrap(), log, guest, server)
+    }
+
+    #[test]
+    fn guest_pages_carry_the_ram_file_and_every_run() {
+        let (mut c, _, guest, server) = importer_pair_with_guest(true);
+        assert_ne!(c.features() & crate::FEATURE_IMPORT_GUEST_PAGES, 0);
+        let ram = crate::mock::memfd(16 << 20).unwrap();
+        // The most runs one import may carry, single pages in reverse order.
+        let runs: Vec<crate::PageRun> = (0..crate::guest_pages::MAX_RUNS as u64)
+            .rev()
+            .map(|i| crate::PageRun { offset: i * 4096, len: 4096 })
+            .collect();
+        c.import_guest_pages(9, ram.as_fd(), &runs).unwrap();
+        {
+            let g = guest.lock().unwrap();
+            assert_eq!(g.len(), 1);
+            assert_eq!((g[0].0, g[0].1), (9, inode(ram.as_fd())));
+            assert_eq!(g[0].2, runs);
+        }
+        // Runs past the file are the renderer's to refuse; the connection
+        // survives it.
+        let past = [crate::PageRun { offset: 16 << 20, len: 4096 }];
+        assert!(matches!(c.import_guest_pages(10, ram.as_fd(), &past), Err(Error::Refused(_))));
+        // More runs than the op carries are refused before sending.
+        let too_many = vec![crate::PageRun { offset: 0, len: 4096 }; crate::guest_pages::MAX_RUNS + 1];
+        assert!(matches!(c.import_guest_pages(11, ram.as_fd(), &too_many), Err(Error::Refused(_))));
+        assert_eq!(guest.lock().unwrap().len(), 2);
+        c.ctx_create(1, CAPSET_VENUS, b"").unwrap();
+        c.ctx_attach(1, 9).unwrap();
+        drop(c);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn guest_pages_are_never_sent_to_a_renderer_without_the_feature() {
+        let (mut c, _, guest, server) = importer_pair_with_guest(false);
+        let ram = crate::mock::memfd(4096).unwrap();
+        let runs = [crate::PageRun { offset: 0, len: 4096 }];
+        assert!(matches!(c.import_guest_pages(1, ram.as_fd(), &runs), Err(Error::Refused(_))));
+        assert!(guest.lock().unwrap().is_empty());
+        assert_eq!(c.capset_info(0).unwrap().id, CAPSET_VENUS);
+        drop(c);
+        server.join().unwrap();
     }
 
     #[test]
     fn dmabuf_import_carries_the_descriptor() {
         let (mut c, log, server) = importer_pair(true);
-        assert_eq!(c.features(), crate::FEATURE_IMPORT_DMABUF);
+        assert_eq!(c.features(), crate::FEATURE_IMPORT_DMABUF | crate::FEATURE_IMPORT_GUEST_PAGES);
         let buf = crate::mock::memfd(1 << 16).unwrap();
         c.import_dmabuf(7, buf.as_fd(), 1 << 16).unwrap();
         // The renderer got the very file, not a copy of its bytes.

@@ -445,6 +445,17 @@ pub const NVGPU_CFG_RM_IMPORT: u32 = 1 << 13;
 /// object of the caller's render node). Set whenever RM import is.
 pub const NVGPU_CFG_RM_RESOURCE_IMPORT: u32 = 1 << 14;
 
+/// Device config `features` bit, only together with [`NVGPU_CFG_VENUS`]: the
+/// backend serves guest-memory blobs (docs/VENUS.md "Guest-memory blobs"):
+/// `RESOURCE_CREATE_BLOB` with `blob_mem =` [`crate::venus::BLOB_MEM_GUEST`]
+/// makes a Venus resource of the guest pages its entries name, which Venus
+/// contexts import with `VkImportMemoryResourceInfoMESA` as a copy
+/// destination, so the host GPU writes those pages directly. Set only when
+/// the backend runs with `--venus-guest-blobs` and its renderer can import
+/// host memory (`VK_EXT_external_memory_host`). Bit 15 is skipped (see
+/// [`NVGPU_F_SCANOUT_RELEASE`]).
+pub const NVGPU_CFG_GUEST_BLOB: u32 = 1 << 16;
+
 /// A **virtio device feature** the guest acks (like [`NVGPU_CFG_TAKES_INPUT`],
 /// not a config `features` bit; config bit 15 stays unused): the guest wants
 /// `ScanoutReleased` events. The backend offers it in its device features

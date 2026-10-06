@@ -3,6 +3,7 @@
 //! | key | values | default |
 //! |---|---|---|
 //! | `view.close_stops_vm` | true, false | true: closing the window of a VM that `conduit view` started shuts it down. A VM started any other way (`conduit up`, virt-manager, virsh) always keeps running. |
+//! | `venus.guest_blobs` | true, false | false: the backend serves guest-memory blobs (docs/VENUS.md "Guest-memory blobs"), Venus copy destinations over the guest's own pages, for the Windows KMD's windowed Present. Opt-in while new. Applies when a VM's backend next starts. |
 //! | `gpu.window_mib` | auto, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144 | auto: the host GPU's BAR1 (as Resizable BAR on bare metal), clamped to what the guest's 64-bit MMIO window holds, 4096 without a GPU. The shared window every guest CPU mapping of GPU memory goes through, in MiB. Address space, not memory. Applies when a VM's backend next starts. |
 
 use crate::paths;
@@ -17,6 +18,11 @@ const KEYS: &[(&str, &[&str], &str)] = &[
         "view.close_stops_vm",
         &["true", "false"],
         "closing the window of a VM that `conduit view` started shuts it down (default true)",
+    ),
+    (
+        "venus.guest_blobs",
+        &["true", "false"],
+        "serve guest-memory blobs to Venus guests (the Windows KMD's windowed Present writes guest pages directly), from the next backend start (default false)",
     ),
     (
         "gpu.window_mib",
@@ -113,6 +119,14 @@ pub fn close_stops_vm() -> bool {
         .get("view.close_stops_vm")
         .and_then(Value::as_bool)
         .unwrap_or(true)
+}
+
+/// `venus.guest_blobs` (default false): the backend gets `--venus-guest-blobs`.
+pub fn venus_guest_blobs() -> bool {
+    load()
+        .get("venus.guest_blobs")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// `gpu.window_mib` as a number; `None` for `auto` (unset, or set to auto).

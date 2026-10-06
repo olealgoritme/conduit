@@ -202,6 +202,7 @@ impl Venus {
                 rm: Some(RmImport {
                     modifier: obj.modifier,
                 }),
+                guest: None,
             },
         );
         Ok(Reply::NoData)

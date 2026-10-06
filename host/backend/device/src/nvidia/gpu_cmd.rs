@@ -19,6 +19,7 @@ impl NvidiaBackend {
                 window: self.window.as_deref(),
                 display: self.display.as_deref(),
                 rm: Some(&rm),
+                ram: self.guest_ram.as_deref(),
             };
             return match venus.dispatch(payload, resp_buf, env) {
                 crate::venus::Outcome::Done(n) => n,
@@ -67,6 +68,7 @@ impl NvidiaBackend {
             window: self.window.as_deref(),
             display: self.display.as_deref(),
             rm: None,
+            ram: None,
         };
         self.venus
             .as_mut()

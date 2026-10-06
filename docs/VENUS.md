@@ -40,6 +40,7 @@ Setting up a Windows VM, installing the guest driver and tuning it:
 | Config `features` bit | `NVGPU_CFG_VENUS = 1 << 10`. Set only with `--venus`. A guest sends `GpuCmd` only when set. |
 | Config `features` bit | `NVGPU_CFG_RM_RESOURCE_IMPORT = 1 << 14`, set with `NVGPU_CFG_RM_IMPORT`: `RmResourceImport` (MsgType 31) is served (below). |
 | Config `features` bit | `NVGPU_CFG_RM_IMPORT = 1 << 13`, only with `NVGPU_CFG_VENUS`: RM-export blobs are served (below). Set when the renderer imports dma-bufs (`conduit-venus` from this release on). Bit 12 is not used in the config word. |
+| Config `features` bit | `NVGPU_CFG_GUEST_BLOB = 1 << 16`, only with `NVGPU_CFG_VENUS`: guest-memory blobs are served (below). Set with `--venus-guest-blobs` when the renderer imports host memory. Bit 15 is not used in the config word. |
 | Shared memory region 3 | `SHM_ID_VENUS`, host-visible Venus blobs, `--venus-hostmem-mib` (default 8192, power of two). Advertised only with `--venus`. Offsets inside it are chosen by the guest, as with virtio-gpu's host-visible region. QEMU only (conduit-vmm has fixed BARs). |
 | Queues | unchanged: 0 control, 1 event. No cursor queue. |
 
@@ -121,7 +122,7 @@ spell opens a new window. An idle guest logs nothing
 | `CTX_DESTROY` | destroys the context and detaches its resources |
 | `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` | renderer attach/detach |
 | `SUBMIT_3D` | Venus command stream to the context |
-| `RESOURCE_CREATE_BLOB` | `blob_mem = HOST3D`: renderer allocates, returns an fd and map info. `blob_mem = BLOB_MEM_RM_EXPORT` (`0x80000001`): an RM-export blob (below). Guest-memory blobs refused for now |
+| `RESOURCE_CREATE_BLOB` | `blob_mem = HOST3D`: renderer allocates, returns an fd and map info. `blob_mem = BLOB_MEM_RM_EXPORT` (`0x80000001`): an RM-export blob (below). `blob_mem = GUEST`: a guest-memory blob (below), only with `NVGPU_CFG_GUEST_BLOB`; refused otherwise |
 | `RESOURCE_MAP_BLOB` | the blob's fd placed in region 3 at the guest's offset; reply `RESP_OK_MAP_INFO` with the cache type |
 | `RESOURCE_UNMAP_BLOB` | withdrawn from region 3 |
 | `RESOURCE_UNREF` | unmapped if mapped, then freed |
@@ -381,6 +382,154 @@ window is then the top eighth of `min(bits, 46)`, 8 TiB on most hosts, and
 least twice the BAR in MiB (`262144` for a 128 GiB BAR), or set
 `conduit config set gpu.window_mib 4096`.
 
+### Guest-memory blobs
+
+A Venus resource whose memory is the guest's own pages, so a copy on the host
+GPU writes straight into memory the guest reads. It is for the Windows KMD's
+windowed Present blt. The blt destination is a guest allocation that dxgkrnl
+and DWM read through guest system pages. Today the KMD copies the frame into a
+Venus present buffer with the GPU, waits on the fence, and then copies that
+buffer into those pages with the CPU (0.4 to 0.7 ms a frame, plus a wait of
+about 1 ms). With a guest-memory blob over the pages, the GPU copy writes them
+directly, and the CPU copy and the wait go
+(`guest/windows/docs/rm-backed-standard.md` 13.3, "candidate B"). Served
+only with `NVGPU_CFG_GUEST_BLOB`.
+
+**Measured** (RTX 5090, driver 610.57; `host/venus/examples/venus-guest-blob.rs`
+through a sandboxed `conduit-venus`). A 1600x900 BGRA `vkCmdCopyImageToBuffer`
+from an OPTIMAL image into 1407 scattered 4 KiB pages of a sealed memfd takes
+0.207 ms of GPU time. That is the same as into a Venus HOST_VISIBLE buffer, at
+about 28 GB/s. Every pixel was right when read through a separate mapping of
+the memfd. The import costs about 2 ms for the resource plus about 3 ms for
+`vkAllocateMemory`, once per destination. NVIDIA does not import a udmabuf
+dma-buf (`vkAllocateMemory` gives `VK_ERROR_OUT_OF_DEVICE_MEMORY`), nor a host
+pointer into a udmabuf mapping (`VM_PFNMAP`). It does import a host pointer into
+memfd pages (`VK_EXT_external_memory_host`, `minImportedHostPointerAlignment`
+4096), including a span stitched from many separate mappings. That is the path
+used.
+
+**Detection.** Config `features` bit `NVGPU_CFG_GUEST_BLOB = 1 << 16`, only
+with `NVGPU_CFG_VENUS`. The backend sets it only when it runs with
+`--venus-guest-blobs` (opt-in while new) and the renderer reports
+`FEATURE_IMPORT_GUEST_PAGES`. The renderer reports that when every host Vulkan
+device has `VK_EXT_external_memory_host`. Without the bit, `BLOB_MEM_GUEST`
+is refused as before (`RESP_ERR_INVALID_PARAMETER`).
+
+**Wire contract.** `RESOURCE_CREATE_BLOB` in a `GpuCmd`, with
+
+| Field | Value |
+|---|---|
+| `hdr.ctx_id` | the guest's Venus context, to which the resource is attached |
+| `resource_id` | chosen by the guest, not yet in use |
+| `blob_mem` | `VIRTIO_GPU_BLOB_MEM_GUEST = 1` |
+| `blob_flags` | 0 or `USE_SHAREABLE` (which changes nothing). `USE_MAPPABLE` and `USE_CROSS_DEVICE` are refused: there is no region 3 mapping, because the guest already has the pages |
+| `blob_id` | 0 |
+| `size` | the sum of the entries' lengths: a nonzero multiple of 4096, at most `GUEST_BLOB_MAX_BYTES` (256 MiB) |
+| `nr_entries` | 1 to `GUEST_BLOB_MAX_ENTRIES` (4096) |
+
+followed in the same payload by `nr_entries` `virtio_gpu_mem_entry`s
+(`{ le64 addr; le32 length; le32 padding = 0 }`, 16 bytes each). `addr` is a
+guest **physical** address as the VM sees it (for the KMD, the PFN of an
+MDL-locked page shifted left by 12). `length` is a nonzero multiple of 4096.
+`addr` is page-aligned, so there are no sub-page offsets. The entries may come
+in any order. They are the blob's pages in that order: byte `i` of the blob is
+byte `i - (sum of the earlier lengths)` of the entry it falls in. Each entry
+must lie wholly inside one region of guest RAM, as the vhost-user memory table
+describes it (RAM above 4 GiB included). All entries must be in the same guest
+RAM file, which they always are with QEMU's single `memory-backend-memfd`. The
+backend merges entries that are adjacent in guest RAM, so the guest should
+coalesce where it can: each merged run is one host mapping.
+
+The backend resolves the entries through the memory table. It sends the
+renderer the guest RAM file and the runs (`Renderer::import_guest_pages`, IPC
+op `IMPORT_GUEST_PAGES`). The renderer maps the runs, in order, as one span of
+its own address space and makes it a `VIRGL_RESOURCE_HOST_PTR` resource
+(`host/venus/patches/0002-vkr-host-pointer-resources.patch`). The backend then
+attaches the resource to `ctx_id`. The guest's own `CTX_ATTACH_RESOURCE` after
+the create is then a no-op, and other Venus contexts attach it as any resource.
+
+**Importing it** (in the guest's Venus context):
+
+1. `vkGetMemoryResourcePropertiesMESA(resourceId)` gives `memoryTypeBits`.
+   These are the host-pointer memory types, HOST_VISIBLE | HOST_COHERENT (on
+   the RTX 5090: types 2 and 3, the latter also CACHED). With
+   `VkMemoryResourceAllocationSizePropertiesMESA` chained, it also gives the
+   blob's size.
+2. `vkAllocateMemory` with `VkImportMemoryResourceInfoMESA { resourceId }`,
+   a `memoryTypeIndex` from those bits, and `allocationSize` = the blob size.
+   vkr rounds a smaller size up to the import alignment (4096) and refuses one
+   larger than the blob. It turns the import into a
+   `VkImportMemoryHostPointerInfoEXT` of the span and drops any
+   `VkExportMemoryAllocateInfo` (host memory is not exported again).
+3. `vkCreateBuffer` (plain; `TRANSFER_DST` is enough, and no
+   `VkExternalMemoryBufferCreateInfo` is needed), then bind it at offset 0.
+4. Use it as the destination of `vkCmdCopyImageToBuffer`. After the copy,
+   record a barrier from `TRANSFER` / `TRANSFER_WRITE` to `HOST` /
+   `HOST_READ` before the fence. The CPU may read the pages once the fence has
+   signalled.
+
+Do not `vkMapMemory` it through Venus. The guest has the pages already, and a
+Venus mapping would need a region 3 placement this resource does not have.
+
+**Coherence.** The memory types are HOST_COHERENT: the GPU's writes to host
+RAM are snooped on x86, so the guest's ordinary write-back mapping of the
+pages sees them once the fence has signalled. This is verified page by page
+through a separate mapping of the memfd. A host whose driver offers no
+host-pointer import does not set the bit.
+
+**Lifetime.** The guest must keep the pages locked, at the same guest physical
+addresses, from the create until after `RESOURCE_UNREF`. The host maps the
+pages at create time and keeps that mapping until the unref. The order is:
+
+1. Wait for the last copy's fence.
+2. `vkDestroyBuffer` and `vkFreeMemory`.
+3. `RESOURCE_UNREF`.
+4. Unlock the pages.
+
+Venus ring commands run asynchronously to control commands. For the strong
+guarantee that nothing on the host still refers to the pages, make sure the
+`vkFreeMemory` has executed before the `UNREF` (a ring fence or seqno after
+it). After both, the host holds no mapping and no pin of the pages.
+
+An `UNREF` first is still safe for the host. NVIDIA's import keeps the pages
+it pinned until the `VkDeviceMemory` is freed or the context dies, and only
+the guest's own data is at risk: the GPU could write pages the guest has
+already reused. The renderer's spans come out of an address range reserved
+for guest pages only. A freed span goes back to an inaccessible reservation
+and is handed out again only for guest pages, so an import that races an
+`UNREF` reaches this guest's memory or nothing, never the renderer's own.
+Device reset, backend exit and renderer death release everything.
+
+**Limits.** Per VM, at once: `GUEST_BLOB_MAX_LIVE` (1024) guest blobs,
+`GUEST_BLOB_MAX_LIVE_RUNS` (32768) merged runs and
+`GUEST_BLOB_MAX_LIVE_BYTES` (32 GiB). Beyond any of these the create gets
+`RESP_ERR_OUT_OF_MEMORY` / `ENOMEM`. The constants are in
+`host/backend/protocol/src/venus.rs`.
+
+**Errors.** As for RM-export blobs, the header's three `padding` bytes carry
+the errno:
+
+| Response | errno | Why |
+|---|---|---|
+| `RESP_ERR_INVALID_PARAMETER` | 0 | not served (no `NVGPU_CFG_GUEST_BLOB`): refused as any unknown `blob_mem` |
+| `RESP_ERR_INVALID_PARAMETER` | `EINVAL` | shape: `blob_flags`, `blob_id`, `nr_entries` 0 or over 4096, `size` 0, not pages, over 256 MiB or not the sum of the entries, an entry not whole pages |
+| `RESP_ERR_INVALID_PARAMETER` | `EFAULT` | an entry outside guest RAM, or running past the end of its RAM region |
+| `RESP_ERR_INVALID_PARAMETER` | `EXDEV` | entries in more than one guest RAM file (a VM with several memory backends) |
+| `RESP_ERR_OUT_OF_MEMORY` | `ENOMEM` | the live limits above, or the resource limit |
+| `RESP_ERR_UNSPEC` | `EOPNOTSUPP` | the guest's memory table is not known yet |
+| `RESP_ERR_UNSPEC` | `EIO` | the renderer refused the import or the attach |
+| `RESP_ERR_INVALID_CONTEXT_ID` / `RESP_ERR_INVALID_RESOURCE_ID` | 0 | as for any blob |
+
+On the import side, `vkAllocateMemory` gives `VK_ERROR_INVALID_EXTERNAL_HANDLE`
+(the resource is not a guest blob, the size is too large, or the renderer
+cannot import host pointers) or `VK_ERROR_OUT_OF_DEVICE_MEMORY` (the driver
+refused the pin). Any refusal means: use the legacy copy for that destination.
+
+**Security.** The renderer receives the guest RAM file to map the runs from,
+which gives it the whole of guest RAM, not only the runs. The backend has the
+same file already, and the renderer is sandboxed (below). It closes the
+descriptor after mapping, so only the mapped runs stay reachable.
+
 ### RM-export resources in a second process (`RmResourceImport`, MsgType 31)
 
 An RM-export blob is memory one NVK process rendered into. A second NVK
@@ -464,9 +613,10 @@ The backend talks to it over a Unix `SOCK_SEQPACKET` socket
 (`host/venus/src/ipc.rs`): one request per call, replies in order, messages
 sent in 64 KiB fragments (a submit can be 4 MiB), blob and dma-buf fds passed
 by `SCM_RIGHTS` (from the renderer, and to it for `IMPORT_DMABUF`, the
-RM-export blob's dma-buf), and fence signals pushed by the renderer on their
-own. What a renderer can do beyond the base calls (`Renderer::features`,
-today only `FEATURE_IMPORT_DMABUF`) is asked once as `CAPSET_INFO` with index
+RM-export blob's dma-buf, and for `IMPORT_GUEST_PAGES`, the guest RAM file of
+a guest-memory blob), and fence signals pushed by the renderer on their
+own. What a renderer can do beyond the base calls (`Renderer::features`:
+`FEATURE_IMPORT_DMABUF`, `FEATURE_IMPORT_GUEST_PAGES`) is asked once as `CAPSET_INFO` with index
 `0xffffffff`: a `conduit-venus` from before it refuses that index like any
 other, so the backend reads "no features" and never sends it an op it does
 not know (an unknown op ends the connection). Both

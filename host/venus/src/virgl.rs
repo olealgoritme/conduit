@@ -122,6 +122,8 @@ mod ffi {
         pub fn virgl_renderer_resource_create_blob(args: *const CreateBlobArgs) -> c_int;
         pub fn virgl_renderer_resource_export_blob(res_id: u32, fd_type: *mut u32, fd: *mut c_int) -> c_int;
         pub fn virgl_renderer_resource_import_blob(args: *const ImportBlobArgs) -> c_int;
+        /// patches/0002-vkr-host-pointer-resources.patch
+        pub fn virgl_renderer_resource_import_host_ptr(res_handle: u32, ptr: *mut c_void, size: u64) -> c_int;
         pub fn virgl_renderer_resource_get_map_info(res_handle: u32, map_info: *mut u32) -> c_int;
         pub fn virgl_renderer_resource_unref(res_handle: u32);
         pub fn virgl_renderer_context_create_fence(ctx_id: u32, flags: u32, ring_idx: u32, fence_id: u64) -> c_int;
@@ -219,6 +221,12 @@ fn check(ret: c_int) -> Result<()> {
 
 pub struct Virgl {
     event: OwnedFd,
+    /// Where guest-memory blobs are mapped; reserved at the first one.
+    arena: Option<crate::guest_pages::Arena>,
+    /// Guest-memory blobs, by resource id: the span each is mapped at.
+    guest: std::collections::HashMap<u32, crate::guest_pages::Span>,
+    /// Whether every host Vulkan device imports host pointers; asked once.
+    host_ptr: Option<bool>,
 }
 
 impl Virgl {
@@ -254,7 +262,7 @@ impl Virgl {
             INITIALIZED.store(false, Ordering::Release);
             return Err(Error::Io(io::Error::from_raw_os_error(ret.abs())));
         }
-        let me = Self { event };
+        let me = Self { event, arena: None, guest: Default::default(), host_ptr: None };
         // Venus registers its capset only when the render server came up and
         // found a Vulkan driver; without it every context would be refused.
         if me.venus_caps().1 == 0 {
@@ -417,6 +425,13 @@ impl Renderer for Virgl {
     fn unref(&mut self, res_id: u32) {
         // SAFETY: unknown ids are ignored.
         unsafe { ffi::virgl_renderer_resource_unref(res_id) };
+        // The render worker may still hold the pointer (guest_pages module
+        // comment); the arena keeps the range for guest pages only.
+        if let Some(span) = self.guest.remove(&res_id)
+            && let Some(a) = self.arena.as_mut()
+        {
+            a.unmap(span);
+        }
     }
 
     fn create_fence(&mut self, ctx_id: u32, ring_idx: u32, fence_id: u64) -> Result<()> {
@@ -452,7 +467,48 @@ impl Renderer for Virgl {
     }
 
     fn features(&mut self) -> u32 {
-        crate::FEATURE_IMPORT_DMABUF
+        let host_ptr = *self.host_ptr.get_or_insert_with(|| {
+            let yes = vk_probe::every_device_imports_host_pointers();
+            eprintln!(
+                "conduit-venus: guest-memory blobs {}",
+                if yes {
+                    "served (VK_EXT_external_memory_host)"
+                } else {
+                    "not served: a device lacks VK_EXT_external_memory_host"
+                }
+            );
+            yes
+        });
+        crate::FEATURE_IMPORT_DMABUF | if host_ptr { crate::FEATURE_IMPORT_GUEST_PAGES } else { 0 }
+    }
+
+    /// The runs mapped as one span of the guest-page arena, then
+    /// `virgl_renderer_resource_import_host_ptr` on it (the 0002 patch): a
+    /// `VIRGL_RESOURCE_HOST_PTR` resource, which the render worker's attach
+    /// receives as the pointer and vkr imports with
+    /// `VkImportMemoryHostPointerInfoEXT`.
+    fn import_guest_pages(&mut self, res_id: u32, ram: BorrowedFd<'_>, runs: &[crate::PageRun]) -> Result<()> {
+        if self.features() & crate::FEATURE_IMPORT_GUEST_PAGES == 0 {
+            return Err(Error::Refused("no host-pointer import on this host".into()));
+        }
+        if res_id == 0 || self.guest.contains_key(&res_id) {
+            return Err(Error::Refused("import_guest_pages: resource 0 or in use".into()));
+        }
+        if self.arena.is_none() {
+            self.arena = Some(crate::guest_pages::Arena::new(crate::guest_pages::ARENA_BYTES)?);
+        }
+        let arena = self.arena.as_mut().expect("made above");
+        let span = arena.map(ram, runs)?;
+        // SAFETY: the span is page-aligned guest memory mapped in this
+        // process, and stays mapped (or reserved) for the arena's life.
+        let ret =
+            unsafe { ffi::virgl_renderer_resource_import_host_ptr(res_id, span.addr as *mut c_void, span.len as u64) };
+        if ret != 0 {
+            arena.unmap(span);
+            return check(ret);
+        }
+        self.guest.insert(res_id, span);
+        Ok(())
     }
 
     /// `virgl_renderer_resource_import_blob` with a dma-buf. The resource is
@@ -541,5 +597,128 @@ impl Renderer for Virgl {
             fourcc: layout.fourcc,
             modifier: DRM_FORMAT_MOD_LINEAR,
         })
+    }
+}
+
+/// Whether the host's Vulkan devices can import host pointers
+/// (`VK_EXT_external_memory_host`), which guest-memory blobs need. Asked
+/// through the loader directly, as virglrenderer's own instances are out of
+/// reach from here.
+mod vk_probe {
+    use std::ffi::{CStr, c_char, c_void};
+
+    type Handle = *mut c_void;
+    type GetInstanceProcAddr = unsafe extern "C" fn(Handle, *const c_char) -> *const c_void;
+    type CreateInstance = unsafe extern "C" fn(*const InstanceCreateInfo, *const c_void, *mut Handle) -> i32;
+    type DestroyInstance = unsafe extern "C" fn(Handle, *const c_void);
+    type EnumeratePhysicalDevices = unsafe extern "C" fn(Handle, *mut u32, *mut Handle) -> i32;
+    type EnumerateDeviceExtensionProperties =
+        unsafe extern "C" fn(Handle, *const c_char, *mut u32, *mut ExtensionProperties) -> i32;
+
+    #[repr(C)]
+    struct ApplicationInfo {
+        s_type: u32,
+        p_next: *const c_void,
+        app_name: *const c_char,
+        app_version: u32,
+        engine_name: *const c_char,
+        engine_version: u32,
+        api_version: u32,
+    }
+
+    #[repr(C)]
+    struct InstanceCreateInfo {
+        s_type: u32,
+        p_next: *const c_void,
+        flags: u32,
+        app: *const ApplicationInfo,
+        layer_count: u32,
+        layers: *const *const c_char,
+        ext_count: u32,
+        exts: *const *const c_char,
+    }
+
+    #[repr(C)]
+    struct ExtensionProperties {
+        name: [c_char; 256],
+        spec_version: u32,
+    }
+
+    pub fn every_device_imports_host_pointers() -> bool {
+        // SAFETY: dlopen/dlsym of the Vulkan loader, called through the
+        // documented signatures; every out-pointer is a live local, and the
+        // instance is destroyed before return.
+        unsafe {
+            let lib = libc::dlopen(c"libvulkan.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+            if lib.is_null() {
+                return false;
+            }
+            let gipa = libc::dlsym(lib, c"vkGetInstanceProcAddr".as_ptr());
+            if gipa.is_null() {
+                return false;
+            }
+            let gipa: GetInstanceProcAddr = std::mem::transmute(gipa);
+            let create = gipa(std::ptr::null_mut(), c"vkCreateInstance".as_ptr());
+            if create.is_null() {
+                return false;
+            }
+            let create: CreateInstance = std::mem::transmute(create);
+            let app = ApplicationInfo {
+                s_type: 0,
+                p_next: std::ptr::null(),
+                app_name: c"conduit-venus probe".as_ptr(),
+                app_version: 0,
+                engine_name: std::ptr::null(),
+                engine_version: 0,
+                api_version: (1 << 22) | (1 << 12), // 1.1
+            };
+            let info = InstanceCreateInfo {
+                s_type: 1,
+                p_next: std::ptr::null(),
+                flags: 0,
+                app: &app,
+                layer_count: 0,
+                layers: std::ptr::null(),
+                ext_count: 0,
+                exts: std::ptr::null(),
+            };
+            let mut inst: Handle = std::ptr::null_mut();
+            if create(&info, std::ptr::null(), &mut inst) != 0 || inst.is_null() {
+                return false;
+            }
+            let destroy: DestroyInstance = std::mem::transmute(gipa(inst, c"vkDestroyInstance".as_ptr()));
+            let enum_pd: EnumeratePhysicalDevices =
+                std::mem::transmute(gipa(inst, c"vkEnumeratePhysicalDevices".as_ptr()));
+            let enum_ext: EnumerateDeviceExtensionProperties =
+                std::mem::transmute(gipa(inst, c"vkEnumerateDeviceExtensionProperties".as_ptr()));
+            let mut n = 0u32;
+            let mut ok = enum_pd(inst, &mut n, std::ptr::null_mut()) == 0 && n > 0;
+            let mut pds = vec![std::ptr::null_mut(); n as usize];
+            ok &= ok && enum_pd(inst, &mut n, pds.as_mut_ptr()) == 0;
+            pds.truncate(n as usize);
+            for pd in &pds {
+                if !ok {
+                    break;
+                }
+                let mut m = 0u32;
+                if enum_ext(*pd, std::ptr::null(), &mut m, std::ptr::null_mut()) != 0 {
+                    ok = false;
+                    break;
+                }
+                let mut exts: Vec<ExtensionProperties> =
+                    (0..m).map(|_| ExtensionProperties { name: [0; 256], spec_version: 0 }).collect();
+                // VK_INCOMPLETE (5) only if the list grew in between.
+                if enum_ext(*pd, std::ptr::null(), &mut m, exts.as_mut_ptr()) != 0 {
+                    ok = false;
+                    break;
+                }
+                ok = exts
+                    .iter()
+                    .take(m as usize)
+                    .any(|e| CStr::from_ptr(e.name.as_ptr()) == c"VK_EXT_external_memory_host");
+            }
+            destroy(inst, std::ptr::null());
+            ok
+        }
     }
 }
