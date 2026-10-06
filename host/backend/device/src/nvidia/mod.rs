@@ -353,6 +353,9 @@ pub struct NvidiaBackend {
     display: Option<std::sync::Arc<crate::display::DisplayLink>>,
     /// dma-bufs exported for scanout, one per (owner file, host GEM handle).
     dmabufs: crate::display::DmabufCache,
+    /// The modifier of each GEM object NVK imported through nvidia-drm, for
+    /// RM-export blobs (`rm_import.rs`).
+    rm_layouts: rm_import::RmLayouts,
     /// The guest's clipboard transfer being reassembled (`ClipboardToHost`).
     clip_in: clipboard::ClipIn,
     /// Video memory charged to this guest, against its limit. See
@@ -469,6 +472,7 @@ impl NvidiaBackend {
             host: Box::new(RealHost),
             display: None,
             dmabufs: Default::default(),
+            rm_layouts: Default::default(),
             clip_in: Default::default(),
             #[cfg(feature = "venus")]
             venus: None,
@@ -1107,6 +1111,8 @@ mod os_event;
 mod osdesc;
 mod resp;
 mod rm_fd;
+mod rm_import;
+pub use rm_import::{RmObject, SurfaceLayout, Tiling};
 mod rmctrl;
 mod scanout;
 mod simple;

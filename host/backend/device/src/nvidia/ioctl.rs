@@ -252,6 +252,7 @@ impl NvidiaBackend {
         let n = self.serve_ioctl(cookie, payload, resp_buf);
         self.vidmem_note(payload, &mut resp_buf[..n]);
         self.note_clients(payload, &resp_buf[..n]);
+        self.note_gem_import(payload, &resp_buf[..n]);
         self.note_registrations(payload, &resp_buf[..n]);
         self.note_os_events(payload, &resp_buf[..n]);
         n

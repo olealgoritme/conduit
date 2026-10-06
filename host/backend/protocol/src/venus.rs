@@ -67,6 +67,28 @@ pub const FLAG_INFO_RING_IDX: u32 = 1 << 1;
 pub const BLOB_MEM_GUEST: u32 = 0x0001;
 pub const BLOB_MEM_HOST3D: u32 = 0x0002;
 pub const BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
+/// Conduit's own `blob_mem` (docs/VENUS.md "RM-export blobs"), only with
+/// [`crate::messages::NVGPU_CFG_RM_IMPORT`]: the blob is a host GEM object NVK
+/// exported through nvidia-drm, named by `blob_id = rm_handle << 32 |
+/// gem_handle` (`rm_handle` the backend handle of the render node the guest
+/// opened, `gem_handle` what `DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY` returned on
+/// it). `blob_flags` 0, no entries, `size` at most the object's. The resource
+/// is imported as a dma-buf and attached to the creating context; it cannot
+/// be mapped.
+pub const BLOB_MEM_RM_EXPORT: u32 = 0x8000_0001;
+
+/// `blob_id` of a [`BLOB_MEM_RM_EXPORT`] blob: (rm_handle, gem_handle).
+pub const fn rm_export_ids(blob_id: u64) -> (u32, u32) {
+    ((blob_id >> 32) as u32, blob_id as u32)
+}
+
+/// The errno a host refusal of a [`BLOB_MEM_RM_EXPORT`] blob is echoed with,
+/// in `padding` of the error response's header (24 bits, little-endian;
+/// zero when there is none). Every other response leaves `padding` zero.
+pub fn errno_padding(errno: i32) -> [u8; 3] {
+    let e = (errno.unsigned_abs() & 0x00ff_ffff).to_le_bytes();
+    [e[0], e[1], e[2]]
+}
 
 /// `virtio_gpu_resource_create_blob.blob_flags`.
 pub const BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;

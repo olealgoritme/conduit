@@ -8,9 +8,17 @@ impl NvidiaBackend {
     pub(super) fn handle_gpu_cmd(&mut self, payload: &[u8], resp_buf: &mut [u8]) -> usize {
         #[cfg(feature = "venus")]
         if let Some(venus) = self.venus.as_mut() {
+            // Field by field, so Venus can be borrowed mutably beside it.
+            let rm = super::rm_import::RmView {
+                handles: &self.handles,
+                kinds: &self.handle_kinds,
+                host: &*self.host,
+                layouts: &self.rm_layouts,
+            };
             let env = crate::venus::Env {
                 window: self.window.as_deref(),
                 display: self.display.as_deref(),
+                rm: Some(&rm),
             };
             return match venus.dispatch(payload, resp_buf, env) {
                 crate::venus::Outcome::Done(n) => n,
@@ -36,6 +44,13 @@ impl NvidiaBackend {
         self.venus.as_ref()
     }
 
+    /// RM-export blobs are served (docs/VENUS.md "RM-export blobs"): Venus
+    /// is on and its renderer imports dma-bufs. The transport offers
+    /// [`protocol::messages::NVGPU_CFG_RM_IMPORT`] on it.
+    pub fn venus_rm_import(&self) -> bool {
+        self.venus.as_ref().is_some_and(|v| v.rm_import())
+    }
+
     /// After [`NvidiaBackend::dispatch`]: when the message was a fenced
     /// `GpuCmd`, nothing was written, and this is the token its response
     /// will come back under from [`NvidiaBackend::venus_completions`]. The
@@ -51,6 +66,7 @@ impl NvidiaBackend {
         let env = crate::venus::Env {
             window: self.window.as_deref(),
             display: self.display.as_deref(),
+            rm: None,
         };
         self.venus
             .as_mut()

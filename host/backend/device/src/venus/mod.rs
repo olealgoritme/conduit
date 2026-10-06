@@ -10,7 +10,7 @@
 //! this side has not seen created.
 //!
 //! `mod.rs` holds the state and the dispatch; display info, the EDID,
-//! contexts and capsets are in `cmd.rs` (the EDID's bytes in `edid.rs`), blobs and region 3 in `blob.rs`, fences in `fence.rs` and the
+//! contexts and capsets are in `cmd.rs` (the EDID's bytes in `edid.rs`), blobs and region 3 in `blob.rs`, RM-export blobs in `rm.rs`, fences in `fence.rs` and the
 //! scanout in `scanout.rs`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -27,6 +27,7 @@ mod blob;
 mod cmd;
 pub mod edid;
 mod fence;
+mod rm;
 mod scanout;
 #[cfg(test)]
 mod tests;
@@ -54,12 +55,28 @@ pub enum Outcome {
     Held(u64),
 }
 
-/// What the transport lends a command: where region 3 is placed, and where
-/// frames go. Either may be missing (no frontend channel yet, no display).
+/// What the transport lends a command: where region 3 is placed, where
+/// frames go, and where RM-export blobs come from. Any may be missing (no
+/// frontend channel yet, no display, no RM side).
 #[derive(Clone, Copy, Default)]
 pub struct Env<'a> {
     pub window: Option<&'a dyn WindowPlacer>,
     pub display: Option<&'a DisplayLink>,
+    pub rm: Option<&'a dyn RmExports>,
+}
+
+/// The RM side of the backend, as an RM-export blob needs it
+/// (docs/VENUS.md "RM-export blobs").
+pub trait RmExports {
+    /// `(rm_handle, gem_handle)` as a fresh dma-buf, with the modifier the
+    /// backend saw NVK import it with. `Err` is an errno: `EBADF` when
+    /// `rm_handle` is not a render node the guest opened, otherwise what the
+    /// export failed with (`ENOENT`: no such GEM handle on that file).
+    fn export(
+        &self,
+        rm_handle: u32,
+        gem_handle: u32,
+    ) -> std::result::Result<crate::nvidia::RmObject, i32>;
 }
 
 /// A blob resource, as the guest made it.
@@ -79,6 +96,17 @@ struct Resource {
     attached: HashSet<u32>,
     /// The scanout export, for the size it was made at.
     export: Option<scanout::Export>,
+    /// An RM-export blob: `fd` is then the backend's own dma-buf reference
+    /// to the host object, held until the resource goes, whatever the guest
+    /// does with the render node it came from.
+    rm: Option<RmImport>,
+}
+
+/// What an RM-export blob carries besides its dma-buf.
+#[derive(Clone, Copy, Debug)]
+struct RmImport {
+    /// The modifier NVK imported the object with, when the backend saw it.
+    modifier: Option<u64>,
 }
 
 /// A virtio-gpu answer, before the response header is put on it.
@@ -115,6 +143,11 @@ pub struct Venus {
     lose_pending: bool,
     /// Commands served, by name, and refused, by why. Reported at teardown.
     counts: BTreeMap<&'static str, u64>,
+    /// The renderer imports dma-bufs, so RM-export blobs are served.
+    rm_import: bool,
+    /// The errno the command being served was refused with, echoed in the
+    /// error response's header (`errno_padding`). Set by RM-export blobs.
+    refusal_errno: Option<i32>,
 }
 
 impl Venus {
@@ -133,7 +166,14 @@ impl Venus {
             },
             ..d
         });
+        let mut renderer = renderer;
+        let rm_import = renderer.features() & conduit_venus::FEATURE_IMPORT_DMABUF != 0;
+        if rm_import {
+            log::info!("venus: the renderer imports dma-bufs; RM-export blobs are served");
+        }
         Self {
+            rm_import,
+            refusal_errno: None,
             renderer,
             hostmem_len,
             display,
@@ -151,6 +191,11 @@ impl Venus {
 
     pub fn hostmem_len(&self) -> u64 {
         self.hostmem_len
+    }
+
+    /// RM-export blobs are served: the renderer imports dma-bufs.
+    pub fn rm_import(&self) -> bool {
+        self.rm_import
     }
 
     /// Readable when a fence may have signalled: the transport polls it and
@@ -222,6 +267,7 @@ impl Venus {
             self.count("refused: no virtio-gpu header");
             return Outcome::Done(transport_err(resp, libc::EINVAL));
         };
+        self.refusal_errno = None;
         let answer = if self.lost {
             Err(RESP_ERR_UNSPEC)
         } else if hdr.fenced() && hdr.ring() >= MAX_RINGS {
@@ -280,7 +326,13 @@ impl Venus {
             }
             Ok(Reply::NoData) => Outcome::Done(reply(resp, &hdr.response(RESP_OK_NODATA), &[])),
             Ok(Reply::With(ty, body)) => Outcome::Done(reply(resp, &hdr.response(ty), &body)),
-            Err(e) => Outcome::Done(reply(resp, &hdr.response(e), &[])),
+            Err(e) => {
+                let mut h = hdr.response(e);
+                if let Some(errno) = self.refusal_errno.take() {
+                    h.padding = errno_padding(errno);
+                }
+                Outcome::Done(reply(resp, &h, &[]))
+            }
         }
     }
 
@@ -350,7 +402,7 @@ impl Venus {
                     .ok_or(RESP_ERR_UNSPEC)?;
                 exact(ResourceCreateBlob::LEN.saturating_add(entries))?;
                 self.count("resource_create_blob");
-                self.create_blob(&c)
+                self.create_blob(&c, env)
             }
             CMD_RESOURCE_MAP_BLOB => {
                 exact(ResourceMapBlob::LEN)?;

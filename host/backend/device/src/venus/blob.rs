@@ -51,8 +51,12 @@ impl Maps {
 }
 
 impl Venus {
-    /// `blob_mem = HOST3D` only; guest-memory blobs are refused for now.
-    pub(super) fn create_blob(&mut self, c: &ResourceCreateBlob) -> Answer {
+    /// `blob_mem = HOST3D`, or Conduit's `BLOB_MEM_RM_EXPORT` (`rm.rs`);
+    /// guest-memory blobs are refused for now.
+    pub(super) fn create_blob(&mut self, c: &ResourceCreateBlob, env: Env<'_>) -> Answer {
+        if c.blob_mem == BLOB_MEM_RM_EXPORT {
+            return self.create_rm_blob(c, env);
+        }
         let ctx = c.hdr.ctx_id;
         log::debug!(
             "venus: create blob res {} ctx {}: blob_mem {} flags {:#x} blob_id {} size {} entries {}",
@@ -114,6 +118,7 @@ impl Venus {
                 // The renderer attaches a blob to the context it was made in.
                 attached: HashSet::from([ctx]),
                 export: None,
+                rm: None,
             },
         );
         Ok(Reply::NoData)

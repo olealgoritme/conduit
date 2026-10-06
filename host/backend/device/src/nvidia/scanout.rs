@@ -155,7 +155,9 @@ impl NvidiaBackend {
     /// number, so the dma-buf exported for it goes now.
     pub(super) fn note_gem_close(&mut self, payload: &[u8]) {
         let parked = self.display.as_ref().is_some_and(|l| l.has_parked());
-        if (self.dmabufs.is_empty() && !parked) || payload.len() < size_of::<IoctlReq>() + 4 {
+        if (self.dmabufs.is_empty() && !parked && self.rm_layouts.is_empty())
+            || payload.len() < size_of::<IoctlReq>() + 4
+        {
             return;
         }
         let req = read_struct::<IoctlReq>(payload, 0);
@@ -165,6 +167,9 @@ impl NvidiaBackend {
         let at = size_of::<IoctlReq>();
         let handle = u32::from_le_bytes(payload[at..at + 4].try_into().unwrap());
         self.dmabufs.forget(self.current_handle, handle);
+        // The layout NVK imported it with, likewise: a reused number is a
+        // different object.
+        self.rm_layouts.forget(self.current_handle, handle);
         if let Some(link) = self.display.as_ref() {
             link.forget(self.current_handle, handle);
         }
@@ -175,6 +180,7 @@ impl NvidiaBackend {
         if !self.dmabufs.is_empty() {
             self.dmabufs.forget_owner(owner as u32);
         }
+        self.rm_layouts.forget_owner(owner as u32);
         if let Some(link) = self.display.as_ref() {
             link.forget_owner(owner as u32);
         }

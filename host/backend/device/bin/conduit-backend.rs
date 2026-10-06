@@ -1076,10 +1076,11 @@ impl NvGpuBackend {
                 refresh_hz: self.config.display_refresh_hz,
             });
         self.config.set_venus();
-        self.nvidia
-            .lock()
-            .expect("backend mutex")
-            .set_venus(device::venus::Venus::new(renderer, hostmem_len, display));
+        let venus = device::venus::Venus::new(renderer, hostmem_len, display);
+        if venus.rm_import() {
+            self.config.set_rm_import();
+        }
+        self.nvidia.lock().expect("backend mutex").set_venus(venus);
         self.venus.hostmem_len = hostmem_len;
     }
 

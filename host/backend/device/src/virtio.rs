@@ -287,6 +287,13 @@ impl VirtioGpuNvConfig {
         self.features |= protocol::messages::NVGPU_CFG_VENUS;
     }
 
+    /// Serve RM-export blobs (docs/VENUS.md "RM-export blobs"): sets
+    /// [`protocol::messages::NVGPU_CFG_RM_IMPORT`]. Only with Venus, and only
+    /// when its renderer imports dma-bufs.
+    pub fn set_rm_import(&mut self) {
+        self.features |= protocol::messages::NVGPU_CFG_RM_IMPORT;
+    }
+
     /// Turn host fences into guest fences (docs/SYNC.md): sets
     /// [`protocol::messages::NVGPU_CFG_DRM_FENCES`]. Only by a transport that
     /// delivers one-shot fence watches (`take_watch_updates`); without that
@@ -497,5 +504,19 @@ mod tests {
             { cfg.features },
             FEATURE_RMCTRL_SEGMENTS | NVGPU_CFG_DRM_FENCES
         );
+    }
+
+    #[test]
+    fn rm_import_is_announced_only_when_set() {
+        use protocol::messages::{NVGPU_CFG_RM_IMPORT, NVGPU_CFG_VENUS};
+        let mut cfg = VirtioGpuNvConfig::new("615.71.09", &[], crate::caps::Caps::DEFAULT, 0);
+        assert_eq!({ cfg.features } & NVGPU_CFG_RM_IMPORT, 0);
+        cfg.set_venus();
+        cfg.set_rm_import();
+        assert_eq!(
+            { cfg.features },
+            FEATURE_RMCTRL_SEGMENTS | NVGPU_CFG_VENUS | NVGPU_CFG_RM_IMPORT
+        );
+        assert_eq!(NVGPU_CFG_RM_IMPORT, 1 << 13);
     }
 }
