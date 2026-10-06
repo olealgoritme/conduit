@@ -310,7 +310,16 @@ unsafe fn dxgkddi_present_inner(
     let stashed_stream_marker = present_context
         .as_ref()
         .and_then(ContextHandleRef::take_present_stream_marker_stash);
-    let present_stream_boundary = stashed_stream_marker.and_then(|(ctx_id, value, cookie)| {
+    let present_stream_boundary = stashed_stream_marker.and_then(|marker| {
+        let (ctx_id, value, cookie) = match marker {
+            // An RM fence attached at Render: only its boundary travels.
+            crate::device::StashedMarker::Resolved(boundary) => return Some(boundary),
+            crate::device::StashedMarker::Stream {
+                ctx_id,
+                value,
+                cookie,
+            } => (ctx_id, value, cookie),
+        };
         let creator_process = present_context
             .as_ref()
             .and_then(ContextHandleRef::creator_process)?;

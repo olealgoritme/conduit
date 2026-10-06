@@ -23,7 +23,7 @@
 //! # Ownership (all carriers)
 //!
 //! The KMD takes the handle over when the carrier is ACCEPTED (status OK for (a);
-//! the Present DDI resolving the marker for (b)). From then on the caller must
+//! `DxgkDdiRender` parsing the record for (b)). From then on the caller must
 //! never `Close`, `EVENT_REGISTER` on, `FORWARD` on or reuse it: all of those answer
 //! `NOT_OWNED`. The KMD closes it on the host when it fires or on any teardown.
 //! A refused carrier leaves the handle the caller's, who may CPU-wait and `Close`.
@@ -52,7 +52,8 @@ pub const HELIOS_NVRM_CAP_PRESENT_FENCE: u64 = 1 << 33;
 // Statuses (`HeliosNvrmHeader.status`). 13 and 14 are `SCANOUT_BUSY` / `NO_SOURCE`.
 // ---------------------------------------------------------------------------
 
-/// The fence handle is already attached to a present (and so is the KMD's now).
+/// Reserved: an already attached handle is the KMD's, so today it answers
+/// `NOT_OWNED` like any handle that is not the caller's.
 pub const HELIOS_NVRM_ST_FENCE_ATTACHED: i32 = 15;
 /// `SCANOUT_PRESENT` with a fence: the source already has
 /// [`HELIOS_NVRM_SCANOUT_FENCE_DEPTH`] presents waiting. Retry after the oldest

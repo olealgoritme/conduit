@@ -1109,6 +1109,13 @@ impl Io<'_> {
             Err(PresentRefusal::Forbidden) => Err(Fail::new(FailKind::Refused, 4)),
             Err(PresentRefusal::NoSource) => Err(Fail::new(FailKind::Refused, 6)),
             Err(PresentRefusal::Device(e)) => Err(fail_of(Refusal::Transport(e))),
+            // The fenced-present refusals cannot come from an unfenced present.
+            Err(
+                PresentRefusal::Unsupported
+                | PresentRefusal::NotFence
+                | PresentRefusal::AlreadyAttached
+                | PresentRefusal::QueueFull,
+            ) => Err(Fail::new(FailKind::Refused, 8)),
         };
         if result.is_err() {
             // The source was set (`ScanoutSet`) and never shown: end it now, so the

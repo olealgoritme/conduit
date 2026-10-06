@@ -31,6 +31,7 @@ pub mod page_runs;
 pub mod rm_client;
 pub mod producer_completion;
 pub mod execution_completion;
+pub mod rm_fence_present;
 pub mod msi;
 pub mod paging;
 pub mod sweep_budget;

@@ -34,6 +34,18 @@ pub struct DeviceContext {
     creator_process: usize,
 }
 
+/// What a `DxgkDdiRender` left for the Present that follows it on the same context.
+#[derive(Clone, Copy)]
+pub enum StashedMarker {
+    /// A registered Venus stream point `(ctx, value, cookie)`; the Present resolves
+    /// it against the stream table.
+    Stream { ctx_id: u32, value: u32, cookie: u64 },
+    /// An RM fence already attached at Render (`docs/rm-fence-marker.md`): the
+    /// boundary it named. Attaching takes the fence over, so it happens exactly once,
+    /// at Render, and Present only carries the result.
+    Resolved(u64),
+}
+
 /// State for one scheduler context opened on a D3D device.
 pub struct ContextContext {
     /// Back-pointer to the owning device (valid for the context's lifetime).
@@ -88,7 +100,7 @@ pub struct ContextContext {
     /// prior cookie, cross-pairing two frames. The fixed Option neither allocates
     /// nor blocks below DISPATCH; `SpinLock` raises/restores IRQL around the
     /// handful of scalar accesses.
-    present_stream_marker: crate::sync::SpinLock<Option<(u32, u32, u64)>>,
+    present_stream_marker: crate::sync::SpinLock<Option<StashedMarker>>,
     /// One authenticated, generation-qualified execution stream per context.
     execution_stream: AtomicU64,
 }
@@ -208,12 +220,24 @@ impl<'a> ContextHandleRef<'a> {
         if !helios_kmd_logic::present_stream::tail_selects_boundary(ctx_id, value, cookie) {
             return;
         }
-        *self.context.present_stream_marker.lock() = Some((ctx_id, value, cookie));
+        *self.context.present_stream_marker.lock() = Some(StashedMarker::Stream {
+            ctx_id,
+            value,
+            cookie,
+        });
+    }
+
+    /// Stash the boundary of an RM fence attached at Render for the Present that
+    /// follows (same pairing and orphan bound as the stream marker).
+    pub fn stash_resolved_marker(&self, boundary: u64) {
+        if boundary != 0 {
+            *self.context.present_stream_marker.lock() = Some(StashedMarker::Resolved(boundary));
+        }
     }
 
     /// Take and clear the stream marker stash, bounding an orphaned Render to
     /// one following Present just like the snapshot descriptor.
-    pub fn take_present_stream_marker_stash(&self) -> Option<(u32, u32, u64)> {
+    pub fn take_present_stream_marker_stash(&self) -> Option<StashedMarker> {
         self.context.present_stream_marker.lock().take()
     }
 }
@@ -508,10 +532,26 @@ pub unsafe extern "C" fn dxgkddi_create_process(
 
 /// `DxgkDdiDestroyProcess` — free the per-process state from CreateProcess.
 pub unsafe extern "C" fn dxgkddi_destroy_process(
-    _miniport_device_context: *mut c_void,
+    miniport_device_context: *mut c_void,
     h_process: *mut c_void,
 ) -> NTSTATUS {
     if !h_process.is_null() {
+        // The process's RM gate (`docs/rm-fence-marker.md`) goes with it: waits that
+        // named it are discharged and the fences it still held are closed. The token
+        // is only compared, never dereferenced.
+        // SAFETY: dxgkrnl passes back the adapter context it was given.
+        if let Some(adapter) = unsafe { (miniport_device_context as *const AdapterContext).as_ref() } {
+            let purged = adapter.with_wddm_notify_lock(|guard| {
+                guard
+                    .with_virtio(|order, v| v.rm_gate_purge_process_ordered(order, h_process as usize))
+                    .unwrap_or(0)
+            });
+            if purged != 0 {
+                crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+                // The fences the gate still held are owed a host `Close`.
+                adapter.signal_hpd();
+            }
+        }
         // SAFETY: h_process was produced by Box::into_raw in create_process and
         // is destroyed exactly once.
         drop(unsafe { Box::from_raw(h_process as *mut ProcessContext) });

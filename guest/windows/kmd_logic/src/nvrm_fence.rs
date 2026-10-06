@@ -144,6 +144,8 @@ pub struct FenceBook {
     inflight: u32,
     len: usize,
     early: [u32; EARLY_CAP],
+    /// The `EventReady` status kept with each early handle (0 or the fence's error).
+    early_status: [i32; EARLY_CAP],
 }
 
 impl Default for FenceBook {
@@ -158,6 +160,7 @@ impl FenceBook {
             inflight: 0,
             len: 0,
             early: [0; EARLY_CAP],
+            early_status: [0; EARLY_CAP],
         }
     }
 
@@ -179,6 +182,12 @@ impl FenceBook {
 
     /// `EventReady{handle}` arrived for a handle no process has open.
     pub fn note_ready(&mut self, handle: u32) -> Noted {
+        self.note_ready_status(handle, 0)
+    }
+
+    /// As [`Self::note_ready`], keeping the fence's status (0 or its error) so an
+    /// early error fire is not recorded as a success.
+    pub fn note_ready_status(&mut self, handle: u32, status: i32) -> Noted {
         if self.inflight == 0 {
             return Noted::NotTracking;
         }
@@ -188,6 +197,7 @@ impl FenceBook {
         match self.early.get_mut(self.len) {
             Some(slot) => {
                 *slot = handle;
+                self.early_status[self.len] = status;
                 self.len += 1;
                 Noted::Kept
             }
@@ -201,12 +211,18 @@ impl FenceBook {
     /// create stops counting as in flight, and once none is left every kept
     /// notification is discarded.
     pub fn finish(&mut self, handle: Option<u32>) -> bool {
-        let mut fired = false;
+        self.finish_status(handle).is_some()
+    }
+
+    /// As [`Self::finish`], returning the status the early fire carried.
+    pub fn finish_status(&mut self, handle: Option<u32>) -> Option<i32> {
+        let mut fired = None;
         if let Some(h) = handle {
             if let Some(i) = self.early[..self.len].iter().position(|&x| x == h) {
+                fired = Some(self.early_status[i]);
                 self.len -= 1;
                 self.early[i] = self.early[self.len];
-                fired = true;
+                self.early_status[i] = self.early_status[self.len];
             }
         }
         self.inflight = self.inflight.saturating_sub(1);
@@ -373,6 +389,19 @@ mod tests {
         assert!(!b.finish(Some(10)));
         assert_eq!(b.kept(), 0, "no create left: nobody can");
         assert_eq!(b.inflight(), 0);
+    }
+
+    #[test]
+    fn an_early_fire_keeps_its_status_through_the_hand_over() {
+        let mut b = FenceBook::new();
+        b.begin();
+        b.begin();
+        assert_eq!(b.note_ready_status(5, -62), Noted::Kept);
+        assert_eq!(b.note_ready_status(6, 0), Noted::Kept);
+        assert_eq!(b.note_ready_status(5, 0), Noted::Kept, "twice is still one");
+        assert_eq!(b.finish_status(Some(6)), Some(0));
+        assert_eq!(b.finish_status(Some(5)), Some(-62));
+        assert_eq!(b.finish_status(Some(5)), None);
     }
 
     #[test]

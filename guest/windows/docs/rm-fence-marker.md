@@ -36,7 +36,8 @@ Three carriers, one fence object:
   `DEVICE_TYPE_FENCE` (511) at the reply. Create it right before the present, in the
   presenting process, through NVK's NVRM device handle. 0 means "none".
 * **Ownership passes to the KMD when the carrier is accepted** (status `OK` for (a); the
-  Present DDI resolving the marker for (b)). From then on the UMD/NVK must NEVER `Close`,
+  `DxgkDdiRender` that parses the record for (b): one attach per present, at Render, and the
+  Present that follows only carries the resulting boundary). From then on the UMD/NVK must NEVER `Close`,
   `EVENT_REGISTER`, `FORWARD` on or reuse the handle: the KMD re-tags the entry to its own
   owner (`DeviceOwner::KMD_RM`), so every such call answers `NOT_OWNED`. The KMD closes the
   handle on the host when it fires, and on every teardown (see below).
@@ -71,9 +72,11 @@ HeliosNvrmScanoutPresent {            // 64 bytes, unchanged size
 };
 ```
 
-* No flag: exactly today's behaviour (the flip is sent synchronously). This is also what
+* No flag: today's behaviour (the flip is sent synchronously). This is also what
   NVK sends when no fence is wanted, i.e. after it waited on the CPU (value 0 /
-  CPU-complete).
+  CPU-complete). One exception, to keep the order: while fenced presents wait (or are
+  being sent) a plain `PRESENT` queues behind them as an already-ready entry and returns
+  at once (it can then answer `QUEUE_FULL`, and a failed send is counted, not returned).
 * With the flag the KMD validates, in this order (first failure wins; nothing changes on
   a refusal):
   1. `rm_fence_handle != 0` and `gem != 0` (`BAD_RANGE`); the capability exists
@@ -82,8 +85,10 @@ HeliosNvrmScanoutPresent {            // 64 bytes, unchanged size
      a plain `PRESENT`).
   3. `rm_fence_handle` is a handle of the SAME NVRM owner as the source (`NOT_OWNED`: not
      the caller's or unknown, and one answer so nothing is learnt of others' handles),
-     whose kind is a fence (`FORBIDDEN` otherwise), and is not already attached
-     (`HELIOS_NVRM_ST_FENCE_ATTACHED` = 15).
+     whose kind is a fence (`FORBIDDEN` otherwise). An already attached handle is the KMD's,
+     so it answers `NOT_OWNED` like any handle that is not yours;
+     `HELIOS_NVRM_ST_FENCE_ATTACHED` (15) is reserved for a future distinction and is not
+     returned today.
   4. fewer than `HELIOS_NVRM_SCANOUT_FENCE_DEPTH` (8) presents wait (`HELIOS_NVRM_ST_QUEUE_FULL`
      = 16; present without a fence, or retry).
 * On `OK` the KMD minted `out_seq` (strictly increasing, as for every flip), queued
@@ -114,7 +119,7 @@ HeliosNvrmScanoutPresent {            // 64 bytes, unchanged size
   question below). `PRESENT` returning does NOT mean the flip was sent any more.
 * **The source ends** (RELEASE, close of the DRM file, device destroy, process exit, lapse,
   transport reset): queued entries of that source are dropped unsent (`FsFDrop`), their
-  fences are closed. A flip the host refuses is counted (`FsErr`, as today) and the frame
+  fences are closed. The worker notices on its next wake (every end path wakes it). A flip the host refuses is counted (`FsErr`, as today) and the frame
   is lost silently: the client has no completion channel.
 * `QUERY_CAPS.supported_ops` bit 32 (`HELIOS_NVRM_CAP_SCANOUT_FENCE`) says the flag works
   (see "Capability bits").
@@ -178,11 +183,18 @@ struct HeliosRmFenceTail {
   of the gate fired (prefix retirement, so a merged DMA buffer carrying two presents of
   one process waits for both, and an out-of-order fire never lets a later point read as
   retired before an earlier one).
-* **Retirement.** `EventReady{handle}` in the `nvrm_events` DPC marks the point fired (once;
-  a second `EventReady` for the number is ignored), advances the gate, observes pending
-  execution waits, and the same DPC pass re-evaluates the WDDM FIFO head, the deferred
-  fast bind and the windowed blit, all of which read `scanout_boundary_ready`. The handle
-  is queued for a host `Close` that the HPD worker sends (PASSIVE).
+* **Retirement.** `EventReady{handle, status}` in the `nvrm_events` DPC marks the fence
+  fired (once; a second `EventReady` for the number is ignored), fires its gate point,
+  advances the gate's retired value, observes pending execution waits, and the same DPC
+  pass re-evaluates the WDDM FIFO head, the deferred fast bind and the windowed blit, all
+  of which read `scanout_boundary_ready`. The handle is queued for a host `Close` that the
+  HPD worker sends (PASSIVE).
+* **Limits.** 8 gates (processes), 128 unretired points per gate (a D3D12 app with more
+  `ExecuteCommandLists` in flight than that has its next v4 record refused: the UMD then
+  falls back to a CPU wait plus the `COMPLETE` variant), and a gate refuses past 2^32 - 1025
+  points (about 49 days at 1000 presents/s; it is recycled when its process exits). The
+  generic `WddmHeadMs` bound (250 ms by default) applies to a gate boundary like to any
+  stream boundary: a frame whose fence takes longer is released early, counted `WfBReb`.
 
 ## What the UMD/NVK sends when it wants no fence
 
@@ -227,20 +239,23 @@ foreign scanout's `SCANOUT_BUSY` / `NO_SOURCE`). Reused: `NOT_OWNED`, `FORBIDDEN
 
 ## Counters (names are at most 14 bytes; published by `publish_nvrm_counters`)
 
-(a): `FsFAtt` attached, `FsFFire` fired, `FsFErr` fired with an error status, `FsFEarly`
-attached already fired, `FsFSkip` coalesced, `FsFDrop` dropped unsent, `FsFRef` refused,
-`FsFFull` refused queue full. Live = `FsFAtt - FsFFire - FsFDrop` (the skipped count is a
-subset of fired).
+(a): `FsFQue` entries queued, `FsFSent` flips sent from the queue, `FsFFire` fences fired,
+`FsFErr` fired with an error status, `FsFEarly` queued already fired, `FsFSkip` ready entries
+superseded, `FsFDrop` dropped unsent, `FsFRef` refused, `FsFFull` refused for a full queue.
+Waiting now = `FsFQue - FsFSent - FsFSkip - FsFDrop`.
 (b): `RmGAtt` points attached, `RmGFire`, `RmGErr`, `RmGEarly`, `RmGCan` cancelled by
 teardown, `RmGRef` markers refused (not owned / not a fence / already attached / both
 markers / no gate room).
-Common: `FnClose` fence handles the KMD closed, `FnCloseErr` closes the host did not take.
+Common: `NvFenceCl` (existing) counts every fence handle closed, including the KMD's;
+`FnCloseErr` counts the KMD's closes the host did not take.
 
 ## Locks and IRQL
 
-* Attach (a) runs in the PASSIVE escape; attach (b) in the Present DDI under
-  `virtio_lock` (`DISPATCH`): table scans and fixed-array writes only, no allocation, no
-  wait, no PASSIVE-only call. Gate and queue storage is reserved at transport init.
+* Attach (a) runs in the PASSIVE escape under `virtio_lock` then the leaf `FENCES` lock;
+  attach (b) in `DxgkDdiRender` under `virtio_lock` (`DISPATCH`): table scans and
+  fixed-array writes only, no allocation, no wait, no PASSIVE-only call. Lock order:
+  `wddm_notify` -> `virtio_lock` -> `FENCES`; `STATE` (foreign scanout) is never taken under
+  either. Gate and queue storage is reserved at transport init.
 * Fire runs in `drain_nvrm_events` under `virtio_lock` in the DPC: it sets flags, advances
   the gate, observes waits, and returns "work for the worker"; the caller then
   `signal_hpd`s (`KeSetEvent`, `Wait = FALSE`). The host `Close` and the flip send are the
