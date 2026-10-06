@@ -44,6 +44,20 @@ Setup finds the disk only after "Load driver" from it (`viostor\w11\amd64`).
 Windows 11 needs UEFI and TPM 2.0; libvirt emulates the TPM with `swtpm`
 (`sudo apt install swtpm swtpm-tools ovmf`).
 
+The quickest way to get both is
+[quickget](https://github.com/quickemu-project/quickemu) (`sudo apt install
+quickemu`, or the project's PPA): it fetches the official ISO through
+Microsoft's download service, plus virtio-win and an unattended-install
+answer file:
+
+```bash
+quickget windows 11      # windows-11/: the Windows ISO, virtio-win.iso, unattended.iso
+```
+
+Use those ISOs as the VM's CD-ROMs below (keep `unattended.iso` attached for
+a hands-off install that skips the Microsoft account). quickget also writes a
+quickemu config; Conduit does not use it, the VM is a libvirt domain.
+
 1. Create the VM, either way:
    - in virt-manager: a Windows 11 VM with UEFI (OVMF), **Secure Boot off**
      (the driver is test-signed) and a TPM 2.0 (emulated, CRB);
