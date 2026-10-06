@@ -1,4 +1,4 @@
-From c59ae5c9d2171cdb314f42090d1ba2e2d4a4ed15 Mon Sep 17 00:00:00 2001
+From 6140e405375b46d490f2ede3d6593c7dbe80947b Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Tue, 6 Oct 2026 04:48:20 +0200
 Subject: [PATCH] nvk/rm: open another NVK process's shared surface by its
@@ -310,7 +310,7 @@ index ef9691f..b1a3bf0 100644
     LOAD(event_wait,   "crm_event_wait",   false);
     LOAD(alloc_pages,  "crm_alloc_pages",  false);
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
-index e7930fa..f0592ab 100644
+index e7930fa..5236866 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
 @@ -652,3 +652,206 @@ nvkmd_rm_mem_helios_res_release(struct nvkmd_rm_mem *mem)
@@ -372,7 +372,7 @@ index e7930fa..f0592ab 100644
 +                       res_id);
 +
 +   int drm_fd;
-+   result = get_drm_fd(dev, log_obj, &drm_fd);
++   result = nvkmd_rm_win_drm_fd(dev, log_obj, &drm_fd);
 +   if (result != VK_SUCCESS)
 +      return result;
 +
