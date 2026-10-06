@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 04:09:30 +0200
+Subject: [PATCH 4/7] nvk: skip binding a constant buffer range that is already
+ bound
+
+vkCmdBindDescriptorSets marks every constant buffer that comes from the
+bound sets dirty, and nvk_cmd_flush_gfx_cbufs() binds each of them again
+(SET_CONSTANT_BUFFER_SELECTOR_A/B/C + BIND_GROUP_CONSTANT_BUFFER) even
+when the set and the dynamic offsets are the ones already bound, which is
+what DXVK-style recording does before most draws.
+
+Remember, per group and slot, the range last bound from the CPU and skip
+the bind when it is the same.  Slots bound by NVK_MME_BIND_CBUF_DESC
+(whose descriptor only the GPU reads) are unknown.  The tracking starts
+empty in every command buffer and is dropped with the rest of the
+graphics state after vkCmdExecuteCommands, around meta and after
+generated commands.
+
+vk_perf_bench "rebind same, 2 pipelines" (the same set and dynamic offset
+bound before each draw, two pipelines alternating) now emits no constant
+buffer or root table methods between draws: 0.926 -> 0.914 ms GPU for
+20000 draws on an RTX 5090 (NVIDIA 2.735 ms).
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.h |  9 +++++++++
+ src/nouveau/vulkan/nvk_cmd_draw.c   | 17 +++++++++++++++--
+ 2 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 63a79a6..dbe711b 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -208,6 +208,13 @@ struct nvk_graphics_state {
+    struct nvk_cbuf_group {
+       uint16_t dirty;
+       struct nvk_cbuf cbufs[16];
++
++      /* Slots whose binding (bound_addr/bound_size, size 0 for unbound)
++       * the CPU knows, so binding the same range again can be skipped.
++       */
++      uint16_t bound_known;
++      uint32_t bound_size[16];
++      uint64_t bound_addr[16];
+    } cbuf_groups[5];
+ 
+    /* The draw parameters as the GPU last saw them: the root table's
+@@ -363,6 +370,8 @@ nvk_cmd_forget_gfx_gpu_state(struct nvk_cmd_buffer *cmd)
+ {
+    cmd->state.gfx.draw_params.valid = false;
+    BITSET_ZERO(cmd->state.gfx.root_shadow_valid);
++   for (uint32_t g = 0; g < ARRAY_SIZE(cmd->state.gfx.cbuf_groups); g++)
++      cmd->state.gfx.cbuf_groups[g].bound_known = 0;
+ }
+ void nvk_cmd_invalidate_compute_state(struct nvk_cmd_buffer *cmd);
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 083da50..85d2228 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -4383,13 +4383,23 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+          if (cbuf->type == NVK_CBUF_TYPE_ROOT_DESC)
+             continue;
+ 
+-         bound_any_cbuf = true;
+-
+          struct nvk_buffer_address ba;
+          if (nvk_cmd_buffer_get_cbuf_addr(cmd, desc, shader, cbuf, &ba)) {
+             assert(ba.base_addr % min_cbuf_alignment == 0);
+             ba.size = align(ba.size, min_cbuf_alignment);
+             ba.size = MIN2(ba.size, NVK_MAX_CBUF_SIZE);
++            if (ba.size == 0)
++               ba.base_addr = 0;
++
++            if ((group->bound_known & BITFIELD_BIT(c)) &&
++                group->bound_addr[c] == ba.base_addr &&
++                group->bound_size[c] == ba.size)
++               continue;
++
++            group->bound_known |= BITFIELD_BIT(c);
++            group->bound_addr[c] = ba.base_addr;
++            group->bound_size[c] = ba.size;
++            bound_any_cbuf = true;
+ 
+             struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+ 
+@@ -4405,6 +4415,9 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+                .shader_slot = c,
+             });
+          } else {
++            group->bound_known &= ~BITFIELD_BIT(c);
++            bound_any_cbuf = true;
++
+             uint64_t desc_addr =
+                nvk_cmd_buffer_get_cbuf_descriptor_addr(cmd, desc, cbuf);
+ 

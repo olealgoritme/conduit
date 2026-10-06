@@ -1,0 +1,224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 04:27:58 +0200
+Subject: [PATCH 7/7] nvk: keep what changes per draw in one hardware root
+ table bank
+
+On Turing+ the root descriptor table lives in the hardware root table,
+256-byte banks loaded with SET_ROOT_TABLE_SELECTOR / LOAD_ROOT_TABLE.
+Measured on an RTX 5090: changing dwords in one bank between draws is
+almost free, each additional bank changed costs about 5 ns of GPU time
+per draw.  A descriptor set switch with a dynamic offset changed two:
+sets[] in bank 0 and dynamic_buffers[0] in bank 3.
+
+Move the first dword of the swizzled dynamic buffer descriptors (the base
+address bits, the only dword a new dynamic offset normally changes) into
+bank 0, next to the draw parameters and followed by sets[0..3], and the
+other three dwords to banks 3 and 4.  For that each array has to be 128
+bytes, so NVK_MAX_DYNAMIC_BUFFERS goes from 64 to 32: 16 dynamic uniform
+and 16 dynamic storage buffers per pipeline layout (NVIDIA's driver
+exposes 15 and 16).  The table shrinks from 0x800 to 0x600 bytes.
+
+vk_perf_bench, 20000 draws: a descriptor set switch with a dynamic offset
+per draw 0.219 -> 0.178 ms GPU (NVIDIA 0.143 ms).  Dynamic uniform buffer
+arrays in two sets indexed at run time (vk_perf_bench -t dynidx) render
+the same as before and as on NVIDIA.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.c           | 14 +++--
+ src/nouveau/vulkan/nvk_cmd_buffer.h           | 51 ++++++++++++++-----
+ src/nouveau/vulkan/nvk_cmd_draw.c             |  3 +-
+ .../vulkan/nvk_nir_lower_descriptors.c        | 18 +++++--
+ src/nouveau/vulkan/nvk_private.h              |  2 +-
+ 5 files changed, 65 insertions(+), 23 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index 626fbcb..089595e 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -1063,8 +1063,11 @@ nvk_bind_descriptor_sets(struct nvk_cmd_buffer *cmd,
+    assert(dyn_buffer_end <= NVK_MAX_DYNAMIC_BUFFERS);
+    assert(next_dyn_offset <= info->dynamicOffsetCount);
+ 
+-   for (int i = 0; i < 4; i++)
+-      nvk_descriptor_state_set_root_array(cmd, desc, dynamic_buffers[i],
++   nvk_descriptor_state_set_root_array(cmd, desc, dynamic_buffers_0,
++                                       dyn_buffer_start, dyn_buffer_end - dyn_buffer_start,
++                                       &dynamic_buffers[0][dyn_buffer_start]);
++   for (int i = 1; i < 4; i++)
++      nvk_descriptor_state_set_root_array(cmd, desc, dynamic_buffers_123[i - 1],
+                                           dyn_buffer_start, dyn_buffer_end - dyn_buffer_start,
+                                           &dynamic_buffers[i][dyn_buffer_start]);
+ 
+@@ -1366,8 +1369,11 @@ nvk_cmd_buffer_get_cbuf_addr(struct nvk_cmd_buffer *cmd,
+          desc, set_dynamic_buffer_start[cbuf->desc_set], &dyn_idx);
+       dyn_idx += cbuf->dynamic_idx;
+       union nvk_buffer_descriptor ubo_desc;
+-      for (int i = 0; i < 4; i++)
+-         nvk_descriptor_state_get_root(desc, dynamic_buffers[i][dyn_idx], &ubo_desc.values[i]);
++      nvk_descriptor_state_get_root(desc, dynamic_buffers_0[dyn_idx],
++                                    &ubo_desc.values[0]);
++      for (int i = 1; i < 4; i++)
++         nvk_descriptor_state_get_root(desc, dynamic_buffers_123[i - 1][dyn_idx],
++                                       &ubo_desc.values[i]);
+       *addr_out = nvk_ubo_descriptor_addr(pdev, ubo_desc);
+       return true;
+    }
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 5f07622..dceff5e 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -53,6 +53,23 @@ struct nvk_root_descriptor_table {
+       } cs;
+    };
+ 
++   uint32_t __padding0[2];
++
++   /*
++    * Arrays with dynamic (shader-provided) indices need to fit in a single
++    * 256-byte bank for gpus with ROOT_TABLE.
++    *
++    * Dynamic buffer bindings (swizzled form of nvk_buffer_descriptor).
++    * Changing values in more than one 256-byte bank of the hardware root
++    * table between two draws costs about 5 ns of GPU time per extra bank
++    * (RTX 5090), so the dword that a new dynamic offset changes
++    * (dynamic_buffers_0) shares bank 0 with the draw parameters and the
++    * first four sets, the ones that change from draw to draw.  The other
++    * three dwords of each descriptor rarely change.  Use
++    * nvk_root_dynamic_buffers_offset() for the byte offset of dword i.
++    */
++   uint32_t dynamic_buffers_0[NVK_MAX_DYNAMIC_BUFFERS];
++
+    /* Descriptor set addresses */
+    struct nvk_buffer_address sets[NVK_MAX_SETS];
+ 
+@@ -63,17 +80,11 @@ struct nvk_root_descriptor_table {
+ 
+    uint64_t printf_buffer_addr;
+ 
+-   /* enfore total structure alignment to 0x100 as needed pre pascal */
+-   uint8_t __padding[0xa0];
++   uint8_t __padding1[0x18];
+ 
+-   /*
+-    * Arrays with dynamic (shader-provided) indices need to fit in a single
+-    * 256-byte bank for gpus with ROOT_TABLE. We place them here after the
+-    * padding so they're appropriately aligned.
+-    */
++   uint32_t dynamic_buffers_123[3][NVK_MAX_DYNAMIC_BUFFERS];
+ 
+-   /* Dynamic buffer bindings (swizzled form of nvk_buffer_descriptor) */
+-   uint32_t dynamic_buffers[4][NVK_MAX_DYNAMIC_BUFFERS];
++   uint8_t __padding2[0x80];
+ 
+    /* Client push constants */
+    uint8_t push[NVK_MAX_PUSH_SIZE];
+@@ -83,10 +94,27 @@ struct nvk_root_descriptor_table {
+ #define nvk_root_descriptor_offset(member)\
+    offsetof(struct nvk_root_descriptor_table, member)
+ 
++#define nvk_root_dynamic_buffers_offset(i) \
++   ((i) == 0 ? nvk_root_descriptor_offset(dynamic_buffers_0) : \
++               nvk_root_descriptor_offset(dynamic_buffers_123[(i) - 1]))
++
+ /* Push constants should be aligned properly */
+ static_assert(nvk_root_descriptor_offset(push) % 8 == 0,
+               "Push constants should be aligned properly");
+ 
++/* Layout of the hardware root table banks (see above) */
++static_assert(nvk_root_descriptor_offset(dynamic_buffers_0) +
++              sizeof(((struct nvk_root_descriptor_table *)0)->dynamic_buffers_0) +
++              4 * sizeof(struct nvk_buffer_address) <= 256,
++              "dynamic_buffers_0 and sets[0..3] share bank 0");
++static_assert(nvk_root_descriptor_offset(dynamic_buffers_123) % 256 == 0 &&
++              sizeof(((struct nvk_root_descriptor_table *)0)->dynamic_buffers_123[0]) == 128,
++              "dynamic_buffers_123 rows do not cross banks");
++static_assert(nvk_root_descriptor_offset(push) % 256 == 0,
++              "push constants fill a bank");
++static_assert(sizeof(struct nvk_root_descriptor_table) % 256 == 0,
++              "pre-Pascal needs cb0 aligned to 0x100");
++
+ #define nvk_hw_root_table_index(member)\
+    (nvk_root_descriptor_offset(member) / NVK_HW_ROOT_TABLE_SIZE)
+ #define nvk_hw_root_table_offset(member)\
+@@ -236,9 +264,8 @@ struct nvk_graphics_state {
+    } draw_params;
+ 
+    /* The root table as last written from the CPU in this command buffer,
+-    * so that unchanged dwords are not loaded again.  Only dwords from
+-    * sets onwards are tracked; the draw parameters before them are also
+-    * written by MME macros.
++    * so that unchanged dwords are not loaded again.  The draw parameters at
++    * the start are not tracked: MME macros write them too.
+     */
+    uint32_t root_shadow[sizeof(struct nvk_root_descriptor_table) / 4];
+    BITSET_DECLARE(root_shadow_valid, sizeof(struct nvk_root_descriptor_table) / 4);
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index c6b3807..e82f711 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -791,7 +791,8 @@ nvk_cmd_flush_gfx_root_desc(struct nvk_cmd_buffer *cmd,
+    const uint32_t start_dw = offset / 4;
+    const uint32_t end_dw = DIV_ROUND_UP(offset + size, 4);
+    const uint32_t *root_dw = (uint32_t *)desc->root;
+-   const uint32_t first_tracked_dw = nvk_root_descriptor_offset(sets) / 4;
++   const uint32_t first_tracked_dw =
++      nvk_root_descriptor_offset(dynamic_buffers_0) / 4;
+ 
+    if (end_dw <= first_tracked_dw) {
+       nvk_cmd_load_gfx_root_desc(cmd, desc, start_dw, end_dw);
+diff --git a/src/nouveau/vulkan/nvk_nir_lower_descriptors.c b/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
+index 9361402..8f2c09b 100644
+--- a/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
++++ b/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
+@@ -622,6 +622,17 @@ _load_root_table_array(nir_builder *b,
+                           sizeof(((struct nvk_root_descriptor_table){}).member), \
+                           index, ctx)
+ 
++/* Dword i of the swizzled dynamic buffer descriptors */
++static nir_def *
++load_root_dynamic_buffers(nir_builder *b, unsigned i, nir_def *index,
++                          const struct lower_descriptors_ctx *ctx)
++{
++   return _load_root_table_array(b, 1, 32, nvk_root_dynamic_buffers_offset(i),
++                                 sizeof(uint32_t),
++                                 NVK_MAX_DYNAMIC_BUFFERS * sizeof(uint32_t),
++                                 index, ctx);
++}
++
+ static bool
+ _lower_sysval_to_root_table(nir_builder *b, nir_intrinsic_instr *intrin,
+                             uint32_t root_table_offset,
+@@ -697,8 +708,7 @@ load_descriptor(nir_builder *b, unsigned num_components, unsigned bit_size,
+       assert(bit_size % 32 == 0);
+       int components32 = num_components * bit_size / 32;
+       for (unsigned i = 0; i < components32; i++) {
+-         dest_comps[i] = load_root_table_array(b, 1, 32,
+-                                               dynamic_buffers[i], index, ctx);
++         dest_comps[i] = load_root_dynamic_buffers(b, i, index, ctx);
+       }
+       return nir_bitcast_vector(b, nir_vec(b, dest_comps, components32), bit_size);
+    }
+@@ -1485,9 +1495,7 @@ lower_load_ssbo_descriptor(nir_builder *b, nir_intrinsic_instr *intrin,
+       nir_def *desc_root_comps[4];
+       nir_def *index = nir_iadd(b, base_lo, offset);
+       for (unsigned i = 0; i < 4; i++) {
+-         desc_root_comps[i] = load_root_table_array(b, 1, 32,
+-                                                    dynamic_buffers[i],
+-                                                    index, ctx);
++         desc_root_comps[i] = load_root_dynamic_buffers(b, i, index, ctx);
+       }
+       desc_root = nir_vec(b, desc_root_comps, 4);
+ 
+diff --git a/src/nouveau/vulkan/nvk_private.h b/src/nouveau/vulkan/nvk_private.h
+index 673232f..cb79e31 100644
+--- a/src/nouveau/vulkan/nvk_private.h
++++ b/src/nouveau/vulkan/nvk_private.h
+@@ -12,7 +12,7 @@
+ 
+ #define NVK_MAX_SETS 32
+ #define NVK_MAX_PUSH_SIZE 256
+-#define NVK_MAX_DYNAMIC_BUFFERS 64
++#define NVK_MAX_DYNAMIC_BUFFERS 32
+ #define NVK_MAX_RTS 8
+ #define NVK_MAX_SAMPLES 8
+ #define NVK_MIN_TEXEL_BUFFER_ALIGNMENT 16
