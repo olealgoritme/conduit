@@ -52,7 +52,7 @@ flush or finds nothing bound), on:
   changed (re-checked on every suppressed refresh, so a missed hook cannot wedge it);
 * the lapse: no `PRESENT` for `lapse_ms` (default 2 s, 100 ms..30 s). The HPD worker
   waits with a timeout equal to the remaining lapse while a source is live, so a
-  silent owner gives the desktop back with no other edge A DISPATCH-level watchdog on the vsync tick ends a source the worker has not
+  silent owner gives the desktop back with no other edge. A DISPATCH-level watchdog on the vsync tick ends a source the worker has not
   polled 250 ms after its deadline.
 * transport reset / StopDevice (`reset_display_publication_state`): `Inactive`, no
   restore (the display state is rebuilt).
@@ -444,7 +444,10 @@ Venus present cannot touch it. The ~104 ms per frame is not the S4 queue.
 4. **Closing present-stream slots keep undispatched requests alive (fixed).** A purge that finds a
    mid-frame stream only marks it closing; the sweep that cancels the requests of dead streams
    ran at that moment, when the slot still counted as live, and was not repeated when the
-   context's `CTX_DESTROY` finalized the slot. It is now repeated there.
+   context's `CTX_DESTROY` finalized the slot. It is now repeated there, together with
+   `discharge_dead_present_stream_waits` (the callers hold the notification-ordered token already, and
+   finalize only runs after a successful `CTX_DESTROY`, i.e. an explicit cancellation, which is the case
+   that sweep is defined for).
 5. Not changed, named for the next look: a windowed blt destination buffer left in `KmdWriter` /
    `KmdCpuMirror` after a rejected blt or an early return in the legacy Present arm
    (`present_buffer` ownership never returns, `try_begin_present_buffer_write` stays Busy and the

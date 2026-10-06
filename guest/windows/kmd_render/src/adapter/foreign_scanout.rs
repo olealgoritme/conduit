@@ -515,7 +515,11 @@ impl AdapterContext {
         let (ended, was_resident) = {
             let mut g = STATE.lock();
             let was = g.resident_foreground();
-            (g.reset(), was)
+            let ended = g.reset();
+            // Inside the hold, with the state it describes: a SET that follows this reset
+            // stores its own hint after ours, never before it.
+            FS_WATCH_AT.store(0, Ordering::Relaxed);
+            (ended, was)
         };
         if ended {
             self.count_end(was_resident);
@@ -523,7 +527,6 @@ impl AdapterContext {
                 note_end(EndCause::Reset);
             }
         }
-        FS_WATCH_AT.store(0, Ordering::Relaxed);
         // Queued fenced flips die with the transport; their fence handles are
         // closed by the transport sweep.
         let dropped = FENCES.lock().clear();

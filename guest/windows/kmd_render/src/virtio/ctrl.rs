@@ -908,7 +908,9 @@ pub fn ctx_destroy_within(
     if result.is_ok() {
         let finalized = adapter.with_wddm_notify_lock(|guard| {
             guard
-                .with_virtio(|_order, v| v.finalize_closed_present_streams_for_context(ctx_id))
+                .with_virtio(|order, v| {
+                    v.finalize_closed_present_streams_for_context(order, ctx_id)
+                })
                 .unwrap_or(0)
         });
         if finalized != 0 {
@@ -959,7 +961,9 @@ pub fn destroy_contexts_for_owner(
         if ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None).is_ok() {
             let finalized = adapter.with_wddm_notify_lock(|guard| {
                 guard
-                    .with_virtio(|_order, v| v.finalize_closed_present_streams_for_context(ctx_id))
+                    .with_virtio(|order, v| {
+                        v.finalize_closed_present_streams_for_context(order, ctx_id)
+                    })
                     .unwrap_or(0)
             });
             if finalized != 0 {
