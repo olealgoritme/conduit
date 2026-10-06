@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 06:05:02 +0200
+Subject: [PATCH] util/queue: destroy the finish barrier after every thread has
+ left it
+
+util_queue_finish() puts one util_queue_finish_execute job per thread
+behind a util_barrier on its stack, and each job destroyed the barrier
+when util_barrier_wait() returned true. With pthread barriers that is
+one thread (PTHREAD_BARRIER_SERIAL_THREAD), but the mutex + condvar
+fallback (Windows, macOS) returned true in every thread. Worse, the
+thread that releases the barrier gets there first: it broadcasts,
+unlocks and destroys the mutex while the threads it has just woken
+still have to take the mutex again to leave cnd_wait().
+
+On Windows the mutex is a CRITICAL_SECTION: DeleteCriticalSection()
+zeroes it, the woken thread finds it "locked" with no debug info and
+faults in RtlpWaitOnCriticalSection (inc [DebugInfo+24h], DebugInfo
+NULL). NVK hits it in vkDestroyInstance -> disk_cache_destroy ->
+util_queue_finish whenever the shader cache queue has grown to two or
+more threads, i.e. on every run that wrote new cache entries: 111 of
+150 vk_offscreen_test runs with an empty cache crashed with
+0xC0000005 in ntdll.
+
+The jobs no longer destroy the barrier; util_queue_finish() does, after
+it has waited for every job's fence (signalled only once the job has
+returned from util_barrier_wait()). The fallback util_barrier_wait()
+returns true in one thread only, like pthread_barrier_wait().
+---
+ src/util/u_queue.c  | 13 +++++++++++--
+ src/util/u_thread.c |  6 +++++-
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/src/util/u_queue.c b/src/util/u_queue.c
+index 6c13521..5d11508 100644
+--- a/src/util/u_queue.c
++++ b/src/util/u_queue.c
+@@ -522,8 +522,13 @@ static void
+ util_queue_finish_execute(void *data, void *gdata, int num_thread)
+ {
+    util_barrier *barrier = data;
+-   if (util_barrier_wait(barrier))
+-      util_barrier_destroy(barrier);
++
++   /* util_queue_finish destroys the barrier once every thread has left it.
++    * Destroying it here, in whichever thread util_barrier_wait picks, can
++    * pull the mutex out from under the threads it has just woken up: they
++    * still have to take the mutex again to leave util_barrier_wait.
++    */
++   util_barrier_wait(barrier);
+ }
+ 
+ void
+@@ -729,6 +734,10 @@ util_queue_finish(struct util_queue *queue)
+       util_queue_fence_destroy(&fences[i]);
+    }
+ 
++   /* Each fence is signalled after its job has returned from
++    * util_barrier_wait, so no thread uses the barrier any more.
++    */
++   util_barrier_destroy(&barrier);
+    free(fences);
+ }
+ 
+diff --git a/src/util/u_thread.c b/src/util/u_thread.c
+index d1cf085..e0401ab 100644
+--- a/src/util/u_thread.c
++++ b/src/util/u_thread.c
+@@ -233,6 +233,8 @@ void util_barrier_destroy(util_barrier *barrier)
+ 
+ bool util_barrier_wait(util_barrier *barrier)
+ {
++   bool serial = false;
++
+    mtx_lock(&barrier->mutex);
+ 
+    assert(barrier->waiters < barrier->count);
+@@ -248,11 +250,13 @@ bool util_barrier_wait(util_barrier *barrier)
+       barrier->waiters = 0;
+       barrier->sequence++;
+       cnd_broadcast(&barrier->condvar);
++      serial = true;
+    }
+ 
+    mtx_unlock(&barrier->mutex);
+ 
+-   return true;
++   /* Like PTHREAD_BARRIER_SERIAL_THREAD: true in exactly one thread. */
++   return serial;
+ }
+ 
+ #endif
+-- 
+2.43.0
+
