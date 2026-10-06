@@ -743,7 +743,7 @@ pub(crate) unsafe fn finish_wddm_tex2d_nvk(
         super::present::note_nvk_present_buffer(foreign.is_some());
     }
     if needs_wddm_texture_allocation(a) && foreign.is_none() {
-        trace_line!(
+        log_error!(
             "DDI create_resource(tex2d) NVK: no resource id, KMD placeholder {}x{} fmt={} bind=0x{:x} misc=0x{:x}",
             mip0.TexelWidth, mip0.TexelHeight, a.Format, a.BindFlags, a.MiscFlags
         );
@@ -765,6 +765,13 @@ pub(crate) unsafe fn finish_wddm_tex2d_nvk(
         .as_ref()
         .map(ResidentAllocation::handle)
         .unwrap_or(0);
+    super::present::note_nvk_allocation(
+        allocation_handle,
+        foreign.map_or(0, |f| f.resource_id),
+        mip0.TexelWidth,
+        mip0.TexelHeight,
+        !a.pPrimaryDesc.is_null(),
+    );
     if allocation_handle != 0 && foreign.is_some() {
         // SAFETY: `res` is the live resource this DDI just created.
         if !unsafe { dev.dxvk.transfer_resource_ownership(res.as_raw() as usize) } {

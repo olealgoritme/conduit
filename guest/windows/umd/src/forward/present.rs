@@ -1335,6 +1335,59 @@ pub(crate) fn note_nvk_present_buffer(has_resource_id: bool) {
     }
 }
 
+/// What `finish_wddm_tex2d_nvk` made for each WDDM allocation of this process:
+/// `(allocation, foreign resource id or 0, width, height, primary)`, newest
+/// last, at most `NVK_ALLOC_BOOK_CAP` entries. Diagnostics only: a present
+/// whose source has no foreign id cannot be flipped by the KMD's foreign path
+/// (docs/dwm-on-nvk.md, T3 `FfNoRec`), and this names which one it was.
+static NVK_ALLOC_BOOK: std::sync::Mutex<Vec<(u32, u32, u32, u32, bool)>> =
+    std::sync::Mutex::new(Vec::new());
+const NVK_ALLOC_BOOK_CAP: usize = 512;
+
+pub(crate) fn note_nvk_allocation(allocation: u32, resource_id: u32, width: u32, height: u32, primary: bool) {
+    if allocation == 0 {
+        return;
+    }
+    let mut book = lock_ignore_poison(&NVK_ALLOC_BOOK);
+    book.retain(|e| e.0 != allocation);
+    if book.len() >= NVK_ALLOC_BOOK_CAP {
+        book.remove(0);
+    }
+    book.push((allocation, resource_id, width, height, primary));
+}
+
+static NVK_PRESENT_SOURCE_LOGS: AtomicUsize = AtomicUsize::new(0);
+static NVK_PRESENT_NO_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// Log the allocation an NVK present shows and whether it carries a foreign
+/// resource id: the first 64 presents, then every one without an id (first
+/// 64 of those) and every 512th.
+unsafe fn nvk_log_present_source(shown: ddi::D3D10DDI_HRESOURCE) {
+    let alloc = resource_allocation(shown);
+    let entry = lock_ignore_poison(&NVK_ALLOC_BOOK).iter().find(|e| e.0 == alloc).copied();
+    let n = NVK_PRESENT_SOURCE_LOGS.fetch_add(1, Ordering::Relaxed);
+    let no_id = entry.map_or(true, |e| e.1 == 0);
+    let m = if no_id { NVK_PRESENT_NO_ID.fetch_add(1, Ordering::Relaxed) } else { usize::MAX };
+    if n < 64 || m < 64 || n % 512 == 0 {
+        let (w, h) = resource_dimensions(shown);
+        match entry {
+            Some((_, rid, ew, eh, primary)) if rid != 0 => log_error!(
+                "NVK present #{n}: source alloc=0x{alloc:x} res_id={rid} {ew}x{eh} primary={primary}"
+            ),
+            Some((_, _, ew, eh, primary)) => log_error!(
+                "NVK present #{n}: source alloc=0x{alloc:x} has NO resource id (KMD placeholder) \
+                 {ew}x{eh} primary={primary} (no-id presents: {})",
+                m.saturating_add(1)
+            ),
+            None => log_error!(
+                "NVK present #{n}: source alloc=0x{alloc:x} {w}x{h} was not made by finish_wddm_tex2d_nvk \
+                 (opened, rotated in, or no allocation) (no-id presents: {})",
+                m.saturating_add(1)
+            ),
+        }
+    }
+}
+
 /// Upper bound of the CPU wait for a frame's NVK work before it is presented.
 const NVK_PRESENT_WAIT_US: u32 = 2_000_000;
 
@@ -1384,6 +1437,7 @@ unsafe fn nvk_present_frame(
     let Some(dev) = helios_device(h) else {
         return Err(E_FAIL);
     };
+    nvk_log_present_source(shown);
     if let Some(context) = d3d11_context(h) {
         context.Flush();
     }
