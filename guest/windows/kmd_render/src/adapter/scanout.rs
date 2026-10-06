@@ -224,9 +224,9 @@ impl AdapterContext {
         self.pending_refresh_resource
             .store(resource_id, Ordering::Release);
         self.scanout_refresh_pending.store(1, Ordering::Release);
-        // SAFETY: hpd_event is initialized in place and stable for the adapter
-        // lifetime; KeSetEvent(Wait=FALSE) is legal through DISPATCH_LEVEL.
-        unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
+        // `signal_hpd_for`: KeSetEvent(Wait=FALSE) on the initialized hpd_event, legal through
+        // DISPATCH_LEVEL, and counted per cause (`HpdSgRfr`).
+        self.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::REFRESH);
     }
 
     /// The marker and bind edges publish their pending identity while holding

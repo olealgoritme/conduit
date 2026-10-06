@@ -32,6 +32,7 @@ pub mod flip_pipeline;
 pub mod foreign_flip;
 pub mod foreign_resource;
 pub mod foreign_scanout;
+pub mod hpd_wake;
 pub mod rm_resource_import;
 pub mod page_runs;
 pub mod rm_client;

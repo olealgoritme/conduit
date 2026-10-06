@@ -883,15 +883,24 @@ pub unsafe extern "C" fn dxgkddi_set_power_state(
     //
     // Compared against the bindgen discriminant rather than a hand-written
     // integer, so a WDK header change cannot silently invert this.
-    if device_power_state == _DEVICE_POWER_STATE::PowerDeviceD0 {
-        if adapter.display_half() {
+    //
+    // T5 anomaly 2: it quiesced on ANY non-D0 state of ANY `DeviceUid`, the monitor child's
+    // included, and a flip is retired only by a CRTC_VSYNC, so a heartbeat stopped by the
+    // monitor's power state strands the desktop's flips. Only the ADAPTER leaving D0 quiesces
+    // (`hpd_wake::power_vsync`, host-tested); every call is counted (`PwrN`, `PwrUid`,
+    // `PwrD3N`) and the watchdog (`AdapterContext::vsync_watch`) re-arms a heartbeat the adapter
+    // should be running.
+    let d0 = device_power_state == _DEVICE_POWER_STATE::PowerDeviceD0;
+    crate::ddi::stall_diag::note_power(device_uid, d0);
+    match helios_kmd_logic::hpd_wake::power_vsync(device_uid, d0, adapter.display_half()) {
+        helios_kmd_logic::hpd_wake::PowerVsync::Resume => {
             // SAFETY: the context is the final boxed adapter (dxgkrnl holds it
             // as the miniport device context) and dxgkrnl was saved at
             // StartDevice. PASSIVE_LEVEL.
             unsafe { adapter.resume_vsync() };
         }
-    } else {
-        adapter.quiesce_vsync();
+        helios_kmd_logic::hpd_wake::PowerVsync::Quiesce => adapter.quiesce_vsync(),
+        helios_kmd_logic::hpd_wake::PowerVsync::Leave => {}
     }
     STATUS_SUCCESS
 }

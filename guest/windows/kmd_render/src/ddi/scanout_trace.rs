@@ -648,15 +648,19 @@ pub(crate) fn note_worker_epoch_conflict() {
 /// Ticks [`dump_periodic`].
 static DUMP_TICKS: AtomicU32 = AtomicU32::new(0);
 
-/// Dump cadence, in HPD-worker wakeups.
-///
-/// The worker wakes once per dirty edge plus once per control completion, so
-/// during a workload this is roughly 128 frames — about one dump per second at
-/// the 155 flush/s the handoff measured, and no dumps at all while idle (where
-/// there is nothing to observe). One dump is ~120 registry writes, so the
-/// cadence is the whole cost control: it must stay well above the per-frame
-/// rate this driver spent T1b removing.
-const DUMP_EVERY: u32 = 128;
+/// The wake count and the time (ms) of the last dump ([`dump_periodic`]).
+static DUMP_LAST_N: AtomicU32 = AtomicU32::new(0);
+static DUMP_LAST_MS: AtomicU32 = AtomicU32::new(0);
+
+// Dump cadence: `hpd_wake::dump_due`, at least `DUMP_EVERY_LOOPS` (128) HPD-worker wakes AND
+// `DUMP_MIN_INTERVAL_MS` (1 s) since the previous dump.
+//
+// The worker wakes once per dirty edge plus once per control completion, so during a Venus
+// workload 128 wakes were roughly 128 frames — about one dump per second at the 155 flush/s the
+// handoff measured, and no dumps at all while idle (where there is nothing to observe). One dump
+// is ~300 registry writes, so the cadence is the whole cost control: it must stay well above the
+// per-frame rate this driver spent T1b removing. With a workload that wakes the worker per
+// present (T5: 9000 wakes a second) the count alone was 70 dumps a second, hence the interval.
 
 /// Note one `dxgkddi_present` entry and which arms its flags select. Any IRQL.
 pub(crate) fn note_present(flags: u32, flip_interval: u32, has_dma: bool, blt: bool, flip: bool) {
@@ -837,6 +841,8 @@ pub(crate) fn dump(adapter: &crate::adapter::AdapterContext) {
     // The timer's own tick count and those with the delivery gate closed, on the same dump
     // as `VpVsN` (`VpVsN` = `VsTickN` - `VsOffN`): see `ddi::stall_diag`.
     crate::ddi::stall_diag::publish_vsync_ticks();
+    // The worker's wakes, waits and signals by cause (`HpdWk*`, `HpdTm*`, `HpdSg*`).
+    crate::ddi::stall_diag::publish_hpd_wake();
     crate::diag::record_named_bytes(b"VsMinGap", adapter.vsync_min_gap_published());
     crate::diag::record_named_bytes(b"VsFast", adapter.vsync_fast.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"VpVsEn", adapter.vsync_enabled.load(Ordering::Relaxed));
@@ -983,8 +989,26 @@ pub(crate) fn dump(adapter: &crate::adapter::AdapterContext) {
 /// Throttled [`dump`] for the HPD worker loop. PASSIVE_LEVEL only.
 pub(crate) fn dump_periodic(adapter: &crate::adapter::AdapterContext) {
     let n = DUMP_TICKS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-    if n == 1 || n % DUMP_EVERY == 0 {
+    let since = n.wrapping_sub(DUMP_LAST_N.load(Ordering::Relaxed));
+    // The cadence is a function of TIME as well as of wakes (`hpd_wake::dump_due`): the loop
+    // count alone ran the ~300 registry writes of a dump about 70 times a second in the T5 run
+    // (9000 wakes a second), taking the worker out of its flip pacing for much of each second.
+    let now_ms = crate::adapter::AdapterContext::interrupt_time_ms();
+    if helios_kmd_logic::hpd_wake::dump_due(
+        n == 1,
+        since,
+        now_ms,
+        DUMP_LAST_MS.load(Ordering::Relaxed),
+    ) {
+        DUMP_LAST_N.store(n, Ordering::Relaxed);
+        DUMP_LAST_MS.store(now_ms, Ordering::Relaxed);
+        let t0 = crate::adapter::foreign_scanout::now_100ns();
         dump(adapter);
+        let us = (crate::adapter::foreign_scanout::now_100ns().saturating_sub(t0) / 10)
+            .min(u32::MAX as u64) as u32;
+        crate::ddi::stall_diag::note_dump(us);
+    } else if since >= helios_kmd_logic::hpd_wake::DUMP_EVERY_LOOPS {
+        crate::ddi::stall_diag::note_dump_skipped();
     }
 }
 
@@ -1045,6 +1069,8 @@ pub(crate) fn reset(adapter: &crate::adapter::AdapterContext) {
         &WORKER_EPOCH_SUPERSEDED,
         &WORKER_EPOCH_CONFLICT,
         &DUMP_TICKS,
+        &DUMP_LAST_N,
+        &DUMP_LAST_MS,
     ] {
         counter.store(0, Ordering::Relaxed);
     }
