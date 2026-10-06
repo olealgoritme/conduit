@@ -547,6 +547,13 @@ pub mod knobs {
     /// restores) is `crate::virtio::gpu::VirtioGpu::dma_gpu_fence`; the unread
     /// `AdapterKnobs` copy was deleted 2026-08-05.
     pub const DMA_GPU_FENCE: KnobName = KnobName::new(b"DmaGpuFence");
+    /// `KmdRmClient` (default 0 = off, nothing is opened and nothing is written).
+    /// The KMD's own RM client (`virtio::rm_client`, `docs/kmd-rm-client.md`): 1 =
+    /// open an RM client over the forwarding path and allocate, export and import a
+    /// video-memory surface of the VidPn primary's size (invisible); 2 = also map it,
+    /// paint a test picture and show it once through the KMD's own `ScanoutFlip`.
+    /// Read once per transport generation. Values above 2 count as 2.
+    pub const KMD_RM_CLIENT: KnobName = KnobName::new(b"KmdRmClient");
     /// `BindFlushMode` (default 0). Selects when the bind edge tells the host
     /// to READ the freshly bound primary (ROADMAP defect 0ab-B):
     ///   0 = completion-ordered against the boundary this buffer's own present

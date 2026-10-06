@@ -448,6 +448,12 @@ What is owned, and what is checked:
 - Capacity of every table is reserved at init, so nothing allocates under the spinlock.
   Anything whose drop must run at PASSIVE (locked MDL, contiguous buffer, event
   reference) is handed back by value from `take_*` and released after the lock.
+- **The KMD itself is a client of this pipe** behind the `KmdRmClient` knob (default off): its
+  handles are recorded under the reserved owner `DeviceOwner::KMD_RM`, which no escape can
+  present (`DeviceOwner::new` refuses it), so `close_all_for_owner` never touches them, the
+  per-owner quotas above apply to it alone, and the transport-wide sweep of section 6 closes
+  them with everybody's. Its traffic is counted in `NvOpen`/`NvClose`/`NvIoctl` like any
+  client's. Design and counters (`Rm*`): `kmd-rm-client.md`.
 
 ## 6. Teardown rules
 

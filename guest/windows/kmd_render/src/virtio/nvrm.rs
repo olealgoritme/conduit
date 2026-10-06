@@ -1320,6 +1320,11 @@ const SWEEP_SEND_BUDGET_100NS: u64 = 10 * 10_000_000;
 /// wire call and every pin unlock is outside it). Returns how many handles were
 /// closed or dropped.
 pub fn close_all_on_host(passive: PassiveLevel, adapter: &AdapterContext) -> u32 {
+    // The KMD's own RM client keeps a kernel view of an RM mapping: it must be
+    // unmapped BEFORE the host closes the file that holds the mapping (and whether
+    // or not the host is still being asked). Its handles are in the tables below
+    // under `DeviceOwner::KMD_RM`, so the sweep closes them like any other owner's.
+    super::rm_client::retire_begin(passive);
     let alive = adapter
         .with_virtio(|v| !v.transport_failed())
         .unwrap_or(false);
@@ -1409,6 +1414,8 @@ pub fn retire_transport(passive: PassiveLevel, adapter: &AdapterContext) -> bool
         close_all_on_host(passive, adapter);
     }
     adapter.set_virtio(None);
+    // Its handles were closed by the sweep (or died with the transport): forget them.
+    super::rm_client::forget();
     if had {
         mark_views_stale(adapter);
     }
