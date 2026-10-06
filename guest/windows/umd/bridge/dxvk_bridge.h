@@ -153,6 +153,18 @@ struct HeliosDxvkDevice {
   //                     *fence_value diagnostic).
   // Returns 0 = nothing recorded since the previous gate (send nothing),
   // 1 = ready, -1 = this mode is unavailable here (fall back), -2 = failed.
+  // Cross-process hand-off ledger (docs/shared-surfaces.md section 4).
+  // handoff_register: a cross-process shared resource of this device gets its
+  // ledger key (KMD resource id) now, so reads of it wait for other processes'
+  // hand-offs. handoff_publish: flush, and if work was recorded since the last
+  // hand-off, publish a point of this device on every resource in `resources`
+  // (ID3D11Resource* as size_t); the GPU's completion of the point is stored
+  // without anyone waiting. 0 = nothing new, 1 = published, -1 = ledger
+  // unavailable or full (fall back), -2 = failed.
+  void handoff_register(std::size_t d3d11_resource_ptr) const noexcept;
+  std::int32_t handoff_publish(const std::size_t* resources,
+                               std::uint32_t resource_count) const noexcept;
+
   // kFlushGateStream also publishes the point on every resource in
   // `resources` (ID3D11Resource* as size_t) that has an allocation producer
   // binding, so an importer's read waits for it.

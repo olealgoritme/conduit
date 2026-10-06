@@ -148,6 +148,38 @@ D3D12 swap-chain buffers turned that into a 250 ms stall per frame, 969 -> 4 fps
   the CPU), `=0` (no CPU wait: shows the unordered acquirer), `HELIOS_FLUSH_GATE_PUBLISH=0` (no
   publication).
 
+**Hand-off ledger (`fix/s6-handoff-ledger`, replaces the two stopgaps above as the default).**
+One backend-neutral mechanism for both remaining items: a session-wide shared table
+(`Local\\HeliosHandoffLedger`, 1.5 MiB, `umd/bridge/dxvk_bridge.cpp` `helios_handoff`) with
+65536 never-reused device records `{pid, completed}` and 32768 slots `{key = KMD resource id,
+device << 48 | point}`.
+
+* Releaser, at a flush with recorded work while it holds cross-process shared resources: one
+  signal of a local DXVK timeline to the next point, the point written into the slot of every
+  shared resource it holds (created and opened), and a DXVK fence worker callback that stores
+  `completed = point` in its record when the GPU reaches it. No CPU wait, no WDDM packet.
+* Reader: DXVK patch 0007 samples the slot when it records a read of a shared image (copy
+  source, sampled view; imported images and, while the hooks are installed, our own shared
+  images) and the submission worker waits until the publisher's record completes the point,
+  skipping our own points, bounded (2 s, and not at all for a publisher process that is gone).
+  So the keyed-mutex acquirer waits for exactly the releaser's work, in both directions
+  (creator reads opener too), on Venus and NVK.
+
+Why not the RM semaphore import that was proposed: `IMPORT_RM` mints resource ids only for
+32 bpp 2D image layouts, NVK's queue semaphore memory is private per queue, and a GPU-side acquire
+of a foreign RM semaphore needs new NVK entry points (an external timeline that is not a
+`VkSemaphore` NVK can import on Windows). The ledger reaches the same perf goal (the producer is
+never drained) with user-mode state only; its cost is the reader's submission-worker wait, which
+the read needs anyway. A GPU-side wait can replace the CPU wait in the reader's submission worker
+later without changing the ledger.
+
+Limits: slots are never freed (32768 keys per session, then the releaser falls back to the CPU
+wait), the device records are not reused (65536 per session, likewise), reads other than copies
+and sampled views (resolves, blits from a shared image) do not wait. Knobs:
+`HELIOS_HANDOFF_LEDGER=0` (the previous behaviour), `HELIOS_FLUSH_GATE_CPU_WAIT=1` (also the
+releaser CPU wait). `d3d11_share keyed-load W H ROUNDS COPIES perf` reports the producer's
+flush+release time and hand-offs/s without readbacks.
+
 ## 5. Implementation on this branch
 
 - **librmclient**: `crm_win_rm_resource_import(rm_handle, resource_id, &gem, &size, &modifier,
