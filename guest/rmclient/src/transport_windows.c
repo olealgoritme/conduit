@@ -739,6 +739,19 @@ static int win_ioctl(void *vctx, int fd, uint32_t nr, void *arg, uint32_t size)
             size = (uint32_t)sizeof(NVOS64_PARAMETERS);
         }
         break;
+    case NV_ESC_RM_GET_EVENT_DATA:
+        /* NVOS41 (16 bytes) plus the one NvUnixEvent that `pEvent` addresses; the
+         * host refuses any other split. The event comes back only when RM's status
+         * is OK. */
+        if (size < sizeof(NVOS41_PARAMETERS))
+            return -EINVAL;
+        {
+            const NVOS41_PARAMETERS *p = arg;
+            nested = (void *)(uintptr_t)p->pEvent;
+            nested_len = (uint32_t)sizeof(NvUnixEvent);
+            size = (uint32_t)sizeof(NVOS41_PARAMETERS);
+        }
+        break;
     case NV_ESC_RM_ALLOC_MEMORY:
         return alloc_memory_pinned(c, fd, nr, arg, size);
     case NV_ESC_RM_UNMAP_MEMORY:
