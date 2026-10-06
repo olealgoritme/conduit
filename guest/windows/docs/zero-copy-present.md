@@ -722,8 +722,8 @@ trailer is not a fact: a creator can forge it, and a forged one keeps failing. T
 `helios_kmd_logic::present_foreign::decide` (host tests); the arms call
 `ddi::present_foreign::skip`.
 
-What is never skipped: a null `DXGKARG_PRESENT`, no adapter, an unresolved SOURCE handle (nothing says it is
-foreign), `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER` (dxgkrnl's retry protocol), `STATUS_NO_MEMORY` and the
+What is never skipped: a null `DXGKARG_PRESENT`, no adapter, an unresolved handle in a Venus-only session (12.7: with
+foreign activity it IS skipped), `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER` (dxgkrnl's retry protocol), `STATUS_NO_MEMORY` and the
 rest after a host copy was submitted (the wait, the mirror, the ownership release of a standard-buffer
 destination cannot be unwound; they are not foreign-specific), and a foreign source that the existing arms
 handle: `ForeignCopy=1` imports it as before, and the level 5 Blt fallback (`sysmem_blt`) keeps taking an RM
@@ -743,6 +743,7 @@ mirror (`publish_nvrm_counters`) writes the rest. No registry write per Present.
 | `PrFgSkip` | refusals a foreign allocation caused, answered with success |
 | `PrFgWhy` | the last one: `arm << 12 \| destination_foreign << 9 \| source_foreign << 8 \| refusal` (arm 1 Blt, 2 MMIO flip, 3 DMA flip) |
 | `PrFgBlt`, `PrFgFlip` | the same per arm (`PrFgFlip` holds both flip contracts) |
+| `PrFgHand` | DMA flips of a foreign allocation armed for `ForeignFlip`'s programming (12.6); not skips |
 | `PBRetSite` | the site id of the last non-success return of `DxgkDdiPresent` (table 12.4), written when it changes and then every 64th failure; 0 = a status no site names |
 
 Refusal codes (`PrFgWhy`, low byte):
@@ -760,10 +761,12 @@ Refusal codes (`PrFgWhy`, low byte):
 | 9 | the destination Present buffer cannot be taken for the write (a foreign STANDARD destination without a level 5 primary) | `PBOwn` 0xE1 | no copy |
 | 10 | the host copy was refused or could not be submitted before anything was written (a foreign import the host refused, with `ForeignCopy=0` or 1) | `PBCpy` 0xE4 / 0xE5 | no copy |
 | 11 | flip: unresolved DXGI format (a check only) | `PBFlip` 0xE2 | flip proceeds |
-| 12 | DMA flip: the resource is not in the direct-scan-out table | `PBFlip` 0xE6 | nothing armed, previous picture kept |
+| 12 | DMA flip: the resource is not in the direct-scan-out table, `ForeignFlip` off (or registered while it is off) | `PBFlip` 0xE6 | nothing armed, previous picture kept |
 | 13 | completion tail: the stream boundary cannot be merged into the DMA private data | tail return | boundary dropped, legacy retirement |
+| 14 | DMA flip, `ForeignFlip` on, foreign allocation that is not registered in the table (it was full, or the allocation predates the knob) | `PBFlip` 0xE6 | nothing armed, previous picture kept |
+| 15 | Blt: a source or destination handle resolves to no allocation, with a live foreign record or `ForeignFlip` on (12.7); `PrFgWhy` bits 8 / 9 name the UNRESOLVED side | `PBCpy` 0xE1 | no copy, destination keeps its bytes |
 
-Roles: refusals 3, 4, 11 and 12 and 1 concern the source; 9 the destination; the rest either (the `source` and
+Roles: refusals 1, 3, 4, 11, 12 and 14 concern the source; 9 the destination; the rest either (the `source` and
 `destination` bits of `PrFgWhy` say which was foreign). A flip has no destination entry.
 
 ### 12.3 Where the failing status came from (read the breadcrumbs this way)
@@ -797,9 +800,22 @@ Roles: refusals 3, 4, 11 and 12 and 1 concern the source; 9 the destination; the
 | 16 / 17 | DMA flip: no allocation-list source / resource not in the direct-scan-out table |
 | 18 | level 5 Blt arm: no allocation behind the source handle |
 | 19 | completion tail: stream boundary cannot be merged |
+| 20 | completion tail: the patch-location capacity or write failed (insufficient, dxgkrnl retries) |
+| 21 | `FlipWithMultiPlaneOverlay` (`STATUS_NOT_SUPPORTED`) |
+| 22 | Blt arm (legacy or level 5): DMA buffer or its private data too small (insufficient, retried) |
+| 23 | Blt arm (legacy or level 5): patch-location capacity (insufficient, retried) |
+| 24 / 25 / 26 | Blt arm: snapshot queue failed / destination Present buffer not takeable / host copy refused or not submittable |
+| 27 | Blt arm, after the copy was submitted: fence wait, CPU mirror or ownership release failed |
+| 28 | Blt arm: fence marker not mergeable into the DMA private data |
+| 29 | completion tail: DMA buffer smaller than the refresh marker (insufficient, retried) |
+| 30 | DMA flip: the flip record does not fit the DMA private data (insufficient, retried) |
 
-Sites 1, 2, 3, 4, 13, 14 and 18 (null argument, no adapter, an unresolved SOURCE handle) stay failures by
-design; site 5 is skipped only when the source is foreign.
+Every non-success return of `dxgkddi_present_inner` and of the level 5 arm names one of these; a status that does not
+come from them (none known) would read 0. A return by a callee that already named its own site (the level 5 arm's
+`Err`) is passed through unchanged.
+
+Sites 1, 2, 3, 13, 14 and 18 (null argument, no adapter, an unresolved handle in a Venus-only session) stay
+failures by design; sites 4 and 5 become skips under the conditions of 12.7 (and 5 also for a foreign source).
 
 ### 12.5 Not verified, risks
 
@@ -818,4 +834,55 @@ model crate against the real `present_foreign.rs`; display.rs itself was only ru
 * The skip of 13 drops a producer boundary: the buffer retires by the legacy rule, which can show a frame the
   producer has not finished.
 * `PresentAllocInfo::foreign_identity` is new state read at the refusals; an allocation opened before the
-  foreign table recorded it is only caught by the table lookup.
+  foreign table recorded it is only caught by the table lookup. It is purely the table's record:
+  `OpenAllocation` clears a FOREIGN flag the private data carried when `foreign_open` finds no table entry
+  (`NotForeign`), so a previous open's flag or a creator's forgery never counts. A legitimate foreign open
+  (`Opened`) sets it, as before; a `Refused` open fails the open, as before.
+
+### 12.6 DMA flips of a foreign allocation: handed to `ForeignFlip`
+
+DWM on NVK flips DEVICE_MEMORY + `MISC_PRIMARY` buffers that are not `MISC_DIRECT_SCANOUT`, so they are not in the
+direct-scan-out table that the DMA-buffer flip contract (interval 0) resolves its source from, and the flip used to
+fail (`PBFlip` 0xE6) before `arm_dma_flip` could run. Skipping those flips outright would have hidden every
+interval-0 flip from `ForeignFlip` (`docs/kmd-rm-client.md` 15.18). So:
+
+* With `ForeignFlip` on, `CreateAllocation` registers an adopted foreign allocation (`ctx.foreign`, the KMD's own
+  adoption record, independent of `ForeignCopy`) in the same table as a direct-scan-out one (`register_for_flip`).
+  With the knob off, one relaxed load, nothing registered, nothing changes.
+* The DMA flip arm routes with `present_foreign::flip_route(knob, in_table, direct_scanout, source facts)`:
+
+| `ForeignFlip` | in the table | foreign (identity / table record) | direct flag | route |
+|---|---|---|---|---|
+| any | yes | any | yes | arm, as always (byte-identical) |
+| any | yes | no | no | arm, as always |
+| on | yes | yes | no | arm; counted `PrFgHand`; the deferred programming reaches `ForeignFlip`'s hook in `program_vidpn_source_inner` |
+| off | yes | yes | no | skip, reason 12 (a registration from before the knob went off) |
+| any | no | no | any | fail `PBFlip` 0xE6, as always (Venus) |
+| off | no | yes | any | skip, reason 12 |
+| on | no | yes | any | skip, reason 14 |
+
+* What happens after the flip is armed is the MMIO route's, unchanged: `process_deferred_vidpn_source_address` calls
+  `program_vidpn_source`, whose `ForeignFlip` hook takes the allocation (`FfProg`) or refuses it with a counted reason
+  (`FfRef*`). A refusal there runs the Venus path of the same function (`production_linear_scanout`, the KMD copy of the
+  foreign resource, which needs `ForeignCopy=1`; with it off the host refuses the import, counted, and the screen keeps
+  the previous picture), exactly as for a refused MMIO flip. The Present does not wait for that decision, so a
+  `ForeignFlip` refusal is NOT visible in the Present status or in `PrFg*`; `FfRef` / `FfWhy` carry it.
+* With the knob on, the KMD's own level 5 sysmem primary (adopted too) is registered the same way; its DMA flips are
+  then armed and answered by the level 5 arm, where they used to be skipped or refused. That is the intended route for
+  them, but it is a change to read in a level 5 run.
+* The MMIO flip (`pDmaBuffer == NULL`) is unchanged: it returns success and `SetVidPnSourceAddress` follows.
+
+### 12.7 Unresolved handles (`PBCpy` 0xE1, sites 4 and 5)
+
+The tester's counters (`PBCpy` 225 = 0xE1, `PBFlip` and the sampled blocks unmoved) point at the Blt arm's first
+refusal: a source or destination handle that resolves to no allocation. Such a handle cannot say whether it was a
+foreign one, so the refusal is skipped only when foreign activity makes that likely: the transport holds at least one
+foreign table record (`foreign_live() != 0`) or `ForeignFlip` is on. Reason 15; `PrFgWhy` bits 8 and 9 name the
+UNRESOLVED side(s). The skipped Blt finishes through `present_complete` like any other. A Venus-only session (no
+foreign record, knob off) keeps failing with `PBRetSite` 4 / 5.
+
+Trade-off, stated plainly: an unresolved handle in a session that has any foreign resource now loses that frame's
+picture instead of failing the Present. If the cause is a real handle bug (a stale open context after a transport
+restart, a handle of another driver), it is hidden from dxgkrnl and visible only as `PrFgSkip` with reason 15 and
+`PBRetSite` no longer moving. That is the point (a failed Present is a device error for DWM), but it makes `PrFgWhy`
+low byte 15 the number to read first. Flips with an unresolved source (`PBFlip` 0xE1, site 14) are NOT covered.
