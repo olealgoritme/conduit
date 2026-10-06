@@ -11,6 +11,11 @@
 //! * `PrFgWhy`: the last skip's reason, `present_foreign::Why::code`
 //!   (`arm << 12 | destination << 9 | source << 8 | refusal`).
 //! * `PrFgBlt`, `PrFgFlip`: the same, per arm (the flip count holds both contracts).
+//! * `PrUnres`: Blts answered with success because the adapter, source or destination handle
+//!   resolved to nothing, on every transport; `PrUnrWhy`: the last one's causes
+//!   (`pf::pack_causes`: source | destination << 4 | adapter << 8; 1 null slot, 2 not ours,
+//!   3 older transport generation, 4 no identity recorded); `PrColFill`: `ColorFill` Blts with no
+//!   source (a no-op). All three also set `PrFgWhy`.
 //! * `PrFgHand`: DMA flips of a foreign allocation armed for `ForeignFlip`'s programming (not
 //!   skips: the flip proceeds; `FfProg` / `FfRef*` say what the programming did).
 //! * `PBRetSite`: the site id (`present_foreign::site`) of the last non-success return of
@@ -33,6 +38,12 @@ static BLT_SKIPS: AtomicU32 = AtomicU32::new(0);
 static FLIP_SKIPS: AtomicU32 = AtomicU32::new(0);
 /// DMA flips of a foreign allocation armed for `ForeignFlip`'s programming (`PrFgHand`).
 static HANDED: AtomicU32 = AtomicU32::new(0);
+/// Blts answered with success because the adapter, source or destination did not resolve
+/// (`PrUnres`), and the last one's causes (`PrUnrWhy`, `pf::pack_causes`).
+static UNRESOLVED: AtomicU32 = AtomicU32::new(0);
+static LAST_CAUSES: AtomicU32 = AtomicU32::new(0);
+/// `ColorFill` Blts with no source, a no-op (`PrColFill`).
+static COLOR_FILLS: AtomicU32 = AtomicU32::new(0);
 
 /// The site of the current (or last) Present's non-success return; reset at each call.
 static CALL_SITE: AtomicU32 = AtomicU32::new(0);
@@ -105,33 +116,52 @@ fn note_skip(why: pf::Why) {
     }
 }
 
-/// A Blt has an unresolved source or destination handle (`PBCpy` 0xE1): `true` if the Present is
-/// a counted success instead (the transport holds a live foreign record, or `ForeignFlip` is on;
-/// a Venus-only session keeps failing). Only called at the refusal, so the table lock is taken
-/// only then.
+/// A Blt could not resolve its adapter, source or destination (`PBCpy` 0xE1): a counted success,
+/// on every transport (`pf::decide_unresolved`). `true` if the Present is to be skipped (always, for
+/// a Blt). `color_fill`: the Present carries `DXGK_PRESENTFLAGS.ColorFill`, which has no source.
+/// Each side is `(handle, resolved)`; the cause of an unresolved one is read here, at the refusal,
+/// and kept in `PrUnrWhy` (`pf::pack_causes`).
 pub(crate) fn unresolved_skip(
-    adapter: &AdapterContext,
-    source: Option<&PresentAllocInfo>,
-    destination: Option<&PresentAllocInfo>,
+    adapter: Option<&AdapterContext>,
+    color_fill: bool,
+    source: (crate::dxgk::HANDLE, bool),
+    destination: (crate::dxgk::HANDLE, bool),
 ) -> bool {
-    let foreign_flip = crate::virtio::foreign_flip::enabled();
-    let live = foreign_flip
-        || adapter
-            .with_virtio(|v| v.foreign_live() != 0)
-            .unwrap_or(false);
-    match pf::decide_unresolved(
+    let Verdict::Skip { why, .. } = pf::decide_unresolved(
         Arm::Blt,
-        source.is_some(),
-        destination.is_some(),
-        live,
-        foreign_flip,
-    ) {
-        Verdict::Skip { why, .. } => {
-            note_skip(why);
-            true
+        adapter.is_some(),
+        source.1,
+        destination.1,
+        color_fill,
+    ) else {
+        return false;
+    };
+    let cause = |(handle, resolved): (crate::dxgk::HANDLE, bool)| {
+        if resolved {
+            pf::HandleCause::Resolved
+        } else {
+            // SAFETY: a handle from the present allocation list; only its magic is read.
+            unsafe { crate::ddi::create_allocation::present_alloc_cause(adapter, handle) }
         }
-        Verdict::Proceed => false,
+    };
+    let causes = pf::pack_causes(adapter.is_none(), cause(source), cause(destination));
+    if why.refusal == Refusal::ColorFill {
+        let n = COLOR_FILLS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        LAST_WHY.store(why.code(), Ordering::Relaxed);
+        if n == 1 || n % 64 == 0 {
+            crate::diag::record_named_bytes(b"PrColFill", n);
+        }
+        return true;
     }
+    let n = UNRESOLVED.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    LAST_WHY.store(why.code(), Ordering::Relaxed);
+    LAST_CAUSES.store(causes, Ordering::Relaxed);
+    if n == 1 || n % 64 == 0 {
+        crate::diag::record_named_bytes(b"PrUnrWhy", causes);
+        crate::diag::record_named_bytes(b"PrFgWhy", why.code());
+        crate::diag::record_named_bytes(b"PrUnres", n);
+    }
+    true
 }
 
 /// Route a DMA flip (`pf::flip_route`): `Arm` (the flip is armed as every direct-scan-out flip
@@ -174,6 +204,14 @@ fn note_handoff() {
 pub(crate) fn publish_counters() {
     let n = SKIPS.load(Ordering::Relaxed);
     let handed = HANDED.load(Ordering::Relaxed);
+    let unresolved = UNRESOLVED.load(Ordering::Relaxed);
+    let fills = COLOR_FILLS.load(Ordering::Relaxed);
+    if unresolved != 0 || fills != 0 {
+        crate::diag::record_named_bytes(b"PrUnres", unresolved);
+        crate::diag::record_named_bytes(b"PrUnrWhy", LAST_CAUSES.load(Ordering::Relaxed));
+        crate::diag::record_named_bytes(b"PrColFill", fills);
+        crate::diag::record_named_bytes(b"PrFgWhy", LAST_WHY.load(Ordering::Relaxed));
+    }
     if n == 0 && handed == 0 {
         return;
     }

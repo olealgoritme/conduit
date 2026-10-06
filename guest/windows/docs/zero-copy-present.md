@@ -722,8 +722,7 @@ trailer is not a fact: a creator can forge it, and a forged one keeps failing. T
 `helios_kmd_logic::present_foreign::decide` (host tests); the arms call
 `ddi::present_foreign::skip`.
 
-What is never skipped: a null `DXGKARG_PRESENT`, no adapter, an unresolved handle in a Venus-only session (12.7: with
-foreign activity it IS skipped), `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER` (dxgkrnl's retry protocol), `STATUS_NO_MEMORY` and the
+What is never skipped: a null `DXGKARG_PRESENT`, `STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER` (dxgkrnl's retry protocol), `STATUS_NO_MEMORY` and the
 rest after a host copy was submitted (the wait, the mirror, the ownership release of a standard-buffer
 destination cannot be unwound; they are not foreign-specific), and a foreign source that the existing arms
 handle: `ForeignCopy=1` imports it as before, and the level 5 Blt fallback (`sysmem_blt`) keeps taking an RM
@@ -741,16 +740,19 @@ mirror (`publish_nvrm_counters`) writes the rest. No registry write per Present.
 | counter | meaning |
 |---|---|
 | `PrFgSkip` | refusals a foreign allocation caused, answered with success |
-| `PrFgWhy` | the last one: `arm << 12 \| destination_foreign << 9 \| source_foreign << 8 \| refusal` (arm 1 Blt, 2 MMIO flip, 3 DMA flip) |
+| `PrFgWhy` | the last one: `arm << 12 \| destination_foreign << 9 \| source_foreign << 8 \| refusal` (arm 1 Blt, 2 MMIO flip, 3 DMA flip); bit 10 is the unresolved ADAPTER of reason 15 |
 | `PrFgBlt`, `PrFgFlip` | the same per arm (`PrFgFlip` holds both flip contracts) |
 | `PrFgHand` | DMA flips of a foreign allocation armed for `ForeignFlip`'s programming (12.6); not skips |
+| `PrUnres` | Blts answered with success because the adapter, source or destination handle resolved to nothing, on EVERY transport (12.7); not counted in `PrFgSkip` (which stays "a foreign allocation caused it") |
+| `PrUnrWhy` | the last one's causes: `source \| destination << 4 \| adapter_unresolved << 8`, each side 0 resolved, 1 null list slot, 2 not an open context of ours (`OaBadH`), 3 open of an older transport generation, 4 open that recorded no identity |
+| `PrColFill` | `ColorFill` Blts with no source allocation, a no-op (12.7) |
 | `PBRetSite` | the site id of the last non-success return of `DxgkDdiPresent` (table 12.4), written when it changes and then every 64th failure; 0 = a status no site names |
 
 Refusal codes (`PrFgWhy`, low byte):
 
 | code | refusal | what it replaces | effect |
 |---|---|---|---|
-| 1 | Blt destination handle resolves to nothing, source foreign | `PBCpy` 0xE1 | no copy |
+| 1 | Blt destination handle resolves to nothing, source foreign (superseded by 15, which skips every unresolved handle; the code is kept stable and no longer produced) | `PBCpy` 0xE1 | no copy |
 | 2 | unresolved DXGI format (source or destination) | `PBCpy` 0xE2 | no copy |
 | 3 | source kind is not DEVICE_MEMORY | `PBCpy` 0xE6 | no copy |
 | 4 | WindowedBlt snapshot does not match the source | `PBCpy` 0xE7 | no copy |
@@ -764,7 +766,8 @@ Refusal codes (`PrFgWhy`, low byte):
 | 12 | DMA flip: the resource is not in the direct-scan-out table, `ForeignFlip` off (or registered while it is off) | `PBFlip` 0xE6 | nothing armed, previous picture kept |
 | 13 | completion tail: the stream boundary cannot be merged into the DMA private data | tail return | boundary dropped, legacy retirement |
 | 14 | DMA flip, `ForeignFlip` on, foreign allocation that is not registered in the table (it was full, or the allocation predates the knob) | `PBFlip` 0xE6 | nothing armed, previous picture kept |
-| 15 | Blt: a source or destination handle resolves to no allocation, with a live foreign record or `ForeignFlip` on (12.7); `PrFgWhy` bits 8 / 9 name the UNRESOLVED side | `PBCpy` 0xE1 | no copy, destination keeps its bytes |
+| 15 | Blt: the adapter, source or destination resolves to nothing, unconditionally (12.7); `PrFgWhy` bits 10 / 8 / 9 name the UNRESOLVED adapter / source / destination | `PBCpy` 0xE1 | no copy, destination keeps its bytes |
+| 16 | Blt with `ColorFill` and no source allocation (12.7) | `PBCpy` 0xE1 | no copy (a no-op fill) |
 
 Roles: refusals 1, 3, 4, 11, 12 and 14 concern the source; 9 the destination; the rest either (the `source` and
 `destination` bits of `PrFgWhy` say which was foreign). A flip has no destination entry.
@@ -814,8 +817,10 @@ Every non-success return of `dxgkddi_present_inner` and of the level 5 arm names
 come from them (none known) would read 0. A return by a callee that already named its own site (the level 5 arm's
 `Err`) is passed through unchanged.
 
-Sites 1, 2, 3, 13, 14 and 18 (null argument, no adapter, an unresolved handle in a Venus-only session) stay
-failures by design; sites 4 and 5 become skips under the conditions of 12.7 (and 5 also for a foreign source).
+Sites 1 and 13 to 14 (null argument, flip without an adapter or source) stay failures by design. Sites 3, 4, 5
+(Blt adapter, source, destination) and 18 (level 5 arm source) are skips on every transport since 12.7: they stay in
+the table because the code below the skip is the failure a Blt would have returned, and `PBRetSite` still reads them
+if that decision is ever wrong (it cannot be reached for a Blt today).
 
 ### 12.5 Not verified, risks
 
@@ -872,17 +877,44 @@ interval-0 flip from `ForeignFlip` (`docs/kmd-rm-client.md` 15.18). So:
   them, but it is a change to read in a level 5 run.
 * The MMIO flip (`pDmaBuffer == NULL`) is unchanged: it returns success and `SetVidPnSourceAddress` follows.
 
-### 12.7 Unresolved handles (`PBCpy` 0xE1, sites 4 and 5)
+### 12.7 Unresolved handles and ColorFill (`PBCpy` 0xE1, sites 3 / 4 / 5 / 18): unconditional
 
-The tester's counters (`PBCpy` 225 = 0xE1, `PBFlip` and the sampled blocks unmoved) point at the Blt arm's first
-refusal: a source or destination handle that resolves to no allocation. Such a handle cannot say whether it was a
-foreign one, so the refusal is skipped only when foreign activity makes that likely: the transport holds at least one
-foreign table record (`foreign_live() != 0`) or `ForeignFlip` is on. Reason 15; `PrFgWhy` bits 8 and 9 name the
-UNRESOLVED side(s). The skipped Blt finishes through `present_complete` like any other. A Venus-only session (no
-foreign record, knob off) keeps failing with `PBRetSite` 4 / 5.
+Evidence. T1 (DWM on NVK): `PBCpy` 225 (= 0xE1) with `PBFlip` and the sampled blocks unmoved. T2 (DWM stayed on Venus,
+no foreign allocation anywhere): `PBRet` 0 to `0xC000000D` and `PBCpy` 2 to 225 during a DWM restart, on its first
+presents. So this refusal does not need a foreign allocation; the earlier gate (a live foreign record or `ForeignFlip`)
+was wrong and is removed. A Blt whose adapter, source or destination does not resolve is a counted success on every
+transport (reason 15, `PrUnres`); a `ColorFill` Blt with no source and a resolved destination is reason 16
+(`PrColFill`). Both finish through `present_complete` after a fence-0 marker, like every skipped Blt, and the level 5
+arm does the same for an unreadable source. Flips (`PBFlip` 0xE1, site 14) are not covered.
 
-Trade-off, stated plainly: an unresolved handle in a session that has any foreign resource now loses that frame's
-picture instead of failing the Present. If the cause is a real handle bug (a stale open context after a transport
-restart, a handle of another driver), it is hidden from dxgkrnl and visible only as `PrFgSkip` with reason 15 and
-`PBRetSite` no longer moving. That is the point (a failed Present is a device error for DWM), but it makes `PrFgWhy`
-low byte 15 the number to read first. Flips with an unresolved source (`PBFlip` 0xE1, site 14) are NOT covered.
+Trade-off, stated plainly: a Blt that cannot be resolved loses that frame's picture instead of failing the Present
+(which dxgkrnl turns into a device error for DWM). A real handle bug is hidden from dxgkrnl and visible only as
+`PrUnres` with `PrUnrWhy` naming the cause; read those two first when a window shows stale content.
+
+When `present_alloc_info(adapter, h)` returns `None` (static reading of `ddi/create_allocation.rs`), in order:
+
+1. `h` is NULL: the list slot is not part of this operation. dxgkrnl encodes an absent source or destination as a NULL
+   `hDeviceSpecificAllocation` (`PresentAllocations::from_allocation_list`). The Blt shape with NO source by definition
+   is `ColorFill`. This is the one cause that needs no restart or race to occur, and it is a KMD defect, not a
+   dxgkrnl one: `docs/kmd-rm-client.md` 15.16 says "ColorFill ... accepted as no-ops", but the Blt arm required
+   both entries and answered every `Blt | ColorFill` with 0xE1. A freshly started DWM clears its buffers with fills
+   before it has composed anything, which fits "the first present(s) of a fresh DWM" and `PBCpy` 2 to 225. It is
+   fixed (reason 16) because it changes only a path that always failed. It is not proven to be T2's cause: `PBcnt`
+   is sampled and cannot show it, hence `PrUnrWhy`.
+2. `h` is not an `OpenAllocationContext` of ours (misaligned, or the `HOPN` magic does not match; counted `OaBadH`): a
+   handle this driver did not mint, or one already closed.
+3. The open belongs to an older transport generation (`is_current_generation` false; counted `STALE_ALLOC_REFUSED`).
+   `alloc_is_current` is false for serial 0 ("never stamped") and while no transport is up, so every open made across a
+   StopDevice/StartDevice (a device restart, a TDR-style reset) is refused for good even though dxgkrnl and DWM still
+   hold it: resource ids restart at 1 per generation, so serving it could name another live blob. That is intended
+   safety, and a reason the presents that follow a restart can hit this refusal.
+4. The open context recorded no identity: `read_alloc_identity` found neither a `HeliosWddmOpenIdentity` nor a
+   `HeliosWddmAllocPrivate` with a non-zero adopt id in the open-time private data (null or under 48 bytes, or an
+   allocation the KMD created without a Venus backing, or a private-data buffer dxgkrnl did not carry the create-time
+   write-back into). `present` is then `None` although the handle is ours.
+
+Causes 2 to 4 are not a KMD bug that can be fixed blind: each is the driver correctly declining to guess. Which one
+T2 hit is not known; `PrUnrWhy` records it per side (codes in the counters table) so the next dump names it. Neither the
+open-before-present ordering (dxgkrnl cannot reference a `hDeviceSpecificAllocation` before `DxgkDdiOpenAllocation`
+returned it) nor a different handle table (the list entries are always the open handles this driver returned) is a
+candidate: a handle that was never returned is cause 2.
