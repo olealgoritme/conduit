@@ -80,6 +80,9 @@ static SHOWN_RESID: AtomicU32 = AtomicU32::new(0);
 /// down, this one cannot be.
 static OWED: AtomicU32 = AtomicU32::new(0);
 static YIELDS: AtomicU32 = AtomicU32::new(0);
+/// Until when (interrupt time, 100 ns) a failed registration or flip keeps [`program`] from
+/// taking another allocation (the presenter's own retry pause; 0 = none).
+static FAIL_UNTIL: AtomicU64 = AtomicU64::new(0);
 /// When the presenter that gave up starts over (interrupt time, 100 ns; 0 = not waiting).
 static RESTART_AT: AtomicU64 = AtomicU64::new(0);
 /// The `seq` of the last flip the host took.
@@ -89,8 +92,8 @@ static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
 // allocation: `publish_counters`). `FfProg` allocations taken, of which `FfSame` the same
 // one again, `FfMoved` another of the same device, `FfReowned` of another device; `FfNoRec`
 // programmed with no foreign record (a plain Venus allocation or a placeholder); `FfRef` refused to
-// Venus, `FfWhy` the last reason (`Why::code`), `FfRef01`..`FfRef12` per reason; `FfRegs`
-// registrations, `FfWithdrawn` withdrawals, `FfGaveUp` giving-ups, `FfFrames` flips for an edge,
+// Venus, `FfWhy` the last reason (`Why::code`), `FfRef01`..`FfRef14` per reason; `FfRegs`
+// registrations, `FfRegFail` refused registrations, `FfWithdrawn` withdrawals, `FfGaveUp` giving-ups, `FfFrames` flips for an edge,
 // `FfReflips` flips for a resume, `FfYielded` flips that found the source yielded,
 // `FfFlipFail` flips refused, `FfStale` flips refused because the importer's file is no longer
 // its own (the shown allocation is dropped), `FfGone` shown allocations dropped (destroyed, file
@@ -116,8 +119,11 @@ static REFUSED_BY: [AtomicU32; Why::COUNT] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
 ];
 static REGS: AtomicU32 = AtomicU32::new(0);
+static REG_FAIL: AtomicU32 = AtomicU32::new(0);
 static WITHDRAWN: AtomicU32 = AtomicU32::new(0);
 static GAVE_UP: AtomicU32 = AtomicU32::new(0);
 static FRAMES: AtomicU32 = AtomicU32::new(0);
@@ -156,6 +162,7 @@ pub(crate) fn publish_counters() {
         );
     }
     rec(b"FfRegs", REGS.load(Ordering::Relaxed));
+    rec(b"FfRegFail", REG_FAIL.load(Ordering::Relaxed));
     rec(b"FfWithdrawn", WITHDRAWN.load(Ordering::Relaxed));
     rec(b"FfGaveUp", GAVE_UP.load(Ordering::Relaxed));
     rec(b"FfFrames", FRAMES.load(Ordering::Relaxed));
@@ -210,6 +217,7 @@ pub(crate) fn forget() {
     OWED.store(0, Ordering::Release);
     YIELDS.store(0, Ordering::Relaxed);
     RESTART_AT.store(0, Ordering::Release);
+    FAIL_UNTIL.store(0, Ordering::Release);
     LAST_SEQ.store(0, Ordering::Relaxed);
     KNOB.store(KNOB_UNREAD, Ordering::Relaxed);
 }
@@ -235,7 +243,13 @@ pub(crate) enum Programmed {
 
 /// The facts of one programmed allocation, gathered under one hold of the virtio lock.
 #[inline(never)]
-fn gather(adapter: &AdapterContext, resource_id: u32, width: u32, height: u32) -> Facts {
+fn gather(
+    adapter: &AdapterContext,
+    resource_id: u32,
+    width: u32,
+    height: u32,
+    direct_scanout: bool,
+) -> Facts {
     let host_import = crate::virtio::foreign::rm_import_served(adapter);
     let level = super::rm_client::level_if_read();
     let (record, epoch, owner_file) = adapter
@@ -258,7 +272,29 @@ fn gather(adapter: &AdapterContext, resource_id: u32, width: u32, height: u32) -
         mode: (width, height),
         record,
         owner_file,
+        failing: is_failing(),
+        direct_scanout,
     }
+}
+
+/// Flips are not working: the presenter gave up (and its restart is pending), or a
+/// registration or a flip failed within the retry pause. Two atomics and the presenter's
+/// leaf lock; the pure rule is `foreign_flip::failing`.
+fn is_failing() -> bool {
+    let gave_up = PRES.lock().p.gave_up();
+    ff::failing(
+        now(),
+        RESTART_AT.load(Ordering::Acquire),
+        gave_up,
+        FAIL_UNTIL.load(Ordering::Acquire),
+    )
+}
+
+/// A registration or a flip failed: no new allocation is taken before the presenter's own
+/// retry pause is over (the screen is the Venus path's meanwhile).
+fn note_failure() {
+    let until = now().saturating_add(helios_kmd_logic::rm_present::RETRY_AFTER_FAIL_100NS);
+    FAIL_UNTIL.fetch_max(until, Ordering::AcqRel);
 }
 
 /// `SetVidPnSourceAddress` of `resource_id` at the mode's extent `width` x `height`, from
@@ -272,11 +308,12 @@ pub(crate) fn program(
     primary_address: u64,
     width: u32,
     height: u32,
+    direct_scanout: bool,
 ) -> Programmed {
     if !knob_on() {
         return Programmed::NotOurs;
     }
-    let facts = gather(adapter, resource_id, width, height);
+    let facts = gather(adapter, resource_id, width, height, direct_scanout);
     match ff::decide_for(resource_id, &facts) {
         Verdict::Off | Verdict::Sysmem => Programmed::NotOurs,
         Verdict::NotForeign => {
@@ -488,6 +525,7 @@ fn service_pass(passive: PassiveLevel, adapter: &AdapterContext) {
                 withdraw(adapter);
             }
             PRES.lock().p.reset();
+            // The restart pause below is what `program` reads as "failing" from here on.
             GAVE_UP.fetch_add(1, Ordering::Relaxed);
             crate::diag::record_named_bytes(b"FfGaveUp", GAVE_UP.load(Ordering::Relaxed));
             let at = now().saturating_add(rs::RESTART_AFTER_GIVING_UP_100NS);
@@ -542,6 +580,11 @@ fn register(adapter: &AdapterContext, epoch: u64, target: Option<Target>) -> boo
     };
     if ok {
         REGS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        // Counted and mirrored by the throttled path (Windows may alternate between Venus and
+        // foreign allocations: no registry write per registration).
+        REG_FAIL.fetch_add(1, Ordering::Relaxed);
+        note_failure();
     }
     {
         let mut g = PRES.lock();
@@ -549,7 +592,6 @@ fn register(adapter: &AdapterContext, epoch: u64, target: Option<Target>) -> boo
             g.p.registration(ok, now());
         }
     }
-    crate::diag::record_named_bytes(b"FfReg", u32::from(ok));
     ok
 }
 
@@ -629,6 +671,7 @@ fn finish(epoch: u64, slot: u8, copied: bool, result: FlipResult) {
         }
         FlipResult::Failed | FlipResult::SourceFailed => {
             FLIP_FAIL.fetch_add(1, Ordering::Relaxed);
+            note_failure();
         }
     }
 }

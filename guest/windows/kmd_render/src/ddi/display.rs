@@ -2625,6 +2625,7 @@ unsafe fn program_vidpn_source_inner(
             source.primary_address,
             width,
             height,
+            source.direct_scanout,
         ) {
             FfProgrammed::NotOurs | FfProgrammed::Refused => ffl::other_source(adapter),
             FfProgrammed::Ok => {

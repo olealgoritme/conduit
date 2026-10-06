@@ -54,10 +54,18 @@ pub enum Why {
     Extent,
     /// The importer's DRM file is not that device's in this generation (closed, other epoch).
     OwnerGone,
+    /// Flips are failing: the presenter gave up (and waits out its restart pause), or a
+    /// registration or a flip failed within its retry pause. Taking another allocation now
+    /// would leave the screen frozen (no bind, no `SET_SCANOUT_BLOB`), so the Venus path
+    /// runs until the pause is over.
+    Failing,
+    /// The allocation carries `MISC_DIRECT_SCANOUT`: the fast bind of a flip
+    /// (`fast_bind_from_flip`) would race the resident source for the same screen.
+    DirectScanout,
 }
 
 impl Why {
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 14;
 
     pub const ALL: [Why; Self::COUNT] = [
         Why::RingLevel,
@@ -72,6 +80,8 @@ impl Why {
         Why::BadLayout,
         Why::Extent,
         Why::OwnerGone,
+        Why::Failing,
+        Why::DirectScanout,
     ];
 
     /// Stable nonzero code, 1 to [`Self::COUNT`].
@@ -89,6 +99,8 @@ impl Why {
             Why::BadLayout => 10,
             Why::Extent => 11,
             Why::OwnerGone => 12,
+            Why::Failing => 13,
+            Why::DirectScanout => 14,
         }
     }
 
@@ -120,6 +132,19 @@ pub struct Facts {
     /// The `device_type` the record's importer holds its `rm_handle` with in this
     /// generation (`nvrm_handle_device_type`), `None` when that handle is not its own.
     pub owner_file: Option<u32>,
+    /// [`failing`]: flips are not working right now.
+    pub failing: bool,
+    /// The allocation's `MISC_DIRECT_SCANOUT` flag.
+    pub direct_scanout: bool,
+}
+
+/// Whether flips are failing at `now` (100 ns): the presenter has given up and not been reset
+/// yet, or waits for its restart (`restart_at`, 0 = not waiting; `rm_sysmem::restart_pause`),
+/// or a registration or flip failed and `fail_until` (its retry pause, 0 = none) has not
+/// passed. The pause ending is what lets the arm be used again: a "failing" that stuck would
+/// refuse for good.
+pub fn failing(now: u64, restart_at: u64, gave_up: bool, fail_until: u64) -> bool {
+    gave_up || crate::rm_sysmem::restart_pause(restart_at, now).is_some() || now < fail_until
 }
 
 /// The source a taken allocation makes: what the flip names, under whose token.
@@ -152,8 +177,9 @@ pub enum Verdict {
 }
 
 /// The decision table. Order matters and is the doc's (15.18): the knob, then "is it foreign
-/// at all", then the environment (level, transport, display, host), then the record's life,
-/// then the picture, last the importer's file.
+/// at all", then the environment (level, transport, display, host), then "are flips failing",
+/// then the record's life, then the allocation's flags and the picture, last the importer's
+/// file.
 pub fn decide(f: &Facts) -> Verdict {
     if !f.knob {
         return Verdict::Off;
@@ -178,6 +204,9 @@ pub fn decide(f: &Facts) -> Verdict {
     if !f.host_import {
         return Verdict::Refuse(Why::HostCap);
     }
+    if f.failing {
+        return Verdict::Refuse(Why::Failing);
+    }
     if !rec.adopted {
         return Verdict::Refuse(Why::NotAdopted);
     }
@@ -189,6 +218,9 @@ pub fn decide(f: &Facts) -> Verdict {
     }
     if rec.origin == f.kmd_token {
         return Verdict::Refuse(Why::KmdOwned);
+    }
+    if f.direct_scanout {
+        return Verdict::Refuse(Why::DirectScanout);
     }
     let layout = flip_layout(&rec.layout);
     if layout.validate().is_err() {
@@ -319,6 +351,8 @@ pub fn target_ready(t: Option<&Target>, epoch: u64) -> bool {
 
 /// The service-key counter names this arm writes (`FfRef<NN>` per [`Why`] are built from
 /// [`ref_name`]). At most 13 characters each, all with the `Ff` prefix no other counter uses.
+/// `FfKnob` (when the knob is read) and `FfGaveUp` (at the event) are also written at their
+/// event; everything else only by the throttled mirror.
 pub const COUNTERS: [&str; 22] = [
     "FfKnob",
     "FfProg",
@@ -341,10 +375,10 @@ pub const COUNTERS: [&str; 22] = [
     "FfGone",
     "FfPoison",
     "FfEdges",
-    "FfReg",
+    "FfRegFail",
 ];
 
-/// Name of the per-reason refusal counter: `FfRef01` .. `FfRef12`.
+/// Name of the per-reason refusal counter: `FfRef01` .. `FfRef14`.
 pub const fn ref_name(why: Why) -> [u8; 7] {
     let c = why.code();
     [
@@ -412,6 +446,8 @@ mod tests {
             mode: MODE,
             record: Some(rec()),
             owner_file: Some(512),
+            failing: false,
+            direct_scanout: false,
         }
     }
 
@@ -545,6 +581,16 @@ mod tests {
                 Verdict::Refuse(Why::OwnerGone),
             ),
             (
+                "flips are failing",
+                |f| f.failing = true,
+                Verdict::Refuse(Why::Failing),
+            ),
+            (
+                "an adopted allocation with MISC_DIRECT_SCANOUT",
+                |f| f.direct_scanout = true,
+                Verdict::Refuse(Why::DirectScanout),
+            ),
+            (
                 "a user owner on a healthy box is taken at level 0",
                 |_| {},
                 Verdict::Take(Target {
@@ -562,6 +608,103 @@ mod tests {
             edit(&mut f);
             assert_eq!(decide(&f), *want, "{name}");
         }
+    }
+
+    #[test]
+    fn refusal_precedence_is_the_tables_order() {
+        let mut f = facts();
+        let mut r = rec();
+        r.adopted = false;
+        r.destroyed = true;
+        r.file_closed = true;
+        r.origin = KMD;
+        r.layout.fourcc = 0;
+        f.record = Some(r);
+        f.direct_scanout = true;
+        f.mode = (1, 1);
+        f.owner_file = None;
+        // Each step removes the fault that was refused, and the next one in the table's order
+        // is what is refused then: not adopted, destroyed, file closed, the KMD's own origin,
+        // direct scanout, the layout, the extent, the importer's file.
+        let order: &[(&str, fn(&mut Facts), Why)] = &[
+            ("not adopted", |_| {}, Why::NotAdopted),
+            (
+                "destroyed",
+                |f| f.record.as_mut().unwrap().adopted = true,
+                Why::Destroyed,
+            ),
+            (
+                "file closed",
+                |f| f.record.as_mut().unwrap().destroyed = false,
+                Why::FileClosed,
+            ),
+            (
+                "kmd origin",
+                |f| f.record.as_mut().unwrap().file_closed = false,
+                Why::KmdOwned,
+            ),
+            (
+                "direct scanout",
+                |f| f.record.as_mut().unwrap().origin = DWM,
+                Why::DirectScanout,
+            ),
+            ("bad layout", |f| f.direct_scanout = false, Why::BadLayout),
+            (
+                "extent",
+                |f| f.record.as_mut().unwrap().layout.fourcc = FOURCC_XRGB8888,
+                Why::Extent,
+            ),
+            ("owner gone", |f| f.mode = MODE, Why::OwnerGone),
+        ];
+        for (name, fix, want) in order {
+            fix(&mut f);
+            assert_eq!(decide(&f), Verdict::Refuse(*want), "{name}");
+        }
+        f.owner_file = Some(512);
+        assert!(matches!(decide(&f), Verdict::Take(_)));
+        // The environment rows, and "failing", come before the record's life.
+        let mut g = facts();
+        let mut r = rec();
+        r.destroyed = true;
+        g.record = Some(r);
+        g.failing = true;
+        assert_eq!(decide(&g), Verdict::Refuse(Why::Failing));
+        g.host_import = false;
+        assert_eq!(decide(&g), Verdict::Refuse(Why::HostCap));
+        g.display = false;
+        assert_eq!(decide(&g), Verdict::Refuse(Why::NoDisplay));
+        g.epoch = 0;
+        assert_eq!(decide(&g), Verdict::Refuse(Why::NoTransport));
+        g.level = Some(4);
+        assert_eq!(decide(&g), Verdict::Refuse(Why::RingLevel));
+        g.level = None;
+        assert_eq!(decide(&g), Verdict::Refuse(Why::LevelUnread));
+        // The sysmem row and the no-record row precede all of them, the knob precedes those.
+        let mut r = rec();
+        r.sysmem = true;
+        g.record = Some(r);
+        assert_eq!(decide(&g), Verdict::Sysmem);
+        g.record = None;
+        assert_eq!(decide(&g), Verdict::NotForeign);
+        g.knob = false;
+        assert_eq!(decide(&g), Verdict::Off);
+    }
+
+    #[test]
+    fn failing_lasts_exactly_as_long_as_the_pause() {
+        let now = 1_000 * MS;
+        assert!(!failing(now, 0, false, 0));
+        // The presenter gave up and waits for its restart: failing until then, not after.
+        assert!(failing(now, now + 5_000 * MS, false, 0));
+        assert!(!failing(now, now - 1, false, 0));
+        assert!(!failing(now + 5_000 * MS, now + 5_000 * MS, false, 0));
+        // A presenter that has given up and was not reset yet is failing whatever the clock says.
+        assert!(failing(now, 0, true, 0));
+        // A registration or flip failure's retry pause.
+        assert!(failing(now, 0, false, now + 100 * MS));
+        assert!(!failing(now + 100 * MS, 0, false, now + 100 * MS));
+        // It never sticks: with every deadline in the past it is clear.
+        assert!(!failing(now, now - 5 * MS, false, now - 5 * MS));
     }
 
     #[test]
@@ -597,6 +740,8 @@ mod tests {
         assert_eq!(Why::ALL.len(), Why::COUNT);
         assert_eq!(&ref_name(Why::RingLevel), b"FfRef01");
         assert_eq!(&ref_name(Why::OwnerGone), b"FfRef12");
+        assert_eq!(&ref_name(Why::Failing), b"FfRef13");
+        assert_eq!(&ref_name(Why::DirectScanout), b"FfRef14");
     }
 
     // ---- the book -------------------------------------------------------------------

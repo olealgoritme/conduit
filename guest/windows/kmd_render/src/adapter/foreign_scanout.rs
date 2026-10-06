@@ -326,6 +326,11 @@ impl AdapterContext {
         // The device is gone: nothing of its flips is waited for, and the host sends no
         // release for the buffers of the files it closed.
         crate::virtio::scanout_release::forget_owner(owner.raw());
+        // `ForeignFlip`: what the device imported is not flippable any more (its token may be
+        // handed to a new device), and the shown allocation is dropped BEFORE the arbiter
+        // ends the source, so the worker finds no target to flip rather than a refused flip
+        // (a presenter strike), as `foreign_scanout_release_handle` does. PASSIVE, no lock.
+        crate::virtio::foreign_flip::owner_closed(self, owner);
         let (ended, was_resident) = {
             let mut g = STATE.lock();
             let was = g.resident_foreground();
@@ -335,9 +340,6 @@ impl AdapterContext {
             self.count_end(was_resident);
             self.foreign_scanout_restore_desktop();
         }
-        // `ForeignFlip`: what the device imported is not flippable any more (its token may
-        // be handed to a new device). After `STATE` was released; PASSIVE.
-        crate::virtio::foreign_flip::owner_closed(self, owner);
     }
 
     /// The owner closed `handle` (a successful forwarded `Close`).
