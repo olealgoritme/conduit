@@ -13,6 +13,10 @@ Background: `docs/research/nvk-rm-windows.md` on branch `research/nvk-rm-windows
 `nvk-rm/zero-copy` ("Zero-copy presentation": the Linux export route this reuses),
 `docs/VENUS.md` and `docs/SCANOUT.md` for what the host does with a scanout blob.
 
+See also `independent-flip.md` (design only): showing a flip-model application's OWN swap-chain buffers as the primary
+(independent / direct flip), built on the flip arms, the `ForeignFlip` hand-off of section 12.6 and the flip-completion
+invariant of section 13 below.
+
 ## 1. The question, and the short answer
 
 NVK-on-RM renders into RM memory (`HELIOS_ESCAPE_NVRM` / librmclient). The viewer
