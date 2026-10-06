@@ -631,6 +631,10 @@ pub const HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM: u32 = 1 << 2;
 pub const HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT: u32 = 1 << 3;
 /// SNAPSHOT_STATUS includes deferred WindowedBlt CPU mirrors and context stashes.
 pub const HELIOS_SCANOUT_CAP_SNAPSHOT_STATUS: u32 = 1 << 4;
+/// The KMD honours the flush gate record (`HEFL`, `crate::flush_gate`): a tiny render
+/// packet from the D3D11 `pfnFlush` whose WDDM fence retires on a registered stream
+/// point (or the legacy wire prefix). The UMD must never send it without this bit.
+pub const HELIOS_SCANOUT_CAP_FLUSH_GATE: u32 = 1 << 5;
 
 /// out_state values for the two D4a escapes.
 pub const HELIOS_SCANOUT_ACQ_OK: u32 = 0;

@@ -148,6 +148,11 @@ pub struct Drain {
     pub skipped: u32,
     /// Entries of a source that ended (or of an earlier transport generation).
     pub dropped: u32,
+    /// The `seq` of every entry counted in `skipped` and `dropped` (flips that will
+    /// never reach the host): the release book retires them. At most the queue's depth
+    /// in all.
+    pub gone: [u64; SCANOUT_QUEUE_DEPTH],
+    pub ngone: usize,
 }
 
 impl Drain {
@@ -158,7 +163,21 @@ impl Drain {
             nclose: 0,
             skipped: 0,
             dropped: 0,
+            gone: [0; SCANOUT_QUEUE_DEPTH],
+            ngone: 0,
         }
+    }
+
+    fn note_gone(&mut self, seq: u64) {
+        if let Some(slot) = self.gone.get_mut(self.ngone) {
+            *slot = seq;
+            self.ngone += 1;
+        }
+    }
+
+    /// The seqs of the flips this drain discarded unsent.
+    pub fn gone_seqs(&self) -> &[u64] {
+        &self.gone[..self.ngone]
     }
 
     fn close_fence(&mut self, fence: u32) {
@@ -243,6 +262,7 @@ impl ScanoutQueue {
                 keep += 1;
             } else {
                 out.dropped += 1;
+                out.note_gone(entry.flip.seq);
                 out.close_fence(entry.fence);
             }
         }
@@ -268,6 +288,7 @@ impl ScanoutQueue {
                 out.send = Some(entry);
             } else {
                 out.skipped += 1;
+                out.note_gone(entry.flip.seq);
             }
         }
         // 3. Shift the rest down.
@@ -671,6 +692,8 @@ mod tests {
         assert_eq!(d.send.map(|e| e.flip.seq), Some(3));
         assert_eq!(d.skipped, 2);
         assert_eq!(d.closes(), &[10, 11, 12]);
+        // The skipped flips never reach the host: the release book retires them.
+        assert_eq!(d.gone_seqs(), &[1, 2]);
         assert_eq!(q.len(), 1);
         // The pending one is untouched and sent when it fires.
         let d = q.drain(Some((1, 7)), |_| true);
@@ -714,6 +737,7 @@ mod tests {
         assert_eq!(d.send, None);
         assert_eq!(d.dropped, 2);
         assert_eq!(d.closes(), &[10, 11]);
+        assert_eq!(d.gone_seqs(), &[1, 2]);
         assert!(q.is_empty());
         // No source at all, and a stale epoch.
         q.push(entry(3, 12)).unwrap();
@@ -732,6 +756,7 @@ mod tests {
         let d = q.drain(Some((1, 7)), |_| false);
         assert_eq!(d.dropped, 1);
         assert_eq!(d.closes(), &[10]);
+        assert_eq!(d.gone_seqs(), &[1]);
         assert_eq!(q.len(), 1);
     }
 
@@ -745,6 +770,18 @@ mod tests {
         assert_eq!(q.push(entry(99, 99)), Err(Full));
         assert_eq!(q.clear(), SCANOUT_QUEUE_DEPTH as u32);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn a_whole_queue_dropped_names_every_seq() {
+        let mut q = ScanoutQueue::new();
+        for i in 1..=SCANOUT_QUEUE_DEPTH as u64 {
+            q.push(entry(i, 10 + i as u32)).unwrap();
+        }
+        let d = q.drain(None, |_| true);
+        assert_eq!(d.dropped, SCANOUT_QUEUE_DEPTH as u32);
+        assert_eq!(d.ngone, SCANOUT_QUEUE_DEPTH);
+        assert_eq!(d.gone_seqs(), &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     // ---- Gate ------------------------------------------------------------------------

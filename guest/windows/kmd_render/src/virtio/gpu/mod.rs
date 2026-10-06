@@ -121,6 +121,11 @@ const CTRL_QUEUE_SIZE: usize = 64;
 /// a driver that consumes `InputEvent` acks (the Linux module): this one must
 /// not, or keyboard and mouse leave QEMU's emulated devices for the event queue.
 const CONDUIT_REQUIRED_FEATURES: u64 = helios_protocol::VIRTIO_F_VERSION_1;
+/// What this driver acks IN ADDITION when the device offers it and the caller wants it
+/// (`init`'s `scanout_release` argument): the host's buffer-release event
+/// (`NVGPU_F_SCANOUT_RELEASE`, bit 15; see `nvrm_events` and `docs/foreign-scanout.md`).
+/// NEVER the input bit (12): `nvrm_events` asserts it.
+const CONDUIT_OPTIONAL_FEATURES: u64 = helios_protocol::CONDUIT_OPTIONAL_FEATURES;
 /// Byte offset of `features` in the device config (`VirtioGpuNvConfig`, right
 /// after `num_fd_translations` at 3880).
 const CONDUIT_CFG_FEATURES_OFFSET: usize = 3884;
@@ -2331,6 +2336,10 @@ pub struct VirtioGpu {
     /// The device's config `features` word (`NVGPU_CFG_*`), read at init, for
     /// `HELIOS_NVRM_OP_QUERY_CAPS`.
     cfg_features: u32,
+    /// The host's buffer-release event was acked AND the event queue that carries it is
+    /// up: `ScanoutReleased` messages are consumed (`nvrm_events`) and the consumers of
+    /// them (`virtio/scanout_release.rs`) are live. Fixed for the transport's life.
+    scanout_release: bool,
     /// Backend RM handles opened through HELIOS_ESCAPE_NVRM, tagged with the
     /// owning device so a process cannot name another's, and closed at device
     /// teardown. Reserved to MAX_NVRM_HANDLES at init. See `nvrm_tables`.
@@ -2607,6 +2616,54 @@ fn fetch_host_edid(
     Ok(Some(size))
 }
 
+/// Feature negotiation (VirtIO 1.2 section 3.1.1, from the point `ACKNOWLEDGE | DRIVER`
+/// are set to `FEATURES_OK`): ack `CONDUIT_REQUIRED_FEATURES` plus whichever of `optional`
+/// the device offers, and return what was acked.
+///
+/// An optional bit is a convenience, never a requirement. If the device does not leave
+/// `FEATURES_OK` set for a set that includes one, the device is reset (bounded, like
+/// the reset at the top of `init`), `ACKNOWLEDGE | DRIVER` are set again and the required
+/// set alone is tried once more (`RelNeg` = 1): a device that would refuse its own offer
+/// costs the feature, not the transport. A required bit the device does not offer (or
+/// refuses) is `FeatureRejected` as before, with `FAILED` set.
+///
+/// Its own frame, so the optional-set retry costs `init`'s measured frame nothing.
+#[inline(never)]
+fn negotiate_features(transport: &mut PciTransport, optional: u64) -> Result<u64, VirtioError> {
+    let driver = DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER;
+    let offered = transport.read_device_features();
+    let mut accepted = offered & (CONDUIT_REQUIRED_FEATURES | optional);
+    transport.write_driver_features(accepted);
+    transport.set_status(driver | DeviceStatus::FEATURES_OK);
+    if !transport.get_status().contains(DeviceStatus::FEATURES_OK)
+        && accepted & !CONDUIT_REQUIRED_FEATURES != 0
+    {
+        crate::diag::record_named_bytes(b"RelNeg", 1);
+        transport.set_status(DeviceStatus::empty());
+        let mut spins = 0u32;
+        while !transport.get_status().is_empty() && spins < 100_000 {
+            spins += 1;
+            core::hint::spin_loop();
+        }
+        if !transport.get_status().is_empty() {
+            crate::diag::fault(crate::diag::FaultCounter::StVioR, spins);
+            return Err(VirtioError::DeviceError);
+        }
+        transport.set_status(DeviceStatus::ACKNOWLEDGE);
+        transport.set_status(driver);
+        accepted = offered & CONDUIT_REQUIRED_FEATURES;
+        transport.write_driver_features(accepted);
+        transport.set_status(driver | DeviceStatus::FEATURES_OK);
+    }
+    if !transport.get_status().contains(DeviceStatus::FEATURES_OK)
+        || accepted & CONDUIT_REQUIRED_FEATURES != CONDUIT_REQUIRED_FEATURES
+    {
+        transport.set_status(DeviceStatus::FAILED);
+        return Err(VirtioError::FeatureRejected);
+    }
+    Ok(accepted)
+}
+
 impl VirtioGpu {
     pub(crate) fn control_space_epoch(&self) -> u64 {
         self.control_space_epoch
@@ -2622,6 +2679,7 @@ impl VirtioGpu {
         passive: crate::irql::PassiveLevel,
         dxgkrnl: &DXGKRNL_INTERFACE,
         msi_granted: u32,
+        scanout_release: bool,
     ) -> Result<Box<Self>, VirtioError> {
         // ── M1: discover the device + map BARs through Dxgkrnl ──────────────
         // A miniport doesn't own the bus, so config space is reached via the
@@ -2660,18 +2718,21 @@ impl VirtioGpu {
         transport.set_status(DeviceStatus::ACKNOWLEDGE);
         transport.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
 
-        let offered = transport.read_device_features();
-        let accepted = offered & CONDUIT_REQUIRED_FEATURES;
-        transport.write_driver_features(accepted);
-        transport.set_status(
-            DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FEATURES_OK,
-        );
-        if !transport.get_status().contains(DeviceStatus::FEATURES_OK)
-            || accepted & CONDUIT_REQUIRED_FEATURES != CONDUIT_REQUIRED_FEATURES
-        {
-            transport.set_status(DeviceStatus::FAILED);
-            return Err(VirtioError::FeatureRejected);
-        }
+        // The required set, plus the optional bits this caller wants (the release event:
+        // only with the display half, see `StartDevice`). A device that refuses the
+        // larger set is retried once with the required one: an optional feature never
+        // costs the transport.
+        let accepted = negotiate_features(
+            &mut transport,
+            if scanout_release {
+                CONDUIT_OPTIONAL_FEATURES
+            } else {
+                0
+            },
+        )?;
+        let scanout_release_acked = accepted & helios_protocol::NVGPU_F_SCANOUT_RELEASE != 0;
+        // 1 when the host's buffer-release event was acked, 0 when not offered / not wanted.
+        crate::diag::record_named_bytes(b"RelAck", u32::from(scanout_release_acked));
 
         crate::diag::record_named_bytes(b"InitStg", 2); // features negotiated
         // The device only takes `GpuCmd` when the backend runs with `--venus`.
@@ -2716,9 +2777,9 @@ impl VirtioGpu {
         control.set_dev_notify(true);
         // The event queue (index 1), where the host's `EventReady` arrives (see
         // `nvrm_events`). Created before DRIVER_OK like the control queue; its
-        // buffers are posted once the device object exists. No feature is acked
-        // for it, and the input bit (12) is never acked: `accepted` above is the
-        // only thing written back.
+        // buffers are posted once the device object exists. `EventReady` needs no
+        // feature; the host's release event (bit 15) was acked above when wanted, and
+        // the input bit (12) is never acked: `accepted` is the only thing written back.
         let nvrm_event_ring = nvrm_events::new_event_ring(passive, &mut transport);
         // 1 when the event queue is up, 0 when RM events are unsupported.
         crate::diag::record_named_bytes(b"NvEvQ", u32::from(nvrm_event_ring.is_some()));
@@ -2927,6 +2988,14 @@ impl VirtioGpu {
             MAX_NVRM_EVENTS_PER_OWNER,
         )
         .ok_or(VirtioError::OutOfMemory)?;
+        // The release event is delivered on the event queue: without it (a device with no
+        // second queue, no memory for its buffers) the ack buys nothing, so the consumers
+        // stay off. `RelNoQ` = 1 names that case (the host then keeps bookkeeping it can
+        // never deliver on; it retries every 2 ms and drops nothing important).
+        let scanout_release_on = scanout_release_acked && nvrm_event_ring.is_some();
+        if scanout_release_acked && !scanout_release_on {
+            crate::diag::record_named_bytes(b"RelNoQ", 1);
+        }
 
         crate::diag::record_named_bytes(b"InitStg", 7); // building the device object
         // `VirtioGpu` contains the control virtqueue and many ownership tables.
@@ -2950,6 +3019,7 @@ impl VirtioGpu {
             nvrm_event_ring,
             nvrm_events,
             cfg_features,
+            scanout_release: scanout_release_on,
             nvrm_handles: Vec::with_capacity(MAX_NVRM_HANDLES),
             nvrm_reserved: 0,
             nvrm_fences: nvrm_tables::new_fence_book(),
@@ -5962,6 +6032,41 @@ impl VirtioGpu {
         cookie: u64,
         creator_process: usize,
     ) -> Option<u64> {
+        self.present_stream_marker_boundary_counted(ctx_id, value, cookie, creator_process, true)
+    }
+
+    /// [`Self::present_stream_marker_boundary`] for the flush gate (`HEFL`): the same
+    /// resolution, none of the present-marker calibration counters
+    /// (`PRESENT_STREAM_MARKERS`, `PsMkAhd` / `PsMkAhdHi`, `PsMkCpl`,
+    /// `PRESENT_STREAM_REJECTS`). Those are read against the PRESENT path's pipeline
+    /// depth (`PsMkAhdHi` against DXVK's 32 queued command buffers, rejects expected
+    /// zero), and a flush point is a different producer pattern that must not distort
+    /// them; the gate counts its own outcomes (`FlGStrm`, `FlGDeg`).
+    pub fn flush_stream_marker_boundary(
+        &self,
+        ctx_id: u32,
+        value: u32,
+        cookie: u64,
+        creator_process: usize,
+    ) -> Option<u64> {
+        self.present_stream_marker_boundary_counted(ctx_id, value, cookie, creator_process, false)
+    }
+
+    /// The wire-fence id a flush packet with no boundary of its own is stamped with
+    /// (`helios_kmd_logic::flush_gate::wire_floor`): the last fence this transport
+    /// generation issued, or `None` when it has issued none.
+    pub fn flush_wire_floor(&self) -> Option<u64> {
+        helios_kmd_logic::flush_gate::wire_floor(self.wire_fence_base, self.next_wire_fence)
+    }
+
+    fn present_stream_marker_boundary_counted(
+        &self,
+        ctx_id: u32,
+        value: u32,
+        cookie: u64,
+        creator_process: usize,
+        count: bool,
+    ) -> Option<u64> {
         // `value == 0` is admitted: "already complete" (see
         // `present_stream::MarkerTail`). It still has to name a live registered
         // stream of this process, exactly like a nonzero point; for every
@@ -5972,7 +6077,9 @@ impl VirtioGpu {
             cookie,
             creator_process,
         ) {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
+            if count {
+                PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
+            }
             return None;
         }
         let found = self.present_streams.iter().enumerate().find(|(_, slot)| {
@@ -5983,7 +6090,9 @@ impl VirtioGpu {
                 && slot.creator_process == creator_process
         });
         let Some((index, slot)) = found else {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
+            if count {
+                PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
+            }
             return None;
         };
         // INSTRUMENT ONLY — nothing below refuses, and the boundary returned is
@@ -6013,12 +6122,14 @@ impl VirtioGpu {
         // `virtio/counters.rs` beside the statics.
         let lookahead =
             helios_kmd_logic::present_stream::marker_lookahead(value, slot.submitted_value);
-        if lookahead != 0 {
+        if count && lookahead != 0 {
             PRESENT_STREAM_MARKER_AHEAD.fetch_add(1, Ordering::Relaxed);
             bump_high_water(&PRESENT_STREAM_MARKER_AHEAD_HIGH_WATER, lookahead as usize);
         }
-        PRESENT_STREAM_MARKERS.fetch_add(1, Ordering::Relaxed);
-        if value == 0 {
+        if count {
+            PRESENT_STREAM_MARKERS.fetch_add(1, Ordering::Relaxed);
+        }
+        if count && value == 0 {
             // A boundary at point 0 of a live stream: `slot_ready` holds for any
             // retirement, so the bind it gates does not wait on a Venus
             // timeline, yet it stays in the tagged namespace and dies with its

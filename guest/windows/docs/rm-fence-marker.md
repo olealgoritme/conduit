@@ -28,6 +28,7 @@ Three carriers, one fence object:
 | (a) main | `HELIOS_NVRM_OP_SCANOUT_PRESENT` with flag `RM_FENCE`, `rm_fence_handle` at offset 52 | the host `ScanoutFlip` is sent when the fence fires |
 | (b) | `HERF` (`HeliosPresentRefreshCmdFence`, 48 B) and `HEPR` (`HeliosPresentRenderCmdFence`, 96 B) | the present's DMA fence, scanout bind and windowed blit |
 | (b) | `HE12` version 4 (`HeliosD3D12SubmitCmdV4`, 48 B) | the ExecuteCommandLists batch's DMA completion (the runtime's monitored-fence signals) |
+| (b) | `HEFL` (`HeliosFlushGateCmd`, 48 B, `flags = RM_FENCE`) | a D3D11 `pfnFlush` packet's DMA fence, so a keyed-mutex release waits for the real work (`flush-gate.md`) |
 
 ## The fence object (all carriers)
 
@@ -123,12 +124,16 @@ HeliosNvrmScanoutPresent {            // 64 bytes, unchanged size
     The only safe reuse rule for the client's N rotating images is "do not write an image
     until a LATER frame has been shown". Dropping a still-pending frame would make that
     rule unsound for the image behind it.
-* **What the client must assume about image reuse (v1):** with N >= 3 images, do not
-  render into the image of present P until the fence of present P+1 has fired (CPU-read
-  the semaphore) AND P+1's call returned. The flip of P+1 follows its fence by one worker
-  wake (sub-millisecond when idle), so there is a window of that length in which P is still
-  on the host. A precise signal would need a `sent_seq` readable by the client (open
-  question below). `PRESENT` returning does NOT mean the flip was sent any more.
+* **What the client must assume about image reuse (v1, without the release capability):**
+  with N >= 3 images, do not render into the image of present P until the fence of present
+  P+1 has fired (CPU-read the semaphore) AND P+1's call returned. The flip of P+1 follows its
+  fence by one worker wake (sub-millisecond when idle), so there is a window of that length in
+  which P is still on the host. `PRESENT` returning does NOT mean the flip was sent any more.
+  **With `HELIOS_NVRM_CAP_SCANOUT_RELEASE`** (the host's buffer-release event was acked) the rule
+  is exact and needs only N >= 2: write the image of present P again once `SCANOUT_STATUS`
+  reports `out_released_seq >= P` (a skipped or dropped present counts as released at once), and
+  wait for it with the `SCANOUT_RELEASED` event instead of polling; `foreign-scanout.md`, "Buffer
+  release".
 * **The source ends** (RELEASE, close of the DRM file, device destroy, process exit, lapse,
   transport reset): queued entries of that source are dropped unsent (`FsFDrop`), their
   fences are closed. The worker notices on its next wake (every end path wakes it). A flip the host refuses is counted (`FsErr`, as today) and the frame
@@ -307,6 +312,7 @@ free for capabilities:
 |---|---|---|
 | 32 | `HELIOS_NVRM_CAP_SCANOUT_FENCE` | the event queue is up, the host advertises `NVGPU_CFG_DRM_FENCES` (features bit 11) and the scanout ops exist |
 | 33 | `HELIOS_NVRM_CAP_PRESENT_FENCE` | the same, and the WDDM carriers are compiled in |
+| 34 | `HELIOS_NVRM_CAP_SCANOUT_RELEASE` | the host's `NVGPU_F_SCANOUT_RELEASE` was acked (display half on, event queue up): `SCANOUT_STATUS` (op bit 12) and the `SCANOUT_RELEASED` event kind exist (`foreign-scanout.md`) |
 
 ## Statuses
 
@@ -381,9 +387,9 @@ Common: `NvFenceCl` (existing) counts every fence handle closed, including the K
 
 ## Open questions for the UMD/NVK side
 
-* Do you need a precise "this flip was sent" signal (a `sent_seq` the client can read,
-  e.g. a field of a new `SCANOUT_STATUS` op, or an event)? Without it the image-reuse rule
-  above has a worker-wake-sized window.
+* ~~Do you need a precise "this flip was sent" signal?~~ Answered by the host's buffer
+  release: `SCANOUT_STATUS` + the `SCANOUT_RELEASED` event (`foreign-scanout.md`), a signal of
+  "the host is DONE with it", stronger than "sent". Only on a host that offers it.
 * NVK D3D12 (`HE12`) has no Venus stream: confirm the v4 FENCE/COMPLETE variants cover
   `ExecuteCommandLists` (one fence per batch, created right before it).
 * One fence per present means one `0x55` round trip (about one escape) per frame on the

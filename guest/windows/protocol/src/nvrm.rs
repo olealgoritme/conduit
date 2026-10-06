@@ -431,10 +431,22 @@ pub const HELIOS_NVRM_EVENT_READY: u32 = 1;
 /// registration in the process, of EVERY kind, so a blocked waiter can give up
 /// and see the loss (its next escape fails or reports a new `epoch`).
 pub const HELIOS_NVRM_EVENT_TRANSPORT_LOST: u32 = 2;
-/// Bitmask over the kinds above (bit `n` ⇔ kind `n`): what `QUERY_CAPS`
-/// reports in `supported_event_kinds` while events are usable.
+/// A flip of the caller's scanout source can be reused: its buffer was released by the
+/// host, or a flip that waited was found never to have reached it. `handle` is ignored
+/// (use 0). Signalled whenever the `out_released_seq` of `SCANOUT_STATUS` may have
+/// advanced, never otherwise (a spurious wake is harmless: read the status). The
+/// wake-then-read protocol that loses no wakeup is in `nvrm_scanout`
+/// (`HELIOS_NVRM_OP_SCANOUT_STATUS`). Only on a device that acked the host's release
+/// feature: [`HELIOS_NVRM_EVENT_KINDS_SCANOUT_RELEASE`] is in `supported_event_kinds`
+/// then, and `HELIOS_NVRM_CAP_SCANOUT_RELEASE` is set. It also wakes with
+/// `TRANSPORT_LOST`, like every registration.
+pub const HELIOS_NVRM_EVENT_SCANOUT_RELEASED: u32 = 3;
+/// Bitmask over the kinds above that every device has (bit `n` ⇔ kind `n`): what
+/// `QUERY_CAPS` reports in `supported_event_kinds` while events are usable.
 pub const HELIOS_NVRM_EVENT_KINDS_ALL: u32 =
     (1 << HELIOS_NVRM_EVENT_READY) | (1 << HELIOS_NVRM_EVENT_TRANSPORT_LOST);
+/// The kind bit ORed into `supported_event_kinds` on a device with buffer releases.
+pub const HELIOS_NVRM_EVENT_KINDS_SCANOUT_RELEASE: u32 = 1 << HELIOS_NVRM_EVENT_SCANOUT_RELEASED;
 
 /// `HeliosNvrmEvent.out_state`.
 pub const HELIOS_NVRM_EVENT_STATE_REGISTERED: u32 = 1;
@@ -476,9 +488,11 @@ pub const HELIOS_NVRM_EVENT_STATE_NOT_FOUND: u32 = 5;
 /// transport start. If it could not (a device without a second queue, no memory),
 /// `EVENT_REGISTER` answers `HELIOS_NVRM_ST_UNSUPPORTED`, `QUERY_CAPS` reports no
 /// event ops and `supported_event_kinds == 0`, and a client falls back to polling.
-/// No feature bit is involved. In particular the KMD never acknowledges the
-/// device's input feature bit (12, `NVGPU_CFG_TAKES_INPUT`): acking it would move
-/// the keyboard and mouse onto `InputEvent`s the Windows driver cannot use.
+/// No feature bit is involved for `READY` and `TRANSPORT_LOST`. In particular the KMD
+/// never acknowledges the device's input feature bit (12, `NVGPU_CFG_TAKES_INPUT`):
+/// acking it would move the keyboard and mouse onto `InputEvent`s the Windows driver
+/// cannot use. The one kind that depends on a feature is `SCANOUT_RELEASED`, which
+/// exists only where the KMD acked `NVGPU_F_SCANOUT_RELEASE` (bit 15).
 /// `EventReady` is "wake and drain": the host re-reports a readable handle, so a
 /// spurious wake is harmless.
 ///
@@ -644,6 +658,7 @@ const _: () = {
     assert!(offset_of!(HeliosNvrmEvent, flags) == 56);
     assert!(offset_of!(HeliosNvrmEvent, out_state) == 60);
     assert!(HELIOS_NVRM_EVENT_KINDS_ALL == 0b110);
+    assert!(HELIOS_NVRM_EVENT_KINDS_SCANOUT_RELEASE == 0b1000);
 
     assert!(size_of::<HeliosNvrmPin>() == HELIOS_NVRM_PIN_BYTES);
     assert!(offset_of!(HeliosNvrmPin, user_va) == 48);

@@ -27,6 +27,7 @@ pub mod rm_client;
 pub mod rm_foreign;
 pub mod rm_present;
 pub mod rm_resource_import;
+pub mod scanout_release;
 pub mod venus;
 
 // `gpu::CompletedBind` is deliberately NOT re-exported: its only consumer names
