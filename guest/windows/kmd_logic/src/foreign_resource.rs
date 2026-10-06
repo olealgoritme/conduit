@@ -638,7 +638,15 @@ pub fn validate_request(
     size: u64,
     layout: Option<Layout>,
 ) -> Result<Layout, RequestError> {
-    validate_request_with(ctx_id, rm_handle, gem_handle, flags, size, layout, GobScheme::Gb20x)
+    validate_request_with(
+        ctx_id,
+        rm_handle,
+        gem_handle,
+        flags,
+        size,
+        layout,
+        GobScheme::Gb20x,
+    )
 }
 
 /// [`validate_request`] for a GPU whose block-linear planes follow `scheme`.
@@ -675,7 +683,9 @@ pub fn validate_request_with(
     if (flags & FLAG_PLANE1 != 0) != layout.plane1.is_some() {
         return Err(RequestError::Flags);
     }
-    layout.validate_for_with(size, scheme).map_err(RequestError::Layout)?;
+    layout
+        .validate_for_with(size, scheme)
+        .map_err(RequestError::Layout)?;
     Ok(layout)
 }
 
@@ -2974,16 +2984,32 @@ mod shared_format_tests {
     #[test]
     fn the_scheme_follows_the_3d_class_and_the_architecture() {
         for cls in [0xc597, 0xc797, 0xc997, 0xcb97] {
-            assert_eq!(GobScheme::from_eng3d_class(cls), GobScheme::Desktop, "{cls:#x}");
+            assert_eq!(
+                GobScheme::from_eng3d_class(cls),
+                GobScheme::Desktop,
+                "{cls:#x}"
+            );
         }
         for cls in [0xcd97, 0xce97] {
-            assert_eq!(GobScheme::from_eng3d_class(cls), GobScheme::Gb20x, "{cls:#x}");
+            assert_eq!(
+                GobScheme::from_eng3d_class(cls),
+                GobScheme::Gb20x,
+                "{cls:#x}"
+            );
         }
         for arch in [0x160, 0x170, 0x180, 0x190] {
-            assert_eq!(GobScheme::from_rm_architecture(arch), GobScheme::Desktop, "{arch:#x}");
+            assert_eq!(
+                GobScheme::from_rm_architecture(arch),
+                GobScheme::Desktop,
+                "{arch:#x}"
+            );
         }
         for arch in [0x1A0, 0x1B0] {
-            assert_eq!(GobScheme::from_rm_architecture(arch), GobScheme::Gb20x, "{arch:#x}");
+            assert_eq!(
+                GobScheme::from_rm_architecture(arch),
+                GobScheme::Gb20x,
+                "{arch:#x}"
+            );
         }
         for bytes in [0, 1, 2, 4, 8, u32::MAX] {
             assert_eq!(GobScheme::Gb20x.family(bytes), gb20x_family(bytes));
@@ -2997,8 +3023,15 @@ mod shared_format_tests {
         for &(fourcc, _, bpp, hdiv) in ONE_PLANE.iter() {
             let w = 64;
             for m in [MOD_LINEAR, gb20x_family(bpp) | 3, BL | 3] {
-                let l = Layout { modifier: m, ..one(fourcc, w, 64, row0(bpp, hdiv, w)) };
-                assert_eq!(l.validate(), l.validate_with(GobScheme::Gb20x), "{fourcc:#x} {m:#x}");
+                let l = Layout {
+                    modifier: m,
+                    ..one(fourcc, w, 64, row0(bpp, hdiv, w))
+                };
+                assert_eq!(
+                    l.validate(),
+                    l.validate_with(GobScheme::Gb20x),
+                    "{fourcc:#x} {m:#x}"
+                );
                 assert_eq!(
                     l.validate_for(MIB),
                     l.validate_for_with(MIB, GobScheme::Gb20x),
@@ -3014,13 +3047,23 @@ mod shared_format_tests {
         // ones are the same family on both.
         for &(fourcc, name, bpp, hdiv) in ONE_PLANE.iter() {
             let w = 64;
-            let desk = Layout { modifier: BL | 2, ..one(fourcc, w, 64, row0(bpp, hdiv, w)) };
-            let gb = Layout { modifier: gb20x_family(bpp) | 2, ..desk };
+            let desk = Layout {
+                modifier: BL | 2,
+                ..one(fourcc, w, 64, row0(bpp, hdiv, w))
+            };
+            let gb = Layout {
+                modifier: gb20x_family(bpp) | 2,
+                ..desk
+            };
             assert_eq!(desk.validate_with(GobScheme::Desktop), Ok(()), "{name}");
             assert_eq!(gb.validate_with(GobScheme::Gb20x), Ok(()), "{name}");
             if bpp <= 2 {
                 assert_eq!(desk.validate(), Err(LayoutError::Modifier), "{name}");
-                assert_eq!(gb.validate_with(GobScheme::Desktop), Err(LayoutError::Modifier), "{name}");
+                assert_eq!(
+                    gb.validate_with(GobScheme::Desktop),
+                    Err(LayoutError::Modifier),
+                    "{name}"
+                );
             } else {
                 assert_eq!(desk, gb, "{name}");
             }
@@ -3032,7 +3075,11 @@ mod shared_format_tests {
             assert_eq!(desk.validate_with(GobScheme::Desktop), Ok(()), "{name}");
             assert_eq!(gb.validate_with(GobScheme::Gb20x), Ok(()), "{name}");
             assert_eq!(desk.validate(), Err(LayoutError::Modifier), "{name}");
-            assert_eq!(gb.validate_with(GobScheme::Desktop), Err(LayoutError::Modifier), "{name}");
+            assert_eq!(
+                gb.validate_with(GobScheme::Desktop),
+                Err(LayoutError::Modifier),
+                "{name}"
+            );
             // The block height bound does not depend on the family.
             assert_eq!(desk.min_bytes(), gb.min_bytes(), "{name}");
         }
