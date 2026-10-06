@@ -408,21 +408,6 @@ impl RowPitch {
     }
 }
 
-/// Row-count alignment for an external LINEAR image, in rows.
-///
-/// EMPIRICAL, and named so it reads as one. NVIDIA's external-linear image
-/// requirements round the row count up to GOB granularity; 128 is what the
-/// measurements below produced. It is not derived from a documented rule.
-const NV_LINEAR_ROW_ALIGN: u64 = 128;
-
-/// Opaque tail slack an external LINEAR image requires beyond the padded rows.
-///
-/// Equally empirical. The measurements that produced both constants:
-///   1896x48   -> 487424  vs 368640  tight
-///   1896x1030 -> 8773632 vs 7913472 tight
-///   1024x1872 -> 7864320 =  pitch * align(1872, 128)
-const NV_LINEAR_TAIL_SLACK: u64 = 64 * 1024;
-
 /// `D3DKMDT_GDISURFACETYPE` value for a GDI texture (OPTIMAL tiling, no linear
 /// CPU byte view). It was a bare `1` compared against `gdi_surface_type`.
 const GDI_SURFACE_TYPE_TEXTURE: u32 = 1;
@@ -440,11 +425,9 @@ const GDI_SURFACE_TYPE_TEXTURE: u32 = 1;
 /// a sizing error — which is why `BlbSzD` counts the divergence between this
 /// guess and the exact Vulkan requirement the create path later learns.
 fn linear_blob_size(pitch: u64, height: u64) -> u64 {
-    let padded_rows = (height + (NV_LINEAR_ROW_ALIGN - 1)) & !(NV_LINEAR_ROW_ALIGN - 1);
-    pitch
-        .saturating_mul(padded_rows)
-        .saturating_add(NV_LINEAR_TAIL_SLACK)
-        .max(PAGE as u64)
+    // The arithmetic and its constants live in `helios_kmd_logic::paging`, where
+    // the 5120x1440 measurement (0x1C20000 tight, 0x1E10000 here) is a test vector.
+    helios_kmd_logic::paging::linear_blob_size(pitch, height)
 }
 
 /// Blobs whose guessed linear size differed from the Vulkan memory requirement

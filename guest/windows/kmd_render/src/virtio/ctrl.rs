@@ -75,6 +75,7 @@ use crate::error::NotStarted;
 use crate::irql::PassiveLevel;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
+use helios_kmd_logic::sweep_budget::SweepBudget;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
     VirtioGpuGetCapsetInfo, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
@@ -720,16 +721,28 @@ fn ctrl_roundtrip_ok_seq(
     extra: Option<&[u8]>,
     bind: Option<BindMint<'_>>,
 ) -> Result<(), VirtioError> {
-    let mut resp = [0u8; size_of::<VirtioGpuCtrlHdr>()];
-    ctrl_roundtrip(
+    ctrl_roundtrip_ok_timed(
         passive,
         adapter,
         req,
         extra,
-        &mut resp,
-        SYNC_ROUNDTRIP_TIMEOUT_MS,
         bind,
-    )?;
+        SYNC_ROUNDTRIP_TIMEOUT_MS,
+    )
+}
+
+/// [`ctrl_roundtrip_ok_seq`] with an explicit wait budget, for the teardown
+/// sweeps that must not wait the full 30 s on a host that is not answering.
+fn ctrl_roundtrip_ok_timed(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    extra: Option<&[u8]>,
+    bind: Option<BindMint<'_>>,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
+    let mut resp = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+    ctrl_roundtrip(passive, adapter, req, extra, &mut resp, timeout_ms, bind)?;
     let resp_type = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
     if resp_is_ok(resp_type) {
         Ok(())
@@ -823,6 +836,29 @@ pub fn ctx_destroy(
     owner: Option<DeviceOwner>,
     ctx_id: u32,
 ) -> Result<(), VirtioError> {
+    ctx_destroy_within(passive, adapter, owner, ctx_id, None)
+}
+
+/// How long the next command of a teardown sweep may wait: the whole synchronous
+/// timeout when there is no budget, the budget's per-call allowance otherwise,
+/// and `None` once the budget is spent (send nothing more).
+fn sweep_timeout_ms(budget: Option<&SweepBudget>) -> Option<u64> {
+    match budget {
+        None => Some(SYNC_ROUNDTRIP_TIMEOUT_MS),
+        Some(b) => b.call_timeout_ms(crate::adapter::foreign_scanout::now_100ns()),
+    }
+}
+
+/// [`ctx_destroy`] under an optional [`SweepBudget`]. With the budget spent the
+/// context is still untracked (the table entry goes) but no `CTX_DESTROY` is sent;
+/// the transport reset that follows a StopDevice sweep reclaims it.
+pub fn ctx_destroy_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: Option<DeviceOwner>,
+    ctx_id: u32,
+    budget: Option<&SweepBudget>,
+) -> Result<(), VirtioError> {
     let owned = adapter
         .with_wddm_notify_lock(|guard| {
             guard.with_virtio(|order, v| {
@@ -844,7 +880,12 @@ pub fn ctx_destroy(
     let mut cmd = VirtioGpuCtxDestroy::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
     cmd.hdr.ctx_id = ctx_id;
-    let result = ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None);
+    let result = match sweep_timeout_ms(budget) {
+        Some(timeout_ms) => {
+            ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
+        }
+        None => Err(VirtioError::Timeout),
+    };
     if result.is_ok() {
         let finalized = adapter.with_wddm_notify_lock(|guard| {
             guard
@@ -866,8 +907,9 @@ pub fn ctx_destroy_kmd(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
+    budget: Option<&SweepBudget>,
 ) -> Result<(), VirtioError> {
-    ctx_destroy(passive, adapter, None, ctx_id)
+    ctx_destroy_within(passive, adapter, None, ctx_id, budget)
 }
 
 /// `CTX_DESTROY` every context still owned by `owner` (device teardown).
@@ -937,11 +979,27 @@ pub fn ctx_detach_resource(
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    ctx_detach_resource_within(
+        passive,
+        adapter,
+        ctx_id,
+        resource_id,
+        SYNC_ROUNDTRIP_TIMEOUT_MS,
+    )
+}
+
+fn ctx_detach_resource_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    resource_id: u32,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuCtxResource::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
     cmd.hdr.ctx_id = ctx_id;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
 }
 
 /// Bind a venus blob `resource_id` to scanout 0 (the QEMU gtk/sdl display) via
@@ -1111,10 +1169,19 @@ pub fn resource_unref(
     adapter: &AdapterContext,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    resource_unref_within(passive, adapter, resource_id, SYNC_ROUNDTRIP_TIMEOUT_MS)
+}
+
+fn resource_unref_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuResourceUnref::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNREF;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
 }
 
 /// Attach an EXISTING live resource id to a context without taking ownership
@@ -1325,10 +1392,19 @@ pub fn resource_unmap_blob(
     adapter: &AdapterContext,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    resource_unmap_blob_within(passive, adapter, resource_id, SYNC_ROUNDTRIP_TIMEOUT_MS)
+}
+
+fn resource_unmap_blob_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    timeout_ms: u64,
+) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuResourceUnmapBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok_timed(passive, adapter, bytes_of(&cmd), None, None, timeout_ms)
 }
 
 /// Map a blob into the host-visible window (idempotent — returns the existing
@@ -1536,6 +1612,19 @@ pub fn release_blobs_for_owner(
     adapter: &AdapterContext,
     owner: Option<DeviceOwner>,
 ) -> u32 {
+    release_blobs_for_owner_within(passive, adapter, owner, None)
+}
+
+/// [`release_blobs_for_owner`] under an optional [`SweepBudget`] (StopDevice's
+/// KMD-owned sweep). Once the budget is spent the remaining slots are still taken
+/// out of the table, but no host command (`UNMAP_BLOB`, detach, unref) is sent for
+/// them: the transport reset that follows reclaims the host side.
+pub fn release_blobs_for_owner_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: Option<DeviceOwner>,
+    budget: Option<&SweepBudget>,
+) -> u32 {
     let mut reclaimed = 0u32;
     loop {
         let taken = adapter
@@ -1567,15 +1656,21 @@ pub fn release_blobs_for_owner(
             return reclaimed;
         }
         if mapped {
-            let _ = resource_unmap_blob(passive, adapter, res);
+            if let Some(timeout_ms) = sweep_timeout_ms(budget) {
+                let _ = resource_unmap_blob_within(passive, adapter, res, timeout_ms);
+            }
             let _ = adapter.with_virtio(|v| v.free_window_range_pub(map_offset, map_len));
         }
         let first_teardown = adapter
             .with_virtio(|v| v.take_live_resource(res))
             .unwrap_or(false);
         if first_teardown {
-            let _ = ctx_detach_resource(passive, adapter, ctx_id, res);
-            let _ = resource_unref(passive, adapter, res);
+            if let Some(timeout_ms) = sweep_timeout_ms(budget) {
+                let _ = ctx_detach_resource_within(passive, adapter, ctx_id, res, timeout_ms);
+            }
+            if let Some(timeout_ms) = sweep_timeout_ms(budget) {
+                let _ = resource_unref_within(passive, adapter, res, timeout_ms);
+            }
         }
         // Same D4b ledger reclaim as `release_blob_for_owner`: this sweep is
         // how a crashed/exited process's snapshot resids reach the ledger at
