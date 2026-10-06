@@ -1,6 +1,7 @@
 //! Which of the KMD's STANDARD allocations (`DxgkDdiGetStandardAllocationDriverData`) may be
 //! given a foreign (RM-importable) identity, and with what layout record. The pure half of
-//! `docs/rm-backed-standard.md`; nothing in `kmd_render` calls it yet.
+//! `docs/rm-backed-standard.md`. Only the census (S-A0: `hist_*`, `CENSUS_COUNTERS`) is called
+//! by `kmd_render` (`ddi/std_census.rs`); the policy half is not wired yet.
 //!
 //! It is deliberately independent of HOW the bytes are made. Both candidates of that
 //! document need exactly these answers before they differ:
@@ -318,6 +319,73 @@ pub const fn hist_name(slot: usize) -> &'static [u8] {
         _ => b"StdNOther",
     }
 }
+
+/// The registry value counting OPENS of a census slot: [`hist_name`] with `StdO` for `StdN`.
+pub const fn hist_open_name(slot: usize) -> &'static [u8] {
+    match slot {
+        0 => b"StdOPrimary",
+        1 => b"StdOShadow",
+        2 => b"StdOStaging",
+        3 => b"StdOGdi0",
+        4 => b"StdOGdiTex",
+        5 => b"StdOGdiStgCpu",
+        6 => b"StdOGdiStg",
+        7 => b"StdOGdiLut",
+        8 => b"StdOGdiSys",
+        9 => b"StdOGdiTexCpu",
+        10 => b"StdOGdiTexXa",
+        11 => b"StdOGdiTexCXa",
+        12 => b"StdOGdiOther",
+        _ => b"StdOOther",
+    }
+}
+
+/// Whether a census slot is the shared primary (its opens are not counted in `StdOpenN`, which
+/// is about the CPU-visible and GDI surfaces).
+pub const fn hist_slot_is_primary(slot: usize) -> bool {
+    slot == 0
+}
+
+/// The census slot an open recovers from the allocation's meta `misc_flags` (standard type in
+/// bits 24..27, GDI type in bits 20..23, as `GetStandardAllocationDriverData` authors them), or
+/// `None` when the standard type is 0 (not a KMD-made standard allocation).
+pub const fn hist_slot_from_misc(misc_flags: u32) -> Option<usize> {
+    let std_type = (misc_flags >> 24) & 0xF;
+    let gdi_type = (misc_flags >> 20) & 0xF;
+    if std_type == 0 {
+        None
+    } else {
+        Some(hist_slot(std_type, gdi_type))
+    }
+}
+
+/// MiB of a byte count for a counter, rounded up (a 4 KiB surface is 1, not 0), saturating.
+pub const fn census_mib(bytes: u64) -> u32 {
+    let mib = bytes.div_ceil(1 << 20);
+    if mib > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        mib as u32
+    }
+}
+
+/// The fixed-name census counters `kmd_render/src/ddi/std_census.rs` publishes (each a `b"..."`
+/// literal there, and only there); the per-slot names are [`hist_name`] and [`hist_open_name`].
+///
+/// * `StdBytesMiB`: cumulative size of the standard allocations asked for, MiB (each rounded up).
+/// * `StdMaxMiB`: the largest single one, MiB.
+/// * `StdMkPid`: the process id current at the last request (who asked dxgkrnl for it).
+/// * `StdOpenN`: successful opens of a KMD-made non-primary standard allocation.
+/// * `StdOpenSlot`: the census slot of the last such open (0 to 13, the slot order above).
+/// * `StdOpenPid`: the process id of the last such opener (DWM's pid answers the census).
+pub const CENSUS_COUNTERS: &[&str] = &[
+    "StdBytesMiB",
+    "StdMaxMiB",
+    "StdMkPid",
+    "StdOpenN",
+    "StdOpenSlot",
+    "StdOpenPid",
+];
 
 #[cfg(test)]
 mod tests {
@@ -675,6 +743,169 @@ mod tests {
         }
         // A slot past the table is the catch-all, not a panic.
         assert_eq!(hist_name(HIST_SLOTS + 5), b"StdNOther");
+    }
+
+    #[test]
+    fn the_open_census_mirrors_the_request_census() {
+        let mut all = BTreeSet::new();
+        for slot in 0..HIST_SLOTS {
+            let n = hist_name(slot);
+            let o = hist_open_name(slot);
+            assert!(o.len() <= 14, "{:?}", std::str::from_utf8(o));
+            assert!(o.starts_with(b"StdO"));
+            assert_eq!(&n[4..], &o[4..], "slot {slot}: the open name is the request name");
+            all.insert(n);
+            all.insert(o);
+        }
+        assert_eq!(all.len(), 2 * HIST_SLOTS, "request and open names are all distinct");
+        assert_eq!(hist_open_name(HIST_SLOTS + 5), b"StdOOther");
+        assert!(hist_slot_is_primary(hist_slot(STD_SHAREDPRIMARYSURFACE, 0)));
+        assert!(!hist_slot_is_primary(hist_slot(STD_GDISURFACE, GDI_TEXTURE_CROSSADAPTER)));
+    }
+
+    #[test]
+    fn an_open_recovers_the_slot_from_misc_flags() {
+        // The words `GetStandardAllocationDriverData` writes: std << 24, gdi << 20, plus the
+        // PRIMARY (bit 31) or OPTIMAL_GDI_TEXTURE (bit 29) flag, which must not move the slot.
+        let misc = |s: u32, g: u32, extra: u32| ((s & 0xF) << 24) | ((g & 0xF) << 20) | extra;
+        assert_eq!(hist_slot_from_misc(misc(STD_SHAREDPRIMARYSURFACE, 0, 1 << 31)), Some(0));
+        assert_eq!(hist_slot_from_misc(misc(STD_SHADOWSURFACE, 0, 0)), Some(1));
+        assert_eq!(hist_slot_from_misc(misc(STD_STAGINGSURFACE, 0, 0)), Some(2));
+        for g in 0..=GDI_TEXTURE_CPUVISIBLE_CROSSADAPTER {
+            assert_eq!(
+                hist_slot_from_misc(misc(STD_GDISURFACE, g, 1 << 29)),
+                Some(hist_slot(STD_GDISURFACE, g))
+            );
+        }
+        assert_eq!(hist_slot_from_misc(misc(STD_GDISURFACE, 15, 0)), Some(12));
+        // Not a KMD-made standard allocation (a UMD resource's misc, with D3D10 SHARED bits).
+        assert_eq!(hist_slot_from_misc(0x0000_0102), None);
+        assert_eq!(hist_slot_from_misc(0), None);
+    }
+
+    #[test]
+    fn census_mib_rounds_up_and_saturates() {
+        assert_eq!(census_mib(0), 0);
+        assert_eq!(census_mib(4096), 1);
+        assert_eq!(census_mib(1 << 20), 1);
+        assert_eq!(census_mib((1 << 20) + 1), 2);
+        // 5120x1440 shadow: linear_blob_size = 20480 * 1536 + 64 KiB.
+        assert_eq!(census_mib(20480 * 1536 + 65536), 31);
+        assert_eq!(census_mib(u64::MAX), u32::MAX);
+    }
+
+    /// Every `b"..."` literal under `root`: (literal, file name).
+    fn byte_literals(root: &std::path::Path) -> std::vec::Vec<(std::string::String, std::string::String)> {
+        let mut out = std::vec::Vec::new();
+        let mut stack = std::vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let file = p.file_name().unwrap().to_string_lossy().into_owned();
+                    let text = std::fs::read_to_string(&p).unwrap();
+                    let mut rest = text.as_str();
+                    while let Some(i) = rest.find("b\"") {
+                        let before = rest[..i].chars().last();
+                        let tail = &rest[i + 2..];
+                        let Some(end) = tail.find('"') else { break };
+                        if !before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                            out.push((tail[..end].into(), file.clone()));
+                        }
+                        rest = &tail[end + 1..];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The census names fit, are unique, are not in another counter list of this crate, and in
+    /// `kmd_render` (when the sibling tree is present; `HELIOS_REQUIRE_NAME_SCAN=1` makes its
+    /// absence a failure) the fixed ones are written exactly once, by `ddi/std_census.rs`, and
+    /// the per-slot ones nowhere (they come from the tables above), and no literal elsewhere
+    /// equals or truncates onto any of them.
+    #[test]
+    fn census_counter_names_fit_are_unique_and_live_only_in_the_publisher() {
+        let mut mine: std::vec::Vec<std::string::String> =
+            CENSUS_COUNTERS.iter().map(|s| (*s).into()).collect();
+        for slot in 0..HIST_SLOTS {
+            mine.push(std::str::from_utf8(hist_name(slot)).unwrap().into());
+            mine.push(std::str::from_utf8(hist_open_name(slot)).unwrap().into());
+        }
+        for n in &mine {
+            assert!(n.len() <= 14, "{n} is longer than 14");
+            assert!(n.chars().all(|c| c.is_ascii_alphanumeric()), "{n}");
+        }
+        let mut sorted = mine.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), mine.len(), "duplicate census name");
+        let lists: [&[&str]; 5] = [
+            &crate::foreign_flip::COUNTERS[..],
+            &crate::flip_completion::COUNTERS[..],
+            &crate::stall_diag::COUNTERS[..],
+            crate::rm_window::COUNTERS,
+            &crate::device_lost::COUNTERS[..],
+        ];
+        for list in lists {
+            for other in list {
+                assert!(!mine.iter().any(|m| m.as_str() == *other), "{other} collides");
+            }
+        }
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let render = manifest.join("../kmd_render/src");
+        if !render.exists() {
+            assert!(
+                std::env::var("HELIOS_REQUIRE_NAME_SCAN").map_or(true, |v| v != "1"),
+                "HELIOS_REQUIRE_NAME_SCAN=1 and no sibling kmd_render/src at {}",
+                render.display()
+            );
+            return;
+        }
+        let lits = byte_literals(&render);
+        assert!(lits.len() > 500, "scan found {} literals", lits.len());
+        for (lit, file) in &lits {
+            for m in &mine {
+                if lit == m {
+                    assert!(
+                        file == "std_census.rs" && CENSUS_COUNTERS.contains(&m.as_str()),
+                        "{m} is spelled in {file}"
+                    );
+                }
+                if lit.len() > 14 && lit[..14] == **m {
+                    panic!("{lit} in {file} truncates onto {m}");
+                }
+            }
+        }
+        for name in CENSUS_COUNTERS {
+            let n = lits
+                .iter()
+                .filter(|(l, f)| l == name && f == "std_census.rs")
+                .count();
+            assert_eq!(n, 1, "{name} must be published exactly once");
+        }
+        // Nothing else in this crate spells them as a quoted string.
+        let logic = manifest.join("src");
+        for e in std::fs::read_dir(&logic).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().is_none_or(|x| x != "rs")
+                || p.file_name().is_some_and(|n| n == "rm_standard.rs")
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap();
+            for m in &mine {
+                assert!(
+                    !text.contains(&std::format!("\"{m}\"")),
+                    "{} spells the census counter {m}",
+                    p.display()
+                );
+            }
+        }
     }
 
     #[test]

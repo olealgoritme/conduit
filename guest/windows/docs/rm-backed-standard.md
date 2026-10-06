@@ -2,9 +2,10 @@
 
 Status: written on `kmd/rm-backed-standard-design` over `8aba6f4` (the tip of `worktree-kmd-start-debug`: it has the
 `ForeignFlip` arm and section 15.18 of `kmd-rm-client.md`; the commit named in the request, `aeda363`, is its
-ancestor and has neither). **Design only.** The only code is the pure, host-tested
-`kmd_logic/src/rm_standard.rs` (14 tests; 888 in the crate), which nothing in `kmd_render` calls. Nothing here was
-built into a driver or run in a guest.
+ancestor and has neither). **Design only**, except stage S-A0 (the census, counting only, section 8): the pure,
+host-tested `kmd_logic/src/rm_standard.rs` and its I/O half `kmd_render/src/ddi/std_census.rs`, called from
+`GetStandardAllocationDriverData` and `OpenAllocation`. The census was not built into a driver or run in a guest
+when it was written; nothing of S-A, S-B or S-C exists.
 
 Evidence rules. "Read" is `file:line` in this tree. "Branch" is read from another branch, named, and not part of
 this tree (`feat/dwm-on-nvk`, `feat/umd-nvk-combined`, `feat/rm-export-map-blob`, the Mesa worktree `mesa-nvk-s6`,
@@ -21,6 +22,11 @@ directory.
 > not on DWM's critical path: what matters for the NVK desktop is the shell processes moving to NVK with A8
 > resource ids (v321 shared formats) and the existing 32 bpp ids. Nothing below is scheduled; it stays as the
 > design to pick up if a census on another workload shows KMD-made STANDARD opens.
+>
+> **S-A0 is implemented** (`kmd/std-census`; counters only, no behaviour change; section 8, "S-A0 as built") to
+> answer the census for the workload T1/T2 did not cover: a windowed legacy-blt D3D11 app under an NVK DWM, whose Blt
+> destination is a KMD standard buffer. Does DWM open that allocation, and which slot is it? Everything else stays
+> parked.
 
 ## 0. The answer in ten lines
 
@@ -411,6 +417,40 @@ All counters are REG_DWORD values of the service key, at most 14 characters, wri
   1.6; and which types DWM opens (`FgOpen` does not count them today: add one `StdOpenN` total at
   `dxgkddi_open_allocation`, and log the slot).
 
+#### S-A0 as built
+
+`kmd_render/src/ddi/std_census.rs` (the I/O half; tables and the name scan in `kmd_logic/src/rm_standard.rs`:
+`hist_slot`, `hist_name`, `hist_open_name`, `hist_slot_from_misc`, `census_mib`, `CENSUS_COUNTERS`). Two call
+sites, both PASSIVE DDIs, counting only: `GetStandardAllocationDriverData` phase 2 after its last refusal arm
+(`note_request(std, gdi, size)`), and `OpenAllocation` after the open is registered with the producer table, for an
+identity of kind STANDARD (`note_open(meta.misc_flags)`; a refused open is not counted). All values are zeroed at
+every StartDevice (`start_generation_mirrors`). Registry writes happen at every event: both rates are low (window
+and swap-chain creation, DWM opens), and the entry already wrote four values per call.
+
+Slots, in order 0 to 13: Primary, Shadow, Staging, Gdi0 (`INVALID`), GdiTex (`TEXTURE`, GPU-only), GdiStgCpu
+(`STAGING_CPUVISIBLE`), GdiStg, GdiLut, GdiSys (`EXISTINGSYSMEM`), GdiTexCpu (`TEXTURE_CPUVISIBLE`), GdiTexXa
+(`TEXTURE_CROSSADAPTER`), GdiTexCXa (`TEXTURE_CPUVISIBLE_CROSSADAPTER`), GdiOther (GDI type above 8), Other.
+
+| value | meaning |
+|---|---|
+| `StdN<slot>` (`StdNPrimary` .. `StdNOther`) | phase-2 requests of that slot |
+| `StdBytesMiB` | cumulative size of the requests, MiB (each rounded up; the private data's `size`, i.e. `linear_blob_size` for a pitched buffer, `w*h*4` for the GDI texture) |
+| `StdMaxMiB` | the largest single request, MiB |
+| `StdMkPid` | the process id current at the last request |
+| `StdO<slot>` (`StdOPrimary` .. `StdOOther`) | registered opens of a KMD-made standard allocation of that slot (the slot is recovered from the meta's `misc` bits 24..27 and 20..23) |
+| `StdOpenN` | the non-primary ones of those (the CPU-visible and GDI surfaces) |
+| `StdOpenSlot` | the slot (0 to 13) of the last non-primary open |
+| `StdOpenPid` | the process id of the last non-primary opener |
+
+How to read them for the windowed legacy-blt question: zero the run (restart the adapter), start the NVK DWM, note
+`dwm.exe`'s pid, then start one windowed legacy-blt D3D11 app and note its pid. The `StdN*` that grew when the app's
+window appeared is the slot of its redirection surface (expected: one of the cross-adapter GDI slots or Shadow;
+`StdMkPid` says whose request it was). If `StdOpenN` grows at the same time and `StdOpenPid` is DWM's pid, DWM opens
+the KMD standard buffer and `StdOpenSlot` / the grown `StdO*` name its slot: S-A (route D) is then on DWM's path for
+these apps. If `StdOpenN` stays still (or `StdOpenPid` is the app's own pid, the creator's device open), DWM does not
+open it and the windowed legacy-blt black window has another cause. Not counted: whether the opener is the creating
+process (the identity records no creator for these; compare the two pids by hand).
+
 ### S-A: make the existing Venus standard buffers importable (route D)
 
 * Scope: section 6. Knob `KmdRmStd` = 1 (R, S-B, adds the value 2).
@@ -516,6 +556,12 @@ the 128 / 256 disagreement at every width 1 to 2048; the order of the refusals; 
 names (distinct, at most 14 bytes). Nothing else was built or run; `kmd_render` and `protocol` are untouched (the
 protocol crate was not re-tested). Every line number above was read in this tree on `8aba6f4`; branch citations were
 read through `git show` and not built.
+
+S-A0 (`kmd/std-census`): `cargo test --offline` in a scratch copy of `kmd_logic` with a sibling copy of
+`kmd_render/src` and `HELIOS_REQUIRE_NAME_SCAN=1`: 1215 pass, 18 of them `rm_standard`'s (the four new ones: open names
+mirror the request names, the slot from `misc`, `census_mib`, and the name scan that holds `ddi/std_census.rs` to
+`CENSUS_COUNTERS` and every census name to one writer and no collision); the protocol crate's 38 pass. `kmd_render`
+was not compiled (no WDK here); its two call sites and `std_census.rs` were checked by reading the neighbouring code.
 
 **Not verified by anything:** every statement about the host's behaviour (msg 31 on a host-visible Venus blob, RM
 sysmem create and map), NVK's behaviour (stride, import), dxgkrnl's two-phase standard allocation protocol, the UMD
