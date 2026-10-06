@@ -128,6 +128,11 @@ pub static NVRM_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// Live mappings made, and their failures. Published as `NvMap`, `NvMapErr`.
 pub static NVRM_MAPS: AtomicU32 = AtomicU32::new(0);
 pub static NVRM_MAP_ERRORS: AtomicU32 = AtomicU32::new(0);
+/// Bytes currently mapped through MMAP, all owners (`NvMapMb`, in MiB). Refreshed
+/// under the table lock at every change.
+pub static NVRM_MAP_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// MMAPs refused by the per-device byte quota (`NvMapQRef`).
+pub static NVRM_MAP_QUOTA_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// Pins made, pins released, pin failures. `NvPin - NvUnpin` is what is locked
 /// now; a count that only grows is a leak. Published as `NvPin`, `NvUnpin`,
 /// `NvPinErr`.
@@ -939,6 +944,15 @@ pub fn host_mmap(
         .with_virtio(|v| v.nvrm_map_count(owner) < super::gpu::MAX_NVRM_MAPS_PER_OWNER)
         .unwrap_or(false);
     if !quota_ok {
+        return Err(MapRefusal::NoResources);
+    }
+    // The byte quota (a quarter of the RM window per device), before the host is
+    // asked to map anything. The UVM aperture is exempt.
+    let bytes_ok = adapter
+        .with_virtio(|v| v.nvrm_map_bytes_room(owner, device_type == 256, size))
+        .unwrap_or(false);
+    if !bytes_ok {
+        NVRM_MAP_QUOTA_REFUSED.fetch_add(1, Ordering::Relaxed);
         return Err(MapRefusal::NoResources);
     }
 

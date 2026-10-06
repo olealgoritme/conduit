@@ -69,6 +69,11 @@ pub(super) struct NvrmMapSlot {
     handle: u32,
     kmd_id: u32,
     host_id: u32,
+    /// Bytes mapped (the request's size, page multiple).
+    size: u64,
+    /// Whether it is a view of the UVM aperture (region 2) rather than the RM
+    /// window (region 1): only the window is subject to the byte quota.
+    uvm: bool,
 }
 
 /// One pin: user pages locked for an OS-descriptor registration, and the
@@ -359,8 +364,20 @@ impl VirtioGpu {
     /// reused the number), or the table or `owner`'s quota is full, or ids ran out.
     /// Checked and pushed under one lock hold, so a mapping can never be recorded
     /// against a handle that is gone.
-    pub fn push_nvrm_map(&mut self, owner: DeviceOwner, handle: u32, host_id: u32) -> Option<u32> {
+    pub fn push_nvrm_map(
+        &mut self,
+        owner: DeviceOwner,
+        handle: u32,
+        host_id: u32,
+        size: u64,
+        uvm: bool,
+    ) -> Option<u32> {
         if !self.nvrm_handle_owned(owner, handle) {
+            return None;
+        }
+        // Re-checked here under the same hold as the push (the pre-check in
+        // `nvrm_map_bytes_room` ran before the host round trip).
+        if !self.nvrm_map_bytes_room(owner, uvm, size) {
             return None;
         }
         let mine = self.nvrm_maps.iter().filter(|s| s.owner == owner).count();
@@ -376,8 +393,41 @@ impl VirtioGpu {
             handle,
             kmd_id,
             host_id,
+            size,
+            uvm,
         });
+        self.refresh_map_gauge();
         Some(kmd_id)
+    }
+
+    /// The per-device byte quota for views of the RM window: a quarter of the window
+    /// (read from the device at init, not assumed), so one process cannot starve the
+    /// others of window space. 0 with no window.
+    pub fn nvrm_map_byte_quota(&self) -> u64 {
+        self.nvrm_window.map_or(0, |w| w.len / 4)
+    }
+
+    /// Whether `owner` may map `size` more bytes: always for the UVM aperture (it has
+    /// its own region and the host sizes it), else within [`Self::nvrm_map_byte_quota`].
+    pub fn nvrm_map_bytes_room(&self, owner: DeviceOwner, uvm: bool, size: u64) -> bool {
+        if uvm {
+            return true;
+        }
+        let mine: u64 = self
+            .nvrm_maps
+            .iter()
+            .filter(|s| s.owner == owner && !s.uvm)
+            .fold(0u64, |a, s| a.saturating_add(s.size));
+        mine.saturating_add(size) <= self.nvrm_map_byte_quota()
+    }
+
+    /// Publish the bytes currently mapped, all owners (`NvMapMb`).
+    fn refresh_map_gauge(&self) {
+        let total = self
+            .nvrm_maps
+            .iter()
+            .fold(0u64, |a, s| a.saturating_add(s.size));
+        crate::virtio::nvrm::NVRM_MAP_BYTES.store(total, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether a live mapping already carries this nonzero host id on `handle`.
@@ -399,6 +449,7 @@ impl VirtioGpu {
             .iter()
             .position(|s| s.owner == owner && s.kmd_id == kmd_id)?;
         let s = self.nvrm_maps.swap_remove(idx);
+        self.refresh_map_gauge();
         Some((s.handle, s.host_id))
     }
 
@@ -414,6 +465,7 @@ impl VirtioGpu {
             .iter()
             .position(|s| s.owner == owner && s.handle == handle)?;
         let s = self.nvrm_maps.swap_remove(idx);
+        self.refresh_map_gauge();
         Some((s.kmd_id, s.host_id))
     }
 
@@ -422,6 +474,7 @@ impl VirtioGpu {
     pub fn take_nvrm_map_for_owner(&mut self, owner: DeviceOwner) -> Option<(u32, u32, u32)> {
         let idx = self.nvrm_maps.iter().position(|s| s.owner == owner)?;
         let s = self.nvrm_maps.swap_remove(idx);
+        self.refresh_map_gauge();
         Some((s.handle, s.kmd_id, s.host_id))
     }
 
@@ -429,6 +482,7 @@ impl VirtioGpu {
     /// handle and host id.
     pub fn take_nvrm_map_any(&mut self) -> Option<(u32, u32)> {
         let s = self.nvrm_maps.pop()?;
+        self.refresh_map_gauge();
         Some((s.handle, s.host_id))
     }
 
