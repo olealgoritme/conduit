@@ -8013,11 +8013,15 @@ impl Drop for VirtioGpu {
         // waiters (a process blocked on one must give up and see the loss), then
         // drop the references. PASSIVE, outside the device lock.
         self.teardown_nvrm_events();
-        // Pins, handle and mapping records the owners did not release before the
-        // transport went (StopDevice ahead of their DestroyDevice): the device was
-        // reset above, so the host holds no alias of a pinned page and the pages
-        // may be unlocked (user pages left locked bugcheck their process at exit).
-        // Nothing is sent to the host: there is no host to send to.
+        // FALLBACK sweep of the pins, handle and mapping records still tracked
+        // (the normal path, `nvrm::retire_transport`, already closed every handle
+        // on the host and emptied these while the transport was alive; what is
+        // left here is a transport that had failed, was never asked, or that
+        // something re-populated since). Nothing is sent to the host: the reset
+        // above does not make it drop its RM files (its backend resets only at
+        // the next feature negotiation), so this CANNOT promise the host let go of
+        // a pinned page; it unlocks them anyway because user pages left locked
+        // bugcheck their process at exit.
         self.teardown_nvrm_state();
 
         // The reset above quiesced the device before the in-flight/parked entry

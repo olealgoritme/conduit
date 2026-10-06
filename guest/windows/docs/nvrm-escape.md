@@ -480,9 +480,30 @@ after the device's user mappings were drained in the owning process:
 exit (`close_all_for_owner` then sends nothing to a transport that has already failed, but
 still clears the tables and unlocks the pins).
 
-When the transport object is dropped (`StopDevice`, `set_virtio(None)`) the device is reset
-first, and then `VirtioGpu::drop` releases what the owners did not, without sending anything
-(there is no host to send to):
+**Device reset does NOT make the host drop anything.** The host backend keeps its RM files,
+registrations (and with them its alias of every OS-descriptor page) across a guest device
+reset: QEMU's generic vhost-user device never sends `RESET_DEVICE`, and the backend resets
+only at its next feature negotiation, i.e. the next `StartDevice`. Between the reset and
+then the host may still hold, and the GPU still write, a page the guest has unlocked. So
+the guest never unlocks pinned pages on the strength of a reset; it unlocks them after the
+host closed the files that hold them.
+
+**Retiring the transport** (`StopDevice`, and `StartDevice` when it finds a transport no
+stop retired; both go through `nvrm::retire_transport`; `RemoveDevice` without a stop runs
+the first step too). While the transport is still alive:
+
+1. `nvrm::close_all_on_host`, for ALL owners at once: host `Munmap` for every mapping, host
+   `Close` (5 s) for every handle left open (fence handles counted in `NvFenceCl`), then
+   every pin is unlocked. Best effort and bounded: it stops sending after the first
+   timeout or failed send, or after 10 s in total, and keeps clearing the tables. A
+   transport that has already failed (`transport_failed()`) or is absent is not asked, and
+   this step does nothing.
+2. `set_virtio(None)`: the transport is dropped, the device reset, and `VirtioGpu::drop`
+   releases what is left, without sending anything (fallback, see below).
+3. The user views of the dropped transport's mappings are marked stale (below).
+
+**Fallback sweep** (`VirtioGpu::drop`, for a transport that failed, was never asked, or was
+re-populated by a call racing the sweep). The device is reset first, then:
 
 1. event registrations are signalled once more and dereferenced (PASSIVE);
 2. every pin is unlocked (`NvrmPin`'s `Drop` is the unlock, so a pin cannot leave the tables
@@ -490,30 +511,38 @@ first, and then `VirtioGpu::drop` releases what the owners did not, without send
    `MmUnlockPages` on such an MDL does not need the owning process (the same helper,
    `helios_unlock_system_buffer`, already runs from `close_all_for_owner` in whatever
    context the destroy arrives in). User pages left locked would bugcheck the owning process
-   at exit (0x76);
-3. the handle and host-mapping records are dropped; `NvSwept` counts the entries 1-3 found
-   (0 when dxgkrnl destroyed every device first).
+   at exit (0x76). Here the host was NOT asked to let go, so this is the one place a page
+   can be unlocked while a (wedged or dead) host still holds it; it is accepted because the
+   alternative is the bugcheck, and the host side is gone or not answering;
+3. the handle and host-mapping records are dropped (fence handles counted in `NvFenceCl`);
+   `NvSwept` counts the entries 2-3 found (0 when the live sweep, or dxgkrnl destroying every
+   device first, emptied the tables).
 
-That is idempotent against `DestroyDevice` -> `close_all_for_owner`: both take entries out of
-the same tables under the virtio lock, so whichever runs first releases them and the other
-finds nothing (after the drop `with_virtio` fails and the per-device path does nothing).
+All of this is idempotent against `DestroyDevice` -> `close_all_for_owner`: they take
+entries out of the same tables under the virtio lock, so whichever runs first releases them
+and the others find nothing (after the drop `with_virtio` fails and the per-device path does
+nothing).
 
 **User views of a stopped transport.** The views made by `MMAP` live in
 `AdapterContext::mappings`, which deliberately outlives the transport (as blob views do): a
 user view can only be unmapped inside the process that made it, and `StopDevice` is not that
 process. After the drop they point at BAR memory the host no longer backs for them, and the
-next transport may hand the same window offsets to another process. So `StopDevice` marks
+next transport may hand the same window offsets to another process. So retiring the transport marks
 them stale (`MappingTable::mark_nvrm_views_stale`, `NvStale`, taken AFTER the drop so no older
 id can still be minted), and the owner's NEXT `HELIOS_ESCAPE_NVRM` call of any op unmaps its
 own stale views first, in its own process (`nvrm::reclaim_stale_views`, `NvStaleUn`): a process
 that touches one afterwards takes an access violation instead of reading someone else's
 memory. A process that never calls again keeps them until its `DestroyDevice` drain, which
-takes every view regardless of the transport, as it always did. A `MUNMAP` of such an id
-answers `NOT_OWNED` (the escape-entry sweep already removed the view). Because the views
-outlive the transport, mapping ids come from one driver-wide counter, so a new transport can
-never mint an id an old view still holds. Residual: an `MMAP` that is between its own table
-push and its view insert while `StopDevice` runs can leave one view unmarked until
-`DestroyDevice`.
+takes every view regardless of the transport, as it always did, and does not slow anyone
+else down: the "anything to reclaim" test is per owner (`helios_kmd_logic::nvrm_views::
+StaleOwners`, up to 16 owners exactly, then conservative until the next locked scan repairs
+it), so a process with nothing stale pays a few atomic loads whatever the others hold. A
+`MUNMAP` of such an id answers `NOT_OWNED` (the escape-entry sweep already removed the
+view). Because the views outlive the transport, mapping ids come from one driver-wide
+counter, so a new transport can never mint an id an old view still holds. An `MMAP` caught
+between its table push and its view insert while the transport is retired is marked by the
+insert itself (`MappingTable::insert_unique` sees an id below the stale line and flags its
+owner), so its next call reclaims it.
 
 A new transport starts with empty tables and a new `epoch`.
 
@@ -554,11 +583,11 @@ change a shape counter) before reading, or compare after the process has exited.
 | `NvEvOther` | queue messages other than `EventReady` | **0** (nonzero means the host sent e.g. `InputEvent`) |
 | `NvEvErr` | event-queue faults: a buffer that would not repost, a bad token, **or a `REGISTER` whose `event_handle` did not resolve** | **0** |
 | `NvFence` | fence handles recorded as owned (section 4.6) | moves with `SEMSURF_FENCE_CREATE`s |
-| `NvFenceCl` | fence handles released: a successful or timed-out `Close`, plus device-destroy closes (unlike `NvClose`) | `NvFence - NvFenceCl` is the fences open now; **equal** when no client runs |
+| `NvFenceCl` | fence handles released: a successful or timed-out `Close`, plus device-destroy closes and transport sweeps (live or fallback; unlike `NvClose`) | `NvFence - NvFenceCl` is the fences open now; **equal** when no client runs |
 | `NvFenceSig` | `EventReady`s for fence handles (one per fire), including the early ones | at most `NvFence` |
 | `NvFenceEarly` | fires that arrived before their handle was recorded and were latched at record time (also counted in `NvFenceSig` and `NvEvLatch`) | small; nonzero only when the semaphore was already reached |
 | `NvFenceErr` | a create the host answered with status 0 whose reply could not be recorded (short or bad reply, duplicate handle), or a notification lost to a full early table | **0** |
-| `NvSwept` | handles, mappings and pins still tracked when a transport was dropped (`StopDevice`), cumulative | **0** when dxgkrnl destroys every device first; nonzero means the sweep did the owners' work |
+| `NvSwept` | handles, mappings and pins still tracked when the transport was dropped, AFTER the live host-close sweep (so only what a failed transport, a wedged host or a racing call left), cumulative | **0** when dxgkrnl destroys every device first; nonzero means the sweep did the owners' work |
 | `NvStale` | user views of a dropped transport that `StopDevice` marked stale, cumulative | usually 0 |
 | `NvStaleUn` | of those, how many owners' next NVRM escape unmapped | follows `NvStale`; the rest is reclaimed by `DestroyDevice` |
 | `NvWinMb`, `NvAptMb` | size in MiB of shared-memory region 1 (RM window) and 2 (UVM aperture), written at init | nonzero, or `MMAP` answers `UNSUPPORTED` |
@@ -694,6 +723,10 @@ For orientation, from `src/transport_windows.c` on `feat/nvk-rm-windows-transpor
   `StopDevice` thread) is accepted by the memory manager. It is the documented behaviour of
   that routine (the MDL records the locking process) and the same helper is already relied on
   from `DestroyDevice`, but it was not run.
+- Anything about the retire sweep on a real host: the order (Munmap, Close, then unlock), the
+  10 s / first-failure bound and the stale-owner set were read and (for the pure set) unit
+  tested, not run. Not covered: a call racing the sweep that opens or pins after it has
+  passed (the fallback unlocks that pin without a host close).
 - That, when a process crashes, `DestroyDevice` runs in a context where unmapping the user
   views is valid; the code comments assume the creating process.
 - That `D3DKMTEscape` from a non-console SSH session works for the smoke programs.
