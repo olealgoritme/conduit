@@ -1322,6 +1322,7 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     std::uint32_t foreign_offset) const {
   if (!impl || !impl->d3d11 || !global || !renderer_resource_id || !width || !height)
     return 0;
+  bool nvk_blank = false;
   if (impl->backend != helios_bridge::IcdBackend::Venus) {
     // NVK opens another NVK process's surface (a foreign resource: the KMD's
     // layout trailer) by resource id (shared-surfaces.md, NVK patch 0031,
@@ -1331,7 +1332,15 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     const bool nvk_can_open = foreign
       && (impl->icd.caps & HELIOS_ICD_CAP_SHARED_IMPORT) != 0
       && !scanout_linear && !linear_scanout_target && !source_image_create_info;
-    if (!nvk_can_open) {
+    // DWM on NVK (DwmIcd=nvk, docs/dwm-on-nvk.md): a failed open of a window's
+    // surface takes DWM down (dwmcore 0x8898008d), and every Venus app's and
+    // every KMD-made (GDI, cursor) surface is one NVK cannot import yet. DWM
+    // gets a blank texture of the same size instead: that window composes
+    // black, the desktop stays up. Any other NVK process still sees the open
+    // fail.
+    if (!nvk_can_open && helios_bridge::is_dwm_process()) {
+      nvk_blank = true;
+    } else if (!nvk_can_open) {
       static std::atomic<std::uint32_t> s_nvkOpen{0};
       const std::uint32_t n = s_nvkOpen.fetch_add(1, std::memory_order_relaxed) + 1;
       if (n <= 8 || (n % 512u) == 0) {
@@ -1366,8 +1375,8 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       // Hand back an ordinary blank texture of the same size instead: the
       // window composes black, and the NVK app shows its frames on scanout 0
       // as designed (NvkPresent auto picks scanout without ForeignImport).
-      if (foreign && impl->backend == helios_bridge::IcdBackend::Venus
-          && !dxvk::heliosForeignImport()) {
+      if (nvk_blank || (foreign && impl->backend == helios_bridge::IcdBackend::Venus
+          && !dxvk::heliosForeignImport())) {
         D3D11_TEXTURE2D_DESC td = { };
         td.Width = width;
         td.Height = height;
@@ -1389,10 +1398,12 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
         static std::atomic<std::uint32_t> s_placeholders{0};
         const std::uint32_t n = s_placeholders.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 8 || (n % 512u) == 0) {
-          char msg[200];
+          char msg[240];
           std::snprintf(msg, sizeof(msg),
-            "OpenDdiTexture2D foreign res_id=%u %ux%u with ForeignImport off: blank placeholder hr=0x%08lx (x%u)",
-            renderer_resource_id, width, height, static_cast<unsigned long>(phr), n);
+            nvk_blank
+              ? "OpenDdiTexture2D res_id=%u %ux%u (foreign=%d) on NVK DWM, not importable: blank placeholder hr=0x%08lx (x%u)"
+              : "OpenDdiTexture2D foreign res_id=%u %ux%u (foreign=%d) with ForeignImport off: blank placeholder hr=0x%08lx (x%u)",
+            renderer_resource_id, width, height, int(foreign), static_cast<unsigned long>(phr), n);
           umd_log(msg);
         }
         return (SUCCEEDED(phr) && res) ? reinterpret_cast<std::size_t>(res) : std::size_t(0);

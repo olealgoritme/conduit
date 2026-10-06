@@ -119,6 +119,67 @@ bool denied(const char* exe, const char** why) {
   return false;
 }
 
+// DwmIcd=nvk crash-loop guard (docs/dwm-on-nvk.md, "Failure safety"). Windows
+// restarts a DWM that dies; a DWM that dies on NVK at every start would leave
+// the desktop black and, after a few rounds, make Windows give up on the
+// display. %ProgramData%\Helios\dwm-nvk-starts.txt keeps the FILETIMEs of the
+// recent DWM starts that chose NVK, one per line. When DwmNvkMaxStarts
+// (REG_DWORD, default 2, 0 = no guard) of them fall inside the last
+// DwmNvkGuardSeconds (default 600) this start goes to Venus and is not
+// recorded, so NVK is tried again once the window has passed. A DWM that
+// stays up never starts again, so a healthy session never trips it; a test
+// that restarts DWM by hand more often than that sees Venus (delete the file
+// or raise the knob).
+bool dwm_nvk_guard_allows(const char** why) {
+  DWORD max_starts = 2;
+  reg_dword("DwmNvkMaxStarts", &max_starts);
+  if (max_starts == 0)
+    return true;
+  DWORD window_s = 600;
+  reg_dword("DwmNvkGuardSeconds", &window_s);
+  char dir[MAX_PATH];
+  const DWORD n = GetEnvironmentVariableA("ProgramData", dir, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH - 40)
+    std::snprintf(dir, sizeof(dir), "C:\\ProgramData");
+  char path[MAX_PATH];
+  std::snprintf(path, sizeof(path), "%s\\Helios\\dwm-nvk-starts.txt", dir);
+
+  FILETIME ft;
+  GetSystemTimeAsFileTime(&ft);
+  const unsigned long long now =
+      (static_cast<unsigned long long>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+  const unsigned long long window = static_cast<unsigned long long>(window_s) * 10000000ull;
+
+  unsigned long long kept[16];
+  std::size_t count = 0;
+  if (FILE* f = std::fopen(path, "r")) {
+    unsigned long long t = 0;
+    while (count < 15 && std::fscanf(f, "%llu", &t) == 1) {
+      if (t <= now && now - t < window)
+        kept[count++] = t;
+    }
+    std::fclose(f);
+  }
+  if (count >= max_starts) {
+    static char reason[192];
+    std::snprintf(reason, sizeof(reason),
+                  "DwmIcd=nvk, but %u DWM starts on NVK in the last %u s (crash-loop guard, "
+                  "DwmNvkMaxStarts=%u): Venus",
+                  unsigned(count), unsigned(window_s), unsigned(max_starts));
+    *why = reason;
+    return false;
+  }
+  kept[count++] = now;
+  if (FILE* f = std::fopen(path, "w")) {
+    for (std::size_t i = 0; i < count; i++)
+      std::fprintf(f, "%llu\n", kept[i]);
+    std::fclose(f);
+  } else {
+    umd_log("icd backend: DwmIcd=nvk crash-loop guard cannot write its file; NVK unguarded");
+  }
+  return true;
+}
+
 bool file_exists(const wchar_t* path) {
   const DWORD a = GetFileAttributesW(path);
   return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
@@ -225,6 +286,26 @@ IcdBackendChoice decide() {
     }
     if (std::strcmp(forced, "nvk") == 0)
       force_nvk = true;
+  }
+
+  // DWM's own lever (docs/dwm-on-nvk.md): HKLM\SOFTWARE\Helios!DwmIcd = nvk
+  // puts dwm.exe on NVK whatever Icd and the deny-lists say; venus or absent
+  // (the default) leaves DWM to the rules below, which keep it on Venus. Read
+  // only in dwm.exe, and only while the crash-loop guard allows it.
+  if (!force_nvk && std::strcmp(c.exe, "dwm.exe") == 0) {
+    char dwm[16];
+    if (reg_sz("DwmIcd", dwm, sizeof(dwm))) {
+      lower_ascii(dwm);
+      if (std::strcmp(dwm, "nvk") == 0) {
+        const char* why = nullptr;
+        if (!dwm_nvk_guard_allows(&why)) {
+          c.reason = why;
+          return c;
+        }
+        force_nvk = true;
+        c.reason = "HKLM\\SOFTWARE\\Helios!DwmIcd=nvk";
+      }
+    }
   }
 
   if (!force_nvk) {
@@ -338,6 +419,10 @@ const IcdBackendChoice& icd_backend_choice() {
     umd_log(msg);
   });
   return g_choice;
+}
+
+bool is_dwm_process() {
+  return std::strcmp(icd_backend_choice().exe, "dwm.exe") == 0;
 }
 
 IcdBackend effective_icd_backend() {
