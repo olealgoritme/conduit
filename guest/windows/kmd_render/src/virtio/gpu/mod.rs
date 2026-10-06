@@ -5209,7 +5209,7 @@ impl VirtioGpu {
                                         .store(notify.primary_address, Ordering::Release);
                                     // `FlipPub`: this DPC stores through the pointer, not
                                     // through `publish_displayed_primary`.
-                                    crate::ddi::stall_diag::note_published();
+                                    crate::ddi::stall_diag::note_published(notify.primary_address);
                                     notify.pending.as_ref().store(1, Ordering::Release);
                                 } else if notify.keep_on_failure
                                     && notify.primary_address != 0
@@ -5224,7 +5224,7 @@ impl VirtioGpu {
                                         .displayed_primary
                                         .as_ref()
                                         .store(notify.primary_address, Ordering::Release);
-                                    crate::ddi::stall_diag::note_published();
+                                    crate::ddi::stall_diag::note_published(notify.primary_address);
                                     crate::ddi::flip_keep::count(
                                         helios_kmd_logic::flip_completion::KeepWhy::AsyncCopyFailed,
                                         crate::ddi::flip_keep::Lane::Async,

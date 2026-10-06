@@ -652,6 +652,9 @@ impl AdapterContext {
             crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::REFRESH_LOCKED);
             self.queue_active_scanout_refresh_locked(lock)
         });
+        // The mutex is free again: the pacing snapshot below must not run under a site that
+        // says it is held.
+        crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::REFRESH_POST);
         // R318: the pacing snapshot runs OUTSIDE `scanout_mutex`. It used to run
         // inside it — 32 synchronous registry transactions every 16 queued
         // refreshes, roughly 3.75 bursts per second at 60 Hz, on the PASSIVE

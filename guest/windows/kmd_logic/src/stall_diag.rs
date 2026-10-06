@@ -63,9 +63,15 @@ pub mod site {
     pub const DEFERRED_LOCKED: u32 = 16;
     /// Inside `queue_active_scanout_refresh` with the scanout mutex held (id 14 is waiting for it).
     pub const REFRESH_LOCKED: u32 = 17;
+    /// `process_deferred_vidpn_source_address` AFTER the scanout mutex was released: the `VpDSt`
+    /// registry write.
+    pub const DEFERRED_POST: u32 = 18;
+    /// `queue_active_scanout_refresh` AFTER the scanout mutex was released: the pacing snapshot
+    /// (about 40 registry writes).
+    pub const REFRESH_POST: u32 = 19;
 
     /// Every id with its name, for the doc and the host tests.
-    pub const ALL: [(u32, &str); 18] = [
+    pub const ALL: [(u32, &str); 20] = [
         (NONE, "none"),
         (WAIT, "wait"),
         (START_WAIT, "start_wait"),
@@ -87,6 +93,14 @@ pub mod site {
             "process_deferred_vidpn_source_address (mutex held)",
         ),
         (REFRESH_LOCKED, "queue_active_scanout_refresh (mutex held)"),
+        (
+            DEFERRED_POST,
+            "process_deferred_vidpn_source_address (mutex released)",
+        ),
+        (
+            REFRESH_POST,
+            "queue_active_scanout_refresh (mutex released)",
+        ),
     ];
 }
 
@@ -101,20 +115,22 @@ pub mod site {
 ///   `FlipPub`: publications of a displayed address (bound or kept, any class). `FlipPubT`: when.
 /// * `VsPendN`, `VsPendMax`: consecutive vsync ticks with a pending programming (handle in the
 ///   slot, or the programming gate raised), and the longest run this generation.
-/// * `ScLkN`, `ScLkAcqT`, `ScLkRelT`: acquisitions of the scanout mutex and the interrupt time of
-///   the last acquisition and release; held now when `ScLkAcqT` is later than `ScLkRelT`.
+/// * `ScLkN`, `ScLkRelN`, `ScLkAcqT`, `ScLkRelT`: acquisitions and releases of the scanout mutex
+///   (held now when they differ, [`lock_held`]) and the interrupt time of the last acquisition
+///   and release.
 /// * `StartN`, `StartT`: StartDevice generation count (since the image loaded) and its time.
 /// * `FlipWd`, `FlipWdT`, `FlipWdBig`: watchdog publications, the time of the last, and flips it
 ///   could not record (an address above 2^40).
 /// * `StallT`: interrupt time (ms) of the publication of this block: the "now" of every age.
 /// * `FlWdMsEff`, `DefBudEff`: the `FlipWdogMs` and `DeferBudget` knobs in force (clamped, 0
 ///   included), written at every StartDevice.
-pub const COUNTERS: [&str; 20] = [
+pub const COUNTERS: [&str; 21] = [
     "HpdLoopN",
     "HpdLoopT",
     "HpdSite",
     "HpdSiteT",
     "ScLkN",
+    "ScLkRelN",
     "ScLkAcqT",
     "ScLkRelT",
     "FlipIss",
@@ -131,6 +147,77 @@ pub const COUNTERS: [&str; 20] = [
     "FlWdMsEff",
     "DefBudEff",
 ];
+
+// ---- the scanout mutex -----------------------------------------------------------------------
+
+/// Whether the scanout mutex is held, from the acquisition and release COUNTS (`ScLkN`,
+/// `ScLkRelN`). The mutex serializes its holders, so the counts alternate: they are equal when it
+/// is free and differ by one while held. Counts, not the millisecond stamps: an acquisition and a
+/// release in the same millisecond are indistinguishable by time, and the wrapping 32-bit counts
+/// compare exactly.
+pub const fn lock_held(acquired: u32, released: u32) -> bool {
+    acquired != released
+}
+
+// ---- does the worker look stuck? ----------------------------------------------------------
+
+/// A step the worker has been in for longer than this (and that is not the idle wait) looks stuck.
+pub const STUCK_SITE_MS: u32 = 1_000;
+/// A scanout mutex held for longer than this looks stuck.
+pub const STUCK_LOCK_MS: u32 = 1_000;
+/// A worker that has not woken for longer than this while work is pending looks stuck (a pending
+/// programming wakes it on every vsync tick, so a healthy worker's last wake is a few ticks old).
+pub const STUCK_LOOP_MS: u32 = 2_000;
+
+/// Milliseconds from `then` to `now` on the wrapping 32-bit interrupt-time clock. A `then` that
+/// is AHEAD of `now` (a stamp from before a reset, or read a hair after `now`) is age 0, never a
+/// 49-day age.
+pub const fn age_ms(now: u32, then: u32) -> u32 {
+    let d = now.wrapping_sub(then);
+    if d >= 0x8000_0000 {
+        0
+    } else {
+        d
+    }
+}
+
+/// What the escape thread can see of the worker, all from atomics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StuckInput {
+    /// Interrupt time now, ms.
+    pub now: u32,
+    /// `HpdSite` and `HpdSiteT`.
+    pub site: u32,
+    pub site_t: u32,
+    /// The scanout mutex is held ([`lock_held`]) and `ScLkAcqT`.
+    pub lock_held: bool,
+    pub lock_acq_t: u32,
+    /// `HpdLoopT`.
+    pub loop_t: u32,
+    /// A programming is pending (`pending_vidpn_allocation != 0` or the gate is raised).
+    pub work_pending: bool,
+}
+
+/// Whether the HPD worker LOOKS stuck, so that the escape thread should write the stall block
+/// (and otherwise write nothing: the registry is not free). Any of:
+/// * it is in a step other than the idle wait (and not "never ran" or "exited") for more than
+///   [`STUCK_SITE_MS`];
+/// * the scanout mutex has been held for more than [`STUCK_LOCK_MS`] (by anyone);
+/// * work is pending and it has not woken for more than [`STUCK_LOOP_MS`].
+///
+/// A healthy idle worker (asleep in `WAIT`, nothing pending, the mutex free) is never stuck, however
+/// old its stamps are. A false positive costs one block write per interval; a false negative is
+/// the instrument missing the stall, so the thresholds are short.
+pub const fn worker_looks_stuck(i: StuckInput) -> bool {
+    let in_step = i.site != site::WAIT && i.site != site::NONE && i.site != site::EXITED;
+    if in_step && age_ms(i.now, i.site_t) > STUCK_SITE_MS {
+        return true;
+    }
+    if i.lock_held && age_ms(i.now, i.lock_acq_t) > STUCK_LOCK_MS {
+        return true;
+    }
+    i.work_pending && age_ms(i.now, i.loop_t) > STUCK_LOOP_MS
+}
 
 // ---- knobs ---------------------------------------------------------------------------------
 
@@ -225,6 +312,37 @@ pub const fn flip_address(word: u64) -> u64 {
     word & FLIP_ADDR_MASK
 }
 
+/// The 24-bit flip number a packed word carries.
+pub const fn flip_seq(word: u64) -> u32 {
+    ((word >> FLIP_ADDR_BITS) as u32) & FLIP_SEQ_MASK
+}
+
+/// Whether flip number `a` is NEWER than `b` on the wrapping 24-bit numbering: strictly ahead by
+/// less than half the range. Equal is not newer.
+pub const fn seq_newer(a: u32, b: u32) -> bool {
+    let d = a.wrapping_sub(b) & FLIP_SEQ_MASK;
+    d != 0 && d < (FLIP_SEQ_MASK + 1) / 2
+}
+
+/// A publication of `published` happened: does it complete the recorded flip? When it names the
+/// newest recorded flip's address and that flip is newer than the last one done, the flip is done:
+/// returns its number, for the driver to store. Any publisher goes through this (the worker's
+/// bind, a kept publication of any lane, the ring-1 completion), so the watchdog can never later
+/// publish the address of a flip that something newer already replaced or completed. A
+/// publication of some other address (an older flip's programming finishing while a newer flip is
+/// recorded) completes nothing.
+pub const fn flip_done_by(published: u64, flip_word: u64, done_seq: u32) -> Option<u32> {
+    if flip_word == 0 || (published & FLIP_ADDR_MASK) != flip_address(flip_word) {
+        return None;
+    }
+    let seq = flip_seq(flip_word);
+    if seq_newer(seq, done_seq) {
+        Some(seq)
+    } else {
+        None
+    }
+}
+
 // ---- the vsync tick ------------------------------------------------------------------------
 
 /// What the vsync DPC remembers between ticks (a handful of atomics in the driver).
@@ -249,8 +367,10 @@ pub struct PendInput {
     pub pub_count: u32,
     /// The newest recorded flip ([`pack_flip`]), 0 for none.
     pub flip_word: u64,
-    /// The flip word the watchdog already published, 0 for none.
-    pub fired_word: u64,
+    /// The number of the newest flip that is DONE: published by anyone (the watchdog included).
+    /// The watchdog only ever publishes a flip newer than this, so it never publishes an older
+    /// address than what was displayed last, and never the same flip twice.
+    pub done_seq: u32,
     /// The watchdog interval in ticks ([`ticks_for_ms`]), 0 = off.
     pub limit_ticks: u32,
 }
@@ -260,16 +380,16 @@ pub struct PendInput {
 pub enum WdAction {
     /// Nothing.
     None,
-    /// Publish this address as the displayed one (a kept picture), and remember the flip word
-    /// as fired. Once per flip word.
+    /// Publish this address as the displayed one (a kept picture) and mark the flip done
+    /// ([`flip_seq`] of the word that was read). Once per flip.
     Publish(u64),
 }
 
 /// One vsync tick of bookkeeping: the pending run, its maximum, the no-publication clock, and the
 /// watchdog decision. Total, atomics-sized, no allocation: it runs in the DPC.
 ///
-/// The watchdog fires when it is on (`limit_ticks != 0`), a flip is recorded and not yet fired,
-/// and the pending run has gone MORE than `limit_ticks` ticks with no publication since (every
+/// The watchdog fires when it is on (`limit_ticks != 0`), a flip is recorded and NEWER than the
+/// last one done (`done_seq`), and the pending run has gone MORE than `limit_ticks` ticks with no publication since (every
 /// publication restarts the clock: a stream of flips that each publish is progress, however long
 /// the gate stays raised). After a publication by the watchdog the clock restarts, and the same
 /// flip is never published again.
@@ -295,7 +415,7 @@ pub const fn pend_step(s: PendState, i: PendInput) -> (PendState, WdAction) {
     if i.limit_ticks != 0
         && stall > i.limit_ticks
         && i.flip_word != 0
-        && i.flip_word != i.fired_word
+        && seq_newer(flip_seq(i.flip_word), i.done_seq)
     {
         let address = flip_address(i.flip_word);
         if address != 0 {
@@ -349,6 +469,41 @@ pub const fn defer_decide(attempts: u32, budget: u32) -> DeferDecision {
         DeferDecision::Exhausted
     } else {
         DeferDecision::Again
+    }
+}
+
+/// The Deferred budget's whole state: the handle being deferred and how many consecutive
+/// Deferred outcomes it has had. `EMPTY` (also `default()`) is "no count in progress".
+///
+/// The driver keeps these two words in atomics (`ddi/stall_diag.rs`) and calls [`Self::note`]
+/// for every Deferred outcome and clears the state at EVERY other outcome of the deferred
+/// wrapper (programmed, copy queued, superseded, a retryable refusal re-armed or given up, a
+/// permanent reject): the count is of CONSECUTIVE Deferred outcomes of one handle, so a later
+/// Deferred of the same handle never continues an old count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeferState {
+    pub handle: usize,
+    pub attempts: u32,
+}
+
+impl DeferState {
+    /// No count in progress.
+    pub const EMPTY: Self = Self {
+        handle: 0,
+        attempts: 0,
+    };
+
+    /// One more Deferred outcome for `handle` under `budget`. `budget` 0 (unlimited) touches
+    /// nothing. A different handle starts at 1; an `Exhausted` answer forgets the state.
+    pub const fn note(self, handle: usize, budget: u32) -> (Self, DeferDecision) {
+        if budget == 0 {
+            return (self, DeferDecision::Again);
+        }
+        let attempts = defer_attempts(self.handle, self.attempts, handle);
+        match defer_decide(attempts, budget) {
+            DeferDecision::Again => (Self { handle, attempts }, DeferDecision::Again),
+            DeferDecision::Exhausted => (Self::EMPTY, DeferDecision::Exhausted),
+        }
     }
 }
 
@@ -531,22 +686,22 @@ mod tests {
         let (s, acts) = run(PendState::default(), 500, |_| PendInput {
             pending: true,
             flip_word: w,
-            // The driver stores the fired word once it published.
-            fired_word: 0,
+            // The driver stores the flip as done once it published.
+            done_seq: 0,
             limit_ticks: limit,
             ..PendInput::default()
         });
         // Fires on the tick that EXCEEDS the interval (the clock reads limit + 1), and, because
-        // the test never stores the fired word, again each limit + 1 ticks: the driver's store of
-        // the fired word is what makes it once.
+        // the test never stores the done number, again each limit + 1 ticks: the driver's store of
+        // it is what makes it once.
         assert_eq!(acts[0], (limit + 1, WdAction::Publish(0x4000)));
         assert_eq!(acts[1].0, 2 * (limit + 1));
         assert!(s.pend == 500);
-        // With the fired word stored (what the driver does) it never repeats.
+        // With the done number stored (what the driver does) it never repeats.
         let (_, acts) = run(PendState::default(), 5_000, |_| PendInput {
             pending: true,
             flip_word: w,
-            fired_word: w,
+            done_seq: flip_seq(w),
             limit_ticks: limit,
             ..PendInput::default()
         });
@@ -622,7 +777,7 @@ mod tests {
             s = n;
         }
         // Stuck on w1 until it fires, then the driver stores it as fired.
-        let mut fired = 0u64;
+        let mut fired = 0u32;
         let mut fires = Vec::new();
         for _ in 0..40 {
             let (n, a) = pend_step(
@@ -630,14 +785,14 @@ mod tests {
                 PendInput {
                     pending: true,
                     flip_word: w1,
-                    fired_word: fired,
+                    done_seq: fired,
                     limit_ticks: limit,
                     ..Default::default()
                 },
             );
             s = n;
             if let WdAction::Publish(addr) = a {
-                fired = w1;
+                fired = flip_seq(w1);
                 fires.push(addr);
             }
         }
@@ -649,14 +804,14 @@ mod tests {
                 PendInput {
                     pending: true,
                     flip_word: w2,
-                    fired_word: fired,
+                    done_seq: fired,
                     limit_ticks: limit,
                     ..Default::default()
                 },
             );
             s = n;
             if let WdAction::Publish(addr) = a {
-                fired = w2;
+                fired = flip_seq(w2);
                 fires.push(addr);
             }
         }
@@ -694,7 +849,7 @@ mod tests {
         let w1 = word(1, 0x1000);
         let mut s = PendState::default();
         let mut pubs = 0u32;
-        let mut fired = 0u64;
+        let mut fired = 0u32;
         let mut fire_ticks = Vec::new();
         for t in 1..=200u32 {
             let flip = if t < 100 { w1 } else { word(2, 0x2000) };
@@ -704,13 +859,13 @@ mod tests {
                     pending: true,
                     pub_count: pubs,
                     flip_word: flip,
-                    fired_word: fired,
+                    done_seq: fired,
                     limit_ticks: limit,
                 },
             );
             s = n;
             if let WdAction::Publish(_) = a {
-                fired = flip;
+                fired = flip_seq(flip);
                 pubs += 1;
                 fire_ticks.push(t);
             }
@@ -720,6 +875,105 @@ mod tests {
         // The pipeline stayed stuck with no publication but the watchdog's own, so the clock had
         // long exceeded the interval when the newer flip appeared: that one fires at once.
         assert_eq!(fire_ticks[1], 100);
+    }
+
+    // ---- done numbers: a watchdog never publishes an older address ---------------------------
+
+    #[test]
+    fn sequence_order_wraps_in_24_bits() {
+        assert!(seq_newer(1, 0));
+        assert!(!seq_newer(0, 0));
+        assert!(!seq_newer(0, 1));
+        assert!(seq_newer(0, 0xFF_FFFF), "0 follows 0xFFFFFF");
+        assert!(!seq_newer(0xFF_FFFF, 0));
+        assert!(seq_newer(0x7F_FFFF, 0));
+        assert!(
+            !seq_newer(0x80_0000, 0),
+            "half the range ahead is not newer"
+        );
+        assert_eq!(flip_seq(word(0x12_3456, 0x1000)), 0x12_3456);
+        assert_eq!(flip_seq(0), 0);
+    }
+
+    #[test]
+    fn a_publication_of_the_recorded_address_completes_that_flip_only() {
+        let w = word(5, 0x4000);
+        assert_eq!(flip_done_by(0x4000, w, 4), Some(5));
+        assert_eq!(flip_done_by(0x4000, w, 5), None, "already done");
+        assert_eq!(flip_done_by(0x4000, w, 9), None, "something newer is done");
+        // Another address (an older flip's programming finishing): completes nothing.
+        assert_eq!(flip_done_by(0x3000, w, 0), None);
+        // Nothing recorded.
+        assert_eq!(flip_done_by(0x4000, 0, 0), None);
+        // A published address wider than the word carries compares on its low 40 bits only.
+        assert_eq!(flip_done_by((1 << 41) | 0x4000, w, 4), Some(5));
+    }
+
+    #[test]
+    fn the_watchdog_never_publishes_an_older_flip_than_one_already_done() {
+        // Flip 5 (address A) is stuck pending. Flip 6 (address B) is then issued and completed
+        // by a direct publisher (a keep: FkDdi, the DMA keep record, ForeignFlip): the word now
+        // names 6 and the publication marked it done. The pipeline stays stuck on flip 5's gate.
+        let limit = 10;
+        let w5 = word(5, 0xA000);
+        let w6 = word(6, 0xB000);
+        let mut done = 4u32;
+        let mut s = PendState::default();
+        let mut published = std::vec::Vec::new();
+        for t in 1..=200u32 {
+            let flip = if t < 5 { w5 } else { w6 };
+            if t == 5 {
+                // flip 6 published directly
+                done = flip_done_by(0xB000, w6, done).unwrap();
+                published.push(0xB000u64);
+            }
+            let (n, a) = pend_step(
+                s,
+                PendInput {
+                    pending: true,
+                    pub_count: if t < 5 { 0 } else { 1 },
+                    flip_word: flip,
+                    done_seq: done,
+                    limit_ticks: limit,
+                },
+            );
+            s = n;
+            if let WdAction::Publish(addr) = a {
+                published.push(addr);
+            }
+        }
+        assert_eq!(
+            published,
+            std::vec![0xB000],
+            "flip 5's address must never be published after flip 6's"
+        );
+    }
+
+    #[test]
+    fn an_older_flip_recorded_after_a_newer_one_done_is_never_published() {
+        // The numbers race: the older flip's record lands last (two issuing contexts).
+        let (w6, w5) = (word(6, 0xB000), word(5, 0xA000));
+        let (_, acts) = run(PendState::default(), 500, |_| PendInput {
+            pending: true,
+            flip_word: w5,
+            done_seq: flip_seq(w6),
+            limit_ticks: 5,
+            ..PendInput::default()
+        });
+        assert!(acts.is_empty());
+    }
+
+    #[test]
+    fn the_watchdog_fires_for_a_newer_flip_across_the_24_bit_wrap() {
+        let w = word(0, 0x4000); // 0 follows 0xFFFFFF
+        let (_, acts) = run(PendState::default(), 50, |_| PendInput {
+            pending: true,
+            flip_word: w,
+            done_seq: 0xFF_FFFF,
+            limit_ticks: 5,
+            ..PendInput::default()
+        });
+        assert_eq!(acts.len() >= 1, true);
     }
 
     // ---- the Deferred budget -------------------------------------------------------------
@@ -760,7 +1014,219 @@ mod tests {
         assert_eq!(again, budget);
     }
 
+    /// What the deferred wrapper does with the state, as a model: Deferred notes it, every
+    /// other outcome clears it.
+    #[derive(Clone, Copy)]
+    enum Outcome {
+        Deferred(usize),
+        /// Programmed, copy queued, superseded, a retryable refusal (re-armed or given up), a
+        /// permanent reject: anything but Deferred.
+        Other,
+    }
+
+    fn drive(budget: u32, outcomes: &[Outcome]) -> Vec<DeferDecision> {
+        let mut st = DeferState::EMPTY;
+        let mut out = Vec::new();
+        for o in outcomes {
+            match *o {
+                Outcome::Deferred(h) => {
+                    let (n, d) = st.note(h, budget);
+                    st = n;
+                    out.push(d);
+                }
+                Outcome::Other => st = DeferState::EMPTY,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_later_deferred_of_the_same_handle_does_not_continue_an_old_count() {
+        let budget = 20;
+        // 15 Deferred, a refusal in between (re-armed or given up), 15 more: no exhaustion; with
+        // the count continuing it would have run out at the 21st.
+        let mut seq = std::vec::Vec::new();
+        seq.extend(std::iter::repeat(Outcome::Deferred(7)).take(15));
+        seq.push(Outcome::Other);
+        seq.extend(std::iter::repeat(Outcome::Deferred(7)).take(15));
+        assert!(drive(budget, &seq)
+            .iter()
+            .all(|d| *d == DeferDecision::Again));
+        // Without the clear (the bug the follow-up fixes) the same sequence exhausts.
+        let mut st = DeferState::EMPTY;
+        let mut exhausted = false;
+        for _ in 0..30 {
+            let (n, d) = st.note(7, budget);
+            st = n;
+            exhausted |= d == DeferDecision::Exhausted;
+        }
+        assert!(exhausted);
+        // Consecutive Deferred of one handle exhaust after exactly the budget.
+        let run = drive(budget, &std::vec![Outcome::Deferred(7); 25]);
+        assert!(run[..20].iter().all(|d| *d == DeferDecision::Again));
+        assert_eq!(run[20], DeferDecision::Exhausted);
+        // ... and after exhaustion the state is empty: the next Deferred starts from 1.
+        assert_eq!(run[21], DeferDecision::Again);
+    }
+
+    #[test]
+    fn a_handle_change_restarts_the_count_and_the_old_one_does_not_come_back() {
+        let budget = 16;
+        let mut seq = std::vec::Vec::new();
+        seq.extend(std::iter::repeat(Outcome::Deferred(1)).take(10));
+        seq.extend(std::iter::repeat(Outcome::Deferred(2)).take(10));
+        // Back to handle 1: 10 more. Neither handle ever has 16 in a row.
+        seq.extend(std::iter::repeat(Outcome::Deferred(1)).take(10));
+        assert!(drive(budget, &seq)
+            .iter()
+            .all(|d| *d == DeferDecision::Again));
+    }
+
+    #[test]
+    fn budget_zero_never_changes_the_state() {
+        let st = DeferState {
+            handle: 9,
+            attempts: 5,
+        };
+        assert_eq!(st.note(9, 0), (st, DeferDecision::Again));
+        assert_eq!(st.note(3, 0), (st, DeferDecision::Again));
+    }
+
     // ---- sites and counter names ---------------------------------------------------------
+
+    #[test]
+    fn the_lock_is_held_when_the_counts_differ_whatever_the_clock_says() {
+        assert!(!lock_held(0, 0));
+        assert!(lock_held(1, 0));
+        assert!(!lock_held(1, 1));
+        assert!(lock_held(1_000_001, 1_000_000));
+        // The counts wrap: free again after the 2^32th pair, held with the acquire already wrapped.
+        assert!(!lock_held(0, 0));
+        assert!(lock_held(0, u32::MAX));
+        assert!(!lock_held(u32::MAX, u32::MAX));
+    }
+
+    // ---- does the worker look stuck ------------------------------------------------------
+
+    fn healthy() -> StuckInput {
+        StuckInput {
+            now: 1_000_000,
+            site: site::WAIT,
+            site_t: 1_000_000 - 50_000,
+            lock_held: false,
+            lock_acq_t: 1_000_000 - 50_000,
+            loop_t: 1_000_000 - 50_000,
+            work_pending: false,
+        }
+    }
+
+    #[test]
+    fn a_healthy_idle_worker_is_never_stuck_however_old_its_stamps() {
+        assert!(!worker_looks_stuck(healthy()));
+        // Hours idle: still healthy.
+        let mut i = healthy();
+        i.site_t = 0;
+        i.loop_t = 0;
+        i.lock_acq_t = 0;
+        i.now = 40_000_000;
+        assert!(!worker_looks_stuck(i));
+        // Never ran / exited: not stuck either, at any age.
+        for s in [site::NONE, site::EXITED] {
+            let mut i = healthy();
+            i.site = s;
+            i.site_t = 0;
+            assert!(!worker_looks_stuck(i), "site {s}");
+        }
+    }
+
+    #[test]
+    fn busy_but_moving_is_not_stuck() {
+        // In a step for 40 ms, woke 16 ms ago, work pending, mutex held for 30 ms.
+        let i = StuckInput {
+            now: 5_000,
+            site: site::DEFERRED_LOCKED,
+            site_t: 4_960,
+            lock_held: true,
+            lock_acq_t: 4_970,
+            loop_t: 4_984,
+            work_pending: true,
+        };
+        assert!(!worker_looks_stuck(i));
+    }
+
+    #[test]
+    fn stuck_in_any_step_after_a_second() {
+        for (id, name) in site::ALL {
+            if id == site::WAIT || id == site::NONE || id == site::EXITED {
+                continue;
+            }
+            let mut i = healthy();
+            i.site = id;
+            i.site_t = i.now - STUCK_SITE_MS;
+            assert!(
+                !worker_looks_stuck(i),
+                "{name}: exactly the threshold is not yet"
+            );
+            i.site_t = i.now - STUCK_SITE_MS - 1;
+            assert!(worker_looks_stuck(i), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_held_mutex_is_stuck_after_a_second_and_a_free_one_never() {
+        let mut i = healthy();
+        i.lock_held = true;
+        i.lock_acq_t = i.now - STUCK_LOCK_MS;
+        assert!(!worker_looks_stuck(i));
+        i.lock_acq_t = i.now - STUCK_LOCK_MS - 1;
+        assert!(worker_looks_stuck(i));
+        // Free, however old the acquisition stamp: not stuck.
+        i.lock_held = false;
+        assert!(!worker_looks_stuck(i));
+    }
+
+    #[test]
+    fn an_old_loop_stamp_is_stuck_only_with_work_pending() {
+        let mut i = healthy();
+        i.loop_t = i.now - STUCK_LOOP_MS - 1;
+        assert!(
+            !worker_looks_stuck(i),
+            "nothing pending: an idle worker has an old loop stamp"
+        );
+        i.work_pending = true;
+        assert!(worker_looks_stuck(i));
+        i.loop_t = i.now - STUCK_LOOP_MS;
+        assert!(!worker_looks_stuck(i));
+    }
+
+    #[test]
+    fn ages_survive_the_clock_wrapping() {
+        // now just after the 2^32 ms wrap, stamps just before it.
+        let mut i = healthy();
+        i.now = 500;
+        i.site = site::FOREIGN_FENCE;
+        i.site_t = u32::MAX - 999; // 1 500 ms ago
+        assert_eq!(age_ms(i.now, i.site_t), 1_500);
+        assert!(worker_looks_stuck(i));
+        i.site_t = u32::MAX - 100; // 601 ms ago
+        assert!(!worker_looks_stuck(i));
+        // A stamp ahead of now (stale after a reset, or racing the clock read) is age 0.
+        assert_eq!(age_ms(10, 20), 0);
+        assert_eq!(age_ms(10, 10), 0);
+        i.site_t = i.now + 5;
+        assert!(!worker_looks_stuck(i));
+        // The loop and lock stamps wrap the same way.
+        let mut j = healthy();
+        j.now = 100;
+        j.work_pending = true;
+        j.loop_t = u32::MAX - 2_999;
+        assert!(worker_looks_stuck(j));
+        j.loop_t = 0; // woke at the epoch of the clock, 100 ms ago
+        assert!(!worker_looks_stuck(j));
+        j.lock_held = true;
+        j.lock_acq_t = u32::MAX - 1_999;
+        assert!(worker_looks_stuck(j));
+    }
 
     #[test]
     fn site_ids_are_dense_unique_and_named() {

@@ -1207,7 +1207,7 @@ arithmetic), the clock of `VpDmpT`, `VpVsT` and `VsCntT`.
 | `StallT` | the time this block was last written: the "now" of every age below. A `StallT` that does not move between two reads means NOBODY is writing the block (see below) |
 | `HpdLoopN`, `HpdLoopT` | HPD worker loops (wakes) and the time of the last wake |
 | `HpdSite`, `HpdSiteT` | the step the worker is in or last entered (ids below) and the time it entered it. Age in the step = `StallT - HpdSiteT`. The pair is two stores: a reader may see the id of one step with the time of the next |
-| `ScLkN`, `ScLkAcqT`, `ScLkRelT` | acquisitions of the scanout mutex, the time of the last acquisition and of the last release. HELD NOW when `ScLkAcqT` is later than `ScLkRelT`; its age is `StallT - ScLkAcqT`. Every holder is counted (the worker, the DDI threads, `DestroyAllocation`), which is what lets a worker that waits on the mutex be told from one that holds it |
+| `ScLkN`, `ScLkRelN`, `ScLkAcqT`, `ScLkRelT` | acquisitions and releases of the scanout mutex, and the time of the last acquisition and of the last release. HELD NOW when `ScLkN` and `ScLkRelN` differ (counts, not the millisecond stamps: an acquire and a release in one millisecond cannot be ordered by time); its age is `StallT - ScLkAcqT`. Every holder is counted (the worker, the DDI threads, `DestroyAllocation`), which is what lets a worker that waits on the mutex be told from one that holds it |
 | `FlipIss` | flips dxgkrnl issued: each `SetVidPnSourceAddress` with an argument, each DMA flip record the submit took (a flip record or a keep record) |
 | `FlipPub`, `FlipPubT` | publications of a displayed address (`publish_displayed_primary`: bound or kept, any class, plus the ring-1 completion DPC's two direct stores) and the time of the last. A flip can publish more than once, so `FlipPub` can exceed `FlipIss` by a little; coalescing (`VpCoal`: dxgkrnl flipping faster than the worker drains, handles dropped) makes `FlipIss` exceed it. Healthy at quiescence: `FlipIss - FlipPub - VpCoal` about 0 |
 | `VsPendN`, `VsPendMax` | consecutive vsync ticks with a pending programming (`pending_vidpn_allocation != 0` or the programming gate raised; the vsync DPC maintains it with atomics only) and the longest run this generation. 0 and a small max is a quiet pipeline |
@@ -1237,17 +1237,26 @@ arithmetic), the clock of `VpDmpT`, `VpVsT` and `VsCntT`.
 | 13 | the one-shot Present probe (a fence wait and a host map round trip) |
 | 14 | `queue_active_scanout_refresh`, WAITING for the scanout mutex |
 | 17 | the same with the mutex HELD |
+| 18 | `process_deferred_vidpn_source_address` AFTER the mutex was released (the `VpDSt` registry write) |
+| 19 | `queue_active_scanout_refresh` AFTER the mutex was released (the pacing snapshot, about 40 registry writes) |
 | 15 | the worker is terminating |
 
 Where the numbers come from, and why they survive a stuck worker. The worker's own stores (`HpdLoopN`, `HpdSite`, ...) are
 atomics, written on entering each step (one clock read per step); nothing about them depends on the worker running
 afterwards. They are PUBLISHED from three places. `publish_nvrm_counters` (the escape-driven `Nv*` mirror) and the pacing
 snapshot (the existing periodic mirror) both run ON the worker, so a stuck worker stops them. The third does not:
-`dxgkddi_escape` calls `stall_diag::publish_from_escape`, which, at most every 500 ms, writes the block on the CALLER's
-thread (user mode calls an escape at PASSIVE on its own thread). So a stall dump is fresh as long as SOMETHING calls an
-escape: an NVK process (every NVRM message is one), a Venus submit, the tester's own tool. If `StallT` does not move,
-nothing is calling one and the worker's mirrors are not running either: every value is as old as `StallT`, and the next
-step is to make one call (start any Vulkan app) and read again.
+`dxgkddi_escape` calls `stall_diag::publish_from_escape`, which writes the block on the CALLER's thread (user mode calls
+an escape at PASSIVE on its own thread), but ONLY while the worker LOOKS STUCK, and at most every 500 ms. The block is
+about twenty registry writes (each opens the key by path, about half a millisecond), and the `Nv*` mirror was already
+moved off the escape path for a similar cost, so a healthy worker costs the escape one clock read, one load and the
+loads of the test, and nothing else. "Looks stuck" is `kmd_logic::stall_diag::worker_looks_stuck`: the worker has been
+in a step other than the idle wait for more than 1 s (`HpdSite` not 0, 1 or 15, age of `HpdSiteT`), or the scanout mutex
+has been held for more than 1 s (`ScLkN` != `ScLkRelN`, age of `ScLkAcqT`), or a programming is pending (slot or gate)
+and `HpdLoopT` is older than 2 s. Ages are on the wrapping 32-bit clock; a stamp ahead of now is age 0. So a stall dump
+is fresh as long as SOMETHING calls an escape (an NVK process: every NVRM message is one; a Venus submit; the tester's
+own tool) after the worker has been stuck for a second or two. If `StallT` does not move and nothing is calling an
+escape, every value is as old as `StallT`: make one call (start any Vulkan app) and read again. If `StallT` does not
+move although escapes ARE being called, the worker does not look stuck by the rules above (row 7).
 
 Where the hooks are: `HpdSite` / `HpdLoop*`: `ddi/hpd.rs` (every service and step) and `display.rs` /
 `adapter/scanout.rs` (the two mutex-held sites). Scanout mutex: `adapter/locks.rs`, `with_scanout_lifecycle`. `FlipIss`:
@@ -1266,7 +1275,9 @@ Both are read at every StartDevice (`reg add` + `pnputil /restart-device` applie
 boundary" or "the publication is busy" or "the host SET timed out": the exact handle is re-armed and the gate stays
 raised, and the vsync DPC wakes the worker again (one attempt per tick, more when completions also wake it). With a
 budget, the attempt that exceeds it (the same convention as `SCANOUT_RETRY_BUDGET`: `attempts > budget`, a different
-handle restarts the count, a programmed or failed primary forgets it) does what the refusal retry's `GaveUp` does:
+handle restarts the count, and ANY other outcome of the deferred wrapper forgets it: a programmed or failed primary,
+a copy queued, a superseded handle, a retryable refusal whether re-armed or given up; the count is of CONSECUTIVE Deferred
+outcomes of one handle, so a later Deferred of the same handle never continues an old count; `kmd_logic::DeferState`) does what the refusal retry's `GaveUp` does:
 releases the leases, publishes the flip's address KEPT (any class, Venus included, `FkDefBud`), and lowers the gate
 instead of re-arming. Clamped to 16..4 000 000 when nonzero; 240 is about four seconds at 60 Hz.
 
@@ -1280,14 +1291,20 @@ the A/B that tells a Deferred livelock (the stall clears, `FkDefBud` moves) from
 
 `FlipWdogMs` (default 0 = off). Clamped to 50..60 000 when nonzero. With it set:
 
-* The vsync DPC keeps the address of the newest pending flip (recorded where the gate is raised:
-  `set_vidpn_source_address_dirql` for the MMIO contract, `arm_dma_flip_programming` for the DMA contract) as one packed
-  word. When the pending run (`VsPendN`) has gone more than `FlipWdogMs` worth of ticks (`ticks_for_ms`, rounded up) with
+* EVERY flip dxgkrnl issues is recorded as the newest flip, as one packed word of its number (the new `FlipIss`, 24 bits)
+  and its address: `note_flip_issued` at the top of `SetVidPnSourceAddress` and in both DMA branches of `arm_dma_flip`,
+  before the flip can be paired, raise the gate, or be completed by a direct publisher (an unpaired handle `FkDdi`, a DMA
+  keep record, `ForeignFlip`). The last DONE flip number is advanced by EVERY publication (`note_published`, from
+  `publish_displayed_primary` and the ring-1 DPC): when the published address is the newest recorded flip's, that flip is
+  done. When the pending run (`VsPendN`) has gone more than `FlipWdogMs` worth of ticks (`ticks_for_ms`, rounded up) with
   NO publication since (every publication restarts the clock, so a stream of flips that each publish is progress however
-  long the gate stays raised), it publishes that address with `publish_kept_primary` (one atomic store, legal at
-  DISPATCH), counted `FlipWd` / `FlipWdT`. Class independent, Venus included. Never twice for the same flip (the fired
-  word is remembered); a newer flip that is still stuck after the interval fires again; the watchdog's own publication
-  restarts the clock. It does not lower the gate or touch the pending slot: the worker still owns the programming.
+  long the gate stays raised), and the newest recorded flip is NEWER than the last one done (wrapping 24-bit order), it
+  publishes that flip's address with `publish_kept_primary` (one atomic store, legal at DISPATCH), counted `FlipWd` /
+  `FlipWdT`. Class independent, Venus included. So it never publishes the same flip twice, never the address of an OLDER
+  flip than one already done (a flip n stuck behind a gate while a direct publisher completes flip n+1 stays unpublished),
+  and a newer flip that is still stuck after the interval fires again; the watchdog's own publication restarts the clock.
+  A flip whose address the word cannot carry (zero, 40 bits or more) clears the word instead (`FlipWdBig`), so no older
+  address is fired for it. It does not lower the gate or touch the pending slot: the worker still owns the programming.
 * The Venus direct exits publish kept too: `GaveUp` (the refusal-retry budget) and permanent rejects of a VENUS flip in
   the deferred wrapper, which by default complete nothing (`FkVenus`). Foreign and hollow flips are untouched (they
   already publish kept). The inline (PASSIVE DDI) wrapper is not changed: its refusal status reaches dxgkrnl directly.
@@ -1314,7 +1331,7 @@ frozen `StallT`). A stalled system is read by what MOVES between the two reads; 
 * Clocks and freshness: `StallT`, `VpDmpT`, `VpVsT` (and `VsCntT`), `StartN`, `StartT`.
 * Pending state: `VpGate`, `VpPend`, `VpDSt` (the worker's last status, 0 = success), `VpVsEn`, `VpLpa` (and `SaLo` /
   `SaHi`: the address the vsync reports), `SaCnt`, `VpPrgN`, `VpCoal`.
-* New: `HpdLoopN`, `HpdLoopT`, `HpdSite`, `HpdSiteT`, `ScLkN`, `ScLkAcqT`, `ScLkRelT`, `FlipIss`, `FlipPub`, `FlipPubT`,
+* New: `HpdLoopN`, `HpdLoopT`, `HpdSite`, `HpdSiteT`, `ScLkN`, `ScLkRelN`, `ScLkAcqT`, `ScLkRelT`, `FlipIss`, `FlipPub`, `FlipPubT`,
   `VsPendN`, `VsPendMax`, `FlipWd`, `FlipWdT`, `FkDefBud`, `FkVenus`, `FlWdMsEff`, `DefBudEff`.
 * Programming outcomes: `ScUnav`, `ScRetry`, `ScGaveUp`, `FkKeep`, `FkWhy`, `PrUnres`.
 * Refresh pipeline: `RfCnt`, `RfDone`, `RfFail`, `RfUnb`, `RfWait`.
@@ -1332,7 +1349,7 @@ together. If `StallT` does not move, see 14.2 (nothing is writing the block).
 
 | # | pattern | means | next |
 |---|---|---|---|
-| 1a | `HpdSite` 7 or 14 (waiting on the mutex), age growing; `ScLkAcqT` later than `ScLkRelT`, age growing, `ScLkN` flat; `VsPendN` growing; `VpVsN` moves | hypothesis 1: ANOTHER thread holds the scanout mutex across a host round trip (`retire_scanout_allocation_locked`: `ctrl_fifo_barrier`, `set_scanout_blob`, up to 30 s each), the worker queues on it | the age is the answer: near 30 s or 60 s is the barrier / SET timeout; `NvEvErr`, `RelRTimeouts`, `RngSub - RngCmp` say whether the host is answering |
+| 1a | `HpdSite` 7 or 14 (waiting on the mutex), age growing; `ScLkN` ahead of `ScLkRelN`, `ScLkAcqT` age growing, `ScLkN` flat; `VsPendN` growing; `VpVsN` moves | hypothesis 1: ANOTHER thread holds the scanout mutex across a host round trip (`retire_scanout_allocation_locked`: `ctrl_fifo_barrier`, `set_scanout_blob`, up to 30 s each), the worker queues on it | the age is the answer: near 30 s or 60 s is the barrier / SET timeout; `NvEvErr`, `RelRTimeouts`, `RngSub - RngCmp` say whether the host is answering |
 | 1b | `HpdSite` 16 or 17 (mutex held by the worker), age growing; `ScLkN` flat; `FlipPub` flat | hypothesis 1: the worker is INSIDE the programming (a Venus copy, `SET_SCANOUT_BLOB`) waiting on the host | `IrqN` / `DpcN` flat = the host is not interrupting; moving = it answers, the wait is on a fence or producer |
 | 1c | `HpdLoopN` moves fast (about the vsync rate), `HpdSite` flickers between 1 and 16, `ScLkN` moves, `VpPrgN` moves, `VpPend` nonzero or `VsPendN` growing, `FlipPub` flat, `VpDSt` 0, `ScRetry` / `ScGaveUp` flat | hypothesis 1: a DEFERRED programming retrying forever (no budget; it has no counter of its own) | set `DeferBudget` 240: `FkDefBud` moves and the stall clears = confirmed |
 | 1d | `HpdSite` is another step (4, 5, 6, 9, 10, 11, 12, 13), age growing | the worker is stuck in that service, not in the programming | 4: `virtio_lock` / the used ring; 5, 6: `Fs*`, `FnCloseErr`; 9: `Rm*`; 10: `Ff*`; 12: the registry |
@@ -1343,16 +1360,18 @@ together. If `StallT` does not move, see 14.2 (nothing is writing the block).
 | 4 | `VpVsN` does not move, or `VpVsEn` 0 | the vsync heartbeat is dead or its delivery gate closed: a separate failure from all of the above | `VpVsEn`, `VsMinGap`, the timer / DPC |
 | 5 | `FlipWd` moves and the compositor still blocks | `FlipWd` published, dxgkrnl did not retire on the address (13.4 unknown 1): the stall has another cause | the DMA fence path (`WfDone`, `WtOut`); do not read the knob as a fix |
 | 6 | `StartN` moved | the device restarted: every block above was zeroed; compare only values written after `StartT` | |
-| 7 | `StallT` frozen | nobody called an escape and the worker's mirrors are not running | start any Vulkan app (any NVRM message is an escape) and read again |
+| 7 | `StallT` frozen | either nothing is calling an escape and the worker's mirrors are not running, or escapes are called and the worker looks healthy to `worker_looks_stuck` (asleep in `wait`, mutex free, nothing pending, or in a step for less than a second): a block written only by the escape path stays quiet while the worker is healthy | start any Vulkan app (any NVRM message is an escape), wait two seconds and read again; a stall of a few hundred milliseconds is not visible here |
 
 ### 14.6 Verified, and not
 
 Verified (host tests, `kmd_logic`): the vsync tick bookkeeping (pending run, maximum, saturation, the no-publication clock
 restarting on every publication, idle ticks resetting it); the watchdog decision (off never fires; fires after exactly the
 interval, never earlier; once per flip word; again for a newer stuck flip; a stream of publishing flips is progress; needs
-a recorded flip; idle never fires); the flip word (round trip, never 0, 40-bit limit, 24-bit sequence wrap); ticks from
+a recorded flip; idle never fires; never a flip older than one already done, across the 24-bit wrap too; a publication completes
+the newest recorded flip only when it names its address); the flip word (round trip, never 0, 40-bit limit, 24-bit sequence wrap); ticks from
 milliseconds (rounded up, never earlier, zero = off); the Deferred budget (0 unlimited, exactly `budget` attempts, a new
-handle restarts it); the knob clamps; the site ids (dense, unique); the counter names (at most 14 characters, unique, no
+handle restarts it, and an outcome in between that is not a Deferred ends the count; the clear on each non-Deferred arm
+is wiring in `display.rs`, read and type-checked, not host-run); the knob clamps; the site ids (dense, unique); the counter names (at most 14 characters, unique, no
 collision with any other literal in `kmd_render` or quoted name in `kmd_logic`, no 14-character truncation onto one, the
 writer file spells exactly the list, histogram and `Vp<hex>` ring stems excluded). Type-checked: the whole `kmd_render`
 against the stub harness, the error set IDENTICAL to the base (v321), with five injected errors (one per touched file
@@ -1361,8 +1380,10 @@ group) all reported, so the touched code is checked and not skipped.
 NOT verified: anything on hardware; the WDK build; that dxgkrnl retires a flip on the kept address (13.4 unknown 1); the
 DISPATCH / DIRQL legality claims (read, not run: the new code is relaxed atomics and, in `publish_displayed_primary`, one
 `KeQueryInterruptTimePrecise` per publication); the cost of one clock read per HPD worker step, two per scanout lifecycle
-operation and one per publication (a scalar read, assumed small next to what each step does); that the 500 ms registry
-write from an escape thread (about 20 values) is not noticeable on a hot escape path; that a Deferred wait never
+operation and one per publication (a scalar read, assumed small next to what each step does); the stuck test's thresholds
+(1 s, 1 s, 2 s) against real stalls (a stall that is none of its three patterns, such as a worker that loops fast and never
+publishes, looks healthy to it; `VsPendN` and `FlipIss - FlipPub` see that, and the worker's own mirrors still write); the
+cost of the 500 ms write from an escape thread while the worker looks stuck (about 20 values); that a Deferred wait never
 legitimately exceeds a budget (why it defaults to off).
 
 Risks: the kept address (14.3); `DeferBudget` abandons a programming whose host SET may still land; the watchdog and the
