@@ -800,7 +800,7 @@ unsafe fn note_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURC
     let Some(dev) = helios_device(h) else {
         return;
     };
-    if !dev.dxvk.is_nvk() {
+    if !dev.dxvk.is_nvk() && !keyed_flush_wait_forced() {
         return;
     }
     let mut list = lock_ignore_poison(&dev.nvk_keyed_resources);

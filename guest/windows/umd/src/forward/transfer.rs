@@ -302,6 +302,18 @@ pub(crate) unsafe extern "system" fn flush(h: Hdevice) {
 
 static NVK_KEYED_WAITS: AtomicUsize = AtomicUsize::new(0);
 
+/// `HELIOS_KEYED_FLUSH_WAIT=1` (process environment): the keyed-mutex flush
+/// wait on any backend, Venus included. Diagnostic: d3d11_share keyed-load
+/// shows Venus devices misorder keyed-mutex hand-offs across processes too
+/// (docs/shared-surfaces.md section 4); off by default there because DWM
+/// runs on Venus.
+pub(crate) fn keyed_flush_wait_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("HELIOS_KEYED_FLUSH_WAIT").is_ok_and(|v| v == "1")
+    })
+}
+
 /// NVK with a live keyed-mutex shared resource (docs/shared-surfaces.md §4,
 /// v1): wait on the CPU until every command this device submitted so far has
 /// completed on the GPU. The Microsoft runtime releases a keyed mutex right
@@ -317,7 +329,9 @@ pub(crate) unsafe fn nvk_keyed_flush_wait(h: Hdevice, context: &ID3D11DeviceCont
     let Some(dev) = helios_device(h) else {
         return;
     };
-    if !dev.dxvk.is_nvk() || lock_ignore_poison(&dev.nvk_keyed_resources).is_empty() {
+    if (!dev.dxvk.is_nvk() && !keyed_flush_wait_forced())
+        || lock_ignore_poison(&dev.nvk_keyed_resources).is_empty()
+    {
         return;
     }
     let Some(device) = dev.dxvk.d3d11_device() else {
