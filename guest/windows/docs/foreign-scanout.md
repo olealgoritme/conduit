@@ -313,6 +313,12 @@ A count and its time are two registry values read at slightly different instants
 pair can be one tick (4 ms at 240 Hz) apart; this matters for intervals of a few ticks, not
 for seconds.
 
+The heartbeat is a free-running timer: it does not know when the host really presents, so the two clocks
+beat. `docs/host-vblank-pacing.md` (design only, nothing wired) is the opt-in alternative that follows the
+host viewer's presentation feedback with a phase-locked loop and falls back to this timer; its step 0 is
+the measurement (the viewer's drops per second, the `VsyncRateMhz` experiment) that decides whether it is
+worth building.
+
 ## Owner death and killed processes
 
 Status: implemented on `kmd/scanout-kill-lapse`, never built or run (the KMD cannot be compiled
