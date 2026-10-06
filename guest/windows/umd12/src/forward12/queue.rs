@@ -533,6 +533,12 @@ pub struct QueueState {
     windows: Mutex<ContextWindows>,
     /// Orders admission, worker commit and Render across concurrent ECL calls.
     execution: Mutex<()>,
+    /// S5 (dxvk-on-nvk): the NVK ordering state (`nvk12.rs`), made at the
+    /// queue's first NVK boundary. Empty on Venus.
+    nvk: std::sync::OnceLock<super::nvk12::NvkSync>,
+    /// S5: the highest NVK execution boundary committed on this queue (present
+    /// waits for it before showing a frame on scanout 0).
+    nvk_last_value: std::sync::atomic::AtomicU64,
 }
 
 /// Engine allocators materialised for one DDI command pool, indexed by command
@@ -1234,6 +1240,8 @@ unsafe extern "system" fn create_command_queue(
             // `pfnRenderCb` record into memory dxgkrnl never lent this context.
             windows: Mutex::new(windows),
             execution: Mutex::new(()),
+            nvk: std::sync::OnceLock::new(),
+            nvk_last_value: std::sync::atomic::AtomicU64::new(0),
         });
     }
     S_OK
@@ -1397,6 +1405,15 @@ unsafe extern "system" fn destroy_command_queue(
     // SAFETY: `state` is the live box this call took out of the slot, so its
     // `h_rt_queue` and `h_context` are the pair `create_wddm_context` produced.
     let hr = unsafe { destroy_wddm_context(&state) };
+    // S5: the context is gone (and drained through the NVK fence the worker
+    // signals); stop the worker and release the fence before the engine queue.
+    if let Some(sync) = state.nvk.get() {
+        // SAFETY: the queue's creating device outlives its queues.
+        if let Some(dev) = unsafe { device12::device(state.h_device) } {
+            // SAFETY: the fence was created on this device.
+            unsafe { sync.shutdown(dev) };
+        }
+    }
     // A successful context destroy has drained all admitted packets. Failure
     // must cancel remaining admissions and remove the engine device before
     // Release joins its workers; neither case fabricates stream completion.
@@ -2871,6 +2888,80 @@ unsafe fn enqueue_runtime_admission(
     }
 }
 
+/// S5 (dxvk-on-nvk): complete an NVK engine boundary on the runtime context.
+///
+/// The engine's boundary on NVK is a point on the queue's local execution
+/// stream (`ctx` = `cookie` = 0, see `bridge12::boundary`); an `HE12` record
+/// cannot name it, so no Render packet is submitted. Instead the runtime
+/// admission event is queued exactly as on Venus (the engine worker waits for
+/// it), then the context is ordered behind the boundary (`nvk12.rs`).
+///
+/// # Safety
+/// Live runtime device/queue, on the entering DDI thread, under the queue's
+/// `execution` lock.
+unsafe fn nvk_complete(
+    dev: &device12::HeliosD3D12Device,
+    queue: &QueueState,
+    value: u32,
+    admission: &AdmissionEvent,
+) -> Result<(), ddi12::HRESULT> {
+    // SAFETY: forwarded precondition.
+    unsafe { enqueue_runtime_admission(dev, queue, admission) }?;
+    let engine = queue.engine_queue.as_raw() as usize;
+    // SAFETY: the engine queue lives as long as the queue state that owns the sync.
+    let sync = queue
+        .nvk
+        .get_or_init(|| unsafe { super::nvk12::NvkSync::new(dev, engine) });
+    queue
+        .nvk_last_value
+        .fetch_max(u64::from(value), std::sync::atomic::Ordering::AcqRel);
+    // SAFETY: forwarded precondition; the queue's own context.
+    unsafe { sync.order_context(dev, queue.h_context, engine, u64::from(value)) }
+}
+
+/// S5: does this queue's device run its engine on NVK on RM?
+///
+/// # Safety
+/// As [`queue_state`].
+pub(crate) unsafe fn queue_is_nvk(h: ddi12::D3D12DDI_HCOMMANDQUEUE) -> bool {
+    // SAFETY: forwarded precondition; a live queue implies its live device.
+    unsafe { queue_state(h) }
+        .and_then(|queue| unsafe { device12::device(queue.h_device) })
+        .is_some_and(|dev| dev.engine.is_nvk())
+}
+
+/// S5: show `resource` (a borrowed engine resource) on scanout 0 through NVK.
+///
+/// # Safety
+/// As [`queue_state`]; `resource` is a live engine resource of this device.
+pub(crate) unsafe fn nvk_scanout_present(h: ddi12::D3D12DDI_HCOMMANDQUEUE, resource: usize) -> bool {
+    // SAFETY: forwarded preconditions.
+    unsafe { queue_state(h) }
+        .and_then(|queue| unsafe { device12::device(queue.h_device) })
+        .is_some_and(|dev| unsafe { dev.engine.nvk_scanout_present(resource) })
+}
+
+/// S5: wait on the CPU until every NVK boundary committed on this queue
+/// completed (scanout present: the frame must be finished before it is shown).
+/// True when reached, or when nothing was committed.
+///
+/// # Safety
+/// As [`queue_state`].
+pub(crate) unsafe fn nvk_wait_queue_idle(h: ddi12::D3D12DDI_HCOMMANDQUEUE, timeout_ns: u64) -> bool {
+    // SAFETY: forwarded precondition.
+    let Some(queue) = (unsafe { queue_state(h) }) else {
+        return false;
+    };
+    let value = queue
+        .nvk_last_value
+        .load(std::sync::atomic::Ordering::Acquire);
+    if value == 0 {
+        return true;
+    }
+    // SAFETY: the live queue's engine queue.
+    unsafe { super::nvk12::NvkSync::wait_cpu(queue.engine_queue.as_raw() as usize, value, timeout_ns) }
+}
+
 fn report_ecl_submit_error(queue: &QueueState, hr: ddi12::HRESULT) {
     // SAFETY: QueueState owns this engine queue throughout error propagation.
     unsafe { crate::bridge12::cancel_execution(queue.engine_queue.as_raw() as usize, hr) };
@@ -3061,6 +3152,22 @@ unsafe extern "system" fn execute_command_lists(
     };
     L2_REFUSALS.ecl_forwarded.bump();
     L2_REFUSALS.ecl_exact_boundary.bump();
+    if boundary.0 == 0 {
+        // S5: NVK on RM -- no HE12 record (the KMD knows no NVK stream); the
+        // context is ordered behind the boundary by this driver.
+        // SAFETY: entering ECL thread, live device/queue, execution lock held.
+        match unsafe { nvk_complete(dev, queue, boundary.1, &admission) } {
+            Ok(()) => {
+                L2_REFUSALS.ecl_nvk_ordered.bump();
+                note_refusal(&L2_REFUSALS.ecl_admission_queued);
+            }
+            Err(hr) => {
+                note_refusal(&L2_REFUSALS.ecl_admission_failed);
+                report_ecl_submit_error(queue, hr);
+            }
+        }
+        return;
+    }
     // ⛔ WIRE FENCE WITHDRAWN (2026-09-13): the D3D12 record carries
     // `gpu_wire_fence = 0`, i.e. the pre-lever retire domain. The sampled Venus
     // wire fence was measured not to fix the early fence (allocator failed 2 of 2
@@ -3706,6 +3813,8 @@ pub(crate) struct L2Refusals {
     /// zero normally; E_OUTOFMEMORY is returned with no object on exhaustion.
     /// Atomic-only on the error path; readable in the next normal summary.
     command_signature_translation_oom: RefusalCounter,
+    /// S5: ECLs on NVK on RM ordered by the driver (no HE12 record).
+    ecl_nvk_ordered: RefusalCounter,
 }
 
 pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
@@ -3804,6 +3913,7 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     tile_mappings_forwarded: RefusalCounter::new("TileMappingsForwarded"),
     tile_mappings_admitted: RefusalCounter::new("TileMappingsAdmitted"),
     command_signature_translation_oom: RefusalCounter::new("CommandSignatureTranslationOom"),
+    ecl_nvk_ordered: RefusalCounter::new("EclNvkOrdered"),
 };
 
 /// L2's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -3946,6 +4056,7 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.fence_native_refused,
     &L2_REFUSALS.present_producer_admitted,
     &L2_REFUSALS.command_signature_translation_oom,
+    &L2_REFUSALS.ecl_nvk_ordered,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the

@@ -1,8 +1,9 @@
 // ICD backend selection and the NVK ICD loader. See `bridge_icd_backend.h`.
 //
-// Compiled into helios_umd.dll (and into helios_umd12.dll when D3D12 moves to
-// NVK, S5); every copy reads the same environment and registry, so copies in
-// one process agree.
+// Compiled into helios_umd.dll and helios_umd12.dll (S5, with
+// HELIOS_ICD_BACKEND_D3D12: the D3D12-only levers in decide()); every copy
+// reads the same environment and registry, so copies in one process agree
+// except where a D3D12 lever says otherwise.
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -137,6 +138,15 @@ bool find_nvk_icd(wchar_t* out, std::size_t cap) {
 #endif
 }
 
+#if defined(HELIOS_ICD_BACKEND_D3D12)
+bool reg_dword(const char* name, DWORD* out) {
+  DWORD size = sizeof(*out);
+  return RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", name,
+                      RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, nullptr, out,
+                      &size) == ERROR_SUCCESS;
+}
+#endif
+
 IcdBackendChoice decide() {
   IcdBackendChoice c = {};
   c.backend = IcdBackend::Venus;
@@ -150,7 +160,39 @@ IcdBackendChoice decide() {
 
   char forced[16];
   bool force_nvk = false;
+#if defined(HELIOS_ICD_BACKEND_D3D12)
+  // D3D12 (helios_umd12.dll, S5) has its own levers in front of the shared
+  // ones: HELIOS_ICD12 (environment, venus|nvk) wins over HELIOS_ICD; Nvk12=0
+  // (REG_DWORD) keeps D3D12 on Venus everywhere; NvkDenyList12 (REG_SZ, `;`
+  // separated executables) keeps titles that need what NVK lacks -- ray
+  // tracing (DXR) above all -- on Venus. On NVK D3D12 reports no DXR.
+  if (env_sz("HELIOS_ICD12", forced, sizeof(forced))) {
+    lower_ascii(forced);
+    if (std::strcmp(forced, "venus") == 0) {
+      c.reason = "HELIOS_ICD12=venus";
+      return c;
+    }
+    if (std::strcmp(forced, "nvk") == 0) {
+      force_nvk = true;
+      c.reason = "HELIOS_ICD12=nvk";
+    }
+  }
+  if (!force_nvk) {
+    DWORD nvk12 = 1;
+    if (reg_dword("Nvk12", &nvk12) && nvk12 == 0) {
+      c.reason = "HKLM\\SOFTWARE\\Helios!Nvk12=0 (D3D12 on Venus)";
+      return c;
+    }
+    char deny12[4096];
+    if (reg_sz("NvkDenyList12", deny12, sizeof(deny12)) && list_has(deny12, c.exe)) {
+      c.reason = "NvkDenyList12 names this executable (D3D12, e.g. DXR)";
+      return c;
+    }
+  }
+  if (!force_nvk && env_sz("HELIOS_ICD", forced, sizeof(forced))) {
+#else
   if (env_sz("HELIOS_ICD", forced, sizeof(forced))) {
+#endif
     lower_ascii(forced);
     if (std::strcmp(forced, "venus") == 0) {
       c.reason = "HELIOS_ICD=venus";
@@ -181,7 +223,8 @@ IcdBackendChoice decide() {
     return c;
   }
   c.backend = IcdBackend::NvkRm;
-  c.reason = force_nvk ? "HELIOS_ICD=nvk" : "global NVK, not denied";
+  if (!c.reason)
+    c.reason = force_nvk ? "HELIOS_ICD=nvk" : "global NVK, not denied";
   return c;
 }
 

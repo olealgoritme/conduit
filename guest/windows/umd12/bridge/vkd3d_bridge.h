@@ -40,9 +40,36 @@ struct HeliosVkd3dDevice {
   std::unique_ptr<HeliosVkd3dDeviceImpl> impl;
 
   // Engine-derived values, rechecking native admission including override refusal.
+  // `rovs` / `conservative_tier`: the engine's own OPTIONS answers (S5: NVK has
+  // no ROVs and conservative rasterization tier 2), so the driver table never
+  // reports more than the engine backs. `maximum_feature_level` is 12_1, 12_0
+  // (S5) or the baseline.
   bool native_optional_caps(std::uint32_t& maximum_feature_level,
                             std::uint32_t& shader_model, std::uint32_t& raytracing_tier,
+                            std::uint32_t& rovs, std::uint32_t& conservative_tier,
                             rust::Slice<std::uint8_t> device_uuid) const noexcept;
+
+  // S5 (dxvk-on-nvk). The ICD under the engine: 1 = Venus, 2 = NVK on RM
+  // (helios_icd_interface.h's HELIOS_ICD_BACKEND_*).
+  std::uint32_t icd_backend() const noexcept;
+
+  // S5, NVK only. The KMD resource id NVK mints (IMPORT_RM) for the dedicated
+  // memory of a 2D texture placed at offset 0 of an export heap, the holder
+  // context it is attached to, the layout the KMD recorded with it, and the
+  // memory it names. False (all zero) for anything else, or when the KMD's
+  // IMPORT_RM gate is closed. `resource` is a borrowed ID3D12Resource*.
+  bool resource_foreign_identity(std::size_t resource, std::uint32_t* out_res_id,
+                                 std::uint32_t* out_ctx_id, std::uint64_t* out_size,
+                                 std::uint64_t* out_modifier, std::uint32_t* out_stride,
+                                 std::uint32_t* out_offset, std::uint32_t* out_fourcc,
+                                 std::uint64_t* out_vk_memory,
+                                 std::uint32_t* out_memory_type_index) const noexcept;
+
+  // S5, NVK only: show the texture on scanout 0 through the KMD's foreign
+  // scanout source (the caller waited for its GPU work). 0 = shown.
+  std::int32_t nvk_scanout_present(std::size_t resource) const noexcept;
+  // S5, NVK only: give scanout 0 back to the desktop.
+  void nvk_scanout_release() const noexcept;
 
   // BORROWED — the bridge keeps the owning reference. 0 if not created.
   // The caller must NOT `Release()` this, and on the Rust side must not let a
@@ -183,6 +210,12 @@ constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_ICD_REFUSED = 6;
 // Exact resource/queue producer boundary, enqueued on the engine worker.
 bool helios_vkd3d_bridge_publish_producer(std::size_t queue, std::size_t resource,
     std::uint32_t allocation, std::size_t admission_event, std::uint32_t* ctx, std::uint32_t* value, std::uint64_t* cookie);
+
+// S5, NVK only: wait until the queue's execution stream reaches `value` (a
+// boundary helios_vkd3d_bridge_execute returned, ctx 0 / cookie 0 on NVK).
+// S_OK reached, S_FALSE timed out, failure on device loss.
+std::int32_t helios_vkd3d_bridge_wait_execution(std::size_t queue, std::uint64_t value,
+                                                std::uint64_t timeout_ns) noexcept;
 
 // Borrowed engine allocator; S_FALSE retains pending storage without resetting.
 std::int32_t helios_vkd3d_bridge_try_reset_allocator(std::size_t allocator);

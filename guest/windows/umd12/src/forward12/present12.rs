@@ -356,6 +356,15 @@ unsafe extern "system" fn present(
     // registered signal completes the allocation epoch at host retirement.
     // SAFETY: the runtime retains h_queue and engine for this present DDI;
     // identity12 supplies the exact resource's dxgkrnl allocation handle.
+    // S5 (dxvk-on-nvk): NVK on RM has no producer stream. The frame's GPU work
+    // is ordered before this present on the context by the NVK ECL sync
+    // (`nvk12.rs`), so the identity record carries no stream tail.
+    if unsafe { queue::queue_is_nvk(h_queue) } {
+        // SAFETY: live runtime arguments of this pfnPresent, on its thread.
+        unsafe { present_nvk(h_queue, h_context, engine.as_raw() as usize, &identity, p_out, p_contexts) };
+        return;
+    }
+
     let Some((producer_ctx, producer_value, producer_cookie)) = (unsafe {
         queue::publish_present_producer(h_queue, engine.as_raw() as usize, identity.h_allocation)
     }) else {
@@ -577,6 +586,129 @@ unsafe extern "system" fn present(
 /// Install L8's one device-core slot, `pfnGetPresentPrivateDriverDataSize`.
 ///
 /// Chain position: `FenceSlots` -> `PresentSlots` on the device-core table.
+/// S5: did any NVK present of this process use scanout 0?
+pub(crate) fn nvk_scanout_used() -> bool {
+    L8_REFUSALS.nvk_scanout_presents.get() > 0
+}
+
+/// Upper bound of the CPU wait for a frame's NVK work before it is shown on
+/// scanout 0.
+const NVK_SCANOUT_WAIT_NS: u64 = 2_000_000_000;
+
+/// `present` on NVK on RM (dxvk-on-nvk S5).
+///
+/// The back buffer reaches the screen one of two ways (`Nvk12Present`):
+/// * **composed** -- the WDDM present below names the allocation, which adopted
+///   the KMD resource id NVK minted for the buffer (IMPORT_RM), and DWM's Venus
+///   DXVK imports it as a foreign surface (`ForeignImport=1`);
+/// * **scanout 0** -- the frame is shown zero-copy through the KMD's foreign
+///   scanout source after a CPU wait for the queue's work (the desktop is hidden
+///   while the app presents), and the WDDM present still runs so DXGI's flip
+///   queue and frame statistics behave.
+/// Automatic: composed when DWM imports foreign surfaces and the buffer has an
+/// id, else scanout.
+///
+/// # Safety
+/// The live runtime arguments of the `pfnPresent` that called this, on its thread.
+unsafe fn present_nvk(
+    h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
+    h_context: *mut core::ffi::c_void,
+    engine_resource: usize,
+    identity: &identity12::AllocationIdentity,
+    p_out: *mut ddi12::D3D12DDI_PRESENT_0051,
+    p_contexts: *mut ddi12::D3D12DDI_PRESENT_CONTEXTS_0051,
+) {
+    let has_id = identity.venus_res_id != 0;
+    let scanout = match crate::knobs12::nvk12_present_mode() {
+        1 => true,
+        2 => false,
+        _ => !(crate::knobs12::foreign_import() && has_id),
+    };
+    if scanout {
+        // SAFETY: forwarded precondition.
+        let done = unsafe { queue::nvk_wait_queue_idle(h_queue, NVK_SCANOUT_WAIT_NS) };
+        if !done {
+            note_refusal(&L8_REFUSALS.nvk_scanout_wait_timeout);
+        }
+        // SAFETY: the live engine resource of this present.
+        if unsafe { queue::nvk_scanout_present(h_queue, engine_resource) } {
+            L8_REFUSALS.nvk_scanout_presents.bump();
+            let n = L8_REFUSALS.nvk_scanout_presents.get();
+            if n == 1 || n % 1024 == 0 {
+                log_error!(
+                    "L8: NVK present: {n} frames on scanout 0 (failures {})",
+                    L8_REFUSALS.nvk_scanout_failed.get()
+                );
+            }
+        } else {
+            note_refusal(&L8_REFUSALS.nvk_scanout_failed);
+        }
+    } else {
+        L8_REFUSALS.nvk_composed_presents.bump();
+        let n = L8_REFUSALS.nvk_composed_presents.get();
+        if n == 1 || n % 1024 == 0 {
+            log_error!(
+                "L8: NVK present: {n} frames composed by DWM from foreign resource id {}",
+                identity.venus_res_id
+            );
+        }
+    }
+
+    // The frame's identity for the KMD's flush/ledger, as on Venus but with no
+    // stream tail; only a buffer with a KMD resource id has one.
+    if has_id {
+        let private = helios_protocol::HeliosPresentPrivateData {
+            plane_offset: identity.memory_offset,
+            magic: helios_protocol::HELIOS_PRESENT_PRIVATE_MAGIC,
+            version: helios_protocol::HELIOS_PRESENT_PRIVATE_VERSION,
+            resource_id: identity.venus_res_id,
+            width: identity.geometry.width.min(u64::from(u32::MAX)) as u32,
+            height: identity.geometry.height,
+            pitch: identity.pitch,
+            dxgi_format: identity.geometry.dxgi_format,
+            reserved: 0,
+            venus_alloc_size: identity.venus_alloc_size,
+            present_ctx_id: 0,
+            present_value: 0,
+            present_cookie: 0,
+            snapshot_memory_type_index: 0,
+            snapshot_purpose: helios_protocol::HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE,
+        };
+        let record = helios_protocol::HeliosPresentRenderCmd {
+            magic: helios_protocol::HELIOS_PRESENT_RENDER_MAGIC,
+            version: helios_protocol::HELIOS_PRESENT_RENDER_VERSION,
+            present: private,
+        };
+        // SAFETY: forwarded precondition (inside pfnPresent, entering thread).
+        match unsafe { queue::submit_present_identity(h_queue, &record) } {
+            queue::WddmSubmit::Submitted => {}
+            queue::WddmSubmit::Unavailable => {
+                note_refusal(&L8_REFUSALS.present_identity_unavailable);
+                unsafe { queue::report_present_submit_error(h_queue, E_NOTIMPL) };
+                return;
+            }
+            queue::WddmSubmit::Refused(hr) => {
+                note_refusal(&L8_REFUSALS.present_identity_refused);
+                unsafe { queue::report_present_submit_error(h_queue, hr) };
+                return;
+            }
+        }
+    }
+
+    unsafe {
+        if let Some(out) = p_out.as_mut() {
+            out.BroadcastSrcAllocation[0] = identity.h_allocation;
+            out.AddedGpuWork = 0;
+            out.BackBufferMultiplicity = 1;
+            out.SyncIntervalOverrideValid = 0;
+        }
+        if let Some(contexts) = p_contexts.as_mut() {
+            contexts.hContext = h_context;
+            contexts.BroadcastContextCount = 0;
+        }
+    }
+}
+
 pub(crate) fn install_core(
     mut filling: Filling<'_, DeviceCoreTable, stage::FenceSlots>,
 ) -> Filling<'_, DeviceCoreTable, stage::PresentSlots> {
@@ -701,6 +833,10 @@ struct L8Refusals {
     /// means the failure could not even be reported, which is strictly worse — a
     /// queue whose frames silently carry no identity.
     present_identity_refused: RefusalCounter,
+    nvk_scanout_presents: RefusalCounter,
+    nvk_scanout_failed: RefusalCounter,
+    nvk_scanout_wait_timeout: RefusalCounter,
+    nvk_composed_presents: RefusalCounter,
 }
 
 static L8_REFUSALS: L8Refusals = L8Refusals {
@@ -718,6 +854,10 @@ static L8_REFUSALS: L8Refusals = L8Refusals {
     present_source_allocation_zero: RefusalCounter::new("PresentSourceAllocationZero"),
     present_identity_unavailable: RefusalCounter::new("PresentIdentityUnavailable"),
     present_identity_refused: RefusalCounter::new("PresentIdentityRefused"),
+    nvk_scanout_presents: RefusalCounter::new("Nvk12ScanoutPresents"),
+    nvk_scanout_failed: RefusalCounter::new("Nvk12ScanoutFailed"),
+    nvk_scanout_wait_timeout: RefusalCounter::new("Nvk12ScanoutWaitTimeout"),
+    nvk_composed_presents: RefusalCounter::new("Nvk12ComposedPresents"),
 };
 
 /// L8's refusal counters, printed by `crate::log_refusal_summary` at this lane's
@@ -754,4 +894,8 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L8_REFUSALS.present_source_allocation_zero,
     &L8_REFUSALS.present_identity_unavailable,
     &L8_REFUSALS.present_identity_refused,
+    &L8_REFUSALS.nvk_scanout_presents,
+    &L8_REFUSALS.nvk_scanout_failed,
+    &L8_REFUSALS.nvk_scanout_wait_timeout,
+    &L8_REFUSALS.nvk_composed_presents,
 ];

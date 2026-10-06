@@ -70,3 +70,5 @@ pub(crate) mod shaders;
 // rather than between two lanes' files. It holds no DDI slot; the lane counts in
 // the table above are unchanged.
 pub(crate) mod identity12;
+// S5 (dxvk-on-nvk): ordering the runtime context behind NVK engine work.
+pub(crate) mod nvk12;

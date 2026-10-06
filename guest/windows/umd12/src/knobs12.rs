@@ -290,7 +290,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 9] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 11] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -308,5 +308,55 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 9] {
         ("Umd12EclFence", 1),
         ("Umd12EclDrain", 0),
         ("ExecutionSyncVersion", 2),
+        // S5 (NVK on RM). Appended.
+        ("Nvk12EclSync", nvk12_ecl_sync()),
+        ("Nvk12Present", nvk12_present_mode()),
     ]
+}
+
+// --- NVK on RM (dxvk-on-nvk S5) ----------------------------------------------
+//
+// Which ICD the D3D12 engine runs on is decided in the bridge
+// (`umd_common/bridge/bridge_icd_backend.h`: `Icd`, `NvkDenyList`,
+// `NvkAllowList`, `NvkIcdPath`, and for D3D12 only `Nvk12` / `NvkDenyList12` /
+// `HELIOS_ICD12`). These two shape how an NVK device orders and presents.
+
+/// `Nvk12EclSync`: how the runtime's context is ordered behind NVK work, which
+/// the KMD cannot see (no Venus stream; the RM-fence boundary is S4).
+///
+/// | value | meaning |
+/// |---:|---|
+/// | 0 | a UMD monitored fence: each ECL makes the context wait for its value, a per-queue worker signals it from the CPU when the engine's execution stream reaches it. Nothing blocks the app thread. The default; falls back to 1 if the fence cannot be created |
+/// | 1 | CPU wait: ExecuteCommandLists returns only after its work completed (2 s cap per call, then it proceeds and counts a timeout) |
+pub(crate) static NVK12_ECL_SYNC: DwordKnob = DwordKnob::new(c"Nvk12EclSync", 0);
+
+/// `Nvk12Present` (or `HELIOS_NVK_PRESENT` in the process environment): 0 =
+/// automatic (DWM composes the back buffer from its NVK resource id when the
+/// Venus side imports foreign surfaces, `ForeignImport=1`, else scanout 0),
+/// 1 = always scanout 0 (zero-copy flip; the desktop is hidden while the app
+/// presents), 2 = always the WDDM present (DWM composes).
+pub(crate) static NVK12_PRESENT: DwordKnob = DwordKnob::new(c"Nvk12Present", 0);
+
+pub(crate) fn nvk12_ecl_sync() -> u32 {
+    NVK12_ECL_SYNC.get().min(1)
+}
+
+pub(crate) fn nvk12_present_mode() -> u32 {
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("HELIOS_NVK_PRESENT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| NVK12_PRESENT.get())
+            .min(2)
+    })
+}
+
+/// `ForeignImport` (shared with the D3D11 driver's Venus side): DWM imports
+/// NVK-made surfaces, so a windowed NVK app can be composed.
+pub(crate) fn foreign_import() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        helios_umd_common::knobs::reg_dword(c"ForeignImport").is_some_and(|v| v != 0)
+    })
 }

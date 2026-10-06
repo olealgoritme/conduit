@@ -303,6 +303,11 @@ fn build_vkd3d_bridge() {
         // whichever module the loader enumerated first becomes the single
         // publisher for the process. `umd/build.rs` lists the identical line.
         .file("../umd_common/bridge/bridge_icd_anchor.cpp")
+        // S5 (dxvk-on-nvk): ICD backend selection (global NVK with a deny-list,
+        // plus the D3D12-only levers under HELIOS_ICD_BACKEND_D3D12) and the NVK
+        // ICD loader. The same source `umd/build.rs` compiles.
+        .file("../umd_common/bridge/bridge_icd_backend.cpp")
+        .define("HELIOS_ICD_BACKEND_D3D12", None)
         .compiler(&clang_cl)
         .archiver(&archiver)
         .std("c++17")
@@ -326,6 +331,11 @@ fn build_vkd3d_bridge() {
         // source, compiled by this bridge and by `umd`'s — which is the whole
         // reason there is exactly one `bridge_guard` in the tree.
         .include("../umd_common/bridge")
+        // helios_icd_interface.h (the backend-neutral ICD table, S5) and the
+        // Khronos Vulkan headers it needs. Only `vulkan/vulkan_core.h` is reached
+        // through the latter: Khronos headers, not vkd3d's (see the next note).
+        .include("../protocol/include")
+        .include("../third_party/vkd3d-proton/khronos/Vulkan-Headers/include")
         // ⛔ NO vkd3d include directory. `vkd3d-proton-helios/include/vkd3d.h`
         // drags in `vulkan.h` and vkd3d's own widl `D3D12_*` types, which then
         // collide with the SDK's. The `D12-G1` static arm proved the Windows SDK
@@ -378,6 +388,9 @@ fn build_vkd3d_bridge() {
         "../umd_common/bridge/bridge_guard.h",
         "../umd_common/bridge/bridge_icd_anchor.cpp",
         "../umd_common/bridge/bridge_icd_anchor.h",
+        "../umd_common/bridge/bridge_icd_backend.cpp",
+        "../umd_common/bridge/bridge_icd_backend.h",
+        "../protocol/include/helios_icd_interface.h",
         "../umd_common/bridge/bridge_util.h",
         "bridge/vkd3d_bridge.cpp",
         "bridge/vkd3d_bridge.h",
