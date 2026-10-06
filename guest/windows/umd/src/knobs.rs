@@ -470,11 +470,14 @@ pub(crate) fn nvk_placeholder_allocations() -> bool {
 /// S3 CPU wait before every NVK present.
 pub(crate) static NVK_RM_FENCE: BoolKnob = BoolKnob::new(c"NvkRmFence", true);
 
-/// `NvkRmFencePresent`: 1 = when DWM composes an NVK app's frames, the WDDM
-/// present carries the RM fence in its `HEPR`/`HERF` tail and the KMD retires
-/// the present on it (needs capability bit 33, the KMD's (b) carrier).
-/// 0 (default until that KMD is tested) = the S3 CPU wait for composed frames.
-pub(crate) static NVK_RM_FENCE_PRESENT: BoolKnob = BoolKnob::new(c"NvkRmFencePresent", false);
+/// `NvkRmFencePresent`: 1 (default) = when DWM composes an NVK app's frames, the
+/// WDDM present carries the RM fence in its `HEPR`/`HERF` tail and the KMD
+/// retires the present on it (needs capability bit 33, the KMD's (b) carrier).
+/// Default on since 22.22.339.2, after a 10-minute windowed Heaven soak with no
+/// pending-flip, gate or escape timeouts (windowed Heaven 121 -> 213 fps).
+/// 0 (registry, or `HELIOS_NVK_RM_FENCE_PRESENT=0`) = the S3 CPU wait for
+/// composed frames.
+pub(crate) static NVK_RM_FENCE_PRESENT: BoolKnob = BoolKnob::new(c"NvkRmFencePresent", true);
 
 fn env_bool(name: &str) -> Option<bool> {
     std::env::var(name).ok().and_then(|v| match v.trim() {
