@@ -53,6 +53,8 @@ main(void)
    uint32_t n = 16;
    VkPhysicalDevice pd[16];
    res = vkEnumeratePhysicalDevices(inst, &n, pd);
+   if (res < 0)
+      n = 0;
    printf("physical devices: %u (%d)\n", n, res);
    int pick = -1;
    for (uint32_t i = 0; i < n; i++) {

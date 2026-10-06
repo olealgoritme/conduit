@@ -487,7 +487,7 @@ stalled on PCIe reads of DXVK's dynamic buffers in system memory, not
 computing. (The "off" rows are faster than the 62 fps in the table above
 because KMD 22.22.309/310 and the backend got faster in between.)
 
-### OpenGL on NVK: Zink (patches 32-34, 2026-10-06, `win11`, KMD 22.22.311.0)
+### OpenGL on NVK: Zink (patches 32-34, 2026-10-06, `win11`, KMD 22.22.311.0 and 312.0)
 
 `GL=1 guest/nvk-rm/build-windows.sh` also builds Zink as Mesa's gallium WGL
 ICD (`libgallium_wgl.dll`) and Mesa's `opengl32.dll`, from the same tree as
@@ -503,16 +503,22 @@ glxgears' gears with swap interval 0. App-local `opengl32.dll` +
 `libgallium_wgl.dll` + `vulkan_nouveau.dll` + `librmclient.dll`, run in the
 desktop session (scheduled task, `/it`):
 
-| | renderer | readback | compute | gears 1280x720 |
-|---|---|---|---|---|
-| 64-bit, NVK | `zink Vulkan 1.4(NVIDIA GeForce RTX 5090 (NVK GB202) (MESA_NVK))`, GL 4.6 compat | pass | pass | 406-447 fps |
-| 32-bit (WoW64), NVK | same | pass | pass | 440 fps |
-| 64-bit, `ZINK_VULKAN_ICD=loader` (Venus) | `zink Vulkan 1.4(Virtio-GPU Venus (NVIDIA GeForce RTX 5090) (NVIDIA_PROPRIETARY))` | pass | pass | 353 fps |
+| KMD | build | renderer | readback | compute | gears 1280x720 |
+|---|---|---|---|---|---|
+| 311.0 | 64-bit, NVK | `zink Vulkan 1.4(NVIDIA GeForce RTX 5090 (NVK GB202) (MESA_NVK))`, GL 4.6 compat | pass | pass | 406-447 fps |
+| 311.0 | 32-bit (WoW64), NVK | same | pass | pass | 440 fps |
+| 311.0 | 64-bit, `ZINK_VULKAN_ICD=loader` (Venus) | `zink Vulkan 1.4(Virtio-GPU Venus (NVIDIA GeForce RTX 5090) (NVIDIA_PROPRIETARY))` | pass | pass | 353 fps |
+| 312.0 | 64-bit, NVK, driver-store layout (`stage-helios-package.sh`) | NVK, as above | pass | pass | 4148-4763 fps |
+| 312.0 | 32-bit, NVK, `vulkan_nouveau32.dll` + `librmclient32.dll` | NVK | pass | pass | 4555 fps |
+| 312.0 | 64-bit, NVK, `NVK_HELIOS_WSI=0` (GDI present) | NVK | pass | pass | 1561 fps |
+| 312.0 | 64-bit, `ZINK_VULKAN_ICD=loader` (Venus) | Venus | pass | pass | 831 fps |
 
-The gears are present-bound either way: NVK's Helios scanout flip is
-refused with EBUSY while DWM owns the scanout ("frames dropped"), and with
-`NVK_HELIOS_WSI=0` (GDI, a CPU copy per present) the rate is the same,
-408 fps. Without patch 33 the first frame failed: Zink renders its default
+On KMD 311.0 the gears were present-bound: NVK's Helios scanout flip was
+refused with EBUSY ("frames dropped"), and the GDI path gave the same rate.
+On 312.0 the flip works: zero-copy present to the scanout (the window's
+content goes to scanout 0, as for every NVK swapchain without
+ForeignImport), 5x Venus. `HELIOS_ICD=venus` sends Zink to the loader
+(Venus). Without patch 33 the first frame failed: Zink renders its default
 framebuffer, a linear swapchain image, with a depth buffer.
 
 The same build registered as a Vulkan ICD (a manifest next to

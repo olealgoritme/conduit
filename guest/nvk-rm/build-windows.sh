@@ -74,10 +74,13 @@ fi
 # patches-windows-dxvk/: what a D3D11 game on DXVK needs (32-bit build fix,
 # no present wait on Win32, R/B order of the GDI present); applied last.
 series="$here/patches/*.patch $here/patches-windows/*.patch $here/patches-windows-dxvk/*.patch"
+# The whole series, in order (the start of each subject: a folded Subject:
+# line only holds its beginning), must be what is on top of the base; a tree
+# with an older or different series (another branch's patches) is rebuilt.
 # shellcheck disable=SC2086
-last_patch=$(printf "%s\n" $series | tail -1)
-last_subject=$(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$last_patch" | head -1)
-if git -C "$MESA_DIR" log --format=%s "$MESA_BASE..HEAD" 2>/dev/null | grep -qxF "$last_subject"; then
+want=$(for p in $series; do sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$p" | head -1 | cut -c1-30; done)
+have=$(git -C "$MESA_DIR" log --reverse --format=%s "$MESA_BASE..HEAD" 2>/dev/null | cut -c1-30)
+if [ -n "$have" ] && [ "$want" = "$have" ]; then
   echo "nvk-rm: Windows series already applied in $MESA_DIR"
 else
   if [ -n "$(git -C "$MESA_DIR" status --porcelain --untracked-files=no)" ]; then
