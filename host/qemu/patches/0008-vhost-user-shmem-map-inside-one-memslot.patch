@@ -1,0 +1,252 @@
+diff --color -ru a/hw/virtio/vhost-user.c b/hw/virtio/vhost-user.c
+--- a/hw/virtio/vhost-user.c	2026-10-06 02:39:25.090184775 +0200
++++ b/hw/virtio/vhost-user.c	2026-10-06 02:41:33.866297373 +0200
+@@ -1993,6 +1993,26 @@
+         }
+     }
+ 
++    /*
++     * A writable, page-aligned mapping goes inside the region's one memslot
++     * (virtio_shmem_place()): an mmap, with no memory transaction and no
++     * KVM memslot created now or deleted at unmap. Fixed-VA mappings, which
++     * must sit at an address of the fd's choosing, and read-only ones, which
++     * need a read-only memslot, keep a MemoryRegion of their own.
++     */
++    if (!(vu_mmap->flags & VHOST_USER_FLAG_MAP_FIXED_VA) &&
++        (vu_mmap->flags & VHOST_USER_FLAG_MAP_RW) &&
++        QEMU_IS_ALIGNED(vu_mmap->shm_offset, qemu_real_host_page_size()) &&
++        QEMU_IS_ALIGNED(vu_mmap->fd_offset, qemu_real_host_page_size()) &&
++        QEMU_IS_ALIGNED(vu_mmap->len, qemu_real_host_page_size()) &&
++        vu_mmap->len) {
++        if (virtio_shmem_place(shmem, fd, vu_mmap->fd_offset,
++                               vu_mmap->shm_offset, vu_mmap->len) != 0) {
++            ret = -EFAULT;
++        }
++        goto send_reply;
++    }
++
+     memory_region_transaction_begin();
+ 
+     /* Create VirtioSharedMemoryMapping object */
+@@ -2111,6 +2131,16 @@
+         goto send_reply;
+     }
+ 
++    /*
++     * An in-place mapping is taken out before the reply: it costs an mmap,
++     * and once the backend hears back it may hand the range to another
++     * mapping, which must find the old one gone.
++     */
++    if (mmap->in_place) {
++        virtio_del_shmem_map(shmem, vu_mmap->shm_offset, vu_mmap->len);
++        mmap = NULL;
++    }
++
+ send_reply:
+     if (hdr->flags & VHOST_USER_NEED_REPLY_MASK) {
+         payload->u64 = !!ret;
+diff --color -ru a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+--- a/hw/virtio/virtio.c	2026-10-06 02:39:25.086631422 +0200
++++ b/hw/virtio/virtio.c	2026-10-06 02:41:33.865711476 +0200
+@@ -3308,6 +3308,93 @@
+ #endif
+ }
+ 
++/* Fresh, empty memory over [p, p + len): what an unplaced range holds. */
++static void *virtio_shmem_empty(void *p, uint64_t len)
++{
++    return mmap(p, len, PROT_READ | PROT_WRITE,
++                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE |
++                (p ? MAP_FIXED : 0), -1, 0);
++}
++
++static VirtioSharedMemoryMapping *virtio_shmem_backing(VirtioSharedMemory *shmem)
++{
++    g_autoptr(GString) mr_name = g_string_new(NULL);
++    VirtioSharedMemoryMapping *backing;
++    uint64_t size = memory_region_size(&shmem->mr);
++    MemoryRegion *mr;
++    void *p;
++
++    if (shmem->backing) {
++        return shmem->backing;
++    }
++    p = virtio_shmem_empty(NULL, size);
++    if (p == MAP_FAILED) {
++        error_report("VIRTIO Shared Memory Region %d: reserving 0x%" PRIx64
++                     " bytes: %s", shmem->shmid, size, strerror(errno));
++        return NULL;
++    }
++    /*
++     * Owned by a mapping object, so the vhost memory listener leaves it out
++     * of the backend's memory table as it does every shmem mapping, and its
++     * finalize unmaps the range.
++     */
++    backing = VIRTIO_SHARED_MEMORY_MAPPING(
++        object_new(TYPE_VIRTIO_SHARED_MEMORY_MAPPING));
++    backing->shmid = shmem->shmid;
++    backing->offset = 0;
++    backing->len = size;
++    backing->fixed_va = p;
++    mr = g_new0(MemoryRegion, 1);
++    g_string_printf(mr_name, "virtio-shmem-%d-backing", shmem->shmid);
++    memory_region_init_ram_ptr(mr, OBJECT(backing), mr_name->str, size, p);
++    backing->mr = mr;
++
++    /* Below every subregion a fixed-VA mapping makes. */
++    memory_region_transaction_begin();
++    memory_region_add_subregion_overlap(&shmem->mr, 0, mr, -1);
++    memory_region_transaction_commit();
++    shmem->backing = backing;
++    return backing;
++}
++
++int virtio_shmem_place(VirtioSharedMemory *shmem, int fd, uint64_t fd_offset,
++                       uint64_t shm_offset, uint64_t len)
++{
++    VirtioSharedMemoryMapping *backing = virtio_shmem_backing(shmem);
++    VirtioSharedMemoryMapping *mapping;
++    uint8_t *at;
++    void *p;
++
++    if (!backing) {
++        return -1;
++    }
++    at = (uint8_t *)backing->fixed_va + shm_offset;
++    p = mmap(at, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd,
++             fd_offset);
++    if (p == MAP_FAILED) {
++        error_report("VIRTIO Shared Memory Region %d: mapping 0x%" PRIx64
++                     "+0x%" PRIx64 ": %s", shmem->shmid, shm_offset, len,
++                     strerror(errno));
++        /* A failed MAP_FIXED may have unmapped the range: never a hole. */
++        if (virtio_shmem_empty(at, len) == MAP_FAILED) {
++            error_report("VIRTIO Shared Memory Region %d: refilling 0x%" PRIx64
++                         "+0x%" PRIx64 ": %s", shmem->shmid, shm_offset, len,
++                         strerror(errno));
++            abort();
++        }
++        return -1;
++    }
++
++    mapping = VIRTIO_SHARED_MEMORY_MAPPING(
++        object_new(TYPE_VIRTIO_SHARED_MEMORY_MAPPING));
++    mapping->shmid = shmem->shmid;
++    mapping->offset = shm_offset;
++    mapping->len = len;
++    mapping->in_place = true;
++    QTAILQ_INSERT_TAIL(&shmem->mmaps, mapping, link);
++    return 0;
++}
++
+ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
+                          VirtioSharedMemoryMapping *mapping)
+ {
+@@ -3355,6 +3442,25 @@
+         return;
+     }
+ 
++    if (mapping->in_place) {
++        uint8_t *at = (uint8_t *)shmem->backing->fixed_va + mapping->offset;
++
++        /*
++         * Overwritten, not unmapped: the memslot covers the range, and the
++         * MMU notifier has zapped the guest's view of the old pages by the
++         * time this returns.
++         */
++        if (virtio_shmem_empty(at, mapping->len) == MAP_FAILED) {
++            error_report("VIRTIO Shared Memory Region %d: emptying 0x%" PRIx64
++                         "+0x%" PRIx64 ": %s", shmem->shmid, mapping->offset,
++                         mapping->len, strerror(errno));
++            abort();
++        }
++        QTAILQ_REMOVE(&shmem->mmaps, mapping, link);
++        object_unref(OBJECT(mapping));
++        return;
++    }
++
+     /*
+      * Remove from memory region first
+      */
+@@ -3538,8 +3644,7 @@
+     QSIMPLEQ_FOREACH(shmem, &vdev->shmem_list, entry) {
+         while (!QTAILQ_EMPTY(&shmem->mmaps)) {
+             VirtioSharedMemoryMapping *mapping = QTAILQ_FIRST(&shmem->mmaps);
+-            virtio_del_shmem_map(shmem, mapping->offset,
+-                                 memory_region_size(mapping->mr));
++            virtio_del_shmem_map(shmem, mapping->offset, mapping->len);
+         }
+     }
+ }
+@@ -4396,8 +4501,12 @@
+         shmem = QSIMPLEQ_FIRST(&vdev->shmem_list);
+         while (!QTAILQ_EMPTY(&shmem->mmaps)) {
+             VirtioSharedMemoryMapping *mapping = QTAILQ_FIRST(&shmem->mmaps);
+-            virtio_del_shmem_map(shmem, mapping->offset,
+-                                 memory_region_size(mapping->mr));
++            virtio_del_shmem_map(shmem, mapping->offset, mapping->len);
++        }
++        if (shmem->backing) {
++            memory_region_del_subregion(&shmem->mr, shmem->backing->mr);
++            object_unref(OBJECT(shmem->backing));
++            shmem->backing = NULL;
+         }
+ 
+         /* Clean up the embedded MemoryRegion */
+diff --color -ru a/include/hw/virtio/virtio.h b/include/hw/virtio/virtio.h
+--- a/include/hw/virtio/virtio.h	2026-10-06 02:39:25.086955523 +0200
++++ b/include/hw/virtio/virtio.h	2026-10-06 02:41:33.864755244 +0200
+@@ -129,12 +129,25 @@
+     MemoryRegion *mr;
+     /* Set when mapped at a backend-chosen host address (fixed VA). */
+     void *fixed_va;
++    /*
++     * Set when the fd is mapped inside the region's backing with MAP_FIXED
++     * (virtio_shmem_place()): there is no MemoryRegion of its own, and
++     * taking it out overwrites the range rather than deleting a memslot.
++     */
++    bool in_place;
+     QTAILQ_ENTRY(VirtioSharedMemoryMapping) link;
+ };
+ 
+ struct VirtioSharedMemory {
+     uint8_t shmid;
+     MemoryRegion mr;
++    /*
++     * One RAM region over a reserved range the size of the whole region,
++     * made on the first in-place mapping: one KVM memslot for the life of
++     * the device, which mappings are mmap()ed into and out of. NULL until
++     * then (and for a region only ever given fixed-VA mappings).
++     */
++    VirtioSharedMemoryMapping *backing;
+     QTAILQ_HEAD(, VirtioSharedMemoryMapping) mmaps;
+     QSIMPLEQ_ENTRY(VirtioSharedMemory) entry;
+ };
+@@ -408,6 +421,27 @@
+     uint64_t len);
+ 
+ /**
++ * virtio_shmem_place() - Map an fd inside a region without a memslot update
++ * @shmem: VirtioSharedMemory region
++ * @fd: File descriptor to map (not consumed)
++ * @fd_offset: Offset within the file descriptor
++ * @shm_offset: Offset within the region (page aligned)
++ * @len: Size of the mapping (page aligned)
++ *
++ * Maps @fd shared and read-write over @shm_offset of the region's backing
++ * with MAP_FIXED, creating the backing on first use. KVM sees an MMU
++ * notifier invalidation of that range and nothing else: no memslot is
++ * created, and none is deleted by virtio_del_shmem_map() later, where the
++ * range is overwritten with fresh anonymous memory. A memslot deletion on
++ * x86 zaps every SPTE of the VM (KVM_X86_QUIRK_SLOT_ZAP_ALL), which a guest
++ * that maps and unmaps device memory often pays tens of milliseconds for.
++ *
++ * Returns: 0 on success, -1 on error (the range is left empty).
++ */
++int virtio_shmem_place(VirtioSharedMemory *shmem, int fd, uint64_t fd_offset,
++                       uint64_t shm_offset, uint64_t len);
++
++/**
+  * virtio_add_shmem_map() - Add a memory mapping to a shared region
+  * @shmem: VirtioSharedMemory region
+  * @mapping: VirtioSharedMemoryMapping to add (transfers ownership)
