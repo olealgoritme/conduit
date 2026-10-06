@@ -28,12 +28,12 @@ NV12/P010/P016 video), which kept them off NVK.
 ---
  src/nouveau/vulkan/helios_icd_interface.h   |  38 +++-
  src/nouveau/vulkan/nvk_device_memory.c      |  15 +-
- src/nouveau/vulkan/nvk_helios.c             | 218 +++++++++++++++++---
+ src/nouveau/vulkan/nvk_helios.c             | 239 +++++++++++++++++---
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm.h      |  15 ++
  src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_lib.c  |   1 +
- src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c  |  32 ++-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c  |  45 +++-
  src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h |   7 +
- 7 files changed, 286 insertions(+), 40 deletions(-)
+ 7 files changed, 318 insertions(+), 42 deletions(-)
 
 diff --git a/src/nouveau/vulkan/helios_icd_interface.h b/src/nouveau/vulkan/helios_icd_interface.h
 index 14df724..6b4b338 100644
@@ -139,7 +139,7 @@ index 085090b..10992e8 100644
           tile_mode = image->planes[0].nil.tile_mode;
        }
 diff --git a/src/nouveau/vulkan/nvk_helios.c b/src/nouveau/vulkan/nvk_helios.c
-index 218c4de..d3c34a5 100644
+index 218c4de..11b0469 100644
 --- a/src/nouveau/vulkan/nvk_helios.c
 +++ b/src/nouveau/vulkan/nvk_helios.c
 @@ -27,6 +27,11 @@
@@ -154,7 +154,7 @@ index 218c4de..d3c34a5 100644
  static uint32_t
  helios_fourcc(VkFormat format)
  {
-@@ -36,65 +41,162 @@ helios_fourcc(VkFormat format)
+@@ -36,65 +41,181 @@ helios_fourcc(VkFormat format)
        return DRM_FORMAT_ARGB8888;
     case VK_FORMAT_R8G8B8A8_UNORM:
     case VK_FORMAT_R8G8B8A8_SRGB:
@@ -256,14 +256,34 @@ index 218c4de..d3c34a5 100644
     const struct nil_image_level *level = &plane->nil.levels[0];
  
 -   uint64_t modifier;
++   /* GB20x picks the GOB by element size (nil GOBType::choose): 1-byte
++    * elements (R8, A8, NV12's luma) use Blackwell8Bit, 2-byte ones (R8G8,
++    * R16, 5:6:5, NV12's chroma, P010's luma) Blackwell16Bit, the rest
++    * TuringColor2D.  The DRM modifier names it in the sector-layout field
++    * (bits 22 and 26..27: Desktop 1, Blackwell8Bpp 2, Blackwell16Bpp 3),
++    * the kind (generic memory) and GOB-kind version stay those of
++    * HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X.
++    */
++   uint64_t sector_layout;
++   switch (level->tiling.gob_type) {
++   case NIL_GOB_TYPE_TURING_COLOR2_D:  sector_layout = 1; break;
++   case NIL_GOB_TYPE_BLACKWELL8_BIT:   sector_layout = 2; break;
++   case NIL_GOB_TYPE_BLACKWELL16_BIT:  sector_layout = 3; break;
++   default:                            sector_layout = 0; break;
++   }
++
     if (level->tiling.gob_type == NIL_GOB_TYPE_LINEAR) {
 -      modifier = DRM_FORMAT_MOD_LINEAR;
+-   } else if (level->tiling.gob_type == NIL_GOB_TYPE_TURING_COLOR2_D &&
 +      *modifier = DRM_FORMAT_MOD_LINEAR;
-    } else if (level->tiling.gob_type == NIL_GOB_TYPE_TURING_COLOR2_D &&
++   } else if (sector_layout != 0 &&
                level->tiling.x_log2 == 0 && level->tiling.z_log2 == 0 &&
                level->tiling.y_log2 <= 5) {
 -      modifier = HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X | level->tiling.y_log2;
-+      *modifier = HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X | level->tiling.y_log2;
++      const uint64_t base = HELIOS_DRM_FORMAT_MOD_NVIDIA_BL_GB20X &
++                            ~((1ull << 22) | (3ull << 26));
++      *modifier = base | ((sector_layout & 1) << 22) |
++                  ((sector_layout >> 1) << 26) | level->tiling.y_log2;
     } else {
        return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
@@ -344,7 +364,7 @@ index 218c4de..d3c34a5 100644
   */
  VkResult
  nvk_helios_check_import_layout(const struct nvk_image *image,
-@@ -103,7 +205,11 @@ nvk_helios_check_import_layout(const struct nvk_image *image,
+@@ -103,7 +224,11 @@ nvk_helios_check_import_layout(const struct nvk_image *image,
     struct nvkmd_rm_foreign_layout fl;
     uint8_t pte_kind;
     uint16_t tile_mode;
@@ -357,7 +377,7 @@ index 218c4de..d3c34a5 100644
     if (result != VK_SUCCESS) {
        return vk_errorf(&image->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
                         "Helios shared surface %u: the image (format %d, "
-@@ -121,6 +227,20 @@ nvk_helios_check_import_layout(const struct nvk_image *image,
+@@ -121,6 +246,20 @@ nvk_helios_check_import_layout(const struct nvk_image *image,
                         fl.stride, fl.offset, info->modifier, info->stride,
                         info->offset);
     }
@@ -378,7 +398,7 @@ index 218c4de..d3c34a5 100644
     return VK_SUCCESS;
  }
  
-@@ -148,7 +268,9 @@ helios_memory_res_id(VkDevice _device, VkDeviceMemory _mem, VkImage _image,
+@@ -148,7 +287,9 @@ helios_memory_res_id(VkDevice _device, VkDeviceMemory _mem, VkImage _image,
     struct nvkmd_rm_foreign_layout fl;
     uint8_t pte_kind;
     uint16_t tile_mode;
@@ -389,7 +409,7 @@ index 218c4de..d3c34a5 100644
     if (result != VK_SUCCESS)
        return result;
  
-@@ -219,7 +341,7 @@ helios_scanout_present(VkDevice _device, VkDeviceMemory _mem, VkImage _image)
+@@ -219,7 +360,7 @@ helios_scanout_present(VkDevice _device, VkDeviceMemory _mem, VkImage _image)
     struct nvkmd_rm_foreign_layout fl;
     uint8_t pte_kind;
     uint16_t tile_mode;
@@ -398,7 +418,7 @@ index 218c4de..d3c34a5 100644
     if (result != VK_SUCCESS)
        return result;
     nvkmd_rm_mem_set_export_layout(mem->mem, pte_kind, tile_mode);
-@@ -281,7 +403,7 @@ helios_scanout_present_fenced(VkDevice _device, VkDeviceMemory _mem,
+@@ -281,7 +422,7 @@ helios_scanout_present_fenced(VkDevice _device, VkDeviceMemory _mem,
     uint16_t tile_mode;
     if (mem != NULL && image != NULL && mem->dedicated_image == image &&
         !image->is_compressed)
@@ -407,7 +427,7 @@ index 218c4de..d3c34a5 100644
     if (result != VK_SUCCESS) {
        /* Takes the fence in every case: nothing will wait on it now */
        nvkmd_rm_rmfence_close(dev->nvkmd, fence);
-@@ -294,6 +416,34 @@ helios_scanout_present_fenced(VkDevice _device, VkDeviceMemory _mem,
+@@ -294,6 +435,34 @@ helios_scanout_present_fenced(VkDevice _device, VkDeviceMemory _mem,
                                             fl.fourcc, fl.modifier, fence);
  }
  
@@ -442,7 +462,7 @@ index 218c4de..d3c34a5 100644
  static void
  helios_scanout_release(VkDevice _device)
  {
-@@ -320,8 +470,11 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
+@@ -320,8 +489,11 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
     if (lib != NULL && lib->win_open_device != NULL &&
         lib->win_scanout_set != NULL) {
        caps |= HELIOS_ICD_CAP_SCANOUT;
@@ -455,7 +475,7 @@ index 218c4de..d3c34a5 100644
     }
     uint64_t ops = 0;
     uint32_t features = 0;
-@@ -357,6 +510,7 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
+@@ -357,6 +529,7 @@ helios_icd_interface_v2(uint32_t version, struct helios_icd_api *out)
        .rm_fence_wait = helios_rm_fence_wait,
        .rm_fence_close = helios_rm_fence_close,
        .scanout_present_fenced = helios_scanout_present_fenced,
@@ -514,7 +534,7 @@ index 353623e..5ec98af 100644
     LOAD(win_scanout_wait_released,  "crm_win_scanout_wait_released",  false);
  
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
-index d6c7581..aba5d1b 100644
+index d6c7581..d3c8dd1 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
 +++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_win.c
 @@ -502,6 +502,23 @@ nvkmd_rm_win_rm_import_served(void)
@@ -563,6 +583,26 @@ index d6c7581..aba5d1b 100644
        if (ret == 0 && res_id != 0) {
           mem->helios_res_id = res_id;
           mem->helios_res_ctx = ctx;
+@@ -726,7 +756,18 @@ nvkmd_rm_mem_import_resource(struct nvkmd_dev *_dev,
+                        res_id, ret, ret < 0 ? strerror(-ret) : "no handle");
+    }
+ 
+-   if (check_modifier && (flags & 1u) && host_modifier != modifier) {
++   /* The host derives the modifier from the NVKMS import parameters, which
++    * carry the block height but not the GB20x sector layout (bits 22 and
++    * 26..27: the GOB of 8- and 16-bit elements, Conduit shared-formats.md),
++    * so it always says "desktop" there.  The KMD record is authoritative for
++    * those bits; compare the rest.
++    */
++   const uint64_t sector_bits = (1ull << 22) | (3ull << 26);
++   const bool host_differs =
++      fourcc_mod_is_vendor(modifier, NVIDIA) && (modifier & 0x10) ?
++      (host_modifier & ~sector_bits) != (modifier & ~sector_bits) :
++      host_modifier != modifier;
++   if (check_modifier && (flags & 1u) && host_differs) {
+       result = vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                          "Helios shared surface %u: the host knows it as "
+                          "modifier 0x%" PRIx64 ", the open said 0x%" PRIx64,
 diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
 index 3947801..d132c0e 100644
 --- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h

@@ -413,5 +413,17 @@ installed UMD otherwise:
 | NVK `a8`, `r8g8`, `r10g10b10a2`, `rgba16f`, `nv12` | refused as designed on this KMD (`memory_res_id` -11, no escape); the UMD's KMD placeholder is then refused by `pfnAllocateCb` (E_INVALIDARG) and the runtime reported DEVICE_REMOVED. Pre-existing: the same happens to `bgra8` with `NVK_HELIOS_RESID=0`. The UMD now answers E_OUTOFMEMORY for that one creation (commit e38d158); relayed to the KMD session |
 | health | no dumps, no TDR, no app crash, DWM pid unchanged |
 
-Pending: the non-32 bpp formats end to end need the KMD change (section 5);
+22.22.323.1 (KMD v321+ with `CAP_LAYOUT_FORMATS`, run by the install agent):
+NVK to NVK r16g16, r10g10b10a2, rgba16f, yuy2 byte-exact (`FgImpFmt` 7); a8,
+r8, r8g8, r16, b5g6r5, nv12, p010 refused by NVK before any escape. Cause: on
+GB20x nil uses the Blackwell8Bit / Blackwell16Bit GOBs for 1- and 2-byte
+elements, which the first 0041 did not map to a modifier. Fixed in 0041 (the
+sector-layout field, see section 5); the KMD's modifier rule must take the two
+extra families. With the fixed NVK on v323 the KMD refuses those imports
+(`vr=-2`, BAD_RANGE) and the texture fails with E_OUTOFMEMORY, cleanly; r16g16
+still passes byte-exact. The host's RmResourceImport reports the modifier from
+the NVKMS parameters, which carry no sector layout: NVK's opener ignores those
+bits when it compares (the KMD record is authoritative).
+
+Pending: the 8/16-bit-element formats end to end need the KMD modifier rule;
 then `d3d11_share.exe fmt all kmt|nt` on NVK.
