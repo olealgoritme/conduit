@@ -79,6 +79,8 @@ pub(crate) unsafe fn collect_slots<H, T>(
 pub(crate) const MAX_SRV_BIND_SLOTS: usize = 128;
 pub(crate) const MAX_SAMPLER_BIND_SLOTS: usize = 16;
 pub(crate) const MAX_CONSTANT_BUFFER_BIND_SLOTS: usize = 16;
+/// `D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT`.
+pub(crate) const MAX_VERTEX_BUFFER_BIND_SLOTS: usize = 32;
 
 /// Binding-array arms that arrived with `num` beyond their collector's cap and
 /// were clamped. The runtime validates the API-level slot limits, so a nonzero
@@ -173,6 +175,26 @@ pub(crate) unsafe fn collect_buffers(
         resource_state_at(handle.pDrvPrivate).map_or(0, |s| s.buffer_raw)
     })
 }
+/// [`collect_buffers`] for the 32 input-assembler vertex-buffer slots.
+pub(crate) unsafe fn collect_vertex_buffers(
+    num: u32,
+    h: *const ddi::D3D10DDI_HRESOURCE,
+) -> RawBinds<MAX_VERTEX_BUFFER_BIND_SLOTS> {
+    collect_raw(h, num, |handle| {
+        resource_state_at(handle.pDrvPrivate).map_or(0, |s| s.buffer_raw)
+    })
+}
+
+/// The pre-cast `ID3D11Buffer` word of one resource handle (0 for a null
+/// handle or a non-buffer resource), with no `QueryInterface` and no
+/// AddRef/Release.
+pub(crate) unsafe fn buffer_raw_of(h: ddi::D3D10DDI_HRESOURCE) -> usize {
+    if h.pDrvPrivate.is_null() {
+        return 0;
+    }
+    resource_state_at(h.pDrvPrivate).map_or(0, |s| s.buffer_raw)
+}
+
 pub(crate) unsafe fn collect_srvs(
     num: u32,
     h: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,

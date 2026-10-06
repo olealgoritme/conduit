@@ -218,6 +218,12 @@ pub struct BridgeOwned {
     /// across a bridge/COM call (COM releases and creates run arbitrary DXVK
     /// code).
     pub caches: std::sync::Mutex<ShaderCaches>,
+    /// Bumped whenever an entry leaves `caches.layout_cache` or
+    /// `caches.vs_variants` (element-layout or vertex-shader destruction,
+    /// teardown), before the evicted COM objects are released. A context's
+    /// [`CtxBindings::ia_memo`] is valid only while it carries the current
+    /// value, so a destroyed layout/VS whose address is reused never matches.
+    pub ia_gen: core::sync::atomic::AtomicU64,
     /// Immediate-context pipeline binding shadow. Per-context state — each
     /// deferred context gets its own copy when command lists land.
     pub bindings: CtxBindings,
@@ -229,6 +235,7 @@ impl BridgeOwned {
             present_src_cache: core::cell::RefCell::new(Vec::new()),
             snapshot_rings: core::cell::RefCell::new(SnapshotRingCache::default()),
             caches: std::sync::Mutex::new(ShaderCaches::default()),
+            ia_gen: core::sync::atomic::AtomicU64::new(0),
             bindings: CtxBindings::default(),
         }
     }
@@ -258,6 +265,7 @@ impl BridgeOwned {
         self.present_src_cache.get_mut().clear();
         *self.snapshot_rings.get_mut() = SnapshotRingCache::default();
         self.bindings.bound_vs_com.store(0, Ordering::Relaxed);
+        self.ia_gen.fetch_add(1, Ordering::Release);
         match self.caches.get_mut() {
             Ok(caches) => caches.release_owned_com(),
             Err(poisoned) => poisoned.into_inner().release_owned_com(),
@@ -551,6 +559,31 @@ pub struct CtxBindings {
     pub current_rt0_format: AtomicU32,
     /// Currently-bound element layout's `LayoutData` raw pointer (0 = none).
     pub current_layout: AtomicUsize,
+    /// The last (layout, VS) pair `bind_input_layout` resolved on this
+    /// context and what it resolved to. Pure memoisation of the device
+    /// caches (no binding state), so clear-state resets leave it alone; it is
+    /// keyed on [`BridgeOwned::ia_gen`].
+    pub ia_memo: std::sync::Mutex<IaMemo>,
+}
+
+/// See [`CtxBindings::ia_memo`].
+#[derive(Default, Clone, Copy)]
+pub struct IaMemo {
+    pub gen: u64,
+    pub layout: usize,
+    pub vs: usize,
+    /// The cached `ID3D11InputLayout` (owned by `layout_cache`).
+    pub input_layout: usize,
+    /// The VS to bind: `vs` itself or its input-class variant (owned by
+    /// `vs_variants`).
+    pub vs_to_bind: usize,
+}
+
+impl IaMemo {
+    pub fn get(&self, gen: u64, layout: usize, vs: usize) -> Option<(usize, usize)> {
+        (self.input_layout != 0 && self.gen == gen && self.layout == layout && self.vs == vs)
+            .then_some((self.input_layout, self.vs_to_bind))
+    }
 }
 
 impl CtxBindings {

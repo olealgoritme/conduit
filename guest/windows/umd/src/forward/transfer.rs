@@ -54,12 +54,12 @@ pub(crate) unsafe extern "system" fn resource_copy_region(
     };
     let dst = load_resource(h_dst);
     let src = load_resource(h_src);
-    let dst_summary = resource_summary(h_dst);
-    let src_summary = resource_summary(h_src);
-    let (dst_rt, dst_km) = resource_parent_handles(h_dst);
-    let (src_rt, src_km) = resource_parent_handles(h_src);
     let n = COPY_REGION_LOG_COUNT.next();
-    if n < 1024 || dst.is_none() || src.is_none() {
+    if crate::trace_enabled() && (n < 1024 || dst.is_none() || src.is_none()) {
+        let dst_summary = resource_summary(h_dst);
+        let src_summary = resource_summary(h_src);
+        let (dst_rt, dst_km) = resource_parent_handles(h_dst);
+        let (src_rt, src_km) = resource_parent_handles(h_src);
         trace_line!(
             "DDI ResourceCopyRegion: #{} dstDrv={:p} dstRT={:p} dstKM=0x{:x} \
              dstAlloc=0x{:x} dst={}x{} fmt={} srcDrv={:p} srcRT={:p} srcKM=0x{:x} \
@@ -853,7 +853,7 @@ pub(crate) unsafe extern "system" fn resource_update_subresource(
     // `read_unaligned` probes in particular are two dependent cache misses into
     // the CALLER's buffer, and they used to be paid on every BGRA/RGBA tex2d
     // update purely to produce a log field.
-    let (alloc, kind, width, height, depth, fmt) = resource_summary(h_res);
+    let alloc = resource_allocation(h_res);
     let n = UPDATE_LOG_COUNT.next();
     // DECLARED diagnostic change: the old gate's `|| alloc != 0` disjunct
     // removed the rate cap entirely for exactly the shared/primary/present
@@ -866,6 +866,10 @@ pub(crate) unsafe extern "system" fn resource_update_subresource(
         UPDATE_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
     }
     if crate::trace_enabled() && rate_ok {
+        // Three QueryInterface casts and a GetDesc: only for the log line,
+        // never on the untraced path (profiled at ~3 % of Heaven's render
+        // thread when it ran per call).
+        let (_, kind, width, height, depth, fmt) = resource_summary(h_res);
         let (rt_resource, km_resource) = resource_parent_handles(h_res);
         let (box_left, box_top, box_right, box_bottom) = if box_.is_null() {
             (
