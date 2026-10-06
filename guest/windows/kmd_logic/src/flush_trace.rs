@@ -16,7 +16,7 @@
 //!
 //! Everything here is a function of its arguments, host-tested.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{self, AtomicU32, AtomicU64, Ordering};
 
 /// Slots in the ring (a power of two: the index is one mask).
 pub const RING_LEN: usize = 64;
@@ -58,6 +58,13 @@ pub mod flag {
     pub const IMMEDIATE: u8 = 2;
     /// SubmitCommand found no private-data record at all (nothing to decode).
     pub const EMPTY: u8 = 4;
+    /// The record replaced an earlier pending one (batched into one DMA buffer): the
+    /// buffer's decoded boundary is a merge of several Renders, so the comparison with
+    /// this one is not counted ([`account`]). `MATCH` still reports it.
+    pub const EXEMPT: u8 = 8;
+    /// The fence was satisfiable at SubmitCommand but the `DMA_COMPLETED` notification
+    /// failed (or dxgkrnl's interface was unavailable): it is not tracked as queued.
+    pub const SIGNAL_FAILED: u8 = 128;
     // RETIRE
     /// The fence retired after the `WddmHeadMs` rebase: its boundary was replaced.
     pub const REBASED: u8 = 1;
@@ -175,6 +182,9 @@ impl Ring {
         // Invalidate the previous occupant before touching the payload, so a reader
         // that started on it fails its final check instead of mixing two events.
         slot.commit.store(0, Ordering::Release);
+        // A Release STORE does not stop the payload stores below from becoming visible
+        // before it: the fence does (the writer half of a seqlock).
+        atomic::fence(Ordering::Release);
         slot.meta.store(
             kind as u64 | (flags as u64) << 8 | (ctx_low as u64) << 16,
             Ordering::Relaxed,
@@ -211,7 +221,10 @@ impl Ring {
             boundary: slot.boundary.load(Ordering::Relaxed),
             stamp_100ns: slot.stamp.load(Ordering::Relaxed),
         };
-        (slot.commit.load(Ordering::Acquire) == seq).then_some(event)
+        // Reader half of the seqlock: the payload loads above must not move below the
+        // final commit load.
+        atomic::fence(Ordering::Acquire);
+        (slot.commit.load(Ordering::Relaxed) == seq).then_some(event)
     }
 
     /// The newest retained event of `kind` for `fence`, scanning newest to oldest.
@@ -249,6 +262,30 @@ pub struct PendingFlush {
     pub expected_boundary: u64,
     /// The wire floor the Render stamped, else 0.
     pub expected_floor: u64,
+    /// This record replaced an earlier one still waiting for its SubmitCommand (set by the
+    /// stash, under the context's lock). Such a record is exempt from the match accounting.
+    pub replaced: bool,
+}
+
+/// How a SubmitCommand's comparison of the decoded boundary with the merged one is counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Account {
+    Matched,
+    Mismatched,
+    /// Not counted either way: the buffer carries several Renders' merge.
+    Exempt,
+}
+
+/// A record that replaced an earlier pending one is [`Account::Exempt`] whatever the
+/// comparison said (batching is not a lost boundary); otherwise by `matched`.
+pub const fn account(pending: &PendingFlush, matched: bool) -> Account {
+    if pending.replaced {
+        Account::Exempt
+    } else if matched {
+        Account::Matched
+    } else {
+        Account::Mismatched
+    }
 }
 
 /// What [`Outstanding::insert`] did.
@@ -712,7 +749,14 @@ mod tests {
         assert_eq!(gate_bits(flag::DEGRADED | flag::BATCHED), 0);
         // The gate bits never collide with the SUBMIT / RETIRE group bits.
         assert_eq!(
-            (flag::MATCH | flag::IMMEDIATE | flag::EMPTY | flag::REBASED | flag::NO_SUBMIT | flag::AT_SUBMIT)
+            (flag::MATCH
+                | flag::IMMEDIATE
+                | flag::EMPTY
+                | flag::EXEMPT
+                | flag::SIGNAL_FAILED
+                | flag::REBASED
+                | flag::NO_SUBMIT
+                | flag::AT_SUBMIT)
                 & (flag::GATE_STREAM | flag::GATE_FENCE | flag::GATE_WIRE),
             0
         );
@@ -788,6 +832,42 @@ mod tests {
         assert_eq!(pack_event(kind::SUBMIT, 0, u32::MAX) & 0x3f_ffff, 0x3f_ffff);
         // Flags never bleed into the kind.
         assert_eq!(pack_event(kind::RENDER, 0xff, 0) >> 30, 1);
+    }
+
+    #[test]
+    fn a_replaced_record_is_exempt_from_the_match_accounting() {
+        let fresh = PendingFlush::default();
+        let batched = PendingFlush { replaced: true, ..PendingFlush::default() };
+        assert_eq!(account(&fresh, true), Account::Matched);
+        assert_eq!(account(&fresh, false), Account::Mismatched);
+        // Batching merges several Renders' boundaries into one buffer: neither verdict.
+        assert_eq!(account(&batched, true), Account::Exempt);
+        assert_eq!(account(&batched, false), Account::Exempt);
+        assert!(!PendingFlush::default().replaced);
+    }
+
+    #[test]
+    fn batching_alone_is_not_a_lost_boundary() {
+        // Every Render after the first of each pair replaced its predecessor, so each
+        // SubmitCommand was exempt: nothing matched, nothing mismatched.
+        let s = Summary {
+            render: 80,
+            submit: 40,
+            batched: 40,
+            matched: 0,
+            mismatched: 0,
+            immediate: 0,
+            retired: 40,
+            rebased: 0,
+            lag_sum_us: 40 * 5_000,
+            overlap: 0,
+        };
+        assert_eq!(verdict(&s), Verdict::GateHonest);
+        // The same run with its comparisons wrongly counted would have said BoundaryLost.
+        assert_eq!(
+            verdict(&Summary { mismatched: 40, ..s }),
+            Verdict::BoundaryLost
+        );
     }
 
     #[test]
