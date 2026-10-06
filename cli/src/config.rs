@@ -3,7 +3,7 @@
 //! | key | values | default |
 //! |---|---|---|
 //! | `view.close_stops_vm` | true, false | true: closing the window of a VM that `conduit view` started shuts it down. A VM started any other way (`conduit up`, virt-manager, virsh) always keeps running. |
-//! | `gpu.window_mib` | 1024, 2048, 4096, 8192, 16384 | the backend's own (4096): the shared window every guest CPU mapping of GPU memory goes through, in MiB. Address space, not memory. Applies when a VM's backend next starts. |
+//! | `gpu.window_mib` | auto, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144 | auto: the host GPU's BAR1 (as Resizable BAR on bare metal), clamped to what the guest's 64-bit MMIO window holds, 4096 without a GPU. The shared window every guest CPU mapping of GPU memory goes through, in MiB. Address space, not memory. Applies when a VM's backend next starts. |
 
 use crate::paths;
 use crate::ui::oops;
@@ -20,8 +20,10 @@ const KEYS: &[(&str, &[&str], &str)] = &[
     ),
     (
         "gpu.window_mib",
-        &["1024", "2048", "4096", "8192", "16384"],
-        "MiB of shared window for guest CPU mappings of GPU memory, from the next backend start (default 4096)",
+        &[
+            "auto", "1024", "2048", "4096", "8192", "16384", "32768", "65536", "131072", "262144",
+        ],
+        "MiB of shared window for guest CPU mappings of GPU memory, from the next backend start (default auto: the host GPU's BAR1)",
     ),
 ];
 
@@ -113,9 +115,10 @@ pub fn close_stops_vm() -> bool {
         .unwrap_or(true)
 }
 
-/// `gpu.window_mib`, when set: given to the backend as `--window-mib` and to
-/// conduit-vmm as `gpu-forward.window-mib`, which must agree. Unset, neither
-/// is told and both use their own default (4096).
+/// `gpu.window_mib` as a number; `None` for `auto` (unset, or set to auto).
+/// The backend gets it as `--window-mib` and conduit-vmm as
+/// `gpu-forward.window-mib`, which must agree, so `auto` is resolved once per
+/// start, by the backend itself (`run::window_mib`).
 pub fn window_mib() -> Option<u64> {
     window_mib_of(&load())
 }
@@ -143,6 +146,10 @@ mod tests {
         assert_eq!(window_mib_of(&m), None);
         m.insert("gpu.window_mib".into(), Value::String("8192".into()));
         assert_eq!(window_mib_of(&m), Some(8192));
+        m.insert("gpu.window_mib".into(), Value::String("131072".into()));
+        assert_eq!(window_mib_of(&m), Some(131072));
+        m.insert("gpu.window_mib".into(), Value::String("auto".into()));
+        assert_eq!(window_mib_of(&m), None, "auto: the backend decides");
         // Hand-edited to something the backend would refuse: not passed.
         m.insert("gpu.window_mib".into(), Value::String("3000".into()));
         assert_eq!(window_mib_of(&m), None);

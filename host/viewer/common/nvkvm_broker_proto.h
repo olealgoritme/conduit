@@ -150,6 +150,17 @@ enum {
      * A client that does not know it may ignore it and keep sending.
      */
     NVKVM_BROKER_EV_ACTIVE = 19,
+
+    /*
+     * EV_REFRESH -- send the current frame again.  The broker dropped what
+     * it was sent while it could not show it yet: the first frame of a
+     * (fourcc, modifier) goes to the import probe and is never shown, and a
+     * frame that arrives while the probe is out is dropped.  An idle guest
+     * sends no new flip, so without this a viewer that (re)connects to it
+     * keeps showing its placeholder.  A client that does not know it ignores
+     * it.
+     */
+    NVKVM_BROKER_EV_REFRESH = 20,
 };
 
 #define NVKVM_BROKER_HINT_RESTORE    0u  /* windowed, scaled: configured mode */

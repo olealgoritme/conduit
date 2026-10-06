@@ -107,9 +107,11 @@ pub struct GpuForward {
     #[serde(default)]
     pub vram_limit_mib: Option<u64>,
     /// Size of the window (BAR 2) the backend places device memory in, in
-    /// MiB: a power of two from 32 to 65536. It must be the backend's
+    /// MiB: a power of two from 32 to 4194304. It must be the backend's
     /// `--window-mib`, whose allocator hands out offsets up to its own size.
-    /// Omitted, both default to 4096. Address space only.
+    /// Omitted, both use `auto`: the host GPU's BAR1, clamped to what the
+    /// guest's 64-bit MMIO window holds (`conduit-backend --print-window-mib`
+    /// prints it; `conduit up` always writes the number). Address space only.
     #[serde(default)]
     pub window_mib: Option<u64>,
 }

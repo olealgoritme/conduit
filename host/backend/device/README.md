@@ -49,8 +49,17 @@ against a fake host driver; the skipped ones open the real `/dev/nvidiactl`.
 conduit-backend --socket /run/user/1000/conduit/vm.sock \
     --caps graphics,video,utility,compute [--vram-limit-mib 8192] \
     [--display-socket PATH]... [--console-vnc PATH] \
-    [--window-mib N] [--venus --venus-renderer PATH [--venus-hostmem-mib N]]
+    [--window-mib auto|N] [--venus --venus-renderer PATH [--venus-hostmem-mib N]]
 ```
+
+`--window-mib` (default `auto`) sizes the shared window every guest CPU
+mapping goes through: `auto` is the host GPU's BAR1 (largest among GPUs
+bound to `nvidia`, from `/sys/bus/pci/devices/*/resource`) rounded up to a
+power of two, from 4096 MiB up to what the guest's 64-bit MMIO window holds
+for this CPU's physical address bits (2 TiB at 46 bits and up), 4096 MiB
+when there is no GPU (`src/shm_regions.rs`, docs/ARCHITECTURE.md "Limits").
+`--print-window-mib` prints the number it comes to and exits; `conduit up`
+uses it to give conduit-vmm the same number.
 
 `--display-socket` may be given several times (the CLI passes the viewer's
 `display.sock` and the stream host's `stream.sock`); every frame goes to each

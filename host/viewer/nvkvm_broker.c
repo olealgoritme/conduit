@@ -792,6 +792,13 @@ void nb_sink_mode_hint(struct nb_sink *s, unsigned w, unsigned h,
     nb_emit(s, NVKVM_BROKER_EV_MODE_HINT, (int)w, (int)h, refresh_mhz, reason);
 }
 
+void nb_sink_refresh(struct nb_sink *s)
+{
+    if (s && s->client_fd >= 0) {
+        nb_emit(s, NVKVM_BROKER_EV_REFRESH, 0, 0, 0, 0);
+    }
+}
+
 void nb_sink_frame(struct nb_sink *s)
 {
     nb_emit(s, NVKVM_BROKER_EV_FRAME, 0, 0, 0, 0);

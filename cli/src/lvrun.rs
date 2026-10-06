@@ -633,6 +633,9 @@ pub fn backend_exec(name: &str) -> Result<()> {
     if let Some(s) = &venus_sock {
         cmd.arg("--venus").arg("--venus-renderer").arg(s);
     }
+    // Unset or `auto`: the backend's own `auto` (the GPU's BAR1). QEMU asks
+    // the backend for the size (GET_SHMEM_CONFIG), so there is nothing else
+    // to tell, and the guest driver reads it from the device.
     if let Some(mib) = config::window_mib() {
         cmd.arg("--window-mib").arg(mib.to_string());
     }

@@ -251,9 +251,7 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
             .arg(rt.venus_sock());
     }
     // conduit-vmm is given the same number (vm::vmm_config).
-    if let Some(mib) = crate::config::window_mib() {
-        cmd.arg("--window-mib").arg(mib.to_string());
-    }
+    cmd.arg("--window-mib").arg(p.window_mib.to_string());
     if let Some(m) = mode {
         cmd.arg("--display")
             .arg(m.to_string())
@@ -452,7 +450,7 @@ fn start_qemu(c: &VmConfig, rt: &Rt, p: &Parts) -> Result<()> {
 fn start_vm(c: &VmConfig, rt: &Rt, p: &Parts) -> Result<()> {
     let (vmm, share, kernel) = (&p.vmm, &p.share, p.boot.kernel());
     check_disk(c)?;
-    let cfg = vm::vmm_config(c, kernel, &rt.gpu_sock(), share);
+    let cfg = vm::vmm_config(c, kernel, &rt.gpu_sock(), share, p.window_mib);
     let cfg_path = rt.p("vmm.json");
     std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg)?)?;
     let log = c.logs_dir().join("vm.log");
@@ -629,6 +627,9 @@ fn prepare(c: &VmConfig) -> Result<(Rt, sys::Lock)> {
 
 /// Everything that can fail (or ask for a password) before anything is started.
 struct Parts {
+    /// The window, in MiB, decided once ([`window_mib`]): the backend's
+    /// `--window-mib` and conduit-vmm's `gpu-forward.window-mib`.
+    window_mib: u64,
     backend: PathBuf,
     kind: VmmKind,
     /// QEMU or the built-in runner.
@@ -742,6 +743,39 @@ pub(crate) fn check_memory(c: &VmConfig) -> Result<()> {
     )
 }
 
+/// The window's size for this start, in MiB: `gpu.window_mib` when it is a
+/// number, else what the backend's `auto` comes to on this host (the GPU's
+/// BAR1, clamped to the guest's 64-bit MMIO window), asked of the backend
+/// itself so the rule lives in one place. Decided once, then given to the
+/// backend and to conduit-vmm alike. A backend that cannot answer (one older
+/// than `--print-window-mib`) gets 4096, its own old default, and so does
+/// conduit-vmm.
+fn window_mib(backend: &Path, venus: bool) -> u64 {
+    if let Some(mib) = crate::config::window_mib() {
+        return mib;
+    }
+    let mut cmd = Command::new(backend);
+    cmd.arg("--print-window-mib");
+    if venus {
+        cmd.arg("--venus");
+    }
+    let out = cmd.stderr(std::process::Stdio::null()).output();
+    match out
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok()?.trim().parse::<u64>().ok())
+    {
+        Some(mib) => mib,
+        None => {
+            ui::warn(format!(
+                "{} could not size the GPU window (--print-window-mib); using 4096 MiB",
+                backend.display()
+            ));
+            4096
+        }
+    }
+}
+
 fn preflight(c: &VmConfig, want: Option<VmmKind>) -> Result<Parts> {
     check_memory(c)?;
     let backend = Tool::Backend.require()?;
@@ -773,7 +807,9 @@ fn preflight(c: &VmConfig, want: Option<VmmKind>) -> Result<Parts> {
     ui::info(format!("booting {}", boot.describe()));
     let share = ensure_share(c)?;
     net::up(c)?;
+    let window_mib = window_mib(&backend, venus.is_some());
     Ok(Parts {
+        window_mib,
         backend,
         kind,
         vmm,
