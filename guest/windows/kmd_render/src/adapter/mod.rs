@@ -1568,7 +1568,7 @@ impl AdapterContext {
             .store(primary.address, Ordering::Release);
         // `FlipPub` / `FlipPubT` (`ddi::stall_diag`): every publication, bound or kept, any
         // class. Atomics only, as this is reached from DIRQL and DISPATCH too.
-        crate::ddi::stall_diag::note_published();
+        crate::ddi::stall_diag::note_published(primary.address);
     }
 
     /// The state StartDevice established, or `None` before it ran.

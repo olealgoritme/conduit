@@ -93,8 +93,14 @@ pub mod site {
             "process_deferred_vidpn_source_address (mutex held)",
         ),
         (REFRESH_LOCKED, "queue_active_scanout_refresh (mutex held)"),
-        (DEFERRED_POST, "process_deferred_vidpn_source_address (mutex released)"),
-        (REFRESH_POST, "queue_active_scanout_refresh (mutex released)"),
+        (
+            DEFERRED_POST,
+            "process_deferred_vidpn_source_address (mutex released)",
+        ),
+        (
+            REFRESH_POST,
+            "queue_active_scanout_refresh (mutex released)",
+        ),
     ];
 }
 
@@ -306,6 +312,37 @@ pub const fn flip_address(word: u64) -> u64 {
     word & FLIP_ADDR_MASK
 }
 
+/// The 24-bit flip number a packed word carries.
+pub const fn flip_seq(word: u64) -> u32 {
+    ((word >> FLIP_ADDR_BITS) as u32) & FLIP_SEQ_MASK
+}
+
+/// Whether flip number `a` is NEWER than `b` on the wrapping 24-bit numbering: strictly ahead by
+/// less than half the range. Equal is not newer.
+pub const fn seq_newer(a: u32, b: u32) -> bool {
+    let d = a.wrapping_sub(b) & FLIP_SEQ_MASK;
+    d != 0 && d < (FLIP_SEQ_MASK + 1) / 2
+}
+
+/// A publication of `published` happened: does it complete the recorded flip? When it names the
+/// newest recorded flip's address and that flip is newer than the last one done, the flip is done:
+/// returns its number, for the driver to store. Any publisher goes through this (the worker's
+/// bind, a kept publication of any lane, the ring-1 completion), so the watchdog can never later
+/// publish the address of a flip that something newer already replaced or completed. A
+/// publication of some other address (an older flip's programming finishing while a newer flip is
+/// recorded) completes nothing.
+pub const fn flip_done_by(published: u64, flip_word: u64, done_seq: u32) -> Option<u32> {
+    if flip_word == 0 || (published & FLIP_ADDR_MASK) != flip_address(flip_word) {
+        return None;
+    }
+    let seq = flip_seq(flip_word);
+    if seq_newer(seq, done_seq) {
+        Some(seq)
+    } else {
+        None
+    }
+}
+
 // ---- the vsync tick ------------------------------------------------------------------------
 
 /// What the vsync DPC remembers between ticks (a handful of atomics in the driver).
@@ -330,8 +367,10 @@ pub struct PendInput {
     pub pub_count: u32,
     /// The newest recorded flip ([`pack_flip`]), 0 for none.
     pub flip_word: u64,
-    /// The flip word the watchdog already published, 0 for none.
-    pub fired_word: u64,
+    /// The number of the newest flip that is DONE: published by anyone (the watchdog included).
+    /// The watchdog only ever publishes a flip newer than this, so it never publishes an older
+    /// address than what was displayed last, and never the same flip twice.
+    pub done_seq: u32,
     /// The watchdog interval in ticks ([`ticks_for_ms`]), 0 = off.
     pub limit_ticks: u32,
 }
@@ -341,16 +380,16 @@ pub struct PendInput {
 pub enum WdAction {
     /// Nothing.
     None,
-    /// Publish this address as the displayed one (a kept picture), and remember the flip word
-    /// as fired. Once per flip word.
+    /// Publish this address as the displayed one (a kept picture) and mark the flip done
+    /// ([`flip_seq`] of the word that was read). Once per flip.
     Publish(u64),
 }
 
 /// One vsync tick of bookkeeping: the pending run, its maximum, the no-publication clock, and the
 /// watchdog decision. Total, atomics-sized, no allocation: it runs in the DPC.
 ///
-/// The watchdog fires when it is on (`limit_ticks != 0`), a flip is recorded and not yet fired,
-/// and the pending run has gone MORE than `limit_ticks` ticks with no publication since (every
+/// The watchdog fires when it is on (`limit_ticks != 0`), a flip is recorded and NEWER than the
+/// last one done (`done_seq`), and the pending run has gone MORE than `limit_ticks` ticks with no publication since (every
 /// publication restarts the clock: a stream of flips that each publish is progress, however long
 /// the gate stays raised). After a publication by the watchdog the clock restarts, and the same
 /// flip is never published again.
@@ -376,7 +415,7 @@ pub const fn pend_step(s: PendState, i: PendInput) -> (PendState, WdAction) {
     if i.limit_ticks != 0
         && stall > i.limit_ticks
         && i.flip_word != 0
-        && i.flip_word != i.fired_word
+        && seq_newer(flip_seq(i.flip_word), i.done_seq)
     {
         let address = flip_address(i.flip_word);
         if address != 0 {
@@ -612,22 +651,22 @@ mod tests {
         let (s, acts) = run(PendState::default(), 500, |_| PendInput {
             pending: true,
             flip_word: w,
-            // The driver stores the fired word once it published.
-            fired_word: 0,
+            // The driver stores the flip as done once it published.
+            done_seq: 0,
             limit_ticks: limit,
             ..PendInput::default()
         });
         // Fires on the tick that EXCEEDS the interval (the clock reads limit + 1), and, because
-        // the test never stores the fired word, again each limit + 1 ticks: the driver's store of
-        // the fired word is what makes it once.
+        // the test never stores the done number, again each limit + 1 ticks: the driver's store of
+        // it is what makes it once.
         assert_eq!(acts[0], (limit + 1, WdAction::Publish(0x4000)));
         assert_eq!(acts[1].0, 2 * (limit + 1));
         assert!(s.pend == 500);
-        // With the fired word stored (what the driver does) it never repeats.
+        // With the done number stored (what the driver does) it never repeats.
         let (_, acts) = run(PendState::default(), 5_000, |_| PendInput {
             pending: true,
             flip_word: w,
-            fired_word: w,
+            done_seq: flip_seq(w),
             limit_ticks: limit,
             ..PendInput::default()
         });
@@ -703,7 +742,7 @@ mod tests {
             s = n;
         }
         // Stuck on w1 until it fires, then the driver stores it as fired.
-        let mut fired = 0u64;
+        let mut fired = 0u32;
         let mut fires = Vec::new();
         for _ in 0..40 {
             let (n, a) = pend_step(
@@ -711,14 +750,14 @@ mod tests {
                 PendInput {
                     pending: true,
                     flip_word: w1,
-                    fired_word: fired,
+                    done_seq: fired,
                     limit_ticks: limit,
                     ..Default::default()
                 },
             );
             s = n;
             if let WdAction::Publish(addr) = a {
-                fired = w1;
+                fired = flip_seq(w1);
                 fires.push(addr);
             }
         }
@@ -730,14 +769,14 @@ mod tests {
                 PendInput {
                     pending: true,
                     flip_word: w2,
-                    fired_word: fired,
+                    done_seq: fired,
                     limit_ticks: limit,
                     ..Default::default()
                 },
             );
             s = n;
             if let WdAction::Publish(addr) = a {
-                fired = w2;
+                fired = flip_seq(w2);
                 fires.push(addr);
             }
         }
@@ -775,7 +814,7 @@ mod tests {
         let w1 = word(1, 0x1000);
         let mut s = PendState::default();
         let mut pubs = 0u32;
-        let mut fired = 0u64;
+        let mut fired = 0u32;
         let mut fire_ticks = Vec::new();
         for t in 1..=200u32 {
             let flip = if t < 100 { w1 } else { word(2, 0x2000) };
@@ -785,13 +824,13 @@ mod tests {
                     pending: true,
                     pub_count: pubs,
                     flip_word: flip,
-                    fired_word: fired,
+                    done_seq: fired,
                     limit_ticks: limit,
                 },
             );
             s = n;
             if let WdAction::Publish(_) = a {
-                fired = flip;
+                fired = flip_seq(flip);
                 pubs += 1;
                 fire_ticks.push(t);
             }
@@ -801,6 +840,105 @@ mod tests {
         // The pipeline stayed stuck with no publication but the watchdog's own, so the clock had
         // long exceeded the interval when the newer flip appeared: that one fires at once.
         assert_eq!(fire_ticks[1], 100);
+    }
+
+    // ---- done numbers: a watchdog never publishes an older address ---------------------------
+
+    #[test]
+    fn sequence_order_wraps_in_24_bits() {
+        assert!(seq_newer(1, 0));
+        assert!(!seq_newer(0, 0));
+        assert!(!seq_newer(0, 1));
+        assert!(seq_newer(0, 0xFF_FFFF), "0 follows 0xFFFFFF");
+        assert!(!seq_newer(0xFF_FFFF, 0));
+        assert!(seq_newer(0x7F_FFFF, 0));
+        assert!(
+            !seq_newer(0x80_0000, 0),
+            "half the range ahead is not newer"
+        );
+        assert_eq!(flip_seq(word(0x12_3456, 0x1000)), 0x12_3456);
+        assert_eq!(flip_seq(0), 0);
+    }
+
+    #[test]
+    fn a_publication_of_the_recorded_address_completes_that_flip_only() {
+        let w = word(5, 0x4000);
+        assert_eq!(flip_done_by(0x4000, w, 4), Some(5));
+        assert_eq!(flip_done_by(0x4000, w, 5), None, "already done");
+        assert_eq!(flip_done_by(0x4000, w, 9), None, "something newer is done");
+        // Another address (an older flip's programming finishing): completes nothing.
+        assert_eq!(flip_done_by(0x3000, w, 0), None);
+        // Nothing recorded.
+        assert_eq!(flip_done_by(0x4000, 0, 0), None);
+        // A published address wider than the word carries compares on its low 40 bits only.
+        assert_eq!(flip_done_by((1 << 41) | 0x4000, w, 4), Some(5));
+    }
+
+    #[test]
+    fn the_watchdog_never_publishes_an_older_flip_than_one_already_done() {
+        // Flip 5 (address A) is stuck pending. Flip 6 (address B) is then issued and completed
+        // by a direct publisher (a keep: FkDdi, the DMA keep record, ForeignFlip): the word now
+        // names 6 and the publication marked it done. The pipeline stays stuck on flip 5's gate.
+        let limit = 10;
+        let w5 = word(5, 0xA000);
+        let w6 = word(6, 0xB000);
+        let mut done = 4u32;
+        let mut s = PendState::default();
+        let mut published = std::vec::Vec::new();
+        for t in 1..=200u32 {
+            let flip = if t < 5 { w5 } else { w6 };
+            if t == 5 {
+                // flip 6 published directly
+                done = flip_done_by(0xB000, w6, done).unwrap();
+                published.push(0xB000u64);
+            }
+            let (n, a) = pend_step(
+                s,
+                PendInput {
+                    pending: true,
+                    pub_count: if t < 5 { 0 } else { 1 },
+                    flip_word: flip,
+                    done_seq: done,
+                    limit_ticks: limit,
+                },
+            );
+            s = n;
+            if let WdAction::Publish(addr) = a {
+                published.push(addr);
+            }
+        }
+        assert_eq!(
+            published,
+            std::vec![0xB000],
+            "flip 5's address must never be published after flip 6's"
+        );
+    }
+
+    #[test]
+    fn an_older_flip_recorded_after_a_newer_one_done_is_never_published() {
+        // The numbers race: the older flip's record lands last (two issuing contexts).
+        let (w6, w5) = (word(6, 0xB000), word(5, 0xA000));
+        let (_, acts) = run(PendState::default(), 500, |_| PendInput {
+            pending: true,
+            flip_word: w5,
+            done_seq: flip_seq(w6),
+            limit_ticks: 5,
+            ..PendInput::default()
+        });
+        assert!(acts.is_empty());
+    }
+
+    #[test]
+    fn the_watchdog_fires_for_a_newer_flip_across_the_24_bit_wrap() {
+        let w = word(0, 0x4000); // 0 follows 0xFFFFFF
+        let (_, acts) = run(PendState::default(), 50, |_| PendInput {
+            pending: true,
+            flip_word: w,
+            done_seq: 0xFF_FFFF,
+            limit_ticks: 5,
+            ..PendInput::default()
+        });
+        assert_eq!(acts.len() >= 1, true);
     }
 
     // ---- the Deferred budget -------------------------------------------------------------

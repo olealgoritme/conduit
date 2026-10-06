@@ -92,24 +92,49 @@ static FLIP_ISS: AtomicU32 = AtomicU32::new(0);
 static FLIP_PUB: AtomicU32 = AtomicU32::new(0);
 static FLIP_PUB_T: AtomicU32 = AtomicU32::new(0);
 
-/// A flip was issued by dxgkrnl. Atomics only, any IRQL.
-pub(crate) fn note_flip_issued() {
-    FLIP_ISS.fetch_add(1, Ordering::Relaxed);
+/// A flip was issued by dxgkrnl, naming `address`: count it, give it its number (the new
+/// `FlipIss`, 24 bits on the wire of the word) and record it as the NEWEST flip for the watchdog
+/// (one packed store). Atomics only, any IRQL (`SetVidPnSourceAddress` at DIRQL, the DMA lane at
+/// DISPATCH). Every issued flip is recorded, whether its programming will be pending (the gate
+/// is raised) or a direct publisher completes it at once (an unpaired handle, a keep record,
+/// `ForeignFlip`): the watchdog only ever publishes the newest recorded flip and only if it is
+/// newer than the last one done (`note_published`), so it cannot republish an address that a
+/// newer flip replaced. An address the word cannot carry (zero, or 40 bits or more) clears the
+/// word instead, so an OLDER flip's address is never fired for this one (`FlipWdBig`).
+pub(crate) fn note_flip_issued(address: u64) {
+    let seq = FLIP_ISS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    match sd::pack_flip(seq, address) {
+        Some(word) => FLIP_WORD.store(word, Ordering::Release),
+        None => {
+            FLIP_WORD.store(0, Ordering::Release);
+            if address != 0 {
+                WD_BIG.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
-/// An address was published as the displayed one. Atomics only, any IRQL.
-pub(crate) fn note_published() {
+/// An address was published as the displayed one: `address` (any publisher: the worker's bind,
+/// a kept publication of any lane, the ring-1 completion DPC, the watchdog). Counts it and, when
+/// it names the newest recorded flip, marks that flip done. Atomics only, any IRQL.
+pub(crate) fn note_published(address: u64) {
     FLIP_PUB.fetch_add(1, Ordering::Relaxed);
     FLIP_PUB_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
+    if let Some(seq) = sd::flip_done_by(
+        address,
+        FLIP_WORD.load(Ordering::Acquire),
+        DONE_SEQ.load(Ordering::Relaxed),
+    ) {
+        DONE_SEQ.store(seq, Ordering::Relaxed);
+    }
 }
 
 // ---- the vsync tick and the watchdog -------------------------------------------------------
 
-/// The newest pending flip as one packed word (`stall_diag::pack_flip`), the word the watchdog
-/// already published, and the flip numbering.
+/// The newest issued flip as one packed word (`stall_diag::pack_flip`: its number and address),
+/// and the number of the newest flip that is DONE (published by anyone, the watchdog included).
 static FLIP_WORD: AtomicU64 = AtomicU64::new(0);
-static FIRED_WORD: AtomicU64 = AtomicU64::new(0);
-static FLIP_SEQ: AtomicU32 = AtomicU32::new(0);
+static DONE_SEQ: AtomicU32 = AtomicU32::new(0);
 /// The vsync DPC's state between ticks (`stall_diag::PendState`): the consecutive-pending run
 /// (`VsPendN`), its maximum (`VsPendMax`), the no-publication clock and the `FlipPub` last seen.
 static VS_PEND: AtomicU32 = AtomicU32::new(0);
@@ -126,25 +151,6 @@ static WD_BIG: AtomicU32 = AtomicU32::new(0);
 static WDOG_MS: AtomicU32 = AtomicU32::new(0);
 static DEFER_BUDGET: AtomicU32 = AtomicU32::new(0);
 
-/// Record the newest pending flip's address for the watchdog: called where a flip's programming
-/// gate is raised (`set_vidpn_source_address_dirql`, `arm_dma_flip_programming`), after the
-/// handle paired. One packed store, no read-modify-write of shared state beyond the sequence:
-/// legal at DIRQL. An address the word cannot carry (zero, or 40 bits or more) records nothing,
-/// and clears the older word so the watchdog cannot publish ANOTHER flip's address for this one
-/// (counted `FlipWdBig`).
-pub(crate) fn note_flip_pending(address: u64) {
-    let seq = FLIP_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-    match sd::pack_flip(seq, address) {
-        Some(word) => FLIP_WORD.store(word, Ordering::Release),
-        None => {
-            FLIP_WORD.store(0, Ordering::Release);
-            if address != 0 {
-                WD_BIG.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
 /// One vsync tick of bookkeeping (`VsPendN`, its maximum) and, with `FlipWdogMs` set, the
 /// watchdog. Called from the vsync DPC (`adapter/kobj.rs`, DISPATCH, atomics only). The tick is
 /// serialized (one-shot, re-armed by its own DPC), so the state is plain loads and stores.
@@ -152,7 +158,10 @@ pub(crate) fn note_flip_pending(address: u64) {
 /// The watchdog publishes the newest recorded flip's address as a kept picture
 /// (`AdapterContext::publish_kept_primary`, one atomic store, legal at DISPATCH) once the
 /// pending run has gone `FlipWdogMs` worth of ticks without any publication, for ANY class of
-/// allocation including Venus, and never twice for the same flip. The kept address names a
+/// allocation including Venus, only if that flip is NEWER than the last one done (published by
+/// anyone: `note_published` marks the newest recorded flip done whenever its address is
+/// published), so never twice for the same flip and never the address of a flip a newer one
+/// already replaced or completed. The kept address names a
 /// picture that is not on the screen: this is recovery, not completion, and only the opt-in knob
 /// allows it. It does not lower the programming gate or touch the pending slot: the worker
 /// still owns the programming and will bind or reject it as before.
@@ -172,7 +181,7 @@ pub(crate) fn on_vsync_tick(adapter: &AdapterContext, period_100ns: u64) {
             pending,
             pub_count: FLIP_PUB.load(Ordering::Relaxed),
             flip_word,
-            fired_word: FIRED_WORD.load(Ordering::Relaxed),
+            done_seq: DONE_SEQ.load(Ordering::Relaxed),
             limit_ticks: if wdog_ms == 0 {
                 0
             } else {
@@ -185,7 +194,8 @@ pub(crate) fn on_vsync_tick(adapter: &AdapterContext, period_100ns: u64) {
     VS_STALL.store(next.stall, Ordering::Relaxed);
     VS_SEEN_PUB.store(next.seen_pub, Ordering::Relaxed);
     if let WdAction::Publish(address) = action {
-        FIRED_WORD.store(flip_word, Ordering::Relaxed);
+        // Done BEFORE the publication (which would mark it too): the same flip never fires twice.
+        DONE_SEQ.store(sd::flip_seq(flip_word), Ordering::Relaxed);
         adapter.publish_kept_primary(address);
         WD_COUNT.fetch_add(1, Ordering::Relaxed);
         WD_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);
@@ -273,7 +283,6 @@ pub(crate) fn start_generation() {
         &FLIP_ISS,
         &FLIP_PUB,
         &FLIP_PUB_T,
-        &FLIP_SEQ,
         &VS_PEND,
         &VS_PEND_MAX,
         &VS_STALL,
@@ -286,7 +295,7 @@ pub(crate) fn start_generation() {
         c.store(0, Ordering::Relaxed);
     }
     FLIP_WORD.store(0, Ordering::Release);
-    FIRED_WORD.store(0, Ordering::Relaxed);
+    DONE_SEQ.store(0, Ordering::Relaxed);
     DEFER_HANDLE.store(0, Ordering::Relaxed);
     START_N.fetch_add(1, Ordering::Relaxed);
     START_T.store(AdapterContext::interrupt_time_ms(), Ordering::Relaxed);

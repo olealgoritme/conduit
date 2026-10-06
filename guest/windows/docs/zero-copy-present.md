@@ -1289,14 +1289,20 @@ the A/B that tells a Deferred livelock (the stall clears, `FkDefBud` moves) from
 
 `FlipWdogMs` (default 0 = off). Clamped to 50..60 000 when nonzero. With it set:
 
-* The vsync DPC keeps the address of the newest pending flip (recorded where the gate is raised:
-  `set_vidpn_source_address_dirql` for the MMIO contract, `arm_dma_flip_programming` for the DMA contract) as one packed
-  word. When the pending run (`VsPendN`) has gone more than `FlipWdogMs` worth of ticks (`ticks_for_ms`, rounded up) with
+* EVERY flip dxgkrnl issues is recorded as the newest flip, as one packed word of its number (the new `FlipIss`, 24 bits)
+  and its address: `note_flip_issued` at the top of `SetVidPnSourceAddress` and in both DMA branches of `arm_dma_flip`,
+  before the flip can be paired, raise the gate, or be completed by a direct publisher (an unpaired handle `FkDdi`, a DMA
+  keep record, `ForeignFlip`). The last DONE flip number is advanced by EVERY publication (`note_published`, from
+  `publish_displayed_primary` and the ring-1 DPC): when the published address is the newest recorded flip's, that flip is
+  done. When the pending run (`VsPendN`) has gone more than `FlipWdogMs` worth of ticks (`ticks_for_ms`, rounded up) with
   NO publication since (every publication restarts the clock, so a stream of flips that each publish is progress however
-  long the gate stays raised), it publishes that address with `publish_kept_primary` (one atomic store, legal at
-  DISPATCH), counted `FlipWd` / `FlipWdT`. Class independent, Venus included. Never twice for the same flip (the fired
-  word is remembered); a newer flip that is still stuck after the interval fires again; the watchdog's own publication
-  restarts the clock. It does not lower the gate or touch the pending slot: the worker still owns the programming.
+  long the gate stays raised), and the newest recorded flip is NEWER than the last one done (wrapping 24-bit order), it
+  publishes that flip's address with `publish_kept_primary` (one atomic store, legal at DISPATCH), counted `FlipWd` /
+  `FlipWdT`. Class independent, Venus included. So it never publishes the same flip twice, never the address of an OLDER
+  flip than one already done (a flip n stuck behind a gate while a direct publisher completes flip n+1 stays unpublished),
+  and a newer flip that is still stuck after the interval fires again; the watchdog's own publication restarts the clock.
+  A flip whose address the word cannot carry (zero, 40 bits or more) clears the word instead (`FlipWdBig`), so no older
+  address is fired for it. It does not lower the gate or touch the pending slot: the worker still owns the programming.
 * The Venus direct exits publish kept too: `GaveUp` (the refusal-retry budget) and permanent rejects of a VENUS flip in
   the deferred wrapper, which by default complete nothing (`FkVenus`). Foreign and hollow flips are untouched (they
   already publish kept). The inline (PASSIVE DDI) wrapper is not changed: its refusal status reaches dxgkrnl directly.
@@ -1359,7 +1365,8 @@ together. If `StallT` does not move, see 14.2 (nothing is writing the block).
 Verified (host tests, `kmd_logic`): the vsync tick bookkeeping (pending run, maximum, saturation, the no-publication clock
 restarting on every publication, idle ticks resetting it); the watchdog decision (off never fires; fires after exactly the
 interval, never earlier; once per flip word; again for a newer stuck flip; a stream of publishing flips is progress; needs
-a recorded flip; idle never fires); the flip word (round trip, never 0, 40-bit limit, 24-bit sequence wrap); ticks from
+a recorded flip; idle never fires; never a flip older than one already done, across the 24-bit wrap too; a publication completes
+the newest recorded flip only when it names its address); the flip word (round trip, never 0, 40-bit limit, 24-bit sequence wrap); ticks from
 milliseconds (rounded up, never earlier, zero = off); the Deferred budget (0 unlimited, exactly `budget` attempts, a new
 handle restarts it); the knob clamps; the site ids (dense, unique); the counter names (at most 14 characters, unique, no
 collision with any other literal in `kmd_render` or quoted name in `kmd_logic`, no 14-character truncation onto one, the

@@ -1922,8 +1922,9 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     let primary_segment = unsafe { (*address).PrimarySegment };
     let primary_address = unsafe { (*address).PrimaryAddress.QuadPart as u64 };
     let primary_flags = unsafe { (*address).Flags.__bindgen_anon_1.Value };
-    // `FlipIss` (`ddi::stall_diag`): a flip dxgkrnl issued. Atomics only, legal at DIRQL.
-    crate::ddi::stall_diag::note_flip_issued();
+    // `FlipIss` (`ddi::stall_diag`): a flip dxgkrnl issued, recorded as the newest for the
+    // watchdog. Atomics only, legal at DIRQL. Before anything below can publish or raise the gate.
+    crate::ddi::stall_diag::note_flip_issued(primary_address);
 
     // Dxgkrnl's MMIO-flip path invokes this DDI under DxgkCbSynchronizeExecution
     // at DIRQL. At that IRQL it is illegal to write registry diagnostics, wait on
@@ -2065,8 +2066,6 @@ pub(crate) unsafe fn arm_dma_flip_programming(
         crate::ddi::scanout_trace::note_ddi_pair_failed();
         return false;
     }
-    // The watchdog's record of this flip, before the raise (see `set_vidpn_source_address_dirql`).
-    crate::ddi::stall_diag::note_flip_pending(primary_address);
     let _ticket = adapter.raise_programming_gate();
     let previous = adapter
         .pending_vidpn_allocation
@@ -2341,10 +2340,6 @@ unsafe fn set_vidpn_source_address_dirql(
     // address until this primary has actually been published; that is the
     // scanout pipeline's truthful current address.
     //
-    // The watchdog's record of this flip (`ddi::stall_diag::note_flip_pending`: the address as
-    // one packed word; atomics only, legal at DIRQL), BEFORE the raise so a tick that sees the
-    // gate never pairs it with an older flip's word.
-    crate::ddi::stall_diag::note_flip_pending(primary_address);
     // Raising bumps the generation and sets the active flag in ONE publication,
     // so a completion can tell which interval it belongs to.
     let _ticket = adapter.raise_programming_gate();
