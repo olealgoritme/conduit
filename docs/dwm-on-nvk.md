@@ -138,3 +138,39 @@ Run each step only in a quiet window agreed with the install agent. Always end w
   * A TDR while on NVK: DWM recreates its device.
 * **T7 soak.** 30 min of desktop use: a mode change, the lock screen (LogonUI is deny-listed: a
   Venus surface under an NVK DWM), sleep of the viewer.
+
+## 6. Results
+
+### T1 (2026-10-06 09:42, 22.22.319.2; `Icd` removed and `NvkAllowList=dwm.exe` for 30 s)
+
+* **First NVK DWM (pid 9068) died within 2 s** with `STATUS_STACK_OVERFLOW` (0xc00000fd), Application
+  event 1000. The dump is `W:\dumps\dwm.exe.9068.dmp`.
+  * Where: thread "DWM LPC Port Thread", whose stack is **128 KiB** (TIB 0x...d4fd0000 to
+    0x...d4fb0000; dwm.exe's PE default is 512 KiB). DWM creates its D3D11 device on that thread.
+  * Stack: `d3d11!D3D11CoreCreateDevice` > `helios_umd!OpenAdapter10_2...` > the UMD's device creation
+    (a 43 KiB frame) > `vulkan_nouveau` device bring-up (frames of 28 and 17 KiB) >
+    `RtlAllocateHeap` > overflow.
+  * Venus fits in 128 KiB; NVK does not. **Fixed in the UMD**: an NVK device creation on a thread with
+    less than 8 MiB of stack runs on a helper thread with 8 MiB (`run_with_stack`,
+    `dxvk_bridge.cpp`).
+* **Second NVK DWM (pid 2788) came up** (it created its first device on a different thread) and lived
+  about 20 s, until the revert:
+  * three DXVK devices on NVK (icd caps 0xf7);
+  * six 5120x1440 swap-chain buffers with foreign ids (res 538 to 543, holder ctx 63, modifier
+    0x0300000000606014, stride 20480, 128-byte private data, three of them `Flags.Primary`): **the
+    adoption path works for DWM's primaries**;
+  * every `OpenResource` of a Venus window surface was refused (`E_FAIL`, res 77 800x704 A8, res 41
+    1024x1024, res 43 704x704). DWM survived these but composed nothing;
+  * **its first frame went to NVK's own scanout source** ("NVK present: 1 frames on scanout 0 on RM
+    fences"). Present #3 and #4 then entered `nvk_present_frame` and never came back: DWM's render
+    thread hung for the rest of the run. **Fixed in the UMD**: DWM always presents through the WDDM
+    flip.
+* KMD counters across the run:
+  * `FgImp`/`FgAdo` +17 (the adoptions), `FgOpen` +17;
+  * `CpImpSt` 16, `CpReq` 31457280 (one 5120x1440 buffer), `CpBit` 3 and `FcOff` +4: the KMD tried
+    the foreign copy (Blt model) for a 5120x1440 NVK buffer while that copy is off;
+  * `PBRet` 0xC000000D (`STATUS_INVALID_PARAMETER`);
+  * `ScFnc` +143009 and `ScVs` +118824 in 30 s (to be read with the KMD session);
+  * `VsR4` 536.
+* Revert: `Icd=venus` restored, `NvkAllowList` removed, DWM killed once. The Venus DWM (pid 10916)
+  kept the same pid for 30 s. No TDR, no reboot.
