@@ -99,6 +99,7 @@ is the next step. Nine more Mesa patches on top of the 13 above, in `patches-win
 | 27 | `nvk/rm: let the GPU cache coherent host-visible system memory in L2` | host-visible system memory mapped GPU-cacheable, L2 sysmem invalidate at the start of every submit (`NVK_RM_SYSMEM_CACHED=0` off). Generic RM code (Linux series: patch 15 on perf/nvk-rm-efficiency) |
 | 28 | `nvk/rm: compressible VRAM for images on GB20x` | `has_compression`: dedicated image memory allocated COMPR_ANY and mapped with the compressible GMK kind (`NVK_RM_COMPRESSION=0` off). Generic RM code (Linux: patch 16) |
 | 29 | `nvk/rm: ZCULL from NV2080_CTRL_CMD_GR_GET_ZCULL_INFO` | `has_zcull_info` (`NVK_RM_ZCULL=0` off). Generic RM code (Linux: patch 17) |
+| 35 | `nvk/rm: video decode on an NVDEC channel` | NVK's H.264 Vulkan Video decode on GB20x's NVDEC (NVCFB0): `cls_vdec` from the class list, `NVKMD_ENGINE_VDEC` contexts on the NVDEC0 runlist, SET_OBJECT with the device's class. Needs `-Dvideo-codecs=h264dec` and `NVK_EXPERIMENTAL=video`; bit-exact in `win11` and on the host (see `docs/video.md`). Generic RM code |
 
 Linux behaviour is unchanged: the full series (20 patches) builds the Linux
 NVK (nouveau + RM) as before, with the same `.so` exports; the patches apply
