@@ -220,6 +220,7 @@ isolation like a dedicated GPU: only run VMs you trust. See
 | `conduit view` says no KVM | Enable virtualization (VT-x / AMD-V) in your BIOS |
 | Black window | `conduit status myvm`, then `conduit logs myvm` |
 | Low fps when idle | Normal: the VM only draws when something changes |
+| Short stutters or freezes in the VM, benchmark numbers that swing | The host is starving it (swap, builds on its cores): see [host tuning](docs/HOST-TUNING.md) |
 | "not enough free memory" | Close apps or give the VM less RAM; `--no-mem-check` skips the check |
 | Overlay says `COMPOSITED` in fullscreen | Your desktop composites the window; see [direct scanout](docs/SCANOUT.md). On Hyprland: `conduit view myvm --tune-hyprland`, then `Ctrl+Alt+F`, `Ctrl+Alt+D` |
 | Stream: "ports are in use" | Another `conduit stream` or Sunshine is running; stop it, or use `--port 48089` |
