@@ -93,6 +93,7 @@ struct win_ctx {
     D3DKMT_HANDLE context;
 
     uint32_t max_buffer; /* QUERY_CAPS.max_buffer_bytes */
+    uint64_t supported_ops; /* QUERY_CAPS.supported_ops: bit n = HELIOS_NVRM_OP n */
     uint64_t epoch;      /* the KMD's device generation at init */
 
     /* Host's per-class allocation parameter sizes (GetSysFiles section 3). */
@@ -163,6 +164,10 @@ static int kmd_status_to_errno(int32_t status)
         return -ETIMEDOUT;
     case HELIOS_NVRM_ST_BAD_RANGE:
         return -EINVAL;
+    case HELIOS_NVRM_ST_SCANOUT_BUSY:
+        return -EBUSY;
+    case HELIOS_NVRM_ST_NO_SOURCE:
+        return -ENOENT;
     default:
         return -EIO;
     }
@@ -302,6 +307,7 @@ static int probe_adapter(struct win_ctx *c, D3DKMT_HANDLE adapter, D3DKMT_HANDLE
         if (caps.max_buffer_bytes < 4096)
             goto reject;
         c->max_buffer = caps.max_buffer_bytes;
+        c->supported_ops = caps.supported_ops;
         c->epoch = caps.head.epoch;
         *out_device = cd.hDevice;
         *out_context = context;
@@ -1110,6 +1116,83 @@ int crm_win_scanout_flip(const struct crm_scanout_flip *flip)
     return r ? r : reply_status(resp, n);
 }
 
+/* Foreign scanout source (KMD 22.22.308+, QUERY_CAPS bits 9..11): the KMD owns
+ * the ScanoutFlip, mints its seq and keeps the desktop's own flips off scanout 0
+ * while the source is live. -ENOSYS from a KMD without the ops: send ScanoutFlip
+ * with crm_win_scanout_flip instead. */
+static int scanout_op_ready(struct win_ctx *c, uint32_t op)
+{
+    if (!c->ready)
+        return -ENODEV;
+    return (c->supported_ops & (1ull << op)) ? 0 : -ENOSYS;
+}
+
+int crm_win_scanout_set(struct crm_scanout_source *src)
+{
+    struct win_ctx *c = &g_ctx;
+    int r = scanout_op_ready(c, HELIOS_NVRM_OP_SCANOUT_SET);
+    if (r)
+        return r;
+    HeliosNvrmScanoutSet s;
+    memset(&s, 0, sizeof(s));
+    helios_nvrm_init(&s.head, HELIOS_NVRM_OP_SCANOUT_SET, sizeof(s));
+    s.handle = src->handle;
+    s.width = src->width;
+    s.height = src->height;
+    s.stride = src->stride;
+    s.offset = src->offset;
+    s.fourcc = src->fourcc;
+    s.lapse_ms = src->lapse_ms;
+    s.modifier = src->modifier;
+    r = nvrm_escape(c, &s, sizeof(s));
+    if (r)
+        return r;
+    if (s.head.status != HELIOS_NVRM_ST_OK)
+        return kmd_status_to_errno(s.head.status);
+    if (s.out_generation == 0)
+        return -EIO;
+    src->lapse_ms = s.lapse_ms;
+    src->generation = s.out_generation;
+    return 0;
+}
+
+int crm_win_scanout_present(uint32_t handle, uint32_t gem, uint64_t *seq)
+{
+    struct win_ctx *c = &g_ctx;
+    int r = scanout_op_ready(c, HELIOS_NVRM_OP_SCANOUT_PRESENT);
+    if (r)
+        return r;
+    HeliosNvrmScanoutPresent p;
+    memset(&p, 0, sizeof(p));
+    helios_nvrm_init(&p.head, HELIOS_NVRM_OP_SCANOUT_PRESENT, sizeof(p));
+    p.handle = handle;
+    p.gem = gem;
+    r = nvrm_escape(c, &p, sizeof(p));
+    if (r)
+        return r;
+    if (p.head.status != HELIOS_NVRM_ST_OK)
+        return kmd_status_to_errno(p.head.status);
+    if (seq)
+        *seq = p.out_seq;
+    return 0;
+}
+
+int crm_win_scanout_release(uint32_t handle)
+{
+    struct win_ctx *c = &g_ctx;
+    int r = scanout_op_ready(c, HELIOS_NVRM_OP_SCANOUT_RELEASE);
+    if (r)
+        return r;
+    HeliosNvrmScanoutRelease rel;
+    memset(&rel, 0, sizeof(rel));
+    helios_nvrm_init(&rel.head, HELIOS_NVRM_OP_SCANOUT_RELEASE, sizeof(rel));
+    rel.handle = handle;
+    r = nvrm_escape(c, &rel, sizeof(rel));
+    if (r)
+        return r;
+    return kmd_status_to_errno(rel.head.status);
+}
+
 static struct crm_transport windows_transport = {
     .abi = CRM_TRANSPORT_ABI,
     .flags = 0,
@@ -1161,6 +1244,24 @@ int crm_win_ioctl(int fd, uint32_t cmd, void *arg, uint32_t size, void *nested,
 int crm_win_scanout_flip(const struct crm_scanout_flip *flip)
 {
     (void)flip;
+    return -ENOSYS;
+}
+
+int crm_win_scanout_set(struct crm_scanout_source *src)
+{
+    (void)src;
+    return -ENOSYS;
+}
+
+int crm_win_scanout_present(uint32_t handle, uint32_t gem, uint64_t *seq)
+{
+    (void)handle; (void)gem; (void)seq;
+    return -ENOSYS;
+}
+
+int crm_win_scanout_release(uint32_t handle)
+{
+    (void)handle;
     return -ENOSYS;
 }
 

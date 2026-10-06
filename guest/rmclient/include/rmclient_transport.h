@@ -170,6 +170,38 @@ struct crm_scanout_flip {
  * does not forward ScanoutFlip (KMD before 22.22.307). */
 int crm_win_scanout_flip(const struct crm_scanout_flip *flip);
 
+/*
+ * Foreign scanout source (KMD 22.22.308 and later, guest/windows/docs/
+ * foreign-scanout.md): instead of sending ScanoutFlips itself, the program
+ * registers a source once (layout and the DRM-node file its GEM objects live
+ * in) and then names one GEM object per frame. The KMD sends the ScanoutFlip
+ * with its own seq and keeps the desktop's flips off scanout 0 while the source
+ * is live, and gives the scanout back on release, on close of the DRM file, at
+ * process exit, or after lapse_ms without a present. Present from one thread
+ * and rotate three or more images (no release event per image yet).
+ *
+ * Each returns 0 or a negative errno: -ENOSYS when the KMD does not have the
+ * op (use crm_win_scanout_flip), -EBUSY when another device's source is live,
+ * -ENOENT from present when the source is gone (set it again), -EINVAL for a
+ * layout the KMD refuses, -EBADF / -EPERM for the handle.
+ */
+struct crm_scanout_source {
+    uint32_t handle;     /* in:  fd from crm_win_open_device(CRM_WIN_DEV_DRI_BASE + n) */
+    uint32_t width, height;
+    uint32_t stride;     /* plane 0 pitch, bytes */
+    uint32_t offset;     /* plane 0 offset, bytes */
+    uint32_t fourcc;     /* DRM_FORMAT_{XRGB,ARGB,XBGR,ABGR}8888 */
+    uint64_t modifier;   /* DRM_FORMAT_MOD_*; 0 = linear */
+    uint32_t lapse_ms;   /* in:  0 = the KMD's default (2000); out: in effect */
+    uint32_t generation; /* out: nonzero source id */
+};
+int crm_win_scanout_set(struct crm_scanout_source *src);
+/* Show GEM object gem of the source's DRM file; *seq (may be NULL) gets the
+ * ScanoutFlip's seq. */
+int crm_win_scanout_present(uint32_t handle, uint32_t gem, uint64_t *seq);
+/* Give scanout 0 back; handle 0 = whatever source this process holds. */
+int crm_win_scanout_release(uint32_t handle);
+
 /* The platform default transport (what crm_open(.., NULL) uses). */
 const struct crm_transport *crm_default_transport(void);
 

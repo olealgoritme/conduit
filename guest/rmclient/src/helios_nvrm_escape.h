@@ -296,6 +296,76 @@ typedef struct HeliosNvrmUnpin {
 HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmUnpin) == HELIOS_NVRM_UNPIN_BYTES, "Unpin");
 HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmUnpin, pin_id) == 40, "unpin.pin_id");
 
+/* ---- SCANOUT_SET / SCANOUT_PRESENT / SCANOUT_RELEASE: foreign scanout source -
+ * Own scanout 0 and show host GEM objects on it through the KMD (protocol/src/
+ * nvrm_scanout.rs has the contract). While a source is live the KMD withholds the
+ * desktop's own flushes of scanout 0 (so the two do not alternate), sends the
+ * ScanoutFlip itself with a seq it mints, and gives scanout 0 back (with one fresh
+ * desktop flush) on RELEASE, close of the DRM file, process exit, device reset, or
+ * `lapse_ms` without a PRESENT. Advertised in QueryCaps.supported_ops bits 9..11.
+ * SET: BAD_RANGE for a bad layout, NOT_OWNED / FORBIDDEN for the handle (as for a
+ * forwarded ScanoutFlip), SCANOUT_BUSY while another device's source is live.
+ * PRESENT: NO_SOURCE when the caller has none live on that handle (SET again). */
+#define HELIOS_NVRM_OP_SCANOUT_SET 9u
+#define HELIOS_NVRM_OP_SCANOUT_PRESENT 10u
+#define HELIOS_NVRM_OP_SCANOUT_RELEASE 11u
+#define HELIOS_NVRM_ST_SCANOUT_BUSY 13
+#define HELIOS_NVRM_ST_NO_SOURCE 14
+
+typedef struct HeliosNvrmScanoutSet {
+  HeliosNvrmHeader head;
+  uint32_t handle;         /* in:  backend handle of a DRM-node file (device_type >= 512) */
+  uint32_t flags;          /* in:  zero */
+  uint32_t width;          /* in:  64..16384 */
+  uint32_t height;         /* in:  64..16384 */
+  uint32_t stride;         /* in:  plane 0 pitch, >= width * 4, <= 1 MiB */
+  uint32_t offset;         /* in:  plane 0 offset */
+  uint32_t fourcc;         /* in:  DRM_FORMAT_{XRGB,ARGB,XBGR,ABGR}8888 */
+  uint32_t lapse_ms;       /* in:  0 = 2000, clamped 100..30000; out: in effect */
+  uint64_t modifier;       /* in:  DRM_FORMAT_MOD_* (block-linear allowed) */
+  uint32_t out_generation; /* out: nonzero source id */
+  uint32_t reserved;       /* in:  zero */
+} HeliosNvrmScanoutSet;
+#define HELIOS_NVRM_SCANOUT_SET_BYTES 88u
+HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmScanoutSet) == HELIOS_NVRM_SCANOUT_SET_BYTES, "ScanoutSet");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutSet, handle) == 40, "sset.handle");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutSet, flags) == 44, "sset.flags");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutSet, width) == 48, "sset.width");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutSet, height) == 52, "sset.height");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutSet, stride) == 56, "sset.stride");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutSet, offset) == 60, "sset.offset");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutSet, fourcc) == 64, "sset.fourcc");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutSet, lapse_ms) == 68, "sset.lapse_ms");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutSet, modifier) == 72, "sset.modifier");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutSet, out_generation) == 80, "sset.out_generation");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutSet, reserved) == 84, "sset.reserved");
+
+typedef struct HeliosNvrmScanoutPresent {
+  HeliosNvrmHeader head;
+  uint32_t handle;   /* in:  the handle given to SET */
+  uint32_t gem;      /* in:  GEM handle (in that DRM file) of the image to show */
+  uint32_t flags;    /* in:  zero */
+  uint32_t reserved; /* in:  zero */
+  uint64_t out_seq;  /* out: the seq the KMD put in the ScanoutFlip */
+} HeliosNvrmScanoutPresent;
+#define HELIOS_NVRM_SCANOUT_PRESENT_BYTES 64u
+HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmScanoutPresent) == HELIOS_NVRM_SCANOUT_PRESENT_BYTES, "ScanoutPresent");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, handle) == 40, "spres.handle");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, gem) == 44, "spres.gem");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, flags) == 48, "spres.flags");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, reserved) == 52, "spres.reserved");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutPresent, out_seq) == 56, "spres.out_seq");
+
+typedef struct HeliosNvrmScanoutRelease {
+  HeliosNvrmHeader head;
+  uint32_t handle; /* in: the handle given to SET, or 0 for "whatever I hold" */
+  uint32_t flags;  /* in: zero */
+} HeliosNvrmScanoutRelease;
+#define HELIOS_NVRM_SCANOUT_RELEASE_BYTES 48u
+HELIOS_NVRM_STATIC_ASSERT(sizeof(HeliosNvrmScanoutRelease) == HELIOS_NVRM_SCANOUT_RELEASE_BYTES, "ScanoutRelease");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutRelease, handle) == 40, "srel.handle");
+HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmScanoutRelease, flags) == 44, "srel.flags");
+
 /* Fill the common header for `op`; `total` is the whole buffer size. */
 static inline void helios_nvrm_init(HeliosNvrmHeader *h, uint32_t op, uint32_t total) {
   h->hdr.magic = HELIOS_ESCAPE_MAGIC;
