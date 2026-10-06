@@ -2351,6 +2351,12 @@ pub struct VirtioGpu {
     nvrm_handles: Vec<nvrm_tables::NvrmHandleSlot>,
     /// Slots reserved by in-flight forwarded `Open`s.
     nvrm_reserved: usize,
+    /// RM clients (`NV01_ROOT`) each owner was given, learned from forwarded replies, so
+    /// a payload that names a client can be checked against the caller
+    /// (`kmd_logic::nvrm_clients`, `virtio/nvrm_harden.rs`). Part of the transport: a
+    /// new transport starts with none. Boxed (4 KiB) and built by
+    /// [`nvrm_tables::new_client_table`], for the same frame-size reason as `nvrm_fences`.
+    nvrm_clients: Box<helios_kmd_logic::nvrm_clients::ClientTable>,
     /// `SEMSURF_FENCE_CREATE`s in flight and the `EventReady`s that beat their
     /// handle's recording (see `kmd_logic::nvrm_fence`). Also reserved slots: a
     /// create reserves one in `nvrm_reserved` like an `Open`.
@@ -3027,6 +3033,7 @@ impl VirtioGpu {
             scanout_release: scanout_release_on,
             nvrm_handles: Vec::with_capacity(MAX_NVRM_HANDLES),
             nvrm_reserved: 0,
+            nvrm_clients: nvrm_tables::new_client_table(),
             nvrm_fences: nvrm_tables::new_fence_book(),
             nvrm_maps: Vec::with_capacity(MAX_NVRM_MAPS),
             nvrm_pins: Vec::with_capacity(MAX_NVRM_PINS),
