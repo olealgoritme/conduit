@@ -48,6 +48,70 @@ Mesa `main` at **`70c4c018cbe5b78a1db7e9413bc7e511b366fd95`**
 
 Each patch builds on its own.
 
+### Common patches (`patches-common/`): per-draw cost
+
+Generic NVK patches (one also touches the RM backend) that apply on top of
+**both** lineages, unchanged:
+
+- Linux: base + `patches/0001-0017` + `patches-common/*` (`build.sh` does
+  this).
+- Windows: base + `patches/0001-0013` + `patches-windows/*` +
+  `patches-windows-dxvk/*` + `patches-common/*` (`build-windows.sh` does
+  this). Verified with `git am` (no 3-way needed) and by building that
+  stack for Linux and running the tests below natively.
+
+| # | patch | what |
+|---|---|---|
+| 1 | `nvk: direct draws without an MME macro on Turing+` | `vkCmdDraw*`/`DrawIndexed*`/`DrawMulti*` set first vertex, base instance, draw index and view index from the CPU (shadow scratch, `SET_GLOBAL_BASE_*`, root table), only what changed since the last direct draw, then draw with `SET_DRAW_CONTROL_A/B` + `DRAW_*_BEGIN_END_A/B`; indirect, mesh, XFB, multiview draws, meta and generated commands drop the tracking |
+| 2 | `nvk: don't reselect cb0 after binding constant buffers on Turing+` | no `NVK_MME_SELECT_CB0` call after cbuf binds: with the hardware root table nothing loads cb0 through the selector |
+| 3 | `nvk: skip root table loads of dwords the GPU already has` | CPU shadow of the root table (valid bit per dword, per command buffer); a descriptor bind loads only the dwords that changed |
+| 4 | `nvk: skip binding a constant buffer range that is already bound` | per group/slot memory of the bound range; rebinding the same set/offset emits nothing |
+| 5 | `nvk, nvk/rm: let the GPU cache descriptor pools and tables on RM` | new `NVKMD_MEM_GPU_READ_ONLY`, set on descriptor pools and the image/sampler tables; the RM backend maps it GPU-cacheable (it was uncached system memory, so every descriptor set bound was a cbuf fetched across PCIe). RM-specific in effect, generic in form; nouveau ignores the flag |
+| 6 | `nvk: bind vertex and index buffers with plain methods on Turing+` | no `NVK_MME_BIND_VB/IB` for CPU-recorded binds, and the range already bound is skipped |
+| 7 | `nvk: keep what changes per draw in one hardware root table bank` | changing a second 256-byte root table bank between draws costs ~5 ns; the dynamic-offset dword of the dynamic buffer descriptors moves into bank 0 with the draw parameters and `sets[0..3]`. **API-visible**: `NVK_MAX_DYNAMIC_BUFFERS` 64 -> 32, i.e. 16 dynamic UBOs + 16 dynamic SSBOs per layout (NVIDIA: 15 + 16) |
+
+Per draw, steady state (`NVK_DEBUG=push_dump`, `BENCH_NDRAWS=8`):
+
+| test | before | after |
+|---|---|---|
+| plain draws | 1 MME call (`DRAW`, 5 dwords) | 4 methods, 6 dwords, no MME |
+| new dynamic UBO offset | 27 methods, 36 dwords: 5 root loads (12 dwords), cbuf bind, 2 MME calls (`SELECT_CB0`, `DRAW`) | 10 methods, 15 dwords: 1 root dword, cbuf bind, draw |
+| descriptor set switch | 36 methods, 48 dwords: 6 root loads, 2 cbuf binds, 2 MME calls | 16 methods, 24 dwords: 2 root dwords (same bank), 2 cbuf binds, draw |
+| VB + IB bound per draw | 3 MME calls (`BIND_VB`, `BIND_IB`, `DRAW_INDEXED`) | plain methods only when the range changes, 5-dword draw |
+
+GPU ms for 20000 draws (`vk_perf_bench -r 21 -t alu,ubo,desc,rebind,vbib`,
+2560x1440, RTX 5090, median of 3 runs per build, every commit built and
+measured in one session; ratio to NVIDIA 610.57.04 in parentheses):
+
+| after patch | plain draws | dyn. UBO offset | set switch | same set rebound, 2 pipelines | VB+IB per draw |
+|---|---|---|---|---|---|
+| `patches/0017` (before) | 0.509 (2.21x) | 0.667 (5.51x) | 0.712 (4.98x) | 2.258 (0.83x) | 0.808 (4.96x) |
+| 1 direct draws | 0.226 (0.98x) | 0.224 (1.85x) | 0.317 (2.22x) | 1.079 (0.39x) | 0.318 (1.95x) |
+| 2 no cb0 reselect | 0.226 | 0.189 (1.56x) | 0.322 | 1.070 | 0.318 |
+| 3 root shadow | 0.226 | 0.109 (0.90x) | 0.299 (2.09x) | 0.926 | 0.318 |
+| 4 cbuf dedupe | 0.226 | 0.110 | 0.285 (1.99x) | 0.914 (0.33x) | 0.318 |
+| 5 cached descriptors | 0.225 | 0.107 | 0.218 (1.52x) | 0.914 | 0.318 |
+| 6 plain VB/IB binds | 0.226 | 0.107 | 0.219 | 0.913 | 0.156 (0.96x) |
+| 7 root bank layout | 0.226 (0.98x) | 0.108 (0.89x) | 0.178 (1.24x) | 0.915 (0.33x) | 0.156 (0.96x) |
+| NVIDIA | 0.230 | 0.121 | 0.143 | 2.735 | 0.163 |
+
+The GPU is shared with the desktop and VMs, and its clocks follow the
+load: absolute numbers move by up to ~15% between sessions (NVIDIA's set
+switch measured 0.123-0.143 ms), so compare within a table. The other
+categories (ALU, texturing, fill, blend, ZCULL, clears, meshes, dynamic
+UBO meshes, tessellation, terrain, copies) are unchanged, within 1-2%.
+
+Correctness: `BENCH_HASH=1 vk_perf_bench -t ubo,desc,rebind,vbib,dynidx,descupd,params,verify`
+prints image hashes; all are identical before and after the series, and
+every per-draw test (`ubo`, `desc`, `rebind`, `vbib`, `dynidx`, `params`,
+`descupd`) also hashes the same as on NVIDIA's driver. `params` mixes direct, indexed,
+multi-draw and indirect draws with varying first vertex, vertex offset,
+first instance and draw index, 32- and 16-bit index buffers and a clear,
+and repeats a direct draw right after each indirect one (dropping one
+invalidation in the driver changes its hash); `dynidx` indexes dynamic UBO
+arrays in two sets at run time; `descupd` rewrites a descriptor set between
+submits. dEQP-VK is not installed on the host and was not run.
+
 ## Build
 
 ```sh
@@ -56,8 +120,8 @@ guest/nvk-rm/build.sh /path/to/mesa build-dir
 ```
 
 The script clones Mesa if needed, checks out the base commit on a local
-branch `nvk-rm`, applies the series with `git am` (skipped if already
-applied), points meson at `guest/rmclient/include/rmclient.h` through a
+branch `nvk-rm`, applies `patches/` and then `patches-common/` with `git am`
+(skipped if already applied), points meson at `guest/rmclient/include/rmclient.h` through a
 throwaway `rmclient.pc`, and builds only NVK:
 
 ```sh
@@ -67,8 +131,8 @@ ninja -C build-rm src/nouveau/vulkan/libvulkan_nouveau.so \
     src/nouveau/vulkan/nouveau_devenv_icd.x86_64.json
 ```
 
-By hand: `git am guest/nvk-rm/patches/*.patch` on the base commit, then the
-two commands above. librmclient is not needed to build (only its header, and
+By hand: `git am guest/nvk-rm/patches/*.patch guest/nvk-rm/patches-common/*.patch`
+on the base commit, then the two commands above. librmclient is not needed to build (only its header, and
 a copy is in patch 2).
 
 Build dependencies (Ubuntu 24.04; this is what the host needed on top of its
@@ -79,7 +143,8 @@ libclc-20-dev` (for `mesa_clc`), `libxshmfence-dev`, plus the usual Mesa
 deps (libdrm, libelf, wayland, xcb, glslang, python3-mako/yaml).
 
 Verified on the host: the series applies to the base commit and builds, both
-with `-Dnvk-rm=enabled` and without it (plain nouveau NVK).
+with `-Dnvk-rm=enabled` and without it (plain nouveau NVK), `patches-common/`
+included.
 
 ## Windows build (cross-compiled, first bring-up)
 

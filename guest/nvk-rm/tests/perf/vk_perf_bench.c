@@ -6,6 +6,13 @@
  *
  * Offscreen only (no WSI).  Each test records one command buffer bracketed by
  * timestamps, submits it reps times (after one warm-up) and prints the median.
+ * Put alu first in -t: it brings the GPU clocks up for the short tests.
+ *
+ * Environment: BENCH_HASH=1 prints an image hash after the per-draw tests
+ * (ubo, desc, rebind, vbib); BENCH_NDRAWS=n draws n instead of 20000 times
+ * in them (e.g. with NVK_DEBUG=push_dump); BENCH_NSETS=n cycles "set
+ * switch" through n sets.  Tests params, dynidx and descupd only print
+ * hashes, to compare drivers or driver changes bit for bit.
  */
 #include <vulkan/vulkan.h>
 
@@ -22,10 +29,12 @@
 #include "shaders/color_frag.h"
 #include "shaders/colortex_frag.h"
 #include "shaders/copy_comp.h"
+#include "shaders/dynidx_vert.h"
 #include "shaders/fsq_vert.h"
 #include "shaders/fsqz_vert.h"
 #include "shaders/mesh_vert.h"
 #include "shaders/meshubo_vert.h"
+#include "shaders/params_vert.h"
 #include "shaders/tess_tesc.h"
 #include "shaders/tess_tese.h"
 #include "shaders/tess_vert.h"
@@ -34,6 +43,8 @@
 #include "shaders/tri_tese.h"
 #include "shaders/tex_frag.h"
 #include "shaders/ubo_vert.h"
+
+#define CLAMP(x, lo, hi) ((x) < (lo) ? (lo) : (x) > (hi) ? (hi) : (x))
 
 #define CHECK(x)                                                              \
    do {                                                                       \
@@ -215,6 +226,7 @@ static VkPipelineLayout pl_gfx, pl_comp;
 static VkDescriptorPool dpool;
 
 struct gfx_desc {
+   VkPipelineLayout layout; /* pl_gfx if NULL */
    VkShaderModule vs, tcs, tes, fs;
    VkFormat color;
    bool blend, depth, mesh_vb, patch3;
@@ -307,7 +319,7 @@ make_gfx(const struct gfx_desc *d)
       .pMultisampleState = &ms,
       .pDepthStencilState = &ds,
       .pColorBlendState = &cb,
-      .layout = pl_gfx,
+      .layout = d->layout ? d->layout : pl_gfx,
    };
    VkPipeline p;
    CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &ci, NULL, &p));
@@ -565,6 +577,9 @@ upload_buffer(struct buf *b, const void *data, VkDeviceSize size,
 
 #define UBO_STRIDE 256
 
+static uint64_t image_hash(struct img *im, VkImageAspectFlags aspect,
+                           VkImageLayout layout, uint32_t bpp);
+
 static bool
 make_draw_ubos(struct buf *ubo, int ndraws, enum placement pl, float scale)
 {
@@ -605,6 +620,11 @@ test_ubo_draws(VkPipeline p, enum placement pl, int ndraws, bool switch_sets,
    enum { NSETS = 64 };
    VkDescriptorSet sets[NSETS];
    int nsets = switch_sets ? NSETS : 1;
+   /* BENCH_NSETS: how many sets "set switch" cycles through (1: same set,
+    * new dynamic offset each draw, to separate the switch from the shader)
+    */
+   if (switch_sets && getenv("BENCH_NSETS"))
+      nsets = CLAMP(atoi(getenv("BENCH_NSETS")), 1, NSETS);
    for (int i = 0; i < nsets; i++) {
       sets[i] = alloc_set(dsl_gfx);
       write_gfx_set(sets[i], ubo.buf);
@@ -628,6 +648,10 @@ test_ubo_draws(VkPipeline p, enum placement pl, int ndraws, bool switch_sets,
    char name[64];
    snprintf(name, sizeof(name), "%s %s", label, pl_name[pl]);
    report(name, "Mdraws/s", ndraws, gpu, cpu);
+   if (getenv("BENCH_HASH"))
+      printf("  hash %016llx\n", (unsigned long long)
+             image_hash(&rt8, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 4));
    vkFreeCommandBuffers(dev, cpool, 1, &cmd);
    reset_sets();
    free_buffer(&ubo);
@@ -1054,6 +1078,391 @@ test_tess_terrain(VkPipeline p, float level, int grid, int ndraws)
    reset_sets();
 }
 
+/* Dynamic uniform buffers in two sets, arrays indexed with a push constant:
+ * the shader reads the root table's dynamic buffer descriptors with
+ * runtime indices, at set_dynamic_buffer_start[1] = 5 for set 1.
+ */
+static void
+test_dynidx(VkShaderModule vs, VkShaderModule fs)
+{
+   VkDescriptorSetLayoutBinding ba[2] = {
+      { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL, NULL },
+      { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4, VK_SHADER_STAGE_ALL, NULL },
+   };
+   VkDescriptorSetLayoutBinding bb = {
+      0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3, VK_SHADER_STAGE_ALL, NULL,
+   };
+   VkDescriptorSetLayoutCreateInfo dli = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .bindingCount = 2, .pBindings = ba,
+   };
+   VkDescriptorSetLayout dsl[2];
+   CHECK(vkCreateDescriptorSetLayout(dev, &dli, NULL, &dsl[0]));
+   dli.bindingCount = 1;
+   dli.pBindings = &bb;
+   CHECK(vkCreateDescriptorSetLayout(dev, &dli, NULL, &dsl[1]));
+   VkPushConstantRange pcr = { VK_SHADER_STAGE_ALL, 0, 16 };
+   VkPipelineLayoutCreateInfo pli = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .setLayoutCount = 2, .pSetLayouts = dsl,
+      .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr,
+   };
+   VkPipelineLayout pl;
+   CHECK(vkCreatePipelineLayout(dev, &pli, NULL, &pl));
+   VkPipeline p = make_gfx(&(struct gfx_desc){ .layout = pl, .vs = vs, .fs = fs,
+      .color = VK_FORMAT_R8G8B8A8_UNORM,
+      .topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP });
+
+   enum { NC = 64 };
+   float colors[NC * 64];
+   memset(colors, 0, sizeof(colors));
+   for (int i = 0; i < NC; i++) {
+      float *c = &colors[i * 64];
+      c[0] = (i % 7) / 6.0f; c[1] = (i % 5) / 4.0f; c[2] = (i % 3) / 2.0f; c[3] = 1.0f;
+   }
+   struct buf ubo;
+   upload_buffer(&ubo, colors, sizeof(colors), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                 PL_DEVICE);
+
+   VkDescriptorSet sets[2];
+   for (int s = 0; s < 2; s++) {
+      VkDescriptorSetAllocateInfo ai = {
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+         .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl[s],
+      };
+      CHECK(vkAllocateDescriptorSets(dev, &ai, &sets[s]));
+   }
+   VkDescriptorBufferInfo bi[4];
+   for (int i = 0; i < 4; i++)
+      bi[i] = (VkDescriptorBufferInfo){ ubo.buf, i * 256, 16 };
+   VkWriteDescriptorSet w[3] = {
+      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[0],
+        .dstBinding = 0, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .pBufferInfo = bi },
+      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[0],
+        .dstBinding = 1, .descriptorCount = 4,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .pBufferInfo = bi },
+      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[1],
+        .dstBinding = 0, .descriptorCount = 3,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .pBufferInfo = bi },
+   };
+   vkUpdateDescriptorSets(dev, 3, w, 0, NULL);
+
+   VkCommandBuffer cmd = begin_cmd();
+   begin_render(cmd, &rt8, true, false);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+   for (int k = 0; k < 64; k++) {
+      uint32_t off[8];
+      for (int i = 0; i < 8; i++)
+         off[i] = ((k * (i + 3) + i) % 48) * 256;
+      if (k % 3 == 0) {
+         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 2,
+                                 sets, 8, off);
+      } else {
+         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 1, 1,
+                                 &sets[1], 3, &off[5]);
+      }
+      int32_t pc[4] = { k % 64, k % 4, (k / 4) % 3, 0 };
+      vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_ALL, 0, 16, pc);
+      vkCmdDraw(cmd, 4, 1, 0, 0);
+   }
+   vkCmdEndRendering(cmd);
+   CHECK(vkEndCommandBuffer(cmd));
+   submit_wait(cmd);
+   vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+   printf("dynidx hash %016llx\n", (unsigned long long)
+          image_hash(&rt8, VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 4));
+   reset_sets();
+   free_buffer(&ubo);
+   vkDestroyPipeline(dev, p, NULL);
+   vkDestroyPipelineLayout(dev, pl, NULL);
+   vkDestroyDescriptorSetLayout(dev, dsl[0], NULL);
+   vkDestroyDescriptorSetLayout(dev, dsl[1], NULL);
+}
+
+/* Small indexed draws that bind their vertex and index buffers before each
+ * draw, as DXVK records them: the offsets change every fourth draw.
+ */
+static void
+test_vbib(VkPipeline p, int ndraws)
+{
+   enum { N = 8 };
+   uint32_t nv = (N + 1) * (N + 1), ni = N * N * 6;
+   float *v = malloc(nv * 16ull * 64);
+   for (int c = 0; c < 64; c++)
+      for (int y = 0; y <= N; y++)
+         for (int x = 0; x <= N; x++) {
+            float *q = v + 4 * (c * nv + y * (N + 1) + x);
+            q[0] = (c % 8) * 0.25f - 1.0f + x * 0.002f;
+            q[1] = (c / 8) * 0.25f - 1.0f + y * 0.002f;
+            q[2] = 0.25f + (c % 5) * 0.1f;
+            q[3] = 1.0f;
+         }
+   uint32_t *idx = malloc(ni * 4ull * 16);
+   for (int c = 0; c < 16; c++) {
+      uint32_t k = c * ni;
+      for (int y = 0; y < N; y++)
+         for (int x = 0; x < N; x++) {
+            uint32_t a = y * (N + 1) + x, b = a + 1, cc = a + N + 1, d = cc + 1;
+            if (c & 1) { uint32_t t = b; b = cc; cc = t; }
+            idx[k++] = a; idx[k++] = b; idx[k++] = cc;
+            idx[k++] = b; idx[k++] = d; idx[k++] = cc;
+         }
+   }
+   struct buf vb, ib;
+   upload_buffer(&vb, v, nv * 16ull * 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, PL_DEVICE);
+   upload_buffer(&ib, idx, ni * 4ull * 16, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, PL_DEVICE);
+   free(v);
+   free(idx);
+
+   VkCommandBuffer cmd = begin_cmd();
+   ts_begin(cmd);
+   begin_render(cmd, &rt8, true, true);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+   uint32_t off = 0;
+   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl_gfx, 0, 1,
+                           &set_default, 1, &off);
+   for (int i = 0; i < ndraws; i++) {
+      VkDeviceSize vo = (VkDeviceSize)((i / 4) % 64) * nv * 16;
+      vkCmdBindVertexBuffers(cmd, 0, 1, &vb.buf, &vo);
+      vkCmdBindIndexBuffer(cmd, ib.buf, (VkDeviceSize)((i / 4) % 16) * ni * 4,
+                           VK_INDEX_TYPE_UINT32);
+      vkCmdDrawIndexed(cmd, ni, 1, 0, 0, 0);
+   }
+   vkCmdEndRendering(cmd);
+   ts_end(cmd);
+   double cpu, gpu = time_cmd(cmd, &cpu);
+   report("vb+ib bind per draw", "Mdraws/s", ndraws, gpu, cpu);
+   if (getenv("BENCH_HASH"))
+      printf("  hash %016llx\n", (unsigned long long)
+             image_hash(&rt8, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 4));
+   vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+   free_buffer(&vb);
+   free_buffer(&ib);
+}
+
+/* A descriptor set rewritten between submits (the sampler alternates
+ * between linear and nearest): every second hash must repeat and the two
+ * must differ, or the GPU read a stale descriptor.
+ */
+static void
+test_descupd(VkPipeline p)
+{
+   VkSamplerCreateInfo sci = {
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST,
+      .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+      .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+      .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+   };
+   VkSampler nearest;
+   CHECK(vkCreateSampler(dev, &sci, NULL, &nearest));
+   struct buf ubo;
+   make_draw_ubos(&ubo, 64, PL_DEVICE, 30.0f);
+   VkDescriptorSet set = alloc_set(dsl_gfx);
+   write_gfx_set(set, ubo.buf);
+   uint64_t h[4];
+   for (int k = 0; k < 4; k++) {
+      VkDescriptorImageInfo ii = { (k & 1) ? nearest : sampler, tex.view,
+                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+      VkWriteDescriptorSet w = {
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+         .dstBinding = 1, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+         .pImageInfo = &ii,
+      };
+      vkUpdateDescriptorSets(dev, 1, &w, 0, NULL);
+      VkCommandBuffer cmd = begin_cmd();
+      begin_render(cmd, &rt8, true, false);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+      for (int i = 0; i < 64; i++) {
+         uint32_t off = i * UBO_STRIDE;
+         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl_gfx, 0,
+                                 1, &set, 1, &off);
+         vkCmdDraw(cmd, 4, 1, 0, 0);
+      }
+      vkCmdEndRendering(cmd);
+      CHECK(vkEndCommandBuffer(cmd));
+      submit_wait(cmd);
+      vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+      h[k] = image_hash(&rt8, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 4);
+   }
+   printf("descupd hash %016llx %016llx %s\n", (unsigned long long)h[0],
+          (unsigned long long)h[1],
+          h[0] == h[2] && h[1] == h[3] && h[0] != h[1] ? "ok" : "MISMATCH");
+   reset_sets();
+   free_buffer(&ubo);
+   vkDestroySampler(dev, nearest, NULL);
+}
+
+/* What DXVK-style recording does a lot: the same descriptor set and dynamic
+ * offset bound again before each draw (the offset changes every 16 draws)
+ * and the pipeline alternating between two that share the layout.
+ */
+static void
+test_rebind(VkPipeline pa, VkPipeline pb, int ndraws)
+{
+   struct buf ubo;
+   if (!make_draw_ubos(&ubo, ndraws, PL_DEVICE, 1.0f))
+      return;
+   VkDescriptorSet set = alloc_set(dsl_gfx);
+   write_gfx_set(set, ubo.buf);
+
+   VkCommandBuffer cmd = begin_cmd();
+   ts_begin(cmd);
+   begin_render(cmd, &rt8, true, false);
+   for (int i = 0; i < ndraws; i++) {
+      uint32_t off = (i / 16) * 16 * UBO_STRIDE;
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, (i & 1) ? pb : pa);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl_gfx, 0,
+                              1, &set, 1, &off);
+      vkCmdDraw(cmd, 4, 1, 0, 0);
+   }
+   vkCmdEndRendering(cmd);
+   ts_end(cmd);
+   double cpu, gpu = time_cmd(cmd, &cpu);
+   report("rebind same, 2 pipelines", "Mdraws/s", ndraws, gpu, cpu);
+   if (getenv("BENCH_HASH"))
+      printf("  hash %016llx\n", (unsigned long long)
+             image_hash(&rt8, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 4));
+   vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+   reset_sets();
+   free_buffer(&ubo);
+}
+
+/* Draw parameters (firstVertex, vertexOffset, firstInstance, draw index)
+ * through every draw path, direct and indirect interleaved, plus a clear
+ * in the middle: the image hash must not change with driver optimizations
+ * that track these on the CPU.
+ */
+static bool has_multi_draw;
+
+static void
+params_draw(VkCommandBuffer cmd, int kind, int k, VkBuffer ib, VkBuffer ind)
+{
+   static PFN_vkCmdDrawMultiEXT draw_multi;
+   static PFN_vkCmdDrawMultiIndexedEXT draw_multi_idx;
+   if (!draw_multi) {
+      draw_multi = (PFN_vkCmdDrawMultiEXT)
+         vkGetDeviceProcAddr(dev, "vkCmdDrawMultiEXT");
+      draw_multi_idx = (PFN_vkCmdDrawMultiIndexedEXT)
+         vkGetDeviceProcAddr(dev, "vkCmdDrawMultiIndexedEXT");
+   }
+   switch (kind) {
+   case 0:
+      vkCmdDraw(cmd, 3 * (1 + k % 3), 1 + k % 4, (k * 5) % 17, k % 5);
+      break;
+   case 3:
+      vkCmdDrawIndexed(cmd, 3 * (1 + k % 4), 1 + k % 3, 3 * (k % 50),
+                       (k % 7) - 2, k % 6);
+      break;
+   case 1:
+      if (has_multi_draw) {
+         VkMultiDrawInfoEXT mi[3] = { { k % 13, 3 }, { 7, 6 }, { k % 5, 9 } };
+         draw_multi(cmd, 3, mi, 1 + k % 2, k % 3, sizeof(mi[0]));
+      } else {
+         vkCmdDraw(cmd, 6, 2, k % 13, k % 3);
+      }
+      break;
+   case 2:
+      if (has_multi_draw) {
+         VkMultiDrawIndexedInfoEXT mi[3] = {
+            { 3, 3, k % 3 }, { 6 * (k % 9), 6, -1 }, { 12, 3, 5 },
+         };
+         int32_t vo = k % 4;
+         draw_multi_idx(cmd, 3, mi, 1 + k % 3, k % 4, sizeof(mi[0]),
+                        (k & 16) ? &vo : NULL);
+      } else {
+         vkCmdDrawIndexed(cmd, 9, 2, 12, k % 4, k % 4);
+      }
+      break;
+   case 4:
+      vkCmdDrawIndirect(cmd, ind, (k % 8) * 16, 1 + k % 3, 16);
+      break;
+   case 5:
+      vkCmdDrawIndexedIndirect(cmd, ind, 128 + (k % 4) * 20, 1 + k % 4, 20);
+      break;
+   }
+}
+
+static void
+test_params(VkPipeline p)
+{
+   enum { NIDX = 4096 };
+   uint32_t *idx = malloc(NIDX * 4);
+   for (int i = 0; i < NIDX; i++)
+      idx[i] = 3 + (i * 5) % 61; /* index + vertexOffset >= 0 */
+   struct buf ib, ib16, ind;
+   upload_buffer(&ib, idx, NIDX * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, PL_DEVICE);
+   uint16_t *idx16 = malloc(NIDX * 2);
+   for (int i = 0; i < NIDX; i++)
+      idx16[i] = idx[(i + 7) % NIDX];
+   upload_buffer(&ib16, idx16, NIDX * 2, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, PL_DEVICE);
+   free(idx16);
+   free(idx);
+   /* VkDrawIndirectCommand x 8, then VkDrawIndexedIndirectCommand x 8 */
+   uint32_t cmds[8 * 4 + 8 * 5];
+   for (int i = 0; i < 8; i++) {
+      uint32_t *c = &cmds[i * 4];
+      c[0] = 3 * (1 + i % 3); c[1] = 1 + i % 2; c[2] = i * 11; c[3] = i * 3;
+   }
+   for (int i = 0; i < 8; i++) {
+      uint32_t *c = &cmds[32 + i * 5];
+      c[0] = 3 * (2 + i % 2); c[1] = 1 + i % 3; c[2] = 6 * i;
+      c[3] = (uint32_t)(i - 2); c[4] = 7 * i;
+   }
+   upload_buffer(&ind, cmds, sizeof(cmds), VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                 PL_DEVICE);
+
+   VkCommandBuffer cmd = begin_cmd();
+   begin_render(cmd, &rt8, true, false);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+   vkCmdBindIndexBuffer(cmd, ib.buf, 0, VK_INDEX_TYPE_UINT32);
+   /* Each macro draw (indirect) is followed by a repeat of the last direct
+    * draw, which must not trust parameters the macro has changed.
+    * BENCH_PARAMS_MASK: only the draw kinds (k % 6) whose bit is set.
+    */
+   const unsigned mask = getenv("BENCH_PARAMS_MASK") ?
+      strtoul(getenv("BENCH_PARAMS_MASK"), NULL, 0) : ~0u;
+   for (int k = 0; k < 384; k++) {
+      int kind = k % 6;
+      if (!(mask & (1u << kind)))
+         continue;
+      if (k % 64 == 32)
+         vkCmdBindIndexBuffer(cmd, ib16.buf, 0, VK_INDEX_TYPE_UINT16);
+      else if (k % 64 == 0)
+         vkCmdBindIndexBuffer(cmd, ib.buf, 0, VK_INDEX_TYPE_UINT32);
+      params_draw(cmd, kind, k, ib.buf, ind.buf);
+      if (kind == 4)
+         params_draw(cmd, 3, k - 1, ib.buf, ind.buf);
+      if (kind == 5)
+         params_draw(cmd, 3, k - 2, ib.buf, ind.buf);
+      if (k == 192 && (mask & 0x40)) {
+         VkClearAttachment ca = {
+            VK_IMAGE_ASPECT_COLOR_BIT, 0, { .color.float32 = { 0.2f, 0.1f, 0.4f, 1.0f } },
+         };
+         VkClearRect cr = { { { W / 4, H / 4 }, { W / 3, H / 3 } }, 0, 1 };
+         vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+         params_draw(cmd, 0, k, ib.buf, ind.buf);
+      }
+   }
+   vkCmdEndRendering(cmd);
+   CHECK(vkEndCommandBuffer(cmd));
+   submit_wait(cmd);
+   vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+   printf("params hash %016llx%s\n", (unsigned long long)
+          image_hash(&rt8, VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 4),
+          has_multi_draw ? "" : " (no multi draw)");
+   free_buffer(&ib);
+   free_buffer(&ib16);
+   free_buffer(&ind);
+}
+
 static bool
 want(const char *tests, const char *t)
 {
@@ -1126,18 +1535,40 @@ main(int argc, char **argv)
       .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
       .queueFamilyIndex = qfam, .queueCount = 1, .pQueuePriorities = &prio,
    };
+   uint32_t next = 0;
+   CHECK(vkEnumerateDeviceExtensionProperties(pdev, NULL, &next, NULL));
+   VkExtensionProperties *exts = calloc(next, sizeof(*exts));
+   CHECK(vkEnumerateDeviceExtensionProperties(pdev, NULL, &next, exts));
+   for (uint32_t i = 0; i < next; i++)
+      if (!strcmp(exts[i].extensionName, VK_EXT_MULTI_DRAW_EXTENSION_NAME))
+         has_multi_draw = true;
+   free(exts);
+   const char *dev_exts[] = { VK_EXT_MULTI_DRAW_EXTENSION_NAME };
+   VkPhysicalDeviceMultiDrawFeaturesEXT fmd = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT,
+      .multiDraw = VK_TRUE,
+   };
+   VkPhysicalDeviceVulkan11Features f11 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+      .pNext = has_multi_draw ? &fmd : NULL,
+      .shaderDrawParameters = VK_TRUE,
+   };
    VkPhysicalDeviceVulkan13Features f13 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+      .pNext = &f11,
       .dynamicRendering = VK_TRUE,
    };
    VkPhysicalDeviceFeatures2 f2 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f13,
       .features.tessellationShader = VK_TRUE,
+      .features.multiDrawIndirect = VK_TRUE,
    };
    VkDeviceCreateInfo dci = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .pNext = &f2,
       .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
+      .enabledExtensionCount = has_multi_draw ? 1 : 0,
+      .ppEnabledExtensionNames = dev_exts,
    };
    CHECK(vkCreateDevice(pdev, &dci, NULL, &dev));
    vkGetDeviceQueue(dev, qfam, 0, &queue);
@@ -1271,6 +1702,7 @@ main(int argc, char **argv)
    m_tcs = SHADER(spv_tess_tesc);
    m_tes = SHADER(spv_tess_tese);
    m_copy = SHADER(spv_copy_comp);
+   VkShaderModule m_params = SHADER(spv_params_vert);
 
    const VkPrimitiveTopology TL = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
    VkPipeline p_alu = make_gfx(&(struct gfx_desc){ .vs = m_fsq, .fs = m_alu,
@@ -1299,6 +1731,8 @@ main(int argc, char **argv)
    VkPipeline p_tess = make_gfx(&(struct gfx_desc){ .vs = m_tvs, .tcs = m_tcs,
       .tes = m_tes, .fs = m_color, .color = VK_FORMAT_R8G8B8A8_UNORM,
       .depth = true, .topo = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST });
+   VkPipeline p_params = make_gfx(&(struct gfx_desc){ .vs = m_params, .fs = m_color,
+      .color = VK_FORMAT_R8G8B8A8_UNORM, .topo = TL });
    VkComputePipelineCreateInfo cpci = {
       .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
       .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -1331,15 +1765,21 @@ main(int argc, char **argv)
    }
    if (want(tests, "clear"))
       test_clear();
+   /* BENCH_NDRAWS: fewer draws, e.g. for NVK_DEBUG=push_dump */
+   const int nd = getenv("BENCH_NDRAWS") ? atoi(getenv("BENCH_NDRAWS")) : 20000;
    if (want(tests, "ubo")) {
-      test_ubo_draws(p_ubo, PL_DEVICE, 20000, false, "plain draws");
-      test_ubo_draws(p_ubo, PL_DEVICE, 20000, false, "ubo draws");
-      test_ubo_draws(p_ubo, PL_HOST, 20000, false, "ubo draws");
-      test_ubo_draws(p_ubo, PL_DEVICE_HOST, 20000, false, "ubo draws");
+      test_ubo_draws(p_ubo, PL_DEVICE, nd, false, "plain draws");
+      test_ubo_draws(p_ubo, PL_DEVICE, nd, false, "ubo draws");
+      test_ubo_draws(p_ubo, PL_HOST, nd, false, "ubo draws");
+      test_ubo_draws(p_ubo, PL_DEVICE_HOST, nd, false, "ubo draws");
    }
    if (want(tests, "desc")) {
-      test_ubo_draws(p_ubotex, PL_DEVICE, 20000, true, "set switch");
+      test_ubo_draws(p_ubotex, PL_DEVICE, nd, true, "set switch");
    }
+   if (want(tests, "rebind"))
+      test_rebind(p_ubo, p_ubotex, nd);
+   if (want(tests, "vbib"))
+      test_vbib(p_mesh, nd);
    if (want(tests, "mesh")) {
       test_mesh(p_mesh, 1024, 4, PL_DEVICE, -1, "mesh 2M");
       test_mesh(p_mesh, 1024, 4, PL_HOST, -1, "mesh 2M");
@@ -1364,6 +1804,12 @@ main(int argc, char **argv)
       test_transfer_copy(256ull << 20);
    }
 
+   if (want(tests, "dynidx"))
+      test_dynidx(SHADER(spv_dynidx_vert), m_color);
+   if (want(tests, "descupd"))
+      test_descupd(p_ubotex);
+   if (want(tests, "params"))
+      test_params(p_params);
    if (want(tests, "verify"))
       test_verify(p_tex, p_blend, p_tess);
    if (want(tests, "coh"))

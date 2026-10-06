@@ -175,6 +175,34 @@ void main() {
    col = vec4(nrm * 0.5 + 0.5, 1.0) * u.c;
 }
 """
+S["params.vert"] = """#version 460
+layout(location = 0) out vec4 col;
+void main() {
+   int corner = gl_VertexIndex % 3;
+   int cell = (gl_VertexIndex / 3 * 7 + gl_InstanceIndex * 13 + gl_DrawID * 29 +
+               gl_BaseVertex * 3 + gl_BaseInstance * 5) & 1023;
+   vec2 o = vec2(float(cell & 31), float(cell >> 5)) / 16.0 - 1.0;
+   vec2 c = vec2(float(corner & 1), float(corner >> 1)) / 12.0;
+   gl_Position = vec4(o + c, 0.0, 1.0);
+   col = vec4(fract(float(gl_BaseVertex + 64) / 37.0),
+              fract(float(gl_BaseInstance) / 41.0),
+              fract(float(gl_DrawID) / 7.0),
+              fract(float(gl_VertexIndex + 1000 * gl_InstanceIndex + 4096) / 53.0));
+}
+"""
+S["dynidx.vert"] = """#version 450
+layout(push_constant) uniform PC { ivec4 i; } pc;
+layout(set = 0, binding = 0) uniform A { vec4 c; } a;
+layout(set = 0, binding = 1) uniform B { vec4 c; } b[4];
+layout(set = 1, binding = 0) uniform C { vec4 c; } cc[3];
+layout(location = 0) out vec4 col;
+void main() {
+   vec2 p = vec2(float(gl_VertexIndex & 1), float(gl_VertexIndex >> 1)) * 0.2;
+   vec2 o = vec2(float(pc.i.x % 8), float(pc.i.x / 8)) * 0.25 - 1.0;
+   gl_Position = vec4(o + p, 0.0, 1.0);
+   col = a.c * 0.25 + b[pc.i.y].c * 0.5 + cc[pc.i.z].c * 0.25;
+}
+"""
 S["copy.comp"] = """#version 450
 layout(local_size_x = 256) in;
 layout(std430, set = 0, binding = 0) readonly buffer A { vec4 a[]; };
