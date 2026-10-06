@@ -7,7 +7,8 @@ zero-copy presentation, smooth frame pacing and performance at bare-metal
 level. Venus (Vulkan command encoding replayed on the host) is removed once
 every workload has an NVK path.
 
-This file is the working plan. It is updated as stages land; the numbers are
+This file is the working plan; [HANDOFF.md](HANDOFF.md) has the current
+state, what was tried and the next steps. It is updated as stages land; the numbers are
 measurements, with the setup named.
 
 ## Where it stands (2026-10-07)
@@ -29,7 +30,10 @@ Remaining, in order:
 1. The windowed blt path: a guest-memory blob as the Venus copy destination
    removes the CPU copy and the fence wait from the composed Present. Host
    side done (`venus.guest_blobs`, [VENUS.md](VENUS.md) "Guest-memory
-   blobs"); KMD v343 in review.
+   blobs"); KMD v343 merged (package 22.22.343.1, `GuestBlob` default off):
+   windowed Heaven 214 → 247 fps, CPU mirror gone; with `BltAsync` the KMD
+   Blt costs 0.135 ms. The remaining ~1.8 ms per Present is the previous
+   Blt's fence retire; next steps in [HANDOFF.md](HANDOFF.md).
 2. Recovery after `pnputil /restart-device`: open issues (wrong buffer on
    scanout after a restart,
    [zero-copy-present.md](../guest/windows/docs/zero-copy-present.md) 25;

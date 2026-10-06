@@ -1,0 +1,11 @@
+#!/bin/bash
+# clean perf pass on the installed driver
+T=${VMTEST_DIR:-$HOME/.cache/conduit-vmtest}/t; H="Ole Algoritme@127.0.0.1"
+fl() { timeout 30 ssh -p 2222 "$H" '$f=Get-ChildItem C:\ProgramData\Helios -Filter "umd-*.log" | Sort LastWriteTime -Desc | ? { Select-String -Path $_.FullName -Pattern "for Heaven.exe" -Quiet } | Select -First 1; (Select-String -Path $f.FullName -Pattern "fps over the last" | % { ($_.Line -split "\), ")[1].Split(" ")[0] }) -join " "' | tr -d '\r'; }
+echo "== 1 composed default"; bash $T/blrow.sh K0 "" 2>&1 | grep -E "^PM|PrDdi"
+echo "== 2 composed BltAsync=1 (mirror on)"; bash $T/blrow.sh K1 "" ForeignCopy=1 BltAsync=1 2>&1 | grep -E "^PM|PrDdi"
+timeout 150 ssh -p 2222 "$H" "\$K='HKLM:\SYSTEM\CurrentControlSet\Services\helios_kmd_render'; foreach(\$n in 'BltAsync','BltNoMirror','ForeignCopy'){ Remove-ItemProperty \$K -Name \$n -EA 0 }; \$id=(Get-PnpDevice -Class Display -Status OK | ? Service -eq helios_kmd_render).InstanceId; pnputil /restart-device \"\$id\" | Out-Null; Start-Sleep 15; \$o=(Get-Process dwm).Id; Stop-Process -Id \$o -Force; Start-Sleep 12; foreach(\$n in 'ShellExperienceHost','SearchHost','StartMenuExperienceHost','TextInputHost','explorer'){ Get-Process \$n -EA 0 | % { Stop-Process -Id \$_.Id -Force } }; Start-Sleep 8; if(-not (Get-Process explorer -EA 0)){ schtasks /create /f /tn ConduitExp /tr explorer.exe /sc once /st 23:59 /it /ru 'Ole Algoritme' | Out-Null; schtasks /run /tn ConduitExp | Out-Null; Start-Sleep 6; schtasks /delete /f /tn ConduitExp | Out-Null }; 'knobs off'" | tr -d '\r'
+echo "== 3 X0 scanout"; bash $T/hvwin.sh direct3d11 "HELIOS_NVK_PRESENT=1" >/dev/null; sleep 60; fl; bash $T/hvclose.sh >/dev/null
+echo "== 4 X1 scanout, affinity FFFE"; bash $T/hvwin.sh direct3d11 "HELIOS_NVK_PRESENT=1" >/dev/null; timeout 20 ssh -p 2222 "$H" '(Get-Process Heaven).ProcessorAffinity=0xFFFE; "aff=" + (Get-Process Heaven).ProcessorAffinity' | tr -d '\r'; sleep 58; fl; bash $T/hvclose.sh >/dev/null
+timeout 20 ssh -p 2222 "$H" 'Get-Process Heaven -EA 0 | % { Stop-Process -Id $_.Id -Force }' >/dev/null
+echo "== 5 D3D12 quick"; for a in "-Icd venus" "-Icd nvk -Present 1"; do timeout 90 ssh -p 2222 "$H" "powershell -ExecutionPolicy Bypass -File C:\\Users\\Public\\s315\\app\\s5-d3d12-tri.ps1 $a -Dir C:\\Users\\Public\\s315" 2>&1 | tr -d '\r' | grep -iE 'fps|PASS|FAIL' | tail -2; done
