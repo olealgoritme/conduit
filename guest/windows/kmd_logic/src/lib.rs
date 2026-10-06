@@ -24,9 +24,11 @@ pub mod nvrm_events;
 pub mod nvrm_fastpath;
 pub mod nvrm_fence;
 pub mod nvrm_views;
+pub mod foreign_copy;
 pub mod foreign_errno;
 pub mod foreign_resource;
 pub mod foreign_scanout;
+pub mod rm_resource_import;
 pub mod page_runs;
 pub mod rm_client;
 pub mod rm_present;
@@ -854,6 +856,8 @@ pub const ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: i32 = 1000072001;
 pub const ST_EXPORT_MEMORY_ALLOCATE_INFO: i32 = 1000072002;
 pub const ST_MEMORY_DEDICATED_ALLOCATE_INFO: i32 = 1000127001;
 pub const ST_IMPORT_MEMORY_RESOURCE_INFO_MESA: i32 = 1000384002;
+/// `VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT`.
+pub const ST_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT: i32 = 1000158004;
 
 pub const IMAGE_TYPE_2D: u32 = 1;
 pub const SAMPLE_COUNT_1: u32 = 0x0000_0001;
@@ -872,6 +876,10 @@ pub const IMAGE_TILING_OPTIMAL: u32 = 0;
 /// and the host built a tiled image the display importer read as linear: a black
 /// screen with no error anywhere. It is 1. Do not "simplify" it.
 pub const IMAGE_TILING_LINEAR: u32 = 1;
+/// `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`. Only valid on a device created with
+/// `VK_EXT_image_drm_format_modifier`; the one user is the foreign-resource copy
+/// import ([`foreign_copy`]).
+pub const IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT: u32 = 1000158000;
 
 /// Which pNext chain a `VkImageCreateInfo` carries.
 ///
@@ -880,15 +888,32 @@ pub const IMAGE_TILING_LINEAR: u32 = 1;
 /// cannot be encoded.
 ///
 /// The `ExternalMemoryWithModifierList` variant the review specifies is NOT
-/// here: `ST_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO`, `DRM_FORMAT_MOD_LINEAR`
-/// and `IMAGE_TILING_DRM_FORMAT_MODIFIER` all went with T6/R906 when the modifier
-/// path was deleted, so it would have zero users.
+/// here: `ST_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO` and
+/// `DRM_FORMAT_MOD_LINEAR` went with T6/R906 when the modifier path was deleted,
+/// so it would have zero users. The EXPLICIT variant below is a different thing:
+/// it is the one chain a foreign (NVK-on-RM) resource can be imported with, and
+/// it has a user ([`foreign_copy`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ImagePNext {
     /// An internal image with no external-memory contract.
     None,
     /// `VkExternalMemoryImageCreateInfo` with the given `VkExternalMemoryHandleTypeFlags`.
     ExternalMemory { handle_type: u32 },
+    /// `VkExternalMemoryImageCreateInfo` -> `VkImageDrmFormatModifierExplicitCreateInfoEXT`
+    /// with exactly one plane layout `{offset = plane_offset, rowPitch = row_pitch}`
+    /// (`size`, `arrayPitch` and `depthPitch` are 0, as
+    /// VUID-VkImageDrmFormatModifierExplicitCreateInfoEXT-size-02267 and its two
+    /// siblings require for a single-layer 2D image). Pair it with
+    /// [`IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`]. The explicit struct is nested
+    /// INSIDE the external-memory struct's pNext, so its fields are written
+    /// first and the external struct's own `handleTypes` comes last (the same
+    /// order rule as `MemoryPNext::ExportDedicated`).
+    ExternalMemoryDrmExplicit {
+        handle_type: u32,
+        modifier: u64,
+        plane_offset: u64,
+        row_pitch: u64,
+    },
 }
 
 /// Everything the three image creates differ by. The rest of
@@ -919,6 +944,29 @@ pub fn encode_image_create(device_id: u64, image_id: u64, spec: &ImageCreateSpec
             w.count(true);
             w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
             w.count(false);
+            w.u32(handle_type);
+        }
+        ImagePNext::ExternalMemoryDrmExplicit {
+            handle_type,
+            modifier,
+            plane_offset,
+            row_pitch,
+        } => {
+            w.count(true);
+            w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+            // pNext of the external struct: the explicit-modifier struct.
+            w.count(true);
+            w.i32(ST_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+            w.count(false); // its own pNext ends the chain
+            w.u64(modifier); // drmFormatModifier
+            w.u32(1); // drmFormatModifierPlaneCount
+            w.u64(1); // pPlaneLayouts array_size
+            w.u64(plane_offset); // VkSubresourceLayout.offset
+            w.u64(0); // size
+            w.u64(row_pitch); // rowPitch
+            w.u64(0); // arrayPitch
+            w.u64(0); // depthPitch
+                      // The EXTERNAL struct's own field, after the nested one.
             w.u32(handle_type);
         }
     }
@@ -965,6 +1013,12 @@ pub enum MemoryPNext {
     ExportDedicatedBuffer { handle_type: u32, buffer: u64 },
     /// `VkImportMemoryResourceInfoMESA` — adopt an existing virtio resource.
     ImportResource { resource_id: u32 },
+    /// `VkImportMemoryResourceInfoMESA` -> `VkMemoryDedicatedAllocateInfo` for an
+    /// image: a dedicated import. The dedicated struct is nested inside the
+    /// import struct's pNext, so `image`/`buffer` are written before `resourceId`
+    /// (the `ExportDedicated` rule again). This is the shape the host's NVIDIA
+    /// driver requires to import a dma-buf as an explicit-modifier image.
+    ImportResourceDedicated { resource_id: u32, image: u64 },
 }
 
 /// Everything the memory-allocation command variants differ by.
@@ -1032,6 +1086,17 @@ pub fn encode_memory_allocate(device_id: u64, memory_id: u64, spec: &MemoryAlloc
             w.count(true);
             w.i32(ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
             w.count(false);
+            w.u32(resource_id);
+        }
+        MemoryPNext::ImportResourceDedicated { resource_id, image } => {
+            w.count(true);
+            w.i32(ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+            w.count(true);
+            w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
+            w.count(false);
+            w.u64(image);
+            w.u64(0); // buffer
+                      // The IMPORT struct's own field, after the nested dedicated one.
             w.u32(resource_id);
         }
     }

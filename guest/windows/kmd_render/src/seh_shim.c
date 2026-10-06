@@ -154,3 +154,39 @@ helios_unlock_system_buffer(PMDL Mdl)
     MmUnlockPages(Mdl);
     IoFreeMdl(Mdl);
 }
+
+/*
+ * Process reference for a pin (HELIOS_ESCAPE_NVRM PIN), header-free like the
+ * rest of this file: IoGetCurrentProcess / ObfReferenceObject /
+ * ObfDereferenceObject are the exports behind the PsGetCurrentProcess /
+ * ObReferenceObject / ObDereferenceObject macros (FASTCALL is the only x64
+ * convention, so the prototypes need no decoration).
+ *
+ * helios_reference_current_process takes one reference on the CALLING process's
+ * EPROCESS and returns it. It is paired with exactly one
+ * helios_dereference_process, which NvrmPin's Drop makes AFTER the pages are
+ * unlocked, at PASSIVE_LEVEL, in any process context. A pin that is leaked on
+ * purpose (the host may still alias its pages) never reaches the dereference,
+ * so the process object stays alive. Whether that defers the kernel's
+ * locked-pages check at process teardown is NOT verified (see NvrmPin).
+ */
+long long ObfReferenceObject(PVOID Object);
+long long ObfDereferenceObject(PVOID Object);
+PVOID IoGetCurrentProcess(void);
+
+PVOID
+helios_reference_current_process(void)
+{
+    PVOID process = IoGetCurrentProcess();
+
+    if (process)
+        ObfReferenceObject(process);
+    return process;
+}
+
+void
+helios_dereference_process(PVOID Process)
+{
+    if (Process)
+        ObfDereferenceObject(Process);
+}

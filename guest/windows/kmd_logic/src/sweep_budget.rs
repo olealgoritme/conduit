@@ -118,6 +118,30 @@ pub enum PinFate {
     Leak,
 }
 
+/// What to do with ONE pin, given the sweep's [`PinFate`] and whether the host
+/// may alias that pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinAction {
+    /// `MmUnlockPages` (and release everything the pin owns).
+    Unlock,
+    /// Leave the pages locked on purpose. The pin's reference on its owning
+    /// process stays too (see `NvrmPin::leak`): the pin is never dropped.
+    Leak,
+}
+
+impl PinFate {
+    /// A pin no `FORWARD` claimed was never described to the host, so nothing
+    /// can alias it and it is unlocked whatever happened to the sweep. A claimed
+    /// pin is unlocked only when the host confirmed closing everything that could
+    /// alias it.
+    pub const fn action(self, host_may_alias: bool) -> PinAction {
+        match self {
+            PinFate::Leak if host_may_alias => PinAction::Leak,
+            PinFate::Unlock | PinFate::Leak => PinAction::Unlock,
+        }
+    }
+}
+
 /// Outcome of the host-side closes of one sweep.
 ///
 /// A handle or mapping that was dropped from the tables WITHOUT a confirmed
@@ -307,6 +331,26 @@ mod tests {
         t.failed();
         t.confirmed();
         assert_eq!(t.pin_fate(), PinFate::Leak);
+    }
+
+    #[test]
+    fn pin_action_follows_fate_and_alias() {
+        // Confirmed closed: everything unlocks, claimed or not.
+        assert_eq!(PinFate::Unlock.action(true), PinAction::Unlock);
+        assert_eq!(PinFate::Unlock.action(false), PinAction::Unlock);
+        // Not confirmed: only a pin the host may alias stays locked.
+        assert_eq!(PinFate::Leak.action(true), PinAction::Leak);
+        assert_eq!(PinFate::Leak.action(false), PinAction::Unlock);
+    }
+
+    #[test]
+    fn a_failed_transport_sweep_is_a_leak_fate() {
+        // `teardown_nvrm_state` (nothing was sent, nothing confirmed) decides
+        // with `PinFate::Leak`: the same answer an unconfirmed sweep gives.
+        let mut t = CloseTally::new();
+        t.unsent();
+        assert_eq!(t.pin_fate(), PinFate::Leak);
+        assert_eq!(t.pin_fate().action(true), PinAction::Leak);
     }
 
     #[test]

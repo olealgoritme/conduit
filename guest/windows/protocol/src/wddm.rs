@@ -352,6 +352,26 @@ impl HeliosWddmAllocLayout {
             && self.version == HELIOS_WDDM_LAYOUT_VERSION
             && self.reserved == 0
     }
+
+    /// The trailer of an allocation's per-allocation private driver data, for an
+    /// opener: `private` is the whole buffer dxgkrnl handed over
+    /// (`pPrivateDriverData`, `PrivateDriverDataSize` bytes). `None` when the
+    /// buffer is shorter than [`HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES`] or the
+    /// record is not a valid one. For a foreign allocation the KMD rewrites this
+    /// record at every open from its own table, so a valid one is trustworthy.
+    pub fn read_open(private: &[u8]) -> Option<Self> {
+        let bytes =
+            private.get(HELIOS_WDDM_LAYOUT_OFFSET..HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES)?;
+        let layout: Self = bytemuck::pod_read_unaligned(bytes);
+        layout.is_valid().then_some(layout)
+    }
+
+    /// The trailer repeats `stride` and `plane_offset` of the meta; an opener that
+    /// reads both can check they agree.
+    #[inline]
+    pub fn agrees_with(&self, meta: &HeliosWddmAllocMeta) -> bool {
+        self.stride == meta.pitch && u64::from(self.plane_offset) == meta.plane_offset
+    }
 }
 
 const _: () = {
@@ -415,6 +435,19 @@ pub const HELIOS_WDDM_IDENTITY_VERSION: u32 = 2;
 /// is kind-discriminated: DEVICE_MEMORY identities use the same words for the
 /// global VidMm tracker, while STANDARD identities never carry that tracker.
 pub const HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER: u32 = 0x0000_0001;
+/// [`HeliosWddmOpenIdentity::reserved`] word 0 bit for a DEVICE_MEMORY allocation
+/// that adopted a FOREIGN resource (`HELIOS_ESCAPE_FOREIGN_RESOURCE` `IMPORT_RM`,
+/// `blob_mem = HELIOS_BLOB_MEM_RM_EXPORT`): RM memory exported by an NVK-on-RM
+/// process and imported on the host as a dma-buf-origin blob. The opener must
+/// import it with `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and the explicit layout
+/// of the [`HeliosWddmAllocLayout`] trailer, not as a plain opaque-fd image.
+///
+/// Wire shape: `reserved[0] == HELIOS_WDDM_OPEN_FLAG_FOREIGN`, `reserved[1] == 0`.
+/// A DEVICE_MEMORY identity that carries a global VidMm tracker has BOTH words
+/// nonzero, so the two never collide, and every existing reader (which acts on
+/// `reserved` only through [`HeliosWddmOpenIdentity::global_vidmm_tracker`])
+/// ignores a foreign identity's words. Version is NOT bumped.
+pub const HELIOS_WDDM_OPEN_FLAG_FOREIGN: u32 = 0x0000_0001;
 /// Allocation identity record the KMD writes into the OPEN-time private driver
 /// data in `DxgkDdiOpenAllocation`, overwriting the first 48 bytes (the
 /// [`HeliosWddmAllocPrivate`] region — the [`HeliosWddmAllocMeta`] trailer at
@@ -466,6 +499,21 @@ impl HeliosWddmOpenIdentity {
             && self.version >= HELIOS_WDDM_IDENTITY_VERSION
             && self.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
             && self.reserved[0] & HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER != 0
+    }
+
+    /// Whether this allocation adopted a FOREIGN (RM-exported) resource, so the
+    /// opener takes the dma-buf-modifier import path with the layout trailer
+    /// ([`HeliosWddmAllocLayout`], private-data offset
+    /// [`HELIOS_WDDM_LAYOUT_OFFSET`]) instead of the plain opaque-fd path. Only
+    /// the KMD sets it, from its own record, never from creator data.
+    #[inline]
+    pub fn foreign(&self) -> bool {
+        self.is_valid()
+            && self.version >= HELIOS_WDDM_IDENTITY_VERSION
+            && self.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
+            && self.resource_id != 0
+            && self.reserved[1] == 0
+            && self.reserved[0] & HELIOS_WDDM_OPEN_FLAG_FOREIGN != 0
     }
 
     /// Return the global VidMm tracker identity only when its complete typed
@@ -1118,6 +1166,101 @@ mod classify_tests {
         ident.resource_id = 42;
         ident.kind = HELIOS_WDDM_ALLOC_KIND_STANDARD;
         assert_eq!(ident.global_vidmm_tracker(), None);
+    }
+
+    fn foreign_identity() -> HeliosWddmOpenIdentity {
+        HeliosWddmOpenIdentity {
+            venus_alloc_size: 8 << 20,
+            blob_size: 8 << 20,
+            magic: HELIOS_WDDM_IDENTITY_MAGIC,
+            version: HELIOS_WDDM_IDENTITY_VERSION,
+            resource_id: 42,
+            memory_type_index: 0,
+            ctx_id: 7,
+            kind: HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+            reserved: [HELIOS_WDDM_OPEN_FLAG_FOREIGN, 0],
+        }
+    }
+
+    #[test]
+    fn a_foreign_identity_is_flagged_and_is_never_a_tracker() {
+        let ident = foreign_identity();
+        assert!(ident.foreign());
+        // The same words an old reader looks at: not a tracker.
+        assert_eq!(ident.global_vidmm_tracker(), None);
+        assert!(!ident.dedicated_present_buffer());
+        // The identity keeps its size: an old opener parses it unchanged.
+        assert_eq!(core::mem::size_of::<HeliosWddmOpenIdentity>(), 48);
+        assert_eq!(HELIOS_WDDM_IDENTITY_VERSION, 2);
+    }
+
+    #[test]
+    fn the_foreign_flag_cannot_be_read_out_of_other_shapes() {
+        // A global-tracker identity has both words nonzero: not foreign even if
+        // its share happens to have bit 0 set.
+        let mut t = foreign_identity();
+        t.reserved = [0x1235, 0x5678];
+        assert!(!t.foreign());
+        assert!(t.global_vidmm_tracker().is_some());
+        // A plain identity.
+        let mut plain = foreign_identity();
+        plain.reserved = [0, 0];
+        assert!(!plain.foreign());
+        // Wrong kind, legacy version, invalid record, no resource.
+        let mut k = foreign_identity();
+        k.kind = HELIOS_WDDM_ALLOC_KIND_STANDARD;
+        assert!(!k.foreign());
+        let mut v = foreign_identity();
+        v.version = HELIOS_WDDM_IDENTITY_VERSION_LEGACY;
+        assert!(!v.foreign());
+        let mut m = foreign_identity();
+        m.magic = 0;
+        assert!(!m.foreign());
+        let mut r = foreign_identity();
+        r.resource_id = 0;
+        assert!(!r.foreign());
+        // Other bits of word 0 are reserved for later flags and do not matter.
+        let mut o = foreign_identity();
+        o.reserved[0] |= 0x8000_0000;
+        assert!(o.foreign());
+    }
+
+    #[test]
+    fn an_opener_reads_the_layout_trailer_from_the_private_data() {
+        let layout = HeliosWddmAllocLayout {
+            modifier: 0x0300_0000_0060_6015,
+            magic: HELIOS_WDDM_LAYOUT_MAGIC,
+            version: HELIOS_WDDM_LAYOUT_VERSION,
+            fourcc: 0x3432_5258,
+            stride: 7680,
+            plane_offset: 0,
+            reserved: 0,
+        };
+        let mut buf = [0u8; HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES];
+        buf[HELIOS_WDDM_LAYOUT_OFFSET..].copy_from_slice(bytemuck::bytes_of(&layout));
+        assert_eq!(HeliosWddmAllocLayout::read_open(&buf), Some(layout));
+        // Longer buffers are fine (the trailer is at a fixed offset).
+        let mut long = [0u8; 160];
+        long[..buf.len()].copy_from_slice(&buf);
+        assert_eq!(HeliosWddmAllocLayout::read_open(&long), Some(layout));
+        // A 96-byte buffer (an old creator's size) has no trailer.
+        assert_eq!(HeliosWddmAllocLayout::read_open(&buf[..96]), None);
+        assert_eq!(HeliosWddmAllocLayout::read_open(&buf[..127]), None);
+        // An invalid record is not returned.
+        buf[HELIOS_WDDM_LAYOUT_OFFSET + 8] ^= 1;
+        assert_eq!(HeliosWddmAllocLayout::read_open(&buf), None);
+
+        let meta = HeliosWddmAllocMeta {
+            pitch: 7680,
+            plane_offset: 0,
+            ..HeliosWddmAllocMeta::zeroed()
+        };
+        assert!(layout.agrees_with(&meta));
+        let skewed = HeliosWddmAllocMeta {
+            pitch: 7584,
+            ..meta
+        };
+        assert!(!layout.agrees_with(&skewed));
     }
 
     #[test]

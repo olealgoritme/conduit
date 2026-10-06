@@ -14,6 +14,9 @@ pub const ENOMEM: u32 = 12;
 pub const EINVAL: u32 = 22;
 pub const ERANGE: u32 = 34;
 pub const EOPNOTSUPP: u32 = 95;
+/// An older backend answers a message type it does not know with `-EPROTO`
+/// (`RmResourceImport`, MsgType 31).
+pub const EPROTO: u32 = 71;
 
 /// The errno of a response header, or 0 if the response is too short.
 pub fn from_resp_hdr(resp: &[u8]) -> u32 {
@@ -31,7 +34,8 @@ pub enum Verdict {
     NotOwned,
     /// The size is bigger than the object, or the request is malformed.
     BadRange,
-    /// The host does not serve the import.
+    /// The host does not serve the import (`EOPNOTSUPP`, or `EPROTO` from a backend
+    /// that predates the message).
     Unsupported,
     /// The host or the renderer is out of memory.
     NoResources,
@@ -43,7 +47,7 @@ pub fn classify(errno: u32) -> Verdict {
     match errno {
         EBADF | ENOENT => Verdict::NotOwned,
         ERANGE | EINVAL => Verdict::BadRange,
-        EOPNOTSUPP => Verdict::Unsupported,
+        EOPNOTSUPP | EPROTO => Verdict::Unsupported,
         ENOMEM => Verdict::NoResources,
         _ => Verdict::Device,
     }
@@ -86,6 +90,7 @@ mod tests {
         assert_eq!(classify(ERANGE), Verdict::BadRange);
         assert_eq!(classify(EINVAL), Verdict::BadRange);
         assert_eq!(classify(EOPNOTSUPP), Verdict::Unsupported);
+        assert_eq!(classify(EPROTO), Verdict::Unsupported);
         assert_eq!(classify(ENOMEM), Verdict::NoResources);
         assert_eq!(classify(EIO), Verdict::Device);
         assert_eq!(classify(0), Verdict::Device);

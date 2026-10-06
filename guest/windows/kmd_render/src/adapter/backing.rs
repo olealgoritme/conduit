@@ -370,9 +370,25 @@ impl SystemBackingTable {
         self.invalid.lock().mark(resource_id)
     }
 
-    /// Whether a page-in of `resource_id` must be skipped.
-    pub fn system_copy_invalid(&self, resource_id: u32) -> bool {
-        self.invalid.lock().contains(resource_id)
+    /// Whether a page-in of `resource_id` must be skipped. When it must, the
+    /// blob (which the GPU may now write) is the only current copy, so whatever
+    /// eviction chunks were tallied toward clearing the mark are void.
+    pub fn page_in_blocked(&self, resource_id: u32) -> bool {
+        self.invalid.lock().page_in_blocked(resource_id)
+    }
+
+    /// A LOCAL_TO_SYSTEM eviction chunk `[offset, offset + moved)` of the
+    /// `alloc_size`-byte `resource_id` succeeded. Own spinlock, no allocation.
+    pub fn evict_chunk_done(
+        &self,
+        resource_id: u32,
+        alloc_size: u64,
+        offset: u64,
+        moved: u64,
+    ) -> helios_kmd_logic::paging::Chunk {
+        self.invalid
+            .lock()
+            .evict_chunk_done(resource_id, alloc_size, offset, moved)
     }
 
     /// Drop the mark. Returns whether it was set.
@@ -573,15 +589,25 @@ impl SystemBackingGuard<'_> {
     }
 
     /// Whether a page-in of `resource_id` must be skipped (its last eviction was
-    /// skipped, so the system pages are not its content).
-    pub(crate) fn system_copy_invalid(&self, resource_id: u32) -> bool {
-        self.table.system_copy_invalid(resource_id)
+    /// skipped, so the system pages are not its content). A skipped page-in also
+    /// voids the partial-eviction coverage gathered so far: see
+    /// [`SystemBackingTable::page_in_blocked`].
+    pub(crate) fn page_in_blocked(&self, resource_id: u32) -> bool {
+        self.table.page_in_blocked(resource_id)
     }
 
-    /// The system copy of `resource_id` is valid again (a whole-allocation
-    /// eviction succeeded).
-    pub(crate) fn clear_system_copy_invalid(&self, resource_id: u32) -> bool {
-        self.table.clear_system_copy_invalid(resource_id)
+    /// A LOCAL_TO_SYSTEM eviction chunk of `resource_id` succeeded; clears the
+    /// "invalid" mark once the successful chunks since the mark cover the whole
+    /// allocation. See [`SystemBackingTable::evict_chunk_done`].
+    pub(crate) fn evict_chunk_done(
+        &self,
+        resource_id: u32,
+        alloc_size: u64,
+        offset: u64,
+        moved: u64,
+    ) -> helios_kmd_logic::paging::Chunk {
+        self.table
+            .evict_chunk_done(resource_id, alloc_size, offset, moved)
     }
 
     /// The allocation's content is discarded or the allocation is gone: drop its

@@ -98,6 +98,13 @@ impl VenusClient {
     /// cache the returned object in the allocation context, submit it with
     /// [`Self::submit_prepared_image_copy`], and destroy it only through
     /// [`Self::destroy_prepared_image_copy`].
+    ///
+    /// `foreign` is `Some` only for a source that adopted a foreign (NVK-on-RM)
+    /// resource: it is then imported as an explicit-modifier dma-buf image from
+    /// its record ([`foreign_copy`](super::foreign_copy)), and
+    /// `source_memory_type_index`, `ddi_bind_flags` and `source_dxgi_format` do
+    /// not shape the image (the record's fourcc does). With `None` every line
+    /// below runs exactly as before the foreign path existed.
     pub fn prepare_optimal_scanout_copy(
         &mut self,
         adapter: &AdapterContext,
@@ -109,6 +116,7 @@ impl VenusClient {
         source_dxgi_format: u32,
         ddi_bind_flags: u32,
         target_image_id: u64,
+        foreign: Option<ForeignSource>,
     ) -> Result<PreparedImageCopy, VirtioError> {
         // The pub surface still speaks raw u64 (R607 commit 2 converts it); this
         // is the one place the "0 is not a handle" rule is enforced, and it
@@ -121,43 +129,98 @@ impl VenusClient {
             || source_allocation_size == 0
             || width == 0
             || height == 0
-            || source_memory_type_index >= self.memory_type_count
+            // A foreign source has no creator-side memory type to check: the KMD
+            // device chooses its own at import.
+            || (foreign.is_none() && source_memory_type_index >= self.memory_type_count)
         {
             diag(0x0137);
             return Err(VirtioError::DeviceError);
         }
-        let source_pixel_format =
-            PresentPixelFormat::from_dxgi(source_dxgi_format).ok_or(VirtioError::DeviceError)?;
+        let source_pixel_format = match &foreign {
+            // The record's fourcc is what the bytes are.
+            Some(source) => source.pixel_format().ok_or(VirtioError::DeviceError)?,
+            None => {
+                PresentPixelFormat::from_dxgi(source_dxgi_format).ok_or(VirtioError::DeviceError)?
+            }
+        };
         let target_pixel_format = PresentPixelFormat::Bgra8Unorm;
+
+        // Foreign only: everything decidable without the host, BEFORE the
+        // attach, so a refusal has nothing to undo.
+        let foreign_image = match &foreign {
+            Some(source) => {
+                Some(self.foreign_preflight(adapter, source_resource_id, source, width, height)?)
+            }
+            None => None,
+        };
 
         crate::diag::record_named_bytes(b"CpImpSt", 1);
         ctrl::attach_resource_checked(self.passive(), adapter, self.ctx_id(), source_resource_id)?;
 
-        crate::diag::record_named_bytes(b"CpImpSt", 2);
-        let source_image_id = match self.create_optimal_present_image_alias(
-            adapter,
-            width,
-            height,
-            ddi_bind_flags,
-            source_dxgi_format,
-            OptimalImageTransport::OpaqueFd,
-        ) {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = ctrl::ctx_detach_resource(
-                    self.passive(),
-                    adapter,
-                    self.ctx_id(),
-                    source_resource_id,
-                );
-                return Err(e);
-            }
-        };
+        let (source_image_id, source_memory_id) = if let Some(image) = foreign_image {
+            // The explicit-modifier import cleans up after itself, attach included.
+            let ids = self.import_foreign_source(adapter, source_resource_id, &image)?;
+            FC_SCANOUT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            ids
+        } else {
+            crate::diag::record_named_bytes(b"CpImpSt", 2);
+            let source_image_id = match self.create_optimal_present_image_alias(
+                adapter,
+                width,
+                height,
+                ddi_bind_flags,
+                source_dxgi_format,
+                OptimalImageTransport::OpaqueFd,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    let _ = ctrl::ctx_detach_resource(
+                        self.passive(),
+                        adapter,
+                        self.ctx_id(),
+                        source_resource_id,
+                    );
+                    return Err(e);
+                }
+            };
 
-        crate::diag::record_named_bytes(b"CpImpSt", 3);
-        let (required_size, memory_type_bits) =
-            match self.image_memory_requirements(adapter, source_image_id) {
-                Ok(req) => req,
+            crate::diag::record_named_bytes(b"CpImpSt", 3);
+            let (required_size, memory_type_bits) =
+                match self.image_memory_requirements(adapter, source_image_id) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        let _ = self.cleanup_imported_source_alias(
+                            adapter,
+                            source_resource_id,
+                            source_image_id,
+                            None,
+                        );
+                        return Err(e);
+                    }
+                };
+            crate::diag::record_named_bytes(b"CpReq", required_size as u32);
+            crate::diag::record_named_bytes(b"CpBit", memory_type_bits);
+            if required_size > source_allocation_size
+                || (memory_type_bits & (1u32 << source_memory_type_index)) == 0
+            {
+                crate::diag::record_named_bytes(b"CpImpSt", 0xE3);
+                let _ = self.cleanup_imported_source_alias(
+                    adapter,
+                    source_resource_id,
+                    source_image_id,
+                    None,
+                );
+                return Err(VirtioError::DeviceError);
+            }
+
+            crate::diag::record_named_bytes(b"CpImpSt", 4);
+            let source_memory_id = match self.allocate_imported_resource_memory(
+                adapter,
+                source_resource_id,
+                source_allocation_size,
+                source_memory_type_index,
+            ) {
+                Ok(id) => id,
                 Err(e) => {
                     let _ = self.cleanup_imported_source_alias(
                         adapter,
@@ -168,50 +231,19 @@ impl VenusClient {
                     return Err(e);
                 }
             };
-        crate::diag::record_named_bytes(b"CpReq", required_size as u32);
-        crate::diag::record_named_bytes(b"CpBit", memory_type_bits);
-        if required_size > source_allocation_size
-            || (memory_type_bits & (1u32 << source_memory_type_index)) == 0
-        {
-            crate::diag::record_named_bytes(b"CpImpSt", 0xE3);
-            let _ = self.cleanup_imported_source_alias(
-                adapter,
-                source_resource_id,
-                source_image_id,
-                None,
-            );
-            return Err(VirtioError::DeviceError);
-        }
 
-        crate::diag::record_named_bytes(b"CpImpSt", 4);
-        let source_memory_id = match self.allocate_imported_resource_memory(
-            adapter,
-            source_resource_id,
-            source_allocation_size,
-            source_memory_type_index,
-        ) {
-            Ok(id) => id,
-            Err(e) => {
+            crate::diag::record_named_bytes(b"CpImpSt", 5);
+            if let Err(e) = self.bind_image_memory(adapter, source_image_id, source_memory_id) {
                 let _ = self.cleanup_imported_source_alias(
                     adapter,
                     source_resource_id,
                     source_image_id,
-                    None,
+                    Some(source_memory_id),
                 );
                 return Err(e);
             }
+            (source_image_id, source_memory_id)
         };
-
-        crate::diag::record_named_bytes(b"CpImpSt", 5);
-        if let Err(e) = self.bind_image_memory(adapter, source_image_id, source_memory_id) {
-            let _ = self.cleanup_imported_source_alias(
-                adapter,
-                source_resource_id,
-                source_image_id,
-                Some(source_memory_id),
-            );
-            return Err(e);
-        }
 
         crate::diag::record_named_bytes(b"CpImpSt", 6);
         if let Err(e) = self.ensure_linear_copy_target_ready(target_image_id) {
