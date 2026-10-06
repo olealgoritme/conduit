@@ -76,6 +76,9 @@ static MAP_REF: AtomicU32 = AtomicU32::new(0);
 /// found no storage because growth had not caught up (needs more concurrent reservers than
 /// the headroom: only a hostile process gets there).
 pub(super) static TBL_OOM: AtomicU32 = AtomicU32::new(0);
+/// Handles that were still open on the host and could not be put back into the table after a
+/// failed `Close` (the storage kept for restores was used up): `NvRestLost`. Should read 0.
+pub(super) static REST_LOST: AtomicU32 = AtomicU32::new(0);
 
 /// Count one more in `NvMapQRef`, the all-reasons window refusal total. Under `NvWinPolicy`
 /// = 0 it counts only what it always counted (the per-device quota, `Refusal::Quota`), so a
@@ -266,6 +269,7 @@ pub fn publish_counters() {
     rec(b"NvMapTGrow", MAP_GROWS.load(Ordering::Relaxed));
     rec(b"NvMapTRef", MAP_REF.load(Ordering::Relaxed));
     rec(b"NvTblOom", TBL_OOM.load(Ordering::Relaxed));
+    rec(b"NvRestLost", REST_LOST.load(Ordering::Relaxed));
     rec(b"NvPinQRef", PIN_QUOTA_REF.load(Ordering::Relaxed));
     rec(b"NvWinInfo", INFO_CALLS.load(Ordering::Relaxed));
     // Every refusal by a sanity bound, handles and mappings together.

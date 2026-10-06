@@ -1266,6 +1266,7 @@ both trees).
 | `NvHdlLive` / `NvHdlPeak` / `NvHdlCap` / `NvHdlGrow` | live handles (reservations included), high-water mark, table slots, growths |
 | `NvHdlORef` / `NvHdlGRef` / `NvHdlFRef` | handle reservations refused: per-process bound, whole-table bound, fairness while scarce |
 | `NvMapTCap` / `NvMapTGrow` / `NvMapTRef` | mapping table slots, growths, refusals by its bounds |
+| `NvRestLost` | a handle still open on the host that could not be put back after a failed `Close` (nothing was left in the storage kept for restores): untracked until the sweep. Should read 0 |
 | `NvTblOom` | a table wanted to grow and the allocator refused, or a reservation found no storage because growth lagged (only a hostile burst gets there) |
 | `NvPinQRef` | `PIN`s refused by the per-process pin quota (before this counter nothing in the registry showed it) |
 | `NvWinInfo` | `WINDOW_INFO` calls answered (section 4.7) |
@@ -1363,6 +1364,15 @@ adapter-wide view table they feed), counted when hit (`NvHdl*Ref`, `NvMapTRef`, 
   returned, its registry reads in its own frame), so `init` gains 8 bytes of struct and no return
   slot. **The script must be run on the build** (`new_window_account` is in its default symbols and
   chains); the numbers were not measured here.
+* **Restores cannot grow, so they have their own slots.** A forwarded `Close` takes the entry out
+  of the table first (the host may reuse the number at once) and puts it back if the host did not
+  take the close; the KMD's own fence close does the same. Both run where nothing may allocate, and
+  used to reserve a slot like an `Open`, so a table that filled up in between silently untracked a
+  handle still open on the host. The handle table now keeps `restore_slack` = 8 slots of storage
+  that no reservation may take (`rm_limits::admit` stops reservations 8 short of the capacity, and
+  the PASSIVE pre-grow keeps 16 free, so growth stays ahead); `restore_nvrm_handle` /
+  `restore_fence_after_failed_close` use them with no bound and no growth. If even those are gone
+  `NvRestLost` counts it (read 0). `NvWinPolicy` = 0 has no slack (the old shape, 0 slots).
 * The window account's owner rows (512) are reserved at init; a 513th device mapping at once is
   `NvWinRTab`.
 * Behaviour in the working range is unchanged: refusals only appear past the old numbers.

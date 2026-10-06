@@ -306,12 +306,10 @@ pub fn forward(
             // address may outlive the host mapping it points at.
             release_maps_for_handle(passive, adapter, owner, handle);
             let restore = || {
-                // The host did not close it, so it is still ours.
-                let _ = adapter.with_virtio(|v| {
-                    if v.reserve_nvrm_handle_slot(owner) {
-                        v.commit_nvrm_handle(owner, handle, device_type);
-                    }
-                });
+                // The host did not close it, so it is still ours: back into the table, in
+                // the storage reservations leave free for this (`NvRestLost` if even that
+                // is gone, never a silent untrack).
+                let _ = adapter.with_virtio(|v| v.restore_nvrm_handle(owner, handle, device_type));
             };
             match ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms) {
                 Ok(n) => {

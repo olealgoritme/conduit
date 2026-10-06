@@ -44,6 +44,12 @@ pub struct Bounds {
     /// refused.
     pub fair_num: usize,
     pub fair_den: usize,
+    /// Slots of storage no RESERVATION may take: kept for restores, the entries that must go
+    /// back into the table after a host call that failed (a `Close` the host did not take: the
+    /// handle is still open there). A restore cannot grow the table (it may run where nothing
+    /// may allocate), so without these a full table silently untracked a handle that was
+    /// still open on the host. Keep it at or below `headroom`, so growth keeps ahead of it.
+    pub restore_slack: usize,
 }
 
 impl Bounds {
@@ -61,7 +67,14 @@ impl Bounds {
             scarce_den: 4,
             fair_num: 4,
             fair_den: 4,
+            restore_slack: 0,
         }
+    }
+
+    /// The same shape with `n` slots held back from reservations, for restores.
+    pub const fn with_restore_slack(mut self, n: usize) -> Self {
+        self.restore_slack = n;
+        self
     }
 
     /// The growing shape: scarce at 3/4 of the table, fair share 1/4 of it.
@@ -91,6 +104,7 @@ impl Bounds {
             scarce_den: 4,
             fair_num: 1,
             fair_den,
+            restore_slack: 0,
         }
     }
 
@@ -106,7 +120,7 @@ impl Bounds {
 /// most 4096 per process. Fair share 1/8 (2048): once the table is 3/4 full (12288), a process
 /// holding 2048 or more is refused, so the last quarter (4096 slots) is only for processes
 /// below that. Four hostile processes at 4096 cannot fill it and starve the shell.
-pub const HANDLES: Bounds = Bounds::growing_fair(1024, 16, 16_384, 4_096, 8);
+pub const HANDLES: Bounds = Bounds::growing_fair(1024, 16, 16_384, 4_096, 8).with_restore_slack(8);
 /// The mapping table's shape: starts at 1024, grows to 8192 (the adapter-wide view table),
 /// at most 4096 per process, fair share 1/4 (2048).
 pub const MAPS: Bounds = Bounds::growing(1024, 16, 8_192, 4_096);
@@ -145,12 +159,21 @@ pub fn want_capacity(b: &Bounds, capacity: usize, live: usize) -> Option<usize> 
     Some(doubled.max(need).min(b.global_max))
 }
 
+/// Whether a restore (an entry going back after a failed host call) finds a free slot: pure
+/// storage, no bound and no fairness (the entry was admitted when it was made), and never a
+/// growth. `live` counts reservations too.
+pub fn restore_room(capacity: usize, live: usize) -> bool {
+    live < capacity
+}
+
 /// May one more slot be reserved for an owner that holds `owner_live` of the `live` in use,
 /// in a table of `capacity` slots?
 pub fn admit(b: &Bounds, capacity: usize, live: usize, owner_live: usize) -> Admit {
     if live >= b.global_max {
         return Admit::GlobalBound;
     }
+    // Storage a reservation may use: the capacity less the slots kept for restores.
+    let usable = capacity.saturating_sub(b.restore_slack);
     if owner_live >= b.per_owner_max {
         return Admit::OwnerBound;
     }
@@ -158,9 +181,9 @@ pub fn admit(b: &Bounds, capacity: usize, live: usize, owner_live: usize) -> Adm
     if scarce && owner_live.saturating_mul(b.fair_den) >= b.global_max.saturating_mul(b.fair_num) {
         return Admit::Unfair;
     }
-    if live >= capacity {
+    if live >= usable {
         return match want_capacity(b, capacity, live) {
-            Some(n) if n > live => Admit::NeedGrow(n),
+            Some(n) if n > live.saturating_add(b.restore_slack) => Admit::NeedGrow(n),
             // At the bound with no slot: the bound is what refuses.
             _ => Admit::GlobalBound,
         };
@@ -277,6 +300,9 @@ mod tests {
     /// refusal always fired first and `NvHdlFRef` could never move).
     #[test]
     fn production_shapes_can_actually_be_fair() {
+        // Growth keeps ahead of the restore slack.
+        assert!(HANDLES.restore_slack > 0 && HANDLES.restore_slack <= HANDLES.headroom);
+        assert_eq!(MAPS.restore_slack, 0);
         assert!(HANDLES.fairness_reachable());
         assert!(MAPS.fairness_reachable());
         // The fixed legacy shapes have no fairness rule and need none.
@@ -343,6 +369,44 @@ mod tests {
             }
         }
         assert!(live <= b.global_max);
+    }
+
+    /// Reservations stop `restore_slack` short of the storage, so a restore always finds room.
+    #[test]
+    fn restore_slack_is_never_taken_by_a_reservation() {
+        let b = HANDLES;
+        // Storage 1024, 1016 live: the next reservation would eat the slack: grow first.
+        assert_eq!(admit(&b, 1024, 1015, 3), Admit::Ok);
+        assert_eq!(admit(&b, 1024, 1016, 3), Admit::NeedGrow(2048));
+        // ... and the restore path can still use it.
+        assert!(restore_room(1024, 1016));
+        assert!(restore_room(1024, 1023));
+        assert!(!restore_room(1024, 1024));
+        // At the global bound the slack stays: reservations are refused 8 short of it, as the
+        // bound says (never NeedGrow: there is nowhere to grow to).
+        let top = b.global_max;
+        assert_eq!(admit(&b, top, top - b.restore_slack - 1, 3), Admit::Ok);
+        assert_eq!(admit(&b, top, top - b.restore_slack, 3), Admit::GlobalBound);
+        assert!(restore_room(top, top - 1));
+    }
+
+    /// With the PASSIVE pre-grow run before each reservation, a sequential client never sees
+    /// NeedGrow, and the slack is never touched.
+    #[test]
+    fn pre_grow_keeps_sequential_reservations_ahead_of_the_slack() {
+        let b = HANDLES;
+        let mut cap = b.initial;
+        let mut live = 0;
+        for _ in 0..2_000 {
+            if let Some(n) = want_capacity(&b, cap, live) {
+                cap = n;
+            }
+            match admit(&b, cap, live, live.min(100)) {
+                Admit::Ok => live += 1,
+                other => panic!("{other:?} at {live}"),
+            }
+            assert!(cap - live >= b.restore_slack);
+        }
     }
 
     #[test]

@@ -568,6 +568,31 @@ impl VirtioGpu {
         crate::virtio::nvrm_window::HDL_LIVE.store(live, Ordering::Relaxed);
     }
 
+    /// Put `handle` back after a forwarded `Close` the host did not take (it is still open
+    /// there, and still `owner`'s). Takes a slot of the storage the reservations leave free
+    /// (`Bounds::restore_slack`): no bound, no fairness (the entry was admitted when it was
+    /// made) and no growth (this runs where nothing may allocate). `false`, and `NvRestLost`
+    /// counted, when even that is gone: the handle is then open on the host and untracked
+    /// here until the transport's sweep.
+    pub fn restore_nvrm_handle(&mut self, owner: DeviceOwner, handle: u32, device_type: u32) -> bool {
+        if !rm_limits::restore_room(
+            self.nvrm_handles.capacity(),
+            self.nvrm_handles.len() + self.nvrm_reserved,
+        ) {
+            crate::virtio::nvrm_window::REST_LOST.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.nvrm_handles.push(NvrmHandleSlot {
+            owner,
+            handle,
+            device_type,
+            ready_latched: false,
+            fence: FenceMeta::new(0),
+        });
+        self.note_handles_live();
+        true
+    }
+
     /// Commit a reserved slot once the host has opened `handle`.
     pub fn commit_nvrm_handle(&mut self, owner: DeviceOwner, handle: u32, device_type: u32) {
         self.nvrm_reserved = self.nvrm_reserved.saturating_sub(1);
@@ -922,9 +947,13 @@ impl VirtioGpu {
     /// the worker would retry it forever): it is the KMD's, counted against the KMD's
     /// own fence quota and not the RM client's, and only the sweep closes it.
     pub fn restore_fence_after_failed_close(&mut self, handle: u32) {
-        // Storage, not the sanity bound: this pushes without a reservation, so it must
-        // find a free slot already (a push past the capacity would allocate under the lock).
-        if self.nvrm_handles.len() + self.nvrm_reserved >= self.nvrm_handles.capacity() {
+        if !rm_limits::restore_room(
+            self.nvrm_handles.capacity(),
+            self.nvrm_handles.len() + self.nvrm_reserved,
+        ) {
+            // No slot (the slack kept for this was used up): the fence stays open on the
+            // host and untracked here. Counted, never silent (`NvRestLost`).
+            crate::virtio::nvrm_window::REST_LOST.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let mut fence = FenceMeta::new(0);
