@@ -361,6 +361,11 @@ pub(crate) unsafe fn destroy_device(h_device: ddi12::D3D12DDI_HDEVICE) {
         return;
     };
     log_device_teardown(dev);
+    // S5: an NVK device that showed frames on scanout 0 gives it back to the
+    // desktop before its memory goes away.
+    if dev.engine.is_nvk() && crate::forward12::present12::nvk_scanout_used() {
+        dev.engine.nvk_scanout_release();
+    }
 
     let device = h_device.pDrvPrivate.cast::<HeliosD3D12Device>();
     // SAFETY: the same live handle, which `core::ptr::write` initialised at

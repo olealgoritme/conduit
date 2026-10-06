@@ -211,7 +211,7 @@ fn main() {
         // publisher for the process. `umd12/build.rs` lists the identical line.
         .file("../umd_common/bridge/bridge_icd_anchor.cpp")
         // S3: ICD backend selection (global NVK with a deny-list) and the NVK
-        // ICD loader. `umd12` joins at S5.
+        // ICD loader. `umd12` compiles it too (S5, with HELIOS_ICD_BACKEND_D3D12).
         .file("../umd_common/bridge/bridge_icd_backend.cpp")
         .compiler(&clang_cl)
         .archiver(&archiver)

@@ -28,6 +28,12 @@
 //     a WoW64 process). Missing file = Venus. NVK itself applies the same
 //     policy to Vulkan apps (Mesa patch 0032) and Zink to OpenGL apps (0034).
 //
+// D3D12 (helios_umd12.dll, stage S5, compiled with HELIOS_ICD_BACKEND_D3D12)
+// checks three levers of its own first: `HELIOS_ICD12` (environment, venus|nvk,
+// wins over HELIOS_ICD), `Nvk12` (REG_DWORD, 0 = D3D12 on Venus everywhere)
+// and `NvkDenyList12` (REG_SZ, executables whose D3D12 stays on Venus -- titles
+// that need ray tracing above all: NVK has no DXR and reports none).
+//
 // After that the device create can still fall back: the DLL does not load, it
 // lacks `helios_icd_interface_v2`, NVK enumerates no GPU, or the DXVK device
 // fails. The first such failure latches the process to Venus

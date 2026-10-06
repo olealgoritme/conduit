@@ -158,6 +158,9 @@ mod v {
         D3D12DDI_3DPIPELINELEVEL_D3D12DDI_3DPIPELINELEVEL_11_0;
     pub(super) const FL_12_1: D3D12DDI_3DPIPELINELEVEL =
         D3D12DDI_3DPIPELINELEVEL_D3D12DDI_3DPIPELINELEVEL_12_1;
+    /// S5: the level an NVK on RM engine stops at (no ROVs).
+    pub(super) const FL_12_0: D3D12DDI_3DPIPELINELEVEL =
+        D3D12DDI_3DPIPELINELEVEL_D3D12DDI_3DPIPELINELEVEL_12_0;
 
     pub(super) const BINDING_TIER_3: D3D12DDI_RESOURCE_BINDING_TIER =
         D3D12DDI_RESOURCE_BINDING_TIER_D3D12DDI_RESOURCE_BINDING_TIER_3;
@@ -294,10 +297,15 @@ pub(crate) const REQUIRED_ENGINE_FEATURE_LEVEL: u32 =
     windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0.0 as u32;
 
 fn driver_max_feature_level() -> Option<ddi12::D3D12DDI_3DPIPELINELEVEL> {
-    use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_12_1};
+    use windows::Win32::Graphics::Direct3D::{
+        D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_12_1,
+    };
     let level = native_optional_caps()?.maximum_feature_level;
     if level == D3D_FEATURE_LEVEL_12_1.0 as u32 {
         Some(v::FL_12_1)
+    } else if level == D3D_FEATURE_LEVEL_12_0.0 as u32 {
+        // S5: NVK on RM (the fork's FL12_0 admission, vkd3d patch 0002).
+        Some(v::FL_12_0)
     } else if level == D3D_FEATURE_LEVEL_11_0.0 as u32 {
         Some(v::FL_11_0)
     } else {
@@ -737,7 +745,9 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         // is not native API admission: PID9380 receives tier0 at maximum FL11_0,
         // consistent with Microsoft's FL11_1+ eligibility requirement. Full
         // native tier3 behavior remains unvalidated; see FEATURE_LEVELS.md.
-        ConservativeRasterizationTier: v::CONSERVATIVE_RASTER_MAX,
+        // S5: never above the engine's own tier (NVK: 2).
+        ConservativeRasterizationTier: v::CONSERVATIVE_RASTER_MAX
+            .min(optional.conservative_tier as ddi12::D3D12DDI_CONSERVATIVE_RASTERIZATION_TIER),
         TiledResourcesTier: tiled_resources_tier(),
         CrossNodeSharingTier: v::CROSS_NODE_NONE,
         // ⭐ RAISED 0 -> 1, 2026-08-07. Engine: 1 —
@@ -1025,6 +1035,8 @@ unsafe fn shader_caps(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresu
     const TOTAL_LANE_COUNT_GUESS: ddi12::UINT = 32 * SUBGROUP_SIZE;
 
     UMD12_REFUSALS.caps_total_lane_count_guess.bump();
+    // S5: the engine's own ROV answer (NVK has no fragment shader interlock).
+    let engine_rovs = native_optional_caps().map_or(0, |o| o.rovs);
     let caps = ddi12::D3D12DDI_SHADER_CAPS_0084 {
         MinPrecision: v::MIN_PRECISION_NONE,
         DoubleOps: 0,
@@ -1035,7 +1047,7 @@ unsafe fn shader_caps(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresu
         TypedUAVLoadAdditionalFormats: TYPED_UAV_LOAD_ADDITIONAL_FORMATS,
         // Driver-side backing; native eligibility and validation are separate
         // from this value, as documented above.
-        ROVs: 1,
+        ROVs: engine_rovs.min(1) as _,
         // ⭐ RAISED 0 -> 1, 2026-08-07. Engine: 1 — `OPTIONS1,WaveOps,1`
         // (`baselines/d3d12-caps.csv:24`), sitting in the baseline directly above
         // the three lane counts this function ALREADY reports:

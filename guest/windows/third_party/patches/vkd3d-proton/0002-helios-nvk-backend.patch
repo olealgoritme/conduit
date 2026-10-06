@@ -1,0 +1,359 @@
+Helios vkd3d-proton fork: the engine on NVK on RM (D3D12 on NVK)
+
+Conduit guest/windows/docs/dxvk-on-nvk.md, stage S5. Applied to
+third_party/vkd3d-proton after 0001 by ci/windows/Build-Driver.ps1.
+
+- helios_vkd3d_create_device_icd(luid, icd_gipa, iid, device): the native
+  device created directly on an ICD the UMD loaded itself (NVK's
+  vk_icdGetInstanceProcAddr, no Vulkan loader; layer enumeration answered
+  "none"), marked as running on NVK on RM (d3d12_device.helios_nvk).
+- On NVK a VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT allocation chains Conduit's
+  helios_export_memory_resource_info (sType 1000384003) instead of an
+  OPAQUE_FD export, and the image/buffer declares no external handle type:
+  NVK then allocates the dedicated memory standalone and uncompressed and
+  the UMD asks it for a KMD resource id (IMPORT_RM).
+- On NVK the queue execution stream is a local timeline semaphore (ctx 0,
+  cookie 0; no producer interface, no KMD stream);
+  helios_vkd3d_wait_execution(queue, value, timeout) waits on it.
+- Native admission accepts FL 12_0 (NVK has no ROVs, so no FL 12_1).
+- helios_vkd3d.def (the retired dynamic arm, kept for engine gates) exports
+  the S5 entry points, for tools/d3d12_nvk_engine.cpp.
+
+diff --git a/libs/d3d12core/helios_entry.c b/libs/d3d12core/helios_entry.c
+index 93871a0b..b1a0213a 100644
+--- a/libs/d3d12core/helios_entry.c
++++ b/libs/d3d12core/helios_entry.c
+@@ -53,6 +53,8 @@
+ 
+ #include "debug.h"
+ 
++#include <string.h>
++
+ #if defined(__WINE__) || !defined(_WIN32)
+ #define DLLEXPORT __attribute__((visibility("default")))
+ #include <dlfcn.h>
+@@ -109,7 +111,8 @@ static void helios_load_vulkan_once(void)
+ #endif
+ }
+ 
+-DLLEXPORT HRESULT helios_vkd3d_create_device(LUID adapter_luid, REFIID iid, void **device)
++static HRESULT helios_create_device_with(LUID adapter_luid, PFN_vkGetInstanceProcAddr gipa,
++        REFIID iid, void **device)
+ {
+     /* The same lists d3d12core uses (main.c:574-593, :659-670), so that the
+      * device this export creates is configured exactly like the one vkd3d's own
+@@ -151,15 +154,14 @@ DLLEXPORT HRESULT helios_vkd3d_create_device(LUID adapter_luid, REFIID iid, void
+     if (!device)
+         return E_INVALIDARG;
+ 
+-    pthread_once(&helios_vulkan_once, helios_load_vulkan_once);
+-    if (!helios_vk_gipa)
++    if (!gipa)
+     {
+-        ERR("Failed to load Vulkan library.\n");
++        ERR("No vkGetInstanceProcAddr.\n");
+         return E_FAIL;
+     }
+ 
+     memset(&instance_create_info, 0, sizeof(instance_create_info));
+-    instance_create_info.pfn_vkGetInstanceProcAddr = helios_vk_gipa;
++    instance_create_info.pfn_vkGetInstanceProcAddr = gipa;
+     instance_create_info.instance_extensions = instance_extensions;
+     instance_create_info.instance_extension_count = ARRAY_SIZE(instance_extensions);
+     instance_create_info.optional_instance_extensions = optional_instance_extensions;
+@@ -187,6 +189,72 @@ DLLEXPORT HRESULT helios_vkd3d_create_device(LUID adapter_luid, REFIID iid, void
+     return vkd3d_create_device(&device_create_info, iid, device);
+ }
+ 
++DLLEXPORT HRESULT helios_vkd3d_create_device(LUID adapter_luid, REFIID iid, void **device)
++{
++    TRACE("adapter_luid %08x:%08x, iid %s, device %p.\n",
++            (unsigned int)adapter_luid.HighPart, (unsigned int)adapter_luid.LowPart,
++            debugstr_guid(iid), device);
++
++    pthread_once(&helios_vulkan_once, helios_load_vulkan_once);
++    if (!helios_vk_gipa)
++    {
++        ERR("Failed to load Vulkan library.\n");
++        return E_FAIL;
++    }
++    return helios_create_device_with(adapter_luid, helios_vk_gipa, iid, device);
++}
++
++void vkd3d_helios_device_set_nvk(ID3D12Device *iface);
++
++/* An ICD's vk_icdGetInstanceProcAddr serves no layer queries (the loader does),
++ * and vkd3d's global procs include vkEnumerateInstanceLayerProperties: answer it
++ * with "no layers" and forward everything else. One ICD per process. */
++static PFN_vkGetInstanceProcAddr helios_icd_gipa;
++
++static VkResult VKAPI_PTR helios_icd_enumerate_instance_layers(uint32_t *count, VkLayerProperties *layers)
++{
++    (void)layers;
++    *count = 0;
++    return VK_SUCCESS;
++}
++
++static PFN_vkVoidFunction VKAPI_PTR helios_icd_get_instance_proc_addr(VkInstance instance, const char *name)
++{
++    if (!instance && name && !strcmp(name, "vkEnumerateInstanceLayerProperties"))
++        return (PFN_vkVoidFunction)helios_icd_enumerate_instance_layers;
++    return helios_icd_gipa(instance, name);
++}
++
++/* Helios (Conduit dxvk-on-nvk S5): the same device, created directly on an ICD
++ * the UMD loaded itself -- `icd_gipa` is NVK's vk_icdGetInstanceProcAddr, after
++ * the loader-interface negotiation -- with no Vulkan loader, no registry ICD
++ * list and no Venus ICD in the instance. The device is marked as running on NVK
++ * on RM (export requests and execution streams, see vkd3d_private.h). */
++DLLEXPORT HRESULT helios_vkd3d_create_device_icd(LUID adapter_luid, PFN_vkGetInstanceProcAddr icd_gipa,
++        REFIID iid, void **device)
++{
++    ID3D12Device *d3d12 = NULL;
++    HRESULT hr;
++
++    TRACE("adapter_luid %08x:%08x, icd_gipa %p, iid %s, device %p.\n",
++            (unsigned int)adapter_luid.HighPart, (unsigned int)adapter_luid.LowPart,
++            (void *)icd_gipa, debugstr_guid(iid), device);
++
++    if (!device)
++        return E_INVALIDARG;
++    *device = NULL;
++    if (!icd_gipa)
++        return E_INVALIDARG;
++    helios_icd_gipa = icd_gipa;
++    if (FAILED(hr = helios_create_device_with(adapter_luid, helios_icd_get_instance_proc_addr,
++            &IID_ID3D12Device, (void **)&d3d12)))
++        return hr;
++    vkd3d_helios_device_set_nvk(d3d12);
++    hr = d3d12->lpVtbl->QueryInterface(d3d12, iid, device);
++    d3d12->lpVtbl->Release(d3d12);
++    return hr;
++}
++
+ DLLEXPORT HRESULT helios_vkd3d_serialize_root_signature(
+         const D3D12_ROOT_SIGNATURE_DESC *desc, D3D_ROOT_SIGNATURE_VERSION version,
+         ID3DBlob **blob, ID3DBlob **error_blob)
+diff --git a/libs/d3d12core/helios_vkd3d.def b/libs/d3d12core/helios_vkd3d.def
+index 72f95d00..65523d2e 100644
+--- a/libs/d3d12core/helios_vkd3d.def
++++ b/libs/d3d12core/helios_vkd3d.def
+@@ -5,3 +5,7 @@ EXPORTS
+     D3D12SDKVersion DATA PRIVATE
+     helios_vkd3d_create_device
+     helios_vkd3d_serialize_root_signature
++    helios_vkd3d_create_device_icd
++    helios_vkd3d_validate_native_feature_level
++    helios_vkd3d_execute_command_lists
++    helios_vkd3d_wait_execution
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 845be940..25292f73 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -11481,7 +11481,8 @@ HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device *iface, uint32_t
+     char override[VKD3D_PATH_MAX];
+ 
+     if (!iface || !shader_model || !raytracing_tier || !device_uuid ||
+-            (minimum_feature_level != D3D_FEATURE_LEVEL_11_0 && minimum_feature_level != D3D_FEATURE_LEVEL_12_1))
++            (minimum_feature_level != D3D_FEATURE_LEVEL_11_0 && minimum_feature_level != D3D_FEATURE_LEVEL_12_0 &&
++             minimum_feature_level != D3D_FEATURE_LEVEL_12_1))
+         return E_INVALIDARG;
+     /* The engine's developer overrides modify the derived caps. They cannot
+      * supply evidence for a native driver contract, even when set lower. */
+@@ -11547,6 +11548,15 @@ HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device *iface, uint32_t
+     return S_OK;
+ }
+ 
++/* Helios (Conduit dxvk-on-nvk S5): mark a device created on NVK on RM. Called by
++ * helios_vkd3d_create_device_icd() before the device is handed out. */
++void vkd3d_helios_device_set_nvk(ID3D12Device *iface)
++{
++    struct d3d12_device *device = impl_from_ID3D12Device((d3d12_device_iface *)iface);
++    device->helios_nvk = true;
++    INFO("Helios: device on NVK on RM (driver %s).\n", device->device_info.vulkan_1_2_properties.driverName);
++}
++
+ static void d3d12_device_replace_vtable(struct d3d12_device *device)
+ {
+     /* Don't bother replacing the vtable unless we have to. */
+diff --git a/libs/vkd3d/heap.c b/libs/vkd3d/heap.c
+index 9d1e380b..6fedd1c9 100644
+--- a/libs/vkd3d/heap.c
++++ b/libs/vkd3d/heap.c
+@@ -342,8 +342,7 @@ HRESULT d3d12_heap_helios_allocate_pending(struct d3d12_heap *heap, VkImage dedi
+     assert(heap->allocation.device_allocation.vk_memory == VK_NULL_HANDLE);
+ 
+     memset(&export_info, 0, sizeof(export_info));
+-    export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+-    export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++    vkd3d_helios_export_info(device, &export_info);
+ 
+     if (dedicated_image != VK_NULL_HANDLE)
+     {
+diff --git a/libs/vkd3d/helios_producer.h b/libs/vkd3d/helios_producer.h
+index e8d4552d..740c9572 100644
+--- a/libs/vkd3d/helios_producer.h
++++ b/libs/vkd3d/helios_producer.h
+@@ -37,6 +37,25 @@ static bool vkd3d_helios_ensure_stream_locked(struct d3d12_command_queue *queue,
+     helios_get_producer_api_fn get;
+     HMODULE module = NULL;
+     if (queue->helios_producer) return true;
++    if (queue->device->helios_nvk)
++    {
++        /* NVK on RM (Conduit dxvk-on-nvk S5): no producer interface and no KMD
++         * stream. The execution stream is a local timeline (ctx 0, cookie 0);
++         * the UMD waits on it with helios_vkd3d_wait_execution() and orders the
++         * runtime's context behind it itself. */
++        if (!(stream = vkd3d_calloc(1, sizeof(*stream)))) return false;
++        type.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
++        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
++        create.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
++        create.pNext = &type;
++        if (VK_CALL(vkCreateSemaphore(queue->device->vk_device, &create, NULL, &stream->semaphore)) != VK_SUCCESS)
++        {
++            vkd3d_free(stream);
++            return false;
++        }
++        queue->helios_producer = stream;
++        return true;
++    }
+     if (!api)
+     {
+         if (vk_procs->vkGetSemaphoreCounterValue)
+@@ -306,6 +325,42 @@ static void vkd3d_helios_operation_submit(void *userdata)
+     if (FAILED(hr)) ERR("Helios producer cleanup enqueue failed, hr %#x.\n", (unsigned int)hr);
+ }
+ 
++/* NVK on RM: wait until this queue's execution stream reaches `value` (an ECL
++ * or tile-mapping boundary helios_vkd3d_execute_command_lists() returned).
++ * S_OK when reached, S_FALSE on timeout, a failure HRESULT on device loss or
++ * when the queue has no stream yet. Thread-safe: the stream lives as long as
++ * the queue. */
++HRESULT helios_vkd3d_wait_execution(ID3D12CommandQueue *iface, uint64_t value, uint64_t timeout_ns)
++{
++    struct d3d12_command_queue *queue;
++    const struct vkd3d_vk_device_procs *vk_procs;
++    struct vkd3d_helios_stream *stream;
++    VkSemaphoreWaitInfo wait;
++    VkResult vr;
++
++    if (!iface)
++        return E_INVALIDARG;
++    queue = impl_from_ID3D12CommandQueue(iface);
++    vk_procs = &queue->device->vk_procs;
++    pthread_mutex_lock(&queue->queue_lock);
++    stream = queue->helios_producer;
++    pthread_mutex_unlock(&queue->queue_lock);
++    if (!stream)
++        return value ? E_FAIL : S_OK;
++    memset(&wait, 0, sizeof(wait));
++    wait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
++    wait.semaphoreCount = 1;
++    wait.pSemaphores = &stream->semaphore;
++    wait.pValues = &value;
++    vr = VK_CALL(vkWaitSemaphores(queue->device->vk_device, &wait, timeout_ns));
++    if (vr == VK_SUCCESS)
++        return S_OK;
++    if (vr == VK_TIMEOUT)
++        return FAILED(d3d12_device_removed_reason(queue->device)) ?
++                d3d12_device_removed_reason(queue->device) : S_FALSE;
++    return hresult_from_vk_result(vr);
++}
++
+ HRESULT helios_vkd3d_enqueue_producer(ID3D12CommandQueue *iface, ID3D12Resource *resource_iface,
+         uint32_t allocation, HANDLE admission_event, uint32_t *ctx, uint32_t *value, uint64_t *cookie)
+ {
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 982f1893..0001ca5e 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -186,7 +186,7 @@ HRESULT vkd3d_create_buffer(struct d3d12_device *device,
+ 
+     /* This is only used by OpenExistingHeapFrom*,
+      * and external host memory is the only way for us to do CROSS_ADAPTER. */
+-    if (heap_flags & VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT)
++    if ((heap_flags & VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT) && !device->helios_nvk)
+     {
+         /* Helios WDDM adoption uses the venus OPAQUE_FD wire identity. The matching
+          * VkExportMemoryAllocateInfo is attached by the committed-buffer allocation
+@@ -759,8 +759,11 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+         external_info->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+         vk_prepend_struct(image_info, external_info);
+     }
+-    else if (resource && (resource->heap_flags & VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT))
++    else if (resource && (resource->heap_flags & VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT) &&
++            !device->helios_nvk)
+     {
++        /* (NVK on RM declares no external handle type: its export request lives
++         * only in the allocation, see vkd3d_helios_export_info().) */
+         /* Helios venus export (see VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT). The memory this
+          * image gets bound to is allocated with a matching VkExportMemoryAllocateInfo in
+          * d3d12_resource_create_committed(), and Vulkan requires the image to declare the
+@@ -4530,9 +4533,9 @@ static HRESULT d3d12_resource_create_committed_flags(struct d3d12_device *device
+              * (heap_flags & SHARED) and handleTypes == OPAQUE_WIN32, so this arm cannot
+              * reach it on either conjunct. */
+             dedicated_requirements.prefersDedicatedAllocation = VK_TRUE;
+-            export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
++            memset(&export_info, 0, sizeof(export_info));
++            vkd3d_helios_export_info(device, &export_info);
+             export_info.pNext = allocate_info.pNext;
+-            export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+             allocate_info.pNext = &export_info;
+         }
+ 
+@@ -4633,8 +4636,7 @@ static HRESULT d3d12_resource_create_committed_flags(struct d3d12_device *device
+              * so mirror the image arm's two guarantees here: an OPAQUE_FD export for
+              * the venus resource id and a dedicated allocation at offset zero. */
+             memset(&export_info, 0, sizeof(export_info));
+-            export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+-            export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++            vkd3d_helios_export_info(device, &export_info);
+             allocate_info.pNext = &export_info;
+             allocate_info.extra_allocation_flags |= VKD3D_ALLOCATION_FLAG_DEDICATED;
+         }
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 24baaad5..a88b19f4 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -5976,6 +5976,11 @@ struct d3d12_device
+     IAmdExtAntiLagApi IAmdExtAntiLagApi_iface;
+     ID3D12DeviceConfiguration1 ID3D12DeviceConfiguration1_iface;
+     LONG refcount;
++    /* Helios: the ICD is NVK on RM (Conduit dxvk-on-nvk S5), set by
++     * helios_vkd3d_create_device_icd() right after creation. Export heaps then
++     * use the Helios export request instead of an OPAQUE_FD export, and queue
++     * execution streams are local timelines the UMD waits on itself. */
++    bool helios_nvk;
+     uint32_t reserved_compat_resources;
+     uint32_t reserved_compat_update_mappings;
+     uint32_t reserved_compat_copy_mappings;
+@@ -6127,6 +6132,29 @@ VkPipeline d3d12_device_get_or_create_fragment_output_pipeline(struct d3d12_devi
+ 
+ uint32_t d3d12_device_get_max_descriptor_heap_size(struct d3d12_device *device, D3D12_DESCRIPTOR_HEAP_TYPE heap_type);
+ 
++/* Helios: the export request chained into a VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT
++ * allocation. Venus: an OPAQUE_FD export (the virtio resource identity). NVK on RM:
++ * Conduit's helios_export_memory_resource_info (sType 1000384003,
++ * protocol/include/helios_icd_interface.h), whose layout is VkExportMemoryAllocateInfo's
++ * with handleTypes read as `flags` = 0; NVK then allocates the memory standalone and
++ * uncompressed and records the dedicated image's layout, and the UMD later asks NVK for
++ * a KMD resource id of it (IMPORT_RM). */
++#define VKD3D_HELIOS_STRUCTURE_TYPE_EXPORT_MEMORY_RESOURCE_INFO ((VkStructureType)1000384003)
++static inline void vkd3d_helios_export_info(const struct d3d12_device *device,
++        VkExportMemoryAllocateInfo *info)
++{
++    if (device->helios_nvk)
++    {
++        info->sType = VKD3D_HELIOS_STRUCTURE_TYPE_EXPORT_MEMORY_RESOURCE_INFO;
++        info->handleTypes = 0;
++    }
++    else
++    {
++        info->sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
++        info->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++    }
++}
++
+ static inline struct d3d12_device *unsafe_impl_from_ID3D12Device(d3d12_device_iface *iface)
+ {
+     return CONTAINING_RECORD(iface, struct d3d12_device, ID3D12Device_iface);

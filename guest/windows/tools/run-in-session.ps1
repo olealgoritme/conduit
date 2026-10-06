@@ -10,7 +10,9 @@ param(
     [Parameter(Mandatory)][string]$Command,
     [hashtable]$Env = @{},
     [int]$TimeoutSec = 120,
-    [string]$User = "Ole Algoritme"
+    [string]$User = "Ole Algoritme",
+    # One transient task per caller, so concurrent callers do not replace each other.
+    [string]$Task = "ConduitSession$PID"
 )
 $ErrorActionPreference = "Stop"
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -22,7 +24,7 @@ foreach ($k in $Env.Keys) { $lines += "set $k=$($Env[$k])" }
 $lines += "$Command > `"$log`" 2>&1"
 $lines += "echo %ERRORLEVEL% > `"$done`""
 Set-Content -LiteralPath $cmd -Value $lines -Encoding ASCII
-$task = "ConduitS3Session"
+$task = $Task
 schtasks /create /f /tn $task /tr "`"$cmd`"" /sc once /st 23:59 /it /ru $User | Out-Null
 schtasks /run /tn $task | Out-Null
 $deadline = (Get-Date).AddSeconds($TimeoutSec)

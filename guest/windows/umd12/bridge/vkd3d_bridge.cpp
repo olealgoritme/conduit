@@ -48,6 +48,10 @@
 #include "bridge_common.h"
 #include "bridge_guard.h"
 #include "bridge_icd_anchor.h"
+// S5 (dxvk-on-nvk): which ICD the engine runs on, and NVK's backend-neutral
+// table. Vulkan types come from the Khronos headers (build.rs), never vkd3d's.
+#include "bridge_icd_backend.h"
+#include "helios_icd_interface.h"
 
 #include <atomic>
 #include <cstdio>
@@ -67,6 +71,14 @@
 // `extern "C"` here is load-bearing, not decorative.
 extern "C" HRESULT helios_vkd3d_create_device(LUID adapter_luid, REFIID iid,
                                               void** device);
+// S5: the same device on an ICD the bridge loaded itself (NVK on RM), from the
+// vkd3d patch third_party/patches/vkd3d-proton/0002 (helios_entry.c).
+extern "C" HRESULT helios_vkd3d_create_device_icd(LUID adapter_luid,
+                                                  PFN_vkGetInstanceProcAddr icd_gipa,
+                                                  REFIID iid, void** device);
+extern "C" HRESULT helios_vkd3d_wait_execution(ID3D12CommandQueue* queue,
+                                               std::uint64_t value,
+                                               std::uint64_t timeout_ns);
 extern "C" HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device* device,
     std::uint32_t minimum_feature_level, std::uint32_t* shader_model,
     std::uint32_t* raytracing_tier, std::uint8_t* device_uuid) noexcept(false);
@@ -282,6 +294,12 @@ struct HeliosVkd3dDeviceImpl {
   // UP-5. The instance-scoped ctx id, also read on the creating thread. This is
   // the one that may be stamped into an identity; see the header.
   std::uint32_t venus_instance_ctx_id = 0;
+  // S5. The ICD under the engine. On NVK on RM: NVK's helios_icd_interface_v2
+  // table (re-read at create) and the engine's Vulkan handles it takes.
+  helios_bridge::IcdBackend backend = helios_bridge::IcdBackend::Venus;
+  helios_icd_api icd = {};
+  void* vk_instance = nullptr;
+  void* vk_device = nullptr;
 
   ~HeliosVkd3dDeviceImpl() {
     // ⛔ The interop interface FIRST: it is a reference on the same object as
@@ -468,7 +486,8 @@ std::size_t HeliosVkd3dDevice::d3d12_device_ptr() const noexcept {
 
 bool HeliosVkd3dDevice::native_optional_caps(std::uint32_t& maximum_feature_level,
     std::uint32_t& shader_model,
-    std::uint32_t& raytracing_tier, rust::Slice<std::uint8_t> device_uuid) const noexcept {
+    std::uint32_t& raytracing_tier, std::uint32_t& rovs, std::uint32_t& conservative_tier,
+    rust::Slice<std::uint8_t> device_uuid) const noexcept {
   if (!impl || !impl->d3d12 || device_uuid.size() != 16)
     return false;
   // Revalidate even when adopting the discovery engine: an environment override
@@ -478,12 +497,39 @@ bool HeliosVkd3dDevice::native_optional_caps(std::uint32_t& maximum_feature_leve
     return false;
   // Higher native levels have additional backing requirements. Their absence
   // must not discard a device that satisfies the baseline contract.
-  const HRESULT extended = helios_vkd3d_validate_native_feature_level(impl->d3d12,
+  HRESULT extended = helios_vkd3d_validate_native_feature_level(impl->d3d12,
       D3D_FEATURE_LEVEL_12_1, &shader_model, &raytracing_tier, device_uuid.data());
   if (FAILED(extended) && extended != DXGI_ERROR_UNSUPPORTED)
     return false;
-  maximum_feature_level = SUCCEEDED(extended) ? D3D_FEATURE_LEVEL_12_1 : impl->minimum_feature_level;
+  maximum_feature_level = D3D_FEATURE_LEVEL_12_1;
+  if (FAILED(extended)) {
+    // S5: NVK has no ROVs (no fragment shader interlock), so its engine stops at
+    // FL12_0; the fork's admission (vkd3d patch 0002) checks that level too.
+    extended = helios_vkd3d_validate_native_feature_level(impl->d3d12,
+        D3D_FEATURE_LEVEL_12_0, &shader_model, &raytracing_tier, device_uuid.data());
+    if (FAILED(extended) && extended != DXGI_ERROR_UNSUPPORTED)
+      return false;
+    maximum_feature_level = SUCCEEDED(extended) ? D3D_FEATURE_LEVEL_12_0 : impl->minimum_feature_level;
+    if (FAILED(extended)) {
+      // Re-run the baseline so the outputs describe the level reported.
+      if (FAILED(helios_vkd3d_validate_native_feature_level(impl->d3d12,
+          impl->minimum_feature_level, &shader_model, &raytracing_tier, device_uuid.data())))
+        return false;
+    }
+  }
+  // The engine's own answers for the two FL-defining caps the driver table
+  // otherwise pins at Venus/NVIDIA values (caps12 takes the minimum).
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  if (FAILED(impl->d3d12->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options,
+                                              sizeof(options))))
+    return false;
+  rovs = options.ROVsSupported ? 1u : 0u;
+  conservative_tier = static_cast<std::uint32_t>(options.ConservativeRasterizationTier);
   return true;
+}
+
+std::uint32_t HeliosVkd3dDevice::icd_backend() const noexcept {
+  return impl ? static_cast<std::uint32_t>(impl->backend) : 0;
 }
 
 std::uint32_t HeliosVkd3dDevice::venus_context_id() const noexcept {
@@ -672,10 +718,19 @@ std::uint32_t HeliosVkd3dDevice::transfer_resource_ownership(
         std::uint32_t mti = 0;
         const std::uint32_t status = engine_resource_memory(
             impl.get(), resource, &vk_memory, &offset, &size, &mti);
-        const MemoryIdentityExports& e = memory_identity_exports();
         std::uint32_t handed = 0;
-        if (status == HELIOS_VKD3D_IDENTITY_RESOLVED && e.transfer_ownership) {
-          handed = e.transfer_ownership(venus_device_memory(vk_memory));
+        bool have_export = false;
+        if (impl && impl->backend == helios_bridge::IcdBackend::NvkRm) {
+          // S5: NVK minted the id (IMPORT_RM); NVK stops releasing it.
+          have_export = impl->icd.transfer_ownership != nullptr;
+          if (status == HELIOS_VKD3D_IDENTITY_RESOLVED && have_export)
+            handed = impl->icd.transfer_ownership((VkDeviceMemory)vk_memory);
+        } else {
+          const MemoryIdentityExports& e = memory_identity_exports();
+          have_export = e.transfer_ownership != nullptr;
+          if (status == HELIOS_VKD3D_IDENTITY_RESOLVED && e.transfer_ownership) {
+            handed = e.transfer_ownership(venus_device_memory(vk_memory));
+          }
         }
         if (handed == 0) {
           // ⛔ Loud, and the caller treats it as a defect: `pfnAllocateCb` has
@@ -689,12 +744,217 @@ std::uint32_t HeliosVkd3dDevice::transfer_resource_ownership(
                         "transfer_resource_ownership(%p) FAILED: status=%u vk_memory=0x%llx "
                         "export=%d (Vkd3dOwnershipTransferFailed=%u)",
                         (void*)resource, status, (unsigned long long)vk_memory,
-                        e.transfer_ownership != nullptr, n);
+                        have_export, n);
           umd_log(msg);
         }
         return handed;
       });
 }
+
+// ── S5: NVK on RM ───────────────────────────────────────────────────────────
+
+bool HeliosVkd3dDevice::resource_foreign_identity(std::size_t resource,
+    std::uint32_t* out_res_id, std::uint32_t* out_ctx_id, std::uint64_t* out_size,
+    std::uint64_t* out_modifier, std::uint32_t* out_stride, std::uint32_t* out_offset,
+    std::uint32_t* out_fourcc, std::uint64_t* out_vk_memory,
+    std::uint32_t* out_memory_type_index) const noexcept {
+  if (out_res_id) *out_res_id = 0;
+  if (out_ctx_id) *out_ctx_id = 0;
+  if (out_size) *out_size = 0;
+  if (out_modifier) *out_modifier = 0;
+  if (out_stride) *out_stride = 0;
+  if (out_offset) *out_offset = 0;
+  if (out_fourcc) *out_fourcc = 0;
+  if (out_vk_memory) *out_vk_memory = 0;
+  if (out_memory_type_index) *out_memory_type_index = 0;
+  return helios_bridge::bridge_guard("resource_foreign_identity", false, [&]() -> bool {
+    if (!out_res_id || !out_ctx_id || !out_size || !out_modifier || !out_stride ||
+        !out_offset || !out_fourcc || !out_vk_memory || !out_memory_type_index)
+      return false;
+    if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm ||
+        !impl->icd.memory_res_id || !impl->interop || !resource)
+      return false;
+    auto* res = reinterpret_cast<ID3D12Resource*>(resource);
+    // memory_res_id reads the handle as a VkImage: only ever a texture.
+    const D3D12_RESOURCE_DESC desc = res->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+      return false;
+    std::uint64_t vk_memory = 0, memory_offset = 0, memory_size = 0;
+    std::uint32_t memory_type = 0;
+    if (engine_resource_memory(impl.get(), resource, &vk_memory, &memory_offset, &memory_size,
+                               &memory_type) != HELIOS_VKD3D_IDENTITY_RESOLVED ||
+        memory_offset != 0)
+      return false;
+    std::uint64_t vk_image = 0, buffer_offset = 0;
+    if (FAILED(impl->interop->GetVulkanResourceInfo(res, &vk_image, &buffer_offset)) || !vk_image)
+      return false;
+    helios_icd_layout layout = {};
+    std::uint32_t res_id = 0;
+    const VkResult vr = impl->icd.memory_res_id((VkDevice)impl->vk_device,
+        (VkDeviceMemory)vk_memory, (VkImage)vk_image, &res_id, &layout);
+    static std::atomic<std::uint32_t> s_logs{0};
+    const std::uint32_t n = s_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 32 || (n % 4096) == 0) {
+      char msg[320];
+      std::snprintf(msg, sizeof(msg),
+                    "nvk resource id: vr=%d res_id=%u %ux%u stride=%u offset=%u fourcc=0x%08x "
+                    "modifier=0x%016llx size=%llu (x%u)",
+                    int(vr), res_id, layout.width, layout.height, layout.stride, layout.offset,
+                    layout.fourcc, static_cast<unsigned long long>(layout.modifier),
+                    static_cast<unsigned long long>(layout.size), n);
+      umd_log(msg);
+    }
+    if (vr != VK_SUCCESS || !res_id)
+      return false;
+    *out_res_id = res_id;
+    *out_ctx_id = impl->icd.ctx_id ? impl->icd.ctx_id((VkInstance)impl->vk_instance) : 0;
+    *out_size = layout.size;
+    *out_modifier = layout.modifier;
+    *out_stride = layout.stride;
+    *out_offset = layout.offset;
+    *out_fourcc = layout.fourcc;
+    *out_vk_memory = vk_memory;
+    *out_memory_type_index = memory_type;
+    return *out_ctx_id != 0;
+  });
+}
+
+std::int32_t HeliosVkd3dDevice::nvk_scanout_present(std::size_t resource) const noexcept {
+  return helios_bridge::bridge_guard("nvk_scanout_present12", std::int32_t(-1),
+      [&]() -> std::int32_t {
+    if (!impl || impl->backend != helios_bridge::IcdBackend::NvkRm ||
+        !impl->icd.scanout_present || !impl->interop || !resource)
+      return -1;
+    std::uint64_t vk_memory = 0, memory_offset = 0, memory_size = 0, vk_image = 0, buffer_offset = 0;
+    std::uint32_t memory_type = 0;
+    auto* res = reinterpret_cast<ID3D12Resource*>(resource);
+    if (engine_resource_memory(impl.get(), resource, &vk_memory, &memory_offset, &memory_size,
+                               &memory_type) != HELIOS_VKD3D_IDENTITY_RESOLVED ||
+        memory_offset != 0 ||
+        FAILED(impl->interop->GetVulkanResourceInfo(res, &vk_image, &buffer_offset)) || !vk_image)
+      return -2;
+    const VkResult vr = impl->icd.scanout_present((VkDevice)impl->vk_device,
+        (VkDeviceMemory)vk_memory, (VkImage)vk_image);
+    if (vr != VK_SUCCESS) {
+      static std::atomic<std::uint32_t> s_fail{0};
+      const std::uint32_t n = s_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n % 512u) == 0) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "nvk scanout present failed vr=%d (x%u)", int(vr), n);
+        umd_log(msg);
+      }
+      return -3;
+    }
+    return 0;
+  });
+}
+
+void HeliosVkd3dDevice::nvk_scanout_release() const noexcept {
+  helios_bridge::bridge_guard("nvk_scanout_release12", false, [&]() -> bool {
+    if (impl && impl->backend == helios_bridge::IcdBackend::NvkRm && impl->icd.scanout_release &&
+        impl->vk_device)
+      impl->icd.scanout_release((VkDevice)impl->vk_device);
+    return true;
+  });
+}
+
+std::int32_t helios_vkd3d_bridge_wait_execution(std::size_t queue, std::uint64_t value,
+                                                std::uint64_t timeout_ns) noexcept {
+  if (!queue) return E_INVALIDARG;
+  return helios_bridge::bridge_guard("wait_execution12", std::int32_t(E_FAIL),
+      [&]() -> std::int32_t {
+    return helios_vkd3d_wait_execution(reinterpret_cast<ID3D12CommandQueue*>(queue), value,
+                                       timeout_ns);
+  });
+}
+
+namespace {
+
+// The native baseline check and the interop interface for the NVK arm (the
+// Venus arm keeps its own copy below, unchanged). Returns false (logged,
+// counted) when the device must be refused; `d` owns `dev` either way.
+bool finish_engine_device(HeliosVkd3dDeviceImpl& d, ID3D12Device* dev,
+                          std::uint32_t minimum_feature_level) {
+  d.d3d12 = dev;
+  d.minimum_feature_level = minimum_feature_level;
+  std::uint32_t shader_model = 0, raytracing_tier = 0;
+  std::uint8_t device_uuid[16] = {};
+  const HRESULT admission = helios_vkd3d_validate_native_feature_level(dev, minimum_feature_level,
+      &shader_model, &raytracing_tier, device_uuid);
+  if (FAILED(admission)) {
+    const std::uint32_t n = helios_bridge::g_vkd3dCreateDeviceFailed.fetch_add(1, std::memory_order_relaxed) + 1;
+    char msg[192];
+    std::snprintf(msg, sizeof(msg), "Native feature contract 0x%x unavailable hr=0x%08lx (Vkd3dCreateDeviceFailed=%u)",
+                  minimum_feature_level, (unsigned long)admission, n);
+    umd_log(msg);
+    return false;
+  }
+  ID3D12DXVKInteropDevice4* interop = nullptr;
+  const HRESULT qi = dev->QueryInterface(
+      IID_HeliosID3D12DXVKInteropDevice4, reinterpret_cast<void**>(&interop));
+  if (SUCCEEDED(qi) && interop) {
+    d.interop = interop;
+  } else {
+    const std::uint32_t n =
+        helios_bridge::g_vkd3dNoInteropDevice.fetch_add(1, std::memory_order_relaxed) + 1;
+    char qmsg[224];
+    std::snprintf(qmsg, sizeof(qmsg),
+                  "ID3D12DXVKInteropDevice4 unavailable hr=0x%08lx -- no D3D12 "
+                  "resource can carry a present identity (Vkd3dNoInteropDevice=%u)",
+                  (unsigned long)qi, n);
+    umd_log(qmsg);
+  }
+  return true;
+}
+
+// S5: the engine on NVK on RM, loaded directly (no Vulkan loader, no Venus ICD
+// in the instance). Null on any failure; the caller latches the process to
+// Venus.
+std::unique_ptr<HeliosVkd3dDevice> create_on_nvk(LUID luid, std::uint32_t minimum_feature_level) {
+  auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+      helios_bridge::nvk_icd_get_instance_proc_addr());
+  auto out = std::make_unique<HeliosVkd3dDevice>();
+  out->impl = std::make_unique<HeliosVkd3dDeviceImpl>();
+  HeliosVkd3dDeviceImpl& d = *out->impl;
+  d.backend = helios_bridge::IcdBackend::NvkRm;
+  if (!gipa || !helios_bridge::nvk_icd_api(&d.icd)) {
+    helios_bridge::note_nvk_failed("the NVK ICD did not load or has no helios_icd_interface_v2");
+    return {};
+  }
+  ID3D12Device* dev = nullptr;
+  const HRESULT hr = helios_vkd3d_create_device_icd(luid, gipa, __uuidof(ID3D12Device),
+                                                    reinterpret_cast<void**>(&dev));
+  if (FAILED(hr) || !dev) {
+    char msg[160];
+    std::snprintf(msg, sizeof(msg), "helios_vkd3d_create_device_icd failed hr=0x%08lx",
+                  (unsigned long)hr);
+    umd_log(msg);
+    return {};
+  }
+  if (!finish_engine_device(d, dev, minimum_feature_level))
+    return {};
+  if (!d.interop) {
+    umd_log("NVK engine without ID3D12DXVKInteropDevice4: refusing (no resource ids)");
+    return {};
+  }
+  void* vk_physical_device = nullptr;
+  if (FAILED(d.interop->GetVulkanHandles(&d.vk_instance, &vk_physical_device, &d.vk_device)) ||
+      !d.vk_device) {
+    umd_log("NVK engine: GetVulkanHandles failed");
+    return {};
+  }
+  char msg[256];
+  std::snprintf(msg, sizeof(msg),
+                "ID3D12Device created OK on NVK on RM, luid %08x:%08x (icd caps 0x%x: res_id=%u "
+                "scanout=%u; static vkd3d engine)",
+                (unsigned)luid.HighPart, (unsigned)luid.LowPart, d.icd.caps,
+                (d.icd.caps & HELIOS_ICD_CAP_RES_ID) ? 1u : 0u,
+                (d.icd.caps & HELIOS_ICD_CAP_SCANOUT) ? 1u : 0u);
+  umd_log(msg);
+  return out;
+}
+
+}  // namespace
 
 std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
     std::uint32_t luid_low, std::int32_t luid_high, std::uint32_t minimum_feature_level) {
@@ -733,6 +993,23 @@ std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
                   (existing && existing[0]) ? "pre-set, kept" : "set by bridge");
     umd_log(msg);
   });
+
+  // S5 (dxvk-on-nvk): global NVK with a deny-list, Venus whenever NVK is denied,
+  // missing or failed in this process (bridge_icd_backend.h, D3D12 levers
+  // included). The first NVK failure latches the process to Venus.
+  if (helios_bridge::effective_icd_backend() == helios_bridge::IcdBackend::NvkRm) {
+    LUID luid;
+    luid.LowPart = luid_low;
+    luid.HighPart = luid_high;
+    auto nvk = helios_bridge::bridge_guard(
+        "helios_vkd3d_bridge_create_device(nvk)", std::unique_ptr<HeliosVkd3dDevice>{},
+        [&]() -> std::unique_ptr<HeliosVkd3dDevice> {
+          return create_on_nvk(luid, minimum_feature_level);
+        });
+    if (nvk)
+      return nvk;
+    helios_bridge::note_nvk_failed("vkd3d device creation on NVK failed");
+  }
 
   // ⚠ The sentinel is written with its explicit type. `bridge_guard` deduces
   // `R` from the ERROR VALUE ALONE — the body's return type is not a deduction

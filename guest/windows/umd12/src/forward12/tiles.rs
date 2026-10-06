@@ -108,6 +108,15 @@ unsafe fn admit_mapping(
         }
     };
     L2_REFUSALS.tile_mappings_forwarded.bump();
+    if boundary.0 == 0 {
+        // S5: NVK on RM, the same completion as an ECL boundary (queue.rs).
+        // SAFETY: entering DDI thread, live device/queue, execution lock held.
+        match unsafe { nvk_complete(dev, queue, boundary.1, &event) } {
+            Ok(()) => L2_REFUSALS.tile_mappings_admitted.bump(),
+            Err(hr) => mapping_error(queue, hr),
+        }
+        return;
+    }
     // SAFETY: runtime submission callbacks stay on the entering DDI thread and
     // the exact context used for this operation's engine completion stream.
     // ⛔ WIRE FENCE WITHDRAWN (2026-09-13): the D3D12 record carries
