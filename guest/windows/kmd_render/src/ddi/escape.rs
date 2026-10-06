@@ -2186,7 +2186,14 @@ fn nvrm_mmap(
     // `region.base + host.offset .. + m.size` was just checked to lie inside the
     // region's BAR range, and is page aligned.
     let mapped =
-        unsafe { map_io_pages_to_user_prot(region.base + host.offset, m.size, cache, !write) };
+        unsafe {
+            map_io_pages_to_user_prot(
+                region.base.saturating_add(host.offset),
+                m.size,
+                cache,
+                !write,
+            )
+        };
     let Some((user_va, mdl)) = mapped else {
         crate::virtio::gpu::MAP_PAGES_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         crate::virtio::nvrm::NVRM_MAP_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
