@@ -1,6 +1,6 @@
 #!/bin/sh
-# Cross-compile NVK with the RM backend for Windows x86_64 (MinGW-w64), plus
-# librmclient.dll, on a Linux host.
+# Cross-compile NVK with the RM backend for Windows x86_64 or x86 (32-bit,
+# for WoW64 applications) with MinGW-w64, plus librmclient.dll, on a Linux host.
 #
 #   guest/nvk-rm/build-windows.sh [MESA_DIR [BUILD_DIR]]
 #
@@ -8,6 +8,9 @@
 # BUILD_DIR  meson build directory inside MESA_DIR. Default: build-win
 #
 # Environment:
+#   ARCH          x86_64 (default) or i686 (32-bit DLLs for WoW64 apps such as
+#                 Unigine Heaven; needs gcc-mingw-w64-i686 and rustup target
+#                 i686-pc-windows-gnu; use a separate BUILD_DIR, e.g. build-win32)
 #   MESA_BASE     Mesa commit the series applies to (default below)
 #   MESON         meson binary (>= 1.7 for Mesa's Rust; default: meson in PATH)
 #   MESON_ARGS    extra `meson setup` arguments for Mesa
@@ -29,7 +32,13 @@ set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 conduit=$(cd "$here/../.." && pwd)
-cross="$here/windows/mingw-x86_64.ini"
+ARCH=${ARCH:-x86_64}
+case "$ARCH" in
+  x86_64|i686) ;;
+  *) echo "nvk-rm: ARCH must be x86_64 or i686" >&2; exit 1 ;;
+esac
+cross="$here/windows/mingw-$ARCH.ini"
+tool=$ARCH-w64-mingw32
 
 MESA_DIR=${1:-$HOME/code/mesa-nvk-rm-windows}
 BUILD_DIR=${2:-build-win}
@@ -49,15 +58,20 @@ capped() {
   fi
 }
 
-# 1. Mesa checkout with both series: patches/ (NVK on RM) and
-#    patches-windows/ (the Windows build) on a local branch
+# 1. Mesa checkout with the series: patches/ (NVK on RM), patches-windows/
+#    (the Windows build) and patches-windows-dxvk/ on a local branch
 if [ ! -d "$MESA_DIR/.git" ] && [ ! -f "$MESA_DIR/.git" ]; then
   git clone --depth 200 "$MESA_URL" "$MESA_DIR"
 fi
 if ! git -C "$MESA_DIR" cat-file -e "$MESA_BASE^{commit}" 2>/dev/null; then
   git -C "$MESA_DIR" fetch --depth 200 origin "$MESA_BASE"
 fi
-last_subject=$(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$(ls "$here"/patches-windows/*.patch | tail -1)")
+# patches-windows-dxvk/: what a D3D11 game on DXVK needs (32-bit build fix,
+# no present wait on Win32, R/B order of the GDI present); applied last.
+series="$here/patches/*.patch $here/patches-windows/*.patch $here/patches-windows-dxvk/*.patch"
+# shellcheck disable=SC2086
+last_patch=$(printf "%s\n" $series | tail -1)
+last_subject=$(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$last_patch" | head -1)
 if git -C "$MESA_DIR" log --format=%s "$MESA_BASE..HEAD" 2>/dev/null | grep -qxF "$last_subject"; then
   echo "nvk-rm: Windows series already applied in $MESA_DIR"
 else
@@ -66,7 +80,7 @@ else
     exit 1
   fi
   git -C "$MESA_DIR" checkout -B nvk-rm-windows "$MESA_BASE"
-  git -C "$MESA_DIR" am --3way "$here"/patches/*.patch "$here"/patches-windows/*.patch
+  git -C "$MESA_DIR" am --3way $series
 fi
 
 # 2. Native mesa_clc + vtn_bindgen2 (build-machine tools)
@@ -124,15 +138,15 @@ if [ ! -f "$BUILD_DIR/build.ninja" ]; then
 fi
 capped ninja -C "$BUILD_DIR" -j"$JOBS" \
   src/nouveau/vulkan/vulkan_nouveau.dll \
-  src/nouveau/vulkan/nouveau_icd.x86_64.json
+  src/nouveau/vulkan/nouveau_icd.$ARCH.json
 
 # 5. Stage: the DLLs, an ICD manifest pointing next to itself, imports/exports
 mkdir -p "$OUT_DIR"
 # Stripped copies (debugoptimized vulkan_nouveau.dll is ~140 MB with DWARF,
 # ~18 MB without); the unstripped DLLs stay in the build directories.
-x86_64-w64-mingw32-strip -o "$OUT_DIR/vulkan_nouveau.dll" "$BUILD_DIR/src/nouveau/vulkan/vulkan_nouveau.dll"
-x86_64-w64-mingw32-strip -o "$OUT_DIR/librmclient.dll" "$rmc/librmclient.dll"
-python3 - "$BUILD_DIR/src/nouveau/vulkan/nouveau_icd.x86_64.json" "$OUT_DIR/nouveau_icd.json" <<'EOF'
+"$tool-strip" -o "$OUT_DIR/vulkan_nouveau.dll" "$BUILD_DIR/src/nouveau/vulkan/vulkan_nouveau.dll"
+"$tool-strip" -o "$OUT_DIR/librmclient.dll" "$rmc/librmclient.dll"
+python3 - "$BUILD_DIR/src/nouveau/vulkan/nouveau_icd.$ARCH.json" "$OUT_DIR/nouveau_icd.json" <<'EOF'
 import json, sys
 icd = json.load(open(sys.argv[1]))
 # The Windows loader resolves a relative path with a separator against the
@@ -140,7 +154,7 @@ icd = json.load(open(sys.argv[1]))
 icd["ICD"]["library_path"] = ".\\vulkan_nouveau.dll"
 json.dump(icd, open(sys.argv[2], "w"), indent=4)
 EOF
-objdump=x86_64-w64-mingw32-objdump
+objdump=$tool-objdump
 {
   for dll in "$OUT_DIR"/*.dll; do
     echo "=== $(basename "$dll") ==="

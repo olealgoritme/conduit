@@ -306,6 +306,109 @@ same NAK bitfield question answered with the MSVC layout), presenting
 through the win32 WSI, `vkcube` (it cannot be pointed at NVK from an
 elevated session, see above) and dEQP.
 
+### D3D11 games through DXVK: Unigine Heaven (2026-10-06, `win11`, KMD 22.22.308.0)
+
+Heaven 4.0 runs as D3D11 -> DXVK -> NVK -> RM, without touching the Helios
+WDDM driver or registering anything system-wide. Every file sits next to
+`Heaven.exe` in a private copy of Heaven.
+
+**Heaven is a 32-bit (WoW64) application.** That means a 32-bit NVK and
+librmclient. The 64-bit `vulkan_nouveau.dll` fails to load in it
+(`LoadLibrary` error 193). In that case the shim below falls back to the
+system loader, and DXVK silently runs on the Venus ICD instead. Check
+`logs\nvk-shim.log` and `Heaven_dxgi.log` ("Found device: ... (NVK GB202)").
+The RM transport works from WoW64 as it is: the escape ABI is
+pointer-free, and the KMD's user mappings land below 4 GiB. The 32-bit
+`crm_smoke`, `crm_pin_smoke` and `crm_event_smoke` all pass.
+
+Build (host):
+
+    ARCH=i686 OUT_DIR=dist32 guest/nvk-rm/build-windows.sh ~/code/mesa-nvk-rm-win32 build-win32
+    # DXVK: the Helios fork, built plain with MinGW, no source changes
+    # (its Helios hooks find no helios_* exports outside helios_umd.dll and stay off):
+    cd guest/windows/third_party/dxvk && meson setup build32 --cross-file build-win32.txt \
+        --buildtype release --strip -Denable_d3d8=false -Denable_d3d9=false \
+        -Denable_d3d10=false -Db_vscrt=none && ninja -C build32
+    guest/nvk-rm/windows/stage-dxvk-app.sh i686 dist32 <dir with the fork's d3d11.dll+dxgi.dll> stage
+
+Requirements for `ARCH=i686`: `gcc-mingw-w64-i686` (dwarf2) and the
+`i686-pc-windows-gnu` rustup target for the toolchain meson uses. Install it
+with `rustup target add --toolchain stable ...` if a `rust-toolchain` file
+pins another one. `patches-windows-dxvk/` is applied after
+`patches-windows/`:
+
+| # | patch | why |
+|---|---|---|
+| 1 | VKAPI_CALL on `nvk_CmdCopyMemoryToImageIndirectKHR` | 32-bit Windows (`__stdcall`) build error |
+| 2 | no `VK_KHR_present_id`/`present_wait(2)` on Windows | the Win32 WSI has no `wait_for_present`; DXVK uses present wait when offered and hit `assert(swapchain->wait_for_present)` |
+| 3 | R/B swizzle in the GDI present for R8G8B8A8 swapchains | the DIB is BGRA; DXVK picked `R8G8B8A8_UNORM`, so the sky came out orange |
+| 4 | `NVK_RM_WAIT_SPIN`, `NVK_RM_WAIT_POLL_MS` | knobs for measuring the CPU wait path |
+
+The upstream DXVK 3.1.1 release `d3d11.dll` is quarantined by Windows
+Defender in the guest (a false positive). The fork build is not.
+
+Guest: copy `W:\Heaven` to `C:\Users\Public\heaven-nvk`, then put the staged
+files in its `bin\` and `run-heaven-nvk.bat` + `heaven-nvk-fps.ps1` in
+its root. Double-clicking `run-heaven-nvk.bat` runs it on the desktop. Its
+arguments are `[dir [w h [prof]]]`. An optional `env.cmd` next to it is
+`call`ed first (e.g. `set HEAVEN_TESS=TESSELLATION_DISABLED`,
+`set NVK_HELIOS_WSI=0`).
+
+- `vulkan-1.dll` (`windows/vulkan_shim.c`) forwards to the system loader.
+  In `vkCreateInstance` it chains `VK_LUNARG_direct_driver_loading`
+  (exclusive) with the `vulkan_nouveau.dll` next to it. The loader ignores
+  `VK_DRIVER_FILES` in elevated processes, and this sidesteps that.
+  `NVK_SHIM_FRAMES=file` logs every `vkQueuePresentKHR`. It is the only
+  frame clock here: an app-local `dxgi.dll` emits no DXGI ETW events, so
+  PresentMon sees nothing.
+- `heaven-nvk-fps.ps1 [-Seconds 30] [-Warmup 45] [-Width] [-Height] [-Prof]`
+  starts it through a scheduled task in the user's session, prints fps,
+  frame-time median/p99 and 5 s buckets, and stops it by PID. `-Prof` adds
+  librmclient's per-escape table (`CRM_WIN_PROF_FILE`, which also counts
+  event waits) for the timed window.
+
+Results, 1600x900 Medium, tessellation normal, the same RTX 5090. The NVK
+rows are a 30 s window after 45 s; Venus is `heaven-fps.ps1`, 30 s after 25 s:
+
+| path | fps | median / p99 ms | host SM % (nvidia-smi dmon) | power |
+|---|---|---|---|---|
+| Venus, Helios UMD (embedded DXVK) | 138.8 | 6.75 / 13.3 | 25-40 | ~165 W |
+| NVK, GDI copy present | 62.5-62.8 | 15.2-17.1 / 22-41 | 68-94 | ~160 W |
+| NVK, GDI, 800x450 | 85.2 | 10.5 / 18.6 | 93-99 | ~155 W |
+| NVK, GDI, pure spin waits (`NVK_RM_WAIT_SPIN=1e8`) | 61.8 | 17.7 / 22.6 | | |
+| NVK, zero-copy Helios WSI (patch 21, SCANOUT_PRESENT, unpaced) | 59.7 | 15.6 / 57.6 | 72-99 | ~150-170 W |
+| NVK, zero-copy, tessellation disabled | 96.6 | 8.7 / 18.7 | | |
+| app-local DXVK fork on Venus (64-bit NVK DLL failed to load) | ~50 | | 16-20 | ~100 W |
+
+Rendering is correct: geometry, textures, tessellation, and colors after
+patch 3. The per-bucket fps follows the camera path identically from run
+to run, 48-175 fps.
+
+RM traffic per frame (GDI run): 10.4 `NV_ESC_RM_GET_EVENT_DATA` at ~100 us
+each, from the event drain in `nvkmd_rm_wait_step()`, so ~1 ms. There are
+10.4 event waits, almost all woken by the event, not the 10 ms timeout.
+Zero-copy adds one `SCANOUT_PRESENT` (op 10) per frame, 0.1-1.9 ms.
+Everything else is under 0.05 per frame: no per-frame mmap, Open/Close,
+alloc/free or event registration.
+
+What limits NVK here is NVK's GPU work, not the transport or the present:
+
+- removing the GDI copy changes nothing;
+- removing event waits (pure spinning) changes nothing;
+- the GPU is busy 70-99% of the time at 60 fps, where the NVIDIA driver
+  (Venus) needs 25-40% at 139 fps. That is ~5-6x more GPU time per frame,
+  at low power, so stalls more likely than math;
+- a quarter of the pixels only goes from 62 to 85 fps;
+- turning tessellation off gives +60%.
+
+NVK reports no host-visible VRAM (`bar_size_B = 0` in
+`nvkmd_rm_pdev.c`). The memory types are type 0 DEVICE_LOCAL (heap 0,
+31.4 GiB) and type 1 HOST_VISIBLE|HOST_COHERENT|HOST_CACHED (heap 1,
+15 GiB sysmem). So DXVK keeps its dynamic and upload buffers in snooped
+system memory, which the GPU reads over PCIe on every draw. This is the
+first suspect (`feat/nvk-rm-bar-heap`). After that come NVK/NAK on
+Blackwell itself and tessellation.
+
 ## Running (in a guest)
 
 ```sh
