@@ -1063,10 +1063,7 @@ mod tests {
         assert!(exhausted);
         // Consecutive Deferred of one handle exhaust after exactly the budget.
         let run = drive(budget, &std::vec![Outcome::Deferred(7); 25]);
-        assert_eq!(
-            run.iter().filter(|d| **d == DeferDecision::Again).count(),
-            20
-        );
+        assert!(run[..20].iter().all(|d| *d == DeferDecision::Again));
         assert_eq!(run[20], DeferDecision::Exhausted);
         // ... and after exhaustion the state is empty: the next Deferred starts from 1.
         assert_eq!(run[21], DeferDecision::Again);
