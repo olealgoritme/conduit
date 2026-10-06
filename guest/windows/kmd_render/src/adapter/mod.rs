@@ -1566,6 +1566,9 @@ impl AdapterContext {
     pub(crate) fn publish_displayed_primary(&self, primary: ProgrammedPrimary) {
         self.last_primary_address
             .store(primary.address, Ordering::Release);
+        // `FlipPub` / `FlipPubT` (`ddi::stall_diag`): every publication, bound or kept, any
+        // class. Atomics only, as this is reached from DIRQL and DISPATCH too.
+        crate::ddi::stall_diag::note_published();
     }
 
     /// The state StartDevice established, or `None` before it ran.

@@ -648,6 +648,8 @@ impl AdapterContext {
         passive: PassiveLevel,
     ) -> ScanoutRefreshQueue {
         let outcome = self.with_scanout_lifecycle(passive, |lock| {
+            // Stall breadcrumb: the HPD worker (the only caller) holds the scanout mutex now.
+            crate::ddi::stall_diag::hpd_enter(crate::ddi::stall_diag::site::REFRESH_LOCKED);
             self.queue_active_scanout_refresh_locked(lock)
         });
         // R318: the pacing snapshot runs OUTSIDE `scanout_mutex`. It used to run
@@ -692,6 +694,8 @@ impl AdapterContext {
             return;
         }
 
+        // The stall-diagnosis block rides the same periodic mirror (`ddi::stall_diag`).
+        crate::ddi::stall_diag::publish_counters();
         crate::diag::record_named_bytes(b"RfRid", resource_id);
         crate::diag::record_named_bytes(b"RfWH", (width << 16) | (height & 0xFFFF));
         crate::diag::record_named_bytes(b"RfCnt", n);

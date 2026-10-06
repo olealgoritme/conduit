@@ -604,6 +604,14 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         }
         now
     };
+    // Stall diagnosis (`ddi::stall_diag`): the consecutive-pending-tick count `VsPendN` and its
+    // maximum, and, only with `FlipWdogMs` set, the flip watchdog. Atomics only (DISPATCH),
+    // before the delivery gate below so a disabled delivery does not blind the count; the
+    // watchdog's kept address is read by the `phys` load further down, in this very tick.
+    crate::ddi::stall_diag::on_vsync_tick(
+        adapter,
+        helios_kmd_logic::vsync_deadline::period_100ns(vsync_rate_mhz(adapter)),
+    );
     // ControlInterrupt may close only the delivery gate at DIRQL. Keep the
     // one-shot heartbeat free-running while disabled so a later enable needs no
     // illegal timer operation and resumes on the next nominal retrace.
