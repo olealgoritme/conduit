@@ -47,6 +47,11 @@ use alloc::vec::Vec;
 pub const PAGE: u64 = 4096;
 /// The default reserve held back for the privileged device, in MiB.
 pub const DEFAULT_RESERVE_MIB: u32 = 256;
+/// How long after the privileged device (DWM) is destroyed a device that appears may use the
+/// reserve before it has set a scanout source itself: 30 seconds in 100 ns units. A restarted
+/// DWM is a NEW device, ordinary until its first `SCANOUT_SET`, and its first maps come before
+/// that; without this, while others hold the window up to `cap - reserve` they would be refused.
+pub const PRIVILEGE_GRACE_100NS: u64 = 30 * 10_000_000;
 /// How many owners [`Account::top`] reports.
 pub const TOP_N: usize = 4;
 
@@ -109,6 +114,9 @@ pub struct Stats {
     pub host_refused: u32,
     /// The errno of the last host refusal (12, ENOMEM, is "the host's window zone is full").
     pub last_host_errno: u32,
+    /// Devices that appeared while the privilege grace was running and were let use the
+    /// reserve until it ended (a restarted DWM, or any other new device: not a refusal).
+    pub grace_grants: u32,
 }
 
 impl Stats {
@@ -178,6 +186,8 @@ struct Row {
     bytes: u64,
     maps: u32,
     privileged: bool,
+    /// Nonzero: this device appeared during a privilege grace and may use the reserve until then.
+    grace_until: u64,
 }
 
 /// One entry of [`Account::top`]. `bytes == 0` marks an unused rank.
@@ -227,6 +237,11 @@ pub struct Account {
     maps: u64,
     rows: Vec<Row>,
     stats: Stats,
+    /// The last time the driver told the account ([`Self::tick`]); 0 = never.
+    now: u64,
+    /// While `now` is below this, a device with no row (or one made during the grace) is
+    /// privileged: set when a marked-privileged device is forgotten.
+    grace_until: u64,
 }
 
 impl Account {
@@ -242,6 +257,8 @@ impl Account {
             maps: 0,
             rows,
             stats: Stats::default(),
+            now: 0,
+            grace_until: 0,
         })
     }
 
@@ -264,6 +281,33 @@ impl Account {
 
     fn row_index(&self, owner: u64) -> Option<usize> {
         self.rows.iter().position(|r| r.owner == owner)
+    }
+
+    /// The driver's clock (100 ns units, monotonic), before a decision. Never goes back.
+    pub fn tick(&mut self, now: u64) {
+        if now > self.now {
+            self.now = now;
+        }
+    }
+
+    /// Whether the privilege grace covers `owner` at `now`: it is running, and `owner` has no
+    /// row yet (a device that appears) or made its row during it.
+    fn grace_covers(&self, now: u64, owner: u64) -> bool {
+        now < self.grace_until
+            && match self.rows.iter().find(|r| r.owner == owner) {
+                None => true,
+                Some(r) => r.grace_until > now,
+            }
+    }
+
+    /// Whether `owner` may use the reserve at `now`: live evidence, the sticky mark, or the grace.
+    fn privileged_at(&self, now: u64, owner: u64, live_privileged: bool) -> bool {
+        live_privileged || self.is_marked_privileged(owner) || self.grace_covers(now, owner)
+    }
+
+    /// Whether the privilege grace is running at the last tick.
+    pub fn grace_active(&self) -> bool {
+        self.now < self.grace_until
     }
 
     /// Whether `owner` was marked privileged earlier (and has not been forgotten).
@@ -309,7 +353,7 @@ impl Account {
                 }
             }
             Policy::Dynamic => {
-                let privileged = live_privileged || self.is_marked_privileged(owner);
+                let privileged = self.privileged_at(self.now, owner, live_privileged);
                 let limit = if privileged {
                     self.cfg.cap
                 } else {
@@ -388,12 +432,21 @@ impl Account {
                     self.refuse(Refusal::TableFull);
                     return Err(Refusal::TableFull);
                 }
+                // A device that appears during the privilege grace keeps the reserve until
+                // the grace ends (a restarted DWM's first maps come before its SCANOUT_SET).
+                let grace = if self.now < self.grace_until {
+                    self.stats.grace_grants = self.stats.grace_grants.saturating_add(1);
+                    self.grace_until
+                } else {
+                    0
+                };
                 self.rows.push(Row {
                     owner,
                     pid,
                     bytes: 0,
                     maps: 0,
                     privileged: false,
+                    grace_until: grace,
                 });
                 self.rows.len() - 1
             }
@@ -440,6 +493,11 @@ impl Account {
             return 0;
         };
         let row = self.rows.swap_remove(idx);
+        if row.privileged {
+            // The privileged device (DWM) is gone; its replacement is a new device that is
+            // ordinary until its first SCANOUT_SET: give new devices the reserve meanwhile.
+            self.grace_until = self.grace_until.max(self.now.saturating_add(PRIVILEGE_GRACE_100NS));
+        }
         self.in_use = self.in_use.saturating_sub(row.bytes);
         self.maps = self.maps.saturating_sub(u64::from(row.maps));
         row.bytes
@@ -462,12 +520,14 @@ impl Account {
             bytes: 0,
             maps: 0,
             privileged: true,
+            grace_until: 0,
         });
         true
     }
 
     /// The transport is gone: nothing is mapped, nobody is privileged. Statistics stay.
     pub fn clear(&mut self) {
+        self.grace_until = 0;
         self.rows.clear();
         self.in_use = 0;
         self.maps = 0;
@@ -512,11 +572,17 @@ impl Account {
     /// device is `owner_limit - used`. Legacy: a quarter of the window, a ceiling on the
     /// device's own bytes (flag clear): the room is `owner_limit - owner_used`.
     pub fn info(&self, owner: u64, live_privileged: bool) -> Info {
+        self.info_at(self.now, owner, live_privileged)
+    }
+
+    /// [`Self::info`] at the driver's clock `now` (the privilege grace may have ended since the
+    /// last [`Self::tick`]).
+    pub fn info_at(&self, now: u64, owner: u64, live_privileged: bool) -> Info {
         let window = self.cfg.window;
         let (limit, mut flags) = match self.cfg.policy {
             Policy::Legacy => (self.cfg.legacy_quota(), 0),
             Policy::Dynamic => {
-                let privileged = live_privileged || self.is_marked_privileged(owner);
+                let privileged = self.privileged_at(now, owner, live_privileged);
                 let limit = if privileged {
                     self.cfg.cap
                 } else {
@@ -566,6 +632,7 @@ pub const COUNTERS: &[&str] = &[
     "NvWinRsvUse",
     "NvWinMaps",
     "NvWinOwn",
+    "NvWinGrace",
     "NvWinPriv",
     "NvWinRFull",
     "NvWinRRes",
@@ -950,7 +1017,82 @@ mod tests {
         assert_eq!(a.snapshot().privileged_owners, 1);
         a.forget_owner(7);
         assert!(!a.is_marked_privileged(7));
+        // The grace the loss started covers a device with no row for 30 s ...
+        assert_eq!(a.check(7, false, 4096), Ok(()));
+        // ... and then the device is ordinary again.
+        a.tick(PRIVILEGE_GRACE_100NS + 1);
         assert_eq!(a.check(7, false, 4096), Err(Refusal::ReserveHit));
+    }
+
+    /// The DWM-restart case: the privileged device is destroyed while other processes hold the
+    /// window up to `cap - reserve`. Its replacement is a new, ordinary device; for the grace it
+    /// may use the reserve, and a map it made then stays covered until the grace ends.
+    #[test]
+    fn a_restarted_dwm_gets_the_reserve_for_its_first_maps() {
+        let sec = 10_000_000u64;
+        let mut a = dynamic(GIB, 256);
+        a.tick(100 * sec);
+        a.charge(9, 90, false, 100 * MIB).unwrap();
+        a.mark_privileged(1, 10); // DWM
+        a.charge(1, 10, false, 100 * MIB).unwrap();
+        // Others fill the rest of the ordinary share.
+        a.charge(2, 20, false, 768 * MIB - 200 * MIB).unwrap();
+        assert_eq!(a.in_use(), 768 * MIB);
+        // DWM dies: its maps go (the per-map releases), then the device is forgotten.
+        a.release(1, 100 * MIB);
+        a.forget_owner(1);
+        // Others take the space DWM freed, up to the ordinary limit again.
+        a.charge(3, 30, false, 100 * MIB).unwrap();
+        assert_eq!(a.in_use(), 768 * MIB);
+        assert!(a.grace_active());
+        // The restarted DWM (a new device, no SCANOUT_SET yet) is refused as an ordinary one
+        // would be ...
+        a.tick(100 * sec + PRIVILEGE_GRACE_100NS + 1);
+        assert!(!a.grace_active());
+        assert_eq!(a.check(4, false, 64 * MIB), Err(Refusal::ReserveHit));
+        // ... unless it appears within the grace.
+        let mut b = dynamic(GIB, 256);
+        b.tick(100 * sec);
+        b.mark_privileged(1, 10);
+        b.charge(2, 20, false, 768 * MIB).unwrap();
+        b.forget_owner(1);
+        b.tick(110 * sec); // 10 s later
+        assert!(b.grace_active());
+        assert_eq!(b.check(4, false, 64 * MIB), Ok(()));
+        b.charge(4, 40, false, 64 * MIB).unwrap();
+        assert_eq!(b.stats().grace_grants, 1);
+        // Its next map is still covered (its row was made during the grace) ...
+        b.charge(4, 40, false, 64 * MIB).unwrap();
+        // ... the old processes are not: they are ordinary.
+        assert_eq!(b.check(2, false, 4096), Err(Refusal::ReserveHit));
+        // When the grace ends the device is ordinary again, and its bytes stay accounted.
+        b.tick(100 * sec + PRIVILEGE_GRACE_100NS + 1);
+        assert_eq!(b.check(4, false, 4096), Err(Refusal::ReserveHit));
+        assert_eq!(b.bytes_of(4), 128 * MIB);
+        // WINDOW_INFO follows the same rule at the caller's clock.
+        let g = b.info_at(110 * sec, 5, false);
+        assert_eq!(g.owner_limit_bytes, GIB);
+        let after = b.info_at(100 * sec + PRIVILEGE_GRACE_100NS + 2, 5, false);
+        assert_eq!(after.owner_limit_bytes, GIB - 256 * MIB);
+    }
+
+    #[test]
+    fn grace_is_only_started_by_a_marked_privileged_device_and_never_shrinks() {
+        let mut a = dynamic(GIB, 256);
+        a.tick(5);
+        a.charge(1, 1, false, 4096).unwrap();
+        a.forget_owner(1); // an ordinary device: no grace
+        assert!(!a.grace_active());
+        a.mark_privileged(2, 2);
+        a.forget_owner(2);
+        assert!(a.grace_active());
+        let until = a.grace_until;
+        a.tick(1); // the clock never goes back
+        a.mark_privileged(3, 3);
+        a.forget_owner(3);
+        assert!(a.grace_until >= until);
+        a.clear();
+        assert!(!a.grace_active());
     }
 
     #[test]
@@ -998,6 +1140,7 @@ mod tests {
                         bytes: m,
                         maps: 1,
                         privileged: false,
+                        grace_until: 0,
                     });
                     assert_eq!(a.check(1, false, s).is_ok(), old(m, s, w), "w={w} m={m} s={s}");
                 }

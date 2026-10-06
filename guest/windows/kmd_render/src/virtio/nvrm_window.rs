@@ -39,6 +39,8 @@ static WIN_RSV_USE: AtomicU64 = AtomicU64::new(0);
 static WIN_MAPS: AtomicU32 = AtomicU32::new(0);
 static WIN_OWNERS: AtomicU32 = AtomicU32::new(0);
 static WIN_PRIV: AtomicU32 = AtomicU32::new(0);
+/// Devices let use the reserve by the privilege grace (a restarted DWM) since the transport started.
+static WIN_GRACE: AtomicU32 = AtomicU32::new(0);
 /// The four largest owners: pid in the high half, MiB in the low half (0 = unused rank).
 static WIN_TOP: [AtomicU64; TOP_N] = [
     AtomicU64::new(0),
@@ -186,6 +188,7 @@ pub fn mirror(s: &Snapshot) {
     WIN_MAPS.store(s.maps.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
     WIN_OWNERS.store(s.owners, Ordering::Relaxed);
     WIN_PRIV.store(s.privileged_owners, Ordering::Relaxed);
+    WIN_GRACE.store(s.stats.grace_grants, Ordering::Relaxed);
     for (slot, top) in WIN_TOP.iter().zip(s.top.iter()) {
         slot.store(pack_top(*top), Ordering::Relaxed);
     }
@@ -240,6 +243,7 @@ pub fn publish_counters() {
     rec(b"NvWinRsvUse", mib(WIN_RSV_USE.load(Ordering::Relaxed)));
     rec(b"NvWinMaps", WIN_MAPS.load(Ordering::Relaxed));
     rec(b"NvWinOwn", WIN_OWNERS.load(Ordering::Relaxed));
+    rec(b"NvWinGrace", WIN_GRACE.load(Ordering::Relaxed));
     rec(b"NvWinPriv", WIN_PRIV.load(Ordering::Relaxed));
     rec(b"NvWinRFull", R_FULL.load(Ordering::Relaxed));
     rec(b"NvWinRRes", R_RESERVE.load(Ordering::Relaxed));

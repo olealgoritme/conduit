@@ -1069,6 +1069,7 @@ impl VirtioGpu {
         if uvm {
             return Ok(());
         }
+        self.win_tick();
         let r = self
             .nvrm_limits
             .acct
@@ -1079,6 +1080,14 @@ impl VirtioGpu {
         r
     }
 
+    /// Give the window account the clock (a scalar read, legal at any IRQL), for the privilege
+    /// grace (`rm_window::PRIVILEGE_GRACE_100NS`).
+    fn win_tick(&mut self) {
+        self.nvrm_limits
+            .acct
+            .tick(crate::adapter::foreign_scanout::now_100ns());
+    }
+
     /// What `WINDOW_INFO` tells `owner` (`helios_kmd_logic::rm_window::Account::info`). Read
     /// only: no counter moves.
     pub fn nvrm_window_info(
@@ -1086,8 +1095,11 @@ impl VirtioGpu {
         owner: DeviceOwner,
         live_privileged: bool,
     ) -> rm_window::Info {
-        self.nvrm_limits.acct
-            .info(owner.raw() as u64, live_privileged)
+        self.nvrm_limits.acct.info_at(
+            crate::adapter::foreign_scanout::now_100ns(),
+            owner.raw() as u64,
+            live_privileged,
+        )
     }
 
     /// `owner` set the foreign scanout source: it is the privileged device from now until
@@ -1104,6 +1116,7 @@ impl VirtioGpu {
     /// per-map releases already ran for each mapping taken; this drops the sticky
     /// privileged mark and any row left by a map whose slot was already gone).
     pub fn nvrm_window_forget_owner(&mut self, owner: DeviceOwner) {
+        self.win_tick();
         let _ = self.nvrm_limits.acct.forget_owner(owner.raw() as u64);
         crate::virtio::nvrm_window::mirror(&self.nvrm_limits.acct.snapshot());
     }
@@ -1136,6 +1149,7 @@ impl VirtioGpu {
             return None;
         }
         // Re-checked here under the same hold as the push.
+        self.win_tick();
         if !uvm
             && self
                 .nvrm_limits

@@ -1205,6 +1205,21 @@ Nothing in the KMD identified DWM before (no image name, no pid). The choice, le
    lapse), exactly when it re-creates its swap chain.
 2. **The KMD's own RM client** (`DeviceOwner::KMD_RM`), always.
 
+**A restarted DWM** is a new device, ordinary until its first `SCANOUT_SET`, and its first maps
+(swap chain, glyph caches) come before that. While others hold the window up to `cap - reserve` it
+would be refused: the shell would fall back to system memory for its first buffers. Mitigation, kept
+simple (`rm_window::PRIVILEGE_GRACE_100NS`, test `a_restarted_dwm_gets_the_reserve_for_its_first_maps`):
+when a device marked privileged is destroyed, the account opens a 30 s grace. A device that appears
+during it (no row yet) may use the reserve, and the row it makes keeps that right until the grace
+ends (`NvWinGrace` counts them); devices that already held maps stay ordinary, and the right ends
+with the 30 s or with the device's own `SCANOUT_SET` (the sticky mark). Cost: any new process
+that starts in those 30 s can use the reserve too, which only matters if the window is nearly full,
+and the reserve is only 256 MiB. Not chosen: keying on a MISC_PRIMARY/foreign primary allocation
+(the KMD sees it at `CreateAllocation`, in another lock domain and before any NVRM device exists)
+or on the last privileged process image (no image name is recorded anywhere). If DWM restarts
+slower than 30 s after the old one died, its first maps are ordinary until its `SCANOUT_SET`;
+`NvWinPriv` 0 with a running desktop says it.
+
 Not used, on purpose: an image-name list (`PsGetProcessImageFileName` for `dwm.exe`) needs an
 export the Rust bindings do not carry and a C shim that cannot be built here, and is a name a
 renamed binary spoofs; no image name or pid is recorded anywhere in the KMD today. Cost: a device that never sets a scanout
@@ -1253,6 +1268,7 @@ both trees).
 | `NvWinUseMb` / `NvWinPeakMb` / `NvWinFreeMb` | window bytes mapped now (non-UVM); high-water mark since driver load; `cap - use` |
 | `NvWinRsvUse` | MiB in use inside the reserve (only the privileged device gets there) |
 | `NvWinMaps` / `NvWinOwn` / `NvWinPriv` | live window mappings; devices with a row; devices marked privileged |
+| `NvWinGrace` | devices let use the reserve by the privilege grace (13.3, a restarted DWM or any new device within 30 s of the shell's loss) since the transport started |
 | `NvWinRFull` | refused: the window (up to `cap`) has no room |
 | `NvWinRRes` | refused: a non-privileged map would eat into the reserve |
 | `NvWinRBig` | refused: one map larger than the window could ever give |
@@ -1447,4 +1463,5 @@ global is scarce, counted, grown at PASSIVE outside the lock (13.8).
   `wdk_sys::ntddk::PsGetCurrentProcessId` is bound, the grow-and-swap under load, the 32 GiB BAR
   assignment by the guest, DWM's actual `SCANOUT_SET` ordering relative to its first maps.
 * Risks: a process can claim the reserve with a `SCANOUT_SET`; the byte total cannot see the host's
-  zones (13.1); table scans are `O(n)` under the lock (13.5).
+  zones (13.1); table scans are `O(n)` under the lock (13.5); the privilege grace (13.3) lets
+  any device that appears within 30 s of the shell's loss use the reserve.
