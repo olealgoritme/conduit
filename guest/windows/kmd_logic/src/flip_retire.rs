@@ -444,6 +444,23 @@ impl AnnounceMode {
 /// 244 used vblanks a second, no artifacts. `FlipAnnounce` 0 in the service key turns it off.
 pub const DEFAULT_KNOB: u32 = 2;
 
+/// `FlipAnnForeign` when the service key has none: 1 when `ForeignFlip` is on (the foreign class
+/// exists only then), else 0. An explicit value, 0 included, wins. On 333.1 hardware with it on
+/// (NVK DWM, 5120x1440@240): PresentMon `dwm.exe` 237 a second, p50 4.05 / p99 4.69 ms, until-
+/// displayed p50 3.73 / p99 4.32, `FfProg` 250 and `FfFrames` 242 a second, `IfStall8` 0, against
+/// 227 a second, p99 8.01 ms, max 783 ms with it off. The announced foreign flip retires one tick
+/// after the DDI whatever the host does, so the previous buffer can be handed back to DWM while the
+/// host still shows it when the host flip takes longer than that tick: a tear exposure
+/// (`docs/kmd-rm-client.md` 15.18.16), bounded by `foreign_flip::busy()` (no announce with a host
+/// flip owed or flying) and measured by `FlipHostLat*` / `FfRttB*`. `FlipAnnForeign` 0 removes it.
+pub const fn ann_foreign_default(foreign_flip_knob: u32) -> u32 {
+    if foreign_flip_knob != 0 {
+        1
+    } else {
+        0
+    }
+}
+
 /// Whether the DDI asks for the DPC that wakes the worker at issue: an announce mode, or the
 /// `FlipEarlyWake` knob alone (early programming without an early retire).
 pub const fn wakes_early(mode: AnnounceMode, early_wake_knob: u32) -> bool {
@@ -1103,6 +1120,11 @@ mod tests {
         }
         let f = AnnounceFacts { idle: false, ..facts() };
         assert_eq!(announce_decide(&f), Announce::No(NoAnnounce::Busy));
+        // the foreign class is announced by default exactly when ForeignFlip is on
+        assert_eq!(ann_foreign_default(0), 0);
+        assert_eq!(ann_foreign_default(1), 1);
+        assert_eq!(ann_foreign_default(2), 1);
+        assert_eq!(ann_foreign_default(u32::MAX), 1);
         // mode 2 announces the Venus class always and the foreign class only with FlipAnnForeign
         let f = AnnounceFacts {
             mode: AnnounceMode::All,

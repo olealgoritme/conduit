@@ -1054,10 +1054,12 @@ pub mod knobs {
     /// Read at every StartDevice (`pnputil /restart-device` applies it); mirrored as `FaKnob`.
     /// `docs/kmd-rm-client.md` 15.18.15.
     pub const FLIP_ANNOUNCE: KnobName = KnobName::new(b"FlipAnnounce");
-    /// `FlipAnnForeign` (default 0): with `FlipAnnounce` 2, also announce flips of foreign or
-    /// hollow allocations (the NVK DWM's swap chain). 0 announces the Venus class only.
-    /// `FlipAnnounce` 1 (the explicit foreign mode) ignores it. Read at every StartDevice; mirrored
-    /// in `FaKnob` (bit 16). The name is 14 characters, the lookup buffer's limit.
+    /// `FlipAnnForeign` (default 1 with `ForeignFlip` on, else 0; an explicit value wins, 0
+    /// included): with `FlipAnnounce` 2, also announce flips of foreign or hollow allocations (the
+    /// NVK DWM's swap chain). 0 announces the Venus class only, which is the tear-exposure-free
+    /// setting (the foreign flip retires when the worker publishes it). `FlipAnnounce` 1 (the
+    /// explicit foreign mode) ignores it. Read at every StartDevice; mirrored in `FaKnob` (bit 16).
+    /// The name is 14 characters, the lookup buffer's limit. `docs/kmd-rm-client.md` 15.18.16.
     pub const FLIP_ANN_FOREIGN: KnobName = KnobName::new(b"FlipAnnForeign");
     /// `MirrorThread` (default 1, 0 = off): run the registry mirror (`stall_diag::publish_counters`)
     /// on its own thread, one pass a second (`ddi/mirror_thread.rs`). 0 is the kill switch: every

@@ -2920,7 +2920,7 @@ Read every counter twice 10 s apart; PresentMon on `dwm.exe` alongside. Knobs: s
 bucket 4 (4.2 to 8.4 ms); `VbUsed` 113 of 227 ticks; `IfStall8` 113 a second. Row B (`FlipAnnounce` 2): 225 a second, p50 4.04 / p99 4.72 ms, until-displayed p50
 3.80 ms; `FlipLat` in bucket 3; `VbUsed` 244 of 248; `FaDdi` 243, `FaWorker` 241, `FaRefuse` 0, `FaLate` 0; viewer overlay 238 fps, no artifacts. That
 confirms the chain of 15.18.15.1 (two ticks to one) and step 3 (`FlipInDpc`). `FlipAnnounce` 2 is therefore the DEFAULT now (`flip_retire::DEFAULT_KNOB`; the
-service value 0 turns it off), for the Venus class only (`FlipAnnForeign`, below).
+service value 0 turns it off), for the Venus class only (`FlipAnnForeign`, below; the foreign class too by default with `ForeignFlip` on since 15.18.16.6).
 Both rows show one 29 ms `FlipMaxUs` at `HpdSite` 19 (`REFRESH_POST`): the registry mirror running on the flip worker. Two corrections follow.
 
 * **The mirror was on the flip worker.** `stall_diag::publish_counters` (stall block, `Vs*`, device-lost block, `FlipLat*`, `Fa*`: the 332 estimate of "about 55 writes a second"
@@ -2991,7 +2991,7 @@ the host still shows, because a buffer is not released until a flip that replace
 must not exceed the window + 1; at 2 and a 3-deep chain a value of 3 means every buffer was host-pinned at once. `FlipBusyFly` 1 (the tester's experiment) lets the announce run with one host flip in flight: it removes the stall of the announce behind a slow host flip and costs a tear exposure of one more host round trip;
 `FaNoBusy` against `FfFrames` is the trade.
 
-**Knobs added in this series** (service key, REG_DWORD, read at StartDevice unless noted): `FlipAnnForeign` (default 0; the name is 14 characters, the lookup buffer's limit: a longer name would read as its default for ever), `FlipBusyFly` (default 0, at most 4, per transport generation),
+**Knobs added in this series** (service key, REG_DWORD, read at StartDevice unless noted): `FlipAnnForeign` (default 0 in 333, 1 with `ForeignFlip` on since 15.18.16.6; the name is 14 characters, the lookup buffer's limit: a longer name would read as its default for ever), `FlipBusyFly` (default 0, at most 4, per transport generation),
 `FfAsyncWin` (default 2 with `FlipAnnounce` on, else 0), `FlipAnnounce` default 2. **Counters added:** `FfRttB0..7`, `FfDropped`, `FfCoal`, `FfPinPeak`, `FaNoFgn`, `MirReqs` / `MirRuns` / `MirLastUs` / `MirMaxUs`, `HpdMx00..31`.
 `HELIOS_REQUIRE_NAME_SCAN=1` (an environment variable of the HOST test run, not a registry value): the two name-scan tests of `kmd_logic/src/flip_retire.rs` fail instead of skipping when `kmd_render` is not a sibling directory of `kmd_logic`; the pre-push scripts copy both and set it.
 
@@ -3059,6 +3059,12 @@ With `FlipAnnounce` 0 and `FlipEarlyWake` 0 the flip path is the old one: one re
 * **No registry write per flip.** `VpDSt` goes through `diag::record_named_changed`.
 * **Without the thread** (`MirrorThread` 0, or it failed to start) the worker no longer writes the dump or the `Nv*` mirror between two flips: they wait for a worker with no flip in its hands (`flip_announce::worker_idle` false: a pending slot, the programming gate, a host flip owed or flying), for 10 s at most (`hpd_wake::dump_gate`, host-tested; `HpdDumpDef` counts the deferrals).
 * **Which steps still exceed 4 ms.** `HpdOv4N` (steps of the worker over 4 ms, one 240 Hz period) and `HpdOv4Mask` (bit = `site` id of every step that had one: bit 11 `Nv*`, 12 dump, 18 `VpDSt`, 19 pacing, 7 / 16 programming, 10 `ForeignFlip`), with `HpdMx00..31` for the size; on the next run a mask of `0x...0400` (site 10) or `0x...0080` is the programming and the host flip, not the registry.
+
+###### 15.18.16.6 `FlipAnnForeign` defaults to 1 with `ForeignFlip` on
+
+333.1 hardware (NVK DWM, `ForeignFlip` 1, `FfAsyncWin` 2, 5120x1440@240): `FlipAnnForeign` 1 (r2) 237 presents a second, PresentMon p50 4.05 / p99 4.69 ms, until-displayed p50 3.73 / p99 4.32, `FfProg` 250 / `FfFrames` 242 a second, `FlipLat` all in buckets 2 and 3, `IfStall8` 0, `FaDdi` 214 and `FaNoBusy` 16 a second; `FlipAnnForeign` 0 (r1) 227 a second, p99 8.01 ms, max 783 ms, `FfRttB` d `[2332,77,0,1,0,6,0,0]`. `FfAsyncWin` 0 (r4: the synchronous host flip) gave `FfFrames` 162 and `FaNoBusy` 116 a second: the async window is what carries it. So the default is now `flip_retire::ann_foreign_default`: 1 when the `ForeignFlip` knob is non-zero, else 0; an explicit `FlipAnnForeign` value, 0 included, wins (`FaKnob` bit 16 mirrors what is in force). The knob stays: `FlipAnnForeign` 0 is the setting without the exposure below.
+
+**The tear exposure, stated.** With the foreign class announced the DDI publishes the flip's address at issue, so the next tick retires it whatever the host is doing, and dxgkrnl may hand the PREVIOUS buffer back to DWM at that retire. The host is still showing that buffer until the worker's host flip of the new picture is done. When that flip takes longer than the time to the retiring tick (one period at most, `FlipHostLat*` buckets above 3, `FfRttB4..7`), DWM can draw into a buffer the viewer is still reading: a tear or a glitch of that length, for that frame. What bounds it: an announce is made only when `foreign_flip::busy()` says nothing is owed or flying (`FaNoBusy` counts the declines: 16 a second in r2, those flips retire the normal way), `FlipBusyFly` stays 0 (r3, `FlipBusyFly` 1, gave 235 a second, p99 5.77 ms, max 313 ms and `FaNoBusy` 26: no better and a wider window), and `FfPinPeak` must not exceed the window + 1. r2 is clean in the numbers; the tester's visual verdict on tearing is pending. If tearing shows, `FlipAnnForeign` 0 in the service key and `pnputil /restart-device` restores the retire-after-programming behaviour (r1 numbers).
 
 ###### 15.18.16.5 Checklist for the next run
 

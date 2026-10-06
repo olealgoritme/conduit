@@ -81,8 +81,17 @@ pub(crate) fn configured_mode() -> AnnounceMode {
 pub(crate) fn start_generation() {
     let mode = configured_mode();
     let early = crate::diag::read_config_dword(crate::diag::knobs::FLIP_EARLY_WAKE, 0);
+    // `FlipAnnForeign`: default 1 with `ForeignFlip` on, else 0; an explicit value, 0 included,
+    // wins (`flip_retire::ann_foreign_default`).
+    let foreign_default = fr::ann_foreign_default(crate::diag::read_config_dword(
+        crate::diag::knobs::FOREIGN_FLIP,
+        0,
+    ));
     FOREIGN_OK.store(
-        u32::from(crate::diag::read_config_dword(crate::diag::knobs::FLIP_ANN_FOREIGN, 0) != 0),
+        u32::from(
+            crate::diag::read_config_dword(crate::diag::knobs::FLIP_ANN_FOREIGN, foreign_default)
+                != 0,
+        ),
         Ordering::Relaxed,
     );
     MODE.store(mode.code(), Ordering::Relaxed);
