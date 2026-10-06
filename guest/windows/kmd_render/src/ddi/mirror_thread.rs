@@ -43,6 +43,10 @@ static STOP: Ev = Ev(UnsafeCell::new(unsafe { core::mem::zeroed() }));
 static EXITED: Ev = Ev(UnsafeCell::new(unsafe { core::mem::zeroed() }));
 
 static THREAD: AtomicUsize = AtomicUsize::new(0);
+/// The thread did not end within the join timeout: it may still wait on the events below, so they
+/// must never be initialised again (the HPD worker's `hpd_worker_leaked`). Set by [`stop`],
+/// refuses [`start`] for the rest of the image's life. `MirLeak` mirrors it.
+static LEAKED: AtomicU32 = AtomicU32::new(0);
 static STOPPING: AtomicU32 = AtomicU32::new(0);
 static WANTED: AtomicU32 = AtomicU32::new(0);
 /// Passes published by the thread (`MirRuns`), requests (`MirReqs`), the longest pass in
@@ -79,6 +83,24 @@ pub(crate) unsafe fn start() {
     if THREAD.load(Ordering::Acquire) != 0 {
         return;
     }
+    // Kill switch: `MirrorThread` 0 leaves `running()` false, so every caller publishes inline on
+    // the worker as before this thread existed. Read at every StartDevice, mirrored as `MirThrEff`.
+    let want = crate::diag::read_config_dword(crate::diag::knobs::MIRROR_THREAD, 1) != 0;
+    if LEAKED.load(Ordering::Acquire) != 0 {
+        // A thread of an earlier start may still wait on these events: initialising them again
+        // would corrupt the dispatcher objects it is queued on. Inline publishing from now on.
+        crate::diag::record_named_bytes(b"MirThrEff", 0);
+        crate::diag::record_named_bytes(b"MirLeak", 1);
+        return;
+    }
+    crate::diag::record_named_bytes(b"MirThrEff", u32::from(want));
+    if !want {
+        return;
+    }
+    for c in [&REQS, &RUNS, &MAX_US, &LAST_US] {
+        c.store(0, Ordering::Relaxed);
+    }
+    crate::diag::record_named_bytes(b"MirLeak", 0);
     STOPPING.store(0, Ordering::Release);
     WANTED.store(0, Ordering::Release);
     // SAFETY: no thread uses the events now (none exists); PASSIVE.
@@ -123,7 +145,8 @@ pub(crate) fn stop() {
     let mut timeout: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
     timeout.QuadPart = JOIN_TIMEOUT_100NS;
     // SAFETY: the exited latch is a NotificationEvent set by the thread just before it ends.
-    let _ = unsafe { KeWaitForSingleObject(EXITED.0.get() as PVOID, 0, 0, 0, &mut timeout) };
+    let exited = unsafe { KeWaitForSingleObject(EXITED.0.get() as PVOID, 0, 0, 0, &mut timeout) };
+    let mut joined = exited == STATUS_SUCCESS;
     const SYNCHRONIZE: u32 = 0x0010_0000;
     let mut obj: PVOID = core::ptr::null_mut();
     // SAFETY: `h` is the live handle `start` created; PsThreadType validates it.
@@ -141,8 +164,14 @@ pub(crate) fn stop() {
         let mut timeout: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
         timeout.QuadPart = JOIN_TIMEOUT_100NS;
         // SAFETY: waiting on the ETHREAD at PASSIVE_LEVEL, then releasing our reference.
-        let _ = unsafe { KeWaitForSingleObject(obj, 0, 0, 0, &mut timeout) };
+        let wait = unsafe { KeWaitForSingleObject(obj, 0, 0, 0, &mut timeout) };
         unsafe { wdk_sys::ntddk::ObfDereferenceObject(obj) };
+        joined = wait == STATUS_SUCCESS;
+    }
+    if !joined {
+        // Trade a hang for a live thread: counted (`MirLeak`), and `start` refuses to run again.
+        LEAKED.store(1, Ordering::Release);
+        crate::diag::record_named_bytes(b"MirLeak", 1);
     }
     // SAFETY: closing the handle we created.
     let _ = unsafe { wdk_sys::ntddk::ZwClose(h as wdk_sys::HANDLE) };
