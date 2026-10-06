@@ -21,6 +21,12 @@
 #include <atomic>
 #include <cstdint>
 
+// umd_common's log writer (log.rs `helios_umd_log_raw`): one complete line,
+// written to the module's log file, or for a process that may not create it
+// (a browser's sandboxed GPU process) to C:\ProgramData\Helios\sandbox or the
+// debugger output. A bridge's umd_log falls back to it.
+extern "C" void helios_umd_log_raw(const char* line);
+
 namespace helios_bridge {
 
 /// Append one line to the module's own per-process log, prefixed with the

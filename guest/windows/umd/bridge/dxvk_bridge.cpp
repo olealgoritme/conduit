@@ -245,6 +245,11 @@ namespace helios_bridge {
     if (f) {
       fprintf(f, "[dxvk-bridge] %s\n", msg);
       fclose(f);
+    } else {
+      // Not ours to create (sandboxed process): umd_common's fallbacks.
+      char line[1100];
+      _snprintf_s(line, sizeof(line), _TRUNCATE, "[dxvk-bridge] %s", msg);
+      helios_umd_log_raw(line);
     }
   }
 

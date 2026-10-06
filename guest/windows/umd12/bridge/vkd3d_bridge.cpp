@@ -260,6 +260,11 @@ void umd_log(const char* msg) {
   if (f) {
     fprintf(f, "[vkd3d-bridge] %s\n", msg);
     fclose(f);
+  } else {
+    // Not ours to create (sandboxed process): umd_common's fallbacks.
+    char line[1100];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[vkd3d-bridge] %s", msg);
+    helios_umd_log_raw(line);
   }
 }
 
