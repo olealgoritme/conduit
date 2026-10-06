@@ -57,6 +57,14 @@ helios_kmdmap_c_unregister_owner(uint64_t owner)
    helios_kmdmap_unregister_owner(owner);
 }
 
+/* The process's loss epoch now (moves whenever the KMD went away). */
+int32_t
+helios_kmdmap_c_epoch(void)
+{
+   struct helios_kmdmap_table *t = helios_kmdmap_table_get();
+   return t ? (int32_t)InterlockedCompareExchange(&t->epoch, 0, 0) : 0;
+}
+
 bool
 helios_kmdmap_c_lost(int32_t epoch)
 {

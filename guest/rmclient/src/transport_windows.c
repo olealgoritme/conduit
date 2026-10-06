@@ -78,9 +78,10 @@ typedef LONG NTSTATUS, *PNTSTATUS;
  * and the Helios UMD use for the same problem (see there): every view is
  * registered, a vanished one is backed with zero pages, and the process's
  * loss epoch moves, which NVK reads through crm_win_loss_epoch(). After a
- * loss this library sends no escape any more (the device handles are dead,
- * and fd numbers of the dead generation could alias a later one's): a
- * process needs restarting to get the GPU back through RM. */
+ * loss this library sends no escape with the dead generation's handles; the
+ * next open starts a new generation on the KMD that came back
+ * (generation_restart), so a long-lived process gets the GPU back through RM
+ * without restarting. */
 static void crm_kmdmap_log(const char *fmt, ...)
 {
     FILE *f = fopen("C:\\ProgramData\\Helios\\helios_icd_diag.log", "a");
@@ -149,6 +150,7 @@ struct win_ctx {
         void *base;       /* the start of the KMD's view (registered for loss) */
         int fd;           /* the channel kept for this mapping */
         uint32_t id;      /* the KMD/host mapping id */
+        uint32_t gen;     /* the generation that made it */
     } *maps;
     uint32_t n_maps, cap_maps;
 
@@ -175,6 +177,17 @@ struct win_ctx {
     /* The SCANOUT_RELEASED registration (kind 3, handle 0), made on first use
      * by crm_win_scanout_wait_released: an auto-reset event, under `lock`. */
     HANDLE release_ev;
+
+    /* Generations (see generation_restart): 1 from the first init, +1 each
+     * time the KMD came back after a loss and the library reopened it. */
+    uint32_t generation;
+    /* Channels opened in this generation (win_open, crm_win_open_device) and
+     * channels of earlier generations still open in some caller: the latter
+     * are refused without an escape and only forgotten at their close. */
+    int *live_fds;
+    uint32_t n_live, cap_live;
+    int *stale_fds;
+    uint32_t n_stale, cap_stale;
 };
 
 static struct win_ctx g_ctx = { .lock = SRWLOCK_INIT, .ctl_handle = -1 };
@@ -578,10 +591,119 @@ static void read_host_tables(struct win_ctx *c)
     free(resp);
 }
 
+/* ---- generations: the KMD came back after a loss ------------------------ */
+
+static int fd_list_add(int **list, uint32_t *n, uint32_t *cap, int fd)
+{
+    if (*n == *cap) {
+        const uint32_t ncap = *cap ? *cap * 2 : 16;
+        int *nl = realloc(*list, (size_t)ncap * sizeof(int));
+        if (!nl)
+            return -ENOMEM;
+        *list = nl;
+        *cap = ncap;
+    }
+    (*list)[(*n)++] = fd;
+    return 0;
+}
+
+static int fd_list_remove(int *list, uint32_t *n, int fd)
+{
+    for (uint32_t i = 0; i < *n; i++) {
+        if (list[i] == fd) {
+            list[i] = list[--*n];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void fd_track(struct win_ctx *c, int fd)
+{
+    AcquireSRWLockExclusive(&c->lock);
+    (void)fd_list_add(&c->live_fds, &c->n_live, &c->cap_live, fd);
+    ReleaseSRWLockExclusive(&c->lock);
+}
+
+/* Is `fd` a channel of an earlier generation? Those are dead on the host
+ * (the device reset closed every file) and must not reach the new KMD. */
+static int fd_stale(struct win_ctx *c, int fd)
+{
+    if (c->n_stale == 0) /* the common case, no lock */
+        return 0;
+    int r = 0;
+    AcquireSRWLockShared(&c->lock);
+    for (uint32_t i = 0; i < c->n_stale; i++) {
+        if (c->stale_fds[i] == fd) {
+            r = 1;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&c->lock);
+    return r;
+}
+
+/*
+ * The KMD went away under this process (a live driver update, a device
+ * restart) and the library was lost (helios_kmdmap.h). A process used to stay
+ * lost for good, so a long-lived process (explorer, the shell hosts, DWM)
+ * fell back to Venus at its next device creation and stayed there. Now the
+ * next open after a loss starts a new generation: the old generation's KMD
+ * objects are released, its channels become stale (refused without an escape,
+ * forgotten at their close; the host closed them at its reset, which freed
+ * every RM object made on them, and the host never reuses a handle number
+ * across a reset), its CPU views stay in the loss table (zero pages for
+ * whoever still holds a pointer) and are only dropped from it at their unmap,
+ * and the adapter is opened again. NVK devices created before the loss stay
+ * lost (their loss epoch moved); devices created afterwards use the new
+ * generation. Called with c->lock held exclusively and c->ready set.
+ */
+static void generation_restart(struct win_ctx *c)
+{
+    const uint32_t old_gen = c->generation;
+    const int32_t epoch =
+        helios_kmdmap_t ? (int32_t)InterlockedCompareExchange(&helios_kmdmap_t->epoch, 0, 0) : 0;
+
+    /* Channel events: the KMD that held the registrations is gone. */
+    for (uint32_t i = 0; i < c->n_evs; i++)
+        CloseHandle(c->evs[i].ev);
+    c->n_evs = 0;
+    if (c->release_ev) {
+        CloseHandle(c->release_ev);
+        c->release_ev = NULL;
+    }
+    /* Channels parked for their RM_UNMAP_MEMORY and every live channel: stale. */
+    for (uint32_t i = 0; i < c->n_pend; i++)
+        (void)fd_list_remove(c->live_fds, &c->n_live, c->pend[i].fd);
+    c->n_pend = 0;
+    const uint32_t moved = c->n_live;
+    for (uint32_t i = 0; i < c->n_live; i++)
+        (void)fd_list_add(&c->stale_fds, &c->n_stale, &c->cap_stale, c->live_fds[i]);
+    c->n_live = 0;
+    c->ctl_handle = -1;
+    /* The dead device's D3DKMT objects (dxgkrnl keeps their user handles valid
+     * until they are closed). */
+    close_handles(c, c->adapter, c->device, c->context);
+    c->adapter = c->device = c->context = 0;
+    free(c->alloc_pairs);
+    c->alloc_pairs = NULL;
+    c->n_alloc = 0;
+    c->foreign_ops = 0;
+    c->loss_epoch0 = epoch;
+    c->ready = 0;
+    c->generation = old_gen + 1;
+    crm_kmdmap_log("generation %u -> %u: the KMD came back after a loss (loss epoch %d); "
+                   "%u channel(s) of generation %u are stale, %u CPU view(s) kept in the "
+                   "loss table until their unmap",
+                   old_gen, c->generation, (int)epoch, moved, old_gen, c->n_maps);
+}
+
 static int win_init(struct win_ctx *c)
 {
     AcquireSRWLockExclusive(&c->lock);
     int r = 0;
+    if (c->ready && win_lost(c))
+        generation_restart(c);
     /* A failed init is NOT latched: the adapter or the KMD may simply not be up
      * yet on the first crm_open, and the next one should get another try. */
     if (!c->ready) {
@@ -590,6 +712,8 @@ static int win_init(struct win_ctx *c)
             r = find_adapter(c);
         if (r == 0) {
             c->ready = 1;
+            if (c->generation == 0)
+                c->generation = 1;
             if (!c->kmdmap_attached) {
                 c->loss_epoch0 = helios_kmdmap_attach();
                 c->kmdmap_attached = 1;
@@ -611,9 +735,8 @@ static int reply_status(const uint8_t *resp, uint32_t n)
     return n >= CRM_WIRE_HDR ? (int32_t)crm_get32(resp + 8) : -EIO;
 }
 
-static int win_open(void *vctx, int32_t node, int *fd)
+static int win_open_once(struct win_ctx *c, int32_t node, int *fd)
 {
-    struct win_ctx *c = vctx;
     *fd = -1;
     int r = win_init(c);
     if (r)
@@ -641,7 +764,24 @@ static int win_open(void *vctx, int32_t node, int *fd)
         c->ctl_handle = (int)handle;
         ReleaseSRWLockExclusive(&c->lock);
     }
+    fd_track(c, *fd);
     return 0;
+}
+
+/* The first escape after the KMD went away fails with "device gone" and marks
+ * the process lost; one retry then runs on a new generation (win_init). */
+static int retry_after_loss(struct win_ctx *c, int r)
+{
+    return r != 0 && c->kmdmap_attached && win_lost(c);
+}
+
+static int win_open(void *vctx, int32_t node, int *fd)
+{
+    struct win_ctx *c = vctx;
+    int r = win_open_once(c, node, fd);
+    if (retry_after_loss(c, r))
+        r = win_open_once(c, node, fd);
+    return r;
 }
 
 static void win_close_one(struct win_ctx *c, int fd);
@@ -719,6 +859,13 @@ static void ev_drop(struct win_ctx *c, int fd)
 
 static void win_close_one(struct win_ctx *c, int fd)
 {
+    AcquireSRWLockExclusive(&c->lock);
+    const int stale = fd_list_remove(c->stale_fds, &c->n_stale, fd);
+    if (!stale)
+        (void)fd_list_remove(c->live_fds, &c->n_live, fd);
+    ReleaseSRWLockExclusive(&c->lock);
+    if (stale)
+        return; /* closed on the host at its reset; nothing to send */
     ev_drop(c, fd);
     uint8_t req[CRM_WIRE_HDR];
     uint8_t resp[CRM_WIRE_HDR + REPLY_SLACK];
@@ -744,6 +891,8 @@ static int ioctl_wire_cmd(struct win_ctx *c, int fd, uint32_t cmd, void *arg, ui
 {
     if (fd < 0)
         return -EBADF;
+    if (fd_stale(c, fd))
+        return -ENODEV;
     if (size > CRM_WIRE_BLOCK_MAX || nested_len > CRM_WIRE_BLOCK_MAX)
         return -EINVAL;
 
@@ -1013,7 +1162,8 @@ static int map_table_add(struct win_ctx *c, void *ptr, void *base, int fd, uint3
         }
     }
     if (r == 0)
-        c->maps[c->n_maps++] = (struct win_map){ .ptr = ptr, .base = base, .fd = fd, .id = id };
+        c->maps[c->n_maps++] =
+            (struct win_map){ .ptr = ptr, .base = base, .fd = fd, .id = id, .gen = c->generation };
     ReleaseSRWLockExclusive(&c->lock);
     return r;
 }
@@ -1041,7 +1191,7 @@ static int win_map_memory(void *vctx, int ctl_fd, const struct crm_map_request *
     struct win_ctx *c = vctx;
     *cpu_ptr = NULL;
     *cookie = 0;
-    if (!c->ready)
+    if (!c->ready || fd_stale(c, ctl_fd))
         return -ENODEV;
 
     const uint64_t pm = 4096 - 1;
@@ -1135,6 +1285,13 @@ static int win_unmap_memory(void *vctx, int ctl_fd, const struct crm_map_request
     struct win_map m;
     if (map_table_take(c, cpu_ptr, &m) != 0)
         return -ENOENT;
+    if (m.gen != c->generation) {
+        /* A view of an earlier generation: the KMD and host that made it are
+         * gone (the KMD unmapped it, the host reset freed it); only its zero
+         * backing in the loss table is left to release. */
+        helios_kmdmap_unregister(m.base);
+        return 0;
+    }
     /* The view goes first, then the host's mapping. The channel RM armed the
      * mapping on stays open until the library's NV_ESC_RM_UNMAP_MEMORY (win_ioctl
      * closes it then), or until the control channel closes. Out of the loss
@@ -1196,6 +1353,8 @@ static int win_event_wait(void *vctx, int fd, uint32_t timeout_ms)
     struct win_ctx *c = vctx;
     if (fd < 0)
         return -EBADF;
+    if (fd_stale(c, fd))
+        return -ENODEV;
     HANDLE ev = NULL;
     int r = ev_get(c, fd, &ev);
     if (r)
@@ -1244,9 +1403,8 @@ static void win_free_pages(void *ctx, void *ptr, uint64_t size)
 
 /* ---- extras: DRM node, raw ioctl, ScanoutFlip (rmclient_transport.h) ----- */
 
-int crm_win_open_device(uint32_t device_type, int *fd)
+static int open_device_once(struct win_ctx *c, uint32_t device_type, int *fd)
 {
-    struct win_ctx *c = &g_ctx;
     *fd = -1;
     int r = win_init(c);
     if (r)
@@ -1265,7 +1423,17 @@ int crm_win_open_device(uint32_t device_type, int *fd)
     if (handle == 0 || handle > 0x7fffffffu)
         return -EIO;
     *fd = (int)handle;
+    fd_track(c, *fd);
     return 0;
+}
+
+int crm_win_open_device(uint32_t device_type, int *fd)
+{
+    struct win_ctx *c = &g_ctx;
+    int r = open_device_once(c, device_type, fd);
+    if (retry_after_loss(c, r))
+        r = open_device_once(c, device_type, fd);
+    return r;
 }
 
 void crm_win_close_device(int fd)
@@ -1323,6 +1491,8 @@ static int scanout_op_ready(struct win_ctx *c, uint32_t op)
 int crm_win_scanout_set(struct crm_scanout_source *src)
 {
     struct win_ctx *c = &g_ctx;
+    if (fd_stale(c, (int)src->handle))
+        return -ENODEV;
     int r = scanout_op_ready(c, HELIOS_NVRM_OP_SCANOUT_SET);
     if (r)
         return r;
@@ -1352,6 +1522,8 @@ int crm_win_scanout_set(struct crm_scanout_source *src)
 int crm_win_scanout_present(uint32_t handle, uint32_t gem, uint64_t *seq)
 {
     struct win_ctx *c = &g_ctx;
+    if (fd_stale(c, (int)handle))
+        return -ENODEV;
     int r = scanout_op_ready(c, HELIOS_NVRM_OP_SCANOUT_PRESENT);
     if (r)
         return r;
@@ -1373,6 +1545,8 @@ int crm_win_scanout_present(uint32_t handle, uint32_t gem, uint64_t *seq)
 int crm_win_scanout_release(uint32_t handle)
 {
     struct win_ctx *c = &g_ctx;
+    if (fd_stale(c, (int)handle))
+        return -ENODEV;
     int r = scanout_op_ready(c, HELIOS_NVRM_OP_SCANOUT_RELEASE);
     if (r)
         return r;
@@ -1481,6 +1655,8 @@ int crm_win_fence_wait(int fence, uint32_t timeout_ms)
 int crm_win_scanout_present_fenced(uint32_t handle, uint32_t gem, int fence, uint64_t *seq)
 {
     struct win_ctx *c = &g_ctx;
+    if (fd_stale(c, (int)handle))
+        return -ENODEV;
     int r = scanout_op_ready(c, HELIOS_NVRM_OP_SCANOUT_PRESENT);
     if (r)
         return r;
@@ -1519,6 +1695,8 @@ int crm_win_scanout_present_fenced(uint32_t handle, uint32_t gem, int fence, uin
 int crm_win_scanout_status(uint32_t handle, uint64_t *released_seq, uint64_t *last_seq)
 {
     struct win_ctx *c = &g_ctx;
+    if (fd_stale(c, (int)handle))
+        return -ENODEV;
     if (!c->ready)
         return -ENODEV;
     if (!(c->supported_ops & HELIOS_NVRM_CAP_SCANOUT_RELEASE) ||
