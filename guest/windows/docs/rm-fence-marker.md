@@ -312,7 +312,8 @@ free for capabilities:
 |---|---|---|
 | 32 | `HELIOS_NVRM_CAP_SCANOUT_FENCE` | the event queue is up, the host advertises `NVGPU_CFG_DRM_FENCES` (features bit 11) and the scanout ops exist |
 | 33 | `HELIOS_NVRM_CAP_PRESENT_FENCE` | the same, and the WDDM carriers are compiled in |
-| 34 | `HELIOS_NVRM_CAP_SCANOUT_RELEASE` | the host's `NVGPU_F_SCANOUT_RELEASE` was acked (display half on, event queue up): `SCANOUT_STATUS` (op bit 12) and the `SCANOUT_RELEASED` event kind exist (`foreign-scanout.md`) |
+| 34 | `HELIOS_NVRM_CAP_FLUSH_GATE` | the flush gate (`HEFL`) honours its RM fence variant, under the same preconditions as bit 33 (`flush-gate.md`) |
+| 35 | `HELIOS_NVRM_CAP_SCANOUT_RELEASE` | the host's `NVGPU_F_SCANOUT_RELEASE` was acked (display half on, event queue up): `SCANOUT_STATUS` (op bit 12) and the `SCANOUT_RELEASED` event kind exist (`foreign-scanout.md`) |
 
 ## Statuses
 
