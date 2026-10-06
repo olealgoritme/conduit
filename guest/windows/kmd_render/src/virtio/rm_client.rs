@@ -82,7 +82,7 @@ static CLIENT: SpinLock<Client> = SpinLock::new(Client::new());
 
 /// `KNOB_LEVEL` before the knob has been read for this transport generation.
 const KNOB_UNREAD: u32 = u32::MAX;
-/// The `KmdRmClient` knob (0, 1, 2 or 3), or [`KNOB_UNREAD`]: read once per transport
+/// The `KmdRmClient` knob (0 to 4), or [`KNOB_UNREAD`]: read once per transport
 /// generation (so `reg add` + `pnputil /restart-device` applies it), by resetting it to
 /// unread in [`forget`], which `retire_transport` runs for every transport it drops.
 /// With the knob at 0 (the default) [`service`] is this one atomic load and nothing
@@ -161,6 +161,7 @@ pub(crate) fn publish_counters() {
     rec(b"RmSoft", RM_SOFT.load(Ordering::Relaxed));
     rec(b"RmRegFd", RM_REGFD_REFUSED.load(Ordering::Relaxed));
     rec(b"RmLeaseTmo", RM_LEASE_TIMEOUTS.load(Ordering::Relaxed));
+    super::rm_foreign::publish_counters();
     rm_present::publish_counters();
 }
 
@@ -193,7 +194,7 @@ fn knob_level() -> u32 {
 /// per transport generation that needs it.
 #[inline(never)]
 fn read_knob() -> u32 {
-    let v = crate::diag::read_config_dword(crate::diag::knobs::KMD_RM_CLIENT, 0).min(3);
+    let v = crate::diag::read_config_dword(crate::diag::knobs::KMD_RM_CLIENT, 0).min(4);
     KNOB_LEVEL.store(v, Ordering::Relaxed);
     // Nothing is written for the default (off): the registry stays as it was.
     if v != 0 {
@@ -354,6 +355,9 @@ fn apply(epoch: u64, step: Step, result: Result<Out, Fail>, before: &Client) -> 
         Step::KernelMap if g.view().is_some() => {
             RM_VIEWS.fetch_add(1, Ordering::Relaxed);
         }
+        Step::ForeignImport if g.foreign() != 0 => {
+            super::rm_foreign::RM_FG_IMPORTED.fetch_add(1, Ordering::Relaxed);
+        }
         Step::ScanoutPresent if g.probe() == rc::Probe::Shown => {
             RM_PROBES.fetch_add(1, Ordering::Relaxed);
         }
@@ -380,6 +384,10 @@ fn cleanup(io: &Io<'_>) {
     };
     wait_for_lease(io.passive);
     unmap_views(&views);
+    // The foreign resources it made (level 4) are Venus blobs owned by the KMD's own
+    // owner: reclaim them before their DRM file goes (the host import holds its own
+    // dma-buf reference, so the order is only tidiness).
+    super::rm_foreign::release_all(io.passive, io.adapter);
     for &h in handles.as_slice() {
         // Bounded like the step loop: once StopDevice asks, or the transport has
         // failed, stop sending. The handles are still in the NVRM tables, and the
@@ -743,6 +751,12 @@ impl Io<'_> {
 
             // Pure moves between the ring's slots: nothing to ask the host.
             Step::Park | Step::Unpark => Ok(Out::Unit),
+
+            // Level 4: the surface as a foreign (Venus) resource under the KMD's owner.
+            Step::ForeignImport => super::rm_foreign::import_surface(self.passive, self.adapter, c),
+            Step::ForeignRelease => {
+                super::rm_foreign::release_surface(self.passive, self.adapter, c.foreign())
+            }
         }
     }
 

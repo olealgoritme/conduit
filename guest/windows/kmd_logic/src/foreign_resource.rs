@@ -2191,4 +2191,42 @@ mod tests {
         assert!(l.min_bytes() <= size);
         l
     }
+
+    /// The KMD's own owner token (`DeviceOwner::KMD_RM`, `usize::MAX` widened) is just an
+    /// owner to the table: quota per owner, adoption frees it, the record stays.
+    #[test]
+    fn a_resource_the_kmd_created_is_adopted_like_any_creators() {
+        const KMD: u64 = u64::MAX;
+        let mut t = small();
+        let r = t.reserve(KMD, 8 * MIB).unwrap();
+        t.commit(r, 50, 7, 3, 9, lay()).unwrap();
+        assert_eq!(t.owner_live(KMD), 1);
+        assert_eq!(t.owner_live(1), 0, "a user device's count is not the KMD's");
+        assert_eq!(t.get(50).unwrap().creator, Some(KMD));
+        // The glue proves the holder context and the KMD-owned slot, then the table adopts.
+        assert_eq!(
+            adopt(&mut t, &req()),
+            Ok(AdoptPlan::Foreign(Adopted {
+                size: 8 * MIB,
+                layout: lay()
+            }))
+        );
+        assert_eq!(t.owner_live(KMD), 0);
+        assert_eq!(t.owner_bytes(KMD), 0);
+        assert_eq!(t.layout(50), Some(lay()));
+        // Without the proofs it is refused and nothing moves.
+        let mut t = small();
+        let r = t.reserve(KMD, 8 * MIB).unwrap();
+        t.commit(r, 50, 7, 3, 9, lay()).unwrap();
+        assert!(t.adopt_for_allocation(50, &req(), false, true).is_err());
+        assert!(t.adopt_for_allocation(50, &req(), true, false).is_err());
+        assert_eq!(t.owner_live(KMD), 1);
+        // The KMD's quota is its own: filling it does not touch a device's.
+        let per_owner = t.limits().per_owner;
+        let mut t = small();
+        for _ in 0..per_owner {
+            assert!(t.reserve(KMD, MIB).is_ok());
+        }
+        assert!(t.reserve(KMD, MIB).is_err());
+    }
 }

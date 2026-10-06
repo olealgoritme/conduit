@@ -1,8 +1,8 @@
 # The KMD's own RM client (slice 1)
 
 Status: slice 1 written on `kmd/rm-client` against `044b242` (KMD 22.22.309); slice 2
-(sections 12 and 13: the decision on CPU access, the source priority stack, the level 3 ring and
-presenter) on `kmd/rm-client-s2` against `bd5bef6`. **Never built, never run**: the KMD cannot
+(sections 12 to 14: the decision on CPU access, the source priority stack, the level 3 ring and
+presenter, the KMD as the creator of foreign resources) on `kmd/rm-client-s2` against `bd5bef6`. **Never built, never run**: the KMD cannot
 be compiled where this was written. The pure logic is host-tested
 (`cargo test` in `guest/windows/kmd_logic`, 38 tests in `rm_client`); the I/O file was
 type-checked against a shim that copies the signatures of the code it calls, and read by
@@ -40,8 +40,9 @@ one atomic load per HPD worker pass (no lock) and one registry read of the knob 
 | 1 | client + surface + GEM import. Invisible: nothing is flipped |
 | 2 | 1, plus the kernel view of the surface, the test picture, one flip |
 | 3 | (slice 2, section 13) a ring of two surfaces with their views, and the composited desktop shown through it by the presenter, with Venus as the fallback |
+| 4 | (section 14) 3, plus each ring surface imported as a foreign resource under the KMD's own owner (the resid a WDDM allocation adopts) |
 
-Values above 3 count as 3. The knob is read once per transport generation (so `reg add` +
+Values above 4 count as 4. The knob is read once per transport generation (so `reg add` +
 `pnputil /restart-device` applies it): one atomic holds the level, `u32::MAX` meaning unread, and
 `retire_transport` (through `forget`) resets it to unread. At level 0 `service` returns on that one
 load, before it asks for the virtio lock.
@@ -522,8 +523,7 @@ the existing segment**, and a WDDM allocation backed by one would have no usable
 ## 13. Slice 2 as built: the source priority stack, the ring and the presenter (`KmdRmClient` = 3)
 
 Pure logic: `kmd_logic/src/foreign_scanout.rs` (resident source), `rm_client.rs` (ring slots),
-`rm_present.rs` (source eligibility, copy plan, ring, presenter); 495 host tests in the crate, 46 of
-them new, including a co-simulation of the presenter against the real arbiter. I/O:
+`rm_present.rs` (source eligibility, copy plan, ring, presenter); 568 host tests in the crate (about 70 of them this slice's), including a co-simulation of the presenter against the real arbiter. I/O:
 `kmd_render/src/virtio/rm_present.rs` and the hooks in `adapter/foreign_scanout.rs` and
 `virtio/rm_client.rs`. The I/O half was type-checked against a shim of the signatures it calls and
 read by hand, as slice 1 was; **it has not been built**.
@@ -544,7 +544,8 @@ exists, and it is not the fast path (12.4 item 4).
 | 0 (default) | nothing |
 | 1 | client + one surface + GEM import. Invisible |
 | 2 | 1, plus the kernel view, the test picture, one flip for four seconds |
-| 3 | the **ring**: two surfaces, each with its kernel view and GEM; no probe; the presenter shows the desktop through it. Values above 3 count as 3 |
+| 3 | the **ring**: two surfaces, each with its kernel view and GEM; no probe; the presenter shows the desktop through it |
+| 4 | 3, and each surface also a foreign resource (section 14). Values above 4 count as 4 |
 
 ### 13.2 Who owns scanout 0: the source stack
 
@@ -666,7 +667,7 @@ source's ends are counted in `RmResEnd`, not `FsEnd`.
 
 ### 13.7 Verified here, and not
 
-Verified on the host (495 tests in `kmd_logic`): the resident source's every transition (foreground,
+Verified on the host (568 tests in `kmd_logic`): the resident source's every transition (foreground,
 preempt, every way a user source ends, the resident one's own ends, parked-file closure, withdraw,
 re-registration keeping the generation, a resume cancelled by another user source, reset, `seq`);
 the ring's build order, whole teardown on a new extent, the failure of the second slot closing the
@@ -746,3 +747,118 @@ Stop at the first step that fails; each says what to read. Same registry key as 
    also serves HPD and the refresh, so nothing else would work either, but the user-source lapse
    cannot rescue it. The worker's own bounded waits are the protection.
 5. **NVKMS and system memory** (12.3 (a)), and whether any 5120x1440 sysmem flip is worth having.
+
+## 14. The KMD's own RM allocations as foreign resources (`KmdRmClient` = 4, and the hooks for the rest)
+
+Requirement (the S6 change list): DWM on NVK must open the KMD's own RM allocations the way it opens
+any NVK surface, so each KMD-owned RM allocation needs a **foreign resid**: the KMD is the creator,
+exports its RM memory to a GEM handle on its own DRI file (this client already does, section 4),
+creates the resource with `RESOURCE_CREATE_BLOB` / `RM_EXPORT` through the `IMPORT_RM` machinery,
+records the layout in the foreign table, and the WDDM allocation that backs it **adopts** the resid,
+so `OpenAllocation` yields the FOREIGN identity and the layout trailer (`shared-foreign-surfaces.md`
+section 2). Present through `ScanoutFlip` from the foreign record is the separate Option B lane: only
+its hook points are designed here (14.3); `display.rs` is not touched.
+
+### 14.1 Built: the KMD as the creator of a foreign resource (level 4)
+
+* **`virtio/rm_foreign.rs`** (new): `import_surface` is `foreign::import_rm` for the KMD's own owner.
+  Same sequence (gate `rm_import_served`, `validate_request` with a mandatory layout, reserve under one
+  lock hold, `alloc_blob_errno` with `HELIOS_BLOB_MEM_RM_EXPORT` and `blob_id = (drm << 32) | gem`,
+  commit under one lock hold, with the stale-handle rule), with three differences: the **owner** is
+  `DeviceOwner::KMD_RM` (the client's DRI file is recorded under it), the **holder context** is the KMD's
+  own Venus context (`adapter.venus_ctx_id()`, not device-owned, so `resolve_owned_ctx` cannot name it:
+  `foreign_begin_kmd_import` compares it with the transport generation's instead), and the **layout** is
+  the surface's (`surface_foreign_layout`: `XRGB8888`, `MOD_LINEAR`, the RM pitch, offset 0). The KMD's quota is
+  its own (the table counts per owner token: 64 resources, 4 GiB). `release_surface` / `release_all` undo it
+  through `release_blob_for_owner(KMD_RM, ...)`; a resource a WDDM allocation adopted since is no longer
+  the client's (slot owner `None`), so that release is a no-op and the allocation's destroy releases it.
+* **Adoption of a KMD-created resource** (`virtio/gpu/foreign_tables.rs::adopt_for_allocation`): the
+  creator check used `DeviceOwner::new(creator)`, which refuses the KMD's token on purpose. A creator that
+  is `KMD_RM` now proves "holder context" as "the record's context is nonzero" (the import proved it is the
+  KMD's own Venus context, and the record dies with the transport generation) and "slot" as "the blob slot
+  is `KMD_RM`'s"; the pure table already treated an owner as an opaque token (a new test pins that
+  adoption frees the KMD's quota and keeps the record).
+* **Client machine** (`kmd_logic::rm_client`): level 4 = level 3 plus, per ring surface, `Step::ForeignImport`
+  (right after `CloseExportCh`: the surface is `Ready`, before its view) and, on teardown,
+  `Step::ForeignRelease` **before** `GemClose` / `FreeMemory` (the resource names the GEM). A refused import
+  is given up for that surface (`share_failed`, never retried, nothing to undo); a failed release is counted
+  (`RmSoft`) and advances; the ring is complete (`Park`) only once each surface's import is settled. A death
+  reclaims what was made (`release_all`); the transport sweep reclaims the rest. The slot's resid is in
+  `SlotInfo::foreign` (and the status word, bits 16 and 17: working and parked slot have one).
+* **Why level 4 exists at all**: the ring surfaces are not WDDM allocations, so nothing adopts them; the level
+  proves the KMD-owned import end to end on hardware (`RmFgImp`, a resource in the host, the layout in the
+  record, the same teardown) and gives the allocation hooks below a tested producer.
+
+Counters: `RmFgImp` / `RmFgRel` / `RmFgErr` (imports made / released / failed), `RmFgErrno` (the last host
+errno), `RmFgWhy` (the last failure: 1 gate closed, 2 no KMD Venus context, 3 bad request or not owned, 4 table
+or quota, 5 host refused, 6 transport, 7 recorded nothing or raced). The foreign table's own `Fg*`
+counters count these resources too (`FgImp`, `FgLive`, `FgRel`).
+
+### 14.2 Not built: the allocation arms (what needs deciding or building, in order)
+
+None of the KMD's allocations is RM-backed today (section 12: the CPU-written ones cannot be, until the pool
+of 12.3 (c); the GPU-only ones need an RM surface made on demand). The foreign resid is the easy half; the
+hooks are:
+
+1. **A surface service.** `CreateAllocation` runs at PASSIVE on the caller's thread, but the RM client's state
+   has exactly one mutator, the HPD worker (section 6). A request mailbox (a small static array of tickets
+   guarded by the same leaf-lock rule, an event, a bounded wait of 2.5 s like every message of the client)
+   lets `create_one` ask the worker for a surface of `(kind, w, h)` and get back `(resid, layout)`; the
+   client grows from one working slot to a table of surfaces (the doc's slice 2 item: free list, quotas from
+   "one" to a table). The `Step` sequence per surface is the one already tested (`AllocMemory` .. `ForeignImport`);
+   `Park`/`Unpark` are the table's moves.
+2. **Which allocations.** `KmdLinearPrimary` (pitch-linear vidmem, the memory of this client's surfaces:
+   done as a surface, not as an allocation), `KmdOptimalGdiTexture` (GPU-only: pitch-linear first, with
+   `MOD_LINEAR` recorded; a block-linear allocation needs the RM kind/attr values nvk-rm uses and the
+   modifier `MOD_NVIDIA_BLOCK_LINEAR_BASE | h` in the layout, both **unverified blind**). `KmdStandardBuffer`
+   and every other CPU-written allocation stay out until the pool (12.3 (c)); a shadow/staging allocation is
+   a sub-range of it, not a surface.
+3. **The arm.** A new `Backing` arm (or a branch in the three KMD arms behind the knob, Venus the fallback
+   on any failure) that obtains the resid and returns `CreatedBacking { resource_id, foreign:
+   ForeignBacking::Adopted(layout), blob_size: NonHostAuthoritative(size), pitch: layout.stride, .. }` after
+   `adopt_for_allocation(resource_id, &AdoptRequest { declares_foreign: true, take_ownership: true, ctx_id:
+   <the KMD's context>, width, height, pitch, plane_offset: 0, supplied_layout: Some(layout), trailer_room })`
+   (the same call `AdoptedUmdResource` makes; the KMD fills the private data a UMD would). The layout trailer
+   is written by the existing `write_foreign_layout_trailer`. `HeliosWddmAllocMeta` carries `width`, `height`,
+   `pitch` as for any foreign allocation; no new field.
+4. **After adoption** everything is the S6 route unchanged: `OpenAllocation` rewrites the identity (FOREIGN
+   flag) and the trailer, opens are counted per process, the host resource lives until the last of destroy and
+   closes, DWM-on-NVK imports with `RM_RESOURCE_IMPORT` (route R). The KMD must not release an adopted
+   resource from the client (14.1: the release no-ops) and the allocation's destroy must be what frees the
+   surface: the client's `FreeMemory` / `GemClose` then run when the table entry is retired, which has to wait
+   for the destroy (a reference count on the table entry; the host import holds its own reference to the
+   memory, so freeing the RM memory first is safe for the host but not for a consumer's RM import of it).
+
+### 14.3 Not built: Option B, the present hook points (design only)
+
+Nothing in `display.rs` or `adapter/scanout.rs` is edited. Where the flip lane plugs in:
+
+| where | today | Option B |
+|---|---|---|
+| `create_allocation::scanout_alloc_info` | returns the resource id, extent, primary address, `direct_scanout` | also whether `foreign_record(resource_id)` is `Some`, with its creator (`KMD_RM` or a device), `rm_handle`, `gem_handle`, layout and size (the record keeps all of them; `foreign_layout` / `foreign_record` already exist for the copy import) |
+| `program_vidpn_source_inner`, the `target` match (`direct_scanout` / `production_linear_scanout`) | builds a `ScanoutTarget` the host `SET_SCANOUT_BLOB`s | a third arm for a foreign source: no `ScanoutTarget` and no bind; take the foreign source path instead of `set_scanout_blob` + the `remember_scanout_blob` bookkeeping |
+| the flip itself | `SET_SCANOUT_BLOB` then (worker refresh arm) `RESOURCE_FLUSH` | `virtio::foreign_scanout::present_within` with the record's `(owner, handle = rm_handle, gem)`: the arbiter's resident source **updates in place** per flipped allocation (`resident_set` with the allocation's handle and layout keeps its generation), so the desktop suppression, user preemption and the resume rule of section 13 apply unchanged. A record created by a user device needs its owner token (the creator may be gone: then the source is refused and Venus keeps the screen) |
+| completion and reuse | `ScanoutFlushToken`, the read ledger per flushed resid, retired by the flush's completion | the host flip has no completion: a ring depth, or the host forwarding `EV_RELEASE`, feeds the ledger (a flip stands in for "the previous buffer is free after the next one is accepted"); until then the conservative rule of 12.4 item 5 |
+| `queue_active_scanout_refresh_locked` | the gate withholds the flush for a live source | unchanged: Option B sources are sources |
+
+Decisions Option B needs from the host before it can be written: a release/completion signal (or a depth to
+assume), and whether a flip of the same GEM at the display rate is acceptable to the viewer (the same
+question as 13.11 item 2).
+
+### 14.4 Hardware checklist for level 4, in order
+
+1. Section 13.9 steps 1 to 5 at level 3 first. 2. **`KmdRmClient=4`, restart the device.** `RmFgImp=2`
+   (one per ring surface), `RmFgErr=0`, `RmStatus=0x11b35500`; `RmSteps` 34 (two imports); host log: two
+   `RESOURCE_CREATE_BLOB` of blob_mem `0x80000001` for the KMD's DRI handle; `FgImp=2`, `FgLive=2`. If
+   `RmFgErr` is nonzero `RmFgWhy` says where (1 gate: the host does not serve the import, config bits 13 and 10;
+   5 the host refused: `RmFgErrno`). The desktop is as at level 3 (the import changes nothing on screen).
+3. **Mode change**: `RmFgRel=2`, then `RmFgImp=4` after the ring is rebuilt; no `RmSoft`. 4. **Stop and start**:
+   `FgLive` returns to 0, `RmFgRel` counts the reclaim, no bugcheck. 5. With a user-mode NVK process open, run
+   `RM_RESOURCE_IMPORT` on a resid the KMD made (the open row rule refuses it: nothing adopted it, so
+   `FgRiRef` counts it: the expected answer until 14.2 exists).
+### 14.5 Bounds
+
+`import_surface` waits on the host for `RESOURCE_CREATE_BLOB` with the control queue's ordinary
+   synchronous bound on the HPD worker, which StopDevice joins for a bounded time (section 6): at level 4 a host
+   that stops answering during an import can cost the worker its join. It is a validation level for that reason;
+   the allocation arms (14.2) run on the creator's thread, not the worker.

@@ -650,7 +650,9 @@ pub mod knobs {
     /// primary the display worker keeps current) is copied into the one not shown and
     /// flipped, in place of Venus' `RESOURCE_FLUSH`, with Venus as the fallback
     /// (`virtio::rm_present`, `docs/kmd-rm-client.md` section 13).
-    /// Read once per transport generation. Values above 3 count as 3 (before level 3
+    /// 4 = 3 plus each ring surface imported as a foreign resource under the KMD's own
+    /// owner (the resource id a WDDM allocation adopts, `docs/kmd-rm-client.md` section
+    /// 14). Read once per transport generation. Values above 4 count as 4 (before level 3
     /// existed, 3 and more counted as 2: a service key left at 3 turns the ring on).
     pub const KMD_RM_CLIENT: KnobName = KnobName::new(b"KmdRmClient");
     /// `BindFlushMode` (default 0). Selects when the bind edge tells the host

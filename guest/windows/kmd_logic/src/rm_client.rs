@@ -832,6 +832,12 @@ pub enum Step {
     FillPattern = 48,
     ScanoutSet = 49,
     ScanoutPresent = 50,
+    // The surface as a foreign (Venus) resource, level 4.
+    /// `RESOURCE_CREATE_BLOB` of the surface's GEM as `RM_EXPORT`, under the KMD's own
+    /// owner: the resid a WDDM allocation adopts and DWM opens.
+    ForeignImport = 51,
+    /// Release that resource (host unref); an undo, it always advances.
+    ForeignRelease = 52,
     // Pure state moves between the slots of a ring (level 3); no I/O.
     /// Put the finished working slot aside; the next surface is built in a fresh one.
     Park = 56,
@@ -938,6 +944,8 @@ pub enum Out {
     Version([u8; VERSION_STR_BYTES]),
     /// The kernel view: address and length.
     Mapped(u64, u64),
+    /// The foreign resource id the surface was imported as.
+    Resource(u32),
 }
 
 /// Where the machine is.
@@ -966,6 +974,8 @@ struct Surface {
     memory: u32,
     stage: SurfStage,
     gem: u32,
+    /// The foreign resource id the surface was imported as (level 4), 0 = none.
+    foreign: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1001,7 +1011,8 @@ pub const PROBE_MAX_BUSY: u8 = 3;
 pub struct Want {
     /// 0 off, 1 client and surface, 2 also the CPU view and the probe flip, 3 a ring
     /// of [`RING_SLOTS`] surfaces, each with its CPU view, and no probe (the
-    /// presenter, `rm_present`, drives scanout).
+    /// presenter, `rm_present`, drives scanout), 4 also each surface imported as a
+    /// foreign resource (`docs/kmd-rm-client.md` section 14).
     pub level: u8,
     /// The extent of the VidPn primary, once one is bound.
     pub surface: Option<(u32, u32)>,
@@ -1027,6 +1038,11 @@ impl Want {
     /// Whether the CPU view of a surface is wanted.
     fn views(&self) -> bool {
         self.level >= 2
+    }
+
+    /// Whether each surface is also imported as a foreign resource (level 4).
+    fn shares(&self) -> bool {
+        self.level >= 4
     }
 
     /// Whether the one-picture probe flip runs (levels 2 only: level 3 flips real frames).
@@ -1075,6 +1091,9 @@ struct Slot {
     view_va: u64,
     view_len: u64,
     view_failed: bool,
+    /// The foreign import failed: given up for this surface (no retry), the surface
+    /// itself is fine.
+    share_failed: bool,
     probe: Probe,
     probe_busy: u8,
 }
@@ -1091,6 +1110,7 @@ impl Slot {
         view_va: 0,
         view_len: 0,
         view_failed: false,
+        share_failed: false,
         probe: Probe::Idle,
         probe_busy: 0,
     };
@@ -1116,11 +1136,13 @@ impl Slot {
         v
     }
 
-    /// The surface is finished and, when `views`, its CPU view is up.
-    fn is_complete(&self, views: bool) -> bool {
+    /// The surface is finished and, when `views`, its CPU view is up and, when
+    /// `shares`, the foreign import is settled (done, or given up).
+    fn is_complete(&self, views: bool, shares: bool) -> bool {
         match self.surface {
             Some(s) if s.stage == SurfStage::Ready => {
-                !views || (self.view == ViewStage::KernelMapped && !self.view_failed)
+                (!views || (self.view == ViewStage::KernelMapped && !self.view_failed))
+                    && (!shares || s.foreign != 0 || self.share_failed)
             }
             _ => false,
         }
@@ -1135,6 +1157,8 @@ pub struct SlotInfo {
     pub gem: u32,
     /// The kernel view: address and length.
     pub view: (u64, u64),
+    /// The foreign resource id the surface was imported as (level 4), 0 = none.
+    pub foreign: u32,
 }
 
 /// Every kernel view the client holds, for unmapping all of them at once (a retire,
@@ -1292,6 +1316,11 @@ impl Client {
         self.cur.surface.map_or(0, |s| s.gem)
     }
 
+    /// The foreign resource id of the working slot's surface (0 = none).
+    pub fn foreign(&self) -> u32 {
+        self.cur.surface.map_or(0, |s| s.foreign)
+    }
+
     /// The cookie of the CPU mapping RM holds, for its unmap.
     pub fn view_cookie(&self) -> u64 {
         self.cur.view_cookie
@@ -1342,6 +1371,7 @@ impl Client {
             layout: s.layout,
             gem: s.gem,
             view,
+            foreign: s.foreign,
         })
     }
 
@@ -1379,6 +1409,13 @@ impl Client {
         (phase << 28)
             | (u32::from(self.parked_n) << 24)
             | (u32::from(self.up) << 20)
+            | (u32::from(self.foreign() != 0) << 16)
+            | (u32::from(
+                self.parked
+                    .iter()
+                    .take(usize::from(self.parked_n))
+                    .any(|p| p.surface.is_some_and(|s| s.foreign != 0)),
+            ) << 17)
             | (surf << 12)
             | ((self.cur.view as u32) << 8)
             | probe
@@ -1473,6 +1510,10 @@ impl Client {
             if export_lost
                 || (wanted.is_some() && wanted != Some((s.layout.width, s.layout.height)))
             {
+                // The foreign resource goes before the GEM and the memory it names.
+                if s.foreign != 0 {
+                    return Action::Step(Step::ForeignRelease);
+                }
                 // A different extent: tear the surface down; the next call makes
                 // the new one. An export file still open (stages `ExportChOpen` ..
                 // `Imported`) goes first: nothing else would close it, and the next
@@ -1491,18 +1532,21 @@ impl Client {
                 SurfStage::ExportChOpen => Action::Step(Step::ExportToFd),
                 SurfStage::Exported => Action::Step(Step::GemImport),
                 SurfStage::Imported => Action::Step(Step::CloseExportCh),
-                SurfStage::Ready => match self.view_and_probe_step(want) {
-                    // Finished, and the ring wants more: set it aside and build the
-                    // next one. Only a slot that is complete (surface AND, when the
-                    // view is wanted, its view) is kept: a given-up view ends the
-                    // ring here, and the presenter never starts.
-                    Action::Idle
-                        if self.cur.is_complete(want.views())
-                            && usize::from(self.parked_n) + 1 < want.slots() =>
-                    {
-                        Action::Step(Step::Park)
-                    }
-                    other => other,
+                SurfStage::Ready => match self.share_step(s, want) {
+                    Some(step) => Action::Step(step),
+                    None => match self.view_and_probe_step(want) {
+                        // Finished, and the ring wants more: set it aside and build the
+                        // next one. Only a slot that is complete (surface AND, when the
+                        // view is wanted, its view) is kept: a given-up view ends the
+                        // ring here, and the presenter never starts.
+                        Action::Idle
+                            if self.cur.is_complete(want.views(), want.shares())
+                                && usize::from(self.parked_n) + 1 < want.slots() =>
+                        {
+                            Action::Step(Step::Park)
+                        }
+                        other => other,
+                    },
                 },
             };
         }
@@ -1515,6 +1559,15 @@ impl Client {
             Some(_) if usize::from(self.parked_n) < want.slots() => Action::Step(Step::AllocMemory),
             _ => Action::Idle,
         }
+    }
+
+    /// The foreign-resource step of a finished surface: import it when level 4 wants it
+    /// shared (once; a failure is not retried), release it when it is no longer wanted.
+    fn share_step(&self, s: Surface, want: Want) -> Option<Step> {
+        if s.foreign != 0 && !want.shares() {
+            return Some(Step::ForeignRelease);
+        }
+        (want.shares() && s.foreign == 0 && !self.cur.share_failed).then_some(Step::ForeignImport)
     }
 
     /// Whether a parked slot has an extent other than the one now wanted.
@@ -1587,6 +1640,24 @@ impl Client {
     pub fn finish(&mut self, step: Step, result: Result<Out, Fail>) {
         use Step::*;
         match step {
+            ForeignImport => match result {
+                Ok(Out::Resource(r)) if r != 0 => {
+                    if let Some(s) = self.cur.surface.as_mut() {
+                        s.foreign = r;
+                    }
+                }
+                // Given up for this surface; the surface is untouched.
+                _ => self.cur.share_failed = true,
+            },
+            ForeignRelease => {
+                // An undo always advances: a failed release is counted, never retried.
+                if result.is_err() {
+                    self.soft_errors = self.soft_errors.saturating_add(1);
+                }
+                if let Some(s) = self.cur.surface.as_mut() {
+                    s.foreign = 0;
+                }
+            }
             // Pure state moves: no I/O behind them, so no result to judge.
             Park => {
                 let n = usize::from(self.parked_n);
@@ -1747,6 +1818,7 @@ impl Client {
                     memory: memory_handle(self.surfaces_made),
                     stage: SurfStage::Allocated,
                     gem: 0,
+                    foreign: 0,
                 });
                 // A fresh surface shows its own picture once.
                 self.cur.probe = Probe::Idle;
@@ -3256,5 +3328,212 @@ mod tests {
         }
         assert!(c.ready_surface().is_some());
         assert!(!c.is_dead());
+    }
+
+    // ---- level 4: each surface also a foreign resource -------------------------------
+
+    const WANT4: Want = Want {
+        level: 4,
+        surface: Some((1920, 1080)),
+    };
+
+    /// `run3` for level 4: the import answers a distinct resource id.
+    fn run4(c: &mut Client, want: Want, files: &mut u32, resid: &mut u32) -> Vec<Step> {
+        let mut log = Vec::new();
+        loop {
+            c.begin(if c.epoch() == 0 { 1 } else { c.epoch() });
+            match c.next(want) {
+                Action::Step(s) => {
+                    assert!(log.len() < 120, "runaway: {log:?}");
+                    log.push(s);
+                    let out = match s {
+                        Step::AllocMemory => {
+                            let (w, h) = want.surface.unwrap();
+                            Out::Mem(surface_layout(w, h).unwrap())
+                        }
+                        Step::ForeignImport => {
+                            *resid += 1;
+                            Out::Resource(*resid)
+                        }
+                        _ => ok_out3(s, c, files),
+                    };
+                    c.finish(s, Ok(out));
+                }
+                Action::Idle | Action::Dead => return log,
+            }
+        }
+    }
+
+    #[test]
+    fn level_four_imports_every_surface_once_and_hands_the_resource_ids_out() {
+        use Step::*;
+        assert!(WANT4.shares() && !WANT3.shares());
+        assert_eq!(WANT4.slots(), RING_SLOTS);
+        let (mut c, mut files, mut resid) = (Client::new(), 0, 100);
+        let log = run4(&mut c, WANT4, &mut files, &mut resid);
+        assert_eq!(
+            log.iter().filter(|s| **s == ForeignImport).count(),
+            2,
+            "{log:?}"
+        );
+        // The import follows the export file's close of the same surface and precedes
+        // its view; the park comes after both.
+        let imp = log.iter().position(|s| *s == ForeignImport).unwrap();
+        assert_eq!(log[imp - 1], CloseExportCh);
+        assert_eq!(log[imp + 1], OpenMapCh);
+        let park = log.iter().position(|s| *s == Park).unwrap();
+        assert!(park > imp);
+        assert_eq!(log.len(), 11 + 2 * 11 + 1);
+        assert!(c.presentable(WANT4));
+        let (a, b) = (c.slot(0).unwrap(), c.slot(1).unwrap());
+        assert_eq!((a.foreign, b.foreign), (101, 102));
+        assert_eq!(c.next(WANT4), Action::Idle);
+        // The status word shows both.
+        let w = c.status_word();
+        assert_eq!((w >> 16) & 3, 3, "{w:#x}");
+        // Level 3 never imports.
+        let mut c3 = Client::new();
+        let log3 = run3(&mut c3, WANT3, &mut files);
+        assert!(!log3.contains(&ForeignImport));
+        assert_eq!(c3.slot(0).unwrap().foreign, 0);
+    }
+
+    #[test]
+    fn a_new_extent_releases_the_foreign_resources_before_the_gem_and_the_memory() {
+        use Step::*;
+        let (mut c, mut files, mut resid) = (Client::new(), 0, 100);
+        run4(&mut c, WANT4, &mut files, &mut resid);
+        let other = Want {
+            level: 4,
+            surface: Some((1280, 720)),
+        };
+        let log = run4(&mut c, other, &mut files, &mut resid);
+        let first_alloc = log.iter().position(|s| *s == AllocMemory).unwrap();
+        let before = &log[..first_alloc];
+        assert_eq!(
+            before.iter().filter(|s| **s == ForeignRelease).count(),
+            2,
+            "{log:?}"
+        );
+        // Per surface: the release comes before its GemClose.
+        let mut released = 0;
+        for s in before {
+            match s {
+                ForeignRelease => released += 1,
+                GemClose => assert!(released >= 1, "GemClose before any release: {log:?}"),
+                _ => {}
+            }
+        }
+        let first_gem = before.iter().position(|s| *s == GemClose).unwrap();
+        let first_rel = before.iter().position(|s| *s == ForeignRelease).unwrap();
+        assert!(first_rel < first_gem);
+        assert!(c.presentable(other));
+        assert_eq!(c.slot(0).unwrap().foreign, 103);
+        assert_eq!(c.soft_errors(), 0);
+    }
+
+    #[test]
+    fn a_refused_import_is_given_up_for_that_surface_without_killing_anything() {
+        use Step::*;
+        let mut c = Client::new();
+        let mut files = 0;
+        let mut imports = 0;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard < 120);
+            c.begin(1);
+            let Action::Step(s) = c.next(WANT4) else {
+                break;
+            };
+            if s == ForeignImport {
+                imports += 1;
+                c.finish(s, Err(Fail::new(FailKind::Host, 95)));
+                continue;
+            }
+            let out = match s {
+                AllocMemory => Out::Mem(surface_layout(1920, 1080).unwrap()),
+                _ => ok_out3(s, &c, &mut files),
+            };
+            c.finish(s, Ok(out));
+        }
+        // Once per surface, never retried; the ring is whole and showing is unaffected.
+        assert_eq!(imports, 2);
+        assert!(!c.is_dead());
+        assert!(c.presentable(WANT4));
+        assert_eq!(c.slot(0).unwrap().foreign, 0);
+        // A given-up surface has nothing to release.
+        let log = {
+            let other = Want {
+                level: 4,
+                surface: Some((1280, 720)),
+            };
+            let mut log = Vec::new();
+            while let Action::Step(s) = c.next(other) {
+                assert!(log.len() < 80);
+                log.push(s);
+                let out = match s {
+                    AllocMemory => Out::Mem(surface_layout(1280, 720).unwrap()),
+                    ForeignImport => Out::Resource(7),
+                    _ => ok_out3(s, &c, &mut files),
+                };
+                c.finish(s, Ok(out));
+            }
+            log
+        };
+        let first_alloc = log.iter().position(|s| *s == AllocMemory).unwrap();
+        assert!(!log[..first_alloc].contains(&ForeignRelease), "{log:?}");
+    }
+
+    #[test]
+    fn a_release_that_fails_still_advances_and_is_counted() {
+        use Step::*;
+        let (mut c, mut files, mut resid) = (Client::new(), 0, 100);
+        run4(&mut c, WANT4, &mut files, &mut resid);
+        let other = Want {
+            level: 4,
+            surface: Some((1280, 720)),
+        };
+        let mut failed = 0;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard < 120);
+            c.begin(1);
+            let Action::Step(s) = c.next(other) else {
+                break;
+            };
+            if s == ForeignRelease && failed == 0 {
+                failed += 1;
+                c.finish(s, Err(Fail::new(FailKind::Transport, 1)));
+                continue;
+            }
+            let out = match s {
+                AllocMemory => Out::Mem(surface_layout(1280, 720).unwrap()),
+                ForeignImport => {
+                    resid += 1;
+                    Out::Resource(resid)
+                }
+                _ => ok_out3(s, &c, &mut files),
+            };
+            c.finish(s, Ok(out));
+        }
+        assert!(!c.is_dead());
+        assert_eq!(c.soft_errors(), 1);
+        assert!(c.presentable(other));
+    }
+
+    #[test]
+    fn dropping_from_level_four_to_three_releases_the_resources() {
+        use Step::*;
+        let (mut c, mut files, mut resid) = (Client::new(), 0, 100);
+        run4(&mut c, WANT4, &mut files, &mut resid);
+        let log = run3(&mut c, WANT3, &mut files);
+        assert_eq!(
+            log.iter().filter(|s| **s == ForeignRelease).count(),
+            1,
+            "{log:?} (the working slot)"
+        );
+        assert_eq!(c.foreign(), 0);
     }
 }
