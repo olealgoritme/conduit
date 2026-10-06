@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Tue, 6 Oct 2026 04:32:44 +0200
+Subject: [PATCH] nvk/rm: video decode on an NVDEC channel
+
+NVK's H.264 decode (NVK_EXPERIMENTAL=video) only needs a channel on the
+video decoder engine.  The RM backend now provides it:
+
+- the NVDEC class comes from the class list: Turing's 0xc4b0 up to
+  GB20x's 0xcfb0 (cls_vdec); has_video follows it (NVK_RM_VIDEO=0 off)
+- a context for NVKMD_ENGINE_VDEC is the usual TSG + subcontext + GPFIFO
+  channel, on the NVDEC0 runlist instead of GR, bound to NVDEC0, with the
+  *_VIDEO_DECODER object (NV_NVDEC_ALLOCATION_PARAMETERS, instance 0)
+  alone on it, the way NVIDIA's own video driver sets NVDEC up
+- SET_OBJECT on the video queue names the class the device has rather
+  than NVC5B0; the decoder methods NVK programs are NVC5B0's, which every
+  later NVDEC class (up to NVCFB0) keeps at the same offsets, and the
+  H.264 picture setup (nvdec_h264_pic_s) is unchanged in cfb0_drv.h
+
+Waits and signals stay host semaphore methods, which every runlist
+executes, so the queue needs nothing else from the backend.
+
+Still needs -Dvideo-codecs=h264dec (not in all_free) and
+NVK_EXPERIMENTAL=video.  On an RTX 5090 (GB202, RM 610.57.04) ffmpeg's
+Vulkan hwaccel decodes H.264 baseline and high (B-frames, 4 refs,
+1080p60) bit-exact against libavcodec.
+---
+ src/nouveau/vulkan/nvk_queue.c              |  3 +-
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c  | 36 ++++++++++++++++++---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c | 11 ++++++-
+ src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h |  9 ++++++
+ src/nouveau/vulkan/rust/video/decode/mod.rs | 13 ++++++--
+ 5 files changed, 64 insertions(+), 8 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_queue.c b/src/nouveau/vulkan/nvk_queue.c
+index 1fe82b6..4238a84 100644
+--- a/src/nouveau/vulkan/nvk_queue.c
++++ b/src/nouveau/vulkan/nvk_queue.c
+@@ -362,7 +362,8 @@ nvk_queue_init_context_state(struct nvk_queue *queue)
+    }
+ 
+    if (queue->engines & NVKMD_ENGINE_VDEC) {
+-      result = nvk_push_video_decode_state_init(queue, p);
++      result = nvk_push_video_decode_state_init(queue, p,
++                                                 pdev->info.cls_vdec);
+       if (result != VK_SUCCESS)
+          return result;
+    }
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index 16ed858..f80e6b0 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -25,6 +25,10 @@
+  *     *_CHANNEL_GPFIFO_* with a client-allocated GPFIFO ring and USERD
+  *       3D, compute and copy objects (RM allocates GR context buffers)
+  *
++ * A video decode context is the same on the NVDEC0 runlist instead of GR,
++ * with the *_VIDEO_DECODER object alone on its channel.  That is how
++ * NVIDIA's own video driver sets up NVDEC.
++ *
+  * Submission needs no RM call: GPFIFO entries go into the ring, GP_PUT
+  * into USERD, and the channel's work-submit token into the usermode
+  * doorbell.
+@@ -652,9 +656,17 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+    ctx->userd = (volatile uint32_t *)((uint8_t *)map + NVKMD_RM_CTL_USERD_OFFSET);
+    const uint32_t h_ctl = nvkmd_rm_mem(ctx->ctl_mem)->h_memory;
+ 
++   /* NVDEC runs on a runlist of its own: a decode context cannot share a
++    * channel with GR engines, and NVK never asks for that.
++    */
++   const bool vdec = engines & NVKMD_ENGINE_VDEC;
++   assert(!vdec || engines == NVKMD_ENGINE_VDEC);
++   const uint32_t engine_type = vdec ? NV2080_ENGINE_TYPE_NVDEC0
++                                     : NV2080_ENGINE_TYPE_GRAPHICS;
++
+    NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS tsg_params = {
+       .hVASpace = dev->h_vaspace,
+-      .engineType = NV2080_ENGINE_TYPE_GRAPHICS,
++      .engineType = engine_type,
+    };
+    result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
+                            lib->alloc(dev->client, dev->h_device, &ctx->h_tsg,
+@@ -688,7 +700,7 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+       .hContextShare = ctx->h_ctxshare,
+       .hUserdMemory = { h_ctl },
+       .userdOffset = { NVKMD_RM_CTL_USERD_OFFSET },
+-      .engineType = NV2080_ENGINE_TYPE_GRAPHICS,
++      .engineType = engine_type,
+    };
+    result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
+                            lib->alloc(dev->client, ctx->h_tsg,
+@@ -704,7 +716,7 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+     * a runlist yet; engineType in the allocation parameters is not enough.
+     */
+    NVA06F_CTRL_BIND_PARAMS bind_params = {
+-      .engineType = NV2080_ENGINE_TYPE_GRAPHICS,
++      .engineType = engine_type,
+    };
+    result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
+                            lib->control(dev->client, ctx->h_channel,
+@@ -732,6 +744,22 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+       if (result != VK_SUCCESS)
+          goto fail;
+    }
++   if (vdec) {
++      /* RM wants the parameters here (engine instance 0 is NVDEC0) */
++      NV_NVDEC_ALLOCATION_PARAMETERS nvdec_params = {
++         .size = sizeof(nvdec_params),
++         .engineInstance = 0,
++      };
++      result = NVKMD_RM_CHECK(lib, log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                              lib->alloc(dev->client, ctx->h_channel,
++                                         &ctx->h_objects[ctx->object_count],
++                                         info->cls_vdec, &nvdec_params,
++                                         sizeof(nvdec_params)),
++                              "alloc video decoder object");
++      if (result != VK_SUCCESS)
++         goto fail;
++      ctx->object_count++;
++   }
+ 
+    /* RM writes the token into this notifier too; we use the control */
+    NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS notif_params = {
+@@ -893,7 +921,7 @@ nvkmd_rm_create_ctx(struct nvkmd_dev *_dev,
+    }
+ 
+    assert(!(engines & NVKMD_ENGINE_BIND));
+-   if (engines & NVKMD_ENGINE_VDEC)
++   if ((engines & NVKMD_ENGINE_VDEC) && !dev->base.pdev->dev_info.has_video)
+       return vk_error(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
+ 
+    return nvkmd_rm_create_exec_ctx(dev, log_obj, engines, ctx_out);
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+index 80c7485..b08e514 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_pdev.c
+@@ -154,6 +154,11 @@ fill_device_info(struct nvkmd_rm_pdev *pdev,
+    if (info->cls_m2mf == 0)
+       info->cls_m2mf = 0xa140; /* KEPLER_INLINE_TO_MEMORY_B */
+    info->cls_eng2d   = has_class(classes, 0x902d) ? 0x902d : 0;
++   /* NVDEC: Turing's 0xc4b0 up to Blackwell GB20x's 0xcfb0.  NVK programs
++    * the methods of NVC5B0, which every NVDEC class since keeps at the same
++    * offsets; the class only goes into SET_OBJECT.
++    */
++   info->cls_vdec    = pick_class(classes, 0xb0, 0xc4b0, 0xcfb0);
+ 
+    static const uint32_t usermode_classes[] = {
+       NVRM_BLACKWELL_USERMODE_A,
+@@ -279,7 +284,11 @@ fill_device_info(struct nvkmd_rm_pdev *pdev,
+ 
+    /* Not exposed in the first cut */
+    info->has_transfer_queue = false;
+-   info->has_video = false;
++   /* Video decode on its own NVDEC channel (nvkmd_rm_ctx.c); NVK still
++    * only exposes it with NVK_EXPERIMENTAL=video.
++    */
++   info->has_video = info->cls_vdec != 0 &&
++                     debug_get_bool_option("NVK_RM_VIDEO", true);
+ 
+    /* ZCULL: the same numbers nouveau's DRM_NOUVEAU_GET_ZCULL_INFO passes on
+     * from this control.  NVK keeps each depth image's ZCULL storage next to
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+index 51a66b9..762a28e 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
++++ b/src/nouveau/vulkan/nvkmd/rm/nvrm/nvrm_api.h
+@@ -95,6 +95,7 @@ typedef NvU32 NvHandle;
+ /* cl2080_notification.h */
+ #define NV2080_ENGINE_TYPE_GRAPHICS               (0x00000001)
+ #define NV2080_ENGINE_TYPE_COPY0                  (0x00000009)
++#define NV2080_ENGINE_TYPE_NVDEC0                 (0x00000013) /* _BSP */
+ #define NV2080_NOTIFIERS_FIFO_EVENT_MTHD          (35)
+ #define NV2080_NOTIFIERS_RC_ERROR                 (37)
+ 
+@@ -296,6 +297,13 @@ typedef struct {
+    NvBool   bIsCallingContextVgpuPlugin;
+ } NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS;
+ 
++/* nvos.h: the *_VIDEO_DECODER (NVDEC) classes' allocation parameters */
++typedef struct {
++   NvU32 size;
++   NvU32 prohibitMultipleInstances;
++   NvU32 engineInstance;
++} NV_NVDEC_ALLOCATION_PARAMETERS;
++
+ typedef struct {
+    NvHandle hVASpace;
+    NvU32    flags;
+@@ -698,6 +706,7 @@ static_assert(sizeof(NV_OS_DESC_MEMORY_ALLOCATION_PARAMS) == 40, "NV_OS_DESC_MEM
+ static_assert(sizeof(NV_VASPACE_ALLOCATION_PARAMETERS) == 56, "NV_VASPACE_ALLOCATION_PARAMETERS");
+ static_assert(sizeof(NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS) == 20, "NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS");
+ static_assert(sizeof(NV_CTXSHARE_ALLOCATION_PARAMETERS) == 12, "NV_CTXSHARE_ALLOCATION_PARAMETERS");
++static_assert(sizeof(NV_NVDEC_ALLOCATION_PARAMETERS) == 12, "NV_NVDEC_ALLOCATION_PARAMETERS");
+ static_assert(sizeof(NV_HOPPER_USERMODE_A_PARAMS) == 2, "NV_HOPPER_USERMODE_A_PARAMS");
+ static_assert(sizeof(NV_CHANNEL_ALLOC_PARAMS) == 376, "NV_CHANNEL_ALLOC_PARAMS");
+ static_assert(sizeof(NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS) == 32, "GET_ID_INFO_V2");
+diff --git a/src/nouveau/vulkan/rust/video/decode/mod.rs b/src/nouveau/vulkan/rust/video/decode/mod.rs
+index e1bcea8..68a8499 100644
+--- a/src/nouveau/vulkan/rust/video/decode/mod.rs
++++ b/src/nouveau/vulkan/rust/video/decode/mod.rs
+@@ -72,15 +72,24 @@ fn to_session<'a>(cmd_buf: *mut ffi::nvk_cmd_buffer) -> &'a mut SessionData {
+ pub extern "C" fn nvk_push_video_decode_state_init(
+     _queue: &mut ffi::nvk_queue,
+     p: *mut ffi::nv_push,
++    cls_vdec: u16,
+ ) -> ffi::VkResult {
+     let mut push = nv_push_rs::Push::new();
+ 
++    /* The decoder methods are NVC5B0's, which later NVDEC classes keep at
++     * the same offsets, but the object is the class the device has.
++     */
++    let cls = if cls_vdec != 0 {
++        cls_vdec
++    } else {
++        NVC5B0_VIDEO_DECODER
++    };
+     let set_object = cl906f::SetObject {
+-        nvclass: NVC5B0_VIDEO_DECODER.into(),
++        nvclass: cls.into(),
+         engine: cl906f::SetObjectEngine::Sw,
+     };
+     push.push_mthd_bits(
+-        nv_push_rs::class_to_subc(NVC5B0_VIDEO_DECODER),
++        nv_push_rs::class_to_subc(cls),
+         cl906f::SetObject::ADDR,
+         set_object.to_bits(),
+     );
