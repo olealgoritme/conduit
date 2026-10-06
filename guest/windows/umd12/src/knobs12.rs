@@ -326,9 +326,14 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 11] {
 ///
 /// | value | meaning |
 /// |---:|---|
-/// | 0 | a UMD monitored fence: each ECL makes the context wait for its value, a per-queue worker signals it from the CPU when the engine's execution stream reaches it. Nothing blocks the app thread. The default; falls back to 1 if the fence cannot be created |
-/// | 1 | CPU wait: ExecuteCommandLists returns only after its work completed (2 s cap per call, then it proceeds and counts a timeout) |
-pub(crate) static NVK12_ECL_SYNC: DwordKnob = DwordKnob::new(c"Nvk12EclSync", 0);
+/// | 0 | a UMD monitored fence: each ECL makes the context wait for its value, a per-queue worker signals it from the CPU when the engine's execution stream reaches it. Nothing blocks the app thread. Falls back to 1 if the fence cannot be created |
+/// | 1 | CPU wait: ExecuteCommandLists returns only after its work completed (2 s cap per call, then it proceeds and counts a timeout). The default |
+///
+/// Default 1 since 2026-10-06: with 0, Basemark GPU DX12 on NVK deadlocks after
+/// its first frame (the ECL worker waits in librmclient for the engine's
+/// execution stream while the app thread waits on its own fence); with 1 it
+/// completes (79,799, 798 fps). 0 returns once that deadlock is fixed.
+pub(crate) static NVK12_ECL_SYNC: DwordKnob = DwordKnob::new(c"Nvk12EclSync", 1);
 
 /// `Nvk12Present` (or `HELIOS_NVK_PRESENT` in the process environment): 0 =
 /// automatic (DWM composes the back buffer from its NVK resource id when the
