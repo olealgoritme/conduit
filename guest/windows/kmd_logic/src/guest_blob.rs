@@ -906,6 +906,20 @@ pub const fn present_effect(guest_hit: bool, no_mirror_on: bool) -> Effect {
     }
 }
 
+/// Whether a deferred copy must be prepared again at submission: it was prepared for the guest
+/// blob `prepared_for` (`None`: not for a guest blob, never), and the destination's copy
+/// target is now `current` (the guest blob `VenusClient::guest_target_for` finds, `None`: the
+/// Venus blob). A copy whose guest blob was retired since the Present is re-prepared into the
+/// current target and submitted (its mirror then decided by [`present_effect`] from the new
+/// target), never dropped: the frame lands.
+pub const fn retarget_needed(prepared_for: Option<u32>, current: Option<u32>) -> bool {
+    match (prepared_for, current) {
+        (None, _) => false,
+        (Some(was), Some(now)) => was != now,
+        (Some(_), None) => true,
+    }
+}
+
 /// What the DIRECT asynchronous route does with a copy it has prepared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectCopy {
@@ -973,7 +987,8 @@ pub const COUNTERS: &[&str] = &[
     "GbBytes",
     "GbLive",
     "GbLiveRuns",
-    // Deferred copies prepared for a guest blob that was retired before they were submitted.
+    // Deferred copies prepared for a guest blob that was retired before they were submitted
+    // (each re-prepared into the destination's current target, so the frame still lands).
     "GbLost",
 ];
 
@@ -1453,6 +1468,24 @@ mod tests {
                 mark_stale: false
             }
         );
+    }
+
+    #[test]
+    fn a_deferred_copy_whose_guest_blob_went_is_prepared_again() {
+        // Not prepared for a guest blob: never touched (the default path).
+        assert!(!retarget_needed(None, None));
+        assert!(!retarget_needed(None, Some(7)));
+        // Still the target: submitted as prepared.
+        assert!(!retarget_needed(Some(7), Some(7)));
+        // Retired (the Venus blob is the target now), or replaced by a newer guest blob.
+        assert!(retarget_needed(Some(7), None));
+        assert!(retarget_needed(Some(7), Some(9)));
+        // The re-prepared copy's mirror follows its new target: into the Venus blob it is
+        // mirrored (or marked stale with `BltNoMirror`), into a guest blob neither.
+        assert!(present_effect(false, false).mirror);
+        assert!(present_effect(false, true).mark_stale);
+        let into_guest = present_effect(true, false);
+        assert!(!into_guest.mirror && !into_guest.mark_stale);
     }
 
     #[test]

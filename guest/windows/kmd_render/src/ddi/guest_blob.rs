@@ -17,7 +17,7 @@
 //! decision kept on the legacy copy), `GbStrike` (destinations disabled), `GbLeak`
 //! (destinations whose pages stay pinned after a failed release), `GbRuns` / `GbBytes` (the
 //! last create), `GbLive` / `GbLiveRuns` (live blobs and runs), `GbLost` (deferred copies whose
-//! guest blob was retired before submission).
+//! guest blob was retired before submission, re-prepared into the destination's current target).
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -136,7 +136,9 @@ pub(crate) fn note_hit() {
     HIT.fetch_add(1, Ordering::Relaxed);
 }
 
-/// A deferred copy prepared for a guest blob found it retired at submission.
+/// A deferred copy prepared for a guest blob found it retired at submission and was prepared
+/// again into the destination's current target (`VenusClient::retarget_prepared_present_blt`).
+/// The name is historical: the frame is no longer lost.
 pub(crate) fn note_lost() {
     LOST.fetch_add(1, Ordering::Relaxed);
 }
