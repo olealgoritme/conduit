@@ -70,6 +70,41 @@ static NOT_SHARED: AtomicU32 = AtomicU32::new(0);
 static EARLY_SMALL: AtomicU32 = AtomicU32::new(0);
 static EARLY_INVALID: AtomicU32 = AtomicU32::new(0);
 
+/// A new generation (StartDevice): zero the counters and write zeros over their service-key
+/// values. These are written only when an event happens, so without this a value from an
+/// earlier run stays readable as this one's until its event recurs. PASSIVE.
+pub(crate) fn reset_for_start() {
+    for c in [
+        &MADE, &REFUSED, &NEAR, &OPENED, &FREED, &SHAPE, &NOT_SHARED, &EARLY_SMALL, &EARLY_INVALID,
+    ] {
+        c.store(0, Ordering::Relaxed);
+    }
+    use crate::diag::record_named_bytes as rec;
+    for name in [
+        &b"ShPhMade"[..],
+        b"ShPhBytes",
+        b"ShPhRefuse",
+        b"ShPhRefWhy",
+        b"ShPhNear",
+        b"ShPhNearWhy",
+        b"ShPhShape",
+        b"ShPhNotSh",
+        b"ShPhFlg",
+        b"ShPhPriv",
+        b"ShPhOpen",
+        b"ShPhFree",
+        b"CrPrivSmall",
+        b"CrApInvalid",
+    ] {
+        rec(name, 0);
+    }
+    let mut n = 1u8;
+    while n <= FLAG_SAMPLES as u8 {
+        rec(&[b'S', b'h', b'P', b'h', b'F', b'l', b'0' + n], 0);
+        n += 1;
+    }
+}
+
 /// How many identity-less STANDARD allocations have their creation flags recorded one by one.
 const FLAG_SAMPLES: u32 = 8;
 
@@ -180,8 +215,34 @@ pub(crate) fn note_destroyed() {
     }
 }
 
+/// Whether an open that found no identity in the allocation's private data has the placeholder's
+/// shape (the open has no creation flags, so the shared test is taken as met). The KMD's own
+/// record of a host-less shared placeholder at open time: flips of it complete as kept pictures
+/// (`helios_kmd_logic::flip_completion`, the Present's identity-less flip arm).
+///
+/// # Safety
+/// `private` is null or valid for `size` bytes (the DDI contract for the open's buffer).
+pub(crate) unsafe fn identityless_open_is_placeholder(
+    private: *const c_void,
+    size: u32,
+    misc_flags: u32,
+) -> bool {
+    if private.is_null() || size as usize != size_of::<HeliosWddmAllocPrivate>() + size_of::<HeliosWddmAllocMeta>() {
+        return false;
+    }
+    // SAFETY: `size` >= 48 was just checked; read unaligned, like every private-data read.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(private as *const u8, size_of::<HeliosWddmAllocPrivate>()) };
+    let ap: HeliosWddmAllocPrivate = pod_read_unaligned(bytes);
+    if !ap.is_valid() {
+        return false;
+    }
+    let input = create_input(&ap, 0, size as usize, misc_flags, false);
+    sp::has_placeholder_shape(&input)
+}
+
 /// An open found no identity in the allocation's private data. Count it when the data has the
-/// placeholder's shape (the open has no creation flags, so the shared test is taken as met).
+/// placeholder's shape (see [`identityless_open_is_placeholder`]); returns whether it had.
 ///
 /// # Safety
 /// `private` is null or valid for `size` bytes (the DDI contract for the open's buffer).
@@ -189,23 +250,13 @@ pub(crate) unsafe fn note_identityless_open(
     private: *const c_void,
     size: u32,
     misc_flags: u32,
-) {
-    if private.is_null() || size as usize != size_of::<HeliosWddmAllocPrivate>() + size_of::<HeliosWddmAllocMeta>() {
-        return;
-    }
-    // SAFETY: `size` >= 48 was just checked; read unaligned, like every private-data read.
-    let bytes =
-        unsafe { core::slice::from_raw_parts(private as *const u8, size_of::<HeliosWddmAllocPrivate>()) };
-    let ap: HeliosWddmAllocPrivate = pod_read_unaligned(bytes);
-    if !ap.is_valid() {
-        return;
-    }
-    let input = create_input(&ap, 0, size as usize, misc_flags, false);
-    if !sp::has_placeholder_shape(&input) {
-        return;
+) -> bool {
+    if !unsafe { identityless_open_is_placeholder(private, size, misc_flags) } {
+        return false;
     }
     let n = OPENED.fetch_add(1, Ordering::Relaxed) + 1;
     if n == 1 || n % 64 == 0 {
         crate::diag::record_named_bytes(b"ShPhOpen", n);
     }
+    true
 }

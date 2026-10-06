@@ -271,6 +271,12 @@ struct OpenAllocationContext {
     /// whichever of {the adopting allocation's destroy, the last such close}
     /// comes last (`docs/shared-foreign-surfaces.md` section 3).
     foreign_open: Option<ForeignOpenRef>,
+    /// The open found no identity and the private data has the host-less shared placeholder's
+    /// shape (`shared_placeholder::identityless_open_is_placeholder`): the KMD's own record that
+    /// the allocation has no host resource. Read only by [`present_alloc_is_placeholder`], so
+    /// the Present can complete a flip of it (`helios_kmd_logic::flip_completion`) instead of
+    /// failing it for want of an identity.
+    host_less_placeholder: bool,
 }
 
 /// What one counted foreign open must give back.
@@ -585,6 +591,23 @@ pub unsafe fn present_alloc_info(
     open.present
 }
 
+/// Whether `h` is an open handle of the current transport generation that the KMD recorded as a
+/// host-less shared placeholder at open time (no identity, the placeholder's shape). Such a flip
+/// source has no [`PresentAllocInfo`] and no host resource, and its flip still has to COMPLETE
+/// (`helios_kmd_logic::flip_completion`). Venus allocations (an identity) answer `false`.
+///
+/// # Safety
+/// As [`present_alloc_info`].
+pub unsafe fn present_alloc_is_placeholder(adapter: Option<&AdapterContext>, h: HANDLE) -> bool {
+    let Some(open) = (unsafe { open_allocation_context(h) }) else {
+        return false;
+    };
+    if adapter.is_some_and(|a| !a.is_current_generation(open.serial)) {
+        return false;
+    }
+    open.present.is_none() && open.host_less_placeholder
+}
+
 /// Validate an `hDeviceSpecificAllocation` BEFORE forming a reference to it.
 ///
 /// The handle is an integer from dxgkrnl and the check cannot be encoded — but
@@ -894,10 +917,12 @@ pub(crate) struct WindowsPrimary {
     /// from this primary's own layout; everything else here (address, epoch,
     /// retirement) still describes the flipped allocation.
     pub snapshot: Option<SnapshotDescriptor>,
-    /// Which flip-completion rule this allocation follows (`helios_kmd_logic::flip_completion`),
-    /// from the KMD's own create-time record, never the creator's words: a foreign adoption, or
-    /// a hollow allocation the Venus path can never show, still completes its flip as a kept
-    /// picture when the programming cannot show it. A Venus allocation keeps every path it had.
+    /// Which flip-completion rule this allocation follows (`helios_kmd_logic::flip_completion`):
+    /// a foreign adoption (the KMD's own adoption record), or a hollow allocation the Venus path
+    /// can never show (decided from geometry, `direct_scanout` and the Venus identity, which come
+    /// from the creator's trailer: a creator can only make its OWN allocation hollow), still
+    /// completes its flip as a kept picture when the programming cannot show it. A Venus
+    /// allocation keeps every path it had.
     pub flip_source: helios_kmd_logic::flip_completion::Source,
 }
 
@@ -3865,16 +3890,17 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 .or_else(|| read_alloc_identity(args.pPrivateDriverData, args.PrivateDriverSize))
         };
         let resource_id = ident.map(|d| d.resource_id).unwrap_or(0);
+        let mut host_less_placeholder = false;
         if ident.is_none() {
             // A shared placeholder (or any allocation with no identity) opens with no
             // identity: counted, never resolved to a resource.
-            unsafe {
+            host_less_placeholder = unsafe {
                 crate::ddi::shared_placeholder::note_identityless_open(
                     info.pPrivateDriverData,
                     info.PrivateDriverDataSize,
                     meta.map_or(0, |m| m.misc_flags),
-                );
-            }
+                )
+            };
         }
 
         // C1 liveness gate: an identified allocation whose venus resource is no
@@ -4051,6 +4077,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             serial: adapter.current_transport_serial().unwrap_or(0),
             present_buffer_capability,
             foreign_open: foreign_ref,
+            host_less_placeholder,
         });
         let registered = crate::adapter::producer::with_allocation_reference(
             passive,
