@@ -103,6 +103,13 @@ pub struct ContextContext {
     present_stream_marker: crate::sync::SpinLock<Option<StashedMarker>>,
     /// One authenticated, generation-qualified execution stream per context.
     execution_stream: AtomicU64,
+    /// Flush-gate trace (`ddi::flush_trace`): what the last `HEFL` Render of this
+    /// context left for the SubmitCommand of the same DMA buffer. DIAGNOSTIC ONLY:
+    /// nothing in the driver's behaviour reads it. `flush_pending_flag` is the lock-free
+    /// "is there one" test, so SubmitCommand takes the lock only for a context that has
+    /// a pending record.
+    flush_pending: crate::sync::SpinLock<Option<helios_kmd_logic::flush_trace::PendingFlush>>,
+    flush_pending_flag: AtomicU32,
 }
 
 /// Typed borrowed view of a scheduler context handle.
@@ -239,6 +246,42 @@ impl<'a> ContextHandleRef<'a> {
     /// one following Present just like the snapshot descriptor.
     pub fn take_present_stream_marker_stash(&self) -> Option<StashedMarker> {
         self.context.present_stream_marker.lock().take()
+    }
+
+    /// Low 32 bits of the context handle (a pointer): enough to tell contexts apart in
+    /// the flush-gate trace.
+    pub fn trace_id(&self) -> u32 {
+        (self.context as *const ContextContext as usize) as u32
+    }
+
+    /// Flush-gate trace: leave `pending` for the SubmitCommand of this Render's DMA
+    /// buffer. Returns true when an earlier one was still waiting (batched, or never
+    /// submitted) and was replaced. PASSIVE (`DxgkDdiRender`).
+    pub fn stash_flush_pending(
+        &self,
+        mut pending: helios_kmd_logic::flush_trace::PendingFlush,
+    ) -> bool {
+        let mut slot = self.context.flush_pending.lock();
+        let replaced = slot.is_some();
+        // The stored record knows it replaced one (it is exempt from the match accounting).
+        pending.replaced = replaced;
+        *slot = Some(pending);
+        // The flag changes only under the lock, so it can never disagree with the slot.
+        self.context.flush_pending_flag.store(1, Ordering::Relaxed);
+        replaced
+    }
+
+    /// Flush-gate trace: take the record the last `HEFL` Render left, if any. One relaxed
+    /// load for the (normal) context with nothing pending; the lock only when the flag says
+    /// there is one. DISPATCH (SubmitCommand).
+    pub fn take_flush_pending(&self) -> Option<helios_kmd_logic::flush_trace::PendingFlush> {
+        if self.context.flush_pending_flag.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let mut slot = self.context.flush_pending.lock();
+        let taken = slot.take();
+        self.context.flush_pending_flag.store(0, Ordering::Relaxed);
+        taken
     }
 }
 
@@ -471,6 +514,8 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         snap_purpose: AtomicU32::new(0),
         present_stream_marker: crate::sync::SpinLock::new(None),
         execution_stream: AtomicU64::new(0),
+        flush_pending: crate::sync::SpinLock::new(None),
+        flush_pending_flag: AtomicU32::new(0),
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;
 

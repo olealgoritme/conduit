@@ -115,6 +115,20 @@ pub(crate) struct PassiveLevel {
 }
 
 impl PassiveLevel {
+    /// The token only if `KeGetCurrentIrql` says PASSIVE_LEVEL right now, else `None`.
+    ///
+    /// Unlike [`Self::assume`] (which COUNTS a wrong claim and hands the token over anyway)
+    /// this REFUSES, so a caller that is about to sleep can bail out instead of sleeping
+    /// above PASSIVE. Nothing is counted into [`IRQL_ASSUME_BAD`]: the caller decides what
+    /// a refusal means.
+    #[inline]
+    pub(crate) fn try_assume() -> Option<Self> {
+        // SAFETY: KeGetCurrentIrql is callable at any IRQL.
+        (unsafe { KeGetCurrentIrql() } == PASSIVE_LEVEL_IRQL).then_some(Self {
+            _not_send: PhantomData,
+        })
+    }
+
     /// Assert that this thread is at `PASSIVE_LEVEL`.
     ///
     /// This is the irreducibly unsafe half of the token: one call per DDI entry

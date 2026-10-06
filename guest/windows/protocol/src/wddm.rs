@@ -307,6 +307,32 @@ pub const HELIOS_WDDM_LAYOUT_VERSION: u32 = 1;
 pub const HELIOS_WDDM_LAYOUT_OFFSET: usize = 96;
 /// Private-data size that covers the layout trailer (96 + 32).
 pub const HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES: usize = 128;
+/// [`HeliosWddmAllocLayout::version`] of a two-plane record (NV12 / P010 / P016,
+/// `HELIOS_FOREIGN_CAP_LAYOUT_FORMATS`): `reserved` holds the plane count (2)
+/// and plane 1 follows at [`HELIOS_WDDM_LAYOUT_PLANE1_OFFSET`]. Version-1 readers
+/// refuse it (`is_valid`), so an older opener falls back instead of misreading.
+/// Every single-plane record, whatever its format, stays version 1.
+pub const HELIOS_WDDM_LAYOUT_VERSION_PLANES: u32 = 2;
+/// Byte offset of [`HeliosWddmAllocPlane`] (plane 1) in the private data.
+pub const HELIOS_WDDM_LAYOUT_PLANE1_OFFSET: usize = 128;
+/// Private-data size of an allocation holding a two-plane foreign resource
+/// (96 + 32 + 16). The creator sends it; the KMD refuses a two-plane adoption
+/// with less, and rewrites all of it at every open.
+pub const HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES: usize = 144;
+
+/// Plane 1 of a two-plane foreign resource, after a version-2
+/// [`HeliosWddmAllocLayout`]. The same 16 bytes as
+/// [`crate::HeliosForeignPlane`]; KMD-written like the layout.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+pub struct HeliosWddmAllocPlane {
+    /// `DRM_FORMAT_MOD_*` of plane 1.
+    pub modifier: u64,
+    /// Plane 1 row pitch in bytes.
+    pub stride: u32,
+    /// Plane 1 offset in bytes.
+    pub plane_offset: u32,
+}
 
 /// Surface layout of an adopted FOREIGN resource (`blob_mem =
 /// HELIOS_BLOB_MEM_RM_EXPORT`), the second trailer of an allocation's private
@@ -366,6 +392,23 @@ impl HeliosWddmAllocLayout {
         layout.is_valid().then_some(layout)
     }
 
+    /// A two-plane record (version 2, `reserved` = 2) and its plane 1, for an
+    /// opener: `None` when `private` holds no valid version-2 record. A
+    /// version-1 record is [`Self::read_open`]'s.
+    pub fn read_open_planes(private: &[u8]) -> Option<(Self, HeliosWddmAllocPlane)> {
+        let bytes =
+            private.get(HELIOS_WDDM_LAYOUT_OFFSET..HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES)?;
+        let layout: Self = bytemuck::pod_read_unaligned(bytes);
+        if layout.magic != HELIOS_WDDM_LAYOUT_MAGIC
+            || layout.version != HELIOS_WDDM_LAYOUT_VERSION_PLANES
+            || layout.reserved != 2
+        {
+            return None;
+        }
+        let p1 = private.get(HELIOS_WDDM_LAYOUT_PLANE1_OFFSET..HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES)?;
+        Some((layout, bytemuck::pod_read_unaligned(p1)))
+    }
+
     /// The trailer repeats `stride` and `plane_offset` of the meta; an opener that
     /// reads both can check they agree.
     #[inline]
@@ -391,6 +434,15 @@ const _: () = {
     assert!(
         HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES
             == HELIOS_WDDM_LAYOUT_OFFSET + size_of::<HeliosWddmAllocLayout>()
+    );
+    assert!(size_of::<HeliosWddmAllocPlane>() == 16);
+    assert!(offset_of!(HeliosWddmAllocPlane, modifier) == 0);
+    assert!(offset_of!(HeliosWddmAllocPlane, stride) == 8);
+    assert!(offset_of!(HeliosWddmAllocPlane, plane_offset) == 12);
+    assert!(HELIOS_WDDM_LAYOUT_PLANE1_OFFSET == HELIOS_WDDM_PRIVATE_WITH_LAYOUT_BYTES);
+    assert!(
+        HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES
+            == HELIOS_WDDM_LAYOUT_PLANE1_OFFSET + size_of::<HeliosWddmAllocPlane>()
     );
 };
 

@@ -275,3 +275,152 @@ present.
   whether the swap to the wire prefix lengthens the wait in practice.
 * Head-of-line cost with DWM among the gated devices (it holds shared surfaces).
 * The `d3d11_share` keyed-load test (400 copies, 20 rounds) on v313 + this change, Venus and NVK.
+
+## 9. Why the gate does not order the key release (investigation, `kmd/flush-gate-why`, diagnostics `kmd/flush-gate-why2`)
+
+Status: the findings are from reading the code. The diagnostics are WRITTEN (pure part host-tested,
+`kmd_render` part type-checked only against a stub harness, see "What was built"); nothing has been
+built as a driver or run in the guest. Context: the `HEFL` packet is off by default, and the peer reports
+that the keyed mutex now passes with an acquirer-side wait, which is finding 1 below. The diagnostics are
+therefore evidence for or against that reading, not a fix.
+
+### Finding (ranked)
+
+1. **Most likely, structural: the acquirer's work is not ordered, whatever the releaser's fence does.**
+   `d3dkmthk.h` (`D3DKMT_RELEASEKEYEDMUTEX.FenceValue` "new fence value to use for GPU sync object",
+   `D3DKMT_ACQUIREKEYEDMUTEX.FenceValue` "current fence value of the GPU sync object") says dxgkrnl's
+   keyed mutex orders GPU work through a GPU sync object: the acquirer's context queue waits on it.
+   That orders only the acquirer's DMA buffers. B's reads run through DXVK into the Venus ring / NVK's
+   RM channel (escapes), never in a DMA buffer, so nothing holds them; B's only DMA packet is its own
+   `HEFL`, queued after the work was already forwarded and never waited for by the UMD. `AcquireSync`
+   returns on the CPU as soon as A calls the release, so B reads while A's 400 copies run. This explains
+   "same on Venus and NVK", "unchanged with the gate active" and "A always sees B's writes" (B's write is
+   small and long finished). It is also the gap `shared-surfaces.md` section 4 named ("the acquirer still
+   issues NVK work dxgkrnl does not see: it needs a GPU wait") and the v1 CPU rule hid: "the acquirer needs
+   nothing" held only while the releaser waited on the CPU. The gate removed that wait.
+2. (a) dxgkrnl eliding the packet: unlikely. `dxgkddi_render` copies the 48 bytes into `pDmaBuffer` and
+   advances it (`submit_command.rs` end of `dxgkddi_render`), so the buffer is non-empty; the counters
+   `FlGRec` = 95 prove Render runs. Whether each packet reaches SubmitCommand is UNMEASURED (no counter).
+3. (b) wrong context: unlikely. The UMD creates one context per device (`device_funcs.rs` CreateDevice) and
+   `send_flush_gate` uses it, like presents.
+4. (c) early retire: not found in the code. `take_one_ready_wddm` retires a stream/RM boundary only when
+   `present_stream_slot_ready` (`retired >= value`); the host retires a fenced SUBMIT_3D only after the
+   renderer signals its fence (`host/backend/device/src/venus/fence.rs`). Unverified traps: a stream point
+   of value 0 ("already complete"), the 250 ms rebase, and the assumption of section 8 that SubmitCommand
+   reads the private-data offset Render wrote (`FlGStrm` counts at Render, not at SubmitCommand).
+5. (d) async submission order of the runtime's signal vs our Render: cannot be seen from the KMD.
+
+### Fix options (the knob exists as a diagnostic, the UMD fix does not)
+
+* Cheapest and testable without a UMD change: the registry knob `FlGSyncMs` (built, see below, default off): the
+  `HEFL` Render waits (bounded, clamped by `clamp_sync_ms`) until its boundary retired
+  (`VirtioGpu::flush_gate_ready`, read-only on `scanout_boundary_ready` / `async_retired_up_to`), so the
+  key release follows completion on the CPU. If `d3d11_share keyed-load` passes with it, finding 1 is
+  confirmed. Cost: a GPU-latency stall per flush of every shared-resource device (DWM too), hence a knob.
+* Proper fix, UMD: the acquirer must not forward work before its own context's pending GPU waits are
+  satisfied, e.g. send a barrier `HEFL` first and wait for its WDDM fence before releasing the batch.
+  Not in this session's scope (umd/ is read-only).
+
+### What was built (`kmd/flush-gate-why2`)
+
+DIAGNOSTIC ONLY. With `FlGSyncMs` at 0 (the default) the driver's behaviour is unchanged: every addition
+records into atomics or a per-context stash and no return value or branch of the old code depends on it.
+
+Pure (`kmd_logic/src/flush_trace.rs`, host-tested): the 64-event `Ring`, `submit_matches`, `lag_us`,
+`verdict`, `clamp_sync_ms` (cap `SYNC_MS_MAX` = 2000 ms), plus `PendingFlush` (what a Render leaves for its
+SubmitCommand), `Outstanding` (16-slot atomics table of queued HEFL fences with their submit stamp, so lag is
+exact even when the ring wrapped), `gate_bits` and `pack_event`.
+
+KMD (`kmd_render/src/ddi/flush_trace.rs`, wired from `submit_command.rs`, `interrupt.rs`, `device.rs`,
+`virtio/gpu/mod.rs`):
+
+| Point | Where | Records |
+|---|---|---|
+| RENDER | end of `flush_gate_record` (PASSIVE) | event with the gate kind (STREAM / FENCE / WIRE flags, plus DEGRADED, STAMPED, ZERO_POINT, BATCHED), `aux` = the stream point asked, `boundary` = the merged boundary or the stamped wire floor; leaves a `PendingFlush` on the context |
+| SUBMIT | both SubmitCommand DDIs, inside `note_and_maybe_signal` under the notify lock | takes the context's pending record; compares the decoded boundary with the merged one (`submit_matches`); event with the gate bits, MATCH, EMPTY (no private-data record found), EXEMPT (batched, see below); recorded AFTER the signal decision, with the fence's disposition: queued (added to `Outstanding`), IMMEDIATE (delivered inside SubmitCommand, and its RETIRE event), or SIGNAL_FAILED (satisfiable but the notification failed or dxgkrnl's callback table was missing: not delivered, not tracked) |
+| RETIRE | completion DPC after a successful `DMA_COMPLETED` (`WddmReady::rebased` read-only accessor), or SubmitCommand itself for an immediate fence | event with the gate bits, `aux` = microseconds since the SUBMIT (exact, from `Outstanding`), REBASED, NO_SUBMIT, AT_SUBMIT |
+| (abandon) | `abandon_pending_submissions` | `Outstanding` cleared (`FlGAbn` counts the dropped fences) |
+| (overlap) | `enqueue_submit_inner`, one relaxed load | `FlGUnord` while a queued HEFL fence is outstanding |
+
+Pairing a Render with its SubmitCommand is per context and one deep (dxgkrnl issues them in order). Two
+Renders before one SubmitCommand count `FlGBat`, and the record that replaced an earlier pending one is EXEMPT:
+the buffer then carries a merge of several Renders' boundaries, so its comparison is counted in neither
+`FlGMat` nor `FlGMis` (`FlGExempt` counts them; `FlGSub` still includes them), and `verdict()` cannot report
+BoundaryLost because of batching alone. The pending slot and its "is there one" flag change together under
+the context's spinlock; SubmitCommand reads the flag with one relaxed load and takes the lock only when set.
+The Outstanding table is reset at transport init (`init_from_registry`), as at an abandon. A HEFL Render whose DMA buffer dxgkrnl never submits would
+hand its record to the NEXT submit of that context (a present's): bounded to one record, and visible as
+`FlGSub` < `FlGRec` plus a mismatch.
+
+### How to read the counters (registry values under the service key, PASSIVE mirror on the present edge)
+
+Published only once a HEFL Render has been seen or `FlGSyncMs` is set; an absent `FlG*` value reads as zero.
+New values (the older `FlGRec FlGStrm FlGFnc FlGWire FlGDeg FlGFlr FlGVer` are unchanged):
+
+* `FlGSub` DMA buffers that reached SubmitCommand with a HEFL record. Compare with `FlGRec`: fewer means
+  dxgkrnl dropped or never submitted some packets (finding 2). `FlGBat` explains part of a gap.
+* `FlGMat` / `FlGMis` the decoded boundary was / was not the one the Render merged. `FlGEmpty` of the
+  mismatches, those where SubmitCommand found no record at all: the private data it reads is not the range
+  Render wrote (the section 8 assumption).
+* `FlGExempt` batched records (see the pairing note above); `FlGSub` = `FlGMat` + `FlGMis` + `FlGExempt`.
+  `FlGSigFail` fences satisfiable at SubmitCommand whose `DMA_COMPLETED` could not be delivered there (not
+  tracked; expected 0, it moves with `DMA_NOTIFY_FAILS`).
+* `FlGImm` fences completed inside SubmitCommand, never queued: the gate held nothing. `FlGImm` close
+  to `FlGSub` means the gate cannot order anything.
+* `FlGRet` tracked fences delivered (immediate ones included); `FlGReb` of them released by the `WddmHeadMs`
+  rebase, not by the point.
+* `FlGLagAvg` / `FlGLagMax` microseconds from SubmitCommand to `DMA_COMPLETED` of the QUEUED fences. A few
+  microseconds is a wait-free pickup; the copies of the failing keyed test take milliseconds, so a gate that
+  really waits reads in the milliseconds.
+* `FlGUnord` Venus transport submissions that entered while a queued HEFL fence was outstanding. Adapter
+  wide: DWM's and the releaser's own next frame count too. Evidence that nothing holds other work behind the
+  gate, not of one consumer.
+* `FlGTblFull` queued fences the 16-slot table had no room for (not tracked, so under-counted in `FlGRet`).
+* `FlGVerdict` the pure reduction (`flush_trace::Verdict`): 0 no data, 1 not submitted, 2 boundary lost,
+  3 retired at submit, 4 rebased, 5 consumer unordered (every step honest AND other work entered while the
+  gate was open: finding 1), 6 gate honest (the cause is not in what the KMD observes: read the events).
+* `FlGEvSeq` the ring cursor; `FlGEv0` .. `FlGEv7` the newest eight events, `FlGEv0` the newest, each packed
+  by `pack_event`: bits 30..31 kind (1 RENDER, 2 SUBMIT, 3 RETIRE, 0 empty), bits 22..29 flags, bits 0..21
+  `aux` (microseconds for SUBMIT / RETIRE since the Render / SUBMIT, the stream point for RENDER; clipped to
+  4 194 303). Flags of RENDER: 1 STREAM, 2 FENCE, 4 WIRE, 8 DEGRADED, 16 STAMPED, 32 ZERO_POINT, 64 BATCHED.
+  Flags of SUBMIT: 1 MATCH, 2 IMMEDIATE, 4 EMPTY, 8 EXEMPT, 128 SIGNAL_FAILED, and the gate kind 16 STREAM / 32 FENCE / 64 WIRE. Flags
+  of RETIRE: 1 REBASED, 2 NO_SUBMIT, 4 AT_SUBMIT, and the gate kind as for SUBMIT. The full 64-event ring
+  (with fence ids, boundaries, stamps) is the static `RING` in `ddi/flush_trace.rs`, readable from a debugger.
+* `FlGSyncEff` the `FlGSyncMs` value in force after clamping (0 = off). Shows whether the knob took.
+
+### The `FlGSyncMs` knob (default 0 = off)
+
+Service-key REG_DWORD `FlGSyncMs`, snapshotted at transport init (`pnputil /restart-device` applies it),
+clamped in code to 2000 ms. When nonzero a HEFL Render that carries a boundary (stream point / RM fence) or
+a wire floor waits, at the end of `flush_gate_record`, until that wait has retired
+(`VirtioGpu::flush_gate_ready`), then returns, so the runtime's key release follows the GPU completion on
+the CPU. Rules it was built to: PASSIVE only, and CHECKED (`DxgkDdiRender` is documented PASSIVE, but
+`PassiveLevel::assume` only counts a wrong claim, so the wait reads the live IRQL with
+`PassiveLevel::try_assume` just before its first sleep and, above PASSIVE, returns without sleeping and counts
+`FlGSyncSkip`); no lock across the wait (each poll takes
+`virtio_lock` for one read-only readiness test and drops it before sleeping, the same way `ctrl::wait_block`
+does, including draining the used ring so a lost interrupt cannot pass for a timeout); bounded (the
+deadline, plus one timer tick of overshoot: a 1 ms `KeDelayExecutionThread` sleeps up to ~15.6 ms); a dead
+stream, a failed transport or a down transport ends the wait at once. With 0 nothing runs, not even the
+IRQL check. `FlGSyncSkip` > 0 means some waits were skipped for IRQL and the experiment is incomplete.
+
+Reading it: `FlGSyncWt` waits that actually blocked (0 means the boundary was always already ready, or the
+knob did not take: check `FlGSyncEff`), `FlGSyncTmo` those that hit the bound, `FlGSyncMaxUs` the longest.
+Run the failing keyed-mutex test with the knob at, say, 100.
+* It passes, `FlGSyncWt` > 0, `FlGSyncTmo` = 0: the ordering failure is a CPU-vs-GPU race (the release
+  outran the releaser's work), finding 1 (the acquirer's work is not ordered by the packet; the CPU wait
+  covers for it).
+* It still fails with `FlGSyncWt` > 0 and no timeouts: the releaser's work was complete before the release;
+  the failure is not the gate's ordering at all (look at the acquirer, finding 1 / 5).
+* `FlGSyncTmo` > 0: the point did not retire within the bound; read `FlGEv*` / `FlGReb` before concluding.
+
+### Not done / not verified
+
+* Nothing was built as a driver (no WDK target here) or run in the guest. The pure code has host tests;
+  the `kmd_render` code was type-checked against a stub harness that mirrors the module visibility and the
+  signatures used (not the WDK bindings), and parsed with `rustfmt`.
+* Whether the SubmitCommand-side `hContext` read is valid on the virtual path when
+  `DmaBufferUmdPrivateDataSize` is nonzero is not assumed: the trace is skipped there, exactly like the
+  execution-record decode (`FlGSub` would then under-count; `FlGVerdict` 1 on that path means "not traced").
+* Read after the next run: `FlGSub` vs `FlGRec`, then `FlGMis` / `FlGEmpty`, `FlGImm`, `FlGLagAvg`, `FlGUnord`,
+  `FlGVerdict`, and the knob experiment above.

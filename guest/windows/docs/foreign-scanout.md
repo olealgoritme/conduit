@@ -252,6 +252,53 @@ is visible.
 `FsSet - FsRel - FsLapse - FsEnd - FsTake` (0 or 1). `FsSupp` rising with no source
 live is a bug. `FsRest` should track `FsRel + FsLapse + FsEnd`.
 
+### Reading vsync rates
+
+The heartbeat has exactly one source: `service_vsync_tick` (`adapter/kobj.rs`), run by a
+one-shot fixed-phase timer at the display rate (41667 units of 100 ns at 240 Hz, 166667 at
+60 Hz). It never catches up, so it does not burst. Its tick count is mirrored into the
+service key from three places, at different times, which is why a count read from one
+mirror and divided by wall-clock time (or by another mirror's time) is not a rate:
+
+| count | its time | written by | when |
+|---|---|---|---|
+| `ScVs` | `ScVsT` | `enum_cofunc_modality` (`ddi/vidpn.rs`) | each call, dozens during a mode set, then rarely |
+| `VpVsN` | `VpVsT` | `scanout_trace::dump` | first HPD worker wake, then every 128th |
+| `VsCnt` | `VsCntT` | `pacing_snapshot` (`adapter/scanout.rs`) | about every 600 refreshes |
+
+Every `*T` value is the interrupt time, in milliseconds (wraps at 2^32 ms, 49.7 days), of
+the tick that last advanced the count beside it. `VpDmpT` is the interrupt time of the
+`VpVsN` dump itself, on the same clock. The tick-gap statistics are also written by the dump:
+
+* `VsMinGap`: the smallest gap between two consecutive ticks since boot, in 100 ns units
+  (`0xFFFFFFFF` = none measured yet). The first tick after an arm is ignored (arm and
+  disarm forget the previous tick), so a D3 round trip does not show up as a gap.
+* `VsFast`: ticks that came closer than half a period to the previous one. A late tick is
+  followed by one on the original phase, so a few are normal after a DPC latency spike; a
+  burst would show `VsFast` close to the tick count. Ticks while `ControlInterrupt` has the
+  delivery gate closed (`VpVsEn` 0) count here but do not advance the count or its time.
+
+Recipe, using only values written by one dump (or one `enum_cofunc_modality` call):
+
+1. Read the pair `(count, time)` twice, far enough apart that a dump happened in between:
+   `VpDmpT` must have changed. Two reads inside one dump interval return the same values
+   and a rate from them is undefined (zero elapsed time), not 0.
+2. Rate = `(N2 - N1) / ((T2 - T1) / 1000)` ticks per second, with `N`/`T` from the same
+   mirror (`VpVsN`/`VpVsT`) in both reads, or across mirrors with each count paired to its
+   own time (`ScVs`/`ScVsT` against `VpVsN`/`VpVsT`). Differences are wrapping `u32`.
+   `kmd_logic::vsync_rate::rate_mhz` is this arithmetic (millihertz: 240000 = 240 Hz).
+3. Sanity: `VpDmpT - VpVsT` (`vsync_rate::age_ms`) is under one period on a running
+   heartbeat (about 4 ms at 240 Hz); seconds mean it stalled or the gate is off. The rate
+   should match the mode's refresh (`VpRfr`, millihertz) within a fraction of a percent;
+   a result thousands of times off (for example 4000/s against a 240 Hz mode) means the
+   count and time did not come from the same pair, or the machine rebooted between reads
+   (the registry keeps the previous boot's values until the first dump).
+4. `VsMinGap` close to the period and `VsFast` near 0 (against `VpVsN`) confirm no burst.
+
+A count and its time are two registry values read at slightly different instants, so a
+pair can be one tick (4 ms at 240 Hz) apart; this matters for intervals of a few ticks, not
+for seconds.
+
 ## What is not done
 
 * The flip is not issued from the WDDM present/flip path. `PRESENT` is a PASSIVE

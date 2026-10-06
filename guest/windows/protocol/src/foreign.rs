@@ -91,6 +91,15 @@ pub const HELIOS_FOREIGN_CAP_SHARED_OPEN: u32 = 1 << 1;
 /// [`HELIOS_FOREIGN_CAP_SHARED_OPEN`]. Without it the op answers
 /// [`HELIOS_FOREIGN_ST_UNSUPPORTED`] and touches nothing.
 pub const HELIOS_FOREIGN_CAP_RM_RESOURCE_IMPORT: u32 = 1 << 2;
+/// `QueryCaps.caps_flags`: the layout record takes every format of
+/// [`share_format`] (not only the four 32-bit RGB ones), the
+/// [`HELIOS_FOREIGN_IMPORT_FLAG_PLANE1`] tail for two-plane formats, and the KMD
+/// writes the version-2 trailer ([`crate::HELIOS_WDDM_LAYOUT_VERSION_PLANES`],
+/// plane 1 at [`crate::HELIOS_WDDM_LAYOUT_PLANE1_OFFSET`]) for a two-plane
+/// record. KMD-only (the host moves one object and never looks at its format).
+/// Without it a client mints ids for the 32-bit RGB formats only.
+/// `guest/windows/docs/shared-formats.md`.
+pub const HELIOS_FOREIGN_CAP_LAYOUT_FORMATS: u32 = 1 << 3;
 
 pub const HELIOS_FOREIGN_ST_OK: i32 = 0;
 /// The op is valid in this ABI but not served: `CAP_RM_IMPORT` is not set.
@@ -185,6 +194,12 @@ pub const HELIOS_FOREIGN_QUERY_CAPS_BYTES: usize = 96;
 /// unchanged so a client can still build it as the prefix of the 104-byte one.
 pub const HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT: u32 = 1 << 0;
 
+/// `IMPORT_RM.flags` bit (with [`HELIOS_FOREIGN_CAP_LAYOUT_FORMATS`]): plane 1
+/// of a two-plane format follows the layout ([`HeliosForeignImportRmPlanes`],
+/// 120 bytes). Only together with [`HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT`]; set iff
+/// the fourcc has two planes ([`ShareFormat::planes`]).
+pub const HELIOS_FOREIGN_IMPORT_FLAG_PLANE1: u32 = 1 << 1;
+
 /// `IMPORT_RM`. 72 bytes, followed by the 32-byte [`HeliosForeignLayout`] when
 /// [`HELIOS_FOREIGN_IMPORT_FLAG_LAYOUT`] is set (always, in a served gate).
 ///
@@ -266,6 +281,151 @@ pub struct HeliosForeignImportRmLayout {
 }
 
 pub const HELIOS_FOREIGN_IMPORT_RM_LAYOUT_BYTES: usize = 104;
+
+/// One more plane of a foreign resource: plane 1 of NV12 / P010 / P016 (the
+/// interleaved chroma, `width / 2` x `height / 2` texel pairs). 16 bytes. Its
+/// own modifier because NVK picks the block height per plane extent; it must be
+/// LINEAR iff plane 0's is, and from the same block-linear family otherwise.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+pub struct HeliosForeignPlane {
+    /// `DRM_FORMAT_MOD_*` of this plane.
+    pub modifier: u64,
+    /// Row pitch in bytes.
+    pub stride: u32,
+    /// Byte offset from the start of the object; past plane 0.
+    pub offset: u32,
+}
+
+pub const HELIOS_FOREIGN_PLANE_BYTES: usize = 16;
+
+/// `IMPORT_RM` with layout and plane 1 ([`HELIOS_FOREIGN_IMPORT_FLAG_PLANE1`]).
+/// 120 bytes. Only the 72-byte `base.base` is written back.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosForeignImportRmPlanes {
+    pub base: HeliosForeignImportRmLayout,
+    pub plane1: HeliosForeignPlane,
+}
+
+pub const HELIOS_FOREIGN_IMPORT_RM_PLANES_BYTES: usize = 120;
+
+// ---------------------------------------------------------------------------
+// The formats a foreign resource may hold (HELIOS_FOREIGN_CAP_LAYOUT_FORMATS)
+// ---------------------------------------------------------------------------
+//
+// What the Windows desktop and browsers share between processes, by DRM fourcc
+// (the layout record's format code); guest/windows/docs/shared-formats.md.
+
+pub const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+pub const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+pub const DRM_FORMAT_XBGR8888: u32 = 0x3432_4258;
+pub const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
+pub const DRM_FORMAT_R8: u32 = 0x2020_3852;
+pub const DRM_FORMAT_GR88: u32 = 0x3838_5247;
+pub const DRM_FORMAT_R16: u32 = 0x2036_3152;
+pub const DRM_FORMAT_GR1616: u32 = 0x3233_5247;
+pub const DRM_FORMAT_RGB565: u32 = 0x3631_4752;
+pub const DRM_FORMAT_ARGB1555: u32 = 0x3531_5241;
+pub const DRM_FORMAT_ARGB4444: u32 = 0x3231_5241;
+pub const DRM_FORMAT_ABGR2101010: u32 = 0x3033_4241;
+pub const DRM_FORMAT_ABGR16161616F: u32 = 0x4834_4241;
+pub const DRM_FORMAT_ABGR16161616: u32 = 0x3834_4241;
+pub const DRM_FORMAT_YUYV: u32 = 0x5659_5559;
+pub const DRM_FORMAT_NV12: u32 = 0x3231_564E;
+pub const DRM_FORMAT_P010: u32 = 0x3031_3050;
+pub const DRM_FORMAT_P016: u32 = 0x3631_3050;
+
+/// How a [`share_format`] lays out its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShareFormat {
+    /// 1, or 2 for the 4:2:0 formats (plane 1: interleaved chroma at half
+    /// width and half height).
+    pub planes: u32,
+    /// Bytes of one texel of plane 0 (YUYV: of one two-pixel group).
+    pub bpp0: u32,
+    /// Bytes of one texel of plane 1 (a chroma pair), 0 for one plane.
+    pub bpp1: u32,
+    /// Plane 0 texels per row = `width.div_ceil(hdiv0)` (2 for YUYV, else 1).
+    pub hdiv0: u32,
+    /// `width` must be even (4:2:2 and 4:2:0).
+    pub even_width: bool,
+    /// `height` must be even (4:2:0).
+    pub even_height: bool,
+}
+
+impl ShareFormat {
+    const fn one(bpp: u32) -> Self {
+        Self { planes: 1, bpp0: bpp, bpp1: 0, hdiv0: 1, even_width: false, even_height: false }
+    }
+
+    const fn yuv420(bpp0: u32) -> Self {
+        Self { planes: 2, bpp0, bpp1: bpp0 * 2, hdiv0: 1, even_width: true, even_height: true }
+    }
+
+    /// Bytes of one row of plane `plane` of a `width`-pixel image, unpadded.
+    pub const fn row_bytes(&self, plane: u32, width: u32) -> u64 {
+        if plane == 0 {
+            (width.div_ceil(self.hdiv0) as u64) * self.bpp0 as u64
+        } else {
+            (width.div_ceil(2) as u64) * self.bpp1 as u64
+        }
+    }
+
+    /// Rows of plane `plane` of a `height`-row image.
+    pub const fn rows(&self, plane: u32, height: u32) -> u32 {
+        if plane == 0 {
+            height
+        } else {
+            height.div_ceil(2)
+        }
+    }
+
+    /// The alignment a plane's stride must have: its texel size, at most 4.
+    pub const fn stride_align(&self, plane: u32) -> u32 {
+        let bpp = if plane == 0 { self.bpp0 } else { self.bpp1 };
+        if bpp > 4 {
+            4
+        } else {
+            bpp
+        }
+    }
+
+    /// One of the four 32-bit RGB formats every KMD with `IMPORT_RM` takes.
+    pub const fn is_rgb32(fourcc: u32) -> bool {
+        matches!(
+            fourcc,
+            DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 | DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888
+        )
+    }
+}
+
+/// The layout facts of `fourcc`, or `None` for a format a foreign resource may
+/// not hold. The four 32-bit RGB formats are always in; the rest need
+/// [`HELIOS_FOREIGN_CAP_LAYOUT_FORMATS`].
+pub const fn share_format(fourcc: u32) -> Option<ShareFormat> {
+    Some(match fourcc {
+        DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 | DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888 => {
+            ShareFormat::one(4)
+        }
+        DRM_FORMAT_R8 => ShareFormat::one(1),
+        DRM_FORMAT_GR88 | DRM_FORMAT_R16 | DRM_FORMAT_RGB565 | DRM_FORMAT_ARGB1555
+        | DRM_FORMAT_ARGB4444 => ShareFormat::one(2),
+        DRM_FORMAT_GR1616 | DRM_FORMAT_ABGR2101010 => ShareFormat::one(4),
+        DRM_FORMAT_ABGR16161616F | DRM_FORMAT_ABGR16161616 => ShareFormat::one(8),
+        DRM_FORMAT_YUYV => ShareFormat {
+            planes: 1,
+            bpp0: 4,
+            bpp1: 0,
+            hdiv0: 2,
+            even_width: true,
+            even_height: false,
+        },
+        DRM_FORMAT_NV12 => ShareFormat::yuv420(1),
+        DRM_FORMAT_P010 | DRM_FORMAT_P016 => ShareFormat::yuv420(2),
+        _ => return None,
+    })
+}
 
 /// `RM_RESOURCE_IMPORT`. 80 bytes, no trailing data.
 ///
@@ -361,6 +521,16 @@ const _: () = {
     assert!(offset_of!(HeliosForeignImportRmLayout, base) == 0);
     assert!(offset_of!(HeliosForeignImportRmLayout, layout) == HELIOS_FOREIGN_IMPORT_RM_BYTES);
 
+    assert!(size_of::<HeliosForeignPlane>() == HELIOS_FOREIGN_PLANE_BYTES);
+    assert!(offset_of!(HeliosForeignPlane, modifier) == 0);
+    assert!(offset_of!(HeliosForeignPlane, stride) == 8);
+    assert!(offset_of!(HeliosForeignPlane, offset) == 12);
+    assert!(size_of::<HeliosForeignImportRmPlanes>() == HELIOS_FOREIGN_IMPORT_RM_PLANES_BYTES);
+    assert!(offset_of!(HeliosForeignImportRmPlanes, base) == 0);
+    assert!(
+        offset_of!(HeliosForeignImportRmPlanes, plane1) == HELIOS_FOREIGN_IMPORT_RM_LAYOUT_BYTES
+    );
+
     assert!(size_of::<HeliosForeignRmResourceImport>() == HELIOS_FOREIGN_RM_RESOURCE_IMPORT_BYTES);
     assert!(offset_of!(HeliosForeignRmResourceImport, rm_handle) == 40);
     assert!(offset_of!(HeliosForeignRmResourceImport, resource_id) == 44);
@@ -422,6 +592,57 @@ mod tests {
             };
         }
         panic!("{name} is not defined in helios_foreign.h");
+    }
+
+    #[test]
+    fn the_shared_format_table_and_its_c_mirror() {
+        for (name, v) in [
+            ("HELIOS_FOREIGN_CAP_LAYOUT_FORMATS", HELIOS_FOREIGN_CAP_LAYOUT_FORMATS),
+            ("HELIOS_FOREIGN_IMPORT_FLAG_PLANE1", HELIOS_FOREIGN_IMPORT_FLAG_PLANE1),
+            ("HELIOS_DRM_FORMAT_R8", DRM_FORMAT_R8),
+            ("HELIOS_DRM_FORMAT_GR88", DRM_FORMAT_GR88),
+            ("HELIOS_DRM_FORMAT_R16", DRM_FORMAT_R16),
+            ("HELIOS_DRM_FORMAT_GR1616", DRM_FORMAT_GR1616),
+            ("HELIOS_DRM_FORMAT_RGB565", DRM_FORMAT_RGB565),
+            ("HELIOS_DRM_FORMAT_ARGB1555", DRM_FORMAT_ARGB1555),
+            ("HELIOS_DRM_FORMAT_ARGB4444", DRM_FORMAT_ARGB4444),
+            ("HELIOS_DRM_FORMAT_ABGR2101010", DRM_FORMAT_ABGR2101010),
+            ("HELIOS_DRM_FORMAT_ABGR16161616F", DRM_FORMAT_ABGR16161616F),
+            ("HELIOS_DRM_FORMAT_ABGR16161616", DRM_FORMAT_ABGR16161616),
+            ("HELIOS_DRM_FORMAT_YUYV", DRM_FORMAT_YUYV),
+            ("HELIOS_DRM_FORMAT_NV12", DRM_FORMAT_NV12),
+            ("HELIOS_DRM_FORMAT_P010", DRM_FORMAT_P010),
+            ("HELIOS_DRM_FORMAT_P016", DRM_FORMAT_P016),
+            ("HELIOS_WDDM_LAYOUT_VERSION_PLANES", crate::HELIOS_WDDM_LAYOUT_VERSION_PLANES),
+            ("HELIOS_WDDM_LAYOUT_PLANE1_OFFSET", crate::HELIOS_WDDM_LAYOUT_PLANE1_OFFSET as u32),
+            (
+                "HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES",
+                crate::HELIOS_WDDM_PRIVATE_WITH_PLANES_BYTES as u32,
+            ),
+        ] {
+            assert_eq!(c_define(name), v as u64, "{name}");
+        }
+        // The fourccs spell what drm_fourcc.h spells.
+        let cc = |s: &[u8; 4]| u32::from_le_bytes(*s);
+        assert_eq!(DRM_FORMAT_R8, cc(b"R8  "));
+        assert_eq!(DRM_FORMAT_NV12, cc(b"NV12"));
+        assert_eq!(DRM_FORMAT_P010, cc(b"P010"));
+        assert_eq!(DRM_FORMAT_ABGR16161616F, cc(b"AB4H"));
+        assert_eq!(DRM_FORMAT_ABGR2101010, cc(b"AB30"));
+        assert_eq!(DRM_FORMAT_YUYV, cc(b"YUYV"));
+
+        let nv12 = share_format(DRM_FORMAT_NV12).unwrap();
+        assert_eq!((nv12.planes, nv12.row_bytes(0, 1920), nv12.row_bytes(1, 1920)), (2, 1920, 1920));
+        assert_eq!((nv12.rows(0, 1080), nv12.rows(1, 1080)), (1080, 540));
+        let p010 = share_format(DRM_FORMAT_P010).unwrap();
+        assert_eq!((p010.row_bytes(0, 1920), p010.row_bytes(1, 1920)), (3840, 3840));
+        let yuyv = share_format(DRM_FORMAT_YUYV).unwrap();
+        assert_eq!(yuyv.row_bytes(0, 1920), 3840);
+        let f16 = share_format(DRM_FORMAT_ABGR16161616F).unwrap();
+        assert_eq!((f16.row_bytes(0, 100), f16.stride_align(0)), (800, 4));
+        assert_eq!(share_format(DRM_FORMAT_R8).unwrap().stride_align(0), 1);
+        assert!(share_format(0).is_none());
+        assert!(ShareFormat::is_rgb32(DRM_FORMAT_ARGB8888) && !ShareFormat::is_rgb32(DRM_FORMAT_R8));
     }
 
     #[test]

@@ -20,12 +20,14 @@
 
 pub mod edid;
 pub mod external_memory;
+pub mod nvrm_clients;
 pub mod nvrm_events;
 pub mod nvrm_fastpath;
 pub mod nvrm_fence;
 pub mod nvrm_views;
 pub mod foreign_copy;
 pub mod foreign_errno;
+pub mod foreign_flip;
 pub mod foreign_resource;
 pub mod foreign_scanout;
 pub mod rm_resource_import;
@@ -35,14 +37,18 @@ pub mod rm_present;
 pub mod rm_refresh;
 pub mod rm_blt;
 pub mod scanout_release;
+pub mod rm_standard;
 pub mod rm_sysmem;
 pub mod producer_completion;
 pub mod execution_completion;
 pub mod flush_gate;
+pub mod flush_trace;
 pub mod rm_fence_present;
+pub mod present_foreign;
 pub mod msi;
 pub mod paging;
 pub mod sweep_budget;
+pub mod vsync_rate;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///

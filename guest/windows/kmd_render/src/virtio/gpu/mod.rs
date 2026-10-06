@@ -2212,6 +2212,13 @@ impl WddmReady {
         self.pending.fence
     }
 
+    /// Whether this fence was released by the `WddmHeadMs` rebase (its tagged
+    /// dependency replaced by the conservative wire prefix). Read-only; the flush-gate
+    /// trace records it.
+    pub(crate) fn rebased(&self) -> bool {
+        self.pending.rebased
+    }
+
     pub(crate) fn terminal_prefix(&self) -> Option<WindowedBltTerminalPrefix> {
         self.terminal_prefix
     }
@@ -2346,6 +2353,12 @@ pub struct VirtioGpu {
     nvrm_handles: Vec<nvrm_tables::NvrmHandleSlot>,
     /// Slots reserved by in-flight forwarded `Open`s.
     nvrm_reserved: usize,
+    /// RM clients (`NV01_ROOT`) each owner was given, learned from forwarded replies, so
+    /// a payload that names a client can be checked against the caller
+    /// (`kmd_logic::nvrm_clients`, `virtio/nvrm_harden.rs`). Part of the transport: a
+    /// new transport starts with none. Boxed (4 KiB) and built by
+    /// [`nvrm_tables::new_client_table`], for the same frame-size reason as `nvrm_fences`.
+    nvrm_clients: Box<helios_kmd_logic::nvrm_clients::ClientTable>,
     /// `SEMSURF_FENCE_CREATE`s in flight and the `EventReady`s that beat their
     /// handle's recording (see `kmd_logic::nvrm_fence`). Also reserved slots: a
     /// create reserves one in `nvrm_reserved` like an `Open`.
@@ -3022,6 +3035,7 @@ impl VirtioGpu {
             scanout_release: scanout_release_on,
             nvrm_handles: Vec::with_capacity(MAX_NVRM_HANDLES),
             nvrm_reserved: 0,
+            nvrm_clients: nvrm_tables::new_client_table(),
             nvrm_fences: nvrm_tables::new_fence_book(),
             nvrm_maps: Vec::with_capacity(MAX_NVRM_MAPS),
             nvrm_pins: Vec::with_capacity(MAX_NVRM_PINS),
@@ -3125,6 +3139,9 @@ impl VirtioGpu {
             ),
             Ordering::Relaxed,
         );
+        // `FlGSyncMs` (flush-gate diagnostic, default 0 = off): snapshotted here with the
+        // other knobs; clamped in `flush_trace::init_from_registry`.
+        crate::ddi::flush_trace::init_from_registry();
         // (The old Gate-2 venus ctx self-test is gone: the StartDevice venus
         // client bring-up right after transport init exercises the full context
         // + blob lifecycle for real.)
@@ -4496,6 +4513,9 @@ impl VirtioGpu {
         self.next_wire_fence += 1;
         let ring = cmd.hdr.ring_idx;
         ASYNC_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+        // Flush-gate trace (diagnostic): one relaxed load. Counts a transport submission
+        // that entered while a queued `HEFL` fence was outstanding (`FlGUnord`).
+        crate::ddi::flush_trace::note_transport_submit();
         if ring != 0 {
             RING_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
         }
@@ -6057,6 +6077,28 @@ impl VirtioGpu {
     /// generation issued, or `None` when it has issued none.
     pub fn flush_wire_floor(&self) -> Option<u64> {
         helios_kmd_logic::flush_gate::wire_floor(self.wire_fence_base, self.next_wire_fence)
+    }
+
+    /// Whether the wait a flush-gate packet carries has been satisfied (read-only;
+    /// `FlGSyncMs`, `ddi::flush_trace::sync_wait`). `boundary` is the tagged boundary the
+    /// packet kept (0 for none), `floor` the wire floor it was stamped with (0 for none).
+    ///
+    /// * A tagged boundary is ready when [`Self::scanout_boundary_ready`] says so, or
+    ///   when its stream is gone: a dead stream's wait is discharged by the lifecycle
+    ///   code, not by completing, and waiting on it would only burn the knob's budget.
+    /// * A wire floor `f` is the last fence this generation had issued, so "everything up
+    ///   to and including `f` retired" is `async_retired_up_to(f + 1)`.
+    /// * Neither: nothing to wait for.
+    pub fn flush_gate_ready(&self, boundary: u64, floor: u64) -> bool {
+        if boundary != 0 {
+            // A failed transport can retire nothing: do not burn the knob's budget on it.
+            return self.failed
+                || self.scanout_boundary_ready(boundary)
+                || !self.present_stream_boundary_live(boundary);
+        }
+        floor == 0
+            || self.failed
+            || self.async_retired_up_to(floor.saturating_add(1), RetireDomain::IncludingGpu)
     }
 
     fn present_stream_marker_boundary_counted(

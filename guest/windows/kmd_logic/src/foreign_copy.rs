@@ -273,7 +273,7 @@ pub fn layout_from_open(
 /// Whether the device bring-up should try the export trio plus
 /// `VK_EXT_image_drm_format_modifier` first.
 ///
-/// All three must hold: the `ForeignCopy` knob (default on) allows it, the
+/// All three must hold: the `ForeignCopy` knob (default off; set 1) allows it, the
 /// adapter is the display half (the only shape that has a scan-out copy at all),
 /// and the host serves `IMPORT_RM` (otherwise no foreign resource can ever exist
 /// and the extension would only add the 38th-session risk to a device that

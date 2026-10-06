@@ -293,11 +293,22 @@ pub(crate) fn publish_nvrm_counters() {
     );
     // The KMD's own RM client (`KmdRmClient`): `Rm*`, written only once it has run.
     crate::virtio::rm_client::publish_counters();
+    // The KMD's flip of a foreign allocation (`ForeignFlip`): `Ff*`, written only once the
+    // knob was on and an allocation was programmed.
+    crate::virtio::foreign_flip::publish_counters();
     // The KMD copy of a foreign resource into the scan-out image (`Fc*`): imports
     // made (`FcImp`, split `FcScan` / `FcBlt`), refusals (`FcRefuse`, last reason
     // `FcRefCode`), host refusals (`FcHostErr`), device without the extension
     // (`FcNoExt`), stale or unknown records (`FcStale`), knob off (`FcOff`).
     crate::virtio::venus::publish_foreign_copy_counters();
+    // A Present refusal caused by a foreign allocation, answered with success: `PrFgSkip`
+    // (last reason `PrFgWhy`, per arm `PrFgBlt` / `PrFgFlip`), written once one happened.
+    crate::ddi::present_foreign::publish_counters();
+    // Cross-client hardening of forwarded RM ioctls (`NvDupHarden`): clients recorded /
+    // dropped / refused for room (`NvCli*`), and requests that named a client or file
+    // that is not the caller's (`NvDup*`). Nonzero `NvDupDeny` / `NvDupWould` outside a
+    // deliberate negative test means a process names something that is not its own.
+    crate::virtio::nvrm_harden::publish_counters();
     // RM fence handles (a forwarded SEMSURF_FENCE_CREATE): `NvFence` made and
     // recorded, `NvFenceCl` released (Close or teardown; the difference is what is
     // live), `NvFenceSig` EventReadys seen for fences, `NvFenceEarly` of those that
@@ -464,6 +475,9 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"FlGVer",
         FLUSH_GATE_UNKNOWN_VERSION.load(Ordering::Relaxed),
     );
+    // Flush-gate timeline (`ddi::flush_trace`, `docs/flush-gate.md` section 9): submits,
+    // retires, lag, the newest ring events and the verdict.
+    crate::ddi::flush_trace::publish_counters();
     // ⛔ ADAPTER-GLOBAL, AND DWM MOVES IT. A guest-supplied boundary replaced by
     // the conservative prefix, from EITHER writer — `wddm_boundary::select` decides
     // the rejection before it reads the `d3d12` bit, so the D3D11 present BLT
@@ -948,12 +962,20 @@ fn note_and_maybe_signal(
     is_paging: bool,
     present_submission: Option<PresentSubmissionBoundary>,
     execution_boundary: Option<(u64, Option<u64>)>,
+    // Flush-gate trace (`ddi::flush_trace`): `Some` only for the SubmitCommand that
+    // follows a `HEFL` Render. Record-only; nothing below branches on it.
+    trace: Option<&crate::ddi::flush_trace::SubmitTrace>,
 ) -> SubmitAck {
     let Ok(dxgkrnl) = adapter.dxgkrnl() else {
         // Effectively unreachable: dxgkrnl is set at StartDevice and never
         // cleared, and SubmitCommand cannot precede it. The submission stays in
         // the FIFO for the DPC either way.
         DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
+        // The pending record was already taken: record it so the trace stays consistent
+        // (nothing delivered, nothing tracked).
+        if let Some(trace) = trace {
+            trace.record(fence, crate::ddi::flush_trace::Disposition::SignalFailed);
+        }
         return SubmitAck::Accepted;
     };
     adapter.with_wddm_notify_lock(|guard| {
@@ -991,9 +1013,18 @@ fn note_and_maybe_signal(
             })
             // Transport down (bring-up / teardown): no venus work can gate it.
             .unwrap_or(false);
+        // What became of the fence, for the trace (recorded below, still under the
+        // notification lock, so the completion DPC cannot retire a queued fence before its
+        // submit is recorded).
+        let mut disposition = crate::ddi::flush_trace::Disposition::Queued;
         if signal_now {
             // SAFETY: the notification lock is held and dxgkrnl is live.
             let status = unsafe { signal_dma_completed(guard, dxgkrnl, fence) };
+            disposition = if status == STATUS_SUCCESS {
+                crate::ddi::flush_trace::Disposition::Immediate
+            } else {
+                crate::ddi::flush_trace::Disposition::SignalFailed
+            };
             if status != STATUS_SUCCESS {
                 // Same handling as the DPC path in R209: count it and leave the
                 // retirement to a later DPC rather than failing the submission.
@@ -1004,6 +1035,9 @@ fn note_and_maybe_signal(
                     unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
                 }
             }
+        }
+        if let Some(trace) = trace {
+            trace.record(fence, disposition);
         }
     });
     if execution_boundary.is_some() {
@@ -1309,8 +1343,22 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
     } else {
         None
     };
-    let SubmitAck::Accepted =
-        note_and_maybe_signal(adapter, fence, is_paging, present_fence, execution_boundary);
+    // Flush-gate trace: the record the context's last `HEFL` Render left, if any.
+    // SAFETY: the same hContext the execution-record decode above reads, under the
+    // same condition.
+    let trace = if !is_paging && submit.DmaBufferUmdPrivateDataSize == 0 {
+        unsafe { crate::ddi::flush_trace::submit_trace(submit.hContext, present_fence) }
+    } else {
+        None
+    };
+    let SubmitAck::Accepted = note_and_maybe_signal(
+        adapter,
+        fence,
+        is_paging,
+        present_fence,
+        execution_boundary,
+        trace.as_ref(),
+    );
     STATUS_SUCCESS
 }
 
@@ -1361,8 +1409,26 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     } else {
         None
     };
-    let SubmitAck::Accepted =
-        note_and_maybe_signal(adapter, fence, is_paging, present_fence, execution_boundary);
+    // Flush-gate trace: the record the context's last `HEFL` Render left, if any.
+    // SAFETY: the same hContext the execution-record decode above reads.
+    let trace = if !is_paging {
+        unsafe {
+            crate::ddi::flush_trace::submit_trace(
+                submit.__bindgen_anon_1.hContext,
+                present_fence,
+            )
+        }
+    } else {
+        None
+    };
+    let SubmitAck::Accepted = note_and_maybe_signal(
+        adapter,
+        fence,
+        is_paging,
+        present_fence,
+        execution_boundary,
+        trace.as_ref(),
+    );
     STATUS_SUCCESS
 }
 
@@ -1442,6 +1508,8 @@ pub(crate) fn abandon_pending_submissions(
         if dropped != 0 {
             ABANDONED_FENCES.fetch_add(dropped, Ordering::Relaxed);
         }
+        // Flush-gate trace: the dropped fences never retire (atomics only).
+        crate::ddi::flush_trace::note_abandon();
         let status = match outcome {
             AbandonOutcome::Silent => STATUS_SUCCESS,
             AbandonOutcome::Preempted { dxgkrnl, fence } => {
@@ -1751,9 +1819,10 @@ unsafe fn flush_gate_record(
             degraded = true;
         }
     }
+    let mut floor = None;
     if boundary.is_none() {
         // SAFETY: the same private range.
-        unsafe { stamp_flush_wire_floor(adapter, private_data, private_size) };
+        floor = unsafe { stamp_flush_wire_floor(adapter, private_data, private_size) };
     }
     match (boundary, decision.carrier) {
         (Some(_), Carrier::Stream { .. }) => FLUSH_GATE_STREAM.fetch_add(1, Ordering::Relaxed),
@@ -1762,6 +1831,26 @@ unsafe fn flush_gate_record(
     };
     if degraded {
         FLUSH_GATE_DEGRADED.fetch_add(1, Ordering::Relaxed);
+    }
+    // Diagnostic timeline (`ddi::flush_trace`): record only, nothing below reads it.
+    crate::ddi::flush_trace::note_render(
+        context,
+        &crate::ddi::flush_trace::RenderInfo {
+            carrier_stream: matches!(decision.carrier, Carrier::Stream { .. }),
+            carrier_fence: decision.carrier == Carrier::Fence,
+            asked_value: command.value,
+            boundary,
+            degraded,
+            floor,
+        },
+    );
+    // `FlGSyncMs` (default 0 = off, and then NOTHING below runs, not even the IRQL check):
+    // hold this Render until the boundary the packet carries has retired. `DxgkDdiRender`
+    // is documented PASSIVE_LEVEL, but the wait SLEEPS, so the live IRQL is checked rather
+    // than assumed (`PassiveLevel::assume` only counts a wrong claim): above PASSIVE the
+    // wait is skipped and counted (`FlGSyncSkip`). No lock is held here.
+    if crate::ddi::flush_trace::sync_ms() != 0 {
+        crate::ddi::flush_trace::sync_wait(adapter, boundary, floor);
     }
 }
 
@@ -1777,16 +1866,17 @@ unsafe fn stamp_flush_wire_floor(
     adapter: &AdapterContext,
     private_data: *mut c_void,
     private_size: u32,
-) {
-    let Some(floor) = adapter.with_virtio(|v| v.flush_wire_floor()).ok().flatten() else {
-        return;
-    };
+) -> Option<u64> {
+    let floor = adapter.with_virtio(|v| v.flush_wire_floor()).ok().flatten()?;
     // SAFETY: forwarded: the helper checks null and the record size before any access.
     let stamped =
         unsafe { PresentSubmissionPrivate::merge_flush_fence(private_data, private_size, floor) };
     if stamped.is_ok() {
         FLUSH_GATE_FLOOR.fetch_add(1, Ordering::Relaxed);
+        // The floor the packet was stamped with (for the trace and `FlGSyncMs`).
+        return Some(floor);
     }
+    None
 }
 
 /// `HEFL` magic and size, a version this KMD does not know. The record is not
@@ -1814,7 +1904,7 @@ unsafe fn flush_gate_unknown_version(
     };
     take_fence_tail(adapter, Some(process), &command.fence);
     // SAFETY: forwarded.
-    unsafe { stamp_flush_wire_floor(adapter, private_data, private_size) };
+    let _ = unsafe { stamp_flush_wire_floor(adapter, private_data, private_size) };
 }
 
 /// Hand a resolved marker to the Present that follows this Render on the context:
