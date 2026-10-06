@@ -247,6 +247,8 @@ fn start_generation_mirrors() {
     crate::ddi::flip_lat::start_generation();
     crate::ddi::flip_announce::start_generation();
     crate::ddi::stall_diag::start_generation();
+    // The round-trip statistics of forwarded RM calls start over: this generation's `NvRtt*`.
+    crate::virtio::nvrm::reset_rtt_counters();
 }
 
 /// Flush the service key (when `flush`) so the stage just recorded survives a
@@ -491,6 +493,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // is moved into set_virtio). The message-mode word goes FIRST so an
             // ISR that sees a nonzero `isr_status` can never still believe it is
             // on a line the device is no longer using.
+            // The interrupt counters and the delivery-health state of this start begin here
+            // (before the ISR can count anything into them).
+            crate::virtio::msi::on_transport_up(gpu.msi_isr_state() != 0);
             adapter
                 .msi_state
                 .store(gpu.msi_isr_state(), core::sync::atomic::Ordering::Release);
@@ -686,6 +691,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     }
 
     crate::diag::record(0x0B00_0004);
+    // In message mode: the verdict on whether interrupts reached this start (the venus bring-up
+    // above ran sync round trips), and the run-time health judging is armed from here. A no-op
+    // on the INTx line. Never fails the start.
+    crate::virtio::msi::finish_start(adapter);
     // LAST action: the real edge the HPD worker waits on. Its prologue used to
     // approximate "StartDevice has returned" with a 500 ms delay; that delay is
     // now only a bounded fallback (`HpdStTo` counts it firing). Safe to signal

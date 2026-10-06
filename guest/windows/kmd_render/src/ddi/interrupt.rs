@@ -41,8 +41,8 @@ use crate::dxgk::*;
 pub static INT_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DPC_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CONTROL_INT_COUNT: AtomicU32 = AtomicU32::new(0);
-/// Interrupts taken in message mode (a subset of `INT_ROUTINE_COUNT`).
-pub static MSI_INT_COUNT: AtomicU32 = AtomicU32::new(0);
+// The per-vector counters (`MsiV0`.., `MsiDpc0`.., `IntxInts`, ...) live in `virtio::msi`: the
+// ISR and the DPC feed them there (`note_message`, `note_intx`, `take_dpc_cause`), atomics only.
 
 /// Ask dxgkrnl to run the normal completion DPC after PASSIVE-side lifecycle
 /// code changed a WDDM wait predicate.  The caller has already preserved the
@@ -366,9 +366,11 @@ pub unsafe extern "C" fn dxgkddi_interrupt_routine(
     let status = unsafe { core::ptr::read_volatile(isr_va as *const u8) };
     if status == 0 {
         // Shared line, but no virtio interrupt pending — not ours.
+        crate::virtio::msi::note_intx_miss();
         return 0;
     }
     INT_ROUTINE_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::virtio::msi::note_intx();
     // Bit 1 = configuration change: the virtio-gpu raises it on a
     // VIRTIO_GPU_EVENT_DISPLAY (monitor connect / mode change). Latch it for the
     // DPC, which wakes the HPD worker to (re-)indicate the child connected — the
@@ -397,7 +399,9 @@ pub unsafe extern "C" fn dxgkddi_interrupt_routine(
 fn msi_interrupt(adapter: &AdapterContext, msi_state: u32, message_number: u32) -> BOOLEAN {
     use helios_kmd_logic::msi::{isr_route, IsrRoute};
     INT_ROUTINE_COUNT.fetch_add(1, Ordering::Relaxed);
-    MSI_INT_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Per vector, and which vector the coming DPC is for (one cache line each: the messages
+    // of this device can interrupt on different CPUs at the same moment).
+    crate::virtio::msi::note_message(message_number);
     // The config-change message (vector 0 when the device has one of its own):
     // latch it for the DPC, which wakes the HPD worker. Every other message —
     // and the single shared one — is queue work.
@@ -423,6 +427,12 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
     }
     // SAFETY: our AdapterContext, valid for the device's lifetime.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+
+    // What queued this DPC (a message, the INTx line, or something else), counted per vector.
+    // Atomics only. `ring_pops` lets the end of the routine tell a message that had work from
+    // one that found both rings empty.
+    let cause = crate::virtio::msi::take_dpc_cause();
+    let ring_pops = crate::virtio::gpu::RING_POPS.load(Ordering::Relaxed);
 
     // A latched config-change (ISR bit 1): wake the HPD worker to re-indicate the
     // child connected. KeSetEvent (Wait=FALSE) is legal at DISPATCH_LEVEL.
@@ -468,6 +478,14 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
     // Drain the used ring, wake ctrl/fence waiters, and retire every WDDM
     // submission whose Venus watermark has been reached.
     drain_used_and_complete(adapter);
+
+    // A message woke this DPC and neither ring had anything to take: spurious, or a waiter's
+    // polling drain (or an earlier coalesced DPC) took the work first. Harmless either way.
+    if cause & !helios_kmd_logic::msi::CAUSE_INTX != 0
+        && crate::virtio::gpu::RING_POPS.load(Ordering::Relaxed) == ring_pops
+    {
+        crate::virtio::msi::note_dpc_idle();
+    }
 }
 
 /// `DxgkDdiControlInterrupt` — enable/disable a class of GPU interrupts. Called at

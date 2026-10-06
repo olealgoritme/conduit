@@ -4927,6 +4927,7 @@ impl VirtioGpu {
                 return;
             };
             self.control_space_epoch = self.control_space_epoch.wrapping_add(1);
+            RING_POPS.fetch_add(1, Ordering::Relaxed);
             let mut entry = self.inflight.swap_remove(idx);
             // As in `latch_failed_and_fail_inflight`: take the ownership token
             // out before the `match entry.kind` moves the other fields, so the
