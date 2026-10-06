@@ -954,8 +954,7 @@ enum Tex2DShape {
 /// so these numbers are all the driver gets, and the offset must be part of the
 /// predicate rather than an input to the branch that cannot hold it.
 ///
-/// ⚠ `umd/src/forward/state.rs` has the same predicate and the same defect; it
-/// is a D3D11 fix that belongs in that file's own change, not here.
+/// `umd/src/forward/state.rs` has the same predicate (`needs_array_form`).
 const fn needs_array_form(array_size: u32, first_array_slice: u32) -> bool {
     array_size > 1 || first_array_slice > 0
 }

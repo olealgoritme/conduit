@@ -1136,7 +1136,8 @@ unsafe extern "system" fn create_vpov(
     let Some(e) = load_com::<ID3D11VideoProcessorEnumerator>(a.hDrvVideoProcessorEnum) else {
         return E_INVALIDARG.0;
     };
-    let desc = if a.ArraySize > 1 {
+    // A one-slice view of slice N > 0 is an array view too (needs_array_form).
+    let desc = if needs_array_form(a.ArraySize, a.FirstArraySlice) {
         D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
             ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2DARRAY,
             Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {

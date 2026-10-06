@@ -20,6 +20,8 @@
  *   sw.md5   framemd5 output of a software decode (ffmpeg -i clip -f framemd5)
  *   -bench   decode only, frames stay on the GPU; prints fps
  *   -noblt   skip the video processor check
+ *   -nosrv   skip the plane SRV check (R8 / R8G8 views of the decoded
+ *            array slice sampled by a compute shader, as players render)
  *   -sw      decode in software instead (sanity check of the harness)
  *
  * Output: "frames N/M, bit-exact K, blt ok B" and exit code 0 if every frame
@@ -29,11 +31,13 @@
  *   x86_64-w64-mingw32-gcc -O2 -o d3d11va_decode_test.exe d3d11va_decode_test.c \
  *       -I<ffmpeg>/include -L<ffmpeg>/lib -lavformat -lavcodec -lavutil \
  *       -ld3d11 -ldxgi -luuid -lole32
+ *   (d3dcompiler_47.dll is loaded at run time for the SRV check)
  */
 #define COBJMACROS
 #define INITGUID
 #include <windows.h>
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -253,6 +257,153 @@ static int blt_check(struct blt *b, ID3D11Device *dev, ID3D11DeviceContext *ctx,
    return ok;
 }
 
+/* Plane SRV check: what a player's own renderer does (VLC's direct3d11
+ * output, mpv's d3d11 path). The decoded surface is a slice of a texture
+ * array; it is sampled through an R8_UNORM view (luma) and an R8G8_UNORM
+ * view (chroma) of that one slice, Texture2DArray with FirstArraySlice =
+ * slice and ArraySize = 1, by a compute shader that copies both planes out.
+ * The planes are read back and compared byte for byte with the NV12 frame
+ * libavcodec downloaded (CopySubresourceRegion of the same slice). */
+static const char srv_cs[] =
+   "Texture2DArray<float>  Y   : register(t0);\n"
+   "Texture2DArray<float2> UV  : register(t1);\n"
+   "RWTexture2D<float>     OY  : register(u0);\n"
+   "RWTexture2D<float2>    OUV : register(u1);\n"
+   "[numthreads(8, 8, 1)]\n"
+   "void main(uint3 id : SV_DispatchThreadID) {\n"
+   "  uint w, h, cw, ch;\n"
+   "  OY.GetDimensions(w, h);\n"
+   "  OUV.GetDimensions(cw, ch);\n"
+   "  if (id.x < w && id.y < h) OY[id.xy] = Y.Load(int4(id.xy, 0, 0));\n"
+   "  if (id.x < cw && id.y < ch) OUV[id.xy] = UV.Load(int4(id.xy, 0, 0));\n"
+   "}\n";
+
+struct srvchk {
+   ID3D11ComputeShader *cs;
+   ID3D11Texture2D *y, *uv, *y_staging, *uv_staging;
+   ID3D11UnorderedAccessView *y_uav, *uv_uav;
+   int w, h, reports, slices_nonzero;
+};
+
+typedef HRESULT (WINAPI *d3dcompile_fn)(LPCVOID, SIZE_T, LPCSTR, const void *, void *, LPCSTR, LPCSTR,
+                                        UINT, UINT, ID3DBlob **, ID3DBlob **);
+
+static int srv_init(struct srvchk *s, ID3D11Device *dev, int w, int h)
+{
+   HMODULE m = LoadLibraryA("d3dcompiler_47.dll");
+   d3dcompile_fn compile = m ? (d3dcompile_fn)(void *)GetProcAddress(m, "D3DCompile") : NULL;
+   if (!compile) {
+      printf("srv: no d3dcompiler_47.dll\n");
+      return -1;
+   }
+   ID3DBlob *code = NULL, *err = NULL;
+   if (FAILED(compile(srv_cs, sizeof(srv_cs) - 1, "srv_cs", NULL, NULL, "main", "cs_5_0", 0, 0, &code, &err))) {
+      printf("srv: shader compile failed: %s\n", err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+      return -1;
+   }
+   HRESULT hr = ID3D11Device_CreateComputeShader(dev, ID3D10Blob_GetBufferPointer(code),
+                                                 ID3D10Blob_GetBufferSize(code), NULL, &s->cs);
+   ID3D10Blob_Release(code);
+   if (FAILED(hr))
+      return -1;
+
+   s->w = w;
+   s->h = h;
+   D3D11_TEXTURE2D_DESC td = { 0 };
+   td.MipLevels = 1;
+   td.ArraySize = 1;
+   td.SampleDesc.Count = 1;
+   for (int plane = 0; plane < 2; plane++) {
+      td.Width = plane ? w / 2 : w;
+      td.Height = plane ? h / 2 : h;
+      td.Format = plane ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM;
+      td.Usage = D3D11_USAGE_DEFAULT;
+      td.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+      td.CPUAccessFlags = 0;
+      ID3D11Texture2D **t = plane ? &s->uv : &s->y, **st = plane ? &s->uv_staging : &s->y_staging;
+      if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, t)))
+         return -1;
+      if (FAILED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)*t, NULL,
+                                                        plane ? &s->uv_uav : &s->y_uav)))
+         return -1;
+      td.Usage = D3D11_USAGE_STAGING;
+      td.BindFlags = 0;
+      td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, st)))
+         return -1;
+   }
+   return 0;
+}
+
+/* Returns 1 if both planes sampled through slice SRVs equal the download */
+static int srv_check(struct srvchk *s, ID3D11Device *dev, ID3D11DeviceContext *ctx,
+                     ID3D11Texture2D *tex, UINT slice, const AVFrame *nv12)
+{
+   ID3D11ShaderResourceView *srv[2] = { NULL, NULL };
+   D3D11_TEXTURE2D_DESC desc;
+   ID3D11Texture2D_GetDesc(tex, &desc);
+   if (slice)
+      s->slices_nonzero++;
+   for (int plane = 0; plane < 2; plane++) {
+      D3D11_SHADER_RESOURCE_VIEW_DESC vd = { 0 };
+      vd.Format = plane ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM;
+      vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+      vd.Texture2DArray.MostDetailedMip = 0;
+      vd.Texture2DArray.MipLevels = 1;
+      vd.Texture2DArray.FirstArraySlice = slice;
+      vd.Texture2DArray.ArraySize = 1;
+      HRESULT hr = ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)tex, &vd, &srv[plane]);
+      if (FAILED(hr)) {
+         if (s->reports++ < 3)
+            printf("srv: CreateShaderResourceView plane %d slice %u of %u: %08lx\n", plane, slice,
+                   desc.ArraySize, hr);
+         if (srv[0]) ID3D11ShaderResourceView_Release(srv[0]);
+         return 0;
+      }
+   }
+
+   ID3D11UnorderedAccessView *uavs[2] = { s->y_uav, s->uv_uav };
+   ID3D11ShaderResourceView *nulls[2] = { NULL, NULL };
+   ID3D11UnorderedAccessView *nullu[2] = { NULL, NULL };
+   ID3D11DeviceContext_CSSetShader(ctx, s->cs, NULL, 0);
+   ID3D11DeviceContext_CSSetShaderResources(ctx, 0, 2, srv);
+   ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 2, uavs, NULL);
+   ID3D11DeviceContext_Dispatch(ctx, (s->w + 7) / 8, (s->h + 7) / 8, 1);
+   ID3D11DeviceContext_CSSetShaderResources(ctx, 0, 2, nulls);
+   ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 2, nullu, NULL);
+   ID3D11ShaderResourceView_Release(srv[0]);
+   ID3D11ShaderResourceView_Release(srv[1]);
+   ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)s->y_staging, (ID3D11Resource *)s->y);
+   ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)s->uv_staging, (ID3D11Resource *)s->uv);
+
+   int ok = 1, bad = 0, fx = -1, fy = -1, fp = -1, got = 0, want = 0;
+   for (int plane = 0; plane < 2; plane++) {
+      ID3D11Texture2D *st = plane ? s->uv_staging : s->y_staging;
+      D3D11_MAPPED_SUBRESOURCE map;
+      if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &map)))
+         return 0;
+      int rows = plane ? s->h / 2 : s->h, bytes = s->w; /* w/2 texels of 2 bytes */
+      for (int y = 0; y < rows; y++) {
+         const uint8_t *g = (const uint8_t *)map.pData + y * map.RowPitch;
+         const uint8_t *e = nv12->data[plane] + y * nv12->linesize[plane];
+         if (memcmp(g, e, bytes)) {
+            for (int x = 0; x < bytes; x++) {
+               if (g[x] != e[x]) {
+                  if (!bad) { fx = x; fy = y; fp = plane; got = g[x]; want = e[x]; }
+                  bad++;
+               }
+            }
+            ok = 0;
+         }
+      }
+      ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)st, 0);
+   }
+   if (!ok && s->reports++ < 5)
+      printf("srv: slice %u of %u: %d bytes differ, first plane %d at %d,%d: got %d, want %d\n",
+             slice, desc.ArraySize, bad, fp, fx, fy, got, want);
+   return ok;
+}
+
 static void probe_video_device(ID3D11Device *dev)
 {
    ID3D11VideoDevice *vdev = NULL;
@@ -288,16 +439,17 @@ static void probe_video_device(ID3D11Device *dev)
 int main(int argc, char **argv)
 {
    const char *clip = NULL, *ref = NULL;
-   int bench = 0, noblt = 0, sw = 0;
+   int bench = 0, noblt = 0, nosrv = 0, sw = 0;
    for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "-bench")) bench = 1;
       else if (!strcmp(argv[i], "-noblt")) noblt = 1;
+      else if (!strcmp(argv[i], "-nosrv")) nosrv = 1;
       else if (!strcmp(argv[i], "-sw")) sw = 1;
       else if (!clip) clip = argv[i];
       else ref = argv[i];
    }
    if (!clip) {
-      fprintf(stderr, "usage: %s <clip.mp4> [sw.md5] [-bench] [-noblt] [-sw]\n", argv[0]);
+      fprintf(stderr, "usage: %s <clip.mp4> [sw.md5] [-bench] [-noblt] [-nosrv] [-sw]\n", argv[0]);
       return 2;
    }
 
@@ -381,6 +533,8 @@ int main(int argc, char **argv)
    AVFrame *frame = av_frame_alloc(), *nv12 = av_frame_alloc(), *yuv = av_frame_alloc();
    struct AVMD5 *md5 = av_md5_alloc();
    struct blt b = { 0 };
+   struct srvchk sc = { 0 };
+   int srvok = 0, srvrun = 0, srv_failed = 0;
    int nframes = 0, exact = 0, bltok = 0, bltrun = 0, mismatch_print = 0, blt_failed = 0;
    uint8_t *buf = NULL;
    double t0 = now_s();
@@ -486,6 +640,16 @@ int main(int argc, char **argv)
                                   (UINT)(intptr_t)frame->data[1], yuv);
             }
          }
+         if (!nosrv && frame->format == AV_PIX_FMT_D3D11 && !srv_failed) {
+            if (!sc.cs && srv_init(&sc, dev, w, h) < 0) {
+               printf("srv check setup failed\n");
+               srv_failed = 1;
+            } else {
+               srvrun++;
+               srvok += srv_check(&sc, dev, ctx, (ID3D11Texture2D *)frame->data[0],
+                                  (UINT)(intptr_t)frame->data[1], cpu);
+            }
+         }
          nframes++;
          av_frame_unref(frame);
       }
@@ -496,9 +660,10 @@ int main(int argc, char **argv)
 
    if (bench)
       printf("bench: %d frames in %.3f s, %.1f fps\n", nframes, dt, nframes / dt);
-   printf("frames %d/%d, bit-exact %d, blt ok %d/%d, %.1f fps\n", nframes, nrefs, exact, bltok, bltrun,
-          nframes / dt);
+   printf("frames %d/%d, bit-exact %d, blt ok %d/%d, srv ok %d/%d (%d from slices > 0), %.1f fps\n",
+          nframes, nrefs, exact, bltok, bltrun, srvok, srvrun, sc.slices_nonzero, nframes / dt);
 
-   int pass = bench ? nframes > 0 : (nrefs > 0 && nframes == nrefs && exact == nrefs && bltok == bltrun);
+   int pass = bench ? nframes > 0 : (nrefs > 0 && nframes == nrefs && exact == nrefs && bltok == bltrun &&
+                                    srvok == srvrun && !srv_failed);
    return pass ? 0 : 1;
 }
