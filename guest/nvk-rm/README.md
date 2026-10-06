@@ -642,6 +642,79 @@ runs), so they are not compiles.
   (asserts on, NAK debug assertions) compiles more slowly; it was not
   measured here.
 
+### Integration stack (branch `nvk-rm/integration`, 2026-10-06, `win11`)
+
+The canonical Windows build: every finished NVK-on-RM patch in one series.
+`build-windows.sh` applies, with `git am --3way` on `MESA_BASE`:
+
+| order | patches | what |
+|---|---|---|
+| 1 | `patches/0001-0013` | NVK on RM (Linux backend, generic) |
+| 2 | `patches-windows/0014-0022` | Windows build, Win32 WSI, zero-copy Helios scanout (21), BAR heap (22) |
+| 3 | `patches-windows/0024` | block-linear scanout swapchains |
+| 4 | `patches-windows/0025` | BAR heap falls back to system memory when the CPU map fails |
+| 5 | `patches-windows/0026` | shader cache on Windows |
+| 6 | `patches-windows/0027-0029` | L2-cached sysmem, compression, ZCULL info (`NVK_RM_SYSMEM_CACHED=0`, `NVK_RM_COMPRESSION=0`, `NVK_RM_ZCULL=0`) |
+| 7 | `patches-windows/0035` | H.264 decode on NVDEC (`NVK_EXPERIMENTAL=video`) |
+| 8 | `patches-windows-dxvk/0001-0004` | what DXVK needs |
+| 9 | `patches-common/0001-0007` | per-draw cost (shared with the Linux series) |
+
+0023 (S3's Helios ICD interface) is not in this stack: S3 stages its own
+build on top. 0027-0029 are the efficiency patches from
+`perf/nvk-rm-efficiency-win` (there 23-25), renumbered and rebased onto 0025.
+Release build (`b_ndebug`), shader cache on, `-Dvideo-codecs=h264dec`.
+
+Note: the "series already applied" check compares the last patch's subject,
+so a Mesa checkout that has an older stack with the same last patch is not
+re-patched. Use a fresh checkout, or reset its branch to `MESA_BASE` first.
+
+Tests, x86_64, KMD 22.22.312.0: `vk_summary` (184 extensions), `vk_compute_test`
+(host-visible and copy), `vk_offscreen_test 5000`, `vk_bar_test ... fill`,
+`vk_coherence_test`, `vk_bl_readback`, `vk_scanout_present` (1920x1080,
+9749 fps, 0 failed flips) and `vk_video_probe` all pass. One run of
+`vk_offscreen_test` (and earlier one of `vk_coherence_test`) died with an
+access violation in ntdll before printing anything. It did not reproduce in
+9 reruns, and it is still open.
+
+`tests/vk_coherence_test.c` checks patch 27 on Windows, where the GPU-cacheable
+mapping flags go through the KMD. Per iteration, for every HOST_VISIBLE |
+HOST_COHERENT type: the CPU writes a new pattern, compute reads and rewrites
+it, the CPU checks it, the CPU rewrites the even elements, compute runs
+again, and the CPU checks again. Each iteration uses a new pattern and a new
+multiplier. Result: 1000 iterations, 0 bad, on the BAR type and on cached
+sysmem. That holds alone and while another process runs compute over 32 MiB
+of host-visible sysmem plus an offscreen draw loop.
+
+Heaven 4.0 (32-bit), 1600x900 Medium, tessellation normal,
+`heaven-nvk-fps.ps1 -Warmup 25 -Seconds 30`, host `nvidia-smi dmon -s pu`
+over the window. The same DXVK and shim throughout; the driver is picked with
+`NVK_SHIM_DRIVER` in `env.cmd`.
+
+Zero-copy present (unpaced), KMD 312, full stack against 0022 alone,
+interleaved:
+
+| build | fps | median / p99 ms | SM % avg | W avg |
+|---|---|---|---|---|
+| full stack, first pass (fills the shader cache) | 363.3 | 2.31 / 5.02 | 91 | 187 |
+| full stack | 356.3, 352.1 | 2.51 / 5.06-5.41 | 90-91 | 199-204 |
+| 0022 alone | 316.1, 346.8 | 2.48-2.87 / 5.2 | 93 | 200-201 |
+
+Zero-copy, linear (before 0024/0026/patches-common), KMD 311: 0022 alone
+336.2 / 328.1 / 293.4. 0022+0025+0027-0029: 287.5 / 306.8 / 352.2. With
+`NVK_RM_COMPRESSION=0`: 338.3 / 329.5. With `NVK_RM_SYSMEM_CACHED=0`: 326.4.
+With `NVK_RM_ZCULL=0`: 324.4.
+
+GDI present, KMD 311: every build lands at 200-227 fps (0022 alone, +0025,
++0027-0029, each of 27/28/29 off), at 70-77% SM. vkQueuePresentKHR averages
+4.4 ms there, so the GDI copy is the limit.
+
+Reading: Heaven at Medium on the BAR heap is GPU-bound (90-93% SM). The same
+build varies by about ±10% from run to run. Within that, 0027-0029 change
+nothing measurable either way. The full stack is about 8% above 0022 alone
+on zero-copy (357 against 331 fps on average), which is what block-linear
+scanout (0024) gives on its own (344-356). Per-draw cost does not limit this
+benchmark.
+
 ## Running (in a guest)
 
 ```sh
