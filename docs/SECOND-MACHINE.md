@@ -3,7 +3,8 @@
 Step by step, from a bare Linux host with an NVIDIA GPU to a Windows 11 guest
 whose desktop runs on NVK-on-RM. Everything here was done on one machine (an
 RTX 5090, Blackwell); on another GPU (for example an RTX 4070, Ada) read the
-caveats at the end first. Background: [WINDOWS.md](WINDOWS.md),
+caveats at the end and [GPU-SUPPORT.md](GPU-SUPPORT.md) (per-generation
+status, first-hour plan for an RTX 4070) first. Background: [WINDOWS.md](WINDOWS.md),
 [NVK-ROADMAP.md](NVK-ROADMAP.md).
 
 ## 1. Host driver
@@ -121,7 +122,8 @@ process back on Venus.
   memory-kind tables the KMD and NVK use for scanout and shared surfaces
   (written and measured for GB20x), and the RM classes NVK picks for the GPU.
   Expect scanout or shared-surface problems first; `Icd=venus` is the way
-  back while they are found.
+  back while they are found. Per-generation details, known gaps and the test
+  order: [GPU-SUPPORT.md](GPU-SUPPORT.md).
 - The open items on the reference machine apply too
   ([NVK-ROADMAP.md](NVK-ROADMAP.md) "Where it stands"): the windowed blt
   path, recovery after `pnputil /restart-device`, Unigine Heaven x86 OpenGL

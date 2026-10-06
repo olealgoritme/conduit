@@ -104,7 +104,8 @@ Levers, most promising first:
 5. Flip-model route for windowed apps (parked), level 5 (on hold), Venus
    removal (S6d).
 6. Second machine (RTX 4070, Ada): never tested; RM ABI tables and NVK on Ada
-   are the risk ([SECOND-MACHINE.md](SECOND-MACHINE.md)).
+   are the risk ([SECOND-MACHINE.md](SECOND-MACHINE.md),
+   [GPU-SUPPORT.md](GPU-SUPPORT.md): per-generation matrix, first-hour plan).
 
 ## Where things are
 
