@@ -1031,6 +1031,44 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
         }
       }
 
+      // A Venus process opening an NVK-made surface with ForeignImport off
+      // (the default): the import would throw, and an E_FAIL from this open
+      // takes DWM down (dwmcore 0x8898008d when a windowed NVK swap chain is
+      // created: DXGI has DWM open the buffers whatever the present path).
+      // Hand back an ordinary blank texture of the same size instead: the
+      // window composes black, and the NVK app shows its frames on scanout 0
+      // as designed (NvkPresent auto picks scanout without ForeignImport).
+      if (foreign && !dxvk::heliosForeignImport()) {
+        D3D11_TEXTURE2D_DESC td = { };
+        td.Width = width;
+        td.Height = height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = static_cast<DXGI_FORMAT>(format);
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = bind_flags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+        ID3D11Texture2D* placeholder = nullptr;
+        HRESULT phr = static_cast<dxvk::D3D11Device*>(impl->d3d11)->CreateTexture2D(
+            &td, nullptr, &placeholder);
+        ID3D11Resource* res = nullptr;
+        if (SUCCEEDED(phr) && placeholder) {
+          phr = placeholder->QueryInterface(__uuidof(ID3D11Resource),
+                                            reinterpret_cast<void**>(&res));
+          placeholder->Release();
+        }
+        static std::atomic<std::uint32_t> s_placeholders{0};
+        const std::uint32_t n = s_placeholders.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n % 512u) == 0) {
+          char msg[200];
+          std::snprintf(msg, sizeof(msg),
+            "OpenDdiTexture2D foreign res_id=%u %ux%u with ForeignImport off: blank placeholder hr=0x%08lx (x%u)",
+            renderer_resource_id, width, height, static_cast<unsigned long>(phr), n);
+          umd_log(msg);
+        }
+        return (SUCCEEDED(phr) && res) ? reinterpret_cast<std::size_t>(res) : std::size_t(0);
+      }
+
       dxvk::D3D11_COMMON_TEXTURE_DESC desc = { };
       desc.Width = width;
       desc.Height = height;
