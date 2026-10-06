@@ -2202,6 +2202,28 @@ namespace {
     }
   }
 
+  // An ICD's vk_icdGetInstanceProcAddr serves no layer queries (that is the
+  // loader's job): NVK's MinGW build returns NULL for
+  // vkEnumerateInstanceLayerProperties (its vk_common_ fallback is a weak
+  // symbol), and DxvkInstance::initVulkanInstance calls it unconditionally,
+  // a call through NULL. Answer "no layers" and forward everything else, as
+  // vkd3d's 0002-helios-nvk-backend does for D3D12. One ICD per process.
+  PFN_vkGetInstanceProcAddr g_nvkIcdGipa = nullptr;
+
+  VKAPI_ATTR VkResult VKAPI_CALL nvk_icd_enumerate_instance_layers(
+      uint32_t* count, VkLayerProperties* layers) {
+    (void)layers;
+    *count = 0;
+    return VK_SUCCESS;
+  }
+
+  VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL nvk_icd_get_instance_proc_addr(
+      VkInstance instance, const char* name) {
+    if (!instance && name && !std::strcmp(name, "vkEnumerateInstanceLayerProperties"))
+      return reinterpret_cast<PFN_vkVoidFunction>(nvk_icd_enumerate_instance_layers);
+    return g_nvkIcdGipa(instance, name);
+  }
+
   // Build the DXVK instance/adapter/device and the D3D11 COM device on
   // `backend`. Returns false (with `d` partly filled) on any failure; the
   // caller drops `d`.
@@ -2217,8 +2239,9 @@ namespace {
       }
       // NVK's own vk_icdGetInstanceProcAddr: no Vulkan loader, no registry,
       // and no Venus ICD in this instance.
+      g_nvkIcdGipa = gipa;
       dxvk::DxvkInstanceImportInfo import = { };
-      import.loaderProc = gipa;
+      import.loaderProc = nvk_icd_get_instance_proc_addr;
       d.instance = new dxvk::DxvkInstance(import, dxvk::DxvkInstanceFlags());
     } else {
       d.icd = *helios_bridge::venus_icd_api();
