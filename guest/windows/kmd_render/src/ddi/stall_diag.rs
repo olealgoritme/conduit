@@ -12,7 +12,7 @@
 //! IRQL. Every `note_*` function, [`on_vsync_tick`] and [`defer_note`]'s state are atomics only
 //! and legal at any IRQL (the vsync DPC at DISPATCH, `SetVidPnSourceAddress` at DIRQL, the DMA
 //! lane at DISPATCH). The registry is written only by [`publish_counters`] and the knob
-//! mirrors, at PASSIVE: from the escape thread ([`publish_from_escape`], which does not depend on
+//! mirrors, at PASSIVE: from the escape thread ([`publish_from_escape`], only while the worker looks stuck; it does not depend on
 //! the worker), from the HPD worker's periodic mirrors, and at StartDevice.
 //!
 //! Defaults. `FlipWdogMs` 0 and `DeferBudget` 0 are today's behaviour: the watchdog never
@@ -319,19 +319,46 @@ pub(crate) fn publish_counters() {
     rec(b"FlipWdBig", WD_BIG.load(Ordering::Relaxed));
 }
 
-/// How often the escape thread may write the block: twice a second.
+/// How often the escape thread may write the block while the worker looks stuck: twice a second.
 const ESCAPE_PUBLISH_MS: u32 = 500;
 /// Interrupt time (ms, never 0) of the last publication from an escape.
 static LAST_ESCAPE_PUBLISH: AtomicU32 = AtomicU32::new(0);
 
-/// Publish the block from the escape thread, at most every [`ESCAPE_PUBLISH_MS`]. An escape is
-/// called by user mode at PASSIVE on ITS OWN thread, so this refreshes the counters even when
-/// the HPD worker is stuck (every other mirror runs on the worker, including the `Nv*` mirror
-/// the escapes ask for). One clock read and one load when nothing is due.
-pub(crate) fn publish_from_escape() {
+/// Whether the HPD worker looks stuck right now (`stall_diag::worker_looks_stuck`): a few
+/// relaxed and acquire loads, no registry, no lock.
+fn worker_looks_stuck(adapter: &AdapterContext, now: u32) -> bool {
+    // Release count first, acquire count second: a mutex acquired in between reads as held, with
+    // the stamp of that acquisition (stamp then count, `note_lock_acquired`).
+    let released = LOCK_REL_N.load(Ordering::Acquire);
+    let acquired = LOCK_N.load(Ordering::Acquire);
+    sd::worker_looks_stuck(sd::StuckInput {
+        now,
+        site: HPD_SITE.load(Ordering::Relaxed),
+        site_t: HPD_SITE_T.load(Ordering::Relaxed),
+        lock_held: sd::lock_held(acquired, released),
+        lock_acq_t: LOCK_ACQ_T.load(Ordering::Relaxed),
+        loop_t: HPD_LOOP_T.load(Ordering::Relaxed),
+        work_pending: adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0
+            || gate_active(adapter.vidpn_programming.load(Ordering::Acquire)),
+    })
+}
+
+/// Publish the block from the escape thread, but ONLY while the HPD worker looks stuck
+/// (`stall_diag::worker_looks_stuck`: in a step other than the idle wait for more than a second,
+/// or the scanout mutex held for more than a second, or work pending and no wake for two), and at
+/// most every [`ESCAPE_PUBLISH_MS`]. An escape is called by user mode at PASSIVE on ITS OWN
+/// thread, so this refreshes the counters even when the worker is stuck (the other mirrors run on
+/// the worker, including the `Nv*` mirror an escape asks for). While the worker is healthy this
+/// does NOTHING beyond one clock read, one load and the loads of the stuck test: the block is
+/// about twenty registry writes (each opens the key by path, about half a millisecond in all)
+/// and the worker's own mirrors keep publishing it as before.
+pub(crate) fn publish_from_escape(adapter: &AdapterContext) {
     let now = AdapterContext::interrupt_time_ms().max(1);
     let last = LAST_ESCAPE_PUBLISH.load(Ordering::Relaxed);
     if last != 0 && now.wrapping_sub(last) < ESCAPE_PUBLISH_MS {
+        return;
+    }
+    if !worker_looks_stuck(adapter, now) {
         return;
     }
     // One thread publishes per interval: the others see the new stamp.

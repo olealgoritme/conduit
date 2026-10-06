@@ -145,6 +145,66 @@ pub const fn lock_held(acquired: u32, released: u32) -> bool {
     acquired != released
 }
 
+// ---- does the worker look stuck? ----------------------------------------------------------
+
+/// A step the worker has been in for longer than this (and that is not the idle wait) looks stuck.
+pub const STUCK_SITE_MS: u32 = 1_000;
+/// A scanout mutex held for longer than this looks stuck.
+pub const STUCK_LOCK_MS: u32 = 1_000;
+/// A worker that has not woken for longer than this while work is pending looks stuck (a pending
+/// programming wakes it on every vsync tick, so a healthy worker's last wake is a few ticks old).
+pub const STUCK_LOOP_MS: u32 = 2_000;
+
+/// Milliseconds from `then` to `now` on the wrapping 32-bit interrupt-time clock. A `then` that
+/// is AHEAD of `now` (a stamp from before a reset, or read a hair after `now`) is age 0, never a
+/// 49-day age.
+pub const fn age_ms(now: u32, then: u32) -> u32 {
+    let d = now.wrapping_sub(then);
+    if d >= 0x8000_0000 {
+        0
+    } else {
+        d
+    }
+}
+
+/// What the escape thread can see of the worker, all from atomics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StuckInput {
+    /// Interrupt time now, ms.
+    pub now: u32,
+    /// `HpdSite` and `HpdSiteT`.
+    pub site: u32,
+    pub site_t: u32,
+    /// The scanout mutex is held ([`lock_held`]) and `ScLkAcqT`.
+    pub lock_held: bool,
+    pub lock_acq_t: u32,
+    /// `HpdLoopT`.
+    pub loop_t: u32,
+    /// A programming is pending (`pending_vidpn_allocation != 0` or the gate is raised).
+    pub work_pending: bool,
+}
+
+/// Whether the HPD worker LOOKS stuck, so that the escape thread should write the stall block
+/// (and otherwise write nothing: the registry is not free). Any of:
+/// * it is in a step other than the idle wait (and not "never ran" or "exited") for more than
+///   [`STUCK_SITE_MS`];
+/// * the scanout mutex has been held for more than [`STUCK_LOCK_MS`] (by anyone);
+/// * work is pending and it has not woken for more than [`STUCK_LOOP_MS`].
+///
+/// A healthy idle worker (asleep in `WAIT`, nothing pending, the mutex free) is never stuck, however
+/// old its stamps are. A false positive costs one block write per interval; a false negative is
+/// the instrument missing the stall, so the thresholds are short.
+pub const fn worker_looks_stuck(i: StuckInput) -> bool {
+    let in_step = i.site != site::WAIT && i.site != site::NONE && i.site != site::EXITED;
+    if in_step && age_ms(i.now, i.site_t) > STUCK_SITE_MS {
+        return true;
+    }
+    if i.lock_held && age_ms(i.now, i.lock_acq_t) > STUCK_LOCK_MS {
+        return true;
+    }
+    i.work_pending && age_ms(i.now, i.loop_t) > STUCK_LOOP_MS
+}
+
 // ---- knobs ---------------------------------------------------------------------------------
 
 /// Smallest nonzero `FlipWdogMs`. A flip's programming legitimately takes a few vsync ticks (the
@@ -785,6 +845,128 @@ mod tests {
         assert!(!lock_held(0, 0));
         assert!(lock_held(0, u32::MAX));
         assert!(!lock_held(u32::MAX, u32::MAX));
+    }
+
+    // ---- does the worker look stuck ------------------------------------------------------
+
+    fn healthy() -> StuckInput {
+        StuckInput {
+            now: 1_000_000,
+            site: site::WAIT,
+            site_t: 1_000_000 - 50_000,
+            lock_held: false,
+            lock_acq_t: 1_000_000 - 50_000,
+            loop_t: 1_000_000 - 50_000,
+            work_pending: false,
+        }
+    }
+
+    #[test]
+    fn a_healthy_idle_worker_is_never_stuck_however_old_its_stamps() {
+        assert!(!worker_looks_stuck(healthy()));
+        // Hours idle: still healthy.
+        let mut i = healthy();
+        i.site_t = 0;
+        i.loop_t = 0;
+        i.lock_acq_t = 0;
+        i.now = 40_000_000;
+        assert!(!worker_looks_stuck(i));
+        // Never ran / exited: not stuck either, at any age.
+        for s in [site::NONE, site::EXITED] {
+            let mut i = healthy();
+            i.site = s;
+            i.site_t = 0;
+            assert!(!worker_looks_stuck(i), "site {s}");
+        }
+    }
+
+    #[test]
+    fn busy_but_moving_is_not_stuck() {
+        // In a step for 40 ms, woke 16 ms ago, work pending, mutex held for 30 ms.
+        let i = StuckInput {
+            now: 5_000,
+            site: site::DEFERRED_LOCKED,
+            site_t: 4_960,
+            lock_held: true,
+            lock_acq_t: 4_970,
+            loop_t: 4_984,
+            work_pending: true,
+        };
+        assert!(!worker_looks_stuck(i));
+    }
+
+    #[test]
+    fn stuck_in_any_step_after_a_second() {
+        for (id, name) in site::ALL {
+            if id == site::WAIT || id == site::NONE || id == site::EXITED {
+                continue;
+            }
+            let mut i = healthy();
+            i.site = id;
+            i.site_t = i.now - STUCK_SITE_MS;
+            assert!(
+                !worker_looks_stuck(i),
+                "{name}: exactly the threshold is not yet"
+            );
+            i.site_t = i.now - STUCK_SITE_MS - 1;
+            assert!(worker_looks_stuck(i), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_held_mutex_is_stuck_after_a_second_and_a_free_one_never() {
+        let mut i = healthy();
+        i.lock_held = true;
+        i.lock_acq_t = i.now - STUCK_LOCK_MS;
+        assert!(!worker_looks_stuck(i));
+        i.lock_acq_t = i.now - STUCK_LOCK_MS - 1;
+        assert!(worker_looks_stuck(i));
+        // Free, however old the acquisition stamp: not stuck.
+        i.lock_held = false;
+        assert!(!worker_looks_stuck(i));
+    }
+
+    #[test]
+    fn an_old_loop_stamp_is_stuck_only_with_work_pending() {
+        let mut i = healthy();
+        i.loop_t = i.now - STUCK_LOOP_MS - 1;
+        assert!(
+            !worker_looks_stuck(i),
+            "nothing pending: an idle worker has an old loop stamp"
+        );
+        i.work_pending = true;
+        assert!(worker_looks_stuck(i));
+        i.loop_t = i.now - STUCK_LOOP_MS;
+        assert!(!worker_looks_stuck(i));
+    }
+
+    #[test]
+    fn ages_survive_the_clock_wrapping() {
+        // now just after the 2^32 ms wrap, stamps just before it.
+        let mut i = healthy();
+        i.now = 500;
+        i.site = site::FOREIGN_FENCE;
+        i.site_t = u32::MAX - 999; // 1 500 ms ago
+        assert_eq!(age_ms(i.now, i.site_t), 1_500);
+        assert!(worker_looks_stuck(i));
+        i.site_t = u32::MAX - 100; // 601 ms ago
+        assert!(!worker_looks_stuck(i));
+        // A stamp ahead of now (stale after a reset, or racing the clock read) is age 0.
+        assert_eq!(age_ms(10, 20), 0);
+        assert_eq!(age_ms(10, 10), 0);
+        i.site_t = i.now + 5;
+        assert!(!worker_looks_stuck(i));
+        // The loop and lock stamps wrap the same way.
+        let mut j = healthy();
+        j.now = 100;
+        j.work_pending = true;
+        j.loop_t = u32::MAX - 2_999;
+        assert!(worker_looks_stuck(j));
+        j.loop_t = 0; // woke at the epoch of the clock, 100 ms ago
+        assert!(!worker_looks_stuck(j));
+        j.lock_held = true;
+        j.lock_acq_t = u32::MAX - 1_999;
+        assert!(worker_looks_stuck(j));
     }
 
     #[test]

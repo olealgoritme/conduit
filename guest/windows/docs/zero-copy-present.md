@@ -1243,11 +1243,18 @@ Where the numbers come from, and why they survive a stuck worker. The worker's o
 atomics, written on entering each step (one clock read per step); nothing about them depends on the worker running
 afterwards. They are PUBLISHED from three places. `publish_nvrm_counters` (the escape-driven `Nv*` mirror) and the pacing
 snapshot (the existing periodic mirror) both run ON the worker, so a stuck worker stops them. The third does not:
-`dxgkddi_escape` calls `stall_diag::publish_from_escape`, which, at most every 500 ms, writes the block on the CALLER's
-thread (user mode calls an escape at PASSIVE on its own thread). So a stall dump is fresh as long as SOMETHING calls an
-escape: an NVK process (every NVRM message is one), a Venus submit, the tester's own tool. If `StallT` does not move,
-nothing is calling one and the worker's mirrors are not running either: every value is as old as `StallT`, and the next
-step is to make one call (start any Vulkan app) and read again.
+`dxgkddi_escape` calls `stall_diag::publish_from_escape`, which writes the block on the CALLER's thread (user mode calls
+an escape at PASSIVE on its own thread), but ONLY while the worker LOOKS STUCK, and at most every 500 ms. The block is
+about twenty registry writes (each opens the key by path, about half a millisecond), and the `Nv*` mirror was already
+moved off the escape path for a similar cost, so a healthy worker costs the escape one clock read, one load and the
+loads of the test, and nothing else. "Looks stuck" is `kmd_logic::stall_diag::worker_looks_stuck`: the worker has been
+in a step other than the idle wait for more than 1 s (`HpdSite` not 0, 1 or 15, age of `HpdSiteT`), or the scanout mutex
+has been held for more than 1 s (`ScLkN` != `ScLkRelN`, age of `ScLkAcqT`), or a programming is pending (slot or gate)
+and `HpdLoopT` is older than 2 s. Ages are on the wrapping 32-bit clock; a stamp ahead of now is age 0. So a stall dump
+is fresh as long as SOMETHING calls an escape (an NVK process: every NVRM message is one; a Venus submit; the tester's
+own tool) after the worker has been stuck for a second or two. If `StallT` does not move and nothing is calling an
+escape, every value is as old as `StallT`: make one call (start any Vulkan app) and read again. If `StallT` does not
+move although escapes ARE being called, the worker does not look stuck by the rules above (row 7).
 
 Where the hooks are: `HpdSite` / `HpdLoop*`: `ddi/hpd.rs` (every service and step) and `display.rs` /
 `adapter/scanout.rs` (the two mutex-held sites). Scanout mutex: `adapter/locks.rs`, `with_scanout_lifecycle`. `FlipIss`:
@@ -1343,7 +1350,7 @@ together. If `StallT` does not move, see 14.2 (nothing is writing the block).
 | 4 | `VpVsN` does not move, or `VpVsEn` 0 | the vsync heartbeat is dead or its delivery gate closed: a separate failure from all of the above | `VpVsEn`, `VsMinGap`, the timer / DPC |
 | 5 | `FlipWd` moves and the compositor still blocks | `FlipWd` published, dxgkrnl did not retire on the address (13.4 unknown 1): the stall has another cause | the DMA fence path (`WfDone`, `WtOut`); do not read the knob as a fix |
 | 6 | `StartN` moved | the device restarted: every block above was zeroed; compare only values written after `StartT` | |
-| 7 | `StallT` frozen | nobody called an escape and the worker's mirrors are not running | start any Vulkan app (any NVRM message is an escape) and read again |
+| 7 | `StallT` frozen | either nothing is calling an escape and the worker's mirrors are not running, or escapes are called and the worker looks healthy to `worker_looks_stuck` (asleep in `wait`, mutex free, nothing pending, or in a step for less than a second): a block written only by the escape path stays quiet while the worker is healthy | start any Vulkan app (any NVRM message is an escape), wait two seconds and read again; a stall of a few hundred milliseconds is not visible here |
 
 ### 14.6 Verified, and not
 
@@ -1361,8 +1368,10 @@ group) all reported, so the touched code is checked and not skipped.
 NOT verified: anything on hardware; the WDK build; that dxgkrnl retires a flip on the kept address (13.4 unknown 1); the
 DISPATCH / DIRQL legality claims (read, not run: the new code is relaxed atomics and, in `publish_displayed_primary`, one
 `KeQueryInterruptTimePrecise` per publication); the cost of one clock read per HPD worker step, two per scanout lifecycle
-operation and one per publication (a scalar read, assumed small next to what each step does); that the 500 ms registry
-write from an escape thread (about 20 values) is not noticeable on a hot escape path; that a Deferred wait never
+operation and one per publication (a scalar read, assumed small next to what each step does); the stuck test's thresholds
+(1 s, 1 s, 2 s) against real stalls (a stall that is none of its three patterns, such as a worker that loops fast and never
+publishes, looks healthy to it; `VsPendN` and `FlipIss - FlipPub` see that, and the worker's own mirrors still write); the
+cost of the 500 ms write from an escape thread while the worker looks stuck (about 20 values); that a Deferred wait never
 legitimately exceeds a budget (why it defaults to off).
 
 Risks: the kept address (14.3); `DeferBudget` abandons a programming whose host SET may still land; the watchdog and the
