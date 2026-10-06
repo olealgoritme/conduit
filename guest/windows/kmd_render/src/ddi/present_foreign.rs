@@ -11,12 +11,17 @@
 //! * `PrFgWhy`: the last skip's reason, `present_foreign::Why::code`
 //!   (`arm << 12 | destination << 9 | source << 8 | refusal`).
 //! * `PrFgBlt`, `PrFgFlip`: the same, per arm (the flip count holds both contracts).
+//! * `PrFgHand`: DMA flips of a foreign allocation armed for `ForeignFlip`'s programming (not
+//!   skips: the flip proceeds; `FfProg` / `FfRef*` say what the programming did).
 //! * `PBRetSite`: the site id (`present_foreign::site`) of the last non-success return of
-//!   `DxgkDdiPresent`; 0 when the status came from no named site.
+//!   `DxgkDdiPresent`; every return of the inner function names one, 0 only for a status that
+//!   did not come from it.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use helios_kmd_logic::present_foreign::{self as pf, AllocFacts, Arm, Effect, Refusal, Verdict};
+use helios_kmd_logic::present_foreign::{
+    self as pf, AllocFacts, Arm, Effect, FlipRoute, Refusal, Verdict,
+};
 
 use crate::adapter::AdapterContext;
 use crate::ddi::create_allocation::PresentAllocInfo;
@@ -26,6 +31,8 @@ static SKIPS: AtomicU32 = AtomicU32::new(0);
 static LAST_WHY: AtomicU32 = AtomicU32::new(0);
 static BLT_SKIPS: AtomicU32 = AtomicU32::new(0);
 static FLIP_SKIPS: AtomicU32 = AtomicU32::new(0);
+/// DMA flips of a foreign allocation armed for `ForeignFlip`'s programming (`PrFgHand`).
+static HANDED: AtomicU32 = AtomicU32::new(0);
 
 /// The site of the current (or last) Present's non-success return; reset at each call.
 static CALL_SITE: AtomicU32 = AtomicU32::new(0);
@@ -54,6 +61,12 @@ fn facts(adapter: Option<&AdapterContext>, info: Option<&PresentAllocInfo>) -> O
     Some(facts)
 }
 
+// The kinds `helios_kmd_logic` spells as literals are the protocol's.
+const _: () = assert!(
+    pf::KIND_DEVICE_MEMORY == helios_protocol::HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
+        && pf::KIND_STANDARD == helios_protocol::HELIOS_WDDM_ALLOC_KIND_STANDARD
+);
+
 /// A refusal of `arm` is about to fail the Present. `Some(effect)` if a foreign allocation
 /// caused it: the skip is counted and the caller answers with success and does `effect`;
 /// `None` keeps the failure (an ordinary allocation, or a refusal that is not a foreign one).
@@ -72,9 +85,15 @@ pub(crate) fn skip(
     ) else {
         return None;
     };
+    note_skip(why);
+    Some(effect)
+}
+
+/// Count one skip (`PrFgSkip`, `PrFgWhy`, the per-arm count).
+fn note_skip(why: pf::Why) {
     let n = SKIPS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     LAST_WHY.store(why.code(), Ordering::Relaxed);
-    if arm.is_flip() {
+    if why.arm.is_flip() {
         FLIP_SKIPS.fetch_add(1, Ordering::Relaxed);
     } else {
         BLT_SKIPS.fetch_add(1, Ordering::Relaxed);
@@ -84,15 +103,81 @@ pub(crate) fn skip(
         crate::diag::record_named_bytes(b"PrFgWhy", why.code());
         crate::diag::record_named_bytes(b"PrFgSkip", n);
     }
-    Some(effect)
+}
+
+/// A Blt has an unresolved source or destination handle (`PBCpy` 0xE1): `true` if the Present is
+/// a counted success instead (the transport holds a live foreign record, or `ForeignFlip` is on;
+/// a Venus-only session keeps failing). Only called at the refusal, so the table lock is taken
+/// only then.
+pub(crate) fn unresolved_skip(
+    adapter: &AdapterContext,
+    source: Option<&PresentAllocInfo>,
+    destination: Option<&PresentAllocInfo>,
+) -> bool {
+    let foreign_flip = crate::virtio::foreign_flip::enabled();
+    let live = foreign_flip
+        || adapter
+            .with_virtio(|v| v.foreign_live() != 0)
+            .unwrap_or(false);
+    match pf::decide_unresolved(
+        Arm::Blt,
+        source.is_some(),
+        destination.is_some(),
+        live,
+        foreign_flip,
+    ) {
+        Verdict::Skip { why, .. } => {
+            note_skip(why);
+            true
+        }
+        Verdict::Proceed => false,
+    }
+}
+
+/// Route a DMA flip (`pf::flip_route`): `Arm` (the flip is armed as every direct-scan-out flip
+/// is; `foreign_flip` says the programming it reaches is `ForeignFlip`'s, counted `PrFgHand`),
+/// `Fail` (an ordinary allocation: the failure it always was) or `Skip` (counted here).
+/// `in_table`: the source's resource id has a global handle in the direct-scan-out table.
+pub(crate) fn flip_route(
+    adapter: Option<&AdapterContext>,
+    in_table: bool,
+    source: &PresentAllocInfo,
+) -> FlipRoute {
+    // Nothing to ask for the common flip: a direct-scan-out allocation in the table.
+    if in_table && source.direct_scanout {
+        return FlipRoute::Arm {
+            foreign_flip: false,
+        };
+    }
+    let route = pf::flip_route(
+        crate::virtio::foreign_flip::enabled(),
+        in_table,
+        source.direct_scanout,
+        facts(adapter, Some(source)),
+    );
+    match route {
+        FlipRoute::Skip { why, .. } => note_skip(why),
+        FlipRoute::Arm { foreign_flip: true } => note_handoff(),
+        _ => {}
+    }
+    route
+}
+
+fn note_handoff() {
+    let n = HANDED.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if n == 1 || n % 64 == 0 {
+        crate::diag::record_named_bytes(b"PrFgHand", n);
+    }
 }
 
 /// Mirror the counters to the service key. PASSIVE_LEVEL only; with the NVRM counters.
 pub(crate) fn publish_counters() {
     let n = SKIPS.load(Ordering::Relaxed);
-    if n == 0 {
+    let handed = HANDED.load(Ordering::Relaxed);
+    if n == 0 && handed == 0 {
         return;
     }
+    crate::diag::record_named_bytes(b"PrFgHand", handed);
     crate::diag::record_named_bytes(b"PrFgSkip", n);
     crate::diag::record_named_bytes(b"PrFgWhy", LAST_WHY.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PrFgBlt", BLT_SKIPS.load(Ordering::Relaxed));

@@ -21,7 +21,7 @@ use crate::dxgk::*;
 use crate::irql::PassiveLevel;
 use crate::virtio::venus::{OptimalPresentImageDesc, PresentBufferDesc, PresentDestinationDesc};
 use crate::virtio::VirtioError;
-use helios_kmd_logic::present_foreign::{site, Arm as PresentArm, Refusal};
+use helios_kmd_logic::present_foreign::{site, Arm as PresentArm, FlipRoute, Refusal};
 use helios_kmd_logic::rm_refresh::Edge;
 use helios_kmd_logic::scanout_worker_bind::{
     decide as decide_worker_bind, decide_epoch as decide_worker_epoch, Action as WorkerBindAction,
@@ -273,7 +273,7 @@ unsafe fn dxgkddi_present_inner(
         // struct as an allocation array.
         crate::diag::record_named_bytes(b"PBmpo", 1);
         PRESENT_LAST_STATUS.store(STATUS_NOT_SUPPORTED as u32, Ordering::Relaxed);
-        return STATUS_NOT_SUPPORTED;
+        return crate::ddi::present_foreign::site(site::MPO, STATUS_NOT_SUPPORTED);
     };
     let payload_has_list = allocation_list.is_present();
     // SAFETY: `allocation_list` came from `PresentPayload::decode`, so it is the
@@ -483,6 +483,7 @@ unsafe fn dxgkddi_present_inner(
                 )
             } {
                 Ok(capacity) => patch_capacity = Some(capacity),
+                // The arm named its own site.
                 Err(status) => return status,
             }
         } else if present_flags & 1 != 0 {
@@ -492,7 +493,10 @@ unsafe fn dxgkddi_present_inner(
                     STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER as u32,
                     Ordering::Relaxed,
                 );
-                return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
+                return crate::ddi::present_foreign::site(
+                    site::BLT_DMA_SMALL,
+                    STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
+                );
             }
             if args.pDmaBufferPrivateData.is_null()
                 || (args.DmaBufferPrivateDataSize as usize)
@@ -502,7 +506,10 @@ unsafe fn dxgkddi_present_inner(
                     STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER as u32,
                     Ordering::Relaxed,
                 );
-                return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
+                return crate::ddi::present_foreign::site(
+                    site::BLT_DMA_SMALL,
+                    STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
+                );
             }
             // BEFORE any host GPU work: an insufficient-buffer retry must not
             // be able to duplicate the BLT below. The token is carried to the
@@ -512,7 +519,7 @@ unsafe fn dxgkddi_present_inner(
                 Ok(capacity) => patch_capacity = Some(capacity),
                 Err(status) => {
                     PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
-                    return status;
+                    return crate::ddi::present_foreign::site(site::BLT_PATCH, status);
                 }
             }
 
@@ -543,6 +550,28 @@ unsafe fn dxgkddi_present_inner(
                             dst_info,
                         )
                     };
+                }
+                // An unresolved source or destination handle while the transport holds a
+                // foreign record (or `ForeignFlip` is on) is a lost picture, not a failed
+                // Present; a Venus-only session keeps failing below.
+                if let Some(adapter) = adapter {
+                    if crate::ddi::present_foreign::unresolved_skip(
+                        adapter,
+                        src_info.as_ref(),
+                        dst_info.as_ref(),
+                    ) {
+                        return unsafe {
+                            present_blt_skipped(
+                                args,
+                                present_allocations,
+                                patch_capacity.take(),
+                                present_stream_boundary,
+                                Some(adapter),
+                                src_info,
+                                dst_info,
+                            )
+                        };
+                    }
                 }
                 crate::diag::record_named_bytes(b"PBCpy", 0xE1);
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
@@ -777,14 +806,20 @@ unsafe fn dxgkddi_present_inner(
                         blt_foreign_skip!(Refusal::BltQueue);
                         crate::diag::record_named_bytes(b"PBCpy", 0xE4);
                         PRESENT_LAST_STATUS.store(STATUS_NO_MEMORY as u32, Ordering::Relaxed);
-                        return STATUS_NO_MEMORY;
+                        return crate::ddi::present_foreign::site(
+                            site::BLT_QUEUE,
+                            STATUS_NO_MEMORY,
+                        );
                     }
                     Err(_) => {
                         blt_foreign_skip!(Refusal::BltQueue);
                         crate::diag::record_named_bytes(b"PBCpy", 0xE5);
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                        return STATUS_DEVICE_NOT_READY;
+                        return crate::ddi::present_foreign::site(
+                            site::BLT_QUEUE,
+                            STATUS_DEVICE_NOT_READY,
+                        );
                     }
                 };
                 if let Err(status) = unsafe {
@@ -830,7 +865,10 @@ unsafe fn dxgkddi_present_inner(
                         crate::diag::record_named_bytes(b"PBOwn", 0xE1);
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                        return STATUS_DEVICE_NOT_READY;
+                        return crate::ddi::present_foreign::site(
+                            site::BLT_BEGIN,
+                            STATUS_DEVICE_NOT_READY,
+                        );
                     }
                 }
                 let copy = adapter.with_venus_client(passive, |client| {
@@ -847,7 +885,10 @@ unsafe fn dxgkddi_present_inner(
                         blt_foreign_skip!(Refusal::BltSubmit);
                         crate::diag::record_named_bytes(b"PBCpy", 0xE4);
                         PRESENT_LAST_STATUS.store(STATUS_NO_MEMORY as u32, Ordering::Relaxed);
-                        return STATUS_NO_MEMORY;
+                        return crate::ddi::present_foreign::site(
+                            site::BLT_SUBMIT,
+                            STATUS_NO_MEMORY,
+                        );
                     }
                     Ok(Err(_)) | Err(_) => {
                         if let Some(resource_id) = destination_buffer {
@@ -859,7 +900,10 @@ unsafe fn dxgkddi_present_inner(
                         crate::diag::record_named_bytes(b"PBCpy", 0xE5);
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                        return STATUS_DEVICE_NOT_READY;
+                        return crate::ddi::present_foreign::site(
+                            site::BLT_SUBMIT,
+                            STATUS_DEVICE_NOT_READY,
+                        );
                     }
                 };
                 crate::diag::record_named_bytes(
@@ -886,13 +930,19 @@ unsafe fn dxgkddi_present_inner(
                             crate::diag::record_named_bytes(b"PBSyWt", 0xE1);
                             PRESENT_LAST_STATUS
                                 .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                            return STATUS_DEVICE_NOT_READY;
+                            return crate::ddi::present_foreign::site(
+                                site::BLT_WAIT,
+                                STATUS_DEVICE_NOT_READY,
+                            );
                         }
                         crate::virtio::ctrl::WaitFenceOutcome::Invalid => {
                             crate::diag::record_named_bytes(b"PBSyWt", 0xE2);
                             PRESENT_LAST_STATUS
                                 .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                            return STATUS_DEVICE_NOT_READY;
+                            return crate::ddi::present_foreign::site(
+                                site::BLT_WAIT,
+                                STATUS_DEVICE_NOT_READY,
+                            );
                         }
                     }
                     let mirror_ready = destination_buffer.is_some_and(|resource_id| {
@@ -907,7 +957,10 @@ unsafe fn dxgkddi_present_inner(
                         crate::diag::record_named_bytes(b"PBSyWt", 0xE3);
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                        return STATUS_DEVICE_NOT_READY;
+                        return crate::ddi::present_foreign::site(
+                            site::BLT_WAIT,
+                            STATUS_DEVICE_NOT_READY,
+                        );
                     }
                 }
                 let mirror_ok = if destination_buffer.is_some() {
@@ -950,7 +1003,10 @@ unsafe fn dxgkddi_present_inner(
                     if !ownership_released || !mirror_ok {
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                        return STATUS_DEVICE_NOT_READY;
+                        return crate::ddi::present_foreign::site(
+                            site::BLT_WAIT,
+                            STATUS_DEVICE_NOT_READY,
+                        );
                     }
                 }
                 // Capacity was checked before host work was queued, so this cannot
@@ -965,7 +1021,7 @@ unsafe fn dxgkddi_present_inner(
                 } {
                     crate::diag::record_named_bytes(b"PBCpy", 0xE6);
                     PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
-                    return status;
+                    return crate::ddi::present_foreign::site(site::BLT_FENCE_MERGE, status);
                 }
                 // NOT sampled: PBCpy is the value a failed Present is read from
                 // (its 0xE1..0xE6 arms), so its success arm has to keep the same
@@ -1089,20 +1145,19 @@ unsafe fn dxgkddi_present_inner(
         // see `create_allocation::SCANOUT_ALLOCS`. Measured before this
         // existed: `VpDmaF=165, VpDmaA=0, VpPrF=165`, i.e. every DMA flip
         // failed to pair because the open handle is not an `AllocationContext*`.
-        let Some(flip_allocation) =
-            crate::ddi::create_allocation::scanout_allocation_for_resource(source.resource_id)
-        else {
-            // A foreign swap-chain buffer is not in the direct-scan-out table: nothing to arm,
-            // the display keeps the previous picture and the flip's DMA fence retires normally.
-            if crate::ddi::present_foreign::skip(
-                present_arm,
-                Refusal::FlipNotScanout,
-                adapter,
-                src_info.as_ref(),
-                None,
-            )
-            .is_some()
-            {
+        let registered =
+            crate::ddi::create_allocation::scanout_allocation_for_resource(source.resource_id);
+        // A flip of a foreign allocation (DWM-on-NVK's swap chain: DEVICE_MEMORY, not
+        // `MISC_DIRECT_SCANOUT`) is armed when `ForeignFlip` is on and `CreateAllocation`
+        // registered its handle: the deferred programming then reaches the `ForeignFlip` hook of
+        // `program_vidpn_source_inner`, which takes it or refuses it to the Venus path as it does
+        // for the MMIO flip. Otherwise it is skipped (counted) and the display keeps the previous
+        // picture and the flip's DMA fence retires normally. An ordinary allocation that is not
+        // registered still fails (`PBFlip` 0xE6).
+        let route = crate::ddi::present_foreign::flip_route(adapter, registered.is_some(), &source);
+        let flip_allocation = match (route, registered) {
+            (FlipRoute::Arm { .. }, Some(handle)) => handle,
+            (FlipRoute::Skip { .. }, _) => {
                 return unsafe {
                     present_complete(
                         args,
@@ -1116,9 +1171,11 @@ unsafe fn dxgkddi_present_inner(
                     )
                 };
             }
-            crate::diag::record_named_bytes(b"PBFlip", 0xE6);
-            PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
-            return crate::ddi::present_foreign::invalid(site::FLIP_NOT_SCANOUT);
+            _ => {
+                crate::diag::record_named_bytes(b"PBFlip", 0xE6);
+                PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
+                return crate::ddi::present_foreign::invalid(site::FLIP_NOT_SCANOUT);
+            }
         };
         // D4b SNAPSHOT SUBSTITUTION, decided HERE and carried by value. The
         // candidate arrived through the RENDER command's per-context stash
@@ -1159,7 +1216,7 @@ unsafe fn dxgkddi_present_inner(
         } {
             crate::diag::record_named_bytes(b"PBFlip", 0xE5);
             PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
-            return status;
+            return crate::ddi::present_foreign::site(site::FLIP_PRIVATE, status);
         }
         crate::ddi::scanout_trace::note_present_dma_flip(
             source.resource_id,
@@ -1208,13 +1265,13 @@ unsafe fn present_complete(
             Ok(capacity) => capacity,
             Err(status) => {
                 PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
-                return status;
+                return crate::ddi::present_foreign::site(site::TAIL_PATCH, status);
             }
         },
     };
     if let Err(status) = unsafe { present_allocations.write_patch_references(capacity, args) } {
         PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
-        return status;
+        return crate::ddi::present_foreign::site(site::TAIL_PATCH, status);
     }
 
     if !args.pDmaBuffer.is_null() {
@@ -1224,7 +1281,10 @@ unsafe fn present_complete(
                 STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER as u32,
                 Ordering::Relaxed,
             );
-            return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
+            return crate::ddi::present_foreign::site(
+                site::TAIL_DMA_SMALL,
+                STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
+            );
         }
         let command = helios_protocol::HeliosPresentRefreshCmd {
             magic: helios_protocol::HELIOS_PRESENT_REFRESH_MAGIC,
@@ -1363,14 +1423,17 @@ unsafe fn present_blt_to_rm_primary(
             STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER as u32,
             Ordering::Relaxed,
         );
-        return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
+        return Err(crate::ddi::present_foreign::site(
+            site::BLT_DMA_SMALL,
+            STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
+        ));
     }
     // BEFORE any copy, as in the legacy arm: an insufficient-buffer retry must not duplicate it.
     let capacity = match present_allocations.validate_patch_capacity(args) {
         Ok(capacity) => capacity,
         Err(status) => {
             PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
-            return Err(status);
+            return Err(crate::ddi::present_foreign::site(site::BLT_PATCH, status));
         }
     };
     let Some(source) = source else {

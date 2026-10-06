@@ -115,6 +115,13 @@ pub enum Refusal {
     FlipNotScanout = 12,
     /// The completion tail could not merge the stream boundary into the DMA private data.
     TailBoundary = 13,
+    /// DMA flip, `ForeignFlip` on: a foreign allocation that is nevertheless not in the
+    /// direct-scan-out table (the table was full, or it was created before the knob was read),
+    /// so there is no global handle to hand to the programming path.
+    FlipUnregistered = 14,
+    /// Blt: a source or destination handle resolves to no allocation, while the transport holds
+    /// a live foreign record or `ForeignFlip` is on (see [`decide_unresolved`]).
+    Unresolved = 15,
 }
 
 impl Refusal {
@@ -131,6 +138,8 @@ impl Refusal {
             | Refusal::FlipFormat
             | Refusal::FlipNotScanout => Roles::Source,
             Refusal::BltBegin => Roles::Destination,
+            Refusal::FlipUnregistered => Roles::Source,
+            Refusal::Unresolved => Roles::Either,
             Refusal::BltFormat
             | Refusal::BltDescriptor
             | Refusal::BltExtent
@@ -146,8 +155,10 @@ impl Refusal {
     const fn in_arm(self, arm: Arm) -> bool {
         match self {
             Refusal::FlipFormat => arm.is_flip(),
-            Refusal::FlipNotScanout => matches!(arm, Arm::FlipDma),
+            Refusal::FlipNotScanout | Refusal::FlipUnregistered => matches!(arm, Arm::FlipDma),
             Refusal::TailBoundary => true,
+            // Decided by `decide_unresolved`, which has no foreign facts to read.
+            Refusal::Unresolved => false,
             _ => matches!(arm, Arm::Blt),
         }
     }
@@ -156,7 +167,7 @@ impl Refusal {
     const fn effect(self) -> Effect {
         match self {
             Refusal::FlipFormat => Effect::IgnoreCheck,
-            Refusal::FlipNotScanout => Effect::KeepPicture,
+            Refusal::FlipNotScanout | Refusal::FlipUnregistered => Effect::KeepPicture,
             Refusal::TailBoundary => Effect::DropBoundary,
             _ => Effect::LeaveDestination,
         }
@@ -260,6 +271,104 @@ pub const fn decide(
     }
 }
 
+/// What a Present's unresolved handle does (`PBCpy` 0xE1, `PBRetSite` 4 / 5).
+///
+/// A Blt whose source or destination handle resolves to no allocation cannot say whether it was a
+/// foreign one (the open context is gone, or never was ours). That is a failed Present for a
+/// Venus-only session, which keeps failing exactly as before. While the transport holds a live
+/// foreign record, or `ForeignFlip` is on, the unresolved handle is most plausibly a foreign
+/// swap-chain buffer the KMD cannot name any more, and the Blt is a counted success that leaves
+/// the destination as it was (a lost picture instead of a failed Present, which dxgkrnl turns
+/// into a device error for DWM).
+///
+/// `source_resolved` / `destination_resolved`: the handle resolved to an allocation. The Why's
+/// `source` / `destination` bits name the UNRESOLVED side(s) here, not a foreign one.
+pub const fn decide_unresolved(
+    arm: Arm,
+    source_resolved: bool,
+    destination_resolved: bool,
+    foreign_live: bool,
+    foreign_flip_knob: bool,
+) -> Verdict {
+    if !matches!(arm, Arm::Blt) || (source_resolved && destination_resolved) {
+        return Verdict::Proceed;
+    }
+    if !foreign_live && !foreign_flip_knob {
+        return Verdict::Proceed;
+    }
+    Verdict::Skip {
+        why: Why {
+            arm,
+            refusal: Refusal::Unresolved,
+            source: !source_resolved,
+            destination: !destination_resolved,
+        },
+        effect: Effect::LeaveDestination,
+    }
+}
+
+/// What a DMA flip does with its source, from the direct-scan-out table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlipRoute {
+    /// Arm the deferred programming (`PresentFlipPrivate` + `arm_dma_flip`), as every
+    /// direct-scan-out flip does. `foreign_flip` is true when the programming it reaches is
+    /// `ForeignFlip`'s (a foreign allocation, knob on), false for the existing Venus flips.
+    Arm { foreign_flip: bool },
+    /// Not a foreign allocation's refusal: the flip fails as it always did.
+    Fail,
+    /// A foreign allocation the programming path cannot take: counted success, nothing armed.
+    Skip { why: Why, effect: Effect },
+}
+
+/// Route a DMA flip.
+///
+/// * `in_table`: the source's resource id has a global handle in the direct-scan-out table.
+///   Foreign allocations are registered there at creation iff `ForeignFlip` is on, so a
+///   foreign flip can reach `program_vidpn_source_inner` (whose `ForeignFlip` hook programs it,
+///   or refuses it and the Venus path runs as for any other primary).
+/// * `direct_scanout`: the allocation carries `MISC_DIRECT_SCANOUT` (the table's original
+///   population: unchanged behaviour whatever the knob).
+/// * `source`: facts of the source entry; only consulted when not (`in_table` and
+///   `direct_scanout`), so the common flip needs none.
+pub const fn flip_route(
+    knob_on: bool,
+    in_table: bool,
+    direct_scanout: bool,
+    source: Option<AllocFacts>,
+) -> FlipRoute {
+    if in_table && direct_scanout {
+        return FlipRoute::Arm {
+            foreign_flip: false,
+        };
+    }
+    let foreign = match source {
+        Some(facts) => facts.is_foreign(),
+        None => false,
+    };
+    if !foreign {
+        return if in_table {
+            FlipRoute::Arm {
+                foreign_flip: false,
+            }
+        } else {
+            FlipRoute::Fail
+        };
+    }
+    if in_table && knob_on {
+        return FlipRoute::Arm { foreign_flip: true };
+    }
+    // Foreign, and either not registered or registered while the knob is off.
+    let refusal = if knob_on {
+        Refusal::FlipUnregistered
+    } else {
+        Refusal::FlipNotScanout
+    };
+    match decide(Arm::FlipDma, refusal, source, None) {
+        Verdict::Skip { why, effect } => FlipRoute::Skip { why, effect },
+        Verdict::Proceed => FlipRoute::Fail,
+    }
+}
+
 /// Early-return site ids for `PBRetSite`: which line of the Present path returned a
 /// non-success status, so the registry dump names it. 0 = none (success, or a status no site
 /// names). Stable: the dump is read against this table.
@@ -304,6 +413,28 @@ pub mod site {
     pub const TAIL_BOUNDARY: u32 = 19;
     /// Completion tail: the patch-location capacity or write failed.
     pub const TAIL_PATCH: u32 = 20;
+    /// `FlipWithMultiPlaneOverlay`: refused with `STATUS_NOT_SUPPORTED`.
+    pub const MPO: u32 = 21;
+    /// Blt arm (legacy or level 5): the DMA buffer or its private data is too small
+    /// (`STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER`, dxgkrnl retries).
+    pub const BLT_DMA_SMALL: u32 = 22;
+    /// Blt arm (legacy or level 5): the patch-location capacity check failed.
+    pub const BLT_PATCH: u32 = 23;
+    /// Blt arm: the two-phase snapshot Blt could not be queued.
+    pub const BLT_QUEUE: u32 = 24;
+    /// Blt arm: the destination Present buffer could not be taken for the write.
+    pub const BLT_BEGIN: u32 = 25;
+    /// Blt arm: the host copy was refused or could not be submitted.
+    pub const BLT_SUBMIT: u32 = 26;
+    /// Blt arm, after the copy was submitted: the fence wait, the CPU mirror or the ownership
+    /// release failed.
+    pub const BLT_WAIT: u32 = 27;
+    /// Blt arm: the fence marker could not be merged into the DMA private data.
+    pub const BLT_FENCE_MERGE: u32 = 28;
+    /// Completion tail: the DMA buffer is smaller than the refresh marker.
+    pub const TAIL_DMA_SMALL: u32 = 29;
+    /// DMA flip: the flip record could not be written into the DMA private data.
+    pub const FLIP_PRIVATE: u32 = 30;
 }
 
 #[cfg(test)]
@@ -330,7 +461,7 @@ mod tests {
         identity_foreign: true,
         table_record: false,
     };
-    const ALL: [Refusal; 13] = [
+    const ALL: [Refusal; 15] = [
         Refusal::BltNoDestination,
         Refusal::BltFormat,
         Refusal::BltSourceKind,
@@ -344,6 +475,8 @@ mod tests {
         Refusal::FlipFormat,
         Refusal::FlipNotScanout,
         Refusal::TailBoundary,
+        Refusal::FlipUnregistered,
+        Refusal::Unresolved,
     ];
     const ARMS: [Arm; 3] = [Arm::Blt, Arm::FlipMmio, Arm::FlipDma];
 
@@ -593,12 +726,127 @@ mod tests {
             site::RM_BLT_NO_SOURCE,
             site::TAIL_BOUNDARY,
             site::TAIL_PATCH,
+            site::MPO,
+            site::BLT_DMA_SMALL,
+            site::BLT_PATCH,
+            site::BLT_QUEUE,
+            site::BLT_BEGIN,
+            site::BLT_SUBMIT,
+            site::BLT_WAIT,
+            site::BLT_FENCE_MERGE,
+            site::TAIL_DMA_SMALL,
+            site::FLIP_PRIVATE,
         ];
         for (i, a) in ids.iter().enumerate() {
             assert!(*a != 0);
             for b in &ids[i + 1..] {
                 assert_ne!(a, b);
             }
+        }
+    }
+
+    /// The matrix the coordinator asked for: ForeignFlip knob x in the table x foreign record.
+    #[test]
+    fn dma_flip_route_matrix() {
+        let arm_plain = FlipRoute::Arm {
+            foreign_flip: false,
+        };
+        let arm_ff = FlipRoute::Arm { foreign_flip: true };
+        for knob in [false, true] {
+            // A direct-scan-out allocation in the table: unchanged, whatever it is.
+            for facts in [None, Some(VENUS), Some(FOREIGN_ID), Some(FOREIGN_TABLE)] {
+                assert_eq!(flip_route(knob, true, true, facts), arm_plain, "{knob}");
+            }
+            // Not foreign and not in the table: the failure it always was.
+            for facts in [None, Some(VENUS)] {
+                assert_eq!(flip_route(knob, false, false, facts), FlipRoute::Fail);
+                assert_eq!(flip_route(knob, false, true, facts), FlipRoute::Fail);
+            }
+            // Not foreign, in the table without the direct flag (not a registration this
+            // code makes): armed as before.
+            assert_eq!(flip_route(knob, true, false, Some(VENUS)), arm_plain);
+        }
+        // Foreign, in the table, knob on: handed to ForeignFlip's programming.
+        for f in [FOREIGN_ID, FOREIGN_TABLE] {
+            assert_eq!(flip_route(true, true, false, Some(f)), arm_ff);
+        }
+        // Foreign, in the table, knob off (a stale registration): skipped, 12.
+        let FlipRoute::Skip { why, effect } = flip_route(false, true, false, Some(FOREIGN_ID))
+        else {
+            panic!("not skipped")
+        };
+        assert_eq!(why.refusal, Refusal::FlipNotScanout);
+        assert_eq!(why.arm, Arm::FlipDma);
+        assert_eq!(effect, Effect::KeepPicture);
+        // Foreign, not in the table: knob off -> 12, knob on -> 14.
+        for (knob, refusal) in [
+            (false, Refusal::FlipNotScanout),
+            (true, Refusal::FlipUnregistered),
+        ] {
+            for f in [FOREIGN_ID, FOREIGN_TABLE, SYSMEM_PRIMARY] {
+                let FlipRoute::Skip { why, effect } = flip_route(knob, false, false, Some(f))
+                else {
+                    panic!("not skipped")
+                };
+                assert_eq!(why.refusal, refusal);
+                assert!(why.source && !why.destination);
+                assert_eq!(effect, Effect::KeepPicture);
+            }
+        }
+        // A foreign allocation carrying the direct flag but missing from the table is
+        // foreign and unregistered: skipped, never failed.
+        assert!(matches!(
+            flip_route(false, false, true, Some(FOREIGN_ID)),
+            FlipRoute::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn unresolved_handles_skip_only_with_foreign_activity() {
+        // Both resolved: not this refusal.
+        for live in [false, true] {
+            for knob in [false, true] {
+                assert_eq!(
+                    decide_unresolved(Arm::Blt, true, true, live, knob),
+                    Verdict::Proceed
+                );
+            }
+        }
+        // Venus-only operation keeps failing.
+        for (s, d) in [(false, true), (true, false), (false, false)] {
+            assert_eq!(
+                decide_unresolved(Arm::Blt, s, d, false, false),
+                Verdict::Proceed
+            );
+        }
+        // A live foreign record or the knob turns it into a skip, naming the unresolved side.
+        for (live, knob) in [(true, false), (false, true), (true, true)] {
+            let Verdict::Skip { why, effect } =
+                decide_unresolved(Arm::Blt, false, true, live, knob)
+            else {
+                panic!("not skipped")
+            };
+            assert!(why.source && !why.destination);
+            assert_eq!(why.refusal, Refusal::Unresolved);
+            assert_eq!(effect, Effect::LeaveDestination);
+            assert_eq!(why.code(), (1 << 12) | (1 << 8) | 15);
+            let Verdict::Skip { why, .. } = decide_unresolved(Arm::Blt, true, false, live, knob)
+            else {
+                panic!("not skipped")
+            };
+            assert!(!why.source && why.destination);
+            let Verdict::Skip { why, .. } = decide_unresolved(Arm::Blt, false, false, live, knob)
+            else {
+                panic!("not skipped")
+            };
+            assert!(why.source && why.destination);
+        }
+        // Flips are not covered.
+        for arm in [Arm::FlipMmio, Arm::FlipDma] {
+            assert_eq!(
+                decide_unresolved(arm, false, true, true, true),
+                Verdict::Proceed
+            );
         }
     }
 

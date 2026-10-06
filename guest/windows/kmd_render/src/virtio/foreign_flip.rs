@@ -204,6 +204,12 @@ fn read_knob() -> u32 {
     v
 }
 
+/// Whether `ForeignFlip` is on for this transport generation (`Present` and
+/// `CreateAllocation` ask: PASSIVE, the first call reads the service key).
+pub(crate) fn enabled() -> bool {
+    knob_on()
+}
+
 /// Forget everything (the transport generation ended; `retire_transport`). The next
 /// generation reads the knob again.
 pub(crate) fn forget() {
